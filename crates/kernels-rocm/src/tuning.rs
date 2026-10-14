@@ -171,6 +171,13 @@ pub struct MoeBatchUntil(pub u32);
 #[decision(id = "kernel.moe.dense_batch_until", constant(range(0..=4096)), default = 160, tune = search)]
 pub struct MoeDenseBatchUntil(pub u32);
 
+/// The routes an expert averages from which a bf16 / f16 batch fire takes
+/// the wide leg (an item an expert's routes, the waves splitting them, the
+/// weight read once) over the batch items; 0, never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.dense_wide_from", constant(range(0..=4096)), default = 26, tune = search)]
+pub struct MoeDenseWideFrom(pub u32);
+
 /// The rows from which, and up to which, a bf16 projection (and the fused
 /// gate/up SwiGLU) takes the batch engine over hipBLASLt; until 0, never.
 /// On MI300X it wins by 1.2x only at a few rows over a wide bank (Qwen3.8's
@@ -222,6 +229,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeBatchFrom>()
         .add::<MoeBatchUntil>()
         .add::<MoeDenseBatchUntil>()
+        .add::<MoeDenseWideFrom>()
         .add::<DenseBatchFrom>()
         .add::<DenseBatchUntil>()
         .add::<DenseBatchWeightMi>()
@@ -261,6 +269,7 @@ pub struct Tuning {
     pub moe_batch_from: u32,
     pub moe_batch_until: u32,
     pub moe_dense_batch_until: u32,
+    pub moe_dense_wide_from: u32,
     pub dense_batch_from: u32,
     pub dense_batch_until: u32,
     pub dense_batch_weight_mi: u32,
@@ -298,6 +307,7 @@ impl Tuning {
         moe_batch_from: 2,
         moe_batch_until: 32,
         moe_dense_batch_until: 160,
+        moe_dense_wide_from: 26,
         dense_batch_from: 8,
         dense_batch_until: 16,
         dense_batch_weight_mi: 128,
@@ -335,6 +345,7 @@ impl Tuning {
             moe_batch_from: profile.get::<MoeBatchFrom>().0,
             moe_batch_until: profile.get::<MoeBatchUntil>().0,
             moe_dense_batch_until: profile.get::<MoeDenseBatchUntil>().0,
+            moe_dense_wide_from: profile.get::<MoeDenseWideFrom>().0,
             dense_batch_from: profile.get::<DenseBatchFrom>().0,
             dense_batch_until: profile.get::<DenseBatchUntil>().0,
             dense_batch_weight_mi: profile.get::<DenseBatchWeightMi>().0,

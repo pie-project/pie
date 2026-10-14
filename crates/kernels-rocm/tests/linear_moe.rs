@@ -582,6 +582,12 @@ fn moe_matmul_dense() {
         (5, 64, 2, 128, 2304, "grouped"),
         (4, 96, 4, 136, 512, "grouped"),
         (3, 20, 2, 50, 60, "blas"),
+        // The wide leg in 64- to 256-route items, N ragged by 8 and by 2.
+        (8, 64, 4, 520, 256, "wide"),
+        (5, 65, 2, 130, 320, "wide"),
+        (4, 100, 4, 136, 512, "wide"),
+        (3, 140, 3, 200, 1024, "wide"),
+        (2, 220, 2, 72, 2048, "wide"),
     ] {
         let (e, t, kk, nn, kd) = (
             experts as usize,
@@ -598,10 +604,11 @@ fn moe_matmul_dense() {
         let bt = gpu.tensor(&bank.w, experts, n * k, Dtype::Bf16);
         let ctx = tuned(&gpu, |t| {
             t.moe_grouped = leg != "stream";
-            t.moe_batch = leg == "batch";
+            t.moe_batch = leg == "batch" || leg == "wide";
             t.moe_batch_from = 1;
             // Up to 64 routes an expert, so a 64-route item fills.
-            t.moe_dense_batch_until = 64;
+            t.moe_dense_batch_until = if leg == "wide" { 4096 } else { 64 };
+            t.moe_dense_wide_from = u32::from(leg == "wide");
         });
         for by_token in [true, false] {
             let routes = make_routes(t, kk, e, u64::from(n), leg != "blas");
@@ -638,9 +645,12 @@ fn moe_matmul_dense() {
     let rt = planes.i32s(&routes, tokens, top_k);
     let (want, mag) = reference(&bank, &x, &routes, 2, true, None);
     let win = gpu.ints(&[2, 1, 0, 0]);
-    for leg in ["stream", "batch"] {
+    for leg in ["stream", "batch", "wide"] {
         let mut y = gpu.zeros(tokens * top_k, n, Dtype::Bf16);
-        let ctx = tuned(&gpu, |t| t.moe_batch = leg == "batch");
+        let ctx = tuned(&gpu, |t| {
+            t.moe_batch = leg != "stream";
+            t.moe_dense_wide_from = u32::from(leg == "wide");
+        });
         ctx.arm_stage(win.ptr);
         moe::matmul_select(&ctx, xt, bt, rt, &mut y, moe::ExpertTable::RESIDENT).unwrap();
         ctx.disarm_stage();
@@ -678,6 +688,31 @@ fn moe_matmul_dense() {
         counted[e as usize] += 1;
     }
     assert_eq!(planes.read_i32(&gpu, &hits), counted, "expert hits");
+}
+
+#[test]
+fn moe_matmul_dense_wide_skewed() {
+    // The wide leg where one expert takes more routes than an item: expert 0
+    // in every token (100 routes over 64-route items), the others a few
+    // each, so its routes split over two items, each reading the weight.
+    let Some(gpu) = Gpu::open() else { return };
+    let planes = Planes::default();
+    let (experts, tokens, top_k, n, k) = (8u32, 100u32, 2u32, 192u32, 512u32);
+    let bank = Dense {
+        n: 192,
+        k: 512,
+        w: bf16s(8 * 192 * 512, 31, 0.1),
+    };
+    let bt = gpu.tensor(&bank.w, experts, n * k, Dtype::Bf16);
+    let routes: Vec<i32> = (0..100).flat_map(|t| [0, 1 + t % 7]).collect();
+    let x = bf16s(100 * 512, 32, 1.0);
+    let xt = gpu.tensor(&x, tokens, k, Dtype::Bf16);
+    let rt = planes.i32s(&routes, tokens, top_k);
+    let (want, mag) = reference(&bank, &x, &routes, 2, true, None);
+    let ctx = tuned(&gpu, |t| t.moe_dense_wide_from = 1);
+    let mut y = gpu.zeros(tokens * top_k, n, Dtype::Bf16);
+    moe::matmul_select(&ctx, xt, bt, rt, &mut y, moe::ExpertTable::RESIDENT).unwrap();
+    close_dot("wide skewed", &gpu.read(&y), &want, &mag, 1e-5);
 }
 
 /// fp4 (e2m1) magnitudes by code.
@@ -1002,6 +1037,7 @@ fn moe_matmul_f16() {
         (3, 100, 2, 136, 264, "batch"),
         (8, 40, 4, 200, 256, "grouped"),
         (4, 96, 4, 136, 512, "grouped"),
+        (4, 96, 4, 136, 512, "wide"),
     ] {
         let (e, t, kk, nn, kd) = (
             experts as usize,
@@ -1018,8 +1054,9 @@ fn moe_matmul_f16() {
         let bt = planes.f16s(&bank.w, experts, n * k);
         let ctx = tuned(&gpu, |t| {
             t.moe_grouped = leg != "stream";
-            t.moe_batch = leg == "batch";
+            t.moe_batch = leg == "batch" || leg == "wide";
             t.moe_batch_from = 1;
+            t.moe_dense_wide_from = u32::from(leg == "wide");
         });
         let routes = make_routes(t, kk, e, 52, true);
         let x = f16s(t * kd, 53, 1.0);

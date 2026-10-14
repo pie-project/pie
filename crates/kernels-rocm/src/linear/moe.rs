@@ -408,6 +408,13 @@ pub fn matmul_select(
     const OP: &str = "linear.moe_matmul_select";
 
     let fan = selected(OP, x, routes, y)?;
+    // A wide decode batch over a resident bank: an item an expert's routes,
+    // its weight read once.
+    if let Some(count) = dense_experts(x, bank, y, experts)
+        && let Some(mw) = wide_items(ctx, &fan, count, x)
+    {
+        return select_wide(ctx, OP, x, bank, routes, y, &fan, count, mw);
+    }
     // A decode batch over a resident bank: each expert read once for all its
     // routes.
     if let Some(count) = dense_experts(x, bank, y, experts)
@@ -643,6 +650,105 @@ fn select_batch(
             [GROUP_BLOCK, 1, 1],
         )),
         &args,
+    )
+}
+
+/// Weight rows a wide block takes (the kernel's `NT`).
+const WIDE_ROWS: u32 = 64;
+const WIDE_ROWS_TALL: u32 = 128;
+/// Elements a wide stage takes of a row (the kernel's `KC`).
+const WIDE_K: u32 = 64;
+
+/// The routes a wide wave takes (the kernel's `MW`; an item is four waves'),
+/// if the wide leg takes this fire: from `kernel.moe.dense_wide_from` routes
+/// an expert (averaged, rounded up) to `kernel.moe.dense_batch_until`, K
+/// whole 64-element stages and the activation under 4 GiB. The item is the
+/// least of 64, 128, 192 and 256 routes past the average by two of its
+/// square roots and one (as `batch_items`), so each expert's routes are one
+/// item.
+fn wide_items(ctx: &Ctx, fan: &Selected, experts: u32, x: Tensor) -> Option<u32> {
+    let t = ctx.tuning();
+    let top_k = fan.top_k.unsigned_abs();
+    if !t.moe_batch
+        || t.moe_dense_wide_from == 0
+        || fan.route_count < t.moe_batch_from.saturating_mul(top_k)
+        || !x.width.is_multiple_of(WIDE_K)
+        || u64::from(x.rows) * u64::from(x.width) * 2 >= 0xffff_f000
+    {
+        return None;
+    }
+    let per = fan.route_count.div_ceil(experts);
+    if per < t.moe_dense_wide_from || per > t.moe_dense_batch_until {
+        return None;
+    }
+    // per ≤ (√cap − 1)² for cap = 64, 128, 192, 256.
+    Some(match per {
+        0..=49 => 16,
+        50..=106 => 32,
+        107..=165 => 48,
+        _ => 64,
+    })
+}
+
+/// A wide fire: routes ordered by expert into items of up to 4·`mw`, then
+/// one item a block row against 64 or 128 weight rows a block.
+#[allow(clippy::too_many_arguments)]
+fn select_wide(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    fan: &Selected,
+    experts: u32,
+    mw: u32,
+) -> Result<(), Error> {
+    let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let ordered = route_order(ctx, op, routes, fan, experts, 4 * mw)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    #[allow(clippy::cast_possible_truncation)]
+    let act_bytes = (u64::from(x.rows) * u64::from(x.width) * 2) as u32;
+    // Items an XCD takes (the kernel's `per_xcd`).
+    let per_xcd = ordered.work_cap.div_ceil(8);
+    // 128-row tiles once the items are 128 or 192 routes (the activation
+    // read half as often), their weight two stages ahead at 192 (so the
+    // tile fits the registers); 64 rows otherwise, four stages ahead.
+    let nt = if (32..=48).contains(&mw) {
+        WIDE_ROWS_TALL
+    } else {
+        WIDE_ROWS
+    };
+    let depth = if nt == WIDE_ROWS_TALL && mw >= 48 { 2 } else { 4 };
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::linear::moe_matmul_select_dense_wide<{t}, ::pie::i32({mw}), ::pie::i32({nt}), \
+                 ::pie::i32({WIDE_K}), ::pie::i32({depth}), ::pie::i32(2)>"
+            )),
+        )
+        .apply(Launch::grid(
+            [8 * per_xcd * y.width.div_ceil(nt), 1, 1],
+            [GROUP_BLOCK, 1, 1],
+        )),
+        &[
+            x.arg(),
+            ArgValue::Ptr(ordered.order),
+            ArgValue::Ptr(ordered.offsets),
+            ArgValue::Ptr(ordered.work),
+            bank.arg(),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+            act_bytes.arg(),
+            per_xcd.arg(),
+        ],
     )
 }
 

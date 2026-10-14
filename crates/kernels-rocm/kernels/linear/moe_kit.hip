@@ -764,16 +764,18 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
     }
 }
 
-// The work item a grouped block takes: `work` lists (expert << 16 | slice)
-// and offsets[experts + 1] holds how many; false past the list.
+// The work item a grouped block takes (item `at`, by default the block's
+// x): `work` lists (expert << 16 | slice) and offsets[experts + 1] holds how
+// many; false past the list.
 struct GroupItem {
     int expert, begin, count;
 };
 
 __device__ __forceinline__ bool group_item(const i32* __restrict__ offsets, const i32* __restrict__ work,
-                                           int num_experts, int routes, GroupItem& item) {
-    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return false;
-    const int w = work[blockIdx.x];
+                                           int num_experts, int routes, GroupItem& item, int at = -1) {
+    if (at < 0) at = static_cast<int>(blockIdx.x);
+    if (at >= offsets[num_experts + 1]) return false;
+    const int w = work[at];
     item.expert = w / 65536;
     item.begin = offsets[item.expert] + (w % 65536) * routes;
     item.count = min(offsets[item.expert + 1] - item.begin, routes);
@@ -1324,6 +1326,186 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
                 }
             }
         }
+}
+
+// -------------------------------------------------------------- wide ----
+
+// A dense 16-bit bank at wide decode batches (an expert sees tens to a couple
+// of hundred routes): a work item is all of an expert's routes up to 4·MW,
+// against NT weight rows a block. The block's four waves share the weight
+// and split the routes, wave w taking the item's 16-route blocks w, w + 4,
+// ..., so an item covers its expert's routes at once and the weight is read
+// from memory once; the tiles are narrow enough that blocks run several to
+// a CU and the grid's last round is a small part of it.
+//
+// A stage is KC (64 or 128) elements of a row (128 or 256 bytes on 8 or 16
+// lanes, whole rows a wave read); the weight goes memory → registers (DEPTH stages ahead, hand-issued
+// buffer reads) → the block's LDS (double-buffered, one barrier a stage) →
+// each wave's operand pieces. A wave's activation goes memory → registers
+// (ADEPTH stages ahead) straight into the operand: lane (r16, g) holds route
+// r16's 16 bytes at element 8·(4j + g) of the stage, and its weight piece is
+// the same elements of row r16, so the matrix core's k order agrees. The
+// weight is A and the activation B: a lane's D cells are four neighbouring
+// weight rows of one route, stored as one 8-byte write.
+
+// y[route] = W·act[route / act_div] for routes order[begin .. begin + count)
+// (count ≤ 4·MW) of one expert (planes `w`, n x k, k a multiple of KC),
+// weight rows [tile·NT, +NT). `act_bytes` bounds the activation's buffer.
+template <class T, int MW, int NT, int KC, int DEPTH, int ADEPTH>
+__device__ __forceinline__ void wide_tile(const T* __restrict__ act, unsigned long long act_bytes,
+                                          const i32* __restrict__ order, int begin, int count,
+                                          const T* __restrict__ w, T* __restrict__ out, int act_div, int n, int k,
+                                          int tile) {
+    static_assert(MW % 16 == 0 && MW >= 16 && MW <= 64, "a wave takes one to four 16-route blocks");
+    static_assert(NT == 32 || NT == 64 || NT == 128, "a block takes 32, 64 or 128 weight rows");
+    static_assert(KC == 64 || KC == 128, "a stage of 64 or 128 elements");
+    constexpr int PITCH = 2 * KC + 16;
+    static_assert(DEPTH % ADEPTH == 0 && ADEPTH >= 1 && DEPTH >= 2, "the activation ring divides the weight's");
+    constexpr int WAVES = kGroupThreads / kWave, MB = MW / 16, NB = NT / 16;
+    constexpr int KU = KC / 32;                    // 16-byte pieces a lane a 16-route block
+    constexpr int NW = NT * 2 * KC / (16 * kGroupThreads);  // weight reads a thread a stage
+    constexpr int NA = MB * KU;                        // activation reads a lane a stage
+    constexpr int LPR = 2 * KC / 16;               // lanes a row's stage
+    static_assert(NW >= 1 && NW * 16 * kGroupThreads == NT * 2 * KC, "the stage is whole reads");
+    static_assert((ADEPTH - 1) * (NW + NA) + NW * DEPTH + NA * ADEPTH < 64, "the reads in flight fit the count");
+    __shared__ __align__(16) u8 wl[2][NT * PITCH];
+
+    const int tid = threadIdx.x, l = lane(), r16 = l % 16, g = l / 16;
+    const int wave = __builtin_amdgcn_readfirstlane(tid / kWave);
+    const int row0 = tile * NT;
+    const int stages = k / KC;
+    const int blocks = (count + 15) / 16;
+    // The wave's live 16-route blocks: wave + 4·i for i < live.
+    const int live = __builtin_amdgcn_readfirstlane(blocks > wave ? (blocks - wave + WAVES - 1) / WAVES : 0);
+    const moe_rsrc wr = batch_plane(w, 2ull * n * k);
+    const moe_rsrc ar = batch_plane(act, act_bytes);
+
+    // A read's offset: the weight's flat run of rows (thread tid's read i is
+    // 16 bytes (256·i + tid) of the stage); the activation's route row.
+    u32 wo[NW];
+#pragma unroll
+    for (int i = 0; i < NW; ++i) {
+        const int flat = kGroupThreads * i + tid;
+        wo[i] = static_cast<u32>(min(row0 + flat / LPR, n - 1)) * (2u * k) + flat % LPR * 16;
+    }
+    u32 ao[MB];
+    bool alive[MB];
+#pragma unroll
+    for (int i = 0; i < MB; ++i) {
+        const int m = (wave + WAVES * i) * 16 + r16;
+        alive[i] = m < count;
+        ao[i] = alive[i] ? static_cast<u32>(order[begin + m] / act_div) * (2u * k) + 16 * g : kBatchVoid;
+    }
+
+    i32x4 wv[DEPTH][NW];
+    i32x4 av[ADEPTH][NA];
+    mfma_cd acc[NB][MB];
+#pragma unroll
+    for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+        for (int mb = 0; mb < MB; ++mb) acc[nb][mb] = mfma_zero();
+
+    // Every read is issued, a dead one at the void offset (it lands zeros and
+    // touches nothing), so the count of reads behind each stays fixed.
+    auto issue_w = [&](auto slot, int s) {
+        constexpr int S = decltype(slot)::value;
+        const bool on = s < stages;
+#pragma unroll
+        for (int i = 0; i < NW; ++i) bload_nt(wv[S][i], wr, on ? wo[i] + s * (2 * KC) : kBatchVoid);
+    };
+    auto issue_a = [&](auto slot, int s) {
+        constexpr int S = decltype(slot)::value;
+        const bool on = s < stages;
+#pragma unroll
+        for (int i = 0; i < MB; ++i)
+#pragma unroll
+            for (int j = 0; j < KU; ++j)
+                bload_kept(av[S][i * KU + j], ar,
+                           on && alive[i] ? ao[i] + s * (2 * KC) + 64 * j : kBatchVoid);
+    };
+    auto stage_w = [&](auto slot, int buf) {
+        constexpr int S = decltype(slot)::value;
+#pragma unroll
+        for (int i = 0; i < NW; ++i) {
+            const int flat = kGroupThreads * i + tid;
+            *reinterpret_cast<i32x4*>(wl[buf] + flat / LPR * PITCH + flat % LPR * 16) = wv[S][i];
+        }
+    };
+    auto multiply = [&](auto aslot, int buf) {
+        constexpr int A = decltype(aslot)::value;
+#pragma unroll
+        for (int j = 0; j < KU; ++j) {
+            b128 wp[NB];
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb)
+                wp[nb] = *reinterpret_cast<const b128*>(wl[buf] + (nb * 16 + r16) * PITCH + 16 * (4 * j + g));
+#pragma unroll
+            for (int h = 0; h < 4; h += 2)
+#pragma unroll
+                for (int mb = 0; mb < MB; ++mb) {
+                    if (mb >= live) continue;
+                    const i32x4& x = av[A][mb * KU + j];
+#pragma unroll
+                    for (int nb = 0; nb < NB; ++nb)
+                        acc[nb][mb] = mma16x16<T>(wp[nb].w[h], wp[nb].w[h + 1], static_cast<u32>(x[h]),
+                                                  static_cast<u32>(x[h + 1]), acc[nb][mb]);
+                }
+        }
+    };
+
+    // The prologue issues as the steady state would have: virtual stage t
+    // (t from -DEPTH) issues the weight of t + DEPTH and the activation of
+    // t + ADEPTH.
+    Unroll<DEPTH, 0>::run(
+        [&](auto slot, int t) {
+            constexpr int S = decltype(slot)::value;
+            issue_w(slot, t);
+            if constexpr (S >= DEPTH - ADEPTH) issue_a(Const<(S - (DEPTH - ADEPTH)) % ADEPTH>{}, t - (DEPTH - ADEPTH));
+        },
+        0);
+
+    auto stage_at = [&](auto cur, int s) {
+        constexpr int CU = decltype(cur)::value;
+        constexpr int AC = CU % ADEPTH;
+        if (s >= stages) return;
+        // Stage s's activation, and (older) its weight; younger are the
+        // ADEPTH - 1 stages behind.
+        vm_wait<(ADEPTH - 1) * (NW + NA)>();
+        tie(wv[CU]);
+        tie(av[AC]);
+        stage_w(Const<CU>{}, s & 1);
+        issue_w(Const<CU>{}, s + DEPTH);
+        lds_barrier();
+        multiply(Const<AC>{}, s & 1);
+        issue_a(Const<AC>{}, s + ADEPTH);
+    };
+    for (int s = 0; s < stages; s += DEPTH) Unroll<DEPTH, 0>::run(stage_at, s);
+    vm_wait<0>();
+#pragma unroll
+    for (int r = 0; r < DEPTH; ++r) tie(wv[r]);
+#pragma unroll
+    for (int r = 0; r < ADEPTH; ++r) tie(av[r]);
+
+    // D cell (weight row 4g + t, route r16) of block (nb, mb).
+#pragma unroll
+    for (int mb = 0; mb < MB; ++mb) {
+        if (mb >= live || !alive[mb]) continue;
+        T* o = out + static_cast<long long>(order[begin + (wave + WAVES * mb) * 16 + r16]) * n;
+#pragma unroll
+        for (int nb = 0; nb < NB; ++nb) {
+            const int c = row0 + nb * 16 + 4 * g;
+            T v[4];
+#pragma unroll
+            for (int t = 0; t < 4; ++t) v[t] = from_f32<T>(acc[nb][mb][t]);
+            if (c + 3 < n && n % 4 == 0) {
+                *reinterpret_cast<moe_u2*>(o + c) = __builtin_bit_cast(moe_u2, v);
+            } else {
+#pragma unroll
+                for (int t = 0; t < 4; ++t)
+                    if (c + t < n) o[c + t] = v[t];
+            }
+        }
+    }
 }
 
 // ----------------------------------------------------------- ordering ---

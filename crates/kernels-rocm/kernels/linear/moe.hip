@@ -492,6 +492,27 @@ __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch(
                                                   k, blockIdx.y);
 }
 
+constexpr int kDenseXcds = 8;
+
+// The wide dense leg (wide decode batches): one work item of up to 4·MW
+// routes a block, NT weight rows, KC elements a stage; k a multiple of KC and the activation
+// under 4 GiB. One dimension of 8·per_xcd·tiles blocks: XCD x (block b runs
+// on XCD b mod 8) takes items x, x + 8, ..., their tiles in turn, so the
+// blocks one item's activation feeds run on one XCD at once and find it in
+// its L2.
+template <class T, int MW, int NT, int KC, int DEPTH, int ADEPTH>
+__global__ __launch_bounds__(256) void moe_matmul_select_dense_wide(
+    const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
+    const i32* __restrict__ work, const T* __restrict__ bank, T* __restrict__ out, int act_div, int n, int k,
+    int num_experts, u32 act_bytes, int per_xcd) {
+    const int b = blockIdx.x, slot = b / kDenseXcds;
+    const int at = b % kDenseXcds + kDenseXcds * (slot % per_xcd), tile = slot / per_xcd;
+    GroupItem item;
+    if (!group_item(offsets, work, num_experts, 4 * MW, item, at)) return;
+    const T* w = bank + static_cast<long long>(item.expert) * n * k;
+    wide_tile<T, MW, NT, KC, DEPTH, ADEPTH>(act, act_bytes, order, item.begin, item.count, w, out, act_div, n, k, tile);
+}
+
 // The dense projection as one expert every row routes to: y[m, n] = act[m,
 // k]·wᵀ (SWIGLU: h[m, n] = silu(act·gateᵀ)·(act·upᵀ) from a packed [gate |
 // up] bank of 2·n rows), MT rows of act an item, 64 output rows a block. One
@@ -501,8 +522,6 @@ __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch(
 // reads of the weight (cached reads, past one item) find its L2. A slice is
 // `per` stages; SPLIT lands each slice's f32 partial in `part` ([splits, m,
 // n], 2·n under SWIGLU) for mgemm_finalize to sum in slice order.
-constexpr int kDenseXcds = 8;
-
 template <int MT, bool SWIGLU, bool SPLIT, bool NT>
 __global__ __launch_bounds__(256) void dense_batch_bf16(const bf16* __restrict__ act, const bf16* __restrict__ w,
                                                         bf16* __restrict__ y, float* __restrict__ part, int m, int n,
