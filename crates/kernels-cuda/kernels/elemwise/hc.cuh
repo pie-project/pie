@@ -422,6 +422,53 @@ __global__ void hc_mix(
     }
 }
 
+// `hc_mix` eight columns a thread, read and written 16 bytes at a time: the
+// same sums, element for element.
+template <class T, int BLOCK = 256>
+__global__ void hc_mix_vec8(
+    const T* __restrict__ gates,
+    const T* __restrict__ normed,
+    T* __restrict__ y,
+    int M,
+    int H,
+    const u32* __restrict__ win)
+{
+    const int n = blockIdx.x;
+
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const int tid = threadIdx.x;
+
+    const T* gr = gates + static_cast<long long>(row) * M * H;
+    const T* nr = normed + static_cast<long long>(row) * M * H;
+    T* yr = y + static_cast<long long>(row) * H;
+
+    for (int h0 = tid * 8; h0 < H; h0 += BLOCK * 8) {
+        float acc[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] = 0.f;
+        for (int s = 0; s < M; ++s) {
+            uint4 gw = *reinterpret_cast<const uint4*>(gr + s * H + h0);
+            uint4 nw = *reinterpret_cast<const uint4*>(nr + s * H + h0);
+            const T* g8 = reinterpret_cast<const T*>(&gw);
+            const T* v8 = reinterpret_cast<const T*>(&nw);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float g = Elem<T>::to_f32(g8[i]);
+                const float v = Elem<T>::to_f32(v8[i]);
+                acc[i] += v / (1.f + __expf(-g));
+            }
+        }
+        uint4 out;
+        T* o8 = reinterpret_cast<T*>(&out);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o8[i] = Elem<T>::from_f32(acc[i] / static_cast<float>(M));
+        *reinterpret_cast<uint4*>(yr + h0) = out;
+    }
+}
+
 template <class T, int BLOCK = 256>
 __global__ void hc_inject(
     const T* __restrict__ o,
@@ -456,6 +503,51 @@ __global__ void hc_inject(
         const int h = i - s * H;
         const float v = Elem<T>::to_f32(hr[i]) + g[s] * Elem<T>::to_f32(orow[h]);
         hr[i] = Elem<T>::from_f32(v);
+    }
+}
+
+// `hc_inject` eight columns a thread, 16 bytes at a time: the same sums.
+template <class T, int BLOCK = 256>
+__global__ void hc_inject_vec8(
+    const T* __restrict__ o,
+    const T* __restrict__ gates,
+    T* __restrict__ hyper,
+    int M,
+    int H,
+    const u32* __restrict__ win)
+{
+    const int n = blockIdx.x;
+
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const int tid = threadIdx.x;
+
+    const T* orow = o + static_cast<long long>(row) * H;
+    const T* gr = gates + static_cast<long long>(row) * M;
+    T* hr = hyper + static_cast<long long>(row) * M * H;
+
+    __shared__ float g[MAX_HC_MULT];
+    if (tid < M) {
+        const float logit = Elem<T>::to_f32(gr[tid]) / static_cast<float>(M);
+        g[tid] = 2.f / (1.f + __expf(-logit));
+    }
+    __syncthreads();
+
+    const int total = M * H;
+    for (int i0 = tid * 8; i0 < total; i0 += BLOCK * 8) {
+        const int s = i0 / H;
+        const int h0 = i0 - s * H;
+        uint4 hw = *reinterpret_cast<const uint4*>(hr + i0);
+        const uint4 ow = *reinterpret_cast<const uint4*>(orow + h0);
+        T* h8 = reinterpret_cast<T*>(&hw);
+        const T* o8 = reinterpret_cast<const T*>(&ow);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            h8[i] = Elem<T>::from_f32(Elem<T>::to_f32(h8[i]) + g[s] * Elem<T>::to_f32(o8[i]));
+        }
+        *reinterpret_cast<uint4*>(hr + i0) = hw;
     }
 }
 

@@ -325,6 +325,12 @@ pub fn collapse(
     )
 }
 
+/// Whether rows `width` wide (two-byte elements) at these planes split into
+/// whole aligned 16-byte runs.
+fn whole_runs(width: u32, planes: &[u64]) -> bool {
+    width.is_multiple_of(8) && planes.iter().all(|p| p % 16 == 0)
+}
+
 pub fn mix(
     ctx: &Ctx,
     gates: Tensor,
@@ -345,9 +351,16 @@ pub fn mix(
     );
     debug_assert_eq!(y.rows, normed.rows, "the mix lands one narrow row per row");
     nonzero(OP, "rows", y.rows)?;
+    // Whole 16-byte runs where the width and the three planes allow them:
+    // the same sums, element for element.
+    let entry = if whole_runs(y.width, &[gates.ptr, normed.ptr, y.ptr]) {
+        "hc_mix_vec8"
+    } else {
+        "hc_mix"
+    };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::hc_mix<{t}, 256>")))
+        Fire::at(FILE, symbol(&format!("::pie::elemwise::{entry}<{t}, 256>")))
             .apply(Launch::per_row(y.rows, BLOCK)),
         &[
             gates.arg(),
@@ -379,13 +392,15 @@ pub fn inject(
         "one gate logit per stream per row, one wide row per row"
     );
     nonzero(OP, "rows", o.rows)?;
+    let entry = if whole_runs(o.width, &[o.ptr, hyper.ptr]) {
+        "hc_inject_vec8"
+    } else {
+        "hc_inject"
+    };
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!("::pie::elemwise::hc_inject<{t}, 256>")),
-        )
-        .apply(Launch::per_row(o.rows, BLOCK)),
+        Fire::at(FILE, symbol(&format!("::pie::elemwise::{entry}<{t}, 256>")))
+            .apply(Launch::per_row(o.rows, BLOCK)),
         &[
             o.arg(),
             gates.arg(),
