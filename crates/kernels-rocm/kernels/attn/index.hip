@@ -338,17 +338,18 @@ __device__ __forceinline__ void radix_select(int groups, int k, int* hist, int* 
             } else {
                 group(g, key, ok);
             }
-            // Every bin first, then the adds. A key that does not count
-            // lands in a discard its own low bits pick: spread, and its
-            // read needed whatever it counts.
+            // Every bin first, then the adds. A key that does not count adds
+            // nothing: a short row's padding (every slot past it reads the
+            // same clamped score) and the keys a narrowed prefix leaves out
+            // would all land on a few discard words, and LDS serializes the
+            // atomics on one word, so a 500-key row cost 40 us a pass.
             int bin[PER];
 #pragma unroll
             for (int u = 0; u < PER; ++u)
-                bin[u] = ok[u] && (key[u] & mask) == prefix ? static_cast<int>((key[u] >> sh) & (bins - 1))
-                                                            : BINS + static_cast<int>(key[u] & (kWave - 1));
+                bin[u] = ok[u] && (key[u] & mask) == prefix ? static_cast<int>((key[u] >> sh) & (bins - 1)) : -1;
 #pragma unroll
             for (int u = 0; u < PER; ++u)
-                __hip_atomic_fetch_add(&hist[bin[u]], 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+                if (bin[u] >= 0) __hip_atomic_fetch_add(&hist[bin[u]], 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
         }
         __syncthreads();
         // Thread i owns `per` bins counted from the top.
@@ -521,10 +522,12 @@ __global__ __launch_bounds__(kSelectThreads) void index_topk_select(
     const float* frow = scores + static_cast<long long>(t) * score_stride;
     const int wv = threadIdx.x / kWave, ln = lane();
 
-    const int cand = lists.count != nullptr ? lists.count[t] : 0;
-    if (cand >= topk && cand <= kCandidates && n <= kBitmapKeys) {
-        const i32* cidx = lists.cand_idx + static_cast<long long>(t) * kCandidates;
-        const u32* ckey = lists.cand_key + static_cast<long long>(t) * kCandidates;
+    // A set of keys ranked from a short list: the row's candidates, or the
+    // whole row when it is no longer than a list (a decode's few hundred
+    // pooled keys), which then skips the walk's 32-key-a-thread passes.
+    // `key_at(i)` / `idx_at(i)` give entry i's order key and its key index;
+    // false leaves the row to the walk (its ties overflowed).
+    auto from_list = [&](int cand, auto&& key_at, auto&& idx_at) -> bool {
         u32 thr;
         int need;
         radix_select<kSelectThreads, 4>(
@@ -533,7 +536,7 @@ __global__ __launch_bounds__(kSelectThreads) void index_topk_select(
 #pragma unroll
                 for (int u = 0; u < 4; ++u) {
                     const int i = u * kSelectThreads + static_cast<int>(threadIdx.x);
-                    key[u] = ckey[min(i, cand - 1)];
+                    key[u] = key_at(min(i, cand - 1));
                     ok[u] = i < cand;
                 }
             },
@@ -545,8 +548,8 @@ __global__ __launch_bounds__(kSelectThreads) void index_topk_select(
         if (threadIdx.x == 0) n_ties = 0;
         __syncthreads();
         for (int i = threadIdx.x; i < cand; i += kSelectThreads) {
-            const u32 key = ckey[i];
-            const int j = cidx[i];
+            const u32 key = key_at(i);
+            const int j = idx_at(i);
             if (key > thr) {
                 atomicOr(&bitmap[j / 32], 1u << (j % 32));
             } else if (key == thr) {
@@ -583,8 +586,17 @@ __global__ __launch_bounds__(kSelectThreads) void index_topk_select(
                     srow[at++] = 32 * i + b;
                 }
             }
-            return;
+            return true;
         }
+        return false;
+    };
+    const int cand = lists.count != nullptr ? lists.count[t] : 0;
+    if (cand >= topk && cand <= kCandidates && n <= kBitmapKeys) {
+        const i32* cidx = lists.cand_idx + static_cast<long long>(t) * kCandidates;
+        const u32* ckey = lists.cand_key + static_cast<long long>(t) * kCandidates;
+        if (from_list(cand, [&](int i) { return ckey[i]; }, [&](int i) { return cidx[i]; })) return;
+    } else if (n <= kCandidates) {
+        if (from_list(n, [&](int i) { return order_key(frow[i]); }, [&](int i) { return i; })) return;
     }
 
     // The walk over the whole row: eight four-score reads in flight a
