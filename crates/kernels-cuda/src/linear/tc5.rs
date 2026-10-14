@@ -1421,19 +1421,19 @@ fn output_map(y: u64, m: u32, n: u32) -> Result<[u64; 16], Error> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct Map {
-    ptr: u64,
-    ty: dr::CUtensorMapDataType,
+pub(crate) struct Map {
+    pub(crate) ptr: u64,
+    pub(crate) ty: dr::CUtensorMapDataType,
     /// A zero third extent makes the map 2D.
-    dims: [u32; 3],
-    strides: [u64; 2],
-    boxes: [u32; 3],
-    swizzle: dr::CUtensorMapSwizzle,
+    pub(crate) dims: [u32; 3],
+    pub(crate) strides: [u64; 2],
+    pub(crate) boxes: [u32; 3],
+    pub(crate) swizzle: dr::CUtensorMapSwizzle,
 }
 
 /// Encoding is host-only and cheap; the cache spares the driver call on a
 /// replayed shape.
-fn encode(m: Map) -> Result<[u64; 16], Error> {
+pub(crate) fn encode(m: Map) -> Result<[u64; 16], Error> {
     static MAPS: OnceLock<Mutex<HashMap<Map, [u64; 16]>>> = OnceLock::new();
     let maps = MAPS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(found) = maps

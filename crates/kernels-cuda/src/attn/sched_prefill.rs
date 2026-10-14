@@ -306,6 +306,7 @@ fn layout(
         "batch_prefill_o_indptr",
     )?);
     info.kv_chunk_size_ptr_offset = Some(ints.alloc(4, 1, "batch_prefill_kv_chunk_size_ptr")?);
+    info.live_lanes_offset = Some(ints.alloc(8, 16, "batch_prefill_live_lanes")?);
     if req.enable_cuda_graph {
         info.total_num_rows_offset = Some(ints.alloc(4, 16, "batch_prefill_total_num_rows")?);
     }
@@ -378,6 +379,18 @@ fn stage(
                 .map_err(|_| refuse(op, "the kv chunk width does not fit the device's i32"))?,
         )?,
         "batch_prefill_kv_chunk_size_ptr",
+    )?;
+    staging.put_i32s(
+        at(info.live_lanes_offset),
+        &[
+            narrow(
+                op,
+                "batch_prefill_live_lanes",
+                i64::from(req.live.lane_offset),
+            )?,
+            narrow(op, "batch_prefill_live_lanes", i64::from(req.live.requests))?,
+        ],
+        "batch_prefill_live_lanes",
     )?;
     if req.enable_cuda_graph {
         staging.put_i32(

@@ -28,6 +28,9 @@ pub mod selector;
 
 pub mod ssm;
 
+#[cfg(feature = "cuda")]
+mod tc5_fmha;
+
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -238,6 +241,14 @@ fn fa2_prefill(
     );
 
     lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
+    #[cfg(feature = "cuda")]
+    if lse.is_none()
+        && mask.is_none()
+        && rel.is_none()
+        && tc5_fmha::try_prefill(ctx, op, q, plan, pool, head_dim, sm_scale, o)?
+    {
+        return Ok(());
+    }
     let mut bufs = pool_buffers(q.data.ptr, pool, plan.workspace, o.ptr);
     bufs.qo_indptr = q.indptr.ptr;
     if let Some(lse) = &lse {

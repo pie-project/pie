@@ -98,7 +98,10 @@ const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
 
 /// The units compiled for the arch-specific target, each with the NVRTC
 /// that first spells everything it asks of it (`.block16` is 12.9's).
-const SPECIFIC: &[(&str, Toolchain)] = &[("linear/tc5.cuh", Toolchain::new(12, 9))];
+const SPECIFIC: &[(&str, Toolchain)] = &[
+    ("linear/tc5.cuh", Toolchain::new(12, 9)),
+    ("attn/tc5_fmha.cuh", Toolchain::new(12, 9)),
+];
 
 const fn specific_for(file: &str) -> Option<Toolchain> {
     let mut i = 0;

@@ -575,6 +575,9 @@ pub struct PrefillPlanInfo {
     pub v_offset: Option<u32>,
     pub s_offset: Option<u32>,
     pub block_valid_mask_offset: Option<u32>,
+    /// The fire's live lanes, `[first lane, requests]`, as two i32s: a
+    /// captured launch reads them at replay.
+    pub live_lanes_offset: Option<u32>,
     pub enable_cuda_graph: bool,
     pub split_kv: bool,
 }
