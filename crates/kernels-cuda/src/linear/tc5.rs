@@ -20,8 +20,8 @@ use crate::jit::{ArgValue, Ctx, Fire, Launch, refuse, symbol};
 const OP: &str = "linear.tc5";
 const FILE: &str = "linear/tc5.cuh";
 const THREADS: u32 = 224;
-/// Four transform warps more for a W4A16 weight.
-const THREADS_MIXED: u32 = 352;
+/// Eight transform warps more for a W4A16 weight.
+const THREADS_MIXED: u32 = 480;
 const SMEM_CAP: u32 = 232_448;
 /// The routing entries a grouped launch holds in shared memory.
 const MAX_ROUTES: u32 = 1028;

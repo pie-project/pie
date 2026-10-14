@@ -41,7 +41,7 @@
 //         3  nvfp4 x nvfp4           kind::mxf4nvf4      K 256, ue4m3 scales a 16
 //
 // W4A16 (kMix 1 mxfp4, 2 nvfp4) is kind 0 against a 4-bit weight: its codes
-// land raw by TMA (32 bytes a row a stage), four transform warps (7-10)
+// land raw by TMA (32 bytes a row a stage), eight transform warps (7-14)
 // write them as bf16 -- exact, the block scale (row-major in global memory)
 // multiplied in -- into the swizzled tile TMA would have landed, and the MMA
 // waits on that (xfull) instead of the load.
@@ -116,6 +116,9 @@ __device__ __forceinline__ int ue8m0_exponent(float amax) {
     return m == 0.5f ? e - 1 : e;
 }
 
+// A W4A16 weight's transform warps.
+constexpr unsigned kXWarps = 8;
+
 // Eight e2m1 codes (element i in bits 4i..4i+3) as bf16 times a block
 // scale: the magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6 by byte permutes of their
 // bf16 high and low bytes, the sign or'd in, then one exact bf16 multiply a
@@ -148,6 +151,14 @@ __device__ __forceinline__ uint4 dequant8(unsigned code, unsigned char sb) {
         asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(w[i]) : "r"(w[i]), "r"(scale));
     }
     return make_uint4(w[0], w[1], w[2], w[3]);
+}
+
+// One byte from global memory through the non-coherent path, where the
+// asm stands.
+__device__ __forceinline__ unsigned ld_nc_u8(const unsigned char* p) {
+    unsigned short v;
+    asm volatile("ld.global.nc.u8 %0, [%1];" : "=h"(v) : "l"(p));
+    return v;
 }
 
 // 2^-e for a block exponent: exact, and in range from the 1e-4 floor up.
@@ -207,7 +218,7 @@ __device__ __forceinline__ size_t atom_at(int row, int col, int cols) {
 
 template <int kKind, int kFmtP, int kFmtQ, int kGranP, int kGranQ, int kBN, int kStages,
           int kSwap, int kPair, int kGroup, int kGlu, int kOut, int kMix>
-__global__ __launch_bounds__(kMix != 0 ? 352 : 224, 1) void tc5_gemm(
+__global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void tc5_gemm(
     const __grid_constant__ tc5::TmaMap map_p, const __grid_constant__ tc5::TmaMap map_q,
     const __grid_constant__ tc5::TmaMap map_y, const __grid_constant__ tc5::TmaMap map_sfp,
     const __grid_constant__ tc5::TmaMap map_sfq, bf16* __restrict__ y, int rows_p, int rows_q,
@@ -333,7 +344,7 @@ __global__ __launch_bounds__(kMix != 0 ? 352 : 224, 1) void tc5_gemm(
         for (u32 s = 0; s < kStages; ++s) {
             bar_init(&full[s], 1);
             bar_init(&empty[s], 1);
-            bar_init(&xfull[s], 4);
+            bar_init(&xfull[s], tc5k::kXWarps);
         }
         for (u32 a = 0; a < 2; ++a) {
             bar_init(&tfull[a], 1);
@@ -768,7 +779,7 @@ __global__ __launch_bounds__(kMix != 0 ? 352 : 224, 1) void tc5_gemm(
     } else if (kMixed && warp >= 7) {
         // The transform warps: each stage's raw weight codes as bf16 in the
         // 128-byte-swizzled K-major tile TMA would have landed. A thread
-        // keeps one 16-byte chunk (8 codes) of every 16th row; its scales
+        // keeps one 16-byte chunk (8 codes) of every 32nd row; its scales
         // come row-major from global memory.
         const u32 t = threadIdx.x - 224;
         const u32 c = t % 8;
@@ -794,25 +805,46 @@ __global__ __launch_bounds__(kMix != 0 ? 352 : 224, 1) void tc5_gemm(
                     return x.q_row + ri;
                 }
             };
-            constexpr u32 kIters = kRawRows / 16 > 0 ? kRawRows / 16 : 1;
-            for (int kb = x.kb0; kb < x.kb1; ++kb) {
-                // The rows' scales first, all in flight while the codes land.
+            constexpr u32 kRowStep = 4 * tc5k::kXWarps;
+            constexpr u32 kIters = kRawRows / kRowStep > 0 ? kRawRows / kRowStep : 1;
+            // A stage's scales load a stage ahead, by volatile loads the
+            // compiler keeps where they stand (a plain load would sink
+            // past the barrier wait to its use, an L2 trip a row).
+            auto load_sb = [&](int kb, unsigned (&sb)[kIters]) {
                 const int col = (kb * 64 + static_cast<int>(c) * 8) / kWGran;
-                unsigned char sb[kIters];
 #pragma unroll
                 for (u32 i = 0; i < kIters; ++i) {
-                    const int g = wrow(t / 8 + 16 * i);
-                    sb[i] = g < weight_rows ? __ldg(epi.wsf + static_cast<size_t>(g) * sf_cols + col) : 0;
+                    const int g = wrow(t / 8 + kRowStep * i);
+                    sb[i] = g < weight_rows
+                                ? tc5k::ld_nc_u8(epi.wsf + static_cast<size_t>(g) * sf_cols + col)
+                                : 0u;
+                }
+            };
+            unsigned sb[kIters], next[kIters];
+            load_sb(x.kb0, sb);
+            for (int kb = x.kb0; kb < x.kb1; ++kb) {
+                if (kb + 1 < x.kb1) {
+                    load_sb(kb + 1, next);
                 }
                 bar_wait(&full[s], phase);
                 const unsigned char* raw_s = smem + kOffRaw + s * kRawBytes;
                 unsigned char* tile = kMixP ? smem + s * kTileP * kPT : smem + kOffQ + s * kTileQ;
+                // Every code first: a store to the tile may not pass a load
+                // from the raw slot the compiler cannot tell apart.
+                unsigned code[kIters];
 #pragma unroll
                 for (u32 i = 0; i < kIters; ++i) {
-                    const u32 r = t / 8 + 16 * i;
-                    const unsigned code = *reinterpret_cast<const unsigned*>(raw_s + r * 32 + c * 4);
+                    code[i] = *reinterpret_cast<const unsigned*>(raw_s + (t / 8 + kRowStep * i) * 32 + c * 4);
+                }
+#pragma unroll
+                for (u32 i = 0; i < kIters; ++i) {
+                    const u32 r = t / 8 + kRowStep * i;
                     *reinterpret_cast<uint4*>(tile + r * 128 + ((c ^ (r % 8)) * 16)) =
-                        tc5k::dequant8<kMix>(code, sb[i]);
+                        tc5k::dequant8<kMix>(code[i], static_cast<unsigned char>(sb[i]));
+                }
+#pragma unroll
+                for (u32 i = 0; i < kIters; ++i) {
+                    sb[i] = next[i];
                 }
                 fence_async_shared();
                 __syncwarp();
