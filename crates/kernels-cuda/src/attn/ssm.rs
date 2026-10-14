@@ -740,14 +740,13 @@ fn fused_fits(shape: &Delta, state: &RecurrentPool, qkv: Tensor, y: &Tensor) -> 
             .all(|&at| aligned16(at))
 }
 
-/// Warps per block of the fused step: two, so a wide batch's blocks are few
-/// enough for every SM to hold its register-limited share of warps, and one
-/// when a small batch would otherwise leave SMs idle.
-fn fused_warps(shape: &Delta) -> u32 {
-    const SMS: u64 = 148;
-    let tiles = u64::from(shape.n) * u64::from(shape.v_heads) * u64::from(shape.v_dim / FUSED_BV);
-    if tiles >= 4 * SMS { 2 } else { 1 }
-}
+/// Warps per block of the fused step, and the blocks each SM holds: the
+/// warps are persistent, so the grid is at most what the SMs seat at once.
+const FUSED_WARPS: u32 = 4;
+const FUSED_BLOCKS_PER_SM: u32 = 3;
+/// The bytes one warp's stage of the fused step streams: its state tile, the
+/// q and k rows, its value slice and the two gates.
+const FUSED_STAGE: u32 = 4096 + 512 + 32 + 32;
 
 impl Delta {
     fn decode_fused(
@@ -761,22 +760,23 @@ impl Delta {
     ) -> Result<(), Error> {
         #[allow(clippy::cast_precision_loss)]
         let q_scale = (self.k_dim as f32).sqrt().recip();
-        let warps = fused_warps(&self);
-        let entry = if warps == 2 {
-            "::pie::attn::ssm_gdn_decode_step<2>"
-        } else {
-            "::pie::attn::ssm_gdn_decode_step<1>"
-        };
+        let sms = ctx.multiprocessors().unwrap_or(148);
+        let tiles = self
+            .n
+            .checked_mul(self.v_heads * (self.v_dim / FUSED_BV))
+            .ok_or_else(|| {
+                refuse(
+                    op,
+                    format!("{} rows of value tiles overflow a grid", self.n),
+                )
+            })?;
+        let blocks = tiles.div_ceil(FUSED_WARPS).min(sms * FUSED_BLOCKS_PER_SM);
         ctx.fire(
             op,
-            Fire::at(FILE, entry).apply(Launch::grid(
-                [
-                    (self.v_dim / FUSED_BV).div_ceil(warps),
-                    self.n,
-                    self.v_heads,
-                ],
-                [32 * warps, 1, 1],
-            )),
+            Fire::at(FILE, "::pie::attn::ssm_gdn_decode_step<4>").apply(
+                Launch::grid([blocks, 1, 1], [32 * FUSED_WARPS, 1, 1])
+                    .smem(FUSED_WARPS * 2 * FUSED_STAGE),
+            ),
             &[
                 qkv.arg(),
                 gates.arg(),
@@ -792,6 +792,7 @@ impl Delta {
                 q_scale.arg(),
                 state.write_state.arg(),
                 state.write_state_mask.arg(),
+                stated(op, tiles)?.arg(),
                 ctx.stage(),
             ],
         )
@@ -801,9 +802,8 @@ impl Delta {
 /// The value columns one block of the chunked scan carries: a whole head
 /// once the requests' heads cover every SM, half a head (each half
 /// recomputing its chunk's scores) when fewer would leave SMs idle.
-fn scan_bv(lanes: u32, v_heads: u32) -> u32 {
-    const SMS: u32 = 148;
-    if lanes.saturating_mul(v_heads) >= SMS {
+fn scan_bv(lanes: u32, v_heads: u32, sms: u32) -> u32 {
+    if lanes.saturating_mul(v_heads) >= sms {
         128
     } else {
         64
@@ -886,7 +886,7 @@ fn gated_delta_chunked_fla(
             ctx.stage(),
         ],
     )?;
-    let bv = scan_bv(lanes, v_heads);
+    let bv = scan_bv(lanes, v_heads, ctx.multiprocessors().unwrap_or(148));
     let ldv = bv + 8;
     let stage = 3 * CH * LD + CH * ldv + 2 * CH;
     let scan_smem = (2 * stage + k_dim * ldv + 2 * CH * ldv + CH * LDC) * 2;

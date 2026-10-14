@@ -2112,6 +2112,32 @@ __device__ __forceinline__ float2 gdn_unpack(unsigned bits) {
     return make_float2(__uint_as_float(bits << 16), __uint_as_float(bits & 0xffff0000u));
 }
 
+// 16- and 4-byte `cp.async` copies that zero-fill what they do not read, and
+// their group fences.
+__device__ __forceinline__ void gdn_cp16(void* dst, const void* src, bool live) {
+    const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :
+                 : "r"(d), "l"(src), "r"(live ? 16 : 0)
+                 : "memory");
+}
+
+__device__ __forceinline__ void gdn_cp4(void* dst, const void* src, bool live) {
+    const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
+                 :
+                 : "r"(d), "l"(src), "r"(live ? 4 : 0)
+                 : "memory");
+}
+
+__device__ __forceinline__ void gdn_cp_commit() {
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+__device__ __forceinline__ void gdn_cp_wait_all() {
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+}
+
 // A warp's column sum: the lanes that share a column half hold disjoint key
 // rows of it, so a butterfly over the other four lane bits folds the sum
 // into every one of them.
@@ -2123,14 +2149,20 @@ __device__ __forceinline__ void gdn_rows_sum(float (&x)[8]) {
     }
 }
 
-// One decode step of the gated delta rule. A warp owns a sixteen-wide value
-// tile of one head and keeps its whole `K_d x 16` state tile in registers:
-// lane `l` holds the eight columns `(l & 1) * 8` of key rows `l / 2 + 16 m`,
-// so each state row is one 32-byte sector two lanes read whole. The key and
-// query rows a lane needs are the rows it holds, so the norms, both column
-// sums and the update stay inside the warp; the block's warps share nothing.
-// The host keeps the state, the qkv row and the output 16-byte aligned and
-// the key width a whole number of sixteen-row steps.
+// One decode step of the gated delta rule, streamed. A warp owns a
+// sixteen-wide value tile of one head at a time and keeps the whole
+// `K_d x 16` state tile in registers: lane `l` holds the eight columns
+// `(l & 1) * 8` of key rows `l / 2 + 16 m`, so each state row is one 32-byte
+// sector two lanes read whole, and the key and query rows a lane needs are
+// the rows it holds — the norms, both column sums and the update stay inside
+// the warp. The warps are persistent: each walks every `gridDim.x * W`-th
+// tile, and the next tile's state, q and k rows, value slice and gates
+// stream into the warp's other shared-memory stage while this one is
+// computed, so a warp keeps a tile's bytes in flight all the time. The host
+// keeps the state, the qkv row and the output 16-byte aligned and the key
+// width a whole number of sixteen-row steps no wider than 128.
+constexpr int GDN_STREAM_STAGE = 4096 + 512 + 32 + 32;
+
 template <int W>
 __global__ void __launch_bounds__(W * 32) ssm_gdn_decode_step(
     const bf16* __restrict__ qkv_post,
@@ -2143,134 +2175,185 @@ __global__ void __launch_bounds__(W * 32) ssm_gdn_decode_step(
     float q_scale,
     bool write_state,
     const u8* __restrict__ write_state_mask,
+    int tiles,
     const u32* __restrict__ win)
 {
     constexpr int MR = 8;
     constexpr int VEC = 8;
+    extern __shared__ __align__(16) unsigned char gdn_ring[];
     const int lane = threadIdx.x & 31;
-    const int j0 = (blockIdx.x * W + (threadIdx.x >> 5)) * 16 + (lane & 1) * VEC;
-    if (j0 >= V_d) return;
-    const int r = blockIdx.y;
-    const int h = blockIdx.z;
-
-    if (win != nullptr && r >= static_cast<int>(win[0])) return;
-    const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
-    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
-    const bool fold = folds(write_state, write_state_mask, rl);
-
-    const int h_k = h / (V_h / K_h);
-    const int K_dim = K_h * K_d;
-    const bf16* row = qkv_post + (long long)r_row * conv_dim;
-    const bf16* q = row + (long long)h_k * K_d;
-    const bf16* k = row + K_dim + (long long)h_k * K_d;
-    __nv_bfloat16* cell = state_base
-        + (long long)slot * slot_stride_elems
-        + (long long)h * K_d * V_d + j0;
+    const int warp = threadIdx.x >> 5;
+    unsigned char* ring = gdn_ring + warp * 2 * GDN_STREAM_STAGE;
     const int i0 = lane >> 1;
+    const int vts = V_d / 16;
+    const int group = V_h / K_h;
+    const int K_dim = K_h * K_d;
+    const int live_rows = win != nullptr ? static_cast<int>(win[0]) : 0x7fffffff;
 
-    // Every load is in flight before the first is read: the rows past a
-    // narrower head are whole sixteen-row steps, so the guard is uniform.
-    uint4 raw[MR];
-    #pragma unroll
-    for (int m = 0; m < MR; ++m) {
-        raw[m] = 16 * m < K_d
-            ? *reinterpret_cast<const uint4*>(cell + (long long)(i0 + 16 * m) * V_d)
-            : make_uint4(0u, 0u, 0u, 0u);
-    }
-    float s[MR][VEC];
-    #pragma unroll
-    for (int m = 0; m < MR; ++m) {
-        const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw[m]);
-        #pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            const float2 f = __bfloat1622float2(pairs[u]);
-            s[m][2 * u] = f.x;
-            s[m][2 * u + 1] = f.y;
-        }
-    }
-    float qi[MR];
-    float ki[MR];
-    float qs = 0.f;
-    float ks = 0.f;
-    #pragma unroll
-    for (int m = 0; m < MR; ++m) {
-        const int i = i0 + 16 * m;
-        qi[m] = 16 * m < K_d ? Elem<bf16>::to_f32(q[i]) : 0.f;
-        ki[m] = 16 * m < K_d ? Elem<bf16>::to_f32(k[i]) : 0.f;
-        qs += qi[m] * qi[m];
-        ks += ki[m] * ki[m];
-    }
-    float vv[VEC];
-    {
-        const uint4 vraw = *reinterpret_cast<const uint4*>(row + 2 * K_dim + (long long)h * V_d + j0);
-        const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&vraw);
-        #pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            const float2 f = __bfloat1622float2(pairs[u]);
-            vv[2 * u] = f.x;
-            vv[2 * u + 1] = f.y;
-        }
-    }
-    const float* gate_row = gates + (long long)r_row * 2 * V_h;
-    const float g = __expf(gate_row[h]);
-    const float beta = gate_row[V_h + h];
-
-    // Both lanes of a row pair hold the row, so the warp sums it twice.
-    const float nq = rsqrtf(0.5f * warp_sum(qs) + 1e-6f) * q_scale;
-    const float nk = rsqrtf(0.5f * warp_sum(ks) + 1e-6f);
-    #pragma unroll
-    for (int m = 0; m < MR; ++m) {
-        qi[m] *= nq;
-        ki[m] *= nk;
-    }
-
-    float x[VEC];
-    #pragma unroll
-    for (int u = 0; u < VEC; ++u) x[u] = 0.f;
-    #pragma unroll
-    for (int m = 0; m < MR; ++m) {
-        #pragma unroll
-        for (int u = 0; u < VEC; ++u) x[u] += s[m][u] * g * ki[m];
-    }
-    gdn_rows_sum(x);
-
-    float o[VEC];
-    #pragma unroll
-    for (int u = 0; u < VEC; ++u) {
-        x[u] = (vv[u] - x[u]) * beta;
-        o[u] = 0.f;
-    }
-    #pragma unroll
-    for (int m = 0; m < MR; ++m) {
-        #pragma unroll
-        for (int u = 0; u < VEC; ++u) {
-            const float sg = __bfloat162float(__float2bfloat16(s[m][u] * g));
-            const float sn = sg + ki[m] * x[u];
-            s[m][u] = sn;
-            o[u] += sn * qi[m];
-        }
-    }
-    if (fold) {
+    struct Tile {
+        bool live;
+        bool fold;
+        int r_row;
+        int h;
+        int j0;
+        __nv_bfloat16* cell;
+    };
+    auto plan = [&](int tile) {
+        Tile tl;
+        tl.live = false;
+        if (tile >= tiles) return tl;
+        const int vt = tile % vts;
+        const int rest = tile / vts;
+        tl.h = rest % V_h;
+        const int r = rest / V_h;
+        if (r >= live_rows) return tl;
+        tl.r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
+        const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+        const int slot = slot_ids[rl];
+        if (slot < 0) return tl;
+        tl.live = true;
+        tl.fold = folds(write_state, write_state_mask, rl);
+        tl.j0 = vt * 16 + (lane & 1) * VEC;
+        tl.cell = state_base + (long long)slot * slot_stride_elems
+            + (long long)tl.h * K_d * V_d + tl.j0;
+        return tl;
+    };
+    auto issue = [&](const Tile& tl, int stage) {
+        if (!tl.live) return;
+        unsigned char* st = ring + stage * GDN_STREAM_STAGE;
         #pragma unroll
         for (int m = 0; m < MR; ++m) {
-            if (16 * m >= K_d) break;
-            uint4 packed;
-            __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&packed);
-            #pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                pairs[u] = __floats2bfloat162_rn(s[m][2 * u], s[m][2 * u + 1]);
+            if (16 * m < K_d) {
+                gdn_cp16(st + (m * 32 + lane) * 16, tl.cell + (long long)(i0 + 16 * m) * V_d, true);
             }
-            *reinterpret_cast<uint4*>(cell + (long long)(i0 + 16 * m) * V_d) = packed;
         }
+        const bf16* row = qkv_post + (long long)tl.r_row * conv_dim;
+        const int h_k = tl.h / group;
+        const int c = lane & 15;
+        if (c * 8 < K_d) {
+            const bf16* src = row + (lane < 16 ? 0 : K_dim) + (long long)h_k * K_d + c * 8;
+            gdn_cp16(st + 4096 + (lane >> 4) * 256 + c * 16, src, true);
+        }
+        if (lane < 2) {
+            gdn_cp16(st + 4608 + lane * 16, row + 2 * K_dim + (long long)tl.h * V_d + tl.j0, true);
+            gdn_cp4(st + 4640 + lane * 4, gates + (long long)tl.r_row * 2 * V_h + lane * V_h + tl.h, true);
+        }
+    };
+
+    const int stride = gridDim.x * W;
+    int t = blockIdx.x * W + warp;
+    Tile cur = plan(t);
+    issue(cur, 0);
+    gdn_cp_commit();
+    for (int it = 0; t < tiles; t += stride, ++it) {
+        const Tile nxt = plan(t + stride);
+        issue(nxt, (it + 1) & 1);
+        gdn_cp_commit();
+        asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+        __syncwarp();
+        if (cur.live) {
+            const unsigned char* st = ring + (it & 1) * GDN_STREAM_STAGE;
+            float s[MR][VEC];
+            #pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                const uint4 raw = 16 * m < K_d
+                    ? *reinterpret_cast<const uint4*>(st + (m * 32 + lane) * 16)
+                    : make_uint4(0u, 0u, 0u, 0u);
+                const unsigned* w32 = reinterpret_cast<const unsigned*>(&raw);
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const float2 f = gdn_unpack(w32[u]);
+                    s[m][2 * u] = f.x;
+                    s[m][2 * u + 1] = f.y;
+                }
+            }
+            const bf16* sq = reinterpret_cast<const bf16*>(st + 4096);
+            const bf16* sk = reinterpret_cast<const bf16*>(st + 4096 + 256);
+            float qi[MR];
+            float ki[MR];
+            float qs = 0.f;
+            float ks = 0.f;
+            #pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                const int i = i0 + 16 * m;
+                qi[m] = 16 * m < K_d ? Elem<bf16>::to_f32(sq[i]) : 0.f;
+                ki[m] = 16 * m < K_d ? Elem<bf16>::to_f32(sk[i]) : 0.f;
+                qs += qi[m] * qi[m];
+                ks += ki[m] * ki[m];
+            }
+            float vv[VEC];
+            {
+                const uint4 vraw = *reinterpret_cast<const uint4*>(st + 4608 + (lane & 1) * 16);
+                const unsigned* w32 = reinterpret_cast<const unsigned*>(&vraw);
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const float2 f = gdn_unpack(w32[u]);
+                    vv[2 * u] = f.x;
+                    vv[2 * u + 1] = f.y;
+                }
+            }
+            const float* sgate = reinterpret_cast<const float*>(st + 4640);
+            const float g = __expf(sgate[0]);
+            const float beta = sgate[1];
+
+            // Both lanes of a row pair hold the row, so the warp sums it twice.
+            const float nq = rsqrtf(0.5f * warp_sum(qs) + 1e-6f) * q_scale;
+            const float nk = rsqrtf(0.5f * warp_sum(ks) + 1e-6f);
+            #pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                qi[m] *= nq;
+                ki[m] *= nk;
+            }
+
+            float x[VEC];
+            #pragma unroll
+            for (int u = 0; u < VEC; ++u) x[u] = 0.f;
+            #pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                #pragma unroll
+                for (int u = 0; u < VEC; ++u) x[u] += s[m][u] * g * ki[m];
+            }
+            gdn_rows_sum(x);
+
+            float o[VEC];
+            #pragma unroll
+            for (int u = 0; u < VEC; ++u) {
+                x[u] = (vv[u] - x[u]) * beta;
+                o[u] = 0.f;
+            }
+            #pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                #pragma unroll
+                for (int u = 0; u < VEC; ++u) {
+                    const float sg = __bfloat162float(__float2bfloat16(s[m][u] * g));
+                    const float sn = sg + ki[m] * x[u];
+                    s[m][u] = sn;
+                    o[u] += sn * qi[m];
+                }
+            }
+            if (cur.fold) {
+                #pragma unroll
+                for (int m = 0; m < MR; ++m) {
+                    if (16 * m >= K_d) break;
+                    uint4 packed;
+                    unsigned* w32 = reinterpret_cast<unsigned*>(&packed);
+                    #pragma unroll
+                    for (int u = 0; u < 4; ++u) w32[u] = gdn_pack(s[m][2 * u], s[m][2 * u + 1]);
+                    *reinterpret_cast<uint4*>(cur.cell + (long long)(i0 + 16 * m) * V_d) = packed;
+                }
+            }
+            gdn_rows_sum(o);
+            if (lane < 2) {
+                float4* dst = reinterpret_cast<float4*>(
+                    out + ((long long)cur.r_row * V_h + cur.h) * V_d + cur.j0);
+                dst[0] = make_float4(o[0], o[1], o[2], o[3]);
+                dst[1] = make_float4(o[4], o[5], o[6], o[7]);
+            }
+        }
+        __syncwarp();
+        cur = nxt;
     }
-    gdn_rows_sum(o);
-    if (lane < 2) {
-        float4* dst = reinterpret_cast<float4*>(out + ((long long)r_row * V_h + h) * V_d + j0);
-        dst[0] = make_float4(o[0], o[1], o[2], o[3]);
-        dst[1] = make_float4(o[4], o[5], o[6], o[7]);
-    }
+    gdn_cp_wait_all();
 }
 
 template <typename StateT, int BV, int BK_MAX>
@@ -2859,8 +2942,7 @@ __device__ __forceinline__ int gdn_slot_lane(
 }
 
 // The chunked scan's tensor-core pieces: a bf16 `m16n8k16` with f32
-// accumulators, `ldmatrix` fragment loads (plain and transposed) and
-// 16-byte `cp.async` copies that zero-fill a row past the chunk's end.
+// accumulators and `ldmatrix` fragment loads, plain and transposed.
 __device__ __forceinline__ void gdn_mma(
     float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
     asm volatile(
@@ -2905,30 +2987,6 @@ __device__ __forceinline__ const bf16* gdn_at_b(const bf16* s, int ld, int k0, i
 // the A operand of rows `m0..m0+16` stored as `[k][m]` rows (transposed).
 __device__ __forceinline__ const bf16* gdn_at_at(const bf16* s, int ld, int k0, int m0, int l) {
     return s + (k0 + (l & 7) + ((l >> 4) << 3)) * ld + m0 + (((l >> 3) & 1) << 3);
-}
-
-__device__ __forceinline__ void gdn_cp16(void* dst, const void* src, bool live) {
-    const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-                 :
-                 : "r"(d), "l"(src), "r"(live ? 16 : 0)
-                 : "memory");
-}
-
-__device__ __forceinline__ void gdn_cp4(void* dst, const void* src, bool live) {
-    const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
-                 :
-                 : "r"(d), "l"(src), "r"(live ? 4 : 0)
-                 : "memory");
-}
-
-__device__ __forceinline__ void gdn_cp_commit() {
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
-}
-
-__device__ __forceinline__ void gdn_cp_wait_all() {
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
 }
 
 // A 128-wide bf16 row padded so the eight rows one `ldmatrix` reads land in
