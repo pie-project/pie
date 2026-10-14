@@ -20,6 +20,8 @@ use crate::jit::{ArgValue, Ctx, Fire, Launch, refuse, symbol};
 const OP: &str = "linear.tc5";
 const FILE: &str = "linear/tc5.cuh";
 const THREADS: u32 = 224;
+/// Four transform warps more for a W4A16 weight.
+const THREADS_MIXED: u32 = 352;
 const SMEM_CAP: u32 = 232_448;
 /// The routing entries a grouped launch holds in shared memory.
 const MAX_ROUTES: u32 = 1028;
@@ -34,7 +36,12 @@ pub enum Elem {
     E2m1,
 }
 
-/// A block-scale tensor in the atom layout.
+/// A block-scale tensor in the atom layout -- except a W4A16 weight's (an
+/// e2m1 weight against bf16 activations), which lies row-major,
+/// `[rows][k / gran]`, as checkpoints store it: ue8m0 at gran 32 (mxfp4)
+/// or e4m3 at gran 16 (nvfp4, its per-tensor global left to `alpha` or
+/// `alpha_e`). The kernel dequantizes that weight to bf16 in shared memory,
+/// exactly, and multiplies on kind::f16.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Scales {
     pub ptr: u64,
@@ -183,12 +190,15 @@ enum Kind {
     Fp8,
     Mx,
     Nvf4,
+    /// W4A16: bf16 activations against e2m1 weights the kernel dequantizes
+    /// to bf16 in shared memory (1: ue8m0 a 32, mxfp4; 2: e4m3 a 16, nvfp4).
+    Mixed(u32),
 }
 
 impl Kind {
     const fn code(self) -> u32 {
         match self {
-            Self::Bf16 => 0,
+            Self::Bf16 | Self::Mixed(_) => 0,
             Self::Fp8 => 1,
             Self::Mx => 2,
             Self::Nvf4 => 3,
@@ -197,7 +207,7 @@ impl Kind {
 
     const fn stage_k(self) -> u32 {
         match self {
-            Self::Bf16 => 64,
+            Self::Bf16 | Self::Mixed(_) => 64,
             Self::Nvf4 => 256,
             Self::Fp8 | Self::Mx => 128,
         }
@@ -207,6 +217,8 @@ impl Kind {
         let gran = |o: Operand| o.scales.map(|s| s.gran);
         match (act.elem, w.elem, gran(act), gran(w)) {
             (Elem::Bf16, Elem::Bf16, None, None) => Ok(Self::Bf16),
+            (Elem::Bf16, Elem::E2m1, None, Some(32)) => Ok(Self::Mixed(1)),
+            (Elem::Bf16, Elem::E2m1, None, Some(16)) => Ok(Self::Mixed(2)),
             (Elem::E4m3, Elem::E4m3, None, None) => Ok(Self::Fp8),
             (Elem::E2m1, Elem::E2m1, Some(16), Some(16)) => Ok(Self::Nvf4),
             (Elem::E4m3 | Elem::E2m1, Elem::E4m3 | Elem::E2m1, Some(a), Some(b))
@@ -216,7 +228,8 @@ impl Kind {
             }
             other => Err(format!(
                 "no tcgen05 kind multiplies {other:?} (act elem, w elem, act gran, w gran): \
-                 bf16 x bf16, e4m3 x e4m3, nvfp4 (gran 16) or e4m3/e2m1 with ue8m0 at 32/128"
+                 bf16 x bf16, e4m3 x e4m3, nvfp4 (gran 16), e4m3/e2m1 with ue8m0 at 32/128, \
+                 or bf16 x e2m1 (W4A16, gran 32 or 16)"
             )),
         }
     }
@@ -224,7 +237,7 @@ impl Kind {
     /// The instruction descriptor's format code for one side.
     const fn format(self, elem: Elem) -> u32 {
         match (self, elem) {
-            (Self::Bf16, _) | (Self::Nvf4, _) => 1,
+            (Self::Bf16 | Self::Mixed(_), _) | (Self::Nvf4, _) => 1,
             (_, Elem::E2m1) => 5,
             _ => 0,
         }
@@ -233,7 +246,7 @@ impl Kind {
 
 const fn atoms_k(kind: Kind, gran: u32) -> u32 {
     match kind {
-        Kind::Bf16 | Kind::Fp8 => 0,
+        Kind::Bf16 | Kind::Fp8 | Kind::Mixed(_) => 0,
         Kind::Mx | Kind::Nvf4 => {
             let atoms = kind.stage_k() / gran / 4;
             if atoms == 0 { 1 } else { atoms }
@@ -262,10 +275,17 @@ const fn smem_bytes(
         + bn / if pair { 2 } else { 1 } * 128
         + atoms_k(kind, gran_p) * 512 * pt * p_blocks
         + atoms_k(kind, gran_q) * bn.div_ceil(128) * 512;
-    let out = (stages * stage).div_ceil(1024) * 1024;
+    // A W4A16 weight's raw codes: 32 bytes a row a stage.
+    let raw = match kind {
+        Kind::Mixed(_) if swap => 128 * pt * 32,
+        Kind::Mixed(_) => bn * 32,
+        _ => 0,
+    };
+    let out = (stages * stage).div_ceil(128) * 128;
+    let out = (out + stages * raw).div_ceil(1024) * 1024;
     let bar = out + if swap { 1024 } else { 4 * 2 * 2048 };
     // The routing a grouped launch holds is reserved for every launch.
-    bar + (2 * stages + 16) * 8 + 8 + MAX_ROUTES * 8 + 1024
+    bar + (3 * stages + 16) * 8 + 8 + MAX_ROUTES * 8 + 1024
 }
 
 /// One shape's specialization: which side is the MMA's M, whether two CTAs
@@ -418,6 +438,10 @@ pub struct Epilogue {
     /// A device `f32` a output row multiplying it last (the routed weight
     /// in a down projection's epilogue), or 0.
     pub row_scale: u64,
+    /// A device bf16 bias a weight row (`[n]`, a bank's `[experts][n]`, a
+    /// GLU's gate rows then its up rows), added to the product before the
+    /// GLU, or 0.
+    pub bias: u64,
 }
 
 impl Epilogue {
@@ -425,6 +449,7 @@ impl Epilogue {
         glu: None,
         out: Out::Bf16,
         row_scale: 0,
+        bias: 0,
     };
 
     const fn glu_code(&self) -> u32 {
@@ -467,7 +492,7 @@ impl Epilogue {
         Ok(plan)
     }
 
-    fn args(&self, n: u32, pad: u32) -> EpiArgs {
+    fn args(&self, n: u32, pad: u32, wsf: u64) -> EpiArgs {
         let (limit, galpha) = match self.glu {
             Some(Glu::SwigluClamp { limit }) => (limit, 1.0),
             Some(Glu::SwigluClampAlpha { limit, alpha }) => (limit, alpha),
@@ -491,6 +516,8 @@ impl Epilogue {
             gscale,
             row_scale: self.row_scale,
             pad: i32::try_from(pad).unwrap_or(i32::MAX),
+            bias: self.bias,
+            wsf,
         }
     }
 }
@@ -507,6 +534,8 @@ struct EpiArgs {
     gscale: f32,
     row_scale: u64,
     pad: i32,
+    bias: u64,
+    wsf: u64,
 }
 
 /// `y = epilogue(alpha * act . w^T)` for `[m, n, k]`, `n` the output's
@@ -541,7 +570,7 @@ pub fn gemm_epi_with(
     if m == 0 || n == 0 {
         return Ok(());
     }
-    let plan = epi.fit(plan)?;
+    let plan = unpaired_if_mixed(act, w, epi.fit(plan)?);
     let kind = admit(act, w, n, k, plan)?;
     let glu = epi.glu.is_some();
     if glu && !n.is_multiple_of(128) {
@@ -749,7 +778,7 @@ pub fn grouped_gemm_epi_with(
     if g.experts == 0 || n == 0 {
         return Ok(());
     }
-    let plan = epi.fit(plan)?;
+    let plan = unpaired_if_mixed(act, w, epi.fit(plan)?);
     let glu = epi.glu.is_some();
     if glu && !n.is_multiple_of(128) {
         return Err(refuse(OP, "a GLU's gate rows are whole 128-row blocks"));
@@ -868,6 +897,18 @@ fn admit(act: Operand, w: Operand, n: u32, k: u32, plan: Plan) -> Result<Kind, E
     Ok(kind)
 }
 
+/// A W4A16 weight runs on lone CTAs: its transform warps write each CTA's
+/// own tile, which a pair's MMA would read across both.
+fn unpaired_if_mixed(act: Operand, w: Operand, plan: Plan) -> Plan {
+    match Kind::of(act, w) {
+        Ok(Kind::Mixed(_)) => Plan {
+            pair: false,
+            ..plan
+        },
+        _ => plan,
+    }
+}
+
 /// The kernel's grouping arguments; mode 0 is none.
 #[derive(Clone, Copy)]
 struct Group {
@@ -934,6 +975,12 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let ctas = if plan.pair { 2 } else { 1 };
     let [rows_p, rows_q] = job.rows;
 
+    if matches!(kind, Kind::Mixed(_)) && (plan.pair || !k.is_multiple_of(64)) {
+        return Err(refuse(
+            OP,
+            format!("W4A16 runs on lone CTAs at whole 64s of K; k = {k}, {plan:?}"),
+        ));
+    }
     let map_p = tensor_map(kind, p, job.map_rows[0], k, 128)?;
     let q_box = if halves { 128 } else { plan.bn / ctas };
     let map_q = tensor_map(kind, q, job.map_rows[1], k, q_box)?;
@@ -943,13 +990,20 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
         output_map(y, job.y_rows, n)?
     };
     let atoms = |o: Operand, rows: u32, row_blocks: u32| match o.scales {
-        Some(s) => scale_map(s, rows, k, atoms_k(kind, s.gran), row_blocks),
-        None => Ok([0; 16]),
+        Some(s) if !matches!(kind, Kind::Mixed(_)) => {
+            scale_map(s, rows, k, atoms_k(kind, s.gran), row_blocks)
+        }
+        _ => Ok([0; 16]),
     };
     let map_sfp = atoms(p, job.scale_rows[0], p_blocks)?;
     let q_blocks = if halves { 1 } else { plan.bn.div_ceil(128) };
     let map_sfq = atoms(q, job.scale_rows[1], q_blocks)?;
-    let epi_args = epi.args(n, job.pad);
+    // A W4A16 weight's row-major scales, read by the transform warps.
+    let wsf = match kind {
+        Kind::Mixed(_) => (if plan.swap { p } else { q }).scales.map_or(0, |s| s.ptr),
+        _ => 0,
+    };
+    let epi_args = epi.args(n, job.pad, wsf);
     let sms = ctx.multiprocessors().unwrap_or(148);
     // Too few tiles to fill the SMs split K, each split keeping four K steps
     // or more to pipeline; the splits sum in f32 and one pass rounds.
@@ -972,7 +1026,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let units = job.tiles * splits;
     let grid = ctas * units.min(sms / ctas).max(1);
     let entry = symbol(&format!(
-        "::pie::linear::tc5_gemm<{}, {}, {}, {}, {}, {}, {}, {}, {ctas}, {}, {}, {}>",
+        "::pie::linear::tc5_gemm<{}, {}, {}, {}, {}, {}, {}, {}, {ctas}, {}, {}, {}, {}>",
         kind.code(),
         kind.format(p.elem),
         kind.format(q.elem),
@@ -984,6 +1038,10 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
         group.mode,
         epi.glu_code(),
         epi.out_code(),
+        match kind {
+            Kind::Mixed(mix) => mix,
+            _ => 0,
+        },
     ));
     let map = |m: &[u64; 16]| ArgValue::Bytes {
         ptr: m.as_ptr().cast(),
@@ -1016,9 +1074,20 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     ctx.fire(
         OP,
         Fire::at(FILE, entry).apply(
-            Launch::grid([grid, 1, 1], [THREADS, 1, 1])
-                .smem(smem)
-                .cluster(ctas),
+            Launch::grid(
+                [grid, 1, 1],
+                [
+                    if matches!(kind, Kind::Mixed(_)) {
+                        THREADS_MIXED
+                    } else {
+                        THREADS
+                    },
+                    1,
+                    1,
+                ],
+            )
+            .smem(smem)
+            .cluster(ctas),
         ),
         &values,
     )?;
@@ -1151,6 +1220,24 @@ fn tensor_map(
     use dr::CUtensorMapDataType as T;
 
     // (type, inner extent in the type's elements, row stride in bytes, box width)
+    if let (Kind::Mixed(_), Elem::E2m1) = (kind, o.elem) {
+        // Raw codes, 32 bytes (64 codes) a row a stage, unswizzled.
+        let stride = u64::from(k) / 2;
+        if !stride.is_multiple_of(16) || !o.ptr.is_multiple_of(16) {
+            return Err(refuse(
+                OP,
+                format!("TMA needs 16-byte rows and base; this weight's row is {stride} bytes"),
+            ));
+        }
+        return encode(Map {
+            ptr: o.ptr,
+            ty: T::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            dims: [k / 2, rows, 0],
+            strides: [stride, 0],
+            boxes: [32, box_rows, 1],
+            swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        });
+    }
     let (ty, inner, stride, box_k) = match (kind, o.elem) {
         (_, Elem::Bf16) => (T::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, k, u64::from(k) * 2, 64),
         (_, Elem::E4m3) => (T::CU_TENSOR_MAP_DATA_TYPE_UINT8, k, u64::from(k), 128),

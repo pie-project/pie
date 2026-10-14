@@ -256,6 +256,7 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
                         glu: Some(Glu::Swiglu),
                         out,
                         row_scale: 0,
+                        bias: 0,
                     };
                     let fused = |i: usize| {
                         let g = grouped(i);

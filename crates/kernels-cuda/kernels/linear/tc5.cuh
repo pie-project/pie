@@ -40,6 +40,12 @@
 //         2  {e4m3, e2m1} x {..}     kind::mxf8f6f4      K 128, ue8m0 scales
 //         3  nvfp4 x nvfp4           kind::mxf4nvf4      K 256, ue4m3 scales a 16
 //
+// W4A16 (kMix 1 mxfp4, 2 nvfp4) is kind 0 against a 4-bit weight: its codes
+// land raw by TMA (32 bytes a row a stage), four transform warps (7-10)
+// write them as bf16 -- exact, the block scale (row-major in global memory)
+// multiplied in -- into the swizzled tile TMA would have landed, and the MMA
+// waits on that (xfull) instead of the load.
+//
 // Block scales (kinds 2, 3) arrive in 512-byte atoms: 128 rows x 4 scale
 // columns, byte (r % 32) * 16 + (r / 32) * 4 + c -- the layout cuBLASLt and
 // the NVFP4 checkpoints use, and exactly what tcgen05.cp 32x128b.warpx4
@@ -77,6 +83,8 @@ struct Epi {
     float gscale;            // NVFP4's global scale, 1 / input_scale
     const float* row_scale;  // a weight each output row (routed), or null
     int pad;                 // masked: scale rows an expert; 0 otherwise
+    const bf16* bias;        // a bias each weight row, added before the GLU, or null
+    const unsigned char* wsf;  // a W4A16 weight's scales, row-major [rows][k / gran]
 };
 
 namespace tc5k {
@@ -106,6 +114,40 @@ __device__ __forceinline__ int ue8m0_exponent(float amax) {
     int e;
     const float m = frexpf(fmaxf(amax, 1e-4f) / 448.f, &e);
     return m == 0.5f ? e - 1 : e;
+}
+
+// Eight e2m1 codes (element i in bits 4i..4i+3) as bf16 times a block
+// scale: the magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6 by byte permutes of their
+// bf16 high and low bytes, the sign or'd in, then one exact bf16 multiply a
+// pair (mxfp4: ue8m0 2^(b - 127), 0 standing for 2^-127; nvfp4: an e4m3).
+template <int kMix>
+__device__ __forceinline__ uint4 dequant8(unsigned code, unsigned char sb) {
+    auto four = [](unsigned nib, unsigned& a, unsigned& b) {
+        const unsigned sel = nib & 0x7777u;
+        const unsigned hi = __byte_perm(0x3F3F3F00u, 0x40404040u, sel);
+        const unsigned lo = __byte_perm(0xC0800000u, 0xC0804000u, sel);
+        a = __byte_perm(lo, hi, 0x5140u) | ((nib << 12) & 0x8000u) | ((nib << 24) & 0x80000000u);
+        b = __byte_perm(lo, hi, 0x7362u) | ((nib << 4) & 0x8000u) | ((nib << 16) & 0x80000000u);
+    };
+    unsigned scale;
+    if constexpr (kMix == 1) {
+        scale = sb == 0 ? 0x0040u : static_cast<unsigned>(sb) << 7;
+    } else {
+        const unsigned e = (sb >> 3) & 15u, m = sb & 7u;
+        float f = e == 0 ? static_cast<float>(m) * 0.001953125f
+                         : __int_as_float(static_cast<int>(((e + 120u) << 23) | (m << 20)));
+        if (e == 15 && m == 7) f = __int_as_float(0x7fc00000);
+        scale = (__float_as_uint(f) >> 16) | ((sb & 0x80u) << 8);
+    }
+    scale |= scale << 16;
+    unsigned w[4];
+    four(code, w[0], w[1]);
+    four(code >> 16, w[2], w[3]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(w[i]) : "r"(w[i]), "r"(scale));
+    }
+    return make_uint4(w[0], w[1], w[2], w[3]);
 }
 
 // 2^-e for a block exponent: exact, and in range from the 1e-4 floor up.
@@ -164,8 +206,8 @@ __device__ __forceinline__ size_t atom_at(int row, int col, int cols) {
 }  // namespace tc5k
 
 template <int kKind, int kFmtP, int kFmtQ, int kGranP, int kGranQ, int kBN, int kStages,
-          int kSwap, int kPair, int kGroup, int kGlu, int kOut>
-__global__ __launch_bounds__(224, 1) void tc5_gemm(
+          int kSwap, int kPair, int kGroup, int kGlu, int kOut, int kMix>
+__global__ __launch_bounds__(kMix != 0 ? 352 : 224, 1) void tc5_gemm(
     const __grid_constant__ tc5::TmaMap map_p, const __grid_constant__ tc5::TmaMap map_q,
     const __grid_constant__ tc5::TmaMap map_y, const __grid_constant__ tc5::TmaMap map_sfp,
     const __grid_constant__ tc5::TmaMap map_sfq, bf16* __restrict__ y, int rows_p, int rows_q,
@@ -180,6 +222,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                   "contiguous groups run unswapped, masked swapped on lone CTAs");
     static_assert(kGlu == 0 || kSwap || kBN == 256, "an unswapped GLU tile is gate 128 | up 128");
     static_assert(kGlu == 0 || !kSwap || kBN <= 128, "a swapped GLU tile holds two accumulators");
+    static_assert(kMix == 0 || (kKind == 0 && kPair == 1), "W4A16 runs kind::f16 on lone CTAs");
     static_assert(kOut == 0 || kGlu != 0, "a quantized store follows a GLU");
 
     // A GLU tile reads the weight's gate rows and the matching up rows `inter`
@@ -210,7 +253,16 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     constexpr u32 kRowAtomsP = kGroup == 1 && kScaled ? 2 : 1;
     constexpr u32 kSfP = kAtomsP * 512 * kPT * kRowAtomsP;  // this CTA's P rows (each P tile's)
     constexpr u32 kSfQ = kAtomsQ * kRowAtomsQ * 512;  // all of Q's rows, in each CTA
-    constexpr u32 kTx = kPair * (kTxP * kPT + kTxQ + kSfP + kSfQ);
+    // W4A16 (kMix 1 mxfp4: e2m1 under a ue8m0 a 32; 2 nvfp4: under an e4m3
+    // a 16): the weight's codes land raw, 32 bytes a row a stage, and four
+    // transform warps write them as bf16 into the tile the MMA reads.
+    constexpr bool kMixed = kMix != 0;
+    constexpr bool kMixP = kMixed && kSwap;
+    constexpr bool kMixQ = kMixed && !kSwap;
+    constexpr u32 kRawRows = kMixP ? 128 * kPT : kMixQ ? kQRows : 0;
+    constexpr u32 kRawBytes = kRawRows * 32;
+    constexpr u32 kTx = kPair * ((kMixP ? kRawBytes : kTxP * kPT) + (kMixQ ? kRawBytes : kTxQ) +
+                                 kSfP + kSfQ);
     constexpr u32 kSfCols = 4 * kAtomsP * kPT * kRowAtomsP + 4 * kAtomsQ * kRowAtomsQ;
     // Scales go to TMEM from their own warp, up to four K steps ahead in
     // their own slots: a copy in the MMA thread's stream would hold every
@@ -233,7 +285,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     constexpr u32 kOffSfP = kOffQ + kStages * kTileQ;
     constexpr u32 kOffSfQ = kOffSfP + kStages * kSfP;
     // Each epilogue warp stages two 32 x 32 bf16 boxes for the TMA store.
-    constexpr u32 kOffOut = (kOffSfQ + kStages * kSfQ + 1023) / 1024 * 1024;
+    constexpr u32 kOffRaw = (kOffSfQ + kStages * kSfQ + 127) / 128 * 128;
+    constexpr u32 kOffOut = (kOffRaw + kStages * kRawBytes + 1023) / 1024 * 1024;
     // A swapped GLU quantizing over the P rows reduces its amax through
     // shared memory instead.
     constexpr u32 kOutBytes = kSwap ? (kOut != 0 ? 1024 : 0) : 4 * 2 * 2048;
@@ -241,7 +294,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     // A grouped launch holds the routing (offsets or counts) in shared memory:
     // every role reads it once a unit, empty units most.
     constexpr u32 kGroupInts = kGroup == 0 ? 0 : 2 * 1028;
-    constexpr u32 kBytes = kOffBar + (2 * kStages + 16) * 8 + 8 + kGroupInts * 4;
+    constexpr u32 kBytes = kOffBar + (3 * kStages + 16) * 8 + 8 + kGroupInts * 4;
 
     extern __shared__ unsigned char smem_raw[];
     const u32 raw = smem_addr(smem_raw);
@@ -249,7 +302,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
 
     u64* full = reinterpret_cast<u64*>(smem + kOffBar);
     u64* empty = full + kStages;
-    u64* tfull = empty + kStages;
+    u64* xfull = empty + kStages;  // a W4A16 stage's weight tile written
+    u64* tfull = xfull + kStages;
     u64* tempty = tfull + 2;
     u64* tover = tempty + 2;
     u64* sf_ready = tover + 2;
@@ -279,6 +333,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         for (u32 s = 0; s < kStages; ++s) {
             bar_init(&full[s], 1);
             bar_init(&empty[s], 1);
+            bar_init(&xfull[s], 4);
         }
         for (u32 a = 0; a < 2; ++a) {
             bar_init(&tfull[a], 1);
@@ -517,10 +572,24 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     };
                     // A GLU's second P tile, or the up half of its Q tile,
                     // reads the rows `inter` past the gate's.
+                    // A W4A16 weight's codes land raw, 32 bytes a row.
+                    unsigned char* raw_s = smem + kOffRaw + s * kRawBytes;
+                    auto load_raw = [&](void* dst, const TmaMap* map, int row) {
+                        tma_load_2d(dst, &full[s], map, kb * 32, row);
+                    };
                     for (u32 h = 0; h < kPT; ++h) {
-                        load2(tile_p + h * kTileP, &map_p, p0 + static_cast<int>(h) * inter);
+                        if constexpr (kMixP) {
+                            load_raw(raw_s + h * 128 * 32, &map_p, p0 + static_cast<int>(h) * inter);
+                        } else {
+                            load2(tile_p + h * kTileP, &map_p, p0 + static_cast<int>(h) * inter);
+                        }
                     }
-                    if constexpr (kFused && !kSwap && kPair == 1) {
+                    if constexpr (kMixQ && kFused) {
+                        load_raw(raw_s, &map_q, x.q_row);
+                        load_raw(raw_s + 128 * 32, &map_q, x.q_row + inter);
+                    } else if constexpr (kMixQ) {
+                        load_raw(raw_s, &map_q, q0);
+                    } else if constexpr (kFused && !kSwap && kPair == 1) {
                         load2(tile_q, &map_q, x.q_row);
                         load2(tile_q + 128 * 128, &map_q, x.q_row + inter);
                     } else if constexpr (kFused && !kSwap) {
@@ -623,7 +692,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                 const u32 d0 = tmem + acc * kStride;
                 const u32 quarter_q = x.quarter;
                 for (int kb = kb0; kb < x.kb1; ++kb, ++step) {
-                    bar_wait(&full[s], phase);
+                    // A W4A16 stage is ready once its weight tile is written.
+                    bar_wait(kMixed ? &xfull[s] : &full[s], phase);
                     const u32 slot = step % kSfSlots;
                     if constexpr (kScaled) {
                         bar_wait(&sf_ready[slot], (step / kSfSlots) & 1);
@@ -695,6 +765,60 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                 bar_wait(&tempty[last % 2], (last / 2) & 1);
             }
         }
+    } else if (kMixed && warp >= 7) {
+        // The transform warps: each stage's raw weight codes as bf16 in the
+        // 128-byte-swizzled K-major tile TMA would have landed. A thread
+        // keeps one 16-byte chunk (8 codes) of every 16th row; its scales
+        // come row-major from global memory.
+        const u32 t = threadIdx.x - 224;
+        const u32 c = t % 8;
+        constexpr int kWGran = kMix == 1 ? 32 : 16;
+        // The weight's rows: a dense GLU's extent is its output columns,
+        // its up rows past them; a bank's extent is all of its rows.
+        const int weight_rows = (kMixP ? rows_p : rows_q) * (kFused && kGroup == 0 ? 2 : 1);
+        const int sf_cols = k / kWGran;
+        u32 s = 0, phase = 0;
+        for (int u = first_tile; u < tiles; u += tile_step) {
+            Unit x;
+            if (!unit_of(u, x)) {
+                continue;
+            }
+            // A raw row's weight row: a GLU's up rows `inter` past its gate's.
+            auto wrow = [&](u32 r) -> int {
+                const int ri = static_cast<int>(r);
+                if constexpr (kMixP) {
+                    return x.p_row + ri / 128 * inter + ri % 128;
+                } else if constexpr (kFused) {
+                    return x.q_row + (ri >= 128 ? inter + ri - 128 : ri);
+                } else {
+                    return x.q_row + ri;
+                }
+            };
+            for (int kb = x.kb0; kb < x.kb1; ++kb) {
+                bar_wait(&full[s], phase);
+                const unsigned char* raw_s = smem + kOffRaw + s * kRawBytes;
+                unsigned char* tile = kMixP ? smem + s * kTileP * kPT : smem + kOffQ + s * kTileQ;
+                const int col = (kb * 64 + static_cast<int>(c) * 8) / kWGran;
+#pragma unroll 4
+                for (u32 r = t / 8; r < kRawRows; r += 16) {
+                    const unsigned code = *reinterpret_cast<const unsigned*>(raw_s + r * 32 + c * 4);
+                    const int g = wrow(r);
+                    const unsigned char sb =
+                        g < weight_rows ? __ldg(epi.wsf + static_cast<size_t>(g) * sf_cols + col) : 0;
+                    *reinterpret_cast<uint4*>(tile + r * 128 + ((c ^ (r % 8)) * 16)) =
+                        tc5k::dequant8<kMix>(code, sb);
+                }
+                fence_async_shared();
+                __syncwarp();
+                if (lane == 0) {
+                    bar_arrive(&xfull[s]);
+                }
+                if (++s == kStages) {
+                    s = 0;
+                    phase ^= 1;
+                }
+            }
+        }
     } else {
         int it = 0;
         const u32 row = warp * 32 + lane;
@@ -728,18 +852,37 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     tmem_ld32(taddr + kUp + c0, u);
                 }
             };
+            // A bias each weight row (gate, and up `inter` on), added before
+            // the GLU: a swapped thread's row holds one, an unswapped chunk a
+            // column each. Of a tile's K splits, the first adds it.
+            const bool biased = epi.bias != nullptr && x.kb0 == 0;  // one split adds it
+            const float bias_row = kSwap && biased && live ? bf16_to_f32(epi.bias[x.p_row + i]) : 0.f;
+            const float bias_row_up =
+                kSwap && kFused && biased && live ? bf16_to_f32(epi.bias[x.p_row + inter + i]) : 0.f;
+            auto bias_col = [&](u32 c0, int j, bool up) -> float {
+                if (!biased) {
+                    return 0.f;
+                }
+                if constexpr (kSwap) {
+                    return up ? bias_row_up : bias_row;
+                } else {
+                    const int c = static_cast<int>(c0) + j;
+                    return c < x.lim_q ? bf16_to_f32(epi.bias[x.q_row + (up ? inter : 0) + c]) : 0.f;
+                }
+            };
             auto finish = [&](u32 c0, const u32 (&v)[32], const u32 (&u)[32], float (&h)[32]) {
                 if constexpr (kFused) {
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
-                        h[j] = tc5k::glu<kGlu>(__uint_as_float(v[j]) * alpha,
-                                               __uint_as_float(u[j]) * alpha, epi.limit,
-                                               epi.galpha);
+                        h[j] = tc5k::glu<kGlu>(
+                            __uint_as_float(v[j]) * alpha + bias_col(c0, j, false),
+                            __uint_as_float(u[j]) * alpha + bias_col(c0, j, true), epi.limit,
+                            epi.galpha);
                     }
                 } else {
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
-                        h[j] = __uint_as_float(v[j]) * alpha;
+                        h[j] = __uint_as_float(v[j]) * alpha + bias_col(c0, j, false);
                     }
                 }
 #pragma unroll

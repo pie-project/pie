@@ -239,6 +239,7 @@ fn dense(
         glu: f,
         out: t.out,
         row_scale,
+        bias: 0,
     };
     let plan = Plan {
         swap,
@@ -371,6 +372,7 @@ fn grouped(
         glu: Some(f),
         out: t.out,
         row_scale,
+        bias: 0,
     };
     let plan = Plan {
         swap: masked,
