@@ -86,7 +86,9 @@ impl Sampling {
 /// shape; their values ride in channels, so requests that differ only in
 /// value share one program and fly as one batch.
 struct Knobs {
-    temperature: Option<Tensor>,
+    /// A program constant: a channel-fed divisor costs the fused sampler
+    /// ~20% of a decode step, more than mixed temperatures cost by splitting.
+    temperature: Option<f32>,
     top_p: Option<Tensor>,
     top_k: Option<Tensor>,
     repetition: Option<Tensor>,
@@ -96,7 +98,7 @@ struct Knobs {
 
 /// The channels a pass's knobs are seeded in.
 struct KnobChannels {
-    temperature: Option<Channel>,
+    temperature: Option<f32>,
     top_p: Option<Channel>,
     top_k: Option<Channel>,
     repetition: Option<Channel>,
@@ -112,7 +114,7 @@ impl KnobChannels {
         let sampled = s.temperature > 0.0;
         let penalized = s.penalized();
         Self {
-            temperature: f(sampled, s.temperature.max(1e-4), "temperature"),
+            temperature: sampled.then(|| s.temperature.max(1e-4)),
             top_p: f(sampled && s.top_p < 1.0, s.top_p, "top_p"),
             top_k: (sampled && s.top_k > 0)
                 .then(|| Channel::from([s.top_k]).named(&format!("top_k{tag}"))),
@@ -126,7 +128,7 @@ impl KnobChannels {
     fn read(&self) -> Knobs {
         let t = |c: &Option<Channel>| c.as_ref().map(|c| reshape(c.read(), []));
         Knobs {
-            temperature: t(&self.temperature),
+            temperature: self.temperature,
             top_p: t(&self.top_p),
             top_k: t(&self.top_k),
             repetition: t(&self.repetition),
@@ -168,10 +170,10 @@ fn sample(
     if let Some(mask) = mask {
         logits = mask_apply(&logits, mask);
     }
-    let token = match &k.temperature {
+    let token = match k.temperature {
         None => reduce_argmax(&logits),
         Some(temperature) => {
-            let scaled = &logits / broadcast(temperature, [vocab]);
+            let scaled = &logits / temperature;
             let mut keep: Option<Tensor> = None;
             if k.top_k.is_some() || k.top_p.is_some() {
                 let probs = softmax(&scaled);
