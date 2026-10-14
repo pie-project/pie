@@ -126,7 +126,7 @@ __device__ __forceinline__ int ue8m0_exponent(float amax) {
 
 // A W4A16 weight's transform warps.
 constexpr unsigned kXWarps = 8;
-constexpr unsigned kXGroups = 2;
+constexpr unsigned kXGroupsMax = 2;
 
 // Eight e2m1 codes (element i in bits 4i..4i+3) as bf16 times a block
 // scale: the magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6 by byte permutes of their
@@ -268,12 +268,15 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     static_assert(kBN % 32 == 0 && kBN >= 32 && kBN <= 256, "the Q tile is 32..256 rows");
     static_assert(kKind >= 0 && kKind <= 3, "four kinds");
     static_assert(kPair == 1 || (kPair == 2 && !kSwap && kBN >= 64), "a pair splits a wide Q");
-    static_assert(kGroup == 0 || ((kGroup == 1) == !kSwap && (kGroup == 1 || kPair == 1)),
-                  "contiguous groups run unswapped, masked swapped on lone CTAs");
+    static_assert(kGroup == 0 || (((kGroup == 1) == !kSwap || (kGroup == 1 && kMix != 0)) &&
+                                  (kGroup == 1 || kPair == 1)),
+                  "contiguous groups run unswapped (a W4A16 one swapped too), masked swapped on "
+                  "lone CTAs");
     static_assert(kGlu == 0 || kSwap || kBN == 256, "an unswapped GLU tile is gate 128 | up 128");
     static_assert(kGlu == 0 || !kSwap || kBN <= 128, "a swapped GLU tile holds two accumulators");
     static_assert(kMix == 0 || (kKind == 0 && kPair == 1), "W4A16 runs kind::f16 on lone CTAs");
-    static_assert(kMix == 0 || kStages % 2 == 0, "W4A16's transform groups own alternate slots");
+    static_assert(kMix == 0 || !kSwap || kStages % 2 == 0,
+                  "a swapped W4A16 weight's transform groups own alternate slots");
     static_assert(kOut == 0 || kGlu != 0, "a quantized store follows a GLU");
 
     // A GLU tile reads the weight's gate rows and the matching up rows `inter`
@@ -308,8 +311,12 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     // a 16): the weight's codes land raw, 32 bytes a row a stage, and four
     // transform warps write them as bf16 into the tile the MMA reads.
     constexpr bool kMixed = kMix != 0;
+    // Two groups of transform warps take turns a stage where the ring is
+    // even (each group's slots its own); an odd ring (the Q side's widest
+    // tiles) keeps one group of all eight.
     constexpr bool kMixP = kMixed && kSwap;
     constexpr bool kMixQ = kMixed && !kSwap;
+    constexpr u32 kXGroups = kStages % 2 == 0 ? tc5k::kXGroupsMax : 1;
     constexpr u32 kRawRows = kMixP ? 128 * kPT : kMixQ ? kQRows : 0;
     constexpr u32 kRawBytes = kRawRows * 32;
     constexpr u32 kTx = kPair * ((kMixP ? kRawBytes : kTxP * kPT) + (kMixQ ? kRawBytes : kTxQ) +
@@ -326,7 +333,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     // scale slots would sit.
     constexpr u32 kASlots = kStages;
     constexpr u32 kSfAll = kScaled ? kSfSlots * kSfCols : kMixP ? kASlots * kPT * 32 : 0;
-    static_assert(!kMixP || kASlots % tc5k::kXGroups == 0, "W4A16's groups own alternate A slots");
+    static_assert(!kMixP || kASlots % kXGroups == 0, "W4A16's groups own alternate A slots");
     // Two accumulator stages always. When they and the scale slots overrun
     // TMEM the stages share kOv columns -- stage 0's tail is stage 1's head --
     // and a tile's first MMA waits until the previous tile's epilogue has
@@ -390,7 +397,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         for (u32 s = 0; s < kStages; ++s) {
             bar_init(&full[s], 1);
             bar_init(&empty[s], 1);
-            bar_init(&xfull[s], tc5k::kXWarps / tc5k::kXGroups);
+            bar_init(&xfull[s], tc5k::kXWarps / kXGroups);
         }
         for (u32 a = 0; a < 2; ++a) {
             bar_init(&tfull[a], 1);
@@ -424,7 +431,11 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             const int hi = min(experts, lo + per);
             // An expert's tiles: its rows' 128-row tiles by the Q tiles.
             auto tiles_of = [&](int e) {
-                if constexpr (kGroup == 1) {
+                if constexpr (kGroup == 1 && kSwap) {
+                    // Swapped (W4A16): its rows' kBN-row Q tiles by its
+                    // weight's 128-row P tiles.
+                    return (routes[e + 1] - routes[e] + kBN - 1) / kBN * masked_p;
+                } else if constexpr (kGroup == 1) {
                     return (routes[e + 1] - routes[e] + kM - 1) / kM * cont_q;
                 } else {
                     return (min(routes[e], m_max) + kBN - 1) / kBN * masked_p;
@@ -508,7 +519,12 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             }
             e = lo;
             const int r = t - starts[e];
-            if constexpr (kGroup == 1) {
+            if constexpr (kGroup == 1 && kSwap) {
+                // An expert's row tiles walk fastest, sharing its weight tile.
+                const int q_tiles = (routes[e + 1] - routes[e] + kBN - 1) / kBN;
+                pt = r / q_tiles;
+                qt = r - pt * q_tiles;
+            } else if constexpr (kGroup == 1) {
                 // An expert's row tiles walk fastest, sharing its weight tile.
                 const int m_tiles = (routes[e + 1] - routes[e] + static_cast<int>(kM) - 1) / static_cast<int>(kM);
                 qt = r / m_tiles;
@@ -537,6 +553,16 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             x.out_q = x.q_row;
             x.lim_p = rows_p - x.p_row;
             x.lim_q = rows_q - x.q_row;
+        } else if constexpr (kGroup == 1 && kSwap) {
+            // Swapped (W4A16): the expert's weight rows on P, its routed rows
+            // from its offset on Q.
+            x.p_row = e * n_per + pt * 128;
+            x.q_row = routes[e] + qt * kBN;
+            x.p_block = x.p_row / 128;
+            x.out_p = pt * 128;
+            x.out_q = x.q_row;
+            x.lim_p = span - pt * 128;
+            x.lim_q = routes[e + 1] - x.q_row;
         } else if constexpr (kGroup == 1) {
             // A tile starts at its expert's rows, either 64-row half (the
             // MMA faults on A-side scales at an odd quarter): its
@@ -837,7 +863,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         // is one group's and every barrier a group waits on, it waits on in
         // order (a parity wait a round ahead would pass on the round
         // before).
-        constexpr u32 kGroupWarps = tc5k::kXWarps / tc5k::kXGroups;
+        constexpr u32 kGroupWarps = tc5k::kXWarps / kXGroups;
         const u32 xgroup = (warp - 7) / kGroupWarps;
         const u32 t = (threadIdx.x - 224) % (32 * kGroupWarps);
         const u32 c = t % 8;
@@ -899,7 +925,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 // An affine row's groups a stage: two of 32, else one.
                 constexpr int kGroups = kWGran < 64 ? 2 : 1;
                 for (int kb = x.kb0; kb < x.kb1; ++kb, ++step) {
-                    if (step % tc5k::kXGroups != xgroup) {
+                    if (step % kXGroups != xgroup) {
                         if (++s == kStages) {
                             s = 0;
                             phase ^= 1;
@@ -978,7 +1004,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 continue;
             }
             for (int kb = x.kb0; kb < x.kb1; ++kb, ++step) {
-                if (step % tc5k::kXGroups != xgroup) {
+                if (step % kXGroups != xgroup) {
                     if (++s == kStages) {
                         s = 0;
                         phase ^= 1;

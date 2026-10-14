@@ -405,9 +405,10 @@ impl Plan {
             let acc = self.bn * pt;
             stages = stages.min((512 - acc) / (pt * 32)).max(2);
         }
-        // A W4A16 weight's two transform groups take turns a stage: an even
-        // ring gives each its own slots, so each waits on them in order.
-        if matches!(kind, Kind::Mixed(_)) && stages % 2 == 1 {
+        // A swapped W4A16 weight's two transform groups take turns a stage:
+        // an even ring gives each its own slots, so each waits on them in
+        // order. (Unswapped, an odd ring keeps one group.)
+        if matches!(kind, Kind::Mixed(_)) && self.swap && stages % 2 == 1 {
             stages -= 1;
         }
         self.stages = stages;
@@ -631,7 +632,7 @@ pub fn gemm_epi_with(
     if m == 0 || n == 0 {
         return Ok(());
     }
-    let plan = unpaired_if_mixed(act, w, epi.fit(plan)?);
+    let plan = unpaired_if_mixed(act, w, epi.fit(swapped_if_mixed(act, w, plan, m >= 256))?);
     let kind = admit(act, w, n, k, plan)?;
     let glu = epi.glu.is_some();
     if glu && !n.is_multiple_of(128) && !glu_any_rows(act, w, epi) {
@@ -842,7 +843,16 @@ pub fn grouped_gemm_epi_with(
     if g.experts == 0 || n == 0 {
         return Ok(());
     }
-    let plan = unpaired_if_mixed(act, w, epi.fit(plan)?);
+    let plan = unpaired_if_mixed(
+        act,
+        w,
+        epi.fit(match g.groups {
+            Groups::Contiguous { rows, .. } => {
+                swapped_if_mixed(act, w, plan, epi.glu.is_some() || rows >= 16_384)
+            }
+            Groups::Masked { .. } => plan,
+        })?,
+    );
     let glu = epi.glu.is_some();
     if glu && !n.is_multiple_of(128) && !glu_any_rows(act, w, epi) {
         return Err(refuse(
@@ -871,22 +881,36 @@ pub fn grouped_gemm_epi_with(
     let q_step = if glu { 128 } else { plan.bn };
     let job = match g.groups {
         Groups::Contiguous { offsets, rows } => {
-            if plan.swap {
-                return Err(refuse(OP, "a contiguous group runs unswapped"));
+            let swap = plan.swap;
+            if swap && !matches!(kind, Kind::Mixed(_)) {
+                return Err(refuse(
+                    OP,
+                    "a contiguous group runs unswapped (a W4A16 one swapped too)",
+                ));
             }
             if rows == 0 {
                 return Ok(());
             }
+            // Swapped (W4A16): the bank on P, the rows on Q.
+            let (p, q, extents) = if swap {
+                (w, act, [bank, rows])
+            } else {
+                (act, w, [rows, bank])
+            };
             Job {
                 kind,
                 plan,
-                p: act,
-                q: w,
-                rows: [rows, bank],
-                map_rows: [rows, bank],
-                scale_rows: [rows, bank],
+                p,
+                q,
+                rows: extents,
+                map_rows: extents,
+                scale_rows: extents,
                 y_rows: rows,
-                tiles: rows.div_ceil(if plan.pair { 256 } else { 128 }) * n.div_ceil(q_step),
+                tiles: if swap {
+                    (rows.div_ceil(plan.bn) + g.experts) * n.div_ceil(128)
+                } else {
+                    rows.div_ceil(if plan.pair { 256 } else { 128 }) * n.div_ceil(q_step)
+                },
                 group: Group {
                     mode: 1,
                     ptr: offsets,
@@ -977,6 +1001,26 @@ fn unpaired_if_mixed(act: Operand, w: Operand, plan: Plan) -> Plan {
     match Kind::of(act, w) {
         Ok(Kind::Mixed(_)) => Plan {
             pair: false,
+            ..plan
+        },
+        _ => plan,
+    }
+}
+
+/// A wide W4A16 product runs swapped: its weight on the A side lands in
+/// TMEM, and a stage dequantizes 128 weight rows against up to 256 rows of
+/// activations, half the elements a GEMM step that the unswapped tile (256
+/// weight rows against 128) dequantizes. Measured on gpt-oss's legs: a
+/// contiguous select gains from 32768 routes (down 1308 -> 996 us) and with
+/// a GLU at any width (128 tokens: 894 -> 835 us), loses below (1024 tokens,
+/// down: 537 -> 588 us); a dense 4096 x 4096 gains from 1024 rows (88 ->
+/// 55 us) and loses at 128 (26 -> 32 us).
+fn swapped_if_mixed(act: Operand, w: Operand, plan: Plan, wide: bool) -> Plan {
+    match Kind::of(act, w) {
+        Ok(Kind::Mixed(_)) if !plan.swap && wide => Plan {
+            swap: true,
+            pair: false,
+            bn: 256,
             ..plan
         },
         _ => plan,
