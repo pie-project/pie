@@ -655,7 +655,7 @@ pub fn gated_delta(
         false,
         false,
     )?;
-    if fused_fits(&shape, state) {
+    if fused_fits(&shape, state, qkv, y) {
         return shape.decode_fused(ctx, OP, qkv, gates, state, y);
     }
     let staged = shape.stage(ctx, OP, qkv, gates, StagePlanes::Step)?;
@@ -696,18 +696,35 @@ pub fn gated_delta(
     )
 }
 
-const FUSED_BLOCK: u32 = 256;
-
+/// The value columns one warp of the fused step owns.
 const FUSED_BV: u32 = 16;
 
-fn fused_fits(shape: &Delta, state: &RecurrentPool) -> bool {
+/// The key rows one warp of the fused step holds: sixteen row pairs, eight
+/// rows each.
+const FUSED_BK: u32 = 128;
+
+/// Whether the fused step's vector reads land whole: every row it touches
+/// starts on a 16-byte boundary and the key width is whole sixteen-row steps.
+fn fused_fits(shape: &Delta, state: &RecurrentPool, qkv: Tensor, y: &Tensor) -> bool {
     const VEC: u32 = 8;
     shape.conv_dim.is_multiple_of(VEC)
         && (shape.k_heads * shape.k_dim).is_multiple_of(VEC)
         && shape.v_dim.is_multiple_of(FUSED_BV)
-        && (shape.k_dim * shape.v_dim).is_multiple_of(VEC)
+        && shape.k_dim.is_multiple_of(16)
         && state.slot_stride_elems % i64::from(VEC) == 0
-        && shape.k_dim <= FUSED_BLOCK * VEC / FUSED_BV
+        && shape.k_dim <= FUSED_BK
+        && [qkv.ptr, y.ptr, state.slab.ptr]
+            .iter()
+            .all(|&at| aligned16(at))
+}
+
+/// Warps per block of the fused step: two, so a wide batch's blocks are few
+/// enough for every SM to hold its register-limited share of warps, and one
+/// when a small batch would otherwise leave SMs idle.
+fn fused_warps(shape: &Delta) -> u32 {
+    const SMS: u64 = 148;
+    let tiles = u64::from(shape.n) * u64::from(shape.v_heads) * u64::from(shape.v_dim / FUSED_BV);
+    if tiles >= 4 * SMS { 2 } else { 1 }
 }
 
 impl Delta {
@@ -722,11 +739,21 @@ impl Delta {
     ) -> Result<(), Error> {
         #[allow(clippy::cast_precision_loss)]
         let q_scale = (self.k_dim as f32).sqrt().recip();
+        let warps = fused_warps(&self);
+        let entry = if warps == 2 {
+            "::pie::attn::ssm_gdn_decode_step<2>"
+        } else {
+            "::pie::attn::ssm_gdn_decode_step<1>"
+        };
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::ssm_gdn_decode_step<16>").apply(Launch::grid(
-                [self.v_dim / FUSED_BV, self.n, self.v_heads],
-                [FUSED_BLOCK, 1, 1],
+            Fire::at(FILE, entry).apply(Launch::grid(
+                [
+                    (self.v_dim / FUSED_BV).div_ceil(warps),
+                    self.n,
+                    self.v_heads,
+                ],
+                [32 * warps, 1, 1],
             )),
             &[
                 qkv.arg(),
@@ -749,19 +776,33 @@ impl Delta {
     }
 }
 
+/// The value columns one block of the chunked scan carries: a whole head
+/// once the requests' heads cover every SM, half a head (each half
+/// recomputing its chunk's scores) when fewer would leave SMs idle.
+fn scan_bv(lanes: u32, v_heads: u32) -> u32 {
+    const SMS: u32 = 148;
+    if lanes.saturating_mul(v_heads) >= SMS {
+        128
+    } else {
+        64
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gated_delta_chunked_fla(
     ctx: &Ctx,
     op: &'static str,
     shape: &Delta,
-    staged: &DeltaStaged,
     qkv: RaggedTensor,
+    gates: Tensor,
     state: &RecurrentPool,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const CH: u32 = 64;
-    const BVT: u32 = 16;
-    const BLOCK: u32 = 256;
+    const BLOCK: u32 = 128;
+    const LD: u32 = 136;
+    const LDC: u32 = 72;
+    const LDA: u32 = 68;
     let lanes = requests(op, qkv)?;
     seated(op, state, "ssm_gdn_chunk", true, true, true)?;
     let (k_dim, v_dim, v_heads, k_heads) = (shape.k_dim, shape.v_dim, shape.v_heads, shape.k_heads);
@@ -770,25 +811,18 @@ fn gated_delta_chunked_fla(
         n: shape.n + CH,
         ..*shape
     };
-    let per_slot = |heads: u32, width: u32| u64::from(slots) * u64::from(heads) * u64::from(width);
-    let gcum = plane(ctx, op, "attn.ssm_gdn_chunk_gcum", shape.elems(v_heads, 1))?;
-    let qb = plane_bf16(
+    let gcum = plane(ctx, op, "attn.ssm_gdn_chunk_gcum", padded.elems(v_heads, 1))?;
+    let qn = plane_bf16(
         ctx,
         op,
-        "attn.ssm_gdn_chunk_qb",
+        "attn.ssm_gdn_chunk_qn",
         padded.elems(k_heads, k_dim),
     )?;
-    let kb = plane_bf16(
+    let kn = plane_bf16(
         ctx,
         op,
-        "attn.ssm_gdn_chunk_kb",
+        "attn.ssm_gdn_chunk_kn",
         padded.elems(k_heads, k_dim),
-    )?;
-    let kt = plane_bf16(
-        ctx,
-        op,
-        "attn.ssm_gdn_chunk_kt",
-        per_slot(k_heads, k_dim * CH),
     )?;
     let w = plane_bf16(
         ctx,
@@ -802,62 +836,54 @@ fn gated_delta_chunked_fla(
         "attn.ssm_gdn_chunk_u",
         padded.elems(v_heads, v_dim),
     )?;
-    let vnt = plane_bf16(
-        ctx,
-        op,
-        "attn.ssm_gdn_chunk_vnt",
-        per_slot(v_heads, v_dim * CH),
-    )?;
-    let hct = plane_bf16(
-        ctx,
-        op,
-        "attn.ssm_gdn_chunk_hct",
-        per_slot(v_heads, v_dim * k_dim),
-    )?;
-    let wu_smem = CH * CH * FLOAT + CH * k_dim * 2 + CH * CH * 2 + 4 * CH * FLOAT;
+    #[allow(clippy::cast_precision_loss)]
+    let q_scale = (k_dim as f32).sqrt().recip();
+    let prep_smem =
+        2 * CH * LD * 2 + 2 * CH * LDC * 2 + CH * LDA * FLOAT + 3 * CH * FLOAT + 4 * 256 * FLOAT;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_wu<128, 128>")
-            .apply(Launch::grid([slots, v_heads, 1], [BLOCK, 1, 1]).smem(wu_smem)),
+        Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_prep<128, 128>")
+            .apply(Launch::grid([v_heads, slots, 1], [2 * BLOCK, 1, 1]).smem(prep_smem)),
         &[
-            ArgValue::Ptr(staged.q_norm),
-            ArgValue::Ptr(staged.k_norm),
-            ArgValue::Ptr(staged.v),
-            ArgValue::Ptr(staged.g_log),
-            ArgValue::Ptr(staged.beta),
+            qkv.data.arg(),
+            gates.arg(),
             state.slot_ids.arg(),
             qkv.indptr.arg(),
             state.commit_len.arg(),
             state.begin_at.arg(),
             ArgValue::Ptr(gcum),
-            ArgValue::Ptr(qb),
-            ArgValue::Ptr(kb),
-            ArgValue::Ptr(kt),
+            ArgValue::Ptr(qn),
+            ArgValue::Ptr(kn),
             ArgValue::Ptr(w),
             ArgValue::Ptr(u),
             stated(op, lanes)?.arg(),
             stated(op, k_heads)?.arg(),
             stated(op, v_heads)?.arg(),
+            stated(op, shape.conv_dim)?.arg(),
+            q_scale.arg(),
             ctx.stage(),
         ],
     )?;
+    let bv = scan_bv(lanes, v_heads);
+    let ldv = bv + 8;
+    let stage = 3 * CH * LD + CH * ldv + 2 * CH;
+    let scan_smem = (2 * stage + k_dim * ldv + 2 * CH * ldv + CH * LDC) * 2;
+    let entry = if bv == 128 {
+        "::pie::attn::ssm_gdn_chunk_scan<128>"
+    } else {
+        "::pie::attn::ssm_gdn_chunk_scan<64>"
+    };
     ctx.fire(
         op,
-        Fire::at(
-            FILE,
-            "::pie::attn::ssm_gdn_chunk_h<::pie::attn::state_bf16, 128, 128, 16>",
-        )
-        .apply(Launch::grid(
-            [lanes * v_heads * (v_dim / BVT), 1, 1],
-            [BLOCK, 1, 1],
-        )),
+        Fire::at(FILE, entry).apply(
+            Launch::grid([lanes * v_heads * (v_dim / bv), 1, 1], [2 * BLOCK, 1, 1]).smem(scan_smem),
+        ),
         &[
             ArgValue::Ptr(gcum),
-            ArgValue::Ptr(kt),
+            ArgValue::Ptr(qn),
+            ArgValue::Ptr(kn),
             ArgValue::Ptr(w),
             ArgValue::Ptr(u),
-            ArgValue::Ptr(vnt),
-            ArgValue::Ptr(hct),
             state.slab.arg(),
             state.slot_ids.arg(),
             qkv.indptr.arg(),
@@ -866,26 +892,6 @@ fn gated_delta_chunked_fla(
             state.begin_at.arg(),
             state.write_state.arg(),
             state.write_state_mask.arg(),
-            stated(op, lanes)?.arg(),
-            stated(op, k_heads)?.arg(),
-            stated(op, v_heads)?.arg(),
-            ctx.stage(),
-        ],
-    )?;
-    ctx.fire(
-        op,
-        Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_o<128, 128, 16>")
-            .apply(Launch::grid([slots, v_heads, 1], [BLOCK, 1, 1])),
-        &[
-            ArgValue::Ptr(gcum),
-            ArgValue::Ptr(qb),
-            ArgValue::Ptr(kb),
-            ArgValue::Ptr(vnt),
-            ArgValue::Ptr(hct),
-            state.slot_ids.arg(),
-            qkv.indptr.arg(),
-            state.commit_len.arg(),
-            state.begin_at.arg(),
             y.arg(),
             stated(op, lanes)?.arg(),
             stated(op, k_heads)?.arg(),
@@ -953,10 +959,19 @@ pub fn gated_delta_chunked(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;
-    let staged = shape.stage(ctx, OP, qkv.data, gates, StagePlanes::Chunk)?;
-    if k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get) {
-        return gated_delta_chunked_fla(ctx, OP, &shape, &staged, qkv, state, y);
+    if k_dim == BK_MAX_FLA
+        && v_dim == BV_FLA
+        && shape.conv_dim.is_multiple_of(8)
+        && (k_heads * k_dim).is_multiple_of(8)
+        && state.slot_stride_elems % 8 == 0
+        && [qkv.data.ptr, y.ptr, state.slab.ptr]
+            .iter()
+            .all(|&at| aligned16(at))
+        && !SERIAL_SCAN.with(core::cell::Cell::get)
+    {
+        return gated_delta_chunked_fla(ctx, OP, &shape, qkv, gates, state, y);
     }
+    let staged = shape.stage(ctx, OP, qkv.data, gates, StagePlanes::Chunk)?;
     if k_dim <= BK_MAX_FLA && v_dim.is_multiple_of(BV_FLA) {
         seated(
             OP,
