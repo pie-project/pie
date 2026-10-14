@@ -490,9 +490,27 @@ fn the_activation_quantizers_land_what_the_host_rounds_every_case() {
     }
     routed_select(Format::Nvfp4, 70, false);
     routed_select(Format::E4m3 { gran: 128 }, 5, false);
+    // A captured fire's live window: the routes past it were never written
+    // by this fire, so their ids are no expert's.
+    for (tokens, live) in [(4, 3), (40, 17)] {
+        routed_select_live(Format::Nvfp4, tokens, live);
+        routed_select_live(Format::E4m3 { gran: 128 }, tokens, live);
+    }
     // DeepSeek-V4-Flash's routed legs at one token.
-    routed_select_at(Format::E4m3 { gran: 128 }, 1, true, [16, 6, 2048, 4096]);
-    routed_select_at(Format::E4m3 { gran: 128 }, 1, false, [16, 6, 4096, 2048]);
+    routed_select_at(
+        Format::E4m3 { gran: 128 },
+        1,
+        true,
+        [16, 6, 2048, 4096],
+        None,
+    );
+    routed_select_at(
+        Format::E4m3 { gran: 128 },
+        1,
+        false,
+        [16, 6, 4096, 2048],
+        None,
+    );
 }
 
 /// A routed bank on the grouped tcgen05 GEMM, masked (few tokens) or
@@ -500,10 +518,22 @@ fn the_activation_quantizers_land_what_the_host_rounds_every_case() {
 /// expert's global) and its expert's dequantized weight, times the expert's
 /// product scale.
 fn routed_select(fmt: Format, tokens: usize, by_token: bool) {
-    routed_select_at(fmt, tokens, by_token, [8, 3, 256, 512]);
+    routed_select_at(fmt, tokens, by_token, [8, 3, 256, 512], None);
 }
 
-fn routed_select_at(fmt: Format, tokens: usize, by_token: bool, dims: [usize; 4]) {
+/// The select under a live window of `live` tokens from the first: the
+/// routes past it hold ids no expert has, and are neither read nor written.
+fn routed_select_live(fmt: Format, tokens: usize, live: usize) {
+    routed_select_at(fmt, tokens, true, [8, 3, 256, 512], Some(live));
+}
+
+fn routed_select_at(
+    fmt: Format,
+    tokens: usize,
+    by_token: bool,
+    dims: [usize; 4],
+    live: Option<usize>,
+) {
     let [experts, top_k, n, k] = dims;
     let nvfp4 = fmt == Format::Nvfp4;
     let gran = if nvfp4 { 16 } else { 32 };
@@ -515,6 +545,10 @@ fn routed_select_at(fmt: Format, tokens: usize, by_token: bool, dims: [usize; 4]
         .map(|r| ((r / top_k * 5 + r % top_k * 3 + r / 97) % experts) as i32)
         .collect();
     routes[1] = -1;
+    let live_routes = live.map_or(count, |l| l * top_k);
+    for r in &mut routes[live_routes..] {
+        *r = 0x3fff_ffff;
+    }
     let input_scales: Vec<f32> = (0..experts).map(|e| 0.004 + 0.003 * e as f32).collect();
     let tensor: Vec<f32> = (0..experts * n)
         .map(|r| 0.5 + (r / n) as f32 * 0.125)
@@ -550,7 +584,8 @@ fn routed_select_at(fmt: Format, tokens: usize, by_token: bool, dims: [usize; 4]
     let scales_at = gpu.up(&scales);
     let atoms_at = gpu.zeros(atom_bytes(experts * n, k, gran));
     let alpha_at = gpu.zeros(experts * 4);
-    let y_at = gpu.zeros(count * n * 2);
+    const UNTOUCHED: u16 = 0x7f7f;
+    let y_at = gpu.up(&vec![UNTOUCHED; count * n]);
     let values_at = gpu.zeros(count * k * 2);
     let ctx = gpu.ctx();
     let x = Tensor::new(x_at, act_rows as u32, k as u32, Dtype::Bf16);
@@ -571,6 +606,10 @@ fn routed_select_at(fmt: Format, tokens: usize, by_token: bool, dims: [usize; 4]
             .expect("the product scales land");
     }
     let mut y = Tensor::new(y_at, count as u32, n as u32, Dtype::Bf16);
+    if let Some(l) = live {
+        let window = gpu.up(&[l as u32, 0, 0, 0]);
+        ctx.arm_stage(window);
+    }
     select(
         &ctx,
         OP,
@@ -591,16 +630,23 @@ fn routed_select_at(fmt: Format, tokens: usize, by_token: bool, dims: [usize; 4]
         &mut y,
     )
     .expect("the routed product fires");
+    ctx.disarm_stage();
     let div = if by_token { top_k } else { 1 };
+    let live_t = Tensor::new(
+        routes_at,
+        (live_routes / top_k) as u32,
+        top_k as u32,
+        Dtype::I32,
+    );
     read_back(
         &ctx,
         OP,
         fmt,
         Source {
             x,
-            rows: count as u32,
+            rows: live_routes as u32,
             div: div as u32,
-            routes: nvfp4.then_some(route_t),
+            routes: nvfp4.then_some(live_t),
             input_scales: globals,
             pos: 0,
             m_max: 0,
@@ -617,6 +663,13 @@ fn routed_select_at(fmt: Format, tokens: usize, by_token: bool, dims: [usize; 4]
         .collect();
     let mut bad = 0;
     for r in 0..count {
+        if r >= live_routes {
+            assert!(
+                got[r * n..(r + 1) * n].iter().all(|&v| v == UNTOUCHED),
+                "{fmt:?}: route {r} is past the live window and was written"
+            );
+            continue;
+        }
         for c in 0..n {
             let g = from_bf16(got[r * n + c]);
             if routes[r] < 0 {

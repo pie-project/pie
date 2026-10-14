@@ -105,6 +105,11 @@ __global__ void act_quant_nvfp4(
     if (at >= static_cast<long long>(rows) * blocks) return;
     const int r = static_cast<int>(at / blocks);
     const int b = static_cast<int>(at % blocks);
+    // A route that lands nowhere -- dropped, or past a captured fire's live
+    // window, whose route ids this fire never wrote -- is not read: its id
+    // is no expert's, so it indexes no input scale.
+    const int o = pos != nullptr ? pos[r] : r;
+    if (kMode == kQuantCodes && o < 0) return;
     bool dropped = false;
     const float gs = global_of(input_scales, routes, r, &dropped);
     const bf16* src = x + static_cast<long long>(r / div) * k + b * 16;
@@ -120,8 +125,6 @@ __global__ void act_quant_nvfp4(
     const float sf_value = e4m3_value(sf_code);
     const float out_scale = sf_value != 0.f ? rcp_approx_ftz(sf_value * rcp_approx_ftz(gs)) : 0.f;
     if constexpr (kMode == kQuantCodes) {
-        const int o = pos != nullptr ? pos[r] : r;
-        if (o < 0) return;
         u8* dst = codes + static_cast<long long>(o) * (k / 2) + b * 8;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
