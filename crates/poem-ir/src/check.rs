@@ -871,6 +871,16 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Fused::RopeYarnAppend { .. } => {
                 &[(In(3), I32), (In(4), CACHE), (In(5), I32), (In(6), I32)]
             }
+            // The attention's own, and the sink's f32 log-sum-exp is its.
+            Fused::LseSink { attn, .. } => match **attn {
+                Attention::DecodeLse { .. } => {
+                    &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)]
+                }
+                Attention::PrefillLse { .. } => {
+                    &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)]
+                }
+                _ => &[],
+            },
             Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::NormModulate {

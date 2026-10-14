@@ -16,8 +16,10 @@ pub fn no_schedule_straddles_its_readers(trace: &Trace, compiled: &CompiledModel
     let mask_of = |node: usize| &compiled.template()[region_of[node]].mask;
 
     for (at, node) in trace.nodes.iter().enumerate() {
-        let Operation::Attention(op) = &node.op else {
-            continue;
+        let op = match &node.op {
+            Operation::Attention(op) => op,
+            Operation::Fused(poem_ir::Fused::LseSink { attn, .. }) => &**attn,
+            _ => continue,
         };
         let consumed = match op {
             Attention::Decode { plan, .. }

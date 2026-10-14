@@ -350,7 +350,9 @@ using IdType = std::int32_t;
 // its normalized output straight from global memory, and lands the row's
 // output and log-sum-exp. A row of no partials lands zeros and -inf, one
 // partial lands as it stands. `win` is the staged `(count, start)` seat.
-template <int HEAD_DIM>
+// With `sinks`, each head's output is scaled as `sink_rescale` scales it,
+// by 1 / (1 + exp(sink - lse)), from the f32 sum before it rounds.
+template <int HEAD_DIM, class S = float>
 __global__ void __launch_bounds__(256) merge_partials_warp(
     const merge_lse::DTypeIn* __restrict__ v,
     const float* __restrict__ s,
@@ -360,6 +362,7 @@ __global__ void __launch_bounds__(256) merge_partials_warp(
     u32 max_seq_len,
     const u32* __restrict__ seq_len_ptr,
     u32 num_heads,
+    const S* __restrict__ sinks,
     const u32* __restrict__ win)
 {
     static_assert(HEAD_DIM % 64 == 0, "two columns a lane at least");
@@ -403,7 +406,12 @@ __global__ void __launch_bounds__(256) merge_partials_warp(
                 }
             }
         }
-        const float inv = d > 0.f ? 1.f / d : 0.f;
+        float inv = d > 0.f ? 1.f / d : 0.f;
+        if (sinks != nullptr && d > 0.f) {
+            constexpr float kLn2 = 0.69314718055994530942f;
+            const float lse = m + log2f(d);
+            inv *= 1.0f / (1.0f + __expf(-(lse * kLn2 - Elem<S>::to_f32(sinks[head]))));
+        }
         const long long out = (static_cast<long long>(row_base) + pos) * num_heads + head;
         merge_lse::DTypeO* dst = v_merged + out * HEAD_DIM + col;
 #pragma unroll

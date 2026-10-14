@@ -34,6 +34,9 @@ struct Fixture {
     q: RaggedTensor,
     o: u64,
     lse: u64,
+    /// gpt-oss's per-head sinks, f32.
+    sinks: u64,
+    host_sinks: Vec<f32>,
     workspace: Workspace,
     host_q: Vec<f32>,
     host_k: Vec<f32>,
@@ -107,6 +110,10 @@ fn fixture(case: Case, seed: u64) -> Fixture {
     };
     let o = gpu.zeros(rows * q_width * 2);
     let lse = gpu.zeros(rows * case.q_heads as usize * 4);
+    let host_sinks: Vec<f32> = (0..case.q_heads)
+        .map(|h| 0.5 * (h % 7) as f32 - 1.0)
+        .collect();
+    let sinks = gpu.up(&host_sinks);
     let workspace = Workspace {
         int_ptr: gpu.zeros(INT_BYTES),
         int_bytes: INT_BYTES,
@@ -122,6 +129,8 @@ fn fixture(case: Case, seed: u64) -> Fixture {
         q,
         o,
         lse,
+        sinks,
+        host_sinks,
         workspace,
         host_q,
         host_k,
@@ -133,6 +142,12 @@ fn fixture(case: Case, seed: u64) -> Fixture {
 impl Fixture {
     /// Plans and fires one decode (with its log-sum-exp) under `tuning`.
     fn fire(&self, tuning: Tuning) -> impl Fn() + '_ {
+        self.fire_with(tuning, false)
+    }
+
+    /// [`Fixture::fire`], with the sinks landed over its output where
+    /// `sinked`.
+    fn fire_with(&self, tuning: Tuning, sinked: bool) -> impl Fn() + '_ {
         let ctx = self.gpu.ctx().with_tuning(tuning);
         let device = Device::probe(&ctx).expect("the device answers");
         let rows = self.case.lens.len() as u32;
@@ -176,17 +191,33 @@ impl Fixture {
         move || {
             let mut o = Tensor::new(self.o, rows, q_width, Dtype::Bf16);
             let mut lse = Tensor::new(self.lse, rows, self.case.q_heads, Dtype::F32);
-            attn::decode_lse(
-                &ctx,
-                self.q,
-                &planned,
-                &self.pool,
-                self.case.window,
-                self.case.head_dim,
-                scale,
-                &mut o,
-                &mut lse,
-            )
+            let sinks = Tensor::new(self.sinks, self.case.q_heads, 1, Dtype::F32);
+            if sinked {
+                attn::decode_lse_sink(
+                    &ctx,
+                    self.q,
+                    &planned,
+                    &self.pool,
+                    self.case.window,
+                    self.case.head_dim,
+                    scale,
+                    &mut o,
+                    &mut lse,
+                    sinks,
+                )
+            } else {
+                attn::decode_lse(
+                    &ctx,
+                    self.q,
+                    &planned,
+                    &self.pool,
+                    self.case.window,
+                    self.case.head_dim,
+                    scale,
+                    &mut o,
+                    &mut lse,
+                )
+            }
             .expect("the decode fires");
         }
     }
@@ -194,6 +225,10 @@ impl Fixture {
     /// The same rows through the tensor-core prefill kernel, one query row a
     /// request.
     fn fire_prefill(&self, tuning: Tuning) -> impl Fn() + '_ {
+        self.fire_prefill_with(tuning, false)
+    }
+
+    fn fire_prefill_with(&self, tuning: Tuning, sinked: bool) -> impl Fn() + '_ {
         let ctx = self.gpu.ctx().with_tuning(tuning);
         let device = Device::probe(&ctx).expect("the device answers");
         let rows = self.case.lens.len() as u32;
@@ -235,18 +270,35 @@ impl Fixture {
         move || {
             let mut o = Tensor::new(self.o, rows, q_width, Dtype::Bf16);
             let mut lse = Tensor::new(self.lse, rows, self.case.q_heads, Dtype::F32);
-            attn::prefill_lse(
-                &ctx,
-                self.q,
-                &planned,
-                &self.pool,
-                self.case.window,
-                self.case.head_dim,
-                self.case.kv_heads,
-                scale,
-                &mut o,
-                &mut lse,
-            )
+            let sinks = Tensor::new(self.sinks, self.case.q_heads, 1, Dtype::F32);
+            if sinked {
+                attn::prefill_lse_sink(
+                    &ctx,
+                    self.q,
+                    &planned,
+                    &self.pool,
+                    self.case.window,
+                    self.case.head_dim,
+                    self.case.kv_heads,
+                    scale,
+                    &mut o,
+                    &mut lse,
+                    sinks,
+                )
+            } else {
+                attn::prefill_lse(
+                    &ctx,
+                    self.q,
+                    &planned,
+                    &self.pool,
+                    self.case.window,
+                    self.case.head_dim,
+                    self.case.kv_heads,
+                    scale,
+                    &mut o,
+                    &mut lse,
+                )
+            }
             .expect("the prefill fires");
         }
     }
@@ -491,6 +543,56 @@ fn a_decode_reports_its_time_at_gptoss_and_gemma4_heads() {
                      {prefill_w:.1} |",
                     lens.len()
                 );
+            }
+        }
+    }
+}
+
+/// A sinked decode or prefill lands what the attention and the sink kernel
+/// land after it: in the warp fold where the profile takes it, else by the
+/// sink kernel, against the host softmax scaled by each head's sink.
+#[test]
+fn a_sinked_attention_answers_the_reference_scaled_by_its_sinks() {
+    for window in [None, Some(128)] {
+        for graph in [false, true] {
+            let case = Case {
+                lens: LENS,
+                q_heads: 64,
+                kv_heads: 8,
+                head_dim: 64,
+                window,
+                graph,
+            };
+            let fx = fixture(case, 0x51c);
+            let (mut want_o, want_lse) = fx.reference();
+            for (at, chunk) in want_o.chunks_mut(64).enumerate() {
+                let h = at % 64;
+                let r = 1.0
+                    / (1.0 + (-(want_lse[at] * std::f32::consts::LN_2 - fx.host_sinks[h])).exp());
+                for x in chunk {
+                    *x *= r;
+                }
+            }
+            for merge_warp in [false, true] {
+                let tuning = Tuning {
+                    merge_warp,
+                    ..Tuning::DEFAULT
+                };
+                for via_prefill in [false, true] {
+                    if via_prefill {
+                        fx.fire_prefill_with(tuning, true)();
+                    } else {
+                        fx.fire_with(tuning, true)();
+                    }
+                    let (o, lse) = fx.output();
+                    fx.scrub();
+                    let (eo, el) = (worst(&o, &want_o), worst(&lse, &want_lse));
+                    assert!(
+                        eo < 2e-2 && el < 1e-2,
+                        "window {window:?}, graph {graph}, warp merge {merge_warp}, via prefill \
+                         {via_prefill}: output off by {eo}, lse by {el}"
+                    );
+                }
             }
         }
     }

@@ -9,6 +9,7 @@ impl DispatchFused for Run<'_> {
         match op {
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op),
             Fused::RopeYarnAppend { .. } => self.rope_yarn_append(op),
+            Fused::LseSink { .. } => self.lse_sink(op),
             Fused::MatmulGeglu { .. }
             | Fused::MatmulSwiglu { .. }
             | Fused::MlpSwiglu { .. }
@@ -36,6 +37,69 @@ impl DispatchFused for Run<'_> {
 }
 
 impl Run<'_> {
+    /// A log-sum-exp attention with its sinks: landed in the split's fold
+    /// where the profile's warp fold takes them, else by the sink kernel
+    /// after, as the pair ran.
+    fn lse_sink(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::LseSink {
+            attn, sink, o_out, ..
+        } = op
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let sinks = self.tensor(*sink);
+        match **attn {
+            poem_ir::Attention::DecodeLse {
+                q,
+                plan,
+                cache,
+                window,
+                head_dim,
+                sm_scale,
+                o: _,
+                lse,
+            } => kernels_cuda::attn::decode_lse_sink(
+                self.ctx(),
+                self.ragged_q(q),
+                self.decode_plan(plan),
+                &self.pool_absolute(cache),
+                window,
+                head_dim,
+                sm_scale,
+                &mut self.tensor(*o_out),
+                &mut self.tensor(lse),
+                sinks,
+            ),
+            poem_ir::Attention::PrefillLse {
+                q,
+                plan,
+                cache,
+                window,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                o: _,
+                lse,
+            } => {
+                kernels_cuda::attn::prefill_lse_sink(
+                    self.ctx(),
+                    self.ragged_q(q),
+                    self.prefill_plan(plan),
+                    &self.pool_absolute(cache),
+                    window,
+                    head_dim,
+                    kv_heads,
+                    sm_scale,
+                    &mut self.tensor(*o_out),
+                    &mut self.tensor(lse),
+                    sinks,
+                )?;
+                self.capture_scores(q, plan, cache, window, head_dim, kv_heads, sm_scale, lse)
+            }
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
     /// YaRN and the cache write in one launch where the pool is the plain
     /// bf16 one `kv_append` writes directly; else the two as they were.
     fn rope_yarn_append(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {

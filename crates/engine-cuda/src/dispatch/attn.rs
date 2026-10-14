@@ -15,7 +15,7 @@ impl DispatchAttention for Run<'_> {
 
 impl Run<'_> {
     #[allow(clippy::too_many_arguments)]
-    fn capture_scores(
+    pub(super) fn capture_scores(
         &mut self,
         q: poem_ir::ValueId,
         plan: poem_ir::ValueId,

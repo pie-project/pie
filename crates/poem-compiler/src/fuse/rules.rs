@@ -4,7 +4,7 @@
 use poem::ops::{attn, elemwise, layout, linear};
 use poem::pattern::{Pattern, Template, template};
 use poem_ir::ops::fused::PostNorm;
-use poem_ir::{Dim, Dtype, Elementwise, Fused, ModulateForm, NormKind, Operation, Ty};
+use poem_ir::{Dim, Dtype, Elementwise, Fused, ModulateForm, NormKind, Operation, StructKind, Ty};
 
 use super::Rule;
 
@@ -29,7 +29,50 @@ pub(super) fn all() -> Vec<Rule> {
         norm_modulate(),
         rmsnorm_rope_partial_q(),
         rope_yarn_append(),
+        lse_sink(),
     ]
+}
+
+/// A log-sum-exp attention and the sinks over its output.
+fn lse_sink() -> Rule {
+    let pair = |decode: bool| {
+        template(move |p| {
+            let q = p.rows("q", W);
+            let cache = p.cache("cache");
+            let d = p.u32("d");
+            p.free("window");
+            let (o, lse) = if decode {
+                let plan = p.value("plan", Ty::Struct(StructKind::AttnDecodePlan));
+                attn::decode_lse(&q, &plan, cache, None, d, p.f32("sm_scale"))
+            } else {
+                let plan = p.value("plan", Ty::Struct(StructKind::AttnPrefillPlan));
+                attn::prefill_lse(
+                    &q,
+                    &plan,
+                    cache,
+                    None,
+                    d,
+                    p.u32("kv_heads"),
+                    p.f32("sm_scale"),
+                )
+            };
+            p.name("o", &o);
+            p.name("lse", &lse);
+            let out = attn::sink(&o, &lse, &p.weight("sink", [W]), d);
+            p.export("o_out", &out);
+        })
+    };
+    Rule::new("attention.lse_sink", [pair(true), pair(false)], |m| {
+        let Operation::Attention(attn) = m.op("o") else {
+            panic!("the sinked output comes from an attention");
+        };
+        Fused::LseSink {
+            attn: Box::new(attn.clone()),
+            sink: m.value("sink"),
+            head_dim: m.u32("d"),
+            o_out: m.value("o_out"),
+        }
+    })
 }
 
 /// YaRN over q and k, and the rotated k written to the cache with its v.

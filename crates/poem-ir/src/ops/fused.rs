@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::operands::Operands;
+use crate::ops::attn::Attention;
 use crate::ops::elemwise::ModulateForm;
 use crate::ops::linear::Linear;
 use crate::value::ValueId;
@@ -152,6 +153,16 @@ pub enum Fused {
         select: Box<Linear>,
         glu: Box<Linear>,
     },
+    /// A log-sum-exp attention (`DecodeLse` or `PrefillLse`) and the sinks
+    /// over its output (`Sink`): a backend lands the sinked output in
+    /// `o_out`, in the attention's fold of a split or after it. The
+    /// attention's `o` (read by nothing else) and `lse` are still outputs.
+    LseSink {
+        attn: Box<Attention>,
+        sink: ValueId,
+        head_dim: u32,
+        o_out: ValueId,
+    },
     /// YaRN over q and k, and the rotated k with its v landed in the paged
     /// cache at each row's page and offset (`kv_append`); `k_out` is read by
     /// nothing else.
@@ -262,6 +273,12 @@ impl Operands for Fused {
                 write_offset,
                 ..
             } => sink.extend([*q, *k, *v, *positions, *cache, *write_page, *write_offset]),
+            Self::LseSink {
+                attn, sink: sinks, ..
+            } => {
+                attn.inputs(sink);
+                sink.push(*sinks);
+            }
             Self::QkvFusedQknormRopeVnormWrite {
                 packed,
                 positions,
@@ -334,6 +351,10 @@ impl Operands for Fused {
                 glu.outputs(sink);
             }
             Self::RopeYarnAppend { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
+            Self::LseSink { attn, o_out, .. } => {
+                attn.outputs(sink);
+                sink.push(*o_out);
+            }
             Self::QkvFusedQknormRopeVnormWrite { q, .. } => sink.push(*q),
         }
     }
@@ -347,6 +368,9 @@ impl Operands for Fused {
             Self::RopeYarnAppend {
                 q_out, q, k_out, k, ..
             } => sink.extend([(*q_out, *q), (*k_out, *k)]),
+            // The sinked output lands in a plane of its own: the
+            // attention's `o` is written by nothing a reader sees.
+            Self::LseSink { attn, .. } => attn.aliases(sink),
             Self::NormModulate { .. } => {}
             Self::GatedResidualNormModulate { r_out, r, .. } => sink.push((*r_out, *r)),
             Self::LmHeadSoftcap { y, y_out, .. } | Self::MatmulBias { y, y_out, .. } => {
@@ -377,6 +401,7 @@ impl Operands for Fused {
             Self::MatmulBias { .. } => "linear.matmul_bias",
             Self::MoeSelectGlu { .. } => "linear.moe_select_glu",
             Self::RopeYarnAppend { .. } => "elementwise.rope_yarn_append",
+            Self::LseSink { .. } => "attention.lse_sink",
             Self::QkvFusedQknormRopeVnormWrite { .. } => {
                 "custom_cuda.qkv_fused_qknorm_rope_vnorm_write"
             }

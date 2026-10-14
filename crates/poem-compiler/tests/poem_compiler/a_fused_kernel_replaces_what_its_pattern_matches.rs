@@ -178,7 +178,17 @@ fn yarn_write(p: &Pattern, interleaved: bool) {
     let positions = p.indices("positions");
     let (q, k, v) = (p.rows("q", 512), p.rows("k", 128), p.rows("v", 128));
     let (q, k) = elemwise::rope_yarn(
-        &q, &k, &positions, 64, 150_000.0, 32.0, 32.0, 1.0, 1.3, 4096, interleaved,
+        &q,
+        &k,
+        &positions,
+        64,
+        150_000.0,
+        32.0,
+        32.0,
+        1.0,
+        1.3,
+        4096,
+        interleaved,
     );
     attn::kv_append(
         &k,
@@ -217,6 +227,61 @@ fn a_yarn_rotation_and_its_cache_write_fold_into_one_op() {
         assert_eq!(
             (*head_dim, *theta, *factor, *original_max_position, *carried),
             (64, 150_000.0, 32.0, 4096, interleaved)
+        );
+    }
+}
+
+/// gpt-oss's sinks fold onto the log-sum-exp attention before them, decode
+/// and prefill alike, carrying the attention whole; a log-sum-exp read past
+/// the sink keeps the pair apart.
+#[test]
+fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
+    let sinked = |decode: bool, scores: bool| {
+        trace(move |p| {
+            let q = p.rows("q", 512);
+            let cache = p.cache("kv");
+            let (o, lse) = if decode {
+                let plan = p.value(
+                    "plan",
+                    poem_ir::Ty::Struct(poem_ir::StructKind::AttnDecodePlan),
+                );
+                attn::decode_lse(&q, &plan, cache, Some(128), 64, 0.125)
+            } else {
+                let plan = p.value(
+                    "plan",
+                    poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
+                );
+                attn::prefill_lse(&q, &plan, cache, None, 64, 8, 0.125)
+            };
+            let out = attn::sink(&o, &lse, &p.weight("sinks", [8]), 64);
+            elemwise::silu(&out);
+            if scores {
+                elemwise::silu(&lse);
+            }
+        })
+    };
+    for decode in [true, false] {
+        let fused = fuse(sinked(decode, false), &["attention.lse_sink"]);
+        assert_eq!(ops(&fused), ["attention.lse_sink", "elementwise.silu"]);
+        let Some(poem_ir::Operation::Fused(poem_ir::Fused::LseSink { attn, head_dim, .. })) =
+            fused.nodes.first().map(|node| &node.op)
+        else {
+            panic!("the first op is the sinked attention");
+        };
+        assert_eq!(*head_dim, 64);
+        assert_eq!(
+            attn.name(),
+            if decode {
+                "attention.decode_lse"
+            } else {
+                "attention.prefill_lse"
+            }
+        );
+        let apart = sinked(decode, true);
+        assert_eq!(
+            ops(&fuse(apart.clone(), &["attention.lse_sink"])),
+            ops(&apart),
+            "a log-sum-exp read elsewhere keeps the pair apart"
         );
     }
 }

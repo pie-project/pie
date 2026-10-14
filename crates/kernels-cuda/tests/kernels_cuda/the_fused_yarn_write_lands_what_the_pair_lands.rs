@@ -117,6 +117,12 @@ fn check(interleaved: bool) {
     assert!(apart.2.iter().any(|&b| b != 0), "the pair landed keys");
     assert_eq!(fused.0, apart.0, "interleaved {interleaved}: q");
     assert_eq!(fused.1, apart.1, "interleaved {interleaved}: k");
-    assert_eq!(fused.2, apart.2, "interleaved {interleaved}: the cached keys");
-    assert_eq!(fused.3, apart.3, "interleaved {interleaved}: the cached values");
+    assert_eq!(
+        fused.2, apart.2,
+        "interleaved {interleaved}: the cached keys"
+    );
+    assert_eq!(
+        fused.3, apart.3,
+        "interleaved {interleaved}: the cached values"
+    );
 }

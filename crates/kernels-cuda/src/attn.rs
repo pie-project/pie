@@ -145,6 +145,29 @@ fn fa2_decode(
     lse: Option<&mut Tensor>,
     rel: Option<RelBias>,
 ) -> Result<(), Error> {
+    fa2_decode_with(
+        ctx, op, q, plan, pool, window, head_dim, sm_scale, o, lse, rel, None,
+    )
+    .map(|_| ())
+}
+
+/// [`fa2_decode`], handing the split's fold `sinks` to land in the same
+/// pass; `Ok(true)` where it did, `Ok(false)` where the caller owes them.
+#[allow(clippy::too_many_arguments)]
+fn fa2_decode_with(
+    ctx: &Ctx,
+    op: &'static str,
+    q: RaggedTensor,
+    plan: &DecodePlan,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: Option<&mut Tensor>,
+    rel: Option<RelBias>,
+    sinks: Option<Tensor>,
+) -> Result<bool, Error> {
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
@@ -207,9 +230,20 @@ fn fa2_decode(
         }
     }
     if plan.info.split_kv {
-        fa2::fold(ctx, op, &split)
+        fa2::fold(ctx, op, &sinked(split, sinks))
     } else {
-        Ok(())
+        Ok(false)
+    }
+}
+
+fn sinked(split: fa2_abi::Partials, sinks: Option<Tensor>) -> fa2_abi::Partials {
+    match sinks {
+        Some(sinks) => fa2_abi::Partials {
+            sinks: sinks.ptr,
+            sinks_f32: sinks.dtype == Dtype::F32,
+            ..split
+        },
+        None => split,
     }
 }
 
@@ -228,6 +262,30 @@ fn fa2_prefill(
     mask: Option<(Tensor, Tensor)>,
     rel: Option<RelBias>,
 ) -> Result<(), Error> {
+    fa2_prefill_with(
+        ctx, op, q, plan, pool, window, head_dim, sm_scale, o, lse, mask, rel, None,
+    )
+    .map(|_| ())
+}
+
+/// [`fa2_prefill`], handing the split's fold `sinks` as
+/// [`fa2_decode_with`] does.
+#[allow(clippy::too_many_arguments)]
+fn fa2_prefill_with(
+    ctx: &Ctx,
+    op: &'static str,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: Option<&mut Tensor>,
+    mask: Option<(Tensor, Tensor)>,
+    rel: Option<RelBias>,
+    sinks: Option<Tensor>,
+) -> Result<bool, Error> {
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
@@ -247,7 +305,7 @@ fn fa2_prefill(
         && rel.is_none()
         && tc5_fmha::try_prefill(ctx, op, q, plan, pool, window_left, head_dim, sm_scale, o)?
     {
-        return Ok(());
+        return Ok(false);
     }
     let mut bufs = pool_buffers(q.data.ptr, pool, plan.workspace, o.ptr);
     bufs.qo_indptr = q.indptr.ptr;
@@ -303,9 +361,9 @@ fn fa2_prefill(
         }
     }
     if plan.info.split_kv {
-        fa2::fold(ctx, op, &split)
+        fa2::fold(ctx, op, &sinked(split, sinks))
     } else {
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -373,6 +431,81 @@ pub fn prefill(
     fa2_prefill(
         ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, None,
     )
+}
+
+/// [`decode_lse`], then the sinks over its output: in the split's fold
+/// where the profile's warp fold takes them, else by [`sink`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_lse_sink(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    plan: &DecodePlan,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: &mut Tensor,
+    sinks: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.lse_sink";
+    plan.accepts(OP, head_dim, window)?;
+    let landed = fa2_decode_with(
+        ctx,
+        OP,
+        q,
+        plan,
+        pool,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        Some(&mut *lse),
+        None,
+        Some(sinks),
+    )?;
+    if landed {
+        return Ok(());
+    }
+    sink(ctx, o, *lse, sinks, head_dim)
+}
+
+/// [`prefill_lse`], then the sinks, as [`decode_lse_sink`] lands them.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_lse_sink(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: &mut Tensor,
+    sinks: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.lse_sink";
+    plan.accepts(OP, head_dim, Some(kv_heads), window)?;
+    let landed = fa2_prefill_with(
+        ctx,
+        OP,
+        q,
+        plan,
+        pool,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        Some(&mut *lse),
+        None,
+        None,
+        Some(sinks),
+    )?;
+    if landed {
+        return Ok(());
+    }
+    sink(ctx, o, *lse, sinks, head_dim)
 }
 
 #[allow(clippy::too_many_arguments)]

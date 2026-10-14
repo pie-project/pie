@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use poem_ir::{Attention, Operands, Operation, StructKind, Trace, Ty, ValueId};
+use poem_ir::{Attention, Fused, Operands, Operation, StructKind, Trace, Ty, ValueId};
 
 /// `trace` with every decode plan of `from` or more query heads a KV head
 /// that only plain decodes read planned and read as a prefill.
@@ -53,11 +53,14 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool) -> Trace {
     // decode unless `lse`, or under a window) stays a decode plan.
     let mut inputs = Vec::new();
     for node in &trace.nodes {
-        match &node.op {
-            Operation::Attention(Attention::PlanDecode { .. } | Attention::Decode { .. }) => {
-                continue;
-            }
-            Operation::Attention(Attention::DecodeLse { plan, .. })
+        let attention = match &node.op {
+            Operation::Attention(op) => Some(op),
+            Operation::Fused(Fused::LseSink { attn, .. }) => Some(&**attn),
+            _ => None,
+        };
+        match attention {
+            Some(Attention::PlanDecode { .. } | Attention::Decode { .. }) => continue,
+            Some(Attention::DecodeLse { plan, .. })
                 if lse && wide.get(plan).is_some_and(|(_, slides)| !slides) =>
             {
                 continue;
@@ -71,8 +74,10 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool) -> Trace {
         }
     }
     for node in &mut trace.nodes {
-        let Operation::Attention(op) = &mut node.op else {
-            continue;
+        let op = match &mut node.op {
+            Operation::Attention(op) => op,
+            Operation::Fused(Fused::LseSink { attn, .. }) => &mut **attn,
+            _ => continue,
         };
         *op = match op.clone() {
             Attention::PlanDecode {
@@ -150,14 +155,17 @@ mod tests {
     fn census(trace: &Trace) -> (usize, usize, usize) {
         let mut counts = (0, 0, 0);
         for node in &trace.nodes {
-            match &node.op {
-                Operation::Attention(Attention::DecodeLse { window: None, .. }) => counts.0 += 1,
-                Operation::Attention(Attention::DecodeLse {
+            let op = match &node.op {
+                Operation::Attention(op) => op,
+                Operation::Fused(Fused::LseSink { attn, .. }) => &**attn,
+                _ => continue,
+            };
+            match op {
+                Attention::DecodeLse { window: None, .. } => counts.0 += 1,
+                Attention::DecodeLse {
                     window: Some(_), ..
-                }) => {
-                    counts.1 += 1;
-                }
-                Operation::Attention(Attention::PrefillLse { .. }) => counts.2 += 1,
+                } => counts.1 += 1,
+                Attention::PrefillLse { .. } => counts.2 += 1,
                 _ => {}
             }
         }
@@ -167,11 +175,27 @@ mod tests {
     /// gpt-oss's full-attention layers read their single-token rows through
     /// the prefill kernel where the profile turns log-sum-exp decodes on; its
     /// sliding layers, and every layer without it, keep the decode kernel.
+    /// So with its sinks fused onto the attentions, and without.
     #[test]
     fn a_sinked_decode_without_a_window_takes_the_prefill_where_the_profile_says() {
         let row = poem_compiler::catalog::deployment("gptoss-120b-bf16-mxfp4-kv-bf16")
             .expect("gpt-oss is in the catalog");
-        let trace = row.trace(poem::Platform::Cuda);
+        let plain = row.trace(poem::Platform::Cuda);
+        let fused = poem_compiler::fuse::fuse(plain.clone(), &["attention.lse_sink"]);
+        assert!(
+            fused
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, Operation::Fused(Fused::LseSink { .. }))),
+            "gpt-oss's sinks fuse onto its attentions"
+        );
+        for trace in [plain, fused] {
+            regroups(&trace);
+        }
+    }
+
+    fn regroups(trace: &Trace) {
+        let trace = trace.clone();
         let (full, sliding, prefills) = census(&trace);
         assert!(
             full > 0 && sliding > 0,
