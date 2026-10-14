@@ -398,10 +398,18 @@ fn check(case: Case, via_prefill: bool) {
             decode_xqa,
             ..Tuning::DEFAULT
         };
+        // Twice off one staged plan, as a step's layers read it: what one
+        // fire leaves in the plan's workspace must not spoil the next.
         if via_prefill {
-            fx.fire_prefill(tuning)();
+            let fire = fx.fire_prefill(tuning);
+            fire();
+            fx.scrub();
+            fire();
         } else {
-            fx.fire(tuning)();
+            let fire = fx.fire(tuning);
+            fire();
+            fx.scrub();
+            fire();
         }
         let (o, lse) = fx.output();
         fx.scrub();
