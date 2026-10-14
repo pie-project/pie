@@ -266,13 +266,21 @@ fn check_on(case: &Case, fused: bool) {
 ///
 ///     cargo test -p kernels-cuda --features cuda --release --test kernels_cuda \
 ///         the_chunked_gated_delta_reports -- --ignored --nocapture
+///
+/// vLLM's same kernel takes 48.95 ms over Qwen3.6-35B-A3B's 30 such layers
+/// (32 value heads), 1.63 ms a layer.
 #[test]
 #[ignore = "a measurement: run alone, on an idle GPU"]
 fn the_chunked_gated_delta_reports_its_rate_at_a_qwen38_27b_head() {
     use crate::the_tcgen05_gemm_lands_and_paces_what_cublaslt_does::{FLUSH, Timer};
     use kernels_cuda::cudarc::runtime::sys as rt;
 
-    let (k_heads, v_heads, k_dim, v_dim) = (16u32, 48u32, 128u32, 128u32);
+    // `PIE_GDN_V_HEADS=32` measures Qwen3.6-35B-A3B's head instead.
+    let v_heads: u32 = std::env::var("PIE_GDN_V_HEADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48);
+    let (k_heads, k_dim, v_dim) = (16u32, 128u32, 128u32);
     let conv_dim = (2 * k_heads * k_dim + v_heads * v_dim) as usize;
     let stride = (v_heads * k_dim * v_dim) as usize;
     let len = 4096usize;
@@ -284,9 +292,17 @@ fn the_chunked_gated_delta_reports_its_rate_at_a_qwen38_27b_head() {
     };
     println!("| scan | requests x tokens | ms / layer | tokens/s per layer |");
     println!("|---|---|---:|---:|");
+    // `PIE_GDN_ONLY=fused32` measures the two-launch scan at 32 requests
+    // alone (a profiler's one launch).
+    let only = std::env::var("PIE_GDN_ONLY").ok();
     for (fused, requests) in [false, true]
         .into_iter()
         .flat_map(|fused| [1usize, 8, 32].map(|requests| (fused, requests)))
+        .filter(|&(fused, requests)| {
+            only.as_deref().is_none_or(|o| {
+                o == format!("{}{requests}", if fused { "fused" } else { "split" })
+            })
+        })
     {
         let rows = requests * len;
         let mut lcg = Lcg::seeded(0x27);
