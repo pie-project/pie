@@ -361,13 +361,19 @@ mod tests {
             .flatten()
             .map(|schedule| schedule.kind)
             .collect();
+        // Four query heads to a KV head read single-token rows through the
+        // prefill kernel: every schedule qwen3.5 carves is a prefill one,
+        // the single-token rows' among them.
         assert!(
-            kinds.contains(&StructKind::AttnDecodePlan),
-            "qwen3.5 carves a decode schedule: {kinds:?}"
+            kinds
+                .iter()
+                .all(|kind| *kind == StructKind::AttnPrefillPlan),
+            "qwen3.5 carves prefill schedules alone: {kinds:?}"
         );
-        assert!(
-            kinds.contains(&StructKind::AttnPrefillPlan),
-            "and prefill ones: {kinds:?}"
+        assert_eq!(
+            kinds.len(),
+            4,
+            "the masked, scored, single-token and prefill rows' schedules: {kinds:?}"
         );
 
         let states = plan
