@@ -1966,7 +1966,9 @@ mod tests {
         assert_eq!(freed, bytes, "the codes of the table and nothing else move");
         assert!(plan.pinned(table));
         assert_eq!(
-            (0..trace.params.len()).filter(|&p| plan.streamed_whole(p)).count(),
+            (0..trace.params.len())
+                .filter(|&p| plan.streamed_whole(p))
+                .count(),
             1,
             "only the table leaves the device"
         );
@@ -1976,12 +1978,19 @@ mod tests {
             !plan.hosts_beyond_declared(),
             "a declared plane alone leaves a recorded body free to hold it"
         );
-        assert_eq!(plan.host_declared(&trace).expect("again"), 0, "a second call moves nothing");
+        assert_eq!(
+            plan.host_declared(&trace).expect("again"),
+            0,
+            "a second call moves nothing"
+        );
 
         let trace = gpt_oss();
         let mut plan = Plan::of(&trace, &scales_of(&trace), Budgets::uncapped()).expect("plans");
         assert_eq!(plan.host_declared(&trace).expect("nothing to move"), 0);
-        assert!(!plan.streams(), "a trace that declares no host plane plans as before");
+        assert!(
+            !plan.streams(),
+            "a trace that declares no host plane plans as before"
+        );
     }
 
     fn a_packed_bank_the_plan_pairs_no_scales_with_is_refused_by_name() {

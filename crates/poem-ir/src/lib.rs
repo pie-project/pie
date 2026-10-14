@@ -21,7 +21,8 @@ pub use ops::{
 };
 pub use request::{Request, Stream};
 pub use trace::{
-    BlockDrafter, CacheRow, Node, Param, ParamLayout, ParamPlacement, ParamSource, Platform, Seam, Shard, Trace,
+    BlockDrafter, CacheRow, Node, Param, ParamLayout, ParamPlacement, ParamSource, Platform, Seam,
+    Shard, Trace,
 };
 pub use value::{
     BIASES, Def, Dim, Dtype, GLOBAL_SCALES, GeomKind, INPUT_SCALES, PerAxis, RowAxis, RuntimeInput,

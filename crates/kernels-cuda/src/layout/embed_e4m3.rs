@@ -68,11 +68,8 @@ pub fn embed_concat_e4m3(
     })?;
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!("::pie::layout::{entry}<{t}>")),
-        )
-        .apply(Launch::flat(lanes, BLOCK)),
+        Fire::at(FILE, symbol(&format!("::pie::layout::{entry}<{t}>")))
+            .apply(Launch::flat(lanes, BLOCK)),
         &[
             ids.arg(),
             codes.arg(),

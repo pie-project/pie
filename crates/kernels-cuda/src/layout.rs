@@ -306,7 +306,9 @@ pub fn split_qkv(
     // 16-byte runs: a copy, so the same bits land either way.
     let vec8 = q.width.is_multiple_of(8)
         && k.width.is_multiple_of(8)
-        && [packed.ptr, q.ptr, k.ptr, v.ptr].iter().all(|p| p % 16 == 0);
+        && [packed.ptr, q.ptr, k.ptr, v.ptr]
+            .iter()
+            .all(|p| p % 16 == 0);
     let (entry, width) = if vec8 {
         ("split_qkv_vec8", q.width.max(k.width) / 8)
     } else {
@@ -314,7 +316,11 @@ pub fn split_qkv(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::layout::{entry}<::pie::bf16>"))).apply(Launch::grid(
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::layout::{entry}<::pie::bf16>")),
+        )
+        .apply(Launch::grid(
             [q.rows, width.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
