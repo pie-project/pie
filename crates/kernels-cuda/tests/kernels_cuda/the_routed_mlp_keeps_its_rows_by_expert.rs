@@ -8,7 +8,7 @@ use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::moe::{
     ExpertTable, GluBank, GroupSeat, experts, matmul_select, matmul_select_quant, select_glu,
-    weighted_sum,
+    sigmoid_gate_add, weighted_sum,
 };
 use kernels_cuda::linear::tc5::{Glu, supported};
 use kernels_cuda::tensor::Tensor;
@@ -26,7 +26,9 @@ enum Bank {
 }
 
 fn check(tokens: usize, hidden: usize, inter: usize, bank: Bank, n_experts: usize, top: usize) {
-    check_in(tokens, hidden, inter, bank, n_experts, top, None);
+    for gated in [false, true] {
+        check_in(tokens, hidden, inter, bank, n_experts, top, None, gated);
+    }
 }
 
 /// `window`: (live tokens, first live token), armed as the context's stage.
@@ -39,6 +41,7 @@ fn check_in(
     n_experts: usize,
     top: usize,
     window: Option<(u32, u32)>,
+    gated: bool,
 ) {
     #[allow(non_snake_case)]
     let (EXPERTS, TOP) = (n_experts, top);
@@ -152,6 +155,34 @@ fn check_in(
     }
     let mut apart_out = apart;
     weighted_sum(&ctx, r, weights_t, &mut apart_out).expect("the sum fires");
+    // Under a gate, Qwen's shared expert row added at its sigmoid.
+    let gate = gated.then(|| {
+        let mut l = Lcg::seeded(0x77 ^ tokens as u64);
+        let (shared_raw, _) = l.row(tokens * hidden);
+        let (gate_raw, _) = l.row(tokens);
+        (
+            Tensor::new(
+                gpu.up(&shared_raw),
+                tokens as u32,
+                hidden as u32,
+                Dtype::Bf16,
+            ),
+            Tensor::new(gpu.up(&gate_raw), tokens as u32, 1, Dtype::Bf16),
+        )
+    });
+    let apart = match gate {
+        Some((shared, g)) => {
+            let mut gated_out = Tensor::new(
+                gpu.zeros(tokens * hidden * 2),
+                tokens as u32,
+                hidden as u32,
+                Dtype::Bf16,
+            );
+            sigmoid_gate_add(&ctx, apart, shared, g, &mut gated_out).expect("the gate-add fires");
+            gated_out
+        }
+        None => apart,
+    };
 
     // Kept by expert.
     let kept = Tensor::new(
@@ -173,6 +204,7 @@ fn check_in(
         &mut kept_out,
         ExpertTable::RESIDENT,
         ExpertTable::RESIDENT,
+        gate,
     )
     .expect("the routed MLP fires");
     assert!(took, "the grouped GEMM takes a {tokens}-token fire");
@@ -213,8 +245,8 @@ fn the_routed_mlp_keeps_its_rows_by_expert_every_case() {
     }
     // Qwen3.6's routing: 256 experts, top 8, at a decode batch and a prefill.
     // A live window of a decode plane, as a captured step fires it.
-    check_in(64, 2048, 512, Bank::Bf16, 256, 8, Some((40, 8)));
-    check_in(64, 256, 128, Bank::Mxfp4, 16, 4, Some((17, 3)));
+    check_in(64, 2048, 512, Bank::Bf16, 256, 8, Some((40, 8)), true);
+    check_in(64, 256, 128, Bank::Mxfp4, 16, 4, Some((17, 3)), false);
     for tokens in [64, 33, 512] {
         check(tokens, 2048, 512, Bank::Bf16, 256, 8);
     }

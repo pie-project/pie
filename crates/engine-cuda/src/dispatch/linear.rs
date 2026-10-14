@@ -31,9 +31,10 @@ impl Run<'_> {
                 glu,
                 down,
                 sum,
+                gate_add,
             } => {
                 #[cfg(feature = "cuda")]
-                if self.moe_experts(select, glu, down, sum)? {
+                if self.moe_experts(select, glu, down, sum, gate_add.as_deref())? {
                     return Ok(());
                 }
                 // Apart, the gate-up select and its GLU as their own fusion.
@@ -42,7 +43,11 @@ impl Run<'_> {
                     glu: glu.clone(),
                 })?;
                 self.linear(down)?;
-                self.linear(sum)
+                self.linear(sum)?;
+                match gate_add {
+                    Some(gate_add) => self.linear(gate_add),
+                    None => Ok(()),
+                }
             }
             Fused::MatmulSwiglu {
                 act,
@@ -908,6 +913,7 @@ impl Run<'_> {
         glu: &Linear,
         down: &Linear,
         sum: &Linear,
+        gate_add: Option<&Linear>,
     ) -> Result<bool, kernels_cuda::Error> {
         use linear::tc5::Glu;
         if !self.ctx().tuning().moe_tc5 || !linear::tc5::supported() {
@@ -962,6 +968,17 @@ impl Run<'_> {
         if up_y != packed || down_x != hidden || down_routes != routes || down_y != summed {
             return Ok(false);
         }
+        // Under a gate, the gate-add's row lands, the shared row added.
+        let (y, gate) = match gate_add {
+            None => (y, None),
+            Some(&Linear::MoeSigmoidGateAdd {
+                routed,
+                shared,
+                gate,
+                y: gated,
+            }) if routed == y => (gated, Some((self.tensor(shared), self.tensor(gate)))),
+            Some(_) => return Ok(false),
+        };
         let x = self.tensor(x);
         let routes = self.tensor(routes);
         let weights = self.tensor(weights);
@@ -978,6 +995,7 @@ impl Run<'_> {
             &mut out,
             up_experts,
             down_experts,
+            gate,
         )
     }
 

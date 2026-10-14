@@ -596,17 +596,22 @@ pub(crate) fn gather_back(
 
 /// `y[t] = sum_j weights[t][j] * grouped[pos[t * top + j]]`, in f32 and in
 /// `j` order, a dropped route adding nothing: `moe_weighted_sum` of the
-/// grouped product gathered back, read where it lies. Tokens past the live
-/// window are untouched.
+/// grouped product gathered back, read where it lies. Under a gate, plus
+/// `shared[t] * sigmoid(gate[t])`, rounded once. Tokens past the live window
+/// are untouched.
 pub(crate) fn weighted_gather(
     ctx: &Ctx,
     op: &'static str,
     grouped: u64,
     pos: u64,
     weights: Tensor,
+    gate: Option<(Tensor, Tensor)>,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     let (tokens, n, top) = (y.rows, y.width, weights.width);
+    // Under a gate, the shared expert's row and its gate column (a pitch a
+    // row); without, nothing.
+    let (shared, gate, pitch) = gate.map_or((0, 0, 0), |(s, g)| (s.ptr, g.ptr, g.width));
     if !n.is_multiple_of(8) || grouped % 16 != 0 || y.ptr % 16 != 0 {
         return Err(refuse(
             op,
@@ -624,6 +629,9 @@ pub(crate) fn weighted_gather(
             ArgValue::Ptr(grouped),
             ArgValue::Ptr(pos),
             weights.arg(),
+            ArgValue::Ptr(shared),
+            ArgValue::Ptr(gate),
+            int(pitch)?,
             y.arg(),
             int(n)?,
             int(top)?,

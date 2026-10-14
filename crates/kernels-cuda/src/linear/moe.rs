@@ -691,9 +691,20 @@ pub fn experts(
     y: &mut Tensor,
     up_experts: ExpertTable,
     down_experts: ExpertTable,
+    gate: Option<(Tensor, Tensor)>,
 ) -> Result<bool, Error> {
     use crate::linear::{act_quant, tc5};
     const OP: &str = "linear.moe_experts";
+    if let Some((shared, g)) = gate
+        && (shared.dtype != Dtype::Bf16
+            || g.dtype != Dtype::Bf16
+            || shared.rows != y.rows
+            || shared.width != y.width
+            || g.rows != y.rows
+            || g.width == 0)
+    {
+        return Ok(false);
+    }
     const GROUPED_X: &str = "linear.moe_tc5_x";
     const GROUPED_H: &str = "linear.moe_tc5_h";
     const GROUPED_Y: &str = "linear.moe_tc5_y";
@@ -771,7 +782,7 @@ pub fn experts(
             },
             count,
         )?;
-        act_quant::weighted_gather(ctx, OP, ys, layout.pos, weights, y)
+        act_quant::weighted_gather(ctx, OP, ys, layout.pos, weights, gate, y)
     };
     // A tcgen05 launch that fails leaves the four to run apart.
     Ok(run().is_ok())

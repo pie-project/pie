@@ -187,14 +187,17 @@ pub enum Fused {
     },
     /// A routed MLP: the gate-up select and its GLU (as in `MoeSelectGlu`),
     /// the down select of the GLU on the same routes, and the weighted sum
-    /// of its rows a token (`MoeWeightedSum`). A backend may keep the rows
-    /// between in its own layout, or run the four. The packed, GLU and
-    /// routed rows are still outputs, read by nothing else.
+    /// of its rows a token (`MoeWeightedSum`), and where it follows, the
+    /// shared expert's row added under its sigmoid gate
+    /// (`MoeSigmoidGateAdd`). A backend may keep the rows between in its own
+    /// layout, or run the ops. The packed, GLU and routed rows (and the sum,
+    /// under a gate) are still outputs, read by nothing else.
     MoeExperts {
         select: Box<Linear>,
         glu: Box<Linear>,
         down: Box<Linear>,
         sum: Box<Linear>,
+        gate_add: Option<Box<Linear>>,
     },
     QkvFusedQknormRopeVnormWrite {
         packed: ValueId,
@@ -291,7 +294,11 @@ impl Operands for Fused {
                 sink.push(*sinks);
             }
             Self::MoeExperts {
-                select, down, sum, ..
+                select,
+                down,
+                sum,
+                gate_add,
+                ..
             } => {
                 // The select's (x, bank, its bias, routes), the sum's weights,
                 // then the down bank and its bias.
@@ -306,6 +313,10 @@ impl Operands for Fused {
                     }
                     Linear::MoeMatmulSelectBias { bank, bias, .. } => sink.extend([bank, bias]),
                     _ => {}
+                }
+                // Then the gated shared expert's row and its gate.
+                if let Some(Linear::MoeSigmoidGateAdd { shared, gate, .. }) = gate_add.as_deref() {
+                    sink.extend([*shared, *gate]);
                 }
             }
             Self::QkvFusedQknormRopeVnormWrite {
@@ -389,11 +400,15 @@ impl Operands for Fused {
                 glu,
                 down,
                 sum,
+                gate_add,
             } => {
                 select.outputs(sink);
                 glu.outputs(sink);
                 down.outputs(sink);
                 sum.outputs(sink);
+                if let Some(gate_add) = gate_add {
+                    gate_add.outputs(sink);
+                }
             }
             Self::QkvFusedQknormRopeVnormWrite { q, .. } => sink.push(*q),
         }

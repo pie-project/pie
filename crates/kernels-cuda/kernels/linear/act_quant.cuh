@@ -436,6 +436,9 @@ __global__ void route_weighted_gather_vec8(
     const bf16* __restrict__ grouped,
     const i32* __restrict__ pos,
     const float* __restrict__ weights,
+    const bf16* __restrict__ shared,
+    const bf16* __restrict__ gate,
+    int gate_pitch,
     bf16* __restrict__ y,
     int n,
     int top,
@@ -458,6 +461,16 @@ __global__ void route_weighted_gather_vec8(
         const float wr = weights[base + j];
 #pragma unroll
         for (int i = 0; i < 8; ++i) acc[i] += wr * bf16_to_f32(v8[i]);
+    }
+    // Qwen's shared expert under its sigmoid gate, as moe_sigmoid_gate_add
+    // adds it.
+    if (shared != nullptr) {
+        const float gv = bf16_to_f32(gate[static_cast<long long>(plane) * gate_pitch]);
+        const float s = 1.f / (1.f + __expf(-gv));
+        const uint4 sv = *reinterpret_cast<const uint4*>(shared + static_cast<long long>(plane) * n + h0);
+        const bf16* s8 = reinterpret_cast<const bf16*>(&sv);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] += bf16_to_f32(s8[i]) * s;
     }
     uint4 out;
     bf16* o8 = reinterpret_cast<bf16*>(&out);

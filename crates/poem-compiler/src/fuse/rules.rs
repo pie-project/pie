@@ -389,7 +389,7 @@ fn moe_experts() -> Rule {
     let mut alternatives = Vec::new();
     for select in 0..3 {
         for glu in 0..4 {
-            for down in 0..3 {
+            for (down, gated) in (0..3).flat_map(|d| [(d, true), (d, false)]) {
                 alternatives.push(template(move |p| {
                     let x = p.rows("x", W);
                     let routes = p.value(
@@ -445,8 +445,19 @@ fn moe_experts() -> Rule {
                             dtype: Dtype::F32,
                         },
                     );
-                    let y = linear::moe_weighted_sum(&routed, &weights);
-                    p.export("y", &y);
+                    let summed = linear::moe_weighted_sum(&routed, &weights);
+                    if gated {
+                        // Qwen's gated shared expert, added to the sum.
+                        p.name("summed", &summed);
+                        let y = linear::moe_sigmoid_gate_add(
+                            &summed,
+                            &p.rows("shared", W),
+                            &p.rows("gate", W),
+                        );
+                        p.export("y", &y);
+                    } else {
+                        p.export("y", &summed);
+                    }
                 }));
             }
         }
@@ -456,11 +467,17 @@ fn moe_experts() -> Rule {
             Operation::Linear(op) => Box::new(op.clone()),
             other => panic!("`{name}` is computed by {other:?}, not a linear op"),
         };
+        // Under a gate the sum is `summed` and the gate-add `y`.
+        let (sum, gate_add) = match m.get("summed") {
+            Some(_) => (linear_op("summed"), Some(linear_op("y"))),
+            None => (linear_op("y"), None),
+        };
         Fused::MoeExperts {
             select: linear_op("packed"),
             glu: linear_op("hidden"),
             down: linear_op("routed"),
-            sum: linear_op("y"),
+            sum,
+            gate_add,
         }
     })
 }
