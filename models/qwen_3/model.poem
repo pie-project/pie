@@ -168,6 +168,7 @@ HEADS = {
         taps = [5, 19, 33, 47, 61], windows = [SLIDING] * 5, q_heads = 32, kv_heads = 8,
         head_dim = 128, inter = 17408, theta = 10000000.0, block = 8, mask_token = 248070,
         conv = struct(taps = 2, group = 16), readout = selector(rank = 256, top_k = 16),
+        bidirectional = True,
     ),
     "qwen38-27b-dspark": dflash_head(
         taps = [1, 16, 31, 46, 61], windows = [None] * 5, q_heads = 32, kv_heads = 8,

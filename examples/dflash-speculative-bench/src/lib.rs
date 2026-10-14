@@ -476,10 +476,9 @@ struct Input {
     /// load does not advertise it yet, so the caller states it; absent, v1's.
     #[serde(default)]
     block: Option<u32>,
-    /// Bind no mask to the draft fire. DFlash2's layers are all sliding and
-    /// causal inside the block, so its plan states no masked arm for the
-    /// draft rows and refuses a lane that carries one; v1's last layer is
-    /// bidirectional and needs the mask this loop builds.
+    /// Bind no mask to the draft fire. The runtime then stamps the whole
+    /// extent on the block lane and reads it both ways, which is the mask
+    /// this loop would build, without building it on the guest every round.
     #[serde(default)]
     no_mask: bool,
     /// Let the drafter's own logit margin choose the width per round, rather
