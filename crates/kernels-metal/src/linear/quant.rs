@@ -760,6 +760,52 @@ fn act_x_wt_over(
                     return staged(ctx, op, act, w, biases, y, scratch, (m, n, k, cols, ld));
                 }
             }
+            Qmm::Register => {
+                if cols % REGISTER_COLUMNS == 0 {
+                    // Without room for the partials it runs whole.
+                    let split = register_split(cols, k, tuning.cores());
+                    let partial = (split > 1)
+                        .then(|| {
+                            (scratch.partials)(
+                                m.unsigned_abs() * split.unsigned_abs(),
+                                n.unsigned_abs(),
+                            )
+                        })
+                        .flatten();
+                    let split = if partial.is_some() { split } else { 1 };
+                    let entry = symbol(&format!("affine_qmm_sg_k{split}"));
+                    let stamp = symbol(&format!("PIE_SG_POINT(\"{entry}\",{split})"));
+                    ctx.fire(
+                        Fire::at(REGISTER_FILE, entry).stamp(stamp).apply(Grid::of(
+                            [
+                                128 * (cols / REGISTER_COLUMNS).unsigned_abs(),
+                                split.unsigned_abs(),
+                                1,
+                            ],
+                            [128, 1, 1],
+                        )),
+                        &[
+                            w.codes.arg(),
+                            w.scales.arg(),
+                            biases.arg(),
+                            act.arg(),
+                            y.arg_mut(),
+                            k.arg(),
+                            n.arg(),
+                            match partial {
+                                Some(partial) => partial.arg_mut(),
+                                None => ctx.absent()?,
+                            },
+                            m.arg(),
+                            ld.arg(),
+                        ],
+                    )?;
+                    return match partial {
+                        Some(partial) => splitk_reduce(ctx, op, y, partial, (m, n, cols), split),
+                        None => Ok(()),
+                    };
+                }
+            }
             Qmm::Tiled { crossover_tg } => {
                 let crossover = i32::try_from(crossover_tg).unwrap_or(i32::MAX);
                 let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
@@ -953,6 +999,34 @@ fn act_x_wt_over(
 }
 
 const STAGED_TILE: i32 = 8;
+
+const REGISTER_FILE: &str = "linear/quant_qmm_sg.metal";
+
+/// The columns of one threadgroup of the register tile: four simdgroups of 16.
+const REGISTER_COLUMNS: i32 = 64;
+
+/// The contraction span the register tile stages and splits by.
+const REGISTER_SPAN: i32 = 256;
+
+/// The register tile's contraction partitions, as Splash's Apple9 register
+/// tile takes them: doubled (to 8) while the grid stays under 4 threadgroups
+/// a core with 256 inputs a partition, or under 32 a core with 1024.
+#[must_use]
+pub fn register_split(cols: i32, k: i32, cores: Option<u32>) -> i32 {
+    let cores = i64::from(cores.unwrap_or(32));
+    let grid = i64::from(cols / REGISTER_COLUMNS);
+    let spans = k / REGISTER_SPAN;
+    let mut split = 1i32;
+    while split < 8 && spans % (2 * split) == 0 {
+        let s = i64::from(split);
+        let holds = |tg: i64, inputs: i32| grid * s < tg * cores && k / (2 * split) >= inputs;
+        if !(holds(4, 256) || holds(32, 1024)) {
+            break;
+        }
+        split *= 2;
+    }
+    split
+}
 
 const STAGED_SPLIT_WIDE: i32 = 8;
 

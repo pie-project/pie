@@ -44,6 +44,15 @@ fn old_qmm(family: u32, at: &QmmAt) -> Qmm {
     {
         return Qmm::Staged;
     }
+    if family == 9
+        && (5..=8).contains(&at.rows)
+        && at.bits == 4
+        && at.group == 64
+        && at.n % 64 == 0
+        && at.k % 256 == 0
+    {
+        return Qmm::Register;
+    }
     let bn = if at.rows <= 8 { 64 } else { 128 };
     if mpp
         && at.bits == 4
