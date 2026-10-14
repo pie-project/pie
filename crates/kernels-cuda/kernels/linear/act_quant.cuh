@@ -346,7 +346,11 @@ __global__ void __launch_bounds__(kOffsetThreads) route_lay_out_small(
     int align,
     i32* __restrict__ counts,
     i32* __restrict__ offsets,
-    i32* __restrict__ pos)
+    i32* __restrict__ pos,
+    const float* __restrict__ input_scales,
+    const float* __restrict__ tensor_scales,
+    float* __restrict__ alpha,
+    int alpha_rows)
 {
     extern __shared__ int lay[];
     int* tally = lay;
@@ -387,6 +391,11 @@ __global__ void __launch_bounds__(kOffsetThreads) route_lay_out_small(
         at += rows(e);
     }
     if (tid == kOffsetThreads - 1) offsets[experts] = run_sum[tid];
+    // NVFP4's per-expert product scale (`expert_alpha`), where asked.
+    if (alpha != nullptr) {
+        for (int e = tid; e < experts; e += kOffsetThreads)
+            alpha[e] = input_scales[e] * tensor_scales[static_cast<long long>(e) * alpha_rows];
+    }
     __syncthreads();
 #pragma unroll
     for (int i = 0; i < kSmallPer; ++i) {

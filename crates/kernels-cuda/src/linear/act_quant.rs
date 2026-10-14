@@ -361,6 +361,20 @@ pub struct Bank {
     pub elem: tc5::Elem,
     pub gran: u32,
     pub alpha_e: u64,
+    /// Where `alpha_e` comes from, when the select lays it: NVFP4's input
+    /// scales and tensor scales (`rows` an expert), `alpha_e[e] =
+    /// input_scales[e] · tensor_scales[e · rows]` ([`expert_alpha`]),
+    /// written with the fire's route layout rather than in a launch of its
+    /// own.
+    pub alpha_from: Option<AlphaFrom>,
+}
+
+/// NVFP4's per-expert product scale's sources (see [`Bank::alpha_from`]).
+#[derive(Clone, Copy, Debug)]
+pub struct AlphaFrom {
+    pub input_scales: u64,
+    pub tensor_scales: u64,
+    pub rows: u32,
 }
 
 /// A fire of this many routes (or tokens, when no token names an expert
@@ -415,7 +429,15 @@ pub fn select(
         rows,
         groups,
         m_max,
-    } = lay_out(ctx, op, routes, experts, BLOCK_ROWS, false)?;
+    } = lay_out_with(
+        ctx,
+        op,
+        routes,
+        experts,
+        BLOCK_ROWS,
+        false,
+        bank.alpha_from.map(|a| (a, bank.alpha_e)),
+    )?;
     let (e, gran) = (experts as usize, fmt.gran() as usize);
     let atom_bytes = if m_max > 0 {
         tc5::masked_atom_bytes(e, m_max as usize, k as usize, gran)
@@ -483,6 +505,20 @@ pub(crate) fn lay_out(
     align: u32,
     distinct: bool,
 ) -> Result<Layout, Error> {
+    lay_out_with(ctx, op, routes, experts, align, distinct, None)
+}
+
+/// [`lay_out`], laying NVFP4's per-expert alpha too where `alpha` names its
+/// sources and destination: in the narrow fire's one launch, else apart.
+fn lay_out_with(
+    ctx: &Ctx,
+    op: &'static str,
+    routes: Tensor,
+    experts: u32,
+    align: u32,
+    distinct: bool,
+    alpha: Option<(AlphaFrom, u64)>,
+) -> Result<Layout, Error> {
     let tokens = routes.rows;
     let count = tokens * routes.width;
     let m_max = match distinct {
@@ -536,9 +572,24 @@ pub(crate) fn lay_out(
                 ArgValue::Ptr(counts),
                 ArgValue::Ptr(offsets),
                 ArgValue::Ptr(pos),
+                ArgValue::Ptr(alpha.map_or(0, |(a, _)| a.input_scales)),
+                ArgValue::Ptr(alpha.map_or(0, |(a, _)| a.tensor_scales)),
+                ArgValue::Ptr(alpha.map_or(0, |(_, out)| out)),
+                int(alpha.map_or(0, |(a, _)| a.rows))?,
             ],
         )?;
         return Ok(laid(pos));
+    }
+    if let Some((a, out)) = alpha {
+        expert_alpha(
+            ctx,
+            op,
+            a.input_scales,
+            a.tensor_scales,
+            out,
+            experts,
+            a.rows,
+        )?;
     }
     zero(ctx, op, counts, e * 4)?;
     // A block of routes tallies its experts in shared memory and touches the

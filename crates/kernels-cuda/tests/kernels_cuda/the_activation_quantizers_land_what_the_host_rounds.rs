@@ -3,8 +3,7 @@
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::act_quant::{
-    Bank, Format, Source, Weight, expert_alpha, matmul, quantize, read_back, scales_to_atoms,
-    select,
+    AlphaFrom, Bank, Format, Source, Weight, matmul, quantize, read_back, scales_to_atoms, select,
 };
 use kernels_cuda::linear::tc5::{Elem, atom_bytes, atom_offset, supported};
 use kernels_cuda::tensor::Tensor;
@@ -601,10 +600,6 @@ fn routed_select_at(
         1,
     )
     .expect("the bank's atoms land");
-    if nvfp4 {
-        expert_alpha(&ctx, OP, is_at, ts_at, alpha_at, experts as u32, n as u32)
-            .expect("the product scales land");
-    }
     let mut y = Tensor::new(y_at, count as u32, n as u32, Dtype::Bf16);
     if let Some(l) = live {
         let window = gpu.up(&[l as u32, 0, 0, 0]);
@@ -626,6 +621,12 @@ fn routed_select_at(
             elem: Elem::E2m1,
             gran: gran as u32,
             alpha_e: if nvfp4 { alpha_at } else { 0 },
+            // The select lays the product scales with the routes.
+            alpha_from: nvfp4.then_some(AlphaFrom {
+                input_scales: is_at,
+                tensor_scales: ts_at,
+                rows: n as u32,
+            }),
         },
         &mut y,
     )

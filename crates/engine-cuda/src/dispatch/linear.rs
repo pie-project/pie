@@ -1111,7 +1111,7 @@ impl Run<'_> {
         let route_t = self.tensor(routes);
         let mut out = self.tensor(y);
         let (experts, n, k) = (codes.rows, out.width, x.width);
-        let (fmt, elem, gran, alpha_e) = match (codes.dtype, quant) {
+        let (fmt, elem, gran, alpha_e, alpha_from) = match (codes.dtype, quant) {
             (Dtype::Nvfp4, ActQuant::Nvfp4) => {
                 let globals = self.tensor(input_scales.ok_or_else(|| {
                     kernels_cuda::Error::Backend {
@@ -1126,16 +1126,19 @@ impl Run<'_> {
                     .ctx()
                     .scratch_stream(OP, EXPERT_ALPHA, experts as usize * 4)?
                     as u64;
-                act_quant::expert_alpha(
-                    self.ctx(),
-                    OP,
-                    globals.ptr,
-                    tensor_scales.ptr,
+                // The select lays it with the fire's routes.
+                let from = act_quant::AlphaFrom {
+                    input_scales: globals.ptr,
+                    tensor_scales: tensor_scales.ptr,
+                    rows: n,
+                };
+                (
+                    act_quant::Format::Nvfp4,
+                    linear::tc5::Elem::E2m1,
+                    16,
                     alpha,
-                    experts,
-                    n,
-                )?;
-                (act_quant::Format::Nvfp4, linear::tc5::Elem::E2m1, 16, alpha)
+                    Some(from),
+                )
             }
             // An MXFP4 bank's codes are bound as bytes; only an MXFP4 bank pairs
             // with e4m3 activations.
@@ -1144,6 +1147,7 @@ impl Run<'_> {
                 linear::tc5::Elem::E2m1,
                 32,
                 0,
+                None,
             ),
             (stored, quant) => {
                 return Err(kernels_cuda::Error::Backend {
@@ -1175,6 +1179,7 @@ impl Run<'_> {
                 elem,
                 gran: gran as u32,
                 alpha_e,
+                alpha_from,
             },
             &mut out,
         )
