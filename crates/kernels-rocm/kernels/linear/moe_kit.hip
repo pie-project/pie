@@ -561,7 +561,7 @@ struct GroupDense {
         moe_u4 w;
     };
     static __device__ __forceinline__ Chunk fetch(const Planes& p, long long row, int k, int c) {
-        return {__builtin_nontemporal_load(reinterpret_cast<const moe_u4*>(p.w + row * k) + c)};
+        return {*(reinterpret_cast<const moe_u4*>(p.w + row * k) + c)};
     }
     static __device__ __forceinline__ void decode(const Chunk& c, u32* d) {
 #pragma unroll
@@ -627,7 +627,7 @@ struct GroupAffine {
 template <class C, class T, int MT>
 __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i32* __restrict__ order, int begin,
                                              int count, const typename C::Planes& p, const T* __restrict__ bias,
-                                             T* __restrict__ out, int act_div, int n, int k) {
+                                             T* __restrict__ out, int act_div, int n, int k, int tile = -1) {
     static_assert(MT == 32 || MT == 64 || MT == 128, "a work item is 32, 64 or 128 routes");
     constexpr int CODES = C::kCodes, KU = MT == 32 || C::kKU == 1 ? C::kKU : C::kKU / 2;
     constexpr int KC = 4 * KU * CODES;  // codes a stage
@@ -640,7 +640,7 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
     __shared__ __align__(16) T xt[MT * LD];
 
     const int tid = threadIdx.x, wave = tid / kWave, l = lane(), r16 = l % 16, g = l / 16;
-    const int row0 = blockIdx.y * TILE_N + wave * NB * 16;
+    const int row0 = (tile < 0 ? static_cast<int>(blockIdx.y) : tile) * TILE_N + wave * NB * 16;
     const int chunks = k / CODES;
     const int stages = (k + KC - 1) / KC;
 

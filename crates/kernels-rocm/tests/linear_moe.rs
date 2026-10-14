@@ -1829,3 +1829,55 @@ fn bench_grouped_projection() {
         println!("{line}");
     }
 }
+
+/// A prefill-sized routed matmul against the dense GEMM of the same
+/// products (hipBLASLt, every route's row against one expert's weight), at
+/// GLM-5.3-Flash's and Qwen3.8-Flash-Next's legs, or `MOE_PF="tokens,top_k,
+/// experts,n,k"`. Weights cold enough: the bank is the experts' own.
+#[test]
+#[ignore = "benchmark: cargo test --release --features rocm --test linear_moe bench_moe_prefill_vs_dense -- --ignored --nocapture"]
+fn bench_moe_prefill_vs_dense() {
+    let Some(gpu) = Gpu::open() else { return };
+    let planes = Planes::default();
+    let shapes: Vec<[usize; 5]> = match std::env::var("MOE_PF") {
+        Ok(spec) => {
+            let v: Vec<usize> = spec.split(',').map(|x| x.parse().unwrap()).collect();
+            vec![[v[0], v[1], v[2], v[3], v[4]]]
+        }
+        Err(_) => vec![
+            [8192, 8, 32, 4096, 4096],
+            [8192, 8, 32, 4096, 2048],
+            [8192, 10, 16, 1280, 2560],
+            [8192, 10, 16, 2560, 640],
+        ],
+    };
+    for [tokens, top_k, experts, n, k] in shapes {
+        let (experts, n, k) = (experts as u32, n as u32, k as u32);
+        let routes = make_routes(tokens, top_k, experts as usize, 3, false);
+        let rt = planes.i32s(&routes, tokens as u32, top_k as u32);
+        let x = gpu.tensor(&bf16s(tokens * k as usize, 1, 1.0), tokens as u32, k, Dtype::Bf16);
+        let mut y = gpu.zeros((tokens * top_k) as u32, n, Dtype::Bf16);
+        let bytes = u64::from(experts) * u64::from(n) * u64::from(k) * 2;
+        let bank = Tensor::new(
+            planes.keep(hip::Buffer::alloc(bytes as usize).unwrap(), 1, 1, Dtype::U8).ptr,
+            experts,
+            n * k,
+            Dtype::Bf16,
+        );
+        let flops = 2.0 * (tokens * top_k) as f64 * f64::from(n) * f64::from(k);
+        let ctx = gpu.ctx();
+        let us = gpu.time(6, || {
+            moe::matmul_select(&ctx, x, bank, rt, &mut y, moe::ExpertTable::RESIDENT).unwrap();
+        });
+        let xr = gpu.tensor(&bf16s(tokens * top_k * k as usize, 2, 1.0), (tokens * top_k) as u32, k, Dtype::Bf16);
+        let w = Tensor::new(bank.ptr, n, k, Dtype::Bf16);
+        let dense = gpu.time(6, || {
+            kernels_rocm::linear::gemm::matmul(&ctx, xr, w, &mut y).unwrap();
+        });
+        println!(
+            "moe prefill {tokens}x{top_k} over {experts} experts {n}x{k}: routed {us:8.1} us {:6.1} TFLOP/s | dense {dense:8.1} us {:6.1} TFLOP/s",
+            flops / us / 1e6,
+            flops / dense / 1e6
+        );
+    }
+}

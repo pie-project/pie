@@ -462,6 +462,8 @@ __global__ __launch_bounds__(256) void moe_matmul_select_gemv_by_route(
                           rows_per_wave, win);
 }
 
+constexpr int kDenseXcds = 8;
+
 // The grouped dense leg: routes ordered by expert (moe_route_order in
 // linear/quant.hip), one work item of up to MT a block. Grid (work items,
 // ⌈N / (32·waves)⌉), kGroupWaves<MT> waves.
@@ -471,10 +473,18 @@ __global__ __launch_bounds__(kGroupWaves<MT>* kWave) void moe_matmul_select_grou
                                                                  const i32* __restrict__ work,
                                                                  const T* __restrict__ bank, T* __restrict__ out,
                                                                  int act_div, int n, int k, int num_experts) {
+    // Each XCD (block b runs on XCD b mod 8) takes a run of the grid in
+    // (tile, item) order: its CUs walk one weight tile's items together, so
+    // the tile is read from its L2 once a wave of them, not once an XCD each.
+    const int blocks = gridDim.x * gridDim.y;
+    const int b = blockIdx.x + gridDim.x * blockIdx.y;
+    const int at = (b % kDenseXcds) * ((blocks + kDenseXcds - 1) / kDenseXcds) + b / kDenseXcds;
+    if (at >= blocks) return;
     GroupItem item;
-    if (!group_item(offsets, work, num_experts, MT, item)) return;
+    if (!group_item(offsets, work, num_experts, MT, item, at % gridDim.x)) return;
     const T* w = bank + static_cast<long long>(item.expert) * n * k;
-    grouped_tile<GroupDense<T>, T, MT>(act, order, item.begin, item.count, {w}, nullptr, out, act_div, n, k);
+    grouped_tile<GroupDense<T>, T, MT>(act, order, item.begin, item.count, {w}, nullptr, out, act_div, n, k,
+                                       at / gridDim.x);
 }
 
 // The batch dense leg (decode batches): one work item of up to MT routes a
@@ -492,7 +502,6 @@ __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch(
                                                   k, blockIdx.y);
 }
 
-constexpr int kDenseXcds = 8;
 
 // The wide dense leg (wide decode batches): one work item of up to 4·MW
 // routes a block, NT weight rows, KC elements a stage; k a multiple of KC and the activation
