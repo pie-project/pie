@@ -330,7 +330,7 @@ pub fn prefill_with_scratch(
     tuning: &Tuning,
     partials: &dyn Fn(u32, u32) -> Option<Tensor>,
 ) -> Result<(), Error> {
-    if tuning.sdpa_mpp()
+    if (tuning.sdpa_mpp() || tuning.sdpa_split_bf16())
         && super::split::try_paged(
             ctx,
             q.data,
@@ -345,6 +345,7 @@ pub fn prefill_with_scratch(
             requests,
             partials,
             tuning.sdpa_split(),
+            tuning.sdpa_split_bf16(),
         )?
     {
         return Ok(());
@@ -371,7 +372,7 @@ pub fn masked_with_scratch(
     tuning: &Tuning,
     partials: &dyn Fn(u32, u32) -> Option<Tensor>,
 ) -> Result<(), Error> {
-    if tuning.sdpa_mpp()
+    if (tuning.sdpa_mpp() || tuning.sdpa_split_bf16())
         && super::split::try_paged(
             ctx,
             q.data,
@@ -386,6 +387,7 @@ pub fn masked_with_scratch(
             requests,
             partials,
             tuning.sdpa_split(),
+            tuning.sdpa_split_bf16(),
         )?
     {
         return Ok(());

@@ -34,6 +34,15 @@ fn f32s(v: &[u8]) -> Vec<f32> {
 }
 #[test]
 fn stored_q8_and_all_attention_routes_match_fp64() {
+    routes(true);
+}
+/// A bf16 pool through the same routes, its verify rows through the split kernel
+/// (`kernel.sdpa.split_bf16`), as Splash runs its verify attention.
+#[test]
+fn a_bf16_pool_takes_every_route_and_the_split_one_matches_fp64() {
+    routes(false);
+}
+fn routes(q8: bool) {
     // `PIE_TEST_MPP=1` lets prompt rows take the MPP kernel.
     let tuning = if std::env::var("PIE_TEST_MPP").as_deref() == Ok("1") {
         engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false)
@@ -111,7 +120,7 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
             page_size: page as i32,
             seq_stride: (kh * d) as u64,
             head_stride: d as u64,
-            q8: true,
+            q8,
         };
         let frame = dev.frame().unwrap();
         attn::kv_append(
@@ -126,7 +135,14 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
         frame.commit().unwrap();
         let mut kd = vec![0f32; k.len()];
         let mut vd = kd.clone();
-        for (orig, buf, qd) in [(&k, &kp, &mut kd), (&v, &vp, &mut vd)] {
+        if !q8 {
+            kd.copy_from_slice(&k);
+            vd.copy_from_slice(&v);
+        }
+        for (orig, buf, qd) in [(&k, &kp, &mut kd), (&v, &vp, &mut vd)]
+            .into_iter()
+            .filter(|_| q8)
+        {
             let raw = handles.read(bind(buf), buf.bytes()).unwrap();
             assert!(raw[orig.len() * 2..].iter().all(|x| *x == 0xa5));
             for (row, input) in orig.chunks_exact(d).enumerate() {
@@ -277,6 +293,7 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                                 Dtype::F32
                             )),
                             32,
+                            !q8,
                         )
                         .unwrap()
                     );

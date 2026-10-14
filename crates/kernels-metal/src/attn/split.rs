@@ -19,11 +19,15 @@ pub fn workspace_words(splits: u32, heads: u32) -> Option<u32> {
 
 macro_rules! split_points {
     ($($gh:literal),+) => {
-        fn point(gqa: u32) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
+        fn point(gqa: u32, bf16: bool) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
             match gqa {
                 $($gh => Some((
                     concat!("pie_q8_batch_pack_g", $gh),
-                    concat!("pie_q8_batch_split_g", $gh),
+                    if bf16 {
+                        concat!("pie_bf16_batch_split_g", $gh)
+                    } else {
+                        concat!("pie_q8_batch_split_g", $gh)
+                    },
                     concat!("pie_q8_batch_reduce_g", $gh),
                     concat!("PIE_Q8_BATCH(", $gh, ")"),
                 )),)+
@@ -49,8 +53,17 @@ pub fn try_paged(
     requests: u32,
     partials: &dyn Fn(u32, u32) -> Option<Tensor>,
     target: u32,
+    bf16: bool,
 ) -> Result<bool, Error> {
-    if !super::q8::enabled(pool, head_dim) {
+    // a q8 pool, or (where `kernel.sdpa.split_bf16` says) a bf16 pool stored as it was
+    // written, whose cells sit where a q8 pool's do
+    let q8 = super::q8::enabled(pool, head_dim);
+    let plain = bf16
+        && !pool.q8
+        && pool.head_stride == u64::from(head_dim)
+        && pool.keys.width == pool.values.width
+        && u64::from(pool.keys.width) == pool.seq_stride;
+    if !q8 && !plain {
         return Ok(false);
     }
     if requests == 0
@@ -73,7 +86,7 @@ pub fn try_paged(
         return Ok(false);
     }
     let shape = Paged::of("attention.split", q, pool, window, causal, head_dim)?;
-    let Some((pack, split, reduce, stamp)) = point(shape.gqa) else {
+    let Some((pack, split, reduce, stamp)) = point(shape.gqa, !q8) else {
         return Ok(false);
     };
     let splits = split_count(q.rows, target);

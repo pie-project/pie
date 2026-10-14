@@ -2,10 +2,13 @@
 using namespace metal;
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
-template <int GH>
+// KV is int8_t over a q8 pool, whose cells carry their own scale behind their D codes, and
+// bfloat over a pool stored as it was written: the same split, pack and reduce, as Splash
+// runs its verify rows over bf16 pages.
+template <int GH, typename KV = int8_t>
 [[kernel]] void pie_q8_batch_split(
-    const device bfloat *queries [[buffer(0)]], const device int8_t *k_pages [[buffer(1)]],
-    const device int8_t *v_pages [[buffer(2)]], device bfloat *out [[buffer(3)]],
+    const device bfloat *queries [[buffer(0)]], const device KV *k_pages [[buffer(1)]],
+    const device KV *v_pages [[buffer(2)]], device bfloat *out [[buffer(3)]],
     const constant int &gqa_factor [[buffer(4)]], const device int *position_ids [[buffer(5)]],
     const device int *req_of_token [[buffer(6)]], const device uint *kv_page_indices [[buffer(7)]],
     const device uint *kv_page_indptr [[buffer(8)]], const constant int &page_size [[buffer(9)]],
@@ -21,6 +24,9 @@ template <int GH>
 
   constexpr int SG = 8;
   constexpr int M = 8 * GH, N = 32, D = 256;
+  constexpr bool Q8 = sizeof(KV) == 1;
+  // a q8 cell is D codes then a scale, 2 * D bytes; a bf16 cell is D values
+  constexpr int W = Q8 ? 2 * D : D;
   const uint heads = GH * n_kv_heads, packed_rows = 8 * heads;
   const uint query_words = packed_rows * D / 2;
   workspace += tile.z * (query_words + splits * packed_rows * (D + 2));
@@ -47,8 +53,8 @@ template <int GH>
   auto a = tensor(const_cast<device bfloat *>(packed_q), extents<int, D, M>{}, array<int, 2>{1, D});
   auto sv = tensor(scores, extents<int, N, M>{}, array<int, 2>{1, N});
   auto p = tensor(probs, extents<int, N, M>{}, array<int, 2>{1, N});
-  auto v0 = tensor(const_cast<device int8_t *>(v_pages), dextents<int, 2>{D, N},
-                   array<int, 2>{1, n_kv_heads * 2 * D});
+  auto v0 = tensor(const_cast<device KV *>(v_pages), dextents<int, 2>{D, N},
+                   array<int, 2>{1, n_kv_heads * W});
   constexpr auto qkd = matmul2d_descriptor(M, N, D, false, true, false);
   constexpr auto pvd = matmul2d_descriptor(M, D, N, false, false, false,
                                            matmul2d_descriptor::mode::multiply_accumulate);
@@ -83,18 +89,23 @@ template <int GH>
         break;
 
       const uint physical = kv_page_indices[kv_page_indptr[req] + page];
-      const ulong off = (ulong(physical) * N * n_kv_heads + kv) * 2 * D;
-      auto k = tensor(const_cast<device int8_t *>(k_pages) + off, dextents<int, 2>{D, N},
-                      array<int, 2>{1, n_kv_heads * 2 * D});
+      const ulong off = (ulong(physical) * N * n_kv_heads + kv) * W;
+      auto k = tensor(const_cast<device KV *>(k_pages) + off, dextents<int, 2>{D, N},
+                      array<int, 2>{1, n_kv_heads * W});
       auto score =
           qkop.template get_destination_cooperative_tensor<decltype(a), decltype(k), float>();
       qkop.run(a, k, score);
       score.store(sv);
       if (tid < N) {
-        kscale[tid] = *reinterpret_cast<const device float *>(k_pages + off +
-                                                              ulong(tid) * n_kv_heads * 2 * D + D);
-        vscale[tid] = *reinterpret_cast<const device float *>(v_pages + off +
-                                                              ulong(tid) * n_kv_heads * 2 * D + D);
+        if constexpr (Q8) {
+          kscale[tid] = *reinterpret_cast<const device float *>(k_pages + off +
+                                                                ulong(tid) * n_kv_heads * W + D);
+          vscale[tid] = *reinterpret_cast<const device float *>(v_pages + off +
+                                                                ulong(tid) * n_kv_heads * W + D);
+        } else {
+          kscale[tid] = 1.0f;
+          vscale[tid] = 1.0f;
+        }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -143,8 +154,8 @@ template <int GH>
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      auto v = tensor(const_cast<device int8_t *>(v_pages) + off, dextents<int, 2>{D, N},
-                      array<int, 2>{1, n_kv_heads * 2 * D});
+      auto v = tensor(const_cast<device KV *>(v_pages) + off, dextents<int, 2>{D, N},
+                      array<int, 2>{1, n_kv_heads * W});
 
       for (ushort i = 0; i < acc.get_capacity(); ++i)
         if (acc.is_valid_element(i)) {
@@ -215,6 +226,13 @@ kernel void pie_q8_batch_reduce(const device float *workspace [[buffer(0)]],
 #define PIE_Q8_BATCH(gh) \
   template [[host_name("pie_q8_batch_split_g" #gh)]] [[kernel]] void pie_q8_batch_split<gh>( \
       const device bfloat *, const device int8_t *, const device int8_t *, device bfloat *, \
+      const constant int &, const device int *, const device int *, const device uint *, \
+      const device uint *, const constant int &, const constant int &, const constant float &, \
+      const device uchar *, const device uint &, const device uchar *, const constant int &, \
+      const device bfloat *, device float *, constant uint &, constant uint &, constant uint &, \
+      uint3, uint3, uint, uint); \
+  template [[host_name("pie_bf16_batch_split_g" #gh)]] [[kernel]] void pie_q8_batch_split<gh, bfloat>( \
+      const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *, \
       const constant int &, const device int *, const device int *, const device uint *, \
       const device uint *, const constant int &, const constant int &, const constant float &, \
       const device uchar *, const device uint &, const device uchar *, const constant int &, \
