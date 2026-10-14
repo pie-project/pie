@@ -330,22 +330,14 @@ __device__ __forceinline__ void mma_f16(u32 d, u64 a, u64 b, u32 idesc, bool acc
                   "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)))
 }
 
-// kind::f16 with A in TMEM at `a` (its rows the lanes, K along the
-// columns, two bf16 a column), B by descriptor.
-__device__ __forceinline__ void mma_f16_tmem_a(u32 d, u32 a, u64 b, u32 idesc, bool acc) {
-    asm volatile(
-        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, p;\n\t}"
-        ::"r"(d), "r"(a), "l"(b), "r"(idesc), "r"(static_cast<u32>(acc))
-        : "memory");
-}
-
 // As mma_f16 with A in TMEM at `a` (a row a lane, two 16-bit elements a
-// column; a K step of 16 is 8 columns on).
+// column; a K step of 16 is 8 columns on). Ordered against the memory
+// operations around it, as the TMEM stores that land A are.
 template <int G = 1>
 __device__ __forceinline__ void mma_f16_ts(u32 d, u32 a, u64 b, u32 idesc, bool acc) {
     PIE_TC5_GROUP(G, PIE_TC5_MMA_HEAD, ".kind::f16 [%0], [%1], %2, %3, p;\n\t}", ::"r"(d), "r"(a),
-                  "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)))
+                  "l"(b), "r"(idesc), "r"(static_cast<u32>(acc))
+                  : "memory")
 }
 
 template <int G = 1>

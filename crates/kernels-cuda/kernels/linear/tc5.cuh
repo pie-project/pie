@@ -805,8 +805,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         const u64 b = desc_q + 2 * j;
                         const bool accumulate = kb > kb0 || j > 0;
                         if constexpr (kMixP) {
-                            mma_f16_tmem_a(d, a_slot + h * 32 + j * 8, b,
-                                           idesc_dense(kF16Bf16, kF16Bf16, kM, kBN), accumulate);
+                            mma_f16_ts(d, a_slot + h * 32 + j * 8, b,
+                                       idesc_dense(kF16Bf16, kF16Bf16, kM, kBN), accumulate);
                         } else if constexpr (kKind == 0) {
                             mma_f16<kPair>(d, a, b, idesc_dense(kF16Bf16, kF16Bf16, kM, kBN),
                                            accumulate);
