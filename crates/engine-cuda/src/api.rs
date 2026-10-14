@@ -278,6 +278,10 @@ pub(crate) fn lattice(stated: Vec<u32>, max_tokens: u32, steps: u32) -> Vec<u32>
     }
 }
 
+/// The rows a fire takes when neither `max_forward_tokens` nor the chip's
+/// profile states them.
+pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
+
 fn bake_budgets(budgets: &LoadBudgets) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
@@ -300,7 +304,13 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
 
     let max_patches = budgets
         .max_patches
-        .unwrap_or_else(|| budgets.max_tokens.min(DERIVED_PATCH_CEILING))
+        .unwrap_or_else(|| {
+            let tokens = match budgets.max_tokens {
+                0 => DEFAULT_FORWARD_TOKENS,
+                tokens => tokens,
+            };
+            tokens.min(DERIVED_PATCH_CEILING)
+        })
         .max(PATCH_LATTICE_FLOOR);
     let mut buckets = Vec::new();
     let mut rung = PATCH_LATTICE_FLOOR;

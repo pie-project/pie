@@ -48,6 +48,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
+    if boot.budget.max_tokens == 0 {
+        boot.budget.max_tokens = match engine.forward_tokens {
+            0 => crate::api::DEFAULT_FORWARD_TOKENS,
+            tokens => tokens,
+        };
+    }
     if boot.slots == 0 {
         boot.slots = match engine.state_slots_per_lane {
             0 => DEFAULT_STATE_SLOTS,

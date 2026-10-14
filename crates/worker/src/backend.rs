@@ -99,7 +99,9 @@ fn cuda_budgets(
         .max(page_size);
     engine::Budgets {
         max_lanes: opts.max_forward_requests.unwrap_or(256).max(1),
-        max_tokens: opts.max_forward_tokens.unwrap_or(8192).max(1),
+        // Unstated, 0: the engine takes its chip's `engine.forward_tokens`,
+        // 8192 where the profile says nothing.
+        max_tokens: opts.max_forward_tokens.map_or(0, |tokens| tokens.max(1)),
         buckets: Vec::new(),
         max_adapters: adapter_seats,
         page_size,

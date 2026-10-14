@@ -35,9 +35,17 @@ sdpa.selected_mma = true
 # tok/s, TTFT p50 20.7 -> 6.1 s (TPOT p50 74 -> 93 ms, twice the lanes),
 # while its offline decode loses under 2% (bs1 8.99 -> 9.16 ms, bs64 37.01
 # -> 37.12 ms).
+
+# A fire of 16384 rows where `max_forward_tokens` is unstated (8192 elsewhere)
+# batches twice the prompt chunks into one pass of the weights. 256 requests
+# of 1024 in / 256 out offered at once, 8192 -> 16384 rows: Qwen3.8-27B 2645 ->
+# 3041 output tok/s, gpt-oss-120b 3537 -> 3866, Qwen3.6-35B-A3B 6573 -> 6385
+# (TTFT p50 2.1 -> 2.6 s), Gemma-4-31B 1384 -> 1402. The grouped expert legs
+# serve the wider fires' route runs.
 [engine]
 one_frame_when_short = true
 state_slots_per_lane = 2
+forward_tokens = 16384
 
 [provenance]
 source = "pie tune (quick, gemma4-31b) and the scoreboard's fixed points, end to end"
@@ -64,6 +72,7 @@ measured = [
   "kernel.sdpa.prefill.ctas_per_sm",
   "kernel.sdpa.selected_mma",
   "engine.copies",
+  "engine.forward_tokens",
   "engine.lattice_steps",
   "engine.one_frame_when_short",
   "engine.recording",

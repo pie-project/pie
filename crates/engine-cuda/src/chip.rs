@@ -85,6 +85,13 @@ pub struct StateSlotsPerLane(pub u32);
 #[decision(id = "engine.one_frame_when_short", flag, default = false, tune = engine)]
 pub struct OneFrameWhenShort;
 
+/// The rows one fire takes when `[engine] max_forward_tokens` is not
+/// stated; 0 keeps the fixed 8192. Wider fires batch more prompts' chunks
+/// into one pass of the weights, and their activation arena grows with them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.forward_tokens", constant(range(0..=65536)), default = 0, tune = engine)]
+pub struct ForwardTokens(pub u32);
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
     kernels_cuda::tuning::register(&mut r);
@@ -95,7 +102,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<WorkingSetPercent>()
         .add::<LatticeSteps>()
         .add::<StateSlotsPerLane>()
-        .add::<OneFrameWhenShort>();
+        .add::<OneFrameWhenShort>()
+        .add::<ForwardTokens>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     poem_compiler::costs::register(&mut r, 2);
     r
@@ -153,6 +161,7 @@ pub struct Engine {
     pub lattice_steps: u32,
     pub state_slots_per_lane: u32,
     pub one_frame_when_short: bool,
+    pub forward_tokens: u32,
 }
 
 impl Engine {
@@ -177,6 +186,7 @@ impl Engine {
             lattice_steps: profile.get::<LatticeSteps>().0,
             state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
             one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
+            forward_tokens: profile.get::<ForwardTokens>().0,
         }
     }
 }
@@ -423,6 +433,7 @@ mod tests {
                 lattice_steps: 1,
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
+                forward_tokens: 0,
             }
         );
         assert_eq!(
@@ -471,14 +482,16 @@ mod tests {
         );
         assert_eq!(Engine::of(&b200).state_slots_per_lane, 2);
         assert!(Engine::of(&b200).one_frame_when_short);
+        assert_eq!(Engine::of(&b200).forward_tokens, 16384);
         assert_eq!(
             Engine {
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
+                forward_tokens: 0,
                 ..Engine::of(&b200)
             },
             Engine::of(&family),
-            "only the state seating differs from the family's engine"
+            "only the state seating and the fire width differ from the family's engine"
         );
         assert_eq!(Engine::of(&family).state_slots_per_lane, 0);
         assert!(!Engine::of(&family).one_frame_when_short);
