@@ -92,6 +92,11 @@ MODELS = {m.key: m for m in [
           "experts mxfp4 (w4a16), rest bf16 / kv bf16", "gptoss-120b-bf16-mxfp4-kv-bf16",
           vllm_flags=["--extra", "--moe-backend marlin"],
           note="vLLM: default Triton mxfp4 MoE crashes at warmup on this build; --moe-backend marlin"),
+    Model("gptoss-20b", "openai/gpt-oss-20b", "experts mxfp4 (w4a16), rest bf16 / kv bf16",
+          "experts mxfp4 (w4a16), rest bf16 / kv bf16", "gptoss-20b-bf16-mxfp4-kv-bf16",
+          vllm_flags=["--extra", "--moe-backend marlin"],
+          note="vLLM: --moe-backend marlin, as gpt-oss-120b"),
+    Model("gemma4-e4b", "google/gemma-4-E4B-it", "bf16 / kv bf16", "bf16 / kv bf16", "gemma4-e4b-bf16-kv-bf16"),
     # Before the tcgen05 grouped select, a fire past 8191 tokens routed more
     # rows than the bf16 select GEMV takes, and the before runs held fires to
     # 4096 tokens; the select has no such limit now.
