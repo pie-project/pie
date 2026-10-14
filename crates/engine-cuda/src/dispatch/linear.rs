@@ -26,6 +26,28 @@ impl Run<'_> {
                 self.linear(select)?;
                 self.linear(glu)
             }
+            Fused::MatmulSwiglu {
+                act,
+                w,
+                intermediate,
+                packed,
+                y,
+            } => {
+                #[cfg(feature = "cuda")]
+                if self.dense_glu(*act, *w, *y, linear::tc5::Glu::Swiglu)? {
+                    return Ok(());
+                }
+                self.linear(&Linear::Matmul {
+                    act: *act,
+                    w: *w,
+                    y: *packed,
+                })?;
+                self.linear(&Linear::MlpSwiglu {
+                    packed: *packed,
+                    intermediate: *intermediate,
+                    y: *y,
+                })
+            }
             Fused::MatmulGeglu {
                 act,
                 w,
@@ -33,6 +55,10 @@ impl Run<'_> {
                 packed,
                 y,
             } => {
+                #[cfg(feature = "cuda")]
+                if self.dense_glu(*act, *w, *y, linear::tc5::Glu::GegluTanh)? {
+                    return Ok(());
+                }
                 // The skinny leg reads the weight as one dense handle; a split-plane
                 // bank resolves only through the matmul below.
                 if self.dense_weight(*w) {
@@ -670,6 +696,58 @@ impl Run<'_> {
         }
     }
 
+    /// A dense bf16 gate-up projection and its GLU as one tcgen05 GEMM, the
+    /// GLU in its epilogue, from `kernel.gemm.tc5_glu_from` rows on; `false`
+    /// leaves the projection and the GLU to run apart.
+    #[cfg(feature = "cuda")]
+    fn dense_glu(
+        &mut self,
+        act: ValueId,
+        w: ValueId,
+        y: ValueId,
+        glu: linear::tc5::Glu,
+    ) -> Result<bool, kernels_cuda::Error> {
+        use linear::tc5;
+        let a = self.tensor(act);
+        let out = self.tensor(y);
+        if a.dtype != Dtype::Bf16
+            || !self.dense_weight(w)
+            || a.rows < self.ctx().tuning().gemm_tc5_glu_from
+            || !tc5::supported()
+        {
+            return Ok(false);
+        }
+        let weight = self.tensor(w);
+        let (k, inter) = (a.width, out.width);
+        if weight.dtype != Dtype::Bf16
+            || weight.rows != 2 * inter
+            || weight.width != k
+            || !k.is_multiple_of(64)
+            || !inter.is_multiple_of(8)
+        {
+            return Ok(false);
+        }
+        // Every row the padded extent holds, as the GEMM it stands for.
+        let m = u32::try_from(
+            self.ctx()
+                .opaque_rows(i32::try_from(a.rows).unwrap_or(i32::MAX)),
+        )
+        .unwrap_or(a.rows);
+        tc5::gemm_epi(
+            self.ctx(),
+            tc5::Operand::plain(a.ptr, tc5::Elem::Bf16),
+            tc5::Operand::plain(weight.ptr, tc5::Elem::Bf16),
+            out.ptr,
+            [m, inter, k],
+            1.0,
+            tc5::Epilogue {
+                glu: Some(glu),
+                ..tc5::Epilogue::STORE
+            },
+        )?;
+        Ok(true)
+    }
+
     /// A gate-up select and its GLU as one grouped tcgen05 GEMM, the GLU in
     /// its epilogue (a bf16 bank, or an mxfp4 one, biased or not), when the
     /// fire takes it; `false` leaves the two to run apart.
@@ -689,6 +767,7 @@ impl Run<'_> {
                 alpha,
                 ..
             } => (packed, y, Glu::SwigluClampAlpha { limit, alpha }),
+            Linear::MlpGegluTanhPacked { packed, y, .. } => (packed, y, Glu::GegluTanh),
             _ => return Ok(false),
         };
         let (x, routes, bank, experts) = match *select {

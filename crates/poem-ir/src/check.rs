@@ -877,6 +877,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 lane_of_row: None, ..
             }
             | Fused::MatmulGeglu { .. }
+            | Fused::MatmulSwiglu { .. }
             | Fused::MlpSwiglu { .. }
             | Fused::LmHeadSoftcap { .. }
             | Fused::MatmulBias { .. } => &[],

@@ -44,6 +44,7 @@ flags! {
     MlpSwiglu = "fuse.mlp_swiglu" => "linear.mlp_swiglu",
     MatmulGeglu = "fuse.matmul_geglu" => "linear.matmul_geglu",
     MoeSelectGlu = "fuse.moe_select_glu" => "linear.moe_select_glu",
+    MatmulSwiglu = "fuse.matmul_swiglu" => "linear.matmul_swiglu",
     LmHeadSoftcap = "fuse.lm_head_softcap" => "linear.lm_head_softcap",
     MatmulBias = "fuse.matmul_bias" => "linear.matmul_bias",
     GatedResidualNormModulate = "fuse.gated_residual_norm_modulate" => "elementwise.gated_residual_norm_modulate",

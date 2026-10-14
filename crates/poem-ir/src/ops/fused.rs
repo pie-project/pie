@@ -108,6 +108,15 @@ pub enum Fused {
         packed: ValueId,
         y: ValueId,
     },
+    /// The packed gate-up projection and its SwiGLU; `packed` still an
+    /// output, read by nothing else.
+    MatmulSwiglu {
+        act: ValueId,
+        w: ValueId,
+        intermediate: u32,
+        packed: ValueId,
+        y: ValueId,
+    },
     /// A whole dense MLP: `gate_up` over `act`, swiglu, `down`. `packed` and
     /// `h` are the two intermediates, still written, so a backend may run
     /// the three primitives, or split the chain between engines.
@@ -136,7 +145,7 @@ pub enum Fused {
     },
     /// A routed gate-up select (`MoeMatmulSelect`, `..Bias` or `..Quant`,
     /// its `y` the packed gate|up rows) and the GLU of it (`MlpSwiglu`,
-    /// `..Clamp` or `..ClampAlpha`): a backend may land the GLU from the
+    /// `..Clamp`, `..ClampAlpha` or `MlpGegluTanhPacked`): a backend may land the GLU from the
     /// select's epilogue, or run the two. The packed rows are still an
     /// output, read by nothing else.
     MoeSelectGlu {
@@ -211,7 +220,9 @@ impl Operands for Fused {
                 sink.extend([*r, *g, *y, *m]);
                 sink.extend(*lane_of_row);
             }
-            Self::MatmulGeglu { act, w, .. } | Self::LmHeadSoftcap { act, w, .. } => {
+            Self::MatmulGeglu { act, w, .. }
+            | Self::MatmulSwiglu { act, w, .. }
+            | Self::LmHeadSoftcap { act, w, .. } => {
                 sink.extend([*act, *w]);
             }
             Self::MlpSwiglu {
@@ -280,7 +291,9 @@ impl Operands for Fused {
             } => {
                 sink.extend([*r_out, *normed, *out]);
             }
-            Self::MatmulGeglu { packed, y, .. } => sink.extend([*packed, *y]),
+            Self::MatmulGeglu { packed, y, .. } | Self::MatmulSwiglu { packed, y, .. } => {
+                sink.extend([*packed, *y]);
+            }
             Self::MlpSwiglu { packed, h, y, .. } => sink.extend([*packed, *h, *y]),
             Self::LmHeadSoftcap { y, y_out, .. } => sink.extend([*y, *y_out]),
             Self::MatmulBias { y, y_out, .. } => sink.extend([*y, *y_out]),
@@ -304,6 +317,7 @@ impl Operands for Fused {
                 sink.push((*y_out, *y));
             }
             Self::MatmulGeglu { .. }
+            | Self::MatmulSwiglu { .. }
             | Self::MlpSwiglu { .. }
             | Self::MoeSelectGlu { .. }
             | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
@@ -321,6 +335,7 @@ impl Operands for Fused {
             Self::NormModulate { .. } => "elementwise.norm_modulate",
             Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
             Self::MatmulGeglu { .. } => "linear.matmul_geglu",
+            Self::MatmulSwiglu { .. } => "linear.matmul_swiglu",
             Self::MlpSwiglu { .. } => "linear.mlp_swiglu",
             Self::LmHeadSoftcap { .. } => "linear.lm_head_softcap",
             Self::MatmulBias { .. } => "linear.matmul_bias",

@@ -24,6 +24,10 @@ fn glu(f: Glu, g: f64, u: f64) -> f64 {
             let g = g.min(l);
             (u.clamp(-l, l) + 1.0) * silu(g, f64::from(alpha))
         }
+        Glu::GegluTanh => {
+            let inner = (2.0 / std::f64::consts::PI).sqrt() * (g + 0.044_715 * g * g * g);
+            0.5 * g * (1.0 + inner.tanh()) * u
+        }
     }
 }
 
@@ -423,6 +427,18 @@ fn the_tcgen05_epilogue_lands_the_glu_and_the_next_operand_every_case() {
     }
     dense(bf, bf, clamp, 0, 130, [128, 256], false, false);
     dense(bf, bf, alpha, 0, 33, [256, 256], true, false);
+    // GeGLU (Gemma's), and a gate width that ends mid-block.
+    dense(
+        bf,
+        bf,
+        Some(Glu::GegluTanh),
+        0,
+        300,
+        [192, 512],
+        false,
+        false,
+    );
+    dense(bf, bf, Some(Glu::GegluTanh), 0, 20, [192, 512], true, false);
     dense(ds, ds, alpha, 0, 129, [384, 640], false, true);
     dense(bf, bf, None, 0, 150, [256, 512], false, true);
     dense(nv, nv, None, 0, 7, [256, 512], true, true);

@@ -410,6 +410,8 @@ pub enum Glu {
     /// `(clamp(u, ±limit) + 1) * g' * sigmoid(alpha * g')`, `g' = min(g,
     /// limit)` (`mlp_swiglu_clamp_alpha`).
     SwigluClampAlpha { limit: f32, alpha: f32 },
+    /// `gelu_tanh(g) * u` (`mlp_geglu_tanh_packed`).
+    GegluTanh,
 }
 
 /// Where the epilogue lands its `rows x n` result.
@@ -466,6 +468,7 @@ impl Epilogue {
             Some(Glu::Swiglu) => 1,
             Some(Glu::SwigluClamp { .. }) => 2,
             Some(Glu::SwigluClampAlpha { .. }) => 3,
+            Some(Glu::GegluTanh) => 4,
         }
     }
 

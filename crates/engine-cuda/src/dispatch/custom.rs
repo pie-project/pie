@@ -9,6 +9,7 @@ impl DispatchFused for Run<'_> {
         match op {
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op),
             Fused::MatmulGeglu { .. }
+            | Fused::MatmulSwiglu { .. }
             | Fused::MlpSwiglu { .. }
             | Fused::LmHeadSoftcap { .. }
             | Fused::MatmulBias { .. }

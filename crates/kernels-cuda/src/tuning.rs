@@ -32,6 +32,13 @@ pub struct MoeTc5;
 #[decision(id = "kernel.moe.tc5_from", constant(range(1..=65_536)), default = 16, tune = search)]
 pub struct MoeTc5From(pub u32);
 
+/// The fewest rows a dense gate-up projection lands its GLU from the
+/// tcgen05 GEMM's epilogue at; fewer keep the skinny kernel or the GEMM and
+/// the GLU apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.tc5_glu_from", constant(range(1..=65_536)), default = 64, tune = search)]
+pub struct GemmTc5GluFrom(pub u32);
+
 /// Whether a small decode batch still splits its keys across blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.decode.split_small", flag, default = false, tune = search)]
@@ -182,7 +189,8 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeAffineWmma>()
         .add::<MoeAffineGroupedFrom>()
         .add::<MoeTc5>()
-        .add::<MoeTc5From>();
+        .add::<MoeTc5From>()
+        .add::<GemmTc5GluFrom>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -216,6 +224,7 @@ pub struct Tuning {
     pub affine_grouped_from: u32,
     pub moe_tc5: bool,
     pub moe_tc5_from: u32,
+    pub gemm_tc5_glu_from: u32,
 }
 
 impl Tuning {
@@ -247,6 +256,7 @@ impl Tuning {
         affine_grouped_from: 16,
         moe_tc5: true,
         moe_tc5_from: 16,
+        gemm_tc5_glu_from: 64,
     };
 
     #[must_use]
@@ -278,6 +288,7 @@ impl Tuning {
             affine_grouped_from: profile.get::<MoeAffineGroupedFrom>().0,
             moe_tc5: profile.on::<MoeTc5>(&Anywhere),
             moe_tc5_from: profile.get::<MoeTc5From>().0,
+            gemm_tc5_glu_from: profile.get::<GemmTc5GluFrom>().0,
         }
     }
 }

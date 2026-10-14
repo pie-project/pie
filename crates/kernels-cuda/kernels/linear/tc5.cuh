@@ -97,6 +97,12 @@ template <int kGlu>
 __device__ __forceinline__ float glu(float g, float u, float limit, float galpha) {
     if constexpr (kGlu == 1) {
         return __fdividef(g, 1.f + __expf(-g)) * u;
+    } else if constexpr (kGlu == 4) {
+        // GeGLU, gelu's tanh form: 0.5 g (1 + tanh(sqrt(2 / pi) (g + 0.044715 g^3))) u.
+        float t;
+        const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(inner));
+        return 0.5f * g * (1.f + t) * u;
     } else {
         g = fminf(g, limit);
         u = fminf(fmaxf(u, -limit), limit);

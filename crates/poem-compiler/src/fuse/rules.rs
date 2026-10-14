@@ -22,6 +22,7 @@ pub(super) fn all() -> Vec<Rule> {
         mlp_swiglu(),
         matmul_geglu(),
         moe_select_glu(),
+        matmul_swiglu(),
         lm_head_softcap(),
         matmul_bias(),
         gated_residual_norm_modulate(),
@@ -280,12 +281,12 @@ fn mlp_swiglu() -> Rule {
 
 /// A routed gate-up select and its GLU: the select over a dense bank, a
 /// biased one (gpt-oss) or a quantized one, then SwiGLU, its clamp or its
-/// clamp-alpha form over the packed gate|up rows. The packed rows stay
+/// clamp-alpha form, or GeGLU (Gemma 4), over the packed gate|up rows. The packed rows stay
 /// inside the match.
 fn moe_select_glu() -> Rule {
     let mut alternatives = Vec::new();
     for select in 0..3 {
-        for glu in 0..3 {
+        for glu in 0..4 {
             alternatives.push(template(|p| {
                 let x = p.rows("x", W);
                 let bank = p.weight("bank", [W, W, W]);
@@ -313,6 +314,7 @@ fn moe_select_glu() -> Rule {
                 let y = match glu {
                     0 => linear::mlp_swiglu(&packed, intermediate),
                     1 => linear::mlp_swiglu_clamp(&packed, intermediate, p.f32("limit")),
+                    3 => linear::mlp_geglu_tanh_packed(&packed, intermediate),
                     _ => linear::mlp_swiglu_clamp_alpha(
                         &packed,
                         intermediate,
@@ -344,6 +346,25 @@ fn matmul_geglu() -> Rule {
         p.export("y", &y);
     });
     Rule::new("linear.matmul_geglu", [pattern], |m| Fused::MatmulGeglu {
+        act: m.value("act"),
+        w: m.value("w"),
+        intermediate: m.u32("intermediate"),
+        packed: m.value("packed"),
+        y: m.value("y"),
+    })
+}
+
+/// The packed gate-up projection and its SwiGLU, where the MLP's down
+/// projection stays apart (a backend that ships `linear.mlp_swiglu` forms
+/// that first).
+fn matmul_swiglu() -> Rule {
+    let pattern = template(|p| {
+        let packed = linear::matmul(&p.rows("act", W), &p.weight("w", [2 * W, W]));
+        p.name("packed", &packed);
+        let y = linear::mlp_swiglu(&packed, p.u32("intermediate"));
+        p.export("y", &y);
+    });
+    Rule::new("linear.matmul_swiglu", [pattern], |m| Fused::MatmulSwiglu {
         act: m.value("act"),
         w: m.value("w"),
         intermediate: m.u32("intermediate"),
