@@ -80,6 +80,10 @@ def bench_args(args: argparse.Namespace) -> argparse.Namespace:
         argv += ["--engine-option", opt]
     if getattr(args, "precision", None):
         argv += ["--precision", args.precision]
+    if getattr(args, "frame_dispatch_depth", None):
+        argv += ["--frame-dispatch-depth", str(args.frame_dispatch_depth)]
+    if getattr(args, "device_weight_budget", None):
+        argv += ["--device-weight-budget", args.device_weight_budget]
     return pie_bench.build_parser().parse_args(argv)
 
 
@@ -192,6 +196,10 @@ def main() -> None:
     ap.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
     ap.add_argument("--engine-option", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--precision", default=None, help="[model] precision, e.g. bf16+nvfp4a4")
+    ap.add_argument("--frame-dispatch-depth", type=int, default=None,
+                    help="[runtime] frame_dispatch_depth: frames a lane keeps posted (its state slots)")
+    ap.add_argument("--device-weight-budget", default=None,
+                    help="[model] device_weight_budget, e.g. 80GiB: what of the weights stays on the device")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
