@@ -508,7 +508,8 @@ pub(crate) fn lay_out(
     )?;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_offsets").apply(Launch::flat(32, 32)),
+        // One block scans the experts' rows into their starts.
+        Fire::at(FILE, "::pie::linear::route_offsets_scan").apply(Launch::flat(1024, 1024)),
         &[
             ArgValue::Ptr(counts),
             int(experts)?,

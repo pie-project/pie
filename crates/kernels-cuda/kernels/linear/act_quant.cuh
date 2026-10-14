@@ -258,6 +258,46 @@ __global__ void route_offsets(
     offsets[experts] = at;
 }
 
+// `route_offsets` across a block: each thread sums a run of consecutive
+// experts' rows, the block scans the runs, and each thread writes its run's
+// starts. The same integers, without one thread walking every expert.
+constexpr int kOffsetThreads = 1024;
+
+__global__ void __launch_bounds__(kOffsetThreads) route_offsets_scan(
+    const i32* __restrict__ counts,
+    int experts,
+    int m_max,
+    int align,
+    i32* __restrict__ offsets,
+    i32* __restrict__ cursor)
+{
+    __shared__ int run_sum[kOffsetThreads];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int per = (experts + kOffsetThreads - 1) / kOffsetThreads;
+    const int lo = min(tid * per, experts), hi = min(lo + per, experts);
+    auto rows = [&](int e) {
+        return m_max > 0 ? m_max : (counts[e] + align - 1) / align * align;
+    };
+    int sum = 0;
+    for (int e = lo; e < hi; ++e) sum += rows(e);
+    run_sum[tid] = sum;
+    __syncthreads();
+    // Inclusive scan over the runs.
+    for (int step = 1; step < kOffsetThreads; step <<= 1) {
+        const int add = tid >= step ? run_sum[tid - step] : 0;
+        __syncthreads();
+        run_sum[tid] += add;
+        __syncthreads();
+    }
+    int at = run_sum[tid] - sum;
+    for (int e = lo; e < hi; ++e) {
+        offsets[e] = at;
+        cursor[e] = at;
+        at += rows(e);
+    }
+    if (tid == kOffsetThreads - 1) offsets[experts] = run_sum[tid];
+}
+
 __global__ void route_place(
     const i32* __restrict__ routes,
     int count,
