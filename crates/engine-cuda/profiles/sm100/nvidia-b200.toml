@@ -1,0 +1,40 @@
+api = 1
+
+[target]
+device = "NVIDIA B200"
+
+# The fused skinny bf16 GEMM (GEGLU, soft-capped heads) loses to cuBLAS at
+# every row count it takes on this card: Gemma-4-31B decodes a step at one
+# lane in 12.84 ms without it and 14.98 ms with it, at eight in 13.63 and
+# 16.53, at 64 in 26.64 and 27.21. A model without those products reads
+# the same either way (Qwen3.8-27B 11.30 / 12.26 / 16.54 ms against
+# 11.29 / 12.34 / 16.48).
+[kernel]
+gemm.skinny_rows = 0
+
+[provenance]
+source = "pie tune (quick, gemma4-31b) and the scoreboard's fixed points, end to end"
+measured = [
+  "kernel.gemm.heuristics",
+  "kernel.gemm.skinny_rows",
+  "kernel.gemm.tc5_glu_from",
+  "kernel.gemm.workspace_mb",
+  "kernel.gemv.bf16",
+  "kernel.gemv.splitk_max_n",
+  "kernel.moe.mxfp4_grouped_reuse",
+  "kernel.moe.tc5_from",
+  "kernel.qmm.gemm_from",
+  "kernel.qmm.long_rows",
+  "kernel.qmm.split_thin_max",
+  "kernel.qmm.split_warps_per_sm",
+  "kernel.qmm.split_wide_max",
+  "kernel.sdpa.decode.chunk_floor_128",
+  "kernel.sdpa.decode.split_small",
+  "kernel.sdpa.decode.split_window",
+  "kernel.sdpa.decode.static_max_requests",
+  "kernel.sdpa.prefill.ctas_per_sm",
+  "engine.copies",
+  "engine.lattice_steps",
+  "engine.recording",
+  "engine.working_set_percent",
+]

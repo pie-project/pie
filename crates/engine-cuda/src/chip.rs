@@ -105,6 +105,7 @@ seeded!(
     "sm89/nvidia-l40s.toml",
     "sm90.toml",
     "sm100.toml",
+    "sm100/nvidia-b200.toml",
     "sm103.toml",
     "sm110.toml",
     "sm120.toml",
@@ -305,7 +306,7 @@ mod tests {
             (8, 7, "Orin"),
             (8, 9, "NVIDIA L4"),
             (9, 0, "NVIDIA H100 80GB HBM3"),
-            (10, 0, "NVIDIA B200"),
+            (10, 0, "NVIDIA GB200"),
             (10, 3, "NVIDIA B300"),
             (11, 0, "NVIDIA Thor"),
             (12, 0, "NVIDIA RTX PRO 6000"),
@@ -374,6 +375,33 @@ mod tests {
         fused.sort_unstable();
         shipped.sort_unstable();
         assert_eq!(fused, shipped);
+    }
+
+    #[test]
+    fn the_b200_runs_its_family_measured_with_the_skinny_gemm_off() {
+        let (b200, report) = resolve("NVIDIA B200", &facts(10, 0, 148), None);
+        assert_eq!(
+            report.layers,
+            [
+                profile::Source::Seeded("sm100.toml".into()),
+                profile::Source::Seeded("sm100/nvidia-b200.toml".into())
+            ]
+        );
+        assert!(!report.untuned());
+        let tuning = kernels_cuda::tuning::Tuning::of(&b200);
+        assert_eq!(
+            tuning.gemm_skinny_rows, 0,
+            "cuBLAS beats the skinny GEMM on a B200"
+        );
+        let (family, _) = resolve("NVIDIA GB200", &facts(10, 0, 152), None);
+        assert_eq!(
+            kernels_cuda::tuning::Tuning {
+                gemm_skinny_rows: kernels_cuda::tuning::Tuning::of(&family).gemm_skinny_rows,
+                ..tuning
+            },
+            kernels_cuda::tuning::Tuning::of(&family),
+            "only the skinny GEMM's reach differs from the family"
+        );
     }
 
     #[test]
