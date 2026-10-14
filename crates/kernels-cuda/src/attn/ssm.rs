@@ -799,16 +799,11 @@ impl Delta {
     }
 }
 
-/// The value columns one block of the chunked scan carries: a whole head
-/// once the requests' heads cover every SM, half a head (each half
-/// recomputing its chunk's scores) when fewer would leave SMs idle.
-fn scan_bv(lanes: u32, v_heads: u32, sms: u32) -> u32 {
-    if lanes.saturating_mul(v_heads) >= sms {
-        128
-    } else {
-        64
-    }
-}
+/// The value columns one block of the chunked scan carries: half a head,
+/// so a lone long request still spreads over twice its heads' blocks. A
+/// captured fire states its bucket's lanes, not the live ones, so the width
+/// cannot follow the batch.
+const SCAN_BV: u32 = 64;
 
 #[allow(clippy::too_many_arguments)]
 fn gated_delta_chunked_fla(
@@ -858,6 +853,12 @@ fn gated_delta_chunked_fla(
         "attn.ssm_gdn_chunk_u",
         padded.elems(v_heads, v_dim),
     )?;
+    let pm = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_p",
+        u64::from(slots) * u64::from(v_heads) * u64::from(CH * CH),
+    )?;
     #[allow(clippy::cast_precision_loss)]
     let q_scale = (k_dim as f32).sqrt().recip();
     let prep_smem =
@@ -878,6 +879,7 @@ fn gated_delta_chunked_fla(
             ArgValue::Ptr(kn),
             ArgValue::Ptr(w),
             ArgValue::Ptr(u),
+            ArgValue::Ptr(pm),
             stated(op, lanes)?.arg(),
             stated(op, k_heads)?.arg(),
             stated(op, v_heads)?.arg(),
@@ -886,19 +888,17 @@ fn gated_delta_chunked_fla(
             ctx.stage(),
         ],
     )?;
-    let bv = scan_bv(lanes, v_heads, ctx.multiprocessors().unwrap_or(148));
-    let ldv = bv + 8;
-    let stage = 3 * CH * LD + CH * ldv + 2 * CH;
-    let scan_smem = (2 * stage + k_dim * ldv + 2 * CH * ldv + CH * LDC) * 2;
-    let entry = if bv == 128 {
-        "::pie::attn::ssm_gdn_chunk_scan<128>"
-    } else {
-        "::pie::attn::ssm_gdn_chunk_scan<64>"
-    };
+    let ldv = SCAN_BV + 8;
+    let scan_smem =
+        (4 * CH * LD + CH * ldv + CH * LDC + k_dim * ldv + 2 * CH * ldv) * 2 + 2 * CH * FLOAT;
     ctx.fire(
         op,
-        Fire::at(FILE, entry).apply(
-            Launch::grid([lanes * v_heads * (v_dim / bv), 1, 1], [2 * BLOCK, 1, 1]).smem(scan_smem),
+        Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_scan<64>").apply(
+            Launch::grid(
+                [lanes * v_heads * (v_dim / SCAN_BV), 1, 1],
+                [2 * BLOCK, 1, 1],
+            )
+            .smem(scan_smem),
         ),
         &[
             ArgValue::Ptr(gcum),
@@ -906,6 +906,7 @@ fn gated_delta_chunked_fla(
             ArgValue::Ptr(kn),
             ArgValue::Ptr(w),
             ArgValue::Ptr(u),
+            ArgValue::Ptr(pm),
             state.slab.arg(),
             state.slot_ids.arg(),
             qkv.indptr.arg(),

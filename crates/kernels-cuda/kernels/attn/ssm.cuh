@@ -2999,7 +2999,8 @@ constexpr int GDN_LDA = 68;
 // (chunk, value head) normalizes its chunk's key rows, scans the decay
 // within the chunk, inverts `I + A` with `A = tril(beta_i k_i . k_j
 // exp(G_i - G_j), -1)` and lands `w = T (beta exp(G) k)` and
-// `u = T (beta v)`, the chunk's update directions, beside the normalized
+// `u = T (beta v)`, the chunk's update directions, and the chunk's decayed
+// causal scores `P = tril(q_i . k_j exp(G_i - G_j))`, beside the normalized
 // queries and keys (written once per key head) and the decay's running sum.
 template <int BK, int BV>
 __global__ void __launch_bounds__(256) ssm_gdn_chunk_prep(
@@ -3014,6 +3015,7 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_prep(
     bf16* __restrict__ kn_out,
     bf16* __restrict__ w_out,
     bf16* __restrict__ u_out,
+    bf16* __restrict__ p_out,
     int lanes, int K_h, int V_h, int conv_dim,
     float q_scale,
     const u32* __restrict__ win)
@@ -3049,8 +3051,9 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_prep(
     const int l = tid & 31;
     const int K_dim = K_h * BK;
 
-    // The chunk's raw key, value and (once per key head) query rows land
-    // whole before any is read; the queries borrow the score tile's space.
+    // The chunk's raw key, value and query rows land whole before any is
+    // read; the queries borrow the decay tile's space until the scores are
+    // formed.
     bf16* qs = reinterpret_cast<bf16*>(A);
     for (int e = tid; e < GDN_CH * (BK / 8); e += THREADS) {
         const int i = e / (BK / 8);
@@ -3059,7 +3062,7 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_prep(
         const bf16* row = qkv_post + static_cast<long long>(ta + (in ? i : 0) + row0) * conv_dim;
         gdn_cp16(ks + i * GDN_LD + c, row + K_dim + hk * BK + c, in);
         gdn_cp16(vs + i * GDN_LD + c, row + 2 * K_dim + h * BV + c, in);
-        if (writer) gdn_cp16(qs + i * GDN_LD + c, row + hk * BK + c, in);
+        gdn_cp16(qs + i * GDN_LD + c, row + hk * BK + c, in);
     }
     gdn_cp_commit();
     if (tid < GDN_CH) {
@@ -3089,20 +3092,20 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_prep(
         const float2 v01 = gdn_unpack(vr.x);
         const float2 v23 = gdn_unpack(vr.y);
         *vp = make_uint2(gdn_pack(v01.x * beta, v01.y * beta), gdn_pack(v23.x * beta, v23.y * beta));
-        if (writer) {
-            const uint2 qr = *reinterpret_cast<const uint2*>(qs + i * GDN_LD + l * 4);
-            const float2 q01 = gdn_unpack(qr.x);
-            const float2 q23 = gdn_unpack(qr.y);
-            const float qinv = rsqrtf(
-                warp_sum(q01.x * q01.x + q01.y * q01.y + q23.x * q23.x + q23.y * q23.y) + 1e-6f)
-                * q_scale;
-            if (in) {
-                const long long at = (static_cast<long long>(ta + i) * K_h + hk) * BK + l * 4;
-                *reinterpret_cast<uint2*>(kn_out + at) = kw;
-                *reinterpret_cast<uint2*>(qn_out + at) =
-                    make_uint2(gdn_pack(q01.x * qinv, q01.y * qinv),
-                               gdn_pack(q23.x * qinv, q23.y * qinv));
-            }
+        uint2* qp = reinterpret_cast<uint2*>(qs + i * GDN_LD + l * 4);
+        const uint2 qr = *qp;
+        const float2 q01 = gdn_unpack(qr.x);
+        const float2 q23 = gdn_unpack(qr.y);
+        const float qinv = rsqrtf(
+            warp_sum(q01.x * q01.x + q01.y * q01.y + q23.x * q23.x + q23.y * q23.y) + 1e-6f)
+            * q_scale;
+        const uint2 qw = make_uint2(gdn_pack(q01.x * qinv, q01.y * qinv),
+                                    gdn_pack(q23.x * qinv, q23.y * qinv));
+        *qp = qw;
+        if (writer && in) {
+            const long long at = (static_cast<long long>(ta + i) * K_h + hk) * BK + l * 4;
+            *reinterpret_cast<uint2*>(kn_out + at) = kw;
+            *reinterpret_cast<uint2*>(qn_out + at) = qw;
         }
     }
     __syncthreads();
@@ -3132,25 +3135,49 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_prep(
     const int m0 = (warp & 3) * 16;
     const int half_n = warp >> 2;
     {
+        // `k k^T` and `q k^T` share their key operand.
         const int j0 = half_n * 32;
         float acc[4][4];
+        float qkc[4][4];
         #pragma unroll
         for (int nt = 0; nt < 4; ++nt) {
             #pragma unroll
-            for (int e = 0; e < 4; ++e) acc[nt][e] = 0.f;
+            for (int e = 0; e < 4; ++e) {
+                acc[nt][e] = 0.f;
+                qkc[nt][e] = 0.f;
+            }
         }
         #pragma unroll
         for (int kk = 0; kk < BK / 16; ++kk) {
             unsigned a[4];
+            unsigned aq[4];
             gdn_ldsm(a, gdn_at_a(ks, GDN_LD, m0, kk * 16, l));
+            gdn_ldsm(aq, gdn_at_a(qs, GDN_LD, m0, kk * 16, l));
             #pragma unroll
             for (int np = 0; np < 2; ++np) {
                 unsigned b[4];
                 gdn_ldsm(b, gdn_at_bt(ks, GDN_LD, j0 + np * 16, kk * 16, l));
                 gdn_mma(acc[2 * np], a, b[0], b[1]);
                 gdn_mma(acc[2 * np + 1], a, b[2], b[3]);
+                gdn_mma(qkc[2 * np], aq, b[0], b[1]);
+                gdn_mma(qkc[2 * np + 1], aq, b[2], b[3]);
             }
         }
+        bf16* pd = p_out + (static_cast<long long>(s) * V_h + h) * GDN_CH * GDN_CH;
+        #pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            #pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int i = m0 + g + 8 * half;
+                const int jj = j0 + nt * 8 + 2 * t;
+                const float p0 = (jj <= i && i < L)
+                    ? qkc[nt][2 * half] * __expf(G[i] - G[jj]) : 0.f;
+                const float p1 = (jj + 1 <= i && i < L)
+                    ? qkc[nt][2 * half + 1] * __expf(G[i] - G[jj + 1]) : 0.f;
+                *reinterpret_cast<unsigned*>(pd + i * GDN_CH + jj) = gdn_pack(p0, p1);
+            }
+        }
+        __syncthreads();
         #pragma unroll
         for (int nt = 0; nt < 4; ++nt) {
             #pragma unroll
@@ -3290,13 +3317,14 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_prep(
 
 // The sequential half: one block per (request, value head, `BV`-wide value
 // tile) walks the request's chunks in order with the `BK x BV` state in f32
-// accumulators. Each chunk lands its output — the
-// decayed state's reading `exp(G_i) q_i S` plus the chunk's own causal part
-// `(q k^T * exp(G_i - G_j)) v_new` with `v_new = u - w S` — and then folds
-// the chunk into the state, `S = exp(G_L) S + k^T (exp(G_L - G_j) v_new)`.
-// The chunk's rows split four ways and its value columns two ways over the
-// eight warps; the next chunk's operands stream in while this one
-// multiplies.
+// accumulators. Each chunk lands its output — the decayed state's reading
+// `exp(G_i) q_i S` plus the chunk's own causal part `P v_new`, with `P` the
+// prep's decayed causal scores and `v_new = u - w S` — and then folds the
+// chunk into the state, `S = exp(G_L) S + k^T (exp(G_L - G_j) v_new)`. The
+// chunk's rows split four ways and its value columns two ways over the
+// eight warps. Each operand of the next chunk streams in as soon as this
+// chunk is done with its buffer: q, w and u once `v_new` is formed, the
+// scores once the output is, and k and the decay into a second buffer.
 template <int BV>
 __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
     const float* __restrict__ gcum,
@@ -3304,6 +3332,7 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
     const bf16* __restrict__ kn,
     const bf16* __restrict__ w,
     const bf16* __restrict__ u,
+    const bf16* __restrict__ pm,
     __nv_bfloat16* __restrict__ state_base,
     const int* __restrict__ slot_ids,
     const u32* __restrict__ qo_indptr,
@@ -3323,14 +3352,17 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
     constexpr int CN = BV / 2;
     constexpr int CT = CN / 8;
     constexpr int LDV = BV + 8;
-    constexpr int STAGE = 3 * GDN_CH * GDN_LD + GDN_CH * LDV + 2 * GDN_CH;
     static_assert(CN % 16 == 0 && V % BV == 0, "a warp's value columns are whole sixteen-wide pairs");
     extern __shared__ __align__(16) unsigned char gdn_smem[];
-    bf16* stage0 = reinterpret_cast<bf16*>(gdn_smem);
-    bf16* hs = stage0 + 2 * STAGE;
+    bf16* sq = reinterpret_cast<bf16*>(gdn_smem);
+    bf16* sw = sq + GDN_CH * GDN_LD;
+    bf16* sk0 = sw + GDN_CH * GDN_LD;
+    bf16* su = sk0 + 2 * GDN_CH * GDN_LD;
+    bf16* sp = su + GDN_CH * LDV;
+    bf16* hs = sp + GDN_CH * GDN_LDC;
     bf16* vn = hs + BK * LDV;
     bf16* vsc = vn + GDN_CH * LDV;
-    bf16* ps = vsc + GDN_CH * LDV;
+    float* sg0 = reinterpret_cast<float*>(vsc + GDN_CH * LDV);
 
     const int nvt = V / BV;
     const int vt = static_cast<int>(blockIdx.x) % nvt;
@@ -3343,6 +3375,7 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
     const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
     const int hk = h / (V_h / K_h);
     const int v0 = vt * BV;
+    const int base = lane.t0 / GDN_CH + r;
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int l = tid & 31;
@@ -3372,24 +3405,39 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
     }
 
     const int nchunks = (lane.T + GDN_CH - 1) / GDN_CH;
-    auto load = [&](int jc, bf16* st) {
-        const int ta = lane.t0 + jc * GDN_CH;
-        const int L = min(GDN_CH, lane.t0 + lane.T - ta);
-        bf16* sq = st;
-        bf16* sk = sq + GDN_CH * GDN_LD;
-        bf16* sw = sk + GDN_CH * GDN_LD;
-        bf16* su = sw + GDN_CH * GDN_LD;
-        float* sg = reinterpret_cast<float*>(su + GDN_CH * LDV);
+    auto span = [&](int jc, int& ta, int& L) {
+        ta = lane.t0 + jc * GDN_CH;
+        L = min(GDN_CH, lane.t0 + lane.T - ta);
+    };
+    auto load_kg = [&](int jc) {
+        int ta, L;
+        span(jc, ta, L);
+        bf16* sk = sk0 + (jc & 1) * GDN_CH * GDN_LD;
+        float* sg = sg0 + (jc & 1) * GDN_CH;
         #pragma unroll
         for (int e = tid; e < GDN_CH * (BK / 8); e += THREADS) {
             const int i = e / (BK / 8);
             const int c = (e % (BK / 8)) * 8;
             const bool in = i < L;
-            const long long at_k = (static_cast<long long>(ta + (in ? i : 0)) * K_h + hk) * BK + c;
-            const long long at_v = (static_cast<long long>(ta + (in ? i : 0)) * V_h + h) * BK + c;
-            gdn_cp16(sq + i * GDN_LD + c, qn + at_k, in);
-            gdn_cp16(sk + i * GDN_LD + c, kn + at_k, in);
-            gdn_cp16(sw + i * GDN_LD + c, w + at_v, in);
+            gdn_cp16(sk + i * GDN_LD + c,
+                     kn + (static_cast<long long>(ta + (in ? i : 0)) * K_h + hk) * BK + c, in);
+        }
+        if (tid < GDN_CH) {
+            const bool in = tid < L;
+            gdn_cp4(sg + tid, gcum + static_cast<long long>(ta + (in ? tid : 0)) * V_h + h, in);
+        }
+    };
+    auto load_qwu = [&](int jc) {
+        int ta, L;
+        span(jc, ta, L);
+        #pragma unroll
+        for (int e = tid; e < GDN_CH * (BK / 8); e += THREADS) {
+            const int i = e / (BK / 8);
+            const int c = (e % (BK / 8)) * 8;
+            const bool in = i < L;
+            const long long row = ta + (in ? i : 0);
+            gdn_cp16(sq + i * GDN_LD + c, qn + (row * K_h + hk) * BK + c, in);
+            gdn_cp16(sw + i * GDN_LD + c, w + (row * V_h + h) * BK + c, in);
         }
         #pragma unroll
         for (int e = tid; e < GDN_CH * (BV / 8); e += THREADS) {
@@ -3399,13 +3447,20 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
             gdn_cp16(su + i * LDV + c,
                      u + (static_cast<long long>(ta + (in ? i : 0)) * V_h + h) * V + v0 + c, in);
         }
-        if (tid < GDN_CH) {
-            const bool in = tid < L;
-            gdn_cp4(sg + tid, gcum + static_cast<long long>(ta + (in ? tid : 0)) * V_h + h, in);
+    };
+    auto load_p = [&](int jc) {
+        const bf16* src = pm + (static_cast<long long>(base + jc) * V_h + h) * GDN_CH * GDN_CH;
+        #pragma unroll
+        for (int e = tid; e < GDN_CH * (GDN_CH / 8); e += THREADS) {
+            const int i = e / (GDN_CH / 8);
+            const int c = (e % (GDN_CH / 8)) * 8;
+            gdn_cp16(sp + i * GDN_LDC + c, src + i * GDN_CH + c, true);
         }
     };
 
-    load(0, stage0);
+    load_kg(0);
+    load_qwu(0);
+    load_p(0);
     gdn_cp_commit();
     #pragma unroll
     for (int q = 0; q < NT; ++q) {
@@ -3417,56 +3472,17 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
     }
 
     for (int jc = 0; jc < nchunks; ++jc) {
-        bf16* st = stage0 + (jc & 1) * STAGE;
         gdn_cp_wait_all();
         __syncthreads();
-        if (jc + 1 < nchunks) load(jc + 1, stage0 + ((jc + 1) & 1) * STAGE);
+        const bool more = jc + 1 < nchunks;
+        if (more) load_kg(jc + 1);
         gdn_cp_commit();
 
-        const int ta = lane.t0 + jc * GDN_CH;
-        const int L = min(GDN_CH, lane.t0 + lane.T - ta);
-        const bf16* sq = st;
-        const bf16* sk = sq + GDN_CH * GDN_LD;
-        const bf16* sw = sk + GDN_CH * GDN_LD;
-        const bf16* su = sw + GDN_CH * GDN_LD;
-        const float* sg = reinterpret_cast<const float*>(su + GDN_CH * LDV);
+        int ta, L;
+        span(jc, ta, L);
+        const bf16* sk = sk0 + (jc & 1) * GDN_CH * GDN_LD;
+        const float* sg = sg0 + (jc & 1) * GDN_CH;
         const float g_last = sg[L - 1];
-
-        // This warp's half of its rows' causal scores, decayed and masked.
-        {
-            float sc[4][4];
-            #pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                #pragma unroll
-                for (int e = 0; e < 4; ++e) sc[nt][e] = 0.f;
-            }
-            const int j0 = (warp >> 2) * 32;
-            #pragma unroll
-            for (int kk = 0; kk < BK / 16; ++kk) {
-                unsigned a[4];
-                gdn_ldsm(a, gdn_at_a(sq, GDN_LD, m0, kk * 16, l));
-                #pragma unroll
-                for (int np = 0; np < 2; ++np) {
-                    unsigned b[4];
-                    gdn_ldsm(b, gdn_at_bt(sk, GDN_LD, j0 + np * 16, kk * 16, l));
-                    gdn_mma(sc[2 * np], a, b[0], b[1]);
-                    gdn_mma(sc[2 * np + 1], a, b[2], b[3]);
-                }
-            }
-            #pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                #pragma unroll
-                for (int half = 0; half < 2; ++half) {
-                    const int i = m0 + g + 8 * half;
-                    const int jj = j0 + nt * 8 + 2 * t;
-                    const float s0 = (jj <= i && i < L)
-                        ? sc[nt][2 * half] * __expf(sg[i] - sg[jj]) : 0.f;
-                    const float s1 = (jj + 1 <= i && i < L)
-                        ? sc[nt][2 * half + 1] * __expf(sg[i] - sg[jj + 1]) : 0.f;
-                    *reinterpret_cast<unsigned*>(ps + i * GDN_LDC + jj) = gdn_pack(s0, s1);
-                }
-            }
-        }
 
         float qh[CT][4];
         float wh[CT][4];
@@ -3510,6 +3526,8 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
             }
         }
         __syncthreads();
+        if (more) load_qwu(jc + 1);
+        gdn_cp_commit();
 
         #pragma unroll
         for (int half = 0; half < 2; ++half) {
@@ -3524,7 +3542,7 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
         #pragma unroll
         for (int kk = 0; kk < GDN_CH / 16; ++kk) {
             unsigned pa[4];
-            gdn_ldsm(pa, gdn_at_a(ps, GDN_LDC, m0, kk * 16, l));
+            gdn_ldsm(pa, gdn_at_a(sp, GDN_LDC, m0, kk * 16, l));
             #pragma unroll
             for (int np = 0; np < CT / 2; ++np) {
                 unsigned b[4];
@@ -3544,6 +3562,9 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
                     make_float2(qh[nt][2 * half], qh[nt][2 * half + 1]);
             }
         }
+        __syncthreads();
+        if (more) load_p(jc + 1);
+        gdn_cp_commit();
 
         const float el = __expf(g_last);
         #pragma unroll
