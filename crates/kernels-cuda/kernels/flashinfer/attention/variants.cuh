@@ -31,6 +31,8 @@ DEFINE_HAS_MEMBER(maybe_mask_indptr)
 template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
 struct DefaultAttention : AttentionVariantBase {
   static constexpr bool use_softmax = true;
+  // PIE: a decode row sees only the window's keys, nothing else masks them.
+  static constexpr bool skips_decode_window = use_sliding_window && !use_custom_mask;
 
   uint8_t* custom_mask_ptr;
   uint32_t qo_len, kv_len;

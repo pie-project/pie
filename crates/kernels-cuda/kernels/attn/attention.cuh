@@ -33,6 +33,8 @@ struct PieScoreWindowParams : PieScoreParams<Base, IdT> {
 
 template <class Base>
 struct PieScoreCapture : Base {
+    // A capture lands every key's score, the masked ones too.
+    static constexpr bool skips_decode_window = false;
 
     float* score_row = nullptr;
 

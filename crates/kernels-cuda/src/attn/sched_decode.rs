@@ -15,6 +15,23 @@ pub struct Request<'a> {
     pub head_dim: u32,
     pub enable_cuda_graph: bool,
     pub chunk_floor_128: bool,
+    /// The sliding window's `window_left`: a request's tiles cover only the
+    /// keys its one query row sees, the last `window_left + 1`.
+    pub window_left: Option<u32>,
+}
+
+/// Each request's pages a decode walks: all of them, or under a sliding
+/// window as many as its last `window_left + 1` keys fill, counted from the
+/// window's start, where the kernel's tiles count from.
+fn walked(op: &'static str, req: &Request<'_>) -> Result<Vec<u32>, Error> {
+    let pages = spans(op, "kv_indptr", req.kv_indptr, req.live.requests as usize)?;
+    Ok(match req.window_left {
+        Some(left) if req.page_size > 0 => {
+            let seen = (left + 1).div_ceil(req.page_size);
+            pages.iter().map(|&p| p.min(seen)).collect()
+        }
+        _ => pages,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +47,7 @@ pub fn estimate(
     req: &Request<'_>,
     max_grid_size: u32,
 ) -> Result<WorkEstimate, Error> {
-    let pages = spans(op, "kv_indptr", req.kv_indptr, req.live.requests as usize)?;
+    let pages = walked(op, req)?;
     if req.gqa_group_size == 0 {
         return Err(refuse(op, "the GQA group this schedule states is zero"));
     }
@@ -99,7 +116,7 @@ pub fn schedule(
     max_grid_size: u32,
 ) -> Result<Schedule, Error> {
     let est = estimate(op, req, max_grid_size)?;
-    let pages = spans(op, "kv_indptr", req.kv_indptr, req.live.requests as usize)?;
+    let pages = walked(op, req)?;
 
     let mut request_indices = Vec::new();
     let mut kv_tile_indices = Vec::new();

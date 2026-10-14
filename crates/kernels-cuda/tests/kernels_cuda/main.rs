@@ -37,6 +37,7 @@ mod the_mla_prefill_ada_arm_answers_the_reference;
 mod the_mla_scores_land_their_log_sum_exp;
 mod the_modulate_forms_answer_the_broadcast_and_the_per_token_reference;
 mod the_nvfp4_select_answers_the_dequantized_dot;
+mod the_paged_decode_answers_the_reference;
 mod the_partial_rope_turns_only_the_rotary_pairs;
 mod the_pooled_index_selects_its_best_blocks;
 mod the_ragged_arm_adds_a_relative_bias;

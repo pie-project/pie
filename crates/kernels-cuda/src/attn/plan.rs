@@ -356,6 +356,7 @@ pub fn plan_decode(
             head_dim: shape.head_dim,
             enable_cuda_graph,
             chunk_floor_128: toggles.chunk_floor_128,
+            window_left: u32::try_from(window_left).ok(),
         };
         sched_decode::plan(
             OP,
