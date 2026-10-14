@@ -356,7 +356,29 @@ fn conv1d_chunked(
     )?;
     let reach = (conv_width.saturating_sub(1)).saturating_mul(dilation);
     let row_tiled = reach <= CONV_TT;
-    let (entrypoint, launch) = if row_tiled {
+    let vec8 = conv_width == 4
+        && dilation == 1
+        && channels.is_multiple_of(8)
+        && state.conv_stride % 8 == 0
+        && [x.data.ptr, y.ptr, weight.ptr, state.conv_slab.ptr]
+            .iter()
+            .all(|&at| aligned16(at));
+    let (entrypoint, launch) = if vec8 {
+        (
+            symbol(&format!(
+                "::pie::attn::ssm_causal_conv1d_chunked_batched_row_tile_vec8{}",
+                out.args()
+            )),
+            Launch::grid(
+                [
+                    (channels / 8).div_ceil(TILE_BLOCK),
+                    x.data.rows.div_ceil(CONV_TT).max(1),
+                    1,
+                ],
+                [TILE_BLOCK, 1, 1],
+            ),
+        )
+    } else if row_tiled {
         (
             symbol(&format!(
                 "::pie::attn::ssm_causal_conv1d_chunked_batched_row_tile{}",

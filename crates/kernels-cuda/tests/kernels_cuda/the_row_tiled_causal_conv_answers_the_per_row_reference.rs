@@ -5,10 +5,17 @@ use dtype::Dtype;
 use kernels_cuda::attn::ssm;
 use kernels_cuda::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
+/// Two hundred channels take the eight-channel vector arm, a hundred the
+/// per-channel one.
 #[test]
 fn the_row_tiled_causal_conv_answers_the_per_row_reference() {
+    check(200);
+    check(100);
+}
+
+fn check(channels: usize) {
     let lens: [usize; 4] = [31, 2, 131, 45];
-    let (channels, k) = (200usize, 4u32);
+    let k = 4u32;
     let rows: usize = lens.iter().sum();
     let slot_of: [i32; 4] = [3, 2, 0, 1];
     let stride = (k as usize - 1 + 1) * channels;
