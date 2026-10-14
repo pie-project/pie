@@ -28,6 +28,8 @@ pub mod selector;
 
 pub mod ssm;
 
+pub mod xqa;
+
 #[cfg(feature = "cuda")]
 mod tc5_fmha;
 
@@ -204,7 +206,14 @@ fn fa2_decode_with(
         num_kv_heads: plan.shape.num_kv_heads,
         device: plan.device,
     };
+    let tensor_cores = xqa::takes(ctx, plan, pool, rel.is_some());
     match rel {
+        None if tensor_cores => {
+            xqa::decode(ctx, op, plan, &params, sinks)?;
+            if !plan.info.split_kv {
+                return Ok(sinks.is_some());
+            }
+        }
         None => {
             let arm = fa2::decode_arm(plan.full_attention_variant(), window_left, NO_SOFT_CAP);
             fa2::decode(ctx, op, point(arm), &params)?;

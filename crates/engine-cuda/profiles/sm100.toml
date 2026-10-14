@@ -44,6 +44,12 @@ sdpa.decode.grouped_prefill_from = 4
 # where it took 10.10. Its 128-wide windows stay on the decode kernel, which
 # reads a window that short faster.
 sdpa.decode.grouped_prefill_lse = true
+# Gemma 4's 256-wide sliding layers (two query heads a KV head) read their
+# cache on tensor cores (attn/xqa.cuh), the group one MMA tile: a 64-request
+# layer over 640-key requests takes 138.8 us where the FA2 decode took 185.8,
+# and Gemma-4-31B decodes a step at 64 requests in 21.70 ms where it took
+# 25.97 (13.23 / 13.51 at eight, 12.84 / 12.96 at one).
+sdpa.decode.xqa = true
 # A dense projection's bias from the cuBLASLt epilogue, not a separate add
 # (gpt-oss's qkv and o: about 0.44 ms a bs64 decode step).
 gemm.bias_epilogue = true

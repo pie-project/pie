@@ -239,6 +239,13 @@ pub struct DecodeGroupedPrefillFrom(pub u32);
 #[decision(id = "kernel.sdpa.decode.grouped_prefill_lse", flag, default = false, tune = search)]
 pub struct DecodeGroupedPrefillLse;
 
+/// Whether a paged decode of a group of at most eight query heads reads its
+/// cache on tensor cores (`attn/xqa.cuh`, the group's rows one MMA tile)
+/// rather than the FA2 decode kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.xqa", flag, default = false, tune = search)]
+pub struct DecodeXqa;
+
 /// Whether a split attention's partial states fold a warp a (row, head)
 /// rather than through the staged persistent merge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -283,6 +290,7 @@ pub fn register(registry: &mut Registry) {
         .add::<PrefillTc5>()
         .add::<DecodeGroupedPrefillFrom>()
         .add::<DecodeGroupedPrefillLse>()
+        .add::<DecodeXqa>()
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<GemmNarrowN>();
@@ -329,6 +337,7 @@ pub struct Tuning {
     pub prefill_tc5: bool,
     pub decode_grouped_prefill_from: u32,
     pub decode_grouped_prefill_lse: bool,
+    pub decode_xqa: bool,
     pub selected_mma: bool,
     pub index_mma: bool,
     pub gemm_narrow_n: u32,
@@ -373,6 +382,7 @@ impl Tuning {
         prefill_tc5: false,
         decode_grouped_prefill_from: 0,
         decode_grouped_prefill_lse: false,
+        decode_xqa: false,
         selected_mma: false,
         index_mma: false,
         gemm_narrow_n: 0,
@@ -417,6 +427,7 @@ impl Tuning {
             prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),
             decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,
             decode_grouped_prefill_lse: profile.on::<DecodeGroupedPrefillLse>(&Anywhere),
+            decode_xqa: profile.on::<DecodeXqa>(&Anywhere),
             selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),
             index_mma: profile.on::<SdpaIndexMma>(&Anywhere),
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,

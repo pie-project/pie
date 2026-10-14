@@ -392,9 +392,10 @@ fn worst(got: &[f32], want: &[f32]) -> f32 {
 fn check(case: Case, via_prefill: bool) {
     let fx = fixture(case, 0x5eed);
     let (want_o, want_lse) = fx.reference();
-    for merge_warp in [false, true] {
+    for (merge_warp, decode_xqa) in [(false, false), (true, false), (false, true), (true, true)] {
         let tuning = Tuning {
             merge_warp,
+            decode_xqa,
             ..Tuning::DEFAULT
         };
         if via_prefill {
@@ -408,7 +409,7 @@ fn check(case: Case, via_prefill: bool) {
         assert!(
             eo < 2e-2 && el < 1e-2,
             "{} q / {} kv heads at {}, window {:?}, graph {}, via prefill {via_prefill}, warp \
-             merge {merge_warp}: output off by {eo}, lse by {el}",
+             merge {merge_warp}, tensor-core decode {decode_xqa}: output off by {eo}, lse by {el}",
             case.q_heads,
             case.kv_heads,
             case.head_dim,
@@ -479,8 +480,20 @@ fn time(gpu: &Gpu, flush: u64, fire: &dyn Fn()) -> f64 {
             (core::ptr::null_mut(), core::ptr::null_mut());
         rt::cudaEventCreate(&raw mut a);
         rt::cudaEventCreate(&raw mut b);
+        // The L2 is flushed by reading past its size into the host: a
+        // device-side write would leave dirty lines the timed reads pay to
+        // write back.
+        let mut host: *mut core::ffi::c_void = core::ptr::null_mut();
+        rt::cudaMallocHost(&raw mut host, FLUSH);
+        rt::cudaMemsetAsync(flush as *mut core::ffi::c_void, 1, FLUSH, stream);
         for _ in 0..21 {
-            rt::cudaMemsetAsync(flush as *mut core::ffi::c_void, 1, FLUSH, stream);
+            rt::cudaMemcpyAsync(
+                host,
+                flush as *const core::ffi::c_void,
+                FLUSH,
+                rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                stream,
+            );
             rt::cudaEventRecord(a, stream);
             fire();
             rt::cudaEventRecord(b, stream);
@@ -491,6 +504,7 @@ fn time(gpu: &Gpu, flush: u64, fire: &dyn Fn()) -> f64 {
         }
         rt::cudaEventDestroy(a);
         rt::cudaEventDestroy(b);
+        rt::cudaFreeHost(host);
     }
     times.sort_by(f64::total_cmp);
     times[times.len() / 2]
@@ -510,7 +524,10 @@ fn a_decode_reports_its_time_at_gptoss_and_gemma4_heads() {
     static B1: [usize; 1] = [CTX];
     static B8: [usize; 8] = [CTX; 8];
     static B64: [usize; 64] = [CTX; 64];
-    println!("| layer | batch | graph | decode us | + warp merge | prefill us | + warp merge |");
+    println!(
+        "| layer | batch | graph | FA2 decode us | + warp merge | tensor-core decode | prefill + \
+         warp merge |"
+    );
     println!("|---|---:|---|---:|---:|---:|---:|");
     for (name, q_heads, kv_heads, head_dim, window) in [
         ("gpt-oss full", 64, 8, 64, None),
@@ -534,12 +551,16 @@ fn a_decode_reports_its_time_at_gptoss_and_gemma4_heads() {
                     merge_warp: true,
                     ..Tuning::DEFAULT
                 };
+                let tensor = Tuning {
+                    decode_xqa: true,
+                    ..warp
+                };
                 let decode = time(&fx.gpu, flush, &fx.fire(Tuning::DEFAULT));
                 let decode_w = time(&fx.gpu, flush, &fx.fire(warp));
-                let prefill = time(&fx.gpu, flush, &fx.fire_prefill(Tuning::DEFAULT));
+                let xqa = time(&fx.gpu, flush, &fx.fire(tensor));
                 let prefill_w = time(&fx.gpu, flush, &fx.fire_prefill(warp));
                 println!(
-                    "| {name} | {} | {graph} | {decode:.1} | {decode_w:.1} | {prefill:.1} | \
+                    "| {name} | {} | {graph} | {decode:.1} | {decode_w:.1} | {xqa:.1} | \
                      {prefill_w:.1} |",
                     lens.len()
                 );
@@ -573,9 +594,12 @@ fn a_sinked_attention_answers_the_reference_scaled_by_its_sinks() {
                     *x *= r;
                 }
             }
-            for merge_warp in [false, true] {
+            for (merge_warp, decode_xqa) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
                 let tuning = Tuning {
                     merge_warp,
+                    decode_xqa,
                     ..Tuning::DEFAULT
                 };
                 for via_prefill in [false, true] {
@@ -589,8 +613,9 @@ fn a_sinked_attention_answers_the_reference_scaled_by_its_sinks() {
                     let (eo, el) = (worst(&o, &want_o), worst(&lse, &want_lse));
                     assert!(
                         eo < 2e-2 && el < 1e-2,
-                        "window {window:?}, graph {graph}, warp merge {merge_warp}, via prefill \
-                         {via_prefill}: output off by {eo}, lse by {el}"
+                        "window {window:?}, graph {graph}, warp merge {merge_warp}, tensor-core \
+                         decode {decode_xqa}, via prefill {via_prefill}: output off by {eo}, lse by \
+                         {el}"
                     );
                 }
             }

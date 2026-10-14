@@ -391,6 +391,7 @@ mod tests {
                 assert_eq!(tuning.ssm_gdn_tc5, b200, "{gpu}");
                 assert_eq!(tuning.merge_warp, b200, "{gpu}");
                 assert_eq!(tuning.gemm_bias_epilogue, b200, "{gpu}");
+                assert_eq!(tuning.decode_xqa, b200, "{gpu}");
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
@@ -406,6 +407,7 @@ mod tests {
                         decode_grouped_prefill_from: 0,
                         gemm_bias_epilogue: false,
                         decode_grouped_prefill_lse: false,
+                        decode_xqa: false,
                         ..tuning
                     },
                     defaults,

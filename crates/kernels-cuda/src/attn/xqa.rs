@@ -1,0 +1,179 @@
+//! The tensor-core paged decode (`attn/xqa.cuh`): a whole GQA group's rows
+//! as one MMA column tile, read off the FA2 decode plan and landing what the
+//! FA2 decode kernel lands, so the same fold follows it. Taken where the
+//! profile says (`kernel.sdpa.decode.xqa`), for groups of at most eight
+//! query heads over a plain bf16 NHD pool, at the head widths it is stamped
+//! for.
+
+use dtype::Dtype;
+
+use crate::attn::fa2_abi::DecodeParams;
+use crate::attn::plan::DecodePlan;
+use crate::error::Error;
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, symbol};
+use crate::tensor::{KvPool, Tensor};
+
+const FILE: &str = "attn/xqa.cuh";
+
+/// One head width's stamp: key tiles of `16 * mt` rows, `warps` warps a
+/// block, `stages` tiles in flight a warp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    pub head_dim: u32,
+    pub mt: u32,
+    pub warps: u32,
+    pub stages: u32,
+}
+
+impl Stamp {
+    /// The width measured on the B200: Gemma 4's 256-wide sliding layers
+    /// (two query heads a KV head), at the smallest block that keeps one tile
+    /// in flight a warp beside the one it reads, so two blocks share an SM.
+    /// gpt-oss's 64-wide groups read no faster end to end than through the
+    /// prefill and FA2 kernels, and lose a little at one request; Gemma's
+    /// 512-wide global layers read faster through the prefill kernel.
+    #[must_use]
+    pub const fn of(head_dim: u32) -> Option<Self> {
+        let (mt, warps, stages) = match head_dim {
+            256 => (1, 3, 2),
+            _ => return None,
+        };
+        Some(Self {
+            head_dim,
+            mt,
+            warps,
+            stages,
+        })
+    }
+
+    /// The blocks a split decode aims for: as many as the SMs hold at once.
+    #[must_use]
+    pub fn grid(self, device: &crate::attn::plan::Device) -> u32 {
+        let per_sm = (device.max_smem_per_sm / (self.smem() + 1024)).max(1);
+        device.num_sm.max(1) * per_sm
+    }
+
+    /// The dynamic shared memory a block holds (`Shape::SMEM_BYTES`).
+    #[must_use]
+    pub const fn smem(self) -> u32 {
+        let head_dim = self.head_dim;
+        let ld = head_dim + 8;
+        let tile = 16 * self.mt;
+        let staged = self.warps * self.stages * 2 * tile * ld * 2;
+        let fold = self.warps * (8 * head_dim + 16) * 4;
+        let region = if staged > fold { staged } else { fold };
+        region + (8 * ld + self.warps * tile * 8) * 2
+    }
+}
+
+/// Whether the profile and the device take the tensor-core decode for a
+/// plan of this width and group (the pool's own checks aside).
+#[must_use]
+pub fn stamps(xqa: bool, head_dim: u32, group: u32) -> bool {
+    xqa && (1..=8).contains(&group) && Stamp::of(head_dim).is_some()
+}
+
+/// Whether this decode takes the tensor-core kernel.
+#[must_use]
+pub fn takes(ctx: &Ctx, plan: &DecodePlan, pool: &KvPool, rel: bool) -> bool {
+    let group = plan.shape.group_size();
+    let head_dim = plan.shape.head_dim;
+    stamps(ctx.tuning().decode_xqa, head_dim, group)
+        && !rel
+        && plan.shape.num_kv_heads * group == plan.shape.num_q_heads
+        && !plan.shape.hnd_layout
+        && pool.keys.dtype == Dtype::Bf16
+        && pool.values.dtype == Dtype::Bf16
+        && Stamp::of(head_dim).is_some_and(|stamp| {
+            ctx.smem_per_block_optin()
+                .is_some_and(|cap| cap >= stamp.smem())
+        })
+}
+
+/// Fires the tensor-core decode over `params` (the FA2 decode's, its output
+/// already the split's partial plane where the plan splits). With `sinks`
+/// and no split, the sinks scale the output in the same pass.
+pub fn decode(
+    ctx: &Ctx,
+    op: &'static str,
+    plan: &DecodePlan,
+    params: &DecodeParams,
+    sinks: Option<Tensor>,
+) -> Result<(), Error> {
+    let head_dim = plan.shape.head_dim;
+    let stamp = Stamp::of(head_dim).ok_or_else(|| {
+        crate::jit::refuse(
+            op,
+            format!("no tensor-core decode at head width {head_dim}"),
+        )
+    })?;
+    let sink_ty = match sinks {
+        Some(s) if s.dtype == Dtype::F32 => "float",
+        _ => "::pie::bf16",
+    };
+    let kv = &params.paged_kv;
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::attn::xqa::decode<{head_dim}, {}, {}, {}, {sink_ty}>",
+                stamp.mt, stamp.warps, stamp.stages
+            )),
+        )
+        .apply(
+            Launch::grid(
+                [plan.shape.num_kv_heads, params.padded_batch_size, 1],
+                [32 * stamp.warps, 1, 1],
+            )
+            .smem(stamp.smem()),
+        ),
+        &[
+            ArgValue::Ptr(params.q),
+            ArgValue::Ptr(kv.k_data),
+            ArgValue::Ptr(kv.v_data),
+            ArgValue::Ptr(kv.indices),
+            ArgValue::Ptr(kv.indptr),
+            ArgValue::Ptr(kv.last_page_len),
+            plan.shape.page_size.arg(),
+            kv.stride_page.arg(),
+            kv.stride_n.arg(),
+            kv.stride_h.arg(),
+            ArgValue::Ptr(params.q_indptr),
+            u32::try_from(params.q_stride_n).unwrap_or(0).arg(),
+            ArgValue::Ptr(params.request_indices),
+            ArgValue::Ptr(params.kv_tile_indices),
+            ArgValue::Ptr(params.kv_chunk_size_ptr),
+            ArgValue::Ptr(params.block_valid_mask),
+            params.partition_kv.arg(),
+            params.num_qo_heads.arg(),
+            plan.shape.group_size().arg(),
+            params.window_left.arg(),
+            params.sm_scale.arg(),
+            ArgValue::Ptr(params.o),
+            ArgValue::Ptr(params.lse),
+            ArgValue::Ptr(match sinks {
+                Some(s) if !params.partition_kv => s.ptr,
+                _ => 0,
+            }),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stamp fits a B200 block (an sm_86 one does not, and such a card
+    /// keeps the FA2 decode), and only the stamped width and groups of at
+    /// most eight take the kernel.
+    #[test]
+    fn each_stamp_states_what_its_block_holds() {
+        let stamp = Stamp::of(256).expect("stamped");
+        assert!(stamp.smem() <= 232_448 && stamp.smem() > 101_376);
+        assert_eq!(Stamp::of(64), None);
+        assert_eq!(Stamp::of(512), None);
+        assert!(stamps(true, 256, 2));
+        assert!(!stamps(false, 256, 2) && !stamps(true, 256, 16) && !stamps(true, 64, 8));
+    }
+}
