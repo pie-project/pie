@@ -839,7 +839,7 @@ pub fn copy_words_batch(ctx: &Ctx<'_>, copies: &[(Tensor, Tensor, u64)]) -> Resu
     }
     let mut words = [0u32; 4];
     let mut args = Vec::with_capacity(12);
-    for at in 0..4 {
+    for (at, word) in words.iter_mut().enumerate() {
         match copies.get(at) {
             Some((src, dst, bytes)) => {
                 if !bytes.is_multiple_of(4) {
@@ -848,7 +848,7 @@ pub fn copy_words_batch(ctx: &Ctx<'_>, copies: &[(Tensor, Tensor, u64)]) -> Resu
                         format!("{bytes} bytes is not a whole number of 32-bit words"),
                     ));
                 }
-                words[at] = u32::try_from(bytes / 4).map_err(|_| {
+                *word = u32::try_from(bytes / 4).map_err(|_| {
                     refuse(
                         OP,
                         format!("{bytes} bytes is more than one launch addresses"),
@@ -921,10 +921,13 @@ pub fn topk(
             format!("the indices plane is not [{rows}, {k}] i32"),
         ));
     }
-    let threads = if wide { TOPK_WIDE_THREADS } else { TOPK_THREADS };
+    let threads = if wide {
+        TOPK_WIDE_THREADS
+    } else {
+        TOPK_THREADS
+    };
     ctx.fire(
-        Fire::at("layout/topk.metal", entry)
-            .apply(Grid::of([threads, rows, 1], [threads, 1, 1])),
+        Fire::at("layout/topk.metal", entry).apply(Grid::of([threads, rows, 1], [threads, 1, 1])),
         &[
             x.arg(),
             values.arg_mut(),
