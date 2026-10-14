@@ -11,8 +11,13 @@ const TALL: u32 = 65_536;
 
 #[test]
 fn a_qkv_split_reaches_every_row_of_a_tall_fire() {
+    // Element by element (a cut not a multiple of 8) and in 16-byte runs.
+    split_every_row(8, 4);
+    split_every_row(64, 16);
+}
+
+fn split_every_row(q_width: u32, kv_width: u32) {
     common::arm_cache();
-    let (q_width, kv_width) = (8u32, 4u32);
     let stride = (q_width + 2 * kv_width) as usize;
 
     let mut lcg = Lcg::seeded(0x51);
@@ -52,8 +57,8 @@ fn a_qkv_split_reaches_every_row_of_a_tall_fire() {
     }
     assert_eq!(
         first_wrong, None,
-        "the split stopped at row {:?} of {TALL}; `gridDim.y` caps at 65535, so a \
-         split whose rows ride `y` silently drops everything past it",
+        "the {q_width}/{kv_width} split stopped at row {:?} of {TALL}; `gridDim.y` caps at \
+         65535, so a split whose rows ride `y` silently drops everything past it",
         first_wrong
     );
 }

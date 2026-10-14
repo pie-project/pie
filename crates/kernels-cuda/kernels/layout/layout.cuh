@@ -369,6 +369,36 @@ __global__ void split_qkv(
     }
 }
 
+// split_qkv eight columns a thread: q_dim and kv_dim are multiples of 8 and
+// every plane 16-byte aligned, so each run is one 16-byte load and store.
+template <class T>
+__global__ void split_qkv_vec8(
+    const T* __restrict__ src,
+    T* __restrict__ q_out,
+    T* __restrict__ k_out,
+    T* __restrict__ v_out,
+    i32 q_dim, i32 kv_dim,
+    const u32* __restrict__ win)
+{
+    static_assert(sizeof(T) == 2, "eight columns are one 16-byte run");
+    const int n = static_cast<int>(blockIdx.x);
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const int q8 = q_dim / 8;
+    const int kv8 = kv_dim / 8;
+    const uint4* src_row =
+        reinterpret_cast<const uint4*>(src) + static_cast<long long>(row) * (q8 + 2 * kv8);
+    uint4* q_row = reinterpret_cast<uint4*>(q_out) + static_cast<long long>(row) * q8;
+    uint4* k_row = reinterpret_cast<uint4*>(k_out) + static_cast<long long>(row) * kv8;
+    uint4* v_row = reinterpret_cast<uint4*>(v_out) + static_cast<long long>(row) * kv8;
+    const int step = static_cast<int>(blockDim.x * gridDim.y);
+    const int first = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x);
+    for (int j = first; j < q8; j += step) q_row[j] = src_row[j];
+    for (int j = first; j < kv8; j += step) k_row[j] = src_row[q8 + j];
+    for (int j = first; j < kv8; j += step) v_row[j] = src_row[q8 + kv8 + j];
+}
+
 template <class T>
 __global__ void split_qkv_devwin(
     const T* __restrict__ src,
