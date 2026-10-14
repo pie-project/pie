@@ -65,9 +65,9 @@ const CENSUS: &[(u32, u32, u32)] = &[
     (12288, 4096, 104),
     (8192, 2816, 225),
     (4096, 12288, 88),
-    (4096, 2048, 472),
+    (12288, 2048, 164),
+    (4096, 2048, 478),
     (2560, 6144, 246),
-    (16384, 4096, 57),
 ];
 
 struct Grid {
@@ -105,7 +105,7 @@ impl Grid {
                 // Small shapes too: a crossover learned on large banks alone
                 // misplaces small ones.
                 shapes: shapes(
-                    [0, 1, 2, 3, 9, 15, 21, 22]
+                    [0, 1, 2, 3, 9, 15, 22, 23]
                         .iter()
                         .map(|&i| CENSUS[i])
                         .collect(),

@@ -179,6 +179,12 @@ HEADS = {
         taps = [1, 6, 11, 16, 22, 27, 32, 37], windows = [4096] * 5 + [None], q_heads = 32,
         kv_heads = 8, head_dim = 128, inter = 6144, theta = 10000000.0, block = 16, mask_token = 248077,
     ),
+    "qwen36-35b-a3b-dflash2": dflash_head(
+        taps = [1, 6, 11, 16, 22, 27, 32, 37], windows = [SLIDING] * 6, q_heads = 32, kv_heads = 8,
+        head_dim = 128, inter = 6144, theta = 10000000.0, block = 8, mask_token = 248077,
+        conv = struct(taps = 2, group = 16), readout = selector(rank = 256, top_k = 16),
+        bidirectional = True,
+    ),
     "qwen35-d9b-dflash": dflash_head(
         taps = [1, 5, 9, 13, 17, 21, 25, 29], windows = [4096] * 5 + [None], q_heads = 32,
         kv_heads = 8, head_dim = 128, inter = 12288, theta = 10000000.0, block = 16, mask_token = 248077,
@@ -298,6 +304,8 @@ def drafted(id, deploy):
             return a3b(draft = "mtp")
         if drafter == "dflash":
             return a3b(draft = "dflash", dflash_head = HEADS["qwen36-35b-a3b-dflash"])
+        if drafter == "dflash2":
+            return a3b(draft = "dflash2", dflash_head = HEADS["qwen36-35b-a3b-dflash2"])
         refuse()
     if drafter != None:
         refuse()

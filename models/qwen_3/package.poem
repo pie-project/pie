@@ -26,7 +26,7 @@ MODELS = [
     qwen("qwen35-d4b", layers = 32),
     qwen("qwen35-a3b", layers = 40),
     qwen("qwen35-d9b", drafters = ["dflash"], layers = 32),
-    qwen("qwen36-35b-a3b", drafters = ["mtp", "dflash"], layers = 40),
+    qwen("qwen36-35b-a3b", drafters = ["mtp", "dflash", "dflash2"], layers = 40),
     qwen("qwen35-tiny", mini = True, layers = 4),
     qwen("qwen36-35b-a3b-mini", mini = True, layers = 5),
     qwen("qwen36-35b-a3b-mini64", mini = True, layers = 5),
@@ -56,6 +56,7 @@ DEPLOYMENTS = [
     deployment("qwen35-d9b", weights = U4, kv = BF, drafter = "dflash"),
     deployment("qwen35-d9b", weights = U4, kv = BF),
     deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "dflash"),
+    deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "dflash2"),
     deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "mtp"),
     deployment("qwen36-35b-a3b", weights = U4, kv = BF),
     deployment("qwen36-35b-a3b-mini", weights = U4, kv = BF),
@@ -86,5 +87,6 @@ PUBLISHED = [
     published(target = "mlx-community/Qwen3.8-27B-4bit", head = "z-lab/Qwen3.8-27B-DFlash2", drafter = "dflash2", deployment = "qwen38-27b-dflash2-u4g64-kv-bf16"),
     published(target = "mlx-community/Qwen3.8-27B-4bit", head = "DimInfer/Qwen3.8-27B-Dspark-v1", drafter = "dspark", deployment = "qwen38-27b-dspark-u4g64-kv-bf16"),
     published(target = "mlx-community/Qwen3.6-35B-A3B-4bit", head = "z-lab/Qwen3.6-35B-A3B-DFlash", drafter = "dflash", deployment = "qwen36-35b-a3b-dflash-u4g64-kv-bf16"),
+    published(target = "mlx-community/Qwen3.6-35B-A3B-4bit", head = "incoai/Qwen3.6-35B-A3B-DFlash2", drafter = "dflash2", deployment = "qwen36-35b-a3b-dflash2-u4g64-kv-bf16"),
     published(target = "mlx-community/Qwen3.5-9B-4bit", head = "z-lab/Qwen3.5-9B-DFlash", drafter = "dflash", deployment = "qwen35-d9b-dflash-u4g64-kv-bf16"),
 ]
