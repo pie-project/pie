@@ -20,7 +20,6 @@ const RATIO: usize = 4;
 const TOP_K: usize = 6;
 const PAGE: usize = 16;
 
-const Q_LENS: [usize; 2] = [45, 30];
 const KV_LENS: [usize; 2] = [45, 77];
 const PAGE_INDICES: [i32; 8] = [5, 1, 7, 0, 3, 6, 2, 4];
 const PAGE_INDPTR: [i32; 3] = [0, 3, 8];
@@ -56,33 +55,57 @@ fn pool(keys: u64, values: u64, tables: [u64; 3]) -> KvPool {
 
 #[test]
 fn the_selected_attention_lands_alike_on_the_tensor_cores() {
+    // Two prefills (the row-tile walk), then one row each (the row walk).
+    for q_lens in [[45, 30], [1, 1]] {
+        lands_alike(q_lens);
+    }
+}
+
+fn lands_alike(q_lens: [usize; 2]) {
     let mut gpu = Gpu::open();
     let mut rng = Lcg::seeded(0x5e1e_c7ed);
-    let tokens: usize = Q_LENS.iter().sum();
+    let tokens: usize = q_lens.iter().sum();
     let slots = PAGE_INDICES.len() * PAGE;
     let (q_raw, _) = rng.row(tokens * Q_HEADS * HEAD_DIM);
     let (k_raw, _) = rng.row(slots * KV_HEADS * HEAD_DIM);
     let (v_raw, _) = rng.row(slots * KV_HEADS * HEAD_DIM);
     let mut qo_indptr = vec![0i32];
-    for n in Q_LENS {
+    for n in q_lens {
         qo_indptr.push(qo_indptr.last().unwrap() + n as i32);
     }
-    // Each row's blocks: some it may see, some past it, some named twice,
+    // Each row's blocks, each at most once: some it may see, some past it,
     // and the empty slots -1.
-    let mut selection = Vec::with_capacity(tokens * TOP_K);
+    let mut selection: Vec<i32> = Vec::with_capacity(tokens * TOP_K);
     let mut t = 0;
-    for r in 0..Q_LENS.len() {
-        for i in 0..Q_LENS[r] {
-            let seen = (KV_LENS[r] - Q_LENS[r] + i + 1) / RATIO;
+    for r in 0..q_lens.len() {
+        for i in 0..q_lens[r] {
+            let seen = (KV_LENS[r] - q_lens[r] + i + 1) / RATIO;
+            let mut row: Vec<i32> = Vec::with_capacity(TOP_K);
             for k in 0..TOP_K {
                 let pick = match (t + k) % 7 {
                     0 => -1,
-                    1 => (seen + 2) as i32,
-                    2 if k > 0 => *selection.last().unwrap(),
-                    _ => ((t * 5 + k * 3) % seen.max(1)) as i32,
+                    1 => (seen + 2 + k) as i32,
+                    _ => {
+                        let mut c = (t * 5 + k * 3) % seen.max(1);
+                        let mut tries = 0;
+                        while row.contains(&(c as i32)) && tries < seen {
+                            c = (c + 1) % seen.max(1);
+                            tries += 1;
+                        }
+                        if row.contains(&(c as i32)) {
+                            -1
+                        } else {
+                            c as i32
+                        }
+                    }
                 };
-                selection.push(pick);
+                row.push(if pick >= 0 && row.contains(&pick) {
+                    -1
+                } else {
+                    pick
+                });
             }
+            selection.extend(row);
             t += 1;
         }
     }
@@ -150,7 +173,7 @@ fn the_selected_attention_lands_alike_on_the_tensor_cores() {
             let (s, m) = (from_bf16(s), from_bf16(m));
             assert!(
                 close(m, s),
-                "decode {decode}: row {} head {} dim {}: the tensor cores land {m}, the scalar walk {s}",
+                "{q_lens:?} decode {decode}: row {} head {} dim {}: the tensor cores land {m}, the scalar walk {s}",
                 i / (Q_HEADS * HEAD_DIM),
                 (i / HEAD_DIM) % Q_HEADS,
                 i % HEAD_DIM

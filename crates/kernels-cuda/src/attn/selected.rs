@@ -35,6 +35,19 @@ const fn mma_smem_bytes(head_dim: i32) -> u32 {
     16 * ld * 2 + 4 * (2 * 16 * ld * 2) + 4 * 16 * 2 * 4
 }
 
+/// `mma::Tile`: eight rows a block, six warps, maps of up to 4096 blocks.
+const TILE_ROWS: i32 = 8;
+const TILE_THREADS: u32 = 192;
+const TILE_GROUP: i32 = 12;
+const TILE_MAX_BLOCKS: i64 = 4096;
+
+/// `mma::Tile<D>::kBytes`: 96 query rows, two stages of 16 keys' K and V,
+/// eight rows' maps of 4096 blocks and the union's list of them.
+const fn tile_smem_bytes(head_dim: i32) -> u32 {
+    let ld = head_dim as u32 + 8;
+    96 * ld * 2 + 2 * (2 * 16 * ld * 2) + 8 * (4096 / 32) * 4 + 4096 * 4
+}
+
 #[allow(clippy::too_many_arguments)]
 fn selected(
     ctx: &Ctx,
@@ -128,6 +141,58 @@ fn selected(
         return Err(refuse(op, "the query this attention was handed is empty"));
     }
     let num_requests = kv::lanes_of(op, q.indptr)?;
+    // Rows that share their keys, where a fire's requests run eight rows or
+    // more and every block a row can see fits the tile's maps.
+    let max_blocks = i64::from(pool.max_pages_per_request) * i64::from(pool.page_size)
+        / i64::from(ratio.max(1))
+        + 1;
+    if let Some(dim) = mma_dim(ctx, head_dim, q_heads / kv_heads)
+        && q_heads / kv_heads <= TILE_GROUP
+        && max_blocks <= TILE_MAX_BLOCKS
+        && total_tokens >= TILE_ROWS * num_requests.max(1)
+    {
+        #[allow(clippy::cast_sign_loss)]
+        let launch = Launch::grid(
+            [
+                (total_tokens as u32).div_ceil(TILE_ROWS as u32),
+                kv_heads as u32,
+                1,
+            ],
+            [TILE_THREADS, 1, 1],
+        )
+        .smem(tile_smem_bytes(dim));
+        return ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::attn::sdpa_selected::mma::sdpa_paged_selected_tile_kernel<{dim}>"
+                )),
+            )
+            .apply(launch),
+            &[
+                q.data.arg(),
+                pool.keys.arg(),
+                pool.values.arg(),
+                q.indptr.arg(),
+                pool.page_indices.arg(),
+                pool.page_indptr.arg(),
+                pool.last_page_lens.arg(),
+                selection.arg(),
+                ArgValue::Ptr(o.ptr),
+                num_requests.arg(),
+                q_heads.arg(),
+                kv_heads.arg(),
+                pool.page_size.arg(),
+                sm_scale.arg(),
+                top_k.arg(),
+                ratio.arg(),
+                i32::from(per_head).arg(),
+                total_tokens.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     if let Some(dim) = mma_dim(ctx, head_dim, q_heads / kv_heads) {
         #[allow(clippy::cast_sign_loss)]
         let launch = Launch::grid(
