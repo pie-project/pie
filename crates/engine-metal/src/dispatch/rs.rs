@@ -36,9 +36,11 @@ impl Run<'_> {
         }
     }
 
+    /// Queues one copy of `bytes` from `src` to `dst` on `copies`.
     fn rs_copy(
         &self,
         op: &'static str,
+        copies: &mut Vec<(Tensor, Tensor, u64)>,
         src: (u32, u64),
         dst: (u32, u64),
         bytes: u64,
@@ -54,18 +56,30 @@ impl Run<'_> {
             .handles()
             .cut(dst.0, dst.1, bytes)
             .map_err(|fault| Self::kernel(fault, op))?;
-        layout::copy_words(
-            self.ctx(),
+        copies.push((
             Tensor::new(src, 1, 1, poem_ir::Dtype::U32),
             Tensor::new(dst, 1, 1, poem_ir::Dtype::U32),
             bytes,
-        )
+        ));
+        Ok(())
+    }
+
+    /// Lands the copies one recurrent op queued, four to a launch. They are
+    /// disjoint — each lane's rows, its buffer pages, and the extended plane
+    /// it lands them in are its own — so a launch runs them side by side
+    /// where one launch a copy paid the device's launch cost per row run.
+    fn rs_flush(&self, copies: &[(Tensor, Tensor, u64)]) -> Result<(), Error> {
+        for chunk in copies.chunks(4) {
+            layout::copy_words_batch(self.ctx(), chunk)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn rs_move(
         &self,
         op: &'static str,
+        copies: &mut Vec<(Tensor, Tensor, u64)>,
         seat: &Seat,
         plane: usize,
         run: &crate::rs::Run,
@@ -83,9 +97,9 @@ impl Run<'_> {
             let bytes = u64::from(take) * row_bytes;
             let rows_at = u64::from(row0 + done) * row_bytes;
             if into_slab {
-                self.rs_copy(op, (rect.buf, rows_at), (seat.pool, at), bytes)?;
+                self.rs_copy(op, copies, (rect.buf, rows_at), (seat.pool, at), bytes)?;
             } else {
-                self.rs_copy(op, (seat.pool, at), (rect.buf, rows_at), bytes)?;
+                self.rs_copy(op, copies, (seat.pool, at), (rect.buf, rows_at), bytes)?;
             }
             done += take;
         }
@@ -111,6 +125,7 @@ impl Run<'_> {
         let row_bytes = seat.layout.planes[plane].row_bytes;
         let indptr = self.qo_indptr_host();
         let lane0 = self.window().span.lane_offset;
+        let mut copies = Vec::new();
         for r in 0..indptr.len().saturating_sub(1) {
             let rows = (indptr[r + 1] - indptr[r]).max(0) as u32;
             let (begin, replay) = extended_origin(indptr, &seat.lanes, lane0, r);
@@ -119,24 +134,35 @@ impl Run<'_> {
             };
             if plan.override_rows {
                 if let Some(run) = &plan.gather {
-                    self.rs_move(op, seat, plane, run, ext, begin, false)?;
+                    self.rs_move(op, &mut copies, seat, plane, run, ext, begin, false)?;
                 }
                 continue;
             }
             if let Some(run) = &plan.gather {
-                self.rs_move(op, seat, plane, run, ext, begin, false)?;
+                self.rs_move(op, &mut copies, seat, plane, run, ext, begin, false)?;
             }
             let own_at = u64::from(indptr[r].max(0) as u32) * row_bytes;
             self.rs_copy(
                 op,
+                &mut copies,
                 (own.buf, own_at),
                 (ext.buf, u64::from(begin + replay) * row_bytes),
                 u64::from(rows) * row_bytes,
             )?;
             if let Some(run) = &plan.scatter {
-                self.rs_move(op, seat, plane, run, own, indptr[r].max(0) as u32, true)?;
+                self.rs_move(
+                    op,
+                    &mut copies,
+                    seat,
+                    plane,
+                    run,
+                    own,
+                    indptr[r].max(0) as u32,
+                    true,
+                )?;
             }
         }
+        self.rs_flush(&copies)?;
         Ok(ext)
     }
 
@@ -210,16 +236,18 @@ impl Run<'_> {
             })?;
         let indptr = self.qo_indptr_host();
         let lane0 = self.window().span.lane_offset;
+        let mut copies = Vec::new();
         for r in 0..indptr.len().saturating_sub(1) {
             let rows = (indptr[r + 1] - indptr[r]).max(0) as u32;
             let (begin, replay) = extended_origin(indptr, &seat.lanes, lane0, r);
             self.rs_copy(
                 op,
+                &mut copies,
                 (ext.buf, u64::from(begin + replay) * row_bytes),
                 (target.buf, u64::from(indptr[r].max(0) as u32) * row_bytes),
                 u64::from(rows) * row_bytes,
             )?;
         }
-        Ok(())
+        self.rs_flush(&copies)
     }
 }
