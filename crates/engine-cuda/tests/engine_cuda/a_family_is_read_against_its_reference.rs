@@ -155,6 +155,11 @@ fn every_probe_is_dumped() {
     };
     let tag = std::env::var("PIE_PARITY_TAG").unwrap_or_else(|_| "pie".to_string());
 
+    // Each process times its dense GEMM tactics afresh, and a near tie can
+    // land on another cuBLASLt algorithm (another rounding) run to run;
+    // `PIE_PARITY_CACHE` names a directory the chosen tactics persist in,
+    // so two runs over it read bit for bit alike.
+    let tactics = std::env::var_os("PIE_PARITY_CACHE").map(std::path::PathBuf::from);
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {
         voxels: None,
@@ -187,7 +192,7 @@ fn every_probe_is_dumped() {
             }),
             ..Knobs::default()
         },
-        cache_dir: None,
+        cache_dir: tactics.as_deref(),
         runahead: engine::runahead::Runahead::F1,
         residency,
         world: World::default(),
