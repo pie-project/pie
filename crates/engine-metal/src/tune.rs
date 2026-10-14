@@ -180,6 +180,7 @@ fn candidates(base: &Profile) -> Vec<Qmm> {
         });
     }
     out.push(Qmm::Staged);
+    out.push(Qmm::Register);
     for q in base.ladder::<Qmm>().values() {
         if !out.contains(q) {
             out.push(*q);
@@ -192,6 +193,7 @@ fn body(q: &Qmm) -> String {
     match *q {
         Qmm::Mpp => "use = \"mpp\"".to_string(),
         Qmm::Staged => "use = \"staged\"".to_string(),
+        Qmm::Register => "use = \"register\"".to_string(),
         Qmm::Tiled { crossover_tg } => format!("use = \"tiled\", crossover_tg = {crossover_tg}"),
         Qmm::Qmv {
             rows_max,
@@ -221,10 +223,19 @@ fn ran(files: &[&str], q: &Qmm) -> bool {
     match q {
         Qmm::Mpp => has("quant_qmm_mpp"),
         Qmm::Staged => has("quant_qmm_staged"),
+        Qmm::Register => has("quant_qmm_sg"),
         Qmm::Tiled { .. } => {
-            !has("quant_qmm_mpp") && !has("quant_qmm_staged") && has("quant_qmm_t")
+            !has("quant_qmm_mpp")
+                && !has("quant_qmm_staged")
+                && !has("quant_qmm_sg")
+                && has("quant_qmm_t")
         }
-        Qmm::Qmv { .. } => !has("quant_qmm_mpp") && !has("quant_qmm_staged") && !has("quant_qmm_t"),
+        Qmm::Qmv { .. } => {
+            !has("quant_qmm_mpp")
+                && !has("quant_qmm_staged")
+                && !has("quant_qmm_sg")
+                && !has("quant_qmm_t")
+        }
     }
 }
 
@@ -1298,7 +1309,7 @@ mod tests {
                     let times = candidates
                         .iter()
                         .map(|q| match *q {
-                            Qmm::Mpp | Qmm::Staged => None,
+                            Qmm::Mpp | Qmm::Staged | Qmm::Register => None,
                             Qmm::Tiled { crossover_tg } => {
                                 (rows >= 4).then(|| 12.0 + f64::from(crossover_tg) / 1000.0)
                             }

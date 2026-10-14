@@ -29,6 +29,11 @@ pub enum Qmm {
     Mpp,
     #[partial]
     Staged,
+    /// Up to 8 rows of 4-bit, 64-group banks on the simdgroup-matrix MMA,
+    /// operands built in registers: the tile for GPUs without neural
+    /// accelerators (Apple9), whose MMA runs on the FP32 pipe.
+    #[partial]
+    Register,
     /// The tiled kernels (fp16 precast, split-k, plain), where the
     /// contraction is whole 32-code tiles and a tile fills the device.
     #[partial]
@@ -81,6 +86,9 @@ impl Qmm {
                 at.bits == 4 && at.group == 64 && at.rows >= 8 && at.n % i64::from(bn) == 0
             }
             Qmm::Staged => at.bits == 4 && at.group == 64 && at.rows <= 8 && at.n % 64 == 0,
+            Qmm::Register => {
+                at.bits == 4 && at.group == 64 && at.rows <= 8 && at.n % 64 == 0 && at.k % 256 == 0
+            }
             Qmm::Tiled { .. } => at.k % i64::from(crate::linear::quant::QMM_BK) == 0,
             Qmm::Qmv { .. } => true,
         }
@@ -310,6 +318,12 @@ impl Tuning {
                 "emulated"
             },
         }
+    }
+
+    /// The GPU's cores, where the device says.
+    #[must_use]
+    pub fn cores(&self) -> Option<u32> {
+        self.cores
     }
 
     #[must_use]

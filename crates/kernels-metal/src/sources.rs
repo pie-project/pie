@@ -325,6 +325,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/linear/quant_qmm_staged.metal")),
     ),
     (
+        "linear/quant_qmm_sg.metal",
+        include_str!(concat!(source_root!(), "/linear/quant_qmm_sg.metal")),
+    ),
+    (
         "linear/quant_qmv.metal",
         include_str!(concat!(source_root!(), "/linear/quant_qmv.metal")),
     ),
