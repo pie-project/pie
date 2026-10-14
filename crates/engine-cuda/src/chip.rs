@@ -437,10 +437,11 @@ mod tests {
             kernels_cuda::tuning::Tuning {
                 gemm_skinny_rows: kernels_cuda::tuning::Tuning::of(&family).gemm_skinny_rows,
                 selected_mma: false,
+                index_mma: false,
                 ..tuning
             },
             kernels_cuda::tuning::Tuning::of(&family),
-            "only the skinny GEMM's reach and the selected attention's walk differ from \
+            "only the skinny GEMM's reach and the two sparse-attention walks differ from \
              the family"
         );
         assert!(

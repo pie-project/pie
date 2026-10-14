@@ -12,9 +12,11 @@ device = "NVIDIA B200"
 #
 # The selected (sparse) attention runs on the tensor cores: one 32x4096
 # prefill of Qwen3.8-Flash-Next spends 1.07 s in it against 18.99 s in the
-# scalar walk.
+# scalar walk. Its pooled index scores on the tensor cores too: 0.11 s of
+# the same prefill against 1.20 s a thread a block.
 [kernel]
 gemm.skinny_rows = 0
+sdpa.index_mma = true
 sdpa.selected_mma = true
 
 # Two recurrent-state slots a lane seat every lane a hybrid trunk batches
@@ -47,6 +49,7 @@ measured = [
   "kernel.sdpa.decode.split_small",
   "kernel.sdpa.decode.split_window",
   "kernel.sdpa.decode.static_max_requests",
+  "kernel.sdpa.index_mma",
   "kernel.sdpa.prefill.ctas_per_sm",
   "kernel.sdpa.selected_mma",
   "engine.copies",
