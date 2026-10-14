@@ -247,8 +247,14 @@ pub(crate) fn build_frame_submission(
                 tokens += usage.forward_tokens;
                 page_refs += usage.page_refs;
             }
+            let prefill_lanes = build
+                .lanes
+                .iter()
+                .filter(|lane| lane.tokens.len() > 1)
+                .count();
             super::worker::wave_trace_emit(format!(
-                "[step-lanes] members={} lanes={} tokens={tokens}/{} page_refs={page_refs}/{} kv_len_max={}",
+                "[step-lanes] t={}us members={} prefill_lanes={prefill_lanes} lanes={} tokens={tokens}/{} page_refs={page_refs}/{} kv_len_max={}",
+                super::worker::wave_trace_us(),
                 group.len(),
                 build.lanes.len(),
                 limits.max_forward_tokens,
