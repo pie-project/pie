@@ -4138,6 +4138,7 @@ pub struct Landed {
 /// the device tens, so a head this long keeps the device busy while the host
 /// encodes the tail: a 64-layer verify fire is some 1700 launches and 0.6 ms
 /// of encoding the device otherwise sat out.
+#[cfg(target_vendor = "apple")]
 const HEAD_LAUNCHES: u32 = 64;
 
 fn fire_trace(line: impl FnOnce() -> String) {
