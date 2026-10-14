@@ -498,6 +498,11 @@ pub struct Epilogue {
     /// A device f32 scale a weight row (as `bias` indexes them) multiplying
     /// the product before the bias (NVFP4's per-row tensor scale), or 0.
     pub weight_scale: u64,
+    /// A contiguous group's live rows an expert (device `i32 [experts]`),
+    /// or 0: rows of an expert's block past them are padding, whose
+    /// products land nowhere (an expert's 128-row block at decode widths
+    /// holds a route or two).
+    pub live_rows: u64,
 }
 
 impl Epilogue {
@@ -507,6 +512,7 @@ impl Epilogue {
         row_scale: 0,
         bias: 0,
         weight_scale: 0,
+        live_rows: 0,
     };
 
     const fn glu_code(&self) -> u32 {
@@ -578,6 +584,7 @@ impl Epilogue {
             wsf,
             wzero,
             wscale: self.weight_scale,
+            live: self.live_rows,
         }
     }
 }
@@ -598,6 +605,7 @@ struct EpiArgs {
     wsf: u64,
     wzero: u64,
     wscale: u64,
+    live: u64,
 }
 
 /// `y = epilogue(alpha * act . w^T)` for `[m, n, k]`, `n` the output's

@@ -506,7 +506,11 @@ pub(crate) fn select_tc5(
         },
         [n, k],
         1.0,
-        epi,
+        // An expert's padding rows land nowhere.
+        crate::linear::tc5::Epilogue {
+            live_rows: layout.live_rows(),
+            ..epi
+        },
         count,
     )?;
     act_quant::gather_back(ctx, op, ys, layout.pos, routes.width, y)
@@ -751,6 +755,7 @@ pub fn experts(
             glu: Some(glu),
             bias: u.2,
             weight_scale: u.3,
+            live_rows: layout.live_rows(),
             ..tc5::Epilogue::STORE
         };
         let xs = ctx.scratch_stream(OP, GROUPED_X, rows * k as usize * 2)? as u64;
@@ -778,6 +783,7 @@ pub fn experts(
             tc5::Epilogue {
                 bias: d.2,
                 weight_scale: d.3,
+                live_rows: layout.live_rows(),
                 ..tc5::Epilogue::STORE
             },
             count,

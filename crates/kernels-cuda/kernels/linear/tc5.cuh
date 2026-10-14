@@ -87,6 +87,7 @@ struct Epi {
     const unsigned char* wsf;  // a W4A16 weight's scales, row-major [rows][k / gran]
     const bf16* wzero;         // an affine W4A16 weight's zeros, beside its scales
     const float* wscale;       // an f32 scale each weight row (NVFP4's tensor scale), or null
+    const int* live;           // a contiguous group's live rows an expert, or null
 };
 
 namespace tc5k {
@@ -577,6 +578,11 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             x.out_p = x.p_row;
             x.out_q = qt * static_cast<int>(kQStep);
             x.lim_p = min(static_cast<int>(kM), routes[e + 1] - x.p_row);
+            // Past the expert's live rows its block is padding: those rows
+            // land nowhere, and a warp wholly past them stores nothing.
+            if (epi.live != nullptr) {
+                x.lim_p = min(x.lim_p, __ldg(&epi.live[e]) - pt * static_cast<int>(kM));
+            }
             x.lim_q = span - qt * static_cast<int>(kQStep);
         } else {
             const int count = min(routes[e], m_max);

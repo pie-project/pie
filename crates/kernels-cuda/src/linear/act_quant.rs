@@ -424,12 +424,7 @@ pub fn select(
         return Ok(());
     }
     let div = if x.rows == count { 1 } else { routes.width };
-    let Layout {
-        pos,
-        rows,
-        groups,
-        m_max,
-    } = lay_out_with(
+    let layout = lay_out_with(
         ctx,
         op,
         routes,
@@ -438,6 +433,13 @@ pub fn select(
         false,
         bank.alpha_from.map(|a| (a, bank.alpha_e)),
     )?;
+    let Layout {
+        pos,
+        rows,
+        groups,
+        m_max,
+        ..
+    } = layout;
     let (e, gran) = (experts as usize, fmt.gran() as usize);
     let atom_bytes = if m_max > 0 {
         tc5::masked_atom_bytes(e, m_max as usize, k as usize, gran)
@@ -463,7 +465,7 @@ pub fn select(
         Format::Nvfp4 => tc5::Elem::E2m1,
         Format::E4m3 { .. } => tc5::Elem::E4m3,
     };
-    tc5::grouped_gemm(
+    tc5::grouped_gemm_epi(
         ctx,
         tc5::Operand::scaled(codes as u64, a_elem, atoms as u64, fmt.gran()),
         tc5::Operand::scaled(bank.codes, bank.elem, bank.atoms, bank.gran),
@@ -475,6 +477,11 @@ pub fn select(
         },
         [n, k],
         1.0,
+        // An expert's padding rows land nowhere.
+        tc5::Epilogue {
+            live_rows: layout.live_rows(),
+            ..tc5::Epilogue::STORE
+        },
         count,
     )?;
     gather_back(ctx, op, grouped, pos, routes.width, y)
@@ -493,6 +500,20 @@ pub(crate) struct Layout {
     pub rows: u32,
     pub groups: tc5::Groups,
     pub m_max: u32,
+    /// Each expert's live rows (`i32 [experts]`), the rest of a contiguous
+    /// expert's block padding.
+    pub counts: u64,
+}
+
+impl Layout {
+    /// The epilogue's live-row clip for this layout: a contiguous group's
+    /// counts (a masked one's tiles already stop at them).
+    pub(crate) fn live_rows(&self) -> u64 {
+        match self.groups {
+            tc5::Groups::Contiguous { .. } => self.counts,
+            tc5::Groups::Masked { .. } => 0,
+        }
+    }
 }
 
 /// Lays `routes` (`i32 [tokens][top]`, an expert of `experts` or negative)
@@ -542,6 +563,7 @@ fn lay_out_with(
                 rows: experts * m_max,
                 groups: tc5::Groups::Masked { counts, m_max },
                 m_max,
+                counts,
             }
         } else {
             // Each expert's rows start a whole alignment apart.
@@ -551,6 +573,7 @@ fn lay_out_with(
                 rows,
                 groups: tc5::Groups::Contiguous { offsets, rows },
                 m_max,
+                counts,
             }
         }
     };
