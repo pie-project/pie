@@ -8,6 +8,8 @@
 //!
 //!     cargo test -p kernels-cuda --features cuda --release --test kernels_cuda \
 //!         the_tcgen05_gemm_reports -- --ignored --nocapture
+//!
+//! `PIE_TC5_SHAPE=m,n,k` measures one shape.
 
 use core::ffi::c_void;
 
@@ -368,14 +370,26 @@ fn the_tcgen05_gemm_reports_its_rate_beside_cublaslt() {
         "| M | N | K | cuBLASLt bf16 | tc5 bf16 | cuBLASLt mxfp8 | tc5 fp8 per-tensor | tc5 fp8 1x128 ue8m0 | tc5 fp8 mx32 | cuBLASLt nvfp4 | tc5 nvfp4 | tc5 w4a8 |"
     );
     println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
-    for (n, k) in [(4096, 4096), (7168, 2048), (2048, 7168), (14336, 4096)] {
+    // `PIE_TC5_SHAPE=m,n,k` measures that shape alone.
+    let only: Option<Vec<usize>> = std::env::var("PIE_TC5_SHAPE")
+        .ok()
+        .map(|v| v.split(',').filter_map(|d| d.trim().parse().ok()).collect());
+    let shapes = match &only {
+        Some(s) if s.len() == 3 => vec![(s[1], s[2])],
+        _ => vec![(4096, 4096), (7168, 2048), (2048, 7168), (14336, 4096)],
+    };
+    for (n, k) in shapes {
         let w16 = copies(&mut gpu, &noise(n * k * 2, 0xbf, 0x00, 1));
         let w8 = copies(&mut gpu, &noise(n * k, 0xb7, 0x00, 2));
         let w4 = copies(&mut gpu, &noise(n * k / 2, 0xff, 0x00, 3));
         let sw128 = gpu.up(&noise(atom_bytes(n, k, 128), 0x03, 0x7c, 4));
         let sw32 = gpu.up(&noise(atom_bytes(n, k, 32), 0x03, 0x7c, 5));
         let sw16 = gpu.up(&noise(atom_bytes(n, k, 16), 0x07, 0x30, 6));
-        for m in [1usize, 16, 128, 1024, 8192] {
+        let ms = match &only {
+            Some(s) if s.len() == 3 => vec![s[0]],
+            _ => vec![1usize, 16, 128, 1024, 8192],
+        };
+        for m in ms {
             let a16 = gpu.up(&noise(m * k * 2, 0xbf, 0x00, 7));
             let a8 = gpu.up(&noise(m * k, 0xb7, 0x00, 8));
             let a4 = gpu.up(&noise(m * k / 2, 0xff, 0x00, 9));
