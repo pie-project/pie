@@ -327,11 +327,17 @@ mod tests {
                 let b200 = (major, minor) == (10, 0);
                 assert_eq!(tuning.moe_tc5, b200, "{gpu}");
                 assert_eq!(
+                    tuning.ssm_gdn_fused_scan,
+                    major == 10 && minor == 0,
+                    "{gpu}"
+                );
+                assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
                         mla_naive: false,
                         moe_tc5: defaults.moe_tc5,
                         gemm_tc5_glu_from: defaults.gemm_tc5_glu_from,
+                        ssm_gdn_fused_scan: false,
                         ..tuning
                     },
                     defaults,
@@ -407,6 +413,37 @@ mod tests {
             kernels_cuda::tuning::Tuning::of(&family),
             "only the skinny GEMM's reach differs from the family"
         );
+    }
+
+    /// The two-launch gated delta scan is an sm_100 family decision; every
+    /// other family keeps the three wmma launches it ran before.
+    #[test]
+    fn only_the_sm100_family_runs_the_two_launch_gated_delta_scan() {
+        for (name, major, minor, sms) in [("NVIDIA B200", 10, 0, 148), ("NVIDIA GB200", 10, 0, 152)]
+        {
+            let (p, _) = resolve(name, &facts(major, minor, sms), None);
+            assert!(
+                kernels_cuda::tuning::Tuning::of(&p).ssm_gdn_fused_scan,
+                "{name}"
+            );
+        }
+        for (name, major, minor, sms) in [
+            ("NVIDIA A100-SXM4-80GB", 8, 0, 108),
+            ("NVIDIA GeForce RTX 3090", 8, 6, 82),
+            ("NVIDIA Jetson AGX Orin", 8, 7, 16),
+            ("NVIDIA L40S", 8, 9, 142),
+            ("NVIDIA H100 80GB HBM3", 9, 0, 132),
+            ("NVIDIA B300", 10, 3, 148),
+            ("NVIDIA Thor", 11, 0, 20),
+            ("NVIDIA GeForce RTX 5090", 12, 0, 170),
+            ("NVIDIA GB10", 12, 1, 48),
+        ] {
+            let (p, _) = resolve(name, &facts(major, minor, sms), None);
+            assert!(
+                !kernels_cuda::tuning::Tuning::of(&p).ssm_gdn_fused_scan,
+                "{name}"
+            );
+        }
     }
 
     #[test]

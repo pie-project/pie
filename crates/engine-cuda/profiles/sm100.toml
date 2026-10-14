@@ -12,3 +12,7 @@ mla.path  = "naive"
 moe.tc5           = true
 moe.tc5_from      = 16
 gemm.tc5_glu_from = 64
+# Every sm_100 block opts into 227 KiB, past the 123 KiB the two-launch
+# gated delta scan holds; 32 x 4096 tokens take 7.8 ms a layer there where
+# the three wmma launches took about 97 (Qwen3.8-27B's head).
+ssm.gdn_fused_scan = true

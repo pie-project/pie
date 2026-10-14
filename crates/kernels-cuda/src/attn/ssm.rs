@@ -740,13 +740,25 @@ fn fused_fits(shape: &Delta, state: &RecurrentPool, qkv: Tensor, y: &Tensor) -> 
             .all(|&at| aligned16(at))
 }
 
-/// Warps per block of the fused step, and the blocks each SM holds: the
-/// warps are persistent, so the grid is at most what the SMs seat at once.
+/// Warps per block of the fused step, and the most blocks each SM holds:
+/// the warps are persistent, so the grid is at most what the SMs seat at
+/// once.
 const FUSED_WARPS: u32 = 4;
 const FUSED_BLOCKS_PER_SM: u32 = 3;
 /// The bytes one warp's stage of the fused step streams: its state tile, the
 /// q and k rows, its value slice and the two gates.
 const FUSED_STAGE: u32 = 4096 + 512 + 32 + 32;
+/// The fused step's shared memory a block, double-buffered.
+const FUSED_SMEM: u32 = FUSED_WARPS * 2 * FUSED_STAGE;
+
+/// The fused step's blocks one SM seats: three, or fewer where the SM's
+/// shared memory (less the 1 KiB the runtime keeps a block) holds fewer.
+fn fused_blocks_per_sm(smem_per_sm: Option<u32>) -> u32 {
+    const RESERVED: u32 = 1024;
+    smem_per_sm.map_or(FUSED_BLOCKS_PER_SM, |bytes| {
+        (bytes / (FUSED_SMEM + RESERVED)).clamp(1, FUSED_BLOCKS_PER_SM)
+    })
+}
 
 impl Delta {
     fn decode_fused(
@@ -770,13 +782,13 @@ impl Delta {
                     format!("{} rows of value tiles overflow a grid", self.n),
                 )
             })?;
-        let blocks = tiles.div_ceil(FUSED_WARPS).min(sms * FUSED_BLOCKS_PER_SM);
+        let blocks = tiles
+            .div_ceil(FUSED_WARPS)
+            .min(sms * fused_blocks_per_sm(ctx.smem_per_sm()));
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::ssm_gdn_decode_step<4>").apply(
-                Launch::grid([blocks, 1, 1], [32 * FUSED_WARPS, 1, 1])
-                    .smem(FUSED_WARPS * 2 * FUSED_STAGE),
-            ),
+            Fire::at(FILE, "::pie::attn::ssm_gdn_decode_step<4>")
+                .apply(Launch::grid([blocks, 1, 1], [32 * FUSED_WARPS, 1, 1]).smem(FUSED_SMEM)),
             &[
                 qkv.arg(),
                 gates.arg(),
@@ -804,6 +816,25 @@ impl Delta {
 /// captured fire states its bucket's lanes, not the live ones, so the width
 /// cannot follow the batch.
 const SCAN_BV: u32 = 64;
+
+/// The shared memory one block of the chunked scan holds at key width
+/// `k_dim`: its prep is smaller.
+const fn scan_smem(k_dim: u32) -> u32 {
+    const CH: u32 = 64;
+    const LD: u32 = 136;
+    const LDC: u32 = 72;
+    let ldv = SCAN_BV + 8;
+    (4 * CH * LD + CH * ldv + CH * LDC + k_dim * ldv + 2 * CH * ldv) * 2 + 2 * CH * FLOAT
+}
+
+/// Whether a 128-wide prefill takes the two-launch scan: the profile turns
+/// it on, and this device's blocks can opt into its shared memory.
+fn fused_scan(ctx: &Ctx, k_dim: u32) -> bool {
+    ctx.tuning().ssm_gdn_fused_scan
+        && ctx
+            .smem_per_block_optin()
+            .is_some_and(|cap| cap >= scan_smem(k_dim))
+}
 
 #[allow(clippy::too_many_arguments)]
 fn gated_delta_chunked_fla(
@@ -888,9 +919,7 @@ fn gated_delta_chunked_fla(
             ctx.stage(),
         ],
     )?;
-    let ldv = SCAN_BV + 8;
-    let scan_smem =
-        (4 * CH * LD + CH * ldv + CH * LDC + k_dim * ldv + 2 * CH * ldv) * 2 + 2 * CH * FLOAT;
+    let scan_smem = scan_smem(k_dim);
     ctx.fire(
         op,
         Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_scan<64>").apply(
@@ -915,6 +944,156 @@ fn gated_delta_chunked_fla(
             state.begin_at.arg(),
             state.write_state.arg(),
             state.write_state_mask.arg(),
+            y.arg(),
+            stated(op, lanes)?.arg(),
+            stated(op, k_heads)?.arg(),
+            stated(op, v_heads)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// The chunked rule in three wmma launches over the staged planes: the
+/// update directions per chunk, the state walk per sixteen value columns,
+/// and the output per chunk. No block holds more than 41 KiB of shared
+/// memory, so every card runs it.
+#[allow(clippy::too_many_arguments)]
+fn gated_delta_chunked_split(
+    ctx: &Ctx,
+    op: &'static str,
+    shape: &Delta,
+    staged: &DeltaStaged,
+    qkv: RaggedTensor,
+    state: &RecurrentPool,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const CH: u32 = 64;
+    const BVT: u32 = 16;
+    const BLOCK: u32 = 256;
+    let lanes = requests(op, qkv)?;
+    seated(op, state, "ssm_gdn_chunk", true, true, true)?;
+    let (k_dim, v_dim, v_heads, k_heads) = (shape.k_dim, shape.v_dim, shape.v_heads, shape.k_heads);
+    let slots = shape.n.div_ceil(CH) + lanes;
+    let padded = Delta {
+        n: shape.n + CH,
+        ..*shape
+    };
+    let per_slot = |heads: u32, width: u32| u64::from(slots) * u64::from(heads) * u64::from(width);
+    let gcum = plane(ctx, op, "attn.ssm_gdn_chunk_gcum", shape.elems(v_heads, 1))?;
+    let qb = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_qb",
+        padded.elems(k_heads, k_dim),
+    )?;
+    let kb = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_kb",
+        padded.elems(k_heads, k_dim),
+    )?;
+    let kt = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_kt",
+        per_slot(k_heads, k_dim * CH),
+    )?;
+    let w = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_w",
+        padded.elems(v_heads, k_dim),
+    )?;
+    let u = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_u",
+        padded.elems(v_heads, v_dim),
+    )?;
+    let vnt = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_vnt",
+        per_slot(v_heads, v_dim * CH),
+    )?;
+    let hct = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_hct",
+        per_slot(v_heads, v_dim * k_dim),
+    )?;
+    let wu_smem = CH * CH * FLOAT + CH * k_dim * 2 + CH * CH * 2 + 4 * CH * FLOAT;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_wu<128, 128>")
+            .apply(Launch::grid([slots, v_heads, 1], [BLOCK, 1, 1]).smem(wu_smem)),
+        &[
+            ArgValue::Ptr(staged.q_norm),
+            ArgValue::Ptr(staged.k_norm),
+            ArgValue::Ptr(staged.v),
+            ArgValue::Ptr(staged.g_log),
+            ArgValue::Ptr(staged.beta),
+            state.slot_ids.arg(),
+            qkv.indptr.arg(),
+            state.commit_len.arg(),
+            state.begin_at.arg(),
+            ArgValue::Ptr(gcum),
+            ArgValue::Ptr(qb),
+            ArgValue::Ptr(kb),
+            ArgValue::Ptr(kt),
+            ArgValue::Ptr(w),
+            ArgValue::Ptr(u),
+            stated(op, lanes)?.arg(),
+            stated(op, k_heads)?.arg(),
+            stated(op, v_heads)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            "::pie::attn::ssm_gdn_chunk_h<::pie::attn::state_bf16, 128, 128, 16>",
+        )
+        .apply(Launch::grid(
+            [lanes * v_heads * (v_dim / BVT), 1, 1],
+            [BLOCK, 1, 1],
+        )),
+        &[
+            ArgValue::Ptr(gcum),
+            ArgValue::Ptr(kt),
+            ArgValue::Ptr(w),
+            ArgValue::Ptr(u),
+            ArgValue::Ptr(vnt),
+            ArgValue::Ptr(hct),
+            state.slab.arg(),
+            state.slot_ids.arg(),
+            qkv.indptr.arg(),
+            state.slot_stride_elems.arg(),
+            state.commit_len.arg(),
+            state.begin_at.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            stated(op, lanes)?.arg(),
+            stated(op, k_heads)?.arg(),
+            stated(op, v_heads)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_o<128, 128, 16>")
+            .apply(Launch::grid([slots, v_heads, 1], [BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(gcum),
+            ArgValue::Ptr(qb),
+            ArgValue::Ptr(kb),
+            ArgValue::Ptr(vnt),
+            ArgValue::Ptr(hct),
+            state.slot_ids.arg(),
+            qkv.indptr.arg(),
+            state.commit_len.arg(),
+            state.begin_at.arg(),
             y.arg(),
             stated(op, lanes)?.arg(),
             stated(op, k_heads)?.arg(),
@@ -982,19 +1161,22 @@ pub fn gated_delta_chunked(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;
-    if k_dim == BK_MAX_FLA
-        && v_dim == BV_FLA
+    let wide = k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get);
+    let fused = wide && fused_scan(ctx, k_dim);
+    if fused
         && shape.conv_dim.is_multiple_of(8)
         && (k_heads * k_dim).is_multiple_of(8)
         && state.slot_stride_elems % 8 == 0
         && [qkv.data.ptr, y.ptr, state.slab.ptr]
             .iter()
             .all(|&at| aligned16(at))
-        && !SERIAL_SCAN.with(core::cell::Cell::get)
     {
         return gated_delta_chunked_fla(ctx, OP, &shape, qkv, gates, state, y);
     }
     let staged = shape.stage(ctx, OP, qkv.data, gates, StagePlanes::Chunk)?;
+    if wide && !fused {
+        return gated_delta_chunked_split(ctx, OP, &shape, &staged, qkv, state, y);
+    }
     if k_dim <= BK_MAX_FLA && v_dim.is_multiple_of(BV_FLA) {
         seated(
             OP,
@@ -1420,4 +1602,30 @@ pub fn kda_chunked(
             ctx.stage(),
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A B200 or H100 block opts into 227 KiB, an A100 into 163 KiB; an
+    /// RTX 30/40/50 or a DGX Spark into 99 KiB, short of the scan.
+    #[test]
+    fn the_scan_fits_a_datacenter_block_and_not_a_99_kib_one() {
+        assert_eq!(scan_smem(128), 125_440);
+        assert!(scan_smem(128) <= 232_448);
+        assert!(scan_smem(128) <= 166_912);
+        assert!(scan_smem(128) > 101_376);
+    }
+
+    /// Three blocks of the fused step where the SM holds them, as on a B200
+    /// (228 KiB) or an A100 (164 KiB); two on a 100 KiB SM.
+    #[test]
+    fn the_fused_step_seats_what_the_sm_holds() {
+        assert_eq!(fused_blocks_per_sm(Some(233_472)), 3);
+        assert_eq!(fused_blocks_per_sm(Some(167_936)), 3);
+        assert_eq!(fused_blocks_per_sm(Some(102_400)), 2);
+        assert_eq!(fused_blocks_per_sm(Some(16_384)), 1);
+        assert_eq!(fused_blocks_per_sm(None), 3);
+    }
 }

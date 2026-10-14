@@ -164,6 +164,14 @@ pub struct MoeAffineWmma;
 #[decision(id = "kernel.moe.affine_grouped_from", constant(range(1..=65_536)), default = 16, tune = search)]
 pub struct MoeAffineGroupedFrom(pub u32);
 
+/// Whether a 128-wide gated delta prefill runs the two-launch tensor-core
+/// scan (its scan block holds about 123 KiB of shared memory) rather than
+/// the three wmma launches; a card whose blocks cannot opt into that much
+/// keeps the three whatever this says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_fused_scan", flag, default = false, tune = search)]
+pub struct SsmGdnFusedScan;
+
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
@@ -192,7 +200,8 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeAffineGroupedFrom>()
         .add::<MoeTc5>()
         .add::<MoeTc5From>()
-        .add::<GemmTc5GluFrom>();
+        .add::<GemmTc5GluFrom>()
+        .add::<SsmGdnFusedScan>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -227,6 +236,7 @@ pub struct Tuning {
     pub moe_tc5: bool,
     pub moe_tc5_from: u32,
     pub gemm_tc5_glu_from: u32,
+    pub ssm_gdn_fused_scan: bool,
 }
 
 impl Tuning {
@@ -259,6 +269,7 @@ impl Tuning {
         moe_tc5: false,
         moe_tc5_from: 16,
         gemm_tc5_glu_from: 65_536,
+        ssm_gdn_fused_scan: false,
     };
 
     #[must_use]
@@ -291,6 +302,7 @@ impl Tuning {
             moe_tc5: profile.on::<MoeTc5>(&Anywhere),
             moe_tc5_from: profile.get::<MoeTc5From>().0,
             gemm_tc5_glu_from: profile.get::<GemmTc5GluFrom>().0,
+            ssm_gdn_fused_scan: profile.on::<SsmGdnFusedScan>(&Anywhere),
         }
     }
 }

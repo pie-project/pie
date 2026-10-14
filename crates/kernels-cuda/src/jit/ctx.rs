@@ -436,6 +436,34 @@ impl Ctx {
         }
     }
 
+    /// The dynamic shared memory one block may opt into on this device.
+    #[allow(clippy::unused_self)]
+    #[must_use]
+    pub fn smem_per_block_optin(&self) -> Option<u32> {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::max_shared_memory_per_block_optin()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    /// The shared memory one SM holds across its resident blocks.
+    #[allow(clippy::unused_self)]
+    #[must_use]
+    pub fn smem_per_sm(&self) -> Option<u32> {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::max_shared_memory_per_sm()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
     pub fn fire(&self, op: &'static str, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         let Some(root) = crate::jit::Root::of(fire.file) else {
             return Err(refuse(
