@@ -201,14 +201,33 @@ pub fn decode(
     let hnd = if shape.hnd_layout { "true" } else { "false" };
     // The matrix-core decode takes a group within one 16-column tile; a
     // wider group takes the vector decode.
-    let (entry, threads) = if group <= 16 && shape.head_dim.is_multiple_of(32) {
+    let blocks = (info.padded_batch_size as u32).saturating_mul(shape.num_kv_heads);
+    let (entry, threads) = if group <= 16 && shape.head_dim >= 512 && !info.split_kv {
+        // An unsplit batch at the widest heads fills the grid: the decode
+        // whose columns split over its wavefronts keeps more blocks a CU
+        // (and their reads) in flight.
         (
             symbol(&format!(
-                "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}>",
+                "::pie::attn::paged_decode_cols<{}, {group}, {hnd}>",
                 shape.head_dim
             )),
-            // `kDecodeMfmaWaves`: four wavefronts at 512-wide heads.
-            if shape.head_dim >= 512 { 256 } else { 512 },
+            256,
+        )
+    } else if group <= 16 && shape.head_dim.is_multiple_of(32) {
+        // Four wavefronts at 512-wide heads; below, eight, or four (three
+        // or four blocks a CU, not one) once the grid is two blocks a CU.
+        let waves = if shape.head_dim >= 512 || blocks >= 2 * plan.device.num_sm {
+            4
+        } else {
+            8
+        };
+        (
+            symbol(&format!(
+                "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}, {waves}, {}>",
+                shape.head_dim,
+                shape.head_dim < 512
+            )),
+            64 * waves,
         )
     } else {
         let waves = decode_waves(group, shape.head_dim);
