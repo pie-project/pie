@@ -756,6 +756,14 @@ impl Run<'_> {
                 .opaque_rows(i32::try_from(a.rows).unwrap_or(i32::MAX)),
         )
         .unwrap_or(a.rows);
+        // A GLU tile is 128 gate rows and their up rows over every K: a
+        // product of too few tiles to reach a quarter of the SMs (a narrow
+        // shared expert at decode widths) streams its weight through those
+        // few, slower than the GEMM and the GLU apart.
+        let sms = self.ctx().multiprocessors().unwrap_or(148);
+        if inter.div_ceil(128) * m.div_ceil(128) < sms / 4 {
+            return Ok(false);
+        }
         // A tcgen05 launch that fails leaves the projection and the GLU to
         // run apart.
         Ok(tc5::gemm_epi(
