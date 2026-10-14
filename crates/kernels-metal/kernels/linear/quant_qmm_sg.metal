@@ -20,7 +20,8 @@ using namespace metal;
 // group, whose pair p (codes p and p + 4 of word 2c + j) is its operand of
 // MMA step (j, p): the step's eight k are the four lanes' pairs, all of one
 // group. `SPLIT` is the grid's y extent: partitions of the contraction,
-// written to `partials` and folded by the split-k reduce.
+// written to `partials` and added, in partition order, by the last partition
+// of each column tile to arrive.
 
 namespace qmm_sg {
 
@@ -48,11 +49,17 @@ constant constexpr int kSpan = 256;
 // The rows' inputs as the tile's lanes take them: for each 64-code group h and B-operand lane
 // slot (fm, c), the 16 inputs of rows 2c and 2c + 1 at MMA steps (j, p) = 0..1 x 0..3, which sit
 // at k = 64h + 8(2c' + j) + p + 4i for the A lane c' = fm / 2 that pairs with B row fm (i = fm % 2);
-// then each row's sum of each 32 inputs, [group][row], at `table` + 8 * width.
+// then each row's sum of each 32 inputs, [group][row], at `table` + 8 * width; then the split
+// tile's arrival counters, one per 64 columns, which it zeroes.
 [[kernel]] void qmm_sg_table(const device bfloat *input [[buffer(0)]], device bfloat *table [[buffer(1)]],
                              constant int &width [[buffer(2)]], constant int &rows [[buffer(3)]],
-                             uint2 at [[thread_position_in_grid]]) {
+                             constant int &counters [[buffer(4)]],
+                             uint2 at [[thread_position_in_grid]], uint2 grid [[threads_per_grid]]) {
   const uint h = at.x, slot = at.y;
+  // The split tile's arrival counters, past the sums: zero before the tile counts on them.
+  device uint *count = reinterpret_cast<device uint *>(table + 8 * ulong(width)) + width / 4;
+  for (uint at_ = h * 32 + slot; at_ < uint(counters); at_ += grid.x * grid.y)
+    count[at_] = 0;
   const uint fm = slot >> 2, c = slot & 3;
   const uint cp = fm >> 1, i = fm & 1;
   vec<bfloat, 16> v;
@@ -157,17 +164,59 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
       acc[f] = fma(sm, ck[f].y, acc[f]);
     }
   }
+  if constexpr (SPLIT > 1) {
+    // Each partition publishes its sums; the last of a column tile's to arrive adds them in
+    // partition order, as the split-k reduce did, and writes the output.
+    device coherent(device) float *plane = partials;
 #pragma unroll
-  for (uint i = 0; i < 2; ++i) {
-    const uint row = fn + i;
-    if (int(row) >= rows)
-      continue;
-    const ulong o = ulong(row) * columns + column;
+    for (uint i = 0; i < 2; ++i) {
+      const uint row = fn + i;
+      if (int(row) >= rows)
+        continue;
+      const ulong o = ulong(row) * columns + column;
 #pragma unroll
-    for (int f = 0; f < NF; ++f) {
-      if constexpr (SPLIT > 1)
-        partials[ulong(position.y) * rows * columns + o + 8 * f] = acc[f][i];
-      else
+      for (int f = 0; f < NF; ++f)
+        plane[ulong(position.y) * rows * columns + o + 8 * f] = acc[f][i];
+    }
+    threadgroup uint arrival;
+    device atomic_uint *count = reinterpret_cast<device atomic_uint *>(
+                                    const_cast<device bfloat *>(table) + 8 * ulong(width)) +
+                                width / 4 + position.x;
+    const uint me = simd * 32 + lane;
+    threadgroup_barrier(mem_flags::mem_device);
+    if (me == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      arrival = atomic_fetch_add_explicit(count, 1u, memory_order_relaxed);
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    if (arrival != SPLIT - 1)
+      return;
+#pragma unroll
+    for (uint i = 0; i < 2; ++i) {
+      const uint row = fn + i;
+      if (int(row) >= rows)
+        continue;
+      const ulong o = ulong(row) * columns + column;
+#pragma unroll
+      for (int f = 0; f < NF; ++f) {
+        float total = 0.0f;
+        for (int s = 0; s < SPLIT; ++s)
+          total += s == int(position.y) ? acc[f][i] : plane[ulong(s) * rows * columns + o + 8 * f];
+        output[o + 8 * f] = bfloat(total);
+      }
+    }
+    if (me == 0)
+      atomic_store_explicit(count, 0u, memory_order_relaxed);
+  } else {
+#pragma unroll
+    for (uint i = 0; i < 2; ++i) {
+      const uint row = fn + i;
+      if (int(row) >= rows)
+        continue;
+      const ulong o = ulong(row) * columns + column;
+#pragma unroll
+      for (int f = 0; f < NF; ++f)
         output[o + 8 * f] = bfloat(acc[f][i]);
     }
   }
