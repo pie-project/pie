@@ -402,7 +402,9 @@ mod tests {
         );
         assert_eq!(report.measured, ["kernel.ane.mlp", "kernel.qmm_splitk"]);
         assert!(!report.untuned());
-        assert_eq!(*profile.get::<AneMlp>(), AneMlp::Share { percent: 71 });
+        assert_eq!(*profile.get::<AneMlp>(), AneMlp::Share { percent: 74 });
+        assert_eq!(*profile.get::<AneProjections>(), AneProjections::Gpu);
+        assert_eq!(profile.get::<AneMinRows>().0, 512);
     }
 
     #[test]
