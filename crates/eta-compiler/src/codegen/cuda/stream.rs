@@ -166,6 +166,9 @@ impl<'a> Streams<'a> {
         }
         let op = &self.ops[node];
         let out = self.bases[node];
+        if op.results != 1 || out as usize >= self.stage.normalized.value_types.len() {
+            return None;
+        }
         let out_dtype = self.dtype(out);
         if !matches!(
             out_dtype,
@@ -1029,12 +1032,11 @@ pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
     if super::validate::validate_generated_region(stage, region).is_err() {
         return Vec::new();
     }
-    let Some(geometry) = super::fused::row_geometry(stage, region) else {
+    let Some(kinds) = super::fused::stream_rows(stage, region) else {
         return Vec::new();
     };
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
     let bases = crate::codegen::op_view::result_bases(&ops);
-    let kinds = super::fused::row_kinds(stage, region, geometry);
     let direct = super::fused::analyze_direct_argmax(stage, region, &bases);
     let direct_topk = super::fused::analyze_direct_topk(stage);
     let streams = Streams::new(

@@ -348,6 +348,56 @@ pub(crate) fn row_kinds(stage: &CompiledStage, region: &Region, geometry: (u64, 
         .collect()
 }
 
+/// The narrowest row a single-row region streams: below it a value is a
+/// small vector (an RNG state, a top-k list), not a row.
+const SINGLE_ROW_WIDTH: u32 = 64;
+
+/// Whether a single-row region streams (off: op by op, as before).
+pub static SINGLE_ROW_STREAMS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Row kinds of a region that is one row — a decode lane's sampler, its
+/// values vocabulary-wide rows and scalars: every value `[1, .., 1, W]` of a
+/// wide static `W` is the row, every one-element value a scalar. `None` if
+/// the region has no such row.
+fn single_row_kinds(stage: &CompiledStage, region: &Region) -> Option<Vec<u8>> {
+    if region.kind != crate::plan::RegionKind::Generated
+        || !SINGLE_ROW_STREAMS.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    let kinds: Vec<u8> = stage
+        .normalized
+        .value_types
+        .iter()
+        .map(|ty| {
+            let Some((last, leading)) = ty.dims.split_last() else {
+                return 2;
+            };
+            let unit = |d: &Dimension| matches!(d, Dimension::Static(1));
+            match last {
+                Dimension::Static(width)
+                    if *width >= SINGLE_ROW_WIDTH && leading.iter().all(unit) =>
+                {
+                    1
+                }
+                _ if ty.dims.iter().all(unit) => 2,
+                _ => 0,
+            }
+        })
+        .collect();
+    kinds.contains(&1).then_some(kinds)
+}
+
+/// How a region's values sit in rows when it streams: the row geometry of a
+/// row-parallel region, or one row for a single-row region.
+pub(crate) fn stream_rows(stage: &CompiledStage, region: &Region) -> Option<Vec<u8>> {
+    match row_geometry(stage, region) {
+        Some(geometry) => Some(row_kinds(stage, region, geometry)),
+        None => single_row_kinds(stage, region),
+    }
+}
+
 pub fn emit_fused_region(
     entry_name: &str,
     stage: &CompiledStage,
@@ -387,11 +437,10 @@ pub fn emit_fused_region_in(
     let _ = write!(source, "{LANE_TABLE_ABI_VERSION}");
     source.push_str(PREAMBLE);
 
-    let row_geometry = row_geometry(stage, region);
-    let row_parallel = row_geometry.is_some();
-    let row_kinds: Vec<u8> =
-        row_geometry.map_or_else(Vec::new, |geometry| row_kinds(stage, region, geometry));
-    if row_geometry.is_some() {
+    let stream_kinds = stream_rows(stage, region);
+    let row_parallel = stream_kinds.is_some();
+    let row_kinds: Vec<u8> = stream_kinds.unwrap_or_default();
+    if row_parallel {
         let kinds: Vec<String> = row_kinds.iter().map(|k| format!("{k}u")).collect();
         let count = kinds.len().max(1);
         let _ = writeln!(
