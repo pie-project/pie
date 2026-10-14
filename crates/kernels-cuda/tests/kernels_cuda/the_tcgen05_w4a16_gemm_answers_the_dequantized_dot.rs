@@ -1,10 +1,12 @@
 #![cfg(feature = "cuda")]
 
-//! W4A16 on the tcgen05 GEMM: bf16 activations against e2m1 weights under
-//! row-major block scales (mxfp4: ue8m0 a 32; nvfp4: e4m3 a 16), which the
-//! kernel's transform warps dequantize to bf16 in shared memory. Every
-//! dequantized weight is exact in bf16, so the product is the f64 dot of
-//! the bf16 activations and the decoded weights up to f32 accumulation.
+//! W4A16 on the tcgen05 GEMM: bf16 activations against 4-bit weights under
+//! row-major factors -- mxfp4 (e2m1, ue8m0 a 32), nvfp4 (e2m1, e4m3 a 16,
+//! and an f32 tensor scale a row in the epilogue) and pie's affine u4 (a
+//! bf16 scale and zero a group of 32, 64 or 128) -- which the kernel's
+//! transform warps dequantize to bf16. An e2m1 weight is exact in bf16; an
+//! affine one rounds as pie's affine kernels round it, which the reference
+//! rounds alike. The product is then the f64 dot up to f32 accumulation.
 //! Dense (swapped and not), grouped (contiguous and masked), with a bias a
 //! weight row and a fused SwiGLU.
 
@@ -16,18 +18,47 @@ use kernels_cuda::linear::tc5::{
 
 const E2M1: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 
-/// A random 4-bit weight `[rows][k]` and its row-major scales.
+/// A W4A16 weight's format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fmt {
+    Mx,
+    Nv,
+    Affine(usize),
+}
+
+impl Fmt {
+    const fn gran(self) -> usize {
+        match self {
+            Self::Mx => 32,
+            Self::Nv => 16,
+            Self::Affine(group) => group,
+        }
+    }
+}
+
+/// A random 4-bit weight `[rows][k]` and its row-major factors.
 struct Weight {
+    fmt: Fmt,
     codes: Vec<u8>,
     scales: Vec<u8>,
-    gran: usize,
+    /// Affine: bf16 scales and zeros a group.
+    factors: Vec<u16>,
+    zeros: Vec<u16>,
+    /// NVFP4: an f32 tensor scale a row.
+    tensor: Vec<f32>,
     k: usize,
 }
 
 impl Weight {
-    fn random(lcg: &mut Lcg, rows: usize, k: usize, gran: usize) -> Self {
-        let mut byte = || ((lcg.unit() + 1.0) * 127.99) as u8;
-        let codes = (0..rows * k / 2).map(|_| byte()).collect();
+    fn random(lcg: &mut Lcg, rows: usize, k: usize, fmt: Fmt) -> Self {
+        let gran = fmt.gran();
+        let mut units: Vec<f32> = (0..rows * k).map(|_| lcg.unit()).collect();
+        let mut at = 0;
+        let mut byte = || {
+            at += 1;
+            ((units[at % units.len()] + 1.0) * 127.99) as u8
+        };
+        let codes: Vec<u8> = (0..rows * k / 2).map(|_| byte()).collect();
         let scales = (0..rows * k / gran)
             .map(|_| {
                 let b = byte();
@@ -40,17 +71,32 @@ impl Weight {
                 }
             })
             .collect();
+        let factor = |b: u8, lo: f32, span: f32| to_bf16(lo + span * f32::from(b) / 255.0);
+        let factors = (0..rows * k / gran)
+            .map(|_| factor(byte(), 0.01, 0.2))
+            .collect();
+        let zeros = (0..rows * k / gran)
+            .map(|_| factor(byte(), -1.5, 1.0))
+            .collect();
+        let tensor = (0..rows)
+            .map(|_| 0.5 + f32::from(byte() % 8) * 0.25)
+            .collect();
+        units.clear();
         Self {
+            fmt,
             codes,
             scales,
-            gran,
+            factors,
+            zeros,
+            tensor,
             k,
         }
     }
 
     fn scale(&self, row: usize, col: usize) -> f64 {
-        let b = self.scales[row * (self.k / self.gran) + col / self.gran];
-        if self.gran == 32 {
+        let gran = self.fmt.gran();
+        let b = self.scales[row * (self.k / gran) + col / gran];
+        if gran == 32 {
             2f64.powi(i32::from(b) - 127)
         } else {
             let (e, m) = (i32::from((b >> 3) & 15), f64::from(b & 7));
@@ -69,9 +115,48 @@ impl Weight {
         } else {
             byte >> 4
         };
+        if let Fmt::Affine(group) = self.fmt {
+            let at = row * (self.k / group) + col / group;
+            let (s, z) = (from_bf16(self.factors[at]), from_bf16(self.zeros[at]));
+            return f64::from(from_bf16(to_bf16(f32::from(nib).mul_add(s, z))));
+        }
         let mag = E2M1[usize::from(nib & 7)];
         let v = if nib & 8 != 0 { -mag } else { mag };
-        v * self.scale(row, col)
+        let t = if self.fmt == Fmt::Nv {
+            f64::from(self.tensor[row])
+        } else {
+            1.0
+        };
+        v * self.scale(row, col) * t
+    }
+
+    /// The operand and the epilogue's weight scale, uploaded.
+    fn up(&self, gpu: &mut Gpu) -> (Operand, u64) {
+        let codes = gpu.up(&self.codes);
+        match self.fmt {
+            Fmt::Mx | Fmt::Nv => (
+                Operand::scaled(
+                    codes,
+                    Elem::E2m1,
+                    gpu.up(&self.scales),
+                    self.fmt.gran() as u32,
+                ),
+                if self.fmt == Fmt::Nv {
+                    gpu.up(&self.tensor)
+                } else {
+                    0
+                },
+            ),
+            Fmt::Affine(group) => (
+                Operand::affine(
+                    codes,
+                    gpu.up(&self.factors),
+                    gpu.up(&self.zeros),
+                    group as u32,
+                ),
+                0,
+            ),
+        }
     }
 }
 
@@ -127,22 +212,23 @@ fn check(what: &str, got: &[u16], wants: &[(usize, f64)]) {
     eprintln!("{what}: worst error {worst:.3} of the slack");
 }
 
-fn dense(gran: usize, [m, n, k]: [usize; 3], swap: bool, glu: bool) {
-    let what = format!("dense gran {gran} {m}x{n}x{k} swap={swap} glu={glu}");
-    let mut lcg = Lcg::seeded((m * 31 + n * 7 + k + gran) as u64);
+fn dense(fmt: Fmt, [m, n, k]: [usize; 3], swap: bool, glu: bool) {
+    let what = format!("dense {fmt:?} {m}x{n}x{k} swap={swap} glu={glu}");
+    let mut lcg = Lcg::seeded((m * 31 + n * 7 + k + fmt.gran()) as u64);
     let wrows = if glu { 2 * n } else { n };
-    let w = Weight::random(&mut lcg, wrows, k, gran);
+    let w = Weight::random(&mut lcg, wrows, k, fmt);
     let (x_raw, x) = bf16s(&mut lcg, m * k);
     let (b_raw, bias) = bf16s(&mut lcg, wrows);
     let mut gpu = Gpu::open();
     let act = Operand::plain(gpu.up(&x_raw), Elem::Bf16);
-    let wt = Operand::scaled(gpu.up(&w.codes), Elem::E2m1, gpu.up(&w.scales), gran as u32);
+    let (wt, weight_scale) = w.up(&mut gpu);
     let y = gpu.zeros(m * n * 2);
     let epi = Epilogue {
         glu: glu.then_some(Glu::Swiglu),
         out: Out::Bf16,
         row_scale: 0,
         bias: gpu.up(&b_raw),
+        weight_scale,
     };
     let plan = Plan {
         swap,
@@ -176,11 +262,11 @@ fn dense(gran: usize, [m, n, k]: [usize; 3], swap: bool, glu: bool) {
     check(&what, &got, &wants);
 }
 
-fn grouped(gran: usize, experts: usize, [n, k]: [usize; 2], masked: bool, glu: bool) {
-    let what = format!("grouped gran {gran} e={experts} n={n} k={k} masked={masked} glu={glu}");
-    let mut lcg = Lcg::seeded((experts * 131 + n + k + gran) as u64);
+fn grouped(fmt: Fmt, experts: usize, [n, k]: [usize; 2], masked: bool, glu: bool) {
+    let what = format!("grouped {fmt:?} e={experts} n={n} k={k} masked={masked} glu={glu}");
+    let mut lcg = Lcg::seeded((experts * 131 + n + k + fmt.gran()) as u64);
     let n_per = if glu { 2 * n } else { n };
-    let w = Weight::random(&mut lcg, experts * n_per, k, gran);
+    let w = Weight::random(&mut lcg, experts * n_per, k, fmt);
     let (b_raw, bias) = bf16s(&mut lcg, experts * n_per);
     let counts: Vec<usize> = (0..experts).map(|e| (e * 37 + 5) % 70).collect();
     let mut gpu = Gpu::open();
@@ -222,13 +308,14 @@ fn grouped(gran: usize, experts: usize, [n, k]: [usize; 2], masked: bool, glu: b
     };
     let (x_raw, x) = bf16s(&mut lcg, rows * k);
     let act = Operand::plain(gpu.up(&x_raw), Elem::Bf16);
-    let wt = Operand::scaled(gpu.up(&w.codes), Elem::E2m1, gpu.up(&w.scales), gran as u32);
+    let (wt, weight_scale) = w.up(&mut gpu);
     let y = gpu.up(&vec![to_bf16(0.0); rows * n]);
     let epi = Epilogue {
         glu: glu.then_some(Glu::Swiglu),
         out: Out::Bf16,
         row_scale: 0,
         bias: gpu.up(&b_raw),
+        weight_scale,
     };
     let plan = Plan {
         swap: masked,
@@ -277,14 +364,20 @@ fn the_tcgen05_w4a16_gemm_answers_the_dequantized_dot_every_case() {
         eprintln!("skipped: no tcgen05 on this device");
         return;
     }
-    for gran in [32, 16] {
-        dense(gran, [200, 256, 576], false, false);
-        dense(gran, [24, 384, 2880], true, false);
-        dense(gran, [130, 256, 512], false, true);
-        dense(gran, [40, 128, 512], true, true);
-        grouped(gran, 6, [256, 576], false, false);
-        grouped(gran, 6, [256, 576], true, false);
-        grouped(gran, 5, [128, 512], false, true);
-        grouped(gran, 5, [128, 512], true, true);
+    for fmt in [Fmt::Mx, Fmt::Nv, Fmt::Affine(64)] {
+        dense(fmt, [200, 256, 576], false, false);
+        dense(fmt, [24, 384, 2880], true, false);
+        dense(fmt, [130, 256, 512], false, true);
+        dense(fmt, [40, 128, 512], true, true);
+        grouped(fmt, 6, [256, 576], false, false);
+        grouped(fmt, 6, [256, 576], true, false);
+        grouped(fmt, 5, [128, 512], false, true);
+        grouped(fmt, 5, [128, 512], true, true);
+    }
+    // Affine groups of 32 (two a stage) and 128 (a stage's half).
+    for fmt in [Fmt::Affine(32), Fmt::Affine(128)] {
+        dense(fmt, [200, 256, 512], false, false);
+        dense(fmt, [24, 384, 512], true, false);
+        grouped(fmt, 5, [128, 512], true, true);
     }
 }

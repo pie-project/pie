@@ -85,6 +85,8 @@ struct Epi {
     int pad;                 // masked: scale rows an expert; 0 otherwise
     const bf16* bias;        // a bias each weight row, added before the GLU, or null
     const unsigned char* wsf;  // a W4A16 weight's scales, row-major [rows][k / gran]
+    const bf16* wzero;         // an affine W4A16 weight's zeros, beside its scales
+    const float* wscale;       // an f32 scale each weight row (NVFP4's tensor scale), or null
 };
 
 namespace tc5k {
@@ -179,6 +181,23 @@ __device__ __forceinline__ unsigned ld_nc_u8(const unsigned char* p) {
     unsigned short v;
     asm volatile("ld.global.nc.u8 %0, [%1];" : "=h"(v) : "l"(p));
     return v;
+}
+
+// Eight unsigned 4-bit codes (element i in bits 4i..4i+3) as bf16 of
+// fma(code, scale, zero), rounded once as pie's affine kernels round them.
+__device__ __forceinline__ uint4 dequant8_affine(unsigned code, float scale, float zero) {
+    unsigned w[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float a = __int_as_float(0x4b000000 | ((code >> (8 * i)) & 15u)) - 8388608.f;
+        const float b = __int_as_float(0x4b000000 | ((code >> (8 * i + 4)) & 15u)) - 8388608.f;
+        w[i] = pack_bf16x2(fmaf(a, scale, zero), fmaf(b, scale, zero));
+    }
+    return make_uint4(w[0], w[1], w[2], w[3]);
+}
+
+__device__ __forceinline__ float bf16_bits_f32(unsigned bits) {
+    return __uint_as_float(bits << 16);
 }
 
 // 2^-e for a block exponent: exact, and in range from the 1e-4 floor up.
@@ -823,7 +842,10 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         const u32 t = (threadIdx.x - 224) % (32 * kGroupWarps);
         const u32 c = t % 8;
         u32 step = 0;
-        constexpr int kWGran = kMix == 1 ? 32 : 16;
+        // The weight's factor group: its scales' gran (mxfp4 32, nvfp4 16,
+        // affine 32, 64 or 128).
+        constexpr int kWGran = kSwap ? kGranP : kGranQ;
+        constexpr bool kAffine = kMix == 3;
         // The weight's rows: a dense GLU's extent is its output columns,
         // its up rows past them; a bank's extent is all of its rows.
         const int weight_rows = (kMixP ? rows_p : rows_q) * (kFused && kGroup == 0 ? 2 : 1);
@@ -855,16 +877,27 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
 #pragma unroll
                 for (u32 i = 0; i < kIters; ++i) {
                     const int g = wrow(t / 8 + kRowStep * i);
-                    sb[i] = g < weight_rows
-                                ? tc5k::ld_nc_u8(epi.wsf + static_cast<size_t>(g) * sf_cols + col)
-                                : 0u;
+                    if constexpr (kAffine) {
+                        const size_t at = static_cast<size_t>(g) * sf_cols + col;
+                        const unsigned char* zeros = reinterpret_cast<const unsigned char*>(epi.wzero);
+                        sb[i] = g < weight_rows
+                                    ? tc5k::ld_nc_u16(epi.wsf + 2 * at) |
+                                          (tc5k::ld_nc_u16(zeros + 2 * at) << 16)
+                                    : 0u;
+                    } else {
+                        sb[i] = g < weight_rows
+                                    ? tc5k::ld_nc_u8(epi.wsf + static_cast<size_t>(g) * sf_cols + col)
+                                    : 0u;
+                    }
                 }
             };
             if constexpr (kMixP) {
                 // A thread owns a row of each P tile: its lane quarter's
                 // row of TMEM, 64 K a stage as 32 bf16 pairs.
                 const u32 r = (warp % 4) * 32 + lane;
-                constexpr int kSfStage = 64 / kWGran;  // scales a row a stage
+                constexpr int kSfStage = 64 / kWGran;  // scales a row a stage (not affine)
+                // An affine row's groups a stage: two of 32, else one.
+                constexpr int kGroups = kWGran < 64 ? 2 : 1;
                 for (int kb = x.kb0; kb < x.kb1; ++kb, ++step) {
                     if (step % tc5k::kXGroups != xgroup) {
                         if (++s == kStages) {
@@ -874,14 +907,30 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         continue;
                     }
                     unsigned sc[kPT];
+                    unsigned az[kPT][kGroups];  // affine: scale | zero << 16 a group
 #pragma unroll
                     for (u32 h = 0; h < kPT; ++h) {
                         const int g = wrow(h * 128 + r);
-                        const unsigned char* at =
-                            epi.wsf + static_cast<size_t>(g) * sf_cols + kb * kSfStage;
-                        sc[h] = g >= weight_rows ? 0u
-                                : kSfStage == 2  ? tc5k::ld_nc_u16(at)
-                                                 : tc5k::ld_nc_u32(at);
+                        if constexpr (kAffine) {
+                            sc[h] = 0;
+                            const unsigned char* zeros =
+                                reinterpret_cast<const unsigned char*>(epi.wzero);
+#pragma unroll
+                            for (int q = 0; q < kGroups; ++q) {
+                                const size_t at = static_cast<size_t>(g) * sf_cols +
+                                                  (kb * 64 + q * 32) / kWGran;
+                                az[h][q] = g >= weight_rows
+                                               ? 0u
+                                               : tc5k::ld_nc_u16(epi.wsf + 2 * at) |
+                                                     (tc5k::ld_nc_u16(zeros + 2 * at) << 16);
+                            }
+                        } else {
+                            const unsigned char* at =
+                                epi.wsf + static_cast<size_t>(g) * sf_cols + kb * kSfStage;
+                            sc[h] = g >= weight_rows ? 0u
+                                    : kSfStage == 2  ? tc5k::ld_nc_u16(at)
+                                                     : tc5k::ld_nc_u32(at);
+                        }
                     }
                     bar_wait(&full[s], phase);
                     tc_fence_after();
@@ -898,9 +947,16 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         u32 v[32];
 #pragma unroll
                         for (int w = 0; w < 8; ++w) {
-                            const unsigned char b = static_cast<unsigned char>(
-                                sc[h] >> (8 * (w * 8 / kWGran)));
-                            const uint4 d = tc5k::dequant8<kMix>(code[w], b);
+                            uint4 d;
+                            if constexpr (kAffine) {
+                                const unsigned f = az[h][kGroups == 2 ? w / 4 : 0];
+                                d = tc5k::dequant8_affine(code[w], tc5k::bf16_bits_f32(f & 0xffffu),
+                                                          tc5k::bf16_bits_f32(f >> 16));
+                            } else {
+                                const unsigned char b = static_cast<unsigned char>(
+                                    sc[h] >> (8 * (w * 8 / kWGran)));
+                                d = tc5k::dequant8<kMix>(code[w], b);
+                            }
                             v[4 * w] = d.x;
                             v[4 * w + 1] = d.y;
                             v[4 * w + 2] = d.z;
@@ -944,8 +1000,14 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
 #pragma unroll
                 for (u32 i = 0; i < kIters; ++i) {
                     const u32 r = t / 8 + kRowStep * i;
-                    *reinterpret_cast<uint4*>(tile + r * 128 + ((c ^ (r % 8)) * 16)) =
-                        tc5k::dequant8<kMix>(code[i], static_cast<unsigned char>(sb[i]));
+                    uint4 d;
+                    if constexpr (kAffine) {
+                        d = tc5k::dequant8_affine(code[i], tc5k::bf16_bits_f32(sb[i] & 0xffffu),
+                                                  tc5k::bf16_bits_f32(sb[i] >> 16));
+                    } else {
+                        d = tc5k::dequant8<kMix>(code[i], static_cast<unsigned char>(sb[i]));
+                    }
+                    *reinterpret_cast<uint4*>(tile + r * 128 + ((c ^ (r % 8)) * 16)) = d;
                 }
                 fence_async_shared();
                 __syncwarp();
@@ -1009,19 +1071,39 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     return c < x.lim_q ? bf16_to_f32(epi.bias[x.q_row + (up ? inter : 0) + c]) : 0.f;
                 }
             };
+            // An f32 scale each weight row (NVFP4's tensor scale), on the
+            // product before the bias.
+            const bool wscaled = epi.wscale != nullptr;
+            const float ws_row = kSwap && wscaled && live ? epi.wscale[x.p_row + i] : 1.f;
+            const float ws_row_up =
+                kSwap && kFused && wscaled && live ? epi.wscale[x.p_row + inter + i] : 1.f;
+            auto ws_col = [&](u32 c0, int j, bool up) -> float {
+                if (!wscaled) {
+                    return 1.f;
+                }
+                if constexpr (kSwap) {
+                    return up ? ws_row_up : ws_row;
+                } else {
+                    const int c = static_cast<int>(c0) + j;
+                    return c < x.lim_q ? epi.wscale[x.q_row + (up ? inter : 0) + c] : 1.f;
+                }
+            };
             auto finish = [&](u32 c0, const u32 (&v)[32], const u32 (&u)[32], float (&h)[32]) {
                 if constexpr (kFused) {
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
                         h[j] = tc5k::glu<kGlu>(
-                            __uint_as_float(v[j]) * alpha + bias_col(c0, j, false),
-                            __uint_as_float(u[j]) * alpha + bias_col(c0, j, true), epi.limit,
-                            epi.galpha);
+                            __uint_as_float(v[j]) * alpha * ws_col(c0, j, false) +
+                                bias_col(c0, j, false),
+                            __uint_as_float(u[j]) * alpha * ws_col(c0, j, true) +
+                                bias_col(c0, j, true),
+                            epi.limit, epi.galpha);
                     }
                 } else {
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
-                        h[j] = __uint_as_float(v[j]) * alpha + bias_col(c0, j, false);
+                        h[j] = __uint_as_float(v[j]) * alpha * ws_col(c0, j, false) +
+                               bias_col(c0, j, false);
                     }
                 }
 #pragma unroll

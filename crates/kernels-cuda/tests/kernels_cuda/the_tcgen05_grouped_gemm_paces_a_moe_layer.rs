@@ -62,7 +62,7 @@ impl Kind {
         match e {
             Elem::Bf16 => n * 2,
             Elem::E4m3 => n,
-            Elem::E2m1 => n / 2,
+            Elem::E2m1 | Elem::U4 => n / 2,
         }
     }
 
@@ -71,7 +71,7 @@ impl Kind {
         match e {
             Elem::Bf16 => (0xbf, 0),
             Elem::E4m3 => (0xb7, 0),
-            Elem::E2m1 => (0xff, 0),
+            Elem::E2m1 | Elem::U4 => (0xff, 0),
         }
     }
 
@@ -259,6 +259,7 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
                         out,
                         row_scale: 0,
                         bias: 0,
+                        weight_scale: 0,
                     };
                     let fused = |i: usize| {
                         let g = grouped(i);

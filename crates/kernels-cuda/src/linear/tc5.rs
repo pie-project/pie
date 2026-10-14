@@ -34,6 +34,9 @@ pub enum Elem {
     E4m3,
     /// fp4 e2m1, two a byte, the even element in the low nibble.
     E2m1,
+    /// An unsigned 4-bit code, two a byte, the even element in the low
+    /// nibble: pie's affine weight, `code * scale + zero` a group (W4A16).
+    U4,
 }
 
 /// A block-scale tensor in the atom layout -- except a W4A16 weight's (an
@@ -45,8 +48,12 @@ pub enum Elem {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Scales {
     pub ptr: u64,
-    /// The K a scale covers: 16 (ue4m3), 32 or 128 (ue8m0).
+    /// The K a scale covers: 16 (ue4m3), 32 or 128 (ue8m0); an affine
+    /// weight's group, 32, 64 or 128.
     pub gran: u32,
+    /// An affine weight's zeros, bf16 row-major beside its bf16 scales;
+    /// 0 otherwise.
+    pub zeros: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,7 +78,28 @@ impl Operand {
         Self {
             ptr,
             elem,
-            scales: Some(Scales { ptr: scales, gran }),
+            scales: Some(Scales {
+                ptr: scales,
+                gran,
+                zeros: 0,
+            }),
+        }
+    }
+}
+
+impl Operand {
+    /// pie's affine 4-bit weight (W4A16 only): codes, and a bf16 scale and
+    /// zero each `group` (32, 64 or 128) of a row, row-major.
+    #[must_use]
+    pub const fn affine(ptr: u64, scales: u64, zeros: u64, group: u32) -> Self {
+        Self {
+            ptr,
+            elem: Elem::U4,
+            scales: Some(Scales {
+                ptr: scales,
+                gran: group,
+                zeros,
+            }),
         }
     }
 }
@@ -190,8 +218,9 @@ enum Kind {
     Fp8,
     Mx,
     Nvf4,
-    /// W4A16: bf16 activations against e2m1 weights the kernel dequantizes
-    /// to bf16 in shared memory (1: ue8m0 a 32, mxfp4; 2: e4m3 a 16, nvfp4).
+    /// W4A16: bf16 activations against 4-bit weights the kernel dequantizes
+    /// to bf16 (1: e2m1 under ue8m0 a 32, mxfp4; 2: e2m1 under e4m3 a 16,
+    /// nvfp4; 3: affine u4, bf16 scale and zero a group).
     Mixed(u32),
 }
 
@@ -219,6 +248,7 @@ impl Kind {
             (Elem::Bf16, Elem::Bf16, None, None) => Ok(Self::Bf16),
             (Elem::Bf16, Elem::E2m1, None, Some(32)) => Ok(Self::Mixed(1)),
             (Elem::Bf16, Elem::E2m1, None, Some(16)) => Ok(Self::Mixed(2)),
+            (Elem::Bf16, Elem::U4, None, Some(32 | 64 | 128)) => Ok(Self::Mixed(3)),
             (Elem::E4m3, Elem::E4m3, None, None) => Ok(Self::Fp8),
             (Elem::E2m1, Elem::E2m1, Some(16), Some(16)) => Ok(Self::Nvf4),
             (Elem::E4m3 | Elem::E2m1, Elem::E4m3 | Elem::E2m1, Some(a), Some(b))
@@ -464,6 +494,9 @@ pub struct Epilogue {
     /// GLU's gate rows then its up rows), added to the product before the
     /// GLU, or 0.
     pub bias: u64,
+    /// A device f32 scale a weight row (as `bias` indexes them) multiplying
+    /// the product before the bias (NVFP4's per-row tensor scale), or 0.
+    pub weight_scale: u64,
 }
 
 impl Epilogue {
@@ -472,6 +505,7 @@ impl Epilogue {
         out: Out::Bf16,
         row_scale: 0,
         bias: 0,
+        weight_scale: 0,
     };
 
     const fn glu_code(&self) -> u32 {
@@ -515,7 +549,7 @@ impl Epilogue {
         Ok(plan)
     }
 
-    fn args(&self, n: u32, pad: u32, wsf: u64) -> EpiArgs {
+    fn args(&self, n: u32, pad: u32, wsf: u64, wzero: u64) -> EpiArgs {
         let (limit, galpha) = match self.glu {
             Some(Glu::SwigluClamp { limit }) => (limit, 1.0),
             Some(Glu::SwigluClampAlpha { limit, alpha }) => (limit, alpha),
@@ -541,6 +575,8 @@ impl Epilogue {
             pad: i32::try_from(pad).unwrap_or(i32::MAX),
             bias: self.bias,
             wsf,
+            wzero,
+            wscale: self.weight_scale,
         }
     }
 }
@@ -559,6 +595,8 @@ struct EpiArgs {
     pad: i32,
     bias: u64,
     wsf: u64,
+    wzero: u64,
+    wscale: u64,
 }
 
 /// `y = epilogue(alpha * act . w^T)` for `[m, n, k]`, `n` the output's
@@ -1035,11 +1073,13 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let q_blocks = if halves { 1 } else { plan.bn.div_ceil(128) };
     let map_sfq = atoms(q, job.scale_rows[1], q_blocks)?;
     // A W4A16 weight's row-major scales, read by the transform warps.
-    let wsf = match kind {
-        Kind::Mixed(_) => (if plan.swap { p } else { q }).scales.map_or(0, |s| s.ptr),
-        _ => 0,
+    let (wsf, wzero) = match kind {
+        Kind::Mixed(_) => (if plan.swap { p } else { q })
+            .scales
+            .map_or((0, 0), |s| (s.ptr, s.zeros)),
+        _ => (0, 0),
     };
-    let epi_args = epi.args(n, job.pad, wsf);
+    let epi_args = epi.args(n, job.pad, wsf, wzero);
     let sms = ctx.multiprocessors().unwrap_or(148);
     // Too few tiles to fill the SMs split K, each split keeping four K steps
     // or more to pipeline; the splits sum in f32 and one pass rounds.
@@ -1256,7 +1296,7 @@ fn tensor_map(
     use dr::CUtensorMapDataType as T;
 
     // (type, inner extent in the type's elements, row stride in bytes, box width)
-    if let (Kind::Mixed(_), Elem::E2m1) = (kind, o.elem) {
+    if let (Kind::Mixed(_), Elem::E2m1 | Elem::U4) = (kind, o.elem) {
         // Raw codes, 32 bytes (64 codes) a row a stage, unswizzled.
         let stride = u64::from(k) / 2;
         if !stride.is_multiple_of(16) || !o.ptr.is_multiple_of(16) {
@@ -1289,6 +1329,7 @@ fn tensor_map(
             u64::from(k) / 2,
             128,
         ),
+        (_, Elem::U4) => return Err(refuse(OP, "an affine u4 weight runs W4A16 alone")),
     };
     // Packed fp4 rows are 16-byte strides; unpacked (16U4_ALIGN16B) ones
     // must be whole 64-byte runs.
