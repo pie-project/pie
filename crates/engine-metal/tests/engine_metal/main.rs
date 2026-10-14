@@ -33,6 +33,7 @@ mod the_packed_kv_decode_reads;
 mod the_packed_kv_page_migrates;
 mod the_packed_kv_tiled_reads;
 mod the_partial_rope_turns_only_the_rotary_pairs;
+mod the_prompt_conv_matches_a_running_reference;
 mod the_ptq1_0_gguf_passes_through_ingest_and_serves_the_host_decoder;
 mod the_q8_kv_roundtrip;
 mod the_ragged_attention_answers_its_host_reference;
