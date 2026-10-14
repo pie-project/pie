@@ -96,10 +96,23 @@ impl Ane {
     }
 }
 
+/// Whether `trace` routes its tokens through experts. Such a model's prompt
+/// stays on the GPU, as Splash keeps Qwen3.6-35B-A3B's: the Neural Engine's
+/// int8 activations move its greedy answers off the model's, and on a
+/// 512-token prompt the split is slower than the GPU alone.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+fn routes_experts(trace: &poem_ir::Trace) -> bool {
+    use poem_ir::Operands as _;
+    trace
+        .nodes
+        .iter()
+        .any(|node| node.op.name().starts_with("linear.moe_"))
+}
+
 /// Sets the Neural Engine up for the dense MLPs and the wide projections
 /// in `trace` as the chip's profile splits them, or `None` when the profile
-/// keeps both on the GPU, the bridge does not load, or the model has nothing
-/// it can take.
+/// keeps both on the GPU, the model routes through experts, the bridge does
+/// not load, or the model has nothing it can take.
 pub fn load(
     device: &Context,
     handles: &Handles,
@@ -114,6 +127,9 @@ pub fn load(
         let projection_split = *chip.get::<AneProjections>();
         let min_rows = chip.get::<AneMinRows>().0;
         let min_columns = chip.get::<AneMinColumns>().0;
+        if routes_experts(trace) {
+            return Ok(None);
+        }
         let mlps = match mlp_split {
             AneMlp::Gpu => Vec::new(),
             _ => banks::mlps(trace, weights),
@@ -139,5 +155,23 @@ pub fn load(
     {
         let _ = (device, handles, trace, weights, chip);
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use poem_ir::Platform;
+
+    fn routes(name: &str) -> bool {
+        let trace = poem_compiler::catalog::deployment(name)
+            .unwrap_or_else(|| panic!("the catalog ships {name}"))
+            .trace(Platform::Metal);
+        super::routes_experts(&trace)
+    }
+
+    #[test]
+    fn a_routed_model_keeps_its_prompt_on_the_gpu() {
+        assert!(routes("qwen36-35b-a3b-u4g64-kv-bf16"), "Qwen3.6-35B-A3B routes its tokens");
+        assert!(!routes("qwen38-27b-u4g64-kv-bf16"), "Qwen3.8-27B is dense");
     }
 }
