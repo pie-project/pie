@@ -1142,7 +1142,22 @@ fn decoded_weight_planes(
                     poem_ir::Linear::MatmulActQuant { .. }
                     | poem_ir::Linear::MoeMatmulSelectActQuant { .. },
                 ) => continue,
-                poem_ir::Operation::Linear(_) => {
+                poem_ir::Operation::Fused(poem_ir::Fused::MoeSelectGlu { select, .. })
+                    if matches!(**select, poem_ir::Linear::MoeMatmulSelectActQuant { .. }) =>
+                {
+                    continue;
+                }
+                // A fused projection runs its matmul when no fused kernel
+                // takes it, and decodes the same plane that matmul would.
+                poem_ir::Operation::Linear(_)
+                | poem_ir::Operation::Fused(
+                    poem_ir::Fused::MatmulSwiglu { .. }
+                    | poem_ir::Fused::MatmulGeglu { .. }
+                    | poem_ir::Fused::MlpSwiglu { .. }
+                    | poem_ir::Fused::MatmulBias { .. }
+                    | poem_ir::Fused::LmHeadSoftcap { .. }
+                    | poem_ir::Fused::MoeSelectGlu { .. },
+                ) => {
                     outputs.clear();
                     node.op.outputs(&mut outputs);
                     outputs.iter().any(|id| token_rows(*id))

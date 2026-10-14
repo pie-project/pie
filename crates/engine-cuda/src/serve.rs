@@ -453,6 +453,13 @@ impl Shell {
     pub fn armed(&self) -> Option<&Armed> {
         self.armed.as_ref()
     }
+
+    /// The decoded-weight tile each stream was warmed with, main stream
+    /// first: a plane past its stream's tile takes the fused-dequant arm.
+    #[must_use]
+    pub fn decoded_tiles(&self) -> &[u64] {
+        &self.decoded_tiles
+    }
 }
 
 impl Drop for Shell {
