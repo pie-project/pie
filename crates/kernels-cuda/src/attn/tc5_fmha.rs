@@ -39,14 +39,14 @@ struct Params {
     window_left: i32,
 }
 
-/// The key tile and ring depth a head width runs at: two stages of K and V
-/// beside Q and P in shared memory.
+/// The key tile and ring depth a head width runs at: three stages of K and
+/// V fill shared memory, Q and P living in TMEM.
 const fn tiling(head_dim: u32) -> (u32, u32) {
-    if head_dim == 256 { (64, 2) } else { (128, 2) }
+    if head_dim == 256 { (64, 3) } else { (128, 3) }
 }
 
 const fn smem_bytes(d: u32, bkv: u32, stages: u32) -> u32 {
-    (d / 64) * 16384 + 2 * stages * (d / 64) * bkv * 128 + (bkv / 64) * 16384 + 512 + 1024
+    2 * stages * (d / 64) * bkv * 128 + 512 + 1024
 }
 
 /// Whether this prefill runs on the tcgen05 kernel, and if so runs it.

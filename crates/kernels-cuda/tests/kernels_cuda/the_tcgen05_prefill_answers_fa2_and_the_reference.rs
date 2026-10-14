@@ -246,3 +246,154 @@ fn the_tcgen05_prefill_answers_fa2_and_the_reference() {
         window: None,
     });
 }
+
+/// The tcgen05 prefill's rate beside FA2's (the log-sum-exp form) over
+/// causal 4096-token requests at Qwen3.8-27B's full-attention head (256
+/// wide, six query heads a key head) and a 128-wide one with eight. FLOPs
+/// count the causal half. vLLM's prefill on B200 (FlashInfer's trtllm-gen
+/// FMHA) runs Qwen3.8-27B's 32 x 4096 at about 790 TFLOPS by the same
+/// count. Run it alone on an idle GPU:
+///
+///     cargo test -p kernels-cuda --features cuda --release --test kernels_cuda \
+///         the_tcgen05_prefill_reports -- --ignored --nocapture
+#[test]
+#[ignore = "a measurement: run alone, on an idle GPU"]
+#[allow(clippy::too_many_lines)]
+fn the_tcgen05_prefill_reports_its_rate_beside_fa2() {
+    use crate::the_tcgen05_gemm_lands_and_paces_what_cublaslt_does::{FLUSH, Timer};
+    use kernels_cuda::cudarc::runtime::sys as rt;
+
+    let mut gpu = Gpu::open();
+    let ctx = gpu.ctx();
+    let Some(device) = Device::probe(&ctx) else {
+        eprintln!("skipped: the device would not say its shape");
+        return;
+    };
+    let stream: rt::cudaStream_t = ctx.stream().cast();
+    let timer = Timer {
+        flush: gpu.zeros(FLUSH),
+        stream,
+    };
+    println!("| head | group | kv heads | requests x tokens | tc5 TFLOPS | FA2 TFLOPS |");
+    println!("|---:|---:|---:|---|---:|---:|");
+    for (d, g, kvh, n) in [
+        (256usize, 6usize, 4usize, 1usize),
+        (256, 6, 4, 8),
+        (128, 8, 8, 1),
+        (128, 8, 8, 8),
+    ] {
+        let len = 4096usize;
+        let qh = kvh * g;
+        let rows = n * len;
+        let pages_per = len / PAGE;
+        let pages = n * pages_per;
+        let cells = pages * PAGE;
+        let qo_indptr: Vec<i32> = (0..=n).map(|r| (r * len) as i32).collect();
+        let kv_indptr: Vec<i32> = (0..=n).map(|r| (r * pages_per) as i32).collect();
+        let kv_len = vec![len as i32; n];
+        let last = vec![PAGE as i32; n];
+        let indices: Vec<i32> = (0..pages as i32).collect();
+        let mut lcg = Lcg::seeded(0x5eed);
+        let (q_raw, _) = lcg.row(rows * qh * d);
+        let (k_raw, _) = lcg.row(cells * kvh * d);
+        let (v_raw, _) = lcg.row(cells * kvh * d);
+        let q_at = gpu.up(&q_raw);
+        let k_at = gpu.up(&k_raw);
+        let v_at = gpu.up(&v_raw);
+        let qo_at = gpu.up(&qo_indptr);
+        let kvp_at = gpu.up(&kv_indptr);
+        let idx_at = gpu.up(&indices);
+        let last_at = gpu.up(&last);
+        let ws_bytes = 256 << 20;
+        let workspace = Workspace {
+            int_ptr: gpu.zeros(ws_bytes),
+            int_bytes: ws_bytes,
+            float_ptr: gpu.zeros(ws_bytes),
+            float_bytes: ws_bytes,
+        };
+        let o_at = gpu.zeros(rows * qh * d * 2);
+        let lse_at = gpu.zeros(rows * qh * 4);
+        let shape = Shape {
+            num_requests: n as u32,
+            lane_offset: 0,
+            num_q_heads: qh as u32,
+            num_kv_heads: kvh as u32,
+            head_dim: d as u32,
+            page_size: PAGE as u32,
+            hnd_layout: false,
+        };
+        let live = Live {
+            requests: n as u32,
+            lane_offset: 0,
+            row_offset: 0,
+            rows: rows as u32,
+        };
+        let built = plan::plan_prefill(
+            &qo_indptr,
+            &kv_indptr,
+            &kv_len,
+            rows as u32,
+            shape,
+            live,
+            None,
+            true,
+            false,
+            None,
+            &device,
+            Toggles::of(Tuning::DEFAULT),
+            workspace,
+        )
+        .expect("the plan builds");
+        built.stage(&ctx).expect("the plan uploads");
+        let pool = KvPool {
+            keys: Tensor::new(k_at, cells as u32, (kvh * d) as u32, Dtype::Bf16),
+            values: Tensor::new(v_at, cells as u32, (kvh * d) as u32, Dtype::Bf16),
+            bf16_keys: Tensor::ABSENT,
+            bf16_values: Tensor::ABSENT,
+            key_scales: Tensor::ABSENT,
+            value_scales: Tensor::ABSENT,
+            page_indices: Tensor::new(idx_at, pages as u32, 1, Dtype::I32),
+            page_indptr: Tensor::new(kvp_at, n as u32 + 1, 1, Dtype::I32),
+            last_page_lens: Tensor::new(last_at, n as u32, 1, Dtype::I32),
+            row_valid: Tensor::ABSENT,
+            env_min: Tensor::ABSENT,
+            env_max: Tensor::ABSENT,
+            has_envelopes: false,
+            page_size: PAGE as i32,
+            seq_stride: (kvh * d) as i64,
+            head_stride: d as i64,
+            layout: 0,
+            scheme_byte: 0,
+            block_size: 0,
+            max_pages_per_request: pages_per as i32,
+            pages_in_batch: pages as i32,
+        };
+        let q_t = RaggedTensor {
+            data: Tensor::new(q_at, rows as u32, (qh * d) as u32, Dtype::Bf16),
+            indptr: Tensor::new(qo_at, n as u32 + 1, 1, Dtype::I32),
+        };
+        let sm_scale = 1.0 / (d as f32).sqrt();
+        let tc5 = timer.median(|_| {
+            let mut o = Tensor::new(o_at, rows as u32, (qh * d) as u32, Dtype::Bf16);
+            attn::prefill(
+                &ctx, q_t, &built, &pool, None, d as u32, kvh as u32, sm_scale, &mut o,
+            )
+            .expect("the prefill fires");
+        });
+        let fa2 = timer.median(|_| {
+            let mut o = Tensor::new(o_at, rows as u32, (qh * d) as u32, Dtype::Bf16);
+            let mut lse = Tensor::new(lse_at, rows as u32, qh as u32, Dtype::F32);
+            attn::prefill_lse(
+                &ctx, q_t, &built, &pool, None, d as u32, kvh as u32, sm_scale, &mut o, &mut lse,
+            )
+            .expect("the FA2 prefill fires");
+        });
+        // Causal: row t reads t + 1 keys.
+        let flops = 4.0 * (n * qh * d) as f64 * (len * (len + 1) / 2) as f64;
+        println!(
+            "| {d} | {g} | {kvh} | {n} x {len} | {:.0} | {:.0} |",
+            flops / tc5 * 1e-6,
+            flops / fa2 * 1e-6
+        );
+    }
+}

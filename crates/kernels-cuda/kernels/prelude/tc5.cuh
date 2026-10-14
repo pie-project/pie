@@ -340,6 +340,14 @@ __device__ __forceinline__ void mma_f16_tmem_a(u32 d, u32 a, u64 b, u32 idesc, b
         : "memory");
 }
 
+// As mma_f16 with A in TMEM at `a` (a row a lane, two 16-bit elements a
+// column; a K step of 16 is 8 columns on).
+template <int G = 1>
+__device__ __forceinline__ void mma_f16_ts(u32 d, u32 a, u64 b, u32 idesc, bool acc) {
+    PIE_TC5_GROUP(G, PIE_TC5_MMA_HEAD, ".kind::f16 [%0], [%1], %2, %3, p;\n\t}", ::"r"(d), "r"(a),
+                  "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)))
+}
+
 template <int G = 1>
 __device__ __forceinline__ void mma_f8f6f4(u32 d, u64 a, u64 b, u32 idesc, bool acc) {
     PIE_TC5_GROUP(G, PIE_TC5_MMA_HEAD, ".kind::f8f6f4 [%0], %1, %2, %3, p;\n\t}", ::"r"(d),
