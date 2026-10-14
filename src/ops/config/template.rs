@@ -111,7 +111,8 @@ device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
 # kv_page_size    = 32      # omit: the engine derives one
-# max_state_slots = 256     # recurrent-state seats (hybrid models); omit for 256
+# max_state_slots = 512     # recurrent-state slots (hybrid models); omit for two
+#                           # a lane (512 at 256 lanes), cut at load to fit
 # max_model_len   = 4096    # the most tokens one sequence may hold; omit for
 #                           # 4096. State it at what you serve: a decode body
 #                           # for n lanes is armed only when the pool holds
