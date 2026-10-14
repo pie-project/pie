@@ -265,6 +265,57 @@ pub fn prefill(
     o: &Tensor,
     lse: u64,
 ) -> Result<(), Error> {
+    prefill_walk(ctx, op, q, plan, pool, window_left, sm_scale, o, lse, None)
+}
+
+/// `pie::attn::PrefillSel`, field for field: the selection rows a selected
+/// prefill masks its keys by.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PrefillSel {
+    pub selection: u64,
+    pub top_k: i32,
+    pub ratio: i32,
+}
+
+const _: () = assert!(core::mem::size_of::<PrefillSel>() == 16);
+
+/// The tokens of a 128-row tile whose selections the selected prefill holds
+/// (`kSelTokens`), and the pooled blocks a token's bitmap spans
+/// (`kSelBlocks`).
+pub const SEL_TOKENS: u32 = 16;
+pub const SEL_BLOCKS: u32 = 2048;
+
+/// The causal prefill over `plan` with every row's keys cut to the pooled
+/// blocks its selection row names and its open block
+/// (`paged_prefill_selected`).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_selected(
+    ctx: &Ctx,
+    op: &'static str,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    pool: &KvPool,
+    sm_scale: f32,
+    o: &Tensor,
+    sel: PrefillSel,
+) -> Result<(), Error> {
+    prefill_walk(ctx, op, q, plan, pool, -1, sm_scale, o, 0, Some(sel))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_walk(
+    ctx: &Ctx,
+    op: &'static str,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    pool: &KvPool,
+    window_left: i32,
+    sm_scale: f32,
+    o: &Tensor,
+    lse: u64,
+    sel: Option<PrefillSel>,
+) -> Result<(), Error> {
     let shape = &plan.shape;
     head_dim_built(op, shape.head_dim)?;
     let info = &plan.info;
@@ -320,23 +371,44 @@ pub fn prefill(
     }
     let hnd = if shape.hnd_layout { "true" } else { "false" };
     let causal = if plan.causal { "true" } else { "false" };
-    let kernel = if matches!(shape.head_dim, 128 | 256) {
-        "paged_prefill"
+    let launch = Launch::grid(
+        [info.padded_batch_size as u32, shape.num_kv_heads, 1],
+        [512, 1, 1],
+    );
+    if let Some(sel) = sel {
+        if !matches!(shape.head_dim, 128 | 256) || !plan.causal {
+            return Err(refuse(
+                op,
+                "the selected prefill walks causal 128- or 256-wide heads only",
+            ));
+        }
+        let entry = symbol(&format!(
+            "::pie::attn::paged_prefill_selected<{}, {hnd}>",
+            shape.head_dim
+        ));
+        ctx.fire(
+            op,
+            Fire::at(FILE, entry).apply(launch),
+            &[
+                by_value(&args),
+                ArgValue::Bytes {
+                    ptr: core::ptr::from_ref(&sel).cast::<u8>(),
+                    len: core::mem::size_of::<PrefillSel>(),
+                },
+            ],
+        )?;
     } else {
-        "paged_prefill_wide"
-    };
-    let entry = symbol(&format!(
-        "::pie::attn::{kernel}<{}, {hnd}, {causal}>",
-        shape.head_dim
-    ));
-    ctx.fire(
-        op,
-        Fire::at(FILE, entry).apply(Launch::grid(
-            [info.padded_batch_size as u32, shape.num_kv_heads, 1],
-            [512, 1, 1],
-        )),
-        &[by_value(&args)],
-    )?;
+        let kernel = if matches!(shape.head_dim, 128 | 256) {
+            "paged_prefill"
+        } else {
+            "paged_prefill_wide"
+        };
+        let entry = symbol(&format!(
+            "::pie::attn::{kernel}<{}, {hnd}, {causal}>",
+            shape.head_dim
+        ));
+        ctx.fire(op, Fire::at(FILE, entry).apply(launch), &[by_value(&args)])?;
+    }
     match split {
         Some(parts) => merge(ctx, op, &parts),
         None => Ok(()),

@@ -211,7 +211,7 @@ impl Run<'_> {
             ),
             Attention::PrefillSelected {
                 q,
-                plan: _,
+                plan,
                 selection,
                 cache,
                 window,
@@ -220,18 +220,40 @@ impl Run<'_> {
                 sm_scale,
                 ratio,
                 o,
-            } => selected::attention_prefill_selected(
-                self.ctx(),
-                self.ragged_q(*q),
-                self.tensor(*selection),
-                &self.pool_absolute(*cache),
-                *window,
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                *ratio,
-                &mut self.tensor(*o),
-            ),
+            } => {
+                // The rows' causal plan walks them a tile at a time, the
+                // selection masking each row's keys; the per-row walk takes
+                // what the tiled one does not cover.
+                if let StructSlot::Prefill(planned) = self.slot(*plan)
+                    && attn::prefill_selected_tiled(
+                        self.ctx(),
+                        self.ragged_q(*q),
+                        planned,
+                        self.tensor(*selection),
+                        &self.pool_absolute(*cache),
+                        *window,
+                        *head_dim,
+                        *kv_heads,
+                        *sm_scale,
+                        *ratio,
+                        &mut self.tensor(*o),
+                    )?
+                {
+                    return Ok(());
+                }
+                selected::attention_prefill_selected(
+                    self.ctx(),
+                    self.ragged_q(*q),
+                    self.tensor(*selection),
+                    &self.pool_absolute(*cache),
+                    *window,
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    *ratio,
+                    &mut self.tensor(*o),
+                )
+            }
             Attention::DecodeRel {
                 q,
                 plan,

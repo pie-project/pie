@@ -252,6 +252,71 @@ pub fn prefill(
     )
 }
 
+/// A selected (DSA / QSA) prefill on the tiled causal walk of `plan`, each
+/// row's keys masked to the pooled blocks its selection row names and its
+/// open block: the request's queries share every key read, where the
+/// per-row walk (`selected::attention_prefill_selected`) streams each row's
+/// keys alone. `Ok(false)` where it does not cover the shape (a window, a
+/// quantized pool, a GQA group under 9 heads, a context past
+/// `paged::SEL_BLOCKS` pooled blocks), which the per-row walk then takes.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_selected_tiled(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    selection: Tensor,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    ratio: u32,
+    o: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "attention.prefill_selected";
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let off = *OFF.get_or_init(|| std::env::var_os("PIE_SEL_TILED").is_some_and(|v| v == "0"));
+    if off
+        || window.is_some()
+        || q.data.dtype != Dtype::Bf16
+        || pool.keys.dtype != Dtype::Bf16
+        || pool.key_scales.ptr != 0
+        || !matches!(head_dim, 128 | 256)
+        || !plan.causal
+        || plan.info.cta_tile_q != i64::from(paged::PREFILL_TILE_Q)
+        || selection.ptr == 0
+        || selection.dtype != Dtype::I32
+        || selection.rows != o.rows
+        || ratio == 0
+        || kv_heads == 0
+        || plan.accepts(OP, head_dim, Some(kv_heads), window).is_err()
+    {
+        return Ok(false);
+    }
+    let q_heads = q.data.width / head_dim;
+    if q_heads % kv_heads != 0 {
+        return Ok(false);
+    }
+    let group = q_heads / kv_heads;
+    // A 128-row tile spans at most 127 / G + 2 tokens.
+    if group == 0 || 127 / group + 2 > paged::SEL_TOKENS {
+        return Ok(false);
+    }
+    let context = i64::from(pool.max_pages_per_request) * i64::from(pool.page_size);
+    if context <= 0 || context / i64::from(ratio) > i64::from(paged::SEL_BLOCKS) {
+        return Ok(false);
+    }
+    attention_lands(OP, q.data, o);
+    lanes_carry(OP, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
+    let sel = paged::PrefillSel {
+        selection: selection.ptr,
+        top_k: stated(OP, selection.width)?,
+        ratio: stated(OP, ratio)?,
+    };
+    paged::prefill_selected(ctx, OP, q, plan, pool, sm_scale, o, sel)?;
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_lse(
     ctx: &Ctx,

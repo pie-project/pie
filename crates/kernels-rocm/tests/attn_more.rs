@@ -424,6 +424,19 @@ fn selected_decode_at_the_models_shape() {
     );
 }
 
+/// The tiled causal walk of a selected prefill at Qwen3.8-Flash-Next's
+/// shape (24 query heads over 2 kv heads of 256, blocks of 4): requests
+/// whose contexts stay inside the budget (every block selected), past it
+/// (rows naming a scattered subset), and fresh runs that cross several
+/// 128-row tiles mid-token, beside a decode row.
+#[test]
+fn selected_prefill_tiled_reads_the_named_blocks_and_the_open_one() {
+    let Some(gpu) = Gpu::open() else { return };
+    check_selected_as(&gpu, 24, 2, 256, 16, 4, 64, &[40, 1, 23], &[100, 7, 0], false, true, 92);
+    check_selected_as(&gpu, 24, 2, 256, 16, 4, 16, &[130, 3, 61], &[300, 900, 41], false, true, 93);
+    check_selected_as(&gpu, 12, 1, 128, 16, 4, 32, &[200, 1], &[50, 500], false, true, 94);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_selected(
     gpu: &Gpu,
@@ -438,10 +451,31 @@ fn check_selected(
     decode: bool,
     seed: u64,
 ) {
+    check_selected_as(gpu, hq, hk, d, ps, ratio, top_k, fresh, prefix, decode, false, seed);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_selected_as(
+    gpu: &Gpu,
+    hq: u32,
+    hk: u32,
+    d: u32,
+    ps: usize,
+    ratio: u32,
+    top_k: u32,
+    fresh: &[u32],
+    prefix: &[u32],
+    decode: bool,
+    tiled: bool,
+    seed: u64,
+) {
     let ctx = gpu.ctx();
     let kv_lens: Vec<u32> = fresh.iter().zip(prefix).map(|(f, p)| f + p).collect();
     let Cache {
-        pool, keys, vals, ..
+        pool,
+        keys,
+        vals,
+        page_indptr,
     } = paged_cache(gpu, hk as usize, d as usize, ps, &kv_lens, seed);
     let qo = indptr_of(fresh);
     let total = *qo.last().unwrap() as usize;
@@ -465,7 +499,53 @@ fn check_selected(
     let selection = gpu.ints_shaped(&sel, total as u32, top_k);
     let scale = 1.0 / (d as f32).sqrt();
     let mut o = gpu.zeros(total as u32, hq * d, Dtype::Bf16);
-    if decode {
+    if tiled {
+        let device = plan::Device::probe(&ctx).unwrap();
+        let int = gpu.zeros(1, 16 << 20, Dtype::F32);
+        let float = gpu.zeros(1, 16 << 20, Dtype::F32);
+        let n = fresh.len() as u32;
+        let built = plan::plan_prefill(
+            &qo,
+            &page_indptr,
+            &kv_lens.iter().map(|&x| x as i32).collect::<Vec<_>>(),
+            total as u32,
+            plan::Shape {
+                num_requests: n,
+                lane_offset: 0,
+                num_q_heads: hq,
+                num_kv_heads: hk,
+                head_dim: d,
+                page_size: ps as u32,
+                hnd_layout: false,
+            },
+            plan::Live {
+                requests: n,
+                lane_offset: 0,
+                row_offset: 0,
+                rows: total as u32,
+            },
+            None,
+            true,
+            false,
+            None,
+            &device,
+            plan::Toggles::default(),
+            plan::Workspace {
+                int_ptr: int.ptr,
+                int_bytes: 64 << 20,
+                float_ptr: float.ptr,
+                float_bytes: 64 << 20,
+            },
+        )
+        .unwrap();
+        built.stage(&ctx).unwrap();
+        let took = attn::prefill_selected_tiled(
+            &ctx, q, &built, selection, &pool, None, d, hk, scale, ratio, &mut o,
+        )
+        .unwrap();
+        assert!(took, "the tiled selected prefill refused d{d} {hq}/{hk}");
+        gpu.sync();
+    } else if decode {
         selected::attention_decode_selected(
             &ctx, q, selection, &pool, None, d, scale, ratio, &mut o,
         )

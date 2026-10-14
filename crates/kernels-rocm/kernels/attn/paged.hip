@@ -871,8 +871,24 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
 //
 // A block owns 128 packed query rows as eight wavefronts of 16 and walks
 // its kv chunk 32 keys at a time.
-template <int D, bool HND, bool CAUSAL>
-__global__ __launch_bounds__(512) void paged_prefill(const Paged p) {
+// The selected (DSA / QSA) form of a prefill: row t reads the keys of the
+// pooled blocks its selection row names below its ⌊j_end / ratio⌋, and the
+// open block up to itself, `attn/sdpa_selected.hip`'s key set. The tile's
+// tokens (up to kSelTokens, so G ≥ 9) hold their blocks as LDS bitmaps of
+// up to kSelBlocks blocks, and the walk masks each key by its row's bit:
+// the request's queries share every K and V read instead of each row
+// streaming its own keys.
+struct PrefillSel {
+    const i32* selection;  // [row][top_k], the rows of q
+    i32 top_k;
+    i32 ratio;
+};
+constexpr int kSelTokens = 16;
+constexpr int kSelBlocks = 2048;
+constexpr int kSelWords = kSelBlocks / 32;
+
+template <int D, bool HND, bool CAUSAL, bool SEL>
+__device__ __forceinline__ void paged_prefill_body(const Paged& p, const PrefillSel& sel) {
     constexpr int BC = 32, KT = BC / 16, KP = D / 32, DT = D / 16;
     constexpr int KPAD = D + 4, VPAD = BC + 4;
     constexpr int THREADS = 512, TABLE = 512;
@@ -929,6 +945,26 @@ __global__ __launch_bounds__(512) void paged_prefill(const Paged p) {
     float m = neg_inf(), l = 0.f;
     const int key_hi = CAUSAL ? kv_len - qo_len + token : kv_len - 1;
     const int key_lo = kv_len - qo_len + token - wl;
+
+    // The tile's tokens' selected blocks, and how many blocks each pools.
+    __shared__ u32 sel_bits[SEL ? kSelTokens : 1][SEL ? kSelWords : 1];
+    __shared__ int sel_blocks[SEL ? kSelTokens : 1];
+    const int tok_lo = (qo_tile * kPrefillTileQ) / G;
+    if constexpr (SEL) {
+        const int tok_n = min(qo_len, ((qo_tile + 1) * kPrefillTileQ + G - 1) / G) - tok_lo;
+        for (int i = tid; i < kSelTokens * kSelWords; i += THREADS) sel_bits[i / kSelWords][i % kSelWords] = 0;
+        if (tid < kSelTokens) sel_blocks[tid] = tid < tok_n ? (kv_len - qo_len + tok_lo + tid + 1) / sel.ratio : 0;
+        __syncthreads();
+        for (int i = tid; i < tok_n * sel.top_k; i += THREADS) {
+            const int r = i / sel.top_k, e = i % sel.top_k;
+            const int nb = sel_blocks[r];
+            if (e >= min(sel.top_k, nb)) continue;
+            const int c = sel.selection[static_cast<long long>(q_first + tok_lo + r) * sel.top_k + e];
+            if (c >= 0 && c < nb) atomicOr(&sel_bits[r][c / 32], 1u << (c % 32));
+        }
+        __syncthreads();
+    }
+    const int sel_row = token - tok_lo;
 
     const i32* pages = p.page_indices + p.page_indptr[req];
     const int ps = p.page_size;
@@ -999,7 +1035,11 @@ __global__ __launch_bounds__(512) void paged_prefill(const Paged p) {
 #pragma unroll
                 for (int t = 0; t < 4; ++t) {
                     const int key = kv0 + kt * 16 + 4 * quad + t;
-                    const bool seen = row_live && key < wend && key <= key_hi && key >= key_lo;
+                    bool seen = row_live && key < wend && key <= key_hi && key >= key_lo;
+                    if constexpr (SEL) {
+                        const int b = key / sel.ratio;
+                        seen = seen && (b >= sel_blocks[sel_row] || ((sel_bits[sel_row][b / 32] >> (b % 32)) & 1u));
+                    }
                     s[kt][t] = seen ? s[kt][t] * p.scale_log2 : neg_inf();
                     tile_max = fmaxf(tile_max, s[kt][t]);
                 }
@@ -1053,6 +1093,16 @@ __global__ __launch_bounds__(512) void paged_prefill(const Paged p) {
         }
     }
     if (quad == 0 && p.lse != nullptr) p.lse[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
+}
+
+template <int D, bool HND, bool CAUSAL>
+__global__ __launch_bounds__(512) void paged_prefill(const Paged p) {
+    paged_prefill_body<D, HND, CAUSAL, false>(p, PrefillSel{});
+}
+
+template <int D, bool HND>
+__global__ __launch_bounds__(512) void paged_prefill_selected(const Paged p, const PrefillSel sel) {
+    paged_prefill_body<D, HND, true, true>(p, sel);
 }
 
 // ----------------------------------------------------------------- merge --
