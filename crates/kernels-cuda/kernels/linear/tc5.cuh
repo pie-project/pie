@@ -160,6 +160,19 @@ __device__ __forceinline__ uint4 dequant8(unsigned code, unsigned char sb) {
     return make_uint4(w[0], w[1], w[2], w[3]);
 }
 
+// Two and four bytes likewise.
+__device__ __forceinline__ unsigned ld_nc_u16(const unsigned char* p) {
+    unsigned short v;
+    asm volatile("ld.global.nc.u16 %0, [%1];" : "=h"(v) : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ unsigned ld_nc_u32(const unsigned char* p) {
+    unsigned v;
+    asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(v) : "l"(p));
+    return v;
+}
+
 // One byte from global memory through the non-coherent path, where the
 // asm stands.
 __device__ __forceinline__ unsigned ld_nc_u8(const unsigned char* p) {
@@ -288,7 +301,13 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     // MMA behind it until it lands, and a shallower ring would hold the
     // copier on the MMAs.
     constexpr u32 kSfSlots = kStages < 4 ? kStages : 4;
-    constexpr u32 kSfAll = kScaled ? kSfSlots * kSfCols : 0;
+    // A W4A16 weight on the A side (swapped) lands in TMEM instead: an A
+    // slot a ring stage (so the stage's own barriers guard it) of each P
+    // tile's 64 K (32 columns of two bf16), past the accumulators where the
+    // scale slots would sit.
+    constexpr u32 kASlots = kStages;
+    constexpr u32 kSfAll = kScaled ? kSfSlots * kSfCols : kMixP ? kASlots * kPT * 32 : 0;
+    static_assert(!kMixP || kASlots % tc5k::kXGroups == 0, "W4A16's groups own alternate A slots");
     // Two accumulator stages always. When they and the scale slots overrun
     // TMEM the stages share kOv columns -- stage 0's tail is stage 1's head --
     // and a tile's first MMA waits until the previous tile's epilogue has
@@ -300,7 +319,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     constexpr u32 kCols = tc5k::pow2_cols(kStride + kAccN + kSfAll);
     static_assert(kCols <= 512, "TMEM is 512 columns");
 
-    constexpr u32 kOffQ = kStages * kTileP * kPT;
+    constexpr u32 kOffQ = kMixP ? 0 : kStages * kTileP * kPT;
     constexpr u32 kOffSfP = kOffQ + kStages * kTileQ;
     constexpr u32 kOffSfQ = kOffSfP + kStages * kSfP;
     // Each epilogue warp stages two 32 x 32 bf16 boxes for the TMA store.
@@ -728,6 +747,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         tc_fence_after();
                     }
                     const u64 desc_q = sdesc_sw128(tile_q);
+                    // A W4A16 A side's slot: this step's, in TMEM.
+                    const u32 a_slot = tmem + kStride + kAccN + s * kPT * 32;
 #pragma unroll
                     for (u32 h = 0; h < kPT; ++h) {
                     const u64 desc_p = sdesc_sw128(tile_p + h * kTileP);
@@ -738,7 +759,10 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         const u64 a = desc_p + 2 * j;
                         const u64 b = desc_q + 2 * j;
                         const bool accumulate = kb > kb0 || j > 0;
-                        if constexpr (kKind == 0) {
+                        if constexpr (kMixP) {
+                            mma_f16_tmem_a(d, a_slot + h * 32 + j * 8, b,
+                                           idesc_dense(kF16Bf16, kF16Bf16, kM, kBN), accumulate);
+                        } else if constexpr (kKind == 0) {
                             mma_f16<kPair>(d, a, b, idesc_dense(kF16Bf16, kF16Bf16, kM, kBN),
                                            accumulate);
                         } else if constexpr (kKind == 1) {
@@ -836,6 +860,67 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                                 : 0u;
                 }
             };
+            if constexpr (kMixP) {
+                // A thread owns a row of each P tile: its lane quarter's
+                // row of TMEM, 64 K a stage as 32 bf16 pairs.
+                const u32 r = (warp % 4) * 32 + lane;
+                constexpr int kSfStage = 64 / kWGran;  // scales a row a stage
+                for (int kb = x.kb0; kb < x.kb1; ++kb, ++step) {
+                    if (step % tc5k::kXGroups != xgroup) {
+                        if (++s == kStages) {
+                            s = 0;
+                            phase ^= 1;
+                        }
+                        continue;
+                    }
+                    unsigned sc[kPT];
+#pragma unroll
+                    for (u32 h = 0; h < kPT; ++h) {
+                        const int g = wrow(h * 128 + r);
+                        const unsigned char* at =
+                            epi.wsf + static_cast<size_t>(g) * sf_cols + kb * kSfStage;
+                        sc[h] = g >= weight_rows ? 0u
+                                : kSfStage == 2  ? tc5k::ld_nc_u16(at)
+                                                 : tc5k::ld_nc_u32(at);
+                    }
+                    bar_wait(&full[s], phase);
+                    tc_fence_after();
+                    const unsigned char* raw_s = smem + kOffRaw + s * kRawBytes;
+                    // Its stage's slot: free once `full` says the producer saw
+                    // the stage emptied by the MMAs that read it last.
+                    const u32 a_slot = tmem + kStride + kAccN + s * kPT * 32 +
+                                       (((warp % 4) * 32) << 16);
+#pragma unroll
+                    for (u32 h = 0; h < kPT; ++h) {
+                        const uint4* row = reinterpret_cast<const uint4*>(raw_s + (h * 128 + r) * 32);
+                        const uint4 c0 = row[0], c1 = row[1];
+                        const unsigned code[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
+                        u32 v[32];
+#pragma unroll
+                        for (int w = 0; w < 8; ++w) {
+                            const unsigned char b = static_cast<unsigned char>(
+                                sc[h] >> (8 * (w * 8 / kWGran)));
+                            const uint4 d = tc5k::dequant8<kMix>(code[w], b);
+                            v[4 * w] = d.x;
+                            v[4 * w + 1] = d.y;
+                            v[4 * w + 2] = d.z;
+                            v[4 * w + 3] = d.w;
+                        }
+                        tmem_st32(a_slot + h * 32, v);
+                    }
+                    tmem_wait_st();
+                    tc_fence_before();
+                    __syncwarp();
+                    if (lane == 0) {
+                        bar_arrive(&xfull[s]);
+                    }
+                    if (++s == kStages) {
+                        s = 0;
+                        phase ^= 1;
+                    }
+                }
+                continue;
+            }
             for (int kb = x.kb0; kb < x.kb1; ++kb, ++step) {
                 if (step % tc5k::kXGroups != xgroup) {
                     if (++s == kStages) {

@@ -271,7 +271,13 @@ const fn smem_bytes(
         stages,
         ..
     } = plan;
-    let stage = 128 * 128 * pt
+    // A W4A16 weight on the A side (swapped) lands in TMEM, not shared memory.
+    let p_tile = if swap && matches!(kind, Kind::Mixed(_)) {
+        0
+    } else {
+        128 * 128 * pt
+    };
+    let stage = p_tile
         + bn / if pair { 2 } else { 1 } * 128
         + atoms_k(kind, gran_p) * 512 * pt * p_blocks
         + atoms_k(kind, gran_q) * bn.div_ceil(128) * 512;
@@ -362,6 +368,12 @@ impl Plan {
             && smem_bytes(kind, gran_p, gran_q, Self { stages, ..self }, pt, p_blocks) > SMEM_CAP
         {
             stages -= 1;
+        }
+        // A W4A16 weight on the A side keeps an A slot a stage in TMEM past
+        // the accumulators, which may share all but one stage's columns.
+        if matches!(kind, Kind::Mixed(_)) && self.swap {
+            let acc = self.bn * pt;
+            stages = stages.min((512 - acc) / (pt * 32)).max(2);
         }
         // A W4A16 weight's two transform groups take turns a stage: an even
         // ring gives each its own slots, so each waits on them in order.

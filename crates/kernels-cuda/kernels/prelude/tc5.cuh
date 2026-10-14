@@ -330,6 +330,16 @@ __device__ __forceinline__ void mma_f16(u32 d, u64 a, u64 b, u32 idesc, bool acc
                   "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)))
 }
 
+// kind::f16 with A in TMEM at `a` (its rows the lanes, K along the
+// columns, two bf16 a column), B by descriptor.
+__device__ __forceinline__ void mma_f16_tmem_a(u32 d, u32 a, u64 b, u32 idesc, bool acc) {
+    asm volatile(
+        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, p;\n\t}"
+        ::"r"(d), "r"(a), "l"(b), "r"(idesc), "r"(static_cast<u32>(acc))
+        : "memory");
+}
+
 template <int G = 1>
 __device__ __forceinline__ void mma_f8f6f4(u32 d, u64 a, u64 b, u32 idesc, bool acc) {
     PIE_TC5_GROUP(G, PIE_TC5_MMA_HEAD, ".kind::f8f6f4 [%0], %1, %2, %3, p;\n\t}", ::"r"(d),
@@ -383,6 +393,18 @@ __device__ __forceinline__ void tmem_ld32(u32 taddr, u32 (&v)[32]) {
 
 __device__ __forceinline__ void tmem_wait_ld() {
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+}
+
+// Whole-warp: 32 consecutive columns of the warp's 32 lanes from `v`, one
+// row a thread. Pair with tmem_wait_st before another thread reads them.
+__device__ __forceinline__ void tmem_st32(u32 taddr, const u32 (&v)[32]) {
+    asm volatile("tcgen05.st.sync.aligned.32x32b.x32.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
+                 ::"r"(taddr), "r"(v[0]), "r"(v[1]), "r"(v[2]), "r"(v[3]), "r"(v[4]), "r"(v[5]), "r"(v[6]), "r"(v[7]), "r"(v[8]), "r"(v[9]), "r"(v[10]), "r"(v[11]), "r"(v[12]), "r"(v[13]), "r"(v[14]), "r"(v[15]), "r"(v[16]), "r"(v[17]), "r"(v[18]), "r"(v[19]), "r"(v[20]), "r"(v[21]), "r"(v[22]), "r"(v[23]), "r"(v[24]), "r"(v[25]), "r"(v[26]), "r"(v[27]), "r"(v[28]), "r"(v[29]), "r"(v[30]), "r"(v[31])
+                 : "memory");
+}
+
+__device__ __forceinline__ void tmem_wait_st() {
+    asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
 }
 
 }  // namespace pie::tc5
