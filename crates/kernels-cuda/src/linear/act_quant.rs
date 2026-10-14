@@ -560,12 +560,20 @@ pub(crate) fn gather_back(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     let (count, n) = (y.rows, y.width);
-    let pairs = u32::try_from(u64::from(count) * u64::from(n / 2))
+    // Whole 16-byte runs where the rows and both buffers allow them: the same
+    // values, a quarter of the threads.
+    let vec8 = n.is_multiple_of(8) && grouped % 16 == 0 && y.ptr % 16 == 0;
+    let (entry, per) = if vec8 {
+        ("::pie::linear::route_gather_vec8", 8)
+    } else {
+        ("::pie::linear::route_gather", 2)
+    };
+    let threads = u32::try_from(u64::from(count) * u64::from(n / per))
         .map_err(|_| refuse(op, format!("{count} routes of {n} overflow a launch")))?;
     let int = |v: u32| stated(op, v).map(|v| v.arg());
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_gather").apply(Launch::flat(pairs, BLOCK)),
+        Fire::at(FILE, entry).apply(Launch::flat(threads, BLOCK)),
         &[
             ArgValue::Ptr(grouped),
             ArgValue::Ptr(pos),

@@ -296,6 +296,31 @@ __global__ void route_gather(
     *dst = *reinterpret_cast<const bf16x2*>(grouped + static_cast<long long>(o) * n + c);
 }
 
+// `route_gather`, 16 bytes a thread: the same rows, written whole.
+__global__ void route_gather_vec8(
+    const bf16* __restrict__ grouped,
+    const i32* __restrict__ pos,
+    bf16* __restrict__ y,
+    int count,
+    int n,
+    int top,
+    const u32* __restrict__ win)
+{
+    const int runs = n / 8;
+    const long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at >= static_cast<long long>(count) * runs) return;
+    const int r = static_cast<int>(at / runs);
+    if (!route_live(r, top, win)) return;
+    const int c = static_cast<int>(at % runs) * 8;
+    const int o = pos[r];
+    uint4* dst = reinterpret_cast<uint4*>(y + static_cast<long long>(r) * n + c);
+    if (o < 0) {
+        *dst = make_uint4(0u, 0u, 0u, 0u);
+        return;
+    }
+    *dst = *reinterpret_cast<const uint4*>(grouped + static_cast<long long>(o) * n + c);
+}
+
 // `grouped[pos[r]] = x[r / div]`, 16 bytes a thread; a dropped route lands
 // nowhere.
 __global__ void route_scatter_rows(
