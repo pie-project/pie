@@ -43,6 +43,9 @@ struct Fixture {
     host_v: Vec<f32>,
     /// Each request's pages, in order.
     pages: Vec<Vec<usize>>,
+    /// The fire's live seat, `[rows, row offset, lanes, lane offset]`, as
+    /// a recorded body stages it for a plan over some of its lanes.
+    stage: u64,
 }
 
 fn fixture(case: Case, seed: u64) -> Fixture {
@@ -114,6 +117,7 @@ fn fixture(case: Case, seed: u64) -> Fixture {
         .map(|h| 0.5 * (h % 7) as f32 - 1.0)
         .collect();
     let sinks = gpu.up(&host_sinks);
+    let stage = gpu.zeros(16);
     let workspace = Workspace {
         int_ptr: gpu.zeros(INT_BYTES),
         int_bytes: INT_BYTES,
@@ -136,6 +140,7 @@ fn fixture(case: Case, seed: u64) -> Fixture {
         host_k,
         host_v,
         pages,
+        stage,
     }
 }
 
@@ -148,12 +153,42 @@ impl Fixture {
     /// [`Fixture::fire`], with the sinks landed over its output where
     /// `sinked`.
     fn fire_with(&self, tuning: Tuning, sinked: bool) -> impl Fn() + '_ {
+        self.fire_lanes(tuning, sinked, 0..self.case.lens.len() as u32)
+    }
+
+    /// [`Fixture::fire_with`] over the fire's `lanes` alone (one query row
+    /// a lane), its live seat staged as a recorded body stages it where they
+    /// are not all of the fire's.
+    fn fire_lanes(
+        &self,
+        tuning: Tuning,
+        sinked: bool,
+        lanes: core::ops::Range<u32>,
+    ) -> impl Fn() + '_ {
         let ctx = self.gpu.ctx().with_tuning(tuning);
         let device = Device::probe(&ctx).expect("the device answers");
-        let rows = self.case.lens.len() as u32;
+        let all = self.case.lens.len() as u32;
+        let (first, count) = (lanes.start, lanes.len() as u32);
+        if count != all {
+            let seat = [count, first, count, first];
+            self.gpu.sync();
+            let copied = unsafe {
+                kernels_cuda::cudarc::runtime::sys::cudaMemcpy(
+                    self.stage as *mut core::ffi::c_void,
+                    seat.as_ptr().cast(),
+                    16,
+                    kernels_cuda::cudarc::runtime::sys::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                )
+            };
+            assert_eq!(
+                copied,
+                kernels_cuda::cudarc::runtime::sys::cudaError::cudaSuccess
+            );
+            ctx.arm_stage(self.stage);
+        }
         let shape = Shape {
-            num_requests: rows,
-            lane_offset: 0,
+            num_requests: count,
+            lane_offset: first,
             num_q_heads: self.case.q_heads,
             num_kv_heads: self.case.kv_heads,
             head_dim: self.case.head_dim,
@@ -161,11 +196,12 @@ impl Fixture {
             hnd_layout: false,
         };
         let live = Live {
-            requests: rows,
-            lane_offset: 0,
-            row_offset: 0,
-            rows,
+            requests: count,
+            lane_offset: first,
+            row_offset: first,
+            rows: count,
         };
+        let (at, end) = (first as usize, (first + count) as usize);
         let max_grid = attn::fa2::decode_max_grid_size(
             self.case.head_dim,
             self.case.q_heads,
@@ -173,8 +209,8 @@ impl Fixture {
             &device,
         );
         let planned = plan::plan_decode(
-            &self.kv_indptr,
-            &self.kv_len,
+            &self.kv_indptr[at..=end],
+            &self.kv_len[at..end],
             shape,
             live,
             self.case.window,
@@ -189,8 +225,8 @@ impl Fixture {
         let scale = (self.case.head_dim as f32).sqrt().recip();
         let q_width = self.case.q_heads * self.case.head_dim;
         move || {
-            let mut o = Tensor::new(self.o, rows, q_width, Dtype::Bf16);
-            let mut lse = Tensor::new(self.lse, rows, self.case.q_heads, Dtype::F32);
+            let mut o = Tensor::new(self.o, all, q_width, Dtype::Bf16);
+            let mut lse = Tensor::new(self.lse, all, self.case.q_heads, Dtype::F32);
             let sinks = Tensor::new(self.sinks, self.case.q_heads, 1, Dtype::F32);
             if sinked {
                 attn::decode_lse_sink(
@@ -593,6 +629,69 @@ fn a_decode_reports_its_time_at_gptoss_and_gemma4_heads() {
                      {whole:.1} | {prefill_w:.1} |",
                     lens.len()
                 );
+            }
+        }
+    }
+}
+
+/// A recorded decode plan over some of a fire's lanes lands those lanes' rows
+/// (sinks and all) at the plane's own rows, under every read, and leaves the
+/// other lanes' rows as they were: a whole-window read lands each row where
+/// its query sits, a split's fold at the staged seat.
+#[test]
+fn a_plan_over_some_of_a_fires_lanes_lands_their_rows_alone() {
+    for window in [None, Some(128)] {
+        let case = Case {
+            lens: LENS,
+            q_heads: 64,
+            kv_heads: 8,
+            head_dim: 64,
+            window,
+            graph: true,
+        };
+        let fx = fixture(case, 0x1a7e);
+        let (mut want_o, want_lse) = fx.reference();
+        for (at, chunk) in want_o.chunks_mut(64).enumerate() {
+            let r = 1.0
+                / (1.0 + (-(want_lse[at] * std::f32::consts::LN_2 - fx.host_sinks[at % 64])).exp());
+            for x in chunk {
+                *x *= r;
+            }
+        }
+        let width = 64 * 64;
+        for lanes in [2..5u32, 5..7] {
+            for (merge_warp, decode_xqa, whole) in READS {
+                let tuning = Tuning {
+                    merge_warp,
+                    decode_xqa,
+                    decode_xqa_whole_window: whole,
+                    ..Tuning::DEFAULT
+                };
+                fx.scrub();
+                fx.fire_lanes(tuning, true, lanes.clone())();
+                let (o, lse) = fx.output();
+                let (from, to) = (lanes.start as usize, lanes.end as usize);
+                let label = format!(
+                    "window {window:?}, lanes {lanes:?}, warp merge {merge_warp}, tensor-core \
+                     decode {decode_xqa}, whole to {whole}"
+                );
+                let eo = worst(
+                    &o[from * width..to * width],
+                    &want_o[from * width..to * width],
+                );
+                let el = worst(&lse[from * 64..to * 64], &want_lse[from * 64..to * 64]);
+                assert!(
+                    eo < 2e-2 && el < 1e-2,
+                    "{label}: output off by {eo}, lse by {el}"
+                );
+                let scrubbed = common::from_bf16(0x7f7f);
+                let others = (0..LENS.len()).filter(|r| !lanes.contains(&(*r as u32)));
+                for r in others {
+                    assert!(
+                        o[r * width..(r + 1) * width].iter().all(|x| *x == scrubbed),
+                        "{label}: row {r}, outside the plan's lanes, was written"
+                    );
+                }
             }
         }
     }
