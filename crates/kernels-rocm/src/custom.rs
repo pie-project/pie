@@ -25,10 +25,13 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
 ) -> Result<(), Error> {
     const OP: &str = "custom_cuda.qkv_fused_qknorm_rope_vnorm_write";
 
-    const WARP_BLOCK: u32 = 256;
-
-    // The `_warp` entry runs one wavefront of 64 lanes per (row, head).
-    const WARPS_PER_BLOCK: u32 = WARP_BLOCK / 64;
+    // The `_warp` entry runs one wavefront of 64 lanes per head, a block of
+    // them over one row's heads; a row's rotation is computed once a block.
+    // A decode's few rows want blocks to spread over the device (four heads
+    // a block); a prefill's thousands fill it anyway and want the rotation
+    // computed for fewer blocks (up to twelve heads, a divisor of the row's).
+    const SPREAD_WARPS: u32 = 4;
+    const PREFILL_ROWS: u32 = 1024;
 
     const DECODE_BLOCK: u32 = 128;
 
@@ -60,7 +63,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         "the q output is the packed row minus its two kv planes"
     );
     let heads = num_q_heads.unsigned_abs() + kv_heads.unsigned_abs();
-    let rows = count(OP, "rows", packed.rows)?;
+    count(OP, "rows", packed.rows)?;
 
     let hnd_layout = pool.layout != 0;
     let rope_table = ArgValue::ABSENT;
@@ -76,15 +79,36 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         256 => Some(
             "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(256), false>",
         ),
+        512 => Some(
+            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(512), false>",
+        ),
         _ => None,
     };
-    if let Some(instantiation) = warped {
-        let units = packed.rows.saturating_mul(heads);
+    // A lane moves its run of a head as one access, up to 16 bytes.
+    let aligned = [
+        packed.ptr,
+        q.ptr,
+        pool.keys.ptr,
+        pool.values.ptr,
+        q_norm_weight.ptr,
+        k_norm_weight.ptr,
+    ]
+    .iter()
+    .all(|&at| at.is_multiple_of(16));
+    if let Some(instantiation) = warped.filter(|_| aligned) {
+        let warps = if packed.rows >= PREFILL_ROWS {
+            [12u32, 8, 6]
+                .into_iter()
+                .find(|w| heads.is_multiple_of(*w))
+                .unwrap_or(SPREAD_WARPS)
+        } else {
+            SPREAD_WARPS
+        };
         return ctx.fire(
             OP,
             Fire::at(FILE, instantiation).apply(Launch::grid(
-                [units.div_ceil(WARPS_PER_BLOCK), 1, 1],
-                [WARP_BLOCK, 1, 1],
+                [packed.rows, heads.div_ceil(warps), 1],
+                [64 * warps, 1, 1],
             )),
             &[
                 packed.arg(),
@@ -102,7 +126,6 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
                 write_offset.arg(),
                 pool.row_valid.arg(),
                 window,
-                rows.arg(),
                 num_q_heads.arg(),
                 kv_heads.arg(),
                 pool.page_size.arg(),

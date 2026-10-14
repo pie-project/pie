@@ -122,10 +122,18 @@ __global__ __launch_bounds__(BLOCK) void qkv_decode_qk_norm_rope_vnorm_write_kv(
     }
 }
 
-// A 64-, 128- or 256-wide head: one wavefront per (row, head), WAVES to a
-// block, units ordered row-major over [rows][q heads + kv heads]. Lane l
-// holds elements E·l .. E·l + E − 1; a pair's partner D/2 away is the lane
-// 32 across, one exchange.
+// A 64-, 128-, 256- or 512-wide head: one wavefront per head, a block of
+// blockDim / 64 wavefronts over consecutive heads of one row (grid: rows ×
+// head groups), heads ordered q then kv. The row's rotation (cos, sin of
+// each pair) is computed once a block into LDS rather than once a lane for
+// every head. Lane l holds elements E·l .. E·l + E − 1, read and written as
+// one 2E-byte access; a pair's partner D/2 away is the lane 32 across, one
+// exchange.
+template <int E>
+struct alignas(2 * E) BfRun {
+    bf16 v[E];
+};
+
 template <int HEAD_DIM, bool USE_ROPE_TABLE>
 __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     const bf16* __restrict__ packed, bf16* __restrict__ q_out, bf16* __restrict__ k_pages,
@@ -134,38 +142,62 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     const u32* __restrict__ page_indices, const u32* __restrict__ page_indptr,
     const u32* __restrict__ last_page_lens, const u32* __restrict__ w_page,
     const u32* __restrict__ w_off, const u8* __restrict__ row_valid, const u32* __restrict__ win,
-    int num_rows, int num_q_heads, int num_kv_heads, int page_size, bool hnd_layout, float theta,
-    float eps, int rotary_dim) {
+    int num_q_heads, int num_kv_heads, int page_size, bool hnd_layout, float theta, float eps,
+    int rotary_dim) {
     static_assert(kWave == 64 && HEAD_DIM % 64 == 0, "a lane holds whole elements of each half");
     constexpr int E = HEAD_DIM / kWave;
     constexpr int kHalf = kWave / 2;
+    constexpr int kPairs = HEAD_DIM / 2;
+    using Run = BfRun<E>;
+    __shared__ float rot_c[kPairs], rot_s[kPairs];
 
-    const int ln = lane();
-    const int heads = num_q_heads + num_kv_heads;
-    const int unit = static_cast<int>(blockIdx.x * (blockDim.x / kWave) + threadIdx.x / kWave);
-    if (unit >= num_rows * heads) return;
-    const int r = unit / heads;
+    const int r = static_cast<int>(blockIdx.x);
     const Window window{win};
     if (!window.live(r)) return;
     const long long row = window.plane(r);
-    const int head = unit - r * heads;
+    const int ln = lane();
+    const int heads = num_q_heads + num_kv_heads;
+    const int head = static_cast<int>(blockIdx.y * (blockDim.x / kWave) + threadIdx.x / kWave);
     const bool is_q = head < num_q_heads;
-    if (!is_q && row_valid != nullptr && row_valid[row] == 0) return;
+    const bool live = head < heads && (is_q || row_valid == nullptr || row_valid[row] != 0);
     const int local = is_q ? head : head - num_q_heads;
     const int q_dim = num_q_heads * HEAD_DIM;
     const int kv_dim = num_kv_heads * HEAD_DIM;
     const bf16* src_row = packed + row * (q_dim + 2 * kv_dim);
-    const bf16* src = src_row + (is_q ? 0 : q_dim) + local * HEAD_DIM + ln * E;
-    const bf16* v_src = src_row + q_dim + kv_dim + local * HEAD_DIM + ln * E;
-    const bf16* weight = (is_q ? q_weight : k_weight) + ln * E;
+
+    // The head's reads first, so they fly while the rotation is computed.
+    Run xr{}, yr{}, wr{};
+    if (live) {
+        xr = reinterpret_cast<const Run*>(src_row + (is_q ? 0 : q_dim) + local * HEAD_DIM)[ln];
+        if (!is_q) yr = reinterpret_cast<const Run*>(src_row + q_dim + kv_dim + local * HEAD_DIM)[ln];
+        wr = reinterpret_cast<const Run*>(is_q ? q_weight : k_weight)[ln];
+    }
+
+    if constexpr (USE_ROPE_TABLE) {
+        const float* rope_row = rope_table + row * HEAD_DIM;
+        for (int p = threadIdx.x; p < kPairs; p += blockDim.x) {
+            rot_c[p] = p < rotary_dim / 2 ? rope_row[p] : 1.f;
+            rot_s[p] = p < rotary_dim / 2 ? rope_row[p + kPairs] : 0.f;
+        }
+    } else {
+        const int pos = positions[row];
+        for (int p = threadIdx.x; p < kPairs; p += blockDim.x) {
+            float c, s;
+            rope_angle(p, HEAD_DIM, rotary_dim, pos, theta, c, s);
+            rot_c[p] = c;
+            rot_s[p] = s;
+        }
+    }
+    __syncthreads();
+    if (!live) return;
 
     float x[E], y[E];
     float ss = 0.f, ss_v = 0.f;
 #pragma unroll
     for (int i = 0; i < E; ++i) {
-        x[i] = to_f32(src[i]);
+        x[i] = to_f32(xr.v[i]);
         ss += x[i] * x[i];
-        y[i] = is_q ? 0.f : to_f32(v_src[i]);
+        y[i] = to_f32(yr.v[i]);
         ss_v += y[i] * y[i];
     }
     ss = wave_sum(ss);
@@ -173,22 +205,14 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
 
     const float inv_rms = rsqrtf(ss / static_cast<float>(HEAD_DIM) + eps);
 #pragma unroll
-    for (int i = 0; i < E; ++i) x[i] *= inv_rms * to_f32(weight[i]);
+    for (int i = 0; i < E; ++i) x[i] *= inv_rms * to_f32(wr.v[i]);
 
-    const float* rope_row = USE_ROPE_TABLE ? rope_table + row * HEAD_DIM : nullptr;
-    const int pos = USE_ROPE_TABLE ? 0 : positions[row];
+    Run out;
 #pragma unroll
     for (int i = 0; i < E; ++i) {
         const float pair = __shfl_xor(x[i], kHalf, kWave);
-        const int p = (ln * E + i) % (HEAD_DIM / 2);
-        float c, s;
-        if constexpr (USE_ROPE_TABLE) {
-            c = p < rotary_dim / 2 ? rope_row[p] : 1.f;
-            s = p < rotary_dim / 2 ? rope_row[p + HEAD_DIM / 2] : 0.f;
-        } else {
-            rope_angle(p, HEAD_DIM, rotary_dim, pos, theta, c, s);
-        }
-        x[i] = x[i] * c + (ln < kHalf ? -pair : pair) * s;
+        const int p = (ln * E + i) % kPairs;
+        out.v[i] = from_f32<bf16>(x[i] * rot_c[p] + (ln < kHalf ? -pair : pair) * rot_s[p]);
     }
 
     bf16* dst;
@@ -199,11 +223,12 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
                                          local, num_kv_heads, HEAD_DIM, page_size, hnd_layout);
         dst = k_pages + at;
         const float inv_v = rsqrtf(ss_v / static_cast<float>(HEAD_DIM) + eps);
+        Run vq;
 #pragma unroll
-        for (int i = 0; i < E; ++i) v_pages[at + ln * E + i] = from_f32<bf16>(y[i] * inv_v);
+        for (int i = 0; i < E; ++i) vq.v[i] = from_f32<bf16>(y[i] * inv_v);
+        reinterpret_cast<Run*>(v_pages + at)[ln] = vq;
     }
-#pragma unroll
-    for (int i = 0; i < E; ++i) dst[ln * E + i] = from_f32<bf16>(x[i]);
+    reinterpret_cast<Run*>(dst)[ln] = out;
 }
 
 }  // namespace pie::custom

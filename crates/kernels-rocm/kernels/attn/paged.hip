@@ -155,7 +155,9 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
     }
     __syncthreads();
 
-    const long long row = static_cast<long long>(bx) * p.num_qo_heads;
+    // A split writes its work item's partial row; an unsplit decode the
+    // request's own query row of the plane.
+    const long long row = static_cast<long long>(p.partition ? bx : p.q_indptr[req]) * p.num_qo_heads;
     for (int i = threadIdx.x; i < G * D; i += blockDim.x) {
         const int g = i / D, j = i % D;
         float big = neg_inf();
@@ -410,7 +412,9 @@ __global__ __launch_bounds__(64 * kDecodeMfmaWaves<D>) void paged_decode_mfma(co
         part_l[wave][g] = lsum;
     }
 
-    const long long row = static_cast<long long>(bx) * p.num_qo_heads;
+    // A split writes its work item's partial row; an unsplit decode the
+    // request's own query row of the plane.
+    const long long row = static_cast<long long>(p.partition ? bx : p.q_indptr[req]) * p.num_qo_heads;
 #pragma unroll
     for (int h0 = 0; h0 < G; h0 += HG) {
         if (h0 > 0) __syncthreads();

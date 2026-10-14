@@ -45,9 +45,12 @@ pub fn estimate(
         return Err(refuse(op, "the pool's page size is zero"));
     }
 
+    // A batch whose (request, kv head) blocks already fill the grid reads
+    // each request's kv whole: no partials and no merge, captured or not
+    // (the decision rides the stated batch, which a captured body fixes).
     if u64::from(req.batch_size) * u64::from(gdy) >= u64::from(max_grid_size) {
         return Ok(WorkEstimate {
-            split_kv: req.enable_cuda_graph,
+            split_kv: false,
             kv_chunk_size_in_pages: pages.iter().copied().max().unwrap_or(0).max(1),
             new_batch_size: req.live.requests,
             gdy,
@@ -192,6 +195,10 @@ fn layout(
             16,
             "batch_decode_tmp_s",
         )?);
+    }
+    // The blocks past the live work items exit on the mask: a captured grid
+    // is padded past them, and an unsplit one would otherwise write rows.
+    if sched.split_kv || sched.enable_cuda_graph || padded > sched.new_batch_size as usize {
         info.block_valid_mask_offset =
             Some(ints.alloc(padded, 16, "batch_decode_block_valid_mask")?);
     }
@@ -235,7 +242,7 @@ fn stage(
         )?,
         "batch_decode_kv_chunk_size_ptr",
     )?;
-    if sched.split_kv {
+    if info.block_valid_mask_offset.is_some() {
         staging.put_bools(
             at(info.block_valid_mask_offset),
             (0..sched.padded_batch_size).map(|i| i < sched.new_batch_size as usize),

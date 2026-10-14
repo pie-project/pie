@@ -190,8 +190,16 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         window_reach(window_left, cta_tile_q, group).div_ceil(u64::from(req.page_size))
             <= WINDOW_WHOLE * min_kv_chunk_size
     });
-    let (split_kv, kv_chunk_size_in_pages) = if whole {
-        (false, effective_kv_lens.iter().copied().max().unwrap_or(1).max(1))
+    // Query tiles that already fill the grid (the graph's bound on them,
+    // under capture) read each request's kv whole: a split would only add
+    // partials and their fold. The tiles alone decide, so a captured plan
+    // keeps its layout across replays.
+    let filled = total_num_tiles_q >= u64::from(max_batch_size_if_split);
+    let (split_kv, kv_chunk_size_in_pages) = if whole || filled {
+        (
+            false,
+            effective_kv_lens.iter().copied().max().unwrap_or(1).max(1),
+        )
     } else {
         search_kv_chunk_size(
             req.enable_cuda_graph,

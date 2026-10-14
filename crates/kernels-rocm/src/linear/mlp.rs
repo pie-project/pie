@@ -242,13 +242,23 @@ pub fn geglu_tanh_packed(
     const OP: &str = "linear.mlp_geglu_tanh_packed";
     let t = dtype_dispatch!(OP, packed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
+    // Eight elements a thread in 16-byte packs where the halves allow it.
+    let packs =
+        intermediate.is_multiple_of(8) && packed.ptr.is_multiple_of(16) && y.ptr.is_multiple_of(16);
+    let (entry, launch) = if packs {
+        (
+            format!("::pie::linear::mlp_geglu_tanh_packed_vec8<{t}>"),
+            Launch::grid(
+                [y.rows, (intermediate / 8).div_ceil(BLOCK), 1],
+                [BLOCK, 1, 1],
+            ),
+        )
+    } else {
+        (format!("::pie::linear::mlp_geglu_tanh_packed<{t}>"), launch)
+    };
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!("::pie::linear::mlp_geglu_tanh_packed<{t}>")),
-        )
-        .apply(launch),
+        Fire::at(FILE, symbol(&entry)).apply(launch),
         &[
             packed.arg(),
             y.arg(),

@@ -123,13 +123,6 @@ fn fa2_decode(
     attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
     lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
-    if plan.shape.lane_offset > 0 && !plan.info.split_kv {
-        return Err(refuse(
-            op,
-            "this schedule names fire lanes and did not split kv, so its output rows would be \
-             the launch's own and not the plane's",
-        ));
-    }
 
     let _ = kv::dequant_active(
         ctx,

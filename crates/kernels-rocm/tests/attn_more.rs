@@ -1226,11 +1226,12 @@ fn bench_ple_ngram_ids() {
 fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
-    // 64/128/256 run the wavefront entry, 96 the block entry.
+    // 64/128/256/512 run the wavefront entry, 96 the block entry.
     for (d, rotary, hnd) in [
         (128u32, 128u32, false),
         (64, 32, true),
         (256, 256, false),
+        (512, 128, true),
         (96, 64, true),
     ] {
         let (hq, hk, ps, rows) = (4u32, 2u32, 8u32, 5u32);

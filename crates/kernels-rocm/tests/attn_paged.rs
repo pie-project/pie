@@ -457,11 +457,35 @@ fn attn_paged_wide_heads() {
     // query row a request over caches past and short of the window (whole,
     // unsplit), a wide batch of them (split), and windowed prefills whose
     // tiles straddle tokens.
-    run_prefill_window(&gpu, &mqa, &[1, 1, 1, 1], &[0, 40, 127, 900], 1, Some(128), false);
+    run_prefill_window(
+        &gpu,
+        &mqa,
+        &[1, 1, 1, 1],
+        &[0, 40, 127, 900],
+        1,
+        Some(128),
+        false,
+    );
     run_prefill_window(&gpu, &mqa, &[1; 64], &[600; 64], 7, Some(128), false);
-    run_prefill_window(&gpu, &mqa, &[3, 70, 200], &[300, 0, 31], 1, Some(128), false);
+    run_prefill_window(
+        &gpu,
+        &mqa,
+        &[3, 70, 200],
+        &[300, 0, 31],
+        1,
+        Some(128),
+        false,
+    );
     run_prefill_window(&gpu, &global, &[33, 130], &[100, 900], 1, Some(128), false);
-    run_prefill_window(&gpu, &sliding, &[1200, 70], &[0, 1500], 3, Some(1024), false);
+    run_prefill_window(
+        &gpu,
+        &sliding,
+        &[1200, 70],
+        &[0, 1500],
+        3,
+        Some(1024),
+        false,
+    );
     // Windows long enough to split: the partials' rows count each request's
     // chunks over the window's reach.
     run_prefill_window(&gpu, &mqa, &[1, 2], &[2000, 700], 1, Some(512), false);
@@ -469,4 +493,192 @@ fn attn_paged_wide_heads() {
     run_prefill_window(&gpu, &mqa, &[1, 1, 1], &[0, 40, 900], 1, Some(128), true);
     run_prefill_window(&gpu, &mqa, &[1, 2], &[2000, 700], 1, Some(512), true);
     run_prefill_window(&gpu, &sliding, &[1, 3], &[3000, 5000], 1, Some(1024), false);
+}
+
+/// A decode planned captured, as the engine plans a step, over a bucket of
+/// `kv_lens.len()` lanes of which `live` run (the window's rows; the rest
+/// must stay untouched), at the device's own grid. A bucket whose blocks
+/// fill the grid reads each request whole (no split); a small one splits
+/// and folds its partials under the window.
+fn run_decode_captured(
+    gpu: &Gpu,
+    c: &Case,
+    kv_lens: &[u32],
+    window: Option<u32>,
+    live: std::ops::Range<u32>,
+) {
+    let ctx = gpu.ctx();
+    let device = plan::Device::probe(&ctx).unwrap();
+    let n = kv_lens.len() as u32;
+    let cache = cache(gpu, c, kv_lens, 11);
+    let qv: Vec<f32> = values((n * c.q_heads * c.head_dim) as usize, 5, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let q = RaggedTensor {
+        data: gpu.tensor(&qv, n, c.q_heads * c.head_dim, Dtype::Bf16),
+        indptr: gpu.column(&(0..=n as i32).collect::<Vec<_>>()),
+    };
+    let lanes = live.end - live.start;
+    let shape = plan::Shape {
+        // The bucket the fire states, from its first lane.
+        num_requests: n - live.start,
+        lane_offset: live.start,
+        num_q_heads: c.q_heads,
+        num_kv_heads: c.kv_heads,
+        head_dim: c.head_dim,
+        page_size: c.page_size,
+        hnd_layout: c.hnd,
+    };
+    let seat = plan::Live {
+        requests: lanes,
+        lane_offset: live.start,
+        row_offset: live.start,
+        rows: lanes,
+    };
+    let kv_len: Vec<i32> = kv_lens[live.start as usize..live.end as usize]
+        .iter()
+        .map(|&x| x as i32)
+        .collect();
+    let built = plan::plan_decode(
+        &cache.page_indptr[live.start as usize..],
+        &kv_len,
+        shape,
+        seat,
+        window,
+        true,
+        kernels_rocm::attn::paged::decode_max_grid_size(c.kv_heads, device.num_sm),
+        plan::Toggles::default(),
+        &device,
+        workspace(gpu),
+    )
+    .unwrap();
+    built.stage(&ctx).unwrap();
+    let mut o = gpu.zeros(n, c.q_heads * c.head_dim, Dtype::Bf16);
+    let mut lse = gpu.zeros(n, c.q_heads, Dtype::F32);
+    let win = gpu.ints(&[
+        lanes as i32,
+        live.start as i32,
+        lanes as i32,
+        live.start as i32,
+    ]);
+    ctx.arm_stage(win.ptr);
+    attn::decode_lse(
+        &ctx,
+        q,
+        &built,
+        &cache.pool,
+        window,
+        c.head_dim,
+        0.0,
+        &mut o,
+        &mut lse,
+    )
+    .unwrap();
+    ctx.disarm_stage();
+    let (got, got_lse) = (gpu.read(&o), gpu.read(&lse));
+    let row = (c.q_heads * c.head_dim) as usize;
+    let tag = |r: usize| {
+        format!(
+            "captured decode d{} g{} bucket {n} live {live:?} split={} req {r}",
+            c.head_dim,
+            c.q_heads / c.kv_heads,
+            built.info.split_kv
+        )
+    };
+    for r in 0..n as usize {
+        let have = &got[r * row..(r + 1) * row];
+        if !live.contains(&(r as u32)) {
+            assert!(
+                have.iter().all(|&x| x == 0.0),
+                "{}: a dead row is untouched",
+                tag(r)
+            );
+            continue;
+        }
+        let (want, want_lse) = reference_row(
+            c,
+            &qv[r * row..(r + 1) * row],
+            &cache.keys[r],
+            &cache.vals[r],
+            kv_lens[r] as usize,
+            1,
+            0,
+            window,
+        );
+        close(&tag(r), have, &want, 1.5e-2);
+        close(
+            &format!("{} lse", tag(r)),
+            &got_lse[r * c.q_heads as usize..(r + 1) * c.q_heads as usize],
+            &want_lse,
+            1e-3,
+        );
+    }
+}
+
+/// Gemma 4's decode as a step captures it, at 1, 7, 128 and 512 lanes and
+/// in padded buckets whose window holds a run of their lanes.
+#[test]
+fn attn_paged_captured_decode_rows() {
+    let Some(gpu) = Gpu::open() else { return };
+    let global = Case {
+        q_heads: 32,
+        kv_heads: 4,
+        head_dim: 512,
+        page_size: 16,
+        hnd: false,
+    };
+    let sliding = Case {
+        q_heads: 32,
+        kv_heads: 16,
+        head_dim: 256,
+        page_size: 16,
+        hnd: false,
+    };
+    let lens = |n: u32, top: u32| -> Vec<u32> { (0..n).map(|r| 1 + (r * 7919) % top).collect() };
+    for (c, window) in [(&sliding, Some(1024u32)), (&global, None)] {
+        for (n, top) in [(1u32, 1500u32), (7, 1500), (128, 1300), (512, 160)] {
+            run_decode_captured(&gpu, c, &lens(n, top), window, 0..n);
+        }
+        // A few lanes of a small bucket (split, folded under the window)
+        // and runs inside wide ones (whole).
+        run_decode_captured(&gpu, c, &lens(8, 1500), window, 2..7);
+        run_decode_captured(&gpu, c, &lens(128, 1300), window, 7..107);
+        run_decode_captured(&gpu, c, &lens(512, 160), window, 100..228);
+    }
+}
+
+/// Gemma 4's prefill as a step captures it: chunks whose query tiles fill
+/// the grid run unsplit (no partials to fold), captured or not; a short
+/// chunk over a long prefix still splits.
+#[test]
+fn attn_paged_prefill_rows_fill_the_grid() {
+    let Some(gpu) = Gpu::open() else { return };
+    let global = Case {
+        q_heads: 32,
+        kv_heads: 4,
+        head_dim: 512,
+        page_size: 16,
+        hnd: false,
+    };
+    let sliding = Case {
+        q_heads: 32,
+        kv_heads: 16,
+        head_dim: 256,
+        page_size: 16,
+        hnd: false,
+    };
+    for graph in [false, true] {
+        run_prefill_window(
+            &gpu,
+            &sliding,
+            &[1500, 1100],
+            &[0, 700],
+            113,
+            Some(1024),
+            graph,
+        );
+        run_prefill_window(&gpu, &global, &[1300, 1300], &[0, 500], 211, None, graph);
+        run_prefill_window(&gpu, &global, &[7], &[2000], 1, None, graph);
+    }
 }

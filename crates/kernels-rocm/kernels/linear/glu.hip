@@ -119,6 +119,24 @@ __global__ void mlp_geglu_tanh_packed(const T* __restrict__ packed, T* __restric
     });
 }
 
+// The same over 16-byte packs of eight, for an `I` that is a multiple of 8
+// and 16-byte aligned planes. Grid: (rows, ⌈I / (8 · block)⌉).
+template <class T>
+__global__ void mlp_geglu_tanh_packed_vec8(const T* __restrict__ packed, T* __restrict__ y, i32 I, i32 fan,
+                                           const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x, fan)) return;
+    const i32 k = blockIdx.y * blockDim.x + threadIdx.x;
+    if (k >= I / 8) return;
+    const long long row = window.plane(blockIdx.x, fan);
+    const Pack8<T> g = reinterpret_cast<const Pack8<T>*>(packed + row * 2 * I)[k];
+    const Pack8<T> u = reinterpret_cast<const Pack8<T>*>(packed + row * 2 * I + I)[k];
+    Pack8<T> out;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) out.v[e] = from_f32<T>(gelu_tanh(to_f32(g.v[e])) * to_f32(u.v[e]));
+    reinterpret_cast<Pack8<T>*>(y + row * I)[k] = out;
+}
+
 // y = β·tanh(g/β)·sigmoid(g) · u, the up half capped to β'·tanh(u/β') when
 // β' (`linear_beta`) is positive.
 template <class T>
