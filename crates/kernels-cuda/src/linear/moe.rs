@@ -568,6 +568,24 @@ pub fn select_glu(
     use crate::linear::tc5;
     const OP: &str = "linear.moe_select_glu";
     let fan = selected(OP, x, routes, y)?;
+    // A narrow mxfp4 fire reads its bank faster on the register-dequant
+    // kernel, which lands the GLU too.
+    if let GluBank::Mxfp4 {
+        codes,
+        scales,
+        bias,
+    } = bank
+        && mxfp4_mma_spans(ctx, fan.route_count)
+        && !experts.streams()
+        && x.dtype == Dtype::Bf16
+        && x.width > 0
+        && x.width.is_multiple_of(32)
+    {
+        // A launch that fails leaves the select and the GLU to run apart.
+        return Ok(
+            select_mxfp4_mma(ctx, OP, x, codes, scales, bias, routes, y, &fan, Some(glu)).is_ok(),
+        );
+    }
     let (w, rows, bias, weight_scale, dtype) = match bank {
         GluBank::Bf16(b) => (
             tc5::Operand::plain(b.ptr, tc5::Elem::Bf16),
@@ -973,9 +991,21 @@ pub(crate) fn route_order(
     fan: &Selected,
     experts: u32,
 ) -> Result<RouteOrder, Error> {
+    route_order_sliced(ctx, op, routes, fan, experts, WMMA_ROUTES)
+}
+
+/// [`route_order`] with each work item `slice` routes of one expert.
+fn route_order_sliced(
+    ctx: &Ctx,
+    op: &'static str,
+    routes: Tensor,
+    fan: &Selected,
+    experts: u32,
+    slice: u32,
+) -> Result<RouteOrder, Error> {
     const ORDER_BLOCK: u32 = 1024;
     let offsets_at = (fan.route_count as usize).next_multiple_of(64);
-    let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
+    let work_cap = fan.route_count.div_ceil(slice) + experts;
     let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
     let order = ctx.scratch(
         op,
@@ -994,7 +1024,7 @@ pub(crate) fn route_order(
             ArgValue::Ptr(offsets),
             ArgValue::Ptr(work),
             stated(op, work_cap)?.arg(),
-            WMMA_ROUTES.arg(),
+            slice.arg(),
             fan.top_k.arg(),
             stated(op, fan.route_count)?.arg(),
             stated(op, experts)?.arg(),
@@ -1007,6 +1037,115 @@ pub(crate) fn route_order(
         work,
         work_cap,
     })
+}
+
+/// Whether a fire of `routes` routes is one the register-dequant MMA kernel
+/// takes: from `kernel.moe.mxfp4_mma_from` to `kernel.moe.mxfp4_mma_until`
+/// routes (until 0, never, but where a chip's profile says). Narrower fires
+/// keep the per-route GEMV, wider ones the grouped GEMMs.
+#[cfg(feature = "cuda")]
+fn mxfp4_mma_spans(ctx: &Ctx, routes: u32) -> bool {
+    let t = ctx.tuning();
+    t.mxfp4_mma_from <= routes && routes <= t.mxfp4_mma_until
+}
+
+/// Whether a routed mxfp4 select runs the register-dequant MMA kernel: bf16
+/// activations, resident experts, whole 32-code blocks, and a width
+/// [`mxfp4_mma_spans`] takes.
+#[cfg(feature = "cuda")]
+pub(crate) fn mxfp4_mma_worth(
+    ctx: &Ctx,
+    x: Tensor,
+    y: &Tensor,
+    seat: GroupSeat,
+    fan: &Selected,
+) -> bool {
+    mxfp4_mma_spans(ctx, fan.route_count)
+        && !seat.streams()
+        && x.dtype == Dtype::Bf16
+        && y.dtype == Dtype::Bf16
+        && x.width > 0
+        && x.width.is_multiple_of(32)
+}
+
+/// The routed mxfp4 select on mma.sync, each expert's rows dequantized in
+/// registers (`linear/moe_w4.cuh`); with `glu`, `y` is the GLU of the bank's
+/// gate rows and the up rows after them, half the bank's width.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn select_mxfp4_mma(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    bias: Option<Tensor>,
+    routes: Tensor,
+    y: &mut Tensor,
+    fan: &Selected,
+    glu: Option<crate::linear::tc5::Glu>,
+) -> Result<(), Error> {
+    use crate::linear::tc5::Glu;
+    const THREADS: u32 = 128;
+    let (code, limit, alpha) = match glu {
+        None => (0, 0.0f32, 1.0f32),
+        Some(Glu::Swiglu) => (1, 0.0, 1.0),
+        Some(Glu::SwigluClamp { limit }) => (2, limit, 1.0),
+        Some(Glu::SwigluClampAlpha { limit, alpha }) => (3, limit, alpha),
+        Some(Glu::GegluTanh) => (4, 0.0, 1.0),
+    };
+    // A CTA lands 128 rows, or 64 GLU columns (their gate and up rows).
+    let cols = if glu.is_some() { 64 } else { 128 };
+    let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
+    let experts = codes.rows.clamp(1, EXPERT_CAP);
+    // An expert's slice is 8, 16 or 32 routes: as few 8-route blocks as the
+    // average expert fills.
+    let per = fan.route_count.div_ceil(experts);
+    let nb: u32 = match per {
+        0..=4 => 1,
+        5..=12 => 2,
+        _ => 4,
+    };
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
+    let inter = stated(op, y.width)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(ctx, op, routes, fan, experts, 8 * nb)?;
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/moe_w4.cuh",
+            symbol(&format!(
+                "::pie::linear::moe_select_mxfp4_mma<{nb}, 2, {code}>"
+            )),
+        )
+        .apply(Launch::grid(
+            [work_cap, y.width.div_ceil(cols), 1],
+            [THREADS, 1, 1],
+        )),
+        &[
+            x.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            codes.arg(),
+            scales.arg(),
+            bias.map_or(ArgValue::ABSENT, |bias| bias.arg()),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+            inter.arg(),
+            limit.arg(),
+            alpha.arg(),
+        ],
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1035,6 +1174,13 @@ fn matmul_select_mxfp4(
         "the expert bias rides the activation's dtype"
     );
     let fan = selected(op, x, routes, y)?;
+    // A launch that fails falls back to the arms below.
+    #[cfg(feature = "cuda")]
+    if mxfp4_mma_worth(ctx, x, y, seat, &fan)
+        && select_mxfp4_mma(ctx, op, x, codes, scales, bias, routes, y, &fan, None).is_ok()
+    {
+        return Ok(());
+    }
     #[cfg(feature = "cuda")]
     if !seat.streams()
         && tc5_worth(

@@ -16,3 +16,9 @@ gemm.tc5_glu_from = 64
 # gated delta scan holds; 32 x 4096 tokens take 7.8 ms a layer there where
 # the three wmma launches took about 97 (Qwen3.8-27B's head).
 ssm.gdn_fused_scan = true
+
+# gpt-oss's mxfp4 selects from 64 routes to 1024 dequantize in registers on
+# mma.sync: at decode widths that reads the bank about twice as fast as the
+# tcgen05 GEMM; past 1024 routes the GEMM's reuse wins.
+moe.mxfp4_mma_from  = 64
+moe.mxfp4_mma_until = 1024

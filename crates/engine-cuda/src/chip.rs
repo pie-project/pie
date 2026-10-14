@@ -338,6 +338,8 @@ mod tests {
                         moe_tc5: defaults.moe_tc5,
                         gemm_tc5_glu_from: defaults.gemm_tc5_glu_from,
                         ssm_gdn_fused_scan: false,
+                        mxfp4_mma_until: defaults.mxfp4_mma_until,
+                        mxfp4_mma_from: defaults.mxfp4_mma_from,
                         ..tuning
                     },
                     defaults,
@@ -456,6 +458,7 @@ mod tests {
         let b200 = tuning(10, 0, 148);
         assert!(b200.moe_tc5);
         assert_eq!(b200.gemm_tc5_glu_from, 64);
+        assert_eq!((b200.mxfp4_mma_from, b200.mxfp4_mma_until), (64, 1024));
         for (major, minor) in [
             (8, 0),
             (8, 6),
@@ -472,6 +475,10 @@ mod tests {
             assert_eq!(
                 other.gemm_tc5_glu_from, 65_536,
                 "sm_{major}{minor} keeps the GLU apart"
+            );
+            assert_eq!(
+                other.mxfp4_mma_until, 0,
+                "sm_{major}{minor} keeps the mxfp4 GEMV"
             );
         }
     }

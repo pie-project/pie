@@ -34,6 +34,19 @@ pub struct MoeTc5;
 #[decision(id = "kernel.moe.tc5_from", constant(range(1..=65_536)), default = 16, tune = search)]
 pub struct MoeTc5From(pub u32);
 
+/// The most routes a routed mxfp4 select (bf16 activations) runs on the
+/// register-dequant MMA kernel with; 0 (never) but where a chip's profile
+/// says (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMxfp4MmaUntil(pub u32);
+
+/// The fewest routes a routed mxfp4 select runs on the register-dequant MMA
+/// kernel with (up to `kernel.moe.mxfp4_mma_until`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_mma_from", constant(range(1..=65_536)), default = 64, tune = search)]
+pub struct MoeMxfp4MmaFrom(pub u32);
+
 /// The fewest rows a dense gate-up projection lands its GLU from the
 /// tcgen05 GEMM's epilogue at; fewer keep the skinny kernel or the GEMM and
 /// the GLU apart. 65536 (never) but where a chip's profile says (B200's).
@@ -201,7 +214,9 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeTc5>()
         .add::<MoeTc5From>()
         .add::<GemmTc5GluFrom>()
-        .add::<SsmGdnFusedScan>();
+        .add::<SsmGdnFusedScan>()
+        .add::<MoeMxfp4MmaUntil>()
+        .add::<MoeMxfp4MmaFrom>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -237,6 +252,8 @@ pub struct Tuning {
     pub moe_tc5_from: u32,
     pub gemm_tc5_glu_from: u32,
     pub ssm_gdn_fused_scan: bool,
+    pub mxfp4_mma_until: u32,
+    pub mxfp4_mma_from: u32,
 }
 
 impl Tuning {
@@ -270,6 +287,8 @@ impl Tuning {
         moe_tc5_from: 16,
         gemm_tc5_glu_from: 65_536,
         ssm_gdn_fused_scan: false,
+        mxfp4_mma_until: 0,
+        mxfp4_mma_from: 64,
     };
 
     #[must_use]
@@ -303,6 +322,8 @@ impl Tuning {
             moe_tc5_from: profile.get::<MoeTc5From>().0,
             gemm_tc5_glu_from: profile.get::<GemmTc5GluFrom>().0,
             ssm_gdn_fused_scan: profile.on::<SsmGdnFusedScan>(&Anywhere),
+            mxfp4_mma_until: profile.get::<MoeMxfp4MmaUntil>().0,
+            mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,
         }
     }
 }

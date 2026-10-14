@@ -125,7 +125,7 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
         let only: Option<usize> = std::env::var("PIE_TC5_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok());
-        for tokens in [1usize, 16, 128, 1024, 8192] {
+        for tokens in [1usize, 16, 64, 128, 1024, 8192] {
             if only.is_some_and(|t| t != tokens) {
                 continue;
             }
@@ -222,11 +222,21 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
                     }),
                     Err(why) => panic!("{name} {}: {why}", kind.name),
                 };
+                // The weight bytes the routed experts hold, read once.
+                let hit = routings
+                    .iter()
+                    .map(|c| c.iter().filter(|&&x| x > 0).count())
+                    .sum::<usize>() as f64
+                    / routings.len() as f64;
+                let w_bytes = hit
+                    * (Kind::bytes(kind.w.0, n * k) + kind.w.1.map_or(0, |g| n * k / g as usize))
+                        as f64;
                 cells.push(format!(
-                    "{} {:.1}us {:.0}TF",
+                    "{} {:.1}us {:.0}TF {:.0}GB/s",
                     if masked { "masked" } else { "contiguous" },
                     us,
-                    flops / us * 1e-6
+                    flops / us * 1e-6,
+                    w_bytes / us * 1e-3
                 ));
                 // A gate_up's fused form: the SwiGLU of the halves, landed as
                 // the down projection's quantized operand.
