@@ -26,15 +26,17 @@ pub struct Stamp {
 }
 
 impl Stamp {
-    /// The width measured on the B200: Gemma 4's 256-wide sliding layers
-    /// (two query heads a KV head), at the smallest block that keeps one tile
-    /// in flight a warp beside the one it reads, so two blocks share an SM.
-    /// gpt-oss's 64-wide groups read no faster end to end than through the
-    /// prefill and FA2 kernels, and lose a little at one request; Gemma's
-    /// 512-wide global layers read faster through the prefill kernel.
+    /// The widths measured on the B200, each at the smallest block that
+    /// keeps one tile in flight a warp beside the one it reads, so several
+    /// blocks share an SM: Gemma 4's 256-wide sliding layers (two query heads
+    /// a KV head) and gpt-oss's 64-wide groups of eight (from
+    /// `kernel.sdpa.decode.xqa_from_64` requests: narrower, the FA2 decode
+    /// reads them faster). Gemma's 512-wide global layers read faster
+    /// through the prefill kernel.
     #[must_use]
     pub const fn of(head_dim: u32) -> Option<Self> {
         let (mt, warps, stages) = match head_dim {
+            64 => (1, 4, 2),
             256 => (1, 3, 2),
             _ => return None,
         };
@@ -66,11 +68,35 @@ impl Stamp {
     }
 }
 
-/// Whether the profile and the device take the tensor-core decode for a
-/// plan of this width and group (the pool's own checks aside).
-#[must_use]
-pub fn stamps(xqa: bool, head_dim: u32, group: u32) -> bool {
-    xqa && (1..=8).contains(&group) && Stamp::of(head_dim).is_some()
+/// The profile's reading of the tensor-core decode: whether it is on, and
+/// the fewest requests its 64-wide stamp takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Gate {
+    pub on: bool,
+    pub from_64: u32,
+}
+
+impl Gate {
+    #[must_use]
+    pub const fn of(tuning: crate::tuning::Tuning) -> Self {
+        Self {
+            on: tuning.decode_xqa,
+            from_64: tuning.decode_xqa_from_64,
+        }
+    }
+
+    /// Whether a plan of this width and group may take the tensor-core
+    /// decode at some batch (the pool's own checks aside).
+    #[must_use]
+    pub fn stamps(self, head_dim: u32, group: u32) -> bool {
+        self.on && (1..=8).contains(&group) && Stamp::of(head_dim).is_some()
+    }
+
+    /// Whether a plan of this width, group and request count takes it.
+    #[must_use]
+    pub fn takes(self, head_dim: u32, group: u32, requests: u32) -> bool {
+        self.stamps(head_dim, group) && (head_dim != 64 || requests >= self.from_64)
+    }
 }
 
 /// Whether this decode takes the tensor-core kernel.
@@ -78,7 +104,7 @@ pub fn stamps(xqa: bool, head_dim: u32, group: u32) -> bool {
 pub fn takes(ctx: &Ctx, plan: &DecodePlan, pool: &KvPool, rel: bool) -> bool {
     let group = plan.shape.group_size();
     let head_dim = plan.shape.head_dim;
-    stamps(ctx.tuning().decode_xqa, head_dim, group)
+    Gate::of(ctx.tuning()).takes(head_dim, group, plan.shape.num_requests)
         && !rel
         && plan.shape.num_kv_heads * group == plan.shape.num_q_heads
         && !plan.shape.hnd_layout
@@ -164,16 +190,21 @@ pub fn decode(
 mod tests {
     use super::*;
 
-    /// The stamp fits a B200 block (an sm_86 one does not, and such a card
-    /// keeps the FA2 decode), and only the stamped width and groups of at
-    /// most eight take the kernel.
+    /// Each stamp fits a B200 block, the 64-wide an sm_86 one too, and only
+    /// the stamped widths, groups of at most eight and, at 64 wide, batches of
+    /// `xqa_from_64` requests take the kernel.
     #[test]
     fn each_stamp_states_what_its_block_holds() {
-        let stamp = Stamp::of(256).expect("stamped");
-        assert!(stamp.smem() <= 232_448 && stamp.smem() > 101_376);
-        assert_eq!(Stamp::of(64), None);
+        assert!(Stamp::of(64).expect("stamped").smem() <= 101_376);
+        assert!(Stamp::of(256).expect("stamped").smem() <= 232_448);
         assert_eq!(Stamp::of(512), None);
-        assert!(stamps(true, 256, 2));
-        assert!(!stamps(false, 256, 2) && !stamps(true, 256, 16) && !stamps(true, 64, 8));
+        let gate = Gate {
+            on: true,
+            from_64: 16,
+        };
+        assert!(gate.takes(256, 2, 1) && gate.takes(64, 8, 16));
+        assert!(!gate.takes(64, 8, 15) && !gate.takes(256, 16, 64) && !gate.takes(512, 8, 64));
+        assert!(gate.stamps(64, 8));
+        assert!(!Gate::default().stamps(256, 2));
     }
 }

@@ -50,6 +50,10 @@ sdpa.decode.grouped_prefill_lse = true
 # and Gemma-4-31B decodes a step at 64 requests in 21.70 ms where it took
 # 25.97 (13.23 / 13.51 at eight, 12.84 / 12.96 at one).
 sdpa.decode.xqa = true
+# gpt-oss's 64-wide sliding layers (groups of eight; its full-attention rows
+# read through the prefill kernel) take it from 16 requests; narrower, the
+# FA2 decode reads them faster.
+sdpa.decode.xqa_from_64 = 16
 # A dense projection's bias from the cuBLASLt epilogue, not a separate add
 # (gpt-oss's qkv and o: about 0.44 ms a bs64 decode step).
 gemm.bias_epilogue = true

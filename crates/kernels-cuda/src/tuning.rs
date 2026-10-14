@@ -246,6 +246,12 @@ pub struct DecodeGroupedPrefillLse;
 #[decision(id = "kernel.sdpa.decode.xqa", flag, default = false, tune = search)]
 pub struct DecodeXqa;
 
+/// The fewest requests a 64-wide decode takes the tensor-core kernel at;
+/// narrower, the FA2 decode reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.xqa_from_64", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct DecodeXqaFrom64(pub u32);
+
 /// Whether a split attention's partial states fold a warp a (row, head)
 /// rather than through the staged persistent merge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -291,6 +297,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeGroupedPrefillFrom>()
         .add::<DecodeGroupedPrefillLse>()
         .add::<DecodeXqa>()
+        .add::<DecodeXqaFrom64>()
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<GemmNarrowN>();
@@ -338,6 +345,7 @@ pub struct Tuning {
     pub decode_grouped_prefill_from: u32,
     pub decode_grouped_prefill_lse: bool,
     pub decode_xqa: bool,
+    pub decode_xqa_from_64: u32,
     pub selected_mma: bool,
     pub index_mma: bool,
     pub gemm_narrow_n: u32,
@@ -383,6 +391,7 @@ impl Tuning {
         decode_grouped_prefill_from: 0,
         decode_grouped_prefill_lse: false,
         decode_xqa: false,
+        decode_xqa_from_64: 0,
         selected_mma: false,
         index_mma: false,
         gemm_narrow_n: 0,
@@ -428,6 +437,7 @@ impl Tuning {
             decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,
             decode_grouped_prefill_lse: profile.on::<DecodeGroupedPrefillLse>(&Anywhere),
             decode_xqa: profile.on::<DecodeXqa>(&Anywhere),
+            decode_xqa_from_64: profile.get::<DecodeXqaFrom64>().0,
             selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),
             index_mma: profile.on::<SdpaIndexMma>(&Anywhere),
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,

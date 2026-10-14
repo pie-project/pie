@@ -255,7 +255,7 @@ pub struct Toggles {
 
     pub static_max_requests: u32,
 
-    pub xqa: bool,
+    pub xqa: crate::attn::xqa::Gate,
 }
 
 impl Toggles {
@@ -267,7 +267,7 @@ impl Toggles {
             chunk_floor_128: tuning.decode_chunk_floor_128,
             prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
             static_max_requests: tuning.decode_static_max_requests,
-            xqa: tuning.decode_xqa,
+            xqa: crate::attn::xqa::Gate::of(tuning),
         }
     }
 }
@@ -339,7 +339,13 @@ pub fn plan_decode(
     // The tensor-core decode's block holds a whole stamp of key tiles; its
     // split fills the SMs once, not the FA2 kernel's occupancy.
     let max_grid_size = match crate::attn::xqa::Stamp::of(shape.head_dim) {
-        Some(stamp) if toggles.xqa && (1..=8).contains(&shape.group_size()) => stamp.grid(device),
+        Some(stamp)
+            if toggles
+                .xqa
+                .takes(shape.head_dim, shape.group_size(), shape.num_requests) =>
+        {
+            stamp.grid(device)
+        }
         _ => max_grid_size,
     };
     let windowed_split = toggles.window_split && window_left >= 0;

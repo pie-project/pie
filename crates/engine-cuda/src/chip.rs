@@ -393,6 +393,11 @@ mod tests {
                 assert_eq!(tuning.gemm_bias_epilogue, b200, "{gpu}");
                 assert_eq!(tuning.decode_xqa, b200, "{gpu}");
                 assert_eq!(
+                    tuning.decode_xqa_from_64,
+                    if b200 { 16 } else { 0 },
+                    "{gpu}"
+                );
+                assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
                         mla_naive: false,
@@ -408,6 +413,7 @@ mod tests {
                         gemm_bias_epilogue: false,
                         decode_grouped_prefill_lse: false,
                         decode_xqa: false,
+                        decode_xqa_from_64: 0,
                         ..tuning
                     },
                     defaults,
