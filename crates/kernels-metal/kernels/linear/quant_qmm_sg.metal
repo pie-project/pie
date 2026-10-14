@@ -10,14 +10,17 @@ using namespace metal;
 //   0x4300 into a word's halves;
 // - one chain per 64 codes (one scale, one bias), closed in fp32 as
 //   s * chain + (b - 128 s) * sum, where sum is the row's sum of those inputs;
-// - the threadgroup stages up to 1024 of the rows' inputs at a time,
-//   transposed, with their sums, for its four simdgroups, while each lane's
-//   next 256 codes load during this span's MMAs.
+// - the rows' inputs are laid out once per matmul (`qmm_sg_table`) in the
+//   order the lanes take them, with their sums, so a lane reads its 16 inputs
+//   of a 64-code group as one load and no threadgroup stages them;
+// - a lane reads its two words of a 64-code group (one scale, one bias) as
+//   one 8-byte load per fragment, its next group's while this one's MMAs run.
 // A threadgroup is 4 simdgroups of 16 columns; a lane holds column fm of each
-// 8-column fragment and reads word fn / 2 of its 32-code group, whose pair p
-// (codes p and p + 4 of the word) is its operand of fragment p. The inputs
-// follow that order. `SPLIT` is the grid's y extent: partitions of the
-// contraction, written to `partials` and folded by the split-k reduce.
+// 8-column fragment and reads words 2c and 2c + 1 (c = fn / 2) of its 64-code
+// group, whose pair p (codes p and p + 4 of word 2c + j) is its operand of
+// MMA step (j, p): the step's eight k are the four lanes' pairs, all of one
+// group. `SPLIT` is the grid's y extent: partitions of the contraction,
+// written to `partials` and folded by the split-k reduce.
 
 namespace qmm_sg {
 
@@ -39,130 +42,119 @@ __attribute__((always_inline)) inline void mma(thread float2 &c, bfloat2 a, bflo
 }
 
 constant constexpr int kSpan = 256;
-constant constexpr int kGroups = kSpan / 32;
-// Spans staged at once: one barrier pair per 1024 inputs.
-constant constexpr int kStage = 4;
 
 } // namespace qmm_sg
+
+// The rows' inputs as the tile's lanes take them: for each 64-code group h and B-operand lane
+// slot (fm, c), the 16 inputs of rows 2c and 2c + 1 at MMA steps (j, p) = 0..1 x 0..3, which sit
+// at k = 64h + 8(2c' + j) + p + 4i for the A lane c' = fm / 2 that pairs with B row fm (i = fm % 2);
+// then each row's sum of each 32 inputs, [group][row], at `table` + 8 * width.
+[[kernel]] void qmm_sg_table(const device bfloat *input [[buffer(0)]], device bfloat *table [[buffer(1)]],
+                             constant int &width [[buffer(2)]], constant int &rows [[buffer(3)]],
+                             uint2 at [[thread_position_in_grid]]) {
+  const uint h = at.x, slot = at.y;
+  const uint fm = slot >> 2, c = slot & 3;
+  const uint cp = fm >> 1, i = fm & 1;
+  vec<bfloat, 16> v;
+#pragma unroll
+  for (int j = 0; j < 2; ++j)
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      const uint k = 64 * h + 8 * (2 * cp + j) + p + 4 * i;
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        const int row = 2 * c + r;
+        v[8 * j + 2 * p + r] = row < rows ? input[ulong(row) * width + k] : bfloat(0.0f);
+      }
+    }
+  reinterpret_cast<device vec<bfloat, 16> *>(table)[ulong(h) * 32 + slot] = v;
+  if (slot < 8) {
+    device float *sums = reinterpret_cast<device float *>(table + 8 * ulong(width));
+    const int row = slot;
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int q = 0; q < 32; ++q)
+        sum += row < rows ? float(input[ulong(row) * width + 64 * h + 32 * g + q]) : 0.0f;
+      sums[(2 * ulong(h) + g) * 8 + row] = sum;
+    }
+  }
+}
 
 template <int SPLIT>
 [[kernel]] void
 affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
-              const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
+              const device bfloat *biases [[buffer(2)]], const device bfloat *table [[buffer(3)]],
               device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
               constant int &columns [[buffer(6)]], device float *partials [[buffer(7)]],
               constant int &rows [[buffer(8)]], constant int &stride [[buffer(9)]],
               uint2 position [[threadgroup_position_in_grid]],
-              uint tid [[thread_index_in_threadgroup]],
               uint lane [[thread_index_in_simdgroup]],
               uint simd [[simdgroup_index_in_threadgroup]]) {
   using namespace qmm_sg;
   constexpr int NF = 2; // 8-column fragments a simdgroup holds
-  // Up to kStage spans of the rows' inputs as [k][row], and their rows' sums of each 32
-  // inputs as [group][row].
-  threadgroup bfloat xt[kStage * kSpan * 8];
-  threadgroup float xs[kStage * kGroups * 8];
-
   const uint qid = lane >> 2;
   const uint fm = (qid & 4) | ((lane >> 1) & 3);
   const uint fn = ((qid & 2) << 1) | ((lane & 1) << 1);
   const uint c = fn >> 1;
   const uint column = position.x * 32 * NF + simd * 8 * NF + fm;
   const ulong words = ulong(stride) / 8, groups = ulong(stride) / 64;
-  const device uint *w0 = weights + ulong(column) * words + c;
+  const device uint2 *w0 = reinterpret_cast<const device uint2 *>(weights + ulong(column) * words) + c;
+  const ulong apart = 8 * words / 2; // uint2s between the two fragments
   const device bfloat *s0 = scales + ulong(column) * groups, *b0 = biases + ulong(column) * groups;
-  // The physical k, within a 32-code group, of this lane's input row fm of fragment p is
-  // kp + p: logical k 2j and 2j + 1 of a fragment are codes 8j + p and 8j + p + 4.
-  const uint kp = 8 * (fm >> 1) + 4 * (fm & 1);
-
-  // Staging: thread t loads 16 inputs of row t / 16 at 16 (t % 16) of each span.
-  const uint srow = tid / 16, sseg = tid % 16;
-  const bool live = int(srow) < rows;
-  const device bfloat *xin = input + ulong(min(int(srow), rows - 1)) * width + sseg * 16;
-
+  const device vec<bfloat, 16> *xt =
+      reinterpret_cast<const device vec<bfloat, 16> *>(table) + fm * 4 + c;
+  const device float *sums = reinterpret_cast<const device float *>(table + 8 * ulong(width));
   const int spans = width / kSpan / SPLIT;
-  const int first = int(position.y) * spans, last = first + spans;
+  const int first = int(position.y) * spans * 4, last = first + spans * 4;
   float2 acc[NF];
+  uint2 q[NF];
+  float qs[NF], qb[NF];
 #pragma unroll
-  for (int f = 0; f < NF; ++f)
+  for (int f = 0; f < NF; ++f) {
     acc[f] = float2(0.0f);
-  uint q[NF][kGroups];
-  float2 kc[NF][kGroups / 2];
-  const auto fetch = [&](int span) __attribute__((always_inline)) {
+    q[f] = w0[f * apart + ulong(first) * 4];
+    qs[f] = float(s0[8 * f * groups + first]);
+    qb[f] = float(b0[8 * f * groups + first]);
+  }
+  for (int h = first; h < last; ++h) {
+    uint2 cw[NF];
+    float2 ck[NF];
 #pragma unroll
-    for (int f = 0; f < NF; ++f)
-#pragma unroll
-      for (int g = 0; g < kGroups; ++g)
-        q[f][g] = w0[8 * f * words + (span * kGroups + g) * 4];
-#pragma unroll
-    for (int f = 0; f < NF; ++f)
-#pragma unroll
-      for (int g = 0; g < kGroups / 2; ++g) {
-        const float a = float(s0[8 * f * groups + span * 4 + g]);
-        kc[f][g] = float2(a, fma(-128.0f, a, float(b0[8 * f * groups + span * 4 + g])));
-      }
-  };
-  fetch(first);
-  for (int chunk = first; chunk < last; chunk += kStage) {
-    const int n = min(kStage, last - chunk);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int j = 0; j < n; ++j) {
-      const vec<bfloat, 8> lo = *reinterpret_cast<const device vec<bfloat, 8> *>(xin + (chunk + j) * kSpan);
-      const vec<bfloat, 8> hi = *reinterpret_cast<const device vec<bfloat, 8> *>(xin + (chunk + j) * kSpan + 8);
-      threadgroup bfloat *into = xt + j * kSpan * 8;
-      float sum = 0.0f;
-#pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        const bfloat a = live ? lo[i] : bfloat(0.0f), b = live ? hi[i] : bfloat(0.0f);
-        into[(sseg * 16 + i) * 8 + srow] = a;
-        into[(sseg * 16 + 8 + i) * 8 + srow] = b;
-        sum += float(a) + float(b);
-      }
-      sum += simd_shuffle_xor(sum, 1u);
-      if ((sseg & 1) == 0)
-        xs[(j * kGroups + (sseg >> 1)) * 8 + srow] = sum;
+    for (int f = 0; f < NF; ++f) {
+      cw[f] = q[f];
+      ck[f] = float2(qs[f], fma(-128.0f, qs[f], qb[f]));
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int j = 0; j < n; ++j) {
-      uint cq[NF][kGroups];
-      float2 ck[NF][kGroups / 2];
+    if (h + 1 < last) {
 #pragma unroll
       for (int f = 0; f < NF; ++f) {
-#pragma unroll
-        for (int g = 0; g < kGroups; ++g)
-          cq[f][g] = q[f][g];
-#pragma unroll
-        for (int g = 0; g < kGroups / 2; ++g)
-          ck[f][g] = kc[f][g];
+        q[f] = w0[f * apart + ulong(h + 1) * 4];
+        qs[f] = float(s0[8 * f * groups + h + 1]);
+        qb[f] = float(b0[8 * f * groups + h + 1]);
       }
-      if (chunk + j + 1 < last)
-        fetch(chunk + j + 1);
-      threadgroup const bfloat *from = xt + j * kSpan * 8;
-      threadgroup const float *sums = xs + j * kGroups * 8;
-      // One chain per 64 codes (one scale and bias), two 32-code groups.
+    }
+    const vec<bfloat, 16> x = xt[ulong(h) * 32];
+    // One chain per 64 codes (one scale and bias).
+    float2 d[NF];
 #pragma unroll
-      for (int h = 0; h < kGroups / 2; ++h) {
-        float2 d[NF];
+    for (int f = 0; f < NF; ++f)
+      d[f] = float2(0.0f);
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+      for (uint p = 0; p < 4; ++p) {
+        const bfloat2 b = bfloat2(x[8 * j + 2 * p], x[8 * j + 2 * p + 1]);
 #pragma unroll
         for (int f = 0; f < NF; ++f)
-          d[f] = float2(0.0f);
-#pragma unroll
-        for (int g = 2 * h; g < 2 * h + 2; ++g)
-#pragma unroll
-          for (uint p = 0; p < 4; ++p) {
-            const bfloat2 x = *reinterpret_cast<threadgroup const bfloat2 *>(from + (g * 32 + kp + p) * 8 + fn);
-#pragma unroll
-            for (int f = 0; f < NF; ++f)
-              mma(d[f], as_type<bfloat2>(((cq[f][g] >> (4 * p)) & 0x000F000Fu) | 0x43004300u), x);
-          }
-        const float2 sm = *reinterpret_cast<threadgroup const float2 *>(sums + 2 * h * 8 + fn) +
-                          *reinterpret_cast<threadgroup const float2 *>(sums + (2 * h + 1) * 8 + fn);
-#pragma unroll
-        for (int f = 0; f < NF; ++f) {
-          acc[f] = fma(d[f], ck[f][h].x, acc[f]);
-          acc[f] = fma(sm, ck[f][h].y, acc[f]);
-        }
+          mma(d[f], as_type<bfloat2>(((cw[f][j] >> (4 * p)) & 0x000F000Fu) | 0x43004300u), b);
       }
+    const float2 sm = *reinterpret_cast<const device float2 *>(sums + 2 * ulong(h) * 8 + fn) +
+                      *reinterpret_cast<const device float2 *>(sums + (2 * ulong(h) + 1) * 8 + fn);
+#pragma unroll
+    for (int f = 0; f < NF; ++f) {
+      acc[f] = fma(d[f], ck[f].x, acc[f]);
+      acc[f] = fma(sm, ck[f].y, acc[f]);
     }
   }
 #pragma unroll
@@ -185,4 +177,4 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
   template [[host_name(name)]] [[kernel]] void affine_qmm_sg<split>(                               \
       const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
       device bfloat *, constant int &, constant int &, device float *, constant int &,             \
-      constant int &, uint2, uint, uint, uint);
+      constant int &, uint2, uint, uint);
