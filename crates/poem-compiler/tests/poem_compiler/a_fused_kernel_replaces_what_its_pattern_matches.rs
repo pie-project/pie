@@ -231,6 +231,72 @@ fn a_yarn_rotation_and_its_cache_write_fold_into_one_op() {
     }
 }
 
+/// gpt-oss's packed q/k/v row, split, rotated and written, folds into one
+/// op reading the packed row; with the split left to read elsewhere, the
+/// rotation and write fold as they did.
+#[test]
+fn a_split_rotation_and_its_cache_write_fold_into_one_op() {
+    let packed_write = |interleaved: bool, split_read: bool| {
+        trace(move |p| {
+            let positions = p.indices("positions");
+            let packed = p.rows("packed", 768);
+            let (q, k, v) = layout::split_qkv(&packed, 512, 128);
+            let (qr, kr) = elemwise::rope_yarn(
+                &q, &k, &positions, 64, 150_000.0, 32.0, 32.0, 1.0, 1.3, 4096, interleaved,
+            );
+            attn::kv_append(
+                &kr,
+                &v,
+                p.cache("kv"),
+                &p.rows("write_page", 1),
+                &p.rows("write_offset", 1),
+            );
+            elemwise::silu(&qr);
+            if split_read {
+                elemwise::silu(&v);
+            }
+        })
+    };
+    let kernels = [
+        "elementwise.split_rope_yarn_append",
+        "elementwise.rope_yarn_append",
+    ];
+    for interleaved in [false, true] {
+        let fused = fuse(packed_write(interleaved, false), &kernels);
+        assert_eq!(
+            ops(&fused),
+            ["elementwise.split_rope_yarn_append", "elementwise.silu"]
+        );
+        let Some(poem_ir::Operation::Fused(poem_ir::Fused::SplitRopeYarnAppend {
+            q_width,
+            kv_width,
+            head_dim,
+            theta,
+            original_max_position,
+            interleaved: carried,
+            ..
+        })) = fused.nodes.first().map(|node| &node.op)
+        else {
+            panic!("the first op is the fused split rotation");
+        };
+        assert_eq!(
+            (*q_width, *kv_width, *head_dim, *theta, *original_max_position, *carried),
+            (512, 128, 64, 150_000.0, 4096, interleaved)
+        );
+    }
+    let fused = fuse(packed_write(false, true), &kernels);
+    assert_eq!(
+        ops(&fused),
+        [
+            "layout.split_qkv",
+            "elementwise.rope_yarn_append",
+            "elementwise.silu",
+            "elementwise.silu"
+        ],
+        "a split read past the rotation stays a split"
+    );
+}
+
 /// gpt-oss's sinks fold onto the log-sum-exp attention before them, decode
 /// and prefill alike, carrying the attention whole; a log-sum-exp read past
 /// the sink keeps the pair apart.

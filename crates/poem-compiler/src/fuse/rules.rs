@@ -29,6 +29,7 @@ pub(super) fn all() -> Vec<Rule> {
         gated_residual_norm_modulate(),
         norm_modulate(),
         rmsnorm_rope_partial_q(),
+        split_rope_yarn_append(),
         rope_yarn_append(),
         lse_sink(),
     ]
@@ -73,6 +74,73 @@ fn lse_sink() -> Rule {
             head_dim: m.u32("d"),
             o_out: m.value("o_out"),
         }
+    })
+}
+
+/// A packed q/k/v row split, YaRN over its q and k, and the rotated k
+/// written to the cache with its v: what `rope_yarn_append` does, reading the
+/// three from the packed row rather than from a split's copies.
+fn split_rope_yarn_append() -> Rule {
+    let pattern = template(|p| {
+        let packed = p.rows("packed", 3 * W);
+        let (q, k, v) = layout::split_qkv(&packed, p.u32("q_width"), p.u32("kv_width"));
+        p.name("k_split", &k);
+        p.name("v_split", &v);
+        let positions = p.indices("positions");
+        p.free("interleaved");
+        let (q, k) = elemwise::rope_yarn(
+            &q,
+            &k,
+            &positions,
+            p.u32("d"),
+            p.f32("theta"),
+            p.f32("factor"),
+            p.f32("beta_fast"),
+            p.f32("beta_slow"),
+            p.f32("attention_factor"),
+            p.u32("original_max_position"),
+            false,
+        );
+        let cache = p.cache("cache");
+        let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
+        attn::kv_append(&k, &v, cache, &write_page, &write_offset);
+        p.export("q_out", &q);
+    });
+    Rule::new("elementwise.split_rope_yarn_append", [pattern], |m| {
+        Fused::SplitRopeYarnAppend {
+            packed: m.value("packed"),
+            q_width: m.u32("q_width"),
+            kv_width: m.u32("kv_width"),
+            positions: m.value("positions"),
+            head_dim: m.u32("d"),
+            theta: m.f32("theta"),
+            factor: m.f32("factor"),
+            beta_fast: m.f32("beta_fast"),
+            beta_slow: m.f32("beta_slow"),
+            attention_factor: m.f32("attention_factor"),
+            original_max_position: m.u32("original_max_position"),
+            interleaved: matches!(
+                m.op("q_out"),
+                Operation::Elementwise(Elementwise::RopeYarn {
+                    interleaved: true,
+                    ..
+                })
+            ),
+            cache: m.value("cache"),
+            write_page: m.value("write_page"),
+            write_offset: m.value("write_offset"),
+            q_out: m.value("q_out"),
+            k_out: m.value("k_split"),
+            v_out: m.value("v_split"),
+        }
+    })
+    .when(|m| {
+        let d = m.u32("d");
+        m.dtype("packed") == Some(Dtype::Bf16)
+            && d > 0
+            && d % 2 == 0
+            && m.u32("q_width") % d == 0
+            && m.u32("kv_width") % d == 0
     })
 }
 

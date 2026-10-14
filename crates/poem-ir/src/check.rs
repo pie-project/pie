@@ -871,6 +871,9 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Fused::RopeYarnAppend { .. } => {
                 &[(In(3), I32), (In(4), CACHE), (In(5), I32), (In(6), I32)]
             }
+            Fused::SplitRopeYarnAppend { .. } => {
+                &[(In(1), I32), (In(2), CACHE), (In(3), I32), (In(4), I32)]
+            }
             // The attention's own, and the sink's f32 log-sum-exp is its.
             Fused::LseSink { attn, .. } => match **attn {
                 Attention::DecodeLse { .. } => {

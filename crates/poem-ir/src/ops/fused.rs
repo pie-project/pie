@@ -185,6 +185,31 @@ pub enum Fused {
         q_out: ValueId,
         k_out: ValueId,
     },
+    /// A packed q/k/v row split (`split_qkv`), YaRN over its q and k, and
+    /// the rotated k with its v landed in the paged cache (`kv_append`):
+    /// `RopeYarnAppend` reading its three straight from the packed row.
+    /// `k_out` and `v_out` (the split's k and v) are read by nothing else; a
+    /// backend may leave them unwritten.
+    SplitRopeYarnAppend {
+        packed: ValueId,
+        q_width: u32,
+        kv_width: u32,
+        positions: ValueId,
+        head_dim: u32,
+        theta: f32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        attention_factor: f32,
+        original_max_position: u32,
+        interleaved: bool,
+        cache: ValueId,
+        write_page: ValueId,
+        write_offset: ValueId,
+        q_out: ValueId,
+        k_out: ValueId,
+        v_out: ValueId,
+    },
     /// A routed MLP: the gate-up select and its GLU (as in `MoeSelectGlu`),
     /// the down select of the GLU on the same routes, and the weighted sum
     /// of its rows a token (`MoeWeightedSum`), and where it follows, the
@@ -287,6 +312,14 @@ impl Operands for Fused {
                 write_offset,
                 ..
             } => sink.extend([*q, *k, *v, *positions, *cache, *write_page, *write_offset]),
+            Self::SplitRopeYarnAppend {
+                packed,
+                positions,
+                cache,
+                write_page,
+                write_offset,
+                ..
+            } => sink.extend([*packed, *positions, *cache, *write_page, *write_offset]),
             Self::LseSink {
                 attn, sink: sinks, ..
             } => {
@@ -391,6 +424,12 @@ impl Operands for Fused {
                 glu.outputs(sink);
             }
             Self::RopeYarnAppend { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
+            Self::SplitRopeYarnAppend {
+                q_out,
+                k_out,
+                v_out,
+                ..
+            } => sink.extend([*q_out, *k_out, *v_out]),
             Self::LseSink { attn, o_out, .. } => {
                 attn.outputs(sink);
                 sink.push(*o_out);
@@ -436,6 +475,7 @@ impl Operands for Fused {
             | Self::MlpSwiglu { .. }
             | Self::MoeSelectGlu { .. }
             | Self::MoeExperts { .. }
+            | Self::SplitRopeYarnAppend { .. }
             | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
         }
     }
@@ -457,6 +497,7 @@ impl Operands for Fused {
             Self::MatmulBias { .. } => "linear.matmul_bias",
             Self::MoeSelectGlu { .. } => "linear.moe_select_glu",
             Self::RopeYarnAppend { .. } => "elementwise.rope_yarn_append",
+            Self::SplitRopeYarnAppend { .. } => "elementwise.split_rope_yarn_append",
             Self::LseSink { .. } => "attention.lse_sink",
             Self::MoeExperts { .. } => "linear.moe_experts",
             Self::QkvFusedQknormRopeVnormWrite { .. } => {

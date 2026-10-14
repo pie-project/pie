@@ -408,6 +408,100 @@ pub fn yarn_append(
     )
 }
 
+/// [`yarn_append`] reading q, k and v straight out of `packed` (`[rows, q |
+/// k | v]`, `q_width` and `kv_width` wide): the rotated q lands in `q_out`,
+/// the rotated k and its v in `append`'s cache, the same bits as
+/// `split_qkv`, [`yarn_append`] would land. `append.v` is not read. The
+/// caller checks [`YarnAppend::fits`] first.
+#[allow(clippy::too_many_arguments)]
+pub fn yarn_split_append(
+    ctx: &Ctx,
+    packed: Tensor,
+    kv_width: u32,
+    q_out: &mut Tensor,
+    positions: Tensor,
+    head_dim: u32,
+    theta: f32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    attention_factor: f32,
+    original_max_position: u32,
+    interleaved: bool,
+    append: YarnAppend<'_>,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.split_rope_yarn_append";
+    dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
+    if !append.fits() {
+        return Err(refuse(
+            OP,
+            "the fused YaRN write lands a bf16 NHD cache without envelopes only",
+        ));
+    }
+    positions_stream(OP, positions, q_out);
+    let max_position = stated(
+        OP,
+        nonzero(
+            OP,
+            "the position span this checkpoint's YaRN block states",
+            original_max_position,
+        )?,
+    )?;
+    let num_q_heads = q_heads(OP, q_out.width, head_dim)?;
+    let num_kv_heads = heads(OP, kv_width, head_dim)?;
+    if packed.width != q_out.width + 2 * kv_width || packed.rows != q_out.rows {
+        return Err(refuse(
+            OP,
+            format!(
+                "a [{} x {}] packed row is not q {} wide and k and v {} wide each over {} rows",
+                packed.rows, packed.width, q_out.width, kv_width, q_out.rows
+            ),
+        ));
+    }
+    let (low_dim, high_dim) = ramp_bounds(
+        stated(OP, head_dim)?,
+        theta,
+        beta_fast,
+        beta_slow,
+        max_position,
+    );
+    let half = head_dim / 2;
+    let pairs = cache_pairs(half);
+    let per_block = heads_per_block(half);
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::elemwise::rope_yarn_split_append").apply(rotate_launch(
+            q_out.rows,
+            num_q_heads + num_kv_heads,
+            per_block,
+            pairs * 8,
+        )),
+        &[
+            packed.arg(),
+            q_out.arg(),
+            positions.arg(),
+            stated(OP, num_q_heads)?.arg(),
+            stated(OP, num_kv_heads)?.arg(),
+            stated(OP, head_dim)?.arg(),
+            theta.arg(),
+            factor.arg(),
+            low_dim.arg(),
+            high_dim.arg(),
+            attention_factor.arg(),
+            interleaved.arg(),
+            stated(OP, per_block)?.arg(),
+            stated(OP, pairs)?.arg(),
+            append.pool.keys.arg(),
+            append.pool.values.arg(),
+            append.write_page.arg(),
+            append.write_offset.arg(),
+            append.pool.row_valid.arg(),
+            append.pool.page_size.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 fn yarn_fire(
     ctx: &Ctx,
     op: &'static str,

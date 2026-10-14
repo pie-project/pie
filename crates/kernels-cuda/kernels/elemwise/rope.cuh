@@ -544,6 +544,98 @@ __global__ void rope_yarn(
     }
 }
 
+// `rope_yarn<true>` reading q, k and v straight out of a packed
+// `[rows, q | k | v]` row: each rotated q pair lands in `q_out`, each rotated
+// k pair and its v pair in the paged (NHD) cache. The arithmetic is
+// `rope_yarn`'s pair for pair, so the same bits land as split, rotate, write.
+__global__ void rope_yarn_split_append(
+    const bf16* __restrict__ packed,
+    bf16* __restrict__ q_out,
+    const i32* __restrict__ positions,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float theta, float factor,
+    float low_dim, float high_dim,
+    float mscale,
+    bool interleaved,
+    int heads_per_block,
+    int cache_pairs,
+    bf16* __restrict__ k_pages,
+    bf16* __restrict__ v_pages,
+    const u32* __restrict__ w_page,
+    const u32* __restrict__ w_off,
+    const u8* __restrict__ row_valid,
+    int page_size,
+    const u32* __restrict__ win)
+{
+    extern __shared__ float2 yarn_cs[];
+    const int n = blockIdx.x;
+
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    KvSlot slot{};
+    slot.page = static_cast<int>(w_page[row]);
+    slot.offset_in_page = static_cast<int>(w_off[row]);
+    const bool write_this_row = (row_valid == nullptr || row_valid[row] != 0) &&
+                                slot.offset_in_page >= 0 && slot.offset_in_page < page_size;
+
+    const int total_heads = num_q_heads + num_kv_heads;
+    const int half = head_dim / 2;
+    const int pos = positions[row];
+    const long long stride = static_cast<long long>(num_q_heads + 2 * num_kv_heads) * head_dim;
+    const bf16* src = packed + static_cast<long long>(row) * stride;
+
+    auto angle = [&](int d) -> float2 {
+        const float base_freq = powf(theta,
+            -2.f * static_cast<float>(d) / static_cast<float>(head_dim));
+        const float freq = yarn_original_freq(base_freq, factor,
+                                              low_dim, high_dim, d);
+        float cos_v, sin_v;
+        __sincosf(static_cast<float>(pos) * freq, &sin_v, &cos_v);
+        return make_float2(cos_v * mscale, sin_v * mscale);
+    };
+    for (int d = threadIdx.x; d < cache_pairs; d += blockDim.x) {
+        yarn_cs[d] = angle(d);
+    }
+    if (cache_pairs > 0) __syncthreads();
+
+    const int head_base = blockIdx.y * heads_per_block;
+    const int heads_here = min(heads_per_block, total_heads - head_base);
+    for (int t = threadIdx.x; t < heads_here * half; t += blockDim.x) {
+        const int head_idx = head_base + t / half;
+        const int dim_pair = t % half;
+        const float2 cs = dim_pair < cache_pairs ? yarn_cs[dim_pair]
+                                                 : angle(dim_pair);
+        const int j0 = interleaved ? dim_pair * 2 : dim_pair;
+        const int j1 = interleaved ? dim_pair * 2 + 1 : dim_pair + half;
+
+        if (head_idx < num_q_heads) {
+            const bf16* qs = src + static_cast<long long>(head_idx) * head_dim;
+            bf16* qd = q_out + (static_cast<long long>(row) * num_q_heads +
+                                head_idx) * head_dim;
+            if (interleaved) rotate_pair_interleaved_to(qs, qd, dim_pair, cs.x, cs.y);
+            else             rotate_pair_to(qs, qd, half, dim_pair, cs.x, cs.y);
+        } else if (write_this_row) {
+            const int kv_h = head_idx - num_q_heads;
+            const bf16* ks = src + static_cast<long long>(num_q_heads + kv_h) * head_dim;
+            const bf16* vs =
+                src + static_cast<long long>(num_q_heads + num_kv_heads + kv_h) * head_dim;
+            const float a = bf16_to_f32(ks[j0]);
+            const float b = bf16_to_f32(ks[j1]);
+            const int base = kv_h * head_dim;
+            const long long d0 =
+                kv_dst_index<false>(slot, base + j0, page_size, num_kv_heads, head_dim);
+            const long long d1 =
+                kv_dst_index<false>(slot, base + j1, page_size, num_kv_heads, head_dim);
+            k_pages[d0] = f32_to_bf16(a * cs.x - b * cs.y);
+            k_pages[d1] = f32_to_bf16(b * cs.x + a * cs.y);
+            v_pages[d0] = vs[j0];
+            v_pages[d1] = vs[j1];
+        }
+    }
+}
+
 template <int BLOCK>
 __global__ __launch_bounds__(BLOCK) void q_rmsnorm_rope_partial(
     const bf16* __restrict__ x,

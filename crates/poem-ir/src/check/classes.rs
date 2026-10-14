@@ -458,7 +458,9 @@ fn writes_cache(op: &Operation) -> bool {
         },
         Operation::Fused(op) => matches!(
             op,
-            Fused::QkvFusedQknormRopeVnormWrite { .. } | Fused::RopeYarnAppend { .. }
+            Fused::QkvFusedQknormRopeVnormWrite { .. }
+                | Fused::RopeYarnAppend { .. }
+                | Fused::SplitRopeYarnAppend { .. }
         ),
         Operation::Spatial(op) => match op {
             Spatial::Conv3d { cache, .. } => cache.is_some(),

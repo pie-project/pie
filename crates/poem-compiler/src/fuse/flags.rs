@@ -51,6 +51,7 @@ flags! {
     GatedResidualNormModulate = "fuse.gated_residual_norm_modulate" => "elementwise.gated_residual_norm_modulate",
     NormModulate = "fuse.norm_modulate" => "elementwise.norm_modulate",
     RmsnormRopePartialQ = "fuse.rmsnorm_rope_partial_q" => "elementwise.rmsnorm_rope_partial_q",
+    SplitRopeYarnAppend = "fuse.split_rope_yarn_append" => "elementwise.split_rope_yarn_append",
     RopeYarnAppend = "fuse.rope_yarn_append" => "elementwise.rope_yarn_append",
     LseSink = "fuse.lse_sink" => "attention.lse_sink",
 }

@@ -35,7 +35,20 @@ fn check(interleaved: bool) {
     let indptr: Vec<i32> = vec![0, rows as i32];
     let width = (kv_heads * d) as usize;
     let cells = PAGES * PAGE;
-    let run = |gpu: &mut Gpu, fused: bool| -> (Vec<u16>, Vec<u16>, Vec<u16>, Vec<u16>) {
+    let (qw, kw) = ((q_heads * d) as usize, width);
+    let packed_bits: Vec<u16> = (0..rows)
+        .flat_map(|r| {
+            q_bits[r * qw..(r + 1) * qw]
+                .iter()
+                .chain(&k_bits[r * kw..(r + 1) * kw])
+                .chain(&v_bits[r * kw..(r + 1) * kw])
+                .copied()
+                .collect::<Vec<u16>>()
+        })
+        .collect();
+    // 0: rotate then append; 1: the fused write; 2: the fused write read
+    // straight from the packed row.
+    let run = |gpu: &mut Gpu, mode: u8| -> (Vec<u16>, Vec<u16>, Vec<u16>, Vec<u16>) {
         let q = gpu.up(&q_bits);
         let k = gpu.up(&k_bits);
         let v = gpu.up(&v_bits);
@@ -72,7 +85,25 @@ fn check(interleaved: bool) {
         let wo = Tensor::new(gpu.up(&offsets), rows as u32, 1, Dtype::U32);
         let ctx = gpu.ctx();
         let params = (d, 150_000.0, 32.0, 32.0, 1.0, 1.347, 4096u32, interleaved);
-        if fused {
+        if mode == 2 {
+            let packed = Tensor::new(
+                gpu.up(&packed_bits),
+                rows as u32,
+                q_heads * d + 2 * kv_heads * d,
+                Dtype::Bf16,
+            );
+            let append = rope::YarnAppend {
+                v: vt,
+                pool: &pool,
+                write_page: wp,
+                write_offset: wo,
+            };
+            rope::yarn_split_append(
+                &ctx, packed, kv_heads * d, &mut qt, pos, params.0, params.1, params.2,
+                params.3, params.4, params.5, params.6, params.7, append,
+            )
+            .expect("the split rotation fires");
+        } else if mode == 1 {
             let append = rope::YarnAppend {
                 v: vt,
                 pool: &pool,
@@ -112,8 +143,12 @@ fn check(interleaved: bool) {
             gpu.down(values, cells * width),
         )
     };
-    let apart = run(&mut gpu, false);
-    let fused = run(&mut gpu, true);
+    let apart = run(&mut gpu, 0);
+    let fused = run(&mut gpu, 1);
+    let split = run(&mut gpu, 2);
+    assert_eq!(split.0, apart.0, "interleaved {interleaved}: q from the packed row");
+    assert_eq!(split.2, apart.2, "interleaved {interleaved}: keys from the packed row");
+    assert_eq!(split.3, apart.3, "interleaved {interleaved}: values from the packed row");
     assert!(apart.2.iter().any(|&b| b != 0), "the pair landed keys");
     assert_eq!(fused.0, apart.0, "interleaved {interleaved}: q");
     assert_eq!(fused.1, apart.1, "interleaved {interleaved}: k");
