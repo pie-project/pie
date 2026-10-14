@@ -173,15 +173,22 @@ fn assert_old_tuning(
     assert_eq!(t.sdpa_tile_rows_per_request(), 32, "{device}");
     assert!(t.sdpa_mma() && !t.kv_q8(), "{device}");
     assert_eq!(t.gdn_scan(), gdn_scan, "{device}");
-    let mlp = mlp.unwrap_or(if mpp {
-        AneMlp::Units { units: 8 }
+    // An Apple10 GPU reads a prompt faster alone than beside the Neural
+    // Engine, as Splash keeps a 512-token prompt there.
+    let mlp = mlp.unwrap_or(if family == 10 {
+        AneMlp::Gpu
     } else {
         AneMlp::Share { percent: 47 }
     });
     assert_eq!(*profile.get::<AneMlp>(), mlp, "{device}");
     assert_eq!(
         *profile.get::<AneProjections>(),
-        AneProjections::Share { percent: 47 }
+        if family == 10 {
+            AneProjections::Gpu
+        } else {
+            AneProjections::Share { percent: 47 }
+        },
+        "{device}"
     );
     assert_eq!(
         *profile.get::<WeightsLayout>(),
@@ -268,7 +275,7 @@ fn a_device_file_applies_only_within_its_family() {
     let (profile, report) =
         chip::resolve("Apple M4 Pro", &chip::facts(10, Some(40), 10, true), None);
     assert_eq!(report.layers, [Source::Seeded("apple10.toml".into())]);
-    assert_eq!(*profile.get::<AneMlp>(), AneMlp::Units { units: 8 });
+    assert_eq!(*profile.get::<AneMlp>(), AneMlp::Gpu);
     let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(11, Some(40), 10, true), None);
     assert_eq!(report.used, Source::Defaults, "no family applies");
 }
