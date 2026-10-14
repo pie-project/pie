@@ -402,6 +402,7 @@ fn host_ring_plan(
                     advance: crate::store::rs::RingAdvance {
                         positioned: true,
                         settled: lane.kv.held,
+                        reach: lane.kv.held,
                         fold: fold_len.as_ref().map(|lens| lens[row]),
                         commit_end: end,
                         head: (rows > 0).then_some(end),
@@ -1057,7 +1058,9 @@ fn stamp_lane_translation(
 /// The ring plan of a device-geometry fire: every row writes the pages
 /// the fire's write indexes name and reads through the working set's mapped
 /// pages. The device decides where its tokens land, so the ring keeps every
-/// page it writes and moves on at the next fire whose positions are known.
+/// page it writes and commits nothing; what it retires is behind the first
+/// page it writes, where every row lands past, so a decode loop that never
+/// states its positions still holds a window and not its whole sequence.
 fn device_ring_plan(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
@@ -1077,6 +1080,11 @@ fn device_ring_plan(
         .map(|&index| u32::try_from(index).unwrap_or(u32::MAX))
         .collect();
     let last = written.iter().copied().max();
+    let reach = written
+        .iter()
+        .copied()
+        .min()
+        .map_or(0, |first| first.saturating_mul(stores.kv_page_size));
     let extent = u32::try_from(mapped)
         .unwrap_or(u32::MAX)
         .max(last.map_or(0, |last| last.saturating_add(1)));
@@ -1089,6 +1097,7 @@ fn device_ring_plan(
                 advance: crate::store::rs::RingAdvance {
                     positioned: false,
                     settled: 0,
+                    reach,
                     fold: None,
                     commit_end: 0,
                     head: None,

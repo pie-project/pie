@@ -3817,6 +3817,7 @@ mod starvation_race_tests {
             crate::store::rs::RingAdvance {
                 positioned: true,
                 settled: held,
+                reach: held,
                 fold: Some(u32::MAX),
                 commit_end: end,
                 head: Some(end),
