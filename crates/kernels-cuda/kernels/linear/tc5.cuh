@@ -794,19 +794,25 @@ __global__ __launch_bounds__(kMix != 0 ? 352 : 224, 1) void tc5_gemm(
                     return x.q_row + ri;
                 }
             };
+            constexpr u32 kIters = kRawRows / 16 > 0 ? kRawRows / 16 : 1;
             for (int kb = x.kb0; kb < x.kb1; ++kb) {
+                // The rows' scales first, all in flight while the codes land.
+                const int col = (kb * 64 + static_cast<int>(c) * 8) / kWGran;
+                unsigned char sb[kIters];
+#pragma unroll
+                for (u32 i = 0; i < kIters; ++i) {
+                    const int g = wrow(t / 8 + 16 * i);
+                    sb[i] = g < weight_rows ? __ldg(epi.wsf + static_cast<size_t>(g) * sf_cols + col) : 0;
+                }
                 bar_wait(&full[s], phase);
                 const unsigned char* raw_s = smem + kOffRaw + s * kRawBytes;
                 unsigned char* tile = kMixP ? smem + s * kTileP * kPT : smem + kOffQ + s * kTileQ;
-                const int col = (kb * 64 + static_cast<int>(c) * 8) / kWGran;
-#pragma unroll 4
-                for (u32 r = t / 8; r < kRawRows; r += 16) {
+#pragma unroll
+                for (u32 i = 0; i < kIters; ++i) {
+                    const u32 r = t / 8 + 16 * i;
                     const unsigned code = *reinterpret_cast<const unsigned*>(raw_s + r * 32 + c * 4);
-                    const int g = wrow(r);
-                    const unsigned char sb =
-                        g < weight_rows ? __ldg(epi.wsf + static_cast<size_t>(g) * sf_cols + col) : 0;
                     *reinterpret_cast<uint4*>(tile + r * 128 + ((c ^ (r % 8)) * 16)) =
-                        tc5k::dequant8<kMix>(code, sb);
+                        tc5k::dequant8<kMix>(code, sb[i]);
                 }
                 fence_async_shared();
                 __syncwarp();

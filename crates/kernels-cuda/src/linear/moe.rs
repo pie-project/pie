@@ -412,7 +412,7 @@ pub fn matmul_select(
     #[cfg(feature = "cuda")]
     {
         let fan = selected(OP, x, routes, y)?;
-        if tc5_worth(x, bank.dtype, y, experts, routes.rows, fan.route_count) {
+        if tc5_worth(ctx, x, bank.dtype, y, experts, routes.rows, fan.route_count) {
             return select_tc5(
                 ctx,
                 OP,
@@ -421,6 +421,7 @@ pub fn matmul_select(
                 bank.rows,
                 routes,
                 y,
+                crate::linear::tc5::Epilogue::STORE,
             );
         }
         if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
@@ -430,17 +431,15 @@ pub fn matmul_select(
     select_gemv(ctx, OP, x, bank, routes, y, experts)
 }
 
-/// A fire of fewer tokens keeps the GEMV: its layout's four small launches
-/// cost more than they save (Qwen3.6-35B-A3B decode: 3.9 ms a token on the
-/// GEMV against 5.3 ms on the grouped GEMM at one token, even at eight).
-#[cfg(feature = "cuda")]
-const TC5_TOKENS: u32 = 16;
-
 /// Whether a select of `x` (bf16) runs on the grouped tcgen05 GEMM: a
 /// resident bank on a device that has it, at widths its tiles take (a live
-/// window lays out only its routes), for a fire wide enough to repay it.
+/// window lays out only its routes), for a fire of `kernel.moe.tc5_from`
+/// tokens or more -- narrower ones keep the GEMV, whose one launch beats
+/// the layout's four (Qwen3.6-35B-A3B decode: 3.9 ms a token on the GEMV,
+/// 5.3 ms on the grouped GEMM, at one token, and even at eight).
 #[cfg(feature = "cuda")]
 fn tc5_worth(
+    ctx: &Ctx,
     x: Tensor,
     bank: Dtype,
     y: &Tensor,
@@ -448,7 +447,8 @@ fn tc5_worth(
     tokens: u32,
     routes: u32,
 ) -> bool {
-    (tokens >= TC5_TOKENS || routes > MAX_GRID_Y)
+    ctx.tuning().moe_tc5
+        && (tokens >= ctx.tuning().moe_tc5_from || routes > MAX_GRID_Y)
         && x.dtype == Dtype::Bf16
         && bank == Dtype::Bf16
         && !experts.streams()
@@ -472,6 +472,7 @@ pub(crate) fn select_tc5(
     experts: u32,
     routes: Tensor,
     y: &mut Tensor,
+    epi: crate::linear::tc5::Epilogue,
 ) -> Result<(), Error> {
     use crate::linear::{act_quant, tc5};
     const GROUPED_X: &str = "linear.moe_tc5_x";
@@ -488,7 +489,7 @@ pub(crate) fn select_tc5(
     let xs = ctx.scratch_stream(op, GROUPED_X, layout.rows as usize * k as usize * 2)? as u64;
     act_quant::scatter_rows(ctx, op, x, div, layout.pos, count, xs)?;
     let ys = ctx.scratch_stream(op, GROUPED_Y, layout.rows as usize * n as usize * 2)? as u64;
-    tc5::grouped_gemm(
+    tc5::grouped_gemm_epi(
         ctx,
         tc5::Operand::plain(xs, tc5::Elem::Bf16),
         w,
@@ -500,6 +501,7 @@ pub(crate) fn select_tc5(
         },
         [n, k],
         1.0,
+        epi,
         count,
     )?;
     act_quant::gather_back(ctx, op, ys, layout.pos, routes.width, y)
@@ -903,6 +905,33 @@ fn matmul_select_mxfp4(
         "the expert bias rides the activation's dtype"
     );
     let fan = selected(op, x, routes, y)?;
+    #[cfg(feature = "cuda")]
+    if !seat.streams()
+        && tc5_worth(
+            ctx,
+            x,
+            Dtype::Bf16,
+            y,
+            ExpertTable::RESIDENT,
+            routes.rows,
+            fan.route_count,
+        )
+    {
+        use crate::linear::tc5;
+        return select_tc5(
+            ctx,
+            op,
+            x,
+            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, MXFP4_BLOCK),
+            codes.rows,
+            routes,
+            y,
+            tc5::Epilogue {
+                bias: bias.map_or(0, |b| b.ptr),
+                ..tc5::Epilogue::STORE
+            },
+        );
+    }
     if x.width == 0 || !x.width.is_multiple_of(MXFP4_BLOCK) {
         return Err(refuse(
             op,

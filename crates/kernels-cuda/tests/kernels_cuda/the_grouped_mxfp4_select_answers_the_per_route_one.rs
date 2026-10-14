@@ -76,6 +76,7 @@ fn check(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool, tuning
     let grouped = gpu.ctx().with_tuning(tuning);
     let bare = gpu.ctx().with_tuning(Tuning {
         mxfp4_grouped: false,
+        moe_tc5: false,
         ..tuning
     });
     let x = Tensor::new(act_at, act_rows as u32, k as u32, Dtype::Bf16);
@@ -148,6 +149,15 @@ fn the_grouped_mxfp4_select_answers_the_per_route_one_every_case() {
     the_gpt_oss_legs_are_priced();
     the_fp32_form_agrees_at_both_readings();
     the_fp32_form_agrees_on_a_ragged_rectangle();
+    the_tcgen05_form_agrees_at_gpt_oss_widths();
+}
+
+/// The grouped tcgen05 GEMM (W4A16, on a device that has it) at a gpt-oss
+/// leg's K, biased and bare, masked and contiguous.
+fn the_tcgen05_form_agrees_at_gpt_oss_widths() {
+    check(40, 576, 2880, true, true, Tuning::DEFAULT);
+    check(100, 384, 2880, true, false, Tuning::DEFAULT);
+    check(100, 384, 2880, false, true, Tuning::DEFAULT);
 }
 
 fn the_token_read_leg_with_a_bias_agrees() {
@@ -192,11 +202,18 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
     let routes_at = gpu.up(&routes);
     let y_at = gpu.zeros(route_count * n * 2);
 
-    let grouped = gpu.ctx();
-    let bare = gpu.ctx().with_tuning(Tuning {
-        mxfp4_grouped: false,
+    // The grouped WMMA kernel against the per-route select, and the
+    // tcgen05 GEMM (where the device has it) beside them.
+    let grouped = gpu.ctx().with_tuning(Tuning {
+        moe_tc5: false,
         ..Tuning::DEFAULT
     });
+    let bare = gpu.ctx().with_tuning(Tuning {
+        mxfp4_grouped: false,
+        moe_tc5: false,
+        ..Tuning::DEFAULT
+    });
+    let tc5 = gpu.ctx();
     let x = Tensor::new(act_at, act_rows as u32, k as u32, Dtype::Bf16);
     let codes_t = Tensor::new(codes_at, EXPERTS as u32, (n * k / 2) as u32, Dtype::U8);
     let scales_t = Tensor::new(scales_at, EXPERTS as u32, (n * groups) as u32, Dtype::U8);
@@ -227,14 +244,17 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
     };
     let grouped_ms = run(&grouped);
     let per_route_ms = run(&bare);
+    let tc5_ms = run(&tc5);
 
     let flop = 2.0 * route_count as f64 * n as f64 * k as f64;
     eprintln!(
         "{label:9} n={n:5} k={k:5}: grouped {grouped_ms:7.3} ms ({:5.1} TFLOP/s)  \
-         per-route {per_route_ms:7.3} ms ({:5.1} TFLOP/s)  {:.1}x",
+         per-route {per_route_ms:7.3} ms ({:5.1} TFLOP/s)  {:.1}x; tcgen05 {tc5_ms:7.3} ms \
+         ({:5.1} TFLOP/s)",
         flop / grouped_ms / 1e9,
         flop / per_route_ms / 1e9,
         per_route_ms / grouped_ms,
+        flop / tc5_ms / 1e9,
     );
     assert!(
         grouped_ms < per_route_ms,
