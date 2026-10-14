@@ -278,6 +278,70 @@ fn check_glu(tokens: usize, inter: usize, k: usize, by_token: bool, biased: bool
             );
         }
     }
+
+    // The down select right after takes the GLU select's route order; it
+    // answers what the per-route select does from the same GLU.
+    let down_n = 160;
+    let down_codes = bytes(0x55, EXPERTS * down_n * inter / 2);
+    let down_scales = scale_bytes(0x56, EXPERTS * down_n * inter / BLOCK);
+    let dc = Tensor::new(
+        gpu.up(&down_codes),
+        EXPERTS as u32,
+        (down_n * inter / 2) as u32,
+        Dtype::U8,
+    );
+    let ds = Tensor::new(
+        gpu.up(&down_scales),
+        EXPERTS as u32,
+        (down_n * inter / BLOCK) as u32,
+        Dtype::U8,
+    );
+    let shared_at = gpu.zeros(route_count * down_n * 2);
+    let apart_at = gpu.zeros(route_count * down_n * 2);
+    let fire_down = |ctx: &kernels_cuda::Ctx, into: u64| {
+        let mut out = Tensor::new(into, route_count as u32, down_n as u32, Dtype::Bf16);
+        matmul_select_quant(
+            ctx,
+            y,
+            dc,
+            ds,
+            None,
+            routes_t,
+            &mut out,
+            GroupSeat::RESIDENT,
+        )
+        .expect("the down select fires");
+    };
+    let mut again = Tensor::new(glu_at, route_count as u32, inter as u32, Dtype::Bf16);
+    select_glu(
+        &mma,
+        x,
+        GluBank::Mxfp4 {
+            codes: codes_t,
+            scales: scales_t,
+            bias: bias_of,
+        },
+        routes_t,
+        &mut again,
+        Glu::SwigluClampAlpha { limit, alpha },
+        ExpertTable::RESIDENT,
+    )
+    .expect("the fused select fires");
+    fire_down(&mma, shared_at);
+    fire_down(&bare, apart_at);
+    gpu.sync();
+    let shared: Vec<u16> = gpu.down(shared_at, route_count * down_n);
+    let apart: Vec<u16> = gpu.down(apart_at, route_count * down_n);
+    for (i, (a, b)) in shared.iter().zip(&apart).enumerate() {
+        assert!(
+            close(from_bf16(*a), from_bf16(*b)),
+            "route {} column {}: the down select on the kept order says {}, apart {}",
+            i / down_n,
+            i % down_n,
+            from_bf16(*a),
+            from_bf16(*b)
+        );
+    }
 }
 
 /// The grouped tcgen05 GEMM (W4A16, on a device that has it) at a gpt-oss

@@ -977,6 +977,7 @@ pub(crate) const GROUPED_TILE_N: u32 = 128;
 pub(crate) const GROUPED_BLOCK: u32 = 256;
 const WMMA_ROUTES: u32 = 32;
 
+#[derive(Clone, Copy)]
 pub(crate) struct RouteOrder {
     pub(crate) order: u64,
     pub(crate) offsets: u64,
@@ -991,12 +992,46 @@ pub(crate) fn route_order(
     fan: &Selected,
     experts: u32,
 ) -> Result<RouteOrder, Error> {
-    route_order_sliced(ctx, op, routes, fan, experts, WMMA_ROUTES, false)
+    route_order_sliced(ctx, op, routes, fan, experts, WMMA_ROUTES, false, Share::No)
+}
+
+/// Whether a route order is kept for, or taken from, the select beside it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Share {
+    No,
+    /// A GLU select's order, kept for the down select that follows it.
+    Keep,
+    /// The down select: the kept order of the same routes, if it is the last
+    /// one laid.
+    Take,
+}
+
+/// What a route order was laid for: the same routes tensor in the same
+/// window, stream, bank and slice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OrderKey {
+    stream: usize,
+    routes: u64,
+    rows: u32,
+    cols: u32,
+    stage: u64,
+    experts: u32,
+    slice: u32,
+    count: u32,
+}
+
+std::thread_local! {
+    /// The last route order laid on this thread, when a GLU select laid it
+    /// for its down select. Any other order laid clears it: they share the
+    /// scratch.
+    static KEPT_ORDER: core::cell::Cell<Option<(OrderKey, RouteOrder)>> =
+        const { core::cell::Cell::new(None) };
 }
 
 /// [`route_order`] with each work item `slice` routes of one expert; with
 /// `scan`, its walks over the experts run as block scans
 /// (`moe_route_order_scan`) instead of on one thread.
+#[allow(clippy::too_many_arguments)]
 fn route_order_sliced(
     ctx: &Ctx,
     op: &'static str,
@@ -1005,8 +1040,29 @@ fn route_order_sliced(
     experts: u32,
     slice: u32,
     scan: bool,
+    share: Share,
 ) -> Result<RouteOrder, Error> {
     const ORDER_BLOCK: u32 = 1024;
+    let key = OrderKey {
+        stream: ctx.stream().addr(),
+        routes: routes.ptr,
+        rows: routes.rows,
+        cols: routes.width,
+        stage: match ctx.stage() {
+            ArgValue::Ptr(p) => p,
+            _ => u64::MAX,
+        },
+        experts,
+        slice,
+        count: fan.route_count,
+    };
+    let kept = KEPT_ORDER.with(|k| k.take());
+    if share == Share::Take
+        && let Some((was, order)) = kept
+        && was == key
+    {
+        return Ok(order);
+    }
     let offsets_at = (fan.route_count as usize).next_multiple_of(64);
     let work_cap = fan.route_count.div_ceil(slice) + experts;
     let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
@@ -1041,12 +1097,16 @@ fn route_order_sliced(
             ctx.stage(),
         ],
     )?;
-    Ok(RouteOrder {
+    let laid = RouteOrder {
         order,
         offsets,
         work,
         work_cap,
-    })
+    };
+    if share == Share::Keep {
+        KEPT_ORDER.with(|k| k.set(Some((key, laid))));
+    }
+    Ok(laid)
 }
 
 /// Whether a fire of `routes` routes is one the register-dequant MMA kernel
@@ -1125,13 +1185,30 @@ fn select_mxfp4_mma(
         offsets,
         work,
         work_cap,
-    } = route_order_sliced(ctx, op, routes, fan, experts, 8 * nb, true)?;
+    } = route_order_sliced(
+        ctx,
+        op,
+        routes,
+        fan,
+        experts,
+        8 * nb,
+        true,
+        if glu.is_some() {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    // One chunk in flight a warp: its 93 registers seat five CTAs an SM, and
+    // the warps between them hide the loads better than a deeper ring in
+    // fewer warps (gpt-oss at 64 tokens, gate-up 308 -> 305 us, down 172 ->
+    // 164).
     ctx.fire(
         op,
         Fire::at(
             "linear/moe_w4.cuh",
             symbol(&format!(
-                "::pie::linear::moe_select_mxfp4_mma<{nb}, 2, {code}>"
+                "::pie::linear::moe_select_mxfp4_mma<{nb}, 1, {code}>"
             )),
         )
         .apply(Launch::grid(
