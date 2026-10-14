@@ -336,11 +336,15 @@ mod tests {
             // group's single-token rows through the prefill kernel; every
             // other chip keeps FA2 and the decode kernel.
             assert_eq!(
-                (tuning.prefill_tc5, tuning.decode_grouped_prefill_from),
+                (
+                    tuning.prefill_tc5,
+                    tuning.decode_grouped_prefill_from,
+                    tuning.decode_grouped_prefill_lse,
+                ),
                 if (major, minor) == (10, 0) {
-                    (true, 4)
+                    (true, 4, true)
                 } else {
-                    (false, 0)
+                    (false, 0, false)
                 },
                 "{gpu}"
             );
@@ -369,6 +373,7 @@ mod tests {
                         prefill_tc5: false,
                         decode_grouped_prefill_from: 0,
                         gemm_bias_epilogue: false,
+                        decode_grouped_prefill_lse: false,
                         ..tuning
                     },
                     defaults,

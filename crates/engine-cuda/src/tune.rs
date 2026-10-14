@@ -142,12 +142,14 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
     let engine = crate::chip::Engine::of(chip);
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
     let profile = poem_compiler::DeviceProfile::of(chip, sms, &crate::EXCLUSIVE, grouped);
-    let trace = crate::grouped_decode::rewrite(
+    let tuning = kernels_cuda::tuning::Tuning::of(chip);
+    let trace = crate::grouped_decode::rewrite_with(
         poem_compiler::fuse::fuse(
             row.trace(poem::Platform::Cuda),
             &poem_compiler::fuse::flags::kernels(chip),
         ),
-        kernels_cuda::tuning::Tuning::of(chip).decode_grouped_prefill_from,
+        tuning.decode_grouped_prefill_from,
+        tuning.decode_grouped_prefill_lse,
     );
     let slots = *LANES.iter().max().expect("lanes") as u32;
     let mut budget = poem_compiler::Budget::new(slots, CONTEXT);

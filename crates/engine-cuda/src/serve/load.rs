@@ -71,9 +71,11 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         kernels.retain(|kernel| crate::UNCHAINED.contains(kernel));
     }
     boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), &kernels);
-    boot.trace = crate::grouped_decode::rewrite(
+    let tuning = kernels_cuda::tuning::Tuning::of(&chip);
+    boot.trace = crate::grouped_decode::rewrite_with(
         boot.trace.clone(),
-        kernels_cuda::tuning::Tuning::of(&chip).decode_grouped_prefill_from,
+        tuning.decode_grouped_prefill_from,
+        tuning.decode_grouped_prefill_lse,
     );
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =

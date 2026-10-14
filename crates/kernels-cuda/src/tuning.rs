@@ -225,6 +225,13 @@ pub struct PrefillTc5;
 #[decision(id = "kernel.sdpa.decode.grouped_prefill_from", constant(range(0..=64)), default = 0, tune = search)]
 pub struct DecodeGroupedPrefillFrom(pub u32);
 
+/// Whether a wide group's single-token rows that also land their
+/// log-sum-exp (gpt-oss's, for its sinks) take the prefill kernel too,
+/// where their plan has no sliding window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.grouped_prefill_lse", flag, default = false, tune = search)]
+pub struct DecodeGroupedPrefillLse;
+
 /// Whether a split attention's partial states fold a warp a (row, head)
 /// rather than through the staged persistent merge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -267,6 +274,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmBiasEpilogue>()
         .add::<PrefillTc5>()
         .add::<DecodeGroupedPrefillFrom>()
+        .add::<DecodeGroupedPrefillLse>()
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<GemmNarrowN>();
@@ -311,6 +319,7 @@ pub struct Tuning {
     pub gemm_bias_epilogue: bool,
     pub prefill_tc5: bool,
     pub decode_grouped_prefill_from: u32,
+    pub decode_grouped_prefill_lse: bool,
     pub selected_mma: bool,
     pub index_mma: bool,
     pub gemm_narrow_n: u32,
@@ -353,6 +362,7 @@ impl Tuning {
         gemm_bias_epilogue: false,
         prefill_tc5: false,
         decode_grouped_prefill_from: 0,
+        decode_grouped_prefill_lse: false,
         selected_mma: false,
         index_mma: false,
         gemm_narrow_n: 0,
@@ -395,6 +405,7 @@ impl Tuning {
             gemm_bias_epilogue: profile.on::<GemmBiasEpilogue>(&Anywhere),
             prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),
             decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,
+            decode_grouped_prefill_lse: profile.on::<DecodeGroupedPrefillLse>(&Anywhere),
             selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),
             index_mma: profile.on::<SdpaIndexMma>(&Anywhere),
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,
