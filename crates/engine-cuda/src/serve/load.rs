@@ -22,6 +22,10 @@ use super::{Boot, FireCost, Golden, Graphs, Shell};
 /// prefill chunk a frame, which serves, and under it the halving stops.
 const TOKENS_FLOOR: u32 = 1024;
 
+/// The recurrent-state slots a load holds when neither the config nor the
+/// chip's profile states them.
+const DEFAULT_STATE_SLOTS: u32 = 256;
+
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     super::diag::publish(&boot.knobs.diagnostics);
     // SAFETY: the boot's communicator is held by the engine for the life of
@@ -44,6 +48,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
+    if boot.slots == 0 {
+        boot.slots = match engine.state_slots_per_lane {
+            0 => DEFAULT_STATE_SLOTS,
+            per_lane => per_lane.saturating_mul(boot.budget.max_lanes).max(1),
+        };
+    }
 
     kernels_cuda::disk::install(boot.cache_dir);
 

@@ -70,6 +70,14 @@ pub struct WorkingSetPercent(pub u32);
 #[decision(id = "engine.lattice_steps", constant(set(1, 2)), default = 1, tune = engine)]
 pub struct LatticeSteps(pub u32);
 
+/// Recurrent-state slots a lane is given when `[engine] max_state_slots` is
+/// not stated, so a hybrid trunk seats every lane it batches (a lane holds a
+/// slot per posted frame, two at the default dispatch depth); 0 keeps the
+/// fixed 256, which seats 128 lanes at that depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.state_slots_per_lane", constant(range(0..=8)), default = 0, tune = engine)]
+pub struct StateSlotsPerLane(pub u32);
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
     kernels_cuda::tuning::register(&mut r);
@@ -78,7 +86,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<Copies>()
         .add::<Grouped>()
         .add::<WorkingSetPercent>()
-        .add::<LatticeSteps>();
+        .add::<LatticeSteps>()
+        .add::<StateSlotsPerLane>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     poem_compiler::costs::register(&mut r, 2);
     r
@@ -134,6 +143,7 @@ pub struct Engine {
     pub grouped: bool,
     pub working_set_percent: u32,
     pub lattice_steps: u32,
+    pub state_slots_per_lane: u32,
 }
 
 impl Engine {
@@ -156,6 +166,7 @@ impl Engine {
             grouped: profile.on::<Grouped>(&Anywhere),
             working_set_percent: profile.get::<WorkingSetPercent>().0,
             lattice_steps: profile.get::<LatticeSteps>().0,
+            state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
         }
     }
 }
@@ -391,6 +402,7 @@ mod tests {
                 grouped: true,
                 working_set_percent: 50,
                 lattice_steps: 1,
+                state_slots_per_lane: 0,
             }
         );
         assert_eq!(
@@ -429,6 +441,16 @@ mod tests {
             kernels_cuda::tuning::Tuning::of(&family),
             "only the skinny GEMM's reach differs from the family"
         );
+        assert_eq!(Engine::of(&b200).state_slots_per_lane, 2);
+        assert_eq!(
+            Engine {
+                state_slots_per_lane: 0,
+                ..Engine::of(&b200)
+            },
+            Engine::of(&family),
+            "only the per-lane state slots differ from the family's engine"
+        );
+        assert_eq!(Engine::of(&family).state_slots_per_lane, 0);
     }
 
     /// The two-launch gated delta scan is an sm_100 family decision; every

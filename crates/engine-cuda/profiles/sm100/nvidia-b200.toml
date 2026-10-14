@@ -12,6 +12,16 @@ device = "NVIDIA B200"
 [kernel]
 gemm.skinny_rows = 0
 
+# Two recurrent-state slots a lane seat every lane a hybrid trunk batches
+# (the fixed 256 seat 128 at the default dispatch depth). 256 requests of
+# 1024 in / 256 out offered at once: Qwen3.8-27B 2660 -> 2869 output tok/s,
+# TTFT p50 9.7 -> 7.8 s; Qwen3.6-35B-A3B 4501 -> 5418 tok/s, TTFT p50
+# 4.8 -> 3.0 s; TPOT p50 rises (37 -> 57, 24 -> 32 ms) with the batch twice
+# as wide, as vLLM runs it. A 183 GB card holds the doubled slab beside the
+# kv pages; a smaller one may not, so it is this card's decision.
+[engine]
+state_slots_per_lane = 2
+
 [provenance]
 source = "pie tune (quick, gemma4-31b) and the scoreboard's fixed points, end to end"
 measured = [
@@ -36,5 +46,6 @@ measured = [
   "engine.copies",
   "engine.lattice_steps",
   "engine.recording",
+  "engine.state_slots_per_lane",
   "engine.working_set_percent",
 ]

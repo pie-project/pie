@@ -97,32 +97,22 @@ fn cuda_budgets(
         .filter(|&len| len > 0)
         .unwrap_or_else(|| engine::Budgets::default().max_context)
         .max(page_size);
-    let max_lanes = opts.max_forward_requests.unwrap_or(256).max(1);
     engine::Budgets {
-        max_lanes,
+        max_lanes: opts.max_forward_requests.unwrap_or(256).max(1),
         max_tokens: opts.max_forward_tokens.unwrap_or(8192).max(1),
         buckets: Vec::new(),
         max_adapters: adapter_seats,
         page_size,
         max_context,
-        // A lane holds a recurrent-state slot per posted frame, two at the
-        // default dispatch depth, so the default seats every lane the
-        // engine batches; a card the slab does not fit cuts it at load.
-        slots: opts
-            .max_state_slots
-            .unwrap_or(CUDA_SLOTS_PER_LANE * max_lanes)
-            .max(1),
+        // Unstated, 0: the engine sizes the slab from its chip's profile
+        // (`engine.state_slots_per_lane`), 256 where the profile says nothing.
+        slots: opts.max_state_slots.map_or(0, |slots| slots.max(1)),
         max_patches: patch_ceilings.0,
         max_images: patch_ceilings.1,
         max_voxels: voxel_ceilings.0,
         max_clips: voxel_ceilings.1,
     }
 }
-
-/// Recurrent-state slots a CUDA lane is given when `max_state_slots` is not
-/// stated: one per frame the default `frame_dispatch_depth` (2) posts.
-#[cfg(any(feature = "cuda", test))]
-const CUDA_SLOTS_PER_LANE: u32 = 2;
 
 #[cfg(feature = "cuda")]
 fn device_boot(
@@ -626,14 +616,8 @@ mod tests {
         assert_eq!(budgets.page_size, 16);
         assert_eq!(budgets.max_context, 4096);
         assert_eq!(
-            budgets.slots, 512,
-            "two slots for each of the 256 default lanes"
-        );
-
-        opts.max_forward_requests = Some(64);
-        assert_eq!(
-            cuda_budgets(&opts, 0, (None, None), (None, None)).slots,
-            128
+            budgets.slots, 0,
+            "unstated, the engine's chip sizes the slab"
         );
 
         opts.max_state_slots = Some(4);
