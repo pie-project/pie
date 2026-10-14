@@ -50,4 +50,48 @@ __global__ void embed_concat_e4m3(
         : Elem<T>::from_f32(e4m3_value(codes[(long long)id * width + w]) * scale[0]);
 }
 
+// embed_concat_e4m3 sixteen codes a thread: `width` a multiple of 16 and the
+// table 16-byte aligned, so each thread reads one 16-byte run of a row (one
+// request, where the table sits in mapped host memory) and widens each code
+// as the element walk does.
+template <class T>
+__global__ void embed_concat_e4m3_vec16(
+    const int* __restrict__ ids,
+    const u8* __restrict__ codes,
+    const float* __restrict__ scale,
+    T* __restrict__ y,
+    int rows,
+    int heads,
+    int width,
+    int vocab,
+    const u32* __restrict__ win)
+{
+    const int runs = width / 16;
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)rows * heads * runs;
+    if (i >= total) return;
+
+    const int c = (int)(i % runs);
+    const long long rh = i / runs;
+    const int h = (int)(rh % heads);
+    const long long r = rh / heads;
+
+    if (win != nullptr && r >= static_cast<long long>(win[0])) return;
+
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    T* out = y + (row * heads + h) * (long long)width + c * 16;
+
+    const int id = ids[row * heads + h];
+    if (id < 0 || id >= vocab) {
+#pragma unroll
+        for (int k = 0; k < 16; ++k) out[k] = Elem<T>::from_f32(0.f);
+        return;
+    }
+    const uint4 run = *reinterpret_cast<const uint4*>(codes + (long long)id * width + c * 16);
+    const u8* b = reinterpret_cast<const u8*>(&run);
+    const float s = scale[0];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) out[k] = Elem<T>::from_f32(e4m3_value(b[k]) * s);
+}
+
 }  // namespace pie::layout

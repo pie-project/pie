@@ -18,8 +18,14 @@ fn e4m3(b: u8) -> f32 {
 
 #[test]
 fn the_e4m3_table_gather_widens_only_its_rows() {
+    // 16-byte runs a thread (160), and a code a thread (24).
+    gather_at(160);
+    gather_at(24);
+}
+
+#[allow(non_snake_case)]
+fn gather_at(WIDTH: usize) {
     const VOCAB: usize = 1000;
-    const WIDTH: usize = 160;
     const HEADS: usize = 16;
     const ROWS: usize = 7;
     let mut lcg = Lcg::seeded(0x81);
@@ -65,7 +71,7 @@ fn the_e4m3_table_gather_widens_only_its_rows() {
             assert_eq!(
                 from_bf16(got[slot * WIDTH + w]),
                 want,
-                "slot {slot} (id {id}) column {w}"
+                "width {WIDTH}: slot {slot} (id {id}) column {w}"
             );
         }
     }

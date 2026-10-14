@@ -49,7 +49,17 @@ pub fn embed_concat_e4m3(
     }
     debug_assert_eq!(y.rows, ids.rows, "one output row per id row");
     let rows = nonzero(OP, "rows", ids.rows)?;
-    let total = u64::from(rows) * u64::from(heads) * u64::from(width);
+    // Sixteen codes a thread where every row is whole 16-byte runs of an
+    // aligned table: the same widening, code for code, in a sixteenth of
+    // the requests (which is what counts where the table is mapped host
+    // memory).
+    let vec16 = width.is_multiple_of(16) && codes.ptr % 16 == 0;
+    let (entry, per) = if vec16 {
+        ("embed_concat_e4m3_vec16", width / 16)
+    } else {
+        ("embed_concat_e4m3", width)
+    };
+    let total = u64::from(rows) * u64::from(heads) * u64::from(per);
     let lanes = u32::try_from(total).map_err(|_| {
         refuse(
             OP,
@@ -60,7 +70,7 @@ pub fn embed_concat_e4m3(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::layout::embed_concat_e4m3<{t}>")),
+            symbol(&format!("::pie::layout::{entry}<{t}>")),
         )
         .apply(Launch::flat(lanes, BLOCK)),
         &[
