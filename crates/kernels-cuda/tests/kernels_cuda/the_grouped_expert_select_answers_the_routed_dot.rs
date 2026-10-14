@@ -129,6 +129,18 @@ fn the_grouped_expert_select_answers_the_routed_dot_every_case() {
     a_decode_width_fire_is_still_served();
     a_dominant_expert_still_fits_the_block_budget();
     a_ragged_expert_count_still_lands();
+    the_tcgen05_widths_land_masked_and_contiguous();
+}
+
+/// Widths the grouped tcgen05 GEMM takes (on a device that has it): a
+/// decode fire laid out masked, prefill fires contiguous, one of them past
+/// 65535 routes, and one expert taking most of them.
+fn the_tcgen05_widths_land_masked_and_contiguous() {
+    check(16, 9, 2, 256, 128, true, Spread::Mixed);
+    check(16, 64, 4, 256, 192, false, Spread::Mixed);
+    check(16, 70, 4, 256, 192, true, Spread::Mixed);
+    check(16, 300, 4, 512, 320, true, Spread::Dominant);
+    check(8, 33_000, 2, 64, 64, true, Spread::Mixed);
 }
 
 fn the_token_read_leg_answers_the_dot() {

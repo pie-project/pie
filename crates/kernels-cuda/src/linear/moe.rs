@@ -412,11 +412,84 @@ pub fn matmul_select(
     #[cfg(feature = "cuda")]
     {
         let fan = selected(OP, x, routes, y)?;
+        if tc5_worth(ctx, x, bank.dtype, y, experts) {
+            return select_tc5(
+                ctx,
+                OP,
+                x,
+                crate::linear::tc5::Operand::plain(bank.ptr, crate::linear::tc5::Elem::Bf16),
+                bank.rows,
+                routes,
+                y,
+            );
+        }
         if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
             return select_grouped(ctx, OP, x, bank, routes, y, count);
         }
     }
     select_gemv(ctx, OP, x, bank, routes, y, experts)
+}
+
+/// Whether a select of `x` (bf16) runs on the grouped tcgen05 GEMM: a
+/// resident bank, unstaged, on a device that has it, at widths its tiles
+/// take.
+#[cfg(feature = "cuda")]
+fn tc5_worth(ctx: &Ctx, x: Tensor, bank: Dtype, y: &Tensor, experts: ExpertTable) -> bool {
+    x.dtype == Dtype::Bf16
+        && bank == Dtype::Bf16
+        && !experts.streams()
+        && matches!(ctx.stage(), ArgValue::Ptr(0))
+        && x.width.is_multiple_of(64)
+        && y.width.is_multiple_of(64)
+        && crate::linear::tc5::supported()
+}
+
+/// `y[route] = x[route or its token] . W[routes[route]]^T` on one grouped
+/// tcgen05 GEMM: the routes laid out by expert on the device, the
+/// activations scattered into their experts' rows, and the product
+/// gathered back to route order. No route-count limit past the device's
+/// memory.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_tc5(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    w: crate::linear::tc5::Operand,
+    experts: u32,
+    routes: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    use crate::linear::{act_quant, tc5};
+    const GROUPED_X: &str = "linear.moe_tc5_x";
+    const GROUPED_Y: &str = "linear.moe_tc5_y";
+    let fan = selected(op, x, routes, y)?;
+    let count = fan.route_count;
+    if count == 0 {
+        return Ok(());
+    }
+    let (n, k) = (y.width, x.width);
+    // The routers this select serves name an expert once a token.
+    let layout = act_quant::lay_out(ctx, op, routes, experts, tc5::GROUP_ALIGN, true)?;
+    let div = if fan.by_token { routes.width } else { 1 };
+    let xs = ctx.scratch_stream(op, GROUPED_X, layout.rows as usize * k as usize * 2)? as u64;
+    act_quant::scatter_rows(ctx, op, x, div, layout.pos, count, xs)?;
+    let ys = ctx.scratch_stream(op, GROUPED_Y, layout.rows as usize * n as usize * 2)? as u64;
+    tc5::grouped_gemm(
+        ctx,
+        tc5::Operand::plain(xs, tc5::Elem::Bf16),
+        w,
+        ys,
+        tc5::Grouped {
+            experts,
+            groups: layout.groups,
+            alpha_e: 0,
+        },
+        [n, k],
+        1.0,
+        count,
+    )?;
+    act_quant::gather_back(ctx, op, ys, layout.pos, y)
 }
 
 #[cfg(feature = "cuda")]

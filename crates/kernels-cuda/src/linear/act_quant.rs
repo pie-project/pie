@@ -358,10 +358,15 @@ pub struct Bank {
     pub alpha_e: u64,
 }
 
-/// A fire of this many routes or fewer lays them out masked, each expert's
-/// rows a block as long as the fire's routes (a routing may name one expert
-/// twice for a token); a wider one lays them out contiguous.
-const MASKED_ROUTES: u32 = 64;
+/// A fire of this many routes (or tokens, when no token names an expert
+/// twice) or fewer lays them out masked, each expert's rows a block as long
+/// as the fire's routes (tokens); a wider one lays them out contiguous.
+const MASKED_FIRE: u32 = 64;
+
+/// A select's experts start whole 128-row scale blocks apart when its
+/// activations carry block scales (the atoms it lands are whole blocks).
+const BLOCK_ROWS: u32 = 128;
+const _: () = assert!(BLOCK_ROWS.is_multiple_of(tc5::GROUP_ALIGN));
 
 const ROUTE_COUNTS: &str = "linear.act_quant.route_counts";
 const ROUTE_OFFSETS: &str = "linear.act_quant.route_offsets";
@@ -400,66 +405,17 @@ pub fn select(
         return Ok(());
     }
     let div = if x.rows == count { 1 } else { routes.width };
-    let m_max = if count <= MASKED_ROUTES { count } else { 0 };
-    let e = experts as usize;
-    let i32s = |name, len: usize| -> Result<u64, Error> {
-        Ok(ctx.scratch_stream(op, name, len * 4)? as u64)
-    };
-    let counts = i32s(ROUTE_COUNTS, e)?;
-    let offsets = i32s(ROUTE_OFFSETS, e + 1)?;
-    let cursor = i32s(ROUTE_CURSOR, e)?;
-    let pos = i32s(ROUTE_POS, count as usize)?;
-    zero(ctx, op, counts, e * 4)?;
-    let int = |v: u32| stated(op, v).map(|v| v.arg());
-    ctx.fire(
-        op,
-        Fire::at(FILE, "::pie::linear::route_count").apply(Launch::flat(count, BLOCK)),
-        &[routes.arg(), int(count)?, ArgValue::Ptr(counts)],
-    )?;
-    ctx.fire(
-        op,
-        Fire::at(FILE, "::pie::linear::route_offsets").apply(Launch::flat(32, 32)),
-        &[
-            ArgValue::Ptr(counts),
-            int(experts)?,
-            int(m_max)?,
-            ArgValue::Ptr(offsets),
-            ArgValue::Ptr(cursor),
-        ],
-    )?;
-    ctx.fire(
-        op,
-        Fire::at(FILE, "::pie::linear::route_place").apply(Launch::flat(count, BLOCK)),
-        &[
-            routes.arg(),
-            int(count)?,
-            ArgValue::Ptr(cursor),
-            ArgValue::Ptr(pos),
-        ],
-    )?;
-
-    let gran = fmt.gran() as usize;
-    let (rows, groups, atom_bytes) = if m_max > 0 {
-        let rows = experts * m_max;
-        let groups = tc5::Groups::Masked { counts, m_max };
-        (
-            rows,
-            groups,
-            tc5::masked_atom_bytes(e, m_max as usize, k as usize, gran),
-        )
+    let Layout {
+        pos,
+        rows,
+        groups,
+        m_max,
+    } = lay_out(ctx, op, routes, experts, BLOCK_ROWS, false)?;
+    let (e, gran) = (experts as usize, fmt.gran() as usize);
+    let atom_bytes = if m_max > 0 {
+        tc5::masked_atom_bytes(e, m_max as usize, k as usize, gran)
     } else {
-        // Each expert's rows start a whole 128-row scale block apart (a
-        // multiple of the GEMM's group alignment), as `route_offsets` lays
-        // them.
-        const BLOCK_ROWS: u32 = 128;
-        const _: () = assert!(BLOCK_ROWS.is_multiple_of(tc5::GROUP_ALIGN));
-        let rows = (count + (BLOCK_ROWS - 1) * experts.min(count)).next_multiple_of(BLOCK_ROWS);
-        let groups = tc5::Groups::Contiguous { offsets, rows };
-        (
-            rows,
-            groups,
-            tc5::atom_bytes(rows as usize, k as usize, gran),
-        )
+        tc5::atom_bytes(rows as usize, k as usize, gran)
     };
     let codes = ctx.scratch_stream(op, ACT_CODES, rows as usize * fmt.row_bytes(k) as usize)?;
     let atoms = ctx.scratch_stream(op, ACT_ATOMS, atom_bytes)?;
@@ -494,8 +450,110 @@ pub fn select(
         1.0,
         count,
     )?;
+    gather_back(ctx, op, grouped, pos, y)
+}
+
+/// Routes laid out by expert on the device, as the grouped [`tc5`] GEMM
+/// reads them: route `r` at row `pos[r]` of `rows` (negative: dropped, or
+/// past the context's live window, whose rows are left alone). A fire of
+/// [`MASKED_FIRE`] routes or fewer is masked, each expert `m_max` = its
+/// route count of rows (its count of them live) -- or of tokens or fewer
+/// when `distinct` (no token names an expert twice: `m_max` = its tokens);
+/// a wider one contiguous, each expert's rows `align` apart.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Layout {
+    pub pos: u64,
+    pub rows: u32,
+    pub groups: tc5::Groups,
+    pub m_max: u32,
+}
+
+/// Lays `routes` (`i32 [tokens][top]`, an expert of `experts` or negative)
+/// out by expert: counts, offsets and each route's row, on the device.
+pub(crate) fn lay_out(
+    ctx: &Ctx,
+    op: &'static str,
+    routes: Tensor,
+    experts: u32,
+    align: u32,
+    distinct: bool,
+) -> Result<Layout, Error> {
+    let tokens = routes.rows;
+    let count = tokens * routes.width;
+    let m_max = match distinct {
+        true if tokens <= MASKED_FIRE => tokens,
+        false if count <= MASKED_FIRE => count,
+        _ => 0,
+    };
+    let e = experts as usize;
+    let i32s = |name, len: usize| -> Result<u64, Error> {
+        Ok(ctx.scratch_stream(op, name, len * 4)? as u64)
+    };
+    let counts = i32s(ROUTE_COUNTS, e)?;
+    let offsets = i32s(ROUTE_OFFSETS, e + 1)?;
+    let cursor = i32s(ROUTE_CURSOR, e)?;
+    let pos = i32s(ROUTE_POS, count as usize)?;
+    zero(ctx, op, counts, e * 4)?;
+    let int = |v: u32| stated(op, v).map(|v| v.arg());
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::route_count").apply(Launch::flat(count, BLOCK)),
+        &[routes.arg(), int(count)?, ArgValue::Ptr(counts)],
+    )?;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::route_offsets").apply(Launch::flat(32, 32)),
+        &[
+            ArgValue::Ptr(counts),
+            int(experts)?,
+            int(m_max)?,
+            int(align)?,
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(cursor),
+        ],
+    )?;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::route_place").apply(Launch::flat(count, BLOCK)),
+        &[
+            routes.arg(),
+            int(count)?,
+            ArgValue::Ptr(cursor),
+            ArgValue::Ptr(pos),
+        ],
+    )?;
+    Ok(if m_max > 0 {
+        Layout {
+            pos,
+            rows: experts * m_max,
+            groups: tc5::Groups::Masked { counts, m_max },
+            m_max,
+        }
+    } else {
+        // Each expert's rows start a whole alignment apart.
+        let rows = (count + (align - 1) * experts.min(count)).next_multiple_of(align);
+        Layout {
+            pos,
+            rows,
+            groups: tc5::Groups::Contiguous { offsets, rows },
+            m_max,
+        }
+    })
+}
+
+/// `y[r] = grouped[pos[r]]`, a dropped route's row zeros: the grouped
+/// product back in route order.
+pub(crate) fn gather_back(
+    ctx: &Ctx,
+    op: &'static str,
+    grouped: u64,
+    pos: u64,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let (count, n) = (y.rows, y.width);
     let pairs = u32::try_from(u64::from(count) * u64::from(n / 2))
         .map_err(|_| refuse(op, format!("{count} routes of {n} overflow a launch")))?;
+    let int = |v: u32| stated(op, v).map(|v| v.arg());
     ctx.fire(
         op,
         Fire::at(FILE, "::pie::linear::route_gather").apply(Launch::flat(pairs, BLOCK)),
@@ -505,6 +563,47 @@ pub fn select(
             y.arg(),
             int(count)?,
             int(n)?,
+        ],
+    )
+}
+
+/// `grouped[pos[r]] = x[r / div]` for each of `count` routes (a dropped one
+/// lands nowhere): bf16 activations in the layout's rows.
+pub(crate) fn scatter_rows(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    div: u32,
+    pos: u64,
+    count: u32,
+    grouped: u64,
+) -> Result<(), Error> {
+    if x.dtype != Dtype::Bf16 || !x.width.is_multiple_of(8) {
+        return Err(refuse(
+            op,
+            format!(
+                "rows scatter as bf16 in 16-byte runs, not {:?} x {}",
+                x.dtype, x.width
+            ),
+        ));
+    }
+    let runs = u32::try_from(u64::from(count) * u64::from(x.width / 8)).map_err(|_| {
+        refuse(
+            op,
+            format!("{count} routes of {} overflow a launch", x.width),
+        )
+    })?;
+    let int = |v: u32| stated(op, v).map(|v| v.arg());
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::route_scatter_rows").apply(Launch::flat(runs, BLOCK)),
+        &[
+            x.arg(),
+            ArgValue::Ptr(pos),
+            ArgValue::Ptr(grouped),
+            int(count)?,
+            int(x.width)?,
+            int(div)?,
         ],
     )
 }

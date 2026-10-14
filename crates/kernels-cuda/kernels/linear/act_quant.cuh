@@ -214,7 +214,7 @@ __global__ void scales_to_atoms(
 }
 
 // Routes laid out by expert for the grouped GEMM: each routed expert's
-// count, its rows' start (whole 128-row blocks apart for the contiguous
+// count, its rows' start (`align` rows apart, rounded up, for the contiguous
 // layout, `m_max` apart for the masked one) and each route's row.
 __global__ void route_count(const i32* __restrict__ routes, int count, i32* __restrict__ counts)
 {
@@ -226,6 +226,7 @@ __global__ void route_offsets(
     const i32* __restrict__ counts,
     int experts,
     int m_max,
+    int align,
     i32* __restrict__ offsets,
     i32* __restrict__ cursor)
 {
@@ -234,7 +235,7 @@ __global__ void route_offsets(
     for (int e = 0; e < experts; ++e) {
         offsets[e] = at;
         cursor[e] = at;
-        at += m_max > 0 ? m_max : (counts[e] + 127) / 128 * 128;
+        at += m_max > 0 ? m_max : (counts[e] + align - 1) / align * align;
     }
     offsets[experts] = at;
 }
@@ -269,6 +270,27 @@ __global__ void route_gather(
         return;
     }
     *dst = *reinterpret_cast<const bf16x2*>(grouped + static_cast<long long>(o) * n + c);
+}
+
+// `grouped[pos[r]] = x[r / div]`, 16 bytes a thread; a dropped route lands
+// nowhere.
+__global__ void route_scatter_rows(
+    const bf16* __restrict__ x,
+    const i32* __restrict__ pos,
+    bf16* __restrict__ grouped,
+    int count,
+    int k,
+    int div)
+{
+    const long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int runs = k / 8;
+    if (at >= static_cast<long long>(count) * runs) return;
+    const int r = static_cast<int>(at / runs);
+    const int c = static_cast<int>(at % runs) * 8;
+    const int o = pos[r];
+    if (o < 0) return;
+    *reinterpret_cast<uint4*>(grouped + static_cast<long long>(o) * k + c) =
+        *reinterpret_cast<const uint4*>(x + static_cast<long long>(r / div) * k + c);
 }
 
 // Each expert's product scale: its activations' static global times its
