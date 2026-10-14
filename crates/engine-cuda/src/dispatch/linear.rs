@@ -658,6 +658,16 @@ impl Run<'_> {
                 let mut y =
                     kernels_cuda::tensor::Tensor::new(y.ptr, rows, y.width / groups_nz, y.dtype);
                 let (bank, experts) = self.expert_bank(*w);
+                // One "expert" a group: the plane viewed `[groups, n * k]`, so
+                // a select that lays routes out by expert (the grouped and
+                // tcgen05 legs) counts groups, not the plane's rows.
+                let span = u64::from(bank.rows) * u64::from(bank.width);
+                let bank = match u32::try_from(span / u64::from(groups_nz)) {
+                    Ok(per) if span % u64::from(groups_nz) == 0 => {
+                        kernels_cuda::tensor::Tensor::new(bank.ptr, groups_nz, per, bank.dtype)
+                    }
+                    _ => bank,
+                };
                 linear::moe::matmul_select(
                     self.ctx(),
                     x,

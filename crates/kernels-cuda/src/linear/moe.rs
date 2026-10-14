@@ -413,8 +413,9 @@ pub fn matmul_select(
     {
         let fan = selected(OP, x, routes, y)?;
         if tc5_worth(ctx, x, bank.dtype, y, experts, routes.rows, fan.route_count) {
-            // A tcgen05 launch that fails falls back to the arm below.
-            if select_tc5(
+            // A tcgen05 launch that fails falls back to the arm below, said
+            // once a process.
+            match select_tc5(
                 ctx,
                 OP,
                 x,
@@ -423,10 +424,9 @@ pub fn matmul_select(
                 routes,
                 y,
                 crate::linear::tc5::Epilogue::STORE,
-            )
-            .is_ok()
-            {
-                return Ok(());
+            ) {
+                Ok(()) => return Ok(()),
+                Err(why) => tc5_fell_back(OP, &why),
             }
         }
         if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
@@ -434,6 +434,16 @@ pub fn matmul_select(
         }
     }
     select_gemv(ctx, OP, x, bank, routes, y, experts)
+}
+
+/// Says, once a process, that a select the tcgen05 GEMM was to take fell
+/// back to the GEMV, and why: a silent fallback reads as a slow kernel.
+#[cfg(feature = "cuda")]
+fn tc5_fell_back(op: &'static str, why: &Error) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("kernels-cuda: `{op}` fell back from the tcgen05 grouped GEMM: {why}");
+    }
 }
 
 /// Whether a select of `x` (bf16) runs on the grouped tcgen05 GEMM: a
@@ -1061,16 +1071,16 @@ pub(crate) fn select_gemv(
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(bank.dtype, x.dtype, "the bank rides the activation's dtype");
     let fan = selected(op, x, routes, y)?;
-    if fan.route_count > MAX_GRID_Y {
-        return Err(refuse(
-            op,
-            format!(
-                "the route run is {}, above the {MAX_GRID_Y} rows this GEMV puts on the \
-                 grid's y axis; the aligned batched leg is what a wider fire wants",
-                fan.route_count
-            ),
-        ));
+    if fan.route_count == 0 {
+        return Ok(());
     }
+    // A run past grid.y's 65535 rows continues on grid.z; every run within
+    // it launches as it did.
+    let (grid_y, grid_z) = if fan.route_count > MAX_GRID_Y {
+        (MAX_GRID_Y, fan.route_count.div_ceil(MAX_GRID_Y))
+    } else {
+        (fan.route_count, 1)
+    };
     if x.width == 0 || !x.width.is_multiple_of(VEC_WIDTH) {
         return Err(refuse(
             op,
@@ -1092,7 +1102,7 @@ pub(crate) fn select_gemv(
             )),
         )
         .apply(Launch::grid(
-            [y.width.div_ceil(GEMV_WARPS), fan.route_count, 1],
+            [y.width.div_ceil(GEMV_WARPS), grid_y, grid_z],
             [WARP, GEMV_WARPS, 1],
         )),
         &[
@@ -1106,6 +1116,7 @@ pub(crate) fn select_gemv(
             (i64::from(n) * i64::from(k)).arg(), // the bank's expert stride
             ArgValue::Ptr(experts.table),
             ArgValue::Ptr(experts.hits),
+            stated(op, fan.route_count)?.arg(),
             ctx.stage(),
         ],
     )

@@ -843,10 +843,13 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
     int top_k, int K, int N, long long expert_stride,
     const T* const* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits,
-    const u32* __restrict__ win)
+    const u32* __restrict__ win,
+    int route_count)
 {
-    const int route = blockIdx.y;
+    // A run past the 65535 rows grid.y holds continues on grid.z.
+    const int route = static_cast<int>(blockIdx.y + blockIdx.z * gridDim.y);
 
+    if (route >= route_count) return;
     if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
     const int plane_route = win != nullptr
         ? route + static_cast<int>(win[1]) * top_k
@@ -927,7 +930,7 @@ __global__ void moe_matmul_select_gemv(
 {
     moe_matmul_select_gemv_body<T, ActByToken, kWarps, kUnroll>(
         topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
-        expert_table, expert_hits, nullptr);
+        expert_table, expert_hits, nullptr, 0x7fffffff);
 }
 
 template <class T>
@@ -939,11 +942,12 @@ __global__ void moe_matmul_select_gemv_by_token(
     int top_k, int K, int N, long long expert_stride,
     const T* const* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits,
+    int route_count,
     const u32* __restrict__ win)
 {
     moe_matmul_select_gemv_body<T, true, kGemvWarps, 1>(
         topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
-        expert_table, expert_hits, win);
+        expert_table, expert_hits, win, route_count);
 }
 
 template <class T>
@@ -955,11 +959,12 @@ __global__ void moe_matmul_select_gemv_by_route(
     int top_k, int K, int N, long long expert_stride,
     const T* const* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits,
+    int route_count,
     const u32* __restrict__ win)
 {
     moe_matmul_select_gemv_body<T, false, kGemvWarps, 1>(
         topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
-        expert_table, expert_hits, win);
+        expert_table, expert_hits, win, route_count);
 }
 
 template <class T>

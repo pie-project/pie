@@ -145,6 +145,7 @@ fn the_grouped_expert_select_answers_the_routed_dot_every_case() {
     the_token_read_leg_answers_the_dot();
     the_route_read_leg_answers_the_dot();
     a_fire_wider_than_the_gemvs_grid_is_still_answered();
+    a_gemv_run_past_grid_y_is_answered();
     a_decode_width_fire_is_still_served();
     a_dominant_expert_still_fits_the_block_budget();
     a_ragged_expert_count_still_lands();
@@ -173,6 +174,18 @@ fn the_route_read_leg_answers_the_dot() {
 
 fn a_fire_wider_than_the_gemvs_grid_is_still_answered() {
     check(8, 33_000, 2, 32, 32, true, Spread::Mixed);
+}
+
+/// A route run past grid.y's 65535 rows on the GEMV itself (the grouped
+/// and tcgen05 legs off), read by token and by route: DeepSeek-V4's grouped
+/// o-projection at an 8192-row fire is 65536 routes.
+fn a_gemv_run_past_grid_y_is_answered() {
+    let gemv = Tuning {
+        moe_grouped: false,
+        ..Tuning::DEFAULT
+    };
+    check_tuned(gemv, 8, 33_000, 2, 32, 32, true, Spread::Mixed);
+    check_tuned(gemv, 8, 8_192, 8, 32, 32, false, Spread::Mixed);
 }
 
 fn a_decode_width_fire_is_still_served() {
