@@ -183,13 +183,22 @@ fn every_probe_is_dumped() {
             // Eager, at the registry defaults; `PIE_PARITY_KERNEL` adds
             // `[kernel]` decisions (a chip profile's, `;`-separated) to
             // read under.
-            chip: Some(match std::env::var("PIE_PARITY_KERNEL") {
-                Ok(kernel) => engine_cuda::chip::profile(&format!(
-                    "[engine]\ngraphs = \"off\"\n[kernel]\n{}\n",
-                    kernel.replace(';', "\n")
-                )),
-                Err(_) => engine_cuda::chip::pinned(Graphs::Off, None),
-            }),
+            // `PIE_PARITY_DEVICE_PROFILE` reads under the device's own
+            // resolved profile instead (graphs, bodies and side streams as a
+            // server runs them), a user file in `PIE_PARITY_PROFILES`
+            // overlaid.
+            chip: if std::env::var_os("PIE_PARITY_DEVICE_PROFILE").is_some() {
+                None
+            } else {
+                Some(match std::env::var("PIE_PARITY_KERNEL") {
+                    Ok(kernel) => engine_cuda::chip::profile(&format!(
+                        "[engine]\ngraphs = \"off\"\n[kernel]\n{}\n",
+                        kernel.replace(';', "\n")
+                    )),
+                    Err(_) => engine_cuda::chip::pinned(Graphs::Off, None),
+                })
+            },
+            profiles: std::env::var_os("PIE_PARITY_PROFILES").map(PathBuf::from),
             ..Knobs::default()
         },
         cache_dir: tactics.as_deref(),
