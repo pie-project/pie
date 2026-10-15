@@ -91,6 +91,15 @@ pub struct OneFrameWhenShort;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.forward_tokens", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct ForwardTokens(pub u32);
+
+/// The prompt rows a lane brings to a fire, as the chunked gated delta walk
+/// sizes its fire by: where a trace has chunked gated delta layers of `H`
+/// value heads and `max_forward_tokens` is not stated, a fire takes at most
+/// `floor(SMs / H)` lanes of this many rows, so the walk's one block a (lane,
+/// value head) runs in one wave. 0 leaves the fire as `forward_tokens` says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.walk_fire_rows", constant(range(0..=65536)), default = 0, tune = engine)]
+pub struct WalkFireRows(pub u32);
 /// Whether a plane its package declares `host` (read only by row gathers, as
 /// a hashed n-gram table) is served from pinned, device-mapped host memory,
 /// its device bytes left to KV pages and state slots. Off holds every plane
@@ -111,6 +120,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<StateSlotsPerLane>()
         .add::<OneFrameWhenShort>()
         .add::<ForwardTokens>()
+        .add::<WalkFireRows>()
         .add::<HostPlanes>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     poem_compiler::costs::register(&mut r, 2);
@@ -170,6 +180,7 @@ pub struct Engine {
     pub state_slots_per_lane: u32,
     pub one_frame_when_short: bool,
     pub forward_tokens: u32,
+    pub walk_fire_rows: u32,
     pub host_planes: bool,
 }
 
@@ -196,6 +207,7 @@ impl Engine {
             state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
             one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
             forward_tokens: profile.get::<ForwardTokens>().0,
+            walk_fire_rows: profile.get::<WalkFireRows>().0,
             host_planes: profile.on::<HostPlanes>(&Anywhere),
         }
     }
@@ -479,6 +491,7 @@ mod tests {
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 forward_tokens: 0,
+                walk_fire_rows: 0,
                 host_planes: false,
             }
         );
@@ -529,12 +542,14 @@ mod tests {
         assert_eq!(Engine::of(&b200).state_slots_per_lane, 2);
         assert!(Engine::of(&b200).one_frame_when_short);
         assert_eq!(Engine::of(&b200).forward_tokens, 16384);
+        assert_eq!(Engine::of(&b200).walk_fire_rows, 4096);
         assert!(Engine::of(&b200).host_planes);
         assert_eq!(
             Engine {
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 forward_tokens: 0,
+                walk_fire_rows: 0,
                 host_planes: false,
                 ..Engine::of(&b200)
             },

@@ -53,6 +53,16 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             0 => crate::api::DEFAULT_FORWARD_TOKENS,
             tokens => tokens,
         };
+        if let Some(fit) = walk_fire_fit(&boot.trace, engine.walk_fire_rows, device.device().num_sm)
+            && fit < boot.budget.max_tokens
+        {
+            eprintln!(
+                "engine-cuda: fires of {fit} rows where {} were asked: the chunked gated delta \
+                 walk's blocks fit one wave (engine.walk_fire_rows)",
+                boot.budget.max_tokens
+            );
+            boot.budget.max_tokens = fit;
+        }
     }
     if engine.host_planes {
         let freed = boot.residency.host_declared(&boot.trace)?;
@@ -1273,4 +1283,25 @@ pub(super) struct Baked {
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
     pub(super) profile: DeviceProfile,
+}
+
+/// The widest fire whose lanes of `rows` prompt rows put no more (lane,
+/// value head) blocks of the trace's widest chunked gated delta walk than the
+/// card has SMs; `None` where `rows` is 0 or the trace has no such walk.
+fn walk_fire_fit(trace: &poem_ir::Trace, rows: u32, sms: u32) -> Option<u32> {
+    if rows == 0 {
+        return None;
+    }
+    let heads = trace
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            poem_ir::Operation::Attention(poem_ir::Attention::SsmGatedDeltaChunked {
+                v_heads,
+                ..
+            }) => Some(*v_heads),
+            _ => None,
+        })
+        .max()?;
+    Some((sms / heads.max(1)).max(1) * rows)
 }

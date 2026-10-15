@@ -56,6 +56,14 @@ host_planes = true
 one_frame_when_short = true
 state_slots_per_lane = 2
 forward_tokens = 16384
+# A gated delta model's fire at most floor(148 / value heads) lanes of 4096
+# rows, so the chunked walk's one block a (lane, value head) runs in one
+# wave: Qwen3.8-27B's 48 value heads put 4 x 48 = 192 blocks on 148 SMs at
+# 16384 rows, two waves; 12288 runs one. Its 32 x 4096 prefill 23,629 /
+# 23,645 -> 24,407 / 24,501 tok/s; 256 x 1024/256 served 3237 / 3259 ->
+# 3213 / 3230 output tok/s (within run to run), decode unmoved. Qwen3.6's 32
+# value heads already fit at 16384; a model without the walk is untouched.
+walk_fire_rows = 4096
 
 [provenance]
 source = "pie tune (quick, gemma4-31b) and the scoreboard's fixed points, end to end"
@@ -88,5 +96,6 @@ measured = [
   "engine.one_frame_when_short",
   "engine.recording",
   "engine.state_slots_per_lane",
+  "engine.walk_fire_rows",
   "engine.working_set_percent",
 ]
