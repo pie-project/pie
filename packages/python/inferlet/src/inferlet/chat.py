@@ -73,6 +73,15 @@ def cue() -> list[int]:
     return list(_chat.cue())
 
 
+def system_thinking(message: str | None = None, effort: str = "xhigh") -> list[int]:
+    """The system turn of a request the model answers with thinking, as its
+    template renders it: the template's reasoning-effort instruction
+    (``effort``: ``"xhigh"``, the template's default, ``"medium"`` or
+    ``"low"``) ahead of ``message``, in a system turn of its own when
+    ``message`` is ``None``. :func:`system` where the template has none."""
+    return list(_chat.system_thinking(message, _chat.ReasoningEffort[effort.upper()]))
+
+
 def cue_without_thinking() -> list[int]:
     """:func:`cue` for a turn the model answers without thinking: an empty
     thinking block where the model has one, as its template renders

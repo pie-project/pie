@@ -4,13 +4,17 @@ use tokenizer::{Tokenizer, TokenizerDecoder};
 
 use crate::decode::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder, ThinkingDecoder};
 use crate::{
-    ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar, special, specials,
+    ChatDecoder, Effort, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar, special,
+    specials,
 };
 
 #[derive(Clone, Debug)]
 pub struct ChatML {
     pub thinking: bool,
     pub preserve_thinking: bool,
+    /// The template opens a thinking request's system turn with its
+    /// reasoning-effort instruction (Qwen3.8).
+    pub reasoning_effort: bool,
     pub tools: bool,
     pub generation_suffix: String,
     pub stop_tokens: Vec<String>,
@@ -180,9 +184,29 @@ json-array ::= "[" ws (json-value (ws "," ws json-value)* ws)? "]"
 ws ::= [ \t\n\r]{0,20}
 "#;
 
+/// Qwen3.8's `chat_template.jinja`, word for word; `medium` writes none.
+const EFFORT_XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+const EFFORT_LOW: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+
 impl Instruct for ChatMLInstruct {
     fn system(&self, msg: &str) -> Vec<u32> {
         self.turn(&self.system_prefix, msg)
+    }
+
+    fn system_thinking(&self, msg: Option<&str>, effort: Effort) -> Vec<u32> {
+        let instruction = match effort {
+            _ if !(self.config.thinking && self.config.reasoning_effort) => None,
+            Effort::Xhigh => Some(EFFORT_XHIGH),
+            Effort::Low => Some(EFFORT_LOW),
+            Effort::Medium => None,
+        };
+        let content = msg.map(str::trim).filter(|m| !m.is_empty());
+        match (instruction, content) {
+            (Some(i), Some(c)) => self.turn(&self.system_prefix, &format!("{i}\n\n{c}")),
+            (Some(i), None) => self.turn(&self.system_prefix, i),
+            (None, Some(c)) => self.system(c),
+            (None, None) => Vec::new(),
+        }
     }
 
     fn user(&self, msg: &str) -> Vec<u32> {
@@ -345,6 +369,7 @@ mod tests {
         ChatML {
             thinking,
             preserve_thinking,
+            reasoning_effort: false,
             tools: true,
             generation_suffix: String::new(),
             stop_tokens: vec!["<|im_end|>".to_string()],

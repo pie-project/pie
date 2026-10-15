@@ -121,6 +121,7 @@ pub(crate) fn template_of(model: &poem::star::Model) -> chat_template::Spec {
         format: t.format.clone(),
         thinking: t.thinking,
         preserve_thinking: t.preserve_thinking,
+        reasoning_effort: t.reasoning_effort,
         tools: t.tools,
         generation_suffix: t.generation_suffix.clone(),
         stop: t.stop.clone(),

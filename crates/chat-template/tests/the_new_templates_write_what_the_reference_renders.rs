@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chat_template::Instruct;
+use chat_template::{Effort, Instruct};
 use tokenizer::Tokenizer;
 
 const MESSAGE: &str = "What is 17 times 23?";
@@ -28,6 +28,7 @@ fn the_new_templates_write_what_the_reference_renders_every_case() {
     inkling_writes_the_effort_line_the_user_turn_and_the_cue();
     atem_writes_the_user_turn_and_the_cue_after_the_opening();
     chatml_trims_the_turn_and_closes_an_empty_thinking_block();
+    qwen38_opens_a_thinking_request_with_its_reasoning_effort_instruction();
     gemma_closes_an_empty_thought_channel_where_its_template_does();
 }
 
@@ -45,6 +46,7 @@ fn chatml_trims_the_turn_and_closes_an_empty_thinking_block() {
         chat_template::chatml::ChatML {
             thinking: true,
             preserve_thinking: false,
+            reasoning_effort: false,
             tools: true,
             generation_suffix: String::new(),
             stop_tokens: vec!["<|im_end|>".to_string()],
@@ -57,6 +59,74 @@ fn chatml_trims_the_turn_and_closes_an_empty_thinking_block() {
         22, 2942, 220, 17, 18, 30, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
     ];
     assert_eq!(got, want);
+}
+
+/// Qwen3.8's template opens a thinking request's system turn with its
+/// reasoning-effort instruction (`xhigh` by default, `low` its own, `medium`
+/// none), in a system turn of its own when the request has no system message.
+/// The reference ids are `apply_chat_template(..., enable_thinking=True)` over
+/// the same snapshot, up to the generation cue.
+fn qwen38_opens_a_thinking_request_with_its_reasoning_effort_instruction() {
+    let Some(tokenizer) = snapshot(
+        "mlx-community/Qwen3.8-27B-4bit",
+        "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+    ) else {
+        return;
+    };
+    let config = |reasoning_effort| chat_template::chatml::ChatML {
+        thinking: true,
+        preserve_thinking: true,
+        reasoning_effort,
+        tools: true,
+        generation_suffix: String::new(),
+        stop_tokens: vec!["<|im_end|>".to_string()],
+    };
+    let qwen38 = chat_template::chatml::ChatMLInstruct::new(tokenizer.clone(), config(true));
+    let render =
+        |template: &chat_template::chatml::ChatMLInstruct, system: Option<&str>, effort| {
+            let mut got = template.system_thinking(system, effort);
+            got.extend(template.user(&format!("{MESSAGE}\n")));
+            got
+        };
+    let xhigh: &[u32] = &[
+        24342, 286, 4879, 369, 716, 310, 830, 11553, 13, 5044, 1683, 15060, 1472, 279, 3274, 11,
+        9307, 1328, 30800, 11, 2814, 47675, 25605, 11, 321, 60445, 55404, 11, 27224, 11, 321,
+        30246, 303, 279, 1534, 4087, 13,
+    ];
+    let low: &[u32] = &[
+        24342, 286, 4879, 369, 716, 310, 3238, 13, 13262, 678, 7047, 9522, 321, 10419, 11, 6992,
+        5774, 310, 279, 16198, 1973, 24366, 24150, 362, 13,
+    ];
+    let system: &[u32] = &[248045, 8678, 198];
+    let terse: &[u32] = &[2523, 513, 48834, 13];
+    let end: &[u32] = &[248046, 198];
+    let user: &[u32] = &[
+        248045, 846, 198, 3710, 369, 220, 16, 22, 2942, 220, 17, 18, 30, 248046, 198,
+    ];
+    let gap: &[u32] = &[271];
+    assert_eq!(
+        render(&qwen38, Some("You are terse."), Effort::Xhigh),
+        [system, xhigh, gap, terse, end, user].concat()
+    );
+    assert_eq!(
+        render(&qwen38, None, Effort::Xhigh),
+        [system, xhigh, end, user].concat()
+    );
+    assert_eq!(
+        render(&qwen38, Some("You are terse."), Effort::Low),
+        [system, low, gap, terse, end, user].concat()
+    );
+    assert_eq!(
+        render(&qwen38, Some("You are terse."), Effort::Medium),
+        [system, terse, end, user].concat()
+    );
+    // A template that states no instruction writes the plain system turn.
+    let plain = chat_template::chatml::ChatMLInstruct::new(tokenizer, config(false));
+    assert_eq!(
+        render(&plain, Some("You are terse."), Effort::Xhigh),
+        [system, terse, end, user].concat()
+    );
+    assert_eq!(render(&plain, None, Effort::Xhigh), user.to_vec());
 }
 
 /// Gemma 4 26B-A4B's and 31B's templates close an empty thought channel

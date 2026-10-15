@@ -25,6 +25,7 @@ pub struct Template {
     pub format: String,
     pub thinking: bool,
     pub preserve_thinking: bool,
+    pub reasoning_effort: bool,
     pub tools: bool,
     pub generation_suffix: String,
     pub stop: Vec<String>,
@@ -348,12 +349,13 @@ pub fn dtype_of(spelled: &str) -> Option<Dtype> {
 #[starlark_module]
 pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
     /// The template `format` with the settings it reads: ChatML `thinking`,
-    /// `preserve_thinking`, `tools`, `generation_suffix`, `stop`; `lines`
+    /// `preserve_thinking`, `reasoning_effort`, `tools`, `generation_suffix`, `stop`; `lines`
     /// `stop`, `bos`, `eos`; `raw` `stop`.
     fn template(
         #[starlark(require = pos)] format: String,
         #[starlark(require = named, default = false)] thinking: bool,
         #[starlark(require = named, default = false)] preserve_thinking: bool,
+        #[starlark(require = named, default = false)] reasoning_effort: bool,
         #[starlark(require = named, default = false)] tools: bool,
         #[starlark(require = named, default = String::new())] generation_suffix: String,
         #[starlark(require = named, default = UnpackList::default())] stop: UnpackList<String>,
@@ -364,6 +366,7 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
             format,
             thinking,
             preserve_thinking,
+            reasoning_effort,
             tools,
             generation_suffix,
             stop: stop.items,

@@ -8,6 +8,8 @@ load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
 
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 CHATML_INTERLEAVED = template("chatml", thinking = True, preserve_thinking = True, tools = True, stop = QWEN_STOP)
+# Qwen3.8's template opens a thinking request's system turn with its reasoning-effort instruction.
+CHATML_QWEN38 = template("chatml", thinking = True, preserve_thinking = True, reasoning_effort = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP], parts = {"vision": [QWEN_VISION]})
 TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"vision": [QWEN_VISION]})
 
@@ -19,7 +21,7 @@ def fixture(id):
 
 MODELS = [
     qwen("qwen36-27b", parts = ["vision"], drafters = ["mtp", "dflash"], layers = 64),
-    qwen("qwen38-27b", template = CHATML_INTERLEAVED, tokenizer = TOKENIZER_38, parts = ["vision"], drafters = ["mtp", "dflash2", "dspark"], layers = 64),
+    qwen("qwen38-27b", template = CHATML_QWEN38, tokenizer = TOKENIZER_38, parts = ["vision"], drafters = ["mtp", "dflash2", "dspark"], layers = 64),
     qwen("qwen35-d0.8b", parts = ["vision"], drafters = ["eagle"], layers = 24),
     qwen("qwen35-d2b", layers = 24),
     qwen("qwen35-d3b", layers = 24, vocab = 151936),

@@ -22,6 +22,20 @@ interface chat {
     system-user: func(system: string, user: string) -> list<u32>;
     assistant: func(message: string) -> list<u32>;
 
+    /// The reasoning effort a thinking request names.
+    enum reasoning-effort {
+        /// The template's default.
+        xhigh,
+        medium,
+        low,
+    }
+
+    /// The system turn of a request the model answers with thinking, as its
+    /// template renders it: the template's reasoning-effort instruction ahead
+    /// of `message`, in a system turn of its own when `message` is `none`.
+    /// `system(message)` (or nothing) where the template has no instruction.
+    system-thinking: func(message: option<string>, effort: reasoning-effort) -> list<u32>;
+
     /// Cue the model to generate (fills generation header)
     cue: func() -> list<u32>;
 
