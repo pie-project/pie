@@ -162,6 +162,7 @@ def layout(id, deploy):
         draft = None
     d = DIMS[id]
     dense = compute(weights)
+    table = dtype.bf16 if weights == dtype.bf16 else dtype.u4g64
     hidden = d.hidden
     streams = d.streams
     a = d.mla
@@ -291,8 +292,9 @@ def layout(id, deploy):
         kv_lora_rank = a.kv_lora_rank,
         kv = deploy.kv,
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn),
-        embed = weight("embed", [d.vocab, hidden], dtype.u4g64),
-        head = weight("lm_head", [d.vocab, hidden], dtype.u4g64),
+        # mlx stores its table and head at four bits; the release, unquantized.
+        embed = weight("embed", [d.vocab, hidden], table),
+        head = weight("lm_head", [d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight("final_norm", [hidden], dense),
         final_norm_eps = d.norm_eps,
