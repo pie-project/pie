@@ -81,6 +81,7 @@ fn the_skinny_gemm_lands_the_dot_and_its_epilogue_every_case() {
     the_plain_projection_answers_the_dot_at_one_ragged_and_full_rows();
     the_softcap_epilogue_lands_the_capped_logit();
     a_folded_bias_lands_the_bits_of_the_add_after_the_projection();
+    the_cublaslt_epilogue_lands_the_bias_of_a_decode_batch();
     the_geglu_epilogue_lands_the_gated_product();
     a_shape_the_block_does_not_divide_is_refused_without_firing();
 }
@@ -112,6 +113,45 @@ fn a_folded_bias_lands_the_bits_of_the_add_after_the_projection() {
         let got: Vec<u16> = gpu.down(fused.ptr, m * n);
         let want: Vec<u16> = gpu.down(apart.ptr, m * n);
         assert_eq!(got, want, "m={m} n={n} k={k}");
+    }
+}
+
+/// `kernel.gemm.bias_epilogue`: a projection whose shape chose a cuBLASLt
+/// algorithm lands the bias from its epilogue, within a rounding of the add
+/// after (the epilogue adds before the bf16 store).
+fn the_cublaslt_epilogue_lands_the_bias_of_a_decode_batch() {
+    let tuning = kernels_cuda::tuning::Tuning {
+        gemm_bias_epilogue: true,
+        ..kernels_cuda::tuning::Tuning::DEFAULT
+    };
+    for (m, n, k) in [(64, 5120, 2880), (64, 2880, 4096), (8, 640, 256)] {
+        let mut lcg = Lcg::seeded(0x5b ^ n as u64);
+        let (w_raw, _) = lcg.row(n * k);
+        let (a_raw, _) = lcg.row(m * k);
+        let (b_raw, _) = lcg.row(n);
+        let mut gpu = Gpu::open();
+        let w = Tensor::new(gpu.up(&w_raw), n as u32, k as u32, Dtype::Bf16);
+        let a = Tensor::new(gpu.up(&a_raw), m as u32, k as u32, Dtype::Bf16);
+        let b = Tensor::new(gpu.up(&b_raw), 1, n as u32, Dtype::Bf16);
+        let mut fused = Tensor::new(gpu.zeros(m * n * 2), m as u32, n as u32, Dtype::Bf16);
+        let mut apart = Tensor::new(gpu.zeros(m * n * 2), m as u32, n as u32, Dtype::Bf16);
+        let ctx = gpu.ctx().with_tuning(tuning);
+        // Twice: the first call picks the shape's tactic, the second runs it.
+        for _ in 0..2 {
+            matmul_bias(&ctx, a, w, b, &mut fused).expect("the biased projection fires");
+        }
+        matmul(&ctx, a, w, &mut apart).expect("the projection fires");
+        add_bias(&ctx, b, &mut apart).expect("the add fires");
+        gpu.sync();
+        let got: Vec<u16> = gpu.down(fused.ptr, m * n);
+        let want: Vec<u16> = gpu.down(apart.ptr, m * n);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            let (g, w) = (from_bf16(*g), from_bf16(*w));
+            assert!(
+                (g - w).abs() <= 1e-2 * w.abs().max(1.0),
+                "m={m} n={n} k={k} at {i}: {g} with the epilogue, {w} with the add"
+            );
+        }
     }
 }
 

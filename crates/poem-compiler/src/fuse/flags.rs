@@ -43,14 +43,21 @@ flags! {
     ResidualAddRmsnorm = "fuse.residual_add_rmsnorm" => "elementwise.residual_add_rmsnorm",
     MlpSwiglu = "fuse.mlp_swiglu" => "linear.mlp_swiglu",
     MatmulGeglu = "fuse.matmul_geglu" => "linear.matmul_geglu",
+    MoeExperts = "fuse.moe_experts" => "linear.moe_experts",
+    MoeSelectGlu = "fuse.moe_select_glu" => "linear.moe_select_glu",
+    MatmulSwiglu = "fuse.matmul_swiglu" => "linear.matmul_swiglu",
     LmHeadSoftcap = "fuse.lm_head_softcap" => "linear.lm_head_softcap",
     MatmulBias = "fuse.matmul_bias" => "linear.matmul_bias",
+    MatmulSplitRows = "fuse.matmul_split_rows" => "linear.matmul_split_rows",
     GatedResidualNormModulate = "fuse.gated_residual_norm_modulate" => "elementwise.gated_residual_norm_modulate",
     NormModulate = "fuse.norm_modulate" => "elementwise.norm_modulate",
     RmsnormRopePartialQ = "fuse.rmsnorm_rope_partial_q" => "elementwise.rmsnorm_rope_partial_q",
     HcNormProject = "fuse.hc_norm_project" => "elementwise.hc_norm_project",
     SsmGdnStep = "fuse.ssm_gdn_step" => "attention.ssm_gdn_step",
     QGateKNormRopeAppend = "fuse.q_gate_k_norm_rope_append" => "attention.q_gate_k_norm_rope_append",
+    SplitRopeYarnAppend = "fuse.split_rope_yarn_append" => "elementwise.split_rope_yarn_append",
+    RopeYarnAppend = "fuse.rope_yarn_append" => "elementwise.rope_yarn_append",
+    LseSink = "fuse.lse_sink" => "attention.lse_sink",
 }
 
 /// The fused kernels `profile` turns on, in rule order: what [`super::fuse`]

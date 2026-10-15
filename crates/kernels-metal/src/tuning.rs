@@ -27,6 +27,8 @@ pub enum Qmm {
     /// 8 rows, a whole number of its column tiles.
     #[partial]
     Mpp,
+    #[partial]
+    Staged,
     /// The tiled kernels (fp16 precast, split-k, plain), where the
     /// contraction is whole 32-code tiles and a tile fills the device.
     #[partial]
@@ -78,6 +80,7 @@ impl Qmm {
                 let (_, bn) = mpp_tile(u32::try_from(at.rows).unwrap_or(u32::MAX));
                 at.bits == 4 && at.group == 64 && at.rows >= 8 && at.n % i64::from(bn) == 0
             }
+            Qmm::Staged => at.bits == 4 && at.group == 64 && at.rows <= 8 && at.n % 64 == 0,
             Qmm::Tiled { .. } => at.k % i64::from(crate::linear::quant::QMM_BK) == 0,
             Qmm::Qmv { .. } => true,
         }

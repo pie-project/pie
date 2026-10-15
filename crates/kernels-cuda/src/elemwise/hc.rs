@@ -80,10 +80,21 @@ pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Resu
         "the normed rectangle is the stream rectangle"
     );
     nonzero(OP, "rows", y.rows)?;
+    // Eight elements a thread, 1024 threads a row, where the row is whole
+    // 16-byte runs: a 16384-wide stream row is two loads a thread, not 64
+    // serial ones (DeepSeek-V4-Flash decode8: 28 us a call).
+    let vec8 = y.width.is_multiple_of(8) && streams.ptr % 16 == 0 && y.ptr % 16 == 0;
+    let (entry, block) = if vec8 {
+        (
+            "::pie::elemwise::hc_rmsnorm_f32_vec8<::pie::bf16, 1024>",
+            1024,
+        )
+    } else {
+        ("::pie::elemwise::hc_rmsnorm_f32<::pie::bf16, 256>", BLOCK)
+    };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::elemwise::hc_rmsnorm_f32<::pie::bf16, 256>")
-            .apply(Launch::per_row(y.rows, BLOCK)),
+        Fire::at(FILE, entry).apply(Launch::per_row(y.rows, block)),
         &[
             streams.arg(),
             y.arg(),
@@ -131,17 +142,29 @@ pub fn project(
     }
     let mix_hc = hc_fn.rows;
     let layer_row = 2 * stream_count + stream_count * stream_count;
-    if mixes.width != mix_hc || (mix_hc != layer_row && mix_hc != stream_count) {
+    let independent_row = 2 * stream_count;
+    if mixes.width != mix_hc
+        || (mix_hc != layer_row && mix_hc != independent_row && mix_hc != stream_count)
+    {
         return Err(refuse(
             OP,
             format!(
-                "a {stream_count}-stream mix row is {layer_row} wide and a trunk collapse row \
-                 is {stream_count}; the plane lands {} rows into a {}-wide row",
+                "a {stream_count}-stream mix row is {layer_row} wide ({independent_row} without \
+                 its combine) and a trunk collapse row is {stream_count}; the plane lands {} \
+                 rows into a {}-wide row",
                 hc_fn.rows, mixes.width
             ),
         ));
     }
     let rows = nonzero(OP, "rows", mixes.rows)?;
+    // Four rows a block, a warp's mix columns every eighth (three of a
+    // layer's 24), the row's width cut into slices across blocks where the
+    // rows alone would leave the SMs idle (a decode fire). The kernel below
+    // read a row once a mix column and walked it alone (DeepSeek-V4-Flash:
+    // 8.3 s of a 32x4096 prefill, 3.3 ms a decode8 step).
+    if fan.is_multiple_of(4) && mix_hc <= 8 * PROJECT_COLS {
+        return project_split(ctx, OP, normed, hc_fn, mixes, rows, fan, mix_hc);
+    }
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::elemwise::hc_project<256>")
@@ -168,6 +191,7 @@ pub fn gates(
     gate_eps: f32,
     alpha: f32,
     sinkhorn: u32,
+    comb: bool,
     x: &mut Tensor,
     post_mix: &mut Tensor,
     comb_mix: &mut Tensor,
@@ -190,7 +214,51 @@ pub fn gates(
         post_mix.width == fan && comb_mix.width == fan * fan,
         "the gate matrices are `[N, M]` and `[N, M, M]`"
     );
+    // Without a combine the mix row is the pre and post logits alone, and
+    // the combine landed is the identity the fold carries each stream by.
+    let mix_hc = if comb { 2 * fan + fan * fan } else { 2 * fan };
+    if normed.width != mix_hc {
+        return Err(refuse(
+            OP,
+            format!(
+                "a {fan}-stream mix row {} its combine is {mix_hc} wide and this one is {}",
+                if comb { "with" } else { "without" },
+                normed.width
+            ),
+        ));
+    }
     nonzero(OP, "rows", x.rows)?;
+    // The combined form with its Sinkhorn walk in one warp and the row's
+    // width over blocks, enough of them to fill the SMs (DeepSeek-V4-Flash
+    // decode8: 32 us a call on the block-barrier walk, a block a row).
+    if comb && fan * fan <= 32 {
+        let hidden = nonzero(OP, "the hidden width", x.width)?;
+        let want = 2 * ctx.multiprocessors().unwrap_or(132);
+        let slices = want.div_ceil(x.rows).clamp(1, hidden.div_ceil(BLOCK));
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!("::pie::elemwise::hc_gates_warp<{t}, 256>")),
+            )
+            .apply(Launch::grid([x.rows, slices, 1], [BLOCK, 1, 1])),
+            &[
+                normed.arg(),
+                scale.arg(),
+                base.arg(),
+                streams.arg(),
+                post_mix.arg(),
+                comb_mix.arg(),
+                x.arg(),
+                stated(OP, fan)?.arg(),
+                stated(OP, hidden)?.arg(),
+                gate_eps.arg(),
+                alpha.arg(),
+                stated(OP, sinkhorn)?.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(
@@ -211,6 +279,7 @@ pub fn gates(
             gate_eps.arg(),
             alpha.arg(),
             stated(OP, sinkhorn)?.arg(),
+            comb.arg(),
             ctx.stage(),
         ],
     )
@@ -306,6 +375,15 @@ pub fn collapse(
     )
 }
 
+/// Whether rows `width` wide (two-byte elements) at these planes split into
+/// whole aligned 16-byte runs.
+/// The threads a block of the spread 16-byte mix and inject.
+const SPREAD: u32 = 64;
+
+fn whole_runs(width: u32, planes: &[u64]) -> bool {
+    width.is_multiple_of(8) && planes.iter().all(|p| p % 16 == 0)
+}
+
 pub fn mix(
     ctx: &Ctx,
     gates: Tensor,
@@ -326,10 +404,26 @@ pub fn mix(
     );
     debug_assert_eq!(y.rows, normed.rows, "the mix lands one narrow row per row");
     nonzero(OP, "rows", y.rows)?;
+    // Whole 16-byte runs where the width and the three planes allow them:
+    // the same sums, element for element.
+    let vec8 = whole_runs(y.width, &[gates.ptr, normed.ptr, y.ptr]);
+    // The 16-byte form spreads a row's columns over blocks of 64 threads, so
+    // a decode fire's few rows still fill the SMs; each element's sum is the
+    // same one, in the same order.
+    let (entry, launch) = if vec8 {
+        (
+            format!("::pie::elemwise::hc_mix_vec8<{t}, {SPREAD}>"),
+            Launch::grid([y.rows, (y.width / 8).div_ceil(SPREAD), 1], [SPREAD, 1, 1]),
+        )
+    } else {
+        (
+            format!("::pie::elemwise::hc_mix<{t}, 256>"),
+            Launch::per_row(y.rows, BLOCK),
+        )
+    };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::hc_mix<{t}, 256>")))
-            .apply(Launch::per_row(y.rows, BLOCK)),
+        Fire::at(FILE, symbol(&entry)).apply(launch),
         &[
             gates.arg(),
             normed.arg(),
@@ -360,13 +454,25 @@ pub fn inject(
         "one gate logit per stream per row, one wide row per row"
     );
     nonzero(OP, "rows", o.rows)?;
+    let vec8 = whole_runs(o.width, &[o.ptr, hyper.ptr]);
+    // As `mix`: a row's streams over blocks of 64 threads, the same sums.
+    let (entry, launch) = if vec8 {
+        (
+            format!("::pie::elemwise::hc_inject_vec8<{t}, {SPREAD}>"),
+            Launch::grid(
+                [o.rows, (fan * o.width / 8).div_ceil(SPREAD), 1],
+                [SPREAD, 1, 1],
+            ),
+        )
+    } else {
+        (
+            format!("::pie::elemwise::hc_inject<{t}, 256>"),
+            Launch::per_row(o.rows, BLOCK),
+        )
+    };
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!("::pie::elemwise::hc_inject<{t}, 256>")),
-        )
-        .apply(Launch::per_row(o.rows, BLOCK)),
+        Fire::at(FILE, symbol(&entry)).apply(launch),
         &[
             o.arg(),
             gates.arg(),
@@ -422,6 +528,81 @@ pub fn ple_gate(
             y.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, value.width)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+const PROJECT_ROWS: u32 = 4;
+const PROJECT_COLS: u32 = 3;
+
+/// `hc_project` on `hc_project_split` (and `hc_project_fold` past one slice).
+#[allow(clippy::too_many_arguments)]
+fn project_split(
+    ctx: &Ctx,
+    op: &'static str,
+    normed: Tensor,
+    hc_fn: Tensor,
+    mixes: &mut Tensor,
+    rows: u32,
+    fan: u32,
+    mix_hc: u32,
+) -> Result<(), Error> {
+    const SLICE_FLOOR: u32 = 256;
+    let row_blocks = rows.div_ceil(PROJECT_ROWS);
+    let want = 2 * ctx.multiprocessors().unwrap_or(132);
+    // At most 2048 partial rows: a region captured on its own holds its own
+    // partial slab.
+    const PARTIAL_ROWS: u32 = 2048;
+    let slices = want
+        .div_ceil(row_blocks)
+        .clamp(1, (fan / SLICE_FLOOR).max(1))
+        .min(64)
+        .min((PARTIAL_ROWS / rows).max(1));
+    let slice = fan.div_ceil(slices).next_multiple_of(4);
+    let slices = fan.div_ceil(slice);
+    let out = if slices > 1 {
+        ctx.scratch_shared(
+            op,
+            "elementwise.hc_project_partial",
+            (slices * rows * mix_hc) as usize * core::mem::size_of::<f32>(),
+        )? as usize as u64
+    } else {
+        mixes.ptr
+    };
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_project_split<{PROJECT_ROWS}, {PROJECT_COLS}>"
+            )),
+        )
+        .apply(Launch::grid([row_blocks, slices, 1], [BLOCK, 1, 1])),
+        &[
+            normed.arg(),
+            hc_fn.arg(),
+            crate::jit::ArgValue::Ptr(out),
+            stated(op, fan)?.arg(),
+            stated(op, mix_hc)?.arg(),
+            stated(op, rows)?.arg(),
+            stated(op, slice)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    if slices == 1 {
+        return Ok(());
+    }
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::elemwise::hc_project_fold")
+            .apply(Launch::flat(rows * mix_hc, BLOCK)),
+        &[
+            crate::jit::ArgValue::Ptr(out),
+            mixes.arg(),
+            stated(op, mix_hc)?.arg(),
+            stated(op, rows)?.arg(),
+            stated(op, slices)?.arg(),
             ctx.stage(),
         ],
     )

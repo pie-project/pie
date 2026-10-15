@@ -6,13 +6,17 @@ pub mod atem;
 pub mod chatml;
 pub mod decode;
 pub mod deepseek;
+pub mod dots;
 pub mod gemma;
 pub mod glm;
 pub mod harmony;
+pub mod hy;
 pub mod inkling;
 pub mod kimi;
 pub mod kimi3;
 pub mod lines;
+pub mod mimo;
+pub mod minimax;
 pub mod raw;
 pub mod spec;
 

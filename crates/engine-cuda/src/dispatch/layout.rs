@@ -19,6 +19,19 @@ impl Run<'_> {
                 vocab,
                 y,
             } => match self.maybe_planes(*table) {
+                Some((codes, ..))
+                    if matches!(
+                        codes.dtype,
+                        poem_ir::Dtype::Nvfp4 | poem_ir::Dtype::E4m3tensor
+                    ) =>
+                {
+                    Err(kernels_cuda::Error::Backend {
+                        op: "layout.embed",
+                        detail: "an nvfp4 table has no cuda gather; its rows are read as \
+                                 bf16 or affine codes"
+                            .to_string(),
+                    })
+                }
                 Some((codes, scales, biases, seat)) => {
                     kernels_cuda::layout_embed_concat::embed_mlx_affine(
                         self.ctx(),
@@ -51,6 +64,24 @@ impl Run<'_> {
                 vocab,
                 y,
             } => match self.maybe_planes(*table) {
+                Some((codes, ..)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
+                    Err(kernels_cuda::Error::Backend {
+                        op: "layout.embed_concat",
+                        detail: "an nvfp4 table has no cuda gather; its rows are read as \
+                                 bf16 or affine codes"
+                            .to_string(),
+                    })
+                }
+                Some((codes, scales, _, _)) if codes.dtype == poem_ir::Dtype::E4m3tensor => {
+                    kernels_cuda::layout_embed_e4m3::embed_concat_e4m3(
+                        self.ctx(),
+                        self.tensor(*ids),
+                        codes,
+                        scales,
+                        *vocab,
+                        &mut self.tensor(*y),
+                    )
+                }
                 Some((codes, scales, biases, seat)) => {
                     kernels_cuda::layout_embed_concat::embed_concat_mlxu4(
                         self.ctx(),

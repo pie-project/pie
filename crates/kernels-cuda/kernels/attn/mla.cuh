@@ -312,9 +312,11 @@ namespace mla_naive {
 
 constexpr int kMlaNaiveBlock = 256;
 constexpr int kMlaNaiveWarps = kMlaNaiveBlock / 32;
-constexpr int kMlaNaiveMaxPer = 16;
 constexpr int kMlaNaiveMaxPePer = 4;
 
+// `MaxPer` latent elements a lane holds: 16 for a 512-wide latent, 32 for
+// a 1024-wide one.
+template <int MaxPer>
 __global__ void mla_naive_paged_kernel(
     const __nv_bfloat16* __restrict__ q_nope,
     const __nv_bfloat16* __restrict__ q_pe,
@@ -325,9 +327,10 @@ __global__ void mla_naive_paged_kernel(
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
     __nv_bfloat16* __restrict__ o,
+    float* __restrict__ lse,
     const std::int32_t* __restrict__ selection, int top_k,
     int R, int H, int CKV, int KPE, int page_size, float sm_scale, bool causal,
-    int G,
+    int G, int window,
     const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
@@ -365,6 +368,7 @@ __global__ void mla_naive_paged_kernel(
     const int pre_kv = kv_len - new_tokens;
     const int abs_q = pre_kv + (t - qo_lo);
     const int j_end = causal ? (abs_q + 1) : kv_len;
+    const int j_lo = window > 0 ? max(0, abs_q + 1 - window) : 0;
 
     extern __shared__ float smem[];
     float* wacc  = smem;
@@ -375,21 +379,21 @@ __global__ void mla_naive_paged_kernel(
         q_nope + (static_cast<long long>(t_row) * H + h) * CKV;
     const __nv_bfloat16* qp =
         q_pe + (static_cast<long long>(t_row) * H + h) * KPE;
-    float qn_r[kMlaNaiveMaxPer];
+    float qn_r[MaxPer];
     float qp_r[kMlaNaiveMaxPePer];
     for (int i = 0; i < per; ++i) qn_r[i] = __bfloat162float(qn[lane + i * 32]);
     for (int i = 0; i < pper; ++i) qp_r[i] = __bfloat162float(qp[lane + i * 32]);
 
-    float acc[kMlaNaiveMaxPer];
+    float acc[MaxPer];
     for (int i = 0; i < per; ++i) acc[i] = 0.f;
     float m = -CUDART_INF_F, lsum = 0.f;
 
     const int steps = (srow != nullptr) ? top_k : j_end;
-    for (int n = s; n < steps; n += K) {
+    for (int n = (srow != nullptr ? 0 : j_lo) + s; n < steps; n += K) {
         int j = n;
         if (srow != nullptr) {
             j = srow[n];
-            if (j < 0 || j >= j_end) continue;
+            if (j < j_lo || j >= j_end) continue;
         }
         const int page =
             static_cast<int>(kv_page_indices[pages_first + j / page_size]);
@@ -399,7 +403,7 @@ __global__ void mla_naive_paged_kernel(
         const __nv_bfloat16* kpe_j =
             kpe_pages + (static_cast<long long>(page) * page_size + off) * KPE;
 
-        float kv[kMlaNaiveMaxPer];
+        float kv[MaxPer];
         float pd = 0.f;
         for (int i = 0; i < per; ++i) {
             kv[i] = __bfloat162float(ckv_j[lane + i * 32]);
@@ -447,6 +451,10 @@ __global__ void mla_naive_paged_kernel(
         const float inv = (l_all > 0.f) ? (1.f / l_all) : 0.f;
         o[(static_cast<long long>(t_row) * H + blockIdx.y * G + gg) * CKV + d] =
             __float2bfloat16(v * inv);
+        if (lse != nullptr && d == 0) {
+            lse[static_cast<long long>(t_row) * H + blockIdx.y * G + gg] =
+                (l_all > 0.f) ? (m_all + logf(l_all)) * 1.4426950408889634f : -CUDART_INF_F;
+        }
     }
 }
 
@@ -547,6 +555,7 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
     __nv_bfloat16* __restrict__ o,
+    float* __restrict__ lse,
     int R, int H, int page_size, float sm_scale, bool causal,
     const u32* __restrict__ win)
 {
@@ -770,6 +779,11 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     }
 
     __syncthreads();
+    if (lse != nullptr && tid < kBM) {
+        const float l = sL[tid];
+        lse[static_cast<long long>(t_row) * H + h0 + tid] =
+            (l > 0.f) ? (sM[tid] + logf(l)) * 1.4426950408889634f : -CUDART_INF_F;
+    }
     const float l0 = sL[g], l1 = sL[g + 8];
     const float i0 = (l0 > 0.f) ? (1.f / l0) : 0.f;
     const float i1 = (l1 > 0.f) ? (1.f / l1) : 0.f;

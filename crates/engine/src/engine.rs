@@ -98,6 +98,13 @@ pub trait Engine: Send + Sync {
         Ok(())
     }
 
+    /// Publishes what the guests' programs of the steps already landed put
+    /// on their channels, without waiting on a step still in flight. An
+    /// engine that publishes as each step lands needs nothing here.
+    fn publish_landed(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     fn expect_fire(&mut self, submission: &Step) {
         let _ = submission;
     }

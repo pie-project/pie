@@ -20,6 +20,15 @@ namespace flashinfer {
 
 DEFINE_HAS_MEMBER(decode_maybe_q_rope_offset)
 
+// PIE: whether a decode variant's mask is its sliding window alone, so the
+// batch decode may start a request's walk at the window. A variant that does
+// not say so walks every key, as upstream does.
+template <typename V, typename = void>
+struct decode_skips_window : std::false_type {};
+template <typename V>
+struct decode_skips_window<V, std::void_t<decltype(V::skips_decode_window)>>
+    : std::integral_constant<bool, V::skips_decode_window> {};
+
 namespace cg = cooperative_groups;
 using cp_async::PrefetchMode;
 using cp_async::SharedMemFillMode;
@@ -317,10 +326,18 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   if (block_valid_mask && !block_valid_mask[bx]) return;
   const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
   const uint32_t kv_len = paged_kv.get_length(batch_idx);
-  const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len;
-  const uint32_t chunk_start = partition_kv ? kv_tile_idx * max_chunk_size : 0;
+  // PIE: a sliding-window variant walks only the keys its one query row can
+  // see, the last `window_left + 1`; the kv tiles count from there.
+  uint32_t window_start = 0;
+  if constexpr (decode_skips_window<AttentionVariant>::value) {
+    if (params.window_left >= 0 && kv_len > uint32_t(params.window_left) + 1) {
+      window_start = kv_len - uint32_t(params.window_left) - 1;
+    }
+  }
+  const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len - window_start;
+  const uint32_t chunk_start = window_start + (partition_kv ? kv_tile_idx * max_chunk_size : 0);
   const uint32_t chunk_end =
-      partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
+      partition_kv ? min(window_start + (kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
   if (partition_kv && chunk_start >= kv_len) {
     if (tz == 0) {
       state_t<vec_size> empty;

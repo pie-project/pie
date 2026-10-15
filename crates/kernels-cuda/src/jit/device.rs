@@ -43,6 +43,9 @@ pub(crate) fn release(arena: u32) {
     let Some(held) = arenas.remove(&arena) else {
         return;
     };
+    // A freed slab's address may come back to another; what the tcgen05
+    // GEMM knows to be zero about it no longer holds.
+    crate::linear::tc5::forget_zeroed();
     for (_, slab) in held.slabs {
         if !slab.ptr.is_null() {
             // SAFETY: an address this map allocated with `cudaMalloc` and

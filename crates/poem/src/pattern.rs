@@ -6,7 +6,7 @@ use std::cell::RefCell;
 
 use poem_ir::{CacheRow, Def, Dim, Dtype, Platform, Trace, Ty, ValueId};
 
-use crate::declare::Weight;
+use crate::declare::{Precision, Weight};
 use crate::record::{Recorder, Value};
 
 /// A wildcard attribute. The pattern traces with a sentinel no model states
@@ -94,6 +94,21 @@ impl Pattern {
     /// A hole that matches only a weight.
     pub fn weight(&self, name: &'static str, shape: impl IntoIterator<Item = u64>) -> Weight {
         let w = Weight::sym(format!("pattern.{name}"), shape, Dtype::Bf16);
+        let id = self.rec.weight(&w);
+        self.named(name, id);
+        w
+    }
+
+    /// A hole that matches only a weight stored at `precision`, whose
+    /// products quantize their activations as it says (its planes, an
+    /// input scale's among them, holes too).
+    pub fn weight_at(
+        &self,
+        name: &'static str,
+        shape: impl IntoIterator<Item = u64>,
+        precision: Precision,
+    ) -> Weight {
+        let w = Weight::at(format!("pattern.{name}"), shape, precision);
         let id = self.rec.weight(&w);
         self.named(name, id);
         w

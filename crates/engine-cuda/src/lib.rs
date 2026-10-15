@@ -12,6 +12,7 @@ mod error;
 pub mod experts;
 pub mod exports;
 pub mod group;
+pub mod grouped_decode;
 pub mod inputs;
 pub mod mask;
 pub mod program;
@@ -35,18 +36,25 @@ pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 /// The fused kernels this backend ships; the compiler forms only these. A
 /// rule it does not list (`linear.mlp_swiglu`, which Metal splits across
 /// engines) leaves its primitives alone here.
-pub const FUSED: [&str; 11] = [
+pub const FUSED: [&str; 18] = [
     "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
     "elementwise.rmsnorm_residual_add",
     "elementwise.embed_scale_add_select",
     "elementwise.embed_scale_add",
     "elementwise.residual_add_rmsnorm",
     "linear.matmul_geglu",
+    "linear.moe_experts",
+    "linear.moe_select_glu",
+    "linear.matmul_swiglu",
     "linear.lm_head_softcap",
     "linear.matmul_bias",
+    "linear.matmul_split_rows",
     "elementwise.gated_residual_norm_modulate",
     "elementwise.norm_modulate",
     "elementwise.rmsnorm_rope_partial_q",
+    "elementwise.split_rope_yarn_append",
+    "elementwise.rope_yarn_append",
+    "attention.lse_sink",
 ];
 
 /// The fused kernels left on with `fuse-chains=off`.

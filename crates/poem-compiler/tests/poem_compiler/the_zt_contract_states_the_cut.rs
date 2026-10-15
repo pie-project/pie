@@ -91,6 +91,8 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         Dtype::Nvfp4
         | Dtype::E4m3row
         | Dtype::E4m3tile128
+        | Dtype::E4m3tensor
+        | Dtype::Fp8b128
         | Dtype::U2g16k
         | Dtype::I3g16k
         | Dtype::U4g32k
@@ -205,7 +207,7 @@ fn by_load(row: &poem_compiler::catalog::Deployment) -> bool {
     row.deploy
         .weights
         .iter()
-        .all(|w| matches!(w, Dtype::Bf16 | Dtype::Mxfp4))
+        .all(|w| w.act.is_none() && matches!(w.dtype, Dtype::Bf16 | Dtype::Mxfp4))
 }
 
 #[test]

@@ -5,7 +5,7 @@ The Python client for pie: `PieClient` speaks to a `pie serve` (or an embedded
 
 ```bash
 pip install pie-client
-pie-client submit text-completion -- --prompt "The capital of France is"
+pie-client submit --path main.py -- --prompt "The capital of France is"
 pie-client ping
 ```
 
@@ -15,7 +15,8 @@ from pie_client import PieClient
 client = PieClient("ws://127.0.0.1:8080")
 await client.connect()
 await client.authenticate("me")
-process = await client.launch_process("text-completion", {"prompt": "The capital of France is"})
+# an inferlet the server holds, as installed by `pie inferlet install`
+process = await client.launch_process("my-inferlet@0.1.0", {"prompt": "The capital of France is"})
 event, value = await process.recv()
 ```
 

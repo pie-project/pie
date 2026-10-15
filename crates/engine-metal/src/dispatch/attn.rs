@@ -1,6 +1,6 @@
 use kernels_metal::attn;
 use poem_exec::{DispatchAttention, KernelError};
-use poem_ir::{Attention, Operands, RaggedMask, StructKind};
+use poem_ir::{Attention, IndexScore, Operands, RaggedMask, StructKind};
 
 use crate::run::{Run, StructSlot};
 
@@ -164,6 +164,12 @@ impl Run<'_> {
                 self.tuning(),
                 &|rows, width| self.partials(rows, width),
             ),
+            Attention::DecodeSelected { per_head: true, .. }
+            | Attention::PrefillSelected { per_head: true, .. }
+            | Attention::IndexTopk {
+                score: IndexScore::BlockMax,
+                ..
+            } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Attention::DecodeSelected {
                 q,
                 plan,
@@ -173,6 +179,7 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 ratio,
+                per_head: false,
                 o,
             } => attn::decode_selected(
                 self.ctx(),
@@ -196,6 +203,7 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 ratio,
+                per_head: false,
                 o,
             } => attn::prefill_selected(
                 self.ctx(),
@@ -517,15 +525,30 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
+            // The per-head log-sum-exp a sink rescales by is landed on CUDA alone.
+            Attention::MlaDecode { lse: Some(_), .. }
+            | Attention::MlaPrefill { lse: Some(_), .. }
+            | Attention::MlaDecodeSelected { lse: Some(_), .. }
+            | Attention::MlaPrefillSelected { lse: Some(_), .. } => {
+                Err(kernels_metal::Error::Unsupported { op: op.name() })
+            }
+            Attention::MlaDecode {
+                window: Some(_), ..
+            }
+            | Attention::MlaPrefill {
+                window: Some(_), ..
+            } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Attention::MlaDecode {
                 q,
                 plan: _,
                 q_pe,
                 cache,
+                window: None,
                 heads,
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse: _,
             } => {
                 let (positions, request_of_token) = {
                     let fire = self.bindings();
@@ -549,10 +572,12 @@ impl Run<'_> {
                 plan: _,
                 q_pe,
                 cache,
+                window: None,
                 heads,
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse: _,
             } => {
                 let (positions, request_of_token) = {
                     let fire = self.bindings();
@@ -581,6 +606,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse: _,
             } => {
                 let (positions, request_of_token) = {
                     let fire = self.bindings();
@@ -610,6 +636,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse: _,
             } => {
                 let (positions, request_of_token) = {
                     let fire = self.bindings();
@@ -1155,6 +1182,7 @@ impl Run<'_> {
                 head_dim,
                 top_k,
                 ratio,
+                score: IndexScore::Pooled,
                 selection,
             } => {
                 let Some(scores) = self.index_scores() else {

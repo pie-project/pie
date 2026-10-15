@@ -144,6 +144,7 @@ fn build_model(
                 backend_kind,
                 rs_cache_required: g.caps.pools.state_slots != 0,
                 rs_cache_slots: g.caps.pools.state_slots as usize,
+                one_frame_when_short: g.caps.pools.one_frame_when_short,
                 rs_cache_slot_bytes: g.caps.pools.state_slot_bytes,
                 rs_host_slots: g.caps.pools.host_state_slots as usize,
                 has_mtp_logits: g.caps.profile.has_mtp_logits,

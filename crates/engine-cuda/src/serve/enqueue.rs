@@ -32,7 +32,7 @@ use super::{Golden, Graphs, Prepared, Readback, Shell};
 #[derive(Debug)]
 pub(super) struct GuestBatch {
     launched: Vec<(usize, u64)>,
-    seq: u64,
+    pub(super) seq: u64,
 }
 
 fn seating(lanes: &[super::Seated<'_>]) -> String {
@@ -92,11 +92,11 @@ impl Shell {
         slot: &SlotGuard,
     ) -> Result<(u32, Option<Readback>)> {
         let page_size = self.pools.paging().page_size;
-        let window_copies: Vec<crate::store::Move> = p
+        let window_copies: Vec<engine::transfer::KvRun> = p
             .lanes
             .iter()
             .flat_map(|lane| lane.window_copies)
-            .map(|&(src, dst)| crate::store::Move {
+            .map(|&(src, dst)| engine::transfer::KvRun {
                 src_page: src,
                 src_token: 0,
                 dst_page: dst,
@@ -296,9 +296,9 @@ impl FireCtx<'_> {
         let rows = p.composition.rows();
         let lane_count = p.composition.lane_count();
 
-        let handles =
-            self.inputs
-                .commit(self.device.stream(), slot, &p.lengths, &p.token_injects)?;
+        let handles = self
+            .inputs
+            .commit(self.device, slot, &p.lengths, &p.token_injects)?;
         p.windows.bind(handles.windows);
         p.windows.bind_live(handles.live_rows);
         p.windows.bind_qo_absolute(handles.qo_absolute);

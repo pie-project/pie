@@ -23,6 +23,9 @@ pub enum WeightRow {
         biases: Option<Tensor>,
         seat: GroupSeat,
         repacked: bool,
+        /// The scales lie in the tcgen05 GEMM's atoms, laid there at load
+        /// for a low-precision product, not row-major.
+        atoms: bool,
     },
 
     Streamed {
@@ -1561,6 +1564,7 @@ impl<'c> Run<'c> {
                 biases,
                 seat,
                 repacked: false,
+                atoms: false,
             }) => Some((codes, scales, biases, seat)),
             _ => None,
         }
@@ -1581,6 +1585,7 @@ impl<'c> Run<'c> {
                 biases: Some(biases),
                 seat,
                 repacked: true,
+                atoms: false,
             }) => Some((codes, scales, biases, seat)),
             _ => None,
         }
@@ -1627,6 +1632,7 @@ impl<'c> Run<'c> {
                 biases,
                 seat,
                 repacked: _,
+                atoms: _,
             }) => (codes, scales, biases, seat),
             Some(WeightRow::Dense(_) | WeightRow::Streamed { .. }) => panic!(
                 "value {at} is weight {row}, bound as one dense handle, and this op reads \
@@ -1634,6 +1640,18 @@ impl<'c> Run<'c> {
             ),
             None => panic!("value {at} is weight {row}, which the shell has not bound"),
         }
+    }
+
+    /// Whether weight `id`'s scales were laid into tcgen05 atoms at load.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn scales_in_atoms(&self, id: ValueId) -> bool {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return false;
+        };
+        matches!(
+            self.weights.0.get(*w as usize).copied().flatten(),
+            Some(WeightRow::Planes { atoms: true, .. })
+        )
     }
 
     pub(crate) fn expert_bank(&self, id: ValueId) -> (Tensor, ExpertTable) {

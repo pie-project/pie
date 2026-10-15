@@ -22,6 +22,10 @@ use super::{Boot, FireCost, Golden, Graphs, Shell};
 /// prefill chunk a frame, which serves, and under it the halving stops.
 const TOKENS_FLOOR: u32 = 1024;
 
+/// The recurrent-state slots a load holds when neither the config nor the
+/// chip's profile states them.
+const DEFAULT_STATE_SLOTS: u32 = 256;
+
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     super::diag::publish(&boot.knobs.diagnostics);
     // SAFETY: the boot's communicator is held by the engine for the life of
@@ -44,6 +48,32 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
+    if boot.budget.max_tokens == 0 {
+        boot.budget.max_tokens = match engine.forward_tokens {
+            0 => crate::api::DEFAULT_FORWARD_TOKENS,
+            tokens => tokens,
+        };
+    }
+    if engine.host_planes {
+        let freed = boot.residency.host_declared(&boot.trace)?;
+        if freed > 0 {
+            // The deferred fill republishes routed seats only; a dense row
+            // read through the artifact's mapping would stay there, so the
+            // host image is built at boot.
+            boot.deferred_tier = false;
+            eprintln!(
+                "engine-cuda: {:.1} GiB of planes the package declares `host` serve from \
+                 pinned host memory (engine.host_planes)",
+                freed as f64 / f64::from(1u32 << 30)
+            );
+        }
+    }
+    if boot.slots == 0 {
+        boot.slots = match engine.state_slots_per_lane {
+            0 => DEFAULT_STATE_SLOTS,
+            per_lane => per_lane.saturating_mul(boot.budget.max_lanes).max(1),
+        };
+    }
 
     kernels_cuda::disk::install(boot.cache_dir);
 
@@ -61,6 +91,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         kernels.retain(|kernel| crate::UNCHAINED.contains(kernel));
     }
     boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), &kernels);
+    let tuning = kernels_cuda::tuning::Tuning::of(&chip);
+    boot.trace = crate::grouped_decode::rewrite_with(
+        boot.trace.clone(),
+        tuning.decode_grouped_prefill_from,
+        tuning.decode_grouped_prefill_lse,
+        kernels_cuda::attn::xqa::Gate::of(tuning),
+    );
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
@@ -799,6 +836,7 @@ impl Shell {
             exports,
             graphs: engine.graphs,
             copies: engine.copies,
+            one_frame_when_short: engine.one_frame_when_short,
             pad: engine.recording.pad(),
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),
@@ -1137,7 +1175,30 @@ fn decoded_weight_planes(
                 continue;
             };
             let at_tokens = match &node.op {
-                poem_ir::Operation::Linear(_) => {
+                // A low-precision product decodes no bf16 tile.
+                poem_ir::Operation::Linear(
+                    poem_ir::Linear::MatmulActQuant { .. }
+                    | poem_ir::Linear::MoeMatmulSelectActQuant { .. },
+                ) => continue,
+                poem_ir::Operation::Fused(
+                    poem_ir::Fused::MoeSelectGlu { select, .. }
+                    | poem_ir::Fused::MoeExperts { select, .. },
+                ) if matches!(**select, poem_ir::Linear::MoeMatmulSelectActQuant { .. }) => {
+                    continue;
+                }
+                // A fused projection runs its matmul when no fused kernel
+                // takes it, and decodes the same plane that matmul would.
+                poem_ir::Operation::Linear(_)
+                | poem_ir::Operation::Fused(
+                    poem_ir::Fused::MatmulSwiglu { .. }
+                    | poem_ir::Fused::MatmulGeglu { .. }
+                    | poem_ir::Fused::MlpSwiglu { .. }
+                    | poem_ir::Fused::MatmulBias { .. }
+                    | poem_ir::Fused::MatmulSplitRows { .. }
+                    | poem_ir::Fused::LmHeadSoftcap { .. }
+                    | poem_ir::Fused::MoeSelectGlu { .. }
+                    | poem_ir::Fused::MoeExperts { .. },
+                ) => {
                     outputs.clear();
                     node.op.outputs(&mut outputs);
                     outputs.iter().any(|id| token_rows(*id))

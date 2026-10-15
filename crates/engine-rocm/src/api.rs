@@ -247,6 +247,14 @@ fn extents(stated: &BindExtents) -> eta_exec::Extents {
     }
 }
 
+/// A fire's token budget unless `[engine] max_forward_tokens` states one:
+/// 10K, measured on MI300X against vLLM's 16K-token steps (GLM-5.3-Flash and
+/// Qwen3.8-Flash-Next minis, 2K x 8 and 1K x 64 prompts). 8K left the first
+/// prompts' decodes waiting out a second prefill fire (TPOT), and 12K to 16K
+/// fires made the prompts queued behind them wait (GLM 1K x 64 TTFT 665 ms at
+/// 10K, 916 at 12K, 984 at 16K).
+pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 10240;
+
 /// Powers of two from the floor up to `max_tokens`, with `steps - 1` more
 /// between each pair; from `PREFILL_LATTICE_FROM` rows, `PREFILL_LATTICE_STEPS`
 /// a doubling at least. A prefill's GEMMs run its bucket's rows, so a 2K

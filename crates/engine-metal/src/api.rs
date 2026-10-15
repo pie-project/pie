@@ -556,6 +556,7 @@ impl Engine for Metal {
                 elastic_page_bytes,
                 elastic_budget_pages,
                 disk_kv_pages,
+                one_frame_when_short: false,
                 // The sliding rows are paged in full here: the model's window
                 // is a fact of the model, its pool is not.
                 window_tokens: poem_exec::store::kv::declared_window(shell.trace()).unwrap_or(0),
@@ -862,7 +863,7 @@ impl Engine for Metal {
             });
         }
         let page_size = self.loaded_mut()?.paging().page_size;
-        let moves = crate::store::Move::plan(copy, page_size).map_err(Error::Invalid)?;
+        let moves = copy.runs(page_size)?;
         self.loaded_mut()?.copy_kv(&moves).map_err(fault)
     }
 

@@ -30,7 +30,12 @@ pub enum CachePool {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct CacheTable(pub Vec<CachePool>);
+pub struct CacheTable {
+    /// One pool per cache space, in space order.
+    pub pools: Vec<CachePool>,
+    /// The compressor state beside each kv space a pool gather reads.
+    pub compressed: Vec<(u32, PoolSlabs)>,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CacheGeometry {
@@ -709,13 +714,11 @@ impl<'c> Run<'c> {
         let Some(Def::Cache(space)) = self.values.get(at).map(|v| &v.def) else {
             panic!("value {at} is not a cache space; the pooled state is keyed by one")
         };
-        Some(
-            self.scratch
-                .pool_state(self.handles, *space)?
-                .unwrap_or_else(|fault| {
-                    panic!("the compressor state this load reserved does not mint: {fault}")
-                }),
-        )
+        self.caches
+            .compressed
+            .iter()
+            .find(|(held, _)| *held == *space)
+            .map(|&(_, slabs)| slabs)
     }
 
     pub(crate) fn ple_hash(
@@ -805,10 +808,10 @@ impl<'c> Run<'c> {
         match &self.values[at].def {
             Def::Cache(c) => {
                 let row = *c as usize;
-                self.caches.0.get(row).unwrap_or_else(|| {
+                self.caches.pools.get(row).unwrap_or_else(|| {
                     panic!(
                         "value {at} is cache space {row}, and the shell binds {} pools",
-                        self.caches.0.len()
+                        self.caches.pools.len()
                     )
                 })
             }

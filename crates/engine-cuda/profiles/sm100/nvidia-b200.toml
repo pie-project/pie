@@ -1,0 +1,92 @@
+api = 1
+
+[target]
+device = "NVIDIA B200"
+
+# The fused skinny bf16 GEMM (GEGLU, soft-capped heads) loses to cuBLAS at
+# every row count it takes on this card: Gemma-4-31B decodes a step at one
+# lane in 12.84 ms without it and 14.98 ms with it, at eight in 13.63 and
+# 16.53, at 64 in 26.64 and 27.21. A model without those products reads
+# the same either way (Qwen3.8-27B 11.30 / 12.26 / 16.54 ms against
+# 11.29 / 12.34 / 16.48).
+#
+# The selected (sparse) attention runs on the tensor cores: one 32x4096
+# prefill of Qwen3.8-Flash-Next spends 1.07 s in it against 18.99 s in the
+# scalar walk. Its pooled index scores on the tensor cores too: 0.11 s of
+# the same prefill against 1.20 s a thread a block.
+[kernel]
+gemm.narrow_n = 8
+gemm.skinny_rows = 0
+sdpa.index_mma = true
+sdpa.selected_mma = true
+
+# Two recurrent-state slots a lane seat every lane a hybrid trunk batches
+# (the fixed 256 seat 128 at the default dispatch depth). 256 requests of
+# 1024 in / 256 out offered at once: Qwen3.8-27B 2660 -> 2869 output tok/s,
+# TTFT p50 9.7 -> 7.8 s; Qwen3.6-35B-A3B 4501 -> 5418 tok/s, TTFT p50
+# 4.8 -> 3.0 s; TPOT p50 rises (37 -> 57, 24 -> 32 ms) with the batch twice
+# as wide, as vLLM runs it. A 183 GB card holds the doubled slab beside the
+# kv pages; a smaller one may not, so it is this card's decision.
+#
+# A hybrid trunk whose state slots seat fewer lanes than it batches posts one
+# frame a lane rather than two: Qwen3.8-Flash-Next W4A16 fills this card, its
+# load cuts the slab to 230 slots, and two frames a lane seat 115. One seats
+# 230: 256 requests of 1024 in / 256 out at once go 1334 -> 1756 output
+# tok/s, TTFT p50 20.7 -> 6.1 s (TPOT p50 74 -> 93 ms, twice the lanes),
+# while its offline decode loses under 2% (bs1 8.99 -> 9.16 ms, bs64 37.01
+# -> 37.12 ms).
+
+# A fire of 16384 rows where `max_forward_tokens` is unstated (8192 elsewhere)
+# batches twice the prompt chunks into one pass of the weights. 256 requests
+# of 1024 in / 256 out offered at once, 8192 -> 16384 rows: Qwen3.8-27B 2645 ->
+# 3041 output tok/s, gpt-oss-120b 3537 -> 3866, Qwen3.6-35B-A3B 6571 -> 7026
+# (TTFT p50 2.06 -> 1.75 s), Gemma-4-31B 1384 -> 1402. The grouped expert legs
+# serve the wider fires' route runs.
+#
+# A plane its package declares `host` serves from pinned, device-mapped host
+# memory: Qwen3.8-Flash-Next's 47.7 GiB e4m3 n-gram table, which held the
+# state slab to 230 slots, is gathered over the bus a few rows a token. The
+# slab seats all 512 slots (256 lanes, two frames each): 256 requests of
+# 1024 in / 256 out at once go 1493 -> 2175 output tok/s (W4A16, TTFT p50
+# 5.4 -> 5.8 s), while the gather adds 43 ms to a 32x4096 prefill (26.4k ->
+# 26.1k tok/s); decode bs1 9.02 -> 8.98 ms, bs8 15.91 -> 15.72, bs64 35.5 ->
+# 37.2 (37.1 -> 37.6 in a second pair).
+[engine]
+host_planes = true
+one_frame_when_short = true
+state_slots_per_lane = 2
+forward_tokens = 16384
+
+[provenance]
+source = "pie tune (quick, gemma4-31b) and the scoreboard's fixed points, end to end"
+measured = [
+  "kernel.gemm.heuristics",
+  "kernel.gemm.narrow_n",
+  "kernel.gemm.skinny_rows",
+  "kernel.gemm.tc5_glu_from",
+  "kernel.gemm.workspace_mb",
+  "kernel.gemv.bf16",
+  "kernel.gemv.splitk_max_n",
+  "kernel.moe.mxfp4_grouped_reuse",
+  "kernel.moe.tc5_from",
+  "kernel.qmm.gemm_from",
+  "kernel.qmm.long_rows",
+  "kernel.qmm.split_thin_max",
+  "kernel.qmm.split_warps_per_sm",
+  "kernel.qmm.split_wide_max",
+  "kernel.sdpa.decode.chunk_floor_128",
+  "kernel.sdpa.decode.split_small",
+  "kernel.sdpa.decode.split_window",
+  "kernel.sdpa.decode.static_max_requests",
+  "kernel.sdpa.index_mma",
+  "kernel.sdpa.prefill.ctas_per_sm",
+  "kernel.sdpa.selected_mma",
+  "engine.copies",
+  "engine.forward_tokens",
+  "engine.host_planes",
+  "engine.lattice_steps",
+  "engine.one_frame_when_short",
+  "engine.recording",
+  "engine.state_slots_per_lane",
+  "engine.working_set_percent",
+]

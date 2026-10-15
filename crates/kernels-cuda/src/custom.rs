@@ -31,6 +31,10 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
 
     const DECODE_BLOCK: u32 = 128;
 
+    const ROW_BLOCK: u32 = 256;
+
+    const ROWS_BY_ROW: u32 = 64;
+
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     debug_assert_eq!(positions.dtype, Dtype::I32, "`{OP}` reads i32 positions");
     if rotary_dim == 0 || rotary_dim > head_dim || !rotary_dim.is_multiple_of(2) {
@@ -64,6 +68,47 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     let hnd_layout = pool.layout != 0;
     let rope_table = ArgValue::ABSENT;
     let window = ctx.stage();
+
+    // A prefill's rows go a block a row: the row's rotation is computed once
+    // for every head rather than once a head, and each head moves in whole
+    // 16-byte words. A decode's few rows keep the warp a head.
+    let by_row = match head_dim {
+        64 => Some("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32(64)>"),
+        128 => Some("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32(128)>"),
+        256 => Some("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32(256)>"),
+        512 => Some("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32(512)>"),
+        _ => None,
+    };
+    if let Some(instantiation) = by_row.filter(|_| packed.rows >= ROWS_BY_ROW) {
+        return ctx.fire(
+            OP,
+            Fire::at(FILE, instantiation)
+                .apply(Launch::grid([packed.rows, 1, 1], [ROW_BLOCK, 1, 1])),
+            &[
+                packed.arg(),
+                q.arg(),
+                pool.keys.arg(),
+                pool.values.arg(),
+                q_norm_weight.arg(),
+                k_norm_weight.arg(),
+                positions.arg(),
+                pool.page_indices.arg(),
+                pool.page_indptr.arg(),
+                pool.last_page_lens.arg(),
+                write_page.arg(),
+                write_offset.arg(),
+                pool.row_valid.arg(),
+                window,
+                num_q_heads.arg(),
+                kv_heads.arg(),
+                pool.page_size.arg(),
+                hnd_layout.arg(),
+                theta.arg(),
+                eps.arg(),
+                rotary.arg(),
+            ],
+        );
+    }
 
     let warped = match head_dim {
         64 => Some(

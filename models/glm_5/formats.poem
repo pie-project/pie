@@ -1,5 +1,9 @@
 # How a GLM-5 checkpoint is laid out: transformers' names, each expert's
-# projections a tensor of their own.
+# projections a tensor of their own; GLM-5.3's draft head the layer after
+# the last. A GLM-5.3 checkpoint stores its projections FP8 in 128-square
+# blocks, their factors beside them as `*_scale_inv`.
+
+BF = raw(dtype.bf16)
 
 def named(a, at):
     """`a`'s weights, each beside the name `at` gives its transformers leaf,
@@ -15,6 +19,15 @@ def named(a, at):
     if a.gate != None:
         out.append((a.gate, at("self_attn.g_proj.weight")))
     out.append((a.o_proj, at("self_attn.o_proj.weight")))
+    ix = a.indexer
+    if ix != None:
+        out.extend([
+            (ix.q_proj, at("self_attn.indexer.wq_b.weight")),
+            (ix.k_proj, at("self_attn.indexer.wk.weight")),
+            (ix.weights_proj, at("self_attn.indexer.weights_proj.weight")),
+            (ix.k_norm, at("self_attn.indexer.k_norm.weight")),
+            (ix.k_norm_bias, at("self_attn.indexer.k_norm.bias")),
+        ])
     return out
 
 def formats(m):
@@ -26,35 +39,75 @@ def huggingface(m, reads):
     reads.read(m.head, "lm_head.weight")
     for l, layer in enumerate(m.layers):
         at = lambda tail: "model.layers.{}.{}".format(l, tail)
-        attn = layer.attn
-        index = attn.indexer
         reads.read(layer.attn_norm, at("input_layernorm.weight"))
         reads.read(layer.mlp_norm, at("post_attention_layernorm.weight"))
-        for w, name in named(attn, at):
+        for w, name in named(layer.attn, at):
             reads.read(w, name)
-        reads.read(index.q_proj, at("self_attn.indexer.wq_b.weight"))
-        reads.read(index.k_proj, at("self_attn.indexer.wk.weight"))
-        reads.read(index.weights_proj, at("self_attn.indexer.weights_proj.weight"))
-        reads.read(index.k_norm, at("self_attn.indexer.k_norm.weight"))
-        reads.read(index.k_norm_bias, at("self_attn.indexer.k_norm.bias"))
         f = layer.mlp
-        if not f.routed:
-            reads.read_concat(f.gate_up, [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")])
+        if f.routed:
+            moe(reads, at, f)
+        else:
+            joined(reads, f.gate_up, [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")])
             reads.read(f.down, at("mlp.down_proj.weight"))
-            continue
-        reads.read(f.router, at("mlp.gate.weight"))
-        expert = lambda e, leaf: src(at("mlp.experts.{}.{}.weight".format(e, leaf)))
-        reads.read_expr(f.gate_up, concat(0, [
-            concat(0, [expert(e, "gate_proj"), expert(e, "up_proj")])
-                .transmute([1, -1, m.hidden], encoding(f.gate_up.dtype))
-            for e in range(f.experts)
-        ]))
-        reads.read_expr(f.down, concat(0, [
-            expert(e, "down_proj").transmute([1, m.hidden, -1], encoding(f.down.dtype))
-            for e in range(f.experts)
-        ]))
-        reads.read_concat(f.shared.gate_up, [
-            at("mlp.shared_experts.gate_proj.weight"),
-            at("mlp.shared_experts.up_proj.weight"),
-        ])
-        reads.read(f.shared.down, at("mlp.shared_experts.down_proj.weight"))
+
+    mtp = m.mtp
+    if mtp == None:
+        return
+    at = lambda tail: "model.layers.{}.{}".format(len(m.layers), tail)
+    reads.read(mtp.enorm, at("enorm.weight"))
+    reads.read(mtp.hnorm, at("hnorm.weight"))
+    eh = leg(reads, at("eh_proj.weight"))
+    land(reads, mtp.e_proj, eh.slice(1, 0, m.hidden))
+    land(reads, mtp.h_proj, eh.slice(1, m.hidden, m.hidden))
+    reads.read(mtp.attn_norm, at("input_layernorm.weight"))
+    reads.read(mtp.mlp_norm, at("post_attention_layernorm.weight"))
+    for w, name in named(mtp.attn, at):
+        reads.read(w, name)
+    moe(reads, at, mtp.mlp)
+    reads.read(mtp.norm, at("shared_head.norm.weight"))
+
+def moe(reads, at, f):
+    reads.read(f.router, at("mlp.gate.weight"))
+    if f.bias != None:
+        reads.read(f.bias, at("mlp.gate.e_score_correction_bias"))
+    hidden = f.down.shape[1]
+    expert = lambda e, leaf: leg(reads, at("mlp.experts.{}.{}.weight".format(e, leaf)))
+    land(reads, f.gate_up, concat(0, [
+        concat(0, [expert(e, "gate_proj"), expert(e, "up_proj")]).transmute([1, 2 * f.inter, hidden], BF)
+        for e in range(f.experts)
+    ]))
+    land(reads, f.down, concat(0, [
+        expert(e, "down_proj").transmute([1, hidden, f.inter], BF)
+        for e in range(f.experts)
+    ]))
+    joined(reads, f.shared.gate_up, [
+        at("mlp.shared_experts.gate_proj.weight"),
+        at("mlp.shared_experts.up_proj.weight"),
+    ])
+    reads.read(f.shared.down, at("mlp.shared_experts.down_proj.weight"))
+
+# A cast inside a join or a cut has no block factors to read, so an FP8
+# tensor that is joined or cut is first dequantized whole into a bf16 tensor
+# of its own, and the join or the cut reads that.
+
+def leg(reads, name):
+    """The tensor `name` as bf16: as stored, or, stored FP8, dequantized by
+    its block factors."""
+    if stored(name) == BF:
+        return src(name)
+    reads.push(tensor(name + ".bf16", src(name).cast(BF), BF, internal = True))
+    return out(name + ".bf16")
+
+def land(reads, w, value):
+    """`w` from the bf16 `value`, encoded to its own dtype."""
+    if w.dtype == dtype.bf16:
+        reads.push(tensor(w.name, value, BF))
+    else:
+        reads.push(tensor(w.name, value.cast(grouped(w)), grouped(w)))
+
+def joined(reads, w, names):
+    """`w` from the tensors `names`, joined along its first axis."""
+    if all([stored(name) == BF for name in names]):
+        reads.read_concat(w, names)
+    else:
+        land(reads, w, concat(0, [leg(reads, name) for name in names]))

@@ -46,12 +46,14 @@ pub enum Dtype {
     I6g16k,
     E4m3row,
     E4m3tile128,
+    E4m3tensor,
+    Fp8b128,
     Ptq1_0,
     KvU4,
 }
 
 impl Dtype {
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 36] = [
         Self::F32,
         Self::F16,
         Self::Bf16,
@@ -84,6 +86,8 @@ impl Dtype {
         Self::I6g16k,
         Self::E4m3row,
         Self::E4m3tile128,
+        Self::E4m3tensor,
+        Self::Fp8b128,
         Self::Ptq1_0,
         Self::KvU4,
     ];
@@ -128,11 +132,15 @@ impl Dtype {
                 gain: &Fmt::Elem(Elem::E { e: 8, m: 0 }),
                 offset: None,
             },
+            // e2m1 codes under one e4m3 gain per 16, each gain under its
+            // row's f32 tensor scale: a projection's one tensor scale is
+            // every row's, and a bank's experts (or the legs a bank joins)
+            // keep their own.
             Self::Nvfp4 => &Fmt::Q {
                 g: Group::N(16),
                 elem: Elem::E { e: 2, m: 1 },
                 gain: &Fmt::Q {
-                    g: Group::Tensor,
+                    g: Group::Row,
                     elem: Elem::E { e: 4, m: 3 },
                     gain: &F32,
                     offset: None,
@@ -222,8 +230,24 @@ impl Dtype {
                 gain: &F32,
                 offset: None,
             },
+            // DeepSeek's FP8 dense weights as released: e4m3 codes under one
+            // ue8m0 exponent a 128x128 block, read by a W8A8 product.
+            Self::Fp8b128 => &Fmt::Q {
+                g: Group::Tile(128, 128),
+                elem: Elem::E { e: 4, m: 3 },
+                gain: &Fmt::Elem(Elem::E { e: 8, m: 0 }),
+                offset: None,
+            },
             Self::E4m3tile128 => &Fmt::Q {
                 g: Group::Tile(128, 128),
+                elem: Elem::E { e: 4, m: 3 },
+                gain: &F32,
+                offset: None,
+            },
+            // e4m3 codes under one f32 scale for the whole tensor, as
+            // modelopt stores a per-tensor FP8 table.
+            Self::E4m3tensor => &Fmt::Q {
+                g: Group::Tensor,
                 elem: Elem::E { e: 4, m: 3 },
                 gain: &F32,
                 offset: None,
@@ -270,7 +294,7 @@ impl Dtype {
             Self::U8 => "u8",
             Self::Bool => "bool",
             Self::Mxfp4 => "g32_e2m1_e8m0_n",
-            Self::Nvfp4 => "g16_e2m1_gt_e4m3_f32_n_n",
+            Self::Nvfp4 => "g16_e2m1_gr_e4m3_f32_n_n",
             Self::U4g64 => "g64_u4_bf16_b_bf16",
             Self::U8g64 => "g64_u8_bf16_b_bf16",
             Self::U4g32 => "g32_u4_bf16_b_bf16",
@@ -285,6 +309,8 @@ impl Dtype {
             Self::I6g16k => "g16_i6_g16_i8_f16_n_n",
             Self::E4m3row => "gr_e4m3_f32_n",
             Self::E4m3tile128 => "g128x128_e4m3_f32_n",
+            Self::E4m3tensor => "gt_e4m3_f32_n",
+            Self::Fp8b128 => "g128x128_e4m3_e8m0_n",
             Self::Ptq1_0 => "g128_t3_f16_n",
             Self::KvU4 => "g256_u4_f16_n",
         }
@@ -415,6 +441,15 @@ pub const TILED_STEP: u32 = 64;
 pub const SCALES: &str = ".scales";
 
 pub const BIASES: &str = ".biases";
+
+/// An NVFP4 weight's second-level gains: the f32 tensor scale each row's
+/// e4m3 scales are read under.
+pub const GLOBAL_SCALES: &str = ".global_scales";
+
+/// The static f32 scale an NVFP4 weight's activations were calibrated to,
+/// one per expert (or one for a projection); a W4A16 product leaves it
+/// unread and a W4A4 one quantizes its activations under it.
+pub const INPUT_SCALES: &str = ".input_scales";
 
 /// Weights per PTQ1_0 block (`Dtype::Ptq1_0`).
 pub const PTQ1_0_BLOCK: u32 = 128;

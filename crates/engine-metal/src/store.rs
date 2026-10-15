@@ -1,15 +1,15 @@
 pub mod accounting;
 pub mod kv;
 
-use engine::transfer::KvCopy;
+use engine::transfer::KvRun;
 use kernels_metal::{KvPool, RecurrentPool, Tensor};
-use poem_ir::{CacheRow, Dtype, Trace};
+use poem_ir::{Attention, CacheRow, Def, Dtype, Operation, Trace};
 
 use crate::device::ctx::Frame;
 use crate::device::elastic;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
-use crate::run::{CachePool, CacheTable};
+use crate::run::{CachePool, CacheTable, PoolSlabs};
 use crate::store::kv::{Facts, Paging};
 
 impl From<poem_exec::store::Fault> for Fault {
@@ -62,6 +62,15 @@ enum Shape {
         stride: u64,
         dtype: Dtype,
         plane: usize,
+    },
+    /// The compressor state a pool gather keeps beside kv space `space`: a
+    /// kv and a score row of `width` bf16 per cell, so it grows, maps and
+    /// moves with the pool's pages.
+    Compressed {
+        space: u32,
+        width: u64,
+        kv: usize,
+        score: usize,
     },
 }
 
@@ -148,85 +157,6 @@ pub struct Seats {
     pub spaces: Vec<SpaceSeat>,
     pub slot_ids: Tensor,
     pub slot_of_row: Tensor,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Move {
-    pub src_page: u32,
-    pub src_token: u32,
-    pub dst_page: u32,
-    pub dst_token: u32,
-    pub tokens: u32,
-}
-
-impl Move {
-    pub fn plan(copy: &KvCopy, page_size: u32) -> std::result::Result<Vec<Move>, String> {
-        if copy.src_page_ids.len() != copy.dst_page_ids.len() {
-            return Err(format!(
-                "src_page_ids has {} entries and dst_page_ids {}",
-                copy.src_page_ids.len(),
-                copy.dst_page_ids.len()
-            ));
-        }
-        let mut moves: Vec<Move> = Vec::with_capacity(copy.src_page_ids.len() + copy.moves.len());
-        for (src, dst) in copy.src_page_ids.iter().zip(&copy.dst_page_ids) {
-            moves.push(Move {
-                src_page: *src,
-                src_token: 0,
-                dst_page: *dst,
-                dst_token: 0,
-                tokens: page_size,
-            });
-        }
-        for (at, cell) in copy.moves.iter().enumerate() {
-            if cell.src_token_offset >= page_size || cell.dst_token_offset >= page_size {
-                return Err(format!(
-                    "kv move {at} names token offsets {}/{} in pages of {page_size} tokens",
-                    cell.src_token_offset, cell.dst_token_offset
-                ));
-            }
-            if cell.src_page_id == cell.dst_page_id
-                && cell.src_token_offset == cell.dst_token_offset
-            {
-                continue;
-            }
-            let run = moves.last_mut().filter(|run| {
-                run.src_page == cell.src_page_id
-                    && run.dst_page == cell.dst_page_id
-                    && run.src_token + run.tokens == cell.src_token_offset
-                    && run.dst_token + run.tokens == cell.dst_token_offset
-                    && run.src_token + run.tokens < page_size
-            });
-            match run {
-                Some(run) => run.tokens += 1,
-                None => moves.push(Move {
-                    src_page: cell.src_page_id,
-                    src_token: cell.src_token_offset,
-                    dst_page: cell.dst_page_id,
-                    dst_token: cell.dst_token_offset,
-                    tokens: 1,
-                }),
-            }
-        }
-        for run in &moves {
-            if run.src_page != run.dst_page {
-                continue;
-            }
-            let (lo, hi) = (
-                u32::min(run.src_token, run.dst_token),
-                u32::max(run.src_token, run.dst_token),
-            );
-            if hi - lo < run.tokens {
-                return Err(format!(
-                    "a kv move of {} tokens reads page {} from token {} and writes the same \
-                     page at token {} — the two ends overlap, and a blit whose regions \
-                     overlap is undefined rather than a shift",
-                    run.tokens, run.src_page, run.src_token, run.dst_token
-                ));
-            }
-        }
-        Ok(moves)
-    }
 }
 
 /// How the pool holds its memory: every Metal 4 device gets the elastic
@@ -422,6 +352,20 @@ impl Pools {
                 }
             }
         }
+        let cells = paging.pages() * u64::from(paging.page_size);
+        for (space, width) in compressed_spaces(trace) {
+            let bytes = cells * width * u64::from(elem_size(Dtype::Bf16));
+            rows.push(RowPlan {
+                shape: Shape::Compressed {
+                    space,
+                    width,
+                    kv: next,
+                    score: next + 1,
+                },
+                planes: vec![bytes, bytes],
+            });
+            next += 2;
+        }
         Ok(rows)
     }
 
@@ -443,7 +387,7 @@ impl Pools {
             .iter()
             .map(|shape| match shape {
                 Shape::State { stride, dtype, .. } => stride * u64::from(elem_size(*dtype)),
-                Shape::Kv { .. } => 0,
+                Shape::Kv { .. } | Shape::Compressed { .. } => 0,
             })
             .sum()
     }
@@ -540,8 +484,34 @@ impl Pools {
     /// 8-bit attention kernels (the profile's `kernel.sdpa.kv_q8`).
     pub fn table(&self, handles: &Handles, seats: &Seats, q8: bool) -> Result<CacheTable> {
         let mut rows = Vec::with_capacity(self.shapes.len());
+        let mut compressed = Vec::new();
+        let cells = self.paging.pages() * u64::from(self.paging.page_size);
         for shape in &self.shapes {
             rows.push(match *shape {
+                Shape::Compressed {
+                    space,
+                    width,
+                    kv,
+                    score,
+                } => {
+                    let plane = |at: usize| -> Result<Tensor> {
+                        let buffer = self.planes[at].buffer();
+                        Ok(Tensor::new(
+                            handles.bind(buffer, 0, buffer.bytes())?,
+                            u32::try_from(cells).unwrap_or(u32::MAX),
+                            u32::try_from(width).unwrap_or(u32::MAX),
+                            Dtype::Bf16,
+                        ))
+                    };
+                    compressed.push((
+                        space,
+                        PoolSlabs {
+                            state_kv: plane(kv)?,
+                            state_score: plane(score)?,
+                        },
+                    ));
+                    continue;
+                }
                 Shape::Kv {
                     space,
                     head_dim,
@@ -602,7 +572,10 @@ impl Pools {
                 }
             });
         }
-        Ok(CacheTable(rows))
+        Ok(CacheTable {
+            pools: rows,
+            compressed,
+        })
     }
 
     pub fn clear(&mut self, slot: u32) -> Result<()> {
@@ -639,7 +612,7 @@ impl Pools {
         Ok(())
     }
 
-    pub fn copy_kv(&mut self, frame: &mut Frame, moves: &[Move]) -> Result<()> {
+    pub fn copy_kv(&mut self, frame: &mut Frame, moves: &[KvRun]) -> Result<()> {
         if moves.is_empty() {
             return Ok(());
         }
@@ -697,6 +670,14 @@ impl Pools {
     fn kv_planes(&self) -> Result<Vec<(usize, u64)>> {
         let mut planes = Vec::new();
         for shape in &self.shapes {
+            if let Shape::Compressed {
+                width, kv, score, ..
+            } = *shape
+            {
+                let cell = width * u64::from(elem_size(Dtype::Bf16));
+                planes.extend([(kv, cell), (score, cell)]);
+                continue;
+            }
             let Shape::Kv {
                 head_dim,
                 kv_heads,
@@ -898,6 +879,14 @@ impl Pools {
                         u64::from(demand.state_slots) * stride * u64::from(elem_size(dtype));
                     want[plane] = want[plane].max(bytes);
                 }
+                Shape::Compressed {
+                    width, kv, score, ..
+                } => {
+                    let cells = u64::from(demand.kv_pages) * page_size;
+                    let bytes = cells * width * u64::from(elem_size(Dtype::Bf16));
+                    want[kv] = want[kv].max(bytes);
+                    want[score] = want[score].max(bytes);
+                }
             }
         }
         want.iter_mut()
@@ -1019,58 +1008,32 @@ impl engine::frame::Supply for Pools {
 
 /// What the kv pool and the recurrent-state buffers beside it wire: a part
 /// per kv page, and a part per state slot the page count leaves alone.
+/// `widest` is the widest plane's part per page: each plane is one buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolDemand {
     pub per_page: u64,
     pub fixed: u64,
+    pub widest: u64,
 }
 
 impl PoolDemand {
     /// `trace`'s pool at `paging`'s page size and slots, beside `rs`'s
-    /// recurrent-state buffers; `paging`'s page count is not read.
+    /// recurrent-state buffers; `paging`'s page count is not read. Read off
+    /// the plan `Pools::reserve` lays, so the two never disagree.
     pub fn of(trace: &Trace, paging: Paging, rs: Option<&crate::rs::Layout>) -> Result<PoolDemand> {
         let mut demand = PoolDemand {
             per_page: 0,
             fixed: rs.map_or(0, |layout| crate::rs::Buffers::demand(layout, paging)),
+            widest: 0,
         };
-        for row in &trace.caches {
-            match row {
-                CacheRow::Kv {
-                    name,
-                    planes,
-                    dtype,
-                    head_dim,
-                    ..
-                } => {
-                    let planes = split(name, planes)?;
-                    let tokens = u64::from(paging.page_size);
-                    // The demand estimate runs before consumers state a seat, but the
-                    // trace row now carries the cache's head_dim, so a packed KvU4
-                    // cache is sized exactly per head at ANY head_dim (matching what
-                    // `reserve` computes from the seat), not from the 256 anchor. A
-                    // row from a trace serialized before this field carries head_dim
-                    // 0, which `row_stride` treats as "unknown" and falls back to the
-                    // format anchor — the old behavior.
-                    let block = (*head_dim != 0).then_some(*head_dim);
-                    let keys = tokens * row_stride(name, *dtype, planes.keys, block)?;
-                    let values = if planes.shared || planes.values == 0 {
-                        0
-                    } else {
-                        tokens * row_stride(name, *dtype, planes.values, block)?
-                    };
-                    demand.per_page = demand.per_page.saturating_add(keys.saturating_add(values));
-                }
-                CacheRow::State {
-                    name, slab, dtype, ..
-                } => {
-                    let stride: u64 = slab.iter().product();
-                    let dtype = state_dtype(*dtype);
-                    demand.fixed = demand.fixed.saturating_add(
-                        stride
-                            .saturating_mul(u64::from(paging.slots))
-                            .saturating_mul(elem_bytes(name, dtype)?),
-                    );
-                }
+        let one_page = Paging { pages: 1, ..paging };
+        for row in Pools::plan(trace, one_page, &Facts::default())? {
+            let bytes: u64 = row.planes.iter().sum();
+            if matches!(row.shape, Shape::State { .. }) {
+                demand.fixed = demand.fixed.saturating_add(bytes);
+            } else {
+                demand.per_page = demand.per_page.saturating_add(bytes);
+                demand.widest = row.planes.iter().fold(demand.widest, |w, &p| w.max(p));
             }
         }
         Ok(demand)
@@ -1082,11 +1045,51 @@ impl PoolDemand {
             .saturating_add(self.per_page.saturating_mul(pages))
     }
 
+    /// The pool's bytes at `pages`, or `u64::MAX` past the pages whose widest
+    /// plane one buffer of `max_buffer` bytes holds.
+    #[must_use]
+    pub fn bytes_binding(self, pages: u64, max_buffer: u64) -> u64 {
+        if self.widest.saturating_mul(pages) > max_buffer {
+            u64::MAX
+        } else {
+            self.bytes(pages)
+        }
+    }
+
     /// The most pages whose pool fits in `room`.
     #[must_use]
     pub fn pages_within(self, room: u64) -> u64 {
         room.saturating_sub(self.fixed) / self.per_page.max(1)
     }
+}
+
+/// Each kv space a pool gather compresses, with the widest state row its
+/// gathers keep per cell (`ratio` 4 overlaps two windows, so twice the head).
+fn compressed_spaces(trace: &Trace) -> Vec<(u32, u64)> {
+    let mut spaces: Vec<(u32, u64)> = Vec::new();
+    for node in &trace.nodes {
+        let Operation::Attention(Attention::PoolGather {
+            pages,
+            head_dim,
+            ratio,
+            ..
+        }) = &node.op
+        else {
+            continue;
+        };
+        let Some(Def::Cache(space)) = trace.values.get(pages.0 as usize).map(|v| &v.def) else {
+            continue;
+        };
+        let width = if *ratio == 4 { 2 } else { 1 } * u64::from(*head_dim);
+        if width == 0 {
+            continue;
+        }
+        match spaces.iter_mut().find(|(held, _)| *held == *space) {
+            Some((_, held)) => *held = (*held).max(width),
+            None => spaces.push((*space, width)),
+        }
+    }
+    spaces
 }
 
 /// The bytes `trace`'s kv and state rows wire at `paging`.
@@ -1225,6 +1228,23 @@ mod tests {
             disk: None,
             arena: None,
         }
+    }
+
+    #[test]
+    fn a_pool_stops_where_its_widest_plane_outgrows_one_buffer() {
+        let demand = PoolDemand {
+            per_page: 3 << 20,
+            fixed: 1 << 20,
+            widest: 2 << 20,
+        };
+        let max_buffer = 64 << 20;
+        assert_eq!(demand.bytes_binding(32, max_buffer), demand.bytes(32));
+        assert_eq!(demand.bytes_binding(33, max_buffer), u64::MAX);
+        let pages = engine::fit::pages_for(None, u64::MAX >> 1, 1, |pages| {
+            demand.bytes_binding(pages, max_buffer)
+        })
+        .expect("the room holds a sequence");
+        assert_eq!(pages, 32, "the room filled past what one buffer binds");
     }
 
     fn paging(slots: u32) -> Paging {
@@ -1393,7 +1413,7 @@ mod tests {
         pools
             .copy_kv(
                 &mut frame,
-                &[Move {
+                &[KvRun {
                     src_page: 0,
                     src_token: 0,
                     dst_page: 1,

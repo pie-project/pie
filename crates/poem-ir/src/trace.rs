@@ -94,6 +94,17 @@ pub enum ParamLayout {
     },
 }
 
+/// Where a plane may be served from. `Host` names a plane read only by row
+/// gathers (a hashed table), which a card whose profile asks serves from
+/// pinned, device-mapped host memory; every other card, and every plane left
+/// `Device`, holds it in device memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ParamPlacement {
+    #[default]
+    Device,
+    Host,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Param {
     pub name: String,
@@ -104,6 +115,8 @@ pub struct Param {
     pub source: ParamSource,
     #[serde(default)]
     pub layout: ParamLayout,
+    #[serde(default)]
+    pub placement: ParamPlacement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

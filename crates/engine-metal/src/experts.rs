@@ -76,6 +76,9 @@ impl Plan {
         gathered: crate::gather::Plan,
     ) -> Result<Plan> {
         let held = gathered.params();
+        // The gathered table is resident beside whatever the budget holds:
+        // every test against the budget charges it, as the load check does.
+        let slab = gathered.device_demand();
         let bytes = crate::weights::plane_bytes(trace)?;
         let full: u64 = bytes
             .iter()
@@ -90,7 +93,7 @@ impl Plan {
                 ..Plan::default()
             });
         };
-        if budget >= full {
+        if budget >= full + slab {
             return Ok(Plan {
                 device_bytes: full,
                 gathered,
@@ -102,9 +105,10 @@ impl Plan {
         if bands.is_empty() {
             return Err(Fault::Residency(format!(
                 "`device_weight_budget` is {budget} bytes and this plan's weight table \
-                 demands {full}. Nothing in it is a routed-expert bank, so there is no \
+                 demands {}. Nothing in it is a routed-expert bank, so there is no \
                  tier to hold less of: only routed experts stream (their seat is \
-                 chosen after the router has run); dense planes do not. Raise the budget, or state `None` for uncapped."
+                 chosen after the router has run); dense planes do not. Raise the budget, or state `None` for uncapped.",
+                full + slab,
             )));
         }
 
@@ -131,13 +135,14 @@ impl Plan {
         let need = (1..=u32::MAX)
             .find(|&n| pass_group(n) >= fan)
             .unwrap_or(fan);
-        let floor = dense + seats(need);
+        let floor = dense + slab + seats(need);
         if budget < floor {
             return Err(Fault::Residency(format!(
                 "`device_weight_budget` is {budget} bytes; this plan's DENSE planes \
-                 demand {dense} resident and its {} routed bands need {need} expert \
-                 seats each on top (a row routes to {fan} experts and a pass seats half \
-                 the slab), which is {floor}. Dense planes do not stream in this build, \
+                 demand {dense} resident, its gathered table {slab} beside them, and \
+                 its {} routed bands need {need} expert seats each on top (a row \
+                 routes to {fan} experts and a pass seats half the slab), which is \
+                 {floor}. Dense planes do not stream in this build, \
                  so the budget cannot be met by holding less. Raise it to at least \
                  {floor}, or state `None`.",
                 bands.len(),
@@ -145,7 +150,7 @@ impl Plan {
         }
 
         let experts = groups[0].experts;
-        let slack = budget - dense;
+        let slack = budget - dense - slab;
         let mut slots = 0u32;
         for n in (need..=experts.max(need)).rev() {
             if seats(n) <= slack {

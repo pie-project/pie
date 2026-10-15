@@ -500,6 +500,57 @@ pub fn lm_head_via_dense(
     )
 }
 
+/// A dense affine 4-bit projection (`s·c + b`, bf16 factors a group of 32,
+/// 64 or 128) on the tcgen05 GEMM, dequantized in its transform warps:
+/// `Ok(false)` when this device, this load or these planes do not take it.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_tc5(
+    ctx: &Ctx,
+    act: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    offset: OffsetKind,
+    biases: Option<Tensor>,
+    factor: Dtype,
+    y: &mut Tensor,
+    seat: GroupSeat,
+) -> Result<bool, Error> {
+    use crate::linear::tc5;
+    const OP: &str = "linear.matmul";
+    let Some(zeros) = biases else {
+        return Ok(false);
+    };
+    if offset != OffsetKind::Post
+        || factor != Dtype::Bf16
+        || act.dtype != Dtype::Bf16
+        || seat.streams()
+        || !ctx.tuning().moe_tc5
+        || !tc5::supported()
+    {
+        return Ok(false);
+    }
+    let Affine { bits, group, n, k } = affine(OP, act, codes, scales, offset, biases, y)?;
+    if bits != 4 || !matches!(group, 32 | 64 | 128) || !k.is_multiple_of(64) || !n.is_multiple_of(8)
+    {
+        return Ok(false);
+    }
+    if y.rows == 0 {
+        return Ok(true);
+    }
+    let m =
+        u32::try_from(ctx.opaque_rows(i32::try_from(y.rows).unwrap_or(i32::MAX))).unwrap_or(y.rows);
+    tc5::gemm(
+        ctx,
+        tc5::Operand::plain(act.ptr, tc5::Elem::Bf16),
+        tc5::Operand::affine(codes.ptr, scales.ptr, zeros.ptr, group),
+        y.ptr,
+        [m, n, k],
+        1.0,
+    )?;
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dense_affine_via_dense(
     ctx: &Ctx,

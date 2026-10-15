@@ -70,6 +70,35 @@ pub struct WorkingSetPercent(pub u32);
 #[decision(id = "engine.lattice_steps", constant(set(1, 2)), default = 1, tune = engine)]
 pub struct LatticeSteps(pub u32);
 
+/// Recurrent-state slots a lane is given when `[engine] max_state_slots` is
+/// not stated, so a hybrid trunk seats every lane it batches (a lane holds a
+/// slot per posted frame, two at the default dispatch depth); 0 keeps the
+/// fixed 256, which seats 128 lanes at that depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.state_slots_per_lane", constant(range(0..=8)), default = 0, tune = engine)]
+pub struct StateSlotsPerLane(pub u32);
+
+/// Whether a hybrid trunk whose state slots cannot seat every lane at the
+/// configured dispatch depth (two frames a lane) asks the runtime to post one
+/// frame a lane instead, seating up to twice the lanes. Off keeps the depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.one_frame_when_short", flag, default = false, tune = engine)]
+pub struct OneFrameWhenShort;
+
+/// The rows one fire takes when `[engine] max_forward_tokens` is not
+/// stated; 0 keeps the fixed 8192. Wider fires batch more prompts' chunks
+/// into one pass of the weights, and their activation arena grows with them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.forward_tokens", constant(range(0..=65536)), default = 0, tune = engine)]
+pub struct ForwardTokens(pub u32);
+/// Whether a plane its package declares `host` (read only by row gathers, as
+/// a hashed n-gram table) is served from pinned, device-mapped host memory,
+/// its device bytes left to KV pages and state slots. Off holds every plane
+/// in device memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.host_planes", flag, default = false, tune = engine)]
+pub struct HostPlanes;
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
     kernels_cuda::tuning::register(&mut r);
@@ -78,7 +107,11 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<Copies>()
         .add::<Grouped>()
         .add::<WorkingSetPercent>()
-        .add::<LatticeSteps>();
+        .add::<LatticeSteps>()
+        .add::<StateSlotsPerLane>()
+        .add::<OneFrameWhenShort>()
+        .add::<ForwardTokens>()
+        .add::<HostPlanes>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     poem_compiler::costs::register(&mut r, 2);
     r
@@ -105,6 +138,7 @@ seeded!(
     "sm89/nvidia-l40s.toml",
     "sm90.toml",
     "sm100.toml",
+    "sm100/nvidia-b200.toml",
     "sm103.toml",
     "sm110.toml",
     "sm120.toml",
@@ -133,6 +167,10 @@ pub struct Engine {
     pub grouped: bool,
     pub working_set_percent: u32,
     pub lattice_steps: u32,
+    pub state_slots_per_lane: u32,
+    pub one_frame_when_short: bool,
+    pub forward_tokens: u32,
+    pub host_planes: bool,
 }
 
 impl Engine {
@@ -155,6 +193,10 @@ impl Engine {
             grouped: profile.on::<Grouped>(&Anywhere),
             working_set_percent: profile.get::<WorkingSetPercent>().0,
             lattice_steps: profile.get::<LatticeSteps>().0,
+            state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
+            one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
+            forward_tokens: profile.get::<ForwardTokens>().0,
+            host_planes: profile.on::<HostPlanes>(&Anywhere),
         }
     }
 }
@@ -305,7 +347,7 @@ mod tests {
             (8, 7, "Orin"),
             (8, 9, "NVIDIA L4"),
             (9, 0, "NVIDIA H100 80GB HBM3"),
-            (10, 0, "NVIDIA B200"),
+            (10, 0, "NVIDIA GB200"),
             (10, 3, "NVIDIA B300"),
             (11, 0, "NVIDIA Thor"),
             (12, 0, "NVIDIA RTX PRO 6000"),
@@ -320,12 +362,77 @@ mod tests {
             assert!(report.untuned(), "{gpu}");
             assert_eq!(Engine::of(&profile), Engine::of(&registry().defaults()));
             let tuning = kernels_cuda::tuning::Tuning::of(&profile);
+            // sm_100 alone runs the tcgen05 prefill and reads a wide
+            // group's single-token rows through the prefill kernel; every
+            // other chip keeps FA2 and the decode kernel.
+            assert_eq!(
+                (
+                    tuning.prefill_tc5,
+                    tuning.decode_grouped_prefill_from,
+                    tuning.decode_grouped_prefill_lse,
+                ),
+                if (major, minor) == (10, 0) {
+                    (true, 4, true)
+                } else {
+                    (false, 0, false)
+                },
+                "{gpu}"
+            );
             if major >= 10 {
                 assert!(tuning.gemv_narrow && tuning.mla_naive, "{gpu}");
+                // B200 alone also runs the tcgen05 selects and GLU epilogues.
+                let b200 = (major, minor) == (10, 0);
+                assert_eq!(tuning.moe_tc5, b200, "{gpu}");
+                assert_eq!(
+                    tuning.ssm_gdn_fused_scan,
+                    major == 10 && minor == 0,
+                    "{gpu}"
+                );
+                assert_eq!(tuning.ssm_gdn_tc5, b200, "{gpu}");
+                assert_eq!(tuning.rows_vec, b200, "{gpu}");
+                assert_eq!(tuning.ssm_conv_vec4, b200, "{gpu}");
+                assert_eq!(tuning.merge_warp, b200, "{gpu}");
+                assert_eq!(tuning.gemm_bias_epilogue, b200, "{gpu}");
+                assert_eq!(tuning.decode_xqa, b200, "{gpu}");
+                assert_eq!(tuning.pool_mma, major == 10 && minor == 0, "{gpu}");
+                assert_eq!(
+                    tuning.decode_xqa_from_64,
+                    if b200 { 16 } else { 0 },
+                    "{gpu}"
+                );
+                assert_eq!(
+                    tuning.decode_xqa_whole_window,
+                    if b200 { 128 } else { 0 },
+                    "{gpu}"
+                );
+                assert_eq!(tuning.decode_xqa_cluster, if b200 { 8 } else { 0 }, "{gpu}");
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
                         mla_naive: false,
+                        moe_tc5: defaults.moe_tc5,
+                        gemm_tc5_glu_from: defaults.gemm_tc5_glu_from,
+                        ssm_gdn_fused_scan: false,
+                        ssm_gdn_tc5: false,
+                        rows_vec: false,
+                        ssm_conv_vec4: false,
+                        merge_warp: false,
+                        mxfp4_mma_until: defaults.mxfp4_mma_until,
+                        mxfp4_mma_from: defaults.mxfp4_mma_from,
+                        prefill_tc5: false,
+                        prefill_wide_sliding: false,
+                        decode_grouped_prefill_from: 0,
+                        gemm_bias_epilogue: false,
+                        gemm_nvfp4_k128: false,
+                        moe_w4a4_fused_from: 65_536,
+                        gemm_split_launch_ns: 0,
+                        moe_topk_warp: false,
+                        decode_grouped_prefill_lse: false,
+                        decode_xqa: false,
+                        decode_xqa_from_64: 0,
+                        decode_xqa_whole_window: 0,
+                        decode_xqa_cluster: 0,
+                        pool_mma: false,
                         ..tuning
                     },
                     defaults,
@@ -363,6 +470,10 @@ mod tests {
                 grouped: true,
                 working_set_percent: 50,
                 lattice_steps: 1,
+                state_slots_per_lane: 0,
+                one_frame_when_short: false,
+                forward_tokens: 0,
+                host_planes: false,
             }
         );
         assert_eq!(
@@ -374,6 +485,143 @@ mod tests {
         fused.sort_unstable();
         shipped.sort_unstable();
         assert_eq!(fused, shipped);
+    }
+
+    #[test]
+    fn the_b200_runs_its_family_measured_with_the_skinny_gemm_off() {
+        let (b200, report) = resolve("NVIDIA B200", &facts(10, 0, 148), None);
+        assert_eq!(
+            report.layers,
+            [
+                profile::Source::Seeded("sm100.toml".into()),
+                profile::Source::Seeded("sm100/nvidia-b200.toml".into())
+            ]
+        );
+        assert!(!report.untuned());
+        let tuning = kernels_cuda::tuning::Tuning::of(&b200);
+        assert_eq!(
+            tuning.gemm_skinny_rows, 0,
+            "cuBLAS beats the skinny GEMM on a B200"
+        );
+        let (family, _) = resolve("NVIDIA GB200", &facts(10, 0, 152), None);
+        assert_eq!(
+            kernels_cuda::tuning::Tuning {
+                gemm_skinny_rows: kernels_cuda::tuning::Tuning::of(&family).gemm_skinny_rows,
+                selected_mma: false,
+                index_mma: false,
+                gemm_narrow_n: 0,
+                ..tuning
+            },
+            kernels_cuda::tuning::Tuning::of(&family),
+            "only the skinny GEMM's reach and the two sparse-attention walks differ from \
+             the family"
+        );
+        assert!(
+            tuning.selected_mma,
+            "a B200 walks a selection on the tensor cores"
+        );
+        assert_eq!(Engine::of(&b200).state_slots_per_lane, 2);
+        assert!(Engine::of(&b200).one_frame_when_short);
+        assert_eq!(Engine::of(&b200).forward_tokens, 16384);
+        assert!(Engine::of(&b200).host_planes);
+        assert_eq!(
+            Engine {
+                state_slots_per_lane: 0,
+                one_frame_when_short: false,
+                forward_tokens: 0,
+                host_planes: false,
+                ..Engine::of(&b200)
+            },
+            Engine::of(&family),
+            "only the state seating, the fire width and the host planes differ from the \
+             family's engine"
+        );
+        assert_eq!(Engine::of(&family).state_slots_per_lane, 0);
+        assert!(!Engine::of(&family).one_frame_when_short);
+        assert!(!Engine::of(&family).host_planes);
+    }
+
+    /// The two-launch gated delta scan is an sm_100 family decision; every
+    /// other family keeps the three wmma launches it ran before.
+    #[test]
+    fn only_the_sm100_family_runs_the_two_launch_gated_delta_scan() {
+        for (name, major, minor, sms) in [("NVIDIA B200", 10, 0, 148), ("NVIDIA GB200", 10, 0, 152)]
+        {
+            let (p, _) = resolve(name, &facts(major, minor, sms), None);
+            assert!(
+                kernels_cuda::tuning::Tuning::of(&p).ssm_gdn_fused_scan,
+                "{name}"
+            );
+        }
+        for (name, major, minor, sms) in [
+            ("NVIDIA A100-SXM4-80GB", 8, 0, 108),
+            ("NVIDIA GeForce RTX 3090", 8, 6, 82),
+            ("NVIDIA Jetson AGX Orin", 8, 7, 16),
+            ("NVIDIA L40S", 8, 9, 142),
+            ("NVIDIA H100 80GB HBM3", 9, 0, 132),
+            ("NVIDIA B300", 10, 3, 148),
+            ("NVIDIA Thor", 11, 0, 20),
+            ("NVIDIA GeForce RTX 5090", 12, 0, 170),
+            ("NVIDIA GB10", 12, 1, 48),
+        ] {
+            let (p, _) = resolve(name, &facts(major, minor, sms), None);
+            assert!(
+                !kernels_cuda::tuning::Tuning::of(&p).ssm_gdn_fused_scan,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_b200_runs_the_tcgen05_selects_and_glu_epilogues() {
+        let tuning = |major, minor, sms| {
+            kernels_cuda::tuning::Tuning::of(
+                &resolve("NVIDIA GPU", &facts(major, minor, sms), None).0,
+            )
+        };
+        let b200 = tuning(10, 0, 148);
+        assert!(b200.moe_tc5);
+        assert_eq!(b200.gemm_tc5_glu_from, 512);
+        assert_eq!((b200.mxfp4_mma_from, b200.mxfp4_mma_until), (28, 1024));
+        assert!(b200.merge_warp);
+        for (major, minor) in [
+            (8, 0),
+            (8, 6),
+            (8, 7),
+            (8, 9),
+            (9, 0),
+            (10, 3),
+            (11, 0),
+            (12, 0),
+            (12, 1),
+        ] {
+            let other = tuning(major, minor, 132);
+            assert!(!other.moe_tc5, "sm_{major}{minor} keeps the old selects");
+            assert!(
+                !other.merge_warp,
+                "sm_{major}{minor} keeps the staged merge"
+            );
+            assert_eq!(
+                other.gemm_tc5_glu_from, 65_536,
+                "sm_{major}{minor} keeps the GLU apart"
+            );
+            assert_eq!(
+                other.mxfp4_mma_until, 0,
+                "sm_{major}{minor} keeps the mxfp4 GEMV"
+            );
+            assert_eq!(
+                other.gemm_split_launch_ns, 0,
+                "sm_{major}{minor} charges a split's launch nothing"
+            );
+            assert!(
+                !other.moe_topk_warp,
+                "sm_{major}{minor} ranks its router a block a row"
+            );
+            assert_eq!(
+                other.moe_w4a4_fused_from, 65_536,
+                "sm_{major}{minor} keeps the W4A4 routed MLP apart"
+            );
+        }
     }
 
     #[test]

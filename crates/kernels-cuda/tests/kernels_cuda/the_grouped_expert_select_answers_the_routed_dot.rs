@@ -4,6 +4,7 @@ use crate::common::{Gpu, Lcg, close, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::moe::{ExpertTable, matmul_select};
 use kernels_cuda::tensor::Tensor;
+use kernels_cuda::tuning::Tuning;
 
 #[derive(Clone, Copy)]
 enum Spread {
@@ -44,7 +45,25 @@ fn routed_dot(
     y
 }
 
+/// Each case on the old arm and on the tcgen05 one (where the device has it).
+#[allow(clippy::too_many_arguments)]
 fn check(
+    experts: usize,
+    tokens: usize,
+    top_k: usize,
+    k: usize,
+    n: usize,
+    by_token: bool,
+    spread: Spread,
+) {
+    for tuning in [Tuning::DEFAULT, crate::common::TC5] {
+        check_tuned(tuning, experts, tokens, top_k, k, n, by_token, spread);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_tuned(
+    tuning: Tuning,
     experts: usize,
     tokens: usize,
     top_k: usize,
@@ -70,7 +89,7 @@ fn check(
     let routes_at = gpu.up(&routes);
     let y_at = gpu.zeros(route_count * n * 2);
 
-    let ctx = gpu.ctx();
+    let ctx = gpu.ctx().with_tuning(tuning);
     let x = Tensor::new(
         x_at,
         u32::try_from(x_rows).unwrap(),
@@ -126,9 +145,23 @@ fn the_grouped_expert_select_answers_the_routed_dot_every_case() {
     the_token_read_leg_answers_the_dot();
     the_route_read_leg_answers_the_dot();
     a_fire_wider_than_the_gemvs_grid_is_still_answered();
+    a_gemv_run_past_grid_y_is_answered();
     a_decode_width_fire_is_still_served();
     a_dominant_expert_still_fits_the_block_budget();
     a_ragged_expert_count_still_lands();
+    the_tcgen05_widths_land_masked_and_contiguous();
+}
+
+/// Widths the grouped tcgen05 GEMM takes (on a device that has it): a
+/// decode fire laid out masked, prefill fires contiguous, one of them past
+/// 65535 routes, and one expert taking most of them.
+fn the_tcgen05_widths_land_masked_and_contiguous() {
+    check(16, 20, 2, 256, 128, true, Spread::Mixed);
+    check(16, 9, 2, 256, 128, true, Spread::Mixed);
+    check(16, 64, 4, 256, 192, false, Spread::Mixed);
+    check(16, 70, 4, 256, 192, true, Spread::Mixed);
+    check(16, 300, 4, 512, 320, true, Spread::Dominant);
+    check(8, 33_000, 2, 64, 64, true, Spread::Mixed);
 }
 
 fn the_token_read_leg_answers_the_dot() {
@@ -141,6 +174,18 @@ fn the_route_read_leg_answers_the_dot() {
 
 fn a_fire_wider_than_the_gemvs_grid_is_still_answered() {
     check(8, 33_000, 2, 32, 32, true, Spread::Mixed);
+}
+
+/// A route run past grid.y's 65535 rows on the GEMV itself (the grouped
+/// and tcgen05 legs off), read by token and by route: DeepSeek-V4's grouped
+/// o-projection at an 8192-row fire is 65536 routes.
+fn a_gemv_run_past_grid_y_is_answered() {
+    let gemv = Tuning {
+        moe_grouped: false,
+        ..Tuning::DEFAULT
+    };
+    check_tuned(gemv, 8, 33_000, 2, 32, 32, true, Spread::Mixed);
+    check_tuned(gemv, 8, 8_192, 8, 32, 32, false, Spread::Mixed);
 }
 
 fn a_decode_width_fire_is_still_served() {

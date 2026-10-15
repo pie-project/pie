@@ -32,7 +32,7 @@ fn every_model_is_one_entry() {
 
 fn deploy(weights: &[Dtype], tp: u32, parts: &[&str], drafter: Option<&str>) -> Deploy {
     Deploy {
-        weights: weights.to_vec(),
+        weights: weights.iter().map(|w| (*w).into()).collect(),
         kv: Dtype::Bf16,
         tp,
         parts: parts.iter().map(|p| (*p).to_string()).collect(),

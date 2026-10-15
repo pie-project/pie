@@ -5,8 +5,8 @@
 
 load("//lib/adapters/model.poem", "banks")
 
-def dims(layers = 66, experts = 256):
-    return struct(
+def dims(layers = 66, experts = 256, **over):
+    d = dict(
         hidden = 6144,
         layers = layers,
         vocab = 201024,
@@ -32,10 +32,27 @@ def dims(layers = 66, experts = 256):
         log_floor = 128000,
         log_alpha = 0.1,
     )
+    d.update(over)
+    return struct(**d)
+
+def small(layers = 42, experts = 256):
+    """Inkling-Small: the same layer pattern, narrower and shallower."""
+    return dims(
+        layers,
+        experts,
+        hidden = 4096,
+        heads = 32,
+        local_kv_heads = 8,
+        dense_inter = 16384,
+        moe_inter = 2048,
+        mup = 16.0,
+    )
 
 DIMS = {
     "inkling": dims(),
     "inkling-mini-l7-e8": dims(layers = 7, experts = 8),
+    "inkling-small": small(),
+    "inkling-small-mini-l7-e8": small(layers = 7, experts = 8),
 }
 
 LOCAL = 0

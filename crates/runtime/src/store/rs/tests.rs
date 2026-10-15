@@ -60,6 +60,7 @@ fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
     let advance = |fold, end| RingAdvance {
         positioned: true,
         settled: 0,
+        reach: 0,
         fold,
         commit_end: end,
         head: Some(end),
@@ -135,6 +136,7 @@ fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
     let device = |settled, end| RingAdvance {
         positioned: true,
         settled,
+        reach: settled,
         fold: None,
         commit_end: end,
         head: Some(end),
@@ -151,6 +153,7 @@ fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
     let lease = RingAdvance {
         positioned: false,
         settled: 0,
+        reach: 32,
         fold: None,
         commit_end: 0,
         head: None,
@@ -162,6 +165,23 @@ fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
         [0],
         "a device-geometry fire keeps the page its lease names"
     );
+
+    let decode = RingAdvance {
+        reach: 144,
+        ..lease
+    };
+    fire(&mut s, ws, &[9], decode);
+    assert_eq!(
+        s.ring_positions(ws),
+        Ok(Some((128, 144))),
+        "a device-geometry fire commits nothing"
+    );
+    assert_eq!(
+        s.ring_translation(ws, [6, 7]).unwrap()[0],
+        0,
+        "and retires what lies wholly behind the window of the first token it writes"
+    );
+    assert_ne!(s.ring_translation(ws, [7]).unwrap(), [0]);
 }
 
 fn a_suspend_parks_private_slots_on_host_and_restore_brings_them_back() {

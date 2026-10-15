@@ -1,5 +1,6 @@
 use poem_ir::{
-    BIASES, Dtype, Param, ParamLayout, ParamSource, Platform, SCALES, Shard, TILED_BAND, TILED_STEP,
+    ActQuant, BIASES, Dtype, GLOBAL_SCALES, INPUT_SCALES, Param, ParamLayout, ParamPlacement,
+    ParamSource, Platform, SCALES, Shard, TILED_BAND, TILED_STEP,
 };
 
 #[derive(Clone, Debug)]
@@ -7,9 +8,15 @@ pub struct Weight {
     pub name: String,
     pub shape: Vec<u64>,
     pub dtype: Dtype,
+    /// The precision a product quantizes its activations to before reading
+    /// this weight, or `None` for one that reads them as they are.
+    pub act: Option<ActQuant>,
     pub shard: Shard,
     pub source: ParamSource,
     pub layout: ParamLayout,
+    /// Where the weight's leading plane (its codes) may be served from; its
+    /// companions (a scale) stay on the device.
+    pub placement: ParamPlacement,
 }
 
 impl Weight {
@@ -23,9 +30,25 @@ impl Weight {
             name: name.into(),
             shape: shape.into_iter().collect(),
             dtype,
+            act: None,
             shard: Shard::Replicated,
             source: ParamSource::Checkpoint,
             layout: ParamLayout::Natural,
+            placement: ParamPlacement::Device,
+        }
+    }
+
+    /// A weight stored at `precision`'s dtype, its products quantizing their
+    /// activations as it says.
+    #[must_use]
+    pub fn at(
+        name: impl Into<String>,
+        shape: impl IntoIterator<Item = u64>,
+        precision: Precision,
+    ) -> Weight {
+        Weight {
+            act: precision.act,
+            ..Weight::sym(name, shape, precision.dtype)
         }
     }
 
@@ -39,6 +62,14 @@ impl Weight {
             u64::from(c_in) * u64::from(taps)
         );
         self.layout = ParamLayout::ConvTapsMajor { c_in, taps };
+        self
+    }
+
+    /// The weight is read only by row gathers, so a card whose profile asks
+    /// may serve it from pinned host memory the device reads through.
+    #[must_use]
+    pub fn host(mut self) -> Weight {
+        self.placement = ParamPlacement::Host;
         self
     }
 
@@ -257,7 +288,79 @@ impl Weight {
                     },
                 ]
             }
-            Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 | Dtype::KvU4 => panic!(
+            Dtype::Nvfp4 => {
+                let (&k, lead) = self
+                    .shape
+                    .split_last()
+                    .expect("an nvfp4 bank's logical shape ends in its contracted axis");
+                assert!(
+                    k % 16 == 0,
+                    "`{}` is an nvfp4 bank contracting over {k}, which is not a whole \
+                     number of 16-code groups",
+                    self.name,
+                );
+                let mut scales = lead.to_vec();
+                scales.push(k / 16);
+                let slabs = lead.split_last().map_or(&[][..], |(_, slabs)| slabs);
+                vec![
+                    BankPlane {
+                        suffix: "",
+                        shape: self.shape.clone(),
+                        dtype: Dtype::Nvfp4,
+                    },
+                    BankPlane {
+                        suffix: SCALES,
+                        shape: scales,
+                        dtype: Dtype::E4m3,
+                    },
+                    BankPlane {
+                        suffix: GLOBAL_SCALES,
+                        shape: lead.to_vec(),
+                        dtype: Dtype::F32,
+                    },
+                    BankPlane {
+                        suffix: INPUT_SCALES,
+                        shape: slabs.to_vec(),
+                        dtype: Dtype::F32,
+                    },
+                ]
+            }
+            Dtype::E4m3tensor => vec![
+                BankPlane {
+                    suffix: "",
+                    shape: self.shape.clone(),
+                    dtype: Dtype::E4m3tensor,
+                },
+                BankPlane {
+                    suffix: SCALES,
+                    shape: Vec::new(),
+                    dtype: Dtype::F32,
+                },
+            ],
+            // Its codes and its block exponents are planes of their own, raw
+            // e4m3 and e8m0, which a W8A8 product reads beside each other.
+            Dtype::Fp8b128 => {
+                let [n, k] = self.shape[..] else {
+                    panic!(
+                        "`{}` is an fp8b128 weight declared {:?}; its 128x128 blocks \
+                         scale a two-dimensional projection",
+                        self.name, self.shape,
+                    )
+                };
+                vec![
+                    BankPlane {
+                        suffix: "",
+                        shape: vec![n, k],
+                        dtype: Dtype::E4m3,
+                    },
+                    BankPlane {
+                        suffix: SCALES,
+                        shape: vec![n.div_ceil(128), k.div_ceil(128)],
+                        dtype: Dtype::E8m0,
+                    },
+                ]
+            }
+            Dtype::E4m3row | Dtype::E4m3tile128 | Dtype::KvU4 => panic!(
                 "`{}`: {} is served but not yet a weight representation a \
                  model text declares",
                 self.name, self.dtype
@@ -398,10 +501,71 @@ impl Weight {
             name: p.name.clone(),
             shape,
             dtype: p.dtype,
+            act: None,
             shard,
             source: p.source,
             layout: p.layout,
+            placement: p.placement,
         }
+    }
+}
+
+/// The precision a deployment states for a bank: the dtype its weights are
+/// stored at and, for a low-precision product, the precision its activations
+/// are quantized to (`nvfp4a4`: NVFP4 weights against NVFP4 activations).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Precision {
+    pub dtype: Dtype,
+    pub act: Option<ActQuant>,
+}
+
+impl Precision {
+    /// The stored dtypes that quantize their activations, by the word a
+    /// deployment's name spells each: NVFP4 against NVFP4 (W4A4, vLLM's
+    /// modelopt product), and MXFP4 (W4A8) and DeepSeek's 128x128-block FP8
+    /// (W8A8) against e4m3 in its 1x128 blocks.
+    pub const ACTED: [Precision; 3] = [
+        Precision {
+            dtype: Dtype::Nvfp4,
+            act: Some(ActQuant::Nvfp4),
+        },
+        Precision {
+            dtype: Dtype::Mxfp4,
+            act: Some(ActQuant::E4m3 { gran: 128 }),
+        },
+        Precision {
+            dtype: Dtype::Fp8b128,
+            act: Some(ActQuant::E4m3 { gran: 128 }),
+        },
+    ];
+
+    #[must_use]
+    pub const fn of(dtype: Dtype) -> Precision {
+        Precision { dtype, act: None }
+    }
+
+    /// What a deployment's name appends to its dtype's word: `a4` for NVFP4
+    /// activations, `a8` for e4m3 in 128s, `a8g{n}` in `n`s.
+    #[must_use]
+    pub fn suffix(self) -> String {
+        match self.act {
+            None => String::new(),
+            Some(ActQuant::Nvfp4) => "a4".to_string(),
+            Some(ActQuant::E4m3 { gran: 128 }) => "a8".to_string(),
+            Some(ActQuant::E4m3 { gran }) => format!("a8g{gran}"),
+        }
+    }
+}
+
+impl From<Dtype> for Precision {
+    fn from(dtype: Dtype) -> Precision {
+        Precision::of(dtype)
+    }
+}
+
+impl PartialEq<Dtype> for Precision {
+    fn eq(&self, other: &Dtype) -> bool {
+        self.act.is_none() && self.dtype == *other
     }
 }
 
@@ -413,6 +577,16 @@ pub fn scales_name(of: &str) -> String {
 #[must_use]
 pub fn biases_name(of: &str) -> String {
     format!("{of}{BIASES}")
+}
+
+#[must_use]
+pub fn global_scales_name(of: &str) -> String {
+    format!("{of}{GLOBAL_SCALES}")
+}
+
+#[must_use]
+pub fn input_scales_name(of: &str) -> String {
+    format!("{of}{INPUT_SCALES}")
 }
 
 #[must_use]
@@ -437,6 +611,8 @@ pub fn compute_dtype(dtype: Dtype) -> Option<Dtype> {
         | Dtype::I6g16k
         | Dtype::E4m3row
         | Dtype::E4m3tile128
+        | Dtype::E4m3tensor
+        | Dtype::Fp8b128
         | Dtype::Ptq1_0 => Some(Dtype::Bf16),
         Dtype::I64 => Some(Dtype::I64),
         Dtype::I32

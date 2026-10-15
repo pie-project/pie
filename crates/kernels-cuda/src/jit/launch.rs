@@ -16,12 +16,19 @@ pub(crate) unsafe fn issue(
         raise_dynamic_smem_cap(function, launch.smem)?;
     }
 
-    let mut attrs: [dr::CUlaunchAttribute; 1] = unsafe { core::mem::zeroed() };
+    let mut attrs: [dr::CUlaunchAttribute; 2] = unsafe { core::mem::zeroed() };
     let mut n = 0usize;
     if launch.cooperative {
-        attrs[0].id = dr::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
-        attrs[0].value.cooperative = 1;
-        n = 1;
+        attrs[n].id = dr::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+        attrs[n].value.cooperative = 1;
+        n += 1;
+    }
+    if launch.cluster > 1 {
+        attrs[n].id = dr::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        attrs[n].value.clusterDim.x = launch.cluster;
+        attrs[n].value.clusterDim.y = 1;
+        attrs[n].value.clusterDim.z = 1;
+        n += 1;
     }
 
     let config = dr::CUlaunchConfig {

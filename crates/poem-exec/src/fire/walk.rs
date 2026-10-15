@@ -126,6 +126,7 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
                             Operation::Linear(
                                 poem_ir::Linear::MoeMatmulSelect { .. }
                                     | poem_ir::Linear::MoeMatmulSelectQuant { .. }
+                                    | poem_ir::Linear::MoeMatmulSelectActQuant { .. }
                             )
                         )
                     })

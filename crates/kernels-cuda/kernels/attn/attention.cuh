@@ -33,6 +33,8 @@ struct PieScoreWindowParams : PieScoreParams<Base, IdT> {
 
 template <class Base>
 struct PieScoreCapture : Base {
+    // A capture lands every key's score, the masked ones too.
+    static constexpr bool skips_decode_window = false;
 
     float* score_row = nullptr;
 
@@ -343,6 +345,87 @@ using IdType = std::int32_t;
 
 }
 
+// The split kv's partial states folded one warp a (row, head): each lane
+// holds HEAD_DIM / 32 columns, reads every partial's base-2 log-sum-exp and
+// its normalized output straight from global memory, and lands the row's
+// output and log-sum-exp. A row of no partials lands zeros and -inf, one
+// partial lands as it stands. `win` is the staged `(count, start)` seat.
+// With `sinks`, each head's output is scaled as `sink_rescale` scales it,
+// by 1 / (1 + exp(sink - lse)), from the f32 sum before it rounds.
+template <int HEAD_DIM, class S = float>
+__global__ void __launch_bounds__(256) merge_partials_warp(
+    const merge_lse::DTypeIn* __restrict__ v,
+    const float* __restrict__ s,
+    const merge_lse::IdType* __restrict__ indptr,
+    merge_lse::DTypeO* __restrict__ v_merged,
+    float* __restrict__ s_merged,
+    u32 max_seq_len,
+    const u32* __restrict__ seq_len_ptr,
+    u32 num_heads,
+    const S* __restrict__ sinks,
+    const u32* __restrict__ win)
+{
+    static_assert(HEAD_DIM % 64 == 0, "two columns a lane at least");
+    constexpr int PER = HEAD_DIM / 32;
+    const u32 staged = seq_len_ptr != nullptr ? *seq_len_ptr : max_seq_len;
+    const u32 rows = (win != nullptr && win[0] < staged) ? win[0] : staged;
+    const u32 row_base = win != nullptr ? win[1] : 0;
+    const u32 lane = threadIdx.x & 31;
+    const u32 warps = (gridDim.x * blockDim.x) >> 5;
+    const u32 col = lane * PER;
+    for (u32 pair = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; pair < rows * num_heads;
+         pair += warps) {
+        const u32 pos = pair / num_heads;
+        const u32 head = pair % num_heads;
+        const int begin = indptr[pos];
+        const int end = indptr[pos + 1];
+        float m = -::flashinfer::math::inf;
+        for (int k = begin + static_cast<int>(lane); k < end; k += 32) {
+            m = fmaxf(m, s[static_cast<long long>(k) * num_heads + head]);
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+        }
+        float acc[PER];
+#pragma unroll
+        for (int j = 0; j < PER; ++j) acc[j] = 0.f;
+        float d = 0.f;
+        if (m != -::flashinfer::math::inf) {
+#pragma unroll 4
+            for (int k = begin; k < end; ++k) {
+                const long long at = static_cast<long long>(k) * num_heads + head;
+                const float w = exp2f(s[at] - m);
+                d += w;
+                const merge_lse::DTypeIn* row = v + at * HEAD_DIM + col;
+#pragma unroll
+                for (int j = 0; j < PER; j += 2) {
+                    const u32 two = *reinterpret_cast<const u32*>(row + j);
+                    acc[j] += w * Elem<bf16>::to_f32(bf16(static_cast<unsigned short>(two)));
+                    acc[j + 1] += w * Elem<bf16>::to_f32(bf16(static_cast<unsigned short>(two >> 16)));
+                }
+            }
+        }
+        float inv = d > 0.f ? 1.f / d : 0.f;
+        if (sinks != nullptr && d > 0.f) {
+            constexpr float kLn2 = 0.69314718055994530942f;
+            const float lse = m + log2f(d);
+            inv *= 1.0f / (1.0f + __expf(-(lse * kLn2 - Elem<S>::to_f32(sinks[head]))));
+        }
+        const long long out = (static_cast<long long>(row_base) + pos) * num_heads + head;
+        merge_lse::DTypeO* dst = v_merged + out * HEAD_DIM + col;
+#pragma unroll
+        for (int j = 0; j < PER; j += 2) {
+            const u32 lo = Elem<bf16>::from_f32(acc[j] * inv).raw;
+            const u32 hi = Elem<bf16>::from_f32(acc[j + 1] * inv).raw;
+            *reinterpret_cast<u32*>(dst + j) = lo | (hi << 16);
+        }
+        if (s_merged != nullptr && lane == 0) {
+            s_merged[out] = d > 0.f ? m + log2f(d) : -::flashinfer::math::inf;
+        }
+    }
+}
+
 template <class T>
 __global__ void logit_softcap(T* __restrict__ x, float cap, usize n) {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -350,6 +433,22 @@ __global__ void logit_softcap(T* __restrict__ x, float cap, usize n) {
     const float inv_cap = 1.f / cap;
     const float v = Elem<T>::to_f32(x[i]);
     x[i] = Elem<T>::from_f32(cap * tanhf(v * inv_cap));
+}
+
+// `logit_softcap` eight elements a thread, read and written 16 bytes at a
+// time: the same value for every element.
+template <class T>
+__global__ void logit_softcap_vec8(T* __restrict__ x, float cap, usize runs) {
+    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= runs) return;
+    const float inv_cap = 1.f / cap;
+    uint4 w = reinterpret_cast<const uint4*>(x)[i];
+    T* e = reinterpret_cast<T*>(&w);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        e[k] = Elem<T>::from_f32(cap * tanhf(Elem<T>::to_f32(e[k]) * inv_cap));
+    }
+    reinterpret_cast<uint4*>(x)[i] = w;
 }
 
 template <class T>
@@ -361,11 +460,11 @@ __global__ void lse_log2_to_ln(T* __restrict__ lse, usize n) {
     if (isfinite(v)) lse[i] = static_cast<T>(v * kLn2);
 }
 
-template <class T>
+template <class T, class S = T>
 __global__ void sink_rescale(
     T* __restrict__ o,
     const float* __restrict__ lse,
-    const T* __restrict__ sinks,
+    const S* __restrict__ sinks,
     i32 N,
     i32 num_q_heads,
     i32 head_dim,
@@ -381,7 +480,7 @@ __global__ void sink_rescale(
 
     constexpr float kLn2 = 0.69314718055994530942f;
     const float lse_val = lse[t_row * num_q_heads + h];
-    const float sink = Elem<T>::to_f32(sinks[h]);
+    const float sink = Elem<S>::to_f32(sinks[h]);
     float r;
     if (!isfinite(lse_val)) {
 

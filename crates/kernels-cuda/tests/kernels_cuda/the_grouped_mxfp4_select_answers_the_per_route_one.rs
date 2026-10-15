@@ -2,7 +2,10 @@
 
 use crate::common::{Gpu, close, from_bf16, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::linear::moe::{GroupSeat, matmul_select_bias, matmul_select_quant};
+use kernels_cuda::linear::moe::{
+    ExpertTable, GluBank, GroupSeat, matmul_select_bias, matmul_select_quant, select_glu,
+};
+use kernels_cuda::linear::tc5::Glu;
 use kernels_cuda::tensor::Tensor;
 use kernels_cuda::tuning::Tuning;
 use std::time::Instant;
@@ -76,6 +79,8 @@ fn check(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool, tuning
     let grouped = gpu.ctx().with_tuning(tuning);
     let bare = gpu.ctx().with_tuning(Tuning {
         mxfp4_grouped: false,
+        moe_tc5: false,
+        mxfp4_mma_until: 0,
         ..tuning
     });
     let x = Tensor::new(act_at, act_rows as u32, k as u32, Dtype::Bf16);
@@ -148,6 +153,203 @@ fn the_grouped_mxfp4_select_answers_the_per_route_one_every_case() {
     the_gpt_oss_legs_are_priced();
     the_fp32_form_agrees_at_both_readings();
     the_fp32_form_agrees_on_a_ragged_rectangle();
+    the_tcgen05_form_agrees_at_gpt_oss_widths();
+    the_register_dequant_form_agrees();
+}
+
+/// The register-dequant MMA kernel: one, two and four 8-route blocks a
+/// slice, ragged rows, a K that ends mid-chunk, and scales past 2^1.
+fn the_register_dequant_form_agrees() {
+    let mma = Tuning {
+        mxfp4_mma_until: 65_536,
+        mxfp4_mma_from: 1,
+        ..Tuning::DEFAULT
+    };
+    check(1, 200, 2880, true, true, mma);
+    check(3, 576, 2880, false, true, mma);
+    check(12, 384, 2880, true, false, mma);
+    check(40, 576, 2880, true, true, mma);
+    check(100, 384, 2880, false, true, mma);
+    check(64, 256, 256, false, false, mma);
+    check_glu(1, 192, 2880, true, true);
+    check_glu(16, 2880, 2880, true, true);
+    check_glu(40, 160, 2880, false, false);
+}
+
+/// The register-dequant kernel's GLU: the gate rows' and the up rows'
+/// products (the per-route select's) through gpt-oss's clamped GLU.
+fn check_glu(tokens: usize, inter: usize, k: usize, by_token: bool, biased: bool) {
+    let n = 2 * inter;
+    let groups = k / BLOCK;
+    let routes = routes_of(tokens);
+    let route_count = routes.len();
+    let act_rows = if by_token { tokens } else { route_count };
+    let codes = bytes(0x51 + n as u64, EXPERTS * n * k / 2);
+    let scales = scale_bytes(0x52 + k as u64, EXPERTS * n * groups);
+    let act: Vec<u16> = bytes(0x53, act_rows * k * 2)
+        .chunks(2)
+        .map(|p| to_bf16((f32::from(p[0]) / 128.0 - 1.0) * 0.5))
+        .collect();
+    let bias: Vec<u16> = bytes(0x54, EXPERTS * n)
+        .into_iter()
+        .map(|b| to_bf16((f32::from(b) / 128.0 - 1.0) * 2.0))
+        .collect();
+    let mut gpu = Gpu::open();
+    let x = Tensor::new(gpu.up(&act), act_rows as u32, k as u32, Dtype::Bf16);
+    let codes_t = Tensor::new(
+        gpu.up(&codes),
+        EXPERTS as u32,
+        (n * k / 2) as u32,
+        Dtype::U8,
+    );
+    let scales_t = Tensor::new(
+        gpu.up(&scales),
+        EXPERTS as u32,
+        (n * groups) as u32,
+        Dtype::U8,
+    );
+    let bias_t = Tensor::new(gpu.up(&bias), EXPERTS as u32, n as u32, Dtype::Bf16);
+    let routes_t = Tensor::new(gpu.up(&routes), tokens as u32, TOP_K as u32, Dtype::I32);
+    let full_at = gpu.zeros(route_count * n * 2);
+    let glu_at = gpu.zeros(route_count * inter * 2);
+    let bare = gpu.ctx().with_tuning(Tuning {
+        mxfp4_grouped: false,
+        ..Tuning::DEFAULT
+    });
+    let mma = gpu.ctx().with_tuning(Tuning {
+        mxfp4_mma_until: 65_536,
+        mxfp4_mma_from: 1,
+        ..Tuning::DEFAULT
+    });
+    let mut full = Tensor::new(full_at, route_count as u32, n as u32, Dtype::Bf16);
+    let bias_of = biased.then_some(bias_t);
+    match bias_of {
+        Some(b) => matmul_select_bias(
+            &bare,
+            x,
+            codes_t,
+            scales_t,
+            b,
+            routes_t,
+            &mut full,
+            GroupSeat::RESIDENT,
+        ),
+        None => matmul_select_quant(
+            &bare,
+            x,
+            codes_t,
+            scales_t,
+            None,
+            routes_t,
+            &mut full,
+            GroupSeat::RESIDENT,
+        ),
+    }
+    .expect("the per-route select fires");
+    let (limit, alpha) = (7.0f32, 1.702f32);
+    let mut y = Tensor::new(glu_at, route_count as u32, inter as u32, Dtype::Bf16);
+    let fused = select_glu(
+        &mma,
+        x,
+        GluBank::Mxfp4 {
+            codes: codes_t,
+            scales: scales_t,
+            bias: bias_of,
+        },
+        routes_t,
+        &mut y,
+        Glu::SwigluClampAlpha { limit, alpha },
+        ExpertTable::RESIDENT,
+    )
+    .expect("the fused select fires");
+    assert!(fused, "the register-dequant kernel lands the GLU");
+    gpu.sync();
+    let full: Vec<u16> = gpu.down(full_at, route_count * n);
+    let got: Vec<u16> = gpu.down(glu_at, route_count * inter);
+    for r in 0..route_count {
+        for j in 0..inter {
+            let g = from_bf16(full[r * n + j]).min(limit);
+            let u = from_bf16(full[r * n + inter + j]).clamp(-limit, limit);
+            let want = (u + 1.0) * g / (1.0 + (-alpha * g).exp());
+            let have = from_bf16(got[r * inter + j]);
+            assert!(
+                close(have, want),
+                "route {r} column {j} of a GLU {inter} wide: {have} where the select and the GLU say {want}"
+            );
+        }
+    }
+
+    // The down select right after takes the GLU select's route order; it
+    // answers what the per-route select does from the same GLU.
+    let down_n = 160;
+    let down_codes = bytes(0x55, EXPERTS * down_n * inter / 2);
+    let down_scales = scale_bytes(0x56, EXPERTS * down_n * inter / BLOCK);
+    let dc = Tensor::new(
+        gpu.up(&down_codes),
+        EXPERTS as u32,
+        (down_n * inter / 2) as u32,
+        Dtype::U8,
+    );
+    let ds = Tensor::new(
+        gpu.up(&down_scales),
+        EXPERTS as u32,
+        (down_n * inter / BLOCK) as u32,
+        Dtype::U8,
+    );
+    let shared_at = gpu.zeros(route_count * down_n * 2);
+    let apart_at = gpu.zeros(route_count * down_n * 2);
+    let fire_down = |ctx: &kernels_cuda::Ctx, into: u64| {
+        let mut out = Tensor::new(into, route_count as u32, down_n as u32, Dtype::Bf16);
+        matmul_select_quant(
+            ctx,
+            y,
+            dc,
+            ds,
+            None,
+            routes_t,
+            &mut out,
+            GroupSeat::RESIDENT,
+        )
+        .expect("the down select fires");
+    };
+    let mut again = Tensor::new(glu_at, route_count as u32, inter as u32, Dtype::Bf16);
+    select_glu(
+        &mma,
+        x,
+        GluBank::Mxfp4 {
+            codes: codes_t,
+            scales: scales_t,
+            bias: bias_of,
+        },
+        routes_t,
+        &mut again,
+        Glu::SwigluClampAlpha { limit, alpha },
+        ExpertTable::RESIDENT,
+    )
+    .expect("the fused select fires");
+    fire_down(&mma, shared_at);
+    fire_down(&bare, apart_at);
+    gpu.sync();
+    let shared: Vec<u16> = gpu.down(shared_at, route_count * down_n);
+    let apart: Vec<u16> = gpu.down(apart_at, route_count * down_n);
+    for (i, (a, b)) in shared.iter().zip(&apart).enumerate() {
+        assert!(
+            close(from_bf16(*a), from_bf16(*b)),
+            "route {} column {}: the down select on the kept order says {}, apart {}",
+            i / down_n,
+            i % down_n,
+            from_bf16(*a),
+            from_bf16(*b)
+        );
+    }
+}
+
+/// The grouped tcgen05 GEMM (W4A16, on a device that has it) at a gpt-oss
+/// leg's K, biased and bare, masked and contiguous.
+fn the_tcgen05_form_agrees_at_gpt_oss_widths() {
+    check(40, 576, 2880, true, true, crate::common::TC5);
+    check(100, 384, 2880, true, false, crate::common::TC5);
+    check(100, 384, 2880, false, true, crate::common::TC5);
 }
 
 fn the_token_read_leg_with_a_bias_agrees() {
@@ -192,11 +394,18 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
     let routes_at = gpu.up(&routes);
     let y_at = gpu.zeros(route_count * n * 2);
 
-    let grouped = gpu.ctx();
-    let bare = gpu.ctx().with_tuning(Tuning {
-        mxfp4_grouped: false,
+    // The grouped WMMA kernel against the per-route select, and the
+    // tcgen05 GEMM (where the device has it) beside them.
+    let grouped = gpu.ctx().with_tuning(Tuning {
+        moe_tc5: false,
         ..Tuning::DEFAULT
     });
+    let bare = gpu.ctx().with_tuning(Tuning {
+        mxfp4_grouped: false,
+        moe_tc5: false,
+        ..Tuning::DEFAULT
+    });
+    let tc5 = gpu.ctx().with_tuning(crate::common::TC5);
     let x = Tensor::new(act_at, act_rows as u32, k as u32, Dtype::Bf16);
     let codes_t = Tensor::new(codes_at, EXPERTS as u32, (n * k / 2) as u32, Dtype::U8);
     let scales_t = Tensor::new(scales_at, EXPERTS as u32, (n * groups) as u32, Dtype::U8);
@@ -227,14 +436,17 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
     };
     let grouped_ms = run(&grouped);
     let per_route_ms = run(&bare);
+    let tc5_ms = run(&tc5);
 
     let flop = 2.0 * route_count as f64 * n as f64 * k as f64;
     eprintln!(
         "{label:9} n={n:5} k={k:5}: grouped {grouped_ms:7.3} ms ({:5.1} TFLOP/s)  \
-         per-route {per_route_ms:7.3} ms ({:5.1} TFLOP/s)  {:.1}x",
+         per-route {per_route_ms:7.3} ms ({:5.1} TFLOP/s)  {:.1}x; tcgen05 {tc5_ms:7.3} ms \
+         ({:5.1} TFLOP/s)",
         flop / grouped_ms / 1e9,
         flop / per_route_ms / 1e9,
         per_route_ms / grouped_ms,
+        flop / tc5_ms / 1e9,
     );
     assert!(
         grouped_ms < per_route_ms,

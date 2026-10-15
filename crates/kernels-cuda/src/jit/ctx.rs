@@ -10,6 +10,8 @@ pub struct Launch {
     pub block: [u32; 3],
     pub smem: u32,
     pub cooperative: bool,
+    /// CTAs a cluster along x; 1 launches none.
+    pub cluster: u32,
 }
 
 impl Launch {
@@ -21,6 +23,7 @@ impl Launch {
             block: [block, 1, 1],
             smem: 0,
             cooperative: false,
+            cluster: 1,
         }
     }
 
@@ -31,6 +34,7 @@ impl Launch {
             block: [block, 1, 1],
             smem: 0,
             cooperative: false,
+            cluster: 1,
         }
     }
 
@@ -41,6 +45,7 @@ impl Launch {
             block,
             smem: 0,
             cooperative: false,
+            cluster: 1,
         }
     }
 
@@ -53,6 +58,14 @@ impl Launch {
     #[must_use]
     pub const fn cooperative(mut self) -> Self {
         self.cooperative = true;
+        self
+    }
+
+    /// Launches `ctas` consecutive CTAs along x as one cluster; the grid's
+    /// x must be a multiple of it.
+    #[must_use]
+    pub const fn cluster(mut self, ctas: u32) -> Self {
+        self.cluster = ctas;
         self
     }
 
@@ -416,6 +429,34 @@ impl Ctx {
         #[cfg(feature = "cuda")]
         {
             crate::jit::device::multiprocessors()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    /// The dynamic shared memory one block may opt into on this device.
+    #[allow(clippy::unused_self)]
+    #[must_use]
+    pub fn smem_per_block_optin(&self) -> Option<u32> {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::max_shared_memory_per_block_optin()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    /// The shared memory one SM holds across its resident blocks.
+    #[allow(clippy::unused_self)]
+    #[must_use]
+    pub fn smem_per_sm(&self) -> Option<u32> {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::max_shared_memory_per_sm()
         }
         #[cfg(not(feature = "cuda"))]
         {

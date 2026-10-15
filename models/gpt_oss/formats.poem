@@ -50,12 +50,9 @@ def read(m, reads, codes):
         mlp = layer.mlp
         reads.read(layer.attn_norm, ck("input_layernorm.weight"))
         reads.read(layer.mlp_norm, ck("post_attention_layernorm.weight"))
-        reads.read(attn.q_proj, ck("self_attn.q_proj.weight"))
-        reads.read(attn.q_bias, ck("self_attn.q_proj.bias"))
-        reads.read(attn.k_proj, ck("self_attn.k_proj.weight"))
-        reads.read(attn.k_bias, ck("self_attn.k_proj.bias"))
-        reads.read(attn.v_proj, ck("self_attn.v_proj.weight"))
-        reads.read(attn.v_bias, ck("self_attn.v_proj.bias"))
+        proj = lambda part: [ck("self_attn.{}_proj.{}".format(x, part)) for x in ["q", "k", "v"]]
+        reads.read_concat(attn.qkv, proj("weight"))
+        reads.read_concat(attn.qkv_bias, proj("bias"))
         reads.read(attn.o_proj, ck("self_attn.o_proj.weight"))
         reads.read(attn.o_bias, ck("self_attn.o_proj.bias"))
         reads.read(attn.sinks, ck("self_attn.sinks"))

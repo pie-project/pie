@@ -1,16 +1,25 @@
 //! The fusion rules, in the order they run. A rule that forms a longer chain
 //! runs before one that forms a piece of it.
 
+use poem::declare::Precision;
 use poem::ops::{attn, elemwise, layout, linear};
 use poem::pattern::{Pattern, Template, template};
 use poem_ir::ops::fused::PostNorm;
-use poem_ir::{Dim, Dtype, Elementwise, Fused, ModulateForm, NormKind, Operation, Ty};
+use poem_ir::{
+    ActQuant, Dim, Dtype, Elementwise, Fused, ModulateForm, NormKind, Operation, StructKind, Ty,
+};
 
 use super::Rule;
 
 /// A placeholder width for pattern holes; the matcher compares op fields, not
 /// the types of the values they hold.
 const W: u64 = 64;
+
+/// An NVFP4 bank against NVFP4 activations (W4A4).
+const W4A4: Precision = Precision {
+    dtype: Dtype::Nvfp4,
+    act: Some(ActQuant::Nvfp4),
+};
 
 pub(super) fn all() -> Vec<Rule> {
     vec![
@@ -21,15 +30,188 @@ pub(super) fn all() -> Vec<Rule> {
         residual_add_rmsnorm(),
         mlp_swiglu(),
         matmul_geglu(),
+        moe_experts(),
+        moe_select_glu(),
+        matmul_swiglu(),
         lm_head_softcap(),
         matmul_bias(),
+        matmul_split_rows(),
         gated_residual_norm_modulate(),
         norm_modulate(),
         rmsnorm_rope_partial_q(),
         hc_norm_project(),
         ssm_gdn_step(),
         q_gate_k_norm_rope_append(),
+        split_rope_yarn_append(),
+        rope_yarn_append(),
+        lse_sink(),
     ]
+}
+
+/// A log-sum-exp attention and the sinks over its output.
+fn lse_sink() -> Rule {
+    let pair = |decode: bool| {
+        template(move |p| {
+            let q = p.rows("q", W);
+            let cache = p.cache("cache");
+            let d = p.u32("d");
+            p.free("window");
+            let (o, lse) = if decode {
+                let plan = p.value("plan", Ty::Struct(StructKind::AttnDecodePlan));
+                attn::decode_lse(&q, &plan, cache, None, d, p.f32("sm_scale"))
+            } else {
+                let plan = p.value("plan", Ty::Struct(StructKind::AttnPrefillPlan));
+                attn::prefill_lse(
+                    &q,
+                    &plan,
+                    cache,
+                    None,
+                    d,
+                    p.u32("kv_heads"),
+                    p.f32("sm_scale"),
+                )
+            };
+            p.name("o", &o);
+            p.name("lse", &lse);
+            let out = attn::sink(&o, &lse, &p.weight("sink", [W]), d);
+            p.export("o_out", &out);
+        })
+    };
+    Rule::new("attention.lse_sink", [pair(true), pair(false)], |m| {
+        let Operation::Attention(attn) = m.op("o") else {
+            panic!("the sinked output comes from an attention");
+        };
+        Fused::LseSink {
+            attn: Box::new(attn.clone()),
+            sink: m.value("sink"),
+            head_dim: m.u32("d"),
+            o_out: m.value("o_out"),
+        }
+    })
+}
+
+/// A packed q/k/v row split, YaRN over its q and k, and the rotated k
+/// written to the cache with its v: what `rope_yarn_append` does, reading the
+/// three from the packed row rather than from a split's copies.
+fn split_rope_yarn_append() -> Rule {
+    let pattern = template(|p| {
+        let packed = p.rows("packed", 3 * W);
+        let (q, k, v) = layout::split_qkv(&packed, p.u32("q_width"), p.u32("kv_width"));
+        p.name("k_split", &k);
+        p.name("v_split", &v);
+        let positions = p.indices("positions");
+        p.free("interleaved");
+        let (q, k) = elemwise::rope_yarn(
+            &q,
+            &k,
+            &positions,
+            p.u32("d"),
+            p.f32("theta"),
+            p.f32("factor"),
+            p.f32("beta_fast"),
+            p.f32("beta_slow"),
+            p.f32("attention_factor"),
+            p.u32("original_max_position"),
+            false,
+        );
+        let cache = p.cache("cache");
+        let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
+        attn::kv_append(&k, &v, cache, &write_page, &write_offset);
+        p.export("q_out", &q);
+    });
+    Rule::new("elementwise.split_rope_yarn_append", [pattern], |m| {
+        Fused::SplitRopeYarnAppend {
+            packed: m.value("packed"),
+            q_width: m.u32("q_width"),
+            kv_width: m.u32("kv_width"),
+            positions: m.value("positions"),
+            head_dim: m.u32("d"),
+            theta: m.f32("theta"),
+            factor: m.f32("factor"),
+            beta_fast: m.f32("beta_fast"),
+            beta_slow: m.f32("beta_slow"),
+            attention_factor: m.f32("attention_factor"),
+            original_max_position: m.u32("original_max_position"),
+            interleaved: matches!(
+                m.op("q_out"),
+                Operation::Elementwise(Elementwise::RopeYarn {
+                    interleaved: true,
+                    ..
+                })
+            ),
+            cache: m.value("cache"),
+            write_page: m.value("write_page"),
+            write_offset: m.value("write_offset"),
+            q_out: m.value("q_out"),
+            k_out: m.value("k_split"),
+            v_out: m.value("v_split"),
+        }
+    })
+    // gpt-oss marks its split q and v with `attn.qv`, which no shell reads.
+    .through_markers()
+    .when(|m| {
+        let d = m.u32("d");
+        m.dtype("packed") == Some(Dtype::Bf16)
+            && d > 0
+            && d % 2 == 0
+            && m.u32("q_width") % d == 0
+            && m.u32("kv_width") % d == 0
+    })
+}
+
+/// YaRN over q and k, and the rotated k written to the cache with its v.
+fn rope_yarn_append() -> Rule {
+    let pattern = template(|p| {
+        let (q, k, v) = (p.rows("q", W), p.rows("k", W), p.rows("v", W));
+        let positions = p.indices("positions");
+        p.free("interleaved");
+        let (q, k) = elemwise::rope_yarn(
+            &q,
+            &k,
+            &positions,
+            p.u32("d"),
+            p.f32("theta"),
+            p.f32("factor"),
+            p.f32("beta_fast"),
+            p.f32("beta_slow"),
+            p.f32("attention_factor"),
+            p.u32("original_max_position"),
+            false,
+        );
+        p.name("k_out", &k);
+        let cache = p.cache("cache");
+        let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
+        attn::kv_append(&k, &v, cache, &write_page, &write_offset);
+        p.export("q_out", &q);
+    });
+    Rule::new("elementwise.rope_yarn_append", [pattern], |m| {
+        Fused::RopeYarnAppend {
+            q: m.value("q"),
+            k: m.value("k"),
+            v: m.value("v"),
+            positions: m.value("positions"),
+            head_dim: m.u32("d"),
+            theta: m.f32("theta"),
+            factor: m.f32("factor"),
+            beta_fast: m.f32("beta_fast"),
+            beta_slow: m.f32("beta_slow"),
+            attention_factor: m.f32("attention_factor"),
+            original_max_position: m.u32("original_max_position"),
+            interleaved: matches!(
+                m.op("q_out"),
+                Operation::Elementwise(Elementwise::RopeYarn {
+                    interleaved: true,
+                    ..
+                })
+            ),
+            cache: m.value("cache"),
+            write_page: m.value("write_page"),
+            write_offset: m.value("write_offset"),
+            q_out: m.value("q_out"),
+            k_out: m.value("k_out"),
+        }
+    })
+    .when(|m| m.dtype("q") == Some(Dtype::Bf16))
 }
 
 #[derive(Clone, Copy)]
@@ -280,6 +462,175 @@ fn mlp_swiglu() -> Rule {
     })
 }
 
+/// A routed gate-up select and its GLU: the select over a dense bank, a
+/// biased one (gpt-oss) or a quantized one, then SwiGLU, its clamp or its
+/// clamp-alpha form, or GeGLU (Gemma 4), over the packed gate|up rows. The packed rows stay
+/// inside the match.
+/// A routed MLP: a gate-up select and its GLU (each `moe_select_glu` form),
+/// the down select of the GLU on the same routes, and the weighted sum.
+fn moe_experts() -> Rule {
+    let mut alternatives = Vec::new();
+    // Each leg's select: over a dense bank, a biased one, a quantized one,
+    // or (both legs) an NVFP4 bank quantizing its activations (W4A4).
+    let legs = (0..3)
+        .flat_map(|s| (0..3).map(move |d| (s, d)))
+        .chain([(3, 3)]);
+    for (select, down) in legs {
+        for glu in 0..4 {
+            for gated in [true, false] {
+                alternatives.push(template(move |p| {
+                    let x = p.rows("x", W);
+                    let routes = p.value(
+                        "routes",
+                        Ty::Tensor {
+                            shape: vec![Dim::Tokens, Dim::Const(W)],
+                            dtype: Dtype::I32,
+                        },
+                    );
+                    let top_k = p.u32("top_k");
+                    let select_of = |x: &poem::Value,
+                                     bank: &'static str,
+                                     bias: &'static str,
+                                     kind: u32| match kind {
+                        0 => {
+                            linear::moe_matmul_select(x, &p.weight(bank, [W, W, W]), &routes, top_k)
+                        }
+                        1 => linear::moe_matmul_select_bias(
+                            x,
+                            &p.weight(bank, [W, W, W]),
+                            &p.weight(bias, [W, W]),
+                            &routes,
+                            top_k,
+                        ),
+                        2 => linear::moe_matmul_select_quant(
+                            x,
+                            &p.weight(bank, [W, W, W]),
+                            &routes,
+                            top_k,
+                        ),
+                        _ => linear::moe_matmul_select_quant(
+                            x,
+                            &p.weight_at(bank, [W, W, W], W4A4),
+                            &routes,
+                            top_k,
+                        ),
+                    };
+                    let packed = select_of(&x, "bank", "bias", select);
+                    p.name("packed", &packed);
+                    let intermediate = p.u32("intermediate");
+                    let hidden = match glu {
+                        0 => linear::mlp_swiglu(&packed, intermediate),
+                        1 => linear::mlp_swiglu_clamp(&packed, intermediate, p.f32("limit")),
+                        3 => linear::mlp_geglu_tanh_packed(&packed, intermediate),
+                        _ => linear::mlp_swiglu_clamp_alpha(
+                            &packed,
+                            intermediate,
+                            p.f32("limit"),
+                            p.f32("alpha"),
+                        ),
+                    };
+                    p.name("hidden", &hidden);
+                    let routed = select_of(&hidden, "down", "down_bias", down);
+                    p.name("routed", &routed);
+                    let weights = p.value(
+                        "weights",
+                        Ty::Tensor {
+                            shape: vec![Dim::Tokens, Dim::Const(W)],
+                            dtype: Dtype::F32,
+                        },
+                    );
+                    let summed = linear::moe_weighted_sum(&routed, &weights);
+                    if gated {
+                        // Qwen's gated shared expert, added to the sum.
+                        p.name("summed", &summed);
+                        let y = linear::moe_sigmoid_gate_add(
+                            &summed,
+                            &p.rows("shared", W),
+                            &p.rows("gate", W),
+                        );
+                        p.export("y", &y);
+                    } else {
+                        p.export("y", &summed);
+                    }
+                }));
+            }
+        }
+    }
+    Rule::new("linear.moe_experts", alternatives, |m| {
+        let linear_op = |name| match m.op(name) {
+            Operation::Linear(op) => Box::new(op.clone()),
+            other => panic!("`{name}` is computed by {other:?}, not a linear op"),
+        };
+        // Under a gate the sum is `summed` and the gate-add `y`.
+        let (sum, gate_add) = match m.get("summed") {
+            Some(_) => (linear_op("summed"), Some(linear_op("y"))),
+            None => (linear_op("y"), None),
+        };
+        Fused::MoeExperts {
+            select: linear_op("packed"),
+            glu: linear_op("hidden"),
+            down: linear_op("routed"),
+            sum,
+            gate_add,
+        }
+    })
+}
+
+fn moe_select_glu() -> Rule {
+    let mut alternatives = Vec::new();
+    for select in 0..3 {
+        for glu in 0..4 {
+            alternatives.push(template(|p| {
+                let x = p.rows("x", W);
+                let bank = p.weight("bank", [W, W, W]);
+                let routes = p.value(
+                    "routes",
+                    Ty::Tensor {
+                        shape: vec![Dim::Tokens, Dim::Const(W)],
+                        dtype: Dtype::I32,
+                    },
+                );
+                let top_k = p.u32("top_k");
+                let packed = match select {
+                    0 => linear::moe_matmul_select(&x, &bank, &routes, top_k),
+                    1 => linear::moe_matmul_select_bias(
+                        &x,
+                        &bank,
+                        &p.weight("bias", [W, W]),
+                        &routes,
+                        top_k,
+                    ),
+                    _ => linear::moe_matmul_select_quant(&x, &bank, &routes, top_k),
+                };
+                p.name("packed", &packed);
+                let intermediate = p.u32("intermediate");
+                let y = match glu {
+                    0 => linear::mlp_swiglu(&packed, intermediate),
+                    1 => linear::mlp_swiglu_clamp(&packed, intermediate, p.f32("limit")),
+                    3 => linear::mlp_geglu_tanh_packed(&packed, intermediate),
+                    _ => linear::mlp_swiglu_clamp_alpha(
+                        &packed,
+                        intermediate,
+                        p.f32("limit"),
+                        p.f32("alpha"),
+                    ),
+                };
+                p.export("y", &y);
+            }));
+        }
+    }
+    Rule::new("linear.moe_select_glu", alternatives, |m| {
+        let linear_op = |name| match m.op(name) {
+            Operation::Linear(op) => Box::new(op.clone()),
+            other => panic!("`{name}` is computed by {other:?}, not a linear op"),
+        };
+        Fused::MoeSelectGlu {
+            select: linear_op("packed"),
+            glu: linear_op("y"),
+        }
+    })
+}
+
 fn matmul_geglu() -> Rule {
     let pattern = template(|p| {
         let packed = linear::matmul(&p.rows("act", W), &p.weight("w", [2 * W, W]));
@@ -288,6 +639,25 @@ fn matmul_geglu() -> Rule {
         p.export("y", &y);
     });
     Rule::new("linear.matmul_geglu", [pattern], |m| Fused::MatmulGeglu {
+        act: m.value("act"),
+        w: m.value("w"),
+        intermediate: m.u32("intermediate"),
+        packed: m.value("packed"),
+        y: m.value("y"),
+    })
+}
+
+/// The packed gate-up projection and its SwiGLU, where the MLP's down
+/// projection stays apart (a backend that ships `linear.mlp_swiglu` forms
+/// that first).
+fn matmul_swiglu() -> Rule {
+    let pattern = template(|p| {
+        let packed = linear::matmul(&p.rows("act", W), &p.weight("w", [2 * W, W]));
+        p.name("packed", &packed);
+        let y = linear::mlp_swiglu(&packed, p.u32("intermediate"));
+        p.export("y", &y);
+    });
+    Rule::new("linear.matmul_swiglu", [pattern], |m| Fused::MatmulSwiglu {
         act: m.value("act"),
         w: m.value("w"),
         intermediate: m.u32("intermediate"),
@@ -328,6 +698,29 @@ fn matmul_bias() -> Rule {
         y: m.value("y"),
         y_out: m.value("y_out"),
     })
+}
+
+/// A projection cut into two row halves (Qwen3.5's packed qkv|z), through
+/// the `recurrent` marker the cut's caller sets on the packed rows.
+fn matmul_split_rows() -> Rule {
+    let pattern = template(|p| {
+        let y = linear::matmul(&p.rows("act", W), &p.weight("w", [W, W]));
+        p.name("y", &y);
+        let (left, right) = layout::split_rows(&y, p.u32("width"));
+        p.export("left", &left);
+        p.export("right", &right);
+    });
+    Rule::new("linear.matmul_split_rows", [pattern], |m| {
+        Fused::MatmulSplitRows {
+            act: m.value("act"),
+            w: m.value("w"),
+            width: m.u32("width"),
+            y: m.value("y"),
+            left: m.value("left"),
+            right: m.value("right"),
+        }
+    })
+    .through_markers()
 }
 
 #[derive(Clone, Copy)]

@@ -1,6 +1,6 @@
 use crate::error::Error;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
+use crate::jit::{Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const BLOCK: u32 = 256;
@@ -21,6 +21,22 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<
         )
     })?;
     nonzero(OP, "the gated rectangle's element count", lanes)?;
+    if ctx.tuning().rows_vec && x.width.is_multiple_of(8) && aligned16(x.ptr) && aligned16(gate.ptr)
+    {
+        return ctx.fire(
+            OP,
+            Fire::at("linear/glu.cuh", "::pie::linear::gate_sigmoid_mul_vec8")
+                .apply(Launch::flat(lanes / 8, BLOCK)),
+            &[
+                x.arg(),
+                gate.arg(),
+                stated(OP, lanes / 8)?.arg(),
+                stated(OP, x.width)?.arg(),
+                stated(OP, fan)?.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(

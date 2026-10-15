@@ -207,10 +207,15 @@ impl FamilyCosts {
             poem_ir::Operation::Layout(_) => self.layout,
             poem_ir::Operation::Collective(_) => self.collective,
             poem_ir::Operation::Fused(op) => match op {
+                poem_ir::Fused::LseSink { .. } => self.attention,
                 poem_ir::Fused::MatmulGeglu { .. }
+                | poem_ir::Fused::MatmulSwiglu { .. }
                 | poem_ir::Fused::MlpSwiglu { .. }
                 | poem_ir::Fused::LmHeadSoftcap { .. }
-                | poem_ir::Fused::MatmulBias { .. } => self.linear,
+                | poem_ir::Fused::MatmulBias { .. }
+                | poem_ir::Fused::MatmulSplitRows { .. }
+                | poem_ir::Fused::MoeSelectGlu { .. }
+                | poem_ir::Fused::MoeExperts { .. } => self.linear,
                 poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom,
                 poem_ir::Fused::GdnStep { .. } => self.attention,
                 poem_ir::Fused::QGateNormRopeAppend { .. } => self.attention,
@@ -220,6 +225,8 @@ impl FamilyCosts {
                 | poem_ir::Fused::EmbedScaleAddSelect { .. }
                 | poem_ir::Fused::RmsnormRopePartialQ { .. }
                 | poem_ir::Fused::HcNormProject { .. }
+                | poem_ir::Fused::RopeYarnAppend { .. }
+                | poem_ir::Fused::SplitRopeYarnAppend { .. }
                 | poem_ir::Fused::NormModulate { .. }
                 | poem_ir::Fused::GatedResidualNormModulate { .. } => self.elementwise,
             },

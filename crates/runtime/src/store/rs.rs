@@ -71,12 +71,16 @@ struct RingState {
 /// device-decided length (no `fold`) the host commits nothing, but every
 /// token before `settled`, the first the fire writes, is part of the
 /// sequence it continues, so the ring catches up to it. `positioned` says
-/// the host knows the fire's positions: only then do pages retire, through
-/// the sequence order of its kv page indexes.
+/// the host knows the fire's positions: the pages behind the committed
+/// position's window retire, through the sequence order of its kv page
+/// indexes. A fire whose positions the device decides retires behind
+/// `reach` instead, the first token it may write: each of its rows lands
+/// past it, so no row's window reaches back past `reach`'s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RingAdvance {
     pub(crate) positioned: bool,
     pub(crate) settled: u32,
+    pub(crate) reach: u32,
     pub(crate) fold: Option<u32>,
     pub(crate) commit_end: u32,
     pub(crate) head: Option<u32>,
@@ -692,8 +696,13 @@ impl RsStore {
             let tail = advance.commit_end.saturating_sub(ring.committed);
             ring.committed = ring.committed.saturating_add(fold.min(tail));
         }
-        let first = ring.committed.saturating_sub(geom.tokens) / geom.page_size.max(1);
-        if !advance.positioned || first <= ring.retired {
+        let reach = if advance.positioned {
+            ring.committed
+        } else {
+            advance.reach
+        };
+        let first = reach.saturating_sub(geom.tokens) / geom.page_size.max(1);
+        if first <= ring.retired {
             return;
         }
         let behind =

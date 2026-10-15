@@ -663,6 +663,20 @@ fn pairings<'a>(
                           point this shell stamps reads them in the width they are stored",
                 });
             }
+            ScaleForm::E4m3TensorScaled => {
+                return Err(Fault::Param {
+                    name: (*name).to_string(),
+                    why: "is an NVFP4 bank (e4m3 scales under per-row tensor scales), and \
+                          no point this shell stamps reads one; it serves on cuda",
+                });
+            }
+            ScaleForm::F32Tensor => {
+                return Err(Fault::Param {
+                    name: (*name).to_string(),
+                    why: "is an e4m3 table under one f32 scale, and no point this shell \
+                          stamps reads one; it serves on cuda",
+                });
+            }
         };
         let biases = match (attachment.scale_form, attachment.zero_point_tensor) {
             (_, Some(id)) => Some(row(
@@ -1326,6 +1340,7 @@ mod tests {
                     Expr::Cast {
                         src: Box::new(Expr::Src("stored".into())),
                         to: Encoding::Raw(DType::F32),
+                        chunks: 0,
                     },
                 ),
                 entry(
@@ -1333,6 +1348,7 @@ mod tests {
                     Expr::Cast {
                         src: Box::new(Expr::Out("leaf".into())),
                         to: Encoding::Raw(DType::F32),
+                        chunks: 0,
                     },
                 ),
             ],

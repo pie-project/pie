@@ -63,8 +63,18 @@ fn every_probe_is_dumped() {
             let stamp = checkpoint::file::serve::stamp_of(&artifact)
                 .expect("the artifact reads")
                 .expect("the artifact carries a serving stamp");
-            let deployment = poem_compiler::catalog::deployment(&stamp.deployment)
-                .unwrap_or_else(|| panic!("no deployment {}", stamp.deployment));
+            // A stated row serves the artifact's planes if they are its own:
+            // `nvfp4a4` reads the planes an `nvfp4` import lands.
+            let name = std::env::var("PIE_PARITY_DEPLOYMENT").unwrap_or(stamp.deployment);
+            // A row the catalog does not list (a whole model's own export)
+            // still reads as its name spells.
+            let deployment = poem_compiler::catalog::deployment(&name)
+                .or_else(|| {
+                    poem_compiler::catalog::repository()
+                        .parse(&name)
+                        .map(|d| &*Box::leak(Box::new(d)))
+                })
+                .unwrap_or_else(|| panic!("no deployment {name}"));
             let trace = deployment.trace(Platform::Cuda);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
             let contract = poem::import::own_contract(
@@ -145,6 +155,11 @@ fn every_probe_is_dumped() {
     };
     let tag = std::env::var("PIE_PARITY_TAG").unwrap_or_else(|_| "pie".to_string());
 
+    // Each process times its dense GEMM tactics afresh, and a near tie can
+    // land on another cuBLASLt algorithm (another rounding) run to run;
+    // `PIE_PARITY_CACHE` names a directory the chosen tactics persist in,
+    // so two runs over it read bit for bit alike.
+    let tactics = std::env::var_os("PIE_PARITY_CACHE").map(std::path::PathBuf::from);
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {
         voxels: None,
@@ -158,13 +173,35 @@ fn every_probe_is_dumped() {
         context,
         slots: 4,
         kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        memory_share: std::env::var("PIE_PARITY_MEMORY_SHARE")
+            .ok()
+            .map_or(engine::load::DEFAULT_DEVICE_MEMORY_SHARE, |share| {
+                share.parse().expect("a device memory share")
+            }),
         ordinal: 0,
         knobs: Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),
+            // Eager, at the registry defaults; `PIE_PARITY_KERNEL` adds
+            // `[kernel]` decisions (a chip profile's, `;`-separated) to
+            // read under.
+            // `PIE_PARITY_DEVICE_PROFILE` reads under the device's own
+            // resolved profile instead (graphs, bodies and side streams as a
+            // server runs them), a user file in `PIE_PARITY_PROFILES`
+            // overlaid.
+            chip: if std::env::var_os("PIE_PARITY_DEVICE_PROFILE").is_some() {
+                None
+            } else {
+                Some(match std::env::var("PIE_PARITY_KERNEL") {
+                    Ok(kernel) => engine_cuda::chip::profile(&format!(
+                        "[engine]\ngraphs = \"off\"\n[kernel]\n{}\n",
+                        kernel.replace(';', "\n")
+                    )),
+                    Err(_) => engine_cuda::chip::pinned(Graphs::Off, None),
+                })
+            },
+            profiles: std::env::var_os("PIE_PARITY_PROFILES").map(PathBuf::from),
             ..Knobs::default()
         },
-        cache_dir: None,
+        cache_dir: tactics.as_deref(),
         runahead: engine::runahead::Runahead::F1,
         residency,
         world: World::default(),

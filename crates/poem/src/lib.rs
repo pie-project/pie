@@ -20,8 +20,8 @@ pub use fact::Predicate;
 pub use forward::*;
 pub use poem_ir::{
     Attention, BlockDrafter, CacheRow, Collective, Def, Dim, Dtype, Elementwise, GateActivation,
-    GeomKind, Guard, Layout, Linear, ModulateForm, MropeForm, Operands, Operation, Param,
-    ParamSource, PixelOrder, Platform, RaggedMask, RopeForm, RuntimeInput, Selection, Shard,
+    GeomKind, Guard, IndexScore, Layout, Linear, ModulateForm, MropeForm, Operands, Operation,
+    Param, ParamSource, PixelOrder, Platform, RaggedMask, RopeForm, RuntimeInput, Selection, Shard,
     Stream, TapKind, Trace, Ty, ValueId, VoxelSegment, resolve_classes,
 };
 pub use record::{Arm, Primitive, Recorder, Refine, Switch, Value, switch};

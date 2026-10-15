@@ -148,9 +148,23 @@ fn fixture(text: Text) -> Fixture {
     }
 }
 
-fn load(fixture: &Fixture, grouped: bool) -> engine_cuda::Result<Shell> {
+/// The routed matmul's leg: the grouped tcgen05 GEMM (where the device has
+/// it), the cuBLAS grouped GEMM, or one GEMV a route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Leg {
+    Tcgen05,
+    Grouped,
+    Gemv,
+}
+
+fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
+    let (tc5, grouped) = match leg {
+        Leg::Tcgen05 => (true, true),
+        Leg::Grouped => (false, true),
+        Leg::Gemv => (false, false),
+    };
     let chip = engine_cuda::chip::profile(&format!(
-        "[kernel]\nmoe.grouped = {grouped}\n[engine]\ngraphs = \"off\"\n"
+        "[kernel]\nmoe.grouped = {grouped}\nmoe.tc5 = {tc5}\n[engine]\ngraphs = \"off\"\n"
     ));
     Shell::load(Boot {
         trace: fixture.trace.clone(),
@@ -178,12 +192,8 @@ fn load(fixture: &Fixture, grouped: bool) -> engine_cuda::Result<Shell> {
     })
 }
 
-fn fire_at(
-    fixture: &Fixture,
-    tokens: u32,
-    grouped: bool,
-) -> engine_cuda::Result<(Vec<Vec<f32>>, f64)> {
-    let mut shell = load(fixture, grouped)?;
+fn fire_at(fixture: &Fixture, tokens: u32, leg: Leg) -> engine_cuda::Result<(Vec<Vec<f32>>, f64)> {
+    let mut shell = load(fixture, leg)?;
     shell.open(0).expect("slot 0 opens");
     shell.open(1).expect("slot 1 opens");
     let prompt: Vec<u32> = (0..tokens).map(|t| (t * 7 + 11) % 2048).collect();
@@ -223,20 +233,22 @@ fn a_prefill_past_the_gemvs_grid_is_served() {
         )
     };
 
-    let (logits, _) = fire_at(&fixture, WIDE, true).expect(
-        "a prefill of 65600 routes fires — if this refused, the engine never reached the \
-         grouped leg and the routed matmul is still one GEMV per route",
-    );
-    finite(&logits[0], "the wide prefill");
+    for leg in [Leg::Grouped, Leg::Tcgen05] {
+        let (logits, _) = fire_at(&fixture, WIDE, leg).unwrap_or_else(|why| {
+            panic!(
+                "a prefill of 65600 routes fires on the {leg:?} leg — if this refused, the \
+                 engine never reached it and the routed matmul is still one GEMV per route: \
+                 {why}"
+            )
+        });
+        finite(&logits[0], "the wide prefill");
+    }
 
-    let why = fire_at(&fixture, WIDE, false)
-        .expect_err("with the grouped leg declined, a 65600-route fire is past the GEMV's grid")
-        .to_string();
-    assert!(
-        why.contains("65600") || why.contains("65535"),
-        "the refusal should be the GEMV's, naming the route run against the grid it does \
-         not fit; it said: {why}"
-    );
+    // The GEMV carries a route run past its grid's y axis on z, so it serves the fire too.
+    let (logits, _) = fire_at(&fixture, WIDE, Leg::Gemv).unwrap_or_else(|why| {
+        panic!("a prefill of 65600 routes fires on the GEMV leg past grid y: {why}")
+    });
+    finite(&logits[0], "the wide prefill on the GEMV");
 }
 
 fn the_two_legs_answer_the_same_model() {
@@ -247,11 +259,18 @@ fn the_two_legs_answer_the_same_model() {
     }
     let fixture = fixture(MICRO);
 
-    let (grouped, grouped_ms) = fire_at(&fixture, BOTH, true).expect("the grouped leg fires");
-    let (gemv, gemv_ms) = fire_at(&fixture, BOTH, false).expect("the per-route GEMV fires");
-    finite(&grouped[0], "grouped");
+    let (gemv, gemv_ms) = fire_at(&fixture, BOTH, Leg::Gemv).expect("the per-route GEMV fires");
     finite(&gemv[0], "gemv");
+    for leg in [Leg::Grouped, Leg::Tcgen05] {
+        let (grouped, grouped_ms) = fire_at(&fixture, BOTH, leg).expect("the grouped leg fires");
+        finite(&grouped[0], "grouped");
+        agree(leg, &grouped, grouped_ms, &gemv, gemv_ms);
+    }
+}
 
+/// A grouped leg's logits against the GEMV's: a reordered sum moves the
+/// tail, not the middle.
+fn agree(leg: Leg, grouped: &[Vec<f32>], grouped_ms: f64, gemv: &[Vec<f32>], gemv_ms: f64) {
     assert_eq!(
         grouped[0].len(),
         gemv[0].len(),
@@ -282,7 +301,7 @@ fn the_two_legs_answer_the_same_model() {
             .0
     };
     eprintln!(
-        "{BOTH} tokens, {} routes: grouped {grouped_ms:.1} ms, gemv {gemv_ms:.1} ms \
+        "{BOTH} tokens, {} routes: {leg:?} {grouped_ms:.1} ms, gemv {gemv_ms:.1} ms \
          ({:.2}x); gap worst {worst:.4} mean {mean:.4} median {median:.4} over a spread \
          of {spread:.2}; argmax {} vs {}",
         BOTH * TOP_K,
@@ -310,11 +329,18 @@ fn a_bank_past_the_cache_is_where_grouping_pays() {
     }
     let fixture = fixture(UNCACHED);
 
-    let (grouped, grouped_ms) = fire_at(&fixture, BOTH, true).expect("the grouped leg fires");
-    let (gemv, gemv_ms) = fire_at(&fixture, BOTH, false).expect("the per-route GEMV fires");
-    finite(&grouped[0], "grouped");
+    let (gemv, gemv_ms) = fire_at(&fixture, BOTH, Leg::Gemv).expect("the per-route GEMV fires");
     finite(&gemv[0], "gemv");
+    for leg in [Leg::Grouped, Leg::Tcgen05] {
+        let (grouped, grouped_ms) = fire_at(&fixture, BOTH, leg).expect("the grouped leg fires");
+        finite(&grouped[0], "grouped");
+        pays(leg, &grouped, grouped_ms, &gemv, gemv_ms);
+    }
+}
 
+/// A grouped leg reading the bank once a batch against the GEMV reading it
+/// once a route: the same logits, sooner.
+fn pays(leg: Leg, grouped: &[Vec<f32>], grouped_ms: f64, gemv: &[Vec<f32>], gemv_ms: f64) {
     let spread = gemv[0].iter().copied().fold(f32::NEG_INFINITY, f32::max)
         - gemv[0].iter().copied().fold(f32::INFINITY, f32::min);
     let mean = grouped[0]
@@ -325,7 +351,7 @@ fn a_bank_past_the_cache_is_where_grouping_pays() {
         / grouped[0].len() as f32;
 
     eprintln!(
-        "{} tokens, {} routes over a 134 MiB bank: grouped {grouped_ms:.1} ms, \
+        "{} tokens, {} routes over a 134 MiB bank: {leg:?} {grouped_ms:.1} ms, \
          gemv {gemv_ms:.1} ms ({:.1}x); mean logit gap {mean:.4} over a spread of {spread:.2}",
         BOTH,
         BOTH * TOP_K,
@@ -337,7 +363,7 @@ fn a_bank_past_the_cache_is_where_grouping_pays() {
     );
     assert!(
         grouped_ms < gemv_ms,
-        "grouping a bank that does not fit in cache took {grouped_ms:.1} ms against the \
+        "grouping a bank that does not fit in cache ({leg:?}) took {grouped_ms:.1} ms against the \
          per-route GEMV's {gemv_ms:.1} ms; this is the shape it exists for"
     );
 }

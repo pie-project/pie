@@ -44,6 +44,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     device.set_tuning(kernels_rocm::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
+    if boot.budget.max_tokens == 0 {
+        boot.budget.max_tokens = crate::api::DEFAULT_FORWARD_TOKENS;
+    }
 
     kernels_rocm::disk::install(boot.cache_dir);
 

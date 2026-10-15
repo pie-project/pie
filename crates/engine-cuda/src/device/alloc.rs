@@ -183,6 +183,9 @@ impl Buffer {
         {
             use cudarc::runtime::sys as rt;
 
+            if bounce(stream, self.ptr + offset, bytes)? {
+                return Ok(());
+            }
             // SAFETY: the span is checked; `bytes` outlives the enqueue, and the caller synchronizes the stream before it is dropped — every caller in this crate stages inside one `fire`.
             unsafe {
                 crate::device::ctx::check(
@@ -772,6 +775,78 @@ pub fn write_raw(at: u64, bytes: &[u8]) -> Result<()> {
     }
 }
 
+/// The least copy that goes through pinned memory. A pageable source past
+/// the driver's own staging buffer makes the copy wait for every launch
+/// already queued on its stream, so a fire's table staged behind the fire
+/// before it holds the host until the device drains, and the next fire is
+/// assembled on an idle device.
+#[cfg(feature = "cuda")]
+const BOUNCED: usize = 32 << 10;
+
+/// Pinned buffers a thread cycles its bounced copies through. A buffer is
+/// written again only once the copy that last read it has run, so the ring
+/// holds the host back only when the device is that many copies behind.
+#[cfg(feature = "cuda")]
+const BOUNCES: usize = 8;
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct Bounces {
+    ring: Vec<(Pinned, crate::device::graph::Event)>,
+    next: usize,
+}
+
+#[cfg(feature = "cuda")]
+thread_local! {
+    static BOUNCES_HELD: core::cell::RefCell<Bounces> = core::cell::RefCell::default();
+}
+
+/// Copies `bytes` to `dst` on `stream` through this thread's pinned ring
+/// when it is `BOUNCED` or longer; false when it is shorter and the caller
+/// copies it as it is.
+#[cfg(feature = "cuda")]
+fn bounce(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<bool> {
+    use cudarc::runtime::sys as rt;
+
+    if bytes.len() < BOUNCED {
+        return Ok(false);
+    }
+    BOUNCES_HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        let at = held.next;
+        held.next = (at + 1) % BOUNCES;
+        if held.ring.len() <= at {
+            let pinned = Pinned::mapped_uninit(bytes.len().next_power_of_two())?;
+            held.ring
+                .push((pinned, crate::device::graph::Event::new()?));
+        } else {
+            held.ring[at].1.settle()?;
+            if held.ring[at].0.bytes() < bytes.len() {
+                held.ring[at].0 = Pinned::mapped_uninit(bytes.len().next_power_of_two())?;
+            }
+        }
+        let (pinned, read) = &held.ring[at];
+        pinned.write(0, bytes);
+        // SAFETY: the source is this ring's pinned buffer, written again only
+        // after `read` reports this copy run; the destination is the caller's
+        // checked span.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaMemcpyAsync",
+                rt::cudaMemcpyAsync(
+                    dst as *mut core::ffi::c_void,
+                    pinned.host().cast_const().cast(),
+                    bytes.len(),
+                    rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    stream.cast(),
+                ),
+            )?;
+        }
+        read.record(stream)?;
+        Ok(true)
+    })
+}
+
 pub fn stage_raw(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
@@ -779,6 +854,10 @@ pub fn stage_raw(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Resu
     #[cfg(feature = "cuda")]
     {
         use cudarc::runtime::sys as rt;
+
+        if bounce(stream, dst, bytes)? {
+            return Ok(());
+        }
 
         // SAFETY: `bytes` is a live host slice for the call; the destination span is the caller's own scratch.
         unsafe {

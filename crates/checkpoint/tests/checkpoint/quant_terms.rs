@@ -40,6 +40,7 @@ const ROWS: &[(QuantScheme, &str)] = &[
     (QuantScheme::GgufQ5K, "g32_u5_g8_u6_f16_n_b_g8_u6_f16_n"),
     (QuantScheme::GgufQ6K, "g16_i6_g16_i8_f16_n_n"),
     (QuantScheme::GgufMxfp4, "g32_e2m1_e8m0_n"),
+    (QuantScheme::Nvfp4E2M1E4M3, "g16_e2m1_gr_e4m3_f32_n_n"),
 ];
 
 const NO_ROW: &[QuantScheme] = &[
@@ -169,6 +170,7 @@ fn of_fmt_sorts_the_bridge_rows_into_served_and_import_only() {
         (QuantScheme::GgufQ5K, Dtype::U5g32k),
         (QuantScheme::GgufQ6K, Dtype::I6g16k),
         (QuantScheme::GgufMxfp4, Dtype::Mxfp4),
+        (QuantScheme::Nvfp4E2M1E4M3, Dtype::Nvfp4),
     ];
     for (scheme, d) in served {
         assert_eq!(

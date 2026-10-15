@@ -302,10 +302,25 @@ pub fn split_qkv(
     if q_dim <= 0 && kv_dim <= 0 {
         return Err(refuse(OP, "both halves of this cut are zero-wide"));
     }
-    let width = q.width.max(k.width);
+    // Eight columns a thread where both cuts and every plane take whole
+    // 16-byte runs: a copy, so the same bits land either way.
+    let vec8 = q.width.is_multiple_of(8)
+        && k.width.is_multiple_of(8)
+        && [packed.ptr, q.ptr, k.ptr, v.ptr]
+            .iter()
+            .all(|p| p % 16 == 0);
+    let (entry, width) = if vec8 {
+        ("split_qkv_vec8", q.width.max(k.width) / 8)
+    } else {
+        ("split_qkv", q.width.max(k.width))
+    };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::layout::split_qkv<::pie::bf16>").apply(Launch::grid(
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::layout::{entry}<::pie::bf16>")),
+        )
+        .apply(Launch::grid(
             [q.rows, width.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
@@ -341,6 +356,31 @@ pub fn split_q_gate(
         ));
     }
     let heads = q.width / head_dim;
+    if ctx.tuning().rows_vec
+        && head_dim.is_multiple_of(8)
+        && [packed.ptr, q.ptr, gate.ptr]
+            .iter()
+            .all(|&at| aligned16(at))
+    {
+        let runs = head_dim / 8;
+        let total = u64::from(q.rows) * u64::from(heads) * u64::from(runs);
+        let blocks = u32::try_from(total.div_ceil(256))
+            .map_err(|_| refuse(OP, format!("{total} runs overflow a grid")))?;
+        return ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::layout::split_q_gate_vec8<::pie::bf16>")
+                .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
+            &[
+                packed.arg(),
+                q.arg(),
+                gate.arg(),
+                (total as i64).arg(),
+                stated(OP, heads)?.arg(),
+                stated(OP, runs)?.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     let block = if head_dim < 128 { 64 } else { 128 };
     ctx.fire(
         OP,

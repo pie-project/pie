@@ -81,6 +81,37 @@ __global__ void gate_sigmoid_mul(
     x[at] = Elem<T>::from_f32(xv * s);
 }
 
+// `gate_sigmoid_mul` 16 bytes a lane: `n8` counts eight-element runs.
+__global__ void gate_sigmoid_mul_vec8(
+    bf16* __restrict__ x,
+    const bf16* __restrict__ gate,
+    i32 n8,
+    i32 width,
+    i32 fan,
+    const u32* __restrict__ win)
+{
+    const i32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n8) return;
+    if (win != nullptr &&
+        static_cast<long long>(i) * 8 >=
+            static_cast<long long>(win[0]) * fan * width) return;
+    const long long at = win != nullptr
+        ? static_cast<long long>(i) * 8 + static_cast<long long>(win[1]) * fan * width
+        : static_cast<long long>(i) * 8;
+
+    uint4 xv = *reinterpret_cast<const uint4*>(x + at);
+    const uint4 gv = *reinterpret_cast<const uint4*>(gate + at);
+    bf16x2* xh = reinterpret_cast<bf16x2*>(&xv);
+    const bf16x2* gh = reinterpret_cast<const bf16x2*>(&gv);
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 a = bf16x2_to_f32(xh[j]);
+        const float2 g = bf16x2_to_f32(gh[j]);
+        xh[j] = f32_to_bf16x2(a.x * (1.f / (1.f + __expf(-g.x))), a.y * (1.f / (1.f + __expf(-g.y))));
+    }
+    *reinterpret_cast<uint4*>(x + at) = xv;
+}
+
 template <class T>
 __global__ void gate_sigmoid_mul_heads(
     T* __restrict__ x,
@@ -142,6 +173,34 @@ template <class T>
 __global__ void mlp_swiglu(const T* __restrict__ packed, T* __restrict__ y, i32 I,
                            i32 fan, const u32* __restrict__ win) {
     mlp_swiglu_body<T, false>(packed, y, I, fan, win);
+}
+
+// `mlp_swiglu` eight columns a thread, read and written 16 bytes at a time:
+// the same value for every element.
+template <class T>
+__global__ void mlp_swiglu_vec8(const T* __restrict__ packed, T* __restrict__ y, i32 I,
+                                i32 fan, const u32* __restrict__ win) {
+    const i32 n = blockIdx.x;
+    if (win != nullptr && n >= static_cast<i32>(win[0]) * fan) return;
+    const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) * fan : n;
+    const i32 i0 = (blockIdx.y * blockDim.x + threadIdx.x) * 8;
+    if (i0 >= I) return;
+    const long long row = static_cast<long long>(plane_row) * I;
+    const long long packed_row = row * 2;
+    const uint4 gw = *reinterpret_cast<const uint4*>(packed + packed_row + i0);
+    const uint4 uw = *reinterpret_cast<const uint4*>(packed + packed_row + I + i0);
+    const T* g8 = reinterpret_cast<const T*>(&gw);
+    const T* u8 = reinterpret_cast<const T*>(&uw);
+    uint4 out;
+    T* o8 = reinterpret_cast<T*>(&out);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const float g = Elem<T>::to_f32(g8[k]);
+        const float u = Elem<T>::to_f32(u8[k]);
+        const float silu = g / (1.f + __expf(-g));
+        o8[k] = Elem<T>::from_f32(silu * u);
+    }
+    *reinterpret_cast<uint4*>(y + row + i0) = out;
 }
 
 template <class T, bool GateSecond>
@@ -214,6 +273,38 @@ __global__ void mlp_geglu_tanh_packed(
     mlp_geglu_tanh_packed_body<T, false>(packed, y, I, fan, win);
 }
 
+// `mlp_geglu_tanh_packed` eight columns a thread, read and written 16 bytes
+// at a time: the same value for every element.
+template <class T>
+__global__ void mlp_geglu_tanh_packed_vec8(
+    const T* __restrict__ packed, T* __restrict__ y, i32 I,
+    i32 fan, const u32* __restrict__ win)
+{
+    const i32 n = blockIdx.x;
+    if (win != nullptr && n >= static_cast<i32>(win[0]) * fan) return;
+    const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) * fan : n;
+    const i32 i0 = (blockIdx.y * blockDim.x + threadIdx.x) * 8;
+    if (i0 >= I) return;
+    const long long packed_row = static_cast<long long>(plane_row) * 2 * I;
+    const uint4 gw = *reinterpret_cast<const uint4*>(packed + packed_row + gate_offset<false>(i0, I));
+    const uint4 uw = *reinterpret_cast<const uint4*>(packed + packed_row + up_offset<false>(i0, I));
+    const T* g8 = reinterpret_cast<const T*>(&gw);
+    const T* u8 = reinterpret_cast<const T*>(&uw);
+    uint4 out;
+    T* o8 = reinterpret_cast<T*>(&out);
+    constexpr float kAlpha = 0.7978845608028654f;
+    constexpr float kBeta = 0.044715f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const float g = Elem<T>::to_f32(g8[k]);
+        const float u = Elem<T>::to_f32(u8[k]);
+        const float inner = kAlpha * (g + kBeta * g * g * g);
+        const float gelu = 0.5f * g * (1.f + tanhf(inner));
+        o8[k] = Elem<T>::from_f32(gelu * u);
+    }
+    *reinterpret_cast<uint4*>(y + static_cast<long long>(plane_row) * I + i0) = out;
+}
+
 template <class T>
 __global__ void mlp_swiglu_clamp(
     const T* __restrict__ packed,
@@ -237,6 +328,62 @@ __global__ void mlp_swiglu_clamp(
     g = fminf(g, limit);
     u = fminf(fmaxf(u, -limit), limit);
     y[row + i] = Elem<T>::from_f32((g / (1.f + expf(-g))) * u);
+}
+
+// `mlp_swiglu_clamp` over a gate and an up plane held apart: the routed
+// banks whose gate and up legs are read as two.
+template <class T>
+__global__ void mlp_swiglu_clamp_split(
+    const T* __restrict__ gate,
+    const T* __restrict__ up,
+    T* __restrict__ y,
+    i32 n,
+    i32 width,
+    float limit,
+    i32 fan,
+    const u32* __restrict__ win)
+{
+    const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    if (win != nullptr &&
+        static_cast<long long>(idx) >=
+            static_cast<long long>(win[0]) * fan * width) return;
+    const long long at = win != nullptr
+        ? idx + static_cast<long long>(win[1]) * fan * width
+        : idx;
+
+    const float g = fminf(Elem<T>::to_f32(gate[at]), limit);
+    const float u = fminf(fmaxf(Elem<T>::to_f32(up[at]), -limit), limit);
+    y[at] = Elem<T>::from_f32((g / (1.f + expf(-g))) * u);
+}
+
+// Each routed row times its route's weight before it rounds.
+template <class T>
+__global__ void mlp_swiglu_clamp_split_routed(
+    const T* __restrict__ gate,
+    const T* __restrict__ up,
+    const float* __restrict__ weights,
+    T* __restrict__ y,
+    i32 n,
+    i32 width,
+    float limit,
+    i32 fan,
+    const u32* __restrict__ win)
+{
+    const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    if (win != nullptr &&
+        static_cast<long long>(idx) >=
+            static_cast<long long>(win[0]) * fan * width) return;
+    const long long at = win != nullptr
+        ? idx + static_cast<long long>(win[1]) * fan * width
+        : idx;
+
+    const float g = fminf(Elem<T>::to_f32(gate[at]), limit);
+    const float u = fminf(fmaxf(Elem<T>::to_f32(up[at]), -limit), limit);
+    y[at] = Elem<T>::from_f32((g / (1.f + expf(-g))) * u * weights[at / width]);
 }
 
 template <class T>

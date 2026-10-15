@@ -661,9 +661,20 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Attention::MlaAbsorbOut { .. } => &[],
             Attention::MlaLatentsRope { .. } => &[(In(1), I32)],
             Attention::MlaKvAppend { .. } => &[(In(2), CACHE), (In(3), I32), (In(4), I32)],
+            Attention::MlaDecode { lse: Some(_), .. }
+            | Attention::MlaPrefill { lse: Some(_), .. } => {
+                &[(In(1), MLA_PLAN), (In(3), CACHE), (Out(1), F32)]
+            }
             Attention::MlaDecode { .. } | Attention::MlaPrefill { .. } => {
                 &[(In(1), MLA_PLAN), (In(3), CACHE)]
             }
+            Attention::MlaDecodeSelected { lse: Some(_), .. }
+            | Attention::MlaPrefillSelected { lse: Some(_), .. } => &[
+                (In(1), MLA_PLAN),
+                (In(3), I32),
+                (In(4), CACHE),
+                (Out(1), F32),
+            ],
             Attention::MlaDecodeSelected { .. } | Attention::MlaPrefillSelected { .. } => {
                 &[(In(1), MLA_PLAN), (In(3), I32), (In(4), CACHE)]
             }
@@ -731,15 +742,27 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Linear::MoeMatmulSelect { .. } => &[(In(2), I32)],
             Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],
             Linear::MoeMatmulSelectQuant { .. } => &[(In(2), I32)],
+            Linear::MoeMatmulSelectActQuant {
+                input_scales: Some(_),
+                ..
+            } => &[(In(2), I32), (In(3), F32)],
+            Linear::MoeMatmulSelectActQuant { .. } => &[(In(2), I32)],
+            Linear::MatmulActQuant {
+                input_scales: Some(_),
+                ..
+            } => &[(In(2), F32)],
             Linear::MoeWeightedSum { .. } => &[(In(1), F32)],
+            Linear::MlpSwigluClampSplitRouted { .. } => &[(In(2), F32)],
             Linear::MoeBiasSum { .. } => &[(In(2), I32), (In(3), F32)],
             Linear::LoraCorrect { .. } => &[(In(3), I32)],
             Linear::Matmul { .. }
+            | Linear::MatmulActQuant { .. }
             | Linear::LmHead { .. }
             | Linear::MlpSwiglu { .. }
             | Linear::MlpSwigluClamp { .. }
             | Linear::MlpSwigluClampAlpha { .. }
             | Linear::MlpSwigluClampSplit { .. }
+            | Linear::MoeSumAdd { .. }
             | Linear::MlpGegluTanh { .. }
             | Linear::MlpGeluTanh { .. }
             | Linear::MlpGegluTanhPacked { .. }
@@ -853,6 +876,22 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Fused::QkvFusedQknormRopeVnormWrite { .. } => {
                 &[(In(1), I32), (In(4), CACHE), (In(5), I32), (In(6), I32)]
             }
+            Fused::RopeYarnAppend { .. } => {
+                &[(In(3), I32), (In(4), CACHE), (In(5), I32), (In(6), I32)]
+            }
+            Fused::SplitRopeYarnAppend { .. } => {
+                &[(In(1), I32), (In(2), CACHE), (In(3), I32), (In(4), I32)]
+            }
+            // The attention's own, and the sink's f32 log-sum-exp is its.
+            Fused::LseSink { attn, .. } => match **attn {
+                Attention::DecodeLse { .. } => {
+                    &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)]
+                }
+                Attention::PrefillLse { .. } => {
+                    &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)]
+                }
+                _ => &[],
+            },
             Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::NormModulate {
@@ -862,9 +901,25 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 lane_of_row: None, ..
             }
             | Fused::MatmulGeglu { .. }
+            | Fused::MatmulSwiglu { .. }
             | Fused::MlpSwiglu { .. }
             | Fused::LmHeadSoftcap { .. }
-            | Fused::MatmulBias { .. } => &[],
+            | Fused::MatmulBias { .. }
+            | Fused::MatmulSplitRows { .. } => &[],
+            // The select's own: its routes are i32.
+            Fused::MoeSelectGlu { select, .. } => match select.as_ref() {
+                Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],
+                _ => &[(In(2), I32)],
+            },
+            // The select's routes, then the sum's weights.
+            Fused::MoeExperts { select, .. } => match select.as_ref() {
+                Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32), (In(4), F32)],
+                Linear::MoeMatmulSelectActQuant {
+                    input_scales: Some(_),
+                    ..
+                } => &[(In(2), I32), (In(3), F32), (In(4), F32)],
+                _ => &[(In(2), I32), (In(3), F32)],
+            },
         },
         Operation::Collective(_) => &[],
         Operation::Spatial(op) => match op {

@@ -1,0 +1,167 @@
+# How a MiMo-V2.6 checkpoint is laid out: transformers' names, the routed
+# experts one plane per expert (MXFP4 codes as `.weight` beside their
+# `.weight_scale` exponents), the dense projections fp8 beside their
+# `weight_scale_inv` block factors.
+#
+# The fused qkv is stored pre-sharded at `shards` chunks, each chunk its own
+# heads' queries, then keys, then values ([Q_0|K_0|V_0|Q_1|...]), so each
+# head is read out of its chunk and laid out 256 wide.
+
+FP8 = raw(dtype.e4m3)
+
+def formats(m):
+    return [format(
+        "huggingface",
+        recognizes = lambda checkpoint: has("model.layers.0.self_attn.qkv_proj.weight"),
+        read = lambda reads: huggingface(m, reads),
+        states = configured(m),
+    )]
+
+def configured(m):
+    """The shape a transformers configuration states of this model."""
+    routed = [w.mlp for w in m.layers if w.mlp.routed]
+    stated = [
+        config("hidden_size", m.hidden),
+        config("vocab_size", m.vocab),
+        config("num_attention_heads", m.q_heads),
+        config("num_key_value_heads", m.full_kv_heads),
+        config("swa_num_key_value_heads", m.window_kv_heads),
+        config("head_dim", m.qk_head_dim),
+        config("v_head_dim", m.v_head_dim),
+        config("num_hidden_layers", len(m.layers)),
+        config("layernorm_epsilon", m.final_norm_eps),
+        config("sliding_window", m.window),
+        config("attention_value_scale", m.value_scale),
+    ]
+    if routed:
+        stated.append(config("n_routed_experts", routed[0].experts))
+    return stated
+
+def huggingface(m, reads):
+    reads.read(m.embed, "model.embed_tokens.weight")
+    reads.read(m.final_norm, "model.norm.weight")
+    reads.read(m.head, "lm_head.weight")
+    for l, w in enumerate(m.layers):
+        n = lambda leaf: "model.layers.{}.{}".format(l, leaf)
+        at = w.attn
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
+        qkv(m, reads, at, n("self_attn.qkv_proj.weight"))
+        o_proj(m, reads, at.o_proj, n("self_attn.o_proj.weight"))
+        if at.sinks != None:
+            reads.read(at.sinks, n("self_attn.attention_sink_bias"))
+        f = w.mlp
+        if not f.routed:
+            legs = [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")]
+            reads.push(tensor(f.gate_up.name, concat(0, [readable(reads, f.gate_up, leg) for leg in legs]), encoding(f.gate_up.dtype)))
+            reads.read(f.down, n("mlp.down_proj.weight"))
+            continue
+        reads.read(f.router, n("mlp.gate.weight"))
+        reads.read(f.bias, n("mlp.gate.e_score_correction_bias"))
+        expert = lambda e, leg: n("mlp.experts.{}.{}_proj".format(e, leg))
+        gate_up = []
+        for e in range(f.experts):
+            gate_up += [expert(e, "gate"), expert(e, "up")]
+        packed_bank(reads, f.gate_up, gate_up)
+        packed_bank(reads, f.down, [expert(e, "down") for e in range(f.experts)])
+
+def readable(reads, w, name, rows = None, chunks = 0):
+    """The tensor `name` (its `rows` = (start, count), if given) at `w`'s
+    dtype: an fp8 plane is read out through its block factors on its own
+    first, since a join reads whole planes, its rows stored cut into
+    `chunks` each scaled apart, if stated."""
+    whole = src(name)
+    part = whole.slice(0, rows[0], rows[1]) if rows != None else whole
+    if stored(name) != FP8:
+        return part
+    tag = name if rows == None else "{}.{}+{}".format(name, rows[0], rows[1])
+    held = "{}.{}".format(w.name, tag)
+    reads.push(tensor(held, part.cast(encoding(w.dtype), chunks = chunks), encoding(w.dtype), internal = True))
+    return out(held)
+
+def qkv(m, reads, at, name):
+    """Each head's rows out of the chunk that holds it, queries and keys zero
+    from 192 to 256 and values from 128."""
+    d = m.head_dim
+    hidden = m.hidden
+    kv = at.kv_heads
+    if m.q_heads % m.shards != 0 or kv % m.shards != 0:
+        fail("`{}`: {} query and {} kv heads do not cut into the {} chunks it is stored in".format(name, m.q_heads, kv, m.shards))
+    per_q = m.q_heads // m.shards
+    per_kv = kv // m.shards
+    qk = m.qk_head_dim
+    vd = m.v_head_dim
+    chunk = per_q * qk + per_kv * (qk + vd)
+    held = shape(name)
+    if held != [m.shards * chunk, hidden]:
+        fail("`{}`: {} chunks of {} heads of queries and {} of keys and values are [{}, {}], and it is stored {}".format(
+            name, m.shards, per_q, per_kv, m.shards * chunk, hidden, held))
+    pad = lambda rows: fill(0.0, [rows, hidden], encoding(at.qkv.dtype))
+    head = lambda start, rows: readable(reads, at.qkv, name, (start, rows), chunks = m.shards)
+    parts = []
+    for h in range(m.q_heads):
+        parts += [head((h // per_q) * chunk + (h % per_q) * qk, qk), pad(d - qk)]
+    for g in range(kv):
+        parts += [head((g // per_kv) * chunk + per_q * qk + (g % per_kv) * qk, qk), pad(d - qk)]
+    for g in range(kv):
+        parts += [head((g // per_kv) * chunk + (per_q + per_kv) * qk + (g % per_kv) * vd, vd), pad(d - vd)]
+    reads.push(tensor(at.qkv.name, concat(0, parts), encoding(at.qkv.dtype), shape = at.qkv.shape))
+
+# The most stretches one read of the padded output projection is cut into:
+# each row is two per head, so a wide projection is read a band of rows at
+# a time and the bands joined.
+STRETCHES = 1 << 19
+
+def o_proj(m, reads, w, name):
+    """The output projection's columns, each head's 128 then 128 of zeros."""
+    heads = m.q_heads
+    vd = m.v_head_dim
+    plain = encoding(w.dtype)
+    if stored(name) != plain:
+        fail("`{}` is stored {}, and its padded columns are read at {}".format(name, stored(name), plain))
+
+    def padded(rows, start):
+        held = src(name) if rows == m.hidden else src(name).slice(0, start, rows)
+        cols = held.transmute([rows, heads, vd], plain)
+        zeros = fill(0.0, [rows, heads, m.head_dim - vd], plain)
+        return concat(2, [cols, zeros]).transmute([rows, heads * m.head_dim], plain)
+
+    band = max(1, STRETCHES // (2 * heads))
+    if m.hidden <= band:
+        reads.read_expr(w, padded(m.hidden, 0))
+        return
+    bands = []
+    for start in range(0, m.hidden, band):
+        held = "{}.rows{}".format(w.name, start)
+        reads.push(tensor(held, padded(min(band, m.hidden - start), start), plain, internal = True))
+        bands.append(out(held))
+    reads.push(tensor(w.name, concat(0, bands), plain, shape = w.shape))
+
+def packed_bank(reads, w, stems):
+    """A routed bank from MXFP4 legs: each `*.weight` a `[rows, cols/2]` u8
+    plane of e2m1 nibble pairs beside a `[rows, cols/32]` u8 e8m0
+    `*.weight_scale`, stacked on the leading axis and read as the bank's
+    `[experts, ...]` rectangle."""
+    rows, cols = w.shape[1], w.shape[2]
+    legs = len(stems)
+    per_leg = rows * w.shape[0] // legs
+    codes = []
+    scales = []
+    for stem in stems:
+        if stored(stem + ".weight") != raw(dtype.u8) or not has(stem + ".weight_scale"):
+            fail("`{}`: `{}.weight` is read as MXFP4 codes beside their `{}.weight_scale` exponents".format(w.name, stem, stem))
+        codes.append(src(stem + ".weight").transmute([1, per_leg, cols], encoding(dtype.mxfp4)))
+        scales.append(src(stem + ".weight_scale").transmute([1, per_leg, cols // 32], encoding(dtype.e8m0)))
+    counted = scales_shape(w)
+    codes = concat(0, codes)
+    scales = concat(0, scales)
+
+    # Two legs per expert (gate, up) stack to `[2E, inter, cols]`, which is
+    # the declared `[E, 2*inter, cols]` rectangle byte for byte.
+    if [legs, per_leg, cols] != list(w.shape):
+        codes = codes.transmute(w.shape, encoding(dtype.mxfp4))
+        scales = scales.transmute(counted, encoding(dtype.e8m0))
+    reads.extend([
+        tensor(w.name, codes, encoding(dtype.mxfp4)),
+        tensor(scales_name(w.name), scales, encoding(dtype.e8m0), shape = counted, scaling = w),
+    ])

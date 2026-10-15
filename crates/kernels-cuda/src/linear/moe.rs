@@ -86,6 +86,31 @@ pub fn topk_softmax(
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     ranked_planes(OP, logits, top_k, routes, weights);
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
+    // A warp a row where the profile says: the block's sums in its order,
+    // without its barrier a pick.
+    const WARP_ROWS: u32 = 4;
+    if ctx.tuning().moe_topk_warp && top_k <= 16 {
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!("::pie::linear::moe_topk_softmax_warp<{t}>")),
+            )
+            .apply(Launch::grid(
+                [logits.rows.div_ceil(WARP_ROWS), 1, 1],
+                [32 * WARP_ROWS, 1, 1],
+            )),
+            &[
+                logits.arg(),
+                routes.arg(),
+                weights.arg(),
+                stated(OP, logits.rows)?.arg(),
+                e.arg(),
+                k.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(
@@ -323,15 +348,20 @@ pub fn topk_sqrt_softplus(
     )
 }
 
-struct Selected {
-    route_count: u32,
+pub(crate) struct Selected {
+    pub(crate) route_count: u32,
 
-    top_k: i32,
+    pub(crate) top_k: i32,
 
-    by_token: bool,
+    pub(crate) by_token: bool,
 }
 
-fn selected(op: &'static str, x: Tensor, routes: Tensor, y: &Tensor) -> Result<Selected, Error> {
+pub(crate) fn selected(
+    op: &'static str,
+    x: Tensor,
+    routes: Tensor,
+    y: &Tensor,
+) -> Result<Selected, Error> {
     debug_assert_eq!(routes.dtype, Dtype::I32, "`{op}` walks i32 routes");
     let top_k = nonzero(op, "the routed fan-out", routes.width)?;
     let route_count = routes.rows.checked_mul(top_k).ok_or_else(|| {
@@ -407,11 +437,580 @@ pub fn matmul_select(
     #[cfg(feature = "cuda")]
     {
         let fan = selected(OP, x, routes, y)?;
+        if tc5_worth(ctx, x, bank.dtype, y, experts, routes.rows, fan.route_count) {
+            // A tcgen05 launch that fails falls back to the arm below, said
+            // once a process.
+            match select_tc5(
+                ctx,
+                OP,
+                x,
+                crate::linear::tc5::Operand::plain(bank.ptr, crate::linear::tc5::Elem::Bf16),
+                bank.rows,
+                routes,
+                y,
+                crate::linear::tc5::Epilogue::STORE,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(why) => tc5_fell_back(OP, &why),
+            }
+        }
         if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
             return select_grouped(ctx, OP, x, bank, routes, y, count);
         }
     }
     select_gemv(ctx, OP, x, bank, routes, y, experts)
+}
+
+/// Says, once a process, that a select the tcgen05 GEMM was to take fell
+/// back to the GEMV, and why: a silent fallback reads as a slow kernel.
+#[cfg(feature = "cuda")]
+fn tc5_fell_back(op: &'static str, why: &Error) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("kernels-cuda: `{op}` fell back from the tcgen05 grouped GEMM: {why}");
+    }
+}
+
+/// Whether a select of `x` (bf16) runs on the grouped tcgen05 GEMM: a
+/// resident bank on a device that has it, at widths its tiles take (a live
+/// window lays out only its routes), for a fire of `kernel.moe.tc5_from`
+/// tokens or more -- narrower ones keep the GEMV, whose one launch beats
+/// the layout's four (Qwen3.6-35B-A3B decode: 3.9 ms a token on the GEMV,
+/// 5.3 ms on the grouped GEMM, at one token, and even at eight).
+#[cfg(feature = "cuda")]
+pub(crate) fn tc5_worth(
+    ctx: &Ctx,
+    x: Tensor,
+    bank: Dtype,
+    y: &Tensor,
+    experts: ExpertTable,
+    tokens: u32,
+    routes: u32,
+) -> bool {
+    ctx.tuning().moe_tc5
+        && (tokens >= ctx.tuning().moe_tc5_from || routes > MAX_GRID_Y)
+        && x.dtype == Dtype::Bf16
+        && bank == Dtype::Bf16
+        && !experts.streams()
+        && x.width.is_multiple_of(64)
+        && y.width.is_multiple_of(64)
+        && crate::linear::tc5::supported()
+}
+
+/// `y[route] = x[route or its token] . W[routes[route]]^T` on one grouped
+/// tcgen05 GEMM: the routes laid out by expert on the device, the
+/// activations scattered into their experts' rows, and the product
+/// gathered back to route order. No route-count limit past the device's
+/// memory.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_tc5(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    w: crate::linear::tc5::Operand,
+    experts: u32,
+    routes: Tensor,
+    y: &mut Tensor,
+    epi: crate::linear::tc5::Epilogue,
+) -> Result<(), Error> {
+    use crate::linear::{act_quant, tc5};
+    const GROUPED_X: &str = "linear.moe_tc5_x";
+    const GROUPED_Y: &str = "linear.moe_tc5_y";
+    let fan = selected(op, x, routes, y)?;
+    let count = fan.route_count;
+    if count == 0 {
+        return Ok(());
+    }
+    let (n, k) = (y.width, x.width);
+    // The routers this select serves name an expert once a token.
+    let layout = act_quant::lay_out(ctx, op, routes, experts, tc5::GROUP_ALIGN, true)?;
+    let div = if fan.by_token { routes.width } else { 1 };
+    let xs = ctx.scratch_stream(op, GROUPED_X, layout.rows as usize * k as usize * 2)? as u64;
+    act_quant::scatter_rows(ctx, op, x, div, layout.pos, count, xs)?;
+    let ys = ctx.scratch_stream(op, GROUPED_Y, layout.rows as usize * n as usize * 2)? as u64;
+    tc5::grouped_gemm_epi(
+        ctx,
+        tc5::Operand::plain(xs, tc5::Elem::Bf16),
+        w,
+        ys,
+        tc5::Grouped {
+            experts,
+            groups: layout.groups,
+            alpha_e: 0,
+        },
+        [n, k],
+        1.0,
+        // An expert's padding rows land nowhere.
+        crate::linear::tc5::Epilogue {
+            live_rows: layout.live_rows(),
+            ..epi
+        },
+        count,
+    )?;
+    act_quant::gather_back(ctx, op, ys, layout.pos, routes.width, y)
+}
+
+/// A gate-up bank a fused select reads: bf16 `[experts][2 * inter * k]`,
+/// mxfp4 codes and row-major ue8m0 scales (with an optional bf16 bias a
+/// row), nvfp4 codes, e4m3 scales and an f32 tensor scale a row, or affine
+/// u4 codes and bf16 scales and zeros a group; each expert's gate rows,
+/// then its up rows.
+#[derive(Clone, Copy, Debug)]
+pub enum GluBank {
+    Bf16(Tensor),
+    Mxfp4 {
+        codes: Tensor,
+        scales: Tensor,
+        bias: Option<Tensor>,
+    },
+    Nvfp4 {
+        codes: Tensor,
+        scales: Tensor,
+        tensor_scales: Tensor,
+    },
+    Affine {
+        codes: Tensor,
+        scales: Tensor,
+        zeros: Tensor,
+    },
+    /// An NVFP4 bank against NVFP4 activations (W4A4): its scales laid in
+    /// atoms, a tensor scale a row, an input scale an expert (the global its
+    /// activations quantize under). Only [`experts`] takes it, both legs so.
+    Nvfp4A4 {
+        codes: Tensor,
+        atoms: Tensor,
+        tensor_scales: Tensor,
+        input_scales: Tensor,
+    },
+}
+
+/// The group of an affine 4-bit bank of bf16 factors that the tcgen05
+/// GEMM takes (32, 64 or 128 codes), from its planes' widths.
+#[cfg(feature = "cuda")]
+pub(crate) fn affine_u4_group(x: Tensor, codes: Tensor, scales: Tensor, n: u32) -> Option<u32> {
+    let (k, n) = (u64::from(x.width), u64::from(n));
+    if x.dtype != Dtype::Bf16 || u64::from(codes.width) * 2 != k * n || k % 64 != 0 {
+        return None;
+    }
+    let groups = u64::from(scales.width).checked_div(2 * n)?;
+    let group = k.checked_div(groups)?;
+    (groups * group == k && matches!(group, 32 | 64 | 128)).then_some(group as u32)
+}
+
+/// A bank's tcgen05 operand, its experts, its bias and weight-scale planes
+/// and the dtype `tc5_worth` reads, for a product `n` wide of `x`; `None`
+/// for an affine bank whose group the GEMM does not take.
+#[cfg(feature = "cuda")]
+#[allow(clippy::type_complexity)]
+fn bank_operand(
+    x: Tensor,
+    bank: GluBank,
+    n: u32,
+) -> Option<(crate::linear::tc5::Operand, u32, u64, u64, Dtype)> {
+    use crate::linear::tc5;
+    Some(match bank {
+        GluBank::Bf16(b) => (
+            tc5::Operand::plain(b.ptr, tc5::Elem::Bf16),
+            b.rows,
+            0,
+            0,
+            b.dtype,
+        ),
+        GluBank::Mxfp4 {
+            codes,
+            scales,
+            bias,
+        } => (
+            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, 32),
+            codes.rows,
+            bias.map_or(0, |b| b.ptr),
+            0,
+            Dtype::Bf16,
+        ),
+        GluBank::Nvfp4 {
+            codes,
+            scales,
+            tensor_scales,
+        } => (
+            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, 16),
+            codes.rows,
+            0,
+            tensor_scales.ptr,
+            Dtype::Bf16,
+        ),
+        GluBank::Affine {
+            codes,
+            scales,
+            zeros,
+        } => {
+            let group = affine_u4_group(x, codes, scales, n)?;
+            (
+                tc5::Operand::affine(codes.ptr, scales.ptr, zeros.ptr, group),
+                codes.rows,
+                0,
+                0,
+                Dtype::Bf16,
+            )
+        }
+        // Its activations quantize first: no bf16 operand reads it.
+        GluBank::Nvfp4A4 { .. } => return None,
+    })
+}
+
+/// `y[route] = glu(x[route or its token] . W[routes[route]]^T)`, the GLU
+/// in the grouped tcgen05 GEMM's epilogue: `y` is `[routes][inter]`, the
+/// bank's experts `2 * inter` rows each. `Ok(false)` when this fire does
+/// not take it (no tcgen05, a narrow fire, a streamed bank, widths it does
+/// not tile): the caller runs the select and the GLU apart.
+#[cfg(feature = "cuda")]
+pub fn select_glu(
+    ctx: &Ctx,
+    x: Tensor,
+    bank: GluBank,
+    routes: Tensor,
+    y: &mut Tensor,
+    glu: crate::linear::tc5::Glu,
+    experts: ExpertTable,
+) -> Result<bool, Error> {
+    use crate::linear::tc5;
+    const OP: &str = "linear.moe_select_glu";
+    let fan = selected(OP, x, routes, y)?;
+    // A narrow mxfp4 fire reads its bank faster on the register-dequant
+    // kernel, which lands the GLU too.
+    if let GluBank::Mxfp4 {
+        codes,
+        scales,
+        bias,
+    } = bank
+        && mxfp4_mma_spans(ctx, fan.route_count)
+        && !experts.streams()
+        && x.dtype == Dtype::Bf16
+        && x.width > 0
+        && x.width.is_multiple_of(32)
+    {
+        // A launch that fails leaves the select and the GLU to run apart.
+        return Ok(
+            select_mxfp4_mma(ctx, OP, x, codes, scales, bias, routes, y, &fan, Some(glu)).is_ok(),
+        );
+    }
+    let Some((w, rows, bias, weight_scale, dtype)) = bank_operand(x, bank, 2 * y.width) else {
+        return Ok(false);
+    };
+    if !tc5_worth(ctx, x, dtype, y, experts, routes.rows, fan.route_count) {
+        return Ok(false);
+    }
+    // A tcgen05 launch that fails leaves the select and the GLU to run apart.
+    Ok(select_tc5(
+        ctx,
+        OP,
+        x,
+        w,
+        rows,
+        routes,
+        y,
+        tc5::Epilogue {
+            glu: Some(glu),
+            bias,
+            weight_scale,
+            ..tc5::Epilogue::STORE
+        },
+    )
+    .is_ok())
+}
+
+/// A routed MLP on the grouped tcgen05 GEMM, its rows kept by expert from
+/// the gate-up select to the down select: `y[token]` is the sum over `j`
+/// of `weights[token][j]` times `down(glu(up(x[token])))` on expert
+/// `routes[token][j]`. The routes are laid out
+/// once, the activations scattered into their experts' rows once, the GLU
+/// lands from the gate-up GEMM's epilogue into the down GEMM's operand, and
+/// the weighted sum reads the down product where it lies. `Ok(false)` when
+/// a leg is not one the grouped GEMM takes: the caller runs the four apart.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn experts(
+    ctx: &Ctx,
+    x: Tensor,
+    up: GluBank,
+    glu: crate::linear::tc5::Glu,
+    down: GluBank,
+    routes: Tensor,
+    weights: Tensor,
+    inter: u32,
+    y: &mut Tensor,
+    up_experts: ExpertTable,
+    down_experts: ExpertTable,
+    gate: Option<(Tensor, Tensor)>,
+) -> Result<bool, Error> {
+    use crate::linear::{act_quant, tc5};
+    const OP: &str = "linear.moe_experts";
+    if let Some((shared, g)) = gate
+        && (shared.dtype != Dtype::Bf16
+            || g.dtype != Dtype::Bf16
+            || shared.rows != y.rows
+            || shared.width != y.width
+            || g.rows != y.rows
+            || g.width == 0)
+    {
+        return Ok(false);
+    }
+    const GROUPED_X: &str = "linear.moe_tc5_x";
+    const GROUPED_H: &str = "linear.moe_tc5_h";
+    const GROUPED_Y: &str = "linear.moe_tc5_y";
+    let count = routes.rows * routes.width;
+    if let (GluBank::Nvfp4A4 { .. }, GluBank::Nvfp4A4 { .. }) = (up, down) {
+        return experts_w4a4(ctx, x, up, glu, down, routes, weights, inter, y, gate);
+    }
+    let hidden = Tensor::new(0, count, inter, Dtype::Bf16);
+    let routed = Tensor::new(0, count, y.width, Dtype::Bf16);
+    // An mxfp4 fire the register-dequant kernel takes stays on it.
+    let mma = |bank: GluBank| matches!(bank, GluBank::Mxfp4 { .. }) && mxfp4_mma_spans(ctx, count);
+    if count == 0
+        || mma(up)
+        || mma(down)
+        || weights.dtype != Dtype::F32
+        || weights.rows != routes.rows
+        || weights.width != routes.width
+        || y.rows != routes.rows
+        || !y.width.is_multiple_of(8)
+    {
+        return Ok(false);
+    }
+    let (Some(u), Some(d)) = (
+        bank_operand(x, up, 2 * inter),
+        bank_operand(hidden, down, y.width),
+    ) else {
+        return Ok(false);
+    };
+    if !tc5_worth(ctx, x, u.4, &hidden, up_experts, routes.rows, count)
+        || !tc5_worth(ctx, hidden, d.4, &routed, down_experts, routes.rows, count)
+        || u.1 != d.1
+    {
+        return Ok(false);
+    }
+    let experts = u.1;
+    let mut run = || -> Result<(), Error> {
+        let layout = act_quant::lay_out(ctx, OP, routes, experts, tc5::GROUP_ALIGN, true)?;
+        let k = x.width;
+        let rows = layout.rows as usize;
+        let hs = ctx.scratch_stream(OP, GROUPED_H, rows * inter as usize * 2)? as u64;
+        let grouped = tc5::Grouped {
+            experts,
+            groups: layout.groups,
+            alpha_e: 0,
+        };
+        let up_epi = tc5::Epilogue {
+            glu: Some(glu),
+            bias: u.2,
+            weight_scale: u.3,
+            live_rows: layout.live_rows(),
+            ..tc5::Epilogue::STORE
+        };
+        let xs = ctx.scratch_stream(OP, GROUPED_X, rows * k as usize * 2)? as u64;
+        act_quant::scatter_rows(ctx, OP, x, routes.width, layout.pos, count, xs)?;
+        tc5::grouped_gemm_epi(
+            ctx,
+            tc5::Operand::plain(xs, tc5::Elem::Bf16),
+            u.0,
+            hs,
+            grouped,
+            [inter, k],
+            1.0,
+            up_epi,
+            count,
+        )?;
+        let ys = ctx.scratch_stream(OP, GROUPED_Y, rows * y.width as usize * 2)? as u64;
+        tc5::grouped_gemm_epi(
+            ctx,
+            tc5::Operand::plain(hs, tc5::Elem::Bf16),
+            d.0,
+            ys,
+            grouped,
+            [y.width, inter],
+            1.0,
+            tc5::Epilogue {
+                bias: d.2,
+                weight_scale: d.3,
+                live_rows: layout.live_rows(),
+                ..tc5::Epilogue::STORE
+            },
+            count,
+        )?;
+        act_quant::weighted_gather(ctx, OP, ys, layout.pos, weights, gate, y)
+    };
+    // A tcgen05 launch that fails leaves the four to run apart.
+    Ok(run().is_ok())
+}
+
+/// [`experts`] on two W4A4 banks: the routes laid out once (the gate-up
+/// leg's alpha with them), the activations quantized into their experts'
+/// rows under each expert's global, the gate-up GEMM's epilogue landing
+/// the GLU as the down GEMM's NVFP4 operand under the down leg's globals
+/// (rounded through bf16 first, as the GLU's row and the down select's
+/// quantizer would land it), and the weighted sum reading the down product
+/// where it lies. A fire under `kernel.moe.w4a4_fused_from` tokens runs the
+/// four apart (a decode's few rows an expert leave the GLU epilogue slower
+/// than the glue it saves), as does one narrow enough to lay its routes out
+/// masked.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn experts_w4a4(
+    ctx: &Ctx,
+    x: Tensor,
+    up: GluBank,
+    glu: crate::linear::tc5::Glu,
+    down: GluBank,
+    routes: Tensor,
+    weights: Tensor,
+    inter: u32,
+    y: &mut Tensor,
+    gate: Option<(Tensor, Tensor)>,
+) -> Result<bool, Error> {
+    use crate::linear::{act_quant, tc5};
+    const OP: &str = "linear.moe_experts";
+    const W4A4_X: &str = "linear.moe_tc5_x4";
+    const W4A4_XS: &str = "linear.moe_tc5_x4_atoms";
+    const W4A4_H: &str = "linear.moe_tc5_h4";
+    const W4A4_HS: &str = "linear.moe_tc5_h4_atoms";
+    const W4A4_Y: &str = "linear.moe_tc5_y";
+    const UP_ALPHA: &str = "linear.moe_tc5_up_alpha";
+    const DOWN_ALPHA: &str = "linear.moe_tc5_down_alpha";
+    let (
+        GluBank::Nvfp4A4 {
+            codes: up_codes,
+            atoms: up_atoms,
+            tensor_scales: up_ts,
+            input_scales: up_is,
+        },
+        GluBank::Nvfp4A4 {
+            codes: down_codes,
+            atoms: down_atoms,
+            tensor_scales: down_ts,
+            input_scales: down_is,
+        },
+    ) = (up, down)
+    else {
+        return Ok(false);
+    };
+    let tokens = routes.rows;
+    let count = tokens * routes.width;
+    let experts = up_codes.rows;
+    let (k, n) = (x.width, y.width);
+    // Only SwiGLU's epilogue lands what the four apart would.
+    if count <= act_quant::MASKED_FIRE
+        || tokens < ctx.tuning().moe_w4a4_fused_from
+        || !matches!(glu, tc5::Glu::Swiglu)
+        || !ctx.tuning().moe_tc5
+        || !tc5::supported()
+        || x.dtype != Dtype::Bf16
+        || x.rows != tokens
+        || down_codes.rows != experts
+        || up_is.rows * up_is.width < experts
+        || down_is.rows * down_is.width < experts
+        || !k.is_multiple_of(128)
+        || !inter.is_multiple_of(128)
+        || !n.is_multiple_of(64)
+        || weights.dtype != Dtype::F32
+        || weights.rows != tokens
+        || weights.width != routes.width
+        || y.rows != tokens
+        || !n.is_multiple_of(8)
+    {
+        return Ok(false);
+    }
+    let mut run = || -> Result<(), Error> {
+        let e = experts as usize;
+        let up_alpha = ctx.scratch_stream(OP, UP_ALPHA, e * 4)? as u64;
+        let down_alpha = ctx.scratch_stream(OP, DOWN_ALPHA, e * 4)? as u64;
+        let layout = act_quant::lay_out_with(
+            ctx,
+            OP,
+            routes,
+            experts,
+            act_quant::BLOCK_ROWS,
+            false,
+            Some((
+                act_quant::AlphaFrom {
+                    input_scales: up_is.ptr,
+                    tensor_scales: up_ts.ptr,
+                    rows: 2 * inter,
+                },
+                up_alpha,
+            )),
+        )?;
+        act_quant::expert_alpha(ctx, OP, down_is.ptr, down_ts.ptr, down_alpha, experts, n)?;
+        let rows = layout.rows as usize;
+        let xq = ctx.scratch_stream(OP, W4A4_X, rows * k as usize / 2)? as u64;
+        let x_atom_bytes = tc5::atom_bytes(rows, k as usize, 16);
+        let xs = ctx.scratch_stream(OP, W4A4_XS, x_atom_bytes)? as u64;
+        act_quant::quantize(
+            ctx,
+            OP,
+            act_quant::Format::Nvfp4,
+            act_quant::Source {
+                x,
+                rows: count,
+                div: routes.width,
+                routes: Some(routes),
+                input_scales: Some(up_is),
+                pos: layout.pos,
+                m_max: 0,
+            },
+            xq,
+            xs,
+            x_atom_bytes,
+        )?;
+        let hq = ctx.scratch_stream(OP, W4A4_H, rows * inter as usize / 2)? as u64;
+        let hs = ctx.scratch_stream(OP, W4A4_HS, tc5::atom_bytes(rows, inter as usize, 16))? as u64;
+        tc5::grouped_gemm_epi(
+            ctx,
+            tc5::Operand::scaled(xq, tc5::Elem::E2m1, xs, 16),
+            tc5::Operand::scaled(up_codes.ptr, tc5::Elem::E2m1, up_atoms.ptr, 16),
+            hq,
+            tc5::Grouped {
+                experts,
+                groups: layout.groups,
+                alpha_e: up_alpha,
+            },
+            [inter, k],
+            1.0,
+            tc5::Epilogue {
+                glu: Some(glu),
+                out: tc5::Out::Nvfp4 {
+                    data: hq,
+                    scales: hs,
+                    gscale: 1.0,
+                },
+                live_rows: layout.live_rows(),
+                input_scales: down_is.ptr,
+                ..tc5::Epilogue::STORE
+            },
+            count,
+        )?;
+        let ys = ctx.scratch_stream(OP, W4A4_Y, rows * n as usize * 2)? as u64;
+        tc5::grouped_gemm_epi(
+            ctx,
+            tc5::Operand::scaled(hq, tc5::Elem::E2m1, hs, 16),
+            tc5::Operand::scaled(down_codes.ptr, tc5::Elem::E2m1, down_atoms.ptr, 16),
+            ys,
+            tc5::Grouped {
+                experts,
+                groups: layout.groups,
+                alpha_e: down_alpha,
+            },
+            [n, inter],
+            1.0,
+            tc5::Epilogue {
+                live_rows: layout.live_rows(),
+                ..tc5::Epilogue::STORE
+            },
+            count,
+        )?;
+        act_quant::weighted_gather(ctx, OP, ys, layout.pos, weights, gate, y)
+    };
+    // A tcgen05 launch that fails leaves the four to run apart.
+    Ok(run().is_ok())
 }
 
 #[cfg(feature = "cuda")]
@@ -522,7 +1121,9 @@ fn select_grouped(
                     format!("{name} wants {bytes} bytes, past this host's usize"),
                 )
             })
-            .and_then(|bytes| ctx.scratch(op, name, bytes))
+            // One slab a stream: the layout lives within this op, so
+            // regions captured apart share it rather than holding one each.
+            .and_then(|bytes| ctx.scratch_stream(op, name, bytes))
             .map(|ptr| ptr as usize as u64)
     };
     let sorted = slab("linear.moe_group_sorted", u64::from(rows) * 4)?;
@@ -681,16 +1282,16 @@ pub(crate) fn select_gemv(
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(bank.dtype, x.dtype, "the bank rides the activation's dtype");
     let fan = selected(op, x, routes, y)?;
-    if fan.route_count > MAX_GRID_Y {
-        return Err(refuse(
-            op,
-            format!(
-                "the route run is {}, above the {MAX_GRID_Y} rows this GEMV puts on the \
-                 grid's y axis; the aligned batched leg is what a wider fire wants",
-                fan.route_count
-            ),
-        ));
+    if fan.route_count == 0 {
+        return Ok(());
     }
+    // A run past grid.y's 65535 rows continues on grid.z; every run within
+    // it launches as it did.
+    let (grid_y, grid_z) = if fan.route_count > MAX_GRID_Y {
+        (MAX_GRID_Y, fan.route_count.div_ceil(MAX_GRID_Y))
+    } else {
+        (fan.route_count, 1)
+    };
     if x.width == 0 || !x.width.is_multiple_of(VEC_WIDTH) {
         return Err(refuse(
             op,
@@ -703,16 +1304,15 @@ pub(crate) fn select_gemv(
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
     let form = if fan.by_token { "by_token" } else { "by_route" };
+    // Four weight rows a warp, their loads in flight together: Qwen3.6's
+    // layer at 8 decode tokens (gate-up K 2048, down K 512) 55 + 37 us at one
+    // row a warp, 40 + 21 at four (two 44 + 25, eight 45 + 24).
+    const ROWS: u32 = 4;
+    let entry = format!("::pie::linear::moe_matmul_select_gemv_{form}<{t}, {ROWS}>");
     ctx.fire(
         op,
-        Fire::at(
-            FILE,
-            symbol(&format!(
-                "::pie::linear::moe_matmul_select_gemv_{form}<{t}>"
-            )),
-        )
-        .apply(Launch::grid(
-            [y.width.div_ceil(GEMV_WARPS), fan.route_count, 1],
+        Fire::at(FILE, symbol(&entry)).apply(Launch::grid(
+            [y.width.div_ceil(GEMV_WARPS * ROWS), grid_y, grid_z],
             [WARP, GEMV_WARPS, 1],
         )),
         &[
@@ -726,7 +1326,271 @@ pub(crate) fn select_gemv(
             (i64::from(n) * i64::from(k)).arg(), // the bank's expert stride
             ArgValue::Ptr(experts.table),
             ArgValue::Ptr(experts.hits),
+            stated(op, fan.route_count)?.arg(),
             ctx.stage(),
+        ],
+    )
+}
+
+pub(crate) const EXPERT_CAP: u32 = 4096;
+pub(crate) const GROUPED_TILE_N: u32 = 128;
+pub(crate) const GROUPED_BLOCK: u32 = 256;
+const WMMA_ROUTES: u32 = 32;
+
+#[derive(Clone, Copy)]
+pub(crate) struct RouteOrder {
+    pub(crate) order: u64,
+    pub(crate) offsets: u64,
+    pub(crate) work: u64,
+    pub(crate) work_cap: u32,
+}
+
+pub(crate) fn route_order(
+    ctx: &Ctx,
+    op: &'static str,
+    routes: Tensor,
+    fan: &Selected,
+    experts: u32,
+) -> Result<RouteOrder, Error> {
+    route_order_sliced(ctx, op, routes, fan, experts, WMMA_ROUTES, false, Share::No)
+}
+
+/// Whether a route order is kept for, or taken from, the select beside it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Share {
+    No,
+    /// A GLU select's order, kept for the down select that follows it.
+    Keep,
+    /// The down select: the kept order of the same routes, if it is the last
+    /// one laid.
+    Take,
+}
+
+/// What a route order was laid for: the same routes tensor in the same
+/// window, stream, bank and slice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OrderKey {
+    stream: usize,
+    routes: u64,
+    rows: u32,
+    cols: u32,
+    stage: u64,
+    experts: u32,
+    slice: u32,
+    count: u32,
+}
+
+std::thread_local! {
+    /// The last route order laid on this thread, when a GLU select laid it
+    /// for its down select. Any other order laid clears it: they share the
+    /// scratch.
+    static KEPT_ORDER: core::cell::Cell<Option<(OrderKey, RouteOrder)>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// [`route_order`] with each work item `slice` routes of one expert; with
+/// `scan`, its walks over the experts run as block scans
+/// (`moe_route_order_scan`) instead of on one thread.
+#[allow(clippy::too_many_arguments)]
+fn route_order_sliced(
+    ctx: &Ctx,
+    op: &'static str,
+    routes: Tensor,
+    fan: &Selected,
+    experts: u32,
+    slice: u32,
+    scan: bool,
+    share: Share,
+) -> Result<RouteOrder, Error> {
+    const ORDER_BLOCK: u32 = 1024;
+    let key = OrderKey {
+        stream: ctx.stream().addr(),
+        routes: routes.ptr,
+        rows: routes.rows,
+        cols: routes.width,
+        stage: match ctx.stage() {
+            ArgValue::Ptr(p) => p,
+            _ => u64::MAX,
+        },
+        experts,
+        slice,
+        count: fan.route_count,
+    };
+    let kept = KEPT_ORDER.with(|k| k.take());
+    if share == Share::Take
+        && let Some((was, order)) = kept
+        && was == key
+    {
+        return Ok(order);
+    }
+    let offsets_at = (fan.route_count as usize).next_multiple_of(64);
+    let work_cap = fan.route_count.div_ceil(slice) + experts;
+    let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
+    let order = ctx.scratch(
+        op,
+        "moe_route_order",
+        (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
+    )? as usize as u64;
+    let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
+    let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
+    ctx.fire(
+        op,
+        if scan {
+            Fire::at(
+                "linear/moe_w4.cuh",
+                symbol("::pie::linear::moe_route_order_scan"),
+            )
+        } else {
+            Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
+        }
+        .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
+        &[
+            routes.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            stated(op, work_cap)?.arg(),
+            slice.arg(),
+            fan.top_k.arg(),
+            stated(op, fan.route_count)?.arg(),
+            stated(op, experts)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    let laid = RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    };
+    if share == Share::Keep {
+        KEPT_ORDER.with(|k| k.set(Some((key, laid))));
+    }
+    Ok(laid)
+}
+
+/// Whether a fire of `routes` routes is one the register-dequant MMA kernel
+/// takes: from `kernel.moe.mxfp4_mma_from` to `kernel.moe.mxfp4_mma_until`
+/// routes (until 0, never, but where a chip's profile says). Narrower fires
+/// keep the per-route GEMV, wider ones the grouped GEMMs.
+#[cfg(feature = "cuda")]
+fn mxfp4_mma_spans(ctx: &Ctx, routes: u32) -> bool {
+    let t = ctx.tuning();
+    t.mxfp4_mma_from <= routes && routes <= t.mxfp4_mma_until
+}
+
+/// Whether a routed mxfp4 select runs the register-dequant MMA kernel: bf16
+/// activations, resident experts, whole 32-code blocks, and a width
+/// [`mxfp4_mma_spans`] takes.
+#[cfg(feature = "cuda")]
+pub(crate) fn mxfp4_mma_worth(
+    ctx: &Ctx,
+    x: Tensor,
+    y: &Tensor,
+    seat: GroupSeat,
+    fan: &Selected,
+) -> bool {
+    mxfp4_mma_spans(ctx, fan.route_count)
+        && !seat.streams()
+        && x.dtype == Dtype::Bf16
+        && y.dtype == Dtype::Bf16
+        && x.width > 0
+        && x.width.is_multiple_of(32)
+}
+
+/// The routed mxfp4 select on mma.sync, each expert's rows dequantized in
+/// registers (`linear/moe_w4.cuh`); with `glu`, `y` is the GLU of the bank's
+/// gate rows and the up rows after them, half the bank's width.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn select_mxfp4_mma(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    bias: Option<Tensor>,
+    routes: Tensor,
+    y: &mut Tensor,
+    fan: &Selected,
+    glu: Option<crate::linear::tc5::Glu>,
+) -> Result<(), Error> {
+    use crate::linear::tc5::Glu;
+    const THREADS: u32 = 128;
+    let (code, limit, alpha) = match glu {
+        None => (0, 0.0f32, 1.0f32),
+        Some(Glu::Swiglu) => (1, 0.0, 1.0),
+        Some(Glu::SwigluClamp { limit }) => (2, limit, 1.0),
+        Some(Glu::SwigluClampAlpha { limit, alpha }) => (3, limit, alpha),
+        Some(Glu::GegluTanh) => (4, 0.0, 1.0),
+    };
+    // A CTA lands 128 rows, or 64 GLU columns (their gate and up rows).
+    let cols = if glu.is_some() { 64 } else { 128 };
+    let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
+    let experts = codes.rows.clamp(1, EXPERT_CAP);
+    // An expert's slice is 8, 16 or 32 routes: as few 8-route blocks as the
+    // average expert fills.
+    let per = fan.route_count.div_ceil(experts);
+    let nb: u32 = match per {
+        0..=4 => 1,
+        5..=12 => 2,
+        _ => 4,
+    };
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
+    let inter = stated(op, y.width)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
+        ctx,
+        op,
+        routes,
+        fan,
+        experts,
+        8 * nb,
+        true,
+        if glu.is_some() {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    // One chunk in flight a warp: its 93 registers seat five CTAs an SM, and
+    // the warps between them hide the loads better than a deeper ring in
+    // fewer warps (gpt-oss at 64 tokens, gate-up 308 -> 305 us, down 172 ->
+    // 164).
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/moe_w4.cuh",
+            symbol(&format!(
+                "::pie::linear::moe_select_mxfp4_mma<{nb}, 1, {code}>"
+            )),
+        )
+        .apply(Launch::grid(
+            [work_cap, y.width.div_ceil(cols), 1],
+            [THREADS, 1, 1],
+        )),
+        &[
+            x.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            codes.arg(),
+            scales.arg(),
+            bias.map_or(ArgValue::ABSENT, |bias| bias.arg()),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+            inter.arg(),
+            limit.arg(),
+            alpha.arg(),
         ],
     )
 }
@@ -757,6 +1621,45 @@ fn matmul_select_mxfp4(
         "the expert bias rides the activation's dtype"
     );
     let fan = selected(op, x, routes, y)?;
+    // A launch that fails falls back to the arms below.
+    #[cfg(feature = "cuda")]
+    if mxfp4_mma_worth(ctx, x, y, seat, &fan)
+        && select_mxfp4_mma(ctx, op, x, codes, scales, bias, routes, y, &fan, None).is_ok()
+    {
+        return Ok(());
+    }
+    #[cfg(feature = "cuda")]
+    if !seat.streams()
+        && tc5_worth(
+            ctx,
+            x,
+            Dtype::Bf16,
+            y,
+            ExpertTable::RESIDENT,
+            routes.rows,
+            fan.route_count,
+        )
+    {
+        use crate::linear::tc5;
+        // A tcgen05 launch that fails falls back to the arm below.
+        if select_tc5(
+            ctx,
+            op,
+            x,
+            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, MXFP4_BLOCK),
+            codes.rows,
+            routes,
+            y,
+            tc5::Epilogue {
+                bias: bias.map_or(0, |b| b.ptr),
+                ..tc5::Epilogue::STORE
+            },
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+    }
     if x.width == 0 || !x.width.is_multiple_of(MXFP4_BLOCK) {
         return Err(refuse(
             op,
@@ -771,47 +1674,18 @@ fn matmul_select_mxfp4(
     let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
 
-    const ROUTE_ORDER: &str = "moe_route_order";
-    const ORDER_BLOCK: u32 = 1024;
-    const EXPERT_CAP: u32 = 4096;
+    let experts = codes.rows.clamp(1, EXPERT_CAP);
     // The grouped kernels read an expert once per batch of its routes, the
     // by-route one once per route but at the card's streaming rate, so grouping
     // pays only once an expert serves more than `kernel.moe.mxfp4_grouped_reuse`
     // routes on average; routes over experts is a floor on that average.
-    const GROUPED_TILE_N: u32 = 128;
-    const GROUPED_BLOCK: u32 = 256;
-    const WMMA_ROUTES: u32 = 32;
-
-    let experts = codes.rows.clamp(1, EXPERT_CAP);
     if fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts && ctx.tuning().mxfp4_grouped {
-        let order_words = fan.route_count as usize;
-        let offsets_at = order_words.next_multiple_of(64);
-        let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
-        let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
-        let order = ctx.scratch(
-            op,
-            ROUTE_ORDER,
-            (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
-        )? as usize as u64;
-        let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
-        let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
-        ctx.fire(
-            op,
-            Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
-                .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
-            &[
-                routes.arg(),
-                ArgValue::Ptr(order),
-                ArgValue::Ptr(offsets),
-                ArgValue::Ptr(work),
-                stated(op, work_cap)?.arg(),
-                WMMA_ROUTES.arg(),
-                fan.top_k.arg(),
-                stated(op, fan.route_count)?.arg(),
-                stated(op, experts)?.arg(),
-                ctx.stage(),
-            ],
-        )?;
+        let RouteOrder {
+            order,
+            offsets,
+            work,
+            work_cap,
+        } = route_order(ctx, op, routes, &fan, experts)?;
         let wmma = x.dtype == Dtype::Bf16 && ctx.tuning().mxfp4_wmma;
         let entry = if wmma {
             "::pie::linear::moe_matmul_select_mxfp4_wmma".to_string()
@@ -943,6 +1817,37 @@ fn matmul_select_mlxu4(
         "a packed bank's planes bind as bytes"
     );
     let fan = selected(op, x, routes, y)?;
+    // A 4-bit bank of bf16 factors on the grouped tcgen05 GEMM.
+    #[cfg(feature = "cuda")]
+    if let Some(group) = affine_u4_group(x, codes, scales, y.width)
+        && !seat.streams()
+        && tc5_worth(
+            ctx,
+            x,
+            Dtype::Bf16,
+            y,
+            ExpertTable::RESIDENT,
+            routes.rows,
+            fan.route_count,
+        )
+    {
+        use crate::linear::tc5;
+        // A tcgen05 launch that fails falls back to the arm below.
+        if select_tc5(
+            ctx,
+            op,
+            x,
+            tc5::Operand::affine(codes.ptr, scales.ptr, biases.ptr, group),
+            codes.rows,
+            routes,
+            y,
+            tc5::Epilogue::STORE,
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+    }
     let k = stated(op, nonzero(op, "K, the bank's contracted width", x.width)?)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
     let elems = u64::from(x.width) * u64::from(y.width);
@@ -985,43 +1890,15 @@ fn matmul_select_mlxu4(
     let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
 
-    const ROUTE_ORDER: &str = "moe_route_order";
-    const ORDER_BLOCK: u32 = 1024;
-    const EXPERT_CAP: u32 = 4096;
-    const GROUPED_TILE_N: u32 = 128;
-    const GROUPED_BLOCK: u32 = 256;
-    const WMMA_ROUTES: u32 = 32;
     let experts = codes.rows.clamp(1, EXPERT_CAP);
-    let order_words = fan.route_count as usize;
-    let offsets_at = order_words.next_multiple_of(64);
-    let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
-    let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
-    let order = ctx.scratch(
-        op,
-        ROUTE_ORDER,
-        (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
-    )? as usize as u64;
-    let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
-    let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
-    ctx.fire(
-        op,
-        Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
-            .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
-        &[
-            routes.arg(),
-            ArgValue::Ptr(order),
-            ArgValue::Ptr(offsets),
-            ArgValue::Ptr(work),
-            stated(op, work_cap)?.arg(),
-            WMMA_ROUTES.arg(),
-            fan.top_k.arg(),
-            stated(op, fan.route_count)?.arg(),
-            stated(op, experts)?.arg(),
-            ctx.stage(),
-        ],
-    )?;
     let tuning = ctx.tuning();
     if tuning.affine_grouped && fan.route_count >= tuning.affine_grouped_from {
+        let RouteOrder {
+            order,
+            offsets,
+            work,
+            work_cap,
+        } = route_order(ctx, op, routes, &fan, experts)?;
         let wmma = x.dtype == Dtype::Bf16 && tuning.affine_wmma;
         let entry = if wmma {
             format!(
@@ -1078,7 +1955,6 @@ fn matmul_select_mlxu4(
         &[
             x.arg(),
             routes.arg(),
-            ArgValue::Ptr(order),
             codes.arg(),
             scales.arg(),
             biases.arg(),
@@ -1122,17 +1998,56 @@ pub fn weighted_sum(
         weights.rows == y.rows && weights.width == top_k,
         "the weight plane is one weight per route"
     );
+    // Eight columns a thread where the rows and both planes take whole
+    // 16-byte runs: the same sums, element for element.
+    let vec8 = y.width.is_multiple_of(8) && routed.ptr % 16 == 0 && y.ptr % 16 == 0;
+    let (entry, threads) = if vec8 {
+        ("moe_weighted_sum_vec8", y.width / 8)
+    } else {
+        ("moe_weighted_sum", y.width)
+    };
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!("::pie::linear::moe_weighted_sum<{t}>")),
-        )
-        .apply(elementwise_rows(OP, y.rows, y.width)?),
+        Fire::at(FILE, symbol(&format!("::pie::linear::{entry}<{t}>")))
+            .apply(elementwise_rows(OP, y.rows, threads)?),
         &[
             y.arg(),
             routed.arg(),
             weights.arg(),
+            stated(OP, top_k)?.arg(),
+            stated(OP, y.width)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// Each token's weighted routed rows summed in f32, plus its `shared` row,
+/// rounded once.
+pub fn sum_add(ctx: &Ctx, routed: Tensor, shared: Tensor, y: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "linear.moe_sum_add";
+    let t = dtype_dispatch!(OP, routed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    nonzero(OP, "the token rows this fold lands on", y.rows)?;
+    if !routed.rows.is_multiple_of(y.rows)
+        || (shared.rows, shared.width) != (y.rows, y.width)
+        || routed.width != y.width
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} x {} routed rows and {} x {} shared ones do not fold into {} x {}",
+                routed.rows, routed.width, shared.rows, shared.width, y.rows, y.width
+            ),
+        ));
+    }
+    let top_k = routed.rows / y.rows;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::linear::moe_sum_add<{t}>")))
+            .apply(elementwise_rows(OP, y.rows, y.width)?),
+        &[
+            y.arg(),
+            routed.arg(),
+            shared.arg(),
             stated(OP, top_k)?.arg(),
             stated(OP, y.width)?.arg(),
             ctx.stage(),

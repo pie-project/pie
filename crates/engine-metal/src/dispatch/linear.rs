@@ -286,9 +286,14 @@ impl Run<'_> {
             Linear::MlpGeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
-            Linear::RelBias { .. } | Linear::MoeTopkSigmoidSink { .. } => {
-                Err(kernels_metal::Error::Unsupported { op: op.name() })
-            }
+            // A product that quantizes its activations runs only on CUDA's
+            // tcgen05 GEMMs.
+            Linear::RelBias { .. }
+            | Linear::MoeTopkSigmoidSink { .. }
+            | Linear::MatmulActQuant { .. }
+            | Linear::MoeMatmulSelectActQuant { .. }
+            | Linear::MlpSwigluClampSplitRouted { .. }
+            | Linear::MoeSumAdd { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Linear::MlpGegluTanhPacked {
                 packed,
                 intermediate,

@@ -1,0 +1,43 @@
+# Tencent Hy4-preview, with its multi-token draft head or without, and its
+# six-layer, sixteen-expert miniature.
+
+HY = template("hy", thinking = True)
+TOKENIZER = tokenizer(
+    markers = [
+        ["<｜hy_end:opensource｜>"],
+        [
+            "<｜hy_start:opensource｜>",
+            "<｜hy_middle:opensource｜>",
+            "<｜reasoning_mode:opensource｜>",
+            "<think:opensource>",
+            "</think:opensource>",
+            "<tool_calls:opensource>",
+            "</tool_calls:opensource>",
+            "<tool_call:opensource>",
+            "</tool_call:opensource>",
+            "<arg_key:opensource>",
+            "</arg_key:opensource>",
+            "<arg_value:opensource>",
+            "</arg_value:opensource>",
+            "<tool_response:opensource>",
+            "</tool_response:opensource>",
+        ],
+    ],
+)
+
+MODELS = [
+    model("hy4-preview", template = HY, tokenizer = TOKENIZER, drafters = ["mtp"], arch = "hy_v4", layers = 78, vocab = 120832),
+    model("hy4-mini", mini = True, template = HY, tokenizer = TOKENIZER, arch = "hy_v4", layers = 6, vocab = 120832),
+]
+
+BF = dtype.bf16
+U4 = dtype.u4g64
+U2 = dtype.u2g64
+
+DEPLOYMENTS = [
+    deployment("hy4-preview", weights = [U4, U2], kv = BF),
+    deployment("hy4-preview", weights = [U4, U2, U4], kv = BF, drafter = "mtp"),
+    deployment("hy4-preview", weights = BF, kv = BF),
+    deployment("hy4-mini", weights = BF, kv = BF),
+    deployment("hy4-mini", weights = [U4, U4], kv = BF),
+]

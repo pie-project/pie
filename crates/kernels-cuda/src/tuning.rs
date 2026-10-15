@@ -20,6 +20,108 @@ pub struct MoeMxfp4Grouped;
 #[decision(id = "kernel.moe.mxfp4_wmma", flag, default = true, tune = search)]
 pub struct MoeMxfp4Wmma;
 
+/// Whether routed matmuls (bf16 banks, and 4-bit ones against bf16
+/// activations) run on the grouped tcgen05 GEMM where the device has it.
+/// Off but where a chip's profile turns it on (B200's): its plans assume
+/// B200's shared memory and SM count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.tc5", flag, default = false, tune = search)]
+pub struct MoeTc5;
+
+/// The fewest tokens a fire routes on the tcgen05 GEMM; narrower fires keep
+/// their GEMV or grouped kernel (unless their routes pass the GEMV's grid).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.tc5_from", constant(range(1..=65_536)), default = 16, tune = search)]
+pub struct MoeTc5From(pub u32);
+
+/// The most routes a routed mxfp4 select (bf16 activations) runs on the
+/// register-dequant MMA kernel with; 0 (never) but where a chip's profile
+/// says (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMxfp4MmaUntil(pub u32);
+
+/// Whether an NVFP4 x NVFP4 tcgen05 GEMM runs 128 K a stage (64-byte rows
+/// under the 64-byte swizzle) instead of 256: the ring holds twice the
+/// stages. Off but where a chip's profile turns it on (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.nvfp4_k128", flag, default = false, tune = search)]
+pub struct GemmNvfp4K128;
+
+/// Whether a softmax router of up to 512 experts and 16 picks ranks a row
+/// a warp (the same routes and weights to the bit) instead of a 64-thread
+/// block with a barrier a pick. Off but where a chip's profile turns it on
+/// (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.topk_warp", flag, default = false, tune = search)]
+pub struct MoeTopkWarp;
+
+/// What a K-splitting cuBLASLt algorithm's own reduce launch costs a
+/// captured step past its lone timing, in ns, charged to it (and to
+/// `cublasGemmEx`, which may split) when a dense bf16 product's tactic is
+/// timed; split algorithms reduced in place (one launch) join the timing.
+/// 0 (charge nothing) but where a chip's profile says (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.split_launch_ns", constant(range(0..=100_000)), default = 0, tune = search)]
+pub struct GemmSplitLaunchNs(pub u32);
+
+/// The fewest tokens a W4A4 routed MLP keeps its rows by expert from the
+/// gate-up select to the weighted sum with (its GLU landing the down leg's
+/// NVFP4 operand from the gate-up epilogue); never (65 536 past any fire)
+/// but where a chip's profile says (B200's). A decode's few rows an expert
+/// leave that epilogue the slower half, a prefill's glue the larger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.w4a4_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
+pub struct MoeW4a4FusedFrom(pub u32);
+
+/// Whether a dense projection's bias lands from the cuBLASLt epilogue of the
+/// algorithm its shape chose, instead of a separate add. Off but where a
+/// chip's profile turns it on (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.bias_epilogue", flag, default = false, tune = search)]
+pub struct GemmBiasEpilogue;
+
+/// The fewest routes a routed mxfp4 select runs on the register-dequant MMA
+/// kernel with (up to `kernel.moe.mxfp4_mma_until`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_mma_from", constant(range(1..=65_536)), default = 64, tune = search)]
+pub struct MoeMxfp4MmaFrom(pub u32);
+
+/// The fewest rows a dense gate-up projection lands its GLU from the
+/// tcgen05 GEMM's epilogue at; fewer keep the skinny kernel or the GEMM and
+/// the GLU apart. 65536 (never) but where a chip's profile says (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.tc5_glu_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
+pub struct GemmTc5GluFrom(pub u32);
+
+/// Whether a selected (sparse) attention runs on the tensor cores, a block a
+/// row and kv head, rather than the scalar walk. Off reads every key the
+/// scalar way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.selected_mma", flag, default = false, tune = search)]
+pub struct SdpaSelectedMma;
+
+/// Whether a compressed-pool attention (`attention.pool_lse`, and its
+/// selected form) runs on the tensor cores, a block a row's 16 heads, rather
+/// than the scalar walk a block a row and head. Off reads the pool the
+/// scalar way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.pool_mma", flag, default = false, tune = search)]
+pub struct SdpaPoolMma;
+
+/// Whether a pooled index (`attention.index_topk`) scores its blocks on the
+/// tensor cores rather than a thread a block. Off scores the scalar way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.index_mma", flag, default = false, tune = search)]
+pub struct SdpaIndexMma;
+
+/// The widest dense bf16 product (in columns) the GEMM tuner may also time
+/// on the narrow kernel (a block a row, every column's sum in registers);
+/// 0 never offers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.narrow_n", constant(range(0..=8)), default = 0, tune = search)]
+pub struct GemmNarrowN(pub u32);
+
 /// Whether a small decode batch still splits its keys across blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.decode.split_small", flag, default = false, tune = search)]
@@ -143,6 +245,96 @@ pub struct MoeAffineWmma;
 #[decision(id = "kernel.moe.affine_grouped_from", constant(range(1..=65_536)), default = 16, tune = search)]
 pub struct MoeAffineGroupedFrom(pub u32);
 
+/// Whether a 128-wide gated delta prefill runs the two-launch tensor-core
+/// scan (its scan block holds about 123 KiB of shared memory) rather than
+/// the three wmma launches; a card whose blocks cannot opt into that much
+/// keeps the three whatever this says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_fused_scan", flag, default = false, tune = search)]
+pub struct SsmGdnFusedScan;
+
+/// Whether a 128-wide gated delta prefill runs the one-launch tcgen05 walk
+/// (`attn/gdn_tc5.cuh`, sm_100a), the state in TMEM; off, the scan above
+/// serves it as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_tc5", flag, default = false, tune = search)]
+pub struct SsmGdnTc5;
+
+/// Whether the row kernels a prefill streams run their bandwidth-shaped
+/// forms: a 128- or 256-wide RMS norm a warp a row (per head or whole),
+/// and the q/gate cut and sigmoid gate 16 bytes a lane; off, the
+/// block-a-row and element-a-thread forms serve them as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.rows_vec", flag, default = false, tune = search)]
+pub struct ElemwiseRowsVec;
+
+/// Whether the chunked causal conv's 16-byte row-tiled form runs four
+/// channels a thread under a 64-register bound (the same sums in the same
+/// order); off, eight a thread as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.conv_vec4", flag, default = false, tune = search)]
+pub struct SsmConvVec4;
+
+/// Whether a prefill the tcgen05 FMHA (`attn/tc5_fmha.cuh`, sm_100a) can
+/// serve runs on it; off, FA2 serves every prefill, as before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.prefill.tc5", flag, default = false, tune = search)]
+pub struct PrefillTc5;
+
+/// Whether a sliding 256-wide prefill (Gemma-4's) on the tcgen05 FMHA runs
+/// the 128-key-tile kernel (`tc5_fmha_prefill_wide`) rather than the 64-key
+/// one; a 256-wide prefill without a window runs it either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.prefill.wide_sliding", flag, default = false, tune = search)]
+pub struct PrefillWideSliding;
+
+/// The fewest query heads to a KV head at which a single-token row reads
+/// the cache through the prefill kernel (tensor cores over the group's
+/// rows) instead of the decode kernel; 0 never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.grouped_prefill_from", constant(range(0..=64)), default = 0, tune = search)]
+pub struct DecodeGroupedPrefillFrom(pub u32);
+
+/// Whether a wide group's single-token rows that also land their
+/// log-sum-exp (gpt-oss's, for its sinks) take the prefill kernel too,
+/// where their plan has no sliding window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.grouped_prefill_lse", flag, default = false, tune = search)]
+pub struct DecodeGroupedPrefillLse;
+
+/// Whether a paged decode of a group of at most eight query heads reads its
+/// cache on tensor cores (`attn/xqa.cuh`, the group's rows one MMA tile)
+/// rather than the FA2 decode kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.xqa", flag, default = false, tune = search)]
+pub struct DecodeXqa;
+
+/// The fewest requests a 64-wide decode takes the tensor-core kernel at;
+/// narrower, the FA2 decode reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.xqa_from_64", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct DecodeXqaFrom64(pub u32);
+
+/// The widest sliding window (keys a query row sees) the tensor-core decode
+/// reads whole, a block a (request, kv head) landing its rows and sinks
+/// itself, with no split to fold; 0 splits every window as the plan sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.xqa_whole_window", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct DecodeXqaWholeWindow(pub u32);
+
+/// The most blocks a cluster splits an unwindowed tensor-core decode row's
+/// keys across, folding them through distributed shared memory in place of
+/// the plan's split and its fold launch; 0 leaves the split to the plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.xqa_cluster", constant(set(0, 1, 2, 4, 8)), default = 0, tune = search)]
+pub struct DecodeXqaCluster(pub u32);
+
+/// Whether a split attention's partial states fold a warp a (row, head)
+/// rather than through the staged persistent merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.merge_warp", flag, default = false, tune = search)]
+pub struct SdpaMergeWarp;
+
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
@@ -168,7 +360,34 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4GroupedReuse>()
         .add::<MoeAffineGrouped>()
         .add::<MoeAffineWmma>()
-        .add::<MoeAffineGroupedFrom>();
+        .add::<MoeAffineGroupedFrom>()
+        .add::<MoeTc5>()
+        .add::<MoeTc5From>()
+        .add::<GemmTc5GluFrom>()
+        .add::<SsmGdnFusedScan>()
+        .add::<SsmGdnTc5>()
+        .add::<ElemwiseRowsVec>()
+        .add::<SsmConvVec4>()
+        .add::<SdpaMergeWarp>()
+        .add::<MoeMxfp4MmaUntil>()
+        .add::<MoeMxfp4MmaFrom>()
+        .add::<GemmBiasEpilogue>()
+        .add::<GemmNvfp4K128>()
+        .add::<MoeW4a4FusedFrom>()
+        .add::<GemmSplitLaunchNs>()
+        .add::<MoeTopkWarp>()
+        .add::<PrefillTc5>()
+        .add::<PrefillWideSliding>()
+        .add::<DecodeGroupedPrefillFrom>()
+        .add::<DecodeGroupedPrefillLse>()
+        .add::<DecodeXqa>()
+        .add::<DecodeXqaFrom64>()
+        .add::<DecodeXqaWholeWindow>()
+        .add::<DecodeXqaCluster>()
+        .add::<SdpaSelectedMma>()
+        .add::<SdpaIndexMma>()
+        .add::<SdpaPoolMma>()
+        .add::<GemmNarrowN>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -200,6 +419,33 @@ pub struct Tuning {
     pub affine_grouped: bool,
     pub affine_wmma: bool,
     pub affine_grouped_from: u32,
+    pub moe_tc5: bool,
+    pub moe_tc5_from: u32,
+    pub gemm_tc5_glu_from: u32,
+    pub ssm_gdn_fused_scan: bool,
+    pub ssm_gdn_tc5: bool,
+    pub rows_vec: bool,
+    pub ssm_conv_vec4: bool,
+    pub merge_warp: bool,
+    pub mxfp4_mma_until: u32,
+    pub mxfp4_mma_from: u32,
+    pub gemm_bias_epilogue: bool,
+    pub gemm_nvfp4_k128: bool,
+    pub moe_w4a4_fused_from: u32,
+    pub gemm_split_launch_ns: u32,
+    pub moe_topk_warp: bool,
+    pub prefill_tc5: bool,
+    pub prefill_wide_sliding: bool,
+    pub decode_grouped_prefill_from: u32,
+    pub decode_grouped_prefill_lse: bool,
+    pub decode_xqa: bool,
+    pub decode_xqa_from_64: u32,
+    pub decode_xqa_whole_window: u32,
+    pub decode_xqa_cluster: u32,
+    pub selected_mma: bool,
+    pub index_mma: bool,
+    pub pool_mma: bool,
+    pub gemm_narrow_n: u32,
 }
 
 impl Tuning {
@@ -229,6 +475,33 @@ impl Tuning {
         affine_grouped: true,
         affine_wmma: true,
         affine_grouped_from: 16,
+        moe_tc5: false,
+        moe_tc5_from: 16,
+        gemm_tc5_glu_from: 65_536,
+        ssm_gdn_fused_scan: false,
+        ssm_gdn_tc5: false,
+        rows_vec: false,
+        ssm_conv_vec4: false,
+        merge_warp: false,
+        mxfp4_mma_until: 0,
+        mxfp4_mma_from: 64,
+        gemm_bias_epilogue: false,
+        gemm_nvfp4_k128: false,
+        moe_w4a4_fused_from: 65_536,
+        gemm_split_launch_ns: 0,
+        moe_topk_warp: false,
+        prefill_tc5: false,
+        prefill_wide_sliding: false,
+        decode_grouped_prefill_from: 0,
+        decode_grouped_prefill_lse: false,
+        decode_xqa: false,
+        decode_xqa_from_64: 0,
+        decode_xqa_whole_window: 0,
+        decode_xqa_cluster: 0,
+        selected_mma: false,
+        index_mma: false,
+        pool_mma: false,
+        gemm_narrow_n: 0,
     };
 
     #[must_use]
@@ -258,6 +531,33 @@ impl Tuning {
             affine_grouped: profile.on::<MoeAffineGrouped>(&Anywhere),
             affine_wmma: profile.on::<MoeAffineWmma>(&Anywhere),
             affine_grouped_from: profile.get::<MoeAffineGroupedFrom>().0,
+            moe_tc5: profile.on::<MoeTc5>(&Anywhere),
+            moe_tc5_from: profile.get::<MoeTc5From>().0,
+            gemm_tc5_glu_from: profile.get::<GemmTc5GluFrom>().0,
+            ssm_gdn_fused_scan: profile.on::<SsmGdnFusedScan>(&Anywhere),
+            ssm_gdn_tc5: profile.on::<SsmGdnTc5>(&Anywhere),
+            rows_vec: profile.on::<ElemwiseRowsVec>(&Anywhere),
+            ssm_conv_vec4: profile.on::<SsmConvVec4>(&Anywhere),
+            merge_warp: profile.on::<SdpaMergeWarp>(&Anywhere),
+            mxfp4_mma_until: profile.get::<MoeMxfp4MmaUntil>().0,
+            mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,
+            gemm_bias_epilogue: profile.on::<GemmBiasEpilogue>(&Anywhere),
+            gemm_nvfp4_k128: profile.on::<GemmNvfp4K128>(&Anywhere),
+            moe_w4a4_fused_from: profile.get::<MoeW4a4FusedFrom>().0,
+            gemm_split_launch_ns: profile.get::<GemmSplitLaunchNs>().0,
+            moe_topk_warp: profile.on::<MoeTopkWarp>(&Anywhere),
+            prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),
+            prefill_wide_sliding: profile.on::<PrefillWideSliding>(&Anywhere),
+            decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,
+            decode_grouped_prefill_lse: profile.on::<DecodeGroupedPrefillLse>(&Anywhere),
+            decode_xqa: profile.on::<DecodeXqa>(&Anywhere),
+            decode_xqa_from_64: profile.get::<DecodeXqaFrom64>().0,
+            decode_xqa_whole_window: profile.get::<DecodeXqaWholeWindow>().0,
+            decode_xqa_cluster: profile.get::<DecodeXqaCluster>().0,
+            selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),
+            index_mma: profile.on::<SdpaIndexMma>(&Anywhere),
+            pool_mma: profile.on::<SdpaPoolMma>(&Anywhere),
+            gemm_narrow_n: profile.get::<GemmNarrowN>().0,
         }
     }
 }

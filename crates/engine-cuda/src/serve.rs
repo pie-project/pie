@@ -90,6 +90,8 @@ pub struct Shell {
     scores: Option<crate::scores::Scores>,
     graphs: Graphs,
     copies: bool,
+    /// `engine.one_frame_when_short`.
+    one_frame_when_short: bool,
     pad: bool,
     bodies: bool,
     bodies_mem: usize,
@@ -113,6 +115,13 @@ impl Shell {
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
         self.pools.copy_slot(self.device.stream(), src, dst)?;
         self.device.synchronize()
+    }
+
+    /// Whether this load would post one frame a lane rather than seat fewer
+    /// lanes than it batches (`engine.one_frame_when_short`).
+    #[must_use]
+    pub fn one_frame_when_short(&self) -> bool {
+        self.one_frame_when_short
     }
 
     /// Host rs slots, one per device slot so every slot can be parked once.
@@ -152,7 +161,7 @@ impl Shell {
     /// Copies full pages and token cells in the full kv rows. A windowed
     /// row's pages are named by the fire that reads them, so cells moved
     /// between pages here would leave its copy behind.
-    pub fn copy_kv(&mut self, moves: &[crate::store::Move], cells: bool) -> Result<()> {
+    pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun], cells: bool) -> Result<()> {
         if cells && self.pools.has_windowed() {
             return Err(Fault::Unbound {
                 what: "a token-cell kv copy on a load with windowed kv rows, whose pages this \
@@ -343,6 +352,21 @@ impl Shell {
         self.reap_guests_at("shell.reap_guests")
     }
 
+    /// Settles the guest batch a step left owed once that step has landed:
+    /// its channels' cells reach their readers then, and not at the next
+    /// fire's enqueue, which a reader waiting on them may be what holds back.
+    pub fn reap_landed_guests(&mut self) -> Result<()> {
+        let Some(batch) = self.owed.as_ref() else {
+            return Ok(());
+        };
+        // The batch's own event is recorded behind its programs, so it says
+        // the batch has landed even before the step's settle is counted.
+        if self.airborne.settled_past(batch.seq) || self.guest_landed.done()? {
+            self.reap_guests_at("shell.reap_landed_guests")?;
+        }
+        Ok(())
+    }
+
     pub fn reap_guests_at(&mut self, site: &'static str) -> Result<()> {
         reap_guest_fires(
             &mut self.programs,
@@ -452,6 +476,13 @@ impl Shell {
     #[must_use]
     pub fn armed(&self) -> Option<&Armed> {
         self.armed.as_ref()
+    }
+
+    /// The decoded-weight tile each stream was warmed with, main stream
+    /// first: a plane past its stream's tile takes the fused-dequant arm.
+    #[must_use]
+    pub fn decoded_tiles(&self) -> &[u64] {
+        &self.decoded_tiles
     }
 }
 

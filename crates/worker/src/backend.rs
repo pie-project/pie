@@ -85,17 +85,6 @@ fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
     Ok(())
 }
 
-/// A fire's token budget unless `[engine] max_forward_tokens` states one. On
-/// ROCm, 10K: measured on MI300X against vLLM's 16K-token steps (GLM-5.3-Flash
-/// and Qwen3.8-Flash-Next minis, 2K x 8 and 1K x 64 prompts), 8K left the
-/// first prompts' decodes waiting out a second prefill fire (TPOT), and 12K
-/// to 16K fires made the prompts queued behind them wait (GLM 1K x 64 TTFT
-/// 665 ms at 10K, 916 at 12K, 984 at 16K).
-#[cfg(feature = "rocm")]
-const DEFAULT_FORWARD_TOKENS: u32 = 10240;
-#[cfg(not(feature = "rocm"))]
-const DEFAULT_FORWARD_TOKENS: u32 = 8192;
-
 #[cfg(any(feature = "cuda", feature = "rocm", test))]
 fn cuda_budgets(
     opts: &CudaNativeEngineOptions,
@@ -111,12 +100,16 @@ fn cuda_budgets(
         .max(page_size);
     engine::Budgets {
         max_lanes: opts.max_forward_requests.unwrap_or(256).max(1),
-        max_tokens: opts.max_forward_tokens.unwrap_or(DEFAULT_FORWARD_TOKENS).max(1),
+        // Unstated, 0: the engine takes its chip's `engine.forward_tokens`,
+        // 8192 where the profile says nothing.
+        max_tokens: opts.max_forward_tokens.map_or(0, |tokens| tokens.max(1)),
         buckets: Vec::new(),
         max_adapters: adapter_seats,
         page_size,
         max_context,
-        slots: opts.max_state_slots.unwrap_or(256).max(1),
+        // Unstated, 0: the engine sizes the slab from its chip's profile
+        // (`engine.state_slots_per_lane`), 256 where the profile says nothing.
+        slots: opts.max_state_slots.map_or(0, |slots| slots.max(1)),
         max_patches: patch_ceilings.0,
         max_images: patch_ceilings.1,
         max_voxels: voxel_ceilings.0,
@@ -659,7 +652,10 @@ mod tests {
         let budgets = cuda_budgets(&opts, 0, (None, None), (None, None));
         assert_eq!(budgets.page_size, 16);
         assert_eq!(budgets.max_context, 4096);
-        assert_eq!(budgets.slots, 256);
+        assert_eq!(
+            budgets.slots, 0,
+            "unstated, the engine's chip sizes the slab"
+        );
 
         opts.max_state_slots = Some(4);
         assert_eq!(cuda_budgets(&opts, 0, (None, None), (None, None)).slots, 4);

@@ -241,6 +241,7 @@ pub enum Elementwise {
         gate_eps: f32,
         alpha: f32,
         sinkhorn: u32,
+        comb: bool,
         x: ValueId,
         post_mix: ValueId,
         comb_mix: ValueId,

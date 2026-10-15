@@ -7,7 +7,6 @@ mod a_copied_window_is_one_encode_over_the_same_rows;
 mod a_drafting_neighbour_leaves_a_plain_lane_alone;
 mod a_family_is_read_against_its_reference;
 mod a_fenced_frame_lands_both_sides;
-mod a_forked_page_is_one_run_and_not_one_move_per_token;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
 mod each_checked_in_profile_runs_its_familys_old_tuning;
@@ -40,6 +39,7 @@ mod the_ragged_attention_answers_its_host_reference;
 mod the_rotated_packed_kv_serves;
 mod the_selector_reads_out_the_reference_walk;
 mod the_split_mlp_matches_the_gpu_alone;
+mod the_staged_rows_match_affine_dots;
 mod the_tower_reads_pixels_as_the_host_cut_them;
 mod the_voxel_axis_answers_its_host_reference;
 

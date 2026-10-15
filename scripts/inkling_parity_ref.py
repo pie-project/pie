@@ -20,6 +20,10 @@ The logits are the model's readout as `InklingForCausalLM` states it: the
 hidden state over `logits_mup_width_multiplier`, the head, then the row cut to
 `unpadded_vocab_size` (200 058 of the 201 024 the head stores). Inkling writes
 no `<|begin_of_text|>` at the head of a conversation, so none is prepended.
+
+The text model is driven directly: `InklingModel.forward` norms the embedding
+with `embed_norm` and hands it to the text model, which norms it again, so the
+multimodal wrapper reads a twice-normed embedding no checkpoint was trained on.
 """
 
 import argparse
@@ -29,7 +33,7 @@ import time
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, InklingForConditionalGeneration
+from transformers import AutoConfig, AutoTokenizer, InklingForConditionalGeneration
 
 PROMPTS = [
     ("capital", "The capital of France is"),
@@ -54,10 +58,18 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.snapshot)
+    # A checkpoint states its routed experts' width as `intermediate_size`
+    # beside `dense_intermediate_size`; `InklingConfig` takes the dense one
+    # and leaves `moe_intermediate_size` at Inkling's 3072, which is not
+    # Inkling-Small's 2048.
+    config = AutoConfig.from_pretrained(args.snapshot)
+    stated = json.load(open(os.path.join(args.snapshot, "config.json")))["text_config"]
+    if "dense_intermediate_size" in stated:
+        config.text_config.moe_intermediate_size = stated["intermediate_size"]
     model = InklingForConditionalGeneration.from_pretrained(
-        args.snapshot, dtype=torch.bfloat16, device_map=args.device
+        args.snapshot, config=config, dtype=torch.bfloat16
     )
-    model.eval()
+    model.to(args.device).eval()
 
     if args.probes:
         probes = json.load(open(args.probes))["probes"]
@@ -68,26 +80,29 @@ def main():
             probes.append({"name": name, "ids": ids})
         json.dump({"probes": probes}, open(os.path.join(args.out, "probes.json"), "w"), indent=1)
 
+    text = model.model.language_model
+    stated = config.text_config
+
+    def read(input_ids, past):
+        out = text(input_ids=input_ids, past_key_values=past, use_cache=True)
+        logits = model.lm_head(out.last_hidden_state / stated.logits_mup_width_multiplier)
+        if stated.unpadded_vocab_size is not None:
+            logits = logits[..., : stated.unpadded_vocab_size]
+        return logits[0].float().cpu().numpy(), out.past_key_values
+
     for probe in probes:
         name, ids = probe["name"], probe["ids"]
         started = time.time()
         input_ids = torch.tensor([ids], device=args.device)
         with torch.no_grad():
-            out = model(input_ids=input_ids, use_cache=True)
-            tf = out.logits[0].float().cpu().numpy()
-            past = out.past_key_values
+            tf, past = read(input_ids, None)
             gen_rows = [tf[-1].copy()]
             produced = []
             last = int(tf[-1].argmax())
             for _ in range(args.steps):
                 produced.append(last)
-                step = model(
-                    input_ids=torch.tensor([[last]], device=args.device),
-                    past_key_values=past,
-                    use_cache=True,
-                )
-                past = step.past_key_values
-                row = step.logits[0, -1].float().cpu().numpy()
+                step, past = read(torch.tensor([[last]], device=args.device), past)
+                row = step[-1]
                 gen_rows.append(row)
                 last = int(row.argmax())
         vocab = tf.shape[-1]

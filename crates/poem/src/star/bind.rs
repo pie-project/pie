@@ -25,8 +25,8 @@ pub(crate) mod spelled {
     pub(crate) use crate::ops::elemwise::Yarn;
     pub(crate) use crate::ops::spatial::Conv;
     pub(crate) use crate::{
-        Dtype, GateActivation, Input, ModulateForm, MropeForm, PixelOrder, RaggedMask, RopeForm,
-        TapKind, Value, ValueId, VoxelSegment, Weight,
+        Dtype, GateActivation, IndexScore, Input, ModulateForm, MropeForm, PixelOrder, RaggedMask,
+        RopeForm, TapKind, Value, ValueId, VoxelSegment, Weight,
     };
 }
 
@@ -257,6 +257,17 @@ impl<'v> Arg<'v> for GateActivation {
     fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
         use GateActivation::*;
         spelled(v, "an activation", &[("silu", Silu), ("sigmoid", Sigmoid)])
+    }
+}
+
+impl<'v> Arg<'v> for IndexScore {
+    fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
+        use IndexScore::*;
+        spelled(
+            v,
+            "an index score",
+            &[("pooled", Pooled), ("block_max", BlockMax)],
+        )
     }
 }
 

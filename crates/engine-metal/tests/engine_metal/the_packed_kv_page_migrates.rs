@@ -15,11 +15,12 @@
 //!
 //! We run it at head_dim 256 AND 128 — the two blocks the packed codec ships.
 
+use engine::transfer::KvRun;
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use engine_metal::run::CachePool;
 use engine_metal::store::kv::{Facts, Paging, SpaceFacts};
-use engine_metal::store::{Move, Pools, Seats, SpaceSeat};
+use engine_metal::store::{Pools, Seats, SpaceSeat};
 use kernels_metal::Tensor;
 use poem_ir::{CacheRow, Dtype, Platform, Trace};
 
@@ -217,7 +218,7 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
     let table = pools
         .table(&rig.handles, &seats, false)
         .expect("bind plane handles");
-    let CachePool::Kv(pool_planes) = table.0[0] else {
+    let CachePool::Kv(pool_planes) = table.pools[0] else {
         panic!("the one cache row is a KV pool");
     };
 
@@ -267,7 +268,7 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
     );
 
     // Migrate the whole physical page 0 -> page 1, both planes, via the store.
-    let moves = [Move {
+    let moves = [KvRun {
         src_page: 0,
         src_token: 0,
         dst_page: 1,

@@ -11,10 +11,17 @@ impl DispatchFused for Run<'_> {
             Fused::GdnStep { .. } | Fused::QGateNormRopeAppend { .. } => {
                 Err(kernels_cuda::Error::Unsupported { op: op.name() })
             }
+            Fused::RopeYarnAppend { .. } => self.rope_yarn_append(op),
+            Fused::SplitRopeYarnAppend { .. } => self.split_rope_yarn_append(op),
+            Fused::LseSink { .. } => self.lse_sink(op),
             Fused::MatmulGeglu { .. }
+            | Fused::MatmulSwiglu { .. }
             | Fused::MlpSwiglu { .. }
             | Fused::LmHeadSoftcap { .. }
-            | Fused::MatmulBias { .. } => self.fused_linear(op),
+            | Fused::MatmulBias { .. }
+            | Fused::MatmulSplitRows { .. }
+            | Fused::MoeSelectGlu { .. }
+            | Fused::MoeExperts { .. } => self.fused_linear(op),
             Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::EmbedScaleAdd { .. }
@@ -37,6 +44,234 @@ impl DispatchFused for Run<'_> {
 }
 
 impl Run<'_> {
+    /// A log-sum-exp attention with its sinks: landed in the split's fold
+    /// where the profile's warp fold takes them, else by the sink kernel
+    /// after, as the pair ran.
+    fn lse_sink(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::LseSink {
+            attn, sink, o_out, ..
+        } = op
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let sinks = self.tensor(*sink);
+        match **attn {
+            poem_ir::Attention::DecodeLse {
+                q,
+                plan,
+                cache,
+                window,
+                head_dim,
+                sm_scale,
+                o: _,
+                lse,
+            } => kernels_cuda::attn::decode_lse_sink(
+                self.ctx(),
+                self.ragged_q(q),
+                self.decode_plan(plan),
+                &self.pool_absolute(cache),
+                window,
+                head_dim,
+                sm_scale,
+                &mut self.tensor(*o_out),
+                &mut self.tensor(lse),
+                sinks,
+            ),
+            poem_ir::Attention::PrefillLse {
+                q,
+                plan,
+                cache,
+                window,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                o: _,
+                lse,
+            } => {
+                kernels_cuda::attn::prefill_lse_sink(
+                    self.ctx(),
+                    self.ragged_q(q),
+                    self.prefill_plan(plan),
+                    &self.pool_absolute(cache),
+                    window,
+                    head_dim,
+                    kv_heads,
+                    sm_scale,
+                    &mut self.tensor(*o_out),
+                    &mut self.tensor(lse),
+                    sinks,
+                )?;
+                self.capture_scores(q, plan, cache, window, head_dim, kv_heads, sm_scale, lse)
+            }
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
+    /// The packed row's q, k and v rotated and written in one launch where
+    /// the pool is the plain bf16 one; else split, then YaRN and the write as
+    /// `rope_yarn_append` runs them.
+    fn split_rope_yarn_append(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        use kernels_cuda::elemwise::rope;
+        let Fused::SplitRopeYarnAppend {
+            packed,
+            q_width,
+            kv_width,
+            positions,
+            head_dim,
+            theta,
+            factor,
+            beta_fast,
+            beta_slow,
+            attention_factor,
+            original_max_position,
+            interleaved,
+            cache,
+            write_page,
+            write_offset,
+            q_out,
+            k_out,
+            v_out,
+        } = op
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let pool = self.pool(*cache);
+        let (mut qt, mut kt, mut vt) = (
+            self.tensor(*q_out),
+            self.tensor(*k_out),
+            self.tensor(*v_out),
+        );
+        let append = rope::YarnAppend {
+            v: vt,
+            pool: &pool,
+            write_page: self.tensor(*write_page),
+            write_offset: self.tensor(*write_offset),
+        };
+        if append.fits() {
+            return rope::yarn_split_append(
+                self.ctx(),
+                self.tensor(*packed),
+                *kv_width,
+                &mut qt,
+                self.tensor(*positions),
+                *head_dim,
+                *theta,
+                *factor,
+                *beta_fast,
+                *beta_slow,
+                *attention_factor,
+                *original_max_position,
+                *interleaved,
+                append,
+            );
+        }
+        kernels_cuda::layout::split_qkv(
+            self.ctx(),
+            self.tensor(*packed),
+            *q_width,
+            *kv_width,
+            &mut qt,
+            &mut kt,
+            &mut vt,
+        )?;
+        rope::yarn(
+            self.ctx(),
+            &mut qt,
+            &mut kt,
+            self.tensor(*positions),
+            *head_dim,
+            *theta,
+            *factor,
+            *beta_fast,
+            *beta_slow,
+            *attention_factor,
+            *original_max_position,
+            *interleaved,
+        )?;
+        kernels_cuda::attn::kv_append(
+            self.ctx(),
+            self.ragged_lanes(*k_out),
+            vt,
+            &pool,
+            self.tensor(*write_page),
+            self.tensor(*write_offset),
+        )
+    }
+
+    /// YaRN and the cache write in one launch where the pool is the plain
+    /// bf16 one `kv_append` writes directly; else the two as they were.
+    fn rope_yarn_append(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        use kernels_cuda::elemwise::rope;
+        let Fused::RopeYarnAppend {
+            q,
+            k,
+            v,
+            positions,
+            head_dim,
+            theta,
+            factor,
+            beta_fast,
+            beta_slow,
+            attention_factor,
+            original_max_position,
+            interleaved,
+            cache,
+            write_page,
+            write_offset,
+            ..
+        } = op
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let pool = self.pool(*cache);
+        let append = rope::YarnAppend {
+            v: self.tensor(*v),
+            pool: &pool,
+            write_page: self.tensor(*write_page),
+            write_offset: self.tensor(*write_offset),
+        };
+        let (mut qt, mut kt) = (self.tensor(*q), self.tensor(*k));
+        if append.fits() {
+            return rope::yarn_append(
+                self.ctx(),
+                &mut qt,
+                &mut kt,
+                self.tensor(*positions),
+                *head_dim,
+                *theta,
+                *factor,
+                *beta_fast,
+                *beta_slow,
+                *attention_factor,
+                *original_max_position,
+                *interleaved,
+                append,
+            );
+        }
+        rope::yarn(
+            self.ctx(),
+            &mut qt,
+            &mut kt,
+            self.tensor(*positions),
+            *head_dim,
+            *theta,
+            *factor,
+            *beta_fast,
+            *beta_slow,
+            *attention_factor,
+            *original_max_position,
+            *interleaved,
+        )?;
+        kernels_cuda::attn::kv_append(
+            self.ctx(),
+            self.ragged_lanes(*k),
+            self.tensor(*v),
+            &pool,
+            self.tensor(*write_page),
+            self.tensor(*write_offset),
+        )
+    }
+
     fn custom_cuda(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         match op {
             Fused::QkvFusedQknormRopeVnormWrite {

@@ -92,7 +92,7 @@ impl Drop for Scratch {
 pub fn reads(dir: &Path, id: &str, w: poem::Dtype, kvs: &[(&str, Kv)]) -> Vec<String> {
     let package = poem_compiler::catalog::package_of(id).expect("a package holds the model");
     let deploy = poem::star::Deploy {
-        weights: vec![w],
+        weights: vec![w.into()],
         kv: poem::Dtype::Bf16,
         tp: 1,
         parts: Vec::new(),

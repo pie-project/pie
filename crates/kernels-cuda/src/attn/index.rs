@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::kv;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const FILE: &str = "attn/index.cuh";
@@ -228,18 +228,41 @@ pub fn topk(
         .checked_mul(keys.page_size)
         .filter(|bound| *bound > 0)
         .ok_or_else(|| refuse(OP, "the page budget this fire's pool row states is zero"))?;
-    let scores = ctx.scratch(
+    // A row scores at most one block a `ratio` positions it sees: the
+    // scores scratch is a ratio's share of the positions, not all of them
+    // (DeepSeek-V4-Flash at ratio 4: 5.4 GB of an 8192-row fire's memory).
+    let ratio = count(OP, "the pooling ratio this ranking states", ratio.max(1))?;
+    let score_stride = ((max_kv + ratio - 1) / ratio).max(1);
+    let scores = ctx.scratch_shared(
         OP,
         "attn.index_topk_scores",
         (selection.rows as usize)
-            .saturating_mul(max_kv as usize)
+            .saturating_mul(score_stride as usize)
             .saturating_mul(core::mem::size_of::<f32>()),
     )?;
 
+    // The tensor-core scorer where the profile asks for it and the heads fit
+    // one mma's rows at its key width.
+    // (one to four tiles of 16 heads: DeepSeek-V4's indexer is 64 wide).
+    let (entry, smem) = match heads {
+        h if ctx.tuning().index_mma && head_dim == 128 && h <= 64 => {
+            let tiles: u32 = match h.unsigned_abs().div_ceil(16) {
+                1 => 1,
+                2 => 2,
+                _ => 4,
+            };
+            (
+                format!("::pie::attn::index_topk_paged_mma<::pie::bf16, {tiles}>"),
+                // The query, 16 rows a tile, and each warp's 16 keys, at 128 + 8
+                // bf16 a row.
+                (16 * tiles + (K_BLOCK / 32) * 16) * (128 + 8) * 2,
+            )
+        }
+        _ => ("::pie::attn::index_topk_paged<::pie::bf16>".to_string(), 0),
+    };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_topk_paged<::pie::bf16>")
-            .apply(Launch::per_row(selection.rows, K_BLOCK)),
+        Fire::at(FILE, symbol(&entry)).apply(Launch::per_row(selection.rows, K_BLOCK).smem(smem)),
         &[
             q.data.arg(),
             ArgValue::Ptr(weights.map_or(0, |w| w.ptr)),
@@ -254,9 +277,117 @@ pub fn topk(
             heads.arg(),
             head_dim.arg(),
             keys.page_size.arg(),
-            max_kv.arg(),
+            score_stride.arg(),
             top_k.arg(),
-            count(OP, "the pooling ratio this ranking states", ratio.max(1))?.arg(),
+            ratio.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+const MAX_BLOCK_MAX_HEADS: i32 = 8;
+
+const MAX_BLOCK_MAX_PER: i32 = 8;
+
+/// `attention.index_topk` scored block by block: each head ranks the blocks
+/// a row sees by their best key, keeps the row's own, and writes its run of
+/// `top_k` ascending into `selection`, `heads * top_k` wide.
+#[allow(clippy::too_many_arguments)]
+pub fn topk_block_max(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    keys: &KvPool,
+    heads: u32,
+    head_dim: u32,
+    top_k: u32,
+    block: u32,
+    selection: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.index_topk";
+    dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
+    debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 block ids");
+    let heads = count(OP, "the head count this ranking states", heads)?;
+    let head_dim = count(OP, "the key width this ranking states", head_dim)?;
+    let top_k = count(OP, "the selection budget this ranking states", top_k)?;
+    let block = count(OP, "the block width this ranking scores", block)?;
+    if heads <= 0 || heads > MAX_BLOCK_MAX_HEADS {
+        return Err(refuse(
+            OP,
+            format!(
+                "a block-max ranking holds at most {MAX_BLOCK_MAX_HEADS} heads' queries, not {heads}"
+            ),
+        ));
+    }
+    if head_dim % 32 != 0 || head_dim / 32 > MAX_BLOCK_MAX_PER {
+        return Err(refuse(
+            OP,
+            format!(
+                "the key width {head_dim} is not one a block-max ranking lane-splits \
+                 (a multiple of 32, at most 256)"
+            ),
+        ));
+    }
+    if top_k <= 0 || block <= 0 {
+        return Err(refuse(
+            OP,
+            "a block-max ranking keeps at least one block of at least one key",
+        ));
+    }
+
+    pool_pitch(OP, keys, head_dim)?;
+    let q_width = stated(OP, q.data.width)?;
+    if q_width != heads.saturating_mul(head_dim) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the {q_width}-wide index query does not divide by the stated head count \
+                 and width"
+            ),
+        ));
+    }
+    if stated(OP, selection.width)? != heads.saturating_mul(top_k) {
+        return Err(refuse(
+            OP,
+            "the selection this statement allocated is not one budget per head",
+        ));
+    }
+    let num_requests = kv::lanes_of(OP, q.indptr)?;
+
+    let max_kv = keys
+        .max_pages_per_request
+        .checked_mul(keys.page_size)
+        .filter(|bound| *bound > 0)
+        .ok_or_else(|| refuse(OP, "the page budget this fire's pool row states is zero"))?;
+    let max_blocks = (max_kv - 1) / block + 1;
+    let scores = ctx.scratch(
+        OP,
+        "attn.index_topk_block_scores",
+        (selection.rows as usize)
+            .saturating_mul(heads as usize)
+            .saturating_mul(max_blocks as usize)
+            .saturating_mul(core::mem::size_of::<f32>()),
+    )?;
+
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::index_topk_block_max<::pie::bf16>")
+            .apply(Launch::per_row(selection.rows, K_BLOCK)),
+        &[
+            q.data.arg(),
+            keys.keys.arg(),
+            q.indptr.arg(),
+            keys.page_indices.arg(),
+            keys.page_indptr.arg(),
+            keys.last_page_lens.arg(),
+            ArgValue::Ptr(scores as usize as u64),
+            selection.arg(),
+            num_requests.arg(),
+            heads.arg(),
+            head_dim.arg(),
+            keys.page_size.arg(),
+            max_blocks.arg(),
+            top_k.arg(),
+            block.arg(),
             ctx.stage(),
         ],
     )

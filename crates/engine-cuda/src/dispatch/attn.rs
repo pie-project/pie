@@ -1,7 +1,7 @@
 use kernels_cuda::attn::{self, fa2, index, mla, plan, pool, selected};
 use kernels_cuda::attn_dense;
 use poem_exec::{DispatchAttention, KernelError};
-use poem_ir::{Attention, StructKind};
+use poem_ir::{Attention, IndexScore, StructKind};
 
 use crate::run::{Run, StructSlot};
 use kernels_cuda::RaggedTensor;
@@ -15,7 +15,7 @@ impl DispatchAttention for Run<'_> {
 
 impl Run<'_> {
     #[allow(clippy::too_many_arguments)]
-    fn capture_scores(
+    pub(super) fn capture_scores(
         &mut self,
         q: poem_ir::ValueId,
         plan: poem_ir::ValueId,
@@ -201,6 +201,7 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 ratio,
+                per_head,
                 o,
             } => selected::attention_decode_selected(
                 self.ctx(),
@@ -211,6 +212,7 @@ impl Run<'_> {
                 *head_dim,
                 *sm_scale,
                 *ratio,
+                *per_head,
                 &mut self.tensor(*o),
             ),
             Attention::PrefillSelected {
@@ -223,6 +225,7 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 ratio,
+                per_head,
                 o,
             } => selected::attention_prefill_selected(
                 self.ctx(),
@@ -234,6 +237,7 @@ impl Run<'_> {
                 *kv_heads,
                 *sm_scale,
                 *ratio,
+                *per_head,
                 &mut self.tensor(*o),
             ),
             Attention::DecodeRel {
@@ -636,10 +640,12 @@ impl Run<'_> {
                 plan,
                 q_pe,
                 cache,
+                window,
                 heads,
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse,
             } => mla::attention_decode(
                 self.ctx(),
                 self.ragged(*q),
@@ -649,17 +655,21 @@ impl Run<'_> {
                 *heads,
                 *kv_lora_rank,
                 *sm_scale,
+                *window,
                 &mut self.tensor(*o),
+                lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
             Attention::MlaPrefill {
                 q,
                 plan,
                 q_pe,
                 cache,
+                window,
                 heads,
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse,
             } => mla::attention_prefill(
                 self.ctx(),
                 self.ragged(*q),
@@ -669,7 +679,9 @@ impl Run<'_> {
                 *heads,
                 *kv_lora_rank,
                 *sm_scale,
+                *window,
                 &mut self.tensor(*o),
+                lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
             Attention::MlaDecodeSelected {
                 q,
@@ -681,6 +693,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse,
             } => mla::attention_decode_selected(
                 self.ctx(),
                 self.ragged_lanes(*q),
@@ -692,6 +705,7 @@ impl Run<'_> {
                 *kv_lora_rank,
                 *sm_scale,
                 &mut self.tensor(*o),
+                lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
             Attention::MlaPrefillSelected {
                 q,
@@ -703,6 +717,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse,
             } => mla::attention_prefill_selected(
                 self.ctx(),
                 self.ragged_lanes(*q),
@@ -714,6 +729,7 @@ impl Run<'_> {
                 *kv_lora_rank,
                 *sm_scale,
                 &mut self.tensor(*o),
+                lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
             Attention::SsmCausalConv1d {
                 x,
@@ -1157,6 +1173,7 @@ impl Run<'_> {
                 head_dim,
                 top_k,
                 ratio,
+                score: IndexScore::Pooled,
                 selection,
             } => index::topk(
                 self.ctx(),
@@ -1169,6 +1186,33 @@ impl Run<'_> {
                 *ratio,
                 &mut self.tensor(*selection),
             ),
+            Attention::IndexTopk {
+                q,
+                weights,
+                keys,
+                heads,
+                head_dim,
+                top_k,
+                ratio,
+                score: IndexScore::BlockMax,
+                selection,
+            } => {
+                if weights.is_some() {
+                    return Err(kernels_cuda::Error::Unsupported {
+                        op: "attention.index_topk",
+                    });
+                }
+                index::topk_block_max(
+                    self.ctx(),
+                    self.ragged_lanes(*q),
+                    &self.pool(*keys),
+                    *heads,
+                    *head_dim,
+                    *top_k,
+                    *ratio,
+                    &mut self.tensor(*selection),
+                )
+            }
             Attention::IndexKvAppend {
                 k,
                 keys,
@@ -1315,9 +1359,34 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 &mut self.tensor(*lse),
             ),
-            Attention::PoolLseSelected { .. } => Err(kernels_cuda::Error::Unsupported {
-                op: "attention.pool_lse_selected",
-            }),
+            Attention::PoolLseSelected {
+                q,
+                positions,
+                request_of_token,
+                selection,
+                entries,
+                ratio,
+                top_k,
+                heads,
+                head_dim,
+                sm_scale,
+                o,
+                lse,
+            } => pool::attention_lse_selected(
+                self.ctx(),
+                self.tensor(*q),
+                self.tensor(*positions),
+                self.tensor(*request_of_token),
+                self.tensor(*selection),
+                &self.pool(*entries),
+                *ratio,
+                *top_k,
+                *heads,
+                *head_dim,
+                *sm_scale,
+                &mut self.tensor(*o),
+                &mut self.tensor(*lse),
+            ),
             Attention::Ragged {
                 q,
                 k,
@@ -1454,6 +1523,25 @@ impl Run<'_> {
         k: u32,
     ) -> Result<kernels_cuda::Tensor, kernels_cuda::Error> {
         match self.maybe_planes(w) {
+            Some((codes, ..)) if codes.dtype == poem_ir::Dtype::E4m3tensor => {
+                Err(kernels_cuda::Error::Backend {
+                    op,
+                    detail: "a per-tensor e4m3 plane is read by the n-gram gather alone"
+                        .to_string(),
+                })
+            }
+            Some((codes, scales, biases, seat)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
+                kernels_cuda::linear::nvfp4::decoded_plane(
+                    self.ctx(),
+                    op,
+                    codes,
+                    scales,
+                    super::linear::tensor_scales(op, biases)?,
+                    n,
+                    k,
+                    seat,
+                )
+            }
             Some((codes, scales, biases, seat)) => kernels_cuda::linear::quant::decoded_plane(
                 self.ctx(),
                 op,

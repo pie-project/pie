@@ -277,3 +277,215 @@ fn a_gated_delta_step_whose_conv_is_read_elsewhere_stays_apart() {
         ]
     );
 }
+
+fn yarn_write(p: &Pattern, interleaved: bool) {
+    let positions = p.indices("positions");
+    let (q, k, v) = (p.rows("q", 512), p.rows("k", 128), p.rows("v", 128));
+    let (q, k) = elemwise::rope_yarn(
+        &q,
+        &k,
+        &positions,
+        64,
+        150_000.0,
+        32.0,
+        32.0,
+        1.0,
+        1.3,
+        4096,
+        interleaved,
+    );
+    attn::kv_append(
+        &k,
+        &v,
+        p.cache("kv"),
+        &p.rows("write_page", 1),
+        &p.rows("write_offset", 1),
+    );
+    elemwise::silu(&q);
+}
+
+/// gpt-oss's YaRN and its cache write fold into one launch, carrying the
+/// rotation's every parameter.
+#[test]
+fn a_yarn_rotation_and_its_cache_write_fold_into_one_op() {
+    for interleaved in [false, true] {
+        let fused = fuse(
+            trace(|p| yarn_write(p, interleaved)),
+            &["elementwise.rope_yarn_append"],
+        );
+        assert_eq!(
+            ops(&fused),
+            ["elementwise.rope_yarn_append", "elementwise.silu"]
+        );
+        let Some(poem_ir::Operation::Fused(poem_ir::Fused::RopeYarnAppend {
+            head_dim,
+            theta,
+            factor,
+            original_max_position,
+            interleaved: carried,
+            ..
+        })) = fused.nodes.first().map(|node| &node.op)
+        else {
+            panic!("the first op is the fused rotation");
+        };
+        assert_eq!(
+            (*head_dim, *theta, *factor, *original_max_position, *carried),
+            (64, 150_000.0, 32.0, 4096, interleaved)
+        );
+    }
+}
+
+/// gpt-oss's packed q/k/v row, split, rotated and written, folds into one
+/// op reading the packed row; with the split left to read elsewhere, the
+/// rotation and write fold as they did.
+#[test]
+fn a_split_rotation_and_its_cache_write_fold_into_one_op() {
+    let packed_write = |interleaved: bool, split_read: bool| {
+        trace(move |p| {
+            let positions = p.indices("positions");
+            let packed = p.rows("packed", 768);
+            let (q, k, v) = layout::split_qkv(&packed, 512, 128);
+            let (qr, kr) = elemwise::rope_yarn(
+                &q,
+                &k,
+                &positions,
+                64,
+                150_000.0,
+                32.0,
+                32.0,
+                1.0,
+                1.3,
+                4096,
+                interleaved,
+            );
+            attn::kv_append(
+                &kr,
+                &v,
+                p.cache("kv"),
+                &p.rows("write_page", 1),
+                &p.rows("write_offset", 1),
+            );
+            elemwise::silu(&qr);
+            if split_read {
+                elemwise::silu(&v);
+            }
+        })
+    };
+    let kernels = [
+        "elementwise.split_rope_yarn_append",
+        "elementwise.rope_yarn_append",
+    ];
+    for interleaved in [false, true] {
+        let fused = fuse(packed_write(interleaved, false), &kernels);
+        assert_eq!(
+            ops(&fused),
+            ["elementwise.split_rope_yarn_append", "elementwise.silu"]
+        );
+        let Some(poem_ir::Operation::Fused(poem_ir::Fused::SplitRopeYarnAppend {
+            q_width,
+            kv_width,
+            head_dim,
+            theta,
+            original_max_position,
+            interleaved: carried,
+            ..
+        })) = fused.nodes.first().map(|node| &node.op)
+        else {
+            panic!("the first op is the fused split rotation");
+        };
+        assert_eq!(
+            (
+                *q_width,
+                *kv_width,
+                *head_dim,
+                *theta,
+                *original_max_position,
+                *carried
+            ),
+            (512, 128, 64, 150_000.0, 4096, interleaved)
+        );
+    }
+    let fused = fuse(packed_write(false, true), &kernels);
+    assert_eq!(
+        ops(&fused),
+        [
+            "layout.split_qkv",
+            "elementwise.rope_yarn_append",
+            "elementwise.silu",
+            "elementwise.silu"
+        ],
+        "a split read past the rotation stays a split"
+    );
+}
+
+/// gpt-oss's sinks fold onto the log-sum-exp attention before them, decode
+/// and prefill alike, carrying the attention whole; a log-sum-exp read past
+/// the sink keeps the pair apart.
+#[test]
+fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
+    let sinked = |decode: bool, scores: bool| {
+        trace(move |p| {
+            let q = p.rows("q", 512);
+            let cache = p.cache("kv");
+            let (o, lse) = if decode {
+                let plan = p.value(
+                    "plan",
+                    poem_ir::Ty::Struct(poem_ir::StructKind::AttnDecodePlan),
+                );
+                attn::decode_lse(&q, &plan, cache, Some(128), 64, 0.125)
+            } else {
+                let plan = p.value(
+                    "plan",
+                    poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
+                );
+                attn::prefill_lse(&q, &plan, cache, None, 64, 8, 0.125)
+            };
+            let out = attn::sink(&o, &lse, &p.weight("sinks", [8]), 64);
+            elemwise::silu(&out);
+            if scores {
+                elemwise::silu(&lse);
+            }
+        })
+    };
+    for decode in [true, false] {
+        let fused = fuse(sinked(decode, false), &["attention.lse_sink"]);
+        assert_eq!(ops(&fused), ["attention.lse_sink", "elementwise.silu"]);
+        let Some(poem_ir::Operation::Fused(poem_ir::Fused::LseSink { attn, head_dim, .. })) =
+            fused.nodes.first().map(|node| &node.op)
+        else {
+            panic!("the first op is the sinked attention");
+        };
+        assert_eq!(*head_dim, 64);
+        assert_eq!(
+            attn.name(),
+            if decode {
+                "attention.decode_lse"
+            } else {
+                "attention.prefill_lse"
+            }
+        );
+        let apart = sinked(decode, true);
+        assert_eq!(
+            ops(&fuse(apart.clone(), &["attention.lse_sink"])),
+            ops(&apart),
+            "a log-sum-exp read elsewhere keeps the pair apart"
+        );
+    }
+}
+
+#[test]
+fn a_projection_cut_into_two_halves_lands_as_one_fused_op() {
+    let t = trace(|p| {
+        let (left, right) = layout::split_rows(&biased(p), 40);
+        elemwise::silu(&left);
+        elemwise::silu(&right);
+    });
+    assert_eq!(
+        ops(&fuse(t, &["linear.matmul_split_rows"])),
+        [
+            "linear.matmul_split_rows",
+            "elementwise.silu",
+            "elementwise.silu"
+        ]
+    );
+}

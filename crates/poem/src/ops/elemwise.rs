@@ -564,11 +564,12 @@ pub fn hc_project(normed: &Value, dynamic: &Weight, stream_count: u32) -> Value 
     let count = u64::from(stream_count);
     let mix_hc = 2 * count + count * count;
     assert!(
-        dynamic.dim(0) == mix_hc || dynamic.dim(0) == count,
-        "`{}` lands {} rows; a {stream_count}-stream mix row is {mix_hc} wide and a trunk \
-         collapse row is {count}",
+        dynamic.dim(0) == mix_hc || dynamic.dim(0) == 2 * count || dynamic.dim(0) == count,
+        "`{}` lands {} rows; a {stream_count}-stream mix row is {mix_hc} wide ({} without \
+         its combine), and a trunk collapse row is {count}",
         dynamic.name,
         dynamic.dim(0),
+        2 * count,
     );
     let mixes = r.fresh(tensor(normed.rows(), dynamic.dim(0), Dtype::F32));
     r.push(
@@ -593,6 +594,57 @@ pub fn hc_gates(
     alpha: f32,
     sinkhorn: u32,
 ) -> (Value, Value, Value) {
+    gates(
+        normed,
+        streams,
+        scale,
+        base,
+        stream_count,
+        gate_eps,
+        alpha,
+        sinkhorn,
+        true,
+    )
+}
+
+/// `hc_gates` in the independent form: the mix row is the pre and post logits
+/// alone, the post gate carries `gate_eps` as the pre gate does, and the
+/// combine landed is the identity, so a fold adds each stream to itself.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_gates_independent(
+    mixes: &Value,
+    streams: &Value,
+    scale: &Weight,
+    base: &Weight,
+    stream_count: u32,
+    gate_eps: f32,
+    alpha: f32,
+) -> (Value, Value, Value) {
+    gates(
+        mixes,
+        streams,
+        scale,
+        base,
+        stream_count,
+        gate_eps,
+        alpha,
+        0,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gates(
+    normed: &Value,
+    streams: &Value,
+    scale: &Weight,
+    base: &Weight,
+    stream_count: u32,
+    gate_eps: f32,
+    alpha: f32,
+    sinkhorn: u32,
+    comb: bool,
+) -> (Value, Value, Value) {
     let r = normed.rec();
     let count = u64::from(stream_count);
     let x = r.fresh(tensor(
@@ -612,6 +664,7 @@ pub fn hc_gates(
             gate_eps,
             alpha,
             sinkhorn,
+            comb,
             x: x.id(),
             post_mix: post_mix.id(),
             comb_mix: comb_mix.id(),

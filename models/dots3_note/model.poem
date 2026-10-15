@@ -1,0 +1,195 @@
+# The weights of Dots3 NOTE: latent attention (MLA) on every layer, a full
+# layer reading the keys a lightning indexer picks and a sliding one reading
+# a window through its own wider latent; one dense layer, then routed
+# experts with a shared one.
+
+load("//lib/adapters/model.poem", "banks")
+
+def attention(n, a, hidden, weights, norms, eps, kv, window = None, indexer = None):
+    """The latent attention named by `n` at the dims `a`, its projections in
+    `weights` and its norms in `norms`, caching under `kv`. The q and kv
+    latents' norms carry the checkpoint's `sqrt(hidden / rank)` rescale;
+    each head's output is gated by a sigmoid of the layer input."""
+    qk_head_dim = a.qk_nope_head_dim + a.qk_rope_head_dim
+    v_width = a.heads * a.v_head_dim
+    return struct(
+        heads = a.heads,
+        kv_lora_rank = a.kv_lora_rank,
+        qk_nope_head_dim = a.qk_nope_head_dim,
+        qk_rope_head_dim = a.qk_rope_head_dim,
+        v_head_dim = a.v_head_dim,
+        theta = a.theta,
+        window = window,
+        sm_scale = f32(1.0 / f32(sqrt(qk_head_dim))),
+        q_a_proj = weight(n("q_a_proj"), [a.q_lora_rank, hidden], weights),
+        q_a_norm = weight(n("q_a_norm"), [a.q_lora_rank], norms),
+        q_a_scale = sqrt(hidden / a.q_lora_rank),
+        q_b_proj = weight(n("q_b_proj"), [a.heads * qk_head_dim, a.q_lora_rank], weights).columns(),
+        kv_a_proj = weight(n("kv_a_proj"), [a.kv_lora_rank + a.qk_rope_head_dim, hidden], weights),
+        kv_a_norm = weight(n("kv_a_norm"), [a.kv_lora_rank], norms),
+        kv_a_scale = sqrt(hidden / a.kv_lora_rank),
+        k_pe_norm = weight(n("k_pe_norm"), [a.qk_rope_head_dim], norms),
+        norm_eps = eps,
+        kv_b_proj = weight(
+            n("kv_b_proj"),
+            [a.heads * (a.qk_nope_head_dim + a.v_head_dim), a.kv_lora_rank],
+            weights,
+        ).columns(),
+        gate = weight(n("o_gate"), [a.heads, hidden], weights).columns(),
+        o_proj = weight(n("o_proj"), [hidden, v_width], weights).rows(),
+        kv = kv,
+        indexer = indexer,
+    )
+
+def note(layers = 46, experts = 256, full_layers = [0] + list(range(1, 46, 4))):
+    """Dots3 NOTE's dims, `layers` deep with `experts` routed experts; the
+    layers in `full_layers` read the whole context, the rest 513 tokens back,
+    themselves included."""
+    return struct(
+        hidden = 5120,
+        layers = layers,
+        dense_layers = 1,
+        full = struct(
+            heads = 128,
+            q_lora_rank = 1024,
+            kv_lora_rank = 512,
+            qk_nope_head_dim = 128,
+            qk_rope_head_dim = 64,
+            v_head_dim = 128,
+            theta = 80000000.0,
+        ),
+        sliding = struct(
+            heads = 64,
+            q_lora_rank = 1024,
+            kv_lora_rank = 1024,
+            qk_nope_head_dim = 192,
+            qk_rope_head_dim = 64,
+            v_head_dim = 128,
+            theta = 50000.0,
+        ),
+        full_layers = full_layers,
+        window = 513,
+        index_heads = 64,
+        index_head_dim = 128,
+        index_top_k = 2048,
+        index_norm_eps = 1e-6,
+        dense_inter = 13824,
+        experts = experts,
+        top_k = min(8, experts),
+        moe_inter = 1536,
+        shared_inter = 1536,
+        scaling = 1.0,
+        vocab = 152064,
+        norm_eps = 1e-5,
+    )
+
+DIMS = {
+    "dots3-note": note(),
+    # Layers 0-5 at full width with the first 16 routed experts: two full
+    # layers (the dense one first), three sliding ones, then a full one.
+    "dots3-note-mini": note(layers = 6, experts = 16, full_layers = [0, 1, 5]),
+}
+
+def layout(id, deploy):
+    if len(deploy.weights) == 1:
+        weights, experts = deploy.weights[0], deploy.weights[0]
+    elif len(deploy.weights) == 2:
+        weights, experts = deploy.weights
+    else:
+        fail("{} stores its weights (and its experts) at one dtype each, not {}".format(id, deploy.weights))
+    d = DIMS[id]
+    dense = compute(weights)
+    hidden = d.hidden
+    index_width = d.index_heads * d.index_head_dim
+
+    def layer(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        norm = lambda s, width: weight(n(s), [width], dense)
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        if l in d.full_layers:
+            a = d.full
+            attn = attention(
+                n,
+                a,
+                hidden,
+                weights = weights,
+                norms = dense,
+                eps = d.norm_eps,
+                kv = "kv.{}".format(l),
+                indexer = struct(
+                    heads = d.index_heads,
+                    head_dim = d.index_head_dim,
+                    top_k = d.index_top_k,
+                    rope_dim = a.qk_rope_head_dim,
+                    theta = a.theta,
+                    q_proj = weight(n("index_q_proj"), [index_width, a.q_lora_rank], weights),
+                    k_proj = weight(n("index_k_proj"), [d.index_head_dim, hidden], weights),
+                    weights_proj = weight(n("index_weights"), [d.index_heads, hidden], weights),
+                    k_norm = norm("index_k_norm", d.index_head_dim),
+                    k_norm_bias = norm("index_k_norm_bias", d.index_head_dim),
+                    k_norm_eps = d.index_norm_eps,
+                    keys = "index.{}".format(l),
+                ),
+            )
+        else:
+            attn = attention(
+                n,
+                d.sliding,
+                hidden,
+                weights = weights,
+                norms = dense,
+                eps = d.norm_eps,
+                kv = "swa.{}".format(l),
+                window = d.window,
+            )
+        if l < d.dense_layers:
+            iw = d.dense_inter
+            mlp = struct(
+                routed = False,
+                gate_up = weight(n("gate_up"), [2 * iw, hidden], weights).packed([iw, iw]),
+                down = weight(n("down"), [hidden, iw], weights).rows(),
+                inter = iw,
+            )
+        else:
+            iw = d.moe_inter
+            sw = d.shared_inter
+            mlp = struct(
+                routed = True,
+                router = weight(n("router"), [d.experts, hidden], dense),
+                bias = weight(n("router_bias"), [d.experts], dtype.f32),
+                gate_up = weight(n("experts_gate_up"), [d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
+                down = weight(n("experts_down"), [d.experts, hidden, iw], experts).rows(),
+                shared = struct(
+                    gate_up = weight(n("shared_gate_up"), [2 * sw, hidden], weights).packed([sw, sw]),
+                    down = weight(n("shared_down"), [hidden, sw], weights).rows(),
+                    inter = sw,
+                ),
+                experts = d.experts,
+                top_k = d.top_k,
+                inter = iw,
+                scaling = d.scaling,
+            )
+        return struct(
+            attn = attn,
+            attn_norm = norm("attn_norm", hidden),
+            attn_norm_eps = d.norm_eps,
+            mlp_norm = norm("mlp_norm", hidden),
+            mlp_norm_eps = d.norm_eps,
+            mlp = mlp,
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        full = d.full,
+        sliding = d.sliding,
+        window = d.window,
+        kv = deploy.kv,
+        embed = weight("embed", [d.vocab, hidden], weights),
+        head = weight("lm_head", [d.vocab, hidden], weights).packed([d.vocab]),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight("final_norm", [hidden], dense),
+        final_norm_eps = d.norm_eps,
+    )

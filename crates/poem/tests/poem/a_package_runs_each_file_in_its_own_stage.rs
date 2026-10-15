@@ -20,7 +20,7 @@ def caches(m, c):
 
 fn deploy() -> Deploy {
     Deploy {
-        weights: vec![Dtype::Bf16],
+        weights: vec![Dtype::Bf16.into()],
         kv: Dtype::Bf16,
         tp: 1,
         parts: vec![],

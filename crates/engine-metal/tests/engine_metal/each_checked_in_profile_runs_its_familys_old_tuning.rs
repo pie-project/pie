@@ -36,6 +36,14 @@ fn old_tile(pairs: u32, experts: u32) -> u32 {
 /// The kernel the old cascade in `act_x_wt_over` ran a dense matmul on.
 fn old_qmm(family: u32, at: &QmmAt) -> Qmm {
     let (fp16_from, crossover_tg, mpp, ..) = old(family);
+    if family == 10
+        && (5..=8).contains(&at.rows)
+        && at.bits == 4
+        && at.group == 64
+        && at.n % 64 == 0
+    {
+        return Qmm::Staged;
+    }
     let bn = if at.rows <= 8 { 64 } else { 128 };
     if mpp
         && at.bits == 4

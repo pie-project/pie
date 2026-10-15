@@ -356,7 +356,44 @@ fn conv1d_chunked(
     )?;
     let reach = (conv_width.saturating_sub(1)).saturating_mul(dilation);
     let row_tiled = reach <= CONV_TT;
-    let (entrypoint, launch) = if row_tiled {
+    let vec8 = conv_width == 4
+        && dilation == 1
+        && channels.is_multiple_of(8)
+        && state.conv_stride % 8 == 0
+        && [x.data.ptr, y.ptr, weight.ptr, state.conv_slab.ptr]
+            .iter()
+            .all(|&at| aligned16(at));
+    let (entrypoint, launch) = if vec8 && ctx.tuning().ssm_conv_vec4 {
+        (
+            symbol(&format!(
+                "::pie::attn::ssm_causal_conv1d_chunked_batched_row_tile_vec4{}",
+                out.args()
+            )),
+            Launch::grid(
+                [
+                    (channels / 4).div_ceil(TILE_BLOCK),
+                    x.data.rows.div_ceil(CONV_TT).max(1),
+                    1,
+                ],
+                [TILE_BLOCK, 1, 1],
+            ),
+        )
+    } else if vec8 {
+        (
+            symbol(&format!(
+                "::pie::attn::ssm_causal_conv1d_chunked_batched_row_tile_vec8{}",
+                out.args()
+            )),
+            Launch::grid(
+                [
+                    (channels / 8).div_ceil(TILE_BLOCK),
+                    x.data.rows.div_ceil(CONV_TT).max(1),
+                    1,
+                ],
+                [TILE_BLOCK, 1, 1],
+            ),
+        )
+    } else if row_tiled {
         (
             symbol(&format!(
                 "::pie::attn::ssm_causal_conv1d_chunked_batched_row_tile{}",
@@ -655,7 +692,7 @@ pub fn gated_delta(
         false,
         false,
     )?;
-    if fused_fits(&shape, state) {
+    if fused_fits(&shape, state, qkv, y) {
         return shape.decode_fused(ctx, OP, qkv, gates, state, y);
     }
     let staged = shape.stage(ctx, OP, qkv, gates, StagePlanes::Step)?;
@@ -696,18 +733,46 @@ pub fn gated_delta(
     )
 }
 
-const FUSED_BLOCK: u32 = 256;
-
+/// The value columns one warp of the fused step owns.
 const FUSED_BV: u32 = 16;
 
-fn fused_fits(shape: &Delta, state: &RecurrentPool) -> bool {
+/// The key rows one warp of the fused step holds: sixteen row pairs, eight
+/// rows each.
+const FUSED_BK: u32 = 128;
+
+/// Whether the fused step's vector reads land whole: every row it touches
+/// starts on a 16-byte boundary and the key width is whole sixteen-row steps.
+fn fused_fits(shape: &Delta, state: &RecurrentPool, qkv: Tensor, y: &Tensor) -> bool {
     const VEC: u32 = 8;
     shape.conv_dim.is_multiple_of(VEC)
         && (shape.k_heads * shape.k_dim).is_multiple_of(VEC)
         && shape.v_dim.is_multiple_of(FUSED_BV)
-        && (shape.k_dim * shape.v_dim).is_multiple_of(VEC)
+        && shape.k_dim.is_multiple_of(16)
         && state.slot_stride_elems % i64::from(VEC) == 0
-        && shape.k_dim <= FUSED_BLOCK * VEC / FUSED_BV
+        && shape.k_dim <= FUSED_BK
+        && [qkv.ptr, y.ptr, state.slab.ptr]
+            .iter()
+            .all(|&at| aligned16(at))
+}
+
+/// Warps per block of the fused step, and the most blocks each SM holds:
+/// the warps are persistent, so the grid is at most what the SMs seat at
+/// once.
+const FUSED_WARPS: u32 = 4;
+const FUSED_BLOCKS_PER_SM: u32 = 3;
+/// The bytes one warp's stage of the fused step streams: its state tile, the
+/// q and k rows, its value slice and the two gates.
+const FUSED_STAGE: u32 = 4096 + 512 + 32 + 32;
+/// The fused step's shared memory a block, double-buffered.
+const FUSED_SMEM: u32 = FUSED_WARPS * 2 * FUSED_STAGE;
+
+/// The fused step's blocks one SM seats: three, or fewer where the SM's
+/// shared memory (less the 1 KiB the runtime keeps a block) holds fewer.
+fn fused_blocks_per_sm(smem_per_sm: Option<u32>) -> u32 {
+    const RESERVED: u32 = 1024;
+    smem_per_sm.map_or(FUSED_BLOCKS_PER_SM, |bytes| {
+        (bytes / (FUSED_SMEM + RESERVED)).clamp(1, FUSED_BLOCKS_PER_SM)
+    })
 }
 
 impl Delta {
@@ -722,12 +787,23 @@ impl Delta {
     ) -> Result<(), Error> {
         #[allow(clippy::cast_precision_loss)]
         let q_scale = (self.k_dim as f32).sqrt().recip();
+        let sms = ctx.multiprocessors().unwrap_or(148);
+        let tiles = self
+            .n
+            .checked_mul(self.v_heads * (self.v_dim / FUSED_BV))
+            .ok_or_else(|| {
+                refuse(
+                    op,
+                    format!("{} rows of value tiles overflow a grid", self.n),
+                )
+            })?;
+        let blocks = tiles
+            .div_ceil(FUSED_WARPS)
+            .min(sms * fused_blocks_per_sm(ctx.smem_per_sm()));
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::ssm_gdn_decode_step<16>").apply(Launch::grid(
-                [self.v_dim / FUSED_BV, self.n, self.v_heads],
-                [FUSED_BLOCK, 1, 1],
-            )),
+            Fire::at(FILE, "::pie::attn::ssm_gdn_decode_step<4>")
+                .apply(Launch::grid([blocks, 1, 1], [32 * FUSED_WARPS, 1, 1]).smem(FUSED_SMEM)),
             &[
                 qkv.arg(),
                 gates.arg(),
@@ -743,14 +819,267 @@ impl Delta {
                 q_scale.arg(),
                 state.write_state.arg(),
                 state.write_state_mask.arg(),
+                stated(op, tiles)?.arg(),
                 ctx.stage(),
             ],
         )
     }
 }
 
+/// The value columns one block of the chunked scan carries: half a head,
+/// so a lone long request still spreads over twice its heads' blocks. A
+/// captured fire states its bucket's lanes, not the live ones, so the width
+/// cannot follow the batch.
+const SCAN_BV: u32 = 64;
+
+/// The shared memory one block of the chunked scan holds at key width
+/// `k_dim`: its prep is smaller.
+const fn scan_smem(k_dim: u32) -> u32 {
+    const CH: u32 = 64;
+    const LD: u32 = 136;
+    const LDC: u32 = 72;
+    let ldv = SCAN_BV + 8;
+    (3 * CH * LD + CH * ldv + CH * LDC + k_dim * ldv + 2 * CH * ldv) * 2 + 2 * CH * FLOAT
+}
+
+/// Whether a 128-wide prefill takes the two-launch scan: the profile turns
+/// it on, and this device's blocks can opt into its shared memory.
+fn fused_scan(ctx: &Ctx, k_dim: u32) -> bool {
+    ctx.tuning().ssm_gdn_fused_scan
+        && ctx
+            .smem_per_block_optin()
+            .is_some_and(|cap| cap >= scan_smem(k_dim))
+}
+
+/// `pie::attn::gdn::Params`, field for field.
+#[cfg(feature = "cuda")]
+#[repr(C)]
+struct Tc5Params {
+    gates: u64,
+    state: u64,
+    slot_ids: u64,
+    qo_indptr: u64,
+    commit_len: u64,
+    begin_at: u64,
+    write_state_mask: u64,
+    out: u64,
+    win: u64,
+    slot_stride: i64,
+    lanes: i32,
+    k_heads: i32,
+    v_heads: i32,
+    write_state: i32,
+    q_scale: f32,
+}
+
+/// The one-launch tcgen05 walk (`attn/gdn_tc5.cuh`), where the profile
+/// asks for it and the device and operands admit it: 128-wide heads, rows
+/// TMA can read. `Ok(false)` leaves the prefill to the scans.
+#[cfg(feature = "cuda")]
+fn gated_delta_chunked_tc5(
+    ctx: &Ctx,
+    op: &'static str,
+    shape: &Delta,
+    qkv: RaggedTensor,
+    gates: Tensor,
+    state: &RecurrentPool,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    use crate::linear::tc5::{Map, encode, supported};
+    use cudarc::driver::sys as dr;
+    const FILE_TC5: &str = "attn/gdn_tc5.cuh";
+    /// `pie::attn::gdn::smem_bytes()`.
+    const SMEM: u32 = 213_504 + 1024;
+    if !(ctx.tuning().ssm_gdn_tc5
+        && supported()
+        && shape.k_dim == 128
+        && shape.v_dim == 128
+        && shape.v_heads.is_multiple_of(shape.k_heads.max(1))
+        && (shape.conv_dim * 2).is_multiple_of(16)
+        && aligned16(qkv.data.ptr)
+        && state.slot_stride_elems > 0)
+    {
+        return Ok(false);
+    }
+    let lanes = requests(op, qkv)?;
+    seated(op, state, "gdn_chunked_tc5", true, true, true)?;
+    let map = encode(Map {
+        ptr: qkv.data.ptr,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        dims: [shape.conv_dim, qkv.data.rows, 1],
+        strides: [
+            u64::from(shape.conv_dim) * 2,
+            u64::from(shape.conv_dim) * 2 * u64::from(qkv.data.rows.max(1)),
+        ],
+        boxes: [64, 64, 1],
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    })?;
+    #[allow(clippy::cast_precision_loss)]
+    let q_scale = (shape.k_dim as f32).sqrt().recip();
+    let int = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
+    let ArgValue::Ptr(win) = ctx.stage() else {
+        return Ok(false);
+    };
+    let params = Tc5Params {
+        gates: gates.ptr,
+        state: state.slab.ptr,
+        slot_ids: state.slot_ids.ptr,
+        qo_indptr: qkv.indptr.ptr,
+        commit_len: state.commit_len.ptr,
+        begin_at: state.begin_at.ptr,
+        write_state_mask: state.write_state_mask.ptr,
+        out: y.ptr,
+        win,
+        slot_stride: state.slot_stride_elems,
+        lanes: int(lanes),
+        k_heads: int(shape.k_heads),
+        v_heads: int(shape.v_heads),
+        write_state: i32::from(state.write_state),
+        q_scale,
+    };
+    let tiles = lanes.saturating_mul(shape.v_heads);
+    let grid = tiles.min(ctx.multiprocessors().unwrap_or(148)).max(1);
+    ctx.fire(
+        op,
+        Fire::at(FILE_TC5, symbol("::pie::attn::gdn::gdn_chunked_tc5"))
+            .apply(Launch::grid([grid, 1, 1], [384, 1, 1]).smem(SMEM)),
+        &[
+            ArgValue::Bytes {
+                ptr: map.as_ptr().cast(),
+                len: 128,
+            },
+            ArgValue::Bytes {
+                ptr: (&raw const params).cast(),
+                len: core::mem::size_of::<Tc5Params>(),
+            },
+        ],
+    )?;
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gated_delta_chunked_fla(
+    ctx: &Ctx,
+    op: &'static str,
+    shape: &Delta,
+    qkv: RaggedTensor,
+    gates: Tensor,
+    state: &RecurrentPool,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const CH: u32 = 64;
+    const BLOCK: u32 = 128;
+    const LD: u32 = 136;
+    const LDC: u32 = 72;
+    const LDA: u32 = 68;
+    let lanes = requests(op, qkv)?;
+    seated(op, state, "ssm_gdn_chunk", true, true, true)?;
+    let (k_dim, v_dim, v_heads, k_heads) = (shape.k_dim, shape.v_dim, shape.v_heads, shape.k_heads);
+    let slots = shape.n.div_ceil(CH) + lanes;
+    let padded = Delta {
+        n: shape.n + CH,
+        ..*shape
+    };
+    let gcum = plane(ctx, op, "attn.ssm_gdn_chunk_gcum", padded.elems(v_heads, 1))?;
+    let qn = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_qn",
+        padded.elems(k_heads, k_dim),
+    )?;
+    let kn = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_kn",
+        padded.elems(k_heads, k_dim),
+    )?;
+    let w = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_w",
+        padded.elems(v_heads, k_dim),
+    )?;
+    let u = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_u",
+        padded.elems(v_heads, v_dim),
+    )?;
+    let pm = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_p",
+        u64::from(slots) * u64::from(v_heads) * u64::from(CH * CH),
+    )?;
+    #[allow(clippy::cast_precision_loss)]
+    let q_scale = (k_dim as f32).sqrt().recip();
+    let prep_smem =
+        2 * CH * LD * 2 + 2 * CH * LDC * 2 + CH * LDA * FLOAT + 3 * CH * FLOAT + 4 * 256 * FLOAT;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_prep<128, 128>")
+            .apply(Launch::grid([v_heads, slots, 1], [2 * BLOCK, 1, 1]).smem(prep_smem)),
+        &[
+            qkv.data.arg(),
+            gates.arg(),
+            state.slot_ids.arg(),
+            qkv.indptr.arg(),
+            state.commit_len.arg(),
+            state.begin_at.arg(),
+            ArgValue::Ptr(gcum),
+            ArgValue::Ptr(qn),
+            ArgValue::Ptr(kn),
+            ArgValue::Ptr(w),
+            ArgValue::Ptr(u),
+            ArgValue::Ptr(pm),
+            stated(op, lanes)?.arg(),
+            stated(op, k_heads)?.arg(),
+            stated(op, v_heads)?.arg(),
+            stated(op, shape.conv_dim)?.arg(),
+            q_scale.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    let scan_smem = scan_smem(k_dim);
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_scan<64>").apply(
+            Launch::grid(
+                [lanes * v_heads * (v_dim / SCAN_BV), 1, 1],
+                [2 * BLOCK, 1, 1],
+            )
+            .smem(scan_smem),
+        ),
+        &[
+            ArgValue::Ptr(gcum),
+            ArgValue::Ptr(qn),
+            ArgValue::Ptr(kn),
+            ArgValue::Ptr(w),
+            ArgValue::Ptr(u),
+            ArgValue::Ptr(pm),
+            state.slab.arg(),
+            state.slot_ids.arg(),
+            qkv.indptr.arg(),
+            state.slot_stride_elems.arg(),
+            state.commit_len.arg(),
+            state.begin_at.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            y.arg(),
+            stated(op, lanes)?.arg(),
+            stated(op, k_heads)?.arg(),
+            stated(op, v_heads)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// The chunked rule in three wmma launches over the staged planes: the
+/// update directions per chunk, the state walk per sixteen value columns,
+/// and the output per chunk. No block holds more than 41 KiB of shared
+/// memory, so every card runs it.
+#[allow(clippy::too_many_arguments)]
+fn gated_delta_chunked_split(
     ctx: &Ctx,
     op: &'static str,
     shape: &Delta,
@@ -953,9 +1282,25 @@ pub fn gated_delta_chunked(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;
+    let wide = k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get);
+    #[cfg(feature = "cuda")]
+    if wide && gated_delta_chunked_tc5(ctx, OP, &shape, qkv, gates, state, y)? {
+        return Ok(());
+    }
+    let fused = wide && fused_scan(ctx, k_dim);
+    if fused
+        && shape.conv_dim.is_multiple_of(8)
+        && (k_heads * k_dim).is_multiple_of(8)
+        && state.slot_stride_elems % 8 == 0
+        && [qkv.data.ptr, y.ptr, state.slab.ptr]
+            .iter()
+            .all(|&at| aligned16(at))
+    {
+        return gated_delta_chunked_fla(ctx, OP, &shape, qkv, gates, state, y);
+    }
     let staged = shape.stage(ctx, OP, qkv.data, gates, StagePlanes::Chunk)?;
-    if k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get) {
-        return gated_delta_chunked_fla(ctx, OP, &shape, &staged, qkv, state, y);
+    if wide && !fused {
+        return gated_delta_chunked_split(ctx, OP, &shape, &staged, qkv, state, y);
     }
     if k_dim <= BK_MAX_FLA && v_dim.is_multiple_of(BV_FLA) {
         seated(
@@ -1382,4 +1727,29 @@ pub fn kda_chunked(
             ctx.stage(),
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A B200 or H100 block opts into 227 KiB, an A100 into 163 KiB; an
+    /// RTX 30/40/50 or a DGX Spark into 99 KiB, short of the scan.
+    #[test]
+    fn the_scan_fits_a_datacenter_block_and_not_a_99_kib_one() {
+        assert!(scan_smem(128) <= 232_448);
+        assert!(scan_smem(128) <= 166_912);
+        assert!(scan_smem(128) > 101_376);
+    }
+
+    /// Three blocks of the fused step where the SM holds them, as on a B200
+    /// (228 KiB) or an A100 (164 KiB); two on a 100 KiB SM.
+    #[test]
+    fn the_fused_step_seats_what_the_sm_holds() {
+        assert_eq!(fused_blocks_per_sm(Some(233_472)), 3);
+        assert_eq!(fused_blocks_per_sm(Some(167_936)), 3);
+        assert_eq!(fused_blocks_per_sm(Some(102_400)), 2);
+        assert_eq!(fused_blocks_per_sm(Some(16_384)), 1);
+        assert_eq!(fused_blocks_per_sm(None), 3);
+    }
 }

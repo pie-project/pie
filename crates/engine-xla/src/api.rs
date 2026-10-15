@@ -649,7 +649,7 @@ impl Engine for Xla {
             });
         }
         let page_size = self.loaded_mut()?.paging().page_size;
-        let moves = crate::store::Move::plan(copy, page_size).map_err(Error::Invalid)?;
+        let moves = copy.runs(page_size)?;
         self.loaded_mut()?.copy_kv(&moves).map_err(fault)
     }
 
