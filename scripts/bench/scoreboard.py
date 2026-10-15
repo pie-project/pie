@@ -57,6 +57,10 @@ class Model:
     pie_options: list[str] = field(default_factory=list)
     # `[model] precision`, for a deployment that shares another's artifact.
     pie_precision_flag: str | None = None
+    # The device memory share pie is served at, when its vLLM row ran at
+    # another `gpu_memory_utilization` than the driver's 0.90 (both rows at
+    # one budget, so the KV pages each fits are compared like for like).
+    pie_mem_share: float | None = None
     # The artifact, when it was imported into another home under another
     # deployment's name.
     pie_artifact: str | None = None
@@ -114,8 +118,10 @@ MODELS = {m.key: m for m in [
           note="vLLM serves this checkpoint W4A4 by default; this pair holds both to W4A16 (Marlin); " + SEATS),
     Model("deepseek-v4-flash", "deepseek-ai/DeepSeek-V4-Flash", "fp8 dense + mxfp4 experts / kv fp8_ds_mla",
           "fp8b128 dense W8A8 + mxfp4 experts W4A8 / kv bf16", "dsv4-flash-fp8b128a8-mxfp4a8-kv-bf16",
-          vllm_dir="/root/baselines/deepseek-v4-flash",
-          note="kv differs: vLLM fp8_ds_mla, pie bf16; pie's artifact is the #903 import of the official release"),
+          vllm_dir="/root/baselines/deepseek-v4-flash", pie_mem_share=0.95,
+          note="kv differs: vLLM fp8_ds_mla, pie bf16; pie's artifact is the #903 import of the official release; "
+               "both rows at a 0.95 memory share (vLLM's run used gpu_memory_utilization 0.95; the weights "
+               "take ~157 GB of 180, and at 0.85-0.90 pie's KV pool starves bs64)"),
 ]}
 
 
@@ -135,6 +141,8 @@ def run_once(model: Model, engine: str, mode: str, out: Path) -> dict | None:
             cmd += ["--engine-option", opt]
         if model.pie_precision_flag:
             cmd += ["--precision", model.pie_precision_flag]
+        if model.pie_mem_share is not None:
+            cmd += ["--gpu-mem-util", str(model.pie_mem_share)]
     env = {**os.environ, "PIE_HOME": PIE_HOME}
     log("+", " ".join(cmd))
     with open(out / f"{mode}_driver.log", "w") as f:
