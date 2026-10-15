@@ -188,6 +188,84 @@ __global__ void ssm_conv1d_chunked(const T* __restrict__ x, const T* __restrict_
     }
 }
 
+// The prefill conv at dilation 1 and K taps, eight channels a thread: each
+// input row is read once as one 16-byte load and slides through a window of
+// K rows in registers, where the per-channel walk above reads every input K
+// times, two bytes a lane. The same products in the same order, so the same
+// bits. Grid (⌈C / (8·block)⌉, ⌈rows / 32⌉); C a multiple of 8.
+template <class T, int K, bool SILU = true, bool RESIDUAL = false>
+__global__ void ssm_conv1d_chunked_v8(const T* __restrict__ x, const T* __restrict__ weight,
+                                      const T* __restrict__ bias, T* __restrict__ y,
+                                      const T* __restrict__ state_base, const i32* __restrict__ slot_ids,
+                                      const u32* __restrict__ indptr, long long slot_stride, int C,
+                                      const int* __restrict__ commit_len, const int* __restrict__ begin_at,
+                                      const u32* __restrict__ win, int lanes_stated) {
+    constexpr int V = 8;
+    const int c0 = (blockIdx.x * blockDim.x + threadIdx.x) * V;
+    if (c0 >= C) return;
+    const int lanes = win != nullptr ? static_cast<int>(win[2]) : lanes_stated;
+    if (lanes <= 0) return;
+    const int total = static_cast<int>(indptr[lanes]);
+    const int tile0 = blockIdx.y * kConvRows;
+    if (tile0 >= total) return;
+    const int tile_end = min(tile0 + kConvRows, total);
+    const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
+    float w[V][K], b[V];
+#pragma unroll
+    for (int v = 0; v < V; ++v) {
+        b[v] = bias != nullptr ? to_f32(bias[c0 + v]) : 0.f;
+#pragma unroll
+        for (int k = 0; k < K; ++k) w[v][k] = to_f32(weight[(c0 + v) * K + k]);
+    }
+    auto load = [](const T* at, float (&out)[V]) {
+        const Pack8<T> p = *reinterpret_cast<const Pack8<T>*>(at);
+#pragma unroll
+        for (int v = 0; v < V; ++v) out[v] = to_f32(p.v[v]);
+    };
+
+    int lo = 0, hi = lanes - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) / 2;
+        if (static_cast<int>(indptr[mid]) <= tile0) lo = mid; else hi = mid - 1;
+    }
+    for (int r = lo; r < lanes; ++r) {
+        if (static_cast<int>(indptr[r]) >= tile_end) break;
+        const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+        const Span s = span_of(indptr, r, rl, commit_len, begin_at);
+        if (s.n <= 0) continue;
+        const int slot = slot_ids[rl];
+        if (slot < 0) continue;
+        const T* xr = x + (s.t0 + row0) * C + c0;
+        T* yr = y + (s.t0 + row0) * C + c0;
+        const T* state = state_base + static_cast<long long>(slot) * slot_stride + c0;
+        const int t_begin = max(tile0, s.t0) - s.t0, t_end = min(tile_end, s.t0 + s.n) - s.t0;
+        if (t_begin >= t_end) continue;
+        // win_[j] holds input t - (K - 1) + j.
+        float xw[K][V];
+#pragma unroll
+        for (int j = 0; j < K - 1; ++j) {
+            const int src = t_begin - (K - 1) + j;
+            load(src < 0 ? state + static_cast<long long>(K + src) * C : xr + static_cast<long long>(src) * C, xw[j]);
+        }
+        for (int t = t_begin; t < t_end; ++t) {
+            load(xr + static_cast<long long>(t) * C, xw[K - 1]);
+            Pack8<T> out;
+#pragma unroll
+            for (int v = 0; v < V; ++v) {
+                float acc = b[v];
+#pragma unroll
+                for (int k = 0; k < K; ++k) acc += w[v][k] * xw[k][v];
+                out.v[v] = from_f32<T>(conv_out<SILU, RESIDUAL>(acc, xw[K - 1][v]));
+            }
+            *reinterpret_cast<Pack8<T>*>(yr + static_cast<long long>(t) * C) = out;
+#pragma unroll
+            for (int j = 0; j < K - 1; ++j)
+#pragma unroll
+                for (int v = 0; v < V; ++v) xw[j][v] = xw[j + 1][v];
+        }
+    }
+}
+
 // The window after a request's rows: its last (K−1)·dil + 1 inputs, the
 // older ones from the window it started with. Grid (⌈C / block⌉, lanes).
 template <class T>

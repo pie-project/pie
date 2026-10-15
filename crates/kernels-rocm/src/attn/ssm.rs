@@ -143,6 +143,14 @@ impl ConvOut {
             ConvOut::Residual => "<::pie::bf16, false, true>",
         }
     }
+
+    /// The template arguments with the tap count after the element type.
+    fn args_with(self, taps: &str) -> String {
+        match self {
+            ConvOut::Silu => format!("<::pie::bf16, {taps}>"),
+            ConvOut::Residual => format!("<::pie::bf16, {taps}, false, true>"),
+        }
+    }
 }
 
 pub fn causal_conv1d(
@@ -311,38 +319,81 @@ fn conv1d_chunked(
         true,
         true,
     )?;
-    let entrypoint = symbol(&format!("::pie::attn::ssm_conv1d_chunked{}", out.args()));
-    let launch = Launch::grid(
-        [
-            channels.div_ceil(TILE_BLOCK),
-            x.data.rows.div_ceil(CONV_TT).max(1),
-            1,
-        ],
-        [TILE_BLOCK, 1, 1],
-    );
-    ctx.fire(
-        op,
-        Fire::at(FILE, entrypoint).apply(launch),
-        &[
-            x.data.arg(),
-            weight.arg(),
-            ArgValue::ABSENT,
-            y.arg(),
-            state.conv_slab.arg(),
-            state.slot_ids.arg(),
-            x.indptr.arg(),
-            state.conv_stride.arg(),
-            c.arg(),
-            k.arg(),
-            dil.arg(),
-            state.write_state.arg(),
-            state.write_state_mask.arg(),
-            state.commit_len.arg(),
-            state.begin_at.arg(),
-            ctx.stage(),
-            stated(op, lanes)?.arg(),
-        ],
-    )?;
+    // Dilation 1 at 2..=4 taps over whole 16-byte channel runs takes the
+    // eight-channel sliding walk (`ssm_conv1d_chunked_v8`).
+    let vectored = dil == 1
+        && (2..=4).contains(&k)
+        && channels % 8 == 0
+        && crate::jit::aligned16(x.data.ptr)
+        && crate::jit::aligned16(y.ptr)
+        && crate::jit::aligned16(state.conv_slab.ptr)
+        && state.conv_stride % 8 == 0;
+    if vectored {
+        let entrypoint = symbol(&format!(
+            "::pie::attn::ssm_conv1d_chunked_v8{}",
+            out.args_with(&format!("{k}"))
+        ));
+        let launch = Launch::grid(
+            [
+                (channels / 8).div_ceil(TILE_BLOCK),
+                x.data.rows.div_ceil(CONV_TT).max(1),
+                1,
+            ],
+            [TILE_BLOCK, 1, 1],
+        );
+        ctx.fire(
+            op,
+            Fire::at(FILE, entrypoint).apply(launch),
+            &[
+                x.data.arg(),
+                weight.arg(),
+                ArgValue::ABSENT,
+                y.arg(),
+                state.conv_slab.arg(),
+                state.slot_ids.arg(),
+                x.indptr.arg(),
+                state.conv_stride.arg(),
+                c.arg(),
+                state.commit_len.arg(),
+                state.begin_at.arg(),
+                ctx.stage(),
+                stated(op, lanes)?.arg(),
+            ],
+        )?;
+    } else {
+        let entrypoint = symbol(&format!("::pie::attn::ssm_conv1d_chunked{}", out.args()));
+        let launch = Launch::grid(
+            [
+                channels.div_ceil(TILE_BLOCK),
+                x.data.rows.div_ceil(CONV_TT).max(1),
+                1,
+            ],
+            [TILE_BLOCK, 1, 1],
+        );
+        ctx.fire(
+            op,
+            Fire::at(FILE, entrypoint).apply(launch),
+            &[
+                x.data.arg(),
+                weight.arg(),
+                ArgValue::ABSENT,
+                y.arg(),
+                state.conv_slab.arg(),
+                state.slot_ids.arg(),
+                x.indptr.arg(),
+                state.conv_stride.arg(),
+                c.arg(),
+                k.arg(),
+                dil.arg(),
+                state.write_state.arg(),
+                state.write_state_mask.arg(),
+                state.commit_len.arg(),
+                state.begin_at.arg(),
+                ctx.stage(),
+                stated(op, lanes)?.arg(),
+            ],
+        )?;
+    }
     if !state.write_state {
         return Ok(());
     }
