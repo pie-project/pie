@@ -1729,6 +1729,25 @@ impl<'c> Run<'c> {
         }
     }
 
+    /// `id`'s pool with the whole fire's page tables, for a reader that
+    /// indexes them by the fire's own request ids (`request_of_token`)
+    /// whatever lanes this region starts at; `None` where the region reads
+    /// gathered seats instead.
+    pub(crate) fn pool_whole(&self, id: ValueId) -> Option<KvPool> {
+        if self.window().gathered.is_some() {
+            return None;
+        }
+        let pool = self.pool(id);
+        Some(match self.cache(id) {
+            CachePool::Kv { pool: whole, .. } => KvPool {
+                page_indptr: whole.page_indptr,
+                last_page_lens: whole.last_page_lens,
+                ..pool
+            },
+            CachePool::Recurrent(_) => pool,
+        })
+    }
+
     pub(crate) fn windowed(&self, handle: Tensor) -> Tensor {
         if !self.plane_base() {
             return handle;

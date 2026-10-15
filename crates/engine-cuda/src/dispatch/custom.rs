@@ -169,11 +169,11 @@ impl Run<'_> {
             }
         }
         // DeepSeek's fp8 rows have no other reader: the one launch at any
-        // width.
-        if self.fp8_rows(window)
-            && let Some(landed) = self.dsv4_decode(window, Some(pool), *sink, *o_out)
-        {
-            return landed;
+        // width, or a refusal, never the four ops reading them as bf16.
+        if self.fp8_rows(window) {
+            return self
+                .dsv4_decode(window, Some(pool), *sink, *o_out)
+                .unwrap_or_else(|| Err(fp8_unread(op.name())));
         }
         self.attention(window)?;
         self.attention(pool)?;
@@ -208,7 +208,7 @@ impl Run<'_> {
     /// DeepSeek-V4's window (`window`, a `PrefillLse`), its pool if any
     /// (`PoolLse` or `PoolLseSelected`) and the sinks in one launch
     /// (`attn::dsv4::decode`), the sinked output in `o_out`; `None` where it
-    /// does not take the shape.
+    /// does not take the shape or the region reads gathered seats.
     fn dsv4_decode(
         &mut self,
         window: &poem_ir::Attention,
@@ -254,7 +254,7 @@ impl Run<'_> {
                 (
                     *positions,
                     *request_of_token,
-                    Some((self.pool(*entries), *ratio, selection)),
+                    Some((self.pool_whole(*entries)?, *ratio, selection)),
                 )
             }
             Some(_) => return None,
@@ -269,7 +269,10 @@ impl Run<'_> {
         };
         let q = self.tensor(q);
         let heads = q.width / head_dim.max(1);
-        let window_pool = self.pool(cache);
+        // The kernel reads each row's request id against the whole fire's
+        // page tables, so it reads them whole whatever lanes this region
+        // starts at (and not at all where the region reads gathered seats).
+        let window_pool = self.pool_whole(cache)?;
         let pooled = pooled
             .as_ref()
             .map(|(entries, ratio, selection)| dsv4::Pooled {
@@ -306,16 +309,17 @@ impl Run<'_> {
         else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
-        // DeepSeek-V4's window and sinks (its layers without a pool): the
-        // one launch at a decode's rows, and always over fp8 rows.
-        // Its request ids index the whole fire's page tables, so only where
-        // this region's lanes start at the fire's first.
-        let unshifted = self.window().gathered.is_none() && self.window().span().lane_offset == 0;
-        if let poem_ir::Attention::PrefillLse { .. } = **attn
-            && unshifted
-        {
+        // DeepSeek-V4's window and sinks (its layers without a pool, its
+        // draft head): the one launch at a decode's rows; over fp8 rows that
+        // or a refusal, never FlashInfer reading them as bf16.
+        if let poem_ir::Attention::PrefillLse { .. } = **attn {
+            if self.fp8_rows(attn) {
+                return self
+                    .dsv4_decode(attn, None, *sink, *o_out)
+                    .unwrap_or_else(|| Err(fp8_unread(op.name())));
+            }
             let rows = self.tensor(*o_out).rows;
-            if (rows <= self.ctx().tuning().dsv4_decode_until || self.fp8_rows(attn))
+            if rows <= self.ctx().tuning().dsv4_decode_until
                 && let Some(landed) = self.dsv4_decode(attn, None, *sink, *o_out)
             {
                 return landed;
@@ -797,5 +801,16 @@ impl poem_exec::DispatchProbe for Run<'_> {
                 );
             }
         }
+    }
+}
+
+/// A read of DeepSeek's fp8 rows nothing here takes: refused, as no other
+/// reader knows the plane.
+fn fp8_unread(op: &'static str) -> kernels_cuda::Error {
+    kernels_cuda::Error::Backend {
+        op,
+        detail: "the cache holds DeepSeek's fp8 rows and only `attn::dsv4::decode` reads them; \
+                 it does not take this shape or this region's gathered seats"
+            .to_string(),
     }
 }

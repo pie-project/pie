@@ -413,6 +413,14 @@ impl Run<'_> {
                 o,
                 lse,
             } => {
+                if attn::dsv4::fp8_ds(&self.pool(*cache)) {
+                    return Err(kernels_cuda::Error::Backend {
+                        op: "attention.prefill_lse",
+                        detail: "the cache holds DeepSeek's fp8 rows, which only the fused \
+                                 `attention.pool_attention` and `attention.lse_sink` read"
+                            .to_string(),
+                    });
+                }
                 attn::prefill_lse(
                     self.ctx(),
                     self.ragged_q(*q),
