@@ -80,10 +80,18 @@ pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Resu
         "the normed rectangle is the stream rectangle"
     );
     nonzero(OP, "rows", y.rows)?;
+    // Eight elements a thread, 1024 threads a row, where the row is whole
+    // 16-byte runs: a 16384-wide stream row is two loads a thread, not 64
+    // serial ones (DeepSeek-V4-Flash decode8: 28 us a call).
+    let vec8 = y.width.is_multiple_of(8) && streams.ptr % 16 == 0 && y.ptr % 16 == 0;
+    let (entry, block) = if vec8 {
+        ("::pie::elemwise::hc_rmsnorm_f32_vec8<::pie::bf16, 1024>", 1024)
+    } else {
+        ("::pie::elemwise::hc_rmsnorm_f32<::pie::bf16, 256>", BLOCK)
+    };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::elemwise::hc_rmsnorm_f32<::pie::bf16, 256>")
-            .apply(Launch::per_row(y.rows, BLOCK)),
+        Fire::at(FILE, entry).apply(Launch::per_row(y.rows, block)),
         &[
             streams.arg(),
             y.arg(),
@@ -217,6 +225,37 @@ pub fn gates(
         ));
     }
     nonzero(OP, "rows", x.rows)?;
+    // The combined form with its Sinkhorn walk in one warp and the row's
+    // width over blocks, enough of them to fill the SMs (DeepSeek-V4-Flash
+    // decode8: 32 us a call on the block-barrier walk, a block a row).
+    if comb && fan * fan <= 32 {
+        let hidden = nonzero(OP, "the hidden width", x.width)?;
+        let want = 2 * ctx.multiprocessors().unwrap_or(132);
+        let slices = want.div_ceil(x.rows).clamp(1, hidden.div_ceil(BLOCK));
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!("::pie::elemwise::hc_gates_warp<{t}, 256>")),
+            )
+            .apply(Launch::grid([x.rows, slices, 1], [BLOCK, 1, 1])),
+            &[
+                normed.arg(),
+                scale.arg(),
+                base.arg(),
+                streams.arg(),
+                post_mix.arg(),
+                comb_mix.arg(),
+                x.arg(),
+                stated(OP, fan)?.arg(),
+                stated(OP, hidden)?.arg(),
+                gate_eps.arg(),
+                alpha.arg(),
+                stated(OP, sinkhorn)?.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(

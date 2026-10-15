@@ -178,6 +178,95 @@ __global__ void hc_gates(
     }
 }
 
+// `hc_gates`' combined form with the combine's Sinkhorn walk held in one
+// warp's lanes (an entry a lane, `M * M <= 32`) and its sums taken by
+// shuffles, in the order the shared-memory walk takes them, rather than 40
+// block barriers; and the row's `H` spread over `gridDim.y` blocks, each of
+// which works the row's few gates out again. Block `y == 0` lands the post
+// and combine mixes.
+template <class T, int BLOCK = 256>
+__global__ void __launch_bounds__(BLOCK) hc_gates_warp(
+    const float* __restrict__ mixes,
+    const float* __restrict__ scale,
+    const float* __restrict__ base,
+    const T* __restrict__ residual,
+    float* __restrict__ post_mix,
+    float* __restrict__ comb_mix,
+    T* __restrict__ layer_input,
+    int M,
+    int H,
+    float hc_eps,
+    float hc_post_alpha,
+    int sinkhorn_iters,
+    const u32* __restrict__ win)
+{
+    const int n = blockIdx.x;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int tid = threadIdx.x;
+    const int mix_hc = M * 2 + M * M;
+    const float* row = mixes + static_cast<long long>(plane_row) * mix_hc;
+    const bool lands = blockIdx.y == 0;
+
+    __shared__ float pre[MAX_HC_MULT];
+    if (tid < 32) {
+        if (tid < M) {
+            const float logit = row[tid] * scale[0] + base[tid];
+            pre[tid] = 1.f / (1.f + expf(-logit)) + hc_eps;
+            const float pl = row[M + tid] * scale[1] + base[M + tid];
+            if (lands)
+                post_mix[static_cast<long long>(plane_row) * M + tid] =
+                    1.f / (1.f + expf(-pl)) * hc_post_alpha;
+        }
+        // The combine: lane `i * M + j` holds entry (i, j).
+        const int MM = M * M;
+        const int i = tid / M, j = tid % M;
+        float c = tid < MM ? row[2 * M + tid] * scale[2] + base[2 * M + tid] : 0.f;
+        auto at = [&](int lane) { return __shfl_sync(0xffffffffu, c, lane < MM ? lane : 0); };
+        // Row softmax, then the eps.
+        {
+            float max_v = -flt_max();
+            for (int k = 0; k < M; ++k) max_v = fmaxf(max_v, at(i * M + k));
+            c = expf(c - max_v);
+            float sum = 0.f;
+            for (int k = 0; k < M; ++k) sum += at(i * M + k);
+            c = c / sum + hc_eps;
+        }
+        // Column, then (row, column) `sinkhorn_iters - 1` times.
+        auto col = [&]() {
+            float s = 0.f;
+            for (int k = 0; k < M; ++k) s += at(k * M + j);
+            s += hc_eps;
+            c = c / s;
+        };
+        auto rowf = [&]() {
+            float s = 0.f;
+            for (int k = 0; k < M; ++k) s += at(i * M + k);
+            s += hc_eps;
+            c = c / s;
+        };
+        col();
+        for (int iter = 0; iter < sinkhorn_iters - 1; ++iter) {
+            rowf();
+            col();
+        }
+        if (lands && tid < MM)
+            comb_mix[static_cast<long long>(plane_row) * MM + tid] = c;
+    }
+    __syncthreads();
+
+    const T* res_n = residual + static_cast<long long>(plane_row) * M * H;
+    T* out = layer_input + static_cast<long long>(plane_row) * H;
+    const int per = (H + gridDim.y - 1) / gridDim.y;
+    const int h0 = blockIdx.y * per;
+    const int h1 = min(h0 + per, H);
+    for (int h = h0 + tid; h < h1; h += BLOCK) {
+        float acc = 0.f;
+        for (int k = 0; k < M; ++k) acc += pre[k] * Elem<T>::to_f32(res_n[k * H + h]);
+        out[h] = Elem<T>::from_f32(acc);
+    }
+}
+
 template <class T>
 __global__ void hc_fold(
     const T* __restrict__ x,
@@ -328,6 +417,60 @@ __global__ void hc_rmsnorm_f32(
     const float s = scale;
     for (int d = tid; d < dim; d += blockDim.x) {
         out[d] = Elem<T>::to_f32(row[d]) * s;
+    }
+}
+
+// `hc_rmsnorm_f32` eight elements a thread (one 16-byte load, two 16-byte
+// stores), a 1024-thread block a row: a 16384-wide stream row is two loads a
+// thread rather than 64 serial ones. `dim` a whole number of eight.
+template <class T, int BLOCK>
+__global__ void __launch_bounds__(BLOCK) hc_rmsnorm_f32_vec8(
+    const T* __restrict__ input,
+    float* __restrict__ output,
+    int dim,
+    float eps,
+    const u32* __restrict__ win)
+{
+    static_assert(sizeof(T) == 2, "eight elements are one 16-byte load");
+    const int n = blockIdx.x;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int tid = threadIdx.x;
+    const uint4* row = reinterpret_cast<const uint4*>(input + static_cast<long long>(plane_row) * dim);
+    float4* out = reinterpret_cast<float4*>(output + static_cast<long long>(plane_row) * dim);
+    const int vecs = dim / 8;
+
+    float local_sum = 0.f;
+    for (int v = tid; v < vecs; v += BLOCK) {
+        const uint4 raw = row[v];
+        const T* e = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float x = Elem<T>::to_f32(e[j]);
+            local_sum += x * x;
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+    __shared__ float warp_sums[BLOCK / 32];
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = local_sum;
+    __syncthreads();
+    __shared__ float scale;
+    if (tid < 32) {
+        float t = tid < BLOCK / 32 ? warp_sums[tid] : 0.f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            t += __shfl_down_sync(0xFFFFFFFF, t, offset);
+        if (tid == 0) scale = rsqrtf(t / dim + eps);
+    }
+    __syncthreads();
+    const float sc = scale;
+    for (int v = tid; v < vecs; v += BLOCK) {
+        const uint4 raw = row[v];
+        const T* e = reinterpret_cast<const T*>(&raw);
+        out[2 * v] = make_float4(Elem<T>::to_f32(e[0]) * sc, Elem<T>::to_f32(e[1]) * sc,
+                                 Elem<T>::to_f32(e[2]) * sc, Elem<T>::to_f32(e[3]) * sc);
+        out[2 * v + 1] = make_float4(Elem<T>::to_f32(e[4]) * sc, Elem<T>::to_f32(e[5]) * sc,
+                                     Elem<T>::to_f32(e[6]) * sc, Elem<T>::to_f32(e[7]) * sc);
     }
 }
 
