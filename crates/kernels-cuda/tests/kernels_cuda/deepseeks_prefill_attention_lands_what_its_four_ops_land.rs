@@ -10,6 +10,7 @@ use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::dsv4_prefill::{self, Pooled};
 use kernels_cuda::tensor::{KvPool, Tensor};
+use kernels_cuda::tuning::Tuning;
 
 const PAGE: usize = 64;
 const HEADS: usize = 64;
@@ -52,6 +53,12 @@ fn paging(per: usize) -> (Vec<u32>, Vec<u32>) {
 }
 
 fn check(ratio: usize, top_k: Option<usize>) {
+    for sparse in [false, true] {
+        check_with(ratio, top_k, sparse);
+    }
+}
+
+fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool) {
     let per = 18;
     let cells = 2 * per * PAGE;
     let (pages, indptr) = paging(per);
@@ -112,7 +119,10 @@ fn check(ratio: usize, top_k: Option<usize>) {
         dsv4_prefill::takes(HEADS as u32, D as u32, Some(128), &win, &pooled),
         "the kernel takes DeepSeek-V4-Flash's shape"
     );
-    let ctx = gpu.ctx();
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        dsv4_sparse: sparse,
+        ..Tuning::DEFAULT
+    });
     dsv4_prefill::prefill(
         &ctx,
         "attention.pool_attention",
@@ -180,7 +190,7 @@ fn check(ratio: usize, top_k: Option<usize>) {
     }
     assert!(
         worst <= 4e-2,
-        "ratio {ratio}, top_k {top_k:?}: an output element differs by {worst} relative"
+        "ratio {ratio}, top_k {top_k:?}, sparse {sparse}: an output element differs by {worst} relative"
     );
 }
 
@@ -241,34 +251,39 @@ fn deepseeks_prefill_attention_paces_a_prefill() {
         ratio: ratio as u32,
         selection: Some((sel_t, k as u32)),
     };
-    let ctx = gpu.ctx();
-    let mut fire = || {
-        dsv4_prefill::prefill(
-            &ctx,
-            "attention.pool_attention",
-            q_t,
-            pos_t,
-            req_t,
-            &win,
-            &pooled,
-            sink_t,
-            0.044,
-            &mut o,
-        )
-        .expect("the prefill attention fires");
-    };
-    fire();
-    gpu.sync();
-    let iters = 20;
-    let t0 = std::time::Instant::now();
-    for _ in 0..iters {
+    for sparse in [false, true] {
+        let ctx = gpu.ctx().with_tuning(Tuning {
+            dsv4_sparse: sparse,
+            ..Tuning::DEFAULT
+        });
+        let mut fire = || {
+            dsv4_prefill::prefill(
+                &ctx,
+                "attention.pool_attention",
+                q_t,
+                pos_t,
+                req_t,
+                &win,
+                &pooled,
+                sink_t,
+                0.044,
+                &mut o,
+            )
+            .expect("the prefill attention fires");
+        };
         fire();
+        gpu.sync();
+        let iters = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            fire();
+        }
+        gpu.sync();
+        let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+        let flops = (n * HEADS * (k + 128) * D * 4) as f64;
+        println!(
+            "| {n} rows, window + {k} selected, sparse {sparse} | {us:.0} us | {:.1} TFLOP/s useful |",
+            flops / us / 1e6
+        );
     }
-    gpu.sync();
-    let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
-    let flops = (n * HEADS * (k + 128) * D * 4) as f64;
-    println!(
-        "| {n} rows, window + {k} selected | {us:.0} us | {:.1} TFLOP/s useful |",
-        flops / us / 1e6
-    );
 }

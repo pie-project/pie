@@ -176,6 +176,13 @@ pub struct SdpaPoolMma;
 #[decision(id = "kernel.sdpa.dsv4_prefill_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
 pub struct SdpaDsv4PrefillFrom(pub u32);
 
+/// Whether that pass runs a block a row (`attn/dsv4_sparse.cuh`: Q in TMEM,
+/// whole 64-key tiles, V the tile K brought) rather than a block a pair of
+/// rows over their keys' union. Off runs the pairs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.dsv4_sparse", flag, default = false, tune = search)]
+pub struct SdpaDsv4Sparse;
+
 /// Whether a pooled index (`attention.index_topk`) scores its blocks on the
 /// tensor cores rather than a thread a block. Off scores the scalar way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -479,6 +486,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaIndexRadix>()
         .add::<SdpaPoolMma>()
         .add::<SdpaDsv4PrefillFrom>()
+        .add::<SdpaDsv4Sparse>()
         .add::<GemmNarrowN>();
 }
 
@@ -548,6 +556,7 @@ pub struct Tuning {
     pub index_radix: bool,
     pub pool_mma: bool,
     pub dsv4_prefill_from: u32,
+    pub dsv4_sparse: bool,
     pub gemm_narrow_n: u32,
 }
 
@@ -615,6 +624,7 @@ impl Tuning {
         index_radix: false,
         pool_mma: false,
         dsv4_prefill_from: 0,
+        dsv4_sparse: false,
         gemm_narrow_n: 0,
     };
 
@@ -682,6 +692,7 @@ impl Tuning {
             index_radix: profile.on::<SdpaIndexRadix>(&Anywhere),
             pool_mma: profile.on::<SdpaPoolMma>(&Anywhere),
             dsv4_prefill_from: profile.get::<SdpaDsv4PrefillFrom>().0,
+            dsv4_sparse: profile.on::<SdpaDsv4Sparse>(&Anywhere),
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,
         }
     }

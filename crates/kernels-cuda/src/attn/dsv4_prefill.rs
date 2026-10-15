@@ -39,6 +39,38 @@ struct Params {
     scale_log2: f32,
 }
 
+const SPARSE_FILE: &str = "attn/dsv4_sparse.cuh";
+
+/// `pie::attn::dsv4s::Params`, field for field.
+#[repr(C)]
+struct SparseParams {
+    o: u64,
+    q: u64,
+    positions: u64,
+    requests: u64,
+    win_indptr: u64,
+    win_indices: u64,
+    ent_indptr: u64,
+    ent_indices: u64,
+    selection: u64,
+    sinks: u64,
+    live: u64,
+    sinks_f32: i32,
+    ent_runs: i32,
+    win_page: i32,
+    ent_page: i32,
+    top_k: i32,
+    ratio: i32,
+    rows: i32,
+    q_stride: i32,
+    o_stride: i32,
+    scale_log2: f32,
+}
+
+/// `pie::attn::dsv4s::smem_bytes`: three 64-key tiles, P twice, the score
+/// exchange, three key lists, barriers, and the 1024-byte alignment.
+const SPARSE_SMEM: u32 = 3 * 65536 + 2 * 8192 + 16384 + 3 * 64 * 4 + 512 + 1024;
+
 const HEADS: u32 = 64;
 const HEAD_DIM: u32 = 512;
 const WINDOW: u32 = 128;
@@ -194,6 +226,51 @@ pub fn prefill(
         len: 128,
     };
     let selected = pooled.selection.is_some();
+    if ctx.tuning().dsv4_sparse {
+        // A block a row (`attn/dsv4_sparse.cuh`): Q in TMEM, whole 64-key
+        // tiles, V the tile K brought.
+        let sparse = SparseParams {
+            o: o.ptr,
+            q: q.ptr,
+            positions: positions.ptr,
+            requests: requests.ptr,
+            win_indptr: window_pool.page_indptr.ptr,
+            win_indices: window_pool.page_indices.ptr,
+            ent_indptr: pooled.entries.page_indptr.ptr,
+            ent_indices: pooled.entries.page_indices.ptr,
+            selection,
+            sinks: sinks.ptr,
+            live,
+            sinks_f32: i32::from(sinks.dtype == Dtype::F32),
+            ent_runs: i32::from(ent_runs),
+            win_page: window_pool.page_size,
+            ent_page: pooled.entries.page_size,
+            top_k: int(top_k),
+            ratio: int(pooled.ratio),
+            rows: int(rows),
+            q_stride: int(q.width),
+            o_stride: int(o.width),
+            scale_log2: sm_scale * core::f32::consts::LOG2_E,
+        };
+        return ctx.fire(
+            op,
+            Fire::at(
+                SPARSE_FILE,
+                symbol(&format!("::pie::attn::dsv4s::dsv4_sparse<{selected}>")),
+            )
+            .apply(Launch::grid([rows, 1, 1], [384, 1, 1]).smem(SPARSE_SMEM)),
+            &[
+                bytes(&map_win),
+                bytes(&map_ent),
+                bytes(&map_win_run),
+                bytes(&map_ent_run),
+                ArgValue::Bytes {
+                    ptr: (&raw const sparse).cast(),
+                    len: core::mem::size_of::<SparseParams>(),
+                },
+            ],
+        );
+    }
     ctx.fire(
         op,
         Fire::at(
