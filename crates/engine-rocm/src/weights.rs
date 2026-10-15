@@ -664,6 +664,14 @@ fn pairings<'a>(
                 "is an affine bank whose zero points this plan does not publish as a \
                  param of their own",
             )?),
+            ScaleForm::E4m3TensorScaled | ScaleForm::F32Tensor => {
+                return Err(Fault::Param {
+                    name: (*name).to_string(),
+                    why: "is an NVFP4 plane (e4m3 scales under f32 tensor scales) or a \
+                          per-tensor e4m3 table, which rocm has no products for; serve a \
+                          bf16, u4g64 or mxfp4 deployment of this model",
+                });
+            }
             ScaleForm::F32Factors => {
                 return Err(Fault::Param {
                     name: (*name).to_string(),
