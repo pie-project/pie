@@ -14,13 +14,14 @@ using namespace metal;
 //   order the lanes take them, with their sums, so a lane reads its 16 inputs
 //   of a 64-code group as one load and no threadgroup stages them;
 // - a lane reads its two words of a 64-code group (one scale, one bias) as
-//   one 8-byte load per fragment, its next group's while this one's MMAs run.
+//   one 8-byte load per fragment, the next two groups' while these two's MMAs run.
 // A threadgroup is 4 simdgroups of 16 columns; a lane holds column fm of each
 // 8-column fragment and reads words 2c and 2c + 1 (c = fn / 2) of its 64-code
 // group, whose pair p (codes p and p + 4 of word 2c + j) is its operand of
 // MMA step (j, p): the step's eight k are the four lanes' pairs, all of one
 // group. `SPLIT` is the grid's y extent: partitions of the contraction,
-// written to `partials` and folded by the split-k reduce.
+// written to `partials` and added, in partition order, by the last partition
+// of each column tile to arrive.
 
 namespace qmm_sg {
 
@@ -48,14 +49,22 @@ constant constexpr int kSpan = 256;
 // The rows' inputs as the tile's lanes take them: for each 64-code group h and B-operand lane
 // slot (fm, c), the 16 inputs of rows 2c and 2c + 1 at MMA steps (j, p) = 0..1 x 0..3, which sit
 // at k = 64h + 8(2c' + j) + p + 4i for the A lane c' = fm / 2 that pairs with B row fm (i = fm % 2);
-// then each row's sum of each 32 inputs, [group][row], at `table` + 8 * width.
+// then each row's sum of each 32 inputs, [group][row], at `table` + 8 * width; then the split
+// tile's arrival counters, one per 64 columns, which it zeroes.
 [[kernel]] void qmm_sg_table(const device bfloat *input [[buffer(0)]], device bfloat *table [[buffer(1)]],
                              constant int &width [[buffer(2)]], constant int &rows [[buffer(3)]],
-                             uint2 at [[thread_position_in_grid]]) {
-  const uint h = at.x, slot = at.y;
+                             constant int &counters [[buffer(4)]],
+                             uint2 at [[thread_position_in_grid]], uint2 grid [[threads_per_grid]]) {
+  // A simdgroup per 64-code group h (grid.y), a lane per slot (grid.x).
+  const uint slot = at.x, h = at.y;
+  // The split tile's arrival counters, past the sums: zero before the tile counts on them.
+  device uint *count = reinterpret_cast<device uint *>(table + 8 * ulong(width)) + width / 4;
+  for (uint at_ = h * 32 + slot; at_ < uint(counters); at_ += grid.x * grid.y)
+    count[at_] = 0;
   const uint fm = slot >> 2, c = slot & 3;
   const uint cp = fm >> 1, i = fm & 1;
   vec<bfloat, 16> v;
+  float sum[2] = {0.0f, 0.0f};
 #pragma unroll
   for (int j = 0; j < 2; ++j)
 #pragma unroll
@@ -64,21 +73,24 @@ constant constexpr int kSpan = 256;
 #pragma unroll
       for (int r = 0; r < 2; ++r) {
         const int row = 2 * c + r;
-        v[8 * j + 2 * p + r] = row < rows ? input[ulong(row) * width + k] : bfloat(0.0f);
+        const bfloat x = row < rows ? input[ulong(row) * width + k] : bfloat(0.0f);
+        v[8 * j + 2 * p + r] = x;
+        sum[r] += float(x);
       }
     }
   reinterpret_cast<device vec<bfloat, 16> *>(table)[ulong(h) * 32 + slot] = v;
-  if (slot < 8) {
+  // A lane's 16 inputs are 8 of each of its two rows, all in the 32-input group fm / 4; the
+  // four lanes of that group and rows (fm bits 0 and 1) add theirs.
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    sum[r] += simd_shuffle_xor(sum[r], 4u);
+    sum[r] += simd_shuffle_xor(sum[r], 8u);
+  }
+  if ((fm & 3) == 0) {
     device float *sums = reinterpret_cast<device float *>(table + 8 * ulong(width));
-    const int row = slot;
 #pragma unroll
-    for (int g = 0; g < 2; ++g) {
-      float sum = 0.0f;
-#pragma unroll
-      for (int q = 0; q < 32; ++q)
-        sum += row < rows ? float(input[ulong(row) * width + 64 * h + 32 * g + q]) : 0.0f;
-      sums[(2 * ulong(h) + g) * 8 + row] = sum;
-    }
+    for (int r = 0; r < 2; ++r)
+      sums[(2 * ulong(h) + (fm >> 2)) * 8 + 2 * c + r] = sum[r];
   }
 }
 
@@ -106,68 +118,126 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
   const device vec<bfloat, 16> *xt =
       reinterpret_cast<const device vec<bfloat, 16> *>(table) + fm * 4 + c;
   const device float *sums = reinterpret_cast<const device float *>(table + 8 * ulong(width));
-  const int spans = width / kSpan / SPLIT;
-  const int first = int(position.y) * spans * 4, last = first + spans * 4;
+  // Partition y takes 256-input units [y * units / SPLIT, (y + 1) * units / SPLIT), as Splash's
+  // tile cuts them: a contraction need not hold SPLIT equal parts (down's 68 units take 8).
+  const int units = width / kSpan;
+  const int first = int(position.y) * units / SPLIT * 4, last = (int(position.y) + 1) * units / SPLIT * 4;
+  // Two groups a step: their words, scales and biases load while the step before runs.
+  constexpr int U = 2;
   float2 acc[NF];
-  uint2 q[NF];
-  float qs[NF], qb[NF];
+  uint2 q[U][NF];
+  float qs[U][NF], qb[U][NF];
 #pragma unroll
-  for (int f = 0; f < NF; ++f) {
+  for (int f = 0; f < NF; ++f)
     acc[f] = float2(0.0f);
-    q[f] = w0[f * apart + ulong(first) * 4];
-    qs[f] = float(s0[8 * f * groups + first]);
-    qb[f] = float(b0[8 * f * groups + first]);
-  }
-  for (int h = first; h < last; ++h) {
-    uint2 cw[NF];
-    float2 ck[NF];
+#pragma unroll
+  for (int u = 0; u < U; ++u)
 #pragma unroll
     for (int f = 0; f < NF; ++f) {
-      cw[f] = q[f];
-      ck[f] = float2(qs[f], fma(-128.0f, qs[f], qb[f]));
+      q[u][f] = w0[f * apart + ulong(first + u) * 4];
+      qs[u][f] = float(s0[8 * f * groups + first + u]);
+      qb[u][f] = float(b0[8 * f * groups + first + u]);
     }
-    if (h + 1 < last) {
+  for (int h0 = first; h0 < last; h0 += U) {
+    uint2 cw[U][NF];
+    float2 ck[U][NF];
+#pragma unroll
+    for (int u = 0; u < U; ++u)
 #pragma unroll
       for (int f = 0; f < NF; ++f) {
-        q[f] = w0[f * apart + ulong(h + 1) * 4];
-        qs[f] = float(s0[8 * f * groups + h + 1]);
-        qb[f] = float(b0[8 * f * groups + h + 1]);
+        cw[u][f] = q[u][f];
+        ck[u][f] = float2(qs[u][f], fma(-128.0f, qs[u][f], qb[u][f]));
       }
+    if (h0 + U < last) {
+#pragma unroll
+      for (int u = 0; u < U; ++u)
+#pragma unroll
+        for (int f = 0; f < NF; ++f) {
+          q[u][f] = w0[f * apart + ulong(h0 + U + u) * 4];
+          qs[u][f] = float(s0[8 * f * groups + h0 + U + u]);
+          qb[u][f] = float(b0[8 * f * groups + h0 + U + u]);
+        }
     }
-    const vec<bfloat, 16> x = xt[ulong(h) * 32];
-    // One chain per 64 codes (one scale and bias).
-    float2 d[NF];
 #pragma unroll
-    for (int f = 0; f < NF; ++f)
-      d[f] = float2(0.0f);
+    for (int u = 0; u < U; ++u) {
+      const int h = h0 + u;
+      const vec<bfloat, 16> x = xt[ulong(h) * 32];
+      // One chain per 64 codes (one scale and bias).
+      float2 d[NF];
 #pragma unroll
-    for (int j = 0; j < 2; ++j)
+      for (int f = 0; f < NF; ++f)
+        d[f] = float2(0.0f);
 #pragma unroll
-      for (uint p = 0; p < 4; ++p) {
-        const bfloat2 b = bfloat2(x[8 * j + 2 * p], x[8 * j + 2 * p + 1]);
+      for (int j = 0; j < 2; ++j)
 #pragma unroll
-        for (int f = 0; f < NF; ++f)
-          mma(d[f], as_type<bfloat2>(((cw[f][j] >> (4 * p)) & 0x000F000Fu) | 0x43004300u), b);
+        for (uint p = 0; p < 4; ++p) {
+          const bfloat2 b = bfloat2(x[8 * j + 2 * p], x[8 * j + 2 * p + 1]);
+#pragma unroll
+          for (int f = 0; f < NF; ++f)
+            mma(d[f], as_type<bfloat2>(((cw[u][f][j] >> (4 * p)) & 0x000F000Fu) | 0x43004300u), b);
+        }
+      const float2 sm = *reinterpret_cast<const device float2 *>(sums + 2 * ulong(h) * 8 + fn) +
+                        *reinterpret_cast<const device float2 *>(sums + (2 * ulong(h) + 1) * 8 + fn);
+#pragma unroll
+      for (int f = 0; f < NF; ++f) {
+        acc[f] = fma(d[f], ck[u][f].x, acc[f]);
+        acc[f] = fma(sm, ck[u][f].y, acc[f]);
       }
-    const float2 sm = *reinterpret_cast<const device float2 *>(sums + 2 * ulong(h) * 8 + fn) +
-                      *reinterpret_cast<const device float2 *>(sums + (2 * ulong(h) + 1) * 8 + fn);
-#pragma unroll
-    for (int f = 0; f < NF; ++f) {
-      acc[f] = fma(d[f], ck[f].x, acc[f]);
-      acc[f] = fma(sm, ck[f].y, acc[f]);
     }
   }
+  if constexpr (SPLIT > 1) {
+    // Each partition publishes its sums; the last of a column tile's to arrive adds them in
+    // partition order, as the split-k reduce did, and writes the output.
+    device coherent(device) float *plane = partials;
 #pragma unroll
-  for (uint i = 0; i < 2; ++i) {
-    const uint row = fn + i;
-    if (int(row) >= rows)
-      continue;
-    const ulong o = ulong(row) * columns + column;
+    for (uint i = 0; i < 2; ++i) {
+      const uint row = fn + i;
+      if (int(row) >= rows)
+        continue;
+      const ulong o = ulong(row) * columns + column;
 #pragma unroll
-    for (int f = 0; f < NF; ++f) {
-      if constexpr (SPLIT > 1)
-        partials[ulong(position.y) * rows * columns + o + 8 * f] = acc[f][i];
-      else
+      for (int f = 0; f < NF; ++f)
+        plane[ulong(position.y) * rows * columns + o + 8 * f] = acc[f][i];
+    }
+    threadgroup uint arrival;
+    device atomic_uint *count = reinterpret_cast<device atomic_uint *>(
+                                    const_cast<device bfloat *>(table) + 8 * ulong(width)) +
+                                width / 4 + position.x;
+    const uint me = simd * 32 + lane;
+    threadgroup_barrier(mem_flags::mem_device);
+    if (me == 0) {
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      arrival = atomic_fetch_add_explicit(count, 1u, memory_order_relaxed);
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    if (arrival != SPLIT - 1)
+      return;
+#pragma unroll
+    for (uint i = 0; i < 2; ++i) {
+      const uint row = fn + i;
+      if (int(row) >= rows)
+        continue;
+      const ulong o = ulong(row) * columns + column;
+#pragma unroll
+      for (int f = 0; f < NF; ++f) {
+        float total = 0.0f;
+        for (int s = 0; s < SPLIT; ++s)
+          total += s == int(position.y) ? acc[f][i] : plane[ulong(s) * rows * columns + o + 8 * f];
+        output[o + 8 * f] = bfloat(total);
+      }
+    }
+    if (me == 0)
+      atomic_store_explicit(count, 0u, memory_order_relaxed);
+  } else {
+#pragma unroll
+    for (uint i = 0; i < 2; ++i) {
+      const uint row = fn + i;
+      if (int(row) >= rows)
+        continue;
+      const ulong o = ulong(row) * columns + column;
+#pragma unroll
+      for (int f = 0; f < NF; ++f)
         output[o + 8 * f] = bfloat(acc[f][i]);
     }
   }

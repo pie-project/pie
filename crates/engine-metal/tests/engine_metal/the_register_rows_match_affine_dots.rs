@@ -90,11 +90,14 @@ fn every_register_row_answers_an_affine_reference() {
                 let output_bytes = u64::from(m) * u64::from(n) * 2;
                 let out_b = upload(&vec![0xa5; output_bytes as usize + 64]);
                 let (ha, ho) = (bind(&act_b), bind(&out_b));
-                // The tile's input table: 8 x k bf16 and k / 4 f32 of sums.
-                let table_buffer = upload(&vec![0xa5; 9 * k as usize * 2]);
+                // The tile's input table: 8 x k bf16, k / 4 f32 of sums and the split's
+                // arrival counters, left dirty for the table to zero.
+                let table_rows = 16;
+                let table_buffer = upload(&vec![0xa5; table_rows as usize * k as usize * 2]);
                 let th = bind(&table_buffer);
                 let precast = |rows: u32, width: u32| {
-                    (rows <= 9 && width == k).then(|| Tensor::new(th, rows, width, Dtype::F16))
+                    (rows <= table_rows && width == k)
+                        .then(|| Tensor::new(th, rows, width, Dtype::F16))
                 };
                 let partial_bytes = u64::from(cap) * 8 * u64::from(n) * 4;
                 let partial_buffer = upload(&vec![0xa5; partial_bytes as usize + 64]);

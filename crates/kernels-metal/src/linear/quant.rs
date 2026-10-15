@@ -761,18 +761,7 @@ fn act_x_wt_over(
                 }
             }
             Qmm::Register => {
-                // The rows' inputs as the lanes take them, and their sums: 8 x k bf16, then k / 4 f32.
-                let table = if cols % REGISTER_COLUMNS == 0 && m <= 8 {
-                    (scratch.precast)(9, contraction)
-                } else {
-                    None
-                };
-                if let Some(table) = table {
-                    ctx.fire(
-                        Fire::at(REGISTER_FILE, "qmm_sg_table")
-                            .apply(Grid::of([(k / 64).unsigned_abs(), 32, 1], [2, 32, 1])),
-                        &[act.arg(), table.arg_mut(), k.arg(), m.arg()],
-                    )?;
+                if cols % REGISTER_COLUMNS == 0 && m <= 8 {
                     // Without room for the partials it runs whole.
                     let split = register_split(cols, k, tuning.cores());
                     let partial = (split > 1)
@@ -784,9 +773,29 @@ fn act_x_wt_over(
                         })
                         .flatten();
                     let split = if partial.is_some() { split } else { 1 };
+                    // The rows' inputs as the lanes take them (8 x k bf16), their sums (k / 4
+                    // f32) and, split, one arrival counter per 64 columns, in 2k-byte rows.
+                    let counters = if split > 1 {
+                        cols / REGISTER_COLUMNS
+                    } else {
+                        0
+                    };
+                    let bytes = 16 * k + k + 4 * counters;
+                    let table = (scratch.precast)(
+                        bytes.unsigned_abs().div_ceil(2 * k.unsigned_abs()),
+                        contraction,
+                    );
+                    let Some(table) = table else {
+                        continue;
+                    };
+                    ctx.fire(
+                        Fire::at(REGISTER_FILE, "qmm_sg_table")
+                            .apply(Grid::of([32, (k / 64).unsigned_abs(), 1], [32, 4, 1])),
+                        &[act.arg(), table.arg_mut(), k.arg(), m.arg(), counters.arg()],
+                    )?;
                     let entry = symbol(&format!("affine_qmm_sg_k{split}"));
                     let stamp = symbol(&format!("PIE_SG_POINT(\"{entry}\",{split})"));
-                    ctx.fire(
+                    return ctx.fire(
                         Fire::at(REGISTER_FILE, entry).stamp(stamp).apply(Grid::of(
                             [
                                 128 * (cols / REGISTER_COLUMNS).unsigned_abs(),
@@ -810,11 +819,7 @@ fn act_x_wt_over(
                             m.arg(),
                             ld.arg(),
                         ],
-                    )?;
-                    return match partial {
-                        Some(partial) => splitk_reduce(ctx, op, y, partial, (m, n, cols), split),
-                        None => Ok(()),
-                    };
+                    );
                 }
             }
             Qmm::Tiled { crossover_tg } => {
@@ -1021,14 +1026,15 @@ const REGISTER_SPAN: i32 = 256;
 
 /// The register tile's contraction partitions, as Splash's Apple9 register
 /// tile takes them: doubled (to 8) while the grid stays under 4 threadgroups
-/// a core with 256 inputs a partition, or under 32 a core with 1024.
+/// a core with 256 inputs a partition, or under 32 a core with 1024. Partitions
+/// take whole 256-input units, as many as fall to them, so an uneven count splits too.
 #[must_use]
 pub fn register_split(cols: i32, k: i32, cores: Option<u32>) -> i32 {
     let cores = i64::from(cores.unwrap_or(32));
     let grid = i64::from(cols / REGISTER_COLUMNS);
     let spans = k / REGISTER_SPAN;
     let mut split = 1i32;
-    while split < 8 && spans % (2 * split) == 0 {
+    while split < 8 && spans >= 2 * split {
         let s = i64::from(split);
         let holds = |tg: i64, inputs: i32| grid * s < tg * cores && k / (2 * split) >= inputs;
         if !(holds(4, 256) || holds(32, 1024)) {
