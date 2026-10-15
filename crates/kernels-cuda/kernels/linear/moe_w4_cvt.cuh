@@ -283,9 +283,9 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
 #pragma unroll
         for (int t = 0; t < kTiles; ++t) wide |= cc.s[t][0] > 128u || cc.s[t][1] > 128u;
         if (__any_sync(0xffffffffu, wide)) {
-            w4mma::compute<true>(full, acc);
+            w4mma::compute<true, false>(full, acc);
         } else {
-            w4mma::compute<false>(full, acc);
+            w4mma::compute<false, false>(full, acc);
         }
     };
 

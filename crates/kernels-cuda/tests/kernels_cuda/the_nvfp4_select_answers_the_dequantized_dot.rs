@@ -77,6 +77,9 @@ fn routed(
 ) {
     let mma = Tuning {
         nvfp4_mma_until: 65_536,
+        // As sm100 runs it: the MXFP4 e2m1-convert kernel on, which NVFP4 banks
+        // must not take.
+        mxfp4_cvt: true,
         ..crate::common::TC5
     };
     for tuning in [Tuning::DEFAULT, crate::common::TC5, mma] {
@@ -228,6 +231,9 @@ fn the_register_dequant_gate_up_lands_its_swiglu() {
     let y_at = gpu.zeros(tokens * top_k * inter * 2);
     let ctx = gpu.ctx().with_tuning(Tuning {
         nvfp4_mma_until: 65_536,
+        // As sm100 runs it: the MXFP4 e2m1-convert kernel on, which NVFP4 banks
+        // must not take.
+        mxfp4_cvt: true,
         ..crate::common::TC5
     });
     let slab =
