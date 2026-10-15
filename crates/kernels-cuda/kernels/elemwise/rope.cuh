@@ -686,6 +686,139 @@ __global__ void rope_yarn_split_append(
     }
 }
 
+// Qwen3.5's attention prologue in one launch, a warp a (row, head), PER
+// (head_dim / 32) consecutive values a lane in one 8- or 16-byte load: a q
+// head cut from its [q | gate] row (the gate copied out beside it) and a k
+// head, each normed per head with its plus-one weight and its rotary prefix
+// turned (`rope_partial`'s pairs, `span` apart, from the rounded normed
+// values, as the norm then the rotation land them); the k head and its v
+// head land in the paged (NHD) cache at the row's page and offset.
+template <int PER> struct QgRun { using type = uint4; };
+template <> struct QgRun<4> { using type = uint2; };
+
+template <int PER>
+__global__ __launch_bounds__(256) void qg_qknorm_rope_append(
+    const bf16* __restrict__ qg,
+    const bf16* __restrict__ k,
+    const bf16* __restrict__ v,
+    const bf16* __restrict__ q_norm,
+    const bf16* __restrict__ k_norm,
+    const i32* __restrict__ positions,
+    bf16* __restrict__ q_out,
+    bf16* __restrict__ gate_out,
+    bf16* __restrict__ k_pages,
+    bf16* __restrict__ v_pages,
+    const u32* __restrict__ w_page,
+    const u32* __restrict__ w_off,
+    const u8* __restrict__ row_valid,
+    int page_size,
+    int Hq,
+    int Hk,
+    int units,
+    int rotary_dim,
+    int span,
+    float theta,
+    float q_eps,
+    float k_eps,
+    const u32* __restrict__ win)
+{
+    static_assert(PER == 4 || PER == 8, "a lane's run is one 8- or 16-byte load");
+    using Run = typename QgRun<PER>::type;
+    constexpr int D = 32 * PER;
+    __shared__ float freqs[D / 2];
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    // The pairs' frequencies once a block, as rope_partial takes them.
+    for (int pr = threadIdx.x; pr < rotary_dim / 2; pr += blockDim.x) {
+        freqs[pr] = powf(theta, -static_cast<float>(pr) / static_cast<float>(span));
+    }
+    __syncthreads();
+    const int unit = static_cast<int>(blockIdx.x) * 8 + warp;
+    if (unit >= units) return;
+    const int heads = Hq + Hk;
+    const int n = unit / heads;
+    const int head = unit - n * heads;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const bool is_q = head < Hq;
+    const int kvh = head - Hq;
+
+    KvSlot slot{};
+    if (!is_q) {
+        slot.page = static_cast<int>(w_page[row]);
+        slot.offset_in_page = static_cast<int>(w_off[row]);
+        const bool write_this_row = (row_valid == nullptr || row_valid[row] != 0) &&
+                                    slot.offset_in_page >= 0 && slot.offset_in_page < page_size;
+        if (!write_this_row) return;
+    }
+    const bf16* x = is_q ? qg + (static_cast<long long>(row) * Hq + head) * 2 * D
+                         : k + (static_cast<long long>(row) * Hk + kvh) * D;
+    const bf16* w = is_q ? q_norm : k_norm;
+    const float eps = is_q ? q_eps : k_eps;
+    const int e0 = lane * PER;
+
+    bf16 xv[PER], wv[PER];
+    *reinterpret_cast<Run*>(xv) = *reinterpret_cast<const Run*>(x + e0);
+    *reinterpret_cast<Run*>(wv) = *reinterpret_cast<const Run*>(w + e0);
+    if (is_q) {
+        *reinterpret_cast<Run*>(gate_out + (static_cast<long long>(row) * Hq + head) * D + e0) =
+            *reinterpret_cast<const Run*>(x + D + e0);
+    }
+    float local = 0.f;
+#pragma unroll
+    for (int u = 0; u < PER; ++u) {
+        const float t = bf16_to_f32(xv[u]);
+        local += t * t;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+    const float inv_rms = rsqrtf(local / static_cast<float>(D) + eps);
+    float y[PER];
+#pragma unroll
+    for (int u = 0; u < PER; ++u) {
+        y[u] = bf16_to_f32(f32_to_bf16(bf16_to_f32(xv[u]) * inv_rms * (bf16_to_f32(wv[u]) + 1.f)));
+    }
+    // A pair's mate is `span` on, `span / PER` lanes away at the same slot
+    // (the caller holds span to a whole number of lanes' runs).
+    const int hop = span / PER;
+    float up[PER], down[PER];
+#pragma unroll
+    for (int u = 0; u < PER; ++u) {
+        up[u] = __shfl_sync(0xffffffffu, y[u], (lane + hop) & 31);
+        down[u] = __shfl_sync(0xffffffffu, y[u], (lane - hop) & 31);
+    }
+
+    const int pos = positions[row];
+    const int pairs = rotary_dim / 2;
+    bf16 out[PER];
+#pragma unroll
+    for (int u = 0; u < PER; ++u) {
+        const int i = e0 + u;
+        float o = y[u];
+        int pair = -1;
+        if (i < pairs) pair = i;
+        else if (i >= span && i < span + pairs) pair = i - span;
+        if (pair >= 0) {
+            const float ang = static_cast<float>(pos) * freqs[pair];
+            float cos_v, sin_v;
+            __sincosf(ang, &sin_v, &cos_v);
+            const float a = i == pair ? y[u] : down[u];
+            const float b = i == pair ? up[u] : y[u];
+            o = i == pair ? a * cos_v - b * sin_v : b * cos_v + a * sin_v;
+        }
+        out[u] = f32_to_bf16(o);
+    }
+    if (is_q) {
+        *reinterpret_cast<Run*>(q_out + (static_cast<long long>(row) * Hq + head) * D + e0) =
+            *reinterpret_cast<const Run*>(out);
+    } else {
+        const long long d = kv_dst_index<false>(slot, kvh * D + e0, page_size, Hk, D);
+        *reinterpret_cast<Run*>(k_pages + d) = *reinterpret_cast<const Run*>(out);
+        *reinterpret_cast<Run*>(v_pages + d) =
+            *reinterpret_cast<const Run*>(v + (static_cast<long long>(row) * Hk + kvh) * D + e0);
+    }
+}
+
 template <int BLOCK>
 __global__ __launch_bounds__(BLOCK) void q_rmsnorm_rope_partial(
     const bf16* __restrict__ x,

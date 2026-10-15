@@ -39,6 +39,7 @@ pub(super) fn all() -> Vec<Rule> {
         gated_residual_norm_modulate(),
         norm_modulate(),
         rmsnorm_rope_partial_q(),
+        qg_qknorm_rope_append(),
         split_rope_yarn_append(),
         rope_yarn_append(),
         lse_sink(),
@@ -90,6 +91,69 @@ fn lse_sink() -> Rule {
 /// A packed q/k/v row split, YaRN over its q and k, and the rotated k
 /// written to the cache with its v: what `rope_yarn_append` does, reading the
 /// three from the packed row rather than from a split's copies.
+/// Qwen3.5's attention prologue: q cut from its gate, q and k normed per
+/// head (plus-one weights), turned, and k with its v written to the cache,
+/// through the `attn.qv` marker the model sets on the cut q and v.
+fn qg_qknorm_rope_append() -> Rule {
+    let pattern = template(|p| {
+        let qg = p.rows("qg", 2 * W);
+        let k = p.rows("k", W);
+        let v = p.rows("v", W);
+        let positions = p.indices("positions");
+        let d = p.u32("d");
+        let (q, gate) = layout::split_q_gate(&qg, d);
+        p.name("q_split", &q);
+        p.export("gate", &gate);
+        let qn =
+            elemwise::rmsnorm_per_head_plus_one(&q, &p.weight("q_norm", [W]), d, p.f32("q_eps"));
+        p.name("q_normed", &qn);
+        let kn =
+            elemwise::rmsnorm_per_head_plus_one(&k, &p.weight("k_norm", [W]), d, p.f32("k_eps"));
+        p.name("k_normed", &kn);
+        let (q_out, k_out) = elemwise::rope_partial(
+            &qn,
+            &kn,
+            &positions,
+            p.u32("rotary"),
+            d,
+            p.f32("theta"),
+            Some(p.u32("span")),
+        );
+        p.name("k_out", &k_out);
+        let cache = p.cache("cache");
+        let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
+        attn::kv_append(&k_out, &v, cache, &write_page, &write_offset);
+        p.export("q_out", &q_out);
+    });
+    Rule::new("elementwise.qg_qknorm_rope_append", [pattern], |m| {
+        Fused::QgQknormRopeAppend {
+            qg: m.value("qg"),
+            k: m.value("k"),
+            v: m.value("v"),
+            positions: m.value("positions"),
+            q_norm: m.value("q_norm"),
+            k_norm: m.value("k_norm"),
+            head_dim: m.u32("d"),
+            q_eps: m.f32("q_eps"),
+            k_eps: m.f32("k_eps"),
+            rotary_dim: m.u32("rotary"),
+            theta: m.f32("theta"),
+            span: m.u32("span"),
+            cache: m.value("cache"),
+            write_page: m.value("write_page"),
+            write_offset: m.value("write_offset"),
+            q_split: m.value("q_split"),
+            gate: m.value("gate"),
+            q_normed: m.value("q_normed"),
+            k_normed: m.value("k_normed"),
+            q_out: m.value("q_out"),
+            k_out: m.value("k_out"),
+        }
+    })
+    .through_markers()
+    .when(|m| m.dtype("qg") == Some(Dtype::Bf16))
+}
+
 fn split_rope_yarn_append() -> Rule {
     let pattern = template(|p| {
         let packed = p.rows("packed", 3 * W);

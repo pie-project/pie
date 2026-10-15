@@ -196,6 +196,35 @@ pub enum Fused {
         q_out: ValueId,
         k_out: ValueId,
     },
+    /// Qwen3.5's attention prologue: the q heads cut from their `[q | gate]`
+    /// rows (`split_q_gate`), q and k normed per head with plus-one weights
+    /// (`rmsnorm_per_head_plus_one`), their rotary prefixes turned
+    /// (`rope_partial`), and the turned k with its v landed in the paged
+    /// cache (`kv_append`). `q_split`, `q_normed`, `k_normed` and `k_out` are
+    /// read by nothing else; a backend may leave them unwritten.
+    QgQknormRopeAppend {
+        qg: ValueId,
+        k: ValueId,
+        v: ValueId,
+        positions: ValueId,
+        q_norm: ValueId,
+        k_norm: ValueId,
+        head_dim: u32,
+        q_eps: f32,
+        k_eps: f32,
+        rotary_dim: u32,
+        theta: f32,
+        span: u32,
+        cache: ValueId,
+        write_page: ValueId,
+        write_offset: ValueId,
+        q_split: ValueId,
+        gate: ValueId,
+        q_normed: ValueId,
+        k_normed: ValueId,
+        q_out: ValueId,
+        k_out: ValueId,
+    },
     /// A packed q/k/v row split (`split_qkv`), YaRN over its q and k, and
     /// the rotated k with its v landed in the paged cache (`kv_append`):
     /// `RopeYarnAppend` reading its three straight from the packed row.
@@ -332,6 +361,28 @@ impl Operands for Fused {
                 write_offset,
                 ..
             } => sink.extend([*packed, *positions, *cache, *write_page, *write_offset]),
+            Self::QgQknormRopeAppend {
+                qg,
+                k,
+                v,
+                positions,
+                q_norm,
+                k_norm,
+                cache,
+                write_page,
+                write_offset,
+                ..
+            } => sink.extend([
+                *qg,
+                *k,
+                *v,
+                *positions,
+                *q_norm,
+                *k_norm,
+                *cache,
+                *write_page,
+                *write_offset,
+            ]),
             Self::LseSink {
                 attn, sink: sinks, ..
             } => {
@@ -450,6 +501,15 @@ impl Operands for Fused {
                 v_out,
                 ..
             } => sink.extend([*q_out, *k_out, *v_out]),
+            Self::QgQknormRopeAppend {
+                q_split,
+                gate,
+                q_normed,
+                k_normed,
+                q_out,
+                k_out,
+                ..
+            } => sink.extend([*q_split, *gate, *q_normed, *k_normed, *q_out, *k_out]),
             Self::LseSink { attn, o_out, .. } => {
                 attn.outputs(sink);
                 sink.push(*o_out);
@@ -498,6 +558,14 @@ impl Operands for Fused {
             | Self::MoeExperts { .. }
             | Self::SplitRopeYarnAppend { .. }
             | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
+            // The rotation turns the normed rows in place.
+            Self::QgQknormRopeAppend {
+                q_out,
+                q_normed,
+                k_out,
+                k_normed,
+                ..
+            } => sink.extend([(*q_out, *q_normed), (*k_out, *k_normed)]),
         }
     }
     // The name a backend keys its kernel by (seat tables, `FUSED` lists), in
@@ -520,6 +588,7 @@ impl Operands for Fused {
             Self::MoeSelectGlu { .. } => "linear.moe_select_glu",
             Self::RopeYarnAppend { .. } => "elementwise.rope_yarn_append",
             Self::SplitRopeYarnAppend { .. } => "elementwise.split_rope_yarn_append",
+            Self::QgQknormRopeAppend { .. } => "elementwise.qg_qknorm_rope_append",
             Self::LseSink { .. } => "attention.lse_sink",
             Self::MoeExperts { .. } => "linear.moe_experts",
             Self::QkvFusedQknormRopeVnormWrite { .. } => {

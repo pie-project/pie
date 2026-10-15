@@ -44,6 +44,12 @@ ssm.conv_vec4 = true
 # A chunked gated delta walk read only by its gated norm lands bf16, as
 # vLLM's does: half the bytes out of the walk and into the norm.
 ssm.gdn_out_bf16 = true
+# Qwen3.5's attention prologue (q/gate cut, per-head q/k norms, partial
+# rotation, cache write) in one launch up to 64 rows (decode); a prefill
+# runs the five launches, which stream faster there. Qwen3.8-27B decode
+# TPOT, two A/B pairs: bs1 11.10 / 11.10 -> 10.96 / 10.96 ms, bs8 11.85 /
+# 11.94 -> 11.87 / 11.68, bs64 16.14 / 16.80 -> 16.59 / 15.99.
+elemwise.qg_prologue_until = 64
 # A wide decode's split partials fold a warp a row: gpt-oss-120b's layers
 # at 64 requests fold in about 4 us where the staged merge took 17.
 sdpa.merge_warp = true

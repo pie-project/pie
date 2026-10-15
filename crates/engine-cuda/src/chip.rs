@@ -404,6 +404,7 @@ mod tests {
                 assert_eq!(tuning.rows_vec, b200, "{gpu}");
                 assert_eq!(tuning.ssm_conv_vec4, b200, "{gpu}");
                 assert_eq!(tuning.ssm_gdn_out_bf16, b200, "{gpu}");
+                assert_eq!(tuning.qg_prologue_until, if b200 { 64 } else { 0 }, "{gpu}");
                 assert_eq!(tuning.merge_warp, b200, "{gpu}");
                 assert_eq!(tuning.gemm_bias_epilogue, b200, "{gpu}");
                 assert_eq!(tuning.decode_xqa, b200, "{gpu}");
@@ -436,6 +437,7 @@ mod tests {
                         rows_vec: false,
                         ssm_conv_vec4: false,
                         ssm_gdn_out_bf16: false,
+                        qg_prologue_until: 0,
                         merge_warp: false,
                         mxfp4_mma_until: defaults.mxfp4_mma_until,
                         mxfp4_mma_from: defaults.mxfp4_mma_from,

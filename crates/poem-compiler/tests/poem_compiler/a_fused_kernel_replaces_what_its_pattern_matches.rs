@@ -385,3 +385,38 @@ fn a_projection_cut_into_two_halves_lands_as_one_fused_op() {
         ]
     );
 }
+
+#[test]
+fn qwens_attention_prologue_lands_as_one_fused_op() {
+    let t = trace(|p| {
+        let d = 64;
+        let (q, gate) = layout::split_q_gate(&p.rows("qg", 4 * 64), d);
+        let q = elemwise::rmsnorm_per_head_plus_one(&q, &p.weight("q_norm", [64]), d, 1e-6);
+        let k = elemwise::rmsnorm_per_head_plus_one(
+            &p.rows("k", 64),
+            &p.weight("k_norm", [64]),
+            d,
+            1e-6,
+        );
+        let positions = p.indices("positions");
+        let (q, k) = elemwise::rope_partial(&q, &k, &positions, 16, d, 1e6, None);
+        let cache = p.cache("cache");
+        attn::kv_append(
+            &k,
+            &p.rows("v", 64),
+            cache,
+            &p.rows("wp", 1),
+            &p.rows("wo", 1),
+        );
+        elemwise::silu(&q);
+        elemwise::silu(&gate);
+    });
+    assert_eq!(
+        ops(&fuse(t, &["elementwise.qg_qknorm_rope_append"])),
+        [
+            "elementwise.qg_qknorm_rope_append",
+            "elementwise.silu",
+            "elementwise.silu"
+        ]
+    );
+}

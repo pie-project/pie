@@ -129,6 +129,14 @@ pub struct GemmTc5GluFrom(pub u32);
 #[decision(id = "kernel.gemm.split_rows_from", constant(range(1..=65_536)), default = 256, tune = search)]
 pub struct GemmSplitRowsFrom(pub u32);
 
+/// The most rows Qwen3.5's attention prologue (the q/gate cut, the two
+/// per-head norms, the partial rotation and the cache write) lands in one
+/// launch at; more run the five launches. 0 (never) but where a chip's
+/// profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.qg_prologue_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct QgPrologueUntil(pub u32);
+
 /// Whether a selected (sparse) attention runs on the tensor cores, a block a
 /// row and kv head, rather than the scalar walk. Off reads every key the
 /// scalar way.
@@ -310,8 +318,9 @@ pub struct ElemwiseRowsVec;
 #[decision(id = "kernel.ssm.conv_vec4", flag, default = false, tune = search)]
 pub struct SsmConvVec4;
 
-/// Whether a chunked gated delta walk whose one reader is its gated norm
-/// lands its output in bf16 (and the norm reads it so); off, f32, as before.
+/// Whether a gated delta walk (chunked or a decode step) whose one reader is
+/// its gated norm lands its output in bf16 (and the norm reads it so); off,
+/// f32, as before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.ssm.gdn_out_bf16", flag, default = false, tune = search)]
 pub struct SsmGdnOutBf16;
@@ -406,6 +415,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeTc5From>()
         .add::<GemmTc5GluFrom>()
         .add::<GemmSplitRowsFrom>()
+        .add::<QgPrologueUntil>()
         .add::<SsmGdnFusedScan>()
         .add::<SsmGdnTc5>()
         .add::<ElemwiseRowsVec>()
@@ -470,6 +480,7 @@ pub struct Tuning {
     pub moe_tc5_from: u32,
     pub gemm_tc5_glu_from: u32,
     pub gemm_split_rows_from: u32,
+    pub qg_prologue_until: u32,
     pub ssm_gdn_fused_scan: bool,
     pub ssm_gdn_tc5: bool,
     pub rows_vec: bool,
@@ -532,6 +543,7 @@ impl Tuning {
         moe_tc5_from: 16,
         gemm_tc5_glu_from: 65_536,
         gemm_split_rows_from: 256,
+        qg_prologue_until: 0,
         ssm_gdn_fused_scan: false,
         ssm_gdn_tc5: false,
         rows_vec: false,
@@ -594,6 +606,7 @@ impl Tuning {
             moe_tc5_from: profile.get::<MoeTc5From>().0,
             gemm_tc5_glu_from: profile.get::<GemmTc5GluFrom>().0,
             gemm_split_rows_from: profile.get::<GemmSplitRowsFrom>().0,
+            qg_prologue_until: profile.get::<QgPrologueUntil>().0,
             ssm_gdn_fused_scan: profile.on::<SsmGdnFusedScan>(&Anywhere),
             ssm_gdn_tc5: profile.on::<SsmGdnTc5>(&Anywhere),
             rows_vec: profile.on::<ElemwiseRowsVec>(&Anywhere),

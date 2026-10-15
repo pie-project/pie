@@ -3,7 +3,9 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
+use crate::jit::{
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+};
 use crate::tensor::{KvPool, Tensor};
 
 const FILE: &str = "elemwise/rope.cuh";
@@ -665,6 +667,97 @@ fn rope_partial(
             stated(op, rotary_dim)?.arg(),
             stated(op, span)?.arg(),
             theta.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// Qwen3.5's attention prologue in one launch: the q heads cut from their
+/// `[q | gate]` rows (`qg`) and the k heads, each normed per head with its
+/// plus-one weight and turned by `rope_partial`'s pairs, the gate copied to
+/// `gate`, and the turned k with its v landed in `append`'s cache. The
+/// caller checks [`YarnAppend::fits`] first.
+#[allow(clippy::too_many_arguments)]
+pub fn qg_qknorm_rope_append(
+    ctx: &Ctx,
+    qg: Tensor,
+    k: Tensor,
+    q_norm: Tensor,
+    k_norm: Tensor,
+    positions: Tensor,
+    head_dim: u32,
+    rotary_dim: u32,
+    span: u32,
+    theta: f32,
+    q_eps: f32,
+    k_eps: f32,
+    q_out: &mut Tensor,
+    gate: &mut Tensor,
+    append: YarnAppend<'_>,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.qg_qknorm_rope_append";
+    dtype_dispatch!(OP, qg.dtype, { Bf16 => () });
+    positions_stream(OP, positions, q_out);
+    if !append.fits()
+        || !(head_dim == 128 || head_dim == 256)
+        || !span.is_multiple_of(head_dim / 32)
+        || !rotary_dim.is_multiple_of(2)
+        || span < rotary_dim / 2
+        || span + rotary_dim / 2 > head_dim
+        || !q_out.width.is_multiple_of(head_dim)
+        || !k.width.is_multiple_of(head_dim)
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "wants whole 128- or 256-wide heads, an even rotary prefix whose pairs sit \
+                 within them and a bf16 NHD cache; was handed head_dim={head_dim}, \
+                 rotary_dim={rotary_dim}, span={span}"
+            ),
+        ));
+    }
+    let hq = q_out.width / head_dim;
+    let hk = k.width / head_dim;
+    if q_out.rows == 0 {
+        return Ok(());
+    }
+    let units = q_out
+        .rows
+        .checked_mul(hq + hk)
+        .ok_or_else(|| refuse(OP, "the (row, head) units overflow a grid"))?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::qg_qknorm_rope_append<{}>",
+                head_dim / 32
+            )),
+        )
+        .apply(Launch::grid([units.div_ceil(8), 1, 1], [256, 1, 1])),
+        &[
+            qg.arg(),
+            k.arg(),
+            append.v.arg(),
+            q_norm.arg(),
+            k_norm.arg(),
+            positions.arg(),
+            q_out.arg(),
+            gate.arg(),
+            append.pool.keys.arg(),
+            append.pool.values.arg(),
+            append.write_page.arg(),
+            append.write_offset.arg(),
+            append.pool.row_valid.arg(),
+            append.pool.page_size.arg(),
+            stated(OP, hq)?.arg(),
+            stated(OP, hk)?.arg(),
+            stated(OP, units)?.arg(),
+            stated(OP, rotary_dim)?.arg(),
+            stated(OP, span)?.arg(),
+            theta.arg(),
+            q_eps.arg(),
+            k_eps.arg(),
             ctx.stage(),
         ],
     )
