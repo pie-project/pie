@@ -25,6 +25,7 @@ DEPLOYMENTS = [
     deployment("glm53-flash", weights = [dtype.u8g64, dtype.u2g64, dtype.u4g64], kv = dtype.bf16, drafter = "mtp"),
     deployment("glm53-flash-mini", weights = [dtype.u4g64, dtype.u4g64], kv = dtype.bf16),
     deployment("glm53-flash-l8", weights = [dtype.u8g64, dtype.u2g64], kv = dtype.bf16),
+    deployment("glm53-flash-l8", weights = [dtype.u8g64, dtype.u4g64], kv = dtype.bf16),
     deployment("glm53-flash", weights = [dtype.u8g64, dtype.u2g64], kv = dtype.bf16),
     deployment(
         "glm53-flash",
