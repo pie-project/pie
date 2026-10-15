@@ -1876,8 +1876,8 @@ __global__ __launch_bounds__(8 * D) void ssm_kda_chunked_batched(
 // the block's own decay. A chunk where some channel decays past e^80 within
 // a block (as a decay without a floor may) sums its diagonal blocks per
 // channel instead, every exponential then of a difference no greater than
-// zero. `wu` builds W, U, P and the gated operands per chunk; `h` walks
-// each request's chunks carrying S in f32; `o` lands the output.
+// zero. `wu` builds W, U, P and the gated operands per chunk; `ho` walks
+// each request's chunks carrying S in f32, landing the output as it goes.
 
 // f(Index<0>{}) .. f(Index<N − 1>{}), in order: a loop whose index must be
 // a constant (it picks registers) however long the body.
@@ -2227,12 +2227,16 @@ __global__ __launch_bounds__(512) void ssm_kda_chunk_wu(
 // state S through every chunk of one request, in f32 registers in the matrix
 // core's D layout (wavefront w holds key rows [16w, 16w+16) and
 // [16(w+4), 16(w+4)+16)), as `ssm_gdn_chunk_h` walks it, with the decay a
-// row's own. Records each chunk's entering state (hcT [s][H][D][D]) and V'
-// (vnT [s][H][D][CH], zero past the chunk's rows).
+// row's own, landing each chunk's output for its slice on the way: O =
+// (Q̂ ∘ exp Γ)·S + P·V' from the entering S and V' it holds in LDS,
+// wavefront w's chunk rows [16w, 16w+16), so neither is recorded (a separate
+// output pass wrote and read back 790 MiB of them at a 16K-token prefill). f32
+// [n][H][D] at row + row_offset.
 template <int D>
-__global__ __launch_bounds__(256) void ssm_kda_chunk_h(
+__global__ __launch_bounds__(256) void ssm_kda_chunk_ho(
     const bf16* __restrict__ kT, const bf16* __restrict__ w, const bf16* __restrict__ uT,
-    const float* __restrict__ gl, bf16* __restrict__ vnT, bf16* __restrict__ hcT, float* __restrict__ state_base,
+    const float* __restrict__ gl, const bf16* __restrict__ qg, const bf16* __restrict__ p,
+    float* __restrict__ out, float* __restrict__ state_base,
     const i32* __restrict__ slot_ids, const u32* __restrict__ indptr, long long slot_stride,
     const int* __restrict__ commit_len, const int* __restrict__ begin_at, bool write_state,
     const u8* __restrict__ mask, int lanes, int H, const u32* __restrict__ win) {
@@ -2251,6 +2255,7 @@ __global__ __launch_bounds__(256) void ssm_kda_chunk_h(
     const GdnLane ln = gdn_lane(r, indptr, slot_ids, commit_len, begin_at, win);
     if (ln.T <= 0 || ln.slot < 0) return;
     const int v0 = vt * BVT;
+    const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
     const int tid = threadIdx.x, wave = tid / kWave, l = lane();
     // The lane's cells (key rows k(q)..k(q)+3, value column v0 + l % 16) are
     // four adjacent floats of St.
@@ -2293,8 +2298,9 @@ __global__ __launch_bounds__(256) void ssm_kda_chunk_h(
         }
     };
 
-    // A ring of DEPTH chunks in flight, as `ssm_gdn_chunk_h` keeps it.
-    constexpr int DEPTH = 3;
+    // A ring of DEPTH chunks in flight: two keep the walk at two wavefronts a
+    // SIMD (three needed more registers than that leaves).
+    constexpr int DEPTH = 2;
     Ops ring[DEPTH];
 #pragma unroll
     for (int d = 0; d < DEPTH; ++d) fetch(min(d, chunks - 1), ring[d]);
@@ -2308,10 +2314,12 @@ __global__ __launch_bounds__(256) void ssm_kda_chunk_h(
             mfma_each(mfma_zero(), [&](int i, int vv, float) { hT[vv * HP + (wave + 4 * q) * 16 + i] = from_f32<bf16>(hf[q][i % 4]); });
         lds_barrier();
 
-        // The entering state, recorded as a contiguous slice.
-        bf16* hcT_s = hcT + (sh * D + v0) * D;
-        *reinterpret_cast<b128*>(hcT_s + (tid / 16) * D + (tid % 16) * 8) =
-            *reinterpret_cast<const b128*>(hT + (tid / 16) * HP + (tid % 16) * 8);
+        // The wavefront's rows of Q̂ ∘ exp Γ and of P as A fragments.
+        mfma_ab2 qf[KS], pf[CS];
+#pragma unroll
+        for (int st = 0; st < KS; ++st) qf[st] = load8(qg + (sh * CH + m0 + l % 16) * D + st * 32 + g8);
+#pragma unroll
+        for (int st = 0; st < CS; ++st) pf[st] = load8(p + (sh * CH + m0 + l % 16) * CH + st * 32 + g8);
 
         // V' = U − W·S for the wavefront's 16 chunk rows.
         {
@@ -2325,12 +2333,20 @@ __global__ __launch_bounds__(256) void ssm_kda_chunk_h(
             for (int t = 0; t < 4; ++t) y[t] = i0 + t < L ? to_f32(uv[t]) - x[t] : 0.f;
             *reinterpret_cast<mfma_ab*>(vn + (l % 16) * VP + i0) = pack4(y[0], y[1], y[2], y[3]);
         }
+        // (Q̂ ∘ exp Γ)·S, from hT before the barrier lets the next chunk at it.
+        mfma_cd out_c = mfma_zero();
+#pragma unroll
+        for (int st = 0; st < KS; ++st) out_c = mfma16x2(qf[st], load8(hT + (l % 16) * HP + st * 32 + g8), out_c);
         lds_barrier();
 
-        static_assert(BVT * CH / 8 == 128, "a 16-byte piece per thread of the first half");
-        if (tid < BVT * CH / 8)
-            *reinterpret_cast<b128*>(vnT + (sh * D + v0 + tid / 8) * CH + (tid % 8) * 8) =
-                *reinterpret_cast<const b128*>(vn + (tid / 8) * VP + (tid % 8) * 8);
+        // + P·V'.
+#pragma unroll
+        for (int st = 0; st < CS; ++st) out_c = mfma16x2(pf[st], load8(vn + (l % 16) * VP + st * 32 + g8), out_c);
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int i = m0 + 4 * (l / 16) + t;
+            if (i < L) out[((ta + i + row0) * H + h) * D + v0 + l % 16] = out_c[t];
+        }
 
         // S ← diag(exp Γ_L)·S + (K̂ ∘ exp(Γ_L − Γ))ᵀ·V'.
 #pragma unroll
@@ -2356,57 +2372,6 @@ __global__ __launch_bounds__(256) void ssm_kda_chunk_h(
 #pragma unroll
     for (int q = 0; q < KT; ++q)
         *reinterpret_cast<f32x4*>(state + key(q)) = f32x4{hf[q][0], hf[q][1], hf[q][2], hf[q][3]};
-}
-
-// Grid (slots, H), block 256: the chunk's output rows, f32 [n][H][D] at row
-// + row_offset, O = (Q̂ ∘ exp Γ)·S + P·V'. Wavefront w lands chunk rows
-// [16w, 16w+16).
-template <int D>
-__global__ __launch_bounds__(256) void ssm_kda_chunk_o(
-    const bf16* __restrict__ qg, const bf16* __restrict__ p, const bf16* __restrict__ vnT,
-    const bf16* __restrict__ hcT, const i32* __restrict__ slot_ids, const u32* __restrict__ indptr,
-    const int* __restrict__ commit_len, const int* __restrict__ begin_at, float* __restrict__ out, int lanes, int H,
-    const u32* __restrict__ win) {
-    constexpr int CH = GDN_CH, BVT = 16, KS = D / 32, CS = CH / 32;
-
-    const int h = blockIdx.y, s = blockIdx.x;
-    if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
-    if (lanes <= 0) return;
-    const int r = gdn_slot_lane(s, lanes, indptr, begin_at, win);
-    const GdnLane ln = gdn_lane(r, indptr, slot_ids, commit_len, begin_at, win);
-    if (ln.T <= 0 || ln.slot < 0) return;
-    const int j = s - gdn_chunk_base(r, indptr, begin_at, win);
-    if (j < 0 || j * CH >= ln.T) return;
-    const int ta = ln.t0 + j * CH;
-    const int L = min(CH, ln.t0 + ln.T - ta);
-    const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
-    const int wave = threadIdx.x / kWave, l = lane(), g8 = 8 * (l / 16), m0 = wave * 16;
-    const long long sh = static_cast<long long>(s) * H + h;
-
-    // The wavefront's 16 rows of Q̂ ∘ exp Γ and of P as A fragments, kept
-    // across the slices.
-    mfma_ab2 qf[KS], pf[CS];
-#pragma unroll
-    for (int st = 0; st < KS; ++st) qf[st] = load8(qg + (sh * CH + m0 + l % 16) * D + st * 32 + g8);
-#pragma unroll
-    for (int st = 0; st < CS; ++st) pf[st] = load8(p + (sh * CH + m0 + l % 16) * CH + st * 32 + g8);
-    const bf16* hcT_s = hcT + sh * D * D;
-    const bf16* vnT_s = vnT + sh * D * CH;
-#pragma unroll 2
-    for (int v0 = 0; v0 < D; v0 += BVT) {
-        mfma_cd o1 = mfma_zero(), o2 = mfma_zero();
-#pragma unroll
-        for (int st = 0; st < KS; ++st)
-            o1 = mfma16x2(qf[st], load8(hcT_s + static_cast<long long>(v0 + l % 16) * D + st * 32 + g8), o1);
-#pragma unroll
-        for (int st = 0; st < CS; ++st)
-            o2 = mfma16x2(pf[st], load8(vnT_s + static_cast<long long>(v0 + l % 16) * CH + st * 32 + g8), o2);
-#pragma unroll
-        for (int t = 0; t < 4; ++t) {
-            const int i = m0 + 4 * (l / 16) + t;
-            if (i < L) out[((ta + i + row0) * H + h) * D + v0 + l % 16] = o1[t] + o2[t];
-        }
-    }
 }
 
 }  // namespace pie::attn

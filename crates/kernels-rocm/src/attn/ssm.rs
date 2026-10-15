@@ -1446,7 +1446,8 @@ pub fn kda_chunked(
     )
 }
 
-/// The recurrence as three chunk-parallel passes (see `ssm_kda_chunk_*`),
+/// The recurrence as two chunk-parallel passes (`ssm_kda_chunk_wu`, then
+/// `ssm_kda_chunk_ho`),
 /// over the chunk slots the gated delta rule's passes use.
 #[allow(clippy::too_many_arguments)]
 fn kda_chunk_parallel(
@@ -1469,8 +1470,6 @@ fn kda_chunk_parallel(
     let qg = plane_bf16(ctx, op, "attn.ssm_kda_chunk_qg", per_slot(CHUNK * d))?;
     let p = plane_bf16(ctx, op, "attn.ssm_kda_chunk_p", per_slot(CHUNK * CHUNK))?;
     let gl = plane(ctx, op, "attn.ssm_kda_chunk_gl", per_slot(d))?;
-    let vnt = plane_bf16(ctx, op, "attn.ssm_kda_chunk_vnt", per_slot(d * CHUNK))?;
-    let hct = plane_bf16(ctx, op, "attn.ssm_kda_chunk_hct", per_slot(d * d))?;
     let tail = |args: &mut Vec<ArgValue>| -> Result<(), Error> {
         args.push(stated(op, lanes)?.arg());
         args.push(stated(op, heads)?.arg());
@@ -1507,13 +1506,16 @@ fn kda_chunk_parallel(
         &args,
     )?;
 
+    // The state walk lands each chunk's output on the way: its entering
+    // state and V' stay in the walk's LDS.
     let mut args = vec![
         ArgValue::Ptr(kt),
         ArgValue::Ptr(w),
         ArgValue::Ptr(ut),
         ArgValue::Ptr(gl),
-        ArgValue::Ptr(vnt),
-        ArgValue::Ptr(hct),
+        ArgValue::Ptr(qg),
+        ArgValue::Ptr(p),
+        y.arg(),
         state.slab.arg(),
         state.slot_ids.arg(),
         mixed.indptr.arg(),
@@ -1526,29 +1528,10 @@ fn kda_chunk_parallel(
     tail(&mut args)?;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::attn::ssm_kda_chunk_h<128>").apply(Launch::grid(
+        Fire::at(FILE, "::pie::attn::ssm_kda_chunk_ho<128>").apply(Launch::grid(
             [lanes * heads * (d / CHUNK_SLICE), 1, 1],
             [BLOCK, 1, 1],
         )),
-        &args,
-    )?;
-
-    let mut args = vec![
-        ArgValue::Ptr(qg),
-        ArgValue::Ptr(p),
-        ArgValue::Ptr(vnt),
-        ArgValue::Ptr(hct),
-        state.slot_ids.arg(),
-        mixed.indptr.arg(),
-        state.commit_len.arg(),
-        state.begin_at.arg(),
-        y.arg(),
-    ];
-    tail(&mut args)?;
-    ctx.fire(
-        op,
-        Fire::at(FILE, "::pie::attn::ssm_kda_chunk_o<128>")
-            .apply(Launch::grid([slots, heads, 1], [BLOCK, 1, 1])),
         &args,
     )
 }
