@@ -270,6 +270,22 @@ pub unsafe fn hipMemsetAsync(
     }
 }
 
+/// `width` bytes zeroed (`value`) at each of `height` rows `pitch` apart.
+pub unsafe fn hipMemset2DAsync(
+    dst: *mut c_void,
+    pitch: usize,
+    value: c_int,
+    width: usize,
+    height: usize,
+    stream: Stream,
+) -> HipError {
+    match sys::api() {
+        // SAFETY: forwarded unchanged; the caller holds HIP's contract.
+        Ok(api) => unsafe { (api.hip.hipMemset2DAsync)(dst, pitch, value, width, height, stream) },
+        Err(_) => hipErrorNotInitialized,
+    }
+}
+
 pub unsafe fn hipMemcpy(
     dst: *mut c_void,
     src: *const c_void,

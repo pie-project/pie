@@ -604,14 +604,15 @@ __device__ __forceinline__ m1_u64 m1_cut_composite(m1_u32 key, m1_u32 index) {
   return ((m1_u64)key << 32) | (m1_u64)index;
 }
 
-// Every element of the row, eight loads in flight a thread before any is
-// looked at: one block walks the whole row, so a pass is bound by how many
-// loads it keeps outstanding.
+// Every element of the row in [lo, hi), eight loads in flight a thread
+// before any is looked at: a block walks its stretch of the row, so a pass is
+// bound by how many loads it keeps outstanding.
 template <class Body>
-__device__ __forceinline__ void m1_cut_scan(
-    const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype, Body body) {
+__device__ __forceinline__ void m1_cut_scan_range(
+    const m1_u8* input, m1_u32 base, m1_u32 lo, m1_u32 hi, m1_u32 dtype, Body body) {
   const m1_u32 stride = blockDim.x;
-  const float* row = reinterpret_cast<const float*>(input) + base;
+  const m1_u32 len = hi > lo ? hi - lo : 0u;
+  const float* row = reinterpret_cast<const float*>(input) + base + lo;
   if (dtype == 0u && (reinterpret_cast<m1_u64>(row) & 15ull) == 0ull) {
     // An f32 row on a 16-byte boundary: two float4 loads in flight a thread.
     const float4* quads = reinterpret_cast<const float4*>(row);
@@ -620,13 +621,13 @@ __device__ __forceinline__ void m1_cut_scan(
       const bool second = at + stride < whole;
       const float4 a = quads[at];
       const float4 b = second ? quads[at + stride] : a;
-      const m1_u32 i = at << 2;
+      const m1_u32 i = lo + (at << 2);
       body(i, a.x);
       body(i + 1u, a.y);
       body(i + 2u, a.z);
       body(i + 3u, a.w);
       if (second) {
-        const m1_u32 j = (at + stride) << 2;
+        const m1_u32 j = lo + ((at + stride) << 2);
         body(j, b.x);
         body(j + 1u, b.y);
         body(j + 2u, b.z);
@@ -634,7 +635,7 @@ __device__ __forceinline__ void m1_cut_scan(
       }
     }
     for (m1_u32 i = (whole << 2) + threadIdx.x; i < len; i += stride)
-      body(i, row[i]);
+      body(lo + i, row[i]);
     return;
   }
   for (m1_u32 at = threadIdx.x; at < len; at += 8u * stride) {
@@ -642,15 +643,43 @@ __device__ __forceinline__ void m1_cut_scan(
 #pragma unroll
     for (m1_u32 u = 0u; u < 8u; ++u) {
       const m1_u32 i = at + u * stride;
-      batch[u] = i < len ? m1_load_f(input, base + i, dtype) : 0.0f;
+      batch[u] = i < len ? m1_load_f(input, base + lo + i, dtype) : 0.0f;
     }
 #pragma unroll
     for (m1_u32 u = 0u; u < 8u; ++u) {
       const m1_u32 i = at + u * stride;
-      if (i < len) body(i, batch[u]);
+      if (i < len) body(lo + i, batch[u]);
     }
   }
 }
+
+template <class Body>
+__device__ __forceinline__ void m1_cut_scan(
+    const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype, Body body) {
+  m1_cut_scan_range(input, base, 0u, len, dtype, body);
+}
+
+// The blocks a row's cut runs on. A cut walks the row in passes; each pass
+// leaves sums, least indices, gathered elements or tie values in the block's
+// LDS, and every decision after a pass is a function of those alone. One
+// block (`M1Solo`) walks the whole row and its hooks do nothing; a group of
+// blocks (`M1Lane`, sample_lane.cuh) each walks its stretch [lo, hi) and its
+// hooks merge every block's pass results into every block's LDS, in block
+// order, so the blocks decide alike.
+struct M1Solo {
+  m1_u32 lo;
+  m1_u32 hi;
+  __device__ __forceinline__ void row(m1_u32 len) {
+    lo = 0u;
+    hi = len;
+  }
+  __device__ __forceinline__ void entry(M1CutShared&) {}
+  __device__ __forceinline__ void select(M1CutShared&, bool, bool) {}
+  __device__ __forceinline__ void weights(M1CutShared&) {}
+  __device__ __forceinline__ void chunk(M1CutShared&) {}
+  __device__ __forceinline__ void gaps(M1CutShared&, m1_u32) {}
+  __device__ __forceinline__ void sum_u32(m1_u32*, m1_u32) {}
+};
 
 // What a nonnegative `y` (no larger than the running sum) adds to a sum that
 // is a whole number of units u = 2^eu: `whole` units, and where the rest sits
@@ -715,9 +744,52 @@ __device__ __forceinline__ void m1_cut_tie(m1_u32 key, M1CutShared& cut) {
 // With `gather_ties`, the first pass also gathers the elements exactly half
 // a unit off a whole (weighing none of them) and the select stops there if
 // it found any: their weight is not order-free (see m1_cut_phase).
+// The first of 256 buckets at which the running weight reaches `want` (the
+// weight before it plus its own): its index into `found` (256 if the whole
+// is short of it) and the weight before it into `before`, for every thread.
+// Thirty-two threads sum eight buckets each, the one whose stretch holds the
+// crossing walks its eight.
+__device__ __forceinline__ void m1_bucket_find(
+    const m1_u64* weight, m1_u64 want, m1_u32& found, m1_u64& before) {
+  __shared__ m1_u64 sums[32];
+  __shared__ m1_u32 found_s;
+  __shared__ m1_u64 before_s;
+  const m1_u32 t = threadIdx.x;
+  if (t < 32u) {
+    m1_u64 sum = 0ull;
+#pragma unroll
+    for (m1_u32 b = 0u; b < 8u; ++b) sum += weight[t * 8u + b];
+    sums[t] = sum;
+  }
+  __syncthreads();
+  if (t < 32u) {
+    m1_u64 prior = 0ull;
+    for (m1_u32 j = 0u; j < t; ++j) prior += sums[j];
+    const m1_u64 mine = sums[t];
+    if ((t == 0u || prior < want) && prior + mine >= want) {
+      m1_u64 run = prior;
+      for (m1_u32 b = t * 8u; b < t * 8u + 8u; ++b) {
+        if (run + weight[b] >= want) {
+          found_s = b;
+          before_s = run;
+          break;
+        }
+        run += weight[b];
+      }
+    } else if (t == 31u && prior + mine < want) {
+      found_s = 256u;
+      before_s = prior + mine;
+    }
+  }
+  __syncthreads();
+  found = found_s;
+  before = before_s;
+}
+
+template <class G>
 __device__ void m1_cut_select_key(
     const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype,
-    m1_u64 low, m1_u64 high, m1_u64 need, int eu, M1CutShared& cut,
+    m1_u64 low, m1_u64 high, m1_u64 need, int eu, M1CutShared& cut, G& g,
     bool gather_ties = false) {
   __syncthreads();
   // Leading key bytes every element in the window shares are not passes:
@@ -750,7 +822,7 @@ __device__ void m1_cut_select_key(
     const m1_u32 prefix = cut.select_prefix & high_mask;
     m1_u32 held_bucket = 256u;
     m1_u64 held = 0ull;
-    m1_cut_scan(input, base, len, dtype, [&](m1_u32 i, float y) {
+    m1_cut_scan_range(input, base, g.lo, g.hi, dtype, [&](m1_u32 i, float y) {
       if (m1_isnan(y)) return;
       const m1_u32 key = m1_desc_key(y);
       if ((key & high_mask) != prefix) return;
@@ -774,17 +846,12 @@ __device__ void m1_cut_select_key(
     });
     if (held != 0ull) atomicAdd(&cut.weight[held_bucket], held);
     __syncthreads();
+    g.select(cut, pass == 3, gather_ties && pass == skip);
+    const m1_u64 want = cut.select_need;
+    m1_u32 chosen;
+    m1_u64 run;
+    m1_bucket_find(cut.weight, want, chosen, run);
     if (threadIdx.x == 0u) {
-      const m1_u64 want = cut.select_need;
-      m1_u64 run = 0ull;
-      m1_u32 chosen = 256u;
-      for (m1_u32 bucket = 0u; bucket < 256u; ++bucket) {
-        if (run + cut.weight[bucket] >= want) {
-          chosen = bucket;
-          break;
-        }
-        run += cut.weight[bucket];
-      }
       if (chosen == 256u) {
         cut.select_short = 1u;
       } else {
@@ -802,9 +869,10 @@ __device__ void m1_cut_select_key(
 
 // The `rank`-th (from 0) least index among the live elements of key `key`
 // past `low`.
+template <class G>
 __device__ m1_u32 m1_cut_select_index(
     const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype,
-    m1_u32 key, m1_u64 low, m1_u64 rank, M1CutShared& cut) {
+    m1_u32 key, m1_u64 low, m1_u64 rank, M1CutShared& cut, G& g) {
   int bits = 0;
   while (bits < 32 && ((len - 1u) >> bits) != 0u) ++bits;
   const int passes = (bits + 7) / 8;
@@ -822,7 +890,7 @@ __device__ m1_u32 m1_cut_select_index(
       cut.weight[bucket] = 0ull;
     __syncthreads();
     const m1_u32 prefix = cut.select_prefix & high_mask;
-    for (m1_u32 i = threadIdx.x; i < len; i += blockDim.x) {
+    for (m1_u32 i = g.lo + threadIdx.x; i < g.hi; i += blockDim.x) {
       if ((i & high_mask) != prefix) continue;
       const float y = m1_load_f(input, base + i, dtype);
       if (m1_isnan(y) || m1_desc_key(y) != key) continue;
@@ -830,17 +898,13 @@ __device__ m1_u32 m1_cut_select_index(
       atomicAdd(&cut.weight[(i >> shift) & 0xFFu], 1ull);
     }
     __syncthreads();
+    g.weights(cut);
+    const m1_u64 want = cut.select_need;
+    m1_u32 chosen;
+    m1_u64 run;
+    m1_bucket_find(cut.weight, want, chosen, run);
+    if (chosen == 256u) chosen = 255u;
     if (threadIdx.x == 0u) {
-      const m1_u64 want = cut.select_need;
-      m1_u64 run = 0ull;
-      m1_u32 chosen = 255u;
-      for (m1_u32 bucket = 0u; bucket < 256u; ++bucket) {
-        if (run + cut.weight[bucket] >= want) {
-          chosen = bucket;
-          break;
-        }
-        run += cut.weight[bucket];
-      }
       cut.select_need = want - run;
       cut.select_prefix = prefix | (chosen << shift);
     }
@@ -879,12 +943,13 @@ __device__ void m1_cut_sort(m1_u64* items, m1_u32 count) {
 // f32 as the reference walks them. A monotone row (no negative value) stops
 // at the first element whose exclusive mass reaches the cutoff; any other
 // row is walked to its end, each element's verdict stored as it is reached.
+template <class G>
 __device__ void m1_cut_chunk(
     const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype,
-    float cutoff, bool monotone, m1_u8* output, M1CutShared& cut) {
+    float cutoff, bool monotone, m1_u8* output, M1CutShared& cut, G& g) {
   const m1_u64 low = cut.cursor;
   m1_cut_select_key(
-      input, base, len, dtype, low, ~0ull, M1_CUT_CHUNK + 1u, M1_CUT_COUNT, cut);
+      input, base, len, dtype, low, ~0ull, M1_CUT_CHUNK + 1u, M1_CUT_COUNT, cut, g);
   m1_u64 high = ~0ull;
   if (cut.select_short == 0u) {
     const m1_u32 key = cut.select_prefix;
@@ -896,13 +961,13 @@ __device__ void m1_cut_chunk(
       const m1_u32 index =
           rank == 0ull
               ? least
-              : m1_cut_select_index(input, base, len, dtype, key, low, rank, cut);
+              : m1_cut_select_index(input, base, len, dtype, key, low, rank, cut, g);
       high = m1_cut_composite(key, index);
     }
   }
   if (threadIdx.x == 0u) cut.count = 0u;
   __syncthreads();
-  m1_cut_scan(input, base, len, dtype, [&](m1_u32 i, float y) {
+  m1_cut_scan_range(input, base, g.lo, g.hi, dtype, [&](m1_u32 i, float y) {
     if (m1_isnan(y)) return;
     const m1_u64 composite = m1_cut_composite(m1_desc_key(y), i);
     if (composite <= low || composite >= high) return;
@@ -910,6 +975,7 @@ __device__ void m1_cut_chunk(
     if (slot < M1_CUT_CHUNK) cut.chunk[slot] = composite;
   });
   __syncthreads();
+  g.chunk(cut);
   const m1_u32 count = cut.count < M1_CUT_CHUNK ? cut.count : M1_CUT_CHUNK;
   if (count == 0u) {
     if (threadIdx.x == 0u) {
@@ -986,9 +1052,10 @@ __device__ void m1_cut_chunk(
 // One binade of the running sum past the head (see the top of this section):
 // finds the element at which the sum reaches the cutoff or its next binade,
 // adds it in f32, and either stops there or moves the cursor past it.
+template <class G>
 __device__ void m1_cut_phase(
     const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype,
-    float cutoff, M1CutShared& cut) {
+    float cutoff, M1CutShared& cut, G& g) {
   const float mass = cut.mass;
   const m1_u32 mass_bits = __float_as_uint(mass);
   const m1_u32 biased = mass_bits >> 23;
@@ -1032,7 +1099,7 @@ __device__ void m1_cut_phase(
   // The first select pass gathers the phase's ties; without any it is the
   // select itself.
   m1_cut_select_key(
-      input, base, len, dtype, low, ~0ull, limit - start, eu, cut, true);
+      input, base, len, dtype, low, ~0ull, limit - start, eu, cut, g, true);
   if (cut.overflow != 0u) {
     __syncthreads();
     if (threadIdx.x == 0u) cut.stage = M1_CUT_BAIL;
@@ -1093,7 +1160,7 @@ __device__ void m1_cut_phase(
       cut.tie_slot[b] = lo;
     }
     __syncthreads();
-    m1_cut_scan(input, base, len, dtype, [&](m1_u32 i, float y) {
+    m1_cut_scan_range(input, base, g.lo, g.hi, dtype, [&](m1_u32 i, float y) {
       if (m1_isnan(y)) return;
       const m1_u32 key = m1_desc_key(y);
       if (m1_cut_composite(key, i) <= low) return;
@@ -1107,6 +1174,7 @@ __device__ void m1_cut_phase(
         atomicAdd(&cut.gap[lo], (m1_u64)whole + (rest == 2u ? 1ull : 0ull));
     });
     __syncthreads();
+    g.gaps(cut, ties);
     if (threadIdx.x == 0u) {
       m1_u64 units = start;
       for (m1_u32 g = 0u; g <= ties; ++g) {
@@ -1168,7 +1236,7 @@ __device__ void m1_cut_phase(
     if (ties != 0u)
       m1_cut_select_key(
           input, base, len, dtype, segment_low, cut.segment_high,
-          limit - segment_units, eu, cut);
+          limit - segment_units, eu, cut, g);
     if (cut.select_short != 0u) {
       __syncthreads();
       if (threadIdx.x == 0u) cut.stage = M1_CUT_BAIL;
@@ -1184,13 +1252,13 @@ __device__ void m1_cut_phase(
     index = rank == 0ull
                 ? least
                 : m1_cut_select_index(
-                      input, base, len, dtype, key, segment_low, rank, cut);
+                      input, base, len, dtype, key, segment_low, rank, cut, g);
     units = segment_units + before + rank * each;
   } else {
     key = cut.crossing_key;
     units = cut.crossing_units;
     index = m1_cut_select_index(
-        input, base, len, dtype, key, low, cut.crossing_rank, cut);
+        input, base, len, dtype, key, low, cut.crossing_rank, cut, g);
   }
   __syncthreads();
   if (threadIdx.x == 0u) {
@@ -1208,6 +1276,84 @@ __device__ void m1_cut_phase(
   __syncthreads();
 }
 
+// The cut of one row (at `base`, `len` wide) on the group `g`: the verdicts
+// of the group's stretch of the row land in `output`.
+template <class G>
+__device__ void m1_cut_row(
+    const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype, float cutoff,
+    m1_u8* output, M1CutShared& cut, G& g) {
+  if (threadIdx.x == 0u) {
+    cut.first_nan = 0xFFFFFFFFu;
+    cut.negative = 0u;
+    cut.wide = 0u;
+    cut.cursor = 0ull;
+    cut.pivot = 0ull;
+    cut.mass = 0.0f;
+    cut.stage = M1_CUT_RUN;
+    cut.nan_kept = 0u;
+    cut.key_least = 0xFFFFFFFFu;
+    cut.key_most = 0u;
+    cut.key_skip = 0u;
+  }
+  __syncthreads();
+  m1_u32 least = 0xFFFFFFFFu;
+  m1_u32 most = 0u;
+  m1_cut_scan_range(input, base, g.lo, g.hi, dtype, [&](m1_u32 i, float y) {
+    if (m1_isnan(y)) {
+      atomicMin(&cut.first_nan, i);
+    } else {
+      if (y < 0.0f) cut.negative = 1u;
+      if (!(y < 1.8446744e19f)) cut.wide = 1u;
+      const m1_u32 key = m1_desc_key(y);
+      least = key < least ? key : least;
+      most = key > most ? key : most;
+    }
+  });
+  if (least <= most) {
+    atomicMin(&cut.key_least, least);
+    atomicMax(&cut.key_most, most);
+  }
+  __syncthreads();
+  g.entry(cut);
+  if (threadIdx.x == 0u && cut.key_least <= cut.key_most) {
+    const m1_u32 differ = cut.key_least ^ cut.key_most;
+    m1_u32 skip = 0u;
+    while (skip < 3u && (differ >> (24u - 8u * skip)) == 0u) ++skip;
+    cut.key_skip = skip;
+  }
+  __syncthreads();
+  const bool monotone = cut.negative == 0u;
+  bool binades = monotone && cut.wide == 0u;
+  m1_cut_chunk(input, base, len, dtype, cutoff, monotone, output, cut, g);
+  for (m1_u32 step = 0u; cut.stage == M1_CUT_RUN; ++step) {
+    if (binades && step < 512u) {
+      m1_cut_phase(input, base, len, dtype, cutoff, cut, g);
+      if (cut.stage == M1_CUT_BAIL) {
+        binades = false;
+        __syncthreads();
+        if (threadIdx.x == 0u) cut.stage = M1_CUT_RUN;
+        __syncthreads();
+      }
+    } else {
+      m1_cut_chunk(input, base, len, dtype, cutoff, monotone, output, cut, g);
+    }
+  }
+  const m1_u32 stage = cut.stage;
+  const m1_u64 pivot = cut.pivot;
+  const m1_u32 first_nan = cut.nan_kept != 0u ? cut.first_nan : 0xFFFFFFFFu;
+  m1_cut_scan_range(input, base, g.lo, g.hi, dtype, [&](m1_u32 i, float y) {
+    if (m1_isnan(y)) {
+      m1_store_b(output, base + i, i == first_nan);
+    } else if (monotone) {
+      m1_store_b(
+          output, base + i,
+          stage == M1_CUT_ALL ||
+              m1_cut_composite(m1_desc_key(y), i) <= pivot);
+    }
+  });
+  __syncthreads();
+}
+
 __device__ __forceinline__ void ptir_parallel_pivot_cummass(
     const m1_u8* input,
     const m1_u8* threshold,
@@ -1219,103 +1365,109 @@ __device__ __forceinline__ void ptir_parallel_pivot_cummass(
   const m1_u32 rows = input_desc.rows;
   const m1_u32 dtype = input_desc.dtype;
   if (len == 0u) return;
+  M1Solo g;
+  g.row(len);
   for (m1_u32 row = 0; row < rows; ++row) {
     const m1_u32 base = row * len;
     const float cutoff = m1_load_f(
         threshold,
         m1_pick(threshold_desc.len, row),
         threshold_desc.dtype);
-    if (threadIdx.x == 0u) {
-      cut.first_nan = 0xFFFFFFFFu;
-      cut.negative = 0u;
-      cut.wide = 0u;
-      cut.cursor = 0ull;
-      cut.pivot = 0ull;
-      cut.mass = 0.0f;
-      cut.stage = M1_CUT_RUN;
-      cut.nan_kept = 0u;
-      cut.key_least = 0xFFFFFFFFu;
-      cut.key_most = 0u;
-      cut.key_skip = 0u;
-    }
-    __syncthreads();
-    m1_u32 least = 0xFFFFFFFFu;
-    m1_u32 most = 0u;
-    m1_cut_scan(input, base, len, dtype, [&](m1_u32 i, float y) {
-      if (m1_isnan(y)) {
-        atomicMin(&cut.first_nan, i);
-      } else {
-        if (y < 0.0f) cut.negative = 1u;
-        if (!(y < 1.8446744e19f)) cut.wide = 1u;
-        const m1_u32 key = m1_desc_key(y);
-        least = key < least ? key : least;
-        most = key > most ? key : most;
-      }
-    });
-    if (least <= most) {
-      atomicMin(&cut.key_least, least);
-      atomicMax(&cut.key_most, most);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0u && cut.key_least <= cut.key_most) {
-      const m1_u32 differ = cut.key_least ^ cut.key_most;
-      m1_u32 skip = 0u;
-      while (skip < 3u && (differ >> (24u - 8u * skip)) == 0u) ++skip;
-      cut.key_skip = skip;
-    }
-    __syncthreads();
-    const bool monotone = cut.negative == 0u;
-    bool binades = monotone && cut.wide == 0u;
-    m1_cut_chunk(input, base, len, dtype, cutoff, monotone, output, cut);
-    for (m1_u32 step = 0u; cut.stage == M1_CUT_RUN; ++step) {
-      if (binades && step < 512u) {
-        m1_cut_phase(input, base, len, dtype, cutoff, cut);
-        if (cut.stage == M1_CUT_BAIL) {
-          binades = false;
-          __syncthreads();
-          if (threadIdx.x == 0u) cut.stage = M1_CUT_RUN;
-          __syncthreads();
-        }
-      } else {
-        m1_cut_chunk(input, base, len, dtype, cutoff, monotone, output, cut);
-      }
-    }
-    const m1_u32 stage = cut.stage;
-    const m1_u64 pivot = cut.pivot;
-    const m1_u32 first_nan = cut.nan_kept != 0u ? cut.first_nan : 0xFFFFFFFFu;
-    m1_cut_scan(input, base, len, dtype, [&](m1_u32 i, float y) {
-      if (m1_isnan(y)) {
-        m1_store_b(output, base + i, i == first_nan);
-      } else if (monotone) {
-        m1_store_b(
-            output, base + i,
-            stage == M1_CUT_ALL ||
-                m1_cut_composite(m1_desc_key(y), i) <= pivot);
-      }
-    });
-    __syncthreads();
+    m1_cut_row(input, base, len, dtype, cutoff, output, cut, g);
   }
 }
 
-// The top-k cut, `PivotThreshold(RankLe)`: an element is kept when fewer
-// than k non-NaN elements are greater, so every element tied with the k-th
-// is kept. A radix select on the descending key finds the k-th key in three
-// counting passes of 11, 11 and 10 bits; a last pass keeps every element at
-// or above it.
+// The top-k cut of one row (`k` already clamped to 1..len) on the group
+// `grp`: the verdicts of the group's stretch land in `output`.
+template <class G>
+__device__ void m1_rank_row(
+    const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype, m1_u32 k,
+    m1_u8* output, G& grp) {
+  __shared__ m1_u32 rank_hist[2048];
+  __shared__ m1_u32 rank_group[64];
+  __shared__ m1_u32 rank_prefix;
+  __shared__ m1_u32 rank_target;
+  (void)len;
+  if (threadIdx.x == 0u) {
+    rank_prefix = 0u;
+    rank_target = k;
+  }
+  __syncthreads();
+  for (int pass = 0; pass < 3; ++pass) {
+    const int width = pass == 2 ? 10 : 11;
+    const int shift = pass == 0 ? 21 : (pass == 1 ? 10 : 0);
+    const m1_u32 bins = 1u << width;
+    const m1_u32 high_mask =
+        pass == 0 ? 0u : (0xFFFFFFFFu << (shift + width));
+    for (m1_u32 bin = threadIdx.x; bin < bins; bin += blockDim.x)
+      rank_hist[bin] = 0u;
+    __syncthreads();
+    const m1_u32 prefix = rank_prefix & high_mask;
+    m1_u32 held_bin = 0xFFFFFFFFu;
+    m1_u32 held = 0u;
+    m1_cut_scan_range(input, base, grp.lo, grp.hi, dtype, [&](m1_u32 i, float y) {
+      (void)i;
+      const m1_u32 key = m1_desc_key(y);
+      if ((key & high_mask) != prefix) return;
+      const m1_u32 bin = (key >> shift) & (bins - 1u);
+      if (bin != held_bin) {
+        if (held != 0u) atomicAdd(&rank_hist[held_bin], held);
+        held_bin = bin;
+        held = 0u;
+      }
+      ++held;
+    });
+    if (held != 0u) atomicAdd(&rank_hist[held_bin], held);
+    __syncthreads();
+    grp.sum_u32(rank_hist, bins);
+    // The bin holding the target-th element: group sums of 32 bins, then
+    // one thread walks the groups and the chosen group's bins.
+    const m1_u32 groups = bins >> 5;
+    for (m1_u32 g = threadIdx.x; g < groups; g += blockDim.x) {
+      m1_u32 sum = 0u;
+      for (m1_u32 b = 0u; b < 32u; ++b) sum += rank_hist[(g << 5) + b];
+      rank_group[g] = sum;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+      const m1_u32 target = rank_target;
+      m1_u32 run = 0u;
+      m1_u32 g = 0u;
+      while (g + 1u < groups && run + rank_group[g] < target) {
+        run += rank_group[g];
+        ++g;
+      }
+      m1_u32 bin = g << 5;
+      const m1_u32 last = bin + 31u;
+      while (bin < last && run + rank_hist[bin] < target) {
+        run += rank_hist[bin];
+        ++bin;
+      }
+      rank_target = target - run;
+      rank_prefix = prefix | (bin << shift);
+    }
+    __syncthreads();
+  }
+  const m1_u32 cutoff_key = rank_prefix;
+  m1_cut_scan_range(input, base, grp.lo, grp.hi, dtype, [&](m1_u32 i, float y) {
+    m1_store_b(output, base + i, !m1_isnan(y) && m1_desc_key(y) <= cutoff_key);
+  });
+  __syncthreads();
+}
+
+// The top-k cut, `PivotThreshold(RankLe)`, of each row on one block.
 __device__ __forceinline__ void ptir_parallel_pivot_rank(
     const m1_u8* input,
     const m1_u8* threshold,
     m1_u8* output,
     const M1ValueDesc input_desc,
     const M1ValueDesc threshold_desc) {
-  __shared__ m1_u32 rank_hist[2048];
-  __shared__ m1_u32 rank_group[64];
-  __shared__ m1_u32 rank_prefix;
-  __shared__ m1_u32 rank_target;
   const m1_u32 len = input_desc.last;
   const m1_u32 rows = input_desc.rows;
   const m1_u32 dtype = input_desc.dtype;
   if (len == 0u) return;
+  M1Solo grp;
+  grp.row(len);
   for (m1_u32 row = 0u; row < rows; ++row) {
     const m1_u32 base = row * len;
     m1_u32 k;
@@ -1334,70 +1486,7 @@ __device__ __forceinline__ void ptir_parallel_pivot_rank(
       __syncthreads();
       continue;
     }
-    if (threadIdx.x == 0u) {
-      rank_prefix = 0u;
-      rank_target = k;
-    }
-    __syncthreads();
-    for (int pass = 0; pass < 3; ++pass) {
-      const int width = pass == 2 ? 10 : 11;
-      const int shift = pass == 0 ? 21 : (pass == 1 ? 10 : 0);
-      const m1_u32 bins = 1u << width;
-      const m1_u32 high_mask =
-          pass == 0 ? 0u : (0xFFFFFFFFu << (shift + width));
-      for (m1_u32 bin = threadIdx.x; bin < bins; bin += blockDim.x)
-        rank_hist[bin] = 0u;
-      __syncthreads();
-      const m1_u32 prefix = rank_prefix & high_mask;
-      m1_u32 held_bin = 0xFFFFFFFFu;
-      m1_u32 held = 0u;
-      m1_cut_scan(input, base, len, dtype, [&](m1_u32 i, float y) {
-        (void)i;
-        const m1_u32 key = m1_desc_key(y);
-        if ((key & high_mask) != prefix) return;
-        const m1_u32 bin = (key >> shift) & (bins - 1u);
-        if (bin != held_bin) {
-          if (held != 0u) atomicAdd(&rank_hist[held_bin], held);
-          held_bin = bin;
-          held = 0u;
-        }
-        ++held;
-      });
-      if (held != 0u) atomicAdd(&rank_hist[held_bin], held);
-      __syncthreads();
-      // The bin holding the target-th element: group sums of 32 bins, then
-      // one thread walks the groups and the chosen group's bins.
-      const m1_u32 groups = bins >> 5;
-      for (m1_u32 g = threadIdx.x; g < groups; g += blockDim.x) {
-        m1_u32 sum = 0u;
-        for (m1_u32 b = 0u; b < 32u; ++b) sum += rank_hist[(g << 5) + b];
-        rank_group[g] = sum;
-      }
-      __syncthreads();
-      if (threadIdx.x == 0u) {
-        const m1_u32 target = rank_target;
-        m1_u32 run = 0u;
-        m1_u32 g = 0u;
-        while (g + 1u < groups && run + rank_group[g] < target) {
-          run += rank_group[g];
-          ++g;
-        }
-        m1_u32 bin = g << 5;
-        const m1_u32 last = bin + 31u;
-        while (bin < last && run + rank_hist[bin] < target) {
-          run += rank_hist[bin];
-          ++bin;
-        }
-        rank_target = target - run;
-        rank_prefix = prefix | (bin << shift);
-      }
-      __syncthreads();
-    }
-    const m1_u32 cutoff_key = rank_prefix;
-    m1_cut_scan(input, base, len, dtype, [&](m1_u32 i, float y) {
-      m1_store_b(output, base + i, !m1_isnan(y) && m1_desc_key(y) <= cutoff_key);
-    });
-    __syncthreads();
+    m1_rank_row(input, base, len, dtype, k, output, grp);
   }
 }
 

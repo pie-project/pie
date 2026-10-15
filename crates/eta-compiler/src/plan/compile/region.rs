@@ -27,6 +27,8 @@ eta_ir::declare_tagged_enum! {
         Scan = 3, "scan";
         MatMul = 4, "matmul";
         SecondParty = 5, "second_party";
+        RankSample = 6, "rank_sample";
+        LaneCut = 7, "lane_cut";
     }
 }
 

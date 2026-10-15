@@ -37,6 +37,7 @@ mod a_tower_region_reads_the_patch_window;
 mod a_two_axis_plan_arms_its_token_bodies;
 mod a_two_reading_plan_reads_each_lane_back_from_its_own_seam;
 mod a_windowed_row_reads_what_the_full_row_reads;
+mod a_lane_sampler_draws_what_the_interpreter_draws;
 mod a_nucleus_cut_agrees_with_the_host_interpreter;
 mod a_sampler_epilogue_times;
 mod an_adapter_is_not_a_lanes_scratch;

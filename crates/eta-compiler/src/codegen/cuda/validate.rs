@@ -63,7 +63,9 @@ pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Resu
         return Err(EmitError::FusedRequiresGeneratedRegion);
     }
     if let RegionKind::Library(claimed) = region.kind {
-        let honest = if claimed == LibraryOp::NucleusSample {
+        let honest = if claimed == LibraryOp::LaneCut {
+            region.nodes.len() == 1 && region.inputs.len() == 2 && region.outputs.len() == 1
+        } else if matches!(claimed, LibraryOp::NucleusSample | LibraryOp::RankSample) {
             region.nodes.len() == 13
                 && (region.inputs.len() == 3 || region.inputs.len() == 5)
                 && region.outputs.len() == 1

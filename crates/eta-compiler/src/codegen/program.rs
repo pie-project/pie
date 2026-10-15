@@ -306,7 +306,12 @@ fn grouped_library(stage: &CompiledStage, region: &Region) -> Option<LibraryOp> 
             let op = stage.normalized.ops.get(node)?;
             (crate::codegen::op_view::OpView::of(op).tag == tags::TOP_K).then_some(LibraryOp::TopK)
         }
-        LibraryOp::Sort | LibraryOp::Scan | LibraryOp::MatMul | LibraryOp::SecondParty => None,
+        LibraryOp::Sort
+        | LibraryOp::Scan
+        | LibraryOp::MatMul
+        | LibraryOp::SecondParty
+        | LibraryOp::RankSample
+        | LibraryOp::LaneCut => None,
     }
 }
 

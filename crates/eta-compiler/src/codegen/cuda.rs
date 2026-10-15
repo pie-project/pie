@@ -2,6 +2,7 @@ pub mod fused;
 pub mod order;
 pub mod region_analysis;
 pub mod runtime;
+pub mod sampler;
 pub mod scan;
 pub mod singleton;
 mod stream;
@@ -19,10 +20,10 @@ use crate::codegen::error::EmitError;
 use crate::plan::{CompiledStage, Region};
 use alloc::string::String;
 
-pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 43;
+pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 44;
 
 /// The HIP emitter shares the CUDA one's text and moves with it.
-pub const HIP_GENERATED_EMITTER_VERSION: u16 = 3;
+pub const HIP_GENERATED_EMITTER_VERSION: u16 = 4;
 
 pub fn emit_region(
     entry_name: &str,
@@ -43,6 +44,9 @@ pub fn emit_region_in(
     }
     if is_scan_region(stage, region) {
         return emit_scan_region_in(dialect, entry_name, stage, region);
+    }
+    if sampler::is_sampler_region(stage, region) {
+        return sampler::emit_sampler_region_in(dialect, entry_name, stage, region);
     }
     emit_fused_region_in(dialect, entry_name, stage, region)
 }

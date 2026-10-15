@@ -23,6 +23,23 @@ use super::endpoint::Endpoint;
 const FUSED_ARITY: usize = 18;
 
 pub const ORDER_ROW_BLOCKS: u32 = 32;
+/// The most blocks a lane's sampler region runs on (`sample_lane.cuh`); a
+/// fire runs as many as the device holds at once with its lanes, from one.
+pub const LANE_SAMPLER_BLOCKS: u32 = 16;
+/// A sampler block's arena: a barrier word's line and two exchange buffers.
+const LANE_SAMPLER_ARENA: u64 = 64 + 2 * 18_432;
+
+/// Whether `kind` is a lane sampler region: its lane's blocks split each row
+/// and meet at a barrier (`LANE_SAMPLER_BLOCKS`).
+#[must_use]
+pub fn lane_sampler(kind: RegionKind) -> bool {
+    matches!(
+        kind,
+        RegionKind::Library(
+            LibraryOp::NucleusSample | LibraryOp::RankSample | LibraryOp::LaneCut
+        )
+    )
+}
 
 pub const INTRINSIC_SLOTS: usize = IntrinsicId::SLOTS as usize;
 
@@ -480,6 +497,7 @@ pub struct Prepared {
     temporary_offset: u32,
     temporary_bytes: u32,
     region_rows: Vec<u32>,
+    samplers: Vec<bool>,
     lanes: u32,
     lane_cap: u32,
     filled: u32,
@@ -756,6 +774,7 @@ fn region_rows(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> {
                 .map_or(1, |descriptor| descriptor.rows.max(1));
             match region.kind {
                 RegionKind::Generated => rows,
+                kind if lane_sampler(kind) => LANE_SAMPLER_BLOCKS,
                 RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => rows,
                 RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => {
                     rows.min(ORDER_ROW_BLOCKS)
@@ -794,6 +813,7 @@ fn temporary_floor(plan: &LaunchStagePlan, descriptors: &[ValueDesc], rows: &[u3
             }
             let per_block = match region.kind {
                 RegionKind::Generated => align(2 * widest.div_ceil(32) * 4 + 4096),
+                kind if lane_sampler(kind) => align(LANE_SAMPLER_ARENA),
                 RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => 0,
                 RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => align(8 * widest + 256),
                 RegionKind::Library(_) => 0,
@@ -852,6 +872,7 @@ impl Prepared {
         let temporary_bytes = u32::try_from(scratch_layout.temporary_bytes)
             .map_err(|_| Fault::program("program::launch", "a temporary arena past a u32"))?;
         let region_rows = region_rows(plan, &descriptors);
+        let samplers = plan.fused.iter().map(|region| lane_sampler(region.kind)).collect();
 
         let mut records = Vec::with_capacity(plan.ops.len());
         let mut result_base = 0u32;
@@ -929,6 +950,7 @@ impl Prepared {
             temporary_offset,
             temporary_bytes,
             region_rows,
+            samplers,
             lanes: 0,
             lane_cap: u32::MAX,
             filled: 0,
@@ -1249,6 +1271,20 @@ impl Prepared {
             .unwrap_or(1)
             .max(1);
         let stride = (self.temporary_bytes / rows) & !(SCRATCH_ALIGN as u32 - 1);
+        let sampler = self
+            .samplers
+            .get(region.region_index as usize)
+            .copied()
+            .unwrap_or(false);
+        // A sampler lane runs on as many blocks as the device holds at once
+        // with the fire's lanes (its blocks wait on one another), each over
+        // its own arena; the lanes' barrier words start at zero.
+        let rows = if sampler {
+            self.zero_barriers(stream)?;
+            (device_units() / self.filled.max(1)).clamp(1, sampler_blocks().min(rows))
+        } else {
+            rows
+        };
         args.u32(rows).u32(stride);
         launch(
             &region.module,
@@ -1369,6 +1405,80 @@ impl Args {
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
+}
+
+impl Prepared {
+    /// The fire's lanes' sampler barrier words (the first word of each lane's
+    /// temporary arena) back to zero.
+    fn zero_barriers(&self, stream: *mut core::ffi::c_void) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::driver::sys as dr;
+            // SAFETY: the scratch holds `filled` lanes `scratch_stride` apart,
+            // each with its temporary arena at `temporary_offset`.
+            let code = unsafe {
+                dr::cuMemsetD2D32Async(
+                    self.scratch.ptr() + u64::from(self.temporary_offset),
+                    self.scratch_stride as usize,
+                    0,
+                    1,
+                    self.filled as usize,
+                    stream.cast(),
+                )
+            };
+            if code != dr::CUresult::CUDA_SUCCESS {
+                return Err(Fault::Device {
+                    call: "cuMemsetD2D32Async",
+                    code: code as i32,
+                });
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = stream;
+        Ok(())
+    }
+}
+
+/// The most blocks a sampler lane takes: `LANE_SAMPLER_BLOCKS`, or fewer
+/// under `PIE_LANE_SAMPLER_BLOCKS` (a test's lever on the split).
+fn sampler_blocks() -> u32 {
+    static BLOCKS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BLOCKS.get_or_init(|| {
+        std::env::var("PIE_LANE_SAMPLER_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map_or(LANE_SAMPLER_BLOCKS, |v| v.clamp(1, LANE_SAMPLER_BLOCKS))
+    })
+}
+
+/// The device's multiprocessors, which a sampler fire's blocks may fill.
+fn device_units() -> u32 {
+    static UNITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *UNITS.get_or_init(|| {
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::driver::sys as dr;
+            let mut device: dr::CUdevice = 0;
+            let mut count: core::ffi::c_int = 0;
+            // SAFETY: out-parameters for the current context's device.
+            unsafe {
+                if dr::cuCtxGetDevice(&raw mut device) != dr::CUresult::CUDA_SUCCESS
+                    || dr::cuDeviceGetAttribute(
+                        &raw mut count,
+                        dr::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                        device,
+                    ) != dr::CUresult::CUDA_SUCCESS
+                {
+                    return 1;
+                }
+            }
+            u32::try_from(count).unwrap_or(1).max(1)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            1
+        }
+    })
 }
 
 pub fn launch(

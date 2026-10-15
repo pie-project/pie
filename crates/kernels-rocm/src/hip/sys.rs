@@ -126,6 +126,7 @@ table!(Hip from "libamdhip64.so" {
     fn hipDeviceEnablePeerAccess(peer: c_int, flags: c_uint) -> HipError;
     fn hipMemset(dst: *mut c_void, value: c_int, bytes: usize) -> HipError;
     fn hipMemsetAsync(dst: *mut c_void, value: c_int, bytes: usize, stream: Stream) -> HipError;
+    fn hipMemset2DAsync(dst: *mut c_void, pitch: usize, value: c_int, width: usize, height: usize, stream: Stream) -> HipError;
     fn hipMemcpyBatchAsync(dsts: *mut *mut c_void, srcs: *mut *mut c_void, sizes: *mut usize, count: usize, attrs: *mut MemcpyAttributes, attr_idxs: *mut usize, num_attrs: usize, fail_idx: *mut usize, stream: Stream) -> HipError;
     fn hipHostMalloc(ptr: *mut *mut c_void, bytes: usize, flags: c_uint) -> HipError;
     fn hipHostFree(ptr: *mut c_void) -> HipError;
