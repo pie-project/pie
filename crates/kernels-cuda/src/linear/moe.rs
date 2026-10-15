@@ -1093,16 +1093,15 @@ pub(crate) fn select_gemv(
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
     let form = if fan.by_token { "by_token" } else { "by_route" };
+    // Four weight rows a warp, their loads in flight together: Qwen3.6's
+    // layer at 8 decode tokens (gate-up K 2048, down K 512) 55 + 37 us at one
+    // row a warp, 40 + 21 at four (two 44 + 25, eight 45 + 24).
+    const ROWS: u32 = 4;
+    let entry = format!("::pie::linear::moe_matmul_select_gemv_{form}<{t}, {ROWS}>");
     ctx.fire(
         op,
-        Fire::at(
-            FILE,
-            symbol(&format!(
-                "::pie::linear::moe_matmul_select_gemv_{form}<{t}>"
-            )),
-        )
-        .apply(Launch::grid(
-            [y.width.div_ceil(GEMV_WARPS), grid_y, grid_z],
+        Fire::at(FILE, symbol(&entry)).apply(Launch::grid(
+            [y.width.div_ceil(GEMV_WARPS * ROWS), grid_y, grid_z],
             [WARP, GEMV_WARPS, 1],
         )),
         &[

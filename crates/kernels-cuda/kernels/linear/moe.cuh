@@ -834,7 +834,11 @@ __device__ __forceinline__ void moe_note_expert(
     }
 }
 
-template <class T, bool ActByToken, int kWarps, int kUnroll>
+// `y[route] = x[route or its token] . W[routes[route]]^T`, a warp `kRows`
+// weight rows: a lane's activations are read once and meet every row, and
+// the rows' loads issue together. A route run past grid.y's 65535 rows
+// continues on grid.z.
+template <class T, bool ActByToken, int kRows>
 __device__ __forceinline__ void moe_matmul_select_gemv_body(
     const i32* __restrict__ topk_idx,
     const T* __restrict__ act,
@@ -846,94 +850,68 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
     const u32* __restrict__ win,
     int route_count)
 {
-    // A run past the 65535 rows grid.y holds continues on grid.z.
     const int route = static_cast<int>(blockIdx.y + blockIdx.z * gridDim.y);
-
     if (route >= route_count) return;
     if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
     const int plane_route = win != nullptr
         ? route + static_cast<int>(win[1]) * top_k
         : route;
-    const int row = blockIdx.x * kWarps + threadIdx.y;
-    if (row >= N) return;
+    const int row0 = (static_cast<int>(blockIdx.x) * kGemvWarps + static_cast<int>(threadIdx.y)) * kRows;
+    if (row0 >= N) return;
     const int lane = threadIdx.x;
 
     const int expert = topk_idx[plane_route];
-
     if (expert < 0) {
         if (lane == 0) {
-            out[(long long)plane_route * N + row] = Elem<T>::from_f32(0.f);
+#pragma unroll
+            for (int r = 0; r < kRows; ++r)
+                if (row0 + r < N) out[(long long)plane_route * N + row0 + r] = Elem<T>::from_f32(0.f);
         }
         return;
     }
-
     if (blockIdx.x == 0 && threadIdx.y == 0 && lane == 0) {
         moe_note_expert(expert_hits, expert);
     }
-    const T* w = moe_expert_base(weight_base, expert_table, expert, expert_stride)
-        + (long long)row * K;
+    const T* w = moe_expert_base(weight_base, expert_table, expert, expert_stride);
+    const float4* w4[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r)
+        w4[r] = reinterpret_cast<const float4*>(w + (long long)min(row0 + r, N - 1) * K);
+    const float4* x4 = reinterpret_cast<const float4*>(
+        act + (long long)(ActByToken ? plane_route / top_k : plane_route) * K);
 
-    const T* x =
-        act + (long long)(ActByToken ? plane_route / top_k : plane_route) * K;
-
-    float acc = 0.f;
+    float acc[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
     const int vec = K / kMoeVecWidth;
-    const float4* w4 = reinterpret_cast<const float4*>(w);
-    const float4* x4 = reinterpret_cast<const float4*>(x);
-    int i = lane;
-    for (; i + 32 * (kUnroll - 1) < vec; i += 32 * kUnroll) {
-        float4 wv[kUnroll];
-        float4 xv[kUnroll];
-        #pragma unroll
-        for (int u = 0; u < kUnroll; ++u) {
-            wv[u] = w4[i + 32 * u];
-            xv[u] = x4[i + 32 * u];
-        }
-        #pragma unroll
-        for (int u = 0; u < kUnroll; ++u) {
-            const T* wb = reinterpret_cast<const T*>(&wv[u]);
-            const T* xb = reinterpret_cast<const T*>(&xv[u]);
-            #pragma unroll
+    for (int i = lane; i < vec; i += 32) {
+        float4 wv[kRows];
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) wv[r] = w4[r][i];
+        const float4 xv = x4[i];
+        const T* xb = reinterpret_cast<const T*>(&xv);
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const T* wb = reinterpret_cast<const T*>(&wv[r]);
+#pragma unroll
             for (int j = 0; j < kMoeVecWidth; ++j) {
-                acc += Elem<T>::to_f32(wb[j]) * Elem<T>::to_f32(xb[j]);
+                acc[r] += Elem<T>::to_f32(wb[j]) * Elem<T>::to_f32(xb[j]);
             }
         }
     }
-    for (; i < vec; i += 32) {
-        float4 wv = w4[i];
-        float4 xv = x4[i];
-        const T* wb = reinterpret_cast<const T*>(&wv);
-        const T* xb = reinterpret_cast<const T*>(&xv);
-        #pragma unroll
-        for (int j = 0; j < kMoeVecWidth; ++j) {
-            acc += Elem<T>::to_f32(wb[j]) * Elem<T>::to_f32(xb[j]);
-        }
-    }
-    #pragma unroll
+#pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, off);
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) acc[r] += __shfl_down_sync(0xffffffffu, acc[r], off);
     }
     if (lane == 0) {
-        out[(long long)plane_route * N + row] = Elem<T>::from_f32(acc);
+#pragma unroll
+        for (int r = 0; r < kRows; ++r)
+            if (row0 + r < N) out[(long long)plane_route * N + row0 + r] = Elem<T>::from_f32(acc[r]);
     }
 }
 
-template <class T, bool ActByToken, int kWarps, int kUnroll = 1>
-__global__ void moe_matmul_select_gemv(
-    const i32* __restrict__ topk_idx,
-    const T* __restrict__ act,
-    const T* __restrict__ weight_base,
-    T* __restrict__ out,
-    int top_k, int K, int N, long long expert_stride,
-    const T* const* __restrict__ expert_table,
-    unsigned int* __restrict__ expert_hits)
-{
-    moe_matmul_select_gemv_body<T, ActByToken, kWarps, kUnroll>(
-        topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
-        expert_table, expert_hits, nullptr, 0x7fffffff);
-}
-
-template <class T>
+template <class T, int kRows>
 __global__ void moe_matmul_select_gemv_by_token(
     const i32* __restrict__ topk_idx,
     const T* __restrict__ act,
@@ -945,12 +923,12 @@ __global__ void moe_matmul_select_gemv_by_token(
     int route_count,
     const u32* __restrict__ win)
 {
-    moe_matmul_select_gemv_body<T, true, kGemvWarps, 1>(
+    moe_matmul_select_gemv_body<T, true, kRows>(
         topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
         expert_table, expert_hits, win, route_count);
 }
 
-template <class T>
+template <class T, int kRows>
 __global__ void moe_matmul_select_gemv_by_route(
     const i32* __restrict__ topk_idx,
     const T* __restrict__ act,
@@ -962,7 +940,7 @@ __global__ void moe_matmul_select_gemv_by_route(
     int route_count,
     const u32* __restrict__ win)
 {
-    moe_matmul_select_gemv_body<T, false, kGemvWarps, 1>(
+    moe_matmul_select_gemv_body<T, false, kRows>(
         topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
         expert_table, expert_hits, win, route_count);
 }
