@@ -415,10 +415,27 @@ fn the_tcgen05_gemm_reports_its_rate_beside_cublaslt() {
                     ptr: ptrs[i % ptrs.len()],
                     ..w
                 };
-                match gemm(&ctx, a, at(0), y, shape, 1.0) {
+                // `PIE_TC5_RATE_PLAN=swap,pair,bn,stages,splits` states the plan.
+                let stated = std::env::var("PIE_TC5_RATE_PLAN").ok().map(|v| {
+                    let d: Vec<u32> = v.split(',').filter_map(|d| d.trim().parse().ok()).collect();
+                    kernels_cuda::linear::tc5::Plan {
+                        swap: d[0] == 1,
+                        pair: d[1] == 1,
+                        bn: d[2],
+                        stages: d[3],
+                        splits: d[4],
+                    }
+                });
+                let fire = |w: Operand| match stated {
+                    Some(plan) => {
+                        kernels_cuda::linear::tc5::gemm_with(&ctx, a, w, y, shape, 1.0, plan)
+                    }
+                    None => gemm(&ctx, a, w, y, shape, 1.0),
+                };
+                match fire(at(0)) {
                     Ok(()) => {
                         let us = timer.median(|i| {
-                            gemm(&ctx, a, at(i), y, shape, 1.0).expect("fires again");
+                            fire(at(i)).expect("fires again");
                         });
                         format!("{:.0} ({us:.1}us)", tflops(m, n, k, us))
                     }
