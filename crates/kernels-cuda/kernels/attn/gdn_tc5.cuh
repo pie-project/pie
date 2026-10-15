@@ -543,19 +543,66 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
                 // T = (I + A)^-1: each warp inverts one sixteen-row diagonal
                 // block by forward substitution in f32, then two tf32 merge
                 // levels form the blocks below the diagonal.
-                if (l < 16) {
+                {
+                    // Each warp one sixteen-row diagonal block: lanes 0-7 and
+                    // 8-15 invert its two eight-row halves by forward
+                    // substitution (a lane a column, the rows' A values
+                    // loaded up front), then the warp forms the lower-left
+                    // eight by eight, -D1 (A10 D0).
                     const int d0 = static_cast<int>(quad) * 16;
-                    float tcol[16];
+                    float* X = reinterpret_cast<float*>(prep + kPrepX) + quad * 128;
+                    if (l < 16) {
+                        const int b0 = d0 + (l >> 3) * 8;
+                        const int col = l & 7;
+                        float a[28];
 #pragma unroll
-                    for (int rr = 0; rr < 16; ++rr) {
-                        const float* ar = sA + (d0 + rr) * LDA + d0;
+                        for (int r = 1, e = 0; r < 8; ++r) {
+#pragma unroll
+                            for (int m = 0; m < r; ++m, ++e) a[e] = sA[(b0 + r) * LDA + b0 + m];
+                        }
+                        float t[8];
+#pragma unroll
+                        for (int r = 0, e = 0; r < 8; ++r) {
+                            float sum = 0.f;
+#pragma unroll
+                            for (int m = 0; m < r; ++m, ++e) sum = __fmaf_rn(a[e], t[m], sum);
+                            t[r] = r == col ? 1.f : (r < col ? 0.f : -sum);
+                        }
+#pragma unroll
+                        for (int r = 0; r < 8; ++r) Tm[(b0 + r) * LDA + b0 + col] = t[r];
+                    }
+                    __syncwarp();
+                    // X = A10 D0, two entries a lane.
+#pragma unroll
+                    for (int h2 = 0; h2 < 2; ++h2) {
+                        const int e = l + 32 * h2;
+                        const int r = e >> 3;
+                        const int c = e & 7;
                         float sum = 0.f;
 #pragma unroll
-                        for (int m = 0; m < rr; ++m) sum = __fmaf_rn(ar[m], tcol[m], sum);
-                        tcol[rr] = rr == l ? 1.f : (rr < l ? 0.f : -sum);
+                        for (int m = 0; m < 8; ++m) {
+                            if (m >= c) {
+                                sum = __fmaf_rn(sA[(d0 + 8 + r) * LDA + d0 + m],
+                                                Tm[(d0 + m) * LDA + d0 + c], sum);
+                            }
+                        }
+                        X[e] = sum;
                     }
+                    __syncwarp();
 #pragma unroll
-                    for (int rr = 0; rr < 16; ++rr) Tm[(d0 + rr) * LDA + d0 + l] = tcol[rr];
+                    for (int h2 = 0; h2 < 2; ++h2) {
+                        const int e = l + 32 * h2;
+                        const int r = e >> 3;
+                        const int c = e & 7;
+                        float sum = 0.f;
+#pragma unroll
+                        for (int m = 0; m < 8; ++m) {
+                            if (m <= r) {
+                                sum = __fmaf_rn(Tm[(d0 + 8 + r) * LDA + d0 + 8 + m], X[m * 8 + c], sum);
+                            }
+                        }
+                        Tm[(d0 + 8 + r) * LDA + d0 + c] = -sum;
+                    }
                 }
                 named_sync(bar_id, 128);
                 {
