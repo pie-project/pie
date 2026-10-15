@@ -151,6 +151,8 @@ counts! {
         "The most columns the MPP matmul pipelines its loads over.";
     MppLinearFrom = "kernel.qmm_mpp.linear_from", 256..=8192, 1024,
         "From this many rows a packed bank's MPP matmul walks its tiles linearly.";
+    MppStagedFrom = "kernel.qmm_mpp.staged_from", 0..=65536, 0,
+        "From this many rows a plain bank's MPP matmul stages its weights as half and accumulates over the whole contraction, as Splash's prompt tile does; 0 never.";
     SdpaMppFrom = "kernel.sdpa.mpp_rows.from", 8..=1024, 32,
         "The fewest prompt rows that attend through the MPP kernels.";
     SdpaMppDirectFrom = "kernel.sdpa.mpp_rows.direct_from", 64..=8192, 512,
@@ -172,6 +174,7 @@ pub struct QmmMpp {
     pub pipeline_rows: u32,
     pub pipeline_cols: u32,
     pub linear_from: u32,
+    pub staged_from: u32,
 }
 
 /// The `kernel.sdpa.mpp_rows.*` decisions.
@@ -277,6 +280,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MppPipelineRows>()
         .add::<MppPipelineCols>()
         .add::<MppLinearFrom>()
+        .add::<MppStagedFrom>()
         .add::<SdpaMppFrom>()
         .add::<SdpaMppDirectFrom>()
         .add::<SdpaPairedBelow>()
@@ -468,6 +472,7 @@ impl Tuning {
             pipeline_rows: self.profile.get::<MppPipelineRows>().0,
             pipeline_cols: self.profile.get::<MppPipelineCols>().0,
             linear_from: self.profile.get::<MppLinearFrom>().0,
+            staged_from: self.profile.get::<MppStagedFrom>().0,
         }
     }
 

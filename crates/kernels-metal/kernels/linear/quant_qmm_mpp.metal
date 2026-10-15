@@ -213,3 +213,63 @@ affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
       const device uchar *, const device bfloat *, const device bfloat *, const device bfloat *,   \
       device bfloat *, constant int &, constant int &, const device float *, const device int *,   \
       uint3);
+
+// The staged twin, as Splash runs a prompt's matmul: the threadgroup dequantizes one 64-code group of
+// its N columns into a half stage (q * scale + bias), and the 32 x N matmul accumulates the stage over
+// the whole contraction, so no per-group epilogue touches the destination. 128 threads; thread t
+// stages column t.
+constant constexpr int kStagedM = 32, kStagedN = 128, kStagedK = 64;
+[[kernel]] void affine_qmm_mpp_staged(const device uchar *weights [[buffer(0)]],
+                                      const device bfloat *scales [[buffer(1)]],
+                                      const device bfloat *biases [[buffer(2)]],
+                                      const device bfloat *input [[buffer(3)]],
+                                      device bfloat *output [[buffer(4)]],
+                                      constant int &width [[buffer(5)]],
+                                      constant int &columns [[buffer(6)]],
+                                      constant int &stride [[buffer(7)]],
+                                      uint3 position [[threadgroup_position_in_grid]],
+                                      uint thread_id [[thread_index_in_threadgroup]]) {
+  threadgroup half stage[kStagedN * kStagedK];
+  const uint row = position.y * kStagedM, column = position.x * kStagedN;
+  const int groups = width / 64, groups_total = stride / 64;
+  auto activations = tensor(const_cast<device bfloat *>(input) + ulong(row) * width,
+                            dextents<int, 2>{width, kStagedM}, array<int, 2>{1, width});
+  tensor<threadgroup half, dextents<int, 2>, tensor_inline> staged(
+      stage, dextents<int, 2>{kStagedK, kStagedN}, array<int, 2>{1, kStagedK});
+  constexpr auto descriptor =
+      matmul2d_descriptor(kStagedM, kStagedN, kStagedK, false, true, false,
+                          matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<descriptor, execution_simdgroups<4>> multiply;
+  auto a = activations.template slice<kStagedK, kStagedM>(0, 0);
+  auto b = staged.template slice<kStagedK, kStagedN>(0, 0);
+  auto total =
+      multiply.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+  for (ushort i = 0; i < total.get_capacity(); ++i)
+    total[i] = 0;
+  const uint mine = column + thread_id;
+  const device uint4 *codes =
+      reinterpret_cast<const device uint4 *>(weights + ulong(mine) * (stride / 2));
+  threadgroup half *slot = stage + thread_id * kStagedK;
+  for (int group = 0; group < groups; ++group) {
+    const ulong parameter = ulong(mine) * groups_total + group;
+    const float scale = float(scales[parameter]), bias = float(biases[parameter]);
+    const uint4 low = codes[group * 2], high = codes[group * 2 + 1];
+    const uint words[8] = {low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w};
+#pragma unroll
+    for (int w = 0; w < 8; ++w)
+#pragma unroll
+      for (int nibble = 0; nibble < 8; ++nibble)
+        slot[w * 8 + nibble] = half(float((words[w] >> (4 * nibble)) & 15u) * scale + bias);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    auto lhs = activations.template slice<kStagedK, kStagedM>(group * kStagedK, 0);
+    multiply.run(lhs, b, total);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  auto converted =
+      multiply.template get_destination_cooperative_tensor<decltype(a), decltype(b), bfloat>();
+  for (ushort i = 0; i < total.get_capacity(); ++i)
+    converted[i] = bfloat(total[i]);
+  auto destination = tensor(output + ulong(row) * columns + column,
+                            dextents<int, 2>{columns, kStagedM}, array<int, 2>{1, columns});
+  converted.store(destination.template slice<kStagedN, kStagedM>(0, 0));
+}

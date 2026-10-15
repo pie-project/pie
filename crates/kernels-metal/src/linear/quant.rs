@@ -635,6 +635,35 @@ fn act_x_wt_over(
                 // A column cut lands part of a row, which the MPP kernel never does.
                 if columns == stride {
                     let padded = rows.div_ceil(bm) * bm;
+                    // A prompt's plain bank stages its weights as half and runs the
+                    // matmul over the whole contraction, as Splash's prompt tile does.
+                    let staged_from = tuning.qmm_mpp_tiles().staged_from;
+                    if staged_from > 0
+                        && rows >= staged_from
+                        && (bm, bn) == (32, 128)
+                        && padded <= capacity_rows
+                        && w.mpp_codes.is_none()
+                        && w.biases.is_some()
+                        && w.scales.dtype == dtype::Dtype::Bf16
+                        && (w.bits, w.group) == (4, 64)
+                        && columns.is_multiple_of(128)
+                        && contraction.is_multiple_of(64)
+                    {
+                        return ctx.fire(
+                            Fire::at("linear/quant_qmm_mpp.metal", "affine_qmm_mpp_staged")
+                                .apply(Grid::of([128 * (columns / 128), padded / 32, 1], [128, 1, 1])),
+                            &[
+                                w.codes.arg(),
+                                w.scales.arg(),
+                                biases.arg(),
+                                act.arg(),
+                                y.arg_mut(),
+                                k.arg(),
+                                n.arg(),
+                                ld.arg(),
+                            ],
+                        );
+                    }
                     if padded <= capacity_rows
                         && let Some(staged) = (scratch.precast)(padded, contraction)
                     {
@@ -652,6 +681,7 @@ fn act_x_wt_over(
                             pipeline_rows,
                             pipeline_cols,
                             linear_from,
+                            ..
                         } = tuning.qmm_mpp_tiles();
                         let partitions = if rows > split_rows { 2u32 } else { 4u32 };
                         let partial = if (rows <= split_rows
