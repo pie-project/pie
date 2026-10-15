@@ -8,10 +8,15 @@ assumes = { cc = 100 }
 gemv.bf16 = "narrow"
 mla.path  = "naive"
 # The tcgen05 GEMMs (B200): routed selects from 16 tokens, a dense
-# projection's GLU in the epilogue from 64 rows.
+# projection's GLU in the epilogue from 512 rows. Below that cuBLAS's
+# gate-up and the GLU apart are faster: Gemma-4-31B's (21504 wide over
+# 5376) takes 77 us at 64 rows where the epilogue GEMM takes 107, 92 / 109
+# at 256, and they tie at 512 (133 + the GLU / 143); Gemma-4-31B decodes a
+# step at 64 requests in 20.86 ms where it took 22.97, Qwen3.8-27B in 16.01
+# where it took 16.20, prefills unmoved.
 moe.tc5           = true
 moe.tc5_from      = 16
-gemm.tc5_glu_from = 64
+gemm.tc5_glu_from = 512
 # Every sm_100 block opts into 227 KiB, past the 123 KiB the two-launch
 # gated delta scan holds; 32 x 4096 tokens take 7.8 ms a layer there where
 # the three wmma launches took about 97 (Qwen3.8-27B's head).
