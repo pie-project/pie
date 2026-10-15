@@ -284,6 +284,15 @@ __device__ __forceinline__ long long paged_slot(
     return static_cast<long long>(page) * page_size + (pos % page_size);
 }
 
+// The positions request `req`'s pages hold: a padded lane owns none, and no
+// position at or past this is read through `paged_slot`.
+__device__ __forceinline__ int owned_positions(
+    const u32* __restrict__ kv_page_indptr, int req, int page_size) {
+    const int pages = static_cast<int>(kv_page_indptr[req + 1]) -
+                      static_cast<int>(kv_page_indptr[req]);
+    return max(pages, 0) * page_size;
+}
+
 template <class T = i32>
 __global__ void pool_boundary_decode(
     const i32* __restrict__ positions,
@@ -315,15 +324,29 @@ __global__ void pool_boundary_prefill(
     int num_requests,
     int ratio,
     const u8* __restrict__ row_valid) {
+    // A fire's indptr seats more lanes than it fills, and the unfilled ones
+    // read 0: the live lanes end where the indptr first falls. The search
+    // below walks only those, and a row past the last live request closes
+    // nothing (it would otherwise land on a lane that owns no pages).
+    __shared__ int s_live;
+    if (threadIdx.x == 0) s_live = num_requests;
+    __syncthreads();
+    for (int r = 1 + static_cast<int>(threadIdx.x); r <= num_requests; r += blockDim.x) {
+        if (qo_indptr[r] < qo_indptr[r - 1]) atomicMin(&s_live, r - 1);
+    }
+    __syncthreads();
+    const int live = s_live;
+
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n) return;
     const int p = positions[t];
-    const bool valid = (row_valid == nullptr) || (row_valid[t] != 0);
+    const bool owned = live > 0 && t < static_cast<int>(qo_indptr[live]);
+    const bool valid = owned && ((row_valid == nullptr) || (row_valid[t] != 0));
     const bool is_boundary = valid && (((p + 1) % ratio) == 0);
     out_pos[t] = is_boundary ? p : -1;
 
     int lo = 0;
-    int hi = num_requests;
+    int hi = max(live, 1);
     while (lo + 1 < hi) {
         const int mid = lo + (hi - lo) / 2;
         if (static_cast<int>(qo_indptr[mid]) <= t) {
@@ -371,13 +394,16 @@ __global__ void index_block_mean_paged(
     const u32* __restrict__ kv_page_indptr,
     int head_dim,
     int ratio,
-    int page_size) {
-    const int c = blockIdx.x;
+    int page_size,
+    const u32* __restrict__ win) {
+    const int cb = blockIdx.x;
+    if (win != nullptr && cb >= static_cast<int>(win[0])) return;
+    const int c = win != nullptr ? cb + static_cast<int>(win[1]) : cb;
     const int bpos = boundary_pos[c];
     const int req = boundary_req[c];
     T* orow = out + static_cast<long long>(c) * head_dim;
 
-    if (bpos < 0) {
+    if (bpos < 0 || bpos >= owned_positions(kv_page_indptr, req, page_size)) {
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
             orow[d] = Elem<T>::from_f32(0.f);
         }
@@ -411,16 +437,21 @@ __global__ void pool_gather_paged(
     int ratio,
     int coff,
     int page_size,
-
-    int state_pitch) {
-    const int c = blockIdx.x;
+    int state_pitch,
+    const u32* __restrict__ win) {
+    // A staged fire seats more rows than it fills, and the boundary rows
+    // past the live ones were never written this fire: only the window's
+    // rows are read.
+    const int cb = blockIdx.x;
+    if (win != nullptr && cb >= static_cast<int>(win[0])) return;
+    const int c = win != nullptr ? cb + static_cast<int>(win[1]) : cb;
     const int window = coff * ratio;
     const int width = coff * head_dim;
     const long long pitch = static_cast<long long>(state_pitch);
     const int bpos = boundary_pos[c];
     const int req = boundary_req[c];
 
-    if (bpos < 0) {
+    if (bpos < 0 || bpos >= owned_positions(kv_page_indptr, req, page_size)) {
         T* z = out + static_cast<long long>(c) * head_dim;
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
             z[d] = Elem<T>::from_f32(0.f);
@@ -476,9 +507,14 @@ __global__ void pool_store_entries(
     const u32* __restrict__ kv_page_indices,
     const u32* __restrict__ kv_page_indptr,
     int head_dim,
-    int page_size) {
-    const int c = blockIdx.x;
-    if (boundary_pos[c] < 0) return;
+    int page_size,
+    const u32* __restrict__ win) {
+    const int cb = blockIdx.x;
+    if (win != nullptr && cb >= static_cast<int>(win[0])) return;
+    const int c = win != nullptr ? cb + static_cast<int>(win[1]) : cb;
+    if (boundary_pos[c] < 0 ||
+        boundary_pos[c] >= owned_positions(kv_page_indptr, boundary_req[c], page_size))
+        return;
     const long long slot = paged_slot(kv_page_indices, kv_page_indptr,
                                       boundary_req[c], boundary_pos[c], page_size);
     const T* src = entries + static_cast<long long>(c) * head_dim;
@@ -512,7 +548,8 @@ __global__ void pool_lse_paged(
     const int req = req_of_token[qi_row];
     const int qpos = positions[qi_row];
 
-    const int num_visible = (qpos + 1) / ratio;
+    const int num_visible =
+        min((qpos + 1) / ratio, owned_positions(kv_page_indptr, req, page_size) / ratio);
 
     extern __shared__ float smem[];
     float* q_smem = smem;
@@ -631,7 +668,8 @@ __global__ void pool_lse_selected_paged(
 
     const int req = req_of_token[qi_row];
     const int qpos = positions[qi_row];
-    const int num_visible = (qpos + 1) / ratio;
+    const int num_visible =
+        min((qpos + 1) / ratio, owned_positions(kv_page_indptr, req, page_size) / ratio);
     const i32* srow = selection + static_cast<long long>(qi_row) * top_k;
 
     extern __shared__ float smem[];

@@ -84,7 +84,8 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
 
     const int req = req_of_token[qi_row];
     const int qpos = positions[qi_row];
-    const int num_visible = (qpos + 1) / ratio;
+    const int num_visible =
+        min((qpos + 1) / ratio, owned_positions(kv_page_indptr, req, page_size) / ratio);
     const i32* srow = kSelected ? selection + static_cast<long long>(qi_row) * top_k : nullptr;
 
     // The walk's end: the first negative id (selected), else every visible row.
