@@ -1066,6 +1066,10 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 continue;
             }
             const u32 acc = static_cast<u32>(it) % 2;
+            // An unswapped warp wholly past the tile's rows (a decode
+            // expert's few routes fill one warp's) reads nothing: it only
+            // releases the accumulator.
+            const bool dead = !kSwap && static_cast<int>(rank * 128 + warp * 32) >= x.lim_p;
             bar_wait(&tfull[acc], (static_cast<u32>(it) / 2) & 1);
             tc_fence_after();
             ++it;
@@ -1124,7 +1128,24 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     return c < x.lim_q ? epi.wscale[x.q_row + (up ? inter : 0) + c] : 1.f;
                 }
             };
+            // No factor past alpha (a W4A4 select's store): its chunk
+            // takes the plain path, not the per-column guards below (the
+            // same sums: a zero bias's add turns -0 to +0 there too).
+            const bool plain = !wscaled && !biased && epi.row_scale == nullptr;
             auto finish = [&](u32 c0, const u32 (&v)[32], const u32 (&u)[32], float (&h)[32]) {
+                if (plain) {
+#pragma unroll
+                    for (int j = 0; j < 32; ++j) {
+                        if constexpr (kFused) {
+                            h[j] = tc5k::glu<kGlu>(__uint_as_float(v[j]) * alpha + 0.f,
+                                                   __uint_as_float(u[j]) * alpha + 0.f, epi.limit,
+                                                   epi.galpha);
+                        } else {
+                            h[j] = __uint_as_float(v[j]) * alpha + 0.f;
+                        }
+                    }
+                    return;
+                }
                 if constexpr (kFused) {
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
@@ -1155,6 +1176,13 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 }
             };
             auto product = [&](u32 c0, float (&h)[32]) {
+                if (dead) {
+#pragma unroll
+                    for (int j = 0; j < 32; ++j) {
+                        h[j] = 0.f;
+                    }
+                    return;
+                }
                 u32 v[32], u[32];
                 fetch(c0, v, u);
                 tmem_wait_ld();
