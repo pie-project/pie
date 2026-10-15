@@ -15,6 +15,8 @@ const WARP: u32 = 32;
 const GEMV_WARPS: u32 = 4;
 
 const MAX_EXPERTS: u32 = 512;
+/// The sigmoid router stages twice as many (Kimi-K3 routes over 896).
+const SIGMOID_MAX_EXPERTS: u32 = 1024;
 
 const MAX_GRID_Y: u32 = 65_535;
 
@@ -56,17 +58,28 @@ fn router_extents(
     experts: u32,
     top_k: u32,
 ) -> Result<(i32, i32), Error> {
+    router_extents_upto(op, logits, experts, top_k, MAX_EXPERTS)
+}
+
+/// [`router_extents`] for a router that stages up to `max` scores.
+fn router_extents_upto(
+    op: &'static str,
+    logits: Tensor,
+    experts: u32,
+    top_k: u32,
+    max: u32,
+) -> Result<(i32, i32), Error> {
     debug_assert_eq!(
         logits.width, experts,
         "the router's row is the expert count the statement states"
     );
     nonzero(op, "rows", logits.rows)?;
     nonzero(op, "the fan-out this router states", top_k)?;
-    if experts > MAX_EXPERTS {
+    if experts > max {
         return Err(refuse(
             op,
             format!(
-                "the expert count is {experts}, above the {MAX_EXPERTS} scores this router \
+                "the expert count is {experts}, above the {max} scores this router \
                  stages in shared memory"
             ),
         ));
@@ -189,9 +202,10 @@ fn ranked_router(
     scaling: f32,
     routes: &mut Tensor,
     weights: &mut Tensor,
+    max: u32,
 ) -> Result<(), Error> {
     ranked_planes(op, logits, top_k, routes, weights);
-    let (e, k) = router_extents(op, logits, experts, top_k)?;
+    let (e, k) = router_extents_upto(op, logits, experts, top_k, max)?;
     ctx.fire(
         op,
         Fire::at(file, entrypoint).apply(rms(logits.rows)),
@@ -236,6 +250,7 @@ pub fn topk_sigmoid(
         scaling,
         routes,
         weights,
+        SIGMOID_MAX_EXPERTS,
     )
 }
 
@@ -345,6 +360,7 @@ pub fn topk_sqrt_softplus(
         scaling,
         routes,
         weights,
+        MAX_EXPERTS,
     )
 }
 

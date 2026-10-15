@@ -36,6 +36,9 @@ struct Logit<f32> {
 constexpr int kSoftmaxBlock = 64;
 
 constexpr int kRouterMaxExperts = 512;
+// The sigmoid router's scores staged in shared memory (Kimi-K3 routes over
+// 896 experts).
+constexpr int kSigmoidRouterMaxExperts = 1024;
 
 __device__ inline void block_argmax(
     const float* __restrict__ scores,
@@ -613,8 +616,8 @@ __global__ void moe_topk_sigmoid(
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int tid = threadIdx.x;
     const T* row = logits + static_cast<long long>(plane_row) * E;
-    __shared__ float scores[kRouterMaxExperts];
-    __shared__ float orig_scores[kRouterMaxExperts];
+    __shared__ float scores[kSigmoidRouterMaxExperts];
+    __shared__ float orig_scores[kSigmoidRouterMaxExperts];
 
     for (int e = tid; e < E; e += blockDim.x) {
         const float x = Elem<T>::to_f32(row[e]);
@@ -624,7 +627,7 @@ __global__ void moe_topk_sigmoid(
     }
     __syncthreads();
 
-    __shared__ bool taken[kRouterMaxExperts];
+    __shared__ bool taken[kSigmoidRouterMaxExperts];
     for (int e = tid; e < E; e += blockDim.x) taken[e] = false;
     __syncthreads();
 

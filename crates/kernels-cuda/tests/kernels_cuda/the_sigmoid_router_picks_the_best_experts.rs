@@ -1,11 +1,11 @@
 #![cfg(feature = "cuda")]
 
-//! The sigmoid router (`linear.moe_topk_sigmoid`, GLM's, MiMo's, Hy's): each
-//! row's `K` best experts by `sigmoid(logit) + bias`, the lowest expert on a
-//! tie, weighted by their unbiased scores renormalized and scaled. Read
-//! against the serial walk on the host, at every expert count the families
-//! route over; the logits are spaced well apart save the exact ties planted
-//! to test the tie rule.
+//! The sigmoid router (`linear.moe_topk_sigmoid`, GLM's, MiMo's, Hy's,
+//! Kimi's): each row's `K` best experts by `sigmoid(logit) + bias`, the
+//! lowest expert on a tie, weighted by their unbiased scores renormalized and
+//! scaled. Read against the serial walk on the host, at every expert count
+//! the families route over (Kimi-K3's 896 too); the logits are spaced well
+//! apart save the exact ties planted to test the tie rule.
 
 use crate::common::{Gpu, from_bf16, to_bf16};
 use dtype::Dtype;
@@ -18,6 +18,7 @@ fn the_sigmoid_router_picks_the_best_experts() {
         (9usize, 256usize, 8usize),
         (7, 288, 8),
         (5, 384, 8),
+        (6, 896, 16),
         (4, 128, 4),
         (3, 20, 6),
     ] {
