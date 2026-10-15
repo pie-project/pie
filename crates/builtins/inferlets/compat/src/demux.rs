@@ -50,12 +50,16 @@ pub(crate) struct Demux {
 }
 
 impl Demux {
-    pub fn new() -> Self {
+    /// `cue` is the generation cue the prompt ends with: a cue that opens a
+    /// thinking block puts the first token inside it.
+    pub fn new(cue: &[u32]) -> Self {
+        let reasoning = reasoning::Decoder::for_cue(cue);
+        let in_reasoning = reasoning.starts_inside();
         Self {
-            reasoning: reasoning::Decoder::new(),
+            reasoning,
             tools: tools::Decoder::new(),
             chat: chat::Decoder::new(),
-            in_reasoning: false,
+            in_reasoning,
             reasoning_strip_leading: true,
             in_tool_call: false,
             content_filter: HoldBack::new(vec!["<tool_call>".to_string()]),

@@ -76,6 +76,11 @@ pub trait ChatDecoder: Send {
 pub trait ReasoningDecoder: Send {
     fn feed(&mut self, tokens: &[u32]) -> Vec<ReasoningEvent>;
     fn reset(&mut self);
+    /// The first token is already inside a thinking block, which the cue
+    /// opened; no [`ReasoningEvent::Start`] precedes it.
+    fn starts_inside(&self) -> bool {
+        false
+    }
 }
 
 pub trait ToolDecoder: Send {
@@ -133,6 +138,12 @@ pub trait Instruct: Send + Sync {
     fn chat_decoder(&self) -> Box<dyn ChatDecoder>;
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder>;
+
+    /// [`Instruct::reasoning_decoder`] for the turn `cue` began: inside a
+    /// thinking block from the first token when the cue left one open.
+    fn reasoning_decoder_for_cue(&self, _cue: &[u32]) -> Box<dyn ReasoningDecoder> {
+        self.reasoning_decoder()
+    }
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder>;
 

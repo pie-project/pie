@@ -266,6 +266,18 @@ impl Instruct for ChatMLInstruct {
         ))
     }
 
+    fn reasoning_decoder_for_cue(&self, cue: &[u32]) -> Box<dyn ReasoningDecoder> {
+        if !self.config.thinking {
+            return Box::new(NoopReasoningDecoder);
+        }
+        Box::new(ThinkingDecoder::for_cue(
+            self.tokenizer.clone(),
+            self.think_open.clone(),
+            self.think_close,
+            cue,
+        ))
+    }
+
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         if !self.config.tools {
             return Box::new(NoopToolDecoder);

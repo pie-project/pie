@@ -105,7 +105,7 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
     let prompt = prompt::build(req)?;
     let matcher = constraint(req)?;
     let stop_tokens = chat::stop_tokens();
-    let mut demux = Demux::new();
+    let mut demux = Demux::new(&chat::cue_thinking(prompt::thinks(req)));
     let mut out = Output {
         stops: HoldBack::new(req.stop.clone()),
         content: String::new(),
