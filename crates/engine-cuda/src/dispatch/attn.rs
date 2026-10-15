@@ -484,13 +484,27 @@ impl Run<'_> {
                 cache,
                 write_page,
                 write_offset,
-            } => attn::kv_append_shared(
-                self.ctx(),
-                self.ragged_lanes(*plane),
-                &self.pool(*cache),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
-            ),
+            } => {
+                let pool = self.pool(*cache);
+                if attn::dsv4::fp8_ds(&pool) {
+                    // DeepSeek's fp8 rows, quantized on the way in.
+                    attn::dsv4::append(
+                        self.ctx(),
+                        self.ragged_lanes(*plane).data,
+                        &pool,
+                        self.tensor(*write_page),
+                        self.tensor(*write_offset),
+                    )
+                } else {
+                    attn::kv_append_shared(
+                        self.ctx(),
+                        self.ragged_lanes(*plane),
+                        &pool,
+                        self.tensor(*write_page),
+                        self.tensor(*write_offset),
+                    )
+                }
+            }
             Attention::MlaPlan {
                 kv_indptr,
                 kv_indices: _,
@@ -1347,15 +1361,28 @@ impl Run<'_> {
                 pool: into,
                 write_page,
                 write_offset,
-            } => pool::kv_append(
-                self.ctx(),
-                self.tensor(*entries),
-                self.tensor(*boundary_pos),
-                self.tensor(*boundary_req),
-                &self.pool(*into),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
-            ),
+            } => {
+                let into = self.pool(*into);
+                if attn::dsv4::fp8_ds(&into) {
+                    attn::dsv4::store_entries(
+                        self.ctx(),
+                        self.tensor(*entries),
+                        self.tensor(*boundary_pos),
+                        self.tensor(*boundary_req),
+                        &into,
+                    )
+                } else {
+                    pool::kv_append(
+                        self.ctx(),
+                        self.tensor(*entries),
+                        self.tensor(*boundary_pos),
+                        self.tensor(*boundary_req),
+                        &into,
+                        self.tensor(*write_page),
+                        self.tensor(*write_offset),
+                    )
+                }
+            }
             Attention::PoolLse {
                 q,
                 positions,

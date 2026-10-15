@@ -97,6 +97,14 @@ impl Run<'_> {
         let poem_ir::Attention::MergeLse { o, lse, .. } = **merge else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
+        // A decode's rows, up to what the profile says
+        // (`kernel.sdpa.dsv4_decode_until`): the four in one launch.
+        let rows = self.tensor(*o_out).rows;
+        if rows <= self.ctx().tuning().dsv4_decode_until
+            && let Some(landed) = self.dsv4_decode(window, Some(pool), *sink, *o_out)
+        {
+            return landed;
+        }
         // A prefill's rows, where the profile says
         // (`kernel.sdpa.dsv4_prefill_from`): the four in one tcgen05 pass.
         #[cfg(feature = "cuda")]
@@ -160,6 +168,13 @@ impl Run<'_> {
                 }
             }
         }
+        // DeepSeek's fp8 rows have no other reader: the one launch at any
+        // width.
+        if self.fp8_rows(window)
+            && let Some(landed) = self.dsv4_decode(window, Some(pool), *sink, *o_out)
+        {
+            return landed;
+        }
         self.attention(window)?;
         self.attention(pool)?;
         self.attention(merge)?;
@@ -172,6 +187,115 @@ impl Run<'_> {
         })
     }
 
+    /// Whether `window`'s cache holds DeepSeek's fp8 rows.
+    fn fp8_rows(&self, window: &poem_ir::Attention) -> bool {
+        match *window {
+            poem_ir::Attention::PrefillLse { cache, .. } => {
+                kernels_cuda::attn::dsv4::fp8_ds(&self.pool(cache))
+            }
+            _ => false,
+        }
+    }
+
+    /// The fire's runtime input `want` asks for, if the trace reads it.
+    fn input_of(&self, want: &poem_ir::RuntimeInput) -> Option<poem_ir::ValueId> {
+        self.values()
+            .iter()
+            .position(|decl| matches!(&decl.def, poem_ir::Def::Input(held) if held == want))
+            .map(|at| poem_ir::ValueId(at as u32))
+    }
+
+    /// DeepSeek-V4's window (`window`, a `PrefillLse`), its pool if any
+    /// (`PoolLse` or `PoolLseSelected`) and the sinks in one launch
+    /// (`attn::dsv4::decode`), the sinked output in `o_out`; `None` where it
+    /// does not take the shape.
+    fn dsv4_decode(
+        &mut self,
+        window: &poem_ir::Attention,
+        pool: Option<&poem_ir::Attention>,
+        sink: poem_ir::ValueId,
+        o_out: poem_ir::ValueId,
+    ) -> Option<Result<(), kernels_cuda::Error>> {
+        use kernels_cuda::attn::dsv4;
+        let poem_ir::Attention::PrefillLse {
+            q,
+            cache,
+            window: Some(span),
+            head_dim,
+            sm_scale,
+            ..
+        } = *window
+        else {
+            return None;
+        };
+        let (positions, request_of_token, pooled) = match pool {
+            Some(
+                poem_ir::Attention::PoolLse {
+                    positions,
+                    request_of_token,
+                    entries,
+                    ratio,
+                    ..
+                }
+                | poem_ir::Attention::PoolLseSelected {
+                    positions,
+                    request_of_token,
+                    entries,
+                    ratio,
+                    ..
+                },
+            ) => {
+                let selection = match pool {
+                    Some(poem_ir::Attention::PoolLseSelected {
+                        selection, top_k, ..
+                    }) => Some((self.tensor(*selection), *top_k)),
+                    _ => None,
+                };
+                (
+                    *positions,
+                    *request_of_token,
+                    Some((self.pool(*entries), *ratio, selection)),
+                )
+            }
+            Some(_) => return None,
+            None => (
+                self.input_of(&poem_ir::RuntimeInput::Positions)?,
+                self.input_of(&poem_ir::RuntimeInput::Geometry {
+                    space: 0,
+                    kind: poem_ir::GeomKind::RequestOfToken,
+                })?,
+                None,
+            ),
+        };
+        let q = self.tensor(q);
+        let heads = q.width / head_dim.max(1);
+        let window_pool = self.pool(cache);
+        let pooled = pooled
+            .as_ref()
+            .map(|(entries, ratio, selection)| dsv4::Pooled {
+                entries,
+                ratio: *ratio,
+                selection: *selection,
+            });
+        if !dsv4::takes(heads, head_dim, &window_pool, pooled.as_ref()) {
+            return None;
+        }
+        Some(dsv4::decode(
+            self.ctx(),
+            q,
+            self.tensor(positions),
+            self.tensor(request_of_token),
+            &window_pool,
+            span,
+            pooled,
+            self.tensor(sink),
+            heads,
+            head_dim,
+            sm_scale,
+            &mut self.tensor(o_out),
+        ))
+    }
+
     /// A log-sum-exp attention with its sinks: landed in the split's fold
     /// where the profile's warp fold takes them, else by the sink kernel
     /// after, as the pair ran.
@@ -182,6 +306,21 @@ impl Run<'_> {
         else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
+        // DeepSeek-V4's window and sinks (its layers without a pool): the
+        // one launch at a decode's rows, and always over fp8 rows.
+        // Its request ids index the whole fire's page tables, so only where
+        // this region's lanes start at the fire's first.
+        let unshifted = self.window().gathered.is_none() && self.window().span().lane_offset == 0;
+        if let poem_ir::Attention::PrefillLse { .. } = **attn
+            && unshifted
+        {
+            let rows = self.tensor(*o_out).rows;
+            if (rows <= self.ctx().tuning().dsv4_decode_until || self.fp8_rows(attn))
+                && let Some(landed) = self.dsv4_decode(attn, None, *sink, *o_out)
+            {
+                return landed;
+            }
+        }
         let sinks = self.tensor(*sink);
         match **attn {
             poem_ir::Attention::DecodeLse {

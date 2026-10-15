@@ -62,22 +62,39 @@ def boundaries(positions, row_valid, ratio, split = True):
     ppos, preq, prope = ops.attn.pool_boundary_prefill(positions.on(~one), row_valid, ratio)
     return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])
 
+# An e4m3 kv deployment keeps the window's plane and the compressed rows as
+# DeepSeek's fp8 rows (FlashMLA's fp8_ds_mla): 448 e4m3 codes and the 64
+# rotated dims in bf16 a position, with seven ue8m0 exponents (one a 64
+# codes) in each page's footer, 584 bytes a position in a u8 plane. The
+# index keys stay at bf16.
+DS_ROW = 584
+
+def fp8_rows(m):
+    return m.kv == dtype.e4m3
+
 def caches(m, c):
-    kv = c.kv_space(m.kv)
+    fp8 = fp8_rows(m)
+    rows = dtype.u8 if fp8 else m.kv
+    keys = dtype.bf16 if fp8 else m.kv
+
+    def row(at):
+        return [DS_ROW] if fp8 else [at.kv_down.shape[0]]
+
+    kv = c.kv_space(rows)
     for w in m.layers:
         at = w.attn
-        c.kv(kv, at.kv, [at.kv_down.shape[0]], m.head_dim, heads = at.kv_down.cut_axis != None)
+        c.kv(kv, at.kv, row(at), m.head_dim, heads = at.kv_down.cut_axis != None)
         if at.pool != None and at.pool.owner:
-            pool = c.kv_space(m.kv)
-            c.kv(pool, at.pool.entries, [m.head_dim], m.head_dim)
+            pool = c.kv_space(rows)
+            c.kv(pool, at.pool.entries, [DS_ROW] if fp8 else [m.head_dim], m.head_dim)
         if at.indexer != None and at.indexer.owns_keys:
-            index = c.kv_space(m.kv)
+            index = c.kv_space(keys)
             c.kv(index, at.indexer.keys, [at.indexer.head_dim], at.indexer.head_dim)
         if w.engram != None:
             c.state(w.engram.ids_state, [w.engram.ngram - 1], dtype.i32)
     if m.mtp != None:
         at = m.mtp.block.attn
-        c.kv(kv, at.kv, [at.kv_down.shape[0]], m.head_dim, heads = at.kv_down.cut_axis != None)
+        c.kv(kv, at.kv, row(at), m.head_dim, heads = at.kv_down.cut_axis != None)
 
 # The dtype the forward computes in on every deployment.
 ACT = dtype.bf16
