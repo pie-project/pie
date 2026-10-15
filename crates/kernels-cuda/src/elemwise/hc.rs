@@ -548,7 +548,7 @@ fn project_split(
     fan: u32,
     mix_hc: u32,
 ) -> Result<(), Error> {
-    const SLICE_FLOOR: u32 = 1024;
+    const SLICE_FLOOR: u32 = 256;
     let row_blocks = rows.div_ceil(PROJECT_ROWS);
     let want = 2 * ctx.multiprocessors().unwrap_or(132);
     // At most 2048 partial rows: a region captured on its own holds its own
@@ -557,7 +557,7 @@ fn project_split(
     let slices = want
         .div_ceil(row_blocks)
         .clamp(1, (fan / SLICE_FLOOR).max(1))
-        .min(16)
+        .min(64)
         .min((PARTIAL_ROWS / rows).max(1));
     let slice = fan.div_ceil(slices).next_multiple_of(4);
     let slices = fan.div_ceil(slice);
