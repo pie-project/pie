@@ -1000,3 +1000,47 @@ fn bench_selected_decode() {
         );
     }
 }
+
+/// Device time of the selected prefill at GLM-5.3-Flash's latent shape (64
+/// heads over the 512 latent, no rope): `rows` fresh rows of one request
+/// against a context 2K longer, each naming 2048 keys.
+#[test]
+#[ignore = "benchmark"]
+fn bench_selected_prefill() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let (heads, rank, rope, ps, top_k) = (64usize, 512usize, 0usize, 64usize, 2048usize);
+    for rows in [2048usize, 8192] {
+        let kv = vec![rows + 2048];
+        let qo = vec![rows];
+        let (indices, indptr, last, total) = pages(&kv, ps);
+        let cells = total * ps;
+        let keys = gpu.zeros(cells as u32, rank as u32, Dtype::Bf16);
+        let vals = gpu.zeros(cells as u32, 64, Dtype::Bf16);
+        let pl = pool(&gpu, keys, vals, &indices, &indptr, &last, ps, rank, kv[0] / ps);
+        let c = Cache {
+            pool: pl,
+            ckv: Vec::new(),
+            kpe: Vec::new(),
+            page_indptr: indptr,
+            rank,
+            rope,
+        };
+        let p = mla_plan(&gpu, &c, &qo, &kv, heads as u32, false);
+        let q = query(&gpu, &qo, heads, rank, rope, 1);
+        let sel: Vec<i32> = (0..rows * top_k).map(|i| (i % top_k) as i32).collect();
+        let selection = gpu.ints_shaped(&sel, rows as u32, top_k as u32);
+        let mut o = gpu.zeros(rows as u32, (heads * rank) as u32, Dtype::Bf16);
+        let us = gpu.time_graph(5, || {
+            mla::attention_prefill_selected(
+                &ctx, q.q, &p, q.q_pe, selection, &c.pool, heads as u32, rank as u32, 0.04, &mut o, None,
+            )
+            .unwrap();
+        });
+        let flops = (rows * heads * top_k * (rank + rank) * 2) as f64;
+        eprintln!(
+            "mla selected prefill {rows} rows x top{top_k}: {us:.1} us, {:.0} TFLOP/s",
+            flops / us / 1e6
+        );
+    }
+}

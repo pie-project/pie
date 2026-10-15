@@ -782,6 +782,10 @@ const fn group_routes(fan: &Selected, experts: u32) -> u32 {
 /// Weight rows a grouped block takes off the matrix core (`kSimtTileN`),
 /// and its threads.
 const GROUP_TILE_N: u32 = 128;
+/// Weight rows a tall grouped block takes (four 16-row blocks a wave, eight
+/// waves).
+const TALL_ROWS: u32 = 512;
+const TALL_MIN_K: u32 = 2048;
 const GROUP_BLOCK: u32 = 256;
 
 /// A matrix-core grouped launch over `items` items of `routes` routes: 32
@@ -857,16 +861,35 @@ fn select_grouped(
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
     let ordered = route_order(ctx, op, routes, fan, experts, group_routes(fan, experts))?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
-    ctx.fire(
-        op,
-        Fire::at(
-            FILE,
-            symbol(&format!(
+    // 128-route items over a bank whose rows come in whole 512s take the
+    // tall block: 64 weight rows a wave, so each activation piece read from
+    // LDS feeds twice the products (GLM's 4096-row legs: 461 -> 505
+    // TFLOP/s at an 8192-token prefill); narrower banks would idle its rows.
+    // Only over long K: Qwen3.8-Flash-Next's 640-deep down leg ran no faster
+    // in the serve (its mid-in TPOT 4.8 -> 5.4 ms) for a 10% microbench gain.
+    let tall = ordered.routes == GROUP_ROUTES_WIDE
+        && y.width.is_multiple_of(TALL_ROWS)
+        && x.width >= TALL_MIN_K;
+    let (entry, launch) = if tall {
+        (
+            format!(
+                "::pie::linear::moe_matmul_select_grouped_tall<{t}, ::pie::i32({}), ::pie::i32(4), ::pie::i32(8)>",
+                ordered.routes
+            ),
+            Launch::grid([ordered.work_cap, y.width / TALL_ROWS, 1], [64 * 8, 1, 1]),
+        )
+    } else {
+        (
+            format!(
                 "::pie::linear::moe_matmul_select_grouped<{t}, ::pie::i32({})>",
                 ordered.routes
-            )),
+            ),
+            group_launch(ordered.work_cap, ordered.routes, y.width),
         )
-        .apply(group_launch(ordered.work_cap, ordered.routes, y.width)),
+    };
+    ctx.fire(
+        op,
+        Fire::at(FILE, symbol(&entry)).apply(launch),
         &[
             x.arg(),
             ArgValue::Ptr(ordered.order),

@@ -503,6 +503,25 @@ __global__ __launch_bounds__(kGroupWaves<MT>* kWave) void moe_matmul_select_grou
                                        at / gridDim.x);
 }
 
+// The grouped dense leg at a prefill's routes: NBW 16-row weight blocks a
+// wave over WAVES waves (16·NBW·WAVES weight rows a block), so each
+// activation piece a wave reads from LDS feeds NBW times the products.
+template <class T, int MT, int NBW, int WAVES>
+__global__ __launch_bounds__(WAVES* kWave) void moe_matmul_select_grouped_tall(
+    const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
+    const i32* __restrict__ work, const T* __restrict__ bank, T* __restrict__ out, int act_div, int n, int k,
+    int num_experts) {
+    const int blocks = gridDim.x * gridDim.y;
+    const int b = blockIdx.x + gridDim.x * blockIdx.y;
+    const int x = b % kDenseXcds, q = blocks / kDenseXcds, r = blocks % kDenseXcds;
+    const int at = x * q + min(x, r) + b / kDenseXcds;
+    GroupItem item;
+    if (!group_item(offsets, work, num_experts, MT, item, at % gridDim.x)) return;
+    const T* w = bank + static_cast<long long>(item.expert) * n * k;
+    grouped_tile<GroupDense<T>, T, MT, NBW, WAVES>(act, order, item.begin, item.count, {w}, nullptr, out, act_div,
+                                                   n, k, at / gridDim.x);
+}
+
 // The batch dense leg (decode batches): one work item of up to MT routes a
 // block, 64·NBW weight rows (grid (work cap, ⌈n / (64·NBW)⌉), 256 threads),
 // a stage 128 elements of a row.
