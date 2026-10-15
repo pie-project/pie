@@ -171,8 +171,8 @@ impl<'a> Builder<'a> {
             return Ok(());
         }
         self.whole_checkpoint(w)?;
-        let read = declare(self.src, w, expr)?;
-        self.tensors.push(read);
+        let read = computed(self.src, w, expr)?;
+        self.tensors.extend(read);
         Ok(())
     }
 
@@ -542,36 +542,24 @@ fn stored_block(src: &ztensor::Source, name: &str) -> Result<bool, Error> {
     })
 }
 
+/// `w` encoded from `values`, an expression over self-contained blocks: each
+/// block is decoded to bf16 first, so `values` computes over plain elements
+/// (a gather may cut a block's groups) and its result is encoded once.
 fn reencoded_from_block(
     src: &ztensor::Source,
     w: &Weight,
-    parts: &[String],
+    values: Expr,
 ) -> Result<Vec<TensorContract>, Error> {
     let bf16 = encoding(Dtype::Bf16);
     let want = grouped(w);
-    let mut tensors = Vec::with_capacity(parts.len() + 2);
-    let mut legs = Vec::with_capacity(parts.len());
-    for (at, part) in parts.iter().enumerate() {
-        let stored = stored_encoding(src, part)?;
-        let decoded = format!("{}.block{at}", w.name);
-        let expr = ladder(part, Expr::src(part.clone()), &stored, &bf16)?;
-        tensors.push(TensorContract::inferred(decoded.clone(), expr, bf16.clone()).internal());
-        legs.push(Expr::out(decoded));
-    }
-    let values = if legs.len() == 1 {
-        format!("{}.block0", w.name)
-    } else {
-        let joined = format!("{}.values", w.name);
-        tensors.push(
-            TensorContract::new(
-                joined.clone(),
-                Expr::concat(pack_axis(w), legs),
-                extents(w),
-                bf16,
-            )
-            .internal(),
-        );
-        joined
+    let mut tensors = Vec::new();
+    let values = match over_decoded(src, w, values, &mut tensors)? {
+        Expr::Out(decoded) => decoded,
+        values => {
+            let joined = format!("{}.values", w.name);
+            tensors.push(TensorContract::new(joined.clone(), values, extents(w), bf16).internal());
+            joined
+        }
     };
     tensors.push(TensorContract::new(
         w.name.clone(),
@@ -580,6 +568,76 @@ fn reencoded_from_block(
         want,
     ));
     Ok(tensors)
+}
+
+/// `w` landing what `expr` computes. Over self-contained blocks of another
+/// scheme it computes over their decoded values, as a plain read of them does
+/// (`planes`); a gather may then cut their groups.
+fn computed(src: &ztensor::Source, w: &Weight, expr: Expr) -> Result<Vec<TensorContract>, Error> {
+    let want = encoding(w.dtype);
+    let blocks = expr.sources().into_iter().try_fold(true, |all, part| {
+        Ok::<bool, Error>(all && stored_block(src, part)? && stored_encoding(src, part)? != want)
+    })?;
+    if !blocks || !matches!(want, Encoding::Quant(_)) {
+        return Ok(vec![declare(src, w, expr)?]);
+    }
+    if placed_road_covers(w) {
+        return placed_from_encode(w, |canon| reencoded_from_block(src, canon, expr));
+    }
+    placed_wants_its_own_order(w, "self-contained blocks")?;
+    reencoded_from_block(src, w, expr)
+}
+
+/// `expr` with each checkpoint tensor it reads replaced by that tensor
+/// decoded to bf16, one internal tensor per source however often it is read.
+/// A gather over a decoded tensor lands as its own tensor too: a plan moves
+/// only whole computed buffers into another.
+fn over_decoded(
+    src: &ztensor::Source,
+    w: &Weight,
+    expr: Expr,
+    tensors: &mut Vec<TensorContract>,
+) -> Result<Expr, Error> {
+    let bf16 = encoding(Dtype::Bf16);
+    let mut parts: Vec<String> = Vec::new();
+    for part in expr.sources() {
+        if !parts.iter().any(|p| p == part) {
+            parts.push(part.to_string());
+        }
+    }
+    for (at, part) in parts.iter().enumerate() {
+        let stored = stored_encoding(src, part)?;
+        let decoded = ladder(part, Expr::src(part.clone()), &stored, &bf16)?;
+        tensors.push(
+            TensorContract::inferred(format!("{}.block{at}", w.name), decoded, bf16.clone())
+                .internal(),
+        );
+    }
+    let mut gathered = 0;
+    Ok(rebuilt(expr, &mut |expr| match expr {
+        Expr::Src(part) => {
+            let at = parts
+                .iter()
+                .position(|p| *p == part)
+                .expect("every source was decoded");
+            Expr::out(format!("{}.block{at}", w.name))
+        }
+        gather @ Expr::Gather { .. } => {
+            let name = format!("{}.gathered{gathered}", w.name);
+            gathered += 1;
+            tensors.push(TensorContract::inferred(name.clone(), gather, bf16.clone()).internal());
+            Expr::out(name)
+        }
+        expr => expr,
+    }))
+}
+
+/// `expr` rebuilt bottom-up through `node`.
+fn rebuilt(expr: Expr, node: &mut impl FnMut(Expr) -> Expr) -> Expr {
+    let expr = expr
+        .map_children(|child| Ok(rebuilt(child, node)))
+        .expect("rebuilding an expression cannot fail");
+    node(expr)
 }
 
 fn placed_from_encode(
@@ -673,11 +731,12 @@ fn planes(
             return Ok(vec![copy(src, w, from)?]);
         }
         if placed_road_covers(w) {
-            let parts = [from];
-            return placed_from_encode(w, |canon| reencoded_from_block(src, canon, &parts));
+            return placed_from_encode(w, |canon| {
+                reencoded_from_block(src, canon, Expr::src(from))
+            });
         }
         placed_wants_its_own_order(w, "a self-contained block")?;
-        return reencoded_from_block(src, w, &[from]);
+        return reencoded_from_block(src, w, Expr::src(from));
     }
     if matches!(encoding(w.dtype), Encoding::Raw(_)) && stored_mlx_codes(src, &from)? {
         return affine_decoded(src, w, from);
@@ -723,11 +782,13 @@ fn planes_fused(
         })? {
             return Ok(vec![fused(src, w, parts)?]);
         }
+        let legs =
+            |w: &Weight| joined(pack_axis(w), parts.iter().cloned().map(Expr::src).collect());
         if placed_road_covers(w) {
-            return placed_from_encode(w, |canon| reencoded_from_block(src, canon, &parts));
+            return placed_from_encode(w, |canon| reencoded_from_block(src, canon, legs(canon)));
         }
         placed_wants_its_own_order(w, "self-contained blocks to fuse")?;
-        return reencoded_from_block(src, w, &parts);
+        return reencoded_from_block(src, w, legs(w));
     }
     match w.dtype {
         Dtype::U4g64tiled => tiled_planes(src, w, parts),
@@ -1945,6 +2006,110 @@ mod tests {
         the_unplaced_sibling_of_that_row_still_reads_it();
         the_mlx_road_lands_the_placed_order_and_bands_its_rows();
         a_dense_row_is_untouched_by_the_guard();
+        a_gather_over_k_quants_computes_over_their_decoded_values();
+    }
+
+    /// A container of K-quant blocks, `(name, [rows, cols], scheme)`.
+    fn blocks(dir: &std::path::Path, tensors: &[(&str, [i64; 2], QuantScheme)]) -> ztensor::Source {
+        use checkpoint::types::{TensorDecl, TensorId};
+        let path = dir.join("blocks.zt");
+        let mut writer = checkpoint::file::write::Writer::create(&path, &Default::default())
+            .expect("the container opens");
+        for (name, shape, scheme) in tensors {
+            let decl = TensorDecl {
+                id: TensorId(0),
+                name: name.to_string(),
+                shape: shape.to_vec(),
+                encoding: Encoding::Quant(QuantSpec {
+                    scheme: *scheme,
+                    logical_dtype: DType::Bf16,
+                    bits_per_element: 0,
+                    group_size: 0,
+                    channel_axis: None,
+                }),
+                alignment: 64,
+                visibility: Visibility::default(),
+            };
+            let block = match scheme {
+                QuantScheme::GgufQ4K => 144,
+                _ => 210,
+            };
+            let bytes = vec![0u8; (shape[0] * shape[1] / 256) as usize * block];
+            writer.add_tensor(&decl, &bytes).expect("the blocks land");
+        }
+        writer.finish().expect("the container closes");
+        ztensor::Source::open(&path).expect("it reads back")
+    }
+
+    /// llama.cpp's qwen35 GGUFs tile the GDN v-heads; un-tiling `out_proj`
+    /// gathers 128-wide column spans, which cut a K-quant's 256-wide blocks,
+    /// and its legs are of two schemes.
+    fn a_gather_over_k_quants_computes_over_their_decoded_values() {
+        const COLS: u64 = 256;
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let shape = [ROWS as i64, COLS as i64];
+        let src = blocks(
+            dir.path(),
+            &[
+                ("q4", shape, QuantScheme::GgufQ4K),
+                ("q6", shape, QuantScheme::GgufQ6K),
+            ],
+        );
+        let halves: Vec<i64> = (128..256).chain(0..128).collect();
+        let expr = Expr::concat(
+            0,
+            vec![
+                Expr::src("q6").gather(1, halves.clone()),
+                Expr::src("q4").gather(1, halves),
+            ],
+        );
+        let w = Weight::sym("out_proj", [2 * ROWS, COLS], Dtype::U4g64);
+        let landed = computed(&src, &w, expr.clone()).expect("the blocks are read as values");
+        let names: Vec<&str> = landed.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "out_proj.block0",
+                "out_proj.block1",
+                "out_proj.gathered0",
+                "out_proj.gathered1",
+                "out_proj.values",
+                "out_proj"
+            ],
+            "each leg decodes once and is gathered as its own tensor"
+        );
+        assert!(
+            matches!(&landed[5].expr, Expr::Cast { src, .. } if **src == Expr::out("out_proj.values")),
+            "the values are encoded once: {:?}",
+            landed[5].expr
+        );
+        let metadata = checkpoint::file::read::parse_metadata(&dir.path().join("blocks.zt"))
+            .expect("the container's metadata reads");
+        let contract = ModelContract {
+            alignment: 64,
+            tensors: landed,
+            groups: Vec::new(),
+        };
+        let target = checkpoint::plan::StorageTarget {
+            tile_map_mask: checkpoint::plan::CONVERT_TILE_MAP_MASK,
+            ..Default::default()
+        };
+        let plan = checkpoint::plan::compile(&metadata, &contract, target)
+            .expect("a gather over a decoded leg lands");
+        assert!(
+            plan.instrs.iter().any(|i| matches!(
+                i,
+                checkpoint::plan::StorageInstr::TileMap {
+                    kind: checkpoint::plan::TileMapKind::Gather,
+                    ..
+                }
+            )),
+            "the column gather runs over the decoded buffer"
+        );
+        assert!(
+            declare(&src, &w, expr).is_err(),
+            "read as stored, two schemes are not one weight's representation"
+        );
     }
 
     fn a_placed_row_lands_the_placement_over_the_codes_an_encode_wrote() {

@@ -956,6 +956,13 @@ impl Walk<'_, '_> {
                 self.bias_bytes(source, inputs, outputs.first().copied(), &input, &transform)?
             }
             TileMapKind::Unary => self.unary_bytes(source, inputs, &input, &transform)?,
+            TileMapKind::Gather => permute(
+                &input,
+                transform
+                    .gather
+                    .as_ref()
+                    .ok_or_else(|| invalid("a Gather TileMap states no gather"))?,
+            )?,
             TileMapKind::Decode => {
                 self.decode_bytes(outputs.first().copied(), &input, &transform)?
             }
