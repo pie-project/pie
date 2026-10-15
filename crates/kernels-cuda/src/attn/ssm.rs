@@ -1723,6 +1723,106 @@ pub fn kda_step(
     )
 }
 
+/// [`kda_chunked`] on the tensor cores: a block per (chunk, head) lands the
+/// chunk's decayed queries and fold keys, its update directions `w` and `u`
+/// and its decayed causal scores; then a block per (request, head, 64 value
+/// columns) walks the chunks with the state in f32. 128-wide heads.
+#[allow(clippy::too_many_arguments)]
+fn kda_chunked_mma(
+    ctx: &Ctx,
+    op: &'static str,
+    shape: Kda,
+    staged: KdaStaged,
+    mixed: RaggedTensor,
+    state: &RecurrentPool,
+    lanes: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const CH: u32 = 64;
+    const D: u32 = 128;
+    const LD: u32 = 136;
+    const LDC: u32 = 72;
+    const LDA: u32 = 68;
+    const LDF: u32 = 132;
+    const BV: u32 = 64;
+    let heads = shape.heads;
+    let slots = shape.n.div_ceil(CH) + lanes;
+    let rows = u64::from(shape.n + CH) * u64::from(heads) * u64::from(D);
+    let qg = plane_bf16(ctx, op, "attn.ssm_kda_chunk_qg", rows)?;
+    let kg = plane_bf16(ctx, op, "attn.ssm_kda_chunk_kg", rows)?;
+    let w = plane_bf16(ctx, op, "attn.ssm_kda_chunk_w", rows)?;
+    let u = plane_bf16(ctx, op, "attn.ssm_kda_chunk_u", rows)?;
+    let pm = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_kda_chunk_p",
+        u64::from(slots) * u64::from(heads) * u64::from(CH * CH),
+    )?;
+    let gl = plane(
+        ctx,
+        op,
+        "attn.ssm_kda_chunk_gl",
+        u64::from(slots) * u64::from(heads) * u64::from(D),
+    )?;
+    let prep_smem = 3 * CH * LDF * FLOAT
+        + (3 * CH * LD + 2 * 16 * LD + 2 * CH * LDC) * 2
+        + 2 * CH * LDA * FLOAT
+        + CH * FLOAT
+        + 8 * 256 * FLOAT;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::attn::ssm_kda_chunk_prep")
+            .apply(Launch::grid([heads, slots, 1], [256, 1, 1]).smem(prep_smem)),
+        &[
+            ArgValue::Ptr(staged.q_norm),
+            ArgValue::Ptr(staged.k_norm),
+            ArgValue::Ptr(staged.v),
+            ArgValue::Ptr(staged.gate),
+            ArgValue::Ptr(staged.beta),
+            state.slot_ids.arg(),
+            mixed.indptr.arg(),
+            state.commit_len.arg(),
+            state.begin_at.arg(),
+            ArgValue::Ptr(qg),
+            ArgValue::Ptr(kg),
+            ArgValue::Ptr(w),
+            ArgValue::Ptr(u),
+            ArgValue::Ptr(pm),
+            ArgValue::Ptr(gl),
+            stated(op, lanes)?.arg(),
+            stated(op, heads)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    let ldv = BV + 8;
+    let scan_smem = (3 * CH * LD + CH * ldv + CH * LDC + D * ldv + CH * ldv) * 2 + 2 * D * FLOAT;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::attn::ssm_kda_chunk_scan<64>")
+            .apply(Launch::grid([lanes * heads * (D / BV), 1, 1], [256, 1, 1]).smem(scan_smem)),
+        &[
+            ArgValue::Ptr(qg),
+            ArgValue::Ptr(kg),
+            ArgValue::Ptr(w),
+            ArgValue::Ptr(u),
+            ArgValue::Ptr(pm),
+            ArgValue::Ptr(gl),
+            state.slab.arg(),
+            state.slot_ids.arg(),
+            mixed.indptr.arg(),
+            state.slot_stride_elems.arg(),
+            state.commit_len.arg(),
+            state.begin_at.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            y.arg(),
+            stated(op, lanes)?.arg(),
+            stated(op, heads)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn kda_chunked(
     ctx: &Ctx,
@@ -1753,6 +1853,9 @@ pub fn kda_chunked(
     let staged = shape.stage(
         ctx, OP, mixed.data, f, b, dt_bias, a_log, norm_eps, gate_floor,
     )?;
+    if ctx.tuning().ssm_kda_chunked && shape.head_dim == 128 {
+        return kda_chunked_mma(ctx, OP, shape, staged, mixed, state, lanes, y);
+    }
     let work = shape.work(ctx, OP, state, lanes)?;
     ctx.fire(
         OP,

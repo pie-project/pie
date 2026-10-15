@@ -474,6 +474,7 @@ mod tests {
                         gemm_nvfp4_k128: false,
                         moe_w4a4_fused_from: 65_536,
                         moe_w4a8_fused_from: 65_536,
+                        ssm_kda_chunked: false,
                         gemm_split_launch_ns: 0,
                         gemm_tc5_raster: 8,
                         nvfp4_mma_from: defaults.nvfp4_mma_from,

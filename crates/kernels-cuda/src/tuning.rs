@@ -93,6 +93,14 @@ pub struct GemmSplitLaunchNs(pub u32);
 #[decision(id = "kernel.moe.w4a4_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct MoeW4a4FusedFrom(pub u32);
 
+/// Whether a KDA prefill walks its chunks on the tensor cores (a chunk's
+/// update directions in parallel, then the state chunk by chunk) instead of
+/// a row at a time. Off but where a chip's profile turns it on (B200's): it
+/// asks a block for 219 KiB of shared memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.kda_chunked", flag, default = false, tune = search)]
+pub struct SsmKdaChunked;
+
 /// The fewest tokens a W4A8 routed MLP (MXFP4 banks against e4m3
 /// activations) keeps its rows by expert from the gate-up select to the
 /// weighted sum with (its GLU landing the down leg's e4m3 operand from the
@@ -485,6 +493,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmNvfp4K128>()
         .add::<MoeW4a4FusedFrom>()
         .add::<MoeW4a8FusedFrom>()
+        .add::<SsmKdaChunked>()
         .add::<GemmSplitLaunchNs>()
         .add::<GemmTc5Raster>()
         .add::<MoeNvfp4MmaUntil>()
@@ -557,6 +566,7 @@ pub struct Tuning {
     pub gemm_nvfp4_k128: bool,
     pub moe_w4a4_fused_from: u32,
     pub moe_w4a8_fused_from: u32,
+    pub ssm_kda_chunked: bool,
     pub gemm_split_launch_ns: u32,
     pub gemm_tc5_raster: u32,
     pub nvfp4_mma_from: u32,
@@ -627,6 +637,7 @@ impl Tuning {
         gemm_nvfp4_k128: false,
         moe_w4a4_fused_from: 65_536,
         moe_w4a8_fused_from: 65_536,
+        ssm_kda_chunked: false,
         gemm_split_launch_ns: 0,
         gemm_tc5_raster: 8,
         nvfp4_mma_from: 1,
@@ -697,6 +708,7 @@ impl Tuning {
             gemm_nvfp4_k128: profile.on::<GemmNvfp4K128>(&Anywhere),
             moe_w4a4_fused_from: profile.get::<MoeW4a4FusedFrom>().0,
             moe_w4a8_fused_from: profile.get::<MoeW4a8FusedFrom>().0,
+            ssm_kda_chunked: profile.on::<SsmKdaChunked>(&Anywhere),
             gemm_split_launch_ns: profile.get::<GemmSplitLaunchNs>().0,
             gemm_tc5_raster: profile.get::<GemmTc5Raster>().0,
             nvfp4_mma_from: profile.get::<MoeNvfp4MmaFrom>().0,

@@ -155,6 +155,10 @@ moe.w4a4_fused_from = 1
 # its GLU landing the down leg's e4m3 operand from the gate-up epilogue.
 # A fire of 64 routes or fewer stays apart.
 moe.w4a8_fused_from = 1
+# A KDA prefill walks its chunks on the tensor cores (a chunk's update
+# directions in parallel, then the state chunk by chunk), not a row at a
+# time: its block asks 219 KiB of shared memory.
+ssm.kda_chunked = true
 # A routed NVFP4 select of bf16 activations (W4A16) of 32 to 8192 routes on
 # the register-dequant MMA kernel: the tcgen05 W4A16 path's transform and
 # kind::f16 MMAs (four a 64-K stage) held a decode's gate-up to ~300 us.
