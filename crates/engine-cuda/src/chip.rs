@@ -574,7 +574,7 @@ mod tests {
         let b200 = tuning(10, 0, 148);
         assert!(b200.moe_tc5);
         assert_eq!(b200.gemm_tc5_glu_from, 64);
-        assert_eq!((b200.mxfp4_mma_from, b200.mxfp4_mma_until), (64, 1024));
+        assert_eq!((b200.mxfp4_mma_from, b200.mxfp4_mma_until), (28, 1024));
         assert!(b200.merge_warp);
         for (major, minor) in [
             (8, 0),

@@ -244,14 +244,11 @@ fn a_prefill_past_the_gemvs_grid_is_served() {
         finite(&logits[0], "the wide prefill");
     }
 
-    let why = fire_at(&fixture, WIDE, Leg::Gemv)
-        .expect_err("with both grouped legs declined, a 65600-route fire is past the GEMV's grid")
-        .to_string();
-    assert!(
-        why.contains("65600") || why.contains("65535"),
-        "the refusal should be the GEMV's, naming the route run against the grid it does \
-         not fit; it said: {why}"
-    );
+    // The GEMV carries a route run past its grid's y axis on z, so it serves the fire too.
+    let (logits, _) = fire_at(&fixture, WIDE, Leg::Gemv).unwrap_or_else(|why| {
+        panic!("a prefill of 65600 routes fires on the GEMV leg past grid y: {why}")
+    });
+    finite(&logits[0], "the wide prefill on the GEMV");
 }
 
 fn the_two_legs_answer_the_same_model() {
