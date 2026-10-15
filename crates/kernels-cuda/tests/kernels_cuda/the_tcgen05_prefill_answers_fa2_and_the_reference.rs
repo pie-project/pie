@@ -28,8 +28,17 @@ struct Case {
     scale: Option<f32>,
 }
 
-#[allow(clippy::too_many_lines)]
+/// A case on the tcgen05 kernels; a windowed one also with its 256-wide
+/// sliding prefill on the 128-key kernel (`kernel.sdpa.prefill.wide_sliding`).
 fn check(case: &Case) {
+    check_with(case, false);
+    if case.window.is_some() {
+        check_with(case, true);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn check_with(case: &Case, wide_sliding: bool) {
     let (d, kvh, g) = (case.head_dim, case.kv_heads, case.group);
     let qh = kvh * g;
     let reqs = case.requests;
@@ -64,6 +73,7 @@ fn check(case: &Case) {
     // sm_100's profile decision; off, `attention.prefill` is FA2's.
     let ctx = gpu.ctx().with_tuning(Tuning {
         prefill_tc5: true,
+        prefill_wide_sliding: wide_sliding,
         ..Tuning::DEFAULT
     });
     let Some(device) = Device::probe(&ctx) else {
@@ -232,7 +242,14 @@ fn check(case: &Case) {
             }
         }
     }
-    eprintln!("head {d}, group {g}: worst against the host {worst_ref}, against FA2 {worst_fa2}");
+    eprintln!(
+        "head {d}, group {g}{}: worst against the host {worst_ref}, against FA2 {worst_fa2}",
+        if wide_sliding {
+            ", sliding on 128-key tiles"
+        } else {
+            ""
+        }
+    );
     assert!(
         worst_ref < 2e-2,
         "the prefill strays {worst_ref} from the host's attention"
@@ -351,7 +368,9 @@ fn the_tcgen05_prefill_answers_fa2_and_the_reference() {
 /// Gemma-4-31B's two. FLOPs count the keys each row reads. vLLM's prefill
 /// on B200 (FlashInfer's trtllm-gen FMHA) runs Qwen3.8-27B's 32 x 4096 at
 /// about 790 TFLOPS by the same count, Gemma-4-31B's global layers at about
-/// 700 and its sliding ones at about 900. Run it alone on an idle GPU:
+/// 700 and its sliding ones at about 900. Sliding rows run as B200's
+/// profile runs them, on the 128-key kernel (`PIE_RATE_SLIDING64` keeps
+/// them on the 64-key one). Run it alone on an idle GPU:
 ///
 ///     cargo test -p kernels-cuda --features cuda --release --test kernels_cuda \
 ///         the_tcgen05_prefill_reports -- --ignored --nocapture
@@ -366,6 +385,7 @@ fn the_tcgen05_prefill_reports_its_rate_beside_fa2() {
     // sm_100's profile decision; off, `attention.prefill` is FA2's.
     let ctx = gpu.ctx().with_tuning(Tuning {
         prefill_tc5: true,
+        prefill_wide_sliding: std::env::var("PIE_RATE_SLIDING64").is_err(),
         ..Tuning::DEFAULT
     });
     let Some(device) = Device::probe(&ctx) else {
@@ -540,6 +560,204 @@ fn the_tcgen05_prefill_reports_its_rate_beside_fa2() {
             win.map_or(String::new(), |w| format!(", window {w}")),
             if scatter { ", pages scattered" } else { "" },
             flops / tc5 * 1e-6,
+            flops / fa2 * 1e-6
+        );
+    }
+}
+
+/// A recorded fire's prefill replayed: `PIE_REPLAY_GEOM` names a file of
+/// whitespace-separated integers — the lane count, then a lane's new rows,
+/// its keys, its last page's length and its page count for each lane, then
+/// every lane's pages — and `PIE_REPLAY_SHAPE=head,group,kv_heads,window`
+/// (window -1 for none) the layer. Reports the tcgen05 and FA2 rates, and
+/// the rate with the same lanes' pages renumbered into one rising run each.
+#[test]
+#[ignore = "a measurement: run alone, on an idle GPU, with PIE_REPLAY_GEOM set"]
+#[allow(clippy::too_many_lines)]
+fn the_tcgen05_prefill_replays_a_recorded_fire() {
+    use crate::the_tcgen05_gemm_lands_and_paces_what_cublaslt_does::{FLUSH, Timer};
+    use kernels_cuda::cudarc::runtime::sys as rt;
+
+    let Ok(path) = std::env::var("PIE_REPLAY_GEOM") else {
+        eprintln!("skipped: PIE_REPLAY_GEOM names no recorded fire");
+        return;
+    };
+    let shape_of: Vec<i64> = std::env::var("PIE_REPLAY_SHAPE")
+        .unwrap_or_else(|_| "256,2,16,1023".into())
+        .split(',')
+        .map(|v| v.parse().expect("a shape integer"))
+        .collect();
+    let (d, g, kvh) = (
+        shape_of[0] as usize,
+        shape_of[1] as usize,
+        shape_of[2] as usize,
+    );
+    let window = (shape_of[3] >= 0).then(|| shape_of[3] as u32 + 1);
+    let text = std::fs::read_to_string(&path).expect("the recorded fire reads");
+    let mut ints = text
+        .split_whitespace()
+        .map(|v| v.parse::<i64>().expect("an integer"));
+    let lanes = ints.next().expect("a lane count") as usize;
+    let mut lane = Vec::new();
+    for _ in 0..lanes {
+        let q = ints.next().unwrap() as usize;
+        let kv = ints.next().unwrap() as usize;
+        let last = ints.next().unwrap() as i32;
+        let np = ints.next().unwrap() as usize;
+        lane.push((q, kv, last, np));
+    }
+    let recorded: Vec<i32> = ints.map(|v| v as i32).collect();
+
+    let mut gpu = Gpu::open();
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        prefill_tc5: true,
+        prefill_wide_sliding: std::env::var("PIE_RATE_SLIDING64").is_err(),
+        ..Tuning::DEFAULT
+    });
+    let Some(device) = Device::probe(&ctx) else {
+        eprintln!("skipped: the device would not say its shape");
+        return;
+    };
+    let stream: rt::cudaStream_t = ctx.stream().cast();
+    let timer = Timer {
+        flush: gpu.zeros(FLUSH),
+        stream,
+    };
+    let qh = kvh * g;
+    let n = lanes;
+    let rows: usize = lane.iter().map(|l| l.0).sum();
+    let mut qo_indptr = vec![0i32];
+    let mut kv_indptr = vec![0i32];
+    for l in &lane {
+        qo_indptr.push(qo_indptr.last().unwrap() + l.0 as i32);
+        kv_indptr.push(kv_indptr.last().unwrap() + l.3 as i32);
+    }
+    let kv_len: Vec<i32> = lane.iter().map(|l| l.1 as i32).collect();
+    let last: Vec<i32> = lane.iter().map(|l| l.2).collect();
+    let pages = recorded.len();
+    // The same lanes, each lane's pages one rising run.
+    let contiguous: Vec<i32> = (0..pages as i32).collect();
+    let cells = (recorded.iter().copied().max().unwrap_or(0) as usize + 1).max(pages) * PAGE;
+    let mut lcg = Lcg::seeded(0x5eed);
+    let (q_raw, _) = lcg.row(rows * qh * d);
+    let (k_raw, _) = lcg.row(cells * kvh * d);
+    let (v_raw, _) = lcg.row(cells * kvh * d);
+    let q_at = gpu.up(&q_raw);
+    let k_at = gpu.up(&k_raw);
+    let v_at = gpu.up(&v_raw);
+    let qo_at = gpu.up(&qo_indptr);
+    let kvp_at = gpu.up(&kv_indptr);
+    let last_at = gpu.up(&last);
+    let o_at = gpu.zeros(rows * qh * d * 2);
+    let lse_at = gpu.zeros(rows * qh * 4);
+    let ws_bytes = 256 << 20;
+    let workspace = Workspace {
+        int_ptr: gpu.zeros(ws_bytes),
+        int_bytes: ws_bytes,
+        float_ptr: gpu.zeros(ws_bytes),
+        float_bytes: ws_bytes,
+    };
+    let shape = Shape {
+        num_requests: n as u32,
+        lane_offset: 0,
+        num_q_heads: qh as u32,
+        num_kv_heads: kvh as u32,
+        head_dim: d as u32,
+        page_size: PAGE as u32,
+        hnd_layout: false,
+    };
+    let live = Live {
+        requests: n as u32,
+        lane_offset: 0,
+        row_offset: 0,
+        rows: rows as u32,
+    };
+    let built = plan::plan_prefill(
+        &qo_indptr,
+        &kv_indptr,
+        &kv_len,
+        rows as u32,
+        shape,
+        live,
+        window,
+        true,
+        false,
+        None,
+        &device,
+        Toggles::of(Tuning::DEFAULT),
+        workspace,
+    )
+    .expect("the plan builds");
+    built.stage(&ctx).expect("the plan uploads");
+    let sm_scale = std::env::var("PIE_RATE_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(1.0);
+    // Keys each row reads, its window's or its prefix and itself.
+    let keys: usize = lane
+        .iter()
+        .map(|l| {
+            (0..l.0)
+                .map(|t| {
+                    let reach = l.1 - l.0 + t + 1;
+                    window.map_or(reach, |w| reach.min(w as usize))
+                })
+                .sum::<usize>()
+        })
+        .sum();
+    let flops = 4.0 * (qh * d) as f64 * keys as f64;
+    println!(
+        "{n} lanes, {rows} rows, {pages} pages, {:.1} keys a row",
+        keys as f64 / rows as f64
+    );
+    for (what, indices) in [("recorded pages", &recorded), ("rising runs", &contiguous)] {
+        let idx_at = gpu.up(indices);
+        let pool = KvPool {
+            keys: Tensor::new(k_at, cells as u32, (kvh * d) as u32, Dtype::Bf16),
+            values: Tensor::new(v_at, cells as u32, (kvh * d) as u32, Dtype::Bf16),
+            bf16_keys: Tensor::ABSENT,
+            bf16_values: Tensor::ABSENT,
+            key_scales: Tensor::ABSENT,
+            value_scales: Tensor::ABSENT,
+            page_indices: Tensor::new(idx_at, pages as u32, 1, Dtype::I32),
+            page_indptr: Tensor::new(kvp_at, n as u32 + 1, 1, Dtype::I32),
+            last_page_lens: Tensor::new(last_at, n as u32, 1, Dtype::I32),
+            row_valid: Tensor::ABSENT,
+            env_min: Tensor::ABSENT,
+            env_max: Tensor::ABSENT,
+            has_envelopes: false,
+            page_size: PAGE as i32,
+            seq_stride: (kvh * d) as i64,
+            head_stride: d as i64,
+            layout: 0,
+            scheme_byte: 0,
+            block_size: 0,
+            max_pages_per_request: lane.iter().map(|l| l.3).max().unwrap_or(0) as i32,
+            pages_in_batch: pages as i32,
+        };
+        let q_t = RaggedTensor {
+            data: Tensor::new(q_at, rows as u32, (qh * d) as u32, Dtype::Bf16),
+            indptr: Tensor::new(qo_at, n as u32 + 1, 1, Dtype::I32),
+        };
+        let tc5 = timer.median(|_| {
+            let mut o = Tensor::new(o_at, rows as u32, (qh * d) as u32, Dtype::Bf16);
+            attn::prefill(
+                &ctx, q_t, &built, &pool, window, d as u32, kvh as u32, sm_scale, &mut o,
+            )
+            .expect("the prefill fires");
+        });
+        let fa2 = timer.median(|_| {
+            let mut o = Tensor::new(o_at, rows as u32, (qh * d) as u32, Dtype::Bf16);
+            let mut lse = Tensor::new(lse_at, rows as u32, qh as u32, Dtype::F32);
+            attn::prefill_lse(
+                &ctx, q_t, &built, &pool, window, d as u32, kvh as u32, sm_scale, &mut o, &mut lse,
+            )
+            .expect("the FA2 prefill fires");
+        });
+        println!(
+            "{what}: tc5 {:.0} TFLOPS ({:.3} ms), FA2 {:.0} TFLOPS",
+            flops / tc5 * 1e-6,
+            tc5 * 1e-3,
             flops / fa2 * 1e-6
         );
     }

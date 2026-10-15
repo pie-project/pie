@@ -42,8 +42,8 @@ struct Params {
 /// The key tile and ring depth a head width runs at: three stages of K and
 /// V fill shared memory, Q and P living in TMEM. A prefill `wide_of` names
 /// runs `tc5_fmha_prefill_wide` instead.
-fn tiling(head_dim: u32, window_left: i32) -> (u32, u32) {
-    if let Some(w) = wide_of(head_dim, window_left) {
+fn tiling(head_dim: u32, sliding_wide: bool) -> (u32, u32) {
+    if let Some(w) = wide_of(head_dim, sliding_wide) {
         return (w.bkv, w.slots);
     }
     match head_dim {
@@ -70,12 +70,12 @@ struct Wide {
 }
 
 /// The prefills `tc5_fmha_prefill_wide` serves: every 512-wide head (O
-/// would fill TMEM in the other kernel), and a 256-wide one without a
-/// window, whose 128-key tiles run S at twice the rate of 64. A sliding
-/// 256-wide head (Gemma-4's) stays on the other kernel: its blocks read a
-/// window of a few tiles, and a 128-key tile's partial ends cost it more
-/// than the rate gains.
-fn wide_of(head_dim: u32, window_left: i32) -> Option<Wide> {
+/// would fill TMEM in the other kernel), and a 256-wide one without a window
+/// or where `sliding_wide` says, whose 128-key tiles run S at twice the rate
+/// of 64. A sliding one's pages, lying in one run a request, favour them
+/// (Gemma-4's: 0.69 -> 0.64 ms a recorded 4 x 4096 fire); scattered, a
+/// tile lands as twice the boxes a slice.
+fn wide_of(head_dim: u32, sliding_wide: bool) -> Option<Wide> {
     match head_dim {
         512 => Some(Wide {
             d: 512,
@@ -84,7 +84,7 @@ fn wide_of(head_dim: u32, window_left: i32) -> Option<Wide> {
             atoms: 2,
             slots: 3,
         }),
-        256 if window_left < 0 => Some(Wide {
+        256 if sliding_wide => Some(Wide {
             d: 256,
             bkv: 128,
             qt: 0,
@@ -119,7 +119,11 @@ pub(crate) fn try_prefill(
     let rows = q.data.rows;
     let requests = shape.num_requests;
     let page = u32::try_from(pool.page_size).unwrap_or(0);
-    let (bkv, stages) = tiling(head_dim, window_left);
+    // A sliding 256-wide prefill runs the 128-key kernel where the profile
+    // says (`kernel.sdpa.prefill.wide_sliding`); without a window it always
+    // does.
+    let sliding_wide = window_left < 0 || ctx.tuning().prefill_wide_sliding;
+    let (bkv, stages) = tiling(head_dim, sliding_wide);
     // The profile's decision (`kernel.sdpa.prefill.tc5`, on for sm_100)
     // and the device's capability both: elsewhere FA2 serves as before.
     let fits = ctx.tuning().prefill_tc5
@@ -165,7 +169,7 @@ pub(crate) fn try_prefill(
     let map_v = map(pool.values.ptr, 16)?;
     let map_k_run = map(pool.keys.ptr, bkv)?;
     let map_v_run = map(pool.values.ptr, bkv)?;
-    let wide = wide_of(head_dim, window_left);
+    let wide = wide_of(head_dim, sliding_wide);
     let int = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
     let params = Params {
         q: q.data.ptr,

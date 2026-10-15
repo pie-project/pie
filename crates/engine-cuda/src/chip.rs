@@ -420,6 +420,7 @@ mod tests {
                         mxfp4_mma_until: defaults.mxfp4_mma_until,
                         mxfp4_mma_from: defaults.mxfp4_mma_from,
                         prefill_tc5: false,
+                        prefill_wide_sliding: false,
                         decode_grouped_prefill_from: 0,
                         gemm_bias_epilogue: false,
                         gemm_nvfp4_k128: false,

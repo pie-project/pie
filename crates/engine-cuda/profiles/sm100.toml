@@ -55,6 +55,12 @@ moe.mxfp4_mma_until = 1024
 # Qwen3.8-27B's 256-wide, six-way-grouped head runs at about 900 TFLOPS
 # where FA2 runs at about 300.
 sdpa.prefill.tc5 = true
+# Gemma-4-31B's sliding layers (256 wide, two query heads a key head, a
+# 1024-key window) on the 128-key-tile kernel: a recorded 4 x 4096 fire,
+# its pages one run a request, 0.69 -> 0.64 ms; in a 32 x 4096 prefill
+# 0.41 -> 0.38 s, the prefill's wall time unmoved (the GPU runs it at its
+# power cap, where a kernel's saved time goes to the others' clock).
+sdpa.prefill.wide_sliding = true
 # A single-token row of a four-way or wider head group reads the cache
 # through the prefill kernel, whose tensor cores take the group's rows as
 # one tile: Qwen3.8-27B's 64-row decode step spends 0.64 ms in attention

@@ -281,6 +281,13 @@ pub struct SsmConvVec4;
 #[decision(id = "kernel.sdpa.prefill.tc5", flag, default = false, tune = search)]
 pub struct PrefillTc5;
 
+/// Whether a sliding 256-wide prefill (Gemma-4's) on the tcgen05 FMHA runs
+/// the 128-key-tile kernel (`tc5_fmha_prefill_wide`) rather than the 64-key
+/// one; a 256-wide prefill without a window runs it either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.prefill.wide_sliding", flag, default = false, tune = search)]
+pub struct PrefillWideSliding;
+
 /// The fewest query heads to a KV head at which a single-token row reads
 /// the cache through the prefill kernel (tensor cores over the group's
 /// rows) instead of the decode kernel; 0 never does.
@@ -370,6 +377,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmSplitLaunchNs>()
         .add::<MoeTopkWarp>()
         .add::<PrefillTc5>()
+        .add::<PrefillWideSliding>()
         .add::<DecodeGroupedPrefillFrom>()
         .add::<DecodeGroupedPrefillLse>()
         .add::<DecodeXqa>()
@@ -427,6 +435,7 @@ pub struct Tuning {
     pub gemm_split_launch_ns: u32,
     pub moe_topk_warp: bool,
     pub prefill_tc5: bool,
+    pub prefill_wide_sliding: bool,
     pub decode_grouped_prefill_from: u32,
     pub decode_grouped_prefill_lse: bool,
     pub decode_xqa: bool,
@@ -482,6 +491,7 @@ impl Tuning {
         gemm_split_launch_ns: 0,
         moe_topk_warp: false,
         prefill_tc5: false,
+        prefill_wide_sliding: false,
         decode_grouped_prefill_from: 0,
         decode_grouped_prefill_lse: false,
         decode_xqa: false,
@@ -537,6 +547,7 @@ impl Tuning {
             gemm_split_launch_ns: profile.get::<GemmSplitLaunchNs>().0,
             moe_topk_warp: profile.on::<MoeTopkWarp>(&Anywhere),
             prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),
+            prefill_wide_sliding: profile.on::<PrefillWideSliding>(&Anywhere),
             decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,
             decode_grouped_prefill_lse: profile.on::<DecodeGroupedPrefillLse>(&Anywhere),
             decode_xqa: profile.on::<DecodeXqa>(&Anywhere),
