@@ -1173,10 +1173,29 @@ __device__ __forceinline__ float block_reduce_sum(float x, float* scratch) {
     return total;
 }
 
+// The closed blocks a blend reads, each its own plane (`rows x H`), by value.
+struct ResBlocks {
+    const void* at[kMaxBlocks];
+};
+
+// A row's eight elements from 16 bytes, or its one element where the row is
+// not read 16 bytes at a time.
+template <class T>
+__device__ __forceinline__ void res_load8(const T* v, i32 h, float (&x)[8]) {
+    const uint4 w = *reinterpret_cast<const uint4*>(v + h);
+    const T* e = reinterpret_cast<const T*>(&w);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) x[i] = Elem<T>::to_f32(e[i]);
+}
+
+// AttnRes's blend of a token's closed blocks and its running prefix: each
+// candidate's RMS-normed dot with the projection (one warp a candidate, its
+// square sum and its dot in one pass), their softmax, and the blend of the
+// candidates under it.
 template <class T>
 __global__ void res_blend(
     const T* __restrict__ prefix,
-    const T* __restrict__ blocks,
+    ResBlocks blocks,
     const T* __restrict__ norm_weight,
     const T* __restrict__ proj_weight,
     T* __restrict__ out,
@@ -1189,38 +1208,97 @@ __global__ void res_blend(
 
     const i32 row = win != nullptr ? t + static_cast<i32>(win[1]) : t;
 
-    __shared__ float scratch[kThreads / 32];
     __shared__ float prob_s[kMaxBlocks + 1];
 
     const long long token_off = static_cast<long long>(row) * H;
     const i32 rows = B + 1;
+    (void)block_rows;
 
     auto row_ptr = [&](i32 j) -> const T* {
-        return (j < B) ? blocks + (static_cast<long long>(j) * block_rows + row) * H
-                       : prefix + token_off;
+        return (j < B) ? static_cast<const T*>(blocks.at[j]) + token_off : prefix + token_off;
     };
-
+    // 16-byte runs where every row and both weights allow them.
+    bool wide = (H % 8) == 0
+        && (reinterpret_cast<unsigned long long>(norm_weight) & 15ull) == 0
+        && (reinterpret_cast<unsigned long long>(proj_weight) & 15ull) == 0
+        && (reinterpret_cast<unsigned long long>(out + token_off) & 15ull) == 0;
     for (i32 j = 0; j < rows; ++j) {
-        const T* v = row_ptr(j);
-        float ss = 0.f;
-        for (i32 h = static_cast<i32>(threadIdx.x); h < H;
-             h += static_cast<i32>(blockDim.x)) {
-            const float x = Elem<T>::to_f32(v[h]);
-            ss += x * x;
-        }
-        ss = block_reduce_sum(ss, scratch);
-        const float scale = rsqrtf(ss / static_cast<float>(H) + eps);
+        wide = wide && (reinterpret_cast<unsigned long long>(row_ptr(j)) & 15ull) == 0;
+    }
 
-        float dot = 0.f;
-        for (i32 h = static_cast<i32>(threadIdx.x); h < H;
-             h += static_cast<i32>(blockDim.x)) {
-            dot += Elem<T>::to_f32(v[h]) * scale *
-                   Elem<T>::to_f32(norm_weight[h]) *
-                   Elem<T>::to_f32(proj_weight[h]);
+    // Each thread walks its columns of a group of candidates at once (their
+    // loads independent of one another), its square sums and dots reduced
+    // across the block a group at a time.
+    constexpr int kGroup = 8;
+    __shared__ float part[kThreads / 32][2 * kGroup];
+    const i32 lane = static_cast<i32>(threadIdx.x) & 31;
+    const i32 warp = static_cast<i32>(threadIdx.x) >> 5;
+    const i32 warps = static_cast<i32>(blockDim.x) >> 5;
+    for (i32 j0 = 0; j0 < rows; j0 += kGroup) {
+        float ss[kGroup];
+        float dot[kGroup];
+#pragma unroll
+        for (int g = 0; g < kGroup; ++g) {
+            ss[g] = 0.f;
+            dot[g] = 0.f;
         }
-        dot = block_reduce_sum(dot, scratch);
-        if (threadIdx.x == 0) {
-            prob_s[j] = dot;
+        if (wide) {
+            for (i32 h = static_cast<i32>(threadIdx.x) * 8; h < H;
+                 h += static_cast<i32>(blockDim.x) * 8) {
+                float nw[8], pw[8];
+                res_load8(norm_weight, h, nw);
+                res_load8(proj_weight, h, pw);
+#pragma unroll
+                for (int g = 0; g < kGroup; ++g) {
+                    if (j0 + g < rows) {
+                        float x[8];
+                        res_load8(row_ptr(j0 + g), h, x);
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            ss[g] += x[i] * x[i];
+                            dot[g] += x[i] * nw[i] * pw[i];
+                        }
+                    }
+                }
+            }
+        } else {
+            for (i32 h = static_cast<i32>(threadIdx.x); h < H;
+                 h += static_cast<i32>(blockDim.x)) {
+                const float w = Elem<T>::to_f32(norm_weight[h]) * Elem<T>::to_f32(proj_weight[h]);
+#pragma unroll
+                for (int g = 0; g < kGroup; ++g) {
+                    if (j0 + g < rows) {
+                        const float x = Elem<T>::to_f32(row_ptr(j0 + g)[h]);
+                        ss[g] += x * x;
+                        dot[g] += x * w;
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < kGroup; ++g) {
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                ss[g] += __shfl_xor_sync(0xffffffffu, ss[g], off);
+                dot[g] += __shfl_xor_sync(0xffffffffu, dot[g], off);
+            }
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (int g = 0; g < kGroup; ++g) {
+                part[warp][g] = ss[g];
+                part[warp][kGroup + g] = dot[g];
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < kGroup && j0 + static_cast<i32>(threadIdx.x) < rows) {
+            float s2 = 0.f;
+            float d = 0.f;
+            for (i32 w = 0; w < warps; ++w) {
+                s2 += part[w][threadIdx.x];
+                d += part[w][kGroup + threadIdx.x];
+            }
+            prob_s[j0 + threadIdx.x] = d * rsqrtf(s2 / static_cast<float>(H) + eps);
         }
         __syncthreads();
     }
@@ -1238,13 +1316,32 @@ __global__ void res_blend(
     }
     __syncthreads();
 
-    for (i32 h = static_cast<i32>(threadIdx.x); h < H;
-         h += static_cast<i32>(blockDim.x)) {
-        float acc = 0.f;
-        for (i32 j = 0; j < rows; ++j) {
-            acc += prob_s[j] * Elem<T>::to_f32(row_ptr(j)[h]);
+    if (wide) {
+        for (i32 h = static_cast<i32>(threadIdx.x) * 8; h < H;
+             h += static_cast<i32>(blockDim.x) * 8) {
+            float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            for (i32 j = 0; j < rows; ++j) {
+                float x[8];
+                res_load8(row_ptr(j), h, x);
+                const float p = prob_s[j];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[i] += p * x[i];
+            }
+            uint4 w;
+            T* e = reinterpret_cast<T*>(&w);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) e[i] = Elem<T>::from_f32(acc[i]);
+            *reinterpret_cast<uint4*>(out + token_off + h) = w;
         }
-        out[token_off + h] = Elem<T>::from_f32(acc);
+    } else {
+        for (i32 h = static_cast<i32>(threadIdx.x); h < H;
+             h += static_cast<i32>(blockDim.x)) {
+            float acc = 0.f;
+            for (i32 j = 0; j < rows; ++j) {
+                acc += prob_s[j] * Elem<T>::to_f32(row_ptr(j)[h]);
+            }
+            out[token_off + h] = Elem<T>::from_f32(acc);
+        }
     }
 }
 

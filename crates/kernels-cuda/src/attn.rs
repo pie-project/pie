@@ -928,32 +928,18 @@ pub fn res_blend(
             ),
         ));
     }
-    let plane_bytes = u64::from(y.rows) * u64::from(y.width) * 2;
-    let stacked = blocks
-        .windows(2)
-        .all(|pair| pair[1].ptr == pair[0].ptr.wrapping_add(plane_bytes));
-    // The kernel walks `blocks + (j * rows + t) * hidden`. The planner does not
-    // place the closed blocks side by side (they are residual snapshots taken
-    // layers apart), so scattered ones are staged into one stacked scratch.
-    let first = if stacked {
-        blocks.first().map_or(prefix.ptr, |b| b.ptr)
-    } else {
-        let span = usize::try_from(plane_bytes)
-            .ok()
-            .and_then(|p| p.checked_mul(blocks.len()))
-            .ok_or_else(|| refuse(OP, "the stacked blocks do not fit a usize"))?;
-        let stack = ctx.scratch(OP, "elemwise.res_blend_blocks", span)? as usize as u64;
-        for (j, block) in blocks.iter().enumerate() {
-            stage_plane(
-                ctx,
-                OP,
-                stack + j as u64 * plane_bytes,
-                block.ptr,
-                plane_bytes,
-            )?;
-        }
-        stack
+    // Each closed block is read where it lies (they are residual snapshots
+    // taken layers apart), its address passed by value.
+    #[repr(C)]
+    struct ResBlocks {
+        at: [u64; MAX_BLOCKS],
+    }
+    let mut at = ResBlocks {
+        at: [0; MAX_BLOCKS],
     };
+    for (slot, block) in at.at.iter_mut().zip(blocks) {
+        *slot = block.ptr;
+    }
     ctx.fire(
         OP,
         Fire::at(
@@ -963,7 +949,10 @@ pub fn res_blend(
         .apply(Launch::per_row(y.rows, BLOCK)),
         &[
             prefix.arg(),
-            crate::jit::ArgValue::Ptr(first),
+            crate::jit::ArgValue::Bytes {
+                ptr: std::ptr::from_ref(&at).cast(),
+                len: size_of::<ResBlocks>(),
+            },
             weight.arg(),
             proj.arg(),
             y.arg(),
@@ -974,37 +963,4 @@ pub fn res_blend(
             ctx.stage(),
         ],
     )
-}
-
-/// One device-to-device plane copy on the context's stream.
-fn stage_plane(ctx: &Ctx, op: &'static str, dst: u64, src: u64, bytes: u64) -> Result<(), Error> {
-    #[cfg(feature = "cuda")]
-    {
-        use cudarc::runtime::sys as rt;
-
-        let code = unsafe {
-            rt::cudaMemcpyAsync(
-                dst as usize as *mut core::ffi::c_void,
-                src as usize as *const core::ffi::c_void,
-                usize::try_from(bytes).map_err(|_| refuse(op, "a plane wider than usize"))?,
-                rt::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
-                ctx.stream().cast(),
-            )
-        };
-        if code != rt::cudaError::cudaSuccess {
-            return Err(refuse(
-                op,
-                format!(
-                    "`cudaMemcpyAsync` answered {} stacking a block",
-                    code as i32
-                ),
-            ));
-        }
-        Ok(())
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (ctx, dst, src, bytes);
-        Err(crate::jit::runtimeless(op))
-    }
 }
