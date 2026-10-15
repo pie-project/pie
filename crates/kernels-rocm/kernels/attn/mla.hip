@@ -312,16 +312,19 @@ constexpr int kTable = kTableTiles * kBK;
 // Sixteen bytes in registers (a vector, so the prefetch stays out of scratch).
 typedef u32 chunk __attribute__((ext_vector_type(4)));
 
-template <int R>
+// RK the latent's width, BK the keys a tile: 32 at the 512 latent, 16 at
+// a 1024 one (whose key rows would not fit LDS 32 at a time).
+template <int R, int RK = kRank, int BK = kBK>
 struct Smem {
-    static constexpr int W = kRank + R;  // a key row: latent, then rope
+    static constexpr int W = RK + R;     // a key row: latent, then rope
     static constexpr int LD = W + 8;     // its LDS pitch (16-byte rows, banks staggered)
-    static constexpr int LP = kBK + 4;   // the weights' pitch
-    bf16 kv[kBK][LD];
+    static constexpr int LP = BK + 4;    // the weights' pitch
+    static constexpr int TABLE = kTableTiles * BK;
+    bf16 kv[BK][LD];
     bf16 p[kBM][LP];
     mfma_cd part[kWaves][2][kWave];
-    i32 slot[2][kTable];
-    i32 kpos[2][kTable];
+    i32 slot[2][TABLE];
+    i32 kpos[2][TABLE];
     float rm[kBM];
     float rl[kBM];
 };
@@ -337,12 +340,19 @@ struct Staged {
 // The block's 64 query rows: `qn(r)`/`qp(r)` their latent and rope query
 // rows, `limit(r)` the last key position row r sees (−1: a dead row), and
 // `put(r, j, v)` / `put_lse(r, lse)` land 4 output columns from j / the lse.
-// `attend` walks the keys and lands every live row.
-template <int R, class Rows>
-__device__ void attend(Smem<R>& sm, const Rows& rows, const LatentKeys& keys,
-                       const bf16* __restrict__ ckv, const bf16* __restrict__ kpe, float scale_log2) {
-    constexpr int ST = Smem<R>::W / 32;  // 32-wide k pairs over the key row
+// `attend` walks the keys and lands every live row: every column of the
+// scores, and the 512 output columns from `voff` (a 1024 latent's output
+// is two blocks' halves, each scoring the whole row).
+template <int R, class Rows, int RK = kRank, int BK = kBK>
+__device__ void attend(Smem<R, RK, BK>& sm, const Rows& rows, const LatentKeys& keys,
+                       const bf16* __restrict__ ckv, const bf16* __restrict__ kpe, float scale_log2,
+                       int voff = 0) {
+    using SM = Smem<R, RK, BK>;
+    constexpr int ST = SM::W / 32;       // 32-wide k pairs over the key row
     constexpr int SH = ST / 2;           // a wavefront's half
+    constexpr int KT = BK / 16;          // 16-key halves a tile
+    constexpr int TPK = kThreads / BK;   // threads a key row's read
+    static_assert(ST % 2 == 0 && TPK * 32 == RK, "a key row split evenly");
     const int w = threadIdx.x / kWave, l = lane(), c = l % 16, g = l / 16;
     const int rt = w % 4, dh = w / 4;
     const int qrow = 16 * rt + c;
@@ -356,19 +366,19 @@ __device__ void attend(Smem<R>& sm, const Rows& rows, const LatentKeys& keys,
 #pragma unroll
         for (int j = 0; j < SH; ++j) {
             const int st = SH * dh + j;
-            qf[j] = load8(st < kRank / 32 ? qn + 32 * st + 8 * g : qp + 32 * (st - kRank / 32) + 8 * g);
+            qf[j] = load8(st < RK / 32 ? qn + 32 * st + 8 * g : qp + 32 * (st - RK / 32) + 8 * g);
         }
     }
     const int lim = rows.limit(qrow);
 
     const int count = keys.n1 - keys.n0;
-    const int tiles = keys.limit < 0 || count <= 0 ? 0 : (count + kBK - 1) / kBK;
+    const int tiles = keys.limit < 0 || count <= 0 ? 0 : (count + BK - 1) / BK;
 
     // Table half h holds tiles [8k, 8k + 8) for k ≡ h (mod 2).
     auto fill = [&](int tile0) {
         const int h = (tile0 / kTableTiles) % 2;
-        for (int e = threadIdx.x; e < kTable; e += kThreads) {
-            const int n = keys.n0 + tile0 * kBK + e;
+        for (int e = threadIdx.x; e < SM::TABLE; e += kThreads) {
+            const int n = keys.n0 + tile0 * BK + e;
             const int p = keys.pos(min(n, keys.n1 - 1));
             const bool vis = n < keys.n1 && keys.visible(p);
             const int at = vis ? p : 0;
@@ -376,20 +386,20 @@ __device__ void attend(Smem<R>& sm, const Rows& rows, const LatentKeys& keys,
             sm.slot[h][e] = static_cast<i32>(keys.slot(at, keys.page(at)));
         }
     };
-    const int key = threadIdx.x / 16, part = threadIdx.x % 16;
+    const int key = threadIdx.x / TPK, part = threadIdx.x % TPK;
     auto issue = [&](Staged& s, int tile) {
         tile = min(tile, tiles - 1);  // past the walk: the last tile again, from L2
-        const long long slot = sm.slot[(tile / kTableTiles) % 2][(tile % kTableTiles) * kBK + key];
-        const bf16* src = ckv + slot * kRank;
+        const long long slot = sm.slot[(tile / kTableTiles) % 2][(tile % kTableTiles) * BK + key];
+        const bf16* src = ckv + slot * RK;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) s.lat[i] = *reinterpret_cast<const chunk*>(src + 8 * (part + 16 * i));
+        for (int i = 0; i < 4; ++i) s.lat[i] = *reinterpret_cast<const chunk*>(src + 8 * (part + TPK * i));
         if constexpr (R > 0) s.rp = *reinterpret_cast<const chunk*>(kpe + slot * R + 8 * (part % 8));
     };
     auto store = [&](const Staged& s) {
         bf16* dst = &sm.kv[key][0];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) *reinterpret_cast<chunk*>(dst + 8 * (part + 16 * j)) = s.lat[j];
-        if constexpr (R > 0) *reinterpret_cast<chunk*>(dst + kRank + 8 * (part % 8)) = s.rp;
+        for (int j = 0; j < 4; ++j) *reinterpret_cast<chunk*>(dst + 8 * (part + TPK * j)) = s.lat[j];
+        if constexpr (R > 0) *reinterpret_cast<chunk*>(dst + RK + 8 * (part % 8)) = s.rp;
     };
 
     float m_run = neg_inf(), l_run = 0.f;
@@ -414,26 +424,28 @@ __device__ void attend(Smem<R>& sm, const Rows& rows, const LatentKeys& keys,
         mfma_cd s0 = mfma_zero(), s1 = mfma_zero();
         {
             const bf16* k0 = &sm.kv[c][8 * g];
-            const bf16* k1 = &sm.kv[16 + c][8 * g];
+            const bf16* k1 = &sm.kv[KT > 1 ? 16 + c : c][8 * g];
 #pragma unroll
             for (int j = 0; j < SH; ++j) {
                 const int st = SH * dh + j;
                 s0 = mfma16x2(load8(k0 + 32 * st), qf[j], s0);
-                s1 = mfma16x2(load8(k1 + 32 * st), qf[j], s1);
+                if constexpr (KT > 1) s1 = mfma16x2(load8(k1 + 32 * st), qf[j], s1);
             }
         }
         sm.part[w][0][l] = s0;
-        sm.part[w][1][l] = s1;
+        if constexpr (KT > 1) sm.part[w][1][l] = s1;
         lds_barrier();
-        const mfma_cd o0 = sm.part[w ^ 4][0][l], o1 = sm.part[w ^ 4][1][l];
-        const i32* kp = &sm.kpos[(i / kTableTiles) % 2][(i % kTableTiles) * kBK + 4 * g];
-        const int4 kp0 = *reinterpret_cast<const int4*>(kp), kp1 = *reinterpret_cast<const int4*>(kp + 16);
+        const mfma_cd o0 = sm.part[w ^ 4][0][l];
+        const mfma_cd o1 = KT > 1 ? sm.part[w ^ 4][1][l] : mfma_zero();
+        const i32* kp = &sm.kpos[(i / kTableTiles) % 2][(i % kTableTiles) * BK + 4 * g];
+        const int4 kp0 = *reinterpret_cast<const int4*>(kp);
+        const int4 kp1 = KT > 1 ? *reinterpret_cast<const int4*>(kp + 16) : int4{kNoKey, kNoKey, kNoKey, kNoKey};
         const int ks[8] = {kp0.x, kp0.y, kp0.z, kp0.w, kp1.x, kp1.y, kp1.z, kp1.w};
         float x[8];
 #pragma unroll
         for (int t = 0; t < 4; ++t) {
             x[t] = ks[t] <= lim ? (s0[t] + o0[t]) * scale_log2 : neg_inf();
-            x[4 + t] = ks[4 + t] <= lim ? (s1[t] + o1[t]) * scale_log2 : neg_inf();
+            x[4 + t] = KT > 1 && ks[4 + t] <= lim ? (s1[t] + o1[t]) * scale_log2 : neg_inf();
         }
         float mx = x[0];
 #pragma unroll
@@ -454,8 +466,10 @@ __device__ void attend(Smem<R>& sm, const Rows& rows, const LatentKeys& keys,
         }
         l_run = l_run * alpha + sum;
         m_run = m_new;
-        *reinterpret_cast<mfma_ab*>(&sm.p[qrow][16 * dh + 4 * g]) =
-            dh == 0 ? pack4(e[0], e[1], e[2], e[3]) : pack4(e[4], e[5], e[6], e[7]);
+        // (a 16-key tile's weights are one half, which both waves hold)
+        if (KT > 1 || dh == 0)
+            *reinterpret_cast<mfma_ab*>(&sm.p[qrow][16 * dh + 4 * g]) =
+                dh == 0 ? pack4(e[0], e[1], e[2], e[3]) : pack4(e[4], e[5], e[6], e[7]);
         if (dh == 0 && g == 0) sm.rm[qrow] = alpha;
         lds_barrier();
 
@@ -469,14 +483,14 @@ __device__ void attend(Smem<R>& sm, const Rows& rows, const LatentKeys& keys,
                 for (int t = 0; t < 4; ++t) acc[mt][nt][t] *= a;
         }
 #pragma unroll
-        for (int kk = 0; kk < kBK / 16; ++kk) {
+        for (int kk = 0; kk < KT; ++kk) {
             mfma_ab b[4];
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt)
                 b[nt] = *reinterpret_cast<const mfma_ab*>(&sm.p[16 * nt + c][16 * kk + 4 * g]);
 #pragma unroll
             for (int mt = 0; mt < 4; ++mt) {
-                const int col = 64 * w + 16 * mt + c;
+                const int col = voff + 64 * w + 16 * mt + c;
                 const int r0 = 16 * kk + 4 * g;
                 mfma_ab a;
 #pragma unroll
@@ -521,9 +535,9 @@ __device__ void attend(Smem<R>& sm, const Rows& rows, const LatentKeys& keys,
         for (int mt = 0; mt < 4; ++mt) {
             const float v[4] = {acc[mt][nt][0] * inv, acc[mt][nt][1] * inv, acc[mt][nt][2] * inv,
                                 acc[mt][nt][3] * inv};
-            rows.put(row, 64 * w + 16 * mt + 4 * g, v);
+            rows.put(row, voff + 64 * w + 16 * mt + 4 * g, v);
         }
-        if (w == 0 && g == 0) rows.put_lse(row, sum > 0.f ? sm.rm[row] + log2f(sum) : neg_inf());
+        if (w == 0 && g == 0 && voff == 0) rows.put_lse(row, sum > 0.f ? sm.rm[row] + log2f(sum) : neg_inf());
     }
     lds_barrier();
 }
@@ -797,7 +811,7 @@ struct Gather {
     i32 window;
 };
 
-template <int R>
+template <int R, int RK = kRank>
 struct GatherRows {
     const bf16* q_nope;
     const bf16* q_pe;
@@ -812,13 +826,13 @@ struct GatherRows {
     __device__ __forceinline__ long long prow(int r) const {
         return (t * heads + h0 + r) * splits + split;
     }
-    __device__ __forceinline__ const bf16* qn(int r) const { return q_nope + qrow(r) * kRank; }
+    __device__ __forceinline__ const bf16* qn(int r) const { return q_nope + qrow(r) * RK; }
     __device__ __forceinline__ const bf16* qp(int r) const { return q_pe + qrow(r) * R; }
     __device__ __forceinline__ int limit(int r) const { return h0 + r < heads ? last : -1; }
     __device__ __forceinline__ void put(int r, int j, const float (&v)[4]) const {
         if (h0 + r >= heads) return;
-        if (splits > 1) store4(part_o + prow(r) * kRank + j, v);
-        else store4(o + qrow(r) * kRank + j, v);
+        if (splits > 1) store4(part_o + prow(r) * RK + j, v);
+        else store4(o + qrow(r) * RK + j, v);
     }
     __device__ __forceinline__ void put_lse(int r, float v) const {
         if (h0 + r >= heads) return;
@@ -827,9 +841,13 @@ struct GatherRows {
     }
 };
 
-template <int R>
+template <int R, int RK = kRank>
 __global__ __launch_bounds__(kThreads) void latent_gather(const Gather p) {
-    __shared__ Smem<R> sm;
+    constexpr int BK = RK > kRank ? 16 : kBK;
+    constexpr int HALVES = RK / kRank;  // blocks that split a row's output columns
+    __shared__ Smem<R, RK, BK> sm;
+    const int split = static_cast<int>(blockIdx.z) / HALVES;
+    const int voff = (static_cast<int>(blockIdx.z) % HALVES) * kRank;
     const Window window{p.win};
     const int t = blockIdx.y;
     if (!window.live(t)) return;
@@ -858,18 +876,18 @@ __global__ __launch_bounds__(kThreads) void latent_gather(const Gather p) {
     // window's floor.
     const int first = sel != nullptr ? 0 : floor;
     const int count = sel != nullptr ? p.top_k : max(limit + 1 - floor, 0);
-    const int share = ((count + p.splits - 1) / p.splits + kBK - 1) / kBK * kBK;
-    const int n0 = min(count, static_cast<int>(blockIdx.z) * share);
+    const int share = ((count + p.splits - 1) / p.splits + BK - 1) / BK * BK;
+    const int n0 = min(count, split * share);
     const LatentKeys keys{sel, pages, p.page_size, ratio, first + n0, first + min(count, n0 + share), limit,
                           floor};
-    const GatherRows<R> rows{p.q_nope, p.q_pe, p.o, p.lse, p.part_o, p.part_lse, t_row, t,
-                             p.num_heads, static_cast<int>(blockIdx.x) * kBM, limit, p.splits,
-                             static_cast<int>(blockIdx.z)};
-    attend<R>(sm, rows, keys, p.ckv, p.kpe, p.scale_log2);
+    const GatherRows<R, RK> rows{p.q_nope, p.q_pe, p.o, p.lse, p.part_o, p.part_lse, t_row, t,
+                                 p.num_heads, static_cast<int>(blockIdx.x) * kBM, limit, p.splits, split};
+    attend<R, GatherRows<R, RK>, RK, BK>(sm, rows, keys, p.ckv, p.kpe, p.scale_log2, voff);
 }
 
 // The splits of row (t, h) folded into o (and lse). One wavefront a row,
 // eight columns a lane.
+template <int RK>
 __global__ __launch_bounds__(kWave) void latent_merge(const float* __restrict__ part_o,
                                                       const float* __restrict__ part_lse, bf16* __restrict__ o,
                                                       float* __restrict__ lse, int heads, int splits,
@@ -879,12 +897,13 @@ __global__ __launch_bounds__(kWave) void latent_merge(const float* __restrict__ 
     if (!window.live(t)) return;
     const long long row = window.plane(t) * heads + blockIdx.y;
     const long long prow = (static_cast<long long>(t) * heads + blockIdx.y) * splits;
-    const int col = 8 * lane();
+    for (int c0 = 0; c0 < RK; c0 += 8 * kWave) {
+    const int col = c0 + 8 * lane();
     Fold f;
     typedef float f32x8 __attribute__((ext_vector_type(8)));
     f.walk<f32x8>(
         part_lse + prow, 0, 1, splits,
-        [&](int s) { return *reinterpret_cast<const f32x8*>(part_o + (prow + s) * kRank + col); },
+        [&](int s) { return *reinterpret_cast<const f32x8*>(part_o + (prow + s) * RK + col); },
         [](const f32x8& x, float (&v)[8]) {
 #pragma unroll
             for (int j = 0; j < 8; ++j) v[j] = x[j];
@@ -893,8 +912,9 @@ __global__ __launch_bounds__(kWave) void latent_merge(const float* __restrict__ 
     Pack8<bf16> out;
 #pragma unroll
     for (int j = 0; j < 8; ++j) out.v[j] = from_f32<bf16>(f.o[j] * inv);
-    *reinterpret_cast<Pack8<bf16>*>(o + row * kRank + col) = out;
+    *reinterpret_cast<Pack8<bf16>*>(o + row * RK + col) = out;
     if (lse != nullptr && col == 0) lse[row] = f.lse();
+    }
 }
 
 }  // namespace mla

@@ -529,6 +529,13 @@ pub(crate) mod latent {
         rank == RANK && (rope == 0 || rope == 64)
     }
 
+    /// The gathered walk also takes a 1024 latent (dots.llm3's sliding
+    /// layers): two blocks a row, each over half the output columns.
+    #[must_use]
+    pub const fn gather_supported(rank: i32, rope: i32) -> bool {
+        (rank == RANK || rank == 2 * RANK) && (rope == 0 || rope == 64)
+    }
+
     fn scale_log2(sm_scale: f32) -> f32 {
         sm_scale * core::f32::consts::LOG2_E
     }
@@ -730,10 +737,18 @@ pub(crate) mod latent {
     pub fn gather(
         ctx: &Ctx,
         op: &'static str,
+        rank: i32,
         rope: i32,
         rows: u32,
         mut g: Gather,
     ) -> Result<(), Error> {
+        if !gather_supported(rank, rope) {
+            return Err(refuse(
+                op,
+                format!("the gathered walk takes a 512 or 1024 latent beside a 64 rope or none, not {rank}+{rope}"),
+            ));
+        }
+        let halves = (rank / RANK).unsigned_abs();
         if rows == 0 {
             return Ok(());
         }
@@ -744,18 +759,18 @@ pub(crate) mod latent {
         let splits = g.splits.unsigned_abs();
         if splits > 1 {
             let cells = rows as usize * heads as usize * splits as usize;
-            let rank = RANK.unsigned_abs() as usize;
-            g.part_o = ctx.scratch(op, "attn.mla_part_o", cells * rank * 4)? as usize as u64;
+            let width = rank.unsigned_abs() as usize;
+            g.part_o = ctx.scratch(op, "attn.mla_part_o", cells * width * 4)? as usize as u64;
             g.part_lse = ctx.scratch(op, "attn.mla_part_lse", cells * 4)? as usize as u64;
         }
         if let ArgValue::Ptr(win) = ctx.stage() {
             g.win = win;
         }
-        let entry = symbol(&format!("::pie::attn::mla::latent_gather<{rope}>"));
+        let entry = symbol(&format!("::pie::attn::mla::latent_gather<{rope}, {rank}>"));
         ctx.fire(
             op,
             Fire::at(FILE, entry).apply(Launch::grid(
-                [heads.div_ceil(BLOCK_ROWS), rows, splits],
+                [heads.div_ceil(BLOCK_ROWS), rows, splits * halves],
                 [THREADS, 1, 1],
             )),
             &[by_value(&g)],
@@ -765,7 +780,7 @@ pub(crate) mod latent {
         }
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::mla::latent_merge")
+            Fire::at(FILE, symbol(&format!("::pie::attn::mla::latent_merge<{rank}>")))
                 .apply(Launch::grid([rows, heads, 1], [64, 1, 1])),
             &[
                 ArgValue::Ptr(g.part_o),
@@ -838,11 +853,13 @@ fn dispatch_dense(
     let num_requests = kv::lanes_of(op, qo_indptr)?;
     let matrix_core = !ctx.tuning().mla_naive && latent::supported(layer.kv_lora_rank, layer.rope_dim);
     // A windowed row reads a band of keys of its own: the gathered walk,
-    // a block per token, takes it from its window's floor.
-    if matrix_core && window > 0 {
+    // a block per token, takes it from its window's floor (at a 512 or a
+    // 1024 latent).
+    if !ctx.tuning().mla_naive && window > 0 && latent::gather_supported(layer.kv_lora_rank, layer.rope_dim) {
         return latent::gather(
             ctx,
             op,
+            layer.kv_lora_rank,
             layer.rope_dim,
             o.rows,
             latent::Gather {
@@ -1004,10 +1021,11 @@ fn selected(
     let num_requests = kv::lanes_of(op, q.indptr)?;
     let top_k = stated(op, selection.width)?;
     let lse = lse_plane(op, lse, o.rows, heads)?;
-    if !ctx.tuning().mla_naive && latent::supported(layer.kv_lora_rank, layer.rope_dim) {
+    if !ctx.tuning().mla_naive && latent::gather_supported(layer.kv_lora_rank, layer.rope_dim) {
         return latent::gather(
             ctx,
             op,
+            layer.kv_lora_rank,
             layer.rope_dim,
             o.rows,
             latent::Gather {

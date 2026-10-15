@@ -342,6 +342,7 @@ fn attend_pool(
         return latent::gather(
             ctx,
             op,
+            super::mla::latent::RANK,
             0,
             rows,
             latent::Gather {
