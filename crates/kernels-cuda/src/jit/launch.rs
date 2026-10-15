@@ -23,6 +23,23 @@ pub(crate) unsafe fn issue(
         attrs[n].value.cooperative = 1;
         n += 1;
     }
+    // Past the portable 8 a cluster is the function's to allow (B200 seats
+    // 16 one-block SMs a cluster).
+    if launch.cluster > 8 {
+        let code = unsafe {
+            dr::cuFuncSetAttribute(
+                function,
+                dr::CUfunction_attribute::CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+                1,
+            )
+        };
+        if code != dr::CUresult::CUDA_SUCCESS {
+            return Err(Fault::Device {
+                call: "cuFuncSetAttribute",
+                code: code as i32,
+            });
+        }
+    }
     if launch.cluster > 1 {
         attrs[n].id = dr::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
         attrs[n].value.clusterDim.x = launch.cluster;

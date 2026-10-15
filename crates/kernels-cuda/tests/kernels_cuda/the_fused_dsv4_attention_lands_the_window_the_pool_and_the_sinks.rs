@@ -4,8 +4,10 @@
 //! (`attn::dsv4::decode`): a row's 128-position window of the shared
 //! key/value plane, its compressed rows (all it sees, or an indexer's picks
 //! with ids past the visible ones and an early end), folded together with
-//! the sinks, against an f32 walk over the same bf16 rows; at row counts that
-//! split a row's keys over clusters of 8, 4, 2 and 1 blocks.
+//! the sinks, against an f32 walk over the same rows; at row counts that
+//! split a row's keys over clusters of 8, 4, 2 and 1 blocks. The planes are
+//! bf16, or DeepSeek's fp8 rows as `attn::dsv4::append` writes them, read
+//! back against what the bytes say (and the bytes against the bf16 rows).
 
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
@@ -17,10 +19,22 @@ const HEADS: usize = 64;
 const D: usize = 512;
 const WINDOW: usize = 128;
 
-fn pool_of(gpu: &mut Gpu, keys: u64, cells: usize, pages: &[u32], indptr: &[u32]) -> KvPool {
+fn pool_of(
+    gpu: &mut Gpu,
+    keys: u64,
+    cells: usize,
+    pages: &[u32],
+    indptr: &[u32],
+    fp8: bool,
+) -> KvPool {
+    let (width, dtype) = if fp8 {
+        (dsv4::DS_ROW, Dtype::U8)
+    } else {
+        (D as u32, Dtype::Bf16)
+    };
     KvPool {
-        keys: Tensor::new(keys, cells as u32, D as u32, Dtype::Bf16),
-        values: Tensor::new(keys, cells as u32, D as u32, Dtype::Bf16),
+        keys: Tensor::new(keys, cells as u32, width, dtype),
+        values: Tensor::new(keys, cells as u32, width, dtype),
         bf16_keys: Tensor::ABSENT,
         bf16_values: Tensor::ABSENT,
         key_scales: Tensor::ABSENT,
@@ -33,7 +47,7 @@ fn pool_of(gpu: &mut Gpu, keys: u64, cells: usize, pages: &[u32], indptr: &[u32]
         env_max: Tensor::ABSENT,
         has_envelopes: false,
         page_size: PAGE as i32,
-        seq_stride: D as i64,
+        seq_stride: i64::from(width),
         head_stride: D as i64,
         layout: 0,
         scheme_byte: 0,
@@ -50,7 +64,7 @@ enum Pool {
     Selected(usize, usize),
 }
 
-fn check(rows: usize, pool: Pool, bench: bool) {
+fn check(rows: usize, pool: Pool, bench: bool, fp8: bool) {
     // Two requests of 2304 positions each, their pages interleaved; the
     // window and the compressed rows are two planes on the same tables.
     let span = 2304usize;
@@ -80,6 +94,53 @@ fn check(rows: usize, pool: Pool, bench: bool) {
     let (q_bits, q) = lcg.row(rows * HEADS * D);
     let (w_bits, wk) = lcg.row(cells * D);
     let (e_bits, ek) = lcg.row(cells * D);
+    let mut gpu = Gpu::open();
+    let wkeys = gpu.up(&w_bits);
+    let ekeys = gpu.up(&e_bits);
+    let window_bf16 = pool_of(&mut gpu, wkeys, cells, &pages, &indptr, false);
+    let entries_bf16 = pool_of(&mut gpu, ekeys, cells, &pages, &indptr, false);
+    let (window_pool, entries, wk, ek) = if fp8 {
+        // Every cell written through the fp8 append, then read back.
+        let at_page: Vec<u32> = (0..cells as u32).map(|c| c / PAGE as u32).collect();
+        let at_off: Vec<u32> = (0..cells as u32).map(|c| c % PAGE as u32).collect();
+        let at_page = Tensor::new(gpu.up(&at_page), cells as u32, 1, Dtype::U32);
+        let at_off = Tensor::new(gpu.up(&at_off), cells as u32, 1, Dtype::U32);
+        let bytes = cells * dsv4::DS_ROW as usize;
+        let mut planes = Vec::new();
+        for (src, exact) in [(wkeys, &wk), (ekeys, &ek)] {
+            let plane = gpu.zeros(bytes);
+            let pool = pool_of(&mut gpu, plane, cells, &pages, &indptr, true);
+            let rows_t = Tensor::new(src, cells as u32, D as u32, Dtype::Bf16);
+            dsv4::append(&gpu.ctx(), rows_t, &pool, at_page, at_off).expect("the fp8 append fires");
+            gpu.sync();
+            let raw: Vec<u8> = gpu.down(plane, bytes);
+            let read = ds_read(&raw, cells);
+            for (i, (&got, &want)) in read.iter().zip(exact.iter()).enumerate() {
+                // A code is within half its step of the value: 1/16 of it,
+                // or half the subnormal step under the tile's scale.
+                let tile_max = exact[i / 64 * 64..i / 64 * 64 + 64]
+                    .iter()
+                    .fold(1e-4f32, |m, v| m.max(v.abs()));
+                let bound = if i % D >= dsv4::DS_NOPE as usize {
+                    0.0
+                } else {
+                    want.abs() / 16.0 + tile_max / 448.0 * 2.0 * 2f32.powi(-9)
+                };
+                assert!(
+                    (got - want).abs() <= bound + 1e-6,
+                    "cell {} dim {}: the fp8 row reads {got} for {want}",
+                    i / D,
+                    i % D
+                );
+            }
+            planes.push((pool, read));
+        }
+        let (e_pool, e_read) = planes.pop().expect("two planes");
+        let (w_pool, w_read) = planes.pop().expect("two planes");
+        (w_pool, e_pool, w_read, e_read)
+    } else {
+        (window_bf16, entries_bf16, wk, ek)
+    };
     let sinks: Vec<f32> = (0..HEADS).map(|h| (h as f32 * 0.37).sin() * 3.0).collect();
 
     let (ratio, top_k) = match pool {
@@ -152,20 +213,15 @@ fn check(rows: usize, pool: Pool, bench: bool) {
         }
     }
 
-    let mut gpu = Gpu::open();
     let q_t = Tensor::new(
         gpu.up(&q_bits),
         rows as u32,
         (HEADS * D) as u32,
         Dtype::Bf16,
     );
-    let wkeys = gpu.up(&w_bits);
-    let ekeys = gpu.up(&e_bits);
     let pos_t = Tensor::new(gpu.up(&positions), rows as u32, 1, Dtype::I32);
     let req_t = Tensor::new(gpu.up(&reqs), rows as u32, 1, Dtype::I32);
     let sink_t = Tensor::new(gpu.up(&sinks), HEADS as u32, 1, Dtype::F32);
-    let window_pool = pool_of(&mut gpu, wkeys, cells, &pages, &indptr);
-    let entries = pool_of(&mut gpu, ekeys, cells, &pages, &indptr);
     let sel_t = if sel.is_empty() {
         None
     } else {
@@ -209,20 +265,8 @@ fn check(rows: usize, pool: Pool, bench: bool) {
     };
     if bench {
         let fused = time(&gpu, flush, &fire);
-        let sink_only = time(&gpu, flush, &|| {
-            let mut po = Tensor::new(po_at, rows as u32, (HEADS * D) as u32, Dtype::Bf16);
-            let plse = Tensor::new(plse_at, rows as u32, HEADS as u32, Dtype::F32);
-            kernels_cuda::attn::sink(&gpu.ctx(), &mut po, plse, sink_t, D as u32).expect("sink");
-        });
-        println!("| sink | {rows} rows | {sink_only:.1} us |");
-        let five = time(&gpu, flush, &|| {
-            for _ in 0..5 {
-                fire();
-            }
-        });
-        println!("| dsv4 fused x5 | {rows} rows | ratio {ratio} | top_k {top_k} | {five:.1} us |");
         // The pool walk alone on the tensor cores, as the four launches run it.
-        let pool_only = if ratio > 0 {
+        let pool_only = if ratio > 0 && !fp8 {
             let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
                 pool_mma: true,
                 ..kernels_cuda::tuning::Tuning::DEFAULT
@@ -237,7 +281,7 @@ fn check(rows: usize, pool: Pool, bench: bool) {
                         pos_t,
                         req_t,
                         sel,
-                        &entries,
+                        &entries_bf16,
                         ratio as u32,
                         k,
                         HEADS as u32,
@@ -251,7 +295,7 @@ fn check(rows: usize, pool: Pool, bench: bool) {
                         q_t,
                         pos_t,
                         req_t,
-                        &entries,
+                        &entries_bf16,
                         ratio as u32,
                         HEADS as u32,
                         D as u32,
@@ -268,14 +312,16 @@ fn check(rows: usize, pool: Pool, bench: bool) {
         println!(
             "| pool_lse_mma | {rows} rows | ratio {ratio} | top_k {top_k} | {pool_only:.1} us |"
         );
-        println!("| dsv4 fused | {rows} rows | ratio {ratio} | top_k {top_k} | {fused:.1} us |");
+        println!(
+            "| dsv4 fused | {rows} rows | ratio {ratio} | top_k {top_k} | fp8 {fp8} | {fused:.1} us |"
+        );
         return;
     }
     fire();
     gpu.sync();
     let got: Vec<u16> = gpu.down(o_at, rows * HEADS * D);
 
-    let label = format!("{rows} rows, ratio {ratio}, top_k {top_k}");
+    let label = format!("{rows} rows, ratio {ratio}, top_k {top_k}, fp8 {fp8}");
     let mut worst = 0f32;
     let mut at = 0;
     for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
@@ -298,12 +344,14 @@ fn check(rows: usize, pool: Pool, bench: bool) {
 
 #[test]
 fn the_fused_dsv4_attention_lands_the_window_the_pool_and_the_sinks() {
-    check(8, Pool::Selected(4, 512), false);
-    check(8, Pool::Dense(128), false);
-    check(8, Pool::None, false);
-    check(24, Pool::Selected(4, 512), false);
-    check(40, Pool::Dense(4), false);
-    check(80, Pool::Selected(4, 64), false);
+    for fp8 in [false, true] {
+        check(1, Pool::Selected(4, 512), false, fp8);
+        check(8, Pool::Selected(4, 512), false, fp8);
+        check(8, Pool::Dense(128), false, fp8);
+        check(8, Pool::None, false, fp8);
+        check(16, Pool::Dense(4), false, fp8);
+        check(40, Pool::Selected(4, 64), false, fp8);
+    }
 }
 
 /// The fused launch's device time at DeepSeek-V4-Flash's decode widths.
@@ -311,10 +359,48 @@ fn the_fused_dsv4_attention_lands_the_window_the_pool_and_the_sinks() {
 #[ignore = "a timing report"]
 fn the_fused_dsv4_attention_reports_its_time() {
     for rows in [1, 8, 32, 64, 128] {
-        check(rows, Pool::Selected(4, 512), true);
-        check(rows, Pool::Dense(128), true);
-        check(rows, Pool::None, true);
+        for fp8 in [false, true] {
+            check(rows, Pool::Selected(4, 512), true, fp8);
+            check(rows, Pool::Dense(128), true, fp8);
+            check(rows, Pool::None, true, fp8);
+        }
     }
+}
+
+/// An e4m3 code's value.
+fn e4m3(code: u8) -> f32 {
+    let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from((code >> 3) & 0xf);
+    let man = f32::from(code & 7);
+    sign * if exp == 0 {
+        man / 8.0 * 2f32.powi(-6)
+    } else {
+        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
+    }
+}
+
+/// What DeepSeek's fp8 rows say, page by page: every cell's 512 values.
+fn ds_read(raw: &[u8], cells: usize) -> Vec<f32> {
+    let row = dsv4::DS_ROW as usize;
+    let data = dsv4::DS_DATA as usize;
+    let nope = dsv4::DS_NOPE as usize;
+    let mut out = vec![0f32; cells * D];
+    for cell in 0..cells {
+        let page = cell / PAGE * PAGE * row;
+        let off = cell % PAGE;
+        let bytes = &raw[page + off * data..page + (off + 1) * data];
+        let scales = &raw[page + PAGE * data + off * 8..page + PAGE * data + off * 8 + 8];
+        assert_eq!(scales[7], 0, "cell {cell}: the scale row's pad");
+        for d in 0..D {
+            out[cell * D + d] = if d < nope {
+                e4m3(bytes[d]) * 2f32.powi(i32::from(scales[d / 64]) - 127)
+            } else {
+                let at = nope + (d - nope) * 2;
+                from_bf16(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
+            };
+        }
+    }
+    out
 }
 
 const FLUSH: usize = 256 << 20;
