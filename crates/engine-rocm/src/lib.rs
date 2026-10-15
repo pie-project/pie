@@ -33,7 +33,7 @@ pub const EXCLUSIVE: [&str; 0] = [];
 pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 
 /// The fused kernels this backend ships; the compiler forms only these.
-pub const FUSED: [&str; 15] = [
+pub const FUSED: [&str; 16] = [
     "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
     "elementwise.rmsnorm_residual_add",
     "elementwise.embed_scale_add_select",
@@ -43,6 +43,7 @@ pub const FUSED: [&str; 15] = [
     "linear.lm_head_softcap",
     "linear.matmul_bias",
     "linear.mlp_swiglu",
+    "linear.moe_experts",
     "elementwise.gated_residual_norm_modulate",
     "elementwise.norm_modulate",
     "elementwise.rmsnorm_rope_partial_q",

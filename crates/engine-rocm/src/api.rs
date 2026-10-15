@@ -265,7 +265,7 @@ pub(crate) fn default_lattice(max_tokens: u32, steps: u32) -> Vec<u32> {
     let steps = steps.max(1);
     let fine_from = prefill_lattice_from();
     let mut lattice: Vec<u32> = Vec::new();
-    let mut push = |point: f64, lattice: &mut Vec<u32>| -> bool {
+    let push = |point: f64, lattice: &mut Vec<u32>| -> bool {
         if point >= f64::from(max_tokens) {
             return false;
         }

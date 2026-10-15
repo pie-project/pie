@@ -46,6 +46,79 @@ impl DispatchFused for Run<'_> {
 }
 
 impl Run<'_> {
+    /// A routed swiglu MLP over dense bf16 banks (selects through the plain
+    /// banks, a swiglu or its clamp, the weighted sum) as one
+    /// `linear::moe::mlp_swiglu`, which keeps the routes in expert order
+    /// across both matmuls where that measured faster. Whether it took the
+    /// legs; the caller runs them otherwise.
+    fn moe_experts_ordered(
+        &mut self,
+        select: &poem_ir::Linear,
+        glu: &poem_ir::Linear,
+        down: &poem_ir::Linear,
+        sum: &poem_ir::Linear,
+    ) -> Result<bool, kernels_rocm::Error> {
+        use poem_ir::Linear;
+        let (
+            Linear::MoeMatmulSelect {
+                x,
+                bank: gate_up,
+                routes,
+                y: packed,
+            },
+            Linear::MoeMatmulSelect {
+                x: h,
+                bank: down_bank,
+                routes: down_routes,
+                y: routed,
+            },
+            Linear::MoeWeightedSum {
+                routed: summed,
+                weights,
+                y,
+            },
+        ) = (select, down, sum)
+        else {
+            return Ok(false);
+        };
+        let (intermediate, limit, glu_in, glu_out) = match glu {
+            Linear::MlpSwiglu {
+                packed,
+                intermediate,
+                y,
+            } => (*intermediate, None, *packed, *y),
+            Linear::MlpSwigluClamp {
+                packed,
+                intermediate,
+                limit,
+                y,
+            } => (*intermediate, Some(*limit), *packed, *y),
+            _ => return Ok(false),
+        };
+        if routes != down_routes || glu_in != *packed || glu_out != *h || summed != routed {
+            return Ok(false);
+        }
+        let (gate_up, gate_up_experts) = self.expert_bank(*gate_up);
+        let (down, down_experts) = self.expert_bank(*down_bank);
+        let p = kernels_rocm::linear::moe::RoutedMlp {
+            x: self.tensor(*x),
+            routes: self.tensor(*routes),
+            weights: self.tensor(*weights),
+            gate_up,
+            gate_up_experts,
+            down,
+            down_experts,
+            intermediate,
+            limit,
+            fan: self.plane_fan(self.tensor(*h).rows),
+            packed: self.tensor(*packed),
+            h: self.tensor(*h),
+            routed: self.tensor(*routed),
+        };
+        kernels_rocm::linear::moe::mlp_swiglu(self.ctx(), &p, &mut self.tensor(*y))?;
+        Ok(true)
+    }
+
     /// A fused op as the primitives it replaced, each over the values the
     /// fused op keeps.
     fn primitives(&mut self, op: &Fused) -> Result<(), KernelError> {
@@ -113,8 +186,13 @@ impl Run<'_> {
                 sum,
                 gate_add,
             } => {
-                for leg in [select, glu, down, sum] {
-                    DispatchLinear::dispatch(self, leg)?;
+                if !self
+                    .moe_experts_ordered(select, glu, down, sum)
+                    .map_err(crate::error::kernel)?
+                {
+                    for leg in [select, glu, down, sum] {
+                        DispatchLinear::dispatch(self, leg)?;
+                    }
                 }
                 match gate_add {
                     Some(gate_add) => DispatchLinear::dispatch(self, gate_add),
