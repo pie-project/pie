@@ -16,7 +16,9 @@ use core::ffi::c_void;
 use crate::common::Gpu;
 use kernels_cuda::cudarc::cublaslt::sys as lt;
 use kernels_cuda::cudarc::runtime::sys as rt;
-use kernels_cuda::linear::tc5::{Elem, Operand, atom_bytes, gemm, supported};
+use kernels_cuda::linear::tc5::{
+    Elem, Epilogue, Glu, Operand, Plan, atom_bytes, gemm, gemm_epi, gemm_epi_with, supported,
+};
 
 pub(crate) const FLUSH: usize = 512 << 20;
 const ROUNDS: usize = 7;
@@ -468,7 +470,9 @@ fn the_tcgen05_gemm_reports_its_rate_beside_cublaslt() {
 /// bounds printed (`PHASE name m n k start_ms end_ms launches TFLOPS`, Unix
 /// milliseconds) for a power sampler running beside it to cut at. Shapes
 /// default to Gemma-4-31B's prefill GEMMs over a 16384-row fire;
-/// `PIE_POWER_SHAPES=m,n,k;m,n,k` names others.
+/// `PIE_POWER_SHAPES=m,n,k;m,n,k` names others, `PIE_POWER_PLAN=pair,bn,stages`
+/// states tc5's plan, and `PIE_POWER_GLU=1` runs tc5 with the GEGLU epilogue
+/// (half of `n` landing), as a dense gate-up projection does.
 #[test]
 #[ignore = "a measurement: run alone, on an idle GPU, beside a power sampler"]
 fn the_bf16_gemm_reports_its_power_beside_cublaslt() {
@@ -509,20 +513,41 @@ fn the_bf16_gemm_reports_its_power_beside_cublaslt() {
         let a = gpu.up(&noise(m * k * 2, 0xbf, 0x00, 7));
         let y = gpu.zeros(m * n * 2);
         let shape = [m as u32, n as u32, k as u32];
-        let plan = unsafe { Lt::plan(LtKind::Bf16, [m, n, k], 0, 0, ws, ws_bytes) }
+        let lt_plan = unsafe { Lt::plan(LtKind::Bf16, [m, n, k], 0, 0, ws, ws_bytes) }
             .expect("cuBLASLt plans the shape");
+        let glu = std::env::var("PIE_POWER_GLU").is_ok_and(|v| v == "1");
+        let plan = std::env::var("PIE_POWER_PLAN").ok().map(|v| {
+            let d: Vec<u32> = v.split(',').filter_map(|d| d.trim().parse().ok()).collect();
+            Plan {
+                swap: false,
+                pair: d[0] == 1,
+                bn: d[1],
+                stages: d[2],
+                splits: 0,
+            }
+        });
         let mut tc5 = || {
-            gemm(
-                &ctx,
-                Operand::plain(a, Elem::Bf16),
-                Operand::plain(w, Elem::Bf16),
-                y,
-                shape,
-                1.0,
-            )
+            let epi = if glu {
+                Epilogue {
+                    glu: Some(Glu::GegluTanh),
+                    ..Epilogue::STORE
+                }
+            } else {
+                Epilogue::STORE
+            };
+            let out = if glu {
+                [shape[0], shape[1] / 2, shape[2]]
+            } else {
+                shape
+            };
+            let (act, wt) = (Operand::plain(a, Elem::Bf16), Operand::plain(w, Elem::Bf16));
+            match plan {
+                Some(plan) => gemm_epi_with(&ctx, act, wt, y, out, 1.0, epi, plan),
+                None => gemm_epi(&ctx, act, wt, y, out, 1.0, epi),
+            }
             .expect("the tc5 GEMM fires");
         };
-        let mut lt = || plan.run(w, a, y, stream);
+        let mut lt = || lt_plan.run(w, a, y, stream);
         for (name, launch) in [
             ("cublaslt", &mut lt as &mut dyn FnMut()),
             ("tc5", &mut tc5 as &mut dyn FnMut()),
