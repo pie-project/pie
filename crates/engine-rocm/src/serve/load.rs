@@ -22,6 +22,9 @@ use super::{Boot, FireCost, Golden, Graphs, Shell};
 /// prefill chunk a frame, which serves, and under it the halving stops.
 const TOKENS_FLOOR: u32 = 1024;
 
+/// The recurrent-state slots a load holds when the config states none.
+const DEFAULT_STATE_SLOTS: u32 = 256;
+
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     super::diag::publish(&boot.knobs.diagnostics);
     // SAFETY: the boot's communicator is held by the engine for the life of
@@ -46,6 +49,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let engine = crate::chip::Engine::of(&chip);
     if boot.budget.max_tokens == 0 {
         boot.budget.max_tokens = crate::api::DEFAULT_FORWARD_TOKENS;
+    }
+    if boot.slots == 0 {
+        boot.slots = DEFAULT_STATE_SLOTS;
     }
 
     kernels_rocm::disk::install(boot.cache_dir);

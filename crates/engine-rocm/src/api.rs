@@ -342,7 +342,13 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
 
     let max_patches = budgets
         .max_patches
-        .unwrap_or_else(|| budgets.max_tokens.min(DERIVED_PATCH_CEILING))
+        .unwrap_or_else(|| {
+            let tokens = match budgets.max_tokens {
+                0 => DEFAULT_FORWARD_TOKENS,
+                tokens => tokens,
+            };
+            tokens.min(DERIVED_PATCH_CEILING)
+        })
         .max(PATCH_LATTICE_FLOOR);
     let mut buckets = Vec::new();
     let mut rung = PATCH_LATTICE_FLOOR;
@@ -602,6 +608,7 @@ impl Engine for Cuda {
                 host_window_pages: shell.host_window_pages(),
                 host_state_slots: shell.host_state_slots(),
                 disk_kv_pages,
+                one_frame_when_short: false,
             },
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
