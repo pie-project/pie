@@ -618,8 +618,16 @@ def fixed_prompt_ids(rng: random.Random, vocab: int, batch: int, input_len: int)
 def tokenizer_vocab_size(snapshot: str) -> int:
     """The base vocabulary of a checkpoint's `tokenizer.json` (added tokens
     left out), which is what a Hugging Face tokenizer reports as
-    `vocab_size` and what the vLLM baseline draws prompt ids under."""
-    with open(Path(snapshot) / "tokenizer.json", encoding="utf-8") as f:
+    `vocab_size` and what the vLLM baseline draws prompt ids under. A
+    tiktoken checkpoint (Kimi's) has no `tokenizer.json`; its tokenizer
+    reports its ranks and reserved specials together, the configuration's
+    `vocab_size`."""
+    path = Path(snapshot)
+    if not (path / "tokenizer.json").exists() and (path / "tiktoken.model").exists():
+        with open(path / "config.json", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return int(cfg.get("text_config", cfg)["vocab_size"])
+    with open(path / "tokenizer.json", encoding="utf-8") as f:
         return len(json.load(f)["model"]["vocab"])
 
 
