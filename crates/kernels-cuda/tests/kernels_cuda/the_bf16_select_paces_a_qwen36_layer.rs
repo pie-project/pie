@@ -66,7 +66,12 @@ fn the_bf16_select_paces_a_qwen36_layer() {
             .collect();
         let routes_at: Vec<u64> = routings.iter().map(|r| gpu.up(r)).collect();
         let routes_t = |i: usize| {
-            Tensor::new(routes_at[i % ROUTINGS], tokens as u32, TOP as u32, Dtype::I32)
+            Tensor::new(
+                routes_at[i % ROUTINGS],
+                tokens as u32,
+                TOP as u32,
+                Dtype::I32,
+            )
         };
         let x = Tensor::new(
             gpu.zeros(tokens * HIDDEN * 2),
