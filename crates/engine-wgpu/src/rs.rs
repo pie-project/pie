@@ -6,6 +6,7 @@ use engine::fire::{FoldLen, RsVerb};
 use kernels_wgpu::Tensor;
 use poem_ir::{Attention, Def, Dim, Dtype, Operation, Trace, Ty, ValueId};
 
+use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
 use crate::store::kv::Paging;
@@ -268,6 +269,9 @@ impl Layout {
 #[derive(Debug)]
 pub struct Buffers {
     slab: Buffer,
+    /// One page: a copy between two of the slab's pages goes through it,
+    /// since a buffer copy may not name one buffer as both ends.
+    stage: Buffer,
     page_tokens: u32,
     slots: u32,
     page_bytes: u64,
@@ -284,11 +288,13 @@ impl Buffers {
             plane_at.push(at);
             at += u64::from(page_tokens) * plane.row_bytes;
         }
+        let page_bytes = at.next_multiple_of(256);
         Ok(Buffers {
             slab: Buffer::zeroed(device, Buffers::bytes_at(layout, paging))?,
+            stage: Buffer::zeroed(device, page_bytes.max(256))?,
             page_tokens,
             slots: paging.slots.max(1),
-            page_bytes: at.next_multiple_of(256),
+            page_bytes,
             plane_at,
         })
     }
@@ -305,6 +311,32 @@ impl Buffers {
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.slab.bytes()
+    }
+
+    /// Copies each `(src, dst)` slot's buffered page: a recurrent slot is
+    /// its state and its buffer page, and a copy that left the rows behind
+    /// would hand the next fold whatever `dst` last held.
+    pub fn copy_pages(&self, frame: &mut Frame, moves: &[(u32, u32)]) -> Result<()> {
+        for &(src, dst) in moves {
+            if src == dst {
+                continue;
+            }
+            let need = src.max(dst) + 1;
+            if need > self.slots {
+                return Err(Fault::Ceiling {
+                    what: "recurrent buffer page slots",
+                    need: u64::from(need),
+                    have: u64::from(self.slots),
+                });
+            }
+            let (from, to) = (
+                u64::from(src) * self.page_bytes,
+                u64::from(dst) * self.page_bytes,
+            );
+            frame.copy(&self.slab, from, &self.stage, 0, self.page_bytes)?;
+            frame.copy(&self.stage, 0, &self.slab, to, self.page_bytes)?;
+        }
+        Ok(())
     }
 
     #[must_use]

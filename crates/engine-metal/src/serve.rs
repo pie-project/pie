@@ -1112,6 +1112,9 @@ impl Shell {
         }
         let mut frame = self.device.frame()?;
         self.pools.copy_state(&mut frame, moves)?;
+        if let Some(buffers) = &self.rs_buffers {
+            buffers.copy_pages(&mut frame, moves)?;
+        }
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
     }

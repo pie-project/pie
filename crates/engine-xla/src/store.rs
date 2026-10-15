@@ -601,12 +601,20 @@ impl Pools {
         self.check_slot(src)?;
         self.check_slot(dst)?;
         let tracer = Tracer::new(handles);
-        let rows: Vec<Tensor> = self.state_rows().map(|r| r.1).collect();
-        for &t in &rows {
+        // A recurrent slot is its state row and its buffered page (rows
+        // `slot * page ..` of each buffer plane): a copy that left the page
+        // behind would hand the next fold whatever `dst` last held.
+        let page = i64::from(self.paging.page_size.max(1));
+        let rows = self
+            .state_rows()
+            .map(|r| (r.1, 1))
+            .chain(self.rs_buffers.iter().map(|&t| (t, page)));
+        for (t, span) in rows.collect::<Vec<_>>() {
             tracer.emit(&mut |cx| {
                 let whole = cx.read(t)?;
-                let row = cx.slice_axis(whole, 0, i64::from(src), i64::from(src) + 1)?;
-                let at = cx.const_i(Elem::I32, i64::from(dst), &[]);
+                let from = i64::from(src) * span;
+                let row = cx.slice_axis(whole, 0, from, from + span)?;
+                let at = cx.const_i(Elem::I32, i64::from(dst) * span, &[]);
                 let col = cx.const_i(Elem::I32, 0, &[]);
                 let next = cx.dynamic_update_slice(whole, row, &[at, col])?;
                 cx.write(t, next)

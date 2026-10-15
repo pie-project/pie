@@ -50,11 +50,32 @@ async def test_forked_decode_onto_fresh_pages_is_batch_invariant(client, args):
     assert len(got) == 1, f"{len(got)} distinct outputs even with page-aligned forks:\n" + "\n".join(got)
 
 
+BUFFERED = "rs-fork-buffered-probe-py"
+
+
+async def test_a_fork_with_rows_buffered_leaves_both_sides_as_they_were(client, args):
+    """A hybrid model's fork while rows sit unfolded in the recurrent buffer
+    (#860): the parent kept beside a live fork, and the fork itself, decode
+    what the unforked sequence does. Positions 40 and 63 put the next row on
+    the shared buffer page, the copy-on-write that once lost the rows."""
+    if (await run_inferlet(client, BUFFERED, {"at": 0, "tail": 1}, timeout=args.timeout)) == "not hybrid":
+        return
+    for at in (40, 63):
+        runs = {
+            variant: (await run_inferlet(client, BUFFERED, {"variant": variant, "at": at, "tail": 32}, timeout=args.timeout)).strip()
+            for variant in ("none", "fork", "child")
+        }
+        assert runs["fork"] == runs["none"] == runs["child"], f"fork at {at} with a row buffered diverges:\n" + "\n".join(
+            f"{variant}: {out}" for variant, out in runs.items()
+        )
+
+
 def tests():
     return [
         test_unforked_greedy_decode_is_batch_invariant,
         test_forked_greedy_decode_is_batch_invariant,
         test_forked_decode_onto_fresh_pages_is_batch_invariant,
+        test_a_fork_with_rows_buffered_leaves_both_sides_as_they_were,
     ]
 
 

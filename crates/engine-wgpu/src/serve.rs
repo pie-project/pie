@@ -892,6 +892,9 @@ impl Shell {
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
         let mut frame = self.device.frame()?;
         self.pools.copy_slot(&mut frame, src, dst)?;
+        if let Some(buffers) = &self.rs_buffers {
+            buffers.copy_pages(&mut frame, &[(src, dst)])?;
+        }
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
     }

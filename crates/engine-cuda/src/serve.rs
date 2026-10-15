@@ -110,8 +110,21 @@ pub struct Shell {
 }
 
 impl Shell {
+    /// Copies slot `src` to `dst`: its state rows and, as `copy_state_host`
+    /// moves them, its buffered page. A copy that left the page behind would
+    /// hand the next fold whatever `dst` last held.
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
-        self.pools.copy_slot(self.device.stream(), src, dst)?;
+        let stream = self.device.stream();
+        self.pools.copy_slot(stream, src, dst)?;
+        if src != dst
+            && let Some(buffers) = self.buffers.as_mut()
+            && let Some((from, bytes)) = buffers.page_span(src)
+        {
+            buffers.ensure(&mut self.pools, dst + 1)?;
+            if let Some((to, _)) = buffers.page_span(dst) {
+                crate::device::copy_any(stream, to, from, bytes as usize)?;
+            }
+        }
         self.device.synchronize()
     }
 
