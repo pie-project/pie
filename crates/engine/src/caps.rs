@@ -74,6 +74,12 @@ pub struct PoolFacts {
     /// configured depth whatever the slots seat.
     #[serde(default)]
     pub one_frame_when_short: bool,
+    /// The engine would rather a lane already decoding claim its next pages
+    /// before a prompt waiting to be seated does, and a prompt wait for a
+    /// lane to finish rather than suspend one. False keeps the runtime's
+    /// order of arrival, a waiting prompt older than a lane preempting it.
+    #[serde(default)]
+    pub seated_first: bool,
 }
 
 impl PoolFacts {

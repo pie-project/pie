@@ -571,6 +571,7 @@ impl Engine for Cuda {
                 host_state_slots: shell.host_state_slots(),
                 disk_kv_pages,
                 one_frame_when_short: shell.one_frame_when_short(),
+                seated_first: shell.seated_first(),
             },
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,

@@ -134,6 +134,9 @@ pub struct EngineConfig {
     /// The engine asks for one frame a lane when its slots seat fewer lanes
     /// than it batches (`PoolFacts::one_frame_when_short`).
     pub one_frame_when_short: bool,
+    /// The engine asks the planner to serve a decoding lane's pages before a
+    /// prompt waiting to be seated (`PoolFacts::seated_first`).
+    pub seated_first: bool,
     pub rs_cache_slot_bytes: u64,
     pub rs_host_slots: usize,
     pub has_mtp_logits: bool,
@@ -390,6 +393,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let kv_swap_capable = engine_configs
         .first()
         .is_some_and(|d| d.cpu_pages > 0 || d.disk_pages > 0);
+    let seated_first = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seated_first);
     let engine_count = engine_configs.len();
     let engines: Vec<usize> = engine_configs
         .into_iter()
@@ -421,7 +425,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         0,
         crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
             crate::planner::RegistryPool::new(arena_model_idx, 0, kv_swap_capable),
-        )),
+        ))
+        .seated_first(seated_first),
     );
     if let Some(period) = std::env::var("PIE_CONTENTION_TRACE_MS")
         .ok()

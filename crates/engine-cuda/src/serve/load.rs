@@ -848,6 +848,7 @@ impl Shell {
             graphs: engine.graphs,
             copies: engine.copies,
             one_frame_when_short: engine.one_frame_when_short,
+            seated_first: engine.seated_first,
             pad: engine.recording.pad(),
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),

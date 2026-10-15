@@ -51,9 +51,19 @@ sdpa.selected_mma = true
 # 5.4 -> 5.8 s), while the gather adds 43 ms to a 32x4096 prefill (26.4k ->
 # 26.1k tok/s); decode bs1 9.02 -> 8.98 ms, bs8 15.91 -> 15.72, bs64 35.5 ->
 # 37.2 (37.1 -> 37.6 in a second pair).
+#
+# A lane already decoding claims its next pages before a prompt waiting to be
+# seated, and a prompt waits for a lane to finish rather than suspending one:
+# 256 requests of 1024 in / 256 out offered at once seat in no order of
+# arrival, and the planner's order had an older prompt suspend a younger lane
+# mid-decode and every decode's page boundary park behind the prompts,
+# leaving the frame for the next (Gemma-4-31B: 6,100 one-fire frames a run,
+# 70 of 93 lanes a wave). Gemma-4-31B serves 1533 -> 1744 output tok/s,
+# TPOT p50 56.4 -> 41.5 ms.
 [engine]
 host_planes = true
 one_frame_when_short = true
+seated_first = true
 state_slots_per_lane = 2
 forward_tokens = 16384
 # A gated delta model's fire at most floor(148 / value heads) lanes of 4096
@@ -94,6 +104,7 @@ measured = [
   "engine.host_planes",
   "engine.lattice_steps",
   "engine.one_frame_when_short",
+  "engine.seated_first",
   "engine.recording",
   "engine.state_slots_per_lane",
   "engine.walk_fire_rows",

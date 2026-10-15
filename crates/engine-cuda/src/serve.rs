@@ -92,6 +92,8 @@ pub struct Shell {
     copies: bool,
     /// `engine.one_frame_when_short`.
     one_frame_when_short: bool,
+    /// `engine.seated_first`.
+    seated_first: bool,
     pad: bool,
     bodies: bool,
     bodies_mem: usize,
@@ -122,6 +124,13 @@ impl Shell {
     #[must_use]
     pub fn one_frame_when_short(&self) -> bool {
         self.one_frame_when_short
+    }
+
+    /// Whether this load asks the planner to serve a decoding lane's pages
+    /// before a prompt waiting to be seated (`engine.seated_first`).
+    #[must_use]
+    pub fn seated_first(&self) -> bool {
+        self.seated_first
     }
 
     /// Host rs slots, one per device slot so every slot can be parked once.

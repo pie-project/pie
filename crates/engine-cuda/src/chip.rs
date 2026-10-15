@@ -85,6 +85,14 @@ pub struct StateSlotsPerLane(pub u32);
 #[decision(id = "engine.one_frame_when_short", flag, default = false, tune = engine)]
 pub struct OneFrameWhenShort;
 
+/// Whether a lane already decoding claims its next pages before a prompt
+/// waiting to be seated, and a prompt waits for a lane to finish rather than
+/// suspending one (the runtime's planner, `PoolFacts::seated_first`). Off
+/// keeps the order of arrival, an older prompt preempting a younger lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.seated_first", flag, default = false, tune = engine)]
+pub struct SeatedFirst;
+
 /// The rows one fire takes when `[engine] max_forward_tokens` is not
 /// stated; 0 keeps the fixed 8192. Wider fires batch more prompts' chunks
 /// into one pass of the weights, and their activation arena grows with them.
@@ -119,6 +127,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<LatticeSteps>()
         .add::<StateSlotsPerLane>()
         .add::<OneFrameWhenShort>()
+        .add::<SeatedFirst>()
         .add::<ForwardTokens>()
         .add::<WalkFireRows>()
         .add::<HostPlanes>();
@@ -179,6 +188,7 @@ pub struct Engine {
     pub lattice_steps: u32,
     pub state_slots_per_lane: u32,
     pub one_frame_when_short: bool,
+    pub seated_first: bool,
     pub forward_tokens: u32,
     pub walk_fire_rows: u32,
     pub host_planes: bool,
@@ -206,6 +216,7 @@ impl Engine {
             lattice_steps: profile.get::<LatticeSteps>().0,
             state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
             one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
+            seated_first: profile.on::<SeatedFirst>(&Anywhere),
             forward_tokens: profile.get::<ForwardTokens>().0,
             walk_fire_rows: profile.get::<WalkFireRows>().0,
             host_planes: profile.on::<HostPlanes>(&Anywhere),
@@ -510,6 +521,7 @@ mod tests {
                 lattice_steps: 1,
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
+                seated_first: false,
                 forward_tokens: 0,
                 walk_fire_rows: 0,
                 host_planes: false,
@@ -561,6 +573,7 @@ mod tests {
         );
         assert_eq!(Engine::of(&b200).state_slots_per_lane, 2);
         assert!(Engine::of(&b200).one_frame_when_short);
+        assert!(Engine::of(&b200).seated_first);
         assert_eq!(Engine::of(&b200).forward_tokens, 16384);
         assert_eq!(Engine::of(&b200).walk_fire_rows, 4096);
         assert!(Engine::of(&b200).host_planes);
@@ -568,17 +581,19 @@ mod tests {
             Engine {
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
+                seated_first: false,
                 forward_tokens: 0,
                 walk_fire_rows: 0,
                 host_planes: false,
                 ..Engine::of(&b200)
             },
             Engine::of(&family),
-            "only the state seating, the fire width and the host planes differ from the \
-             family's engine"
+            "only the state seating, the planner's order, the fire width and the host \
+             planes differ from the family's engine"
         );
         assert_eq!(Engine::of(&family).state_slots_per_lane, 0);
         assert!(!Engine::of(&family).one_frame_when_short);
+        assert!(!Engine::of(&family).seated_first);
         assert!(!Engine::of(&family).host_planes);
     }
 

@@ -36,6 +36,16 @@ macro_rules! ptrace {
 
 pub type ProcessId = uuid::Uuid;
 
+/// The window-ring pages a seated lane past its window holds beyond its
+/// prompt's: the straddled page and the one its next boundary takes before
+/// the oldest is let go.
+const RING_GROWTH: u32 = 2;
+
+/// The most of the ring the seated lanes' growth holds back from a prompt
+/// waiting to be seated: a thirty-second, as a small pool seats few lanes
+/// and serves their growth from what the others let go.
+const RESERVE_SHARE: u32 = 32;
+
 pub trait PoolPort: Send + Sync + 'static {
     fn device_stats(&self) -> (u32, u32);
     fn host_stats(&self) -> (u32, u32);
@@ -48,6 +58,12 @@ pub trait PoolPort: Send + Sync + 'static {
     fn reclaimable_idle(&self) -> u32;
     fn suspend_capable(&self) -> bool;
     fn locus(&self) -> (usize, usize);
+    /// The rs slots a seated lane may still claim as it decodes: a window
+    /// ring's page boundary takes one before the page behind the window is
+    /// let go. Fixed state slots never grow.
+    fn rs_growth(&self) -> u32 {
+        0
+    }
     fn reserve_device(
         &self,
         count: u32,
@@ -116,6 +132,14 @@ impl PoolPort for RegistryPool {
 
     fn rs_stats(&self) -> (u32, u32) {
         self.with_rs(|rs| (rs.available_slots() as u32, rs.capacity_slots()))
+    }
+
+    fn rs_growth(&self) -> u32 {
+        if self.with_rs(|rs| rs.is_ring()) {
+            RING_GROWTH
+        } else {
+            0
+        }
     }
 
     fn rs_host_stats(&self) -> (u32, u32) {
@@ -483,6 +507,8 @@ struct Proc {
     idle: bool,
     /// What an idle eviction freed; it asks for it back only once it wakes.
     parked: Option<Demand>,
+    /// It has been granted pages: a seated lane whose next claim is growth.
+    seated: bool,
 }
 
 impl Proc {
@@ -498,6 +524,7 @@ impl Proc {
             resident: Arc::new(AtomicBool::new(true)),
             idle: false,
             parked: None,
+            seated: false,
         }
     }
 }
@@ -653,6 +680,56 @@ impl Inner {
         }
     }
 
+    /// What an unseated claim on `need` rs slots leaves free for the seated
+    /// lanes to grow into: `growth` slots each. A prompt is seated only on
+    /// what the lanes already decoding will not need, so seating it never
+    /// leaves one of them short at its next window page.
+    fn seating_reserve(&self, pid: ProcessId, growth: u32, need: u32, capacity: u32) -> u32 {
+        if need == 0
+            || growth == 0
+            || self.procs.get(&pid).is_none_or(|proc| proc.seated)
+            || self.fleet_stalled()
+        {
+            return 0;
+        }
+        let seated = self
+            .procs
+            .values()
+            .filter(|proc| proc.seated && !proc.idle && proc.state == Residency::Resident)
+            .count();
+        growth
+            .saturating_mul(u32::try_from(seated).unwrap_or(u32::MAX))
+            .min(capacity / RESERVE_SHARE)
+    }
+
+    /// A seated lane's growth takes free pages at once rather than parking
+    /// behind claims the queue would not serve before it: an older waiter
+    /// that holds nothing yet (a prompt waiting to be seated) is not one, an
+    /// older seated waiter or an older preempted process is. A decode's page
+    /// boundary would otherwise park, leaving the frame wait set, behind a
+    /// burst of prompts waiting for a window ring.
+    fn growth_first(&self, pid: ProcessId) -> bool {
+        let Some(proc) = self.procs.get(&pid) else {
+            return false;
+        };
+        let seq = proc.seq;
+        proc.state == Residency::Resident
+            && !proc.respawn
+            && !self.killing.contains(&pid)
+            && self.queue.iter().all(|(&(waiter_seq, _), waiter)| {
+                waiter.pid != pid
+                    && (waiter_seq > seq
+                        || !waiter.is_unmet()
+                        || self.procs.get(&waiter.pid).is_some_and(|w| !w.seated))
+            })
+            && self.procs.iter().all(|(other, proc)| {
+                proc.seq > seq
+                    || (proc.state == Residency::Resident
+                        && !proc.respawn
+                        && !self.killing.contains(other))
+            })
+    }
+
     fn unmet_head(&self) -> Option<(EntryKey, &Waiter)> {
         let mut oldest_restore: Option<EntryKey> = None;
         let mut allocation: Option<EntryKey> = None;
@@ -793,6 +870,9 @@ pub struct ResidencyPlanner {
     idle_reclaim_exhausted: std::sync::atomic::AtomicBool,
     port: Arc<dyn PoolPort>,
     stats: PlannerStats,
+    /// `PoolFacts::seated_first`: a seated lane's growth before a prompt
+    /// waiting to be seated, which waits for a lane to finish.
+    seated_first: bool,
 }
 
 struct WaitRegistration<'a> {
@@ -896,6 +976,28 @@ impl ResidencyPlanner {
             idle_reclaim_exhausted: std::sync::atomic::AtomicBool::new(false),
             port,
             stats: PlannerStats::default(),
+            seated_first: false,
+        }
+    }
+
+    /// The planner serving a seated lane's growth before a prompt waiting to
+    /// be seated, as the engine's profile asks (`PoolFacts::seated_first`):
+    /// the growth takes free pages without parking behind it, the prompt is
+    /// seated only on what leaves the window rings' growth room
+    /// (`PoolPort::rs_growth`), and it suspends no lane but an idle one.
+    #[must_use]
+    pub fn seated_first(mut self, on: bool) -> Self {
+        self.seated_first = on;
+        self
+    }
+
+    /// The rs slots a seated lane may still claim, when the planner keeps
+    /// them for it.
+    fn rs_growth(&self) -> u32 {
+        if self.seated_first {
+            self.port.rs_growth()
+        } else {
+            0
         }
     }
 
@@ -1162,10 +1264,42 @@ impl ResidencyPlanner {
         }
         let uncontended = self.waiters.load(Ordering::Acquire) == 0
             && self.nonresident.load(Ordering::Acquire) == 0;
-        if !uncontended {
-            self.note_progress(pid);
+        if !self.seated_first {
+            if !uncontended {
+                self.note_progress(pid);
+            }
+            if uncontended && let Some(grant) = self.try_reserve(demand) {
+                return Some(grant);
+            }
+            return None;
         }
-        if uncontended && let Some(grant) = self.try_reserve(demand) {
+        if uncontended {
+            if demand.rs_slots > 0 {
+                let (rs_free, rs_total) = self.port.rs_stats();
+                let reserve = self.lock_inner().seating_reserve(
+                    pid,
+                    self.rs_growth(),
+                    demand.rs_slots,
+                    rs_total,
+                );
+                if demand.rs_slots.saturating_add(reserve) > rs_free {
+                    return None;
+                }
+            }
+            let grant = self.try_reserve(demand)?;
+            if let Some(proc) = self.lock_inner().procs.get_mut(&pid) {
+                proc.seated = true;
+            }
+            return Some(grant);
+        }
+        let first = {
+            let mut inner = self.lock_inner();
+            inner.procs.get_mut(&pid).is_some_and(|proc| {
+                proc.progressed = true;
+                proc.seated
+            }) && inner.growth_first(pid)
+        };
+        if first && let Some(grant) = self.try_reserve(demand) {
             return Some(grant);
         }
         None
@@ -1415,7 +1549,14 @@ impl ResidencyPlanner {
             };
             match outcome.take() {
                 Some(outcome) => {
+                    let pid = waiter.pid;
                     inner.queue.remove(&key);
+                    if self.seated_first
+                        && outcome.is_ok()
+                        && let Some(proc) = inner.procs.get_mut(&pid)
+                    {
+                        proc.seated = true;
+                    }
                     Collect::Ready(outcome)
                 }
                 None if *yielded => {
@@ -1480,7 +1621,8 @@ impl ResidencyPlanner {
 
     pub fn plan(self: &Arc<Self>) {
         loop {
-            let (rs_free, _) = self.port.rs_stats();
+            let (rs_free, rs_total) = self.port.rs_stats();
+            let rs_growth = self.rs_growth();
             let step = self.with_inner(|inner| {
                 let Some((key, waiter)) = inner.unmet_head() else {
                     if inner.accum.len() > 0 && inner.queue.is_empty() {
@@ -1504,7 +1646,10 @@ impl ResidencyPlanner {
                 }
                 // rs slots are taken whole when the head is served; a short
                 // pool is funded as paged pages are, by suspending holders.
-                if waiter.rs_need() > rs_free {
+                let need = waiter.rs_need();
+                if need.saturating_add(inner.seating_reserve(pid, rs_growth, need, rs_total))
+                    > rs_free
+                {
                     return Step::ShortRs {
                         fund_by_eviction: !is_restore || inner.fleet_stalled(),
                     };
@@ -1848,7 +1993,8 @@ impl ResidencyPlanner {
 
     fn victim_set(&self) -> Option<VictimSet> {
         let (free, _) = self.port.device_stats();
-        let (rs_free, _) = self.port.rs_stats();
+        let (rs_free, rs_total) = self.port.rs_stats();
+        let rs_growth = self.rs_growth();
         self.with_inner(|inner| {
             let (head, waiter) = inner.unmet_head()?;
             let queued_quantum: u32 = inner
@@ -1871,18 +2017,36 @@ impl ResidencyPlanner {
                 pages: missing.saturating_sub(expected.pages.saturating_add(free)),
                 rs_slots: waiter
                     .rs_need()
+                    .saturating_add(inner.seating_reserve(
+                        waiter.pid,
+                        rs_growth,
+                        waiter.rs_need(),
+                        rs_total,
+                    ))
                     .saturating_sub(rs_free.saturating_add(expected.rs_slots)),
             };
             if deficit == Reclaim::default() {
                 return None;
             }
             let head_seq = head.0;
+            // A prompt not yet seated waits for a lane to finish rather than
+            // suspending one mid-decode: only an idle process yields to it.
+            let seating = self.seated_first
+                && matches!(waiter.kind, WaitKind::Allocation { .. })
+                && inner
+                    .procs
+                    .get(&waiter.pid)
+                    .is_some_and(|proc| !proc.seated);
             let members = inner
                 .procs
                 .iter()
                 .filter(|(pid, proc)| {
                     proc.admitted
-                        && (proc.seq > head_seq || proc.idle)
+                        && if seating {
+                            proc.idle
+                        } else {
+                            proc.seq > head_seq || proc.idle
+                        }
                         && proc.state == Residency::Resident
                         && !inner.host_swap_blocked.contains(*pid)
                         && !inner.prepare_blocked.contains(*pid)
@@ -1945,6 +2109,7 @@ impl ResidencyPlanner {
         let any = !spawned.is_empty();
         for pid in spawned {
             self.stats.evictions_started.fetch_add(1, Ordering::Relaxed);
+            ptrace!("evict pid={} head={:?}", pid, head_key);
             exec::spawn_evict(self.clone(), pid);
         }
         any
