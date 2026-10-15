@@ -592,29 +592,52 @@ __global__ void moe_topk_sqrt_softplus(
     }
     __syncthreads();
 
-    if (tid == 0) {
+    // The `K` picks one warp-wide argmax each: a lane's best of its experts,
+    // then the lanes' best, the lowest expert on a tie (the first strictly
+    // greater one the serial walk would keep). A score below -FLT_MAX never
+    // wins, as the walk's `v > best_v` from -FLT_MAX lets none.
+    if (tid < 32) {
         i32* idx = topk_idx + static_cast<long long>(plane_row) * K;
         float* w = topk_w + static_cast<long long>(plane_row) * K;
         float sum = 0.f;
         for (int k = 0; k < K; ++k) {
             int best_i = -1;
             float best_v = -flt_max();
-            for (int e = 0; e < E; ++e) {
+            for (int e = tid; e < E; e += 32) {
                 const float v = scores[e];
                 if (v > best_v) {
                     best_v = v;
                     best_i = e;
                 }
             }
-            idx[k] = best_i;
-            w[k] = orig_scores[best_i];
-            sum += orig_scores[best_i];
-            scores[best_i] = -flt_max();
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, best_v, off);
+                const int oi = __shfl_xor_sync(0xffffffffu, best_i, off);
+                const bool take = oi >= 0 && (best_i < 0 || ov > best_v || (ov == best_v && oi < best_i));
+                if (take) {
+                    best_v = ov;
+                    best_i = oi;
+                }
+            }
+            if (best_i >= 0) {
+                if (tid == 0) {
+                    idx[k] = best_i;
+                    w[k] = orig_scores[best_i];
+                    scores[best_i] = -flt_max();
+                }
+                sum += orig_scores[best_i];
+            } else if (tid == 0) {
+                idx[k] = best_i;
+            }
+            __syncwarp();
         }
-        const float scale = renormalize && sum > 0.f
-            ? routed_scaling_factor / sum
-            : routed_scaling_factor;
-        for (int k = 0; k < K; ++k) w[k] *= scale;
+        if (tid == 0) {
+            const float scale = renormalize && sum > 0.f
+                ? routed_scaling_factor / sum
+                : routed_scaling_factor;
+            for (int k = 0; k < K; ++k) w[k] *= scale;
+        }
     }
 }
 

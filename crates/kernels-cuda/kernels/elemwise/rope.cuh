@@ -816,6 +816,59 @@ __global__ void rope_partial(
     }
 }
 
+// `rope_partial_last` with a row's heads spread over `gridDim.y` blocks of
+// `heads_per_block`, each block working the row's `rotary_dim / 2` angles
+// out once (the same expression the per-element walk evaluates) into shared
+// memory before its heads rotate. `rotary_dim / 2 <= blockDim.x`.
+__global__ void rope_partial_last_spread(
+    bf16* __restrict__ q,
+    const i32* __restrict__ positions,
+    int num_q_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    bool inverse,
+    bool interleaved,
+    float yarn_factor,
+    float yarn_low_dim,
+    float yarn_high_dim,
+    int heads_per_block,
+    const u32* __restrict__ win)
+{
+    const int n = blockIdx.x;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int rope_half = rotary_dim / 2;
+    const int offset = head_dim - rotary_dim;
+    const int pos = positions[row];
+    extern __shared__ float2 cs_part[];
+    for (int d = threadIdx.x; d < rope_half; d += blockDim.x) {
+        float freq = powf(theta, -2.f * static_cast<float>(d) / static_cast<float>(rotary_dim));
+        if (yarn_factor > 1.f) {
+            freq = yarn_original_freq(freq, yarn_factor, yarn_low_dim, yarn_high_dim, d);
+        }
+        const float ang = (inverse ? -1.f : 1.f) * static_cast<float>(pos) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
+        cs_part[d] = make_float2(cos_v, sin_v);
+    }
+    __syncthreads();
+    const int h0 = static_cast<int>(blockIdx.y) * heads_per_block;
+    const int h1 = min(h0 + heads_per_block, num_q_heads);
+    for (int t = threadIdx.x; t < (h1 - h0) * rope_half; t += blockDim.x) {
+        const int head_idx = h0 + t / rope_half;
+        const int dim_pair = t % rope_half;
+        const float2 c = cs_part[dim_pair];
+        bf16* base = q + static_cast<long long>(row * num_q_heads + head_idx) * head_dim;
+        const int i = interleaved ? offset + 2 * dim_pair : offset + dim_pair;
+        const int j = interleaved ? offset + 2 * dim_pair + 1 : offset + dim_pair + rope_half;
+        const float a = bf16_to_f32(base[i]);
+        const float b = bf16_to_f32(base[j]);
+        base[i] = f32_to_bf16(a * c.x - b * c.y);
+        base[j] = f32_to_bf16(b * c.x + a * c.y);
+    }
+}
+
 __global__ void rope_partial_last(
     bf16* __restrict__ q,
     bf16* __restrict__ k,

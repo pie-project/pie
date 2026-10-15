@@ -293,6 +293,36 @@ pub fn partial_last(
         ));
     }
     let num_q_heads = q_heads(OP, q.width, head_dim)?;
+    // A row's heads over blocks of eight (DeepSeek-V4: 64 heads, a 64-wide
+    // tail), the angles worked out once a block rather than once a head and
+    // pair: the same values land.
+    let half = rotary_dim / 2;
+    if half > 0 && half <= ROTATE_BLOCK {
+        const HEADS: u32 = 8;
+        let heads = num_q_heads;
+        return ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::elemwise::rope_partial_last_spread").apply(
+                Launch::grid([q.rows, heads.div_ceil(HEADS), 1], [ROTATE_BLOCK, 1, 1])
+                    .smem(half * 8),
+            ),
+            &[
+                q.arg(),
+                positions.arg(),
+                stated(OP, num_q_heads)?.arg(),
+                stated(OP, head_dim)?.arg(),
+                stated(OP, rotary_dim)?.arg(),
+                theta.arg(),
+                inverse.arg(),
+                interleaved.arg(),
+                factor.arg(),
+                low_dim.arg(),
+                high_dim.arg(),
+                stated(OP, HEADS)?.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::elemwise::rope_partial_last")
