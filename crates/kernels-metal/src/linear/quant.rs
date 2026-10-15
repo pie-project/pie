@@ -640,18 +640,17 @@ fn act_x_wt_over(
                     let staged_from = tuning.qmm_mpp_tiles().staged_from;
                     if staged_from > 0
                         && rows >= staged_from
-                        && (bm, bn) == (32, 128)
-                        && padded <= capacity_rows
                         && w.mpp_codes.is_none()
                         && w.biases.is_some()
                         && w.scales.dtype == dtype::Dtype::Bf16
                         && (w.bits, w.group) == (4, 64)
-                        && columns.is_multiple_of(128)
+                        && columns.is_multiple_of(64)
                         && contraction.is_multiple_of(64)
                     {
                         return ctx.fire(
-                            Fire::at("linear/quant_qmm_mpp.metal", "affine_qmm_mpp_staged")
-                                .apply(Grid::of([128 * (columns / 128), padded / 32, 1], [128, 1, 1])),
+                            Fire::at("linear/quant_qmm_mpp.metal", "affine_qmm_mpp_staged").apply(
+                                Grid::of([128 * rows.div_ceil(128), columns / 64, 1], [128, 1, 1]),
+                            ),
                             &[
                                 w.codes.arg(),
                                 w.scales.arg(),
@@ -661,6 +660,7 @@ fn act_x_wt_over(
                                 k.arg(),
                                 n.arg(),
                                 ld.arg(),
+                                m.arg(),
                             ],
                         );
                     }

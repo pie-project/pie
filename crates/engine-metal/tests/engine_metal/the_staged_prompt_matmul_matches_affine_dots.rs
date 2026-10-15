@@ -58,8 +58,12 @@ fn every_staged_prompt_row_answers_an_affine_reference() {
         let inputs: Vec<u8> = (0..padded)
             .flat_map(|row| (0..k).flat_map(move |at| bf16(activation(row, at))))
             .collect();
-        let (codes_b, scales_b, biases_b, act_b) =
-            (upload(&codes), upload(&scales), upload(&biases), upload(&inputs));
+        let (codes_b, scales_b, biases_b, act_b) = (
+            upload(&codes),
+            upload(&scales),
+            upload(&biases),
+            upload(&inputs),
+        );
         let output_bytes = u64::from(padded) * u64::from(n) * 2;
         let out_b = upload(&vec![0xa5; output_bytes as usize + 64]);
         let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");

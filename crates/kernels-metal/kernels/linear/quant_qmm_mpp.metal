@@ -214,11 +214,30 @@ affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
       device bfloat *, constant int &, constant int &, const device float *, const device int *,   \
       uint3);
 
-// The staged twin, as Splash runs a prompt's matmul: the threadgroup dequantizes one 64-code group of
-// its N columns into a half stage (q * scale + bias), and the 32 x N matmul accumulates the stage over
-// the whole contraction, so no per-group epilogue touches the destination. 128 threads; thread t
-// stages column t.
-constant constexpr int kStagedM = 32, kStagedN = 128, kStagedK = 64;
+// The staged prompt tile, as Splash's prefill tile runs (runtime/metal/kernels/shared/gguf_linear.metal,
+// gguf_prefill_tile over common/gguf_staged_tile.h): four simdgroups of 32 rows share a stage of the
+// tile's 64 columns over 64 inputs, which all 128 threads dequantize to half (q * scale + bias, rounded
+// once), and each simdgroup's 32 x 64 matmul accumulates the stage over the whole contraction. The two
+// stages alternate by step: a thread dequantizes its next step's codes, loaded while this step's
+// matmuls run, into the other stage. Grid (row tiles of 128, column tiles of 64); a simdgroup past the
+// rows stages and meets every barrier but runs no matmul, and only real rows are stored.
+constant constexpr ushort kStagedRows = 32, kStagedSimdgroups = 4, kStagedColumns = 64, kStagedStep = 64;
+
+inline void staged_dequant32(uint4 codes, float scale, float bias, threadgroup half *dst) {
+  const uint words[4] = {codes.x, codes.y, codes.z, codes.w};
+#pragma unroll
+  for (ushort w = 0; w < 4; ++w) {
+    half4 lo, hi;
+#pragma unroll
+    for (ushort j = 0; j < 4; ++j) {
+      lo[j] = half(fma(float((words[w] >> (4 * j)) & 15u), scale, bias));
+      hi[j] = half(fma(float((words[w] >> (4 * j + 16)) & 15u), scale, bias));
+    }
+    *((threadgroup half4 *)(dst + 8 * w)) = lo;
+    *((threadgroup half4 *)(dst + 8 * w + 4)) = hi;
+  }
+}
+
 [[kernel]] void affine_qmm_mpp_staged(const device uchar *weights [[buffer(0)]],
                                       const device bfloat *scales [[buffer(1)]],
                                       const device bfloat *biases [[buffer(2)]],
@@ -227,49 +246,70 @@ constant constexpr int kStagedM = 32, kStagedN = 128, kStagedK = 64;
                                       constant int &width [[buffer(5)]],
                                       constant int &columns [[buffer(6)]],
                                       constant int &stride [[buffer(7)]],
-                                      uint3 position [[threadgroup_position_in_grid]],
-                                      uint thread_id [[thread_index_in_threadgroup]]) {
-  threadgroup half stage[kStagedN * kStagedK];
-  const uint row = position.y * kStagedM, column = position.x * kStagedN;
-  const int groups = width / 64, groups_total = stride / 64;
-  auto activations = tensor(const_cast<device bfloat *>(input) + ulong(row) * width,
-                            dextents<int, 2>{width, kStagedM}, array<int, 2>{1, width});
-  tensor<threadgroup half, dextents<int, 2>, tensor_inline> staged(
-      stage, dextents<int, 2>{kStagedK, kStagedN}, array<int, 2>{1, kStagedK});
-  constexpr auto descriptor =
-      matmul2d_descriptor(kStagedM, kStagedN, kStagedK, false, true, false,
-                          matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<descriptor, execution_simdgroups<4>> multiply;
-  auto a = activations.template slice<kStagedK, kStagedM>(0, 0);
-  auto b = staged.template slice<kStagedK, kStagedN>(0, 0);
-  auto total =
-      multiply.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
-  for (ushort i = 0; i < total.get_capacity(); ++i)
-    total[i] = 0;
-  const uint mine = column + thread_id;
+                                      constant int &rows [[buffer(8)]],
+                                      uint2 group [[threadgroup_position_in_grid]],
+                                      uint simd_lane [[thread_index_in_simdgroup]],
+                                      uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half stage[2 * kStagedColumns * kStagedStep];
+  const uint first = group.x * kStagedRows * kStagedSimdgroups + simd_group * kStagedRows;
+  const bool owns_rows = first < uint(rows);
+  const uint column0 = group.y * kStagedColumns;
+  const uint thread_index = simd_group * 32 + simd_lane;
+  // Thread t stages column t % 64's half (t / 64) of each 64-input step.
+  const uint column = column0 + thread_index % kStagedColumns, half_step = thread_index / kStagedColumns;
+  const int steps = width / kStagedStep, groups_total = stride / 64;
   const device uint4 *codes =
-      reinterpret_cast<const device uint4 *>(weights + ulong(mine) * (stride / 2));
-  threadgroup half *slot = stage + thread_id * kStagedK;
-  for (int group = 0; group < groups; ++group) {
-    const ulong parameter = ulong(mine) * groups_total + group;
-    const float scale = float(scales[parameter]), bias = float(biases[parameter]);
-    const uint4 low = codes[group * 2], high = codes[group * 2 + 1];
-    const uint words[8] = {low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w};
+      reinterpret_cast<const device uint4 *>(weights + ulong(column) * (stride / 2)) + half_step;
+  const device bfloat *column_scales = scales + ulong(column) * groups_total;
+  const device bfloat *column_biases = biases + ulong(column) * groups_total;
+  auto a = tensor(const_cast<device bfloat *>(input) + ulong(first) * width,
+                  dextents<int, 2>{width, kStagedRows}, array<int, 2>{1, width});
+  constexpr auto descriptor =
+      matmul2d_descriptor(kStagedRows, kStagedColumns, kStagedStep, false, true, false,
+                          matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<descriptor, execution_simdgroups<1>> operation;
+  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(
+      stage, dextents<int, 2>{kStagedStep, kStagedColumns}, array<int, 2>{1, kStagedStep});
+  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(
+      stage + kStagedStep * kStagedColumns, dextents<int, 2>{kStagedStep, kStagedColumns},
+      array<int, 2>{1, kStagedStep});
+  auto b0 = bt0.slice<kStagedStep, kStagedColumns>(0, 0);
+  auto b1 = bt1.slice<kStagedStep, kStagedColumns>(0, 0);
+  auto a0 = a.template slice<kStagedStep, kStagedRows>(0, 0);
+  auto acc = operation.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
 #pragma unroll
-    for (int w = 0; w < 8; ++w)
-#pragma unroll
-      for (int nibble = 0; nibble < 8; ++nibble)
-        slot[w * 8 + nibble] = half(float((words[w] >> (4 * nibble)) & 15u) * scale + bias);
+  for (ushort i = 0; i < acc.get_capacity(); ++i)
+    acc[i] = 0.0f;
+  // The payload of the step this thread stages next: its codes, scale and bias.
+  uint4 packed = codes[0];
+  float scale = float(column_scales[0]), bias = float(column_biases[0]);
+  const uint slot = (thread_index % kStagedColumns) * kStagedStep + half_step * 32;
+  for (int step = 0; step < steps; ++step) {
+    const uint buffer = step & 1;
+    staged_dequant32(packed, scale, bias, stage + buffer * (kStagedStep * kStagedColumns) + slot);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    auto lhs = activations.template slice<kStagedK, kStagedM>(group * kStagedK, 0);
-    multiply.run(lhs, b, total);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (step + 1 < steps) {
+      packed = codes[(step + 1) * 2];
+      scale = float(column_scales[step + 1]);
+      bias = float(column_biases[step + 1]);
+    }
+    if (owns_rows) {
+      auto a_slice = a.template slice<kStagedStep, kStagedRows>(step * kStagedStep, 0);
+      if (buffer)
+        operation.run(a_slice, b1, acc);
+      else
+        operation.run(a_slice, b0, acc);
+    }
   }
-  auto converted =
-      multiply.template get_destination_cooperative_tensor<decltype(a), decltype(b), bfloat>();
-  for (ushort i = 0; i < total.get_capacity(); ++i)
-    converted[i] = bfloat(total[i]);
-  auto destination = tensor(output + ulong(row) * columns + column,
-                            dextents<int, 2>{columns, kStagedM}, array<int, 2>{1, columns});
-  converted.store(destination.template slice<kStagedN, kStagedM>(0, 0));
+  if (!owns_rows)
+    return;
+#pragma unroll
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    if (!acc.is_valid_element(i))
+      continue;
+    auto index = acc.get_multidimensional_index(i);
+    const uint row = first + index[1];
+    if (row < uint(rows))
+      output[ulong(row) * columns + column0 + index[0]] = bfloat(acc[i]);
+  }
 }
