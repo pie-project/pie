@@ -15,6 +15,10 @@ sdpa.pool_mma = true
 # prefills 32 x 4096 in 9.9 s against 12.2 s as the four ops (two runs
 # each); below 512 rows the four ops stay.
 sdpa.dsv4_prefill_from = 512
+# That pass a block a row (Q in TMEM, whole 64-key tiles, V the tile K
+# brought) rather than a block a row pair over their keys' union: 32 x 4096
+# in 8.37 / 8.37 s against 8.72 / 9.18 s.
+sdpa.dsv4_sparse = true
 # A pooled index's top-k by radix select rather than forty bisection passes
 # (DSV4-Flash's 512 of up to 1024 blocks, 2048 rows: 417 -> 220 us).
 sdpa.index_radix = true

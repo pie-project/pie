@@ -410,6 +410,7 @@ mod tests {
                 assert_eq!(tuning.decode_xqa, b200, "{gpu}");
                 assert_eq!(tuning.pool_mma, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(tuning.index_radix, major == 10 && minor == 0, "{gpu}");
+                assert_eq!(tuning.dsv4_sparse, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
                     tuning.dsv4_prefill_from,
                     if major == 10 && minor == 0 { 512 } else { 0 },
@@ -467,6 +468,7 @@ mod tests {
                         pool_mma: false,
                         dsv4_prefill_from: 0,
                         index_radix: false,
+                        dsv4_sparse: false,
                         mxfp4_cvt: false,
                         mxfp4_a8_until: 0,
                         ..tuning
