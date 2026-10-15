@@ -118,8 +118,10 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
   const device vec<bfloat, 16> *xt =
       reinterpret_cast<const device vec<bfloat, 16> *>(table) + fm * 4 + c;
   const device float *sums = reinterpret_cast<const device float *>(table + 8 * ulong(width));
-  const int spans = width / kSpan / SPLIT;
-  const int first = int(position.y) * spans * 4, last = first + spans * 4;
+  // Partition y takes 256-input units [y * units / SPLIT, (y + 1) * units / SPLIT), as Splash's
+  // tile cuts them: a contraction need not hold SPLIT equal parts (down's 68 units take 8).
+  const int units = width / kSpan;
+  const int first = int(position.y) * units / SPLIT * 4, last = (int(position.y) + 1) * units / SPLIT * 4;
   // Two groups a step: their words, scales and biases load while the step before runs.
   constexpr int U = 2;
   float2 acc[NF];

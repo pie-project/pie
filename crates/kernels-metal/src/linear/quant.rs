@@ -1026,14 +1026,15 @@ const REGISTER_SPAN: i32 = 256;
 
 /// The register tile's contraction partitions, as Splash's Apple9 register
 /// tile takes them: doubled (to 8) while the grid stays under 4 threadgroups
-/// a core with 256 inputs a partition, or under 32 a core with 1024.
+/// a core with 256 inputs a partition, or under 32 a core with 1024. Partitions
+/// take whole 256-input units, as many as fall to them, so an uneven count splits too.
 #[must_use]
 pub fn register_split(cols: i32, k: i32, cores: Option<u32>) -> i32 {
     let cores = i64::from(cores.unwrap_or(32));
     let grid = i64::from(cols / REGISTER_COLUMNS);
     let spans = k / REGISTER_SPAN;
     let mut split = 1i32;
-    while split < 8 && spans % (2 * split) == 0 {
+    while split < 8 && spans >= 2 * split {
         let s = i64::from(split);
         let holds = |tg: i64, inputs: i32| grid * s < tg * cores && k / (2 * split) >= inputs;
         if !(holds(4, 256) || holds(32, 1024)) {
