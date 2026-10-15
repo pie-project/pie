@@ -914,7 +914,7 @@ impl FramePolicy {
                     .count();
                 let awaited = self.lanes.values().filter(|lane| lane.awaited).count();
                 super::worker::wave_trace_emit(format!(
-                    "[wave-trace] t={}us seal partition={} fresh={} continuing={} complete_left={} awaited={} lanes={} in_flight={} mid_boundary={mid_boundary} executing={}",
+                    "[wave-trace] t={}us seal partition={} fresh={} continuing={} complete_left={} awaited={} lanes={} in_flight={} mid_boundary={mid_boundary} executing={} rows={wave_rows:?} tokens={wave_tokens:?}",
                     super::worker::wave_trace_us(),
                     members.len(),
                     fresh.len(),
