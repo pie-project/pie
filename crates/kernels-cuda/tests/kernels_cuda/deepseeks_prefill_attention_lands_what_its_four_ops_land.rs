@@ -310,17 +310,19 @@ fn deepseeks_prefill_attention_paces_a_prefill() {
     let req_t = Tensor::new(gpu.up(&requests), n as u32, 1, Dtype::I32);
     let w_at = gpu.up(&w_bits);
     let win = pool_of(&mut gpu, w_at, cells, &pages, &indptr);
+    let (win8, _) = fp8_plane(&mut gpu, w_at, cells, &pages, &indptr);
     let sinks = vec![0f32; HEADS];
     let sink_t = Tensor::new(gpu.up(&sinks), HEADS as u32, 1, Dtype::F32);
     let sel_t = Tensor::new(gpu.up(&sel), n as u32, k as u32, Dtype::I32);
     let o_at = gpu.zeros(n * HEADS * D * 2);
     let mut o = Tensor::new(o_at, n as u32, (HEADS * D) as u32, Dtype::Bf16);
-    let pooled = Pooled {
-        entries: &win,
-        ratio: ratio as u32,
-        selection: Some((sel_t, k as u32)),
-    };
-    for sparse in [false, true] {
+    for (sparse, fp8) in [(false, false), (true, false), (true, true)] {
+        let win = if fp8 { win8 } else { win };
+        let pooled = Pooled {
+            entries: &win,
+            ratio: ratio as u32,
+            selection: Some((sel_t, k as u32)),
+        };
         let ctx = gpu.ctx().with_tuning(Tuning {
             dsv4_sparse: sparse,
             ..Tuning::DEFAULT
@@ -351,7 +353,7 @@ fn deepseeks_prefill_attention_paces_a_prefill() {
         let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
         let flops = (n * HEADS * (k + 128) * D * 4) as f64;
         println!(
-            "| {n} rows, window + {k} selected, sparse {sparse} | {us:.0} us | {:.1} TFLOP/s useful |",
+            "| {n} rows, window + {k} selected, sparse {sparse}, fp8 {fp8} | {us:.0} us | {:.1} TFLOP/s useful |",
             flops / us / 1e6
         );
     }

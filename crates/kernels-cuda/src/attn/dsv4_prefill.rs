@@ -57,8 +57,6 @@ struct SparseParams {
     live: u64,
     sinks_f32: i32,
     ent_runs: i32,
-    win_fp8: u64,
-    ent_fp8: u64,
     win_page: i32,
     ent_page: i32,
     top_k: i32,
@@ -143,6 +141,30 @@ pub fn prefill(
     let rows = o.rows;
     if rows == 0 {
         return Ok(());
+    }
+    if crate::attn::dsv4::fp8_ds(window_pool) {
+        // DeepSeek's fp8 rows: every page of both pools' tables widened into
+        // bf16 planes laid out in table order (as vLLM gathers its prefill's
+        // rows to bf16), read through the same page_indptr.
+        let window_bf16 = stage(ctx, op, window_pool, Staged::Window)?;
+        let entries_bf16 = stage(ctx, op, pooled.entries, Staged::Entries)?;
+        let staged = Pooled {
+            entries: &entries_bf16,
+            ratio: pooled.ratio,
+            selection: pooled.selection,
+        };
+        return prefill(
+            ctx,
+            op,
+            q,
+            positions,
+            requests,
+            &window_bf16,
+            &staged,
+            sinks,
+            sm_scale,
+            o,
+        );
     }
     let int = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
     let plane = |pool: &KvPool| {
@@ -234,8 +256,7 @@ pub fn prefill(
         len: 128,
     };
     let selected = pooled.selection.is_some();
-    let fp8 = crate::attn::dsv4::fp8_ds(window_pool);
-    if ctx.tuning().dsv4_sparse || fp8 {
+    if ctx.tuning().dsv4_sparse {
         // A block a row (`attn/dsv4_sparse.cuh`): Q in TMEM, whole 64-key
         // tiles, V the tile K brought.
         let sparse = SparseParams {
@@ -251,9 +272,7 @@ pub fn prefill(
             sinks: sinks.ptr,
             live,
             sinks_f32: i32::from(sinks.dtype == Dtype::F32),
-            ent_runs: i32::from(ent_runs && !fp8),
-            win_fp8: if fp8 { window_pool.keys.ptr } else { 0 },
-            ent_fp8: if fp8 { pooled.entries.keys.ptr } else { 0 },
+            ent_runs: i32::from(ent_runs),
             win_page: window_pool.page_size,
             ent_page: pooled.entries.page_size,
             top_k: int(top_k),
@@ -267,9 +286,7 @@ pub fn prefill(
             op,
             Fire::at(
                 SPARSE_FILE,
-                symbol(&format!(
-                    "::pie::attn::dsv4s::dsv4_sparse<{selected}, {fp8}>"
-                )),
+                symbol(&format!("::pie::attn::dsv4s::dsv4_sparse<{selected}>")),
             )
             .apply(
                 Launch::grid(
@@ -313,4 +330,50 @@ pub fn prefill(
             },
         ],
     )
+}
+
+/// Which pool a staged plane widens.
+#[derive(Clone, Copy)]
+enum Staged {
+    Window,
+    Entries,
+}
+
+/// `pool`'s pages, every one its table names, widened from DeepSeek's fp8
+/// rows into a bf16 plane in table order (`stage_pages`): the pool the pass
+/// reads instead, its table the identity.
+fn stage(ctx: &Ctx, op: &'static str, pool: &KvPool, which: Staged) -> Result<KvPool, Error> {
+    let (plane_name, table_name) = match which {
+        Staged::Window => ("dsv4.stage.window", "dsv4.stage.window_table"),
+        Staged::Entries => ("dsv4.stage.entries", "dsv4.stage.entries_table"),
+    };
+    let pages = pool.page_indices.rows;
+    let page = u32::try_from(pool.page_size).unwrap_or(0);
+    let cells = pages.saturating_mul(page);
+    let plane =
+        ctx.scratch_shared(op, plane_name, cells as usize * HEAD_DIM as usize * 2)? as usize as u64;
+    let table = ctx.scratch_shared(op, table_name, pages as usize * 4)? as usize as u64;
+    if pages > 0 {
+        ctx.fire(
+            op,
+            Fire::at(SPARSE_FILE, "::pie::attn::dsv4s::stage_pages")
+                .apply(Launch::grid([pages, 1, 1], [256, 1, 1])),
+            &[
+                pool.keys.arg(),
+                ArgValue::Ptr(plane),
+                pool.page_indices.arg(),
+                ArgValue::Ptr(table),
+                ArgValue::I32(i32::try_from(pages).unwrap_or(i32::MAX)),
+                ArgValue::I32(pool.page_size),
+            ],
+        )?;
+    }
+    Ok(KvPool {
+        keys: Tensor::new(plane, cells, HEAD_DIM, Dtype::Bf16),
+        values: Tensor::new(plane, cells, HEAD_DIM, Dtype::Bf16),
+        page_indices: Tensor::new(table, pages, 1, Dtype::U32),
+        seq_stride: i64::from(HEAD_DIM),
+        head_stride: i64::from(HEAD_DIM),
+        ..*pool
+    })
 }

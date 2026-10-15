@@ -53,9 +53,6 @@ struct Params {
     const u32* live;
     int sinks_f32;
     int ent_runs;
-    // DeepSeek's fp8 rows (`attn/dsv4_kv.cuh`): the planes' bytes.
-    const unsigned char* win_fp8;
-    const unsigned char* ent_fp8;
     int win_page;
     int ent_page;
     int top_k;
@@ -139,9 +136,7 @@ __device__ __forceinline__ void pair_sync(u32 warp) {
 constexpr int kIssuers = 6;  // warp 4 and warps 6-10; warp 11 lists
 __device__ __forceinline__ void issue_sync() { asm volatile("bar.sync 2, %0;" ::"n"(kIssuers * 32) : "memory"); }
 
-// kFp8: both planes hold DeepSeek's fp8 rows; the issuing warps read them
-// and land them in bf16 themselves (TMA cannot widen e4m3).
-template <bool kSelected, bool kFp8 = false>
+template <bool kSelected>
 __global__ __launch_bounds__(384, 1) void dsv4_sparse(
     const __grid_constant__ tc5::TmaMap map_win, const __grid_constant__ tc5::TmaMap map_ent,
     const __grid_constant__ tc5::TmaMap map_win_run, const __grid_constant__ tc5::TmaMap map_ent_run,
@@ -175,9 +170,7 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
 
     if (threadIdx.x == 0) {
         for (int s = 0; s < kSlots; ++s) {
-            // bf16: the lead's armed arrival (TMA counts the bytes); fp8:
-            // every issuing thread once its stores are visible.
-            bar_init(&full[s], kFp8 ? kIssuers * 32 : 1);
+            bar_init(&full[s], 1);
             bar_init(&empty[s], 1);
         }
         for (int s = 0; s < 2; ++s) {
@@ -287,44 +280,9 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
             bar_wait(&list_full[J % kLists], (J / kLists) & 1);
             if (lead) {
                 bar_wait(&empty[slot], ((J / kSlots) & 1) ^ 1);
-                if (!kFp8 && lane == 0) bar_arrive_expect_tx(&full[slot], kTile);
+                if (lane == 0) bar_arrive_expect_tx(&full[slot], kTile);
             }
             issue_sync();
-            if constexpr (kFp8) {
-                // A key's 8-dim run an item, 64 keys by 64 runs, dealt round
-                // the issuing threads: widened from its row's codes and scale
-                // and stored where TMA would have landed it (128-byte rows,
-                // their 16-byte words swizzled by the row).
-                const int me = share * 32 + static_cast<int>(lane);
-                const u32 tile = sbase + kOffRing + slot * kTile;
-#pragma unroll 4
-                for (int it = me; it < kBK * (kD / 8); it += kIssuers * 32) {
-                    const int k = it / (kD / 8);
-                    const int c = it % (kD / 8);
-                    const u32 e = l[k];
-                    const u32 cell = e & kSlotMask;
-                    uint4 v = make_uint4(0u, 0u, 0u, 0u);
-                    if (cell != kSlotMask) {
-                        const bool pool = (e & kPool) != 0;
-                        const int page = pool ? p.ent_page : p.win_page;
-                        const dsv4::DsRow row = dsv4::ds_row(
-                            const_cast<std::uint8_t*>(pool ? p.ent_fp8 : p.win_fp8),
-                            static_cast<long long>(cell / static_cast<u32>(page)),
-                            static_cast<int>(cell % static_cast<u32>(page)), page);
-                        v = dsv4::ds_load8(row.data, row.scales, c * 8);
-                    }
-                    const int a = c / 8, q = c % 8;
-                    const u32 at = tile + atom_at(a) + k * 128 + ((q ^ (k & 7)) * 16);
-                    asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};" ::"r"(at), "r"(v.x),
-                                 "r"(v.y), "r"(v.z), "r"(v.w)
-                                 : "memory");
-                }
-                fence_async_shared();
-                bar_arrive(&full[slot]);
-                issue_sync();
-                if (lead && lane == 0) bar_arrive(&list_free[J % kLists]);
-                continue;
-            }
             // 16 groups of four keys by 8 atoms, dealt round the three warps;
             // a run of 16 rows (window positions, or a page's entries one
             // stride apart) lands as one box from its first group.
@@ -605,6 +563,33 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
     if (warp == 5) {
         tc_fence_after();
         tmem_dealloc(tmem, kCols);
+    }
+}
+
+// DeepSeek's fp8 rows (`attn/dsv4_kv.cuh`) widened for the pass above, a
+// page at a time: page i of `out` is page indices[i] of the fp8 plane, and
+// out_indices[i] = i, so the pass reads the staged plane through the same
+// page_indptr. A warp a row, a lane two 8-dim runs.
+__global__ __launch_bounds__(256) void stage_pages(
+    const std::uint8_t* __restrict__ fp8,
+    bf16* __restrict__ out,
+    const u32* __restrict__ indices,
+    u32* __restrict__ out_indices,
+    int n,
+    int page)
+{
+    const int i = static_cast<int>(blockIdx.x);
+    if (i >= n) return;
+    if (threadIdx.x == 0) out_indices[i] = static_cast<u32>(i);
+    const long long src = indices[i];
+    const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
+    for (int r = warp; r < page; r += 8) {
+        const dsv4::DsRow row = dsv4::ds_row(const_cast<std::uint8_t*>(fp8), src, r, page);
+        bf16* dst = out + (static_cast<long long>(i) * page + r) * kD;
+#pragma unroll
+        for (int c = lane; c < kD / 8; c += 32) {
+            *reinterpret_cast<uint4*>(dst + c * 8) = dsv4::ds_load8(row.data, row.scales, c * 8);
+        }
     }
 }
 
