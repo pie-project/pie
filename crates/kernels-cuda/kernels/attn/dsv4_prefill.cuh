@@ -112,31 +112,6 @@ __device__ __forceinline__ int owned(const u32* indptr, int req, int page) {
     return max(static_cast<int>(indptr[req + 1]) - static_cast<int>(indptr[req]), 0) * page;
 }
 
-// A warp's window of 128 ascending ids, four a lane (lane l holds ids
-// 4 l .. 4 l + 3): the one at `i`, every lane asking its own.
-__device__ __forceinline__ int window_at(const int (&v)[4], int i) {
-    const int src = (i >> 2) & 31;
-    const int x0 = __shfl_sync(0xffffffffu, v[0], src);
-    const int x1 = __shfl_sync(0xffffffffu, v[1], src);
-    const int x2 = __shfl_sync(0xffffffffu, v[2], src);
-    const int x3 = __shfl_sync(0xffffffffu, v[3], src);
-    const int q = i & 3;
-    return q == 0 ? x0 : q == 1 ? x1 : q == 2 ? x2 : x3;
-}
-
-// How many of the window's first `n` ids are below `x`; the whole warp
-// steps together.
-__device__ __forceinline__ int window_below(const int (&v)[4], int n, int x) {
-    int pos = 0;
-#pragma unroll
-    for (int step = 128; step > 0; step >>= 1) {
-        const int cand = pos + step;
-        const int val = window_at(v, min(cand, 128) - 1);
-        if (cand <= n && val < x) pos = cand;
-    }
-    return pos;
-}
-
 template <bool kSelected>
 __global__ __launch_bounds__(288, 1) void dsv4_prefill(
     const __grid_constant__ tc5::TmaMap map_q, const __grid_constant__ tc5::TmaMap map_win,
@@ -329,18 +304,51 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
                         va[q] = t < na ? sel_a[ia + t] : 0x7fffffff;
                         vb[q] = t < nb ? sel_b[ib + t] : 0x7fffffff;
                     }
+                    // Each candidate's count of the other window's ids below it,
+                    // and whether that window holds it: the lanes whose first id
+                    // lies at or below it (a search over the 32 lane heads), then the
+                    // last such lane's four ids. The eight searches step together.
                     int la[4], lb[4];
                     bool da[4], db[4];
+                    {
+                        int pa[4] = {0, 0, 0, 0}, pb[4] = {0, 0, 0, 0};
+#pragma unroll
+                        for (int step = 32; step > 0; step >>= 1) {
+#pragma unroll
+                            for (int q = 0; q < 4; ++q) {
+                                const int ca = pa[q] + step, cb = pb[q] + step;
+                                const int hb = __shfl_sync(0xffffffffu, vb[0], min(ca, 32) - 1);
+                                const int ha = __shfl_sync(0xffffffffu, va[0], min(cb, 32) - 1);
+                                if (ca <= 32 && hb <= va[q]) pa[q] = ca;
+                                if (cb <= 32 && ha <= vb[q]) pb[q] = cb;
+                            }
+                        }
+#pragma unroll
+                        for (int q = 0; q < 4; ++q) {
+                            const int sa = max(pa[q], 1) - 1, sb = max(pb[q], 1) - 1;
+                            int cnt_a = 0, cnt_b = 0;
+                            bool eq_a = false, eq_b = false;
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                const int xb = __shfl_sync(0xffffffffu, vb[i], sa);
+                                const int xa = __shfl_sync(0xffffffffu, va[i], sb);
+                                cnt_a += xb < va[q];
+                                cnt_b += xa < vb[q];
+                                eq_a = eq_a || xb == va[q];
+                                eq_b = eq_b || xa == vb[q];
+                            }
+                            la[q] = pa[q] > 0 ? 4 * sa + cnt_a : 0;
+                            lb[q] = pb[q] > 0 ? 4 * sb + cnt_b : 0;
+                            da[q] = pa[q] > 0 && eq_a;
+                            db[q] = pb[q] > 0 && eq_b;
+                        }
+                    }
                     int dup_a = 0, dup_b = 0;
 #pragma unroll
                     for (int q = 0; q < 4; ++q) {
-                        la[q] = window_below(vb, nb, va[q]);
-                        lb[q] = window_below(va, na, vb[q]);
-                        const int at_b = window_at(vb, min(la[q], 127));
-                        const int at_a = window_at(va, min(lb[q], 127));
                         const int t = 4 * static_cast<int>(lane) + q;
-                        da[q] = t < na && la[q] < nb && at_b == va[q];
-                        db[q] = t < nb && lb[q] < na && at_a == vb[q];
+                        da[q] = da[q] && t < na;
+                        db[q] = db[q] && t < nb;
                         dup_a += da[q];
                         dup_b += db[q];
                     }

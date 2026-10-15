@@ -189,6 +189,8 @@ fn deepseeks_prefill_attention_lands_what_its_four_ops_land() {
     // A CSA layer: ratio 4, a selection of 64 a row; an HCA layer: ratio
     // 128, every visible entry.
     check(4, Some(64));
+    // Selections longer than a tile: the merge walks them over several.
+    check(4, Some(512));
     check(128, None);
     // Every visible entry at ratio 4: a page's sixteen entries land as one box.
     check(4, None);
