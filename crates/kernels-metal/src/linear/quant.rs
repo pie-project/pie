@@ -668,8 +668,15 @@ fn act_x_wt_over(
                         let local = bm == 8 && packed && split == 4;
                         let simdgroups = if bm == 8 { 2 } else { 4 };
                         let pipeline = !local && rows <= pipeline_rows && columns <= pipeline_cols;
-                        let linear_mode = if rows >= linear_from && split == 1 && packed {
+                        // A prompt walks every row tile of a column block before the next
+                        // block, so each block of weights is read from memory once, not once
+                        // per row tile (Gemma-4-31B's 43008-wide gate|up streamed its 115 MB
+                        // of weights 18 times a prompt).
+                        let row_tiles = padded / bm;
+                        let linear_mode = if split == 1 && (packed && rows >= linear_from) {
                             16
+                        } else if split == 1 && !packed && row_tiles >= 2 {
+                            row_tiles.min(32) as i32
                         } else {
                             -1
                         };
