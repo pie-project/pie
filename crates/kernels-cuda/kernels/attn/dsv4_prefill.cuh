@@ -103,6 +103,38 @@ __device__ __forceinline__ void gather4(void* dst, u64* bar, const tc5::TmaMap* 
         : "memory");
 }
 
+// gather4 landing at the same offset in both CTAs of the pair, each
+// completing its own barrier there.
+__device__ __forceinline__ void gather4_pair(void* dst, u64* bar, const tc5::TmaMap* map, int col,
+                                             int r0, int r1, int r2, int r3) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4.mbarrier::complete_tx::bytes"
+        ".multicast::cluster [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;" ::"r"(tc5::smem_addr(dst)),
+        "l"(map), "r"(col), "r"(r0), "r"(r1), "r"(r2), "r"(r3), "r"(tc5::smem_addr(bar)),
+        "h"(static_cast<unsigned short>(3))
+        : "memory");
+}
+
+__device__ __forceinline__ void tma_load_3d_both(void* dst, u64* bar, const tc5::TmaMap* map,
+                                                 int x, int y, int z) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes"
+        ".multicast::cluster [%0], [%1, {%3, %4, %5}], [%2], %6;" ::"r"(tc5::smem_addr(dst)),
+        "l"(map), "r"(tc5::smem_addr(bar)), "r"(x), "r"(y), "r"(z),
+        "h"(static_cast<unsigned short>(3))
+        : "memory");
+}
+
+// One arrival, once this thread's tcgen05 work is done, on `bar`'s offset
+// in both CTAs of the pair.
+__device__ __forceinline__ void tc_commit_both(u64* bar) {
+    asm volatile(
+        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64"
+        " [%0], %1;" ::"r"(tc5::smem_addr(bar)),
+        "h"(static_cast<unsigned short>(3))
+        : "memory");
+}
+
 // The row a position lands at, through its request's pages.
 __device__ __forceinline__ int row_in(const u32* pages, int pos, int page) {
     return static_cast<int>(pages[pos / page]) * page + pos % page;
@@ -120,9 +152,12 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
     using namespace tc5;
     const int live = p.live != nullptr ? static_cast<int>(p.live[0]) : p.rows;
     const int base = p.live != nullptr ? static_cast<int>(p.live[1]) : 0;
-    const int pair = static_cast<int>(blockIdx.x);
+    // A cluster of two CTAs a pair of rows: each lands half of O, and the K
+    // both read lands in both, each CTA gathering half of every slice.
+    const int pair = static_cast<int>(blockIdx.x) / 2;
     if (2 * pair >= live) return;
-    const int v0 = static_cast<int>(blockIdx.y) * kDV;
+    const u32 rank = cluster_rank();
+    const int v0 = static_cast<int>(rank) * kDV;
     const int row_a = base + 2 * pair;
     const bool has_b = 2 * pair + 1 < live;
     const int row_b = row_a + 1;
@@ -170,7 +205,8 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
         shared_ints[1] = kSelected && has_b ? p.top_k : 0;
         for (int s = 0; s < kSlots; ++s) {
             bar_init(&full[s], 1);
-            bar_init(&empty[s], 1);
+            // Both CTAs' MMAs free a slot: K lands in both.
+            bar_init(&empty[s], 2);
         }
         bar_init(&s_full[0], 1);
         bar_init(&s_full[1], 1);
@@ -190,7 +226,8 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
         tmem_relinquish();
     }
     tc_fence_before();
-    __syncthreads();
+    // The peer's barriers are initialised before anything lands in them.
+    cluster_sync();
     tc_fence_after();
     if (kSelected) {
         // Each list ends at its first negative id.
@@ -224,8 +261,8 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
         if (lead && lane == 0) {
             bar_arrive_expect_tx(q_ready, (kD / 64) * kAtomQ);
 #pragma unroll
-            for (int a = 0; a < kD / 64; ++a) {
-                tma_load_3d(smem + kOffQ + a * kAtomQ, q_ready, &map_q, a * 64, 0, row_a);
+            for (int a = static_cast<int>(rank) * (kD / 128); a < (static_cast<int>(rank) + 1) * (kD / 128); ++a) {
+                tma_load_3d_both(smem + kOffQ + a * kAtomQ, q_ready, &map_q, a * 64, 0, row_a);
             }
             tma_prefetch(&map_win);
             tma_prefetch(&map_ent);
@@ -418,17 +455,23 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
         int seq = 0;
         // A slice: atoms [col / 64, col / 64 + kSA) of the tile listed in
         // `l`, a gather of four keys a lane.
-        auto slice = [&](const u32* l, int col) {
+        // A slice: atoms [col / 64, col / 64 + kSA) of the tile listed in
+        // `l`. A K slice lands in both CTAs, each gathering half its keys; a
+        // V slice (this CTA's half of the head) only here, all its keys.
+        auto slice = [&](const u32* l, int col, bool both) {
             const int slot = seq % kSlots;
             if (lead) {
                 bar_wait(&empty[slot], ((seq / kSlots) & 1) ^ 1);
                 if (lane == 0) bar_arrive_expect_tx(&full[slot], kSlice);
             }
             group_sync();
-            // Lane: one of this warp's eight groups of four keys, one atom.
-            if (lane < 8 * kSA) {
-                const int g = share * 8 + static_cast<int>(lane % 8);
-                const int a = static_cast<int>(lane / 8);
+            // Lane: one group of four keys, one atom; a K slice's groups split
+            // between the pair.
+            const int per = both ? 4 : 8;
+            if (lane < static_cast<u32>(per * kSA)) {
+                const int g = (both ? static_cast<int>(rank) * 16 : 0) + share * per +
+                              static_cast<int>(lane) % per;
+                const int a = static_cast<int>(lane) / per;
                 unsigned char* dst = smem + kOffRing + slot * kSlice;
                 const u32* e = l + 4 * g;
                 const bool pool = (e[0] & kPool) != 0;
@@ -444,12 +487,20 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
                     whole = whole && (run[i] & (kSlotMask | kPool)) ==
                                          ((first + static_cast<u32>(i * stride)) | (run[0] & kPool));
                 }
+                unsigned char* at = dst + a * kAtomKV + g * 4 * 128;
                 if (whole) {
                     if (g % 4 == 0) {
-                        unsigned char* at = dst + a * kAtomKV + g * 4 * 128;
                         if (pool) {
-                            tma_load_3d(at, &full[slot], &map_ent_run, col + a * 64, p.ratio - 1,
-                                        static_cast<int>(first) / p.ratio);
+                            if (both) {
+                                tma_load_3d_both(at, &full[slot], &map_ent_run, col + a * 64,
+                                                 p.ratio - 1, static_cast<int>(first) / p.ratio);
+                            } else {
+                                tma_load_3d(at, &full[slot], &map_ent_run, col + a * 64,
+                                            p.ratio - 1, static_cast<int>(first) / p.ratio);
+                            }
+                        } else if (both) {
+                            tma_load_2d_multicast(at, &full[slot], &map_win_run, col + a * 64,
+                                                  static_cast<int>(first), 3);
                         } else {
                             tma_load_2d(at, &full[slot], &map_win_run, col + a * 64,
                                         static_cast<int>(first));
@@ -462,8 +513,12 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
                         const u32 sl = e[i] & kSlotMask;
                         r[i] = sl == kSlotMask ? kAbsentRow : static_cast<int>(sl);
                     }
-                    gather4(dst + a * kAtomKV + g * 4 * 128, &full[slot],
-                            pool ? &map_ent : &map_win, col + a * 64, r[0], r[1], r[2], r[3]);
+                    const tc5::TmaMap* map = pool ? &map_ent : &map_win;
+                    if (both) {
+                        gather4_pair(at, &full[slot], map, col + a * 64, r[0], r[1], r[2], r[3]);
+                    } else {
+                        gather4(at, &full[slot], map, col + a * 64, r[0], r[1], r[2], r[3]);
+                    }
                 }
             }
             ++seq;
@@ -491,17 +546,17 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
             nt = j + 1;
             const u32* l = lists + (j % 3) * kBKV;
 #pragma unroll 1
-            for (int a = 0; a < kKS; ++a) slice(l, a * 64 * kSA);
+            for (int a = 0; a < kKS; ++a) slice(l, a * 64 * kSA, true);
             if (j > 0) {
                 const u32* prev = lists + ((j - 1) % 3) * kBKV;
 #pragma unroll 1
-                for (int c = 0; c < kVS; ++c) slice(prev, v0 + c * 64 * kSA);
+                for (int c = 0; c < kVS; ++c) slice(prev, v0 + c * 64 * kSA, false);
             }
             publish(j + 1);
         }
         const u32* last = lists + ((nt - 1) % 3) * kBKV;
 #pragma unroll 1
-        for (int c = 0; c < kVS; ++c) slice(last, v0 + c * 64 * kSA);
+        for (int c = 0; c < kVS; ++c) slice(last, v0 + c * 64 * kSA, false);
     } else if (warp == 5) {
         if (lane == 0) {
             const u32 idesc_s = idesc_dense(kF16Bf16, kF16Bf16, 128, kBKV);
@@ -531,7 +586,7 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
                                    sdesc_sw128_mn(vb + s * 2048, kAtomKV), idesc_o,
                                    i > 0 || s > 0);
                     }
-                    tc_commit(&empty[slot]);
+                    tc_commit_both(&empty[slot]);
                     next();
                 }
                 tc_commit(&pv_done[i & 1]);
@@ -558,7 +613,7 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
                                     sdesc_sw128(kb) + 2 * s, idesc_s, ga > 0 || s > 0);
                         }
                     }
-                    tc_commit(&empty[slot]);
+                    tc_commit_both(&empty[slot]);
                     next();
                 }
                 tc_commit(&s_full[sb]);
@@ -685,7 +740,8 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
         }
     }
     tc_fence_before();
-    __syncthreads();
+    // Nothing the peer issued still lands here once both are past this.
+    cluster_sync();
     if (warp == 5) {
         tc_fence_after();
         tmem_dealloc(tmem, kCols);

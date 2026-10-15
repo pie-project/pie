@@ -200,7 +200,11 @@ pub fn prefill(
             FILE,
             symbol(&format!("::pie::attn::dsv4p::dsv4_prefill<{selected}>")),
         )
-        .apply(Launch::grid([rows.div_ceil(2), 2, 1], [288, 1, 1]).smem(SMEM)),
+        .apply(
+            Launch::grid([rows.div_ceil(2) * 2, 1, 1], [288, 1, 1])
+                .smem(SMEM)
+                .cluster(2),
+        ),
         &[
             bytes(&map_q),
             bytes(&map_win),
