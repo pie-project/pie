@@ -423,6 +423,28 @@ impl Engine for Metal {
             experts::Plan::beside(&trace, &planes, residency.device_weight_budget, gathered)
                 .map_err(fault)?;
 
+        // Compiled before the residency check, so the check prices the arena
+        // scratch the load will wire beside the weights and the kv pool.
+        let mut prepared = Shell::prepare(Boot {
+            trace: trace.clone(),
+            contract: &contract,
+            checkpoint: &path,
+            budget: bake_budgets(&budgets),
+            patches: patch_ladder(&trace, &budgets),
+            voxels: voxel_ladder(&trace, &budgets),
+            profile: None::<DeviceProfile>,
+            page_size: budgets.page_size,
+            context: budgets.max_context,
+            slots: budgets.slots,
+            kv_budget: residency.device_kv_budget,
+            memory_share: residency.device_memory_share,
+            runahead: engine::runahead::Runahead::of(frames_in_flight),
+            residency: residency_plan.clone(),
+            profiles: self.boot.profiles.clone(),
+        })
+        .map_err(fault)?;
+        let scratch = prepared.arena_bytes();
+
         {
             let device = crate::device::Context::bind().map_err(fault)?;
             let (working_set, elsewhere) = (device.working_set(), device.held_elsewhere());
@@ -443,11 +465,12 @@ impl Engine for Metal {
                     .bytes(u64::from(paging.pages_per_slot)),
             };
 
-            let acct = crate::store::accounting::Accounting::of(
+            let acct = crate::store::accounting::Accounting::with_scratch(
                 working_set,
                 elsewhere,
                 util,
                 residency_plan.device_demand(),
+                scratch,
                 kv_pool,
             );
             if acct.admit(residency.device_weight_budget, util).is_err() {
@@ -465,11 +488,12 @@ impl Engine for Metal {
                 };
                 match experts::Plan::beside(&trace, &planes, Some(headroom), regathered) {
                     Ok(shrunk) => {
-                        let re = crate::store::accounting::Accounting::of(
+                        let re = crate::store::accounting::Accounting::with_scratch(
                             working_set,
                             elsewhere,
                             util,
                             shrunk.device_demand(),
+                            scratch,
                             kv_pool,
                         );
                         re.admit(Some(headroom), util).map_err(fault)?;
@@ -488,26 +512,8 @@ impl Engine for Metal {
         residency.admit(residency_plan.device_demand(), residency_plan.host_demand())?;
         let streams = residency_plan.streams();
 
-        let patches = patch_ladder(&trace, &budgets);
-        let voxels = voxel_ladder(&trace, &budgets);
-        let mut shell = Shell::load(Boot {
-            trace,
-            contract: &contract,
-            checkpoint: &path,
-            budget: bake_budgets(&budgets),
-            patches,
-            voxels,
-            profile: None::<DeviceProfile>,
-            page_size: budgets.page_size,
-            context: budgets.max_context,
-            slots: budgets.slots,
-            kv_budget: residency.device_kv_budget,
-            memory_share: residency.device_memory_share,
-            runahead: engine::runahead::Runahead::of(frames_in_flight),
-            residency: residency_plan,
-            profiles: self.boot.profiles.clone(),
-        })
-        .map_err(fault)?;
+        prepared.set_residency(residency_plan);
+        let mut shell = prepared.load().map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
         // The device pool already is host memory, so a host tier would only

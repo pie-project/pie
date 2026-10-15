@@ -330,6 +330,14 @@ pub struct Shell {
 
 impl Shell {
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
+        Self::prepare(boot)?.load()
+    }
+
+    /// The part of a load that places no memory: the device bound, the chip
+    /// measured, the trace fused for it and its axes compiled. Apart so the
+    /// residency check can price the arena scratch the compile reserves before
+    /// it chooses which weights stay resident.
+    pub fn prepare(boot: Boot<'_>) -> Result<PreparedLoad<'_>> {
         // Diffusion and conditioning activations leave the fp16 range.
         let wide_range = boot.trace.values.iter().any(|decl| {
             matches!(
@@ -363,7 +371,7 @@ impl Shell {
             None
         };
 
-        let profile = boot.profile.unwrap_or_else(|| {
+        let profile = boot.profile.clone().unwrap_or_else(|| {
             DeviceProfile::of(
                 &chip,
                 crate::chip::pricing_cores(&chip, device.cores()),
@@ -382,6 +390,58 @@ impl Shell {
             }
         };
         let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
+        Ok(PreparedLoad {
+            boot,
+            device,
+            perf_cores,
+            chip,
+            tuning,
+            elsewhere,
+            keepalive,
+            budgets,
+            compiled,
+        })
+    }
+}
+
+/// A load compiled and not yet placed; [`PreparedLoad::load`] places it.
+pub struct PreparedLoad<'a> {
+    boot: Boot<'a>,
+    device: Context,
+    perf_cores: u32,
+    chip: profile::Profile,
+    tuning: kernels_metal::Tuning,
+    elsewhere: u64,
+    keepalive: Option<crate::keepalive::KeepAlive>,
+    budgets: Budgets,
+    compiled: CompiledModel,
+}
+
+impl PreparedLoad<'_> {
+    /// The scratch the compiled axes reserve, which the load wires beside the
+    /// weights and the kv pool.
+    #[must_use]
+    pub fn arena_bytes(&self) -> u64 {
+        self.compiled.arena.bytes
+    }
+
+    /// The weight residency this load places, once priced with the scratch.
+    pub fn set_residency(&mut self, residency: Plan) {
+        self.boot.residency = residency;
+    }
+
+    pub fn load(self) -> Result<Shell> {
+        let PreparedLoad {
+            boot,
+            device,
+            perf_cores,
+            chip,
+            tuning,
+            elsewhere,
+            keepalive,
+            budgets,
+            compiled,
+        } = self;
 
         let facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
@@ -1067,7 +1127,9 @@ impl Shell {
             rebound: crate::icb::Rebound::default(),
         })
     }
+}
 
+impl Shell {
     pub fn open(&mut self, slot: u32) -> Result<()> {
         if self.pools.has_state() {
             self.drain()?;
