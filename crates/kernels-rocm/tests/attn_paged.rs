@@ -682,3 +682,21 @@ fn attn_paged_prefill_rows_fill_the_grid() {
         run_prefill_window(&gpu, &global, &[7], &[2000], 1, None, graph);
     }
 }
+
+/// Wide groups whose decode weighs its values on the matrix core: MiMo's and
+/// MiniMax-M3's sixteen query heads a kv head (256 wide, after the padding),
+/// Qwen3.8-Flash-Next's twelve, and eight 128-wide ones in HND pages; whole
+/// and split schedules, and a sliding window.
+#[test]
+fn attn_paged_wide_groups() {
+    let Some(gpu) = Gpu::open() else { return };
+    for c in [
+        Case { q_heads: 64, kv_heads: 4, head_dim: 256, page_size: 16, hnd: false },
+        Case { q_heads: 24, kv_heads: 2, head_dim: 256, page_size: 16, hnd: false },
+        Case { q_heads: 16, kv_heads: 2, head_dim: 128, page_size: 32, hnd: true },
+    ] {
+        run_decode(&gpu, &c, &[1, 37, 300, 1000], None, 4096);
+        run_decode(&gpu, &c, &[1, 37, 300, 1000], None, 1);
+        run_decode(&gpu, &c, &[5, 300, 2000], Some(128), 4096);
+    }
+}

@@ -214,16 +214,23 @@ pub fn decode(
             256,
         )
     } else if group <= 16 && shape.head_dim.is_multiple_of(32) {
+        // A group of eight or more weighs its values on the matrix core too
+        // (`PVM`), whose staged value rows hold four wavefronts' rounds at
+        // 256-wide heads.
+        let pvm = group >= 8 && shape.head_dim <= 256;
         // Four wavefronts at 512-wide heads; below, eight, or four (three
         // or four blocks a CU, not one) once the grid is two blocks a CU.
-        let waves = if shape.head_dim >= 512 || blocks >= 2 * plan.device.num_sm {
+        let waves = if shape.head_dim >= 512
+            || blocks >= 2 * plan.device.num_sm
+            || (pvm && shape.head_dim > 128)
+        {
             4
         } else {
             8
         };
         (
             symbol(&format!(
-                "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}, {waves}, {}>",
+                "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}, {waves}, {}, {pvm}>",
                 shape.head_dim,
                 shape.head_dim < 512
             )),
