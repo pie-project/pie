@@ -213,3 +213,115 @@ affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
       const device uchar *, const device bfloat *, const device bfloat *, const device bfloat *,   \
       device bfloat *, constant int &, constant int &, const device float *, const device int *,   \
       uint3);
+
+// A sorted expert tile on Splash's staged expert tile (runtime/metal/kernels/shared/moe_gguf.metal,
+// moe_expert_gguf_m32 over common/gguf_staged_tile.h's decode tile): two simdgroups each stream
+// their own 32 columns of the tile's expert, lane l staging column l's 32 inputs a step as half
+// (q * scale + bias, rounded once) into the simdgroup's two alternating stages, and the 8-, 16- or
+// 32-row matmul that holds the tile's live rows accumulates the stage over the whole contraction.
+// Grid (N / 64, tiles of 32 sorted rows); live rows lead a tile (perm >= 0) and only they are stored.
+constant constexpr ushort kRoutedColumns = 32, kRoutedStep = 32, kRoutedTile = 32;
+
+// 32 affine 4-bit codes (16 bytes, low nibble first) as half, q * scale + bias rounded once.
+inline void staged_dequant32(uint4 codes, float scale, float bias, threadgroup half *dst) {
+  const uint words[4] = {codes.x, codes.y, codes.z, codes.w};
+#pragma unroll
+  for (ushort w = 0; w < 4; ++w) {
+    half4 lo, hi;
+#pragma unroll
+    for (ushort j = 0; j < 4; ++j) {
+      lo[j] = half(fma(float((words[w] >> (4 * j)) & 15u), scale, bias));
+      hi[j] = half(fma(float((words[w] >> (4 * j + 16)) & 15u), scale, bias));
+    }
+    *((threadgroup half4 *)(dst + 8 * w)) = lo;
+    *((threadgroup half4 *)(dst + 8 * w + 4)) = hi;
+  }
+}
+
+template <ushort R>
+inline void routed_staged_rows(const device uchar *weights, const device bfloat *scales,
+                               const device bfloat *biases, const device bfloat *input,
+                               device bfloat *output, int width, int columns, uint tile,
+                               uint expert_column, uint origin, uint live,
+                               threadgroup half *stage, uint lane) {
+  auto a = tensor(const_cast<device bfloat *>(input) + ulong(tile) * kRoutedTile * width,
+                  dextents<int, 2>{width, R}, array<int, 2>{1, width});
+  constexpr auto descriptor =
+      matmul2d_descriptor(R, kRoutedColumns, kRoutedStep, false, true, false,
+                          matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<descriptor, execution_simdgroups<1>> operation;
+  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(
+      stage, dextents<int, 2>{kRoutedStep, kRoutedColumns}, array<int, 2>{1, kRoutedStep});
+  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(
+      stage + kRoutedStep * kRoutedColumns, dextents<int, 2>{kRoutedStep, kRoutedColumns},
+      array<int, 2>{1, kRoutedStep});
+  auto b0 = bt0.slice<kRoutedStep, kRoutedColumns>(0, 0);
+  auto b1 = bt1.slice<kRoutedStep, kRoutedColumns>(0, 0);
+  auto a0 = a.template slice<kRoutedStep, R>(0, 0);
+  auto acc = operation.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
+#pragma unroll
+  for (ushort i = 0; i < acc.get_capacity(); ++i)
+    acc[i] = 0.0f;
+  const ulong column = ulong(expert_column) + origin + lane;
+  const int groups = width / 64, steps = width / kRoutedStep;
+  const device uint4 *codes = reinterpret_cast<const device uint4 *>(weights + column * (width / 2));
+  const device bfloat *column_scales = scales + column * groups;
+  const device bfloat *column_biases = biases + column * groups;
+  uint4 packed = codes[0];
+  float scale = float(column_scales[0]), bias = float(column_biases[0]);
+  for (int step = 0; step < steps; ++step) {
+    threadgroup half *buffer = stage + (step & 1) * (kRoutedStep * kRoutedColumns);
+    staged_dequant32(packed, scale, bias, buffer + lane * kRoutedStep);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (step + 1 < steps) {
+      packed = codes[step + 1];
+      scale = float(column_scales[(step + 1) / 2]);
+      bias = float(column_biases[(step + 1) / 2]);
+    }
+    auto a_slice = a.template slice<kRoutedStep, R>(step * kRoutedStep, 0);
+    if (step & 1)
+      operation.run(a_slice, b1, acc);
+    else
+      operation.run(a_slice, b0, acc);
+  }
+#pragma unroll
+  for (ushort i = 0; i < acc.get_capacity(); ++i) {
+    if (!acc.is_valid_element(i))
+      continue;
+    auto index = acc.get_multidimensional_index(i);
+    if (uint(index[1]) < live)
+      output[(ulong(tile) * kRoutedTile + index[1]) * columns + origin + index[0]] = bfloat(acc[i]);
+  }
+}
+
+[[kernel]] void affine_qmm_routed_staged(const device uchar *weights [[buffer(0)]],
+                                         const device bfloat *scales [[buffer(1)]],
+                                         const device bfloat *biases [[buffer(2)]],
+                                         const device bfloat *input [[buffer(3)]],
+                                         device bfloat *output [[buffer(4)]],
+                                         constant int &width [[buffer(5)]],
+                                         constant int &columns [[buffer(6)]],
+                                         const device int *tile_expert [[buffer(7)]],
+                                         const device int *perm [[buffer(8)]],
+                                         uint2 group [[threadgroup_position_in_grid]],
+                                         uint simd_lane [[thread_index_in_simdgroup]],
+                                         uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half stage[2 * 2 * kRoutedStep * kRoutedColumns];
+  const uint tile = group.y;
+  const int expert = tile_expert[tile];
+  if (expert < 0)
+    return;
+  const uint live = simd_sum(perm[tile * kRoutedTile + simd_lane] >= 0 ? 1u : 0u);
+  const uint origin = group.x * 2 * kRoutedColumns + simd_group * kRoutedColumns;
+  const uint expert_column = uint(expert) * uint(columns);
+  threadgroup half *mine = stage + simd_group * (2 * kRoutedStep * kRoutedColumns);
+  if (live <= 8)
+    routed_staged_rows<8>(weights, scales, biases, input, output, width, columns, tile,
+                          expert_column, origin, live, mine, simd_lane);
+  else if (live <= 16)
+    routed_staged_rows<16>(weights, scales, biases, input, output, width, columns, tile,
+                           expert_column, origin, live, mine, simd_lane);
+  else
+    routed_staged_rows<32>(weights, scales, biases, input, output, width, columns, tile,
+                           expert_column, origin, live, mine, simd_lane);
+}

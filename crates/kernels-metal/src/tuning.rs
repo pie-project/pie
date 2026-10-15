@@ -229,6 +229,12 @@ pub enum SdpaPrefill {
 )]
 pub struct SdpaTileRowsPerRequest(pub u32);
 
+/// Whether a 32-row sorted expert tile runs Splash's staged expert tile,
+/// which stages its weights as half and needs no input sums.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.staged", flag, default = false, tune = search)]
+pub struct MoeStaged;
+
 /// Whether 64-wide heads attend through the simdgroup-matrix kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.mma", flag, default = true, tune = search)]
@@ -283,6 +289,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaSplit>()
         .add::<MoePath>()
         .add::<MoeTileRows>()
+        .add::<MoeStaged>()
         .add::<SdpaPrefill>()
         .add::<SdpaTileRowsPerRequest>()
         .add::<SdpaMma>()
@@ -409,6 +416,11 @@ impl Tuning {
     #[must_use]
     pub fn sdpa_tile_rows_per_request(&self) -> u32 {
         self.profile.get::<SdpaTileRowsPerRequest>().0
+    }
+
+    #[must_use]
+    pub fn moe_staged(&self) -> bool {
+        self.profile.on::<MoeStaged>(&profile::Anywhere)
     }
 
     #[must_use]

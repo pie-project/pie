@@ -823,7 +823,32 @@ pub fn matmul_select_batched(
         ],
     )?;
 
-    if let Some((m, n, simdgroups)) = mpp {
+    if tile == 32
+        && tuning.moe_staged()
+        && bias.is_none()
+        && bank.affine()
+        && bank.biases.is_some()
+        && (bank.bits, bank.group) == (4, 64)
+        && bank.scales.dtype == Dtype::Bf16
+        && x.width.is_multiple_of(64)
+        && y.width.is_multiple_of(64)
+    {
+        ctx.fire(
+            Fire::at("linear/quant_qmm_mpp.metal", "affine_qmm_routed_staged")
+                .apply(Grid::of([64 * (y.width / 64), padded / 32, 1], [64, 1, 1])),
+            &[
+                bank.codes.arg(),
+                bank.scales.arg(),
+                zero_points(ctx, bank)?,
+                scratch.x.arg(),
+                scratch.y.arg_mut(),
+                stated(op, x.width)?.arg(),
+                stated(op, y.width)?.arg(),
+                scratch.tile_expert.arg(),
+                scratch.perm.arg(),
+            ],
+        )?;
+    } else if let Some((m, n, simdgroups)) = mpp {
         const FILE: &str = "linear/quant_qmm_mpp.metal";
         let k = stated(op, x.width)?;
         ctx.fire(
