@@ -234,6 +234,13 @@ pub struct SdpaTileRowsPerRequest(pub u32);
 #[decision(id = "kernel.sdpa.mma", flag, default = true, tune = search)]
 pub struct SdpaMma;
 
+/// Whether a few rows a request (verify rows) over a bf16 pool attend through the split
+/// paged kernel, one threadgroup a KV head and history slice sharing each page across the
+/// rows' grouped query heads, as Splash runs its verify attention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.split_bf16", flag, default = false, tune = search)]
+pub struct SdpaSplitBf16;
+
 /// Whether attention reads keys and values through the 8-bit kernel. It
 /// halves the pool and changes what attention reads: the operator's call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -280,6 +287,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaTileRowsPerRequest>()
         .add::<SdpaMma>()
         .add::<SdpaKvQ8>()
+        .add::<SdpaSplitBf16>()
         .add::<GdnScan>();
 }
 
@@ -406,6 +414,11 @@ impl Tuning {
     #[must_use]
     pub fn sdpa_mma(&self) -> bool {
         self.profile.on::<SdpaMma>(&profile::Anywhere)
+    }
+
+    #[must_use]
+    pub fn sdpa_split_bf16(&self) -> bool {
+        self.profile.on::<SdpaSplitBf16>(&profile::Anywhere)
     }
 
     #[must_use]

@@ -10,5 +10,8 @@ qmm = [
   { when = "rows >= 12", use = "tiled", crossover_tg = 96 },
   { use = "qmv", rows_max = 8, packs = 1, crossover_tg = 96 },
 ]
+# verify rows attend as Splash's do on M3/M4: one threadgroup a KV head and history slice,
+# each page read once for the rows' grouped query heads
+sdpa.split_bf16 = true
 ane.mlp         = [{ when = "ane", use = "share", percent = 47 }, "gpu"]
 ane.projections = [{ when = "ane", use = "share", percent = 47 }, "gpu"]
