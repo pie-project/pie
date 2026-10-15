@@ -628,7 +628,10 @@ __global__ void moe_topk_sigmoid(
     for (int e = tid; e < E; e += blockDim.x) taken[e] = false;
     __syncthreads();
 
-    if (tid == 0) {
+    // The first warp picks: each lane walks its own experts in order, keeping
+    // the first of its highest, and the warp keeps the highest of those, the
+    // lower expert on a tie, so each pick is the serial walk's.
+    if (tid < 32) {
         i32* idx = topk_idx + static_cast<long long>(plane_row) * K;
         float* w = topk_w + static_cast<long long>(plane_row) * K;
         float sum = 0.f;
@@ -636,7 +639,7 @@ __global__ void moe_topk_sigmoid(
         for (int k = 0; k < picks; ++k) {
             int best_i = -1;
             float best_v = -flt_max();
-            for (int e = 0; e < E; ++e) {
+            for (int e = tid; e < E; e += 32) {
                 if (taken[e]) continue;
                 const float v = scores[e];
 
@@ -645,11 +648,25 @@ __global__ void moe_topk_sigmoid(
                     best_i = e;
                 }
             }
-            idx[k] = best_i;
-            w[k] = orig_scores[best_i];
-            sum += orig_scores[best_i];
-            taken[best_i] = true;
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, best_v, off);
+                const int oi = __shfl_xor_sync(0xffffffffu, best_i, off);
+                if (oi >= 0 && (best_i < 0 || ov > best_v || (ov == best_v && oi < best_i))) {
+                    best_v = ov;
+                    best_i = oi;
+                }
+            }
+            best_i = __shfl_sync(0xffffffffu, best_i, 0);
+            if (tid == 0) {
+                idx[k] = best_i;
+                w[k] = orig_scores[best_i];
+                sum += orig_scores[best_i];
+                taken[best_i] = true;
+            }
+            __syncwarp();
         }
+        if (tid != 0) return;
 
         for (int k = picks; k < K; ++k) {
             idx[k] = 0;
