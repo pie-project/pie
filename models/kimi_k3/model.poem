@@ -156,6 +156,9 @@ def released(layers, experts, res_block):
 DIMS = {
     "kimik3-2.8t": released(93, 896, 12),
     "kimik3-mini": released(8, 32, 4),
+    # The release's first four layers with every expert: the dense layer,
+    # two KDA layers and an MLA one, in one AttnRes block.
+    "kimik3-l4": released(4, 896, 12),
     "kimik3": fixture(),
 }
 

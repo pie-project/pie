@@ -1,5 +1,7 @@
-# Kimi-K3: the released model, its eight-layer, 32-expert miniature, and
-# `kimik3`, a small fixture of its architecture (2048 wide, 64 experts).
+# Kimi-K3: the released model, its eight-layer, 32-expert miniature, its
+# first four layers with every expert (a per-layer reading against other
+# engines), and `kimik3`, a small fixture of its architecture (2048 wide, 64
+# experts).
 
 KIMI = template("kimi")
 TOKENIZER = tokenizer(markers = [["<|im_end|>", "[EOS]"]])
@@ -9,11 +11,14 @@ TOKENIZER3 = tokenizer(markers = [["<|end_of_msg|>", "[EOS]", "[EOT]"]])
 MODELS = [
     model("kimik3-2.8t", template = XTML, tokenizer = TOKENIZER3, arch = "kimi_k3", layers = 93, vocab = 163840),
     model("kimik3-mini", mini = True, template = XTML, tokenizer = TOKENIZER3, arch = "kimi_k3", layers = 8, vocab = 163840),
+    model("kimik3-l4", mini = True, template = XTML, tokenizer = TOKENIZER3, arch = "kimi_k3", layers = 4, vocab = 163840),
     model("kimik3", template = KIMI, tokenizer = TOKENIZER, arch = "kimi_k3", layers = 8, vocab = 163840),
 ]
 
 DEPLOYMENTS = [
     deployment("kimik3-2.8t", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
     deployment("kimik3-mini", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
+    deployment("kimik3-l4", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
+    deployment("kimik3-l4", weights = [dtype.bf16, dtype.mxfp4a8], kv = dtype.bf16),
     deployment("kimik3", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
 ]
