@@ -1,5 +1,18 @@
 //! engine-cuda's integration tests, one binary: each module was a test file.
 
+// Strict kernels for the whole binary, before any test runs: an
+// instantiation that will not compile fails its test instead of falling
+// back unseen.
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static STRICT_KERNELS: extern "C" fn() = {
+    extern "C" fn on() {
+        kernels_cuda::jit::strict_kernels();
+    }
+    on
+};
+
 #[cfg(feature = "cuda")]
 mod common_dit;
 #[cfg(feature = "cuda")]

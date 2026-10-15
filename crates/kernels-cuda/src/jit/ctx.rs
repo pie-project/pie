@@ -531,10 +531,32 @@ impl Ctx {
 }
 
 #[cfg(feature = "cuda")]
+/// Whether a device instantiation that will not fire (it does not compile,
+/// or its module does not load) panics rather than falling back: on under
+/// `PIE_STRICT_KERNELS=1` or [`strict_kernels`], as the test harnesses run.
+/// Off, the fallback serves (another chip's toolchain may lack what one
+/// unit asks) and the fault is said once.
+#[must_use]
+pub fn kernels_strict() -> bool {
+    STRICT.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("PIE_STRICT_KERNELS").is_some_and(|v| v == "1")
+}
+
+/// Turns [`kernels_strict`] on for this process.
+pub fn strict_kernels() {
+    STRICT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn said(root: &str, instantiation: &str, why: crate::jit::Fault) -> crate::jit::Fault {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
+    assert!(
+        !kernels_strict(),
+        "strict kernels: `{root}` {instantiation} will not fire: {why}"
+    );
     static SAID: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let said = SAID.get_or_init(|| Mutex::new(HashSet::new()));
     if let Ok(mut said) = said.lock()

@@ -3,6 +3,19 @@
 
 mod common;
 
+// Strict kernels for the whole binary, before any test runs: an
+// instantiation that will not compile fails its test instead of falling
+// back unseen.
+#[cfg(target_os = "linux")]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static STRICT_KERNELS: extern "C" fn() = {
+    extern "C" fn on() {
+        kernels_cuda::jit::strict_kernels();
+    }
+    on
+};
+
 mod a_body_captured_on_its_own_stream_takes_its_owners_tile;
 mod a_qkv_split_reaches_every_row_of_a_tall_fire;
 mod a_trimmed_pixel_shuffle_drops_its_anchor_frames;
