@@ -623,8 +623,10 @@ struct GroupAffine {
 
 // y[route] = W·act[route / act_div] (+ bias) for routes order[begin ..
 // begin + count) (count ≤ MT) of one expert, weight rows [blockIdx.y·32·
-// waves, +32·waves). Rounds once on the store, after the bias.
-template <class C, class T, int MT, int NBW = 2, int WAVES = kGroupWaves<MT>>
+// waves, +32·waves). Rounds once on the store, after the bias. SORTED bit 0:
+// the activation's rows are in expert order (ordered route i at row i, no
+// act_div); bit 1: the products land in that order too, not by route.
+template <class C, class T, int MT, int NBW = 2, int WAVES = kGroupWaves<MT>, int SORTED = 0>
 __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i32* __restrict__ order, int begin,
                                              int count, const typename C::Planes& p, const T* __restrict__ bias,
                                              T* __restrict__ out, int act_div, int n, int k, int tile = -1) {
@@ -659,7 +661,8 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
         const int piece = tid + i * THREADS;
         const int m = piece / (KC / 8);
         live[i] = m < count;
-        src[i] = act + static_cast<long long>(order[begin + (live[i] ? m : 0)] / act_div) * k;
+        const int mm = begin + (live[i] ? m : 0);
+        src[i] = act + static_cast<long long>((SORTED & 1) != 0 ? mm : order[mm] / act_div) * k;
         col[i] = (piece % (KC / 8)) * 8;
         at[i] = swz(m, col[i]);
     }
@@ -748,7 +751,7 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
     for (int mb = 0; mb < MB; ++mb) {
         const int m = mb * 16 + r16;
         if (m >= count) continue;
-        T* o = out + static_cast<long long>(order[begin + m]) * n;
+        T* o = out + static_cast<long long>((SORTED & 2) != 0 ? begin + m : order[begin + m]) * n;
 #pragma unroll
         for (int nb = 0; nb < NB; ++nb) {
             const int c = row0 + nb * 16 + 4 * g;

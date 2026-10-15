@@ -482,8 +482,8 @@ constexpr int kDenseXcds = 8;
 
 // The grouped dense leg: routes ordered by expert (moe_route_order in
 // linear/quant.hip), one work item of up to MT a block. Grid (work items,
-// ⌈N / (32·waves)⌉), kGroupWaves<MT> waves.
-template <class T, int MT>
+// ⌈N / (32·waves)⌉), kGroupWaves<MT> waves. SORTED as grouped_tile's.
+template <class T, int MT, int SORTED = 0>
 __global__ __launch_bounds__(kGroupWaves<MT>* kWave) void moe_matmul_select_grouped(const T* __restrict__ act, const i32* __restrict__ order,
                                                                  const i32* __restrict__ offsets,
                                                                  const i32* __restrict__ work,
@@ -499,14 +499,14 @@ __global__ __launch_bounds__(kGroupWaves<MT>* kWave) void moe_matmul_select_grou
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item, at % gridDim.x)) return;
     const T* w = bank + static_cast<long long>(item.expert) * n * k;
-    grouped_tile<GroupDense<T>, T, MT>(act, order, item.begin, item.count, {w}, nullptr, out, act_div, n, k,
-                                       at / gridDim.x);
+    grouped_tile<GroupDense<T>, T, MT, 2, kGroupWaves<MT>, SORTED>(act, order, item.begin, item.count, {w},
+                                                                  nullptr, out, act_div, n, k, at / gridDim.x);
 }
 
 // The grouped dense leg at a prefill's routes: NBW 16-row weight blocks a
 // wave over WAVES waves (16·NBW·WAVES weight rows a block), so each
 // activation piece a wave reads from LDS feeds NBW times the products.
-template <class T, int MT, int NBW, int WAVES>
+template <class T, int MT, int NBW, int WAVES, int SORTED = 0>
 __global__ __launch_bounds__(WAVES* kWave) void moe_matmul_select_grouped_tall(
     const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const T* __restrict__ bank, T* __restrict__ out, int act_div, int n, int k,
@@ -518,8 +518,8 @@ __global__ __launch_bounds__(WAVES* kWave) void moe_matmul_select_grouped_tall(
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item, at % gridDim.x)) return;
     const T* w = bank + static_cast<long long>(item.expert) * n * k;
-    grouped_tile<GroupDense<T>, T, MT, NBW, WAVES>(act, order, item.begin, item.count, {w}, nullptr, out, act_div,
-                                                   n, k, at / gridDim.x);
+    grouped_tile<GroupDense<T>, T, MT, NBW, WAVES, SORTED>(act, order, item.begin, item.count, {w}, nullptr, out,
+                                                           act_div, n, k, at / gridDim.x);
 }
 
 // The batch dense leg (decode batches): one work item of up to MT routes a
@@ -580,6 +580,39 @@ __global__ __launch_bounds__(256) void dense_batch_bf16(const bf16* __restrict__
     batch_tile<BatchDense<bf16, SBY>, bf16, MT, SWIGLU ? 2 : 1, 3, SWIGLU, NT>(
         act, nullptr, begin, min(MT, m - begin), {w}, nullptr, y, 1, n, k, tile, split * per, (split + 1) * per,
         slice);
+}
+
+
+// ------------------------------------------------ the ordered routed MLP --
+
+// The routed MLP's activation over rows in expert order: h[i] = silu(g) · u
+// of packed[i] = [g | u] (g capped above at `limit`, u held to ±limit, when
+// CLAMP), for the live routes i < offsets[E]. Grid (route cap, ⌈I / (8 ·
+// 256)⌉), 256 threads, eight elements a thread; I a multiple of 8.
+template <class T, bool CLAMP>
+__global__ __launch_bounds__(256) void moe_swiglu_ordered(const T* __restrict__ packed, T* __restrict__ h,
+                                                          const i32* __restrict__ offsets, int num_experts, int I,
+                                                          float limit) {
+    const int i = blockIdx.x;
+    if (i >= offsets[num_experts]) return;
+    const int c = (blockIdx.y * 256 + threadIdx.x) * 8;
+    if (c >= I) return;
+    const long long row = static_cast<long long>(i);
+    const Pack8<T> g = *reinterpret_cast<const Pack8<T>*>(packed + row * 2 * I + c);
+    const Pack8<T> u = *reinterpret_cast<const Pack8<T>*>(packed + row * 2 * I + I + c);
+    Pack8<T> o;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        float gv = to_f32(g.v[e]), uv = to_f32(u.v[e]);
+        if constexpr (CLAMP) {
+            gv = fminf(gv, limit);
+            uv = fminf(fmaxf(uv, -limit), limit);
+            o.v[e] = from_f32<T>(gv / (1.f + expf(-gv)) * uv);
+        } else {
+            o.v[e] = from_f32<T>(gv * (1.f / (1.f + __expf(-gv))) * uv);
+        }
+    }
+    *reinterpret_cast<Pack8<T>*>(h + row * I + c) = o;
 }
 
 }  // namespace pie::linear

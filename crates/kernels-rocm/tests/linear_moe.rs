@@ -1860,40 +1860,23 @@ fn bench_moe_prefill_vs_dense() {
         let rt = planes.i32s(&routes, tokens as u32, top_k as u32);
         let x = gpu.tensor(&bf16s(tokens * k as usize, 1, 1.0), tokens as u32, k, Dtype::Bf16);
         let mut y = gpu.zeros((tokens * top_k) as u32, n, Dtype::Bf16);
-        let bytes = u64::from(experts) * u64::from(n) * u64::from(k) * 2;
-        let bank = Tensor::new(
-            planes.keep(hip::Buffer::alloc(bytes as usize).unwrap(), 1, 1, Dtype::U8).ptr,
-            experts,
-            n * k,
-            Dtype::Bf16,
-        );
-        // Random weights, not the allocation's zeros: a matrix core fed
-        // zeros draws far less power and clocks higher than real data lets
-        // it (hipBLASLt read 772 TFLOP/s on zeros, 636 on random values).
-        {
-            const CHUNK: usize = 16 << 20;
-            let block = gpu.tensor(&bf16s(CHUNK / 2, 9, 0.1), 1, (CHUNK / 2) as u32, Dtype::Bf16);
-            let mut at = 0usize;
-            while at < bytes as usize {
-                let len = CHUNK.min(bytes as usize - at);
-                // SAFETY: both ranges are live device allocations of at least `len` bytes.
-                unsafe {
-                    hip::rt::hipMemcpy(
-                        (bank.ptr as usize + at) as *mut _,
-                        block.ptr as usize as *const _,
-                        len,
-                        hip::rt::hipMemcpyDeviceToDevice,
-                    );
-                }
-                at += len;
-            }
-            gpu.sync();
-        }
+        let bank = random_bank(&gpu, &planes, experts, n, k);
         let flops = 2.0 * (tokens * top_k) as f64 * f64::from(n) * f64::from(k);
         let ctx = gpu.ctx();
         let us = gpu.time(6, || {
             moe::matmul_select(&ctx, x, bank, rt, &mut y, moe::ExpertTable::RESIDENT).unwrap();
         });
+        // The routed leg the default took against the stream leg's products.
+        let got = gpu.read(&y);
+        let mut want_t = gpu.zeros((tokens * top_k) as u32, n, Dtype::Bf16);
+        let stream = tuned(&gpu, |t| t.moe_grouped = false);
+        moe::matmul_select(&stream, x, bank, rt, &mut want_t, moe::ExpertTable::RESIDENT).unwrap();
+        let want = gpu.read(&want_t);
+        let mut worst = 0f32;
+        for (g, w) in got.iter().zip(&want) {
+            worst = worst.max((g - w).abs() / (w.abs() + 0.05));
+        }
+        assert!(worst < 0.05, "routed default leg off the stream leg by {worst}");
         let xr = gpu.tensor(&bf16s(tokens * top_k * k as usize, 2, 1.0), (tokens * top_k) as u32, k, Dtype::Bf16);
         let w = Tensor::new(bank.ptr, n, k, Dtype::Bf16);
         let dense = gpu.time(6, || {
@@ -1958,4 +1941,126 @@ fn the_routed_clamp_and_the_sum_add_answer_the_host() {
         })
         .collect();
     common::close_bf16("moe_sum_add", &gpu.read(&out), &want, 1.0);
+}
+
+/// An experts x (n x k) bf16 bank of random weights, not the allocation's
+/// zeros: a matrix core fed zeros draws far less power and clocks higher than
+/// real data lets it (hipBLASLt read 772 TFLOP/s on zeros, 636 on random
+/// values).
+fn random_bank(gpu: &Gpu, planes: &Planes, experts: u32, n: u32, k: u32) -> Tensor {
+    let bytes = u64::from(experts) * u64::from(n) * u64::from(k) * 2;
+    let bank = Tensor::new(
+        planes.keep(hip::Buffer::alloc(bytes as usize).unwrap(), 1, 1, Dtype::U8).ptr,
+        experts,
+        n * k,
+        Dtype::Bf16,
+    );
+    const CHUNK: usize = 16 << 20;
+    let block = gpu.tensor(&bf16s(CHUNK / 2, 9, 0.1), 1, (CHUNK / 2) as u32, Dtype::Bf16);
+    let mut at = 0usize;
+    while at < bytes as usize {
+        let len = CHUNK.min(bytes as usize - at);
+        // SAFETY: both ranges are live device allocations of at least `len` bytes.
+        unsafe {
+            hip::rt::hipMemcpy(
+                (bank.ptr as usize + at) as *mut _,
+                block.ptr as usize as *const _,
+                len,
+                hip::rt::hipMemcpyDeviceToDevice,
+            );
+        }
+        at += len;
+    }
+    gpu.sync();
+    bank
+}
+
+/// The routed swiglu MLP at the prefill models' shapes: the default (the
+/// expert-ordered pipeline where it measured faster) against the four routed
+/// steps, both against dense GEMMs of the same products, and checked against
+/// the steps.
+#[test]
+#[ignore = "benchmark"]
+fn bench_moe_mlp_prefill() {
+    let Some(gpu) = Gpu::open() else { return };
+    let planes = Planes::default();
+    // tokens, top_k, experts, hidden, intermediate, clamped
+    let shapes: [(usize, usize, u32, u32, u32, bool); 4] = [
+        (8192, 8, 32, 4096, 2048, true),
+        (4096, 8, 32, 4096, 2048, true),
+        (8192, 10, 16, 2560, 640, false),
+        (4096, 10, 16, 2560, 640, false),
+    ];
+    for (tokens, top_k, experts, hidden, inter, clamped) in shapes {
+        let r = (tokens * top_k) as u32;
+        let routes = make_routes(tokens, top_k, experts as usize, 3, false);
+        let rt = planes.i32s(&routes, tokens as u32, top_k as u32);
+        let wt = gpu.tensor(&values(tokens * top_k, 2, 1.0), tokens as u32, top_k as u32, Dtype::F32);
+        let x = gpu.tensor(&bf16s(tokens * hidden as usize, 1, 1.0), tokens as u32, hidden, Dtype::Bf16);
+        let gate_up = random_bank(&gpu, &planes, experts, 2 * inter, hidden);
+        let down = random_bank(&gpu, &planes, experts, hidden, inter);
+        let p = moe::RoutedMlp {
+            x,
+            routes: rt,
+            weights: wt,
+            gate_up,
+            gate_up_experts: moe::ExpertTable::RESIDENT,
+            down,
+            down_experts: moe::ExpertTable::RESIDENT,
+            intermediate: inter,
+            limit: clamped.then_some(7.0),
+            fan: 1,
+            packed: gpu.zeros(r, 2 * inter, Dtype::Bf16),
+            h: gpu.zeros(r, inter, Dtype::Bf16),
+            routed: gpu.zeros(r, hidden, Dtype::Bf16),
+        };
+        let ctx = gpu.ctx();
+        let mut y = gpu.zeros(tokens as u32, hidden, Dtype::Bf16);
+        let mut y_steps = gpu.zeros(tokens as u32, hidden, Dtype::Bf16);
+        let fused = gpu.time(6, || moe::mlp_swiglu(&ctx, &p, &mut y).unwrap());
+        let steps = gpu.time(6, || {
+            let (mut packed, mut h, mut routed) = (p.packed, p.h, p.routed);
+            moe::matmul_select(&ctx, x, gate_up, rt, &mut packed, moe::ExpertTable::RESIDENT).unwrap();
+            match p.limit {
+                Some(l) => kernels_rocm::linear::mlp::swiglu_clamp(&ctx, packed, inter, 1, l, &mut h).unwrap(),
+                None => kernels_rocm::linear::mlp::swiglu(&ctx, packed, inter, 1, &mut h).unwrap(),
+            }
+            moe::matmul_select(&ctx, h, down, rt, &mut routed, moe::ExpertTable::RESIDENT).unwrap();
+            moe::weighted_sum(&ctx, routed, wt, &mut y_steps).unwrap();
+        });
+        let (got, want) = (gpu.read(&y), gpu.read(&y_steps));
+        // Both round the gate_up products and the activation to bf16, from
+        // sums in different orders: an ulp apart there moves a few outputs by
+        // a few percent of the typical magnitude, never the whole.
+        let mag = want.iter().map(|v| v.abs()).sum::<f32>() / want.len() as f32;
+        let (mut worst, mut err, mut norm) = (0f32, 0f64, 0f64);
+        for (g, w) in got.iter().zip(&want) {
+            worst = worst.max((g - w).abs() / (w.abs() + 0.1 * mag));
+            err += f64::from(g - w).powi(2);
+            norm += f64::from(*w).powi(2);
+        }
+        let rms = (err / norm).sqrt();
+        assert!(
+            rms < 5e-3 && worst < 0.2,
+            "routed MLP off its four steps: rms {rms}, worst {worst}"
+        );
+        let xr = gpu.tensor(&bf16s(r as usize * hidden as usize, 2, 1.0), r, hidden, Dtype::Bf16);
+        let hr = gpu.tensor(&bf16s(r as usize * inter as usize, 4, 1.0), r, inter, Dtype::Bf16);
+        let mut packed = p.packed;
+        let mut routed = p.routed;
+        let w1 = Tensor::new(gate_up.ptr, 2 * inter, hidden, Dtype::Bf16);
+        let w2 = Tensor::new(down.ptr, hidden, inter, Dtype::Bf16);
+        let dense = gpu.time(6, || {
+            kernels_rocm::linear::gemm::matmul(&ctx, xr, w1, &mut packed).unwrap();
+            kernels_rocm::linear::gemm::matmul(&ctx, hr, w2, &mut routed).unwrap();
+        });
+        let flops = 2.0 * f64::from(r) * 3.0 * f64::from(inter) * f64::from(hidden);
+        println!(
+            "moe mlp {tokens}x{top_k} over {experts} experts {hidden}/{inter}: default {fused:8.1} us {:6.1} TF | steps {steps:8.1} us {:6.1} TF | dense gemms {dense:8.1} us {:6.1} TF | default/dense {:5.1}% | rms {rms:.1e} worst {worst:.3}",
+            flops / fused / 1e6,
+            flops / steps / 1e6,
+            flops / dense / 1e6,
+            100.0 * dense / fused,
+        );
+    }
 }

@@ -856,11 +856,33 @@ fn select_grouped(
     experts: u32,
     fan: &Selected,
 ) -> Result<(), Error> {
+    let ordered = route_order(ctx, op, routes, fan, experts, group_routes(fan, experts))?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    select_grouped_launch(ctx, op, x, bank, y, experts, &ordered, act_div, 0)
+}
+
+/// The grouped legs' row layouts (`SORTED` of the kernels): the activation's
+/// rows already in expert order (route i of the ordering at row i), and the
+/// products landed in expert order; otherwise each is by route.
+const SORT_ACT: u32 = 1;
+const SORT_OUT: u32 = 2;
+
+/// The grouped dense leg over an ordering already made.
+#[allow(clippy::too_many_arguments)]
+fn select_grouped_launch(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: Tensor,
+    y: &mut Tensor,
+    experts: u32,
+    ordered: &RouteOrder,
+    act_div: i32,
+    sorted: u32,
+) -> Result<(), Error> {
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
-    let ordered = route_order(ctx, op, routes, fan, experts, group_routes(fan, experts))?;
-    let act_div = if fan.by_token { fan.top_k } else { 1 };
     // 128-route items over a bank whose rows come in whole 512s take the
     // tall block: 64 weight rows a wave, so each activation piece read from
     // LDS feeds twice the products (GLM's 4096-row legs: 461 -> 505
@@ -873,7 +895,7 @@ fn select_grouped(
     let (entry, launch) = if tall {
         (
             format!(
-                "::pie::linear::moe_matmul_select_grouped_tall<{t}, ::pie::i32({}), ::pie::i32(4), ::pie::i32(8)>",
+                "::pie::linear::moe_matmul_select_grouped_tall<{t}, ::pie::i32({}), ::pie::i32(4), ::pie::i32(8), ::pie::i32({sorted})>",
                 ordered.routes
             ),
             Launch::grid([ordered.work_cap, y.width / TALL_ROWS, 1], [64 * 8, 1, 1]),
@@ -881,7 +903,7 @@ fn select_grouped(
     } else {
         (
             format!(
-                "::pie::linear::moe_matmul_select_grouped<{t}, ::pie::i32({})>",
+                "::pie::linear::moe_matmul_select_grouped<{t}, ::pie::i32({}), ::pie::i32({sorted})>",
                 ordered.routes
             ),
             group_launch(ordered.work_cap, ordered.routes, y.width),
@@ -903,6 +925,176 @@ fn select_grouped(
             stated(op, experts)?.arg(),
         ],
     )
+}
+
+/// The routed MLP with its routes kept in expert order between the two
+/// matmuls: one route ordering, the gate-up leg reading the tokens' rows by
+/// route and landing its products in expert order, the swiglu over those
+/// rows, the down leg reading them in that order and landing its products by
+/// route for the weighted fold. Against the four steps it skips the gate-up
+/// products' and the activation's walks by route (and a second ordering).
+/// Taken per (experts, hidden, intermediate, route bucket) where it measured
+/// faster: both are timed once, outside a capture, on the fire's own planes.
+#[cfg(feature = "rocm")]
+mod ordered {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use super::{
+        FILE, Selected, dense_experts, group_routes, grouped_worth, route_order, select_grouped_launch,
+        selected, weighted_sum, SORT_ACT, SORT_OUT,
+    };
+    use crate::error::Error;
+    use crate::hip::rt;
+    use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, stated, symbol};
+    use crate::tensor::Tensor;
+
+    /// (device, experts, hidden, intermediate, route bucket).
+    type Key = (i32, u32, u32, u32, u32);
+
+    fn verdicts() -> &'static Mutex<HashMap<Key, bool>> {
+        static V: OnceLock<Mutex<HashMap<Key, bool>>> = OnceLock::new();
+        V.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn capturing(ctx: &Ctx) -> bool {
+        let mut status = 0;
+        // SAFETY: queries a live stream.
+        unsafe { rt::hipStreamIsCapturing(ctx.stream().cast(), &raw mut status) != 0 || status != 0 }
+    }
+
+    fn device() -> i32 {
+        let mut device = 0;
+        // SAFETY: writes one int.
+        unsafe { rt::hipGetDevice(&raw mut device) };
+        device
+    }
+
+    /// Device µs of `reps` runs of `f` on the context's stream.
+    fn time(ctx: &Ctx, reps: u32, mut f: impl FnMut() -> Result<(), Error>) -> Result<f32, Error> {
+        f()?;
+        let (mut a, mut b): (rt::Event, rt::Event) = (core::ptr::null_mut(), core::ptr::null_mut());
+        // SAFETY: fresh events recorded on a live stream, destroyed after.
+        unsafe {
+            rt::hipEventCreate(&raw mut a);
+            rt::hipEventCreate(&raw mut b);
+            rt::hipEventRecord(a, ctx.stream().cast());
+        }
+        for _ in 0..reps {
+            f()?;
+        }
+        let mut ms = 0f32;
+        // SAFETY: as above.
+        unsafe {
+            rt::hipEventRecord(b, ctx.stream().cast());
+            rt::hipEventSynchronize(b);
+            rt::hipEventElapsedTime(&raw mut ms, a, b);
+            rt::hipEventDestroy(a);
+            rt::hipEventDestroy(b);
+        }
+        Ok(ms * 1e3 / reps as f32)
+    }
+
+    /// The routed swiglu MLP in expert order, when both legs are the grouped
+    /// dense ones and the ordered pipeline measured faster than the four
+    /// steps it replaces (`steps`, which land `packed`, `h` and `routed` by
+    /// route, then the fold). Whether it ran.
+    pub(super) fn mlp(
+        ctx: &Ctx,
+        op: &'static str,
+        p: &super::RoutedMlp,
+        steps: &mut dyn FnMut() -> Result<(), Error>,
+        y: &mut Tensor,
+    ) -> Result<bool, Error> {
+        let (x, i) = (p.x, p.intermediate);
+        let fan = selected(op, x, p.routes, &p.packed)?;
+        let (Some(experts), Some(down_experts)) = (
+            grouped_worth(ctx, x, p.gate_up, &p.packed, &fan, p.gate_up_experts),
+            dense_experts(p.h, p.down, &p.routed, p.down_experts),
+        ) else {
+            return Ok(false);
+        };
+        let hidden = y.width;
+        if experts != down_experts
+            || p.packed.width != 2 * i
+            || p.routed.width != hidden
+            || ![x.width, i, hidden].iter().all(|w| w.is_multiple_of(8))
+        {
+            return Ok(false);
+        }
+        let key = (device(), experts, hidden, i, fan.route_count.next_power_of_two());
+        let decided = verdicts().lock().ok().and_then(|v| v.get(&key).copied());
+        match decided {
+            Some(false) => return Ok(false),
+            None if capturing(ctx) => return Ok(false),
+            _ => {}
+        }
+        let run = |y: &mut Tensor| -> Result<(), Error> { pipeline(ctx, op, p, &fan, experts, y) };
+        if decided.is_none() {
+            let ours = time(ctx, 3, || run(y))?;
+            let theirs = time(ctx, 3, &mut *steps)?;
+            let wins = ours < theirs;
+            tracing::info!(
+                experts,
+                hidden,
+                intermediate = i,
+                routes = fan.route_count,
+                ordered_us = ours,
+                steps_us = theirs,
+                wins,
+                "routed MoE MLP: routes in expert order across both matmuls against the four routed steps"
+            );
+            if let Ok(mut v) = verdicts().lock() {
+                v.insert(key, wins);
+            }
+            if !wins {
+                return Ok(false);
+            }
+        }
+        run(y)?;
+        Ok(true)
+    }
+
+    fn pipeline(
+        ctx: &Ctx,
+        op: &'static str,
+        p: &super::RoutedMlp,
+        fan: &Selected,
+        experts: u32,
+        y: &mut Tensor,
+    ) -> Result<(), Error> {
+        let (x, i) = (p.x, p.intermediate);
+        let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+        let rows = fan.route_count as usize;
+        let elem = 2usize;
+        let packed = ctx.scratch(op, "linear.moe_ordered_packed", rows * 2 * i as usize * elem)? as usize as u64;
+        let h = ctx.scratch(op, "linear.moe_ordered_h", rows * i as usize * elem)? as usize as u64;
+        let ordered = route_order(ctx, op, p.routes, fan, experts, group_routes(fan, experts))?;
+        let act_div = if fan.by_token { fan.top_k } else { 1 };
+        // Gate-up: the tokens' rows by route in, the products in expert order.
+        let mut packed_t = Tensor::new(packed, fan.route_count, 2 * i, x.dtype);
+        select_grouped_launch(ctx, op, x, p.gate_up, &mut packed_t, experts, &ordered, act_div, SORT_OUT)?;
+        // The swiglu over the ordered rows.
+        let clamp = if p.limit.is_some() { "true" } else { "false" };
+        ctx.fire(
+            op,
+            Fire::at(FILE, symbol(&format!("::pie::linear::moe_swiglu_ordered<{t}, {clamp}>")))
+                .apply(Launch::grid([fan.route_count, i.div_ceil(8 * 256), 1], [256, 1, 1])),
+            &[
+                ArgValue::Ptr(packed),
+                ArgValue::Ptr(h),
+                ArgValue::Ptr(ordered.offsets),
+                stated(op, experts)?.arg(),
+                stated(op, i)?.arg(),
+                p.limit.unwrap_or(f32::INFINITY).arg(),
+            ],
+        )?;
+        // Down: the ordered rows in, the products by route.
+        let h_t = Tensor::new(h, fan.route_count, i, x.dtype);
+        let mut routed = p.routed;
+        select_grouped_launch(ctx, op, h_t, p.down, &mut routed, experts, &ordered, 1, SORT_ACT)?;
+        weighted_sum(ctx, p.routed, p.weights, y)
+    }
 }
 
 #[cfg(feature = "rocm")]
@@ -1668,6 +1860,59 @@ pub fn sum_add(ctx: &Ctx, routed: Tensor, shared: Tensor, y: &mut Tensor) -> Res
             ctx.stage(),
         ],
     )
+}
+
+/// A routed swiglu MLP (`linear.moe_mlp_swiglu`): `packed` = x through the
+/// gate_up bank by route, `h` = its swiglu (clamped at `limit` when given),
+/// `routed` = h through the down bank, y = their weighted fold. `packed`,
+/// `h` and `routed` are the planes the four steps land; an expert-ordered
+/// pipeline may leave them untouched.
+#[derive(Clone, Copy, Debug)]
+pub struct RoutedMlp {
+    pub x: Tensor,
+    pub routes: Tensor,
+    pub weights: Tensor,
+    pub gate_up: Tensor,
+    pub gate_up_experts: ExpertTable,
+    pub down: Tensor,
+    pub down_experts: ExpertTable,
+    pub intermediate: u32,
+    pub limit: Option<f32>,
+    /// The swiglu's fan-out over `h`'s rows (the engine's plane fan).
+    pub fan: u32,
+    pub packed: Tensor,
+    pub h: Tensor,
+    pub routed: Tensor,
+}
+
+/// The routed MLP: on the grouped GEMM with its routes in expert order
+/// throughout where that measured faster, else the four routed steps.
+pub fn mlp_swiglu(ctx: &Ctx, p: &RoutedMlp, y: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "linear.moe_mlp_swiglu";
+    let steps = || -> Result<(), Error> {
+        let (mut packed, mut h, mut routed) = (p.packed, p.h, p.routed);
+        matmul_select(ctx, p.x, p.gate_up, p.routes, &mut packed, p.gate_up_experts)?;
+        match p.limit {
+            Some(limit) => crate::linear::mlp::swiglu_clamp(ctx, packed, p.intermediate, p.fan, limit, &mut h)?,
+            None => crate::linear::mlp::swiglu(ctx, packed, p.intermediate, p.fan, &mut h)?,
+        }
+        matmul_select(ctx, h, p.down, p.routes, &mut routed, p.down_experts)?;
+        Ok(())
+    };
+    #[cfg(feature = "rocm")]
+    {
+        let landed = *y;
+        let mut whole = || -> Result<(), Error> {
+            steps()?;
+            weighted_sum(ctx, p.routed, p.weights, &mut { landed })
+        };
+        if ordered::mlp(ctx, OP, p, &mut whole, y)? {
+            return Ok(());
+        }
+    }
+    let _ = OP;
+    steps()?;
+    weighted_sum(ctx, p.routed, p.weights, y)
 }
 
 pub fn weighted_sum(
