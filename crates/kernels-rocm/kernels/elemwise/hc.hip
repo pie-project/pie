@@ -425,8 +425,10 @@ __device__ __forceinline__ float sinkhorn(float c, float eps, int iters) {
 // The gates of one row from its mix row, then the layer input
 // x = Σ_i pre[i]·stream_i. Block (n, 0) lands post[M] and comb[M][M] for
 // `hc_fold` on its first wavefront; block (n, 1 + c) lands chunk c of x,
-// its pre gates its own.
-template <class T, int M, int BLOCK, bool VEC>
+// its pre gates its own. Without a combine (COMB false, the independent
+// form) the mix row is the pre and post logits alone, the post gate carries
+// the eps the pre gate does, and the combine landed is the identity.
+template <class T, int M, int BLOCK, bool VEC, bool COMB>
 __global__ __launch_bounds__(BLOCK) void hc_gates(
     const float* __restrict__ mixes, const float* __restrict__ scale, const float* __restrict__ base,
     const T* __restrict__ residual, float* __restrict__ post_mix, float* __restrict__ comb_mix,
@@ -436,15 +438,23 @@ __global__ __launch_bounds__(BLOCK) void hc_gates(
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long row = window.plane(blockIdx.x);
-    const float* mix = mixes + row * (2 * M + M * M);
+    constexpr int kMixRow = COMB ? 2 * M + M * M : 2 * M;
+    const float* mix = mixes + row * kMixRow;
 
     if (blockIdx.y == 0) {
         if (threadIdx.x >= kWave) return;
         const int l = lane();
-        const int t = min(l, M * M - 1);
-        const float logit = mix[2 * M + t] * scale[2] + base[2 * M + t];
-        const float c = sinkhorn<M>(logit, hc_eps, sinkhorn_iters);
-        if (l < M) post_mix[row * M + l] = sigmoid(mix[M + l] * scale[1] + base[M + l]) * hc_post_alpha;
+        float c;
+        if constexpr (COMB) {
+            const int t = min(l, M * M - 1);
+            const float logit = mix[2 * M + t] * scale[2] + base[2 * M + t];
+            c = sinkhorn<M>(logit, hc_eps, sinkhorn_iters);
+        } else {
+            c = (l / M == l % M) ? 1.f : 0.f;
+        }
+        if (l < M)
+            post_mix[row * M + l] =
+                sigmoid(mix[M + l] * scale[1] + base[M + l]) * hc_post_alpha + (COMB ? 0.f : hc_eps);
         if (l < M * M) comb_mix[row * M * M + l] = c;
         return;
     }

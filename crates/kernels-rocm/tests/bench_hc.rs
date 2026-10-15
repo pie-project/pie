@@ -101,7 +101,7 @@ fn bench_hc() {
                 let mut comb = gpu.zeros(n, M * M, Dtype::F32);
                 let us = time_sets(&gpu, sets, |i| {
                     hc::gates(
-                        &ctx, mixes[i], streams[i], scale, base, M, 1e-6, 2.0, 20, &mut x[i],
+                        &ctx, mixes[i], streams[i], scale, base, M, 1e-6, 2.0, 20, true, &mut x[i],
                         &mut post, &mut comb,
                     )
                     .unwrap();

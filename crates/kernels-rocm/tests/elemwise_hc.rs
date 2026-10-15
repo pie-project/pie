@@ -225,7 +225,8 @@ fn mhc_chain(gpu: &Gpu, s: Shape) {
     );
 
     // The projection to the mix row (and to a trunk collapse row of M).
-    for rows_out in [mix_hc, m] {
+    // The independent form's row of 2M (no combine) too.
+    for rows_out in [mix_hc, 2 * m, m] {
         let fn_h = values(rows_out * m * h, 2, 0.05);
         let hc_fn = gpu.tensor(&fn_h, rows_out as u32, wide, Dtype::F32);
         let mut mixes = gpu.zeros(rows, rows_out as u32, Dtype::F32);
@@ -251,7 +252,7 @@ fn mhc_chain(gpu: &Gpu, s: Shape) {
     let mut post = gpu.zeros(rows, m as u32, Dtype::F32);
     let mut comb = gpu.zeros(rows, (m * m) as u32, Dtype::F32);
     hc::gates(
-        &ctx, mixes, streams, scale, base, m as u32, gate_eps, alpha, iters, &mut x, &mut post,
+        &ctx, mixes, streams, scale, base, m as u32, gate_eps, alpha, iters, true, &mut x, &mut post,
         &mut comb,
     )
     .unwrap();
@@ -268,6 +269,35 @@ fn mhc_chain(gpu: &Gpu, s: Shape) {
     close_f32(&what("hc_gates post"), &gpu.read(&post), &want.post);
     close_f32(&what("hc_gates comb"), &gpu.read(&comb), &want.comb);
     close_bf16(&what("hc_gates x"), &gpu.read(&x), &want.x, 1.0);
+
+    // The independent form: pre and post logits alone, the post gate under
+    // the pre gate's eps, and the identity combine.
+    let ind_h = values(n * 2 * m, 5, 1.5);
+    let ind = gpu.tensor(&ind_h, rows, (2 * m) as u32, Dtype::F32);
+    let mut xi = gpu.zeros(rows, h as u32, Dtype::Bf16);
+    let mut posti = gpu.zeros(rows, m as u32, Dtype::F32);
+    let mut combi = gpu.zeros(rows, (m * m) as u32, Dtype::F32);
+    hc::gates(
+        &ctx, ind, streams, scale, base, m as u32, gate_eps, alpha, iters, false, &mut xi,
+        &mut posti, &mut combi,
+    )
+    .unwrap();
+    let (mut post_i, mut comb_i, mut x_i) = (Vec::new(), Vec::new(), Vec::new());
+    for r in 0..n {
+        let row = &ind_h[r * 2 * m..(r + 1) * 2 * m];
+        let pre: Vec<f32> = (0..m)
+            .map(|i| sigmoid(row[i] * scale_h[0] + base_h[i]) + gate_eps)
+            .collect();
+        post_i.extend(
+            (0..m).map(|i| sigmoid(row[m + i] * scale_h[1] + base_h[m + i]) * alpha + gate_eps),
+        );
+        comb_i.extend((0..m * m).map(|t| if t / m == t % m { 1.0 } else { 0.0 }));
+        let st = &streams_h[r * m * h..(r + 1) * m * h];
+        x_i.extend((0..h).map(|k| round_bf16((0..m).map(|i| pre[i] * st[i * h + k]).sum())));
+    }
+    close_f32(&what("hc_gates independent post"), &gpu.read(&posti), &post_i);
+    close_f32(&what("hc_gates independent comb"), &gpu.read(&combi), &comb_i);
+    close_bf16(&what("hc_gates independent x"), &gpu.read(&xi), &x_i, 1.0);
 
     // The fold, into a fresh plane and in place over the streams.
     let layer_out_h = bf16s(n * h, 5, 1.0);
@@ -342,7 +372,7 @@ fn mhc_chain(gpu: &Gpu, s: Shape) {
     hc::project(&ctx, normed, hc_fn, m as u32, &mut mixes_w).unwrap();
     hc::norm_project(&ctx, streams, hc_fn, eps, m as u32, &mut fused_w).unwrap();
     hc::gates(
-        &ctx, mixes, streams, scale, base, m as u32, gate_eps, alpha, iters, &mut x, &mut post,
+        &ctx, mixes, streams, scale, base, m as u32, gate_eps, alpha, iters, true, &mut x, &mut post,
         &mut comb,
     )
     .unwrap();
