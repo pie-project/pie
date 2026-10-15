@@ -1684,7 +1684,10 @@ fn select_mxfp4_mma(
     // one block, the registers' bound (gpt-oss at 8 tokens, gate-up 74 us
     // and down 49 against 92 and 54 on the bf16 path; a third chunk, or
     // five CTAs on fewer registers, no faster).
-    let fire = if ctx.tuning().mxfp4_cvt && crate::linear::tc5::supported() {
+    // The converts read e8m0 scales a 32 codes and no tensor scale, so an
+    // NVFP4 bank (e4m3 a 16 codes, a tensor scale a row) keeps the bf16 path.
+    let cvt = ctx.tuning().mxfp4_cvt && crate::linear::tc5::supported() && tensor_scales.is_none();
+    let fire = if cvt {
         const DEPTH: u32 = 2;
         let win = 8 / nb;
         let blocks = match nb {
@@ -1714,28 +1717,27 @@ fn select_mxfp4_mma(
         // down 172 -> 164).
         .apply(Launch::grid(grid, [THREADS, 1, 1]))
     };
-    ctx.fire(
-        op,
-        fire,
-        &[
-            x.arg(),
-            ArgValue::Ptr(order),
-            ArgValue::Ptr(offsets),
-            ArgValue::Ptr(work),
-            codes.arg(),
-            scales.arg(),
-            bias.map_or(ArgValue::ABSENT, |bias| bias.arg()),
-            y.arg(),
-            act_div.arg(),
-            n.arg(),
-            k.arg(),
-            stated(op, experts)?.arg(),
-            inter.arg(),
-            limit.arg(),
-            alpha.arg(),
-            tensor_scales.map_or(ArgValue::ABSENT, |t| t.arg()),
-        ],
-    )
+    let mut args = vec![
+        x.arg(),
+        ArgValue::Ptr(order),
+        ArgValue::Ptr(offsets),
+        ArgValue::Ptr(work),
+        codes.arg(),
+        scales.arg(),
+        bias.map_or(ArgValue::ABSENT, |bias| bias.arg()),
+        y.arg(),
+        act_div.arg(),
+        n.arg(),
+        k.arg(),
+        stated(op, experts)?.arg(),
+        inter.arg(),
+        limit.arg(),
+        alpha.arg(),
+    ];
+    if !cvt {
+        args.push(tensor_scales.map_or(ArgValue::ABSENT, |t| t.arg()));
+    }
+    ctx.fire(op, fire, &args)
 }
 
 #[allow(clippy::too_many_arguments)]
