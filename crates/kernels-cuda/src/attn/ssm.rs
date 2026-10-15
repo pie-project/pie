@@ -1310,16 +1310,7 @@ pub fn gated_delta_chunked(
         // Narrowed for its gated norm: the tcgen05 walk lands bf16 itself;
         // any other walk lands f32 in a plane, cast after.
         let wide_y = Tensor::new(y.ptr, y.rows, y.width, Dtype::F32);
-        let shape = Delta::of(
-            OP,
-            qkv.data,
-            gates,
-            &wide_y,
-            k_heads,
-            v_heads,
-            k_dim,
-            v_dim,
-        )?;
+        let shape = Delta::of(OP, qkv.data, gates, &wide_y, k_heads, v_heads, k_dim, v_dim)?;
         #[cfg(feature = "cuda")]
         if k_dim == 128
             && v_dim == 128
