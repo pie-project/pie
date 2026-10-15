@@ -351,6 +351,8 @@ fn the_fused_dsv4_attention_lands_the_window_the_pool_and_the_sinks() {
         check(8, Pool::None, false, fp8);
         check(16, Pool::Dense(4), false, fp8);
         check(40, Pool::Selected(4, 64), false, fp8);
+        // More keys than a chunk gathers at once.
+        check(40, Pool::Dense(2), false, fp8);
     }
 }
 

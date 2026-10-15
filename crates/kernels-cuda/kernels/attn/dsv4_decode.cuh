@@ -39,7 +39,8 @@ constexpr int kHeads = kGroup * kGroups;
 constexpr int kWarps = 8;
 constexpr int kThreads = kWarps * 32;
 constexpr int kKeys = 32;
-constexpr int kStages = 3;
+// Tiles a block's key addresses are gathered for at once (a chunk).
+constexpr int kChunkTiles = 32;
 constexpr float kLog2e = 1.44269504088896340736f;
 
 template <int D, bool kFp8>
@@ -47,6 +48,8 @@ struct Shape {
     static constexpr int kLd = D + 8;              // a bf16 row, padded
     static constexpr int kSLd = kKeys + 8;         // a partial score row, padded
     static constexpr int kOLd = D + 8;             // the fold's f32 row, padded
+    // Tiles in flight: fp8 rows are smaller, so more of them.
+    static constexpr int kStages = kFp8 ? 6 : 4;
     static constexpr int kQBytes = kGroup * kLd * 2;
     static constexpr int kTileBytes = kKeys * kLd * 2;
     static constexpr int kRawBytes = kKeys * (kDsData + kDsScaleBytes);
@@ -190,7 +193,9 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
     bf16* sQ = reinterpret_cast<bf16*>(smem_raw);
     char* sRing = smem_raw + S::kQBytes;
     float* sS = reinterpret_cast<float*>(smem_raw + S::kQBytes + S::kRingBytes);
-    __shared__ unsigned char s_valid[kStages][kKeys];
+    constexpr int kStages = S::kStages;
+    // A chunk's key slots (page * page size + offset; -1 reads nothing).
+    __shared__ long long s_slot[kChunkTiles * kKeys];
     __shared__ int s_end;
     __shared__ float s_ml[2][kGroup];
     __shared__ float s_fold[2][kGroup];
@@ -223,59 +228,55 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
     const int t0 = min(tiles, static_cast<int>(rank) * per);
     const int t1 = min(tiles, t0 + per);
 
-    // Where key n of the row lives: its plane, page and offset.
-    struct Where {
-        const void* plane;
-        long long stride;
-        long long page;
-        int off;
-        int ps;
-    };
-    auto where = [&](int n, Where& w) -> bool {
+    // Key n's slot in its plane: the window's first `n_win`, then the
+    // compressed rows'; -1 for none.
+    auto slot_of_key = [&](int n) -> long long {
         if (n < n_win) {
             const int pos = qpos - n_win + 1 + n;
-            w = {win_keys, win_stride,
-                 static_cast<long long>(win_indices[win_indptr[req] + pos / win_page_size]),
-                 pos % win_page_size, win_page_size};
-            return true;
+            return static_cast<long long>(win_indices[win_indptr[req] + pos / win_page_size]) *
+                       win_page_size +
+                   pos % win_page_size;
         }
-        if (n >= total) return false;
+        if (n >= total) return -1;
         const int j = n - n_win;
         const int c = srow != nullptr ? srow[j] : j;
-        if (c < 0 || c >= num_visible) return false;
+        if (c < 0 || c >= num_visible) return -1;
         const int pos = (c + 1) * ratio - 1;
-        w = {pool_keys, pool_stride,
-             static_cast<long long>(pool_indices[pool_indptr[req] + pos / pool_page_size]),
-             pos % pool_page_size, pool_page_size};
-        return true;
+        return static_cast<long long>(pool_indices[pool_indptr[req] + pos / pool_page_size]) *
+                   pool_page_size +
+               pos % pool_page_size;
     };
 
     // Tile t's keys into ring slot `buf`: a key row per kPerKey threads.
-    auto stage = [&](int t, int buf) {
+    auto stage = [&](int t, int c0, int buf) {
         const int key = tid / kPerKey;
         const int part = tid % kPerKey;
-        Where w;
-        const bool ok = where(t * kKeys + key, w);
-        if (part == 0) s_valid[buf][key] = ok;
+        const int n = t * kKeys + key;
+        const long long slot = s_slot[(t - c0) * kKeys + key];
+        const bool win_key = n < n_win;
         if constexpr (kFp8) {
             std::uint8_t* raw = reinterpret_cast<std::uint8_t*>(sRing) + buf * S::kRawBytes;
             std::uint8_t* data = raw + key * kDsData;
             std::uint8_t* sc = raw + kKeys * kDsData + key * kDsScaleBytes;
-            if (ok) {
-                const DsRow r = ds_row(const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(w.plane)),
-                                       w.page, w.off, w.ps);
+            if (slot >= 0) {
+                const int ps = win_key ? win_page_size : pool_page_size;
+                std::uint8_t* plane = const_cast<std::uint8_t*>(
+                    static_cast<const std::uint8_t*>(win_key ? win_keys : pool_keys));
+                const DsRow r = ds_row(plane, slot / ps, static_cast<int>(slot % ps), ps);
                 for (int i = part; i < kDsData / 16; i += kPerKey)
                     __pipeline_memcpy_async(data + i * 16, r.data + i * 16, 16);
                 if (part == 0) __pipeline_memcpy_async(sc, r.scales, 8);
             }
         } else {
             bf16* dst = reinterpret_cast<bf16*>(sRing) + buf * kKeys * kLd + key * kLd;
-            const bf16* src = ok ? static_cast<const bf16*>(w.plane) + (w.page * w.ps + w.off) * w.stride
-                                 : nullptr;
+            const bf16* src =
+                slot >= 0 ? static_cast<const bf16*>(win_key ? win_keys : pool_keys) +
+                                slot * (win_key ? win_stride : pool_stride)
+                          : nullptr;
 #pragma unroll
             for (int i = 0; i < kChunks / kPerKey; ++i) {
                 const int d = (part + i * kPerKey) * 8;
-                if (ok) {
+                if (slot >= 0) {
                     __pipeline_memcpy_async(dst + d, src + d, 16);
                 } else {
                     *reinterpret_cast<int4*>(dst + d) = make_int4(0, 0, 0, 0);
@@ -284,15 +285,9 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
         }
     };
 
-#pragma unroll
-    for (int s = 0; s < kStages - 1; ++s) {
-        if (t0 + s < t1) stage(t0 + s, s);
-        __pipeline_commit();
-    }
-
     // This warp's q fragments: 16 heads over its half of the width.
     std::uint32_t qa[kHalf / 16][4];
-    __pipeline_wait_prior(kStages - 1);
+    __pipeline_wait_prior(0);
     __syncthreads();
 #pragma unroll
     for (int k = 0; k < kHalf / 16; ++k)
@@ -311,11 +306,24 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
     const float* other = sS + (dh ^ 1) * kGroup * kSLd;
     bf16* sTile = reinterpret_cast<bf16*>(sRing + (kFp8 ? kStages * S::kRawBytes : 0));
 
-    for (int t = t0; t < t1; ++t) {
-        const int buf = (t - t0) % kStages;
+    for (int c0 = t0; c0 < t1; c0 += kChunkTiles) {
+    const int c1 = min(t1, c0 + kChunkTiles);
+    // The chunk's key slots, every one in flight at once; the last chunk's
+    // tiles are all read before they are overwritten.
+    __syncthreads();
+    for (int k = tid; k < (c1 - c0) * kKeys; k += kThreads) s_slot[k] = slot_of_key(c0 * kKeys + k);
+    __syncthreads();
+#pragma unroll
+    for (int s = 0; s < kStages - 1; ++s) {
+        if (c0 + s < c1) stage(c0 + s, c0, s);
+        __pipeline_commit();
+    }
+    for (int t = c0; t < c1; ++t) {
+        const int buf = (t - c0) % kStages;
+        const long long* tslot = s_slot + (t - c0) * kKeys;
         __pipeline_wait_prior(kStages - 2);
         __syncthreads();
-        if (t + kStages - 1 < t1) stage(t + kStages - 1, (t - t0 + kStages - 1) % kStages);
+        if (t + kStages - 1 < c1) stage(t + kStages - 1, c0, (t - c0 + kStages - 1) % kStages);
         __pipeline_commit();
         const bf16* sK;
         if constexpr (kFp8) {
@@ -325,7 +333,7 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
                 const int key = c / kChunks;
                 const int j = (c % kChunks) * 8;
                 uint4 v = make_uint4(0, 0, 0, 0);
-                if (s_valid[buf][key])
+                if (tslot[key] >= 0)
                     v = ds_load8(raw + key * kDsData, raw + kKeys * kDsData + key * kDsScaleBytes, j);
                 *reinterpret_cast<uint4*>(sTile + key * kLd + j) = v;
             }
@@ -361,7 +369,7 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
             const float2 b_lo = *reinterpret_cast<const float2*>(other + g * kSLd + nt * 8 + p);
             const float2 a_hi = *reinterpret_cast<const float2*>(mine + (g + 8) * kSLd + nt * 8 + p);
             const float2 b_hi = *reinterpret_cast<const float2*>(other + (g + 8) * kSLd + nt * 8 + p);
-            const bool v0 = s_valid[buf][nt * 8 + p], v1 = s_valid[buf][nt * 8 + p + 1];
+            const bool v0 = tslot[nt * 8 + p] >= 0, v1 = tslot[nt * 8 + p + 1] >= 0;
             sacc[nt][0] = v0 ? (a_lo.x + b_lo.x) * sl2 : -CUDART_INF_F;
             sacc[nt][1] = v1 ? (a_lo.y + b_lo.y) * sl2 : -CUDART_INF_F;
             sacc[nt][2] = v0 ? (a_hi.x + b_hi.x) * sl2 : -CUDART_INF_F;
@@ -423,6 +431,7 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
         }
     }
     __pipeline_wait_prior(0);
+    }
 
     const int h_lo = g, h_hi = g + 8;
     bf16* orow = o + (static_cast<long long>(row) * kHeads + group * kGroup) * D;

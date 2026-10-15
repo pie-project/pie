@@ -36,7 +36,6 @@ const GROUP: u32 = 16;
 const HEAD_DIM: u32 = 512;
 const THREADS: u32 = 256;
 const KEYS: u32 = 32;
-const STAGES: u32 = 3;
 /// The most blocks a row's keys split over (one portable cluster).
 const MAX_RANKS: u32 = 8;
 
@@ -92,10 +91,12 @@ fn ranks(ctx: &Ctx, rows: u32) -> u32 {
 fn smem(fp8: bool) -> u32 {
     let ld = HEAD_DIM + 8;
     let tile = KEYS * ld * 2;
+    // Tiles in flight: six of fp8 rows (and the one they widen into), four
+    // of bf16.
     let ring = if fp8 {
-        STAGES * KEYS * DS_ROW + tile
+        6 * KEYS * DS_ROW + tile
     } else {
-        STAGES * tile
+        4 * tile
     };
     GROUP * ld * 2 + ring + 2 * GROUP * (KEYS + 8) * 4
 }
