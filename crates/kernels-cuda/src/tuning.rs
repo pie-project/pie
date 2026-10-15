@@ -349,6 +349,14 @@ pub struct SsmGdnTc5;
 #[decision(id = "kernel.elemwise.rows_vec", flag, default = false, tune = search)]
 pub struct ElemwiseRowsVec;
 
+/// Whether the hyper-connection kernels run their tiled and 16-byte forms:
+/// the mix projection a block 64 rows of every column over shared-memory
+/// tiles, the fold and the gates' pre-mix eight columns a thread, and a
+/// scale-free per-head RMS norm a warp a head; off, the forms before them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.hc_tile", flag, default = false, tune = search)]
+pub struct ElemwiseHcTile;
+
 /// Whether the chunked causal conv's 16-byte row-tiled form runs four
 /// channels a thread under a 64-register bound (the same sums in the same
 /// order); off, eight a thread as before.
@@ -457,6 +465,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmGdnFusedScan>()
         .add::<SsmGdnTc5>()
         .add::<ElemwiseRowsVec>()
+        .add::<ElemwiseHcTile>()
         .add::<SsmConvVec4>()
         .add::<SsmGdnOutBf16>()
         .add::<SdpaMergeWarp>()
@@ -527,6 +536,7 @@ pub struct Tuning {
     pub ssm_gdn_fused_scan: bool,
     pub ssm_gdn_tc5: bool,
     pub rows_vec: bool,
+    pub hc_tile: bool,
     pub ssm_conv_vec4: bool,
     pub ssm_gdn_out_bf16: bool,
     pub merge_warp: bool,
@@ -595,6 +605,7 @@ impl Tuning {
         ssm_gdn_fused_scan: false,
         ssm_gdn_tc5: false,
         rows_vec: false,
+        hc_tile: false,
         ssm_conv_vec4: false,
         ssm_gdn_out_bf16: false,
         merge_warp: false,
@@ -663,6 +674,7 @@ impl Tuning {
             ssm_gdn_fused_scan: profile.on::<SsmGdnFusedScan>(&Anywhere),
             ssm_gdn_tc5: profile.on::<SsmGdnTc5>(&Anywhere),
             rows_vec: profile.on::<ElemwiseRowsVec>(&Anywhere),
+            hc_tile: profile.on::<ElemwiseHcTile>(&Anywhere),
             ssm_conv_vec4: profile.on::<SsmConvVec4>(&Anywhere),
             ssm_gdn_out_bf16: profile.on::<SsmGdnOutBf16>(&Anywhere),
             merge_warp: profile.on::<SdpaMergeWarp>(&Anywhere),

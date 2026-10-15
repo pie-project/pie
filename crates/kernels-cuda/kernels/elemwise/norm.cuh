@@ -510,6 +510,51 @@ __global__ void rmsnorm_no_scale(
     }
 }
 
+// `rmsnorm_no_scale` a warp a (row, head) unit, eight elements a lane a
+// 16-byte run, `RUNS` runs a lane: a 512-wide head (DeepSeek-V4's q) is two
+// loads a lane where a block a head walked it two elements a thread.
+template <class T, int RUNS>
+__global__ void __launch_bounds__(256) rmsnorm_no_scale_warp(
+    const T* __restrict__ x,
+    T* __restrict__ y,
+    int units,
+    float eps,
+    int heads,
+    const u32* __restrict__ win)
+{
+    static_assert(sizeof(T) == 2, "eight elements are one 16-byte run");
+    constexpr int hidden = 256 * RUNS;
+    const int unit = static_cast<int>(blockIdx.x) * 8 + static_cast<int>(threadIdx.x >> 5);
+    if (unit >= units) return;
+    if (win != nullptr && unit / heads >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? unit + static_cast<int>(win[1]) * heads : unit;
+    const int lane = threadIdx.x & 31;
+    const uint4* xr = reinterpret_cast<const uint4*>(x + static_cast<long long>(plane_row) * hidden);
+    uint4* yr = reinterpret_cast<uint4*>(y + static_cast<long long>(plane_row) * hidden);
+    uint4 raw[RUNS];
+    float local = 0.f;
+#pragma unroll
+    for (int r = 0; r < RUNS; ++r) {
+        raw[r] = xr[r * 32 + lane];
+        const T* e = reinterpret_cast<const T*>(&raw[r]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float v = Elem<T>::to_f32(e[j]);
+            local += v * v;
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+    const float inv_rms = rsqrtf(local / static_cast<float>(hidden) + eps);
+#pragma unroll
+    for (int r = 0; r < RUNS; ++r) {
+        T* e = reinterpret_cast<T*>(&raw[r]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) e[j] = Elem<T>::from_f32(Elem<T>::to_f32(e[j]) * inv_rms);
+        yr[r * 32 + lane] = raw[r];
+    }
+}
+
 template <class T, int BLOCK = 256>
 __global__ void rmsnorm_gated(
     const T* __restrict__ x,

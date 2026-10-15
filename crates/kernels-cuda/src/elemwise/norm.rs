@@ -259,6 +259,37 @@ pub fn rmsnorm_no_scale(
     )?;
     let launch = rows_per_head(OP, y.rows, y.width, head_dim)?;
     let heads = stated(OP, per_head_split(y.width, head_dim))?;
+    // A warp a head, 16 bytes a lane, where the head is whole 256-element
+    // runs (a 512-wide head two a lane).
+    if ctx.tuning().hc_tile
+        && hidden % 256 == 0
+        && (1..=4).contains(&(hidden / 256))
+        && [x.ptr, y.ptr].iter().all(|&at| aligned16(at))
+    {
+        let units = y
+            .rows
+            .checked_mul(per_head_split(y.width, head_dim))
+            .ok_or_else(|| refuse(OP, format!("{} rows of heads overflow a grid", y.rows)))?;
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_no_scale_warp<{t}, {}>",
+                    hidden / 256
+                )),
+            )
+            .apply(Launch::grid([units.div_ceil(8), 1, 1], [BLOCK, 1, 1])),
+            &[
+                x.arg(),
+                y.arg(),
+                stated(OP, units)?.arg(),
+                eps.arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(

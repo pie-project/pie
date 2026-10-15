@@ -49,6 +49,11 @@ ssm.gdn_tc5 = true
 # sigmoid gate 69 where it took 262; a long fire's packed qkv|z lands as two
 # GEMMs off the weight's two slices, never cut.
 elemwise.rows_vec = true
+# The hyper-connection kernels tiled and 16 bytes a lane (DeepSeek-V4-Flash,
+# a 16384-row prefill fire, us a call): the mix projection over shared-memory
+# tiles 1339 -> 427, the fold 869 -> 383, the gates' pre-mix 297 -> 218, the
+# 64 x 512 scale-free q norm a warp a head 1785 -> 310.
+elemwise.hc_tile = true
 # The chunked causal conv four channels a thread: Qwen3.6-35B-A3B's 8192
 # channels over 16384 tokens take 166 us where eight a thread took 258
 # (its 168 registers held three blocks an SM).

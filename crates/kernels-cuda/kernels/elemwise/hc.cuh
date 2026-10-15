@@ -184,7 +184,7 @@ __global__ void hc_gates(
 // block barriers; and the row's `H` spread over `gridDim.y` blocks, each of
 // which works the row's few gates out again. Block `y == 0` lands the post
 // and combine mixes.
-template <class T, int BLOCK = 256>
+template <class T, int BLOCK = 256, bool VEC8 = false>
 __global__ void __launch_bounds__(BLOCK) hc_gates_warp(
     const float* __restrict__ mixes,
     const float* __restrict__ scale,
@@ -257,6 +257,32 @@ __global__ void __launch_bounds__(BLOCK) hc_gates_warp(
 
     const T* res_n = residual + static_cast<long long>(plane_row) * M * H;
     T* out = layer_input + static_cast<long long>(plane_row) * H;
+    if constexpr (VEC8) {
+        // Eight columns a thread, 16 bytes at a time: the same sums.
+        const int runs = H / 8;
+        const int per = (runs + gridDim.y - 1) / gridDim.y;
+        const int v0 = blockIdx.y * per;
+        const int v1 = min(v0 + per, runs);
+        const uint4* r4 = reinterpret_cast<const uint4*>(res_n);
+        uint4* o4 = reinterpret_cast<uint4*>(out);
+        for (int v = v0 + tid; v < v1; v += BLOCK) {
+            float acc[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc[e] = 0.f;
+            for (int k = 0; k < M; ++k) {
+                const uint4 rw = r4[k * runs + v];
+                const T* r8 = reinterpret_cast<const T*>(&rw);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) acc[e] += pre[k] * Elem<T>::to_f32(r8[e]);
+            }
+            uint4 ow;
+            T* o8 = reinterpret_cast<T*>(&ow);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) o8[e] = Elem<T>::from_f32(acc[e]);
+            o4[v] = ow;
+        }
+        return;
+    }
     const int per = (H + gridDim.y - 1) / gridDim.y;
     const int h0 = blockIdx.y * per;
     const int h1 = min(h0 + per, H);
@@ -309,6 +335,94 @@ __global__ void hc_fold(
             acc += comb_n[i * M + j] * r[i];
         }
         out_n[static_cast<long long>(j) * H + h] = Elem<T>::from_f32(acc);
+    }
+}
+
+// One 16-byte run of `hc_fold_vec8`: every load (the streams, the post and
+// combine gates) ahead of the first store, `MM` streams unrolled.
+template <class T, int MM>
+__device__ __forceinline__ void hc_fold_run(
+    const T* x8,
+    const uint4* res_n,
+    const float* post_n,
+    const float* comb_n,
+    uint4* out_n,
+    unsigned runs,
+    int v,
+    int M = MM)
+{
+    float r[MM][8];
+    float p[MM];
+    float c[MM][MM];
+#pragma unroll
+    for (int i = 0; i < MM; ++i) {
+        if (i < M) {
+            const uint4 rw = res_n[static_cast<long long>(i) * runs + v];
+            const T* r8 = reinterpret_cast<const T*>(&rw);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) r[i][e] = Elem<T>::to_f32(r8[e]);
+            p[i] = post_n[i];
+        }
+#pragma unroll
+        for (int j = 0; j < MM; ++j) c[i][j] = (i < M && j < M) ? comb_n[i * M + j] : 0.f;
+    }
+    float xf[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) xf[e] = Elem<T>::to_f32(x8[e]);
+#pragma unroll
+    for (int j = 0; j < MM; ++j) {
+        if (j >= M) break;
+        uint4 ow;
+        T* o8 = reinterpret_cast<T*>(&ow);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            float acc = p[j] * xf[e];
+#pragma unroll
+            for (int i = 0; i < MM; ++i) {
+                if (i < M) acc += c[i][j] * r[i][e];
+            }
+            o8[e] = Elem<T>::from_f32(acc);
+        }
+        out_n[static_cast<long long>(j) * runs + v] = ow;
+    }
+}
+
+// `hc_fold` eight columns a thread, 16 bytes at a time: the same sums in
+// the same order, the row's gate matrices read once a thread.
+template <class T>
+__global__ void __launch_bounds__(256) hc_fold_vec8(
+    const T* __restrict__ x,
+    const T* residual,
+    const float* __restrict__ post_mix,
+    const float* __restrict__ comb_mix,
+    T* out,
+    int N,
+    int M,
+    int H,
+    const u32* __restrict__ win)
+{
+    static_assert(sizeof(T) == 2, "eight elements are one 16-byte run");
+    if (M > MAX_HC_MULT) return;
+    // 32-bit index arithmetic: the host keeps `N * H / 8` under 2^31.
+    const unsigned runs = static_cast<unsigned>(H) / 8u;
+    const unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= static_cast<unsigned>(N) * runs) return;
+    const int v = static_cast<int>(idx % runs);
+    const int n = static_cast<int>(idx / runs);
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const float* comb_n = comb_mix + static_cast<long long>(row) * M * M;
+    const float* post_n = post_mix + static_cast<long long>(row) * M;
+    const uint4 xw = reinterpret_cast<const uint4*>(x + static_cast<long long>(row) * H)[v];
+    const T* x8 = reinterpret_cast<const T*>(&xw);
+    const uint4* res_n = reinterpret_cast<const uint4*>(residual + static_cast<long long>(row) * M * H);
+    uint4* out_n = reinterpret_cast<uint4*>(out + static_cast<long long>(row) * M * H);
+
+    if (M == 4) {
+        hc_fold_run<T, 4>(x8, res_n, post_n, comb_n, out_n, runs, v);
+    } else {
+        hc_fold_run<T, MAX_HC_MULT>(x8, res_n, post_n, comb_n, out_n, runs, v, M);
     }
 }
 
@@ -835,6 +949,150 @@ __global__ void hc_project_fold(
     float sum = 0.f;
     for (int s = 0; s < slices; ++s) sum += partial[static_cast<long long>(s) * rows * mix_hc + i];
     mixes[static_cast<long long>(base) * mix_hc + i] = sum;
+}
+
+// `hc_project` tiled: a block `BR` rows of every mix column (up to 24) over a
+// slice of the row, the slice staged `KT` floats at a time in shared memory
+// by `cp.async` (`STAGES` deep), each thread four rows (strided a quarter
+// block apart, so a warp's 16-byte reads fall in distinct banks) by six
+// columns, four floats of the row a read; the tile's quads split over `KG`
+// thread groups whose sums fold in group order. A row is read once for all
+// its columns and a column once for `BR` rows. One slice lands `mixes`
+// itself; several land `partial[slice][row][col]` for `hc_project_fold`.
+__device__ __forceinline__ void hc_cp16(void* smem, const void* gmem)
+{
+    const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(at), "l"(gmem) : "memory");
+}
+
+template <int BR, int KG, int KT, int STAGES>
+__global__ void __launch_bounds__(BR * KG) hc_project_tile(
+    const float* __restrict__ normed,
+    const float* __restrict__ hc_fn,
+    float* __restrict__ out,
+    int fan_in,
+    int mix_hc,
+    int rows,
+    int slice,
+    const u32* __restrict__ win)
+{
+    constexpr int S = KT + 4;
+    constexpr int NT = BR * KG;
+    constexpr int COLS = 24;
+    constexpr int Q = KT / 4;
+    constexpr int XC = BR * Q;
+    constexpr int WC = COLS * Q;
+    static_assert(BR % 32 == 0 && Q % KG == 0, "whole quads a group");
+    static_assert(STAGES * (BR + COLS) * S >= (KG > 1 ? (KG - 1) * BR * COLS : 0), "the fold fits the tiles");
+    extern __shared__ __align__(16) float smem[];
+    float* xs = smem;
+    float* ws = smem + STAGES * BR * S;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int kg = tid / BR;
+    const int t = tid % BR;
+    const int tr = t >> 2;
+    const int tc = t & 3;
+    const int n0 = static_cast<int>(blockIdx.x) * BR;
+    const int live = win != nullptr ? min(static_cast<int>(win[0]), rows) : rows;
+    if (n0 >= live) return;
+    const int base = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const int d0 = static_cast<int>(blockIdx.y) * slice;
+    const int d1 = min(d0 + slice, fan_in);
+    const int tiles = (d1 - d0) / KT;
+
+    auto issue = [&](int tile) {
+        const int k0 = d0 + tile * KT;
+        float* xd = xs + (tile % STAGES) * BR * S;
+        float* wd = ws + (tile % STAGES) * COLS * S;
+        for (int c = tid; c < XC; c += NT) {
+            const int row = c / Q;
+            const int q = c % Q;
+            const int n = min(n0 + row, live - 1);
+            hc_cp16(xd + row * S + q * 4, normed + static_cast<long long>(base + n) * fan_in + k0 + q * 4);
+        }
+        for (int c = tid; c < WC; c += NT) {
+            const int col = c / Q;
+            const int q = c % Q;
+            const int o = col < mix_hc ? col : 0;
+            hc_cp16(wd + col * S + q * 4, hc_fn + static_cast<long long>(o) * fan_in + k0 + q * 4);
+        }
+    };
+
+    float acc[4][6];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 6; ++j) acc[i][j] = 0.f;
+
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < tiles) issue(s);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+    for (int tile = 0; tile < tiles; ++tile) {
+        asm volatile("cp.async.wait_group %0;" ::"n"(STAGES - 2) : "memory");
+        __syncthreads();
+        if (tile + STAGES - 1 < tiles) issue(tile + STAGES - 1);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+        const float* xt = xs + (tile % STAGES) * BR * S;
+        const float* wt = ws + (tile % STAGES) * COLS * S;
+#pragma unroll
+        for (int qq = 0; qq < Q / KG; ++qq) {
+            const int k = (kg * (Q / KG) + qq) * 4;
+            float4 xv[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                xv[i] = *reinterpret_cast<const float4*>(xt + (tr + i * (BR / 4)) * S + k);
+#pragma unroll
+            for (int j = 0; j < 6; ++j) {
+                const float4 w = *reinterpret_cast<const float4*>(wt + (tc * 6 + j) * S + k);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float a = acc[i][j];
+                    a = fmaf(xv[i].x, w.x, a);
+                    a = fmaf(xv[i].y, w.y, a);
+                    a = fmaf(xv[i].z, w.z, a);
+                    acc[i][j] = fmaf(xv[i].w, w.w, a);
+                }
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    if constexpr (KG > 1) {
+        __syncthreads();
+        float* red = smem;
+        if (kg > 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 6; ++j)
+                    red[((kg - 1) * BR + t) * COLS + i * 6 + j] = acc[i][j];
+        }
+        __syncthreads();
+        if (kg > 0) return;
+#pragma unroll
+        for (int g = 0; g < KG - 1; ++g)
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 6; ++j) acc[i][j] += red[(g * BR + t) * COLS + i * 6 + j];
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int n = n0 + tr + i * (BR / 4);
+        if (n >= live) continue;
+#pragma unroll
+        for (int j = 0; j < 6; ++j) {
+            const int o = tc * 6 + j;
+            if (o >= mix_hc) continue;
+            if (gridDim.y == 1) {
+                out[static_cast<long long>(base + n) * mix_hc + o] = acc[i][j];
+            } else {
+                out[(static_cast<long long>(blockIdx.y) * rows + n) * mix_hc + o] = acc[i][j];
+            }
+        }
+    }
 }
 
 }

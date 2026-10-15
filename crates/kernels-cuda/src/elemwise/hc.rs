@@ -162,6 +162,15 @@ pub fn project(
     // rows alone would leave the SMs idle (a decode fire). The kernel below
     // read a row once a mix column and walked it alone (DeepSeek-V4-Flash:
     // 8.3 s of a 32x4096 prefill, 3.3 ms a decode8 step).
+    if ctx.tuning().hc_tile
+        && fan.is_multiple_of(TILE_K)
+        && rows >= TILE_FROM
+        && mix_hc <= TILE_COLS
+        && normed.ptr % 16 == 0
+        && hc_fn.ptr % 16 == 0
+    {
+        return project_tile(ctx, OP, normed, hc_fn, mixes, rows, fan, mix_hc);
+    }
     if fan.is_multiple_of(4) && mix_hc <= 8 * PROJECT_COLS {
         return project_split(ctx, OP, normed, hc_fn, mixes, rows, fan, mix_hc);
     }
@@ -234,12 +243,14 @@ pub fn gates(
     if comb && fan * fan <= 32 {
         let hidden = nonzero(OP, "the hidden width", x.width)?;
         let want = 2 * ctx.multiprocessors().unwrap_or(132);
-        let slices = want.div_ceil(x.rows).clamp(1, hidden.div_ceil(BLOCK));
+        let vec8 = ctx.tuning().hc_tile && whole_runs(hidden, &[streams.ptr, x.ptr]);
+        let columns = if vec8 { hidden / 8 } else { hidden };
+        let slices = want.div_ceil(x.rows).clamp(1, columns.div_ceil(BLOCK));
         return ctx.fire(
             OP,
             Fire::at(
                 FILE,
-                symbol(&format!("::pie::elemwise::hc_gates_warp<{t}, 256>")),
+                symbol(&format!("::pie::elemwise::hc_gates_warp<{t}, 256, {vec8}>")),
             )
             .apply(Launch::grid([x.rows, slices, 1], [BLOCK, 1, 1])),
             &[
@@ -304,10 +315,17 @@ pub fn fold(
         post_mix.dtype == Dtype::F32 && comb_mix.dtype == Dtype::F32,
         "`{OP}` reads f32 gate matrices"
     );
+    // Eight columns a thread where the rows are whole 16-byte runs: the same
+    // sums in the same order.
+    let (entry, width) =
+        if ctx.tuning().hc_tile && whole_runs(x.width, &[x.ptr, streams.ptr, y.ptr]) {
+            (format!("::pie::elemwise::hc_fold_vec8<{t}>"), x.width / 8)
+        } else {
+            (format!("::pie::elemwise::hc_fold<{t}>"), x.width)
+        };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::hc_fold<{t}>")))
-            .apply(elementwise_in(OP, y.rows, x.width)?),
+        Fire::at(FILE, symbol(&entry)).apply(elementwise_in(OP, y.rows, width)?),
         &[
             x.arg(),
             streams.arg(),
@@ -535,6 +553,95 @@ pub fn ple_gate(
 
 const PROJECT_ROWS: u32 = 4;
 const PROJECT_COLS: u32 = 3;
+
+/// `hc_project_tile`'s rows a block, column ceiling, shared tile, thread
+/// groups over the tile and tiles in flight: 64 x 4 x 64 x 2 projects
+/// DeepSeek-V4-Flash's 16384 rows of 16384 into 24 in 427 us where the
+/// four-row split walk took 1339 (64 x 4 x 32 x 3: 506; 64 x 4 x 128 x 2,
+/// past the default shared memory: 409).
+const TILE_ROWS: u32 = 64;
+const TILE_COLS: u32 = 24;
+const TILE_K: u32 = 64;
+const TILE_STAGES: u32 = 2;
+const TILE_GROUPS: u32 = 4;
+/// Below this many rows the four-row split walk serves: a tile of 64 would
+/// mostly repeat its last row.
+const TILE_FROM: u32 = 128;
+
+/// `hc_project` on `hc_project_tile` (and `hc_project_fold` past one slice):
+/// a decode fire's few rows cut the row into slices across blocks.
+#[allow(clippy::too_many_arguments)]
+fn project_tile(
+    ctx: &Ctx,
+    op: &'static str,
+    normed: Tensor,
+    hc_fn: Tensor,
+    mixes: &mut Tensor,
+    rows: u32,
+    fan: u32,
+    mix_hc: u32,
+) -> Result<(), Error> {
+    const SLICE_FLOOR: u32 = 512;
+    const PARTIAL_ROWS: u32 = 2048;
+    let want = 2 * ctx.multiprocessors().unwrap_or(132);
+    let (br, kg, kt, stages) = (TILE_ROWS, TILE_GROUPS, TILE_K, TILE_STAGES);
+    let smem = stages * (br + TILE_COLS) * (kt + 4) * 4;
+    let row_blocks = rows.div_ceil(br);
+    let slices = want
+        .div_ceil(row_blocks)
+        .clamp(1, (fan / SLICE_FLOOR).max(1))
+        .min((PARTIAL_ROWS / rows).max(1));
+    let slice = fan.div_ceil(slices).next_multiple_of(kt);
+    let slices = fan.div_ceil(slice);
+    let out = if slices > 1 {
+        ctx.scratch_shared(
+            op,
+            "elementwise.hc_project_partial",
+            (slices * rows * mix_hc) as usize * core::mem::size_of::<f32>(),
+        )? as usize as u64
+    } else {
+        mixes.ptr
+    };
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_project_tile<{br}, {kg}, {kt}, {stages}>"
+            )),
+        )
+        .apply(Launch {
+            smem,
+            ..Launch::grid([row_blocks, slices, 1], [br * kg, 1, 1])
+        }),
+        &[
+            normed.arg(),
+            hc_fn.arg(),
+            crate::jit::ArgValue::Ptr(out),
+            stated(op, fan)?.arg(),
+            stated(op, mix_hc)?.arg(),
+            stated(op, rows)?.arg(),
+            stated(op, slice)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    if slices == 1 {
+        return Ok(());
+    }
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::elemwise::hc_project_fold")
+            .apply(Launch::flat(rows * mix_hc, BLOCK)),
+        &[
+            crate::jit::ArgValue::Ptr(out),
+            mixes.arg(),
+            stated(op, mix_hc)?.arg(),
+            stated(op, rows)?.arg(),
+            stated(op, slices)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
 
 /// `hc_project` on `hc_project_split` (and `hc_project_fold` past one slice).
 #[allow(clippy::too_many_arguments)]
