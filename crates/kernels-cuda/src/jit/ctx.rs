@@ -530,7 +530,6 @@ impl Ctx {
     }
 }
 
-#[cfg(feature = "cuda")]
 /// Whether a device instantiation that will not fire (it does not compile,
 /// or its module does not load) panics rather than falling back: on under
 /// `PIE_STRICT_KERNELS=1` or [`strict_kernels`], as the test harnesses run.
@@ -549,6 +548,7 @@ pub fn strict_kernels() {
 
 static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(feature = "cuda")]
 fn said(root: &str, instantiation: &str, why: crate::jit::Fault) -> crate::jit::Fault {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
