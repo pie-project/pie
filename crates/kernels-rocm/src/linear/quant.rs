@@ -18,7 +18,7 @@ const WAVE: u32 = 64;
 /// one a stream, the size of the widest plane fired on it, since the decode
 /// and the gemm are consecutive on the stream. Keyed by region it was one a
 /// region, the whole model in bf16 across a load.
-const DECODED_WEIGHT: &str = "linear.quant.decoded_weight";
+pub(crate) const DECODED_WEIGHT: &str = "linear.quant.decoded_weight";
 
 fn route_rows(rows: u32, width: u32) -> Launch {
     const MAX_BLOCK: u32 = 1024;

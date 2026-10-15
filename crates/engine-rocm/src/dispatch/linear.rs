@@ -288,6 +288,54 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
+            Linear::MlpSwigluClampSplitRouted {
+                gate,
+                up,
+                weights,
+                limit,
+                y,
+            } => {
+                let fan = self.plane_fan(self.tensor(*y).rows);
+                linear::mlp::swiglu_clamp_split_routed(
+                    self.ctx(),
+                    self.tensor(*gate),
+                    self.tensor(*up),
+                    self.tensor(*weights),
+                    fan,
+                    *limit,
+                    &mut self.tensor(*y),
+                )
+            }
+            Linear::MoeSumAdd { routed, shared, y } => linear::moe::sum_add(
+                self.ctx(),
+                self.tensor(*routed),
+                self.tensor(*shared),
+                &mut self.tensor(*y),
+            ),
+            Linear::MatmulActQuant {
+                act,
+                w,
+                quant,
+                input_scales: _,
+                scales,
+                y,
+            } => self.matmul_act_quant(*act, *w, *quant, *scales, *y),
+            Linear::MoeMatmulSelectActQuant {
+                x,
+                bank,
+                routes,
+                quant,
+                input_scales: _,
+                y,
+            } => {
+                const OP: &str = "linear.moe_matmul_select_act_quant";
+                let poem_ir::ActQuant::E4m3 { gran } = *quant else {
+                    return Err(nvfp4_activations(OP));
+                };
+                // The routes' rows read x's rows, so x's rows are what quantize.
+                let x = linear::act_quant::quantized(self.ctx(), OP, self.tensor(*x), gran)?;
+                self.select_quant(x, *bank, *routes, *y)
+            }
             Linear::MlpSwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
                 self.ctx(),
                 self.tensor(*gate),
@@ -592,25 +640,8 @@ impl Run<'_> {
                 )
             }
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
-                let (codes, scales, biases, seat) = self.planes(*bank);
-                let routes = self.tensor(*routes);
-                let (codes, scales, biases, routes, seat) =
-                    match self.staged_experts(codes, scales, biases, routes) {
-                        Some((codes, scales, biases, routes)) => {
-                            (codes, scales, biases, routes, GroupSeat::RESIDENT)
-                        }
-                        None => (codes, scales, biases, routes, seat),
-                    };
-                linear::moe::matmul_select_quant(
-                    self.ctx(),
-                    self.tensor(*x),
-                    codes,
-                    scales,
-                    biases,
-                    routes,
-                    &mut self.tensor(*y),
-                    seat,
-                )
+                let x = self.tensor(*x);
+                self.select_quant(x, *bank, *routes, *y)
             }
             Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(
                 self.ctx(),
@@ -667,6 +698,73 @@ impl Run<'_> {
         self.maybe_tiled_planes(w).is_none()
             && self.maybe_planes(w).is_none()
             && self.maybe_stored(w).is_none()
+    }
+
+    /// A split-plane bank's routed select of `x`'s rows.
+    fn select_quant(
+        &mut self,
+        x: kernels_rocm::Tensor,
+        bank: ValueId,
+        routes: ValueId,
+        y: ValueId,
+    ) -> Result<(), kernels_rocm::Error> {
+        let (codes, scales, biases, seat) = self.planes(bank);
+        let routes = self.tensor(routes);
+        let (codes, scales, biases, routes, seat) =
+            match self.staged_experts(codes, scales, biases, routes) {
+                Some((codes, scales, biases, routes)) => {
+                    (codes, scales, biases, routes, GroupSeat::RESIDENT)
+                }
+                None => (codes, scales, biases, routes, seat),
+            };
+        linear::moe::matmul_select_quant(
+            self.ctx(),
+            x,
+            codes,
+            scales,
+            biases,
+            routes,
+            &mut self.tensor(y),
+            seat,
+        )
+    }
+
+    /// A projection whose activations quantize first: an fp8b128 one
+    /// (DeepSeek's W8A8) against e4m3 in its `gran`s.
+    fn matmul_act_quant(
+        &mut self,
+        act: ValueId,
+        w: ValueId,
+        quant: poem_ir::ActQuant,
+        scales: Option<ValueId>,
+        y: ValueId,
+    ) -> Result<(), kernels_rocm::Error> {
+        const OP: &str = "linear.matmul_act_quant";
+        let poem_ir::ActQuant::E4m3 { gran } = quant else {
+            return Err(nvfp4_activations(OP));
+        };
+        let Some(scales) = scales else {
+            return Err(kernels_rocm::Error::Backend {
+                op: OP,
+                detail: "an MXFP4 projection against e4m3 activations has no dense product on \
+                         rocm (its MXFP4 products are the routed selects); no catalog \
+                         deployment declares one"
+                    .to_string(),
+            });
+        };
+        let codes = self.tensor(w);
+        let (n, k) = (codes.rows, codes.width);
+        let holds = self.decoded_tile_holds(n, k);
+        linear::act_quant::matmul_fp8b128(
+            self.ctx(),
+            OP,
+            self.tensor(act),
+            codes,
+            self.tensor(scales),
+            gran,
+            holds,
+            &mut self.tensor(y),
+        )
     }
 
     fn row_major_matmul(
@@ -869,4 +967,14 @@ fn staging(name: &'static str, bytes: usize) -> Option<u64> {
         held.retired.push(old);
     }
     Some(fresh)
+}
+
+/// NVFP4 activations (`nvfp4a4`) are a tcgen05 product, CUDA's alone.
+fn nvfp4_activations(op: &'static str) -> kernels_rocm::Error {
+    kernels_rocm::Error::Backend {
+        op,
+        detail: "NVFP4 activations (`nvfp4a4`) are multiplied on CUDA's tcgen05 GEMMs, which \
+                 rocm has none of; serve the deployment that reads bf16 activations instead"
+            .to_string(),
+    }
 }

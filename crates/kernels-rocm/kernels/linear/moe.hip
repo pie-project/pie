@@ -277,6 +277,22 @@ __global__ void moe_weighted_sum(T* __restrict__ out, const T* __restrict__ src,
     out[n * hidden + h] = from_f32<T>(acc);
 }
 
+// y[n][h] = Σ_k src[n·top_k + k][h] + shared[n][h], the routed rows already
+// weighted, summed in f32 and rounded once.
+template <class T>
+__global__ void moe_sum_add(T* __restrict__ out, const T* __restrict__ src, const T* __restrict__ shared,
+                            int top_k, int hidden, const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long n = window.plane(blockIdx.x);
+    const int h = blockIdx.y * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+    const long long base = n * top_k;
+    float acc = 0.f;
+    for (int k = 0; k < top_k; ++k) acc += to_f32(src[(base + k) * hidden + h]);
+    out[n * hidden + h] = from_f32<T>(acc + to_f32(shared[n * hidden + h]));
+}
+
 // y[n][h] = x[n][h] + Σ_k weights[n][k] · bias[routes[n][k]][h]; a dead
 // route (expert < 0) adds nothing.
 template <class T>

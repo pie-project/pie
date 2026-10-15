@@ -1176,6 +1176,28 @@ fn decoded_weight_planes(
                 poem_ir::Operation::Attention(_) => true,
                 _ => continue,
             };
+            // An fp8b128 projection is one dense e4m3 plane, decoded to bf16
+            // for a prefill's GEMM like a split-plane one.
+            if let poem_ir::Operation::Linear(poem_ir::Linear::MatmulActQuant {
+                w,
+                scales: Some(_),
+                ..
+            }) = &node.op
+                && let Some(poem_ir::Ty::Tensor { shape, .. }) =
+                    trace.values.get(w.0 as usize).map(|decl| &decl.ty)
+            {
+                let bytes = shape
+                    .iter()
+                    .map(|dim| match dim {
+                        poem_ir::Dim::Const(n) => *n,
+                        _ => 1,
+                    })
+                    .fold(2u64, u64::saturating_mul);
+                slot.widest = slot.widest.max(bytes);
+                if at_tokens {
+                    slot.at_tokens = slot.at_tokens.max(bytes);
+                }
+            }
             inputs.clear();
             node.op.inputs(&mut inputs);
             for id in &inputs {

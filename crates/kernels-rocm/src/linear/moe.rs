@@ -1613,6 +1613,40 @@ fn matmul_select_mlxu4(
     )
 }
 
+/// Each token's routed rows (already weighted) summed in f32, plus its
+/// `shared` row, rounded once.
+pub fn sum_add(ctx: &Ctx, routed: Tensor, shared: Tensor, y: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "linear.moe_sum_add";
+    let t = dtype_dispatch!(OP, routed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    nonzero(OP, "the token rows this fold lands on", y.rows)?;
+    if !routed.rows.is_multiple_of(y.rows) || routed.width != y.width {
+        return Err(refuse(
+            OP,
+            format!(
+                "the routed rectangle [{}, {}] does not fold into [{}, {}] token rows",
+                routed.rows, routed.width, y.rows, y.width
+            ),
+        ));
+    }
+    if shared.rows != y.rows || shared.width != y.width || shared.dtype != routed.dtype {
+        return Err(refuse(OP, "the shared row is not one token row of the routed dtype"));
+    }
+    let top_k = routed.rows / y.rows;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::linear::moe_sum_add<{t}>")))
+            .apply(elementwise_rows(OP, y.rows, y.width)?),
+        &[
+            y.arg(),
+            routed.arg(),
+            shared.arg(),
+            stated(OP, top_k)?.arg(),
+            stated(OP, y.width)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 pub fn weighted_sum(
     ctx: &Ctx,
     routed: Tensor,

@@ -1,4 +1,5 @@
 use crate::error::Error;
+use dtype::Dtype;
 
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
@@ -164,6 +165,57 @@ pub fn swiglu_clamp_split(
             stated(OP, y.width)?.arg(),
             limit.arg(),
             1i32.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// [`swiglu_clamp_split`] of routed rows, each row times its route's
+/// weight before it rounds: `weights` is f32, one a routed row.
+pub fn swiglu_clamp_split_routed(
+    ctx: &Ctx,
+    gate: Tensor,
+    up: Tensor,
+    weights: Tensor,
+    fan: u32,
+    limit: f32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mlp_swiglu_clamp_split_routed";
+    let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    if weights.dtype != Dtype::F32 || weights.elements() != u64::from(y.rows) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the route weights are {:?} [{}, {}] and the {} routed rows want one f32 each",
+                weights.dtype, weights.rows, weights.width, y.rows
+            ),
+        ));
+    }
+    let n = y.elements();
+    let lanes = u32::try_from(n).map_err(|_| {
+        refuse(
+            OP,
+            format!("{n} elements do not fit a 32-bit launch extent"),
+        )
+    })?;
+    nonzero(OP, "the activation's element count", lanes)?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::linear::mlp_swiglu_clamp_split_routed<{t}>")),
+        )
+        .apply(Launch::flat(lanes, BLOCK)),
+        &[
+            gate.arg(),
+            up.arg(),
+            weights.arg(),
+            y.arg(),
+            stated(OP, lanes)?.arg(),
+            stated(OP, y.width)?.arg(),
+            limit.arg(),
+            stated(OP, fan.max(1))?.arg(),
             ctx.stage(),
         ],
     )

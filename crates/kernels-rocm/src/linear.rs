@@ -3,6 +3,8 @@ mod dense;
 #[cfg(feature = "rocm")]
 mod dense_batch;
 
+pub mod act_quant;
+
 pub mod gemm;
 
 pub mod lane_gemm;

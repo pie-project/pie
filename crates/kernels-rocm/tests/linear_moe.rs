@@ -1881,3 +1881,56 @@ fn bench_moe_prefill_vs_dense() {
         );
     }
 }
+
+/// DeepSeek's routed down-leg input: `min(g, l)·sigmoid(min(g, l)) ·
+/// clamp(u, ±l)` times the row's route weight before it rounds, and the
+/// routed rows (already weighted) summed in f32 with the shared row.
+#[test]
+fn the_routed_clamp_and_the_sum_add_answer_the_host() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let (tokens, top_k, width, hidden) = (5usize, 3usize, 200usize, 136usize);
+    let rows = tokens * top_k;
+    let limit = 7.0f32;
+    let g = values(rows * width, 1, 9.0).into_iter().map(round_bf16).collect::<Vec<_>>();
+    let u = values(rows * width, 2, 9.0).into_iter().map(round_bf16).collect::<Vec<_>>();
+    let w = values(rows, 3, 1.0);
+    let mut y = gpu.zeros(rows as u32, width as u32, Dtype::Bf16);
+    kernels_rocm::linear::mlp::swiglu_clamp_split_routed(
+        &ctx,
+        gpu.tensor(&g, rows as u32, width as u32, Dtype::Bf16),
+        gpu.tensor(&u, rows as u32, width as u32, Dtype::Bf16),
+        gpu.tensor(&w, rows as u32, 1, Dtype::F32),
+        1,
+        limit,
+        &mut y,
+    )
+    .unwrap();
+    let want: Vec<f32> = (0..rows * width)
+        .map(|i| {
+            let gg = g[i].min(limit);
+            let uu = u[i].clamp(-limit, limit);
+            round_bf16(gg / (1.0 + (-gg).exp()) * uu * w[i / width])
+        })
+        .collect();
+    common::close_bf16("swiglu_clamp_split_routed", &gpu.read(&y), &want, 1.0);
+
+    let routed = values(rows * hidden, 4, 2.0).into_iter().map(round_bf16).collect::<Vec<_>>();
+    let shared = values(tokens * hidden, 5, 2.0).into_iter().map(round_bf16).collect::<Vec<_>>();
+    let mut out = gpu.zeros(tokens as u32, hidden as u32, Dtype::Bf16);
+    kernels_rocm::linear::moe::sum_add(
+        &ctx,
+        gpu.tensor(&routed, rows as u32, hidden as u32, Dtype::Bf16),
+        gpu.tensor(&shared, tokens as u32, hidden as u32, Dtype::Bf16),
+        &mut out,
+    )
+    .unwrap();
+    let want: Vec<f32> = (0..tokens * hidden)
+        .map(|i| {
+            let (n, h) = (i / hidden, i % hidden);
+            let s: f32 = (0..top_k).map(|k| routed[(n * top_k + k) * hidden + h]).sum();
+            round_bf16(s + shared[i])
+        })
+        .collect();
+    common::close_bf16("moe_sum_add", &gpu.read(&out), &want, 1.0);
+}
