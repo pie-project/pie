@@ -143,3 +143,8 @@ moe.nvfp4_mma_until = 8192
 # reduce launch charged 2 us (a captured step pays it), split algorithms
 # reduced in place joining the timing.
 gemm.split_launch_ns = 2000
+# A dense tcgen05 GEMM rasters 16 P tiles a band, not 8: at the power cap
+# (bf16, 16384-row prefill shapes, ~950 W) tc5 lands 1338 / 1182 / 1354
+# TFLOPS against 1254 / 1161 / 1348 at 8 (12 ties 16, 24 and 32 lose);
+# DeepSeek-V4-Flash's fp8 prefill 10.37k / 10.57k -> 10.57k / 10.58k tok/s.
+gemm.tc5_raster = 16

@@ -449,6 +449,7 @@ mod tests {
                         moe_w4a4_fused_from: 65_536,
                         moe_w4a8_fused_from: 65_536,
                         gemm_split_launch_ns: 0,
+                        gemm_tc5_raster: 8,
                         nvfp4_mma_from: defaults.nvfp4_mma_from,
                         nvfp4_mma_until: defaults.nvfp4_mma_until,
                         moe_topk_warp: false,
@@ -666,6 +667,10 @@ mod tests {
             assert_eq!(
                 other.nvfp4_mma_until, 0,
                 "sm_{major}{minor} keeps the NVFP4 W4A16 select off the register-dequant kernel"
+            );
+            assert_eq!(
+                other.gemm_tc5_raster, 8,
+                "sm_{major}{minor} rasters its dense tcgen05 GEMM 8 tiles a band"
             );
             assert!(
                 !other.moe_topk_warp,

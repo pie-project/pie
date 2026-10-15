@@ -626,6 +626,7 @@ impl Epilogue {
             wscale: self.weight_scale,
             live: self.live_rows,
             in_scale: self.input_scales,
+            raster: 8,
         }
     }
 }
@@ -648,6 +649,7 @@ struct EpiArgs {
     wscale: u64,
     live: u64,
     in_scale: u64,
+    raster: i32,
 }
 
 /// `y = epilogue(alpha * act . w^T)` for `[m, n, k]`, `n` the output's
@@ -1190,7 +1192,10 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
             .map_or((0, 0), |s| (s.ptr, s.zeros)),
         _ => (0, 0),
     };
-    let epi_args = epi.args(n, job.pad, wsf, wzero);
+    let epi_args = EpiArgs {
+        raster: i32::try_from(ctx.tuning().gemm_tc5_raster.max(1)).unwrap_or(8),
+        ..epi.args(n, job.pad, wsf, wzero)
+    };
     let sms = ctx.multiprocessors().unwrap_or(148);
     // Too few tiles to fill the SMs split K, each split keeping four K steps
     // or more to pipeline; the splits sum in f32 and one pass rounds.

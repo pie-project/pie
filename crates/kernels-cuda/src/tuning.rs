@@ -69,6 +69,13 @@ pub struct MoeNvfp4MmaUntil(pub u32);
 #[decision(id = "kernel.moe.nvfp4_mma_from", constant(range(1..=65_536)), default = 1, tune = search)]
 pub struct MoeNvfp4MmaFrom(pub u32);
 
+/// The P tiles a dense tcgen05 GEMM's raster band walks Q together over:
+/// a wave shares both operands' tiles in L2. 8 but where a chip's profile
+/// says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.tc5_raster", constant(range(1..=64)), default = 8, tune = search)]
+pub struct GemmTc5Raster(pub u32);
+
 /// What a K-splitting cuBLASLt algorithm's own reduce launch costs a
 /// captured step past its lone timing, in ns, charged to it (and to
 /// `cublasGemmEx`, which may split) when a dense bf16 product's tactic is
@@ -440,6 +447,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeW4a4FusedFrom>()
         .add::<MoeW4a8FusedFrom>()
         .add::<GemmSplitLaunchNs>()
+        .add::<GemmTc5Raster>()
         .add::<MoeNvfp4MmaUntil>()
         .add::<MoeNvfp4MmaFrom>()
         .add::<MoeTopkWarp>()
@@ -506,6 +514,7 @@ pub struct Tuning {
     pub moe_w4a4_fused_from: u32,
     pub moe_w4a8_fused_from: u32,
     pub gemm_split_launch_ns: u32,
+    pub gemm_tc5_raster: u32,
     pub nvfp4_mma_from: u32,
     pub nvfp4_mma_until: u32,
     pub moe_topk_warp: bool,
@@ -570,6 +579,7 @@ impl Tuning {
         moe_w4a4_fused_from: 65_536,
         moe_w4a8_fused_from: 65_536,
         gemm_split_launch_ns: 0,
+        gemm_tc5_raster: 8,
         nvfp4_mma_from: 1,
         nvfp4_mma_until: 0,
         moe_topk_warp: false,
@@ -634,6 +644,7 @@ impl Tuning {
             moe_w4a4_fused_from: profile.get::<MoeW4a4FusedFrom>().0,
             moe_w4a8_fused_from: profile.get::<MoeW4a8FusedFrom>().0,
             gemm_split_launch_ns: profile.get::<GemmSplitLaunchNs>().0,
+            gemm_tc5_raster: profile.get::<GemmTc5Raster>().0,
             nvfp4_mma_from: profile.get::<MoeNvfp4MmaFrom>().0,
             nvfp4_mma_until: profile.get::<MoeNvfp4MmaUntil>().0,
             moe_topk_warp: profile.on::<MoeTopkWarp>(&Anywhere),

@@ -481,7 +481,14 @@ fn the_bf16_gemm_reports_its_power_beside_cublaslt() {
         return;
     }
     let mut gpu = Gpu::open();
-    let ctx = gpu.ctx();
+    // `PIE_POWER_RASTER` states tc5's raster band.
+    let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+        gemm_tc5_raster: std::env::var("PIE_POWER_RASTER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8),
+        ..kernels_cuda::tuning::Tuning::DEFAULT
+    });
     let stream: rt::cudaStream_t = ctx.stream().cast();
     let ws_bytes = 64 << 20;
     let ws = gpu.zeros(ws_bytes);

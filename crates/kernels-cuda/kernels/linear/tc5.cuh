@@ -92,6 +92,8 @@ struct Epi {
     // for `gscale`; with it, a value is rounded to bf16 before it is
     // quantized, as the GLU's bf16 row would be.
     const float* in_scale;
+    // A dense launch's P tiles a raster band (`kernel.gemm.tc5_raster`).
+    int raster;
 };
 
 namespace tc5k {
@@ -561,7 +563,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         } else {
             // Groups of 8 P tiles walk Q together, so a wave shares both
             // operands.
-            constexpr int kRaster = 8;
+            const int kRaster = epi.raster;
             const int band = t / (kRaster * num_q);
             const int first = band * kRaster;
             const int size = min(num_p - first, kRaster);
