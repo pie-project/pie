@@ -462,3 +462,90 @@ fn the_tcgen05_gemm_reports_its_rate_beside_cublaslt() {
         }
     }
 }
+
+/// The power a sustained bf16 GEMM draws, cuBLASLt's beside tc5's: each
+/// runs back to back for three seconds at a shape, its phase's wall-clock
+/// bounds printed (`PHASE name m n k start_ms end_ms launches TFLOPS`, Unix
+/// milliseconds) for a power sampler running beside it to cut at. Shapes
+/// default to Gemma-4-31B's prefill GEMMs over a 16384-row fire;
+/// `PIE_POWER_SHAPES=m,n,k;m,n,k` names others.
+#[test]
+#[ignore = "a measurement: run alone, on an idle GPU, beside a power sampler"]
+fn the_bf16_gemm_reports_its_power_beside_cublaslt() {
+    if !supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
+    let mut gpu = Gpu::open();
+    let ctx = gpu.ctx();
+    let stream: rt::cudaStream_t = ctx.stream().cast();
+    let ws_bytes = 64 << 20;
+    let ws = gpu.zeros(ws_bytes);
+    let shapes: Vec<[usize; 3]> = std::env::var("PIE_POWER_SHAPES")
+        .ok()
+        .map(|v| {
+            v.split(';')
+                .map(|s| {
+                    let d: Vec<usize> =
+                        s.split(',').filter_map(|d| d.trim().parse().ok()).collect();
+                    [d[0], d[1], d[2]]
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            vec![
+                [16384, 43008, 5376],
+                [16384, 5376, 21504],
+                [16384, 16384, 5376],
+            ]
+        });
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis())
+    };
+    for [m, n, k] in shapes {
+        let w = gpu.up(&noise(n * k * 2, 0xbf, 0x00, 1));
+        let a = gpu.up(&noise(m * k * 2, 0xbf, 0x00, 7));
+        let y = gpu.zeros(m * n * 2);
+        let shape = [m as u32, n as u32, k as u32];
+        let plan = unsafe { Lt::plan(LtKind::Bf16, [m, n, k], 0, 0, ws, ws_bytes) }
+            .expect("cuBLASLt plans the shape");
+        let mut tc5 = || {
+            gemm(
+                &ctx,
+                Operand::plain(a, Elem::Bf16),
+                Operand::plain(w, Elem::Bf16),
+                y,
+                shape,
+                1.0,
+            )
+            .expect("the tc5 GEMM fires");
+        };
+        let mut lt = || plan.run(w, a, y, stream);
+        for (name, launch) in [
+            ("cublaslt", &mut lt as &mut dyn FnMut()),
+            ("tc5", &mut tc5 as &mut dyn FnMut()),
+        ] {
+            launch();
+            gpu.sync();
+            let start = now_ms();
+            let t0 = std::time::Instant::now();
+            let mut launches = 0usize;
+            while t0.elapsed().as_secs_f64() < 3.0 {
+                for _ in 0..8 {
+                    launch();
+                }
+                launches += 8;
+                gpu.sync();
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            let end = now_ms();
+            println!(
+                "PHASE {name} {m} {n} {k} {start} {end} {launches} {:.0}",
+                2.0 * (m * n * k) as f64 * launches as f64 / secs * 1e-12
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        }
+    }
+}
