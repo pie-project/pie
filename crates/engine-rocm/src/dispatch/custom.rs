@@ -14,6 +14,16 @@ impl DispatchFused for Run<'_> {
             | Fused::MlpSwiglu { .. }
             | Fused::LmHeadSoftcap { .. }
             | Fused::MatmulBias { .. } => self.fused_linear(op),
+            // Kernels this backend does not ship as one: never formed for it,
+            // and run as the primitives they stand for where a trace states
+            // them.
+            Fused::MatmulSwiglu { .. }
+            | Fused::MatmulSplitRows { .. }
+            | Fused::MoeSelectGlu { .. }
+            | Fused::MoeExperts { .. }
+            | Fused::LseSink { .. }
+            | Fused::RopeYarnAppend { .. }
+            | Fused::SplitRopeYarnAppend { .. } => return self.primitives(op),
             Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::EmbedScaleAdd { .. }
@@ -36,6 +46,221 @@ impl DispatchFused for Run<'_> {
 }
 
 impl Run<'_> {
+    /// A fused op as the primitives it replaced, each over the values the
+    /// fused op keeps.
+    fn primitives(&mut self, op: &Fused) -> Result<(), KernelError> {
+        use poem_exec::{DispatchAttention, DispatchElementwise, DispatchLayout, DispatchLinear};
+        use poem_ir::{Attention, Elementwise, Layout, Linear};
+        match op {
+            Fused::MatmulSwiglu {
+                act,
+                w,
+                intermediate,
+                packed,
+                y,
+            } => {
+                DispatchLinear::dispatch(
+                    self,
+                    &Linear::Matmul {
+                        act: *act,
+                        w: *w,
+                        y: *packed,
+                    },
+                )?;
+                DispatchLinear::dispatch(
+                    self,
+                    &Linear::MlpSwiglu {
+                        packed: *packed,
+                        intermediate: *intermediate,
+                        y: *y,
+                    },
+                )
+            }
+            Fused::MatmulSplitRows {
+                act,
+                w,
+                width,
+                y,
+                left,
+                right,
+            } => {
+                DispatchLinear::dispatch(
+                    self,
+                    &Linear::Matmul {
+                        act: *act,
+                        w: *w,
+                        y: *y,
+                    },
+                )?;
+                DispatchLayout::dispatch(
+                    self,
+                    &Layout::SplitRows {
+                        x: *y,
+                        width: *width,
+                        left: *left,
+                        right: *right,
+                    },
+                )
+            }
+            Fused::MoeSelectGlu { select, glu } => {
+                DispatchLinear::dispatch(self, select)?;
+                DispatchLinear::dispatch(self, glu)
+            }
+            Fused::MoeExperts {
+                select,
+                glu,
+                down,
+                sum,
+                gate_add,
+            } => {
+                for leg in [select, glu, down, sum] {
+                    DispatchLinear::dispatch(self, leg)?;
+                }
+                match gate_add {
+                    Some(gate_add) => DispatchLinear::dispatch(self, gate_add),
+                    None => Ok(()),
+                }
+            }
+            Fused::LseSink {
+                attn,
+                sink,
+                head_dim,
+                o_out,
+            } => {
+                let (Attention::DecodeLse { o, lse, .. } | Attention::PrefillLse { o, lse, .. }) =
+                    **attn
+                else {
+                    return Err(crate::error::kernel(kernels_rocm::Error::Unsupported {
+                        op: op.name(),
+                    }));
+                };
+                DispatchAttention::dispatch(self, attn)?;
+                DispatchAttention::dispatch(
+                    self,
+                    &Attention::Sink {
+                        o,
+                        lse,
+                        sink: *sink,
+                        head_dim: *head_dim,
+                        o_out: *o_out,
+                    },
+                )
+            }
+            Fused::RopeYarnAppend {
+                q,
+                k,
+                v,
+                positions,
+                head_dim,
+                theta,
+                factor,
+                beta_fast,
+                beta_slow,
+                attention_factor,
+                original_max_position,
+                interleaved,
+                cache,
+                write_page,
+                write_offset,
+                q_out,
+                k_out,
+            } => {
+                DispatchElementwise::dispatch(
+                    self,
+                    &Elementwise::RopeYarn {
+                        q: *q,
+                        k: *k,
+                        positions: *positions,
+                        head_dim: *head_dim,
+                        theta: *theta,
+                        factor: *factor,
+                        beta_fast: *beta_fast,
+                        beta_slow: *beta_slow,
+                        attention_factor: *attention_factor,
+                        original_max_position: *original_max_position,
+                        interleaved: *interleaved,
+                        q_out: *q_out,
+                        k_out: *k_out,
+                    },
+                )?;
+                DispatchAttention::dispatch(
+                    self,
+                    &Attention::KvAppend {
+                        k: *k_out,
+                        v: *v,
+                        cache: *cache,
+                        write_page: *write_page,
+                        write_offset: *write_offset,
+                    },
+                )
+            }
+            Fused::SplitRopeYarnAppend {
+                packed,
+                q_width,
+                kv_width,
+                positions,
+                head_dim,
+                theta,
+                factor,
+                beta_fast,
+                beta_slow,
+                attention_factor,
+                original_max_position,
+                interleaved,
+                cache,
+                write_page,
+                write_offset,
+                q_out,
+                k_out,
+                v_out,
+            } => {
+                // The split lands q where the rotation leaves it.
+                DispatchLayout::dispatch(
+                    self,
+                    &Layout::SplitQkv {
+                        packed: *packed,
+                        q_width: *q_width,
+                        kv_width: *kv_width,
+                        q: *q_out,
+                        k: *k_out,
+                        v: *v_out,
+                    },
+                )?;
+                DispatchElementwise::dispatch(
+                    self,
+                    &Elementwise::RopeYarn {
+                        q: *q_out,
+                        k: *k_out,
+                        positions: *positions,
+                        head_dim: *head_dim,
+                        theta: *theta,
+                        factor: *factor,
+                        beta_fast: *beta_fast,
+                        beta_slow: *beta_slow,
+                        attention_factor: *attention_factor,
+                        original_max_position: *original_max_position,
+                        interleaved: *interleaved,
+                        q_out: *q_out,
+                        k_out: *k_out,
+                    },
+                )?;
+                DispatchAttention::dispatch(
+                    self,
+                    &Attention::KvAppend {
+                        k: *k_out,
+                        v: *v_out,
+                        cache: *cache,
+                        write_page: *write_page,
+                        write_offset: *write_offset,
+                    },
+                )
+            }
+            _ => Err(crate::error::kernel(kernels_rocm::Error::Unsupported {
+                op: op.name(),
+            })),
+        }
+    }
+
     /// The gated-delta decode step whole where the kernel covers it, else
     /// its primitives over the values the fused op keeps.
     fn gdn_step(&mut self, op: &Fused) -> Result<(), KernelError> {
