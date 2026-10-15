@@ -222,19 +222,24 @@ affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
 // Grid (N / 64, tiles of 32 sorted rows); live rows lead a tile (perm >= 0) and only they are stored.
 constant constexpr ushort kRoutedColumns = 32, kRoutedStep = 32, kRoutedTile = 32;
 
-// 32 affine 4-bit codes (16 bytes, low nibble first) as half, q * scale + bias rounded once.
+// 32 affine 4-bit codes (16 bytes, low nibble first) as half, q * scale + bias rounded once, two at a
+// time as Splash's staged_linear does: or-ing a nibble pair into the mantissa of half 1024, whose ulp
+// is 1, makes 1024 + code exactly.
+inline half2 staged_pair(uint pair, float scale, float bias) {
+  const float2 code = float2(as_type<half2>(pair | 0x64006400u) - half2(1024.0h));
+  return half2(fma(code, float2(scale), float2(bias)));
+}
 inline void staged_dequant32(uint4 codes, float scale, float bias, threadgroup half *dst) {
   const uint words[4] = {codes.x, codes.y, codes.z, codes.w};
 #pragma unroll
   for (ushort w = 0; w < 4; ++w) {
-    half4 lo, hi;
-#pragma unroll
-    for (ushort j = 0; j < 4; ++j) {
-      lo[j] = half(fma(float((words[w] >> (4 * j)) & 15u), scale, bias));
-      hi[j] = half(fma(float((words[w] >> (4 * j + 16)) & 15u), scale, bias));
-    }
-    *((threadgroup half4 *)(dst + 8 * w)) = lo;
-    *((threadgroup half4 *)(dst + 8 * w + 4)) = hi;
+    // Pair i holds codes i and i + 4 of the word.
+    const half2 p0 = staged_pair(words[w] & 0x000F000Fu, scale, bias);
+    const half2 p1 = staged_pair((words[w] >> 4) & 0x000F000Fu, scale, bias);
+    const half2 p2 = staged_pair((words[w] >> 8) & 0x000F000Fu, scale, bias);
+    const half2 p3 = staged_pair((words[w] >> 12) & 0x000F000Fu, scale, bias);
+    *((threadgroup half4 *)(dst + 8 * w)) = half4(p0.x, p1.x, p2.x, p3.x);
+    *((threadgroup half4 *)(dst + 8 * w + 4)) = half4(p0.y, p1.y, p2.y, p3.y);
   }
 }
 
