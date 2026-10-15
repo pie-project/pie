@@ -21,6 +21,12 @@ const W4A4: Precision = Precision {
     act: Some(ActQuant::Nvfp4),
 };
 
+/// An MXFP4 bank against e4m3 activations in 1x128 blocks (W4A8).
+const W4A8: Precision = Precision {
+    dtype: Dtype::Mxfp4,
+    act: Some(ActQuant::E4m3 { gran: 128 }),
+};
+
 pub(super) fn all() -> Vec<Rule> {
     vec![
         qkv_qknorm_rope_vnorm_write(),
@@ -532,10 +538,11 @@ fn mlp_swiglu() -> Rule {
 fn moe_experts() -> Rule {
     let mut alternatives = Vec::new();
     // Each leg's select: over a dense bank, a biased one, a quantized one,
-    // or (both legs) an NVFP4 bank quantizing its activations (W4A4).
+    // or (both legs) a bank quantizing its activations: NVFP4 (W4A4) or
+    // MXFP4 against e4m3 (W4A8).
     let legs = (0..3)
         .flat_map(|s| (0..3).map(move |d| (s, d)))
-        .chain([(3, 3)]);
+        .chain([(3, 3), (4, 4)]);
     for (select, down) in legs {
         for glu in 0..4 {
             for gated in [true, false] {
@@ -569,9 +576,15 @@ fn moe_experts() -> Rule {
                             &routes,
                             top_k,
                         ),
-                        _ => linear::moe_matmul_select_quant(
+                        3 => linear::moe_matmul_select_quant(
                             x,
                             &p.weight_at(bank, [W, W, W], W4A4),
+                            &routes,
+                            top_k,
+                        ),
+                        _ => linear::moe_matmul_select_quant(
+                            x,
+                            &p.weight_at(bank, [W, W, W], W4A8),
                             &routes,
                             top_k,
                         ),

@@ -999,6 +999,33 @@ impl Run<'_> {
                     ExpertTable::RESIDENT,
                 )
             }
+            // An MXFP4 bank against e4m3 activations in 1x128 blocks (W4A8),
+            // its scales laid in atoms.
+            Linear::MoeMatmulSelectActQuant {
+                x,
+                bank,
+                routes,
+                quant: ActQuant::E4m3 { gran: 128 },
+                input_scales: None,
+                y: sy,
+            } => {
+                let (codes, atoms, biases, seat) = self.planes(bank);
+                if !matches!(codes.dtype, Dtype::Mxfp4 | Dtype::U8)
+                    || biases.is_some()
+                    || seat.streams()
+                    || !self.scales_in_atoms(bank)
+                    || crate::device::alloc::is_host_pointer(codes.ptr)
+                {
+                    return None;
+                }
+                (
+                    x,
+                    routes,
+                    sy,
+                    GluBank::Mxfp4A8 { codes, atoms },
+                    ExpertTable::RESIDENT,
+                )
+            }
             _ => return None,
         })
     }

@@ -583,6 +583,12 @@ pub enum GluBank {
         tensor_scales: Tensor,
         input_scales: Tensor,
     },
+    /// An MXFP4 bank against e4m3 activations in 1x128 blocks (W4A8): its
+    /// ue8m0 scales laid in atoms. Only [`experts`] takes it, both legs so.
+    Mxfp4A8 {
+        codes: Tensor,
+        atoms: Tensor,
+    },
 }
 
 /// The group of an affine 4-bit bank of bf16 factors that the tcgen05
@@ -654,7 +660,7 @@ fn bank_operand(
             )
         }
         // Its activations quantize first: no bf16 operand reads it.
-        GluBank::Nvfp4A4 { .. } => return None,
+        GluBank::Nvfp4A4 { .. } | GluBank::Mxfp4A8 { .. } => return None,
     })
 }
 
@@ -797,6 +803,9 @@ pub fn experts(
     let count = routes.rows * routes.width;
     if let (GluBank::Nvfp4A4 { .. }, GluBank::Nvfp4A4 { .. }) = (up, down) {
         return experts_w4a4(ctx, x, up, glu, down, routes, weights, inter, y, gate);
+    }
+    if let (GluBank::Mxfp4A8 { .. }, GluBank::Mxfp4A8 { .. }) = (up, down) {
+        return experts_w4a8(ctx, x, up, glu, down, routes, weights, inter, y, gate);
     }
     let hidden = Tensor::new(0, count, inter, Dtype::Bf16);
     let routed = Tensor::new(0, count, y.width, Dtype::Bf16);
@@ -1058,6 +1067,146 @@ fn experts_w4a4(
                 groups: layout.groups,
                 alpha_e: down_alpha,
             },
+            [n, inter],
+            1.0,
+            tc5::Epilogue {
+                live_rows: layout.live_rows(),
+                ..tc5::Epilogue::STORE
+            },
+            count,
+        )?;
+        act_quant::weighted_gather(ctx, OP, ys, layout.pos, weights, gate, y)
+    };
+    // A tcgen05 launch that fails leaves the four to run apart.
+    Ok(run().is_ok())
+}
+
+/// [`experts`] on two W4A8 banks (MXFP4 codes against e4m3 activations in
+/// 1x128 blocks): the routes laid out once, the activations quantized into
+/// their experts' rows, the gate-up GEMM's epilogue landing the GLU as the
+/// down GEMM's e4m3 operand (as the down select's quantizer would land the
+/// GLU's bf16 row, save the bf16 rounding between), and the weighted sum
+/// reading the down product where it lies. A fire under
+/// `kernel.moe.w4a8_fused_from` tokens runs the four apart, as does one
+/// narrow enough to lay its routes out masked.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn experts_w4a8(
+    ctx: &Ctx,
+    x: Tensor,
+    up: GluBank,
+    glu: crate::linear::tc5::Glu,
+    down: GluBank,
+    routes: Tensor,
+    weights: Tensor,
+    inter: u32,
+    y: &mut Tensor,
+    gate: Option<(Tensor, Tensor)>,
+) -> Result<bool, Error> {
+    use crate::linear::{act_quant, tc5};
+    const OP: &str = "linear.moe_experts";
+    const W4A8_X: &str = "linear.moe_tc5_x8";
+    const W4A8_XS: &str = "linear.moe_tc5_x8_atoms";
+    const W4A8_H: &str = "linear.moe_tc5_h8";
+    const W4A8_HS: &str = "linear.moe_tc5_h8_atoms";
+    const W4A8_Y: &str = "linear.moe_tc5_y";
+    const GRAN: u32 = 128;
+    let (
+        GluBank::Mxfp4A8 {
+            codes: up_codes,
+            atoms: up_atoms,
+        },
+        GluBank::Mxfp4A8 {
+            codes: down_codes,
+            atoms: down_atoms,
+        },
+    ) = (up, down)
+    else {
+        return Ok(false);
+    };
+    let tokens = routes.rows;
+    let count = tokens * routes.width;
+    let experts = up_codes.rows;
+    let (k, n) = (x.width, y.width);
+    if count <= act_quant::MASKED_FIRE
+        || tokens < ctx.tuning().moe_w4a8_fused_from
+        || !matches!(glu, tc5::Glu::Swiglu)
+        || !ctx.tuning().moe_tc5
+        || !tc5::supported()
+        || x.dtype != Dtype::Bf16
+        || x.rows != tokens
+        || down_codes.rows != experts
+        || !k.is_multiple_of(GRAN)
+        || !inter.is_multiple_of(GRAN)
+        || !n.is_multiple_of(64)
+        || weights.dtype != Dtype::F32
+        || weights.rows != tokens
+        || weights.width != routes.width
+        || y.rows != tokens
+    {
+        return Ok(false);
+    }
+    let mut run = || -> Result<(), Error> {
+        let layout = act_quant::lay_out(ctx, OP, routes, experts, act_quant::BLOCK_ROWS, false)?;
+        let rows = layout.rows as usize;
+        let fmt = act_quant::Format::E4m3 { gran: GRAN };
+        let xq = ctx.scratch_stream(OP, W4A8_X, rows * k as usize)? as u64;
+        let x_atom_bytes = tc5::atom_bytes(rows, k as usize, GRAN as usize);
+        let xs = ctx.scratch_stream(OP, W4A8_XS, x_atom_bytes)? as u64;
+        act_quant::quantize(
+            ctx,
+            OP,
+            fmt,
+            act_quant::Source {
+                x,
+                rows: count,
+                div: routes.width,
+                routes: None,
+                input_scales: None,
+                pos: layout.pos,
+                m_max: 0,
+            },
+            xq,
+            xs,
+            x_atom_bytes,
+        )?;
+        let hq = ctx.scratch_stream(OP, W4A8_H, rows * inter as usize)? as u64;
+        let hs = ctx.scratch_stream(
+            OP,
+            W4A8_HS,
+            tc5::atom_bytes(rows, inter as usize, GRAN as usize),
+        )? as u64;
+        let grouped = tc5::Grouped {
+            experts,
+            groups: layout.groups,
+            alpha_e: 0,
+        };
+        tc5::grouped_gemm_epi(
+            ctx,
+            tc5::Operand::scaled(xq, tc5::Elem::E4m3, xs, GRAN),
+            tc5::Operand::scaled(up_codes.ptr, tc5::Elem::E2m1, up_atoms.ptr, 32),
+            hq,
+            grouped,
+            [inter, k],
+            1.0,
+            tc5::Epilogue {
+                glu: Some(glu),
+                out: tc5::Out::Fp8Block {
+                    data: hq,
+                    scales: hs,
+                },
+                live_rows: layout.live_rows(),
+                ..tc5::Epilogue::STORE
+            },
+            count,
+        )?;
+        let ys = ctx.scratch_stream(OP, W4A8_Y, rows * n as usize * 2)? as u64;
+        tc5::grouped_gemm_epi(
+            ctx,
+            tc5::Operand::scaled(hq, tc5::Elem::E4m3, hs, GRAN),
+            tc5::Operand::scaled(down_codes.ptr, tc5::Elem::E2m1, down_atoms.ptr, 32),
+            ys,
+            grouped,
             [n, inter],
             1.0,
             tc5::Epilogue {

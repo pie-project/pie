@@ -127,6 +127,10 @@ gemm.nvfp4_k128 = true
 # expert): Flash-Next prefill 34.6k -> 38.4k tok/s, TPOT bs64 20.0 -> 19.1
 # ms, bs16 13.5 -> 12.8 ms. A fire of 64 routes or fewer stays apart.
 moe.w4a4_fused_from = 1
+# A W4A8 routed MLP (MXFP4 banks against e4m3 activations) kept by expert,
+# its GLU landing the down leg's e4m3 operand from the gate-up epilogue.
+# A fire of 64 routes or fewer stays apart.
+moe.w4a8_fused_from = 1
 # A routed NVFP4 select of bf16 activations (W4A16) of 32 to 8192 routes on
 # the register-dequant MMA kernel: the tcgen05 W4A16 path's transform and
 # kind::f16 MMAs (four a 64-K stage) held a decode's gate-up to ~300 us.

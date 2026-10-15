@@ -86,6 +86,15 @@ pub struct GemmSplitLaunchNs(pub u32);
 #[decision(id = "kernel.moe.w4a4_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct MoeW4a4FusedFrom(pub u32);
 
+/// The fewest tokens a W4A8 routed MLP (MXFP4 banks against e4m3
+/// activations) keeps its rows by expert from the gate-up select to the
+/// weighted sum with (its GLU landing the down leg's e4m3 operand from the
+/// gate-up epilogue); never (65 536 past any fire) but where a chip's
+/// profile says (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.w4a8_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
+pub struct MoeW4a8FusedFrom(pub u32);
+
 /// Whether a dense projection's bias lands from the cuBLASLt epilogue of the
 /// algorithm its shape chose, instead of a separate add. Off but where a
 /// chip's profile turns it on (B200's).
@@ -429,6 +438,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmBiasEpilogue>()
         .add::<GemmNvfp4K128>()
         .add::<MoeW4a4FusedFrom>()
+        .add::<MoeW4a8FusedFrom>()
         .add::<GemmSplitLaunchNs>()
         .add::<MoeNvfp4MmaUntil>()
         .add::<MoeNvfp4MmaFrom>()
@@ -494,6 +504,7 @@ pub struct Tuning {
     pub gemm_bias_epilogue: bool,
     pub gemm_nvfp4_k128: bool,
     pub moe_w4a4_fused_from: u32,
+    pub moe_w4a8_fused_from: u32,
     pub gemm_split_launch_ns: u32,
     pub nvfp4_mma_from: u32,
     pub nvfp4_mma_until: u32,
@@ -557,6 +568,7 @@ impl Tuning {
         gemm_bias_epilogue: false,
         gemm_nvfp4_k128: false,
         moe_w4a4_fused_from: 65_536,
+        moe_w4a8_fused_from: 65_536,
         gemm_split_launch_ns: 0,
         nvfp4_mma_from: 1,
         nvfp4_mma_until: 0,
@@ -620,6 +632,7 @@ impl Tuning {
             gemm_bias_epilogue: profile.on::<GemmBiasEpilogue>(&Anywhere),
             gemm_nvfp4_k128: profile.on::<GemmNvfp4K128>(&Anywhere),
             moe_w4a4_fused_from: profile.get::<MoeW4a4FusedFrom>().0,
+            moe_w4a8_fused_from: profile.get::<MoeW4a8FusedFrom>().0,
             gemm_split_launch_ns: profile.get::<GemmSplitLaunchNs>().0,
             nvfp4_mma_from: profile.get::<MoeNvfp4MmaFrom>().0,
             nvfp4_mma_until: profile.get::<MoeNvfp4MmaUntil>().0,

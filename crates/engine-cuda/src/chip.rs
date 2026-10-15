@@ -447,6 +447,7 @@ mod tests {
                         gemm_bias_epilogue: false,
                         gemm_nvfp4_k128: false,
                         moe_w4a4_fused_from: 65_536,
+                        moe_w4a8_fused_from: 65_536,
                         gemm_split_launch_ns: 0,
                         nvfp4_mma_from: defaults.nvfp4_mma_from,
                         nvfp4_mma_until: defaults.nvfp4_mma_until,
@@ -673,6 +674,10 @@ mod tests {
             assert_eq!(
                 other.moe_w4a4_fused_from, 65_536,
                 "sm_{major}{minor} keeps the W4A4 routed MLP apart"
+            );
+            assert_eq!(
+                other.moe_w4a8_fused_from, 65_536,
+                "sm_{major}{minor} keeps the W4A8 routed MLP apart"
             );
         }
     }
