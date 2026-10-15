@@ -345,8 +345,9 @@ impl Operands for Fused {
                 gate_add,
                 ..
             } => {
-                // The select's (x, bank, its bias, routes), the sum's weights,
-                // then the down bank and its bias.
+                // The select's (x, bank, its bias, routes, its input scales),
+                // the sum's weights, then the down bank and its bias or input
+                // scales.
                 select.inputs(sink);
                 if let Linear::MoeWeightedSum { weights, .. } = **sum {
                     sink.push(weights);
@@ -357,6 +358,12 @@ impl Operands for Fused {
                         sink.push(bank);
                     }
                     Linear::MoeMatmulSelectBias { bank, bias, .. } => sink.extend([bank, bias]),
+                    Linear::MoeMatmulSelectActQuant {
+                        bank, input_scales, ..
+                    } => {
+                        sink.push(bank);
+                        sink.extend(input_scales);
+                    }
                     _ => {}
                 }
                 // Then the gated shared expert's row and its gate.

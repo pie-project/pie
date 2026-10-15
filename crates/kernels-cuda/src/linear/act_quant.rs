@@ -380,11 +380,11 @@ pub struct AlphaFrom {
 /// A fire of this many routes (or tokens, when no token names an expert
 /// twice) or fewer lays them out masked, each expert's rows a block as long
 /// as the fire's routes (tokens); a wider one lays them out contiguous.
-const MASKED_FIRE: u32 = 64;
+pub(crate) const MASKED_FIRE: u32 = 64;
 
 /// A select's experts start whole 128-row scale blocks apart when its
 /// activations carry block scales (the atoms it lands are whole blocks).
-const BLOCK_ROWS: u32 = 128;
+pub(crate) const BLOCK_ROWS: u32 = 128;
 const _: () = assert!(BLOCK_ROWS.is_multiple_of(tc5::GROUP_ALIGN));
 
 const ROUTE_COUNTS: &str = "linear.act_quant.route_counts";
@@ -531,7 +531,7 @@ pub(crate) fn lay_out(
 
 /// [`lay_out`], laying NVFP4's per-expert alpha too where `alpha` names its
 /// sources and destination: in the narrow fire's one launch, else apart.
-fn lay_out_with(
+pub(crate) fn lay_out_with(
     ctx: &Ctx,
     op: &'static str,
     routes: Tensor,

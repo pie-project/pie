@@ -48,6 +48,15 @@ pub struct MoeMxfp4MmaUntil(pub u32);
 #[decision(id = "kernel.gemm.nvfp4_k128", flag, default = false, tune = search)]
 pub struct GemmNvfp4K128;
 
+/// The fewest tokens a W4A4 routed MLP keeps its rows by expert from the
+/// gate-up select to the weighted sum with (its GLU landing the down leg's
+/// NVFP4 operand from the gate-up epilogue); never (65 536 past any fire)
+/// but where a chip's profile says (B200's). A decode's few rows an expert
+/// leave that epilogue the slower half, a prefill's glue the larger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.w4a4_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
+pub struct MoeW4a4FusedFrom(pub u32);
+
 /// Whether a dense projection's bias lands from the cuBLASLt epilogue of the
 /// algorithm its shape chose, instead of a separate add. Off but where a
 /// chip's profile turns it on (B200's).
@@ -332,6 +341,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4MmaFrom>()
         .add::<GemmBiasEpilogue>()
         .add::<GemmNvfp4K128>()
+        .add::<MoeW4a4FusedFrom>()
         .add::<PrefillTc5>()
         .add::<DecodeGroupedPrefillFrom>()
         .add::<DecodeGroupedPrefillLse>()
@@ -385,6 +395,7 @@ pub struct Tuning {
     pub mxfp4_mma_from: u32,
     pub gemm_bias_epilogue: bool,
     pub gemm_nvfp4_k128: bool,
+    pub moe_w4a4_fused_from: u32,
     pub prefill_tc5: bool,
     pub decode_grouped_prefill_from: u32,
     pub decode_grouped_prefill_lse: bool,
@@ -436,6 +447,7 @@ impl Tuning {
         mxfp4_mma_from: 64,
         gemm_bias_epilogue: false,
         gemm_nvfp4_k128: false,
+        moe_w4a4_fused_from: 65_536,
         prefill_tc5: false,
         decode_grouped_prefill_from: 0,
         decode_grouped_prefill_lse: false,
@@ -487,6 +499,7 @@ impl Tuning {
             mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,
             gemm_bias_epilogue: profile.on::<GemmBiasEpilogue>(&Anywhere),
             gemm_nvfp4_k128: profile.on::<GemmNvfp4K128>(&Anywhere),
+            moe_w4a4_fused_from: profile.get::<MoeW4a4FusedFrom>().0,
             prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),
             decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,
             decode_grouped_prefill_lse: profile.on::<DecodeGroupedPrefillLse>(&Anywhere),

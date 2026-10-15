@@ -971,6 +971,38 @@ impl Run<'_> {
                 };
                 (x, routes, sy, bank, ExpertTable::RESIDENT)
             }
+            // An NVFP4 bank against NVFP4 activations (W4A4), its scales laid
+            // in atoms and its input scales stated.
+            Linear::MoeMatmulSelectActQuant {
+                x,
+                bank,
+                routes,
+                quant: ActQuant::Nvfp4,
+                input_scales: Some(input_scales),
+                y: sy,
+            } => {
+                let (codes, atoms, biases, seat) = self.planes(bank);
+                if codes.dtype != Dtype::Nvfp4
+                    || seat.streams()
+                    || !self.scales_in_atoms(bank)
+                    || crate::device::alloc::is_host_pointer(codes.ptr)
+                {
+                    return None;
+                }
+                let tensor_scales = biases?;
+                (
+                    x,
+                    routes,
+                    sy,
+                    GluBank::Nvfp4A4 {
+                        codes,
+                        atoms,
+                        tensor_scales,
+                        input_scales: self.tensor(input_scales),
+                    },
+                    ExpertTable::RESIDENT,
+                )
+            }
             _ => return None,
         })
     }

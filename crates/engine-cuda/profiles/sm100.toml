@@ -92,3 +92,8 @@ gemm.bias_epilogue = true
 # An unswapped NVFP4 x NVFP4 GEMM at 128 K a stage (64-byte rows): twice the
 # ring in the same shared memory; W4A4 gate-up 5% ahead at 1024 tokens.
 gemm.nvfp4_k128 = true
+# A W4A4 routed MLP kept by expert, its GLU landing the down leg's NVFP4
+# operand from the gate-up epilogue: Flash-Next prefill 34.6k -> 38.4k
+# tok/s; a bs64 decode's few rows an expert make that epilogue slower than
+# the glue it saves (TPOT 20.5 -> 21.3 ms), so prefill widths only.
+moe.w4a4_fused_from = 2048

@@ -422,6 +422,7 @@ mod tests {
                         decode_grouped_prefill_from: 0,
                         gemm_bias_epilogue: false,
                         gemm_nvfp4_k128: false,
+                        moe_w4a4_fused_from: 65_536,
                         decode_grouped_prefill_lse: false,
                         decode_xqa: false,
                         decode_xqa_from_64: 0,
@@ -602,6 +603,10 @@ mod tests {
             assert_eq!(
                 other.mxfp4_mma_until, 0,
                 "sm_{major}{minor} keeps the mxfp4 GEMV"
+            );
+            assert_eq!(
+                other.moe_w4a4_fused_from, 65_536,
+                "sm_{major}{minor} keeps the W4A4 routed MLP apart"
             );
         }
     }

@@ -88,6 +88,10 @@ struct Epi {
     const bf16* wzero;         // an affine W4A16 weight's zeros, beside its scales
     const float* wscale;       // an f32 scale each weight row (NVFP4's tensor scale), or null
     const int* live;           // a contiguous group's live rows an expert, or null
+    // An NVFP4 store's input scale an expert (its global 1 / that), or null
+    // for `gscale`; with it, a value is rounded to bf16 before it is
+    // quantized, as the GLU's bf16 row would be.
+    const float* in_scale;
 };
 
 namespace tc5k {
@@ -498,6 +502,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         int kb0, kb1;
         float alpha;
         int out_p, out_q, lim_p, lim_q, s_row;
+        int e;  // the expert (grouped), else 0
     };
     // Every role walks the same units and skips the same empty ones (a
     // contiguous tile past the routed rows, a masked tile past its count).
@@ -509,6 +514,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         x.alpha = alpha;
         int e = 0, pt, qt;
         x.pquarter = 0;
+        x.e = 0;
         if constexpr (kGroup != 0) {
             // The last expert whose tiles start at or before t: an empty
             // expert shares its start with the next.
@@ -522,6 +528,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 }
             }
             e = lo;
+            x.e = e;
             const int r = t - starts[e];
             if constexpr (kGroup == 1 && kSwap) {
                 // An expert's row tiles walk fastest, sharing its weight tile.
@@ -1100,15 +1107,42 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             const float bias_row = kSwap && biased && live ? bf16_to_f32(epi.bias[x.p_row + i]) : 0.f;
             const float bias_row_up =
                 kSwap && kFused && biased && live ? bf16_to_f32(epi.bias[x.p_row + inter + i]) : 0.f;
-            auto bias_col = [&](u32 c0, int j, bool up) -> float {
+            // An unswapped chunk's column factors, a lane each column: the
+            // chunk's values take them by shuffle (one load a lane, not 32
+            // a thread).
+            struct Cols {
+                float ws, ws_up, b, b_up;
+            };
+            auto cols_of = [&](u32 c0) {
+                Cols f{1.f, 1.f, 0.f, 0.f};
+                if constexpr (!kSwap) {
+                    const int c = static_cast<int>(c0 + lane);
+                    if (c < x.lim_q) {
+                        const int at = x.q_row + c;
+                        if (epi.wscale != nullptr) {
+                            f.ws = epi.wscale[at];
+                            if constexpr (kFused) {
+                                f.ws_up = epi.wscale[at + inter];
+                            }
+                        }
+                        if (epi.bias != nullptr && x.kb0 == 0) {
+                            f.b = bf16_to_f32(epi.bias[at]);
+                            if constexpr (kFused) {
+                                f.b_up = bf16_to_f32(epi.bias[at + inter]);
+                            }
+                        }
+                    }
+                }
+                return f;
+            };
+            auto bias_col = [&](const Cols& f, int j, bool up) -> float {
                 if (!biased) {
                     return 0.f;
                 }
                 if constexpr (kSwap) {
                     return up ? bias_row_up : bias_row;
                 } else {
-                    const int c = static_cast<int>(c0) + j;
-                    return c < x.lim_q ? bf16_to_f32(epi.bias[x.q_row + (up ? inter : 0) + c]) : 0.f;
+                    return __shfl_sync(0xffffffffu, up ? f.b_up : f.b, j);
                 }
             };
             // An f32 scale each weight row (NVFP4's tensor scale), on the
@@ -1117,29 +1151,43 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             const float ws_row = kSwap && wscaled && live ? epi.wscale[x.p_row + i] : 1.f;
             const float ws_row_up =
                 kSwap && kFused && wscaled && live ? epi.wscale[x.p_row + inter + i] : 1.f;
-            auto ws_col = [&](u32 c0, int j, bool up) -> float {
+            auto ws_col = [&](const Cols& f, int j, bool up) -> float {
                 if (!wscaled) {
                     return 1.f;
                 }
                 if constexpr (kSwap) {
                     return up ? ws_row_up : ws_row;
                 } else {
-                    const int c = static_cast<int>(c0) + j;
-                    return c < x.lim_q ? epi.wscale[x.q_row + (up ? inter : 0) + c] : 1.f;
+                    return __shfl_sync(0xffffffffu, up ? f.ws_up : f.ws, j);
                 }
             };
             // No factor past alpha (a W4A4 select's store): its chunk
             // takes the plain path, not the per-column guards below (the
             // same sums: a zero bias's add turns -0 to +0 there too).
             const bool plain = !wscaled && !biased && epi.row_scale == nullptr;
-            auto finish = [&](u32 c0, const u32 (&v)[32], const u32 (&u)[32], float (&h)[32]) {
+            // A SwiGLU landing an NVFP4 operand under each expert's global
+            // takes gate and up as the select's bf16 rows would hold them
+            // (the store rounds its row to bf16, as `linear.mlp_swiglu`
+            // lands it). Its quotient stays the fast one: the exact one held
+            // a prefill's epilogue to a third of its pace.
+            auto glu_of = [&](float g, float u) -> float {
+                if constexpr (kOut == 2 && kGlu == 1) {
+                    if (epi.in_scale != nullptr) {
+                        g = bf16_to_f32(f32_to_bf16(g));
+                        u = bf16_to_f32(f32_to_bf16(u));
+                        return __fdividef(g, 1.f + __expf(-g)) * u;
+                    }
+                }
+                return tc5k::glu<kGlu>(g, u, epi.limit, epi.galpha);
+            };
+            auto finish = [&](u32 c0, const Cols& f, const u32 (&v)[32], const u32 (&u)[32],
+                              float (&h)[32]) {
                 if (plain) {
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
                         if constexpr (kFused) {
-                            h[j] = tc5k::glu<kGlu>(__uint_as_float(v[j]) * alpha + 0.f,
-                                                   __uint_as_float(u[j]) * alpha + 0.f, epi.limit,
-                                                   epi.galpha);
+                            h[j] = glu_of(__uint_as_float(v[j]) * alpha + 0.f,
+                                          __uint_as_float(u[j]) * alpha + 0.f);
                         } else {
                             h[j] = __uint_as_float(v[j]) * alpha + 0.f;
                         }
@@ -1149,18 +1197,17 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 if constexpr (kFused) {
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
-                        h[j] = tc5k::glu<kGlu>(
-                            __uint_as_float(v[j]) * alpha * ws_col(c0, j, false) +
-                                bias_col(c0, j, false),
-                            __uint_as_float(u[j]) * alpha * ws_col(c0, j, true) +
-                                bias_col(c0, j, true),
-                            epi.limit, epi.galpha);
+                        h[j] = glu_of(
+                            __uint_as_float(v[j]) * alpha * ws_col(f, j, false) +
+                                bias_col(f, j, false),
+                            __uint_as_float(u[j]) * alpha * ws_col(f, j, true) +
+                                bias_col(f, j, true));
                     }
                 } else {
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
-                        h[j] = __uint_as_float(v[j]) * alpha * ws_col(c0, j, false) +
-                               bias_col(c0, j, false);
+                        h[j] = __uint_as_float(v[j]) * alpha * ws_col(f, j, false) +
+                               bias_col(f, j, false);
                     }
                 }
 #pragma unroll
@@ -1183,10 +1230,12 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     }
                     return;
                 }
+                // The factors' loads go out before the accumulator's read.
+                const Cols f = plain ? Cols{1.f, 1.f, 0.f, 0.f} : cols_of(c0);
                 u32 v[32], u[32];
                 fetch(c0, v, u);
                 tmem_wait_ld();
-                finish(c0, v, u, h);
+                finish(c0, f, v, u, h);
             };
             // The columns the next tile's MMA shares go first: stage 0
             // drains tail first, stage 1 head first. A GLU's math is long
@@ -1213,7 +1262,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             }
             auto value = [&](u32 chunk, float (&h)[32]) {
                 if (kEarly && chunk < kPre) {
-                    finish(col(chunk), pre_v[chunk], pre_u[chunk], h);
+                    finish(col(chunk), plain ? Cols{1.f, 1.f, 0.f, 0.f} : cols_of(col(chunk)),
+                           pre_v[chunk], pre_u[chunk], h);
                 } else {
                     product(col(chunk), h);
                 }
@@ -1363,6 +1413,14 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 } else if constexpr (kOut == 2) {
                     // A row's two 16-wide blocks: 16 bytes and two scales.
                     if (live && j0 < x.lim_q) {
+                        float gs = epi.gscale;
+                        if (epi.in_scale != nullptr) {
+                            gs = __fdiv_rn(1.f, __ldg(&epi.in_scale[x.e]));
+#pragma unroll
+                            for (int j = 0; j < 32; ++j) {
+                                h[j] = bf16_to_f32(f32_to_bf16(h[j]));
+                            }
+                        }
                         u32 w[4];
 #pragma unroll
                         for (int b = 0; b < 2; ++b) {
@@ -1372,7 +1430,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                                 m = fmaxf(m, fabsf(h[16 * b + j]));
                             }
                             float scale;
-                            const unsigned char code = tc5k::nvfp4_scale(m, epi.gscale, scale);
+                            const unsigned char code = tc5k::nvfp4_scale(m, gs, scale);
 #pragma unroll
                             for (int g = 0; g < 2; ++g) {
                                 float e[8];

@@ -230,6 +230,7 @@ fn dense(fmt: Fmt, [m, n, k]: [usize; 3], swap: bool, glu: bool) {
         bias: gpu.up(&b_raw),
         weight_scale,
         live_rows: 0,
+        input_scales: 0,
     };
     let plan = Plan {
         swap,
@@ -318,6 +319,7 @@ fn grouped(fmt: Fmt, experts: usize, [n, k]: [usize; 2], masked: bool, glu: bool
         bias: gpu.up(&b_raw),
         weight_scale,
         live_rows: 0,
+        input_scales: 0,
     };
     let plan = Plan {
         swap: masked,

@@ -1361,25 +1361,38 @@ mod tests {
 /// their scales are read only by that product, which takes them in atoms.
 #[cfg(feature = "cuda")]
 fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
-    use poem_ir::{Def, Linear, Operation};
+    use poem_ir::{Def, Fused, Linear, Operation};
+    let lowp = |op: &Linear| match op {
+        Linear::MatmulActQuant { w, .. } | Linear::MoeMatmulSelectActQuant { bank: w, .. } => {
+            Some(*w)
+        }
+        _ => None,
+    };
     let mut banks = BTreeMap::new();
     for node in &trace.nodes {
-        let w = match &node.op {
-            Operation::Linear(
-                Linear::MatmulActQuant { w, .. } | Linear::MoeMatmulSelectActQuant { bank: w, .. },
-            ) => *w,
+        // A fused routed MLP's selects read their banks as they would apart.
+        let ws: Vec<_> = match &node.op {
+            Operation::Linear(op) => lowp(op).into_iter().collect(),
+            Operation::Fused(Fused::MoeExperts { select, down, .. }) => {
+                [lowp(select), lowp(down)].into_iter().flatten().collect()
+            }
+            Operation::Fused(Fused::MoeSelectGlu { select, .. }) => {
+                lowp(select).into_iter().collect()
+            }
             _ => continue,
         };
-        let Some(Def::Weight(at)) = trace.values.get(w.0 as usize).map(|v| &v.def) else {
-            continue;
-        };
-        let at = *at as usize;
-        let gran = match trace.params[at].dtype {
-            Dtype::Nvfp4 => 16,
-            Dtype::Mxfp4 => 32,
-            _ => continue,
-        };
-        banks.insert(at, gran);
+        for w in ws {
+            let Some(Def::Weight(at)) = trace.values.get(w.0 as usize).map(|v| &v.def) else {
+                continue;
+            };
+            let at = *at as usize;
+            let gran = match trace.params[at].dtype {
+                Dtype::Nvfp4 => 16,
+                Dtype::Mxfp4 => 32,
+                _ => continue,
+            };
+            banks.insert(at, gran);
+        }
     }
     banks
 }

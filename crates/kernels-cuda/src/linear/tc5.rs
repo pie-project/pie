@@ -516,6 +516,13 @@ pub struct Epilogue {
     /// products land nowhere (an expert's 128-row block at decode widths
     /// holds a route or two).
     pub live_rows: u64,
+    /// An [`Out::Nvfp4`] store's input scale an expert (device `f32
+    /// [experts]`, its global `1 / input_scale[e]` in place of `gscale`),
+    /// or 0. With it a SwiGLU takes its gate and up rounded to bf16, and
+    /// each value is rounded to bf16 before it is quantized, as the
+    /// select's rows, the GLU's and the next select's quantizer would hold
+    /// them apart.
+    pub input_scales: u64,
 }
 
 impl Epilogue {
@@ -526,6 +533,7 @@ impl Epilogue {
         bias: 0,
         weight_scale: 0,
         live_rows: 0,
+        input_scales: 0,
     };
 
     const fn glu_code(&self) -> u32 {
@@ -598,6 +606,7 @@ impl Epilogue {
             wzero,
             wscale: self.weight_scale,
             live: self.live_rows,
+            in_scale: self.input_scales,
         }
     }
 }
@@ -619,6 +628,7 @@ struct EpiArgs {
     wzero: u64,
     wscale: u64,
     live: u64,
+    in_scale: u64,
 }
 
 /// `y = epilogue(alpha * act . w^T)` for `[m, n, k]`, `n` the output's

@@ -906,6 +906,10 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // The select's routes, then the sum's weights.
             Fused::MoeExperts { select, .. } => match select.as_ref() {
                 Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32), (In(4), F32)],
+                Linear::MoeMatmulSelectActQuant {
+                    input_scales: Some(_),
+                    ..
+                } => &[(In(2), I32), (In(3), F32), (In(4), F32)],
                 _ => &[(In(2), I32), (In(3), F32)],
             },
         },

@@ -277,6 +277,7 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
                         bias: 0,
                         weight_scale: 0,
                         live_rows: 0,
+                        input_scales: 0,
                     };
                     let fused = |i: usize| {
                         let g = grouped(i);

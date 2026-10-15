@@ -1,16 +1,25 @@
 //! The fusion rules, in the order they run. A rule that forms a longer chain
 //! runs before one that forms a piece of it.
 
+use poem::declare::Precision;
 use poem::ops::{attn, elemwise, layout, linear};
 use poem::pattern::{Pattern, Template, template};
 use poem_ir::ops::fused::PostNorm;
-use poem_ir::{Dim, Dtype, Elementwise, Fused, ModulateForm, NormKind, Operation, StructKind, Ty};
+use poem_ir::{
+    ActQuant, Dim, Dtype, Elementwise, Fused, ModulateForm, NormKind, Operation, StructKind, Ty,
+};
 
 use super::Rule;
 
 /// A placeholder width for pattern holes; the matcher compares op fields, not
 /// the types of the values they hold.
 const W: u64 = 64;
+
+/// An NVFP4 bank against NVFP4 activations (W4A4).
+const W4A4: Precision = Precision {
+    dtype: Dtype::Nvfp4,
+    act: Some(ActQuant::Nvfp4),
+};
 
 pub(super) fn all() -> Vec<Rule> {
     vec![
@@ -458,9 +467,14 @@ fn mlp_swiglu() -> Rule {
 /// the down select of the GLU on the same routes, and the weighted sum.
 fn moe_experts() -> Rule {
     let mut alternatives = Vec::new();
-    for select in 0..3 {
+    // Each leg's select: over a dense bank, a biased one, a quantized one,
+    // or (both legs) an NVFP4 bank quantizing its activations (W4A4).
+    let legs = (0..3)
+        .flat_map(|s| (0..3).map(move |d| (s, d)))
+        .chain([(3, 3)]);
+    for (select, down) in legs {
         for glu in 0..4 {
-            for (down, gated) in (0..3).flat_map(|d| [(d, true), (d, false)]) {
+            for gated in [true, false] {
                 alternatives.push(template(move |p| {
                     let x = p.rows("x", W);
                     let routes = p.value(
@@ -485,9 +499,15 @@ fn moe_experts() -> Rule {
                             &routes,
                             top_k,
                         ),
-                        _ => linear::moe_matmul_select_quant(
+                        2 => linear::moe_matmul_select_quant(
                             x,
                             &p.weight(bank, [W, W, W]),
+                            &routes,
+                            top_k,
+                        ),
+                        _ => linear::moe_matmul_select_quant(
+                            x,
+                            &p.weight_at(bank, [W, W, W], W4A4),
                             &routes,
                             top_k,
                         ),

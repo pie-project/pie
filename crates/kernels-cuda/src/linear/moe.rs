@@ -549,6 +549,15 @@ pub enum GluBank {
         scales: Tensor,
         zeros: Tensor,
     },
+    /// An NVFP4 bank against NVFP4 activations (W4A4): its scales laid in
+    /// atoms, a tensor scale a row, an input scale an expert (the global its
+    /// activations quantize under). Only [`experts`] takes it, both legs so.
+    Nvfp4A4 {
+        codes: Tensor,
+        atoms: Tensor,
+        tensor_scales: Tensor,
+        input_scales: Tensor,
+    },
 }
 
 /// The group of an affine 4-bit bank of bf16 factors that the tcgen05
@@ -619,6 +628,8 @@ fn bank_operand(
                 Dtype::Bf16,
             )
         }
+        // Its activations quantize first: no bf16 operand reads it.
+        GluBank::Nvfp4A4 { .. } => return None,
     })
 }
 
@@ -723,6 +734,9 @@ pub fn experts(
     const GROUPED_H: &str = "linear.moe_tc5_h";
     const GROUPED_Y: &str = "linear.moe_tc5_y";
     let count = routes.rows * routes.width;
+    if let (GluBank::Nvfp4A4 { .. }, GluBank::Nvfp4A4 { .. }) = (up, down) {
+        return experts_w4a4(ctx, x, up, glu, down, routes, weights, inter, y, gate);
+    }
     let hidden = Tensor::new(0, count, inter, Dtype::Bf16);
     let routed = Tensor::new(0, count, y.width, Dtype::Bf16);
     // An mxfp4 fire the register-dequant kernel takes stays on it.
@@ -793,6 +807,176 @@ pub fn experts(
             tc5::Epilogue {
                 bias: d.2,
                 weight_scale: d.3,
+                live_rows: layout.live_rows(),
+                ..tc5::Epilogue::STORE
+            },
+            count,
+        )?;
+        act_quant::weighted_gather(ctx, OP, ys, layout.pos, weights, gate, y)
+    };
+    // A tcgen05 launch that fails leaves the four to run apart.
+    Ok(run().is_ok())
+}
+
+/// [`experts`] on two W4A4 banks: the routes laid out once (the gate-up
+/// leg's alpha with them), the activations quantized into their experts'
+/// rows under each expert's global, the gate-up GEMM's epilogue landing
+/// the GLU as the down GEMM's NVFP4 operand under the down leg's globals
+/// (rounded through bf16 first, as the GLU's row and the down select's
+/// quantizer would land it), and the weighted sum reading the down product
+/// where it lies. A fire under `kernel.moe.w4a4_fused_from` tokens runs the
+/// four apart (a decode's few rows an expert leave the GLU epilogue slower
+/// than the glue it saves), as does one narrow enough to lay its routes out
+/// masked.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn experts_w4a4(
+    ctx: &Ctx,
+    x: Tensor,
+    up: GluBank,
+    glu: crate::linear::tc5::Glu,
+    down: GluBank,
+    routes: Tensor,
+    weights: Tensor,
+    inter: u32,
+    y: &mut Tensor,
+    gate: Option<(Tensor, Tensor)>,
+) -> Result<bool, Error> {
+    use crate::linear::{act_quant, tc5};
+    const OP: &str = "linear.moe_experts";
+    const W4A4_X: &str = "linear.moe_tc5_x4";
+    const W4A4_XS: &str = "linear.moe_tc5_x4_atoms";
+    const W4A4_H: &str = "linear.moe_tc5_h4";
+    const W4A4_HS: &str = "linear.moe_tc5_h4_atoms";
+    const W4A4_Y: &str = "linear.moe_tc5_y";
+    const UP_ALPHA: &str = "linear.moe_tc5_up_alpha";
+    const DOWN_ALPHA: &str = "linear.moe_tc5_down_alpha";
+    let (
+        GluBank::Nvfp4A4 {
+            codes: up_codes,
+            atoms: up_atoms,
+            tensor_scales: up_ts,
+            input_scales: up_is,
+        },
+        GluBank::Nvfp4A4 {
+            codes: down_codes,
+            atoms: down_atoms,
+            tensor_scales: down_ts,
+            input_scales: down_is,
+        },
+    ) = (up, down)
+    else {
+        return Ok(false);
+    };
+    let tokens = routes.rows;
+    let count = tokens * routes.width;
+    let experts = up_codes.rows;
+    let (k, n) = (x.width, y.width);
+    // Only SwiGLU's epilogue lands what the four apart would.
+    if count <= act_quant::MASKED_FIRE
+        || tokens < ctx.tuning().moe_w4a4_fused_from
+        || !matches!(glu, tc5::Glu::Swiglu)
+        || !ctx.tuning().moe_tc5
+        || !tc5::supported()
+        || x.dtype != Dtype::Bf16
+        || x.rows != tokens
+        || down_codes.rows != experts
+        || up_is.rows * up_is.width < experts
+        || down_is.rows * down_is.width < experts
+        || !k.is_multiple_of(128)
+        || !inter.is_multiple_of(128)
+        || !n.is_multiple_of(64)
+        || weights.dtype != Dtype::F32
+        || weights.rows != tokens
+        || weights.width != routes.width
+        || y.rows != tokens
+        || !n.is_multiple_of(8)
+    {
+        return Ok(false);
+    }
+    let mut run = || -> Result<(), Error> {
+        let e = experts as usize;
+        let up_alpha = ctx.scratch_stream(OP, UP_ALPHA, e * 4)? as u64;
+        let down_alpha = ctx.scratch_stream(OP, DOWN_ALPHA, e * 4)? as u64;
+        let layout = act_quant::lay_out_with(
+            ctx,
+            OP,
+            routes,
+            experts,
+            act_quant::BLOCK_ROWS,
+            false,
+            Some((
+                act_quant::AlphaFrom {
+                    input_scales: up_is.ptr,
+                    tensor_scales: up_ts.ptr,
+                    rows: 2 * inter,
+                },
+                up_alpha,
+            )),
+        )?;
+        act_quant::expert_alpha(ctx, OP, down_is.ptr, down_ts.ptr, down_alpha, experts, n)?;
+        let rows = layout.rows as usize;
+        let xq = ctx.scratch_stream(OP, W4A4_X, rows * k as usize / 2)? as u64;
+        let x_atom_bytes = tc5::atom_bytes(rows, k as usize, 16);
+        let xs = ctx.scratch_stream(OP, W4A4_XS, x_atom_bytes)? as u64;
+        act_quant::quantize(
+            ctx,
+            OP,
+            act_quant::Format::Nvfp4,
+            act_quant::Source {
+                x,
+                rows: count,
+                div: routes.width,
+                routes: Some(routes),
+                input_scales: Some(up_is),
+                pos: layout.pos,
+                m_max: 0,
+            },
+            xq,
+            xs,
+            x_atom_bytes,
+        )?;
+        let hq = ctx.scratch_stream(OP, W4A4_H, rows * inter as usize / 2)? as u64;
+        let hs = ctx.scratch_stream(OP, W4A4_HS, tc5::atom_bytes(rows, inter as usize, 16))? as u64;
+        tc5::grouped_gemm_epi(
+            ctx,
+            tc5::Operand::scaled(xq, tc5::Elem::E2m1, xs, 16),
+            tc5::Operand::scaled(up_codes.ptr, tc5::Elem::E2m1, up_atoms.ptr, 16),
+            hq,
+            tc5::Grouped {
+                experts,
+                groups: layout.groups,
+                alpha_e: up_alpha,
+            },
+            [inter, k],
+            1.0,
+            tc5::Epilogue {
+                glu: Some(glu),
+                out: tc5::Out::Nvfp4 {
+                    data: hq,
+                    scales: hs,
+                    gscale: 1.0,
+                },
+                live_rows: layout.live_rows(),
+                input_scales: down_is.ptr,
+                ..tc5::Epilogue::STORE
+            },
+            count,
+        )?;
+        let ys = ctx.scratch_stream(OP, W4A4_Y, rows * n as usize * 2)? as u64;
+        tc5::grouped_gemm_epi(
+            ctx,
+            tc5::Operand::scaled(hq, tc5::Elem::E2m1, hs, 16),
+            tc5::Operand::scaled(down_codes.ptr, tc5::Elem::E2m1, down_atoms.ptr, 16),
+            ys,
+            tc5::Grouped {
+                experts,
+                groups: layout.groups,
+                alpha_e: down_alpha,
+            },
+            [n, inter],
+            1.0,
+            tc5::Epilogue {
                 live_rows: layout.live_rows(),
                 ..tc5::Epilogue::STORE
             },
