@@ -137,6 +137,7 @@ impl Run<'_> {
             | Linear::MatmulActQuant { .. }
             | Linear::MoeMatmulSelectActQuant { .. }
             | Linear::MlpSwigluClampSplitRouted { .. }
+            | Linear::MlpSwigluClampRouted { .. }
             | Linear::MoeSumAdd { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
             Linear::MlpGegluTanhPacked {
                 packed,

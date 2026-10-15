@@ -94,6 +94,17 @@ pub enum Linear {
         limit: f32,
         y: ValueId,
     },
+    /// [`Linear::MlpSwigluClamp`] of routed rows (each row's `intermediate`
+    /// gate columns, then as many up columns), each row times its route's
+    /// f32 weight before it rounds: the packed form of
+    /// [`Linear::MlpSwigluClampSplitRouted`].
+    MlpSwigluClampRouted {
+        packed: ValueId,
+        intermediate: u32,
+        weights: ValueId,
+        limit: f32,
+        y: ValueId,
+    },
     MlpGegluTanh {
         gate: ValueId,
         up: ValueId,
@@ -290,6 +301,9 @@ impl Operands for Linear {
             Self::MlpSwigluClampSplitRouted {
                 gate, up, weights, ..
             } => sink.extend([*gate, *up, *weights]),
+            Self::MlpSwigluClampRouted {
+                packed, weights, ..
+            } => sink.extend([*packed, *weights]),
             Self::MlpGegluTanh { gate, up, .. } => sink.extend([*gate, *up]),
             Self::MlpGeluTanh { x, .. } => sink.push(*x),
             Self::MlpGegluTanhPacked { packed, .. } => sink.push(*packed),
@@ -397,6 +411,7 @@ impl Operands for Linear {
             Self::MlpSwigluClampAlpha { y, .. } => sink.push(*y),
             Self::MlpSwigluClampSplit { y, .. } => sink.push(*y),
             Self::MlpSwigluClampSplitRouted { y, .. } => sink.push(*y),
+            Self::MlpSwigluClampRouted { y, .. } => sink.push(*y),
             Self::MlpGegluTanh { y, .. } => sink.push(*y),
             Self::MlpGeluTanh { y, .. } => sink.push(*y),
             Self::MlpGegluTanhPacked { y, .. } => sink.push(*y),
@@ -447,6 +462,7 @@ impl Operands for Linear {
             | Self::MlpSwigluClampAlpha { .. }
             | Self::MlpSwigluClampSplit { .. }
             | Self::MlpSwigluClampSplitRouted { .. }
+            | Self::MlpSwigluClampRouted { .. }
             | Self::MlpGegluTanh { .. }
             | Self::MlpGeluTanh { .. }
             | Self::MlpGegluTanhPacked { .. }
@@ -481,6 +497,7 @@ impl Operands for Linear {
             Self::MlpSwigluClampAlpha { .. } => "linear.mlp_swiglu_clamp_alpha",
             Self::MlpSwigluClampSplit { .. } => "linear.mlp_swiglu_clamp_split",
             Self::MlpSwigluClampSplitRouted { .. } => "linear.mlp_swiglu_clamp_split_routed",
+            Self::MlpSwigluClampRouted { .. } => "linear.mlp_swiglu_clamp_routed",
             Self::MlpGegluTanh { .. } => "linear.mlp_geglu_tanh",
             Self::MlpGeluTanh { .. } => "linear.mlp_gelu_tanh",
             Self::MlpGegluTanhPacked { .. } => "linear.mlp_geglu_tanh_packed",

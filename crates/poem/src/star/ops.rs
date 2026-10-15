@@ -3121,6 +3121,23 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "linear",
+        name: "mlp_swiglu_clamp_routed",
+        params: &["packed", "intermediate", "weights", "limit"],
+        call: |a, heap| {
+            let packed: Value = a.next()?;
+            let intermediate: u32 = a.next()?;
+            let weights: Value = a.next()?;
+            let limit: f32 = a.next()?;
+            result(
+                heap,
+                dsl("linear.mlp_swiglu_clamp_routed", || {
+                    ops::linear::mlp_swiglu_clamp_routed(&packed, intermediate, &weights, limit)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "linear",
         name: "mlp_geglu_tanh",
         params: &["gate", "up"],
         call: |a, heap| {

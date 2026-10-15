@@ -124,6 +124,7 @@ impl Run<'_> {
             | Linear::MatmulActQuant { .. }
             | Linear::MoeMatmulSelectActQuant { .. }
             | Linear::MlpSwigluClampSplitRouted { .. }
+            | Linear::MlpSwigluClampRouted { .. }
             | Linear::MoeSumAdd { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
             Linear::MlpGegluTanhPacked {
                 packed,

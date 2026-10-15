@@ -150,6 +150,29 @@ pub fn mlp_swiglu_clamp_split_routed(
     y
 }
 
+/// `mlp_swiglu_clamp` of routed rows (`packed` each row's gate columns,
+/// then its up columns), each times its route's weight before it rounds.
+pub fn mlp_swiglu_clamp_routed(
+    packed: &Value,
+    intermediate: u32,
+    weights: &Value,
+    limit: f32,
+) -> Value {
+    let r = packed.rec();
+    let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));
+    r.push(
+        Linear::MlpSwigluClampRouted {
+            packed: packed.id(),
+            intermediate,
+            weights: weights.id(),
+            limit,
+            y: y.id(),
+        },
+        &[packed, weights],
+    );
+    y
+}
+
 pub fn mlp_geglu_tanh(gate: &Value, up: &Value) -> Value {
     let r = gate.rec();
     let y = r.fresh(gate.ty().clone());

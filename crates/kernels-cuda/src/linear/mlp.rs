@@ -249,6 +249,71 @@ pub fn swiglu_clamp_split_routed(
     )
 }
 
+/// [`swiglu_clamp_split_routed`] over packed rows: each row's
+/// `intermediate` gate columns, then its up columns.
+#[allow(clippy::too_many_arguments)]
+pub fn swiglu_clamp_routed(
+    ctx: &Ctx,
+    packed: Tensor,
+    intermediate: u32,
+    weights: Tensor,
+    fan: u32,
+    limit: f32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mlp_swiglu_clamp_routed";
+    let t = dtype_dispatch!(OP, packed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    debug_assert_eq!(
+        weights.dtype,
+        dtype::Dtype::F32,
+        "`{OP}` reads f32 route weights"
+    );
+    if packed.width != 2 * intermediate || y.width != intermediate || packed.rows != y.rows {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} x {} packed rows are not {} rows of {intermediate} gate and up columns into {} x {}",
+                packed.rows, packed.width, y.rows, y.rows, y.width
+            ),
+        ));
+    }
+    if u64::from(weights.rows) * u64::from(weights.width) != u64::from(y.rows) {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} x {} route weights for {} routed rows",
+                weights.rows, weights.width, y.rows
+            ),
+        ));
+    }
+    let n = y.elements();
+    let lanes = u32::try_from(n).map_err(|_| {
+        refuse(
+            OP,
+            format!("{n} elements do not fit a 32-bit launch extent"),
+        )
+    })?;
+    nonzero(OP, "the activation's element count", lanes)?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::linear::mlp_swiglu_clamp_routed<{t}>")),
+        )
+        .apply(Launch::flat(lanes, BLOCK)),
+        &[
+            packed.arg(),
+            weights.arg(),
+            y.arg(),
+            stated(OP, lanes)?.arg(),
+            stated(OP, y.width)?.arg(),
+            limit.arg(),
+            stated(OP, fan)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 pub fn geglu_tanh(
     ctx: &Ctx,
     gate: Tensor,

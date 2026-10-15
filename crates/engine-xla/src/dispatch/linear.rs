@@ -19,6 +19,7 @@ impl Run<'_> {
             Linear::MatmulActQuant { .. }
             | Linear::MoeMatmulSelectActQuant { .. }
             | Linear::MlpSwigluClampSplitRouted { .. }
+            | Linear::MlpSwigluClampRouted { .. }
             | Linear::MoeSumAdd { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Linear::Matmul { act, w, y } => match self.banked(*w) {
                 Some(bank) => {

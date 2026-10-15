@@ -400,6 +400,24 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
+            Linear::MlpSwigluClampRouted {
+                packed,
+                intermediate,
+                weights,
+                limit,
+                y,
+            } => {
+                let fan = self.plane_fan(self.tensor(*y).rows);
+                linear::mlp::swiglu_clamp_routed(
+                    self.ctx(),
+                    self.tensor(*packed),
+                    *intermediate,
+                    self.tensor(*weights),
+                    fan,
+                    *limit,
+                    &mut self.tensor(*y),
+                )
+            }
             Linear::MoeSumAdd { routed, shared, y } => linear::moe::sum_add(
                 self.ctx(),
                 self.tensor(*routed),
