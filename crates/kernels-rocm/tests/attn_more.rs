@@ -1502,3 +1502,111 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
         }
     }
 }
+
+// ------------------------------------------------------------ rel bias --
+
+/// Inkling's relative-bias attention against the host: the bias added at
+/// each key's distance inside `extent`, the logits grown by
+/// `1 + α·ln((p + 1) / floor)` past the floor, a sliding window or none, over
+/// decode rows and prefill rows that share requests.
+#[allow(clippy::too_many_arguments)]
+fn check_rel(
+    gpu: &Gpu,
+    hq: u32,
+    hk: u32,
+    d: u32,
+    fresh: &[u32],
+    prefix: &[u32],
+    extent: u32,
+    window: Option<u32>,
+    log: (u32, f32),
+    seed: u64,
+) {
+    let ctx = gpu.ctx();
+    let ps = 16;
+    let kv_lens: Vec<u32> = fresh.iter().zip(prefix).map(|(f, p)| f + p).collect();
+    let Cache {
+        pool, keys, vals, ..
+    } = paged_cache(gpu, hk as usize, d as usize, ps, &kv_lens, seed);
+    let qo = indptr_of(fresh);
+    let total = *qo.last().unwrap() as usize;
+    let qs = bf16s(total * (hq * d) as usize, seed + 7, 1.0);
+    let bias = values(total * (hq * extent) as usize, seed + 9, 2.0);
+    let q = RaggedTensor {
+        data: gpu.tensor(&qs, total as u32, hq * d, Dtype::Bf16),
+        indptr: gpu.column(&qo),
+    };
+    let scale = 1.0 / (d as f32).sqrt();
+    let mut o = gpu.zeros(total as u32, hq * d, Dtype::Bf16);
+    let rel = attn::RelBias {
+        bias: gpu.tensor(&bias, total as u32, hq * extent, Dtype::F32),
+        extent,
+        log_floor: log.0,
+        log_alpha: log.1,
+    };
+    let window_left = window.map_or(-1, |w| w as i32 - 1);
+    attn::rel::walk(&ctx, "attention.prefill_rel", q, &pool, rel, window_left, d, hk, scale, &mut o)
+        .unwrap();
+    let got = gpu.read(&o);
+    let (du, g) = (d as usize, (hq / hk) as usize);
+    for r in 0..fresh.len() {
+        for i in 0..fresh[r] as usize {
+            let t = qo[r] as usize + i;
+            let p = prefix[r] as usize + i;
+            let lo = window.map_or(0, |w| (p + 1).saturating_sub(w as usize));
+            let grow = if log.1 != 0.0 && log.0 != 0 && p + 1 > log.0 as usize {
+                1.0 + f64::from(log.1) * ((p + 1) as f64 / f64::from(log.0)).ln()
+            } else {
+                1.0
+            };
+            for h in 0..hq as usize {
+                let kh = h / g;
+                let at = |j: usize| (j * hk as usize + kh) * du;
+                let qh = &qs[(t * hq as usize + h) * du..(t * hq as usize + h + 1) * du];
+                let s: Vec<f64> = (lo..=p)
+                    .map(|j| {
+                        let dot: f64 = (0..du)
+                            .map(|e| f64::from(qh[e]) * f64::from(keys[r][at(j) + e]))
+                            .sum();
+                        let mut s = dot * f64::from(scale);
+                        if p - j < extent as usize {
+                            s += f64::from(bias[(t * hq as usize + h) * extent as usize + p - j]);
+                        }
+                        s * grow
+                    })
+                    .collect();
+                let m = s.iter().copied().fold(f64::MIN, f64::max);
+                let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+                let z: f64 = e.iter().sum();
+                let want: Vec<f32> = (0..du)
+                    .map(|c| {
+                        ((lo..=p)
+                            .zip(&e)
+                            .map(|(j, w)| w * f64::from(vals[r][at(j) + c]))
+                            .sum::<f64>()
+                            / z) as f32
+                    })
+                    .collect();
+                close_abs(
+                    &format!("rel h{hq}/{hk} d{d} w{window:?} row {t} head {h}"),
+                    &got[(t * hq as usize + h) * du..(t * hq as usize + h + 1) * du],
+                    &want,
+                    1e-2,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn relative_bias_attention_answers_the_host() {
+    let Some(gpu) = Gpu::open() else { return };
+    // Inkling-Small's global layer: 32 heads over 8, 128 wide, the log
+    // growth past a short floor; decode rows and a prefill.
+    check_rel(&gpu, 32, 8, 128, &[1, 1, 1], &[0, 70, 300], 16, None, (64, 0.1), 201);
+    check_rel(&gpu, 32, 8, 128, &[90, 3], &[40, 0], 16, None, (64, 0.1), 202);
+    // Its local layers: a sliding window, no growth.
+    check_rel(&gpu, 32, 8, 128, &[1, 70], &[300, 100], 16, Some(128), (0, 0.0), 203);
+    // A narrow head and a long extent.
+    check_rel(&gpu, 6, 2, 64, &[5, 1], &[20, 200], 300, Some(50), (100, 0.3), 204);
+}

@@ -12,6 +12,8 @@ pub mod plan;
 
 pub mod pool;
 
+pub mod rel;
+
 pub mod selected;
 
 pub mod sched;
@@ -132,8 +134,22 @@ fn fa2_decode(
         stated(op, head_dim)?,
     );
 
-    if rel.is_some() {
-        return Err(Error::Unsupported { op });
+    if let Some(rel) = rel {
+        if lse.is_some() {
+            return Err(Error::Unsupported { op });
+        }
+        return rel::walk(
+            ctx,
+            op,
+            q,
+            pool,
+            rel,
+            window_left,
+            head_dim,
+            plan.shape.num_kv_heads,
+            sm_scale,
+            o,
+        );
     }
     let lse_ptr = match &lse {
         Some(lse) => {
@@ -173,7 +189,24 @@ fn fa2_prefill(
     );
 
     lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
-    if mask.is_some() || rel.is_some() {
+    if let Some(rel) = rel {
+        if lse.is_some() || mask.is_some() {
+            return Err(Error::Unsupported { op });
+        }
+        return rel::walk(
+            ctx,
+            op,
+            q,
+            pool,
+            rel,
+            window_left,
+            head_dim,
+            plan.shape.num_kv_heads,
+            sm_scale,
+            o,
+        );
+    }
+    if mask.is_some() {
         return Err(Error::Unsupported { op });
     }
     let lse_ptr = match &lse {
