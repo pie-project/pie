@@ -110,7 +110,8 @@ pub fn try_paged(
 }
 
 /// The split over any fire's tables: verify and draft rows (a decode plan) take it too.
-/// A sliding or wide window rides in the kernel's per-row walk.
+/// A sliding or wide window, and a block that attends both ways (a drafter's), ride in the
+/// kernel's per-row walk.
 #[allow(clippy::too_many_arguments)]
 pub fn try_tables(
     ctx: &Ctx<'_>,
@@ -143,7 +144,6 @@ pub fn try_tables(
         || !(8..=128).contains(&q.rows)
         || !(head_dim == 256 || (head_dim == 128 && !q8))
         || pool.page_size != 32
-        || !causal
         || q.dtype != Dtype::Bf16
         || pool.keys.dtype != Dtype::Bf16
         || pool.values.dtype != Dtype::Bf16
