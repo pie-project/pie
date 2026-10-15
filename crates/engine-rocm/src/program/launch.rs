@@ -28,7 +28,7 @@ pub const ORDER_ROW_BLOCKS: u32 = 32;
 pub const LANE_SAMPLER_BLOCKS: u32 = 16;
 /// A sampler block's arena: a barrier word's line, two exchange buffers and
 /// two buffers of 512 gathered elements (`M1_FAST_GATHER`).
-const LANE_SAMPLER_ARENA: u64 = 64 + 2 * 18_432 + 2 * 512 * 8;
+const LANE_SAMPLER_ARENA: u64 = 64 + 2 * 24_576 + 2 * 512 * 8;
 
 /// Whether `kind` is a lane sampler region: its lane's blocks split each row
 /// and meet at a barrier (`LANE_SAMPLER_BLOCKS`).

@@ -18,7 +18,7 @@
 // two exchange buffers, used by alternate merges (a block is at most one
 // merge ahead of the slowest), and two buffers of gathered elements.
 
-#define M1_LANE_HALF 18432u
+#define M1_LANE_HALF 24576u
 #define M1_LANE_HEAD 64u
 #define M1_LANE_MAX_SLICES 64u
 // The blocks' arenas a lane has (the launcher's LANE_SAMPLER_BLOCKS), and
@@ -764,15 +764,25 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
   auto bucket_of = [&](m1_u32 key) { return (key - least) >> stretch; };
   for (m1_u32 b = threadIdx.x; b < M1_FAST_BUCKETS; b += blockDim.x) {
     f.count[b] = 0u;
+    f.weight[b] = 0u;
     if (b < M1_FAST_BUCKETS / 4u) f.flags[b] = 0u;
   }
   __syncthreads();
+  // The first pass: each bucket's count and the f32 sum of its values (in
+  // `weight`, the first round's plan reads it), merged as one run of words
+  // (the sums added in block order, every block alike).
   m1_cut_scan_range(input, base, lo, hi, dtype, [&](m1_u32, float y) {
     if (m1_isnan(y)) return;
-    atomicAdd(&f.count[bucket_of(m1_desc_key(y))], 1u);
+    const m1_u32 b = bucket_of(m1_desc_key(y));
+    atomicAdd(&f.count[b], 1u);
+    atomicAdd(reinterpret_cast<float*>(&f.weight[b]), y);
   });
   __syncthreads();
-  sum_u32(f.count, M1_FAST_BUCKETS);
+  combine_u32(f.weight, M1_FAST_BUCKETS * 2u + M1_FAST_BUCKETS / 4u, 0u, nullptr,
+              [](m1_u32 a, m1_u32 b, m1_u32 word) {
+                if (word < M1_FAST_BUCKETS) return __float_as_uint(__uint_as_float(a) + __uint_as_float(b));
+                return word < M1_FAST_BUCKETS + M1_FAST_BUCKETS / 4u ? a | b : a + b;
+              });
   // The edges of a bucket's keys: its largest value and its least.
   auto top_value = [&](m1_u32 b) {
     return (double)m1_cut_value(least + (m1_u32)((m1_u64)b << stretch));
@@ -795,28 +805,38 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
   m1_u64* mends = reinterpret_cast<m1_u64*>(cut.before);
   const m1_u32 mine = gather_room(slice);
   for (m1_u32 round = 0u; round < M1_FAST_ROUNDS && !settled; ++round) {
-    // The plan, from bounds on the running mass at each bucket's edges: the
-    // low bound before each (into `weight`, as f32), then the high after it.
+    // The plan, from the running mass expected at each bucket's edges: the
+    // first round's from the buckets' sums, a later one's from bounds by the
+    // buckets' edge values (the low bound before each into `weight`, as f32,
+    // then the high after it). The f32 walk strays from the exact sum by
+    // far less than the margin.
+    const bool summed = round == 0u;
     for (m1_u32 b = threadIdx.x; b < M1_FAST_BUCKETS; b += blockDim.x) {
       const m1_u32 c = b >= first ? f.count[b] : 0u;
-      bound[b] = c == 0u ? 0.0 : (double)c * bottom_value(b);
+      bound[b] = c == 0u ? 0.0
+                 : summed ? (double)__uint_as_float(f.weight[b])
+                          : (double)c * bottom_value(b);
     }
     __syncthreads();
     m1_fast_scan(bound, M1_FAST_BUCKETS);
+    // (A summed round's `bound` then holds the mass through each bucket.)
     for (m1_u32 b = threadIdx.x; b < M1_FAST_BUCKETS; b += blockDim.x) {
-      f.weight[b] = __float_as_uint((float)(((double)mass + bound[b]) * (1.0 - 1.0 / 4096.0)));
       const m1_u32 c = b >= first ? f.count[b] : 0u;
-      bound[b] = c == 0u ? 0.0 : (double)c * top_value(b);
+      const double low = ((double)mass + bound[b]) * (1.0 - 1.0 / 4096.0);
+      const double own = summed && c != 0u ? (double)__uint_as_float(f.weight[b]) : 0.0;
+      f.weight[b] = __float_as_uint((float)low);
+      bound[b] = summed ? bound[b] + own : (c == 0u ? 0.0 : (double)c * top_value(b));
     }
     __syncthreads();
-    m1_fast_scan(bound, M1_FAST_BUCKETS);
+    if (!summed) m1_fast_scan(bound, M1_FAST_BUCKETS);
     for (m1_u32 b = threadIdx.x; b < M1_FAST_BUCKETS; b += blockDim.x) {
       const m1_u32 c = f.count[b];
       short plan = M1_FAST_EMPTY;
       if (b >= first && c != 0u) {
         const double lower = (double)__uint_as_float(f.weight[b]);
         const double upper =
-            ((double)mass + bound[b] + (double)c * top_value(b)) * (1.0 + 1.0 / 4096.0);
+            ((double)mass + bound[b] + (summed ? 0.0 : (double)c * top_value(b))) *
+            (1.0 + 1.0 / 4096.0);
         if (lower >= (double)cutoff || c > M1_CUT_CHUNK) {
           plan = M1_FAST_PAST;
         } else if (m1_fast_flags(f, b) != 0u) {
