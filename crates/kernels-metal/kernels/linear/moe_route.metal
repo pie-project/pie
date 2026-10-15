@@ -622,6 +622,27 @@ constant constexpr uint kMaxExperts = 1024;
   out[size_t(row) * size_t(width) + size_t(c)] = static_cast<bfloat>(acc);
 }
 
+// expert_combine over rows a routed chain left sorted: route at's row is y[inv[at]].
+[[kernel]] void expert_combine_sorted(
+    const device bfloat* y             [[buffer(0)]],
+    const device float* expert_weights [[buffer(1)]],
+    device bfloat* out                 [[buffer(2)]],
+    const constant uint& width             [[buffer(3)]],
+    const constant uint& experts_per_token [[buffer(4)]],
+    const device int* inv              [[buffer(5)]],
+    uint2 gid                          [[thread_position_in_grid]]) {
+  const uint c = gid.x;
+  const uint row = gid.y;
+  const uint k = experts_per_token;
+  const size_t base = size_t(row) * size_t(k);
+  float acc = 0.0f;
+  for (uint e = 0; e < k; ++e) {
+    const size_t at = base + size_t(e);
+    acc += expert_weights[at] * float(y[size_t(inv[at]) * size_t(width) + size_t(c)]);
+  }
+  out[size_t(row) * size_t(width) + size_t(c)] = static_cast<bfloat>(acc);
+}
+
 [[kernel]] void expert_bias_combine(
     const device bfloat* x             [[buffer(0)]],
     const device bfloat* bias          [[buffer(1)]],
