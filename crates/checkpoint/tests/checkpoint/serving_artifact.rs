@@ -490,6 +490,18 @@ fn an_artifact_for_another_shell_is_refused_naming_the_field() {
         artifact.check(&sharded).unwrap_err().field,
         serving::Field::Deployment,
     );
+    // The kv a config caches at names the deployment and no plane.
+    let bf16 = Stamp::of("cuda", "qwen_3-bf16-kv-bf16-tp2");
+    assert!(
+        bf16.check(&Stamp::of("cuda", "qwen_3-bf16-kv-e4m3-tp2"))
+            .is_ok()
+    );
+    assert_eq!(
+        bf16.check(&Stamp::of("cuda", "qwen_3-u4g64-kv-bf16-tp2"))
+            .unwrap_err()
+            .field,
+        serving::Field::Deployment,
+    );
 }
 
 fn a_tp1_artifact_stripped_of_its_serving_key_is_an_ordinary_checkpoint() {
