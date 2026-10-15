@@ -28,6 +28,7 @@ fn the_new_templates_write_what_the_reference_renders_every_case() {
     inkling_writes_the_effort_line_the_user_turn_and_the_cue();
     atem_writes_the_user_turn_and_the_cue_after_the_opening();
     chatml_trims_the_turn_and_closes_an_empty_thinking_block();
+    qwen38_replays_every_earlier_answer_inside_its_thinking_block();
     qwen38_opens_a_thinking_request_with_its_reasoning_effort_instruction();
     qwen38_cues_a_thinking_answer_inside_an_open_think_block();
     gemma_closes_an_empty_thought_channel_where_its_template_does();
@@ -183,6 +184,54 @@ fn qwen38_cues_a_thinking_answer_inside_an_open_think_block() {
             .feed(&reasoning)
             .iter()
             .all(|e| matches!(e, ReasoningEvent::Delta(text) if text.is_empty()))
+    );
+}
+
+/// Qwen3.8's template preserves thinking: every earlier assistant turn is
+/// written `<think>\n{reasoning}\n</think>\n\n{answer}`, with an empty block
+/// when the turn had no reasoning. The reference ids are
+/// `apply_chat_template(..., enable_thinking=False)` over the same snapshot.
+fn qwen38_replays_every_earlier_answer_inside_its_thinking_block() {
+    let Some(tokenizer) = snapshot(
+        "mlx-community/Qwen3.8-27B-4bit",
+        "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+    ) else {
+        return;
+    };
+    let qwen38 = chat_template::chatml::ChatMLInstruct::new(
+        tokenizer,
+        chat_template::chatml::ChatML {
+            thinking: true,
+            preserve_thinking: true,
+            reasoning_effort: true,
+            tools: true,
+            generation_suffix: String::new(),
+            stop_tokens: vec!["<|im_end|>".to_string()],
+        },
+    );
+    let render = |answer: &str| {
+        let mut got = qwen38.system_user("You are terse.", &format!("{MESSAGE}\n"));
+        got.extend(qwen38.assistant(answer));
+        got.extend(qwen38.user("And 18 times 23?"));
+        got.extend(qwen38.cue_without_thinking());
+        got
+    };
+    let head: &[u32] = &[
+        248045, 8678, 198, 2523, 513, 48834, 13, 248046, 198, 248045, 846, 198, 3710, 369, 220, 16,
+        22, 2942, 220, 17, 18, 30, 248046, 198, 248045, 74455, 198, 248068,
+    ];
+    let tail: &[u32] = &[
+        18, 24, 16, 248046, 198, 248045, 846, 198, 2939, 220, 16, 23, 2942, 220, 17, 18, 30,
+        248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
+    ];
+    let empty: &[u32] = &[271, 248069, 271];
+    let reasoned: &[u32] = &[
+        198, 16, 22, 9, 17, 18, 369, 220, 18, 24, 16, 198, 248069, 271,
+    ];
+    assert_eq!(render("391"), [head, empty, tail].concat());
+    assert_eq!(
+        render("<think>\n17*23 is 391\n</think>\n\n391"),
+        [head, reasoned, tail].concat()
     );
 }
 

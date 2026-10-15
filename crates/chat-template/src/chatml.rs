@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
@@ -112,12 +113,30 @@ impl ChatMLInstruct {
         }
     }
 
-    fn replay_body<'a>(config: &ChatML, msg: &'a str) -> &'a str {
-        if config.thinking && !config.preserve_thinking {
-            Self::without_thinking(msg)
-        } else {
-            msg
+    /// A template that preserves thinking (Qwen3.8) writes every earlier
+    /// assistant turn as `<think>\n{reasoning}\n</think>\n\n{answer}`, an empty
+    /// block where the turn had no reasoning; one that strips it replays the
+    /// answer alone.
+    fn replay_body<'a>(config: &ChatML, msg: &'a str) -> Cow<'a, str> {
+        if !config.thinking {
+            return Cow::Borrowed(msg);
         }
+        if !config.preserve_thinking {
+            return Cow::Borrowed(Self::without_thinking(msg));
+        }
+        let (reasoning, answer) = match msg.rfind(THINK_CLOSE) {
+            Some(at) => {
+                let head = &msg[..at];
+                let reasoning = head
+                    .rfind(THINK_OPEN)
+                    .map_or(head, |open| &head[open + THINK_OPEN.len()..]);
+                (reasoning.trim(), msg[at + THINK_CLOSE.len()..].trim())
+            }
+            None => ("", msg.trim()),
+        };
+        Cow::Owned(format!(
+            "{THINK_OPEN}\n{reasoning}\n{THINK_CLOSE}\n\n{answer}"
+        ))
     }
 
     fn tool_system_prompt(tools: &[String]) -> String {
@@ -214,7 +233,10 @@ impl Instruct for ChatMLInstruct {
     }
 
     fn assistant(&self, msg: &str) -> Vec<u32> {
-        self.turn(&self.assistant_prefix, Self::replay_body(&self.config, msg))
+        self.turn(
+            &self.assistant_prefix,
+            &Self::replay_body(&self.config, msg),
+        )
     }
 
     fn cue(&self) -> Vec<u32> {
@@ -404,6 +426,10 @@ mod tests {
 
     fn a_preserving_model_replays_the_turn_whole() {
         assert_eq!(ChatMLInstruct::replay_body(&config(true, true), TURN), TURN);
+        assert_eq!(
+            ChatMLInstruct::replay_body(&config(true, true), "four"),
+            "<think>\n\n</think>\n\nfour"
+        );
     }
 
     fn a_non_thinking_model_replays_verbatim() {
