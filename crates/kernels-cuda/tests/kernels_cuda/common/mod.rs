@@ -191,6 +191,25 @@ pub const TC5: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {
     ..kernels_cuda::tuning::Tuning::DEFAULT
 };
 
+/// The routed-MoE decisions B200's profile (`engine-cuda`'s `sm100.toml`)
+/// sets, as a fire there runs them: a select's arm turns on these, and a
+/// case run only at [`Tuning::DEFAULT`] or [`TC5`] misses the arm the card
+/// takes. `engine-cuda`'s `the_b200_moe_decisions_are_what_the_kernel_tests_run`
+/// holds the profile to them.
+pub const SM100: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {
+    moe_tc5: true,
+    moe_tc5_from: 16,
+    gemm_tc5_glu_from: 65_536,
+    mxfp4_mma_from: 28,
+    mxfp4_mma_until: 1024,
+    mxfp4_cvt: true,
+    gemm_nvfp4_k128: true,
+    moe_w4a4_fused_from: 1,
+    nvfp4_mma_from: 32,
+    nvfp4_mma_until: 8192,
+    ..kernels_cuda::tuning::Tuning::DEFAULT
+};
+
 pub fn close(got: f32, want: f32) -> bool {
     (got - want).abs() <= TOLERANCE * want.abs().max(1.0)
 }

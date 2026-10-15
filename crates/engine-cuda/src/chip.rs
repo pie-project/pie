@@ -599,6 +599,24 @@ mod tests {
         }
     }
 
+    /// `kernels-cuda`'s tests run the routed selects under `common::SM100`,
+    /// a mirror of these: a change here changes that mirror too.
+    #[test]
+    fn the_b200_moe_decisions_are_what_the_kernel_tests_run() {
+        let b200 =
+            kernels_cuda::tuning::Tuning::of(&resolve("NVIDIA B200", &facts(10, 0, 148), None).0);
+        assert_eq!(
+            (b200.moe_tc5, b200.moe_tc5_from, b200.gemm_tc5_glu_from),
+            (true, 16, 65_536)
+        );
+        assert_eq!(
+            (b200.mxfp4_mma_from, b200.mxfp4_mma_until, b200.mxfp4_cvt),
+            (28, 1024, true)
+        );
+        assert_eq!((b200.nvfp4_mma_from, b200.nvfp4_mma_until), (32, 8192));
+        assert_eq!((b200.gemm_nvfp4_k128, b200.moe_w4a4_fused_from), (true, 1));
+    }
+
     #[test]
     fn only_a_b200_runs_the_tcgen05_selects() {
         let tuning = |major, minor, sms| {

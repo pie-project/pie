@@ -285,6 +285,15 @@ fn the_e2m1_convert_form_agrees() {
     BIG.with(|w| w.set(false));
     check_atoms(8, 256, 2048, cvt);
     check_atoms(12, 384, 4096, cvt);
+    // B200's own decisions: the arm its profile picks at each width (its
+    // GLU cases where the register-dequant kernel spans them).
+    let sm100 = crate::common::SM100;
+    check(1, 200, 2880, true, true, sm100);
+    check(12, 384, 2880, true, false, sm100);
+    check(40, 576, 2880, true, true, sm100);
+    check(100, 384, 2880, false, true, sm100);
+    check_glu(16, 2880, 2880, true, true, sm100);
+    check_glu(40, 160, 2880, false, false, sm100);
 }
 
 /// The byte of scale `(row, col)` in tcgen05's atom layout of `cols`

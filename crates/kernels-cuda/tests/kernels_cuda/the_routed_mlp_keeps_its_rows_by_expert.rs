@@ -291,10 +291,8 @@ fn check_w4a4(
     let weights_t = Tensor::new(gpu.up(&weights), tokens as u32, top as u32, Dtype::F32);
     let up = w4a4_bank(&mut gpu, n_experts, 2 * inter, hidden, 0x61);
     let down = w4a4_bank(&mut gpu, n_experts, hidden, inter, 0x62);
-    let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
-        moe_w4a4_fused_from: 1,
-        ..crate::common::TC5
-    });
+    // B200's own decisions (the fused MLP from the first contiguous fire).
+    let ctx = gpu.ctx().with_tuning(crate::common::SM100);
     // Apart.
     let select_apart =
         |ctx: &kernels_cuda::Ctx, gpu: &mut Gpu, x: Tensor, bank: GluBank, n: usize| {

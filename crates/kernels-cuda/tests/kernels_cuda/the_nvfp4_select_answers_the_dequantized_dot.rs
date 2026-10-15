@@ -82,7 +82,10 @@ fn routed(
         mxfp4_cvt: true,
         ..crate::common::TC5
     };
-    for tuning in [Tuning::DEFAULT, crate::common::TC5, mma] {
+    // B200's own decisions too: the arm its profile picks (the e2m1-convert
+    // form must not take an NVFP4 bank).
+    let sm100 = crate::common::SM100;
+    for tuning in [Tuning::DEFAULT, crate::common::TC5, mma, sm100] {
         routed_tuned(tuning, experts, n, k, tokens, top_k, by_token, seed);
     }
 }
@@ -206,12 +209,18 @@ fn the_nvfp4_select_answers_the_dequantized_dot_every_case() {
     a_wide_fire_takes_the_grouped_kernel_on_the_gate_up_leg();
     a_wide_fire_takes_the_grouped_kernel_on_the_down_leg_with_a_ragged_row_tile();
     a_dense_projection_answers_at_one_row_and_at_many();
-    the_register_dequant_gate_up_lands_its_swiglu();
+    the_register_dequant_gate_up_lands_its_swiglu(Tuning {
+        nvfp4_mma_until: 65_536,
+        // The MXFP4 e2m1-convert kernel on, which NVFP4 banks must not take.
+        mxfp4_cvt: true,
+        ..crate::common::TC5
+    });
+    the_register_dequant_gate_up_lands_its_swiglu(crate::common::SM100);
 }
 
 /// The gate-up select with its SwiGLU on the register-dequant kernel: the
 /// bank's gate rows, then its up rows, an expert.
-fn the_register_dequant_gate_up_lands_its_swiglu() {
+fn the_register_dequant_gate_up_lands_its_swiglu(tuning: Tuning) {
     use kernels_cuda::linear::moe::{ExpertTable, GluBank, select_glu};
     use kernels_cuda::linear::tc5::Glu;
     let (experts, inter, k, tokens, top_k) = (16usize, 640usize, 2560usize, 48usize, 10usize);
@@ -229,13 +238,7 @@ fn the_register_dequant_gate_up_lands_its_swiglu() {
     let tensor_at = gpu.up(&bank.tensor);
     let routes_at = gpu.up(&routes);
     let y_at = gpu.zeros(tokens * top_k * inter * 2);
-    let ctx = gpu.ctx().with_tuning(Tuning {
-        nvfp4_mma_until: 65_536,
-        // As sm100 runs it: the MXFP4 e2m1-convert kernel on, which NVFP4 banks
-        // must not take.
-        mxfp4_cvt: true,
-        ..crate::common::TC5
-    });
+    let ctx = gpu.ctx().with_tuning(tuning);
     let slab =
         |at: u64, bytes: usize, dtype: Dtype| Tensor::new(at, experts as u32, bytes as u32, dtype);
     let mut y_t = Tensor::new(y_at, (tokens * top_k) as u32, inter as u32, Dtype::Bf16);
