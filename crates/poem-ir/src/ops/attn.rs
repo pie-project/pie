@@ -577,6 +577,12 @@ pub enum IndexScore {
     /// run of `top_k` blocks for each head, ascending, the row's own block
     /// always in it, and every visible block when they fit.
     BlockMax,
+    /// `Pooled`'s ranking, its `top_k` closed blocks read back as the raw
+    /// tokens each stands for (`ratio` a block), then the row's own open
+    /// block's tokens: `top_k * ratio + ratio - 1` token indices a row,
+    /// unused ones -1 (GLM-5.3-Flash's k-pool indexer, whose attention reads
+    /// the latent rows themselves).
+    PooledTokens,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

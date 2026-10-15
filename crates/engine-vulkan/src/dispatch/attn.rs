@@ -175,6 +175,10 @@ impl Run<'_> {
             | Attention::IndexTopk {
                 score: IndexScore::BlockMax,
                 ..
+            }
+            | Attention::IndexTopk {
+                score: IndexScore::PooledTokens,
+                ..
             } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
             Attention::DecodeSelected {
                 q,

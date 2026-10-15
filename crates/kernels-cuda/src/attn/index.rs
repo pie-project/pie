@@ -189,6 +189,90 @@ pub fn topk(
     ratio: u32,
     selection: &mut Tensor,
 ) -> Result<(), Error> {
+    ranked(
+        ctx, q, weights, keys, heads, head_dim, top_k, ratio, selection,
+    )
+}
+
+/// [`topk`]'s blocks read back as the tokens each stands for, then the
+/// row's own open block's (`top_k * ratio + ratio - 1` a row, -1 unused):
+/// `attention.index_topk` scored `pooled_tokens`.
+#[allow(clippy::too_many_arguments)]
+pub fn topk_tokens(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    weights: Option<Tensor>,
+    keys: &KvPool,
+    heads: u32,
+    head_dim: u32,
+    top_k: u32,
+    ratio: u32,
+    selection: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.index_topk";
+    let ratio = ratio.max(1);
+    let width = top_k
+        .checked_mul(ratio)
+        .and_then(|w| w.checked_add(ratio - 1))
+        .ok_or_else(|| refuse(OP, "the token selection's width overflows"))?;
+    if selection.width != width {
+        return Err(refuse(
+            OP,
+            format!(
+                "a {top_k}-block selection at ratio {ratio} reads back as {width} tokens, not {}",
+                selection.width
+            ),
+        ));
+    }
+    let blocks_at = ctx.scratch_shared(
+        OP,
+        "attn.index_topk_blocks",
+        (selection.rows as usize).saturating_mul(top_k as usize) * 4,
+    )? as usize as u64;
+    let mut blocks = Tensor::new(blocks_at, selection.rows, top_k, Dtype::I32);
+    ranked(
+        ctx,
+        q,
+        weights,
+        keys,
+        heads,
+        head_dim,
+        top_k,
+        ratio,
+        &mut blocks,
+    )?;
+    let num_requests = kv::lanes_of(OP, q.indptr)?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::index_pool_tokens")
+            .apply(Launch::per_row(selection.rows, K_BLOCK)),
+        &[
+            ArgValue::Ptr(blocks_at),
+            q.indptr.arg(),
+            keys.page_indptr.arg(),
+            keys.last_page_lens.arg(),
+            selection.arg(),
+            num_requests.arg(),
+            keys.page_size.arg(),
+            stated(OP, top_k)?.arg(),
+            stated(OP, ratio)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ranked(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    weights: Option<Tensor>,
+    keys: &KvPool,
+    heads: u32,
+    head_dim: u32,
+    top_k: u32,
+    ratio: u32,
+    selection: &mut Tensor,
+) -> Result<(), Error> {
     const OP: &str = "attention.index_topk";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 page ids");

@@ -1356,11 +1356,12 @@ pub fn index_topk(
 ) -> Value {
     let r = q.rec();
     // A block-max ranking selects for each head on its own.
-    let runs = match score {
-        IndexScore::Pooled => 1,
-        IndexScore::BlockMax => heads,
+    let width = match score {
+        IndexScore::Pooled => top_k,
+        IndexScore::BlockMax => heads * top_k,
+        IndexScore::PooledTokens => top_k * ratio.max(1) + ratio.max(1) - 1,
     };
-    let selection = r.fresh(tensor(q.rows(), runs * top_k, Dtype::I32));
+    let selection = r.fresh(tensor(q.rows(), width, Dtype::I32));
     let mut deps = vec![q];
     deps.extend(weights);
     r.push(

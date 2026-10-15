@@ -877,7 +877,13 @@ fn dispatch_dense(
     // `kernel.mla.path`: Blackwell profiles pick `naive`; otherwise the FA2
     // arm the plan's device fits. The FA2 arms read a 512-wide latent and
     // every row, so a window or another width is the naive kernel's too.
-    if ctx.tuning().mla_naive || window.is_some() || layer.kv_lora_rank != 512 {
+    // A rope part other than 64 wide (GLM-5.3-Flash's none) is the naive
+    // kernel's too: the FA2 arms read a 64-wide one beside the latent.
+    if ctx.tuning().mla_naive
+        || window.is_some()
+        || layer.kv_lora_rank != 512
+        || layer.rope_dim != 64
+    {
         let window = match window {
             None => 0,
             Some(w) => i32::try_from(w)

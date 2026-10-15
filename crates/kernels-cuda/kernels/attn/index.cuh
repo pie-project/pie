@@ -308,6 +308,49 @@ __device__ __forceinline__ void select_top_radix(const float* __restrict__ frow,
     for (int n = written + tid; n < topk; n += kBlock) srow[n] = -1;
 }
 
+// A pooled selection read back as tokens: each selected block `b` (of
+// `ratio` rows, -1 none) its rows `b * ratio ..`, then the row's own open
+// block's rows (past its last closed block, up to and with the row), the
+// rest -1; `topk * ratio + ratio - 1` a row.
+__global__ void index_pool_tokens(
+    const i32* __restrict__ blocks,
+    const u32* __restrict__ qo_indptr,
+    const u32* __restrict__ kv_page_indptr,
+    const u32* __restrict__ kv_last_page_lens,
+    i32* __restrict__ tokens,
+    i32 R, i32 page_size, i32 topk, i32 ratio,
+    const u32* __restrict__ win)
+{
+    const int t = static_cast<int>(blockIdx.x);
+    if (win != nullptr && t >= static_cast<int>(win[0])) return;
+    const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
+    if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
+    int r = 0;
+    for (; r < R - 1; ++r) {
+        if (t < static_cast<int>(qo_indptr[r + 1])) break;
+    }
+    const int qo_lo = static_cast<int>(qo_indptr[r]);
+    const int new_tokens = static_cast<int>(qo_indptr[r + 1]) - qo_lo;
+    const int num_pages = static_cast<int>(kv_page_indptr[r + 1]) - static_cast<int>(kv_page_indptr[r]);
+    const int kv_len = (num_pages - 1) * page_size + static_cast<int>(kv_last_page_lens[r]);
+    const int abs_q = kv_len - new_tokens + (t - qo_lo);
+    const int open_from = (abs_q + 1) / ratio * ratio;
+    const i32* brow = blocks + static_cast<long long>(t_row) * topk;
+    const int width = topk * ratio + ratio - 1;
+    i32* trow = tokens + static_cast<long long>(t_row) * width;
+    for (int n = static_cast<int>(threadIdx.x); n < width; n += static_cast<int>(blockDim.x)) {
+        int j = -1;
+        if (n < topk * ratio) {
+            const int b = brow[n / ratio];
+            if (b >= 0) j = b * ratio + n % ratio;
+        } else {
+            const int at = open_from + (n - topk * ratio);
+            if (at <= abs_q) j = at;
+        }
+        trow[n] = j;
+    }
+}
+
 template <class T, bool kRadix = false>
 __global__ void index_topk_paged(
     const T* __restrict__ idx_q,

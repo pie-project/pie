@@ -266,7 +266,11 @@ impl<'v> Arg<'v> for IndexScore {
         spelled(
             v,
             "an index score",
-            &[("pooled", Pooled), ("block_max", BlockMax)],
+            &[
+                ("pooled", Pooled),
+                ("block_max", BlockMax),
+                ("pooled_tokens", PooledTokens),
+            ],
         )
     }
 }
