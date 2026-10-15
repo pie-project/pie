@@ -478,8 +478,8 @@ __global__ __launch_bounds__(kGroupWaves<MT>* kWave) void moe_matmul_select_grou
     // the tile is read from its L2 once a wave of them, not once an XCD each.
     const int blocks = gridDim.x * gridDim.y;
     const int b = blockIdx.x + gridDim.x * blockIdx.y;
-    const int at = (b % kDenseXcds) * ((blocks + kDenseXcds - 1) / kDenseXcds) + b / kDenseXcds;
-    if (at >= blocks) return;
+    const int x = b % kDenseXcds, q = blocks / kDenseXcds, r = blocks % kDenseXcds;
+    const int at = x * q + min(x, r) + b / kDenseXcds;  // XCD x owns q (+1 below r) blocks
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item, at % gridDim.x)) return;
     const T* w = bank + static_cast<long long>(item.expert) * n * k;
