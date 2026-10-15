@@ -259,8 +259,8 @@ pub fn rmsnorm_no_scale(
     )?;
     let launch = rows_per_head(OP, y.rows, y.width, head_dim)?;
     let heads = stated(OP, per_head_split(y.width, head_dim))?;
-    // A warp a head, 16 bytes a lane, where the head is whole 256-element
-    // runs (a 512-wide head two a lane).
+    // A warp a head, the block form's sums in its order, where the head is
+    // whole 256-element runs.
     if ctx.tuning().hc_tile
         && hidden % 256 == 0
         && (1..=4).contains(&(hidden / 256))

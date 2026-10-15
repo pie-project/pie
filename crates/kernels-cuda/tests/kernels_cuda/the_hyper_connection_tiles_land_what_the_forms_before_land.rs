@@ -4,8 +4,7 @@
 //! shared-memory tiles, the fold and the gates' pre-mix for their 16-byte
 //! forms and the scale-free per-head norm for a warp a head: the fold and
 //! the gates land bit for bit what the forms before land, the projection
-//! the host dot, the norm within a bf16 ulp; on the staged window's rows and
-//! nowhere else.
+//! the host dot; on the staged window's rows and nowhere else.
 
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
@@ -103,7 +102,7 @@ fn rows_pass(tile: bool, window: Option<(u32, u32, u32)>) -> Vec<Vec<u16>> {
     let planes = (base + rows) as usize;
     let h = 4096usize;
     let head_dim = 512usize;
-    let heads = 3usize;
+    let heads = 64usize;
     let mix_hc = 2 * M + M * M;
     let mut lcg = Lcg::seeded(0xf01d);
     let x: Vec<u16> = (0..planes * h).map(|_| to_bf16(lcg.unit())).collect();
@@ -192,17 +191,13 @@ fn rows_pass(tile: bool, window: Option<(u32, u32, u32)>) -> Vec<Vec<u16>> {
 fn compare(window: Option<(u32, u32, u32)>) {
     let before = rows_pass(false, window);
     let after = rows_pass(true, window);
-    for (k, name) in ["fold", "gates", "post", "combine"].iter().enumerate() {
+    for (k, name) in ["fold", "gates", "post", "combine", "norm"]
+        .iter()
+        .enumerate()
+    {
         assert_eq!(
             before[k], after[k],
             "the {name} lands bit for bit ({window:?})"
-        );
-    }
-    for (i, (a, b)) in before[4].iter().zip(&after[4]).enumerate() {
-        let (a, b) = (from_bf16(*a), from_bf16(*b));
-        assert!(
-            (a - b).abs() <= a.abs() * (1.0 / 128.0) + 1e-6,
-            "norm element {i}: {b} where the block form lands {a} ({window:?})"
         );
     }
 }
