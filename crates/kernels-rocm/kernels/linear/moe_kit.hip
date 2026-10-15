@@ -624,7 +624,7 @@ struct GroupAffine {
 // y[route] = W·act[route / act_div] (+ bias) for routes order[begin ..
 // begin + count) (count ≤ MT) of one expert, weight rows [blockIdx.y·32·
 // waves, +32·waves). Rounds once on the store, after the bias.
-template <class C, class T, int MT>
+template <class C, class T, int MT, int NBW = 2, int WAVES = kGroupWaves<MT>>
 __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i32* __restrict__ order, int begin,
                                              int count, const typename C::Planes& p, const T* __restrict__ bias,
                                              T* __restrict__ out, int act_div, int n, int k, int tile = -1) {
@@ -632,8 +632,8 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
     constexpr int CODES = C::kCodes, KU = MT == 32 || C::kKU == 1 ? C::kKU : C::kKU / 2;
     constexpr int KC = 4 * KU * CODES;  // codes a stage
     constexpr int LD = KC + 8;          // LDS row pitch, elements
-    constexpr int THREADS = kGroupWaves<MT> * kWave, TILE_N = 32 * kGroupWaves<MT>;
-    constexpr int MB = MT / 16, NB = 2;
+    constexpr int THREADS = WAVES * kWave, TILE_N = 16 * NBW * WAVES;
+    constexpr int MB = MT / 16, NB = NBW;
     constexpr int NA = MT * KC / 8 / THREADS;  // 16-byte activation reads a thread a stage
     constexpr int WORDS = CODES / 2;
     static_assert(NA * 8 * THREADS == MT * KC, "the activation tile splits evenly");

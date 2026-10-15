@@ -581,6 +581,9 @@ fn moe_matmul_dense() {
         (4, 48, 4, 136, 512, "grouped"),
         (5, 64, 2, 128, 2304, "grouped"),
         (4, 96, 4, 136, 512, "grouped"),
+        // 128-route items over whole 512-row banks: the tall block.
+        (4, 128, 4, 512, 256, "grouped"),
+        (3, 200, 2, 1024, 512, "grouped"),
         (3, 20, 2, 50, 60, "blas"),
         // The wide leg in 64- to 256-route items, N ragged by 8 and by 2.
         (8, 64, 4, 520, 256, "wide"),
