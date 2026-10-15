@@ -13,6 +13,7 @@ impl DispatchFused for Run<'_> {
             Fused::QgQknormRopeAppend { .. } => self.qg_qknorm_rope_append(op),
             Fused::LseSink { .. } => self.lse_sink(op),
             Fused::PoolAttention { .. } => self.pool_attention(op),
+            Fused::HcPrenormProject { .. } => self.hc_prenorm_project(op),
             Fused::MatmulGeglu { .. }
             | Fused::MatmulSwiglu { .. }
             | Fused::MlpSwiglu { .. }
@@ -42,6 +43,43 @@ impl DispatchFused for Run<'_> {
 }
 
 impl Run<'_> {
+    /// A stream norm and the mix projection over it: in one pass over the
+    /// streams where the profile's tiled hyper-connection kernels run (the
+    /// normed rows left unwritten, as nothing reads them), else the two as
+    /// the trace had them.
+    fn hc_prenorm_project(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::HcPrenormProject { norm, project } = op else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let (
+            poem_ir::Elementwise::HcRmsnormF32 { streams, eps, .. },
+            poem_ir::Elementwise::HcProject {
+                weight,
+                stream_count,
+                mixes,
+                ..
+            },
+        ) = (&**norm, &**project)
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        if self.ctx().tuning().hc_tile {
+            let landed = kernels_cuda::elemwise::hc::prenorm_project(
+                self.ctx(),
+                self.tensor(*streams),
+                *eps,
+                self.tensor(*weight),
+                *stream_count,
+                &mut self.tensor(*mixes),
+            )?;
+            if landed {
+                return Ok(());
+            }
+        }
+        self.elementwise(norm)?;
+        self.elementwise(project)
+    }
+
     /// DeepSeek-V4's attention: the window, the pool, their merge and the
     /// sinks, as the trace had them. The sinked output is the merge's plane.
     fn pool_attention(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {

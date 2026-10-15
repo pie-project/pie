@@ -49,8 +49,33 @@ pub(super) fn all() -> Vec<Rule> {
         split_rope_yarn_append(),
         rope_yarn_append(),
         pool_attention(),
+        hc_prenorm_project(),
         lse_sink(),
     ]
+}
+
+/// A hyper-connection stream norm read only by the mix projection over it.
+fn hc_prenorm_project() -> Rule {
+    let pattern = template(|p| {
+        let streams = p.rows("streams", W);
+        let normed = elemwise::hc_rmsnorm_f32(&streams, p.f32("eps"));
+        p.name("normed", &normed);
+        p.free("stream_count");
+        let mixes = elemwise::hc_project(&normed, &p.weight("weight", [24, W]), 4);
+        p.export("mixes", &mixes);
+    });
+    Rule::new("elementwise.hc_prenorm_project", [pattern], |m| {
+        let elementwise = |name: &str| {
+            let Operation::Elementwise(op) = m.op(name) else {
+                panic!("`{name}` comes from an elementwise op");
+            };
+            Box::new(op.clone())
+        };
+        Fused::HcPrenormProject {
+            norm: elementwise("normed"),
+            project: elementwise("mixes"),
+        }
+    })
 }
 
 /// DeepSeek-V4's attention: the windowed log-sum-exp attention, the

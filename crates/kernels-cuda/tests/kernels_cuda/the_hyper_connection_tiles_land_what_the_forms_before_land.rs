@@ -275,6 +275,19 @@ fn the_hyper_connection_forms_time() {
                 )
                 .unwrap();
             });
+            if tile {
+                time("prenorm", &|| {
+                    hc::prenorm_project(
+                        &ctx,
+                        Tensor::new(streams, r, fan as u32, Dtype::Bf16),
+                        1e-6,
+                        Tensor::new(w, mix_hc as u32, fan as u32, Dtype::F32),
+                        M as u32,
+                        &mut Tensor::new(out_m, r, mix_hc as u32, Dtype::F32),
+                    )
+                    .unwrap();
+                });
+            }
             time("gates", &|| {
                 hc::gates(
                     &ctx,
@@ -316,4 +329,74 @@ fn the_hyper_connection_forms_time() {
             });
         }
     }
+}
+
+/// The norm and the projection in one pass over the bf16 streams against a
+/// host norm and dot, at decode and prefill row counts and on a window.
+fn check_prenorm(rows: usize, mix_hc: usize, window: Option<(u32, u32)>) {
+    let fan = M * 4096;
+    let eps = 1e-6f32;
+    let planes = rows + window.map_or(0, |(_, base)| base as usize);
+    let mut lcg = Lcg::seeded(0x9e7 + rows as u64 + mix_hc as u64);
+    let x: Vec<u16> = (0..planes * fan)
+        .map(|_| to_bf16(lcg.unit() * 3.0))
+        .collect();
+    let w: Vec<f32> = (0..mix_hc * fan).map(|_| lcg.unit() * 0.01).collect();
+    let mut gpu = Gpu::open();
+    let x_at = gpu.up(&x);
+    let w_at = gpu.up(&w);
+    let m_at = gpu.zeros(planes * mix_hc * 4);
+    let ctx = gpu.ctx().with_tuning(tuning(true));
+    if let Some((live, base)) = window {
+        let win_at = gpu.up(&[live, base, 0u32, 0u32]);
+        ctx.arm_stage(win_at);
+    }
+    let landed = hc::prenorm_project(
+        &ctx,
+        Tensor::new(x_at, rows as u32, fan as u32, Dtype::Bf16),
+        eps,
+        Tensor::new(w_at, mix_hc as u32, fan as u32, Dtype::F32),
+        M as u32,
+        &mut Tensor::new(m_at, rows as u32, mix_hc as u32, Dtype::F32),
+    )
+    .expect("the fused projection fires");
+    assert!(landed, "a 16384-wide row of {mix_hc} columns is the tile's");
+    gpu.sync();
+    let got: Vec<f32> = gpu.down(m_at, planes * mix_hc);
+    let (live, base) = window.unwrap_or((rows as u32, 0));
+    for r in 0..planes {
+        let inside = r >= base as usize && r < (base + live) as usize;
+        let row: Vec<f64> = (0..fan)
+            .map(|d| f64::from(from_bf16(x[r * fan + d])))
+            .collect();
+        let s = 1.0 / (row.iter().map(|v| v * v).sum::<f64>() / fan as f64 + f64::from(eps)).sqrt();
+        for o in 0..mix_hc {
+            let g = f64::from(got[r * mix_hc + o]);
+            if !inside {
+                assert_eq!(g, 0.0, "row {r} lies outside the window and is left alone");
+                continue;
+            }
+            let want: f64 = (0..fan)
+                .map(|d| row[d] * s * f64::from(w[o * fan + d]))
+                .sum();
+            let mag: f64 = (0..fan)
+                .map(|d| (row[d] * s * f64::from(w[o * fan + d])).abs())
+                .sum();
+            assert!(
+                (g - want).abs() <= 1e-5 * mag.max(1e-3),
+                "{rows} rows, {mix_hc} columns: row {r} column {o} is {g}, the normed dot {want}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_fused_norm_and_projection_answer_the_host() {
+    check_prenorm(1, 24, None);
+    check_prenorm(8, 24, None);
+    check_prenorm(70, 24, Some((50, 3)));
+    check_prenorm(300, 24, None);
+    check_prenorm(130, 8, None);
+    check_prenorm(129, 4, None);
+    check_prenorm(200, 24, Some((150, 6)));
 }

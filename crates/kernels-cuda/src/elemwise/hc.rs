@@ -568,6 +568,110 @@ const TILE_GROUPS: u32 = 4;
 /// mostly repeat its last row.
 const TILE_FROM: u32 = 128;
 
+/// The stream norm and the mix projection over it in one pass over the bf16
+/// `streams` (`hc_prenorm_project_tile`, and `hc_prenorm_project_fold` past
+/// one slice): `mixes = (x . w) * rsqrt(mean(x^2) + eps)`. `Ok(false)` where
+/// the shapes are not the tile's (a width not whole 64-element tiles, more
+/// than 24 mix columns, unaligned planes): the caller runs the two.
+pub fn prenorm_project(
+    ctx: &Ctx,
+    streams: Tensor,
+    eps: f32,
+    hc_fn: Tensor,
+    stream_count: u32,
+    mixes: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "elementwise.hc_prenorm_project";
+    const SLICE_FLOOR: u32 = 512;
+    const PARTIAL_ROWS: u32 = 2048;
+    let fan = streams.width;
+    let mix_hc = hc_fn.rows;
+    if streams.dtype != Dtype::Bf16
+        || hc_fn.dtype != Dtype::F32
+        || mixes.dtype != Dtype::F32
+        || hc_fn.width != fan
+        || !fan.is_multiple_of(TILE_K)
+        || mix_hc > TILE_COLS
+        || mixes.width != mix_hc
+        || mixes.rows != streams.rows
+        || stream_count == 0
+        || stream_count > MAX_HC_MULT
+        || ![streams.ptr, hc_fn.ptr].iter().all(|at| at % 16 == 0)
+    {
+        return Ok(false);
+    }
+    let rows = nonzero(OP, "rows", mixes.rows)?;
+    // Narrow fires (a decode's few rows) on 32-row tiles over eight groups.
+    let (br, kg) = if rows >= TILE_FROM {
+        (TILE_ROWS, TILE_GROUPS)
+    } else {
+        (32, 8)
+    };
+    let (kt, stages) = (TILE_K, TILE_STAGES);
+    let tiles = stages * (br * (kt + 8) * 2 + TILE_COLS * (kt + 4) * 4);
+    let fold = (kg - 1) * br * (TILE_COLS + 4) * 4;
+    let smem = tiles.max(fold);
+    let row_blocks = rows.div_ceil(br);
+    let want = 2 * ctx.multiprocessors().unwrap_or(132);
+    let slices = want
+        .div_ceil(row_blocks)
+        .clamp(1, (fan / SLICE_FLOOR).max(1))
+        .min((PARTIAL_ROWS / rows).max(1));
+    let slice = fan.div_ceil(slices).next_multiple_of(kt);
+    let slices = fan.div_ceil(slice);
+    let out = if slices > 1 {
+        ctx.scratch_shared(
+            OP,
+            "elementwise.hc_project_partial",
+            (slices * rows * (mix_hc + 1)) as usize * core::mem::size_of::<f32>(),
+        )? as usize as u64
+    } else {
+        mixes.ptr
+    };
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_prenorm_project_tile<{br}, {kg}, {kt}, {stages}>"
+            )),
+        )
+        .apply(Launch {
+            smem,
+            ..Launch::grid([row_blocks, slices, 1], [br * kg, 1, 1])
+        }),
+        &[
+            streams.arg(),
+            hc_fn.arg(),
+            crate::jit::ArgValue::Ptr(out),
+            stated(OP, fan)?.arg(),
+            stated(OP, mix_hc)?.arg(),
+            stated(OP, rows)?.arg(),
+            stated(OP, slice)?.arg(),
+            eps.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    if slices > 1 {
+        ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::elemwise::hc_prenorm_project_fold")
+                .apply(Launch::flat(rows * mix_hc, BLOCK)),
+            &[
+                crate::jit::ArgValue::Ptr(out),
+                mixes.arg(),
+                stated(OP, mix_hc)?.arg(),
+                stated(OP, rows)?.arg(),
+                stated(OP, slices)?.arg(),
+                stated(OP, fan)?.arg(),
+                eps.arg(),
+                ctx.stage(),
+            ],
+        )?;
+    }
+    Ok(true)
+}
+
 /// `hc_project` on `hc_project_tile` (and `hc_project_fold` past one slice):
 /// a decode fire's few rows cut the row into slices across blocks.
 #[allow(clippy::too_many_arguments)]

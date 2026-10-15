@@ -905,6 +905,8 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                     (Out(5), F32),
                 ],
             },
+            // The plane, then the normed rows and the mixes.
+            Fused::HcPrenormProject { .. } => &[(In(1), F32), (Out(0), F32), (Out(1), F32)],
             Fused::LseSink { attn, .. } => match **attn {
                 Attention::DecodeLse { .. } => {
                     &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)]

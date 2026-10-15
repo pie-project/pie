@@ -1095,4 +1095,196 @@ __global__ void __launch_bounds__(BR * KG) hc_project_tile(
     }
 }
 
+// The stream norm and the mix projection in one pass over the bf16 streams:
+// `mixes = (x . w) * rsqrt(mean(x^2) + eps)`, the norm's one scale a row
+// taken out of the dot. `hc_project_tile`'s tiles over bf16 rows (eight a
+// 16-byte read), each thread's four rows' sums of squares taken beside the
+// dot by its tile's first column group. One slice lands `mixes` itself;
+// several land `partial[slice][row][mix_hc + 1]`, the dots then the sum of
+// squares, which `hc_prenorm_project_fold` sums in slice order and scales.
+template <int BR, int KG, int KT, int STAGES>
+__global__ void __launch_bounds__(BR * KG) hc_prenorm_project_tile(
+    const bf16* __restrict__ streams,
+    const float* __restrict__ hc_fn,
+    float* __restrict__ out,
+    int fan_in,
+    int mix_hc,
+    int rows,
+    int slice,
+    float eps,
+    const u32* __restrict__ win)
+{
+    constexpr int SX = KT + 8;
+    constexpr int SW = KT + 4;
+    constexpr int NT = BR * KG;
+    constexpr int COLS = 24;
+    constexpr int O = KT / 8;
+    constexpr int XC = BR * O;
+    constexpr int WC = COLS * (KT / 4);
+    constexpr int RED = KG > 1 ? (KG - 1) * BR * (COLS + 4) : 0;
+    static_assert(BR % 32 == 0 && O % KG == 0, "whole octets a group");
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    bf16* xs = reinterpret_cast<bf16*>(smem_raw);
+    float* ws = reinterpret_cast<float*>(smem_raw + STAGES * BR * SX * sizeof(bf16));
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int kg = tid / BR;
+    const int t = tid % BR;
+    const int tr = t >> 2;
+    const int tc = t & 3;
+    const int n0 = static_cast<int>(blockIdx.x) * BR;
+    const int live = win != nullptr ? min(static_cast<int>(win[0]), rows) : rows;
+    if (n0 >= live) return;
+    const int base = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const int d0 = static_cast<int>(blockIdx.y) * slice;
+    const int d1 = min(d0 + slice, fan_in);
+    const int tiles = (d1 - d0) / KT;
+
+    auto issue = [&](int tile) {
+        const int k0 = d0 + tile * KT;
+        bf16* xd = xs + (tile % STAGES) * BR * SX;
+        float* wd = ws + (tile % STAGES) * COLS * SW;
+        for (int c = tid; c < XC; c += NT) {
+            const int row = c / O;
+            const int q = c % O;
+            const int n = min(n0 + row, live - 1);
+            hc_cp16(xd + row * SX + q * 8, streams + static_cast<long long>(base + n) * fan_in + k0 + q * 8);
+        }
+        for (int c = tid; c < WC; c += NT) {
+            const int col = c / (KT / 4);
+            const int q = c % (KT / 4);
+            const int o = col < mix_hc ? col : 0;
+            hc_cp16(wd + col * SW + q * 4, hc_fn + static_cast<long long>(o) * fan_in + k0 + q * 4);
+        }
+    };
+
+    float acc[4][6];
+    float sq[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        sq[i] = 0.f;
+#pragma unroll
+        for (int j = 0; j < 6; ++j) acc[i][j] = 0.f;
+    }
+
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < tiles) issue(s);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+    for (int tile = 0; tile < tiles; ++tile) {
+        asm volatile("cp.async.wait_group %0;" ::"n"(STAGES - 2) : "memory");
+        __syncthreads();
+        if (tile + STAGES - 1 < tiles) issue(tile + STAGES - 1);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+        const bf16* xt = xs + (tile % STAGES) * BR * SX;
+        const float* wt = ws + (tile % STAGES) * COLS * SW;
+#pragma unroll
+        for (int oo = 0; oo < O / KG; ++oo) {
+            const int k = (kg * (O / KG) + oo) * 8;
+            float xf[4][8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint4 raw = *reinterpret_cast<const uint4*>(xt + (tr + i * (BR / 4)) * SX + k);
+                const bf16* e = reinterpret_cast<const bf16*>(&raw);
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    xf[i][u] = Elem<bf16>::to_f32(e[u]);
+                    sq[i] = fmaf(xf[i][u], xf[i][u], sq[i]);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 6; ++j) {
+                const float4 wa = *reinterpret_cast<const float4*>(wt + (tc * 6 + j) * SW + k);
+                const float4 wb = *reinterpret_cast<const float4*>(wt + (tc * 6 + j) * SW + k + 4);
+                const float wf[8] = {wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w};
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float a = acc[i][j];
+#pragma unroll
+                    for (int u = 0; u < 8; ++u) a = fmaf(xf[i][u], wf[u], a);
+                    acc[i][j] = a;
+                }
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    if constexpr (KG > 1) {
+        __syncthreads();
+        float* red = reinterpret_cast<float*>(smem_raw);
+        if (kg > 0) {
+            float* mine = red + ((kg - 1) * BR + t) * (COLS + 4);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+#pragma unroll
+                for (int j = 0; j < 6; ++j) mine[i * 6 + j] = acc[i][j];
+                mine[COLS + i] = sq[i];
+            }
+        }
+        __syncthreads();
+        if (kg > 0) return;
+#pragma unroll
+        for (int g = 0; g < KG - 1; ++g) {
+            const float* theirs = red + (g * BR + t) * (COLS + 4);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+#pragma unroll
+                for (int j = 0; j < 6; ++j) acc[i][j] += theirs[i * 6 + j];
+                sq[i] += theirs[COLS + i];
+            }
+        }
+    }
+    static_cast<void>(RED);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int n = n0 + tr + i * (BR / 4);
+        if (n >= live) continue;
+        if (gridDim.y == 1) {
+            const float s = rsqrtf(sq[i] / static_cast<float>(fan_in) + eps);
+#pragma unroll
+            for (int j = 0; j < 6; ++j) {
+                const int o = tc * 6 + j;
+                if (o < mix_hc) out[static_cast<long long>(base + n) * mix_hc + o] = acc[i][j] * s;
+            }
+        } else {
+            float* p = out + (static_cast<long long>(blockIdx.y) * rows + n) * (mix_hc + 1);
+#pragma unroll
+            for (int j = 0; j < 6; ++j) {
+                const int o = tc * 6 + j;
+                if (o < mix_hc) p[o] = acc[i][j];
+            }
+            if (tc == 0) p[mix_hc] = sq[i];
+        }
+    }
+}
+
+// The slices' partial dots and sums of squares summed in slice order, the
+// dots scaled by the row's norm into `mixes`.
+__global__ void hc_prenorm_project_fold(
+    const float* __restrict__ partial,
+    float* __restrict__ mixes,
+    int mix_hc,
+    int rows,
+    int slices,
+    int fan_in,
+    float eps,
+    const u32* __restrict__ win)
+{
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int live = win != nullptr ? min(static_cast<int>(win[0]), rows) : rows;
+    if (i >= live * mix_hc) return;
+    const int n = i / mix_hc;
+    const int o = i % mix_hc;
+    const int base = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const int w = mix_hc + 1;
+    float dot = 0.f, sq = 0.f;
+    for (int s = 0; s < slices; ++s) {
+        const float* p = partial + (static_cast<long long>(s) * rows + n) * w;
+        dot += p[o];
+        sq += p[mix_hc];
+    }
+    mixes[static_cast<long long>(base + n) * mix_hc + o] =
+        dot * rsqrtf(sq / static_cast<float>(fan_in) + eps);
+}
+
 }

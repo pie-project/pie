@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::operands::Operands;
 use crate::ops::attn::Attention;
-use crate::ops::elemwise::ModulateForm;
+use crate::ops::elemwise::{Elementwise, ModulateForm};
 use crate::ops::linear::Linear;
 use crate::value::ValueId;
 
@@ -173,6 +173,15 @@ pub enum Fused {
         sink: ValueId,
         head_dim: u32,
         o_out: ValueId,
+    },
+    /// A hyper-connection stream norm and the mix projection it feeds
+    /// (`norm` an `HcRmsnormF32`, `project` an `HcProject` of its rows): a
+    /// backend lands the mixes from the streams in one pass, the norm's
+    /// scale a row taken out of the dot, or runs the two. The normed rows
+    /// are still an output, read by nothing else.
+    HcPrenormProject {
+        norm: Box<Elementwise>,
+        project: Box<Elementwise>,
     },
     /// DeepSeek-V4's attention whole: a windowed log-sum-exp attention
     /// (`window`, a `PrefillLse`), a compressed-pool one over the same q
@@ -406,6 +415,12 @@ impl Operands for Fused {
             // The window's (q, plan, cache), the pool's (q, positions,
             // requests, its selection, entries), then the sinks: the merge
             // reads only what the two land.
+            Self::HcPrenormProject { norm, project } => {
+                norm.inputs(sink);
+                if let Elementwise::HcProject { weight, .. } = **project {
+                    sink.push(weight);
+                }
+            }
             Self::PoolAttention {
                 window,
                 pool,
@@ -541,6 +556,10 @@ impl Operands for Fused {
                 attn.outputs(sink);
                 sink.push(*o_out);
             }
+            Self::HcPrenormProject { norm, project } => {
+                norm.outputs(sink);
+                project.outputs(sink);
+            }
             Self::PoolAttention {
                 window,
                 pool,
@@ -600,7 +619,7 @@ impl Operands for Fused {
                     sink.push((*o_out, o));
                 }
             }
-            Self::NormModulate { .. } => {}
+            Self::NormModulate { .. } | Self::HcPrenormProject { .. } => {}
             Self::GatedResidualNormModulate { r_out, r, .. } => sink.push((*r_out, *r)),
             Self::LmHeadSoftcap { y, y_out, .. } | Self::MatmulBias { y, y_out, .. } => {
                 sink.push((*y_out, *y));
@@ -646,6 +665,7 @@ impl Operands for Fused {
             Self::QgQknormRopeAppend { .. } => "elementwise.qg_qknorm_rope_append",
             Self::LseSink { .. } => "attention.lse_sink",
             Self::PoolAttention { .. } => "attention.pool_attention",
+            Self::HcPrenormProject { .. } => "elementwise.hc_prenorm_project",
             Self::MoeExperts { .. } => "linear.moe_experts",
             Self::QkvFusedQknormRopeVnormWrite { .. } => {
                 "custom_cuda.qkv_fused_qknorm_rope_vnorm_write"

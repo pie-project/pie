@@ -291,7 +291,7 @@ impl Run<'_> {
         }
     }
 
-    fn elementwise(&self, op: &Elementwise) -> Result<(), kernels_cuda::Error> {
+    pub(super) fn elementwise(&self, op: &Elementwise) -> Result<(), kernels_cuda::Error> {
         match op {
             Elementwise::Rmsnorm { x, weight, eps, y } => elemwise::norm::rmsnorm(
                 self.ctx(),

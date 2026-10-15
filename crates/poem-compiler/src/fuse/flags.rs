@@ -57,6 +57,7 @@ flags! {
     QgQknormRopeAppend = "fuse.qg_qknorm_rope_append" => "elementwise.qg_qknorm_rope_append",
     LseSink = "fuse.lse_sink" => "attention.lse_sink",
     PoolAttention = "fuse.pool_attention" => "attention.pool_attention",
+    HcPrenormProject = "fuse.hc_prenorm_project" => "elementwise.hc_prenorm_project",
 }
 
 /// The fused kernels `profile` turns on, in rule order: what [`super::fuse`]
