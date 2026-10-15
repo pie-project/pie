@@ -241,9 +241,13 @@ impl Run<'_> {
             } => match self.chain_swiglu(*packed, *y) {
                 // The chain's gate-up rows sit sorted in the routed stack's
                 // output: the swiglu runs there and lands in its input.
-                Some((sorted_packed, sorted_h)) => {
-                    linear::mlp::swiglu(self.ctx(), sorted_packed, *intermediate, sorted_h)
-                }
+                Some((sorted_packed, sorted_h, perm)) => linear::mlp::swiglu_sorted(
+                    self.ctx(),
+                    sorted_packed,
+                    *intermediate,
+                    perm,
+                    sorted_h,
+                ),
                 None => linear::mlp::swiglu(
                     self.ctx(),
                     self.tensor(*packed),
