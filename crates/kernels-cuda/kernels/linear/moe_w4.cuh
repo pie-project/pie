@@ -50,6 +50,12 @@ __device__ __forceinline__ uint4 ld_stream(const void* p) {
     return v;
 }
 
+__device__ __forceinline__ unsigned ld_scale2(const u8* p) {
+    unsigned short v;
+    asm volatile("ld.global.nc.L1::no_allocate.u16 %0, [%1];\n" : "=h"(v) : "l"(p));
+    return v;
+}
+
 __device__ __forceinline__ unsigned ld_scale(const u8* p) {
     unsigned short v;
     asm volatile("ld.global.nc.L1::no_allocate.u8 %0, [%1];\n" : "=h"(v) : "l"(p));
@@ -86,6 +92,18 @@ __device__ __forceinline__ uint4 ld_act(const void* p) {
     return v;
 }
 
+/// An NVFP4 block scale (e4m3) as bf16 bits, times 2^118: an e2m1 code's
+/// 2^-126 (`e2m1_pair`) times it is the product times 2^-8, exact and
+/// normal across e4m3's range; the epilogue's factor restores the 2^8.
+__device__ __forceinline__ unsigned nvfp4_scale_bf16(unsigned b) {
+    const unsigned e = (b >> 3) & 15u, m = b & 7u;
+    if (e == 0) {
+        // m 2^-9 2^118, exact in f32.
+        return __float_as_uint(static_cast<float>(m) * 6.4903710731685345e32f) >> 16;
+    }
+    return ((e + 238u) << 7) | (m << 4);
+}
+
 /// One 128-code chunk a lane holds: its rows' code groups and scales, and
 /// its routes' activations over the group.
 template <int kTiles, int kNb>
@@ -98,21 +116,38 @@ struct Chunk {
 // 2^(s - 1) makes up a code's 2^-126 and the block's 2^(s - 127); past
 // s = 128 that overflows bf16, and a warp with such a block takes it in
 // two factors.
-template <bool wide, int kTiles, int kNb>
+// NVFP4 (`kNv`): a lane's 32 codes are two 16-code blocks, words 0-1 and
+// 2-3, the two e4m3 scales in the low and high byte of its scale word.
+template <bool wide, bool kNv, int kTiles, int kNb>
 __device__ __forceinline__ void compute(const Chunk<kTiles, kNb>& cc, float (&acc)[kTiles][kNb][4]) {
-    unsigned s1[kTiles][2], s2[kTiles][2];
+    unsigned s1[kTiles][2], s2[kTiles][2], nv[kTiles][2][2];
 #pragma unroll
     for (int t = 0; t < kTiles; ++t)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const unsigned s = cc.s[t][h];
-            const unsigned a = !wide || s <= 128u ? (s + 126u) << 7 : 253u << 7;
-            const unsigned b = s <= 128u ? 0x3F80u : s << 7;
-            s1[t][h] = a | (a << 16);
-            s2[t][h] = b | (b << 16);
+            if constexpr (kNv) {
+#pragma unroll
+                for (int q = 0; q < 2; ++q) {
+                    const unsigned v = nvfp4_scale_bf16((s >> (8 * q)) & 0xFFu);
+                    nv[t][h][q] = v | (v << 16);
+                }
+                s1[t][h] = s2[t][h] = 0u;
+            } else {
+                const unsigned a = !wide || s <= 128u ? (s + 126u) << 7 : 253u << 7;
+                const unsigned b = s <= 128u ? 0x3F80u : s << 7;
+                s1[t][h] = a | (a << 16);
+                s2[t][h] = b | (b << 16);
+            }
         }
 #pragma unroll
     for (int w = 0; w < 4; ++w) {
+        if constexpr (kNv) {
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) s1[t][h] = nv[t][h][w >> 1];
+        }
 #pragma unroll
         for (int jj = 0; jj < 2; ++jj) {
             unsigned b0[kNb], b1[kNb];
@@ -256,7 +291,9 @@ __global__ void moe_route_order_scan(
     }
 }
 
-template <int kNb, int kDepth, int kGlu>
+// `kNv`: an NVFP4 bank (an e4m3 scale a 16 codes, `tscale` an f32 tensor
+// scale a weight row) in place of mxfp4's e8m0 a 32.
+template <int kNb, int kDepth, int kGlu, bool kNv = false>
 __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
@@ -272,7 +309,8 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    const float* __restrict__ tscale)
 {
     constexpr int kTiles = 2;
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
@@ -301,7 +339,9 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
     const int chunks = (groups + 3) >> 2;
     const long long row_bytes = k >> 1;
     const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * groups;
+    // A row's scales: one a 32-code group (mxfp4), two (NVFP4).
+    const int sf_row = kNv ? 2 * groups : groups;
+    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
 
     const u8* wrow[kTiles][2];
     const u8* srow[kTiles][2];
@@ -311,7 +351,7 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
         for (int h = 0; h < 2; ++h) {
             const int r = min(tile_row(t) + 8 * h + g, n - 1);
             wrow[t][h] = w_e + r * row_bytes + c * 16;
-            srow[t][h] = s_e + static_cast<long long>(r) * groups + c;
+            srow[t][h] = s_e + static_cast<long long>(r) * sf_row + (kNv ? 2 * c : c);
         }
     const bf16* xrow[kNb];
 #pragma unroll
@@ -330,7 +370,11 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 cc.w[t][h] = live ? w4mma::ld_stream(wrow[t][h] + ch * 64) : make_uint4(0, 0, 0, 0);
-                cc.s[t][h] = live ? w4mma::ld_scale(srow[t][h] + ch * 4) : 127u;
+                if constexpr (kNv) {
+                    cc.s[t][h] = live ? w4mma::ld_scale2(srow[t][h] + ch * 8) : 0u;
+                } else {
+                    cc.s[t][h] = live ? w4mma::ld_scale(srow[t][h] + ch * 4) : 127u;
+                }
             }
 #pragma unroll
         for (int b = 0; b < kNb; ++b)
@@ -362,10 +406,12 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
 #pragma unroll
                 for (int t = 0; t < kTiles; ++t)
                     wide |= ring[d].s[t][0] > 128u || ring[d].s[t][1] > 128u;
-                if (__any_sync(0xffffffffu, wide)) {
-                    w4mma::compute<true>(ring[d], acc);
+                if constexpr (kNv) {
+                    w4mma::compute<false, true>(ring[d], acc);
+                } else if (__any_sync(0xffffffffu, wide)) {
+                    w4mma::compute<true, false>(ring[d], acc);
                 } else {
-                    w4mma::compute<false>(ring[d], acc);
+                    w4mma::compute<false, false>(ring[d], acc);
                 }
                 if (ch + kDepth < chunks) load(ch + kDepth, ring[d]);
             }
@@ -373,6 +419,9 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
     }
 
     const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    // NVFP4: a weight row's tensor scale, and the 2^8 the scales held back.
+    const float* t_e = kNv ? tscale + static_cast<long long>(expert) * n : nullptr;
+    auto factor = [&](int row) { return kNv ? t_e[row] * 256.f : 1.f; };
     if constexpr (kGlu != 0) {
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
@@ -380,6 +429,7 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
             if (col >= inter) continue;
             const float bg = b_e != nullptr ? bf16_to_f32(b_e[col]) : 0.f;
             const float bu = b_e != nullptr ? bf16_to_f32(b_e[inter + col]) : 0.f;
+            const float fg = factor(col), fu = factor(inter + col);
 #pragma unroll
             for (int b = 0; b < kNb; ++b)
 #pragma unroll
@@ -388,7 +438,8 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
                     if (tok < count) {
                         const long long route = order[begin + tok];
                         out[route * inter + col] = f32_to_bf16(w4mma::glu<kGlu>(
-                            acc[0][b][2 * h + e] + bg, acc[1][b][2 * h + e] + bu, limit, galpha));
+                            acc[0][b][2 * h + e] * fg + bg, acc[1][b][2 * h + e] * fu + bu, limit,
+                            galpha));
                     }
                 }
         }
@@ -401,6 +452,7 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
             const int row = row_base + 16 * t + 8 * h + g;
             if (row >= n) continue;
             const float add = b_e != nullptr ? bf16_to_f32(b_e[row]) : 0.f;
+            const float f = factor(row);
 #pragma unroll
             for (int b = 0; b < kNb; ++b)
 #pragma unroll
@@ -408,7 +460,7 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
                     const int tok = 8 * b + 2 * c + e;
                     if (tok < count) {
                         const long long route = order[begin + tok];
-                        out[route * n + row] = f32_to_bf16(acc[t][b][2 * h + e] + add);
+                        out[route * n + row] = f32_to_bf16(acc[t][b][2 * h + e] * f + add);
                     }
                 }
         }

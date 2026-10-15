@@ -103,6 +103,27 @@ pub fn matmul_select(
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let fan = selected(OP, x, routes, y)?;
     let Planes { n, k } = planes(OP, codes, scales, tensor_scales, y.width, x.width)?;
+    // A narrow fire on the register-dequant MMA kernel where the profile
+    // says; a launch that fails falls to the arms below.
+    #[cfg(feature = "cuda")]
+    if !seat.streams()
+        && matches!(
+            crate::linear::moe::select_nvfp4_mma(
+                ctx,
+                OP,
+                x,
+                codes,
+                scales,
+                tensor_scales,
+                routes,
+                y,
+                crate::linear::moe::ExpertTable::RESIDENT,
+            ),
+            Ok(true)
+        )
+    {
+        return Ok(());
+    }
     // On the grouped tcgen05 GEMM (W4A16), the tensor scale a row in its
     // epilogue.
     #[cfg(feature = "cuda")]

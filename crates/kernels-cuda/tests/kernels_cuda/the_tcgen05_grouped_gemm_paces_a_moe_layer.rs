@@ -391,6 +391,13 @@ fn the_tcgen05_grouped_gemm_paces_a_moe_layer() {
         act: (Elem::Bf16, None),
         w: (Elem::E2m1, Some(32)),
     };
+    let w4a16_nv = Kind {
+        name: "w4a16 nvfp4",
+        act: (Elem::Bf16, None),
+        w: (Elem::E2m1, Some(16)),
+    };
+    layer("qwen16 gate_up", 512, 10, [1280, 2560], w4a16_nv);
+    layer("qwen16 down", 512, 10, [2560, 640], w4a16_nv);
     layer("gpt-oss gate_up", 128, 4, [5760, 2880], w4a16);
     layer("gpt-oss down", 128, 4, [2880, 2880], w4a16);
     let bf16 = Kind {

@@ -690,9 +690,43 @@ pub fn select_glu(
         && x.width.is_multiple_of(32)
     {
         // A launch that fails leaves the select and the GLU to run apart.
-        return Ok(
-            select_mxfp4_mma(ctx, OP, x, codes, scales, bias, routes, y, &fan, Some(glu)).is_ok(),
-        );
+        return Ok(select_mxfp4_mma(
+            ctx,
+            OP,
+            x,
+            codes,
+            scales,
+            bias,
+            routes,
+            y,
+            &fan,
+            Some(glu),
+            None,
+        )
+        .is_ok());
+    }
+    // A narrow NVFP4 (W4A16) fire likewise, where the profile says.
+    if let GluBank::Nvfp4 {
+        codes,
+        scales,
+        tensor_scales,
+    } = bank
+        && nvfp4_mma_worth(ctx, x, y, experts, &fan)
+    {
+        return Ok(select_mxfp4_mma(
+            ctx,
+            OP,
+            x,
+            codes,
+            scales,
+            None,
+            routes,
+            y,
+            &fan,
+            Some(glu),
+            Some(tensor_scales),
+        )
+        .is_ok());
     }
     let Some((w, rows, bias, weight_scale, dtype)) = bank_operand(x, bank, 2 * y.width) else {
         return Ok(false);
@@ -765,7 +799,11 @@ pub fn experts(
     let hidden = Tensor::new(0, count, inter, Dtype::Bf16);
     let routed = Tensor::new(0, count, y.width, Dtype::Bf16);
     // An mxfp4 fire the register-dequant kernel takes stays on it.
-    let mma = |bank: GluBank| matches!(bank, GluBank::Mxfp4 { .. }) && mxfp4_mma_spans(ctx, count);
+    let mma = |bank: GluBank| match bank {
+        GluBank::Mxfp4 { .. } => mxfp4_mma_spans(ctx, count),
+        GluBank::Nvfp4 { .. } => nvfp4_mma_spans(ctx, count),
+        _ => false,
+    };
     if count == 0
         || mma(up)
         || mma(down)
@@ -1498,6 +1536,66 @@ fn mxfp4_mma_spans(ctx: &Ctx, routes: u32) -> bool {
     t.mxfp4_mma_from <= routes && routes <= t.mxfp4_mma_until
 }
 
+#[cfg(feature = "cuda")]
+fn nvfp4_mma_spans(ctx: &Ctx, routes: u32) -> bool {
+    let t = ctx.tuning();
+    t.nvfp4_mma_from <= routes && routes <= t.nvfp4_mma_until
+}
+
+/// Whether a routed NVFP4 select of bf16 activations (W4A16) runs the
+/// register-dequant MMA kernel: resident experts, whole 32-code groups, and
+/// a width `kernel.moe.nvfp4_mma_from` to `_until` takes.
+#[cfg(feature = "cuda")]
+pub(crate) fn nvfp4_mma_worth(
+    ctx: &Ctx,
+    x: Tensor,
+    y: &Tensor,
+    experts: ExpertTable,
+    fan: &Selected,
+) -> bool {
+    nvfp4_mma_spans(ctx, fan.route_count)
+        && !experts.streams()
+        && x.dtype == Dtype::Bf16
+        && y.dtype == Dtype::Bf16
+        && x.width > 0
+        && x.width.is_multiple_of(32)
+}
+
+/// The routed NVFP4 select of bf16 activations on the register-dequant MMA
+/// kernel: `scales` row-major e4m3 a 16 codes, `tensor_scales` an f32 a row.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_nvfp4_mma(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    tensor_scales: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    experts: ExpertTable,
+) -> Result<bool, Error> {
+    let fan = selected(op, x, routes, y)?;
+    if !nvfp4_mma_worth(ctx, x, y, experts, &fan) {
+        return Ok(false);
+    }
+    select_mxfp4_mma(
+        ctx,
+        op,
+        x,
+        codes,
+        scales,
+        None,
+        routes,
+        y,
+        &fan,
+        None,
+        Some(tensor_scales),
+    )?;
+    Ok(true)
+}
+
 /// Whether a routed mxfp4 select runs the register-dequant MMA kernel: bf16
 /// activations, resident experts, whole 32-code blocks, and a width
 /// [`mxfp4_mma_spans`] takes.
@@ -1533,6 +1631,7 @@ fn select_mxfp4_mma(
     y: &mut Tensor,
     fan: &Selected,
     glu: Option<crate::linear::tc5::Glu>,
+    tensor_scales: Option<Tensor>,
 ) -> Result<(), Error> {
     use crate::linear::tc5::Glu;
     const THREADS: u32 = 128;
@@ -1603,9 +1702,11 @@ fn select_mxfp4_mma(
     } else {
         Fire::at(
             "linear/moe_w4.cuh",
-            symbol(&format!(
-                "::pie::linear::moe_select_mxfp4_mma<{nb}, 1, {code}>"
-            )),
+            symbol(&match tensor_scales {
+                // NVFP4: an e4m3 scale a 16 codes, a tensor scale a row.
+                Some(_) => format!("::pie::linear::moe_select_mxfp4_mma<{nb}, 1, {code}, true>"),
+                None => format!("::pie::linear::moe_select_mxfp4_mma<{nb}, 1, {code}>"),
+            }),
         )
         // One chunk in flight a warp: its 93 registers seat five CTAs an SM,
         // and the warps between them hide the loads better than a deeper
@@ -1632,6 +1733,7 @@ fn select_mxfp4_mma(
             inter.arg(),
             limit.arg(),
             alpha.arg(),
+            tensor_scales.map_or(ArgValue::ABSENT, |t| t.arg()),
         ],
     )
 }
@@ -1665,7 +1767,7 @@ fn matmul_select_mxfp4(
     // A launch that fails falls back to the arms below.
     #[cfg(feature = "cuda")]
     if mxfp4_mma_worth(ctx, x, y, seat, &fan)
-        && select_mxfp4_mma(ctx, op, x, codes, scales, bias, routes, y, &fan, None).is_ok()
+        && select_mxfp4_mma(ctx, op, x, codes, scales, bias, routes, y, &fan, None, None).is_ok()
     {
         return Ok(());
     }

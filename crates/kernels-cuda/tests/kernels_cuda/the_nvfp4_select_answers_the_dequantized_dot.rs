@@ -63,7 +63,8 @@ fn bank(lcg: &mut Lcg, slabs: usize, n: usize, k: usize) -> Bank {
     }
 }
 
-/// Each case on the old arm and on the tcgen05 one (where the device has it).
+/// Each case on the old arm, on the tcgen05 one (where the device has it)
+/// and on the register-dequant MMA kernel.
 #[allow(clippy::too_many_arguments)]
 fn routed(
     experts: usize,
@@ -74,7 +75,11 @@ fn routed(
     by_token: bool,
     seed: u64,
 ) {
-    for tuning in [Tuning::DEFAULT, crate::common::TC5] {
+    let mma = Tuning {
+        nvfp4_mma_until: 65_536,
+        ..crate::common::TC5
+    };
+    for tuning in [Tuning::DEFAULT, crate::common::TC5, mma] {
         routed_tuned(tuning, experts, n, k, tokens, top_k, by_token, seed);
     }
 }
@@ -198,6 +203,67 @@ fn the_nvfp4_select_answers_the_dequantized_dot_every_case() {
     a_wide_fire_takes_the_grouped_kernel_on_the_gate_up_leg();
     a_wide_fire_takes_the_grouped_kernel_on_the_down_leg_with_a_ragged_row_tile();
     a_dense_projection_answers_at_one_row_and_at_many();
+    the_register_dequant_gate_up_lands_its_swiglu();
+}
+
+/// The gate-up select with its SwiGLU on the register-dequant kernel: the
+/// bank's gate rows, then its up rows, an expert.
+fn the_register_dequant_gate_up_lands_its_swiglu() {
+    use kernels_cuda::linear::moe::{ExpertTable, GluBank, select_glu};
+    use kernels_cuda::linear::tc5::Glu;
+    let (experts, inter, k, tokens, top_k) = (16usize, 640usize, 2560usize, 48usize, 10usize);
+    let n = 2 * inter;
+    let mut lcg = Lcg::seeded(0x77);
+    let bank = bank(&mut lcg, experts, n, k);
+    let (x_raw, x) = lcg.row(tokens * k);
+    let routes: Vec<i32> = (0..tokens * top_k)
+        .map(|r| ((r / top_k * 37 + r % top_k * 17 + 3) % experts) as i32)
+        .collect();
+    let mut gpu = Gpu::open();
+    let x_at = gpu.up(&x_raw);
+    let codes_at = gpu.up(&bank.codes);
+    let scales_at = gpu.up(&bank.scales);
+    let tensor_at = gpu.up(&bank.tensor);
+    let routes_at = gpu.up(&routes);
+    let y_at = gpu.zeros(tokens * top_k * inter * 2);
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        nvfp4_mma_until: 65_536,
+        ..crate::common::TC5
+    });
+    let slab =
+        |at: u64, bytes: usize, dtype: Dtype| Tensor::new(at, experts as u32, bytes as u32, dtype);
+    let mut y_t = Tensor::new(y_at, (tokens * top_k) as u32, inter as u32, Dtype::Bf16);
+    let took = select_glu(
+        &ctx,
+        Tensor::new(x_at, tokens as u32, k as u32, Dtype::Bf16),
+        GluBank::Nvfp4 {
+            codes: slab(codes_at, n * k / 2, Dtype::Nvfp4),
+            scales: slab(scales_at, n * k / GROUP, Dtype::U8),
+            tensor_scales: slab(tensor_at, n * 4, Dtype::U8),
+        },
+        Tensor::new(routes_at, tokens as u32, top_k as u32, Dtype::I32),
+        &mut y_t,
+        Glu::Swiglu,
+        ExpertTable::RESIDENT,
+    )
+    .expect("the select fires");
+    assert!(
+        took,
+        "the register-dequant kernel takes the gate-up and its GLU"
+    );
+    gpu.sync();
+    let got: Vec<u16> = gpu.down(y_at, tokens * top_k * inter);
+    let dot = |route: usize, r: usize| {
+        let e = routes[route] as usize;
+        (0..k)
+            .map(|c| bank.dequant[(e * n + r) * k + c] * x[route / top_k * k + c])
+            .sum::<f32>()
+    };
+    let want = |route: usize, c: usize| {
+        let (g, u) = (dot(route, c), dot(route, inter + c));
+        g / (1.0 + (-g).exp()) * u
+    };
+    verdict(tokens * top_k, inter, &got, want);
 }
 
 fn the_gate_up_leg_read_by_token_route_by_route() {

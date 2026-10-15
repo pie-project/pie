@@ -429,6 +429,8 @@ mod tests {
                         gemm_nvfp4_k128: false,
                         moe_w4a4_fused_from: 65_536,
                         gemm_split_launch_ns: 0,
+                        nvfp4_mma_from: defaults.nvfp4_mma_from,
+                        nvfp4_mma_until: defaults.nvfp4_mma_until,
                         moe_topk_warp: false,
                         decode_grouped_prefill_lse: false,
                         decode_xqa: false,
@@ -618,6 +620,10 @@ mod tests {
             assert_eq!(
                 other.gemm_split_launch_ns, 0,
                 "sm_{major}{minor} charges a split's launch nothing"
+            );
+            assert_eq!(
+                other.nvfp4_mma_until, 0,
+                "sm_{major}{minor} keeps the NVFP4 W4A16 select off the register-dequant kernel"
             );
             assert!(
                 !other.moe_topk_warp,

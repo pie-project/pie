@@ -56,6 +56,19 @@ pub struct GemmNvfp4K128;
 #[decision(id = "kernel.moe.topk_warp", flag, default = false, tune = search)]
 pub struct MoeTopkWarp;
 
+/// The routes a routed NVFP4 select of bf16 activations (W4A16) runs on the
+/// register-dequant MMA kernel from and up to (each expert's rows
+/// dequantized in registers on mma.sync); never (until 0) but where a
+/// chip's profile says (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.nvfp4_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeNvfp4MmaUntil(pub u32);
+
+/// The fewest routes of [`MoeNvfp4MmaUntil`]'s span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.nvfp4_mma_from", constant(range(1..=65_536)), default = 1, tune = search)]
+pub struct MoeNvfp4MmaFrom(pub u32);
+
 /// What a K-splitting cuBLASLt algorithm's own reduce launch costs a
 /// captured step past its lone timing, in ns, charged to it (and to
 /// `cublasGemmEx`, which may split) when a dense bf16 product's tactic is
@@ -389,6 +402,8 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmNvfp4K128>()
         .add::<MoeW4a4FusedFrom>()
         .add::<GemmSplitLaunchNs>()
+        .add::<MoeNvfp4MmaUntil>()
+        .add::<MoeNvfp4MmaFrom>()
         .add::<MoeTopkWarp>()
         .add::<PrefillTc5>()
         .add::<PrefillWideSliding>()
@@ -449,6 +464,8 @@ pub struct Tuning {
     pub gemm_nvfp4_k128: bool,
     pub moe_w4a4_fused_from: u32,
     pub gemm_split_launch_ns: u32,
+    pub nvfp4_mma_from: u32,
+    pub nvfp4_mma_until: u32,
     pub moe_topk_warp: bool,
     pub prefill_tc5: bool,
     pub prefill_wide_sliding: bool,
@@ -507,6 +524,8 @@ impl Tuning {
         gemm_nvfp4_k128: false,
         moe_w4a4_fused_from: 65_536,
         gemm_split_launch_ns: 0,
+        nvfp4_mma_from: 1,
+        nvfp4_mma_until: 0,
         moe_topk_warp: false,
         prefill_tc5: false,
         prefill_wide_sliding: false,
@@ -565,6 +584,8 @@ impl Tuning {
             gemm_nvfp4_k128: profile.on::<GemmNvfp4K128>(&Anywhere),
             moe_w4a4_fused_from: profile.get::<MoeW4a4FusedFrom>().0,
             gemm_split_launch_ns: profile.get::<GemmSplitLaunchNs>().0,
+            nvfp4_mma_from: profile.get::<MoeNvfp4MmaFrom>().0,
+            nvfp4_mma_until: profile.get::<MoeNvfp4MmaUntil>().0,
             moe_topk_warp: profile.on::<MoeTopkWarp>(&Anywhere),
             prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),
             prefill_wide_sliding: profile.on::<PrefillWideSliding>(&Anywhere),
