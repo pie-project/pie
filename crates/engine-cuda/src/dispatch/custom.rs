@@ -138,15 +138,18 @@ impl Run<'_> {
             use kernels_cuda::attn::dsv4_prefill::{self, Pooled};
             let from = self.ctx().tuning().dsv4_prefill_from;
             let mut out = self.tensor(*o_out);
-            if from > 0 && out.rows >= from {
+            // Its request ids index the whole fire's page tables too.
+            if from > 0
+                && out.rows >= from
+                && let (Some(window_pool), Some(entries)) =
+                    (self.pool_whole(*cache), self.pool_whole(*entries))
+            {
                 let selection = match &**pool {
                     poem_ir::Attention::PoolLseSelected {
                         selection, top_k, ..
                     } => Some((self.tensor(*selection), *top_k)),
                     _ => None,
                 };
-                let window_pool = self.pool(*cache);
-                let entries = self.pool(*entries);
                 let pooled = Pooled {
                     entries: &entries,
                     ratio: *ratio,
