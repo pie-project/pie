@@ -954,9 +954,18 @@ impl Shell {
             0
         };
         let resident = footprint(&shell);
-        let fitted = shell
-            .pools
-            .fit_the_card(bodies, held_for_fires, &resident)?;
+        // Arming the tall buckets grows the kernels' scratch slabs (top-k
+        // scores, chunked-recurrence planes, attention partials) after this
+        // fit, by about the activation arena again at a 16K-token budget; held
+        // for them here, the cache rows leave the bodies the room they were
+        // allowed (GLM's mini armed 11 of 49 compositions without it, its
+        // prefill buckets walking eagerly).
+        let scratch_growth = if shell.records_bodies() { shell.arena.bytes() } else { 0 };
+        let fitted = shell.pools.fit_the_card(
+            bodies,
+            held_for_fires.saturating_add(scratch_growth),
+            &resident,
+        )?;
         if fitted.bodies < bodies {
             eprintln!(
                 "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \

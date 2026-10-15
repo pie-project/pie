@@ -248,24 +248,58 @@ fn extents(stated: &BindExtents) -> eta_exec::Extents {
 }
 
 /// Powers of two from the floor up to `max_tokens`, with `steps - 1` more
-/// between each pair.
+/// between each pair; from `PREFILL_LATTICE_FROM` rows, `PREFILL_LATTICE_STEPS`
+/// a doubling at least. A prefill's GEMMs run its bucket's rows, so a 2K
+/// prompt padded to 4096 cost a second prompt, while buckets this tall are
+/// few (a model whose bodies fill their memory still arms its small ones).
 #[must_use]
 pub(crate) fn default_lattice(max_tokens: u32, steps: u32) -> Vec<u32> {
     let steps = steps.max(1);
+    let fine_from = prefill_lattice_from();
     let mut lattice: Vec<u32> = Vec::new();
-    for i in 0u32.. {
-        let point = (f64::from(LATTICE_FLOOR) * 2f64.powf(f64::from(i) / f64::from(steps))).ceil();
+    let mut push = |point: f64, lattice: &mut Vec<u32>| -> bool {
         if point >= f64::from(max_tokens) {
-            break;
+            return false;
         }
         let point = point as u32;
         if lattice.last() != Some(&point) {
             lattice.push(point);
         }
+        true
+    };
+    'coarse: for i in 0u32.. {
+        let point = (f64::from(LATTICE_FLOOR) * 2f64.powf(f64::from(i) / f64::from(steps))).ceil();
+        if fine_from > 0 && point >= f64::from(fine_from) {
+            break 'coarse;
+        }
+        if !push(point, &mut lattice) {
+            lattice.push(max_tokens);
+            return lattice;
+        }
+    }
+    let fine = steps.max(PREFILL_LATTICE_STEPS);
+    for i in 0u32.. {
+        let point = (f64::from(fine_from) * 2f64.powf(f64::from(i) / f64::from(fine))).ceil();
+        if !push(point, &mut lattice) {
+            break;
+        }
     }
     lattice.push(max_tokens);
     lattice
 }
+
+/// Rows from which the default lattice takes `PREFILL_LATTICE_STEPS` buckets
+/// a doubling (`PIE_PREFILL_LATTICE_FROM`, 0 never).
+fn prefill_lattice_from() -> u32 {
+    static FROM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *FROM.get_or_init(|| {
+        std::env::var("PIE_PREFILL_LATTICE_FROM")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2048)
+    })
+}
+const PREFILL_LATTICE_STEPS: u32 = 4;
 
 pub(crate) const LATTICE_FLOOR: u32 = 1;
 
