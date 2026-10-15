@@ -30,12 +30,14 @@ def gate(streams, mix, hy):
     )
 
 def summed(streams, hidden, count):
-    """The `count` streams, each `hidden` wide, added into one row."""
+    """The mean of the `count` streams, each `hidden` wide: the unweighted
+    collapse the head reads (a sum would read the final norm's epsilon a
+    `count` squared smaller)."""
     y, rest = ops.layout.split_rows(streams, hidden)
     for _ in range(1, count - 1):
         stream, rest = ops.layout.split_rows(rest, hidden)
         y = ops.elemwise.residual_add(stream, y)
-    return ops.elemwise.residual_add(rest, y)
+    return ops.elemwise.residual_add(rest, y) * f32(1.0 / count)
 
 def predict_route(streams, hy, mix, norm, norm_eps, router, bias, experts):
     """The experts a following MLP's router is predicted to take: the
@@ -299,12 +301,9 @@ def mlp(x, f, hint):
         f.scaling,
         hint,
     )
-    packed = ops.linear.moe_matmul_select_quant(x, f.gate_up, routes, f.top_k)
+    packed = select(x, f.gate_up, routes, f.top_k)
     act = ops.linear.mlp_swiglu_clamp(packed, f.inter, f.limit)
-    routed = ops.linear.moe_weighted_sum(
-        ops.linear.moe_matmul_select_quant(act, f.down, routes, f.top_k),
-        weights,
-    )
+    routed = ops.linear.moe_weighted_sum(select(act, f.down, routes, f.top_k), weights)
     s = f.shared
     act = ops.linear.mlp_swiglu_clamp(ops.linear.matmul(x, s.gate_up), s.inter, f.limit)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
@@ -387,3 +386,10 @@ def tower(inputs, t):
     h = ops.linear.matmul(g, mg.gate_up)
     a = ops.linear.mlp_swiglu_clamp(h, t.merger_inter, t.limit)
     return ops.linear.matmul(a, mg.down)
+
+def select(x, bank, routes, top_k):
+    """A routed bank's select: a bf16 bank's plain, a quantized one's
+    through its codes and factors."""
+    if bank.dtype == dtype.bf16:
+        return ops.linear.moe_matmul_select(x, bank, routes, top_k)
+    return ops.linear.moe_matmul_select_quant(x, bank, routes, top_k)

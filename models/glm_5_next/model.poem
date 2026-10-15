@@ -151,6 +151,10 @@ def layout(id, deploy):
         if len(deploy.weights) != 3:
             fail("{} with its draft head stores its weights, experts and draft experts at a dtype each, not {}".format(id, deploy.weights))
         weights, experts, draft = deploy.weights
+    elif len(deploy.weights) == 1:
+        weights = deploy.weights[0]
+        experts = weights
+        draft = None
     else:
         if len(deploy.weights) != 2:
             fail("{} stores its weights and its experts at a dtype each, not {}".format(id, deploy.weights))
