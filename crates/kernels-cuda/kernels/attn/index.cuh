@@ -285,7 +285,8 @@ __global__ void index_topk_paged(
 }
 
 // `index_topk_paged` with the scores on the tensor cores: the row's heads
-// are an mma's rows (`H` <= 16, the rest zero), and each warp scores its own
+// are an mma's rows, `kTiles` tiles of 16 (`H` <= 16 kTiles, the rest zero),
+// and each warp scores its own
 // 16-block chunks of the row's keys (`D` = 128), gathered into shared memory
 // a chunk at a time. The ranking that follows is the same.
 namespace index_mma {
@@ -310,7 +311,7 @@ __device__ __forceinline__ void mma_m16n8k16(float (&d)[4], const std::uint32_t 
 
 }  // namespace index_mma
 
-template <class T>
+template <class T, int kTiles = 1>
 __global__ void index_topk_paged_mma(
     const T* __restrict__ idx_q,
     const T* __restrict__ idx_w,
@@ -359,26 +360,29 @@ __global__ void index_topk_paged_mma(
 
     float* frow = scores + static_cast<long long>(t) * score_stride;
     const T* qi = idx_q + static_cast<long long>(t_row) * H * kD;
-    __shared__ __align__(16) T q_s[16 * kLd];
-    __shared__ __align__(16) T k_s[kWarps][kKeys * kLd];
-    __shared__ float w_s[16];
+    // The row's query (16 kTiles rows of kLd) and each warp's key chunk, in
+    // dynamic shared memory.
+    extern __shared__ __align__(16) unsigned char q_raw[];
+    T* q_s = reinterpret_cast<T*>(q_raw);
+    T* k_s0 = q_s + 16 * kTiles * kLd;
+    __shared__ float w_s[16 * kTiles];
     __shared__ long long slot_s[kWarps][kKeys];
-    for (int i = tid; i < 16 * (kD / 8); i += kBlock) {
+    for (int i = tid; i < 16 * kTiles * (kD / 8); i += kBlock) {
         const int row = i / (kD / 8);
         const int d = (i % (kD / 8)) * 8;
         int4 v = make_int4(0, 0, 0, 0);
         if (row < H) v = *reinterpret_cast<const int4*>(qi + row * kD + d);
         *reinterpret_cast<int4*>(q_s + row * kLd + d) = v;
     }
-    if (tid < 16) {
-        w_s[tid] = tid < H
-            ? (idx_w != nullptr ? Elem<T>::to_f32(idx_w[static_cast<long long>(t_row) * H + tid]) : 1.f)
+    for (int h = tid; h < 16 * kTiles; h += kBlock) {
+        w_s[h] = h < H
+            ? (idx_w != nullptr ? Elem<T>::to_f32(idx_w[static_cast<long long>(t_row) * H + h]) : 1.f)
             : 0.f;
     }
     __syncthreads();
 
     const int g = lane >> 2, p = (lane & 3) << 1;
-    T* ks = k_s[warp];
+    T* ks = k_s0 + warp * kKeys * kLd;
     for (int base = warp * kKeys; base < nkeys; base += kWarps * kKeys) {
         if (lane < kKeys) {
             const int j = base + lane;
@@ -400,12 +404,17 @@ __global__ void index_topk_paged_mma(
                 : make_int4(0, 0, 0, 0);
         }
         __syncwarp();
+        // A key's score, this lane's share: each head tile's weighted
+        // rectified dots, rows `g` and `g + 8` of the tile.
+        float part[2][2] = {{0.f, 0.f}, {0.f, 0.f}};
+#pragma unroll
+        for (int ht = 0; ht < kTiles; ++ht) {
         float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
 #pragma unroll
         for (int k0 = 0; k0 < kD; k0 += 16) {
             std::uint32_t a[4];
             {
-                const T* rp = q_s + (lane & 15) * kLd + k0 + ((lane & 16) ? 8 : 0);
+                const T* rp = q_s + (ht * 16 + (lane & 15)) * kLd + k0 + ((lane & 16) ? 8 : 0);
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                              : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
                              : "r"(smem_addr(rp)));
@@ -420,13 +429,20 @@ __global__ void index_topk_paged_mma(
                 mma_m16n8k16(acc[nt], a, b);
             }
         }
-        // Rows `g` and `g + 8` are heads; a key's score sums its heads'
-        // weighted rectified dots, across the eight lane groups.
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+                part[nt][i] += fmaxf(acc[nt][i], 0.f) * w_s[ht * 16 + g]
+                    + fmaxf(acc[nt][2 + i], 0.f) * w_s[ht * 16 + g + 8];
+        }
+        // A key's score sums its heads' weighted rectified dots, across the
+        // eight lane groups.
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
 #pragma unroll
             for (int i = 0; i < 2; ++i) {
-                float v = fmaxf(acc[nt][i], 0.f) * w_s[g] + fmaxf(acc[nt][2 + i], 0.f) * w_s[g + 8];
+                float v = part[nt][i];
 #pragma unroll
                 for (int sh = 4; sh < 32; sh <<= 1) v += __shfl_xor_sync(0xffffffffu, v, sh);
                 const int j = base + nt * 8 + p + i;

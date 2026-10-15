@@ -5,7 +5,7 @@
 // the `TOP_K` best, ascending; a row that sees no more than `TOP_K` blocks
 // selects them all. Read against a host reference over a fresh prefill and a
 // continuation whose page tables are out of order, scored the scalar way
-// and on the tensor cores (`kernel.sdpa.index_mma`).
+// and on the tensor cores (`kernel.sdpa.index_mma`), at 4, 20 and 64 heads.
 
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
@@ -13,7 +13,6 @@ use kernels_cuda::attn::index;
 use kernels_cuda::tensor::{KvPool, RaggedTensor, Tensor};
 use kernels_cuda::tuning::Tuning;
 
-const HEADS: usize = 4;
 const DIM: usize = 128;
 const RATIO: usize = 4;
 const TOP_K: usize = 8;
@@ -59,6 +58,15 @@ fn pool(keys: u64, tables: [u64; 3]) -> KvPool {
 
 #[test]
 fn the_pooled_index_selects_its_best_blocks() {
+    // Flash-Next's four heads, and the tensor cores' two- and four-tile
+    // forms (DeepSeek-V4's indexer is 64 heads wide).
+    check(4);
+    check(20);
+    check(64);
+}
+
+#[allow(non_snake_case)]
+fn check(HEADS: usize) {
     let mut gpu = Gpu::open();
     let mut rng = Lcg::seeded(0x1d3e_c5e1);
     let tokens: usize = Q_LENS.iter().sum();

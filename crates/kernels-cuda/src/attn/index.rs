@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::kv;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const FILE: &str = "attn/index.cuh";
@@ -238,14 +238,27 @@ pub fn topk(
 
     // The tensor-core scorer where the profile asks for it and the heads fit
     // one mma's rows at its key width.
-    let entry = if ctx.tuning().index_mma && head_dim == 128 && heads <= 16 {
-        "::pie::attn::index_topk_paged_mma<::pie::bf16>"
-    } else {
-        "::pie::attn::index_topk_paged<::pie::bf16>"
+    // (one to four tiles of 16 heads: DeepSeek-V4's indexer is 64 wide).
+    let (entry, smem) = match heads {
+        h if ctx.tuning().index_mma && head_dim == 128 && h <= 64 => {
+            let tiles: u32 = match h.unsigned_abs().div_ceil(16) {
+                1 => 1,
+                2 => 2,
+                _ => 4,
+            };
+            (
+                format!("::pie::attn::index_topk_paged_mma<::pie::bf16, {tiles}>"),
+                // The query, 16 rows a tile, and each warp's 16 keys, at 128 + 8
+                // bf16 a row.
+                (16 * tiles + (K_BLOCK / 32) * 16) * (128 + 8) * 2,
+            )
+        }
+        _ => ("::pie::attn::index_topk_paged<::pie::bf16>".to_string(), 0),
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, entry).apply(Launch::per_row(selection.rows, K_BLOCK)),
+        Fire::at(FILE, symbol(&entry))
+            .apply(Launch::per_row(selection.rows, K_BLOCK).smem(smem)),
         &[
             q.data.arg(),
             ArgValue::Ptr(weights.map_or(0, |w| w.ptr)),
