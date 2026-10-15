@@ -38,8 +38,9 @@ fn check(case: Case) {
     let plan = case
         .plan
         .unwrap_or_else(|| Plan::choose(m as u32, n as u32, k as u32, 148));
+    let ctx = gpu.ctx();
     gemm_with(
-        &gpu.ctx(),
+        &ctx,
         a_op,
         w_op,
         y,
@@ -49,6 +50,29 @@ fn check(case: Case) {
     )
     .unwrap_or_else(|e| panic!("{case:?}: {e}"));
     gpu.sync();
+    // Split along K, a second launch lands the same bits: each split sums
+    // into its own slab, added in split order.
+    if SPLITS.load(std::sync::atomic::Ordering::Relaxed) {
+        let first: Vec<u16> = gpu.down(y, tall * n);
+        for _ in 0..3 {
+            gemm_with(
+                &ctx,
+                a_op,
+                w_op,
+                y,
+                [m as u32, n as u32, k as u32],
+                case.alpha,
+                plan,
+            )
+            .unwrap_or_else(|e| panic!("{case:?}: {e}"));
+            gpu.sync();
+            assert_eq!(
+                gpu.down::<u16>(y, tall * n),
+                first,
+                "{case:?}: a split launch lands the same bits again"
+            );
+        }
+    }
     let got: Vec<u16> = gpu.down(y, tall * n);
 
     let mut worst = 0f32;
@@ -112,6 +136,35 @@ fn the_tcgen05_gemm_answers_the_dequantized_dot_every_case() {
     the_deepseek_blocks_land_through_ue8m0();
     nvfp4_lands_its_sixteen_wide_scales_and_global_alpha();
     mxfp4_weights_meet_fp8_activations();
+    a_split_launch_lands_the_same_bits_each_time();
+}
+
+/// The decode-width cases, split along K, run four times: each launch's
+/// bits the first's.
+static SPLITS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn a_split_launch_lands_the_same_bits_each_time() {
+    SPLITS.store(true, std::sync::atomic::Ordering::Relaxed);
+    let f8 = (Elem::E4m3, None);
+    let ds = (Elem::E4m3, Some(128));
+    check(scaled(f8, f8, [3, 256, 1024], None, 1.0));
+    check(scaled(ds, ds, [1, 384, 1024], None, 1.0));
+    check(scaled(ds, ds, [8, 1024, 4096], None, 1.0));
+    check(scaled(ds, ds, [40, 256, 2048], None, 1.0));
+    check(scaled(ds, ds, [64, 512, 8192], None, 1.0));
+    check(bf16(16, 512, 4096, None));
+    // Unswapped, split by hand.
+    check(scaled(
+        ds,
+        ds,
+        [128, 256, 4096],
+        Some(Plan {
+            splits: 4,
+            ..plan(false, 128).unwrap()
+        }),
+        1.0,
+    ));
+    SPLITS.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn scaled(

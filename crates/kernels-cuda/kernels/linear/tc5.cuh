@@ -94,6 +94,10 @@ struct Epi {
     const float* in_scale;
     // A dense launch's P tiles a raster band (`kernel.gemm.tc5_raster`).
     int raster;
+    // A split's own slab of `part`: split s's sums at part + s * slab, each
+    // summed in split order by whoever lands the tile (deterministic, no
+    // float atomics).
+    long long slab;
 };
 
 namespace tc5k {
@@ -517,12 +521,14 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         int kb0, kb1;
         float alpha;
         int out_p, out_q, lim_p, lim_q, s_row;
-        int e;  // the expert (grouped), else 0
+        int e;     // the expert (grouped), else 0
+        int ks;  // which of its tile's K splits
     };
     // Every role walks the same units and skips the same empty ones (a
     // contiguous tile past the routed rows, a masked tile past its count).
     auto unit_of = [&](int u, Unit& x) -> bool {
         const int t = u / splits;
+        x.ks = u - t * splits;
         const int ks = u - t * splits;
         x.kb0 = ks * kb_per;
         x.kb1 = min(num_kb, x.kb0 + kb_per);
@@ -1430,7 +1436,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
 #pragma unroll
                         for (int j = 0; j < 32; ++j) {
                             if (j0 + j < x.lim_q) {
-                                red_add(part + static_cast<size_t>(q0 + j) * ldy + p, h[j]);
+                                part[static_cast<size_t>(x.ks) * epi.slab +
+                                     static_cast<size_t>(q0 + j) * ldy + p] = h[j];
                             }
                         }
                     } else if (live) {
@@ -1479,11 +1486,13 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 } else if (splits > 1) {
                     // A thread's 32 sums of its row, four at a time.
                     if (live) {
-                        float* at = part + static_cast<size_t>(p) * ldy + q0;
+                        float* at = part + static_cast<size_t>(x.ks) * epi.slab +
+                                    static_cast<size_t>(p) * ldy + q0;
 #pragma unroll
                         for (int j = 0; j < 32; j += 4) {
                             if (j0 + j < x.lim_q) {
-                                red_add4(at + j, h[j], h[j + 1], h[j + 2], h[j + 3]);
+                                *reinterpret_cast<float4*>(at + j) =
+                                    make_float4(h[j], h[j + 1], h[j + 2], h[j + 3]);
                             }
                         }
                     }
@@ -1534,14 +1543,22 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     }
 }
 
-// The split-K sum in f32, four at a time, to bf16, leaving the sum zero for
-// the next launch's splits.
-__global__ __launch_bounds__(256) void tc5_finalize(float4* __restrict__ part,
-                                                    uint2* __restrict__ y, int quads) {
+// The split-K sums in f32, four at a time, to bf16: each split's slab
+// added in split order.
+__global__ __launch_bounds__(256) void tc5_finalize(const float4* __restrict__ part,
+                                                    uint2* __restrict__ y, int quads, int splits,
+                                                    long long slab_quads) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < quads) {
-        const float4 v = part[i];
-        part[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+        // Each split's slab in split order: the same sum every launch.
+        float4 v = part[i];
+        for (int s = 1; s < splits; ++s) {
+            const float4 w = part[static_cast<long long>(s) * slab_quads + i];
+            v.x += w.x;
+            v.y += w.y;
+            v.z += w.z;
+            v.w += w.w;
+        }
         y[i] = make_uint2(pack_bf16x2(v.x, v.y), pack_bf16x2(v.z, v.w));
     }
 }
@@ -1549,18 +1566,25 @@ __global__ __launch_bounds__(256) void tc5_finalize(float4* __restrict__ part,
 // As tc5_finalize for a grouped launch's routed rows alone (below
 // group[experts] when contiguous, under each count when masked; the rest
 // were never summed into): a block a row of `n`.
-__global__ __launch_bounds__(128) void tc5_finalize_routed(float4* __restrict__ part,
+__global__ __launch_bounds__(128) void tc5_finalize_routed(const float4* __restrict__ part,
                                                            uint2* __restrict__ y,
                                                            const int* __restrict__ counts,
-                                                           int experts, int m_max, int n) {
+                                                           int experts, int m_max, int n,
+                                                           int splits, long long slab_quads) {
     const int row = static_cast<int>(blockIdx.x);
     if (m_max == 0 ? row >= __ldg(&counts[experts]) : row % m_max >= __ldg(&counts[row / m_max])) {
         return;
     }
     const size_t base = static_cast<size_t>(row) * (n / 4);
     for (int i = static_cast<int>(threadIdx.x); i < n / 4; i += blockDim.x) {
-        const float4 v = part[base + i];
-        part[base + i] = make_float4(0.f, 0.f, 0.f, 0.f);
+        float4 v = part[base + i];
+        for (int s = 1; s < splits; ++s) {
+            const float4 w = part[static_cast<long long>(s) * slab_quads + base + i];
+            v.x += w.x;
+            v.y += w.y;
+            v.z += w.z;
+            v.w += w.w;
+        }
         y[base + i] = make_uint2(pack_bf16x2(v.x, v.y), pack_bf16x2(v.z, v.w));
     }
 }

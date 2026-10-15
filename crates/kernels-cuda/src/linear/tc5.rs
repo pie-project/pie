@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use cudarc::driver::sys as dr;
-use cudarc::runtime::sys as rt;
 
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, refuse, symbol};
@@ -627,6 +626,7 @@ impl Epilogue {
             live: self.live_rows,
             in_scale: self.input_scales,
             raster: 8,
+            slab: 0,
         }
     }
 }
@@ -650,6 +650,7 @@ struct EpiArgs {
     live: u64,
     in_scale: u64,
     raster: i32,
+    slab: i64,
 }
 
 /// `y = epilogue(alpha * act . w^T)` for `[m, n, k]`, `n` the output's
@@ -1207,13 +1208,18 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let splits = steps.div_ceil(steps.div_ceil(splits));
     let int = |v: u32| i32::try_from(v).map_err(|_| refuse(OP, format!("{v} overflows an int")));
     let routed = group.mode != 0;
+    // Each split its own slab of y's shape, summed in split order by the
+    // finalize (or the tile's last split): the same bits every launch, where
+    // float atomics into one sum added in arrival order.
+    let slab = job.y_rows as usize * n as usize;
     let part = if splits > 1 {
-        let bytes = job.y_rows as usize * n as usize * 4;
-        let part = ctx.scratch_stream(OP, SPLIT_PARTIAL, bytes)?;
-        zero_once(ctx, part, bytes)?;
-        part as u64
+        ctx.scratch_stream(OP, SPLIT_PARTIAL, slab * 4 * splits as usize)? as u64
     } else {
         0
+    };
+    let epi_args = EpiArgs {
+        slab: i64::try_from(slab).unwrap_or(i64::MAX),
+        ..epi_args
     };
     let units = job.tiles * splits;
     let grid = ctas * units.min(sms / ctas).max(1);
@@ -1295,6 +1301,8 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
             group,
             job.y_rows,
             n,
+            splits,
+            slab / 4,
         );
     }
     let quads = job.y_rows * n / 4;
@@ -1305,6 +1313,8 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
             ArgValue::Ptr(part),
             ArgValue::Ptr(y),
             ArgValue::I32(int(quads)?),
+            ArgValue::I32(int(splits)?),
+            ArgValue::I64(i64::try_from(slab / 4).unwrap_or(i64::MAX)),
         ],
     )
 }
@@ -1318,6 +1328,8 @@ fn fire_routed(
     group: Group,
     rows: u32,
     n: u32,
+    splits: u32,
+    slab_quads: usize,
 ) -> Result<(), Error> {
     let int = |v: u32| i32::try_from(v).map_err(|_| refuse(OP, format!("{v} overflows an int")));
     ctx.fire(
@@ -1330,6 +1342,8 @@ fn fire_routed(
             ArgValue::I32(int(group.experts)?),
             ArgValue::I32(int(group.m_max)?),
             ArgValue::I32(int(n)?),
+            ArgValue::I32(int(splits)?),
+            ArgValue::I64(i64::try_from(slab_quads).unwrap_or(i64::MAX)),
         ],
     )
 }
@@ -1338,44 +1352,6 @@ fn fire_routed(
 /// same stream consumes it.
 const SPLIT_PARTIAL: &str = "linear.tc5.split_partial";
 
-/// The bytes from the start of each split-sum slab known to be zero.
-fn zeroed() -> std::sync::MutexGuard<'static, HashMap<usize, usize>> {
-    static ZEROED: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
-    ZEROED
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Slabs were freed: an address may come back holding anything.
-pub(crate) fn forget_zeroed() {
-    zeroed().clear();
-}
-
-/// Keeps the split sum's slab zero past `bytes`. Every finalize zeroes what
-/// it rounds, so a slab is cleared once, when first seen or first asked for
-/// more than before, and never again a launch.
-fn zero_once(ctx: &Ctx, part: *mut core::ffi::c_void, bytes: usize) -> Result<(), Error> {
-    let mut zeroed = zeroed();
-    let have = zeroed.entry(part.addr()).or_insert(0);
-    if bytes <= *have {
-        return Ok(());
-    }
-    // SAFETY: a slab of at least `bytes` this context owns, on its stream.
-    let code = unsafe {
-        rt::cudaMemsetAsync(
-            part.cast::<u8>().add(*have).cast(),
-            0,
-            bytes - *have,
-            ctx.stream().cast(),
-        )
-    };
-    if code != rt::cudaError::cudaSuccess {
-        return Err(refuse(OP, format!("cudaMemsetAsync answered {code:?}")));
-    }
-    *have = bytes;
-    Ok(())
-}
 
 /// An atom-layout scale tensor as TMA reads it: [row block][atom][128 words],
 /// boxes of `atoms` atoms by `row_blocks` row blocks, zero past either end.
