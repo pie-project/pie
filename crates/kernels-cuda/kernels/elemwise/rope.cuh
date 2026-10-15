@@ -1002,6 +1002,81 @@ __global__ void rope_partial_last_spread(
     }
 }
 
+// `rope_partial_last_spread` four pairs a thread: interleaved, a thread's
+// pairs are one 16-byte run of the tail; split halves, an 8-byte run of
+// each. The angles are the spread form's, worked out once a block into
+// shared memory, so the same values land. `rotary_dim % 8 == 0`,
+// `head_dim % 8 == 0`, `rotary_dim / 2 <= blockDim.x`.
+__global__ void rope_partial_last_vec(
+    bf16* __restrict__ q,
+    const i32* __restrict__ positions,
+    int num_q_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    bool inverse,
+    bool interleaved,
+    float yarn_factor,
+    float yarn_low_dim,
+    float yarn_high_dim,
+    int heads_per_block,
+    const u32* __restrict__ win)
+{
+    const int n = blockIdx.x;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int rope_half = rotary_dim / 2;
+    const int offset = head_dim - rotary_dim;
+    const int pos = positions[row];
+    extern __shared__ float2 cs_part[];
+    for (int d = threadIdx.x; d < rope_half; d += blockDim.x) {
+        float freq = powf(theta, -2.f * static_cast<float>(d) / static_cast<float>(rotary_dim));
+        if (yarn_factor > 1.f) {
+            freq = yarn_original_freq(freq, yarn_factor, yarn_low_dim, yarn_high_dim, d);
+        }
+        const float ang = (inverse ? -1.f : 1.f) * static_cast<float>(pos) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
+        cs_part[d] = make_float2(cos_v, sin_v);
+    }
+    __syncthreads();
+    const int per_head = rope_half / 4;
+    const int h0 = static_cast<int>(blockIdx.y) * heads_per_block;
+    const int h1 = min(h0 + heads_per_block, num_q_heads);
+    for (int t = threadIdx.x; t < (h1 - h0) * per_head; t += blockDim.x) {
+        const int head_idx = h0 + t / per_head;
+        const int c = t % per_head;
+        bf16* base = q + static_cast<long long>(row * num_q_heads + head_idx) * head_dim + offset;
+        if (interleaved) {
+            bf16 v[8];
+            *reinterpret_cast<uint4*>(v) = *reinterpret_cast<const uint4*>(base + 8 * c);
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const float2 cs = cs_part[4 * c + u];
+                const float a = bf16_to_f32(v[2 * u]);
+                const float b = bf16_to_f32(v[2 * u + 1]);
+                v[2 * u] = f32_to_bf16(a * cs.x - b * cs.y);
+                v[2 * u + 1] = f32_to_bf16(b * cs.x + a * cs.y);
+            }
+            *reinterpret_cast<uint4*>(base + 8 * c) = *reinterpret_cast<const uint4*>(v);
+        } else {
+            bf16 lo[4], hi[4];
+            *reinterpret_cast<uint2*>(lo) = *reinterpret_cast<const uint2*>(base + 4 * c);
+            *reinterpret_cast<uint2*>(hi) = *reinterpret_cast<const uint2*>(base + rope_half + 4 * c);
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const float2 cs = cs_part[4 * c + u];
+                const float a = bf16_to_f32(lo[u]);
+                const float b = bf16_to_f32(hi[u]);
+                lo[u] = f32_to_bf16(a * cs.x - b * cs.y);
+                hi[u] = f32_to_bf16(b * cs.x + a * cs.y);
+            }
+            *reinterpret_cast<uint2*>(base + 4 * c) = *reinterpret_cast<const uint2*>(lo);
+            *reinterpret_cast<uint2*>(base + rope_half + 4 * c) = *reinterpret_cast<const uint2*>(hi);
+        }
+    }
+}
+
 __global__ void rope_partial_last(
     bf16* __restrict__ q,
     bf16* __restrict__ k,

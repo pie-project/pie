@@ -557,6 +557,51 @@ __global__ void __launch_bounds__(256) rmsnorm_no_scale_warp(
             yr[w * 32 + lane + r * 256] = Elem<T>::from_f32(v[w][r] * inv_rms);
 }
 
+// `rmsnorm_no_scale` a warp a (row, head) unit over 16-byte runs: lane `l`
+// loads the head's runs `l`, `l + 32`, ... (eight elements each), so a
+// 512-wide head (DeepSeek-V4's q) is two loads a lane. Its sum folds in a
+// different order from the block form's, so it lands within rounding of it.
+template <class T, int RUNS>
+__global__ void __launch_bounds__(256) rmsnorm_no_scale_vec(
+    const T* __restrict__ x,
+    T* __restrict__ y,
+    int units,
+    float eps,
+    int heads,
+    const u32* __restrict__ win)
+{
+    constexpr int hidden = 256 * RUNS;
+    const int unit = static_cast<int>(blockIdx.x) * 8 + static_cast<int>(threadIdx.x >> 5);
+    if (unit >= units) return;
+    if (win != nullptr && unit / heads >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? unit + static_cast<int>(win[1]) * heads : unit;
+    const int lane = threadIdx.x & 31;
+    const T* xr = x + static_cast<long long>(plane_row) * hidden + lane * 8;
+    T* yr = y + static_cast<long long>(plane_row) * hidden + lane * 8;
+    T v[RUNS][8];
+#pragma unroll
+    for (int r = 0; r < RUNS; ++r)
+        *reinterpret_cast<uint4*>(v[r]) = *reinterpret_cast<const uint4*>(xr + r * 256);
+    float local = 0.f;
+#pragma unroll
+    for (int r = 0; r < RUNS; ++r)
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const float f = Elem<T>::to_f32(v[r][u]);
+            local = fmaf(f, f, local);
+        }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+    const float inv_rms = rsqrtf(local / static_cast<float>(hidden) + eps);
+#pragma unroll
+    for (int r = 0; r < RUNS; ++r) {
+        T out[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) out[u] = Elem<T>::from_f32(Elem<T>::to_f32(v[r][u]) * inv_rms);
+        *reinterpret_cast<uint4*>(yr + r * 256) = *reinterpret_cast<const uint4*>(out);
+    }
+}
+
 template <class T, int BLOCK = 256>
 __global__ void rmsnorm_gated(
     const T* __restrict__ x,

@@ -4,7 +4,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
 };
 use crate::tensor::{KvPool, Tensor};
 
@@ -299,6 +299,42 @@ pub fn partial_last(
     // tail), the angles worked out once a block rather than once a head and
     // pair: the same values land.
     let half = rotary_dim / 2;
+    // Four pairs a thread over 16- or 8-byte runs, a block as many heads as
+    // fill it, the angles the spread form's.
+    if ctx.tuning().rows_vec
+        && half > 0
+        && half <= ROTATE_BLOCK
+        && rotary_dim.is_multiple_of(8)
+        && head_dim.is_multiple_of(8)
+        && aligned16(q.ptr)
+    {
+        let heads_per_block = (ROTATE_BLOCK / (half / 4)).max(1);
+        return ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::elemwise::rope_partial_last_vec").apply(
+                Launch::grid(
+                    [q.rows, num_q_heads.div_ceil(heads_per_block), 1],
+                    [ROTATE_BLOCK, 1, 1],
+                )
+                .smem(half * 8),
+            ),
+            &[
+                q.arg(),
+                positions.arg(),
+                stated(OP, num_q_heads)?.arg(),
+                stated(OP, head_dim)?.arg(),
+                stated(OP, rotary_dim)?.arg(),
+                theta.arg(),
+                inverse.arg(),
+                interleaved.arg(),
+                factor.arg(),
+                low_dim.arg(),
+                high_dim.arg(),
+                stated(OP, heads_per_block)?.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     if half > 0 && half <= ROTATE_BLOCK {
         const HEADS: u32 = 8;
         let heads = num_q_heads;

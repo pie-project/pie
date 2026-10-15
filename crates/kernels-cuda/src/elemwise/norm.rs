@@ -259,6 +259,37 @@ pub fn rmsnorm_no_scale(
     )?;
     let launch = rows_per_head(OP, y.rows, y.width, head_dim)?;
     let heads = stated(OP, per_head_split(y.width, head_dim))?;
+    // A warp a head over 16-byte runs, where the head is whole 256-element
+    // runs (DeepSeek-V4's 512-wide q heads).
+    if ctx.tuning().rows_vec
+        && hidden % 256 == 0
+        && (1..=4).contains(&(hidden / 256))
+        && [x.ptr, y.ptr].iter().all(|&at| aligned16(at))
+    {
+        let units = y
+            .rows
+            .checked_mul(per_head_split(y.width, head_dim))
+            .ok_or_else(|| refuse(OP, format!("{} rows of heads overflow a grid", y.rows)))?;
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_no_scale_vec<{t}, {}>",
+                    hidden / 256
+                )),
+            )
+            .apply(Launch::grid([units.div_ceil(8), 1, 1], [BLOCK, 1, 1])),
+            &[
+                x.arg(),
+                y.arg(),
+                stated(OP, units)?.arg(),
+                eps.arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     // A warp a head, the block form's sums in its order, where the head is
     // whole 256-element runs.
     if ctx.tuning().hc_tile
