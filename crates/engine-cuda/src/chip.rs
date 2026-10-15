@@ -646,6 +646,7 @@ mod tests {
         );
         assert_eq!((b200.nvfp4_mma_from, b200.nvfp4_mma_until), (32, 8192));
         assert_eq!((b200.gemm_nvfp4_k128, b200.moe_w4a4_fused_from), (true, 1));
+        assert_eq!(b200.moe_w4a8_fused_from, 1);
     }
 
     #[test]

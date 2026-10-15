@@ -205,6 +205,7 @@ pub const SM100: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {
     mxfp4_cvt: true,
     gemm_nvfp4_k128: true,
     moe_w4a4_fused_from: 1,
+    moe_w4a8_fused_from: 1,
     nvfp4_mma_from: 32,
     nvfp4_mma_until: 8192,
     ..kernels_cuda::tuning::Tuning::DEFAULT
