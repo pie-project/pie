@@ -54,6 +54,10 @@ sdpa.merge_warp = true
 # 145).
 moe.mxfp4_mma_from  = 28
 moe.mxfp4_mma_until = 1024
+# ... and turn the codes into f16 with sm_100a's e2m1 converts, the
+# activations f16 once a CTA: gpt-oss-120b at 8 tokens, a layer's gate-up
+# 92 -> 74 us and down 54 -> 49; at 64 tokens 289 -> 224 and 160 -> 124.
+moe.mxfp4_cvt = true
 # The tcgen05 prefill FMHA (sm_100a): a causal 4096-token prefill at
 # Qwen3.8-27B's 256-wide, six-way-grouped head runs at about 900 TFLOPS
 # where FA2 runs at about 300.

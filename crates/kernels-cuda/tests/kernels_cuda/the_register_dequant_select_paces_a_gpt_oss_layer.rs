@@ -67,6 +67,13 @@ fn the_register_dequant_select_paces_a_gpt_oss_layer() {
         mxfp4_mma_from: 1,
         ..Tuning::DEFAULT
     });
+    let cvt = gpu.ctx().with_tuning(Tuning {
+        moe_tc5: true,
+        mxfp4_mma_until: 65_536,
+        mxfp4_mma_from: 1,
+        mxfp4_cvt: true,
+        ..Tuning::DEFAULT
+    });
     // Bytes each fire reads: the routed experts' codes and scales.
     let bytes_of = |routes: &[i32], n: usize, k: usize| {
         let mut hit = [false; EXPERTS];
@@ -74,9 +81,9 @@ fn the_register_dequant_select_paces_a_gpt_oss_layer() {
         hit.iter().filter(|&&h| h).count() as f64 * (n * k / 2 + n * k / 32) as f64
     };
     println!(
-        "| tokens | leg | registry default us | tcgen05 us | register-dequant us | GB/s (default / tcgen05 / register) |"
+        "| tokens | leg | registry default us | tcgen05 us | register-dequant us | e2m1 convert us | GB/s (default / tcgen05 / register / convert) |"
     );
-    println!("|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|");
     let counts: Vec<usize> = std::env::var("PIE_W4_TOKENS")
         .ok()
         .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
@@ -212,27 +219,31 @@ fn the_register_dequant_select_paces_a_gpt_oss_layer() {
             .map(|r| bytes_of(r, down_n, INTER))
             .sum::<f64>()
             / ROUTINGS as f64;
-        let (o, a, b) = (
+        let (o, a, b, v) = (
             time(&|i| up(&old, i)),
             time(&|i| up(&tc5, i)),
             time(&|i| up(&mma, i)),
+            time(&|i| up(&cvt, i)),
         );
         println!(
-            "| {tokens} | gate-up + GLU | {o:.1} | {a:.1} | {b:.1} | {:.0} / {:.0} / {:.0} |",
+            "| {tokens} | gate-up + GLU | {o:.1} | {a:.1} | {b:.1} | {v:.1} | {:.0} / {:.0} / {:.0} / {:.0} |",
             up_bytes / o * 1e-3,
             up_bytes / a * 1e-3,
-            up_bytes / b * 1e-3
+            up_bytes / b * 1e-3,
+            up_bytes / v * 1e-3
         );
-        let (o, a, b) = (
+        let (o, a, b, v) = (
             time(&|i| down(&old, i)),
             time(&|i| down(&tc5, i)),
             time(&|i| down(&mma, i)),
+            time(&|i| down(&cvt, i)),
         );
         println!(
-            "| {tokens} | down | {o:.1} | {a:.1} | {b:.1} | {:.0} / {:.0} / {:.0} |",
+            "| {tokens} | down | {o:.1} | {a:.1} | {b:.1} | {v:.1} | {:.0} / {:.0} / {:.0} / {:.0} |",
             down_bytes / o * 1e-3,
             down_bytes / a * 1e-3,
-            down_bytes / b * 1e-3
+            down_bytes / b * 1e-3,
+            down_bytes / v * 1e-3
         );
     }
 }

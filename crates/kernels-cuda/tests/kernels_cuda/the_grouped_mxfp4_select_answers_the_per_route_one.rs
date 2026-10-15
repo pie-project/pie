@@ -8,6 +8,7 @@ use kernels_cuda::linear::moe::{
 use kernels_cuda::linear::tc5::Glu;
 use kernels_cuda::tensor::Tensor;
 use kernels_cuda::tuning::Tuning;
+use std::cell::Cell;
 use std::time::Instant;
 
 const EXPERTS: usize = 8;
@@ -27,10 +28,48 @@ fn bytes(seed: u64, count: usize) -> Vec<u8> {
         .collect()
 }
 
-fn scale_bytes(seed: u64, count: usize) -> Vec<u8> {
+thread_local! {
+    /// Whether the banks this thread builds leave f16's range: one row in
+    /// 40 scaled 2^-27 .. 2^23 throughout.
+    static WIDE: Cell<bool> = const { Cell::new(false) };
+    /// Whether the activations this thread builds do: one in 97 at 2^16.
+    static BIG: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Block scales 2^-3 .. 2^3; with `WIDE`, a row in 40 (rows `groups`
+/// blocks long) all one scale far outside (a row's own scale, so its sums
+/// do not cancel past what bf16 holds).
+fn scale_bytes(seed: u64, count: usize, groups: usize) -> Vec<u8> {
+    let wide = WIDE.with(Cell::get);
+    let row_scale = bytes(seed ^ 0x77, count / groups);
     bytes(seed, count)
         .into_iter()
-        .map(|b| 124 + (b % 7))
+        .enumerate()
+        .map(|(i, b)| {
+            let row = row_scale[i / groups];
+            if wide && row % 40 == 3 {
+                100 + (row % 51)
+            } else {
+                124 + (b % 7)
+            }
+        })
+        .collect()
+}
+
+/// Activations in -0.5 .. 0.5 (with `BIG`, one in 97 at +-2^16).
+fn activations(seed: u64, count: usize) -> Vec<u16> {
+    let wide = BIG.with(Cell::get);
+    bytes(seed, count * 2)
+        .chunks(2)
+        .enumerate()
+        .map(|(i, p)| {
+            let v = (f32::from(p[0]) / 128.0 - 1.0) * 0.5;
+            to_bf16(if wide && i % 97 == 5 {
+                v.signum() * 65536.0
+            } else {
+                v
+            })
+        })
         .collect()
 }
 
@@ -57,11 +96,8 @@ fn check(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool, tuning
     let act_rows = if by_token { tokens } else { route_count };
 
     let codes = bytes(0x11 + n as u64, EXPERTS * n * k / 2);
-    let scales = scale_bytes(0x22 + k as u64, EXPERTS * n * groups);
-    let act: Vec<u16> = bytes(0x33, act_rows * k * 2)
-        .chunks(2)
-        .map(|p| to_bf16((f32::from(p[0]) / 128.0 - 1.0) * 0.5))
-        .collect();
+    let scales = scale_bytes(0x22 + k as u64, EXPERTS * n * groups, groups);
+    let act = activations(0x33, act_rows * k);
     let bias: Vec<u16> = bytes(0x44, EXPERTS * n)
         .into_iter()
         .map(|b| to_bf16((f32::from(b) / 128.0 - 1.0) * 120.0))
@@ -130,9 +166,50 @@ fn check(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool, tuning
             at = i;
         }
     }
+    // The host's sum, in f64, and the sum of its terms' magnitudes.
+    let host = |at: usize| {
+        const E2M1: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        let (route, col) = (at / n, at % n);
+        let e = routes[route] as usize;
+        let row = if by_token { route / TOP_K } else { route };
+        let b = if biased {
+            f64::from(from_bf16(bias[e * n + col]))
+        } else {
+            0.0
+        };
+        let (mut sum, mut mag) = (b, b.abs());
+        for i in 0..k {
+            let byte = codes[(e * n + col) * k / 2 + i / 2];
+            let q = if i % 2 == 0 { byte & 15 } else { byte >> 4 };
+            let v = E2M1[usize::from(q & 7)] * if q & 8 != 0 { -1.0 } else { 1.0 };
+            let s = f64::from(scales[(e * n + col) * groups + i / BLOCK]);
+            let term = v * (s - 127.0).exp2() * f64::from(from_bf16(act[row * k + i]));
+            sum += term;
+            mag += term.abs();
+        }
+        (sum, mag)
+    };
+    // Activations past f16's range sum terms of 2^16 that cancel past
+    // what any f32 accumulation keeps: those fires answer the host to a
+    // part in 2^10 of their terms' magnitudes instead.
+    if BIG.with(Cell::get) {
+        for (i, g) in grouped.iter().enumerate() {
+            let (want, mag) = host(i);
+            let have = f64::from(from_bf16(*g));
+            assert!(
+                (have - want).abs() <= want.abs() / 256.0 + mag / 1024.0,
+                "route {} column {}: {have} where the host says {want} (terms {mag})",
+                i / n,
+                i % n,
+            );
+        }
+        return;
+    }
+    let host = host(at).0;
     assert!(
         close(from_bf16(grouped[at]), from_bf16(per_route[at])),
-        "route {} column {} of a {} {} fire: grouped {} where the per-route select says {}",
+        "route {} column {} of a {} {} fire: grouped {} where the per-route select says {} \
+         (the host {host})",
         at / n,
         at % n,
         if by_token { "token-read" } else { "route-read" },
@@ -155,41 +232,69 @@ fn the_grouped_mxfp4_select_answers_the_per_route_one_every_case() {
     the_fp32_form_agrees_on_a_ragged_rectangle();
     the_tcgen05_form_agrees_at_gpt_oss_widths();
     the_register_dequant_form_agrees();
+    the_e2m1_convert_form_agrees();
 }
 
 /// The register-dequant MMA kernel: one, two and four 8-route blocks a
 /// slice, ragged rows, a K that ends mid-chunk, and scales past 2^1.
 fn the_register_dequant_form_agrees() {
-    let mma = Tuning {
-        mxfp4_mma_until: 65_536,
-        mxfp4_mma_from: 1,
-        ..Tuning::DEFAULT
-    };
+    register_dequant_cases(MMA);
+}
+
+const MMA: Tuning = Tuning {
+    mxfp4_mma_until: 65_536,
+    mxfp4_mma_from: 1,
+    ..Tuning::DEFAULT
+};
+
+fn register_dequant_cases(mma: Tuning) {
     check(1, 200, 2880, true, true, mma);
     check(3, 576, 2880, false, true, mma);
     check(12, 384, 2880, true, false, mma);
     check(40, 576, 2880, true, true, mma);
     check(100, 384, 2880, false, true, mma);
     check(64, 256, 256, false, false, mma);
-    check_glu(1, 192, 2880, true, true);
-    check_glu(16, 2880, 2880, true, true);
-    check_glu(40, 160, 2880, false, false);
+    check(5, 128, 4096, true, false, mma);
+    check_glu(1, 192, 2880, true, true, mma);
+    check_glu(16, 2880, 2880, true, true, mma);
+    check_glu(40, 160, 2880, false, false, mma);
+}
+
+/// The register-dequant kernel on the e2m1 converts (where the device has
+/// them): the same cases, then again with scales past f16's range, which
+/// take the bf16 arithmetic, and activations past it, which walk K again
+/// on it.
+fn the_e2m1_convert_form_agrees() {
+    if !kernels_cuda::linear::tc5::supported() {
+        return;
+    }
+    let cvt = Tuning {
+        mxfp4_cvt: true,
+        ..MMA
+    };
+    register_dequant_cases(cvt);
+    WIDE.with(|w| w.set(true));
+    check(3, 576, 2880, false, true, cvt);
+    check(40, 384, 2880, true, false, cvt);
+    check_glu(1, 192, 2880, true, true, cvt);
+    WIDE.with(|w| w.set(false));
+    BIG.with(|w| w.set(true));
+    check(3, 576, 2880, false, true, cvt);
+    check(12, 384, 2880, true, false, cvt);
+    BIG.with(|w| w.set(false));
 }
 
 /// The register-dequant kernel's GLU: the gate rows' and the up rows'
 /// products (the per-route select's) through gpt-oss's clamped GLU.
-fn check_glu(tokens: usize, inter: usize, k: usize, by_token: bool, biased: bool) {
+fn check_glu(tokens: usize, inter: usize, k: usize, by_token: bool, biased: bool, mma: Tuning) {
     let n = 2 * inter;
     let groups = k / BLOCK;
     let routes = routes_of(tokens);
     let route_count = routes.len();
     let act_rows = if by_token { tokens } else { route_count };
     let codes = bytes(0x51 + n as u64, EXPERTS * n * k / 2);
-    let scales = scale_bytes(0x52 + k as u64, EXPERTS * n * groups);
-    let act: Vec<u16> = bytes(0x53, act_rows * k * 2)
-        .chunks(2)
-        .map(|p| to_bf16((f32::from(p[0]) / 128.0 - 1.0) * 0.5))
-        .collect();
+    let scales = scale_bytes(0x52 + k as u64, EXPERTS * n * groups, groups);
+    let act = activations(0x53, act_rows * k);
     let bias: Vec<u16> = bytes(0x54, EXPERTS * n)
         .into_iter()
         .map(|b| to_bf16((f32::from(b) / 128.0 - 1.0) * 2.0))
@@ -216,11 +321,7 @@ fn check_glu(tokens: usize, inter: usize, k: usize, by_token: bool, biased: bool
         mxfp4_grouped: false,
         ..Tuning::DEFAULT
     });
-    let mma = gpu.ctx().with_tuning(Tuning {
-        mxfp4_mma_until: 65_536,
-        mxfp4_mma_from: 1,
-        ..Tuning::DEFAULT
-    });
+    let mma = gpu.ctx().with_tuning(mma);
     let mut full = Tensor::new(full_at, route_count as u32, n as u32, Dtype::Bf16);
     let bias_of = biased.then_some(bias_t);
     match bias_of {
@@ -283,7 +384,7 @@ fn check_glu(tokens: usize, inter: usize, k: usize, by_token: bool, biased: bool
     // answers what the per-route select does from the same GLU.
     let down_n = 160;
     let down_codes = bytes(0x55, EXPERTS * down_n * inter / 2);
-    let down_scales = scale_bytes(0x56, EXPERTS * down_n * inter / BLOCK);
+    let down_scales = scale_bytes(0x56, EXPERTS * down_n * inter / BLOCK, inter / BLOCK);
     let dc = Tensor::new(
         gpu.up(&down_codes),
         EXPERTS as u32,

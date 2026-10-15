@@ -87,6 +87,13 @@ pub struct GemmBiasEpilogue;
 #[decision(id = "kernel.moe.mxfp4_mma_from", constant(range(1..=65_536)), default = 64, tune = search)]
 pub struct MoeMxfp4MmaFrom(pub u32);
 
+/// Whether the register-dequant mxfp4 select turns its codes into f16 with
+/// the e2m1 converts of the arch-specific Blackwells (`linear/moe_w4_cvt.cuh`)
+/// rather than bf16 by integer ops. Off but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_cvt", flag, default = false, tune = search)]
+pub struct MoeMxfp4Cvt;
+
 /// The fewest rows a dense gate-up projection lands its GLU from the
 /// tcgen05 GEMM's epilogue at; fewer keep the skinny kernel or the GEMM and
 /// the GLU apart. 65536 (never) but where a chip's profile says (B200's).
@@ -378,6 +385,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
+        .add::<MoeMxfp4Cvt>()
         .add::<GemmBiasEpilogue>()
         .add::<GemmNvfp4K128>()
         .add::<MoeW4a4FusedFrom>()
@@ -437,6 +445,7 @@ pub struct Tuning {
     pub merge_warp: bool,
     pub mxfp4_mma_until: u32,
     pub mxfp4_mma_from: u32,
+    pub mxfp4_cvt: bool,
     pub gemm_bias_epilogue: bool,
     pub gemm_nvfp4_k128: bool,
     pub moe_w4a4_fused_from: u32,
@@ -494,6 +503,7 @@ impl Tuning {
         merge_warp: false,
         mxfp4_mma_until: 0,
         mxfp4_mma_from: 64,
+        mxfp4_cvt: false,
         gemm_bias_epilogue: false,
         gemm_nvfp4_k128: false,
         moe_w4a4_fused_from: 65_536,
@@ -551,6 +561,7 @@ impl Tuning {
             merge_warp: profile.on::<SdpaMergeWarp>(&Anywhere),
             mxfp4_mma_until: profile.get::<MoeMxfp4MmaUntil>().0,
             mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,
+            mxfp4_cvt: profile.on::<MoeMxfp4Cvt>(&Anywhere),
             gemm_bias_epilogue: profile.on::<GemmBiasEpilogue>(&Anywhere),
             gemm_nvfp4_k128: profile.on::<GemmNvfp4K128>(&Anywhere),
             moe_w4a4_fused_from: profile.get::<MoeW4a4FusedFrom>().0,

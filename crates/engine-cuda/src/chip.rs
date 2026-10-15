@@ -396,6 +396,7 @@ mod tests {
                 assert_eq!(tuning.gemm_bias_epilogue, b200, "{gpu}");
                 assert_eq!(tuning.decode_xqa, b200, "{gpu}");
                 assert_eq!(tuning.pool_mma, major == 10 && minor == 0, "{gpu}");
+                assert_eq!(tuning.mxfp4_cvt, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
                     tuning.decode_xqa_from_64,
                     if b200 { 16 } else { 0 },
@@ -435,6 +436,7 @@ mod tests {
                         decode_xqa_whole_window: 0,
                         decode_xqa_cluster: 0,
                         pool_mma: false,
+                        mxfp4_cvt: false,
                         ..tuning
                     },
                     defaults,

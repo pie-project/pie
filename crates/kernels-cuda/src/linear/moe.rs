@@ -1559,22 +1559,44 @@ fn select_mxfp4_mma(
             Share::Take
         },
     )?;
-    // One chunk in flight a warp: its 93 registers seat five CTAs an SM, and
-    // the warps between them hide the loads better than a deeper ring in
-    // fewer warps (gpt-oss at 64 tokens, gate-up 308 -> 305 us, down 172 ->
-    // 164).
-    ctx.fire(
-        op,
+    let grid = [work_cap, y.width.div_ceil(cols), 1];
+    // The e2m1 converts exist on the arch-specific Blackwells alone, the
+    // ones that run tcgen05. Two chunks in flight a warp and a window of 8
+    // chunks of one 8-route block (32 KiB for the two): four CTAs an SM at
+    // one block, the registers' bound (gpt-oss at 8 tokens, gate-up 74 us
+    // and down 49 against 92 and 54 on the bf16 path; a third chunk, or
+    // five CTAs on fewer registers, no faster).
+    let fire = if ctx.tuning().mxfp4_cvt && crate::linear::tc5::supported() {
+        const DEPTH: u32 = 2;
+        let win = 8 / nb;
+        let blocks = match nb {
+            1 => 4,
+            2 => 3,
+            _ => 2,
+        };
+        Fire::at(
+            "linear/moe_w4_cvt.cuh",
+            symbol(&format!(
+                "::pie::linear::moe_select_mxfp4_cvt<{nb}, {code}, {DEPTH}, {win}, {blocks}>"
+            )),
+        )
+        .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(nb * win * 4096))
+    } else {
         Fire::at(
             "linear/moe_w4.cuh",
             symbol(&format!(
                 "::pie::linear::moe_select_mxfp4_mma<{nb}, 1, {code}>"
             )),
         )
-        .apply(Launch::grid(
-            [work_cap, y.width.div_ceil(cols), 1],
-            [THREADS, 1, 1],
-        )),
+        // One chunk in flight a warp: its 93 registers seat five CTAs an SM,
+        // and the warps between them hide the loads better than a deeper
+        // ring in fewer warps (gpt-oss at 64 tokens, gate-up 308 -> 305 us,
+        // down 172 -> 164).
+        .apply(Launch::grid(grid, [THREADS, 1, 1]))
+    };
+    ctx.fire(
+        op,
+        fire,
         &[
             x.arg(),
             ArgValue::Ptr(order),
