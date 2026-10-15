@@ -29,4 +29,5 @@ DEPLOYMENTS = [
     deployment("glm53-mini", weights = BF, kv = BF),
     deployment("glm53-mini", weights = [BF, U4], kv = BF),
     deployment("glm53-l7", weights = [BF, U4], kv = BF),
+    deployment("glm53-l7", weights = BF, kv = BF),
 ]
