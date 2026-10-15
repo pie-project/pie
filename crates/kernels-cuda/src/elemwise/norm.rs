@@ -515,7 +515,13 @@ pub fn residual_add_rmsnorm(
         && [x.ptr, y.ptr, weight.ptr, out.ptr]
             .iter()
             .all(|&at| aligned16(at));
-    let (entrypoint, block) = if vectors {
+    let per = (y.width / VEC_WIDTH).div_ceil(BLOCK);
+    let (entrypoint, block) = if vectors && ctx.tuning().rows_vec && (1..=4).contains(&per) {
+        (
+            format!("::pie::elemwise::residual_add_rmsnorm_reg<{per}, {plus}>"),
+            BLOCK,
+        )
+    } else if vectors {
         let block = (y.width / VEC_WIDTH).clamp(WARP, BLOCK).next_power_of_two();
         (
             format!("::pie::elemwise::residual_add_rmsnorm_vec8<{block}, {plus}>"),

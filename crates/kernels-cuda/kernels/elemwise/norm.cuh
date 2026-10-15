@@ -390,6 +390,90 @@ __global__ void residual_add_rmsnorm_vec8(
     }
 }
 
+// residual_add_rmsnorm_vec8 in one pass: a thread keeps its PER vectors of
+// the summed row (and its weight vectors) in registers across the block's
+// reduction, all its loads issued up front, so the normed row is written
+// without reading the stream back. The sums run in the same order, so it
+// lands the same bits.
+template <int PER, bool WEIGHT_PLUS_ONE>
+__global__ void __launch_bounds__(256) residual_add_rmsnorm_reg(
+    const bf16* __restrict__ x,
+    bf16* __restrict__ y,
+    const bf16* __restrict__ weight,
+    bf16* __restrict__ out,
+    int hidden,
+    float eps,
+    const u32* __restrict__ win)
+{
+    constexpr int BLOCK = 256;
+    const int row = blockIdx.x;
+    if (win != nullptr && row >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
+    const int tid = threadIdx.x;
+    const int nvec = hidden / 8;
+    const long long base = static_cast<long long>(plane_row) * hidden;
+
+    const uint4* xr = reinterpret_cast<const uint4*>(x + base);
+    uint4* yr = reinterpret_cast<uint4*>(y + base);
+    uint4* outr = reinterpret_cast<uint4*>(out + base);
+    const uint4* wr = reinterpret_cast<const uint4*>(weight);
+
+    uint4 yv[PER], xv[PER], wv[PER];
+    #pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int i = tid + p * BLOCK;
+        if (i < nvec) {
+            yv[p] = yr[i];
+            xv[p] = xr[i];
+            wv[p] = wr[i];
+        }
+    }
+    float local = 0.f;
+    #pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int i = tid + p * BLOCK;
+        if (i < nvec) {
+            bf16x2* yh = reinterpret_cast<bf16x2*>(&yv[p]);
+            const bf16x2* xh = reinterpret_cast<const bf16x2*>(&xv[p]);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 a = bf16x2_to_f32(yh[j]);
+                const float2 b = bf16x2_to_f32(xh[j]);
+                yh[j] = f32_to_bf16x2(a.x + b.x, a.y + b.y);
+                const float2 f = bf16x2_to_f32(yh[j]);
+                local += f.x * f.x + f.y * f.y;
+            }
+            yr[i] = yv[p];
+        }
+    }
+
+    __shared__ float buf[BLOCK];
+    const float buf_sum = block_reduce_sum_fast<BLOCK>(local, buf);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
+
+    #pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int i = tid + p * BLOCK;
+        if (i < nvec) {
+            uint4 ov;
+            const bf16x2* yh = reinterpret_cast<const bf16x2*>(&yv[p]);
+            const bf16x2* wh = reinterpret_cast<const bf16x2*>(&wv[p]);
+            bf16x2* oh = reinterpret_cast<bf16x2*>(&ov);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 v = bf16x2_to_f32(yh[j]);
+                float2 w = bf16x2_to_f32(wh[j]);
+                if constexpr (WEIGHT_PLUS_ONE) {
+                    w.x += 1.f;
+                    w.y += 1.f;
+                }
+                oh[j] = f32_to_bf16x2(v.x * inv_rms * w.x, v.y * inv_rms * w.y);
+            }
+            outr[i] = ov;
+        }
+    }
+}
+
 template <class T, int BLOCK = 256>
 __global__ void rmsnorm_no_scale(
     const T* __restrict__ x,

@@ -4,9 +4,9 @@ use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::elemwise::norm;
 use kernels_cuda::tensor::Tensor;
+use kernels_cuda::tuning::Tuning;
 
-fn check(window: Option<(u32, u32, u32)>) {
-    let hidden = 1024usize;
+fn check(window: Option<(u32, u32, u32)>, hidden: usize, one_pass: bool) {
     let (rows, live, base) = window.unwrap_or((64, 64, 0));
     let planes = (base + rows) as usize;
     let mut lcg = Lcg::seeded(0x7e5);
@@ -21,7 +21,10 @@ fn check(window: Option<(u32, u32, u32)>) {
     let y_fused = gpu.up(&y_raw);
     let out_ref = gpu.zeros(planes * hidden * 2);
     let out_fused = gpu.zeros(planes * hidden * 2);
-    let ctx = gpu.ctx();
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        rows_vec: one_pass,
+        ..Tuning::DEFAULT
+    });
     let x = Tensor::new(x_at, planes as u32, hidden as u32, Dtype::Bf16);
     let w = Tensor::new(w_at, hidden as u32, 1, Dtype::Bf16);
     let tensor = |at: u64| Tensor::new(at, planes as u32, hidden as u32, Dtype::Bf16);
@@ -85,10 +88,18 @@ fn the_fused_residual_norm_lands_what_the_two_launches_land_every_case() {
     the_pair_retires_a_buckets_padded_rows_off_the_staged_window();
 }
 
+/// Both forms: the two-pass block a row, and the one-pass form holding its
+/// vectors in registers (one to three a thread at these widths).
 fn the_pair_lands_the_two_launches_bits() {
-    check(None);
+    for one_pass in [false, true] {
+        for hidden in [1024, 2048, 5120] {
+            check(None, hidden, one_pass);
+        }
+    }
 }
 
 fn the_pair_retires_a_buckets_padded_rows_off_the_staged_window() {
-    check(Some((4, 2, 1)));
+    for one_pass in [false, true] {
+        check(Some((4, 2, 1)), 5120, one_pass);
+    }
 }
