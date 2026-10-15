@@ -1,6 +1,7 @@
 # MiMo-V2.6: Flash (311B) and Pro (1.02T), each with its miniature: Flash's
 # first six layers, Pro's first three and its second full-attention layer,
-# eight experts each.
+# eight experts each; and Flash's first six layers at full width, every
+# expert kept, for a per-layer reading against other engines.
 
 MIMO = template("mimo")
 TOKENIZER = tokenizer(markers = [["<|im_end|>", "<|endoftext|>", "<think>", "</think>"]])
@@ -11,6 +12,7 @@ def mimo(id, layers, **kwargs):
 MODELS = [
     mimo("mimo26-flash", 48),
     mimo("mimo26-flash-mini", 6, mini = True),
+    mimo("mimo26-flash-l6", 6, mini = True),
     mimo("mimo26-pro", 70),
     mimo("mimo26-pro-mini", 4, mini = True),
 ]
@@ -21,6 +23,8 @@ FP4 = dtype.mxfp4
 DEPLOYMENTS = [
     deployment("mimo26-flash", weights = [BF, FP4], kv = BF),
     deployment("mimo26-flash-mini", weights = [BF, FP4], kv = BF),
+    deployment("mimo26-flash-l6", weights = [BF, FP4], kv = BF),
+    deployment("mimo26-flash-l6", weights = [BF, dtype.mxfp4a8], kv = BF),
     deployment("mimo26-pro", weights = [BF, FP4], kv = BF),
     deployment("mimo26-pro-mini", weights = [BF, FP4], kv = BF),
 ]

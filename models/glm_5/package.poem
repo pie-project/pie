@@ -1,8 +1,9 @@
 # GLM-5: a mixture of experts behind multi-head latent attention, its keys
 # chosen per query by a lightning indexer; GLM-5.3, whose indexers rank on
 # one layer in four and lend the layers between their selection, with its
-# multi-token draft head or without, and its seven-layer, eight-expert
-# miniature.
+# multi-token draft head or without, its seven-layer, eight-expert
+# miniature, and those seven layers with every expert, for a per-layer
+# reading against other engines.
 
 STOP = ["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"]
 CHATML = template("chatml", thinking = True, tools = True, stop = STOP)
@@ -15,6 +16,7 @@ MODELS = [
     model("glm5-a12b", template = CHATML, tokenizer = TOKENIZER, arch = "glm_moe_dsa", layers = 46, vocab = 151552),
     model("glm53", template = GLM, tokenizer = GLM_TOKENIZER, drafters = ["mtp"], arch = "glm_moe_dsa", layers = 78, vocab = 154880),
     model("glm53-mini", mini = True, template = GLM, tokenizer = GLM_TOKENIZER, arch = "glm_moe_dsa", layers = 7, vocab = 154880),
+    model("glm53-l7", mini = True, template = GLM, tokenizer = GLM_TOKENIZER, arch = "glm_moe_dsa", layers = 7, vocab = 154880),
 ]
 
 BF = dtype.bf16
@@ -26,4 +28,5 @@ DEPLOYMENTS = [
     deployment("glm53", weights = [BF, U4, U4], kv = BF, drafter = "mtp"),
     deployment("glm53-mini", weights = BF, kv = BF),
     deployment("glm53-mini", weights = [BF, U4], kv = BF),
+    deployment("glm53-l7", weights = [BF, U4], kv = BF),
 ]

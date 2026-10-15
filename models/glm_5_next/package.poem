@@ -1,5 +1,6 @@
 # GLM-5.3-Flash, with its vision tower and multi-token draft head or
-# without, and its eight-layer, 32-expert miniature.
+# without, its eight-layer, 32-expert miniature, and those eight layers with
+# every expert, for a per-layer reading against other engines.
 
 GLM = template("glm")
 TOKENIZER = tokenizer(
@@ -17,11 +18,13 @@ MODELS = [
         arch = "glm5_next", layers = 45, vocab = 154880,
     ),
     model("glm53-flash-mini", mini = True, template = GLM, tokenizer = TOKENIZER, arch = "glm5_next", layers = 8, vocab = 154880),
+    model("glm53-flash-l8", mini = True, template = GLM, tokenizer = TOKENIZER, arch = "glm5_next", layers = 8, vocab = 154880),
 ]
 
 DEPLOYMENTS = [
     deployment("glm53-flash", weights = [dtype.u8g64, dtype.u2g64, dtype.u4g64], kv = dtype.bf16, drafter = "mtp"),
     deployment("glm53-flash-mini", weights = [dtype.u4g64, dtype.u4g64], kv = dtype.bf16),
+    deployment("glm53-flash-l8", weights = [dtype.u8g64, dtype.u2g64], kv = dtype.bf16),
     deployment("glm53-flash", weights = [dtype.u8g64, dtype.u2g64], kv = dtype.bf16),
     deployment(
         "glm53-flash",

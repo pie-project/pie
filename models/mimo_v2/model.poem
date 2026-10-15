@@ -49,6 +49,8 @@ def pro(layers = 70, full = [0, 7, 15, 23, 31, 39, 47, 55, 62, 69], experts = 38
 DIMS = {
     "mimo26-flash": flash(),
     "mimo26-flash-mini": flash(layers = 6, full = [0, 5], experts = 8),
+    # the release's first six layers at full width, every expert kept
+    "mimo26-flash-l6": flash(layers = 6, full = [0, 5]),
     "mimo26-pro": pro(),
     # layers 0, 1, 2 and 7 of the release
     "mimo26-pro-mini": pro(layers = 4, full = [0, 3], experts = 8),
