@@ -410,6 +410,11 @@ mod tests {
                 assert_eq!(tuning.pool_mma, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(tuning.mxfp4_cvt, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
+                    tuning.mxfp4_a8_until,
+                    if major == 10 && minor == 0 { 48 } else { 0 },
+                    "{gpu}"
+                );
+                assert_eq!(
                     tuning.decode_xqa_from_64,
                     if b200 { 16 } else { 0 },
                     "{gpu}"
@@ -451,6 +456,7 @@ mod tests {
                         decode_xqa_cluster: 0,
                         pool_mma: false,
                         mxfp4_cvt: false,
+                        mxfp4_a8_until: 0,
                         ..tuning
                     },
                     defaults,

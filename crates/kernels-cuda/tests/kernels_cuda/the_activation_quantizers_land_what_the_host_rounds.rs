@@ -510,6 +510,25 @@ fn the_activation_quantizers_land_what_the_host_rounds_every_case() {
         [16, 6, 4096, 2048],
         None,
     );
+    // The same products read back to bf16 on the e2m1-convert
+    // register-dequant kernel, as a decode-wide W4A8 select runs.
+    for (tokens, by_token, live) in [(8, true, None), (5, false, None), (40, true, Some(17))] {
+        routed_select_cvt(tokens, by_token, [8, 3, 256, 512], live);
+    }
+    routed_select_cvt(8, true, [16, 6, 2048, 4096], None);
+    routed_select_cvt(8, false, [16, 6, 4096, 2048], None);
+}
+
+thread_local! {
+    static CVT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`routed_select_at`] (e4m3 in 128s) with the activations read back and
+/// the bank's atoms read by `moe::select_mxfp4_atoms`.
+fn routed_select_cvt(tokens: usize, by_token: bool, dims: [usize; 4], live: Option<usize>) {
+    CVT.with(|c| c.set(true));
+    routed_select_at(Format::E4m3 { gran: 128 }, tokens, by_token, dims, live);
+    CVT.with(|c| c.set(false));
 }
 
 /// A routed bank on the grouped tcgen05 GEMM, masked (few tokens) or
@@ -605,33 +624,61 @@ fn routed_select_at(
         let window = gpu.up(&[l as u32, 0, 0, 0]);
         ctx.arm_stage(window);
     }
-    select(
-        &ctx,
-        OP,
-        fmt,
-        x,
-        route_t,
-        globals,
-        Bank {
-            codes: codes_at,
-            atoms: atoms_at,
-            experts: experts as u32,
-            n: n as u32,
-            k: k as u32,
-            elem: Elem::E2m1,
-            gran: gran as u32,
-            alpha_e: if nvfp4 { alpha_at } else { 0 },
-            // The select lays the product scales with the routes.
-            alpha_from: nvfp4.then_some(AlphaFrom {
-                input_scales: is_at,
-                tensor_scales: ts_at,
-                rows: n as u32,
-            }),
-        },
-        &mut y,
-    )
-    .expect("the routed product fires");
+    let back_at = gpu.zeros(act_rows * k * 2);
+    let cvt_ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+        mxfp4_mma_from: 1,
+        mxfp4_mma_until: 65_536,
+        mxfp4_cvt: true,
+        mxfp4_a8_until: 65_536,
+        ..kernels_cuda::tuning::Tuning::DEFAULT
+    });
+    if let Some(l) = live {
+        let window = gpu.up(&[l as u32, 0, 0, 0]);
+        cvt_ctx.arm_stage(window);
+    }
+    if CVT.with(std::cell::Cell::get) {
+        let back = read_back(&cvt_ctx, OP, fmt, Source::rows(x, None), back_at)
+            .expect("the read-back fires");
+        let taken = kernels_cuda::linear::moe::select_mxfp4_atoms(
+            &cvt_ctx,
+            back,
+            Tensor::new(codes_at, experts as u32, (n * k / 2) as u32, Dtype::U8),
+            atoms_at,
+            route_t,
+            &mut y,
+        )
+        .expect("the e2m1-convert select fires");
+        assert!(taken, "the e2m1-convert select takes {count} routes");
+    } else {
+        select(
+            &ctx,
+            OP,
+            fmt,
+            x,
+            route_t,
+            globals,
+            Bank {
+                codes: codes_at,
+                atoms: atoms_at,
+                experts: experts as u32,
+                n: n as u32,
+                k: k as u32,
+                elem: Elem::E2m1,
+                gran: gran as u32,
+                alpha_e: if nvfp4 { alpha_at } else { 0 },
+                // The select lays the product scales with the routes.
+                alpha_from: nvfp4.then_some(AlphaFrom {
+                    input_scales: is_at,
+                    tensor_scales: ts_at,
+                    rows: n as u32,
+                }),
+            },
+            &mut y,
+        )
+        .expect("the routed product fires");
+    }
     ctx.disarm_stage();
+    cvt_ctx.disarm_stage();
     let div = if by_token { top_k } else { 1 };
     let live_t = Tensor::new(
         routes_at,

@@ -106,6 +106,15 @@ pub struct MoeMxfp4MmaFrom(pub u32);
 #[decision(id = "kernel.moe.mxfp4_cvt", flag, default = false, tune = search)]
 pub struct MoeMxfp4Cvt;
 
+/// The most routes a W4A8 select (an MXFP4 bank against e4m3
+/// activations) reads its activations back to bf16 for and runs on the
+/// e2m1-convert register-dequant kernel (`kernel.moe.mxfp4_cvt`), from
+/// `kernel.moe.mxfp4_mma_from`; wider ones, and all where 0, keep the
+/// grouped tcgen05 GEMM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_a8_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMxfp4A8Until(pub u32);
+
 /// The fewest rows a dense gate-up projection lands its GLU from the
 /// tcgen05 GEMM's epilogue at; fewer keep the skinny kernel or the GEMM and
 /// the GLU apart. 65536 (never) but where a chip's profile says (B200's).
@@ -406,6 +415,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
         .add::<MoeMxfp4Cvt>()
+        .add::<MoeMxfp4A8Until>()
         .add::<GemmBiasEpilogue>()
         .add::<GemmNvfp4K128>()
         .add::<MoeW4a4FusedFrom>()
@@ -469,6 +479,7 @@ pub struct Tuning {
     pub mxfp4_mma_until: u32,
     pub mxfp4_mma_from: u32,
     pub mxfp4_cvt: bool,
+    pub mxfp4_a8_until: u32,
     pub gemm_bias_epilogue: bool,
     pub gemm_nvfp4_k128: bool,
     pub moe_w4a4_fused_from: u32,
@@ -530,6 +541,7 @@ impl Tuning {
         mxfp4_mma_until: 0,
         mxfp4_mma_from: 64,
         mxfp4_cvt: false,
+        mxfp4_a8_until: 0,
         gemm_bias_epilogue: false,
         gemm_nvfp4_k128: false,
         moe_w4a4_fused_from: 65_536,
@@ -591,6 +603,7 @@ impl Tuning {
             mxfp4_mma_until: profile.get::<MoeMxfp4MmaUntil>().0,
             mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,
             mxfp4_cvt: profile.on::<MoeMxfp4Cvt>(&Anywhere),
+            mxfp4_a8_until: profile.get::<MoeMxfp4A8Until>().0,
             gemm_bias_epilogue: profile.on::<GemmBiasEpilogue>(&Anywhere),
             gemm_nvfp4_k128: profile.on::<GemmNvfp4K128>(&Anywhere),
             moe_w4a4_fused_from: profile.get::<MoeW4a4FusedFrom>().0,

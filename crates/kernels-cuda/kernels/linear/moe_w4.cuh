@@ -221,7 +221,9 @@ __device__ __forceinline__ int w4_block_scan(int v, int* warp_sums, int* total) 
 
 /// `moe_route_order`'s product (routes sorted by expert, each expert's
 /// offset, the work list of (expert, slice) items in expert order) with the
-/// two serial walks over the experts done as block scans.
+/// two serial walks over the experts done as block scans; `offsets` holds
+/// `num_experts + 3`: the experts' starts and the dropped routes' (those
+/// naming no expert), the work items' count, and the live routes' count.
 __global__ void moe_route_order_scan(
     const i32* __restrict__ routes,
     i32* __restrict__ order,
@@ -281,7 +283,11 @@ __global__ void moe_route_order_scan(
                 if (item_at < work_cap) work[item_at] = e * 65536 + g;
         }
     }
-    if (tid == 0) offsets[num_experts + 1] = min(items_total, work_cap);
+    if (tid == 0) {
+        offsets[num_experts + 1] = min(items_total, work_cap);
+        // The dropped routes' bucket ends at the live routes' count.
+        offsets[num_experts + 2] = live;
+    }
     __syncthreads();
     for (int r = tid; r < live; r += threads) {
         int e = routes[base + r];

@@ -60,6 +60,12 @@ moe.mxfp4_mma_until = 1024
 # activations f16 once a CTA: gpt-oss-120b at 8 tokens, a layer's gate-up
 # 92 -> 74 us and down 54 -> 49; at 64 tokens 289 -> 224 and 160 -> 124.
 moe.mxfp4_cvt = true
+# DeepSeek-V4's W4A8 selects (e4m3 activations) read their activations back
+# to bf16 and take the same kernel up to 48 routes (8 tokens of 6): a decode
+# step at 8 requests 24.85 -> 22.36 ms. Wider fires lose end to end though
+# the select alone is faster (at 32 requests 39.3 -> 44.2 ms, at 64 82.9 ->
+# 90.9), so they keep the grouped tcgen05 GEMM.
+moe.mxfp4_a8_until = 48
 # The tcgen05 prefill FMHA (sm_100a): a causal 4096-token prefill at
 # Qwen3.8-27B's 256-wide, six-way-grouped head runs at about 900 TFLOPS
 # where FA2 runs at about 300.

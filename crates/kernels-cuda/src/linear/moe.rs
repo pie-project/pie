@@ -702,6 +702,7 @@ pub fn select_glu(
             &fan,
             Some(glu),
             None,
+            false,
         )
         .is_ok());
     }
@@ -725,6 +726,7 @@ pub fn select_glu(
             &fan,
             Some(glu),
             Some(tensor_scales),
+            false,
         )
         .is_ok());
     }
@@ -1482,7 +1484,7 @@ fn route_order_sliced(
     }
     let offsets_at = (fan.route_count as usize).next_multiple_of(64);
     let work_cap = fan.route_count.div_ceil(slice) + experts;
-    let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
+    let work_at = (offsets_at + experts as usize + 3).next_multiple_of(64);
     let order = ctx.scratch(
         op,
         "moe_route_order",
@@ -1592,6 +1594,7 @@ pub(crate) fn select_nvfp4_mma(
         &fan,
         None,
         Some(tensor_scales),
+        false,
     )?;
     Ok(true)
 }
@@ -1632,9 +1635,19 @@ fn select_mxfp4_mma(
     fan: &Selected,
     glu: Option<crate::linear::tc5::Glu>,
     tensor_scales: Option<Tensor>,
+    scale_atoms: bool,
 ) -> Result<(), Error> {
     use crate::linear::tc5::Glu;
     const THREADS: u32 = 128;
+    // The converts read e8m0 scales a 32 codes and no tensor scale, so an
+    // NVFP4 bank (e4m3 a 16 codes, a tensor scale a row) keeps the bf16 path.
+    let cvt = ctx.tuning().mxfp4_cvt && crate::linear::tc5::supported() && tensor_scales.is_none();
+    if scale_atoms && !cvt {
+        return Err(refuse(
+            op,
+            "scales in tcgen05's atoms are read by the e2m1-convert select alone",
+        ));
+    }
     let (code, limit, alpha) = match glu {
         None => (0, 0.0f32, 1.0f32),
         Some(Glu::Swiglu) => (1, 0.0, 1.0),
@@ -1684,9 +1697,6 @@ fn select_mxfp4_mma(
     // one block, the registers' bound (gpt-oss at 8 tokens, gate-up 74 us
     // and down 49 against 92 and 54 on the bf16 path; a third chunk, or
     // five CTAs on fewer registers, no faster).
-    // The converts read e8m0 scales a 32 codes and no tensor scale, so an
-    // NVFP4 bank (e4m3 a 16 codes, a tensor scale a row) keeps the bf16 path.
-    let cvt = ctx.tuning().mxfp4_cvt && crate::linear::tc5::supported() && tensor_scales.is_none();
     let fire = if cvt {
         const DEPTH: u32 = 2;
         let win = 8 / nb;
@@ -1734,10 +1744,57 @@ fn select_mxfp4_mma(
         limit.arg(),
         alpha.arg(),
     ];
-    if !cvt {
+    // The e2m1-convert kernel reads where its scales lie; the bf16 one, an
+    // NVFP4 bank's tensor scales.
+    if cvt {
+        args.push(i32::from(scale_atoms).arg());
+    } else {
         args.push(tensor_scales.map_or(ArgValue::ABSENT, |t| t.arg()));
     }
     ctx.fire(op, fire, &args)
+}
+
+/// Whether [`select_mxfp4_atoms`] takes a fire of `routes` over `x`'s
+/// width (asked before its activations are read back for it).
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn select_mxfp4_atoms_takes(ctx: &Ctx, routes: Tensor, x: Tensor) -> bool {
+    let t = ctx.tuning();
+    let count = routes.rows * routes.width;
+    t.mxfp4_cvt
+        && crate::linear::tc5::supported()
+        && t.mxfp4_mma_from <= count
+        && count <= t.mxfp4_a8_until
+        && x.width > 0
+        && x.width.is_multiple_of(32)
+}
+
+/// A routed mxfp4 select whose scales are laid in tcgen05's atoms (a W4A8
+/// bank's, its rows counted across the experts) on the e2m1-convert
+/// register-dequant kernel, against bf16 activations (for a W4A8 select,
+/// [`crate::linear::act_quant::read_back`]'s). `Ok(false)` where that
+/// kernel does not take the fire: off in this chip's profile, a width
+/// outside `kernel.moe.mxfp4_mma_from ..= kernel.moe.mxfp4_a8_until`, or a
+/// K of part blocks.
+#[cfg(feature = "cuda")]
+pub fn select_mxfp4_atoms(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: Tensor,
+    atoms: u64,
+    routes: Tensor,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.moe_select_mxfp4_atoms";
+    let fan = selected(OP, x, routes, y)?;
+    if !(select_mxfp4_atoms_takes(ctx, routes, x) && y.dtype == Dtype::Bf16) {
+        return Ok(false);
+    }
+    let scales = Tensor::new(atoms, codes.rows, 0, Dtype::U8);
+    select_mxfp4_mma(
+        ctx, OP, x, codes, scales, None, routes, y, &fan, None, None, true,
+    )?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1769,7 +1826,10 @@ fn matmul_select_mxfp4(
     // A launch that fails falls back to the arms below.
     #[cfg(feature = "cuda")]
     if mxfp4_mma_worth(ctx, x, y, seat, &fan)
-        && select_mxfp4_mma(ctx, op, x, codes, scales, bias, routes, y, &fan, None, None).is_ok()
+        && select_mxfp4_mma(
+            ctx, op, x, codes, scales, bias, routes, y, &fan, None, None, false,
+        )
+        .is_ok()
     {
         return Ok(());
     }

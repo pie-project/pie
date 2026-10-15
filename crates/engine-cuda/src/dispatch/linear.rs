@@ -1255,6 +1255,32 @@ impl Run<'_> {
             return Err(unlaid(OP));
         }
         let atoms = scales.ptr;
+        // At decode widths an MXFP4 bank's e4m3 select reads its activations
+        // quantized and read back to bf16 (exact, the same products) on the
+        // e2m1-convert register-dequant kernel, which streams the bank far
+        // faster than the grouped GEMM does a handful of rows an expert.
+        if let act_quant::Format::E4m3 { .. } = fmt
+            && kernels_cuda::linear::moe::select_mxfp4_atoms_takes(self.ctx(), route_t, x)
+        {
+            let back =
+                self.ctx()
+                    .scratch_stream(OP, READ_BACK, x.rows as usize * x.width as usize * 2)?
+                    as u64;
+            let back =
+                act_quant::read_back(self.ctx(), OP, fmt, act_quant::Source::rows(x, None), back)?;
+            let bank_codes =
+                kernels_cuda::tensor::Tensor::new(codes.ptr, experts, n * k / 2, Dtype::U8);
+            if kernels_cuda::linear::moe::select_mxfp4_atoms(
+                self.ctx(),
+                back,
+                bank_codes,
+                atoms,
+                route_t,
+                &mut out,
+            )? {
+                return Ok(());
+            }
+        }
         act_quant::select(
             self.ctx(),
             OP,
@@ -1571,6 +1597,9 @@ fn unlaid(op: &'static str) -> kernels_cuda::Error {
 /// An NVFP4 bank's per-expert product scales, one a stream.
 #[cfg(feature = "cuda")]
 const EXPERT_ALPHA: &str = "linear.act_quant.expert_alpha";
+/// A W4A8 select's activations read back to bf16, for the register-dequant
+/// kernel.
+const READ_BACK: &str = "linear.act_quant.read_back";
 
 const STAGED_EXPERT_BYTES: u64 = 1536 * 1024 * 1024;
 

@@ -270,6 +270,7 @@ fn the_e2m1_convert_form_agrees() {
     }
     let cvt = Tuning {
         mxfp4_cvt: true,
+        mxfp4_a8_until: 65_536,
         ..MMA
     };
     register_dequant_cases(cvt);
@@ -282,6 +283,77 @@ fn the_e2m1_convert_form_agrees() {
     check(3, 576, 2880, false, true, cvt);
     check(12, 384, 2880, true, false, cvt);
     BIG.with(|w| w.set(false));
+    check_atoms(8, 256, 2048, cvt);
+    check_atoms(12, 384, 4096, cvt);
+}
+
+/// The byte of scale `(row, col)` in tcgen05's atom layout of `cols`
+/// columns (`atom_offset` in `linear/act_quant.cuh`).
+fn atom_offset(row: usize, col: usize, cols: usize) -> usize {
+    (row / 128 * cols.div_ceil(4) + col / 4) * 512 + (row % 32) * 16 + (row / 32 % 4) * 4 + col % 4
+}
+
+/// The select over a W4A8 bank's atom-laid scales (rows counted across the
+/// experts) answers the row-major one.
+fn check_atoms(tokens: usize, n: usize, k: usize, cvt: Tuning) {
+    let groups = k / BLOCK;
+    let routes = routes_of(tokens);
+    let route_count = routes.len();
+    let codes = bytes(0x61 + n as u64, EXPERTS * n * k / 2);
+    let scales = scale_bytes(0x62 + k as u64, EXPERTS * n * groups, groups);
+    let mut atoms = vec![0u8; (EXPERTS * n).div_ceil(128) * groups.div_ceil(4) * 512];
+    for row in 0..EXPERTS * n {
+        for col in 0..groups {
+            atoms[atom_offset(row, col, groups)] = scales[row * groups + col];
+        }
+    }
+    let act = activations(0x63, tokens * k);
+    let mut gpu = Gpu::open();
+    let x = Tensor::new(gpu.up(&act), tokens as u32, k as u32, Dtype::Bf16);
+    let codes_t = Tensor::new(
+        gpu.up(&codes),
+        EXPERTS as u32,
+        (n * k / 2) as u32,
+        Dtype::U8,
+    );
+    let scales_t = Tensor::new(
+        gpu.up(&scales),
+        EXPERTS as u32,
+        (n * groups) as u32,
+        Dtype::U8,
+    );
+    let atoms_at = gpu.up(&atoms);
+    let routes_t = Tensor::new(gpu.up(&routes), tokens as u32, TOP_K as u32, Dtype::I32);
+    let laid_at = gpu.zeros(route_count * n * 2);
+    let plain_at = gpu.zeros(route_count * n * 2);
+    let ctx = gpu.ctx().with_tuning(cvt);
+    let mut laid = Tensor::new(laid_at, route_count as u32, n as u32, Dtype::Bf16);
+    assert!(
+        kernels_cuda::linear::moe::select_mxfp4_atoms(
+            &ctx, x, codes_t, atoms_at, routes_t, &mut laid
+        )
+        .expect("the atom-laid select fires"),
+        "the e2m1-convert kernel takes {route_count} routes"
+    );
+    let mut plain = Tensor::new(plain_at, route_count as u32, n as u32, Dtype::Bf16);
+    matmul_select_quant(
+        &ctx,
+        x,
+        codes_t,
+        scales_t,
+        None,
+        routes_t,
+        &mut plain,
+        GroupSeat::RESIDENT,
+    )
+    .expect("the row-major select fires");
+    gpu.sync();
+    let laid: Vec<u16> = gpu.down(laid_at, route_count * n);
+    let plain: Vec<u16> = gpu.down(plain_at, route_count * n);
+    assert_eq!(
+        laid, plain,
+        "the atom-laid scales answer the row-major ones bit for bit"
+    );
 }
 
 /// The register-dequant kernel's GLU: the gate rows' and the up rows'

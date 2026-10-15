@@ -145,8 +145,9 @@ __device__ __forceinline__ void compute(const Codes<kTiles>& cc, const uint4* xs
 
 }  // namespace w4cvt
 
-/// `moe_select_mxfp4_mma` with the e2m1 converts: the same operands, grid
-/// and landing, and `kNb * kWin * 4 KiB` of dynamic shared memory (two
+/// `moe_select_mxfp4_mma` with the e2m1 converts: the same operands (the
+/// scales row-major, or with `scale_atoms` in tcgen05's atoms), grid and
+/// landing, and `kNb * kWin * 4 KiB` of dynamic shared memory (two
 /// windows of `kNb` 8-route blocks' f16 activations).
 template <int kNb, int kGlu, int kDepth, int kWin, int kMinBlocks>
 __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
@@ -164,7 +165,8 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    int scale_atoms)
 {
     constexpr int kTiles = 2;
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
@@ -175,6 +177,15 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
     static_assert(kWin % kDepth == 0, "a window holds whole rings");
     extern __shared__ uint4 w4cvt_xs[];
 
+    // A route that names no expert lands zeros (the first CTA writes them).
+    if (blockIdx.x == 0 && blockIdx.y == 0) {
+        const int width = kGlu != 0 ? inter : n;
+        for (int i = offsets[num_experts]; i < offsets[num_experts + 2]; ++i) {
+            bf16* row = out + static_cast<long long>(order[i]) * width;
+            for (int j = static_cast<int>(threadIdx.x); j < width; j += blockDim.x)
+                row[j] = f32_to_bf16(0.f);
+        }
+    }
     if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
     const int item = work[blockIdx.x];
     const int expert = item >> 16;
@@ -200,6 +211,10 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
     const long long row_bytes = k >> 1;
     const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
     const u8* s_e = scales + static_cast<long long>(expert) * n * groups;
+    // A chunk's scales: the next 4 bytes of a row-major plane, or the next
+    // 512-byte atom column of the tcgen05 layout (`scale_atoms`, the bank's
+    // rows counted across its experts).
+    const int s_step = scale_atoms != 0 ? 512 : 4;
 
     const u8* wrow[kTiles][2];
     const u8* srow[kTiles][2];
@@ -209,7 +224,13 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
         for (int h = 0; h < 2; ++h) {
             const int r = min(tile_row(t) + 8 * h + g, n - 1);
             wrow[t][h] = w_e + r * row_bytes + c * 16;
-            srow[t][h] = s_e + static_cast<long long>(r) * groups + c;
+            if (scale_atoms != 0) {
+                const long long at = static_cast<long long>(expert) * n + r;
+                srow[t][h] = scales + (at / 128) * ((groups + 3) / 4) * 512 + (at % 32) * 16
+                    + ((at / 32) % 4) * 4 + c;
+            } else {
+                srow[t][h] = s_e + static_cast<long long>(r) * groups + c;
+            }
         }
     const bf16* xrow[kNb];
 #pragma unroll
@@ -228,7 +249,7 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 cc.w[t][h] = live ? w4mma::ld_stream(wrow[t][h] + ch * 64) : make_uint4(0, 0, 0, 0);
-                cc.s[t][h] = live ? w4mma::ld_scale(srow[t][h] + ch * 4) : 127u;
+                cc.s[t][h] = live ? w4mma::ld_scale(srow[t][h] + ch * s_step) : 127u;
             }
     };
     // This thread's entries of a window: word `warp` of each chunk and block,
