@@ -426,24 +426,28 @@ fn worst(got: &[f32], want: &[f32]) -> f32 {
 /// The kernels a case reads under: FA2 or the tensor-core decode, each
 /// under both folds of a split's partials (the staged persistent merge and
 /// the warp-a-row one), and the tensor-core decode reading a window of up
-/// to 256 keys whole.
-const READS: [(bool, bool, u32); 6] = [
-    (false, false, 0),
-    (true, false, 0),
-    (false, true, 0),
-    (true, true, 0),
-    (false, true, 256),
-    (true, true, 256),
+/// to 256 keys whole or a full row across a cluster.
+const READS: [(bool, bool, u32, u32); 9] = [
+    (false, false, 0, 0),
+    (true, false, 0, 0),
+    (false, true, 0, 0),
+    (true, true, 0, 0),
+    (false, true, 256, 0),
+    (true, true, 256, 0),
+    (false, true, 0, 8),
+    (true, true, 256, 2),
+    (false, true, 0, 1),
 ];
 
 fn check(case: Case, via_prefill: bool) {
     let fx = fixture(case, 0x5eed);
     let (want_o, want_lse) = fx.reference();
-    for (merge_warp, decode_xqa, whole) in READS {
+    for (merge_warp, decode_xqa, whole, cluster) in READS {
         let tuning = Tuning {
             merge_warp,
             decode_xqa,
             decode_xqa_whole_window: whole,
+            decode_xqa_cluster: cluster,
             ..Tuning::DEFAULT
         };
         // Twice off one staged plan, as a step's layers read it: what one
@@ -465,7 +469,7 @@ fn check(case: Case, via_prefill: bool) {
         assert!(
             eo < 2e-2 && el < 1e-2,
             "{} q / {} kv heads at {}, window {:?}, graph {}, via prefill {via_prefill}, warp \
-             merge {merge_warp}, tensor-core decode {decode_xqa}, whole to {whole}: output off by \
+             merge {merge_warp}, tensor-core decode {decode_xqa}, whole to {whole}, cluster {cluster}: output off by \
              {eo}, lse by {el}",
             case.q_heads,
             case.kv_heads,
@@ -583,9 +587,9 @@ fn a_decode_reports_its_time_at_gptoss_and_gemma4_heads() {
     static B64: [usize; 64] = [CTX; 64];
     println!(
         "| layer | batch | graph | FA2 decode us | + warp merge | tensor-core decode | its window \
-         whole | prefill + warp merge |"
+         whole | a full row across a cluster | prefill + warp merge |"
     );
-    println!("|---|---:|---|---:|---:|---:|---:|---:|");
+    println!("|---|---:|---|---:|---:|---:|---:|---:|---:|");
     for (name, q_heads, kv_heads, head_dim, window) in [
         ("gpt-oss full", 64, 8, 64, None),
         ("gpt-oss sliding 128", 64, 8, 64, Some(128)),
@@ -623,10 +627,18 @@ fn a_decode_reports_its_time_at_gptoss_and_gemma4_heads() {
                         ..tensor
                     }),
                 );
+                let cluster = time(
+                    &fx.gpu,
+                    flush,
+                    &fx.fire(Tuning {
+                        decode_xqa_cluster: 8,
+                        ..tensor
+                    }),
+                );
                 let prefill_w = time(&fx.gpu, flush, &fx.fire_prefill(warp));
                 println!(
                     "| {name} | {} | {graph} | {decode:.1} | {decode_w:.1} | {xqa:.1} | \
-                     {whole:.1} | {prefill_w:.1} |",
+                     {whole:.1} | {cluster:.1} | {prefill_w:.1} |",
                     lens.len()
                 );
             }
@@ -660,11 +672,12 @@ fn a_plan_over_some_of_a_fires_lanes_lands_their_rows_alone() {
         }
         let width = 64 * 64;
         for lanes in [2..5u32, 5..7] {
-            for (merge_warp, decode_xqa, whole) in READS {
+            for (merge_warp, decode_xqa, whole, cluster) in READS {
                 let tuning = Tuning {
                     merge_warp,
                     decode_xqa,
                     decode_xqa_whole_window: whole,
+                    decode_xqa_cluster: cluster,
                     ..Tuning::DEFAULT
                 };
                 fx.scrub();
@@ -673,7 +686,7 @@ fn a_plan_over_some_of_a_fires_lanes_lands_their_rows_alone() {
                 let (from, to) = (lanes.start as usize, lanes.end as usize);
                 let label = format!(
                     "window {window:?}, lanes {lanes:?}, warp merge {merge_warp}, tensor-core \
-                     decode {decode_xqa}, whole to {whole}"
+                     decode {decode_xqa}, whole to {whole}, cluster {cluster}"
                 );
                 let eo = worst(
                     &o[from * width..to * width],
@@ -722,11 +735,12 @@ fn a_sinked_attention_answers_the_reference_scaled_by_its_sinks() {
                     *x *= r;
                 }
             }
-            for (merge_warp, decode_xqa, whole) in READS {
+            for (merge_warp, decode_xqa, whole, cluster) in READS {
                 let tuning = Tuning {
                     merge_warp,
                     decode_xqa,
                     decode_xqa_whole_window: whole,
+                    decode_xqa_cluster: cluster,
                     ..Tuning::DEFAULT
                 };
                 for via_prefill in [false, true] {
@@ -741,7 +755,7 @@ fn a_sinked_attention_answers_the_reference_scaled_by_its_sinks() {
                     assert!(
                         eo < 2e-2 && el < 1e-2,
                         "window {window:?}, graph {graph}, warp merge {merge_warp}, tensor-core \
-                         decode {decode_xqa}, whole to {whole}, via prefill {via_prefill}: output \
+                         decode {decode_xqa}, whole to {whole}, cluster {cluster}, via prefill {via_prefill}: output \
                          off by {eo}, lse by {el}"
                     );
                 }

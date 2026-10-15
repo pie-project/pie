@@ -144,7 +144,11 @@ pub fn schedule(
     }
     let o_indptr = narrow_all(op, "batch_decode_o_indptr", &o_indptr)?;
 
-    let padded_batch_size = if req.enable_cuda_graph {
+    // A whole plan's work items are its requests: a recorded one pads to the
+    // batch it was recorded for, not to the grid a split would fill.
+    let padded_batch_size = if req.enable_cuda_graph && req.whole {
+        req.batch_size as usize
+    } else if req.enable_cuda_graph {
         ((max_grid_size / est.gdy) as usize).max(req.batch_size as usize)
     } else {
         est.new_batch_size as usize

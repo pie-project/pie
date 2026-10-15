@@ -76,6 +76,9 @@ pub struct Gate {
     pub from_64: u32,
     /// The widest window (`window_left + 1` keys) read whole, unsplit.
     pub whole_window: u32,
+    /// The most blocks a cluster splits an unwindowed row across (0: the
+    /// plan splits it).
+    pub cluster: u32,
 }
 
 impl Gate {
@@ -85,6 +88,7 @@ impl Gate {
             on: tuning.decode_xqa,
             from_64: tuning.decode_xqa_from_64,
             whole_window: tuning.decode_xqa_whole_window,
+            cluster: tuning.decode_xqa_cluster,
         }
     }
 
@@ -109,6 +113,31 @@ impl Gate {
         window_left >= 0
             && u32::try_from(window_left).is_ok_and(|left| left < self.whole_window)
             && self.stamps(head_dim, group)
+    }
+
+    /// The blocks a cluster reads an unwindowed row with at any batch (each
+    /// a slice of the row's keys, the cluster folding them), as many as fill
+    /// `grid` blocks across the batch's (request, kv head) pairs, at most
+    /// `cluster`; 0 where the plan splits the row instead.
+    #[must_use]
+    pub fn ranks(
+        self,
+        head_dim: u32,
+        group: u32,
+        requests: u32,
+        kv_heads: u32,
+        window_left: i32,
+        grid: u32,
+    ) -> u32 {
+        if self.cluster == 0 || window_left >= 0 || !self.stamps(head_dim, group) {
+            return 0;
+        }
+        let pairs = requests.saturating_mul(kv_heads).max(1);
+        let mut ranks = self.cluster.min(8);
+        while ranks > 1 && pairs.saturating_mul(ranks) > grid {
+            ranks /= 2;
+        }
+        ranks.max(1)
     }
 }
 
@@ -151,6 +180,18 @@ pub fn decode(
         _ => "::pie::bf16",
     };
     let kv = &params.paged_kv;
+    let ranks = plan.info.ranks.max(1);
+    let launch = Launch::grid(
+        [plan.shape.num_kv_heads * ranks, params.padded_batch_size, 1],
+        [32 * stamp.warps, 1, 1],
+    );
+    let launch = if ranks > 1 {
+        launch
+            .cluster(ranks)
+            .smem(stamp.smem() + (8 * head_dim + 8) * 4)
+    } else {
+        launch.smem(stamp.smem())
+    };
     ctx.fire(
         op,
         Fire::at(
@@ -160,13 +201,7 @@ pub fn decode(
                 stamp.mt, stamp.warps, stamp.stages
             )),
         )
-        .apply(
-            Launch::grid(
-                [plan.shape.num_kv_heads, params.padded_batch_size, 1],
-                [32 * stamp.warps, 1, 1],
-            )
-            .smem(stamp.smem()),
-        ),
+        .apply(launch),
         &[
             ArgValue::Ptr(params.q),
             ArgValue::Ptr(kv.k_data),
@@ -195,6 +230,7 @@ pub fn decode(
                 Some(s) if !params.partition_kv => s.ptr,
                 _ => 0,
             }),
+            ranks.arg(),
         ],
     )
 }
@@ -215,6 +251,7 @@ mod tests {
             on: true,
             from_64: 16,
             whole_window: 128,
+            cluster: 8,
         };
         assert!(gate.takes(256, 2, 1) && gate.takes(64, 8, 16));
         assert!(!gate.takes(64, 8, 15) && !gate.takes(256, 16, 64) && !gate.takes(512, 8, 64));
@@ -222,6 +259,16 @@ mod tests {
         // a full row or an unstamped head does not.
         assert!(gate.whole(64, 8, 127) && gate.whole(256, 2, 0));
         assert!(!gate.whole(64, 8, 128) && !gate.whole(64, 8, -1) && !gate.whole(512, 8, 0));
+        // An unwindowed row a cluster reads takes as many blocks as fill the
+        // grid, at most eight; a windowed one (Gemma's 1024 keys read no
+        // faster so), or any where it is off, none.
+        assert_eq!(gate.ranks(64, 8, 8, 8, -1, 740), 8);
+        assert_eq!(gate.ranks(64, 8, 16, 8, -1, 740), 4);
+        assert_eq!(gate.ranks(64, 8, 64, 8, -1, 740), 1);
+        assert_eq!(gate.ranks(64, 8, 8, 8, 127, 740), 0);
+        assert_eq!(gate.ranks(256, 2, 1, 16, 1023, 740), 0);
+        assert_eq!(gate.ranks(64, 8, 1, 8, -1, 740), 8);
+        assert_eq!(Gate { cluster: 0, ..gate }.ranks(64, 8, 8, 8, -1, 740), 0);
         assert!(gate.stamps(64, 8));
         assert!(!Gate::default().stamps(256, 2));
     }

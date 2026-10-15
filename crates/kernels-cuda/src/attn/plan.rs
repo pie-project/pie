@@ -348,6 +348,19 @@ pub fn plan_decode(
         }
         _ => max_grid_size,
     };
+    // A cluster folds through distributed shared memory, sm_90 on; it fills
+    // the SMs once with the stamp's blocks.
+    let ranks = match crate::attn::xqa::Stamp::of(shape.head_dim) {
+        Some(stamp) if device.cc_major >= 9 => toggles.xqa.ranks(
+            shape.head_dim,
+            shape.group_size(),
+            shape.num_requests,
+            shape.num_kv_heads,
+            window_left,
+            stamp.grid(device),
+        ),
+        _ => 0,
+    };
     let windowed_split = toggles.window_split && window_left >= 0;
     let built = if !windowed_split
         && sched_decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles)
@@ -372,9 +385,10 @@ pub fn plan_decode(
             enable_cuda_graph,
             chunk_floor_128: toggles.chunk_floor_128,
             window_left: u32::try_from(window_left).ok(),
-            whole: toggles
-                .xqa
-                .whole(shape.head_dim, shape.group_size(), window_left),
+            whole: ranks > 0
+                || toggles
+                    .xqa
+                    .whole(shape.head_dim, shape.group_size(), window_left),
         };
         sched_decode::plan(
             OP,
@@ -385,8 +399,12 @@ pub fn plan_decode(
         )?
     };
 
+    let mut info = built.info;
+    if info.whole {
+        info.ranks = ranks;
+    }
     Ok(DecodePlan {
-        info: built.info,
+        info,
         int_upload: built.int_upload,
         int_bytes: built.int_bytes,
         float_bytes: built.float_bytes,
@@ -580,6 +598,9 @@ pub struct DecodePlanInfo {
     /// Each request one work item over its whole window, which the
     /// tensor-core decode lands unsplit (`xqa::Gate::whole`).
     pub whole: bool,
+    /// The blocks a cluster reads each (request, kv head) of a whole plan
+    /// with, folding their slices itself (`xqa::Gate::ranks`); 0 for none.
+    pub ranks: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -150,6 +150,7 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
         ),
         tuning.decode_grouped_prefill_from,
         tuning.decode_grouped_prefill_lse,
+        kernels_cuda::attn::xqa::Gate::of(tuning),
     );
     let slots = *LANES.iter().max().expect("lanes") as u32;
     let mut budget = poem_compiler::Budget::new(slots, CONTEXT);

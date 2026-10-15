@@ -16,6 +16,12 @@
 // keys stream through shared memory on `cp.async`, STAGES tiles deep a warp.
 // A sliding window starts the walk at the window, and where the plan does
 // not split the sinks scale the output as `sink_rescale` does.
+//
+// With `ranks` above one, a cluster of that many blocks reads one (request,
+// kv head) unsplit by the plan, each block a slice of its keys, and the
+// cluster folds the slices through distributed shared memory: each block
+// lands its share of the rows, sinks and all, with no partial plane and no
+// fold launch after it.
 
 namespace pie::attn::xqa {
 
@@ -25,6 +31,28 @@ constexpr float kLn2 = 0.69314718055994530942f;
 constexpr float kEmpty = -5e4f;
 // A masked score: below the running maximum's floor, so it weighs nothing.
 constexpr float kMasked = -3.0e38f;
+
+// A float in cluster block `rank`'s shared memory, at the address `at` holds
+// in this block's.
+__device__ __forceinline__ float ld_cluster(const float* at, unsigned rank) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    const unsigned local = static_cast<unsigned>(__cvta_generic_to_shared(at));
+    unsigned remote;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(local), "r"(rank));
+    float v;
+    asm volatile("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(remote) : "memory");
+    return v;
+#else
+    return rank == 0 ? *at : 0.f;
+#endif
+}
+
+__device__ __forceinline__ void sync_cluster() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::
+                     : "memory");
+#endif
+}
 
 __device__ __forceinline__ void mma(float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
     asm volatile(
@@ -127,7 +155,8 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
     float sm_scale,
     bf16* __restrict__ o,
     float* __restrict__ lse,
-    const S* __restrict__ sinks)
+    const S* __restrict__ sinks,
+    u32 ranks)
 {
     using Sh = Shape<HEAD_DIM, MT, WARPS, STAGES>;
     constexpr int LD = Sh::LD;
@@ -144,7 +173,9 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
     // A request's kv heads run side by side, their slices of each key row
     // one contiguous run.
     const int bx = blockIdx.y;
-    const int kv_head = blockIdx.x;
+    const int slices = ranks > 1 ? static_cast<int>(ranks) : 1;
+    const int kv_head = blockIdx.x / slices;
+    const int rank = blockIdx.x % slices;
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
@@ -161,8 +192,14 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
     int window_start = 0;
     if (window_left >= 0 && kv_len > window_left + 1) window_start = kv_len - window_left - 1;
     const int chunk = partition_kv ? *kv_chunk_size_ptr : kv_len - window_start;
-    const int chunk_start = window_start + (partition_kv ? kv_tile * chunk : 0);
-    const int chunk_end = partition_kv ? min(window_start + (kv_tile + 1) * chunk, kv_len) : kv_len;
+    int chunk_start = window_start + (partition_kv ? kv_tile * chunk : 0);
+    int chunk_end = partition_kv ? min(window_start + (kv_tile + 1) * chunk, kv_len) : kv_len;
+    if (slices > 1) {
+        // The cluster's slices of the unsplit span, whole key tiles each.
+        const int per = ((chunk + slices - 1) / slices + TILE - 1) / TILE * TILE;
+        chunk_start = min(window_start + rank * per, kv_len);
+        chunk_end = min(chunk_start + per, kv_len);
+    }
 
     // The group's query rows, zero past the group.
     const long long q_row = static_cast<long long>(q_indptr[batch]) * q_stride_n;
@@ -376,6 +413,13 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
             static_cast<long long>(partition_kv ? bx : q_indptr[batch]) * num_qo_heads + qo_head;
         float out = (l > 0.f && !empty) ? acc / l : 0.f;
         const float lse_v = (l > 0.f && !empty) ? m + log2f(l) : kEmpty;
+        if (slices > 1) {
+            // A slice's state waits in shared memory for the cluster's fold.
+            float* mine_out = reinterpret_cast<float*>(smem_raw + Sh::SMEM_BYTES);
+            mine_out[h * HEAD_DIM + d] = out;
+            if (d == 0) mine_out[8 * HEAD_DIM + h] = lse_v;
+            continue;
+        }
         if (!partition_kv && sinks != nullptr) {
             const float sink = static_cast<float>(sinks[qo_head]);
             out *= 1.0f / (1.0f + __expf(-(lse_v * kLn2 - sink)));
@@ -383,6 +427,40 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
         o[row * HEAD_DIM + d] = bf16(out);
         if (lse != nullptr && d == 0) lse[row] = lse_v;
     }
+    if (slices == 1) return;
+
+    // The cluster's fold: each block folds every slice's state for its
+    // share of the (head, column) cells, read across the cluster.
+    sync_cluster();
+    const float* states = reinterpret_cast<const float*>(smem_raw + Sh::SMEM_BYTES);
+    const long long out_row = q_indptr[batch];
+    for (int e = rank * 32 * WARPS + tid; e < static_cast<int>(group) * HEAD_DIM;
+         e += slices * 32 * WARPS) {
+        const int h = e / HEAD_DIM;
+        const int d = e % HEAD_DIM;
+        float m = -1e30f;
+        for (int r = 0; r < slices; ++r) {
+            m = fmaxf(m, ld_cluster(states + 8 * HEAD_DIM + h, static_cast<unsigned>(r)));
+        }
+        float l = 0.f, acc = 0.f;
+        for (int r = 0; r < slices; ++r) {
+            const float w = exp2f(ld_cluster(states + 8 * HEAD_DIM + h, static_cast<unsigned>(r)) - m);
+            l += w;
+            acc += w * ld_cluster(states + h * HEAD_DIM + d, static_cast<unsigned>(r));
+        }
+        float out = l > 0.f ? acc / l : 0.f;
+        const float lse_v = l > 0.f ? m + log2f(l) : kEmpty;
+        const int qo_head = kv_head * static_cast<int>(group) + h;
+        if (sinks != nullptr) {
+            const float sink = static_cast<float>(sinks[qo_head]);
+            out *= 1.0f / (1.0f + __expf(-(lse_v * kLn2 - sink)));
+        }
+        const long long row = out_row * num_qo_heads + qo_head;
+        o[row * HEAD_DIM + d] = bf16(out);
+        if (lse != nullptr && d == 0) lse[row] = lse_v;
+    }
+    // No block leaves while another may still read its shared memory.
+    sync_cluster();
 }
 
 }

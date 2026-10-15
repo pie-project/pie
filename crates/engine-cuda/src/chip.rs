@@ -404,6 +404,7 @@ mod tests {
                     if b200 { 128 } else { 0 },
                     "{gpu}"
                 );
+                assert_eq!(tuning.decode_xqa_cluster, if b200 { 8 } else { 0 }, "{gpu}");
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
@@ -425,6 +426,7 @@ mod tests {
                         decode_xqa: false,
                         decode_xqa_from_64: 0,
                         decode_xqa_whole_window: 0,
+                        decode_xqa_cluster: 0,
                         ..tuning
                     },
                     defaults,

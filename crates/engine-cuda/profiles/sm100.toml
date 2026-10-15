@@ -73,6 +73,14 @@ sdpa.decode.xqa_from_64 = 16
 # decode step takes 3.45 / 8.94 / 15.42 ms at 1 / 8 / 64 requests where it
 # took 3.55 / 9.02 / 16.54.
 sdpa.decode.xqa_whole_window = 128
+# Its unwindowed rows read across a cluster of up to eight blocks a (request,
+# kv head), the cluster folding the slices through distributed shared memory:
+# no split partials and no fold launch, and gpt-oss's full-attention rows stay
+# decodes rather than the prefill rewrite. A layer at eight requests takes
+# 11.4 us where the prefill and its fold took 15.6, and gpt-oss-120b decodes
+# a step in 3.27 / 8.74 / 16.44 ms at 1 / 8 / 64 requests where it took
+# 3.36 / 8.82 / 16.49 (three rounds each).
+sdpa.decode.xqa_cluster = 8
 # A dense projection's bias from the cuBLASLt epilogue, not a separate add
 # (gpt-oss's qkv and o: about 0.44 ms a bs64 decode step).
 gemm.bias_epilogue = true
