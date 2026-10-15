@@ -68,13 +68,19 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
             }
         }
 
-        tokens.extend(chat::cue_thinking(req.thinking != Thinking::Disabled));
+        tokens.extend(chat::cue_thinking(thinks(req)));
     }
     // The prefill needs at least one token.
     if tokens.is_empty() {
         tokens.push(0);
     }
     Ok(Prompt { tokens, images })
+}
+
+/// Whether `req` asks for a thinking answer; [`build`] cues it so, and the
+/// demux reads the same cue.
+pub(crate) fn thinks(req: &Request) -> bool {
+    req.thinking != Thinking::Disabled
 }
 
 /// Where `text` begins in its rendered `turn`, so pictures sit inside the

@@ -88,6 +88,19 @@ class Decoder:
     def __init__(self) -> None:
         self._inner = _reasoning.create_decoder()
 
+    @classmethod
+    def for_cue(cls, cue: list[int]) -> Decoder:
+        """A decoder for the turn ``cue`` began: inside a thinking block from
+        the first token when the cue left one open, so no
+        :class:`Event.Start` comes (see :meth:`starts_inside`)."""
+        decoder = cls.__new__(cls)
+        decoder._inner = _reasoning.Decoder.for_cue(list(cue))
+        return decoder
+
+    def starts_inside(self) -> bool:
+        """Whether the first token is already inside a thinking block."""
+        return bool(self._inner.starts_inside())
+
     def feed(self, tokens: list[int]) -> AnyEvent:
         """Feed a token batch and get back the event that fired. Returns
         :class:`Event.Idle` when the batch landed outside any reasoning

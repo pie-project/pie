@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chat_template::{Effort, Instruct};
+use chat_template::{Effort, Instruct, ReasoningEvent};
 use tokenizer::Tokenizer;
 
 const MESSAGE: &str = "What is 17 times 23?";
@@ -29,6 +29,7 @@ fn the_new_templates_write_what_the_reference_renders_every_case() {
     atem_writes_the_user_turn_and_the_cue_after_the_opening();
     chatml_trims_the_turn_and_closes_an_empty_thinking_block();
     qwen38_opens_a_thinking_request_with_its_reasoning_effort_instruction();
+    qwen38_cues_a_thinking_answer_inside_an_open_think_block();
     gemma_closes_an_empty_thought_channel_where_its_template_does();
 }
 
@@ -127,6 +128,62 @@ fn qwen38_opens_a_thinking_request_with_its_reasoning_effort_instruction() {
         [system, terse, end, user].concat()
     );
     assert_eq!(render(&plain, None, Effort::Xhigh), user.to_vec());
+}
+
+/// Qwen 3.5/3.6/3.8 templates end a thinking request's prompt inside an open
+/// `<think>`; the reasoning decoder for that cue starts inside the block, and
+/// the one for the no-thinking cue (which closes it) starts outside. The
+/// reference ids are the whole `apply_chat_template(..., enable_thinking=True)`.
+fn qwen38_cues_a_thinking_answer_inside_an_open_think_block() {
+    let Some(tokenizer) = snapshot(
+        "mlx-community/Qwen3.8-27B-4bit",
+        "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+    ) else {
+        return;
+    };
+    let qwen38 = chat_template::chatml::ChatMLInstruct::new(
+        tokenizer.clone(),
+        chat_template::chatml::ChatML {
+            thinking: true,
+            preserve_thinking: true,
+            reasoning_effort: true,
+            tools: true,
+            generation_suffix: "<think>\n".to_string(),
+            stop_tokens: vec!["<|im_end|>".to_string()],
+        },
+    );
+    let mut got = qwen38.system_thinking(Some("You are terse."), Effort::Xhigh);
+    got.extend(qwen38.user(&format!("{MESSAGE}\n")));
+    got.extend(qwen38.cue());
+    let want: Vec<u32> = vec![
+        248045, 8678, 198, 24342, 286, 4879, 369, 716, 310, 830, 11553, 13, 5044, 1683, 15060,
+        1472, 279, 3274, 11, 9307, 1328, 30800, 11, 2814, 47675, 25605, 11, 321, 60445, 55404, 11,
+        27224, 11, 321, 30246, 303, 279, 1534, 4087, 13, 271, 2523, 513, 48834, 13, 248046, 198,
+        248045, 846, 198, 3710, 369, 220, 16, 22, 2942, 220, 17, 18, 30, 248046, 198, 248045,
+        74455, 198, 248068, 198,
+    ];
+    assert_eq!(got, want);
+
+    let reasoning = tokenizer.encode("seventeen times twenty-three");
+    let close = 248069;
+    let mut thinking = qwen38.reasoning_decoder_for_cue(&qwen38.cue());
+    assert!(thinking.starts_inside());
+    let mut events = thinking.feed(&reasoning);
+    events.extend(thinking.feed(&[close]));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ReasoningEvent::Complete(text) if text.trim() == "seventeen times twenty-three")),
+        "{events:?}"
+    );
+    let mut quiet = qwen38.reasoning_decoder_for_cue(&qwen38.cue_without_thinking());
+    assert!(!quiet.starts_inside());
+    assert!(
+        quiet
+            .feed(&reasoning)
+            .iter()
+            .all(|e| matches!(e, ReasoningEvent::Delta(text) if text.is_empty()))
+    );
 }
 
 /// Gemma 4 26B-A4B's and 31B's templates close an empty thought channel

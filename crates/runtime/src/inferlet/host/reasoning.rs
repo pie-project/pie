@@ -29,6 +29,21 @@ impl pie::inferlet::reasoning::HostDecoder for ProcessCtx {
         Ok(self.ctx().table.push(decoder)?)
     }
 
+    async fn for_cue(&mut self, cue: Vec<u32>) -> Result<Resource<Decoder>> {
+        let inner = crate::model::model()
+            .instruct()
+            .reasoning_decoder_for_cue(&cue);
+        let decoder = Decoder {
+            inner,
+            pending: VecDeque::new(),
+        };
+        Ok(self.ctx().table.push(decoder)?)
+    }
+
+    async fn starts_inside(&mut self, this: Resource<Decoder>) -> Result<bool> {
+        Ok(self.ctx().table.get(&this)?.inner.starts_inside())
+    }
+
     async fn feed(
         &mut self,
         this: Resource<Decoder>,

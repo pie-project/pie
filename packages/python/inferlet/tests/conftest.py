@@ -302,6 +302,16 @@ class ReasoningComplete:
 
 class ReasoningDecoderStub(_ScriptedDecoder):
     script: list[object] = []
+    inside = False
+
+    @classmethod
+    def for_cue(cls, cue: list[int]) -> ReasoningDecoderStub:
+        decoder = cls()
+        decoder.inside = bool(cue) and cue[-1] == 6
+        return decoder
+
+    def starts_inside(self) -> bool:
+        return self.inside
 
 
 def _make_reasoning() -> types.ModuleType:

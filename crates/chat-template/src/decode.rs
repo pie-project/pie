@@ -54,6 +54,7 @@ pub struct ThinkingDecoder {
     decoder: TokenizerDecoder,
     open: Vec<u32>,
     close: u32,
+    starts_inside: bool,
     inside: bool,
     text: String,
     matched: usize,
@@ -70,6 +71,7 @@ impl ThinkingDecoder {
             decoder: tokenizer.decoder(false),
             open,
             close,
+            starts_inside: false,
             inside: false,
             text: String::new(),
             matched: 0,
@@ -79,13 +81,39 @@ impl ThinkingDecoder {
     #[must_use]
     pub fn opened(tokenizer: Arc<Tokenizer>, open: Vec<u32>, close: u32) -> Self {
         Self {
+            starts_inside: true,
             inside: true,
             ..Self::new(tokenizer, open, close)
         }
     }
+
+    /// Inside a thinking block from the first token when `cue` left one
+    /// open (a template that writes `<think>` into its generation cue), and
+    /// outside when it opened none or opened and closed one (its no-thinking
+    /// cue).
+    #[must_use]
+    pub fn for_cue(tokenizer: Arc<Tokenizer>, open: Vec<u32>, close: u32, cue: &[u32]) -> Self {
+        if opens_block(cue, &open, close) {
+            Self::opened(tokenizer, open, close)
+        } else {
+            Self::new(tokenizer, open, close)
+        }
+    }
+}
+
+fn opens_block(cue: &[u32], open: &[u32], close: u32) -> bool {
+    !open.is_empty()
+        && cue
+            .windows(open.len())
+            .rposition(|window| window == open)
+            .is_some_and(|at| !cue[at + open.len()..].contains(&close))
 }
 
 impl ReasoningDecoder for ThinkingDecoder {
+    fn starts_inside(&self) -> bool {
+        self.starts_inside
+    }
+
     fn feed(&mut self, tokens: &[u32]) -> Vec<ReasoningEvent> {
         let mut events = Vec::new();
         let mut content: Vec<u32> = Vec::new();
@@ -124,7 +152,7 @@ impl ReasoningDecoder for ThinkingDecoder {
     }
 
     fn reset(&mut self) {
-        self.inside = false;
+        self.inside = self.starts_inside;
         self.decoder.reset();
         self.text.clear();
         self.matched = 0;
