@@ -242,9 +242,13 @@ def release_layer(reads, w, at):
         reads.read(f.gate.bias, n("ffn.gate.bias"))
     expert = lambda e, leg: n("ffn.experts.{}.{}.weight".format(e, leg))
     if f.gate_up.fused != None:
-        fail("the release layout's routed gate and up legs are read apart")
-    read_bank(reads, f.gate_up.gate, [expert(e, "w1") for e in range(f.experts)])
-    read_bank(reads, f.gate_up.up, [expert(e, "w3") for e in range(f.experts)])
+        # Each expert's gate rows, then its up rows: one bank a fused
+        # gate-up select reads, its GLU over the packed rows.
+        read_bank_packed(reads, f.gate_up.fused,
+            [[expert(e, "w1"), expert(e, "w3")] for e in range(f.experts)])
+    else:
+        read_bank(reads, f.gate_up.gate, [expert(e, "w1") for e in range(f.experts)])
+        read_bank(reads, f.gate_up.up, [expert(e, "w3") for e in range(f.experts)])
     read_bank(reads, f.down, [expert(e, "w2") for e in range(f.experts)])
     reads.read_concat(f.shared_gate_up, [n("ffn.shared_experts.w1.weight"), n("ffn.shared_experts.w3.weight")])
     reads.read(f.shared_down, n("ffn.shared_experts.w2.weight"))
@@ -257,6 +261,27 @@ def v41_mlx(m, reads):
     if not has("model.layers.0.ffn.switch_mlp.gate_proj.weight"):
         fail("no stacked MLX V4.1 expert bank in model.layers")
     v41(m, reads, True)
+
+def read_bank_packed(reads, w, pairs):
+    """A routed MXFP4 bank `[experts, 2 * rows, cols]` whose expert `e` is
+    the planes `pairs[e]` stacked by rows (its gate rows, then its up rows),
+    codes and e8m0 exponents alike."""
+    rows, cols = w.shape[1] // 2, w.shape[2]
+    if w.dtype != dtype.mxfp4:
+        fail("`{}`: a packed gate-up bank is read from MXFP4 halves only".format(w.name))
+    codes = []
+    scales = []
+    for pair in pairs:
+        stems = [part[:-len(".weight")] if part.endswith(".weight") else part for part in pair]
+        for part, stem in zip(pair, stems):
+            if not has(stem + ".scale"):
+                fail("`{}`: `{}` is read as MXFP4 codes, whose exponents are stored beside it as `{}`, and the checkpoint holds none".format(w.name, part, stem + ".scale"))
+        codes.append(concat(1, [src(part).transmute([1, rows, cols], encoding(dtype.mxfp4)) for part in pair]))
+        scales.append(concat(1, [src(stem + ".scale").transmute([1, rows, cols // 32], encoding(dtype.e8m0)) for stem in stems]))
+    reads.extend([
+        tensor(w.name, concat(0, codes), encoding(dtype.mxfp4)),
+        tensor(scales_name(w.name), concat(0, scales), encoding(dtype.e8m0), shape = scales_shape(w), scaling = w),
+    ])
 
 def read_bank(reads, w, parts):
     """A routed bank `[experts, rows, cols]` from one plane per expert, at

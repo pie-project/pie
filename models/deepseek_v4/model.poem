@@ -626,7 +626,7 @@ def layout(id, deploy):
         if ws == [bf, mx]:
             return flash(bf, split_of(mx), kv, flash_dims(43, flash_ratios(), 3, draft = mtp))
         if ws == [fp8, mxa8] and not mtp:
-            return flash(bf, split_of(mxa8), kv, flash_dims(43, flash_ratios(), 3), quant = fp8)
+            return flash(bf, uniform(mxa8), kv, flash_dims(43, flash_ratios(), 3), quant = fp8)
     if id == "dsv4-flash-mini":
         if ws == [bf] and not mtp:
             return flash(bf, uniform(bf), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
@@ -637,7 +637,7 @@ def layout(id, deploy):
         if ws == [bf, mx] and not mtp:
             return flash(bf, split_of(mx), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
         if ws == [fp8, mxa8] and not mtp:
-            return flash(bf, split_of(mxa8), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16), quant = fp8)
+            return flash(bf, uniform(mxa8), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16), quant = fp8)
     if id == "dsv4-pro" and ws == [bf, mx] and not mtp:
         return flash(bf, split_of(mx), kv, pro_dims(61, pro_ratios(), 3))
     if id == "dsv4-pro-mini" and ws == [bf, mx] and not mtp:

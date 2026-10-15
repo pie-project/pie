@@ -356,6 +356,12 @@ def mlp(x, ids, f, streams, following, hy):
             return ops.linear.moe_matmul_select(act, bank, routes, f.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, routes, f.top_k)
 
+    if f.down.precision != f.down.dtype and f.gate_up.fused != None:
+        # The same over one packed gate-up bank: each expert's gate rows,
+        # then its up rows.
+        act = ops.linear.mlp_swiglu_clamp_routed(
+            select(x, f.gate_up.fused), f.inter, weights, f.limit)
+        return ops.linear.moe_sum_add(select(act, f.down), shared)
     if f.down.precision != f.down.dtype and f.gate_up.fused == None:
         # DeepSeek's expert weighs its activations before its down leg
         # quantizes them, and sums its routes and the shared expert in f32.
