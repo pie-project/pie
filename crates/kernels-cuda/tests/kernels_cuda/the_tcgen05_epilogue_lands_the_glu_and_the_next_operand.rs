@@ -284,6 +284,9 @@ enum Layout {
     /// Contiguous on CTA pairs: 256-row tiles.
     ContiguousPair,
     Masked,
+    /// Contiguous, swapped: the bank on P, an expert's rows on 64-row Q
+    /// tiles (a decode's W4A4 gate-up).
+    ContiguousSwapped,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -385,9 +388,13 @@ fn grouped(
         input_scales: 0,
     };
     let plan = Plan {
-        swap: masked,
+        swap: masked || layout == Layout::ContiguousSwapped,
         pair: layout == Layout::ContiguousPair,
-        bn: if masked { 64 } else { 256 },
+        bn: if masked || layout == Layout::ContiguousSwapped {
+            64
+        } else {
+            256
+        },
         stages: 0,
         splits: 0,
     };
@@ -453,6 +460,27 @@ fn the_tcgen05_epilogue_lands_the_glu_and_the_next_operand_every_case() {
         dense(a, w, sw, out, 140, [256, 512], false, false);
         dense(nv, nv, clamp, out, 9, [256, 512], true, true);
     }
+    // NVFP4 swapped contiguous: its GLU landing the next NVFP4 operand.
+    grouped(
+        nv,
+        nv,
+        Glu::Swiglu,
+        0,
+        Layout::ContiguousSwapped,
+        6,
+        [256, 512],
+        false,
+    );
+    grouped(
+        nv,
+        nv,
+        Glu::Swiglu,
+        2,
+        Layout::ContiguousSwapped,
+        6,
+        [256, 512],
+        false,
+    );
     for layout in [Layout::Contiguous, Layout::ContiguousPair, Layout::Masked] {
         for out in [0, 1, 2] {
             // NVFP4 spans 448 x 6 of dynamic range a tensor: the heavy-tailed

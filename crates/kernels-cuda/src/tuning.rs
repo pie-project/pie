@@ -68,8 +68,7 @@ pub struct GemmSplitLaunchNs(pub u32);
 /// The fewest tokens a W4A4 routed MLP keeps its rows by expert from the
 /// gate-up select to the weighted sum with (its GLU landing the down leg's
 /// NVFP4 operand from the gate-up epilogue); never (65 536 past any fire)
-/// but where a chip's profile says (B200's). A decode's few rows an expert
-/// leave that epilogue the slower half, a prefill's glue the larger.
+/// but where a chip's profile says (B200's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.w4a4_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct MoeW4a4FusedFrom(pub u32);

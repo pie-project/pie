@@ -346,6 +346,19 @@ fn the_tcgen05_grouped_gemm_answers_each_experts_dot_every_case() {
         }),
     );
     K128.store(false, std::sync::atomic::Ordering::Relaxed);
+    // NVFP4 swapped: the bank on P, an expert's rows on 64-row Q tiles (a
+    // decode's gate-up).
+    contiguous(
+        nv,
+        nv,
+        8,
+        [256, 512],
+        Some(Plan {
+            swap: true,
+            splits: 1,
+            ..lone(64).unwrap()
+        }),
+    );
     // CTA pairs: 256-row tiles, each CTA its expert's next 128 rows.
     let pair = Some(Plan {
         pair: true,

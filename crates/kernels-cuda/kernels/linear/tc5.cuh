@@ -273,10 +273,11 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     static_assert(kBN % 32 == 0 && kBN >= 32 && kBN <= 256, "the Q tile is 32..256 rows");
     static_assert(kKind >= 0 && kKind <= 4, "five kinds (4: NVFP4 at 128 K a stage)");
     static_assert(kPair == 1 || (kPair == 2 && !kSwap && kBN >= 64), "a pair splits a wide Q");
-    static_assert(kGroup == 0 || (((kGroup == 1) == !kSwap || (kGroup == 1 && kMix != 0)) &&
-                                  (kGroup == 1 || kPair == 1)),
-                  "contiguous groups run unswapped (a W4A16 one swapped too), masked swapped on "
-                  "lone CTAs");
+    static_assert(kGroup == 0 ||
+                      (((kGroup == 1) == !kSwap || (kGroup == 1 && (kMix != 0 || kKind == 3))) &&
+                       (kGroup == 1 || kPair == 1)),
+                  "contiguous groups run unswapped (a W4A16 or NVFP4 one swapped too), masked "
+                  "swapped on lone CTAs");
     static_assert(kGlu == 0 || kSwap || kBN == 256, "an unswapped GLU tile is gate 128 | up 128");
     static_assert(kGlu == 0 || !kSwap || kBN <= 128, "a swapped GLU tile holds two accumulators");
     static_assert(kMix == 0 || (kKind == 0 && kPair == 1), "W4A16 runs kind::f16 on lone CTAs");
@@ -312,7 +313,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     constexpr u32 kRowAtomsQ = (kBN + 127) / 128;
     // A contiguous P tile starts at either 64-row half: its scales span two
     // row blocks.
-    constexpr u32 kRowAtomsP = kGroup == 1 && kScaled ? 2 : 1;
+    constexpr u32 kRowAtomsP = kGroup == 1 && kScaled && !kSwap ? 2 : 1;
     constexpr u32 kSfP = kAtomsP * 512 * kPT * kRowAtomsP;  // this CTA's P rows (each P tile's)
     constexpr u32 kSfQ = kAtomsQ * kRowAtomsQ * 512;  // all of Q's rows, in each CTA
     // W4A16 (kMix 1 mxfp4: e2m1 under a ue8m0 a 32; 2 nvfp4: under an e4m3
@@ -365,7 +366,10 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     constexpr u32 kOffBar = kOffOut + kOutBytes;
     // A grouped launch holds the routing (offsets or counts) in shared memory:
     // every role reads it once a unit, empty units most.
-    constexpr u32 kGroupInts = kGroup == 0 ? 0 : 2 * 1028;
+    // Offsets and tile starts an expert; a swapped contiguous launch, each
+    // expert's live rows too.
+    constexpr bool kLives = kGroup == 1 && kSwap;
+    constexpr u32 kGroupInts = kGroup == 0 ? 0 : (kLives ? 3 : 2) * 1028;
     constexpr u32 kBytes = kOffBar + (3 * kStages + 16) * 8 + 8 + kGroupInts * 4;
 
     extern __shared__ unsigned char smem_raw[];
@@ -382,6 +386,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     u32* tmem_slot = reinterpret_cast<u32*>(sf_ready + 8);
     int* routes = reinterpret_cast<int*>(tmem_slot + 2);
     int* starts = routes + 1028;
+    int* lives = starts + 1028;  // kLives only
 
     const u32 warp = threadIdx.x / 32;
     const u32 lane = threadIdx.x % 32;
@@ -432,6 +437,14 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         for (int i = static_cast<int>(lane); i < experts + (kGroup == 1 ? 1 : 0); i += 32) {
             routes[i] = __ldg(&group[i]);
         }
+        __syncwarp();
+        if constexpr (kLives) {
+            // An expert's rows, but for its block's padding past the live ones.
+            for (int i = static_cast<int>(lane); i < experts; i += 32) {
+                const int rows = routes[i + 1] - routes[i];
+                lives[i] = epi.live != nullptr ? min(rows, __ldg(&epi.live[i])) : rows;
+            }
+        }
         {
             __syncwarp();
             const int per = (experts + 31) / 32;
@@ -440,9 +453,9 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             // An expert's tiles: its rows' 128-row tiles by the Q tiles.
             auto tiles_of = [&](int e) {
                 if constexpr (kGroup == 1 && kSwap) {
-                    // Swapped (W4A16): its rows' kBN-row Q tiles by its
-                    // weight's 128-row P tiles.
-                    return (routes[e + 1] - routes[e] + kBN - 1) / kBN * masked_p;
+                    // Swapped (W4A16, a decode's NVFP4): its live rows'
+                    // kBN-row Q tiles by its weight's 128-row P tiles.
+                    return (lives[e] + kBN - 1) / kBN * masked_p;
                 } else if constexpr (kGroup == 1) {
                     return (routes[e + 1] - routes[e] + kM - 1) / kM * cont_q;
                 } else {
@@ -532,7 +545,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             const int r = t - starts[e];
             if constexpr (kGroup == 1 && kSwap) {
                 // An expert's row tiles walk fastest, sharing its weight tile.
-                const int q_tiles = (routes[e + 1] - routes[e] + kBN - 1) / kBN;
+                const int q_tiles = (lives[e] + kBN - 1) / kBN;
                 pt = r / q_tiles;
                 qt = r - pt * q_tiles;
             } else if constexpr (kGroup == 1) {
@@ -573,7 +586,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             x.out_p = pt * 128;
             x.out_q = x.q_row;
             x.lim_p = span - pt * 128;
-            x.lim_q = routes[e + 1] - x.q_row;
+            // Past the expert's live rows its block is padding.
+            x.lim_q = lives[e] - qt * kBN;
         } else if constexpr (kGroup == 1) {
             // A tile starts at its expert's rows, either 64-row half (the
             // MMA faults on A-side scales at an odd quarter): its
@@ -1223,7 +1237,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 }
             };
             auto product = [&](u32 c0, float (&h)[32]) {
-                if (dead) {
+                // A swapped chunk wholly past the tile's rows lands nothing.
+                if (dead || (kSwap && static_cast<int>(c0) >= x.lim_q)) {
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
                         h[j] = 0.f;
@@ -1367,16 +1382,30 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     }
                 } else if constexpr (kSwap && kOut == 2) {
                     // A token's 16-wide NVFP4 block is 16 lanes; lane pairs
-                    // share a byte.
+                    // share a byte. Under an input scale an expert, the
+                    // tile's expert's global, each value rounded to bf16.
+                    float gs = epi.gscale;
+                    if (epi.in_scale != nullptr) {
+                        gs = __fdiv_rn(1.f, __ldg(&epi.in_scale[x.e]));
+#pragma unroll
+                        for (int j = 0; j < 32; ++j) {
+                            h[j] = bf16_to_f32(f32_to_bf16(h[j]));
+                        }
+                    }
+                    // A chunk wholly past the tile's rows lands nothing.
+                    const int rows_left = x.lim_q - j0;
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
+                        if (j >= rows_left) {
+                            break;
+                        }
                         float m = live ? fabsf(h[j]) : 0.f;
 #pragma unroll
                         for (int d = 8; d > 0; d >>= 1) {
                             m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, d));
                         }
                         float scale;
-                        const unsigned char code = tc5k::nvfp4_scale(m, epi.gscale, scale);
+                        const unsigned char code = tc5k::nvfp4_scale(m, gs, scale);
                         const float mine = live ? h[j] * scale : 0.f;
                         const float odd = __shfl_down_sync(0xffffffffu, mine, 1);
                         if (j0 + j < x.lim_q && live) {

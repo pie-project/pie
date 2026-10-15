@@ -305,6 +305,7 @@ const fn smem_bytes(
     plan: Plan,
     pt: u32,
     p_blocks: u32,
+    lives: bool,
 ) -> u32 {
     let Plan {
         swap,
@@ -333,8 +334,10 @@ const fn smem_bytes(
     let out = (stages * stage).div_ceil(128) * 128;
     let out = (out + stages * raw).div_ceil(1024) * 1024;
     let bar = out + if swap { 1024 } else { 4 * 2 * 2048 };
-    // The routing a grouped launch holds is reserved for every launch.
-    bar + (3 * stages + 16) * 8 + 8 + MAX_ROUTES * 8 + 1024
+    // The routing a grouped launch holds is reserved for every launch; a
+    // swapped contiguous one holds each expert's live rows too.
+    let routing = MAX_ROUTES * if lives { 12 } else { 8 };
+    bar + (3 * stages + 16) * 8 + 8 + routing + 1024
 }
 
 /// One shape's specialization: which side is the MMA's M, whether two CTAs
@@ -405,10 +408,26 @@ impl Plan {
         }
     }
 
-    fn staged(mut self, kind: Kind, gran_p: u32, gran_q: u32, pt: u32, p_blocks: u32) -> Self {
+    fn staged(
+        mut self,
+        kind: Kind,
+        gran_p: u32,
+        gran_q: u32,
+        pt: u32,
+        p_blocks: u32,
+        lives: bool,
+    ) -> Self {
         let mut stages = 8;
         while stages > 2
-            && smem_bytes(kind, gran_p, gran_q, Self { stages, ..self }, pt, p_blocks) > SMEM_CAP
+            && smem_bytes(
+                kind,
+                gran_p,
+                gran_q,
+                Self { stages, ..self },
+                pt,
+                p_blocks,
+                lives,
+            ) > SMEM_CAP
         {
             stages -= 1;
         }
@@ -913,10 +932,10 @@ pub fn grouped_gemm_epi_with(
     let job = match g.groups {
         Groups::Contiguous { offsets, rows } => {
             let swap = plan.swap;
-            if swap && !matches!(kind, Kind::Mixed(_)) {
+            if swap && !matches!(kind, Kind::Mixed(_) | Kind::Nvf4) {
                 return Err(refuse(
                     OP,
-                    "a contiguous group runs unswapped (a W4A16 one swapped too)",
+                    "a contiguous group runs unswapped (a W4A16 or an NVFP4 one swapped too)",
                 ));
             }
             if rows == 0 {
@@ -1128,10 +1147,16 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let pt = if glu && job.plan.swap { 2 } else { 1 };
     let halves = glu && !job.plan.swap;
     let gran = |o: Operand| o.scales.map_or(128, |s| s.gran);
-    // A contiguous tile starting mid-block reads two row blocks of scales.
-    let p_blocks = if group.mode == 1 { 2 } else { 1 };
-    let plan = job.plan.staged(kind, gran(p), gran(q), pt, p_blocks);
-    let smem = smem_bytes(kind, gran(p), gran(q), plan, pt, p_blocks);
+    // A contiguous tile starting mid-block reads two row blocks of scales
+    // (unswapped: its rows on P; swapped, P is the bank's whole blocks).
+    let p_blocks = if group.mode == 1 && !job.plan.swap {
+        2
+    } else {
+        1
+    };
+    let lives = group.mode == 1 && job.plan.swap;
+    let plan = job.plan.staged(kind, gran(p), gran(q), pt, p_blocks, lives);
+    let smem = smem_bytes(kind, gran(p), gran(q), plan, pt, p_blocks, lives);
     let ctas = if plan.pair { 2 } else { 1 };
     let [rows_p, rows_q] = job.rows;
 
@@ -1585,9 +1610,9 @@ mod tests {
                     stages: 0,
                     splits: 0,
                 }
-                .staged(kind, g, g, 1, 1);
+                .staged(kind, g, g, 1, 1, false);
                 assert!(plan.stages >= 3, "{kind:?} bn={bn}: {plan:?}");
-                assert!(smem_bytes(kind, g, g, plan, 1, 1) <= SMEM_CAP);
+                assert!(smem_bytes(kind, g, g, plan, 1, 1, false) <= SMEM_CAP);
             }
         }
     }

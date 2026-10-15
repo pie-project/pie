@@ -850,9 +850,12 @@ pub fn experts(
 /// (rounded through bf16 first, as the GLU's row and the down select's
 /// quantizer would land it), and the weighted sum reading the down product
 /// where it lies. A fire under `kernel.moe.w4a4_fused_from` tokens runs the
-/// four apart (a decode's few rows an expert leave the GLU epilogue slower
-/// than the glue it saves), as does one narrow enough to lay its routes out
-/// masked.
+/// four apart, as does one narrow enough to lay its routes out masked; a
+/// decode's few rows an expert run the gate-up swapped.
+/// The most routes an expert on average whose W4A4 gate-up runs swapped.
+#[cfg(feature = "cuda")]
+const SWAPPED_UP_ROUTES: u32 = 16;
+
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn experts_w4a4(
@@ -963,16 +966,32 @@ fn experts_w4a4(
         )?;
         let hq = ctx.scratch_stream(OP, W4A4_H, rows * inter as usize / 2)? as u64;
         let hs = ctx.scratch_stream(OP, W4A4_HS, tc5::atom_bytes(rows, inter as usize, 16))? as u64;
-        tc5::grouped_gemm_epi(
+        let grouped_up = tc5::Grouped {
+            experts,
+            groups: layout.groups,
+            alpha_e: up_alpha,
+        };
+        // A decode's few rows an expert run the gate-up swapped: a thread
+        // a weight row, its epilogue over the expert's rows alone (unswapped,
+        // a thread a row, the whole 128-row block's).
+        let sms = ctx.multiprocessors().unwrap_or(148);
+        let plan = if count <= SWAPPED_UP_ROUTES * experts {
+            tc5::Plan {
+                swap: true,
+                pair: false,
+                bn: 64,
+                stages: 0,
+                splits: 1,
+            }
+        } else {
+            tc5::Plan::grouped(&grouped_up, inter, k, count, sms)
+        };
+        tc5::grouped_gemm_epi_with(
             ctx,
             tc5::Operand::scaled(xq, tc5::Elem::E2m1, xs, 16),
             tc5::Operand::scaled(up_codes.ptr, tc5::Elem::E2m1, up_atoms.ptr, 16),
             hq,
-            tc5::Grouped {
-                experts,
-                groups: layout.groups,
-                alpha_e: up_alpha,
-            },
+            grouped_up,
             [inter, k],
             1.0,
             tc5::Epilogue {
@@ -986,7 +1005,7 @@ fn experts_w4a4(
                 input_scales: down_is.ptr,
                 ..tc5::Epilogue::STORE
             },
-            count,
+            plan,
         )?;
         let ys = ctx.scratch_stream(OP, W4A4_Y, rows * n as usize * 2)? as u64;
         tc5::grouped_gemm_epi(
