@@ -10,5 +10,7 @@ qmm = [
   { when = "rows >= 12", use = "tiled", crossover_tg = 96 },
   { use = "qmv", rows_max = 8, packs = 1, crossover_tg = 96 },
 ]
+# A decode row reads each key and value once for its kv head's group of query heads.
+sdpa.gqa        = true
 ane.mlp         = [{ when = "ane", use = "share", percent = 47 }, "gpu"]
 ane.projections = [{ when = "ane", use = "share", percent = 47 }, "gpu"]
