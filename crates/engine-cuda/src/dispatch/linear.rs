@@ -1644,6 +1644,7 @@ fn unlaid(op: &'static str) -> kernels_cuda::Error {
 const EXPERT_ALPHA: &str = "linear.act_quant.expert_alpha";
 /// A W4A8 select's activations read back to bf16, for the register-dequant
 /// kernel.
+#[cfg(feature = "cuda")]
 const READ_BACK: &str = "linear.act_quant.read_back";
 
 const STAGED_EXPERT_BYTES: u64 = 1536 * 1024 * 1024;

@@ -61,6 +61,7 @@ impl Run<'_> {
         };
         // A prefill's rows, where the profile says
         // (`kernel.sdpa.dsv4_prefill_from`): the four in one tcgen05 pass.
+        #[cfg(feature = "cuda")]
         if let (
             poem_ir::Attention::PrefillLse {
                 q,
