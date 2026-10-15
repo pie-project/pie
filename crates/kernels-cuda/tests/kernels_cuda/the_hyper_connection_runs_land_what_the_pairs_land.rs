@@ -130,3 +130,52 @@ fn the_routed_swiglu_and_sum_runs_land_what_the_elements_land() {
     );
     assert!(y.iter().any(|&v| v != 0), "the sum landed");
 }
+
+// The packed tanh GeGLU takes the same 16-byte runs and lands the same bits
+// as its element walk, each the host's gelu(gate) * up.
+#[test]
+fn the_packed_geglu_runs_land_what_the_elements_land() {
+    use kernels_cuda::linear::mlp;
+    const ROWS: usize = 7;
+    const INTER: usize = 136;
+    let mut gpu = Gpu::open();
+    let mut rng = Lcg::seeded(0x9e_61);
+    let (packed, values) = rng.row(ROWS * 2 * INTER);
+    let shifted = |v: &[u16]| -> Vec<u16> { [&[0u16][..], v].concat() };
+    let (p_at, p1_at) = (gpu.up(&packed), gpu.up(&shifted(&packed)));
+    let (y_at, y1_at) = (
+        gpu.zeros(ROWS * INTER * 2 + 16),
+        gpu.zeros(ROWS * INTER * 2 + 16),
+    );
+    let ctx = gpu.ctx();
+    let t = |at: u64, rows: usize, width: usize| {
+        Tensor::new(at, rows as u32, width as u32, Dtype::Bf16)
+    };
+    for (p, y) in [(p_at, y_at), (p1_at + 2, y1_at + 2)] {
+        mlp::geglu_tanh_packed(
+            &ctx,
+            t(p, ROWS, 2 * INTER),
+            INTER as u32,
+            1,
+            &mut t(y, ROWS, INTER),
+        )
+        .expect("the geglu fires");
+    }
+    gpu.sync();
+    let y: Vec<u16> = gpu.down(y_at, ROWS * INTER);
+    let y1: Vec<u16> = gpu.down(y1_at + 2, ROWS * INTER);
+    assert_eq!(y, y1, "the geglu's runs and its element walk land alike");
+    for r in 0..ROWS {
+        for i in 0..INTER {
+            let g = f64::from(values[r * 2 * INTER + i]);
+            let u = f64::from(values[r * 2 * INTER + INTER + i]);
+            let inner = (2.0 / std::f64::consts::PI).sqrt() * (g + 0.044_715 * g * g * g);
+            let want = 0.5 * g * (1.0 + inner.tanh()) * u;
+            let got = f64::from(crate::common::from_bf16(y[r * INTER + i]));
+            assert!(
+                (got - want).abs() <= 1e-2 * want.abs().max(1.0),
+                "row {r}, column {i}: {got} against {want}"
+            );
+        }
+    }
+}
