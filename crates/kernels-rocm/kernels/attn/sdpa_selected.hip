@@ -31,7 +31,7 @@ __global__ __launch_bounds__(kBlock) void sdpa_paged_selected_kernel(
     const u32* __restrict__ qo_indptr, const u32* __restrict__ page_indices,
     const u32* __restrict__ page_indptr, const u32* __restrict__ last_page_lens,
     const i32* __restrict__ selection, T* __restrict__ o, i32 R, i32 H, i32 KVH, i32 D,
-    i32 page_size, float sm_scale, i32 top_k, i32 ratio, i32 G, const u32* __restrict__ win) {
+    i32 page_size, float sm_scale, i32 top_k, i32 ratio, i32 G, i32 per_head, const u32* __restrict__ win) {
     const Window window{win};
     const int t = static_cast<int>(blockIdx.x);
     if (!window.live(t)) return;
@@ -63,7 +63,8 @@ __global__ __launch_bounds__(kBlock) void sdpa_paged_selected_kernel(
 
     const int nblocks = ratio > 0 ? j_end / ratio : 0;
     const int blocks = min(top_k, nblocks);
-    const i32* srow = selection + t_row * top_k;
+    // Per head, the row holds a run of top_k for each kv head.
+    const i32* srow = per_head ? selection + (t_row * KVH + kv_head) * top_k : selection + t_row * top_k;
 
     extern __shared__ float smem[];
     float* gacc = smem;
@@ -202,7 +203,7 @@ __global__ __launch_bounds__(kSelThreads) void sdpa_selected_mfma(
     const u32* __restrict__ page_indices, const u32* __restrict__ page_indptr,
     const u32* __restrict__ last_page_lens, const i32* __restrict__ selection,
     bf16* __restrict__ o, float* __restrict__ part, i32 R, i32 H, i32 KVH, i32 page_size,
-    float scale_log2, i32 top_k, i32 ratio, const u32* __restrict__ win) {
+    float scale_log2, i32 top_k, i32 ratio, i32 per_head, const u32* __restrict__ win) {
     constexpr int WAVES = kSelWaves, SUB = 16, KP = D / 32;
     // Columns a lane accumulates: four in a wide group, whose eight would not
     // fit the registers beside the round's reads.
@@ -244,7 +245,7 @@ __global__ __launch_bounds__(kSelThreads) void sdpa_selected_mfma(
     const int nblocks = j_end / ratio;
     const int blocks = min(top_k, nblocks);
     const int entries = blocks + 1;  // the open block last
-    const i32* srow = selection + t_row * top_k;
+    const i32* srow = per_head ? selection + (t_row * KVH + kv_head) * top_k : selection + t_row * top_k;
     const u32* pidx = page_indices + pages_first;
 
     // Qᵀ as B operands (this lane's column is head g, k pairs 8·quad), in

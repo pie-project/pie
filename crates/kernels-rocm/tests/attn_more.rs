@@ -437,6 +437,23 @@ fn selected_prefill_tiled_reads_the_named_blocks_and_the_open_one() {
     check_selected_as(&gpu, 12, 1, 128, 16, 4, 32, &[200, 1], &[50, 500], false, true, 94);
 }
 
+/// MiniMax-M3's per-kv-head selections: 16 query heads over each of four kv
+/// heads (and two, for the tiled walk), each kv head's run its own, on the
+/// vector, matrix-core and tiled walks, decode and prefill.
+#[test]
+fn a_per_head_selection_reads_each_kv_heads_own_blocks() {
+    let Some(gpu) = Gpu::open() else { return };
+    // The vector walk (a 96-wide head), the matrix-core one (128).
+    for d in [96u32, 128] {
+        check_selected_heads(&gpu, 16, 4, d, 16, 8, 4, &[1, 1, 1], &[90, 7, 300], true, false, true, 101);
+        check_selected_heads(&gpu, 16, 4, d, 16, 8, 4, &[9, 3], &[40, 200], false, false, true, 102);
+    }
+    // MiniMax-M3's 128-key blocks, 16 of them a head.
+    check_selected_heads(&gpu, 64, 4, 128, 64, 128, 16, &[1, 1], &[2900, 1500], true, false, true, 103);
+    // The tiled prefill.
+    check_selected_heads(&gpu, 32, 2, 128, 16, 8, 8, &[130, 3, 61], &[300, 900, 41], false, true, true, 104);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_selected(
     gpu: &Gpu,
@@ -469,6 +486,30 @@ fn check_selected_as(
     tiled: bool,
     seed: u64,
 ) {
+    check_selected_heads(
+        gpu, hq, hk, d, ps, ratio, top_k, fresh, prefix, decode, tiled, false, seed,
+    );
+}
+
+/// As `check_selected_as`, with `per_head` a run of `top_k` blocks for each
+/// kv head (MiniMax-M3's indexer), each head's queries reading their own.
+#[allow(clippy::too_many_arguments)]
+fn check_selected_heads(
+    gpu: &Gpu,
+    hq: u32,
+    hk: u32,
+    d: u32,
+    ps: usize,
+    ratio: u32,
+    top_k: u32,
+    fresh: &[u32],
+    prefix: &[u32],
+    decode: bool,
+    tiled: bool,
+    per_head: bool,
+    seed: u64,
+) {
+    let runs = if per_head { hk } else { 1 };
     let ctx = gpu.ctx();
     let kv_lens: Vec<u32> = fresh.iter().zip(prefix).map(|(f, p)| f + p).collect();
     let Cache {
@@ -484,11 +525,13 @@ fn check_selected_as(
     // some -1.
     let mut sel = Vec::new();
     for t in 0..total {
-        for n in 0..top_k as i32 {
-            sel.push(match (t as i32 + n) % 4 {
-                0 => -1,
-                _ => (n * 3 + t as i32) % (4 * top_k as i32).max(20),
-            });
+        for kh in 0..runs as i32 {
+            for n in 0..top_k as i32 {
+                sel.push(match (t as i32 + n + kh) % 4 {
+                    0 => -1,
+                    _ => (n * 3 + t as i32 + 5 * kh) % (4 * top_k as i32).max(20),
+                });
+            }
         }
     }
     // Distinct: (n·3 + t) mod M repeats only when 3·Δn ≡ 0 (mod M).
@@ -496,7 +539,7 @@ fn check_selected_as(
         data: gpu.tensor(&qs, total as u32, hq * d, Dtype::Bf16),
         indptr: gpu.column(&qo),
     };
-    let selection = gpu.ints_shaped(&sel, total as u32, top_k);
+    let selection = gpu.ints_shaped(&sel, total as u32, top_k * runs);
     let scale = 1.0 / (d as f32).sqrt();
     let mut o = gpu.zeros(total as u32, hq * d, Dtype::Bf16);
     if tiled {
@@ -540,19 +583,19 @@ fn check_selected_as(
         .unwrap();
         built.stage(&ctx).unwrap();
         let took = attn::prefill_selected_tiled(
-            &ctx, q, &built, selection, &pool, None, d, hk, scale, ratio, &mut o,
+            &ctx, q, &built, selection, &pool, None, d, hk, scale, ratio, per_head, &mut o,
         )
         .unwrap();
         assert!(took, "the tiled selected prefill refused d{d} {hq}/{hk}");
         gpu.sync();
     } else if decode {
         selected::attention_decode_selected(
-            &ctx, q, selection, &pool, None, d, scale, ratio, &mut o,
+            &ctx, q, selection, &pool, None, d, scale, ratio, per_head, &mut o,
         )
         .unwrap();
     } else {
         selected::attention_prefill_selected(
-            &ctx, q, selection, &pool, None, d, hk, scale, ratio, &mut o,
+            &ctx, q, selection, &pool, None, d, hk, scale, ratio, per_head, &mut o,
         )
         .unwrap();
     }
@@ -563,24 +606,29 @@ fn check_selected_as(
             let t = qo[r] as usize + i;
             let j_end = prefix[r] as usize + i + 1;
             let nblocks = j_end / ratio_;
-            let mut picked: Vec<usize> = Vec::new();
-            for n in 0..(top_k as usize).min(nblocks) {
-                let c = sel[t * top_k as usize + n];
-                if c >= 0 && (c as usize) < nblocks {
-                    assert!(
-                        !picked.contains(&(c as usize)),
-                        "the test's selection repeats"
-                    );
-                    picked.push(c as usize);
+            let keys_of = |run: usize| {
+                let mut picked: Vec<usize> = Vec::new();
+                let base = (t * runs as usize + run) * top_k as usize;
+                for n in 0..(top_k as usize).min(nblocks) {
+                    let c = sel[base + n];
+                    if c >= 0 && (c as usize) < nblocks {
+                        assert!(
+                            !picked.contains(&(c as usize)),
+                            "the test's selection repeats"
+                        );
+                        picked.push(c as usize);
+                    }
                 }
-            }
-            let mut ks_: Vec<usize> = picked
-                .iter()
-                .flat_map(|&c| c * ratio_..(c + 1) * ratio_)
-                .collect();
-            ks_.extend(nblocks * ratio_..j_end);
+                let mut ks_: Vec<usize> = picked
+                    .iter()
+                    .flat_map(|&c| c * ratio_..(c + 1) * ratio_)
+                    .collect();
+                ks_.extend(nblocks * ratio_..j_end);
+                ks_
+            };
             for h in 0..hq as usize {
                 let kh = h / g;
+                let ks_ = keys_of(if per_head { kh } else { 0 });
                 let at = |j: usize| (j * hk as usize + kh) * d_;
                 let want = attend(
                     &qs[(t * hq as usize + h) * d_..(t * hq as usize + h + 1) * d_],
@@ -594,7 +642,7 @@ fn check_selected_as(
                     f64::from(scale),
                 );
                 close_abs(
-                    &format!("selected d{d} g{g} row {t} head {h}"),
+                    &format!("selected d{d} g{g} per_head {per_head} row {t} head {h}"),
                     &got[(t * hq as usize + h) * d_..(t * hq as usize + h + 1) * d_],
                     &want,
                     1e-2,
@@ -635,7 +683,7 @@ fn bench_selected_decode() {
         let mut o = gpu.zeros(lanes as u32, hq * d, Dtype::Bf16);
         let us = gpu.time_graph(50, || {
             selected::attention_decode_selected(
-                &ctx, q, selection, &pool, None, d, 0.0625, ratio, &mut o,
+                &ctx, q, selection, &pool, None, d, 0.0625, ratio, false, &mut o,
             )
             .unwrap();
         });

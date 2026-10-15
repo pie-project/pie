@@ -197,6 +197,7 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 ratio,
+                per_head,
                 o,
             } => selected::attention_decode_selected(
                 self.ctx(),
@@ -207,6 +208,7 @@ impl Run<'_> {
                 *head_dim,
                 *sm_scale,
                 *ratio,
+                *per_head,
                 &mut self.tensor(*o),
             ),
             Attention::PrefillSelected {
@@ -219,6 +221,7 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 ratio,
+                per_head,
                 o,
             } => {
                 // The rows' causal plan walks them a tile at a time, the
@@ -236,6 +239,7 @@ impl Run<'_> {
                         *kv_heads,
                         *sm_scale,
                         *ratio,
+                        *per_head,
                         &mut self.tensor(*o),
                     )?
                 {
@@ -251,6 +255,7 @@ impl Run<'_> {
                     *kv_heads,
                     *sm_scale,
                     *ratio,
+                    *per_head,
                     &mut self.tensor(*o),
                 )
             }

@@ -276,9 +276,11 @@ pub struct PrefillSel {
     pub selection: u64,
     pub top_k: i32,
     pub ratio: i32,
+    /// Nonzero: the row holds a run of `top_k` for each kv head.
+    pub per_head: i32,
 }
 
-const _: () = assert!(core::mem::size_of::<PrefillSel>() == 16);
+const _: () = assert!(core::mem::size_of::<PrefillSel>() == 24);
 
 /// The tokens of a 128-row tile whose selections the selected prefill holds
 /// (`kSelTokens`), and the pooled blocks a token's bitmap spans

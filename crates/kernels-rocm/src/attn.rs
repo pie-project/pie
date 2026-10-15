@@ -271,6 +271,7 @@ pub fn prefill_selected_tiled(
     kv_heads: u32,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
     o: &mut Tensor,
 ) -> Result<bool, Error> {
     const OP: &str = "attention.prefill_selected";
@@ -308,10 +309,16 @@ pub fn prefill_selected_tiled(
     }
     attention_lands(OP, q.data, o);
     lanes_carry(OP, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
+    // Per head, the row holds one run of blocks for each kv head.
+    let runs = if per_head { kv_heads } else { 1 };
+    if selection.width == 0 || selection.width % runs != 0 {
+        return Ok(false);
+    }
     let sel = paged::PrefillSel {
         selection: selection.ptr,
-        top_k: stated(OP, selection.width)?,
+        top_k: stated(OP, selection.width / runs)?,
         ratio: stated(OP, ratio)?,
+        per_head: i32::from(per_head),
     };
     paged::prefill_selected(ctx, OP, q, plan, pool, sm_scale, o, sel)?;
     Ok(true)

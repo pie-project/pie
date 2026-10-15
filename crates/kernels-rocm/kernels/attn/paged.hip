@@ -879,9 +879,10 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
 // the request's queries share every K and V read instead of each row
 // streaming its own keys.
 struct PrefillSel {
-    const i32* selection;  // [row][top_k], the rows of q
+    const i32* selection;  // [row][top_k], the rows of q; per head [row][kv head][top_k]
     i32 top_k;
     i32 ratio;
+    i32 per_head;
 };
 constexpr int kSelTokens = 16;
 constexpr int kSelBlocks = 2048;
@@ -959,7 +960,10 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
             const int r = i / sel.top_k, e = i % sel.top_k;
             const int nb = sel_blocks[r];
             if (e >= min(sel.top_k, nb)) continue;
-            const int c = sel.selection[static_cast<long long>(q_first + tok_lo + r) * sel.top_k + e];
+            const long long row = q_first + tok_lo + r;
+            const int c = sel.per_head
+                              ? sel.selection[(row * p.num_kv_heads + kv_head) * sel.top_k + e]
+                              : sel.selection[row * sel.top_k + e];
             if (c >= 0 && c < nb) atomicOr(&sel_bits[r][c / 32], 1u << (c % 32));
         }
         __syncthreads();
