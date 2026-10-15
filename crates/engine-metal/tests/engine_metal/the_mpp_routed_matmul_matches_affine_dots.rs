@@ -149,6 +149,7 @@ moe.tile_rows = [
                 },
                 y,
                 &tuning,
+                moe::Sorted::default(),
             )
             .expect("the routed matmul fires");
             assert!(batched, "these routes are wide enough to batch");

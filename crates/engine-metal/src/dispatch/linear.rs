@@ -238,12 +238,23 @@ impl Run<'_> {
                 packed,
                 intermediate,
                 y,
-            } => linear::mlp::swiglu(
-                self.ctx(),
-                self.tensor(*packed),
-                *intermediate,
-                self.tensor(*y),
-            ),
+            } => match self.chain_swiglu(*packed, *y) {
+                // The chain's gate-up rows sit sorted in the routed stack's
+                // output: the swiglu runs there and lands in its input.
+                Some((sorted_packed, sorted_h, perm)) => linear::mlp::swiglu_sorted(
+                    self.ctx(),
+                    sorted_packed,
+                    *intermediate,
+                    perm,
+                    sorted_h,
+                ),
+                None => linear::mlp::swiglu(
+                    self.ctx(),
+                    self.tensor(*packed),
+                    *intermediate,
+                    self.tensor(*y),
+                ),
+            },
             Linear::MlpSwigluClamp {
                 packed,
                 intermediate,
@@ -484,6 +495,7 @@ impl Run<'_> {
                         scratch,
                         self.tensor(*y),
                         self.tuning(),
+                        linear::moe::Sorted::default(),
                     )?
                 {
                     return Ok(());
@@ -499,8 +511,9 @@ impl Run<'_> {
             }
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
                 const OP: &str = "linear.moe_matmul_select_quant";
-                if let Some(scratch) = self.routed_scratch()
-                    && linear::moe::matmul_select_batched(
+                if let Some(scratch) = self.routed_scratch() {
+                    let sorted = self.chain_select(*x, *routes, *y);
+                    if linear::moe::matmul_select_batched(
                         self.ctx(),
                         OP,
                         self.tensor(*x),
@@ -511,9 +524,15 @@ impl Run<'_> {
                         scratch,
                         self.tensor(*y),
                         self.tuning(),
-                    )?
-                {
-                    return Ok(());
+                        sorted,
+                    )? {
+                        return Ok(());
+                    }
+                    debug_assert!(
+                        !sorted.input && !sorted.output,
+                        "a chain starts only where the batched matmul runs"
+                    );
+                    self.chain_clear();
                 }
                 linear::moe::matmul_select_quant(
                     self.ctx(),
@@ -538,12 +557,22 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*y_out),
             ),
-            Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(
-                self.ctx(),
-                self.tensor(*routed),
-                self.tensor(*weights),
-                self.tensor(*y),
-            ),
+            Linear::MoeWeightedSum { routed, weights, y } => match self.chain_combine(*routed) {
+                Some((sorted, inv, top_k)) => linear::moe::weighted_sum_sorted(
+                    self.ctx(),
+                    sorted,
+                    inv,
+                    self.tensor(*weights),
+                    top_k,
+                    self.tensor(*y),
+                ),
+                None => linear::moe::weighted_sum(
+                    self.ctx(),
+                    self.tensor(*routed),
+                    self.tensor(*weights),
+                    self.tensor(*y),
+                ),
+            },
             Linear::MoeBiasSum {
                 x,
                 bias,
