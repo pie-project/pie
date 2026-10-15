@@ -19,6 +19,7 @@ fn check(code: rt::cudaError, call: &str) {
 }
 
 fn upload(at: u64, values: &[u16]) {
+    let _legacy = crate::common::legacy();
     unsafe {
         check(
             rt::cudaMemcpy(
@@ -33,6 +34,7 @@ fn upload(at: u64, values: &[u16]) {
 }
 
 fn upload_u32(at: u64, values: &[u32]) {
+    let _legacy = crate::common::legacy();
     unsafe {
         check(
             rt::cudaMemcpy(
@@ -47,6 +49,7 @@ fn upload_u32(at: u64, values: &[u32]) {
 }
 
 fn upload_i32(at: u64, values: &[i32]) {
+    let _legacy = crate::common::legacy();
     unsafe {
         check(
             rt::cudaMemcpy(
@@ -117,6 +120,7 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
     gpu.sync();
 
     let stream = ctx.stream();
+    let alone = crate::common::capturing();
     let exec = unsafe {
         check(
             rt::cudaStreamBeginCapture(
@@ -139,6 +143,7 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
         );
         exec
     };
+    drop(alone);
 
     let (q1, _) = lcg.row(rows * qw);
     let (k1, _) = lcg.row(rows * kw);

@@ -68,6 +68,7 @@ impl Gpu {
     }
 
     pub fn zeros(&mut self, bytes: usize) -> u64 {
+        let _legacy = legacy();
         unsafe {
             let mut at: *mut c_void = core::ptr::null_mut();
             check(rt::cudaMalloc(&raw mut at, bytes.max(1)), "cudaMalloc");
@@ -81,6 +82,7 @@ impl Gpu {
         let bytes = core::mem::size_of_val(values);
         let at = self.zeros(bytes.max(1));
         if bytes > 0 {
+            let _legacy = legacy();
             unsafe {
                 check(
                     rt::cudaMemcpy(
@@ -98,6 +100,7 @@ impl Gpu {
 
     pub fn down<T: Copy + Default>(&self, at: u64, count: usize) -> Vec<T> {
         let mut out = vec![T::default(); count];
+        let _legacy = legacy();
         unsafe {
             check(
                 rt::cudaMemcpy(
@@ -124,6 +127,7 @@ impl Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
+        let _legacy = legacy();
         unsafe {
             rt::cudaStreamSynchronize(self.stream);
             for at in self.device.drain(..) {
@@ -210,6 +214,83 @@ pub const SM100: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {
     nvfp4_mma_until: 8192,
     ..kernels_cuda::tuning::Tuning::DEFAULT
 };
+
+/// Tests run on threads of one process, and a copy, set or free on the
+/// legacy stream syncs with every blocking stream, invalidating whatever
+/// capture another thread has open on one. Such calls hold this shared, a
+/// capture holds it alone.
+static CAPTURE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Held around a call on the legacy stream; see [`CAPTURE`].
+pub fn legacy() -> std::sync::RwLockReadGuard<'static, ()> {
+    CAPTURE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Held around a stream capture; see [`CAPTURE`].
+pub fn capturing() -> std::sync::RwLockWriteGuard<'static, ()> {
+    CAPTURE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The graph `body` fires on `ctx`'s stream, captured and instantiated.
+pub fn captured(
+    ctx: &Ctx,
+    body: impl FnOnce(),
+) -> kernels_cuda::cudarc::runtime::sys::cudaGraphExec_t {
+    use kernels_cuda::cudarc::runtime::sys as rt;
+    let ok = |code: rt::cudaError, call: &str| {
+        assert_eq!(
+            code,
+            rt::cudaError::cudaSuccess,
+            "`{call}` answered {code:?}"
+        );
+    };
+    let stream = ctx.stream();
+    let _alone = capturing();
+    unsafe {
+        ok(
+            rt::cudaStreamBeginCapture(
+                stream.cast(),
+                rt::cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal,
+            ),
+            "cudaStreamBeginCapture",
+        );
+        body();
+        let mut graph: rt::cudaGraph_t = core::ptr::null_mut();
+        ok(
+            rt::cudaStreamEndCapture(stream.cast(), &raw mut graph),
+            "cudaStreamEndCapture",
+        );
+        let mut exec: rt::cudaGraphExec_t = core::ptr::null_mut();
+        ok(
+            rt::cudaGraphInstantiateWithFlags(&raw mut exec, graph, 0),
+            "cudaGraphInstantiateWithFlags",
+        );
+        rt::cudaGraphDestroy(graph);
+        exec
+    }
+}
+
+/// Launches a [`captured`] graph on `ctx`'s stream.
+pub fn replay(ctx: &Ctx, exec: kernels_cuda::cudarc::runtime::sys::cudaGraphExec_t) {
+    use kernels_cuda::cudarc::runtime::sys as rt;
+    let code = unsafe { rt::cudaGraphLaunch(exec, ctx.stream().cast()) };
+    assert_eq!(
+        code,
+        rt::cudaError::cudaSuccess,
+        "`cudaGraphLaunch` answered {code:?}"
+    );
+}
+
+/// Destroys a [`captured`] graph.
+pub fn forget(exec: kernels_cuda::cudarc::runtime::sys::cudaGraphExec_t) {
+    unsafe {
+        kernels_cuda::cudarc::runtime::sys::cudaGraphExecDestroy(exec);
+    }
+}
 
 pub fn close(got: f32, want: f32) -> bool {
     (got - want).abs() <= TOLERANCE * want.abs().max(1.0)

@@ -40,6 +40,7 @@ fn a_body_captured_on_its_own_stream_takes_its_owners_tile() {
     let own = unsafe { Ctx::on(body).with_slabs(main.slabs()) };
     let in_order = unsafe { Ctx::on(body).with_slabs(main.slabs()) }.in_order_of(main.stream());
 
+    let alone = crate::common::capturing();
     unsafe {
         check(
             rt::cudaStreamBeginCapture(
@@ -60,6 +61,7 @@ fn a_body_captured_on_its_own_stream_takes_its_owners_tile() {
         check(rt::cudaGraphDestroy(graph), "cudaGraphDestroy");
         check(rt::cudaStreamDestroy(body.cast()), "cudaStreamDestroy");
     }
+    drop(alone);
 
     assert_eq!(
         shared.expect("a body in the main stream's order takes the main tile"),

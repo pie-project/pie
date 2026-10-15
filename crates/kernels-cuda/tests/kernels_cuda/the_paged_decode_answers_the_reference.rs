@@ -172,6 +172,7 @@ impl Fixture {
         if count != all {
             let seat = [count, first, count, first];
             self.gpu.sync();
+            let legacy = common::legacy();
             let copied = unsafe {
                 kernels_cuda::cudarc::runtime::sys::cudaMemcpy(
                     self.stage as *mut core::ffi::c_void,
@@ -184,6 +185,7 @@ impl Fixture {
                 copied,
                 kernels_cuda::cudarc::runtime::sys::cudaError::cudaSuccess
             );
+            drop(legacy);
             ctx.arm_stage(self.stage);
         }
         let shape = Shape {
@@ -344,6 +346,7 @@ impl Fixture {
     fn scrub(&self) {
         use kernels_cuda::cudarc::runtime::sys as rt;
         let rows = self.case.lens.len();
+        let _legacy = common::legacy();
         unsafe {
             rt::cudaMemset(
                 self.o as *mut core::ffi::c_void,
