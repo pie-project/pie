@@ -17,14 +17,15 @@
 //   O   = diag(e^G rq) Q S^T + tril(rq_i rk_j (q_i . k_j) e^{G_i - G_j}) NV
 //   S^T = e^{G_last} S^T + (diag(rk e^{G_last - G}) NV)^T K
 //
-// Two prep groups of four warps (0-3 and 10-13), one row a thread, take
-// alternate chunks: each reads k k^T and q k^T off the tensor cores, the
-// key norms off its diagonal and the query norms off the rows, forms A and
-// the decayed causal scores, and inverts I + A. Warps 4-7, the state group,
-// one value column a thread, keep the state: they hand its bf16 copy to the
-// products that read it, decay it, scale the products' outputs by the
-// per-row factors the prep groups land, and store the output. Warp 8 loads
-// K, Q and V by TMA; warp 9 owns TMEM and issues every MMA.
+// Two prep groups of four warps (0-3 and 8-11), one row a thread, take
+// alternate chunks: each issues its own k k^T and q k^T, reads them off the
+// tensor cores, the key norms off its diagonal and the query norms off the
+// rows, forms A and the decayed causal scores, and inverts I + A. Warps 4-7,
+// the state group, one value column a thread, keep the state: they hand its
+// bf16 copy to the products that read it, decay it, scale the products'
+// outputs by the per-row factors the prep groups land, and store the output;
+// their thread 0 issues the chain's products and the TMA loads, a chunk
+// ahead. Twelve warps leave each thread 168 registers.
 
 namespace pie::attn::gdn {
 
@@ -252,7 +253,7 @@ __device__ __forceinline__ bool advance(const Params& p, int lanes, Walk& w) {
     return next_tile(p, lanes, w);
 }
 
-__global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
+__global__ void __launch_bounds__(384, 1) gdn_chunked_tc5(
     const __grid_constant__ tc5::TmaMap map_qkv, const Params p) {
     using namespace tc5;
     extern __shared__ unsigned char smem_raw[];
@@ -280,6 +281,9 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
     u64* o_free = bars + 26;
     u64* kv_done = bars + 27;
     u32* tmem_slot = reinterpret_cast<u32*>(bars + 28);
+    // How many chunks' K S^T products the state group has issued: a prep
+    // group issues chunk c's k k^T after chunk c - 1's, as one MMA warp did.
+    volatile int* ks_issued = reinterpret_cast<volatile int*>(bars + 30);
 
     const int tid = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -311,9 +315,10 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
         bar_init(o_full, 1);
         bar_init(o_free, 128);
         bar_init(kv_done, 1);
+        *ks_issued = 0;
         bar_init_fence();
     }
-    if (warp == 9) {
+    if (warp == 0) {
         tmem_alloc(tmem_slot, 512);
         tmem_relinquish();
     }
@@ -325,113 +330,27 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
     Walk w{static_cast<int>(blockIdx.x), 0, 0, {}, 0, 0};
     bool live = next_tile(p, lanes, w);
 
-    if (warp == 8) {
-        if (l == 0 && live) {
-            tma_prefetch(&map_qkv);
-            int c = 0;
-            do {
-                const int s = c & 1;
-                const u32 ph = (c >> 1) & 1;
-                const int hk = w.h / group;
-                const int y = row0 + w.lane.t0 + w.j * CH;
-                unsigned char* kqb = smem + kKQ + s * kKQStage;
-                bar_wait(&kq_empty[s], ph ^ 1);
-                bar_arrive_expect_tx(&kq_full[s], kKQStage);
-                tma_load_3d(kqb, &kq_full[s], &map_qkv, K_dim + hk * 128, y, 0);
-                tma_load_3d(kqb + 8192, &kq_full[s], &map_qkv, hk * 128, y, 0);
-                tma_load_3d(kqb + 16384, &kq_full[s], &map_qkv, K_dim + hk * 128 + 64, y, 0);
-                tma_load_3d(kqb + 24576, &kq_full[s], &map_qkv, hk * 128 + 64, y, 0);
-                unsigned char* vb = smem + kV + s * kVStage;
-                bar_wait(&v_empty[s], ph ^ 1);
-                bar_arrive_expect_tx(&v_full[s], kVStage);
-                tma_load_3d(vb, &v_full[s], &map_qkv, 2 * K_dim + w.h * 128, y, 0);
-                tma_load_3d(vb + 8192, &v_full[s], &map_qkv, 2 * K_dim + w.h * 128 + 64, y, 0);
-                ++c;
-            } while (advance(p, lanes, w));
-        }
-    } else if (warp == 9) {
-        if (l == 0 && live) {
-            const u32 id128 = idesc_dense(kF16Bf16, kF16Bf16, 128, 128);
-            const u32 id64 = idesc_dense(kF16Bf16, kF16Bf16, 128, 64);
-            const u32 idkv = id128 | (1u << 16);
-            const u32 idv = id64 | (1u << 15);
-            // [K;Q] K^T of chunk c into its prep group's buffer.
-            auto kk = [&](int c) {
-                const int s = c & 1;
-                const u32 kqb = sbase + kKQ + s * kKQStage;
-                bar_wait(&kq_full[s], (c >> 1) & 1);
-                bar_wait(&kk_free[s], ((c >> 1) & 1) ^ 1);
-                tc_fence_after();
-#pragma unroll
-                for (u32 k = 0; k < 8; ++k) {
-                    const u64 d = sdesc_sw128(kqb + (k / 4) * 16384) + 2 * (k % 4);
-                    mma_f16(tmem + kColKK + s * 64, d, d, id64, k > 0);
-                }
-                tc_commit(&kk_full[s]);
-            };
-            kk(0);
-            int c = 0;
-            bool more = true;
-            while (more) {
-                const int s = c & 1;
-                const u32 ph = (c >> 1) & 1;
-                const u32 kqb = sbase + kKQ + s * kKQStage;
-                more = advance(p, lanes, w);
-                // [K;Q] S^T, the state's bf16 copy in TMEM as A.
-                bar_wait(si_full, c & 1);
-                if (c > 0) bar_wait(o_free, (c - 1) & 1);
-                tc_fence_after();
-#pragma unroll
-                for (u32 k = 0; k < 8; ++k) {
-                    mma_f16_ts(tmem + kColKS, tmem + kColSI + k * 8,
-                               sdesc_sw128(kqb + (k / 4) * 16384) + 2 * (k % 4), id128, k > 0);
-                }
-                tc_commit(ksqs_full);
-                // The next chunk's product, for the other prep group to work
-                // beside this one.
-                if (more) kk(c + 1);
-                // NV = T' V + T' (-diag(e^G rk) K S^T).
-                // Its D overwrites K S^T: the state group must have read it.
-                bar_wait(u_full, c & 1);
-                bar_wait(&t_full[s], ph);
-                bar_wait(&v_full[s], ph);
-                tc_fence_after();
-                const u32 tb = sbase + kT + s * 8192;
-                const u32 vb = sbase + kV + s * kVStage;
-#pragma unroll
-                for (u32 k = 0; k < 4; ++k) {
-                    mma_f16(tmem + kColKS, sdesc_sw128_mn(vb + k * 2048, 8192),
-                            sdesc_sw128(tb) + 2 * k, idv, k > 0);
-                }
-#pragma unroll
-                for (u32 k = 0; k < 4; ++k) {
-                    mma_f16_ts(tmem + kColKS, tmem + kColU + k * 8, sdesc_sw128(tb) + 2 * k, id64,
-                               true);
-                }
-                tc_commit(nv_full);
-                tc_commit(&v_empty[s]);
-                // O += P NV, then S^T += (decayed NV)^T K.
-                bar_wait(nvb_full, c & 1);
-                tc_fence_after();
-                const u32 qkb = sbase + kQK + s * 8192;
-#pragma unroll
-                for (u32 k = 0; k < 4; ++k) {
-                    mma_f16_ts(tmem + kColQS, tmem + kColU + k * 8, sdesc_sw128(qkb) + 2 * k, id64,
-                               true);
-                }
-                tc_commit(o_full);
-                tc_commit(&t_empty[s]);
-#pragma unroll
-                for (u32 k = 0; k < 4; ++k) {
-                    mma_f16_ts(tmem + kColS, tmem + kColD + k * 8,
-                               sdesc_sw128_mn(kqb + k * 2048, 16384), idkv, true);
-                }
-                tc_commit(kv_done);
-                tc_commit(&kq_empty[s]);
-                ++c;
-            }
-        }
-    } else if (warp < 4 || warp >= 10) {
+    const u32 id128 = idesc_dense(kF16Bf16, kF16Bf16, 128, 128);
+    const u32 id64 = idesc_dense(kF16Bf16, kF16Bf16, 128, 64);
+    const u32 idkv = id128 | (1u << 16);
+    const u32 idv = id64 | (1u << 15);
+    // Chunk c's K, Q and V by TMA into stage c & 1.
+    auto load = [&](const Walk& wl, int c) {
+        const int s = c & 1;
+        const int hk = wl.h / group;
+        const int y = row0 + wl.lane.t0 + wl.j * CH;
+        unsigned char* kqb = smem + kKQ + s * kKQStage;
+        bar_arrive_expect_tx(&kq_full[s], kKQStage);
+        tma_load_3d(kqb, &kq_full[s], &map_qkv, K_dim + hk * 128, y, 0);
+        tma_load_3d(kqb + 8192, &kq_full[s], &map_qkv, hk * 128, y, 0);
+        tma_load_3d(kqb + 16384, &kq_full[s], &map_qkv, K_dim + hk * 128 + 64, y, 0);
+        tma_load_3d(kqb + 24576, &kq_full[s], &map_qkv, hk * 128 + 64, y, 0);
+        unsigned char* vb = smem + kV + s * kVStage;
+        bar_arrive_expect_tx(&v_full[s], kVStage);
+        tma_load_3d(vb, &v_full[s], &map_qkv, 2 * K_dim + wl.h * 128, y, 0);
+        tma_load_3d(vb + 8192, &v_full[s], &map_qkv, 2 * K_dim + wl.h * 128 + 64, y, 0);
+    };
+    if (warp < 4 || warp >= 8) {
         // A prep group: the chunks of its parity. Thread i (by its TMEM lane)
         // holds row i of [K;Q] K^T: k k^T for i < 64, q k^T past it.
         if (live) {
@@ -462,6 +381,20 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
                 float* FD = FQ + CH;
                 const int ta = w.lane.t0 + w.j * CH;
                 const int L = min(CH, w.lane.t0 + w.lane.T - ta);
+                if (i128 == 0) {
+                    // [K;Q] K^T into this group's buffer, once the chunk lands.
+                    const u32 kqb = sbase + kKQ + s * kKQStage;
+                    bar_wait(&kq_full[s], ph);
+                    while (*ks_issued < c) {
+                    }
+                    tc_fence_after();
+#pragma unroll
+                    for (u32 k = 0; k < 8; ++k) {
+                        const u64 d = sdesc_sw128(kqb + (k / 4) * 16384) + 2 * (k % 4);
+                        mma_f16(tmem + kColKK + s * 64, d, d, id64, k > 0);
+                    }
+                    tc_commit(&kk_full[s]);
+                }
                 bar_wait(&cg1_done[s], ph ^ 1);
                 bar_wait(&t_empty[s], ph ^ 1);
                 if (quad == 0) {
@@ -757,6 +690,16 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
             const u32 lane_base = (static_cast<u32>(warp - 4) * 32u) << 16;
             const u32 tb = tmem + lane_base;
             const int stride_row = p.V_h * 128;
+            // Thread 0 loads one chunk ahead: chunks 0 and 1 now, chunk
+            // c + 1 once chunk c - 1's products are done with its stage.
+            Walk wl = w;
+            bool lmore = true;
+            if (v == 0) {
+                tma_prefetch(&map_qkv);
+                load(wl, 0);
+                lmore = advance(p, lanes, wl);
+                if (lmore) load(wl, 1);
+            }
             int c = 0;
             do {
                 const int s = c & 1;
@@ -771,6 +714,10 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
                                     static_cast<long long>(w.h) * 128 * 128;
                 bar_wait(kv_done, (c & 1) ^ 1);
                 tc_fence_after();
+                if (v == 0 && c >= 1 && lmore) {
+                    lmore = advance(p, lanes, wl);
+                    if (lmore) load(wl, c + 1);
+                }
                 if (w.j == 0) {
                     // The request's state, [key][value] in bf16, into S^T.
 #pragma unroll 1
@@ -803,7 +750,20 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
                 }
                 tmem_wait_st();
                 tc_fence_before();
-                bar_arrive(si_full);
+                named_sync(5, 128);
+                if (v == 0) {
+                    // [K;Q] S^T, the state's bf16 copy in TMEM as A.
+                    const u32 kqb = sbase + kKQ + s * kKQStage;
+                    tc_fence_after();
+                    bar_wait(&kq_full[s], ph);
+#pragma unroll
+                    for (u32 k = 0; k < 8; ++k) {
+                        mma_f16_ts(tmem + kColKS, tmem + kColSI + k * 8,
+                                   sdesc_sw128(kqb + (k / 4) * 16384) + 2 * (k % 4), id128, k > 0);
+                    }
+                    tc_commit(ksqs_full);
+                    *ks_issued = c + 1;
+                }
                 bar_wait(&g_full[s], ph);
                 {
                     const float el = FD[CH];
@@ -837,7 +797,26 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
                     tmem_st32(tb + kColU, pk);
                     tmem_wait_st();
                     tc_fence_before();
-                    bar_arrive(u_full);
+                    named_sync(5, 128);
+                    if (v == 0) {
+                        // NV = T' V + T' (-diag(e^G rk) K S^T), over K S^T.
+                        tc_fence_after();
+                        bar_wait(&t_full[s], ph);
+                        bar_wait(&v_full[s], ph);
+                        const u32 tbs = sbase + kT + s * 8192;
+                        const u32 vb = sbase + kV + s * kVStage;
+#pragma unroll
+                        for (u32 k = 0; k < 4; ++k) {
+                            mma_f16(tmem + kColKS, sdesc_sw128_mn(vb + k * 2048, 8192),
+                                    sdesc_sw128(tbs) + 2 * k, idv, k > 0);
+                        }
+#pragma unroll
+                        for (u32 k = 0; k < 4; ++k) {
+                            mma_f16_ts(tmem + kColKS, tmem + kColU + k * 8, sdesc_sw128(tbs) + 2 * k,
+                                       id64, true);
+                        }
+                        tc_commit(nv_full);
+                    }
                     tmem_ld32(tb + kColQS, k0);
                     tmem_ld32(tb + kColQS + 32, k1);
                     tmem_wait_ld();
@@ -875,7 +854,26 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
                     tmem_wait_st();
                 }
                 tc_fence_before();
-                bar_arrive(nvb_full);
+                named_sync(5, 128);
+                if (v == 0) {
+                    // S^T += (decayed NV)^T K, then O += P NV.
+                    tc_fence_after();
+                    const u32 kqb = sbase + kKQ + s * kKQStage;
+                    const u32 qkb = sbase + kQK + s * 8192;
+#pragma unroll
+                    for (u32 k = 0; k < 4; ++k) {
+                        mma_f16_ts(tmem + kColS, tmem + kColD + k * 8,
+                                   sdesc_sw128_mn(kqb + k * 2048, 16384), idkv, true);
+                    }
+                    tc_commit(kv_done);
+#pragma unroll
+                    for (u32 k = 0; k < 4; ++k) {
+                        mma_f16_ts(tmem + kColQS, tmem + kColU + k * 8, sdesc_sw128(qkb) + 2 * k,
+                                   id64, true);
+                    }
+                    tc_commit(o_full);
+                    tc_commit(&t_empty[s]);
+                }
 
                 // The output.
                 bar_wait(o_full, c & 1);
@@ -925,7 +923,7 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
     }
     tc_fence_before();
     __syncthreads();
-    if (warp == 9) {
+    if (warp == 0) {
         tc_fence_after();
         tmem_dealloc(tmem, 512);
     }

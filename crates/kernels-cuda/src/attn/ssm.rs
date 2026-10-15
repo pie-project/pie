@@ -942,7 +942,7 @@ fn gated_delta_chunked_tc5(
     ctx.fire(
         op,
         Fire::at(FILE_TC5, symbol("::pie::attn::gdn::gdn_chunked_tc5"))
-            .apply(Launch::grid([grid, 1, 1], [448, 1, 1]).smem(SMEM)),
+            .apply(Launch::grid([grid, 1, 1], [384, 1, 1]).smem(SMEM)),
         &[
             ArgValue::Bytes {
                 ptr: map.as_ptr().cast(),
