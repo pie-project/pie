@@ -124,7 +124,14 @@ __device__ __forceinline__ int owned(const u32* indptr, int req, int page) {
     return max(static_cast<int>(indptr[req + 1]) - static_cast<int>(indptr[req]), 0) * page;
 }
 
-__device__ __forceinline__ void pair_sync() { asm volatile("bar.sync 1, 128;" ::: "memory"); }
+// The two warps whose lanes hold a head's two halves (warps w and w + 2) meet.
+__device__ __forceinline__ void pair_sync(u32 warp) {
+    if (warp & 1) {
+        asm volatile("bar.sync 4, 64;" ::: "memory");
+    } else {
+        asm volatile("bar.sync 3, 64;" ::: "memory");
+    }
+}
 constexpr int kIssuers = 6;  // warp 4 and warps 6-10; warp 11 lists
 __device__ __forceinline__ void issue_sync() { asm volatile("bar.sync 2, %0;" ::"n"(kIssuers * 32) : "memory"); }
 
@@ -428,24 +435,38 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
             // of the partner's.
             const int mine0 = half * 32;
             const int theirs0 = (1 - half) * 32;
+            // Four floats a word, word w of thread t at (w * 128 + t): a
+            // warp's words land on distinct banks.
+            float4* x4 = reinterpret_cast<float4*>(xbuf);
 #pragma unroll
-            for (int i = 0; i < 32; ++i) xbuf[i * 128 + t] = part[theirs0 + i];
-            pair_sync();
-            // The tile's marks: the keys that count (the lead wrote them before
-            // arming the slot).
+            for (int w4 = 0; w4 < 8; ++w4) {
+                x4[w4 * 128 + t] = make_float4(part[theirs0 + 4 * w4], part[theirs0 + 4 * w4 + 1],
+                                               part[theirs0 + 4 * w4 + 2],
+                                               part[theirs0 + 4 * w4 + 3]);
+            }
+            pair_sync(warp);
+            // The tile's marks: the keys that count (listed ahead of the ring).
             bar_wait(&list_full[J % kLists], (J / kLists) & 1);
-            const u32* marks = lists + (J % kLists) * kBK;
+            const uint4* marks4 = reinterpret_cast<const uint4*>(lists + (J % kLists) * kBK + mine0);
             float s[32];
             float mx = neg_inf();
 #pragma unroll
-            for (int i = 0; i < 32; ++i) {
-                const float v = part[mine0 + i] + xbuf[i * 128 + (t ^ 64)];
-                s[i] = (marks[mine0 + i] & kValid) ? v * p.scale_log2 : neg_inf();
-                mx = fmaxf(mx, s[i]);
+            for (int w4 = 0; w4 < 8; ++w4) {
+                const float4 o = x4[w4 * 128 + (t ^ 64)];
+                const uint4 m = marks4[w4];
+                const float ov[4] = {o.x, o.y, o.z, o.w};
+                const u32 mv[4] = {m.x, m.y, m.z, m.w};
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int k = 4 * w4 + i;
+                    const float v = part[mine0 + k] + ov[i];
+                    s[k] = (mv[i] & kValid) ? v * p.scale_log2 : neg_inf();
+                    mx = fmaxf(mx, s[k]);
+                }
             }
             bar_arrive(&list_free[J % kLists]);
             row_max[t] = mx;
-            pair_sync();
+            pair_sync(warp);
             mx = fmaxf(mx, row_max[t ^ 64]);
             const bool grow = mx > m_used + 8.f;
             const float m_new = grow ? mx : m_used;
@@ -503,9 +524,9 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
         bar_wait(&pv_done[(J - 1) & 1], ((J - 1) >> 1) & 1);
         tc_fence_after();
         // The head's sum over both halves of its keys, its sink, and O.
-        pair_sync();
+        pair_sync(warp);
         row_max[t] = l;
-        pair_sync();
+        pair_sync(warp);
         const float l_all = l + row_max[t ^ 64];
         float scale = 0.f;
         if (l_all > 0.f) {
