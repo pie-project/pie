@@ -390,18 +390,32 @@ fn the_tcgen05_prefill_reports_its_rate_beside_fa2() {
         // Gemma-4-31B's global and sliding layers; a serve's pages lie
         // scattered over the pool, no run for a tile to land in one box.
         (512, 8, 4, 32, None, true),
+        (256, 2, 16, 4, Some(1024u32), false),
+        (256, 2, 16, 4, Some(1024u32), true),
         (256, 2, 16, 32, Some(1024u32), false),
         (256, 2, 16, 32, Some(1024u32), true),
     ] {
-        let len = 4096usize;
+        // `PIE_RATE_HEAD=512` measures one head width's rows alone.
+        if std::env::var("PIE_RATE_HEAD").is_ok_and(|h| h != d.to_string()) {
+            continue;
+        }
+        // `PIE_RATE_CHUNK=new,prefix` measures a serve's chunks instead: each
+        // request's `new` rows over `prefix` cached keys.
+        let (len, prefix) = std::env::var("PIE_RATE_CHUNK")
+            .ok()
+            .and_then(|v| {
+                let (a, b) = v.split_once(',')?;
+                Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+            })
+            .unwrap_or((4096, 0));
         let qh = kvh * g;
         let rows = n * len;
-        let pages_per = len / PAGE;
+        let pages_per = (len + prefix) / PAGE;
         let pages = n * pages_per;
         let cells = pages * PAGE;
         let qo_indptr: Vec<i32> = (0..=n).map(|r| (r * len) as i32).collect();
         let kv_indptr: Vec<i32> = (0..=n).map(|r| (r * pages_per) as i32).collect();
-        let kv_len = vec![len as i32; n];
+        let kv_len = vec![(len + prefix) as i32; n];
         let last = vec![PAGE as i32; n];
         let indices: Vec<i32> = (0..pages)
             .map(|p| {
@@ -491,7 +505,11 @@ fn the_tcgen05_prefill_reports_its_rate_beside_fa2() {
             data: Tensor::new(q_at, rows as u32, (qh * d) as u32, Dtype::Bf16),
             indptr: Tensor::new(qo_at, n as u32 + 1, 1, Dtype::I32),
         };
-        let sm_scale = 1.0 / (d as f32).sqrt();
+        // `PIE_RATE_SCALE` sets the softmax scale (Gemma-4 runs 1 over normed q and k).
+        let sm_scale = std::env::var("PIE_RATE_SCALE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1.0 / (d as f32).sqrt());
         let tc5 = timer.median(|_| {
             let mut o = Tensor::new(o_at, rows as u32, (qh * d) as u32, Dtype::Bf16);
             attn::prefill(
@@ -509,11 +527,16 @@ fn the_tcgen05_prefill_reports_its_rate_beside_fa2() {
         });
         // Causal: row t reads t + 1 keys.
         let keys: usize = (0..len)
-            .map(|t| win.map_or(t + 1, |w| (t + 1).min(w as usize)))
+            .map(|t| win.map_or(prefix + t + 1, |w| (prefix + t + 1).min(w as usize)))
             .sum();
         let flops = 4.0 * (n * qh * d) as f64 * keys as f64;
         println!(
-            "| {d} | {g} | {kvh} | {n} x {len}{}{} | {:.0} | {:.0} |",
+            "| {d} | {g} | {kvh} | {n} x {len}{}{}{} | {:.0} | {:.0} |",
+            if prefix > 0 {
+                format!(" after {prefix}")
+            } else {
+                String::new()
+            },
             win.map_or(String::new(), |w| format!(", window {w}")),
             if scatter { ", pages scattered" } else { "" },
             flops / tc5 * 1e-6,

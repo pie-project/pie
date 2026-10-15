@@ -1,8 +1,8 @@
 //! The tcgen05 prefill over a paged bf16 KV cache (`attn/tc5_fmha.cuh`), for
 //! the shapes it serves: a causal or full prefill, sliding or not, without a
-//! mask, a relative bias or a log-sum-exp, at a 64-, 128-, 256- or 512-wide head, an NHD
-//! pool of 16-token pages, and rows long enough that a 128-row tile of
-//! packed query heads is mostly full. Everything else stays on FA2.
+//! mask, a relative bias or a log-sum-exp, at a 64-, 128-, 256- or 512-wide
+//! head, an NHD pool of 16-token pages, and rows long enough that a 128-row
+//! tile of packed query heads is mostly full. Everything else stays on FA2.
 
 use cudarc::driver::sys as dr;
 
@@ -40,26 +40,64 @@ struct Params {
 }
 
 /// The key tile and ring depth a head width runs at: three stages of K and
-/// V fill shared memory, Q and P living in TMEM. A 512-wide head's block
-/// lands half of O over 32-token tiles, four stages of K and its half of V
-/// beside Q's last 128 columns.
-const fn tiling(head_dim: u32) -> (u32, u32) {
+/// V fill shared memory, Q and P living in TMEM. A prefill `wide_of` names
+/// runs `tc5_fmha_prefill_wide` instead.
+fn tiling(head_dim: u32, window_left: i32) -> (u32, u32) {
+    if let Some(w) = wide_of(head_dim, window_left) {
+        return (w.bkv, w.slots);
+    }
     match head_dim {
-        512 => (32, 4),
         256 => (64, 3),
         _ => (128, 3),
     }
 }
 
-/// The blocks a key head's O splits over: two at a 512-wide head.
-const fn o_split(head_dim: u32) -> u32 {
-    if head_dim > 256 { 2 } else { 1 }
-}
-
 /// `pie::attn::fmha::smem_bytes`.
 const fn smem_bytes(d: u32, bkv: u32, stages: u32) -> u32 {
-    let held = if d > 256 { d - 128 } else { d };
-    stages * (d / 64 + d / o_split(d) / 64) * bkv * 128 + (d - held) / 64 * 128 * 128 + 512 + 1024
+    2 * stages * (d / 64) * bkv * 128 + 512 + 1024
+}
+
+/// `tc5_fmha_prefill_wide`'s shape: 128-key tiles; Q whole in shared
+/// memory (`qt` of its columns in TMEM: none); K and V through a ring of
+/// three slices of two 64-wide atoms.
+#[derive(Clone, Copy)]
+struct Wide {
+    d: u32,
+    bkv: u32,
+    qt: u32,
+    atoms: u32,
+    slots: u32,
+}
+
+/// The prefills `tc5_fmha_prefill_wide` serves: every 512-wide head (O
+/// would fill TMEM in the other kernel), and a 256-wide one without a
+/// window, whose 128-key tiles run S at twice the rate of 64. A sliding
+/// 256-wide head (Gemma-4's) stays on the other kernel: its blocks read a
+/// window of a few tiles, and a 128-key tile's partial ends cost it more
+/// than the rate gains.
+fn wide_of(head_dim: u32, window_left: i32) -> Option<Wide> {
+    match head_dim {
+        512 => Some(Wide {
+            d: 512,
+            bkv: 128,
+            qt: 0,
+            atoms: 2,
+            slots: 3,
+        }),
+        256 if window_left < 0 => Some(Wide {
+            d: 256,
+            bkv: 128,
+            qt: 0,
+            atoms: 2,
+            slots: 5,
+        }),
+        _ => None,
+    }
+}
+
+/// `pie::attn::fmha::wide::smem_bytes`.
+const fn wide_smem_bytes(w: &Wide) -> u32 {
+    (w.d - w.qt) / 64 * 128 * 128 + w.slots * w.atoms * w.bkv * 128 + 512 + 1024
 }
 
 /// Whether this prefill runs on the tcgen05 kernel, and if so runs it.
@@ -81,7 +119,7 @@ pub(crate) fn try_prefill(
     let rows = q.data.rows;
     let requests = shape.num_requests;
     let page = u32::try_from(pool.page_size).unwrap_or(0);
-    let (bkv, stages) = tiling(head_dim);
+    let (bkv, stages) = tiling(head_dim, window_left);
     // The profile's decision (`kernel.sdpa.prefill.tc5`, on for sm_100)
     // and the device's capability both: elsewhere FA2 serves as before.
     let fits = ctx.tuning().prefill_tc5
@@ -127,6 +165,7 @@ pub(crate) fn try_prefill(
     let map_v = map(pool.values.ptr, 16)?;
     let map_k_run = map(pool.keys.ptr, bkv)?;
     let map_v_run = map(pool.values.ptr, bkv)?;
+    let wide = wide_of(head_dim, window_left);
     let int = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
     let params = Params {
         q: q.data.ptr,
@@ -153,29 +192,66 @@ pub(crate) fn try_prefill(
         ptr: m.as_ptr().cast(),
         len: 128,
     };
+    let tail = [
+        bytes(&map_k),
+        bytes(&map_v),
+        bytes(&map_k_run),
+        bytes(&map_v_run),
+        ArgValue::Bytes {
+            ptr: (&raw const params).cast(),
+            len: core::mem::size_of::<Params>(),
+        },
+        ArgValue::I32(int(bound)),
+    ];
+    let Some(w) = wide else {
+        ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::attn::fmha::tc5_fmha_prefill<{head_dim}, {bkv}, {stages}>"
+                )),
+            )
+            .apply(
+                Launch::grid([bound, kv_heads, 1], [192, 1, 1])
+                    .smem(smem_bytes(head_dim, bkv, stages)),
+            ),
+            &tail,
+        )?;
+        return Ok(true);
+    };
+    // A 512-wide head's Q: a box an atom of a block's 128 packed rows, whole
+    // tokens' `group` heads; when they are not whole tokens the kernel
+    // stores Q itself and the map is never read.
+    let whole_tokens = 128 % group == 0;
+    let map_q = encode(Map {
+        ptr: q.data.ptr,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        dims: [head_dim, shape.num_q_heads, rows.max(1)],
+        strides: [u64::from(head_dim) * 2, u64::from(q.data.width) * 2],
+        boxes: if whole_tokens {
+            [64, group, 128 / group]
+        } else {
+            [64, 1, 1]
+        },
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    })?;
+    let mut args = vec![bytes(&map_q)];
+    args.extend(tail);
+    // Two blocks a key head, each landing half of O, side by side in y.
     ctx.fire(
         op,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::attn::fmha::tc5_fmha_prefill<{head_dim}, {bkv}, {stages}>"
+                "::pie::attn::fmha::tc5_fmha_prefill_wide<{}, {}, {}, {}, {}>",
+                w.d, w.bkv, w.qt, w.atoms, w.slots
             )),
         )
         .apply(
-            Launch::grid([bound, kv_heads * o_split(head_dim), 1], [192, 1, 1])
-                .smem(smem_bytes(head_dim, bkv, stages)),
+            Launch::grid([bound, kv_heads * (w.d / 256), 1], [192, 1, 1]).smem(wide_smem_bytes(&w)),
         ),
-        &[
-            bytes(&map_k),
-            bytes(&map_v),
-            bytes(&map_k_run),
-            bytes(&map_v_run),
-            ArgValue::Bytes {
-                ptr: (&raw const params).cast(),
-                len: core::mem::size_of::<Params>(),
-            },
-            ArgValue::I32(int(bound)),
-        ],
+        &args,
     )?;
     Ok(true)
 }
