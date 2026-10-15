@@ -689,14 +689,28 @@ fn bench_kda() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(gpu) = Gpu::open() else { return };
-    // Kimi K3's mixer: 96 heads of 128.
-    let g = Geo {
+    // Kimi K3's mixer: 96 heads of 128; GLM-5.3-Flash's: 64 heads of 128,
+    // its gate floored at -5, at the long-in and mid-in prefill steps.
+    let kimi = Geo {
         heads: 96,
         d: 128,
         floor: 0.0,
         steep: false,
     };
-    for lens in [vec![512], vec![4096], vec![512; 8]] {
+    let glm = Geo {
+        heads: 64,
+        d: 128,
+        floor: -5.0,
+        steep: false,
+    };
+    let g = kimi;
+    for (g, lens) in [
+        (kimi, vec![512]),
+        (kimi, vec![4096]),
+        (kimi, vec![512; 8]),
+        (glm, vec![2048; 8]),
+        (glm, vec![1024; 16]),
+    ] {
         let case = Case {
             g,
             lens: lens.clone(),
@@ -714,7 +728,7 @@ fn bench_kda() {
         let indptr = case.indptr();
         for scan in [Scan::Serial, Scan::Chunked] {
             let us = gpu.time(3, || chunked(&gpu, &gpu.ctx(), g, &mut bd, &indptr, scan));
-            eprintln!("{scan:?} {lens:?}: {us:9.1} us");
+            eprintln!("{scan:?} {} heads, {} x {}: {us:9.1} us", g.heads, lens.len(), lens[0]);
         }
     }
     for rows in [1usize, 16, 64] {
