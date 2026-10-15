@@ -86,6 +86,31 @@ pub fn topk_softmax(
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     ranked_planes(OP, logits, top_k, routes, weights);
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
+    // A warp a row where the profile says: the block's sums in its order,
+    // without its barrier a pick.
+    const WARP_ROWS: u32 = 4;
+    if ctx.tuning().moe_topk_warp && top_k <= 16 {
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!("::pie::linear::moe_topk_softmax_warp<{t}>")),
+            )
+            .apply(Launch::grid(
+                [logits.rows.div_ceil(WARP_ROWS), 1, 1],
+                [32 * WARP_ROWS, 1, 1],
+            )),
+            &[
+                logits.arg(),
+                routes.arg(),
+                weights.arg(),
+                stated(OP, logits.rows)?.arg(),
+                e.arg(),
+                k.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(

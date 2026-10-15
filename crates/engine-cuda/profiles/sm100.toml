@@ -100,3 +100,7 @@ gemm.nvfp4_k128 = true
 # tok/s; a bs64 decode's few rows an expert make that epilogue slower than
 # the glue it saves (TPOT 20.5 -> 21.3 ms), so prefill widths only.
 moe.w4a4_fused_from = 2048
+# A dense bf16 product's tactic is timed with a K-splitting algorithm's
+# reduce launch charged 2 us (a captured step pays it), split algorithms
+# reduced in place joining the timing.
+gemm.split_launch_ns = 2000

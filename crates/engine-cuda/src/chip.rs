@@ -424,6 +424,8 @@ mod tests {
                         gemm_bias_epilogue: false,
                         gemm_nvfp4_k128: false,
                         moe_w4a4_fused_from: 65_536,
+                        gemm_split_launch_ns: 0,
+                        moe_topk_warp: false,
                         decode_grouped_prefill_lse: false,
                         decode_xqa: false,
                         decode_xqa_from_64: 0,
@@ -605,6 +607,14 @@ mod tests {
             assert_eq!(
                 other.mxfp4_mma_until, 0,
                 "sm_{major}{minor} keeps the mxfp4 GEMV"
+            );
+            assert_eq!(
+                other.gemm_split_launch_ns, 0,
+                "sm_{major}{minor} charges a split's launch nothing"
+            );
+            assert!(
+                !other.moe_topk_warp,
+                "sm_{major}{minor} ranks its router a block a row"
             );
             assert_eq!(
                 other.moe_w4a4_fused_from, 65_536,

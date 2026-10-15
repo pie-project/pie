@@ -118,6 +118,7 @@ pub(crate) fn act_x_wt(
             (tuning.gemm_workspace_mb as usize) << 20,
             tuning.gemm_heuristics as usize,
             tuning.gemm_narrow_n,
+            tuning.gemm_split_launch_ns,
         );
         let plan = device.plan_for(call);
         let tactic = capturing
@@ -342,6 +343,7 @@ fn build_lt_plan(
     m: i32,
     n: i32,
     k: i32,
+    in_place: bool,
 ) -> Option<LtPlan> {
     struct Pref(lt::cublasLtMatmulPreference_t);
     impl Drop for Pref {
@@ -463,9 +465,21 @@ fn build_lt_plan(
         if asked != ok || supports == 0 {
             continue;
         }
-        for split in [2i32, 4, 8] {
+        // Where a split's launch is charged, also each split reduced in
+        // place: one launch, its partials serialized through the output.
+        let schemes: &[lt::cublasLtReductionScheme_t] = if in_place {
+            &[
+                lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE,
+                lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_INPLACE,
+            ]
+        } else {
+            &[lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE]
+        };
+        for (split, &scheme) in [2i32, 4, 8]
+            .into_iter()
+            .flat_map(|split| schemes.iter().map(move |scheme| (split, scheme)))
+        {
             let mut algo = heuristic.algo;
-            let scheme = lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
             let set_split = unsafe {
                 lt::cublasLtMatmulAlgoConfigSetAttribute(
                     &raw mut algo,
@@ -648,6 +662,9 @@ struct Device {
     /// `kernel.gemm.narrow_n`: products this many columns or fewer may time
     /// the narrow kernel.
     narrow_n: u32,
+    /// `kernel.gemm.split_launch_ns`: what a K-splitting algorithm's own
+    /// reduce launch costs a captured step past its timing, or 0.
+    split_ns: u32,
     plans: HashMap<(i32, i32, i32), Arc<LtPlan>>,
     chosen: HashMap<u64, Tactic>,
     disk: DiskCache,
@@ -668,6 +685,7 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
                 },
                 heuristics: 8,
                 narrow_n: 0,
+                split_ns: 0,
                 plans: HashMap::new(),
                 chosen: HashMap::new(),
                 disk: DiskCache::new(),
@@ -684,14 +702,22 @@ impl Device {
     /// Lay a load's GEMM settings on this device (`kernel.gemm.workspace_mb`,
     /// `kernel.gemm.heuristics`): plans and tactics chosen under other
     /// settings are dropped, since an algorithm may need more workspace.
-    fn configure(&mut self, workspace_bytes: usize, heuristics: usize, narrow_n: u32) {
+    fn configure(
+        &mut self,
+        workspace_bytes: usize,
+        heuristics: usize,
+        narrow_n: u32,
+        split_ns: u32,
+    ) {
         if self.lt.workspace_bytes != workspace_bytes
             || self.heuristics != heuristics
             || self.narrow_n != narrow_n
+            || self.split_ns != split_ns
         {
             self.lt.workspace_bytes = workspace_bytes;
             self.heuristics = heuristics;
             self.narrow_n = narrow_n;
+            self.split_ns = split_ns;
             self.plans.clear();
             self.chosen.clear();
         }
@@ -712,6 +738,7 @@ impl Device {
             m,
             n,
             k,
+            self.split_ns > 0,
         )?);
         self.plans.insert((m, n, k), Arc::clone(&plan));
         Some(plan)
@@ -730,6 +757,7 @@ impl Device {
             self.lt.workspace_bytes,
             self.heuristics,
             self.narrow_n,
+            self.split_ns,
         );
         if let Some(tactic) = self.chosen.get(&key) {
             return Some(*tactic);
@@ -751,7 +779,15 @@ impl Device {
         if (call.m as usize) * (call.n as usize) * 2 > 256 * 1024 * 1024 {
             return None;
         }
-        let tactic = tune(handle, stream, &self.lt, plan, call, self.narrow_n);
+        let tactic = tune(
+            handle,
+            stream,
+            &self.lt,
+            plan,
+            call,
+            self.narrow_n,
+            self.split_ns,
+        );
         self.disk.store(key, tactic.encode());
         self.chosen.insert(key, tactic);
         tracing::info!(
@@ -765,7 +801,13 @@ impl Device {
     }
 }
 
-fn shape_key(call: Call, workspace_bytes: usize, heuristics: usize, narrow_n: u32) -> u64 {
+fn shape_key(
+    call: Call,
+    workspace_bytes: usize,
+    heuristics: usize,
+    narrow_n: u32,
+    split_ns: u32,
+) -> u64 {
     let mut bytes = [0u8; 28];
     bytes[..4].copy_from_slice(&call.m.to_le_bytes());
     bytes[4..8].copy_from_slice(&call.n.to_le_bytes());
@@ -773,14 +815,23 @@ fn shape_key(call: Call, workspace_bytes: usize, heuristics: usize, narrow_n: u3
     bytes[12..20].copy_from_slice(&(workspace_bytes as u64).to_le_bytes());
     bytes[20..].copy_from_slice(&(heuristics as u64).to_le_bytes());
     // A shape the narrow kernel may serve keys apart from the one it may
-    // not; every other key is what it was.
-    if narrow_n > 0 && call.n <= narrow_n as i32 {
-        let mut wider = [0u8; 32];
-        wider[..28].copy_from_slice(&bytes);
-        wider[28..].copy_from_slice(&narrow_n.to_le_bytes());
-        return crate::source::fnv1a64(&wider);
+    // not, and one timed with a split's launch charged from one timed
+    // without; every other key is what it was.
+    let narrow = narrow_n > 0 && call.n <= narrow_n as i32;
+    let whole = split_ns > 0;
+    if !narrow && !whole {
+        return crate::source::fnv1a64(&bytes);
     }
-    crate::source::fnv1a64(&bytes)
+    let mut wider = [0u8; 36];
+    wider[..28].copy_from_slice(&bytes);
+    if narrow {
+        wider[28..32].copy_from_slice(&narrow_n.to_le_bytes());
+    }
+    if !whole {
+        return crate::source::fnv1a64(&wider[..32]);
+    }
+    wider[32..].copy_from_slice(&split_ns.to_le_bytes());
+    crate::source::fnv1a64(&wider)
 }
 
 fn tune(
@@ -790,6 +841,7 @@ fn tune(
     plan: Option<&LtPlan>,
     call: Call,
     narrow_n: u32,
+    split_ns: u32,
 ) -> Tactic {
     let mut candidates = Vec::new();
     if call.m == 1 {
@@ -824,6 +876,16 @@ fn tune(
             us = ms * 1000.0,
             "dense gemm bench"
         );
+        // A captured step pays a split's reduce its own launch, which a
+        // lone timing hides (`kernel.gemm.split_launch_ns`); `cublasGemmEx`
+        // picks its own algorithm, a split one as likely, so it is charged
+        // too.
+        let two = match candidate {
+            Tactic::Lt(i) => plan.is_some_and(|p| !one_launch(&p.heuristics[i].algo)),
+            Tactic::GemmEx => true,
+            Tactic::Gemv | Tactic::Narrow => false,
+        };
+        let ms = if two { ms + split_ns as f32 * 1e-6 } else { ms };
         timings.push((candidate, ms));
     }
     let fastest = timings
@@ -835,6 +897,50 @@ fn tune(
         }
     }
     candidates[0]
+}
+
+/// Whether an algorithm runs in one launch: it does not split K, or
+/// reduces its splits in place.
+fn one_launch(algo: &lt::cublasLtMatmulAlgo_t) -> bool {
+    if splits_of(algo) == 1 {
+        return true;
+    }
+    let mut scheme: u32 = 0;
+    let mut written: usize = 0;
+    let asked = unsafe {
+        lt::cublasLtMatmulAlgoConfigGetAttribute(
+            std::ptr::from_ref(algo),
+            lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+            std::ptr::from_mut(&mut scheme).cast(),
+            std::mem::size_of::<u32>(),
+            &raw mut written,
+        )
+    };
+    if asked != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        clear_error();
+        return false;
+    }
+    scheme == lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_INPLACE as u32
+}
+
+/// An algorithm's K splits (1 when it does not split K).
+fn splits_of(algo: &lt::cublasLtMatmulAlgo_t) -> i32 {
+    let mut splits: i32 = 1;
+    let mut written: usize = 0;
+    let asked = unsafe {
+        lt::cublasLtMatmulAlgoConfigGetAttribute(
+            std::ptr::from_ref(algo),
+            lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+            std::ptr::from_mut(&mut splits).cast(),
+            std::mem::size_of::<i32>(),
+            &raw mut written,
+        )
+    };
+    if asked != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        clear_error();
+        return 1;
+    }
+    splits.max(1)
 }
 
 struct TuneArena {

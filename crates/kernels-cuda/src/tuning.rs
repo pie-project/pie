@@ -48,6 +48,23 @@ pub struct MoeMxfp4MmaUntil(pub u32);
 #[decision(id = "kernel.gemm.nvfp4_k128", flag, default = false, tune = search)]
 pub struct GemmNvfp4K128;
 
+/// Whether a softmax router of up to 512 experts and 16 picks ranks a row
+/// a warp (the same routes and weights to the bit) instead of a 64-thread
+/// block with a barrier a pick. Off but where a chip's profile turns it on
+/// (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.topk_warp", flag, default = false, tune = search)]
+pub struct MoeTopkWarp;
+
+/// What a K-splitting cuBLASLt algorithm's own reduce launch costs a
+/// captured step past its lone timing, in ns, charged to it (and to
+/// `cublasGemmEx`, which may split) when a dense bf16 product's tactic is
+/// timed; split algorithms reduced in place (one launch) join the timing.
+/// 0 (charge nothing) but where a chip's profile says (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.split_launch_ns", constant(range(0..=100_000)), default = 0, tune = search)]
+pub struct GemmSplitLaunchNs(pub u32);
+
 /// The fewest tokens a W4A4 routed MLP keeps its rows by expert from the
 /// gate-up select to the weighted sum with (its GLU landing the down leg's
 /// NVFP4 operand from the gate-up epilogue); never (65 536 past any fire)
@@ -350,6 +367,8 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmBiasEpilogue>()
         .add::<GemmNvfp4K128>()
         .add::<MoeW4a4FusedFrom>()
+        .add::<GemmSplitLaunchNs>()
+        .add::<MoeTopkWarp>()
         .add::<PrefillTc5>()
         .add::<DecodeGroupedPrefillFrom>()
         .add::<DecodeGroupedPrefillLse>()
@@ -405,6 +424,8 @@ pub struct Tuning {
     pub gemm_bias_epilogue: bool,
     pub gemm_nvfp4_k128: bool,
     pub moe_w4a4_fused_from: u32,
+    pub gemm_split_launch_ns: u32,
+    pub moe_topk_warp: bool,
     pub prefill_tc5: bool,
     pub decode_grouped_prefill_from: u32,
     pub decode_grouped_prefill_lse: bool,
@@ -458,6 +479,8 @@ impl Tuning {
         gemm_bias_epilogue: false,
         gemm_nvfp4_k128: false,
         moe_w4a4_fused_from: 65_536,
+        gemm_split_launch_ns: 0,
+        moe_topk_warp: false,
         prefill_tc5: false,
         decode_grouped_prefill_from: 0,
         decode_grouped_prefill_lse: false,
@@ -511,6 +534,8 @@ impl Tuning {
             gemm_bias_epilogue: profile.on::<GemmBiasEpilogue>(&Anywhere),
             gemm_nvfp4_k128: profile.on::<GemmNvfp4K128>(&Anywhere),
             moe_w4a4_fused_from: profile.get::<MoeW4a4FusedFrom>().0,
+            gemm_split_launch_ns: profile.get::<GemmSplitLaunchNs>().0,
+            moe_topk_warp: profile.on::<MoeTopkWarp>(&Anywhere),
             prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),
             decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,
             decode_grouped_prefill_lse: profile.on::<DecodeGroupedPrefillLse>(&Anywhere),
