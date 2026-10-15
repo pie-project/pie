@@ -428,6 +428,11 @@ mod tests {
                     if major == 10 && minor == 0 { 512 } else { 0 },
                     "{gpu}"
                 );
+                assert_eq!(
+                    tuning.dsv4_decode_until,
+                    if major == 10 && minor == 0 { 64 } else { 0 },
+                    "{gpu}"
+                );
                 assert_eq!(tuning.mxfp4_cvt, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
                     tuning.mxfp4_a8_until,
@@ -458,6 +463,7 @@ mod tests {
                         ssm_conv_vec4: false,
                         ssm_gdn_out_bf16: false,
                         qg_prologue_until: 0,
+                        dsv4_decode_until: 0,
                         merge_warp: false,
                         mxfp4_mma_until: defaults.mxfp4_mma_until,
                         mxfp4_mma_from: defaults.mxfp4_mma_from,

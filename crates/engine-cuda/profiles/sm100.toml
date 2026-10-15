@@ -22,6 +22,11 @@ sdpa.dsv4_sparse = true
 # A pooled index's top-k by radix select rather than forty bisection passes
 # (DSV4-Flash's 512 of up to 1024 blocks, 2048 rows: 417 -> 220 us).
 sdpa.index_radix = true
+# DeepSeek-V4's attention at decode widths in one launch (mma.sync, a block
+# a row's 16 heads, a row's keys over a cluster): DSV4-Flash decodes 8 rows
+# at 22.37 ms a token against 24.09 ms as the four ops, 64 rows at 68.8
+# against 74.1.
+sdpa.dsv4_decode_until = 64
 # The tcgen05 GEMMs (B200): routed selects from 16 tokens. A dense
 # projection's GLU stays apart from cuBLAS's gate-up at every row count
 # (`gemm.tc5_glu_from` at its default): below 512 rows the pair is faster
