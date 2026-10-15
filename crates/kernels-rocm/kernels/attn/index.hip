@@ -695,4 +695,150 @@ __global__ __launch_bounds__(kSelectThreads) void index_topk_select(
     }
 }
 
+// ---------------------------------------------------------- block max --
+//
+// A row's ranking of the blocks of `block` keys it sees, one per head: a
+// block scores the best q_h·k among its keys at or before the row; the
+// row's own block is always kept, the other topk − 1 are the best of the
+// rest (ties to the lower block), and the run is written ascending, −1 past
+// its end, at selection[row][h][·]. A row that sees no more than topk
+// blocks keeps them all.
+//
+// One block of four wavefronts per token row. Scoring: the row's queries
+// sit in LDS as f32, a wavefront takes a key block at a time and a lane a
+// key of it (every head's dot over the whole key row), the block's best a
+// wavefront max per head. Ranking: wavefront h ranks head h's row of block
+// scores, topk − 1 passes of a wavefront argmax.
+
+constexpr int kBlockMaxHeads = 8;
+constexpr int kBlockMaxDim = 256;
+
+template <class T>
+__global__ __launch_bounds__(256) void index_topk_block_max(
+    const T* __restrict__ idx_q, const T* __restrict__ key_pages, const i32* __restrict__ qo_indptr,
+    const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
+    const i32* __restrict__ last_page_lens, float* __restrict__ scores, i32* __restrict__ selection, i32 requests,
+    i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk, i32 block, const u32* __restrict__ win) {
+    constexpr int kWaves = 256 / kWave;
+    __shared__ float qs[kBlockMaxHeads * kBlockMaxDim];
+    const Window window{win};
+    const int t = static_cast<int>(blockIdx.x);
+    if (!window.live(t)) return;
+    const long long t_row = window.plane(t);
+    requests = window.lanes(requests);
+    const int tid = static_cast<int>(threadIdx.x), w = tid / kWave, l = lane();
+    i32* srow = selection + t_row * H * topk;
+
+    const int r = request_of(qo_indptr, requests, t);
+    const int kv_len = paged_len(page_indptr, last_page_lens, r, page_size);
+    const int abs_q = kv_len - (qo_indptr[r + 1] - qo_indptr[r]) + (t - qo_indptr[r]);
+    if (abs_q < 0) {
+        for (int n = tid; n < H * topk; n += 256) srow[n] = -1;
+        return;
+    }
+    const int nb = min(abs_q / block + 1, score_stride);
+    if (nb <= topk) {
+        for (int n = tid; n < H * topk; n += 256) {
+            const int at = n % topk;
+            srow[n] = at < nb ? at : -1;
+        }
+        return;
+    }
+
+    const T* qi = idx_q + t_row * H * D;
+    for (int i = tid; i < H * D; i += 256) qs[i] = to_f32(qi[i]);
+    __syncthreads();
+
+    const i32* pages = page_indices + page_indptr[r];
+    float* frow = scores + static_cast<long long>(t) * H * score_stride;
+    for (int b = w; b < nb; b += kWaves) {
+        float best[kBlockMaxHeads];
+#pragma unroll
+        for (int h = 0; h < kBlockMaxHeads; ++h) best[h] = neg_inf();
+        const int lo = b * block, hi = min(lo + block, abs_q + 1);
+        for (int j = lo + l; j < hi; j += kWave) {
+            const T* kj = key_pages + (static_cast<long long>(pages[j / page_size]) * page_size + j % page_size) * D;
+            float dot[kBlockMaxHeads];
+#pragma unroll
+            for (int h = 0; h < kBlockMaxHeads; ++h) dot[h] = 0.f;
+            for (int d = 0; d < D; d += 8) {
+                const Pack8<T> pk = *reinterpret_cast<const Pack8<T>*>(kj + d);
+                float kv[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) kv[e] = to_f32(pk.v[e]);
+#pragma unroll
+                for (int h = 0; h < kBlockMaxHeads; ++h) {
+                    if (h >= H) break;
+                    const float* qh = qs + h * D + d;
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) dot[h] += qh[e] * kv[e];
+                }
+            }
+#pragma unroll
+            for (int h = 0; h < kBlockMaxHeads; ++h) best[h] = fmaxf(best[h], dot[h]);
+        }
+#pragma unroll
+        for (int h = 0; h < kBlockMaxHeads; ++h) {
+            float v = best[h];
+#pragma unroll
+            for (int off = kWave / 2; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor(v, off, kWave));
+            if (l == 0 && h < H) frow[h * score_stride + b] = v;
+        }
+    }
+    __syncthreads();
+
+    for (int h = w; h < H; h += kWaves) {
+        float* hrow = frow + h * score_stride;
+        i32* out = srow + h * topk;
+        const int own = nb - 1;
+        if (l == 0) hrow[own] = neg_inf();
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+        int picked = 0;
+        for (int n = 0; n < topk - 1; ++n) {
+            float v = neg_inf();
+            int at = nb;
+            for (int b = l; b < nb; b += kWave) {
+                const float sc = hrow[b];
+                if (sc > v) {
+                    v = sc;
+                    at = b;
+                }
+            }
+#pragma unroll
+            for (int off = kWave / 2; off > 0; off >>= 1) {
+                const float ov = __shfl_xor(v, off, kWave);
+                const int oa = __shfl_xor(at, off, kWave);
+                if (ov > v || (ov == v && oa < at)) {
+                    v = ov;
+                    at = oa;
+                }
+            }
+            if (at >= nb) break;
+            if (l == 0) {
+                out[picked] = at;
+                hrow[at] = neg_inf();
+            }
+            ++picked;
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+        }
+        if (l == 0) {
+            out[picked++] = own;
+            for (int a = 1; a < picked; ++a) {
+                const int key = out[a];
+                int c = a - 1;
+                while (c >= 0 && out[c] > key) {
+                    out[c + 1] = out[c];
+                    --c;
+                }
+                out[c + 1] = key;
+            }
+            for (int n = picked; n < topk; ++n) out[n] = -1;
+        }
+    }
+}
+
 }  // namespace pie::attn

@@ -404,3 +404,109 @@ fn by_value<P>(params: &P) -> ArgValue {
         len: core::mem::size_of::<P>(),
     }
 }
+
+/// The most heads a block-max ranking holds, and the widest key row.
+const BLOCK_MAX_HEADS: i32 = 8;
+const BLOCK_MAX_DIM: i32 = 256;
+
+/// `attention.index_topk` scored block by block: each head ranks the blocks
+/// a row sees by their best key, keeps the row's own, and writes its run of
+/// `top_k` ascending into `selection`, `heads * top_k` wide.
+#[allow(clippy::too_many_arguments)]
+pub fn topk_block_max(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    keys: &KvPool,
+    heads: u32,
+    head_dim: u32,
+    top_k: u32,
+    block: u32,
+    selection: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.index_topk";
+    dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
+    debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 block ids");
+    let heads = count(OP, "the head count this ranking states", heads)?;
+    let head_dim = count(OP, "the key width this ranking states", head_dim)?;
+    let top_k = count(OP, "the selection budget this ranking states", top_k)?;
+    let block = count(OP, "the block width this ranking scores", block)?;
+    if heads <= 0 || heads > BLOCK_MAX_HEADS {
+        return Err(refuse(
+            OP,
+            format!("a block-max ranking holds at most {BLOCK_MAX_HEADS} heads' queries, not {heads}"),
+        ));
+    }
+    if head_dim <= 0 || head_dim % 8 != 0 || head_dim > BLOCK_MAX_DIM {
+        return Err(refuse(
+            OP,
+            format!(
+                "the key width {head_dim} is not one a block-max ranking reads \
+                 (a multiple of 8, at most {BLOCK_MAX_DIM})"
+            ),
+        ));
+    }
+    if top_k <= 0 || block <= 0 {
+        return Err(refuse(
+            OP,
+            "a block-max ranking keeps at least one block of at least one key",
+        ));
+    }
+    if keys.keys.ptr % 16 != 0 {
+        return Err(refuse(OP, "the key pool is not 16-byte aligned"));
+    }
+    pool_pitch(OP, keys, head_dim)?;
+    let q_width = stated(OP, q.data.width)?;
+    if q_width != heads.saturating_mul(head_dim) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the {q_width}-wide index query does not divide by the stated head count \
+                 and width"
+            ),
+        ));
+    }
+    if stated(OP, selection.width)? != heads.saturating_mul(top_k) {
+        return Err(refuse(
+            OP,
+            "the selection this statement allocated is not one budget per head",
+        ));
+    }
+    let num_requests = kv::lanes_of(OP, q.indptr)?;
+    let max_kv = keys
+        .max_pages_per_request
+        .checked_mul(keys.page_size)
+        .filter(|bound| *bound > 0)
+        .ok_or_else(|| refuse(OP, "the page budget this fire's pool row states is zero"))?;
+    let max_blocks = (max_kv - 1) / block + 1;
+    let scores = ctx.scratch(
+        OP,
+        "attn.index_topk_block_scores",
+        (selection.rows as usize)
+            .saturating_mul(heads.unsigned_abs() as usize)
+            .saturating_mul(max_blocks.unsigned_abs() as usize)
+            .saturating_mul(core::mem::size_of::<f32>()),
+    )?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::index_topk_block_max<::pie::bf16>")
+            .apply(Launch::per_row(selection.rows, 256)),
+        &[
+            q.data.arg(),
+            keys.keys.arg(),
+            q.indptr.arg(),
+            keys.page_indices.arg(),
+            keys.page_indptr.arg(),
+            keys.last_page_lens.arg(),
+            ArgValue::Ptr(scores as usize as u64),
+            selection.arg(),
+            num_requests.arg(),
+            heads.arg(),
+            head_dim.arg(),
+            keys.page_size.arg(),
+            max_blocks.arg(),
+            top_k.arg(),
+            block.arg(),
+            ctx.stage(),
+        ],
+    )
+}

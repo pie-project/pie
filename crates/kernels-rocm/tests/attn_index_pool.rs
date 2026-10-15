@@ -918,3 +918,99 @@ fn bench_pool_selected() {
         );
     }
 }
+
+/// The block-max ranking (`IndexScore::BlockMax`, MiniMax-M3's indexer):
+/// each head scores the `block`-key blocks a row sees by their best `q_h·k`
+/// (its own block up to the row), keeps its own, and lists the best
+/// `top_k − 1` of the rest with it, ascending, `-1` past the run; a row that
+/// sees no more than `top_k` blocks lists them all.
+fn run_block_max(heads: usize, d: usize, block: usize, top_k: usize, qo_lens: &[usize], prefix: &[usize]) {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let ps = 16;
+    let kv_lens: Vec<usize> = qo_lens.iter().zip(prefix).map(|(q, p)| q + p).collect();
+    let keys: Vec<Vec<f32>> = kv_lens
+        .iter()
+        .enumerate()
+        .map(|(r, &n)| bf16s(n * d, 30 + r as u64, 1.0))
+        .collect();
+    let p = make_pool(&gpu, &keys, &kv_lens, d, ps);
+    let total: usize = qo_lens.iter().sum();
+    let qv = bf16s(total * heads * d, 5, 1.0);
+    let q = RaggedTensor {
+        data: gpu.tensor(&qv, total as u32, (heads * d) as u32, Dtype::Bf16),
+        indptr: gpu.column(&indptr_of(qo_lens)),
+    };
+    let mut sel = int_plane(&gpu, total as u32, (heads * top_k) as u32);
+    index::topk_block_max(
+        &ctx,
+        q,
+        &p.pool,
+        heads as u32,
+        d as u32,
+        top_k as u32,
+        block as u32,
+        &mut sel,
+    )
+    .unwrap();
+    let got = read_ints(&gpu, &sel);
+    let mut t = 0;
+    for (r, &ql) in qo_lens.iter().enumerate() {
+        for i in 0..ql {
+            let abs = kv_lens[r] - ql + i;
+            let nb = abs / block + 1;
+            for h in 0..heads {
+                let run = &got[(t * heads + h) * top_k..(t * heads + h + 1) * top_k];
+                let tag = format!("block max h{heads} d{d} block{block} req {r} row {i} head {h} ({nb} blocks)");
+                if nb <= top_k {
+                    let want: Vec<i32> = (0..top_k as i32)
+                        .map(|n| if (n as usize) < nb { n } else { -1 })
+                        .collect();
+                    assert_eq!(run, &want[..], "{tag}");
+                    continue;
+                }
+                let qh = &qv[(t * heads + h) * d..(t * heads + h + 1) * d];
+                let score: Vec<f64> = (0..nb)
+                    .map(|b| {
+                        (b * block..((b + 1) * block).min(abs + 1))
+                            .map(|j| {
+                                (0..d)
+                                    .map(|e| f64::from(qh[e]) * f64::from(keys[r][j * d + e]))
+                                    .sum::<f64>()
+                            })
+                            .fold(f64::MIN, f64::max)
+                    })
+                    .collect();
+                assert!(run.windows(2).all(|w| w[0] < w[1]), "{tag}: not ascending: {run:?}");
+                assert!(run.iter().all(|&b| b >= 0 && (b as usize) < nb), "{tag}: out of range");
+                let own = nb - 1;
+                assert!(run.contains(&(own as i32)), "{tag}: its own block is dropped");
+                let mut picked = vec![false; nb];
+                for &b in run {
+                    picked[b as usize] = true;
+                }
+                let lo = run
+                    .iter()
+                    .filter(|&&b| b as usize != own)
+                    .map(|&b| score[b as usize])
+                    .fold(f64::MAX, f64::min);
+                let hi = (0..own)
+                    .filter(|&b| !picked[b])
+                    .map(|b| score[b])
+                    .fold(f64::MIN, f64::max);
+                assert!(lo >= hi - 1e-3 * hi.abs().max(1.0), "{tag}: picked {lo} < left {hi}");
+            }
+            t += 1;
+        }
+    }
+}
+
+#[test]
+fn block_max_ranks_each_heads_blocks() {
+    // MiniMax-M3's indexer: four heads of 128, 128-key blocks, 16 a head;
+    // decode rows past and short of the budget, and a prefill.
+    run_block_max(4, 128, 128, 16, &[1, 1, 1], &[3000, 900, 5000]);
+    run_block_max(4, 128, 128, 16, &[300, 7], &[2000, 0]);
+    // Small blocks and a narrow run, eight heads.
+    run_block_max(8, 64, 8, 5, &[1, 20], &[300, 70]);
+}

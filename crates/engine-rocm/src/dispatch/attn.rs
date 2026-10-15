@@ -1186,12 +1186,39 @@ impl Run<'_> {
             ),
             Attention::IndexTopk {
                 q,
+                weights: None,
+                keys,
+                heads,
+                head_dim,
+                top_k,
+                ratio,
+                score: poem_ir::IndexScore::BlockMax,
+                selection,
+            } => index::topk_block_max(
+                self.ctx(),
+                self.ragged_lanes(*q),
+                &self.pool(*keys),
+                *heads,
+                *head_dim,
+                *top_k,
+                *ratio,
+                &mut self.tensor(*selection),
+            ),
+            Attention::IndexTopk {
+                score: poem_ir::IndexScore::BlockMax,
+                ..
+            } => Err(kernels_rocm::Error::Unsupported {
+                op: "attention.index_topk",
+            }),
+            Attention::IndexTopk {
+                q,
                 weights,
                 keys,
                 heads,
                 head_dim,
                 top_k,
                 ratio,
+                score: poem_ir::IndexScore::Pooled,
                 selection,
             } => index::topk(
                 self.ctx(),
