@@ -9,10 +9,6 @@ use poem_ir::{ActQuant, Dtype, Fused, Linear, Operands, ValueId};
 
 use crate::run::Run;
 
-/// The fewest rows a cut projection lands as two GEMMs: below it the cut of
-/// the packed rows costs less than a second weight walk.
-const SPLIT_GEMM_FROM: u32 = 256;
-
 impl DispatchLinear for Run<'_> {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError> {
         self.linear(op).map_err(crate::error::kernel)
@@ -194,7 +190,7 @@ impl Run<'_> {
                 let a = self.tensor(*act);
                 if self.ctx().tuning().rows_vec
                     && a.dtype == Dtype::Bf16
-                    && a.rows >= SPLIT_GEMM_FROM
+                    && a.rows >= self.ctx().tuning().gemm_split_rows_from
                     && self.dense_weight(*w)
                 {
                     let weight = self.tensor(*w);

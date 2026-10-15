@@ -113,6 +113,13 @@ pub struct MoeMxfp4Cvt;
 #[decision(id = "kernel.gemm.tc5_glu_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct GemmTc5GluFrom(pub u32);
 
+/// The fewest rows a projection cut into two row halves (Qwen3.5's qkv|z)
+/// lands as two GEMMs off the weight's two slices, where
+/// `kernel.elemwise.rows_vec` is on; fewer run the GEMM and the cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.split_rows_from", constant(range(1..=65_536)), default = 256, tune = search)]
+pub struct GemmSplitRowsFrom(pub u32);
+
 /// Whether a selected (sparse) attention runs on the tensor cores, a block a
 /// row and kv head, rather than the scalar walk. Off reads every key the
 /// scalar way.
@@ -389,6 +396,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeTc5>()
         .add::<MoeTc5From>()
         .add::<GemmTc5GluFrom>()
+        .add::<GemmSplitRowsFrom>()
         .add::<SsmGdnFusedScan>()
         .add::<SsmGdnTc5>()
         .add::<ElemwiseRowsVec>()
@@ -451,6 +459,7 @@ pub struct Tuning {
     pub moe_tc5: bool,
     pub moe_tc5_from: u32,
     pub gemm_tc5_glu_from: u32,
+    pub gemm_split_rows_from: u32,
     pub ssm_gdn_fused_scan: bool,
     pub ssm_gdn_tc5: bool,
     pub rows_vec: bool,
@@ -511,6 +520,7 @@ impl Tuning {
         moe_tc5: false,
         moe_tc5_from: 16,
         gemm_tc5_glu_from: 65_536,
+        gemm_split_rows_from: 256,
         ssm_gdn_fused_scan: false,
         ssm_gdn_tc5: false,
         rows_vec: false,
@@ -571,6 +581,7 @@ impl Tuning {
             moe_tc5: profile.on::<MoeTc5>(&Anywhere),
             moe_tc5_from: profile.get::<MoeTc5From>().0,
             gemm_tc5_glu_from: profile.get::<GemmTc5GluFrom>().0,
+            gemm_split_rows_from: profile.get::<GemmSplitRowsFrom>().0,
             ssm_gdn_fused_scan: profile.on::<SsmGdnFusedScan>(&Anywhere),
             ssm_gdn_tc5: profile.on::<SsmGdnTc5>(&Anywhere),
             rows_vec: profile.on::<ElemwiseRowsVec>(&Anywhere),
