@@ -10,16 +10,18 @@ mla.path  = "naive"
 # DeepSeek-V4's compressed-pool attention on mma.sync, a block a row's 16
 # heads, rather than the scalar walk a block a row and head.
 sdpa.pool_mma = true
-# The tcgen05 GEMMs (B200): routed selects from 16 tokens, a dense
-# projection's GLU in the epilogue from 512 rows. Below that cuBLAS's
-# gate-up and the GLU apart are faster: Gemma-4-31B's (21504 wide over
-# 5376) takes 77 us at 64 rows where the epilogue GEMM takes 107, 92 / 109
-# at 256, and they tie at 512 (133 + the GLU / 143); Gemma-4-31B decodes a
-# step at 64 requests in 20.86 ms where it took 22.97, Qwen3.8-27B in 16.01
-# where it took 16.20, prefills unmoved.
+# The tcgen05 GEMMs (B200): routed selects from 16 tokens. A dense
+# projection's GLU stays apart from cuBLAS's gate-up at every row count
+# (`gemm.tc5_glu_from` at its default): below 512 rows the pair is faster
+# outright (Gemma-4-31B's 21504 wide over 5376 takes 77 us at 64 rows where
+# the epilogue GEMM takes 107, 92 / 109 at 256), and from there they tie
+# alone but not at the power cap a prefill runs at, where cuBLAS's GEMM
+# does more work a watt (1425 TFLOPS against the GEGLU epilogue GEMM's 1295
+# at 16384 x 43008 x 5376, both at 950 W): Gemma-4-31B prefills 32 x 4096
+# at 19,105 tok/s where it took 18,690 with the epilogue from 512 rows,
+# Qwen3.8-27B at 23,520 where it took 23,220.
 moe.tc5           = true
 moe.tc5_from      = 16
-gemm.tc5_glu_from = 512
 # Every sm_100 block opts into 227 KiB, past the 123 KiB the two-launch
 # gated delta scan holds; 32 x 4096 tokens take 7.8 ms a layer there where
 # the three wmma launches took about 97 (Qwen3.8-27B's head).

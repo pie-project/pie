@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_b200_runs_the_tcgen05_selects_and_glu_epilogues() {
+    fn only_a_b200_runs_the_tcgen05_selects() {
         let tuning = |major, minor, sms| {
             kernels_cuda::tuning::Tuning::of(
                 &resolve("NVIDIA GPU", &facts(major, minor, sms), None).0,
@@ -585,7 +585,9 @@ mod tests {
         };
         let b200 = tuning(10, 0, 148);
         assert!(b200.moe_tc5);
-        assert_eq!(b200.gemm_tc5_glu_from, 512);
+        // A prefill's GLU too stays apart from cuBLAS's gate-up on B200: at
+        // the power cap its GEMM does more work a watt than the epilogue's.
+        assert_eq!(b200.gemm_tc5_glu_from, 65_536);
         assert_eq!((b200.mxfp4_mma_from, b200.mxfp4_mma_until), (28, 1024));
         assert!(b200.merge_warp);
         for (major, minor) in [
