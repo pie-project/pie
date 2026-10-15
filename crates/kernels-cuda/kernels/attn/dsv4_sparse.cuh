@@ -420,29 +420,24 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
             const u32 sb = J & 1;
             bar_wait(&s_full[sb], (J >> 1) & 1);
             tc_fence_after();
-            float part[64];
-#pragma unroll
-            for (int c = 0; c < 64; c += 32) {
-                u32 v[32];
-                tmem_ld32(tmem + lane_base + kColS + sb * 64 + c, v);
-#pragma unroll
-                for (int i = 0; i < 32; ++i) part[c + i] = __uint_as_float(v[i]);
-            }
+            // This thread's 32 keys' partial scores and the partner's 32,
+            // each read straight into registers indexed at compile time.
+            const int mine0 = half * 32;
+            const int theirs0 = (1 - half) * 32;
+            u32 vm[32], vt[32];
+            tmem_ld32(tmem + lane_base + kColS + sb * 64 + mine0, vm);
+            tmem_ld32(tmem + lane_base + kColS + sb * 64 + theirs0, vt);
             tmem_wait_ld();
             tc_fence_before();
             bar_arrive(&s_free[sb]);
-            // The partner's share of this thread's 32 keys, and this thread's
-            // of the partner's.
-            const int mine0 = half * 32;
-            const int theirs0 = (1 - half) * 32;
             // Four floats a word, word w of thread t at (w * 128 + t): a
             // warp's words land on distinct banks.
             float4* x4 = reinterpret_cast<float4*>(xbuf);
 #pragma unroll
             for (int w4 = 0; w4 < 8; ++w4) {
-                x4[w4 * 128 + t] = make_float4(part[theirs0 + 4 * w4], part[theirs0 + 4 * w4 + 1],
-                                               part[theirs0 + 4 * w4 + 2],
-                                               part[theirs0 + 4 * w4 + 3]);
+                x4[w4 * 128 + t] =
+                    make_float4(__uint_as_float(vt[4 * w4]), __uint_as_float(vt[4 * w4 + 1]),
+                                __uint_as_float(vt[4 * w4 + 2]), __uint_as_float(vt[4 * w4 + 3]));
             }
             pair_sync(warp);
             // The tile's marks: the keys that count (listed ahead of the ring).
@@ -459,7 +454,7 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     const int k = 4 * w4 + i;
-                    const float v = part[mine0 + k] + ov[i];
+                    const float v = __uint_as_float(vm[k]) + ov[i];
                     s[k] = (mv[i] & kValid) ? v * p.scale_log2 : neg_inf();
                     mx = fmaxf(mx, s[k]);
                 }
