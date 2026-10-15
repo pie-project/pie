@@ -180,18 +180,23 @@ fn launch(
                     "e4m3 activations quantize alike for every expert",
                 ));
             }
+            // Eight elements a lane where the planes align to it (a 16-byte
+            // load, an 8-byte store), else one a lane: the same bytes.
+            let v8 = src.x.ptr % 16 == 0 && codes % 8 == 0 && values % 16 == 0;
+            let lanes = if v8 { u64::from(gran / 8) } else { 32 };
+            let wide = if v8 { "_v8" } else { "" };
             // Codes for a token's routes: each token's blocks quantized once
             // and landed at each of its routes' rows.
             if mode == 0 && src.div > 1 && src.pos != 0 && src.rows.is_multiple_of(src.div) {
                 let tokens = src.rows / src.div;
-                let fan = u64::from(tokens) * u64::from(k / gran) * 32;
-                let threads = u32::try_from(fan)
+                let fan = u64::from(tokens) * u64::from(k / gran) * lanes;
+                let threads = u32::try_from(fan.next_multiple_of(32))
                     .map_err(|_| refuse(op, format!("{blocks} blocks overflow a launch")))?;
                 return ctx.fire(
                     op,
                     Fire::at(
                         FILE,
-                        symbol(&format!("::pie::linear::act_quant_e4m3_fan<{gran}>")),
+                        symbol(&format!("::pie::linear::act_quant_e4m3_fan{wide}<{gran}>")),
                     )
                     .apply(Launch::flat(threads, BLOCK)),
                     &[
@@ -206,13 +211,15 @@ fn launch(
                     ],
                 );
             }
-            let threads = u32::try_from(blocks * 32)
+            let threads = u32::try_from((blocks * lanes).next_multiple_of(32))
                 .map_err(|_| refuse(op, format!("{blocks} blocks overflow a launch")))?;
             ctx.fire(
                 op,
                 Fire::at(
                     FILE,
-                    symbol(&format!("::pie::linear::act_quant_e4m3<{mode}, {gran}>")),
+                    symbol(&format!(
+                        "::pie::linear::act_quant_e4m3{wide}<{mode}, {gran}>"
+                    )),
                 )
                 .apply(Launch::flat(threads, BLOCK)),
                 &[

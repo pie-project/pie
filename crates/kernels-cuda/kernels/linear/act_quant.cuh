@@ -253,6 +253,136 @@ __global__ void act_quant_e4m3_fan(
     }
 }
 
+// The e4m3 quantizers eight elements a lane: a `kGran`-wide block is
+// kGran / 8 lanes (a warp 32 / that many blocks), read in one 16-byte load
+// and landed in one 8-byte store a lane. The scale a power of two, the
+// quotient `v / s` is `v * 2^-e` exactly, so the codes and values are the
+// one-element-a-lane kernels' byte for byte.
+template <int kGran>
+struct E4m3Block {
+    static constexpr int kLanes = kGran / 8;
+    float v[8];
+    int e;
+    // Lane `lane`'s eight of the block at `src` (its kLanes lanes adjacent).
+    __device__ __forceinline__ void load(const bf16* __restrict__ src, int lane) {
+        const uint4 w = *reinterpret_cast<const uint4*>(src + (lane % kLanes) * 8);
+        const unsigned words[4] = {w.x, w.y, w.z, w.w};
+        float amax = 0.f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            v[2 * i] = __uint_as_float(words[i] << 16);
+            v[2 * i + 1] = __uint_as_float(words[i] & 0xFFFF0000u);
+            amax = fmaxf(amax, fmaxf(fabsf(v[2 * i]), fabsf(v[2 * i + 1])));
+        }
+#pragma unroll
+        for (int o = kLanes / 2; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        }
+        amax = fmaxf(amax, 1e-4f);
+        const unsigned bits = __float_as_uint(amax * (1.f / 448.f));
+        e = static_cast<int>((bits >> 23) & 0xFFu) - 127 + ((bits & 0x7FFFFFu) != 0u ? 1 : 0);
+    }
+    // The eight codes, packed low element first.
+    __device__ __forceinline__ unsigned long long codes() const {
+        const float inv = __uint_as_float(static_cast<unsigned>(127 - e) << 23);
+        // Two codes a convert, the low element in the low byte.
+        unsigned half[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float lo = fminf(fmaxf(v[2 * i] * inv, -448.f), 448.f);
+            const float hi = fminf(fmaxf(v[2 * i + 1] * inv, -448.f), 448.f);
+            unsigned short pair;
+            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(pair) : "f"(hi), "f"(lo));
+            half[i] = pair;
+        }
+        return static_cast<unsigned long long>(half[0] | (half[1] << 16)) |
+               (static_cast<unsigned long long>(half[2] | (half[3] << 16)) << 32);
+    }
+};
+
+template <int kMode, int kGran>
+__global__ void act_quant_e4m3_v8(
+    const bf16* __restrict__ x,
+    const i32* __restrict__ pos,
+    int m_max,
+    u8* __restrict__ codes,
+    u8* __restrict__ atoms,
+    bf16* __restrict__ values,
+    int rows,
+    int k,
+    int div)
+{
+    using Block = E4m3Block<kGran>;
+    const int blocks = k / kGran;
+    const long long at = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x);
+    const long long slot = at / Block::kLanes;
+    const int lane = static_cast<int>(threadIdx.x % 32);
+    // A slot past the last block keeps its lanes in the shuffle, landing
+    // nothing.
+    const bool live = slot < static_cast<long long>(rows) * blocks;
+    const long long sl = live ? slot : 0;
+    const int r = static_cast<int>(sl / blocks);
+    const int b = static_cast<int>(sl % blocks);
+    Block q;
+    q.load(x + static_cast<long long>(r / div) * k + b * kGran, lane);
+    if (!live) return;
+    const int sub = lane % Block::kLanes;
+    if constexpr (kMode == kQuantCodes) {
+        const int o = pos != nullptr ? pos[r] : r;
+        if (o < 0) return;
+        *reinterpret_cast<unsigned long long*>(codes + static_cast<long long>(o) * k + b * kGran +
+                                               sub * 8) = q.codes();
+        if (sub == 0) atoms[atom_offset(atom_row(o, m_max), b, blocks)] = static_cast<u8>(q.e + 127);
+    } else {
+        const float s = __uint_as_float(static_cast<unsigned>(q.e + 127) << 23);
+        const unsigned long long c = q.codes();
+        unsigned w[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float lo = e4m3_value(static_cast<u8>(c >> (16 * i))) * s;
+            const float hi = e4m3_value(static_cast<u8>(c >> (16 * i + 8))) * s;
+            w[i] = pack_bf16x2(lo, hi);
+        }
+        *reinterpret_cast<uint4*>(values + static_cast<long long>(r) * k + b * kGran + sub * 8) =
+            make_uint4(w[0], w[1], w[2], w[3]);
+    }
+}
+
+// `act_quant_e4m3_fan` eight elements a lane.
+template <int kGran>
+__global__ void act_quant_e4m3_fan_v8(
+    const bf16* __restrict__ x,
+    const i32* __restrict__ pos,
+    int m_max,
+    u8* __restrict__ codes,
+    u8* __restrict__ atoms,
+    int tokens,
+    int k,
+    int div)
+{
+    using Block = E4m3Block<kGran>;
+    const int blocks = k / kGran;
+    const long long at = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x);
+    const long long slot = at / Block::kLanes;
+    const int lane = static_cast<int>(threadIdx.x % 32);
+    const bool live = slot < static_cast<long long>(tokens) * blocks;
+    const long long sl = live ? slot : 0;
+    const int t = static_cast<int>(sl / blocks);
+    const int b = static_cast<int>(sl % blocks);
+    Block q;
+    q.load(x + static_cast<long long>(t) * k + b * kGran, lane);
+    if (!live) return;
+    const int sub = lane % Block::kLanes;
+    const unsigned long long c = q.codes();
+    for (int j = 0; j < div; ++j) {
+        const int o = pos[static_cast<long long>(t) * div + j];
+        if (o < 0) continue;
+        *reinterpret_cast<unsigned long long*>(codes + static_cast<long long>(o) * k + b * kGran +
+                                               sub * 8) = c;
+        if (sub == 0) atoms[atom_offset(atom_row(o, m_max), b, blocks)] = static_cast<u8>(q.e + 127);
+    }
+}
+
 // A row-major plane of one-byte scales, `cols` a row, into the atom layout;
 // atom row `r` reads plane row `r / div` (a 128-row block's one scale
 // spread to each of its rows).
