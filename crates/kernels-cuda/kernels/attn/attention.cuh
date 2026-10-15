@@ -435,6 +435,22 @@ __global__ void logit_softcap(T* __restrict__ x, float cap, usize n) {
     x[i] = Elem<T>::from_f32(cap * tanhf(v * inv_cap));
 }
 
+// `logit_softcap` eight elements a thread, read and written 16 bytes at a
+// time: the same value for every element.
+template <class T>
+__global__ void logit_softcap_vec8(T* __restrict__ x, float cap, usize runs) {
+    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= runs) return;
+    const float inv_cap = 1.f / cap;
+    uint4 w = reinterpret_cast<const uint4*>(x)[i];
+    T* e = reinterpret_cast<T*>(&w);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        e[k] = Elem<T>::from_f32(cap * tanhf(Elem<T>::to_f32(e[k]) * inv_cap));
+    }
+    reinterpret_cast<uint4*>(x)[i] = w;
+}
+
 template <class T>
 __global__ void lse_log2_to_ln(T* __restrict__ lse, usize n) {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;

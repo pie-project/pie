@@ -844,14 +844,21 @@ pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
         )
     })?;
     nonzero(OP, "the element count", lanes)?;
+    // Eight elements a thread where the plane takes whole 16-byte runs: the
+    // same values, element for element.
+    let (entry, extent) = if lanes.is_multiple_of(8) && x.ptr % 16 == 0 {
+        ("logit_softcap_vec8", lanes / 8)
+    } else {
+        ("logit_softcap", lanes)
+    };
     ctx.fire(
         OP,
         Fire::at(
             "attn/attention.cuh",
-            symbol(&format!("::pie::attn::logit_softcap<{t}>")),
+            symbol(&format!("::pie::attn::{entry}<{t}>")),
         )
-        .apply(elementwise(lanes)),
-        &[x.arg(), cap.arg(), n.arg()],
+        .apply(elementwise(extent)),
+        &[x.arg(), cap.arg(), (extent as usize).arg()],
     )
 }
 

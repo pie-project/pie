@@ -179,3 +179,38 @@ fn the_packed_geglu_runs_land_what_the_elements_land() {
         }
     }
 }
+
+// The logit soft cap takes 16-byte runs where the plane allows and lands the
+// same bits as its element walk, each cap * tanh(x / cap).
+#[test]
+fn the_soft_capped_logit_runs_land_what_the_elements_land() {
+    const N: usize = 3 * 1024;
+    const CAP: f32 = 30.0;
+    let mut gpu = Gpu::open();
+    let mut rng = Lcg::seeded(0x50f7);
+    let (bits, _) = rng.row(N);
+    let logits: Vec<u16> = bits
+        .iter()
+        .map(|&b| crate::common::to_bf16(crate::common::from_bf16(b) * 40.0))
+        .collect();
+    let shifted = [&[0u16][..], &logits].concat();
+    let (x_at, x1_at) = (gpu.up(&logits), gpu.up(&shifted));
+    let ctx = gpu.ctx();
+    for at in [x_at, x1_at + 2] {
+        kernels_cuda::attn::logit_softcap(&ctx, &mut Tensor::new(at, 3, 1024, Dtype::Bf16), CAP)
+            .expect("the soft cap fires");
+    }
+    gpu.sync();
+    let y: Vec<u16> = gpu.down(x_at, N);
+    let y1: Vec<u16> = gpu.down(x1_at + 2, N);
+    assert_eq!(y, y1, "the soft cap's runs and its element walk land alike");
+    for (got, &x) in y.iter().zip(&logits) {
+        let x = f64::from(crate::common::from_bf16(x));
+        let want = f64::from(CAP) * (x / f64::from(CAP)).tanh();
+        let got = f64::from(crate::common::from_bf16(*got));
+        assert!(
+            (got - want).abs() <= 1e-2 * want.abs().max(1.0),
+            "{got} against {want}"
+        );
+    }
+}
