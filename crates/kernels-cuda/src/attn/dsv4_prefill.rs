@@ -67,9 +67,10 @@ struct SparseParams {
     scale_log2: f32,
 }
 
-/// `pie::attn::dsv4s::smem_bytes`: three 64-key tiles, P twice, the score
+/// `pie::attn::dsv4s::smem_bytes` (a block a multiprocessor, walking rows):
+/// three 64-key tiles, P twice, the score
 /// exchange, three key lists, barriers, and the 1024-byte alignment.
-const SPARSE_SMEM: u32 = 3 * 65536 + 2 * 8192 + 16384 + 3 * 64 * 4 + 512 + 1024;
+const SPARSE_SMEM: u32 = 3 * 65536 + 2 * 8192 + 16384 + 6 * 64 * 4 + 512 + 1024;
 
 const HEADS: u32 = 64;
 const HEAD_DIM: u32 = 512;
@@ -258,7 +259,13 @@ pub fn prefill(
                 SPARSE_FILE,
                 symbol(&format!("::pie::attn::dsv4s::dsv4_sparse<{selected}>")),
             )
-            .apply(Launch::grid([rows, 1, 1], [384, 1, 1]).smem(SPARSE_SMEM)),
+            .apply(
+                Launch::grid(
+                    [rows.min(ctx.multiprocessors().unwrap_or(148)), 1, 1],
+                    [384, 1, 1],
+                )
+                .smem(SPARSE_SMEM),
+            ),
             &[
                 bytes(&map_win),
                 bytes(&map_ent),
