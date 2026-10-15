@@ -595,13 +595,63 @@ __global__ void rope_yarn_split_append(
         __sincosf(static_cast<float>(pos) * freq, &sin_v, &cos_v);
         return make_float2(cos_v * mscale, sin_v * mscale);
     };
+    const int head_base = blockIdx.y * heads_per_block;
+    const int heads_here = min(heads_per_block, total_heads - head_base);
+    if (heads_here * half <= static_cast<int>(blockDim.x)) {
+        // A pair a thread: its operands load before the angles are cached,
+        // so the row's reads overlap the angle math and the barrier. The
+        // arithmetic is the loop's below, pair for pair.
+        const int t = threadIdx.x;
+        const bool live = t < heads_here * half;
+        const int head_idx = head_base + (live ? t / half : 0);
+        const int dim_pair = live ? t % half : 0;
+        const int j0 = interleaved ? dim_pair * 2 : dim_pair;
+        const int j1 = interleaved ? dim_pair * 2 + 1 : dim_pair + half;
+        const bool is_q = head_idx < num_q_heads;
+        // A k head sits where its index says, past the q heads; its v head
+        // the kv heads further on.
+        const bf16* x = src + static_cast<long long>(head_idx) * head_dim;
+        float a = 0.f, b = 0.f;
+        bf16 v0{}, v1{};
+        if (live && (is_q || write_this_row)) {
+            a = bf16_to_f32(x[j0]);
+            b = bf16_to_f32(x[j1]);
+            if (!is_q) {
+                const bf16* vs = x + static_cast<long long>(num_kv_heads) * head_dim;
+                v0 = vs[j0];
+                v1 = vs[j1];
+            }
+        }
+        for (int d = threadIdx.x; d < cache_pairs; d += blockDim.x) {
+            yarn_cs[d] = angle(d);
+        }
+        if (cache_pairs > 0) __syncthreads();
+        if (!live) return;
+        const float2 cs = dim_pair < cache_pairs ? yarn_cs[dim_pair] : angle(dim_pair);
+        const bf16 r0 = f32_to_bf16(a * cs.x - b * cs.y);
+        const bf16 r1 = f32_to_bf16(b * cs.x + a * cs.y);
+        if (is_q) {
+            bf16* qd = q_out + (static_cast<long long>(row) * num_q_heads + head_idx) * head_dim;
+            qd[j0] = r0;
+            qd[j1] = r1;
+        } else if (write_this_row) {
+            const int base = (head_idx - num_q_heads) * head_dim;
+            const long long d0 =
+                kv_dst_index<false>(slot, base + j0, page_size, num_kv_heads, head_dim);
+            const long long d1 =
+                kv_dst_index<false>(slot, base + j1, page_size, num_kv_heads, head_dim);
+            k_pages[d0] = r0;
+            k_pages[d1] = r1;
+            v_pages[d0] = v0;
+            v_pages[d1] = v1;
+        }
+        return;
+    }
     for (int d = threadIdx.x; d < cache_pairs; d += blockDim.x) {
         yarn_cs[d] = angle(d);
     }
     if (cache_pairs > 0) __syncthreads();
 
-    const int head_base = blockIdx.y * heads_per_block;
-    const int heads_here = min(heads_per_block, total_heads - head_base);
     for (int t = threadIdx.x; t < heads_here * half; t += blockDim.x) {
         const int head_idx = head_base + t / half;
         const int dim_pair = t % half;
