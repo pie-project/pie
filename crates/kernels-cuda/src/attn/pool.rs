@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::kv;
-use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const FILE: &str = "attn/pool.cuh";
@@ -306,6 +306,13 @@ pub fn attention_lse(
     let head_dim = count(OP, "the head width this attention states", head_dim)?;
     nonzero(OP, "rows", o.rows)?;
 
+    if pool_mma_takes(ctx, head_dim) {
+        return pool_mma(
+            ctx, OP, q, positions, request_of_token, None, entries, ratio, 0,
+            num_q_heads, head_dim, sm_scale, o, lse,
+        );
+    }
+
     let smem = head_dim
         .unsigned_abs()
         .saturating_add(ATTN_BLOCK)
@@ -403,6 +410,13 @@ pub fn attention_lse_selected(
         ));
     }
 
+    if pool_mma_takes(ctx, head_dim) {
+        return pool_mma(
+            ctx, OP, q, positions, request_of_token, Some(selection), entries, ratio, top_k,
+            num_q_heads, head_dim, sm_scale, o, lse,
+        );
+    }
+
     let smem = head_dim
         .unsigned_abs()
         .saturating_add(ATTN_BLOCK)
@@ -425,6 +439,69 @@ pub fn attention_lse_selected(
             request_of_token.arg(),
             num_q_heads.arg(),
             head_dim.arg(),
+            ratio.arg(),
+            top_k.arg(),
+            entries.page_size.arg(),
+            sm_scale.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// The head widths the tensor-core pool walk is built for.
+const POOL_MMA_WIDTHS: [i32; 3] = [128, 256, 512];
+
+fn pool_mma_takes(ctx: &Ctx, head_dim: i32) -> bool {
+    ctx.tuning().pool_mma && POOL_MMA_WIDTHS.contains(&head_dim)
+}
+
+/// `pool_lse` (or its selected form, with `selection`) on tensor cores: a
+/// block a row's 16 heads (`attn/pool_mma.cuh`).
+#[allow(clippy::too_many_arguments)]
+fn pool_mma(
+    ctx: &Ctx,
+    op: &'static str,
+    q: Tensor,
+    positions: Tensor,
+    request_of_token: Tensor,
+    selection: Option<Tensor>,
+    entries: &KvPool,
+    ratio: i32,
+    top_k: i32,
+    num_q_heads: i32,
+    head_dim: i32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: &mut Tensor,
+) -> Result<(), Error> {
+    const HEADS: u32 = 16;
+    const KEYS: u32 = 16;
+    const WARPS: u32 = 4;
+    let d = head_dim.unsigned_abs();
+    let ld = d + 8;
+    let smem = HEADS * ld * 2 + 2 * KEYS * ld * 2 + WARPS * HEADS * KEYS * 4;
+    let selected = selection.is_some();
+    ctx.fire(
+        op,
+        Fire::at(
+            "attn/pool_mma.cuh",
+            symbol(&format!("::pie::attn::pool_mma::pool_lse_mma<{d}, {selected}>")),
+        )
+        .apply(
+            Launch::grid([o.rows, num_q_heads.unsigned_abs().div_ceil(HEADS), 1], [WARPS * 32, 1, 1])
+                .smem(smem),
+        ),
+        &[
+            q.arg(),
+            entries.keys.arg(),
+            selection.map_or(ArgValue::ABSENT, |s| s.arg()),
+            o.arg(),
+            lse.arg(),
+            positions.arg(),
+            entries.page_indices.arg(),
+            entries.page_indptr.arg(),
+            request_of_token.arg(),
+            num_q_heads.arg(),
             ratio.arg(),
             top_k.arg(),
             entries.page_size.arg(),

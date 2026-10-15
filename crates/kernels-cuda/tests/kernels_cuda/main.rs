@@ -42,6 +42,7 @@ mod the_narrow_gemm_lands_the_dot;
 mod the_nvfp4_select_answers_the_dequantized_dot;
 mod the_paged_decode_answers_the_reference;
 mod the_partial_rope_turns_only_the_rotary_pairs;
+mod the_pool_attention_lands_alike_on_the_tensor_cores;
 mod the_pooled_index_selects_its_best_blocks;
 mod the_ragged_arm_adds_a_relative_bias;
 mod the_ragged_arm_answers_the_naive_dense_kernel;

@@ -84,6 +84,14 @@ pub struct GemmTc5GluFrom(pub u32);
 #[decision(id = "kernel.sdpa.selected_mma", flag, default = false, tune = search)]
 pub struct SdpaSelectedMma;
 
+/// Whether a compressed-pool attention (`attention.pool_lse`, and its
+/// selected form) runs on the tensor cores, a block a row's 16 heads, rather
+/// than the scalar walk a block a row and head. Off reads the pool the
+/// scalar way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.pool_mma", flag, default = false, tune = search)]
+pub struct SdpaPoolMma;
+
 /// Whether a pooled index (`attention.index_topk`) scores its blocks on the
 /// tensor cores rather than a thread a block. Off scores the scalar way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -351,6 +359,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeXqaCluster>()
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
+        .add::<SdpaPoolMma>()
         .add::<GemmNarrowN>();
 }
 
@@ -405,6 +414,7 @@ pub struct Tuning {
     pub decode_xqa_cluster: u32,
     pub selected_mma: bool,
     pub index_mma: bool,
+    pub pool_mma: bool,
     pub gemm_narrow_n: u32,
 }
 
@@ -457,6 +467,7 @@ impl Tuning {
         decode_xqa_cluster: 0,
         selected_mma: false,
         index_mma: false,
+        pool_mma: false,
         gemm_narrow_n: 0,
     };
 
@@ -509,6 +520,7 @@ impl Tuning {
             decode_xqa_cluster: profile.get::<DecodeXqaCluster>().0,
             selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),
             index_mma: profile.on::<SdpaIndexMma>(&Anywhere),
+            pool_mma: profile.on::<SdpaPoolMma>(&Anywhere),
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,
         }
     }

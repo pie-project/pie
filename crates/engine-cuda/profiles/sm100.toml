@@ -7,6 +7,9 @@ assumes = { cc = 100 }
 [kernel]
 gemv.bf16 = "narrow"
 mla.path  = "naive"
+# DeepSeek-V4's compressed-pool attention on mma.sync, a block a row's 16
+# heads, rather than the scalar walk a block a row and head.
+sdpa.pool_mma = true
 # The tcgen05 GEMMs (B200): routed selects from 16 tokens, a dense
 # projection's GLU in the epilogue from 512 rows. Below that cuBLAS's
 # gate-up and the GLU apart are faster: Gemma-4-31B's (21504 wide over
