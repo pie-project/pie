@@ -15,6 +15,9 @@ sdpa.pool_mma = true
 # prefills 32 x 4096 in 9.9 s against 12.2 s as the four ops (two runs
 # each); below 512 rows the four ops stay.
 sdpa.dsv4_prefill_from = 512
+# A pooled index's top-k by radix select rather than forty bisection passes
+# (DSV4-Flash's 512 of up to 1024 blocks, 2048 rows: 417 -> 220 us).
+sdpa.index_radix = true
 # The tcgen05 GEMMs (B200): routed selects from 16 tokens. A dense
 # projection's GLU stays apart from cuBLAS's gate-up at every row count
 # (`gemm.tc5_glu_from` at its default): below 512 rows the pair is faster

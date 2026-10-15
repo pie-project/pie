@@ -182,6 +182,13 @@ pub struct SdpaDsv4PrefillFrom(pub u32);
 #[decision(id = "kernel.sdpa.index_mma", flag, default = false, tune = search)]
 pub struct SdpaIndexMma;
 
+/// Whether a pooled index (`attention.index_topk`) finds its best blocks by
+/// a radix select (four histogram passes, then a block scan) rather than
+/// forty bisection passes and a one-thread walk. Off bisects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.index_radix", flag, default = false, tune = search)]
+pub struct SdpaIndexRadix;
+
 /// The widest dense bf16 product (in columns) the GEMM tuner may also time
 /// on the narrow kernel (a block a row, every column's sum in registers);
 /// 0 never offers it.
@@ -469,6 +476,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeXqaCluster>()
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
+        .add::<SdpaIndexRadix>()
         .add::<SdpaPoolMma>()
         .add::<SdpaDsv4PrefillFrom>()
         .add::<GemmNarrowN>();
@@ -537,6 +545,7 @@ pub struct Tuning {
     pub decode_xqa_cluster: u32,
     pub selected_mma: bool,
     pub index_mma: bool,
+    pub index_radix: bool,
     pub pool_mma: bool,
     pub dsv4_prefill_from: u32,
     pub gemm_narrow_n: u32,
@@ -603,6 +612,7 @@ impl Tuning {
         decode_xqa_cluster: 0,
         selected_mma: false,
         index_mma: false,
+        index_radix: false,
         pool_mma: false,
         dsv4_prefill_from: 0,
         gemm_narrow_n: 0,
@@ -669,6 +679,7 @@ impl Tuning {
             decode_xqa_cluster: profile.get::<DecodeXqaCluster>().0,
             selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),
             index_mma: profile.on::<SdpaIndexMma>(&Anywhere),
+            index_radix: profile.on::<SdpaIndexRadix>(&Anywhere),
             pool_mma: profile.on::<SdpaPoolMma>(&Anywhere),
             dsv4_prefill_from: profile.get::<SdpaDsv4PrefillFrom>().0,
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,

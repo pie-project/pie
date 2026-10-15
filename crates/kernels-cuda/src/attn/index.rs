@@ -244,6 +244,9 @@ pub fn topk(
     // The tensor-core scorer where the profile asks for it and the heads fit
     // one mma's rows at its key width.
     // (one to four tiles of 16 heads: DeepSeek-V4's indexer is 64 wide).
+    // The ranking's selection by radix (`kernel.sdpa.index_radix`) rather
+    // than forty bisection passes.
+    let radix = ctx.tuning().index_radix;
     let (entry, smem) = match heads {
         h if ctx.tuning().index_mma && head_dim == 128 && h <= 64 => {
             let tiles: u32 = match h.unsigned_abs().div_ceil(16) {
@@ -252,13 +255,16 @@ pub fn topk(
                 _ => 4,
             };
             (
-                format!("::pie::attn::index_topk_paged_mma<::pie::bf16, {tiles}>"),
+                format!("::pie::attn::index_topk_paged_mma<::pie::bf16, {tiles}, {radix}>"),
                 // The query, 16 rows a tile, and each warp's 16 keys, at 128 + 8
                 // bf16 a row.
                 (16 * tiles + (K_BLOCK / 32) * 16) * (128 + 8) * 2,
             )
         }
-        _ => ("::pie::attn::index_topk_paged<::pie::bf16>".to_string(), 0),
+        _ => (
+            format!("::pie::attn::index_topk_paged<::pie::bf16, {radix}>"),
+            0,
+        ),
     };
     ctx.fire(
         OP,

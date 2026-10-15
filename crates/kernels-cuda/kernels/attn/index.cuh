@@ -198,7 +198,117 @@ __device__ __forceinline__ void select_top(const float* __restrict__ frow, int n
     }
 }
 
-template <class T>
+// `select_top` by radix: the `topk` largest of `nkeys` scores, ascending by
+// index, `-1` past the end. The k-th largest score's bits are found a byte a
+// pass (a 256-bin histogram of the survivors, most significant byte first),
+// then every score above it and the first ties at it (in index order) take
+// their places by a block scan. Four passes over the scores, where the
+// bisection walks forty.
+__device__ __forceinline__ u32 order_bits(float v) {
+    const u32 b = __float_as_uint(v);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+// Block-wide exclusive prefix of `flag`, and the block's total.
+__device__ __forceinline__ int block_prefix(bool flag, int tid, int* warp_sums, int& total) {
+    const int lane = tid & 31, warp = tid >> 5;
+    const unsigned ballot = __ballot_sync(0xffffffffu, flag);
+    const int before = __popc(ballot & ((1u << lane) - 1u));
+    if (lane == 0) warp_sums[warp] = __popc(ballot);
+    __syncthreads();
+    int base = 0;
+    total = 0;
+#pragma unroll
+    for (int w = 0; w < kBlock / 32; ++w) {
+        const int c = warp_sums[w];
+        if (w < warp) base += c;
+        total += c;
+    }
+    __syncthreads();
+    return base + before;
+}
+
+__device__ __forceinline__ void select_top_radix(const float* __restrict__ frow, int nkeys,
+                                                 int topk, i32* __restrict__ srow, int tid)
+{
+    __shared__ int hist[256];
+    __shared__ int s_digit, s_need;
+    __shared__ int warp_sums[kBlock / 32];
+    u32 prefix = 0, mask = 0;
+    int need = topk;  // how many of the survivors (bits matching prefix under mask) to take
+#pragma unroll 1
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = tid; i < 256; i += kBlock) hist[i] = 0;
+        __syncthreads();
+        // Scores crowd a few bins (the top byte is sign and exponent): a
+        // warp adds each bin once, its lanes in that bin counted together.
+        for (int j0 = 0; j0 < nkeys; j0 += kBlock) {
+            const int j = j0 + tid;
+            const u32 u = j < nkeys ? order_bits(frow[j]) : 0u;
+            const bool in = j < nkeys && (u & mask) == prefix;
+            const int bin = in ? static_cast<int>((u >> shift) & 255) : -1;
+            const unsigned peers = __match_any_sync(0xffffffffu, bin);
+            if (in && (tid & 31) == __ffs(peers) - 1) atomicAdd(&hist[bin], __popc(peers));
+        }
+        __syncthreads();
+        if (tid < 32) {
+            // From the top bin down, the bin where the count reaches `need`.
+            int run = 0;
+            int found = -1, found_need = 0;
+            // Each lane holds eight bins, highest first across the warp.
+            int c[8];
+            int lane_sum = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                c[i] = hist[255 - (tid * 8 + i)];
+                lane_sum += c[i];
+            }
+            int incl = lane_sum;
+#pragma unroll
+            for (int sh = 1; sh < 32; sh <<= 1) {
+                const int x = __shfl_up_sync(0xffffffffu, incl, sh);
+                if (tid >= sh) incl += x;
+            }
+            run = incl - lane_sum;
+            if (run < need && incl >= need) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    if (found < 0 && run + c[i] >= need) {
+                        found = 255 - (tid * 8 + i);
+                        found_need = need - run;
+                    }
+                    run += c[i];
+                }
+                s_digit = found;
+                s_need = found_need;
+            }
+        }
+        __syncthreads();
+        prefix |= static_cast<u32>(s_digit) << shift;
+        mask |= 255u << shift;
+        need = s_need;
+        __syncthreads();
+    }
+    // `prefix` is the k-th largest score's bits; `need` of its ties are taken.
+    int written = 0, ties_seen = 0;
+#pragma unroll 1
+    for (int j0 = 0; j0 < nkeys; j0 += kBlock) {
+        const int j = j0 + tid;
+        const u32 u = j < nkeys ? order_bits(frow[j]) : 0u;
+        const bool tie = j < nkeys && u == prefix;
+        int ties;
+        const int tie_rank = ties_seen + block_prefix(tie, tid, warp_sums, ties);
+        ties_seen += ties;
+        const bool take = j < nkeys && (u > prefix || (tie && tie_rank < need));
+        int took;
+        const int at = written + block_prefix(take, tid, warp_sums, took);
+        if (take) srow[at] = j;
+        written += took;
+    }
+    for (int n = written + tid; n < topk; n += kBlock) srow[n] = -1;
+}
+
+template <class T, bool kRadix = false>
 __global__ void index_topk_paged(
     const T* __restrict__ idx_q,
     const T* __restrict__ idx_w,
@@ -281,7 +391,11 @@ __global__ void index_topk_paged(
     }
     __syncthreads();
 
-    select_top(frow, nkeys, topk, srow, tid);
+    if constexpr (kRadix) {
+        select_top_radix(frow, nkeys, topk, srow, tid);
+    } else {
+        select_top(frow, nkeys, topk, srow, tid);
+    }
 }
 
 // `index_topk_paged` with the scores on the tensor cores: the row's heads
@@ -311,7 +425,7 @@ __device__ __forceinline__ void mma_m16n8k16(float (&d)[4], const std::uint32_t 
 
 }  // namespace index_mma
 
-template <class T, int kTiles = 1>
+template <class T, int kTiles = 1, bool kRadix = false>
 __global__ void index_topk_paged_mma(
     const T* __restrict__ idx_q,
     const T* __restrict__ idx_w,
@@ -453,7 +567,11 @@ __global__ void index_topk_paged_mma(
     }
     __syncthreads();
 
-    select_top(frow, nkeys, topk, srow, tid);
+    if constexpr (kRadix) {
+        select_top_radix(frow, nkeys, topk, srow, tid);
+    } else {
+        select_top(frow, nkeys, topk, srow, tid);
+    }
 }
 
 constexpr int kMaxIndexHeads = 8;

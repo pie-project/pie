@@ -90,11 +90,12 @@ fn check(HEADS: usize) {
     let keys = pool(gpu.up(&k_raw), tables);
     let q_at = gpu.up(&q_raw);
     let w_at = gpu.up(&w_raw);
-    for mma in [false, true] {
+    for (mma, radix) in [(false, false), (true, false), (false, true), (true, true)] {
         let sel_at = gpu.zeros(tokens * TOP_K * 4);
         let mut selection = Tensor::new(sel_at, tokens as u32, TOP_K as u32, Dtype::I32);
         let ctx = gpu.ctx().with_tuning(Tuning {
             index_mma: mma,
+            index_radix: radix,
             ..Tuning::DEFAULT
         });
         index::topk(
@@ -158,5 +159,80 @@ fn check(HEADS: usize) {
             }
         }
         assert!(ranked > 0 && whole > 0, "both kinds of row were read");
+    }
+}
+
+/// DeepSeek-V4-Flash's indexer at a prefill's width: 2048 rows of one
+/// 4096-position request, 64 heads of 128, ratio 4, the best 512 of up to
+/// 1024 blocks a row.
+#[test]
+#[ignore = "a measurement; run it by name under the GPU lock"]
+fn the_pooled_index_paces_a_prefill() {
+    const H: usize = 64;
+    const K: usize = 512;
+    const SPAN: usize = 4096;
+    const ROWS: usize = 2048;
+    const PG: usize = 64;
+    let pages = SPAN / PG;
+    let mut gpu = Gpu::open();
+    let mut rng = Lcg::seeded(0x5a11);
+    let (q_raw, _) = rng.row(ROWS * H * DIM);
+    let (k_raw, _) = rng.row(SPAN * DIM);
+    let w_raw: Vec<u16> = (0..ROWS * H)
+        .map(|_| to_bf16(rng.unit().abs() + 0.25))
+        .collect();
+    let page_indices: Vec<i32> = (0..pages as i32).collect();
+    let k_at = gpu.up(&k_raw);
+    let keys = KvPool {
+        keys: Tensor::new(k_at, SPAN as u32, DIM as u32, Dtype::Bf16),
+        values: Tensor::new(k_at, SPAN as u32, DIM as u32, Dtype::Bf16),
+        page_indices: Tensor::new(gpu.up(&page_indices), pages as u32, 1, Dtype::I32),
+        page_indptr: Tensor::new(gpu.up(&[0i32, pages as i32]), 2, 1, Dtype::I32),
+        last_page_lens: Tensor::new(gpu.up(&[PG as i32]), 1, 1, Dtype::I32),
+        page_size: PG as i32,
+        max_pages_per_request: pages as i32,
+        pages_in_batch: pages as i32,
+        ..pool(k_at, [0, 0, 0])
+    };
+    let indptr = gpu.up(&[0i32, ROWS as i32]);
+    let q_at = gpu.up(&q_raw);
+    let w_at = gpu.up(&w_raw);
+    let sel_at = gpu.zeros(ROWS * K * 4);
+    let mut selection = Tensor::new(sel_at, ROWS as u32, K as u32, Dtype::I32);
+    for radix in [false, true] {
+        let ctx = gpu.ctx().with_tuning(Tuning {
+            index_mma: true,
+            index_radix: radix,
+            ..Tuning::DEFAULT
+        });
+        let mut fire = || {
+            index::topk(
+                &ctx,
+                RaggedTensor {
+                    data: Tensor::new(q_at, ROWS as u32, (H * DIM) as u32, Dtype::Bf16),
+                    indptr: Tensor::new(indptr, 2, 1, Dtype::I32),
+                },
+                Some(Tensor::new(w_at, ROWS as u32, H as u32, Dtype::Bf16)),
+                &keys,
+                H as u32,
+                DIM as u32,
+                K as u32,
+                RATIO as u32,
+                &mut selection,
+            )
+            .expect("attention.index_topk ranks the pooled blocks");
+        };
+        fire();
+        gpu.sync();
+        let iters = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            fire();
+        }
+        gpu.sync();
+        let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+        println!(
+            "| index top-{K}, {ROWS} rows of a {SPAN}-position request, radix {radix} | {us:.0} us |"
+        );
     }
 }
