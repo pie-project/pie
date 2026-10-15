@@ -140,6 +140,77 @@ __device__ __forceinline__ void tile_mm(float (&d)[4], const float* X, int ldx, 
     }
 }
 
+// f16 pairs and the f16 tensor-core product the inverse runs on: its
+// operands keep a tf32's ten mantissa bits, and ldmatrix lands them.
+constexpr int LDH = 72;  // an f16 64-wide row padded so ldmatrix's eight rows miss each other's banks
+
+__device__ __forceinline__ u32 h2(float lo, float hi) {
+    u32 r;
+    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+    return r;
+}
+
+__device__ __forceinline__ float2 h2f(u32 v) {
+    float lo, hi;
+    asm("{\n\t.reg .f16 a, b;\n\tmov.b32 {a, b}, %2;\n\tcvt.f32.f16 %0, a;\n\tcvt.f32.f16 %1, b;\n\t}"
+        : "=f"(lo), "=f"(hi)
+        : "r"(v));
+    return make_float2(lo, hi);
+}
+
+__device__ __forceinline__ float hf(const unsigned short* s) {
+    float f;
+    asm("{\n\t.reg .f16 a;\n\tmov.b16 a, %1;\n\tcvt.f32.f16 %0, a;\n\t}" : "=f"(f) : "h"(*s));
+    return f;
+}
+
+__device__ __forceinline__ unsigned short f2h(float f) {
+    unsigned short r;
+    asm("{\n\t.reg .f16 a;\n\tcvt.rn.f16.f32 a, %1;\n\tmov.b16 %0, a;\n\t}" : "=h"(r) : "f"(f));
+    return r;
+}
+
+__device__ __forceinline__ void mma_h(float (&d)[4], const u32 (&a)[4], u32 b0, u32 b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void ldsm4(u32 (&r)[4], const unsigned short* at) {
+    const u32 addr = static_cast<u32>(__cvta_generic_to_shared(at));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
+__device__ __forceinline__ void ldsm4t(u32 (&r)[4], const unsigned short* at) {
+    const u32 addr = static_cast<u32>(__cvta_generic_to_shared(at));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
+// A 16 x 16 A operand at rows m0.., columns k0.. of a row-major f16 tile.
+__device__ __forceinline__ void frag_a(u32 (&a)[4], const unsigned short* s, int ld, int m0, int k0, int l) {
+    ldsm4(a, s + (m0 + (l & 15)) * ld + k0 + ((l >> 4) << 3));
+}
+
+// The B operand of two eight-wide column tiles n0, n0 + 8 over k0..k0+16 of
+// a row-major [k][n] f16 tile: b[0], b[1] the first, b[2], b[3] the second.
+__device__ __forceinline__ void frag_b(u32 (&b)[4], const unsigned short* s, int ld, int k0, int n0, int l) {
+    ldsm4t(b, s + (k0 + (l & 7) + (((l >> 3) & 1) << 3)) * ld + n0 + ((l >> 4) << 3));
+}
+
+// A 16 x 8 accumulator tile, negated, as f16 at Z[r0.., n0..].
+__device__ __forceinline__ void put_h(const float (&d)[4], unsigned short* Z, int ld, int r0, int n0, float sc, int l) {
+    const int g = l >> 2;
+    const int t = l & 3;
+    *reinterpret_cast<u32*>(Z + (r0 + g) * ld + n0 + 2 * t) = h2(d[0] * sc, d[1] * sc);
+    *reinterpret_cast<u32*>(Z + (r0 + g + 8) * ld + n0 + 2 * t) = h2(d[2] * sc, d[3] * sc);
+}
+
 // Lands a 16 x 8 accumulator tile, scaled, at Z[r0.., n0..].
 __device__ __forceinline__ void tile_put(const float (&d)[4], float* Z, int ldz, int r0, int n0,
                                          float scale, int l) {
@@ -369,9 +440,9 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
             const int i128 = static_cast<int>(quad) * 32 + l;
             const u32 bar_id = 1 + gq * 2;
             unsigned char* prep = smem + kPrep + gq * kPrepBytes;
-            float* sA = reinterpret_cast<float*>(prep + kPrepA);
-            float* Tm = reinterpret_cast<float*>(prep + kPrepT);
-            for (int e = i128; e < CH * LDA; e += 128) Tm[e] = 0.f;
+            unsigned short* Ah = reinterpret_cast<unsigned short*>(prep + kPrepA);
+            unsigned short* Th = reinterpret_cast<unsigned short*>(prep + kPrepT);
+            for (int e = i128; e < CH * LDH; e += 128) Th[e] = 0;
             named_sync(bar_id, 128);
             const u32 lane_base = (quad * 32u) << 16;
             int c = 0;
@@ -491,9 +562,10 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
                             av[u] = (jj < i && i < L) ? kv * f * rj[u] * ex2(gi - gj[u]) : 0.f;
                         }
 #pragma unroll
-                        for (int q = 0; q < 4; ++q) {
-                            reinterpret_cast<float4*>(sA + i * LDA + jb * 16)[q] =
-                                make_float4(av[4 * q], av[4 * q + 1], av[4 * q + 2], av[4 * q + 3]);
+                        for (int q = 0; q < 2; ++q) {
+                            reinterpret_cast<uint4*>(Ah + i * LDH + jb * 16)[q] = make_uint4(
+                                h2(av[8 * q], av[8 * q + 1]), h2(av[8 * q + 2], av[8 * q + 3]),
+                                h2(av[8 * q + 4], av[8 * q + 5]), h2(av[8 * q + 6], av[8 * q + 7]));
                         }
                     }
                 } else {
@@ -540,126 +612,136 @@ __global__ void __launch_bounds__(448, 1) gdn_chunked_tc5(
                 }
                 named_sync(bar_id, 128);
 
-                // T = (I + A)^-1: each warp inverts one sixteen-row diagonal
-                // block by forward substitution in f32, then two tf32 merge
-                // levels form the blocks below the diagonal.
-                {
-                    // Each warp one sixteen-row diagonal block: lanes 0-7 and
-                    // 8-15 invert its two eight-row halves by forward
-                    // substitution (a lane a column, the rows' A values
-                    // loaded up front), then the warp forms the lower-left
-                    // eight by eight, -D1 (A10 D0).
-                    const int d0 = static_cast<int>(quad) * 16;
-                    float* X = reinterpret_cast<float*>(prep + kPrepX) + quad * 128;
-                    if (l < 16) {
-                        const int b0 = d0 + (l >> 3) * 8;
-                        const int col = l & 7;
-                        float a[28];
+                // T = (I + A)^-1 in f16 (its products accumulate in f32):
+                // the eight eight-row diagonal blocks by forward substitution,
+                // then three doubling levels, X = A_lo T_hi and T_lo = -T_d X.
+                if (quad < 2) {
+                    const int L64 = static_cast<int>(quad) * 32 + l;
+                    const int b0 = (L64 >> 3) * 8;
+                    const int col = L64 & 7;
+                    float a[28];
 #pragma unroll
-                        for (int r = 1, e = 0; r < 8; ++r) {
+                    for (int r = 1, e = 0; r < 8; ++r) {
 #pragma unroll
-                            for (int m = 0; m < r; ++m, ++e) a[e] = sA[(b0 + r) * LDA + b0 + m];
-                        }
-                        float t[8];
-#pragma unroll
-                        for (int r = 0, e = 0; r < 8; ++r) {
-                            float sum = 0.f;
-#pragma unroll
-                            for (int m = 0; m < r; ++m, ++e) sum = __fmaf_rn(a[e], t[m], sum);
-                            t[r] = r == col ? 1.f : (r < col ? 0.f : -sum);
-                        }
-#pragma unroll
-                        for (int r = 0; r < 8; ++r) Tm[(b0 + r) * LDA + b0 + col] = t[r];
+                        for (int m = 0; m < r; ++m, ++e) a[e] = hf(Ah + (b0 + r) * LDH + b0 + m);
                     }
-                    __syncwarp();
-                    // X = A10 D0, two entries a lane.
+                    float t[8];
 #pragma unroll
-                    for (int h2 = 0; h2 < 2; ++h2) {
-                        const int e = l + 32 * h2;
+                    for (int r = 0, e = 0; r < 8; ++r) {
+                        float sum = 0.f;
+#pragma unroll
+                        for (int m = 0; m < r; ++m, ++e) sum = __fmaf_rn(a[e], t[m], sum);
+                        t[r] = r == col ? 1.f : (r < col ? 0.f : -sum);
+                    }
+#pragma unroll
+                    for (int r = 0; r < 8; ++r) Th[(b0 + r) * LDH + b0 + col] = f2h(t[r]);
+                }
+                named_sync(bar_id, 128);
+                {
+                    // 8 -> 16, a warp a sixteen-row block, in f32 FMAs.
+                    const int d0 = static_cast<int>(quad) * 16;
+                    float* X = reinterpret_cast<float*>(prep + kPrepX) + quad * 64;
+#pragma unroll
+                    for (int h2i = 0; h2i < 2; ++h2i) {
+                        const int e = l + 32 * h2i;
                         const int r = e >> 3;
                         const int c = e & 7;
                         float sum = 0.f;
 #pragma unroll
                         for (int m = 0; m < 8; ++m) {
                             if (m >= c) {
-                                sum = __fmaf_rn(sA[(d0 + 8 + r) * LDA + d0 + m],
-                                                Tm[(d0 + m) * LDA + d0 + c], sum);
+                                sum = __fmaf_rn(hf(Ah + (d0 + 8 + r) * LDH + d0 + m),
+                                                hf(Th + (d0 + m) * LDH + d0 + c), sum);
                             }
                         }
                         X[e] = sum;
                     }
                     __syncwarp();
 #pragma unroll
-                    for (int h2 = 0; h2 < 2; ++h2) {
-                        const int e = l + 32 * h2;
+                    for (int h2i = 0; h2i < 2; ++h2i) {
+                        const int e = l + 32 * h2i;
                         const int r = e >> 3;
                         const int c = e & 7;
                         float sum = 0.f;
 #pragma unroll
                         for (int m = 0; m < 8; ++m) {
                             if (m <= r) {
-                                sum = __fmaf_rn(Tm[(d0 + 8 + r) * LDA + d0 + 8 + m], X[m * 8 + c], sum);
+                                sum = __fmaf_rn(hf(Th + (d0 + 8 + r) * LDH + d0 + 8 + m), X[m * 8 + c], sum);
                             }
                         }
-                        Tm[(d0 + 8 + r) * LDA + d0 + c] = -sum;
+                        Th[(d0 + 8 + r) * LDH + d0 + c] = f2h(-sum);
                     }
                 }
                 named_sync(bar_id, 128);
-                {
-                    // 16 -> 32: T10 = -D1 (A10 D0) and T32 = -D3 (A32 D2),
-                    // a warp an eight-column half of one.
-                    float* P = reinterpret_cast<float*>(prep + kPrepX) + quad * 128;
-                    const int b = static_cast<int>(quad >> 1) * 32;
-                    const int n0 = static_cast<int>(quad & 1) * 8;
-                    float d[4] = {0.f, 0.f, 0.f, 0.f};
-                    tile_mm(d, sA, LDA, b + 16, b, Tm, LDA, b, b + n0, 2, l);
-                    tile_put(d, P, 8, 0, 0, 1.f, l);
+                unsigned short* Xh = reinterpret_cast<unsigned short*>(prep + kPrepX);
+                if (quad < 2) {
+                    // 16 -> 32: warp b the block at rows 32b, X = A10 T0 then
+                    // T10 = -T1 X, sixteen by sixteen each.
+                    const int b0 = static_cast<int>(quad) * 32;
+                    unsigned short* Xb = Xh + quad * (16 * 24);
+                    u32 fa[4], fb[4];
+                    float d0[4] = {0.f, 0.f, 0.f, 0.f}, d1[4] = {0.f, 0.f, 0.f, 0.f};
+                    frag_a(fa, Ah, LDH, b0 + 16, b0, l);
+                    frag_b(fb, Th, LDH, b0, b0, l);
+                    mma_h(d0, fa, fb[0], fb[1]);
+                    mma_h(d1, fa, fb[2], fb[3]);
+                    put_h(d0, Xb, 24, 0, 0, 1.f, l);
+                    put_h(d1, Xb, 24, 0, 8, 1.f, l);
                     __syncwarp();
-                    float e[4] = {0.f, 0.f, 0.f, 0.f};
-                    tile_mm(e, Tm, LDA, b + 16, b + 16, P, 8, 0, 0, 2, l);
-                    tile_put(e, Tm, LDA, b + 16, b + n0, -1.f, l);
+                    float e0[4] = {0.f, 0.f, 0.f, 0.f}, e1[4] = {0.f, 0.f, 0.f, 0.f};
+                    frag_a(fa, Th, LDH, b0 + 16, b0 + 16, l);
+                    frag_b(fb, Xb, 24, 0, 0, l);
+                    mma_h(e0, fa, fb[0], fb[1]);
+                    mma_h(e1, fa, fb[2], fb[3]);
+                    put_h(e0, Th, LDH, b0 + 16, b0, -1.f, l);
+                    put_h(e1, Th, LDH, b0 + 16, b0 + 8, -1.f, l);
                 }
                 named_sync(bar_id, 128);
                 {
-                    // 32 -> 64: T[32:, :32] = -D23 (A[32:, :32] D01), a warp
-                    // a 16 x 16 quarter of each product.
-                    float* P = reinterpret_cast<float*>(prep + kPrepX);
-                    const int r = 32 + static_cast<int>(quad >> 1) * 16;
-                    const int nb = static_cast<int>(quad & 1) * 16;
+                    // 32 -> 64: warp w the X tile at rows 16(w>>1), columns
+                    // 16(w&1), then the same tile of T_lo.
+                    const int mt = static_cast<int>(quad >> 1) * 16;
+                    const int nh = static_cast<int>(quad & 1) * 16;
+                    u32 fa[4], fb[4];
+                    float d0[4] = {0.f, 0.f, 0.f, 0.f}, d1[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-                    for (int h2 = 0; h2 < 2; ++h2) {
-                        float d[4] = {0.f, 0.f, 0.f, 0.f};
-                        tile_mm(d, sA, LDA, r, 0, Tm, LDA, 0, nb + 8 * h2, 4, l);
-                        tile_put(d, P, 32, r - 32, nb + 8 * h2, 1.f, l);
+                    for (int k = 0; k < 2; ++k) {
+                        frag_a(fa, Ah, LDH, 32 + mt, 16 * k, l);
+                        frag_b(fb, Th, LDH, 16 * k, nh, l);
+                        mma_h(d0, fa, fb[0], fb[1]);
+                        mma_h(d1, fa, fb[2], fb[3]);
                     }
+                    put_h(d0, Xh, 40, mt, nh, 1.f, l);
+                    put_h(d1, Xh, 40, mt, nh + 8, 1.f, l);
                     named_sync(bar_id, 128);
+                    float e0[4] = {0.f, 0.f, 0.f, 0.f}, e1[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-                    for (int h2 = 0; h2 < 2; ++h2) {
-                        float d[4] = {0.f, 0.f, 0.f, 0.f};
-                        tile_mm(d, Tm, LDA, r, 32, P, 32, 0, nb + 8 * h2, 4, l);
-                        tile_put(d, Tm, LDA, r, nb + 8 * h2, -1.f, l);
+                    for (int k = 0; k < 2; ++k) {
+                        frag_a(fa, Th, LDH, 32 + mt, 32 + 16 * k, l);
+                        frag_b(fb, Xh, 40, 16 * k, nh, l);
+                        mma_h(e0, fa, fb[0], fb[1]);
+                        mma_h(e1, fa, fb[2], fb[3]);
                     }
+                    put_h(e0, Th, LDH, 32 + mt, nh, -1.f, l);
+                    put_h(e1, Th, LDH, 32 + mt, nh + 8, -1.f, l);
                 }
                 named_sync(bar_id, 128);
-                // T' = T diag(beta) in bf16, the B operand of NV = T' U.
-                if (i128 < CH) {
-                    const int i = i128;
+                {
+                    // T' = T diag(beta) in bf16, the B operand of NV = T' U:
+                    // two threads a row, 32 columns each.
+                    const int i = i128 >> 1;
+                    const int hh = i128 & 1;
                     unsigned char* tb = smem + kT + s * 8192;
 #pragma unroll
-                    for (int cj = 0; cj < 8; ++cj) {
-                        u32 pk[4] = {0u, 0u, 0u, 0u};
-                        if (cj * 8 <= i) {
-                            const float4 t0 = reinterpret_cast<const float4*>(Tm + i * LDA)[2 * cj];
-                            const float4 t1 = reinterpret_cast<const float4*>(Tm + i * LDA)[2 * cj + 1];
-                            const float4 b0 = reinterpret_cast<const float4*>(B)[2 * cj];
-                            const float4 b1 = reinterpret_cast<const float4*>(B)[2 * cj + 1];
-                            pk[0] = gdn_pack(t0.x * b0.x, t0.y * b0.y);
-                            pk[1] = gdn_pack(t0.z * b0.z, t0.w * b0.w);
-                            pk[2] = gdn_pack(t1.x * b1.x, t1.y * b1.y);
-                            pk[3] = gdn_pack(t1.z * b1.z, t1.w * b1.w);
-                        }
-                        *reinterpret_cast<uint4*>(tb + i * 128 + (((cj ^ (i & 7))) << 4)) =
-                            make_uint4(pk[0], pk[1], pk[2], pk[3]);
+                    for (int q = 0; q < 4; ++q) {
+                        const int cj = hh * 4 + q;
+                        const uint4 t4 = *reinterpret_cast<const uint4*>(Th + i * LDH + cj * 8);
+                        const float4 b0 = reinterpret_cast<const float4*>(B)[2 * cj];
+                        const float4 b1 = reinterpret_cast<const float4*>(B)[2 * cj + 1];
+                        const float2 x0 = h2f(t4.x), x1 = h2f(t4.y), x2 = h2f(t4.z), x3 = h2f(t4.w);
+                        *reinterpret_cast<uint4*>(tb + i * 128 + (((cj ^ (i & 7))) << 4)) = make_uint4(
+                            gdn_pack(x0.x * b0.x, x0.y * b0.y), gdn_pack(x1.x * b0.z, x1.y * b0.w),
+                            gdn_pack(x2.x * b1.x, x2.y * b1.y), gdn_pack(x3.x * b1.z, x3.y * b1.w));
                     }
                     fence_async_shared();
                 }
