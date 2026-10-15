@@ -41,7 +41,43 @@ struct Paged {
     i32 window_left;
     float scale_log2;
     i32 partition;
+    // A learned relative-position bias (Inkling), null for none: the score
+    // of query row r (position pos, head h) against key j gains
+    // rel_bias[(r·H + h)·rel_extent + pos − j] where pos − j < rel_extent,
+    // and grows by 1 + rel_log_alpha·ln((pos + 1) / rel_log_floor) past the
+    // floor, before the softmax.
+    const float* rel_bias;
+    i32 rel_extent;
+    i32 rel_log_floor;
+    float rel_log_alpha;
+    i32 rel_pad;
 };
+
+// The relative bias of one query row and head: `sc` scales a raw dot into
+// the log2 domain, `bs` the bias, `row` its bias row (null: none).
+struct RelRow {
+    const float* row;
+    float sc, bs;
+    int pos, extent;
+
+    __device__ __forceinline__ float score(float dot, int key) const {
+        float x = dot * sc;
+        if (row != nullptr) {
+            const int back = pos - key;
+            if (back >= 0 && back < extent) x += row[back] * bs;
+        }
+        return x;
+    }
+};
+
+__device__ __forceinline__ RelRow rel_row(const Paged& p, long long q_row, int head, int pos) {
+    if (p.rel_bias == nullptr) return {nullptr, p.scale_log2, 0.f, pos, 0};
+    const float grow = p.rel_log_alpha != 0.f && p.rel_log_floor != 0 && pos + 1 > p.rel_log_floor
+                           ? 1.f + p.rel_log_alpha * logf(static_cast<float>(pos + 1) / static_cast<float>(p.rel_log_floor))
+                           : 1.f;
+    return {p.rel_bias + (q_row * p.num_qo_heads + head) * static_cast<long long>(p.rel_extent),
+            p.scale_log2 * grow, 1.4426950408889634f * grow, pos, p.rel_extent};
+}
 
 __device__ __forceinline__ int kv_length(const Paged& p, int req) {
     const int pages = p.page_indptr[req + 1] - p.page_indptr[req];
@@ -308,6 +344,7 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
 
     const i32* pages = p.page_indices + p.page_indptr[req];
     const int ps_ = p.page_size;
+    const RelRow rel = rel_row(p, p.q_indptr[req], kv_head * G + min(g, G - 1), kv_len - 1);
     for (int page0 = lo / ps_; page0 * ps_ < end; page0 += TABLE) {
     const int w0 = max(lo, page0 * ps_), wend = min(end, (page0 + TABLE) * ps_);
     __syncthreads();
@@ -362,7 +399,7 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
 #pragma unroll
             for (int t = 0; t < 4; ++t) {
                 const int key = t0 + kt * 16 + 4 * quad + t;
-                s[kt][t] = key < wend ? s[kt][t] * p.scale_log2 : neg_inf();
+                s[kt][t] = key < wend ? rel.score(s[kt][t], key) : neg_inf();
                 tmax = fmaxf(tmax, s[kt][t]);
             }
         tmax = fmaxf(tmax, __shfl_xor(tmax, 16, kWave));
@@ -1029,6 +1066,7 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
         __syncthreads();
     }
     const int sel_row = token - tok_lo;
+    const RelRow rel = rel_row(p, q_first + min(token, qo_len - 1), head, kv_len - qo_len + token);
 
     const i32* pages = p.page_indices + p.page_indptr[req];
     const int ps = p.page_size;
@@ -1104,7 +1142,7 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
                         const int b = key / sel.ratio;
                         seen = seen && (b >= sel_blocks[sel_row] || ((sel_bits[sel_row][b / 32] >> (b % 32)) & 1u));
                     }
-                    s[kt][t] = seen ? s[kt][t] * p.scale_log2 : neg_inf();
+                    s[kt][t] = seen ? rel.score(s[kt][t], key) : neg_inf();
                     tile_max = fmaxf(tile_max, s[kt][t]);
                 }
             tile_max = fmaxf(tile_max, __shfl_xor(tile_max, 16, kWave));

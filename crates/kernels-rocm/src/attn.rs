@@ -138,6 +138,21 @@ fn fa2_decode(
         if lse.is_some() {
             return Err(Error::Unsupported { op });
         }
+        // The matrix-core decode where it takes the group and width.
+        if paged::rel_walks(plan.shape.group_size(), head_dim) {
+            return paged::decode(
+                ctx,
+                op,
+                q,
+                plan,
+                pool,
+                window_left,
+                sm_scale,
+                o,
+                0,
+                Some(rel.walked(q.data.rows, plan.shape.num_q_heads)?),
+            );
+        }
         return rel::walk(
             ctx,
             op,
@@ -158,7 +173,7 @@ fn fa2_decode(
         }
         None => 0,
     };
-    paged::decode(ctx, op, q, plan, pool, window_left, sm_scale, o, lse_ptr)
+    paged::decode(ctx, op, q, plan, pool, window_left, sm_scale, o, lse_ptr, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -193,6 +208,21 @@ fn fa2_prefill(
         if lse.is_some() || mask.is_some() {
             return Err(Error::Unsupported { op });
         }
+        // The tiled prefill where it takes the group and width.
+        if paged::rel_walks(plan.shape.group_size(), head_dim) {
+            return paged::prefill(
+                ctx,
+                op,
+                q,
+                plan,
+                pool,
+                window_left,
+                sm_scale,
+                o,
+                0,
+                Some(rel.walked(q.data.rows, plan.shape.num_q_heads)?),
+            );
+        }
         return rel::walk(
             ctx,
             op,
@@ -216,7 +246,7 @@ fn fa2_prefill(
         }
         None => 0,
     };
-    paged::prefill(ctx, op, q, plan, pool, window_left, sm_scale, o, lse_ptr)
+    paged::prefill(ctx, op, q, plan, pool, window_left, sm_scale, o, lse_ptr, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -469,6 +499,32 @@ pub struct RelBias {
     pub extent: u32,
     pub log_floor: u32,
     pub log_alpha: f32,
+}
+
+impl RelBias {
+    /// The bias as the matrix-core walks take it.
+    fn walked(self, rows: u32, heads: u32) -> Result<paged::Rel, Error> {
+        const OP: &str = "attention.rel_bias";
+        if self.bias.dtype != Dtype::F32
+            || self.bias.ptr == 0
+            || self.bias.rows != rows
+            || u64::from(self.bias.width) != u64::from(heads) * u64::from(self.extent)
+        {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the bias is {:?} [{}, {}] and the rows want f32 [{rows}, {heads} x {}]",
+                    self.bias.dtype, self.bias.rows, self.bias.width, self.extent
+                ),
+            ));
+        }
+        Ok(paged::Rel {
+            bias: self.bias.ptr,
+            extent: stated(OP, self.extent)?,
+            log_floor: stated(OP, self.log_floor)?,
+            log_alpha: self.log_alpha,
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

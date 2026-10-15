@@ -700,3 +700,204 @@ fn attn_paged_wide_groups() {
         run_decode(&gpu, &c, &[5, 300, 2000], Some(128), 4096);
     }
 }
+
+/// `reference_row` under a relative bias: the bias at each key's distance
+/// inside `extent` and the logits grown by `1 + α·ln((pos + 1) / floor)`.
+#[allow(clippy::too_many_arguments)]
+fn reference_rel_row(
+    c: &Case,
+    q: &[f32],
+    keys: &[f32],
+    vals: &[f32],
+    kv: usize,
+    qo_len: usize,
+    token: usize,
+    window: Option<u32>,
+    bias: &[f32],
+    extent: usize,
+    log: (u32, f32),
+) -> Vec<f32> {
+    let (hq, hk, d) = (c.q_heads as usize, c.kv_heads as usize, c.head_dim as usize);
+    let g = hq / hk;
+    let scale = 1.0 / (d as f64).sqrt();
+    let pos = kv - qo_len + token;
+    let lo = window.map_or(0, |w| (pos + 1).saturating_sub(w as usize));
+    let grow = if log.1 != 0.0 && log.0 != 0 && pos + 1 > log.0 as usize {
+        1.0 + f64::from(log.1) * ((pos + 1) as f64 / f64::from(log.0)).ln()
+    } else {
+        1.0
+    };
+    let mut out = vec![0f32; hq * d];
+    for head in 0..hq {
+        let kh = head / g;
+        let s: Vec<f64> = (lo..=pos)
+            .map(|t| {
+                let mut x = (0..d)
+                    .map(|j| f64::from(q[head * d + j]) * f64::from(keys[(t * hk + kh) * d + j]))
+                    .sum::<f64>()
+                    * scale;
+                if pos - t < extent {
+                    x += f64::from(bias[head * extent + pos - t]);
+                }
+                x * grow
+            })
+            .collect();
+        let m = s.iter().cloned().fold(f64::MIN, f64::max);
+        let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+        let z: f64 = e.iter().sum();
+        for j in 0..d {
+            let acc: f64 = (lo..=pos)
+                .zip(&e)
+                .map(|(t, w)| w * f64::from(vals[(t * hk + kh) * d + j]))
+                .sum();
+            out[head * d + j] = (acc / z) as f32;
+        }
+    }
+    out
+}
+
+/// Inkling's relative-bias attention through the plans the engine stages:
+/// decode rows (all one query a request) on the matrix-core decode, split
+/// and whole, and prefill rows on the tiled walk; windows and the log
+/// growth past its floor.
+#[allow(clippy::too_many_arguments)]
+fn run_rel(
+    gpu: &Gpu,
+    c: &Case,
+    qo_lens: &[u32],
+    prefix: &[u32],
+    window: Option<u32>,
+    extent: u32,
+    log: (u32, f32),
+    max_grid: u32,
+) {
+    let ctx = gpu.ctx();
+    let device = plan::Device::probe(&ctx).unwrap();
+    let n = qo_lens.len() as u32;
+    let decode = qo_lens.iter().all(|&l| l == 1);
+    let kv_lens: Vec<u32> = qo_lens.iter().zip(prefix).map(|(q, p)| q + p).collect();
+    let cache = cache(gpu, c, &kv_lens, 13);
+    let total: u32 = qo_lens.iter().sum();
+    let qv: Vec<f32> = values((total * c.q_heads * c.head_dim) as usize, 5, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let bias = values((total * c.q_heads * extent) as usize, 9, 2.0);
+    let mut qo_indptr = vec![0i32];
+    for &l in qo_lens {
+        qo_indptr.push(qo_indptr.last().unwrap() + l as i32);
+    }
+    let q = RaggedTensor {
+        data: gpu.tensor(&qv, total, c.q_heads * c.head_dim, Dtype::Bf16),
+        indptr: gpu.column(&qo_indptr),
+    };
+    let shape = plan::Shape {
+        num_requests: n,
+        lane_offset: 0,
+        num_q_heads: c.q_heads,
+        num_kv_heads: c.kv_heads,
+        head_dim: c.head_dim,
+        page_size: c.page_size,
+        hnd_layout: c.hnd,
+    };
+    let live = plan::Live {
+        requests: n,
+        lane_offset: 0,
+        row_offset: 0,
+        rows: total,
+    };
+    let kv_len: Vec<i32> = kv_lens.iter().map(|&x| x as i32).collect();
+    let rel = attn::RelBias {
+        bias: gpu.tensor(&bias, total, c.q_heads * extent, Dtype::F32),
+        extent,
+        log_floor: log.0,
+        log_alpha: log.1,
+    };
+    let scale = 1.0 / (c.head_dim as f32).sqrt();
+    let mut o = gpu.zeros(total, c.q_heads * c.head_dim, Dtype::Bf16);
+    if decode {
+        let built = plan::plan_decode(
+            &cache.page_indptr,
+            &kv_len,
+            shape,
+            live,
+            window,
+            false,
+            max_grid,
+            plan::Toggles::default(),
+            &device,
+            workspace(gpu),
+        )
+        .unwrap();
+        built.stage(&ctx).unwrap();
+        attn::decode_rel(&ctx, q, &built, &cache.pool, rel, window, c.head_dim, scale, &mut o)
+            .unwrap();
+    } else {
+        let built = plan::plan_prefill(
+            &qo_indptr,
+            &cache.page_indptr,
+            &kv_len,
+            total,
+            shape,
+            live,
+            window,
+            true,
+            false,
+            None,
+            &device,
+            plan::Toggles::default(),
+            workspace(gpu),
+        )
+        .unwrap();
+        built.stage(&ctx).unwrap();
+        attn::prefill_rel(
+            &ctx, q, &built, &cache.pool, rel, window, c.head_dim, c.kv_heads, scale, &mut o,
+        )
+        .unwrap();
+    }
+    let got = gpu.read(&o);
+    let row = (c.q_heads * c.head_dim) as usize;
+    let brow = (c.q_heads * extent) as usize;
+    for r in 0..n as usize {
+        for t in 0..qo_lens[r] as usize {
+            let at = qo_indptr[r] as usize + t;
+            let want = reference_rel_row(
+                c,
+                &qv[at * row..(at + 1) * row],
+                &cache.keys[r],
+                &cache.vals[r],
+                kv_lens[r] as usize,
+                qo_lens[r] as usize,
+                t,
+                window,
+                &bias[at * brow..(at + 1) * brow],
+                extent as usize,
+                log,
+            );
+            let tag = format!(
+                "rel {} d{} g{} hnd={} window={window:?} req {r} token {t}",
+                if decode { "decode" } else { "prefill" },
+                c.head_dim,
+                c.q_heads / c.kv_heads,
+                c.hnd
+            );
+            close(&tag, &got[at * row..(at + 1) * row], &want, 1.5e-2);
+        }
+    }
+}
+
+#[test]
+fn attn_paged_relative_bias() {
+    let Some(gpu) = Gpu::open() else { return };
+    // Inkling-Small: 32 query heads over 8, 128 wide; its global layers grow
+    // past the floor, its local ones read a 128-key window.
+    let ink = Case { q_heads: 32, kv_heads: 8, head_dim: 128, page_size: 16, hnd: false };
+    let wide = Case { q_heads: 16, kv_heads: 1, head_dim: 256, page_size: 16, hnd: true };
+    for c in [&ink, &wide] {
+        run_rel(&gpu, c, &[1, 1, 1, 1], &[0, 36, 299, 1000], None, 16, (64, 0.1), 4096);
+        run_rel(&gpu, c, &[1, 1, 1, 1], &[0, 36, 299, 1000], None, 16, (64, 0.1), 1);
+        run_rel(&gpu, c, &[1, 1], &[200, 2000], Some(128), 300, (0, 0.0), 4096);
+        run_rel(&gpu, c, &[70, 3, 200], &[0, 40, 900], None, 16, (64, 0.1), 4096);
+        run_rel(&gpu, c, &[150, 9], &[300, 0], Some(128), 300, (100, 0.3), 4096);
+    }
+}

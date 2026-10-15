@@ -44,9 +44,42 @@ struct Args {
     window_left: i32,
     scale_log2: f32,
     partition: i32,
+    rel_bias: u64,
+    rel_extent: i32,
+    rel_log_floor: i32,
+    rel_log_alpha: f32,
+    rel_pad: i32,
 }
 
-const _: () = assert!(core::mem::size_of::<Args>() == 152);
+const _: () = assert!(core::mem::size_of::<Args>() == 176);
+
+/// A learned relative-position bias and Inkling's logit growth, as the
+/// matrix-core walks read it: `bias` f32 `[rows, heads · extent]`.
+#[derive(Clone, Copy, Debug)]
+pub struct Rel {
+    pub bias: u64,
+    pub extent: i32,
+    pub log_floor: i32,
+    pub log_alpha: f32,
+}
+
+impl Args {
+    fn rel(&mut self, rel: Option<Rel>) {
+        if let Some(rel) = rel {
+            self.rel_bias = rel.bias;
+            self.rel_extent = rel.extent;
+            self.rel_log_floor = rel.log_floor;
+            self.rel_log_alpha = rel.log_alpha;
+        }
+    }
+}
+
+/// Whether the matrix-core decode (and, at these widths, the tiled prefill)
+/// takes a relative bias at this group and head width.
+#[must_use]
+pub fn rel_walks(group: u32, head_dim: u32) -> bool {
+    group <= 16 && matches!(head_dim, 128 | 256)
+}
 
 fn by_value(args: &Args) -> ArgValue {
     ArgValue::Bytes {
@@ -155,10 +188,14 @@ pub fn decode(
     sm_scale: f32,
     o: &Tensor,
     lse: u64,
+    rel: Option<Rel>,
 ) -> Result<(), Error> {
     let shape = &plan.shape;
     head_dim_built(op, shape.head_dim)?;
     let group = shape.group_size();
+    if rel.is_some() && !rel_walks(group, shape.head_dim) {
+        return Err(refuse(op, "a relative bias rides the matrix-core decode only"));
+    }
     let info = &plan.info;
     let int = plan.workspace.int_ptr;
     let float = plan.workspace.float_ptr;
@@ -175,6 +212,7 @@ pub fn decode(
     args.window_left = window_left;
     args.scale_log2 = scale_log2(sm_scale, shape.head_dim);
     args.partition = i32::from(info.split_kv);
+    args.rel(rel);
     let split = info.split_kv.then(|| Partials {
         parts: at(float, info.v_offset),
         part_lse: at(float, info.s_offset),
@@ -271,8 +309,9 @@ pub fn prefill(
     sm_scale: f32,
     o: &Tensor,
     lse: u64,
+    rel: Option<Rel>,
 ) -> Result<(), Error> {
-    prefill_walk(ctx, op, q, plan, pool, window_left, sm_scale, o, lse, None)
+    prefill_walk(ctx, op, q, plan, pool, window_left, sm_scale, o, lse, None, rel)
 }
 
 /// `pie::attn::PrefillSel`, field for field: the selection rows a selected
@@ -309,7 +348,7 @@ pub fn prefill_selected(
     o: &Tensor,
     sel: PrefillSel,
 ) -> Result<(), Error> {
-    prefill_walk(ctx, op, q, plan, pool, -1, sm_scale, o, 0, Some(sel))
+    prefill_walk(ctx, op, q, plan, pool, -1, sm_scale, o, 0, Some(sel), None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -324,6 +363,7 @@ fn prefill_walk(
     o: &Tensor,
     lse: u64,
     sel: Option<PrefillSel>,
+    rel: Option<Rel>,
 ) -> Result<(), Error> {
     let shape = &plan.shape;
     head_dim_built(op, shape.head_dim)?;
@@ -354,6 +394,10 @@ fn prefill_walk(
     args.window_left = window_left;
     args.scale_log2 = scale_log2(sm_scale, shape.head_dim);
     args.partition = i32::from(info.split_kv);
+    if rel.is_some() && !rel_walks(shape.group_size(), shape.head_dim) {
+        return Err(refuse(op, "a relative bias rides the tiled prefill only"));
+    }
+    args.rel(rel);
     let split = info.split_kv.then(|| Partials {
         parts: at(float, info.v_offset),
         part_lse: at(float, info.s_offset),
