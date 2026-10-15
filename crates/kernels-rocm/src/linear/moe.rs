@@ -785,6 +785,7 @@ const GROUP_TILE_N: u32 = 128;
 /// Weight rows a tall grouped block takes (four 16-row blocks a wave, eight
 /// waves).
 const TALL_ROWS: u32 = 512;
+const TALL_MIN_K: u32 = 2048;
 const GROUP_BLOCK: u32 = 256;
 
 /// A matrix-core grouped launch over `items` items of `routes` routes: 32
@@ -864,7 +865,11 @@ fn select_grouped(
     // tall block: 64 weight rows a wave, so each activation piece read from
     // LDS feeds twice the products (GLM's 4096-row legs: 461 -> 505
     // TFLOP/s at an 8192-token prefill); narrower banks would idle its rows.
-    let tall = ordered.routes == GROUP_ROUTES_WIDE && y.width.is_multiple_of(TALL_ROWS);
+    // Only over long K: Qwen3.8-Flash-Next's 640-deep down leg ran no faster
+    // in the serve (its mid-in TPOT 4.8 -> 5.4 ms) for a 10% microbench gain.
+    let tall = ordered.routes == GROUP_ROUTES_WIDE
+        && y.width.is_multiple_of(TALL_ROWS)
+        && x.width >= TALL_MIN_K;
     let (entry, launch) = if tall {
         (
             format!(
