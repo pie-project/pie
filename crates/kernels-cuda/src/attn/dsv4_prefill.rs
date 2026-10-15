@@ -57,6 +57,8 @@ struct SparseParams {
     live: u64,
     sinks_f32: i32,
     ent_runs: i32,
+    win_fp8: u64,
+    ent_fp8: u64,
     win_page: i32,
     ent_page: i32,
     top_k: i32,
@@ -107,14 +109,19 @@ pub fn takes(
     window: Option<u32>,
     window_pool: &KvPool,
     pooled: &Pooled<'_>,
+    sparse: bool,
 ) -> bool {
+    // DeepSeek's fp8 rows (both planes) only the block-a-row kernel reads.
+    let fp8 = sparse
+        && crate::attn::dsv4::fp8_ds(window_pool)
+        && crate::attn::dsv4::fp8_ds(pooled.entries);
     supported()
         && heads == HEADS
         && head_dim == HEAD_DIM
         && window == Some(WINDOW)
         && pooled.ratio > 0
-        && plain_bf16(window_pool)
-        && plain_bf16(pooled.entries)
+        && (fp8 || plain_bf16(window_pool))
+        && (fp8 || plain_bf16(pooled.entries))
 }
 
 /// Lands the sinked attention of every row of `q` in `o`: the row's window
@@ -227,7 +234,8 @@ pub fn prefill(
         len: 128,
     };
     let selected = pooled.selection.is_some();
-    if ctx.tuning().dsv4_sparse {
+    let fp8 = crate::attn::dsv4::fp8_ds(window_pool);
+    if ctx.tuning().dsv4_sparse || fp8 {
         // A block a row (`attn/dsv4_sparse.cuh`): Q in TMEM, whole 64-key
         // tiles, V the tile K brought.
         let sparse = SparseParams {
@@ -243,7 +251,9 @@ pub fn prefill(
             sinks: sinks.ptr,
             live,
             sinks_f32: i32::from(sinks.dtype == Dtype::F32),
-            ent_runs: i32::from(ent_runs),
+            ent_runs: i32::from(ent_runs && !fp8),
+            win_fp8: if fp8 { window_pool.keys.ptr } else { 0 },
+            ent_fp8: if fp8 { pooled.entries.keys.ptr } else { 0 },
             win_page: window_pool.page_size,
             ent_page: pooled.entries.page_size,
             top_k: int(top_k),
@@ -257,7 +267,9 @@ pub fn prefill(
             op,
             Fire::at(
                 SPARSE_FILE,
-                symbol(&format!("::pie::attn::dsv4s::dsv4_sparse<{selected}>")),
+                symbol(&format!(
+                    "::pie::attn::dsv4s::dsv4_sparse<{selected}, {fp8}>"
+                )),
             )
             .apply(
                 Launch::grid(

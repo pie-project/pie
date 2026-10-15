@@ -8,6 +8,7 @@
 
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
+use kernels_cuda::attn::dsv4;
 use kernels_cuda::attn::dsv4_prefill::{self, Pooled};
 use kernels_cuda::tensor::{KvPool, Tensor};
 use kernels_cuda::tuning::Tuning;
@@ -54,11 +55,71 @@ fn paging(per: usize) -> (Vec<u32>, Vec<u32>) {
 
 fn check(ratio: usize, top_k: Option<usize>) {
     for sparse in [false, true] {
-        check_with(ratio, top_k, sparse);
+        check_with(ratio, top_k, sparse, false);
+    }
+    // DeepSeek's fp8 rows, which only the block-a-row kernel reads.
+    check_with(ratio, top_k, true, true);
+}
+
+/// An e4m3 code's value.
+fn e4m3(code: u8) -> f32 {
+    let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from((code >> 3) & 0xf);
+    let man = f32::from(code & 7);
+    sign * if exp == 0 {
+        man / 8.0 * 2f32.powi(-6)
+    } else {
+        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
     }
 }
 
-fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool) {
+/// `src`'s cells written as DeepSeek's fp8 rows through the fp8 append:
+/// the u8 pool, and what its rows read as.
+fn fp8_plane(
+    gpu: &mut Gpu,
+    src: u64,
+    cells: usize,
+    pages: &[u32],
+    indptr: &[u32],
+) -> (KvPool, Vec<f32>) {
+    let row = dsv4::DS_ROW as usize;
+    let data = dsv4::DS_DATA as usize;
+    let nope = dsv4::DS_NOPE as usize;
+    let bytes = cells * row;
+    let plane = gpu.zeros(bytes);
+    let pool = KvPool {
+        keys: Tensor::new(plane, cells as u32, dsv4::DS_ROW, Dtype::U8),
+        values: Tensor::new(plane, cells as u32, dsv4::DS_ROW, Dtype::U8),
+        seq_stride: i64::from(dsv4::DS_ROW),
+        ..pool_of(gpu, plane, cells, pages, indptr)
+    };
+    let at_page: Vec<u32> = (0..cells as u32).map(|c| c / PAGE as u32).collect();
+    let at_off: Vec<u32> = (0..cells as u32).map(|c| c % PAGE as u32).collect();
+    let at_page = Tensor::new(gpu.up(&at_page), cells as u32, 1, Dtype::U32);
+    let at_off = Tensor::new(gpu.up(&at_off), cells as u32, 1, Dtype::U32);
+    let rows_t = Tensor::new(src, cells as u32, D as u32, Dtype::Bf16);
+    dsv4::append(&gpu.ctx(), rows_t, &pool, at_page, at_off).expect("the fp8 append fires");
+    gpu.sync();
+    let raw: Vec<u8> = gpu.down(plane, bytes);
+    let mut read = vec![0f32; cells * D];
+    for c in 0..cells {
+        let base = c / PAGE * PAGE * row;
+        let off = c % PAGE;
+        let b = &raw[base + off * data..base + (off + 1) * data];
+        let sc = &raw[base + PAGE * data + off * 8..base + PAGE * data + off * 8 + 8];
+        for d in 0..D {
+            read[c * D + d] = if d < nope {
+                e4m3(b[d]) * 2f32.powi(i32::from(sc[d / 64]) - 127)
+            } else {
+                let at = nope + (d - nope) * 2;
+                from_bf16(u16::from_le_bytes([b[at], b[at + 1]]))
+            };
+        }
+    }
+    (pool, read)
+}
+
+fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool, fp8: bool) {
     let per = 18;
     let cells = 2 * per * PAGE;
     let (pages, indptr) = paging(per);
@@ -72,8 +133,8 @@ fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool) {
     let n = rows.len();
     let mut lcg = Lcg::seeded(0xd5f4 + ratio as u64);
     let (q_bits, q) = lcg.row(n * HEADS * D);
-    let (w_bits, w) = lcg.row(cells * D);
-    let (e_bits, e) = lcg.row(cells * D);
+    let (w_bits, mut w) = lcg.row(cells * D);
+    let (e_bits, mut e) = lcg.row(cells * D);
     let sinks: Vec<f32> = (0..HEADS).map(|h| (h as f32 - 32.0) / 16.0).collect();
     // Each row's selection: ascending ids it sees, neighbours sharing most.
     let mut sel = vec![-1i32; n * top_k.unwrap_or(0)];
@@ -100,6 +161,14 @@ fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool) {
     let win = pool_of(&mut gpu, w_at, cells, &pages, &indptr);
     let e_at = gpu.up(&e_bits);
     let ent = pool_of(&mut gpu, e_at, cells, &pages, &indptr);
+    let (win, ent) = if fp8 {
+        let (wp, wr) = fp8_plane(&mut gpu, w_at, cells, &pages, &indptr);
+        let (ep, er) = fp8_plane(&mut gpu, e_at, cells, &pages, &indptr);
+        (w, e) = (wr, er);
+        (wp, ep)
+    } else {
+        (win, ent)
+    };
     let sink_t = Tensor::new(gpu.up(&sinks), HEADS as u32, 1, Dtype::F32);
     let sel_t = top_k.map(|k| {
         (
@@ -116,7 +185,7 @@ fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool) {
         selection: sel_t,
     };
     assert!(
-        dsv4_prefill::takes(HEADS as u32, D as u32, Some(128), &win, &pooled),
+        dsv4_prefill::takes(HEADS as u32, D as u32, Some(128), &win, &pooled, sparse),
         "the kernel takes DeepSeek-V4-Flash's shape"
     );
     let ctx = gpu.ctx().with_tuning(Tuning {
@@ -190,7 +259,7 @@ fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool) {
     }
     assert!(
         worst <= 4e-2,
-        "ratio {ratio}, top_k {top_k:?}, sparse {sparse}: an output element differs by {worst} relative"
+        "ratio {ratio}, top_k {top_k:?}, sparse {sparse}, fp8 {fp8}: an output element differs by {worst} relative"
     );
 }
 
