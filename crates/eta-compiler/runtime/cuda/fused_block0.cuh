@@ -51,7 +51,17 @@ __device__ __forceinline__ void ptir_parallel_copy(
     m1_u32 len,
     m1_u32 dtype) {
   const m1_u32 bytes = dtype == 3u ? len : len * 4u;
-  for (m1_u32 index = threadIdx.x; index < bytes; index += blockDim.x)
+  // Sixteen bytes a thread where both ends allow it (a vocabulary-wide
+  // value moved a byte a thread is a block's whole pass), the tail bytewise.
+  m1_u32 head = 0u;
+  if (((reinterpret_cast<m1_u64>(input) | reinterpret_cast<m1_u64>(output)) & 15ull) == 0ull) {
+    const m1_u32 quads = bytes >> 4;
+    const uint4* in4 = reinterpret_cast<const uint4*>(input);
+    uint4* out4 = reinterpret_cast<uint4*>(output);
+    for (m1_u32 q = threadIdx.x; q < quads; q += blockDim.x) out4[q] = in4[q];
+    head = quads << 4;
+  }
+  for (m1_u32 index = head + threadIdx.x; index < bytes; index += blockDim.x)
     output[index] = input[index];
 }
 
@@ -65,6 +75,13 @@ __device__ __forceinline__ void ptir_parallel_intrinsic(
       p.intrinsic_row_stride == 0u ? width : p.intrinsic_row_stride;
   const m1_u64 first_row =
       (m1_u64)p.intrinsic_row_offset + (m1_u64)p.imm2;
+  if (output_desc.len <= width) {
+    // One row: its columns, no division an element.
+    for (m1_u32 index = threadIdx.x; index < output_desc.len; index += blockDim.x)
+      m1_store_f(output, index,
+                 m1_intrinsic_row_load(input, first_row, index, stride, p.intrinsic_dtype));
+    return;
+  }
   for (m1_u32 index = threadIdx.x;
        index < output_desc.len;
        index += blockDim.x) {
@@ -378,6 +395,25 @@ __device__ __forceinline__ void ptir_parallel_broadcast(
     m1_u8* output,
     const M1ValueDesc input_desc,
     const M1ValueDesc output_desc) {
+  if (input_desc.len == 1u) {
+    // A scalar's broadcast: its one element everywhere, no index walk.
+    if (output_desc.dtype == 3u) {
+      const m1_u8 v = input[0] != 0u ? 1u : 0u;
+      for (m1_u32 i = threadIdx.x; i < output_desc.len; i += blockDim.x) output[i] = v;
+    } else {
+      const m1_u32 v = reinterpret_cast<const m1_u32*>(input)[0];
+      m1_u32* out = reinterpret_cast<m1_u32*>(output);
+      m1_u32 head = 0u;
+      if ((reinterpret_cast<m1_u64>(output) & 15ull) == 0ull) {
+        const uint4 v4 = make_uint4(v, v, v, v);
+        const m1_u32 quads = output_desc.len >> 2;
+        for (m1_u32 q = threadIdx.x; q < quads; q += blockDim.x) reinterpret_cast<uint4*>(out)[q] = v4;
+        head = quads << 2;
+      }
+      for (m1_u32 i = head + threadIdx.x; i < output_desc.len; i += blockDim.x) out[i] = v;
+    }
+    return;
+  }
   for (m1_u32 linear = threadIdx.x;
        linear < output_desc.len;
        linear += blockDim.x) {
