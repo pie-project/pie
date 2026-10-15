@@ -23,6 +23,7 @@ FP4 = dtype.mxfp4
 DEPLOYMENTS = [
     deployment("mimo26-flash", weights = [BF, FP4], kv = BF),
     deployment("mimo26-flash-mini", weights = [BF, FP4], kv = BF),
+    deployment("mimo26-flash-mini", weights = [BF, dtype.mxfp4a8], kv = BF),
     deployment("mimo26-flash-l6", weights = [BF, FP4], kv = BF),
     deployment("mimo26-flash-l6", weights = [BF, dtype.mxfp4a8], kv = BF),
     deployment("mimo26-pro", weights = [BF, FP4], kv = BF),

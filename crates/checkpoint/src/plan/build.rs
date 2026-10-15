@@ -1239,7 +1239,7 @@ impl ScaleLayout {
                     zero_point_suffix: None,
                     naming: MetaNaming::Extend,
                     shape: crate::types::grouped_shape(lead, cols / 32),
-                    encoding: Encoding::Raw(DType::U8),
+                    encoding: Encoding::Raw(DType::E8m0),
                     granularity: QuantGranularity::PerGroup,
                     group_size: 32,
                     channel_axis: axis(lead.len()),
