@@ -59,6 +59,68 @@ impl Run<'_> {
         let poem_ir::Attention::MergeLse { o, lse, .. } = **merge else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
+        // A prefill's rows, where the profile says
+        // (`kernel.sdpa.dsv4_prefill_from`): the four in one tcgen05 pass.
+        if let (
+            poem_ir::Attention::PrefillLse {
+                q,
+                cache,
+                window: span,
+                head_dim: d,
+                sm_scale,
+                ..
+            },
+            poem_ir::Attention::PoolLse {
+                positions,
+                request_of_token,
+                entries,
+                ratio,
+                heads,
+                ..
+            }
+            | poem_ir::Attention::PoolLseSelected {
+                positions,
+                request_of_token,
+                entries,
+                ratio,
+                heads,
+                ..
+            },
+        ) = (&**window, &**pool)
+        {
+            use kernels_cuda::attn::dsv4_prefill::{self, Pooled};
+            let from = self.ctx().tuning().dsv4_prefill_from;
+            let mut out = self.tensor(*o_out);
+            if from > 0 && out.rows >= from {
+                let selection = match &**pool {
+                    poem_ir::Attention::PoolLseSelected {
+                        selection, top_k, ..
+                    } => Some((self.tensor(*selection), *top_k)),
+                    _ => None,
+                };
+                let window_pool = self.pool(*cache);
+                let entries = self.pool(*entries);
+                let pooled = Pooled {
+                    entries: &entries,
+                    ratio: *ratio,
+                    selection,
+                };
+                if dsv4_prefill::takes(*heads, *d, *span, &window_pool, &pooled) {
+                    return dsv4_prefill::prefill(
+                        self.ctx(),
+                        op.name(),
+                        self.tensor(*q),
+                        self.tensor(*positions),
+                        self.tensor(*request_of_token),
+                        &window_pool,
+                        &pooled,
+                        self.tensor(*sink),
+                        *sm_scale,
+                        &mut out,
+                    );
+                }
+            }
+        }
         self.attention(window)?;
         self.attention(pool)?;
         self.attention(merge)?;

@@ -31,6 +31,9 @@ pub mod ssm;
 pub mod xqa;
 
 #[cfg(feature = "cuda")]
+pub mod dsv4_prefill;
+
+#[cfg(feature = "cuda")]
 mod tc5_fmha;
 
 use crate::error::Error;

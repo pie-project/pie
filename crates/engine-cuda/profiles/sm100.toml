@@ -10,6 +10,11 @@ mla.path  = "naive"
 # DeepSeek-V4's compressed-pool attention on mma.sync, a block a row's 16
 # heads, rather than the scalar walk a block a row and head.
 sdpa.pool_mma = true
+# DeepSeek-V4's attention at prefill widths in one tcgen05 pass: the window,
+# the pool (selected or whole), their merge and the sinks. DSV4-Flash
+# prefills 32 x 4096 in 9.9 s against 12.2 s as the four ops (two runs
+# each); below 512 rows the four ops stay.
+sdpa.dsv4_prefill_from = 512
 # The tcgen05 GEMMs (B200): routed selects from 16 tokens. A dense
 # projection's GLU stays apart from cuBLAS's gate-up at every row count
 # (`gemm.tc5_glu_from` at its default): below 512 rows the pair is faster

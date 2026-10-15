@@ -168,6 +168,14 @@ pub struct SdpaSelectedMma;
 #[decision(id = "kernel.sdpa.pool_mma", flag, default = false, tune = search)]
 pub struct SdpaPoolMma;
 
+/// The fewest rows DeepSeek-V4's attention (`attention.pool_attention`: the
+/// window, the pool, their merge and the sinks) runs as one tcgen05 pass
+/// (`attn/dsv4_prefill.cuh`, sm_100a) rather than its four ops. 0 never
+/// does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.dsv4_prefill_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct SdpaDsv4PrefillFrom(pub u32);
+
 /// Whether a pooled index (`attention.index_topk`) scores its blocks on the
 /// tensor cores rather than a thread a block. Off scores the scalar way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -462,6 +470,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<SdpaPoolMma>()
+        .add::<SdpaDsv4PrefillFrom>()
         .add::<GemmNarrowN>();
 }
 
@@ -529,6 +538,7 @@ pub struct Tuning {
     pub selected_mma: bool,
     pub index_mma: bool,
     pub pool_mma: bool,
+    pub dsv4_prefill_from: u32,
     pub gemm_narrow_n: u32,
 }
 
@@ -594,6 +604,7 @@ impl Tuning {
         selected_mma: false,
         index_mma: false,
         pool_mma: false,
+        dsv4_prefill_from: 0,
         gemm_narrow_n: 0,
     };
 
@@ -659,6 +670,7 @@ impl Tuning {
             selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),
             index_mma: profile.on::<SdpaIndexMma>(&Anywhere),
             pool_mma: profile.on::<SdpaPoolMma>(&Anywhere),
+            dsv4_prefill_from: profile.get::<SdpaDsv4PrefillFrom>().0,
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,
         }
     }
