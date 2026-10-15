@@ -217,7 +217,7 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
         bar_init(&pv_done[1], 1);
         for (int s = 0; s < 3; ++s) {
             bar_init(&list_full[s], 1);
-            bar_init(&list_free[s], 128);
+            bar_init(&list_free[s], 129);
         }
         bar_init_fence();
     }
@@ -252,12 +252,14 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
     const int total = nwp + (same && !kSelected ? max(end_a, end_b) : end_a + end_b);
 
     if (warp == 4 || warp >= 6) {
-        // The producer group: warp 4 merges the lists, waits for the ring and
-        // arms its barriers; all four warps issue a slice's gathers, a quarter
-        // each (one warp's TMA issue serialises across its lanes).
+        // The producer group: warp 6 merges the lists, tiles ahead; warps 4,
+        // 7 and 8 issue the gathers, warp 4 leading (it waits for the ring and
+        // arms its barriers), the three splitting each slice's boxes (one
+        // warp's TMA issue serialises across its lanes).
+        const bool builder = warp == 6;
         const bool lead = warp == 4;
-        const int share = lead ? 0 : static_cast<int>(warp) - 5;
-        auto group_sync = [] { asm volatile("bar.sync 1, 128;" ::: "memory"); };
+        const int share = lead ? 0 : static_cast<int>(warp) - 6;
+        auto group_sync = [] { asm volatile("bar.sync 1, 96;" ::: "memory"); };
         if (lead && lane == 0) {
             bar_arrive_expect_tx(q_ready, (kD / 64) * kAtomQ);
 #pragma unroll
@@ -465,13 +467,14 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
                 if (lane == 0) bar_arrive_expect_tx(&full[slot], kSlice);
             }
             group_sync();
-            // Lane: one group of four keys, one atom; a K slice's groups split
-            // between the pair.
-            const int per = both ? 4 : 8;
-            if (lane < static_cast<u32>(per * kSA)) {
-                const int g = (both ? static_cast<int>(rank) * 16 : 0) + share * per +
-                              static_cast<int>(lane) % per;
-                const int a = static_cast<int>(lane) / per;
+            // One box of four keys (or the first of a run) an op, ops dealt
+            // round the three warps; a K slice's groups split between the
+            // pair.
+            const int groups = both ? 16 : 32;
+            const int op = static_cast<int>(lane) * 3 + share;
+            if (op < groups * kSA) {
+                const int g = (both ? static_cast<int>(rank) * 16 : 0) + op % groups;
+                const int a = op / groups;
                 unsigned char* dst = smem + kOffRing + slot * kSlice;
                 const u32* e = l + 4 * g;
                 const bool pool = (e[0] & kPool) != 0;
@@ -523,40 +526,40 @@ __global__ __launch_bounds__(288, 1) void dsv4_prefill(
             }
             ++seq;
         };
-        // Tile j's list sits in slot j % 3. The producer lists a tile ahead
-        // of the gathers it issues, so a list's merge runs while the MMAs of
-        // the tile before it do.
-        auto publish = [&](int t) {
-            if (lead) {
-                // The slot held tile t - 3: its gathers went out a tile ago,
-                // and the softmax has read its marks.
+        // Tile j's list sits in slot j % 3, listed up to three tiles ahead of
+        // the gathers. A slot is rebuilt once the softmax has read its marks
+        // and the issuers have sent its V slices (129 arrivals).
+        if (builder) {
+            for (int t = 0;; ++t) {
                 if (t >= 3) bar_wait(&list_free[t % 3], ((t - 3) / 3) & 1);
                 const int built = build(lists + (t % 3) * kBKV, t * kBKV);
                 if (lane == 0) {
                     counts[t % 3] = built;
                     bar_arrive(&list_full[t % 3]);
                 }
+                if (built == 0) break;
             }
-        };
-        publish(0);
-        int nt = 0;
-        for (int j = 0;; ++j) {
-            group_sync();
-            if (counts[j % 3] == 0) break;
-            nt = j + 1;
-            const u32* l = lists + (j % 3) * kBKV;
+        } else {
+            int nt = 0;
+            for (int j = 0;; ++j) {
+                bar_wait(&list_full[j % 3], (j / 3) & 1);
+                if (counts[j % 3] == 0) break;
+                nt = j + 1;
+                const u32* l = lists + (j % 3) * kBKV;
 #pragma unroll 1
-            for (int a = 0; a < kKS; ++a) slice(l, a * 64 * kSA, true);
-            if (j > 0) {
-                const u32* prev = lists + ((j - 1) % 3) * kBKV;
+                for (int a = 0; a < kKS; ++a) slice(l, a * 64 * kSA, true);
+                if (j > 0) {
+                    const u32* prev = lists + ((j - 1) % 3) * kBKV;
 #pragma unroll 1
-                for (int c = 0; c < kVS; ++c) slice(prev, v0 + c * 64 * kSA, false);
+                    for (int c = 0; c < kVS; ++c) slice(prev, v0 + c * 64 * kSA, false);
+                    group_sync();
+                    if (lead && lane == 0) bar_arrive(&list_free[(j - 1) % 3]);
+                }
             }
-            publish(j + 1);
+            const u32* last = lists + ((nt - 1) % 3) * kBKV;
+#pragma unroll 1
+            for (int c = 0; c < kVS; ++c) slice(last, v0 + c * 64 * kSA, false);
         }
-        const u32* last = lists + ((nt - 1) % 3) * kBKV;
-#pragma unroll 1
-        for (int c = 0; c < kVS; ++c) slice(last, v0 + c * 64 * kSA, false);
     } else if (warp == 5) {
         if (lane == 0) {
             const u32 idesc_s = idesc_dense(kF16Bf16, kF16Bf16, 128, kBKV);
