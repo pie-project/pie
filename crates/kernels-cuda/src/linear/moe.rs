@@ -1096,7 +1096,9 @@ fn select_grouped(
                     format!("{name} wants {bytes} bytes, past this host's usize"),
                 )
             })
-            .and_then(|bytes| ctx.scratch(op, name, bytes))
+            // One slab a stream: the layout lives within this op, so
+            // regions captured apart share it rather than holding one each.
+            .and_then(|bytes| ctx.scratch_stream(op, name, bytes))
             .map(|ptr| ptr as usize as u64)
     };
     let sorted = slab("linear.moe_group_sorted", u64::from(rows) * 4)?;

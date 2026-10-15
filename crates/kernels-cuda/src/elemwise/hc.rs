@@ -548,14 +548,18 @@ fn project_split(
     const SLICE_FLOOR: u32 = 1024;
     let row_blocks = rows.div_ceil(PROJECT_ROWS);
     let want = 2 * ctx.multiprocessors().unwrap_or(132);
+    // At most 2048 partial rows: a region captured on its own holds its own
+    // partial slab.
+    const PARTIAL_ROWS: u32 = 2048;
     let slices = want
         .div_ceil(row_blocks)
         .clamp(1, (fan / SLICE_FLOOR).max(1))
-        .min(16);
+        .min(16)
+        .min((PARTIAL_ROWS / rows).max(1));
     let slice = fan.div_ceil(slices).next_multiple_of(4);
     let slices = fan.div_ceil(slice);
     let out = if slices > 1 {
-        ctx.scratch(
+        ctx.scratch_shared(
             op,
             "elementwise.hc_project_partial",
             (slices * rows * mix_hc) as usize * core::mem::size_of::<f32>(),

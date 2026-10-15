@@ -228,11 +228,16 @@ pub fn topk(
         .checked_mul(keys.page_size)
         .filter(|bound| *bound > 0)
         .ok_or_else(|| refuse(OP, "the page budget this fire's pool row states is zero"))?;
-    let scores = ctx.scratch(
+    // A row scores at most one block a `ratio` positions it sees: the
+    // scores scratch is a ratio's share of the positions, not all of them
+    // (DeepSeek-V4-Flash at ratio 4: 5.4 GB of an 8192-row fire's memory).
+    let ratio = count(OP, "the pooling ratio this ranking states", ratio.max(1))?;
+    let score_stride = ((max_kv + ratio - 1) / ratio).max(1);
+    let scores = ctx.scratch_shared(
         OP,
         "attn.index_topk_scores",
         (selection.rows as usize)
-            .saturating_mul(max_kv as usize)
+            .saturating_mul(score_stride as usize)
             .saturating_mul(core::mem::size_of::<f32>()),
     )?;
 
@@ -273,9 +278,9 @@ pub fn topk(
             heads.arg(),
             head_dim.arg(),
             keys.page_size.arg(),
-            max_kv.arg(),
+            score_stride.arg(),
             top_k.arg(),
-            count(OP, "the pooling ratio this ranking states", ratio.max(1))?.arg(),
+            ratio.arg(),
             ctx.stage(),
         ],
     )
