@@ -897,6 +897,7 @@ fn gated_delta_chunked_tc5(
         && shape.v_heads.is_multiple_of(shape.k_heads.max(1))
         && (shape.conv_dim * 2).is_multiple_of(16)
         && aligned16(qkv.data.ptr)
+        && aligned16(y.ptr)
         && state.slot_stride_elems > 0)
     {
         return Ok(false);
@@ -913,6 +914,19 @@ fn gated_delta_chunked_tc5(
         ],
         boxes: [64, 64, 1],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    })?;
+    // A whole chunk's output, 64 rows of a value head, stored by TMA.
+    let out_width = shape.v_heads * shape.v_dim;
+    let map_out = encode(Map {
+        ptr: y.ptr,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        dims: [out_width, y.rows, 1],
+        strides: [
+            u64::from(out_width) * 4,
+            u64::from(out_width) * 4 * u64::from(y.rows.max(1)),
+        ],
+        boxes: [128, 64, 1],
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
     })?;
     #[allow(clippy::cast_precision_loss)]
     let q_scale = (shape.k_dim as f32).sqrt().recip();
@@ -946,6 +960,10 @@ fn gated_delta_chunked_tc5(
         &[
             ArgValue::Bytes {
                 ptr: map.as_ptr().cast(),
+                len: 128,
+            },
+            ArgValue::Bytes {
+                ptr: map_out.as_ptr().cast(),
                 len: 128,
             },
             ArgValue::Bytes {

@@ -60,15 +60,17 @@ constexpr u32 kVStage = 16384;
 constexpr u32 kT = kV + 2 * kVStage;    // 2 stages of T': 64 x 64 bf16
 constexpr u32 kQK = kT + 2 * 8192;      // 2 stages of the decayed scores
 constexpr int LDA = 68;
-constexpr u32 kPrep = kQK + 2 * 8192;   // per prep group: A and T in f32, the merge scratch
+constexpr u32 kPrep = kQK + 2 * 8192;   // per prep group: A and T in f16, the merge scratch
 constexpr u32 kPrepA = 0;
-constexpr u32 kPrepT = CH * LDA * 4;
-constexpr u32 kPrepX = 2 * CH * LDA * 4;
+constexpr u32 kPrepT = CH * 72 * 2;
+constexpr u32 kPrepX = 2 * CH * 72 * 2;
 constexpr u32 kPrepBytes = kPrepX + 4096;
+// A whole chunk's output, [token][value] in f32, for one TMA store.
+constexpr u32 kO = kPrep + 2 * kPrepBytes;
 // Per stage, 64 floats each: G (log2), beta, rk, rq, and the per-row
 // factors the state group reads, e^G rk, e^G rq and rk e^(G_last - G)
 // (zero past the chunk), then e^G_last.
-constexpr u32 kRing = kPrep + 2 * kPrepBytes;
+constexpr u32 kRing = kO + CH * 128 * 4;
 constexpr int kRingF = 8 * CH;
 constexpr u32 kBar = kRing + 2 * kRingF * 4;
 constexpr u32 kSmem = kBar + 512;
@@ -253,8 +255,17 @@ __device__ __forceinline__ bool advance(const Params& p, int lanes, Walk& w) {
     return next_tile(p, lanes, w);
 }
 
+__device__ __forceinline__ void tma_store_3d(const tc5::TmaMap* map, const void* src, int x, int y) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group [%0, {%2, %3, %4}], [%1];" ::"l"(
+            reinterpret_cast<tc5::u64>(map)),
+        "r"(tc5::smem_addr(src)), "r"(x), "r"(y), "r"(0)
+        : "memory");
+}
+
 __global__ void __launch_bounds__(384, 1) gdn_chunked_tc5(
-    const __grid_constant__ tc5::TmaMap map_qkv, const Params p) {
+    const __grid_constant__ tc5::TmaMap map_qkv, const __grid_constant__ tc5::TmaMap map_out,
+    const Params p) {
     using namespace tc5;
     extern __shared__ unsigned char smem_raw[];
     const u32 raw = smem_addr(smem_raw);
@@ -885,15 +896,35 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked_tc5(
                     tmem_wait_ld();
                     tc_fence_before();
                     bar_arrive(o_free);
-                    float* orow = p.out + static_cast<long long>(row0 + ta) * stride_row + w.h * 128 + v;
+                    if (L == CH) {
+                        // A whole chunk: staged [token][value] and stored by
+                        // TMA, the last chunk's store done reading first.
+                        if (v == 0) tc5::bulk_wait_read<0>();
+                        named_sync(5, 128);
+                        float* ob = reinterpret_cast<float*>(smem + kO);
 #pragma unroll
-                    for (int t = 0; t < 32; ++t) {
-                        if (t < L) orow[static_cast<long long>(t) * stride_row] = __uint_as_float(o0[t]);
-                    }
+                        for (int t = 0; t < 32; ++t) ob[t * 128 + v] = __uint_as_float(o0[t]);
 #pragma unroll
-                    for (int t = 0; t < 32; ++t) {
-                        if (32 + t < L)
-                            orow[static_cast<long long>(32 + t) * stride_row] = __uint_as_float(o1[t]);
+                        for (int t = 0; t < 32; ++t) ob[(32 + t) * 128 + v] = __uint_as_float(o1[t]);
+                        fence_async_shared();
+                        named_sync(5, 128);
+                        if (v == 0) {
+                            tma_store_3d(&map_out, ob, w.h * 128, row0 + ta);
+                            tc5::bulk_commit();
+                        }
+                    } else {
+                        float* orow =
+                            p.out + static_cast<long long>(row0 + ta) * stride_row + w.h * 128 + v;
+#pragma unroll
+                        for (int t = 0; t < 32; ++t) {
+                            if (t < L) orow[static_cast<long long>(t) * stride_row] = __uint_as_float(o0[t]);
+                        }
+#pragma unroll
+                        for (int t = 0; t < 32; ++t) {
+                            if (32 + t < L)
+                                orow[static_cast<long long>(32 + t) * stride_row] =
+                                    __uint_as_float(o1[t]);
+                        }
                     }
                 }
                 bar_arrive(&cg1_done[s]);
@@ -921,6 +952,7 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked_tc5(
             } while (advance(p, lanes, w));
         }
     }
+    if (tid == 128) tc5::bulk_wait_all();
     tc_fence_before();
     __syncthreads();
     if (warp == 0) {
