@@ -631,7 +631,12 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
     static_assert(MT == 32 || MT == 64 || MT == 128, "a work item is 32, 64 or 128 routes");
     constexpr int CODES = C::kCodes, KU = MT == 32 || C::kKU == 1 ? C::kKU : C::kKU / 2;
     constexpr int KC = 4 * KU * CODES;  // codes a stage
-    constexpr int LD = KC + 8;          // LDS row pitch, elements
+    // LDS rows unpadded, their 16-byte chunks XOR-swizzled by row (chunk c of
+    // row r at c ^ (r % 8)): the 16 rows a read touches fill the banks
+    // twice over instead of colliding (the padded pitch left the dense leg's
+    // LDS reads half in bank conflicts).
+    constexpr int LD = KC;
+    auto swz = [](int row, int e) { return row * LD + ((((e >> 3) ^ (row & 7)) << 3) | (e & 7)); };
     constexpr int THREADS = WAVES * kWave, TILE_N = 16 * NBW * WAVES;
     constexpr int MB = MT / 16, NB = NBW;
     constexpr int NA = MT * KC / 8 / THREADS;  // 16-byte activation reads a thread a stage
@@ -656,7 +661,7 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
         live[i] = m < count;
         src[i] = act + static_cast<long long>(order[begin + (live[i] ? m : 0)] / act_div) * k;
         col[i] = (piece % (KC / 8)) * 8;
-        at[i] = m * LD + col[i];
+        at[i] = swz(m, col[i]);
     }
     long long wrow[NB];
 #pragma unroll
@@ -707,7 +712,7 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
                 b128 xv[MB];
 #pragma unroll
                 for (int mb = 0; mb < MB; ++mb)
-                    xv[mb] = *reinterpret_cast<const b128*>(xt + (mb * 16 + r16) * LD + c0 + 2 * q);
+                    xv[mb] = *reinterpret_cast<const b128*>(xt + swz(mb * 16 + r16, c0 + 2 * q));
                 // The two k-steps of the read in separate sweeps, so no
                 // product waits on the one just before it.
 #pragma unroll
