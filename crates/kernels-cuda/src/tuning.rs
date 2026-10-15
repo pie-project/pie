@@ -153,6 +153,13 @@ pub struct GemmSplitRowsFrom(pub u32);
 #[decision(id = "kernel.elemwise.qg_prologue_until", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct QgPrologueUntil(pub u32);
 
+/// The most rows DeepSeek-V4's attention (the window, the compressed rows,
+/// their fold and the sinks) lands in one launch at; more run the four
+/// launches. 0 (never) but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.dsv4_decode_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct Dsv4DecodeUntil(pub u32);
+
 /// Whether a selected (sparse) attention runs on the tensor cores, a block a
 /// row and kv head, rather than the scalar walk. Off reads every key the
 /// scalar way.
@@ -462,6 +469,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmTc5GluFrom>()
         .add::<GemmSplitRowsFrom>()
         .add::<QgPrologueUntil>()
+        .add::<Dsv4DecodeUntil>()
         .add::<SsmGdnFusedScan>()
         .add::<SsmGdnTc5>()
         .add::<ElemwiseRowsVec>()
@@ -533,6 +541,7 @@ pub struct Tuning {
     pub gemm_tc5_glu_from: u32,
     pub gemm_split_rows_from: u32,
     pub qg_prologue_until: u32,
+    pub dsv4_decode_until: u32,
     pub ssm_gdn_fused_scan: bool,
     pub ssm_gdn_tc5: bool,
     pub rows_vec: bool,
@@ -602,6 +611,7 @@ impl Tuning {
         gemm_tc5_glu_from: 65_536,
         gemm_split_rows_from: 256,
         qg_prologue_until: 0,
+        dsv4_decode_until: 0,
         ssm_gdn_fused_scan: false,
         ssm_gdn_tc5: false,
         rows_vec: false,
@@ -671,6 +681,7 @@ impl Tuning {
             gemm_tc5_glu_from: profile.get::<GemmTc5GluFrom>().0,
             gemm_split_rows_from: profile.get::<GemmSplitRowsFrom>().0,
             qg_prologue_until: profile.get::<QgPrologueUntil>().0,
+            dsv4_decode_until: profile.get::<Dsv4DecodeUntil>().0,
             ssm_gdn_fused_scan: profile.on::<SsmGdnFusedScan>(&Anywhere),
             ssm_gdn_tc5: profile.on::<SsmGdnTc5>(&Anywhere),
             rows_vec: profile.on::<ElemwiseRowsVec>(&Anywhere),
