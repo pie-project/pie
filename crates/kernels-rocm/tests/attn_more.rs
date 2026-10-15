@@ -221,6 +221,12 @@ fn sink_rescales_by_the_sinks_share() {
         attn::sink(&ctx, &mut o, lse, sink, d).unwrap();
         close_bf16("sink", &gpu.read(&o), &want(&|_| true), 1.0);
 
+        // The sinks in f32, as a checkpoint may keep them (Hy4).
+        let sink32 = gpu.tensor(&sinks, 1, heads, Dtype::F32);
+        let mut o = gpu.tensor(&os, rows, heads * d, Dtype::Bf16);
+        attn::sink(&ctx, &mut o, lse, sink32, d).unwrap();
+        close_bf16("f32 sink", &gpu.read(&o), &want(&|_| true), 1.0);
+
         // Staged rows 1..4 of the 5.
         let mut o = gpu.tensor(&os, rows, heads * d, Dtype::Bf16);
         let win = gpu.ints(&[3, 1, 0, 0]);

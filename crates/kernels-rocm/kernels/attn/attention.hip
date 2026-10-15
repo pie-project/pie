@@ -26,9 +26,9 @@ __global__ void logit_softcap(T* __restrict__ x, float cap, usize n) {
 // whose value is zero: it takes softmax mass and gives back nothing, so the
 // output a row already has is scaled by Σ / (Σ + e^sink) = σ(ln Σ − sink).
 // One block per (row, head); a row that saw no key keeps its output.
-template <class T>
+template <class T, class S>
 __global__ void sink_rescale(T* __restrict__ o, const float* __restrict__ lse,
-                             const T* __restrict__ sinks, i32 N, i32 num_q_heads, i32 head_dim,
+                             const S* __restrict__ sinks, i32 N, i32 num_q_heads, i32 head_dim,
                              const u32* __restrict__ win) {
     const Window window{win};
     const int t = static_cast<int>(blockIdx.x);
@@ -37,7 +37,7 @@ __global__ void sink_rescale(T* __restrict__ o, const float* __restrict__ lse,
     const long long row = window.plane(t);
 
     const float lse_val = lse[row * num_q_heads + h];
-    const float r = isfinite(lse_val) ? 1.f / (1.f + __expf(-(lse_val * kLn2 - to_f32(sinks[h])))) : 1.f;
+    const float r = isfinite(lse_val) ? 1.f / (1.f + __expf(-(lse_val * kLn2 - static_cast<float>(sinks[h])))) : 1.f;
 
     T* out = o + (row * num_q_heads + h) * head_dim;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) out[d] = from_f32<T>(to_f32(out[d]) * r);
