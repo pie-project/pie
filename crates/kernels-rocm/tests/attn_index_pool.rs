@@ -626,23 +626,9 @@ fn run_pool_lse(
             match top_k {
                 None => (0..visible).collect(),
                 Some(k) => {
-                    let mut s = 0x9e37u64 ^ (i as u64 * 131);
-                    let mut list = Vec::new();
-                    for n in 0..k {
-                        s ^= s << 13;
-                        s ^= s >> 7;
-                        s ^= s << 17;
-                        let c = if n % 9 == 8 {
-                            -1
-                        } else {
-                            ((s >> 8) as usize % (visible + 3)) as i32
-                        };
-                        sel.push(c);
-                        if c >= 0 && (c as usize) < visible {
-                            list.push(c as usize);
-                        }
-                    }
-                    list
+                    let row = topk_row(visible, k, i as u64);
+                    sel.extend_from_slice(&row);
+                    row.iter().filter(|&&c| c >= 0).map(|&c| c as usize).collect()
                 }
             }
         })
@@ -1013,4 +999,28 @@ fn block_max_ranks_each_heads_blocks() {
     run_block_max(4, 128, 128, 16, &[300, 7], &[2000, 0]);
     // Small blocks and a narrow run, eight heads.
     run_block_max(8, 64, 8, 5, &[1, 20], &[300, 70]);
+}
+
+/// A selection row as `attention.index_topk` writes it: every visible
+/// position when they fit the budget, else a budget's worth of distinct ones,
+/// ascending either way, `-1` past them.
+fn topk_row(visible: usize, top_k: usize, seed: u64) -> Vec<i32> {
+    let mut row: Vec<i32> = if visible <= top_k {
+        (0..visible as i32).collect()
+    } else {
+        let mut pool: Vec<i32> = (0..visible as i32).collect();
+        let mut s = 0x9e37_79b9u64 ^ seed.wrapping_mul(0x2545_f491);
+        for i in 0..top_k {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let j = i + (s as usize) % (visible - i);
+            pool.swap(i, j);
+        }
+        let mut picked = pool[..top_k].to_vec();
+        picked.sort_unstable();
+        picked
+    };
+    row.resize(top_k, -1);
+    row
 }

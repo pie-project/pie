@@ -260,7 +260,7 @@ __global__ __launch_bounds__(kBlock) void mla_naive_paged_kernel(
                     page_size,
                     1,
                     selection != nullptr ? 0 : floor,
-                    selection != nullptr ? top_k : j_end,
+                    selection != nullptr ? min(top_k, max(j_end, 0)) : j_end,
                     j_end - 1,
                     floor};
     const long long head0 = t_row * heads + static_cast<long long>(blockIdx.y) * G;
@@ -875,7 +875,10 @@ __global__ __launch_bounds__(kThreads) void latent_gather(const Gather p) {
     // Without a selection the walk's list is the visible positions from the
     // window's floor.
     const int first = sel != nullptr ? 0 : floor;
-    const int count = sel != nullptr ? p.top_k : max(limit + 1 - floor, 0);
+    // A selection lists its picks first, ascending, −1 past them
+    // (`index_topk`): a row that sees `limit + 1` positions has at most that
+    // many, so the walk stops there rather than at the budget.
+    const int count = sel != nullptr ? min(p.top_k, max(limit + 1, 0)) : max(limit + 1 - floor, 0);
     const int share = ((count + p.splits - 1) / p.splits + BK - 1) / BK * BK;
     const int n0 = min(count, split * share);
     const LatentKeys keys{sel, pages, p.page_size, ratio, first + n0, first + min(count, n0 + share), limit,

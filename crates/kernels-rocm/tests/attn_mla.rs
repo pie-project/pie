@@ -415,17 +415,7 @@ fn run_selected(heads: usize, rope: usize, qo_lens: &[usize], prefix: &[usize], 
     for (r, &ql) in qo_lens.iter().enumerate() {
         for i in 0..ql {
             let pos = kv_lens[r] - ql + i;
-            let mut s = 0x1234_5678u64 ^ (t as u64 * 977);
-            for n in 0..top_k {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                sel[t * top_k + n] = match s % 11 {
-                    0 => -1,
-                    1 => (pos + 1 + (s as usize >> 8) % 7) as i32,
-                    _ => ((s >> 8) as usize % (pos + 1)) as i32,
-                };
-            }
+            sel[t * top_k..(t + 1) * top_k].copy_from_slice(&topk_row(pos + 1, top_k, t as u64));
             lists.push(pos);
             t += 1;
         }
@@ -696,8 +686,11 @@ fn selected_decode_under_a_window() {
         indptr: gpu.column(&[0, 1, 2]),
     };
     let q_pe = gpu.tensor(&qp, 3, (heads * rope) as u32, Dtype::Bf16);
-    let sel: Vec<i32> = (0..3 * top_k)
-        .map(|i| ((i * 37) % 800) as i32 - 50)
+    // (the dead row's list never read)
+    let sel: Vec<i32> = [800usize, kv_lens[0], kv_lens[1]]
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &visible)| topk_row(visible, top_k, i as u64))
         .collect();
     let selection = gpu.ints_shaped(&sel, 3, top_k as u32);
     let mut o = gpu.zeros(3, (heads * rank) as u32, Dtype::Bf16);
@@ -748,6 +741,30 @@ fn selected_decode_under_a_window() {
             1.5e-2,
         );
     }
+}
+
+/// A selection row as `attention.index_topk` writes it: every visible
+/// position when they fit the budget, else a budget's worth of distinct ones,
+/// ascending either way, `-1` past them.
+fn topk_row(visible: usize, top_k: usize, seed: u64) -> Vec<i32> {
+    let mut row: Vec<i32> = if visible <= top_k {
+        (0..visible as i32).collect()
+    } else {
+        let mut pool: Vec<i32> = (0..visible as i32).collect();
+        let mut s = 0x9e37_79b9u64 ^ seed.wrapping_mul(0x2545_f491);
+        for i in 0..top_k {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let j = i + (s as usize) % (visible - i);
+            pool.swap(i, j);
+        }
+        let mut picked = pool[..top_k].to_vec();
+        picked.sort_unstable();
+        picked
+    };
+    row.resize(top_k, -1);
+    row
 }
 
 #[test]

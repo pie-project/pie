@@ -172,7 +172,7 @@ __global__ __launch_bounds__(mla_naive::kBlock) void pool_lse_paged(
                           page_size,
                           ratio,
                           0,
-                          selection != nullptr ? top_k : visible,
+                          selection != nullptr ? min(top_k, max(visible, 0)) : visible,
                           visible - 1};
     const long long head0 = t * heads + static_cast<long long>(blockIdx.y) * G;
     mla_naive::attend(
