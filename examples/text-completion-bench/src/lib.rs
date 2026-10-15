@@ -703,11 +703,12 @@ async fn run_one(
     // Under `host_first_token` there is no decode pass yet, so the
     // frame is one slot wide — the same shape live_slots = 1 already
     // submits.
-    let first_decodes = if fwd_d.is_some() {
-        budget.min(live_slots - 1)
-    } else {
-        0
-    };
+    // The prefill goes alone, and the decode window is staged only after its
+    // token has reached the host (below): a window staged ahead held the
+    // first token's drain behind up to three decode fires, which the client
+    // saw as time to first token (Gemma-4-31B on an M5 Max: 754 ms of
+    // prefill, 866 ms to the first token). Throughput at 32 lanes is the same.
+    let first_decodes = 0;
     reserve_to_tokens(n + first_decodes as u32 + 1).context("reserve first frame")?;
     let mut first_slots: Vec<Option<&ForwardPass>> = Vec::with_capacity(k);
     first_slots.push(Some(&fwd_p));
@@ -767,12 +768,6 @@ async fn run_one(
         Ok(submitted)
     };
 
-    // Stage the window before the prefill token even arrives — the decode
-    // successors ride the queue behind the prefill, off the g0 critical path.
-    // The other arm has no pass to stage yet and does it after the drain.
-    if let Some(fwd) = fwd_d.as_ref() {
-        submitted = submit_ahead(fwd, submitted, 0)?;
-    }
     step(&mut prologue_us, input.report_timing); // [4] build_submit (both passes)
 
     // ── HOST DRAIN (off the critical path — the decode burst is already in
@@ -784,6 +779,12 @@ async fn run_one(
         .then(|| run_start.elapsed().as_micros() as u64);
     if input.report_timing && honor_wait_for_start {
         session::send("t0");
+    }
+    // The device arm stages its decode window now, with the first token out.
+    if build_decode.is_none() {
+        if let Some(fwd) = fwd_d.as_ref() {
+            submitted = submit_ahead(fwd, submitted, 0)?;
+        }
     }
     // The prefill has landed: offer its prompt prefixes to later requests.
     if !input.no_prefix_cache {
