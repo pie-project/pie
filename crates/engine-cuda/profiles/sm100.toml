@@ -39,6 +39,9 @@ elemwise.rows_vec = true
 # channels over 16384 tokens take 166 us where eight a thread took 258
 # (its 168 registers held three blocks an SM).
 ssm.conv_vec4 = true
+# A chunked gated delta walk read only by its gated norm lands bf16, as
+# vLLM's does: half the bytes out of the walk and into the norm.
+ssm.gdn_out_bf16 = true
 # A wide decode's split partials fold a warp a row: gpt-oss-120b's layers
 # at 64 requests fold in about 4 us where the staged merge took 17.
 sdpa.merge_warp = true

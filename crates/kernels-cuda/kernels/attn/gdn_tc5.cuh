@@ -50,6 +50,7 @@ struct Params {
     int V_h;
     int write_state;
     float q_scale;
+    int out_bf16;  // the output lands in bf16, for a gated norm that reads it so
 };
 
 // Shared memory, from a 1024-aligned base.
@@ -902,15 +903,41 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked_tc5(
                         if (v == 0) tc5::bulk_wait_read<0>();
                         named_sync(5, 128);
                         float* ob = reinterpret_cast<float*>(smem + kO);
+                        if (p.out_bf16) {
+                            unsigned short* oh = reinterpret_cast<unsigned short*>(ob);
 #pragma unroll
-                        for (int t = 0; t < 32; ++t) ob[t * 128 + v] = __uint_as_float(o0[t]);
+                            for (int t = 0; t < 32; ++t)
+                                oh[t * 128 + v] = static_cast<unsigned short>(gdn_pack(__uint_as_float(o0[t]), 0.f) & 0xffffu);
 #pragma unroll
-                        for (int t = 0; t < 32; ++t) ob[(32 + t) * 128 + v] = __uint_as_float(o1[t]);
+                            for (int t = 0; t < 32; ++t)
+                                oh[(32 + t) * 128 + v] =
+                                    static_cast<unsigned short>(gdn_pack(__uint_as_float(o1[t]), 0.f) & 0xffffu);
+                        } else {
+#pragma unroll
+                            for (int t = 0; t < 32; ++t) ob[t * 128 + v] = __uint_as_float(o0[t]);
+#pragma unroll
+                            for (int t = 0; t < 32; ++t) ob[(32 + t) * 128 + v] = __uint_as_float(o1[t]);
+                        }
                         fence_async_shared();
                         named_sync(5, 128);
                         if (v == 0) {
                             tma_store_3d(&map_out, ob, w.h * 128, row0 + ta);
                             tc5::bulk_commit();
+                        }
+                    } else if (p.out_bf16) {
+                        unsigned short* orow = reinterpret_cast<unsigned short*>(p.out) +
+                                               static_cast<long long>(row0 + ta) * stride_row + w.h * 128 + v;
+#pragma unroll
+                        for (int t = 0; t < 32; ++t) {
+                            if (t < L)
+                                orow[static_cast<long long>(t) * stride_row] =
+                                    static_cast<unsigned short>(gdn_pack(__uint_as_float(o0[t]), 0.f) & 0xffffu);
+                        }
+#pragma unroll
+                        for (int t = 0; t < 32; ++t) {
+                            if (32 + t < L)
+                                orow[static_cast<long long>(32 + t) * stride_row] =
+                                    static_cast<unsigned short>(gdn_pack(__uint_as_float(o1[t]), 0.f) & 0xffffu);
                         }
                     } else {
                         float* orow =

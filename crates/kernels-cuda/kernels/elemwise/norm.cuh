@@ -575,6 +575,121 @@ __global__ void __launch_bounds__(256) rmsnorm_gated_f32_in_warp(
         *reinterpret_cast<uint4*>(y + at) = *reinterpret_cast<const uint4*>(out);
     }
 }
+// As rmsnorm_gated_f32_in_warp over a bf16 x (a gated delta walk's output
+// landed narrow for it).
+template <class T, int PER>
+__global__ void __launch_bounds__(256) rmsnorm_gated_bf16_in_warp(
+    const bf16* __restrict__ x,
+    const T* __restrict__ gate,
+    const float* __restrict__ weight,
+    T* __restrict__ y,
+    int units,
+    float eps,
+    int sigmoid_gate,
+    int heads,
+    const u32* __restrict__ win)
+{
+    static_assert(PER == 4 || PER == 8, "a lane's gate run is one 8- or 16-byte load");
+    constexpr int hidden = 32 * PER;
+    const int unit = static_cast<int>(blockIdx.x) * 8 + static_cast<int>(threadIdx.x >> 5);
+    if (unit >= units) return;
+    if (win != nullptr && unit / heads >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? unit + static_cast<int>(win[1]) * heads : unit;
+    const int lane = threadIdx.x & 31;
+    const long long at = static_cast<long long>(plane_row) * hidden + lane * PER;
+
+    float xv[PER];
+    float wv[PER];
+    T gv[PER];
+    #pragma unroll
+    for (int q = 0; q < PER / 4; ++q) {
+        const uint2 xb = reinterpret_cast<const uint2*>(x + at)[q];
+        const float2 x01 = bf16x2_to_f32(*reinterpret_cast<const bf16x2*>(&xb.x));
+        const float2 x23 = bf16x2_to_f32(*reinterpret_cast<const bf16x2*>(&xb.y));
+        const float4 wf = reinterpret_cast<const float4*>(weight + lane * PER)[q];
+        xv[4 * q] = x01.x;
+        xv[4 * q + 1] = x01.y;
+        xv[4 * q + 2] = x23.x;
+        xv[4 * q + 3] = x23.y;
+        wv[4 * q] = wf.x;
+        wv[4 * q + 1] = wf.y;
+        wv[4 * q + 2] = wf.z;
+        wv[4 * q + 3] = wf.w;
+    }
+    if constexpr (PER == 4) {
+        *reinterpret_cast<uint2*>(gv) = *reinterpret_cast<const uint2*>(gate + at);
+    } else {
+        *reinterpret_cast<uint4*>(gv) = *reinterpret_cast<const uint4*>(gate + at);
+    }
+    float local = 0.f;
+    #pragma unroll
+    for (int u = 0; u < PER; ++u) local += xv[u] * xv[u];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+    const float inv_rms = rsqrtf(local / static_cast<float>(hidden) + eps);
+
+    T out[PER];
+    #pragma unroll
+    for (int u = 0; u < PER; ++u) {
+        const float g = Elem<T>::to_f32(gv[u]);
+        const float sg = sigmoid_gate
+            ? 1.f / (1.f + __expf(-g))
+            : g / (1.f + __expf(-g));
+        out[u] = Elem<T>::from_f32(wv[u] * (xv[u] * inv_rms) * sg);
+    }
+    if constexpr (PER == 4) {
+        *reinterpret_cast<uint2*>(y + at) = *reinterpret_cast<const uint2*>(out);
+    } else {
+        *reinterpret_cast<uint4*>(y + at) = *reinterpret_cast<const uint4*>(out);
+    }
+}
+
+template <class T, int BLOCK = 256>
+__global__ void rmsnorm_gated_bf16_in(
+    const bf16* __restrict__ x,
+    const T* __restrict__ gate,
+    const float* __restrict__ weight,
+    T* __restrict__ y,
+    int hidden,
+    float eps,
+    int sigmoid_gate,
+    int heads,
+    const u32* __restrict__ win)
+{
+    const int row = blockIdx.x;
+
+    if (win != nullptr && row / heads >= static_cast<int>(win[0])) return;
+
+    const int plane_row =
+        win != nullptr ? row + static_cast<int>(win[1]) * heads : row;
+
+    const int tid = threadIdx.x;
+
+    const bf16* xr = x + static_cast<long long>(plane_row) * hidden;
+    const T* gr = gate + static_cast<long long>(plane_row) * hidden;
+    T* yr = y + static_cast<long long>(plane_row) * hidden;
+
+    float local = 0.f;
+    for (int i = tid; i < hidden; i += BLOCK) {
+        const float v = bf16_to_f32(xr[i]);
+        local += v * v;
+    }
+
+    __shared__ float buf[BLOCK];
+    const float buf_sum = block_reduce_sum_fast<BLOCK>(local, buf);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
+
+    for (int i = tid; i < hidden; i += BLOCK) {
+        const float xv = bf16_to_f32(xr[i]) * inv_rms;
+        const float wv = weight[i];
+        const float gv = Elem<T>::to_f32(gr[i]);
+        const float sg = sigmoid_gate
+            ? 1.f / (1.f + __expf(-gv))
+            : gv / (1.f + __expf(-gv));
+        yr[i] = Elem<T>::from_f32(wv * xv * sg);
+    }
+}
+
 
 template <class T, int BLOCK, int PER_THREAD, bool SCALE, bool POST, bool POST_PLUS_ONE>
 __global__ void rmsnorm_residual_add(

@@ -3,23 +3,34 @@
 //! The gated RMS norm over an f32 accumulator answers the host formula,
 //! `w * x / rms(x) * gate'` with `gate'` the gate's SiLU (or sigmoid), per
 //! head and per whole row, at the widths a warp carries alone and at one it
-//! does not.
+//! does not; and over an x landed in bf16 (a gated delta walk narrowed for
+//! it), against the formula on those bf16 values.
 
-use crate::common::{Gpu, Lcg, close, from_bf16};
+use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::elemwise::norm;
 use kernels_cuda::tensor::Tensor;
 
-fn check(rows: usize, width: usize, head_dim: usize, sigmoid: bool) {
+fn check(rows: usize, width: usize, head_dim: usize, sigmoid: bool, narrow: bool) {
     let normed = if head_dim == 0 { width } else { head_dim };
     let mut lcg = Lcg::seeded(0x9a7e);
     let x: Vec<f32> = (0..rows * width).map(|_| 3.0 * lcg.unit()).collect();
+    let x_narrow: Vec<u16> = x.iter().map(|&v| to_bf16(v)).collect();
+    let x: Vec<f32> = if narrow {
+        x_narrow.iter().map(|&v| from_bf16(v)).collect()
+    } else {
+        x
+    };
     let (gate_raw, gate) = lcg.row(rows * width);
     let weight: Vec<f32> = (0..normed).map(|_| 1.0 + 0.5 * lcg.unit()).collect();
     let eps = 1e-6f32;
 
     let mut gpu = Gpu::open();
-    let x_at = gpu.up(&x);
+    let x_at = if narrow {
+        gpu.up(&x_narrow)
+    } else {
+        gpu.up(&x)
+    };
     let gate_at = gpu.up(&gate_raw);
     let weight_at = gpu.up(&weight);
     let y_at = gpu.zeros(rows * width * 2);
@@ -27,7 +38,12 @@ fn check(rows: usize, width: usize, head_dim: usize, sigmoid: bool) {
     let mut y = Tensor::new(y_at, rows as u32, width as u32, Dtype::Bf16);
     norm::rmsnorm_gated(
         &ctx,
-        Tensor::new(x_at, rows as u32, width as u32, Dtype::F32),
+        Tensor::new(
+            x_at,
+            rows as u32,
+            width as u32,
+            if narrow { Dtype::Bf16 } else { Dtype::F32 },
+        ),
         Tensor::new(gate_at, rows as u32, width as u32, Dtype::Bf16),
         Tensor::new(weight_at, 1, normed as u32, Dtype::F32),
         head_dim as u32,
@@ -64,8 +80,10 @@ fn check(rows: usize, width: usize, head_dim: usize, sigmoid: bool) {
 
 #[test]
 fn the_gated_norm_answers_the_host_reference() {
-    check(5, 4 * 128, 128, false);
-    check(3, 2 * 256, 256, true);
-    check(4, 256, 0, false);
-    check(3, 3 * 96, 96, false);
+    for narrow in [false, true] {
+        check(5, 4 * 128, 128, false, narrow);
+        check(3, 2 * 256, 256, true, narrow);
+        check(4, 256, 0, false, narrow);
+        check(3, 3 * 96, 96, false, narrow);
+    }
 }

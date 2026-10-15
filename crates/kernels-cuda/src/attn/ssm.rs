@@ -870,6 +870,7 @@ struct Tc5Params {
     v_heads: i32,
     write_state: i32,
     q_scale: f32,
+    out_bf16: i32,
 }
 
 /// The one-launch tcgen05 walk (`attn/gdn_tc5.cuh`), where the profile
@@ -915,15 +916,22 @@ fn gated_delta_chunked_tc5(
         boxes: [64, 64, 1],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
     })?;
-    // A whole chunk's output, 64 rows of a value head, stored by TMA.
+    // A whole chunk's output, 64 rows of a value head, stored by TMA, in
+    // bf16 where the trace narrowed it for its gated norm.
+    let out_bf16 = y.dtype == Dtype::Bf16;
+    let out_bytes: u64 = if out_bf16 { 2 } else { 4 };
     let out_width = shape.v_heads * shape.v_dim;
     let map_out = encode(Map {
         ptr: y.ptr,
-        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        ty: if out_bf16 {
+            dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
+        } else {
+            dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32
+        },
         dims: [out_width, y.rows, 1],
         strides: [
-            u64::from(out_width) * 4,
-            u64::from(out_width) * 4 * u64::from(y.rows.max(1)),
+            u64::from(out_width) * out_bytes,
+            u64::from(out_width) * out_bytes * u64::from(y.rows.max(1)),
         ],
         boxes: [128, 64, 1],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
@@ -950,6 +958,7 @@ fn gated_delta_chunked_tc5(
         v_heads: int(shape.v_heads),
         write_state: i32::from(state.write_state),
         q_scale,
+        out_bf16: i32::from(out_bf16),
     };
     let tiles = lanes.saturating_mul(shape.v_heads);
     let grid = tiles.min(ctx.multiprocessors().unwrap_or(148)).max(1);
@@ -1297,6 +1306,45 @@ pub fn gated_delta_chunked(
     let _ = z;
     dtype_dispatch!(OP, qkv.data.dtype, { Bf16 => () });
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
+    if y.dtype == Dtype::Bf16 {
+        // Narrowed for its gated norm: the tcgen05 walk lands bf16 itself;
+        // any other walk lands f32 in a plane, cast after.
+        let wide_y = Tensor::new(y.ptr, y.rows, y.width, Dtype::F32);
+        let shape = Delta::of(
+            OP,
+            qkv.data,
+            gates,
+            &wide_y,
+            k_heads,
+            v_heads,
+            k_dim,
+            v_dim,
+        )?;
+        #[cfg(feature = "cuda")]
+        if k_dim == 128
+            && v_dim == 128
+            && !SERIAL_SCAN.with(core::cell::Cell::get)
+            && gated_delta_chunked_tc5(ctx, OP, &shape, qkv, gates, state, y)?
+        {
+            return Ok(());
+        }
+        let _ = shape;
+        // A staged window lands its rows past its base, within twice the
+        // fire's rows.
+        let plane_at = plane(ctx, OP, "attn.ssm_gdn_wide_out", 2 * y.elements())?;
+        let mut wide = Tensor::new(plane_at, y.rows, y.width, Dtype::F32);
+        gated_delta_chunked(
+            ctx, qkv, z, gates, state, k_heads, v_heads, k_dim, v_dim, &mut wide,
+        )?;
+        let width = stated(OP, y.width)?;
+        let rows = nonzero(OP, "rows", y.rows)?;
+        return ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::attn::ssm_gdn_narrow_rows")
+                .apply(Launch::grid([rows, 1, 1], [128, 1, 1])),
+            &[wide.arg(), y.arg(), width.arg(), ctx.stage()],
+        );
+    }
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;

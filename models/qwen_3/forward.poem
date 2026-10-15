@@ -283,16 +283,19 @@ def gdn_mixer(x, inputs, g, bonsai):
     def step(qkv):
         qkv = ops.attn.ssm_causal_conv1d(qkv, g.conv, conv_state, g.conv_kernel)
         gates = ops.attn.ssm_gdn_prep(ba.on(fact.single_token()), g.dt_bias, g.a_log)
-        core = ops.attn.ssm_gated_delta(qkv, z.on(fact.single_token()), gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
-        return core
+        z1 = z.on(fact.single_token())
+        core = ops.attn.ssm_gated_delta(qkv, z1, gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
+        return ops.elemwise.rmsnorm_gated(core, z1, g.norm, g.v_dim, g.norm_eps, "silu")
 
     def chunked(qkv):
         qkv = ops.attn.ssm_causal_conv1d_chunked(qkv, g.conv, conv_state, g.conv_kernel)
         gates = ops.attn.ssm_gdn_prep(ba.on(~fact.single_token()), g.dt_bias, g.a_log)
-        core = ops.attn.ssm_gated_delta_chunked(qkv, z.on(~fact.single_token()), gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
-        return core
+        zc = z.on(~fact.single_token())
+        core = ops.attn.ssm_gated_delta_chunked(qkv, zc, gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
+        # The gated norm inside the arm: a backend may land the walk's
+        # output narrower for it.
+        return ops.elemwise.rmsnorm_gated(core, zc, g.norm, g.v_dim, g.norm_eps, "silu")
 
     o = switch(qkv, [(fact.single_token(), step)], otherwise = chunked)
-    o = ops.elemwise.rmsnorm_gated(o, z, g.norm, g.v_dim, g.norm_eps, "silu")
     o_in = rot_take(o, bonsai.ssm) if bonsai != None else o
     return ops.linear.matmul(o_in, g.out_proj)

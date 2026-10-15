@@ -3005,6 +3005,21 @@ __global__ void ssm_kda_chunked_batched(
 
 constexpr int GDN_CH = 64;
 
+// A gated delta walk's f32 rows narrowed to bf16 where its trace asked for
+// a bf16 output and the walk could not land one itself: one block a row,
+// the staged window's rows only.
+__global__ void ssm_gdn_narrow_rows(
+    const float* __restrict__ src, __nv_bfloat16* __restrict__ dst, int width,
+    const u32* __restrict__ win)
+{
+    const int r = blockIdx.x;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    for (int c = threadIdx.x; c < width; c += blockDim.x) {
+        dst[row * width + c] = __float2bfloat16(src[row * width + c]);
+    }
+}
+
 struct GdnLane {
     int t0;
     int T;

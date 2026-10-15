@@ -77,7 +77,7 @@ fn the_chunked_gated_delta_reads_and_lands_where_the_window_says() {
 /// runs, the two-launch scan, and the one-launch tcgen05 walk the sm_100
 /// profile turns on (a card that cannot run one falls back to the next).
 fn check(case: &Case) {
-    for arm in [Arm::Split, Arm::Scan, Arm::Tc5] {
+    for arm in [Arm::Split, Arm::Scan, Arm::Tc5, Arm::ScanBf16, Arm::Tc5Bf16] {
         check_on(case, arm);
     }
 }
@@ -87,12 +87,22 @@ enum Arm {
     Split,
     Scan,
     Tc5,
+    /// The walks landing a bf16 output (a trace narrowed for its gated
+    /// norm): the tcgen05 walk lands it itself, the scan through a cast.
+    ScanBf16,
+    Tc5Bf16,
+}
+
+impl Arm {
+    fn narrow(self) -> bool {
+        matches!(self, Arm::ScanBf16 | Arm::Tc5Bf16)
+    }
 }
 
 fn tuned(arm: Arm) -> Tuning {
     Tuning {
         ssm_gdn_fused_scan: arm != Arm::Split,
-        ssm_gdn_tc5: arm == Arm::Tc5,
+        ssm_gdn_tc5: matches!(arm, Arm::Tc5 | Arm::Tc5Bf16),
         ..Tuning::DEFAULT
     }
 }
@@ -168,7 +178,13 @@ fn check_on(case: &Case, fused: Arm) {
             begin_at,
             fused_decay: false,
         };
-        let mut y = Tensor::new(y_at, live as u32, v_heads * v_dim, Dtype::F32);
+        let narrow = !serial && fused.narrow();
+        let mut y = Tensor::new(
+            y_at,
+            live as u32,
+            v_heads * v_dim,
+            if narrow { Dtype::Bf16 } else { Dtype::F32 },
+        );
         let qkv = RaggedTensor {
             data: Tensor::new(qkv_at, live as u32, conv_dim as u32, Dtype::Bf16),
             indptr: Tensor::new(indptr_at, lens.len() as u32 + 1, 1, Dtype::I32),
@@ -207,10 +223,16 @@ fn check_on(case: &Case, fused: Arm) {
         };
         fired.expect("the gated delta fires");
         gpu.sync();
-        (
-            gpu.down(y_at, rows * (v_heads * v_dim) as usize),
-            gpu.down(slab_at, slots * stride),
-        )
+        let cells = rows * (v_heads * v_dim) as usize;
+        let y: Vec<f32> = if narrow {
+            gpu.down::<u16>(y_at, cells)
+                .into_iter()
+                .map(common::from_bf16)
+                .collect()
+        } else {
+            gpu.down(y_at, cells)
+        };
+        (y, gpu.down(slab_at, slots * stride))
     };
     let (y_serial, state_serial) = run(true);
     let (y_chunked, state_chunked) = run(false);
@@ -314,6 +336,8 @@ fn the_chunked_gated_delta_reports_its_rate_at_a_qwen38_27b_head() {
                         Arm::Split => "split",
                         Arm::Scan => "fused",
                         Arm::Tc5 => "tc5",
+                        Arm::ScanBf16 => "fusedbf16",
+                        Arm::Tc5Bf16 => "tc5bf16",
                     }
                 )
             })
@@ -378,6 +402,8 @@ fn the_chunked_gated_delta_reports_its_rate_at_a_qwen38_27b_head() {
                 Arm::Split => "three wmma",
                 Arm::Scan => "two-launch",
                 Arm::Tc5 => "tcgen05",
+                Arm::ScanBf16 => "two-launch, bf16 out",
+                Arm::Tc5Bf16 => "tcgen05, bf16 out",
             },
             us * 1e-3,
             rows as f64 / us * 1e6

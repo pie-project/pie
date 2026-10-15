@@ -275,6 +275,12 @@ pub struct ElemwiseRowsVec;
 #[decision(id = "kernel.ssm.conv_vec4", flag, default = false, tune = search)]
 pub struct SsmConvVec4;
 
+/// Whether a chunked gated delta walk whose one reader is its gated norm
+/// lands its output in bf16 (and the norm reads it so); off, f32, as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_out_bf16", flag, default = false, tune = search)]
+pub struct SsmGdnOutBf16;
+
 /// Whether a prefill the tcgen05 FMHA (`attn/tc5_fmha.cuh`, sm_100a) can
 /// serve runs on it; off, FA2 serves every prefill, as before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -368,6 +374,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmGdnTc5>()
         .add::<ElemwiseRowsVec>()
         .add::<SsmConvVec4>()
+        .add::<SsmGdnOutBf16>()
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
@@ -426,6 +433,7 @@ pub struct Tuning {
     pub ssm_gdn_tc5: bool,
     pub rows_vec: bool,
     pub ssm_conv_vec4: bool,
+    pub ssm_gdn_out_bf16: bool,
     pub merge_warp: bool,
     pub mxfp4_mma_until: u32,
     pub mxfp4_mma_from: u32,
@@ -482,6 +490,7 @@ impl Tuning {
         ssm_gdn_tc5: false,
         rows_vec: false,
         ssm_conv_vec4: false,
+        ssm_gdn_out_bf16: false,
         merge_warp: false,
         mxfp4_mma_until: 0,
         mxfp4_mma_from: 64,
@@ -538,6 +547,7 @@ impl Tuning {
             ssm_gdn_tc5: profile.on::<SsmGdnTc5>(&Anywhere),
             rows_vec: profile.on::<ElemwiseRowsVec>(&Anywhere),
             ssm_conv_vec4: profile.on::<SsmConvVec4>(&Anywhere),
+            ssm_gdn_out_bf16: profile.on::<SsmGdnOutBf16>(&Anywhere),
             merge_warp: profile.on::<SdpaMergeWarp>(&Anywhere),
             mxfp4_mma_until: profile.get::<MoeMxfp4MmaUntil>().0,
             mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,

@@ -98,6 +98,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         tuning.decode_grouped_prefill_lse,
         kernels_cuda::attn::xqa::Gate::of(tuning),
     );
+    boot.trace = crate::narrow::gdn_out_bf16(boot.trace.clone(), tuning.ssm_gdn_out_bf16);
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
