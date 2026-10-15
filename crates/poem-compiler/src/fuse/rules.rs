@@ -48,8 +48,79 @@ pub(super) fn all() -> Vec<Rule> {
         qg_qknorm_rope_append(),
         split_rope_yarn_append(),
         rope_yarn_append(),
+        pool_attention(),
         lse_sink(),
     ]
+}
+
+/// DeepSeek-V4's attention: the windowed log-sum-exp attention, the
+/// compressed-pool one over the same q (every visible entry, or those an
+/// index selected), their merge and the sinks over it.
+fn pool_attention() -> Rule {
+    let chain = |selected: bool| {
+        template(move |p| {
+            let q = p.rows("q", W);
+            let plan = p.value("plan", Ty::Struct(StructKind::AttnPrefillPlan));
+            let cache = p.cache("cache");
+            let d = p.u32("d");
+            let sm_scale = p.f32("sm_scale");
+            p.free("window");
+            let (o, lse) =
+                attn::prefill_lse(&q, &plan, cache, None, d, p.u32("kv_heads"), sm_scale);
+            p.name("o", &o);
+            p.name("lse", &lse);
+            let positions = p.indices("positions");
+            let requests = p.indices("requests");
+            let entries = p.cache("entries");
+            let (ratio, heads) = (p.u32("ratio"), p.u32("heads"));
+            let (po, plse) = if selected {
+                let selection = p.rows("selection", W);
+                attn::pool_lse_selected(
+                    &q,
+                    &positions,
+                    &requests,
+                    &selection,
+                    entries,
+                    ratio,
+                    p.u32("top_k"),
+                    heads,
+                    d,
+                    sm_scale,
+                )
+            } else {
+                attn::pool_lse(
+                    &q, &positions, &requests, entries, ratio, heads, d, sm_scale,
+                )
+            };
+            p.name("po", &po);
+            p.name("plse", &plse);
+            let (mo, mlse) = attn::merge_lse(&o, &lse, &po, &plse, heads, d);
+            p.name("mo", &mo);
+            p.name("mlse", &mlse);
+            let out = attn::sink(&mo, &mlse, &p.weight("sink", [W]), d);
+            p.export("o_out", &out);
+        })
+    };
+    Rule::new(
+        "attention.pool_attention",
+        [chain(true), chain(false)],
+        |m| {
+            let attention = |name: &str| {
+                let Operation::Attention(attn) = m.op(name) else {
+                    panic!("`{name}` comes from an attention");
+                };
+                Box::new(attn.clone())
+            };
+            Fused::PoolAttention {
+                window: attention("o"),
+                pool: attention("po"),
+                merge: attention("mo"),
+                sink: m.value("sink"),
+                head_dim: m.u32("d"),
+                o_out: m.value("o_out"),
+            }
+        },
+    )
 }
 
 /// A log-sum-exp attention and the sinks over its output.

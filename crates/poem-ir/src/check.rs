@@ -878,6 +878,32 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 &[(In(3), I32), (In(6), CACHE), (In(7), I32), (In(8), I32)]
             }
             // The attention's own, and the sink's f32 log-sum-exp is its.
+            // The window's plan and cache (inputs 1, 2), the pool's
+            // positions, requests, selection and entries from input 4, and
+            // the three f32 log-sum-exp planes (outputs 1, 3, 5).
+            Fused::PoolAttention { pool, .. } => match **pool {
+                Attention::PoolLseSelected { .. } => &[
+                    (In(1), PREFILL_PLAN),
+                    (In(2), CACHE),
+                    (In(4), I32),
+                    (In(5), I32),
+                    (In(6), I32),
+                    (In(7), CACHE),
+                    (Out(1), F32),
+                    (Out(3), F32),
+                    (Out(5), F32),
+                ],
+                _ => &[
+                    (In(1), PREFILL_PLAN),
+                    (In(2), CACHE),
+                    (In(4), I32),
+                    (In(5), I32),
+                    (In(6), CACHE),
+                    (Out(1), F32),
+                    (Out(3), F32),
+                    (Out(5), F32),
+                ],
+            },
             Fused::LseSink { attn, .. } => match **attn {
                 Attention::DecodeLse { .. } => {
                     &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)]

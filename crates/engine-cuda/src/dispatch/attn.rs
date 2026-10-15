@@ -54,7 +54,7 @@ impl Run<'_> {
         )
     }
 
-    fn attention(&mut self, op: &Attention) -> Result<(), kernels_cuda::Error> {
+    pub(super) fn attention(&mut self, op: &Attention) -> Result<(), kernels_cuda::Error> {
         match op {
             Attention::PlanDecode {
                 kv_indptr,

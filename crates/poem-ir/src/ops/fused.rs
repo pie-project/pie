@@ -174,6 +174,20 @@ pub enum Fused {
         head_dim: u32,
         o_out: ValueId,
     },
+    /// DeepSeek-V4's attention whole: a windowed log-sum-exp attention
+    /// (`window`, a `PrefillLse`), a compressed-pool one over the same q
+    /// (`pool`, a `PoolLse` or `PoolLseSelected`), their merge (`merge`, a
+    /// `MergeLse` of the two) and the sinks over the merged output: a
+    /// backend lands the sinked output in `o_out` in one pass, or runs the
+    /// four. Every intermediate is still an output, read by nothing else.
+    PoolAttention {
+        window: Box<Attention>,
+        pool: Box<Attention>,
+        merge: Box<Attention>,
+        sink: ValueId,
+        head_dim: u32,
+        o_out: ValueId,
+    },
     /// YaRN over q and k, and the rotated k with its v landed in the paged
     /// cache at each row's page and offset (`kv_append`); `k_out` is read by
     /// nothing else.
@@ -389,6 +403,19 @@ impl Operands for Fused {
                 attn.inputs(sink);
                 sink.push(*sinks);
             }
+            // The window's (q, plan, cache), the pool's (q, positions,
+            // requests, its selection, entries), then the sinks: the merge
+            // reads only what the two land.
+            Self::PoolAttention {
+                window,
+                pool,
+                sink: sinks,
+                ..
+            } => {
+                window.inputs(sink);
+                pool.inputs(sink);
+                sink.push(*sinks);
+            }
             Self::MoeExperts {
                 select,
                 down,
@@ -514,6 +541,18 @@ impl Operands for Fused {
                 attn.outputs(sink);
                 sink.push(*o_out);
             }
+            Self::PoolAttention {
+                window,
+                pool,
+                merge,
+                o_out,
+                ..
+            } => {
+                window.outputs(sink);
+                pool.outputs(sink);
+                merge.outputs(sink);
+                sink.push(*o_out);
+            }
             Self::MoeExperts {
                 select,
                 glu,
@@ -545,6 +584,22 @@ impl Operands for Fused {
             // The sinked output lands in a plane of its own: the
             // attention's `o` is written by nothing a reader sees.
             Self::LseSink { attn, .. } => attn.aliases(sink),
+            // The sinks scale the merged output where it lies, as `Sink`
+            // does: the sinked output is the merge's plane.
+            Self::PoolAttention {
+                window,
+                pool,
+                merge,
+                o_out,
+                ..
+            } => {
+                window.aliases(sink);
+                pool.aliases(sink);
+                merge.aliases(sink);
+                if let Attention::MergeLse { o, .. } = **merge {
+                    sink.push((*o_out, o));
+                }
+            }
             Self::NormModulate { .. } => {}
             Self::GatedResidualNormModulate { r_out, r, .. } => sink.push((*r_out, *r)),
             Self::LmHeadSoftcap { y, y_out, .. } | Self::MatmulBias { y, y_out, .. } => {
@@ -590,6 +645,7 @@ impl Operands for Fused {
             Self::SplitRopeYarnAppend { .. } => "elementwise.split_rope_yarn_append",
             Self::QgQknormRopeAppend { .. } => "elementwise.qg_qknorm_rope_append",
             Self::LseSink { .. } => "attention.lse_sink",
+            Self::PoolAttention { .. } => "attention.pool_attention",
             Self::MoeExperts { .. } => "linear.moe_experts",
             Self::QkvFusedQknormRopeVnormWrite { .. } => {
                 "custom_cuda.qkv_fused_qknorm_rope_vnorm_write"

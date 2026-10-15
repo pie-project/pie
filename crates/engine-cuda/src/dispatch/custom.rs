@@ -12,6 +12,7 @@ impl DispatchFused for Run<'_> {
             Fused::SplitRopeYarnAppend { .. } => self.split_rope_yarn_append(op),
             Fused::QgQknormRopeAppend { .. } => self.qg_qknorm_rope_append(op),
             Fused::LseSink { .. } => self.lse_sink(op),
+            Fused::PoolAttention { .. } => self.pool_attention(op),
             Fused::MatmulGeglu { .. }
             | Fused::MatmulSwiglu { .. }
             | Fused::MlpSwiglu { .. }
@@ -41,6 +42,35 @@ impl DispatchFused for Run<'_> {
 }
 
 impl Run<'_> {
+    /// DeepSeek-V4's attention: the window, the pool, their merge and the
+    /// sinks, as the trace had them. The sinked output is the merge's plane.
+    fn pool_attention(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::PoolAttention {
+            window,
+            pool,
+            merge,
+            sink,
+            head_dim,
+            o_out,
+        } = op
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let poem_ir::Attention::MergeLse { o, lse, .. } = **merge else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        self.attention(window)?;
+        self.attention(pool)?;
+        self.attention(merge)?;
+        self.attention(&poem_ir::Attention::Sink {
+            o,
+            lse,
+            sink: *sink,
+            head_dim: *head_dim,
+            o_out: *o_out,
+        })
+    }
+
     /// A log-sum-exp attention with its sinks: landed in the split's fold
     /// where the profile's warp fold takes them, else by the sink kernel
     /// after, as the pair ran.

@@ -314,6 +314,77 @@ fn a_split_rotation_and_its_cache_write_fold_into_one_op() {
     );
 }
 
+/// DeepSeek-V4's windowed attention, its pool attention (selected or whole),
+/// their merge and the sinks land as one op carrying the four; the lone
+/// window and sinks of a pool-less layer stay `lse_sink`'s.
+#[test]
+fn deepseeks_window_pool_merge_and_sinks_land_as_one_op() {
+    let layer = |selected: bool, pooled: bool| {
+        trace(move |p| {
+            let q = p.rows("q", 64 * 512);
+            let cache = p.cache("kv");
+            let plan = p.value(
+                "plan",
+                poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
+            );
+            let (o, lse) = attn::prefill_lse(&q, &plan, cache, Some(128), 512, 1, 0.04);
+            let (o, lse) = if pooled {
+                let positions = p.indices("positions");
+                let requests = p.indices("requests");
+                let entries = p.cache("entries");
+                let (po, plse) = if selected {
+                    let selection = p.rows("selection", 512);
+                    attn::pool_lse_selected(
+                        &q, &positions, &requests, &selection, entries, 4, 512, 64, 512, 0.04,
+                    )
+                } else {
+                    attn::pool_lse(&q, &positions, &requests, entries, 128, 64, 512, 0.04)
+                };
+                attn::merge_lse(&o, &lse, &po, &plse, 64, 512)
+            } else {
+                (o, lse)
+            };
+            let out = attn::sink(&o, &lse, &p.weight("sinks", [64]), 512);
+            elemwise::silu(&out);
+        })
+    };
+    let kernels = ["attention.pool_attention", "attention.lse_sink"];
+    for selected in [true, false] {
+        let fused = fuse(layer(selected, true), &kernels);
+        assert_eq!(
+            ops(&fused),
+            ["attention.pool_attention", "elementwise.silu"]
+        );
+        let Some(poem_ir::Operation::Fused(poem_ir::Fused::PoolAttention {
+            window,
+            pool,
+            merge,
+            head_dim,
+            ..
+        })) = fused.nodes.first().map(|node| &node.op)
+        else {
+            panic!("the first op is the pool attention");
+        };
+        assert_eq!(*head_dim, 512);
+        assert_eq!(
+            (window.name(), pool.name(), merge.name()),
+            (
+                "attention.prefill_lse",
+                if selected {
+                    "attention.pool_lse_selected"
+                } else {
+                    "attention.pool_lse"
+                },
+                "attention.merge_lse"
+            )
+        );
+    }
+    assert_eq!(
+        ops(&fuse(layer(false, false), &kernels)),
+        ["attention.lse_sink", "elementwise.silu"]
+    );
+}
+
 /// gpt-oss's sinks fold onto the log-sum-exp attention before them, decode
 /// and prefill alike, carrying the attention whole; a log-sum-exp read past
 /// the sink keeps the pair apart.

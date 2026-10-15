@@ -198,8 +198,6 @@ def layer(m, rows, w, streams, trail, following = None):
     plane = rope(plane, pos, at.rope_dim, m.head_dim, at.theta, at.yarn)
     ops.attn.kv_append_shared(plane, pages, write_page, write_offset)
 
-    o, lse = ops.attn.prefill_lse(q, rows.plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale)
-
     selection = trail.selection
     p = at.pool
     if p != None:
@@ -230,12 +228,17 @@ def layer(m, rows, w, streams, trail, following = None):
             selection = struct(picked = picked, top_k = ix.top_k)
         elif at.selection == "shared" and selection == None:
             fail("a CSA2 Reuse Mode layer follows a layer that ranked")
+        # The window's attention runs beside the pool's, where a backend
+        # may land the two, their merge and the sinks as one.
+        o, lse = ops.attn.prefill_lse(q, rows.plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale)
         if at.selection != "none":
             po, plse = ops.attn.pool_lse_selected(q, pos, request_of_token, selection.picked, entries,
                                                   p.ratio, selection.top_k, m.heads, m.head_dim, at.sm_scale)
         else:
             po, plse = ops.attn.pool_lse(q, pos, request_of_token, entries, p.ratio, m.heads, m.head_dim, at.sm_scale)
         o, lse = ops.attn.merge_lse(o, lse, po, plse, m.heads, m.head_dim)
+    else:
+        o, lse = ops.attn.prefill_lse(q, rows.plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale)
 
     o = ops.attn.sink(o, lse, at.sink, m.head_dim)
     o = rope(o, pos, at.rope_dim, m.head_dim, at.theta, at.yarn, inverse = True)
