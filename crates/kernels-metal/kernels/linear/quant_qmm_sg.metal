@@ -55,7 +55,8 @@ constant constexpr int kSpan = 256;
                              constant int &width [[buffer(2)]], constant int &rows [[buffer(3)]],
                              constant int &counters [[buffer(4)]],
                              uint2 at [[thread_position_in_grid]], uint2 grid [[threads_per_grid]]) {
-  const uint h = at.x, slot = at.y;
+  // A simdgroup per 64-code group h (grid.y), a lane per slot (grid.x).
+  const uint slot = at.x, h = at.y;
   // The split tile's arrival counters, past the sums: zero before the tile counts on them.
   device uint *count = reinterpret_cast<device uint *>(table + 8 * ulong(width)) + width / 4;
   for (uint at_ = h * 32 + slot; at_ < uint(counters); at_ += grid.x * grid.y)
@@ -63,6 +64,7 @@ constant constexpr int kSpan = 256;
   const uint fm = slot >> 2, c = slot & 3;
   const uint cp = fm >> 1, i = fm & 1;
   vec<bfloat, 16> v;
+  float sum[2] = {0.0f, 0.0f};
 #pragma unroll
   for (int j = 0; j < 2; ++j)
 #pragma unroll
@@ -71,21 +73,24 @@ constant constexpr int kSpan = 256;
 #pragma unroll
       for (int r = 0; r < 2; ++r) {
         const int row = 2 * c + r;
-        v[8 * j + 2 * p + r] = row < rows ? input[ulong(row) * width + k] : bfloat(0.0f);
+        const bfloat x = row < rows ? input[ulong(row) * width + k] : bfloat(0.0f);
+        v[8 * j + 2 * p + r] = x;
+        sum[r] += float(x);
       }
     }
   reinterpret_cast<device vec<bfloat, 16> *>(table)[ulong(h) * 32 + slot] = v;
-  if (slot < 8) {
+  // A lane's 16 inputs are 8 of each of its two rows, all in the 32-input group fm / 4; the
+  // four lanes of that group and rows (fm bits 0 and 1) add theirs.
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    sum[r] += simd_shuffle_xor(sum[r], 4u);
+    sum[r] += simd_shuffle_xor(sum[r], 8u);
+  }
+  if ((fm & 3) == 0) {
     device float *sums = reinterpret_cast<device float *>(table + 8 * ulong(width));
-    const int row = slot;
 #pragma unroll
-    for (int g = 0; g < 2; ++g) {
-      float sum = 0.0f;
-#pragma unroll
-      for (int q = 0; q < 32; ++q)
-        sum += row < rows ? float(input[ulong(row) * width + 64 * h + 32 * g + q]) : 0.0f;
-      sums[(2 * ulong(h) + g) * 8 + row] = sum;
-    }
+    for (int r = 0; r < 2; ++r)
+      sums[(2 * ulong(h) + (fm >> 2)) * 8 + 2 * c + r] = sum[r];
   }
 }
 

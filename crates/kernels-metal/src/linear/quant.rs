@@ -790,7 +790,7 @@ fn act_x_wt_over(
                     };
                     ctx.fire(
                         Fire::at(REGISTER_FILE, "qmm_sg_table")
-                            .apply(Grid::of([(k / 64).unsigned_abs(), 32, 1], [2, 32, 1])),
+                            .apply(Grid::of([32, (k / 64).unsigned_abs(), 1], [32, 4, 1])),
                         &[act.arg(), table.arg_mut(), k.arg(), m.arg(), counters.arg()],
                     )?;
                     let entry = symbol(&format!("affine_qmm_sg_k{split}"));
