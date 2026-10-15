@@ -4,16 +4,18 @@ use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::ssm;
 use kernels_cuda::tensor::{RaggedTensor, RecurrentPool, Tensor};
+use kernels_cuda::tuning::Tuning;
 
-/// Two hundred channels take the eight-channel vector arm, a hundred the
-/// per-channel one.
+/// Two hundred channels take the eight-channel vector arm (or, with
+/// `ssm_conv_vec4`, the four-channel one), a hundred the per-channel one.
 #[test]
 fn the_row_tiled_causal_conv_answers_the_per_row_reference() {
-    check(200);
-    check(100);
+    check(200, false);
+    check(200, true);
+    check(100, false);
 }
 
-fn check(channels: usize) {
+fn check(channels: usize, vec4: bool) {
     let lens: [usize; 4] = [31, 2, 131, 45];
     let k = 4u32;
     let rows: usize = lens.iter().sum();
@@ -48,7 +50,10 @@ fn check(channels: usize) {
     };
     let mut y = Tensor::new(y_at, rows as u32, channels as u32, Dtype::Bf16);
     ssm::causal_conv1d_chunked(
-        &gpu.ctx(),
+        &gpu.ctx().with_tuning(Tuning {
+            ssm_conv_vec4: vec4,
+            ..Tuning::DEFAULT
+        }),
         RaggedTensor {
             data: Tensor::new(x_at, rows as u32, channels as u32, Dtype::Bf16),
             indptr: Tensor::new(indptr_at, lens.len() as u32 + 1, 1, Dtype::I32),

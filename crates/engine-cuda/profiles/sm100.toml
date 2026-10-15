@@ -27,6 +27,10 @@ ssm.gdn_tc5 = true
 # sigmoid gate 69 where it took 262; a long fire's packed qkv|z lands as two
 # GEMMs off the weight's two slices, never cut.
 elemwise.rows_vec = true
+# The chunked causal conv four channels a thread: Qwen3.6-35B-A3B's 8192
+# channels over 16384 tokens take 166 us where eight a thread took 258
+# (its 168 registers held three blocks an SM).
+ssm.conv_vec4 = true
 # A wide decode's split partials fold a warp a row: gpt-oss-120b's layers
 # at 64 requests fold in about 4 us where the staged merge took 17.
 sdpa.merge_warp = true

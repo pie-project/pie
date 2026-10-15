@@ -363,7 +363,22 @@ fn conv1d_chunked(
         && [x.data.ptr, y.ptr, weight.ptr, state.conv_slab.ptr]
             .iter()
             .all(|&at| aligned16(at));
-    let (entrypoint, launch) = if vec8 {
+    let (entrypoint, launch) = if vec8 && ctx.tuning().ssm_conv_vec4 {
+        (
+            symbol(&format!(
+                "::pie::attn::ssm_causal_conv1d_chunked_batched_row_tile_vec4{}",
+                out.args()
+            )),
+            Launch::grid(
+                [
+                    (channels / 4).div_ceil(TILE_BLOCK),
+                    x.data.rows.div_ceil(CONV_TT).max(1),
+                    1,
+                ],
+                [TILE_BLOCK, 1, 1],
+            ),
+        )
+    } else if vec8 {
         (
             symbol(&format!(
                 "::pie::attn::ssm_causal_conv1d_chunked_batched_row_tile_vec8{}",

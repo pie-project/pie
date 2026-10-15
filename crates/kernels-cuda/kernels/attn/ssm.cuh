@@ -514,6 +514,133 @@ __global__ void ssm_causal_conv1d_chunked_batched_row_tile_vec8(
     }
 }
 
+// The row-tiled conv four channels a thread (one 8-byte vector a row) for
+// a four-tap, undilated kernel: the 16-byte form's registers held a block
+// to three an SM on sm_100, where four channels and a 64-register bound
+// keep eight resident and the SiLU's divide hides under the loads. The sums
+// run in the 16-byte form's order, so the two land the same bits.
+template <class T, bool SILU = true, bool RESIDUAL = false>
+__global__ void __launch_bounds__(128, 8) ssm_causal_conv1d_chunked_batched_row_tile_vec4(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
+    T* __restrict__ y,
+    T* __restrict__ state_out_base,
+    const int* __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    int C, int K, int dil, bool write_state,
+    const u8* __restrict__ write_state_mask,
+    const int* commit_len,
+    const int* begin_at,
+    const u32* __restrict__ win,
+    int lanes_stated)
+{
+    using Run = uint2;
+    constexpr int TAPS = 4;
+    constexpr int VEC = 4;
+    constexpr int RUN = 8;
+    constexpr int TT = CONV_TT;
+    const int c = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
+    if (c >= C) return;
+    const int lanes = win != nullptr ? static_cast<int>(win[2]) : lanes_stated;
+    if (lanes <= 0) return;
+    const int total = static_cast<int>(qo_indptr[lanes]);
+    const int tile0 = static_cast<int>(blockIdx.y) * TT;
+    if (tile0 >= total) return;
+    const int tile_end = min(tile0 + TT, total);
+    const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
+    // The taps, channel-major: element (u * TAPS + q) is channel c + u's tap q.
+    T wraw[VEC * TAPS];
+    {
+        const Run* wq = reinterpret_cast<const Run*>(weight + static_cast<long long>(c) * TAPS);
+        #pragma unroll
+        for (int q = 0; q < TAPS; ++q) reinterpret_cast<Run*>(wraw)[q] = wq[q];
+    }
+    float wf[VEC * TAPS];
+    #pragma unroll
+    for (int i = 0; i < VEC * TAPS; ++i) wf[i] = Elem<T>::to_f32(wraw[i]);
+    auto wt = [&](int q, int u) -> float { return wf[u * TAPS + q]; };
+    float bias_v[VEC];
+    #pragma unroll
+    for (int u = 0; u < VEC; ++u) bias_v[u] = bias ? Elem<T>::to_f32(bias[c + u]) : 0.f;
+    int r = 0;
+    {
+        int lo = 0, hi = lanes - 1;
+        while (lo < hi) {
+            const int mid = (lo + hi + 1) >> 1;
+            if (static_cast<int>(qo_indptr[mid]) <= tile0) lo = mid; else hi = mid - 1;
+        }
+        r = lo;
+    }
+    for (; r < lanes; ++r) {
+        int t0 = static_cast<int>(qo_indptr[r]);
+        int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
+        if (t0 >= tile_end) break;
+        const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+        if (begin_at != nullptr) {
+            int b = begin_at[rl];
+            if (b > Nr) b = Nr;
+            if (b > 0) { t0 += b; Nr -= b; }
+        }
+        if (commit_len != nullptr) {
+            const int cl = commit_len[rl];
+            if (cl < Nr) Nr = cl;
+        }
+        if (Nr <= 0) continue;
+        const int slot = slot_ids[rl];
+        if (slot < 0) continue;
+        const T* x_r = x + static_cast<long long>(t0 + row0) * C + c;
+        T* y_r = y + static_cast<long long>(t0 + row0) * C + c;
+        const T* state = state_out_base + static_cast<long long>(slot) * slot_stride_elems + c;
+        const int t_lo = max(tile0, t0) - t0;
+        const int t_hi = min(tile_end, t0 + Nr) - t0;
+        if (t_lo >= t_hi) continue;
+        Run hist[TAPS - 1];
+        #pragma unroll
+        for (int j = 0; j < TAPS - 1; ++j) {
+            const int src = t_lo - (TAPS - 1) + j;
+            hist[j] = src < 0
+                ? *reinterpret_cast<const Run*>(state + static_cast<long long>(TAPS + src) * C)
+                : *reinterpret_cast<const Run*>(x_r + static_cast<long long>(src) * C);
+        }
+        for (int tb = t_lo; tb < t_hi; tb += RUN) {
+            Run run[RUN];
+            #pragma unroll
+            for (int j = 0; j < RUN; ++j) {
+                const int t = min(tb + j, t_hi - 1);
+                run[j] = *reinterpret_cast<const Run*>(x_r + static_cast<long long>(t) * C);
+            }
+            #pragma unroll
+            for (int j = 0; j < RUN; ++j) {
+                const int t = tb + j;
+                if (t >= t_hi) break;
+                const T* h0 = reinterpret_cast<const T*>(&hist[0]);
+                const T* h1 = reinterpret_cast<const T*>(&hist[1]);
+                const T* h2 = reinterpret_cast<const T*>(&hist[2]);
+                const T* cu = reinterpret_cast<const T*>(&run[j]);
+                T out[VEC];
+                #pragma unroll
+                for (int u = 0; u < VEC; ++u) {
+                    const float cur = Elem<T>::to_f32(cu[u]);
+                    float acc = bias_v[u];
+                    acc += wt(0, u) * Elem<T>::to_f32(h0[u]);
+                    acc += wt(1, u) * Elem<T>::to_f32(h1[u]);
+                    acc += wt(2, u) * Elem<T>::to_f32(h2[u]);
+                    acc += wt(3, u) * cur;
+                    out[u] = Elem<T>::from_f32(conv_out<SILU, RESIDUAL>(acc, cur));
+                }
+                hist[0] = hist[1];
+                hist[1] = hist[2];
+                hist[2] = run[j];
+                *reinterpret_cast<Run*>(y_r + static_cast<long long>(t) * C) =
+                    *reinterpret_cast<const Run*>(out);
+            }
+        }
+    }
+}
+
+
 template <class T>
 __global__ void ssm_causal_conv1d_state_commit(
     const T* __restrict__ x,
