@@ -54,8 +54,10 @@ elemwise.rows_vec = true
 # one pass over the bf16 streams 472 where the two took ~530 + 1339, the fold
 # 869 -> 383, the gates' pre-mix 297 -> 218, the 64 x 512 scale-free q norm a
 # warp a head 1785 -> 432. A 32 x 4096 prefill 11.69 -> 6.62 s, decode at 64
-# requests 93.3 -> 84.5 ms a step.
-elemwise.hc_tile = true
+# requests 93.3 -> 84.5 ms a step. Off until a fresh slot's position-0
+# fire after another sequence's decode lands what the untiled kernels land
+# (DeepSeek-V4-Flash, teacher-forced KL 8.4 on that one row).
+elemwise.hc_tile = false
 # The chunked causal conv four channels a thread: Qwen3.6-35B-A3B's 8192
 # channels over 16384 tokens take 166 us where eight a thread took 258
 # (its 168 registers held three blocks an SM).
