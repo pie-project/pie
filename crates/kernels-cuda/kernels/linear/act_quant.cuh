@@ -199,6 +199,60 @@ __global__ void act_quant_e4m3(
     }
 }
 
+// `act_quant_e4m3`'s codes for rows that read a token `div` times (a
+// token's routes): one warp a token's `kGran`-wide block, quantized once and
+// landed at each of its routes' rows (`pos[t * div + j]`, none where
+// negative), as `act_quant_e4m3` lands each route's alike.
+template <int kGran>
+__global__ void act_quant_e4m3_fan(
+    const bf16* __restrict__ x,
+    const i32* __restrict__ pos,
+    int m_max,
+    u8* __restrict__ codes,
+    u8* __restrict__ atoms,
+    int tokens,
+    int k,
+    int div)
+{
+    constexpr int kEach = kGran / 32;
+    const int blocks = k / kGran;
+    const long long warp = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+    const int lane = threadIdx.x % 32;
+    if (warp >= static_cast<long long>(tokens) * blocks) return;
+    const int t = static_cast<int>(warp / blocks);
+    const int b = static_cast<int>(warp % blocks);
+    const bf16* src = x + static_cast<long long>(t) * k + b * kGran + lane * kEach;
+    float v[kEach];
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < kEach; ++i) {
+        v[i] = bf16_to_f32(src[i]);
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    }
+    amax = fmaxf(amax, 1e-4f);
+    const unsigned bits = __float_as_uint(amax * (1.f / 448.f));
+    const int e = static_cast<int>((bits >> 23) & 0xFFu) - 127 + ((bits & 0x7FFFFFu) != 0u ? 1 : 0);
+    const float s = __uint_as_float(static_cast<unsigned>(e + 127) << 23);
+    u8 q[kEach];
+#pragma unroll
+    for (int i = 0; i < kEach; ++i) {
+        q[i] = __nv_cvt_float_to_fp8(fminf(fmaxf(v[i] / s, -448.f), 448.f),
+                                     __NV_SATFINITE, __NV_E4M3);
+    }
+    for (int j = 0; j < div; ++j) {
+        const int o = pos[static_cast<long long>(t) * div + j];
+        if (o < 0) continue;
+        u8* dst = codes + static_cast<long long>(o) * k + b * kGran + lane * kEach;
+#pragma unroll
+        for (int i = 0; i < kEach; ++i) dst[i] = q[i];
+        if (lane == 0) atoms[atom_offset(atom_row(o, m_max), b, blocks)] = static_cast<u8>(e + 127);
+    }
+}
+
 // A row-major plane of one-byte scales, `cols` a row, into the atom layout;
 // atom row `r` reads plane row `r / div` (a 128-row block's one scale
 // spread to each of its rows).

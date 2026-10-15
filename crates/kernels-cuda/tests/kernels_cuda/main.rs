@@ -18,6 +18,7 @@ static STRICT_KERNELS: extern "C" fn() = {
 
 mod a_body_captured_on_its_own_stream_takes_its_owners_tile;
 mod a_qkv_split_reaches_every_row_of_a_tall_fire;
+mod a_tokens_e4m3_codes_land_once_at_each_route;
 mod a_trimmed_pixel_shuffle_drops_its_anchor_frames;
 mod every_dit_seat_entry_retires_the_staged_windows_padded_rows;
 mod the_activation_quantizers_land_what_the_host_rounds;

@@ -180,6 +180,32 @@ fn launch(
                     "e4m3 activations quantize alike for every expert",
                 ));
             }
+            // Codes for a token's routes: each token's blocks quantized once
+            // and landed at each of its routes' rows.
+            if mode == 0 && src.div > 1 && src.pos != 0 && src.rows.is_multiple_of(src.div) {
+                let tokens = src.rows / src.div;
+                let fan = u64::from(tokens) * u64::from(k / gran) * 32;
+                let threads = u32::try_from(fan)
+                    .map_err(|_| refuse(op, format!("{blocks} blocks overflow a launch")))?;
+                return ctx.fire(
+                    op,
+                    Fire::at(
+                        FILE,
+                        symbol(&format!("::pie::linear::act_quant_e4m3_fan<{gran}>")),
+                    )
+                    .apply(Launch::flat(threads, BLOCK)),
+                    &[
+                        src.x.arg(),
+                        ArgValue::Ptr(src.pos),
+                        int(src.m_max)?,
+                        ArgValue::Ptr(codes),
+                        ArgValue::Ptr(atoms),
+                        int(tokens)?,
+                        int(k)?,
+                        int(src.div)?,
+                    ],
+                );
+            }
             let threads = u32::try_from(blocks * 32)
                 .map_err(|_| refuse(op, format!("{blocks} blocks overflow a launch")))?;
             ctx.fire(
