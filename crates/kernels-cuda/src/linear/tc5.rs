@@ -1352,7 +1352,6 @@ fn fire_routed(
 /// same stream consumes it.
 const SPLIT_PARTIAL: &str = "linear.tc5.split_partial";
 
-
 /// An atom-layout scale tensor as TMA reads it: [row block][atom][128 words],
 /// boxes of `atoms` atoms by `row_blocks` row blocks, zero past either end.
 fn scale_map(
