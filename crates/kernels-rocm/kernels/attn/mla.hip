@@ -121,9 +121,11 @@ struct LatentKeys {
     int ratio;
     int n0, n1;
     int limit;
+    // The first position a windowed row still reads; 0 reads every row.
+    int floor = 0;
 
     __device__ __forceinline__ int pos(int n) const { return sel != nullptr ? sel[n] : n; }
-    __device__ __forceinline__ bool visible(int p) const { return p >= 0 && p <= limit; }
+    __device__ __forceinline__ bool visible(int p) const { return p >= floor && p <= limit; }
     __device__ __forceinline__ int cell(int p) const { return (p + 1) * ratio - 1; }
     __device__ __forceinline__ int page(int p) const { return pages[cell(p) / page_size]; }
     __device__ __forceinline__ long long slot(int p, int page_id) const {
@@ -229,14 +231,16 @@ __device__ void attend(const bf16* __restrict__ qn, const bf16* __restrict__ qp,
 
 // One block per (token, group of G heads). With a selection, the token's
 // keys are the positions its row lists (entries outside the causal range
-// skipped); without, every key up to its causal bound.
+// skipped); without, every key up to its causal bound. A `band` past 0
+// keeps the last `band` positions through the row's own; `lse`, when not
+// null, takes each head's base-2 log-sum-exp.
 __global__ __launch_bounds__(kBlock) void mla_naive_paged_kernel(
     const bf16* __restrict__ q_nope, const bf16* __restrict__ q_pe, const bf16* __restrict__ ckv_pages,
     const bf16* __restrict__ kpe_pages, const i32* __restrict__ qo_indptr,
     const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
-    const i32* __restrict__ last_page_lens, bf16* __restrict__ o, const i32* __restrict__ selection,
-    int top_k, int requests, int heads, int ckv, int kpe, int page_size, float sm_scale, bool causal,
-    int G, const u32* __restrict__ win) {
+    const i32* __restrict__ last_page_lens, bf16* __restrict__ o, float* __restrict__ lse,
+    const i32* __restrict__ selection, int top_k, int requests, int heads, int ckv, int kpe,
+    int page_size, float sm_scale, bool causal, int G, int band, const u32* __restrict__ win) {
     extern __shared__ float naive_smem[];
     const Window window{win};
     const int t = blockIdx.x;
@@ -250,18 +254,23 @@ __global__ __launch_bounds__(kBlock) void mla_naive_paged_kernel(
     const int kv_len = paged_len(page_indptr, last_page_lens, r, page_size);
     const int abs_q = kv_len - (qo_indptr[r + 1] - qo_indptr[r]) + (t - qo_indptr[r]);
     const int j_end = causal ? min(abs_q + 1, kv_len) : kv_len;
+    const int floor = band > 0 ? max(0, abs_q + 1 - band) : 0;
     LatentKeys keys{selection != nullptr ? selection + t_row * top_k : nullptr,
                     page_indices + page_indptr[r],
                     page_size,
                     1,
-                    0,
+                    selection != nullptr ? 0 : floor,
                     selection != nullptr ? top_k : j_end,
-                    j_end - 1};
+                    j_end - 1,
+                    floor};
     const long long head0 = t_row * heads + static_cast<long long>(blockIdx.y) * G;
     attend(
         q_nope + (t_row * heads + h) * ckv, q_pe + (t_row * heads + h) * kpe, ckv_pages, kpe_pages, ckv, kpe,
         keys, sm_scale * 1.4426950408889634f, G, naive_smem,
-        [&](int g, int d, float v) { o[(head0 + g) * ckv + d] = from_f32<bf16>(v); }, [](int, float) {});
+        [&](int g, int d, float v) { o[(head0 + g) * ckv + d] = from_f32<bf16>(v); },
+        [&](int g, float v) {
+            if (lse != nullptr) lse[head0 + g] = v;
+        });
 }
 
 }  // namespace mla_naive
@@ -783,6 +792,9 @@ struct Gather {
     i32 splits;
     i32 causal;
     float scale_log2;
+    // Past 0, the last `window` positions through the row's own (a
+    // request-ordered walk only).
+    i32 window;
 };
 
 template <int R>
@@ -826,6 +838,7 @@ __global__ __launch_bounds__(kThreads) void latent_gather(const Gather p) {
     const i32* pages;
     int limit;
     int ratio = 1;
+    int floor = 0;
     if (p.positions != nullptr) {
         const int req = p.req_of_token[t_row];
         pages = p.page_indices + p.page_indptr[req];
@@ -838,12 +851,17 @@ __global__ __launch_bounds__(kThreads) void latent_gather(const Gather p) {
         const int abs_q = kv_len - (p.qo_indptr[r + 1] - p.qo_indptr[r]) + (t - p.qo_indptr[r]);
         pages = p.page_indices + p.page_indptr[r];
         limit = (p.causal ? min(abs_q + 1, kv_len) : kv_len) - 1;
+        if (p.window > 0) floor = max(0, abs_q + 1 - p.window);
     }
     const i32* sel = p.selection != nullptr ? p.selection + t_row * p.top_k : nullptr;
-    const int count = sel != nullptr ? p.top_k : max(limit + 1, 0);
+    // Without a selection the walk's list is the visible positions from the
+    // window's floor.
+    const int first = sel != nullptr ? 0 : floor;
+    const int count = sel != nullptr ? p.top_k : max(limit + 1 - floor, 0);
     const int share = ((count + p.splits - 1) / p.splits + kBK - 1) / kBK * kBK;
     const int n0 = min(count, static_cast<int>(blockIdx.z) * share);
-    const LatentKeys keys{sel, pages, p.page_size, ratio, n0, min(count, n0 + share), limit};
+    const LatentKeys keys{sel, pages, p.page_size, ratio, first + n0, first + min(count, n0 + share), limit,
+                          floor};
     const GatherRows<R> rows{p.q_nope, p.q_pe, p.o, p.lse, p.part_o, p.part_lse, t_row, t,
                              p.num_heads, static_cast<int>(blockIdx.x) * kBM, limit, p.splits,
                              static_cast<int>(blockIdx.z)};

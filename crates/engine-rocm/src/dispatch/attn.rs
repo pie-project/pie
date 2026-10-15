@@ -654,10 +654,12 @@ impl Run<'_> {
                 plan,
                 q_pe,
                 cache,
+                window,
                 heads,
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse,
             } => mla::attention_decode(
                 self.ctx(),
                 self.ragged(*q),
@@ -667,17 +669,21 @@ impl Run<'_> {
                 *heads,
                 *kv_lora_rank,
                 *sm_scale,
+                *window,
                 &mut self.tensor(*o),
+                lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
             Attention::MlaPrefill {
                 q,
                 plan,
                 q_pe,
                 cache,
+                window,
                 heads,
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse,
             } => mla::attention_prefill(
                 self.ctx(),
                 self.ragged(*q),
@@ -687,7 +693,9 @@ impl Run<'_> {
                 *heads,
                 *kv_lora_rank,
                 *sm_scale,
+                *window,
                 &mut self.tensor(*o),
+                lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
             Attention::MlaDecodeSelected {
                 q,
@@ -699,6 +707,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse,
             } => mla::attention_decode_selected(
                 self.ctx(),
                 self.ragged_lanes(*q),
@@ -710,6 +719,7 @@ impl Run<'_> {
                 *kv_lora_rank,
                 *sm_scale,
                 &mut self.tensor(*o),
+                lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
             Attention::MlaPrefillSelected {
                 q,
@@ -721,6 +731,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse,
             } => mla::attention_prefill_selected(
                 self.ctx(),
                 self.ragged_lanes(*q),
@@ -732,6 +743,7 @@ impl Run<'_> {
                 *kv_lora_rank,
                 *sm_scale,
                 &mut self.tensor(*o),
+                lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
             Attention::SsmCausalConv1d {
                 x,

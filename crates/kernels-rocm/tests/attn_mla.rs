@@ -180,7 +180,7 @@ fn close_rows(what: &str, have: &[f32], want: &[f32], rel: f32) {
 }
 
 fn workspace(gpu: &Gpu) -> plan::Workspace {
-    const BYTES: usize = 64 << 20;
+    const BYTES: usize = 128 << 20;
     let int = gpu.zeros(1, (BYTES / 4) as u32, Dtype::F32);
     let float = gpu.zeros(1, (BYTES / 4) as u32, Dtype::F32);
     plan::Workspace {
@@ -270,9 +270,25 @@ fn query(gpu: &Gpu, qo_lens: &[usize], heads: usize, rank: usize, rope: usize, s
 /// The planned walk (`mla_decode` / `mla_prefill`) over requests of
 /// `qo_lens` new tokens after `prefix` cached ones, against the host.
 fn run_planned(heads: usize, rope: usize, ps: usize, qo_lens: &[usize], prefix: &[usize]) {
+    run_dense(512, heads, rope, ps, qo_lens, prefix, None, false);
+}
+
+/// `mla_decode` / `mla_prefill` at a `rank`-wide latent, reading back
+/// through `window` tokens if one is stated, and landing each row's per-head
+/// base-2 log-sum-exp when `with_lse`.
+#[allow(clippy::too_many_arguments)]
+fn run_dense(
+    rank: usize,
+    heads: usize,
+    rope: usize,
+    ps: usize,
+    qo_lens: &[usize],
+    prefix: &[usize],
+    window: Option<u32>,
+    with_lse: bool,
+) {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
-    let rank = 512;
     let kv_lens: Vec<usize> = qo_lens.iter().zip(prefix).map(|(q, p)| q + p).collect();
     let c = cache(&gpu, &kv_lens, rank, rope, ps, 7);
     let decode = qo_lens.iter().all(|&l| l == 1);
@@ -280,6 +296,7 @@ fn run_planned(heads: usize, rope: usize, ps: usize, qo_lens: &[usize], prefix: 
     let q = query(&gpu, qo_lens, heads, rank, rope, 3);
     let total: usize = qo_lens.iter().sum();
     let mut o = gpu.zeros(total as u32, (heads * rank) as u32, Dtype::Bf16);
+    let mut lse = gpu.zeros(total as u32, heads as u32, Dtype::F32);
     let scale = 1.0 / ((rank + 64) as f32).sqrt();
     let f = if decode {
         mla::attention_decode
@@ -295,17 +312,21 @@ fn run_planned(heads: usize, rope: usize, ps: usize, qo_lens: &[usize], prefix: 
         heads as u32,
         rank as u32,
         scale,
+        window,
         &mut o,
+        with_lse.then_some(&mut lse),
     )
     .unwrap();
     let got = gpu.read(&o);
+    let got_lse = gpu.read(&lse);
     let row = heads * rank;
     let mut t = 0;
     for (r, &ql) in qo_lens.iter().enumerate() {
         for i in 0..ql {
             let pos = kv_lens[r] - ql + i;
-            let visible: Vec<usize> = (0..=pos).collect();
-            let (want, _) = reference(
+            let floor = window.map_or(0, |w| (pos + 1).saturating_sub(w as usize));
+            let visible: Vec<usize> = (floor..=pos).collect();
+            let (want, want_lse) = reference(
                 &c,
                 r,
                 &q.qn[t * row..(t + 1) * row],
@@ -315,11 +336,19 @@ fn run_planned(heads: usize, rope: usize, ps: usize, qo_lens: &[usize], prefix: 
                 f64::from(scale),
             );
             close_rows(
-                &format!("mla h{heads} rope{rope} ps{ps} req {r} token {i}"),
+                &format!("mla r{rank} h{heads} rope{rope} ps{ps} w{window:?} req {r} token {i}"),
                 &got[t * row..(t + 1) * row],
                 &want,
                 1.5e-2,
             );
+            if with_lse {
+                close_abs(
+                    &format!("mla lse r{rank} h{heads} w{window:?} req {r} token {i}"),
+                    &got_lse[t * heads..(t + 1) * heads],
+                    &want_lse,
+                    2e-2,
+                );
+            }
             t += 1;
         }
     }
@@ -341,6 +370,24 @@ fn decode_ninety_six_heads_spans_two_blocks() {
 fn decode_without_a_rope_plane() {
     // GLM-5.3-Flash: NoPE latent attention.
     run_planned(16, 0, 32, &[1, 1], &[77, 1024]);
+}
+
+#[test]
+fn the_planned_walk_lands_its_log_sum_exp() {
+    // Split and unsplit decode rows, and a causal prefill.
+    run_dense(512, 64, 64, 64, &[1, 1, 1], &[0, 300, 2900], None, true);
+    run_dense(512, 16, 64, 16, &[5, 70, 1], &[0, 33, 200], None, true);
+}
+
+#[test]
+fn a_windowed_walk_reads_only_its_window() {
+    // The gathered walk at the 512 latent, decode and prefill, windows
+    // shorter and longer than the context.
+    run_dense(512, 64, 64, 32, &[1, 1, 1], &[0, 300, 2900], Some(513), true);
+    run_dense(512, 16, 64, 16, &[5, 70, 1], &[0, 33, 600], Some(40), true);
+    // dots.llm3's sliding layers: a 1024 latent on the reference walk.
+    run_dense(1024, 8, 64, 16, &[1, 1], &[20, 600], Some(513), true);
+    run_dense(1024, 8, 64, 16, &[9, 3], &[560, 0], Some(513), false);
 }
 
 #[test]
@@ -385,6 +432,7 @@ fn run_selected(heads: usize, rope: usize, qo_lens: &[usize], prefix: &[usize], 
     }
     let selection = gpu.ints_shaped(&sel, total as u32, top_k as u32);
     let mut o = gpu.zeros(total as u32, (heads * rank) as u32, Dtype::Bf16);
+    let mut lse = gpu.zeros(total as u32, heads as u32, Dtype::F32);
     let scale = 1.0 / 24.0;
     let f = if decode {
         mla::attention_decode_selected
@@ -402,9 +450,11 @@ fn run_selected(heads: usize, rope: usize, qo_lens: &[usize], prefix: &[usize], 
         rank as u32,
         scale,
         &mut o,
+        Some(&mut lse),
     )
     .unwrap();
     let got = gpu.read(&o);
+    let got_lse = gpu.read(&lse);
     let row = heads * rank;
     let mut t = 0;
     for (r, &ql) in qo_lens.iter().enumerate() {
@@ -415,7 +465,7 @@ fn run_selected(heads: usize, rope: usize, qo_lens: &[usize], prefix: &[usize], 
                 .filter(|&&j| j >= 0 && j as usize <= pos)
                 .map(|&j| j as usize)
                 .collect();
-            let (want, _) = reference(
+            let (want, want_lse) = reference(
                 &c,
                 r,
                 &q.qn[t * row..(t + 1) * row],
@@ -429,6 +479,12 @@ fn run_selected(heads: usize, rope: usize, qo_lens: &[usize], prefix: &[usize], 
                 &got[t * row..(t + 1) * row],
                 &want,
                 1.5e-2,
+            );
+            close_abs(
+                &format!("selected lse h{heads} rope{rope} row {t}"),
+                &got_lse[t * heads..(t + 1) * heads],
+                &want_lse,
+                2e-2,
             );
             t += 1;
         }
@@ -475,7 +531,9 @@ fn the_reference_walk_takes_other_widths() {
         heads as u32,
         rank as u32,
         scale,
+        None,
         &mut o,
+        None,
     )
     .unwrap();
     let got = gpu.read(&o);
@@ -656,6 +714,7 @@ fn selected_decode_under_a_window() {
         rank as u32,
         0.05,
         &mut o,
+        None,
     )
     .unwrap();
     ctx.disarm_stage();
@@ -850,7 +909,9 @@ fn bench_planned(heads: usize, rope: usize, batch: usize, ctx_len: usize) {
             heads as u32,
             rank as u32,
             0.04,
+            None,
             &mut o,
+            None,
         )
         .unwrap();
     });
@@ -928,6 +989,7 @@ fn bench_selected_decode() {
                 rank as u32,
                 0.04,
                 &mut o,
+                None,
             )
             .unwrap();
         });

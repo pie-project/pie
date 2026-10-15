@@ -414,6 +414,8 @@ pub(crate) mod naive {
         pub sm_scale: f32,
         pub causal: bool,
         pub top_k: i32,
+        /// Past 0, the last `window` positions through each row's own.
+        pub window: i32,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -427,6 +429,9 @@ pub(crate) mod naive {
         pub kv_page_indptr: u64,
         pub kv_last_page_lens: u64,
         pub o: u64,
+        /// Each row's per-head base-2 log-sum-exp, f32 `[rows, heads]`; 0
+        /// lands none.
+        pub lse: u64,
         pub selection: u64,
     }
 
@@ -481,6 +486,7 @@ pub(crate) mod naive {
                 ArgValue::Ptr(ptrs.kv_page_indptr),
                 ArgValue::Ptr(ptrs.kv_last_page_lens),
                 ArgValue::Ptr(ptrs.o),
+                ArgValue::Ptr(ptrs.lse),
                 ArgValue::Ptr(ptrs.selection),
                 shape.top_k.arg(),
                 shape.num_requests.arg(),
@@ -491,6 +497,7 @@ pub(crate) mod naive {
                 shape.sm_scale.arg(),
                 shape.causal.arg(),
                 g.arg(),
+                shape.window.arg(),
                 ctx.stage(),
             ],
         )
@@ -616,9 +623,10 @@ pub(crate) mod latent {
         pub splits: i32,
         pub causal: i32,
         pub scale_log2: f32,
+        pub window: i32,
     }
 
-    const _: () = assert!(core::mem::size_of::<Gather>() == 160);
+    const _: () = assert!(core::mem::size_of::<Gather>() == 168);
 
     /// The planned walk: the MLA scheduler's work list over the batch, then
     /// the fold of every split row. The fold always runs (its blocks with
@@ -637,6 +645,7 @@ pub(crate) mod latent {
         sm_scale: f32,
         causal: bool,
         o: u64,
+        lse: u64,
     ) -> Result<(), Error> {
         if plan.num_heads != num_heads.unsigned_abs() {
             return Err(refuse(
@@ -666,7 +675,7 @@ pub(crate) mod latent {
             kv_end: at(int, info.kv_end_offset),
             work_indptr: at(int, info.work_indptr_offset),
             o,
-            lse: 0,
+            lse,
             partial_o: at(float, info.partial_o_offset),
             partial_lse: at(float, info.partial_lse_offset),
             num_heads,
@@ -691,7 +700,7 @@ pub(crate) mod latent {
             partial_o: work.partial_o,
             partial_lse: work.partial_lse,
             o,
-            lse: 0,
+            lse,
             num_heads,
         };
         ctx.fire(
@@ -771,6 +780,43 @@ pub(crate) mod latent {
     }
 }
 
+/// Where a scoring lands its rows' per-head base-2 log-sum-exp, if asked:
+/// an f32 plane of one entry per head per row.
+fn lse_plane(
+    op: &'static str,
+    lse: Option<&mut Tensor>,
+    rows: u32,
+    heads: i32,
+) -> Result<u64, Error> {
+    let Some(lse) = lse else {
+        return Ok(0);
+    };
+    if lse.dtype != Dtype::F32 || lse.rows != rows || i64::from(lse.width) != i64::from(heads) {
+        return Err(refuse(
+            op,
+            format!(
+                "the log-sum-exp plane is {:?} [{}, {}] and the scores want f32 [{rows}, {heads}]",
+                lse.dtype, lse.rows, lse.width
+            ),
+        ));
+    }
+    if lse.ptr == 0 {
+        return Err(refuse(op, "the log-sum-exp plane is null"));
+    }
+    Ok(lse.ptr)
+}
+
+/// A window as the walks read it: 0 for none.
+fn window_of(op: &'static str, window: Option<u32>) -> Result<i32, Error> {
+    match window {
+        None => Ok(0),
+        Some(w) => i32::try_from(w)
+            .ok()
+            .filter(|&w| w > 0)
+            .ok_or_else(|| refuse(op, format!("a {w}-token window is not one it reads"))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_dense(
     ctx: &Ctx,
@@ -784,11 +830,47 @@ fn dispatch_dense(
     num_heads: i32,
     sm_scale: f32,
     causal: bool,
+    window: Option<u32>,
     o: &mut Tensor,
+    lse: u64,
 ) -> Result<(), Error> {
+    let window = window_of(op, window)?;
+    let num_requests = kv::lanes_of(op, qo_indptr)?;
+    let matrix_core = !ctx.tuning().mla_naive && latent::supported(layer.kv_lora_rank, layer.rope_dim);
+    // A windowed row reads a band of keys of its own: the gathered walk,
+    // a block per token, takes it from its window's floor.
+    if matrix_core && window > 0 {
+        return latent::gather(
+            ctx,
+            op,
+            layer.rope_dim,
+            o.rows,
+            latent::Gather {
+                q_nope: q_nope.ptr,
+                q_pe: q_pe.ptr,
+                ckv: layer.ckv_pages,
+                kpe: layer.kpe_pages,
+                page_indices: pool.page_indices.ptr,
+                page_indptr: pool.page_indptr.ptr,
+                last_page_lens: pool.last_page_lens.ptr,
+                qo_indptr: qo_indptr.ptr,
+                o: o.ptr,
+                lse,
+                num_requests,
+                num_heads,
+                page_size: layer.page_size,
+                ratio: 1,
+                splits: latent::splits(ctx, o.rows, num_heads, i64::from(window)),
+                causal: i32::from(causal),
+                scale_log2: sm_scale * core::f32::consts::LOG2_E,
+                window,
+                ..latent::Gather::default()
+            },
+        );
+    }
     // `kernel.mla.path = naive` takes the reference walk; otherwise the
     // matrix-core walk where it is built.
-    if !ctx.tuning().mla_naive && latent::supported(layer.kv_lora_rank, layer.rope_dim) {
+    if matrix_core {
         return latent::planned(
             ctx,
             op,
@@ -801,9 +883,9 @@ fn dispatch_dense(
             sm_scale,
             causal,
             o.ptr,
+            lse,
         );
     }
-    let num_requests = kv::lanes_of(op, qo_indptr)?;
     naive::fire(
         ctx,
         op,
@@ -817,6 +899,7 @@ fn dispatch_dense(
             kv_page_indptr: pool.page_indptr.ptr,
             kv_last_page_lens: pool.last_page_lens.ptr,
             o: o.ptr,
+            lse,
             selection: 0,
         },
         naive::Shape {
@@ -829,6 +912,7 @@ fn dispatch_dense(
             sm_scale,
             causal,
             top_k: 0,
+            window,
         },
     )
 }
@@ -843,15 +927,19 @@ pub fn attention_decode(
     heads: u32,
     kv_lora_rank: u32,
     sm_scale: f32,
+    window: Option<u32>,
     o: &mut Tensor,
+    lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
     const OP: &str = "attention.mla_decode";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this attention states", heads)?;
     let rope = rope_per_head(OP, q_pe, heads)?;
     let layer = Layer::of(OP, pool, kv_lora_rank, rope)?;
+    let lse = lse_plane(OP, lse, o.rows, heads)?;
     dispatch_dense(
-        ctx, OP, plan, q.data, q_pe, &layer, pool, q.indptr, heads, sm_scale, false, o,
+        ctx, OP, plan, q.data, q_pe, &layer, pool, q.indptr, heads, sm_scale, false, window, o,
+        lse,
     )
 }
 
@@ -865,15 +953,19 @@ pub fn attention_prefill(
     heads: u32,
     kv_lora_rank: u32,
     sm_scale: f32,
+    window: Option<u32>,
     o: &mut Tensor,
+    lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
     const OP: &str = "attention.mla_prefill";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this attention states", heads)?;
     let rope = rope_per_head(OP, q_pe, heads)?;
     let layer = Layer::of(OP, pool, kv_lora_rank, rope)?;
+    let lse = lse_plane(OP, lse, o.rows, heads)?;
     dispatch_dense(
-        ctx, OP, plan, q.data, q_pe, &layer, pool, q.indptr, heads, sm_scale, true, o,
+        ctx, OP, plan, q.data, q_pe, &layer, pool, q.indptr, heads, sm_scale, true, window, o,
+        lse,
     )
 }
 
@@ -890,6 +982,7 @@ fn selected(
     sm_scale: f32,
     causal: bool,
     o: &mut Tensor,
+    lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     debug_assert_eq!(selection.dtype, Dtype::I32, "the selection is i32 page ids");
@@ -910,6 +1003,7 @@ fn selected(
     }
     let num_requests = kv::lanes_of(op, q.indptr)?;
     let top_k = stated(op, selection.width)?;
+    let lse = lse_plane(op, lse, o.rows, heads)?;
     if !ctx.tuning().mla_naive && latent::supported(layer.kv_lora_rank, layer.rope_dim) {
         return latent::gather(
             ctx,
@@ -927,6 +1021,7 @@ fn selected(
                 qo_indptr: q.indptr.ptr,
                 selection: selection.ptr,
                 o: o.ptr,
+                lse,
                 top_k,
                 num_requests,
                 num_heads: heads,
@@ -952,6 +1047,7 @@ fn selected(
             kv_page_indptr: pool.page_indptr.ptr,
             kv_last_page_lens: pool.last_page_lens.ptr,
             o: o.ptr,
+            lse,
             selection: selection.ptr,
         },
         naive::Shape {
@@ -964,6 +1060,7 @@ fn selected(
             sm_scale,
             causal,
             top_k,
+            window: 0,
         },
     )
 }
@@ -980,6 +1077,7 @@ pub fn attention_decode_selected(
     kv_lora_rank: u32,
     sm_scale: f32,
     o: &mut Tensor,
+    lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
     let _ = plan;
     selected(
@@ -994,6 +1092,7 @@ pub fn attention_decode_selected(
         sm_scale,
         false,
         o,
+        lse,
     )
 }
 
@@ -1009,6 +1108,7 @@ pub fn attention_prefill_selected(
     kv_lora_rank: u32,
     sm_scale: f32,
     o: &mut Tensor,
+    lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
     let _ = plan;
     selected(
@@ -1023,6 +1123,7 @@ pub fn attention_prefill_selected(
         sm_scale,
         true,
         o,
+        lse,
     )
 }
 
