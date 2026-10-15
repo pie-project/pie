@@ -42,9 +42,9 @@ template <int GH, typename KV = int8_t, int DD = 256>
   const device bfloat *packed_q =
       reinterpret_cast<const device bfloat *>(workspace) + tile.x * M * D;
   alignas(16) threadgroup float scores[M * N], maxima[M], totals[M], factors[M];
-  alignas(16) threadgroup bfloat probs[M * N];
+  alignas(16) threadgroup float probs[M * N];
   threadgroup float kscale[N], vscale[N];
-  using Prob = bfloat;
+  using Prob = float;
   for (uint r = tid; r < M; r += nt) {
     maxima[r] = -1e30f;
     totals[r] = 0;
