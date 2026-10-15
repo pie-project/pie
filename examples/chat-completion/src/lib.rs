@@ -92,7 +92,10 @@ async fn main(input: Input) -> Result<String> {
             );
         }
         model::ForwardKind::Diffusion => {
-            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+            return Err(
+                "this program decodes a token at a time; a diffusion model wants a canvas loop"
+                    .into(),
+            );
         }
     };
 
@@ -106,7 +109,12 @@ async fn main(input: Input) -> Result<String> {
     }
 
     // Chat-template the system and user messages, then add the assistant cue.
-    let mut prompt_tokens = chat::system_user(&input.system, &input.prompt);
+    // `cue` asks for a thinking answer, so the system turn is the one the
+    // template writes for a thinking request (Qwen3.8 opens it with its
+    // reasoning-effort instruction).
+    let mut prompt_tokens =
+        chat::system_thinking(Some(&input.system), chat::ReasoningEffort::Xhigh);
+    prompt_tokens.extend(chat::user(&input.prompt));
     prompt_tokens.extend(chat::cue());
     if prompt_tokens.is_empty() {
         prompt_tokens.push(0);

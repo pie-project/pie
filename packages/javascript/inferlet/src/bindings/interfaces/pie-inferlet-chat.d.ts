@@ -24,6 +24,13 @@ export function cue(): Uint32Array;
  */
 export function cueWithoutThinking(): Uint32Array;
 /**
+ * The system turn of a request the model answers with thinking, as its
+ * template renders it: the template's reasoning-effort instruction ahead
+ * of `message`, in a system turn of its own when `message` is `none`.
+ * `system(message)` (or nothing) where the template has no instruction.
+ */
+export function systemThinking(message: string | undefined, effort: ReasoningEffort): Uint32Array;
+/**
  * Seal the current turn (insert stop token)
  */
 export function seal(): Uint32Array;
@@ -33,6 +40,20 @@ export function seal(): Uint32Array;
 export function stopTokens(): Uint32Array;
 export type Error = import('./pie-inferlet-types.js').Error;
 export type Event = EventDelta | EventInterrupt | EventDone;
+/**
+ * The reasoning effort a thinking request names.
+ * 
+ * # Variants
+ * 
+ * ## `"xhigh"`
+ * 
+ * The template's default.
+ * 
+ * ## `"medium"`
+ * 
+ * ## `"low"`
+ */
+export type ReasoningEffort = 'xhigh' | 'medium' | 'low';
 /**
  * Generated text chunk
  */

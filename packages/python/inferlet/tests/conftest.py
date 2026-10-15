@@ -25,6 +25,7 @@ version of this file kept passing against `pie:core/inference`.
 
 from __future__ import annotations
 
+import enum
 import sys
 import types
 from dataclasses import dataclass
@@ -276,6 +277,8 @@ def _make_chat() -> types.ModuleType:
     m.assistant = lambda message: [5, *(ord(c) for c in message)]
     m.cue = lambda: [6]
     m.cue_without_thinking = lambda: [6, 7]
+    m.ReasoningEffort = enum.Enum("ReasoningEffort", ["XHIGH", "MEDIUM", "LOW"])
+    m.system_thinking = lambda message, effort: [1, effort.value, *(ord(c) for c in message or "")]
     m.seal = lambda: [7]
     m.stop_tokens = lambda: [8, 9]
     m.create_decoder = ChatDecoderStub

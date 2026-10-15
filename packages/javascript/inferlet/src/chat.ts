@@ -67,6 +67,19 @@ export function cueWithoutThinking(): Uint32Array {
   return _chat.cueWithoutThinking();
 }
 
+/** The reasoning effort a thinking request names; `'xhigh'` is the template's default. */
+export type ReasoningEffort = _chat.ReasoningEffort;
+
+/**
+ * The system turn of a request the model answers with thinking, as its
+ * template renders it: the template's reasoning-effort instruction ahead of
+ * `message`, in a system turn of its own when `message` is undefined.
+ * `system(message)` where the template has none.
+ */
+export function systemThinking(message?: string, effort: ReasoningEffort = 'xhigh'): Uint32Array {
+  return _chat.systemThinking(message, effort);
+}
+
 /** `cue`, or `cueWithoutThinking` when `think` is false. */
 export function cueThinking(think: boolean): Uint32Array {
   return think ? cue() : cueWithoutThinking();
