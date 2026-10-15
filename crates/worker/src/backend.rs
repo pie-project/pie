@@ -86,11 +86,13 @@ fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
 }
 
 /// A fire's token budget unless `[engine] max_forward_tokens` states one. On
-/// ROCm it is vLLM's MI300X default (`max_num_batched_tokens` 16384): a wave
-/// of eight 2K prompts prefills in one fire instead of two, so the first
-/// half's decodes do not wait out the second half's prefill.
+/// ROCm, 10K: measured on MI300X against vLLM's 16K-token steps (GLM-5.3-Flash
+/// and Qwen3.8-Flash-Next minis, 2K x 8 and 1K x 64 prompts), 8K left the
+/// first prompts' decodes waiting out a second prefill fire (TPOT), and 12K
+/// to 16K fires made the prompts queued behind them wait (GLM 1K x 64 TTFT
+/// 665 ms at 10K, 916 at 12K, 984 at 16K).
 #[cfg(feature = "rocm")]
-const DEFAULT_FORWARD_TOKENS: u32 = 16384;
+const DEFAULT_FORWARD_TOKENS: u32 = 10240;
 #[cfg(not(feature = "rocm"))]
 const DEFAULT_FORWARD_TOKENS: u32 = 8192;
 
