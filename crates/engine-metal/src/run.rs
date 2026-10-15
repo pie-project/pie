@@ -164,6 +164,33 @@ pub struct Run<'c> {
 
     /// The chip profile and model facts this load's kernels run under.
     tuning: &'c kernels_metal::Tuning,
+
+    /// A routed MLP whose rows stay sorted from gate-up to the fold.
+    chain: std::cell::Cell<Option<Chain>>,
+
+    /// Per value, the nodes that read it, made on first ask.
+    readers: std::cell::OnceCell<Vec<Vec<u32>>>,
+}
+
+/// Where a routed MLP that keeps its rows sorted, as Splash's does, has got
+/// to: its gate-up left its rows in the routed stack's output, the swiglu
+/// moved them to its input, the down left its rows in the output for the
+/// fold. Each step runs only on the values the chain named when it began.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Chain {
+    step: ChainStep,
+    routes: ValueId,
+    packed: ValueId,
+    hidden: ValueId,
+    routed: ValueId,
+    padded: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChainStep {
+    GateUp,
+    Swiglu,
+    Down,
 }
 
 impl<'c> Run<'c> {
@@ -200,7 +227,151 @@ impl<'c> Run<'c> {
             scratch,
             ane: None,
             tuning,
+            chain: std::cell::Cell::new(None),
+            readers: std::cell::OnceCell::new(),
         }
+    }
+
+    /// The single node that reads `value`, if exactly one does.
+    fn sole_reader(&self, value: ValueId) -> Option<&'c Node> {
+        use poem_ir::Operands as _;
+        let readers = self.readers.get_or_init(|| {
+            let mut readers = vec![Vec::new(); self.values.len()];
+            let mut inputs = Vec::new();
+            for (at, node) in self.nodes.iter().enumerate() {
+                inputs.clear();
+                node.op.inputs(&mut inputs);
+                inputs.sort_unstable_by_key(|v| v.0);
+                inputs.dedup();
+                for input in &inputs {
+                    if let Some(list) = readers.get_mut(input.0 as usize) {
+                        list.push(at as u32);
+                    }
+                }
+            }
+            readers
+        });
+        match readers.get(value.0 as usize).map(Vec::as_slice) {
+            Some(&[only]) => self.nodes.get(only as usize),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn chain_clear(&self) {
+        self.chain.set(None);
+    }
+
+    /// How a batched routed matmul of `x` over `routes` into `y` stands in a
+    /// sorted chain: a gate-up whose output only a swiglu reads, whose output
+    /// only a down over the same routes reads, whose output only a fold
+    /// reads, starts one; that down continues it. Anything else runs as it
+    /// always has.
+    pub(crate) fn chain_select(
+        &self,
+        x: ValueId,
+        routes: ValueId,
+        y: ValueId,
+    ) -> kernels_metal::linear::moe::Sorted {
+        use kernels_metal::linear::moe::Sorted;
+        use poem_ir::{Linear, Operation};
+        if let Some(chain) = self.chain.get()
+            && chain.step == ChainStep::Swiglu
+            && chain.hidden == x
+            && chain.routes == routes
+            && chain.routed == y
+        {
+            self.chain.set(Some(Chain {
+                step: ChainStep::Down,
+                ..chain
+            }));
+            return Sorted {
+                input: true,
+                output: true,
+            };
+        }
+        self.chain.set(None);
+        let Some(Operation::Linear(Linear::MlpSwiglu {
+            packed, y: hidden, ..
+        })) = self.sole_reader(y).map(|n| &n.op)
+        else {
+            return Sorted::default();
+        };
+        let Some(Operation::Linear(Linear::MoeMatmulSelectQuant {
+            x: down_x,
+            routes: down_routes,
+            y: routed,
+            ..
+        })) = self.sole_reader(*hidden).map(|n| &n.op)
+        else {
+            return Sorted::default();
+        };
+        let Some(Operation::Linear(Linear::MoeWeightedSum { routed: folded, .. })) =
+            self.sole_reader(*routed).map(|n| &n.op)
+        else {
+            return Sorted::default();
+        };
+        if *packed != y || down_x != hidden || *down_routes != routes || folded != routed {
+            return Sorted::default();
+        }
+        let pairs = self.tensor(y).rows;
+        let Some((padded, _)) =
+            kernels_metal::linear::moe::sorted_stack(pairs, self.experts(routes), self.tuning)
+        else {
+            return Sorted::default();
+        };
+        self.chain.set(Some(Chain {
+            step: ChainStep::GateUp,
+            routes,
+            packed: y,
+            hidden: *hidden,
+            routed: *routed,
+            padded,
+        }));
+        Sorted {
+            input: false,
+            output: true,
+        }
+    }
+
+    /// The sorted gate-up rows and where their swiglu lands, when `packed`
+    /// is the chain's gate-up output.
+    pub(crate) fn chain_swiglu(
+        &self,
+        packed: ValueId,
+        hidden: ValueId,
+    ) -> Option<(Tensor, Tensor)> {
+        let chain = self.chain.get()?;
+        if chain.step != ChainStep::GateUp || chain.packed != packed || chain.hidden != hidden {
+            self.chain.set(None);
+            return None;
+        }
+        let scratch = self.routed_scratch()?;
+        let (up, inter) = (self.tensor(packed).width, self.tensor(hidden).width);
+        self.chain.set(Some(Chain {
+            step: ChainStep::Swiglu,
+            ..chain
+        }));
+        Some((
+            Tensor::new(scratch.y.buf, chain.padded, up, poem_ir::Dtype::Bf16),
+            Tensor::new(scratch.x.buf, chain.padded, inter, poem_ir::Dtype::Bf16),
+        ))
+    }
+
+    /// The sorted down rows, the route-to-row map and the fan-out, when
+    /// `routed` is the chain's down output; the chain ends here.
+    pub(crate) fn chain_combine(&self, routed: ValueId) -> Option<(Tensor, Tensor, u32)> {
+        let chain = self.chain.take()?;
+        if chain.step != ChainStep::Down || chain.routed != routed {
+            return None;
+        }
+        let scratch = self.routed_scratch()?;
+        let routes = self.tensor(chain.routes);
+        let width = self.tensor(routed).width;
+        Some((
+            Tensor::new(scratch.y.buf, chain.padded, width, poem_ir::Dtype::Bf16),
+            scratch.inv,
+            routes.width,
+        ))
     }
 
     pub(crate) fn tuning(&self) -> &'c kernels_metal::Tuning {
