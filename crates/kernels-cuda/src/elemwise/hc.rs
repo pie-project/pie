@@ -146,6 +146,14 @@ pub fn project(
         ));
     }
     let rows = nonzero(OP, "rows", mixes.rows)?;
+    // Four rows a block, a warp's mix columns every eighth (three of a
+    // layer's 24), the row's width cut into slices across blocks where the
+    // rows alone would leave the SMs idle (a decode fire). The kernel below
+    // read a row once a mix column and walked it alone (DeepSeek-V4-Flash:
+    // 8.3 s of a 32x4096 prefill, 3.3 ms a decode8 step).
+    if fan.is_multiple_of(4) && mix_hc <= 8 * PROJECT_COLS {
+        return project_split(ctx, OP, normed, hc_fn, mixes, rows, fan, mix_hc);
+    }
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::elemwise::hc_project<256>")
@@ -478,6 +486,77 @@ pub fn ple_gate(
             y.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, value.width)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+const PROJECT_ROWS: u32 = 4;
+const PROJECT_COLS: u32 = 3;
+
+/// `hc_project` on `hc_project_split` (and `hc_project_fold` past one slice).
+#[allow(clippy::too_many_arguments)]
+fn project_split(
+    ctx: &Ctx,
+    op: &'static str,
+    normed: Tensor,
+    hc_fn: Tensor,
+    mixes: &mut Tensor,
+    rows: u32,
+    fan: u32,
+    mix_hc: u32,
+) -> Result<(), Error> {
+    const SLICE_FLOOR: u32 = 1024;
+    let row_blocks = rows.div_ceil(PROJECT_ROWS);
+    let want = 2 * ctx.multiprocessors().unwrap_or(132);
+    let slices = want
+        .div_ceil(row_blocks)
+        .clamp(1, (fan / SLICE_FLOOR).max(1))
+        .min(16);
+    let slice = fan.div_ceil(slices).next_multiple_of(4);
+    let slices = fan.div_ceil(slice);
+    let out = if slices > 1 {
+        ctx.scratch(
+            op,
+            "elementwise.hc_project_partial",
+            (slices * rows * mix_hc) as usize * core::mem::size_of::<f32>(),
+        )? as usize as u64
+    } else {
+        mixes.ptr
+    };
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_project_split<{PROJECT_ROWS}, {PROJECT_COLS}>"
+            )),
+        )
+        .apply(Launch::grid([row_blocks, slices, 1], [BLOCK, 1, 1])),
+        &[
+            normed.arg(),
+            hc_fn.arg(),
+            crate::jit::ArgValue::Ptr(out),
+            stated(op, fan)?.arg(),
+            stated(op, mix_hc)?.arg(),
+            stated(op, rows)?.arg(),
+            stated(op, slice)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    if slices == 1 {
+        return Ok(());
+    }
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::elemwise::hc_project_fold")
+            .apply(Launch::flat(rows * mix_hc, BLOCK)),
+        &[
+            crate::jit::ArgValue::Ptr(out),
+            mixes.arg(),
+            stated(op, mix_hc)?.arg(),
+            stated(op, rows)?.arg(),
+            stated(op, slices)?.arg(),
             ctx.stage(),
         ],
     )

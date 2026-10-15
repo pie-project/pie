@@ -593,4 +593,105 @@ __global__ void ple_gate(
     }
 }
 
+// `hc_project` a block `kRows` rows and one of `gridDim.y` column slices: each
+// warp takes mix columns `warp`, `warp + 8`, ... (at most `kCols` of them),
+// its lanes walk the slice four floats at a time, a row read once for every
+// column and a column once for every row. One slice lands `mixes` itself;
+// several land `partial[slice][row][col]`, which `hc_project_fold` sums in
+// slice order.
+template <int kRows, int kCols>
+__global__ void __launch_bounds__(256) hc_project_split(
+    const float* __restrict__ normed,
+    const float* __restrict__ hc_fn,
+    float* __restrict__ out,
+    int fan_in,
+    int mix_hc,
+    int rows,
+    int slice,
+    const u32* __restrict__ win)
+{
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int n0 = static_cast<int>(blockIdx.x) * kRows;
+    const int live = win != nullptr ? min(static_cast<int>(win[0]), rows) : rows;
+    if (n0 >= live) return;
+    const int base = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const int d0 = static_cast<int>(blockIdx.y) * slice;
+    const int d1 = min(d0 + slice, fan_in);
+
+    const float4* xr[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r)
+        xr[r] = reinterpret_cast<const float4*>(
+            normed + static_cast<long long>(base + min(n0 + r, live - 1)) * fan_in);
+    const float4* wc[kCols];
+    bool on[kCols];
+#pragma unroll
+    for (int c = 0; c < kCols; ++c) {
+        const int o = warp + 8 * c;
+        on[c] = o < mix_hc;
+        wc[c] = reinterpret_cast<const float4*>(hc_fn + static_cast<long long>(on[c] ? o : 0) * fan_in);
+    }
+    float acc[kRows][kCols];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r)
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) acc[r][c] = 0.f;
+    for (int v = d0 / 4 + lane; v < d1 / 4; v += 32) {
+        float4 x[kRows];
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) x[r] = xr[r][v];
+#pragma unroll
+        for (int c = 0; c < kCols; ++c) {
+            if (!on[c]) continue;
+            const float4 w = wc[c][v];
+#pragma unroll
+            for (int r = 0; r < kRows; ++r)
+                acc[r][c] += x[r].x * w.x + x[r].y * w.y + x[r].z * w.z + x[r].w * w.w;
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+#pragma unroll
+        for (int r = 0; r < kRows; ++r)
+#pragma unroll
+            for (int c = 0; c < kCols; ++c)
+                acc[r][c] += __shfl_xor_sync(0xffffffffu, acc[r][c], off);
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const int n = n0 + r;
+            if (n >= live) break;
+#pragma unroll
+            for (int c = 0; c < kCols; ++c) {
+                if (!on[c]) continue;
+                const int o = warp + 8 * c;
+                if (gridDim.y == 1) {
+                    out[static_cast<long long>(base + n) * mix_hc + o] = acc[r][c];
+                } else {
+                    out[(static_cast<long long>(blockIdx.y) * rows + n) * mix_hc + o] = acc[r][c];
+                }
+            }
+        }
+    }
+}
+
+// The slices' partial projections summed in slice order into `mixes`.
+__global__ void hc_project_fold(
+    const float* __restrict__ partial,
+    float* __restrict__ mixes,
+    int mix_hc,
+    int rows,
+    int slices,
+    const u32* __restrict__ win)
+{
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int live = win != nullptr ? min(static_cast<int>(win[0]), rows) : rows;
+    if (i >= live * mix_hc) return;
+    const int base = win != nullptr ? static_cast<int>(win[1]) : 0;
+    float sum = 0.f;
+    for (int s = 0; s < slices; ++s) sum += partial[static_cast<long long>(s) * rows * mix_hc + i];
+    mixes[static_cast<long long>(base) * mix_hc + i] = sum;
+}
+
 }
