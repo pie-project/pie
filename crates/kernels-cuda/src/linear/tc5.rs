@@ -935,7 +935,7 @@ pub fn grouped_gemm_epi_with(
     let job = match g.groups {
         Groups::Contiguous { offsets, rows } => {
             let swap = plan.swap;
-            if swap && !matches!(kind, Kind::Mixed(_) | Kind::Nvf4) {
+            if swap && !matches!(kind, Kind::Mixed(_) | Kind::Mx | Kind::Nvf4) {
                 return Err(refuse(
                     OP,
                     "a contiguous group runs unswapped (a W4A16 or an NVFP4 one swapped too)",

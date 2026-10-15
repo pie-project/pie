@@ -347,6 +347,18 @@ fn plan_for(g: &Grouped, shape: [u32; 2], routed: u32) -> Plan {
     {
         plan.bn = bn;
     }
+    // `PIE_TC5_SWAP=1`: a contiguous launch swapped, the bank on P, the
+    // rows on 64-row Q tiles.
+    if let (Groups::Contiguous { .. }, Ok(swap)) = (g.groups, std::env::var("PIE_TC5_SWAP")) {
+        if swap == "1" {
+            plan.swap = true;
+            plan.bn = std::env::var("PIE_TC5_BN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64);
+            plan.splits = 1;
+        }
+    }
     if let (Groups::Contiguous { .. }, Ok(pair)) = (g.groups, std::env::var("PIE_TC5_PAIR")) {
         plan.pair = pair == "1";
         if plan.pair {
