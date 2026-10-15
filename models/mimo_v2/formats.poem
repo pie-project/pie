@@ -47,7 +47,7 @@ def huggingface(m, reads):
         reads.read(w.attn_norm, n("input_layernorm.weight"))
         reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
         qkv(m, reads, at, n("self_attn.qkv_proj.weight"))
-        o_proj(m, reads, at.o_proj, n("self_attn.o_proj.weight"))
+        reads.read(at.o_proj, n("self_attn.o_proj.weight"))
         if at.sinks != None:
             reads.read(at.sinks, n("self_attn.attention_sink_bias"))
         f = w.mlp
@@ -106,36 +106,6 @@ def qkv(m, reads, at, name):
     for g in range(kv):
         parts += [head((g // per_kv) * chunk + (per_q + per_kv) * qk + (g % per_kv) * vd, vd), pad(d - vd)]
     reads.push(tensor(at.qkv.name, concat(0, parts), encoding(at.qkv.dtype), shape = at.qkv.shape))
-
-# The most stretches one read of the padded output projection is cut into:
-# each row is two per head, so a wide projection is read a band of rows at
-# a time and the bands joined.
-STRETCHES = 1 << 19
-
-def o_proj(m, reads, w, name):
-    """The output projection's columns, each head's 128 then 128 of zeros."""
-    heads = m.q_heads
-    vd = m.v_head_dim
-    plain = encoding(w.dtype)
-    if stored(name) != plain:
-        fail("`{}` is stored {}, and its padded columns are read at {}".format(name, stored(name), plain))
-
-    def padded(rows, start):
-        held = src(name) if rows == m.hidden else src(name).slice(0, start, rows)
-        cols = held.transmute([rows, heads, vd], plain)
-        zeros = fill(0.0, [rows, heads, m.head_dim - vd], plain)
-        return concat(2, [cols, zeros]).transmute([rows, heads * m.head_dim], plain)
-
-    band = max(1, STRETCHES // (2 * heads))
-    if m.hidden <= band:
-        reads.read_expr(w, padded(m.hidden, 0))
-        return
-    bands = []
-    for start in range(0, m.hidden, band):
-        held = "{}.rows{}".format(w.name, start)
-        reads.push(tensor(held, padded(min(band, m.hidden - start), start), plain, internal = True))
-        bands.append(out(held))
-    reads.push(tensor(w.name, concat(0, bands), plain, shape = w.shape))
 
 def packed_bank(reads, w, stems):
     """A routed bank from MXFP4 legs: each `*.weight` a `[rows, cols/2]` u8

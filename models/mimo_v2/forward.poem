@@ -72,6 +72,9 @@ def forward(m, inputs):
             ])
         seam.at(seam.ATTN_OUT, [a])
 
+        # Each head's values are its first half; the padding after them is
+        # cut off before the output projection reads them.
+        a, _ = ops.layout.split_q_gate(a, m.v_head_dim)
         o = ops.linear.matmul(a, at.o_proj)
         adapted = fact.has(fact.Adapter)
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))

@@ -6,8 +6,8 @@
 #
 # The attention kernels read a head 64, 128, 256 or 512 wide, so every head
 # is read 256 wide: queries and keys zero past their 192, values past their
-# 128, and the output projection's columns zero against the padding. The
-# scale stays the 192-wide head's.
+# 128. The output projection reads each head's first 128 (its values), the
+# padding cut off ahead of it. The scale stays the 192-wide head's.
 
 load("//lib/adapters/model.poem", "banks")
 
@@ -65,6 +65,8 @@ def layout(id, deploy):
     if deploy.drafter != None:
         fail("{} drafts with nothing, not {}".format(id, deploy.drafter))
     d = DIMS[id]
+    if PADDED != 2 * d.v_head_dim:
+        fail("the output projection reads a padded head's first half, its values")
     weights, experts = deploy.weights
     dense = compute(weights)
     hidden = d.hidden
@@ -106,7 +108,7 @@ def layout(id, deploy):
                     [q_w, kv_w, kv_w],
                     heads = [d.q_heads, kv_heads, kv_heads],
                 ),
-                o_proj = weight(n("o_proj"), [hidden, q_w], weights).rows(),
+                o_proj = weight(n("o_proj"), [hidden, d.q_heads * d.v_head_dim], weights).rows(),
                 sinks = weight(n("attn_sinks"), [d.q_heads], dense).columns() if reading == WINDOWED else None,
                 kv = "kv.{}".format(l),
             ),
