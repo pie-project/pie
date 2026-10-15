@@ -7,10 +7,10 @@
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::act_quant::{self, AlphaFrom, Format, scales_to_atoms};
-use kernels_cuda::linear::mlp::swiglu;
+use kernels_cuda::linear::mlp::{swiglu, swiglu_clamp_routed};
 use kernels_cuda::linear::moe::{
-    ExpertTable, GluBank, GroupSeat, experts, matmul_select, matmul_select_quant, select_glu,
-    sigmoid_gate_add, weighted_sum,
+    ExpertTable, GluBank, GroupSeat, experts, experts_weighted_first, matmul_select,
+    matmul_select_quant, select_glu, sigmoid_gate_add, sum_add, weighted_sum,
 };
 use kernels_cuda::linear::tc5::{Elem, Glu, atom_bytes, supported};
 use kernels_cuda::tensor::Tensor;
@@ -674,6 +674,140 @@ fn check_w4a8(
     );
 }
 
+/// DeepSeek's W4A8 routed MLP kept by expert, against its four apart: the
+/// route weights scale the clamped GLU's rows before the down leg quantizes
+/// them (`mlp_swiglu_clamp_routed`), and the routes sum plainly with the
+/// shared row added (`moe_sum_add`). Held, as the plain W4A8 MLP is, no
+/// farther from the product of unquantized activations than the four apart.
+fn check_w4a8_weighted_first(
+    tokens: usize,
+    hidden: usize,
+    inter: usize,
+    n_experts: usize,
+    top: usize,
+) {
+    let limit = 7.0f32;
+    let mut gpu = Gpu::open();
+    let mut lcg = Lcg::seeded(0xd54 ^ tokens as u64);
+    let routes = routes_of(tokens, n_experts, top);
+    let count = routes.len();
+    let (x_raw, _) = lcg.row(tokens * hidden);
+    let (shared_raw, _) = lcg.row(tokens * hidden);
+    let weights: Vec<f32> = (0..count).map(|i| 0.1 + (i % 7) as f32 * 0.05).collect();
+    let x = Tensor::new(gpu.up(&x_raw), tokens as u32, hidden as u32, Dtype::Bf16);
+    let shared = Tensor::new(
+        gpu.up(&shared_raw),
+        tokens as u32,
+        hidden as u32,
+        Dtype::Bf16,
+    );
+    let routes_t = Tensor::new(gpu.up(&routes), tokens as u32, top as u32, Dtype::I32);
+    let weights_t = Tensor::new(gpu.up(&weights), tokens as u32, top as u32, Dtype::F32);
+    let (up, up16) = w4a8_bank(&mut gpu, n_experts, 2 * inter, hidden, 0x81);
+    let (down, down16) = w4a8_bank(&mut gpu, n_experts, hidden, inter, 0x82);
+    let ctx = gpu.ctx().with_tuning(crate::common::SM100);
+    let bf = |gpu: &mut Gpu, rows: usize, n: usize| {
+        Tensor::new(gpu.zeros(rows * n * 2), rows as u32, n as u32, Dtype::Bf16)
+    };
+    // The four apart, at W4A8 (`a8`) or with unquantized activations.
+    let apart = |ctx: &kernels_cuda::Ctx, gpu: &mut Gpu, a8: bool| {
+        let select =
+            |ctx: &kernels_cuda::Ctx, gpu: &mut Gpu, x: Tensor, bank: GluBank, n: usize| {
+                let mut y = bf(gpu, count, n);
+                match bank {
+                    GluBank::Mxfp4A8 { codes, atoms } => act_quant::select(
+                        ctx,
+                        "test.w4a8_apart",
+                        Format::E4m3 { gran: 128 },
+                        x,
+                        routes_t,
+                        None,
+                        act_quant::Bank {
+                            codes: codes.ptr,
+                            atoms: atoms.ptr,
+                            experts: n_experts as u32,
+                            n: n as u32,
+                            k: x.width,
+                            elem: Elem::E2m1,
+                            gran: 32,
+                            alpha_e: 0,
+                            alpha_from: None,
+                        },
+                        &mut y,
+                    )
+                    .expect("the select fires"),
+                    GluBank::Mxfp4 { codes, scales, .. } => matmul_select_quant(
+                        ctx,
+                        x,
+                        codes,
+                        scales,
+                        None,
+                        routes_t,
+                        &mut y,
+                        GroupSeat::RESIDENT,
+                    )
+                    .expect("the select fires"),
+                    _ => unreachable!(),
+                }
+                y
+            };
+        let (u, d) = if a8 { (up, down) } else { (up16, down16) };
+        let packed = select(ctx, gpu, x, u, 2 * inter);
+        let mut h = bf(gpu, count, inter);
+        swiglu_clamp_routed(ctx, packed, inter as u32, weights_t, 1, limit, &mut h)
+            .expect("the GLU fires");
+        let r = select(ctx, gpu, h, d, hidden);
+        let mut y = bf(gpu, tokens, hidden);
+        sum_add(ctx, r, shared, &mut y).expect("the sum fires");
+        y
+    };
+    let apart8 = apart(&ctx, &mut gpu, true);
+    let exact = apart(&ctx, &mut gpu, false);
+    let mut kept = bf(&mut gpu, tokens, hidden);
+    let took = experts_weighted_first(
+        &ctx,
+        x,
+        up,
+        Glu::SwigluClamp { limit },
+        down,
+        routes_t,
+        weights_t,
+        inter as u32,
+        shared,
+        &mut kept,
+    )
+    .expect("the routed MLP fires");
+    assert!(
+        took,
+        "the grouped GEMM takes a {tokens}-token DeepSeek W4A8 fire"
+    );
+    gpu.sync();
+    let exact: Vec<u16> = gpu.down(exact.ptr, tokens * hidden);
+    let distance = |y: &[u16]| -> f64 {
+        let scale = exact
+            .iter()
+            .map(|w| f64::from(from_bf16(*w)).abs())
+            .sum::<f64>()
+            / exact.len() as f64;
+        y.iter()
+            .zip(&exact)
+            .map(|(g, w)| f64::from(from_bf16(*g) - from_bf16(*w)).abs())
+            .sum::<f64>()
+            / exact.len() as f64
+            / scale
+    };
+    let apart_d = distance(&gpu.down::<u16>(apart8.ptr, tokens * hidden));
+    let kept_d = distance(&gpu.down::<u16>(kept.ptr, tokens * hidden));
+    assert!(
+        apart_d > 0.0 && apart_d < 0.1,
+        "{tokens} tokens: the four apart sit {apart_d:.4} from the unquantized product"
+    );
+    assert!(
+        kept_d <= 1.1 * apart_d,
+        "{tokens} tokens: kept by expert {kept_d:.4} from the unquantized product, apart {apart_d:.4}"
+    );
+}
+
 #[test]
 fn the_routed_mlp_keeps_its_rows_by_expert_every_case() {
     if !supported() {
@@ -705,4 +839,8 @@ fn the_routed_mlp_keeps_its_rows_by_expert_every_case() {
         check_w4a8(64, 512, 256, 64, 10, gated);
         check_w4a8(300, 256, 128, 16, 4, gated);
     }
+    // DeepSeek's W4A8 (its weights before the down leg, a plain sum and the
+    // shared row): its decode64 fire (64 tokens at top 6) and a prefill.
+    check_w4a8_weighted_first(64, 512, 256, 64, 6);
+    check_w4a8_weighted_first(300, 256, 128, 16, 4);
 }

@@ -726,6 +726,50 @@ fn moe_experts() -> Rule {
             }
         }
     }
+    // DeepSeek's W4A8 MLP: its route weights scale the clamped GLU's rows
+    // before the down leg quantizes them, and the routes are summed plainly
+    // with the shared expert's row added.
+    alternatives.push(template(|p| {
+        let x = p.rows("x", W);
+        let routes = p.value(
+            "routes",
+            Ty::Tensor {
+                shape: vec![Dim::Tokens, Dim::Const(W)],
+                dtype: Dtype::I32,
+            },
+        );
+        let top_k = p.u32("top_k");
+        let packed = linear::moe_matmul_select_quant(
+            &x,
+            &p.weight_at("bank", [W, W, W], W4A8),
+            &routes,
+            top_k,
+        );
+        p.name("packed", &packed);
+        let weights = p.value(
+            "weights",
+            Ty::Tensor {
+                shape: vec![Dim::Tokens, Dim::Const(W)],
+                dtype: Dtype::F32,
+            },
+        );
+        let hidden = linear::mlp_swiglu_clamp_routed(
+            &packed,
+            p.u32("intermediate"),
+            &weights,
+            p.f32("limit"),
+        );
+        p.name("hidden", &hidden);
+        let routed = linear::moe_matmul_select_quant(
+            &hidden,
+            &p.weight_at("down", [W, W, W], W4A8),
+            &routes,
+            top_k,
+        );
+        p.name("routed", &routed);
+        let y = linear::moe_sum_add(&routed, &p.rows("shared", W));
+        p.export("y", &y);
+    }));
     Rule::new("linear.moe_experts", alternatives, |m| {
         let linear_op = |name| match m.op(name) {
             Operation::Linear(op) => Box::new(op.clone()),

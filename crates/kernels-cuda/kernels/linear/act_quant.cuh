@@ -729,15 +729,20 @@ __global__ void route_weighted_gather_vec8(
         if (o < 0) continue;
         const uint4 w = *reinterpret_cast<const uint4*>(grouped + static_cast<long long>(o) * n + h0);
         const bf16* v8 = reinterpret_cast<const bf16*>(&w);
-        const float wr = weights[base + j];
+        // No weights: the routes already carry theirs (DeepSeek's, before
+        // the down leg), and moe_sum_add sums them as they are.
+        const float wr = weights != nullptr ? weights[base + j] : 1.f;
 #pragma unroll
         for (int i = 0; i < 8; ++i) acc[i] += wr * bf16_to_f32(v8[i]);
     }
     // Qwen's shared expert under its sigmoid gate, as moe_sigmoid_gate_add
-    // adds it.
+    // adds it; with no gate, the shared row added as it is (moe_sum_add).
     if (shared != nullptr) {
-        const float gv = bf16_to_f32(gate[static_cast<long long>(plane) * gate_pitch]);
-        const float s = 1.f / (1.f + __expf(-gv));
+        float s = 1.f;
+        if (gate != nullptr) {
+            const float gv = bf16_to_f32(gate[static_cast<long long>(plane) * gate_pitch]);
+            s = 1.f / (1.f + __expf(-gv));
+        }
         const uint4 sv = *reinterpret_cast<const uint4*>(shared + static_cast<long long>(plane) * n + h0);
         const bf16* s8 = reinterpret_cast<const bf16*>(&sv);
 #pragma unroll
@@ -748,6 +753,20 @@ __global__ void route_weighted_gather_vec8(
 #pragma unroll
     for (int i = 0; i < 8; ++i) o8[i] = f32_to_bf16(acc[i]);
     *reinterpret_cast<uint4*>(y + static_cast<long long>(plane) * n + h0) = out;
+}
+
+// `out[pos[r]] = v[r]`: a route-order f32 a route landed at its grouped row
+// (a dropped route nowhere).
+__global__ void route_scatter_f32(
+    const float* __restrict__ v,
+    const i32* __restrict__ pos,
+    float* __restrict__ out,
+    int count)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= count) return;
+    const int o = pos[r];
+    if (o >= 0) out[o] = v[r];
 }
 
 // `grouped[pos[r]] = x[r / div]`, 16 bytes a thread; a dropped route lands

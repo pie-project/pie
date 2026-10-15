@@ -433,16 +433,19 @@ impl Operands for Fused {
             }
             Self::MoeExperts {
                 select,
+                glu,
                 down,
                 sum,
                 gate_add,
-                ..
             } => {
                 // The select's (x, bank, its bias, routes, its input scales),
-                // the sum's weights, then the down bank and its bias or input
+                // the route weights (the sum's, or the GLU's that weighs its
+                // rows first), then the down bank and its bias or input
                 // scales.
                 select.inputs(sink);
                 if let Linear::MoeWeightedSum { weights, .. } = **sum {
+                    sink.push(weights);
+                } else if let Linear::MlpSwigluClampRouted { weights, .. } = **glu {
                     sink.push(weights);
                 }
                 match **down {
@@ -459,9 +462,13 @@ impl Operands for Fused {
                     }
                     _ => {}
                 }
-                // Then the gated shared expert's row and its gate.
+                // Then the gated shared expert's row and its gate, or the
+                // shared row a plain sum adds.
                 if let Some(Linear::MoeSigmoidGateAdd { shared, gate, .. }) = gate_add.as_deref() {
                     sink.extend([*shared, *gate]);
+                }
+                if let Linear::MoeSumAdd { shared, .. } = **sum {
+                    sink.push(shared);
                 }
             }
             Self::QkvFusedQknormRopeVnormWrite {

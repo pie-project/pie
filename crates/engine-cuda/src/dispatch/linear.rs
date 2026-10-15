@@ -1064,6 +1064,55 @@ impl Run<'_> {
         if !self.ctx().tuning().moe_tc5 || !linear::tc5::supported() {
             return Ok(false);
         }
+        // DeepSeek's form: the route weights scale the GLU's rows before the
+        // down leg, and the routes sum plainly with the shared row added.
+        if let (
+            Linear::MlpSwigluClampRouted {
+                packed,
+                intermediate,
+                weights,
+                limit,
+                y: hidden,
+            },
+            Linear::MoeSumAdd {
+                routed: summed,
+                shared,
+                y,
+            },
+        ) = (glu, sum)
+        {
+            let (packed, intermediate, weights, limit, hidden) =
+                (*packed, *intermediate, *weights, *limit, *hidden);
+            let (summed, shared, y) = (*summed, *shared, *y);
+            if gate_add.is_some() {
+                return Ok(false);
+            }
+            let (Some((x, routes, up_y, up, _)), Some((down_x, down_routes, down_y, down, _))) =
+                (self.routed_bank(select), self.routed_bank(down))
+            else {
+                return Ok(false);
+            };
+            if up_y != packed || down_x != hidden || down_routes != routes || down_y != summed {
+                return Ok(false);
+            }
+            let x = self.tensor(x);
+            let routes = self.tensor(routes);
+            let weights = self.tensor(weights);
+            let shared = self.tensor(shared);
+            let mut out = self.tensor(y);
+            return linear::moe::experts_weighted_first(
+                self.ctx(),
+                x,
+                up,
+                Glu::SwigluClamp { limit },
+                down,
+                routes,
+                weights,
+                intermediate,
+                shared,
+                &mut out,
+            );
+        }
         let (packed, hidden, intermediate, glu) = match *glu {
             Linear::MlpSwiglu {
                 packed,

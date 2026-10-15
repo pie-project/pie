@@ -775,6 +775,75 @@ pub(crate) fn weighted_gather(
     )
 }
 
+/// `y[t] = shared[t] + sum_j grouped[pos[t * top + j]]`, in f32 and in `j`
+/// order, rounded once: `moe_sum_add` of the grouped product gathered back
+/// (its routes already weighted), read where it lies.
+pub(crate) fn sum_gather(
+    ctx: &Ctx,
+    op: &'static str,
+    grouped: u64,
+    pos: u64,
+    top: u32,
+    shared: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let (tokens, n) = (y.rows, y.width);
+    if !n.is_multiple_of(8)
+        || !grouped.is_multiple_of(16)
+        || !y.ptr.is_multiple_of(16)
+        || !shared.ptr.is_multiple_of(16)
+        || (shared.rows, shared.width) != (tokens, n)
+    {
+        return Err(refuse(
+            op,
+            format!("a summed gather of {n}-wide rows in 16-byte runs"),
+        ));
+    }
+    let int = |v: u32| stated(op, v).map(|v| v.arg());
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::route_weighted_gather_vec8").apply(Launch::grid(
+            [tokens, (n / 8).div_ceil(BLOCK), 1],
+            [BLOCK, 1, 1],
+        )),
+        &[
+            ArgValue::Ptr(grouped),
+            ArgValue::Ptr(pos),
+            ArgValue::Ptr(0),
+            shared.arg(),
+            ArgValue::Ptr(0),
+            int(0)?,
+            y.arg(),
+            int(n)?,
+            int(top)?,
+            ctx.stage(),
+        ],
+    )
+}
+
+/// `out[pos[r]] = v[r]` for each of `count` routes: a route-order f32 a
+/// route (its weight, say) landed at its row of the layout.
+pub(crate) fn scatter_f32(
+    ctx: &Ctx,
+    op: &'static str,
+    v: u64,
+    pos: u64,
+    count: u32,
+    out: u64,
+) -> Result<(), Error> {
+    let int = |x: u32| stated(op, x).map(|x| x.arg());
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::route_scatter_f32").apply(Launch::flat(count, BLOCK)),
+        &[
+            ArgValue::Ptr(v),
+            ArgValue::Ptr(pos),
+            ArgValue::Ptr(out),
+            int(count)?,
+        ],
+    )
+}
+
 /// `grouped[pos[r]] = x[r / div]` for each of `count` routes (a dropped one
 /// lands nowhere): bf16 activations in the layout's rows.
 pub(crate) fn scatter_rows(

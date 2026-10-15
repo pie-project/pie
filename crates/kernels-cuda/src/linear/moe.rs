@@ -1119,6 +1119,83 @@ fn experts_w4a8(
     y: &mut Tensor,
     gate: Option<(Tensor, Tensor)>,
 ) -> Result<bool, Error> {
+    experts_w4a8_as(
+        ctx,
+        x,
+        up,
+        glu,
+        down,
+        routes,
+        weights,
+        inter,
+        y,
+        W4a8Sum::Weighted(gate),
+    )
+}
+
+/// How a W4A8 routed MLP's routes fold into a token's row.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+enum W4a8Sum {
+    /// Each route under its weight (`moe_weighted_sum`), under a gate plus
+    /// the shared row at its sigmoid.
+    Weighted(Option<(Tensor, Tensor)>),
+    /// Each route under its weight before the down leg (the GLU's rows
+    /// scaled before they quantize), then summed plainly and the shared row
+    /// added (`moe_sum_add`): DeepSeek's.
+    WeightedFirst(Tensor),
+}
+
+/// [`experts`]' W4A8 routed MLP the DeepSeek way: the route weights scale the
+/// GLU's rows before they quantize for the down leg
+/// (`mlp_swiglu_clamp_routed`), and the routes are summed plainly with the
+/// shared row added (`moe_sum_add`). `Ok(false)` where the grouped GEMM does
+/// not take it: the caller runs the four apart.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn experts_weighted_first(
+    ctx: &Ctx,
+    x: Tensor,
+    up: GluBank,
+    glu: crate::linear::tc5::Glu,
+    down: GluBank,
+    routes: Tensor,
+    weights: Tensor,
+    inter: u32,
+    shared: Tensor,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    if shared.dtype != Dtype::Bf16 || shared.rows != y.rows || shared.width != y.width {
+        return Ok(false);
+    }
+    experts_w4a8_as(
+        ctx,
+        x,
+        up,
+        glu,
+        down,
+        routes,
+        weights,
+        inter,
+        y,
+        W4a8Sum::WeightedFirst(shared),
+    )
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn experts_w4a8_as(
+    ctx: &Ctx,
+    x: Tensor,
+    up: GluBank,
+    glu: crate::linear::tc5::Glu,
+    down: GluBank,
+    routes: Tensor,
+    weights: Tensor,
+    inter: u32,
+    y: &mut Tensor,
+    sum: W4a8Sum,
+) -> Result<bool, Error> {
     use crate::linear::{act_quant, tc5};
     const OP: &str = "linear.moe_experts";
     const W4A8_X: &str = "linear.moe_tc5_x8";
@@ -1126,6 +1203,7 @@ fn experts_w4a8(
     const W4A8_H: &str = "linear.moe_tc5_h8";
     const W4A8_HS: &str = "linear.moe_tc5_h8_atoms";
     const W4A8_Y: &str = "linear.moe_tc5_y";
+    const ROW_WEIGHTS: &str = "linear.moe_tc5_row_weights";
     const GRAN: u32 = 128;
     let (
         GluBank::Mxfp4A8 {
@@ -1144,9 +1222,13 @@ fn experts_w4a8(
     let count = tokens * routes.width;
     let experts = up_codes.rows;
     let (k, n) = (x.width, y.width);
+    let glu_taken = match sum {
+        W4a8Sum::Weighted(_) => matches!(glu, tc5::Glu::Swiglu),
+        W4a8Sum::WeightedFirst(_) => matches!(glu, tc5::Glu::Swiglu | tc5::Glu::SwigluClamp { .. }),
+    };
     if count <= act_quant::MASKED_FIRE
         || tokens < ctx.tuning().moe_w4a8_fused_from
-        || !matches!(glu, tc5::Glu::Swiglu)
+        || !glu_taken
         || !ctx.tuning().moe_tc5
         || !tc5::supported()
         || x.dtype != Dtype::Bf16
@@ -1192,6 +1274,15 @@ fn experts_w4a8(
             W4A8_HS,
             tc5::atom_bytes(rows, inter as usize, GRAN as usize),
         )? as u64;
+        // DeepSeek's weights scale the GLU's rows, each at its grouped row.
+        let row_scale = match sum {
+            W4a8Sum::Weighted(_) => 0,
+            W4a8Sum::WeightedFirst(_) => {
+                let at = ctx.scratch_stream(OP, ROW_WEIGHTS, rows * 4)? as u64;
+                act_quant::scatter_f32(ctx, OP, weights.ptr, layout.pos, count, at)?;
+                at
+            }
+        };
         let grouped = tc5::Grouped {
             experts,
             groups: layout.groups,
@@ -1211,6 +1302,7 @@ fn experts_w4a8(
                     data: hq,
                     scales: hs,
                 },
+                row_scale,
                 live_rows: layout.live_rows(),
                 ..tc5::Epilogue::STORE
             },
@@ -1231,7 +1323,14 @@ fn experts_w4a8(
             },
             count,
         )?;
-        act_quant::weighted_gather(ctx, OP, ys, layout.pos, weights, gate, y)
+        match sum {
+            W4a8Sum::Weighted(gate) => {
+                act_quant::weighted_gather(ctx, OP, ys, layout.pos, weights, gate, y)
+            }
+            W4a8Sum::WeightedFirst(shared) => {
+                act_quant::sum_gather(ctx, OP, ys, layout.pos, routes.width, shared, y)
+            }
+        }
     };
     // A tcgen05 launch that fails leaves the four to run apart.
     Ok(run().is_ok())
