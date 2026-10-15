@@ -1867,6 +1867,28 @@ fn bench_moe_prefill_vs_dense() {
             n * k,
             Dtype::Bf16,
         );
+        // Random weights, not the allocation's zeros: a matrix core fed
+        // zeros draws far less power and clocks higher than real data lets
+        // it (hipBLASLt read 772 TFLOP/s on zeros, 636 on random values).
+        {
+            const CHUNK: usize = 16 << 20;
+            let block = gpu.tensor(&bf16s(CHUNK / 2, 9, 0.1), 1, (CHUNK / 2) as u32, Dtype::Bf16);
+            let mut at = 0usize;
+            while at < bytes as usize {
+                let len = CHUNK.min(bytes as usize - at);
+                // SAFETY: both ranges are live device allocations of at least `len` bytes.
+                unsafe {
+                    hip::rt::hipMemcpy(
+                        (bank.ptr as usize + at) as *mut _,
+                        block.ptr as usize as *const _,
+                        len,
+                        hip::rt::hipMemcpyDeviceToDevice,
+                    );
+                }
+                at += len;
+            }
+            gpu.sync();
+        }
         let flops = 2.0 * (tokens * top_k) as f64 * f64::from(n) * f64::from(k);
         let ctx = gpu.ctx();
         let us = gpu.time(6, || {
