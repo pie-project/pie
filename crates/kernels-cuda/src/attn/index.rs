@@ -262,8 +262,7 @@ pub fn topk(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entry))
-            .apply(Launch::per_row(selection.rows, K_BLOCK).smem(smem)),
+        Fire::at(FILE, symbol(&entry)).apply(Launch::per_row(selection.rows, K_BLOCK).smem(smem)),
         &[
             q.data.arg(),
             ArgValue::Ptr(weights.map_or(0, |w| w.ptr)),

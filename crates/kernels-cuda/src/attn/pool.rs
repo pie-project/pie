@@ -2,7 +2,9 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::kv;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, symbol};
+use crate::jit::{
+    Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, symbol,
+};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const FILE: &str = "attn/pool.cuh";
@@ -308,8 +310,20 @@ pub fn attention_lse(
 
     if pool_mma_takes(ctx, head_dim) {
         return pool_mma(
-            ctx, OP, q, positions, request_of_token, None, entries, ratio, 0,
-            num_q_heads, head_dim, sm_scale, o, lse,
+            ctx,
+            OP,
+            q,
+            positions,
+            request_of_token,
+            None,
+            entries,
+            ratio,
+            0,
+            num_q_heads,
+            head_dim,
+            sm_scale,
+            o,
+            lse,
         );
     }
 
@@ -412,8 +426,20 @@ pub fn attention_lse_selected(
 
     if pool_mma_takes(ctx, head_dim) {
         return pool_mma(
-            ctx, OP, q, positions, request_of_token, Some(selection), entries, ratio, top_k,
-            num_q_heads, head_dim, sm_scale, o, lse,
+            ctx,
+            OP,
+            q,
+            positions,
+            request_of_token,
+            Some(selection),
+            entries,
+            ratio,
+            top_k,
+            num_q_heads,
+            head_dim,
+            sm_scale,
+            o,
+            lse,
         );
     }
 
@@ -485,11 +511,16 @@ fn pool_mma(
         op,
         Fire::at(
             "attn/pool_mma.cuh",
-            symbol(&format!("::pie::attn::pool_mma::pool_lse_mma<{d}, {selected}>")),
+            symbol(&format!(
+                "::pie::attn::pool_mma::pool_lse_mma<{d}, {selected}>"
+            )),
         )
         .apply(
-            Launch::grid([o.rows, num_q_heads.unsigned_abs().div_ceil(HEADS), 1], [WARPS * 32, 1, 1])
-                .smem(smem),
+            Launch::grid(
+                [o.rows, num_q_heads.unsigned_abs().div_ceil(HEADS), 1],
+                [WARPS * 32, 1, 1],
+            )
+            .smem(smem),
         ),
         &[
             q.arg(),

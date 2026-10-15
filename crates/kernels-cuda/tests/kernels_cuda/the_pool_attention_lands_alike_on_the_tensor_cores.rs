@@ -13,7 +13,14 @@ use kernels_cuda::tuning::Tuning;
 
 const PAGE: usize = 64;
 
-fn pool_of(gpu: &mut Gpu, keys: u64, cells: usize, d: usize, pages: &[u32], indptr: &[u32]) -> KvPool {
+fn pool_of(
+    gpu: &mut Gpu,
+    keys: u64,
+    cells: usize,
+    d: usize,
+    pages: &[u32],
+    indptr: &[u32],
+) -> KvPool {
     KvPool {
         keys: Tensor::new(keys, cells as u32, d as u32, Dtype::Bf16),
         values: Tensor::ABSENT,
@@ -45,7 +52,13 @@ fn check(heads: usize, d: usize, ratio: usize, top_k: usize, selected: bool) {
     let span = 2304usize;
     let per_req = span / PAGE;
     let pages: Vec<u32> = (0..2 * per_req as u32)
-        .map(|i| if i < per_req as u32 { 2 * i } else { 2 * (i - per_req as u32) + 1 })
+        .map(|i| {
+            if i < per_req as u32 {
+                2 * i
+            } else {
+                2 * (i - per_req as u32) + 1
+            }
+        })
         .collect();
     let indptr: Vec<u32> = vec![0, per_req as u32, 2 * per_req as u32];
     let cells = 2 * per_req * PAGE;
@@ -77,7 +90,12 @@ fn check(heads: usize, d: usize, ratio: usize, top_k: usize, selected: bool) {
     }
 
     let mut gpu = Gpu::open();
-    let q = Tensor::new(gpu.up(&q_bits), rows as u32, (heads * d) as u32, Dtype::Bf16);
+    let q = Tensor::new(
+        gpu.up(&q_bits),
+        rows as u32,
+        (heads * d) as u32,
+        Dtype::Bf16,
+    );
     let keys = gpu.up(&k_bits);
     let pos_t = Tensor::new(gpu.up(&positions), rows as u32, 1, Dtype::I32);
     let req_t = Tensor::new(gpu.up(&reqs), rows as u32, 1, Dtype::I32);
@@ -96,29 +114,64 @@ fn check(heads: usize, d: usize, ratio: usize, top_k: usize, selected: bool) {
         });
         if selected {
             pool::attention_lse_selected(
-                &ctx, q, pos_t, req_t, sel_t, &pool_t, ratio as u32, top_k as u32,
-                heads as u32, d as u32, scale, &mut o, &mut lse,
+                &ctx,
+                q,
+                pos_t,
+                req_t,
+                sel_t,
+                &pool_t,
+                ratio as u32,
+                top_k as u32,
+                heads as u32,
+                d as u32,
+                scale,
+                &mut o,
+                &mut lse,
             )
             .expect("the selected pool attention fires");
         } else {
             pool::attention_lse(
-                &ctx, q, pos_t, req_t, &pool_t, ratio as u32, heads as u32, d as u32, scale,
-                &mut o, &mut lse,
+                &ctx,
+                q,
+                pos_t,
+                req_t,
+                &pool_t,
+                ratio as u32,
+                heads as u32,
+                d as u32,
+                scale,
+                &mut o,
+                &mut lse,
             )
             .expect("the pool attention fires");
         }
         gpu.sync();
-        (gpu.down(o_at, rows * heads * d), gpu.down(lse_at, rows * heads))
+        (
+            gpu.down(o_at, rows * heads * d),
+            gpu.down(lse_at, rows * heads),
+        )
     };
     let (o_ref, lse_ref) = run(&mut gpu, false);
     let (o_mma, lse_mma) = run(&mut gpu, true);
     let label = format!("{heads} heads at {d}, ratio {ratio}, selected {selected}");
-    assert!(o_ref.iter().any(|&b| b != 0), "{label}: the scalar walk landed rows");
+    assert!(
+        o_ref.iter().any(|&b| b != 0),
+        "{label}: the scalar walk landed rows"
+    );
     for (i, (&a, &b)) in lse_ref.iter().zip(&lse_mma).enumerate() {
         if a.is_infinite() || b.is_infinite() {
-            assert_eq!(a, b, "{label}: row {} head {} log-sum-exp", i / heads, i % heads);
+            assert_eq!(
+                a,
+                b,
+                "{label}: row {} head {} log-sum-exp",
+                i / heads,
+                i % heads
+            );
         } else {
-            assert!((a - b).abs() <= 2e-2 * a.abs().max(1.0), "{label}: lse {i}: {a} vs {b}");
+            assert!(
+                (a - b).abs() <= 2e-2 * a.abs().max(1.0),
+                "{label}: lse {i}: {a} vs {b}"
+            );
         }
     }
     let mut worst = 0f32;
@@ -126,7 +179,10 @@ fn check(heads: usize, d: usize, ratio: usize, top_k: usize, selected: bool) {
         let (a, b) = (from_bf16(a), from_bf16(b));
         worst = worst.max((a - b).abs() / a.abs().max(0.05));
     }
-    assert!(worst <= 3e-2, "{label}: an output element differs by {worst} relative");
+    assert!(
+        worst <= 3e-2,
+        "{label}: an output element differs by {worst} relative"
+    );
 }
 
 #[test]

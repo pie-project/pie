@@ -20,11 +20,17 @@ fn the_sqrt_softplus_router_picks_the_best_experts() {
         for e in 0..experts {
             // A permutation of evenly spaced values, a few planted ties.
             let slot = (e * 97 + r * 31) % experts;
-            let v = if r % 3 == 0 && e % 50 == 7 { 2.5 } else { -4.0 + 0.03 * slot as f32 };
+            let v = if r % 3 == 0 && e % 50 == 7 {
+                2.5
+            } else {
+                -4.0 + 0.03 * slot as f32
+            };
             logits.push(to_bf16(v));
         }
     }
-    let bias: Vec<f32> = (0..experts).map(|e| if e % 5 == 0 { 0.0 } else { -0.001 }).collect();
+    let bias: Vec<f32> = (0..experts)
+        .map(|e| if e % 5 == 0 { 0.0 } else { -0.001 })
+        .collect();
     let mut gpu = Gpu::open();
     let l_at = gpu.up(&logits);
     let b_at = gpu.up(&bias);
@@ -51,7 +57,9 @@ fn the_sqrt_softplus_router_picks_the_best_experts() {
         s.max(0.0).sqrt()
     };
     for r in 0..rows {
-        let orig: Vec<f32> = (0..experts).map(|e| sp(from_bf16(logits[r * experts + e]))).collect();
+        let orig: Vec<f32> = (0..experts)
+            .map(|e| sp(from_bf16(logits[r * experts + e])))
+            .collect();
         let mut scores: Vec<f32> = (0..experts).map(|e| orig[e] + bias[e]).collect();
         let mut want_i = Vec::new();
         let mut want_w = Vec::new();
@@ -67,8 +75,16 @@ fn the_sqrt_softplus_router_picks_the_best_experts() {
             scores[best.0 as usize] = f32::MIN;
         }
         let sum: f32 = want_w.iter().sum();
-        let scale = if renorm && sum > 0.0 { scaling / sum } else { scaling };
-        assert_eq!(&got_i[r * k..(r + 1) * k], &want_i[..], "row {r}: the picked experts");
+        let scale = if renorm && sum > 0.0 {
+            scaling / sum
+        } else {
+            scaling
+        };
+        assert_eq!(
+            &got_i[r * k..(r + 1) * k],
+            &want_i[..],
+            "row {r}: the picked experts"
+        );
         for j in 0..k {
             let want = want_w[j] * scale;
             assert!(

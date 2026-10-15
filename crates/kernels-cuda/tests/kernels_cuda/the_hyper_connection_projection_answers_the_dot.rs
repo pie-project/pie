@@ -140,7 +140,9 @@ fn the_hyper_connection_gates_answer_the_host_walk() {
     let sig = |v: f32| 1.0 / (1.0 + (-v).exp());
     for r in 0..rows {
         let row = &mixes[r * mix_hc..][..mix_hc];
-        let pre: Vec<f32> = (0..m).map(|i| sig(row[i] * scale[0] + base[i]) + eps).collect();
+        let pre: Vec<f32> = (0..m)
+            .map(|i| sig(row[i] * scale[0] + base[i]) + eps)
+            .collect();
         for i in 0..m {
             let want = sig(row[m + i] * scale[1] + base[m + i]) * alpha;
             assert!((gp[r * m + i] - want).abs() <= 1e-5, "row {r} post {i}");

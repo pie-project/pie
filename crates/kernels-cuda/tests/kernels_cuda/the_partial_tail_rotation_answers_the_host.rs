@@ -44,7 +44,11 @@ fn check(interleaved: bool, inverse: bool, yarn: bool) {
         for h in 0..heads {
             let base = (r * heads + h) * d;
             for i in 0..d - rot {
-                assert_eq!(got[base + i], x[base + i], "row {r} head {h}: dim {i} is not the tail's");
+                assert_eq!(
+                    got[base + i],
+                    x[base + i],
+                    "row {r} head {h}: dim {i} is not the tail's"
+                );
             }
             if yarn {
                 continue; // The scaled angles are the kernel's own ramp; the head's bulk stays put.
@@ -58,9 +62,15 @@ fn check(interleaved: bool, inverse: bool, yarn: bool) {
                 } else {
                     (d - rot + p, d - rot + p + half)
                 };
-                let (a, b) = (f64::from(from_bf16(x[base + i])), f64::from(from_bf16(x[base + j])));
+                let (a, b) = (
+                    f64::from(from_bf16(x[base + i])),
+                    f64::from(from_bf16(x[base + j])),
+                );
                 let (wi, wj) = (a * c - b * s, b * c + a * s);
-                let (gi, gj) = (f64::from(from_bf16(got[base + i])), f64::from(from_bf16(got[base + j])));
+                let (gi, gj) = (
+                    f64::from(from_bf16(got[base + i])),
+                    f64::from(from_bf16(got[base + j])),
+                );
                 assert!(
                     (gi - wi).abs() <= 2e-2 && (gj - wj).abs() <= 2e-2,
                     "row {r} head {h} pair {p}: ({gi}, {gj}) vs ({wi}, {wj})"

@@ -85,7 +85,10 @@ pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Resu
     // serial ones (DeepSeek-V4-Flash decode8: 28 us a call).
     let vec8 = y.width.is_multiple_of(8) && streams.ptr % 16 == 0 && y.ptr % 16 == 0;
     let (entry, block) = if vec8 {
-        ("::pie::elemwise::hc_rmsnorm_f32_vec8<::pie::bf16, 1024>", 1024)
+        (
+            "::pie::elemwise::hc_rmsnorm_f32_vec8<::pie::bf16, 1024>",
+            1024,
+        )
     } else {
         ("::pie::elemwise::hc_rmsnorm_f32<::pie::bf16, 256>", BLOCK)
     };
