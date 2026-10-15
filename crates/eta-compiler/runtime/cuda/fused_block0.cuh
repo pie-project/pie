@@ -679,6 +679,7 @@ struct M1Solo {
   __device__ __forceinline__ void chunk(M1CutShared&) {}
   __device__ __forceinline__ void gaps(M1CutShared&, m1_u32) {}
   __device__ __forceinline__ void sum_u32(m1_u32*, m1_u32) {}
+  __device__ __forceinline__ void fast(const m1_u8*, m1_u32, m1_u32, m1_u32, float, M1CutShared&) {}
 };
 
 // What a nonnegative `y` (no larger than the running sum) adds to a sum that
@@ -1276,12 +1277,10 @@ __device__ void m1_cut_phase(
   __syncthreads();
 }
 
-// The cut of one row (at `base`, `len` wide) on the group `g`: the verdicts
-// of the group's stretch of the row land in `output`.
-template <class G>
-__device__ void m1_cut_row(
-    const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype, float cutoff,
-    m1_u8* output, M1CutShared& cut, G& g) {
+// The cut of one row, in steps a caller can take apart: the cut's state
+// reset, each element of the group's stretch noted (NaNs, signs, the key
+// range), the notes merged over the group, the walk, the verdicts marked.
+__device__ __forceinline__ void m1_cut_reset(M1CutShared& cut) {
   if (threadIdx.x == 0u) {
     cut.first_nan = 0xFFFFFFFFu;
     cut.negative = 0u;
@@ -1295,20 +1294,23 @@ __device__ void m1_cut_row(
     cut.key_most = 0u;
     cut.key_skip = 0u;
   }
-  __syncthreads();
-  m1_u32 least = 0xFFFFFFFFu;
-  m1_u32 most = 0u;
-  m1_cut_scan_range(input, base, g.lo, g.hi, dtype, [&](m1_u32 i, float y) {
-    if (m1_isnan(y)) {
-      atomicMin(&cut.first_nan, i);
-    } else {
-      if (y < 0.0f) cut.negative = 1u;
-      if (!(y < 1.8446744e19f)) cut.wide = 1u;
-      const m1_u32 key = m1_desc_key(y);
-      least = key < least ? key : least;
-      most = key > most ? key : most;
-    }
-  });
+}
+
+__device__ __forceinline__ void m1_cut_note(
+    M1CutShared& cut, m1_u32 i, float y, m1_u32& least, m1_u32& most) {
+  if (m1_isnan(y)) {
+    atomicMin(&cut.first_nan, i);
+  } else {
+    if (y < 0.0f) cut.negative = 1u;
+    if (!(y < 1.8446744e19f)) cut.wide = 1u;
+    const m1_u32 key = m1_desc_key(y);
+    least = key < least ? key : least;
+    most = key > most ? key : most;
+  }
+}
+
+template <class G>
+__device__ void m1_cut_enter(M1CutShared& cut, G& g, m1_u32 least, m1_u32 most) {
   if (least <= most) {
     atomicMin(&cut.key_least, least);
     atomicMax(&cut.key_most, most);
@@ -1322,9 +1324,22 @@ __device__ void m1_cut_row(
     cut.key_skip = skip;
   }
   __syncthreads();
+}
+
+// The walk, after the notes: leaves the stage, the pivot and the NaN's
+// verdict in `cut` (a row with a negative value has its verdicts stored as
+// it goes).
+template <class G>
+__device__ __forceinline__ void m1_cut_walk(
+    const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype, float cutoff,
+    m1_u8* output, M1CutShared& cut, G& g) {
   const bool monotone = cut.negative == 0u;
   bool binades = monotone && cut.wide == 0u;
-  m1_cut_chunk(input, base, len, dtype, cutoff, monotone, output, cut, g);
+  // A group that can walk the row from a histogram first does (its cursor
+  // and mass are where the passes below pick up, if it stops short).
+  if (binades && cutoff > 0.0f) g.fast(input, base, len, dtype, cutoff, cut);
+  if (cut.stage == M1_CUT_RUN)
+    m1_cut_chunk(input, base, len, dtype, cutoff, monotone, output, cut, g);
   for (m1_u32 step = 0u; cut.stage == M1_CUT_RUN; ++step) {
     if (binades && step < 512u) {
       m1_cut_phase(input, base, len, dtype, cutoff, cut, g);
@@ -1338,20 +1353,41 @@ __device__ void m1_cut_row(
       m1_cut_chunk(input, base, len, dtype, cutoff, monotone, output, cut, g);
     }
   }
-  const m1_u32 stage = cut.stage;
-  const m1_u64 pivot = cut.pivot;
-  const m1_u32 first_nan = cut.nan_kept != 0u ? cut.first_nan : 0xFFFFFFFFu;
+}
+
+// Whether the element `i` of value `y` is kept, by the walk's outcome (a
+// row without a negative value).
+__device__ __forceinline__ bool m1_cut_kept(const M1CutShared& cut, m1_u32 i, float y) {
+  if (m1_isnan(y)) return cut.nan_kept != 0u && i == cut.first_nan;
+  return cut.stage == M1_CUT_ALL || m1_cut_composite(m1_desc_key(y), i) <= cut.pivot;
+}
+
+template <class G>
+__device__ void m1_cut_mark(
+    const m1_u8* input, m1_u32 base, m1_u32 dtype, m1_u8* output, M1CutShared& cut, G& g) {
+  const bool monotone = cut.negative == 0u;
   m1_cut_scan_range(input, base, g.lo, g.hi, dtype, [&](m1_u32 i, float y) {
-    if (m1_isnan(y)) {
-      m1_store_b(output, base + i, i == first_nan);
-    } else if (monotone) {
-      m1_store_b(
-          output, base + i,
-          stage == M1_CUT_ALL ||
-              m1_cut_composite(m1_desc_key(y), i) <= pivot);
-    }
+    if (m1_isnan(y) || monotone) m1_store_b(output, base + i, m1_cut_kept(cut, i, y));
   });
   __syncthreads();
+}
+
+// The cut of one row (at `base`, `len` wide) on the group `g`: the verdicts
+// of the group's stretch of the row land in `output`.
+template <class G>
+__device__ __forceinline__ void m1_cut_row(
+    const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype, float cutoff,
+    m1_u8* output, M1CutShared& cut, G& g) {
+  m1_cut_reset(cut);
+  __syncthreads();
+  m1_u32 least = 0xFFFFFFFFu;
+  m1_u32 most = 0u;
+  m1_cut_scan_range(input, base, g.lo, g.hi, dtype, [&](m1_u32 i, float y) {
+    m1_cut_note(cut, i, y, least, most);
+  });
+  m1_cut_enter(cut, g, least, most);
+  m1_cut_walk(input, base, len, dtype, cutoff, output, cut, g);
+  m1_cut_mark(input, base, dtype, output, cut, g);
 }
 
 __device__ __forceinline__ void ptir_parallel_pivot_cummass(
@@ -1380,9 +1416,9 @@ __device__ __forceinline__ void ptir_parallel_pivot_cummass(
 // The top-k cut of one row (`k` already clamped to 1..len) on the group
 // `grp`: the verdicts of the group's stretch land in `output`.
 template <class G>
-__device__ void m1_rank_row(
+__device__ m1_u32 m1_rank_row(
     const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype, m1_u32 k,
-    m1_u8* output, G& grp) {
+    m1_u8* output, G& grp, bool mark = true) {
   __shared__ m1_u32 rank_hist[2048];
   __shared__ m1_u32 rank_group[64];
   __shared__ m1_u32 rank_prefix;
@@ -1449,10 +1485,13 @@ __device__ void m1_rank_row(
     __syncthreads();
   }
   const m1_u32 cutoff_key = rank_prefix;
-  m1_cut_scan_range(input, base, grp.lo, grp.hi, dtype, [&](m1_u32 i, float y) {
-    m1_store_b(output, base + i, !m1_isnan(y) && m1_desc_key(y) <= cutoff_key);
-  });
+  if (mark) {
+    m1_cut_scan_range(input, base, grp.lo, grp.hi, dtype, [&](m1_u32 i, float y) {
+      m1_store_b(output, base + i, !m1_isnan(y) && m1_desc_key(y) <= cutoff_key);
+    });
+  }
   __syncthreads();
+  return cutoff_key;
 }
 
 // The top-k cut, `PivotThreshold(RankLe)`, of each row on one block.

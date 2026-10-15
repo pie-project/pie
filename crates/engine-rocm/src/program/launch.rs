@@ -26,8 +26,9 @@ pub const ORDER_ROW_BLOCKS: u32 = 32;
 /// The most blocks a lane's sampler region runs on (`sample_lane.cuh`); a
 /// fire runs as many as the device holds at once with its lanes, from one.
 pub const LANE_SAMPLER_BLOCKS: u32 = 16;
-/// A sampler block's arena: a barrier word's line and two exchange buffers.
-const LANE_SAMPLER_ARENA: u64 = 64 + 2 * 18_432;
+/// A sampler block's arena: a barrier word's line, two exchange buffers and
+/// two buffers of 512 gathered elements (`M1_FAST_GATHER`).
+const LANE_SAMPLER_ARENA: u64 = 64 + 2 * 18_432 + 2 * 512 * 8;
 
 /// Whether `kind` is a lane sampler region: its lane's blocks split each row
 /// and meet at a barrier (`LANE_SAMPLER_BLOCKS`).
@@ -1408,8 +1409,8 @@ impl Args {
 }
 
 impl Prepared {
-    /// The fire's lanes' sampler barrier words (the first word of each lane's
-    /// temporary arena) back to zero.
+    /// The fire's lanes' sampler barrier words (the first 64 bytes of each
+    /// lane's temporary arena: a word a block) back to zero.
     fn zero_barriers(&self, stream: *mut core::ffi::c_void) -> Result<()> {
         #[cfg(feature = "rocm")]
         {
@@ -1421,7 +1422,7 @@ impl Prepared {
                     (self.scratch.ptr() + u64::from(self.temporary_offset)) as *mut core::ffi::c_void,
                     self.scratch_stride as usize,
                     0,
-                    4,
+                    64,
                     self.filled as usize,
                     stream.cast(),
                 )

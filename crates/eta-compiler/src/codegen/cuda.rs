@@ -20,10 +20,10 @@ use crate::codegen::error::EmitError;
 use crate::plan::{CompiledStage, Region};
 use alloc::string::String;
 
-pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 44;
+pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 45;
 
 /// The HIP emitter shares the CUDA one's text and moves with it.
-pub const HIP_GENERATED_EMITTER_VERSION: u16 = 4;
+pub const HIP_GENERATED_EMITTER_VERSION: u16 = 5;
 
 pub fn emit_region(
     entry_name: &str,

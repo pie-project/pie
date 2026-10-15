@@ -47,6 +47,10 @@ const CUDA_LANE: &str = "
 #define M1_LANE_ACQUIRE() __threadfence()
 ";
 
+/// A sampler block's threads: at most 512, so its walks and plans keep their
+/// state in registers (a 1024-thread block holds 128 a lane).
+const LAUNCH_BOUNDS: &str = "__launch_bounds__(512) ";
+
 /// The kernel's entry follows the fused prologue's last line.
 const ENTRY: &str = "extern \"C\" __global__ void ";
 
@@ -163,6 +167,7 @@ pub fn emit_sampler_region_in(
     source.push_str(SAMPLE_LANE);
     source.push('\n');
     source.push_str(ENTRY);
+    source.push_str(LAUNCH_BOUNDS);
     source.push_str(entry_name);
     source.push_str(SIGNATURE);
     let _ = write!(source, "{LANE_TABLE_ABI_VERSION}");
