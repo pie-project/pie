@@ -566,11 +566,13 @@ constant constexpr uint kMaxExperts = 1024;
     uint2 gid                  [[thread_position_in_grid]]) {
     if (gid.x >= width || gid.y >= padded) return;
     const int sel = perm[gid.y];
+    // A padding row is left as it is: every matmul over the stack is row by
+    // row, and no pass reads a padding row's output.
+    if (sel < 0) return;
     const uint k = experts_per_token < 1u ? 1u : experts_per_token;
 
     const uint pitch = x_pitch != 0u ? x_pitch : width;
-    out[uint(gid.y) * width + gid.x] =
-        sel < 0 ? bfloat(0) : x[(uint(sel) / k) * pitch + gid.x];
+    out[uint(gid.y) * width + gid.x] = x[(uint(sel) / k) * pitch + gid.x];
 }
 
 

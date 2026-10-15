@@ -333,13 +333,13 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The sorted gate-up rows and where their swiglu lands, when `packed`
-    /// is the chain's gate-up output.
+    /// The sorted gate-up rows, where their swiglu lands and which rows are
+    /// padding, when `packed` is the chain's gate-up output.
     pub(crate) fn chain_swiglu(
         &self,
         packed: ValueId,
         hidden: ValueId,
-    ) -> Option<(Tensor, Tensor)> {
+    ) -> Option<(Tensor, Tensor, Tensor)> {
         let chain = self.chain.get()?;
         if chain.step != ChainStep::GateUp || chain.packed != packed || chain.hidden != hidden {
             self.chain.set(None);
@@ -354,6 +354,7 @@ impl<'c> Run<'c> {
         Some((
             Tensor::new(scratch.y.buf, chain.padded, up, poem_ir::Dtype::Bf16),
             Tensor::new(scratch.x.buf, chain.padded, inter, poem_ir::Dtype::Bf16),
+            scratch.perm,
         ))
     }
 
