@@ -17,20 +17,6 @@ __device__ __forceinline__ m1_u32 m1_chunk_ballot(bool predicate) {
   return __ballot_sync(0xffffffffu, predicate);
 }
 
-// A slot of `counter` for each lane of the warp that wants one (in lane
-// order): one atomic a warp, not one a lane.
-__device__ __forceinline__ m1_u32 m1_wave_slot(m1_u32* counter, bool want) {
-  const unsigned active = __activemask();
-  const unsigned mask = __ballot_sync(active, want);
-  if (mask == 0u) return 0u;
-  const unsigned lane = threadIdx.x & 31u;
-  const unsigned leader = (unsigned)(__ffs((int)mask) - 1);
-  m1_u32 base = 0u;
-  if (lane == leader) base = atomicAdd(counter, (m1_u32)__popc(mask));
-  base = __shfl_sync(active, base, leader);
-  return base + (m1_u32)__popc(mask & ((1u << lane) - 1u));
-}
-
 // The inclusive prefix sum of `v` over the warp.
 template <class T>
 __device__ __forceinline__ T m1_chunk_scan(T v) {

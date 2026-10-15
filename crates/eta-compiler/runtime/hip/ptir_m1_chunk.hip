@@ -20,19 +20,6 @@ __device__ __forceinline__ m1_u32 m1_chunk_ballot(bool predicate) {
   return static_cast<m1_u32>(wave >> (__lane_id() & 32u));
 }
 
-// A slot of `counter` for each lane of the wavefront that wants one (in lane
-// order): one atomic a wavefront, not one a lane.
-__device__ __forceinline__ m1_u32 m1_wave_slot(m1_u32* counter, bool want) {
-  const unsigned long long mask = __ballot(want);
-  if (mask == 0ull) return 0u;
-  const int leader = __ffsll((unsigned long long)mask) - 1;
-  const unsigned long long below = mask & ((1ull << __lane_id()) - 1ull);
-  m1_u32 base = 0u;
-  if ((int)__lane_id() == leader) base = atomicAdd(counter, (m1_u32)__popcll(mask));
-  base = __shfl(base, leader);
-  return base + (m1_u32)__popcll(below);
-}
-
 // The inclusive prefix sum of `v` over the lane's 32-lane chunk, by DPP row
 // shifts within each 16-lane row and row 0's (2's) last lane broadcast
 // into row 1 (3).

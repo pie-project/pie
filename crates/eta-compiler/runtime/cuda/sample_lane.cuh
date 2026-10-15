@@ -50,10 +50,12 @@
 #define M1_FAST_TAKE ((short)32766)
 #define M1_FAST_PAST ((short)32765)
 #define M1_FAST_LATE ((short)32764)
-// A whole bucket's flags (a byte a bucket, four to a word): an element half
-// a unit off a whole, a sum past 32 bits.
+// Taken past what one sort holds: gathered with the rest, sorted and walked
+// when the walk reaches it.
+#define M1_FAST_DEFER ((short)32763)
+// A whole bucket's flag (a byte a bucket, four to a word; the first pass
+// keeps its low-bit mask there): an element half a unit off a whole.
 #define M1_FAST_TIE 1u
-#define M1_FAST_WRAP 2u
 
 struct M1Fast {
   // A whole bucket's units (during the plan: the low bound on the mass
@@ -63,6 +65,8 @@ struct M1Fast {
   m1_u32 weight[M1_FAST_BUCKETS];
   m1_u32 flags[M1_FAST_BUCKETS / 4u];
   m1_u32 count[M1_FAST_BUCKETS];
+  // A bucket's plan (during the first pass: how many of its sampled
+  // elements its sum holds, two buckets a word).
   short plan[M1_FAST_BUCKETS];
   m1_u32 starts[M1_LANE_ARENAS + 1u];
   m1_u32 mains[M1_LANE_ARENAS + 1u];
@@ -76,8 +80,85 @@ struct M1Fast {
   float mass;
 };
 
+// Where an element's lowest set mantissa bit lies (the hidden bit counted),
+// a bit of eight: bit k for lowest bits 3k..3k+2 (bit 7 from 21 up). An
+// element is exactly half a unit off a whole at 2^eu iff its lowest set bit
+// is eu - ey - 1, so a bucket whose elements' bits miss that one holds no
+// tie there. Bits 0 and 1 (lowest bits below 6, most elements') are taken
+// as set: a whole bucket that close to its binade's units is taken anyway.
+__device__ __forceinline__ m1_u32 m1_fast_low_bit(float y) {
+  const m1_u32 bits = __float_as_uint(y) & 0x7FFFFFFFu;
+  const m1_u32 mantissa = (bits >> 23) == 0u ? (bits & 0x7FFFFFu) : ((bits & 0x7FFFFFu) | 0x800000u);
+  if (mantissa == 0u) return 0u;
+  const m1_u32 low = (m1_u32)(__ffs((int)mantissa) - 1);
+  return low < 6u ? 0u : 1u << (low >= 21u ? 7u : low / 3u);
+}
+
+// Whether a bucket of values from `bottom` to `top` may hold an element
+// half a unit off a whole at 2^eu, by its low-bit mask.
+__device__ __forceinline__ bool m1_fast_may_tie(m1_u32 mask, float bottom, float top, int eu) {
+  mask |= 3u;
+  const m1_u32 hi = __float_as_uint(top) >> 23;
+  const m1_u32 lo = __float_as_uint(bottom) >> 23;
+  if (hi - lo > 1u) return true;
+  for (m1_u32 biased = lo; biased <= hi; ++biased) {
+    const int ey = biased == 0u ? -149 : (int)biased - 150;
+    const int shift = eu - ey;
+    if (shift < 1) return true;
+    if (shift > 24) continue;
+    const m1_u32 low = (m1_u32)(shift - 1);
+    if ((mask >> (low >= 21u ? 7u : low / 3u)) & 1u) return true;
+  }
+  return false;
+}
+
 __device__ __forceinline__ m1_u32 m1_fast_flags(const M1Fast& f, m1_u32 b) {
   return (f.flags[b >> 2] >> ((b & 3u) * 8u)) & 0xFFu;
+}
+
+// The block's fast-cut state (one, whoever fills it: the cut's own first
+// pass, or the sampler's probability pass).
+__device__ __forceinline__ M1Fast& m1_fast_state() {
+  __shared__ M1Fast f;
+  return f;
+}
+
+// The buckets over keys [least, most]: each 2^stretch keys wide.
+__device__ __forceinline__ int m1_fast_stretch(m1_u32 least, m1_u32 most) {
+  const m1_u32 span = most - least;
+  int stretch = 0;
+  while (stretch < 32 && (span >> stretch) >= M1_FAST_BUCKETS) ++stretch;
+  return stretch;
+}
+
+// A key's bucket, held to the range (a key past either edge lands in the
+// bucket at that edge, so the buckets keep the keys' order).
+__device__ __forceinline__ m1_u32 m1_fast_bucket(m1_u32 key, m1_u32 least, int stretch) {
+  if (key < least) return 0u;
+  const m1_u32 b = (key - least) >> stretch;
+  return b < M1_FAST_BUCKETS ? b : M1_FAST_BUCKETS - 1u;
+}
+
+// The first pass's state cleared, an element noted in it (its bucket's
+// count, low-bit mask, and for indices a multiple of eight its f32 sum and
+// how many it holds, two buckets a word in `plan`).
+__device__ __forceinline__ void m1_fast_clear(M1Fast& f) {
+  for (m1_u32 b = threadIdx.x; b < M1_FAST_BUCKETS; b += blockDim.x) {
+    f.count[b] = 0u;
+    f.weight[b] = 0u;
+    f.plan[b] = 0;
+    if (b < M1_FAST_BUCKETS / 4u) f.flags[b] = 0u;
+  }
+}
+
+__device__ __forceinline__ void m1_fast_note(M1Fast& f, m1_u32 b, m1_u32 i, float y) {
+  atomicAdd(&f.count[b], 1u);
+  const m1_u32 low = m1_fast_low_bit(y);
+  if (low != 0u) atomicOr(&f.flags[b >> 2], low << ((b & 3u) * 8u));
+  if ((i & 7u) == 0u) {
+    M1_LANE_FADD(reinterpret_cast<float*>(&f.weight[b]), y);
+    atomicAdd(reinterpret_cast<m1_u32*>(f.plan) + (b >> 1), 1u << ((b & 1u) * 16u));
+  }
 }
 
 // The least whole number of units 2^eu at or past the cutoff, held to the
@@ -379,34 +460,6 @@ __device__ __forceinline__ void m1_fast_route(
   }
 }
 
-// Sorts `n` composites in place (at most 8 a thread): each element counts
-// those below it among `span(i)`'s [from, to) and lands at from + that.
-template <class Span>
-__device__ __forceinline__ void m1_fast_rank(m1_u64* items, m1_u32 n, Span span) {
-  m1_u64 mine[8];
-  m1_u32 rank[8];
-#pragma unroll
-  for (m1_u32 u = 0u; u < 8u; ++u) {
-    const m1_u32 i = threadIdx.x + u * blockDim.x;
-    mine[u] = i < n ? items[i] : ~0ull;
-    rank[u] = 0u;
-    if (i < n) {
-      m1_u32 from, to;
-      span(mine[u], from, to);
-      m1_u32 below = from;
-      for (m1_u32 j = from; j < to; ++j) below += items[j] < mine[u] ? 1u : 0u;
-      rank[u] = below;
-    }
-  }
-  __syncthreads();
-#pragma unroll
-  for (m1_u32 u = 0u; u < 8u; ++u) {
-    const m1_u32 i = threadIdx.x + u * blockDim.x;
-    if (i < n && rank[u] < n) items[rank[u]] = mine[u];
-  }
-  __syncthreads();
-}
-
 struct M1Lane {
   m1_u32 lo;
   m1_u32 hi;
@@ -416,6 +469,9 @@ struct M1Lane {
   m1_u32 stride;
   m1_u32 parity;
   m1_u32 arrivals;
+  // Whether the fast cut's first pass is done already (the sampler's
+  // probability pass took it).
+  bool counted;
 
   __device__ __forceinline__ void row(m1_u32 len) {
     // Stretches of whole 32-element chunks (the sum's tree), 16-byte aligned.
@@ -698,6 +754,16 @@ struct M1Lane {
                                    : M1_FAST_GATHER * ((M1_LANE_ARENAS - 1u - block) / slices + 1u);
   }
 
+  // The fast cut's first pass merged: counts and masks and sampled sums
+  // (the sums added in block order, every block alike).
+  __device__ __forceinline__ void fast_counted(M1Fast& f) {
+    combine_u32(f.weight, M1_FAST_BUCKETS * 2u + M1_FAST_BUCKETS / 4u + M1_FAST_BUCKETS / 2u, 0u,
+                nullptr, [](m1_u32 a, m1_u32 b, m1_u32 word) {
+                  if (word < M1_FAST_BUCKETS) return __float_as_uint(__uint_as_float(a) + __uint_as_float(b));
+                  return word < M1_FAST_BUCKETS + M1_FAST_BUCKETS / 4u ? a | b : a + b;
+                });
+  }
+
   // The fast cut's second pass: the whole buckets' units summed (held to 32
   // bits), their flags joined, each block's gathered count (into `starts`,
   // its prefix, held to the block's room) and overflow.
@@ -754,35 +820,14 @@ struct M1Lane {
 // (pivot), all kept, or still running from the cursor and mass it reached.
 __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype,
                              float cutoff, M1CutShared& cut) {
-  __shared__ M1Fast f;
+  M1Fast& f = m1_fast_state();
   const m1_u32 least = cut.key_least;
   const m1_u32 most = cut.key_most;
+  const bool noted = counted;
+  counted = false;
   if (least > most) return;
-  const m1_u32 span = most - least;
-  int stretch = 0;
-  while (stretch < 32 && (span >> stretch) >= M1_FAST_BUCKETS) ++stretch;
-  auto bucket_of = [&](m1_u32 key) { return (key - least) >> stretch; };
-  for (m1_u32 b = threadIdx.x; b < M1_FAST_BUCKETS; b += blockDim.x) {
-    f.count[b] = 0u;
-    f.weight[b] = 0u;
-    if (b < M1_FAST_BUCKETS / 4u) f.flags[b] = 0u;
-  }
-  __syncthreads();
-  // The first pass: each bucket's count and the f32 sum of its values (in
-  // `weight`, the first round's plan reads it), merged as one run of words
-  // (the sums added in block order, every block alike).
-  m1_cut_scan_range(input, base, lo, hi, dtype, [&](m1_u32, float y) {
-    if (m1_isnan(y)) return;
-    const m1_u32 b = bucket_of(m1_desc_key(y));
-    atomicAdd(&f.count[b], 1u);
-    atomicAdd(reinterpret_cast<float*>(&f.weight[b]), y);
-  });
-  __syncthreads();
-  combine_u32(f.weight, M1_FAST_BUCKETS * 2u + M1_FAST_BUCKETS / 4u, 0u, nullptr,
-              [](m1_u32 a, m1_u32 b, m1_u32 word) {
-                if (word < M1_FAST_BUCKETS) return __float_as_uint(__uint_as_float(a) + __uint_as_float(b));
-                return word < M1_FAST_BUCKETS + M1_FAST_BUCKETS / 4u ? a | b : a + b;
-              });
+  const int stretch = m1_fast_stretch(least, most);
+  auto bucket_of = [&](m1_u32 key) { return m1_fast_bucket(key, least, stretch); };
   // The edges of a bucket's keys: its largest value and its least.
   auto top_value = [&](m1_u32 b) {
     return (double)m1_cut_value(least + (m1_u32)((m1_u64)b << stretch));
@@ -790,6 +835,27 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
   auto bottom_value = [&](m1_u32 b) {
     const m1_u64 last = (m1_u64)least + (((m1_u64)b + 1ull) << stretch) - 1ull;
     return (double)m1_cut_value(last > most ? most : (m1_u32)last);
+  };
+  // The first pass (unless the caller's took it): each bucket's count, its
+  // elements' low-bit mask (in `flags`, for the first round's plan), and
+  // the f32 sum (in `weight`) and count (in `plan`) of its elements at
+  // indices a multiple of eight, from which the first round's plan reckons
+  // its mass.
+  if (!noted) {
+    m1_fast_clear(f);
+    __syncthreads();
+    m1_cut_scan_range(input, base, lo, hi, dtype, [&](m1_u32 i, float y) {
+      if (!m1_isnan(y)) m1_fast_note(f, bucket_of(m1_desc_key(y)), i, y);
+    });
+    __syncthreads();
+    fast_counted(f);
+  }
+  // A bucket's mass, reckoned: its count times its sampled elements' mean
+  // (its middle value if none was sampled).
+  auto reckoned = [&](m1_u32 b, m1_u32 c) {
+    const m1_u32 n = (m1_u32)(unsigned short)f.plan[b];
+    return n != 0u ? (double)__uint_as_float(f.weight[b]) * (double)c / (double)n
+                   : (double)c * 0.5 * (top_value(b) + bottom_value(b));
   };
   float mass = 0.0f;
   m1_u32 first = 0u;
@@ -799,12 +865,16 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
   // least gather room of the lane's blocks; a repair, half of that.
   const m1_u32 room = gather_room(slices - 1u) * slices / 4u * 3u;
   const m1_u32 planned = room < M1_CUT_CHUNK ? room : M1_CUT_CHUNK;
+  const m1_u32 deferred = room < 2u * M1_CUT_CHUNK ? room : 2u * M1_CUT_CHUNK;
   const m1_u32 mending = planned / 2u;
   double* bound = reinterpret_cast<double*>(cut.chunk);
   m1_u32* takes = reinterpret_cast<m1_u32*>(cut.before);
   m1_u64* mends = reinterpret_cast<m1_u64*>(cut.before);
   const m1_u32 mine = gather_room(slice);
   for (m1_u32 round = 0u; round < M1_FAST_ROUNDS && !settled; ++round) {
+    // A later round's gathers reuse buffers the last one's reads may still
+    // be in: every block past those first.
+    if (round != 0u) barrier();
     // The plan, from the running mass expected at each bucket's edges: the
     // first round's from the buckets' sums, a later one's from bounds by the
     // buckets' edge values (the low bound before each into `weight`, as f32,
@@ -813,9 +883,7 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
     const bool summed = round == 0u;
     for (m1_u32 b = threadIdx.x; b < M1_FAST_BUCKETS; b += blockDim.x) {
       const m1_u32 c = b >= first ? f.count[b] : 0u;
-      bound[b] = c == 0u ? 0.0
-                 : summed ? (double)__uint_as_float(f.weight[b])
-                          : (double)c * bottom_value(b);
+      bound[b] = c == 0u ? 0.0 : summed ? reckoned(b, c) : (double)c * bottom_value(b);
     }
     __syncthreads();
     m1_fast_scan(bound, M1_FAST_BUCKETS);
@@ -823,7 +891,7 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
     for (m1_u32 b = threadIdx.x; b < M1_FAST_BUCKETS; b += blockDim.x) {
       const m1_u32 c = b >= first ? f.count[b] : 0u;
       const double low = ((double)mass + bound[b]) * (1.0 - 1.0 / 4096.0);
-      const double own = summed && c != 0u ? (double)__uint_as_float(f.weight[b]) : 0.0;
+      const double own = summed && c != 0u ? reckoned(b, c) : 0.0;
       f.weight[b] = __float_as_uint((float)low);
       bound[b] = summed ? bound[b] + own : (c == 0u ? 0.0 : (double)c * top_value(b));
     }
@@ -839,7 +907,7 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
             (1.0 + 1.0 / 4096.0);
         if (lower >= (double)cutoff || c > M1_CUT_CHUNK) {
           plan = M1_FAST_PAST;
-        } else if (m1_fast_flags(f, b) != 0u) {
+        } else if (!summed && m1_fast_flags(f, b) != 0u) {
           plan = M1_FAST_TAKE;
         } else {
           int el, eh;
@@ -848,6 +916,16 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
           plan = upper < (double)cutoff && lower >= 1.1754943508222875e-38 && el == eh
                      ? (short)(el - 24)
                      : M1_FAST_TAKE;
+          if (summed && plan != M1_FAST_TAKE &&
+              m1_fast_may_tie(m1_fast_flags(f, b), (float)bottom_value(b), (float)top_value(b), plan))
+            plan = M1_FAST_TAKE;
+          // A whole bucket's units must sum in 32 bits: its count times its
+          // largest element's units (2^25 saturated) stays below 2^32.
+          if (plan != M1_FAST_TAKE) {
+            const double most_units = ldexp(top_value(b), -(int)plan);
+            const double each = most_units >= 8388608.0 ? 33554432.0 : most_units + 1.0;
+            if ((double)c * each >= 4294967296.0) plan = M1_FAST_TAKE;
+          }
         }
       }
       f.plan[b] = plan;
@@ -857,7 +935,9 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
     m1_fast_scan(takes, M1_FAST_BUCKETS);
     for (m1_u32 b = threadIdx.x; b < M1_FAST_BUCKETS; b += blockDim.x) {
       f.weight[b] = 0u;
-      if (f.plan[b] == M1_FAST_TAKE && takes[b] + f.count[b] > planned) f.plan[b] = M1_FAST_PAST;
+      if (summed && b < M1_FAST_BUCKETS / 4u) f.flags[b] = 0u;
+      if (f.plan[b] == M1_FAST_TAKE && takes[b] + f.count[b] > planned)
+        f.plan[b] = takes[b] + f.count[b] > deferred ? M1_FAST_PAST : M1_FAST_DEFER;
     }
     if (threadIdx.x == 0u) {
       f.taken = 0u;
@@ -872,9 +952,8 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
       const m1_u32 b = bucket_of(key);
       const short plan = f.plan[b];
       if (plan == M1_FAST_EMPTY || plan == M1_FAST_PAST) return;
-      const bool take = plan == M1_FAST_TAKE;
-      const m1_u32 n = m1_wave_slot(&f.taken, take);
-      if (take) {
+      if (plan == M1_FAST_TAKE || plan == M1_FAST_DEFER) {
+        const m1_u32 n = atomicAdd(&f.taken, 1u);
         if (n < mine) M1_LANE_PUT64(gather_slot(slice, n, which), m1_cut_composite(key, i));
         else f.overflow = 1u;
         return;
@@ -884,27 +963,32 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
       if (tie) {
         atomicOr(&f.flags[b >> 2], M1_FAST_TIE << ((b & 3u) * 8u));
       } else if (units != 0u) {
-        const m1_u32 before = atomicAdd(&f.weight[b], units);
-        if (before + units < before) atomicOr(&f.flags[b >> 2], M1_FAST_WRAP << ((b & 3u) * 8u));
+        atomicAdd(&f.weight[b], units);
       }
     });
     __syncthreads();
     fast_merge(f, true);
     if (f.overflow != 0u) break;
-    // Whole buckets the second pass flagged (a tie, whose add depends on the
-    // order before it; a sum past 32 bits) are taken too, in a pass of their
-    // own, if the sort holds them.
-    if (threadIdx.x == 0u) f.late = 0u;
+    // Whole buckets the second pass flagged (a tie the plan did not foresee,
+    // whose add depends on the order before it) are taken too, in a pass of
+    // their own, if the sort holds them.
+    if (threadIdx.x == 0u) {
+      f.late = 0u;
+      f.walked = 0u;
+    }
     for (m1_u32 s = threadIdx.x; s <= slices; s += blockDim.x) f.mains[s] = f.starts[s];
     __syncthreads();
     for (m1_u32 b = threadIdx.x; b < M1_FAST_BUCKETS; b += blockDim.x) {
       const short plan = f.plan[b];
       if (plan != M1_FAST_EMPTY && plan != M1_FAST_TAKE && plan != M1_FAST_PAST &&
-          m1_fast_flags(f, b) != 0u)
+          plan != M1_FAST_DEFER && m1_fast_flags(f, b) != 0u)
         atomicAdd(&f.late, f.count[b]);
+      if (plan == M1_FAST_TAKE) atomicAdd(&f.walked, f.count[b]);
     }
     __syncthreads();
-    const m1_u32 main_gathered = f.mains[slices];
+    // The main gather holds the taken and the deferred; the sort, the taken.
+    const m1_u32 main_all = f.mains[slices];
+    const m1_u32 main_gathered = f.walked;
     const bool late = f.late != 0u && main_gathered + f.late <= M1_CUT_CHUNK &&
                       f.late <= gather_room(slices - 1u) * slices / 4u * 3u;
     m1_u32 late_gathered = 0u;
@@ -914,22 +998,21 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
       for (m1_u32 b = threadIdx.x; b < M1_FAST_BUCKETS; b += blockDim.x) {
         const short plan = f.plan[b];
         const bool flagged = plan != M1_FAST_EMPTY && plan != M1_FAST_TAKE &&
-                             plan != M1_FAST_PAST && m1_fast_flags(f, b) != 0u;
+                             plan != M1_FAST_PAST && plan != M1_FAST_DEFER &&
+                             m1_fast_flags(f, b) != 0u;
         if (flagged) f.plan[b] = M1_FAST_LATE;
-        takes[b] = flagged || plan == M1_FAST_TAKE ? f.count[b] : 0u;
       }
       if (threadIdx.x == 0u) {
         f.taken = 0u;
         f.overflow = 0u;
       }
       __syncthreads();
-      m1_fast_scan(takes, M1_FAST_BUCKETS);
       m1_cut_scan_range(input, base, lo, hi, dtype, [&](m1_u32 i, float y) {
         if (m1_isnan(y)) return;
         const m1_u32 key = m1_desc_key(y);
         const bool take = f.plan[bucket_of(key)] == M1_FAST_LATE;
-        const m1_u32 n = m1_wave_slot(&f.taken, take);
         if (!take) return;
+        const m1_u32 n = atomicAdd(&f.taken, 1u);
         if (n < mine) M1_LANE_PUT64(gather_slot(slice, n, late_which), m1_cut_composite(key, i));
         else f.overflow = 1u;
       });
@@ -941,32 +1024,31 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
         if (f.plan[b] == M1_FAST_LATE) f.plan[b] = M1_FAST_TAKE;
       __syncthreads();
     }
-    // Every taken element in, placed by its bucket's run (`takes`) and
-    // sorted within it. The taken buckets' units are spent: their words
-    // count the placements.
+    // Every taken element in (the main gather's, not its deferred ones, and
+    // the late pass's), sorted.
     const m1_u32 gathered = main_gathered + late_gathered;
-    for (m1_u32 b = threadIdx.x; b < M1_FAST_BUCKETS; b += blockDim.x)
-      if (f.plan[b] == M1_FAST_TAKE) f.weight[b] = 0u;
+    if (gathered > M1_CUT_CHUNK) break;
+    if (threadIdx.x == 0u) f.taken = 0u;
     __syncthreads();
-    for (m1_u32 at = threadIdx.x; at < gathered; at += blockDim.x) {
-      const bool from_late = at >= main_gathered;
-      const m1_u32 index = from_late ? at - main_gathered : at;
+    for (m1_u32 at = threadIdx.x; at < main_all + late_gathered; at += blockDim.x) {
+      const bool from_late = at >= main_all;
+      const m1_u32 index = from_late ? at - main_all : at;
       const m1_u32* starts = from_late ? f.starts : f.mains;
       m1_u32 s = 0u;
       while (s + 1u < slices && starts[s + 1u] <= index) ++s;
       const m1_u64 composite =
           M1_LANE_GET64(gather_slot(s, index - starts[s], from_late ? late_which : which));
-      const m1_u32 b = bucket_of((m1_u32)(composite >> 32));
-      const m1_u32 slot = takes[b] + atomicAdd(&f.weight[b], 1u);
+      if (!from_late && f.plan[bucket_of((m1_u32)(composite >> 32))] != M1_FAST_TAKE) continue;
+      const m1_u32 slot = atomicAdd(&f.taken, 1u);
       if (slot < M1_CUT_CHUNK) cut.chunk[slot] = composite;
     }
     __syncthreads();
-    m1_fast_rank(cut.chunk, gathered, [&](m1_u64 composite, m1_u32& from, m1_u32& to) {
-      const m1_u32 b = bucket_of((m1_u32)(composite >> 32));
-      from = takes[b];
-      to = from + f.count[b];
-      if (to > gathered) to = gathered;
-    });
+    if (f.taken != gathered) {
+      first = 0u;
+      mass = 0.0f;
+      break;
+    }
+    m1_cut_sort(cut.chunk, gathered);
     if (threadIdx.x == 0u) {
       f.mass = mass;
       f.walked = 0u;
@@ -974,7 +1056,8 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
     __syncthreads();
     // The walk, on one chunk (every block's alike), and repairs: a bucket
     // the plan misjudged, and the past ones after it (as many as half a
-    // round holds), gathered and walked in f32 as the reference walks them.
+    // round holds), gathered and walked in f32 as the reference walks them;
+    // or a run of deferred buckets, from the main gather.
     m1_u32 from = first;
     m1_u32 repairs = 0u;
     for (;;) {
@@ -1001,57 +1084,81 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
       const m1_u32 missed = f.ended;
       mass = f.mass;
       first = missed;
+      // Once every taken element is walked the repair takes the round's
+      // sort; before, the other half of the cut's buffers.
+      const bool spent = f.walked == gathered;
+      m1_u64* mended = spent ? cut.chunk : mends;
+      const m1_u32 holds = spent ? planned : mending;
+      const bool defer = f.plan[missed] == M1_FAST_DEFER;
       m1_u32 end = missed + 1u;
       m1_u32 held = f.count[missed];
       while (end < M1_FAST_BUCKETS &&
-             (f.plan[end] == M1_FAST_PAST || f.plan[end] == M1_FAST_EMPTY) &&
-             held + f.count[end] <= mending) {
+             (f.plan[end] == (defer ? M1_FAST_DEFER : M1_FAST_PAST) || f.plan[end] == M1_FAST_EMPTY) &&
+             held + f.count[end] <= holds) {
         held += f.count[end];
         ++end;
       }
-      if (repairs == M1_FAST_ROUNDS * 2u || held > mending) break;
+      if (repairs == M1_FAST_ROUNDS * 2u || held > holds) break;
       ++repairs;
-      // The repair pass: the elements of [missed, end).
-      if (threadIdx.x == 0u) {
-        f.taken = 0u;
-        f.overflow = 0u;
+      m1_u32 count = 0u;
+      if (defer) {
+        // Deferred buckets: their elements are in the main gather.
+        if (threadIdx.x == 0u) f.taken = 0u;
+        __syncthreads();
+        for (m1_u32 at = threadIdx.x; at < main_all; at += blockDim.x) {
+          m1_u32 s = 0u;
+          while (s + 1u < slices && f.mains[s + 1u] <= at) ++s;
+          const m1_u64 composite = M1_LANE_GET64(gather_slot(s, at - f.mains[s], which));
+          const m1_u32 b = bucket_of((m1_u32)(composite >> 32));
+          if (b < missed || b >= end) continue;
+          const m1_u32 slot = atomicAdd(&f.taken, 1u);
+          if (slot < holds) mended[slot] = composite;
+        }
+        __syncthreads();
+        count = f.taken;
+        if (count != held) {
+          round = M1_FAST_ROUNDS;
+          break;
+        }
+      } else {
+        // The repair pass: the elements of [missed, end), into the gather
+        // buffer the main gather left (every block past the last reads of it
+        // first).
+        if (threadIdx.x == 0u) {
+          f.taken = 0u;
+          f.overflow = 0u;
+        }
+        barrier();
+        const m1_u32 mend = which ^ 1u;
+        m1_cut_scan_range(input, base, lo, hi, dtype, [&](m1_u32 i, float y) {
+          if (m1_isnan(y)) return;
+          const m1_u32 key = m1_desc_key(y);
+          const m1_u32 b = bucket_of(key);
+          const bool take = b >= missed && b < end;
+          if (!take) return;
+          const m1_u32 n = atomicAdd(&f.taken, 1u);
+          if (n < mine) M1_LANE_PUT64(gather_slot(slice, n, mend), m1_cut_composite(key, i));
+          else f.overflow = 1u;
+        });
+        __syncthreads();
+        fast_merge(f, false);
+        count = f.starts[slices];
+        if (f.overflow != 0u || count != held) {
+          round = M1_FAST_ROUNDS;
+          break;
+        }
+        for (m1_u32 at = threadIdx.x; at < count; at += blockDim.x) {
+          m1_u32 s = 0u;
+          while (s + 1u < slices && f.starts[s + 1u] <= at) ++s;
+          mended[at] = M1_LANE_GET64(gather_slot(s, at - f.starts[s], mend));
+        }
+        __syncthreads();
       }
-      __syncthreads();
-      // Both gather buffers were read since the last meet if a late pass
-      // ran: every block past that before either is written again.
-      if (late) barrier();
-      const m1_u32 mend = gathers++ & 1u;
-      m1_cut_scan_range(input, base, lo, hi, dtype, [&](m1_u32 i, float y) {
-        if (m1_isnan(y)) return;
-        const m1_u32 key = m1_desc_key(y);
-        const m1_u32 b = bucket_of(key);
-        const bool take = b >= missed && b < end;
-        const m1_u32 n = m1_wave_slot(&f.taken, take);
-        if (!take) return;
-        if (n < mine) M1_LANE_PUT64(gather_slot(slice, n, mend), m1_cut_composite(key, i));
-        else f.overflow = 1u;
-      });
-      __syncthreads();
-      fast_merge(f, false);
-      const m1_u32 count = f.starts[slices];
-      if (f.overflow != 0u || count != held) {
-        round = M1_FAST_ROUNDS;
-        break;
-      }
-      for (m1_u32 at = threadIdx.x; at < count; at += blockDim.x) {
-        m1_u32 s = 0u;
-        while (s + 1u < slices && f.starts[s + 1u] <= at) ++s;
-        mends[at] = M1_LANE_GET64(gather_slot(s, at - f.starts[s], mend));
-      }
-      __syncthreads();
-      m1_fast_rank(mends, count, [&](m1_u64, m1_u32& lo_at, m1_u32& hi_at) {
-        lo_at = 0u;
-        hi_at = count;
-      });
+      m1_cut_sort(mended, count);
       if (threadIdx.x < 32u) {
         float sum = mass;
         m1_u64 pivot = 0ull;
-        const bool stopped = m1_fast_walk(mends, count, cutoff, sum, pivot);
+        const bool stopped = m1_fast_walk(mended, count, cutoff, sum, pivot);
         if (threadIdx.x == 0u) {
           f.mass = sum;
           f.pivot = pivot;
@@ -1127,6 +1234,18 @@ __device__ __forceinline__ float m1_lane_tree(
   return total;
 }
 
+// A row's maximum (the canonical max), least value, and whether all are
+// finite.
+struct M1Range {
+  float maximum;
+  float least;
+  m1_u32 finite;
+};
+
+__device__ __forceinline__ M1Range m1_range_combine(M1Range a, M1Range b) {
+  return M1Range{m1_canonical_max(a.maximum, b.maximum), fminf(a.least, b.least), a.finite & b.finite};
+}
+
 // The sampler of each of a lane's rows (`rows` of `len`), on the lane's
 // blocks: `logits` f32, `threshold` the top-p (f32) or top-k (i32) a row or
 // one for all, `state` the Gumbel key, `probs` and `keep` the planes the
@@ -1147,7 +1266,7 @@ __device__ void ptir_lane_sample(
     m1_u32 len) {
   __shared__ M1CutShared cut;
   float* tree_work = cut.before;
-  __shared__ float block_max[32];
+  __shared__ M1Range block_range[32];
   __shared__ M1ArgmaxCandidate block_best[32];
   const m1_u32 lane = threadIdx.x & 31u;
   const m1_u32 warp = threadIdx.x >> 5u;
@@ -1160,21 +1279,33 @@ __device__ void ptir_lane_sample(
   g.row(len);
   for (m1_u32 row = 0u; row < rows; ++row) {
     const m1_u32 base = row * len;
-    // The row's maximum (order-free: the canonical max is).
+    // The row's maximum (order-free: the canonical max is), and its least
+    // value and whether every value is finite (the top-p cut's first pass
+    // then rides the probability pass).
     float m = m1_neg_inf();
-    for (m1_u32 i = g.lo + threadIdx.x; i < g.hi; i += blockDim.x)
-      m = m1_canonical_max(m, x[base + i]);
-    for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u)
+    float least_x = __int_as_float(0x7F800000);
+    m1_u32 finite = 1u;
+    for (m1_u32 i = g.lo + threadIdx.x; i < g.hi; i += blockDim.x) {
+      const float v = x[base + i];
+      m = m1_canonical_max(m, v);
+      least_x = fminf(least_x, v);
+      if (!(fabsf(v) < __int_as_float(0x7F800000))) finite = 0u;
+    }
+    for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
       m = m1_canonical_max(m, m1_chunk_down(m, offset));
-    if (lane == 0u) block_max[warp] = m;
+      least_x = fminf(least_x, m1_chunk_down(least_x, offset));
+      finite &= m1_chunk_down(finite, offset);
+    }
+    if (lane == 0u) block_range[warp] = M1Range{m, least_x, finite};
     __syncthreads();
     if (threadIdx.x == 0u) {
-      float t = m1_neg_inf();
-      for (m1_u32 w = 0u; w < warps; ++w) t = m1_canonical_max(t, block_max[w]);
-      block_max[0] = t;
+      M1Range t{m1_neg_inf(), __int_as_float(0x7F800000), 1u};
+      for (m1_u32 w = 0u; w < warps; ++w) t = m1_range_combine(t, block_range[w]);
+      block_range[0] = t;
     }
     __syncthreads();
-    const float maximum = g.merge(block_max[0], [](float a, float b) { return m1_canonical_max(a, b); });
+    const M1Range range = g.merge(block_range[0], m1_range_combine);
+    const float maximum = range.maximum;
     // The exponentials, and their width-32 chunk sums (the tree's first
     // level) into the keep plane, which the cut has not reached yet.
     float* chunk_sums = reinterpret_cast<float*>(keep + ((base + 3u) & ~3u));
@@ -1196,15 +1327,31 @@ __device__ void ptir_lane_sample(
     // cut writes the keep plane).
     g.barrier();
     // The probabilities (the exponentials again, as the reference's), the
-    // top-p cut's notes taken on the way.
+    // top-p cut's notes taken on the way. Over finite logits they are known
+    // before they are made: none negative, wide or NaN, the largest the
+    // maximum's 1 / sum, the least the least logit's; the fast cut's first
+    // pass rides along.
     if constexpr (!RANK) m1_cut_reset(cut);
-    __syncthreads();
+    const bool counted = !RANK && range.finite != 0u;
     m1_u32 least = 0xFFFFFFFFu;
     m1_u32 most = 0u;
+    int stretch = 0;
+    M1Fast& fs = m1_fast_state();
+    if (counted) {
+      least = m1_desc_key(expf(maximum - maximum) / sum);
+      most = m1_desc_key(expf(range.least - maximum) / sum);
+      if (most < least) most = least;
+      stretch = m1_fast_stretch(least, most);
+      m1_fast_clear(fs);
+    }
+    __syncthreads();
     for (m1_u32 i = g.lo + threadIdx.x; i < g.hi; i += blockDim.x) {
       const float q = expf(x[base + i] - maximum) / sum;
       p[base + i] = q;
-      if constexpr (!RANK) m1_cut_note(cut, i, q, least, most);
+      if constexpr (!RANK) {
+        if (counted) m1_fast_note(fs, m1_fast_bucket(m1_desc_key(q), least, stretch), i, q);
+        else m1_cut_note(cut, i, q, least, most);
+      }
     }
     // The cut; where its verdicts follow from its outcome (top-k's key, a
     // top-p walk's pivot), the argmax pass takes them from it.
@@ -1225,7 +1372,22 @@ __device__ void ptir_lane_sample(
       if (k != 0u) rank_key = m1_rank_row(probs, base, len, 0u, k, keep, g, false);
     } else {
       const float cutoff = m1_load_f(threshold, m1_pick(threshold_desc.len, row), threshold_desc.dtype);
-      m1_cut_enter(cut, g, least, most);
+      if (counted) {
+        __syncthreads();
+        g.fast_counted(fs);
+        if (threadIdx.x == 0u) {
+          cut.key_least = least;
+          cut.key_most = most;
+          const m1_u32 differ = least ^ most;
+          m1_u32 skip = 0u;
+          while (skip < 3u && (differ >> (24u - 8u * skip)) == 0u) ++skip;
+          cut.key_skip = skip;
+        }
+        __syncthreads();
+        g.counted = true;
+      } else {
+        m1_cut_enter(cut, g, least, most);
+      }
       m1_cut_walk(probs, base, len, 0u, cutoff, keep, cut, g);
       if (cut.negative != 0u) {
         m1_cut_mark(probs, base, 0u, keep, cut, g);
@@ -1239,7 +1401,7 @@ __device__ void ptir_lane_sample(
       if (marked) {
         kept = m1_load_b(keep, base + i, 3u);
       } else {
-        const float q = p[base + i];
+        const float q = expf(x[base + i] - maximum) / sum;
         if constexpr (RANK) kept = rank_k != 0u && !m1_isnan(q) && m1_desc_key(q) <= rank_key;
         else kept = m1_cut_kept(cut, i, q);
       }

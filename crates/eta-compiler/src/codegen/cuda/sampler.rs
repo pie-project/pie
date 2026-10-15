@@ -32,6 +32,7 @@ const HIP_LANE: &str = "
 #define M1_LANE_GET64(p) __hip_atomic_load((p), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
 #define M1_LANE_RELEASE() asm volatile(\"s_waitcnt vmcnt(0)\" ::: \"memory\")
 #define M1_LANE_ACQUIRE() asm volatile(\"\" ::: \"memory\")
+#define M1_LANE_FADD(p, v) unsafeAtomicAdd((p), (v))
 ";
 
 /// How a lane's blocks meet on a CUDA device: L2-coherent words behind the
@@ -45,6 +46,7 @@ const CUDA_LANE: &str = "
 #define M1_LANE_GET64(p) (*reinterpret_cast<volatile m1_u64*>(p))
 #define M1_LANE_RELEASE() __threadfence()
 #define M1_LANE_ACQUIRE() __threadfence()
+#define M1_LANE_FADD(p, v) atomicAdd((p), (v))
 ";
 
 /// A sampler block's threads: at most 512, so its walks and plans keep their
@@ -191,6 +193,7 @@ pub fn emit_sampler_region_in(
   g.stride = temporary_stride;
   g.parity = 0u;
   g.arrivals = 0u;
+  g.counted = false;
 ",
     );
     if cut_only {
