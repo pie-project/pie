@@ -63,6 +63,12 @@ impl Recorder {
         }
     }
 
+    /// The platform this trace is recorded for.
+    #[must_use]
+    pub fn platform(&self) -> Platform {
+        self.inner.borrow().platform
+    }
+
     pub fn fresh(&self, ty: Ty) -> Value {
         let mut p = self.inner.borrow_mut();
         p.values.push(ValueDecl {

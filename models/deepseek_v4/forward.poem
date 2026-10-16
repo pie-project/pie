@@ -274,7 +274,8 @@ def layer(m, rows, w, streams, trail, following = None):
     x, post_mix, comb_mix, mix = sublayer_input(streams, w.mlp_mix, m, mix)
     if w.mlp_norm != None:
         x = ops.elemwise.rmsnorm(x, w.mlp_norm, hy.norm_eps)
-    f = mlp(x, rows.ids, w.mlp, streams, following, hy)
+    # The next layer's predicted experts, where the backend streams them.
+    f = mlp(x, rows.ids, w.mlp, streams, following if inputs.route_hints() else None, hy)
     streams = ops.elemwise.hc_fold(f, streams, post_mix, comb_mix)
     return streams, struct(mix = mix, selection = selection)
 

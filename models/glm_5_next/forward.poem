@@ -230,7 +230,8 @@ def forward(m, inputs):
         x, post_mix, comb_mix = gate(streams, w.mlp_mix, hy)
         x = ops.elemwise.rmsnorm(x, w.mlp_norm, w.mlp_norm_eps)
         following = m.layers[l + 1] if l + 1 < len(m.layers) else None
-        hint = predict_next(streams, following, hy)
+        # The next layer's predicted experts, where the backend streams them.
+        hint = predict_next(streams, following, hy) if inputs.route_hints() else None
         f = mlp(x, w.mlp, hint)
         return ops.elemwise.hc_fold(f, streams, post_mix, comb_mix)
 

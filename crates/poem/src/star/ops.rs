@@ -4056,6 +4056,15 @@ pub(crate) static INPUTS: &[Op] = &[
     },
     Op {
         module: "inputs",
+        name: "route_hints",
+        params: &["inputs"],
+        call: |a, heap| {
+            let inputs: Input = a.next()?;
+            Ok(heap.alloc(inputs.route_hints()))
+        },
+    },
+    Op {
+        module: "inputs",
         name: "request_of_token",
         params: &["inputs"],
         call: |a, heap| {
