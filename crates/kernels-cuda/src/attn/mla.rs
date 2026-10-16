@@ -666,8 +666,8 @@ mod sparse {
     }
 
     /// Fires the pass where the profile says and the shape is the one it is
-    /// built for: 64 heads over a 512-wide bf16 latent, a 64-wide rotated
-    /// part or none; `None` where it does not serve.
+    /// built for: 64 heads over a 512-wide bf16 latent and a 64-wide rotated
+    /// part; `None` where it does not serve.
     pub(super) fn fire(
         ctx: &Ctx,
         op: &'static str,
@@ -680,7 +680,9 @@ mod sparse {
             && supported()
             && s.heads == 64
             && s.kv_lora_rank == 512
-            && (s.rope == 0 || s.rope == 64)
+            // GLM-5.3's shape. A latent with no rotated part (GLM-5.3-Flash)
+            // stays on the warp-a-key form until its parity is clean.
+            && s.rope == 64
             && s.q.dtype == Dtype::Bf16
             && pool.keys.dtype == Dtype::Bf16
             && pool.page_size > 0

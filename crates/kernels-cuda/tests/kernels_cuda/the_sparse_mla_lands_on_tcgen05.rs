@@ -1,13 +1,13 @@
 #![cfg(feature = "cuda")]
 
 //! GLM-5.3's DSA attention (`kernel.sdpa.mla_sparse`, `attn/mla_sparse.cuh`):
-//! 64 absorbed heads over a 512-wide latent and a 64-wide rotated part (or
-//! none, as GLM-5.3-Flash), the token ids a row's index selected, a block a
-//! row on tcgen05. Read against a host reference, scores and base-2
+//! 64 absorbed heads over a 512-wide latent and a 64-wide rotated part, the
+//! token ids a row's index selected, a block a row on tcgen05. Read against a host reference, scores and base-2
 //! log-sum-exp, over two requests (one continuing a context), shuffled
 //! pages, selections longer than a tile with whole page runs in them, a row
-//! that selects nothing visible; on a staged window, against the warp-a-key
-//! form over the same rows.
+//! that selects nothing visible; on a staged window and on a pooled index's
+//! selection, against the warp-a-key form over the same rows. Two passes
+//! land the same bits.
 
 use crate::common::{Gpu, Lcg, close, from_bf16};
 use dtype::Dtype;
@@ -33,6 +33,7 @@ const FLOAT_BYTES: usize = 64 << 20;
 
 struct Case {
     rope: usize,
+    pooled: bool,
     q_nope: Vec<f32>,
     q_pe: Vec<f32>,
     ckv: Vec<f32>,
@@ -64,6 +65,9 @@ impl Case {
     }
 
     fn selection(&self) -> Vec<i32> {
+        if self.pooled {
+            return self.pooled_selection();
+        }
         let mut out = vec![-1i32; self.tokens() * TOP_K];
         for r in 0..Q_LENS.len() {
             for i in 0..Q_LENS[r] {
@@ -76,6 +80,34 @@ impl Case {
                     }
                     out[t * TOP_K + n] = j as i32;
                     n += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// A pooled index's: blocks of four tokens a row ranks, expanded whole
+    /// (some of a block past the row), -1 for a dropped block, then the
+    /// row's last three tokens, which may repeat a block's.
+    fn pooled_selection(&self) -> Vec<i32> {
+        let mut out = vec![-1i32; self.tokens() * TOP_K];
+        for r in 0..Q_LENS.len() {
+            for i in 0..Q_LENS[r] {
+                let t = self.qo_indptr[r] as usize + i;
+                let abs = KV_LENS[r] - Q_LENS[r] + i;
+                let blocks = (abs + 1).div_ceil(4).min((TOP_K - 3) / 4);
+                for b in 0..blocks {
+                    if b % 3 == 1 {
+                        continue; // dropped
+                    }
+                    for k in 0..4 {
+                        out[t * TOP_K + 4 * b + k] = (4 * b + k) as i32;
+                    }
+                }
+                for k in 0..3 {
+                    if abs >= k {
+                        out[t * TOP_K + TOP_K - 3 + k] = (abs - k) as i32;
+                    }
                 }
             }
         }
@@ -171,6 +203,7 @@ fn score(
     tc: bool,
     window: Option<(u32, u32)>,
     decode: bool,
+    pooled: bool,
 ) -> ((Vec<u16>, Vec<f32>), Case) {
     let mut rng = Lcg::seeded(0x6c73_6533 + rope as u64);
     let tokens: usize = Q_LENS.iter().sum();
@@ -186,6 +219,7 @@ fn score(
     #[allow(clippy::cast_precision_loss)]
     let case = Case {
         rope,
+        pooled,
         q_nope,
         q_pe,
         ckv,
@@ -292,13 +326,23 @@ fn score(
     )
 }
 
-fn check(rope: usize, window: Option<(u32, u32)>, decode: bool) {
-    let (got, case) = score(rope, true, window, decode);
+fn check(rope: usize, window: Option<(u32, u32)>, decode: bool, pooled: bool) {
+    let (got, case) = score(rope, true, window, decode, pooled);
+    let (again, _) = score(rope, true, window, decode, pooled);
+    assert!(
+        got.0 == again.0
+            && got
+                .1
+                .iter()
+                .zip(&again.1)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "rope {rope} {window:?} decode {decode} pooled {pooled}: two passes land apart"
+    );
     // On a window the warp-a-key form is the reference, over the same rows.
     let want = match window {
-        None => case.reference(),
-        Some(_) => {
-            let (naive, _) = score(rope, false, window, decode);
+        None if !pooled => case.reference(),
+        _ => {
+            let (naive, _) = score(rope, false, window, decode, pooled);
             (naive.0.iter().map(|&b| from_bf16(b)).collect(), naive.1)
         }
     };
@@ -336,13 +380,15 @@ fn check(rope: usize, window: Option<(u32, u32)>, decode: bool) {
 
 #[test]
 fn the_sparse_mla_lands_on_tcgen05() {
-    for rope in [64, 0] {
-        check(rope, None, false);
-    }
-    check(64, Some((30, 25)), false);
+    check(64, None, false, false);
+    // A pooled index's selection (holes, repeats, ids past the row),
+    // against the warp-a-key form.
+    check(64, None, false, true);
+    check(64, None, true, true);
+    check(64, Some((30, 25)), false, false);
     // The decode arm sees the request's keys, not the row's own prefix: the
     // selections here read none past a row's position, so both answer alike.
-    check(64, None, true);
+    check(64, None, true, false);
 }
 
 /// One 4096-row prefill selecting up to 2048 tokens a row, both forms.
@@ -390,6 +436,7 @@ fn the_sparse_mla_paces_a_prefill() {
     let qo = [0i32, ROWS as i32];
     let case = Case {
         rope: 64,
+        pooled: false,
         q_nope: Vec::new(),
         q_pe: Vec::new(),
         ckv: Vec::new(),
