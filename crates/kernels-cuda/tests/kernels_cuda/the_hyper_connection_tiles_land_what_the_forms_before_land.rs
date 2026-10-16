@@ -723,3 +723,89 @@ fn the_pre_mix_lands_the_operand_its_gemm_would_quantize() {
         }
     }
 }
+
+/// The pre-mix at a decode's rows over 96 layers' planes in turn, so each
+/// launch reads its projection plane cold as a model's step does.
+#[test]
+#[ignore = "a timing probe, run by hand"]
+fn the_pre_mix_times_cold() {
+    let h = 4096usize;
+    let fan = M * h;
+    let mix_hc = 2 * M + M * M;
+    let layers = 96usize;
+    for rows in [8usize, 64] {
+        let mut lcg = Lcg::seeded(3);
+        let mut gpu = Gpu::open();
+        let planes: Vec<u64> = (0..layers)
+            .map(|_| {
+                gpu.up(&(0..mix_hc * fan)
+                    .map(|_| lcg.unit() * 0.01)
+                    .collect::<Vec<f32>>())
+            })
+            .collect();
+        let streams: Vec<u64> = (0..layers)
+            .map(|_| {
+                gpu.up(&(0..rows * fan)
+                    .map(|_| to_bf16(lcg.unit()))
+                    .collect::<Vec<u16>>())
+            })
+            .collect();
+        let gate_w: Vec<(u64, u64, u64)> = (0..layers)
+            .map(|_| {
+                (
+                    gpu.up(&[0.7f32, 1.3, 0.9]),
+                    gpu.up(&vec![0.1f32; mix_hc]),
+                    gpu.up(&vec![to_bf16(1.0); h]),
+                )
+            })
+            .collect();
+        let out_m = gpu.zeros(rows * mix_hc * 4);
+        let out_x = gpu.zeros(rows * h * 2);
+        let out_p = gpu.zeros(rows * M * 4);
+        let out_c = gpu.zeros(rows * M * M * 4);
+        let r = rows as u32;
+        let ctx = gpu.ctx().with_tuning(tuning(true));
+        let held = kernels_cuda::linear::act_quant::held_planes(&ctx, "test.held", r, h as u32)
+            .expect("the held planes");
+        let fire = |l: usize| {
+            let (scale, base, w) = gate_w[l];
+            let gate = hc::Gate {
+                scale: Tensor::new(scale, 1, 3, Dtype::F32),
+                base: Tensor::new(base, 1, mix_hc as u32, Dtype::F32),
+                gate_eps: 1e-6,
+                alpha: 2.0,
+                sinkhorn: 20,
+            };
+            hc::pre(
+                &ctx,
+                Tensor::new(streams[l], r, fan as u32, Dtype::Bf16),
+                1e-6,
+                Tensor::new(planes[l], mix_hc as u32, fan as u32, Dtype::F32),
+                M as u32,
+                &mut Tensor::new(out_m, r, mix_hc as u32, Dtype::F32),
+                gate,
+                Tensor::new(w, h as u32, 1, Dtype::Bf16),
+                1e-6,
+                Some(held),
+                &mut Tensor::new(out_p, r, M as u32, Dtype::F32),
+                &mut Tensor::new(out_c, r, (M * M) as u32, Dtype::F32),
+                &mut Tensor::new(out_x, r, h as u32, Dtype::Bf16),
+            )
+            .unwrap();
+        };
+        for l in 0..layers {
+            fire(l);
+        }
+        gpu.sync();
+        let rounds = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..rounds {
+            for l in 0..layers {
+                fire(l);
+            }
+        }
+        gpu.sync();
+        let us = t0.elapsed().as_secs_f64() * 1e6 / (rounds * layers) as f64;
+        eprintln!("cold rows {rows:3} pre {us:6.2} us");
+    }
+}

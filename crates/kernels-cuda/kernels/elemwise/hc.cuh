@@ -432,6 +432,42 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int tid = threadIdx.x;
     const int mix_hc = M * 2 + M * M;
+    // Every load the fold does not feed is issued before it: the gates'
+    // scales and bases, the norm's weight and the streams the row pre-mixes.
+    // At a decode they come cold from memory (a step streams the experts'
+    // banks between one layer's use and the next), and each would otherwise
+    // be its own round trip after the fold.
+    constexpr int COLS = H / THREADS;
+    const int MM = M * M;
+    float gate_s = 0.f, gate_b = 0.f, comb_s = 0.f, comb_b = 0.f;
+    float wv[COLS];
+    // The first four streams' columns are held; any past them are read late.
+    constexpr int HELD = 4;
+    float rv[COLS][HELD];
+    if (blockIdx.y == 1) {
+        if (tid < M) {
+            gate_s = scale[1];
+            gate_b = base[M + tid];
+        }
+        if (tid < MM) {
+            comb_s = scale[2];
+            comb_b = base[2 * M + tid];
+        }
+    } else {
+        if (tid < M) {
+            gate_s = scale[0];
+            gate_b = base[tid];
+        }
+        const T* res_n = residual + static_cast<long long>(plane_row) * M * H;
+#pragma unroll
+        for (int p = 0; p < COLS; ++p) {
+            const int h = tid + p * THREADS;
+            wv[p] = Elem<T>::to_f32(weight[h]);
+#pragma unroll
+            for (int k = 0; k < HELD; ++k)
+                rv[p][k] = k < M ? Elem<T>::to_f32(res_n[k * H + h]) : 0.f;
+        }
+    }
     // Under `PARTIAL` the row's mixes are the projection's slices
     // (`mixes[slice][row][mix_hc + 1]`, the dots then the sum of squares),
     // summed as `hc_prenorm_project_fold` sums them: a warp a mix, its lanes
@@ -442,13 +478,34 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
         const int warp = tid >> 5;
         const int lane = tid & 31;
         const int w = mix_hc + 1;
-        for (int c = warp; c <= mix_hc; c += THREADS / 32) {
+        // The row's slices are runs of `w` adjacent values. A warp a slice
+        // group (slices `g`, `g + 32`, ...), its lanes the run's values, sums
+        // what lane `g` of a column's warp would; the groups' sums then fold
+        // a warp a column in that warp's order, so a warp's loads are a run's
+        // adjacent values rather than a value a run.
+        if (THREADS == 1024 && w <= 32) {
+            __shared__ float red[32][33];
             float sum = 0.f;
-            for (int s = lane; s < slices; s += 32)
-                sum += mixes[(static_cast<long long>(s) * gridDim.x + n) * w + c];
+            if (lane < w)
+                for (int s = warp; s < slices; s += 32)
+                    sum += mixes[(static_cast<long long>(s) * gridDim.x + n) * w + lane];
+            red[warp][lane] = sum;
+            __syncthreads();
+            if (warp < w) {
+                float v = red[lane][warp];
 #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
-            if (lane == 0) folded[c] = sum;
+                for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+                if (lane == 0) folded[warp] = v;
+            }
+        } else {
+            for (int c = warp; c <= mix_hc; c += THREADS / 32) {
+                float sum = 0.f;
+                for (int s = lane; s < slices; s += 32)
+                    sum += mixes[(static_cast<long long>(s) * gridDim.x + n) * w + c];
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+                if (lane == 0) folded[c] = sum;
+            }
         }
         __syncthreads();
         const float sq = folded[mix_hc];
@@ -461,13 +518,12 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
     if (blockIdx.y == 1) {
         if (tid >= 32) return;
         if (tid < M) {
-            const float pl = row[M + tid] * scale[1] + base[M + tid];
+            const float pl = row[M + tid] * gate_s + gate_b;
             post_mix[static_cast<long long>(plane_row) * M + tid] =
                 1.f / (1.f + expf(-pl)) * hc_post_alpha;
         }
-        const int MM = M * M;
         const int i = tid / M, j = tid % M;
-        float c = tid < MM ? row[2 * M + tid] * scale[2] + base[2 * M + tid] : 0.f;
+        float c = tid < MM ? row[2 * M + tid] * comb_s + comb_b : 0.f;
         auto at = [&](int lane) { return __shfl_sync(0xffffffffu, c, lane < MM ? lane : 0); };
         {
             float max_v = -flt_max();
@@ -502,7 +558,7 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
     __shared__ float buf[BLOCK / 32 + 1];
     __shared__ float xsm[H];
     if (tid < M) {
-        const float logit = row[tid] * scale[0] + base[tid];
+        const float logit = row[tid] * gate_s + gate_b;
         pre[tid] = 1.f / (1.f + expf(-logit)) + hc_eps;
     }
     __syncthreads();
@@ -510,10 +566,13 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
     // order rounded to the element, into shared memory.
     const T* res_n = residual + static_cast<long long>(plane_row) * M * H;
 #pragma unroll
-    for (int p = 0; p < H / THREADS; ++p) {
+    for (int p = 0; p < COLS; ++p) {
         const int h = tid + p * THREADS;
         float acc = 0.f;
-        for (int k = 0; k < M; ++k) acc += pre[k] * Elem<T>::to_f32(res_n[k * H + h]);
+#pragma unroll
+        for (int k = 0; k < HELD; ++k)
+            if (k < M) acc += pre[k] * rv[p][k];
+        for (int k = HELD; k < M; ++k) acc += pre[k] * Elem<T>::to_f32(res_n[k * H + h]);
         xsm[h] = Elem<T>::to_f32(Elem<T>::from_f32(acc));
     }
     __syncthreads();
@@ -541,10 +600,9 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
     const float inv_rms = rsqrtf(buf[BLOCK / 32] / static_cast<float>(H) + norm_eps);
     T* yr = y + static_cast<long long>(plane_row) * H;
 #pragma unroll
-    for (int p = 0; p < H / THREADS; ++p) {
+    for (int p = 0; p < COLS; ++p) {
         const int h = tid + p * THREADS;
-        const float wv = Elem<T>::to_f32(weight[h]);
-        yr[h] = Elem<T>::from_f32(xsm[h] * inv_rms * wv);
+        yr[h] = Elem<T>::from_f32(xsm[h] * inv_rms * wv[p]);
     }
     // Under `EMIT` the normed row also lands as the e4m3 1x128 operand a
     // GEMM's quantize would make of it (codes row-major, ue8m0 atoms): a

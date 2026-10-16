@@ -769,9 +769,19 @@ fn prenorm_launch(
     let mix_hc = hc_fn.rows;
     let rows = nonzero(op, "rows", mixes.rows)?;
     let wide = rows >= TILE_FROM;
-    // A decode's few rows cut the row 256 columns a block: the fold's warps
-    // (or the gates', under `pre`) take the 64 slices that leaves.
-    let floor = if wide { 512 } else { 256 };
+    // A decode's few rows (one block of them) cut the row 128 columns a
+    // block: the 128 slices that leaves read the projection plane, cold at a
+    // decode, over as many SMs (DeepSeek-V4 at 8 rows, planes cold: 7.0 ->
+    // 5.0 us), and the fold's warps (or the gates', under `pre`) take them.
+    // Past one block of rows, 256 columns a block, the 64 slices measured
+    // no slower.
+    let floor = if wide {
+        512
+    } else if rows <= 32 {
+        128
+    } else {
+        256
+    };
     let (br, kt) = (if wide { TILE_ROWS } else { 32 }, TILE_K);
     let row_blocks = rows.div_ceil(br);
     let want = 2 * ctx.multiprocessors().unwrap_or(132);
