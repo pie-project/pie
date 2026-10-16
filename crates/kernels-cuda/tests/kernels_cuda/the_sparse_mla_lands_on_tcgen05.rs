@@ -673,6 +673,8 @@ fn glm_decodes_selected_attention_paces_8_rows() {
     let (_, naive) = decode_bs8(false, 20);
     let (_, tc) = decode_bs8(true, 200);
     eprintln!("| 8 rows, top 2048 | warp a key {naive:.1} us | tcgen05 split {tc:.1} us |");
-    let (_, one) = decode_rows(1, true, 200);
-    eprintln!("| 1 row, top 2048 | tcgen05 split {one:.1} us |");
+    for reqs in [1, 32, 64] {
+        let (_, us) = decode_rows(reqs, true, 200);
+        eprintln!("| {reqs} rows, top 2048 | tcgen05 split {us:.1} us |");
+    }
 }

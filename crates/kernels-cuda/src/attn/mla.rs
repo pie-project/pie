@@ -763,15 +763,12 @@ mod sparse {
             _ => 0,
         };
         // Few rows (a decode) deal each row's tiles over splits, so the
-        // multiprocessors fill: as many as fill them, at most a split a
-        // tile of the selection.
+        // multiprocessors fill in one wave: as many as fit them whole, at
+        // most a split a tile of the selection, and at most 16 (a split's
+        // Q load and partial write cost about a tile's work of their own).
         let sms = ctx.multiprocessors().unwrap_or(148);
         let tiles = s.selection.width.div_ceil(64).max(1);
-        let splits = if rows * 2 <= sms {
-            sms.div_ceil(rows).min(tiles).min(32)
-        } else {
-            1
-        };
+        let splits = (sms / rows.max(1)).min(tiles).clamp(1, 16);
         let (part_o, part_lse) = if splits > 1 {
             let units = rows as usize * splits as usize * 64;
             (
