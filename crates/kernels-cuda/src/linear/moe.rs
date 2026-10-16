@@ -926,6 +926,7 @@ const SWAPPED_UP_ROUTES: u32 = 16;
 /// layer (256 experts, top 6, 4096 x 2048), held at the power cap: the
 /// whole MLP 713 -> 679 us at 64 tokens, 916 -> 883 at 512, 938 -> 906 at
 /// 1024; at 2048 (48 an expert) unswapped wins, 982 against 1008.
+#[cfg(feature = "cuda")]
 const SWAPPED_W4A8_UP_ROUTES: u32 = 32;
 
 #[cfg(feature = "cuda")]
