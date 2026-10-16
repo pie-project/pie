@@ -57,8 +57,14 @@ pub fn layernorm_rope(
     let rope_dim = stated(OP, rope_dim)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_knorm_rope<::pie::bf16>")
-            .apply(Launch::per_row(k.rows, K_BLOCK)),
+        // A warp a row where the profile says (`kernel.elemwise.rows_vec`).
+        if ctx.tuning().rows_vec {
+            Fire::at(FILE, "::pie::attn::index_knorm_rope_warp<::pie::bf16>")
+                .apply(Launch::per_row(k.rows, 32))
+        } else {
+            Fire::at(FILE, "::pie::attn::index_knorm_rope<::pie::bf16>")
+                .apply(Launch::per_row(k.rows, K_BLOCK))
+        },
         &[
             k.arg(),
             weight.arg(),
@@ -90,8 +96,15 @@ pub fn rope(
     let rope_dim = stated(OP, rope_dim)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_q_rope<::pie::bf16>")
-            .apply(Launch::per_row(q.rows, q_rope_block(n_heads))),
+        // A thread a (head, pair) where the profile says
+        // (`kernel.elemwise.rows_vec`).
+        if ctx.tuning().rows_vec {
+            Fire::at(FILE, "::pie::attn::index_q_rope_pairs<::pie::bf16>")
+                .apply(Launch::per_row(q.rows, K_BLOCK))
+        } else {
+            Fire::at(FILE, "::pie::attn::index_q_rope<::pie::bf16>")
+                .apply(Launch::per_row(q.rows, q_rope_block(n_heads)))
+        },
         &[
             q.arg(),
             positions.arg(),

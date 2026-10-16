@@ -364,3 +364,49 @@ fn the_pooled_index_turns_its_queries_as_it_loads_them() {
         "turning as it loads selects what turning first selects"
     );
 }
+
+/// The indexer's rotations a pair a thread (`kernel.elemwise.rows_vec`)
+/// land what a head or a row a thread lands: the query's rotation bit for
+/// bit, the key's layer norm within its moments' summation order.
+#[test]
+fn the_indexers_rotations_land_the_same_a_pair_a_thread() {
+    const ROWS: usize = 5;
+    const HEADS: usize = 32;
+    let mut rng = Lcg::seeded(0x1d0e);
+    let (q_raw, _) = rng.row(ROWS * HEADS * DIM);
+    let (k_raw, _) = rng.row(ROWS * DIM);
+    let (w_raw, _) = rng.row(DIM);
+    let (b_raw, _) = rng.row(DIM);
+    let positions: Vec<i32> = (0..ROWS as i32).map(|r| r * 977 + 3).collect();
+    let mut gpu = Gpu::open();
+    let pos_t = Tensor::new(gpu.up(&positions), ROWS as u32, 1, Dtype::I32);
+    let w_t = Tensor::new(gpu.up(&w_raw), DIM as u32, 1, Dtype::Bf16);
+    let b_t = Tensor::new(gpu.up(&b_raw), DIM as u32, 1, Dtype::Bf16);
+    let mut out = Vec::new();
+    for vec in [false, true] {
+        let ctx = gpu.ctx().with_tuning(Tuning {
+            rows_vec: vec,
+            ..Tuning::DEFAULT
+        });
+        let q_at = gpu.up(&q_raw);
+        let k_at = gpu.up(&k_raw);
+        let mut q = Tensor::new(q_at, ROWS as u32, (HEADS * DIM) as u32, Dtype::Bf16);
+        let mut k = Tensor::new(k_at, ROWS as u32, DIM as u32, Dtype::Bf16);
+        index::rope(&ctx, &mut q, pos_t, HEADS as u32, DIM as u32, 64, 10000.0)
+            .expect("the query rotation fires");
+        index::layernorm_rope(&ctx, &mut k, pos_t, w_t, b_t, 1e-6, 64, 10000.0)
+            .expect("the key's norm and rotation fire");
+        gpu.sync();
+        let q_out: Vec<u16> = gpu.down(q_at, ROWS * HEADS * DIM);
+        let k_out: Vec<u16> = gpu.down(k_at, ROWS * DIM);
+        out.push((q_out, k_out));
+    }
+    assert_eq!(out[0].0, out[1].0, "the query rotation lands bit for bit");
+    for (i, (&a, &b)) in out[0].1.iter().zip(&out[1].1).enumerate() {
+        let (a, b) = (from_bf16(a), from_bf16(b));
+        assert!(
+            (a - b).abs() <= b.abs() / 128.0 + 1e-3,
+            "key element {i}: {a} a warp a row against {b} a block a row"
+        );
+    }
+}

@@ -92,6 +92,82 @@ __global__ void index_q_rope(
     for (int d = 0; d < rope_dim; ++d) row[d] = Elem<T>::from_f32(buf[d]);
 }
 
+// `index_knorm_rope` a warp a row (rows_vec): the layer norm's moments by
+// shuffles, the normed row rounded to T as the plane holds it, then the
+// rotated pairs a lane each, every pair's frequency its own.
+template <class T>
+__global__ void index_knorm_rope_warp(
+    T* __restrict__ idx_k,
+    const T* __restrict__ w,
+    const T* __restrict__ b,
+    const i32* __restrict__ positions,
+    i32 head_dim, i32 rope_dim, float theta, float eps,
+    const u32* __restrict__ win)
+{
+    const int n = static_cast<int>(blockIdx.x);
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int lane = static_cast<int>(threadIdx.x);
+    T* row = idx_k + static_cast<long long>(n_row) * head_dim;
+    float s = 0.f;
+    for (int d = lane; d < head_dim; d += 32) s += Elem<T>::to_f32(row[d]);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    const float mean = s / head_dim;
+    float vv = 0.f;
+    for (int d = lane; d < head_dim; d += 32) {
+        const float x = Elem<T>::to_f32(row[d]) - mean;
+        vv += x * x;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) vv += __shfl_xor_sync(0xffffffffu, vv, o);
+    const float inv = rsqrtf(vv / head_dim + eps);
+    __syncwarp();
+    for (int d = lane; d < head_dim; d += 32) {
+        const float x = (Elem<T>::to_f32(row[d]) - mean) * inv;
+        row[d] = Elem<T>::from_f32(x * Elem<T>::to_f32(w[d]) + Elem<T>::to_f32(b[d]));
+    }
+    __syncwarp();
+    const int pos = positions[n_row];
+    for (int i = lane; i < rope_dim / 2; i += 32) {
+        const float freq = powf(theta, -2.f * static_cast<float>(i) / static_cast<float>(rope_dim));
+        float c, sn;
+        __sincosf(static_cast<float>(pos) * freq, &sn, &c);
+        const float a = Elem<T>::to_f32(row[2 * i]);
+        const float bb = Elem<T>::to_f32(row[2 * i + 1]);
+        row[2 * i] = Elem<T>::from_f32(a * c - bb * sn);
+        row[2 * i + 1] = Elem<T>::from_f32(bb * c + a * sn);
+    }
+}
+
+// `index_q_rope` with a thread a (head, pair) (rows_vec): the same
+// rotation, every pair at once rather than a head's pairs in turn.
+template <class T>
+__global__ void index_q_rope_pairs(
+    T* __restrict__ idx_q,
+    const i32* __restrict__ positions,
+    i32 n_heads, i32 head_dim, i32 rope_dim, float theta,
+    const u32* __restrict__ win)
+{
+    const int n = static_cast<int>(blockIdx.x);
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int half = rope_dim / 2;
+    const int pos = positions[n_row];
+    for (int it = static_cast<int>(threadIdx.x); it < n_heads * half; it += static_cast<int>(blockDim.x)) {
+        const int h = it / half;
+        const int i = it % half;
+        T* row = idx_q + (static_cast<long long>(n_row) * n_heads + h) * head_dim;
+        const float freq = powf(theta, -2.f * static_cast<float>(i) / static_cast<float>(rope_dim));
+        float c, sn;
+        __sincosf(static_cast<float>(pos) * freq, &sn, &c);
+        const float a = Elem<T>::to_f32(row[2 * i]);
+        const float bb = Elem<T>::to_f32(row[2 * i + 1]);
+        row[2 * i] = Elem<T>::from_f32(a * c - bb * sn);
+        row[2 * i + 1] = Elem<T>::from_f32(bb * c + a * sn);
+    }
+}
+
 template <class T>
 __global__ void index_topk_mask(
     const T* __restrict__ idx_q,
