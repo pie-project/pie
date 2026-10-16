@@ -1,0 +1,22 @@
+# Engine settings for the agent-os example (Metal, one device).
+#   total_pages           the KV pool, in pages of 32 tokens. 4096 = 131k tokens, ~2 GB for this model.
+#                         (0 = auto-size to the device's free room, perf/metal-auto-kv-pool; on a 24 GB
+#                          Mac shared with other apps it left too little for 32-row waves: see README)
+#   max_model_len = 131072 the arena is one sequence of pages; its highest used page must fit
+#   max_forward_tokens / max_forward_requests: the engine sizes scratch buffers for these up front.
+#       10240 / 512 (the defaults) cost ~11 GB of a 24 GB Mac before a single token is decoded;
+#       2048 / 64 cost ~2 GB and are plenty for 32-row waves of 1 token each.
+[model]
+name = "default"
+model = "Qwen/Qwen3.5-0.8B"
+
+[engine]
+type = "metal"
+device = ["metal:0"]
+activation_dtype = "bfloat16"
+gpu_mem_utilization = 0.90
+kv_page_size = 32
+total_pages = 4096
+max_model_len = 131072
+max_forward_tokens = 2048
+max_forward_requests = 64
