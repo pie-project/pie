@@ -2612,3 +2612,92 @@ pub fn sigmoid_gate_add(
         ],
     )
 }
+
+/// A grouped projection whose routes send row group `g` to bank `g` (what
+/// `group_routes` lays): one strided batched GEMM, group `g` of every row
+/// against plane `g`, rather than the routed select's layout, gather,
+/// pointer table and reorder. `x` is `[rows, groups * k]`, `w` the plane
+/// `[groups * n, k]` (group `g`'s `n` rows after group `g - 1`'s), `y`
+/// `[rows, groups * n]`; bf16 throughout.
+#[cfg(feature = "cuda")]
+pub fn matmul_grouped_strided(
+    ctx: &Ctx,
+    x: Tensor,
+    w: Tensor,
+    y: &mut Tensor,
+    groups: u32,
+) -> Result<(), Error> {
+    use cudarc::cublas::sys::{
+        cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmStridedBatchedEx,
+        cublasOperation_t, cublasStatus_t, cudaDataType,
+    };
+    const OP: &str = "linear.matmul_grouped";
+    if x.dtype != Dtype::Bf16 || w.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
+        return Err(refuse(OP, "the strided grouped leg reads and lands bf16"));
+    }
+    if groups == 0
+        || !x.width.is_multiple_of(groups)
+        || !y.width.is_multiple_of(groups)
+        || x.rows != y.rows
+    {
+        return Err(refuse(OP, "the groups do not divide the rows' widths"));
+    }
+    let k = x.width / groups;
+    let n = y.width / groups;
+    if u64::from(w.rows) * u64::from(w.width) != u64::from(groups) * u64::from(n) * u64::from(k) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the plane is [{}, {}], not {groups} groups of [{n}, {k}]",
+                w.rows, w.width
+            ),
+        ));
+    }
+    if y.rows == 0 {
+        return Ok(());
+    }
+    let int =
+        |v: u32| i32::try_from(v).map_err(|_| refuse(OP, "an extent past the int cuBLAS takes"));
+    let handle = ctx.cublas(OP)?.cast::<cublasContext>();
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    // Column-major: Y_g^T (n x rows) = W_g (row-major [n, k], so op T) x
+    // X_g^T (k x rows, a column every `groups * k`).
+    // SAFETY: `handle` is this context's live cuBLAS handle, bound to its
+    // stream by the shell; the three planes hold what the extents say.
+    let status = unsafe {
+        cublasGemmStridedBatchedEx(
+            handle,
+            cublasOperation_t::CUBLAS_OP_T,
+            cublasOperation_t::CUBLAS_OP_N,
+            int(n)?,
+            int(y.rows)?,
+            int(k)?,
+            core::ptr::from_ref(&alpha).cast(),
+            w.ptr as usize as *const core::ffi::c_void,
+            cudaDataType::CUDA_R_16BF,
+            int(k)?,
+            i64::from(n) * i64::from(k),
+            x.ptr as usize as *const core::ffi::c_void,
+            cudaDataType::CUDA_R_16BF,
+            int(x.width)?,
+            i64::from(k),
+            core::ptr::from_ref(&beta).cast(),
+            y.ptr as usize as *mut core::ffi::c_void,
+            cudaDataType::CUDA_R_16BF,
+            int(y.width)?,
+            i64::from(n),
+            int(groups)?,
+            cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+    };
+    if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(refuse(
+            OP,
+            format!("`cublasGemmStridedBatchedEx` answered {}", status as i32),
+        ))
+    }
+}

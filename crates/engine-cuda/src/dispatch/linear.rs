@@ -666,6 +666,29 @@ impl Run<'_> {
                         ),
                     });
                 }
+                // Routes that send each row's group g to plane g (`group_routes`
+                // made them): one strided batched GEMM, no layout or reorder.
+                let trivial = matches!(
+                    self.values()[routes.0 as usize].def,
+                    poem_ir::Def::Op(at) if matches!(
+                        &self.nodes()[at as usize].op,
+                        poem_ir::Operation::Linear(Linear::GroupRoutes { groups: g, .. }) if *g == groups_nz
+                    )
+                );
+                if trivial {
+                    let (bank, _) = self.expert_bank(*w);
+                    if bank.dtype == Dtype::Bf16 && x.dtype == Dtype::Bf16 && y.dtype == Dtype::Bf16
+                    {
+                        let mut y = y;
+                        return linear::moe::matmul_grouped_strided(
+                            self.ctx(),
+                            x,
+                            bank,
+                            &mut y,
+                            groups_nz,
+                        );
+                    }
+                }
                 let rows = x.rows * groups_nz;
                 let x =
                     kernels_cuda::tensor::Tensor::new(x.ptr, rows, x.width / groups_nz, x.dtype);
