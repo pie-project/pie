@@ -6,7 +6,11 @@ assumes = { cc = 100 }
 
 [kernel]
 gemv.bf16 = "narrow"
-mla.path  = "naive"
+# Dense latent attention on the FA2 arms (a selected one is the naive
+# kernel's whatever this says): Kimi-K3's first four layers prefill 32 x
+# 4096 in 1.50 s against 1.83 s on the naive kernel, decode bs1/8/64 2.33 /
+# 3.53 / 8.58 ms against 2.36 / 3.46 / 8.90.
+mla.path  = "fa2"
 # DeepSeek-V4's compressed-pool attention on mma.sync, a block a row's 16
 # heads, rather than the scalar walk a block a row and head.
 sdpa.pool_mma = true

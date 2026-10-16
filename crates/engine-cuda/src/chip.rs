@@ -402,7 +402,9 @@ mod tests {
                 "{gpu}"
             );
             if major >= 10 {
-                assert!(tuning.gemv_narrow && tuning.mla_naive, "{gpu}");
+                // sm_100 alone reads dense latent attention on the FA2 arms.
+                assert!(tuning.gemv_narrow, "{gpu}");
+                assert_eq!(tuning.mla_naive, (major, minor) != (10, 0), "{gpu}");
                 // B200 alone also runs the tcgen05 selects and GLU epilogues.
                 let b200 = (major, minor) == (10, 0);
                 assert_eq!(tuning.moe_tc5, b200, "{gpu}");
