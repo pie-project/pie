@@ -10,13 +10,8 @@ pub struct StreamPlan {
     pub streams: u32,
 }
 
-#[cfg(test)]
-pub(crate) fn fork(trace: &Trace, regions: &mut [Region], profile: &DeviceProfile) -> StreamPlan {
-    fork_with(trace, regions, profile, &[])
-}
-
-/// [`fork`], each of `blocks`' branches (`branch::blocks`) first: a branch's
-/// regions one chain on one stream, the first branch on the main one, the
+/// The regions forked onto side streams, each of `blocks`' branches
+/// (`branch::blocks`) first: a branch's regions one chain on one stream, the first branch on the main one, the
 /// others on side streams from where the first starts, all joined before
 /// the join's region.
 pub(crate) fn fork_with(
