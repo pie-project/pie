@@ -6,7 +6,8 @@ use poem::ops::{attn, elemwise, layout, linear};
 use poem::pattern::{Pattern, Template, template};
 use poem_ir::ops::fused::PostNorm;
 use poem_ir::{
-    ActQuant, Dim, Dtype, Elementwise, Fused, ModulateForm, NormKind, Operation, StructKind, Ty,
+    ActQuant, Dim, Dtype, Elementwise, Fused, Layout, ModulateForm, NormKind, Operation,
+    StructKind, Ty,
 };
 
 use super::Rule;
@@ -1010,15 +1011,21 @@ fn matmul_split_rows() -> Rule {
     let pattern = template(|p| {
         let y = linear::matmul(&p.rows("act", W), &p.weight("w", [W, W]));
         p.name("y", &y);
-        let (left, right) = layout::split_rows(&y, p.u32("width"));
+        // Any cut matches: the pattern cuts at a width its rows hold, and
+        // the replacement reads the trace's own.
+        let (left, right) = layout::split_rows(&y, W as u32 / 2);
+        p.free("width");
         p.export("left", &left);
         p.export("right", &right);
     });
     Rule::new("linear.matmul_split_rows", [pattern], |m| {
+        let Operation::Layout(Layout::SplitRows { width, .. }) = m.op("left") else {
+            panic!("`left` comes from a row split");
+        };
         Fused::MatmulSplitRows {
             act: m.value("act"),
             w: m.value("w"),
-            width: m.u32("width"),
+            width: *width,
             y: m.value("y"),
             left: m.value("left"),
             right: m.value("right"),
