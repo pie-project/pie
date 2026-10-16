@@ -60,7 +60,17 @@ sdpa.selected_mma = true
 # leaving the frame for the next (Gemma-4-31B: 6,100 one-fire frames a run,
 # 70 of 93 lanes a wave). Gemma-4-31B serves 1533 -> 1744 output tok/s,
 # TPOT p50 56.4 -> 41.5 ms.
+#
+# The row lattice holds a bucket between each pair of powers of two (12288
+# beside 8192 and 16384, ...): a serving burst's prompt fires of 8-12k rows at
+# a cohort's turnover ran the 16384 body, 0.8 s whatever their size. 256
+# requests of 1024 in / 256 out offered at once, two pairs each:
+# Gemma-4-31B 1712 / 1732 -> 1782 / 1795 output tok/s, Qwen3.8-27B 3235 /
+# 3214 -> 3342 / 3345, gpt-oss-120b 5436 -> 5523; the fixed prefill and
+# decode points within run to run (Gemma decode bs64 20.69 / 20.97 -> 21.06 /
+# 20.86 ms, Qwen3.8-27B 16.05 -> 16.30, gpt-oss-120b 13.57 -> 13.53).
 [engine]
+lattice_steps = 2
 host_planes = true
 one_frame_when_short = true
 seated_first = true

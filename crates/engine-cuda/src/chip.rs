@@ -602,8 +602,10 @@ mod tests {
         assert_eq!(Engine::of(&b200).forward_tokens, 16384);
         assert_eq!(Engine::of(&b200).walk_fire_rows, 4096);
         assert!(Engine::of(&b200).host_planes);
+        assert_eq!(Engine::of(&b200).lattice_steps, 2);
         assert_eq!(
             Engine {
+                lattice_steps: 1,
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 seated_first: false,
@@ -613,13 +615,14 @@ mod tests {
                 ..Engine::of(&b200)
             },
             Engine::of(&family),
-            "only the state seating, the planner's order, the fire width and the host \
-             planes differ from the family's engine"
+            "only the row lattice, the state seating, the planner's order, the fire width and \
+             the host planes differ from the family's engine"
         );
         assert_eq!(Engine::of(&family).state_slots_per_lane, 0);
         assert!(!Engine::of(&family).one_frame_when_short);
         assert!(!Engine::of(&family).seated_first);
         assert!(!Engine::of(&family).host_planes);
+        assert_eq!(Engine::of(&family).lattice_steps, 1);
     }
 
     /// The two-launch gated delta scan is an sm_100 family decision; every
