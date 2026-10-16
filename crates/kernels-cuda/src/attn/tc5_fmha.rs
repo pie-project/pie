@@ -300,11 +300,22 @@ pub struct Planes {
 }
 
 /// The widths [`prefill_planes`] runs: a 192-wide key over a 128-wide
-/// value (DeepSeek's and Kimi-K3's expanded latent heads), or one width for
-/// both.
+/// value (DeepSeek-V3's and Kimi-K3's expanded latent heads), 256 over 256
+/// (GLM-5.3's), or 128 or 64 for both.
 #[must_use]
 pub fn planes_take(dqk: u32, dv: u32) -> bool {
-    supported() && matches!((dqk, dv), (192, 128) | (128, 128) | (64, 64))
+    supported() && matches!((dqk, dv), (192, 128) | (256, 256) | (128, 128) | (64, 64))
+}
+
+/// The key tile and ring depth a width pair runs at: TMEM holds two S
+/// buffers, O and Q (`2 bkv + dv + dqk / 2` columns of 512), shared memory
+/// the K and V rings.
+const fn planes_tiling(dqk: u32, dv: u32) -> (u32, u32) {
+    match (dqk, dv) {
+        (256, 256) => (64, 3),
+        (192, 128) => (128, 2),
+        _ => (128, 3),
+    }
 }
 
 /// One query head a key head, every head's rows in [`Planes`]: the tcgen05
@@ -317,11 +328,12 @@ pub fn prefill_planes(ctx: &Ctx, op: &'static str, at: &Planes) -> Result<(), Er
             format!("no tcgen05 prefill reads {} x {} heads", at.dqk, at.dv),
         ));
     }
-    if at.page < 16 || !at.page.is_multiple_of(16) || !128u32.is_multiple_of(at.page) {
+    let (bkv, stages) = planes_tiling(at.dqk, at.dv);
+    if at.page < 16 || !at.page.is_multiple_of(16) || !bkv.is_multiple_of(at.page) {
         return Err(refuse(
             op,
             format!(
-                "a {}-token page is not whole 16-token slices of a 128-key tile",
+                "a {}-token page is not whole 16-token slices of a {bkv}-key tile",
                 at.page
             ),
         ));
@@ -329,7 +341,6 @@ pub fn prefill_planes(ctx: &Ctx, op: &'static str, at: &Planes) -> Result<(), Er
     if ![at.q, at.o, at.k, at.v].iter().all(|&p| aligned16(p)) {
         return Err(refuse(op, "a plane is not 16-byte aligned"));
     }
-    let (bkv, stages) = (128u32, if at.dqk == at.dv { 3 } else { 2 });
     let map = |ptr: u64, d: u32, head: u32, cell: u32, rows: u32| {
         encode(Map {
             ptr,

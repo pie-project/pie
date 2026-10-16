@@ -92,8 +92,7 @@ fn fixture(
     }
 }
 
-fn reads(lens: &[(usize, usize)], heads: usize) {
-    let (dqk, dv) = (192, 128);
+fn reads(lens: &[(usize, usize)], heads: usize, dqk: usize, dv: usize) {
     let mut gpu = Gpu::open();
     if !planes_take(dqk as u32, dv as u32) {
         eprintln!("no tcgen05 here: skipped");
@@ -152,8 +151,10 @@ fn reads(lens: &[(usize, usize)], heads: usize) {
 fn the_tcgen05_prefill_reads_keys_and_values_of_their_own_widths() {
     // A whole prompt, one past a tile, a prompt over a cached prefix, a
     // short one.
-    reads(&[(300, 300)], 2);
-    reads(&[(129, 129), (40, 200), (7, 7)], 3);
+    reads(&[(300, 300)], 2, 192, 128);
+    reads(&[(129, 129), (40, 200), (7, 7)], 3, 192, 128);
+    // GLM-5.3's expanded heads: 256 over 256, 64-key tiles.
+    reads(&[(129, 129), (40, 200), (7, 7)], 2, 256, 256);
 }
 
 /// A Kimi-K3 MLA layer's expanded prefill: 32 x 4096 rows, 96 heads.
