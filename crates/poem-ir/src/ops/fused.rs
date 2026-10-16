@@ -210,6 +210,28 @@ pub enum Fused {
         head_dim: u32,
         o_out: ValueId,
     },
+    /// A sublayer's whole hyper-connection pre-mix: the stream norm
+    /// (`norm`, an `HcRmsnormF32`), the mix projection over it (`project`, an
+    /// `HcProject`), the combined gates over the mixes (`gates`, an
+    /// `HcGates`) and the RMS norm over the row they pre-mix (`rmsnorm`, an
+    /// `Rmsnorm`): a backend lands the post and combine mixes and the normed
+    /// row in two passes, or runs the four. The normed streams, the mixes
+    /// and the pre-mixed row are still outputs, read by nothing else.
+    HcPre {
+        norm: Box<Elementwise>,
+        project: Box<Elementwise>,
+        gates: Box<Elementwise>,
+        rmsnorm: Box<Elementwise>,
+    },
+    /// The combined hyper-connection gates and the RMS norm over the row
+    /// they pre-mix (`gates` an `HcGates`, `norm` an `Rmsnorm` of its `x`):
+    /// a backend lands the post and combine mixes and the normed row in one
+    /// pass, or runs the two. The pre-mixed row is still an output, read by
+    /// nothing else.
+    HcGatesNorm {
+        gates: Box<Elementwise>,
+        norm: Box<Elementwise>,
+    },
     /// A hyper-connection stream norm and the mix projection it feeds
     /// (`norm` an `HcRmsnormF32`, `project` an `HcProject` of its rows): a
     /// backend lands the mixes from the streams in one pass, the norm's
@@ -469,6 +491,30 @@ impl Operands for Fused {
             // The window's (q, plan, cache), the pool's (q, positions,
             // requests, its selection, entries), then the sinks: the merge
             // reads only what the two land.
+            // The streams, the plane, the gates' scale and base, the weight.
+            Self::HcPre {
+                norm,
+                project,
+                gates,
+                rmsnorm,
+            } => {
+                norm.inputs(sink);
+                if let Elementwise::HcProject { weight, .. } = **project {
+                    sink.push(weight);
+                }
+                if let Elementwise::HcGates { scale, base, .. } = **gates {
+                    sink.extend([scale, base]);
+                }
+                if let Elementwise::Rmsnorm { weight, .. } = **rmsnorm {
+                    sink.push(weight);
+                }
+            }
+            Self::HcGatesNorm { gates, norm } => {
+                gates.inputs(sink);
+                if let Elementwise::Rmsnorm { weight, .. } = **norm {
+                    sink.push(weight);
+                }
+            }
             Self::HcPrenormProject { norm, project } => {
                 norm.inputs(sink);
                 if let Elementwise::HcProject { weight, .. } = **project {
@@ -623,6 +669,21 @@ impl Operands for Fused {
                 norm.outputs(sink);
                 project.outputs(sink);
             }
+            Self::HcGatesNorm { gates, norm } => {
+                gates.outputs(sink);
+                norm.outputs(sink);
+            }
+            Self::HcPre {
+                norm,
+                project,
+                gates,
+                rmsnorm,
+            } => {
+                norm.outputs(sink);
+                project.outputs(sink);
+                gates.outputs(sink);
+                rmsnorm.outputs(sink);
+            }
             Self::PoolAttention {
                 window,
                 pool,
@@ -683,7 +744,10 @@ impl Operands for Fused {
                     sink.push((*o_out, o));
                 }
             }
-            Self::NormModulate { .. } | Self::HcPrenormProject { .. } => {}
+            Self::NormModulate { .. }
+            | Self::HcPrenormProject { .. }
+            | Self::HcGatesNorm { .. }
+            | Self::HcPre { .. } => {}
             Self::GatedResidualNormModulate { r_out, r, .. } => sink.push((*r_out, *r)),
             Self::LmHeadSoftcap { y, y_out, .. } | Self::MatmulBias { y, y_out, .. } => {
                 sink.push((*y_out, *y));
@@ -733,6 +797,8 @@ impl Operands for Fused {
             Self::LseSink { .. } => "attention.lse_sink",
             Self::PoolAttention { .. } => "attention.pool_attention",
             Self::HcPrenormProject { .. } => "elementwise.hc_prenorm_project",
+            Self::HcGatesNorm { .. } => "elementwise.hc_gates_norm",
+            Self::HcPre { .. } => "elementwise.hc_pre",
             Self::MoeExperts { .. } => "linear.moe_experts",
             Self::QkvFusedQknormRopeVnormWrite { .. } => {
                 "custom_cuda.qkv_fused_qknorm_rope_vnorm_write"

@@ -15,6 +15,8 @@ impl DispatchFused for Run<'_> {
             Fused::LseSink { .. } => self.lse_sink(op),
             Fused::PoolAttention { .. } => self.pool_attention(op),
             Fused::HcPrenormProject { .. } => self.hc_prenorm_project(op),
+            Fused::HcGatesNorm { .. } => self.hc_gates_norm(op),
+            Fused::HcPre { .. } => self.hc_pre(op),
             Fused::MatmulGeglu { .. }
             | Fused::MatmulSwiglu { .. }
             | Fused::MlpSwiglu { .. }
@@ -45,6 +47,155 @@ impl DispatchFused for Run<'_> {
 }
 
 impl Run<'_> {
+    /// A sublayer's whole pre-mix: in two launches where the profile's tiled
+    /// hyper-connection kernels run (the normed streams, the mixes and the
+    /// pre-mixed row left unwritten, as nothing reads them), else the four as
+    /// the trace had them.
+    fn hc_pre(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::HcPre {
+            norm,
+            project,
+            gates,
+            rmsnorm,
+        } = op
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        // A prefill's rows: the one-pass projection, then the gates and the
+        // norm apart, whose 16-byte forms stream a long fire faster than the
+        // block-a-row pre-mix.
+        if self.ctx().tuning().hc_tile
+            && let poem_ir::Elementwise::HcRmsnormF32 { streams, eps, .. } = &**norm
+            && let poem_ir::Elementwise::HcProject {
+                weight,
+                stream_count,
+                mixes,
+                ..
+            } = &**project
+            && self.tensor(*streams).rows >= kernels_cuda::elemwise::hc::PRE_WIDE_FROM
+            && kernels_cuda::elemwise::hc::prenorm_project(
+                self.ctx(),
+                self.tensor(*streams),
+                *eps,
+                self.tensor(*weight),
+                *stream_count,
+                &mut self.tensor(*mixes),
+            )?
+        {
+            self.elementwise(gates)?;
+            return self.elementwise(rmsnorm);
+        }
+        if self.ctx().tuning().hc_tile
+            && let (
+                poem_ir::Elementwise::HcRmsnormF32 {
+                    streams,
+                    eps: mix_eps,
+                    ..
+                },
+                poem_ir::Elementwise::HcProject {
+                    weight: plane,
+                    stream_count,
+                    mixes,
+                    ..
+                },
+                poem_ir::Elementwise::HcGates {
+                    scale,
+                    base,
+                    gate_eps,
+                    alpha,
+                    sinkhorn,
+                    comb: true,
+                    post_mix,
+                    comb_mix,
+                    ..
+                },
+                poem_ir::Elementwise::Rmsnorm { weight, eps, y, .. },
+            ) = (&**norm, &**project, &**gates, &**rmsnorm)
+            && kernels_cuda::elemwise::hc::pre(
+                self.ctx(),
+                self.tensor(*streams),
+                *mix_eps,
+                self.tensor(*plane),
+                *stream_count,
+                &mut self.tensor(*mixes),
+                kernels_cuda::elemwise::hc::Gate {
+                    scale: self.tensor(*scale),
+                    base: self.tensor(*base),
+                    gate_eps: *gate_eps,
+                    alpha: *alpha,
+                    sinkhorn: *sinkhorn,
+                },
+                self.tensor(*weight),
+                *eps,
+                &mut self.tensor(*post_mix),
+                &mut self.tensor(*comb_mix),
+                &mut self.tensor(*y),
+            )?
+        {
+            return Ok(());
+        }
+        self.elementwise(norm)?;
+        self.elementwise(project)?;
+        self.elementwise(gates)?;
+        self.elementwise(rmsnorm)
+    }
+
+    /// The combined gates and the RMS norm over their pre-mixed row: in one
+    /// launch where the profile's tiled hyper-connection kernels run (the
+    /// pre-mixed row left unwritten, as nothing reads it), else the two as
+    /// the trace had them.
+    fn hc_gates_norm(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::HcGatesNorm { gates, norm } = op else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let (
+            poem_ir::Elementwise::HcGates {
+                normed,
+                streams,
+                scale,
+                base,
+                stream_count,
+                gate_eps,
+                alpha,
+                sinkhorn,
+                comb: true,
+                post_mix,
+                comb_mix,
+                ..
+            },
+            poem_ir::Elementwise::Rmsnorm { weight, eps, y, .. },
+        ) = (&**gates, &**norm)
+        else {
+            self.elementwise(gates)?;
+            return self.elementwise(norm);
+        };
+        if self.ctx().tuning().hc_tile {
+            let landed = kernels_cuda::elemwise::hc::gates_norm(
+                self.ctx(),
+                self.tensor(*normed),
+                self.tensor(*streams),
+                *stream_count,
+                kernels_cuda::elemwise::hc::Gate {
+                    scale: self.tensor(*scale),
+                    base: self.tensor(*base),
+                    gate_eps: *gate_eps,
+                    alpha: *alpha,
+                    sinkhorn: *sinkhorn,
+                },
+                self.tensor(*weight),
+                *eps,
+                &mut self.tensor(*post_mix),
+                &mut self.tensor(*comb_mix),
+                &mut self.tensor(*y),
+            )?;
+            if landed {
+                return Ok(());
+            }
+        }
+        self.elementwise(gates)?;
+        self.elementwise(norm)
+    }
+
     /// A stream norm and the mix projection over it: in one pass over the
     /// streams where the profile's tiled hyper-connection kernels run (the
     /// normed rows left unwritten, as nothing reads them), else the two as

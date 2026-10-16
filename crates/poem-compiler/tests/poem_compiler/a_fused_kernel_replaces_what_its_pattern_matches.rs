@@ -580,3 +580,62 @@ fn deepseeks_kv_plane_norm_rotation_and_write_land_as_one_op() {
         ["elementwise.norm_rope_last_append"]
     );
 }
+
+/// A hyper-connection sublayer's pre-mix: the stream norm, the mix
+/// projection, the combined gates and the RMS norm over their row land as
+/// one op where the backend forms it, as the norm and projection plus the
+/// gates and norm where it forms only those, and a normed row read past the
+/// projection keeps the norm apart.
+#[test]
+fn a_hyper_connection_pre_mix_lands_as_one_op() {
+    let sublayer = |escape: bool| {
+        trace(move |p| {
+            let streams = p.rows("streams", 4 * 64);
+            let normed = elemwise::hc_rmsnorm_f32(&streams, 1e-6);
+            let mixes = elemwise::hc_project(&normed, &p.weight("plane", [24, 256]), 4);
+            let (x, post, comb) = elemwise::hc_gates(
+                &mixes,
+                &streams,
+                &p.weight("scale", [3]),
+                &p.weight("base", [24]),
+                4,
+                1e-6,
+                2.0,
+                20,
+            );
+            let y = elemwise::rmsnorm(&x, &p.weight("norm", [64]), 1e-6);
+            elemwise::silu(&y);
+            elemwise::hc_fold(&y, &streams, &post, &comb);
+            if escape {
+                elemwise::hc_project(&normed, &p.weight("other", [4, 256]), 4);
+            }
+        })
+    };
+    let all = [
+        "elementwise.hc_pre",
+        "elementwise.hc_prenorm_project",
+        "elementwise.hc_gates_norm",
+    ];
+    assert_eq!(
+        ops(&fuse(sublayer(false), &all)),
+        [
+            "elementwise.hc_pre",
+            "elementwise.silu",
+            "elementwise.hc_fold"
+        ]
+    );
+    assert_eq!(
+        ops(&fuse(sublayer(false), &all[1..])),
+        [
+            "elementwise.hc_prenorm_project",
+            "elementwise.hc_gates_norm",
+            "elementwise.silu",
+            "elementwise.hc_fold"
+        ]
+    );
+    let kept = ops(&fuse(sublayer(true), &all));
+    assert!(
+        kept.contains(&"elementwise.hc_rmsnorm_f32") && kept.contains(&"elementwise.hc_gates_norm"),
+        "{kept:?}"
+    );
+}

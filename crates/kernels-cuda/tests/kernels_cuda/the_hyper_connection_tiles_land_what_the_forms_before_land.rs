@@ -243,6 +243,7 @@ fn the_hyper_connection_forms_time() {
         let out_p = gpu.zeros(rows * M * 4);
         let out_c = gpu.zeros(rows * M * M * 4);
         let out_q = gpu.zeros(rows * 64 * 512 * 2);
+        let gpu_w = gpu.up(&vec![to_bf16(1.0); h]);
         let r = rows as u32;
         for tile in [false, true] {
             let ctx = gpu.ctx().with_tuning(tuning(tile));
@@ -279,6 +280,33 @@ fn the_hyper_connection_forms_time() {
                         Tensor::new(w, mix_hc as u32, fan as u32, Dtype::F32),
                         M as u32,
                         &mut Tensor::new(out_m, r, mix_hc as u32, Dtype::F32),
+                    )
+                    .unwrap();
+                });
+            }
+            if tile {
+                let w_norm = gpu_w;
+                time("pre", &|| {
+                    let gate = hc::Gate {
+                        scale: Tensor::new(scale, 1, 3, Dtype::F32),
+                        base: Tensor::new(bias, 1, mix_hc as u32, Dtype::F32),
+                        gate_eps: 1e-6,
+                        alpha: 2.0,
+                        sinkhorn: 20,
+                    };
+                    hc::pre(
+                        &ctx,
+                        Tensor::new(streams, r, fan as u32, Dtype::Bf16),
+                        1e-6,
+                        Tensor::new(w, mix_hc as u32, fan as u32, Dtype::F32),
+                        M as u32,
+                        &mut Tensor::new(out_m, r, mix_hc as u32, Dtype::F32),
+                        gate,
+                        Tensor::new(w_norm, h as u32, 1, Dtype::Bf16),
+                        1e-6,
+                        &mut Tensor::new(out_p, r, M as u32, Dtype::F32),
+                        &mut Tensor::new(out_c, r, (M * M) as u32, Dtype::F32),
+                        &mut Tensor::new(out_x, r, h as u32, Dtype::Bf16),
                     )
                     .unwrap();
                 });
@@ -394,4 +422,201 @@ fn the_fused_norm_and_projection_answer_the_host() {
     check_prenorm(130, 8, None);
     check_prenorm(129, 4, None);
     check_prenorm(200, 24, Some((150, 6)));
+}
+
+/// The gates and the RMS norm over their pre-mixed row in one launch land
+/// what the pair lands, bit for bit: post, combine and the normed row, on
+/// the staged window's rows and nowhere else.
+fn gates_norm_pass(fused: bool, window: Option<(u32, u32, u32)>) -> Vec<Vec<u16>> {
+    let (rows, live, base) = window.unwrap_or((19, 19, 0));
+    let planes = (base + rows) as usize;
+    let h = 4096usize;
+    let mix_hc = 2 * M + M * M;
+    let mut lcg = Lcg::seeded(0x9a7e5);
+    let mixes: Vec<f32> = (0..planes * mix_hc).map(|_| lcg.unit() * 3.0).collect();
+    let streams: Vec<u16> = (0..planes * M * h)
+        .map(|_| to_bf16(lcg.unit() * 2.0))
+        .collect();
+    let weight: Vec<u16> = (0..h).map(|_| to_bf16(1.0 + lcg.unit() * 0.5)).collect();
+    let mut gpu = Gpu::open();
+    let mixes_at = gpu.up(&mixes);
+    let streams_at = gpu.up(&streams);
+    let scale_at = gpu.up(&[0.7f32, 1.3, 0.9]);
+    let base_v: Vec<f32> = (0..mix_hc).map(|_| lcg.unit()).collect();
+    let base_at = gpu.up(&base_v);
+    let w_at = gpu.up(&weight);
+    let x_at = gpu.zeros(planes * h * 2);
+    let y_at = gpu.zeros(planes * h * 2);
+    let post_at = gpu.zeros(planes * M * 4);
+    let comb_at = gpu.zeros(planes * M * M * 4);
+    let ctx = gpu.ctx().with_tuning(tuning(true));
+    if window.is_some() {
+        let win_at = gpu.up(&[live, base, 0u32, 0u32]);
+        ctx.arm_stage(win_at);
+    }
+    let r = rows;
+    let mixes_t = Tensor::new(mixes_at, r, mix_hc as u32, Dtype::F32);
+    let streams_t = Tensor::new(streams_at, r, (M * h) as u32, Dtype::Bf16);
+    let scale_t = Tensor::new(scale_at, 1, 3, Dtype::F32);
+    let base_t = Tensor::new(base_at, 1, mix_hc as u32, Dtype::F32);
+    let w_t = Tensor::new(w_at, h as u32, 1, Dtype::Bf16);
+    let mut post = Tensor::new(post_at, r, M as u32, Dtype::F32);
+    let mut comb = Tensor::new(comb_at, r, (M * M) as u32, Dtype::F32);
+    let mut y = Tensor::new(y_at, r, h as u32, Dtype::Bf16);
+    if fused {
+        let gate = hc::Gate {
+            scale: scale_t,
+            base: base_t,
+            gate_eps: 1e-6,
+            alpha: 2.0,
+            sinkhorn: 20,
+        };
+        let landed = hc::gates_norm(
+            &ctx, mixes_t, streams_t, M as u32, gate, w_t, 1e-6, &mut post, &mut comb, &mut y,
+        )
+        .expect("the fused gates fire");
+        assert!(landed, "a 4096-wide row of four streams is the kernel's");
+    } else {
+        let mut x = Tensor::new(x_at, r, h as u32, Dtype::Bf16);
+        hc::gates(
+            &ctx, mixes_t, streams_t, scale_t, base_t, M as u32, 1e-6, 2.0, 20, true, &mut x,
+            &mut post, &mut comb,
+        )
+        .expect("the gates fire");
+        norm::rmsnorm(&ctx, x, w_t, 1e-6, &mut y).expect("the norm fires");
+    }
+    gpu.sync();
+    let f32_bits = |at: u64, n: usize| -> Vec<u16> {
+        let v: Vec<f32> = gpu.down(at, n);
+        v.iter()
+            .flat_map(|f| {
+                let b = f.to_bits();
+                [b as u16, (b >> 16) as u16]
+            })
+            .collect()
+    };
+    vec![
+        f32_bits(post_at, planes * M),
+        f32_bits(comb_at, planes * M * M),
+        gpu.down(y_at, planes * h),
+    ]
+}
+
+#[test]
+fn the_fused_gates_and_norm_land_what_the_pair_lands() {
+    for window in [None, Some((24, 17, 5))] {
+        let pair = gates_norm_pass(false, window);
+        let fused = gates_norm_pass(true, window);
+        for (k, name) in ["post", "combine", "normed row"].iter().enumerate() {
+            assert_eq!(
+                pair[k], fused[k],
+                "the {name} lands bit for bit ({window:?})"
+            );
+        }
+    }
+}
+
+/// The whole pre-mix in two launches lands what the fused projection, the
+/// gates and the RMS norm land one after another, bit for bit: at a
+/// decode's rows (the gates summing the projection's slices), at a
+/// prefill's, and on a window.
+fn pre_pass(whole: bool, rows: u32, window: Option<(u32, u32)>) -> Vec<Vec<u16>> {
+    let (live, base) = window.unwrap_or((rows, 0));
+    let planes = (base + rows) as usize;
+    let h = 4096usize;
+    let fan = M * h;
+    let mix_hc = 2 * M + M * M;
+    let mut lcg = Lcg::seeded(0x5e7 + u64::from(rows));
+    let streams: Vec<u16> = (0..planes * fan)
+        .map(|_| to_bf16(lcg.unit() * 2.0))
+        .collect();
+    let plane: Vec<f32> = (0..mix_hc * fan).map(|_| lcg.unit() * 0.02).collect();
+    let base_v: Vec<f32> = (0..mix_hc).map(|_| lcg.unit()).collect();
+    let weight: Vec<u16> = (0..h).map(|_| to_bf16(1.0 + lcg.unit() * 0.5)).collect();
+    let mut gpu = Gpu::open();
+    let streams_at = gpu.up(&streams);
+    let plane_at = gpu.up(&plane);
+    let scale_at = gpu.up(&[0.7f32, 1.3, 0.9]);
+    let base_at = gpu.up(&base_v);
+    let w_at = gpu.up(&weight);
+    let mixes_at = gpu.zeros(planes * mix_hc * 4);
+    let x_at = gpu.zeros(planes * h * 2);
+    let y_at = gpu.zeros(planes * h * 2);
+    let post_at = gpu.zeros(planes * M * 4);
+    let comb_at = gpu.zeros(planes * M * M * 4);
+    let ctx = gpu.ctx().with_tuning(tuning(true));
+    if window.is_some() {
+        let win_at = gpu.up(&[live, base, 0u32, 0u32]);
+        ctx.arm_stage(win_at);
+    }
+    let streams_t = Tensor::new(streams_at, rows, fan as u32, Dtype::Bf16);
+    let plane_t = Tensor::new(plane_at, mix_hc as u32, fan as u32, Dtype::F32);
+    let mut mixes = Tensor::new(mixes_at, rows, mix_hc as u32, Dtype::F32);
+    let gate = hc::Gate {
+        scale: Tensor::new(scale_at, 1, 3, Dtype::F32),
+        base: Tensor::new(base_at, 1, mix_hc as u32, Dtype::F32),
+        gate_eps: 1e-6,
+        alpha: 2.0,
+        sinkhorn: 20,
+    };
+    let w_t = Tensor::new(w_at, h as u32, 1, Dtype::Bf16);
+    let mut post = Tensor::new(post_at, rows, M as u32, Dtype::F32);
+    let mut comb = Tensor::new(comb_at, rows, (M * M) as u32, Dtype::F32);
+    let mut y = Tensor::new(y_at, rows, h as u32, Dtype::Bf16);
+    if whole {
+        let landed = hc::pre(
+            &ctx, streams_t, 1e-6, plane_t, M as u32, &mut mixes, gate, w_t, 1e-6, &mut post,
+            &mut comb, &mut y,
+        )
+        .expect("the pre-mix fires");
+        assert!(landed, "a 4096-wide row of four streams is the kernels'");
+    } else {
+        assert!(
+            hc::prenorm_project(&ctx, streams_t, 1e-6, plane_t, M as u32, &mut mixes)
+                .expect("the projection fires")
+        );
+        let mut x = Tensor::new(x_at, rows, h as u32, Dtype::Bf16);
+        hc::gates(
+            &ctx, mixes, streams_t, gate.scale, gate.base, M as u32, 1e-6, 2.0, 20, true, &mut x,
+            &mut post, &mut comb,
+        )
+        .expect("the gates fire");
+        norm::rmsnorm(&ctx, x, w_t, 1e-6, &mut y).expect("the norm fires");
+    }
+    gpu.sync();
+    let f32_bits = |at: u64, n: usize| -> Vec<u16> {
+        let v: Vec<f32> = gpu.down(at, n);
+        v.iter()
+            .flat_map(|f| {
+                let b = f.to_bits();
+                [b as u16, (b >> 16) as u16]
+            })
+            .collect()
+    };
+    vec![
+        f32_bits(post_at, planes * M),
+        f32_bits(comb_at, planes * M * M),
+        gpu.down(y_at, planes * h),
+    ]
+}
+
+#[test]
+fn the_whole_pre_mix_lands_what_its_parts_land() {
+    for (rows, window) in [
+        (1, None),
+        (8, None),
+        (64, None),
+        (300, None),
+        (40, Some((29, 6))),
+        (200, Some((150, 6))),
+    ] {
+        let parts = pre_pass(false, rows, window);
+        let whole = pre_pass(true, rows, window);
+        for (k, name) in ["post", "combine", "normed row"].iter().enumerate() {
+            assert_eq!(
+                parts[k], whole[k],
+                "the {name} lands bit for bit ({rows} rows, {window:?})"
+            );
+        }
+    }
 }

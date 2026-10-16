@@ -911,6 +911,17 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             },
             // The plane, then the normed rows and the mixes.
             Fused::HcPrenormProject { .. } => &[(In(1), F32), (Out(0), F32), (Out(1), F32)],
+            // The gates' mixes, then their post and combine mixes.
+            Fused::HcGatesNorm { .. } => &[(In(0), F32), (Out(1), F32), (Out(2), F32)],
+            // The plane, then the normed streams, the mixes and the post and
+            // combine mixes.
+            Fused::HcPre { .. } => &[
+                (In(1), F32),
+                (Out(0), F32),
+                (Out(1), F32),
+                (Out(3), F32),
+                (Out(4), F32),
+            ],
             Fused::LseSink { attn, .. } => match **attn {
                 Attention::DecodeLse { .. } => {
                     &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)]

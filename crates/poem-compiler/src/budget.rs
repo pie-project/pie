@@ -231,6 +231,8 @@ impl FamilyCosts {
                 | poem_ir::Fused::QgQknormRopeAppend { .. }
                 | poem_ir::Fused::NormModulate { .. }
                 | poem_ir::Fused::HcPrenormProject { .. }
+                | poem_ir::Fused::HcGatesNorm { .. }
+                | poem_ir::Fused::HcPre { .. }
                 | poem_ir::Fused::GatedResidualNormModulate { .. } => self.elementwise,
             },
             poem_ir::Operation::Spatial(_) => self.spatial,

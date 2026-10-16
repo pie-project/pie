@@ -246,6 +246,33 @@ pub fn gates(
         let vec8 = ctx.tuning().hc_tile && whole_runs(hidden, &[streams.ptr, x.ptr]);
         let columns = if vec8 { hidden / 8 } else { hidden };
         let slices = want.div_ceil(x.rows).clamp(1, columns.div_ceil(BLOCK));
+        // The pre-mix on `slices` blocks a row and the Sinkhorn walk on one
+        // more, so the pre-mix waits on no walk.
+        if vec8 {
+            return ctx.fire(
+                OP,
+                Fire::at(
+                    FILE,
+                    symbol(&format!("::pie::elemwise::hc_gates_split<{t}, 256>")),
+                )
+                .apply(Launch::grid([x.rows, slices + 1, 1], [BLOCK, 1, 1])),
+                &[
+                    normed.arg(),
+                    scale.arg(),
+                    base.arg(),
+                    streams.arg(),
+                    post_mix.arg(),
+                    comb_mix.arg(),
+                    x.arg(),
+                    stated(OP, fan)?.arg(),
+                    stated(OP, hidden)?.arg(),
+                    gate_eps.arg(),
+                    alpha.arg(),
+                    stated(OP, sinkhorn)?.arg(),
+                    ctx.stage(),
+                ],
+            );
+        }
         return ctx.fire(
             OP,
             Fire::at(
@@ -294,6 +321,135 @@ pub fn gates(
             ctx.stage(),
         ],
     )
+}
+
+/// The gates' scale and base planes and constants, as `HcGates` states them.
+#[derive(Clone, Copy)]
+pub struct Gate {
+    pub scale: Tensor,
+    pub base: Tensor,
+    pub gate_eps: f32,
+    pub alpha: f32,
+    pub sinkhorn: u32,
+}
+
+/// Whether `hc_gates_norm` takes these: a combine of at most 32 entries over
+/// rows a whole number of 256 up to 4096 wide, the weight the streams'
+/// element.
+fn gates_norm_fits(
+    mixes: &Tensor,
+    streams: &Tensor,
+    stream_count: u32,
+    weight: &Tensor,
+    y: &Tensor,
+) -> bool {
+    let hidden = y.width;
+    matches!(streams.dtype, Dtype::Bf16 | Dtype::F16)
+        && stream_count != 0
+        && stream_count * stream_count <= 32
+        && streams.width == stream_count * hidden
+        && mixes.width == 2 * stream_count + stream_count * stream_count
+        && weight.dtype == streams.dtype
+        && y.dtype == streams.dtype
+        && hidden.is_multiple_of(BLOCK)
+        && (1..=16).contains(&(hidden / BLOCK))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gates_norm_launch(
+    ctx: &Ctx,
+    op: &'static str,
+    mixes: crate::jit::ArgValue,
+    partial: Option<(u32, u32, f32)>,
+    streams: &Tensor,
+    stream_count: u32,
+    gate: Gate,
+    weight: &Tensor,
+    norm_eps: f32,
+    post_mix: &mut Tensor,
+    comb_mix: &mut Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let t = dtype_dispatch!(op, streams.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    nonzero(op, "rows", y.rows)?;
+    let (slices, fan, mix_eps) = partial.unwrap_or((1, streams.width, 0.0));
+    // A row of 1024 or wider pre-mixes 1024 threads a block, its squares
+    // still folded in the 256-thread norm's order.
+    let threads = if y.width.is_multiple_of(1024) {
+        1024
+    } else {
+        BLOCK
+    };
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_gates_norm<{t}, {}, {}, {threads}>",
+                y.width / BLOCK,
+                partial.is_some()
+            )),
+        )
+        .apply(Launch::grid([y.rows, 2, 1], [threads, 1, 1])),
+        &[
+            mixes,
+            gate.scale.arg(),
+            gate.base.arg(),
+            streams.arg(),
+            post_mix.arg(),
+            comb_mix.arg(),
+            weight.arg(),
+            y.arg(),
+            stated(op, stream_count)?.arg(),
+            gate.gate_eps.arg(),
+            gate.alpha.arg(),
+            stated(op, gate.sinkhorn)?.arg(),
+            norm_eps.arg(),
+            stated(op, slices)?.arg(),
+            stated(op, fan)?.arg(),
+            mix_eps.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// The combined gates and the RMS norm over the row they pre-mix in one
+/// launch (`hc_gates_norm`), the pre-mixed row never landed: every value the
+/// pair lands, bit for bit. `Ok(false)` where the shapes are not the
+/// kernel's (no combine, more than 32 combine entries, a width not a whole
+/// number of 256 up to 4096, a weight of another element): the caller runs
+/// the two.
+#[allow(clippy::too_many_arguments)]
+pub fn gates_norm(
+    ctx: &Ctx,
+    mixes: Tensor,
+    streams: Tensor,
+    stream_count: u32,
+    gate: Gate,
+    weight: Tensor,
+    norm_eps: f32,
+    post_mix: &mut Tensor,
+    comb_mix: &mut Tensor,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    if !gates_norm_fits(&mixes, &streams, stream_count, &weight, y) {
+        return Ok(false);
+    }
+    gates_norm_launch(
+        ctx,
+        "elementwise.hc_gates_norm",
+        mixes.arg(),
+        None,
+        &streams,
+        stream_count,
+        gate,
+        &weight,
+        norm_eps,
+        post_mix,
+        comb_mix,
+        y,
+    )?;
+    Ok(true)
 }
 
 pub fn fold(
@@ -568,11 +724,103 @@ const TILE_GROUPS: u32 = 4;
 /// mostly repeat its last row.
 const TILE_FROM: u32 = 128;
 
+/// Whether `hc_prenorm_project_tile` (and its tensor-core form) take
+/// these planes: bf16 streams whole 64-element tiles wide, an f32 plane of
+/// at most 24 mix columns over them, 16-byte aligned.
+fn prenorm_fits(streams: &Tensor, hc_fn: &Tensor, mixes: &Tensor, stream_count: u32) -> bool {
+    streams.dtype == Dtype::Bf16
+        && hc_fn.dtype == Dtype::F32
+        && mixes.dtype == Dtype::F32
+        && hc_fn.width == streams.width
+        && streams.width.is_multiple_of(TILE_K)
+        && hc_fn.rows <= TILE_COLS
+        && mixes.width == hc_fn.rows
+        && mixes.rows == streams.rows
+        && stream_count != 0
+        && stream_count <= MAX_HC_MULT
+        && [streams.ptr, hc_fn.ptr].iter().all(|at| at % 16 == 0)
+}
+
+/// Where `prenorm_launch` landed the projection: the mixes themselves, or
+/// `slices` partial slices at `out`.
+struct Landed {
+    out: u64,
+    slices: u32,
+}
+
+/// The projection's tile launch: a prefill's rows whole, a decode's few cut
+/// across the row.
+fn prenorm_launch(
+    ctx: &Ctx,
+    op: &'static str,
+    streams: &Tensor,
+    eps: f32,
+    hc_fn: &Tensor,
+    mixes: &Tensor,
+) -> Result<Landed, Error> {
+    // At most 8192 partial rows (800 KiB at 24 mixes), in shared scratch.
+    const PARTIAL_ROWS: u32 = 8192;
+    let fan = streams.width;
+    let mix_hc = hc_fn.rows;
+    let rows = nonzero(op, "rows", mixes.rows)?;
+    let wide = rows >= TILE_FROM;
+    // A decode's few rows cut the row 256 columns a block: the fold's warps
+    // (or the gates', under `pre`) take the 64 slices that leaves.
+    let floor = if wide { 512 } else { 256 };
+    let (br, kt) = (if wide { TILE_ROWS } else { 32 }, TILE_K);
+    let row_blocks = rows.div_ceil(br);
+    let want = 2 * ctx.multiprocessors().unwrap_or(132);
+    let slices = want
+        .div_ceil(row_blocks)
+        .clamp(1, (fan / floor).max(1))
+        .min((PARTIAL_ROWS / rows).max(1));
+    let slice = fan.div_ceil(slices).next_multiple_of(kt);
+    let slices = fan.div_ceil(slice);
+    let out = if slices > 1 {
+        ctx.scratch_shared(
+            op,
+            "elementwise.hc_project_partial",
+            (slices * rows * (mix_hc + 1)) as usize * core::mem::size_of::<f32>(),
+        )? as usize as u64
+    } else {
+        mixes.ptr
+    };
+    // A prefill's rows 64 a block over four thread groups, a decode's 32 over
+    // eight.
+    let (kg, stages) = (if wide { TILE_GROUPS } else { 8 }, TILE_STAGES);
+    let tiles = stages * (br * (kt + 8) * 2 + TILE_COLS * (kt + 4) * 4);
+    let fold = (kg - 1) * br * (TILE_COLS + 4) * 4;
+    let (entry, threads, smem) = (
+        format!("::pie::elemwise::hc_prenorm_project_tile<{br}, {kg}, {kt}, {stages}>"),
+        br * kg,
+        tiles.max(fold),
+    );
+    ctx.fire(
+        op,
+        Fire::at(FILE, symbol(&entry)).apply(Launch {
+            smem,
+            ..Launch::grid([row_blocks, slices, 1], [threads, 1, 1])
+        }),
+        &[
+            streams.arg(),
+            hc_fn.arg(),
+            crate::jit::ArgValue::Ptr(out),
+            stated(op, fan)?.arg(),
+            stated(op, mix_hc)?.arg(),
+            stated(op, rows)?.arg(),
+            stated(op, slice)?.arg(),
+            eps.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(Landed { out, slices })
+}
+
 /// The stream norm and the mix projection over it in one pass over the bf16
-/// `streams` (`hc_prenorm_project_tile`, and `hc_prenorm_project_fold` past
-/// one slice): `mixes = (x . w) * rsqrt(mean(x^2) + eps)`. `Ok(false)` where
-/// the shapes are not the tile's (a width not whole 64-element tiles, more
-/// than 24 mix columns, unaligned planes): the caller runs the two.
+/// `streams` (`hc_prenorm_project_tile`, and
+/// `hc_prenorm_project_fold` past one slice): `mixes = (x . w) *
+/// rsqrt(mean(x^2) + eps)`. `Ok(false)` where the shapes are not the
+/// tile's: the caller runs the two.
 pub fn prenorm_project(
     ctx: &Ctx,
     streams: Tensor,
@@ -582,93 +830,81 @@ pub fn prenorm_project(
     mixes: &mut Tensor,
 ) -> Result<bool, Error> {
     const OP: &str = "elementwise.hc_prenorm_project";
-    const SLICE_FLOOR: u32 = 512;
-    const PARTIAL_ROWS: u32 = 2048;
-    let fan = streams.width;
-    let mix_hc = hc_fn.rows;
-    if streams.dtype != Dtype::Bf16
-        || hc_fn.dtype != Dtype::F32
-        || mixes.dtype != Dtype::F32
-        || hc_fn.width != fan
-        || !fan.is_multiple_of(TILE_K)
-        || mix_hc > TILE_COLS
-        || mixes.width != mix_hc
-        || mixes.rows != streams.rows
-        || stream_count == 0
-        || stream_count > MAX_HC_MULT
-        || ![streams.ptr, hc_fn.ptr].iter().all(|at| at % 16 == 0)
-    {
+    if !prenorm_fits(&streams, &hc_fn, mixes, stream_count) {
         return Ok(false);
     }
-    let rows = nonzero(OP, "rows", mixes.rows)?;
-    // Narrow fires (a decode's few rows) on 32-row tiles over eight groups.
-    let (br, kg) = if rows >= TILE_FROM {
-        (TILE_ROWS, TILE_GROUPS)
-    } else {
-        (32, 8)
-    };
-    let (kt, stages) = (TILE_K, TILE_STAGES);
-    let tiles = stages * (br * (kt + 8) * 2 + TILE_COLS * (kt + 4) * 4);
-    let fold = (kg - 1) * br * (TILE_COLS + 4) * 4;
-    let smem = tiles.max(fold);
-    let row_blocks = rows.div_ceil(br);
-    let want = 2 * ctx.multiprocessors().unwrap_or(132);
-    let slices = want
-        .div_ceil(row_blocks)
-        .clamp(1, (fan / SLICE_FLOOR).max(1))
-        .min((PARTIAL_ROWS / rows).max(1));
-    let slice = fan.div_ceil(slices).next_multiple_of(kt);
-    let slices = fan.div_ceil(slice);
-    let out = if slices > 1 {
-        ctx.scratch_shared(
-            OP,
-            "elementwise.hc_project_partial",
-            (slices * rows * (mix_hc + 1)) as usize * core::mem::size_of::<f32>(),
-        )? as usize as u64
-    } else {
-        mixes.ptr
-    };
-    ctx.fire(
-        OP,
-        Fire::at(
-            FILE,
-            symbol(&format!(
-                "::pie::elemwise::hc_prenorm_project_tile<{br}, {kg}, {kt}, {stages}>"
-            )),
-        )
-        .apply(Launch {
-            smem,
-            ..Launch::grid([row_blocks, slices, 1], [br * kg, 1, 1])
-        }),
-        &[
-            streams.arg(),
-            hc_fn.arg(),
-            crate::jit::ArgValue::Ptr(out),
-            stated(OP, fan)?.arg(),
-            stated(OP, mix_hc)?.arg(),
-            stated(OP, rows)?.arg(),
-            stated(OP, slice)?.arg(),
-            eps.arg(),
-            ctx.stage(),
-        ],
-    )?;
-    if slices > 1 {
+    let landed = prenorm_launch(ctx, OP, &streams, eps, &hc_fn, mixes)?;
+    if landed.slices > 1 {
+        let (rows, mix_hc) = (mixes.rows, hc_fn.rows);
         ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::elemwise::hc_prenorm_project_fold")
-                .apply(Launch::flat(rows * mix_hc, BLOCK)),
+            Fire::at(FILE, "::pie::elemwise::hc_prenorm_project_fold").apply(Launch::grid(
+                [(rows * mix_hc).div_ceil(8), 1, 1],
+                [BLOCK, 1, 1],
+            )),
             &[
-                crate::jit::ArgValue::Ptr(out),
+                crate::jit::ArgValue::Ptr(landed.out),
                 mixes.arg(),
                 stated(OP, mix_hc)?.arg(),
                 stated(OP, rows)?.arg(),
-                stated(OP, slices)?.arg(),
-                stated(OP, fan)?.arg(),
+                stated(OP, landed.slices)?.arg(),
+                stated(OP, streams.width)?.arg(),
                 eps.arg(),
                 ctx.stage(),
             ],
         )?;
     }
+    Ok(true)
+}
+
+/// The rows from which a sublayer's pre-mix runs as the one-pass projection
+/// then the gates and norm apart: `pre`'s block-a-row pre-mix wins a
+/// decode's few rows (DeepSeek-V4-Flash, 8 rows: 13.2 us where the parts
+/// take ~17.7) and loses a prefill's (16384 rows: 1054 us where they take
+/// ~836).
+pub const PRE_WIDE_FROM: u32 = TILE_FROM;
+
+/// A sublayer's whole pre-mix in two launches: the stream norm and mix
+/// projection (`prenorm_launch`), then the gates and the RMS norm over the
+/// row they pre-mix (`hc_gates_norm`), which sums the projection's slices
+/// itself where it left several. `Ok(false)` where the shapes are not the
+/// kernels': the caller runs the four ops.
+#[allow(clippy::too_many_arguments)]
+pub fn pre(
+    ctx: &Ctx,
+    streams: Tensor,
+    mix_eps: f32,
+    hc_fn: Tensor,
+    stream_count: u32,
+    mixes: &mut Tensor,
+    gate: Gate,
+    weight: Tensor,
+    norm_eps: f32,
+    post_mix: &mut Tensor,
+    comb_mix: &mut Tensor,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "elementwise.hc_pre";
+    if !prenorm_fits(&streams, &hc_fn, mixes, stream_count)
+        || !gates_norm_fits(mixes, &streams, stream_count, &weight, y)
+    {
+        return Ok(false);
+    }
+    let landed = prenorm_launch(ctx, OP, &streams, mix_eps, &hc_fn, mixes)?;
+    gates_norm_launch(
+        ctx,
+        OP,
+        crate::jit::ArgValue::Ptr(landed.out),
+        (landed.slices > 1).then_some((landed.slices, streams.width, mix_eps)),
+        &streams,
+        stream_count,
+        gate,
+        &weight,
+        norm_eps,
+        post_mix,
+        comb_mix,
+        y,
+    )?;
     Ok(true)
 }
 

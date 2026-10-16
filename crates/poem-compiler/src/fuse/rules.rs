@@ -51,9 +51,97 @@ pub(super) fn all() -> Vec<Rule> {
         split_rope_yarn_append(),
         rope_yarn_append(),
         pool_attention(),
+        hc_pre(),
         hc_prenorm_project(),
+        hc_gates_norm(),
         lse_sink(),
     ]
+}
+
+/// A sublayer's whole hyper-connection pre-mix: the stream norm read only by
+/// the mix projection, the mixes read only by the combined gates, and their
+/// pre-mixed row read only by an RMS norm.
+fn hc_pre() -> Rule {
+    let pattern = template(|p| {
+        let streams = p.rows("streams", 4 * W);
+        let normed = elemwise::hc_rmsnorm_f32(&streams, p.f32("mix_eps"));
+        p.name("normed", &normed);
+        p.free("stream_count");
+        let mixes = elemwise::hc_project(&normed, &p.weight("plane", [24, 4 * W]), 4);
+        p.name("mixes", &mixes);
+        let (x, post, comb) = elemwise::hc_gates(
+            &mixes,
+            &streams,
+            &p.weight("scale", [3]),
+            &p.weight("base", [24]),
+            4,
+            p.f32("gate_eps"),
+            p.f32("alpha"),
+            p.u32("sinkhorn"),
+        );
+        p.name("x", &x);
+        p.export("post", &post);
+        p.export("comb", &comb);
+        let y = elemwise::rmsnorm(&x, &p.weight("weight", [W]), p.f32("eps"));
+        p.export("y", &y);
+    });
+    Rule::new("elementwise.hc_pre", [pattern], |m| {
+        let elementwise = |name: &str| {
+            let Operation::Elementwise(op) = m.op(name) else {
+                panic!("`{name}` comes from an elementwise op");
+            };
+            Box::new(op.clone())
+        };
+        Fused::HcPre {
+            norm: elementwise("normed"),
+            project: elementwise("mixes"),
+            gates: elementwise("x"),
+            rmsnorm: elementwise("y"),
+        }
+    })
+}
+
+/// The combined hyper-connection gates whose pre-mixed row only an RMS norm
+/// reads.
+fn hc_gates_norm() -> Rule {
+    let pattern = template(|p| {
+        let mixes = p.value(
+            "mixes",
+            Ty::Tensor {
+                shape: vec![Dim::Tokens, Dim::Const(24)],
+                dtype: Dtype::F32,
+            },
+        );
+        let streams = p.rows("streams", 4 * W);
+        p.free("stream_count");
+        let (x, post, comb) = elemwise::hc_gates(
+            &mixes,
+            &streams,
+            &p.weight("scale", [3]),
+            &p.weight("base", [24]),
+            4,
+            p.f32("gate_eps"),
+            p.f32("alpha"),
+            p.u32("sinkhorn"),
+        );
+        p.name("x", &x);
+        p.export("post", &post);
+        p.export("comb", &comb);
+        let y = elemwise::rmsnorm(&x, &p.weight("weight", [W]), p.f32("eps"));
+        p.export("y", &y);
+    });
+    Rule::new("elementwise.hc_gates_norm", [pattern], |m| {
+        let elementwise = |name: &str| {
+            let Operation::Elementwise(op) = m.op(name) else {
+                panic!("`{name}` comes from an elementwise op");
+            };
+            Box::new(op.clone())
+        };
+        Fused::HcGatesNorm {
+            gates: elementwise("x"),
+            norm: elementwise("y"),
+        }
+    })
 }
 
 /// A hyper-connection stream norm read only by the mix projection over it.

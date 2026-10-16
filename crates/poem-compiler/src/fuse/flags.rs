@@ -60,6 +60,8 @@ flags! {
     LseSink = "fuse.lse_sink" => "attention.lse_sink",
     PoolAttention = "fuse.pool_attention" => "attention.pool_attention",
     HcPrenormProject = "fuse.hc_prenorm_project" => "elementwise.hc_prenorm_project",
+    HcGatesNorm = "fuse.hc_gates_norm" => "elementwise.hc_gates_norm",
+    HcPre = "fuse.hc_pre" => "elementwise.hc_pre",
 }
 
 /// The fused kernels `profile` turns on, in rule order: what [`super::fuse`]
