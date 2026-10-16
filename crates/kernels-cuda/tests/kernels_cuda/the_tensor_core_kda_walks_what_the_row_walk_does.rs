@@ -129,3 +129,73 @@ fn the_tensor_core_kda_walks_what_the_row_walk_does() {
         near(&format!("{:?} states", case.lens), &s_mma, &s_row);
     }
 }
+
+/// The tensor-core walk at a prefill's width, for nsys to time: eight
+/// 4096-row lanes of GLM-5.3-Flash's 64 heads.
+#[test]
+#[ignore = "a timing fixture, not a check"]
+fn the_tensor_core_kda_paces_a_prefill() {
+    const H: u32 = 64;
+    const W: usize = (H * HEAD_DIM) as usize;
+    let lens = [4096usize; 8];
+    let rows: usize = lens.iter().sum();
+    let mut gpu = Gpu::open();
+    let mut lcg = Lcg::seeded(0x4db);
+    let (mixed, _) = lcg.row(rows * 3 * W);
+    let (f, _) = lcg.row(rows * W);
+    let (b, _) = lcg.row(rows * H as usize);
+    let dt_bias: Vec<f32> = (0..W).map(|_| 0.1 * lcg.unit()).collect();
+    let a_log: Vec<f32> = (0..H).map(|_| -0.5 + 0.2 * lcg.unit()).collect();
+    let stride = (H * HEAD_DIM * HEAD_DIM) as usize;
+    let slab_at = gpu.zeros(lens.len() * stride * 4);
+    let slots: Vec<i32> = (0..lens.len() as i32).collect();
+    let mut indptr: Vec<i32> = vec![0];
+    for len in &lens {
+        indptr.push(indptr.last().unwrap() + *len as i32);
+    }
+    let pool = RecurrentPool {
+        slab: Tensor::new(slab_at, lens.len() as u32, stride as u32, Dtype::F32),
+        slot_ids: Tensor::new(gpu.up(&slots), lens.len() as u32, 1, Dtype::I32),
+        slot_stride_elems: stride as i64,
+        conv_slab: Tensor::ABSENT,
+        conv_stride: 0,
+        write_state: true,
+        write_state_mask: Tensor::ABSENT,
+        commit_len: Tensor::ABSENT,
+        begin_at: Tensor::ABSENT,
+        fused_decay: false,
+    };
+    let y_at = gpu.zeros(rows * W * 4);
+    let mixed_at = gpu.up(&mixed);
+    let f_at = gpu.up(&f);
+    let b_at = gpu.up(&b);
+    let dt_at = gpu.up(&dt_bias);
+    let a_at = gpu.up(&a_log);
+    let indptr_at = gpu.up(&indptr);
+    let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+        ssm_kda_chunked: true,
+        ..kernels_cuda::tuning::Tuning::DEFAULT
+    });
+    for _ in 0..5 {
+        let mut y = Tensor::new(y_at, rows as u32, W as u32, Dtype::F32);
+        ssm::kda_chunked(
+            &ctx,
+            RaggedTensor {
+                data: Tensor::new(mixed_at, rows as u32, 3 * W as u32, Dtype::Bf16),
+                indptr: Tensor::new(indptr_at, indptr.len() as u32, 1, Dtype::I32),
+            },
+            Tensor::new(f_at, rows as u32, W as u32, Dtype::Bf16),
+            Tensor::new(b_at, rows as u32, H, Dtype::Bf16),
+            Tensor::new(dt_at, 1, W as u32, Dtype::F32),
+            Tensor::new(a_at, 1, H, Dtype::F32),
+            &pool,
+            H,
+            HEAD_DIM,
+            1e-6,
+            -5.0,
+            &mut y,
+        )
+        .expect("the KDA scan fires");
+    }
+    gpu.sync();
+}
