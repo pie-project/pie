@@ -257,7 +257,11 @@ struct ReferenceTags : VariantFull {
         kv_base = static_cast<std::uint32_t>(params.kv_indptr[batch_idx]);
     }
 
+    // A query tile's padding rows run past the group's `qo_len` (and the
+    // last group's past the table): no tag is read for a row or key the
+    // group does not hold, so the read stays inside the table.
     REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+        if (qo_idx >= this->qo_len || kv_idx >= this->kv_len) return false;
         const IdType t = params.q_tags[q_base + qo_idx];
         return t < 0 || params.kv_tags[kv_base + kv_idx] == t;
     })
@@ -285,7 +289,9 @@ struct ClassTable : VariantFull {
         kv_base = static_cast<std::uint32_t>(params.kv_indptr[batch_idx]);
     }
 
+    // As `ReferenceTags`: no class is read for a padding row past the group.
     REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+        if (qo_idx >= this->qo_len || kv_idx >= this->kv_len) return false;
         const IdType qc = params.q_classes[q_base + qo_idx];
         const IdType kc = params.kv_classes[kv_base + kv_idx];
         return qc < 0 || kc < 0 ||

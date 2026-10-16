@@ -79,7 +79,7 @@ fn reference(
     o
 }
 
-fn check(hd: u32, q_heads: u32, kv_heads: u32, seed: u64) {
+fn check(hd: u32, q_heads: u32, kv_heads: u32, seed: u64, edge: bool) {
     let groups = [
         Group {
             plain: 7,
@@ -119,7 +119,11 @@ fn check(hd: u32, q_heads: u32, kv_heads: u32, seed: u64) {
     let k_at = gpu.up(&k_raw);
     let v_at = gpu.up(&v_raw);
     let table_at = gpu.up(&table);
-    let tags_at = gpu.up(&tags);
+    let tags_at = if edge {
+        gpu.up_at_edge(&tags)
+    } else {
+        gpu.up(&tags)
+    };
     let o_at = gpu.zeros(rows * qw * 2);
     let ctx = gpu.ctx();
     let csr = Tensor::new(table_at, table.len() as u32, 1, Dtype::I32);
@@ -163,18 +167,20 @@ fn the_ragged_arm_keeps_each_reference_lane_to_itself_every_case() {
     each_reference_lane_attends_itself_alone_at_head_width_128();
     each_reference_lane_attends_itself_alone_at_head_width_256();
     a_short_tag_table_is_refused();
+    the_tags_are_read_no_further_than_the_rows_they_tag();
+    the_class_tables_are_read_no_further_than_the_rows_they_class();
 }
 
 fn each_reference_lane_attends_itself_alone_at_head_width_64() {
-    check(64, 4, 2, 0x71);
+    check(64, 4, 2, 0x71, false);
 }
 
 fn each_reference_lane_attends_itself_alone_at_head_width_128() {
-    check(128, 2, 2, 0x72);
+    check(128, 2, 2, 0x72, false);
 }
 
 fn each_reference_lane_attends_itself_alone_at_head_width_256() {
-    check(256, 2, 1, 0x73);
+    check(256, 2, 1, 0x73, false);
 }
 
 fn a_short_tag_table_is_refused() {
@@ -206,4 +212,75 @@ fn a_short_tag_table_is_refused() {
         refused.to_string().contains("tag table"),
         "the refusal names the table: {refused}"
     );
+}
+
+/// The tag tables end where the device's mapped memory ends, so a read of a
+/// tag past the last row (a query tile's padding rows past the last group)
+/// faults rather than landing on an allocator's neighbouring bytes, as it
+/// once did now and then under a parallel suite.
+fn the_tags_are_read_no_further_than_the_rows_they_tag() {
+    check(64, 4, 2, 0x74, true);
+    check(128, 2, 2, 0x75, true);
+    check(256, 2, 1, 0x76, true);
+}
+
+/// The class arm over class tables that end where mapped memory ends, every
+/// pair of classes allowed: it lands what the unmasked arm lands, and reads
+/// no class past the rows it classes.
+fn the_class_tables_are_read_no_further_than_the_rows_they_class() {
+    let table = [0i32, 7, 18, 39];
+    let rows = 39usize;
+    for (hd, q_heads, kv_heads) in [(64u32, 4u32, 2u32), (128, 2, 2), (256, 2, 1)] {
+        let (qw, kw) = ((q_heads * hd) as usize, (kv_heads * hd) as usize);
+        let mut lcg = Lcg::seeded(0x77 + u64::from(hd));
+        let (q_raw, _) = lcg.row(rows * qw);
+        let (k_raw, _) = lcg.row(rows * kw);
+        let (v_raw, _) = lcg.row(rows * kw);
+        let classes: Vec<i32> = (0..rows as i32).map(|r| r % 3).collect();
+        let mut gpu = Gpu::open();
+        let q_at = gpu.up(&q_raw);
+        let k_at = gpu.up(&k_raw);
+        let v_at = gpu.up(&v_raw);
+        let table_at = gpu.up(&table);
+        let classes_at = gpu.up_at_edge(&classes);
+        let allowed_at = gpu.up_at_edge(&[1u8; 9]);
+        let full_at = gpu.zeros(rows * qw * 2);
+        let classed_at = gpu.zeros(rows * qw * 2);
+        let ctx = gpu.ctx();
+        let csr = Tensor::new(table_at, table.len() as u32, 1, Dtype::I32);
+        let class_table = Tensor::new(classes_at, rows as u32, 1, Dtype::I32);
+        for (mask, out) in [
+            (RaggedMask::None, full_at),
+            (
+                RaggedMask::ClassTable {
+                    q_classes: class_table,
+                    kv_classes: class_table,
+                    table: Tensor::new(allowed_at, 9, 1, Dtype::U8),
+                    count: 3,
+                },
+                classed_at,
+            ),
+        ] {
+            attn_ragged::ragged(
+                &ctx,
+                Tensor::new(q_at, rows as u32, qw as u32, Dtype::Bf16),
+                Tensor::new(k_at, rows as u32, kw as u32, Dtype::Bf16),
+                Tensor::new(v_at, rows as u32, kw as u32, Dtype::Bf16),
+                csr,
+                csr,
+                hd,
+                0.0,
+                mask,
+                &mut Tensor::new(out, rows as u32, qw as u32, Dtype::Bf16),
+            )
+            .expect("the arm fires");
+        }
+        gpu.sync();
+        let full: Vec<u16> = gpu.down(full_at, rows * qw);
+        let classed: Vec<u16> = gpu.down(classed_at, rows * qw);
+        assert_eq!(
+            full, classed,
+            "every class allowed is no mask (head width {hd})"
+        );
+    }
 }

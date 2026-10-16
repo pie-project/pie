@@ -18,7 +18,17 @@ pub struct Gpu {
     stream: rt::cudaStream_t,
     slabs: Slabs,
     device: Vec<*mut c_void>,
+    edges: Vec<Edge>,
     cublas: blas::cublasHandle_t,
+}
+
+/// One granule mapped at the front of a two-granule reservation: the
+/// granule after it is reserved but never mapped, so a read past the
+/// mapped end faults instead of landing on a neighbour's bytes.
+struct Edge {
+    base: u64,
+    granule: usize,
+    handle: u64,
 }
 
 pub fn arm_cache() {
@@ -52,6 +62,7 @@ impl Gpu {
                 stream,
                 slabs,
                 device: Vec::new(),
+                edges: Vec::new(),
                 cublas,
             }
         }
@@ -110,6 +121,83 @@ impl Gpu {
         at
     }
 
+    /// `values` uploaded so their last byte is the last mapped byte of the
+    /// device's memory there: a kernel that reads even one element past
+    /// them faults (an illegal address) rather than reading whatever an
+    /// allocator happened to place next.
+    pub fn up_at_edge<T: Copy>(&mut self, values: &[T]) -> u64 {
+        use kernels_cuda::cudarc::driver::sys as dr;
+        let bytes = core::mem::size_of_val(values);
+        let drv = |code: dr::CUresult, call: &str| {
+            assert_eq!(
+                code,
+                dr::CUresult::CUDA_SUCCESS,
+                "`{call}` answered {code:?}"
+            );
+        };
+        unsafe {
+            let mut prop: dr::CUmemAllocationProp = core::mem::zeroed();
+            prop.type_ = dr::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+            prop.location.type_ = dr::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+            prop.location.id = 0;
+            let mut granule: usize = 0;
+            drv(
+                dr::cuMemGetAllocationGranularity(
+                    &raw mut granule,
+                    &raw const prop,
+                    dr::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+                ),
+                "cuMemGetAllocationGranularity",
+            );
+            assert!(
+                bytes <= granule,
+                "{bytes} bytes do not fit one {granule}-byte granule"
+            );
+            let mut handle: dr::CUmemGenericAllocationHandle = 0;
+            drv(
+                dr::cuMemCreate(&raw mut handle, granule, &raw const prop, 0),
+                "cuMemCreate",
+            );
+            let mut base: dr::CUdeviceptr = 0;
+            drv(
+                dr::cuMemAddressReserve(&raw mut base, 2 * granule, granule, 0, 0),
+                "cuMemAddressReserve",
+            );
+            drv(dr::cuMemMap(base, granule, 0, handle, 0), "cuMemMap");
+            let mut desc: dr::CUmemAccessDesc = core::mem::zeroed();
+            desc.location.type_ = dr::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+            desc.location.id = 0;
+            desc.flags = dr::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            drv(
+                dr::cuMemSetAccess(base, granule, &raw const desc, 1),
+                "cuMemSetAccess",
+            );
+            self.edges.push(Edge {
+                base,
+                granule,
+                handle,
+            });
+            let at = base + (granule - bytes) as u64;
+            let _legacy = legacy();
+            check(
+                rt::cudaMemset(base as *mut c_void, 0, granule),
+                "cudaMemset",
+            );
+            if bytes > 0 {
+                check(
+                    rt::cudaMemcpy(
+                        at as *mut c_void,
+                        values.as_ptr().cast(),
+                        bytes,
+                        rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    ),
+                    "cudaMemcpy H2D",
+                );
+            }
+            at
+        }
+    }
+
     pub fn down<T: Copy + Default>(&self, at: u64, count: usize) -> Vec<T> {
         let mut out = vec![T::default(); count];
         let _legacy = legacy();
@@ -144,6 +232,12 @@ impl Drop for Gpu {
             rt::cudaStreamSynchronize(self.stream);
             for at in self.device.drain(..) {
                 rt::cudaFree(at);
+            }
+            for edge in self.edges.drain(..) {
+                use kernels_cuda::cudarc::driver::sys as dr;
+                let _ = dr::cuMemUnmap(edge.base, edge.granule);
+                let _ = dr::cuMemRelease(edge.handle);
+                let _ = dr::cuMemAddressFree(edge.base, 2 * edge.granule);
             }
             blas::cublasDestroy_v2(self.cublas);
             rt::cudaStreamDestroy(self.stream);
