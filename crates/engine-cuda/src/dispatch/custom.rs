@@ -9,6 +9,7 @@ impl DispatchFused for Run<'_> {
         match op {
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op),
             Fused::RopeYarnAppend { .. } => self.rope_yarn_append(op),
+            Fused::NormRopeLastAppend { .. } => self.norm_rope_last_append(op),
             Fused::SplitRopeYarnAppend { .. } => self.split_rope_yarn_append(op),
             Fused::QgQknormRopeAppend { .. } => self.qg_qknorm_rope_append(op),
             Fused::LseSink { .. } => self.lse_sink(op),
@@ -583,6 +584,94 @@ impl Run<'_> {
             self.tensor(*write_page),
             self.tensor(*write_offset),
         )
+    }
+
+    /// DeepSeek-V4's kv plane normed, rotated and written in one launch
+    /// where the pool holds DeepSeek's fp8 rows (and the profile says,
+    /// `kernel.elemwise.rows_vec`); else the norm and rotation, then the
+    /// write, as the unfused ops fire them.
+    fn norm_rope_last_append(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        use kernels_cuda::elemwise::rope;
+        let Fused::NormRopeLastAppend {
+            x,
+            weight,
+            head_dim,
+            eps,
+            positions,
+            rotary_dim,
+            theta,
+            interleaved,
+            inverse,
+            yarn,
+            y,
+            cache,
+            write_page,
+            write_offset,
+        } = op
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let pool = self.pool(*cache);
+        let yarn = yarn.map(|y| rope::Yarn {
+            factor: y.factor,
+            beta_fast: y.beta_fast,
+            beta_slow: y.beta_slow,
+            original_max_position: y.original_max_position,
+        });
+        let fp8 = kernels_cuda::attn::dsv4::fp8_ds(&pool);
+        let landed = rope::norm_rope_last_append(
+            self.ctx(),
+            self.tensor(*x),
+            self.tensor(*weight),
+            *head_dim,
+            *eps,
+            self.tensor(*positions),
+            *rotary_dim,
+            *theta,
+            *interleaved,
+            *inverse,
+            yarn,
+            &mut self.tensor(*y),
+            fp8.then_some(rope::Append {
+                pool: &pool,
+                write_page: self.tensor(*write_page),
+                write_offset: self.tensor(*write_offset),
+            }),
+        )?;
+        if landed {
+            return Ok(());
+        }
+        rope::norm_rope_last(
+            self.ctx(),
+            self.tensor(*x),
+            Some(self.tensor(*weight)),
+            *head_dim,
+            *eps,
+            self.tensor(*positions),
+            *rotary_dim,
+            *theta,
+            *interleaved,
+            *inverse,
+            yarn,
+            &mut self.tensor(*y),
+        )?;
+        if fp8 {
+            kernels_cuda::attn::dsv4::append(
+                self.ctx(),
+                self.ragged_lanes(*y).data,
+                &pool,
+                self.tensor(*write_page),
+                self.tensor(*write_offset),
+            )
+        } else {
+            kernels_cuda::attn::kv_append_shared(
+                self.ctx(),
+                self.ragged_lanes(*y),
+                &pool,
+                self.tensor(*write_page),
+                self.tensor(*write_offset),
+            )
+        }
     }
 
     /// YaRN and the cache write in one launch where the pool is the plain

@@ -98,6 +98,25 @@ pub enum Fused {
         y: ValueId,
         q_out: ValueId,
     },
+    /// `NormRopeLast` over a row one head wide (scaled), the rotated row
+    /// then written to the cache at its page and offset
+    /// (`KvAppendShared`); `y` is read by nothing else.
+    NormRopeLastAppend {
+        x: ValueId,
+        weight: ValueId,
+        head_dim: u32,
+        eps: f32,
+        positions: ValueId,
+        rotary_dim: u32,
+        theta: f32,
+        interleaved: bool,
+        inverse: bool,
+        yarn: Option<Yarn>,
+        y: ValueId,
+        cache: ValueId,
+        write_page: ValueId,
+        write_offset: ValueId,
+    },
     NormModulate {
         x: ValueId,
         norm: NormKind,
@@ -364,6 +383,15 @@ impl Operands for Fused {
                 sink.extend([*x, *positions]);
                 sink.extend(*weight);
             }
+            Self::NormRopeLastAppend {
+                x,
+                weight,
+                positions,
+                cache,
+                write_page,
+                write_offset,
+                ..
+            } => sink.extend([*x, *weight, *positions, *cache, *write_page, *write_offset]),
             Self::NormModulate {
                 x, m, lane_of_row, ..
             } => {
@@ -553,6 +581,7 @@ impl Operands for Fused {
             } => sink.extend([*e, *e_scaled, *y_out, *y_scaled]),
             Self::RmsnormRopePartialQ { y, q_out, .. } => sink.extend([*y, *q_out]),
             Self::NormRopeLast { y, q_out, .. } => sink.extend([*y, *q_out]),
+            Self::NormRopeLastAppend { y, .. } => sink.push(*y),
             Self::NormModulate { normed, y, .. } => sink.extend([*normed, *y]),
             Self::GatedResidualNormModulate {
                 r_out, normed, out, ..
@@ -666,6 +695,7 @@ impl Operands for Fused {
             | Self::MoeSelectGlu { .. }
             | Self::MoeExperts { .. }
             | Self::SplitRopeYarnAppend { .. }
+            | Self::NormRopeLastAppend { .. }
             | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
             // The rotation turns the normed rows in place.
             Self::QgQknormRopeAppend {
@@ -687,6 +717,7 @@ impl Operands for Fused {
             Self::EmbedScaleAddSelect { .. } => "elementwise.embed_scale_add_select",
             Self::RmsnormRopePartialQ { .. } => "elementwise.rmsnorm_rope_partial_q",
             Self::NormRopeLast { .. } => "elementwise.norm_rope_last",
+            Self::NormRopeLastAppend { .. } => "elementwise.norm_rope_last_append",
             Self::NormModulate { .. } => "elementwise.norm_modulate",
             Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
             Self::MatmulGeglu { .. } => "linear.matmul_geglu",

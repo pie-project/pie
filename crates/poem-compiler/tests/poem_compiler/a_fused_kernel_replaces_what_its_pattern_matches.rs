@@ -554,3 +554,29 @@ fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
         ]
     );
 }
+
+#[test]
+fn deepseeks_kv_plane_norm_rotation_and_write_land_as_one_op() {
+    let kv = trace(|p| {
+        let positions = p.indices("positions");
+        let y = elemwise::rmsnorm(&p.rows("kv", 512), &p.weight("norm", [512]), 1e-6);
+        let k = elemwise::rope_partial_last_yarn(&y, &positions, 64, 512, 1e4, true, false, None);
+        let cache = p.cache("kv_cache");
+        attn::kv_append_shared(
+            &k,
+            cache,
+            &p.rows("write_page", 1),
+            &p.rows("write_offset", 1),
+        );
+    });
+    assert_eq!(
+        ops(&fuse(
+            kv,
+            &[
+                "elementwise.norm_rope_last_append",
+                "elementwise.norm_rope_last"
+            ]
+        )),
+        ["elementwise.norm_rope_last_append"]
+    );
+}

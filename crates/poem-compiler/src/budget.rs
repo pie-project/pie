@@ -225,6 +225,7 @@ impl FamilyCosts {
                 | poem_ir::Fused::EmbedScaleAddSelect { .. }
                 | poem_ir::Fused::RmsnormRopePartialQ { .. }
                 | poem_ir::Fused::NormRopeLast { .. }
+                | poem_ir::Fused::NormRopeLastAppend { .. }
                 | poem_ir::Fused::RopeYarnAppend { .. }
                 | poem_ir::Fused::SplitRopeYarnAppend { .. }
                 | poem_ir::Fused::QgQknormRopeAppend { .. }

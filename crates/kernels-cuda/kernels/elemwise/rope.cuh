@@ -6,6 +6,8 @@
 
 #include "prelude/rope.cuh"
 
+#include "attn/dsv4_kv.cuh"
+
 namespace pie::elemwise {
 
 template <class T>
@@ -1084,8 +1086,11 @@ __global__ void rope_partial_last_vec(
 // and turns the interleaved pairs of the tail it holds by the angles
 // `rope_partial_last_spread` works out, a lane working one pair's and
 // handing it on. `head_dim = 32 * PER`; the tail starts on a run and is at
-// most 128 wide.
-template <int PER, bool WEIGHTED>
+// most 128 wide. APPEND (one 512-wide head a row, DeepSeek-V4's kv plane)
+// also writes the row as DeepSeek's fp8 row at its page and offset, as
+// `ds_append` writes it: a 64-wide tile's exponent over its eight lanes'
+// runs, the rotated tile kept in bf16.
+template <int PER, bool WEIGHTED, bool APPEND = false>
 __global__ void __launch_bounds__(256) norm_rope_last(
     const bf16* __restrict__ x,
     const bf16* __restrict__ weight,
@@ -1100,9 +1105,15 @@ __global__ void __launch_bounds__(256) norm_rope_last(
     float yarn_factor,
     float yarn_low_dim,
     float yarn_high_dim,
+    std::uint8_t* __restrict__ pages,
+    const u32* __restrict__ w_page,
+    const u32* __restrict__ w_off,
+    const u8* __restrict__ row_valid,
+    int page_size,
     const u32* __restrict__ win)
 {
     static_assert(PER == 4 || PER == 8 || PER == 16, "a lane holds one to two runs");
+    static_assert(!APPEND || PER == 16, "an fp8 row is 512 wide");
     constexpr int head_dim = 32 * PER;
     constexpr int RUN = PER == 4 ? 4 : 8;
     constexpr int RUNS = PER / RUN;
@@ -1199,6 +1210,49 @@ __global__ void __launch_bounds__(256) norm_rope_last(
         } else {
             *reinterpret_cast<uint4*>(y + at + e) = *reinterpret_cast<const uint4*>(v[r]);
         }
+    }
+    if constexpr (APPEND) {
+        namespace ds = ::pie::attn::dsv4;
+        if (row_valid != nullptr && row_valid[plane_row] == 0) return;
+        const int page = static_cast<int>(w_page[plane_row]);
+        const int off = static_cast<int>(w_off[plane_row]);
+        if (off < 0 || off >= page_size) return;
+        const ds::DsRow dst = ds::ds_row(pages, page, off, page_size);
+#pragma unroll
+        for (int r = 0; r < RUNS; ++r) {
+            const int e = (lane + 32 * r) * RUN;
+            float f[RUN];
+            float amax = 0.f;
+#pragma unroll
+            for (int u = 0; u < RUN; ++u) {
+                f[u] = bf16_to_f32(v[r][u]);
+                amax = fmaxf(amax, fabsf(f[u]));
+            }
+            // A tile is eight lanes' runs (alike across the warp: r says
+            // whether this run is the rotated tile's).
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+            if (e >= ds::kDsNope) {
+                *reinterpret_cast<uint4*>(dst.data + ds::kDsNope + (e - ds::kDsNope) * 2) =
+                    *reinterpret_cast<const uint4*>(v[r]);
+                continue;
+            }
+            amax = fmaxf(amax, 1e-4f);
+            const float ex = ceilf(log2f(amax / ds::kFp8Max));
+            const float inv = exp2f(-ex);
+            std::uint8_t codes[RUN];
+#pragma unroll
+            for (int u = 0; u < RUN; ++u) {
+                const float c = fminf(fmaxf(f[u] * inv, -ds::kFp8Max), ds::kFp8Max);
+                codes[u] = static_cast<std::uint8_t>(__nv_cvt_float_to_fp8(c, __NV_SATFINITE, __NV_E4M3));
+            }
+            *reinterpret_cast<uint2*>(dst.data + e) = *reinterpret_cast<const uint2*>(codes);
+            if ((lane & 7) == 0) {
+                dst.scales[e / ds::kDsTile] = static_cast<std::uint8_t>(fmaxf(fminf(ex + 127.f, 255.f), 0.f));
+            }
+        }
+        if (lane == 0) dst.scales[ds::kDsScales] = 0;
     }
 }
 

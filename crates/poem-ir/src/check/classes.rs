@@ -460,6 +460,7 @@ fn writes_cache(op: &Operation) -> bool {
             op,
             Fused::QkvFusedQknormRopeVnormWrite { .. }
                 | Fused::RopeYarnAppend { .. }
+                | Fused::NormRopeLastAppend { .. }
                 | Fused::SplitRopeYarnAppend { .. }
                 | Fused::QgQknormRopeAppend { .. }
         ),

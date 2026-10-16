@@ -45,6 +45,7 @@ pub(super) fn all() -> Vec<Rule> {
         gated_residual_norm_modulate(),
         norm_modulate(),
         rmsnorm_rope_partial_q(),
+        norm_rope_last_append(),
         norm_rope_last(),
         qg_qknorm_rope_append(),
         split_rope_yarn_append(),
@@ -1126,6 +1127,60 @@ fn norm_rope_last() -> Rule {
         Some(norm_dim) => norm_dim == m.u32("head_dim"),
         None => m.width("x") == Some(u64::from(m.u32("head_dim"))),
     })
+}
+
+/// DeepSeek-V4's kv plane: a scaled norm of a row one head wide, its last
+/// dims rotated, written to the cache and read by nothing else.
+fn norm_rope_last_append() -> Rule {
+    let pattern = template(|p| {
+        p.free("interleaved");
+        p.free("inverse");
+        p.free("yarn");
+        let positions = p.indices("positions");
+        let y = elemwise::rmsnorm(&p.rows("x", W), &p.weight("weight", [W]), p.f32("eps"));
+        let k = elemwise::rope_partial_last_yarn(
+            &y,
+            &positions,
+            p.u32("rotary_dim"),
+            p.u32("head_dim"),
+            p.f32("theta"),
+            false,
+            false,
+            None,
+        );
+        p.name("y", &k);
+        let cache = p.cache("cache");
+        let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
+        attn::kv_append_shared(&k, cache, &write_page, &write_offset);
+    });
+    Rule::new("elementwise.norm_rope_last_append", [pattern], |m| {
+        let Operation::Elementwise(Elementwise::RopePartialLast {
+            interleaved,
+            inverse,
+            yarn,
+            ..
+        }) = *m.op("y")
+        else {
+            unreachable!("the rotation lands the written row")
+        };
+        Fused::NormRopeLastAppend {
+            x: m.value("x"),
+            weight: m.value("weight"),
+            head_dim: m.u32("head_dim"),
+            eps: m.f32("eps"),
+            positions: m.value("positions"),
+            rotary_dim: m.u32("rotary_dim"),
+            theta: m.f32("theta"),
+            interleaved,
+            inverse,
+            yarn,
+            y: m.value("y"),
+            cache: m.value("cache"),
+            write_page: m.value("write_page"),
+            write_offset: m.value("write_offset"),
+        }
+    })
+    .when(|m| m.width("x") == Some(u64::from(m.u32("head_dim"))))
 }
 
 /// A per-head norm of q, rotated.

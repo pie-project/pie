@@ -388,9 +388,8 @@ pub fn partial_last(
 /// then the rotation of its last `rotary_dim` dims there
 /// (`partial_last`). Under `kernel.elemwise.rows_vec`, where the head is
 /// 128, 256 or 512 wide, the rotation interleaved and its tail (at most 128
-/// wide) whole lane
-/// runs, both in one pass a warp a head; otherwise the two launches the
-/// unfused ops fire, unchanged.
+/// wide) whole lane runs, both in one pass a warp a head; otherwise the two
+/// launches the unfused ops fire, unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn norm_rope_last(
     ctx: &Ctx,
@@ -407,11 +406,112 @@ pub fn norm_rope_last(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.norm_rope_last";
-    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
-    positions_stream(OP, positions, &x);
+    let tail = Tail {
+        head_dim,
+        eps,
+        rotary_dim,
+        theta,
+        interleaved,
+        inverse,
+        yarn,
+    };
+    if one_pass(ctx, OP, x, weight, positions, tail, y, None)? {
+        return Ok(());
+    }
+    match weight {
+        Some(w) => crate::elemwise::norm::rmsnorm(ctx, x, w, eps, y)?,
+        None => crate::elemwise::norm::rmsnorm_no_scale(ctx, x, head_dim, eps, y)?,
+    }
+    partial_last(
+        ctx,
+        y,
+        positions,
+        rotary_dim,
+        head_dim,
+        theta,
+        interleaved,
+        inverse,
+        yarn,
+    )
+}
+
+/// Where a normed, rotated row is written as well: DeepSeek's fp8 pool and
+/// each row's page and offset.
+pub struct Append<'a> {
+    pub pool: &'a KvPool,
+    pub write_page: Tensor,
+    pub write_offset: Tensor,
+}
+
+/// `norm_rope_last` of a row one 512-wide head (scaled), the rotated row
+/// also written into DeepSeek's fp8 pool at its page and offset, in the one
+/// pass: whether it landed (under `kernel.elemwise.rows_vec`, an fp8 pool
+/// given). Nothing is fired where it did not.
+#[allow(clippy::too_many_arguments)]
+pub fn norm_rope_last_append(
+    ctx: &Ctx,
+    x: Tensor,
+    weight: Tensor,
+    head_dim: u32,
+    eps: f32,
+    positions: Tensor,
+    rotary_dim: u32,
+    theta: f32,
+    interleaved: bool,
+    inverse: bool,
+    yarn: Option<Yarn>,
+    y: &mut Tensor,
+    append: Option<Append<'_>>,
+) -> Result<bool, Error> {
+    const OP: &str = "elementwise.norm_rope_last_append";
+    let Some(append) = append else {
+        return Ok(false);
+    };
+    if head_dim != 512 || y.width != head_dim || !crate::attn::dsv4::fp8_ds(append.pool) {
+        return Ok(false);
+    }
+    let tail = Tail {
+        head_dim,
+        eps,
+        rotary_dim,
+        theta,
+        interleaved,
+        inverse,
+        yarn,
+    };
+    one_pass(ctx, OP, x, Some(weight), positions, tail, y, Some(append))
+}
+
+#[derive(Clone, Copy)]
+struct Tail {
+    head_dim: u32,
+    eps: f32,
+    rotary_dim: u32,
+    theta: f32,
+    interleaved: bool,
+    inverse: bool,
+    yarn: Option<Yarn>,
+}
+
+/// The one pass, where its shape and the profile allow: whether it fired.
+#[allow(clippy::too_many_arguments)]
+fn one_pass(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    weight: Option<Tensor>,
+    positions: Tensor,
+    t: Tail,
+    y: &mut Tensor,
+    append: Option<Append<'_>>,
+) -> Result<bool, Error> {
+    dtype_dispatch!(op, x.dtype, { Bf16 => () });
+    positions_stream(op, positions, &x);
+    let head_dim = t.head_dim;
+    let rotary_dim = t.rotary_dim;
     let per = head_dim / 32;
-    let fused = ctx.tuning().rows_vec
-        && interleaved
+    let fits = ctx.tuning().rows_vec
+        && t.interleaved
         && matches!(head_dim, 128 | 256 | 512)
         && rotary_dim > 0
         && rotary_dim <= head_dim.min(128)
@@ -419,36 +519,22 @@ pub fn norm_rope_last(
         && y.width.is_multiple_of(head_dim)
         && weight.is_none_or(|w| w.dtype == Dtype::Bf16 && aligned16(w.ptr))
         && [x.ptr, y.ptr].iter().all(|&at| aligned16(at));
-    if !fused {
-        match weight {
-            Some(w) => crate::elemwise::norm::rmsnorm(ctx, x, w, eps, y)?,
-            None => crate::elemwise::norm::rmsnorm_no_scale(ctx, x, head_dim, eps, y)?,
-        }
-        return partial_last(
-            ctx,
-            y,
-            positions,
-            rotary_dim,
-            head_dim,
-            theta,
-            interleaved,
-            inverse,
-            yarn,
-        );
+    if !fits {
+        return Ok(false);
     }
-    let (factor, low_dim, high_dim) = match yarn {
+    let (factor, low_dim, high_dim) = match t.yarn {
         Some(yn) => {
             let max_position = nonzero(
-                OP,
+                op,
                 "the position span this layer's YaRN ramp states",
                 yn.original_max_position,
             )?;
             let (low, high) = ramp_bounds(
-                stated(OP, rotary_dim)?,
-                theta,
+                stated(op, rotary_dim)?,
+                t.theta,
                 yn.beta_fast,
                 yn.beta_slow,
-                stated(OP, max_position)?,
+                stated(op, max_position)?,
             );
             (yn.factor, low, high)
         }
@@ -457,20 +543,37 @@ pub fn norm_rope_last(
     let heads = y.width / head_dim;
     let units = y.rows.checked_mul(heads).ok_or_else(|| {
         refuse(
-            OP,
+            op,
             format!("{} rows of {heads} heads overflow a grid", y.rows),
         )
     })?;
     if units == 0 {
-        return Ok(());
+        return Ok(true);
     }
     let weighted = weight.is_some();
+    let appends = append.is_some();
+    let (pages, write_page, write_offset, row_valid, page_size) = match &append {
+        Some(a) => (
+            a.pool.keys.arg(),
+            a.write_page.arg(),
+            a.write_offset.arg(),
+            a.pool.row_valid.arg(),
+            a.pool.page_size.arg(),
+        ),
+        None => (
+            Tensor::ABSENT.arg(),
+            Tensor::ABSENT.arg(),
+            Tensor::ABSENT.arg(),
+            Tensor::ABSENT.arg(),
+            0_i32.arg(),
+        ),
+    };
     ctx.fire(
-        OP,
+        op,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::elemwise::norm_rope_last<{per}, {weighted}>"
+                "::pie::elemwise::norm_rope_last<{per}, {weighted}, {appends}>"
             )),
         )
         .apply(Launch::grid([units.div_ceil(8), 1, 1], [256, 1, 1])),
@@ -479,18 +582,24 @@ pub fn norm_rope_last(
             weight.unwrap_or(Tensor::ABSENT).arg(),
             y.arg(),
             positions.arg(),
-            stated(OP, units)?.arg(),
-            stated(OP, heads)?.arg(),
-            eps.arg(),
-            stated(OP, rotary_dim)?.arg(),
-            theta.arg(),
-            inverse.arg(),
+            stated(op, units)?.arg(),
+            stated(op, heads)?.arg(),
+            t.eps.arg(),
+            stated(op, rotary_dim)?.arg(),
+            t.theta.arg(),
+            t.inverse.arg(),
             factor.arg(),
             low_dim.arg(),
             high_dim.arg(),
+            pages,
+            write_page,
+            write_offset,
+            row_valid,
+            page_size,
             ctx.stage(),
         ],
-    )
+    )?;
+    Ok(true)
 }
 
 pub fn yarn(
