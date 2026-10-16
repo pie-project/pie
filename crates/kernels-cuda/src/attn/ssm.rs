@@ -1632,12 +1632,19 @@ impl Kda {
                 ctx.stage(),
             ],
         )?;
-        ctx.fire(
-            op,
+        // A row a block, four channels a thread.
+        let gates = if self.head_dim.is_multiple_of(4) {
+            Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta_rows<::pie::bf16>")
+                .apply(Launch::grid([self.n, 1, 1], [256, 1, 1]))
+        } else {
             Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta<::pie::bf16>").apply(Launch::grid(
                 [self.n, self.heads, 1],
                 [self.head_dim.clamp(WARP, PREP_BLOCK), 1, 1],
-            )),
+            ))
+        };
+        ctx.fire(
+            op,
+            gates,
             &[
                 f.arg(),
                 b.arg(),
@@ -1742,7 +1749,6 @@ fn kda_chunked_mma(
     const D: u32 = 128;
     const LD: u32 = 136;
     const LDC: u32 = 72;
-    const LDA: u32 = 68;
     const LDF: u32 = 132;
     const BV: u32 = 64;
     let heads = shape.heads;
@@ -1764,11 +1770,9 @@ fn kda_chunked_mma(
         "attn.ssm_kda_chunk_gl",
         u64::from(slots) * u64::from(heads) * u64::from(D),
     )?;
-    let prep_smem = 3 * CH * LDF * FLOAT
-        + (3 * CH * LD + 2 * 16 * LD + 2 * CH * LDC) * 2
-        + 2 * CH * LDA * FLOAT
-        + CH * FLOAT
-        + 8 * 256 * FLOAT;
+    // Four regions reused as the chunk goes on (`KDA_PREP_SMEM`), so two
+    // blocks share an SM.
+    let prep_smem = 3 * CH * LD * 2 + (CH + 32) * LD * 2 + CH * LDF * FLOAT + CH * FLOAT;
     ctx.fire(
         op,
         Fire::at(FILE, "::pie::attn::ssm_kda_chunk_prep")

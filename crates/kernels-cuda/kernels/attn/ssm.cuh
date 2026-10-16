@@ -2755,6 +2755,51 @@ __global__ void ssm_kda_gate_beta(
     }
 }
 
+// `ssm_kda_gate_beta` a row a block: each thread four channels of the
+// row's heads at once, the same values (each channel's gate as that kernel
+// forms it, each head's beta).
+template <class ElemT>
+__global__ void ssm_kda_gate_beta_rows(
+    const ElemT* __restrict__ raw_g,
+    const ElemT* __restrict__ raw_beta,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ gate_out,
+    float* __restrict__ beta_out,
+    int T, int H, int D,
+    float lower_bound,
+    const u32* __restrict__ win)
+{
+    const int t = blockIdx.x;
+    if (win != nullptr && t >= static_cast<int>(win[0])) return;
+    const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
+    if (t >= T) return;
+    const int width = H * D;
+    const long long base = static_cast<long long>(t) * width;
+    const long long src = static_cast<long long>(t_row) * width;
+    for (int e = threadIdx.x * 4; e < width; e += blockDim.x * 4) {
+        const float a = __expf(A_log[e / D]);
+        float out[4];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const float g = Elem<ElemT>::to_f32(raw_g[src + e + u]) + dt_bias[e + u];
+            float gate;
+            if (lower_bound < 0.f) {
+                gate = lower_bound * sigmoidf(a * g);
+            } else {
+                const float sp = (g > 20.f) ? g : __logf(1.f + __expf(g));
+                gate = -a * sp;
+            }
+            out[u] = gate;
+        }
+        *reinterpret_cast<float4*>(gate_out + base + e) = make_float4(out[0], out[1], out[2], out[3]);
+    }
+    for (int h = threadIdx.x; h < H; h += blockDim.x) {
+        beta_out[static_cast<long long>(t) * H + h] =
+            sigmoidf(Elem<ElemT>::to_f32(raw_beta[static_cast<long long>(t_row) * H + h]));
+    }
+}
+
 template <class ElemT, int BLOCK>
 __global__ void ssm_kda_qkv_prep(
     const ElemT* __restrict__ mixed,
@@ -3783,7 +3828,17 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
 // decay of one, so both land in bf16 and the tensor cores take them.
 constexpr int KDA_LDF = 132;
 
-__global__ void __launch_bounds__(256) ssm_kda_chunk_prep(
+// The prep's shared memory, in four regions reused as the chunk goes on, so
+// two blocks share an SM: the keys (bf16) and then `T` and then the scaled
+// values; the queries (bf16) and then `A`, a row of each the same 272 bytes,
+// so a block of `A` rows lands where its queries were read; the keys `w`
+// reads; the split-scaled keys and queries of a block and then the
+// inversion's scratch and then `T`'s two scalings; and the decay's running
+// sum in f32.
+constexpr int KDA_PREP_SMEM =
+    3 * GDN_CH * GDN_LD * 2 + (GDN_CH + 32) * GDN_LD * 2 + GDN_CH * KDA_LDF * 4 + GDN_CH * 4;
+
+__global__ void __launch_bounds__(256, 2) ssm_kda_chunk_prep(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
     const float* __restrict__ v_in,
@@ -3804,21 +3859,22 @@ __global__ void __launch_bounds__(256) ssm_kda_chunk_prep(
 {
     constexpr int D = 128;
     constexpr int THREADS = 256;
+    static_assert(GDN_LD * 2 == GDN_LDA * 4, "a query row and an A row are the same bytes");
     extern __shared__ __align__(16) unsigned char kda_smem[];
-    float* Kf = reinterpret_cast<float*>(kda_smem);
-    float* Qf = Kf + GDN_CH * KDA_LDF;
-    float* Gf = Qf + GDN_CH * KDA_LDF;
-    bf16* vs = reinterpret_cast<bf16*>(Gf + GDN_CH * KDA_LDF);
-    bf16* kgs = vs + GDN_CH * GDN_LD;
+    bf16* Kb = reinterpret_cast<bf16*>(kda_smem);
+    float* Tm = reinterpret_cast<float*>(Kb);
+    bf16* vs = Kb;
+    bf16* Qb = Kb + GDN_CH * GDN_LD;
+    float* A = reinterpret_cast<float*>(Qb);
+    bf16* kgs = Qb + GDN_CH * GDN_LD;
     bf16* kc = kgs + GDN_CH * GDN_LD;
     bf16* kr = kc + GDN_CH * GDN_LD;
     bf16* qr = kr + 16 * GDN_LD;
-    bf16* t1 = qr + 16 * GDN_LD;
+    float* X = reinterpret_cast<float*>(kc);
+    bf16* t1 = kc;
     bf16* t2 = t1 + GDN_CH * GDN_LDC;
-    float* A = reinterpret_cast<float*>(t2 + GDN_CH * GDN_LDC);
-    float* Tm = A + GDN_CH * GDN_LDA;
-    float* B = Tm + GDN_CH * GDN_LDA;
-    float* X = B + GDN_CH;
+    float* Gf = reinterpret_cast<float*>(qr + 16 * GDN_LD);
+    float* B = Gf + GDN_CH * KDA_LDF;
 
     const int h = blockIdx.x;
     const int s = blockIdx.y;
@@ -3842,31 +3898,29 @@ __global__ void __launch_bounds__(256) ssm_kda_chunk_prep(
         const bool in = i < L;
         const long long at = (static_cast<long long>(ta + i) * H + h) * D + c;
         const float4 z = make_float4(0.f, 0.f, 0.f, 0.f);
-        *reinterpret_cast<float4*>(Kf + i * KDA_LDF + c) =
-            in ? *reinterpret_cast<const float4*>(k_norm + at) : z;
-        *reinterpret_cast<float4*>(Qf + i * KDA_LDF + c) =
-            in ? *reinterpret_cast<const float4*>(q_norm + at) : z;
+        const float4 kk = in ? *reinterpret_cast<const float4*>(k_norm + at) : z;
+        const float4 qq = in ? *reinterpret_cast<const float4*>(q_norm + at) : z;
+        *reinterpret_cast<uint2*>(Kb + i * GDN_LD + c) = make_uint2(gdn_pack(kk.x, kk.y), gdn_pack(kk.z, kk.w));
+        *reinterpret_cast<uint2*>(Qb + i * GDN_LD + c) = make_uint2(gdn_pack(qq.x, qq.y), gdn_pack(qq.z, qq.w));
         *reinterpret_cast<float4*>(Gf + i * KDA_LDF + c) =
             in ? *reinterpret_cast<const float4*>(gate + at) : z;
     }
     if (tid < GDN_CH) B[tid] = tid < L ? beta[static_cast<long long>(ta + tid) * H + h] : 0.f;
     __syncthreads();
-    for (int e = tid; e < GDN_CH * (D / 4); e += THREADS) {
-        const int i = e / (D / 4);
-        const int c = (e % (D / 4)) * 4;
-        const bool in = i < L;
-        const float bi = B[i];
-        float4 vv = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (in) vv = *reinterpret_cast<const float4*>(v_in + (static_cast<long long>(ta + i) * H + h) * D + c);
-        *reinterpret_cast<uint2*>(vs + i * GDN_LD + c) =
-            make_uint2(gdn_pack(vv.x * bi, vv.y * bi), gdn_pack(vv.z * bi, vv.w * bi));
-    }
-    // The decay's running sum down each channel.
-    if (tid < D) {
+    // The decay's running sum down each channel: two threads a channel, a
+    // half each, the second half then adding the first's total.
+    {
+        const int c = tid & (D - 1);
+        const int half = tid >> 7;
         float run = 0.f;
-        for (int i = 0; i < GDN_CH; ++i) {
-            run += Gf[i * KDA_LDF + tid];
-            Gf[i * KDA_LDF + tid] = run;
+        for (int i = half * 32; i < half * 32 + 32; ++i) {
+            run += Gf[i * KDA_LDF + c];
+            Gf[i * KDA_LDF + c] = run;
+        }
+        __syncthreads();
+        if (half == 1) {
+            const float first = Gf[31 * KDA_LDF + c];
+            for (int i = 32; i < GDN_CH; ++i) Gf[i * KDA_LDF + c] += first;
         }
     }
     __syncthreads();
@@ -3878,23 +3932,22 @@ __global__ void __launch_bounds__(256) ssm_kda_chunk_prep(
         const int c = (e % (D / 2)) * 2;
         const float g0 = Gf[i * KDA_LDF + c];
         const float g1 = Gf[i * KDA_LDF + c + 1];
-        const float k0 = Kf[i * KDA_LDF + c];
-        const float k1 = Kf[i * KDA_LDF + c + 1];
+        const float2 k = gdn_unpack(*reinterpret_cast<const unsigned*>(Kb + i * GDN_LD + c));
         *reinterpret_cast<unsigned*>(kgs + i * GDN_LD + c) =
-            gdn_pack(k0 * __expf(g0), k1 * __expf(g1));
+            gdn_pack(k.x * __expf(g0), k.y * __expf(g1));
         if (i < L) {
             const long long at = (static_cast<long long>(ta + i) * H + h) * D + c;
-            const float q0 = Qf[i * KDA_LDF + c];
-            const float q1 = Qf[i * KDA_LDF + c + 1];
-            *reinterpret_cast<unsigned*>(qg_out + at) = gdn_pack(q0 * __expf(g0), q1 * __expf(g1));
+            const float2 q = gdn_unpack(*reinterpret_cast<const unsigned*>(Qb + i * GDN_LD + c));
+            *reinterpret_cast<unsigned*>(qg_out + at) = gdn_pack(q.x * __expf(g0), q.y * __expf(g1));
             *reinterpret_cast<unsigned*>(kg_out + at) =
-                gdn_pack(k0 * __expf(glast[c] - g0), k1 * __expf(glast[c + 1] - g1));
+                gdn_pack(k.x * __expf(glast[c] - g0), k.y * __expf(glast[c + 1] - g1));
         }
     }
     if (tid < D) gl_out[(static_cast<long long>(s) * H + h) * D + tid] = __expf(glast[tid]);
 
     // `A` and `P` a sixteen-row block at a time, each against the keys of
-    // the blocks up to its own, split at its first row.
+    // the blocks up to its own, split at its first row. A block's `A` rows
+    // land over its own query rows once its scaled queries are read out.
     const int g = l >> 2;
     const int t = l & 3;
     bf16* pd = p_out + (static_cast<long long>(s) * H + h) * GDN_CH * GDN_CH;
@@ -3906,10 +3959,10 @@ __global__ void __launch_bounds__(256) ssm_kda_chunk_prep(
         for (int e = tid; e < cols * (D / 2); e += THREADS) {
             const int i = e / (D / 2);
             const int c = (e % (D / 2)) * 2;
-            const float f0 = __expf(gr[c] - Gf[i * KDA_LDF + c]);
-            const float f1 = __expf(gr[c + 1] - Gf[i * KDA_LDF + c + 1]);
+            const float2 k = gdn_unpack(*reinterpret_cast<const unsigned*>(Kb + i * GDN_LD + c));
             *reinterpret_cast<unsigned*>(kc + i * GDN_LD + c) =
-                gdn_pack(Kf[i * KDA_LDF + c] * f0, Kf[i * KDA_LDF + c + 1] * f1);
+                gdn_pack(k.x * __expf(gr[c] - Gf[i * KDA_LDF + c]),
+                         k.y * __expf(gr[c + 1] - Gf[i * KDA_LDF + c + 1]));
         }
         for (int e = tid; e < 16 * (D / 2); e += THREADS) {
             const int i = e / (D / 2);
@@ -3917,10 +3970,10 @@ __global__ void __launch_bounds__(256) ssm_kda_chunk_prep(
             const int row = r0 + i;
             const float f0 = __expf(Gf[row * KDA_LDF + c] - gr[c]);
             const float f1 = __expf(Gf[row * KDA_LDF + c + 1] - gr[c + 1]);
-            *reinterpret_cast<unsigned*>(kr + i * GDN_LD + c) =
-                gdn_pack(Kf[row * KDA_LDF + c] * f0, Kf[row * KDA_LDF + c + 1] * f1);
-            *reinterpret_cast<unsigned*>(qr + i * GDN_LD + c) =
-                gdn_pack(Qf[row * KDA_LDF + c] * f0, Qf[row * KDA_LDF + c + 1] * f1);
+            const float2 k = gdn_unpack(*reinterpret_cast<const unsigned*>(Kb + row * GDN_LD + c));
+            const float2 q = gdn_unpack(*reinterpret_cast<const unsigned*>(Qb + row * GDN_LD + c));
+            *reinterpret_cast<unsigned*>(kr + i * GDN_LD + c) = gdn_pack(k.x * f0, k.y * f1);
+            *reinterpret_cast<unsigned*>(qr + i * GDN_LD + c) = gdn_pack(q.x * f0, q.y * f1);
         }
         __syncthreads();
         // One eight-wide column tile a warp: the block's `cols` columns.
@@ -3934,18 +3987,12 @@ __global__ void __launch_bounds__(256) ssm_kda_chunk_prep(
                 unsigned aq[4];
                 gdn_ldsm(a, gdn_at_a(kr, GDN_LD, 0, kk * 16, l));
                 gdn_ldsm(aq, gdn_at_a(qr, GDN_LD, 0, kk * 16, l));
-                // Two sixteen-wide k halves of one eight-wide n tile.
                 const bf16* brow = kc + (n0 + (l & 7)) * GDN_LD + kk * 16 + (((l >> 3) & 1) << 3);
                 unsigned b0, b1;
-                {
-                    unsigned bb[4];
-                    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(brow));
-                    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                                 : "=r"(bb[0]), "=r"(bb[1])
-                                 : "r"(addr));
-                    b0 = bb[0];
-                    b1 = bb[1];
-                }
+                const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(brow));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                             : "=r"(b0), "=r"(b1)
+                             : "r"(addr));
                 gdn_mma(acc, a, b0, b1);
                 gdn_mma(qkc, aq, b0, b1);
             }
@@ -3974,7 +4021,8 @@ __global__ void __launch_bounds__(256) ssm_kda_chunk_prep(
     }
     __syncthreads();
 
-    // `T = (I + A)^-1` by sixteen-row blocks, as the GDN prep inverts it.
+    // `T = (I + A)^-1` by sixteen-row blocks, as the GDN prep inverts it,
+    // over the keys' space (the keys are done with).
     float* Xw = X + warp * 256;
     if (warp < 4 && l < 16) {
         const int d0 = warp * 16;
@@ -4036,6 +4084,17 @@ __global__ void __launch_bounds__(256) ssm_kda_chunk_prep(
         const float tv = (c >> 4) > (i >> 4) ? 0.f : Tm[i * GDN_LDA + c];
         t1[i * GDN_LDC + c] = bf16(tv * B[c]);
         t2[i * GDN_LDC + c] = bf16(tv);
+    }
+    __syncthreads();
+    // The values under their betas, over `T`'s space.
+    for (int e = tid; e < GDN_CH * (D / 4); e += THREADS) {
+        const int i = e / (D / 4);
+        const int c = (e % (D / 4)) * 4;
+        const float bi = B[i];
+        float4 vv = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (i < L) vv = *reinterpret_cast<const float4*>(v_in + (static_cast<long long>(ta + i) * H + h) * D + c);
+        *reinterpret_cast<uint2*>(vs + i * GDN_LD + c) =
+            make_uint2(gdn_pack(vv.x * bi, vv.y * bi), gdn_pack(vv.z * bi, vv.w * bi));
     }
     __syncthreads();
 
