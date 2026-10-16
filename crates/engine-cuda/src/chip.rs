@@ -443,6 +443,11 @@ mod tests {
                     "{gpu}"
                 );
                 assert_eq!(
+                    tuning.mxfp4_a8_from,
+                    u32::from(major == 10 && minor == 0),
+                    "{gpu}"
+                );
+                assert_eq!(
                     tuning.decode_xqa_from_64,
                     if b200 { 16 } else { 0 },
                     "{gpu}"
@@ -498,6 +503,7 @@ mod tests {
                         mla_sparse: false,
                         mxfp4_cvt: false,
                         mxfp4_a8_until: 0,
+                        mxfp4_a8_from: 0,
                         ..tuning
                     },
                     defaults,
@@ -662,6 +668,7 @@ mod tests {
         assert_eq!((b200.gemm_nvfp4_k128, b200.moe_w4a4_fused_from), (true, 1));
         assert_eq!(b200.moe_w4a8_fused_from, 512);
         assert_eq!(b200.mla_expanded_from, 256);
+        assert_eq!((b200.mxfp4_a8_from, b200.mxfp4_a8_until), (1, 48));
     }
 
     #[test]

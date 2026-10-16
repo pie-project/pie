@@ -2059,7 +2059,7 @@ pub fn select_mxfp4_atoms_takes(ctx: &Ctx, routes: Tensor, x: Tensor) -> bool {
     let count = routes.rows * routes.width;
     t.mxfp4_cvt
         && crate::linear::tc5::supported()
-        && t.mxfp4_mma_from <= count
+        && t.mxfp4_a8_from <= count
         && count <= t.mxfp4_a8_until
         && x.width > 0
         && x.width.is_multiple_of(32)
@@ -2070,7 +2070,7 @@ pub fn select_mxfp4_atoms_takes(ctx: &Ctx, routes: Tensor, x: Tensor) -> bool {
 /// register-dequant kernel, against bf16 activations (for a W4A8 select,
 /// [`crate::linear::act_quant::read_back`]'s). `Ok(false)` where that
 /// kernel does not take the fire: off in this chip's profile, a width
-/// outside `kernel.moe.mxfp4_mma_from ..= kernel.moe.mxfp4_a8_until`, or a
+/// outside `kernel.moe.mxfp4_a8_from ..= kernel.moe.mxfp4_a8_until`, or a
 /// K of part blocks.
 #[cfg(feature = "cuda")]
 pub fn select_mxfp4_atoms(

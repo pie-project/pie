@@ -109,6 +109,10 @@ moe.mxfp4_cvt = true
 # the select alone is faster (at 32 requests 39.3 -> 44.2 ms, at 64 82.9 ->
 # 90.9), so they keep the grouped tcgen05 GEMM.
 moe.mxfp4_a8_until = 48
+# From one route: at DeepSeek-V4-Flash's single row (6 routes) the
+# register-dequant select streams the six experts where the grouped tcgen05
+# GEMM lays them out first (decode bs1 13.66 -> 13.00 ms a token).
+moe.mxfp4_a8_from = 1
 # The tcgen05 prefill FMHA (sm_100a): a causal 4096-token prefill at
 # Qwen3.8-27B's 256-wide, six-way-grouped head runs at about 900 TFLOPS
 # where FA2 runs at about 300.
