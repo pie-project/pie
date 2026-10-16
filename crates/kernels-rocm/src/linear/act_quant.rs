@@ -230,10 +230,13 @@ fn e4m3tile128_planes(op: &'static str, codes: Tensor, scales: Tensor) -> Result
             ),
         ));
     }
-    if n == 0 || k == 0 || !k.is_multiple_of(FP8_BLOCK) || !codes.ptr.is_multiple_of(16) {
+    if n == 0 || k == 0 || !k.is_multiple_of(FP8_BLOCK) || !n.is_multiple_of(16) || !codes.ptr.is_multiple_of(16) {
         return Err(refuse(
             op,
-            format!("a [{n}, {k}] e4m3tile128 projection contracts whole 128-code blocks"),
+            format!(
+                "a [{n}, {k}] e4m3tile128 projection contracts whole 128-code blocks over whole 16-row strips \
+                 (the matrix core's order)"
+            ),
         ));
     }
     Ok((n, k))
@@ -449,7 +452,8 @@ pub fn matmul_fp8_quantized(
         // The decode tile; K sliced while the tiles and items are short of
         // two blocks a CU.
         let mt = fp8_item_rows(act.rows);
-        let (items, tiles) = (act.rows.div_ceil(mt), n.div_ceil(64));
+        let nb = fp8_strips();
+        let (items, tiles) = (act.rows.div_ceil(mt), n.div_ceil(64 * nb));
         let mut splits = 1u32;
         while splits < 8 && tiles * items * splits < 608 && stages / (2 * splits) >= 4 {
             splits *= 2;
@@ -457,7 +461,7 @@ pub fn matmul_fp8_quantized(
         let part = fp8_partials(ctx, op, splits, act.rows, n)?;
         ctx.fire(
             op,
-            Fire::at("linear/fp8.hip", symbol(&format!("::pie::linear::dense_fp8_mfma<::pie::i32({mt})>")))
+            Fire::at("linear/fp8.hip", symbol(&format!("::pie::linear::dense_fp8_mfma<::pie::i32({mt}), ::pie::i32({nb})>")))
                 .apply(Launch::grid([tiles.div_ceil(8) * 8 * items * splits, 1, 1], [BLOCK, 1, 1])),
             &[
                 q.arg(),
@@ -506,22 +510,47 @@ fn fp8_partials(ctx: &Ctx, op: &'static str, splits: u32, rows: u32, n: u32) -> 
     Ok(ArgValue::Ptr(ctx.scratch_stream(op, "linear.fp8_partials", bytes)? as u64))
 }
 
-/// An e4m3fn plane (`bytes`, a multiple of four) made canonical in place for
-/// the FP8 matrix core: negative zero as zero, the value it is; the NaN
-/// codes (0x7f, 0xff), which fnuz reads as numbers, counted into `nans` (a
-/// u32 the caller zeroed and reads back to refuse the plane).
-pub fn e4m3fn_canonical(ctx: &Ctx, op: &'static str, codes: u64, bytes: u64, nans: u64) -> Result<(), Error> {
-    if bytes == 0 {
+/// An e4m3fn plane of `rows` x `k` codes (`rows` a multiple of 16, `k` of
+/// 64), row-major at `src`, into `dst` in the FP8 matrix core's order (each
+/// strip of 16 rows as K / 64 units of 1 KB, lane l's 16 bytes the A operand
+/// of two k-steps: `fp8_unit_at` in `linear/fp8.hip`), made canonical as
+/// the matrix core reads it: negative zero as zero (fnuz's NaN; the value it
+/// is), and the NaN codes (0x7f, 0xff: numbers to fnuz) counted into `nans`
+/// for the caller to refuse the plane.
+pub fn e4m3fn_shuffle(
+    ctx: &Ctx,
+    op: &'static str,
+    src: u64,
+    dst: u64,
+    rows: u64,
+    k: u64,
+    nans: u64,
+) -> Result<(), Error> {
+    if rows == 0 || k == 0 {
         return Ok(());
     }
-    if !bytes.is_multiple_of(4) || !codes.is_multiple_of(4) {
-        return Err(refuse(op, "an e4m3 plane is not whole 4-byte words"));
+    if !rows.is_multiple_of(16) || !k.is_multiple_of(64) || !src.is_multiple_of(16) || !dst.is_multiple_of(16) {
+        return Err(refuse(
+            op,
+            format!("an e4m3 plane of {rows} x {k} is not whole 16-row strips of 64-code units"),
+        ));
     }
-    let words = bytes / 4;
-    let grid = u32::try_from(words.div_ceil(u64::from(BLOCK)).min(8192)).unwrap_or(8192);
+    let (r, kk) = (
+        i32::try_from(rows).map_err(|_| refuse(op, "the plane's rows pass an i32"))?,
+        i32::try_from(k).map_err(|_| refuse(op, "the plane's width passes an i32"))?,
+    );
+    let chunks = rows * k / 16;
+    let grid = u32::try_from(chunks.div_ceil(u64::from(BLOCK)).min(16384)).unwrap_or(16384);
     ctx.fire(
         op,
-        Fire::at("linear/fp8.hip", "::pie::linear::e4m3fn_canonical").apply(Launch::grid([grid, 1, 1], [BLOCK, 1, 1])),
-        &[ArgValue::Ptr(codes), ArgValue::I64(i64::try_from(words).unwrap_or(i64::MAX)), ArgValue::Ptr(nans)],
+        Fire::at("linear/fp8.hip", "::pie::linear::e4m3fn_shuffle").apply(Launch::grid([grid, 1, 1], [BLOCK, 1, 1])),
+        &[ArgValue::Ptr(src), ArgValue::Ptr(dst), ArgValue::I32(r), ArgValue::I32(kk), ArgValue::Ptr(nans)],
     )
+}
+
+/// The 16-row strips a wave of the FP8 decode tile takes: one (two measured
+/// no faster at GLM-5.3's shapes).
+#[must_use]
+pub const fn fp8_strips() -> u32 {
+    1
 }

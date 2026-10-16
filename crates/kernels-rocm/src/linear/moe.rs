@@ -2072,7 +2072,14 @@ pub fn matmul_select_fp8_quantized(
     let (entry, rows, threads) = if gemm {
         ("::pie::linear::moe_fp8_gemm8".to_string(), 128, 2 * GROUP_BLOCK)
     } else {
-        (format!("::pie::linear::moe_fp8_mfma<::pie::i32({mt})>"), 64, GROUP_BLOCK)
+        (
+            format!(
+                "::pie::linear::moe_fp8_mfma<::pie::i32({mt}), ::pie::i32({})>",
+                crate::linear::act_quant::fp8_strips()
+            ),
+            64 * crate::linear::act_quant::fp8_strips(),
+            GROUP_BLOCK,
+        )
     };
     args.extend([
         ArgValue::Ptr(ordered.order),

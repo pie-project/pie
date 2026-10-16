@@ -627,9 +627,11 @@ struct Pairing {
 }
 
 /// Every e4m3 plane beside f32 block factors (an `e4m3tile128` projection
-/// or bank) made canonical for the FP8 matrix core, which reads e4m3fnuz:
-/// negative zero as zero (fnuz's NaN; the value it is), and a plane holding
-/// a NaN code (0x7f, 0xff: numbers to fnuz) refused.
+/// or bank) put in the FP8 matrix core's order and made canonical for it
+/// (it reads e4m3fnuz): negative zero as zero (fnuz's NaN; the value it
+/// is), and a plane holding a NaN code (0x7f, 0xff: numbers to fnuz)
+/// refused. One staging buffer, the widest plane's, carries each plane out
+/// of place and back.
 fn canonical_fp8(
     trace: &Trace,
     index: &BTreeMap<&str, usize>,
@@ -638,7 +640,6 @@ fn canonical_fp8(
     tier: Option<&crate::experts::Tier>,
     stream: *mut core::ffi::c_void,
 ) -> Result<()> {
-    let mut nans: Option<Buffer> = None;
     // SAFETY: `stream` is the load's stream, live for the load.
     let ctx = unsafe { kernels_rocm::Ctx::on(stream.cast()) };
     let mut planes = Vec::new();
@@ -657,26 +658,44 @@ fn canonical_fp8(
             return Err(Fault::Param {
                 name: param.name.clone(),
                 why: "is an fp8 bank the expert tier seats from host memory; the FP8 matrix core \
-                      reads its codes made canonical on the device, so it must be resident",
+                      reads its codes reordered and made canonical on the device, so it must be resident",
             });
         }
-        let bytes: u64 = param.shape.iter().product();
-        let counter = match nans.as_ref() {
-            Some(buffer) => buffer.ptr(),
-            None => nans.insert(Buffer::zeroed(4)?).ptr(),
+        let (Some(&k), true) = (param.shape.last(), param.shape.len() >= 2) else {
+            continue;
         };
-        kernels_rocm::linear::act_quant::e4m3fn_canonical(
+        let rows: u64 = param.shape[..param.shape.len() - 1].iter().product();
+        planes.push((at, rows, k));
+    }
+    if planes.is_empty() {
+        return Ok(());
+    }
+    let widest = planes.iter().map(|(_, rows, k)| rows * k).max().unwrap_or(0);
+    let staging = Buffer::zeroed(usize::try_from(widest).unwrap_or(usize::MAX))?;
+    let nans = Buffer::zeroed(4)?;
+    for &(at, rows, k) in &planes {
+        let plane = address(tier, store, places[at].offset, at)?;
+        kernels_rocm::linear::act_quant::e4m3fn_shuffle(
             &ctx,
             "linear.matmul_act_quant",
-            address(tier, store, places[at].offset, at)?,
-            bytes,
-            counter,
+            plane,
+            staging.ptr(),
+            rows,
+            k,
+            nans.ptr(),
         )?;
-        planes.push(at);
+        // SAFETY: both spans are device memory this load holds, `rows · k`
+        // bytes each; the copy is ordered on the load's stream.
+        crate::device::ctx::check("hipMemcpyAsync", unsafe {
+            kernels_rocm::hip::rt::hipMemcpyAsync(
+                plane as *mut core::ffi::c_void,
+                staging.ptr() as *const core::ffi::c_void,
+                usize::try_from(rows * k).unwrap_or(usize::MAX),
+                kernels_rocm::hip::rt::hipMemcpyDeviceToDevice,
+                stream.cast(),
+            )
+        })?;
     }
-    let Some(nans) = nans else {
-        return Ok(());
-    };
     // SAFETY: the load's stream, live for the load.
     crate::device::ctx::check("hipStreamSynchronize", unsafe {
         kernels_rocm::hip::rt::hipStreamSynchronize(stream.cast())
@@ -685,7 +704,7 @@ fn canonical_fp8(
     nans.read(0, &mut count)?;
     if u32::from_le_bytes(count) != 0 {
         return Err(Fault::Param {
-            name: trace.params[planes[0]].name.clone(),
+            name: trace.params[planes[0].0].name.clone(),
             why: "is one of the fp8 planes, which together hold NaN codes (0x7f, 0xff); the FP8 \
                   matrix core reads e4m3fnuz, where they are numbers, so this load refuses them",
         });

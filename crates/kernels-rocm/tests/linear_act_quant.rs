@@ -222,20 +222,25 @@ fn tile_dot(codes: &[u8], factors: &[f32], k: usize, xq: &[f32], xs: Option<&[f3
         .sum()
 }
 
-/// `codes` made canonical for the FP8 matrix core, as a load does; the NaN
-/// codes it counted.
-fn canonical(gpu: &Gpu, codes: Tensor, bytes: usize) -> u32 {
+/// `codes` (`rows` x `k`) put in the FP8 matrix core's order and made
+/// canonical, as a load does, into a plane of their own; the NaN codes it
+/// counted.
+fn canonical(gpu: &Gpu, codes: Tensor, rows: usize, k: usize) -> (Tensor, u32) {
     let nans = gpu.zeros(1, 1, Dtype::F32);
-    act_quant::e4m3fn_canonical(&gpu.ctx(), "test", codes.ptr, bytes as u64, nans.ptr).unwrap();
-    gpu.read(&nans)[0].to_bits()
+    let out = gpu.zeros(codes.rows, codes.width.div_ceil(2), Dtype::Bf16);
+    act_quant::e4m3fn_shuffle(&gpu.ctx(), "test", codes.ptr, out.ptr, rows as u64, k as u64, nans.ptr).unwrap();
+    (Tensor::new(out.ptr, codes.rows, codes.width, codes.dtype), gpu.read(&nans)[0].to_bits())
 }
 
 #[test]
 fn a_nan_code_is_counted_and_negative_zero_reads_as_zero() {
     let Some(gpu) = Gpu::open() else { return };
-    let codes: Vec<u8> = vec![0x80, 0x00, 0x7F, 0x3C, 0xFF, 0x80, 0x01, 0x7E];
-    let t = bytes(&gpu, &codes, 1, 8, Dtype::U8);
-    assert_eq!(canonical(&gpu, t, 8), 2, "0x7f and 0xff are NaN codes");
+    let mut codes = vec![0x3Cu8; 16 * 64];
+    for (i, c) in [0x80u8, 0x7F, 0xFF, 0x80, 0x01, 0x7E].iter().enumerate() {
+        codes[i * 97] = *c;
+    }
+    let t = bytes(&gpu, &codes, 16, 64, Dtype::U8);
+    assert_eq!(canonical(&gpu, t, 16, 64).1, 2, "0x7f and 0xff are NaN codes");
 }
 
 fn run_fp8_mfma(m: usize, n: usize, k: usize, edge_codes: bool) {
@@ -259,7 +264,8 @@ fn run_fp8_mfma(m: usize, n: usize, k: usize, edge_codes: bool) {
         .collect();
     let mut y = gpu.zeros(m as u32, n as u32, Dtype::Bf16);
     let wt = bytes(&gpu, &codes, n as u32, k as u32, Dtype::E4m3);
-    assert_eq!(canonical(&gpu, wt, n * k), 0);
+    let (wt, nans) = canonical(&gpu, wt, n, k);
+    assert_eq!(nans, 0);
     act_quant::matmul_fp8(
         &ctx,
         "linear.matmul_act_quant",
@@ -315,7 +321,8 @@ fn an_fp8_bank_on_the_matrix_core_folds_each_route() {
         let (host, host_s) = host_scaled(&x, k, 128);
         let mut y = gpu.zeros((tokens * top_k) as u32, n as u32, Dtype::Bf16);
         let ct = bytes(&gpu, &codes, experts as u32, (n * k) as u32, Dtype::U8);
-        assert_eq!(canonical(&gpu, ct, experts * n * k), 0);
+        let (ct, nans) = canonical(&gpu, ct, experts * n, k);
+        assert_eq!(nans, 0);
         moe::matmul_select_fp8_mfma(
             &ctx,
             xt,
@@ -381,7 +388,8 @@ fn bench_fp8_projections() {
             .map(|c| {
                 let (codes, factors) = tile_planes(n * k, nb * kb, 77 + c as u32);
                 let ct = bytes(&gpu, &codes, n as u32, k as u32, Dtype::E4m3);
-                assert_eq!(canonical(&gpu, ct, n * k), 0);
+                let (ct, nans) = canonical(&gpu, ct, n, k);
+                assert_eq!(nans, 0);
                 (ct, gpu.tensor(&factors, nb as u32, kb as u32, Dtype::F32))
             })
             .collect();
