@@ -64,3 +64,9 @@ __device__ __forceinline__ m1_u64 m1_lead_from(m1_u64 v, m1_u32 lane) {
   const m1_u32 hi = (m1_u32)__builtin_amdgcn_readlane((int)(m1_u32)(v >> 32), (int)lane);
   return ((m1_u64)hi << 32) | lo;
 }
+
+// `v` of the lane `lane ^ mask` of the lane's 32-lane chunk.
+template <class T>
+__device__ __forceinline__ T m1_chunk_xor(T v, m1_u32 mask) {
+  return __shfl_xor(v, mask, 32);
+}

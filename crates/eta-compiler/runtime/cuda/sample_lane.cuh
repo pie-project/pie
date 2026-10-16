@@ -265,9 +265,11 @@ __device__ __forceinline__ float m1_fast_mass(m1_u32 units, int eu) {
   return __uint_as_float(((m1_u32)(eu + 149) << 23) + units);
 }
 
+#define M1_WALK_EACH 8u
+
 // The walk of `n` sorted elements (composites, descending value) from the
-// running sum `mass`, on one 32-lane chunk: a step takes the next 128, four
-// consecutive ones a lane, each its units at the sum's binade, and adds the
+// running sum `mass`, on one 32-lane chunk: a step takes the next 256, eight
+// consecutive ones a lane (their units stay below 2^32 summed), each its units at the sum's binade, and adds the
 // run before the first that leaves the binade, reaches the cutoff's units
 // or is a tie; that one is added in f32 as the reference adds it. True (and
 // `pivot` the last kept) at the first add whose sum reaches the cutoff.
@@ -279,13 +281,13 @@ __device__ __forceinline__ bool m1_fast_walk(
     m1_u32 units;
     const int eu = m1_fast_binade(mass, &units);
     const m1_u32 limit = m1_fast_limit(cutoff, eu);
-    float y[4];
-    m1_u32 r[4];
-    bool special[4];
+    float y[M1_WALK_EACH];
+    m1_u32 r[M1_WALK_EACH];
+    bool special[M1_WALK_EACH];
     m1_u32 own = 0u;
 #pragma unroll
-    for (m1_u32 j = 0u; j < 4u; ++j) {
-      const m1_u32 i = at + lane * 4u + j;
+    for (m1_u32 j = 0u; j < M1_WALK_EACH; ++j) {
+      const m1_u32 i = at + lane * M1_WALK_EACH + j;
       y[j] = 0.0f;
       r[j] = 0u;
       special[j] = false;
@@ -299,20 +301,21 @@ __device__ __forceinline__ bool m1_fast_walk(
       own += r[j];
     }
     const m1_u32 sum = m1_chunk_scan(own);
-    // This lane's first crossing element (4: none), and the units before it.
+    // This lane's first crossing element (none: M1_WALK_EACH), and the units
+    // before it.
     m1_u32 before = sum - own;
-    m1_u32 first = 4u;
+    m1_u32 first = M1_WALK_EACH;
 #pragma unroll
-    for (m1_u32 j = 0u; j < 4u; ++j) {
-      const bool live = at + lane * 4u + j < n;
-      if (first == 4u && live && (special[j] || units + before + r[j] >= limit)) first = j;
-      if (first == 4u) before += r[j];
+    for (m1_u32 j = 0u; j < M1_WALK_EACH; ++j) {
+      const bool live = at + lane * M1_WALK_EACH + j < n;
+      if (first == M1_WALK_EACH && live && (special[j] || units + before + r[j] >= limit)) first = j;
+      if (first == M1_WALK_EACH) before += r[j];
     }
-    const m1_u32 ballot = m1_chunk_ballot(first != 4u);
+    const m1_u32 ballot = m1_chunk_ballot(first != M1_WALK_EACH);
     if (ballot == 0u) {
       units += m1_lead_from(sum, 31u);
       mass = m1_fast_mass(units, eu);
-      at += 128u;
+      at += 32u * M1_WALK_EACH;
       continue;
     }
     const m1_u32 k = (m1_u32)(__ffs((int)ballot) - 1);
@@ -320,18 +323,81 @@ __device__ __forceinline__ bool m1_fast_walk(
     const m1_u32 prior = m1_lead_from(before, k);
     float crossing = y[0];
 #pragma unroll
-    for (m1_u32 q = 1u; q < 4u; ++q)
+    for (m1_u32 q = 1u; q < M1_WALK_EACH; ++q)
       if (q == j) crossing = y[q];
     crossing = m1_lead_from(crossing, k);
     mass = m1_fast_mass(units + prior, eu);
     mass = mass + crossing;
-    at += k * 4u + j + 1u;
+    at += k * M1_WALK_EACH + j + 1u;
     if (!(mass < cutoff)) {
       pivot = items[at - 1u];
       return true;
     }
   }
   return false;
+}
+
+// Sorts `n` composites (at most M1_CUT_CHUNK; `items` holds that many) by
+// a bitonic network whose short stages stay in registers: four elements a
+// thread (512 threads), a pair four apart or less in the thread, up to 128
+// apart in its 32-lane chunk (a shuffle), farther through LDS. Any other
+// block takes the plain network.
+__device__ __forceinline__ m1_u64 m1_fast_exchange(m1_u32 e, m1_u32 partner, m1_u32 k, m1_u64 mine, m1_u64 other) {
+  const bool keep_least = ((e & k) == 0u) == (e < partner);
+  const bool less = mine < other;
+  return keep_least == less ? mine : other;
+}
+
+__device__ __forceinline__ void m1_fast_sort(m1_u64* items, m1_u32 n) {
+  if (blockDim.x * 4u != M1_CUT_CHUNK) {
+    m1_cut_sort(items, n);
+    return;
+  }
+  const m1_u32 t = threadIdx.x;
+  m1_u64 v[4];
+#pragma unroll
+  for (m1_u32 r = 0u; r < 4u; ++r) {
+    const m1_u32 e = t * 4u + r;
+    v[r] = e < n ? items[e] : ~0ull;
+  }
+  for (m1_u32 k = 2u; k <= M1_CUT_CHUNK; k <<= 1) {
+    for (m1_u32 j = k >> 1; j > 0u; j >>= 1) {
+      if (j >= 128u) {
+        __syncthreads();
+#pragma unroll
+        for (m1_u32 r = 0u; r < 4u; ++r) items[t * 4u + r] = v[r];
+        __syncthreads();
+#pragma unroll
+        for (m1_u32 r = 0u; r < 4u; ++r) {
+          const m1_u32 e = t * 4u + r;
+          v[r] = m1_fast_exchange(e, e ^ j, k, v[r], items[e ^ j]);
+        }
+      } else if (j >= 4u) {
+#pragma unroll
+        for (m1_u32 r = 0u; r < 4u; ++r) {
+          const m1_u32 e = t * 4u + r;
+          const m1_u64 other = m1_chunk_xor(v[r], j >> 2);
+          v[r] = m1_fast_exchange(e, e ^ j, k, v[r], other);
+        }
+      } else {
+        m1_u64 w[4];
+#pragma unroll
+        for (m1_u32 r = 0u; r < 4u; ++r) {
+          const m1_u32 e = t * 4u + r;
+          w[r] = m1_fast_exchange(e, e ^ j, k, v[r], v[r ^ j]);
+        }
+#pragma unroll
+        for (m1_u32 r = 0u; r < 4u; ++r) v[r] = w[r];
+      }
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (m1_u32 r = 0u; r < 4u; ++r) {
+    const m1_u32 e = t * 4u + r;
+    if (e < n) items[e] = v[r];
+  }
+  __syncthreads();
 }
 
 #define M1_FAST_MISS 0u
@@ -1048,7 +1114,7 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
       mass = 0.0f;
       break;
     }
-    m1_cut_sort(cut.chunk, gathered);
+    m1_fast_sort(cut.chunk, gathered);
     if (threadIdx.x == 0u) {
       f.mass = mass;
       f.walked = 0u;
@@ -1154,7 +1220,8 @@ __device__ __forceinline__ void M1Lane::fast(const m1_u8* input, m1_u32 base, m1
         }
         __syncthreads();
       }
-      m1_cut_sort(mended, count);
+      if (mended == cut.chunk) m1_fast_sort(mended, count);
+      else m1_cut_sort(mended, count);
       if (threadIdx.x < 32u) {
         float sum = mass;
         m1_u64 pivot = 0ull;
