@@ -491,3 +491,66 @@ fn qwens_attention_prologue_lands_as_one_fused_op() {
         ]
     );
 }
+
+#[test]
+fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
+    let yarn = Some(poem_ir::ops::elemwise::Yarn {
+        factor: 16.0,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+        original_max_position: 65536,
+    });
+    let kernels = ["elementwise.norm_rope_last"];
+    // q: a scale-free norm a 512-wide head, its tail turned.
+    let q = trace(|p| {
+        let positions = p.indices("positions");
+        let y = elemwise::rmsnorm_no_scale(&p.rows("q", 64 * 512), 512, 1e-6);
+        let q = elemwise::rope_partial_last_yarn(&y, &positions, 64, 512, 1e4, true, false, yarn);
+        elemwise::silu(&q);
+    });
+    let fused = fuse(q, &kernels);
+    assert_eq!(
+        ops(&fused),
+        ["elementwise.norm_rope_last", "elementwise.silu"]
+    );
+    let Some(poem_ir::Operation::Fused(poem_ir::Fused::NormRopeLast {
+        weight,
+        head_dim,
+        interleaved,
+        yarn: got,
+        ..
+    })) = fused.nodes.first().map(|node| &node.op)
+    else {
+        panic!("the first op is the norm and rotation");
+    };
+    assert_eq!(
+        (weight.is_none(), *head_dim, *interleaved, *got),
+        (true, 512, true, yarn)
+    );
+    // The kv plane: a scaled norm of a row one head wide.
+    let plane = trace(|p| {
+        let positions = p.indices("positions");
+        let y = elemwise::rmsnorm(&p.rows("kv", 512), &p.weight("norm", [512]), 1e-6);
+        let k = elemwise::rope_partial_last_yarn(&y, &positions, 64, 512, 1e4, true, true, None);
+        elemwise::silu(&k);
+    });
+    assert_eq!(
+        ops(&fuse(plane, &kernels)),
+        ["elementwise.norm_rope_last", "elementwise.silu"]
+    );
+    // A row of several heads normed whole is not a head's norm.
+    let wide = trace(|p| {
+        let positions = p.indices("positions");
+        let y = elemwise::rmsnorm(&p.rows("kv", 1024), &p.weight("norm", [1024]), 1e-6);
+        let k = elemwise::rope_partial_last(&y, &positions, 64, 512, 1e4, true);
+        elemwise::silu(&k);
+    });
+    assert_eq!(
+        ops(&fuse(wide, &kernels)),
+        [
+            "elementwise.rmsnorm",
+            "elementwise.rope_partial_last",
+            "elementwise.silu"
+        ]
+    );
+}

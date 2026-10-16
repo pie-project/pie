@@ -27,6 +27,7 @@ impl DispatchFused for Run<'_> {
             | Fused::EmbedScaleAdd { .. }
             | Fused::EmbedScaleAddSelect { .. }
             | Fused::RmsnormRopePartialQ { .. }
+            | Fused::NormRopeLast { .. }
             | Fused::NormModulate { .. }
             | Fused::GatedResidualNormModulate { .. } => {
                 let mut outputs = Vec::new();

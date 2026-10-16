@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::operands::Operands;
 use crate::ops::attn::Attention;
-use crate::ops::elemwise::{Elementwise, ModulateForm};
+use crate::ops::elemwise::{Elementwise, ModulateForm, Yarn};
 use crate::ops::linear::Linear;
 use crate::value::ValueId;
 
@@ -78,6 +78,23 @@ pub enum Fused {
         rotary_dim: u32,
         theta: f32,
         span: u32,
+        y: ValueId,
+        q_out: ValueId,
+    },
+    /// A head's RMS norm (scaled by `weight`, or scale-free) and the
+    /// rotation of its last `rotary_dim` dims (`RopePartialLast`), the
+    /// normed heads the rotation's own plane.
+    NormRopeLast {
+        x: ValueId,
+        weight: Option<ValueId>,
+        head_dim: u32,
+        eps: f32,
+        positions: ValueId,
+        rotary_dim: u32,
+        theta: f32,
+        interleaved: bool,
+        inverse: bool,
+        yarn: Option<Yarn>,
         y: ValueId,
         q_out: ValueId,
     },
@@ -338,6 +355,15 @@ impl Operands for Fused {
                 positions,
                 ..
             } => sink.extend([*x, *weight, *positions]),
+            Self::NormRopeLast {
+                x,
+                weight,
+                positions,
+                ..
+            } => {
+                sink.extend([*x, *positions]);
+                sink.extend(*weight);
+            }
             Self::NormModulate {
                 x, m, lane_of_row, ..
             } => {
@@ -526,6 +552,7 @@ impl Operands for Fused {
                 ..
             } => sink.extend([*e, *e_scaled, *y_out, *y_scaled]),
             Self::RmsnormRopePartialQ { y, q_out, .. } => sink.extend([*y, *q_out]),
+            Self::NormRopeLast { y, q_out, .. } => sink.extend([*y, *q_out]),
             Self::NormModulate { normed, y, .. } => sink.extend([*normed, *y]),
             Self::GatedResidualNormModulate {
                 r_out, normed, out, ..
@@ -604,6 +631,7 @@ impl Operands for Fused {
             Self::EmbedScaleAdd { y_out, y, .. } => sink.push((*y_out, *y)),
             Self::EmbedScaleAddSelect { .. } => {}
             Self::RmsnormRopePartialQ { q_out, y, .. } => sink.push((*q_out, *y)),
+            Self::NormRopeLast { q_out, y, .. } => sink.push((*q_out, *y)),
             Self::RopeYarnAppend {
                 q_out, q, k_out, k, ..
             } => sink.extend([(*q_out, *q), (*k_out, *k)]),
@@ -658,6 +686,7 @@ impl Operands for Fused {
             Self::EmbedScaleAdd { .. } => "elementwise.embed_scale_add",
             Self::EmbedScaleAddSelect { .. } => "elementwise.embed_scale_add_select",
             Self::RmsnormRopePartialQ { .. } => "elementwise.rmsnorm_rope_partial_q",
+            Self::NormRopeLast { .. } => "elementwise.norm_rope_last",
             Self::NormModulate { .. } => "elementwise.norm_modulate",
             Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
             Self::MatmulGeglu { .. } => "linear.matmul_geglu",

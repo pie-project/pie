@@ -45,6 +45,7 @@ pub(super) fn all() -> Vec<Rule> {
         gated_residual_norm_modulate(),
         norm_modulate(),
         rmsnorm_rope_partial_q(),
+        norm_rope_last(),
         qg_qknorm_rope_append(),
         split_rope_yarn_append(),
         rope_yarn_append(),
@@ -1059,6 +1060,71 @@ fn norm_modulate() -> Rule {
             form: modulate_form(m.op("y")),
             y: m.value("y"),
         }
+    })
+}
+
+/// A head's RMS norm, scaled (the whole row one head) or scale-free (per
+/// head), its last dims rotated: DeepSeek-V4's q, kv plane, compressed
+/// latent and index keys.
+fn norm_rope_last() -> Rule {
+    let rope = |p: &poem::pattern::Pattern, y: &poem::Value| {
+        p.free("interleaved");
+        p.free("inverse");
+        p.free("yarn");
+        let positions = p.indices("positions");
+        elemwise::rope_partial_last_yarn(
+            y,
+            &positions,
+            p.u32("rotary_dim"),
+            p.u32("head_dim"),
+            p.f32("theta"),
+            false,
+            false,
+            None,
+        )
+    };
+    let scale_free = template(move |p| {
+        let y = elemwise::rmsnorm_no_scale(&p.rows("x", W), p.u32("norm_dim"), p.f32("eps"));
+        p.name("y", &y);
+        let q_out = rope(p, &y);
+        p.export("q_out", &q_out);
+    });
+    let scaled = template(move |p| {
+        let y = elemwise::rmsnorm(&p.rows("x", W), &p.weight("weight", [W]), p.f32("eps"));
+        p.name("y", &y);
+        let q_out = rope(p, &y);
+        p.export("q_out", &q_out);
+    });
+    Rule::new("elementwise.norm_rope_last", [scale_free, scaled], |m| {
+        let Operation::Elementwise(Elementwise::RopePartialLast {
+            interleaved,
+            inverse,
+            yarn,
+            ..
+        }) = *m.op("q_out")
+        else {
+            unreachable!("the pattern's last op is the rotation")
+        };
+        Fused::NormRopeLast {
+            x: m.value("x"),
+            weight: m.get("weight"),
+            head_dim: m.u32("head_dim"),
+            eps: m.f32("eps"),
+            positions: m.value("positions"),
+            rotary_dim: m.u32("rotary_dim"),
+            theta: m.f32("theta"),
+            interleaved,
+            inverse,
+            yarn,
+            y: m.value("y"),
+            q_out: m.value("q_out"),
+        }
+    })
+    // The norm's heads are the rotation's: a scale-free norm per head of
+    // the rotation's width, a scaled one over a row one head wide.
+    .when(|m| match m.get_u32("norm_dim") {
+        Some(norm_dim) => norm_dim == m.u32("head_dim"),
+        None => m.width("x") == Some(u64::from(m.u32("head_dim"))),
     })
 }
 

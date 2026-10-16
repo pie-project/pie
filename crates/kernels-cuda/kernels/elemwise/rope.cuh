@@ -1077,6 +1077,131 @@ __global__ void rope_partial_last_vec(
     }
 }
 
+// A head's RMS norm (times `weight` where given) and the rotation of its
+// last `rotary_dim` dims, a warp a (row, head) unit: lane `l` holds the
+// head's runs of RUN elements `l`, `l + 32`, ... (RUN 4 for a 128-wide head,
+// else 8), rounds its normed values to bf16 as the norm's own plane would,
+// and turns the interleaved pairs of the tail it holds by the angles
+// `rope_partial_last_spread` works out, a lane working one pair's and
+// handing it on. `head_dim = 32 * PER`; the tail starts on a run and is at
+// most 128 wide.
+template <int PER, bool WEIGHTED>
+__global__ void __launch_bounds__(256) norm_rope_last(
+    const bf16* __restrict__ x,
+    const bf16* __restrict__ weight,
+    bf16* __restrict__ y,
+    const i32* __restrict__ positions,
+    int units,
+    int heads,
+    float eps,
+    int rotary_dim,
+    float theta,
+    bool inverse,
+    float yarn_factor,
+    float yarn_low_dim,
+    float yarn_high_dim,
+    const u32* __restrict__ win)
+{
+    static_assert(PER == 4 || PER == 8 || PER == 16, "a lane holds one to two runs");
+    constexpr int head_dim = 32 * PER;
+    constexpr int RUN = PER == 4 ? 4 : 8;
+    constexpr int RUNS = PER / RUN;
+    // The tail's frequencies once a block, as the spread form works them.
+    __shared__ float freq_s[64];
+    if (threadIdx.x < rotary_dim / 2) {
+        const int d = static_cast<int>(threadIdx.x);
+        float freq = powf(theta, -2.f * static_cast<float>(d) / static_cast<float>(rotary_dim));
+        if (yarn_factor > 1.f) {
+            freq = yarn_original_freq(freq, yarn_factor, yarn_low_dim, yarn_high_dim, d);
+        }
+        freq_s[d] = freq;
+    }
+    __syncthreads();
+    const int unit = static_cast<int>(blockIdx.x) * 8 + static_cast<int>(threadIdx.x >> 5);
+    if (unit >= units) return;
+    if (win != nullptr && unit / heads >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? unit + static_cast<int>(win[1]) * heads : unit;
+    const int row = plane_row / heads;
+    const int lane = threadIdx.x & 31;
+    const long long at = static_cast<long long>(plane_row) * head_dim;
+
+    bf16 v[RUNS][RUN];
+#pragma unroll
+    for (int r = 0; r < RUNS; ++r) {
+        const int e = (lane + 32 * r) * RUN;
+        if constexpr (RUN == 4) {
+            *reinterpret_cast<uint2*>(v[r]) = *reinterpret_cast<const uint2*>(x + at + e);
+        } else {
+            *reinterpret_cast<uint4*>(v[r]) = *reinterpret_cast<const uint4*>(x + at + e);
+        }
+    }
+    // The tail's angles a lane each (pairs `lane` and `lane + 32`), handed
+    // to the lanes that hold their pairs; worked out while the head loads.
+    const int offset = head_dim - rotary_dim;
+    const int rope_half = rotary_dim / 2;
+    const int pos = positions[row];
+    float2 cs[2];
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const int d = lane + 32 * k;
+        cs[k] = make_float2(1.f, 0.f);
+        if (d < rope_half) {
+            const float ang = (inverse ? -1.f : 1.f) * static_cast<float>(pos) * freq_s[d];
+            __sincosf(ang, &cs[k].y, &cs[k].x);
+        }
+    }
+    float local = 0.f;
+#pragma unroll
+    for (int r = 0; r < RUNS; ++r)
+#pragma unroll
+        for (int u = 0; u < RUN; ++u) {
+            const float f = bf16_to_f32(v[r][u]);
+            local = fmaf(f, f, local);
+        }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+    const float inv_rms = rsqrtf(local / static_cast<float>(head_dim) + eps);
+#pragma unroll
+    for (int r = 0; r < RUNS; ++r)
+#pragma unroll
+        for (int u = 0; u < RUN; ++u) {
+            float n = bf16_to_f32(v[r][u]) * inv_rms;
+            if constexpr (WEIGHTED) n *= bf16_to_f32(weight[(lane + 32 * r) * RUN + u]);
+            v[r][u] = f32_to_bf16(n);
+        }
+
+#pragma unroll
+    for (int r = 0; r < RUNS; ++r) {
+        const int e = (lane + 32 * r) * RUN;
+        const bool tail = e >= offset;
+        const int first = tail ? (e - offset) / 2 : 0;
+        // Whether any of the warp's runs here is the tail's (alike across it).
+        const bool any_tail = (32 * r + 31) * RUN >= offset;
+#pragma unroll
+        for (int u = 0; u < RUN / 2; ++u) {
+            if (!any_tail) break;
+            const int d = first + u;
+            const float c0 = __shfl_sync(0xffffffffu, cs[0].x, d & 31);
+            const float s0 = __shfl_sync(0xffffffffu, cs[0].y, d & 31);
+            const float c1 = __shfl_sync(0xffffffffu, cs[1].x, d & 31);
+            const float s1 = __shfl_sync(0xffffffffu, cs[1].y, d & 31);
+            if (tail) {
+                const float cos_v = d < 32 ? c0 : c1;
+                const float sin_v = d < 32 ? s0 : s1;
+                const float a = bf16_to_f32(v[r][2 * u]);
+                const float b = bf16_to_f32(v[r][2 * u + 1]);
+                v[r][2 * u] = f32_to_bf16(a * cos_v - b * sin_v);
+                v[r][2 * u + 1] = f32_to_bf16(b * cos_v + a * sin_v);
+            }
+        }
+        if constexpr (RUN == 4) {
+            *reinterpret_cast<uint2*>(y + at + e) = *reinterpret_cast<const uint2*>(v[r]);
+        } else {
+            *reinterpret_cast<uint4*>(y + at + e) = *reinterpret_cast<const uint4*>(v[r]);
+        }
+    }
+}
+
 __global__ void rope_partial_last(
     bf16* __restrict__ q,
     bf16* __restrict__ k,

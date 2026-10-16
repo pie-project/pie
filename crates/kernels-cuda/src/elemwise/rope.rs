@@ -384,6 +384,115 @@ pub fn partial_last(
     )
 }
 
+/// A head's RMS norm (times `weight` where given; else scale-free) into `y`,
+/// then the rotation of its last `rotary_dim` dims there
+/// (`partial_last`). Under `kernel.elemwise.rows_vec`, where the head is
+/// 128, 256 or 512 wide, the rotation interleaved and its tail (at most 128
+/// wide) whole lane
+/// runs, both in one pass a warp a head; otherwise the two launches the
+/// unfused ops fire, unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn norm_rope_last(
+    ctx: &Ctx,
+    x: Tensor,
+    weight: Option<Tensor>,
+    head_dim: u32,
+    eps: f32,
+    positions: Tensor,
+    rotary_dim: u32,
+    theta: f32,
+    interleaved: bool,
+    inverse: bool,
+    yarn: Option<Yarn>,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.norm_rope_last";
+    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    positions_stream(OP, positions, &x);
+    let per = head_dim / 32;
+    let fused = ctx.tuning().rows_vec
+        && interleaved
+        && matches!(head_dim, 128 | 256 | 512)
+        && rotary_dim > 0
+        && rotary_dim <= head_dim.min(128)
+        && rotary_dim.is_multiple_of(per.min(8))
+        && y.width.is_multiple_of(head_dim)
+        && weight.is_none_or(|w| w.dtype == Dtype::Bf16 && aligned16(w.ptr))
+        && [x.ptr, y.ptr].iter().all(|&at| aligned16(at));
+    if !fused {
+        match weight {
+            Some(w) => crate::elemwise::norm::rmsnorm(ctx, x, w, eps, y)?,
+            None => crate::elemwise::norm::rmsnorm_no_scale(ctx, x, head_dim, eps, y)?,
+        }
+        return partial_last(
+            ctx,
+            y,
+            positions,
+            rotary_dim,
+            head_dim,
+            theta,
+            interleaved,
+            inverse,
+            yarn,
+        );
+    }
+    let (factor, low_dim, high_dim) = match yarn {
+        Some(yn) => {
+            let max_position = nonzero(
+                OP,
+                "the position span this layer's YaRN ramp states",
+                yn.original_max_position,
+            )?;
+            let (low, high) = ramp_bounds(
+                stated(OP, rotary_dim)?,
+                theta,
+                yn.beta_fast,
+                yn.beta_slow,
+                stated(OP, max_position)?,
+            );
+            (yn.factor, low, high)
+        }
+        None => (UNSCALED, 0.0, 0.0),
+    };
+    let heads = y.width / head_dim;
+    let units = y.rows.checked_mul(heads).ok_or_else(|| {
+        refuse(
+            OP,
+            format!("{} rows of {heads} heads overflow a grid", y.rows),
+        )
+    })?;
+    if units == 0 {
+        return Ok(());
+    }
+    let weighted = weight.is_some();
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::norm_rope_last<{per}, {weighted}>"
+            )),
+        )
+        .apply(Launch::grid([units.div_ceil(8), 1, 1], [256, 1, 1])),
+        &[
+            x.arg(),
+            weight.unwrap_or(Tensor::ABSENT).arg(),
+            y.arg(),
+            positions.arg(),
+            stated(OP, units)?.arg(),
+            stated(OP, heads)?.arg(),
+            eps.arg(),
+            stated(OP, rotary_dim)?.arg(),
+            theta.arg(),
+            inverse.arg(),
+            factor.arg(),
+            low_dim.arg(),
+            high_dim.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 pub fn yarn(
     ctx: &Ctx,
     q: &mut Tensor,
