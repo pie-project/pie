@@ -283,8 +283,11 @@ fn the_e2m1_convert_form_agrees() {
     check(3, 576, 2880, false, true, cvt);
     check(12, 384, 2880, true, false, cvt);
     BIG.with(|w| w.set(false));
-    check_atoms(8, 256, 2048, cvt);
-    check_atoms(12, 384, 4096, cvt);
+    for keep in [false, true] {
+        check_atoms(8, 256, 2048, cvt, keep);
+        check_atoms(12, 384, 4096, cvt, keep);
+        check_atoms(1, 384, 4096, cvt, keep);
+    }
     // B200's own decisions: the arm its profile picks at each width (its
     // GLU cases where the register-dequant kernel spans them).
     let sm100 = crate::common::SM100;
@@ -303,8 +306,10 @@ fn atom_offset(row: usize, col: usize, cols: usize) -> usize {
 }
 
 /// The select over a W4A8 bank's atom-laid scales (rows counted across the
-/// experts) answers the row-major one.
-fn check_atoms(tokens: usize, n: usize, k: usize, cvt: Tuning) {
+/// experts) answers the row-major one; with `keep`, the first keeps its
+/// route order (`keeping_order`) and the second takes it rather than lay
+/// its own.
+fn check_atoms(tokens: usize, n: usize, k: usize, cvt: Tuning, keep: bool) {
     let groups = k / BLOCK;
     let routes = routes_of(tokens);
     let route_count = routes.len();
@@ -337,11 +342,16 @@ fn check_atoms(tokens: usize, n: usize, k: usize, cvt: Tuning) {
     let plain_at = gpu.zeros(route_count * n * 2);
     let ctx = gpu.ctx().with_tuning(cvt);
     let mut laid = Tensor::new(laid_at, route_count as u32, n as u32, Dtype::Bf16);
+    let mut first = || {
+        kernels_cuda::linear::moe::select_mxfp4_atoms(&ctx, x, codes_t, atoms_at, routes_t, &mut laid)
+    };
+    let fired = if keep {
+        kernels_cuda::linear::moe::keeping_order(first)
+    } else {
+        first()
+    };
     assert!(
-        kernels_cuda::linear::moe::select_mxfp4_atoms(
-            &ctx, x, codes_t, atoms_at, routes_t, &mut laid
-        )
-        .expect("the atom-laid select fires"),
+        fired.expect("the atom-laid select fires"),
         "the e2m1-convert kernel takes {route_count} routes"
     );
     let mut plain = Tensor::new(plain_at, route_count as u32, n as u32, Dtype::Bf16);
@@ -361,7 +371,7 @@ fn check_atoms(tokens: usize, n: usize, k: usize, cvt: Tuning) {
     let plain: Vec<u16> = gpu.down(plain_at, route_count * n);
     assert_eq!(
         laid, plain,
-        "the atom-laid scales answer the row-major ones bit for bit"
+        "the atom-laid scales answer the row-major ones bit for bit (kept order: {keep})"
     );
 }
 

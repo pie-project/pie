@@ -1768,11 +1768,30 @@ struct OrderKey {
 }
 
 std::thread_local! {
-    /// The last route order laid on this thread, when a GLU select laid it
-    /// for its down select. Any other order laid clears it: they share the
+    /// The last route order laid on this thread, when a GLU select (or one
+    /// in [`keeping_order`]) laid it for its down select. Any other order laid clears it: they share the
     /// scratch.
     static KEPT_ORDER: core::cell::Cell<Option<(OrderKey, RouteOrder)>> =
         const { core::cell::Cell::new(None) };
+    /// Inside [`keeping_order`]: the select keeps its order, whatever it
+    /// lands.
+    static KEEP_NEXT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Runs `f` with its select keeping the route order it lays, for the next
+/// select of the same routes (a gate-up select whose GLU runs apart, before
+/// its down select): the caller vouches that the next select to lay an
+/// order reads these routes unchanged, and that one takes the order rather
+/// than lay it again.
+pub fn keeping_order<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            KEEP_NEXT.with(|k| k.set(self.0));
+        }
+    }
+    let _reset = Reset(KEEP_NEXT.with(|k| k.replace(true)));
+    f()
 }
 
 /// [`route_order`] with each work item `slice` routes of one expert; with
@@ -2017,7 +2036,7 @@ fn select_mxfp4_mma(
         experts,
         8 * nb,
         true,
-        if glu.is_some() {
+        if glu.is_some() || KEEP_NEXT.with(core::cell::Cell::get) {
             Share::Keep
         } else {
             Share::Take

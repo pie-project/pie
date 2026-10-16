@@ -98,6 +98,7 @@ mod the_sparse_mla_lands_on_tcgen05;
 mod the_spatial_attention_answers_the_cpu_reference;
 mod the_spatial_attention_segments_by_frame;
 mod the_sqrt_softplus_router_picks_the_best_experts;
+mod the_routed_glu_lands_its_e4m3_read_back;
 mod the_strided_grouped_projection_answers_each_group;
 mod the_tcgen05_epilogue_lands_the_glu_and_the_next_operand;
 mod the_tcgen05_gemm_answers_the_dequantized_dot;

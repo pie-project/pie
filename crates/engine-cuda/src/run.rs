@@ -551,6 +551,11 @@ pub struct Run<'c> {
     /// beside its bf16 row), for the projection that reads that row next.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     held: Option<HeldAct>,
+
+    /// The routed GLU rows that land read back through e4m3 already
+    /// ([`Run::lands_read_back`]).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    read_back: Cell<Option<ValueId>>,
 }
 
 /// A producer's own fp8 1x128 copy of value `value` (at `ptr`, on the
@@ -601,7 +606,26 @@ impl<'c> Run<'c> {
             ceilings: Ceilings::default(),
             stood: Cell::new(None),
             held: None,
+            read_back: Cell::new(None),
         }
+    }
+
+    /// Whether `y`, a routed GLU's rows (`mlp_swiglu_clamp_routed`), lands
+    /// as its e4m3 1x128 read-back: inside a routed MLP whose down select
+    /// (its rows' one reader) reads them back at 128-column blocks
+    /// ([`Run::reading_back`]).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn lands_read_back(&self, y: ValueId) -> bool {
+        self.read_back.get() == Some(y)
+    }
+
+    /// `f` with `rows` landing as their read-back ([`Run::lands_read_back`]).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn reading_back<R>(&mut self, rows: ValueId, f: impl FnOnce(&mut Self) -> R) -> R {
+        let was = self.read_back.replace(Some(rows));
+        let r = f(self);
+        self.read_back.set(was);
+        r
     }
 
     /// Planes a producer of `y` lands its fp8 1x128 codes and atoms in,

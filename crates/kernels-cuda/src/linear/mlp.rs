@@ -252,6 +252,63 @@ pub fn swiglu_clamp_split_routed(
 /// [`swiglu_clamp_split_routed`] over packed rows: each row's
 /// `intermediate` gate columns, then its up columns.
 #[allow(clippy::too_many_arguments)]
+/// Whether [`swiglu_clamp_routed_e4m3`] lands rows `y` (at a valid launch):
+/// bf16, whole 128-column blocks.
+#[must_use]
+pub fn routed_e4m3_spans(y: &Tensor) -> bool {
+    y.dtype == dtype::Dtype::Bf16 && y.width.is_multiple_of(128)
+}
+
+/// [`swiglu_clamp_routed`] landing its bf16 rows read back through e4m3 a
+/// 128 columns (`act_quant`'s E4M3 at `gran` 128, read back): what a W4A8
+/// select would read back from the plain rows, and what it reads back from
+/// these again. `Ok(false)` where it does not apply (not bf16, or rows not
+/// whole 128-column blocks); the caller lands the plain rows then.
+#[allow(clippy::too_many_arguments)]
+pub fn swiglu_clamp_routed_e4m3(
+    ctx: &Ctx,
+    packed: Tensor,
+    intermediate: u32,
+    weights: Tensor,
+    fan: u32,
+    limit: f32,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.mlp_swiglu_clamp_routed";
+    if !routed_e4m3_spans(y)
+        || packed.dtype != dtype::Dtype::Bf16
+        || weights.dtype != dtype::Dtype::F32
+        || packed.width != 2 * intermediate
+        || y.width != intermediate
+        || packed.rows != y.rows
+        || u64::from(weights.rows) * u64::from(weights.width) != u64::from(y.rows)
+    {
+        return Ok(false);
+    }
+    let lanes = u32::try_from(y.elements() / 8).map_err(|_| {
+        refuse(OP, "the rows' eights do not fit a 32-bit launch extent")
+    })?;
+    if lanes == 0 {
+        return Ok(true);
+    }
+    ctx.fire(
+        OP,
+        Fire::at("linear/act_quant.cuh", "::pie::linear::mlp_swiglu_clamp_routed_e4m3")
+            .apply(Launch::flat(lanes, BLOCK)),
+        &[
+            packed.arg(),
+            weights.arg(),
+            y.arg(),
+            stated(OP, lanes)?.arg(),
+            stated(OP, y.width)?.arg(),
+            limit.arg(),
+            stated(OP, fan)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}
+
 pub fn swiglu_clamp_routed(
     ctx: &Ctx,
     packed: Tensor,

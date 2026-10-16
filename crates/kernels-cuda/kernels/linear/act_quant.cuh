@@ -890,4 +890,68 @@ __global__ void expert_alpha(
     alpha[e] = input_scales[e] * tensor_scales[static_cast<long long>(e) * rows];
 }
 
+// `mlp_swiglu_clamp_routed` landing its rows as the e4m3 read-back
+// (`act_quant_e4m3_v8`'s values mode) of the bf16 rows it would land: eight
+// columns a lane, a 128-wide block's 16 lanes adjacent. A select reading
+// them back again lands the same values (each block's values sit on its
+// scale's grid, or on the grid one below where the rounding lowered its
+// amax), so it may read them as they are. `width` whole blocks.
+__global__ void mlp_swiglu_clamp_routed_e4m3(
+    const bf16* __restrict__ packed,
+    const float* __restrict__ weights,
+    bf16* __restrict__ y,
+    i32 lanes,
+    i32 width,
+    float limit,
+    i32 fan,
+    const u32* __restrict__ win)
+{
+    using Block = E4m3Block<128>;
+    const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane = static_cast<int>(threadIdx.x % 32);
+    const long long per_row = width / 8;
+    long long live_lanes = lanes;
+    long long first = 0;
+    if (win != nullptr) {
+        live_lanes = static_cast<long long>(win[0]) * fan * per_row;
+        first = static_cast<long long>(win[1]) * fan * per_row;
+    }
+    // A lane past the last block keeps its place in the shuffle.
+    const bool live = idx < lanes && idx < live_lanes;
+    const long long at = (live ? idx : 0) + first;
+    const long long row = at / per_row;
+    const int col = static_cast<int>(at - row * per_row) * 8;
+    const bf16* src = packed + row * 2 * width + col;
+    const uint4 gw = *reinterpret_cast<const uint4*>(src);
+    const uint4 uw = *reinterpret_cast<const uint4*>(src + width);
+    const unsigned gs[4] = {gw.x, gw.y, gw.z, gw.w};
+    const unsigned us[4] = {uw.x, uw.y, uw.z, uw.w};
+    const float wt = weights[row];
+    float v[8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const unsigned gb = h == 0 ? gs[i] << 16 : gs[i] & 0xFFFF0000u;
+            const unsigned ub = h == 0 ? us[i] << 16 : us[i] & 0xFFFF0000u;
+            const float g = fminf(__uint_as_float(gb), limit);
+            const float u = fminf(fmaxf(__uint_as_float(ub), -limit), limit);
+            v[2 * i + h] = (g / (1.f + expf(-g))) * u * wt;
+        }
+    }
+    Block q;
+    q.hold(v);
+    if (!live) return;
+    const float s = __uint_as_float(static_cast<unsigned>(q.e + 127) << 23);
+    const unsigned long long c = q.codes();
+    unsigned w[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float lo = e4m3_value(static_cast<u8>(c >> (16 * i))) * s;
+        const float hi = e4m3_value(static_cast<u8>(c >> (16 * i + 8))) * s;
+        w[i] = pack_bf16x2(lo, hi);
+    }
+    *reinterpret_cast<uint4*>(y + row * width + col) = make_uint4(w[0], w[1], w[2], w[3]);
+}
+
 }  // namespace pie::linear

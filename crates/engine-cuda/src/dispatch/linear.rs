@@ -38,11 +38,52 @@ impl Run<'_> {
                     return Ok(());
                 }
                 // Apart, the gate-up select and its GLU as their own fusion.
-                self.fused_linear(&Fused::MoeSelectGlu {
-                    select: select.clone(),
-                    glu: glu.clone(),
-                })?;
-                self.linear(down)?;
+                // The down select reads the same routes right after, so the
+                // gate-up select keeps its route order for it; and where the
+                // down select reads its rows back through e4m3, the GLU (its
+                // rows read by nothing else) lands them so.
+                #[cfg(feature = "cuda")]
+                {
+                    let pair = Fused::MoeSelectGlu {
+                        select: select.clone(),
+                        glu: glu.clone(),
+                    };
+                    let shares = matches!(
+                        (routes_of(select), routes_of(down)),
+                        (Some(a), Some(b)) if a == b
+                    );
+                    let read_back = match (&**glu, &**down) {
+                        (
+                            Linear::MlpSwigluClampRouted { y: rows, .. },
+                            Linear::MoeMatmulSelectActQuant {
+                                x,
+                                quant: ActQuant::E4m3 { gran: 128 },
+                                ..
+                            },
+                        ) if x == rows => Some(*rows),
+                        _ => None,
+                    };
+                    let apart = |me: &mut Self| -> Result<(), kernels_cuda::Error> {
+                        if shares {
+                            linear::moe::keeping_order(|| me.fused_linear(&pair))?;
+                        } else {
+                            me.fused_linear(&pair)?;
+                        }
+                        me.linear(down)
+                    };
+                    match read_back {
+                        Some(rows) => self.reading_back(rows, apart)?,
+                        None => apart(self)?,
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    self.fused_linear(&Fused::MoeSelectGlu {
+                        select: select.clone(),
+                        glu: glu.clone(),
+                    })?;
+                    self.linear(down)?;
+                }
                 self.linear(sum)?;
                 match gate_add {
                     Some(gate_add) => self.linear(gate_add),
@@ -408,6 +449,22 @@ impl Run<'_> {
                 y,
             } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
+                // Read back through e4m3 here, for the W4A8 select that
+                // would read it back.
+                #[cfg(feature = "cuda")]
+                if self.lands_read_back(*y)
+                    && linear::mlp::swiglu_clamp_routed_e4m3(
+                        self.ctx(),
+                        self.tensor(*packed),
+                        *intermediate,
+                        self.tensor(*weights),
+                        fan,
+                        *limit,
+                        &mut self.tensor(*y),
+                    )?
+                {
+                    return Ok(());
+                }
                 linear::mlp::swiglu_clamp_routed(
                     self.ctx(),
                     self.tensor(*packed),
@@ -1333,6 +1390,7 @@ impl Run<'_> {
                     .to_string(),
             });
         }
+        let x_id = x;
         let x = self.tensor(x);
         let route_t = self.tensor(routes);
         let mut out = self.tensor(y);
@@ -1407,12 +1465,20 @@ impl Run<'_> {
             && elem == linear::tc5::Elem::E2m1
             && kernels_cuda::linear::moe::select_mxfp4_atoms_takes(self.ctx(), route_t, x)
         {
-            let back =
-                self.ctx()
-                    .scratch_stream(OP, READ_BACK, x.rows as usize * x.width as usize * 2)?
-                    as u64;
-            let back =
-                act_quant::read_back(self.ctx(), OP, fmt, act_quant::Source::rows(x, None), back)?;
+            // A routed GLU's rows land read back already.
+            let back = if self.lands_read_back(x_id)
+                && linear::mlp::routed_e4m3_spans(&x)
+                && fmt == (act_quant::Format::E4m3 { gran: 128 })
+            {
+                x
+            } else {
+                let back = self.ctx().scratch_stream(
+                    OP,
+                    READ_BACK,
+                    x.rows as usize * x.width as usize * 2,
+                )? as u64;
+                act_quant::read_back(self.ctx(), OP, fmt, act_quant::Source::rows(x, None), back)?
+            };
             let bank_codes =
                 kernels_cuda::tensor::Tensor::new(codes.ptr, experts, n * k / 2, Dtype::U8);
             if kernels_cuda::linear::moe::select_mxfp4_atoms(
@@ -1878,4 +1944,16 @@ fn staging(name: &'static str, bytes: usize) -> Option<u64> {
         held.retired.push(old);
     }
     Some(fresh)
+}
+
+/// The routes a routed select reads.
+#[cfg(feature = "cuda")]
+fn routes_of(op: &Linear) -> Option<ValueId> {
+    match op {
+        Linear::MoeMatmulSelect { routes, .. }
+        | Linear::MoeMatmulSelectBias { routes, .. }
+        | Linear::MoeMatmulSelectQuant { routes, .. }
+        | Linear::MoeMatmulSelectActQuant { routes, .. } => Some(*routes),
+        _ => None,
+    }
 }
