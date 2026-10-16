@@ -61,6 +61,9 @@ class Model:
     # another `gpu_memory_utilization` than the driver's 0.90 (both rows at
     # one budget, so the KV pages each fits are compared like for like).
     pie_mem_share: float | None = None
+    # `[model] kv`: the cache rows' dtype over the artifact's own, so pie
+    # serves the KV format vLLM's row does (DeepSeek-V4: fp8).
+    pie_kv: str | None = None
     # The artifact, when it was imported into another home under another
     # deployment's name.
     pie_artifact: str | None = None
@@ -117,9 +120,11 @@ MODELS = {m.key: m for m in [
           "qwen38-flash-next-bf16-nvfp4-kv-bf16", vllm_flags=["--extra", "--moe-backend marlin"],
           note="vLLM serves this checkpoint W4A4 by default; this pair holds both to W4A16 (Marlin); " + SEATS),
     Model("deepseek-v4-flash", "deepseek-ai/DeepSeek-V4-Flash", "fp8 dense + mxfp4 experts / kv fp8_ds_mla",
-          "fp8b128 dense W8A8 + mxfp4 experts W4A8 / kv bf16", "dsv4-flash-fp8b128a8-mxfp4a8-kv-bf16",
-          vllm_dir="/root/baselines/deepseek-v4-flash", pie_mem_share=0.95,
-          note="kv differs: vLLM fp8_ds_mla, pie bf16; pie's artifact is the #903 import of the official release; "
+          "fp8b128 dense W8A8 + mxfp4 experts W4A8 / kv fp8 (DeepSeek's fp8 rows)",
+          "dsv4-flash-fp8b128a8-mxfp4a8-kv-bf16",
+          vllm_dir="/root/baselines/deepseek-v4-flash", pie_mem_share=0.95, pie_kv="e4m3",
+          note="kv fp8 on both: vLLM fp8_ds_mla, pie the same layout ([model] kv = \"e4m3\" over the kv-bf16 "
+               "artifact); pie's artifact is the #903 import of the official release; "
                "both rows at a 0.95 memory share (vLLM's run used gpu_memory_utilization 0.95; the weights "
                "take ~157 GB of 180, and at 0.85-0.90 pie's KV pool starves bs64)"),
 ]}
@@ -143,6 +148,8 @@ def run_once(model: Model, engine: str, mode: str, out: Path) -> dict | None:
             cmd += ["--precision", model.pie_precision_flag]
         if model.pie_mem_share is not None:
             cmd += ["--gpu-mem-util", str(model.pie_mem_share)]
+        if model.pie_kv:
+            cmd += ["--kv", model.pie_kv]
     env = {**os.environ, "PIE_HOME": PIE_HOME}
     log("+", " ".join(cmd))
     with open(out / f"{mode}_driver.log", "w") as f:
