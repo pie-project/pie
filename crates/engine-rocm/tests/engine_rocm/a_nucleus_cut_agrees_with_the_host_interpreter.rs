@@ -299,6 +299,50 @@ fn compare_cut(cut: Cut, rows: u32, len: u32, data: Vec<f32>, thresholds: &[f32]
     }
 }
 
+/// The cut's plan rests on f32 bucket sums that device atomics add in no set
+/// order; its verdicts must not: the same rows, fired over and over, keep
+/// the same elements bit for bit (and the interpreter's).
+#[test]
+fn a_cut_keeps_the_same_elements_every_fire() {
+    if !engine_rocm::device::present() {
+        eprintln!("no device: skipping");
+        return;
+    }
+    // A Qwen-next vocabulary: rows as a random-weight model's and a trained
+    // one's next-token distributions spread, and bf16 runs of equal values.
+    let len = 248_320;
+    let mut noise = Noise(0x0dd5_eed5_c0ff_ee11);
+    let rows: Vec<(&str, Vec<f32>, f32)> = vec![
+        ("flat", softmax(&mut noise, len, 2.0), 0.9),
+        ("mini-like", gaussian(&mut noise, len, 1.2), 0.9),
+        ("trained", gaussian(&mut noise, len, 3.5), 0.9),
+        ("peaked", peaked(&mut noise, len), 0.95),
+        ("bf16 ties", bf16_rounded(&gaussian(&mut noise, len, 2.0)), 0.5),
+    ];
+    let count = rows.len() as u32;
+    let thresholds: Vec<f32> = rows.iter().map(|r| r.2).collect();
+    let data: Vec<f32> = rows.into_iter().flat_map(|r| r.1).collect();
+    let bound = bind(
+        program(count, len, Cut::Mass),
+        ModelProfile {
+            vocab: len,
+            ..ModelProfile::dummy()
+        },
+    )
+    .expect("the cut binds");
+    let seeds = vec![(INPUT, Value::F32(data)), (THRESHOLD, Value::F32(thresholds))];
+    let want = host_keep(&bound, &seeds);
+    let mut rig = Rig::new(&bound, &seeds, count);
+    let first = rig.fire();
+    assert!(
+        wire_bools(&first, (count * len) as usize) == want,
+        "the first fire's verdicts are not the interpreter's"
+    );
+    for fire in 1..32 {
+        assert!(rig.fire() == first, "fire {fire} kept other elements than the first");
+    }
+}
+
 #[test]
 fn a_nucleus_cut_agrees_with_the_host_interpreter_every_case() {
     if !engine_rocm::device::present() {

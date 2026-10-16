@@ -24,6 +24,9 @@ use eta_ir::validate::{BoundTrace, bind};
 
 const VOCAB: u32 = 151_936;
 
+/// Fires of each draw (its seed, and so its token, the same each time).
+const REPEATS: usize = 4;
+
 const STATE: u32 = 0;
 const KNOB: u32 = 1;
 const LOGITS: u32 = 2;
@@ -196,15 +199,24 @@ fn draw_all(rank: bool, cases: &[(&str, Vec<f32>, f32, [u32; 2])]) -> (usize, us
                 context.stream(),
             )
             .expect("the sampler binds an instance");
-        let fired = plane.fire(&context, instance).expect("the fire runs");
-        assert!(matches!(fired, Fired::Committed), "{fired:?}");
-        let cell = plane
-            .instance_mut(instance)
-            .expect("the instance")
-            .take(TOKEN)
-            .expect("the token reads")
-            .expect("a token");
-        let got = i32::from_le_bytes(cell[..4].try_into().unwrap());
+        // The same draw, fired again and again, lands on one token.
+        let mut drawn = Vec::new();
+        for _ in 0..REPEATS {
+            let fired = plane.fire(&context, instance).expect("the fire runs");
+            assert!(matches!(fired, Fired::Committed), "{fired:?}");
+            let cell = plane
+                .instance_mut(instance)
+                .expect("the instance")
+                .take(TOKEN)
+                .expect("the token reads")
+                .expect("a token");
+            drawn.push(i32::from_le_bytes(cell[..4].try_into().unwrap()));
+        }
+        let got = drawn[0];
+        assert!(
+            drawn.iter().all(|&t| t == got),
+            "{what}: the same draw landed on {drawn:?}"
+        );
         total += 1;
         if got == want {
             agree += 1;

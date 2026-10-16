@@ -757,7 +757,7 @@ struct M1Lane {
   // The fast cut's first pass merged: counts and masks and sampled sums
   // (the sums added in block order, every block alike).
   __device__ __forceinline__ void fast_counted(M1Fast& f) {
-    combine_u32(f.weight, M1_FAST_BUCKETS * 2u + M1_FAST_BUCKETS / 4u + M1_FAST_BUCKETS / 2u, 0u,
+  combine_u32(f.weight, M1_FAST_BUCKETS * 2u + M1_FAST_BUCKETS / 4u + M1_FAST_BUCKETS / 2u, 0u,
                 nullptr, [](m1_u32 a, m1_u32 b, m1_u32 word) {
                   if (word < M1_FAST_BUCKETS) return __float_as_uint(__uint_as_float(a) + __uint_as_float(b));
                   return word < M1_FAST_BUCKETS + M1_FAST_BUCKETS / 4u ? a | b : a + b;
@@ -1401,13 +1401,17 @@ __device__ void ptir_lane_sample(
       if (marked) {
         kept = m1_load_b(keep, base + i, 3u);
       } else {
-        const float q = expf(x[base + i] - maximum) / sum;
+        const float q = p[base + i];
         if constexpr (RANK) kept = rank_k != 0u && !m1_isnan(q) && m1_desc_key(q) <= rank_key;
         else kept = m1_cut_kept(cut, i, q);
       }
-      const float masked = kept ? x[base + i] : m1_neg_inf();
-      const float uniform = ptir_rng_hash_uniform(seed, base + i);
-      const float value = masked + (-logf(-logf(uniform)));
+      // A cut element's value is -inf whatever its noise (the uniform draw
+      // stays inside (0, 1), so the noise is finite): it is not drawn.
+      float value = m1_neg_inf();
+      if (kept) {
+        const float uniform = ptir_rng_hash_uniform(seed, base + i);
+        value = x[base + i] + (-logf(-logf(uniform)));
+      }
       const M1ArgmaxCandidate next{value, i, m1_isnan(value) ? 0u : 1u, 0u};
       best = m1_argmax_combine(best, next);
     }
