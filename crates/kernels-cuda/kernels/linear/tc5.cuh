@@ -98,6 +98,10 @@ struct Epi {
     // summed in split order by whoever lands the tile (deterministic, no
     // float atomics).
     long long slab;
+    // A split tile's arrival count a CTA (`kernel.gemm.tc5_split_tickets`),
+    // zero between launches, or null for the finalize's launch: the last of
+    // a tile's splits to land sums the slabs and rounds y itself.
+    unsigned* tickets;
 };
 
 namespace tc5k {
@@ -1534,6 +1538,66 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         bulk_commit();
                     }
                     out_buf ^= 1;
+                }
+            }
+            // A split tile's last split to land sums every split's slab in
+            // split order and rounds y, as the finalize did: the same bits,
+            // a launch fewer. Each thread sums what it stored itself (every
+            // split of a tile stores the same places), past a fence, and the
+            // count is left at zero for the next launch.
+            if constexpr (kOut == 0 && !kFused) {
+                if (splits > 1 && epi.tickets != nullptr) {
+                    __threadfence();
+                    const u32 at_ticket =
+                        static_cast<u32>(t / splits) * kPair + static_cast<u32>(rank);
+                    u32 mine = 0;
+                    asm volatile("bar.sync 2, 128;" ::: "memory");
+                    if (row == 0) {
+                        const u32 seen = atomicAdd(&epi.tickets[at_ticket], 1u);
+                        mine = seen + 1 == static_cast<u32>(splits) ? 1u : 0u;
+                        if (mine != 0) {
+                            epi.tickets[at_ticket] = 0;
+                        }
+                    }
+                    u32 last;
+                    asm volatile(
+                        "{\n\t.reg .pred q, l;\n\t"
+                        "setp.ne.u32 q, %1, 0;\n\t"
+                        "bar.red.or.pred l, 2, 128, q;\n\t"
+                        "selp.u32 %0, 1, 0, l;\n\t}"
+                        : "=r"(last)
+                        : "r"(mine)
+                        : "memory");
+                    if (last != 0 && live) {
+                        __threadfence();
+                        const int lim = min(x.lim_q, static_cast<int>(kBN));
+                        const size_t slab = static_cast<size_t>(epi.slab);
+                        if constexpr (kSwap) {
+                            for (int j = 0; j < lim; ++j) {
+                                const size_t at = static_cast<size_t>(x.out_q + j) * ldy + p;
+                                float v = __ldcg(part + at);
+                                for (int sp = 1; sp < splits; ++sp) {
+                                    v += __ldcg(part + static_cast<size_t>(sp) * slab + at);
+                                }
+                                y[at] = f32_to_bf16(v);
+                            }
+                        } else {
+                            for (int j = 0; j < lim; j += 4) {
+                                const size_t at = static_cast<size_t>(p) * ldy + x.out_q + j;
+                                float4 v = __ldcg(reinterpret_cast<const float4*>(part + at));
+                                for (int sp = 1; sp < splits; ++sp) {
+                                    const float4 w = __ldcg(reinterpret_cast<const float4*>(
+                                        part + static_cast<size_t>(sp) * slab + at));
+                                    v.x += w.x;
+                                    v.y += w.y;
+                                    v.z += w.z;
+                                    v.w += w.w;
+                                }
+                                *reinterpret_cast<uint2*>(y + at) =
+                                    make_uint2(pack_bf16x2(v.x, v.y), pack_bf16x2(v.z, v.w));
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -69,6 +69,13 @@ pub struct MoeNvfp4MmaUntil(pub u32);
 #[decision(id = "kernel.moe.nvfp4_mma_from", constant(range(1..=65_536)), default = 1, tune = search)]
 pub struct MoeNvfp4MmaFrom(pub u32);
 
+/// A tcgen05 GEMM split along K sums its splits itself: the last of a
+/// tile's splits to land (a per-tile count) adds every split's slab in split
+/// order and rounds y, the same bits as the finalize launch it replaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.tc5_split_tickets", flag, default = false, tune = search)]
+pub struct GemmTc5SplitTickets;
+
 /// Programmatic dependent launch: a kernel that opts in (it waits on its
 /// predecessor in-kernel before reading what that one wrote) launches while
 /// the stream's previous kernel finishes, its launch latency hidden. Off but
@@ -505,6 +512,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmSplitLaunchNs>()
         .add::<GemmTc5Raster>()
         .add::<KernelPdl>()
+        .add::<GemmTc5SplitTickets>()
         .add::<MoeNvfp4MmaUntil>()
         .add::<MoeNvfp4MmaFrom>()
         .add::<MoeTopkWarp>()
@@ -579,6 +587,7 @@ pub struct Tuning {
     pub gemm_split_launch_ns: u32,
     pub gemm_tc5_raster: u32,
     pub pdl: bool,
+    pub gemm_tc5_split_tickets: bool,
     pub nvfp4_mma_from: u32,
     pub nvfp4_mma_until: u32,
     pub moe_topk_warp: bool,
@@ -651,6 +660,7 @@ impl Tuning {
         gemm_split_launch_ns: 0,
         gemm_tc5_raster: 8,
         pdl: false,
+        gemm_tc5_split_tickets: false,
         nvfp4_mma_from: 1,
         nvfp4_mma_until: 0,
         moe_topk_warp: false,
@@ -723,6 +733,7 @@ impl Tuning {
             gemm_split_launch_ns: profile.get::<GemmSplitLaunchNs>().0,
             gemm_tc5_raster: profile.get::<GemmTc5Raster>().0,
             pdl: profile.on::<KernelPdl>(&Anywhere),
+            gemm_tc5_split_tickets: profile.on::<GemmTc5SplitTickets>(&Anywhere),
             nvfp4_mma_from: profile.get::<MoeNvfp4MmaFrom>().0,
             nvfp4_mma_until: profile.get::<MoeNvfp4MmaUntil>().0,
             moe_topk_warp: profile.on::<MoeTopkWarp>(&Anywhere),

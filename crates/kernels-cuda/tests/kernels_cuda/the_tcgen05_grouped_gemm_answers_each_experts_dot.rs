@@ -120,6 +120,7 @@ fn contiguous(a: Spec, w: Spec, experts: usize, [n, k]: [usize; 2], plan: Option
     let shape = [n as u32, k as u32];
     let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
         gemm_nvfp4_k128: K128.load(std::sync::atomic::Ordering::Relaxed),
+        gemm_tc5_split_tickets: TICKETS.load(std::sync::atomic::Ordering::Relaxed),
         ..kernels_cuda::tuning::Tuning::DEFAULT
     });
     match plan {
@@ -187,17 +188,12 @@ fn masked(a: Spec, w: Spec, experts: usize, m_max: usize, [n, k]: [usize; 2], sp
             148,
         )
     };
-    grouped_gemm_with(
-        &gpu.ctx(),
-        a_op,
-        w_op,
-        y,
-        g,
-        [n as u32, k as u32],
-        1.25,
-        plan,
-    )
-    .unwrap_or_else(|e| panic!("{what}: {e}"));
+    let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+        gemm_tc5_split_tickets: TICKETS.load(std::sync::atomic::Ordering::Relaxed),
+        ..kernels_cuda::tuning::Tuning::DEFAULT
+    });
+    grouped_gemm_with(&ctx, a_op, w_op, y, g, [n as u32, k as u32], 1.25, plan)
+        .unwrap_or_else(|e| panic!("{what}: {e}"));
     gpu.sync();
     let got: Vec<u16> = gpu.down(y, rows * n);
     let mut worst = 0f32;
@@ -305,6 +301,10 @@ fn the_contiguous_group_lands_what_a_loop_of_dense_gemms_lands() {
 /// The contiguous cases' `kernel.gemm.nvfp4_k128`: NVFP4 at 128 K a stage.
 static K128: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Split tiles summed by their last split (`kernel.gemm.tc5_split_tickets`)
+/// in place of the routed finalize.
+static TICKETS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[test]
 fn the_tcgen05_grouped_gemm_answers_each_experts_dot_every_case() {
     if !supported() {
@@ -374,5 +374,23 @@ fn the_tcgen05_grouped_gemm_answers_each_experts_dot_every_case() {
     masked(nv, nv, 12, 40, [256, 2048], 4);
     masked(ds, w4, 5, 130, [128, 1024], 2);
     masked(ds, ds, 7, 64, [640, 512], 1);
+    // The split cases again, each tile summed by its last split.
+    TICKETS.store(true, std::sync::atomic::Ordering::Relaxed);
+    masked(bf, bf, 6, 1, [384, 4104], 0);
+    masked(nv, nv, 12, 40, [256, 2048], 4);
+    masked(ds, w4, 5, 130, [128, 1024], 2);
+    K128.store(true, std::sync::atomic::Ordering::Relaxed);
+    contiguous(
+        nv,
+        nv,
+        3,
+        [640, 768],
+        Some(Plan {
+            splits: 3,
+            ..lone(128).unwrap()
+        }),
+    );
+    K128.store(false, std::sync::atomic::Ordering::Relaxed);
+    TICKETS.store(false, std::sync::atomic::Ordering::Relaxed);
     the_contiguous_group_lands_what_a_loop_of_dense_gemms_lands();
 }

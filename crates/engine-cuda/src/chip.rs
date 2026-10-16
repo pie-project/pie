@@ -480,6 +480,7 @@ mod tests {
                         gemm_split_launch_ns: 0,
                         gemm_tc5_raster: 8,
                         pdl: false,
+                        gemm_tc5_split_tickets: false,
                         nvfp4_mma_from: defaults.nvfp4_mma_from,
                         nvfp4_mma_until: defaults.nvfp4_mma_until,
                         moe_topk_warp: false,
@@ -676,6 +677,7 @@ mod tests {
         // Measured neutral to slower on DeepSeek-V4-Flash's decode (bs64
         // +2% TPOT with the GEMM a dependent too): off on B200 as well.
         assert!(!b200.pdl);
+        assert!(!b200.gemm_tc5_split_tickets);
         for (major, minor) in [
             (8, 0),
             (8, 6),
@@ -712,6 +714,10 @@ mod tests {
             assert_eq!(
                 other.gemm_tc5_raster, 8,
                 "sm_{major}{minor} rasters its dense tcgen05 GEMM 8 tiles a band"
+            );
+            assert!(
+                !other.gemm_tc5_split_tickets,
+                "sm_{major}{minor} sums a tcgen05 GEMM's splits in a finalize launch"
             );
             assert!(
                 !other.pdl,

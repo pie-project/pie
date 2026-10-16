@@ -368,6 +368,33 @@ impl Ctx {
         }
     }
 
+    /// [`Ctx::scratch_stream`], zeroed when fresh: for counts a kernel
+    /// leaves at zero between launches.
+    pub fn scratch_stream_zeroed(
+        &self,
+        op: &'static str,
+        name: &'static str,
+        bytes: usize,
+    ) -> Result<*mut c_void, Error> {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::take_zeroed(
+                self.slabs.0,
+                self.stream,
+                self.owner,
+                name,
+                NO_REGION,
+                bytes,
+            )
+            .map_err(|fault| fault.at(op))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (name, bytes);
+            Err(crate::jit::runtimeless(op))
+        }
+    }
+
     pub fn scratch_shared(
         &self,
         op: &'static str,

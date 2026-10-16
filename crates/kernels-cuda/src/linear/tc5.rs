@@ -627,6 +627,7 @@ impl Epilogue {
             in_scale: self.input_scales,
             raster: 8,
             slab: 0,
+            tickets: 0,
         }
     }
 }
@@ -651,6 +652,7 @@ struct EpiArgs {
     in_scale: u64,
     raster: i32,
     slab: i64,
+    tickets: u64,
 }
 
 /// `y = epilogue(alpha * act . w^T)` for `[m, n, k]`, `n` the output's
@@ -1217,8 +1219,19 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     } else {
         0
     };
+    // Under `kernel.gemm.tc5_split_tickets` a tile's last split sums it, a
+    // count a CTA of each tile (a contiguous group's tiles bounded by its
+    // experts' ragged ends), left at zero by the kernel.
+    let tickets = if splits > 1 && ctx.tuning().gemm_tc5_split_tickets {
+        let count =
+            ctas as usize * (job.tiles as usize + group.experts as usize * n.div_ceil(32) as usize);
+        ctx.scratch_stream_zeroed(OP, SPLIT_TICKETS, count * 4)? as u64
+    } else {
+        0
+    };
     let epi_args = EpiArgs {
         slab: i64::try_from(slab).unwrap_or(i64::MAX),
+        tickets,
         ..epi_args
     };
     let units = job.tiles * splits;
@@ -1290,7 +1303,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
         ),
         &values,
     )?;
-    if splits == 1 {
+    if splits == 1 || tickets != 0 {
         return Ok(());
     }
     if routed {
@@ -1353,6 +1366,9 @@ fn fire_routed(
 /// The f32 split-K sum, one a stream: the finalize after the GEMM on the
 /// same stream consumes it.
 const SPLIT_PARTIAL: &str = "linear.tc5.split_partial";
+
+/// A split tile's arrival counts, zero between launches.
+const SPLIT_TICKETS: &str = "linear.tc5.split_tickets";
 
 /// An atom-layout scale tensor as TMA reads it: [row block][atom][128 words],
 /// boxes of `atoms` atoms by `row_blocks` row blocks, zero past either end.

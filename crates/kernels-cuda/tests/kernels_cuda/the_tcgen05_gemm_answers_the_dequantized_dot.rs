@@ -97,6 +97,49 @@ fn check(case: Case) {
             );
         }
         crate::common::forget(exec);
+        // Under `kernel.gemm.tc5_split_tickets` a tile's last split sums
+        // the slabs in place of the finalize: the same bits, eagerly and
+        // from a graph, behind a launch at half the scale.
+        let tickets = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+            gemm_tc5_split_tickets: true,
+            ..ctx.tuning()
+        });
+        let fire = |alpha: f32| {
+            gemm_with(
+                &tickets,
+                a_op,
+                w_op,
+                y,
+                [m as u32, n as u32, k as u32],
+                alpha,
+                plan,
+            )
+            .unwrap_or_else(|e| panic!("{case:?}: {e}"));
+        };
+        for _ in 0..3 {
+            fire(case.alpha * 0.5);
+            fire(case.alpha);
+            gpu.sync();
+            assert_eq!(
+                gpu.down::<u16>(y, tall * n),
+                first,
+                "{case:?}: a split tile's last split lands the finalize's bits"
+            );
+        }
+        let exec = crate::common::captured(&tickets, || {
+            fire(case.alpha * 0.5);
+            fire(case.alpha);
+        });
+        for _ in 0..3 {
+            crate::common::replay(&tickets, exec);
+            gpu.sync();
+            assert_eq!(
+                gpu.down::<u16>(y, tall * n),
+                first,
+                "{case:?}: a captured split tile's last split lands the finalize's bits"
+            );
+        }
+        crate::common::forget(exec);
     }
     let got: Vec<u16> = gpu.down(y, tall * n);
 

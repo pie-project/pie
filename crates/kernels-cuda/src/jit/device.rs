@@ -115,6 +115,42 @@ pub(crate) fn take(
     Ok(held.slabs[&(name, region, scope)].ptr)
 }
 
+/// [`take`], a slab zeroed on `stream` whenever it is fresh: for counts its
+/// kernels leave at zero between launches, so a slab is cleared once, not a
+/// launch. (A capture never grows a slab, so the clear is never captured.)
+pub(crate) fn take_zeroed(
+    arena: u32,
+    stream: *mut c_void,
+    owner: *mut c_void,
+    name: &'static str,
+    region: u32,
+    bytes: usize,
+) -> Result<*mut c_void, Fault> {
+    let key = (name, region, scope_of(owner, region));
+    let before = locked()
+        .get(&arena)
+        .and_then(|held| held.slabs.get(&key))
+        .map(|slab| slab.ptr);
+    let ptr = take(arena, stream, owner, name, region, bytes)?;
+    if ptr.is_null() || before == Some(ptr) {
+        return Ok(ptr);
+    }
+    let size = locked()
+        .get(&arena)
+        .and_then(|held| held.slabs.get(&key))
+        .map_or(bytes, |slab| slab.bytes);
+    // SAFETY: the slab `take` just allocated, `size` bytes, on the stream
+    // that launches what reads it.
+    let code = unsafe { rt::cudaMemsetAsync(ptr, 0, size, stream.cast()) };
+    if code != rt::cudaError::cudaSuccess {
+        return Err(Fault::Device {
+            call: "cudaMemsetAsync",
+            code: code as i32,
+        });
+    }
+    Ok(ptr)
+}
+
 #[must_use]
 pub fn census() -> Vec<(&'static str, usize)> {
     let arenas = locked();
