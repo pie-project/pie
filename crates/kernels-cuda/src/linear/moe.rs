@@ -1222,10 +1222,8 @@ fn experts_w4a8_as(
     let count = tokens * routes.width;
     let experts = up_codes.rows;
     let (k, n) = (x.width, y.width);
-    let glu_taken = match sum {
-        W4a8Sum::Weighted(_) => matches!(glu, tc5::Glu::Swiglu),
-        W4a8Sum::WeightedFirst(_) => matches!(glu, tc5::Glu::Swiglu | tc5::Glu::SwigluClamp { .. }),
-    };
+    // SwiGLU and its clamp land from the epilogue as the apart GLU does.
+    let glu_taken = matches!(glu, tc5::Glu::Swiglu | tc5::Glu::SwigluClamp { .. });
     if count <= act_quant::MASKED_FIRE
         || tokens < ctx.tuning().moe_w4a8_fused_from
         || !glu_taken
