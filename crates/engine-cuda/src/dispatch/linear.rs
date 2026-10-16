@@ -668,6 +668,7 @@ impl Run<'_> {
                 }
                 // Routes that send each row's group g to plane g (`group_routes`
                 // made them): one strided batched GEMM, no layout or reorder.
+                #[cfg(feature = "cuda")]
                 let trivial = matches!(
                     self.values()[routes.0 as usize].def,
                     poem_ir::Def::Op(at) if matches!(
@@ -675,6 +676,7 @@ impl Run<'_> {
                         poem_ir::Operation::Linear(Linear::GroupRoutes { groups: g, .. }) if *g == groups_nz
                     )
                 );
+                #[cfg(feature = "cuda")]
                 if trivial {
                     let (bank, _) = self.expert_bank(*w);
                     if bank.dtype == Dtype::Bf16 && x.dtype == Dtype::Bf16 && y.dtype == Dtype::Bf16

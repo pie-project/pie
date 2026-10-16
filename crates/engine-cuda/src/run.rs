@@ -549,12 +549,14 @@ pub struct Run<'c> {
 
     /// The fp8 1x128 activations a producer last landed itself (its codes
     /// beside its bf16 row), for the projection that reads that row next.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     held: Option<HeldAct>,
 }
 
 /// A producer's own fp8 1x128 copy of value `value` (at `ptr`, on the
 /// stream `stream`): its codes and atoms in `planes`, `rows x k`.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) struct HeldAct {
     pub value: ValueId,
     pub ptr: u64,
