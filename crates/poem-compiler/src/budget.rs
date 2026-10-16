@@ -214,7 +214,8 @@ impl FamilyCosts {
                 poem_ir::Fused::LseSink { .. }
                 | poem_ir::Fused::PoolAttention { .. }
                 | poem_ir::Fused::PoolCompress { .. }
-                | poem_ir::Fused::MlaPrefillExpanded { .. } => self.attention,
+                | poem_ir::Fused::MlaPrefillExpanded { .. }
+                | poem_ir::Fused::IndexTopkRope { .. } => self.attention,
                 poem_ir::Fused::MatmulGeglu { .. }
                 | poem_ir::Fused::MatmulSwiglu { .. }
                 | poem_ir::Fused::MlpSwiglu { .. }

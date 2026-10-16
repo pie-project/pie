@@ -866,6 +866,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             } => &[(In(4), I32)],
             Fused::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
             Fused::NormRopeLast { .. } => &[(In(1), I32)],
+            Fused::IndexTopkRope { .. } => &[(In(1), I32), (In(2), CACHE), (Out(1), I32)],
             // q's rows and positions, then the plane's rows, weight,
             // positions, cache and write tables.
             Fused::NormRopePair { .. } => &[

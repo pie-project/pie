@@ -117,6 +117,13 @@ pub enum Fused {
         write_page: ValueId,
         write_offset: ValueId,
     },
+    /// An index's ranking (`rank`, an `IndexTopk`) of queries whose tail is
+    /// rotated just before it (`rotate`, a `RopePartialLast` of the queries
+    /// the ranking alone reads): a backend may turn them as it loads them.
+    IndexTopkRope {
+        rotate: Box<Elementwise>,
+        rank: Box<Attention>,
+    },
     /// DeepSeek-V4's q (`NormRopeLast`, scale-free) and its kv plane
     /// (`NormRopeLastAppend`) of one layer, landed together.
     NormRopePair { q: Box<Fused>, kv: Box<Fused> },
@@ -452,6 +459,15 @@ impl Operands for Fused {
                 q.inputs(sink);
                 kv.inputs(sink);
             }
+            // The raw queries and their positions, then the ranking's keys
+            // and head weights.
+            Self::IndexTopkRope { rotate, rank } => {
+                rotate.inputs(sink);
+                if let Attention::IndexTopk { keys, weights, .. } = **rank {
+                    sink.push(keys);
+                    sink.extend(weights);
+                }
+            }
             // The boundaries' positions and requests, the state's pages, the
             // norm's weight, the rope positions, the pool and its write
             // tables, then the gather's position bias where it has one.
@@ -733,6 +749,10 @@ impl Operands for Fused {
                 q.outputs(sink);
                 kv.outputs(sink);
             }
+            Self::IndexTopkRope { rotate, rank } => {
+                rotate.outputs(sink);
+                rank.outputs(sink);
+            }
             Self::PoolCompress {
                 gather,
                 latent,
@@ -904,6 +924,10 @@ impl Operands for Fused {
                 q.aliases(sink);
                 kv.aliases(sink);
             }
+            Self::IndexTopkRope { rotate, rank } => {
+                rotate.aliases(sink);
+                rank.aliases(sink);
+            }
             // The rotation turns the normed rows in place.
             Self::QgQknormRopeAppend {
                 q_out,
@@ -927,6 +951,7 @@ impl Operands for Fused {
             Self::NormRopeLastAppend { .. } => "elementwise.norm_rope_last_append",
             Self::PoolCompress { .. } => "attention.pool_compress",
             Self::NormRopePair { .. } => "elementwise.norm_rope_pair",
+            Self::IndexTopkRope { .. } => "attention.index_topk_rope",
             Self::NormModulate { .. } => "elementwise.norm_modulate",
             Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
             Self::MatmulGeglu { .. } => "linear.matmul_geglu",

@@ -56,6 +56,7 @@ flags! {
     NormRopeLastAppend = "fuse.norm_rope_last_append" => "elementwise.norm_rope_last_append",
     PoolCompress = "fuse.pool_compress" => "attention.pool_compress",
     NormRopePair = "fuse.norm_rope_pair" => "elementwise.norm_rope_pair",
+    IndexTopkRope = "fuse.index_topk_rope" => "attention.index_topk_rope",
     SplitRopeYarnAppend = "fuse.split_rope_yarn_append" => "elementwise.split_rope_yarn_append",
     RopeYarnAppend = "fuse.rope_yarn_append" => "elementwise.rope_yarn_append",
     QgQknormRopeAppend = "fuse.qg_qknorm_rope_append" => "elementwise.qg_qknorm_rope_append",

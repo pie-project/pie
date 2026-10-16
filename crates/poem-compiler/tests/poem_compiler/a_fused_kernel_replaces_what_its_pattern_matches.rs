@@ -745,3 +745,36 @@ fn deepseeks_attention_lands_its_output_turned_back() {
         "the attention holds the turn"
     );
 }
+
+#[test]
+fn an_index_ranking_lands_its_queries_turn() {
+    let t = trace(|p| {
+        let positions = p.indices("positions");
+        let q = elemwise::rope_partial_last_yarn(
+            &p.rows("q", 64 * 128),
+            &positions,
+            64,
+            128,
+            1e4,
+            true,
+            false,
+            None,
+        );
+        let w = p.rows("w", 64);
+        let sel = attn::index_topk(
+            &q,
+            Some(&w),
+            p.cache("keys"),
+            64,
+            128,
+            512,
+            4,
+            poem_ir::IndexScore::Pooled,
+        );
+        elemwise::silu(&sel);
+    });
+    assert_eq!(
+        ops(&fuse(t, &["attention.index_topk_rope"])),
+        ["attention.index_topk_rope", "elementwise.silu"]
+    );
+}

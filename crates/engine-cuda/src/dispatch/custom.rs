@@ -12,6 +12,7 @@ impl DispatchFused for Run<'_> {
             Fused::NormRopeLastAppend { .. } => self.norm_rope_last_append(op),
             Fused::PoolCompress { .. } => self.pool_compress(op),
             Fused::NormRopePair { .. } => self.norm_rope_pair(op),
+            Fused::IndexTopkRope { .. } => self.index_topk_rope(op),
             Fused::SplitRopeYarnAppend { .. } => self.split_rope_yarn_append(op),
             Fused::QgQknormRopeAppend { .. } => self.qg_qknorm_rope_append(op),
             Fused::LseSink { .. } => self.lse_sink(op),
@@ -989,6 +990,70 @@ impl Run<'_> {
             &mut self.tensor(*latent),
         )?;
         self.attention(append)
+    }
+
+    /// An index's queries turned as the ranking loads them where its scorer
+    /// can (the tensor-core one, interleaved forward turns); else the turn,
+    /// then the ranking, as the unfused ops fire them.
+    fn index_topk_rope(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::IndexTopkRope { rotate, rank } = op else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        if let (
+            poem_ir::Elementwise::RopePartialLast {
+                q,
+                positions,
+                rotary_dim,
+                head_dim,
+                theta,
+                interleaved: true,
+                inverse: false,
+                yarn,
+                ..
+            },
+            poem_ir::Attention::IndexTopk {
+                weights,
+                keys,
+                heads,
+                head_dim: rank_dim,
+                top_k,
+                ratio,
+                score: poem_ir::IndexScore::Pooled,
+                selection,
+                ..
+            },
+        ) = (&**rotate, &**rank)
+            && head_dim == rank_dim
+        {
+            let turn = kernels_cuda::attn::index::QueryTurn {
+                positions: self.tensor(*positions),
+                dim: *rotary_dim,
+                theta: *theta,
+                yarn: yarn.map(|y| kernels_cuda::elemwise::rope::Yarn {
+                    factor: y.factor,
+                    beta_fast: y.beta_fast,
+                    beta_slow: y.beta_slow,
+                    original_max_position: y.original_max_position,
+                }),
+            };
+            let landed = kernels_cuda::attn::index::topk_turned(
+                self.ctx(),
+                self.ragged_lanes(*q),
+                weights.map(|w| self.tensor(w)),
+                &self.pool(*keys),
+                *heads,
+                *head_dim,
+                *top_k,
+                *ratio,
+                turn,
+                &mut self.tensor(*selection),
+            )?;
+            if landed {
+                return Ok(());
+            }
+        }
+        self.elementwise(rotate)?;
+        self.attention(rank)
     }
 
     /// DeepSeek-V4's q and kv plane normed and rotated in one launch (the

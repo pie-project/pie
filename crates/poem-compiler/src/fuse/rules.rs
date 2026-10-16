@@ -48,6 +48,7 @@ pub(super) fn all() -> Vec<Rule> {
         rmsnorm_rope_partial_q(),
         pool_compress(),
         norm_rope_pair(),
+        index_topk_rope(),
         norm_rope_last_append(),
         norm_rope_last(),
         qg_qknorm_rope_append(),
@@ -1321,6 +1322,60 @@ fn norm_rope_last() -> Rule {
         Some(norm_dim) => norm_dim == m.u32("head_dim"),
         None => m.width("x") == Some(u64::from(m.u32("head_dim"))),
     })
+}
+
+/// An index's queries rotated and ranked, the rotated queries read by the
+/// ranking alone (DeepSeek-V4's indexer).
+fn index_topk_rope() -> Rule {
+    let chain = |weighted: bool| {
+        template(move |p| {
+            p.free("interleaved");
+            p.free("inverse");
+            p.free("yarn");
+            p.free("score");
+            let positions = p.indices("positions");
+            let d = p.u32("head_dim");
+            let q = elemwise::rope_partial_last_yarn(
+                &p.rows("q", W),
+                &positions,
+                p.u32("rotary_dim"),
+                d,
+                p.f32("theta"),
+                false,
+                false,
+                None,
+            );
+            p.name("q_rot", &q);
+            let weights = weighted.then(|| p.rows("weights", W));
+            let sel = attn::index_topk(
+                &q,
+                weights.as_ref(),
+                p.cache("keys"),
+                p.u32("heads"),
+                d,
+                p.u32("top_k"),
+                p.u32("ratio"),
+                poem_ir::IndexScore::Pooled,
+            );
+            p.export("selection", &sel);
+        })
+    };
+    Rule::new(
+        "attention.index_topk_rope",
+        [chain(true), chain(false)],
+        |m| {
+            let Operation::Elementwise(rotate) = m.op("q_rot") else {
+                unreachable!("the rotated queries come from a rotation")
+            };
+            let Operation::Attention(rank) = m.op("selection") else {
+                unreachable!("the selection comes from the ranking")
+            };
+            Fused::IndexTopkRope {
+                rotate: Box::new(rotate.clone()),
+                rank: Box::new(rank.clone()),
+            }
+        },
+    )
 }
 
 /// DeepSeek-V4's q (a scale-free norm a head, its tail rotated) and its kv

@@ -190,7 +190,48 @@ pub fn topk(
     selection: &mut Tensor,
 ) -> Result<(), Error> {
     ranked(
-        ctx, q, weights, keys, heads, head_dim, top_k, ratio, selection,
+        ctx, q, weights, keys, heads, head_dim, top_k, ratio, None, selection,
+    )
+    .map(|_| ())
+}
+
+/// The turn of an index's queries' tail the ranking lands as it loads them:
+/// `rope_partial_last` forward and interleaved, at `positions`.
+#[derive(Clone, Copy, Debug)]
+pub struct QueryTurn {
+    pub positions: Tensor,
+    pub dim: u32,
+    pub theta: f32,
+    pub yarn: Option<crate::elemwise::rope::Yarn>,
+}
+
+/// [`topk`] of queries whose tail `turn` rotates first, turned as the
+/// tensor-core scorer loads them: whether it fired (nothing is fired where
+/// the scorer is another).
+#[allow(clippy::too_many_arguments)]
+pub fn topk_turned(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    weights: Option<Tensor>,
+    keys: &KvPool,
+    heads: u32,
+    head_dim: u32,
+    top_k: u32,
+    ratio: u32,
+    turn: QueryTurn,
+    selection: &mut Tensor,
+) -> Result<bool, Error> {
+    ranked(
+        ctx,
+        q,
+        weights,
+        keys,
+        heads,
+        head_dim,
+        top_k,
+        ratio,
+        Some(turn),
+        selection,
     )
 }
 
@@ -239,6 +280,7 @@ pub fn topk_tokens(
         head_dim,
         top_k,
         ratio,
+        None,
         &mut blocks,
     )?;
     let num_requests = kv::lanes_of(OP, q.indptr)?;
@@ -271,8 +313,9 @@ fn ranked(
     head_dim: u32,
     top_k: u32,
     ratio: u32,
+    turn: Option<QueryTurn>,
     selection: &mut Tensor,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     const OP: &str = "attention.index_topk";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 page ids");
@@ -345,10 +388,46 @@ fn ranked(
                 (16 * tiles + (K_BLOCK / 32) * 16) * (128 + 8) * 2,
             )
         }
+        _ if turn.is_some() => return Ok(false),
         _ => (
             format!("::pie::attn::index_topk_paged<::pie::bf16, {radix}>"),
             0,
         ),
+    };
+    let mma = smem > 0;
+    // The tail turn's frequencies' ramp, where the queries are turned here.
+    let (turn_pos, turn_dim, turn_theta, factor, low, high) = match turn {
+        Some(t) if t.dim > 0 && t.dim <= 128 && t.dim.is_multiple_of(8) => {
+            let dim = stated(OP, t.dim)?;
+            let (factor, low, high) = match t.yarn {
+                Some(y) => {
+                    let (low, high) = crate::elemwise::rope::ramp_bounds(
+                        dim,
+                        t.theta,
+                        y.beta_fast,
+                        y.beta_slow,
+                        i32::try_from(y.original_max_position).unwrap_or(i32::MAX),
+                    );
+                    (y.factor, low, high)
+                }
+                None => (1.0, 0.0, 0.0),
+            };
+            (t.positions.arg(), dim, t.theta, factor, low, high)
+        }
+        Some(_) => return Ok(false),
+        None => (ArgValue::ABSENT, 0, 0.0, 1.0, 0.0, 0.0),
+    };
+    let turn_args: Vec<ArgValue> = if mma {
+        vec![
+            turn_pos,
+            turn_dim.arg(),
+            turn_theta.arg(),
+            factor.arg(),
+            low.arg(),
+            high.arg(),
+        ]
+    } else {
+        Vec::new()
     };
     ctx.fire(
         OP,
@@ -370,9 +449,13 @@ fn ranked(
             score_stride.arg(),
             top_k.arg(),
             ratio.arg(),
-            ctx.stage(),
-        ],
-    )
+        ]
+        .into_iter()
+        .chain(turn_args)
+        .chain([ctx.stage()])
+        .collect::<Vec<_>>(),
+    )?;
+    Ok(true)
 }
 
 const MAX_BLOCK_MAX_HEADS: i32 = 8;

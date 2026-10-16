@@ -236,3 +236,104 @@ fn the_pooled_index_paces_a_prefill() {
         );
     }
 }
+
+/// DeepSeek-V4's indexer turns its queries' tail just before ranking: the
+/// tensor-core scorer turning them as it loads them selects what turning
+/// them first, then ranking, selects.
+#[test]
+fn the_pooled_index_turns_its_queries_as_it_loads_them() {
+    const HEADS: usize = 64;
+    let mut gpu = Gpu::open();
+    let mut rng = Lcg::seeded(0x7e11_0a2b);
+    let tokens: usize = Q_LENS.iter().sum();
+    let slots = PAGE_INDICES.len() * PAGE;
+    let (q_raw, _) = rng.row(tokens * HEADS * DIM);
+    let (k_raw, _) = rng.row(slots * DIM);
+    let w_raw: Vec<u16> = (0..tokens * HEADS)
+        .map(|_| to_bf16(rng.unit().abs() + 0.25))
+        .collect();
+    let mut qo_indptr = vec![0i32];
+    for n in Q_LENS {
+        qo_indptr.push(qo_indptr.last().unwrap() + n as i32);
+    }
+    let positions: Vec<i32> = (0..Q_LENS.len())
+        .flat_map(|r| (0..Q_LENS[r]).map(move |i| (KV_LENS[r] - Q_LENS[r] + i) as i32))
+        .collect();
+    let tables = [
+        gpu.up(&PAGE_INDICES),
+        gpu.up(&PAGE_INDPTR),
+        gpu.up(&LAST_PAGE_LENS),
+    ];
+    let indptr = gpu.up(&qo_indptr);
+    let keys = pool(gpu.up(&k_raw), tables);
+    let pos_at = gpu.up(&positions);
+    let w_at = gpu.up(&w_raw);
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        index_mma: true,
+        index_radix: true,
+        ..Tuning::DEFAULT
+    });
+    let yarn = Some(kernels_cuda::elemwise::rope::Yarn {
+        factor: 16.0,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+        original_max_position: 65536,
+    });
+    let q_of = |at: u64| RaggedTensor {
+        data: Tensor::new(at, tokens as u32, (HEADS * DIM) as u32, Dtype::Bf16),
+        indptr: Tensor::new(indptr, qo_indptr.len() as u32, 1, Dtype::I32),
+    };
+    let weights = Some(Tensor::new(w_at, tokens as u32, HEADS as u32, Dtype::Bf16));
+    let pos_t = Tensor::new(pos_at, tokens as u32, 1, Dtype::I32);
+
+    // Turned first, then ranked.
+    let q_first = gpu.up(&q_raw);
+    let mut q_t = Tensor::new(q_first, tokens as u32, (HEADS * DIM) as u32, Dtype::Bf16);
+    kernels_cuda::elemwise::rope::partial_last(
+        &ctx, &mut q_t, pos_t, 64, DIM as u32, 1e4, true, false, yarn,
+    )
+    .expect("the turn fires");
+    let first_at = gpu.zeros(tokens * TOP_K * 4);
+    index::topk(
+        &ctx,
+        q_of(q_first),
+        weights,
+        &keys,
+        HEADS as u32,
+        DIM as u32,
+        TOP_K as u32,
+        RATIO as u32,
+        &mut Tensor::new(first_at, tokens as u32, TOP_K as u32, Dtype::I32),
+    )
+    .expect("the ranking fires");
+
+    // Turned as the ranking loads them.
+    let q_raw_at = gpu.up(&q_raw);
+    let loaded_at = gpu.zeros(tokens * TOP_K * 4);
+    let landed = index::topk_turned(
+        &ctx,
+        q_of(q_raw_at),
+        weights,
+        &keys,
+        HEADS as u32,
+        DIM as u32,
+        TOP_K as u32,
+        RATIO as u32,
+        index::QueryTurn {
+            positions: pos_t,
+            dim: 64,
+            theta: 1e4,
+            yarn,
+        },
+        &mut Tensor::new(loaded_at, tokens as u32, TOP_K as u32, Dtype::I32),
+    )
+    .expect("the turned ranking fires");
+    assert!(landed, "the tensor-core scorer turns the queries");
+    gpu.sync();
+    let first: Vec<i32> = gpu.down(first_at, tokens * TOP_K);
+    let loaded: Vec<i32> = gpu.down(loaded_at, tokens * TOP_K);
+    assert_eq!(
+        loaded, first,
+        "turning as it loads selects what turning first selects"
+    );
+}

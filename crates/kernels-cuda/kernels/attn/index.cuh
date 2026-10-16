@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "prelude/device.cuh"
+#include "prelude/rope.cuh"
 
 namespace pie::attn {
 
@@ -481,6 +482,12 @@ __global__ void index_topk_paged_mma(
     i32* __restrict__ selection,
     i32 R, i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk,
     i32 ratio,
+    const i32* __restrict__ turn_pos,
+    i32 turn_dim,
+    float turn_theta,
+    float turn_factor,
+    float turn_low,
+    float turn_high,
     const u32* __restrict__ win)
 {
     using namespace index_mma;
@@ -529,6 +536,24 @@ __global__ void index_topk_paged_mma(
         const int d = (i % (kD / 8)) * 8;
         int4 v = make_int4(0, 0, 0, 0);
         if (row < H) v = *reinterpret_cast<const int4*>(qi + row * kD + d);
+        // The query's tail turned as it lands (`rope_partial_last`, forward,
+        // interleaved, at the row's position), where the ranking holds it.
+        if (turn_dim > 0 && d >= kD - turn_dim) {
+            T* e = reinterpret_cast<T*>(&v);
+            const float pos = static_cast<float>(turn_pos[t_row]);
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int pair = (d - (kD - turn_dim)) / 2 + u;
+                float freq = powf(turn_theta, -2.f * static_cast<float>(pair) / static_cast<float>(turn_dim));
+                if (turn_factor > 1.f) freq = ::pie::yarn_original_freq(freq, turn_factor, turn_low, turn_high, pair);
+                float sn, cs;
+                __sincosf(pos * freq, &sn, &cs);
+                const float a = Elem<T>::to_f32(e[2 * u]);
+                const float b = Elem<T>::to_f32(e[2 * u + 1]);
+                e[2 * u] = Elem<T>::from_f32(a * cs - b * sn);
+                e[2 * u + 1] = Elem<T>::from_f32(b * cs + a * sn);
+            }
+        }
         *reinterpret_cast<int4*>(q_s + row * kLd + d) = v;
     }
     for (int h = tid; h < 16 * kTiles; h += kBlock) {

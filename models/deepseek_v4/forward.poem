@@ -120,7 +120,14 @@ def forward(m, inputs):
     ids = inputs.tokens()
     streams = ops.elemwise.hc_expand(ops.layout.embed(ids, m.embed, m.vocab), hy.streams)
     adapters = inputs.adapter_routes()
-    rows = struct(inputs = inputs, plan = plan, positions = positions, ids = ids, adapters = adapters, kv_heads = kvh)
+    # The pools' boundaries depend on the rows and a pool's ratio alone:
+    # found once a ratio for every layer that pools at it.
+    bounds = {}
+    for w in m.layers:
+        p = w.attn.pool
+        if p != None and p.ratio not in bounds:
+            bounds[p.ratio] = boundaries(positions, inputs.row_valid(), p.ratio)
+    rows = struct(inputs = inputs, plan = plan, positions = positions, ids = ids, adapters = adapters, kv_heads = kvh, bounds = bounds)
 
     def block(l, w, carried):
         streams, trail = carried
@@ -221,7 +228,11 @@ def layer(m, rows, w, streams, trail, following = None):
         entries = inputs.kv(p.entries)
         row_valid = inputs.row_valid()
         request_of_token = inputs.request_of_token()
-        bpos, breq, brope = boundaries(pos, row_valid, p.ratio)
+        bounds = getattr(rows, "bounds", {})
+        if p.ratio in bounds:
+            bpos, breq, brope = bounds[p.ratio]
+        else:
+            bpos, breq, brope = boundaries(pos, row_valid, p.ratio)
 
         if p.owner:
             latent = compress(m, x, p, pages, write_page, write_offset, bpos, breq)
