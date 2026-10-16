@@ -67,6 +67,7 @@ mod the_paged_decode_answers_the_reference;
 mod the_partial_rope_turns_only_the_rotary_pairs;
 mod the_partial_tail_rotation_answers_the_host;
 mod the_pool_attention_lands_alike_on_the_tensor_cores;
+mod the_pool_compressor_lands_in_one_pass;
 mod the_pool_gather_lands_its_vector_form;
 mod the_pooled_index_selects_its_best_blocks;
 mod the_ragged_arm_adds_a_relative_bias;

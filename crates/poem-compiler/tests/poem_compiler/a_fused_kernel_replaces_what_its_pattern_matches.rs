@@ -639,3 +639,38 @@ fn a_hyper_connection_pre_mix_lands_as_one_op() {
         "{kept:?}"
     );
 }
+
+#[test]
+fn deepseeks_compressor_lands_as_one_op() {
+    let chain = |read_latent: bool| {
+        trace(move |p| {
+            let (bpos, breq, brope) = (p.indices("bpos"), p.indices("breq"), p.indices("brope"));
+            let pages = p.cache("pages");
+            let ape = p.weight("ape", [4, 1024]);
+            let g = attn::pool_gather(
+                &bpos,
+                &breq,
+                pages,
+                Some(&ape),
+                512,
+                4,
+                poem_ir::Dtype::Bf16,
+            );
+            let latent = elemwise::rmsnorm(&g, &p.weight("norm", [512]), 1e-6);
+            if read_latent {
+                elemwise::silu(&latent);
+            }
+            let k =
+                elemwise::rope_partial_last_yarn(&latent, &brope, 64, 512, 1e4, true, false, None);
+            let pool = p.cache("entries");
+            attn::pool_kv_append(&k, &bpos, &breq, pool, &p.rows("wp", 1), &p.rows("wo", 1));
+        })
+    };
+    let kernels = ["attention.pool_compress", "elementwise.norm_rope_last"];
+    assert_eq!(
+        ops(&fuse(chain(false), &kernels)),
+        ["attention.pool_compress"]
+    );
+    // A latent read past the match keeps the compressor apart.
+    assert!(!ops(&fuse(chain(true), &kernels)).contains(&"attention.pool_compress"));
+}

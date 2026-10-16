@@ -46,6 +46,7 @@ pub(super) fn all() -> Vec<Rule> {
         gated_residual_norm_modulate(),
         norm_modulate(),
         rmsnorm_rope_partial_q(),
+        pool_compress(),
         norm_rope_last_append(),
         norm_rope_last(),
         qg_qknorm_rope_append(),
@@ -1228,6 +1229,80 @@ fn norm_rope_last() -> Rule {
         Some(norm_dim) => norm_dim == m.u32("head_dim"),
         None => m.width("x") == Some(u64::from(m.u32("head_dim"))),
     })
+}
+
+/// DeepSeek-V4's compressor at its boundaries: the gathered entries normed,
+/// their tail rotated at the boundaries' rope positions, and written to the
+/// pool, the entries and the normed rows read by nothing else.
+fn pool_compress() -> Rule {
+    let chain = |biased: bool| {
+        template(move |p| {
+            p.free("interleaved");
+            p.free("inverse");
+            p.free("yarn");
+            let (bpos, breq) = (p.indices("bpos"), p.indices("breq"));
+            let pages = p.cache("pages");
+            let ape = biased.then(|| p.weight("ape", [W, W]));
+            let gathered = attn::pool_gather(
+                &bpos,
+                &breq,
+                pages,
+                ape.as_ref(),
+                p.u32("head_dim"),
+                p.u32("ratio"),
+                poem_ir::Dtype::Bf16,
+            );
+            p.name("gathered", &gathered);
+            let latent = elemwise::rmsnorm(&gathered, &p.weight("weight", [W]), p.f32("eps"));
+            p.name("latent", &latent);
+            let brope = p.indices("brope");
+            let rotated = elemwise::rope_partial_last_yarn(
+                &latent,
+                &brope,
+                p.u32("rotary_dim"),
+                p.u32("head_dim"),
+                p.f32("theta"),
+                false,
+                false,
+                None,
+            );
+            p.name("rotated", &rotated);
+            let pool = p.cache("pool");
+            let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
+            attn::pool_kv_append(&rotated, &bpos, &breq, pool, &write_page, &write_offset);
+        })
+    };
+    Rule::new(
+        "attention.pool_compress",
+        [chain(true), chain(false)],
+        |m| {
+            let Operation::Attention(gather) = m.op("gathered") else {
+                unreachable!("the entries come from the gather")
+            };
+            let Operation::Elementwise(rotate) = m.op("rotated") else {
+                unreachable!("the rotated rows come from the rotation")
+            };
+            let append =
+                m.trace
+                    .nodes
+                    .iter()
+                    .find_map(|node| match &node.op {
+                        Operation::Attention(
+                            a @ poem_ir::Attention::PoolKvAppend { entries, .. },
+                        ) if *entries == m.value("rotated") => Some(a.clone()),
+                        _ => None,
+                    })
+                    .expect("the rotated rows are appended");
+            Fused::PoolCompress {
+                gather: Box::new(gather.clone()),
+                weight: m.value("weight"),
+                eps: m.f32("eps"),
+                latent: m.value("latent"),
+                rotate: Box::new(rotate.clone()),
+                append: Box::new(append),
+            }
+        },
+    )
 }
 
 /// DeepSeek-V4's kv plane: a scaled norm of a row one head wide, its last

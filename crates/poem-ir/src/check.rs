@@ -866,6 +866,15 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             } => &[(In(4), I32)],
             Fused::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
             Fused::NormRopeLast { .. } => &[(In(1), I32)],
+            Fused::PoolCompress { .. } => &[
+                (In(0), I32),
+                (In(1), I32),
+                (In(2), CACHE),
+                (In(4), I32),
+                (In(5), CACHE),
+                (In(6), I32),
+                (In(7), I32),
+            ],
             Fused::NormRopeLastAppend { .. } => {
                 &[(In(2), I32), (In(3), CACHE), (In(4), I32), (In(5), I32)]
             }

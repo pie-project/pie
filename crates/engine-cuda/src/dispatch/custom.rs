@@ -10,6 +10,7 @@ impl DispatchFused for Run<'_> {
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op),
             Fused::RopeYarnAppend { .. } => self.rope_yarn_append(op),
             Fused::NormRopeLastAppend { .. } => self.norm_rope_last_append(op),
+            Fused::PoolCompress { .. } => self.pool_compress(op),
             Fused::SplitRopeYarnAppend { .. } => self.split_rope_yarn_append(op),
             Fused::QgQknormRopeAppend { .. } => self.qg_qknorm_rope_append(op),
             Fused::LseSink { .. } => self.lse_sink(op),
@@ -735,6 +736,97 @@ impl Run<'_> {
             self.tensor(*write_page),
             self.tensor(*write_offset),
         )
+    }
+
+    /// DeepSeek-V4's compressor at its boundaries in one launch where the
+    /// profile says (`kernel.elemwise.rows_vec`) and the shape fits; else the
+    /// gather, the norm and rotation (`norm_rope_last`), and the append, as
+    /// the unfused ops fire them.
+    fn pool_compress(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        use kernels_cuda::elemwise::rope;
+        let Fused::PoolCompress {
+            gather,
+            weight,
+            eps,
+            latent,
+            rotate,
+            append,
+        } = op
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let (
+            poem_ir::Attention::PoolGather {
+                boundary_pos,
+                boundary_req,
+                pages,
+                ape,
+                head_dim,
+                ratio,
+                entries,
+            },
+            poem_ir::Elementwise::RopePartialLast {
+                positions,
+                rotary_dim,
+                theta,
+                interleaved,
+                inverse,
+                yarn,
+                ..
+            },
+            poem_ir::Attention::PoolKvAppend { pool: into, .. },
+        ) = (&**gather, &**rotate, &**append)
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let yarn = yarn.map(|y| rope::Yarn {
+            factor: y.factor,
+            beta_fast: y.beta_fast,
+            beta_slow: y.beta_slow,
+            original_max_position: y.original_max_position,
+        });
+        let slabs = self.slabs(*pages);
+        let state = self.pool(*pages);
+        let out = self.pool(*into);
+        let gather_ape = ape.map_or(slabs.ape, |id| self.tensor(id));
+        let landed = kernels_cuda::attn::pool::compress(
+            self.ctx(),
+            self.tensor(*boundary_pos),
+            self.tensor(*boundary_req),
+            &state,
+            *head_dim,
+            *ratio,
+            slabs.state_kv,
+            slabs.state_score,
+            gather_ape,
+            self.tensor(*weight),
+            *eps,
+            self.tensor(*positions),
+            *rotary_dim,
+            *theta,
+            *interleaved && !*inverse,
+            yarn,
+            &out,
+        )?;
+        if landed {
+            return Ok(());
+        }
+        self.attention(gather)?;
+        rope::norm_rope_last(
+            self.ctx(),
+            self.tensor(*entries),
+            Some(self.tensor(*weight)),
+            *head_dim,
+            *eps,
+            self.tensor(*positions),
+            *rotary_dim,
+            *theta,
+            *interleaved,
+            *inverse,
+            yarn,
+            &mut self.tensor(*latent),
+        )?;
+        self.attention(append)
     }
 
     /// DeepSeek-V4's kv plane normed, rotated and written in one launch

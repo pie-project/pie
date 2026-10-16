@@ -207,9 +207,9 @@ impl FamilyCosts {
             poem_ir::Operation::Layout(_) => self.layout,
             poem_ir::Operation::Collective(_) => self.collective,
             poem_ir::Operation::Fused(op) => match op {
-                poem_ir::Fused::LseSink { .. } | poem_ir::Fused::PoolAttention { .. } => {
-                    self.attention
-                }
+                poem_ir::Fused::LseSink { .. }
+                | poem_ir::Fused::PoolAttention { .. }
+                | poem_ir::Fused::PoolCompress { .. } => self.attention,
                 poem_ir::Fused::MatmulGeglu { .. }
                 | poem_ir::Fused::MatmulSwiglu { .. }
                 | poem_ir::Fused::MlpSwiglu { .. }

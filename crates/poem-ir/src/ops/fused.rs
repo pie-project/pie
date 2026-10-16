@@ -117,6 +117,19 @@ pub enum Fused {
         write_page: ValueId,
         write_offset: ValueId,
     },
+    /// DeepSeek-V4's compressor at its boundaries: the gathered entries
+    /// (`PoolGather`), their RMS norm times `weight` into `latent`, its tail
+    /// rotated (`rotate`, a `RopePartialLast` over `latent`) and written to
+    /// the pool (`append`, a `PoolKvAppend` of the rotation's output). The
+    /// gathered and normed rows are read by nothing else.
+    PoolCompress {
+        gather: Box<Attention>,
+        weight: ValueId,
+        eps: f32,
+        latent: ValueId,
+        rotate: Box<Elementwise>,
+        append: Box<Attention>,
+    },
     NormModulate {
         x: ValueId,
         norm: NormKind,
@@ -414,6 +427,42 @@ impl Operands for Fused {
                 write_offset,
                 ..
             } => sink.extend([*x, *weight, *positions, *cache, *write_page, *write_offset]),
+            // The boundaries' positions and requests, the state's pages, the
+            // norm's weight, the rope positions, the pool and its write
+            // tables, then the gather's position bias where it has one.
+            Self::PoolCompress {
+                gather,
+                weight,
+                rotate,
+                append,
+                ..
+            } => {
+                if let Attention::PoolGather {
+                    boundary_pos,
+                    boundary_req,
+                    pages,
+                    ..
+                } = **gather
+                {
+                    sink.extend([boundary_pos, boundary_req, pages]);
+                }
+                sink.push(*weight);
+                if let Elementwise::RopePartialLast { positions, .. } = **rotate {
+                    sink.push(positions);
+                }
+                if let Attention::PoolKvAppend {
+                    pool,
+                    write_page,
+                    write_offset,
+                    ..
+                } = **append
+                {
+                    sink.extend([pool, write_page, write_offset]);
+                }
+                if let Attention::PoolGather { ape: Some(ape), .. } = **gather {
+                    sink.push(ape);
+                }
+            }
             Self::NormModulate {
                 x, m, lane_of_row, ..
             } => {
@@ -628,6 +677,16 @@ impl Operands for Fused {
             Self::RmsnormRopePartialQ { y, q_out, .. } => sink.extend([*y, *q_out]),
             Self::NormRopeLast { y, q_out, .. } => sink.extend([*y, *q_out]),
             Self::NormRopeLastAppend { y, .. } => sink.push(*y),
+            Self::PoolCompress {
+                gather,
+                latent,
+                rotate,
+                ..
+            } => {
+                gather.outputs(sink);
+                sink.push(*latent);
+                rotate.outputs(sink);
+            }
             Self::NormModulate { normed, y, .. } => sink.extend([*normed, *y]),
             Self::GatedResidualNormModulate {
                 r_out, normed, out, ..
@@ -762,6 +821,8 @@ impl Operands for Fused {
             | Self::NormRopeLastAppend { .. }
             | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
             // The rotation turns the normed rows in place.
+            Self::PoolCompress { rotate, .. } => rotate.aliases(sink),
+            // The rotation turns the normed rows in place.
             Self::QgQknormRopeAppend {
                 q_out,
                 q_normed,
@@ -782,6 +843,7 @@ impl Operands for Fused {
             Self::RmsnormRopePartialQ { .. } => "elementwise.rmsnorm_rope_partial_q",
             Self::NormRopeLast { .. } => "elementwise.norm_rope_last",
             Self::NormRopeLastAppend { .. } => "elementwise.norm_rope_last_append",
+            Self::PoolCompress { .. } => "attention.pool_compress",
             Self::NormModulate { .. } => "elementwise.norm_modulate",
             Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
             Self::MatmulGeglu { .. } => "linear.matmul_geglu",

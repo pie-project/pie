@@ -1,6 +1,9 @@
 #pragma once
 
 #include "prelude/device.cuh"
+#include "prelude/rope.cuh"
+
+#include "attn/dsv4_kv.cuh"
 
 namespace pie::attn {
 
@@ -614,6 +617,184 @@ __global__ void __launch_bounds__(256) pool_gather_vec(
             o = se > 0.f ? a / se : 0.f;
         }
         orow[d] = Elem<T>::from_f32(o);
+    }
+}
+
+// DeepSeek-V4's compressor at a boundary, in one pass: `pool_gather_vec`'s
+// entry (rounded to bf16 as its plane would hold it), its RMS norm times
+// `weight` (rounded again), the rotation of its last `rotary_dim` dims
+// (interleaved, at the boundary's rope position, as
+// `rope_partial_last_spread` turns them), and the rotated entry written at
+// its boundary's position in the pool (`pool_store_entries`, or as DeepSeek's
+// fp8 row `ds_store_entries` writes it). A row closing no entry writes
+// nothing. 256 threads; `head_dim / 8` divides 256; FP8 wants 512.
+template <bool FP8>
+__global__ void __launch_bounds__(256) pool_compress(
+    const bf16* __restrict__ state_kv,
+    const bf16* __restrict__ state_score,
+    const float* __restrict__ ape,
+    const i32* __restrict__ boundary_pos,
+    const i32* __restrict__ boundary_req,
+    const u32* __restrict__ kv_page_indices,
+    const u32* __restrict__ kv_page_indptr,
+    const bf16* __restrict__ weight,
+    float eps,
+    const i32* __restrict__ rope_pos,
+    int rotary_dim,
+    float theta,
+    float yarn_factor,
+    float yarn_low_dim,
+    float yarn_high_dim,
+    void* __restrict__ out_pages,
+    const u32* __restrict__ out_indices,
+    const u32* __restrict__ out_indptr,
+    int out_page_size,
+    int head_dim,
+    int ratio,
+    int coff,
+    int page_size,
+    int state_pitch,
+    const u32* __restrict__ win) {
+    const int cb = blockIdx.x;
+    if (win != nullptr && cb >= static_cast<int>(win[0])) return;
+    const int c = win != nullptr ? cb + static_cast<int>(win[1]) : cb;
+    const int bpos = boundary_pos[c];
+    const int req = boundary_req[c];
+    if (bpos < 0 || bpos >= owned_positions(out_indptr, req, out_page_size)) return;
+    // A position the state's pages do not hold gathers nothing: a zero entry.
+    const bool held = bpos < owned_positions(kv_page_indptr, req, page_size);
+    const int window = coff * ratio;
+    const int width = coff * head_dim;
+    const long long pitch = static_cast<long long>(state_pitch);
+    const int run = head_dim / 8;
+    const int lane = static_cast<int>(threadIdx.x) % run;
+    const int group = static_cast<int>(threadIdx.x) / run;
+    const int groups = static_cast<int>(blockDim.x) / run;
+
+    extern __shared__ __align__(16) unsigned char pc_smem[];
+    long long* slots = reinterpret_cast<long long*>(pc_smem);
+    float* part = reinterpret_cast<float*>(pc_smem + ((window * 8 + 15) & ~15));
+    bf16* row = reinterpret_cast<bf16*>(part + groups * 3 * head_dim);
+    __shared__ float red[8];
+    for (int i = threadIdx.x; i < window; i += blockDim.x) {
+        const int pos = bpos + i - (window - 1);
+        slots[i] = (pos < 0 || !held) ? -1 : paged_slot(kv_page_indices, kv_page_indptr, req, pos, page_size);
+    }
+    __syncthreads();
+
+    float m[8], sum[8], acc[8];
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        m[u] = neg_inf();
+        sum[u] = 0.f;
+        acc[u] = 0.f;
+    }
+    for (int i = group; i < window; i += groups) {
+        const long long slot = slots[i];
+        if (slot < 0) continue;
+        const int pos = bpos + i - (window - 1);
+        const int col = ((i >= ratio) ? head_dim : 0) + lane * 8;
+        bf16 sc[8], kv[8];
+        *reinterpret_cast<uint4*>(sc) = *reinterpret_cast<const uint4*>(state_score + slot * pitch + col);
+        *reinterpret_cast<uint4*>(kv) = *reinterpret_cast<const uint4*>(state_kv + slot * pitch + col);
+        float bias[8];
+        if (ape != nullptr) {
+            const float4* a = reinterpret_cast<const float4*>(ape + static_cast<long long>(pos % ratio) * width + col);
+            const float4 a0 = a[0], a1 = a[1];
+            bias[0] = a0.x; bias[1] = a0.y; bias[2] = a0.z; bias[3] = a0.w;
+            bias[4] = a1.x; bias[5] = a1.y; bias[6] = a1.z; bias[7] = a1.w;
+        } else {
+#pragma unroll
+            for (int u = 0; u < 8; ++u) bias[u] = 0.f;
+        }
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const float sv = bf16_to_f32(sc[u]) + bias[u];
+            const float v = bf16_to_f32(kv[u]);
+            if (sv > m[u]) {
+                const float r = __expf(m[u] - sv);
+                sum[u] = sum[u] * r + 1.f;
+                acc[u] = acc[u] * r + v;
+                m[u] = sv;
+            } else if (sv > neg_inf()) {
+                const float e = __expf(sv - m[u]);
+                sum[u] += e;
+                acc[u] = fmaf(e, v, acc[u]);
+            }
+        }
+    }
+    float* mine = part + static_cast<long long>(group) * 3 * head_dim + lane * 8;
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        mine[u] = m[u];
+        mine[head_dim + u] = sum[u];
+        mine[2 * head_dim + u] = acc[u];
+    }
+    __syncthreads();
+    // The entry, as the gather's bf16 plane would hold it, and its sum of
+    // squares.
+    float local = 0.f;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float mx = neg_inf();
+        for (int g = 0; g < groups; ++g) mx = fmaxf(mx, part[g * 3 * head_dim + d]);
+        float o = 0.f;
+        if (isfinite(mx)) {
+            float se = 0.f, a = 0.f;
+            for (int g = 0; g < groups; ++g) {
+                const float mg = part[g * 3 * head_dim + d];
+                if (!(mg > neg_inf())) continue;
+                const float r = __expf(mg - mx);
+                se = fmaf(part[g * 3 * head_dim + head_dim + d], r, se);
+                a = fmaf(part[g * 3 * head_dim + 2 * head_dim + d], r, a);
+            }
+            o = se > 0.f ? a / se : 0.f;
+        }
+        const float ob = bf16_to_f32(f32_to_bf16(o));
+        row[d] = f32_to_bf16(ob);
+        local += ob * ob;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = local;
+    __syncthreads();
+    float total = 0.f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) total += red[w];
+    const float inv_rms = rsqrtf(total / static_cast<float>(head_dim) + eps);
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        row[d] = f32_to_bf16(bf16_to_f32(row[d]) * inv_rms * bf16_to_f32(weight[d]));
+    }
+    __syncthreads();
+    // The tail's interleaved pairs, a thread a pair.
+    const int offset = head_dim - rotary_dim;
+    const int rope_half = rotary_dim / 2;
+    const int rp = rope_pos[c];
+    for (int d = threadIdx.x; d < rope_half; d += blockDim.x) {
+        float freq = powf(theta, -2.f * static_cast<float>(d) / static_cast<float>(rotary_dim));
+        if (yarn_factor > 1.f) freq = yarn_original_freq(freq, yarn_factor, yarn_low_dim, yarn_high_dim, d);
+        const float ang = static_cast<float>(rp) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
+        const float a = bf16_to_f32(row[offset + 2 * d]);
+        const float b = bf16_to_f32(row[offset + 2 * d + 1]);
+        row[offset + 2 * d] = f32_to_bf16(a * cos_v - b * sin_v);
+        row[offset + 2 * d + 1] = f32_to_bf16(b * cos_v + a * sin_v);
+    }
+    __syncthreads();
+    const u32 page = out_indices[out_indptr[req] + bpos / out_page_size];
+    const int off = bpos % out_page_size;
+    if constexpr (FP8) {
+        if (threadIdx.x < 32) {
+            ::pie::attn::dsv4::ds_store_warp(
+                row, ::pie::attn::dsv4::ds_row(static_cast<std::uint8_t*>(out_pages), page, off, out_page_size),
+                static_cast<int>(threadIdx.x));
+        }
+    } else {
+        bf16* dst = static_cast<bf16*>(out_pages) +
+                    (static_cast<long long>(page) * out_page_size + off) * head_dim;
+        for (int i = threadIdx.x; i < head_dim / 8; i += blockDim.x) {
+            *reinterpret_cast<uint4*>(dst + 8 * i) = *reinterpret_cast<const uint4*>(row + 8 * i);
+        }
     }
 }
 

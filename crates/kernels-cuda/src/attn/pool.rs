@@ -581,3 +581,130 @@ fn pool_mma(
         ],
     )
 }
+
+/// DeepSeek-V4's compressor at its boundaries in one launch
+/// (`pool_compress`): the gather `gather` fires, the entry's RMS norm times
+/// `weight`, its tail rotated forward (interleaved) at `rope_pos`, and the
+/// rotated entry written into `out` as `kv_append` (or, an fp8 pool,
+/// `dsv4::store_entries`) writes it. Whether it fired: only under
+/// `kernel.elemwise.rows_vec`, for the shapes the one pass is built for;
+/// nothing is fired where it did not.
+#[allow(clippy::too_many_arguments)]
+pub fn compress(
+    ctx: &Ctx,
+    boundary_pos: Tensor,
+    boundary_req: Tensor,
+    pages: &KvPool,
+    head_dim: u32,
+    ratio: u32,
+    state_kv: Tensor,
+    state_score: Tensor,
+    ape: Tensor,
+    weight: Tensor,
+    eps: f32,
+    rope_pos: Tensor,
+    rotary_dim: u32,
+    theta: f32,
+    forward_interleaved: bool,
+    yarn: Option<crate::elemwise::rope::Yarn>,
+    out: &KvPool,
+) -> Result<bool, Error> {
+    const OP: &str = "attention.pool_compress";
+    let fp8 = crate::attn::dsv4::fp8_ds(out);
+    let run = head_dim / 8;
+    let pitch = state_kv.width;
+    let fits = ctx.tuning().rows_vec
+        && forward_interleaved
+        && head_dim.is_multiple_of(8)
+        && run > 0
+        && 256 % run == 0
+        && rotary_dim > 0
+        && rotary_dim <= head_dim
+        && rotary_dim.is_multiple_of(2)
+        && pitch.is_multiple_of(8)
+        && state_kv.dtype == Dtype::Bf16
+        && weight.dtype == Dtype::Bf16
+        && [state_kv.ptr, state_score.ptr, out.keys.ptr]
+            .iter()
+            .all(|&at| aligned16(at))
+        && (ape.is_absent() || aligned16(ape.ptr))
+        && if fp8 {
+            head_dim == 512
+        } else {
+            out.keys.dtype == Dtype::Bf16
+        };
+    if !fits {
+        return Ok(false);
+    }
+    boundary_tables(OP, &boundary_pos, &boundary_req);
+    let ratio = pooling_ratio(OP, ratio)?;
+    let head_dim_i = count(OP, "the head width this compressor states", head_dim)?;
+    let coff = if ape.is_absent() {
+        compressor_coff(ratio)
+    } else {
+        match count(OP, "the ape's row width", ape.width)? {
+            w if w == head_dim_i => 1,
+            w if w == 2 * head_dim_i => 2,
+            w => {
+                return Err(refuse(
+                    OP,
+                    format!("an ape {w} wide is neither one head width ({head_dim}) nor two"),
+                ));
+            }
+        }
+    };
+    let (factor, low_dim, high_dim) = match yarn {
+        Some(yn) => {
+            let max_position = nonzero(
+                OP,
+                "the position span this layer's YaRN ramp states",
+                yn.original_max_position,
+            )?;
+            let (low, high) = crate::elemwise::rope::ramp_bounds(
+                i32::try_from(rotary_dim).unwrap_or(i32::MAX),
+                theta,
+                yn.beta_fast,
+                yn.beta_slow,
+                i32::try_from(max_position).unwrap_or(i32::MAX),
+            );
+            (yn.factor, low, high)
+        }
+        None => (1.0, 0.0, 0.0),
+    };
+    let window = (coff * ratio).unsigned_abs();
+    let groups = 256 / run;
+    let smem = (window * 8).next_multiple_of(16) + groups * 3 * head_dim * 4 + head_dim * 2;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::attn::pool_compress<{fp8}>")))
+            .apply(Launch::grid([boundary_pos.rows, 1, 1], [256, 1, 1]).smem(smem)),
+        &[
+            state_kv.arg(),
+            state_score.arg(),
+            ape.arg(),
+            boundary_pos.arg(),
+            boundary_req.arg(),
+            pages.page_indices.arg(),
+            pages.page_indptr.arg(),
+            weight.arg(),
+            eps.arg(),
+            rope_pos.arg(),
+            count(OP, "the rotated tail's width", rotary_dim)?.arg(),
+            theta.arg(),
+            factor.arg(),
+            low_dim.arg(),
+            high_dim.arg(),
+            out.keys.arg(),
+            out.page_indices.arg(),
+            out.page_indptr.arg(),
+            out.page_size.arg(),
+            head_dim_i.arg(),
+            ratio.arg(),
+            coff.arg(),
+            pages.page_size.arg(),
+            count(OP, "the state plane's row pitch", pitch)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}

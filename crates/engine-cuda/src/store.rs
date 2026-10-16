@@ -1755,12 +1755,18 @@ const fn compressor_coff(ratio: u32) -> u64 {
 fn pooled_spaces(trace: &Trace) -> Vec<(u32, u64)> {
     let mut spaces: Vec<(u32, u64)> = Vec::new();
     for node in &trace.nodes {
-        let Operation::Attention(Attention::PoolGather {
+        // A gather, or one the compressor's fused op holds.
+        let gather = match &node.op {
+            Operation::Attention(a) => a,
+            Operation::Fused(poem_ir::Fused::PoolCompress { gather, .. }) => &**gather,
+            _ => continue,
+        };
+        let Attention::PoolGather {
             pages,
             head_dim,
             ratio,
             ..
-        }) = &node.op
+        } = gather
         else {
             continue;
         };
