@@ -1018,7 +1018,7 @@ fn experts_w4a4(
         let rows = layout.rows as usize;
         let xq = ctx.scratch_stream(OP, W4A4_X, rows * k as usize / 2)? as u64;
         let x_atom_bytes = tc5::atom_bytes(rows, k as usize, 16);
-        let xs = ctx.scratch_stream(OP, W4A4_XS, x_atom_bytes)? as u64;
+        let xs = act_quant::atoms_of(ctx, OP, W4A4_XS, x_atom_bytes)?;
         act_quant::quantize(
             ctx,
             OP,
@@ -1259,7 +1259,7 @@ fn experts_w4a8_as(
         let fmt = act_quant::Format::E4m3 { gran: GRAN };
         let xq = ctx.scratch_stream(OP, W4A8_X, rows * k as usize)? as u64;
         let x_atom_bytes = tc5::atom_bytes(rows, k as usize, GRAN as usize);
-        let xs = ctx.scratch_stream(OP, W4A8_XS, x_atom_bytes)? as u64;
+        let xs = act_quant::atoms_of(ctx, OP, W4A8_XS, x_atom_bytes)?;
         act_quant::quantize(
             ctx,
             OP,

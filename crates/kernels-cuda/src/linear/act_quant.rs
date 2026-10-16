@@ -238,9 +238,13 @@ fn launch(
     }
 }
 
-/// Codes (`fmt.row_bytes(k)` a row) and atom-layout scales, `atom_bytes`
-/// of them zeroed first so the padding the GEMM reads is finite, as [`tc5`]
-/// reads them.
+/// Codes (`fmt.row_bytes(k)` a row) and atom-layout scales, as [`tc5`]
+/// reads them. Only the live rows' atoms land: the padding past them (a
+/// block's rows past its live ones) keeps what it held, which the GEMM
+/// reads for rows no store keeps. It must be finite, so `atoms` is a slab
+/// zeroed when fresh that only ever holds `fmt`'s scales (a ue8m0 1.0,
+/// 0x7f, is an e4m3 NaN): [`atoms_of`]. `atom_bytes` is the extent the GEMM
+/// reads.
 pub fn quantize(
     ctx: &Ctx,
     op: &'static str,
@@ -250,8 +254,27 @@ pub fn quantize(
     atoms: u64,
     atom_bytes: usize,
 ) -> Result<(), Error> {
-    zero(ctx, op, atoms, atom_bytes)?;
+    let _ = atom_bytes;
     launch(ctx, op, fmt, 0, src, codes, atoms, 0)
+}
+
+/// A stream's slab named `name` (one name a format) of `bytes` activation
+/// atoms, zeroed when fresh, for [`quantize`]: no clear a launch.
+pub(crate) fn atoms_of(
+    ctx: &Ctx,
+    op: &'static str,
+    name: &'static str,
+    bytes: usize,
+) -> Result<u64, Error> {
+    Ok(ctx.scratch_stream_zeroed(op, name, bytes)? as u64)
+}
+
+/// The quantizer's own atom slab for `fmt`.
+fn act_atoms(fmt: Format) -> &'static str {
+    match fmt {
+        Format::Nvfp4 => ACT_ATOMS_NVFP4,
+        Format::E4m3 { .. } => ACT_ATOMS_E4M3,
+    }
 }
 
 /// The quantized activations read back to bf16 into `out` (`rows x k`),
@@ -312,7 +335,8 @@ fn zero(ctx: &Ctx, op: &'static str, ptr: u64, bytes: usize) -> Result<(), Error
 /// The activations' codes and scales, one a stream: the GEMM after them on
 /// the same stream consumes them.
 const ACT_CODES: &str = "linear.act_quant.codes";
-const ACT_ATOMS: &str = "linear.act_quant.atoms";
+const ACT_ATOMS_NVFP4: &str = "linear.act_quant.atoms_nvfp4";
+const ACT_ATOMS_E4M3: &str = "linear.act_quant.atoms_e4m3";
 const WEIGHT_ATOMS: &str = "linear.act_quant.weight_atoms";
 const HELD_CODES: &str = "linear.act_quant.held_codes";
 const HELD_ATOMS: &str = "linear.act_quant.held_atoms";
@@ -358,9 +382,9 @@ pub fn matmul(
     }
     let codes = ctx.scratch_stream(op, ACT_CODES, m as usize * fmt.row_bytes(k) as usize)?;
     let atom_bytes = tc5::atom_bytes(m as usize, k as usize, fmt.gran() as usize);
-    let atoms = ctx.scratch_stream(op, ACT_ATOMS, atom_bytes)?;
-    quantize(ctx, op, fmt, act, codes as u64, atoms as u64, atom_bytes)?;
-    product(ctx, op, fmt, [codes as u64, atoms as u64], m, w, y, alpha)
+    let atoms = atoms_of(ctx, op, act_atoms(fmt), atom_bytes)?;
+    quantize(ctx, op, fmt, act, codes as u64, atoms, atom_bytes)?;
+    product(ctx, op, fmt, [codes as u64, atoms], m, w, y, alpha)
 }
 
 /// Where a producer lands `rows x k` of DeepSeek's fp8 1x128 activations
@@ -542,7 +566,7 @@ pub fn select(
         tc5::atom_bytes(rows as usize, k as usize, gran)
     };
     let codes = ctx.scratch_stream(op, ACT_CODES, rows as usize * fmt.row_bytes(k) as usize)?;
-    let atoms = ctx.scratch_stream(op, ACT_ATOMS, atom_bytes)?;
+    let atoms = atoms_of(ctx, op, act_atoms(fmt), atom_bytes)?;
     let src = Source {
         x,
         rows: count,
@@ -554,7 +578,7 @@ pub fn select(
         pos,
         m_max,
     };
-    quantize(ctx, op, fmt, src, codes as u64, atoms as u64, atom_bytes)?;
+    quantize(ctx, op, fmt, src, codes as u64, atoms, atom_bytes)?;
     let grouped = ctx.scratch_stream(op, GROUPED_Y, rows as usize * n as usize * 2)? as u64;
     let a_elem = match fmt {
         Format::Nvfp4 => tc5::Elem::E2m1,
@@ -562,7 +586,7 @@ pub fn select(
     };
     tc5::grouped_gemm_epi(
         ctx,
-        tc5::Operand::scaled(codes as u64, a_elem, atoms as u64, fmt.gran()),
+        tc5::Operand::scaled(codes as u64, a_elem, atoms, fmt.gran()),
         tc5::Operand::scaled(bank.codes, bank.elem, bank.atoms, bank.gran),
         grouped,
         tc5::Grouped {
