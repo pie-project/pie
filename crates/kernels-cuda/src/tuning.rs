@@ -116,6 +116,14 @@ pub struct MoeW4a4FusedFrom(pub u32);
 #[decision(id = "kernel.ssm.kda_chunked", flag, default = false, tune = search)]
 pub struct SsmKdaChunked;
 
+/// Whether a KDA decode step reads its packed rows itself (a block a row,
+/// head and slice of the state's value rows normalizing its query and key
+/// and forming its gates) instead of staging them in two launches first.
+/// Off but where a chip's profile turns it on (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.kda_step_fused", flag, default = false, tune = search)]
+pub struct SsmKdaStepFused;
+
 /// The fewest tokens a W4A8 routed MLP (MXFP4 banks against e4m3
 /// activations) keeps its rows by expert from the gate-up select to the
 /// weighted sum with (its GLU landing the down leg's e4m3 operand from the
@@ -534,6 +542,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeW4a8FusedFrom>()
         .add::<MlaExpandedFrom>()
         .add::<SsmKdaChunked>()
+        .add::<SsmKdaStepFused>()
         .add::<GemmSplitLaunchNs>()
         .add::<GemmTc5Raster>()
         .add::<KernelPdl>()
@@ -611,6 +620,7 @@ pub struct Tuning {
     pub moe_w4a8_fused_from: u32,
     pub mla_expanded_from: u32,
     pub ssm_kda_chunked: bool,
+    pub ssm_kda_step_fused: bool,
     pub gemm_split_launch_ns: u32,
     pub gemm_tc5_raster: u32,
     pub pdl: bool,
@@ -686,6 +696,7 @@ impl Tuning {
         moe_w4a8_fused_from: 65_536,
         mla_expanded_from: 65_536,
         ssm_kda_chunked: false,
+        ssm_kda_step_fused: false,
         gemm_split_launch_ns: 0,
         gemm_tc5_raster: 8,
         pdl: false,
@@ -761,6 +772,7 @@ impl Tuning {
             moe_w4a8_fused_from: profile.get::<MoeW4a8FusedFrom>().0,
             mla_expanded_from: profile.get::<MlaExpandedFrom>().0,
             ssm_kda_chunked: profile.on::<SsmKdaChunked>(&Anywhere),
+            ssm_kda_step_fused: profile.on::<SsmKdaStepFused>(&Anywhere),
             gemm_split_launch_ns: profile.get::<GemmSplitLaunchNs>().0,
             gemm_tc5_raster: profile.get::<GemmTc5Raster>().0,
             pdl: profile.on::<KernelPdl>(&Anywhere),

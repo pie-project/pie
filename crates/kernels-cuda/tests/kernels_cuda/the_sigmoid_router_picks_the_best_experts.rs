@@ -105,3 +105,47 @@ fn one(rows: usize, experts: usize, k: usize) {
         }
     }
 }
+
+/// One Kimi-K3 decode row's routing (896 experts, top 16), timed.
+#[test]
+#[ignore = "timing fixture: run by hand under the GPU lock"]
+fn the_sigmoid_router_paces_a_decode_row() {
+    let experts = 896usize;
+    let k: usize = std::env::var("PK").map_or(16, |v| v.parse().unwrap());
+    let logits: Vec<u16> = (0..experts)
+        .map(|e| to_bf16(-4.0 + 0.007 * ((e * 97) % experts) as f32))
+        .collect();
+    let bias: Vec<f32> = vec![0.0; experts];
+    let mut gpu = Gpu::open();
+    let l = Tensor::new(gpu.up(&logits), 1, experts as u32, Dtype::Bf16);
+    let b = Tensor::new(gpu.up(&bias), 1, experts as u32, Dtype::F32);
+    let mut routes = Tensor::new(gpu.zeros(k * 4), 1, k as u32, Dtype::I32);
+    let mut weights = Tensor::new(gpu.zeros(k * 4), 1, k as u32, Dtype::F32);
+    let ctx = gpu.ctx();
+    let mut fire = || {
+        moe::topk_sigmoid(
+            &ctx,
+            l,
+            Some(b),
+            experts as u32,
+            k as u32,
+            true,
+            1.0,
+            &mut routes,
+            &mut weights,
+        )
+        .expect("the router fires");
+    };
+    fire();
+    gpu.sync();
+    let n = 2000;
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        fire();
+    }
+    gpu.sync();
+    eprintln!(
+        "PACE router 896 x 16: {:.2} us a launch",
+        t.elapsed().as_secs_f64() * 1e6 / f64::from(n)
+    );
+}

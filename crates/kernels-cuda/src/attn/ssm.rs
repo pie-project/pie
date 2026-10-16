@@ -1756,8 +1756,44 @@ pub fn kda_step(
     let shape = Kda::of(OP, mixed, f, b, y, heads, head_dim)?;
     f32_state(OP, state)?;
     seated(OP, state, "ssm_kda_step_batched", true, false, false)?;
-    let staged = shape.stage(ctx, OP, mixed, f, b, dt_bias, a_log, norm_eps, gate_floor)?;
     let work = shape.work(ctx, OP, state, shape.n)?;
+    if ctx.tuning().ssm_kda_step_fused {
+        // Enough blocks to fill the device twice: each (row, head) split
+        // over up to eight slices of its value rows.
+        let sms = ctx.multiprocessors().unwrap_or(148);
+        let blocks = shape.n.saturating_mul(shape.heads).max(1);
+        let splits = (2 * sms)
+            .div_ceil(blocks)
+            .clamp(1, 8)
+            .min(shape.head_dim.max(1));
+        return ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::attn::ssm_kda_step_fused<::pie::bf16>").apply(
+                Launch::grid([shape.n, shape.heads, splits], [STEP_BLOCK, 1, 1])
+                    .smem(kda_shmem(shape.head_dim) + shape.head_dim * FLOAT),
+            ),
+            &[
+                mixed.arg(),
+                f.arg(),
+                b.arg(),
+                a_log.arg(),
+                dt_bias.arg(),
+                gate_floor.arg(),
+                norm_eps.arg(),
+                state.slab.arg(),
+                state.slot_ids.arg(),
+                state.slot_stride_elems.arg(),
+                y.arg(),
+                stated(OP, shape.heads)?.arg(),
+                stated(OP, shape.head_dim)?.arg(),
+                state.write_state.arg(),
+                state.write_state_mask.arg(),
+                ArgValue::Ptr(work),
+                ctx.stage(),
+            ],
+        );
+    }
+    let staged = shape.stage(ctx, OP, mixed, f, b, dt_bias, a_log, norm_eps, gate_floor)?;
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::ssm_kda_step_batched").apply(

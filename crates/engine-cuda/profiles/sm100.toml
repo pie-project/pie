@@ -176,6 +176,10 @@ moe.w4a8_fused_from = 512
 # directions in parallel, then the state chunk by chunk), not a row at a
 # time: its block asks 219 KiB of shared memory.
 ssm.kda_chunked = true
+# A KDA decode step reads its packed rows itself, a block a row, head and
+# quarter of the state's value rows: Kimi-K3's three KDA layers lose two
+# staging launches each at bs1.
+ssm.kda_step_fused = true
 # A routed NVFP4 select of bf16 activations (W4A16) of 32 to 8192 routes on
 # the register-dequant MMA kernel: the tcgen05 W4A16 path's transform and
 # kind::f16 MMAs (four a 64-K stage) held a decode's gate-up to ~300 us.

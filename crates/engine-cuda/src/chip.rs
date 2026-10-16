@@ -483,6 +483,7 @@ mod tests {
                         moe_w4a8_fused_from: 65_536,
                         mla_expanded_from: 65_536,
                         ssm_kda_chunked: false,
+                        ssm_kda_step_fused: false,
                         gemm_split_launch_ns: 0,
                         gemm_tc5_raster: 8,
                         pdl: false,

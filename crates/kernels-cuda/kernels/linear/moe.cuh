@@ -597,6 +597,22 @@ __global__ void moe_topk_sigmoid_sink(
     }
 }
 
+// A router lane's first highest open expert of those it holds (every
+// 32nd, from its lane), or none.
+template <int kPer>
+__device__ __forceinline__ void router_lane_best(
+    const float (&held)[kPer], unsigned open, int lane, float& v, int& i) {
+    v = -flt_max();
+    i = -1;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        if (((open >> j) & 1u) != 0u && (i < 0 || held[j] > v)) {
+            v = held[j];
+            i = j * 32 + lane;
+        }
+    }
+}
+
 template <class T>
 __global__ void moe_topk_sigmoid(
     const T* __restrict__ logits,
@@ -627,30 +643,31 @@ __global__ void moe_topk_sigmoid(
     }
     __syncthreads();
 
-    __shared__ bool taken[kSigmoidRouterMaxExperts];
-    for (int e = tid; e < E; e += blockDim.x) taken[e] = false;
-    __syncthreads();
-
-    // The first warp picks: each lane walks its own experts in order, keeping
-    // the first of its highest, and the warp keeps the highest of those, the
-    // lower expert on a tie, so each pick is the serial walk's.
+    // The first warp picks: each lane holds its own experts (every 32nd) in
+    // registers and keeps the first of its highest untaken, and the warp
+    // keeps the highest of those, the lower expert on a tie, so each pick
+    // is the serial walk's. Only the lane whose expert was taken looks
+    // again.
     if (tid < 32) {
+        constexpr int kPer = kSigmoidRouterMaxExperts / 32;
+        float held[kPer];
+        unsigned open = 0u;
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) {
+            const int e = j * 32 + tid;
+            held[j] = e < E ? scores[e] : 0.f;
+            open |= (e < E ? 1u : 0u) << j;
+        }
+        float lane_v = -flt_max();
+        int lane_i = -1;
+        router_lane_best(held, open, tid, lane_v, lane_i);
         i32* idx = topk_idx + static_cast<long long>(plane_row) * K;
         float* w = topk_w + static_cast<long long>(plane_row) * K;
         float sum = 0.f;
         const int picks = K < E ? K : E;
         for (int k = 0; k < picks; ++k) {
-            int best_i = -1;
-            float best_v = -flt_max();
-            for (int e = tid; e < E; e += 32) {
-                if (taken[e]) continue;
-                const float v = scores[e];
-
-                if (best_i < 0 || v > best_v) {
-                    best_v = v;
-                    best_i = e;
-                }
-            }
+            int best_i = lane_i;
+            float best_v = lane_v;
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1) {
                 const float ov = __shfl_xor_sync(0xffffffffu, best_v, off);
@@ -665,9 +682,11 @@ __global__ void moe_topk_sigmoid(
                 idx[k] = best_i;
                 w[k] = orig_scores[best_i];
                 sum += orig_scores[best_i];
-                taken[best_i] = true;
             }
-            __syncwarp();
+            if (best_i >= 0 && (best_i & 31) == tid) {
+                open &= ~(1u << (best_i >> 5));
+                router_lane_best(held, open, tid, lane_v, lane_i);
+            }
         }
         if (tid != 0) return;
 

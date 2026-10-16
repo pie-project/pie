@@ -2872,6 +2872,136 @@ __device__ __forceinline__ float* kda_state_or_copy(
     return copy;
 }
 
+// `ssm_kda_step_batched` over the packed rows themselves: a block a (row,
+// head) reads its head's query, key and value out of the post-convolution
+// `[q | k | v]` row, normalizes the query and key (a warp a vector, summed
+// as `ssm_kda_qkv_prep` sums them), forms its gates and beta from the raw
+// rows (as `ssm_kda_gate_beta` forms them), then steps its state: the same
+// values, without the three staged planes and their two launches.
+template <class ElemT>
+__global__ void ssm_kda_step_fused(
+    const ElemT* __restrict__ mixed,
+    const ElemT* __restrict__ raw_g,
+    const ElemT* __restrict__ raw_beta,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    float lower_bound,
+    float eps,
+    float* __restrict__ state_base,
+    const i32* __restrict__ slot_ids,
+    long long slot_stride_elems,
+    float* __restrict__ out,
+    int H, int D,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
+    float* __restrict__ work,
+    const u32* __restrict__ win)
+{
+    const int r = blockIdx.x;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
+    const int h = blockIdx.y;
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    const long long rh = (long long)r * H + h;
+    const long long width = (long long)H * D;
+    const ElemT* row = mixed + (long long)r_row * 3 * width + (long long)h * D;
+    // This block's value rows of the state: a `gridDim.z`-th of them, so a
+    // decode's few heads spread over the SMs. A row that does not fold its
+    // boundary walks a copy of them, as `kda_state_or_copy` copies.
+    const int per = (D + gridDim.z - 1) / gridDim.z;
+    const int v0 = blockIdx.z * per;
+    const int v1 = min(D, v0 + per);
+    float* st = state_base + (long long)slot * slot_stride_elems + (long long)h * D * D;
+    if (!folds(write_state, write_state_mask, r)) {
+        float* copy = work + rh * D * D;
+        for (int i = v0 * D + threadIdx.x; i < v1 * D; i += blockDim.x) copy[i] = st[i];
+        st = copy;
+    }
+    float* out_h = out + ((long long)r_row * H + h) * D;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + D;
+    float* sg = smem + 2 * D;
+    float* sv = smem + 3 * D;
+    __shared__ float norms[2];
+    __shared__ float beta_s;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    if (warp < 2) {
+        const ElemT* src = row + (long long)warp * width;
+        float acc = 0.f;
+        for (int d = lane; d < D; d += 32) {
+            const float x = Elem<ElemT>::to_f32(src[d]);
+            acc += x * x;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_xor_sync(0xffffffffu, acc, off);
+        }
+        if (lane == 0) norms[warp] = acc;
+    }
+    if (threadIdx.x == 0) {
+        beta_s = sigmoidf(Elem<ElemT>::to_f32(raw_beta[(long long)r_row * H + h]));
+    }
+    const float a = __expf(A_log[h]);
+    const long long gsrc = ((long long)r_row * H + h) * D;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        const float g = Elem<ElemT>::to_f32(raw_g[gsrc + d]) + dt_bias[(long long)h * D + d];
+        float gate;
+        if (lower_bound < 0.f) {
+            gate = lower_bound * sigmoidf(a * g);
+        } else {
+            const float sp = (g > 20.f) ? g : __logf(1.f + __expf(g));
+            gate = -a * sp;
+        }
+        sg[d] = __expf(gate);
+        sv[d] = Elem<ElemT>::to_f32(row[2 * width + d]);
+    }
+    __syncthreads();
+    {
+        const float q_scale = rsqrtf(static_cast<float>(D));
+        const float inv_q = rsqrtf(norms[0] + eps);
+        const float inv_k = rsqrtf(norms[1] + eps);
+        for (int d = threadIdx.x; d < D; d += blockDim.x) {
+            sq[d] = Elem<ElemT>::to_f32(row[d]) * inv_q * q_scale;
+            sk[d] = Elem<ElemT>::to_f32(row[width + d]) * inv_k * 1.f;
+        }
+    }
+    __syncthreads();
+    const float beta_h = beta_s;
+
+    for (int vi = v0 + warp; vi < v1; vi += warps) {
+        float* srow = st + (long long)vi * D;
+        float mem = 0.f;
+        for (int ki = lane; ki < D; ki += 32) {
+            const float s = srow[ki] * sg[ki];
+            srow[ki] = s;
+            mem += s * sk[ki];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            mem += __shfl_down_sync(0xffffffffu, mem, off);
+        }
+        const float delta = __shfl_sync(0xffffffffu, (sv[vi] - mem) * beta_h, 0);
+
+        float acc = 0.f;
+        for (int ki = lane; ki < D; ki += 32) {
+            const float s = srow[ki] + sk[ki] * delta;
+            srow[ki] = s;
+            acc += s * sq[ki];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xffffffffu, acc, off);
+        }
+        if (lane == 0) out_h[vi] = acc;
+    }
+}
+
 __global__ void ssm_kda_step_batched(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
