@@ -323,6 +323,8 @@ pub fn fp8_block_gemv(
     {
         return Ok(false);
     }
+    // Warps a row group: each at least two 512-code passes of K.
+    let splits = (k / 1024).clamp(1, WARPS).next_power_of_two().min(WARPS);
     let rows_pad: u32 = match m {
         1 => 1,
         2 => 2,
@@ -337,7 +339,10 @@ pub fn fp8_block_gemv(
                 "::pie::linear::fp8_block_gemv<{WARPS}, {ROWS}, {rows_pad}>"
             )),
         )
-        .apply(Launch::grid([n.div_ceil(ROWS), 1, 1], [WARPS * 32, 1, 1])),
+        .apply(Launch::grid(
+            [n.div_ceil(ROWS * (WARPS / splits)), 1, 1],
+            [WARPS * 32, 1, 1],
+        )),
         &[
             act.arg(),
             stated(OP, act.width)?.arg(),
@@ -348,6 +353,7 @@ pub fn fp8_block_gemv(
             stated(OP, m)?.arg(),
             stated(OP, n)?.arg(),
             stated(OP, k)?.arg(),
+            stated(OP, splits)?.arg(),
         ],
     )?;
     Ok(true)

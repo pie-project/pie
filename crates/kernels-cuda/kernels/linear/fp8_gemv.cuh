@@ -54,7 +54,8 @@ __global__ void __launch_bounds__(kWarps * 32) fp8_block_gemv(
     int y_stride,
     int m,
     int n,
-    int k)
+    int k,
+    int splits)
 {
     using namespace fp8gemv;
     const int lane = threadIdx.x & 31;
@@ -62,7 +63,12 @@ __global__ void __launch_bounds__(kWarps * 32) fp8_block_gemv(
     // A block `kRows` weight rows, its warps each a `kWarps`-th of K: a
     // projection of few rows over a long K fills the SMs, and no warp
     // walks K alone.
-    const int row0 = blockIdx.x * kRows;
+    // `splits` warps share a row group's K (a power of two up to kWarps):
+    // a long K over few rows spreads over the SMs, a short one keeps each
+    // warp on rows of its own.
+    const int group = warp / splits;
+    const int part_k = warp % splits;
+    const int row0 = (blockIdx.x * (kWarps / splits) + group) * kRows;
     const int blocks = k / 128;
     float acc[kRows][kM];
 #pragma unroll
@@ -70,7 +76,7 @@ __global__ void __launch_bounds__(kWarps * 32) fp8_block_gemv(
 #pragma unroll
         for (int j = 0; j < kM; ++j) acc[i][j] = 0.f;
     }
-    for (int c0 = warp * 512 + lane * 16; c0 < k; c0 += 512 * kWarps) {
+    for (int c0 = part_k * 512 + lane * 16; c0 < k; c0 += 512 * splits) {
         uint4 w[kRows];
         float s[kRows];
 #pragma unroll
@@ -131,13 +137,15 @@ __global__ void __launch_bounds__(kWarps * 32) fp8_block_gemv(
         }
     }
     __syncthreads();
-    if (threadIdx.x < kRows * kM) {
-        const int i = threadIdx.x / kM;
-        const int j = threadIdx.x % kM;
+    if (threadIdx.x < kWarps * kRows * kM / splits) {
+        const int g = threadIdx.x / (kRows * kM);
+        const int at = threadIdx.x % (kRows * kM);
+        const int i = at / kM;
+        const int j = at % kM;
         float sum = 0.f;
-#pragma unroll
-        for (int w = 0; w < kWarps; ++w) sum += part[w][threadIdx.x];
-        if (row0 + i < n && j < m) y[static_cast<long long>(j) * y_stride + row0 + i] = f32_to_bf16(sum);
+        for (int w = 0; w < splits; ++w) sum += part[g * splits + w][at];
+        const int row = (blockIdx.x * (kWarps / splits) + g) * kRows + i;
+        if (row < n && j < m) y[static_cast<long long>(j) * y_stride + row] = f32_to_bf16(sum);
     }
 }
 
