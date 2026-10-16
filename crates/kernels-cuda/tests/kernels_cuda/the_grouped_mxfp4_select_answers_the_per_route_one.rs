@@ -343,7 +343,9 @@ fn check_atoms(tokens: usize, n: usize, k: usize, cvt: Tuning, keep: bool) {
     let ctx = gpu.ctx().with_tuning(cvt);
     let mut laid = Tensor::new(laid_at, route_count as u32, n as u32, Dtype::Bf16);
     let mut first = || {
-        kernels_cuda::linear::moe::select_mxfp4_atoms(&ctx, x, codes_t, atoms_at, routes_t, &mut laid)
+        kernels_cuda::linear::moe::select_mxfp4_atoms(
+            &ctx, x, codes_t, atoms_at, routes_t, &mut laid,
+        )
     };
     let fired = if keep {
         kernels_cuda::linear::moe::keeping_order(first)

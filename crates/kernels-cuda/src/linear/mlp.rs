@@ -285,16 +285,18 @@ pub fn swiglu_clamp_routed_e4m3(
     {
         return Ok(false);
     }
-    let lanes = u32::try_from(y.elements() / 8).map_err(|_| {
-        refuse(OP, "the rows' eights do not fit a 32-bit launch extent")
-    })?;
+    let lanes = u32::try_from(y.elements() / 8)
+        .map_err(|_| refuse(OP, "the rows' eights do not fit a 32-bit launch extent"))?;
     if lanes == 0 {
         return Ok(true);
     }
     ctx.fire(
         OP,
-        Fire::at("linear/act_quant.cuh", "::pie::linear::mlp_swiglu_clamp_routed_e4m3")
-            .apply(Launch::flat(lanes, BLOCK)),
+        Fire::at(
+            "linear/act_quant.cuh",
+            "::pie::linear::mlp_swiglu_clamp_routed_e4m3",
+        )
+        .apply(Launch::flat(lanes, BLOCK)),
         &[
             packed.arg(),
             weights.arg(),

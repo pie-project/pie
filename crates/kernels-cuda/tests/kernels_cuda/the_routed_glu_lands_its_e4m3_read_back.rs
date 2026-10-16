@@ -36,15 +36,31 @@ fn check(rows: usize, inter: usize, spread: f32) {
     );
     let ctx = gpu.ctx();
     let mut plain = Tensor::new(plain_at, rows as u32, inter as u32, Dtype::Bf16);
-    swiglu_clamp_routed(&ctx, packed_t, inter as u32, weights_t, 1, LIMIT, &mut plain)
-        .expect("the plain GLU fires");
+    swiglu_clamp_routed(
+        &ctx,
+        packed_t,
+        inter as u32,
+        weights_t,
+        1,
+        LIMIT,
+        &mut plain,
+    )
+    .expect("the plain GLU fires");
     let fmt = Format::E4m3 { gran: 128 };
     act_quant::read_back(&ctx, "test", fmt, Source::rows(plain, None), back_at)
         .expect("the read-back fires");
     let mut fused = Tensor::new(fused_at, rows as u32, inter as u32, Dtype::Bf16);
     assert!(
-        swiglu_clamp_routed_e4m3(&ctx, packed_t, inter as u32, weights_t, 1, LIMIT, &mut fused)
-            .expect("the read-back GLU fires"),
+        swiglu_clamp_routed_e4m3(
+            &ctx,
+            packed_t,
+            inter as u32,
+            weights_t,
+            1,
+            LIMIT,
+            &mut fused
+        )
+        .expect("the read-back GLU fires"),
         "{rows} rows of {inter} are whole 128-column blocks"
     );
     act_quant::read_back(&ctx, "test", fmt, Source::rows(fused, None), again_at)
