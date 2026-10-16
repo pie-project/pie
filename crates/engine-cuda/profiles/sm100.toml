@@ -195,10 +195,9 @@ moe.nvfp4_mma_until = 8192
 # reduce launch charged 2 us (a captured step pays it), split algorithms
 # reduced in place joining the timing.
 gemm.split_launch_ns = 2000
-# A lone row (a bs1 decode's products) is timed uncharged: its split pair
-# costs a captured step less than the charge, and Gemma-4-31B bs1 picked
-# slower tactics under it (12.69 -> 12.98 ms).
-gemm.split_launch_from = 2
+# Every row count is charged (kernel.gemm.split_launch_from stays 0). Bounding
+# it to two rows or more, on shared tactic caches: Gemma-4-31B bs1 12.97 ->
+# 12.96 ms (no charge at all 12.92), Flash-Next W4A4 bs64 18.4 -> 19.1.
 # A dense tcgen05 GEMM rasters 16 P tiles a band, not 8: at the power cap
 # (bf16, 16384-row prefill shapes, ~950 W) tc5 lands 1338 / 1182 / 1354
 # TFLOPS against 1254 / 1161 / 1348 at 8 (12 ties 16, 24 and 32 lose);
@@ -217,7 +216,8 @@ pdl = true
 # A dense bf16 product of 2 to 8 rows may time the few-rows kernel (one
 # launch, warps streaming the weight's rows) beside cuBLAS's split pairs:
 # DeepSeek-V4-Flash's narrow projections at 8 x 512 x 4096 4.7 us on the GPU
-# against 3.9 + 2.4; TPOT bs8 14.79 -> 14.56 ms.
+# against 3.9 + 2.4 (it takes N = 512 and 64; N = 256 and 1024 stay on
+# cuBLAS); TPOT bs8 13.27 -> 13.20 ms, three rounds on a shared tactic cache.
 gemm.rows_m = 8
 
 [compiler]
