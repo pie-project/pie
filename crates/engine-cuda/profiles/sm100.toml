@@ -153,8 +153,12 @@ gemm.nvfp4_k128 = true
 moe.w4a4_fused_from = 1
 # A W4A8 routed MLP (MXFP4 banks against e4m3 activations) kept by expert,
 # its GLU landing the down leg's e4m3 operand from the gate-up epilogue.
-# A fire of 64 routes or fewer stays apart.
-moe.w4a8_fused_from = 1
+# A fire of 64 routes or fewer stays apart, and so does a decode-wide one:
+# DeepSeek-V4-Flash at 0.95 share, prefill 32 x 4096 5.85 -> 5.41 s fused,
+# but a decode step at 64 requests 62.9 -> 70.0 ms (the fused gate-up GEMM
+# with its GLU epilogue reads the bank slower at ~2 routes an expert), so
+# from 512 tokens.
+moe.w4a8_fused_from = 512
 # A KDA prefill walks its chunks on the tensor cores (a chunk's update
 # directions in parallel, then the state chunk by chunk), not a row at a
 # time: its block asks 219 KiB of shared memory.

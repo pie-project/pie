@@ -494,8 +494,12 @@ fn check_w4a8(
     let glu = clamp.map_or(Glu::Swiglu, |limit| Glu::SwigluClamp { limit });
     let (up, up16) = w4a8_bank(&mut gpu, n_experts, 2 * inter, hidden, 0x71);
     let (down, down16) = w4a8_bank(&mut gpu, n_experts, hidden, inter, 0x72);
-    // B200's arm: the W4A8 routed MLP fused from the first token.
-    let ctx = gpu.ctx().with_tuning(crate::common::SM100);
+    // B200's arm, fused from the first token (the profile fuses from 512
+    // tokens; the arm is the same at any width).
+    let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+        moe_w4a8_fused_from: 1,
+        ..crate::common::SM100
+    });
     // Apart.
     let select_apart =
         |ctx: &kernels_cuda::Ctx, gpu: &mut Gpu, x: Tensor, bank: GluBank, n: usize| {
@@ -711,7 +715,10 @@ fn check_w4a8_weighted_first(
     let weights_t = Tensor::new(gpu.up(&weights), tokens as u32, top as u32, Dtype::F32);
     let (up, up16) = w4a8_bank(&mut gpu, n_experts, 2 * inter, hidden, 0x81);
     let (down, down16) = w4a8_bank(&mut gpu, n_experts, hidden, inter, 0x82);
-    let ctx = gpu.ctx().with_tuning(crate::common::SM100);
+    let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+        moe_w4a8_fused_from: 1,
+        ..crate::common::SM100
+    });
     let bf = |gpu: &mut Gpu, rows: usize, n: usize| {
         Tensor::new(gpu.zeros(rows * n * 2), rows as u32, n as u32, Dtype::Bf16)
     };
