@@ -498,6 +498,125 @@ __global__ void pool_gather_paged(
     }
 }
 
+// `pool_gather_paged` in one pass over 16-byte runs: a run of `head_dim / 8`
+// threads covers an entry's width eight columns a thread, the block's runs
+// split the window between them (each folding its share as an online
+// softmax), and the runs' partials merge through shared memory. The window's
+// slots are looked up once a block. 256 threads; `head_dim % 8 == 0`,
+// `head_dim / 8` divides 256.
+template <class T>
+__global__ void __launch_bounds__(256) pool_gather_vec(
+    const T* __restrict__ state_kv,
+    const T* __restrict__ state_score,
+    const float* __restrict__ ape,
+    const i32* __restrict__ boundary_pos,
+    const i32* __restrict__ boundary_req,
+    const u32* __restrict__ kv_page_indices,
+    const u32* __restrict__ kv_page_indptr,
+    T* __restrict__ out,
+    int head_dim,
+    int ratio,
+    int coff,
+    int page_size,
+    int state_pitch,
+    const u32* __restrict__ win) {
+    const int cb = blockIdx.x;
+    if (win != nullptr && cb >= static_cast<int>(win[0])) return;
+    const int c = win != nullptr ? cb + static_cast<int>(win[1]) : cb;
+    const int window = coff * ratio;
+    const int width = coff * head_dim;
+    const long long pitch = static_cast<long long>(state_pitch);
+    const int bpos = boundary_pos[c];
+    const int req = boundary_req[c];
+    const int run = head_dim / 8;
+    const int lane = static_cast<int>(threadIdx.x) % run;
+    const int group = static_cast<int>(threadIdx.x) / run;
+    const int groups = static_cast<int>(blockDim.x) / run;
+    T* orow = out + static_cast<long long>(c) * head_dim;
+
+    if (bpos < 0 || bpos >= owned_positions(kv_page_indptr, req, page_size)) {
+        if (group == 0) *reinterpret_cast<uint4*>(orow + lane * 8) = make_uint4(0u, 0u, 0u, 0u);
+        return;
+    }
+
+    extern __shared__ __align__(16) unsigned char pg_smem[];
+    long long* slots = reinterpret_cast<long long*>(pg_smem);
+    float* part = reinterpret_cast<float*>(pg_smem + ((window * 8 + 15) & ~15));
+    for (int i = threadIdx.x; i < window; i += blockDim.x) {
+        const int pos = bpos + i - (window - 1);
+        slots[i] = pos < 0 ? -1 : paged_slot(kv_page_indices, kv_page_indptr, req, pos, page_size);
+    }
+    __syncthreads();
+
+    float m[8], sum[8], acc[8];
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        m[u] = neg_inf();
+        sum[u] = 0.f;
+        acc[u] = 0.f;
+    }
+    for (int i = group; i < window; i += groups) {
+        const long long slot = slots[i];
+        if (slot < 0) continue;
+        const int pos = bpos + i - (window - 1);
+        const int col = ((i >= ratio) ? head_dim : 0) + lane * 8;
+        T sc[8], kv[8];
+        *reinterpret_cast<uint4*>(sc) = *reinterpret_cast<const uint4*>(state_score + slot * pitch + col);
+        *reinterpret_cast<uint4*>(kv) = *reinterpret_cast<const uint4*>(state_kv + slot * pitch + col);
+        float bias[8];
+        if (ape != nullptr) {
+            const float4* a = reinterpret_cast<const float4*>(ape + static_cast<long long>(pos % ratio) * width + col);
+            const float4 a0 = a[0], a1 = a[1];
+            bias[0] = a0.x; bias[1] = a0.y; bias[2] = a0.z; bias[3] = a0.w;
+            bias[4] = a1.x; bias[5] = a1.y; bias[6] = a1.z; bias[7] = a1.w;
+        } else {
+#pragma unroll
+            for (int u = 0; u < 8; ++u) bias[u] = 0.f;
+        }
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const float s = Elem<T>::to_f32(sc[u]) + bias[u];
+            const float v = Elem<T>::to_f32(kv[u]);
+            if (s > m[u]) {
+                const float r = __expf(m[u] - s);
+                sum[u] = sum[u] * r + 1.f;
+                acc[u] = acc[u] * r + v;
+                m[u] = s;
+            } else if (s > neg_inf()) {
+                const float e = __expf(s - m[u]);
+                sum[u] += e;
+                acc[u] = fmaf(e, v, acc[u]);
+            }
+        }
+    }
+    // Partials laid out [group][value][lane][8].
+    float* mine = part + static_cast<long long>(group) * 3 * head_dim + lane * 8;
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        mine[u] = m[u];
+        mine[head_dim + u] = sum[u];
+        mine[2 * head_dim + u] = acc[u];
+    }
+    __syncthreads();
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float mx = neg_inf();
+        for (int g = 0; g < groups; ++g) mx = fmaxf(mx, part[g * 3 * head_dim + d]);
+        float o = 0.f;
+        if (isfinite(mx)) {
+            float se = 0.f, a = 0.f;
+            for (int g = 0; g < groups; ++g) {
+                const float mg = part[g * 3 * head_dim + d];
+                if (!(mg > neg_inf())) continue;
+                const float r = __expf(mg - mx);
+                se = fmaf(part[g * 3 * head_dim + head_dim + d], r, se);
+                a = fmaf(part[g * 3 * head_dim + 2 * head_dim + d], r, a);
+            }
+            o = se > 0.f ? a / se : 0.f;
+        }
+        orow[d] = Elem<T>::from_f32(o);
+    }
+}
+
 template <class T>
 __global__ void pool_store_entries(
     const T* __restrict__ entries,

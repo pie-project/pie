@@ -372,9 +372,12 @@ pub struct SsmGdnFusedScan;
 pub struct SsmGdnTc5;
 
 /// Whether the row kernels a prefill streams run their bandwidth-shaped
-/// forms: a 128- or 256-wide RMS norm a warp a row (per head or whole),
-/// and the q/gate cut and sigmoid gate 16 bytes a lane; off, the
-/// block-a-row and element-a-thread forms serve them as before.
+/// forms: a 128- or 256-wide RMS norm a warp a row (per head or whole), a
+/// scale-free per-head norm of whole 256-element runs a warp a head, the
+/// q/gate cut and sigmoid gate 16 bytes a lane, the rotation of a head's
+/// tail four pairs a thread, and DeepSeek-V4's pool gather in one pass over
+/// 16-byte runs; off, the block-a-row and element-a-thread forms serve them
+/// as before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.elemwise.rows_vec", flag, default = false, tune = search)]
 pub struct ElemwiseRowsVec;

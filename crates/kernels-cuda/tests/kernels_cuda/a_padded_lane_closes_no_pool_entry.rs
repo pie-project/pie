@@ -9,6 +9,7 @@ use crate::common::{Gpu, Lcg};
 use dtype::Dtype;
 use kernels_cuda::attn::pool;
 use kernels_cuda::tensor::{KvPool, RaggedTensor, Tensor};
+use kernels_cuda::tuning::Tuning;
 
 const PAGE: usize = 16;
 
@@ -41,7 +42,8 @@ fn pool_of(gpu: &mut Gpu, keys: u64, pages: &[u32], indptr: &[u32], width: usize
 #[test]
 fn a_padded_lane_closes_no_pool_entry() {
     a_row_past_the_live_lanes_is_no_boundary();
-    a_lane_without_pages_gathers_nothing();
+    a_lane_without_pages_gathers_nothing(false);
+    a_lane_without_pages_gathers_nothing(true);
 }
 
 fn a_row_past_the_live_lanes_is_no_boundary() {
@@ -90,7 +92,7 @@ fn a_row_past_the_live_lanes_is_no_boundary() {
     }
 }
 
-fn a_lane_without_pages_gathers_nothing() {
+fn a_lane_without_pages_gathers_nothing(vec: bool) {
     // Request 0 owns page 0; request 2 is a padded lane owning [1, 1). Both
     // rows name position 7 as their boundary. A third row past the staged
     // window holds what an earlier fire left there.
@@ -109,7 +111,10 @@ fn a_lane_without_pages_gathers_nothing() {
     let breq = Tensor::new(gpu.up(&[0i32, 2, -123_456_789]), 3, 1, Dtype::I32);
     let out_at = gpu.up(&vec![0x3f80u16; 3 * d]);
     let win_at = gpu.up(&[2u32, 0, 3, 0]);
-    let ctx = gpu.ctx();
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        rows_vec: vec,
+        ..Tuning::DEFAULT
+    });
     ctx.arm_stage(win_at);
     pool::gather(
         &ctx,

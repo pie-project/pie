@@ -3,7 +3,7 @@ use dtype::Dtype;
 
 use crate::attn::kv;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, nonzero, refuse, symbol,
 };
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
@@ -224,6 +224,44 @@ pub fn gather(
             }
         }
     };
+    let pitch = count(OP, "the state plane's row pitch", state_kv.width)?;
+    // One pass over 16-byte runs, the window split across the block.
+    let run = head_dim / 8;
+    if ctx.tuning().rows_vec
+        && head_dim % 8 == 0
+        && run > 0
+        && 256 % run == 0
+        && pitch % 8 == 0
+        && [state_kv.ptr, state_score.ptr, entries.ptr]
+            .iter()
+            .all(|&at| aligned16(at))
+        && (ape.is_absent() || aligned16(ape.ptr))
+    {
+        let window = (coff * ratio).unsigned_abs();
+        let smem = (window * 8).next_multiple_of(16)
+            + 256 / run.unsigned_abs() * 3 * head_dim.unsigned_abs() * 4;
+        return ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::attn::pool_gather_vec<::pie::bf16>")
+                .apply(Launch::grid([boundary_pos.rows, 1, 1], [256, 1, 1]).smem(smem)),
+            &[
+                state_kv.arg(),
+                state_score.arg(),
+                ape.arg(),
+                boundary_pos.arg(),
+                boundary_req.arg(),
+                pages.page_indices.arg(),
+                pages.page_indptr.arg(),
+                entries.arg(),
+                head_dim.arg(),
+                ratio.arg(),
+                coff.arg(),
+                pages.page_size.arg(),
+                pitch.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::pool_gather_paged<::pie::bf16>")
@@ -241,7 +279,7 @@ pub fn gather(
             ratio.arg(),
             coff.arg(),
             pages.page_size.arg(),
-            count(OP, "the state plane's row pitch", state_kv.width)?.arg(),
+            pitch.arg(),
             ctx.stage(),
         ],
     )
