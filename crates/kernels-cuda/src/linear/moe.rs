@@ -1222,8 +1222,12 @@ fn experts_w4a8_as(
     let count = tokens * routes.width;
     let experts = up_codes.rows;
     let (k, n) = (x.width, y.width);
-    // SwiGLU and its clamp land from the epilogue as the apart GLU does.
-    let glu_taken = matches!(glu, tc5::Glu::Swiglu | tc5::Glu::SwigluClamp { .. });
+    // SwiGLU, its clamp and SiTU land from the epilogue as the apart GLU
+    // does.
+    let glu_taken = matches!(
+        glu,
+        tc5::Glu::Swiglu | tc5::Glu::SwigluClamp { .. } | tc5::Glu::Situ { .. }
+    );
     if count <= act_quant::MASKED_FIRE
         || tokens < ctx.tuning().moe_w4a8_fused_from
         || !glu_taken
@@ -1920,6 +1924,7 @@ fn select_mxfp4_mma(
         Some(Glu::SwigluClamp { limit }) => (2, limit, 1.0),
         Some(Glu::SwigluClampAlpha { limit, alpha }) => (3, limit, alpha),
         Some(Glu::GegluTanh) => (4, 0.0, 1.0),
+        Some(Glu::Situ { beta, cap }) => (5, beta, cap),
     };
     // A CTA lands 128 rows, or 64 GLU columns (their gate and up rows).
     let cols = if glu.is_some() { 64 } else { 128 };

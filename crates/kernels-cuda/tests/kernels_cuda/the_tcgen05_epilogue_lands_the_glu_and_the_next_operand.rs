@@ -28,6 +28,11 @@ fn glu(f: Glu, g: f64, u: f64) -> f64 {
             let inner = (2.0 / std::f64::consts::PI).sqrt() * (g + 0.044_715 * g * g * g);
             0.5 * g * (1.0 + inner.tanh()) * u
         }
+        Glu::Situ { beta, cap } => {
+            let (b, c) = (f64::from(beta), f64::from(cap));
+            let u = if c > 0.0 { c * (u / c).tanh() } else { u };
+            b * (g / b).tanh() / (1.0 + (-g).exp()) * u
+        }
     }
 }
 
@@ -452,6 +457,26 @@ fn the_tcgen05_epilogue_lands_the_glu_and_the_next_operand_every_case() {
         false,
     );
     dense(bf, bf, Some(Glu::GegluTanh), 0, 20, [192, 512], true, false);
+    // SiTU (Kimi-K3's), capped and not.
+    let situ = Some(Glu::Situ {
+        beta: 4.0,
+        cap: 25.0,
+    });
+    dense(bf, bf, situ, 0, 130, [256, 512], false, false);
+    dense(
+        bf,
+        bf,
+        Some(Glu::Situ {
+            beta: 1.0,
+            cap: 0.0,
+        }),
+        0,
+        20,
+        [256, 512],
+        true,
+        false,
+    );
+    dense(ds, w4, situ, 1, 140, [256, 512], false, false);
     dense(ds, ds, alpha, 0, 129, [384, 640], false, true);
     dense(bf, bf, None, 0, 150, [256, 512], false, true);
     dense(nv, nv, None, 0, 7, [256, 512], true, true);

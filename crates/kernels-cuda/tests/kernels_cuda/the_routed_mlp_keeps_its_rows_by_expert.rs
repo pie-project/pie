@@ -7,7 +7,7 @@
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::act_quant::{self, AlphaFrom, Format, scales_to_atoms};
-use kernels_cuda::linear::mlp::{swiglu, swiglu_clamp, swiglu_clamp_routed};
+use kernels_cuda::linear::mlp::{situ, swiglu, swiglu_clamp, swiglu_clamp_routed};
 use kernels_cuda::linear::moe::{
     ExpertTable, GluBank, GroupSeat, experts, experts_weighted_first, matmul_select,
     matmul_select_quant, select_glu, sigmoid_gate_add, sum_add, weighted_sum,
@@ -480,7 +480,7 @@ fn check_w4a8(
     n_experts: usize,
     top: usize,
     gated: bool,
-    clamp: Option<f32>,
+    glu: Glu,
 ) {
     let mut gpu = Gpu::open();
     let mut lcg = Lcg::seeded(0x4a8 ^ tokens as u64);
@@ -491,7 +491,6 @@ fn check_w4a8(
     let x = Tensor::new(gpu.up(&x_raw), tokens as u32, hidden as u32, Dtype::Bf16);
     let routes_t = Tensor::new(gpu.up(&routes), tokens as u32, top as u32, Dtype::I32);
     let weights_t = Tensor::new(gpu.up(&weights), tokens as u32, top as u32, Dtype::F32);
-    let glu = clamp.map_or(Glu::Swiglu, |limit| Glu::SwigluClamp { limit });
     let (up, up16) = w4a8_bank(&mut gpu, n_experts, 2 * inter, hidden, 0x71);
     let (down, down16) = w4a8_bank(&mut gpu, n_experts, hidden, inter, 0x72);
     // B200's arm, fused from the first token (the profile fuses from 512
@@ -542,9 +541,18 @@ fn check_w4a8(
         inter as u32,
         Dtype::Bf16,
     );
-    match clamp {
-        Some(limit) => swiglu_clamp(&ctx, packed, inter as u32, 1, limit, &mut h),
-        None => swiglu(&ctx, packed, inter as u32, 1, &mut h),
+    match glu {
+        Glu::SwigluClamp { limit } => swiglu_clamp(&ctx, packed, inter as u32, 1, limit, &mut h),
+        Glu::Situ { beta, cap } => situ(
+            &ctx,
+            packed,
+            inter as u32,
+            1,
+            beta,
+            (cap > 0.0).then_some(cap),
+            &mut h,
+        ),
+        _ => swiglu(&ctx, packed, inter as u32, 1, &mut h),
     }
     .expect("the GLU fires");
     let r = select_apart(&ctx, &mut gpu, h, down, hidden);
@@ -849,13 +857,39 @@ fn the_routed_mlp_keeps_its_rows_by_expert_every_case() {
     // W4A8 (MiMo's and DeepSeek's MXFP4 against e4m3): contiguous fires, what
     // the four apart land.
     for gated in [false, true] {
-        check_w4a8(64, 512, 256, 64, 10, gated, None);
-        check_w4a8(300, 256, 128, 16, 4, gated, None);
+        check_w4a8(64, 512, 256, 64, 10, gated, Glu::Swiglu);
+        check_w4a8(300, 256, 128, 16, 4, gated, Glu::Swiglu);
     }
     // GLM-5.3-Flash's clamped SwiGLU, as the epilogue lands it.
     for gated in [false, true] {
-        check_w4a8(300, 256, 128, 16, 4, gated, Some(7.0));
+        check_w4a8(300, 256, 128, 16, 4, gated, Glu::SwigluClamp { limit: 7.0 });
     }
+    // Kimi-K3's SiTU (its gate's beta 4, its up capped at 25), and the
+    // uncapped form.
+    check_w4a8(
+        300,
+        256,
+        128,
+        16,
+        4,
+        false,
+        Glu::Situ {
+            beta: 4.0,
+            cap: 25.0,
+        },
+    );
+    check_w4a8(
+        64,
+        512,
+        256,
+        64,
+        10,
+        false,
+        Glu::Situ {
+            beta: 1.0,
+            cap: 0.0,
+        },
+    );
     // DeepSeek's W4A8 (its weights before the down leg, a plain sum and the
     // shared row): its decode64 fire (64 tokens at top 6) and a prefill.
     check_w4a8_weighted_first(64, 512, 256, 64, 6);

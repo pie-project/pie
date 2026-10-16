@@ -63,7 +63,7 @@ __device__ __forceinline__ unsigned ld_scale(const u8* p) {
 }
 
 /// A GLU of the gate and up rows (1 swiglu, 2 clamped, 3 clamped with
-/// alpha, 4 GeGLU's tanh form), as the tcgen05 epilogue spells them.
+/// alpha, 4 GeGLU's tanh form, 5 SiTU), as the tcgen05 epilogue spells them.
 template <int kGlu>
 __device__ __forceinline__ float glu(float g, float u, float limit, float galpha) {
     if constexpr (kGlu == 1) {
@@ -73,6 +73,18 @@ __device__ __forceinline__ float glu(float g, float u, float limit, float galpha
         const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
         asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(inner));
         return 0.5f * g * (1.f + t) * u;
+    } else if constexpr (kGlu == 5) {
+        // SiTU (Kimi-K3's `mlp_situ`): beta tanh(g / beta) sigmoid(g), times
+        // the up value, capped as cap tanh(u / cap) under a cap (`galpha`,
+        // 0 for none). `limit` holds beta.
+        float t;
+        asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(__fdividef(g, limit)));
+        if (galpha > 0.f) {
+            float c;
+            asm("tanh.approx.f32 %0, %1;" : "=f"(c) : "f"(__fdividef(u, galpha)));
+            u = galpha * c;
+        }
+        return __fdividef(limit * t, 1.f + __expf(-g)) * u;
     } else {
         g = fminf(g, limit);
         u = fminf(fmaxf(u, -limit), limit);

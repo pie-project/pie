@@ -486,6 +486,10 @@ pub enum Glu {
     SwigluClampAlpha { limit: f32, alpha: f32 },
     /// `gelu_tanh(g) * u` (`mlp_geglu_tanh_packed`).
     GegluTanh,
+    /// `beta * tanh(g / beta) * sigmoid(g) * u'`, `u' = cap * tanh(u / cap)`
+    /// under a cap (`cap > 0`), `u` else (`mlp_situ`; its tanh the fast
+    /// one).
+    Situ { beta: f32, cap: f32 },
 }
 
 /// Where the epilogue lands its `rows x n` result.
@@ -561,6 +565,7 @@ impl Epilogue {
             Some(Glu::SwigluClamp { .. }) => 2,
             Some(Glu::SwigluClampAlpha { .. }) => 3,
             Some(Glu::GegluTanh) => 4,
+            Some(Glu::Situ { .. }) => 5,
         }
     }
 
@@ -599,6 +604,7 @@ impl Epilogue {
         let (limit, galpha) = match self.glu {
             Some(Glu::SwigluClamp { limit }) => (limit, 1.0),
             Some(Glu::SwigluClampAlpha { limit, alpha }) => (limit, alpha),
+            Some(Glu::Situ { beta, cap }) => (beta, cap),
             _ => (0.0, 1.0),
         };
         let (q, qs, gscale) = match self.out {

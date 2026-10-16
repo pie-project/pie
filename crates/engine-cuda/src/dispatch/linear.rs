@@ -1165,6 +1165,21 @@ impl Run<'_> {
                 y,
                 intermediate,
             } => (packed, y, intermediate, Glu::GegluTanh),
+            Linear::MlpSitu {
+                packed,
+                y,
+                intermediate,
+                beta,
+                up_cap,
+            } => (
+                packed,
+                y,
+                intermediate,
+                Glu::Situ {
+                    beta,
+                    cap: up_cap.unwrap_or(0.0),
+                },
+            ),
             _ => return Ok(false),
         };
         let Linear::MoeWeightedSum {
