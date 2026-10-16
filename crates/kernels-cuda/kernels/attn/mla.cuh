@@ -44,6 +44,37 @@ __global__ void mla_split_q_b(
     }
 }
 
+// `mla_split_q_b` eight elements a thread (16-byte runs), for a cut whose
+// halves are whole runs: `runs` the 8-element runs of every row's heads.
+template <class T>
+__global__ void mla_split_q_b_vec8(
+    const T* __restrict__ q_b,
+    T* __restrict__ q_nope,
+    T* __restrict__ q_pe,
+    long long runs,
+    int heads,
+    int nope,
+    int rope,
+    const u32* __restrict__ win)
+{
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= runs) return;
+    const int per = (nope + rope) / 8;
+    const int d = static_cast<int>(i % per) * 8;
+    const long long hn = i / per;
+    const int h = static_cast<int>(hn % heads);
+    const long long n = hn / heads;
+    if (win != nullptr && n >= static_cast<long long>(win[0])) return;
+    const long long n_row = win != nullptr ? n + static_cast<long long>(win[1]) : n;
+    const long long head = n_row * heads + h;
+    const uint4 v = *reinterpret_cast<const uint4*>(q_b + head * (nope + rope) + d);
+    if (d < nope) {
+        *reinterpret_cast<uint4*>(q_nope + head * nope + d) = v;
+    } else {
+        *reinterpret_cast<uint4*>(q_pe + head * rope + (d - nope)) = v;
+    }
+}
+
 template <class T, int BLOCK_DIM = 256>
 __global__ void mla_latents(
     const T* __restrict__ kv_a,

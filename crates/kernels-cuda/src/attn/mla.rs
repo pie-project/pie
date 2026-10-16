@@ -184,6 +184,32 @@ pub fn split_q_b(
     let nope = stated(OP, nope_dim)?;
     let rope = stated(OP, rope_dim)?;
     let width = i64::from(heads) * (i64::from(nope) + i64::from(rope));
+    // Whole 16-byte runs a half: eight elements a thread, and an i64 count
+    // (a prefill's cut passes i32 elements).
+    if nope % 8 == 0 && rope % 8 == 0 && [q_b.ptr, q_nope.ptr, q_pe.ptr].iter().all(|p| p % 16 == 0)
+    {
+        let runs = i64::from(q_b.rows) * width / 8;
+        let blocks = u32::try_from((runs + i64::from(BLOCK) - 1) / i64::from(BLOCK))
+            .map_err(|_| refuse(OP, format!("{runs} runs overflow a launch")))?;
+        return ctx.fire(
+            OP,
+            Fire::at(
+                "attn/mla.cuh",
+                crate::jit::symbol(&format!("::pie::attn::mla_split_q_b_vec8<{t}>")),
+            )
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+            &[
+                q_b.arg(),
+                q_nope.arg(),
+                q_pe.arg(),
+                ArgValue::I64(runs),
+                heads.arg(),
+                nope.arg(),
+                rope.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     let total = i64::from(q_b.rows) * width;
     let total = i32::try_from(total).map_err(|_| {
         refuse(
