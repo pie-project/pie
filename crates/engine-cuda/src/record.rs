@@ -924,7 +924,10 @@ impl Bodies {
             return Ok(());
         }
 
-        walk_capture(at, run, place, Streams::Serial)?;
+        // The warm fires walk the streams the capture will: a side stream's
+        // regions take their own slabs (`scratch_stream` scopes by stream),
+        // which a capture cannot grow.
+        walk_capture(at, run, place, Streams::Forked)?;
 
         if self.sealed_decline() {
             let declines = self.recorder.bstats.sealed_declines;

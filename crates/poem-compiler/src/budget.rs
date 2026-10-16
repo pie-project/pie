@@ -179,6 +179,10 @@ pub struct DeviceProfile {
 
     pub fork_floor_us: f32,
 
+    /// Whether a join's independent branches (`branch::blocks`) are forked
+    /// onto side streams.
+    pub branches: bool,
+
     pub family_us: FamilyCosts,
 
     pub exclusive: Vec<String>,
@@ -265,6 +269,7 @@ impl Default for DeviceProfile {
             fat_region_us: 250.0,
             side_streams: 2,
             fork_floor_us: 20.0,
+            branches: false,
             family_us: FamilyCosts::default(),
             exclusive: Vec::new(),
             grouped: Vec::new(),

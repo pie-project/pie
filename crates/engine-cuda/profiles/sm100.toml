@@ -197,3 +197,10 @@ gemm.split_launch_ns = 2000
 # TFLOPS against 1254 / 1161 / 1348 at 8 (12 ties 16, 24 and 32 lose);
 # DeepSeek-V4-Flash's fp8 prefill 10.37k / 10.57k -> 10.57k / 10.58k tok/s.
 gemm.tc5_raster = 16
+
+[compiler]
+# A join's independent chains forked onto side streams (the shared and routed
+# experts a MoE sums, an attention's query chain beside its key/value or index
+# chain), as vLLM runs DeepSeek-V4's: Flash decodes one row at 10.78 -> 10.13
+# ms a token, 8 rows at 14.70 -> 13.80, 64 rows level (50.96 -> 50.55).
+branches = true

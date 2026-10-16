@@ -1,4 +1,5 @@
 pub mod arena;
+pub mod branch;
 pub mod budget;
 pub mod catalog;
 pub mod compiled;
@@ -72,7 +73,18 @@ pub fn compile_axes(
 
     struct_readers_share_one_window(trace, &classes)?;
 
-    let mut regions = region::coalesce(trace, &classes)?;
+    // Branches the trace lays side by side (`branch::split`), where the
+    // profile forks them: each its own region.
+    let blocks = if profile.branches {
+        branch::blocks(trace)
+    } else {
+        Vec::new()
+    };
+    let breaks: std::collections::BTreeSet<u32> = blocks
+        .iter()
+        .flat_map(|b| b.branches.iter().map(|r| r.start).chain([b.join]))
+        .collect();
+    let mut regions = region::coalesce_breaking(trace, &classes, &breaks)?;
 
     region::hoist(trace, &mut regions)?;
 
@@ -80,7 +92,7 @@ pub fn compile_axes(
 
     lowering::lower(trace, &mut regions, &classes, budget, profile);
 
-    let streams = stream::fork(trace, &mut regions, profile);
+    let streams = stream::fork_with(trace, &mut regions, profile, &blocks);
     let concurrency =
         Concurrency::with_pairs(&regions, trace.nodes.len(), streams.pairs.iter().copied());
 

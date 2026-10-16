@@ -35,6 +35,14 @@ micros! {
 #[decision(id = "compiler.side_streams", constant(range(0..=8)), default = 2, tune = engine)]
 pub struct SideStreams(pub u32);
 
+/// Whether a join's independent branches (the shared and routed experts a
+/// MoE sums, the query, key/value and index chains an attention reads) are
+/// laid side by side and forked onto side streams. Off but where a chip's
+/// profile turns it on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "compiler.branches", flag, default = false, tune = engine)]
+pub struct Branches;
+
 /// Register the cost decisions, with this backend's own side-stream default.
 pub fn register(registry: &mut Registry, side_streams: u32) {
     registry
@@ -50,6 +58,7 @@ pub fn register(registry: &mut Registry, side_streams: u32) {
         .add::<CollectiveUs>()
         .add::<CustomUs>()
         .add::<SpatialUs>()
+        .add::<Branches>()
         .add_defaulting::<SideStreams>(&side_streams.to_string());
 }
 
@@ -68,6 +77,8 @@ impl DeviceProfile {
             fat_region_us: us(profile.get::<FatRegionUs>().0),
             side_streams: profile.get::<SideStreams>().0,
             fork_floor_us: us(profile.get::<ForkFloorUs>().0),
+            branches: profile.on::<Branches>(&profile::Anywhere),
+
             family_us: FamilyCosts {
                 attention: us(profile.get::<AttentionUs>().0),
                 linear: us(profile.get::<LinearUs>().0),
