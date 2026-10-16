@@ -23,7 +23,7 @@ use cudarc::runtime::sys::{
     cudaStreamSynchronize,
 };
 
-use super::gemv::{gemm_narrow_bf16, gemv_bf16};
+use super::gemv::{gemm_narrow_bf16, gemm_rows_bf16, gemv_bf16};
 use crate::jit::device::capture_status;
 use crate::jit::{Ctx, refuse};
 
@@ -63,6 +63,9 @@ enum Tactic {
     Lt(usize),
     /// `gemm_narrow_bf16`: a block a row, at most eight columns.
     Narrow,
+    /// `gemm_rows_bf16`: a few rows in one launch, warps streaming the
+    /// weight's rows.
+    Rows,
 }
 
 impl Tactic {
@@ -72,6 +75,7 @@ impl Tactic {
             Self::Lt(algo) => (1, i32::try_from(algo).unwrap_or(0)),
             Self::Gemv => (2, 0),
             Self::Narrow => (3, 0),
+            Self::Rows => (4, 0),
         }
     }
 
@@ -81,6 +85,7 @@ impl Tactic {
             1 => usize::try_from(algo).ok().map(Self::Lt),
             2 => Some(Self::Gemv),
             3 => Some(Self::Narrow),
+            4 => Some(Self::Rows),
             _ => None,
         }
     }
@@ -119,6 +124,7 @@ pub(crate) fn act_x_wt(
             tuning.gemm_heuristics as usize,
             tuning.gemm_narrow_n,
             tuning.gemm_split_launch_ns,
+            tuning.gemm_rows_m,
         );
         let plan = device.plan_for(call);
         let tactic = capturing
@@ -159,7 +165,7 @@ pub(crate) fn act_x_wt(
             ws_bytes,
         )
     {
-        return Ok(tactic == Tactic::Gemv && bias != 0);
+        return Ok(matches!(tactic, Tactic::Gemv | Tactic::Rows) && bias != 0);
     }
     clear_error();
 
@@ -226,6 +232,17 @@ fn run_tactic(
                 )
                 .is_ok()
         }
+        Tactic::Rows => gemm_rows_bf16(
+            &unsafe { Ctx::on(stream) },
+            call.w,
+            call.act,
+            call.bias,
+            call.y,
+            call.m,
+            call.n,
+            call.k,
+        )
+        .is_ok(),
         Tactic::Narrow => gemm_narrow_bf16(
             &unsafe { Ctx::on(stream) },
             call.w,
@@ -665,6 +682,9 @@ struct Device {
     /// `kernel.gemm.split_launch_ns`: what a K-splitting algorithm's own
     /// reduce launch costs a captured step past its timing, or 0.
     split_ns: u32,
+    /// `kernel.gemm.rows_m`: products of 2 to this many rows may time the
+    /// few-rows kernel.
+    rows_m: u32,
     plans: HashMap<(i32, i32, i32), Arc<LtPlan>>,
     chosen: HashMap<u64, Tactic>,
     disk: DiskCache,
@@ -686,6 +706,7 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
                 heuristics: 8,
                 narrow_n: 0,
                 split_ns: 0,
+                rows_m: 0,
                 plans: HashMap::new(),
                 chosen: HashMap::new(),
                 disk: DiskCache::new(),
@@ -708,16 +729,19 @@ impl Device {
         heuristics: usize,
         narrow_n: u32,
         split_ns: u32,
+        rows_m: u32,
     ) {
         if self.lt.workspace_bytes != workspace_bytes
             || self.heuristics != heuristics
             || self.narrow_n != narrow_n
             || self.split_ns != split_ns
+            || self.rows_m != rows_m
         {
             self.lt.workspace_bytes = workspace_bytes;
             self.heuristics = heuristics;
             self.narrow_n = narrow_n;
             self.split_ns = split_ns;
+            self.rows_m = rows_m;
             self.plans.clear();
             self.chosen.clear();
         }
@@ -759,6 +783,13 @@ impl Device {
             self.narrow_n,
             self.split_ns,
         );
+        // A shape the few-rows kernel may serve keys apart from the one it
+        // may not.
+        let key = if rows_tried(call, self.rows_m) {
+            key ^ 0x726f_7773_0000_0000 ^ u64::from(self.rows_m)
+        } else {
+            key
+        };
         if let Some(tactic) = self.chosen.get(&key) {
             return Some(*tactic);
         }
@@ -787,6 +818,7 @@ impl Device {
             call,
             self.narrow_n,
             self.split_ns,
+            self.rows_m,
         );
         self.disk.store(key, tactic.encode());
         self.chosen.insert(key, tactic);
@@ -799,6 +831,12 @@ impl Device {
         );
         Some(tactic)
     }
+}
+
+/// Whether the tuner times the few-rows kernel for `call`
+/// (`kernel.gemm.rows_m`).
+fn rows_tried(call: Call, rows_m: u32) -> bool {
+    call.m >= 2 && call.m <= rows_m.min(8) as i32 && call.k % 8 == 0
 }
 
 fn shape_key(
@@ -842,6 +880,7 @@ fn tune(
     call: Call,
     narrow_n: u32,
     split_ns: u32,
+    rows_m: u32,
 ) -> Tactic {
     let mut candidates = Vec::new();
     if call.m == 1 {
@@ -854,6 +893,9 @@ fn tune(
     // Last, so a tie keeps cuBLAS.
     if call.n <= narrow_n as i32 && call.k % 8 == 0 {
         candidates.push(Tactic::Narrow);
+    }
+    if rows_tried(call, rows_m) {
+        candidates.push(Tactic::Rows);
     }
 
     let mut arena = TuneArena::empty();
@@ -883,7 +925,7 @@ fn tune(
         let two = match candidate {
             Tactic::Lt(i) => plan.is_some_and(|p| !one_launch(&p.heuristics[i].algo)),
             Tactic::GemmEx => true,
-            Tactic::Gemv | Tactic::Narrow => false,
+            Tactic::Gemv | Tactic::Narrow | Tactic::Rows => false,
         };
         let ms = if two { ms + split_ns as f32 * 1e-6 } else { ms };
         timings.push((candidate, ms));

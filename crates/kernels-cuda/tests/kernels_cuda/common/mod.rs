@@ -60,10 +60,22 @@ impl Gpu {
     pub fn ctx(&self) -> Ctx {
         // SAFETY: the stream outlives every fire in a test, and `Gpu`'s drop
         // synchronizes before destroying it.
-        unsafe {
+        let ctx = unsafe {
             Ctx::on(self.stream.cast())
                 .with_cublas(self.cublas.cast())
                 .with_slabs(self.slabs)
+        };
+        // `PIE_TEST_PDL=1` runs every test on this context with sm100's
+        // launch decisions on (programmatic dependents, split tickets).
+        if std::env::var("PIE_TEST_PDL").is_ok_and(|v| v == "1") {
+            let tuning = ctx.tuning();
+            ctx.with_tuning(kernels_cuda::tuning::Tuning {
+                pdl: true,
+                gemm_tc5_split_tickets: 65_536,
+                ..tuning
+            })
+        } else {
+            ctx
         }
     }
 

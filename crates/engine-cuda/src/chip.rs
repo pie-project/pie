@@ -690,6 +690,7 @@ mod tests {
         // DeepSeek-V4-Flash's decode, on a binary that read it: 1.6-3% TPOT.
         assert!(b200.pdl);
         assert_eq!(b200.gemm_tc5_split_tickets, 8);
+        assert_eq!(b200.gemm_rows_m, 8);
         for (major, minor) in [
             (8, 0),
             (8, 6),
@@ -726,6 +727,10 @@ mod tests {
             assert_eq!(
                 other.gemm_tc5_raster, 8,
                 "sm_{major}{minor} rasters its dense tcgen05 GEMM 8 tiles a band"
+            );
+            assert_eq!(
+                other.gemm_rows_m, 0,
+                "sm_{major}{minor} keeps a few-row dense product on cuBLAS"
             );
             assert!(
                 other.gemm_tc5_split_tickets == 0,

@@ -210,6 +210,12 @@ gemm.tc5_raster = 16
 gemm.tc5_split_tickets = 8
 pdl = true
 
+# A dense bf16 product of 2 to 8 rows may time the few-rows kernel (one
+# launch, warps streaming the weight's rows) beside cuBLAS's split pairs:
+# DeepSeek-V4-Flash's narrow projections at 8 x 512 x 4096 4.7 us on the GPU
+# against 3.9 + 2.4; TPOT bs8 14.79 -> 14.56 ms.
+gemm.rows_m = 8
+
 [compiler]
 # A join's independent chains forked onto side streams (the shared and routed
 # experts a MoE sums, an attention's query chain beside its key/value or index

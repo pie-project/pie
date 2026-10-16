@@ -186,4 +186,104 @@ __global__ void gemv_splitk_bf16_kernel(
     out[row] = v;
 }
 
+// `out[r][n] = act[r] . weight[n]` for a few rows (`kM` <= 8, a decode's):
+// each of a block's eight warps streams four weight rows' slice of K, a
+// weight vector of each against every activation row (read through L1, so
+// each activation load serves four weight loads), `kSplit` warps the rows'
+// slices; each warp's sums fold across its lanes, and a row's slices add in
+// slice order, so a launch lands the same bits each time. One launch, every
+// weight byte read once: a split GEMM's reduce launch saved.
+template <int kM, int kSplit>
+__global__ void __launch_bounds__(256) gemm_rows_bf16_kernel(
+    const bf16* __restrict__ weight,
+    const bf16* __restrict__ act,
+    const bf16* __restrict__ bias,
+    bf16* __restrict__ out,
+    int N, int K)
+{
+    static_assert(kM >= 1 && kM <= 8, "a few rows");
+    static_assert(8 % kSplit == 0, "a block's warps split evenly over its rows");
+    constexpr int kR = 2;                     // weight rows a warp
+    constexpr int kRows = 8 / kSplit * kR;    // weight rows a block
+    __shared__ float red[8][kR][kM];
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int row0 = static_cast<int>(blockIdx.x) * kRows + warp / kSplit * kR;
+    const int part = warp % kSplit;
+    const int vectors = K / 8;
+    const int per = vectors / kSplit;
+    float acc[kR][kM];
+#pragma unroll
+    for (int q = 0; q < kR; ++q) {
+#pragma unroll
+        for (int r = 0; r < kM; ++r) acc[q][r] = 0.f;
+    }
+    const uint4* x4 = reinterpret_cast<const uint4*>(act) + part * per;
+    const uint4* w4[kR];
+#pragma unroll
+    for (int q = 0; q < kR; ++q) {
+        // A row past N reads row N - 1 again and lands nothing.
+        const int row = min(row0 + q, N - 1);
+        w4[q] = reinterpret_cast<const uint4*>(weight + static_cast<long long>(row) * K) + part * per;
+    }
+#pragma unroll 4
+    for (int i = lane; i < per; i += 32) {
+        uint4 wv[kR];
+#pragma unroll
+        for (int q = 0; q < kR; ++q) wv[q] = __ldcs(w4[q] + i);
+#pragma unroll
+        for (int r = 0; r < kM; ++r) {
+            const uint4 xv = __ldg(x4 + static_cast<long long>(r) * vectors + i);
+            const unsigned xw[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+            for (int q = 0; q < kR; ++q) {
+                const unsigned ww[4] = {wv[q].x, wv[q].y, wv[q].z, wv[q].w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[q][r] = fmaf(__uint_as_float(ww[j] << 16), __uint_as_float(xw[j] << 16),
+                                     acc[q][r]);
+                    acc[q][r] = fmaf(__uint_as_float(ww[j] & 0xffff0000u),
+                                     __uint_as_float(xw[j] & 0xffff0000u), acc[q][r]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int q = 0; q < kR; ++q) {
+#pragma unroll
+        for (int r = 0; r < kM; ++r) {
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                acc[q][r] += __shfl_xor_sync(0xffffffffu, acc[q][r], off);
+            }
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int q = 0; q < kR; ++q) {
+#pragma unroll
+            for (int r = 0; r < kM; ++r) red[warp][q][r] = acc[q][r];
+        }
+    }
+    __syncthreads();
+    // Thread t lands block row t / kM's column for activation row t % kM.
+    for (int t = static_cast<int>(threadIdx.x); t < kRows * kM; t += 256) {
+        const int local = t / kM;
+        const int r = t % kM;
+        const int group = local / kR;   // the warp group holding the row
+        const int q = local % kR;
+        const int n = static_cast<int>(blockIdx.x) * kRows + local;
+        if (n < N) {
+            float s = red[group * kSplit][q][r];
+#pragma unroll
+            for (int p = 1; p < kSplit; ++p) s += red[group * kSplit + p][q][r];
+            bf16 v = f32_to_bf16(s);
+            if (bias != nullptr) {
+                v = f32_to_bf16(bf16_to_f32(v) + bf16_to_f32(bias[n]));
+            }
+            out[static_cast<long long>(r) * N + n] = v;
+        }
+    }
+}
+
 }

@@ -8,7 +8,7 @@ pub mod lane_gemm;
 #[cfg(feature = "cuda")]
 mod gemv;
 #[cfg(feature = "cuda")]
-pub use gemv::gemm_narrow_bf16;
+pub use gemv::{gemm_narrow_bf16, gemm_rows_bf16};
 pub mod skinny;
 
 pub mod lora;
