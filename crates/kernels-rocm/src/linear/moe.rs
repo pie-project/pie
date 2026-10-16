@@ -408,6 +408,16 @@ pub fn matmul_select(
     const OP: &str = "linear.moe_matmul_select";
 
     let fan = selected(OP, x, routes, y)?;
+    // Past 64 routes an expert at a decode batch, a bf16 bank on the matrix
+    // core's GEMM tile: items of 128 routes against 128 weight rows.
+    if let Some(count) = dense_experts(x, bank, y, experts)
+        && x.dtype == Dtype::Bf16
+        && x.width.is_multiple_of(64)
+        && count <= ORDER_EXPERT_CAP
+        && (65..=ctx.tuning().moe_dense_batch_until).contains(&fan.route_count.div_ceil(count))
+    {
+        return select_gemm(ctx, OP, x, bank, routes, y, &fan, count);
+    }
     // A wide decode batch over a resident bank: an item an expert's routes,
     // its weight read once.
     if let Some(count) = dense_experts(x, bank, y, experts)
@@ -692,6 +702,48 @@ fn wide_items(ctx: &Ctx, fan: &Selected, experts: u32, x: Tensor) -> Option<u32>
         107..=165 => 48,
         _ => 64,
     })
+}
+
+/// A bf16 bank's select on the GEMM tile (`linear/fp8.hip`'s eight-wave
+/// tile at bf16): routes ordered by expert into items of 128, each against
+/// 128 weight rows a block.
+#[allow(clippy::too_many_arguments)]
+fn select_gemm(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    fan: &Selected,
+    experts: u32,
+) -> Result<(), Error> {
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let ordered = route_order(ctx, op, routes, fan, experts, 128)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    // One slice of K: slicing measured no faster (GLM-5.3's mini, 96 to 160
+    // routes an expert).
+    ctx.fire(
+        op,
+        Fire::at("linear/fp8.hip", "::pie::linear::moe_bf16_gemm8")
+            .apply(Launch::grid([ordered.work_cap, y.width.div_ceil(128), 1], [2 * GROUP_BLOCK, 1, 1])),
+        &[
+            x.arg(),
+            ArgValue::Ptr(ordered.order),
+            ArgValue::Ptr(ordered.offsets),
+            ArgValue::Ptr(ordered.work),
+            bank.arg(),
+            y.arg(),
+            ArgValue::ABSENT,
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+            stated(op, y.rows)?.arg(),
+            stated(op, 2 * x.width / 128)?.arg(),
+        ],
+    )
 }
 
 /// A wide fire: routes ordered by expert into items of up to 4·`mw`, then

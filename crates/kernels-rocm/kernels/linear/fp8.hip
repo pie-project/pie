@@ -427,23 +427,29 @@ __device__ __forceinline__ void fp8_gemm_tile(const u8* __restrict__ act, const 
 // a stage's products fit beside two stages' reads in flight (set S holds a
 // stage while it waits for the LDS, the other the stage after). Otherwise as
 // `fp8_gemm_tile`.
+// FP8 false: a bf16 projection or bank against bf16 rows on the bf16 matrix
+// core, a stage 64 elements (the same 128 bytes a row), no scales to fold:
+// the tile at the decode batches past 64 routes an expert that the batch
+// legs read as many items.
+template <bool FP8 = true>
 __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const float* __restrict__ act_scales,
                                                const i32* __restrict__ order, int begin, int count,
                                                const u8* __restrict__ codes, const float* __restrict__ factors,
                                                bf16* __restrict__ out, int act_div, int n, int k, int tile, int s0,
                                                int s1, float* __restrict__ part) {
-    constexpr int THREADS = 512, TM = 128, TN = 128, KC = 128, PITCH = KC + 16;
+    constexpr int THREADS = 512, TM = 128, TN = 128, KC = 128, PITCH = KC + 16;  // KC: bytes a row a stage
     constexpr int NR = TN * KC / 16 / THREADS;  // 16-byte reads a thread a stage, each operand
-    constexpr int PER = 2 * NR + 2;             // a stage's reads: codes, scale, codes, factor
+    constexpr int PER = FP8 ? 2 * NR + 2 : 2 * NR;  // a stage's reads: codes, scale, codes, factor
+    constexpr int EB = FP8 ? 1 : 2;                 // bytes an element
     __shared__ __align__(16) u8 wl[TN * PITCH];
     __shared__ __align__(16) u8 xl[TM * PITCH];
     __shared__ float xsc[TM + 1];  // the rows' scales, then the weight's factor
     const int tid = threadIdx.x, l = lane(), r16 = l % 16, g = l / 16;
     const int wave = tid / kWave, wm = wave / 2, wn = wave % 2;  // wm: 32 activation rows, wn: 64 weight rows
     const int row0 = tile * TN;
-    const int kb = k / KC;
+    const int kb = k * EB / KC;  // stages
     auto route = [&](int m) { return order != nullptr ? order[begin + m] : begin + m; };
-    const moe_rsrc wr = batch_plane(codes, 1ull * n * k);
+    const moe_rsrc wr = batch_plane(codes, 1ull * EB * n * k);
 
     u32 wo[NR];
     const u8* xp[NR];
@@ -451,12 +457,13 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
 #pragma unroll
     for (int i = 0; i < NR; ++i) {
         const int r = (THREADS * i + tid) / 8;
-        wo[i] = static_cast<u32>(min(row0 + r, n - 1)) * static_cast<u32>(k) + 16 * (tid % 8);
+        wo[i] = static_cast<u32>(min(row0 + r, n - 1)) * static_cast<u32>(EB * k) + 16 * (tid % 8);
         xlive[i] = r < count;
-        xp[i] = act + static_cast<long long>(route(xlive[i] ? r : 0) / act_div) * k + 16 * (tid % 8);
+        xp[i] = act + static_cast<long long>(route(xlive[i] ? r : 0) / act_div) * EB * k + 16 * (tid % 8);
     }
-    const float* srow = act_scales + static_cast<long long>(route(min(tid % TM, max(count - 1, 0))) / act_div) * kb;
-    const float* frow = factors + static_cast<long long>(min(row0, n - 1) / 128) * kb;
+    const float* srow =
+        FP8 ? act_scales + static_cast<long long>(route(min(tid % TM, max(count - 1, 0))) / act_div) * kb : nullptr;
+    const float* frow = FP8 ? factors + static_cast<long long>(min(row0, n - 1) / 128) * kb : nullptr;
 
     i32x4 wv[2][NR], xv[2][NR];
     moe_i2 as[2], ws[2];
@@ -466,10 +473,10 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
         const int sc = min(s, last - 1);
 #pragma unroll
         for (int i = 0; i < NR; ++i) gload16(xv[S][i], xp[i] + sc * KC);
-        gload_run<4>(as[S], srow + sc);
+        if constexpr (FP8) gload_run<4>(as[S], srow + sc);
 #pragma unroll
         for (int i = 0; i < NR; ++i) bload_nt(wv[S][i], wr, s < last ? wo[i] + s * KC : kBatchVoid);
-        gload_run<4>(ws[S], frow + sc);
+        if constexpr (FP8) gload_run<4>(ws[S], frow + sc);
     };
     auto store = [&](auto set) {
         constexpr int S = decltype(set)::value;
@@ -484,8 +491,10 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
             *reinterpret_cast<i32x4*>(xl + flat / 8 * PITCH + 16 * (flat % 8)) =
                 xlive[i] ? xv[S][i] : i32x4{0, 0, 0, 0};
         }
-        if (tid < TM) xsc[tid] = __int_as_float(as[S][0]);
-        if (tid == TM) xsc[TM] = __int_as_float(ws[S][0]);
+        if constexpr (FP8) {
+            if (tid < TM) xsc[tid] = __int_as_float(as[S][0]);
+            if (tid == TM) xsc[TM] = __int_as_float(ws[S][0]);
+        }
     };
 
     fp8_f4 acc[4][2];
@@ -495,6 +504,25 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
         for (int mb = 0; mb < 2; ++mb) acc[nb][mb] = fp8_f4{0.f, 0.f, 0.f, 0.f};
 
     auto compute = [&]() {
+        if constexpr (!FP8) {
+            // bf16: four elements a lane a 16-wide k-step, the same bytes.
+#pragma unroll
+            for (int kk = 0; kk < KC / 32; ++kk) {
+                moe_u2 a[4], b[2];
+#pragma unroll
+                for (int nb = 0; nb < 4; ++nb)
+                    a[nb] = *reinterpret_cast<const moe_u2*>(wl + (wn * 64 + nb * 16 + r16) * PITCH + 32 * kk + 8 * g);
+#pragma unroll
+                for (int mb = 0; mb < 2; ++mb)
+                    b[mb] = *reinterpret_cast<const moe_u2*>(xl + (wm * 32 + mb * 16 + r16) * PITCH + 32 * kk + 8 * g);
+#pragma unroll
+                for (int nb = 0; nb < 4; ++nb)
+#pragma unroll
+                    for (int mb = 0; mb < 2; ++mb)
+                        acc[nb][mb] = mma16x16<bf16>(a[nb][0], a[nb][1], b[mb][0], b[mb][1], acc[nb][mb]);
+            }
+            return;
+        }
         const float wf = 4.f * xsc[TM];
         fp8_f4 p[4][2];
 #pragma unroll
@@ -559,7 +587,7 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
         for (int nb = 0; nb < 4; ++nb) {
             const int c = row0 + wn * 64 + nb * 16 + 4 * g;
             if (part != nullptr) {
-                float* q = part + static_cast<long long>(begin + m) * n;
+                float* q = part + static_cast<long long>(route(m)) * n;
                 if (c + 3 < n && n % 4 == 0) {
                     *reinterpret_cast<fp8_f4*>(q + c) = acc[nb][mb];
                 } else {
@@ -597,6 +625,25 @@ __global__ __launch_bounds__(512) void dense_fp8_gemm8(const u8* __restrict__ ac
     fp8_gemm_tile8(act + first * k, act_scales + first * (k / 128), nullptr, begin, min(128, m - begin), codes,
                    factors, y + first * n, 1, n, k, blockIdx.y, split * per, (split + 1) * per,
                    gridDim.z > 1 ? part + static_cast<long long>(split) * rows * n : nullptr);
+}
+
+// A bf16 bank's routed select past 64 routes an expert: one work item of up
+// to 128 routes of one expert a block row (grid (work cap, ⌈n / 128⌉)).
+// Slice z of K (`per` stages) of `gridDim.z`; under slices each one's f32
+// partial lands in `part` ([slices, routes, n], by route) for
+// `fp8_mfma_finalize`.
+__global__ __launch_bounds__(512) void moe_bf16_gemm8(const bf16* __restrict__ act, const i32* __restrict__ order,
+                                                      const i32* __restrict__ offsets, const i32* __restrict__ work,
+                                                      const bf16* __restrict__ bank, bf16* __restrict__ out,
+                                                      float* __restrict__ part, int act_div, int n, int k,
+                                                      int num_experts, int routes, int per) {
+    GroupItem item;
+    if (!group_item(offsets, work, num_experts, 128, item)) return;
+    const int split = static_cast<int>(blockIdx.z);
+    fp8_gemm_tile8<false>(reinterpret_cast<const u8*>(act), nullptr, order, item.begin, item.count,
+                          reinterpret_cast<const u8*>(bank + static_cast<long long>(item.expert) * n * k), nullptr,
+                          out, act_div, n, k, blockIdx.y, split * per, (split + 1) * per,
+                          gridDim.z > 1 ? part + static_cast<long long>(split) * routes * n : nullptr);
 }
 
 __global__ __launch_bounds__(512) void moe_fp8_gemm8(const u8* __restrict__ act, const float* __restrict__ act_scales,
