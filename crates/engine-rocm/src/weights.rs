@@ -170,14 +170,14 @@ pub fn prospect(
         .enumerate()
         .map(|(at, param)| (param.name.as_str(), at))
         .collect();
-    let planes = attachments(&landing, &index)?;
+    let planes = attachments(&landing, trace, &index)?;
     let ranking = crate::experts::Ranking::of(trace, &planes)?;
     Ok(Prospect { ranking, planes })
 }
 
-fn attachments(landing: &LoadPlan, index: &BTreeMap<&str, usize>) -> Result<Attachments> {
+fn attachments(landing: &LoadPlan, trace: &Trace, index: &BTreeMap<&str, usize>) -> Result<Attachments> {
     let mut planes = Attachments::new();
-    for (name, pairing) in pairings(landing, index)? {
+    for (name, pairing) in pairings(landing, trace, index)? {
         let Some(&at) = index.get(name) else {
             continue;
         };
@@ -626,8 +626,76 @@ struct Pairing {
     biases: Option<usize>,
 }
 
+/// Every e4m3 plane beside f32 block factors (an `e4m3tile128` projection
+/// or bank) made canonical for the FP8 matrix core, which reads e4m3fnuz:
+/// negative zero as zero (fnuz's NaN; the value it is), and a plane holding
+/// a NaN code (0x7f, 0xff: numbers to fnuz) refused.
+fn canonical_fp8(
+    trace: &Trace,
+    index: &BTreeMap<&str, usize>,
+    places: &[Place],
+    store: &Buffer,
+    tier: Option<&crate::experts::Tier>,
+    stream: *mut core::ffi::c_void,
+) -> Result<()> {
+    let mut nans: Option<Buffer> = None;
+    // SAFETY: `stream` is the load's stream, live for the load.
+    let ctx = unsafe { kernels_rocm::Ctx::on(stream.cast()) };
+    let mut planes = Vec::new();
+    for (at, param) in trace.params.iter().enumerate() {
+        if param.dtype != Dtype::E4m3 {
+            continue;
+        }
+        let factors = format!("{}{}", param.name, poem_ir::SCALES);
+        let Some(&scales) = index.get(factors.as_str()) else {
+            continue;
+        };
+        if trace.params[scales].dtype != Dtype::F32 {
+            continue;
+        }
+        if tier.is_some_and(|tier| tier.handles(at).is_some() || tier.group_handles(at).is_some()) {
+            return Err(Fault::Param {
+                name: param.name.clone(),
+                why: "is an fp8 bank the expert tier seats from host memory; the FP8 matrix core \
+                      reads its codes made canonical on the device, so it must be resident",
+            });
+        }
+        let bytes: u64 = param.shape.iter().product();
+        let counter = match nans.as_ref() {
+            Some(buffer) => buffer.ptr(),
+            None => nans.insert(Buffer::zeroed(4)?).ptr(),
+        };
+        kernels_rocm::linear::act_quant::e4m3fn_canonical(
+            &ctx,
+            "linear.matmul_act_quant",
+            address(tier, store, places[at].offset, at)?,
+            bytes,
+            counter,
+        )?;
+        planes.push(at);
+    }
+    let Some(nans) = nans else {
+        return Ok(());
+    };
+    // SAFETY: the load's stream, live for the load.
+    crate::device::ctx::check("hipStreamSynchronize", unsafe {
+        kernels_rocm::hip::rt::hipStreamSynchronize(stream.cast())
+    })?;
+    let mut count = [0u8; 4];
+    nans.read(0, &mut count)?;
+    if u32::from_le_bytes(count) != 0 {
+        return Err(Fault::Param {
+            name: trace.params[planes[0]].name.clone(),
+            why: "is one of the fp8 planes, which together hold NaN codes (0x7f, 0xff); the FP8 \
+                  matrix core reads e4m3fnuz, where they are numbers, so this load refuses them",
+        });
+    }
+    Ok(())
+}
+
 fn pairings<'a>(
     landing: &'a LoadPlan,
+    trace: &'a Trace,
     index: &BTreeMap<&str, usize>,
 ) -> Result<BTreeMap<&'a str, Pairing>> {
     let named: BTreeMap<u32, &str> = landing
@@ -692,6 +760,20 @@ fn pairings<'a>(
                 biases,
             },
         );
+    }
+    // An fp8 bank (e4m3tile128): its e4m3 codes, one plane an expert, and
+    // beside them, by name, the f32 factors of each expert's 128x128 blocks,
+    // which the select reads with them.
+    for param in &trace.params {
+        if param.dtype != Dtype::E4m3 || param.shape.len() != 3 || out.contains_key(param.name.as_str()) {
+            continue;
+        }
+        let factors = format!("{}{}", param.name, poem_ir::SCALES);
+        if let Some(&scales) = index.get(factors.as_str())
+            && trace.params[scales].dtype == Dtype::F32
+        {
+            out.insert(param.name.as_str(), Pairing { scales, biases: None });
+        }
     }
     Ok(out)
 }
@@ -824,7 +906,7 @@ impl Weights {
             arm_refill(tier);
         }
 
-        let pairings = pairings(&landing, &index)?;
+        let pairings = pairings(&landing, trace, &index)?;
 
         let mut table = Vec::with_capacity(places.len());
         let mut decoded: Vec<Buffer> = Vec::new();
@@ -905,6 +987,7 @@ impl Weights {
             };
             table.push(Some(row));
         }
+        canonical_fp8(trace, &index, &places, &store, experts.as_ref(), stream)?;
         if let Some(tier) = experts.as_mut() {
             let slabs: Vec<u64> = tier
                 .plan()

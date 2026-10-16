@@ -329,12 +329,24 @@ impl Run<'_> {
                 y,
             } => {
                 const OP: &str = "linear.moe_matmul_select_act_quant";
-                let poem_ir::ActQuant::E4m3 { gran } = *quant else {
-                    return Err(nvfp4_activations(OP));
-                };
                 // The routes' rows read x's rows, so x's rows are what quantize.
-                let x = linear::act_quant::quantized(self.ctx(), OP, self.tensor(*x), gran)?;
-                self.select_quant(x, *bank, *routes, *y)
+                match *quant {
+                    poem_ir::ActQuant::E4m3 { gran } => {
+                        let x = linear::act_quant::quantized(self.ctx(), OP, self.tensor(*x), gran)?;
+                        self.select_quant(x, *bank, *routes, *y)
+                    }
+                    // An fp8 bank against e4m3 codes under f32 scales a block.
+                    // An fp8 bank against e4m3 rows under f32 scales a 1x128
+                    // block, which the select quantizes itself.
+                    poem_ir::ActQuant::E4m3Scaled { gran: 128 } => self.select_fp8(*x, *bank, *routes, *y),
+                    poem_ir::ActQuant::E4m3Scaled { gran } => Err(kernels_rocm::Error::Backend {
+                        op: OP,
+                        detail: format!(
+                            "an fp8 bank folds f32 activation scales over its 128-wide blocks, not {gran}-wide ones"
+                        ),
+                    }),
+                    poem_ir::ActQuant::Nvfp4 => Err(nvfp4_activations(OP)),
+                }
             }
             Linear::MlpSwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
                 self.ctx(),
@@ -729,6 +741,86 @@ impl Run<'_> {
         )
     }
 
+    /// `act`'s rows quantized for the FP8 products: as an earlier product
+    /// of this walk quantized them (same rows, window and stream), or now,
+    /// and held for the later ones when the batch is a decode batch's.
+    fn fp8_quantized(
+        &mut self,
+        op: &'static str,
+        act: ValueId,
+    ) -> Result<(kernels_rocm::Tensor, kernels_rocm::Tensor), kernels_rocm::Error> {
+        let stage = match self.ctx().stage() {
+            kernels_rocm::jit::ArgValue::Ptr(p) => p,
+            _ => 0,
+        };
+        let ctx = core::ptr::from_ref(self.ctx()) as usize;
+        if let Some(held) = self
+            .fp8_rows
+            .iter()
+            .find(|held| held.value == act.0 && held.stage == stage && held.ctx == ctx)
+        {
+            return Ok((held.codes, held.scales));
+        }
+        let x = self.tensor(act);
+        let region = self.at_region();
+        let hold = match self.fp8_holds.iter_mut().find(|(r, _)| *r == region) {
+            Some((_, next)) => {
+                *next += 1;
+                *next - 1
+            }
+            None => {
+                self.fp8_holds.push((region, 1));
+                0
+            }
+        } % linear::act_quant::FP8_HOLDS;
+        let (q, s) = linear::act_quant::quantized_codes_held(self.ctx(), op, x, hold)?;
+        // The hold's earlier rows are gone; past a decode batch nothing is
+        // held (the stream's slab).
+        self.fp8_rows.retain(|held| !(held.region == region && held.hold == hold));
+        if x.rows <= 64 {
+            self.fp8_rows.push(crate::run::Fp8Rows {
+                value: act.0,
+                stage,
+                ctx,
+                region,
+                hold,
+                codes: q,
+                scales: s,
+            });
+        }
+        Ok((q, s))
+    }
+
+    /// An fp8 bank's select against the rows quantized as e4m3 under f32
+    /// scales a 1x128 block.
+    fn select_fp8(
+        &mut self,
+        x: ValueId,
+        bank: ValueId,
+        routes: ValueId,
+        y: ValueId,
+    ) -> Result<(), kernels_rocm::Error> {
+        let (q, act_scales) = self.fp8_quantized("linear.moe_matmul_select_act_quant", x)?;
+        let x = self.tensor(x);
+        let (codes, scales, biases, seat) = self.planes(bank);
+        let routes = self.tensor(routes);
+        let (codes, scales, routes, seat) = match self.staged_experts(codes, scales, biases, routes) {
+            Some((codes, scales, _, routes)) => (codes, scales, routes, GroupSeat::RESIDENT),
+            None => (codes, scales, routes, seat),
+        };
+        linear::moe::matmul_select_fp8_quantized(
+            self.ctx(),
+            x,
+            q,
+            act_scales,
+            codes,
+            scales,
+            routes,
+            &mut self.tensor(y),
+            seat,
+        )
+    }
+
     /// A projection whose activations quantize first: an fp8b128 one
     /// (DeepSeek's W8A8) against e4m3 in its `gran`s.
     fn matmul_act_quant(
@@ -740,8 +832,10 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_rocm::Error> {
         const OP: &str = "linear.matmul_act_quant";
-        let poem_ir::ActQuant::E4m3 { gran } = quant else {
-            return Err(nvfp4_activations(OP));
+        let (gran, f32_scales) = match quant {
+            poem_ir::ActQuant::E4m3 { gran } => (gran, false),
+            poem_ir::ActQuant::E4m3Scaled { gran } => (gran, true),
+            poem_ir::ActQuant::Nvfp4 => return Err(nvfp4_activations(OP)),
         };
         let Some(scales) = scales else {
             return Err(kernels_rocm::Error::Backend {
@@ -753,6 +847,38 @@ impl Run<'_> {
             });
         };
         let codes = self.tensor(w);
+        let scales = self.tensor(scales);
+        // f32 factors: an e4m3tile128 projection (transformers' FP8 release).
+        // Against f32-scaled e4m3 activations, the FP8 matrix core.
+        if scales.dtype == Dtype::F32 && f32_scales {
+            if gran != linear::act_quant::FP8_BLOCK {
+                return Err(kernels_rocm::Error::Backend {
+                    op: OP,
+                    detail: format!(
+                        "an e4m3tile128 projection folds f32 activation scales over its 128-wide blocks, not \
+                         {gran}-wide ones"
+                    ),
+                });
+            }
+            let (q, act_scales) = self.fp8_quantized(OP, act)?;
+            return linear::act_quant::matmul_fp8_quantized(self.ctx(), OP, q, act_scales, codes, scales, &mut self.tensor(y));
+        }
+        if scales.dtype == Dtype::F32 {
+            return Err(kernels_rocm::Error::Backend {
+                op: OP,
+                detail: "an e4m3tile128 projection reads e4m3 activations under f32 scales a 1x128 block \
+                         (e4m3tile128a8f), not ue8m0 ones"
+                    .to_string(),
+            });
+        }
+        if f32_scales {
+            return Err(kernels_rocm::Error::Backend {
+                op: OP,
+                detail: "an fp8b128 projection's e8m0 blocks read e4m3 activations under ue8m0 \
+                         scales (DeepSeek's recipe), not f32 ones"
+                    .to_string(),
+            });
+        }
         let (n, k) = (codes.rows, codes.width);
         let holds = self.decoded_tile_holds(n, k);
         linear::act_quant::matmul_fp8b128(
@@ -760,7 +886,7 @@ impl Run<'_> {
             OP,
             self.tensor(act),
             codes,
-            self.tensor(scales),
+            scales,
             gran,
             holds,
             &mut self.tensor(y),

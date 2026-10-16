@@ -506,6 +506,18 @@ impl Standing {
     }
 }
 
+/// Rows quantized for the FP8 products, where they are held.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Fp8Rows {
+    pub value: u32,
+    pub stage: u64,
+    pub ctx: usize,
+    pub region: u32,
+    pub hold: usize,
+    pub codes: Tensor,
+    pub scales: Tensor,
+}
+
 pub struct Run<'c> {
     ctx: &'c Ctx,
 
@@ -543,6 +555,13 @@ pub struct Run<'c> {
     ceilings: Ceilings<'c>,
 
     stood: Cell<Option<(u32, u32, Standing)>>,
+
+    /// Rows this walk quantized for the FP8 products, by value, staged
+    /// window and context, with the region and hold they sit in: their codes
+    /// and scales, for the later products of the same rows.
+    pub(crate) fp8_rows: Vec<Fp8Rows>,
+    /// The holds each region has handed out this walk.
+    pub(crate) fp8_holds: Vec<(u32, usize)>,
 }
 
 impl<'c> Run<'c> {
@@ -579,6 +598,8 @@ impl<'c> Run<'c> {
             copy: CopyPlan::default(),
             ceilings: Ceilings::default(),
             stood: Cell::new(None),
+            fp8_rows: Vec::new(),
+            fp8_holds: Vec::new(),
         }
     }
 

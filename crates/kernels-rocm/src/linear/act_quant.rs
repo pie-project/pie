@@ -204,3 +204,324 @@ pub fn matmul_fp8b128(
     let w = fp8b128_decode_into(ctx, op, codes, scales, tile)?;
     gemm::act_x_wt(ctx, op, q, w, None, y)
 }
+
+/// That `codes` (e4m3, `[n, k]`) and `scales` (f32, one a 128x128 block) are
+/// one `e4m3tile128` projection.
+fn e4m3tile128_planes(op: &'static str, codes: Tensor, scales: Tensor) -> Result<(u32, u32), Error> {
+    let (n, k) = (codes.rows, codes.width);
+    if !matches!(codes.dtype, Dtype::E4m3 | Dtype::U8) || scales.dtype != Dtype::F32 {
+        return Err(refuse(
+            op,
+            format!(
+                "an e4m3tile128 projection is e4m3 codes beside f32 factors, not {:?} beside {:?}",
+                codes.dtype, scales.dtype
+            ),
+        ));
+    }
+    if scales.rows != n.div_ceil(FP8_BLOCK) || scales.width != k.div_ceil(FP8_BLOCK) {
+        return Err(refuse(
+            op,
+            format!(
+                "a [{n}, {k}] e4m3tile128 projection's factors are [{}, {}], not [{}, {}]",
+                scales.rows,
+                scales.width,
+                n.div_ceil(FP8_BLOCK),
+                k.div_ceil(FP8_BLOCK)
+            ),
+        ));
+    }
+    if n == 0 || k == 0 || !k.is_multiple_of(FP8_BLOCK) || !codes.ptr.is_multiple_of(16) {
+        return Err(refuse(
+            op,
+            format!("a [{n}, {k}] e4m3tile128 projection contracts whole 128-code blocks"),
+        ));
+    }
+    Ok((n, k))
+}
+
+/// `x`'s rows quantized as e4m3 codes under an f32 scale a `gran` (`amax /
+/// 448`): the OCP bytes (`[rows, k]`, negative zero as zero) and each
+/// block's scale (`[rows, k / gran]`), in this fire's scratch, as the FP8
+/// matrix-core products read them (`linear/fp8.hip`).
+pub fn quantized_codes(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    gran: u32,
+) -> Result<(Tensor, Tensor), Error> {
+    dtype_dispatch!(op, x.dtype, { Bf16 => () });
+    if gran != FP8_BLOCK || x.width == 0 || !x.width.is_multiple_of(gran) {
+        return Err(refuse(
+            op,
+            format!("the FP8 matrix core reads e4m3 in 128-wide blocks of whole rows, not {gran} over {}", x.width),
+        ));
+    }
+    let blocks = x.width / gran;
+    // One slab a stream: the product right after consumes them.
+    let at = ctx.scratch_stream(op, "linear.act_quant_codes", (x.rows as usize * x.width as usize).max(16))? as usize as u64;
+    let sat =
+        ctx.scratch_stream(op, "linear.act_quant_scales", (x.rows as usize * blocks as usize * 4).max(16))? as usize as u64;
+    let codes = Tensor::new(at, x.rows, x.width, Dtype::U8);
+    let scales = Tensor::new(sat, x.rows, blocks, Dtype::F32);
+    quantize_codes_into(ctx, op, x, gran, codes, scales)?;
+    Ok((codes, scales))
+}
+
+fn quantize_codes_into(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    gran: u32,
+    codes: Tensor,
+    scales: Tensor,
+) -> Result<(), Error> {
+    let blocks = x.width / gran;
+    if x.rows == 0 {
+        return Ok(());
+    }
+    let threads = u32::try_from(u64::from(x.rows) * u64::from(blocks) * u64::from(WAVE))
+        .map_err(|_| refuse(op, "the quantizer's threads do not fit a 32-bit extent"))?;
+    ctx.fire(
+        op,
+        Fire::at("linear/fp8.hip", symbol(&format!("::pie::linear::act_quant_e4m3_codes<{gran}>")))
+            .apply(Launch::flat(threads, BLOCK)),
+        &[
+            x.arg(),
+            codes.arg(),
+            scales.arg(),
+            stated(op, x.rows)?.arg(),
+            stated(op, x.width)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// The K a stage of the FP8 matrix-core tile takes: one 128-code block
+/// (two measured no faster at GLM-5.3's shapes, their LDS holding a CU to
+/// one block).
+#[must_use]
+pub const fn fp8_stage(_k: u32, _mt: u32) -> u32 {
+    128
+}
+
+/// The item rows the FP8 matrix-core tile takes for `rows`.
+#[must_use]
+pub const fn fp8_item_rows(rows: u32) -> u32 {
+    match rows {
+        0..=16 => 16,
+        17..=32 => 32,
+        _ => 64,
+    }
+}
+
+/// `y = act · wᵀ` for an `e4m3tile128` `w` (`codes` e4m3 `[n, k]` made
+/// canonical at load, `factors` f32 a 128x128 block) against `act` (bf16)
+/// quantized as e4m3 under f32 scales a 1x128 block (`amax / 448`), on the
+/// FP8 matrix core (the rows quantized by `quantized_codes` first): each
+/// block's products summed in f32, then folded under the weight's factor
+/// and the row's scale. Up to 64 rows the decode tile, past them the
+/// prefill tile, 128 rows against 128 of the weight. K is sliced while the
+/// tiles are few, each slice's partial summed after.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_fp8(
+    ctx: &Ctx,
+    op: &'static str,
+    act: Tensor,
+    codes: Tensor,
+    factors: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    dtype_dispatch!(op, act.dtype, { Bf16 => () });
+    if act.rows == 0 {
+        return Ok(());
+    }
+    let (q, act_scales) = quantized_codes(ctx, op, act, FP8_BLOCK)?;
+    matmul_fp8_quantized(ctx, op, q, act_scales, codes, factors, y)
+}
+
+/// The holds a region keeps for quantized rows (`quantized_codes_held`).
+pub const FP8_HOLDS: usize = 8;
+
+const HELD_CODES: [&str; FP8_HOLDS] = [
+    "linear.act_quant_codes_held.0",
+    "linear.act_quant_codes_held.1",
+    "linear.act_quant_codes_held.2",
+    "linear.act_quant_codes_held.3",
+    "linear.act_quant_codes_held.4",
+    "linear.act_quant_codes_held.5",
+    "linear.act_quant_codes_held.6",
+    "linear.act_quant_codes_held.7",
+];
+const HELD_SCALES: [&str; FP8_HOLDS] = [
+    "linear.act_quant_scales_held.0",
+    "linear.act_quant_scales_held.1",
+    "linear.act_quant_scales_held.2",
+    "linear.act_quant_scales_held.3",
+    "linear.act_quant_scales_held.4",
+    "linear.act_quant_scales_held.5",
+    "linear.act_quant_scales_held.6",
+    "linear.act_quant_scales_held.7",
+];
+
+/// The rows quantized as the FP8 products read them (`quantized_codes`),
+/// held for later products of the same rows in this walk: a decode batch's
+/// (64 rows or fewer) in the region's hold `hold` (of `FP8_HOLDS`), which
+/// only the region's next quantizing into that hold overwrites; past them
+/// in the stream's slab, as `quantized_codes`.
+pub fn quantized_codes_held(ctx: &Ctx, op: &'static str, x: Tensor, hold: usize) -> Result<(Tensor, Tensor), Error> {
+    if x.rows > 64 {
+        return quantized_codes(ctx, op, x, FP8_BLOCK);
+    }
+    dtype_dispatch!(op, x.dtype, { Bf16 => () });
+    if x.width == 0 || !x.width.is_multiple_of(FP8_BLOCK) {
+        return Err(refuse(op, format!("the FP8 matrix core reads e4m3 in 128-wide blocks of whole rows, not {}", x.width)));
+    }
+    let blocks = x.width / FP8_BLOCK;
+    let hold = hold % FP8_HOLDS;
+    let at = ctx.scratch(op, HELD_CODES[hold], (x.rows as usize * x.width as usize).max(16))? as usize as u64;
+    let sat = ctx.scratch(op, HELD_SCALES[hold], (x.rows as usize * blocks as usize * 4).max(16))? as usize as u64;
+    let codes = Tensor::new(at, x.rows, x.width, Dtype::U8);
+    let scales = Tensor::new(sat, x.rows, blocks, Dtype::F32);
+    quantize_codes_into(ctx, op, x, FP8_BLOCK, codes, scales)?;
+    Ok((codes, scales))
+}
+
+/// `y = act · wᵀ` as `matmul_fp8`, the rows already quantized (`act` their
+/// codes, `act_scales` their scales).
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_fp8_quantized(
+    ctx: &Ctx,
+    op: &'static str,
+    q: Tensor,
+    act_scales: Tensor,
+    codes: Tensor,
+    factors: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let act = q;
+    let (n, k) = e4m3tile128_planes(op, codes, factors)?;
+    if act.width != k || y.width != n || y.rows != act.rows || y.dtype != Dtype::Bf16 {
+        return Err(refuse(
+            op,
+            format!(
+                "a [{}, {}] act against a [{n}, {k}] projection does not land [{}, {}]",
+                act.rows, act.width, y.rows, y.width
+            ),
+        ));
+    }
+    if act.rows == 0 {
+        return Ok(());
+    }
+    if act.dtype != Dtype::U8 || act_scales.dtype != Dtype::F32 || act_scales.rows != act.rows || act_scales.width != k / FP8_BLOCK {
+        return Err(refuse(op, "the FP8 product reads e4m3 row codes beside f32 scales a 128-wide block"));
+    }
+    let stages = k / FP8_BLOCK;
+    let (splits, part) = if act.rows > 64 {
+        // The prefill tile; K sliced while the tiles are fewer than 128
+        // (measured at GLM-5.3's shapes: past that, slicing costs more than
+        // the blocks win).
+        let (items, tiles) = (act.rows.div_ceil(128), n.div_ceil(128));
+        let mut splits = 1u32;
+        while splits < 8 && tiles * items * splits < 128 && stages / (2 * splits) >= 4 {
+            splits *= 2;
+        }
+        let part = fp8_partials(ctx, op, splits, act.rows, n)?;
+        ctx.fire(
+            op,
+            Fire::at("linear/fp8.hip", "::pie::linear::dense_fp8_gemm8")
+                .apply(Launch::grid([items, tiles, splits], [2 * BLOCK, 1, 1])),
+            &[
+                q.arg(),
+                act_scales.arg(),
+                codes.arg(),
+                factors.arg(),
+                y.arg(),
+                part,
+                stated(op, act.rows)?.arg(),
+                stated(op, n)?.arg(),
+                stated(op, k)?.arg(),
+                stated(op, stages.div_ceil(splits))?.arg(),
+                ctx.stage(),
+            ],
+        )?;
+        (splits, part)
+    } else {
+        // The decode tile; K sliced while the tiles and items are short of
+        // two blocks a CU.
+        let mt = fp8_item_rows(act.rows);
+        let (items, tiles) = (act.rows.div_ceil(mt), n.div_ceil(64));
+        let mut splits = 1u32;
+        while splits < 8 && tiles * items * splits < 608 && stages / (2 * splits) >= 4 {
+            splits *= 2;
+        }
+        let part = fp8_partials(ctx, op, splits, act.rows, n)?;
+        ctx.fire(
+            op,
+            Fire::at("linear/fp8.hip", symbol(&format!("::pie::linear::dense_fp8_mfma<::pie::i32({mt})>")))
+                .apply(Launch::grid([tiles.div_ceil(8) * 8 * items * splits, 1, 1], [BLOCK, 1, 1])),
+            &[
+                q.arg(),
+                act_scales.arg(),
+                codes.arg(),
+                factors.arg(),
+                y.arg(),
+                part,
+                stated(op, act.rows)?.arg(),
+                stated(op, n)?.arg(),
+                stated(op, k)?.arg(),
+                stated(op, items)?.arg(),
+                stated(op, tiles)?.arg(),
+                stated(op, splits)?.arg(),
+                stated(op, stages.div_ceil(splits))?.arg(),
+                ctx.stage(),
+            ],
+        )?;
+        (splits, part)
+    };
+    if splits == 1 {
+        return Ok(());
+    }
+    let grid = u32::try_from((u64::from(act.rows) * u64::from(n)).div_ceil(256).min(4096)).unwrap_or(4096);
+    ctx.fire(
+        op,
+        Fire::at("linear/fp8.hip", "::pie::linear::fp8_mfma_finalize").apply(Launch::grid([grid, 1, 1], [BLOCK, 1, 1])),
+        &[
+            part,
+            y.arg(),
+            stated(op, act.rows)?.arg(),
+            stated(op, n)?.arg(),
+            stated(op, splits)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// The f32 partials of `splits` slices of K over `[rows, n]` (one slab a
+/// stream: the sum right after consumes them), none for one slice.
+fn fp8_partials(ctx: &Ctx, op: &'static str, splits: u32, rows: u32, n: u32) -> Result<ArgValue, Error> {
+    if splits <= 1 {
+        return Ok(ArgValue::ABSENT);
+    }
+    let bytes = (splits as usize) * (rows as usize) * (n as usize) * 4;
+    Ok(ArgValue::Ptr(ctx.scratch_stream(op, "linear.fp8_partials", bytes)? as u64))
+}
+
+/// An e4m3fn plane (`bytes`, a multiple of four) made canonical in place for
+/// the FP8 matrix core: negative zero as zero, the value it is; the NaN
+/// codes (0x7f, 0xff), which fnuz reads as numbers, counted into `nans` (a
+/// u32 the caller zeroed and reads back to refuse the plane).
+pub fn e4m3fn_canonical(ctx: &Ctx, op: &'static str, codes: u64, bytes: u64, nans: u64) -> Result<(), Error> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    if !bytes.is_multiple_of(4) || !codes.is_multiple_of(4) {
+        return Err(refuse(op, "an e4m3 plane is not whole 4-byte words"));
+    }
+    let words = bytes / 4;
+    let grid = u32::try_from(words.div_ceil(u64::from(BLOCK)).min(8192)).unwrap_or(8192);
+    ctx.fire(
+        op,
+        Fire::at("linear/fp8.hip", "::pie::linear::e4m3fn_canonical").apply(Launch::grid([grid, 1, 1], [BLOCK, 1, 1])),
+        &[ArgValue::Ptr(codes), ArgValue::I64(i64::try_from(words).unwrap_or(i64::MAX)), ArgValue::Ptr(nans)],
+    )
+}

@@ -1929,10 +1929,119 @@ pub fn matmul_select_quant(
     seat: GroupSeat,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
+    // A byte a code beside four a 128x128 block: an fp8 bank (`e4m3tile128`).
+    if biases.is_none() && fp8_tiles(x, codes, scales, y) {
+        return Err(refuse(
+            OP,
+            "an fp8 bank (e4m3tile128) is read against e4m3 activations under f32 scales a 1x128 block \
+             (`matmul_select_fp8_mfma`), not as the routes' rows are",
+        ));
+    }
     match biases {
         None => matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, seat),
         Some(biases) => matmul_select_mlxu4(ctx, OP, x, codes, scales, biases, routes, y, seat),
     }
+}
+
+/// Whether `codes` and `scales` are an fp8 bank's planes for `x` into `y`:
+/// a byte an expert's code, an f32 its 128x128 block's factor.
+pub fn fp8_tiles(x: Tensor, codes: Tensor, scales: Tensor, y: &Tensor) -> bool {
+    let (n, k) = (u64::from(y.width), u64::from(x.width));
+    n > 0
+        && k > 0
+        && u64::from(codes.width) == n * k
+        && u64::from(scales.width) == 4 * n.div_ceil(128) * k.div_ceil(128)
+}
+
+/// An fp8 bank (`e4m3tile128`, its codes made canonical at load) against
+/// the routes' activation rows (bf16) quantized as e4m3 under f32 scales a
+/// 1x128 block (`quantized_codes`), on the FP8 matrix core: at decode
+/// batches items of the least of 16, 32 and 64 routes holding what an expert
+/// averages; past 64 routes an expert the prefill tile, items of 128 against
+/// 128 weight rows. An expert past its item takes another.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_select_fp8_mfma(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    seat: GroupSeat,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_matmul_select_quant";
+    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    let (q, act_scales) = crate::linear::act_quant::quantized_codes(ctx, OP, x, 128)?;
+    matmul_select_fp8_quantized(ctx, x, q, act_scales, codes, scales, routes, y, seat)
+}
+
+/// `matmul_select_fp8_mfma` over rows already quantized (`q`, `act_scales`
+/// of `x`'s rows, `x` itself the routes' bf16 rows they came from).
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_select_fp8_quantized(
+    ctx: &Ctx,
+    x: Tensor,
+    q: Tensor,
+    act_scales: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    seat: GroupSeat,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_matmul_select_quant";
+    let op = OP;
+    dtype_dispatch!(op, x.dtype, { Bf16 => () });
+    if q.rows != x.rows || q.width != x.width || act_scales.rows != x.rows || act_scales.width != x.width / 128 {
+        return Err(refuse(op, "the quantized rows are not x's codes beside a scale a 128-wide block"));
+    }
+    let fan = selected(op, x, routes, y)?;
+    if !x.width.is_multiple_of(128) || !fp8_tiles(x, codes, scales, y) {
+        return Err(refuse(op, "the bank's planes are not e4m3 codes beside an f32 factor a 128x128 block of K"));
+    }
+    if codes.rows > ORDER_EXPERT_CAP {
+        return Err(refuse(
+            op,
+            format!(
+                "the batch legs order at most {ORDER_EXPERT_CAP} experts, and this fp8 bank holds {}",
+                codes.rows
+            ),
+        ));
+    }
+    let experts = codes.rows.max(1);
+    let per = fan.route_count.div_ceil(experts);
+    let gemm = per > 64;
+    let mt = if gemm { 128 } else { crate::linear::act_quant::fp8_item_rows(per) };
+    let kk = stated(op, x.width)?;
+    let nn = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let ordered = route_order(ctx, op, routes, &fan, experts, mt)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let mut args = vec![q.arg(), act_scales.arg()];
+    let (entry, rows, threads) = if gemm {
+        ("::pie::linear::moe_fp8_gemm8".to_string(), 128, 2 * GROUP_BLOCK)
+    } else {
+        (format!("::pie::linear::moe_fp8_mfma<::pie::i32({mt})>"), 64, GROUP_BLOCK)
+    };
+    args.extend([
+        ArgValue::Ptr(ordered.order),
+        ArgValue::Ptr(ordered.offsets),
+        ArgValue::Ptr(ordered.work),
+        codes.arg(),
+        scales.arg(),
+        y.arg(),
+        act_div.arg(),
+        nn.arg(),
+        kk.arg(),
+        stated(op, experts)?.arg(),
+        ArgValue::Ptr(seat.cell),
+        ArgValue::Ptr(seat.hits),
+    ]);
+    ctx.fire(
+        op,
+        Fire::at("linear/fp8.hip", symbol(&entry))
+            .apply(Launch::grid([ordered.work_cap, y.width.div_ceil(rows), 1], [threads, 1, 1])),
+        &args,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
