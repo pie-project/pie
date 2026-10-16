@@ -51,20 +51,31 @@ fn check(case: Case) {
     .unwrap_or_else(|e| panic!("{case:?}: {e}"));
     gpu.sync();
     // Split along K, a second launch lands the same bits: each split sums
-    // into its own slab, added in split order.
+    // into its own slab, added in split order. The repeats launch the
+    // finalize as the GEMM's programmatic dependent, eagerly and from a
+    // captured graph, each behind a launch at half the scale: a finalize that
+    // read the slabs before its GEMM had landed them would add stale halves.
     if SPLITS.load(std::sync::atomic::Ordering::Relaxed) {
         let first: Vec<u16> = gpu.down(y, tall * n);
-        for _ in 0..3 {
+        let pdl = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+            pdl: true,
+            ..ctx.tuning()
+        });
+        let fire = |alpha: f32| {
             gemm_with(
-                &ctx,
+                &pdl,
                 a_op,
                 w_op,
                 y,
                 [m as u32, n as u32, k as u32],
-                case.alpha,
+                alpha,
                 plan,
             )
             .unwrap_or_else(|e| panic!("{case:?}: {e}"));
+        };
+        for _ in 0..3 {
+            fire(case.alpha * 0.5);
+            fire(case.alpha);
             gpu.sync();
             assert_eq!(
                 gpu.down::<u16>(y, tall * n),
@@ -72,6 +83,20 @@ fn check(case: Case) {
                 "{case:?}: a split launch lands the same bits again"
             );
         }
+        let exec = crate::common::captured(&pdl, || {
+            fire(case.alpha * 0.5);
+            fire(case.alpha);
+        });
+        for _ in 0..3 {
+            crate::common::replay(&pdl, exec);
+            gpu.sync();
+            assert_eq!(
+                gpu.down::<u16>(y, tall * n),
+                first,
+                "{case:?}: a captured split launch lands the same bits again"
+            );
+        }
+        crate::common::forget(exec);
     }
     let got: Vec<u16> = gpu.down(y, tall * n);
 
@@ -137,6 +162,87 @@ fn the_tcgen05_gemm_answers_the_dequantized_dot_every_case() {
     nvfp4_lands_its_sixteen_wide_scales_and_global_alpha();
     mxfp4_weights_meet_fp8_activations();
     a_split_launch_lands_the_same_bits_each_time();
+    a_dependent_gemm_reads_what_its_producer_landed();
+}
+
+/// Under `kernel.pdl` a tcgen05 GEMM launches as the programmatic dependent
+/// of the kernel before it, and a GEMM lets its own dependent launch once
+/// its set-up is done. A chain h = x w1, out = h w2, unsplit, each pair
+/// behind one at half the scale, eagerly and from a graph, lands what it
+/// lands launched plainly. (A dependent's CTA that lands on its producer's
+/// SM waits on its TMEM anyway, so this alone may not catch a missing wait;
+/// the split-K repeats above do, for the finalize.)
+fn a_dependent_gemm_reads_what_its_producer_landed() {
+    let (m, k, n, n2) = (8usize, 8192usize, 1024usize, 512usize);
+    let mut lcg = Lcg::seeded(0xd9);
+    let mut bits = 0xd9u64;
+    let x = side(&mut lcg, &mut bits, Elem::Bf16, None, m, k);
+    let w1 = side(&mut lcg, &mut bits, Elem::Bf16, None, n, k);
+    let w2 = side(&mut lcg, &mut bits, Elem::Bf16, None, n2, n);
+    let mut gpu = Gpu::open();
+    let x = Operand::plain(gpu.up(&x.bytes), Elem::Bf16);
+    let w1 = Operand::plain(gpu.up(&w1.bytes), Elem::Bf16);
+    let w2 = Operand::plain(gpu.up(&w2.bytes), Elem::Bf16);
+    let h = gpu.zeros(m * n * 2);
+    let out = gpu.zeros(m * n2 * 2);
+    let unsplit = |m: usize, n: usize, k: usize| Plan {
+        splits: 1,
+        ..Plan::choose(m as u32, n as u32, k as u32, 148)
+    };
+    let chain = |ctx: &kernels_cuda::jit::Ctx, alpha: f32| {
+        gemm_with(
+            ctx,
+            x,
+            w1,
+            h,
+            [m as u32, n as u32, k as u32],
+            alpha,
+            unsplit(m, n, k),
+        )
+        .expect("the producer fires");
+        gemm_with(
+            ctx,
+            Operand::plain(h, Elem::Bf16),
+            w2,
+            out,
+            [m as u32, n2 as u32, n as u32],
+            1.0,
+            unsplit(m, n2, n),
+        )
+        .expect("the dependent fires");
+    };
+    let plain = gpu.ctx();
+    chain(&plain, 1.0);
+    gpu.sync();
+    let want: Vec<u16> = gpu.down(out, m * n2);
+    let pdl = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+        pdl: true,
+        ..plain.tuning()
+    });
+    for _ in 0..3 {
+        chain(&pdl, 0.5);
+        chain(&pdl, 1.0);
+        gpu.sync();
+        assert_eq!(
+            gpu.down::<u16>(out, m * n2),
+            want,
+            "a dependent GEMM reads what its producer landed"
+        );
+    }
+    let exec = crate::common::captured(&pdl, || {
+        chain(&pdl, 0.5);
+        chain(&pdl, 1.0);
+    });
+    for _ in 0..3 {
+        crate::common::replay(&pdl, exec);
+        gpu.sync();
+        assert_eq!(
+            gpu.down::<u16>(out, m * n2),
+            want,
+            "a captured dependent GEMM reads what its producer landed"
+        );
+    }
+    crate::common::forget(exec);
 }
 
 /// The decode-width cases, split along K, run four times: each launch's

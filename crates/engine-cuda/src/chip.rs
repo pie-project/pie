@@ -477,6 +477,7 @@ mod tests {
                         ssm_kda_chunked: false,
                         gemm_split_launch_ns: 0,
                         gemm_tc5_raster: 8,
+                        pdl: false,
                         nvfp4_mma_from: defaults.nvfp4_mma_from,
                         nvfp4_mma_until: defaults.nvfp4_mma_until,
                         moe_topk_warp: false,
@@ -670,6 +671,9 @@ mod tests {
         assert_eq!(b200.gemm_tc5_glu_from, 65_536);
         assert_eq!((b200.mxfp4_mma_from, b200.mxfp4_mma_until), (28, 1024));
         assert!(b200.merge_warp);
+        // Measured neutral to slower on DeepSeek-V4-Flash's decode (bs64
+        // +2% TPOT with the GEMM a dependent too): off on B200 as well.
+        assert!(!b200.pdl);
         for (major, minor) in [
             (8, 0),
             (8, 6),
@@ -706,6 +710,10 @@ mod tests {
             assert_eq!(
                 other.gemm_tc5_raster, 8,
                 "sm_{major}{minor} rasters its dense tcgen05 GEMM 8 tiles a band"
+            );
+            assert!(
+                !other.pdl,
+                "sm_{major}{minor} launches no kernel as a programmatic dependent"
             );
             assert!(
                 !other.moe_topk_warp,

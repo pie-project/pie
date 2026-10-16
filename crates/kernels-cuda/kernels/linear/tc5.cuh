@@ -432,6 +432,11 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         tmem_alloc<kPair>(tmem_slot, kCols);
         tmem_relinquish<kPair>();
     }
+    // Launched as its producer's programmatic dependent (`kernel.pdl`), the
+    // set-up above overlapped that kernel's tail; nothing it wrote, nor any
+    // byte it may still read, is touched before it has finished. Without the
+    // attribute the wait returns at once.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     // A masked launch counts each expert's tiles up front, so units map
     // straight onto the busy experts: walking empty ones costs every role
     // a unit's bookkeeping each.
@@ -495,6 +500,12 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     }
     tc_fence_after();
     const u32 tmem = *tmem_slot;
+    // Every CTA of this persistent grid is resident and holds its TMEM, so
+    // its dependent (under `kernel.pdl`: a split-K finalize, or the next
+    // tcgen05 GEMM) may launch now; it waits for this grid to finish and
+    // flush before it touches memory. Not earlier: a dependent's CTA that
+    // took an SM's TMEM first would leave this one's alloc spinning on it.
+    asm volatile("griddepcontrol.launch_dependents;");
 
     // Tiles along P and Q (of one expert, when grouped), and the experts.
     // Contiguous P tiles stop at the routed rows.
@@ -1548,6 +1559,10 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
 __global__ __launch_bounds__(256) void tc5_finalize(const float4* __restrict__ part,
                                                     uint2* __restrict__ y, int quads, int splits,
                                                     long long slab_quads) {
+    // Launched as the GEMM's programmatic dependent (`kernel.pdl`): its sums
+    // are read only once that grid has finished and flushed them. Without
+    // the attribute the wait returns at once.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < quads) {
         // Each split's slab in split order: the same sum every launch.
@@ -1571,6 +1586,7 @@ __global__ __launch_bounds__(128) void tc5_finalize_routed(const float4* __restr
                                                            const int* __restrict__ counts,
                                                            int experts, int m_max, int n,
                                                            int splits, long long slab_quads) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     const int row = static_cast<int>(blockIdx.x);
     if (m_max == 0 ? row >= __ldg(&counts[experts]) : row % m_max >= __ldg(&counts[row / m_max])) {
         return;

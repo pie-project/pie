@@ -12,6 +12,11 @@ pub struct Launch {
     pub cooperative: bool,
     /// CTAs a cluster along x; 1 launches none.
     pub cluster: u32,
+    /// Programmatic dependent launch: this kernel may start while the one
+    /// before it on the stream finishes, and waits on it in-kernel
+    /// (`griddepcontrol.wait`) before it reads anything that one wrote. Set
+    /// only on a kernel that waits so (sm_90 and later).
+    pub pdl: bool,
 }
 
 impl Launch {
@@ -24,6 +29,7 @@ impl Launch {
             smem: 0,
             cooperative: false,
             cluster: 1,
+            pdl: false,
         }
     }
 
@@ -35,6 +41,7 @@ impl Launch {
             smem: 0,
             cooperative: false,
             cluster: 1,
+            pdl: false,
         }
     }
 
@@ -46,6 +53,7 @@ impl Launch {
             smem: 0,
             cooperative: false,
             cluster: 1,
+            pdl: false,
         }
     }
 
@@ -66,6 +74,14 @@ impl Launch {
     #[must_use]
     pub const fn cluster(mut self, ctas: u32) -> Self {
         self.cluster = ctas;
+        self
+    }
+
+    /// Launches as a programmatic dependent of the stream's previous kernel
+    /// where `on`; see [`Launch::pdl`].
+    #[must_use]
+    pub const fn programmatic(mut self, on: bool) -> Self {
+        self.pdl = on;
         self
     }
 

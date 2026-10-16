@@ -1285,7 +1285,8 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
                 ],
             )
             .smem(smem)
-            .cluster(ctas),
+            .cluster(ctas)
+            .programmatic(ctx.tuning().pdl),
         ),
         &values,
     )?;
@@ -1308,7 +1309,8 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let quads = job.y_rows * n / 4;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::linear::tc5_finalize").apply(Launch::flat(quads, 256)),
+        Fire::at(FILE, "::pie::linear::tc5_finalize")
+            .apply(Launch::flat(quads, 256).programmatic(ctx.tuning().pdl)),
         &[
             ArgValue::Ptr(part),
             ArgValue::Ptr(y),
@@ -1334,7 +1336,7 @@ fn fire_routed(
     let int = |v: u32| i32::try_from(v).map_err(|_| refuse(OP, format!("{v} overflows an int")));
     ctx.fire(
         OP,
-        Fire::at(FILE, entry).apply(Launch::per_row(rows, 128)),
+        Fire::at(FILE, entry).apply(Launch::per_row(rows, 128).programmatic(ctx.tuning().pdl)),
         &[
             ArgValue::Ptr(part),
             ArgValue::Ptr(y),

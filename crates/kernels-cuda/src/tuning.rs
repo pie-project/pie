@@ -69,6 +69,14 @@ pub struct MoeNvfp4MmaUntil(pub u32);
 #[decision(id = "kernel.moe.nvfp4_mma_from", constant(range(1..=65_536)), default = 1, tune = search)]
 pub struct MoeNvfp4MmaFrom(pub u32);
 
+/// Programmatic dependent launch: a kernel that opts in (it waits on its
+/// predecessor in-kernel before reading what that one wrote) launches while
+/// the stream's previous kernel finishes, its launch latency hidden. Off but
+/// where a chip's profile turns it on (sm_90 and later only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.pdl", flag, default = false, tune = search)]
+pub struct KernelPdl;
+
 /// The P tiles a dense tcgen05 GEMM's raster band walks Q together over:
 /// a wave shares both operands' tiles in L2. 8 but where a chip's profile
 /// says.
@@ -496,6 +504,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmKdaChunked>()
         .add::<GemmSplitLaunchNs>()
         .add::<GemmTc5Raster>()
+        .add::<KernelPdl>()
         .add::<MoeNvfp4MmaUntil>()
         .add::<MoeNvfp4MmaFrom>()
         .add::<MoeTopkWarp>()
@@ -569,6 +578,7 @@ pub struct Tuning {
     pub ssm_kda_chunked: bool,
     pub gemm_split_launch_ns: u32,
     pub gemm_tc5_raster: u32,
+    pub pdl: bool,
     pub nvfp4_mma_from: u32,
     pub nvfp4_mma_until: u32,
     pub moe_topk_warp: bool,
@@ -640,6 +650,7 @@ impl Tuning {
         ssm_kda_chunked: false,
         gemm_split_launch_ns: 0,
         gemm_tc5_raster: 8,
+        pdl: false,
         nvfp4_mma_from: 1,
         nvfp4_mma_until: 0,
         moe_topk_warp: false,
@@ -711,6 +722,7 @@ impl Tuning {
             ssm_kda_chunked: profile.on::<SsmKdaChunked>(&Anywhere),
             gemm_split_launch_ns: profile.get::<GemmSplitLaunchNs>().0,
             gemm_tc5_raster: profile.get::<GemmTc5Raster>().0,
+            pdl: profile.on::<KernelPdl>(&Anywhere),
             nvfp4_mma_from: profile.get::<MoeNvfp4MmaFrom>().0,
             nvfp4_mma_until: profile.get::<MoeNvfp4MmaUntil>().0,
             moe_topk_warp: profile.on::<MoeTopkWarp>(&Anywhere),
