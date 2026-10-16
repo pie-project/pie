@@ -65,6 +65,7 @@ struct SparseParams {
     q_stride: i32,
     o_stride: i32,
     scale_log2: f32,
+    turn: crate::attn::dsv4::TurnArgs,
 }
 
 /// `pie::attn::dsv4s::smem_bytes` (a block a multiprocessor, walking rows):
@@ -136,6 +137,7 @@ pub fn prefill(
     pooled: &Pooled<'_>,
     sinks: Tensor,
     sm_scale: f32,
+    turn: Option<crate::attn::dsv4::Turn>,
     o: &mut Tensor,
 ) -> Result<(), Error> {
     let rows = o.rows;
@@ -163,6 +165,7 @@ pub fn prefill(
             &staged,
             sinks,
             sm_scale,
+            turn,
             o,
         );
     }
@@ -281,6 +284,7 @@ pub fn prefill(
             q_stride: int(q.width),
             o_stride: int(o.width),
             scale_log2: sm_scale * core::f32::consts::LOG2_E,
+            turn: crate::attn::dsv4::TurnArgs::of(turn),
         };
         return ctx.fire(
             op,
@@ -329,7 +333,14 @@ pub fn prefill(
                 len: core::mem::size_of::<Params>(),
             },
         ],
-    )
+    )?;
+    // The pair kernel lands no turn: the output's tail is turned after it.
+    match turn {
+        Some(t) => crate::elemwise::rope::partial_last(
+            ctx, o, positions, t.dim, HEAD_DIM, t.theta, true, true, t.yarn,
+        ),
+        None => Ok(()),
+    }
 }
 
 /// Which pool a staged plane widens.

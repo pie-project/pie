@@ -13,6 +13,7 @@
 #include <cuda_fp8.h>
 
 #include "prelude/device.cuh"
+#include "prelude/rope.cuh"
 
 namespace pie::attn::dsv4 {
 
@@ -35,6 +36,43 @@ __device__ __forceinline__ DsRow ds_row(std::uint8_t* plane, long long page, int
     std::uint8_t* base = plane + page * static_cast<long long>(ps) * kDsRow;
     return {base + static_cast<long long>(off) * kDsData,
             base + static_cast<long long>(ps) * kDsData + static_cast<long long>(off) * kDsScaleBytes};
+}
+
+// The inverse rotation of an attention output's last `dim` dims (DeepSeek-V4
+// turns its output back by the row's position), landed with the output:
+// `dim` zero turns nothing. The angles are `rope_partial_last`'s, negated.
+struct Turn {
+    int dim;
+    float theta;
+    float factor;
+    float low;
+    float high;
+};
+
+// The turn's frequency of pair `pair`, as `rope_partial_last` works it.
+__device__ __forceinline__ float turn_freq(int pair, const Turn& t) {
+    float freq = powf(t.theta, -2.f * static_cast<float>(pair) / static_cast<float>(t.dim));
+    if (t.factor > 1.f) freq = ::pie::yarn_original_freq(freq, t.factor, t.low, t.high, pair);
+    return freq;
+}
+
+// Interleaved pair (a, b) at head dim `d` (even) of a `head_dim`-wide head,
+// turned back by position `pos` where it is the tail's; `freq` the turn's
+// frequencies (`turn_freq`), a pair each.
+__device__ __forceinline__ void turn_pair(float& a, float& b, int pos, float freq) {
+    float s, c;
+    __sincosf(-static_cast<float>(pos) * freq, &s, &c);
+    const float a2 = a * c - b * s;
+    const float b2 = b * c + a * s;
+    a = a2;
+    b = b2;
+}
+
+__device__ __forceinline__ void turn_back(float& a, float& b, int d, int head_dim, int pos, const Turn& t,
+                                          const float* freq) {
+    const int at = d - (head_dim - t.dim);
+    if (t.dim <= 0 || at < 0) return;
+    turn_pair(a, b, pos, freq[at / 2]);
 }
 
 __device__ __forceinline__ float ue8m0(std::uint8_t e) {

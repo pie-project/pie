@@ -337,3 +337,161 @@ fn the_kv_plane_lands_its_fp8_rows_in_one_pass() {
         assert!(written > 0, "rows are written");
     }
 }
+
+/// q and the kv plane, `pair` choosing the one launch (else q's one pass,
+/// then the plane's): q's rows, the plane's rows, and the fp8 pool's bytes.
+fn pair_pass(pair: bool, window: Option<(u32, u32, u32)>) -> (Vec<u16>, Vec<u16>, Vec<u8>) {
+    const PAGE: usize = 16;
+    let (rows, live, base) = window.unwrap_or((40, 40, 0));
+    let planes = (base + rows) as usize;
+    let cells = planes.next_multiple_of(PAGE);
+    let row = dsv4::DS_ROW as usize;
+    let mut lcg = Lcg::seeded(0x9a12);
+    let qx: Vec<u16> = (0..planes * 64 * 512)
+        .map(|_| to_bf16(lcg.unit() * 3.0))
+        .collect();
+    let kx: Vec<u16> = (0..planes * 512)
+        .map(|_| to_bf16(lcg.unit() * 3.0))
+        .collect();
+    let w: Vec<u16> = (0..512).map(|_| to_bf16(0.5 + lcg.unit())).collect();
+    let positions: Vec<i32> = (0..planes as i32).map(|r| r * 29 + 1).collect();
+    let pages_n = cells / PAGE;
+    let w_page: Vec<u32> = (0..planes).map(|r| (r / PAGE) as u32).collect();
+    let w_off: Vec<u32> = (0..planes).map(|r| (r % PAGE) as u32).collect();
+    let mut gpu = Gpu::open();
+    let qx_at = gpu.up(&qx);
+    let kx_at = gpu.up(&kx);
+    let w_at = gpu.up(&w);
+    let pos_at = gpu.up(&positions);
+    let qy_at = gpu.zeros(planes * 64 * 512 * 2);
+    let ky_at = gpu.zeros(planes * 512 * 2);
+    let plane = gpu.zeros(cells * row);
+    let page_ids: Vec<u32> = (0..pages_n as u32).collect();
+    let pool = KvPool {
+        keys: Tensor::new(plane, cells as u32, dsv4::DS_ROW, Dtype::U8),
+        values: Tensor::new(plane, cells as u32, dsv4::DS_ROW, Dtype::U8),
+        bf16_keys: Tensor::ABSENT,
+        bf16_values: Tensor::ABSENT,
+        key_scales: Tensor::ABSENT,
+        value_scales: Tensor::ABSENT,
+        page_indices: Tensor::new(gpu.up(&page_ids), pages_n as u32, 1, Dtype::U32),
+        page_indptr: Tensor::new(gpu.up(&[0u32, pages_n as u32]), 2, 1, Dtype::U32),
+        last_page_lens: Tensor::ABSENT,
+        row_valid: Tensor::ABSENT,
+        env_min: Tensor::ABSENT,
+        env_max: Tensor::ABSENT,
+        has_envelopes: false,
+        page_size: PAGE as i32,
+        seq_stride: i64::from(dsv4::DS_ROW),
+        head_stride: i64::from(dsv4::DS_ROW),
+        layout: 0,
+        scheme_byte: 0,
+        block_size: 0,
+        max_pages_per_request: pages_n as i32,
+        pages_in_batch: pages_n as i32,
+    };
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        rows_vec: true,
+        ..Tuning::DEFAULT
+    });
+    if window.is_some() {
+        let win_at = gpu.up(&[live, base, 0u32, 0u32]);
+        ctx.arm_stage(win_at);
+    }
+    let wp = Tensor::new(gpu.up(&w_page), rows, 1, Dtype::U32);
+    let wo = Tensor::new(gpu.up(&w_off), rows, 1, Dtype::U32);
+    let pt = Tensor::new(pos_at, rows, 1, Dtype::I32);
+    let wt = Tensor::new(w_at, 512, 1, Dtype::Bf16);
+    let yarn = Some(Yarn {
+        factor: 16.0,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+        original_max_position: 65536,
+    });
+    let append = || {
+        Some(rope::Append {
+            pool: &pool,
+            write_page: wp,
+            write_offset: wo,
+        })
+    };
+    if pair {
+        let landed = rope::norm_rope_pair(
+            &ctx,
+            rope::Side {
+                x: Tensor::new(qx_at, rows, 64 * 512, Dtype::Bf16),
+                head_dim: 512,
+                eps: 1e-6,
+                y: &mut Tensor::new(qy_at, rows, 64 * 512, Dtype::Bf16),
+            },
+            rope::Side {
+                x: Tensor::new(kx_at, rows, 512, Dtype::Bf16),
+                head_dim: 512,
+                eps: 1e-5,
+                y: &mut Tensor::new(ky_at, rows, 512, Dtype::Bf16),
+            },
+            wt,
+            pt,
+            64,
+            10000.0,
+            yarn,
+            append(),
+        )
+        .expect("the pair fires");
+        assert!(landed, "the pair lands in one launch");
+    } else {
+        rope::norm_rope_last(
+            &ctx,
+            Tensor::new(qx_at, rows, 64 * 512, Dtype::Bf16),
+            None,
+            512,
+            1e-6,
+            pt,
+            64,
+            10000.0,
+            true,
+            false,
+            yarn,
+            &mut Tensor::new(qy_at, rows, 64 * 512, Dtype::Bf16),
+        )
+        .expect("q fires");
+        let landed = rope::norm_rope_last_append(
+            &ctx,
+            Tensor::new(kx_at, rows, 512, Dtype::Bf16),
+            wt,
+            512,
+            1e-5,
+            pt,
+            64,
+            10000.0,
+            true,
+            false,
+            yarn,
+            &mut Tensor::new(ky_at, rows, 512, Dtype::Bf16),
+            append(),
+        )
+        .expect("the plane fires");
+        assert!(landed, "the plane lands in one pass");
+    }
+    gpu.sync();
+    (
+        gpu.down(qy_at, planes * 64 * 512),
+        gpu.down(ky_at, planes * 512),
+        gpu.down(plane, cells * row),
+    )
+}
+
+#[test]
+fn q_and_the_kv_plane_land_in_one_launch() {
+    for window in [None, Some((24, 17, 5))] {
+        let one = pair_pass(true, window);
+        let two = pair_pass(false, window);
+        assert!(one.0 == two.0, "{window:?}: q's rows differ");
+        assert!(one.1 == two.1, "{window:?}: the plane's rows differ");
+        assert!(one.2 == two.2, "{window:?}: the fp8 pool's bytes differ");
+        assert!(
+            one.1.iter().any(|&b| b != 0),
+            "{window:?}: the plane is written"
+        );
+    }
+}

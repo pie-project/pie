@@ -1090,21 +1090,20 @@ __global__ void rope_partial_last_vec(
 // also writes the row as DeepSeek's fp8 row at its page and offset, as
 // `ds_append` writes it: a 64-wide tile's exponent over its eight lanes'
 // runs, the rotated tile kept in bf16.
-template <int PER, bool WEIGHTED, bool APPEND = false>
-__global__ void __launch_bounds__(256) norm_rope_last(
+// One (row, head) unit of `norm_rope_last`, its block's frequencies in
+// `freq_s`.
+template <int PER, bool WEIGHTED, bool APPEND>
+__device__ __forceinline__ void norm_rope_unit(
+    const float* freq_s,
+    int unit,
     const bf16* __restrict__ x,
     const bf16* __restrict__ weight,
     bf16* __restrict__ y,
     const i32* __restrict__ positions,
-    int units,
     int heads,
     float eps,
     int rotary_dim,
-    float theta,
     bool inverse,
-    float yarn_factor,
-    float yarn_low_dim,
-    float yarn_high_dim,
     std::uint8_t* __restrict__ pages,
     const u32* __restrict__ w_page,
     const u32* __restrict__ w_off,
@@ -1117,19 +1116,6 @@ __global__ void __launch_bounds__(256) norm_rope_last(
     constexpr int head_dim = 32 * PER;
     constexpr int RUN = PER == 4 ? 4 : 8;
     constexpr int RUNS = PER / RUN;
-    // The tail's frequencies once a block, as the spread form works them.
-    __shared__ float freq_s[64];
-    if (threadIdx.x < rotary_dim / 2) {
-        const int d = static_cast<int>(threadIdx.x);
-        float freq = powf(theta, -2.f * static_cast<float>(d) / static_cast<float>(rotary_dim));
-        if (yarn_factor > 1.f) {
-            freq = yarn_original_freq(freq, yarn_factor, yarn_low_dim, yarn_high_dim, d);
-        }
-        freq_s[d] = freq;
-    }
-    __syncthreads();
-    const int unit = static_cast<int>(blockIdx.x) * 8 + static_cast<int>(threadIdx.x >> 5);
-    if (unit >= units) return;
     if (win != nullptr && unit / heads >= static_cast<int>(win[0])) return;
     const int plane_row = win != nullptr ? unit + static_cast<int>(win[1]) * heads : unit;
     const int row = plane_row / heads;
@@ -1253,6 +1239,95 @@ __global__ void __launch_bounds__(256) norm_rope_last(
             }
         }
         if (lane == 0) dst.scales[ds::kDsScales] = 0;
+    }
+}
+
+
+template <int PER, bool WEIGHTED, bool APPEND = false>
+__global__ void __launch_bounds__(256) norm_rope_last(
+    const bf16* __restrict__ x,
+    const bf16* __restrict__ weight,
+    bf16* __restrict__ y,
+    const i32* __restrict__ positions,
+    int units,
+    int heads,
+    float eps,
+    int rotary_dim,
+    float theta,
+    bool inverse,
+    float yarn_factor,
+    float yarn_low_dim,
+    float yarn_high_dim,
+    std::uint8_t* __restrict__ pages,
+    const u32* __restrict__ w_page,
+    const u32* __restrict__ w_off,
+    const u8* __restrict__ row_valid,
+    int page_size,
+    const u32* __restrict__ win)
+{
+    // The tail's frequencies once a block, as the spread form works them.
+    __shared__ float freq_s[64];
+    if (threadIdx.x < rotary_dim / 2) {
+        const int d = static_cast<int>(threadIdx.x);
+        float freq = powf(theta, -2.f * static_cast<float>(d) / static_cast<float>(rotary_dim));
+        if (yarn_factor > 1.f) {
+            freq = yarn_original_freq(freq, yarn_factor, yarn_low_dim, yarn_high_dim, d);
+        }
+        freq_s[d] = freq;
+    }
+    __syncthreads();
+    const int unit = static_cast<int>(blockIdx.x) * 8 + static_cast<int>(threadIdx.x >> 5);
+    if (unit >= units) return;
+    norm_rope_unit<PER, WEIGHTED, APPEND>(freq_s, unit, x, weight, y, positions, heads, eps, rotary_dim,
+                                          inverse, pages, w_page, w_off, row_valid, page_size, win);
+}
+
+// DeepSeek-V4's q (scale-free, QPER a lane) and its kv plane (scaled, one
+// 512-wide head, written to the cache where APPEND) normed and rotated in
+// one launch: warps [0, q_units) take q's (row, head) units, the rest the
+// plane's rows, the frequencies shared.
+template <int QPER, bool APPEND>
+__global__ void __launch_bounds__(256) norm_rope_pair(
+    const bf16* __restrict__ qx,
+    bf16* __restrict__ qy,
+    int q_units,
+    int q_heads,
+    float q_eps,
+    const bf16* __restrict__ kx,
+    const bf16* __restrict__ kw,
+    bf16* __restrict__ ky,
+    int kv_units,
+    float kv_eps,
+    const i32* __restrict__ positions,
+    int rotary_dim,
+    float theta,
+    float yarn_factor,
+    float yarn_low_dim,
+    float yarn_high_dim,
+    std::uint8_t* __restrict__ pages,
+    const u32* __restrict__ w_page,
+    const u32* __restrict__ w_off,
+    const u8* __restrict__ row_valid,
+    int page_size,
+    const u32* __restrict__ win)
+{
+    __shared__ float freq_s[64];
+    if (threadIdx.x < rotary_dim / 2) {
+        const int d = static_cast<int>(threadIdx.x);
+        float freq = powf(theta, -2.f * static_cast<float>(d) / static_cast<float>(rotary_dim));
+        if (yarn_factor > 1.f) {
+            freq = yarn_original_freq(freq, yarn_factor, yarn_low_dim, yarn_high_dim, d);
+        }
+        freq_s[d] = freq;
+    }
+    __syncthreads();
+    const int unit = static_cast<int>(blockIdx.x) * 8 + static_cast<int>(threadIdx.x >> 5);
+    if (unit < q_units) {
+        norm_rope_unit<QPER, false, false>(freq_s, unit, qx, nullptr, qy, positions, q_heads, q_eps,
+                                           rotary_dim, false, nullptr, nullptr, nullptr, nullptr, 0, win);
+    } else if (unit < q_units + kv_units) {
+        norm_rope_unit<16, true, APPEND>(freq_s, unit - q_units, kx, kw, ky, positions, 1, kv_eps,
+                                         rotary_dim, false, pages, w_page, w_off, row_valid, page_size, win);
     }
 }
 

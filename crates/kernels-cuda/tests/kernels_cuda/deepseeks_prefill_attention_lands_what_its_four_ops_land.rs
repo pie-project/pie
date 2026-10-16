@@ -202,11 +202,56 @@ fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool, fp8: bool) {
         &pooled,
         sink_t,
         scale,
+        None,
         &mut o,
     )
     .expect("the prefill attention fires");
     gpu.sync();
     let got: Vec<u16> = gpu.down(o_at, n * HEADS * D);
+
+    // The output's tail turned back with it lands what turning it after does.
+    {
+        let turn = kernels_cuda::attn::dsv4::Turn {
+            dim: 64,
+            theta: 10000.0,
+            yarn: Some(kernels_cuda::elemwise::rope::Yarn {
+                factor: 16.0,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                original_max_position: 65536,
+            }),
+        };
+        let o2_at = gpu.zeros(n * HEADS * D * 2);
+        let mut o2 = Tensor::new(o2_at, o.rows, o.width, Dtype::Bf16);
+        dsv4_prefill::prefill(
+            &ctx,
+            "attention.pool_attention",
+            q_t,
+            pos_t,
+            req_t,
+            &win,
+            &pooled,
+            sink_t,
+            scale,
+            Some(turn),
+            &mut o2,
+        )
+        .expect("the turned prefill attention fires");
+        kernels_cuda::elemwise::rope::partial_last(
+            &ctx, &mut o, pos_t, 64, D as u32, 10000.0, true, true, turn.yarn,
+        )
+        .expect("the turn after fires");
+        gpu.sync();
+        let after: Vec<u16> = gpu.down(o_at, n * HEADS * D);
+        let with: Vec<u16> = gpu.down(o2_at, n * HEADS * D);
+        for (i, (&a, &b)) in with.iter().zip(&after).enumerate() {
+            let (a, b) = (from_bf16(a), from_bf16(b));
+            assert!(
+                (a - b).abs() <= b.abs() / 64.0 + 1e-2,
+                "ratio {ratio} sparse {sparse} fp8 {fp8}: turned element {i} is {a} against {b}"
+            );
+        }
+    }
 
     let mut worst = 0f64;
     for (r, &(req, pos)) in rows.iter().enumerate() {
@@ -338,6 +383,7 @@ fn deepseeks_prefill_attention_paces_a_prefill() {
                 &pooled,
                 sink_t,
                 0.044,
+                None,
                 &mut o,
             )
             .expect("the prefill attention fires");

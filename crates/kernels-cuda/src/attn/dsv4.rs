@@ -101,6 +101,65 @@ fn smem(fp8: bool) -> u32 {
     GROUP * ld * 2 + ring + 2 * GROUP * (KEYS + 8) * 4
 }
 
+/// The inverse rotation of an attention output's last `dim` dims, landed
+/// with the output (DeepSeek-V4 turns its attention output back by each
+/// row's position before its output projection): `rope_partial_last`'s
+/// interleaved turn with the angles negated.
+#[derive(Clone, Copy, Debug)]
+pub struct Turn {
+    pub dim: u32,
+    pub theta: f32,
+    pub yarn: Option<crate::elemwise::rope::Yarn>,
+}
+
+/// `pie::attn::dsv4::Turn`, field for field.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct TurnArgs {
+    dim: i32,
+    theta: f32,
+    factor: f32,
+    low: f32,
+    high: f32,
+}
+
+impl TurnArgs {
+    pub(crate) const NONE: TurnArgs = TurnArgs {
+        dim: 0,
+        theta: 0.0,
+        factor: 1.0,
+        low: 0.0,
+        high: 0.0,
+    };
+
+    pub(crate) fn of(turn: Option<Turn>) -> TurnArgs {
+        let Some(t) = turn else {
+            return TurnArgs::NONE;
+        };
+        let dim = i32::try_from(t.dim).unwrap_or(0);
+        let (factor, low, high) = match t.yarn {
+            Some(y) => {
+                let (low, high) = crate::elemwise::rope::ramp_bounds(
+                    dim,
+                    t.theta,
+                    y.beta_fast,
+                    y.beta_slow,
+                    i32::try_from(y.original_max_position).unwrap_or(i32::MAX),
+                );
+                (y.factor, low, high)
+            }
+            None => (1.0, 0.0, 0.0),
+        };
+        TurnArgs {
+            dim,
+            theta: t.theta,
+            factor,
+            low,
+            high,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn decode(
     ctx: &Ctx,
@@ -114,9 +173,11 @@ pub fn decode(
     heads: u32,
     head_dim: u32,
     sm_scale: f32,
+    turn: Option<Turn>,
     o: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.dsv4_decode";
+    let turn = TurnArgs::of(turn);
     if !takes(heads, head_dim, window_pool, pooled.as_ref()) {
         return Err(refuse(
             OP,
@@ -201,6 +262,10 @@ pub fn decode(
             sinks.arg(),
             o.arg(),
             sm_scale.arg(),
+            ArgValue::Bytes {
+                ptr: (&raw const turn).cast(),
+                len: core::mem::size_of::<TurnArgs>(),
+            },
             ctx.stage(),
         ],
     )

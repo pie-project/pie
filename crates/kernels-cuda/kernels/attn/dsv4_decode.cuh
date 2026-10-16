@@ -163,6 +163,7 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
     const SinkT* __restrict__ sinks,
     bf16* __restrict__ o,
     float scale,
+    Turn turn,
     const u32* __restrict__ win)
 {
     using S = Shape<D, kFp8>;
@@ -435,6 +436,12 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
 
     const int h_lo = g, h_hi = g + 8;
     bf16* orow = o + (static_cast<long long>(row) * kHeads + group * kGroup) * D;
+    // The turn's frequencies, once a block (every thread reaches here).
+    __shared__ float s_turn[64];
+    if (turn.dim > 0) {
+        if (tid < turn.dim / 2) s_turn[tid] = turn_freq(tid, turn);
+        __syncthreads();
+    }
 
     if constexpr (R == 1) {
         const float sink_lo = Elem<SinkT>::to_f32(sinks[group * kGroup + h_lo]) * kLog2e;
@@ -445,13 +452,16 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
         const float den_hi = l_hi * f_hi + exp2f(sink_hi - top_hi);
         const float s_lo = den_lo > 0.f ? f_lo / den_lo : 0.f;
         const float s_hi = den_hi > 0.f ? f_hi / den_hi : 0.f;
+        const int turn_pos = turn.dim > 0 ? positions[row] : 0;
 #pragma unroll
         for (int n = 0; n < kNT; ++n) {
             const int d = warp * kCols + n * 8 + p;
-            *reinterpret_cast<std::uint32_t*>(orow + h_lo * D + d) =
-                pack2(oacc[n][0] * s_lo, oacc[n][1] * s_lo);
-            *reinterpret_cast<std::uint32_t*>(orow + h_hi * D + d) =
-                pack2(oacc[n][2] * s_hi, oacc[n][3] * s_hi);
+            float a0 = oacc[n][0] * s_lo, a1 = oacc[n][1] * s_lo;
+            float b0 = oacc[n][2] * s_hi, b1 = oacc[n][3] * s_hi;
+            turn_back(a0, a1, d, D, turn_pos, turn, s_turn);
+            turn_back(b0, b1, d, D, turn_pos, turn, s_turn);
+            *reinterpret_cast<std::uint32_t*>(orow + h_lo * D + d) = pack2(a0, a1);
+            *reinterpret_cast<std::uint32_t*>(orow + h_hi * D + d) = pack2(b0, b1);
         }
     } else {
         // The ranks' fold: every rank's (max, sum) a head, then its output
@@ -511,6 +521,11 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
                 acc.y += v[r].y;
                 acc.z += v[r].z;
                 acc.w += v[r].w;
+            }
+            if (turn.dim > 0) {
+                const int turn_pos = positions[row];
+                turn_back(acc.x, acc.y, d, D, turn_pos, turn, s_turn);
+                turn_back(acc.z, acc.w, d + 2, D, turn_pos, turn, s_turn);
             }
             uint2 packed;
             packed.x = pack2(acc.x, acc.y);

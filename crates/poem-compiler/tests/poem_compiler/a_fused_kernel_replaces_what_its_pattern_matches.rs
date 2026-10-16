@@ -674,3 +674,74 @@ fn deepseeks_compressor_lands_as_one_op() {
     // A latent read past the match keeps the compressor apart.
     assert!(!ops(&fuse(chain(true), &kernels)).contains(&"attention.pool_compress"));
 }
+
+#[test]
+fn deepseeks_q_and_kv_plane_land_as_one_op() {
+    let layer = trace(|p| {
+        let positions = p.indices("positions");
+        let x = p.rows("x", 64);
+        let q = linear::matmul(&x, &p.weight("q_up", [64 * 512, 64]));
+        let q = elemwise::rmsnorm_no_scale(&q, 512, 1e-6);
+        let q = elemwise::rope_partial_last_yarn(&q, &positions, 64, 512, 1e4, true, false, None);
+        let plane = linear::matmul(&x, &p.weight("kv_down", [512, 64]));
+        let plane = elemwise::rmsnorm(&plane, &p.weight("kv_norm", [512]), 1e-6);
+        let plane =
+            elemwise::rope_partial_last_yarn(&plane, &positions, 64, 512, 1e4, true, false, None);
+        let cache = p.cache("kv");
+        attn::kv_append_shared(&plane, cache, &p.rows("wp", 1), &p.rows("wo", 1));
+        elemwise::silu(&q);
+    });
+    let kernels = [
+        "elementwise.norm_rope_pair",
+        "elementwise.norm_rope_last_append",
+        "elementwise.norm_rope_last",
+    ];
+    assert_eq!(
+        ops(&fuse(layer, &kernels)),
+        [
+            "linear.matmul",
+            "linear.matmul",
+            "elementwise.norm_rope_pair",
+            "elementwise.silu"
+        ]
+    );
+}
+
+#[test]
+fn deepseeks_attention_lands_its_output_turned_back() {
+    let layer = trace(|p| {
+        let q = p.rows("q", 64 * 512);
+        let cache = p.cache("kv");
+        let plan = p.value(
+            "plan",
+            poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
+        );
+        let (o, lse) = attn::prefill_lse(&q, &plan, cache, Some(128), 512, 1, 0.04);
+        let positions = p.indices("positions");
+        let requests = p.indices("requests");
+        let entries = p.cache("entries");
+        let (po, plse) = attn::pool_lse(&q, &positions, &requests, entries, 128, 64, 512, 0.04);
+        let (o, lse) = attn::merge_lse(&o, &lse, &po, &plse, 64, 512);
+        let out = attn::sink(&o, &lse, &p.weight("sinks", [64]), 512);
+        let turned =
+            elemwise::rope_partial_last_yarn(&out, &positions, 64, 512, 1e4, true, true, None);
+        elemwise::silu(&turned);
+    });
+    let fused = fuse(layer, &["attention.pool_attention"]);
+    assert_eq!(
+        ops(&fused),
+        ["attention.pool_attention", "elementwise.silu"]
+    );
+    let Some(poem_ir::Operation::Fused(poem_ir::Fused::PoolAttention { rotate, .. })) =
+        fused.nodes.first().map(|node| &node.op)
+    else {
+        panic!("the first op is the pool attention");
+    };
+    assert!(
+        matches!(
+            rotate.as_deref(),
+            Some(poem_ir::Elementwise::RopePartialLast { inverse: true, .. })
+        ),
+        "the attention holds the turn"
+    );
+}

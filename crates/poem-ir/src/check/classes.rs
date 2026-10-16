@@ -462,6 +462,7 @@ fn writes_cache(op: &Operation) -> bool {
                 | Fused::RopeYarnAppend { .. }
                 | Fused::NormRopeLastAppend { .. }
                 | Fused::PoolCompress { .. }
+                | Fused::NormRopePair { .. }
                 | Fused::SplitRopeYarnAppend { .. }
                 | Fused::QgQknormRopeAppend { .. }
         ),

@@ -117,6 +117,9 @@ pub enum Fused {
         write_page: ValueId,
         write_offset: ValueId,
     },
+    /// DeepSeek-V4's q (`NormRopeLast`, scale-free) and its kv plane
+    /// (`NormRopeLastAppend`) of one layer, landed together.
+    NormRopePair { q: Box<Fused>, kv: Box<Fused> },
     /// DeepSeek-V4's compressor at its boundaries: the gathered entries
     /// (`PoolGather`), their RMS norm times `weight` into `latent`, its tail
     /// rotated (`rotate`, a `RopePartialLast` over `latent`) and written to
@@ -260,6 +263,9 @@ pub enum Fused {
     /// `MergeLse` of the two) and the sinks over the merged output: a
     /// backend lands the sinked output in `o_out` in one pass, or runs the
     /// four. Every intermediate is still an output, read by nothing else.
+    /// `rotate`, where the sinked output's tail is turned next (a
+    /// `RopePartialLast` of `o_out` at the pool's positions, DeepSeek-V4's
+    /// inverse rotation), lands its rotated rows too.
     PoolAttention {
         window: Box<Attention>,
         pool: Box<Attention>,
@@ -267,6 +273,7 @@ pub enum Fused {
         sink: ValueId,
         head_dim: u32,
         o_out: ValueId,
+        rotate: Option<Box<Elementwise>>,
     },
     /// A latent attention's prefill whole: where it opens on them, the cut
     /// of `q_b`'s rows into their two halves (`split`, an `MlaSplitQB`),
@@ -441,6 +448,10 @@ impl Operands for Fused {
                 write_offset,
                 ..
             } => sink.extend([*x, *weight, *positions, *cache, *write_page, *write_offset]),
+            Self::NormRopePair { q, kv } => {
+                q.inputs(sink);
+                kv.inputs(sink);
+            }
             // The boundaries' positions and requests, the state's pages, the
             // norm's weight, the rope positions, the pool and its write
             // tables, then the gather's position bias where it has one.
@@ -718,6 +729,10 @@ impl Operands for Fused {
             Self::RmsnormRopePartialQ { y, q_out, .. } => sink.extend([*y, *q_out]),
             Self::NormRopeLast { y, q_out, .. } => sink.extend([*y, *q_out]),
             Self::NormRopeLastAppend { y, .. } => sink.push(*y),
+            Self::NormRopePair { q, kv } => {
+                q.outputs(sink);
+                kv.outputs(sink);
+            }
             Self::PoolCompress {
                 gather,
                 latent,
@@ -789,12 +804,16 @@ impl Operands for Fused {
                 pool,
                 merge,
                 o_out,
+                rotate,
                 ..
             } => {
                 window.outputs(sink);
                 pool.outputs(sink);
                 merge.outputs(sink);
                 sink.push(*o_out);
+                if let Some(rotate) = rotate {
+                    rotate.outputs(sink);
+                }
             }
             Self::MlaPrefillExpanded {
                 split,
@@ -848,6 +867,7 @@ impl Operands for Fused {
                 pool,
                 merge,
                 o_out,
+                rotate,
                 ..
             } => {
                 window.aliases(sink);
@@ -855,6 +875,9 @@ impl Operands for Fused {
                 merge.aliases(sink);
                 if let Attention::MergeLse { o, .. } = **merge {
                     sink.push((*o_out, o));
+                }
+                if let Some(rotate) = rotate {
+                    rotate.aliases(sink);
                 }
             }
             Self::NormModulate { .. }
@@ -877,6 +900,10 @@ impl Operands for Fused {
             | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
             // The rotation turns the normed rows in place.
             Self::PoolCompress { rotate, .. } => rotate.aliases(sink),
+            Self::NormRopePair { q, kv } => {
+                q.aliases(sink);
+                kv.aliases(sink);
+            }
             // The rotation turns the normed rows in place.
             Self::QgQknormRopeAppend {
                 q_out,
@@ -899,6 +926,7 @@ impl Operands for Fused {
             Self::NormRopeLast { .. } => "elementwise.norm_rope_last",
             Self::NormRopeLastAppend { .. } => "elementwise.norm_rope_last_append",
             Self::PoolCompress { .. } => "attention.pool_compress",
+            Self::NormRopePair { .. } => "elementwise.norm_rope_pair",
             Self::NormModulate { .. } => "elementwise.norm_modulate",
             Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
             Self::MatmulGeglu { .. } => "linear.matmul_geglu",

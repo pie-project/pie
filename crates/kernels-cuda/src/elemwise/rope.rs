@@ -1016,3 +1016,137 @@ pub fn qg_qknorm_rope_append(
         ],
     )
 }
+
+/// One side of [`norm_rope_pair`]: the rows, the head width and the norm's
+/// epsilon, where the normed and rotated rows land.
+pub struct Side<'a> {
+    pub x: Tensor,
+    pub head_dim: u32,
+    pub eps: f32,
+    pub y: &'a mut Tensor,
+}
+
+/// DeepSeek-V4's q (scale-free per head) and its kv plane (scaled, one
+/// 512-wide head) normed and rotated (forward, interleaved) in one launch
+/// (`norm_rope_pair`), the plane also written into DeepSeek's fp8 pool where
+/// `append` names one: whether it fired (under `kernel.elemwise.rows_vec`,
+/// for the shapes it is built for). Nothing is fired where it did not.
+#[allow(clippy::too_many_arguments)]
+pub fn norm_rope_pair(
+    ctx: &Ctx,
+    q: Side<'_>,
+    kv: Side<'_>,
+    kv_weight: Tensor,
+    positions: Tensor,
+    rotary_dim: u32,
+    theta: f32,
+    yarn: Option<Yarn>,
+    append: Option<Append<'_>>,
+) -> Result<bool, Error> {
+    const OP: &str = "elementwise.norm_rope_pair";
+    let qper = q.head_dim / 32;
+    let fits = ctx.tuning().rows_vec
+        && q.x.dtype == Dtype::Bf16
+        && kv.x.dtype == Dtype::Bf16
+        && kv_weight.dtype == Dtype::Bf16
+        && matches!(q.head_dim, 128 | 256 | 512)
+        && kv.head_dim == 512
+        && kv.y.width == 512
+        && rotary_dim > 0
+        && rotary_dim <= 128.min(q.head_dim)
+        && rotary_dim.is_multiple_of(qper.min(8))
+        && q.y.width.is_multiple_of(q.head_dim)
+        && q.y.rows == kv.y.rows
+        && append
+            .as_ref()
+            .is_none_or(|a| crate::attn::dsv4::fp8_ds(a.pool))
+        && [q.x.ptr, q.y.ptr, kv.x.ptr, kv.y.ptr, kv_weight.ptr]
+            .iter()
+            .all(|&at| aligned16(at));
+    if !fits {
+        return Ok(false);
+    }
+    positions_stream(OP, positions, &q.x);
+    let (factor, low_dim, high_dim) = match yarn {
+        Some(yn) => {
+            let max_position = nonzero(
+                OP,
+                "the position span this layer's YaRN ramp states",
+                yn.original_max_position,
+            )?;
+            let (low, high) = ramp_bounds(
+                stated(OP, rotary_dim)?,
+                theta,
+                yn.beta_fast,
+                yn.beta_slow,
+                stated(OP, max_position)?,
+            );
+            (yn.factor, low, high)
+        }
+        None => (UNSCALED, 0.0, 0.0),
+    };
+    let q_heads = q.y.width / q.head_dim;
+    let q_units = q.y.rows.checked_mul(q_heads).ok_or_else(|| {
+        refuse(
+            OP,
+            format!("{} rows of {q_heads} heads overflow a grid", q.y.rows),
+        )
+    })?;
+    let kv_units = kv.y.rows;
+    let units = q_units + kv_units;
+    if units == 0 {
+        return Ok(true);
+    }
+    let appends = append.is_some();
+    let (pages, write_page, write_offset, row_valid, page_size) = match &append {
+        Some(a) => (
+            a.pool.keys.arg(),
+            a.write_page.arg(),
+            a.write_offset.arg(),
+            a.pool.row_valid.arg(),
+            a.pool.page_size.arg(),
+        ),
+        None => (
+            Tensor::ABSENT.arg(),
+            Tensor::ABSENT.arg(),
+            Tensor::ABSENT.arg(),
+            Tensor::ABSENT.arg(),
+            0_i32.arg(),
+        ),
+    };
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::norm_rope_pair<{qper}, {appends}>"
+            )),
+        )
+        .apply(Launch::grid([units.div_ceil(8), 1, 1], [256, 1, 1])),
+        &[
+            q.x.arg(),
+            q.y.arg(),
+            stated(OP, q_units)?.arg(),
+            stated(OP, q_heads)?.arg(),
+            q.eps.arg(),
+            kv.x.arg(),
+            kv_weight.arg(),
+            kv.y.arg(),
+            stated(OP, kv_units)?.arg(),
+            kv.eps.arg(),
+            positions.arg(),
+            stated(OP, rotary_dim)?.arg(),
+            theta.arg(),
+            factor.arg(),
+            low_dim.arg(),
+            high_dim.arg(),
+            pages,
+            write_page,
+            write_offset,
+            row_valid,
+            page_size,
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}

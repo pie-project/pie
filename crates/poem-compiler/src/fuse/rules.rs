@@ -47,6 +47,7 @@ pub(super) fn all() -> Vec<Rule> {
         norm_modulate(),
         rmsnorm_rope_partial_q(),
         pool_compress(),
+        norm_rope_pair(),
         norm_rope_last_append(),
         norm_rope_last(),
         qg_qknorm_rope_append(),
@@ -175,7 +176,7 @@ fn hc_prenorm_project() -> Rule {
 /// compressed-pool one over the same q (every visible entry, or those an
 /// index selected), their merge and the sinks over it.
 fn pool_attention() -> Rule {
-    let chain = |selected: bool| {
+    let chain = |selected: bool, rotated: bool| {
         template(move |p| {
             let q = p.rows("q", W);
             let plan = p.value("plan", Ty::Struct(StructKind::AttnPrefillPlan));
@@ -216,12 +217,37 @@ fn pool_attention() -> Rule {
             p.name("mo", &mo);
             p.name("mlse", &mlse);
             let out = attn::sink(&mo, &mlse, &p.weight("sink", [W]), d);
-            p.export("o_out", &out);
+            if rotated {
+                // The sinked rows' tail turned back at the rows' positions
+                // (DeepSeek-V4's inverse rotation), the turned rows read on.
+                p.free("interleaved");
+                p.free("inverse");
+                p.free("yarn");
+                p.name("o_out", &out);
+                let turned = elemwise::rope_partial_last_yarn(
+                    &out,
+                    &positions,
+                    p.u32("rotary_dim"),
+                    d,
+                    p.f32("theta"),
+                    false,
+                    false,
+                    None,
+                );
+                p.export("o_rot", &turned);
+            } else {
+                p.export("o_out", &out);
+            }
         })
     };
     Rule::new(
         "attention.pool_attention",
-        [chain(true), chain(false)],
+        [
+            chain(true, true),
+            chain(false, true),
+            chain(true, false),
+            chain(false, false),
+        ],
         |m| {
             let attention = |name: &str| {
                 let Operation::Attention(attn) = m.op(name) else {
@@ -236,6 +262,12 @@ fn pool_attention() -> Rule {
                 sink: m.value("sink"),
                 head_dim: m.u32("d"),
                 o_out: m.value("o_out"),
+                rotate: m.get("o_rot").map(|_| {
+                    let Operation::Elementwise(rotate) = m.op("o_rot") else {
+                        unreachable!("the turned rows come from a rotation")
+                    };
+                    Box::new(rotate.clone())
+                }),
             }
         },
     )
@@ -1289,6 +1321,79 @@ fn norm_rope_last() -> Rule {
         Some(norm_dim) => norm_dim == m.u32("head_dim"),
         None => m.width("x") == Some(u64::from(m.u32("head_dim"))),
     })
+}
+
+/// DeepSeek-V4's q (a scale-free norm a head, its tail rotated) and its kv
+/// plane (a scaled norm of a row one head wide, rotated alike and written to
+/// the cache) of one layer: the two read the same positions at the same
+/// rotation, and nothing between them reads either.
+fn norm_rope_pair() -> Rule {
+    let pattern = template(|p| {
+        p.free("interleaved");
+        p.free("inverse");
+        p.free("yarn");
+        let positions = p.indices("positions");
+        let (rotary, d, theta) = (p.u32("rotary_dim"), p.u32("head_dim"), p.f32("theta"));
+        let qn = elemwise::rmsnorm_no_scale(&p.rows("q", W), d, p.f32("q_eps"));
+        p.name("q_y", &qn);
+        let q =
+            elemwise::rope_partial_last_yarn(&qn, &positions, rotary, d, theta, false, false, None);
+        p.export("q_out", &q);
+        let kn = elemwise::rmsnorm(&p.rows("kv", W), &p.weight("weight", [W]), p.f32("kv_eps"));
+        let k =
+            elemwise::rope_partial_last_yarn(&kn, &positions, rotary, d, theta, false, false, None);
+        p.name("kv_y", &k);
+        let cache = p.cache("cache");
+        let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
+        attn::kv_append_shared(&k, cache, &write_page, &write_offset);
+    });
+    Rule::new("elementwise.norm_rope_pair", [pattern], |m| {
+        let rope = |name: &str| match *m.op(name) {
+            Operation::Elementwise(Elementwise::RopePartialLast {
+                interleaved,
+                inverse,
+                yarn,
+                ..
+            }) => (interleaved, inverse, yarn),
+            _ => unreachable!("`{name}` comes from a rotation"),
+        };
+        let (q_interleaved, q_inverse, q_yarn) = rope("q_out");
+        let (kv_interleaved, kv_inverse, kv_yarn) = rope("kv_y");
+        Fused::NormRopePair {
+            q: Box::new(Fused::NormRopeLast {
+                x: m.value("q"),
+                weight: None,
+                head_dim: m.u32("head_dim"),
+                eps: m.f32("q_eps"),
+                positions: m.value("positions"),
+                rotary_dim: m.u32("rotary_dim"),
+                theta: m.f32("theta"),
+                interleaved: q_interleaved,
+                inverse: q_inverse,
+                yarn: q_yarn,
+                y: m.value("q_y"),
+                q_out: m.value("q_out"),
+            }),
+            kv: Box::new(Fused::NormRopeLastAppend {
+                x: m.value("kv"),
+                weight: m.value("weight"),
+                head_dim: m.u32("head_dim"),
+                eps: m.f32("kv_eps"),
+                positions: m.value("positions"),
+                rotary_dim: m.u32("rotary_dim"),
+                theta: m.f32("theta"),
+                interleaved: kv_interleaved,
+                inverse: kv_inverse,
+                yarn: kv_yarn,
+                y: m.value("kv_y"),
+                cache: m.value("cache"),
+                write_page: m.value("write_page"),
+                write_offset: m.value("write_offset"),
+            }),
+        }
+    })
+    // One layer's: the plane's row is one head of q's width.
+    .when(|m| m.width("kv") == Some(u64::from(m.u32("head_dim"))))
 }
 
 /// DeepSeek-V4's compressor at its boundaries: the gathered entries normed,

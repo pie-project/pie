@@ -259,6 +259,7 @@ fn check(rows: usize, pool: Pool, bench: bool, fp8: bool) {
             HEADS as u32,
             D as u32,
             scale,
+            None,
             &mut o,
         )
         .expect("the fused attention fires");
@@ -340,6 +341,60 @@ fn check(rows: usize, pool: Pool, bench: bool, fp8: bool) {
         from_bf16(got[at]),
         want[at]
     );
+
+    // The output's tail turned back with it lands what turning it after does
+    // (`o_at` holds the unturned output; turned in place here).
+    let turn = dsv4::Turn {
+        dim: 64,
+        theta: 10000.0,
+        yarn: Some(kernels_cuda::elemwise::rope::Yarn {
+            factor: 16.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            original_max_position: 65536,
+        }),
+    };
+    let o2_at = gpu.zeros(rows * HEADS * D * 2);
+    let mut o2 = Tensor::new(o2_at, rows as u32, (HEADS * D) as u32, Dtype::Bf16);
+    dsv4::decode(
+        &gpu.ctx(),
+        q_t,
+        pos_t,
+        req_t,
+        &window_pool,
+        WINDOW as u32,
+        pooled,
+        sink_t,
+        HEADS as u32,
+        D as u32,
+        scale,
+        Some(turn),
+        &mut o2,
+    )
+    .expect("the turned attention fires");
+    let mut o = Tensor::new(o_at, rows as u32, (HEADS * D) as u32, Dtype::Bf16);
+    kernels_cuda::elemwise::rope::partial_last(
+        &gpu.ctx(),
+        &mut o,
+        pos_t,
+        64,
+        D as u32,
+        10000.0,
+        true,
+        true,
+        turn.yarn,
+    )
+    .expect("the turn after fires");
+    gpu.sync();
+    let after: Vec<u16> = gpu.down(o_at, rows * HEADS * D);
+    let with: Vec<u16> = gpu.down(o2_at, rows * HEADS * D);
+    for (i, (&a, &b)) in with.iter().zip(&after).enumerate() {
+        let (a, b) = (from_bf16(a), from_bf16(b));
+        assert!(
+            (a - b).abs() <= b.abs() / 64.0 + 1e-2,
+            "{label}: turned element {i} is {a} against {b}"
+        );
+    }
 }
 
 #[test]

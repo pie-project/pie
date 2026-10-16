@@ -61,6 +61,7 @@ struct Params {
     int q_stride;
     int o_stride;
     float scale_log2;
+    dsv4::Turn turn;
 };
 
 constexpr int kD = 512;
@@ -545,8 +546,13 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
             u32 out[16];
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                out[i] = pack_bf16(__uint_as_float(v[2 * i]) * scale,
-                                   __uint_as_float(v[2 * i + 1]) * scale);
+                float a = __uint_as_float(v[2 * i]) * scale;
+                float b = __uint_as_float(v[2 * i + 1]) * scale;
+                // No shared memory is left to hold the turn's table: a tail
+                // pair works its own frequency.
+                const int at = d0 + 2 * i - (kD - p.turn.dim);
+                if (p.turn.dim > 0 && at >= 0) dsv4::turn_pair(a, b, w.pos, dsv4::turn_freq(at / 2, p.turn));
+                out[i] = pack_bf16(a, b);
             }
             uint4* o4 = reinterpret_cast<uint4*>(dst + d0);
 #pragma unroll

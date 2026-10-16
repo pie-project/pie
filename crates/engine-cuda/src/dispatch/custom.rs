@@ -11,6 +11,7 @@ impl DispatchFused for Run<'_> {
             Fused::RopeYarnAppend { .. } => self.rope_yarn_append(op),
             Fused::NormRopeLastAppend { .. } => self.norm_rope_last_append(op),
             Fused::PoolCompress { .. } => self.pool_compress(op),
+            Fused::NormRopePair { .. } => self.norm_rope_pair(op),
             Fused::SplitRopeYarnAppend { .. } => self.split_rope_yarn_append(op),
             Fused::QgQknormRopeAppend { .. } => self.qg_qknorm_rope_append(op),
             Fused::LseSink { .. } => self.lse_sink(op),
@@ -348,9 +349,25 @@ impl Run<'_> {
         self.attention(absorb_out)
     }
 
+    /// DeepSeek-V4's attention, then the turn of its output's tail where the
+    /// fused op holds one and the pass did not land it.
+    fn pool_attention(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let turned = self.pool_attention_core(op)?;
+        if let Fused::PoolAttention {
+            rotate: Some(rotate),
+            ..
+        } = op
+            && !turned
+        {
+            self.elementwise(rotate)?;
+        }
+        Ok(())
+    }
+
     /// DeepSeek-V4's attention: the window, the pool, their merge and the
     /// sinks, as the trace had them. The sinked output is the merge's plane.
-    fn pool_attention(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+    /// Whether the pass also turned the output's tail (`rotate`).
+    fn pool_attention_core(&mut self, op: &Fused) -> Result<bool, kernels_cuda::Error> {
         let Fused::PoolAttention {
             window,
             pool,
@@ -358,6 +375,7 @@ impl Run<'_> {
             sink,
             head_dim,
             o_out,
+            rotate,
         } = op
         else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
@@ -365,13 +383,44 @@ impl Run<'_> {
         let poem_ir::Attention::MergeLse { o, lse, .. } = **merge else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
+        // The output's tail turned back with the output where the turn is
+        // DeepSeek-V4's (interleaved, inverse, at the pool's positions).
+        let turn = match (rotate.as_deref(), &**pool) {
+            (
+                Some(poem_ir::Elementwise::RopePartialLast {
+                    q,
+                    positions: at,
+                    rotary_dim,
+                    head_dim: d,
+                    theta,
+                    interleaved: true,
+                    inverse: true,
+                    yarn,
+                    ..
+                }),
+                poem_ir::Attention::PoolLse { positions, .. }
+                | poem_ir::Attention::PoolLseSelected { positions, .. },
+            ) if q == o_out && at == positions && d == head_dim => {
+                Some(kernels_cuda::attn::dsv4::Turn {
+                    dim: *rotary_dim,
+                    theta: *theta,
+                    yarn: yarn.map(|y| kernels_cuda::elemwise::rope::Yarn {
+                        factor: y.factor,
+                        beta_fast: y.beta_fast,
+                        beta_slow: y.beta_slow,
+                        original_max_position: y.original_max_position,
+                    }),
+                })
+            }
+            _ => None,
+        };
         // A decode's rows, up to what the profile says
         // (`kernel.sdpa.dsv4_decode_until`): the four in one launch.
         let rows = self.tensor(*o_out).rows;
         if rows <= self.ctx().tuning().dsv4_decode_until
-            && let Some(landed) = self.dsv4_decode(window, Some(pool), *sink, *o_out)
+            && let Some(landed) = self.dsv4_decode(window, Some(pool), *sink, *o_out, turn)
         {
-            return landed;
+            return landed.map(|()| turn.is_some());
         }
         // A prefill's rows, where the profile says
         // (`kernel.sdpa.dsv4_prefill_from`): the four in one tcgen05 pass.
@@ -441,8 +490,10 @@ impl Run<'_> {
                         &pooled,
                         self.tensor(*sink),
                         *sm_scale,
+                        turn,
                         &mut out,
-                    );
+                    )
+                    .map(|()| turn.is_some());
                 }
             }
         }
@@ -450,8 +501,9 @@ impl Run<'_> {
         // width, or a refusal, never the four ops reading them as bf16.
         if self.fp8_rows(window) {
             return self
-                .dsv4_decode(window, Some(pool), *sink, *o_out)
-                .unwrap_or_else(|| Err(fp8_unread(op.name())));
+                .dsv4_decode(window, Some(pool), *sink, *o_out, turn)
+                .unwrap_or_else(|| Err(fp8_unread(op.name())))
+                .map(|()| turn.is_some());
         }
         self.attention(window)?;
         self.attention(pool)?;
@@ -463,6 +515,7 @@ impl Run<'_> {
             head_dim: *head_dim,
             o_out: *o_out,
         })
+        .map(|()| false)
     }
 
     /// Whether `window`'s cache holds DeepSeek's fp8 rows.
@@ -493,6 +546,7 @@ impl Run<'_> {
         pool: Option<&poem_ir::Attention>,
         sink: poem_ir::ValueId,
         o_out: poem_ir::ValueId,
+        turn: Option<kernels_cuda::attn::dsv4::Turn>,
     ) -> Option<Result<(), kernels_cuda::Error>> {
         use kernels_cuda::attn::dsv4;
         let poem_ir::Attention::PrefillLse {
@@ -573,6 +627,7 @@ impl Run<'_> {
             heads,
             head_dim,
             sm_scale,
+            turn,
             &mut self.tensor(o_out),
         ))
     }
@@ -593,12 +648,12 @@ impl Run<'_> {
         if let poem_ir::Attention::PrefillLse { .. } = **attn {
             if self.fp8_rows(attn) {
                 return self
-                    .dsv4_decode(attn, None, *sink, *o_out)
+                    .dsv4_decode(attn, None, *sink, *o_out, None)
                     .unwrap_or_else(|| Err(fp8_unread(op.name())));
             }
             let rows = self.tensor(*o_out).rows;
             if rows <= self.ctx().tuning().dsv4_decode_until
-                && let Some(landed) = self.dsv4_decode(attn, None, *sink, *o_out)
+                && let Some(landed) = self.dsv4_decode(attn, None, *sink, *o_out, None)
             {
                 return landed;
             }
@@ -941,6 +996,109 @@ impl Run<'_> {
             &mut self.tensor(*latent),
         )?;
         self.attention(append)
+    }
+
+    /// DeepSeek-V4's q and kv plane normed and rotated in one launch (the
+    /// plane written as its fp8 row there too, or after it to a bf16 pool)
+    /// where the profile says (`kernel.elemwise.rows_vec`) and the shape
+    /// fits; else each as its own fused op.
+    fn norm_rope_pair(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        use kernels_cuda::elemwise::rope;
+        let Fused::NormRopePair { q, kv } = op else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let (
+            Fused::NormRopeLast {
+                x: qx,
+                weight: None,
+                head_dim: q_dim,
+                eps: q_eps,
+                positions,
+                rotary_dim,
+                theta,
+                interleaved: q_interleaved,
+                inverse: q_inverse,
+                yarn: q_yarn,
+                y: qy,
+                ..
+            },
+            Fused::NormRopeLastAppend {
+                x: kx,
+                weight,
+                head_dim: kv_dim,
+                eps: kv_eps,
+                positions: kv_positions,
+                rotary_dim: kv_rotary,
+                theta: kv_theta,
+                interleaved: kv_interleaved,
+                inverse: kv_inverse,
+                yarn: kv_yarn,
+                y: ky,
+                cache,
+                write_page,
+                write_offset,
+            },
+        ) = (&**q, &**kv)
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let alike = positions == kv_positions
+            && rotary_dim == kv_rotary
+            && theta.to_bits() == kv_theta.to_bits()
+            && *q_interleaved
+            && *kv_interleaved
+            && !*q_inverse
+            && !*kv_inverse
+            && q_yarn == kv_yarn;
+        if alike {
+            let pool = self.pool(*cache);
+            let fp8 = kernels_cuda::attn::dsv4::fp8_ds(&pool);
+            let yarn = q_yarn.map(|y| rope::Yarn {
+                factor: y.factor,
+                beta_fast: y.beta_fast,
+                beta_slow: y.beta_slow,
+                original_max_position: y.original_max_position,
+            });
+            let landed = rope::norm_rope_pair(
+                self.ctx(),
+                rope::Side {
+                    x: self.tensor(*qx),
+                    head_dim: *q_dim,
+                    eps: *q_eps,
+                    y: &mut self.tensor(*qy),
+                },
+                rope::Side {
+                    x: self.tensor(*kx),
+                    head_dim: *kv_dim,
+                    eps: *kv_eps,
+                    y: &mut self.tensor(*ky),
+                },
+                self.tensor(*weight),
+                self.tensor(*positions),
+                *rotary_dim,
+                *theta,
+                yarn,
+                fp8.then_some(rope::Append {
+                    pool: &pool,
+                    write_page: self.tensor(*write_page),
+                    write_offset: self.tensor(*write_offset),
+                }),
+            )?;
+            if landed {
+                if fp8 {
+                    return Ok(());
+                }
+                return kernels_cuda::attn::kv_append_shared(
+                    self.ctx(),
+                    self.ragged_lanes(*ky),
+                    &pool,
+                    self.tensor(*write_page),
+                    self.tensor(*write_offset),
+                );
+            }
+        }
+        self.fused_elementwise(q)?;
+        self.norm_rope_last_append(kv)
     }
 
     /// DeepSeek-V4's kv plane normed, rotated and written in one launch
