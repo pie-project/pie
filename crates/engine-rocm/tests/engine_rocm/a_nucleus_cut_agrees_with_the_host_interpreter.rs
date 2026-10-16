@@ -302,12 +302,7 @@ fn compare_cut(cut: Cut, rows: u32, len: u32, data: Vec<f32>, thresholds: &[f32]
 /// The cut's plan rests on f32 bucket sums that device atomics add in no set
 /// order; its verdicts must not: the same rows, fired over and over, keep
 /// the same elements bit for bit (and the interpreter's).
-#[test]
 fn a_cut_keeps_the_same_elements_every_fire() {
-    if !engine_rocm::device::present() {
-        eprintln!("no device: skipping");
-        return;
-    }
     // A Qwen-next vocabulary: rows as a random-weight model's and a trained
     // one's next-token distributions spread, and bf16 runs of equal values.
     let len = 248_320;
@@ -350,6 +345,7 @@ fn a_nucleus_cut_agrees_with_the_host_interpreter_every_case() {
         return;
     }
     a_vocabulary_wide_cut_matches_bit_for_bit();
+    a_cut_keeps_the_same_elements_every_fire();
     the_edges_of_the_cut_match();
     a_row_outside_the_mass_contract_still_matches();
     a_top_k_cut_matches();
