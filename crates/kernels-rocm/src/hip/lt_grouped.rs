@@ -25,8 +25,8 @@
 //!   knowledge of the counts.
 //!
 //! hipBLASLt's own grouped heuristic offers nothing for these libraries (a
-//! `FreeSize` table); its contract is "time every algorithm", which the
-//! caller does over [`Library::candidates`].
+//! `FreeSize` table); which tile a shape takes is the device profile's
+//! (`kernel.moe.lt_tile_*`), measured offline (`tests/lt_grouped.rs`).
 //!
 //! Guards: the hipBLASLt version must be a known major.minor, and only
 //! solutions whose argument contract matches the one above are offered.
@@ -251,76 +251,20 @@ impl Library {
         Ok(f)
     }
 
-    /// The solutions worth timing for `n` weight rows and about `per_expert`
-    /// routes a group, one a tile shape (MT0 × MT1 × depth): those wasting
-    /// at most a quarter of their area on padding, largest first (and none
-    /// under 128 × 128 where the groups fill such tiles), then — short of
-    /// half of `cap` — the least wasteful others.
+    /// The solution of tile `code` (`MT0·10⁶ + MT1·10³ + depth U`, as the
+    /// device profile names it: 256_192_064 is MT256x192x64), and of its
+    /// runtime settings the first with WGM 1 and no StaggerU, else the first
+    /// with WGM 1, else the tile's first: one solution a tile, whatever the
+    /// shape.
     #[must_use]
-    pub fn candidates(&self, n: u32, per_expert: u32, cap: usize) -> Vec<usize> {
-        let per = per_expert.max(1);
-        let waste = |s: &Solution| {
-            let a = f64::from(n.div_ceil(s.mt[0]) * s.mt[0]) / f64::from(n);
-            let b = f64::from(per.div_ceil(s.mt[1]) * s.mt[1]) / f64::from(per);
-            a * b
+    pub fn pick(&self, code: u32) -> Option<usize> {
+        let tile = |s: &Solution| s.mt[0] * 1_000_000 + s.mt[1] * 1_000 + s.mt[2] == code;
+        let of = |want: &dyn Fn(&Solution) -> bool| {
+            self.solutions.iter().position(|s| tile(s) && want(s))
         };
-        let floor = if per >= 128 && n >= 256 { 128 * 128 } else { 0 };
-        let mut seen = std::collections::HashSet::new();
-        let usable: Vec<usize> = (0..self.solutions.len())
-            .filter(|&i| self.solutions[i].mt[0] >= 32 && self.solutions[i].mt[1] >= 16)
-            .collect();
-        let mut picks: Vec<usize> = usable
-            .iter()
-            .copied()
-            .filter(|&i| {
-                let s = &self.solutions[i];
-                waste(s) <= 1.25 && s.mt[0] * s.mt[1] >= floor
-            })
-            .collect();
-        picks.sort_by_key(|&i| {
-            let s = &self.solutions[i];
-            core::cmp::Reverse(s.mt[0] * s.mt[1])
-        });
-        picks.retain(|&i| seen.insert(self.solutions[i].mt));
-        picks.truncate(cap);
-        if picks.len() < cap / 2 {
-            let mut rest: Vec<usize> = usable
-                .into_iter()
-                .filter(|&i| !seen.contains(&self.solutions[i].mt))
-                .collect();
-            rest.sort_by(|&a, &b| waste(&self.solutions[a]).total_cmp(&waste(&self.solutions[b])));
-            for i in rest {
-                if picks.len() >= cap / 2 {
-                    break;
-                }
-                if seen.insert(self.solutions[i].mt) {
-                    picks.push(i);
-                }
-            }
-        }
-        picks
-    }
-
-    /// The solutions sharing solution `at`'s tile, one a runtime setting
-    /// (WGM, StaggerU): the second stage of a timing.
-    #[must_use]
-    pub fn variants(&self, at: usize) -> Vec<usize> {
-        let mt = self.solutions[at].mt;
-        let mut seen = std::collections::HashSet::new();
-        (0..self.solutions.len())
-            .filter(|&i| {
-                let s = &self.solutions[i];
-                s.mt == mt
-                    && seen.insert((
-                        s.kernel.as_str(),
-                        s.wgm,
-                        s.stagger_u,
-                        s.stagger_mapping,
-                        s.stagger_shift,
-                        s.wgmxcc,
-                    ))
-            })
-            .collect()
+        of(&|s| s.wgm == 1 && s.stagger_u == 0)
+            .or_else(|| of(&|s| s.wgm == 1))
+            .or_else(|| of(&|_| true))
     }
 
     /// Enqueues solution `at` over `groups` UserArguments records at
@@ -481,102 +425,6 @@ fn solutions(logic: &Mp, dtype: Dtype) -> Vec<Solution> {
         });
     }
     out
-}
-
-// ---- the tuning cache --------------------------------------------------------
-
-/// What a first use timed at one shape: the fastest solution's index (-1
-/// when none launched), its grouped GEMM alone, the whole hipBLASLt leg
-/// (ordering, staging and the scatter back), the native grouped leg, and
-/// the ordering and staging alone, in microseconds.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Tuned {
-    pub index: i64,
-    pub gemm_us: f64,
-    pub leg_us: f64,
-    pub native_us: f64,
-    pub stage_us: f64,
-}
-
-impl Tuned {
-    /// Whether the hipBLASLt leg beat the native one.
-    #[must_use]
-    pub fn wins(&self) -> bool {
-        self.index >= 0 && self.leg_us < self.native_us
-    }
-
-    fn render(&self) -> String {
-        format!(
-            "{} {:.1} {:.1} {:.1} {:.1}",
-            self.index, self.gemm_us, self.leg_us, self.native_us, self.stage_us
-        )
-    }
-
-    fn parse(text: &str) -> Option<Self> {
-        let mut it = text.split_whitespace();
-        Some(Self {
-            index: it.next()?.parse().ok()?,
-            gemm_us: it.next()?.parse().ok()?,
-            leg_us: it.next()?.parse().ok()?,
-            native_us: it.next()?.parse().ok()?,
-            stage_us: it.next()?.parse().ok()?,
-        })
-    }
-}
-
-/// What was timed for `key`, in this process or the kernels cache
-/// directory.
-#[must_use]
-pub fn remembered(key: &str) -> Option<Tuned> {
-    let map = tuned()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    map.get(key).copied()
-}
-
-/// Remembers `value` for `key`, here and on disk.
-pub fn remember(key: &str, value: Tuned) {
-    let mut map = tuned()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    map.insert(key.to_owned(), value);
-    let Some(path) = tuned_path() else { return };
-    let Some(parent) = path.parent() else { return };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let mut text: Vec<String> = map
-        .iter()
-        .map(|(k, v)| format!("{k}={}", v.render()))
-        .collect();
-    text.sort();
-    let staging = path.with_extension(format!("txt.{}", std::process::id()));
-    if std::fs::write(&staging, text.join("\n") + "\n").is_ok()
-        && std::fs::rename(&staging, &path).is_err()
-    {
-        let _ = std::fs::remove_file(&staging);
-    }
-}
-
-fn tuned_path() -> Option<PathBuf> {
-    Some(crate::disk::dir(crate::disk::GEMM_ALGOS)?.join("lt-grouped.txt"))
-}
-
-fn tuned() -> &'static Mutex<HashMap<String, Tuned>> {
-    static TUNED: OnceLock<Mutex<HashMap<String, Tuned>>> = OnceLock::new();
-    TUNED.get_or_init(|| {
-        let mut map = HashMap::new();
-        if let Some(text) = tuned_path().and_then(|p| std::fs::read_to_string(p).ok()) {
-            for line in text.lines() {
-                if let Some((k, v)) = line.split_once('=')
-                    && let Some(v) = Tuned::parse(v)
-                {
-                    map.insert(k.to_owned(), v);
-                }
-            }
-        }
-        Mutex::new(map)
-    })
 }
 
 // ---- msgpack, as much as the logic files use -------------------------------

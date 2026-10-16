@@ -9,11 +9,46 @@ use profile::{Anywhere, Decision, Profile, Registry};
 #[decision(id = "kernel.moe.grouped", flag, default = true, tune = search)]
 pub struct MoeGrouped;
 
-/// Whether a dense bank's grouped prefill takes hipBLASLt's grouped GEMM
-/// kernels (hip/lt_grouped.rs) where the first-use timing finds them faster.
+/// Whether a dense bank's grouped prefill may take hipBLASLt's grouped GEMM
+/// kernels (hip/lt_grouped.rs), from the routes an expert below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.lt_grouped", flag, default = true, tune = search)]
+#[decision(id = "kernel.moe.lt_grouped", flag, default = false, tune = search)]
 pub struct MoeLtGrouped;
+
+/// Routes an expert from which a routed select's grouped leg is hipBLASLt's
+/// grouped GEMM over rows gathered by expert and scattered back (0: never).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.lt_select_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct MoeLtSelectFrom(pub u32);
+
+/// Routes an expert from which a routed swiglu MLP keeps its rows by expert
+/// from the gate-up to the fold over hipBLASLt's grouped GEMM (0: never).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.lt_mlp_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct MoeLtMlpFrom(pub u32);
+
+/// The grouped GEMM tile hipBLASLt's leg takes over a contraction of at
+/// least `kernel.moe.lt_deep_k`, as MT0·10⁶ + MT1·10³ + depth (256_192_064
+/// is MT256x192x64).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.lt_tile_deep", constant(range(0..=4_000_000_000)), default = 256_192_064, tune = search)]
+pub struct MoeLtTileDeep(pub u32);
+
+/// The same over a shorter contraction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.lt_tile_shallow", constant(range(0..=4_000_000_000)), default = 256_160_032, tune = search)]
+pub struct MoeLtTileShallow(pub u32);
+
+/// The contraction from which hipBLASLt's leg takes the deep tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.lt_deep_k", constant(range(0..=1_048_576)), default = 2048, tune = search)]
+pub struct MoeLtDeepK(pub u32);
+
+/// Routes an expert from which a routed swiglu MLP keeps its routes in
+/// expert order between the native grouped legs (0: never).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.ordered_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct MoeOrderedFrom(pub u32);
 
 /// The same for mxfp4 banks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -234,6 +269,12 @@ pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
         .add::<MoeLtGrouped>()
+        .add::<MoeLtSelectFrom>()
+        .add::<MoeLtMlpFrom>()
+        .add::<MoeLtTileDeep>()
+        .add::<MoeLtTileShallow>()
+        .add::<MoeLtDeepK>()
+        .add::<MoeOrderedFrom>()
         .add::<MoeMxfp4Grouped>()
         .add::<MoeMxfp4Wmma>()
         .add::<DecodeSplitSmall>()
@@ -277,6 +318,12 @@ pub fn register(registry: &mut Registry) {
 pub struct Tuning {
     pub moe_grouped: bool,
     pub moe_lt_grouped: bool,
+    pub moe_lt_select_from: u32,
+    pub moe_lt_mlp_from: u32,
+    pub moe_lt_tile_deep: u32,
+    pub moe_lt_tile_shallow: u32,
+    pub moe_lt_deep_k: u32,
+    pub moe_ordered_from: u32,
     pub mxfp4_grouped: bool,
     pub mxfp4_wmma: bool,
     pub decode_split_small: bool,
@@ -321,7 +368,13 @@ impl Tuning {
     /// The registry defaults; a test holds the two equal.
     pub const DEFAULT: Tuning = Tuning {
         moe_grouped: true,
-        moe_lt_grouped: true,
+        moe_lt_grouped: false,
+        moe_lt_select_from: 0,
+        moe_lt_mlp_from: 0,
+        moe_lt_tile_deep: 256_192_064,
+        moe_lt_tile_shallow: 256_160_032,
+        moe_lt_deep_k: 2048,
+        moe_ordered_from: 0,
         mxfp4_grouped: true,
         mxfp4_wmma: true,
         decode_split_small: false,
@@ -365,6 +418,12 @@ impl Tuning {
         Tuning {
             moe_grouped: profile.on::<MoeGrouped>(&Anywhere),
             moe_lt_grouped: profile.on::<MoeLtGrouped>(&Anywhere),
+            moe_lt_select_from: profile.get::<MoeLtSelectFrom>().0,
+            moe_lt_mlp_from: profile.get::<MoeLtMlpFrom>().0,
+            moe_lt_tile_deep: profile.get::<MoeLtTileDeep>().0,
+            moe_lt_tile_shallow: profile.get::<MoeLtTileShallow>().0,
+            moe_lt_deep_k: profile.get::<MoeLtDeepK>().0,
+            moe_ordered_from: profile.get::<MoeOrderedFrom>().0,
             mxfp4_grouped: profile.on::<MoeMxfp4Grouped>(&Anywhere),
             mxfp4_wmma: profile.on::<MoeMxfp4Wmma>(&Anywhere),
             decode_split_small: profile.on::<DecodeSplitSmall>(&Anywhere),

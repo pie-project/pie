@@ -15,6 +15,7 @@ use dtype::Dtype;
 use kernels_rocm::Tensor;
 use kernels_rocm::hip::{self, lt_grouped};
 use kernels_rocm::linear::moe;
+use kernels_rocm::tuning::Tuning;
 
 /// Forces the leg for a scope; one scope at a time, the switch being the
 /// process's.
@@ -251,233 +252,285 @@ fn the_grouped_leg_replays_in_a_graph() {
     check(&gpu, Dtype::Bf16, 600, 4, 12, 256, 192, true, true);
 }
 
-/// The routed MLP apart: the gate-up select, the swiglu, the down select and
-/// the weighted fold.
+/// One routed swiglu MLP's planes: the bank pair, the routes and weights,
+/// and the steps' intermediate planes.
+struct Mlp {
+    p: moe::RoutedMlp,
+    y: Tensor,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn mlp_apart(
-    ctx: &kernels_rocm::Ctx,
-    x: Tensor,
-    up: Tensor,
-    down: Tensor,
-    rt: Tensor,
-    weights: Tensor,
-    packed: &mut Tensor,
-    hidden: &mut Tensor,
-    routed: &mut Tensor,
-    y: &mut Tensor,
-    inter: u32,
-) {
-    let resident = moe::ExpertTable::RESIDENT;
-    moe::matmul_select(ctx, x, up, rt, packed, resident).unwrap();
-    kernels_rocm::linear::mlp::swiglu(ctx, *packed, inter, 1, hidden).unwrap();
-    moe::matmul_select(ctx, *hidden, down, rt, routed, resident).unwrap();
-    moe::weighted_sum(ctx, *routed, weights, y).unwrap();
+fn mlp(
+    planes: &mut Planes,
+    dt: Dtype,
+    tokens: usize,
+    top_k: usize,
+    experts: usize,
+    hidden: usize,
+    inter: usize,
+    dead: usize,
+) -> Mlp {
+    let r = routes(tokens, top_k, experts, 11, dead);
+    let count = r.len();
+    let up = |v: Vec<f32>| -> Vec<u16> {
+        v.iter()
+            .map(|&v| bits(dt, if v == 0.0 { 1e-3 } else { v }))
+            .collect()
+    };
+    let x = planes.up(
+        &up(values(tokens * hidden, 1, 1.0)),
+        tokens as u32,
+        hidden as u32,
+        dt,
+    );
+    let gate_up = planes.up(
+        &up(values(experts * 2 * inter * hidden, 2, 0.05)),
+        experts as u32,
+        (2 * inter * hidden) as u32,
+        dt,
+    );
+    let down = planes.up(
+        &up(values(experts * hidden * inter, 3, 0.05)),
+        experts as u32,
+        (hidden * inter) as u32,
+        dt,
+    );
+    let rt = planes.ints(&r, tokens as u32, top_k as u32);
+    let w: Vec<f32> = values(count, 4, 0.5)
+        .iter()
+        .map(|v| v.abs() + 0.1)
+        .collect();
+    let wb = hip::Buffer::from_slice(&w).unwrap();
+    let weights = Tensor::new(wb.device_ptr(), tokens as u32, top_k as u32, Dtype::F32);
+    planes.held.push(wb);
+    let zeros = |rows: usize, w: usize| vec![0u16; rows * w];
+    let packed = planes.up(
+        &zeros(count, 2 * inter),
+        count as u32,
+        (2 * inter) as u32,
+        dt,
+    );
+    let h = planes.up(&zeros(count, inter), count as u32, inter as u32, dt);
+    let routed = planes.up(&zeros(count, hidden), count as u32, hidden as u32, dt);
+    let y = planes.up(&zeros(tokens, hidden), tokens as u32, hidden as u32, dt);
+    Mlp {
+        p: moe::RoutedMlp {
+            x,
+            routes: rt,
+            weights,
+            gate_up,
+            gate_up_experts: moe::ExpertTable::RESIDENT,
+            down,
+            down_experts: moe::ExpertTable::RESIDENT,
+            intermediate: inter as u32,
+            limit: None,
+            fan: top_k as u32,
+            packed,
+            h,
+            routed,
+        },
+        y,
+    }
+}
+
+/// The tuning a path's profile would name: `lt` the hipBLASLt legs' (the
+/// per-route select from `select`, the sorted MLP from `sorted`), `ordered`
+/// the native expert-ordered MLP's, at the tiles given.
+fn tuning(select: u32, sorted: u32, ordered: u32, tiles: Option<(u32, u32)>) -> Tuning {
+    let mut t = Tuning::DEFAULT;
+    t.moe_lt_grouped = select > 0 || sorted > 0;
+    t.moe_lt_select_from = select;
+    t.moe_lt_mlp_from = sorted;
+    t.moe_ordered_from = ordered;
+    if let Some((deep, shallow)) = tiles {
+        t.moe_lt_tile_deep = deep;
+        t.moe_lt_tile_shallow = shallow;
+    }
+    t
 }
 
 #[test]
-fn the_sorted_routed_mlp_answers_the_ops_apart() {
+fn the_sorted_routed_mlp_answers_the_steps() {
     let Some(gpu) = Gpu::open() else { return };
     if lt_grouped::library(Dtype::Bf16).is_err() {
         return;
     }
     let dt = Dtype::Bf16;
-    let (tokens, top_k, experts, hidden_w, inter) = (600usize, 4usize, 8usize, 320usize, 192usize);
-    let packed_w = 2 * inter;
     let mut planes = Planes::default();
-    let r = routes(tokens, top_k, experts, 11, 9);
-    let count = r.len();
-    let up = |v: Vec<f32>| v.iter().map(|&v| bits(dt, v)).collect::<Vec<u16>>();
-    let x = planes.up(
-        &up(values(tokens * hidden_w, 1, 1.0)),
-        tokens as u32,
-        hidden_w as u32,
-        dt,
-    );
-    let w_up = planes.up(
-        &up(values(experts * packed_w * hidden_w, 2, 0.1)),
-        experts as u32,
-        (packed_w * hidden_w) as u32,
-        dt,
-    );
-    let w_down = planes.up(
-        &up(values(experts * hidden_w * inter, 3, 0.1)),
-        experts as u32,
-        (hidden_w * inter) as u32,
-        dt,
-    );
-    let rt = planes.ints(&r, tokens as u32, top_k as u32);
-    let wb = hip::Buffer::from_slice(
-        &values(count, 4, 0.5)
-            .iter()
-            .map(|v| v.abs() + 0.1)
-            .collect::<Vec<f32>>(),
-    )
-    .unwrap();
-    let weights = Tensor::new(wb.device_ptr(), tokens as u32, top_k as u32, Dtype::F32);
-    let zeros = |rows: usize, w: usize| vec![0u16; rows * w];
-    let mut packed = planes.up(&zeros(count, packed_w), count as u32, packed_w as u32, dt);
-    let mut hid = planes.up(&zeros(count, inter), count as u32, inter as u32, dt);
-    let mut routed = planes.up(&zeros(count, hidden_w), count as u32, hidden_w as u32, dt);
-    let mut y_native = planes.up(&zeros(tokens, hidden_w), tokens as u32, hidden_w as u32, dt);
-    let mut y_lt = planes.up(&zeros(tokens, hidden_w), tokens as u32, hidden_w as u32, dt);
-    let mut y_sorted = planes.up(&zeros(tokens, hidden_w), tokens as u32, hidden_w as u32, dt);
-    let ctx = gpu.ctx();
-    {
-        let _f = Forced::on(false);
-        mlp_apart(
-            &ctx,
-            x,
-            w_up,
-            w_down,
-            rt,
-            weights,
-            &mut packed,
-            &mut hid,
-            &mut routed,
-            &mut y_native,
-            inter as u32,
-        );
-    }
-    let _f = Forced::on(true);
-    // Apart through the hipBLASLt leg, which also picks its kernels.
-    mlp_apart(
-        &ctx,
-        x,
-        w_up,
-        w_down,
-        rt,
-        weights,
-        &mut packed,
-        &mut hid,
-        &mut routed,
-        &mut y_lt,
-        inter as u32,
-    );
+    let (tokens, hidden) = (600usize, 320usize);
+    let m = mlp(&mut planes, dt, tokens, 4, 8, hidden, 192, 9);
+    let mut want = m.y;
+    let mut have = planes.up(&vec![0; tokens * hidden], tokens as u32, hidden as u32, dt);
+    let steps = gpu.ctx().with_tuning(tuning(0, 0, 0, None));
+    moe::mlp_swiglu(&steps, &m.p, &mut want).unwrap();
+    let sorted = gpu.ctx().with_tuning(tuning(0, 1, 0, None));
     let fired = moe::lt_grouped_fires();
-    let mut glu = |ctx: &kernels_rocm::Ctx, p: Tensor, h: &mut Tensor| {
-        kernels_rocm::linear::mlp::swiglu(ctx, p, inter as u32, 1, h)
-    };
-    let took = moe::experts_sorted(
-        &ctx,
-        x,
-        w_up,
-        moe::ExpertTable::RESIDENT,
-        rt,
-        weights,
-        w_down,
-        moe::ExpertTable::RESIDENT,
-        packed_w as u32,
-        inter as u32,
-        &mut y_sorted,
-        &mut glu,
-    )
-    .unwrap();
-    assert!(
-        took && moe::lt_grouped_fires() > fired,
+    moe::mlp_swiglu(&sorted, &m.p, &mut have).unwrap();
+    assert_eq!(
+        moe::lt_grouped_fires(),
+        fired + 2,
         "the sorted MLP did not run"
     );
-    let want = planes.read(&gpu, &y_native);
-    for (what, t) in [("apart", &y_lt), ("sorted", &y_sorted)] {
-        let have = planes.read(&gpu, t);
-        for (i, (&h, &w)) in have.iter().zip(&want).enumerate() {
-            let (h, w) = (widen(dt, h), widen(dt, w));
-            assert!(
-                (h - w).abs() <= w.abs() / 32.0 + 0.02,
-                "{what} y[{}][{}] = {h}, native {w}",
-                i / hidden_w,
-                i % hidden_w
+    let (want, have) = (planes.read(&gpu, &want), planes.read(&gpu, &have));
+    for (i, (&h, &w)) in have.iter().zip(&want).enumerate() {
+        let (h, w) = (widen(dt, h), widen(dt, w));
+        assert!(
+            (h - w).abs() <= w.abs() / 32.0 + 0.02,
+            "y[{}][{}] = {h}, steps {w}",
+            i / hidden,
+            i % hidden
+        );
+    }
+}
+
+// ---- the profile's measurements ------------------------------------------------
+
+/// The models' routed MLPs: (name, experts, top-k, hidden, intermediate).
+const MODELS: [(&str, usize, usize, usize, usize); 3] = [
+    ("glm53-flash", 32, 8, 4096, 2048),
+    ("glm53", 8, 8, 6144, 2048),
+    ("qwen38-flash-next", 16, 10, 2560, 640),
+];
+
+/// Every tile of the grouped library on the models' gate-up and down
+/// projections at an 8192- and a 2048-token prefill, through the routed
+/// select's hipBLASLt leg: the measurement behind `kernel.moe.lt_tile_*`.
+/// `LT_MODEL=<name>` narrows it.
+#[test]
+#[ignore = "benchmark"]
+fn bench_lt_tiles() {
+    let Some(gpu) = Gpu::open() else { return };
+    let Ok(lib) = lt_grouped::library(Dtype::Bf16) else {
+        return;
+    };
+    let mut tiles: Vec<u32> = lib
+        .solutions
+        .iter()
+        .filter(|s| s.mt[0] * s.mt[1] >= 128 * 64)
+        .map(|s| s.mt[0] * 1_000_000 + s.mt[1] * 1_000 + s.mt[2])
+        .collect();
+    tiles.sort_unstable();
+    tiles.dedup();
+    for (name, experts, top_k, hidden, inter) in MODELS {
+        if std::env::var("LT_MODEL").is_ok_and(|m| m != name) {
+            continue;
+        }
+        for tokens in [8192usize, 2048] {
+            let mut planes = Planes::default();
+            let m = mlp(
+                &mut planes,
+                Dtype::Bf16,
+                tokens,
+                top_k,
+                experts,
+                hidden,
+                inter,
+                0,
             );
+            let count = (tokens * top_k) as f64;
+            for (leg, x, bank, mut y, n, k) in [
+                ("gate-up", m.p.x, m.p.gate_up, m.p.packed, 2 * inter, hidden),
+                ("down", m.p.h, m.p.down, m.p.routed, hidden, inter),
+            ] {
+                let flops = 2.0 * count * n as f64 * k as f64;
+                let mut timed: Vec<(f64, u32)> = Vec::new();
+                for &tile in &tiles {
+                    let ctx = gpu.ctx().with_tuning(tuning(1, 0, 0, Some((tile, tile))));
+                    let us = gpu.time(3, || {
+                        moe::matmul_select(
+                            &ctx,
+                            x,
+                            bank,
+                            m.p.routes,
+                            &mut y,
+                            moe::ExpertTable::RESIDENT,
+                        )
+                        .unwrap();
+                    });
+                    timed.push((us, tile));
+                }
+                timed.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let native = {
+                    let ctx = gpu.ctx().with_tuning(tuning(0, 0, 0, None));
+                    gpu.time(5, || {
+                        moe::matmul_select(
+                            &ctx,
+                            x,
+                            bank,
+                            m.p.routes,
+                            &mut y,
+                            moe::ExpertTable::RESIDENT,
+                        )
+                        .unwrap();
+                    })
+                };
+                let best: Vec<String> = timed
+                    .iter()
+                    .take(5)
+                    .map(|(us, t)| format!("{t:09} {:.0}", flops / us / 1e6))
+                    .collect();
+                println!(
+                    "{name:18} {tokens:5} {leg:7} n={n} k={k}: native {:.0} TFLOP/s; leg by tile {}",
+                    flops / native / 1e6,
+                    best.join(", ")
+                );
+            }
         }
     }
 }
 
-// ---- benchmark -------------------------------------------------------------
-
+/// The routed MLP's paths at the models' shapes over a prefill's token
+/// counts: the steps (the native grouped legs), the native legs in expert
+/// order, the steps with hipBLASLt's select leg, and the MLP kept by expert
+/// over hipBLASLt's GEMM: the measurement behind `kernel.moe.ordered_from`,
+/// `kernel.moe.lt_select_from` and `kernel.moe.lt_mlp_from`.
+/// `LT_MODEL=<name>` narrows it; `LT_TILES=deep,shallow` names the tiles.
 #[test]
 #[ignore = "benchmark"]
-fn bench_grouped_leg() {
+fn bench_moe_mlp_paths() {
     let Some(gpu) = Gpu::open() else { return };
-    let mut planes = Planes::default();
-    for (name, tokens, top_k, experts, n, k) in [
-        (
-            "glm gate/up",
-            8192usize,
-            8usize,
-            32usize,
-            4096usize,
-            4096usize,
-        ),
-        ("qwen-next gate/up", 8192, 10, 16, 2560, 1280),
-        ("qwen-next down", 8192, 10, 16, 1280, 1280),
-        ("glm 2k gate/up", 2048, 8, 32, 4096, 4096),
-    ] {
-        if std::env::var("LT_ONLY").is_ok_and(|o| !name.starts_with(&o)) {
+    if lt_grouped::library(Dtype::Bf16).is_err() {
+        return;
+    }
+    let tiles = std::env::var("LT_TILES").ok().map(|v| {
+        let mut it = v
+            .split(',')
+            .map(|t| t.replace('_', "").parse::<u32>().unwrap());
+        (it.next().unwrap(), it.next().unwrap())
+    });
+    for (name, experts, top_k, hidden, inter) in MODELS {
+        if std::env::var("LT_MODEL").is_ok_and(|m| m != name) {
             continue;
         }
-        let r = routes(tokens, top_k, experts, 3, 0);
-        let count = r.len();
-        let xh: Vec<u16> = values(tokens * k, 1, 1.0)
-            .iter()
-            .map(|&v| common::bf16(v))
-            .collect();
-        // Random weights, no zeros.
-        let wh: Vec<u16> = values(experts * n * k, 2, 0.05)
-            .iter()
-            .map(|&v| common::bf16(if v == 0.0 { 1e-3 } else { v }))
-            .collect();
-        let x = planes.up(&xh, tokens as u32, k as u32, Dtype::Bf16);
-        let bank = planes.up(&wh, experts as u32, (n * k) as u32, Dtype::Bf16);
-        let rt = planes.ints(&r, tokens as u32, top_k as u32);
-        let mut y = planes.up(&vec![0; count * n], count as u32, n as u32, Dtype::Bf16);
-        let flops = 2.0 * count as f64 * n as f64 * k as f64;
-        let ctx = gpu.ctx();
-        for (leg, force) in [("hipblaslt", true), ("native", false), ("hipblaslt", true)] {
-            let _forced = Forced::on(force);
-            let mut fire = || {
-                moe::matmul_select(&ctx, x, bank, rt, &mut y, moe::ExpertTable::RESIDENT).unwrap();
-            };
-            let us = gpu.time(10, &mut fire);
-            let g = gpu.time_graph(10, &mut fire);
+        for tokens in [256usize, 512, 1024, 2048, 4096, 8192, 16384] {
+            let mut planes = Planes::default();
+            let mut m = mlp(
+                &mut planes,
+                Dtype::Bf16,
+                tokens,
+                top_k,
+                experts,
+                hidden,
+                inter,
+                0,
+            );
+            let per = tokens * top_k / experts;
+            let flops = 2.0 * (tokens * top_k) as f64 * (3 * inter * hidden) as f64;
+            let mut row = Vec::new();
+            for (path, t) in [
+                ("steps", tuning(0, 0, 0, tiles)),
+                ("ordered", tuning(0, 0, 1, tiles)),
+                ("lt-select", tuning(1, 0, 0, tiles)),
+                ("lt-sorted", tuning(0, 1, 0, tiles)),
+            ] {
+                let ctx = gpu.ctx().with_tuning(t);
+                let us = gpu.time(5, || moe::mlp_swiglu(&ctx, &m.p, &mut m.y).unwrap());
+                row.push(format!("{path} {us:8.1} us ({:3.0})", flops / us / 1e6));
+            }
             println!(
-                "{name:18} {tokens}x{top_k}/{experts} n={n} k={k} {leg:9}: {us:8.1} us {:6.1} TFLOP/s (graph {:6.1})",
-                flops / us / 1e6,
-                flops / g / 1e6
+                "{name:18} {tokens:5} tokens ({per:5}/expert): {}",
+                row.join("  ")
             );
         }
-        // Calibration: hipBLASLt dense at the routed rows.
-        let xs = planes.up(
-            &vec![common::bf16(0.5); count * k],
-            count as u32,
-            k as u32,
-            Dtype::Bf16,
-        );
-        let ws = hip::Buffer::alloc(hip::lt::WORKSPACE).unwrap();
-        let shape = hip::lt::Shape {
-            m: count as u32,
-            n: n as u32,
-            k: k as u32,
-            bias: false,
-            groups: 1,
-        };
-        let us = gpu.time(10, || {
-            // SAFETY: xs is [count, k], the bank's first block [n, k], y [count, n].
-            let ok = unsafe {
-                hip::lt::matmul(
-                    shape,
-                    xs.ptr,
-                    bank.ptr,
-                    0,
-                    y.ptr,
-                    ws.device_ptr(),
-                    gpu.stream.raw(),
-                )
-            };
-            assert!(matches!(ok, Ok(true)));
-        });
-        println!(
-            "{name:18} hipBLASLt dense M={count}: {:6.1} TFLOP/s",
-            flops / us / 1e6
-        );
-        planes = Planes::default();
     }
 }

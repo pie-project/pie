@@ -1981,10 +1981,10 @@ fn random_bank(gpu: &Gpu, planes: &Planes, experts: u32, n: u32, k: u32) -> Tens
     bank
 }
 
-/// The routed swiglu MLP at the prefill models' shapes: the default (the
-/// expert-ordered pipeline where it measured faster) against the four routed
-/// steps, both against dense GEMMs of the same products, and checked against
-/// the steps.
+/// The routed swiglu MLP at the prefill models' shapes: as the gfx94 profile
+/// runs it (the expert-ordered or hipBLASLt-sorted pipeline from its
+/// thresholds) against the four routed steps, both against dense GEMMs of
+/// the same products, and checked against the steps.
 #[test]
 #[ignore = "benchmark"]
 fn bench_moe_mlp_prefill() {
@@ -2020,7 +2020,11 @@ fn bench_moe_mlp_prefill() {
             h: gpu.zeros(r, inter, Dtype::Bf16),
             routed: gpu.zeros(r, hidden, Dtype::Bf16),
         };
-        let ctx = gpu.ctx();
+        let ctx = tuned(&gpu, |t| {
+            t.moe_lt_grouped = true;
+            t.moe_lt_mlp_from = 128;
+            t.moe_ordered_from = 256;
+        });
         let mut y = gpu.zeros(tokens as u32, hidden, Dtype::Bf16);
         let mut y_steps = gpu.zeros(tokens as u32, hidden, Dtype::Bf16);
         let fused = gpu.time(6, || moe::mlp_swiglu(&ctx, &p, &mut y).unwrap());

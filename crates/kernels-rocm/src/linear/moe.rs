@@ -443,6 +443,10 @@ pub fn matmul_select(
     }
     if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
         if x.width.is_multiple_of(8) {
+            #[cfg(feature = "rocm")]
+            if select_lt(ctx, OP, x, bank, routes, y, count, &fan)? {
+                return Ok(());
+            }
             return select_grouped(ctx, OP, x, bank, routes, y, count, &fan);
         }
         // A row the native legs cannot read in 16-byte pieces: rocBLAS's
@@ -933,77 +937,25 @@ fn select_grouped_launch(
 /// rows, the down leg reading them in that order and landing its products by
 /// route for the weighted fold. Against the four steps it skips the gate-up
 /// products' and the activation's walks by route (and a second ordering).
-/// Taken per (experts, hidden, intermediate, route bucket) where it measured
-/// faster: both are timed once, outside a capture, on the fire's own planes.
+/// Taken from `kernel.moe.ordered_from` routes an expert, a device profile
+/// decision measured offline (`bench_moe_mlp_paths` in tests/lt_grouped.rs).
 #[cfg(feature = "rocm")]
 mod ordered {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-
     use super::{
         FILE, Selected, dense_experts, group_routes, grouped_worth, route_order, select_grouped_launch,
         selected, weighted_sum, SORT_ACT, SORT_OUT,
     };
     use crate::error::Error;
-    use crate::hip::rt;
     use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, stated, symbol};
     use crate::tensor::Tensor;
 
-    /// (device, experts, hidden, intermediate, route bucket).
-    type Key = (i32, u32, u32, u32, u32);
-
-    fn verdicts() -> &'static Mutex<HashMap<Key, bool>> {
-        static V: OnceLock<Mutex<HashMap<Key, bool>>> = OnceLock::new();
-        V.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    fn capturing(ctx: &Ctx) -> bool {
-        let mut status = 0;
-        // SAFETY: queries a live stream.
-        unsafe { rt::hipStreamIsCapturing(ctx.stream().cast(), &raw mut status) != 0 || status != 0 }
-    }
-
-    fn device() -> i32 {
-        let mut device = 0;
-        // SAFETY: writes one int.
-        unsafe { rt::hipGetDevice(&raw mut device) };
-        device
-    }
-
-    /// Device µs of `reps` runs of `f` on the context's stream.
-    fn time(ctx: &Ctx, reps: u32, mut f: impl FnMut() -> Result<(), Error>) -> Result<f32, Error> {
-        f()?;
-        let (mut a, mut b): (rt::Event, rt::Event) = (core::ptr::null_mut(), core::ptr::null_mut());
-        // SAFETY: fresh events recorded on a live stream, destroyed after.
-        unsafe {
-            rt::hipEventCreate(&raw mut a);
-            rt::hipEventCreate(&raw mut b);
-            rt::hipEventRecord(a, ctx.stream().cast());
-        }
-        for _ in 0..reps {
-            f()?;
-        }
-        let mut ms = 0f32;
-        // SAFETY: as above.
-        unsafe {
-            rt::hipEventRecord(b, ctx.stream().cast());
-            rt::hipEventSynchronize(b);
-            rt::hipEventElapsedTime(&raw mut ms, a, b);
-            rt::hipEventDestroy(a);
-            rt::hipEventDestroy(b);
-        }
-        Ok(ms * 1e3 / reps as f32)
-    }
-
     /// The routed swiglu MLP in expert order, when both legs are the grouped
-    /// dense ones and the ordered pipeline measured faster than the four
-    /// steps it replaces (`steps`, which land `packed`, `h` and `routed` by
-    /// route, then the fold). Whether it ran.
+    /// dense ones and an expert averages `kernel.moe.ordered_from` routes or
+    /// more (0: never). Whether it ran.
     pub(super) fn mlp(
         ctx: &Ctx,
         op: &'static str,
         p: &super::RoutedMlp,
-        steps: &mut dyn FnMut() -> Result<(), Error>,
         y: &mut Tensor,
     ) -> Result<bool, Error> {
         let (x, i) = (p.x, p.intermediate);
@@ -1022,36 +974,11 @@ mod ordered {
         {
             return Ok(false);
         }
-        let key = (device(), experts, hidden, i, fan.route_count.next_power_of_two());
-        let decided = verdicts().lock().ok().and_then(|v| v.get(&key).copied());
-        match decided {
-            Some(false) => return Ok(false),
-            None if capturing(ctx) => return Ok(false),
-            _ => {}
+        let from = ctx.tuning().moe_ordered_from;
+        if from == 0 || fan.route_count / experts < from {
+            return Ok(false);
         }
-        let run = |y: &mut Tensor| -> Result<(), Error> { pipeline(ctx, op, p, &fan, experts, y) };
-        if decided.is_none() {
-            let ours = time(ctx, 3, || run(y))?;
-            let theirs = time(ctx, 3, &mut *steps)?;
-            let wins = ours < theirs;
-            tracing::info!(
-                experts,
-                hidden,
-                intermediate = i,
-                routes = fan.route_count,
-                ordered_us = ours,
-                steps_us = theirs,
-                wins,
-                "routed MoE MLP: routes in expert order across both matmuls against the four routed steps"
-            );
-            if let Ok(mut v) = verdicts().lock() {
-                v.insert(key, wins);
-            }
-            if !wins {
-                return Ok(false);
-            }
-        }
-        run(y)?;
+        pipeline(ctx, op, p, &fan, experts, y)?;
         Ok(true)
     }
 
@@ -1095,6 +1022,374 @@ mod ordered {
         select_grouped_launch(ctx, op, h_t, p.down, &mut routed, experts, &ordered, 1, SORT_ACT)?;
         weighted_sum(ctx, p.routed, p.weights, y)
     }
+}
+
+/// The hipBLASLt grouped leg forced from outside, for tests and benches:
+/// `Some(true)` takes it wherever it launches, past the profile's
+/// thresholds; `Some(false)` never.
+#[cfg(feature = "rocm")]
+static LT_FORCED: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "rocm")]
+pub fn force_lt_grouped(on: Option<bool>) {
+    *LT_FORCED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = on;
+}
+
+/// Grouped GEMMs the hipBLASLt leg has launched, for tests.
+#[cfg(feature = "rocm")]
+static LT_FIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "rocm")]
+pub fn lt_grouped_fires() -> u64 {
+    LT_FIRES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The most the hipBLASLt leg stages: its routes' rows in and out.
+#[cfg(feature = "rocm")]
+const LT_STAGE_CAP: u64 = 3 << 30;
+
+/// Whether the hipBLASLt leg takes `per` routes an expert where the profile
+/// starts it at `from` (0: never) and the shape is of the class it takes
+/// (`fits`), or as forced.
+#[cfg(feature = "rocm")]
+fn lt_wanted(ctx: &Ctx, per: u32, from: u32, fits: bool) -> bool {
+    match *LT_FORCED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        Some(forced) => forced,
+        None => ctx.tuning().moe_lt_grouped && fits && from > 0 && per >= from,
+    }
+}
+
+/// The library and the solution the profile names for a contraction of `k`
+/// (`kernel.moe.lt_tile_deep` from `kernel.moe.lt_deep_k`, else
+/// `kernel.moe.lt_tile_shallow`); `None` where either is missing.
+#[cfg(feature = "rocm")]
+fn lt_solution(
+    ctx: &Ctx,
+    dtype: Dtype,
+    k: u32,
+) -> Option<(&'static crate::hip::lt_grouped::Library, usize)> {
+    let lib = crate::hip::lt_grouped::library(dtype).ok()?;
+    let t = ctx.tuning();
+    let tile = if k >= t.moe_lt_deep_k {
+        t.moe_lt_tile_deep
+    } else {
+        t.moe_lt_tile_shallow
+    };
+    Some((lib, lib.pick(tile)?))
+}
+
+/// The hipBLASLt grouped leg (`hip::lt_grouped`) of a routed select: routes
+/// ordered by expert, their rows gathered by expert while the same launch
+/// writes each expert's device `UserArguments`, one grouped GEMM over a
+/// worst-case grid, and the rows scattered back to route order. From
+/// `kernel.moe.lt_select_from` routes an expert; `Ok(false)` leaves the fire
+/// to the native grouped leg.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn select_lt(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    experts: u32,
+    fan: &Selected,
+) -> Result<bool, Error> {
+    let (n, k, rows) = (y.width, x.width, fan.route_count);
+    if !matches!(x.dtype, Dtype::Bf16 | Dtype::F16)
+        || bank.dtype != x.dtype
+        || y.dtype != x.dtype
+        || !n.is_multiple_of(8)
+        || n < 64
+        || u64::from(rows) * (u64::from(n) + u64::from(k)) * 2 > LT_STAGE_CAP
+        || !lt_wanted(ctx, rows / experts, ctx.tuning().moe_lt_select_from, true)
+    {
+        return Ok(false);
+    }
+    let Some((lib, at)) = lt_solution(ctx, x.dtype, k) else {
+        return Ok(false);
+    };
+    let stage = stage_lt(ctx, op, x, bank, routes, n, experts, fan, 0)?;
+    gemm_lt(op, lib, at, &stage, n, rows, experts, ctx.stream())?;
+    unscatter_lt(ctx, op, &stage, y, experts, rows)?;
+    Ok(true)
+}
+
+/// The hipBLASLt leg's planes: routes in expert order, the staged result
+/// rows, and the `UserArguments` array (one record an expert and the
+/// sentinel).
+#[cfg(feature = "rocm")]
+struct LtStage {
+    ordered: RouteOrder,
+    staged_out: u64,
+    args: u64,
+}
+
+/// Orders the routes, gathers their rows by expert into a stream slab and
+/// writes the experts' arguments (`pos`, when given, takes each route's row
+/// in the order).
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn stage_lt(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    n: u32,
+    experts: u32,
+    fan: &Selected,
+    pos: u64,
+) -> Result<LtStage, Error> {
+    use crate::hip::lt_grouped::USER_ARGS_BYTES;
+    let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let (k, rows) = (x.width, fan.route_count);
+    let ordered = route_order(ctx, op, routes, fan, experts, GROUP_ROUTES_WIDE)?;
+    let staged_in = ctx.scratch_stream(op, "linear.moe_lt_in", rows as usize * k as usize * 2)?
+        as usize as u64;
+    let staged_out = ctx.scratch_stream(op, "linear.moe_lt_out", rows as usize * n as usize * 2)?
+        as usize as u64;
+    let args = ctx.scratch(
+        op,
+        "linear.moe_lt_args",
+        (experts as usize + 1) * USER_ARGS_BYTES,
+    )? as usize as u64;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    ctx.fire(
+        op,
+        Fire::at(FILE, symbol(&format!("::pie::linear::moe_lt_scatter<{t}>")))
+            .apply(Launch::grid([copy_blocks(rows, k), 1, 1], [256, 1, 1])),
+        &[
+            x.arg(),
+            ArgValue::Ptr(ordered.order),
+            ArgValue::Ptr(ordered.offsets),
+            ArgValue::Ptr(staged_in),
+            ArgValue::Ptr(args),
+            ArgValue::Ptr(pos),
+            bank.ptr.arg(),
+            staged_out.arg(),
+            act_div.arg(),
+            stated(op, n)?.arg(),
+            stated(op, k)?.arg(),
+            stated(op, experts)?.arg(),
+        ],
+    )?;
+    Ok(LtStage {
+        ordered,
+        staged_out,
+        args,
+    })
+}
+
+/// Blocks a 16-byte grid-stride copy of `rows` rows of `width` takes.
+#[cfg(feature = "rocm")]
+fn copy_blocks(rows: u32, width: u32) -> u32 {
+    let pieces = u64::from(rows) * u64::from(width / 8);
+    pieces.div_ceil(256).clamp(1, 304 * 8) as u32
+}
+
+/// One grouped GEMM over the arguments at `args`: `experts` groups and the
+/// sentinel, a grid for `rows` routes however they fall.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn lt_launch(
+    op: &'static str,
+    lib: &crate::hip::lt_grouped::Library,
+    at: usize,
+    args: u64,
+    n: u32,
+    rows: u32,
+    experts: u32,
+    stream: *mut core::ffi::c_void,
+) -> Result<(), Error> {
+    let grid = lib.solutions[at].worst_grid(n, rows, experts);
+    let start = crate::prof::on().then(|| crate::prof::begin(stream)).flatten();
+    // SAFETY: the argument array was written on this stream, its records
+    // naming staged planes and the bank, all live through the fire.
+    unsafe { lib.launch(at, experts + 1, args, grid, stream) }.map_err(|why| refuse(op, why))?;
+    crate::prof::end(stream, start, || {
+        format!(
+            "{op} hipblaslt grouped {} experts={experts} routes={rows} n={n}",
+            lib.solutions[at].label()
+        )
+    });
+    LT_FIRES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn gemm_lt(
+    op: &'static str,
+    lib: &crate::hip::lt_grouped::Library,
+    at: usize,
+    stage: &LtStage,
+    n: u32,
+    rows: u32,
+    experts: u32,
+    stream: *mut core::ffi::c_void,
+) -> Result<(), Error> {
+    lt_launch(op, lib, at, stage.args, n, rows, experts, stream)
+}
+
+#[cfg(feature = "rocm")]
+fn unscatter_lt(
+    ctx: &Ctx,
+    op: &'static str,
+    stage: &LtStage,
+    y: &Tensor,
+    experts: u32,
+    rows: u32,
+) -> Result<(), Error> {
+    let t = dtype_dispatch!(op, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    ctx.fire(
+        op,
+        Fire::at(FILE, symbol(&format!("::pie::linear::moe_lt_unscatter<{t}>")))
+            .apply(Launch::grid([copy_blocks(rows, y.width), 1, 1], [256, 1, 1])),
+        &[
+            ArgValue::Ptr(stage.staged_out),
+            ArgValue::Ptr(stage.ordered.order),
+            ArgValue::Ptr(stage.ordered.offsets),
+            y.arg(),
+            stated(op, y.width)?.arg(),
+            stated(op, experts)?.arg(),
+        ],
+    )
+}
+
+/// The routed swiglu MLP with its rows kept by expert from the gate-up to
+/// the fold, over hipBLASLt's grouped GEMM: the routing scatter gathers the
+/// token rows by expert once (noting where each route's row went), the
+/// swiglu runs over the rows in that order, neither GEMM scatters back, and
+/// the fold reads each route's row where it sits. From
+/// `kernel.moe.lt_mlp_from` routes an expert, over two deep contractions
+/// (hidden and intermediate at least `kernel.moe.lt_deep_k`: on MI300X
+/// hipBLASLt's grouped tiles lose to the native legs over a 640-deep down
+/// projection, Qwen3.8-Flash-Next's, at every prefill); whether it ran.
+#[cfg(feature = "rocm")]
+fn mlp_lt(ctx: &Ctx, op: &'static str, p: &RoutedMlp, y: &mut Tensor) -> Result<bool, Error> {
+    use crate::hip::lt_grouped::USER_ARGS_BYTES;
+    let (x, i) = (p.x, p.intermediate);
+    let dtype = x.dtype;
+    let (tokens, top_k) = (p.routes.rows, p.routes.width);
+    let (k, out) = (x.width, y.width);
+    let experts = p.gate_up.rows;
+    if !matches!(dtype, Dtype::Bf16 | Dtype::F16)
+        || p.gate_up.dtype != dtype
+        || p.down.dtype != dtype
+        || y.dtype != dtype
+        || p.weights.dtype != Dtype::F32
+        || p.gate_up_experts.streams()
+        || p.down_experts.streams()
+        || top_k == 0
+        || x.rows != tokens
+        || y.rows != tokens
+        || experts == 0
+        || experts > ORDER_EXPERT_CAP
+        || p.down.rows != experts
+        || u64::from(p.gate_up.width) != 2 * u64::from(i) * u64::from(k)
+        || u64::from(p.down.width) != u64::from(out) * u64::from(i)
+        || [k, i, out].iter().any(|w| !w.is_multiple_of(8) || *w < 64)
+    {
+        return Ok(false);
+    }
+    let Some(rows) = tokens.checked_mul(top_k) else {
+        return Ok(false);
+    };
+    let t = ctx.tuning();
+    if !t.moe_grouped
+        || u64::from(rows) * u64::from(k + 3 * i + out) * 2 > LT_STAGE_CAP
+        || !lt_wanted(
+            ctx,
+            rows / experts,
+            t.moe_lt_mlp_from,
+            k >= t.moe_lt_deep_k && i >= t.moe_lt_deep_k,
+        )
+    {
+        return Ok(false);
+    }
+    let (Some((lib, up_at)), Some((_, down_at))) =
+        (lt_solution(ctx, dtype, k), lt_solution(ctx, dtype, i))
+    else {
+        return Ok(false);
+    };
+    let ty = dtype_dispatch!(op, dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let fan = Selected {
+        route_count: rows,
+        top_k: stated(op, top_k)?,
+        by_token: true,
+    };
+    let stream = ctx.stream();
+    let pos = ctx.scratch(op, "linear.moe_lt_pos", rows as usize * 4)? as usize as u64;
+    let stage = stage_lt(ctx, op, x, p.gate_up, p.routes, 2 * i, experts, &fan, pos)?;
+    gemm_lt(op, lib, up_at, &stage, 2 * i, rows, experts, stream)?;
+
+    // The swiglu over the rows in expert order.
+    let hidden = ctx.scratch_stream(op, "linear.moe_lt_hidden", rows as usize * i as usize * 2)?
+        as usize as u64;
+    let clamp = if p.limit.is_some() { "true" } else { "false" };
+    ctx.fire(
+        op,
+        Fire::at(FILE, symbol(&format!("::pie::linear::moe_swiglu_ordered<{ty}, {clamp}>")))
+            .apply(Launch::grid([rows, i.div_ceil(8 * 256), 1], [256, 1, 1])),
+        &[
+            ArgValue::Ptr(stage.staged_out),
+            ArgValue::Ptr(hidden),
+            ArgValue::Ptr(stage.ordered.offsets),
+            stated(op, experts)?.arg(),
+            stated(op, i)?.arg(),
+            p.limit.unwrap_or(f32::INFINITY).arg(),
+        ],
+    )?;
+
+    // The down GEMM over those rows, its products left in expert order.
+    let routed = ctx.scratch_stream(op, "linear.moe_lt_down", rows as usize * out as usize * 2)?
+        as usize as u64;
+    let args = ctx.scratch(
+        op,
+        "linear.moe_lt_down_args",
+        (experts as usize + 1) * USER_ARGS_BYTES,
+    )? as usize as u64;
+    ctx.fire(
+        op,
+        Fire::at(FILE, symbol(&format!("::pie::linear::moe_lt_args<{ty}>")))
+            .apply(Launch::grid([1, 1, 1], [256, 1, 1])),
+        &[
+            ArgValue::Ptr(stage.ordered.offsets),
+            ArgValue::Ptr(args),
+            p.down.ptr.arg(),
+            hidden.arg(),
+            routed.arg(),
+            stated(op, out)?.arg(),
+            stated(op, i)?.arg(),
+            stated(op, experts)?.arg(),
+        ],
+    )?;
+    lt_launch(op, lib, down_at, args, out, rows, experts, stream)?;
+
+    // The fold, each route's row read where it sits.
+    ctx.fire(
+        op,
+        Fire::at(FILE, symbol(&format!("::pie::linear::moe_lt_fold<{ty}>")))
+            .apply(elementwise_rows(op, y.rows, y.width)?),
+        &[
+            y.arg(),
+            routed.arg(),
+            ArgValue::Ptr(pos),
+            p.routes.arg(),
+            p.weights.arg(),
+            stated(op, top_k)?.arg(),
+            stated(op, out)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
 }
 
 #[cfg(feature = "rocm")]
@@ -1900,15 +2195,8 @@ pub fn mlp_swiglu(ctx: &Ctx, p: &RoutedMlp, y: &mut Tensor) -> Result<(), Error>
         Ok(())
     };
     #[cfg(feature = "rocm")]
-    {
-        let landed = *y;
-        let mut whole = || -> Result<(), Error> {
-            steps()?;
-            weighted_sum(ctx, p.routed, p.weights, &mut { landed })
-        };
-        if ordered::mlp(ctx, OP, p, &mut whole, y)? {
-            return Ok(());
-        }
+    if mlp_lt(ctx, OP, p, y)? || ordered::mlp(ctx, OP, p, y)? {
+        return Ok(());
     }
     let _ = OP;
     steps()?;

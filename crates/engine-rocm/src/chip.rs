@@ -288,11 +288,16 @@ mod tests {
             );
             assert!(report.untuned(), "{gpu}");
             assert_eq!(Engine::of(&profile), Engine::of(&registry().defaults()));
-            assert_eq!(
-                kernels_rocm::tuning::Tuning::of(&profile),
-                kernels_rocm::tuning::Tuning::of(&registry().defaults()),
-                "{gpu}"
-            );
+            // The defaults, but for the routed MLP's paths the family measured.
+            let mut want = kernels_rocm::tuning::Tuning::of(&registry().defaults());
+            want.moe_lt_grouped = true;
+            want.moe_lt_mlp_from = 128;
+            want.moe_lt_select_from = 0;
+            want.moe_lt_tile_deep = 256_192_064;
+            want.moe_lt_tile_shallow = 128_288_032;
+            want.moe_lt_deep_k = 2048;
+            want.moe_ordered_from = 256;
+            assert_eq!(kernels_rocm::tuning::Tuning::of(&profile), want, "{gpu}");
         }
     }
 

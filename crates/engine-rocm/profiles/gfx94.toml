@@ -1,7 +1,40 @@
 api = 1
 
-# CDNA 3: MI300X, MI300A, MI325X (gfx942). The registry defaults, as
-# measured nowhere yet.
+# CDNA 3: MI300X, MI300A, MI325X (gfx942). The registry defaults, but for
+# the decisions measured below.
 [target]
 tier    = "gfx94"
 assumes = { cc = 94 }
+
+# The routed swiglu MLP of a prefill (tests/lt_grouped.rs, bench_moe_mlp_paths
+# and bench_lt_tiles on MI300X, random bf16 weights; µs for the MLP).
+#
+# Kept by expert from the gate-up to the fold over hipBLASLt's grouped GEMM
+# (`lt_mlp_from` routes an expert, both contractions at least `lt_deep_k`):
+# GLM-5.3-Flash (32 experts, top 8, 4096 / 2048) at 512 / 1024 / 2048 / 4096
+# / 8192 tokens 954 / 1955 / 2715 / 4713 / 8599 -> 868 / 1458 / 2214 / 4122 /
+# 7733, at 256 tokens (64 an expert) 703 -> 811; GLM-5.3 (8, top 8, 6144 /
+# 2048) at 256 / 1024 / 8192 tokens 822 / 1960 / 12199 -> 623 / 1578 / 10994.
+# Over Qwen3.8-Flash-Next's 640-deep down projection it loses at every size
+# (2048 tokens 736 -> 775), hence the depth.
+#
+# The native legs in expert order (`ordered_from` routes an expert), where
+# the above does not take the MLP: Qwen3.8-Flash-Next at 512 / 2048 / 8192
+# tokens (320 / 1280 / 5120 an expert) 229 / 736 / 2687 -> 227 / 680 / 2516,
+# at 256 tokens (160) 167 -> 187; GLM-5.3-Flash at 128 an expert 954 -> 1421.
+#
+# The routed select alone over hipBLASLt (rows gathered and scattered back)
+# beats neither: GLM-5.3-Flash 8192 tokens 8599 -> 8556 against the sorted
+# 7733, Qwen3.8-Flash-Next 2048 tokens 736 -> 987.
+#
+# Tiles: MT256x192x64 over the deep contractions (the leg's best, or within
+# 4% of it, on GLM's gate-up and down at 2048 and 8192 tokens), MT128x288x32
+# below.
+[kernel]
+moe.lt_grouped = true
+moe.lt_mlp_from = 128
+moe.lt_select_from = 0
+moe.lt_tile_deep = 256_192_064
+moe.lt_tile_shallow = 128_288_032
+moe.lt_deep_k = 2048
+moe.ordered_from = 256
