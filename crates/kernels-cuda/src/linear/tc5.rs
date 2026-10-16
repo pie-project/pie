@@ -949,6 +949,15 @@ pub fn grouped_gemm_epi_with(
                     "a contiguous group runs unswapped (a W4A16 or an NVFP4 one swapped too)",
                 ));
             }
+            // A 32-row Q tile at an odd quarter of its rows' 128-row scale
+            // atom (an expert's second) faults the block-scaled MMA, as an
+            // A-side one does.
+            if swap && act.scales.is_some() && plan.bn < 64 {
+                return Err(refuse(
+                    OP,
+                    "a swapped contiguous group of scaled rows takes Q tiles of 64 rows or more",
+                ));
+            }
             if rows == 0 {
                 return Ok(());
             }

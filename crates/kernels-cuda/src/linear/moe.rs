@@ -921,6 +921,13 @@ pub fn experts(
 #[cfg(feature = "cuda")]
 const SWAPPED_UP_ROUTES: u32 = 16;
 
+/// A W4A8 routed MLP of this many routes an expert or fewer runs its
+/// gate-up swapped, in 64-row Q tiles. Measured at DeepSeek-V4-Flash's
+/// layer (256 experts, top 6, 4096 x 2048), held at the power cap: the
+/// whole MLP 713 -> 679 us at 64 tokens, 916 -> 883 at 512, 938 -> 906 at
+/// 1024; at 2048 (48 an expert) unswapped wins, 982 against 1008.
+const SWAPPED_W4A8_UP_ROUTES: u32 = 32;
+
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn experts_w4a4(
@@ -1290,7 +1297,24 @@ fn experts_w4a8_as(
             groups: layout.groups,
             alpha_e: 0,
         };
-        tc5::grouped_gemm_epi(
+        // A few rows an expert run the gate-up swapped: the bank on P, the
+        // rows on 64-row Q tiles, where unswapped each expert's rows fill a
+        // 128-row MMA tile and its 256-row weight tile. The products are the
+        // same, at a quarter the MMA work, so the power cap (the W4A8 MMA's
+        // issue rate holds both near 4.3-4.7 TB/s) clocks less down.
+        let sms = ctx.multiprocessors().unwrap_or(148);
+        let up_plan = if count <= SWAPPED_W4A8_UP_ROUTES * experts {
+            tc5::Plan {
+                swap: true,
+                pair: false,
+                bn: 64,
+                stages: 0,
+                splits: 1,
+            }
+        } else {
+            tc5::Plan::grouped(&grouped, inter, k, count, sms)
+        };
+        tc5::grouped_gemm_epi_with(
             ctx,
             tc5::Operand::scaled(xq, tc5::Elem::E4m3, xs, GRAN),
             tc5::Operand::scaled(up_codes.ptr, tc5::Elem::E2m1, up_atoms.ptr, 32),
@@ -1308,7 +1332,7 @@ fn experts_w4a8_as(
                 live_rows: layout.live_rows(),
                 ..tc5::Epilogue::STORE
             },
-            count,
+            up_plan,
         )?;
         let ys = ctx.scratch_stream(OP, W4A8_Y, rows * n as usize * 2)? as u64;
         tc5::grouped_gemm_epi(
