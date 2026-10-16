@@ -684,9 +684,7 @@ mod sparse {
             && supported()
             && s.heads == 64
             && s.kv_lora_rank == 512
-            // GLM-5.3's shape. A latent with no rotated part (GLM-5.3-Flash)
-            // stays on the warp-a-key form until its parity is clean.
-            && s.rope == 64
+            && (s.rope == 0 || s.rope == 64)
             && s.q.dtype == Dtype::Bf16
             && pool.keys.dtype == Dtype::Bf16
             && pool.page_size > 0

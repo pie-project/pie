@@ -249,10 +249,10 @@ pub struct SdpaPoolMma;
 pub struct SdpaDsv4PrefillFrom(pub u32);
 
 /// Whether a sparse MLA's selected attention (64 absorbed heads over a
-/// 512-wide bf16 latent and a 64-wide rotated part: GLM-5.3's DSA) runs a
-/// block a row on tcgen05 (`attn/mla_sparse.cuh`, sm_100a); off, or a
-/// latent with no rotated part (GLM-5.3-Flash), the warp-a-key form serves
-/// it as before.
+/// 512-wide bf16 latent and a 64-wide rotated part or none: GLM-5.3's and
+/// GLM-5.3-Flash's DSA) runs a block a row on tcgen05
+/// (`attn/mla_sparse.cuh`, sm_100a); off, the warp-a-key form serves it as
+/// before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.mla_sparse", flag, default = false, tune = search)]
 pub struct SdpaMlaSparse;

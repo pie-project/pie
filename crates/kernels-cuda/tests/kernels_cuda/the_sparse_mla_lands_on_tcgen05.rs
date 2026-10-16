@@ -1,8 +1,9 @@
 #![cfg(feature = "cuda")]
 
 //! GLM-5.3's DSA attention (`kernel.sdpa.mla_sparse`, `attn/mla_sparse.cuh`):
-//! 64 absorbed heads over a 512-wide latent and a 64-wide rotated part, the
-//! token ids a row's index selected, a block a row on tcgen05. Read against a host reference, scores and base-2
+//! 64 absorbed heads over a 512-wide latent and a 64-wide rotated part (or
+//! none, as GLM-5.3-Flash), the token ids a row's index selected, a block a
+//! row on tcgen05. Read against a host reference, scores and base-2
 //! log-sum-exp, over two requests (one continuing a context), shuffled
 //! pages, selections longer than a tile with whole page runs in them, a row
 //! that selects nothing visible; on a staged window and on a pooled index's
@@ -380,11 +381,15 @@ fn check(rope: usize, window: Option<(u32, u32)>, decode: bool, pooled: bool) {
 
 #[test]
 fn the_sparse_mla_lands_on_tcgen05() {
-    check(64, None, false, false);
+    for rope in [64, 0] {
+        check(rope, None, false, false);
+    }
     // A pooled index's selection (holes, repeats, ids past the row),
     // against the warp-a-key form.
-    check(64, None, false, true);
-    check(64, None, true, true);
+    for rope in [64, 0] {
+        check(rope, None, false, true);
+        check(rope, None, true, true);
+    }
     check(64, Some((30, 25)), false, false);
     // The decode arm sees the request's keys, not the row's own prefix: the
     // selections here read none past a row's position, so both answer alike.
