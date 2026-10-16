@@ -3839,9 +3839,8 @@ constexpr int KDA_PREP_SMEM =
     3 * GDN_CH * GDN_LD * 2 + (GDN_CH + 32) * GDN_LD * 2 + GDN_CH * KDA_LDF * 4 + GDN_CH * 4;
 
 __global__ void __launch_bounds__(256, 2) ssm_kda_chunk_prep(
-    const float* __restrict__ q_norm,
-    const float* __restrict__ k_norm,
-    const float* __restrict__ v_in,
+    const bf16* __restrict__ mixed,
+    float eps,
     const float* __restrict__ gate,
     const float* __restrict__ beta,
     const int* __restrict__ slot_ids,
@@ -3891,21 +3890,50 @@ __global__ void __launch_bounds__(256, 2) ssm_kda_chunk_prep(
     const int warp = tid >> 5;
     const int l = tid & 31;
 
-    // The chunk's rows, a row past the chunk zero (no decay, no update).
+    // The chunk's post-convolution query and key rows straight from the
+    // packed `[q | k | v]` rows, and its decay; a row past the chunk zero (no
+    // decay, no update).
+    const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const long long width = static_cast<long long>(H) * D;
     for (int e = tid; e < GDN_CH * (D / 4); e += THREADS) {
         const int i = e / (D / 4);
         const int c = (e % (D / 4)) * 4;
         const bool in = i < L;
+        const bf16* row = mixed + static_cast<long long>(ta + (in ? i : 0) + row0) * 3 * width + h * D + c;
+        const uint2 z2 = make_uint2(0u, 0u);
+        *reinterpret_cast<uint2*>(Qb + i * GDN_LD + c) = in ? *reinterpret_cast<const uint2*>(row) : z2;
+        *reinterpret_cast<uint2*>(Kb + i * GDN_LD + c) =
+            in ? *reinterpret_cast<const uint2*>(row + width) : z2;
         const long long at = (static_cast<long long>(ta + i) * H + h) * D + c;
-        const float4 z = make_float4(0.f, 0.f, 0.f, 0.f);
-        const float4 kk = in ? *reinterpret_cast<const float4*>(k_norm + at) : z;
-        const float4 qq = in ? *reinterpret_cast<const float4*>(q_norm + at) : z;
-        *reinterpret_cast<uint2*>(Kb + i * GDN_LD + c) = make_uint2(gdn_pack(kk.x, kk.y), gdn_pack(kk.z, kk.w));
-        *reinterpret_cast<uint2*>(Qb + i * GDN_LD + c) = make_uint2(gdn_pack(qq.x, qq.y), gdn_pack(qq.z, qq.w));
         *reinterpret_cast<float4*>(Gf + i * KDA_LDF + c) =
-            in ? *reinterpret_cast<const float4*>(gate + at) : z;
+            in ? *reinterpret_cast<const float4*>(gate + at) : make_float4(0.f, 0.f, 0.f, 0.f);
     }
     if (tid < GDN_CH) B[tid] = tid < L ? beta[static_cast<long long>(ta + tid) * H + h] : 0.f;
+    __syncthreads();
+    // Each row normalized to unit length as the staged walk normalizes it
+    // (channels 32 apart a lane, summed in f32), the queries scaled by
+    // `1 / sqrt(D)`: a warp a row.
+    {
+        const float q_scale = rsqrtf(static_cast<float>(D));
+        for (int i = warp; i < GDN_CH; i += THREADS / 32) {
+            #pragma unroll
+            for (int which = 0; which < 2; ++which) {
+                bf16* rowp = (which == 0 ? Qb : Kb) + i * GDN_LD;
+                float x[D / 32];
+                float acc = 0.f;
+                #pragma unroll
+                for (int u = 0; u < D / 32; ++u) {
+                    x[u] = __bfloat162float(rowp[l + 32 * u]);
+                    acc += x[u] * x[u];
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+                const float inv = rsqrtf(acc + eps) * (which == 0 ? q_scale : 1.f);
+                #pragma unroll
+                for (int u = 0; u < D / 32; ++u) rowp[l + 32 * u] = __float2bfloat16(x[u] * inv);
+            }
+        }
+    }
     __syncthreads();
     // The decay's running sum down each channel: two threads a channel, a
     // half each, the second half then adding the first's total.
@@ -4091,10 +4119,16 @@ __global__ void __launch_bounds__(256, 2) ssm_kda_chunk_prep(
         const int i = e / (D / 4);
         const int c = (e % (D / 4)) * 4;
         const float bi = B[i];
-        float4 vv = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (i < L) vv = *reinterpret_cast<const float4*>(v_in + (static_cast<long long>(ta + i) * H + h) * D + c);
+        float2 v01 = make_float2(0.f, 0.f);
+        float2 v23 = make_float2(0.f, 0.f);
+        if (i < L) {
+            const uint2 raw = *reinterpret_cast<const uint2*>(
+                mixed + static_cast<long long>(ta + i + row0) * 3 * width + 2 * width + h * D + c);
+            v01 = gdn_unpack(raw.x);
+            v23 = gdn_unpack(raw.y);
+        }
         *reinterpret_cast<uint2*>(vs + i * GDN_LD + c) =
-            make_uint2(gdn_pack(vv.x * bi, vv.y * bi), gdn_pack(vv.z * bi, vv.w * bi));
+            make_uint2(gdn_pack(v01.x * bi, v01.y * bi), gdn_pack(v23.x * bi, v23.y * bi));
     }
     __syncthreads();
 

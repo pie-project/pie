@@ -1661,6 +1661,60 @@ impl Kda {
         )?;
         Ok(staged)
     }
+
+    /// [`Kda::stage`]'s gates and betas alone (the query, key and value
+    /// planes left unstaged, their pointers null), for a walk that reads
+    /// the packed rows itself.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_gates(
+        self,
+        ctx: &Ctx,
+        op: &'static str,
+        f: Tensor,
+        b: Tensor,
+        dt_bias: Tensor,
+        a_log: Tensor,
+        gate_floor: f32,
+    ) -> Result<KdaStaged, Error> {
+        let wide = u64::from(self.n) * u64::from(self.width);
+        let decay = u64::from(self.n) * u64::from(self.heads);
+        let gb = plane(ctx, op, "attn.ssm_kda_gates", wide + decay)?;
+        let staged = KdaStaged {
+            q_norm: 0,
+            k_norm: 0,
+            v: 0,
+            gate: gb,
+            beta: gb + wide * u64::from(FLOAT),
+        };
+        // A row a block, four channels a thread.
+        let gates = if self.head_dim.is_multiple_of(4) {
+            Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta_rows<::pie::bf16>")
+                .apply(Launch::grid([self.n, 1, 1], [256, 1, 1]))
+        } else {
+            Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta<::pie::bf16>").apply(Launch::grid(
+                [self.n, self.heads, 1],
+                [self.head_dim.clamp(WARP, PREP_BLOCK), 1, 1],
+            ))
+        };
+        ctx.fire(
+            op,
+            gates,
+            &[
+                f.arg(),
+                b.arg(),
+                a_log.arg(),
+                dt_bias.arg(),
+                ArgValue::Ptr(staged.gate),
+                ArgValue::Ptr(staged.beta),
+                stated(op, self.n)?.arg(),
+                stated(op, self.heads)?.arg(),
+                stated(op, self.head_dim)?.arg(),
+                gate_floor.arg(), // the decay's lower bound; zero leaves it unbounded
+                ctx.stage(),
+            ],
+        )?;
+        Ok(staged)
+    }
 }
 
 fn f32_state(op: &'static str, state: &RecurrentPool) -> Result<(), Error> {
@@ -1741,6 +1795,7 @@ fn kda_chunked_mma(
     shape: Kda,
     staged: KdaStaged,
     mixed: RaggedTensor,
+    norm_eps: f32,
     state: &RecurrentPool,
     lanes: u32,
     y: &mut Tensor,
@@ -1778,9 +1833,8 @@ fn kda_chunked_mma(
         Fire::at(FILE, "::pie::attn::ssm_kda_chunk_prep")
             .apply(Launch::grid([heads, slots, 1], [256, 1, 1]).smem(prep_smem)),
         &[
-            ArgValue::Ptr(staged.q_norm),
-            ArgValue::Ptr(staged.k_norm),
-            ArgValue::Ptr(staged.v),
+            mixed.data.arg(),
+            norm_eps.arg(),
             ArgValue::Ptr(staged.gate),
             ArgValue::Ptr(staged.beta),
             state.slot_ids.arg(),
@@ -1854,12 +1908,15 @@ pub fn kda_chunked(
     let lanes = requests(OP, mixed)?;
     f32_state(OP, state)?;
     seated(OP, state, "ssm_kda_chunked_batched", true, true, true)?;
+    if ctx.tuning().ssm_kda_chunked && shape.head_dim == 128 {
+        // The tensor-core prep reads and normalizes the queries and keys
+        // itself: only the gates are staged.
+        let staged = shape.stage_gates(ctx, OP, f, b, dt_bias, a_log, gate_floor)?;
+        return kda_chunked_mma(ctx, OP, shape, staged, mixed, norm_eps, state, lanes, y);
+    }
     let staged = shape.stage(
         ctx, OP, mixed.data, f, b, dt_bias, a_log, norm_eps, gate_floor,
     )?;
-    if ctx.tuning().ssm_kda_chunked && shape.head_dim == 128 {
-        return kda_chunked_mma(ctx, OP, shape, staged, mixed, state, lanes, y);
-    }
     let work = shape.work(ctx, OP, state, lanes)?;
     ctx.fire(
         OP,
