@@ -486,6 +486,7 @@ mod tests {
                         ssm_kda_chunked: false,
                         ssm_kda_step_fused: false,
                         gemm_split_launch_ns: 0,
+                        gemm_split_launch_from: 0,
                         gemm_tc5_raster: 8,
                         pdl: false,
                         gemm_rows_m: 0,

@@ -109,6 +109,13 @@ pub struct GemmTc5Raster(pub u32);
 #[decision(id = "kernel.gemm.split_launch_ns", constant(range(0..=100_000)), default = 0, tune = search)]
 pub struct GemmSplitLaunchNs(pub u32);
 
+/// The fewest rows a dense bf16 product charges a K-splitting algorithm
+/// its reduce launch at (`kernel.gemm.split_launch_ns`); fewer are timed as
+/// they run alone. 0 charges every product.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.split_launch_from", constant(range(0..=65536)), default = 0, tune = search)]
+pub struct GemmSplitLaunchFrom(pub u32);
+
 /// The fewest tokens a W4A4 routed MLP keeps its rows by expert from the
 /// gate-up select to the weighted sum with (its GLU landing the down leg's
 /// NVFP4 operand from the gate-up epilogue); never (65 536 past any fire)
@@ -561,6 +568,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmKdaChunked>()
         .add::<SsmKdaStepFused>()
         .add::<GemmSplitLaunchNs>()
+        .add::<GemmSplitLaunchFrom>()
         .add::<GemmTc5Raster>()
         .add::<KernelPdl>()
         .add::<GemmRowsM>()
@@ -641,6 +649,7 @@ pub struct Tuning {
     pub ssm_kda_chunked: bool,
     pub ssm_kda_step_fused: bool,
     pub gemm_split_launch_ns: u32,
+    pub gemm_split_launch_from: u32,
     pub gemm_tc5_raster: u32,
     pub pdl: bool,
     pub gemm_rows_m: u32,
@@ -719,6 +728,7 @@ impl Tuning {
         ssm_kda_chunked: false,
         ssm_kda_step_fused: false,
         gemm_split_launch_ns: 0,
+        gemm_split_launch_from: 0,
         gemm_tc5_raster: 8,
         pdl: false,
         gemm_rows_m: 0,
@@ -797,6 +807,7 @@ impl Tuning {
             ssm_kda_chunked: profile.on::<SsmKdaChunked>(&Anywhere),
             ssm_kda_step_fused: profile.on::<SsmKdaStepFused>(&Anywhere),
             gemm_split_launch_ns: profile.get::<GemmSplitLaunchNs>().0,
+            gemm_split_launch_from: profile.get::<GemmSplitLaunchFrom>().0,
             gemm_tc5_raster: profile.get::<GemmTc5Raster>().0,
             pdl: profile.on::<KernelPdl>(&Anywhere),
             gemm_rows_m: profile.get::<GemmRowsM>().0,

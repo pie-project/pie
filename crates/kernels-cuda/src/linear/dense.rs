@@ -125,6 +125,7 @@ pub(crate) fn act_x_wt(
             tuning.gemm_narrow_n,
             tuning.gemm_split_launch_ns,
             tuning.gemm_rows_m,
+            tuning.gemm_split_launch_from,
         );
         let plan = device.plan_for(call);
         let tactic = capturing
@@ -685,6 +686,8 @@ struct Device {
     /// `kernel.gemm.split_launch_ns`: what a K-splitting algorithm's own
     /// reduce launch costs a captured step past its timing, or 0.
     split_ns: u32,
+    /// `kernel.gemm.split_launch_from`: the fewest rows charged `split_ns`.
+    split_from: u32,
     /// `kernel.gemm.rows_m`: products of 2 to this many rows may time the
     /// few-rows kernel.
     rows_m: u32,
@@ -709,6 +712,7 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
                 heuristics: 8,
                 narrow_n: 0,
                 split_ns: 0,
+                split_from: 0,
                 rows_m: 0,
                 plans: HashMap::new(),
                 chosen: HashMap::new(),
@@ -733,13 +737,16 @@ impl Device {
         narrow_n: u32,
         split_ns: u32,
         rows_m: u32,
+        split_from: u32,
     ) {
         if self.lt.workspace_bytes != workspace_bytes
             || self.heuristics != heuristics
             || self.narrow_n != narrow_n
             || self.split_ns != split_ns
             || self.rows_m != rows_m
+            || self.split_from != split_from
         {
+            self.split_from = split_from;
             self.lt.workspace_bytes = workspace_bytes;
             self.heuristics = heuristics;
             self.narrow_n = narrow_n;
@@ -747,6 +754,15 @@ impl Device {
             self.rows_m = rows_m;
             self.plans.clear();
             self.chosen.clear();
+        }
+    }
+
+    /// What a split algorithm's reduce launch is charged at `m` rows.
+    fn charge(&self, m: i32) -> u32 {
+        if i64::from(m) >= i64::from(self.split_from) {
+            self.split_ns
+        } else {
+            0
         }
     }
 
@@ -765,7 +781,7 @@ impl Device {
             m,
             n,
             k,
-            self.split_ns > 0,
+            self.charge(m) > 0,
         )?);
         self.plans.insert((m, n, k), Arc::clone(&plan));
         Some(plan)
@@ -779,12 +795,15 @@ impl Device {
         call: Call,
         capturing: cudaStreamCaptureStatus,
     ) -> Option<Tactic> {
+        // A product below `split_from` rows keys, plans and times as with
+        // no charge, so its tactic is what it was before one.
+        let charge = self.charge(call.m);
         let key = shape_key(
             call,
             self.lt.workspace_bytes,
             self.heuristics,
             self.narrow_n,
-            self.split_ns,
+            charge,
         );
         // A shape the few-rows kernel may serve keys apart from the one it
         // may not.
@@ -820,7 +839,7 @@ impl Device {
             plan,
             call,
             self.narrow_n,
-            self.split_ns,
+            charge,
             self.rows_m,
         );
         self.disk.store(key, tactic.encode());
