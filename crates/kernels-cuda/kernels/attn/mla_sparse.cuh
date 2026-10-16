@@ -5,7 +5,8 @@
 // A DeepSeek-sparse MLA's attention on tcgen05, a block a row (GLM-5.3's
 // DSA: 64 absorbed heads over one 512-wide latent, plus a 64-wide rotated
 // part or none, the keys a row's index selected): `attn/dsv4_sparse.cuh`'s
-// pass with no window and no sinks, the selected token ids its stream.
+// pass with no window and no sinks, the selected token ids its stream (in
+// any order, a negative one anywhere skipped).
 //
 //   - Q's latent sits in TMEM as there (lanes 0-63 a head's first 256 dims,
 //     lanes 64-127 its last), and its rotated part beside it: lanes 0-63
@@ -181,14 +182,13 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
         w.last = p.causal ? w.pos : kv_len - 1;
         w.pages = p.page_indices + pages_first;
         w.sel = p.selection + static_cast<long long>(w.row) * p.top_k;
-        w.entries = p.top_k;
+        // The selection may hold -1 anywhere (a pooled index's dropped
+        // blocks): the stream runs to its last id, a -1 before it masked.
+        w.entries = 0;
         for (int n0 = 0; n0 < p.top_k; n0 += 32) {
             const int n = n0 + static_cast<int>(lane);
-            const unsigned ended = __ballot_sync(0xffffffffu, n < p.top_k && w.sel[n] < 0);
-            if (ended != 0u) {
-                w.entries = n0 + __ffs(ended) - 1;
-                break;
-            }
+            const unsigned held = __ballot_sync(0xffffffffu, n < p.top_k && w.sel[n] >= 0);
+            if (held != 0u) w.entries = n0 + 32 - __clz(held);
         }
         // A row always walks one tile: its O and its log-sum-exp land.
         w.nt = max((w.entries + kBK - 1) / kBK, 1);

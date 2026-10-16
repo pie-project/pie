@@ -24,7 +24,10 @@ const KV_LENS: [usize; 2] = [157, 21];
 const PAGE_INDICES: [i32; 12] = [3, 0, 5, 1, 6, 2, 4, 9, 11, 8, 7, 10];
 const PAGE_INDPTR: [i32; 3] = [0, 10, 12];
 const LAST_PAGE_LENS: [i32; 2] = [13, 5];
-const TOP_K: usize = 96;
+/// A row's selection width: up to 96 ids with -1 holes among them (as a
+/// pooled index's dropped blocks leave), not a whole number of tiles.
+const TOP_K: usize = 131;
+const PICKS: usize = 96;
 const INT_BYTES: usize = 4 << 20;
 const FLOAT_BYTES: usize = 64 << 20;
 
@@ -49,14 +52,14 @@ impl Case {
     }
 
     /// The first 40 keys whole (whole pages among them), then every other,
-    /// at most `TOP_K`; the very first row of request 1 selects nothing.
+    /// at most `PICKS`; the very first row of request 1 selects nothing.
     fn picked(request: usize, abs: usize) -> Vec<usize> {
         if request == 1 && abs == 0 {
             return Vec::new();
         }
         (0..=abs)
             .filter(|&j| j < 40 || j % 2 == 0)
-            .take(TOP_K)
+            .take(PICKS)
             .collect()
     }
 
@@ -66,8 +69,13 @@ impl Case {
             for i in 0..Q_LENS[r] {
                 let t = self.qo_indptr[r] as usize + i;
                 let abs = KV_LENS[r] - Q_LENS[r] + i;
-                for (n, j) in Self::picked(r, abs).into_iter().enumerate() {
+                let mut n = 0;
+                for (i, j) in Self::picked(r, abs).into_iter().enumerate() {
+                    if i % 5 == 2 {
+                        n += 1; // a hole
+                    }
                     out[t * TOP_K + n] = j as i32;
+                    n += 1;
                 }
             }
         }
