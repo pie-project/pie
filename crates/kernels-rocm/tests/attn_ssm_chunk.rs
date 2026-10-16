@@ -232,19 +232,23 @@ fn bench_gated_delta_prefill() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(gpu) = Gpu::open() else { return };
-    // Qwen3.5-0.8B's linear-attention mixer: 16 key and 16 value heads of 128.
-    for lens in [
-        vec![512],
-        vec![2048],
-        vec![8192],
-        vec![1024; 8],
-        vec![1; 64],
-        vec![23; 256],
+    // Qwen3.5-0.8B's linear-attention mixer: 16 key and 16 value heads of
+    // 128; Qwen3.8-Flash-Next's: 16 key and 48 value heads, at the long-in
+    // and mid-in prefill steps.
+    for (k_heads, v_heads, lens) in [
+        (16, 16, vec![512]),
+        (16, 16, vec![2048]),
+        (16, 16, vec![8192]),
+        (16, 16, vec![1024; 8]),
+        (16, 16, vec![1; 64]),
+        (16, 16, vec![23; 256]),
+        (16, 48, vec![2048; 8]),
+        (16, 48, vec![1024; 16]),
     ] {
         let case = Case {
             lens: lens.clone(),
-            k_heads: 16,
-            v_heads: 16,
+            k_heads,
+            v_heads,
             begin: None,
             commit: None,
         };
@@ -253,9 +257,10 @@ fn bench_gated_delta_prefill() {
         for serial in [true, false] {
             let us = gpu.time(10, || launch(&gpu, &case, &mut b, serial));
             eprintln!(
-                "{:>8} {:?}: {us:9.1} us",
+                "{:>8} {k_heads}/{v_heads} heads, {} x {}: {us:9.1} us",
                 if serial { "serial" } else { "chunked" },
-                lens
+                lens.len(),
+                lens[0]
             );
         }
     }
