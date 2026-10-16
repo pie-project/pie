@@ -23,6 +23,9 @@ sdpa.dsv4_prefill_from = 512
 # brought) rather than a block a row pair over their keys' union: 32 x 4096
 # in 8.37 / 8.37 s against 8.72 / 9.18 s.
 sdpa.dsv4_sparse = true
+# GLM-5.3's DSA (sparse MLA, top-2048 tokens a row) a block a row on
+# tcgen05, the selected keys' latent and rotated part gathered whole.
+sdpa.mla_sparse = true
 # A pooled index's top-k by radix select rather than forty bisection passes
 # (DSV4-Flash's 512 of up to 1024 blocks, 2048 rows: 417 -> 220 us).
 sdpa.index_radix = true

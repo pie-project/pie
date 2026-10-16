@@ -103,6 +103,7 @@ const SPECIFIC: &[(&str, Toolchain)] = &[
     ("attn/tc5_fmha.cuh", Toolchain::new(12, 9)),
     ("attn/dsv4_prefill.cuh", Toolchain::new(12, 9)),
     ("attn/dsv4_sparse.cuh", Toolchain::new(12, 9)),
+    ("attn/mla_sparse.cuh", Toolchain::new(12, 9)),
     ("attn/gdn_tc5.cuh", Toolchain::new(12, 9)),
     ("linear/moe_w4_cvt.cuh", Toolchain::new(12, 9)),
 ];

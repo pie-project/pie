@@ -606,6 +606,184 @@ pub(crate) mod naive {
     }
 }
 
+/// The selected attention a block a row on tcgen05 (`attn/mla_sparse.cuh`).
+mod sparse {
+    use cudarc::driver::sys as dr;
+
+    use super::{Ctx, Error, KvPool, Tensor};
+    use crate::jit::{ArgValue, Fire, Launch, aligned16, symbol};
+    use crate::linear::tc5::{Map, encode, supported};
+    use dtype::Dtype;
+
+    const FILE: &str = "attn/mla_sparse.cuh";
+
+    /// `pie::attn::mlas::Params`, field for field.
+    #[repr(C)]
+    struct Params {
+        o: u64,
+        lse: u64,
+        q: u64,
+        q_pe: u64,
+        qo_indptr: u64,
+        page_indptr: u64,
+        page_indices: u64,
+        last_page_lens: u64,
+        selection: u64,
+        live: u64,
+        requests: i32,
+        causal: i32,
+        runs: i32,
+        page: i32,
+        top_k: i32,
+        rows: i32,
+        q_stride: i32,
+        qpe_stride: i32,
+        o_stride: i32,
+        scale_log2: f32,
+    }
+
+    /// `pie::attn::mlas::Layout<kRope>::kSmem`: two slots of 64 keys' latent
+    /// (and their rotated dims twice), P twice, the score exchange, six key
+    /// lists, barriers, and the 1024-byte alignment.
+    const fn smem(rope: i32) -> u32 {
+        let slot = 65536 + if rope > 0 { 16384 } else { 0 };
+        2 * slot + 2 * 8192 + 16384 + 6 * 64 * 4 + 1024 + 1024
+    }
+
+    pub(super) struct Shape<'a> {
+        pub q: Tensor,
+        pub qo_indptr: u64,
+        pub q_pe: Tensor,
+        pub selection: Tensor,
+        pub pool: &'a KvPool,
+        pub heads: i32,
+        pub kv_lora_rank: i32,
+        pub rope: i32,
+        pub requests: i32,
+        pub sm_scale: f32,
+        pub causal: bool,
+        pub lse: u64,
+    }
+
+    /// Fires the pass where the profile says and the shape is the one it is
+    /// built for: 64 heads over a 512-wide bf16 latent, a 64-wide rotated
+    /// part or none; `None` where it does not serve.
+    pub(super) fn fire(
+        ctx: &Ctx,
+        op: &'static str,
+        s: &Shape<'_>,
+        o: &mut Tensor,
+    ) -> Option<Result<(), Error>> {
+        let pool = s.pool;
+        let cells = pool.keys.rows;
+        let fits = ctx.tuning().mla_sparse
+            && supported()
+            && s.heads == 64
+            && s.kv_lora_rank == 512
+            && (s.rope == 0 || s.rope == 64)
+            && s.q.dtype == Dtype::Bf16
+            && pool.keys.dtype == Dtype::Bf16
+            && pool.page_size > 0
+            && cells > 0
+            && s.selection.width > 0
+            && o.width == 64 * 512
+            && s.q.width == 64 * 512
+            && [s.q.ptr, o.ptr, pool.keys.ptr]
+                .iter()
+                .all(|&at| aligned16(at))
+            && (s.rope == 0
+                || (pool.values.dtype == Dtype::Bf16
+                    && aligned16(pool.values.ptr)
+                    && aligned16(s.q_pe.ptr)
+                    && s.q_pe.width == 64 * 64));
+        if !fits {
+            return None;
+        }
+        Some(launch(ctx, op, s, o))
+    }
+
+    fn launch(ctx: &Ctx, op: &'static str, s: &Shape<'_>, o: &mut Tensor) -> Result<(), Error> {
+        let rows = o.rows;
+        if rows == 0 {
+            return Ok(());
+        }
+        let pool = s.pool;
+        let cells = pool.keys.rows;
+        let int = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
+        let map = |ptr: u64, width: u32, box_rows: u32| {
+            encode(Map {
+                ptr,
+                ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                dims: [width, cells, 0],
+                strides: [u64::from(width) * 2, 0],
+                boxes: [64, box_rows, 1],
+                swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            })
+        };
+        let map_ckv = map(pool.keys.ptr, 512, 1)?;
+        let map_ckv_run = map(pool.keys.ptr, 512, 16)?;
+        // No rotated part: the map is never read; any valid one stands in.
+        let map_kpe = if s.rope > 0 {
+            map(pool.values.ptr, 64, 1)?
+        } else {
+            map_ckv
+        };
+        let live = match ctx.stage() {
+            ArgValue::Ptr(at) => at,
+            _ => 0,
+        };
+        let params = Params {
+            o: o.ptr,
+            lse: s.lse,
+            q: s.q.ptr,
+            q_pe: s.q_pe.ptr,
+            qo_indptr: s.qo_indptr,
+            page_indptr: pool.page_indptr.ptr,
+            page_indices: pool.page_indices.ptr,
+            last_page_lens: pool.last_page_lens.ptr,
+            selection: s.selection.ptr,
+            live,
+            requests: s.requests,
+            causal: i32::from(s.causal),
+            runs: 1,
+            page: pool.page_size,
+            top_k: int(s.selection.width),
+            rows: int(rows),
+            q_stride: int(s.q.width),
+            qpe_stride: int(s.q_pe.width),
+            o_stride: int(o.width),
+            scale_log2: s.sm_scale * core::f32::consts::LOG2_E,
+        };
+        let bytes = |m: &[u64; 16]| ArgValue::Bytes {
+            ptr: m.as_ptr().cast(),
+            len: 128,
+        };
+        ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!("::pie::attn::mlas::mla_sparse<{}>", s.rope)),
+            )
+            .apply(
+                Launch::grid(
+                    [rows.min(ctx.multiprocessors().unwrap_or(148)), 1, 1],
+                    [384, 1, 1],
+                )
+                .smem(smem(s.rope)),
+            ),
+            &[
+                bytes(&map_ckv),
+                bytes(&map_ckv_run),
+                bytes(&map_kpe),
+                ArgValue::Bytes {
+                    ptr: (&raw const params).cast(),
+                    len: core::mem::size_of::<Params>(),
+                },
+            ],
+        )
+    }
+}
+
 mod mla_fa2 {
     use super::{Ctx, Error, Layer, refuse};
     use crate::attn::fa2_abi::{UintFastdiv, resolve};
@@ -1062,6 +1240,27 @@ fn selected(
     }
     let num_requests = kv::lanes_of(op, q.indptr)?;
     let lse = lse_plane(op, lse, o.rows, heads)?;
+    if let Some(fired) = sparse::fire(
+        ctx,
+        op,
+        &sparse::Shape {
+            q: q.data,
+            qo_indptr: q.indptr.ptr,
+            q_pe,
+            selection,
+            pool,
+            heads,
+            kv_lora_rank: layer.kv_lora_rank,
+            rope: layer.rope_dim,
+            requests: num_requests,
+            sm_scale,
+            causal,
+            lse,
+        },
+        o,
+    ) {
+        return fired;
+    }
     naive::fire(
         ctx,
         op,

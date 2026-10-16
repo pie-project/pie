@@ -213,6 +213,14 @@ pub struct SdpaDsv4PrefillFrom(pub u32);
 #[decision(id = "kernel.sdpa.dsv4_sparse", flag, default = false, tune = search)]
 pub struct SdpaDsv4Sparse;
 
+/// Whether a sparse MLA's selected attention (64 absorbed heads over a
+/// 512-wide bf16 latent, a 64-wide rotated part or none: GLM-5.3's DSA)
+/// runs a block a row on tcgen05 (`attn/mla_sparse.cuh`, sm_100a); off, the
+/// warp-a-key form serves it as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.mla_sparse", flag, default = false, tune = search)]
+pub struct SdpaMlaSparse;
+
 /// Whether a pooled index (`attention.index_topk`) scores its blocks on the
 /// tensor cores rather than a thread a block. Off scores the scalar way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -533,6 +541,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaPoolMma>()
         .add::<SdpaDsv4PrefillFrom>()
         .add::<SdpaDsv4Sparse>()
+        .add::<SdpaMlaSparse>()
         .add::<GemmNarrowN>();
 }
 
@@ -608,6 +617,7 @@ pub struct Tuning {
     pub pool_mma: bool,
     pub dsv4_prefill_from: u32,
     pub dsv4_sparse: bool,
+    pub mla_sparse: bool,
     pub gemm_narrow_n: u32,
 }
 
@@ -681,6 +691,7 @@ impl Tuning {
         pool_mma: false,
         dsv4_prefill_from: 0,
         dsv4_sparse: false,
+        mla_sparse: false,
         gemm_narrow_n: 0,
     };
 
@@ -754,6 +765,7 @@ impl Tuning {
             pool_mma: profile.on::<SdpaPoolMma>(&Anywhere),
             dsv4_prefill_from: profile.get::<SdpaDsv4PrefillFrom>().0,
             dsv4_sparse: profile.on::<SdpaDsv4Sparse>(&Anywhere),
+            mla_sparse: profile.on::<SdpaMlaSparse>(&Anywhere),
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,
         }
     }
