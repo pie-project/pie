@@ -54,6 +54,7 @@ pub(super) fn all() -> Vec<Rule> {
         rope_yarn_append(),
         pool_attention(),
         hc_pre(),
+        mla_prefill_expanded(),
         hc_prenorm_project(),
         hc_gates_norm(),
         lse_sink(),
@@ -235,6 +236,65 @@ fn pool_attention() -> Rule {
                 sink: m.value("sink"),
                 head_dim: m.u32("d"),
                 o_out: m.value("o_out"),
+            }
+        },
+    )
+}
+
+/// A latent attention's prefill: the query absorb, the scoring over every
+/// cached latent row and the output absorb through one `kv_b`, opening on
+/// the cut of `q_b`'s rows where the query reaches it unturned, or on the
+/// two halves.
+fn mla_prefill_expanded() -> Rule {
+    let chain = |split: bool| {
+        template(move |p| {
+            let (heads, rank) = (p.u32("heads"), p.u32("rank"));
+            let (nope, v) = (p.u32("nope"), p.u32("v"));
+            let (q_nope, q_pe) = if split {
+                let q_b = p.rows("q_b", W);
+                let (q_nope, q_pe) = attn::mla_split_q_b(&q_b, heads, nope, p.u32("rope"));
+                p.name("q_nope", &q_nope);
+                p.name("q_pe", &q_pe);
+                (q_nope, q_pe)
+            } else {
+                (p.rows("nope_rows", W), p.rows("rope_rows", W))
+            };
+            let kv_b = p.weight("kv_b", [W, W]);
+            let q = attn::mla_absorb_q(&q_nope, &kv_b, heads, rank, nope, v);
+            p.name("q", &q);
+            let plan = p.value("plan", Ty::Struct(StructKind::MlaPlan));
+            let pages = p.cache("pages");
+            p.free("window");
+            let scored = attn::mla_prefill(
+                &q,
+                &plan,
+                &q_pe,
+                pages,
+                heads,
+                rank,
+                p.f32("sm_scale"),
+                None,
+            );
+            p.name("scored", &scored);
+            let o = attn::mla_absorb_out(&scored, &kv_b, heads, rank, nope, v);
+            p.export("o", &o);
+        })
+    };
+    Rule::new(
+        "attention.mla_prefill_expanded",
+        [chain(true), chain(false)],
+        |m| {
+            let attention = |name: &str| {
+                let Operation::Attention(attn) = m.op(name) else {
+                    panic!("`{name}` comes from an attention");
+                };
+                Box::new(attn.clone())
+            };
+            Fused::MlaPrefillExpanded {
+                split: m.get("q_b").map(|_| attention("q_nope")),
+                absorb_q: attention("q"),
+                prefill: attention("scored"),
+                absorb_out: attention("o"),
             }
         },
     )

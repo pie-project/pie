@@ -11,6 +11,12 @@ gemv.bf16 = "narrow"
 # 4096 in 1.50 s against 1.83 s on the naive kernel, decode bs1/8/64 2.33 /
 # 3.53 / 8.58 ms against 2.36 / 3.46 / 8.90.
 mla.path  = "fa2"
+# A latent attention's prefill from 256 rows expanded, as vLLM's MLA prefill
+# runs it: the fire's latent rows through kv_b into a 192-wide key and
+# 128-wide value head a query head, then the tcgen05 prefill at those
+# widths. Kimi-K3's MLA layer prefills 32 x 4096 in ~25 ms against 240 ms
+# absorbed (its 576 / 512 widths on the FA2 arm).
+mla.expanded_from = 256
 # DeepSeek-V4's compressed-pool attention on mma.sync, a block a row's 16
 # heads, rather than the scalar walk a block a row and head.
 sdpa.pool_mma = true

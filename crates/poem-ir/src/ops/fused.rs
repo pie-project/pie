@@ -268,6 +268,20 @@ pub enum Fused {
         head_dim: u32,
         o_out: ValueId,
     },
+    /// A latent attention's prefill whole: where it opens on them, the cut
+    /// of `q_b`'s rows into their two halves (`split`, an `MlaSplitQB`),
+    /// the query absorb (`absorb_q`), the scoring over every cached latent
+    /// row (`prefill`, an `MlaPrefill`) and the output absorb
+    /// (`absorb_out`) through the same `kv_b`. A backend may land the
+    /// output absorb's rows expanded (a key and value head a query head),
+    /// or run the ops. Every intermediate is still an output, read by
+    /// nothing else.
+    MlaPrefillExpanded {
+        split: Option<Box<Attention>>,
+        absorb_q: Box<Attention>,
+        prefill: Box<Attention>,
+        absorb_out: Box<Attention>,
+    },
     /// YaRN over q and k, and the rotated k with its v landed in the paged
     /// cache at each row's page and offset (`kv_append`); `k_out` is read by
     /// nothing else.
@@ -580,6 +594,33 @@ impl Operands for Fused {
                 pool.inputs(sink);
                 sink.push(*sinks);
             }
+            // `q_b` (or the query's `nope` half), `kv_b`, the plan, the
+            // rope half where the rows come apart, the cache.
+            Self::MlaPrefillExpanded {
+                split,
+                absorb_q,
+                prefill,
+                ..
+            } => {
+                if let Some(split) = split {
+                    split.inputs(sink);
+                } else if let Attention::MlaAbsorbQ { q_nope, .. } = **absorb_q {
+                    sink.push(q_nope);
+                }
+                if let Attention::MlaAbsorbQ { kv_b, .. } = **absorb_q {
+                    sink.push(kv_b);
+                }
+                if let Attention::MlaPrefill {
+                    plan, q_pe, cache, ..
+                } = **prefill
+                {
+                    sink.push(plan);
+                    if split.is_none() {
+                        sink.push(q_pe);
+                    }
+                    sink.push(cache);
+                }
+            }
             Self::MoeExperts {
                 select,
                 glu,
@@ -755,6 +796,19 @@ impl Operands for Fused {
                 merge.outputs(sink);
                 sink.push(*o_out);
             }
+            Self::MlaPrefillExpanded {
+                split,
+                absorb_q,
+                prefill,
+                absorb_out,
+            } => {
+                if let Some(split) = split {
+                    split.outputs(sink);
+                }
+                absorb_q.outputs(sink);
+                prefill.outputs(sink);
+                absorb_out.outputs(sink);
+            }
             Self::MoeExperts {
                 select,
                 glu,
@@ -817,6 +871,7 @@ impl Operands for Fused {
             | Self::MlpSwiglu { .. }
             | Self::MoeSelectGlu { .. }
             | Self::MoeExperts { .. }
+            | Self::MlaPrefillExpanded { .. }
             | Self::SplitRopeYarnAppend { .. }
             | Self::NormRopeLastAppend { .. }
             | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
@@ -858,6 +913,7 @@ impl Operands for Fused {
             Self::QgQknormRopeAppend { .. } => "elementwise.qg_qknorm_rope_append",
             Self::LseSink { .. } => "attention.lse_sink",
             Self::PoolAttention { .. } => "attention.pool_attention",
+            Self::MlaPrefillExpanded { .. } => "attention.mla_prefill_expanded",
             Self::HcPrenormProject { .. } => "elementwise.hc_prenorm_project",
             Self::HcGatesNorm { .. } => "elementwise.hc_gates_norm",
             Self::HcPre { .. } => "elementwise.hc_pre",

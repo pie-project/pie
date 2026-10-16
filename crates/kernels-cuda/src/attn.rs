@@ -36,7 +36,7 @@ pub mod xqa;
 pub mod dsv4_prefill;
 
 #[cfg(feature = "cuda")]
-mod tc5_fmha;
+pub mod tc5_fmha;
 
 use crate::error::Error;
 use dtype::Dtype;

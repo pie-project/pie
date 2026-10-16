@@ -125,6 +125,16 @@ pub struct SsmKdaChunked;
 #[decision(id = "kernel.moe.w4a8_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct MoeW4a8FusedFrom(pub u32);
 
+/// The prefill rows from which a latent attention's prefill runs expanded
+/// (its latent rows through `kv_b` into a key and value head a query head,
+/// then a dense prefill at those widths, as vLLM's MLA prefill runs) in
+/// place of its absorbed scoring; never (65 536 past any fire) but where a
+/// chip's profile says (B200's). Below it the expansion of every cached row
+/// costs more than the absorbed scoring saves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.mla.expanded_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
+pub struct MlaExpandedFrom(pub u32);
+
 /// Whether a dense projection's bias lands from the cuBLASLt epilogue of the
 /// algorithm its shape chose, instead of a separate add. Off but where a
 /// chip's profile turns it on (B200's).
@@ -520,6 +530,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmNvfp4K128>()
         .add::<MoeW4a4FusedFrom>()
         .add::<MoeW4a8FusedFrom>()
+        .add::<MlaExpandedFrom>()
         .add::<SsmKdaChunked>()
         .add::<GemmSplitLaunchNs>()
         .add::<GemmTc5Raster>()
@@ -596,6 +607,7 @@ pub struct Tuning {
     pub gemm_nvfp4_k128: bool,
     pub moe_w4a4_fused_from: u32,
     pub moe_w4a8_fused_from: u32,
+    pub mla_expanded_from: u32,
     pub ssm_kda_chunked: bool,
     pub gemm_split_launch_ns: u32,
     pub gemm_tc5_raster: u32,
@@ -670,6 +682,7 @@ impl Tuning {
         gemm_nvfp4_k128: false,
         moe_w4a4_fused_from: 65_536,
         moe_w4a8_fused_from: 65_536,
+        mla_expanded_from: 65_536,
         ssm_kda_chunked: false,
         gemm_split_launch_ns: 0,
         gemm_tc5_raster: 8,
@@ -744,6 +757,7 @@ impl Tuning {
             gemm_nvfp4_k128: profile.on::<GemmNvfp4K128>(&Anywhere),
             moe_w4a4_fused_from: profile.get::<MoeW4a4FusedFrom>().0,
             moe_w4a8_fused_from: profile.get::<MoeW4a8FusedFrom>().0,
+            mla_expanded_from: profile.get::<MlaExpandedFrom>().0,
             ssm_kda_chunked: profile.on::<SsmKdaChunked>(&Anywhere),
             gemm_split_launch_ns: profile.get::<GemmSplitLaunchNs>().0,
             gemm_tc5_raster: profile.get::<GemmTc5Raster>().0,

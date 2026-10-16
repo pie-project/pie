@@ -86,3 +86,23 @@ fn gpt_oss_rotates_and_writes_its_kv_from_the_packed_row() {
         (0, layers)
     );
 }
+
+/// Kimi-K3's latent attention prefill (its query cut, absorbs and scoring)
+/// is a pattern the compiler folds, on every MLA layer.
+#[test]
+fn kimi_k3_folds_its_latent_prefill() {
+    let deployment = poem_compiler::catalog::deployment("kimik3-l4-bf16-mxfp4a8-kv-bf16")
+        .expect("the catalog states kimik3-l4");
+    let trace = deployment.trace(Platform::Cuda);
+    let count = |t: &poem_ir::Trace, op: &str| {
+        t.nodes
+            .iter()
+            .filter(|node| poem_ir::Operands::name(&node.op) == op)
+            .count()
+    };
+    let prefills = count(&trace, "attention.mla_prefill");
+    let fused = poem_compiler::fuse::fuse(trace, &["attention.mla_prefill_expanded"]);
+    assert!(prefills > 0);
+    assert_eq!(count(&fused, "attention.mla_prefill"), 0);
+    assert_eq!(count(&fused, "attention.mla_prefill_expanded"), prefills);
+}

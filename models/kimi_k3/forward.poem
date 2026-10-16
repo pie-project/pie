@@ -64,32 +64,34 @@ def plans(inputs, heads, kv_lora_rank):
 def attend(x, q_nope, q_pe, pages, plan, a, selection = None):
     """The split queries `q_nope`/`q_pe` of the rows `x` scored against the
     latent `pages` (or the `selection` of them), through `a`'s output
-    projection. A plan with no decode arm reads its rows whole."""
-    q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    seam.at(seam.ATTN_Q, [q])
-
+    projection. A plan with no decode arm reads its rows whole. Each arm
+    absorbs its own queries and output, so a prefill arm's three are one
+    chain a backend may run expanded."""
     if plan.decode == None:
-        scored = arm(False, q, plan.prefill, q_pe, selection, pages, a)
+        o = arm(False, q_nope, plan.prefill, q_pe, selection, pages, a)
     else:
         one = fact.single_token()
         on = lambda rows, holds: rows.on(holds) if rows != None else None
-        scored = merge([
-            arm(True, q.on(one), plan.decode, q_pe.on(one), on(selection, one), pages, a),
-            arm(False, q.on(~one), plan.prefill, q_pe.on(~one), on(selection, ~one), pages, a),
+        o = merge([
+            arm(True, q_nope.on(one), plan.decode, q_pe.on(one), on(selection, one), pages, a),
+            arm(False, q_nope.on(~one), plan.prefill, q_pe.on(~one), on(selection, ~one), pages, a),
         ])
 
-    o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     if a.gate != None:
         o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
     seam.at(seam.ATTN_OUT, [o])
     return ops.linear.matmul(o, a.o_proj)
 
-def arm(decode, q, plan, q_pe, selection, pages, a):
+def arm(decode, q_nope, plan, q_pe, selection, pages, a):
+    """One arm's rows absorbed, scored and absorbed back out."""
+    q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     if selection == None:
         score = ops.attn.mla_decode if decode else ops.attn.mla_prefill
-        return score(q, plan, q_pe, pages, a.heads, a.kv_lora_rank, a.sm_scale)
-    score = ops.attn.mla_decode_selected if decode else ops.attn.mla_prefill_selected
-    return score(q, plan, q_pe, selection, pages, a.heads, a.kv_lora_rank, a.sm_scale)
+        scored = score(q, plan, q_pe, pages, a.heads, a.kv_lora_rank, a.sm_scale)
+    else:
+        score = ops.attn.mla_decode_selected if decode else ops.attn.mla_prefill_selected
+        scored = score(q, plan, q_pe, selection, pages, a.heads, a.kv_lora_rank, a.sm_scale)
+    return ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
 
 def caches(m, c):
     kv = c.kv_space(m.kv)

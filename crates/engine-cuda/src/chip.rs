@@ -477,6 +477,7 @@ mod tests {
                         gemm_nvfp4_k128: false,
                         moe_w4a4_fused_from: 65_536,
                         moe_w4a8_fused_from: 65_536,
+                        mla_expanded_from: 65_536,
                         ssm_kda_chunked: false,
                         gemm_split_launch_ns: 0,
                         gemm_tc5_raster: 8,
@@ -660,6 +661,7 @@ mod tests {
         assert_eq!((b200.nvfp4_mma_from, b200.nvfp4_mma_until), (32, 8192));
         assert_eq!((b200.gemm_nvfp4_k128, b200.moe_w4a4_fused_from), (true, 1));
         assert_eq!(b200.moe_w4a8_fused_from, 512);
+        assert_eq!(b200.mla_expanded_from, 256);
     }
 
     #[test]
@@ -736,6 +738,10 @@ mod tests {
             assert_eq!(
                 other.moe_w4a8_fused_from, 65_536,
                 "sm_{major}{minor} keeps the W4A8 routed MLP apart"
+            );
+            assert_eq!(
+                other.mla_expanded_from, 65_536,
+                "sm_{major}{minor} scores a latent prefill absorbed"
             );
         }
     }

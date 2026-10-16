@@ -15,6 +15,7 @@ impl DispatchFused for Run<'_> {
             Fused::QgQknormRopeAppend { .. } => self.qg_qknorm_rope_append(op),
             Fused::LseSink { .. } => self.lse_sink(op),
             Fused::PoolAttention { .. } => self.pool_attention(op),
+            Fused::MlaPrefillExpanded { .. } => self.mla_prefill_expanded(op),
             Fused::HcPrenormProject { .. } => self.hc_prenorm_project(op),
             Fused::HcGatesNorm { .. } => self.hc_gates_norm(op),
             Fused::HcPre { .. } => self.hc_pre(op),
@@ -232,6 +233,93 @@ impl Run<'_> {
         }
         self.elementwise(norm)?;
         self.elementwise(project)
+    }
+
+    /// A latent attention's prefill: expanded (a key and value head a query
+    /// head, as vLLM's MLA prefill runs it) from `kernel.mla.expanded_from`
+    /// rows where the device and the heads take it, else the split, the
+    /// absorbs and the scoring as the trace had them.
+    fn mla_prefill_expanded(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::MlaPrefillExpanded {
+            split,
+            absorb_q,
+            prefill,
+            absorb_out,
+        } = op
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        #[cfg(feature = "cuda")]
+        if let (
+            poem_ir::Attention::MlaAbsorbQ {
+                q_nope,
+                kv_b,
+                heads,
+                kv_lora_rank,
+                nope_dim,
+                v_head_dim,
+                ..
+            },
+            poem_ir::Attention::MlaPrefill {
+                q,
+                q_pe,
+                cache,
+                window: None,
+                sm_scale,
+                lse: None,
+                ..
+            },
+            poem_ir::Attention::MlaAbsorbOut { o, .. },
+        ) = (&**absorb_q, &**prefill, &**absorb_out)
+        {
+            use kernels_cuda::attn::mla::{self, ExpandedQ, Heads};
+            let mut out = self.tensor(*o);
+            let q_pe_t = self.tensor(*q_pe);
+            let h = Heads {
+                heads: *heads,
+                kv_lora_rank: *kv_lora_rank,
+                nope: *nope_dim,
+                rope: q_pe_t.width / (*heads).max(1),
+                v: *v_head_dim,
+            };
+            if out.rows >= self.ctx().tuning().mla_expanded_from && mla::expanded_takes(&h) {
+                let queries = match split.as_deref() {
+                    Some(poem_ir::Attention::MlaSplitQB { q_b, .. }) => {
+                        ExpandedQ::Packed(self.tensor(*q_b))
+                    }
+                    _ => ExpandedQ::Split {
+                        q_nope: self.tensor(*q_nope),
+                        q_pe: q_pe_t,
+                    },
+                };
+                let kv_b = self.dense_or_decoded(
+                    "attention.mla_prefill_expanded",
+                    *kv_b,
+                    heads * (nope_dim + v_head_dim),
+                    *kv_lora_rank,
+                )?;
+                let qo_indptr = self.ragged(*q).indptr;
+                let pool = self.pool(*cache);
+                if mla::prefill_expanded(
+                    self.ctx(),
+                    queries,
+                    qo_indptr,
+                    &pool,
+                    kv_b,
+                    h,
+                    *sm_scale,
+                    &mut out,
+                )? {
+                    return Ok(());
+                }
+            }
+        }
+        if let Some(split) = split {
+            self.attention(split)?;
+        }
+        self.attention(absorb_q)?;
+        self.attention(prefill)?;
+        self.attention(absorb_out)
     }
 
     /// DeepSeek-V4's attention: the window, the pool, their merge and the

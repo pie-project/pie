@@ -57,6 +57,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("attention.mla_decode_selected", Reads::Rows),
     entry("attention.mla_latents", Reads::Rows),
     entry("attention.mla_latents_rope", Reads::Rows),
+    entry("attention.mla_prefill_expanded", Reads::Rows),
     entry("attention.mla_prefill_selected", Reads::Rows),
     entry("attention.mla_split_q_b", Reads::Rows),
     entry("attention.ple_ngram_ids", Reads::Rows),

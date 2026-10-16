@@ -259,3 +259,136 @@ pub(crate) fn try_prefill(
     )?;
     Ok(true)
 }
+
+/// A prefill whose key and value heads are rows of planes of their own
+/// (an expanded latent attention's: keys `dqk` wide, values `dv`, each at
+/// its own head and token stride, the value rows perhaps inside a wider
+/// plane), its pages named as a pool's are.
+#[derive(Clone, Copy, Debug)]
+pub struct Planes {
+    /// Queries `[rows][heads * dqk]` at row stride `q_stride`.
+    pub q: u64,
+    pub q_stride: u32,
+    /// Output `[rows][heads * dv]` at row stride `o_stride`.
+    pub o: u64,
+    pub o_stride: u32,
+    /// Key rows: cell `c`, head `h` at `k + (c * k_cell + h * k_head) * 2`.
+    pub k: u64,
+    pub k_head: u32,
+    pub k_cell: u32,
+    /// Value rows likewise.
+    pub v: u64,
+    pub v_head: u32,
+    pub v_cell: u32,
+    /// Cells (tokens) the planes hold.
+    pub cells: u32,
+    pub heads: u32,
+    pub dqk: u32,
+    pub dv: u32,
+    /// The ragged rows and the pages each request reads, as a pool's.
+    pub qo_indptr: u64,
+    pub kv_indptr: u64,
+    pub kv_indices: u64,
+    pub last_page_len: u64,
+    pub page: u32,
+    /// Device `[first lane, requests]`.
+    pub live: u64,
+    pub requests: u32,
+    pub rows: u32,
+    pub causal: bool,
+    pub sm_scale: f32,
+}
+
+/// The widths [`prefill_planes`] runs: a 192-wide key over a 128-wide
+/// value (DeepSeek's and Kimi-K3's expanded latent heads), or one width for
+/// both.
+#[must_use]
+pub fn planes_take(dqk: u32, dv: u32) -> bool {
+    supported() && matches!((dqk, dv), (192, 128) | (128, 128) | (64, 64))
+}
+
+/// One query head a key head, every head's rows in [`Planes`]: the tcgen05
+/// prefill at a key width and a value width of their own.
+pub fn prefill_planes(ctx: &Ctx, op: &'static str, at: &Planes) -> Result<(), Error> {
+    use crate::jit::refuse;
+    if !planes_take(at.dqk, at.dv) {
+        return Err(refuse(
+            op,
+            format!("no tcgen05 prefill reads {} x {} heads", at.dqk, at.dv),
+        ));
+    }
+    if at.page < 16 || !at.page.is_multiple_of(16) || !128u32.is_multiple_of(at.page) {
+        return Err(refuse(
+            op,
+            format!(
+                "a {}-token page is not whole 16-token slices of a 128-key tile",
+                at.page
+            ),
+        ));
+    }
+    if ![at.q, at.o, at.k, at.v].iter().all(|&p| aligned16(p)) {
+        return Err(refuse(op, "a plane is not 16-byte aligned"));
+    }
+    let (bkv, stages) = (128u32, if at.dqk == at.dv { 3 } else { 2 });
+    let map = |ptr: u64, d: u32, head: u32, cell: u32, rows: u32| {
+        encode(Map {
+            ptr,
+            ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            dims: [d, at.heads, at.cells.max(1)],
+            strides: [u64::from(head) * 2, u64::from(cell) * 2],
+            boxes: [64, 1, rows],
+            swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+        })
+    };
+    let map_k = map(at.k, at.dqk, at.k_head, at.k_cell, 16)?;
+    let map_v = map(at.v, at.dv, at.v_head, at.v_cell, 16)?;
+    let map_k_run = map(at.k, at.dqk, at.k_head, at.k_cell, bkv)?;
+    let map_v_run = map(at.v, at.dv, at.v_head, at.v_cell, bkv)?;
+    let int = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
+    let params = Params {
+        q: at.q,
+        o: at.o,
+        qo_indptr: at.qo_indptr,
+        kv_indptr: at.kv_indptr,
+        kv_indices: at.kv_indices,
+        last_page_len: at.last_page_len,
+        live: at.live,
+        q_stride: int(at.q_stride),
+        o_stride: int(at.o_stride),
+        kv_heads: int(at.heads),
+        group: 1,
+        page: int(at.page),
+        scale_log2: sm_scale_or_default(at.sm_scale, at.dqk) * core::f32::consts::LOG2_E,
+        causal: i32::from(at.causal),
+        window_left: -1,
+    };
+    let bound = at.rows.div_ceil(128) + at.requests;
+    let bytes = |m: &[u64; 16]| ArgValue::Bytes {
+        ptr: m.as_ptr().cast(),
+        len: 128,
+    };
+    let (dqk, dv) = (at.dqk, at.dv);
+    // `pie::attn::fmha::smem_bytes(dqk, bkv, stages, dv)`.
+    let smem = stages * (dqk / 64 + dv / 64) * bkv * 128 + 512 + 1024;
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::attn::fmha::tc5_fmha_prefill<{dqk}, {bkv}, {stages}, {dv}>"
+            )),
+        )
+        .apply(Launch::grid([bound.max(1), at.heads, 1], [192, 1, 1]).smem(smem)),
+        &[
+            bytes(&map_k),
+            bytes(&map_v),
+            bytes(&map_k_run),
+            bytes(&map_v_run),
+            ArgValue::Bytes {
+                ptr: (&raw const params).cast(),
+                len: core::mem::size_of::<Params>(),
+            },
+            ArgValue::I32(int(bound)),
+        ],
+    )
+}

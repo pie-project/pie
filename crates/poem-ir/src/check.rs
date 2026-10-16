@@ -931,6 +931,12 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 (Out(3), F32),
                 (Out(4), F32),
             ],
+            // `kv_b` (input 1), the plan, then the cache: after the rope
+            // half where the rows come apart.
+            Fused::MlaPrefillExpanded { split: Some(_), .. } => {
+                &[(In(2), MLA_PLAN), (In(3), CACHE)]
+            }
+            Fused::MlaPrefillExpanded { split: None, .. } => &[(In(2), MLA_PLAN), (In(4), CACHE)],
             Fused::LseSink { attn, .. } => match **attn {
                 Attention::DecodeLse { .. } => {
                     &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)]

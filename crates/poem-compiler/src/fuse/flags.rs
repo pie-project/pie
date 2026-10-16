@@ -60,6 +60,7 @@ flags! {
     QgQknormRopeAppend = "fuse.qg_qknorm_rope_append" => "elementwise.qg_qknorm_rope_append",
     LseSink = "fuse.lse_sink" => "attention.lse_sink",
     PoolAttention = "fuse.pool_attention" => "attention.pool_attention",
+    MlaPrefillExpanded = "fuse.mla_prefill_expanded" => "attention.mla_prefill_expanded",
     HcPrenormProject = "fuse.hc_prenorm_project" => "elementwise.hc_prenorm_project",
     HcGatesNorm = "fuse.hc_gates_norm" => "elementwise.hc_gates_norm",
     HcPre = "fuse.hc_pre" => "elementwise.hc_pre",

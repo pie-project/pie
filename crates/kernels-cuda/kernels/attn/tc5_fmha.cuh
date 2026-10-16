@@ -61,9 +61,9 @@ struct Params {
     int window_left;
 };
 
-__host__ __device__ constexpr u32 smem_bytes(int d, int bkv, int stages) {
+__host__ __device__ constexpr u32 smem_bytes(int d, int bkv, int stages, int dv = 0) {
     // The K and V rings, then barriers; 1024-aligned.
-    return 2u * u32(stages) * u32(d / 64) * u32(bkv) * 128u + 512u + 1024u;
+    return u32(stages) * u32(d / 64 + (dv > 0 ? dv : d) / 64) * u32(bkv) * 128u + 512u + 1024u;
 }
 
 __device__ __forceinline__ u32 pack_bf16(float lo, float hi) {
@@ -141,28 +141,34 @@ __device__ __forceinline__ bool work_of(const Params& p, int bound, int block, W
     return false;
 }
 
-template <int D, int BKV, int ST>
+// `DV` the value head's width where it differs from the query and key
+// head's `D` (an expanded latent attention's: 192 against 128), its rows
+// read at the V map's own head stride.
+template <int D, int BKV, int ST, int DV = D>
 __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
     const __grid_constant__ tc5::TmaMap map_k, const __grid_constant__ tc5::TmaMap map_v,
     const __grid_constant__ tc5::TmaMap map_k_run, const __grid_constant__ tc5::TmaMap map_v_run,
     const Params p, const int bound) {
     using namespace tc5;
-    static_assert(D == 64 || D == 128 || D == 256, "a head of 64, 128 or 256");
+    static_assert(D == 64 || D == 128 || D == 192 || D == 256, "a head of 64, 128, 192 or 256");
+    static_assert(DV == 64 || DV == 128 || DV == 256, "a value head of 64, 128 or 256");
     constexpr int kBKV = BKV;
     static_assert(BKV == 64 || BKV == 128, "a key tile is one or two 64-wide P atoms");
-    constexpr u32 kNA = D / 64;            // 64-wide atoms along the head
+    constexpr u32 kNA = D / 64;            // 64-wide atoms along the key head
+    constexpr u32 kNAV = DV / 64;          // and along the value head
     constexpr u32 kKA = kBKV / 64;         // 64-wide atoms along a key tile
     constexpr u32 kAtomKV = kBKV * 128;    // one 64-wide atom of a K or V tile
     constexpr u32 kTileKV = kNA * kAtomKV;
+    constexpr u32 kTileV = kNAV * kAtomKV;
     // Shared memory holds the K and V rings alone: Q and P live in TMEM.
     constexpr u32 kOffK = 0;
     constexpr u32 kOffV = kOffK + ST * kTileKV;
-    constexpr u32 kOffBar = kOffV + ST * kTileKV;
+    constexpr u32 kOffBar = kOffV + ST * kTileV;
     // TMEM: two S buffers (P overwrites its tile's, two bf16 a column), O,
     // and Q (two bf16 a column), the A operands read in place.
     constexpr u32 kColS = 0;
     constexpr u32 kColO = 2 * kBKV;
-    constexpr u32 kColQ = kColO + D;
+    constexpr u32 kColQ = kColO + DV;
     constexpr u32 kCols = 512;
     static_assert(kColQ + D / 2 <= kCols, "S twice, O and Q fit TMEM");
     (void)kKA;
@@ -255,20 +261,26 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
             const int b = static_cast<int>(lane);
             const int t16 = b / static_cast<int>(kNA);
             const u32 a = static_cast<u32>(b) % kNA;
+            // A narrower value head's boxes: its own lanes' slices, each
+            // slice's pool row the key box's of that slice.
+            constexpr int kBoxesV = (kBKV / 16) * kNAV;
+            const int t16v = b / static_cast<int>(kNAV);
+            const u32 av = static_cast<u32>(b) % kNAV;
+            const int src_v = min(t16v, kBKV / 16 - 1) * static_cast<int>(kNA);
             auto row_of = [&](int j) {
                 const int tok = (jb + j) * kBKV + t16 * 16;
                 const int at = tok / p.page;
                 return at < pages ? p.kv_indices[w.kv_page0 + at] * p.page + tok % p.page : -1;
             };
             auto load = [&](const TmaMap* map, const TmaMap* run, unsigned char* dst, u64* bar,
-                            int row, int row0, bool whole) {
+                            int row, int row0, bool whole, u32 na, int boxes, int t, u32 at) {
                 if (whole) {
-                    if (b < static_cast<int>(kNA)) {
-                        tma_load_3d(dst + a * kAtomKV, bar, run, static_cast<int>(a * 64), h, row0);
+                    if (b < static_cast<int>(na)) {
+                        tma_load_3d(dst + at * kAtomKV, bar, run, static_cast<int>(at * 64), h, row0);
                     }
-                } else if (b < kBoxes) {
-                    tma_load_3d(dst + a * kAtomKV + t16 * 16 * 128, bar, map,
-                                static_cast<int>(a * 64), h, row < 0 ? 0x7fffff00 : row);
+                } else if (b < boxes) {
+                    tma_load_3d(dst + at * kAtomKV + t * 16 * 128, bar, map,
+                                static_cast<int>(at * 64), h, row < 0 ? 0x7fffff00 : row);
                 }
             };
             // Tiles every live row of the block reads whole: from the last
@@ -296,18 +308,26 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
                 bar_wait(&k_empty[st], ph ^ 1);
                 if (lane == 0) bar_arrive_expect_tx(&k_full[st], kTileKV);
                 __syncwarp();
-                load(&map_k, &map_k_run, smem + kOffK + st * kTileKV, &k_full[st], row, row0, whole);
+                load(&map_k, &map_k_run, smem + kOffK + st * kTileKV, &k_full[st], row, row0, whole,
+                     kNA, kBoxes, t16, a);
+                const int row_v = DV == D ? row : __shfl_sync(0xffffffffu, row, src_v);
                 bar_wait(&v_empty[st], ph ^ 1);
-                if (lane == 0) bar_arrive_expect_tx(&v_full[st], kTileKV);
+                if (lane == 0) bar_arrive_expect_tx(&v_full[st], kTileV);
                 __syncwarp();
-                load(&map_v, &map_v_run, smem + kOffV + st * kTileKV, &v_full[st], row, row0, whole);
+                if constexpr (DV == D) {
+                    load(&map_v, &map_v_run, smem + kOffV + st * kTileV, &v_full[st], row_v, row0,
+                         whole, kNA, kBoxes, t16, a);
+                } else {
+                    load(&map_v, &map_v_run, smem + kOffV + st * kTileV, &v_full[st], row_v, row0,
+                         whole, kNAV, kBoxesV, t16v, av);
+                }
                 row = next;
             }
         }
     } else if (warp == 5) {
         if (lane == 0 && nt > 0) {
             const u32 idesc_s = idesc_dense(kF16Bf16, kF16Bf16, 128, kBKV);
-            const u32 idesc_o = idesc_dense(kF16Bf16, kF16Bf16, 128, D) | (1u << 16);
+            const u32 idesc_o = idesc_dense(kF16Bf16, kF16Bf16, 128, DV) | (1u << 16);
             bar_wait(q_ready, 0);
             auto pv = [&](int i) {
                 const u32 st = i % ST;
@@ -315,7 +335,7 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
                 if (i == nt - 1) bar_wait(v_fixed, 0);
                 bar_wait(&p_full[i & 1], (i >> 1) & 1);
                 tc_fence_after();
-                const u32 vb = sbase + kOffV + st * kTileKV;
+                const u32 vb = sbase + kOffV + st * kTileV;
                 const u32 pa = tmem + kColS + (i & 1) * kBKV;
 #pragma unroll
                 for (u32 s = 0; s < kBKV / 16; ++s) {
@@ -439,7 +459,7 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
                 bar_wait(&pv_done[(j - 1) & 1], ((j - 1) >> 1) & 1);
                 tc_fence_after();
 #pragma unroll 1
-                for (u32 c = 0; c < D; c += 32) {
+                for (u32 c = 0; c < DV; c += 32) {
                     u32 v[32];
                     tmem_ld32(tmem + lane_base + kColO + c, v);
                     tmem_wait_ld();
@@ -467,10 +487,10 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
                 const int valid = w.kv_len - k0;
                 if (static_cast<int>(row) < kBKV && static_cast<int>(row) >= valid) {
 #pragma unroll
-                    for (u32 a = 0; a < kNA; ++a) {
+                    for (u32 a = 0; a < kNAV; ++a) {
 #pragma unroll
                         for (u32 c = 0; c < 8; ++c) {
-                            const u32 at = sbase + kOffV + vst * kTileKV + a * kAtomKV + row * 128 + c * 16;
+                            const u32 at = sbase + kOffV + vst * kTileV + a * kAtomKV + row * 128 + c * 16;
                             asm volatile("st.shared.v4.b32 [%0], {%1, %1, %1, %1};" ::"r"(at), "r"(0u)
                                          : "memory");
                         }
@@ -491,9 +511,9 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
         // stores nothing.
         const float inv = l > 0.f ? 1.f / l : 0.f;
         u16* dst = p.o + static_cast<long long>(w.qo_start + (live ? tok : 0)) * p.o_stride +
-                   static_cast<long long>(qh) * D;
+                   static_cast<long long>(qh) * DV;
 #pragma unroll 1
-        for (u32 c = 0; c < D; c += 32) {
+        for (u32 c = 0; c < DV; c += 32) {
             u32 v[32];
             if (nt > 0) {
                 tmem_ld32(tmem + lane_base + kColO + c, v);
