@@ -160,6 +160,35 @@ fn every_probe_is_dumped() {
     // `PIE_PARITY_CACHE` names a directory the chosen tactics persist in,
     // so two runs over it read bit for bit alike.
     let tactics = std::env::var_os("PIE_PARITY_CACHE").map(std::path::PathBuf::from);
+
+    // `PIE_PARITY_BATCH` (e.g. "8,64") also reads batched decode: that many
+    // lanes, each its own prompt of `PIE_PARITY_BATCH_PREFIX` tokens and a
+    // few more, prefilled in one fire and then teacher-forced
+    // `PIE_PARITY_BATCH_STEPS` tokens a lane in fires of every lane at once,
+    // and each lane again alone. The probes above fire one row at a time, so
+    // only this reaches a decode's 2..64-row shapes.
+    let batches: Vec<usize> = std::env::var("PIE_PARITY_BATCH")
+        .ok()
+        .map(|list| {
+            list.split(',')
+                .map(|b| b.trim().parse().expect("a lane count"))
+                .collect()
+        })
+        .unwrap_or_default();
+    let batch_prefix: usize = std::env::var("PIE_PARITY_BATCH_PREFIX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(48);
+    let batch_steps: usize = std::env::var("PIE_PARITY_BATCH_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    let lanes_most = batches.iter().copied().max().unwrap_or(0).max(4);
+    let lane_prefix = |lane: usize| batch_prefix + (lane * 5) % 61;
+    let tokens_most = (0..lanes_most)
+        .map(lane_prefix)
+        .sum::<usize>()
+        .max(context as usize) as u32;
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {
         voxels: None,
@@ -167,11 +196,11 @@ fn every_probe_is_dumped() {
         trace,
         contract: &contract,
         checkpoint: &snapshot,
-        budget: Budget::new(4, context),
+        budget: Budget::new(lanes_most as u32, tokens_most),
         patches: None,
         page_size: 16,
         context,
-        slots: 4,
+        slots: lanes_most as u32,
         kv_budget: None,
         memory_share: std::env::var("PIE_PARITY_MEMORY_SHARE")
             .ok()
@@ -284,6 +313,119 @@ fn every_probe_is_dumped() {
             "  {name}: {} tokens, gen={:?}  ({:.1}s)",
             ids.len(),
             &produced[..produced.len().min(12)],
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    for &lanes in &batches {
+        let started = Instant::now();
+        // Each lane's ids: a fixed LCG walk over the vocabulary's body.
+        let prompts: Vec<Vec<u32>> = (0..lanes)
+            .map(|lane| {
+                let mut state = 0x9e37_79b9_u64 ^ (lane as u64 + 1) * 0x2545_f491;
+                (0..lane_prefix(lane) + batch_steps)
+                    .map(|_| {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        200 + ((state >> 33) % 119_800) as u32
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // All lanes at once: one prefill fire, then a fire a step.
+        let mut together: Vec<Vec<Vec<f32>>> = vec![Vec::new(); lanes];
+        for lane in 0..lanes {
+            shell.open(lane as u32).expect("the slot opens");
+        }
+        // Prefills go a lane a fire (a fire of many lanes' prompts can
+        // outgrow the elastic arena); the decode steps after are what this
+        // reads.
+        for first in 0..lanes {
+            let group = first..first + 1;
+            let fired = shell
+                .fire(
+                    &group
+                        .clone()
+                        .map(|lane| Lane {
+                            slot: lane as u32,
+                            word: word(lane_prefix(lane) as u32),
+                            tokens: &prompts[lane][..lane_prefix(lane)],
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .expect("the batched prefill fires");
+            for (lane, row) in group.zip(fired) {
+                together[lane].push(row);
+            }
+        }
+        for step in 0..batch_steps {
+            let fired = shell
+                .fire(
+                    &(0..lanes)
+                        .map(|lane| {
+                            let at = lane_prefix(lane) + step;
+                            Lane {
+                                slot: lane as u32,
+                                word: word(1),
+                                tokens: &prompts[lane][at..at + 1],
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .expect("a batched decode fires");
+            for (lane, row) in fired.into_iter().enumerate() {
+                together[lane].push(row);
+            }
+        }
+
+        // Each lane alone, the same feed.
+        let mut alone: Vec<Vec<Vec<f32>>> = vec![Vec::new(); lanes];
+        for lane in 0..lanes {
+            shell.open(0).expect("the slot opens");
+            let prefix = lane_prefix(lane);
+            let fired = shell
+                .fire(&[Lane {
+                    slot: 0,
+                    word: word(prefix as u32),
+                    tokens: &prompts[lane][..prefix],
+                }])
+                .expect("a lone prefill fires");
+            alone[lane].push(fired.into_iter().next().expect("one row"));
+            for step in 0..batch_steps {
+                let at = prefix + step;
+                let fired = shell
+                    .fire(&[Lane {
+                        slot: 0,
+                        word: word(1),
+                        tokens: &prompts[lane][at..at + 1],
+                    }])
+                    .expect("a lone decode fires");
+                alone[lane].push(fired.into_iter().next().expect("one row"));
+            }
+        }
+
+        let flat = |rows: &[Vec<Vec<f32>>]| rows.concat();
+        write_rows(
+            &out.join(format!("batch{lanes}.{tag}.together.f32")),
+            &flat(&together),
+        );
+        write_rows(
+            &out.join(format!("batch{lanes}.{tag}.alone.f32")),
+            &flat(&alone),
+        );
+        std::fs::write(
+            out.join(format!("batch{lanes}.{tag}.json")),
+            serde_json::to_string(&serde_json::json!({
+                "lanes": lanes, "rows_a_lane": batch_steps + 1, "vocab": together[0][0].len(),
+            }))
+            .expect("json"),
+        )
+        .expect("the summary is written");
+        eprintln!(
+            "  batch{lanes}: {lanes} lanes x {} rows  ({:.1}s)",
+            batch_steps + 1,
             started.elapsed().as_secs_f64()
         );
     }
