@@ -1583,6 +1583,7 @@ pub fn prefill_expanded(
     }
 }
 
+#[cfg(feature = "cuda")]
 const EXPAND_FILE: &str = "attn/mla_expand.cuh";
 
 #[cfg(test)]
