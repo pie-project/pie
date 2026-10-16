@@ -718,52 +718,74 @@ __global__ void moe_topk_sqrt_softplus(
     }
     __syncthreads();
 
-    // The `K` picks one warp-wide argmax each: a lane's best of its experts,
-    // then the lanes' best, the lowest expert on a tie (the first strictly
-    // greater one the serial walk would keep). A score below -FLT_MAX never
-    // wins, as the walk's `v > best_v` from -FLT_MAX lets none.
+    // The `K` picks, a warp's: each lane's experts as order-preserving keys
+    // in registers (the largest biased score, the lowest expert among its
+    // ties), a pick two warp reductions. A score below -FLT_MAX never wins,
+    // as the serial walk's `v > best_v` from -FLT_MAX lets none.
     if (tid < 32) {
+        constexpr int kPer = kRouterMaxExperts / 32;
+        unsigned key[kPer];
+#pragma unroll
+        for (int m = 0; m < kPer; ++m) {
+            const int e = tid + 32 * m;
+            key[m] = 0u;
+            if (e < E) {
+                const float v = scores[e];
+                if (v > -flt_max()) {
+                    const unsigned u = __float_as_uint(v);
+                    key[m] = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+                }
+            }
+        }
         i32* idx = topk_idx + static_cast<long long>(plane_row) * K;
         float* w = topk_w + static_cast<long long>(plane_row) * K;
+        int my_e = -1;
+        float my_w = 0.f;
         float sum = 0.f;
         for (int k = 0; k < K; ++k) {
-            int best_i = -1;
-            float best_v = -flt_max();
-            for (int e = tid; e < E; e += 32) {
-                const float v = scores[e];
-                if (v > best_v) {
-                    best_v = v;
-                    best_i = e;
-                }
-            }
+            unsigned mine = 0u;
+            int at = 0x7fffffff;
 #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                const float ov = __shfl_xor_sync(0xffffffffu, best_v, off);
-                const int oi = __shfl_xor_sync(0xffffffffu, best_i, off);
-                const bool take = oi >= 0 && (best_i < 0 || ov > best_v || (ov == best_v && oi < best_i));
-                if (take) {
-                    best_v = ov;
-                    best_i = oi;
+            for (int m = 0; m < kPer; ++m) {
+                if (key[m] > mine) {
+                    mine = key[m];
+                    at = tid + 32 * m;
                 }
             }
-            if (best_i >= 0) {
-                if (tid == 0) {
-                    idx[k] = best_i;
-                    w[k] = orig_scores[best_i];
-                    scores[best_i] = -flt_max();
-                }
-                sum += orig_scores[best_i];
-            } else if (tid == 0) {
-                idx[k] = best_i;
+            const unsigned top = __reduce_max_sync(0xffffffffu, mine);
+            const int i = top == 0u ? -1
+                                    : static_cast<int>(__reduce_min_sync(
+                                          0xffffffffu, mine == top ? static_cast<unsigned>(at)
+                                                                   : 0x7fffffffu));
+#pragma unroll
+            for (int m = 0; m < kPer; ++m) {
+                if (tid + 32 * m == i) key[m] = 0u;
             }
-            __syncwarp();
+            if (i >= 0) {
+                const float o = orig_scores[i];
+                sum += o;
+                if (tid == (k & 31)) {
+                    my_e = i;
+                    my_w = o;
+                }
+            } else if (tid == (k & 31)) {
+                my_e = -1;
+            }
+            // More than 32 picks: the lane's first round lands before its
+            // second is kept.
+            if ((k & 31) == 31 || k == K - 1) {
+                const int base = k & ~31;
+                if (tid <= (k & 31)) {
+                    idx[base + tid] = my_e;
+                    if (my_e >= 0) w[base + tid] = my_w;
+                }
+            }
         }
-        if (tid == 0) {
-            const float scale = renormalize && sum > 0.f
-                ? routed_scaling_factor / sum
-                : routed_scaling_factor;
-            for (int k = 0; k < K; ++k) w[k] *= scale;
-        }
+        __syncwarp();
+        const float scale = renormalize && sum > 0.f
+            ? routed_scaling_factor / sum
+            : routed_scaling_factor;
+        for (int k = tid; k < K; k += 32) w[k] *= scale;
     }
 }
 
