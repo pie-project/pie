@@ -1745,7 +1745,11 @@ fn route_order_sliced(
         return Ok(order);
     }
     let offsets_at = (fan.route_count as usize).next_multiple_of(64);
-    let work_cap = fan.route_count.div_ceil(slice) + experts;
+    // An expert's items are its whole slices and at most one part slice, and
+    // no more experts hold routes than there are routes: at decode widths
+    // the grid is the routes', not the bank's (8 tokens of top 6 over 256
+    // experts: 54 items, not 262).
+    let work_cap = fan.route_count.div_ceil(slice) + experts.min(fan.route_count);
     let work_at = (offsets_at + experts as usize + 3).next_multiple_of(64);
     let order = ctx.scratch(
         op,
