@@ -24,16 +24,66 @@ configuration flat) is served as vLLM's `KimiLinearForCausalLM`, through a
 view of the snapshot whose configuration says so, and whose quantization
 recipe leaves the latent MoE's bf16 down and up projections unquantized as
 the checkpoint stores them (vLLM would otherwise seat them as MXFP4).
+
+Today's vLLM seats no compressed-tensors MXFP4 bank for that architecture
+(its loader asks for a `w13_weight_scale` the layer never declared), so a
+snapshot whose experts are `mxfp4-pack-quantized` is first read out to bf16
+(each e2m1 nibble pair, low nibble first, times its e8m0 exponent: exact in
+bf16) into a scratch copy beside OUT, served unquantized, and removed.
 """
 
 import argparse
 import json
 import math
 import os
+import shutil
 import tempfile
 import time
 
 import numpy as np
+
+E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+
+
+def unpacked(snapshot, into):
+    """`snapshot` with each `*.weight_packed` MXFP4 bank read out to a bf16
+    `*.weight`, its quantization recipe dropped, written to `into`."""
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    lut = torch.tensor(E2M1)
+    index = json.load(open(os.path.join(snapshot, "model.safetensors.index.json")))
+    weight_map = {}
+    for shard in sorted(set(index["weight_map"].values())):
+        out = {}
+        with safe_open(os.path.join(snapshot, shard), "pt") as held:
+            names = set(held.keys())
+            for name in sorted(names):
+                if name.endswith(".weight_scale") and name[: -len("_scale")] + "_packed" in names:
+                    continue
+                t = held.get_tensor(name)
+                if name.endswith(".weight_packed"):
+                    stem = name[: -len(".weight_packed")]
+                    exps = held.get_tensor(stem + ".weight_scale").to(torch.int32)
+                    codes = torch.stack([(t & 0xF).long(), (t >> 4).long()], dim=-1).reshape(t.shape[0], -1)
+                    scale = torch.pow(2.0, (exps - 127).float()).repeat_interleave(32, dim=-1)
+                    name = stem + ".weight"
+                    t = (lut[codes] * scale[:, : codes.shape[1]]).to(torch.bfloat16)
+                out[name] = t.contiguous()
+                weight_map[name] = shard
+        save_file(out, os.path.join(into, shard), metadata={"format": "pt"})
+    json.dump({"metadata": {}, "weight_map": weight_map},
+              open(os.path.join(into, "model.safetensors.index.json"), "w"))
+    for name in os.listdir(snapshot):
+        held = os.path.join(snapshot, name)
+        if os.path.isfile(held) and not name.endswith(".safetensors") and name != "model.safetensors.index.json":
+            shutil.copy(held, os.path.join(into, name))
+    config = json.load(open(os.path.join(into, "config.json")))
+    config.pop("quantization_config", None)
+    if "text_config" in config:
+        config["text_config"].pop("quantization_config", None)
+    json.dump(config, open(os.path.join(into, "config.json"), "w"), indent=1)
 
 PROMPTS = [
     ("capital", "The capital of France is"),
@@ -64,6 +114,13 @@ def main():
 
     stated = json.load(open(os.path.join(args.snapshot, "config.json")))
     vocab = (stated.get("text_config") or stated)["vocab_size"]
+    scratch = None
+    recipe = (stated.get("text_config") or stated).get("quantization_config") or {}
+    if recipe.get("format") == "mxfp4-pack-quantized":
+        scratch = tempfile.mkdtemp(prefix="kimi_bf16_", dir=args.out)
+        unpacked(args.snapshot, scratch)
+        args.snapshot = scratch
+        stated = json.load(open(os.path.join(args.snapshot, "config.json")))
     served = args.snapshot
     if "text_config" not in stated:
         served = tempfile.mkdtemp(prefix="kimi_text_")
@@ -125,6 +182,9 @@ def main():
         )
         print(f"  {name}: {len(ids)} tokens, vocab {vocab}, gen={produced[:12]}  ({time.time() - started:.1f}s)")
         print(f"      {tokenizer.decode(produced)!r}")
+
+    if scratch is not None:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 if __name__ == "__main__":
     main()
