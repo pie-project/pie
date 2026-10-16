@@ -590,10 +590,14 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
                 }
                 out[i] = pack_bf16(a, b);
             }
-            uint4* o4 = reinterpret_cast<uint4*>(dst + d0);
+            // A thread's 64 bytes as two whole 32-byte sectors.
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                o4[i] = make_uint4(out[4 * i], out[4 * i + 1], out[4 * i + 2], out[4 * i + 3]);
+            for (int i = 0; i < 2; ++i) {
+                asm volatile(
+                    "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" ::"l"(dst + d0 + 16 * i),
+                    "r"(out[8 * i]), "r"(out[8 * i + 1]), "r"(out[8 * i + 2]), "r"(out[8 * i + 3]),
+                    "r"(out[8 * i + 4]), "r"(out[8 * i + 5]), "r"(out[8 * i + 6]), "r"(out[8 * i + 7])
+                    : "memory");
             }
         }
         }
