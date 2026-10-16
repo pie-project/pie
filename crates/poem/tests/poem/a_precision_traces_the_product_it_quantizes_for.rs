@@ -50,6 +50,7 @@ fn param_of(trace: &Trace, id: poem_ir::ValueId) -> &poem_ir::Param {
 fn a_precision_traces_the_product_it_quantizes_for_every_case() {
     a_plain_dtype_reads_its_activations_as_they_are();
     an_fp8_block_weight_lands_raw_codes_beside_its_block_exponents();
+    an_fp8_tile_weight_lands_raw_codes_beside_its_f32_factors();
     the_words_name_each_precision();
 }
 
@@ -91,12 +92,40 @@ fn an_fp8_block_weight_lands_raw_codes_beside_its_block_exponents() {
     );
 }
 
+fn an_fp8_tile_weight_lands_raw_codes_beside_its_f32_factors() {
+    let w8a8 = Precision::ACTED
+        .into_iter()
+        .find(|p| p.dtype == Dtype::E4m3tile128)
+        .expect("e4m3tile128 is read at a W8A8 precision");
+    let trace = traced(w8a8);
+    let Linear::MatmulActQuant {
+        w,
+        quant,
+        scales: Some(scales),
+        ..
+    } = product(&trace)
+    else {
+        panic!("an e4m3tile128a8 product names its block factors")
+    };
+    assert_eq!(*quant, ActQuant::E4m3Scaled { gran: 128 });
+    let (codes, factors) = (param_of(&trace, *w), param_of(&trace, *scales));
+    assert_eq!(
+        (codes.dtype, codes.shape.as_slice()),
+        (Dtype::E4m3, &[384, HIDDEN][..])
+    );
+    assert_eq!(
+        (factors.name.as_str(), factors.dtype, factors.shape.as_slice()),
+        ("proj.scales", Dtype::F32, &[3, 2][..]),
+        "one f32 factor a 128x128 block"
+    );
+}
+
 fn the_words_name_each_precision() {
     let words: Vec<String> = Precision::ACTED
         .into_iter()
         .map(poem::star::precision_word)
         .collect();
-    assert_eq!(words, ["nvfp4a4", "mxfp4a8", "fp8b128a8"]);
+    assert_eq!(words, ["nvfp4a4", "mxfp4a8", "fp8b128a8", "e4m3tile128a8f"]);
     for word in &words {
         assert_eq!(
             poem::star::precision_of(word)

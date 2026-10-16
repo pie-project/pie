@@ -353,14 +353,14 @@ fn claim(w: &Weight, tp: u32) -> Claim {
             "this dtype names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
         ),
-        Dtype::E4m3row | Dtype::E4m3tile128 => panic!(
+        Dtype::E4m3row => panic!(
             "a {:?} weight is served but no load contract declares one",
             w.dtype
         ),
-        Dtype::Fp8b128 => panic!(
-            "`{}`: an fp8b128 weight is claimed plane by plane, its raw codes and \
-             exponents each their own",
-            w.name
+        Dtype::Fp8b128 | Dtype::E4m3tile128 => panic!(
+            "`{}`: a {} weight is claimed plane by plane, its raw codes and \
+             block factors each their own",
+            w.name, w.dtype
         ),
     };
     Claim {
@@ -642,7 +642,7 @@ fn planes(
     from: impl Into<String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let from = from.into();
-    if w.dtype == Dtype::Fp8b128 {
+    if matches!(w.dtype, Dtype::Fp8b128 | Dtype::E4m3tile128) {
         return fp8_block_planes(src, w, vec![from]);
     }
     if stored_raw(src, &from)? {
@@ -690,7 +690,7 @@ fn planes_fused(
     parts: impl IntoIterator<Item = String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let parts: Vec<String> = parts.into_iter().collect();
-    if w.dtype == Dtype::Fp8b128 {
+    if matches!(w.dtype, Dtype::Fp8b128 | Dtype::E4m3tile128) {
         return fp8_block_planes(src, w, parts);
     }
     if parts.iter().try_fold(true, |all, part| {
@@ -1299,14 +1299,21 @@ fn fp8_block_planes(
                  number of 128-row blocks but the last"
             )));
         }
-        let scale = format!("{stem}.scale");
+        // DeepSeek's e8m0 exponents beside the stem, or transformers' f32
+        // factors beside the whole name.
+        let (scale, factor, spelled) = if w.dtype == Dtype::Fp8b128 {
+            (format!("{stem}.scale"), DType::E8m0, "e8m0")
+        } else {
+            (format!("{part}_scale_inv"), DType::F32, "f32")
+        };
         let blocks = vec![(rows + 127) / 128, (cols + 127) / 128];
         let stored = stored_encoding(src, &scale)?;
-        if stored != Encoding::Raw(DType::E8m0) || shape_of(&scale) != blocks {
+        if stored != Encoding::Raw(factor) || shape_of(&scale) != blocks {
             return Err(illegible(format!(
-                "`{scale}` is stored {stored:?} {:?}; fp8b128 exponents are one e8m0 a \
+                "`{scale}` is stored {stored:?} {:?}; {} factors are one {spelled} a \
                  128x128 block, {blocks:?}",
-                shape_of(&scale)
+                shape_of(&scale),
+                w.dtype,
             )));
         }
         codes.push(Expr::src(part.clone()));
@@ -1328,7 +1335,7 @@ fn fp8_block_planes(
             crate::scales_name(&w.name),
             joined(axis, scales),
             vec![(n + 127) / 128, (k + 127) / 128],
-            encoding(Dtype::E8m0),
+            encoding(if w.dtype == Dtype::Fp8b128 { Dtype::E8m0 } else { Dtype::F32 }),
         ),
     ])
 }
@@ -2048,12 +2055,12 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             group_size: 1,
             channel_axis: None,
         }),
-        Dtype::E4m3row | Dtype::E4m3tile128 => panic!(
+        Dtype::E4m3row => panic!(
             "a {:?} weight is served but no load contract declares one",
             dtype
         ),
-        Dtype::Fp8b128 => panic!(
-            "an fp8b128 weight is encoded plane by plane, its raw codes and exponents \
+        Dtype::Fp8b128 | Dtype::E4m3tile128 => panic!(
+            "a {dtype} weight is encoded plane by plane, its raw codes and block factors \
              each their own"
         ),
         // PTQ1_0 joins the self-contained block family: its `g128_t3_f16_n` term

@@ -360,7 +360,34 @@ impl Weight {
                     },
                 ]
             }
-            Dtype::E4m3row | Dtype::E4m3tile128 | Dtype::KvU4 => panic!(
+            // GLM's and transformers' FP8 release: e4m3 codes under one f32
+            // factor a 128x128 block (of a projection, or of each expert of
+            // a bank), the factors a plane of their own a W8A8 product reads.
+            Dtype::E4m3tile128 => {
+                assert!(
+                    self.shape.len() >= 2,
+                    "`{}` is an e4m3tile128 weight declared {:?}; its 128x128 blocks \
+                     scale a projection's (or each expert's) two trailing axes",
+                    self.name,
+                    self.shape,
+                );
+                let at = self.shape.len() - 2;
+                let mut factors = self.shape[..at].to_vec();
+                factors.extend(self.shape[at..].iter().map(|n| n.div_ceil(128)));
+                vec![
+                    BankPlane {
+                        suffix: "",
+                        shape: self.shape.clone(),
+                        dtype: Dtype::E4m3,
+                    },
+                    BankPlane {
+                        suffix: SCALES,
+                        shape: factors,
+                        dtype: Dtype::F32,
+                    },
+                ]
+            }
+            Dtype::E4m3row | Dtype::KvU4 => panic!(
                 "`{}`: {} is served but not yet a weight representation a \
                  model text declares",
                 self.name, self.dtype
@@ -524,7 +551,7 @@ impl Precision {
     /// deployment's name spells each: NVFP4 against NVFP4 (W4A4, vLLM's
     /// modelopt product), and MXFP4 (W4A8) and DeepSeek's 128x128-block FP8
     /// (W8A8) against e4m3 in its 1x128 blocks.
-    pub const ACTED: [Precision; 3] = [
+    pub const ACTED: [Precision; 4] = [
         Precision {
             dtype: Dtype::Nvfp4,
             act: Some(ActQuant::Nvfp4),
@@ -537,6 +564,10 @@ impl Precision {
             dtype: Dtype::Fp8b128,
             act: Some(ActQuant::E4m3 { gran: 128 }),
         },
+        Precision {
+            dtype: Dtype::E4m3tile128,
+            act: Some(ActQuant::E4m3Scaled { gran: 128 }),
+        },
     ];
 
     #[must_use]
@@ -545,7 +576,8 @@ impl Precision {
     }
 
     /// What a deployment's name appends to its dtype's word: `a4` for NVFP4
-    /// activations, `a8` for e4m3 in 128s, `a8g{n}` in `n`s.
+    /// activations, `a8` for e4m3 in 128s, `a8g{n}` in `n`s (under ue8m0
+    /// scales), `a8f` / `a8fg{n}` the same under f32 ones.
     #[must_use]
     pub fn suffix(self) -> String {
         match self.act {
@@ -553,6 +585,8 @@ impl Precision {
             Some(ActQuant::Nvfp4) => "a4".to_string(),
             Some(ActQuant::E4m3 { gran: 128 }) => "a8".to_string(),
             Some(ActQuant::E4m3 { gran }) => format!("a8g{gran}"),
+            Some(ActQuant::E4m3Scaled { gran: 128 }) => "a8f".to_string(),
+            Some(ActQuant::E4m3Scaled { gran }) => format!("a8fg{gran}"),
         }
     }
 }

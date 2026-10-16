@@ -17,6 +17,11 @@ pub enum ActQuant {
     /// each scale `2^ceil(log2(amax / 448))` of its block, the amax floored
     /// at 1e-4.
     E4m3 { gran: u32 },
+    /// e4m3 under an f32 scale a `gran`, each `amax / 448` of its block, the
+    /// amax floored at 1e-10 (transformers' and vLLM's dynamic FP8 recipe:
+    /// a GLM release's 1x128 blocks), rounded to nearest even. The product
+    /// sums each block's codes against the weight's, then scales the sum.
+    E4m3Scaled { gran: u32 },
 }
 
 impl ActQuant {
@@ -25,7 +30,7 @@ impl ActQuant {
     pub const fn gran(self) -> u32 {
         match self {
             Self::Nvfp4 => 16,
-            Self::E4m3 { gran } => gran,
+            Self::E4m3 { gran } | Self::E4m3Scaled { gran } => gran,
         }
     }
 

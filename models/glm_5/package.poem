@@ -19,11 +19,15 @@ MODELS = [
 
 BF = dtype.bf16
 U4 = dtype.u4g64
+# The FP8 release as stored: 128x128-block e4m3 under f32 factors (W8A8).
+FP8 = dtype.e4m3tile128a8f
 
 DEPLOYMENTS = [
     deployment("glm5-a12b", weights = BF, kv = BF),
     deployment("glm53", weights = [BF, U4], kv = BF),
     deployment("glm53", weights = [BF, U4, U4], kv = BF, drafter = "mtp"),
+    deployment("glm53", weights = FP8, kv = BF),
     deployment("glm53-mini", weights = BF, kv = BF),
     deployment("glm53-mini", weights = [BF, U4], kv = BF),
+    deployment("glm53-mini", weights = FP8, kv = BF),
 ]

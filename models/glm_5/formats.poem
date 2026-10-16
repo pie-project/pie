@@ -71,7 +71,33 @@ def moe(reads, at, f):
     if f.bias != None:
         reads.read(f.bias, at("mlp.gate.e_score_correction_bias"))
     hidden = f.down.shape[1]
-    expert = lambda e, leaf: leg(reads, at("mlp.experts.{}.{}.weight".format(e, leaf)))
+    expert_leg = lambda e, leaf: at("mlp.experts.{}.{}.weight".format(e, leaf))
+    if f.gate_up.dtype == dtype.e4m3tile128:
+        fp8_bank(reads, f.gate_up, [[expert_leg(e, "gate_proj"), expert_leg(e, "up_proj")] for e in range(f.experts)])
+        fp8_bank(reads, f.down, [[expert_leg(e, "down_proj")] for e in range(f.experts)])
+    else:
+        bf16_bank(reads, f, expert_leg, hidden)
+    joined(reads, f.shared.gate_up, [
+        at("mlp.shared_experts.gate_proj.weight"),
+        at("mlp.shared_experts.up_proj.weight"),
+    ])
+    reads.read(f.shared.down, at("mlp.shared_experts.down_proj.weight"))
+
+def fp8_bank(reads, w, experts):
+    """The bank `w` as stored: each expert's legs' e4m3 codes stacked, and
+    beside them the legs' f32 factors, one a 128x128 block."""
+    rows, cols = w.shape[1], w.shape[2]
+    blocks = [(rows + 127) // 128, (cols + 127) // 128]
+    joined = lambda parts: concat(0, parts) if len(parts) > 1 else parts[0]
+    codes = [joined([src(part) for part in legs]).transmute([1, rows, cols], encoding(dtype.e4m3)) for legs in experts]
+    factors = [joined([src(part + "_scale_inv") for part in legs]).transmute([1] + blocks, encoding(dtype.f32)) for legs in experts]
+    reads.extend([
+        tensor(w.name, concat(0, codes), encoding(dtype.e4m3)),
+        tensor(scales_name(w.name), concat(0, factors), encoding(dtype.f32), shape = [len(experts)] + blocks),
+    ])
+
+def bf16_bank(reads, f, expert_leg, hidden):
+    expert = lambda e, leaf: leg(reads, expert_leg(e, leaf))
     land(reads, f.gate_up, concat(0, [
         concat(0, [expert(e, "gate_proj"), expert(e, "up_proj")]).transmute([1, 2 * f.inter, hidden], BF)
         for e in range(f.experts)
@@ -80,11 +106,6 @@ def moe(reads, at, f):
         expert(e, "down_proj").transmute([1, hidden, f.inter], BF)
         for e in range(f.experts)
     ]))
-    joined(reads, f.shared.gate_up, [
-        at("mlp.shared_experts.gate_proj.weight"),
-        at("mlp.shared_experts.up_proj.weight"),
-    ])
-    reads.read(f.shared.down, at("mlp.shared_experts.down_proj.weight"))
 
 # A cast inside a join or a cut has no block factors to read, so an FP8
 # tensor that is joined or cut is first dequantized whole into a bf16 tensor
@@ -107,7 +128,7 @@ def land(reads, w, value):
 
 def joined(reads, w, names):
     """`w` from the tensors `names`, joined along its first axis."""
-    if all([stored(name) == BF for name in names]):
+    if w.dtype == dtype.e4m3tile128 or all([stored(name) == BF for name in names]):
         reads.read_concat(w, names)
     else:
         land(reads, w, concat(0, [leg(reads, name) for name in names]))

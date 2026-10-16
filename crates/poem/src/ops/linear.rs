@@ -4,9 +4,11 @@ use super::*;
 /// them quantized first.
 pub fn matmul(act: &Value, w: &Weight) -> Value {
     assert!(
-        w.act.is_some() || w.dtype != Dtype::Fp8b128,
-        "`{}` is stored fp8b128, which a W8A8 product reads; declare it at fp8b128a8",
+        w.act.is_some() || !block_fp8(w.dtype),
+        "`{}` is stored {}, which a W8A8 product reads; declare it at {}a8",
         w.name,
+        w.dtype,
+        w.dtype,
     );
     let r = act.rec();
     let y = r.fresh(tensor(act.rows(), w.dim(0), act.dtype()));
@@ -25,13 +27,19 @@ pub fn matmul(act: &Value, w: &Weight) -> Value {
                 w: r.weight(w),
                 quant,
                 input_scales: input_scales(r, w, quant),
-                scales: (w.dtype == Dtype::Fp8b128).then(|| r.weight_plane(w, poem_ir::SCALES)),
+                scales: block_fp8(w.dtype).then(|| r.weight_plane(w, poem_ir::SCALES)),
                 y: y.id(),
             },
             &[act],
         ),
     }
     y
+}
+
+/// Raw e4m3 codes beside a plane of 128x128 block factors: DeepSeek's e8m0
+/// exponents (`fp8b128`) or transformers' f32 factors (`e4m3tile128`).
+fn block_fp8(dtype: Dtype) -> bool {
+    matches!(dtype, Dtype::Fp8b128 | Dtype::E4m3tile128)
 }
 
 /// The static global a format quantizes `w`'s activations under, the
@@ -45,7 +53,7 @@ fn input_scales(r: &Recorder, w: &Weight, quant: ActQuant) -> Option<ValueId> {
 /// `w` is read by `op`, which multiplies activations as they are.
 fn unquantized(w: &Weight, op: &str) {
     assert!(
-        w.act.is_none() && w.dtype != Dtype::Fp8b128,
+        w.act.is_none() && !block_fp8(w.dtype),
         "`{}` quantizes its activations, and {op} reads them at their own dtype; \
          declare it at its stored dtype",
         w.name,
