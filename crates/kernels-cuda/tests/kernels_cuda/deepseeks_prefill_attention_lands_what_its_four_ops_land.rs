@@ -11,7 +11,6 @@ use dtype::Dtype;
 use kernels_cuda::attn::dsv4;
 use kernels_cuda::attn::dsv4_prefill::{self, Pooled};
 use kernels_cuda::tensor::{KvPool, Tensor};
-use kernels_cuda::tuning::Tuning;
 
 const PAGE: usize = 64;
 const HEADS: usize = 64;
@@ -54,9 +53,7 @@ fn paging(per: usize) -> (Vec<u32>, Vec<u32>) {
 }
 
 fn check(ratio: usize, top_k: Option<usize>) {
-    for sparse in [false, true] {
-        check_with(ratio, top_k, sparse, false);
-    }
+    check_with(ratio, top_k, true, false);
     // DeepSeek's fp8 rows, which only the block-a-row kernel reads.
     check_with(ratio, top_k, true, true);
 }
@@ -185,13 +182,10 @@ fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool, fp8: bool) {
         selection: sel_t,
     };
     assert!(
-        dsv4_prefill::takes(HEADS as u32, D as u32, Some(128), &win, &pooled, sparse),
+        dsv4_prefill::takes(HEADS as u32, D as u32, Some(128), &win, &pooled),
         "the kernel takes DeepSeek-V4-Flash's shape"
     );
-    let ctx = gpu.ctx().with_tuning(Tuning {
-        dsv4_sparse: sparse,
-        ..Tuning::DEFAULT
-    });
+    let ctx = gpu.ctx();
     dsv4_prefill::prefill(
         &ctx,
         "attention.pool_attention",
@@ -361,17 +355,14 @@ fn deepseeks_prefill_attention_paces_a_prefill() {
     let sel_t = Tensor::new(gpu.up(&sel), n as u32, k as u32, Dtype::I32);
     let o_at = gpu.zeros(n * HEADS * D * 2);
     let mut o = Tensor::new(o_at, n as u32, (HEADS * D) as u32, Dtype::Bf16);
-    for (sparse, fp8) in [(false, false), (true, false), (true, true)] {
+    for (sparse, fp8) in [(true, false), (true, true)] {
         let win = if fp8 { win8 } else { win };
         let pooled = Pooled {
             entries: &win,
             ratio: ratio as u32,
             selection: Some((sel_t, k as u32)),
         };
-        let ctx = gpu.ctx().with_tuning(Tuning {
-            dsv4_sparse: sparse,
-            ..Tuning::DEFAULT
-        });
+        let ctx = gpu.ctx();
         let mut fire = || {
             dsv4_prefill::prefill(
                 &ctx,

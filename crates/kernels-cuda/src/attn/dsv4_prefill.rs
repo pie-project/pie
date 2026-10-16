@@ -1,5 +1,5 @@
-//! DeepSeek-V4's attention at prefill widths on tcgen05
-//! (`attn/dsv4_prefill.cuh`): the window, the compressed pool (every visible
+//! DeepSeek-V4's attention at prefill widths on tcgen05, a block a row
+//! (`attn/dsv4_sparse.cuh`): the window, the compressed pool (every visible
 //! entry or those an index selected), their merge and the sinks in one pass,
 //! for the shape the kernel is built for: 64 query heads of 512 over one
 //! latent, a 128-key window, bf16 NHD pools. Anything else is the caller's to
@@ -12,32 +12,6 @@ use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, symbol};
 use crate::linear::tc5::{Map, encode, supported};
 use crate::tensor::{KvPool, Tensor};
 use dtype::Dtype;
-
-const FILE: &str = "attn/dsv4_prefill.cuh";
-
-/// `pie::attn::dsv4p::Params`, field for field.
-#[repr(C)]
-struct Params {
-    o: u64,
-    positions: u64,
-    requests: u64,
-    win_indptr: u64,
-    win_indices: u64,
-    ent_indptr: u64,
-    ent_indices: u64,
-    selection: u64,
-    sinks: u64,
-    live: u64,
-    sinks_f32: i32,
-    ent_runs: i32,
-    win_page: i32,
-    ent_page: i32,
-    top_k: i32,
-    ratio: i32,
-    rows: i32,
-    o_stride: i32,
-    scale_log2: f32,
-}
 
 const SPARSE_FILE: &str = "attn/dsv4_sparse.cuh";
 
@@ -77,10 +51,6 @@ const HEADS: u32 = 64;
 const HEAD_DIM: u32 = 512;
 const WINDOW: u32 = 128;
 
-/// `pie::attn::dsv4p::smem_bytes`: Q, three two-atom slices of 128 keys, two
-/// key lists, barriers, and the 1024-byte alignment.
-const SMEM: u32 = 8 * 128 * 128 + 3 * 2 * 128 * 128 + 3 * 128 * 4 + 512 + 1024;
-
 /// The compressed pool a row reads: its entries, how many positions an
 /// entry closes, and the ids an index selected for each row (`top_k` a
 /// row, ended early by a negative one), if it selects.
@@ -108,12 +78,9 @@ pub fn takes(
     window: Option<u32>,
     window_pool: &KvPool,
     pooled: &Pooled<'_>,
-    sparse: bool,
 ) -> bool {
-    // DeepSeek's fp8 rows (both planes) only the block-a-row kernel reads.
-    let fp8 = sparse
-        && crate::attn::dsv4::fp8_ds(window_pool)
-        && crate::attn::dsv4::fp8_ds(pooled.entries);
+    // DeepSeek's fp8 rows (both planes), staged to bf16 pages first.
+    let fp8 = crate::attn::dsv4::fp8_ds(window_pool) && crate::attn::dsv4::fp8_ds(pooled.entries);
     supported()
         && heads == HEADS
         && head_dim == HEAD_DIM
@@ -217,15 +184,6 @@ pub fn prefill(
         boxes: [64, 1, 16],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
     })?;
-    // Two rows' 64 heads a box an atom: [64 columns, 64 heads, 2 rows].
-    let map_q = encode(Map {
-        ptr: q.ptr,
-        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        dims: [HEAD_DIM, HEADS, q.rows],
-        strides: [u64::from(HEAD_DIM) * 2, u64::from(q.width) * 2],
-        boxes: [64, HEADS, 2],
-        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-    })?;
     let (selection, top_k) = pooled
         .selection
         .map_or((0, 0), |(selection, top_k)| (selection.ptr, top_k));
@@ -233,33 +191,12 @@ pub fn prefill(
         ArgValue::Ptr(at) => at,
         _ => 0,
     };
-    let params = Params {
-        o: o.ptr,
-        positions: positions.ptr,
-        requests: requests.ptr,
-        win_indptr: window_pool.page_indptr.ptr,
-        win_indices: window_pool.page_indices.ptr,
-        ent_indptr: pooled.entries.page_indptr.ptr,
-        ent_indices: pooled.entries.page_indices.ptr,
-        selection,
-        sinks: sinks.ptr,
-        live,
-        sinks_f32: i32::from(sinks.dtype == Dtype::F32),
-        ent_runs: i32::from(ent_runs),
-        win_page: window_pool.page_size,
-        ent_page: pooled.entries.page_size,
-        top_k: int(top_k),
-        ratio: int(pooled.ratio),
-        rows: int(rows),
-        o_stride: int(o.width),
-        scale_log2: sm_scale * core::f32::consts::LOG2_E,
-    };
     let bytes = |m: &[u64; 16]| ArgValue::Bytes {
         ptr: m.as_ptr().cast(),
         len: 128,
     };
     let selected = pooled.selection.is_some();
-    if ctx.tuning().dsv4_sparse {
+    {
         // A block a row (`attn/dsv4_sparse.cuh`): Q in TMEM, whole 64-key
         // tiles, V the tile K brought.
         let sparse = SparseParams {
@@ -286,7 +223,7 @@ pub fn prefill(
             scale_log2: sm_scale * core::f32::consts::LOG2_E,
             turn: crate::attn::dsv4::TurnArgs::of(turn),
         };
-        return ctx.fire(
+        ctx.fire(
             op,
             Fire::at(
                 SPARSE_FILE,
@@ -309,37 +246,7 @@ pub fn prefill(
                     len: core::mem::size_of::<SparseParams>(),
                 },
             ],
-        );
-    }
-    ctx.fire(
-        op,
-        Fire::at(
-            FILE,
-            symbol(&format!("::pie::attn::dsv4p::dsv4_prefill<{selected}>")),
         )
-        .apply(
-            Launch::grid([rows.div_ceil(2) * 2, 1, 1], [288, 1, 1])
-                .smem(SMEM)
-                .cluster(2),
-        ),
-        &[
-            bytes(&map_q),
-            bytes(&map_win),
-            bytes(&map_ent),
-            bytes(&map_win_run),
-            bytes(&map_ent_run),
-            ArgValue::Bytes {
-                ptr: (&raw const params).cast(),
-                len: core::mem::size_of::<Params>(),
-            },
-        ],
-    )?;
-    // The pair kernel lands no turn: the output's tail is turned after it.
-    match turn {
-        Some(t) => crate::elemwise::rope::partial_last(
-            ctx, o, positions, t.dim, HEAD_DIM, t.theta, true, true, t.yarn,
-        ),
-        None => Ok(()),
     }
 }
 

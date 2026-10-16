@@ -472,14 +472,7 @@ impl Run<'_> {
                     ratio: *ratio,
                     selection,
                 };
-                if dsv4_prefill::takes(
-                    *heads,
-                    *d,
-                    *span,
-                    &window_pool,
-                    &pooled,
-                    self.ctx().tuning().dsv4_sparse,
-                ) {
+                if dsv4_prefill::takes(*heads, *d, *span, &window_pool, &pooled) {
                     return dsv4_prefill::prefill(
                         self.ctx(),
                         op.name(),

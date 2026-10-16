@@ -217,19 +217,12 @@ pub struct SdpaSelectedMma;
 pub struct SdpaPoolMma;
 
 /// The fewest rows DeepSeek-V4's attention (`attention.pool_attention`: the
-/// window, the pool, their merge and the sinks) runs as one tcgen05 pass
-/// (`attn/dsv4_prefill.cuh`, sm_100a) rather than its four ops. 0 never
-/// does.
+/// window, the pool, their merge and the sinks) runs as one tcgen05 pass,
+/// a block a row (`attn/dsv4_sparse.cuh`, sm_100a: Q in TMEM, whole 64-key
+/// tiles, V the tile K brought) rather than its four ops. 0 never does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.dsv4_prefill_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
 pub struct SdpaDsv4PrefillFrom(pub u32);
-
-/// Whether that pass runs a block a row (`attn/dsv4_sparse.cuh`: Q in TMEM,
-/// whole 64-key tiles, V the tile K brought) rather than a block a pair of
-/// rows over their keys' union. Off runs the pairs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.dsv4_sparse", flag, default = false, tune = search)]
-pub struct SdpaDsv4Sparse;
 
 /// Whether a sparse MLA's selected attention (64 absorbed heads over a
 /// 512-wide bf16 latent and a 64-wide rotated part: GLM-5.3's DSA) runs a
@@ -561,7 +554,6 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaIndexRadix>()
         .add::<SdpaPoolMma>()
         .add::<SdpaDsv4PrefillFrom>()
-        .add::<SdpaDsv4Sparse>()
         .add::<SdpaMlaSparse>()
         .add::<GemmNarrowN>();
 }
@@ -639,7 +631,6 @@ pub struct Tuning {
     pub index_radix: bool,
     pub pool_mma: bool,
     pub dsv4_prefill_from: u32,
-    pub dsv4_sparse: bool,
     pub mla_sparse: bool,
     pub gemm_narrow_n: u32,
 }
@@ -715,7 +706,6 @@ impl Tuning {
         index_radix: false,
         pool_mma: false,
         dsv4_prefill_from: 0,
-        dsv4_sparse: false,
         mla_sparse: false,
         gemm_narrow_n: 0,
     };
@@ -791,7 +781,6 @@ impl Tuning {
             index_radix: profile.on::<SdpaIndexRadix>(&Anywhere),
             pool_mma: profile.on::<SdpaPoolMma>(&Anywhere),
             dsv4_prefill_from: profile.get::<SdpaDsv4PrefillFrom>().0,
-            dsv4_sparse: profile.on::<SdpaDsv4Sparse>(&Anywhere),
             mla_sparse: profile.on::<SdpaMlaSparse>(&Anywhere),
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,
         }
