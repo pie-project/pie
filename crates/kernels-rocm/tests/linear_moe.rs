@@ -1697,6 +1697,9 @@ fn bench_moe_models() {
         if let Ok(v) = std::env::var("PIE_BENCH_MOE_BATCH_FROM") {
             t.moe_batch_from = v.parse().unwrap();
         }
+        if let Ok(v) = std::env::var("PIE_BENCH_MOE_WIDE_FROM") {
+            t.moe_dense_wide_from = v.parse().unwrap();
+        }
     });
     let only = std::env::var("PIE_BENCH_MOE").unwrap_or_default();
     let token_list: Vec<usize> = std::env::var("PIE_BENCH_MOE_TOKENS").map_or_else(
@@ -1714,6 +1717,9 @@ fn bench_moe_models() {
         ),
         ("glm53-mini down u4", Codec::Affine4, 32, 8, 4096, 2048),
         ("glm53-mini gate_up bf16", Codec::Bf16, 32, 8, 4096, 4096),
+        // GLM-5.3's seven-layer mini: eight experts, every one routed.
+        ("glm53m8 gate_up bf16", Codec::Bf16, 8, 8, 4096, 6144),
+        ("glm53m8 down bf16", Codec::Bf16, 8, 8, 6144, 2048),
         ("glm53-mini down bf16", Codec::Bf16, 32, 8, 4096, 2048),
         ("kimi-k3 gate_up mxfp4", Codec::Mxfp4, 896, 16, 6144, 3584),
         ("kimi-k3 down mxfp4", Codec::Mxfp4, 896, 16, 3584, 3072),
