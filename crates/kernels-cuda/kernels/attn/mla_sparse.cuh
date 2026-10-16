@@ -586,21 +586,28 @@ __global__ __launch_bounds__(128) void mla_sparse_fold(
     const int row = live != nullptr ? rb + static_cast<int>(live[1]) : rb;
     const int head = static_cast<int>(blockIdx.y);
     const float* l = part_lse + static_cast<long long>(row) * splits * 64 + head;
-    float top = neg_inf();
-    for (int s = 0; s < splits; ++s) top = fmaxf(top, l[s * 64]);
-    float sum = 0.f;
-    for (int s = 0; s < splits; ++s) {
-        if (l[s * 64] > neg_inf()) sum += ex2(l[s * 64] - top);
-    }
+    // The splits' weights a lane each (at most 32 splits), every warp
+    // working them alike: the largest log-sum-exp, the sum over it, and
+    // lane s's share.
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const float mine = lane < splits ? l[lane * 64] : neg_inf();
+    float top = mine;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, o));
+    const float e = mine > neg_inf() ? ex2(mine - top) : 0.f;
+    float sum = e;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const float share = sum > 0.f ? e / sum : 0.f;
     u16* dst = o + static_cast<long long>(row) * o_stride + head * kD;
+    const float* base_o = part_o + (static_cast<long long>(row) * splits * 64 + head) * kD;
     for (int d = static_cast<int>(threadIdx.x) * 4; d < kD; d += 128 * 4) {
         float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-        for (int s = 0; s < splits; ++s) {
-            const float ls = l[s * 64];
-            if (!(ls > neg_inf())) continue;
-            const float wgt = ex2(ls - top) / sum;
-            const float4 v = *reinterpret_cast<const float4*>(
-                part_o + ((static_cast<long long>(row) * splits + s) * 64 + head) * kD + d);
+#pragma unroll 8
+        for (int s2 = 0; s2 < splits; ++s2) {
+            const float wgt = __shfl_sync(0xffffffffu, share, s2);
+            if (wgt == 0.f) continue;
+            const float4 v = *reinterpret_cast<const float4*>(base_o + static_cast<long long>(s2) * 64 * kD + d);
             acc.x = fmaf(wgt, v.x, acc.x);
             acc.y = fmaf(wgt, v.y, acc.y);
             acc.z = fmaf(wgt, v.z, acc.z);

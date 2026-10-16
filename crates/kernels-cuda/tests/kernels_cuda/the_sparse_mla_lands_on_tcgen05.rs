@@ -521,11 +521,15 @@ fn the_sparse_mla_paces_a_prefill() {
 /// keys, the selected attention dealt over splits a row on tcgen05 and
 /// folded, against the warp-a-key form; then both paced.
 fn decode_bs8(tc: bool, iters: u32) -> (Vec<u16>, f64) {
-    const REQS: usize = 8;
+    decode_rows(8, tc, iters)
+}
+
+/// [`decode_bs8`] at `reqs` requests of one row each.
+fn decode_rows(reqs: usize, tc: bool, iters: u32) -> (Vec<u16>, f64) {
     const PG: usize = 64;
     const K: usize = 2048;
     const ROPE: usize = 64;
-    let kv_lens: Vec<usize> = (0..REQS).map(|r| 2500 + 61 * r).collect();
+    let kv_lens: Vec<usize> = (0..reqs).map(|r| 2500 + 61 * r).collect();
     let pages_per: Vec<usize> = kv_lens.iter().map(|&n| n.div_ceil(PG)).collect();
     let total: usize = pages_per.iter().sum();
     let mut indptr = vec![0i32];
@@ -536,13 +540,13 @@ fn decode_bs8(tc: bool, iters: u32) -> (Vec<u16>, f64) {
     let last: Vec<i32> = kv_lens.iter().map(|&n| ((n - 1) % PG + 1) as i32).collect();
     let mut rng = Lcg::seeded(0xdec8);
     let slots = total * PG;
-    let (q_raw, _) = rng.row(REQS * HEADS * RANK);
-    let (qpe_raw, _) = rng.row(REQS * HEADS * ROPE);
+    let (q_raw, _) = rng.row(reqs * HEADS * RANK);
+    let (qpe_raw, _) = rng.row(reqs * HEADS * ROPE);
     let (ckv_raw, _) = rng.row(slots * RANK);
     let (kpe_raw, _) = rng.row(slots * ROPE);
     // Every other key of the request, the last 2048 of them, ascending.
-    let mut sel = vec![-1i32; REQS * K];
-    for r in 0..REQS {
+    let mut sel = vec![-1i32; reqs * K];
+    for r in 0..reqs {
         let ids: Vec<i32> = (0..kv_lens[r] as i32)
             .filter(|j| j % 2 == 0 || *j as usize + 300 > kv_lens[r])
             .collect();
@@ -551,7 +555,7 @@ fn decode_bs8(tc: bool, iters: u32) -> (Vec<u16>, f64) {
             sel[r * K + n] = j;
         }
     }
-    let qo: Vec<i32> = (0..=REQS as i32).collect();
+    let qo: Vec<i32> = (0..=reqs as i32).collect();
     let mut gpu = Gpu::open();
     let device = Device::probe(&gpu.ctx()).expect("the device answers its attributes");
     let kv_len_i: Vec<i32> = kv_lens.iter().map(|&n| n as i32).collect();
@@ -565,13 +569,13 @@ fn decode_bs8(tc: bool, iters: u32) -> (Vec<u16>, f64) {
         &qo,
         &indptr,
         &kv_len_i,
-        REQS as u32,
-        REQS as u32,
+        reqs as u32,
+        reqs as u32,
         Live {
-            requests: REQS as u32,
+            requests: reqs as u32,
             lane_offset: 0,
             row_offset: 0,
-            rows: REQS as u32,
+            rows: reqs as u32,
         },
         HEADS as u32,
         RANK as u32,
@@ -590,7 +594,7 @@ fn decode_bs8(tc: bool, iters: u32) -> (Vec<u16>, f64) {
         value_scales: Tensor::ABSENT,
         page_indices: Tensor::new(gpu.up(&page_ids), total as u32, 1, Dtype::I32),
         page_indptr: Tensor::new(gpu.up(&indptr), indptr.len() as u32, 1, Dtype::I32),
-        last_page_lens: Tensor::new(gpu.up(&last), REQS as u32, 1, Dtype::I32),
+        last_page_lens: Tensor::new(gpu.up(&last), reqs as u32, 1, Dtype::I32),
         row_valid: Tensor::ABSENT,
         env_min: Tensor::ABSENT,
         env_max: Tensor::ABSENT,
@@ -608,7 +612,7 @@ fn decode_bs8(tc: bool, iters: u32) -> (Vec<u16>, f64) {
     let qpe_at = gpu.up(&qpe_raw);
     let qo_at = gpu.up(&qo);
     let sel_at = gpu.up(&sel);
-    let out = gpu.zeros(REQS * HEADS * RANK * 2);
+    let out = gpu.zeros(reqs * HEADS * RANK * 2);
     let ctx = gpu.ctx().with_tuning(Tuning {
         mla_sparse: tc,
         ..Tuning::DEFAULT
@@ -617,24 +621,24 @@ fn decode_bs8(tc: bool, iters: u32) -> (Vec<u16>, f64) {
         mla::attention_decode_selected(
             &ctx,
             RaggedTensor {
-                data: Tensor::new(q_at, REQS as u32, (HEADS * RANK) as u32, Dtype::Bf16),
-                indptr: Tensor::new(qo_at, (REQS + 1) as u32, 1, Dtype::I32),
+                data: Tensor::new(q_at, reqs as u32, (HEADS * RANK) as u32, Dtype::Bf16),
+                indptr: Tensor::new(qo_at, (reqs + 1) as u32, 1, Dtype::I32),
             },
             &plan,
-            Tensor::new(qpe_at, REQS as u32, (HEADS * ROPE) as u32, Dtype::Bf16),
-            Tensor::new(sel_at, REQS as u32, K as u32, Dtype::I32),
+            Tensor::new(qpe_at, reqs as u32, (HEADS * ROPE) as u32, Dtype::Bf16),
+            Tensor::new(sel_at, reqs as u32, K as u32, Dtype::I32),
             &pool,
             HEADS as u32,
             RANK as u32,
             0.04,
-            &mut Tensor::new(out, REQS as u32, (HEADS * RANK) as u32, Dtype::Bf16),
+            &mut Tensor::new(out, reqs as u32, (HEADS * RANK) as u32, Dtype::Bf16),
             None,
         )
         .expect("the decode's selected attention fires");
     };
     fire();
     gpu.sync();
-    let got: Vec<u16> = gpu.down(out, REQS * HEADS * RANK);
+    let got: Vec<u16> = gpu.down(out, reqs * HEADS * RANK);
     let mut us = 0.0;
     if iters > 0 {
         let t0 = std::time::Instant::now();
@@ -669,4 +673,6 @@ fn glm_decodes_selected_attention_paces_8_rows() {
     let (_, naive) = decode_bs8(false, 20);
     let (_, tc) = decode_bs8(true, 200);
     eprintln!("| 8 rows, top 2048 | warp a key {naive:.1} us | tcgen05 split {tc:.1} us |");
+    let (_, one) = decode_rows(1, true, 200);
+    eprintln!("| 1 row, top 2048 | tcgen05 split {one:.1} us |");
 }
