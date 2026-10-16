@@ -576,7 +576,10 @@ fn one_pass(
                 "::pie::elemwise::norm_rope_last<{per}, {weighted}, {appends}>"
             )),
         )
-        .apply(Launch::grid([units.div_ceil(8), 1, 1], [256, 1, 1])),
+        .apply(Launch::grid(
+            [strided_blocks(ctx, units), 1, 1],
+            [256, 1, 1],
+        )),
         &[
             x.arg(),
             weight.unwrap_or(Tensor::ABSENT).arg(),
@@ -1122,7 +1125,10 @@ pub fn norm_rope_pair(
                 "::pie::elemwise::norm_rope_pair<{qper}, {appends}>"
             )),
         )
-        .apply(Launch::grid([units.div_ceil(8), 1, 1], [256, 1, 1])),
+        .apply(Launch::grid(
+            [strided_blocks(ctx, units), 1, 1],
+            [256, 1, 1],
+        )),
         &[
             q.x.arg(),
             q.y.arg(),
@@ -1149,4 +1155,12 @@ pub fn norm_rope_pair(
         ],
     )?;
     Ok(true)
+}
+
+/// Blocks of eight warps for `units` warp-units, at most eight blocks a
+/// multiprocessor (a full one's threads): the kernels stride over the rest,
+/// working the tail's frequencies once a block rather than once a unit-eight.
+fn strided_blocks(ctx: &Ctx, units: u32) -> u32 {
+    let resident = ctx.multiprocessors().unwrap_or(148).saturating_mul(8);
+    units.div_ceil(8).min(resident).max(1)
 }

@@ -1090,13 +1090,45 @@ __global__ void rope_partial_last_vec(
 // also writes the row as DeepSeek's fp8 row at its page and offset, as
 // `ds_append` writes it: a 64-wide tile's exponent over its eight lanes'
 // runs, the rotated tile kept in bf16.
-// One (row, head) unit of `norm_rope_last`, its block's frequencies in
-// `freq_s`.
+// A unit's head as its lane holds it: which plane row (-1 past the stage's
+// live rows) and its runs.
+template <int PER>
+struct NormRuns {
+    static constexpr int RUN = PER == 4 ? 4 : 8;
+    static constexpr int RUNS = PER / RUN;
+    int plane_row;
+    bf16 v[RUNS][RUN];
+};
+
+// Loads unit `unit`'s head (its plane row's, where the stage's window keeps it).
+template <int PER>
+__device__ __forceinline__ void norm_rope_fetch(NormRuns<PER>& in, int unit, const bf16* __restrict__ x,
+                                                int heads, const u32* __restrict__ win)
+{
+    static_assert(PER == 4 || PER == 8 || PER == 16, "a lane holds one to two runs");
+    constexpr int RUN = NormRuns<PER>::RUN;
+    in.plane_row = -1;
+    if (win != nullptr && unit / heads >= static_cast<int>(win[0])) return;
+    in.plane_row = win != nullptr ? unit + static_cast<int>(win[1]) * heads : unit;
+    const int lane = threadIdx.x & 31;
+    const long long at = static_cast<long long>(in.plane_row) * (32 * PER);
+#pragma unroll
+    for (int r = 0; r < NormRuns<PER>::RUNS; ++r) {
+        const int e = (lane + 32 * r) * RUN;
+        if constexpr (RUN == 4) {
+            *reinterpret_cast<uint2*>(in.v[r]) = *reinterpret_cast<const uint2*>(x + at + e);
+        } else {
+            *reinterpret_cast<uint4*>(in.v[r]) = *reinterpret_cast<const uint4*>(x + at + e);
+        }
+    }
+}
+
+// One (row, head) unit of `norm_rope_last` from its fetched head, its
+// block's frequencies in `freq_s`.
 template <int PER, bool WEIGHTED, bool APPEND>
 __device__ __forceinline__ void norm_rope_unit(
     const float* freq_s,
-    int unit,
-    const bf16* __restrict__ x,
+    const NormRuns<PER>& in,
     const bf16* __restrict__ weight,
     bf16* __restrict__ y,
     const i32* __restrict__ positions,
@@ -1108,30 +1140,23 @@ __device__ __forceinline__ void norm_rope_unit(
     const u32* __restrict__ w_page,
     const u32* __restrict__ w_off,
     const u8* __restrict__ row_valid,
-    int page_size,
-    const u32* __restrict__ win)
+    int page_size)
 {
-    static_assert(PER == 4 || PER == 8 || PER == 16, "a lane holds one to two runs");
     static_assert(!APPEND || PER == 16, "an fp8 row is 512 wide");
     constexpr int head_dim = 32 * PER;
-    constexpr int RUN = PER == 4 ? 4 : 8;
-    constexpr int RUNS = PER / RUN;
-    if (win != nullptr && unit / heads >= static_cast<int>(win[0])) return;
-    const int plane_row = win != nullptr ? unit + static_cast<int>(win[1]) * heads : unit;
+    constexpr int RUN = NormRuns<PER>::RUN;
+    constexpr int RUNS = NormRuns<PER>::RUNS;
+    if (in.plane_row < 0) return;
+    const int plane_row = in.plane_row;
     const int row = plane_row / heads;
     const int lane = threadIdx.x & 31;
     const long long at = static_cast<long long>(plane_row) * head_dim;
 
     bf16 v[RUNS][RUN];
 #pragma unroll
-    for (int r = 0; r < RUNS; ++r) {
-        const int e = (lane + 32 * r) * RUN;
-        if constexpr (RUN == 4) {
-            *reinterpret_cast<uint2*>(v[r]) = *reinterpret_cast<const uint2*>(x + at + e);
-        } else {
-            *reinterpret_cast<uint4*>(v[r]) = *reinterpret_cast<const uint4*>(x + at + e);
-        }
-    }
+    for (int r = 0; r < RUNS; ++r)
+#pragma unroll
+        for (int u = 0; u < RUN; ++u) v[r][u] = in.v[r][u];
     // The tail's angles a lane each (pairs `lane` and `lane + 32`), handed
     // to the lanes that hold their pairs; worked out while the head loads.
     const int offset = head_dim - rotary_dim;
@@ -1276,10 +1301,21 @@ __global__ void __launch_bounds__(256) norm_rope_last(
         freq_s[d] = freq;
     }
     __syncthreads();
-    const int unit = static_cast<int>(blockIdx.x) * 8 + static_cast<int>(threadIdx.x >> 5);
+    // A warp a unit, the grid striding over them where it is smaller; the
+    // next unit's head loads while this one's is worked.
+    const int stride = static_cast<int>(gridDim.x) * 8;
+    int unit = static_cast<int>(blockIdx.x) * 8 + static_cast<int>(threadIdx.x >> 5);
     if (unit >= units) return;
-    norm_rope_unit<PER, WEIGHTED, APPEND>(freq_s, unit, x, weight, y, positions, heads, eps, rotary_dim,
-                                          inverse, pages, w_page, w_off, row_valid, page_size, win);
+    NormRuns<PER> cur;
+    norm_rope_fetch<PER>(cur, unit, x, heads, win);
+    for (; unit < units; unit += stride) {
+        NormRuns<PER> next;
+        next.plane_row = -1;
+        if (unit + stride < units) norm_rope_fetch<PER>(next, unit + stride, x, heads, win);
+        norm_rope_unit<PER, WEIGHTED, APPEND>(freq_s, cur, weight, y, positions, heads, eps, rotary_dim,
+                                              inverse, pages, w_page, w_off, row_valid, page_size);
+        cur = next;
+    }
 }
 
 // DeepSeek-V4's q (scale-free, QPER a lane) and its kv plane (scaled, one
@@ -1321,13 +1357,25 @@ __global__ void __launch_bounds__(256) norm_rope_pair(
         freq_s[d] = freq;
     }
     __syncthreads();
-    const int unit = static_cast<int>(blockIdx.x) * 8 + static_cast<int>(threadIdx.x >> 5);
-    if (unit < q_units) {
-        norm_rope_unit<QPER, false, false>(freq_s, unit, qx, nullptr, qy, positions, q_heads, q_eps,
-                                           rotary_dim, false, nullptr, nullptr, nullptr, nullptr, 0, win);
-    } else if (unit < q_units + kv_units) {
-        norm_rope_unit<16, true, APPEND>(freq_s, unit - q_units, kx, kw, ky, positions, 1, kv_eps,
-                                         rotary_dim, false, pages, w_page, w_off, row_valid, page_size, win);
+    // A warp a unit, the grid striding over them where it is smaller; the
+    // next q unit's head loads while this one's is worked.
+    const int stride = static_cast<int>(gridDim.x) * 8;
+    int unit = static_cast<int>(blockIdx.x) * 8 + static_cast<int>(threadIdx.x >> 5);
+    NormRuns<QPER> cur;
+    if (unit < q_units) norm_rope_fetch<QPER>(cur, unit, qx, q_heads, win);
+    for (; unit < q_units; unit += stride) {
+        NormRuns<QPER> next;
+        next.plane_row = -1;
+        if (unit + stride < q_units) norm_rope_fetch<QPER>(next, unit + stride, qx, q_heads, win);
+        norm_rope_unit<QPER, false, false>(freq_s, cur, nullptr, qy, positions, q_heads, q_eps, rotary_dim,
+                                           false, nullptr, nullptr, nullptr, nullptr, 0);
+        cur = next;
+    }
+    for (; unit < q_units + kv_units; unit += stride) {
+        NormRuns<16> kv;
+        norm_rope_fetch<16>(kv, unit - q_units, kx, 1, win);
+        norm_rope_unit<16, true, APPEND>(freq_s, kv, kw, ky, positions, 1, kv_eps, rotary_dim, false, pages,
+                                         w_page, w_off, row_valid, page_size);
     }
 }
 
