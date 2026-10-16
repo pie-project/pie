@@ -2298,9 +2298,10 @@ __global__ __launch_bounds__(256) void ssm_kda_chunk_ho(
         }
     };
 
-    // A ring of DEPTH chunks in flight: two keep the walk at two wavefronts a
-    // SIMD (three needed more registers than that leaves).
-    constexpr int DEPTH = 2;
+    // A ring of DEPTH chunks in flight. Three, at one wavefront a SIMD: two
+    // (at two) ran the whole chunked prefill 2-4% slower from four requests
+    // up, and a single request's walk has no second block to hide behind.
+    constexpr int DEPTH = 3;
     Ops ring[DEPTH];
 #pragma unroll
     for (int d = 0; d < DEPTH; ++d) fetch(min(d, chunks - 1), ring[d]);
