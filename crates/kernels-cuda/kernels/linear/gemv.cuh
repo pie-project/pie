@@ -202,6 +202,10 @@ __global__ void __launch_bounds__(256) gemm_rows_bf16_kernel(
     int N, int K)
 {
     static_assert(kM >= 1 && kM <= 8, "a few rows");
+    // A programmatic dependent (`kernel.pdl`) reads nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     static_assert(8 % kSplit == 0, "a block's warps split evenly over its rows");
     constexpr int kR = 2;                     // weight rows a warp
     constexpr int kRows = 8 / kSplit * kR;    // weight rows a block

@@ -498,6 +498,37 @@ fn w8a8_block_matmul(m: usize, n: usize, k: usize) {
         got,
         "a held W8A8 product lands the quantizing one's bits"
     );
+    // Under `kernel.pdl` the quantizer and the GEMM launch as programmatic
+    // dependents, each of the kernel before it. Behind a product of other
+    // activations through the same planes, this one lands the same bits.
+    let (other, _) = activations(&mut lcg, m, k);
+    let other_at = gpu.up(&other);
+    let pdl = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+        pdl: true,
+        ..ctx.tuning()
+    });
+    let weight = Weight {
+        codes: codes_at,
+        scales: atoms_at,
+        n: n as u32,
+        k: k as u32,
+        elem: Elem::E4m3,
+        gran: 128,
+        laid: true,
+    };
+    let mut scratch = Tensor::new(gpu.zeros(m * n * 2), m as u32, n as u32, Dtype::Bf16);
+    let mut again = Tensor::new(gpu.zeros(m * n * 2), m as u32, n as u32, Dtype::Bf16);
+    for _ in 0..3 {
+        let first = Source::rows(Tensor::new(other_at, m as u32, k as u32, Dtype::Bf16), None);
+        matmul(&pdl, OP, fmt, first, weight, &mut scratch, 1.0).expect("the other product");
+        matmul(&pdl, OP, fmt, src, weight, &mut again, 1.0).expect("the W8A8 product fires");
+        gpu.sync();
+        assert_eq!(
+            gpu.down::<u16>(again.ptr, m * n),
+            got,
+            "a programmatic dependent W8A8 product lands the same bits"
+        );
+    }
 }
 
 #[test]

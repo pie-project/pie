@@ -24,8 +24,10 @@ fn lands(m: usize, n: usize, k: usize, with_bias: bool) {
     let y_at = gpu.zeros(m * n * 2);
     let ctx = gpu.ctx();
     let fire = || {
-        gemm_rows_bf16(&ctx, w_at, a_at, b_at, y_at, m as i32, n as i32, k as i32)
-            .expect("the few-rows GEMM fires");
+        gemm_rows_bf16(
+            &ctx, w_at, a_at, b_at, y_at, m as i32, n as i32, k as i32, false,
+        )
+        .expect("the few-rows GEMM fires");
     };
     fire();
     gpu.sync();
@@ -110,6 +112,7 @@ fn the_few_rows_gemm_paces_dsv4() {
                 m as i32,
                 n as i32,
                 k as i32,
+                false,
             )
             .expect("the few-rows GEMM fires");
         });

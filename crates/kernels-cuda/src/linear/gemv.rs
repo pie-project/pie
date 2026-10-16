@@ -90,7 +90,9 @@ pub(crate) fn gemv_bf16(
 /// `out[m][n] = act[m] . weight[n]` for a few rows (2..=8, a decode's) in
 /// one launch: the tactic `kernel.gemm.rows_m` lets the GEMM tuner try. A
 /// block's eight warps stream weight rows, as many warps a row as keep some
-/// 120 blocks busy (each a slice of K, summed in slice order).
+/// 120 blocks busy (each a slice of K, summed in slice order). Under `pdl`
+/// it launches as the previous kernel's programmatic dependent, waiting on
+/// it in-kernel (sm_90 and later).
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_rows_bf16(
     ctx: &Ctx,
@@ -101,6 +103,7 @@ pub fn gemm_rows_bf16(
     m: i32,
     n: i32,
     k: i32,
+    pdl: bool,
 ) -> Result<(), Error> {
     const OP: &str = "linear.gemm_rows";
     if !(1..=8).contains(&m) || n <= 0 || k <= 0 || k % 8 != 0 {
@@ -131,10 +134,10 @@ pub fn gemm_rows_bf16(
                 "::pie::linear::gemm_rows_bf16_kernel<{m}, {split}>"
             )),
         )
-        .apply(Launch::grid(
-            [n.unsigned_abs().div_ceil(rows as u32), 1, 1],
-            [256, 1, 1],
-        )),
+        .apply(
+            Launch::grid([n.unsigned_abs().div_ceil(rows as u32), 1, 1], [256, 1, 1])
+                .programmatic(pdl),
+        ),
         &[
             ArgValue::Ptr(weight),
             ArgValue::Ptr(act),

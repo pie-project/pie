@@ -185,6 +185,8 @@ fn launch(
             let v8 = src.x.ptr % 16 == 0 && codes % 8 == 0 && values % 16 == 0;
             let lanes = if v8 { u64::from(gran / 8) } else { 32 };
             let wide = if v8 { "_v8" } else { "" };
+            // The eight-a-lane kernels wait on their producer in-kernel.
+            let pdl = v8 && ctx.tuning().pdl;
             // Codes for a token's routes: each token's blocks quantized once
             // and landed at each of its routes' rows.
             if mode == 0 && src.div > 1 && src.pos != 0 && src.rows.is_multiple_of(src.div) {
@@ -198,7 +200,7 @@ fn launch(
                         FILE,
                         symbol(&format!("::pie::linear::act_quant_e4m3_fan{wide}<{gran}>")),
                     )
-                    .apply(Launch::flat(threads, BLOCK)),
+                    .apply(Launch::flat(threads, BLOCK).programmatic(pdl)),
                     &[
                         src.x.arg(),
                         ArgValue::Ptr(src.pos),
@@ -221,7 +223,7 @@ fn launch(
                         "::pie::linear::act_quant_e4m3{wide}<{mode}, {gran}>"
                     )),
                 )
-                .apply(Launch::flat(threads, BLOCK)),
+                .apply(Launch::flat(threads, BLOCK).programmatic(pdl)),
                 &[
                     src.x.arg(),
                     ArgValue::Ptr(src.pos),

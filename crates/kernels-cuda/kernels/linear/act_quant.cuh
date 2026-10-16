@@ -355,6 +355,10 @@ __global__ void act_quant_e4m3_v8(
     int k,
     int div)
 {
+    // A programmatic dependent (`kernel.pdl`) reads nothing until its
+    // producer is done; its consumer (a tcgen05 GEMM) may launch from here.
+    pdl_wait();
+    pdl_launch();
     using Block = E4m3Block<kGran>;
     const int blocks = k / kGran;
     const long long at = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x);
@@ -401,6 +405,10 @@ __global__ void act_quant_e4m3_fan_v8(
     int k,
     int div)
 {
+    // A programmatic dependent (`kernel.pdl`) reads nothing until its
+    // producer is done; its consumer (a tcgen05 GEMM) may launch from here.
+    pdl_wait();
+    pdl_launch();
     using Block = E4m3Block<kGran>;
     const int blocks = k / kGran;
     const long long at = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x);

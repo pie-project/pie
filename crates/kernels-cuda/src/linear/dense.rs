@@ -163,6 +163,7 @@ pub(crate) fn act_x_wt(
             call,
             ws,
             ws_bytes,
+            tuning.pdl,
         )
     {
         return Ok(matches!(tactic, Tactic::Gemv | Tactic::Rows) && bias != 0);
@@ -217,6 +218,7 @@ fn run_tactic(
     call: Call,
     ws: *mut c_void,
     ws_bytes: usize,
+    pdl: bool,
 ) -> bool {
     match tactic {
         Tactic::Gemv => {
@@ -241,6 +243,7 @@ fn run_tactic(
             call.m,
             call.n,
             call.k,
+            pdl,
         )
         .is_ok(),
         Tactic::Narrow => gemm_narrow_bf16(
@@ -1123,6 +1126,7 @@ impl TuneArena {
                 bench,
                 self.workspace,
                 self.workspace_bytes,
+                false,
             )
         };
         let stream = self.stream.cast();
