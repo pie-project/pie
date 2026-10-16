@@ -25,7 +25,8 @@ pub fn matmul(act: &Value, w: &Weight) -> Value {
                 w: r.weight(w),
                 quant,
                 input_scales: input_scales(r, w, quant),
-                scales: (w.dtype == Dtype::Fp8b128).then(|| r.weight_plane(w, poem_ir::SCALES)),
+                scales: matches!(w.dtype, Dtype::Fp8b128 | Dtype::E4m3tile128)
+                    .then(|| r.weight_plane(w, poem_ir::SCALES)),
                 y: y.id(),
             },
             &[act],

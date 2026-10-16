@@ -5,6 +5,35 @@
 
 BF = raw(dtype.bf16)
 
+def fp8_proj(w):
+    """Whether the projection `w` keeps the release's own FP8."""
+    return w != None and w.dtype in [dtype.e4m3tile128, dtype.e4m3tile128a8]
+
+def fp8_read(reads, w, names):
+    """The projection `w` as the release stores it: its legs' e4m3 codes
+    joined along the rows, and their `*.weight_scale_inv` f32 block factors
+    joined likewise, byte for byte."""
+    rows, cols = w.shape[0], w.shape[1]
+    codes = [src(name) for name in names]
+    factors = []
+    for name in names:
+        factor = name[:-len(".weight")] + ".weight_scale_inv"
+        if not has(factor):
+            fail("`{}`: `{}` holds FP8 codes whose block factors are stored beside it as `{}`, and the checkpoint holds none".format(w.name, name, factor))
+        factors.append(src(factor))
+    counted = [(rows + 127) // 128, (cols + 127) // 128]
+    reads.extend([
+        tensor(w.name, codes[0] if len(codes) == 1 else concat(0, codes), encoding(dtype.e4m3)),
+        tensor(scales_name(w.name), factors[0] if len(factors) == 1 else concat(0, factors), encoding(dtype.f32), shape = counted),
+    ])
+
+def proj_read(reads, w, name):
+    """`w` from `name`: as the release stores it where `w` keeps its FP8."""
+    if fp8_proj(w):
+        fp8_read(reads, w, [name])
+    else:
+        reads.read(w, name)
+
 def named(a, at):
     """`a`'s weights, each beside the name `at` gives its transformers leaf,
     in the order a checkpoint lists them."""
@@ -42,13 +71,13 @@ def huggingface(m, reads):
         reads.read(layer.attn_norm, at("input_layernorm.weight"))
         reads.read(layer.mlp_norm, at("post_attention_layernorm.weight"))
         for w, name in named(layer.attn, at):
-            reads.read(w, name)
+            proj_read(reads, w, name)
         f = layer.mlp
         if f.routed:
             moe(reads, at, f)
         else:
             joined(reads, f.gate_up, [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")])
-            reads.read(f.down, at("mlp.down_proj.weight"))
+            proj_read(reads, f.down, at("mlp.down_proj.weight"))
 
     mtp = m.mtp
     if mtp == None:
@@ -93,7 +122,7 @@ def shared(reads, at, f):
         at("mlp.shared_experts.gate_proj.weight"),
         at("mlp.shared_experts.up_proj.weight"),
     ])
-    reads.read(f.shared.down, at("mlp.shared_experts.down_proj.weight"))
+    proj_read(reads, f.shared.down, at("mlp.shared_experts.down_proj.weight"))
 
 def released_fp8(w):
     """Whether the bank `w` keeps the release's own FP8: e4m3 codes under
@@ -150,6 +179,9 @@ def land(reads, w, value):
 
 def joined(reads, w, names):
     """`w` from the tensors `names`, joined along its first axis."""
+    if fp8_proj(w):
+        fp8_read(reads, w, names)
+        return
     if all([stored(name) == BF for name in names]):
         reads.read_concat(w, names)
     else:

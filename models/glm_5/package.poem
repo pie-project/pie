@@ -38,4 +38,7 @@ DEPLOYMENTS = [
     # vLLM serves them: the like-for-like row.
     deployment("glm53-l7", weights = [BF, F8], kv = BF),
     deployment("glm53-mini", weights = [BF, F8], kv = BF),
+    # Every FP8 tensor of the release as released: the projections too.
+    deployment("glm53-l7", weights = [F8, F8], kv = BF),
+    deployment("glm53-mini", weights = [F8, F8], kv = BF),
 ]

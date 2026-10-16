@@ -1629,10 +1629,31 @@ fn lay_block_atoms(
         let atoms = Buffer::zeroed(bytes)?;
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        // A block-FP8 release's f32 factors (not DeepSeek's e8m0
+        // exponents): requantized to their ue8m0 ceilings first, the codes
+        // re-rounded under them, as vLLM's DeepGEMM path does on Blackwell.
+        let mut exps: Option<Buffer> = None;
+        if trace.params[at].dtype == Dtype::F32 {
+            let Some(Some(WeightRow::Dense(c))) = table.get(codes).copied() else {
+                continue;
+            };
+            let held_exps =
+                Buffer::zeroed(usize::try_from(rows.div_ceil(128) * cols).unwrap_or(usize::MAX))?;
+            kernels_cuda::linear::act_quant::fp8_tile_requant(
+                &ctx,
+                "linear.act_quant",
+                c.ptr,
+                plane.ptr,
+                held_exps.ptr(),
+                u32::try_from(rows).unwrap_or(u32::MAX),
+                u32::try_from(k).unwrap_or(u32::MAX),
+            )?;
+            exps = Some(held_exps);
+        }
         kernels_cuda::linear::act_quant::scales_to_atoms(
             &ctx,
             "linear.act_quant",
-            plane.ptr,
+            exps.as_ref().map_or(plane.ptr, Buffer::ptr),
             atoms.ptr(),
             u32::try_from(rows).unwrap_or(u32::MAX),
             u32::try_from(cols).unwrap_or(u32::MAX),
@@ -1645,6 +1666,10 @@ fn lay_block_atoms(
             Dtype::U8,
         )));
         held.push(atoms);
+        if exps.is_some() {
+            // The exponents' buffer frees here: their launches done first.
+            crate::device::ctx::sync(stream)?;
+        }
     }
     Ok(())
 }

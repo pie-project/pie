@@ -5,12 +5,13 @@
 
 load("//lib/adapters/model.poem", "banks")
 
-def attention(n, d, hidden, weights, norms, eps, kv, theta = None, interleaved = False, gated = False, **extra):
+def attention(n, d, hidden, weights, norms, eps, kv, theta = None, interleaved = False, gated = False, latent = None, **extra):
     """The latent attention named by `n`, its projections in `weights` and
     its norms in `norms`, caching under `kv`. Its rope part is rotated at
     `theta` (its pairs adjacent under `interleaved`), or left as it is with
-    none; `gated` adds a sigmoid gate on its output. `extra` rides along (an
-    indexer, say)."""
+    none; `gated` adds a sigmoid gate on its output. `latent` is the dtype
+    of `kv_b_proj`, which the absorbs read as it is (`weights` by default).
+    `extra` rides along (an indexer, say)."""
     qk_head_dim = d.qk_nope_head_dim + d.qk_rope_head_dim
     v_width = d.heads * d.v_head_dim
     return struct(
@@ -32,7 +33,7 @@ def attention(n, d, hidden, weights, norms, eps, kv, theta = None, interleaved =
         kv_b_proj = weight(
             n("kv_b_proj"),
             [d.heads * (d.qk_nope_head_dim + d.v_head_dim), d.kv_lora_rank],
-            weights,
+            latent if latent != None else weights,
         ).columns(),
         gate = weight(n("o_gate"), [v_width, hidden], weights).columns() if gated else None,
         o_proj = weight(n("o_proj"), [hidden, v_width], weights).rows(),
@@ -134,6 +135,13 @@ def layout(id, deploy):
         w, experts, draft = ws[0], ws[0], None
     else:
         fail("{} stores its weights at one dtype, or its weights and experts at a dtype each, and its draft experts at a third with the draft head; not {}".format(id, ws))
+    # The release's FP8 projections as released: the projections at their
+    # 128x128-block FP8 against e4m3 activations, the norms, tables, router,
+    # indexer weights and the latent's up-projection (which the absorbs read
+    # as bf16) at bf16, as the release keeps or vLLM reads them.
+    proj = w
+    if w == dtype.e4m3tile128a8:
+        w = dtype.bf16
     dense = compute(w)
     hidden = d.hidden
     index_width = d.index_heads * d.index_head_dim
@@ -147,8 +155,8 @@ def layout(id, deploy):
             rope_dim = d.qk_rope_head_dim,
             theta = d.theta,
             weights_from = d.index_weights_from,
-            q_proj = weight(n("index_q_proj"), [index_width, d.q_lora_rank], w),
-            k_proj = weight(n("index_k_proj"), [d.index_head_dim, hidden], w),
+            q_proj = weight(n("index_q_proj"), [index_width, d.q_lora_rank], proj),
+            k_proj = weight(n("index_k_proj"), [d.index_head_dim, hidden], proj),
             weights_proj = weight(n("index_weights"), [d.index_heads, index_in], w),
             k_norm = weight(n("index_k_norm"), [d.index_head_dim], w),
             k_norm_eps = d.index_norm_eps,
@@ -162,8 +170,9 @@ def layout(id, deploy):
             n,
             d,
             hidden,
-            weights = w,
+            weights = proj,
             norms = w,
+            latent = w,
             eps = d.norm_eps,
             kv = kv,
             theta = d.theta,
@@ -182,8 +191,8 @@ def layout(id, deploy):
             gate_up = weight(n("experts_gate_up"), [d.experts, 2 * iw, hidden], banks_dtype).bank([iw, iw]),
             down = weight(n("experts_down"), [d.experts, hidden, iw], banks_dtype).rows(),
             shared = struct(
-                gate_up = weight(n("shared_gate_up"), [2 * sw, hidden], w).packed([sw, sw]),
-                down = weight(n("shared_down"), [hidden, sw], w).rows(),
+                gate_up = weight(n("shared_gate_up"), [2 * sw, hidden], proj).packed([sw, sw]),
+                down = weight(n("shared_down"), [hidden, sw], proj).rows(),
                 inter = sw,
             ),
             experts = d.experts,
@@ -203,8 +212,8 @@ def layout(id, deploy):
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight(n("gate_up"), [2 * iw, hidden], w).packed([iw, iw]),
-                down = weight(n("down"), [hidden, iw], w).rows(),
+                gate_up = weight(n("gate_up"), [2 * iw, hidden], proj).packed([iw, iw]),
+                down = weight(n("down"), [hidden, iw], proj).rows(),
                 inter = iw,
             )
         else:
