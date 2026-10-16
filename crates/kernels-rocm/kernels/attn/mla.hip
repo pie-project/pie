@@ -303,6 +303,8 @@ namespace mla {
 constexpr int kRank = 512;
 constexpr int kBM = 64;
 constexpr int kBK = 32;
+// The fewest keys a split of the gathered walk takes.
+constexpr int kMinShare = 64;
 constexpr int kWaves = 8;
 constexpr int kThreads = kWaves * kWave;
 constexpr int kNoKey = 0x7fffffff;
@@ -682,7 +684,8 @@ struct Fold {
                 const int kj = k + j * step;
                 const int at = kj < end ? kj : k;
                 s[j] = lse[at];
-                raw[j] = load(at);
+                // An empty partial (lse −∞) is skipped unread.
+                raw[j] = s[j] == neg_inf() ? Raw{} : load(at);
             }
 #pragma unroll
             for (int j = 0; j < N; ++j) asm volatile("" ::"v"(raw[j]));
@@ -879,8 +882,18 @@ __global__ __launch_bounds__(kThreads) void latent_gather(const Gather p) {
     // (`index_topk`): a row that sees `limit + 1` positions has at most that
     // many, so the walk stops there rather than at the budget.
     const int count = sel != nullptr ? min(p.top_k, max(limit + 1, 0)) : max(limit + 1 - floor, 0);
-    const int share = ((count + p.splits - 1) / p.splits + BK - 1) / BK * BK;
+    // A split takes at least kMinShare keys: past the row's last, a split
+    // folds nothing and says so with an empty lse alone (the merge reads no
+    // more of it), so a short row costs a few splits, not all of them.
+    const int share = max(((count + p.splits - 1) / p.splits + BK - 1) / BK * BK, kMinShare);
     const int n0 = min(count, split * share);
+    if (split > 0 && n0 >= count) {
+        const int h0 = static_cast<int>(blockIdx.x) * kBM;
+        if (voff == 0)
+            for (int r = threadIdx.x; r < kBM && h0 + r < p.num_heads; r += kThreads)
+                p.part_lse[(t * p.num_heads + h0 + r) * p.splits + split] = neg_inf();
+        return;
+    }
     const LatentKeys keys{sel, pages, p.page_size, ratio, first + n0, first + min(count, n0 + share), limit,
                           floor};
     const GatherRows<R, RK> rows{p.q_nope, p.q_pe, p.o, p.lse, p.part_o, p.part_lse, t_row, t,
