@@ -667,6 +667,58 @@ impl Run<'_> {
         ))
     }
 
+    /// DeepSeek-V4's window and sinks at a prefill's width in the tcgen05
+    /// pass (`attn::dsv4_prefill::window_only`); `None` where the profile or
+    /// the shape keeps it off.
+    #[cfg(feature = "cuda")]
+    fn dsv4_window_prefill(
+        &mut self,
+        name: &'static str,
+        window: &poem_ir::Attention,
+        sink: poem_ir::ValueId,
+        o_out: poem_ir::ValueId,
+    ) -> Option<Result<(), kernels_cuda::Error>> {
+        use kernels_cuda::attn::dsv4_prefill;
+        let poem_ir::Attention::PrefillLse {
+            q,
+            cache,
+            window: span,
+            head_dim,
+            sm_scale,
+            ..
+        } = *window
+        else {
+            return None;
+        };
+        let from = self.ctx().tuning().dsv4_prefill_from;
+        let mut out = self.tensor(o_out);
+        if from == 0 || out.rows < from {
+            return None;
+        }
+        let positions = self.input_of(&poem_ir::RuntimeInput::Positions)?;
+        let requests = self.input_of(&poem_ir::RuntimeInput::Geometry {
+            space: 0,
+            kind: poem_ir::GeomKind::RequestOfToken,
+        })?;
+        let window_pool = self.pool_whole(cache)?;
+        let q = self.tensor(q);
+        let heads = q.width / head_dim.max(1);
+        if !dsv4_prefill::takes_window(heads, head_dim, span, &window_pool) {
+            return None;
+        }
+        Some(dsv4_prefill::window_only(
+            self.ctx(),
+            name,
+            q,
+            self.tensor(positions),
+            self.tensor(requests),
+            &window_pool,
+            self.tensor(sink),
+            sm_scale,
+            &mut out,
+        ))
+    }
+
     /// A log-sum-exp attention with its sinks: landed in the split's fold
     /// where the profile's warp fold takes them, else by the sink kernel
     /// after, as the pair ran.
@@ -681,6 +733,12 @@ impl Run<'_> {
         // draft head): the one launch at a decode's rows; over fp8 rows that
         // or a refusal, never FlashInfer reading them as bf16.
         if let poem_ir::Attention::PrefillLse { .. } = **attn {
+            // A prefill's rows, where the profile says
+            // (`kernel.sdpa.dsv4_prefill_from`): the window in the tcgen05 pass.
+            #[cfg(feature = "cuda")]
+            if let Some(landed) = self.dsv4_window_prefill(op.name(), attn, *sink, *o_out) {
+                return landed;
+            }
             if self.fp8_rows(attn) {
                 return self
                     .dsv4_decode(attn, None, *sink, *o_out, None)

@@ -388,6 +388,12 @@ __device__ __forceinline__ void tc_cp_sf_atom(u32 taddr, u64 sdesc) {
                   "l"(sdesc))
 }
 
+// 128 rows of 32 bytes (the operand `sdesc` describes, its swizzle and
+// all) into 8 TMEM columns: row r lands in lane r.
+__device__ __forceinline__ void tc_cp_128x256b(u32 taddr, u64 sdesc) {
+    asm volatile("tcgen05.cp.cta_group::1.128x256b [%0], %1;" ::"r"(taddr), "l"(sdesc) : "memory");
+}
+
 // Whole-warp: 32 consecutive columns of the warp's 32 lanes, one row a
 // thread. Pair with tmem_wait_ld before reading `v`.
 __device__ __forceinline__ void tmem_ld32(u32 taddr, u32 (&v)[32]) {

@@ -90,6 +90,17 @@ pub fn takes(
         && (fp8 || plain_bf16(pooled.entries))
 }
 
+/// Whether [`window_only`] serves this window.
+#[must_use]
+pub fn takes_window(heads: u32, head_dim: u32, window: Option<u32>, window_pool: &KvPool) -> bool {
+    let pooled = Pooled {
+        entries: window_pool,
+        ratio: NO_ENTRY,
+        selection: None,
+    };
+    takes(heads, head_dim, window, window_pool, &pooled)
+}
+
 /// Lands the sinked attention of every row of `q` in `o`: the row's window
 /// of `window_pool` and its compressed entries in one softmax, scaled by
 /// `sigmoid(lse - sink)` a head. The caller checks [`takes`] first.
@@ -111,12 +122,37 @@ pub fn prefill(
     if rows == 0 {
         return Ok(());
     }
+    // The pass turns at most 32 pairs (a lane's frequency each); a wider
+    // turn runs after it.
+    if let Some(wide) = turn.filter(|t| t.dim > 64) {
+        prefill(
+            ctx,
+            op,
+            q,
+            positions,
+            requests,
+            window_pool,
+            pooled,
+            sinks,
+            sm_scale,
+            None,
+            o,
+        )?;
+        return crate::elemwise::rope::partial_last(
+            ctx, o, positions, wide.dim, HEAD_DIM, wide.theta, true, true, wide.yarn,
+        );
+    }
     if crate::attn::dsv4::fp8_ds(window_pool) {
         // DeepSeek's fp8 rows: every page of both pools' tables widened into
         // bf16 planes laid out in table order (as vLLM gathers its prefill's
         // rows to bf16), read through the same page_indptr.
         let window_bf16 = stage(ctx, op, window_pool, Staged::Window)?;
-        let entries_bf16 = stage(ctx, op, pooled.entries, Staged::Entries)?;
+        // A window-only layer's entries are its window (none of them seen).
+        let entries_bf16 = if pooled.entries.keys.ptr == window_pool.keys.ptr {
+            window_bf16
+        } else {
+            stage(ctx, op, pooled.entries, Staged::Entries)?
+        };
         let staged = Pooled {
             entries: &entries_bf16,
             ratio: pooled.ratio,
@@ -164,7 +200,7 @@ pub fn prefill(
     let ratio = pooled.ratio;
     let ent_cells = pooled.entries.keys.rows;
     let ent_runs = ratio > 1
-        && ratio * 16 <= 256
+        && ratio <= 16
         && u32::try_from(pooled.entries.page_size).is_ok_and(|page| page.is_multiple_of(ratio))
         && ent_cells.is_multiple_of(ratio);
     let ent_stride = u64::try_from(pooled.entries.seq_stride).unwrap_or(0) * 2;
@@ -182,6 +218,15 @@ pub fn prefill(
             [ent_stride, ent_stride]
         },
         boxes: [64, 1, 16],
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    })?;
+    // Q a row: 64 heads of 512, eight boxes of 64 dims by the 64 heads.
+    let map_q = encode(Map {
+        ptr: q.ptr,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        dims: [HEAD_DIM, HEADS, q.rows],
+        strides: [u64::from(HEAD_DIM) * 2, u64::from(q.width) * 2],
+        boxes: [64, HEADS, 1],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
     })?;
     let (selection, top_k) = pooled
@@ -241,6 +286,7 @@ pub fn prefill(
                 bytes(&map_ent),
                 bytes(&map_win_run),
                 bytes(&map_ent_run),
+                bytes(&map_q),
                 ArgValue::Bytes {
                     ptr: (&raw const sparse).cast(),
                     len: core::mem::size_of::<SparseParams>(),
@@ -249,6 +295,43 @@ pub fn prefill(
         )
     }
 }
+
+/// [`prefill`] for a layer with a window and no pool: the window's own
+/// pool stands in for the entries, at a ratio no position closes.
+#[allow(clippy::too_many_arguments)]
+pub fn window_only(
+    ctx: &Ctx,
+    op: &'static str,
+    q: Tensor,
+    positions: Tensor,
+    requests: Tensor,
+    window_pool: &KvPool,
+    sinks: Tensor,
+    sm_scale: f32,
+    o: &mut Tensor,
+) -> Result<(), Error> {
+    let pooled = Pooled {
+        entries: window_pool,
+        ratio: NO_ENTRY,
+        selection: None,
+    };
+    prefill(
+        ctx,
+        op,
+        q,
+        positions,
+        requests,
+        window_pool,
+        &pooled,
+        sinks,
+        sm_scale,
+        None,
+        o,
+    )
+}
+
+/// A ratio past any position: a row sees none of the pool.
+const NO_ENTRY: u32 = i32::MAX as u32;
 
 /// Which pool a staged plane widens.
 #[derive(Clone, Copy)]

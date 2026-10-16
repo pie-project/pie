@@ -11,7 +11,9 @@
 // primitives:
 //
 //   - Q (64 heads by 512) sits in TMEM, heads a lane: lanes 0-63 hold the
-//     first 256 of each head, lanes 64-127 the last, 128 columns in all.
+//     first 256 of each head, lanes 64-127 the last, 128 columns in all. It
+//     comes through the ring as a tile does (TMA, heads for keys), and the
+//     MMA warp copies it in (tcgen05.cp) behind the row before's products.
 //   - A tile is 64 keys whole (64 KB) in shared memory, three of them a
 //     ring, laid out so a K step reads 64 keys' first-half dims as rows
 //     0-63 and their second-half dims as rows 64-127 of one 128-row operand:
@@ -25,10 +27,12 @@
 //     [0, 128) and [256, 384), lanes 64-127 [128, 256) and [384, 512).
 //
 // Warps 0-3 run the softmax (thread t: head t % 64, keys or dims half
-// t / 64) and store O; warp 4 lists a tile's keys, waits for the ring and
-// arms it; warps 4, 6 and 7 issue its gathers; warp 5 owns TMEM and issues
-// every MMA. A row's stream is its window (padded to whole gathers) then its
-// entries; a key past it lands as zeros and is masked.
+// t / 64) and store O; warp 11 lists a tile's keys; warp 4 waits for the
+// ring and arms it; warps 4 and 6-10 issue its gathers; warp 5 owns TMEM and
+// issues every copy and MMA. A row's stream is its Q, its window (padded to
+// whole gathers), then its entries; a key past it lands as zeros and is
+// masked. A layer with no pool reads its window alone (a ratio no position
+// closes).
 namespace pie::attn::dsv4s {
 
 using tc5::u32;
@@ -141,7 +145,7 @@ template <bool kSelected>
 __global__ __launch_bounds__(384, 1) void dsv4_sparse(
     const __grid_constant__ tc5::TmaMap map_win, const __grid_constant__ tc5::TmaMap map_ent,
     const __grid_constant__ tc5::TmaMap map_win_run, const __grid_constant__ tc5::TmaMap map_ent_run,
-    const Params p) {
+    const __grid_constant__ tc5::TmaMap map_q, const Params p) {
     using namespace tc5;
     const int live = p.live != nullptr ? static_cast<int>(p.live[0]) : p.rows;
     const int base = p.live != nullptr ? static_cast<int>(p.live[1]) : 0;
@@ -158,9 +162,7 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
     u64* s_free = s_full + 2;
     u64* p_full = s_free + 2;
     u64* pv_done = p_full + 2;
-    u64* q_ready = pv_done + 2;
-    u64* o_free = q_ready + 1;
-    u64* list_full = o_free + 1;
+    u64* list_full = pv_done + 2;
     u64* list_free = list_full + kLists;
     u32* tmem_slot = reinterpret_cast<u32*>(list_free + kLists);
     int* shared_ints = reinterpret_cast<int*>(tmem_slot + 1);  // [end of the selection]
@@ -180,8 +182,6 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
             bar_init(&p_full[s], 128);
             bar_init(&pv_done[s], 1);
         }
-        bar_init(q_ready, 128);
-        bar_init(o_free, 128);
         for (int s = 0; s < kLists; ++s) {
             bar_init(&list_full[s], 1);
             // The softmax read its marks; the issuers sent its gathers.
@@ -218,13 +218,20 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
         w.ent_pages = p.ent_indices + p.ent_indptr[req];
         w.entries = w.vis;
         if (kSelected) {
+            // Where the selection ends: 512 ids a round, their loads all in
+            // flight at once.
             w.entries = p.top_k;
-            for (int n0 = 0; n0 < p.top_k; n0 += 32) {
-                const int n = n0 + static_cast<int>(lane);
-                const unsigned ended = __ballot_sync(0xffffffffu, n < p.top_k && w.sel[n] < 0);
-                if (ended != 0u) {
-                    w.entries = n0 + __ffs(ended) - 1;
-                    break;
+            for (int n0 = 0; n0 < p.top_k && w.entries == p.top_k; n0 += 16 * 32) {
+                int v[16];
+#pragma unroll
+                for (int u = 0; u < 16; ++u) {
+                    const int n = n0 + u * 32 + static_cast<int>(lane);
+                    v[u] = n < p.top_k ? __ldg(w.sel + n) : 0;
+                }
+#pragma unroll
+                for (int u = 0; u < 16; ++u) {
+                    const unsigned ended = __ballot_sync(0xffffffffu, v[u] < 0);
+                    if (ended != 0u && w.entries == p.top_k) w.entries = n0 + u * 32 + __ffs(ended) - 1;
                 }
             }
         }
@@ -245,26 +252,36 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
         const u32* win_pages = w.win_pages;
         const u32* ent_pages = w.ent_pages;
         for (int j = 0; j < w.nt; ++j, ++J) {
-            if (J >= kLists) bar_wait(&list_free[J % kLists], ((J / kLists) - 1) & 1);
-            u32* l = lists + (J % kLists) * kBK;
-            // The tile's keys: their rows, planes and whether they count.
-            for (int c = static_cast<int>(lane); c < kBK; c += 32) {
-                const int k = j * kBK + c;
-                u32 e;
+            // The tile's keys: their rows, planes and whether they count;
+            // a lane's two keys' loads in flight together, ids then pages.
+            int id[2];
+#pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                const int k = j * kBK + u * 32 + static_cast<int>(lane);
+                id[u] = k - nwp;
+                if (kSelected && k >= nwp && k < total) id[u] = __ldg(sel + (k - nwp));
+            }
+            u32 e[2];
+#pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                const int k = j * kBK + u * 32 + static_cast<int>(lane);
                 if (k < nwp) {
-                    e = k < nw ? static_cast<u32>(row_in(win_pages, pos - nw + 1 + k,
+                    e[u] = k < nw ? static_cast<u32>(row_in(win_pages, pos - nw + 1 + k,
                                                          p.win_page)) |
                                      kValid
                                : kSlotMask;
                 } else if (k < total) {
-                    const int id = kSelected ? sel[k - nwp] : k - nwp;
-                    e = static_cast<u32>(row_in(ent_pages, (id + 1) * p.ratio - 1, p.ent_page)) |
-                        kPool | (id < vis ? kValid : 0u);
+                    e[u] = static_cast<u32>(row_in(ent_pages, (id[u] + 1) * p.ratio - 1, p.ent_page)) |
+                           kPool | (id[u] < vis ? kValid : 0u);
                 } else {
-                    e = kSlotMask | kPool;
+                    e[u] = kSlotMask | kPool;
                 }
-                l[c] = e;
             }
+            // The list it lands in is free once its tile is through.
+            if (J >= kLists) bar_wait(&list_free[J % kLists], ((J / kLists) - 1) & 1);
+            u32* l = lists + (J % kLists) * kBK;
+            l[lane] = e[0];
+            l[32 + lane] = e[1];
             __syncwarp();
             if (lane == 0) bar_arrive(&list_full[J % kLists]);
         }
@@ -272,15 +289,33 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
     } else if (warp == 4 || warp >= 6) {
         const bool lead = warp == 4;
         const int share = lead ? 0 : static_cast<int>(warp) - 5;
-        int J = 0;
+        int J = 0, R = 0;
         for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x)) {
         const Row w = row_at(r);
-        for (int j = 0; j < w.nt; ++j, ++J) {
-            const int slot = J % kSlots;
+        {
+            // The row's Q takes a slot of the ring first, laid out as a
+            // tile's keys are (heads for keys); the MMA warp copies it into
+            // TMEM and frees the slot.
+            const int slot = R % kSlots;
+            if (lead) {
+                bar_wait(&empty[slot], ((R / kSlots) & 1) ^ 1);
+                if (lane == 0) {
+                    bar_arrive_expect_tx(&full[slot], kTile);
+                    unsigned char* dst = smem + kOffRing + slot * kTile;
+#pragma unroll
+                    for (int a = 0; a < kD / 64; ++a) {
+                        tma_load_3d(dst + atom_at(a), &full[slot], &map_q, a * 64, 0, w.row);
+                    }
+                }
+            }
+            ++R;
+        }
+        for (int j = 0; j < w.nt; ++j, ++J, ++R) {
+            const int slot = R % kSlots;
             const u32* l = lists + (J % kLists) * kBK;
             bar_wait(&list_full[J % kLists], (J / kLists) & 1);
             if (lead) {
-                bar_wait(&empty[slot], ((J / kSlots) & 1) ^ 1);
+                bar_wait(&empty[slot], ((R / kSlots) & 1) ^ 1);
                 if (lane == 0) bar_arrive_expect_tx(&full[slot], kTile);
             }
             issue_sync();
@@ -333,11 +368,13 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
         const u32 idesc_o = idesc_dense(kF16Bf16, kF16Bf16, 64, 256) | (1u << 16);
         // O += P V of tile i (the row's first is `first`), then the tile's
         // slot and P's buffer are free.
-        auto pv = [&](int i, int first) {
+        // The first product of a row overwrites O: the softmax warps hand
+        // over its P only once they have read the row before's O out.
+        auto pv = [&](int i, int slot, int first) {
             bar_wait(&p_full[i & 1], (i >> 1) & 1);
             tc_fence_after();
             if (lane == 0) {
-                const u32 tile = sbase + kOffRing + (i % kSlots) * kTile;
+                const u32 tile = sbase + kOffRing + slot * kTile;
                 const u32 pa = sbase + kOffP + (i & 1) * kPBytes;
 #pragma unroll
                 for (int v = 0; v < 2; ++v) {
@@ -348,23 +385,41 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
                                i > first || s > 0);
                     }
                 }
-                tc_commit(&empty[i % kSlots]);
+                tc_commit(&empty[slot]);
                 tc_commit(&pv_done[i & 1]);
             }
             __syncwarp();
         };
-        int J = 0, rr = 0;
-        for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++rr) {
+        int J = 0, R = 0;
+        for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x)) {
             const Row w = row_at(r);
-            // This row's Q is in TMEM, and the last row's O was read out.
-            bar_wait(q_ready, rr & 1);
-            if (rr > 0) bar_wait(o_free, (rr - 1) & 1);
-            tc_fence_after();
+            {
+                // The row's Q into TMEM, behind the row before's last S
+                // products (tcgen05 work of one thread runs in order).
+                const int slot = R % kSlots;
+                bar_wait(&full[slot], (R / kSlots) & 1);
+                tc_fence_after();
+                if (lane == 0) {
+                    const u32 q = sbase + kOffRing + slot * kTile;
+#pragma unroll
+                    for (int b = 0; b < 4; ++b) {
+#pragma unroll
+                        for (int s = 0; s < 4; ++s) {
+                            tc_cp_128x256b(tmem + kColQ + b * 32 + s * 8,
+                                           sdesc_sw128(q + b * 2 * kAtom) + 2 * s);
+                        }
+                    }
+                    tc_commit(&empty[slot]);
+                }
+                __syncwarp();
+                ++R;
+            }
             const int first = J;
-            for (int j = 0; j < w.nt; ++j, ++J) {
-                const int slot = J % kSlots;
+            int prev = 0;
+            for (int j = 0; j < w.nt; ++j, ++J, ++R) {
+                const int slot = R % kSlots;
                 if (J >= 2) bar_wait(&s_free[J & 1], ((J - 2) >> 1) & 1);
-                bar_wait(&full[slot], (J / kSlots) & 1);
+                bar_wait(&full[slot], (R / kSlots) & 1);
                 tc_fence_after();
                 if (lane == 0) {
                     const u32 tile = sbase + kOffRing + slot * kTile;
@@ -377,9 +432,10 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
                     tc_commit(&s_full[J & 1]);
                 }
                 __syncwarp();
-                if (j > 0) pv(J - 1, first);
+                if (j > 0) pv(J - 1, prev, first);
+                prev = slot;
             }
-            pv(J - 1, first);
+            pv(J - 1, prev, first);
         }
     } else if (warp < 4) {
         // Thread t: head t % 64; its TMEM lane holds the head's first or
@@ -389,32 +445,14 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
         const int head = t % 64;
         const int half = t / 64;
         const u32 lane_base = (warp * 32) << 16;
-        // A row's Q into TMEM, once the S products of the row before it are in.
-        auto load_q = [&](int qrow) {
-            const uint4* src = reinterpret_cast<const uint4*>(
-                p.q + static_cast<long long>(qrow) * p.q_stride + head * kD + half * 256);
-#pragma unroll 1
-            for (int c = 0; c < 4; ++c) {
-                u32 v[32];
-#pragma unroll
-                for (int g = 0; g < 8; ++g) {
-                    const uint4 x = src[c * 8 + g];
-                    v[4 * g] = x.x;
-                    v[4 * g + 1] = x.y;
-                    v[4 * g + 2] = x.z;
-                    v[4 * g + 3] = x.w;
-                }
-                tmem_st32(tmem + lane_base + kColQ + c * 32, v);
-            }
-            tmem_wait_st();
-            tc_fence_before();
-            bar_arrive(q_ready);
-        };
+        // The turn's frequency of pair `lane` (at most 32 pairs), worked once:
+        // a tail pair reads it from its lane.
+        const float lane_freq =
+            static_cast<int>(lane) < p.turn.dim / 2 ? dsv4::turn_freq(static_cast<int>(lane), p.turn) : 0.f;
         int J = 0;
         for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x)) {
         const Row w = row_at(r);
         const int row = w.row;
-        if (r == static_cast<int>(blockIdx.x)) load_q(row);
         float m_used = neg_inf();
         float l = 0.f;
         for (int j = 0; j < w.nt; ++j, ++J) {
@@ -515,9 +553,6 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
             tc_fence_before();
             bar_arrive(&p_full[sb]);
         }
-        // The next row's Q lands now, its first products running while this
-        // row's O goes out.
-        if (r + static_cast<int>(gridDim.x) < live) load_q(base + r + static_cast<int>(gridDim.x));
         bar_wait(&pv_done[(J - 1) & 1], ((J - 1) >> 1) & 1);
         tc_fence_after();
         // The head's sum over both halves of its keys, its sink, and O.
@@ -548,10 +583,11 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
             for (int i = 0; i < 16; ++i) {
                 float a = __uint_as_float(v[2 * i]) * scale;
                 float b = __uint_as_float(v[2 * i + 1]) * scale;
-                // No shared memory is left to hold the turn's table: a tail
-                // pair works its own frequency.
+                // Whether a pair is the tail's is the same across the warp.
                 const int at = d0 + 2 * i - (kD - p.turn.dim);
-                if (p.turn.dim > 0 && at >= 0) dsv4::turn_pair(a, b, w.pos, dsv4::turn_freq(at / 2, p.turn));
+                if (p.turn.dim > 0 && at >= 0) {
+                    dsv4::turn_pair(a, b, w.pos, __shfl_sync(0xffffffffu, lane_freq, at / 2));
+                }
                 out[i] = pack_bf16(a, b);
             }
             uint4* o4 = reinterpret_cast<uint4*>(dst + d0);
@@ -560,8 +596,6 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
                 o4[i] = make_uint4(out[4 * i], out[4 * i + 1], out[4 * i + 2], out[4 * i + 3]);
             }
         }
-        tc_fence_before();
-        bar_arrive(o_free);
         }
     }
     tc_fence_before();

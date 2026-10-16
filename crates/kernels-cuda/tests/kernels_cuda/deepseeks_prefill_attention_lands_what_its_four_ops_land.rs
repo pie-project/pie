@@ -314,12 +314,107 @@ fn deepseeks_prefill_attention_lands_what_its_four_ops_land() {
     check(4, None);
 }
 
+/// A layer with a window and no pool: the pass reads the window alone and
+/// lands what the decode's one launch does, over bf16 rows and fp8 ones.
+#[test]
+fn a_window_only_layer_lands_its_window_alone() {
+    let per = 18;
+    let cells = 2 * per * PAGE;
+    let (pages, indptr) = paging(per);
+    // Rows near a request's start (fewer than the window) and past it.
+    let rows: Vec<(usize, usize)> = (0..5)
+        .map(|p| (0, p))
+        .chain((600..608).map(|p| (0, p)))
+        .chain((1000..1005).map(|p| (1, p)))
+        .collect();
+    let n = rows.len();
+    let mut lcg = Lcg::seeded(0x0a11);
+    let (q_bits, _) = lcg.row(n * HEADS * D);
+    let (w_bits, _) = lcg.row(cells * D);
+    let sinks: Vec<f32> = (0..HEADS).map(|h| (h as f32 - 32.0) / 16.0).collect();
+    let mut gpu = Gpu::open();
+    let positions: Vec<i32> = rows.iter().map(|&(_, p)| p as i32).collect();
+    let requests: Vec<i32> = rows.iter().map(|&(r, _)| r as i32).collect();
+    let q_t = Tensor::new(gpu.up(&q_bits), n as u32, (HEADS * D) as u32, Dtype::Bf16);
+    let pos_t = Tensor::new(gpu.up(&positions), n as u32, 1, Dtype::I32);
+    let req_t = Tensor::new(gpu.up(&requests), n as u32, 1, Dtype::I32);
+    let w_at = gpu.up(&w_bits);
+    let sink_t = Tensor::new(gpu.up(&sinks), HEADS as u32, 1, Dtype::F32);
+    let scale = 1.0 / (D as f32).sqrt();
+    for fp8 in [false, true] {
+        let win = if fp8 {
+            fp8_plane(&mut gpu, w_at, cells, &pages, &indptr).0
+        } else {
+            pool_of(&mut gpu, w_at, cells, &pages, &indptr)
+        };
+        assert!(dsv4_prefill::takes_window(
+            HEADS as u32,
+            D as u32,
+            Some(128),
+            &win
+        ));
+        let o_at = gpu.zeros(n * HEADS * D * 2);
+        let want_at = gpu.zeros(n * HEADS * D * 2);
+        let mut o = Tensor::new(o_at, n as u32, (HEADS * D) as u32, Dtype::Bf16);
+        let mut want = Tensor::new(want_at, n as u32, (HEADS * D) as u32, Dtype::Bf16);
+        let ctx = gpu.ctx();
+        dsv4_prefill::window_only(
+            &ctx,
+            "attention.lse_sink",
+            q_t,
+            pos_t,
+            req_t,
+            &win,
+            sink_t,
+            scale,
+            &mut o,
+        )
+        .expect("the window-only pass fires");
+        dsv4::decode(
+            &ctx,
+            q_t,
+            pos_t,
+            req_t,
+            &win,
+            128,
+            None,
+            sink_t,
+            HEADS as u32,
+            D as u32,
+            scale,
+            None,
+            &mut want,
+        )
+        .expect("the decode's launch fires");
+        gpu.sync();
+        let got: Vec<u16> = gpu.down(o_at, n * HEADS * D);
+        let wanted: Vec<u16> = gpu.down(want_at, n * HEADS * D);
+        for (i, (&a, &b)) in got.iter().zip(&wanted).enumerate() {
+            let (a, b) = (from_bf16(a), from_bf16(b));
+            assert!(
+                (a - b).abs() <= b.abs() / 32.0 + 2e-2,
+                "fp8 {fp8}: element {i} (row {}) is {a} against {b}",
+                i / (HEADS * D)
+            );
+        }
+    }
+}
+
 /// DeepSeek-V4-Flash at a prefill's width: 2048 rows of one 4096-position
-/// request, each reading its 128-key window and 512 selected entries.
+/// request, each reading its 128-key window and, at a CSA layer, 512
+/// selected entries, or at an HCA layer every visible entry; the output's
+/// tail turned back as the model's attention does.
 #[test]
 #[ignore = "a measurement; run it by name under the GPU lock"]
 fn deepseeks_prefill_attention_paces_a_prefill() {
-    let (ratio, k, n, span) = (4usize, 512usize, 2048usize, 4096usize);
+    for (ratio, k) in [(4usize, Some(512usize)), (128, None)] {
+        pace(ratio, k);
+    }
+}
+
+fn pace(ratio: usize, top_k: Option<usize>) {
+    let (n, span) = (2048usize, 4096usize);
+    let k = top_k.unwrap_or(0);
     let per = span / PAGE;
     let (pages, indptr) = paging(per);
     let cells = 2 * per * PAGE;
@@ -328,8 +423,8 @@ fn deepseeks_prefill_attention_paces_a_prefill() {
     let (w_bits, _) = lcg.row(cells * D);
     let positions: Vec<i32> = (0..n as i32).map(|r| (span - n) as i32 + r).collect();
     let requests = vec![0i32; n];
-    let mut sel = vec![-1i32; n * k];
-    for (r, &pos) in positions.iter().enumerate() {
+    let mut sel = vec![-1i32; n * k.max(1)];
+    for (r, &pos) in positions.iter().enumerate().filter(|_| k > 0) {
         let visible = (pos as usize + 1) / ratio;
         // The same 512 ids a row but for one in sixteen, as neighbouring
         // rows' indexes mostly agree.
@@ -337,7 +432,7 @@ fn deepseeks_prefill_attention_paces_a_prefill() {
             .filter(|id| {
                 (id * 2_654_435_761u32 as i32).rem_euclid(1024)
                     < (k as i32 * 1024 / visible as i32).min(1024)
-                    || (*id as usize + r) % 16 == 0
+                    || (*id as usize + r).is_multiple_of(16)
             })
             .take(k)
             .collect();
@@ -352,15 +447,25 @@ fn deepseeks_prefill_attention_paces_a_prefill() {
     let (win8, _) = fp8_plane(&mut gpu, w_at, cells, &pages, &indptr);
     let sinks = vec![0f32; HEADS];
     let sink_t = Tensor::new(gpu.up(&sinks), HEADS as u32, 1, Dtype::F32);
-    let sel_t = Tensor::new(gpu.up(&sel), n as u32, k as u32, Dtype::I32);
+    let sel_t = Tensor::new(gpu.up(&sel), n as u32, k.max(1) as u32, Dtype::I32);
     let o_at = gpu.zeros(n * HEADS * D * 2);
     let mut o = Tensor::new(o_at, n as u32, (HEADS * D) as u32, Dtype::Bf16);
-    for (sparse, fp8) in [(true, false), (true, true)] {
+    let turn = kernels_cuda::attn::dsv4::Turn {
+        dim: 64,
+        theta: 10000.0,
+        yarn: Some(kernels_cuda::elemwise::rope::Yarn {
+            factor: 16.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            original_max_position: 65536,
+        }),
+    };
+    for fp8 in [false, true] {
         let win = if fp8 { win8 } else { win };
         let pooled = Pooled {
             entries: &win,
             ratio: ratio as u32,
-            selection: Some((sel_t, k as u32)),
+            selection: top_k.map(|k| (sel_t, k as u32)),
         };
         let ctx = gpu.ctx();
         let mut fire = || {
@@ -374,7 +479,7 @@ fn deepseeks_prefill_attention_paces_a_prefill() {
                 &pooled,
                 sink_t,
                 0.044,
-                None,
+                Some(turn),
                 &mut o,
             )
             .expect("the prefill attention fires");
@@ -388,9 +493,14 @@ fn deepseeks_prefill_attention_paces_a_prefill() {
         }
         gpu.sync();
         let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
-        let flops = (n * HEADS * (k + 128) * D * 4) as f64;
+        let entries: usize = positions
+            .iter()
+            .map(|&p| top_k.unwrap_or(usize::MAX).min((p as usize + 1) / ratio))
+            .sum();
+        let flops = ((n * 128 + entries) * HEADS * D * 4) as f64;
         println!(
-            "| {n} rows, window + {k} selected, sparse {sparse}, fp8 {fp8} | {us:.0} us | {:.1} TFLOP/s useful |",
+            "| {n} rows, ratio {ratio}, window + {} entries a row, fp8 {fp8} | {us:.0} us | {:.1} TFLOP/s useful |",
+            entries / n,
             flops / us / 1e6
         );
     }
