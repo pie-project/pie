@@ -293,6 +293,66 @@ pub fn read_back(
     Ok(Tensor::new(out, src.rows, src.x.width, Dtype::Bf16))
 }
 
+/// A 128x128-block FP8 projection (`n x k` e4m3 codes at `codes`, their
+/// ue8m0 exponents laid in atoms a row a 128 columns) at a decode's few rows
+/// as a GEMV (`linear/fp8_gemv.cuh`): the activations as they are, bf16, the
+/// codes streamed once. `Ok(false)` past `kernel.gemm.fp8_gemv_until` rows
+/// or for a shape it does not read (`k` a whole number of 512s, the rows'
+/// activations within its shared memory).
+pub fn fp8_block_gemv(
+    ctx: &Ctx,
+    act: Tensor,
+    codes: u64,
+    atoms: u64,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.fp8_block_gemv";
+    const WARPS: u32 = 8;
+    const ROWS: u32 = 4;
+    let (m, n, k) = (act.rows, y.width, act.width);
+    if m == 0
+        || m > ctx.tuning().gemm_fp8_gemv_until
+        || act.dtype != Dtype::Bf16
+        || y.dtype != Dtype::Bf16
+        || y.rows != m
+        || k == 0
+        || !k.is_multiple_of(512)
+        || n == 0
+        || codes % 16 != 0
+        || act.ptr % 16 != 0
+    {
+        return Ok(false);
+    }
+    let rows_pad: u32 = match m {
+        1 => 1,
+        2 => 2,
+        3 | 4 => 4,
+        _ => return Ok(false),
+    };
+    ctx.fire(
+        OP,
+        Fire::at(
+            "linear/fp8_gemv.cuh",
+            symbol(&format!(
+                "::pie::linear::fp8_block_gemv<{WARPS}, {ROWS}, {rows_pad}>"
+            )),
+        )
+        .apply(Launch::grid([n.div_ceil(ROWS), 1, 1], [WARPS * 32, 1, 1])),
+        &[
+            act.arg(),
+            stated(OP, act.width)?.arg(),
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            y.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, m)?.arg(),
+            stated(OP, n)?.arg(),
+            stated(OP, k)?.arg(),
+        ],
+    )?;
+    Ok(true)
+}
+
 /// A 128x128-block FP8 plane (`rows x cols` e4m3 codes at `codes`) under f32
 /// block factors (`[rows / 128][cols / 128]` at `factors`) requantized in
 /// place to ue8m0 exponents (`exps`, the factors' shape): each factor

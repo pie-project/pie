@@ -1631,6 +1631,13 @@ impl Run<'_> {
             gran: 128,
             laid: true,
         };
+        // A decode's few rows: a GEMV over the activations as they are,
+        // where the profile says (`kernel.gemm.fp8_gemv_until`).
+        if self.held_e4m3(act_id, &act).is_none()
+            && act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)?
+        {
+            return Ok(());
+        }
         // Its producer landed the codes itself: no quantize launch.
         if let Some(planes) = self.held_e4m3(act_id, &act) {
             return act_quant::matmul_held(self.ctx(), OP, planes, act.rows, weight, &mut out, 1.0);

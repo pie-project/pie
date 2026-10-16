@@ -482,6 +482,7 @@ mod tests {
                         moe_w4a4_fused_from: 65_536,
                         moe_w4a8_fused_from: 65_536,
                         mla_expanded_from: 65_536,
+                        gemm_fp8_gemv_until: 0,
                         attn_res_fused_norm: false,
                         ssm_kda_chunked: false,
                         ssm_kda_step_fused: false,
@@ -670,6 +671,7 @@ mod tests {
         assert_eq!((b200.gemm_nvfp4_k128, b200.moe_w4a4_fused_from), (true, 1));
         assert_eq!(b200.moe_w4a8_fused_from, 512);
         assert_eq!(b200.mla_expanded_from, 256);
+        assert_eq!(b200.gemm_fp8_gemv_until, 4);
         assert_eq!((b200.mxfp4_a8_from, b200.mxfp4_a8_until), (1, 48));
         assert!(b200.attn_res_fused_norm);
     }
@@ -756,6 +758,10 @@ mod tests {
             assert_eq!(
                 other.mla_expanded_from, 65_536,
                 "sm_{major}{minor} scores a latent prefill absorbed"
+            );
+            assert_eq!(
+                other.gemm_fp8_gemv_until, 0,
+                "sm_{major}{minor} runs no FP8 projection as a GEMV"
             );
             assert!(
                 !other.attn_res_fused_norm,

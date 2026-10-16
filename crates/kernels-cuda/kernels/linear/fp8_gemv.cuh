@@ -1,0 +1,144 @@
+#pragma once
+
+// A 128x128-block FP8 projection at a decode's few rows as a GEMV:
+// `y[m] = x[m] . W^T`, W's e4m3 codes under one ue8m0 exponent a row a 128
+// columns (the tcgen05 GEMM's atoms, read where they lie), the activations
+// as they are (bf16, not quantized: the W8A16 product of the same codes).
+// A warp `kRows` weight rows; a lane sixteen codes (one 16-byte load) of
+// each a pass, the warp's lanes 512 adjacent codes; `kM` activation rows
+// read through L1 beside them. `k` a whole number of 512s.
+
+#include "linear/act_quant.cuh"
+
+namespace pie::linear {
+
+namespace fp8gemv {
+
+__device__ __forceinline__ uint4 ld_stream(const void* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+}
+
+// Four e4m3 codes of a word as f32: two codes an f16 pair a convert.
+__device__ __forceinline__ void codes4(unsigned w, float (&out)[4]) {
+    unsigned lo, hi;
+    asm("{ .reg .b16 a, b;\n"
+        "mov.b32 {a, b}, %2;\n"
+        "cvt.rn.f16x2.e4m3x2 %0, a;\n"
+        "cvt.rn.f16x2.e4m3x2 %1, b; }\n"
+        : "=r"(lo), "=r"(hi)
+        : "r"(w));
+    float f0, f1, f2, f3;
+    asm("{ .reg .f16 l, u;\n mov.b32 {l, u}, %2;\n cvt.f32.f16 %0, l;\n cvt.f32.f16 %1, u; }\n"
+        : "=f"(f0), "=f"(f1) : "r"(lo));
+    asm("{ .reg .f16 l, u;\n mov.b32 {l, u}, %2;\n cvt.f32.f16 %0, l;\n cvt.f32.f16 %1, u; }\n"
+        : "=f"(f2), "=f"(f3) : "r"(hi));
+    out[0] = f0;
+    out[1] = f1;
+    out[2] = f2;
+    out[3] = f3;
+}
+
+}  // namespace fp8gemv
+
+template <int kWarps, int kRows, int kM>
+__global__ void __launch_bounds__(kWarps * 32) fp8_block_gemv(
+    const bf16* __restrict__ x,
+    int x_stride,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ atoms,
+    bf16* __restrict__ y,
+    int y_stride,
+    int m,
+    int n,
+    int k)
+{
+    using namespace fp8gemv;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    // A block `kRows` weight rows, its warps each a `kWarps`-th of K: a
+    // projection of few rows over a long K fills the SMs, and no warp
+    // walks K alone.
+    const int row0 = blockIdx.x * kRows;
+    const int blocks = k / 128;
+    float acc[kRows][kM];
+#pragma unroll
+    for (int i = 0; i < kRows; ++i) {
+#pragma unroll
+        for (int j = 0; j < kM; ++j) acc[i][j] = 0.f;
+    }
+    for (int c0 = warp * 512 + lane * 16; c0 < k; c0 += 512 * kWarps) {
+        uint4 w[kRows];
+        float s[kRows];
+#pragma unroll
+        for (int i = 0; i < kRows; ++i) {
+            const int row = min(row0 + i, n - 1);
+            w[i] = ld_stream(codes + static_cast<long long>(row) * k + c0);
+            s[i] = __uint_as_float(static_cast<unsigned>(atoms[atom_offset(row, c0 / 128, blocks)]) << 23);
+        }
+        // The activations' sixteen columns of each row, read through L1
+        // (every warp of the block reads the same).
+        uint4 xr[kM][2];
+#pragma unroll
+        for (int j = 0; j < kM; ++j) {
+            const bf16* xp = x + static_cast<long long>(min(j, m - 1)) * x_stride + c0;
+            xr[j][0] = __ldg(reinterpret_cast<const uint4*>(xp));
+            xr[j][1] = __ldg(reinterpret_cast<const uint4*>(xp + 8));
+        }
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            float xv[kM][4];
+#pragma unroll
+            for (int j = 0; j < kM; ++j) {
+                const uint4 h = xr[j][q / 2];
+                const unsigned a = (q & 1) ? h.z : h.x;
+                const unsigned b = (q & 1) ? h.w : h.y;
+                xv[j][0] = __uint_as_float(a << 16);
+                xv[j][1] = __uint_as_float(a & 0xFFFF0000u);
+                xv[j][2] = __uint_as_float(b << 16);
+                xv[j][3] = __uint_as_float(b & 0xFFFF0000u);
+            }
+#pragma unroll
+            for (int i = 0; i < kRows; ++i) {
+                const unsigned word = q == 0 ? w[i].x : q == 1 ? w[i].y : q == 2 ? w[i].z : w[i].w;
+                float cv[4];
+                codes4(word, cv);
+#pragma unroll
+                for (int j = 0; j < kM; ++j) {
+                    const float d = cv[0] * xv[j][0] + cv[1] * xv[j][1] + cv[2] * xv[j][2] + cv[3] * xv[j][3];
+                    acc[i][j] = fmaf(d, s[i], acc[i][j]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kRows; ++i) {
+#pragma unroll
+        for (int j = 0; j < kM; ++j) {
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) acc[i][j] += __shfl_xor_sync(0xffffffffu, acc[i][j], off);
+        }
+    }
+    __shared__ float part[kWarps][kRows * kM];
+    if (lane == 0) {
+#pragma unroll
+        for (int i = 0; i < kRows; ++i) {
+#pragma unroll
+            for (int j = 0; j < kM; ++j) part[warp][i * kM + j] = acc[i][j];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < kRows * kM) {
+        const int i = threadIdx.x / kM;
+        const int j = threadIdx.x % kM;
+        float sum = 0.f;
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) sum += part[w][threadIdx.x];
+        if (row0 + i < n && j < m) y[static_cast<long long>(j) * y_stride + row0 + i] = f32_to_bf16(sum);
+    }
+}
+
+}  // namespace pie::linear

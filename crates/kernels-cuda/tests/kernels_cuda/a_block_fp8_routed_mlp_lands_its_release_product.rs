@@ -253,3 +253,87 @@ fn a_block_fp8_routed_mlp_lands_its_release_product() {
     check(2, 512, 256, 16, 8);
     check(160, 512, 256, 16, 4);
 }
+
+/// A block-FP8 projection at a decode's few rows as a GEMV over the bf16
+/// activations (`kernel.gemm.fp8_gemv_until`) lands the release's product
+/// (codes requantized under their ue8m0 ceilings) to bf16's rounding, and
+/// what the tcgen05 W8A8 product lands to e4m3's.
+#[test]
+fn a_block_fp8_projection_gemv_lands_its_release_product() {
+    use kernels_cuda::linear::act_quant::{Source, Weight, fp8_block_gemv, matmul};
+    if !supported() {
+        return;
+    }
+    for (m, n, k) in [
+        (1usize, 640usize, 6144usize),
+        (3, 1024, 1536),
+        (4, 384, 2048),
+    ] {
+        let mut gpu = Gpu::open();
+        let w = bank(&mut gpu, 1, n, k, 0x91 ^ k as u64);
+        let mut lcg = Lcg::seeded(0x92 ^ (m * n) as u64);
+        let (x_raw, x_f) = lcg.row(m * k);
+        let x = Tensor::new(gpu.up(&x_raw), m as u32, k as u32, Dtype::Bf16);
+        let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+            gemm_fp8_gemv_until: 8,
+            ..crate::common::SM100
+        });
+        let mut got = Tensor::new(gpu.zeros(m * n * 2), m as u32, n as u32, Dtype::Bf16);
+        assert!(
+            fp8_block_gemv(&ctx, x, w.codes, w.atoms, &mut got).expect("the GEMV fires"),
+            "the GEMV takes {m} rows of {k}"
+        );
+        let mut tc5 = Tensor::new(gpu.zeros(m * n * 2), m as u32, n as u32, Dtype::Bf16);
+        matmul(
+            &ctx,
+            "test",
+            Format::E4m3 { gran: 128 },
+            Source::rows(x, None),
+            Weight {
+                codes: w.codes,
+                scales: w.atoms,
+                n: n as u32,
+                k: k as u32,
+                elem: Elem::E4m3,
+                gran: 128,
+                laid: true,
+            },
+            &mut tc5,
+            1.0,
+        )
+        .expect("the W8A8 product fires");
+        gpu.sync();
+        let got: Vec<u16> = gpu.down(got.ptr, m * n);
+        let tc5: Vec<u16> = gpu.down(tc5.ptr, m * n);
+        let xr: Vec<f32> = x_f
+            .iter()
+            .map(|v| from_bf16(crate::common::to_bf16(*v)))
+            .collect();
+        let want: Vec<f32> = (0..m * n)
+            .map(|i| {
+                let (r, o) = (i / n, i % n);
+                w.w[o * k..][..k]
+                    .iter()
+                    .zip(&xr[r * k..][..k])
+                    .map(|(a, b)| a * b)
+                    .sum()
+            })
+            .collect();
+        let scale = want.iter().map(|v| v.abs()).sum::<f32>() / want.len() as f32;
+        let mean = |y: &[u16]| {
+            y.iter()
+                .zip(&want)
+                .map(|(g, w)| (from_bf16(*g) - w).abs())
+                .sum::<f32>()
+                / want.len() as f32
+                / scale
+        };
+        let (g, t) = (mean(&got), mean(&tc5));
+        eprintln!("{m} x {n} x {k}: GEMV {g:.4}, W8A8 {t:.4} from the release's product");
+        // The GEMV's activations unquantized: no farther than the W8A8 product.
+        assert!(
+            g < 0.06 && g <= t * 1.05,
+            "{m} x {n} x {k}: GEMV {g:.4}, W8A8 {t:.4}"
+        );
+    }
+}
