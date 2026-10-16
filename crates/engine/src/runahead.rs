@@ -43,9 +43,18 @@ impl Runahead {
         self.frames_in_flight as usize
     }
 
+    /// Frames a lane may keep submitted past the ones in flight: the cover
+    /// a lane's guest turnaround (drain the last token, submit the next
+    /// frame) hides behind. The frame seal waits for every lane, so the
+    /// slowest of a burst's lanes sets it: at one frame of cover, 256
+    /// requests of 1024 in / 256 out on Gemma-4-31B held 378 of 525 seals
+    /// with the device idle (1.1 ms median, 0.48 s a run) for a few lanes
+    /// still a frame behind; at three, 17 seals and 29 ms.
+    pub const HOST_COVER: u8 = 3;
+
     #[must_use]
     pub const fn submit_depth(&self) -> usize {
-        self.frames_in_flight as usize + 1
+        self.frames_in_flight as usize + Self::HOST_COVER as usize
     }
 
     #[must_use]
