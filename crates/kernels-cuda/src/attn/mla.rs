@@ -607,6 +607,7 @@ pub(crate) mod naive {
 }
 
 /// The selected attention a block a row on tcgen05 (`attn/mla_sparse.cuh`).
+#[cfg(feature = "cuda")]
 mod sparse {
     use cudarc::driver::sys as dr;
 
@@ -1242,6 +1243,7 @@ fn selected(
     }
     let num_requests = kv::lanes_of(op, q.indptr)?;
     let lse = lse_plane(op, lse, o.rows, heads)?;
+    #[cfg(feature = "cuda")]
     if let Some(fired) = sparse::fire(
         ctx,
         op,
