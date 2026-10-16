@@ -608,6 +608,7 @@ pub fn compress(
     forward_interleaved: bool,
     yarn: Option<crate::elemwise::rope::Yarn>,
     out: &KvPool,
+    state: Option<StateRows>,
 ) -> Result<bool, Error> {
     const OP: &str = "attention.pool_compress";
     let fp8 = crate::attn::dsv4::fp8_ds(out);
@@ -633,7 +634,16 @@ pub fn compress(
         } else {
             out.keys.dtype == Dtype::Bf16
         };
-    if !fits {
+    // The rows' own state written first, where the fire holds one row a
+    // request (the caller's to say): its rows as `state_write` reads them.
+    let state_fits = state.as_ref().is_none_or(|s| {
+        s.kv.dtype == Dtype::Bf16
+            && s.score.dtype == Dtype::Bf16
+            && s.kv.width == s.score.width
+            && s.kv.width <= pitch
+            && s.kv.rows >= boundary_pos.rows
+    });
+    if !fits || !state_fits {
         return Ok(false);
     }
     boundary_tables(OP, &boundary_pos, &boundary_req);
@@ -703,8 +713,27 @@ pub fn compress(
             coff.arg(),
             pages.page_size.arg(),
             count(OP, "the state plane's row pitch", pitch)?.arg(),
+            state.as_ref().map_or(ArgValue::ABSENT, |s| s.kv.arg()),
+            state.as_ref().map_or(ArgValue::ABSENT, |s| s.score.arg()),
+            state
+                .as_ref()
+                .map_or(ArgValue::ABSENT, |s| s.write_page.arg()),
+            state
+                .as_ref()
+                .map_or(ArgValue::ABSENT, |s| s.write_offset.arg()),
+            state.as_ref().map_or(0, |s| s.kv.width).arg(),
             ctx.stage(),
         ],
     )?;
     Ok(true)
+}
+
+/// A fire's compressor projections and where each row's state lands
+/// (`state_write`'s), for [`compress`] to write before it gathers, where
+/// every request holds one row of the fire.
+pub struct StateRows {
+    pub kv: Tensor,
+    pub score: Tensor,
+    pub write_page: Tensor,
+    pub write_offset: Tensor,
 }

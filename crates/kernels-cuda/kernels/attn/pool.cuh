@@ -630,8 +630,8 @@ __global__ void __launch_bounds__(256) pool_gather_vec(
 // nothing. 256 threads; `head_dim / 8` divides 256; FP8 wants 512.
 template <bool FP8>
 __global__ void __launch_bounds__(256) pool_compress(
-    const bf16* __restrict__ state_kv,
-    const bf16* __restrict__ state_score,
+    bf16* __restrict__ state_kv,
+    bf16* __restrict__ state_score,
     const float* __restrict__ ape,
     const i32* __restrict__ boundary_pos,
     const i32* __restrict__ boundary_req,
@@ -654,10 +654,31 @@ __global__ void __launch_bounds__(256) pool_compress(
     int coff,
     int page_size,
     int state_pitch,
+    const bf16* __restrict__ s_kv,
+    const bf16* __restrict__ s_score,
+    const u32* __restrict__ s_page,
+    const u32* __restrict__ s_off,
+    int s_width,
     const u32* __restrict__ win) {
     const int cb = blockIdx.x;
     if (win != nullptr && cb >= static_cast<int>(win[0])) return;
     const int c = win != nullptr ? cb + static_cast<int>(win[1]) : cb;
+    // This row's compressor state first, as `pool_state_write` lands it,
+    // where the fire holds one row a request (the block gathers only its
+    // own row of this fire).
+    if (s_width > 0) {
+        const int page = static_cast<int>(s_page[c]);
+        const int off = static_cast<int>(s_off[c]);
+        if (page >= 0 && off >= 0 && off < page_size) {
+            const long long dst = (static_cast<long long>(page) * page_size + off) * static_cast<long long>(state_pitch);
+            const long long src = static_cast<long long>(c) * s_width;
+            for (int d = threadIdx.x; d < s_width; d += blockDim.x) {
+                state_kv[dst + d] = s_kv[src + d];
+                state_score[dst + d] = s_score[src + d];
+            }
+        }
+        __syncthreads();
+    }
     const int bpos = boundary_pos[c];
     const int req = boundary_req[c];
     if (bpos < 0 || bpos >= owned_positions(out_indptr, req, out_page_size)) return;

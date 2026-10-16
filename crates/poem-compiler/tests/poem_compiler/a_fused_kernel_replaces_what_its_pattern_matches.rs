@@ -778,3 +778,42 @@ fn an_index_ranking_lands_its_queries_turn() {
         ["attention.index_topk_rope", "elementwise.silu"]
     );
 }
+
+#[test]
+fn deepseeks_compressor_lands_its_state_write_too() {
+    let t = trace(|p| {
+        let (bpos, breq, brope) = (p.indices("bpos"), p.indices("breq"), p.indices("brope"));
+        let pages = p.cache("pages");
+        attn::pool_state_write(
+            &p.rows("kv", 1024),
+            &p.rows("score", 1024),
+            pages,
+            &p.rows("swp", 1),
+            &p.rows("swo", 1),
+            512,
+            4,
+        );
+        let ape = p.weight("ape", [4, 1024]);
+        let g = attn::pool_gather(
+            &bpos,
+            &breq,
+            pages,
+            Some(&ape),
+            512,
+            4,
+            poem_ir::Dtype::Bf16,
+        );
+        let latent = elemwise::rmsnorm(&g, &p.weight("norm", [512]), 1e-6);
+        let k = elemwise::rope_partial_last_yarn(&latent, &brope, 64, 512, 1e4, true, false, None);
+        let pool = p.cache("entries");
+        attn::pool_kv_append(&k, &bpos, &breq, pool, &p.rows("wp", 1), &p.rows("wo", 1));
+    });
+    let fused = fuse(t, &["attention.pool_compress"]);
+    assert_eq!(ops(&fused), ["attention.pool_compress"]);
+    let Some(poem_ir::Operation::Fused(poem_ir::Fused::PoolCompress { state, .. })) =
+        fused.nodes.first().map(|node| &node.op)
+    else {
+        panic!("the op is the compressor");
+    };
+    assert!(state.is_some(), "the compressor holds its state write");
+}

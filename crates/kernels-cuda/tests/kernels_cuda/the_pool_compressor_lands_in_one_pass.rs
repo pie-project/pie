@@ -141,6 +141,7 @@ fn pass(one: bool, ratio: usize, d: usize, fp8: bool, window: Option<(u32, u32)>
         true,
         yarn,
         &out,
+        None,
     )
     .expect("the compressor fires");
     assert_eq!(landed, one, "the one pass lands where the profile says");
@@ -244,4 +245,144 @@ fn the_pool_compressor_lands_in_one_pass() {
     check(4, 512, true, None);
     check(128, 512, true, None);
     check(4, 512, false, Some((150, 40)));
+}
+
+/// A decode's fire, one row a request: the compressor's state written in the
+/// one pass lands the state slab and the entries pool the separate state
+/// write, then the pass, land.
+fn decode_pass(fused: bool, ratio: usize, d: usize) -> (Vec<u16>, Vec<u16>) {
+    let coff = if ratio == 4 { 2 } else { 1 };
+    let width = coff * d;
+    let requests = 8usize;
+    let per = 12usize;
+    let total = requests * per;
+    let cells = total * PAGE;
+    let pages: Vec<u32> = (0..total).map(|i| ((5 * i) % total) as u32).collect();
+    let indptr: Vec<u32> = (0..=requests).map(|r| (r * per) as u32).collect();
+    // Request r's new row at position p_r; every other request closes an
+    // entry with it.
+    let blocks = (per * PAGE / ratio).max(1);
+    let pos: Vec<usize> = (0..requests)
+        .map(|r| {
+            let close = ((r / 2) % blocks + 1) * ratio - 1;
+            if r % 2 == 0 { close } else { close - 1 }
+        })
+        .collect();
+    let bpos: Vec<i32> = pos
+        .iter()
+        .map(|&p| if (p + 1) % ratio == 0 { p as i32 } else { -1 })
+        .collect();
+    let breq: Vec<i32> = (0..requests as i32).collect();
+    let brope: Vec<i32> = pos
+        .iter()
+        .map(|&p| {
+            if (p + 1) % ratio == 0 {
+                (p + 1 - ratio) as i32
+            } else {
+                0
+            }
+        })
+        .collect();
+    let slot = |r: usize, p: usize| pages[r * per + p / PAGE] as usize * PAGE + p % PAGE;
+    let w_page: Vec<u32> = (0..requests)
+        .map(|r| (slot(r, pos[r]) / PAGE) as u32)
+        .collect();
+    let w_off: Vec<u32> = (0..requests)
+        .map(|r| (slot(r, pos[r]) % PAGE) as u32)
+        .collect();
+    let mut lcg = Lcg::seeded(0x57a7e + (ratio * d) as u64);
+    let (kv_bits, _) = lcg.row(cells * width);
+    let score_bits: Vec<u16> = (0..cells * width)
+        .map(|_| to_bf16(lcg.unit() * 4.0))
+        .collect();
+    let (new_kv, _) = lcg.row(requests * width);
+    let new_score: Vec<u16> = (0..requests * width)
+        .map(|_| to_bf16(lcg.unit() * 4.0))
+        .collect();
+    let ape: Vec<f32> = (0..ratio * width).map(|_| lcg.unit()).collect();
+    let w: Vec<u16> = (0..d).map(|_| to_bf16(0.5 + lcg.unit())).collect();
+    let mut gpu = Gpu::open();
+    let kv = gpu.up(&kv_bits);
+    let score = gpu.up(&score_bits);
+    let state = pool_of(&mut gpu, kv, &pages, &indptr, width as u32, Dtype::Bf16);
+    let out_at = gpu.zeros(cells * d * 2);
+    let out = pool_of(&mut gpu, out_at, &pages, &indptr, d as u32, Dtype::Bf16);
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        rows_vec: true,
+        ..Tuning::DEFAULT
+    });
+    let rows = requests as u32;
+    let t32 = |gpu: &mut Gpu, v: &[i32]| Tensor::new(gpu.up(v), rows, 1, Dtype::I32);
+    let bpos_t = t32(&mut gpu, &bpos);
+    let breq_t = t32(&mut gpu, &breq);
+    let brope_t = t32(&mut gpu, &brope);
+    let wp = Tensor::new(gpu.up(&w_page), rows, 1, Dtype::U32);
+    let wo = Tensor::new(gpu.up(&w_off), rows, 1, Dtype::U32);
+    let new_kv_t = Tensor::new(gpu.up(&new_kv), rows, width as u32, Dtype::Bf16);
+    let new_score_t = Tensor::new(gpu.up(&new_score), rows, width as u32, Dtype::Bf16);
+    let ape_t = Tensor::new(gpu.up(&ape), ratio as u32, width as u32, Dtype::F32);
+    let w_t = Tensor::new(gpu.up(&w), d as u32, 1, Dtype::Bf16);
+    let state_kv = Tensor::new(kv, cells as u32, width as u32, Dtype::Bf16);
+    let state_score = Tensor::new(score, cells as u32, width as u32, Dtype::Bf16);
+    if !fused {
+        pool::state_write(
+            &ctx,
+            new_kv_t,
+            new_score_t,
+            &state,
+            wp,
+            wo,
+            d as u32,
+            ratio as u32,
+            state_kv,
+            state_score,
+        )
+        .expect("the state write fires");
+    }
+    let landed = pool::compress(
+        &ctx,
+        bpos_t,
+        breq_t,
+        &state,
+        d as u32,
+        ratio as u32,
+        state_kv,
+        state_score,
+        ape_t,
+        w_t,
+        1e-6,
+        brope_t,
+        64,
+        10000.0,
+        true,
+        None,
+        &out,
+        fused.then_some(pool::StateRows {
+            kv: new_kv_t,
+            score: new_score_t,
+            write_page: wp,
+            write_offset: wo,
+        }),
+    )
+    .expect("the compressor fires");
+    assert!(landed, "the one pass lands");
+    gpu.sync();
+    (gpu.down(kv, cells * width), gpu.down(out_at, cells * d))
+}
+
+#[test]
+fn a_decodes_compressor_state_lands_in_the_one_pass() {
+    for (ratio, d) in [(4, 512), (128, 512), (4, 128)] {
+        let two = decode_pass(false, ratio, d);
+        let one = decode_pass(true, ratio, d);
+        assert!(
+            one.0 == two.0,
+            "ratio {ratio} d {d}: the state slabs differ"
+        );
+        assert!(one.1 == two.1, "ratio {ratio} d {d}: the entries differ");
+        assert!(
+            one.1.iter().any(|&b| b != 0),
+            "ratio {ratio} d {d}: entries are written"
+        );
+    }
 }

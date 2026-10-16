@@ -131,7 +131,9 @@ pub enum Fused {
     /// (`PoolGather`), their RMS norm times `weight` into `latent`, its tail
     /// rotated (`rotate`, a `RopePartialLast` over `latent`) and written to
     /// the pool (`append`, a `PoolKvAppend` of the rotation's output). The
-    /// gathered and normed rows are read by nothing else.
+    /// gathered and normed rows are read by nothing else. `state`, where
+    /// the fire's compressor state is written just before (a
+    /// `PoolStateWrite` into the gather's pages), lands it too.
     PoolCompress {
         gather: Box<Attention>,
         weight: ValueId,
@@ -139,6 +141,7 @@ pub enum Fused {
         latent: ValueId,
         rotate: Box<Elementwise>,
         append: Box<Attention>,
+        state: Option<Box<Attention>>,
     },
     NormModulate {
         x: ValueId,
@@ -484,6 +487,7 @@ impl Operands for Fused {
                 weight,
                 rotate,
                 append,
+                state,
                 ..
             } => {
                 if let Attention::PoolGather {
@@ -510,6 +514,17 @@ impl Operands for Fused {
                 }
                 if let Attention::PoolGather { ape: Some(ape), .. } = **gather {
                     sink.push(ape);
+                }
+                if let Some(state) = state
+                    && let Attention::PoolStateWrite {
+                        kv,
+                        score,
+                        write_page,
+                        write_offset,
+                        ..
+                    } = **state
+                {
+                    sink.extend([kv, score, write_page, write_offset]);
                 }
             }
             Self::NormModulate {

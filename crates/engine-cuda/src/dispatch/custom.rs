@@ -955,10 +955,41 @@ impl Run<'_> {
             latent,
             rotate,
             append,
+            state: state_op,
         } = op
         else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
+        // The state written in the same launch where every request holds
+        // one row of this fire (its boundary gathers only its own row of
+        // it); else written first, as the trace had it.
+        let one_a_request = {
+            let window = self.window();
+            !window.indptr_host.is_empty()
+                && window
+                    .indptr_host
+                    .windows(2)
+                    .all(|lane| lane[1] - lane[0] <= 1)
+        };
+        let state_rows = match state_op.as_deref() {
+            Some(poem_ir::Attention::PoolStateWrite {
+                kv,
+                score,
+                write_page,
+                write_offset,
+                ..
+            }) if one_a_request => Some(kernels_cuda::attn::pool::StateRows {
+                kv: self.tensor(*kv),
+                score: self.tensor(*score),
+                write_page: self.tensor(*write_page),
+                write_offset: self.tensor(*write_offset),
+            }),
+            _ => None,
+        };
+        let state_rides = state_rows.is_some();
+        if !state_rides && let Some(state) = state_op {
+            self.attention(state)?;
+        }
         let (
             poem_ir::Attention::PoolGather {
                 boundary_pos,
@@ -1011,9 +1042,13 @@ impl Run<'_> {
             *interleaved && !*inverse,
             yarn,
             &out,
+            state_rows,
         )?;
         if landed {
             return Ok(());
+        }
+        if state_rides && let Some(state) = state_op {
+            self.attention(state)?;
         }
         self.attention(gather)?;
         rope::norm_rope_last(

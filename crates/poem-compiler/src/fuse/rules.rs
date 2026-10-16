@@ -1487,13 +1487,25 @@ fn norm_rope_pair() -> Rule {
 /// their tail rotated at the boundaries' rope positions, and written to the
 /// pool, the entries and the normed rows read by nothing else.
 fn pool_compress() -> Rule {
-    let chain = |biased: bool| {
+    let chain = |biased: bool, stated: bool| {
         template(move |p| {
             p.free("interleaved");
             p.free("inverse");
             p.free("yarn");
             let (bpos, breq) = (p.indices("bpos"), p.indices("breq"));
             let pages = p.cache("pages");
+            if stated {
+                // The fire's compressor state written just before the gather.
+                attn::pool_state_write(
+                    &p.rows("s_kv", W),
+                    &p.rows("s_score", W),
+                    pages,
+                    &p.rows("s_page", 1),
+                    &p.rows("s_off", 1),
+                    p.u32("head_dim"),
+                    p.u32("ratio"),
+                );
+            }
             let ape = biased.then(|| p.weight("ape", [W, W]));
             let gathered = attn::pool_gather(
                 &bpos,
@@ -1526,7 +1538,12 @@ fn pool_compress() -> Rule {
     };
     Rule::new(
         "attention.pool_compress",
-        [chain(true), chain(false)],
+        [
+            chain(true, true),
+            chain(false, true),
+            chain(true, false),
+            chain(false, false),
+        ],
         |m| {
             let Operation::Attention(gather) = m.op("gathered") else {
                 unreachable!("the entries come from the gather")
@@ -1545,6 +1562,20 @@ fn pool_compress() -> Rule {
                         _ => None,
                     })
                     .expect("the rotated rows are appended");
+            let state = m.get("s_kv").map(|kv| {
+                let op = m
+                    .trace
+                    .nodes
+                    .iter()
+                    .find_map(|node| match &node.op {
+                        Operation::Attention(
+                            a @ poem_ir::Attention::PoolStateWrite { kv: at, .. },
+                        ) if *at == kv => Some(a.clone()),
+                        _ => None,
+                    })
+                    .expect("the state is written");
+                Box::new(op)
+            });
             Fused::PoolCompress {
                 gather: Box::new(gather.clone()),
                 weight: m.value("weight"),
@@ -1552,6 +1583,7 @@ fn pool_compress() -> Rule {
                 latent: m.value("latent"),
                 rotate: Box::new(rotate.clone()),
                 append: Box::new(append),
+                state,
             }
         },
     )
