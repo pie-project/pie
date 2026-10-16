@@ -489,3 +489,34 @@ fn a_projection_cut_into_two_halves_lands_as_one_fused_op() {
         ]
     );
 }
+
+#[test]
+fn every_rule_states_its_pattern_with_widths_it_can_hold() {
+    // The patterns are recorded on first use; a split past its row (the
+    // matmul-split rule's sentinel width once overflowed in debug builds and
+    // wrapped in release) refuses here.
+    assert!(poem_compiler::fuse::kernels().count() > 0);
+}
+
+#[test]
+fn a_matmul_and_the_split_of_its_row_fold_into_one_op() {
+    let fused = fuse(
+        trace(|p| {
+            let y = linear::matmul(&p.rows("act", 64), &p.weight("w", [96, 64]));
+            let (left, right) = layout::split_rows(&y, 32);
+            elemwise::silu(&left);
+            elemwise::silu(&right);
+        }),
+        &["linear.matmul_split_rows"],
+    );
+    assert_eq!(
+        ops(&fused),
+        ["linear.matmul_split_rows", "elementwise.silu", "elementwise.silu"]
+    );
+}
+
+#[test]
+#[should_panic(expected = "the split is past the row")]
+fn a_split_past_its_row_is_refused() {
+    trace(|p| drop(layout::split_rows(&p.rows("x", 64), 96)));
+}

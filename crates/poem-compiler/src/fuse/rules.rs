@@ -704,7 +704,10 @@ fn matmul_bias() -> Rule {
 /// the `recurrent` marker the cut's caller sets on the packed rows.
 fn matmul_split_rows() -> Rule {
     let pattern = template(|p| {
-        let y = linear::matmul(&p.rows("act", W), &p.weight("w", [W, W]));
+        // The product's row as wide as `ssm_gdn_step`'s `qkvz`: the split
+        // width is a pattern sentinel past any small width, and the rest of
+        // the row is what remains of it.
+        let y = linear::matmul(&p.rows("act", W), &p.weight("w", [1 << 40, W]));
         p.name("y", &y);
         let (left, right) = layout::split_rows(&y, p.u32("width"));
         p.export("left", &left);

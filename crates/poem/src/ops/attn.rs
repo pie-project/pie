@@ -837,14 +837,20 @@ pub fn mla_plan(inputs: &Input, heads: u32, kv_lora_rank: u32) -> Value {
     plan
 }
 
+/// The rope part of a `kv_a` row past its `kv_lora_rank` latent.
+fn rope_width(kv_a: &Value, kv_lora_rank: u32) -> u64 {
+    kv_a.width().checked_sub(u64::from(kv_lora_rank)).unwrap_or_else(|| {
+        panic!(
+            "a {}-wide kv_a row holds no {kv_lora_rank}-wide latent",
+            kv_a.width()
+        )
+    })
+}
+
 pub fn mla_latents(kv_a: &Value, norm: &Weight, eps: f32, kv_lora_rank: u32) -> (Value, Value) {
     let r = kv_a.rec();
     let kv_c = r.fresh(tensor(kv_a.rows(), kv_lora_rank, kv_a.dtype()));
-    let k_pe = r.fresh(tensor(
-        kv_a.rows(),
-        kv_a.width() - u64::from(kv_lora_rank),
-        kv_a.dtype(),
-    ));
+    let k_pe = r.fresh(tensor(kv_a.rows(), rope_width(kv_a, kv_lora_rank), kv_a.dtype()));
     r.push(
         Attention::MlaLatents {
             kv_a: kv_a.id(),
@@ -870,11 +876,7 @@ pub fn mla_latents_rope(
 ) -> (Value, Value) {
     let r = kv_a.rec();
     let kv_c = r.fresh(tensor(kv_a.rows(), kv_lora_rank, kv_a.dtype()));
-    let k_pe = r.fresh(tensor(
-        kv_a.rows(),
-        kv_a.width() - u64::from(kv_lora_rank),
-        kv_a.dtype(),
-    ));
+    let k_pe = r.fresh(tensor(kv_a.rows(), rope_width(kv_a, kv_lora_rank), kv_a.dtype()));
     r.push(
         Attention::MlaLatentsRope {
             kv_a: kv_a.id(),

@@ -89,8 +89,14 @@ pub fn split_q_gate(packed: &Value, head_dim: u32) -> (Value, Value) {
 
 pub fn split_rows(x: &Value, width: u32) -> (Value, Value) {
     let r = x.rec();
+    let rest = x.width().checked_sub(u64::from(width)).unwrap_or_else(|| {
+        panic!(
+            "split_rows at {width} of a {}-wide row: the split is past the row",
+            x.width()
+        )
+    });
     let left = r.fresh(tensor(x.rows(), width, x.dtype()));
-    let right = r.fresh(tensor(x.rows(), x.width() - u64::from(width), x.dtype()));
+    let right = r.fresh(tensor(x.rows(), rest, x.dtype()));
     r.push(
         Layout::SplitRows {
             x: x.id(),
