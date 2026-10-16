@@ -196,11 +196,22 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
         w.sel = p.selection + static_cast<long long>(w.row) * p.top_k;
         // The selection may hold -1 anywhere (a pooled index's dropped
         // blocks): the stream runs to its last id, a -1 before it masked.
+        // Found from the end, 512 ids a round with their loads all in flight
+        // (a full selection's last id is in the first round).
         w.entries = 0;
-        for (int n0 = 0; n0 < p.top_k; n0 += 32) {
-            const int n = n0 + static_cast<int>(lane);
-            const unsigned held = __ballot_sync(0xffffffffu, n < p.top_k && w.sel[n] >= 0);
-            if (held != 0u) w.entries = n0 + 32 - __clz(held);
+        for (int end = p.top_k; end > 0 && w.entries == 0; end -= 16 * 32) {
+            const int n0 = end - 16 * 32;
+            int v[16];
+#pragma unroll
+            for (int u = 0; u < 16; ++u) {
+                const int n = n0 + u * 32 + static_cast<int>(lane);
+                v[u] = n >= 0 ? __ldg(w.sel + n) : -1;
+            }
+#pragma unroll
+            for (int u = 15; u >= 0; --u) {
+                const unsigned held = __ballot_sync(0xffffffffu, v[u] >= 0);
+                if (held != 0u && w.entries == 0) w.entries = n0 + u * 32 + 32 - __clz(held);
+            }
         }
         // A row always walks one tile: its O and its log-sum-exp land. A
         // split walks its share of the row's tiles, one past the row's keys
