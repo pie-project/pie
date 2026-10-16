@@ -101,7 +101,7 @@ fn check(case: Case) {
         // the slabs in place of the finalize: the same bits, eagerly and
         // from a graph, behind a launch at half the scale.
         let tickets = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
-            gemm_tc5_split_tickets: true,
+            gemm_tc5_split_tickets: 65_536,
             ..ctx.tuning()
         });
         let fire = |alpha: f32| {

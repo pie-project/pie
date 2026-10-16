@@ -1584,29 +1584,67 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         __threadfence();
                         const int lim = min(x.lim_q, static_cast<int>(kBN));
                         const size_t slab = static_cast<size_t>(epi.slab);
+                        // Four of the thread's values at a time, each split's
+                        // four loaded before any is added (the adds stay in
+                        // split order): loads in flight, not one at a time.
                         if constexpr (kSwap) {
-                            for (int j = 0; j < lim; ++j) {
-                                const size_t at = static_cast<size_t>(x.out_q + j) * ldy + p;
-                                float v = __ldcg(part + at);
-                                for (int sp = 1; sp < splits; ++sp) {
-                                    v += __ldcg(part + static_cast<size_t>(sp) * slab + at);
+                            for (int j0 = 0; j0 < lim; j0 += 4) {
+                                size_t at[4];
+                                float v[4];
+#pragma unroll
+                                for (int u = 0; u < 4; ++u) {
+                                    const int j = min(j0 + u, lim - 1);
+                                    at[u] = static_cast<size_t>(x.out_q + j) * ldy + p;
+                                    v[u] = __ldcg(part + at[u]);
                                 }
-                                y[at] = f32_to_bf16(v);
+#pragma unroll 4
+                                for (int sp = 1; sp < splits; ++sp) {
+                                    float w[4];
+#pragma unroll
+                                    for (int u = 0; u < 4; ++u) {
+                                        w[u] = __ldcg(part + static_cast<size_t>(sp) * slab + at[u]);
+                                    }
+#pragma unroll
+                                    for (int u = 0; u < 4; ++u) v[u] += w[u];
+                                }
+#pragma unroll
+                                for (int u = 0; u < 4; ++u) {
+                                    if (j0 + u < lim) y[at[u]] = f32_to_bf16(v[u]);
+                                }
                             }
                         } else {
-                            for (int j = 0; j < lim; j += 4) {
-                                const size_t at = static_cast<size_t>(p) * ldy + x.out_q + j;
-                                float4 v = __ldcg(reinterpret_cast<const float4*>(part + at));
-                                for (int sp = 1; sp < splits; ++sp) {
-                                    const float4 w = __ldcg(reinterpret_cast<const float4*>(
-                                        part + static_cast<size_t>(sp) * slab + at));
-                                    v.x += w.x;
-                                    v.y += w.y;
-                                    v.z += w.z;
-                                    v.w += w.w;
+                            for (int j0 = 0; j0 < lim; j0 += 8) {
+                                size_t at[2];
+                                float4 v[2];
+#pragma unroll
+                                for (int u = 0; u < 2; ++u) {
+                                    const int j = min(j0 + 4 * u, (lim - 1) / 4 * 4);
+                                    at[u] = static_cast<size_t>(p) * ldy + x.out_q + j;
+                                    v[u] = __ldcg(reinterpret_cast<const float4*>(part + at[u]));
                                 }
-                                *reinterpret_cast<uint2*>(y + at) =
-                                    make_uint2(pack_bf16x2(v.x, v.y), pack_bf16x2(v.z, v.w));
+#pragma unroll 4
+                                for (int sp = 1; sp < splits; ++sp) {
+                                    float4 w[2];
+#pragma unroll
+                                    for (int u = 0; u < 2; ++u) {
+                                        w[u] = __ldcg(reinterpret_cast<const float4*>(
+                                            part + static_cast<size_t>(sp) * slab + at[u]));
+                                    }
+#pragma unroll
+                                    for (int u = 0; u < 2; ++u) {
+                                        v[u].x += w[u].x;
+                                        v[u].y += w[u].y;
+                                        v[u].z += w[u].z;
+                                        v[u].w += w[u].w;
+                                    }
+                                }
+#pragma unroll
+                                for (int u = 0; u < 2; ++u) {
+                                    if (j0 + 4 * u < lim) {
+                                        *reinterpret_cast<uint2*>(y + at[u]) = make_uint2(
+                                            pack_bf16x2(v[u].x, v[u].y), pack_bf16x2(v[u].z, v[u].w));
+                                    }
+                                }
                             }
                         }
                     }

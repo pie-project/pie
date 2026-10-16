@@ -69,12 +69,21 @@ pub struct MoeNvfp4MmaUntil(pub u32);
 #[decision(id = "kernel.moe.nvfp4_mma_from", constant(range(1..=65_536)), default = 1, tune = search)]
 pub struct MoeNvfp4MmaFrom(pub u32);
 
-/// A tcgen05 GEMM split along K sums its splits itself: the last of a
-/// tile's splits to land (a per-tile count) adds every split's slab in split
-/// order and rounds y, the same bits as the finalize launch it replaces.
+/// The most output rows (a launch's tokens) a split tcgen05 GEMM sums in the
+/// tile's last split to land (a per-tile count, the same bits as the
+/// finalize launch it replaces); wider launches keep the finalize, whose
+/// many blocks share the sum one split's CTA would walk alone. 0 never.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gemm.tc5_split_tickets", flag, default = false, tune = search)]
-pub struct GemmTc5SplitTickets;
+#[decision(id = "kernel.gemm.tc5_split_tickets", constant(range(0..=65536)), default = 0, tune = search)]
+pub struct GemmTc5SplitTickets(pub u32);
+
+/// The most rows (2..=8) a dense bf16 product may time the few-rows kernel
+/// for, one launch streaming the weight's rows, beside cuBLAS's algorithms
+/// (a decode's narrow projections run split along K in two launches there).
+/// 0 never tries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.rows_m", constant(range(0..=8)), default = 0, tune = search)]
+pub struct GemmRowsM(pub u32);
 
 /// Programmatic dependent launch: a kernel that opts in (it waits on its
 /// predecessor in-kernel before reading what that one wrote) launches while
@@ -554,6 +563,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmSplitLaunchNs>()
         .add::<GemmTc5Raster>()
         .add::<KernelPdl>()
+        .add::<GemmRowsM>()
         .add::<GemmTc5SplitTickets>()
         .add::<MoeNvfp4MmaUntil>()
         .add::<MoeNvfp4MmaFrom>()
@@ -633,7 +643,8 @@ pub struct Tuning {
     pub gemm_split_launch_ns: u32,
     pub gemm_tc5_raster: u32,
     pub pdl: bool,
-    pub gemm_tc5_split_tickets: bool,
+    pub gemm_rows_m: u32,
+    pub gemm_tc5_split_tickets: u32,
     pub nvfp4_mma_from: u32,
     pub nvfp4_mma_until: u32,
     pub moe_topk_warp: bool,
@@ -710,7 +721,8 @@ impl Tuning {
         gemm_split_launch_ns: 0,
         gemm_tc5_raster: 8,
         pdl: false,
-        gemm_tc5_split_tickets: false,
+        gemm_rows_m: 0,
+        gemm_tc5_split_tickets: 0,
         nvfp4_mma_from: 1,
         nvfp4_mma_until: 0,
         moe_topk_warp: false,
@@ -787,7 +799,8 @@ impl Tuning {
             gemm_split_launch_ns: profile.get::<GemmSplitLaunchNs>().0,
             gemm_tc5_raster: profile.get::<GemmTc5Raster>().0,
             pdl: profile.on::<KernelPdl>(&Anywhere),
-            gemm_tc5_split_tickets: profile.on::<GemmTc5SplitTickets>(&Anywhere),
+            gemm_rows_m: profile.get::<GemmRowsM>().0,
+            gemm_tc5_split_tickets: profile.get::<GemmTc5SplitTickets>().0,
             nvfp4_mma_from: profile.get::<MoeNvfp4MmaFrom>().0,
             nvfp4_mma_until: profile.get::<MoeNvfp4MmaUntil>().0,
             moe_topk_warp: profile.on::<MoeTopkWarp>(&Anywhere),

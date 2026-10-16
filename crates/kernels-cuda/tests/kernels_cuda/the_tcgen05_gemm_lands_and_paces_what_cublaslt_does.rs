@@ -359,7 +359,16 @@ fn the_tcgen05_gemm_reports_its_rate_beside_cublaslt() {
         return;
     }
     let mut gpu = Gpu::open();
-    let ctx = gpu.ctx();
+    // `PIE_TC5_TICKETS=1` sums a split tile in its last split
+    // (`kernel.gemm.tc5_split_tickets`), no finalize launch.
+    let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+        gemm_tc5_split_tickets: if std::env::var("PIE_TC5_TICKETS").is_ok_and(|v| v == "1") {
+            65_536
+        } else {
+            0
+        },
+        ..kernels_cuda::tuning::Tuning::DEFAULT
+    });
     let stream: rt::cudaStream_t = ctx.stream().cast();
     let timer = Timer {
         flush: gpu.zeros(FLUSH),

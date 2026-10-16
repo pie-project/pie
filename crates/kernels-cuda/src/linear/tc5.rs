@@ -1237,7 +1237,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     // Under `kernel.gemm.tc5_split_tickets` a tile's last split sums it, a
     // count a CTA of each tile (a contiguous group's tiles bounded by its
     // experts' ragged ends), left at zero by the kernel.
-    let tickets = if splits > 1 && ctx.tuning().gemm_tc5_split_tickets {
+    let tickets = if splits > 1 && job.y_rows <= ctx.tuning().gemm_tc5_split_tickets {
         let count =
             ctas as usize * (job.tiles as usize + group.experts as usize * n.div_ceil(32) as usize);
         ctx.scratch_stream_zeroed(OP, SPLIT_TICKETS, count * 4)? as u64

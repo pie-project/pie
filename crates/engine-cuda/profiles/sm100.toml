@@ -201,6 +201,15 @@ gemm.split_launch_ns = 2000
 # DeepSeek-V4-Flash's fp8 prefill 10.37k / 10.57k -> 10.57k / 10.58k tok/s.
 gemm.tc5_raster = 16
 
+# A tcgen05 split-K GEMM of 8 rows or fewer sums its splits in the tile's
+# last split to land, not a finalize launch (the same bits); and the GEMM
+# and its finalize launch as programmatic dependents of the kernel before.
+# DeepSeek-V4-Flash TPOT, both against neither's tickets (PDL on in both):
+# bs1 11.97 -> 11.27 ms, bs8 15.51 -> 14.77, bs64 68.2 -> 65.9; PDL alone
+# 12.17 -> 11.98, 15.65 -> 15.23, 69.8 -> 67.7.
+gemm.tc5_split_tickets = 8
+pdl = true
+
 [compiler]
 # A join's independent chains forked onto side streams (the shared and routed
 # experts a MoE sums, an attention's query chain beside its key/value or index

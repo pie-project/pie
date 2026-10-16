@@ -120,7 +120,11 @@ fn contiguous(a: Spec, w: Spec, experts: usize, [n, k]: [usize; 2], plan: Option
     let shape = [n as u32, k as u32];
     let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
         gemm_nvfp4_k128: K128.load(std::sync::atomic::Ordering::Relaxed),
-        gemm_tc5_split_tickets: TICKETS.load(std::sync::atomic::Ordering::Relaxed),
+        gemm_tc5_split_tickets: if TICKETS.load(std::sync::atomic::Ordering::Relaxed) {
+            65_536
+        } else {
+            0
+        },
         ..kernels_cuda::tuning::Tuning::DEFAULT
     });
     match plan {
@@ -189,7 +193,11 @@ fn masked(a: Spec, w: Spec, experts: usize, m_max: usize, [n, k]: [usize; 2], sp
         )
     };
     let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
-        gemm_tc5_split_tickets: TICKETS.load(std::sync::atomic::Ordering::Relaxed),
+        gemm_tc5_split_tickets: if TICKETS.load(std::sync::atomic::Ordering::Relaxed) {
+            65_536
+        } else {
+            0
+        },
         ..kernels_cuda::tuning::Tuning::DEFAULT
     });
     grouped_gemm_with(&ctx, a_op, w_op, y, g, [n as u32, k as u32], 1.25, plan)
