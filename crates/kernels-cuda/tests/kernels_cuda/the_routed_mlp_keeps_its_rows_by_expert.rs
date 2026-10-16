@@ -482,6 +482,22 @@ fn check_w4a8(
     gated: bool,
     glu: Glu,
 ) {
+    check_w4a8_on(tokens, hidden, inter, n_experts, top, gated, glu, false);
+}
+
+/// [`check_w4a8`], the four apart under the registry's defaults where
+/// `pinned` (another chip's), else under B200's.
+#[allow(clippy::too_many_arguments)]
+fn check_w4a8_on(
+    tokens: usize,
+    hidden: usize,
+    inter: usize,
+    n_experts: usize,
+    top: usize,
+    gated: bool,
+    glu: Glu,
+    pinned: bool,
+) {
     let mut gpu = Gpu::open();
     let mut lcg = Lcg::seeded(0x4a8 ^ tokens as u64);
     let routes = routes_of(tokens, n_experts, top);
@@ -534,7 +550,12 @@ fn check_w4a8(
             .expect("the select fires");
             y
         };
-    let packed = select_apart(&ctx, &mut gpu, x, up, 2 * inter);
+    let actx = if pinned {
+        gpu.ctx()
+    } else {
+        gpu.ctx().with_tuning(crate::common::SM100)
+    };
+    let packed = select_apart(&actx, &mut gpu, x, up, 2 * inter);
     let mut h = Tensor::new(
         gpu.zeros(count * inter * 2),
         count as u32,
@@ -542,9 +563,9 @@ fn check_w4a8(
         Dtype::Bf16,
     );
     match glu {
-        Glu::SwigluClamp { limit } => swiglu_clamp(&ctx, packed, inter as u32, 1, limit, &mut h),
+        Glu::SwigluClamp { limit } => swiglu_clamp(&actx, packed, inter as u32, 1, limit, &mut h),
         Glu::Situ { beta, cap } => situ(
-            &ctx,
+            &actx,
             packed,
             inter as u32,
             1,
@@ -552,10 +573,10 @@ fn check_w4a8(
             (cap > 0.0).then_some(cap),
             &mut h,
         ),
-        _ => swiglu(&ctx, packed, inter as u32, 1, &mut h),
+        _ => swiglu(&actx, packed, inter as u32, 1, &mut h),
     }
     .expect("the GLU fires");
-    let r = select_apart(&ctx, &mut gpu, h, down, hidden);
+    let r = select_apart(&actx, &mut gpu, h, down, hidden);
     let mut apart = Tensor::new(
         gpu.zeros(tokens * hidden * 2),
         tokens as u32,
@@ -863,6 +884,20 @@ fn the_routed_mlp_keeps_its_rows_by_expert_every_case() {
     // GLM-5.3-Flash's clamped SwiGLU, as the epilogue lands it.
     for gated in [false, true] {
         check_w4a8(300, 256, 128, 16, 4, gated, Glu::SwigluClamp { limit: 7.0 });
+    }
+    // GLM-5.3-Flash mini's 17-token prompt fire at its own geometry, the
+    // four apart under B200's decisions and the registry's.
+    for pinned in [false, true] {
+        check_w4a8_on(
+            17,
+            4096,
+            2048,
+            32,
+            8,
+            false,
+            Glu::SwigluClamp { limit: 10.0 },
+            pinned,
+        );
     }
     // Kimi-K3's SiTU (its gate's beta 4, its up capped at 25), and the
     // uncapped form.
