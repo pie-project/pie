@@ -59,6 +59,13 @@ struct Params {
     int qpe_stride;
     int o_stride;
     float scale_log2;
+    // Split-K: each row's tiles dealt over `splits` units, each unit's
+    // normalized output (f32) and base-2 log-sum-exp a head into `part_o` /
+    // `part_lse` at (row * splits + split), folded by `mla_sparse_fold`.
+    // `splits` 1 writes the row's output straight.
+    float* part_o;
+    float* part_lse;
+    int splits;
 };
 
 constexpr int kD = 512;
@@ -100,7 +107,10 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
     using namespace tc5;
     using L = Layout<kRope>;
     static_assert(kRope == 0 || kRope == 64, "the rotated part is 64 wide or absent");
-    const int live = p.live != nullptr ? static_cast<int>(p.live[0]) : p.rows;
+    const int live_rows = p.live != nullptr ? static_cast<int>(p.live[0]) : p.rows;
+    const int splits = p.splits > 0 ? p.splits : 1;
+    // The units the block walks: a row a split.
+    const int live = live_rows * splits;
     const int base = p.live != nullptr ? static_cast<int>(p.live[1]) : 0;
     const int requests =
         p.live != nullptr ? min(p.requests, static_cast<int>(p.live[2])) : p.requests;
@@ -159,12 +169,14 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
     // position in that request's keys, the keys it may see, and its selected
     // ids up to the first negative one.
     struct Row {
-        int row, pos, last, entries, nt;
+        int row, pos, last, entries, nt, j0, split;
         const int* sel;
         const u32* pages;
     };
-    auto row_at = [&](int r) {
+    auto row_at = [&](int u) {
         Row w;
+        const int r = u / splits;
+        w.split = u % splits;
         w.row = base + r;
         int lo = 0, hi = requests - 1;
         while (lo < hi) {
@@ -190,8 +202,17 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
             const unsigned held = __ballot_sync(0xffffffffu, n < p.top_k && w.sel[n] >= 0);
             if (held != 0u) w.entries = n0 + 32 - __clz(held);
         }
-        // A row always walks one tile: its O and its log-sum-exp land.
-        w.nt = max((w.entries + kBK - 1) / kBK, 1);
+        // A row always walks one tile: its O and its log-sum-exp land. A
+        // split walks its share of the row's tiles, one past the row's keys
+        // (every key masked) where the row has fewer tiles than splits.
+        const int tiles = max((w.entries + kBK - 1) / kBK, 1);
+        const int share = (tiles + splits - 1) / splits;
+        w.j0 = w.split * share;
+        w.nt = min(tiles, w.j0 + share) - w.j0;
+        if (w.nt <= 0) {
+            w.j0 = tiles;
+            w.nt = 1;
+        }
         return w;
     };
 
@@ -203,7 +224,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
                 if (J >= kLists) bar_wait(&list_free[J % kLists], ((J / kLists) - 1) & 1);
                 u32* l = lists + (J % kLists) * kBK;
                 for (int c = static_cast<int>(lane); c < kBK; c += 32) {
-                    const int k = j * kBK + c;
+                    const int k = (w.j0 + j) * kBK + c;
                     u32 e = kSlotMask;
                     if (k < w.entries) {
                         const int id = w.sel[k];
@@ -476,7 +497,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
                 tc_fence_before();
                 bar_arrive(&p_full[sb]);
             }
-            if (r + static_cast<int>(gridDim.x) < live) load_q(base + r + static_cast<int>(gridDim.x));
+            if (r + static_cast<int>(gridDim.x) < live) load_q(base + (r + static_cast<int>(gridDim.x)) / splits);
             bar_wait(&pv_done[(J - 1) & 1], ((J - 1) >> 1) & 1);
             tc_fence_after();
             pair_sync(warp);
@@ -484,6 +505,30 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
             pair_sync(warp);
             const float l_all = l + row_max[t ^ 64];
             const float scale = l_all > 0.f ? 1.f / l_all : 0.f;
+            if (splits > 1) {
+                const long long unit = static_cast<long long>(row) * splits + w.split;
+                if (half == 0) {
+                    p.part_lse[unit * 64 + head] = l_all > 0.f ? m_used + __log2f(l_all) : neg_inf();
+                }
+                float* dst = p.part_o + (unit * 64 + head) * kD;
+#pragma unroll 1
+                for (u32 c = 0; c < 256; c += 32) {
+                    u32 v[32];
+                    tmem_ld32(tmem + lane_base + kColO + c, v);
+                    tmem_wait_ld();
+                    const int d0 = static_cast<int>(c / 128) * 256 + half * 128 + static_cast<int>(c % 128);
+                    float4* o4 = reinterpret_cast<float4*>(dst + d0);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        o4[i] = make_float4(__uint_as_float(v[4 * i]) * scale, __uint_as_float(v[4 * i + 1]) * scale,
+                                            __uint_as_float(v[4 * i + 2]) * scale,
+                                            __uint_as_float(v[4 * i + 3]) * scale);
+                    }
+                }
+                tc_fence_before();
+                bar_arrive(o_free);
+                continue;
+            }
             if (p.lse != nullptr && half == 0) {
                 p.lse[static_cast<long long>(row) * 64 + head] =
                     l_all > 0.f ? m_used + __log2f(l_all) : neg_inf();
@@ -516,6 +561,47 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
     if (warp == 5) {
         tc_fence_after();
         tmem_dealloc(tmem, kCols);
+    }
+}
+
+// The split units of each row folded: a block a (row, head), the units'
+// outputs weighted by 2^(lse - max) over their sum, the row's output (bf16)
+// and its base-2 log-sum-exp (where asked) landed.
+__global__ __launch_bounds__(128) void mla_sparse_fold(
+    const float* __restrict__ part_o, const float* __restrict__ part_lse, u16* __restrict__ o,
+    float* __restrict__ lse, int splits, int o_stride, const u32* __restrict__ live) {
+    const int rb = static_cast<int>(blockIdx.x);
+    if (live != nullptr && rb >= static_cast<int>(live[0])) return;
+    const int row = live != nullptr ? rb + static_cast<int>(live[1]) : rb;
+    const int head = static_cast<int>(blockIdx.y);
+    const float* l = part_lse + static_cast<long long>(row) * splits * 64 + head;
+    float top = neg_inf();
+    for (int s = 0; s < splits; ++s) top = fmaxf(top, l[s * 64]);
+    float sum = 0.f;
+    for (int s = 0; s < splits; ++s) {
+        if (l[s * 64] > neg_inf()) sum += ex2(l[s * 64] - top);
+    }
+    u16* dst = o + static_cast<long long>(row) * o_stride + head * kD;
+    for (int d = static_cast<int>(threadIdx.x) * 4; d < kD; d += 128 * 4) {
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+        for (int s = 0; s < splits; ++s) {
+            const float ls = l[s * 64];
+            if (!(ls > neg_inf())) continue;
+            const float wgt = ex2(ls - top) / sum;
+            const float4 v = *reinterpret_cast<const float4*>(
+                part_o + ((static_cast<long long>(row) * splits + s) * 64 + head) * kD + d);
+            acc.x = fmaf(wgt, v.x, acc.x);
+            acc.y = fmaf(wgt, v.y, acc.y);
+            acc.z = fmaf(wgt, v.z, acc.z);
+            acc.w = fmaf(wgt, v.w, acc.w);
+        }
+        uint2 packed;
+        packed.x = pack_bf16(acc.x, acc.y);
+        packed.y = pack_bf16(acc.z, acc.w);
+        *reinterpret_cast<uint2*>(dst + d) = packed;
+    }
+    if (lse != nullptr && threadIdx.x == 0) {
+        lse[static_cast<long long>(row) * 64 + head] = sum > 0.f ? top + __log2f(sum) : neg_inf();
     }
 }
 

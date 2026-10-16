@@ -612,7 +612,7 @@ mod sparse {
     use cudarc::driver::sys as dr;
 
     use super::{Ctx, Error, KvPool, Tensor};
-    use crate::jit::{ArgValue, Fire, Launch, aligned16, symbol};
+    use crate::jit::{Arg, ArgValue, Fire, Launch, aligned16, symbol};
     use crate::linear::tc5::{Map, encode, supported};
     use dtype::Dtype;
 
@@ -641,6 +641,9 @@ mod sparse {
         qpe_stride: i32,
         o_stride: i32,
         scale_log2: f32,
+        part_o: u64,
+        part_lse: u64,
+        splits: i32,
     }
 
     /// `pie::attn::mlas::Layout<kRope>::kSmem`: two slots of 64 keys' latent
@@ -735,6 +738,25 @@ mod sparse {
             ArgValue::Ptr(at) => at,
             _ => 0,
         };
+        // Few rows (a decode) deal each row's tiles over splits, so the
+        // multiprocessors fill: as many as fill them, at most a split a
+        // tile of the selection.
+        let sms = ctx.multiprocessors().unwrap_or(148);
+        let tiles = s.selection.width.div_ceil(64).max(1);
+        let splits = if rows * 2 <= sms {
+            sms.div_ceil(rows).min(tiles).min(32)
+        } else {
+            1
+        };
+        let (part_o, part_lse) = if splits > 1 {
+            let units = rows as usize * splits as usize * 64;
+            (
+                ctx.scratch_shared(op, "attn.mla_sparse.part_o", units * 512 * 4)? as usize as u64,
+                ctx.scratch_shared(op, "attn.mla_sparse.part_lse", units * 4)? as usize as u64,
+            )
+        } else {
+            (0, 0)
+        };
         let params = Params {
             o: o.ptr,
             lse: s.lse,
@@ -756,6 +778,9 @@ mod sparse {
             qpe_stride: int(s.q_pe.width),
             o_stride: int(o.width),
             scale_log2: s.sm_scale * core::f32::consts::LOG2_E,
+            part_o,
+            part_lse,
+            splits: int(splits),
         };
         let bytes = |m: &[u64; 16]| ArgValue::Bytes {
             ptr: m.as_ptr().cast(),
@@ -767,13 +792,7 @@ mod sparse {
                 FILE,
                 symbol(&format!("::pie::attn::mlas::mla_sparse<{}>", s.rope)),
             )
-            .apply(
-                Launch::grid(
-                    [rows.min(ctx.multiprocessors().unwrap_or(148)), 1, 1],
-                    [384, 1, 1],
-                )
-                .smem(smem(s.rope)),
-            ),
+            .apply(Launch::grid([(rows * splits).min(sms), 1, 1], [384, 1, 1]).smem(smem(s.rope))),
             &[
                 bytes(&map_ckv),
                 bytes(&map_ckv_run),
@@ -782,6 +801,23 @@ mod sparse {
                     ptr: (&raw const params).cast(),
                     len: core::mem::size_of::<Params>(),
                 },
+            ],
+        )?;
+        if splits == 1 {
+            return Ok(());
+        }
+        ctx.fire(
+            op,
+            Fire::at(FILE, "::pie::attn::mlas::mla_sparse_fold")
+                .apply(Launch::grid([rows, 64, 1], [128, 1, 1])),
+            &[
+                ArgValue::Ptr(part_o),
+                ArgValue::Ptr(part_lse),
+                o.arg(),
+                ArgValue::Ptr(s.lse),
+                int(splits).arg(),
+                int(o.width).arg(),
+                ctx.stage(),
             ],
         )
     }

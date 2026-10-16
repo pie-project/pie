@@ -511,3 +511,157 @@ fn the_sparse_mla_paces_a_prefill() {
         eprintln!("| {ROWS} rows, top {K} | tcgen05 {tc:5} | {us:9.0} us |");
     }
 }
+
+/// GLM-5.3's decode at 8 rows: each request's one row selecting 2048 of its
+/// keys, the selected attention dealt over splits a row on tcgen05 and
+/// folded, against the warp-a-key form; then both paced.
+fn decode_bs8(tc: bool, iters: u32) -> (Vec<u16>, f64) {
+    const REQS: usize = 8;
+    const PG: usize = 64;
+    const K: usize = 2048;
+    const ROPE: usize = 64;
+    let kv_lens: Vec<usize> = (0..REQS).map(|r| 2500 + 61 * r).collect();
+    let pages_per: Vec<usize> = kv_lens.iter().map(|&n| n.div_ceil(PG)).collect();
+    let total: usize = pages_per.iter().sum();
+    let mut indptr = vec![0i32];
+    for &n in &pages_per {
+        indptr.push(indptr.last().unwrap() + n as i32);
+    }
+    let page_ids: Vec<i32> = (0..total as i32).rev().collect();
+    let last: Vec<i32> = kv_lens.iter().map(|&n| ((n - 1) % PG + 1) as i32).collect();
+    let mut rng = Lcg::seeded(0xdec8);
+    let slots = total * PG;
+    let (q_raw, _) = rng.row(REQS * HEADS * RANK);
+    let (qpe_raw, _) = rng.row(REQS * HEADS * ROPE);
+    let (ckv_raw, _) = rng.row(slots * RANK);
+    let (kpe_raw, _) = rng.row(slots * ROPE);
+    // Every other key of the request, the last 2048 of them, ascending.
+    let mut sel = vec![-1i32; REQS * K];
+    for r in 0..REQS {
+        let ids: Vec<i32> = (0..kv_lens[r] as i32)
+            .filter(|j| j % 2 == 0 || *j as usize + 300 > kv_lens[r])
+            .collect();
+        let take = &ids[ids.len().saturating_sub(K)..];
+        for (n, &j) in take.iter().enumerate() {
+            sel[r * K + n] = j;
+        }
+    }
+    let qo: Vec<i32> = (0..=REQS as i32).collect();
+    let mut gpu = Gpu::open();
+    let device = Device::probe(&gpu.ctx()).expect("the device answers its attributes");
+    let kv_len_i: Vec<i32> = kv_lens.iter().map(|&n| n as i32).collect();
+    let workspace = Workspace {
+        int_ptr: gpu.zeros(INT_BYTES),
+        int_bytes: INT_BYTES,
+        float_ptr: gpu.zeros(FLOAT_BYTES),
+        float_bytes: FLOAT_BYTES,
+    };
+    let plan = plan::plan_mla(
+        &qo,
+        &indptr,
+        &kv_len_i,
+        REQS as u32,
+        REQS as u32,
+        Live {
+            requests: REQS as u32,
+            lane_offset: 0,
+            row_offset: 0,
+            rows: REQS as u32,
+        },
+        HEADS as u32,
+        RANK as u32,
+        false,
+        &device,
+        workspace,
+    )
+    .expect("the plan schedules");
+    plan.stage(&gpu.ctx()).expect("the plan stages");
+    let pool = KvPool {
+        keys: Tensor::new(gpu.up(&ckv_raw), slots as u32, RANK as u32, Dtype::Bf16),
+        values: Tensor::new(gpu.up(&kpe_raw), slots as u32, ROPE as u32, Dtype::Bf16),
+        bf16_keys: Tensor::ABSENT,
+        bf16_values: Tensor::ABSENT,
+        key_scales: Tensor::ABSENT,
+        value_scales: Tensor::ABSENT,
+        page_indices: Tensor::new(gpu.up(&page_ids), total as u32, 1, Dtype::I32),
+        page_indptr: Tensor::new(gpu.up(&indptr), indptr.len() as u32, 1, Dtype::I32),
+        last_page_lens: Tensor::new(gpu.up(&last), REQS as u32, 1, Dtype::I32),
+        row_valid: Tensor::ABSENT,
+        env_min: Tensor::ABSENT,
+        env_max: Tensor::ABSENT,
+        has_envelopes: false,
+        page_size: PG as i32,
+        seq_stride: RANK as i64,
+        head_stride: RANK as i64,
+        layout: 0,
+        scheme_byte: 0,
+        block_size: 0,
+        max_pages_per_request: *pages_per.iter().max().unwrap() as i32,
+        pages_in_batch: total as i32,
+    };
+    let q_at = gpu.up(&q_raw);
+    let qpe_at = gpu.up(&qpe_raw);
+    let qo_at = gpu.up(&qo);
+    let sel_at = gpu.up(&sel);
+    let out = gpu.zeros(REQS * HEADS * RANK * 2);
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        mla_sparse: tc,
+        ..Tuning::DEFAULT
+    });
+    let fire = || {
+        mla::attention_decode_selected(
+            &ctx,
+            RaggedTensor {
+                data: Tensor::new(q_at, REQS as u32, (HEADS * RANK) as u32, Dtype::Bf16),
+                indptr: Tensor::new(qo_at, (REQS + 1) as u32, 1, Dtype::I32),
+            },
+            &plan,
+            Tensor::new(qpe_at, REQS as u32, (HEADS * ROPE) as u32, Dtype::Bf16),
+            Tensor::new(sel_at, REQS as u32, K as u32, Dtype::I32),
+            &pool,
+            HEADS as u32,
+            RANK as u32,
+            0.04,
+            &mut Tensor::new(out, REQS as u32, (HEADS * RANK) as u32, Dtype::Bf16),
+            None,
+        )
+        .expect("the decode's selected attention fires");
+    };
+    fire();
+    gpu.sync();
+    let got: Vec<u16> = gpu.down(out, REQS * HEADS * RANK);
+    let mut us = 0.0;
+    if iters > 0 {
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            fire();
+        }
+        gpu.sync();
+        us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+    }
+    (got, us)
+}
+
+#[test]
+fn glm_decodes_selected_attention_lands_split_over_the_multiprocessors() {
+    let (want, _) = decode_bs8(false, 0);
+    let (got, _) = decode_bs8(true, 0);
+    for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+        let (g, w) = (from_bf16(g), from_bf16(w));
+        assert!(
+            close(g, w),
+            "row {} head {} dim {}: {g} against {w}",
+            i / (HEADS * RANK),
+            (i / RANK) % HEADS,
+            i % RANK
+        );
+    }
+}
+
+#[test]
+#[ignore = "pacing; run with --ignored --nocapture"]
+fn glm_decodes_selected_attention_paces_8_rows() {
+    let (_, naive) = decode_bs8(false, 20);
+    let (_, tc) = decode_bs8(true, 200);
+    eprintln!("| 8 rows, top 2048 | warp a key {naive:.1} us | tcgen05 split {tc:.1} us |");
+}
