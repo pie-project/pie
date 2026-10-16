@@ -1112,24 +1112,49 @@ __device__ __forceinline__ void ptir_fast_argmax_intrinsic(
     M1ArgmaxCandidate candidate{
         m1_neg_inf(), 0u, 0u, 0u};
 
+    // 16-byte vectors (eight bf16 or four f32 values), FLIGHT of them in
+    // flight a thread before any is folded: one block scans the whole row,
+    // so its pace is how many loads it keeps outstanding. The pick is the
+    // same in any order (the greatest value, the least index among equals,
+    // NaN never), so the scan's order is free.
+    constexpr m1_u32 FLIGHT = 4u;
+    const m1_u32 per = mode == 0u ? 4u : 8u;
     const m1_u32 vectors =
-        (mode != 0u &&
-         ((m1_u64)row_base & 15ull) == 0ull)
-            ? (last >> 3)
-            : 0u;
-    for (m1_u32 v = threadIdx.x; v < vectors; v += blockDim.x) {
-      const M1U32x4 packed = reinterpret_cast<const M1U32x4*>(row_base)[v];
-      const m1_u32 words[4] = {packed.x, packed.y, packed.z, packed.w};
+        ((m1_u64)row_base & 15ull) == 0ull ? last / per : 0u;
+    const M1U32x4* packed_row = reinterpret_cast<const M1U32x4*>(row_base);
+    for (m1_u32 v0 = threadIdx.x; v0 < vectors; v0 += blockDim.x * FLIGHT) {
+      M1U32x4 packed[FLIGHT];
 #pragma unroll
-      for (m1_u32 k = 0; k < 8u; ++k) {
-        const float value =
-            __uint_as_float((words[k >> 1] >> ((k & 1u) * 16u)) << 16);
-        const M1ArgmaxCandidate next{
-            value, v * 8u + k, m1_isnan(value) ? 0u : 1u, 0u};
-        candidate = m1_argmax_combine(candidate, next);
+      for (m1_u32 f = 0; f < FLIGHT; ++f) {
+        const m1_u32 v = v0 + f * blockDim.x;
+        if (v < vectors) packed[f] = packed_row[v];
+      }
+#pragma unroll
+      for (m1_u32 f = 0; f < FLIGHT; ++f) {
+        const m1_u32 v = v0 + f * blockDim.x;
+        if (v >= vectors) continue;
+        const m1_u32 words[4] = {packed[f].x, packed[f].y, packed[f].z, packed[f].w};
+        if (mode == 0u) {
+#pragma unroll
+          for (m1_u32 k = 0; k < 4u; ++k) {
+            const float value = __uint_as_float(words[k]);
+            const M1ArgmaxCandidate next{
+                value, v * 4u + k, m1_isnan(value) ? 0u : 1u, 0u};
+            candidate = m1_argmax_combine(candidate, next);
+          }
+        } else {
+#pragma unroll
+          for (m1_u32 k = 0; k < 8u; ++k) {
+            const float value =
+                __uint_as_float((words[k >> 1] >> ((k & 1u) * 16u)) << 16);
+            const M1ArgmaxCandidate next{
+                value, v * 8u + k, m1_isnan(value) ? 0u : 1u, 0u};
+            candidate = m1_argmax_combine(candidate, next);
+          }
+        }
       }
     }
-    for (m1_u32 index = (vectors << 3) + threadIdx.x;
+    for (m1_u32 index = vectors * per + threadIdx.x;
          index < last;
          index += blockDim.x) {
       const float value = m1_intrinsic_column_load(row_base, index, mode);

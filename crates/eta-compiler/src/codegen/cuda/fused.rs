@@ -377,6 +377,7 @@ pub fn emit_fused_region(
     source.push_str(SIGNATURE);
     let _ = write!(source, "{LANE_TABLE_ABI_VERSION}");
     source.push_str(PREAMBLE);
+    emit_table_staging(&mut source, ops.len(), next_value as usize);
 
     let row_geometry = row_geometry(stage, region);
     let row_parallel = row_geometry.is_some();
@@ -584,6 +585,49 @@ pub fn emit_fused_region(
     }
     source.push_str("}\n");
     Ok(source)
+}
+
+/// The most ops and values whose tables a region stages in shared memory:
+/// 128 ops of params (11 KiB) and 256 values' descriptors and offsets
+/// (10 KiB) at most.
+const STAGED_OPS: usize = 128;
+const STAGED_VALUES: usize = 256;
+
+/// The region's op params, value descriptors and scratch offsets staged into
+/// shared memory once, before the first op. Each op otherwise begins with a
+/// chain of dependent global reads (its params, then the descriptors and
+/// offsets they name) before it touches any data: about a microsecond an op,
+/// which over a sampler's twenty-odd small ops was most of its time.
+fn emit_table_staging(source: &mut String, ops: usize, values: usize) {
+    if ops == 0 || values == 0 || ops > STAGED_OPS || values > STAGED_VALUES {
+        return;
+    }
+    let _ = writeln!(source, "  __shared__ M1OpParams ptir_params[{ops}u];");
+    let _ = writeln!(source, "  __shared__ M1ValueDesc ptir_descs[{values}u];");
+    let _ = writeln!(source, "  __shared__ m1_u32 ptir_offsets[{values}u];");
+    let _ = writeln!(
+        source,
+        "  for (m1_u32 i = threadIdx.x; i < {ops}u; i += blockDim.x) ptir_params[i] = params[i];"
+    );
+    let _ = writeln!(
+        source,
+        "  const bool ptir_staged = value_count == {values}u;"
+    );
+    source.push_str("  if (ptir_staged) {\n");
+    let _ = writeln!(
+        source,
+        "    for (m1_u32 v = threadIdx.x; v < {values}u; v += blockDim.x) {{"
+    );
+    source.push_str("      ptir_descs[v] = descriptors[v];\n");
+    source.push_str("      ptir_offsets[v] = offsets[v];\n");
+    source.push_str("    }\n");
+    source.push_str("  }\n");
+    source.push_str("  __syncthreads();\n");
+    source.push_str("  params = ptir_params;\n");
+    source.push_str("  if (ptir_staged) {\n");
+    source.push_str("    descriptors = ptir_descs;\n");
+    source.push_str("    offsets = ptir_offsets;\n");
+    source.push_str("  }\n");
 }
 
 struct GumbelSlots {
