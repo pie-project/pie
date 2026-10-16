@@ -10,6 +10,7 @@ mod common_two_axis;
 mod common_vae;
 
 mod a_bank_says_which_site_it_corrects;
+mod a_buffer_frees_after_another_context_closes;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
 mod a_buffered_fold_is_the_fold_it_replaces;
 mod a_channel_fed_voxel_port_lands_the_committed_cell;

@@ -93,7 +93,9 @@ impl Context {
                 let handle = match kernels_rocm::hip::blas::create_raw() {
                     Ok(handle) => handle,
                     Err(why) => {
-                        rt::hipStreamDestroy(stream);
+                        crate::program::endpoint::pool::retire_stream(ordinal, stream.cast(), || {
+                            rt::hipStreamDestroy(stream);
+                        });
                         return Err(Fault::Device {
                             call: why.call,
                             code: why.status,
@@ -105,7 +107,9 @@ impl Context {
                 let status = rt::hipStreamCreateWithFlags(&raw mut notify, 1);
                 if status != rt::hipSuccess {
                     kernels_rocm::hip::blas::destroy_raw(handle);
-                    rt::hipStreamDestroy(stream);
+                    crate::program::endpoint::pool::retire_stream(ordinal, stream.cast(), || {
+                        rt::hipStreamDestroy(stream);
+                    });
                     return Err(Fault::Device {
                         call: "hipStreamCreateWithFlags",
                         code: status as i32,
@@ -393,7 +397,11 @@ impl Drop for Context {
                     kernels_rocm::hip::blas::destroy_raw(self.blas.cast());
                 }
                 if !self.stream.is_null() {
-                    let _ = kernels_rocm::hip::rt::hipStreamDestroy(self.stream.cast());
+                    // Out of the recorders' reach before it is destroyed.
+                    let stream = self.stream;
+                    crate::program::endpoint::pool::retire_stream(self.ordinal, stream, || {
+                        let _ = kernels_rocm::hip::rt::hipStreamDestroy(stream.cast());
+                    });
                 }
                 if !self.notify.is_null() {
                     let _ = kernels_rocm::hip::rt::hipStreamDestroy(self.notify.cast());

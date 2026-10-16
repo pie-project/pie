@@ -302,12 +302,40 @@ pub mod pool {
     static STREAMS: [AtomicPtr<core::ffi::c_void>; ORDINALS] =
         [const { AtomicPtr::new(core::ptr::null_mut()) }; ORDINALS];
 
+    /// The live contexts' compute streams, by ordinal, in adoption order: a
+    /// stream is recorded on only while this is read-held, and retired (and
+    /// destroyed) only while it is write-held, so no event is recorded on a
+    /// destroyed stream, whichever context of the process goes first.
+    static LIVE: std::sync::RwLock<Vec<(i32, usize)>> = std::sync::RwLock::new(Vec::new());
+
     /// The stream a returned endpoint's event is recorded on: the compute
-    /// stream every fire of `ordinal` launches on.
+    /// stream every fire of `ordinal` launches on (the latest live
+    /// context's).
     pub fn adopt_stream(ordinal: i32, stream: *mut core::ffi::c_void) {
+        let mut live = LIVE.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        live.push((ordinal, stream as usize));
         if let Some(slot) = usize::try_from(ordinal).ok().and_then(|at| STREAMS.get(at)) {
             slot.store(stream, Ordering::Release);
         }
+    }
+
+    /// Takes `stream` out of `ordinal`'s adoption (another live context's
+    /// stream, if any, takes its place) and runs `destroy` before any
+    /// recorder can see the stream again.
+    pub fn retire_stream(ordinal: i32, stream: *mut core::ffi::c_void, destroy: impl FnOnce()) {
+        let mut live = LIVE.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = live.iter().position(|&entry| entry == (ordinal, stream as usize)) {
+            live.remove(at);
+        }
+        let next = live
+            .iter()
+            .rev()
+            .find(|entry| entry.0 == ordinal)
+            .map_or(core::ptr::null_mut(), |entry| entry.1 as *mut core::ffi::c_void);
+        if let Some(slot) = usize::try_from(ordinal).ok().and_then(|at| STREAMS.get(at)) {
+            slot.store(next, Ordering::Release);
+        }
+        destroy();
     }
 
     struct Entry {
@@ -328,18 +356,35 @@ pub mod pool {
         (code == 0).then_some(device)
     }
 
-    pub(crate) fn stream_of(device: i32) -> Option<*mut core::ffi::c_void> {
+    fn stream_of(device: i32) -> Option<*mut core::ffi::c_void> {
         let stream = STREAMS
             .get(usize::try_from(device).ok()?)?
             .load(Ordering::Acquire);
         (!stream.is_null()).then_some(stream)
     }
 
+    /// Whether `device` has an adopted compute stream.
+    pub(crate) fn adopted(device: i32) -> bool {
+        stream_of(device).is_some()
+    }
+
+    /// `use_stream` on `device`'s adopted compute stream, kept live for the
+    /// call; none if it has none.
+    pub(crate) fn with_stream<R>(
+        device: i32,
+        use_stream: impl FnOnce(*mut core::ffi::c_void) -> R,
+    ) -> Option<R> {
+        let _live = LIVE.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        stream_of(device).map(use_stream)
+    }
+
     /// The key an endpoint of this shape pools under, if any: none on a
     /// device whose compute stream was never adopted, or for huge cells.
     pub fn key(device_only: bool, cells: usize) -> Option<PoolKey> {
         let device = current_device()?;
-        stream_of(device)?;
+        if !adopted(device) {
+            return None;
+        }
         (cells <= LARGEST).then_some(PoolKey {
             device,
             device_only,
@@ -351,7 +396,9 @@ pub mod pool {
     /// The key an instance's `bytes`-wide commit slot pools under.
     pub fn commit_key(bytes: usize) -> Option<PoolKey> {
         let device = current_device()?;
-        stream_of(device)?;
+        if !adopted(device) {
+            return None;
+        }
         Some(PoolKey {
             device,
             device_only: false,
@@ -365,7 +412,9 @@ pub mod pool {
     /// fire that reads them).
     pub fn take(key: PoolKey) -> Option<Held> {
         use kernels_rocm::hip::rt;
-        let stream = stream_of(key.device)?;
+        if !adopted(key.device) {
+            return None;
+        }
         let mut pool = POOL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -384,15 +433,15 @@ pub mod pool {
         if let Some(cells) = &cells {
             // SAFETY: the buffer is the entry's, no airborne fire reads it,
             // and the memset is ordered before every later fire.
-            let code = unsafe {
+            let code = with_stream(key.device, |stream| unsafe {
                 rt::hipMemsetAsync(
                     cells.ptr() as *mut core::ffi::c_void,
                     0,
                     cells.bytes(),
                     stream.cast(),
                 )
-            };
-            if code != 0 {
+            });
+            if code != Some(0) {
                 return None;
             }
         }
@@ -404,16 +453,17 @@ pub mod pool {
     /// will not record.
     pub fn give(key: PoolKey, held: Held) {
         use kernels_rocm::hip::rt;
-        let Some(stream) = stream_of(key.device) else {
-            return;
-        };
         let mut event: rt::Event = core::ptr::null_mut();
         // SAFETY: writes and records a fresh event on a live stream.
-        let recorded = unsafe {
+        let recorded = with_stream(key.device, |stream| unsafe {
             rt::hipEventCreateWithFlags(&raw mut event, rt::hipEventDisableTiming) == 0
                 && rt::hipEventRecord(event, stream.cast()) == 0
-        };
-        if !recorded {
+        });
+        if recorded != Some(true) {
+            if !event.is_null() {
+                // SAFETY: the event is this call's own.
+                unsafe { rt::hipEventDestroy(event) };
+            }
             return;
         }
         let mut pool = POOL

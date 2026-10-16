@@ -1199,14 +1199,14 @@ mod recycle {
     pub(super) fn release(ptr: u64, bytes: usize) {
         if HELD.load(Ordering::Relaxed) + bytes <= BUDGET
             && let Some(device) = crate::program::endpoint::pool::current_device()
-            && let Some(stream) = crate::program::endpoint::pool::stream_of(device)
         {
             let mut event: rt::Event = core::ptr::null_mut();
-            // SAFETY: creates and records a fresh event on a live stream.
-            let recorded = unsafe {
+            // SAFETY: creates and records a fresh event on a stream kept
+            // live for the call.
+            let recorded = crate::program::endpoint::pool::with_stream(device, |stream| unsafe {
                 rt::hipEventCreateWithFlags(&raw mut event, rt::hipEventDisableTiming) == 0
                     && rt::hipEventRecord(event, stream.cast()) == 0
-            };
+            }) == Some(true);
             if recorded {
                 HELD.fetch_add(bytes, Ordering::Relaxed);
                 kept()
