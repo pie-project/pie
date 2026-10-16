@@ -2,6 +2,7 @@
 
 #include "prelude/device.cuh"
 #include "elemwise/norm.cuh"
+#include "linear/act_quant.cuh"
 
 namespace pie::elemwise {
 
@@ -401,7 +402,7 @@ __global__ void __launch_bounds__(BLOCK) hc_gates_split(
 // gates' order rounded to the element as the gates land it, then the norm
 // as `rmsnorm` takes it: the squares in that order, the block's fold, the
 // weight. The pre-mixed row is never written; every value is the pair's.
-template <class T, int PER, bool PARTIAL, int THREADS = 256>
+template <class T, int PER, bool PARTIAL, int THREADS = 256, bool EMIT = false>
 __global__ void __launch_bounds__(THREADS) hc_gates_norm(
     const float* __restrict__ mixes,
     const float* __restrict__ scale,
@@ -419,6 +420,8 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
     int slices,
     int fan_in,
     float mix_eps,
+    u8* __restrict__ codes,
+    u8* __restrict__ atoms,
     const u32* __restrict__ win)
 {
     constexpr int BLOCK = 256;
@@ -542,6 +545,21 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
         const int h = tid + p * THREADS;
         const float wv = Elem<T>::to_f32(weight[h]);
         yr[h] = Elem<T>::from_f32(xsm[h] * inv_rms * wv);
+    }
+    // Under `EMIT` the normed row also lands as the e4m3 1x128 operand a
+    // GEMM's quantize would make of it (codes row-major, ue8m0 atoms): a
+    // warp 256 columns, a lane eight, a block's 16 lanes adjacent.
+    if constexpr (EMIT) {
+        static_assert(sizeof(T) == 2 && H % 256 == 0, "whole 128-wide blocks");
+        const int lane = tid & 31;
+        for (int chunk = tid >> 5; chunk < H / 256; chunk += THREADS / 32) {
+            const int h0 = chunk * 256 + lane * 8;
+            float x8[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e)
+                x8[e] = xsm[h0 + e] * inv_rms * Elem<T>::to_f32(weight[h0 + e]);
+            pie::linear::e4m3_block_store(x8, lane, plane_row, h0 / 128, H, 0, codes, atoms);
+        }
     }
 }
 

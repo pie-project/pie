@@ -366,6 +366,7 @@ fn gates_norm_launch(
     gate: Gate,
     weight: &Tensor,
     norm_eps: f32,
+    held: Option<[u64; 2]>,
     post_mix: &mut Tensor,
     comb_mix: &mut Tensor,
     y: &mut Tensor,
@@ -385,9 +386,10 @@ fn gates_norm_launch(
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::elemwise::hc_gates_norm<{t}, {}, {}, {threads}>",
+                "::pie::elemwise::hc_gates_norm<{t}, {}, {}, {threads}, {}>",
                 y.width / BLOCK,
-                partial.is_some()
+                partial.is_some(),
+                held.is_some()
             )),
         )
         .apply(Launch::grid([y.rows, 2, 1], [threads, 1, 1])),
@@ -408,6 +410,8 @@ fn gates_norm_launch(
             stated(op, slices)?.arg(),
             stated(op, fan)?.arg(),
             mix_eps.arg(),
+            crate::jit::ArgValue::Ptr(held.map_or(0, |[codes, _]| codes)),
+            crate::jit::ArgValue::Ptr(held.map_or(0, |[_, atoms]| atoms)),
             ctx.stage(),
         ],
     )
@@ -445,6 +449,7 @@ pub fn gates_norm(
         gate,
         &weight,
         norm_eps,
+        None,
         post_mix,
         comb_mix,
         y,
@@ -857,6 +862,24 @@ pub fn prenorm_project(
     Ok(true)
 }
 
+/// Whether `pre` lands these and with them the e4m3 operand planes a held
+/// GEMM reads: the caller holds the planes only then, so a GEMM never reads
+/// planes nothing wrote.
+#[must_use]
+pub fn pre_emits(
+    streams: &Tensor,
+    hc_fn: &Tensor,
+    mixes: &Tensor,
+    stream_count: u32,
+    weight: &Tensor,
+    y: &Tensor,
+) -> bool {
+    mixes.rows < PRE_WIDE_FROM
+        && prenorm_fits(streams, hc_fn, mixes, stream_count)
+        && gates_norm_fits(mixes, streams, stream_count, weight, y)
+        && y.width.is_multiple_of(256)
+}
+
 /// The rows from which a sublayer's pre-mix runs as the one-pass projection
 /// then the gates and norm apart: `pre`'s block-a-row pre-mix wins a
 /// decode's few rows (DeepSeek-V4-Flash, 8 rows: 13.2 us where the parts
@@ -867,7 +890,9 @@ pub const PRE_WIDE_FROM: u32 = TILE_FROM;
 /// A sublayer's whole pre-mix in two launches: the stream norm and mix
 /// projection (`prenorm_launch`), then the gates and the RMS norm over the
 /// row they pre-mix (`hc_gates_norm`), which sums the projection's slices
-/// itself where it left several. `Ok(false)` where the shapes are not the
+/// itself where it left several. With `held` (a GEMM's e4m3 1x128 operand
+/// planes, codes then atoms) the normed row also lands there, as the GEMM's
+/// quantize would land it. `Ok(false)` where the shapes are not the
 /// kernels': the caller runs the four ops.
 #[allow(clippy::too_many_arguments)]
 pub fn pre(
@@ -880,6 +905,7 @@ pub fn pre(
     gate: Gate,
     weight: Tensor,
     norm_eps: f32,
+    held: Option<[u64; 2]>,
     post_mix: &mut Tensor,
     comb_mix: &mut Tensor,
     y: &mut Tensor,
@@ -901,6 +927,7 @@ pub fn pre(
         gate,
         &weight,
         norm_eps,
+        held.filter(|_| y.width.is_multiple_of(256)),
         post_mix,
         comb_mix,
         y,

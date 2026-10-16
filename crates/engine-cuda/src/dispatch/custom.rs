@@ -49,6 +49,22 @@ impl DispatchFused for Run<'_> {
 }
 
 impl Run<'_> {
+    /// The e4m3 1x128 planes a sublayer's pre-mix lands its normed row `y`
+    /// in beside the bf16 one, for the GEMM that quantizes it next
+    /// (`Run::hold_e4m3`): held only where the pre-mix will land them.
+    fn hc_pre_held(
+        &mut self,
+        y: poem_ir::ValueId,
+        emits: bool,
+    ) -> Result<Option<[u64; 2]>, kernels_cuda::Error> {
+        #[cfg(feature = "cuda")]
+        if emits {
+            return Ok(Some(self.hold_e4m3(y)?));
+        }
+        let _ = (y, emits);
+        Ok(None)
+    }
+
     /// A sublayer's whole pre-mix: in two launches where the profile's tiled
     /// hyper-connection kernels run (the normed streams, the mixes and the
     /// pre-mixed row left unwritten, as nothing reads them), else the four as
@@ -113,6 +129,15 @@ impl Run<'_> {
                 },
                 poem_ir::Elementwise::Rmsnorm { weight, eps, y, .. },
             ) = (&**norm, &**project, &**gates, &**rmsnorm)
+            && let emits = kernels_cuda::elemwise::hc::pre_emits(
+                &self.tensor(*streams),
+                &self.tensor(*plane),
+                &self.tensor(*mixes),
+                *stream_count,
+                &self.tensor(*weight),
+                &self.tensor(*y),
+            )
+            && let held = self.hc_pre_held(*y, emits)?
             && kernels_cuda::elemwise::hc::pre(
                 self.ctx(),
                 self.tensor(*streams),
@@ -129,6 +154,7 @@ impl Run<'_> {
                 },
                 self.tensor(*weight),
                 *eps,
+                held,
                 &mut self.tensor(*post_mix),
                 &mut self.tensor(*comb_mix),
                 &mut self.tensor(*y),
