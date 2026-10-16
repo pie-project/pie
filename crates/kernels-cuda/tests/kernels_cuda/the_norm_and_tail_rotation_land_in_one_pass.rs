@@ -495,3 +495,103 @@ fn q_and_the_kv_plane_land_in_one_launch() {
         );
     }
 }
+
+/// The one pass's fp8 rows are, byte for byte, what the separate fp8 write
+/// (`dsv4::append`) lands from the same pass's bf16 rows.
+#[test]
+fn the_kv_plane_one_pass_writes_the_fp8_bytes_the_append_writes() {
+    const PAGE: usize = 16;
+    for window in [None, Some((24u32, 17u32, 5u32))] {
+        let (rows, live, base) = window.unwrap_or((40, 40, 0));
+        let planes = (base + rows) as usize;
+        let cells = planes.next_multiple_of(PAGE);
+        let row = dsv4::DS_ROW as usize;
+        let mut lcg = Lcg::seeded(0xb17e5);
+        let x: Vec<u16> = (0..planes * 512)
+            .map(|_| to_bf16(lcg.unit() * 3.0))
+            .collect();
+        let w: Vec<u16> = (0..512).map(|_| to_bf16(0.5 + lcg.unit())).collect();
+        let positions: Vec<i32> = (0..planes as i32).map(|r| r * 13 + 7).collect();
+        let pages_n = cells / PAGE;
+        let w_page: Vec<u32> = (0..planes)
+            .map(|r| (pages_n - 1 - r / PAGE) as u32)
+            .collect();
+        let w_off: Vec<u32> = (0..planes).map(|r| (r % PAGE) as u32).collect();
+        let mut gpu = Gpu::open();
+        let x_at = gpu.up(&x);
+        let w_at = gpu.up(&w);
+        let pos_at = gpu.up(&positions);
+        let y_at = gpu.zeros(planes * 512 * 2);
+        let page_ids: Vec<u32> = (0..pages_n as u32).collect();
+        let pages_t = Tensor::new(gpu.up(&page_ids), pages_n as u32, 1, Dtype::U32);
+        let indptr_t = Tensor::new(gpu.up(&[0u32, pages_n as u32]), 2, 1, Dtype::U32);
+        let planes_at = [gpu.zeros(cells * row), gpu.zeros(cells * row)];
+        let pool = |plane: u64| KvPool {
+            keys: Tensor::new(plane, cells as u32, dsv4::DS_ROW, Dtype::U8),
+            values: Tensor::new(plane, cells as u32, dsv4::DS_ROW, Dtype::U8),
+            bf16_keys: Tensor::ABSENT,
+            bf16_values: Tensor::ABSENT,
+            key_scales: Tensor::ABSENT,
+            value_scales: Tensor::ABSENT,
+            page_indices: pages_t,
+            page_indptr: indptr_t,
+            last_page_lens: Tensor::ABSENT,
+            row_valid: Tensor::ABSENT,
+            env_min: Tensor::ABSENT,
+            env_max: Tensor::ABSENT,
+            has_envelopes: false,
+            page_size: PAGE as i32,
+            seq_stride: i64::from(dsv4::DS_ROW),
+            head_stride: i64::from(dsv4::DS_ROW),
+            layout: 0,
+            scheme_byte: 0,
+            block_size: 0,
+            max_pages_per_request: pages_n as i32,
+            pages_in_batch: pages_n as i32,
+        };
+        let (one, two) = (pool(planes_at[0]), pool(planes_at[1]));
+        let ctx = gpu.ctx().with_tuning(Tuning {
+            rows_vec: true,
+            ..Tuning::DEFAULT
+        });
+        if window.is_some() {
+            let win_at = gpu.up(&[live, base, 0u32, 0u32]);
+            ctx.arm_stage(win_at);
+        }
+        let wp = Tensor::new(gpu.up(&w_page), rows, 1, Dtype::U32);
+        let wo = Tensor::new(gpu.up(&w_off), rows, 1, Dtype::U32);
+        let mut yt = Tensor::new(y_at, rows, 512, Dtype::Bf16);
+        let landed = rope::norm_rope_last_append(
+            &ctx,
+            Tensor::new(x_at, rows, 512, Dtype::Bf16),
+            Tensor::new(w_at, 512, 1, Dtype::Bf16),
+            512,
+            1e-6,
+            Tensor::new(pos_at, rows, 1, Dtype::I32),
+            64,
+            10000.0,
+            true,
+            false,
+            None,
+            &mut yt,
+            Some(rope::Append {
+                pool: &one,
+                write_page: wp,
+                write_offset: wo,
+            }),
+        )
+        .expect("the one pass fires");
+        assert!(landed, "the one pass lands");
+        dsv4::append(&ctx, yt, &two, wp, wo).expect("the separate write fires");
+        gpu.sync();
+        let a: Vec<u8> = gpu.down(planes_at[0], cells * row);
+        let b: Vec<u8> = gpu.down(planes_at[1], cells * row);
+        let first = a.iter().zip(&b).position(|(x, y)| x != y);
+        assert!(
+            first.is_none(),
+            "{window:?}: byte {first:?} differs (cell {:?})",
+            first.map(|i| (i / (PAGE * row)) * PAGE)
+        );
+        assert!(a.iter().any(|&v| v != 0), "{window:?}: rows are written");
+    }
+}
