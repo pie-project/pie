@@ -20,6 +20,7 @@ impl DispatchFused for Run<'_> {
             Fused::MlaPrefillExpanded { .. } => self.mla_prefill_expanded(op),
             Fused::HcPrenormProject { .. } => self.hc_prenorm_project(op),
             Fused::HcGatesNorm { .. } => self.hc_gates_norm(op),
+            Fused::ResBlendRmsnorm { .. } => self.res_blend_rmsnorm(op),
             Fused::HcPre { .. } => self.hc_pre(op),
             Fused::MatmulGeglu { .. }
             | Fused::MatmulSwiglu { .. }
@@ -174,6 +175,46 @@ impl Run<'_> {
     /// launch where the profile's tiled hyper-connection kernels run (the
     /// pre-mixed row left unwritten, as nothing reads it), else the two as
     /// the trace had them.
+    /// AttnRes's blend and the norm of its row: in one pass where the
+    /// profile says (`kernel.attn_res.fused_norm`) and the row takes it,
+    /// else the two.
+    fn res_blend_rmsnorm(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::ResBlendRmsnorm { blend, norm } = op else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        if let (
+            poem_ir::Elementwise::ResBlend {
+                prefix,
+                blocks,
+                weight: blend_weight,
+                eps: blend_eps,
+                proj,
+                ..
+            },
+            poem_ir::Elementwise::Rmsnorm { weight, eps, y, .. },
+        ) = (&**blend, &**norm)
+            && self.ctx().tuning().attn_res_fused_norm
+        {
+            let blocks: Vec<kernels_cuda::tensor::Tensor> =
+                blocks.iter().map(|b| self.tensor(*b)).collect();
+            if kernels_cuda::elemwise::norm::res_blend_norm(
+                self.ctx(),
+                self.tensor(*prefix),
+                &blocks,
+                self.tensor(*blend_weight),
+                *blend_eps,
+                self.tensor(*proj),
+                self.tensor(*weight),
+                *eps,
+                &mut self.tensor(*y),
+            )? {
+                return Ok(());
+            }
+        }
+        self.elementwise(blend)?;
+        self.elementwise(norm)
+    }
+
     fn hc_gates_norm(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         let Fused::HcGatesNorm { gates, norm } = op else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });

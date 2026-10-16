@@ -106,3 +106,22 @@ fn kimi_k3_folds_its_latent_prefill() {
     assert_eq!(count(&fused, "attention.mla_prefill"), 0);
     assert_eq!(count(&fused, "attention.mla_prefill_expanded"), prefills);
 }
+
+/// Kimi-K3's AttnRes blends whose rows only a norm reads fold with it.
+#[test]
+fn kimi_k3_folds_its_blends_into_their_norms() {
+    let deployment = poem_compiler::catalog::deployment("kimik3-l4-bf16-mxfp4a8-kv-bf16")
+        .expect("the catalog states kimik3-l4");
+    let trace = deployment.trace(Platform::Cuda);
+    let count = |t: &poem_ir::Trace, op: &str| {
+        t.nodes
+            .iter()
+            .filter(|node| poem_ir::Operands::name(&node.op) == op)
+            .count()
+    };
+    let blends = count(&trace, "elementwise.res_blend");
+    let fused = poem_compiler::fuse::fuse(trace, &["elementwise.res_blend_rmsnorm"]);
+    assert!(blends > 0);
+    assert_eq!(count(&fused, "elementwise.res_blend_rmsnorm"), blends);
+    assert_eq!(count(&fused, "elementwise.res_blend"), 0);
+}

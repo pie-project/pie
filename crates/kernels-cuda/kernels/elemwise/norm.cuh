@@ -1237,14 +1237,19 @@ __device__ __forceinline__ void res_load8(const T* v, i32 h, float (&x)[8]) {
 // candidate's RMS-normed dot with the projection (one warp a candidate, its
 // square sum and its dot in one pass), their softmax, and the blend of the
 // candidates under it.
-template <class T>
-__global__ void res_blend(
+// With `kNorm` the blended row is RMS-normed under `out_weight` before it
+// lands (`rmsnorm` of the blend's bf16 row, the two in one pass): its
+// columns held in registers, at most `kTh * 8 * kChunks` of them, 16-byte
+// runs only.
+template <class T, int kTh, bool kNorm>
+__device__ __forceinline__ void res_blend_body(
     const T* __restrict__ prefix,
-    ResBlocks blocks,
+    const ResBlocks& blocks,
     const T* __restrict__ norm_weight,
     const T* __restrict__ proj_weight,
     T* __restrict__ out,
-    i32 B, i32 H, i32 block_rows, float eps,
+    i32 B, i32 H, float eps,
+    const T* __restrict__ out_weight, float out_eps,
     const u32* __restrict__ win)
 {
     const i32 t = static_cast<i32>(blockIdx.x);
@@ -1257,7 +1262,6 @@ __global__ void res_blend(
 
     const long long token_off = static_cast<long long>(row) * H;
     const i32 rows = B + 1;
-    (void)block_rows;
 
     auto row_ptr = [&](i32 j) -> const T* {
         return (j < B) ? static_cast<const T*>(blocks.at[j]) + token_off : prefix + token_off;
@@ -1275,7 +1279,7 @@ __global__ void res_blend(
     // loads independent of one another), its square sums and dots reduced
     // across the block a group at a time.
     constexpr int kGroup = 8;
-    __shared__ float part[kThreads / 32][2 * kGroup];
+    __shared__ float part[kTh / 32][2 * kGroup];
     const i32 lane = static_cast<i32>(threadIdx.x) & 31;
     const i32 warp = static_cast<i32>(threadIdx.x) >> 5;
     const i32 warps = static_cast<i32>(blockDim.x) >> 5;
@@ -1361,6 +1365,54 @@ __global__ void res_blend(
     }
     __syncthreads();
 
+    if constexpr (kNorm) {
+        // The blended row in registers, rounded to bf16 as it would land,
+        // its square sum, then the norm.
+        constexpr int kChunks = 4;
+        float hv[kChunks][8];
+        float ss = 0.f;
+#pragma unroll
+        for (int c = 0; c < kChunks; ++c) {
+            const i32 h = (static_cast<i32>(threadIdx.x) + c * kTh) * 8;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) hv[c][i] = 0.f;
+            if (h < H) {
+                for (i32 j = 0; j < rows; ++j) {
+                    float x[8];
+                    res_load8(row_ptr(j), h, x);
+                    const float p = prob_s[j];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) hv[c][i] += p * x[i];
+                }
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    hv[c][i] = Elem<T>::to_f32(Elem<T>::from_f32(hv[c][i]));
+                    ss += hv[c][i] * hv[c][i];
+                }
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+        if (lane == 0) part[warp][0] = ss;
+        __syncthreads();
+        float total = 0.f;
+        for (i32 w = 0; w < warps; ++w) total += part[w][0];
+        const float inv_rms = rsqrtf(total / static_cast<float>(H) + out_eps);
+#pragma unroll
+        for (int c = 0; c < kChunks; ++c) {
+            const i32 h = (static_cast<i32>(threadIdx.x) + c * kTh) * 8;
+            if (h < H) {
+                float wv[8];
+                res_load8(out_weight, h, wv);
+                uint4 o;
+                T* e = reinterpret_cast<T*>(&o);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) e[i] = Elem<T>::from_f32(hv[c][i] * inv_rms * wv[i]);
+                *reinterpret_cast<uint4*>(out + token_off + h) = o;
+            }
+        }
+        return;
+    }
     if (wide) {
         for (i32 h = static_cast<i32>(threadIdx.x) * 8; h < H;
              h += static_cast<i32>(blockDim.x) * 8) {
@@ -1390,6 +1442,37 @@ __global__ void res_blend(
     }
 }
 
+template <class T>
+__global__ void res_blend(
+    const T* __restrict__ prefix,
+    ResBlocks blocks,
+    const T* __restrict__ norm_weight,
+    const T* __restrict__ proj_weight,
+    T* __restrict__ out,
+    i32 B, i32 H, i32 block_rows, float eps,
+    const u32* __restrict__ win)
+{
+    (void)block_rows;
+    res_blend_body<T, kThreads, false>(
+        prefix, blocks, norm_weight, proj_weight, out, B, H, eps, nullptr, 0.f, win);
+}
+
+// `res_blend` and the `rmsnorm` of its row (under `out_weight`, `out_eps`)
+// in one pass, `kTh` threads a row; `out` the normed row.
+template <class T, int kTh>
+__global__ void __launch_bounds__(kTh) res_blend_norm(
+    const T* __restrict__ prefix,
+    ResBlocks blocks,
+    const T* __restrict__ norm_weight,
+    const T* __restrict__ proj_weight,
+    const T* __restrict__ out_weight,
+    T* __restrict__ out,
+    i32 B, i32 H, float eps, float out_eps,
+    const u32* __restrict__ win)
+{
+    res_blend_body<T, kTh, true>(
+        prefix, blocks, norm_weight, proj_weight, out, B, H, eps, out_weight, out_eps, win);
+}
 
 template <class ElemT>
 __global__ void rmsnorm_gated_by(

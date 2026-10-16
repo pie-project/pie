@@ -109,6 +109,9 @@ moe.mxfp4_a8_until = 48
 # register-dequant select streams the six experts where the grouped tcgen05
 # GEMM lays them out first (decode bs1 13.66 -> 13.00 ms a token).
 moe.mxfp4_a8_from = 1
+# AttnRes's blend and the norm of its row in one pass, 512 threads a row:
+# Kimi-K3's sublayer inputs lose a launch and a row's round trip each.
+attn_res.fused_norm = true
 # The tcgen05 prefill FMHA (sm_100a): a causal 4096-token prefill at
 # Qwen3.8-27B's 256-wide, six-way-grouped head runs at about 900 TFLOPS
 # where FA2 runs at about 300.

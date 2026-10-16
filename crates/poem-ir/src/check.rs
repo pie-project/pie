@@ -932,6 +932,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Fused::HcPrenormProject { .. } => &[(In(1), F32), (Out(0), F32), (Out(1), F32)],
             // The gates' mixes, then their post and combine mixes.
             Fused::HcGatesNorm { .. } => &[(In(0), F32), (Out(1), F32), (Out(2), F32)],
+            Fused::ResBlendRmsnorm { .. } => &[],
             // The plane, then the normed streams, the mixes and the post and
             // combine mixes.
             Fused::HcPre { .. } => &[

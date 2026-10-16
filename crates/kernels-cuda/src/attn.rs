@@ -966,3 +966,75 @@ pub fn res_blend(
         ],
     )
 }
+
+/// [`res_blend`] and the RMS norm of its row under `out_weight` in one pass
+/// (`res_blend_norm`, 512 threads a row, the blended row held in
+/// registers): `y` the normed row. `Ok(false)` where the row is not whole
+/// 16-byte runs, wider than the registers hold, or a plane is unaligned.
+#[allow(clippy::too_many_arguments)]
+pub fn res_blend_norm(
+    ctx: &Ctx,
+    prefix: Tensor,
+    blocks: &[Tensor],
+    weight: Tensor,
+    eps: f32,
+    proj: Tensor,
+    out_weight: Tensor,
+    out_eps: f32,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "elementwise.res_blend_rmsnorm";
+    const MAX_BLOCKS: usize = 32;
+    const THREADS: u32 = 512;
+    let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let hidden = y.width;
+    let aligned = |p: u64| p % 16 == 0;
+    let row_bytes = u64::from(hidden) * 2;
+    if blocks.len() > MAX_BLOCKS
+        || hidden == 0
+        || !hidden.is_multiple_of(8)
+        || hidden > THREADS * 8 * 4
+        || !row_bytes.is_multiple_of(16)
+        || ![prefix.ptr, weight.ptr, proj.ptr, out_weight.ptr, y.ptr]
+            .into_iter()
+            .chain(blocks.iter().map(|b| b.ptr))
+            .all(aligned)
+    {
+        return Ok(false);
+    }
+    #[repr(C)]
+    struct ResBlocks {
+        at: [u64; MAX_BLOCKS],
+    }
+    let mut at = ResBlocks {
+        at: [0; MAX_BLOCKS],
+    };
+    for (slot, block) in at.at.iter_mut().zip(blocks) {
+        *slot = block.ptr;
+    }
+    ctx.fire(
+        OP,
+        Fire::at(
+            "elemwise/norm.cuh",
+            symbol(&format!("::pie::elemwise::res_blend_norm<{t}, {THREADS}>")),
+        )
+        .apply(Launch::per_row(y.rows, THREADS)),
+        &[
+            prefix.arg(),
+            crate::jit::ArgValue::Bytes {
+                ptr: std::ptr::from_ref(&at).cast(),
+                len: size_of::<ResBlocks>(),
+            },
+            weight.arg(),
+            proj.arg(),
+            out_weight.arg(),
+            y.arg(),
+            stated(OP, u32::try_from(blocks.len()).unwrap_or(u32::MAX))?.arg(),
+            stated(OP, hidden)?.arg(),
+            eps.arg(),
+            out_eps.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}

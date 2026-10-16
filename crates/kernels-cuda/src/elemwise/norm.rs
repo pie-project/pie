@@ -835,3 +835,22 @@ pub fn res_blend(
 ) -> Result<(), Error> {
     crate::attn::res_blend(ctx, prefix, blocks, weight, eps, proj, y)
 }
+
+/// [`res_blend`] with the RMS norm of the blended row in one pass; see
+/// [`crate::attn::res_blend_norm`].
+#[allow(clippy::too_many_arguments)]
+pub fn res_blend_norm(
+    ctx: &Ctx,
+    prefix: Tensor,
+    blocks: &[Tensor],
+    weight: Tensor,
+    eps: f32,
+    proj: Tensor,
+    out_weight: Tensor,
+    out_eps: f32,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    crate::attn::res_blend_norm(
+        ctx, prefix, blocks, weight, eps, proj, out_weight, out_eps, y,
+    )
+}

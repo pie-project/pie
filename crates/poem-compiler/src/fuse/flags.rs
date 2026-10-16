@@ -65,6 +65,7 @@ flags! {
     MlaPrefillExpanded = "fuse.mla_prefill_expanded" => "attention.mla_prefill_expanded",
     HcPrenormProject = "fuse.hc_prenorm_project" => "elementwise.hc_prenorm_project",
     HcGatesNorm = "fuse.hc_gates_norm" => "elementwise.hc_gates_norm",
+    ResBlendRmsnorm = "fuse.res_blend_rmsnorm" => "elementwise.res_blend_rmsnorm",
     HcPre = "fuse.hc_pre" => "elementwise.hc_pre",
 }
 

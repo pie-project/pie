@@ -59,6 +59,7 @@ pub(super) fn all() -> Vec<Rule> {
         mla_prefill_expanded(),
         hc_prenorm_project(),
         hc_gates_norm(),
+        res_blend_rmsnorm(),
         lse_sink(),
     ]
 }
@@ -144,6 +145,37 @@ fn hc_gates_norm() -> Rule {
         };
         Fused::HcGatesNorm {
             gates: elementwise("x"),
+            norm: elementwise("y"),
+        }
+    })
+}
+
+/// AttnRes's blend whose row only an RMS norm reads (Kimi-K3's sublayer
+/// inputs), over however many closed blocks.
+fn res_blend_rmsnorm() -> Rule {
+    let pattern = template(|p| {
+        let prefix = p.rows("prefix", W);
+        p.free("blocks");
+        let h = elemwise::res_blend(
+            &prefix,
+            &[],
+            &p.weight("norm", [W]),
+            p.f32("eps"),
+            &p.weight("proj", [W]),
+        );
+        p.name("h", &h);
+        let y = elemwise::rmsnorm(&h, &p.weight("weight", [W]), p.f32("norm_eps"));
+        p.export("y", &y);
+    });
+    Rule::new("elementwise.res_blend_rmsnorm", [pattern], |m| {
+        let elementwise = |name: &str| {
+            let Operation::Elementwise(op) = m.op(name) else {
+                panic!("`{name}` comes from an elementwise op");
+            };
+            Box::new(op.clone())
+        };
+        Fused::ResBlendRmsnorm {
+            blend: elementwise("h"),
             norm: elementwise("y"),
         }
     })

@@ -482,6 +482,7 @@ mod tests {
                         moe_w4a4_fused_from: 65_536,
                         moe_w4a8_fused_from: 65_536,
                         mla_expanded_from: 65_536,
+                        attn_res_fused_norm: false,
                         ssm_kda_chunked: false,
                         ssm_kda_step_fused: false,
                         gemm_split_launch_ns: 0,
@@ -668,6 +669,7 @@ mod tests {
         assert_eq!(b200.moe_w4a8_fused_from, 512);
         assert_eq!(b200.mla_expanded_from, 256);
         assert_eq!((b200.mxfp4_a8_from, b200.mxfp4_a8_until), (1, 48));
+        assert!(b200.attn_res_fused_norm);
     }
 
     #[test]
@@ -748,6 +750,10 @@ mod tests {
             assert_eq!(
                 other.mla_expanded_from, 65_536,
                 "sm_{major}{minor} scores a latent prefill absorbed"
+            );
+            assert!(
+                !other.attn_res_fused_norm,
+                "sm_{major}{minor} blends and norms apart"
             );
         }
     }

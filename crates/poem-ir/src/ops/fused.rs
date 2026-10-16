@@ -255,6 +255,14 @@ pub enum Fused {
         gates: Box<Elementwise>,
         norm: Box<Elementwise>,
     },
+    /// AttnRes's blend and the RMS norm over the row it blends (`blend` a
+    /// `ResBlend`, `norm` an `Rmsnorm` of its `y`): a backend lands the
+    /// normed row in one pass, or runs the two. The blended row is still an
+    /// output, read by nothing else.
+    ResBlendRmsnorm {
+        blend: Box<Elementwise>,
+        norm: Box<Elementwise>,
+    },
     /// A hyper-connection stream norm and the mix projection it feeds
     /// (`norm` an `HcRmsnormF32`, `project` an `HcProject` of its rows): a
     /// backend lands the mixes from the streams in one pass, the norm's
@@ -599,6 +607,12 @@ impl Operands for Fused {
                     sink.push(weight);
                 }
             }
+            Self::ResBlendRmsnorm { blend, norm } => {
+                blend.inputs(sink);
+                if let Elementwise::Rmsnorm { weight, .. } = **norm {
+                    sink.push(weight);
+                }
+            }
             Self::HcGatesNorm { gates, norm } => {
                 gates.inputs(sink);
                 if let Elementwise::Rmsnorm { weight, .. } = **norm {
@@ -808,6 +822,10 @@ impl Operands for Fused {
                 gates.outputs(sink);
                 norm.outputs(sink);
             }
+            Self::ResBlendRmsnorm { blend, norm } => {
+                blend.outputs(sink);
+                norm.outputs(sink);
+            }
             Self::HcPre {
                 norm,
                 project,
@@ -903,6 +921,7 @@ impl Operands for Fused {
             Self::NormModulate { .. }
             | Self::HcPrenormProject { .. }
             | Self::HcGatesNorm { .. }
+            | Self::ResBlendRmsnorm { .. }
             | Self::HcPre { .. } => {}
             Self::GatedResidualNormModulate { r_out, r, .. } => sink.push((*r_out, *r)),
             Self::LmHeadSoftcap { y, y_out, .. } | Self::MatmulBias { y, y_out, .. } => {
@@ -969,6 +988,7 @@ impl Operands for Fused {
             Self::MlaPrefillExpanded { .. } => "attention.mla_prefill_expanded",
             Self::HcPrenormProject { .. } => "elementwise.hc_prenorm_project",
             Self::HcGatesNorm { .. } => "elementwise.hc_gates_norm",
+            Self::ResBlendRmsnorm { .. } => "elementwise.res_blend_rmsnorm",
             Self::HcPre { .. } => "elementwise.hc_pre",
             Self::MoeExperts { .. } => "linear.moe_experts",
             Self::QkvFusedQknormRopeVnormWrite { .. } => {
