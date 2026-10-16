@@ -3,7 +3,8 @@
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::act_quant::{
-    AlphaFrom, Bank, Format, Source, Weight, matmul, quantize, read_back, scales_to_atoms, select,
+    AlphaFrom, Bank, Format, Source, Weight, held_planes, matmul, matmul_held, quantize, read_back,
+    scales_to_atoms, select,
 };
 use kernels_cuda::linear::tc5::{Elem, atom_bytes, atom_offset, supported};
 use kernels_cuda::tensor::Tensor;
@@ -464,6 +465,38 @@ fn w8a8_block_matmul(m: usize, n: usize, k: usize) {
         0,
         "{bad} of {} W8A8 outputs off the read-back dot",
         m * n
+    );
+    // A producer's codes in the held planes (here the quantizer's bytes,
+    // which `e4m3_block_store` lands too) read by the GEMM with no
+    // quantize launch: the same product, bit for bit.
+    let planes = held_planes(&ctx, OP, m as u32, k as u32).expect("the held planes");
+    let atom_bytes = atom_bytes(m, k, 128);
+    quantize(&ctx, OP, fmt, src, planes[0], planes[1], atom_bytes).expect("the codes land");
+    let held_at = gpu.zeros(m * n * 2);
+    let mut held = Tensor::new(held_at, m as u32, n as u32, Dtype::Bf16);
+    matmul_held(
+        &ctx,
+        OP,
+        planes,
+        m as u32,
+        Weight {
+            codes: codes_at,
+            scales: atoms_at,
+            n: n as u32,
+            k: k as u32,
+            elem: Elem::E4m3,
+            gran: 128,
+            laid: true,
+        },
+        &mut held,
+        1.0,
+    )
+    .expect("the held product fires");
+    gpu.sync();
+    assert_eq!(
+        gpu.down::<u16>(held_at, m * n),
+        got,
+        "a held W8A8 product lands the quantizing one's bits"
     );
 }
 

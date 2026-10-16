@@ -298,7 +298,50 @@ struct E4m3Block {
         return static_cast<unsigned long long>(half[0] | (half[1] << 16)) |
                (static_cast<unsigned long long>(half[2] | (half[3] << 16)) << 32);
     }
+    // A producer's eight of the block, held in registers: each rounded to
+    // bf16 first, as a quantizer reading the producer's bf16 row back
+    // would see it, so the codes and scale are `load`'s from that row.
+    __device__ __forceinline__ void hold(const float (&x)[8]) {
+        float amax = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            v[i] = bf16_to_f32(f32_to_bf16(x[i]));
+            amax = fmaxf(amax, fabsf(v[i]));
+        }
+#pragma unroll
+        for (int o = kLanes / 2; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        }
+        amax = fmaxf(amax, 1e-4f);
+        const unsigned bits = __float_as_uint(amax * (1.f / 448.f));
+        e = static_cast<int>((bits >> 23) & 0xFFu) - 127 + ((bits & 0x7FFFFFu) != 0u ? 1 : 0);
+    }
+    // Lands the block as row `o`'s block `b` of a GEMM's operand: lane
+    // `lane`'s eight codes, and the block's ue8m0 scale in the atom layout.
+    __device__ __forceinline__ void store(u8* __restrict__ to, u8* __restrict__ atoms, int o,
+                                          int b, int k, int m_max, int lane) const {
+        const int sub = lane % kLanes;
+        *reinterpret_cast<unsigned long long*>(to + static_cast<long long>(o) * k + b * kGran +
+                                               sub * 8) = codes();
+        if (sub == 0) {
+            atoms[atom_offset(atom_row(o, m_max), b, k / kGran)] = static_cast<u8>(e + 127);
+        }
+    }
 };
+
+// DeepSeek's fp8 1x128 activation landed by its producer, in place of an
+// `act_quant_e4m3` launch over the producer's bf16 row: lane `lane` holds
+// elements [8 * (lane % 16), +8) of row `o`'s 128-wide block `b` (`k` the
+// row's width), a block's 16 lanes adjacent and 16-aligned in the warp, all
+// 32 lanes calling. The same bytes as act_quant_e4m3 (mode 0, `m_max` its
+// masked rows a group or 0) lands from that row.
+__device__ __forceinline__ void e4m3_block_store(const float (&x)[8], int lane, int o, int b,
+                                                 int k, int m_max, u8* __restrict__ codes,
+                                                 u8* __restrict__ atoms) {
+    E4m3Block<128> q;
+    q.hold(x);
+    q.store(codes, atoms, o, b, k, m_max, lane);
+}
 
 template <int kMode, int kGran>
 __global__ void act_quant_e4m3_v8(
@@ -330,9 +373,7 @@ __global__ void act_quant_e4m3_v8(
     if constexpr (kMode == kQuantCodes) {
         const int o = pos != nullptr ? pos[r] : r;
         if (o < 0) return;
-        *reinterpret_cast<unsigned long long*>(codes + static_cast<long long>(o) * k + b * kGran +
-                                               sub * 8) = q.codes();
-        if (sub == 0) atoms[atom_offset(atom_row(o, m_max), b, blocks)] = static_cast<u8>(q.e + 127);
+        q.store(codes, atoms, o, b, k, m_max, lane);
     } else {
         const float s = __uint_as_float(static_cast<unsigned>(q.e + 127) << 23);
         const unsigned long long c = q.codes();

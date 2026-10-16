@@ -1425,9 +1425,25 @@ impl Run<'_> {
         if !self.scales_in_atoms(w) {
             return Err(unlaid(OP));
         }
+        let act_id = act;
         let act = self.tensor(act);
         let mut out = self.tensor(y);
         let (n, k) = (out.width, act.width);
+        // Its producer landed the 1x128 codes itself: no quantize launch.
+        if let (Dtype::Mxfp4 | Dtype::U8, ActQuant::E4m3 { gran: 128 }) = (codes.dtype, quant)
+            && let Some(planes) = self.held_e4m3(act_id, &act)
+        {
+            let weight = act_quant::Weight {
+                codes: codes.ptr,
+                scales: scales.ptr,
+                n,
+                k,
+                elem: linear::tc5::Elem::E2m1,
+                gran: 32,
+                laid: true,
+            };
+            return act_quant::matmul_held(self.ctx(), OP, planes, act.rows, weight, &mut out, 1.0);
+        }
         match (codes.dtype, quant) {
             (Dtype::Mxfp4 | Dtype::U8, ActQuant::E4m3 { gran }) => act_quant::matmul(
                 self.ctx(),
@@ -1485,23 +1501,29 @@ impl Run<'_> {
         if atoms.dtype != Dtype::U8 {
             return Err(unlaid(OP));
         }
+        let act_id = act;
         let act = self.tensor(act);
         let mut out = self.tensor(y);
         let (n, k) = (out.width, act.width);
+        let weight = act_quant::Weight {
+            codes: codes.ptr,
+            scales: atoms.ptr,
+            n,
+            k,
+            elem: linear::tc5::Elem::E4m3,
+            gran: 128,
+            laid: true,
+        };
+        // Its producer landed the codes itself: no quantize launch.
+        if let Some(planes) = self.held_e4m3(act_id, &act) {
+            return act_quant::matmul_held(self.ctx(), OP, planes, act.rows, weight, &mut out, 1.0);
+        }
         act_quant::matmul(
             self.ctx(),
             OP,
             act_quant::Format::E4m3 { gran: 128 },
             act_quant::Source::rows(act, None),
-            act_quant::Weight {
-                codes: codes.ptr,
-                scales: atoms.ptr,
-                n,
-                k,
-                elem: linear::tc5::Elem::E4m3,
-                gran: 128,
-                laid: true,
-            },
+            weight,
             &mut out,
             1.0,
         )

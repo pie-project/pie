@@ -546,6 +546,22 @@ pub struct Run<'c> {
     ceilings: Ceilings<'c>,
 
     stood: Cell<Option<(u32, u32, Standing)>>,
+
+    /// The fp8 1x128 activations a producer last landed itself (its codes
+    /// beside its bf16 row), for the projection that reads that row next.
+    held: Option<HeldAct>,
+}
+
+/// A producer's own fp8 1x128 copy of value `value` (at `ptr`, on the
+/// stream `stream`): its codes and atoms in `planes`, `rows x k`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeldAct {
+    pub value: ValueId,
+    pub ptr: u64,
+    pub stream: usize,
+    pub rows: u32,
+    pub k: u32,
+    pub planes: [u64; 2],
 }
 
 impl<'c> Run<'c> {
@@ -582,7 +598,43 @@ impl<'c> Run<'c> {
             copy: CopyPlan::default(),
             ceilings: Ceilings::default(),
             stood: Cell::new(None),
+            held: None,
         }
+    }
+
+    /// Planes a producer of `y` lands its fp8 1x128 codes and atoms in,
+    /// beside its bf16 row ([`kernels_cuda::linear::act_quant::held_planes`],
+    /// `e4m3_block_store`): a projection reading `y` next on this stream
+    /// takes them in place of quantizing it. The latest producer's only.
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)] // the first producer to land its codes (DeepSeek's HcPre) calls it
+    pub(crate) fn hold_e4m3(&mut self, y: ValueId) -> Result<[u64; 2], kernels_cuda::Error> {
+        let t = self.tensor(y);
+        let ctx = self.ctx();
+        let planes =
+            kernels_cuda::linear::act_quant::held_planes(ctx, "linear.held_act", t.rows, t.width)?;
+        self.held = Some(HeldAct {
+            value: y,
+            ptr: t.ptr,
+            stream: ctx.stream().addr(),
+            rows: t.rows,
+            k: t.width,
+            planes,
+        });
+        Ok(planes)
+    }
+
+    /// The planes [`Run::hold_e4m3`] gave `act`'s producer, when `act` (at
+    /// `t`) is the value they hold, on this stream.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn held_e4m3(&self, act: ValueId, t: &Tensor) -> Option<[u64; 2]> {
+        let held = self.held?;
+        (held.value == act
+            && held.ptr == t.ptr
+            && held.rows == t.rows
+            && held.k == t.width
+            && held.stream == self.ctx().stream().addr())
+        .then_some(held.planes)
     }
 
     #[must_use]

@@ -314,6 +314,8 @@ fn zero(ctx: &Ctx, op: &'static str, ptr: u64, bytes: usize) -> Result<(), Error
 const ACT_CODES: &str = "linear.act_quant.codes";
 const ACT_ATOMS: &str = "linear.act_quant.atoms";
 const WEIGHT_ATOMS: &str = "linear.act_quant.weight_atoms";
+const HELD_CODES: &str = "linear.act_quant.held_codes";
+const HELD_ATOMS: &str = "linear.act_quant.held_atoms";
 
 /// A dense projection's weight as the tcgen05 GEMM reads it: `codes` its
 /// `n` rows of `k` codes (two e2m1 a byte, the even one low), `scales` its
@@ -358,6 +360,66 @@ pub fn matmul(
     let atom_bytes = tc5::atom_bytes(m as usize, k as usize, fmt.gran() as usize);
     let atoms = ctx.scratch_stream(op, ACT_ATOMS, atom_bytes)?;
     quantize(ctx, op, fmt, act, codes as u64, atoms as u64, atom_bytes)?;
+    product(ctx, op, fmt, [codes as u64, atoms as u64], m, w, y, alpha)
+}
+
+/// Where a producer lands `rows x k` of DeepSeek's fp8 1x128 activations
+/// itself (`e4m3_block_store` in act_quant.cuh, row `o` at row `o`,
+/// `m_max` 0) for [`matmul_held`]: the codes and their atoms, apart from
+/// the quantizer's own planes so a quantize between the producer and its
+/// consumer leaves them be. The atoms are zeroed when fresh, and every
+/// store lands a finite scale, so the padding the GEMM reads past `rows`
+/// stays finite with no clear a launch.
+pub fn held_planes(ctx: &Ctx, op: &'static str, rows: u32, k: u32) -> Result<[u64; 2], Error> {
+    let fmt = Format::E4m3 { gran: 128 };
+    fmt.check(op, k)?;
+    let codes = ctx.scratch_stream(op, HELD_CODES, rows as usize * fmt.row_bytes(k) as usize)?;
+    let atom_bytes = tc5::atom_bytes(rows as usize, k as usize, 128);
+    let atoms = ctx.scratch_stream_zeroed(op, HELD_ATOMS, atom_bytes)?;
+    Ok([codes as u64, atoms as u64])
+}
+
+/// [`matmul`] of activations a producer already landed in `planes`
+/// ([`held_planes`]), `rows` of them: no quantize launch.
+pub fn matmul_held(
+    ctx: &Ctx,
+    op: &'static str,
+    planes: [u64; 2],
+    rows: u32,
+    w: Weight,
+    y: &mut Tensor,
+    alpha: f32,
+) -> Result<(), Error> {
+    let fmt = Format::E4m3 { gran: 128 };
+    fmt.check(op, w.k)?;
+    if y.rows != rows || y.width != w.n {
+        return Err(refuse(
+            op,
+            format!(
+                "{rows} held rows against an {} x {} weight into {} x {}",
+                w.n, w.k, y.rows, y.width
+            ),
+        ));
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    product(ctx, op, fmt, planes, rows, w, y, alpha)
+}
+
+/// The tcgen05 product of quantized activations `[codes, atoms]`, `m` rows.
+#[allow(clippy::too_many_arguments)]
+fn product(
+    ctx: &Ctx,
+    op: &'static str,
+    fmt: Format,
+    [codes, atoms]: [u64; 2],
+    m: u32,
+    w: Weight,
+    y: &mut Tensor,
+    alpha: f32,
+) -> Result<(), Error> {
+    let k = w.k;
     let w_atoms = if w.laid {
         w.scales
     } else {
@@ -372,7 +434,7 @@ pub fn matmul(
     };
     tc5::gemm(
         ctx,
-        tc5::Operand::scaled(codes as u64, a_elem, atoms as u64, fmt.gran()),
+        tc5::Operand::scaled(codes, a_elem, atoms, fmt.gran()),
         tc5::Operand::scaled(w.codes, w.elem, w_atoms, w.gran),
         y.ptr,
         [m, w.n, k],
