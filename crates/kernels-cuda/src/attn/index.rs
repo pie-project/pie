@@ -383,9 +383,9 @@ fn ranked(
             };
             (
                 format!("::pie::attn::index_topk_paged_mma<::pie::bf16, {tiles}, {radix}>"),
-                // The query, 16 rows a tile, and each warp's 16 keys, at 128 + 8
-                // bf16 a row.
-                (16 * tiles + (K_BLOCK / 32) * 16) * (128 + 8) * 2,
+                // The query, 16 rows a tile, and each warp's two chunks of 16
+                // keys, at 128 + 8 bf16 a row.
+                (16 * tiles + 2 * (K_BLOCK / 32) * 16) * (128 + 8) * 2,
             )
         }
         _ if turn.is_some() => return Ok(false),

@@ -199,28 +199,55 @@ fn the_pooled_index_paces_a_prefill() {
     let w_at = gpu.up(&w_raw);
     let sel_at = gpu.zeros(ROWS * K * 4);
     let mut selection = Tensor::new(sel_at, ROWS as u32, K as u32, Dtype::I32);
-    for radix in [false, true] {
+    let positions: Vec<i32> = (0..ROWS as i32).map(|r| (SPAN - ROWS) as i32 + r).collect();
+    let pos_t = Tensor::new(gpu.up(&positions), ROWS as u32, 1, Dtype::I32);
+    for (radix, turned) in [(false, false), (true, false), (true, true)] {
         let ctx = gpu.ctx().with_tuning(Tuning {
             index_mma: true,
             index_radix: radix,
             ..Tuning::DEFAULT
         });
         let mut fire = || {
-            index::topk(
-                &ctx,
-                RaggedTensor {
-                    data: Tensor::new(q_at, ROWS as u32, (H * DIM) as u32, Dtype::Bf16),
-                    indptr: Tensor::new(indptr, 2, 1, Dtype::I32),
-                },
-                Some(Tensor::new(w_at, ROWS as u32, H as u32, Dtype::Bf16)),
-                &keys,
-                H as u32,
-                DIM as u32,
-                K as u32,
-                RATIO as u32,
-                &mut selection,
-            )
-            .expect("attention.index_topk ranks the pooled blocks");
+            let q = RaggedTensor {
+                data: Tensor::new(q_at, ROWS as u32, (H * DIM) as u32, Dtype::Bf16),
+                indptr: Tensor::new(indptr, 2, 1, Dtype::I32),
+            };
+            let w = Some(Tensor::new(w_at, ROWS as u32, H as u32, Dtype::Bf16));
+            if turned {
+                let turn = index::QueryTurn {
+                    positions: pos_t,
+                    dim: 64,
+                    theta: 1e4,
+                    yarn: None,
+                };
+                let landed = index::topk_turned(
+                    &ctx,
+                    q,
+                    w,
+                    &keys,
+                    H as u32,
+                    DIM as u32,
+                    K as u32,
+                    RATIO as u32,
+                    turn,
+                    &mut selection,
+                )
+                .expect("the turned ranking fires");
+                assert!(landed, "the scorer turns its queries");
+            } else {
+                index::topk(
+                    &ctx,
+                    q,
+                    w,
+                    &keys,
+                    H as u32,
+                    DIM as u32,
+                    K as u32,
+                    RATIO as u32,
+                    &mut selection,
+                )
+                .expect("attention.index_topk ranks the pooled blocks");
+            }
         };
         fire();
         gpu.sync();
@@ -232,7 +259,7 @@ fn the_pooled_index_paces_a_prefill() {
         gpu.sync();
         let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
         println!(
-            "| index top-{K}, {ROWS} rows of a {SPAN}-position request, radix {radix} | {us:.0} us |"
+            "| index top-{K}, {ROWS} rows of a {SPAN}-position request, radix {radix}, turned {turned} | {us:.0} us |"
         );
     }
 }

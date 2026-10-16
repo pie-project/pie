@@ -453,6 +453,7 @@ constexpr int kD = 128;
 constexpr int kLd = kD + 8;
 constexpr int kWarps = kBlock / 32;
 constexpr int kKeys = 16;
+constexpr int kNt = kKeys / 8;  // a chunk's 8-key mma column tiles
 
 __device__ __forceinline__ std::uint32_t smem_addr(const void* p) {
     return static_cast<std::uint32_t>(__cvta_generic_to_shared(p));
@@ -530,7 +531,17 @@ __global__ void index_topk_paged_mma(
     T* q_s = reinterpret_cast<T*>(q_raw);
     T* k_s0 = q_s + 16 * kTiles * kLd;
     __shared__ float w_s[16 * kTiles];
-    __shared__ long long slot_s[kWarps][kKeys];
+    __shared__ long long slot_s[kWarps][2][kKeys];
+    // The turn's frequencies, a pair each, worked once a block.
+    __shared__ float turn_f[kD / 2];
+    if (turn_dim > 0) {
+        for (int pair = tid; pair < turn_dim / 2; pair += kBlock) {
+            float freq = powf(turn_theta, -2.f * static_cast<float>(pair) / static_cast<float>(turn_dim));
+            if (turn_factor > 1.f) freq = ::pie::yarn_original_freq(freq, turn_factor, turn_low, turn_high, pair);
+            turn_f[pair] = freq;
+        }
+        __syncthreads();
+    }
     for (int i = tid; i < 16 * kTiles * (kD / 8); i += kBlock) {
         const int row = i / (kD / 8);
         const int d = (i % (kD / 8)) * 8;
@@ -544,10 +555,8 @@ __global__ void index_topk_paged_mma(
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
                 const int pair = (d - (kD - turn_dim)) / 2 + u;
-                float freq = powf(turn_theta, -2.f * static_cast<float>(pair) / static_cast<float>(turn_dim));
-                if (turn_factor > 1.f) freq = ::pie::yarn_original_freq(freq, turn_factor, turn_low, turn_high, pair);
                 float sn, cs;
-                __sincosf(pos * freq, &sn, &cs);
+                __sincosf(pos * turn_f[pair], &sn, &cs);
                 const float a = Elem<T>::to_f32(e[2 * u]);
                 const float b = Elem<T>::to_f32(e[2 * u + 1]);
                 e[2 * u] = Elem<T>::from_f32(a * cs - b * sn);
@@ -564,8 +573,9 @@ __global__ void index_topk_paged_mma(
     __syncthreads();
 
     const int g = lane >> 2, p = (lane & 3) << 1;
-    T* ks = k_s0 + warp * kKeys * kLd;
-    for (int base = warp * kKeys; base < nkeys; base += kWarps * kKeys) {
+    // Each warp's chunks two deep: the next chunk's keys copy in
+    // (cp.async, zero-filled past the row's keys) while this one's score.
+    auto fetch = [&](int base, int buf) {
         if (lane < kKeys) {
             const int j = base + lane;
             long long slot = -1;
@@ -574,24 +584,38 @@ __global__ void index_topk_paged_mma(
                 slot = static_cast<long long>(kv_page_indices[pages_first + cell / page_size]) * page_size
                     + cell % page_size;
             }
-            slot_s[warp][lane] = slot;
+            slot_s[warp][buf][lane] = slot;
         }
         __syncwarp();
+        T* kb = k_s0 + (warp * 2 + buf) * kKeys * kLd;
         for (int c = lane; c < kKeys * (kD / 8); c += 32) {
             const int key = c / (kD / 8);
             const int d = (c % (kD / 8)) * 8;
-            const long long slot = slot_s[warp][key];
-            *reinterpret_cast<int4*>(ks + key * kLd + d) = slot >= 0
-                ? *reinterpret_cast<const int4*>(key_pages + slot * kD + d)
-                : make_int4(0, 0, 0, 0);
+            const long long slot = slot_s[warp][buf][key];
+            const T* src = key_pages + (slot >= 0 ? slot : 0) * kD + d;
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr(kb + key * kLd + d)),
+                         "l"(src), "r"(slot >= 0 ? 16 : 0)
+                         : "memory");
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    };
+    int buf = 0;
+    if (warp * kKeys < nkeys) fetch(warp * kKeys, 0);
+    for (int base = warp * kKeys; base < nkeys; base += kWarps * kKeys, buf ^= 1) {
+        if (base + kWarps * kKeys < nkeys) {
+            fetch(base + kWarps * kKeys, buf ^ 1);
+            asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
         }
         __syncwarp();
+        const T* ks = k_s0 + (warp * 2 + buf) * kKeys * kLd;
         // A key's score, this lane's share: each head tile's weighted
         // rectified dots, rows `g` and `g + 8` of the tile.
-        float part[2][2] = {{0.f, 0.f}, {0.f, 0.f}};
+        float part[kNt][2] = {};
 #pragma unroll
         for (int ht = 0; ht < kTiles; ++ht) {
-        float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+        float acc[kNt][4] = {};
 #pragma unroll
         for (int k0 = 0; k0 < kD; k0 += 16) {
             std::uint32_t a[4];
@@ -602,7 +626,7 @@ __global__ void index_topk_paged_mma(
                              : "r"(smem_addr(rp)));
             }
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt) {
+            for (int nt = 0; nt < kNt; ++nt) {
                 std::uint32_t b[2];
                 const T* rp = ks + (nt * 8 + (lane & 7)) * kLd + k0 + ((lane & 8) ? 8 : 0);
                 asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
@@ -612,7 +636,7 @@ __global__ void index_topk_paged_mma(
             }
         }
 #pragma unroll
-        for (int nt = 0; nt < 2; ++nt)
+        for (int nt = 0; nt < kNt; ++nt)
 #pragma unroll
             for (int i = 0; i < 2; ++i)
                 part[nt][i] += fmaxf(acc[nt][i], 0.f) * w_s[ht * 16 + g]
@@ -621,7 +645,7 @@ __global__ void index_topk_paged_mma(
         // A key's score sums its heads' weighted rectified dots, across the
         // eight lane groups.
 #pragma unroll
-        for (int nt = 0; nt < 2; ++nt) {
+        for (int nt = 0; nt < kNt; ++nt) {
 #pragma unroll
             for (int i = 0; i < 2; ++i) {
                 float v = part[nt][i];
