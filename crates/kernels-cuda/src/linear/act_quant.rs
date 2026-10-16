@@ -291,6 +291,39 @@ pub fn read_back(
     Ok(Tensor::new(out, src.rows, src.x.width, Dtype::Bf16))
 }
 
+/// A 128x128-block FP8 plane (`rows x cols` e4m3 codes at `codes`) under f32
+/// block factors (`[rows / 128][cols / 128]` at `factors`) requantized in
+/// place to ue8m0 exponents (`exps`, the factors' shape): each factor
+/// rounded up to its power of two, each code re-rounded under it, as vLLM's
+/// DeepGEMM path requantizes a block-FP8 release on Blackwell.
+pub fn fp8_tile_requant(
+    ctx: &Ctx,
+    op: &'static str,
+    codes: u64,
+    factors: u64,
+    exps: u64,
+    rows: u32,
+    cols: u32,
+) -> Result<(), Error> {
+    if rows == 0 || cols == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::fp8_tile_requant").apply(Launch::grid(
+            [cols.div_ceil(128), rows.div_ceil(128), 1],
+            [32, 8, 1],
+        )),
+        &[
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(factors),
+            ArgValue::Ptr(exps),
+            stated(op, rows)?.arg(),
+            stated(op, cols)?.arg(),
+        ],
+    )
+}
+
 /// A row-major plane of one-byte scales, `cols` a row, laid into atoms for
 /// `rows` rows (zeroed first), atom row `r` reading plane row `r / div`.
 pub fn scales_to_atoms(

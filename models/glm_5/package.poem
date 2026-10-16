@@ -22,6 +22,7 @@ MODELS = [
 BF = dtype.bf16
 U4 = dtype.u4g64
 A8 = dtype.mxfp4a8
+F8 = dtype.e4m3tile128a8
 
 DEPLOYMENTS = [
     deployment("glm5-a12b", weights = BF, kv = BF),
@@ -33,4 +34,8 @@ DEPLOYMENTS = [
     deployment("glm53-l7", weights = BF, kv = BF),
     deployment("glm53-l7", weights = [BF, A8], kv = BF),
     deployment("glm53-mini", weights = [BF, A8], kv = BF),
+    # The release's own FP8 experts (128x128 blocks under f32 factors), as
+    # vLLM serves them: the like-for-like row.
+    deployment("glm53-l7", weights = [BF, F8], kv = BF),
+    deployment("glm53-mini", weights = [BF, F8], kv = BF),
 ]

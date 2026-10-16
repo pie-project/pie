@@ -664,7 +664,9 @@ fn pairings<'a>(
                 "is an affine bank whose zero points this plan does not publish as a \
                  param of their own",
             )?),
-            ScaleForm::F32Tensor => None,
+            // A block-FP8 bank's f32 factors, one a 128x128 block: requantized
+            // to ue8m0 atoms at load (`lay_tile_banks`).
+            ScaleForm::F32Tensor | ScaleForm::F32Factors => None,
             ScaleForm::E4m3TensorScaled => Some(row(
                 attachment.zero_point_tensor.ok_or_else(|| Fault::Param {
                     name: (*name).to_string(),
@@ -674,15 +676,6 @@ fn pairings<'a>(
                 "is an NVFP4 bank whose tensor scales this plan does not publish as a \
                  param of their own",
             )?),
-            ScaleForm::F32Factors => {
-                return Err(Fault::Param {
-                    name: (*name).to_string(),
-                    why: "carries a scale form no point this shell stamps reads: the \
-                          cuda plane's split-plane banks are mxfp4 codes under raw \
-                          e8m0 exponents, MLX affine codes under bf16 factor pairs and \
-                          NVFP4 codes under e4m3 scales and f32 tensor scales",
-                });
-            }
         };
         out.insert(
             *name,
@@ -695,6 +688,39 @@ fn pairings<'a>(
                 biases,
             },
         );
+    }
+    // A block-FP8 bank stored as released: raw e4m3 codes beside raw f32
+    // block factors (`<name>.scales`), paired by name, the factors read at
+    // load (`lay_tile_banks`).
+    let decls: BTreeMap<&str, &checkpoint::types::TensorDecl> = landing
+        .tensors
+        .iter()
+        .map(|decl| (decl.name.as_str(), decl))
+        .collect();
+    for decl in &landing.tensors {
+        let raw = |dtype| checkpoint::types::Encoding::Raw(dtype);
+        if decl.encoding != raw(checkpoint::types::DType::E4m3)
+            || decl.shape.len() < 3
+            || out.contains_key(decl.name.as_str())
+            || !index.contains_key(decl.name.as_str())
+        {
+            continue;
+        }
+        let factors = poem::scales_name(&decl.name);
+        let (Some(beside), Some(&scales)) =
+            (decls.get(factors.as_str()), index.get(factors.as_str()))
+        else {
+            continue;
+        };
+        if beside.encoding == raw(checkpoint::types::DType::F32) {
+            out.insert(
+                decl.name.as_str(),
+                Pairing {
+                    scales,
+                    biases: None,
+                },
+            );
+        }
     }
     Ok(out)
 }
@@ -913,6 +939,8 @@ impl Weights {
         lay_atoms(trace, &mut table, stream)?;
         #[cfg(feature = "cuda")]
         lay_block_atoms(trace, &mut table, &mut decoded, stream)?;
+        #[cfg(feature = "cuda")]
+        lay_tile_banks(trace, &mut table, &mut decoded, stream)?;
         if let Some(tier) = experts.as_mut() {
             let slabs: Vec<u64> = tier
                 .plan()
@@ -1389,6 +1417,7 @@ fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
             let gran = match trace.params[at].dtype {
                 Dtype::Nvfp4 => 16,
                 Dtype::Mxfp4 => 32,
+                Dtype::E4m3 | Dtype::E4m3tile128 => 128,
                 _ => continue,
             };
             banks.insert(at, gran);
@@ -1432,6 +1461,9 @@ fn lay_atoms(
         };
         // An MXFP4 plane is `[.., rows, blocks, 16]` bytes, an NVFP4 one its
         // logical `[.., rows, k]`.
+        if matches!(trace.params[at].dtype, Dtype::E4m3 | Dtype::E4m3tile128) {
+            continue;
+        }
         let shape = &trace.params[at].shape;
         let (rows, cols): (u64, u64) = match trace.params[at].dtype {
             Dtype::Mxfp4 if shape.len() >= 2 => (
@@ -1477,6 +1509,80 @@ fn lay_atoms(
     }
     if temp.is_some() {
         crate::device::ctx::sync(stream)?;
+    }
+    Ok(())
+}
+
+/// Each 128x128-block FP8 expert bank stored as released (e4m3 codes under
+/// f32 block factors) requantized in place to ue8m0 exponents, as vLLM's
+/// DeepGEMM path does on Blackwell, and the exponents spread into the
+/// tcgen05 GEMM's atoms a weight row an atom row (rows counted across the
+/// experts) in a buffer of their own, bound in the factors' place.
+#[cfg(feature = "cuda")]
+fn lay_tile_banks(
+    trace: &Trace,
+    table: &mut [Option<WeightRow>],
+    held: &mut Vec<Buffer>,
+    stream: *mut core::ffi::c_void,
+) -> Result<()> {
+    for (at, _) in act_quant_banks(trace) {
+        if !matches!(trace.params[at].dtype, Dtype::E4m3 | Dtype::E4m3tile128) {
+            continue;
+        }
+        let Some(Some(WeightRow::Planes {
+            codes,
+            scales,
+            seat,
+            atoms,
+            ..
+        })) = table.get_mut(at)
+        else {
+            continue;
+        };
+        let shape = &trace.params[at].shape;
+        let (&k, lead) = shape.split_last().unwrap_or((&0, &[]));
+        let rows: u64 = lead.iter().product();
+        if rows == 0 || k == 0 || !rows.is_multiple_of(128) || !k.is_multiple_of(512) {
+            continue;
+        }
+        // The factors plane is bound as bytes; its param states it f32.
+        if *atoms
+            || seat.streams()
+            || crate::device::alloc::is_host_pointer(codes.ptr)
+            || crate::device::alloc::is_host_pointer(scales.ptr)
+        {
+            continue;
+        }
+        let (blocks_r, blocks_k) = (rows / 128, k / 128);
+        let exps = Buffer::zeroed(usize::try_from(blocks_r * blocks_k).unwrap_or(usize::MAX))?;
+        let bytes = kernels_cuda::linear::tc5::atom_bytes(rows as usize, k as usize, 128);
+        let laid = Buffer::zeroed(bytes)?;
+        let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        // SAFETY: `stream` is the load's stream, live for the load.
+        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        kernels_cuda::linear::act_quant::fp8_tile_requant(
+            &ctx,
+            "linear.act_quant",
+            codes.ptr,
+            scales.ptr,
+            exps.ptr(),
+            to32(rows),
+            to32(k),
+        )?;
+        kernels_cuda::linear::act_quant::scales_to_atoms(
+            &ctx,
+            "linear.act_quant",
+            exps.ptr(),
+            laid.ptr(),
+            to32(rows),
+            to32(blocks_k),
+            128,
+        )?;
+        *scales = Tensor::new(laid.ptr(), to32(rows), to32(blocks_k), Dtype::U8);
+        *codes = Tensor::new(codes.ptr, codes.rows, codes.width, Dtype::E4m3);
+        *atoms = true;
+        crate::device::ctx::sync(stream)?;
+        held.push(laid);
     }
     Ok(())
 }

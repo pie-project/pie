@@ -96,7 +96,7 @@ fn the_words_name_each_precision() {
         .into_iter()
         .map(poem::star::precision_word)
         .collect();
-    assert_eq!(words, ["nvfp4a4", "mxfp4a8", "fp8b128a8"]);
+    assert_eq!(words, ["nvfp4a4", "mxfp4a8", "fp8b128a8", "e4m3tile128a8"]);
     for word in &words {
         assert_eq!(
             poem::star::precision_of(word)

@@ -424,6 +424,50 @@ __global__ void act_quant_e4m3_fan_v8(
     }
 }
 
+// A 128x128-block FP8 plane under f32 block factors (DeepSeek-V3's and
+// GLM-5.3's release: `w = code * factor`) requantized in place to ue8m0
+// exponents, as vLLM's DeepGEMM path does on Blackwell: each block's factor
+// rounded up to its power of two `2^e`, each code re-rounded to
+// `e4m3(code * factor / 2^e)` (never past e4m3's range, the ratio at most
+// one), the exponent `e + 127` landing in `exps` (`[rows / 128][cols / 128]`,
+// the factors' shape). A block a CTA; a factor not above zero leaves its
+// codes and lands exponent 0.
+__global__ void fp8_tile_requant(
+    u8* __restrict__ codes,
+    const float* __restrict__ factors,
+    u8* __restrict__ exps,
+    int rows,
+    int cols)
+{
+    const int tiles_k = (cols + 127) / 128;
+    const int rb = blockIdx.y;
+    const int cb = blockIdx.x;
+    const float f = factors[static_cast<long long>(rb) * tiles_k + cb];
+    int e = 0;
+    float ratio = 1.f;
+    if (f > 0.f) {
+        int ex;
+        const float m = frexpf(f, &ex);  // f = m * 2^ex, m in [0.5, 1)
+        e = m == 0.5f ? ex - 1 : ex;     // 2^e the least power of two >= f
+        ratio = f / ldexpf(1.f, e);
+    }
+    if (threadIdx.x == 0) {
+        exps[static_cast<long long>(rb) * tiles_k + cb] =
+            f > 0.f ? static_cast<u8>(min(max(e + 127, 0), 254)) : static_cast<u8>(0);
+    }
+    if (!(f > 0.f) || ratio == 1.f) return;
+    const int r1 = min(rows, (rb + 1) * 128);
+    const int c0 = cb * 128;
+    const int c1 = min(cols, c0 + 128);
+    for (int r = rb * 128 + static_cast<int>(threadIdx.y); r < r1; r += blockDim.y) {
+        u8* row = codes + static_cast<long long>(r) * cols;
+        for (int c = c0 + static_cast<int>(threadIdx.x); c < c1; c += blockDim.x) {
+            const float v = e4m3_value(row[c]) * ratio;
+            row[c] = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+        }
+    }
+}
+
 // A row-major plane of one-byte scales, `cols` a row, into the atom layout;
 // atom row `r` reads plane row `r / div` (a 128-row block's one scale
 // spread to each of its rows).

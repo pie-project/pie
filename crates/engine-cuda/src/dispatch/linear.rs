@@ -1053,7 +1053,7 @@ impl Run<'_> {
                 y: sy,
             } => {
                 let (codes, atoms, biases, seat) = self.planes(bank);
-                if !matches!(codes.dtype, Dtype::Mxfp4 | Dtype::U8)
+                if !matches!(codes.dtype, Dtype::Mxfp4 | Dtype::U8 | Dtype::E4m3)
                     || biases.is_some()
                     || seat.streams()
                     || !self.scales_in_atoms(bank)
@@ -1061,13 +1061,13 @@ impl Run<'_> {
                 {
                     return None;
                 }
-                (
-                    x,
-                    routes,
-                    sy,
-                    GluBank::Mxfp4A8 { codes, atoms },
-                    ExpertTable::RESIDENT,
-                )
+                // A block-FP8 bank's e4m3 codes (W8A8), else MXFP4's (W4A8).
+                let bank = if codes.dtype == Dtype::E4m3 {
+                    GluBank::Fp8A8 { codes, atoms }
+                } else {
+                    GluBank::Mxfp4A8 { codes, atoms }
+                };
+                (x, routes, sy, bank, ExpertTable::RESIDENT)
             }
             _ => return None,
         })
@@ -1375,6 +1375,16 @@ impl Run<'_> {
                 0,
                 None,
             ),
+            // A 128x128-block FP8 bank (a block-FP8 release's experts, its
+            // factors requantized to ue8m0 at load and spread a row an atom
+            // row) against e4m3 activations in 1x128 blocks (W8A8).
+            (Dtype::E4m3, ActQuant::E4m3 { gran: 128 }) => (
+                act_quant::Format::E4m3 { gran: 128 },
+                linear::tc5::Elem::E4m3,
+                128,
+                0,
+                None,
+            ),
             (stored, quant) => {
                 return Err(kernels_cuda::Error::Backend {
                     op: OP,
@@ -1394,6 +1404,7 @@ impl Run<'_> {
         // e2m1-convert register-dequant kernel, which streams the bank far
         // faster than the grouped GEMM does a handful of rows an expert.
         if let act_quant::Format::E4m3 { .. } = fmt
+            && elem == linear::tc5::Elem::E2m1
             && kernels_cuda::linear::moe::select_mxfp4_atoms_takes(self.ctx(), route_t, x)
         {
             let back =

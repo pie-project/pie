@@ -605,6 +605,13 @@ pub enum GluBank {
         codes: Tensor,
         atoms: Tensor,
     },
+    /// A 128x128-block FP8 bank against e4m3 activations in 1x128 blocks
+    /// (W8A8): e4m3 codes, their ue8m0 exponents laid in atoms a weight row
+    /// an atom row. Only [`experts`] takes it, both legs so.
+    Fp8A8 {
+        codes: Tensor,
+        atoms: Tensor,
+    },
 }
 
 /// The group of an affine 4-bit bank of bf16 factors that the tcgen05
@@ -676,7 +683,9 @@ fn bank_operand(
             )
         }
         // Its activations quantize first: no bf16 operand reads it.
-        GluBank::Nvfp4A4 { .. } | GluBank::Mxfp4A8 { .. } => return None,
+        GluBank::Nvfp4A4 { .. } | GluBank::Mxfp4A8 { .. } | GluBank::Fp8A8 { .. } => {
+            return None;
+        }
     })
 }
 
@@ -820,7 +829,9 @@ pub fn experts(
     if let (GluBank::Nvfp4A4 { .. }, GluBank::Nvfp4A4 { .. }) = (up, down) {
         return experts_w4a4(ctx, x, up, glu, down, routes, weights, inter, y, gate);
     }
-    if let (GluBank::Mxfp4A8 { .. }, GluBank::Mxfp4A8 { .. }) = (up, down) {
+    if let (GluBank::Mxfp4A8 { .. }, GluBank::Mxfp4A8 { .. })
+    | (GluBank::Fp8A8 { .. }, GluBank::Fp8A8 { .. }) = (up, down)
+    {
         return experts_w4a8(ctx, x, up, glu, down, routes, weights, inter, y, gate);
     }
     let hidden = Tensor::new(0, count, inter, Dtype::Bf16);
@@ -1213,18 +1224,44 @@ fn experts_w4a8_as(
     const W4A8_Y: &str = "linear.moe_tc5_y";
     const ROW_WEIGHTS: &str = "linear.moe_tc5_row_weights";
     const GRAN: u32 = 128;
-    let (
-        GluBank::Mxfp4A8 {
-            codes: up_codes,
-            atoms: up_atoms,
-        },
-        GluBank::Mxfp4A8 {
-            codes: down_codes,
-            atoms: down_atoms,
-        },
-    ) = (up, down)
-    else {
-        return Ok(false);
+    // The weights' element and their scale's span: MXFP4 codes a 32 under
+    // ue8m0, or e4m3 a 128 (a block-FP8 bank's rows) under ue8m0.
+    let (up_codes, up_atoms, down_codes, down_atoms, w_elem, w_gran) = match (up, down) {
+        (
+            GluBank::Mxfp4A8 {
+                codes: up_codes,
+                atoms: up_atoms,
+            },
+            GluBank::Mxfp4A8 {
+                codes: down_codes,
+                atoms: down_atoms,
+            },
+        ) => (
+            up_codes,
+            up_atoms,
+            down_codes,
+            down_atoms,
+            tc5::Elem::E2m1,
+            32,
+        ),
+        (
+            GluBank::Fp8A8 {
+                codes: up_codes,
+                atoms: up_atoms,
+            },
+            GluBank::Fp8A8 {
+                codes: down_codes,
+                atoms: down_atoms,
+            },
+        ) => (
+            up_codes,
+            up_atoms,
+            down_codes,
+            down_atoms,
+            tc5::Elem::E4m3,
+            128,
+        ),
+        _ => return Ok(false),
     };
     let tokens = routes.rows;
     let count = tokens * routes.width;
@@ -1318,7 +1355,7 @@ fn experts_w4a8_as(
         tc5::grouped_gemm_epi_with(
             ctx,
             tc5::Operand::scaled(xq, tc5::Elem::E4m3, xs, GRAN),
-            tc5::Operand::scaled(up_codes.ptr, tc5::Elem::E2m1, up_atoms.ptr, 32),
+            tc5::Operand::scaled(up_codes.ptr, w_elem, up_atoms.ptr, w_gran),
             hq,
             grouped,
             [inter, k],
@@ -1339,7 +1376,7 @@ fn experts_w4a8_as(
         tc5::grouped_gemm_epi(
             ctx,
             tc5::Operand::scaled(hq, tc5::Elem::E4m3, hs, GRAN),
-            tc5::Operand::scaled(down_codes.ptr, tc5::Elem::E2m1, down_atoms.ptr, 32),
+            tc5::Operand::scaled(down_codes.ptr, w_elem, down_atoms.ptr, w_gran),
             ys,
             grouped,
             [n, inter],

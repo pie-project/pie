@@ -285,7 +285,7 @@ fn group_of(dtype: Dtype) -> u32 {
         Dtype::E4m3tensor => 1,
         Dtype::U4g64 | Dtype::U8g64 | Dtype::U2g64 | Dtype::U4g64tiled => 64,
         Dtype::U4g32 | Dtype::U2g32 => 32,
-        Dtype::U2g128 => 128,
+        Dtype::U2g128 | Dtype::E4m3tile128 => 128,
         other => panic!("`{other:?}` blocks no axis; only a packed bank has groups"),
     }
 }
@@ -1893,6 +1893,8 @@ pub fn scaling(w: &Weight) -> Scales {
         Dtype::Mxfp4 => ScaleForm::RawE8M0,
         Dtype::Nvfp4 => ScaleForm::E4m3TensorScaled,
         Dtype::E4m3tensor => ScaleForm::F32Tensor,
+        // A block-FP8 release's f32 factors, one a 128x128 block.
+        Dtype::E4m3tile128 => ScaleForm::F32Factors,
         Dtype::U4g64
         | Dtype::U8g64
         | Dtype::U4g32

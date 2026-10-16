@@ -360,7 +360,33 @@ impl Weight {
                     },
                 ]
             }
-            Dtype::E4m3row | Dtype::E4m3tile128 | Dtype::KvU4 => panic!(
+            // A block-FP8 release's weights as released: e4m3 codes, and one
+            // f32 factor a 128x128 block (`w = code * factor`) of each
+            // projection (each expert's, in a bank), raw planes side by side.
+            Dtype::E4m3tile128 => {
+                let (&k, lead) = self
+                    .shape
+                    .split_last()
+                    .expect("a block-FP8 weight's logical shape ends in its contracted axis");
+                let (&n, slabs) = lead
+                    .split_last()
+                    .expect("a block-FP8 weight is at least a projection");
+                let mut factors = slabs.to_vec();
+                factors.extend([n.div_ceil(128), k.div_ceil(128)]);
+                vec![
+                    BankPlane {
+                        suffix: "",
+                        shape: self.shape.clone(),
+                        dtype: Dtype::E4m3,
+                    },
+                    BankPlane {
+                        suffix: SCALES,
+                        shape: factors,
+                        dtype: Dtype::F32,
+                    },
+                ]
+            }
+            Dtype::E4m3row | Dtype::KvU4 => panic!(
                 "`{}`: {} is served but not yet a weight representation a \
                  model text declares",
                 self.name, self.dtype
@@ -524,7 +550,7 @@ impl Precision {
     /// deployment's name spells each: NVFP4 against NVFP4 (W4A4, vLLM's
     /// modelopt product), and MXFP4 (W4A8) and DeepSeek's 128x128-block FP8
     /// (W8A8) against e4m3 in its 1x128 blocks.
-    pub const ACTED: [Precision; 3] = [
+    pub const ACTED: [Precision; 4] = [
         Precision {
             dtype: Dtype::Nvfp4,
             act: Some(ActQuant::Nvfp4),
@@ -535,6 +561,12 @@ impl Precision {
         },
         Precision {
             dtype: Dtype::Fp8b128,
+            act: Some(ActQuant::E4m3 { gran: 128 }),
+        },
+        // A block-FP8 release's experts as released (f32 block factors),
+        // against e4m3 in 1x128 blocks: vLLM's W8A8 MoE on them.
+        Precision {
+            dtype: Dtype::E4m3tile128,
             act: Some(ActQuant::E4m3 { gran: 128 }),
         },
     ];
