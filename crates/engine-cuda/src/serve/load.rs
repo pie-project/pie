@@ -536,6 +536,12 @@ impl Shell {
             decode_dense,
             boot.deferred_tier,
         )?;
+        // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
+        // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).
+        #[cfg(feature = "cuda")]
+        if device.ctx().tuning().fp8_o_down && kernels_cuda::linear::tc5::supported() {
+            weights.requantize_grouped(&boot.trace, device.stream())?;
+        }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after weights resident",

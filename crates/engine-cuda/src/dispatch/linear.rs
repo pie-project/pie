@@ -700,6 +700,42 @@ impl Run<'_> {
                 y,
             } => {
                 const OP: &str = "linear.matmul_grouped";
+                // A plane requantized in place to fp8b128 at load
+                // (`kernel.gemm.fp8_o_down`): a decode's rows on it; a
+                // prefill's on its bf16 again, landed in a scratch for
+                // cuBLAS (ahead of the grouped tcgen05 GEMM there).
+                #[cfg(feature = "cuda")]
+                if let Some((codes, atoms)) = self.fp8_grouped_plane(*w) {
+                    let (x, mut out) = (self.tensor(*x), self.tensor(*y));
+                    if out.rows <= linear::moe::GROUPED_FP8_ROWS {
+                        return linear::moe::matmul_grouped_fp8(
+                            self.ctx(),
+                            x,
+                            codes.ptr,
+                            atoms.ptr,
+                            &mut out,
+                            *groups,
+                        );
+                    }
+                    let bytes = codes.rows as usize * codes.width as usize * 2;
+                    let plane = self.ctx().scratch_stream(OP, FP8_PLANE_BF16, bytes)? as u64;
+                    linear::moe::dequantize_fp8b128(
+                        self.ctx(),
+                        codes.ptr,
+                        atoms.ptr,
+                        plane,
+                        codes.rows,
+                        codes.width,
+                    )?;
+                    let bank = Tensor::new(plane, codes.rows, codes.width, Dtype::Bf16);
+                    return linear::moe::matmul_grouped_strided(
+                        self.ctx(),
+                        x,
+                        bank,
+                        &mut out,
+                        *groups,
+                    );
+                }
                 if self.maybe_tiled_planes(*w).is_some() {
                     return Err(kernels_cuda::Error::Backend {
                         op: OP,
@@ -1964,3 +2000,8 @@ fn routes_of(op: &Linear) -> Option<ValueId> {
         _ => None,
     }
 }
+
+/// The bf16 of a plane requantized to fp8b128 at load, for a fire too wide
+/// for the fp8 kernel; one a stream.
+#[cfg(feature = "cuda")]
+const FP8_PLANE_BF16: &str = "linear.matmul_grouped.fp8_plane_bf16";

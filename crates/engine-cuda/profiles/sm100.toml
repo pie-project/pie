@@ -113,6 +113,13 @@ moe.mxfp4_a8_until = 48
 # register-dequant select streams the six experts where the grouped tcgen05
 # GEMM lays them out first (decode bs1 13.66 -> 13.00 ms a token).
 moe.mxfp4_a8_from = 1
+# DeepSeek-V4's grouped output projection (`wo_a`) at decode widths (up
+# to 8 rows) on fp8b128 as vLLM reads it: the bf16 plane the import
+# dequantized from the checkpoint's fp8 gains a twin requantized at load,
+# each value exactly the checkpoint's (every one of DeepSeek-V4-Flash's
+# 88064 blocks checked), against the rows in e4m3 1x128 on mma.sync. Wider
+# fires keep the bf16 on cuBLAS, ahead of the grouped tcgen05 GEMM there.
+gemm.fp8_o_down = true
 # AttnRes's blend and the norm of its row in one pass, 512 threads a row:
 # Kimi-K3's sublayer inputs lose a launch and a row's round trip each.
 attn_res.fused_norm = true

@@ -194,6 +194,16 @@ pub struct MoeMxfp4MmaFrom(pub u32);
 #[decision(id = "kernel.moe.mxfp4_cvt", flag, default = false, tune = search)]
 pub struct MoeMxfp4Cvt;
 
+/// A grouped bf16 projection on routes that send each group to its own
+/// plane (DeepSeek-V4's `wo_a`, dequantized at import from the checkpoint's
+/// fp8b128) requantized at load to fp8b128, each value exactly the
+/// checkpoint's, and run as vLLM runs it: W8A8 against the rows in e4m3
+/// 1x128 blocks (a decode's few rows on mma.sync, wider fires on the
+/// grouped tcgen05 GEMM). Off: the bf16 plane on cuBLAS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.fp8_o_down", flag, default = false, tune = search)]
+pub struct GemmFp8ODown;
+
 /// The most routes a W4A8 select (an MXFP4 bank against e4m3
 /// activations) reads its activations back to bf16 for and runs on the
 /// e2m1-convert register-dequant kernel (`kernel.moe.mxfp4_cvt`), from
@@ -565,6 +575,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
         .add::<MoeMxfp4Cvt>()
+        .add::<GemmFp8ODown>()
         .add::<MoeMxfp4A8Until>()
         .add::<MoeMxfp4A8From>()
         .add::<GemmBiasEpilogue>()
@@ -647,6 +658,7 @@ pub struct Tuning {
     pub mxfp4_mma_until: u32,
     pub mxfp4_mma_from: u32,
     pub mxfp4_cvt: bool,
+    pub fp8_o_down: bool,
     pub mxfp4_a8_until: u32,
     pub mxfp4_a8_from: u32,
     pub gemm_bias_epilogue: bool,
@@ -727,6 +739,7 @@ impl Tuning {
         mxfp4_mma_until: 0,
         mxfp4_mma_from: 64,
         mxfp4_cvt: false,
+        fp8_o_down: false,
         mxfp4_a8_until: 0,
         mxfp4_a8_from: 0,
         gemm_bias_epilogue: false,
@@ -807,6 +820,7 @@ impl Tuning {
             mxfp4_mma_until: profile.get::<MoeMxfp4MmaUntil>().0,
             mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,
             mxfp4_cvt: profile.on::<MoeMxfp4Cvt>(&Anywhere),
+            fp8_o_down: profile.on::<GemmFp8ODown>(&Anywhere),
             mxfp4_a8_until: profile.get::<MoeMxfp4A8Until>().0,
             mxfp4_a8_from: profile.get::<MoeMxfp4A8From>().0,
             gemm_bias_epilogue: profile.on::<GemmBiasEpilogue>(&Anywhere),

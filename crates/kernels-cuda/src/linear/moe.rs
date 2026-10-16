@@ -2699,6 +2699,159 @@ pub fn sigmoid_gate_add(
     )
 }
 
+/// The most rows [`matmul_grouped_fp8`] takes: the MMA's eight columns.
+/// Past them cuBLAS's bf16 leads (mma.sync's fp8 at 16, 32 and 64 rows
+/// took 20, 30 and 58 us to its 14 to 15, staged or split as it might be).
+pub const GROUPED_FP8_ROWS: u32 = 8;
+
+/// A grouped projection on fp8 planes (DeepSeek-V4's `wo_a` as its
+/// checkpoint stores it, and as vLLM reads it): `y[r, g*n ..] = q(x[r, g*k
+/// .. g*k + k]) . w_g^T`, each plane `[n, k]` of e4m3 codes under one ue8m0
+/// exponent a 128x128 block (`scales`, spread to the block's rows in
+/// tcgen05's atoms as the load lays them), `q` the rows' e4m3 1x128
+/// quantization (DeepSeek's `act_quant`), in the same launch: DeepSeek's
+/// W8A8 product on mma.sync, each plane streamed once. At most
+/// [`GROUPED_FP8_ROWS`] rows; `k` whole 512s, `n` whole 64s.
+#[cfg(feature = "cuda")]
+pub fn matmul_grouped_fp8(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: u64,
+    scales: u64,
+    y: &mut Tensor,
+    groups: u32,
+) -> Result<(), Error> {
+    const OP: &str = "linear.matmul_grouped";
+    // Four 16-row tiles a CTA (the rows quantized once for 64 rows of the
+    // plane), K in quarters a tile, two steps of codes in flight a warp: at
+    // DeepSeek-V4-Flash's planes 9.9 / 11.3 / 13.1 us at 1 / 4 / 8 rows past
+    // L2, where cuBLAS's bf16 takes 13.7 / 13.7 / 13.4 (two tiles: 9.8 /
+    // 12.4 / 16.4; eight: 21 and up; K in eighths: 14 and up).
+    let (tiles, split, depth) = (4u32, 4u32, 2u32);
+    if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
+        return Err(refuse(OP, "the fp8 grouped leg reads and lands bf16 rows"));
+    }
+    if groups == 0
+        || !x.width.is_multiple_of(groups)
+        || !y.width.is_multiple_of(groups)
+        || x.rows != y.rows
+    {
+        return Err(refuse(OP, "the groups do not divide the rows' widths"));
+    }
+    let (k, n) = (x.width / groups, y.width / groups);
+    if !k.is_multiple_of(128 * split) || !n.is_multiple_of(16 * tiles) || y.rows > GROUPED_FP8_ROWS
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "the fp8 grouped leg takes K in whole 512s, N in whole 64s and at most \
+                 {GROUPED_FP8_ROWS} rows, not {} rows of [{n}, {k}]",
+                y.rows
+            ),
+        ));
+    }
+    if y.rows == 0 {
+        return Ok(());
+    }
+    // The rows' codes (padded 16 bytes a row) and exponents, or the
+    // tiles' sums of K handed across, whichever is more.
+    let smem = (y.rows * (k + 16) + y.rows * (k / 128) * 4).max(tiles * (split - 1) * 4 * 32 * 4);
+    ctx.fire(
+        OP,
+        Fire::at(
+            "linear/grouped_fp8.cuh",
+            symbol(&format!(
+                "::pie::linear::grouped_mma_fp8b128<::pie::i32({tiles}), ::pie::i32({split}), \
+                 ::pie::i32({depth})>"
+            )),
+        )
+        .apply(Launch::grid([n / (16 * tiles), groups, 1], [32 * split * tiles, 1, 1]).smem(smem)),
+        &[
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(scales),
+            x.arg(),
+            y.arg(),
+            stated(OP, y.rows)?.arg(),
+            stated(OP, n)?.arg(),
+            stated(OP, k)?.arg(),
+            stated(OP, groups)?.arg(),
+        ],
+    )
+}
+
+/// A bf16 plane `[rows, k]` (whole 128x128 blocks) as fp8b128 in place of
+/// itself elsewhere: e4m3 codes `[rows, k]` at `codes`, and each block's
+/// ue8m0 exponent spread to its rows in tcgen05's atoms at `atoms`
+/// (`tc5::atom_bytes(rows, k, 128)` bytes, zeroed). Each block's exponent is
+/// the least that holds its amax (DeepSeek's rule), so a plane dequantized
+/// from fp8b128 (DeepSeek-V4's `wo_a`) lands codes of exactly its values.
+#[cfg(feature = "cuda")]
+pub fn quantize_fp8b128(ctx: &Ctx, src: Tensor, codes: u64, atoms: u64) -> Result<(), Error> {
+    const OP: &str = "linear.quantize_fp8b128";
+    if src.dtype != Dtype::Bf16
+        || !src.rows.is_multiple_of(128)
+        || !src.width.is_multiple_of(128)
+        || src.rows == 0
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "quantizes a bf16 plane of whole 128x128 blocks, not {} x {} {:?}",
+                src.rows, src.width, src.dtype
+            ),
+        ));
+    }
+    ctx.fire(
+        OP,
+        Fire::at("linear/grouped_fp8.cuh", "::pie::linear::quantize_fp8b128").apply(Launch::grid(
+            [src.width / 128, src.rows / 128, 1],
+            [256, 1, 1],
+        )),
+        &[
+            src.arg(),
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            stated(OP, src.rows)?.arg(),
+            stated(OP, src.width)?.arg(),
+        ],
+    )
+}
+
+/// An fp8b128 plane (`codes` `[rows, k]`, each 128x128 block's exponent
+/// spread to its rows in tcgen05's atoms at `atoms`) as bf16 at `out`, each
+/// value exactly: the bf16 [`quantize_fp8b128`] read.
+#[cfg(feature = "cuda")]
+pub fn dequantize_fp8b128(
+    ctx: &Ctx,
+    codes: u64,
+    atoms: u64,
+    out: u64,
+    rows: u32,
+    k: u32,
+) -> Result<(), Error> {
+    const OP: &str = "linear.dequantize_fp8b128";
+    if !k.is_multiple_of(128) {
+        return Err(refuse(OP, format!("K {k} is not whole 128-wide blocks")));
+    }
+    let threads = u32::try_from((u64::from(rows) * u64::from(k)).div_ceil(16))
+        .map_err(|_| refuse(OP, "the plane's 16-code runs pass a 32-bit launch"))?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            "linear/grouped_fp8.cuh",
+            "::pie::linear::dequantize_fp8b128",
+        )
+        .apply(Launch::flat(threads, 256)),
+        &[
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            ArgValue::Ptr(out),
+            stated(OP, rows)?.arg(),
+            stated(OP, k)?.arg(),
+        ],
+    )
+}
+
 /// A grouped projection whose routes send row group `g` to bank `g` (what
 /// `group_routes` lays): one strided batched GEMM, group `g` of every row
 /// against plane `g`, rather than the routed select's layout, gather,

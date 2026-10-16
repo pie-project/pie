@@ -34,3 +34,6 @@ cudarc = { version = "0.19.8", optional = true, default-features = false, featur
 ] }
 
 tracing = "0.1"
+
+[dev-dependencies]
+ztensor-compat = { workspace = true }

@@ -3080,6 +3080,7 @@ dependencies = [
  "pie-dtype",
  "pie-profile",
  "tracing",
+ "ztensor-compat",
 ]
 
 [[package]]

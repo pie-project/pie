@@ -446,6 +446,7 @@ mod tests {
                     u32::from(major == 10 && minor == 0),
                     "{gpu}"
                 );
+                assert_eq!(tuning.fp8_o_down, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
                     tuning.decode_xqa_from_64,
                     if b200 { 16 } else { 0 },
@@ -507,6 +508,7 @@ mod tests {
                         mxfp4_cvt: false,
                         mxfp4_a8_until: 0,
                         mxfp4_a8_from: 0,
+                        fp8_o_down: false,
                         ..tuning
                     },
                     defaults,

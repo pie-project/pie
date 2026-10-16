@@ -959,13 +959,125 @@ impl Weights {
         }
         Ok(Weights {
             store,
-            table: WeightTable(table),
+            table: WeightTable(table, BTreeMap::new()),
             banks: banks(trace, &places),
             experts,
             from_cache,
             rotor: None,
             decoded,
         })
+    }
+
+    /// `kernel.gemm.fp8_o_down`: each grouped bf16 projection whose routes
+    /// send group g to plane g (DeepSeek-V4's `wo_a`, which the import
+    /// dequantizes from the checkpoint's fp8b128), read by that projection
+    /// alone, requantized to fp8b128 in its own slot: e4m3 codes, then each
+    /// 128x128 block's exponent spread to its rows in tcgen05's atoms, each
+    /// value the bf16's exactly, so the checkpoint's own. In place, so the
+    /// card holds no more than it did (a twin beside the bf16 costs the
+    /// pools 1.4 GB, and a prefill 1% on DeepSeek-V4-Flash). Returns the
+    /// planes it requantized.
+    #[cfg(feature = "cuda")]
+    pub fn requantize_grouped(
+        &mut self,
+        trace: &Trace,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<u32> {
+        use poem_ir::{Def, Linear, Operands, Operation};
+        let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
+            Some(Def::Weight(at)) => Some(*at as usize),
+            _ => None,
+        };
+        let readers = |id: poem_ir::ValueId| {
+            let mut ins = Vec::new();
+            trace
+                .nodes
+                .iter()
+                .filter(|node| {
+                    ins.clear();
+                    node.op.inputs(&mut ins);
+                    ins.contains(&id)
+                })
+                .count()
+        };
+        // SAFETY: `stream` is the load's stream, live for the load.
+        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        let mut done = 0;
+        for node in &trace.nodes {
+            let Operation::Linear(Linear::MatmulGrouped {
+                w, routes, groups, ..
+            }) = &node.op
+            else {
+                continue;
+            };
+            let trivial = matches!(
+                trace.values.get(routes.0 as usize).map(|v| &v.def),
+                Some(Def::Op(at)) if matches!(
+                    &trace.nodes[*at as usize].op,
+                    Operation::Linear(Linear::GroupRoutes { groups: g, .. }) if g == groups
+                )
+            );
+            let Some(at) = weight(*w) else { continue };
+            let Some(Some(WeightRow::Dense(plane))) = self.table.0.get(at).copied() else {
+                continue;
+            };
+            if self.table.1.contains_key(&at) {
+                continue;
+            }
+            let (rows, k) = (plane.rows as usize, plane.width as usize);
+            let n = rows / (*groups).max(1) as usize;
+            if !trivial
+                || plane.dtype != Dtype::Bf16
+                || readers(*w) != 1
+                || !rows.is_multiple_of(128)
+                || !k.is_multiple_of(512)
+                || !n.is_multiple_of(32)
+            {
+                continue;
+            }
+            let atom_bytes = kernels_cuda::linear::tc5::atom_bytes(rows, k, 128);
+            let staged = Buffer::zeroed(rows * k + atom_bytes)?;
+            kernels_cuda::linear::moe::quantize_fp8b128(
+                &ctx,
+                plane,
+                staged.ptr(),
+                staged.ptr() + (rows * k) as u64,
+            )?;
+            // The codes and atoms into the bf16's own slot, half of it.
+            // SAFETY: both spans are live device memory of these lengths (the
+            // slot `rows * k * 2` bytes), on the load's stream.
+            unsafe {
+                crate::device::ctx::check(
+                    "cudaMemcpyAsync",
+                    cudarc::runtime::sys::cudaMemcpyAsync(
+                        plane.ptr as usize as *mut core::ffi::c_void,
+                        staged.ptr() as usize as *const core::ffi::c_void,
+                        rows * k + atom_bytes,
+                        cudarc::runtime::sys::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                        stream.cast(),
+                    ),
+                )?;
+                crate::device::ctx::check(
+                    "cudaStreamSynchronize",
+                    cudarc::runtime::sys::cudaStreamSynchronize(stream.cast()),
+                )?;
+            }
+            drop(staged);
+            self.table.1.insert(
+                at,
+                (
+                    Tensor::new(plane.ptr, plane.rows, plane.width, Dtype::Fp8b128),
+                    Tensor::new(
+                        plane.ptr + (rows * k) as u64,
+                        plane.rows,
+                        plane.width / 128,
+                        Dtype::U8,
+                    ),
+                ),
+            );
+            done += 1;
+        }
+        Ok(done)
     }
 
     pub fn rotate(

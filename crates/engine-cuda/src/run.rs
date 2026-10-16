@@ -36,7 +36,12 @@ pub enum WeightRow {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct WeightTable(pub Vec<Option<WeightRow>>);
+pub struct WeightTable(
+    pub Vec<Option<WeightRow>>,
+    /// A dense row requantized in place at load to fp8b128 (codes,
+    /// atom-laid exponents; `kernel.gemm.fp8_o_down`): its bf16 is gone.
+    pub std::collections::BTreeMap<usize, (Tensor, Tensor)>,
+);
 
 #[derive(Clone, Debug, Default)]
 pub struct SlotTable(pub Vec<Option<Tensor>>);
@@ -1646,6 +1651,16 @@ impl<'c> Run<'c> {
             }) => Some((codes, scales, biases, seat)),
             _ => None,
         }
+    }
+
+    /// The fp8b128 codes and atom-laid exponents a grouped projection's bf16
+    /// plane was requantized to in place at load (`kernel.gemm.fp8_o_down`).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn fp8_grouped_plane(&self, id: ValueId) -> Option<(Tensor, Tensor)> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        self.weights.1.get(&(*w as usize)).copied()
     }
 
     pub(crate) fn maybe_tiled_planes(
