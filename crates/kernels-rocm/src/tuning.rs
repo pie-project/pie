@@ -9,6 +9,12 @@ use profile::{Anywhere, Decision, Profile, Registry};
 #[decision(id = "kernel.moe.grouped", flag, default = true, tune = search)]
 pub struct MoeGrouped;
 
+/// Whether a dense bank's grouped prefill takes hipBLASLt's grouped GEMM
+/// kernels (hip/lt_grouped.rs) where the first-use timing finds them faster.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.lt_grouped", flag, default = true, tune = search)]
+pub struct MoeLtGrouped;
+
 /// The same for mxfp4 banks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.mxfp4_grouped", flag, default = true, tune = search)]
@@ -227,6 +233,7 @@ pub struct DenseBatchWeightMaxMi(pub u32);
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
+        .add::<MoeLtGrouped>()
         .add::<MoeMxfp4Grouped>()
         .add::<MoeMxfp4Wmma>()
         .add::<DecodeSplitSmall>()
@@ -269,6 +276,7 @@ pub fn register(registry: &mut Registry) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tuning {
     pub moe_grouped: bool,
+    pub moe_lt_grouped: bool,
     pub mxfp4_grouped: bool,
     pub mxfp4_wmma: bool,
     pub decode_split_small: bool,
@@ -313,6 +321,7 @@ impl Tuning {
     /// The registry defaults; a test holds the two equal.
     pub const DEFAULT: Tuning = Tuning {
         moe_grouped: true,
+        moe_lt_grouped: true,
         mxfp4_grouped: true,
         mxfp4_wmma: true,
         decode_split_small: false,
@@ -355,6 +364,7 @@ impl Tuning {
     pub fn of(profile: &Profile) -> Tuning {
         Tuning {
             moe_grouped: profile.on::<MoeGrouped>(&Anywhere),
+            moe_lt_grouped: profile.on::<MoeLtGrouped>(&Anywhere),
             mxfp4_grouped: profile.on::<MoeMxfp4Grouped>(&Anywhere),
             mxfp4_wmma: profile.on::<MoeMxfp4Wmma>(&Anywhere),
             decode_split_small: profile.on::<DecodeSplitSmall>(&Anywhere),

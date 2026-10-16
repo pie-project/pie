@@ -346,6 +346,7 @@ const _: () = assert!(core::mem::size_of::<LtHeuristic>() == 56);
 table!(Hipblaslt from "libhipblaslt.so" {
     fn hipblasLtCreate(handle: *mut Lt) -> LtStatus;
     fn hipblasLtDestroy(handle: Lt) -> LtStatus;
+    fn hipblasLtGetVersion(handle: Lt, version: *mut c_int) -> LtStatus;
     fn hipblasLtMatmulDescCreate(desc: *mut LtDesc, compute: c_int, scale: c_int) -> LtStatus;
     fn hipblasLtMatmulDescDestroy(desc: LtDesc) -> LtStatus;
     fn hipblasLtMatmulDescSetAttribute(desc: LtDesc, attr: c_int, value: *const c_void, size: usize) -> LtStatus;

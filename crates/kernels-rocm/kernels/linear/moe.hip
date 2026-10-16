@@ -615,4 +615,128 @@ __global__ __launch_bounds__(256) void moe_swiglu_ordered(const T* __restrict__ 
     *reinterpret_cast<Pack8<T>*>(h + row * I + c) = o;
 }
 
+// The hipBLASLt grouped leg (hip/lt_grouped.rs). Routes come in expert order
+// from moe_route_order: expert e's at order[offsets[e] .. offsets[e+1]),
+// the dead ones after offsets[num_experts].
+//
+// Each expert's hipBLASLt `UserArguments` (196 packed bytes, 49 words): m = n
+// (the weight's rows), n = its routes, batch 1, k; d = c its rows of
+// `staged_out`, a its [n, k] weight, b its rows of `staged_in`; strides;
+// alpha 1. An n = 0 sentinel follows the experts, so a worst-case grid's
+// spare workgroups end there. Threads of one block write them.
+template <class T>
+__device__ __forceinline__ void lt_write_args(const i32* __restrict__ offsets, u32* __restrict__ args, u64 bank,
+                                              u64 staged_in, u64 staged_out, int n, int k, int num_experts) {
+    for (int e = threadIdx.x; e <= num_experts; e += blockDim.x) {
+        u32 w[49];
+#pragma unroll
+        for (int i = 0; i < 49; ++i) w[i] = 0;
+        if (e < num_experts) {
+            const u32 off = static_cast<u32>(offsets[e]);
+            const u32 c = static_cast<u32>(offsets[e + 1]) - off;
+            const u64 d = staged_out + static_cast<u64>(off) * n * sizeof(T);
+            const u64 a = bank + static_cast<u64>(e) * n * k * sizeof(T);
+            const u64 b = staged_in + static_cast<u64>(off) * k * sizeof(T);
+            w[0] = n;
+            w[1] = c;
+            w[2] = 1;
+            w[3] = k;
+            w[4] = static_cast<u32>(d);
+            w[5] = static_cast<u32>(d >> 32);
+            w[6] = static_cast<u32>(d);
+            w[7] = static_cast<u32>(d >> 32);
+            w[8] = static_cast<u32>(a);
+            w[9] = static_cast<u32>(a >> 32);
+            w[10] = static_cast<u32>(b);
+            w[11] = static_cast<u32>(b >> 32);
+            w[12] = n;
+            w[13] = n * c;
+            w[14] = n;
+            w[15] = n * c;
+            w[16] = k;
+            w[17] = static_cast<u32>(n) * k;
+            w[18] = k;
+            w[19] = k * c;
+            w[20] = 0x3f800000u;  // alpha = 1.0f; beta (word 24) stays 0
+        }
+        u32* rec = args + static_cast<long long>(e) * 49;
+#pragma unroll
+        for (int i = 0; i < 49; ++i) rec[i] = w[i];
+    }
+}
+
+// The routing scatter: the routes' rows gathered by expert into `staged`
+// (row p = act[order[p] / act_div]) and, when `pos` is given, each route's
+// row there (pos[order[p]] = p); block 0 writes the arguments as well. Rows
+// move in 16-byte pieces (k a multiple of 8), a grid-stride over the live
+// routes.
+template <class T>
+__global__ __launch_bounds__(256) void moe_lt_scatter(const T* __restrict__ act, const i32* __restrict__ order,
+                                                      const i32* __restrict__ offsets, T* __restrict__ staged,
+                                                      u32* __restrict__ args, i32* __restrict__ pos, u64 bank,
+                                                      u64 staged_out, int act_div, int n, int k, int num_experts) {
+    if (blockIdx.x == 0)
+        lt_write_args<T>(offsets, args, bank, reinterpret_cast<u64>(staged), staged_out, n, k, num_experts);
+    using V = uint4;
+    const int pieces = k / 8;
+    const long long routed = offsets[num_experts];
+    const long long stride = static_cast<long long>(gridDim.x) * blockDim.x;
+    const long long first = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (pos != nullptr)
+        for (long long p = first; p < routed; p += stride) pos[order[p]] = static_cast<i32>(p);
+    for (long long i = first; i < routed * pieces; i += stride) {
+        const long long p = i / pieces;
+        const int c = static_cast<int>(i - p * pieces);
+        const long long src = static_cast<long long>(order[p] / act_div) * k;
+        reinterpret_cast<V*>(staged + p * k)[c] = reinterpret_cast<const V*>(act + src)[c];
+    }
+}
+
+// The arguments alone, for a leg whose rows are already by expert (the down
+// projection of the sorted routed MLP). One block.
+template <class T>
+__global__ __launch_bounds__(256) void moe_lt_args(const i32* __restrict__ offsets, u32* __restrict__ args, u64 bank,
+                                                   u64 staged_in, u64 staged_out, int n, int k, int num_experts) {
+    lt_write_args<T>(offsets, args, bank, staged_in, staged_out, n, k, num_experts);
+}
+
+// The grouped leg's rows back in route order: out[order[p]] = staged[p]
+// for the routed rows; n a multiple of 8.
+template <class T>
+__global__ __launch_bounds__(256) void moe_lt_unscatter(const T* __restrict__ staged, const i32* __restrict__ order,
+                                                        const i32* __restrict__ offsets, T* __restrict__ out, int n,
+                                                        int num_experts) {
+    using V = uint4;
+    const int pieces = n / 8;
+    const long long live = static_cast<long long>(offsets[num_experts]) * pieces;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < live;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long p = i / pieces;
+        const int c = static_cast<int>(i - p * pieces);
+        reinterpret_cast<V*>(out + static_cast<long long>(order[p]) * n)[c] =
+            reinterpret_cast<const V*>(staged + p * n)[c];
+    }
+}
+
+// The sorted routed MLP's fold: y[n][h] = Σ_k weights[n][k] ·
+// sorted[pos[n·top_k + k]][h], summed in f32 and rounded once; a dead route
+// (expert < 0) adds nothing. As moe_weighted_sum, over the staged window.
+template <class T>
+__global__ void moe_lt_fold(T* __restrict__ out, const T* __restrict__ sorted, const i32* __restrict__ pos,
+                            const i32* __restrict__ routes, const float* __restrict__ weights, int top_k, int hidden,
+                            const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long n = window.plane(blockIdx.x);
+    const int h = blockIdx.y * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+    const long long base = n * top_k;
+    float acc = 0.f;
+    for (int k = 0; k < top_k; ++k) {
+        if (routes[base + k] < 0) continue;
+        acc += weights[base + k] * to_f32(sorted[static_cast<long long>(pos[base + k]) * hidden + h]);
+    }
+    out[n * hidden + h] = from_f32<T>(acc);
+}
+
 }  // namespace pie::linear

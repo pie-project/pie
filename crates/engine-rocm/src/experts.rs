@@ -587,10 +587,16 @@ fn routed(
     let mut banks: Vec<BankPlan> = Vec::new();
     let mut groups: Vec<GroupPlan> = Vec::new();
     let mut arity: Option<u32> = None;
-    for node in &trace.nodes {
-        let Operation::Linear(op) = &node.op else {
-            continue;
-        };
+    // A fused routed MLP's selects read their banks as they would apart.
+    let selects = trace.nodes.iter().flat_map(|node| match &node.op {
+        Operation::Linear(op) => vec![op],
+        Operation::Fused(poem_ir::Fused::MoeExperts { select, down, .. }) => {
+            vec![&**select, &**down]
+        }
+        Operation::Fused(poem_ir::Fused::MoeSelectGlu { select, .. }) => vec![&**select],
+        _ => Vec::new(),
+    });
+    for op in selects {
         let (bank, dense) = match op {
             Linear::MoeMatmulSelect { bank, .. } => (*bank, true),
             Linear::MoeMatmulSelectBias { bank, .. }

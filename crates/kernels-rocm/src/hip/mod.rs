@@ -4,6 +4,7 @@
 
 pub mod blas;
 pub mod lt;
+pub mod lt_grouped;
 pub mod rt;
 pub mod sys;
 

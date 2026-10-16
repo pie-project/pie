@@ -15,12 +15,14 @@ path = "src/lib.rs"
 [features]
 default = []
 
-rocm = ["dep:libloading"]
+rocm = ["dep:libloading", "dep:miniz_oxide"]
 
 [dependencies]
 dtype = { package = "pie-dtype", path = "../dtype" }
 profile = { package = "pie-profile", path = "../profile" }
 
 libloading = { version = "0.9", optional = true }
+miniz_oxide = { version = "0.8", optional = true }
 
 tracing = "0.1"
+

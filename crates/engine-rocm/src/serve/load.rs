@@ -1168,7 +1168,9 @@ fn decoded_weight_planes(
                 continue;
             };
             let at_tokens = match &node.op {
-                poem_ir::Operation::Linear(_) => {
+                // A fused routed MLP decodes the planes its selects would.
+                poem_ir::Operation::Linear(_)
+                | poem_ir::Operation::Fused(poem_ir::Fused::MoeExperts { .. }) => {
                     outputs.clear();
                     node.op.outputs(&mut outputs);
                     outputs.iter().any(|id| token_rows(*id))
