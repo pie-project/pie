@@ -7,6 +7,7 @@ pub mod shared;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use engine::ports::Envelope;
 use engine::program::ProgramRegistration;
 use eta_exec::adopt_launch_package;
 use eta_exec::{ExecPlan, Extents, Versions};
@@ -18,7 +19,6 @@ use crate::error::{Fault, Result};
 
 pub use compile::{Cache, Compiled, Module, Region, Stage, Target};
 pub use launch::{ChannelShape, Cursor, Prepared, Rings};
-pub use ports::Envelope;
 pub use session::{Blocked, Fired, Launched, Session, seeds_of};
 pub use shared::{MAX_ATTACHMENTS, SharedRing};
 

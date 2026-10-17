@@ -4,12 +4,8 @@ These are diagnostics for the engine, driven through the Python `eta` port
 (`rs-fork-probe-py`): they launch N copies of a greedy program at once and
 assert every copy produced the same tokens. A greedy program is a pure
 function of its prompt, so any spread is the engine's, not the guest's.
-
-Known state (2026-10-12, engine-cuda, RTX 4090): the forked decodes are
-stable on gemma-4-E4B and Qwen3.5-0.8B over four boots each (the
-copy-on-write divergence recorded on 2026-09-05 is gone). The first test
-once saw two outputs on Qwen3.5-0.8B straight after boot, a near-tie
-flipping at the third token; three later boots were stable.
+A forked decode that diverges where its page-aligned control does not points at
+the copy-on-write of a shared page.
 
     uv run python tests/examples/test_engine_repro.py --attach ws://127.0.0.1:8080
 """
@@ -50,11 +46,32 @@ async def test_forked_decode_onto_fresh_pages_is_batch_invariant(client, args):
     assert len(got) == 1, f"{len(got)} distinct outputs even with page-aligned forks:\n" + "\n".join(got)
 
 
+BUFFERED = "rs-fork-buffered-probe-py"
+
+
+async def test_a_fork_with_rows_buffered_leaves_both_sides_as_they_were(client, args):
+    """A hybrid model's fork while rows sit unfolded in the recurrent buffer
+    (#860): the parent kept beside a live fork, and the fork itself, decode
+    what the unforked sequence does. Positions 40 and 63 put the next row on
+    the shared buffer page, the copy-on-write that once lost the rows."""
+    if (await run_inferlet(client, BUFFERED, {"at": 0, "tail": 1}, timeout=args.timeout)) == "not hybrid":
+        return
+    for at in (40, 63):
+        runs = {
+            variant: (await run_inferlet(client, BUFFERED, {"variant": variant, "at": at, "tail": 32}, timeout=args.timeout)).strip()
+            for variant in ("none", "fork", "child")
+        }
+        assert runs["fork"] == runs["none"] == runs["child"], f"fork at {at} with a row buffered diverges:\n" + "\n".join(
+            f"{variant}: {out}" for variant, out in runs.items()
+        )
+
+
 def tests():
     return [
         test_unforked_greedy_decode_is_batch_invariant,
         test_forked_greedy_decode_is_batch_invariant,
         test_forked_decode_onto_fresh_pages_is_batch_invariant,
+        test_a_fork_with_rows_buffered_leaves_both_sides_as_they_were,
     ]
 
 

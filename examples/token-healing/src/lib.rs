@@ -32,10 +32,9 @@
 //! <https://github.com/guidance-ai/llguidance> — and llama.cpp's
 //! `--token-healing`.
 //!
-//! Faithfulness: **Exact**. See
-//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+//! Faithfulness: **Exact**.
 
-use inferlet::eta::hybrid::prelude::*;
+use inferlet::eta::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -96,26 +95,6 @@ async fn main(input: Input) -> Result<Output> {
 
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-    // One recurrent working set for the whole generation on a hybrid model (the
-    // engine requires one per request row, and this program runs one row);
-    // none on a pure-attention one. The SAME set is passed to the prefill and
-    // to the decode, so the decode continues the prefill's fold rather than
-    // starting cold.
-    // Fold policy below: everything, every fire — healing never buffers.
-    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
-        model::ForwardKind::Attention => Vec::new(),
-        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
-        model::ForwardKind::Recurrent => {
-            return Err(
-                "this program has no recurrent-only path (no registered model reports that kind)"
-                    .into(),
-            );
-        }
-        model::ForwardKind::Diffusion => {
-            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
-        }
-    };
-    let page_size = kv_page_size();
 
     let full = model::encode(&input.prompt);
     if full.len() <= input.backoff {
@@ -173,44 +152,15 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let n = prompt.len() as u32;
-    let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages).context("reserve KV")?;
 
     let prompt_tokens = Channel::from_iter(prompt.iter().map(|&t| t as i32));
     let prefill_indptr = Channel::from([0u32, n]).named("prefill_indptr");
-    let prefill_positions = Channel::from_iter(0..n).named("prefill_positions");
-    let prefill_pages = Channel::from_iter(0..max_pages).named("prefill_pages");
-    let prefill_page_indptr =
-        Channel::from([0u32, n.div_ceil(page_size)]).named("prefill_page_indptr");
-    let prefill_w_slot = Channel::from_iter((0..n).map(|p| p / page_size)).named("prefill_w_slot");
-    let prefill_w_off = Channel::from_iter((0..n).map(|p| p % page_size)).named("prefill_w_off");
-    let prefill_kv_len = Channel::from([n]).named("prefill_kv_len");
     let heal_mask = Channel::new([vocab], dtype::bool).named("heal_mask");
     let first_out = Channel::new([1], dtype::i32).named("first_token");
 
     let prefill = ForwardPass::new();
     prefill.embed(&prompt_tokens, &prefill_indptr)?;
-    prefill.attention(
-        Some(KvBinding {
-            working_set: &ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &prefill_kv_len,
-                pages: &prefill_pages,
-                page_indptr: &prefill_page_indptr,
-                w_slot: &prefill_w_slot,
-                w_off: &prefill_w_off,
-                positions: &prefill_positions,
-                mask: None,
-            },
-        }),
-        &rs_ws,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
-        },
-    )?;
+    prefill.state(&[&ws], StateGeometry::folding())?;
     prefill.epilogue(move || {
         let allowed = heal_mask.take();
         first_out.put(reshape(masked_argmax(intrinsics::logits(), &allowed), [1]));
@@ -226,56 +176,21 @@ async fn main(input: Input) -> Result<Output> {
     if generated.len() < input.max_tokens {
         let token_in = Channel::from([first as i32]).named("token_in");
         let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
-        let positions = Channel::from([n]).named("positions");
-        let pages = Channel::from_iter(0..max_pages).named("pages");
-        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from([n / page_size]).named("w_slot");
-        let w_off = Channel::from([n % page_size]).named("w_off");
-        let kv_len = Channel::from([n + 1]).named("kv_len");
         let token_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("token_out");
 
         let decode = ForwardPass::new();
         decode.embed(&token_in, &embed_indptr)?;
-        decode.attention(
-            Some(KvBinding {
-                working_set: &ws,
-                geometry: KvGeometry {
-                    readable_pages: ..,
-                    writable_pages: (n / page_size)..,
-                    kv_len: &kv_len,
-                    pages: &pages,
-                    page_indptr: &page_indptr,
-                    w_slot: &w_slot,
-                    w_off: &w_off,
-                    positions: &positions,
-                    mask: None,
-                },
-            }),
-            &rs_ws,
-            RsGeometry {
-                fold_len: None,
-                buffer: 0..0,
-            },
-        )?;
+        decode.state(&[&ws], StateGeometry::folding())?;
         decode.epilogue(move || {
-            let length = kv_len.take();
             let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
-            let next_length = &length + 1u32;
-            let page_count = next_length.div_ceil(page_size);
-
             token_in.put(&token);
-            kv_len.put(&next_length);
-            positions.put(&length);
-            w_slot.put(&length / page_size);
-            w_off.put(&length % page_size);
-            page_indptr.put(indptr(1, &page_count));
             token_out.put(&token);
         });
 
         let budget = input.max_tokens - 1;
-        run_ahead(&pipeline, &decode, budget as usize, async || {
+        run_ahead(&pipeline, &decode, budget, async || {
             let token = token_out.take_host::<i32>().await? as u32;
             generated.push(token);
             Ok(ControlFlow::Continue(()))

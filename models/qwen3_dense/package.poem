@@ -1,0 +1,21 @@
+# Qwen 3, dense and text-only (Qwen/Qwen3-0.6B ... -14B): full attention in
+# every layer, its q and k RMS-normed per head and rotated in full, and a
+# SwiGLU MLP. Qwen 3.5 and later, with gated-delta layers, are `qwen_3`.
+
+load("//lib/spoken.poem", "QWEN_STOP")
+
+CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
+TOKENIZER = tokenizer(markers = [QWEN_STOP])
+
+def qwen3(id, layers):
+    return model(id, template = CHATML, tokenizer = TOKENIZER, arch = "qwen3", layers = layers, vocab = 151936)
+
+MODELS = [
+    qwen3("qwen3-0.6b", layers = 28),
+    qwen3("qwen3-14b", layers = 40),
+]
+
+DEPLOYMENTS = [
+    deployment("qwen3-0.6b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-14b", weights = dtype.bf16, kv = dtype.bf16),
+]

@@ -182,7 +182,7 @@ fn the_same_window_is_one_encode_when_it_does() {
     assert!(
         copy.copied() > 0,
         "the shell was told to copy, P4 wrote a `Copy` row at this bucket, and \
-         nothing gathered — `window::copyable` declined every region over the \
+         nothing gathered — `fallback::copyable` declined every region over the \
          withdrawn mask"
     );
     assert!(
@@ -401,7 +401,7 @@ fn the_masked_window_is_refused_by_name_however_the_switch_is_set() {
     assert!(
         !refused.is_empty(),
         "every withdrawn window on this catalog was gathered; the masked \
-         window names `RuntimeInput::Mask` and `window::copyable` must decline \
+         window names `RuntimeInput::Mask` and `fallback::copyable` must decline \
          it — a copy that permuted the activations and sliced the mask plane \
          would compute the wrong bytes with nothing to fault on"
     );

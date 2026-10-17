@@ -7,6 +7,7 @@ pub mod wave;
 
 use std::collections::BTreeMap;
 
+use engine::ports::Envelope;
 use engine::program::ProgramRegistration;
 use eta_exec::{Boundaries, ExecPlan, Extents, Versions, adopt_launch_package_with};
 use eta_ir::registry::GeometryClass;
@@ -19,7 +20,6 @@ pub use endpoint::Endpoint;
 pub use launch::{
     ChannelShape, Cursor, Prepared, Rings, describe_values, scratch_bytes, scratch_offsets,
 };
-pub use ports::Envelope;
 pub use session::{Fired, Launched, Session, seeds_of};
 pub use wave::Wave;
 
@@ -345,6 +345,15 @@ impl Plane {
         bound
             .session
             .token_device_source(&program.plan, bound.geometry)
+    }
+
+    #[must_use]
+    pub fn fold_device_source(&self, id: u64) -> Option<(u64, u32)> {
+        let bound = self.instances.get(&id)?;
+        let program = self.programs.get(&bound.program_id)?;
+        bound
+            .session
+            .port_device_source(&program.plan, eta_ir::registry::Port::Fold)
     }
 
     #[must_use]

@@ -64,7 +64,7 @@ export class Frames {
   static fromRgb8(bytes: Blob, width: number, height: number, count: number, fps: number): Frames;
   /**
   * Build a handle from a channel's committed cell, WITHOUT the pixels
-  * entering linear memory (design D8/D11). This is the VAE road: a
+  * entering linear memory. This is the VAE road: a
   * `vae.decode` pass's epilogue reads `intrinsics::pixels()` and puts
   * the plane on `ch`; this takes that cell host-side, the way
   * `channel.take` would, and turns it into frames.

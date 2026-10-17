@@ -14,14 +14,17 @@ pub struct Prompt {
     pub tokens: Vec<u32>,
     /// Each picture with the row its span starts at, in order.
     pub images: Vec<(u32, media::Image)>,
+    pub ends: Vec<u32>,
 }
 
 pub fn build(req: &Request) -> Result<Prompt, String> {
     let mut tokens = Vec::new();
     let mut images = Vec::new();
+    let mut ends = Vec::new();
     if let Some(raw) = &req.raw_prompt {
         tokens.extend(chat::prefix());
         tokens.extend(model::encode(raw));
+        ends.push(tokens.len() as u32);
     } else {
         let messages = &req.messages;
         let lead = messages
@@ -30,6 +33,7 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
             .count();
         for m in &messages[..lead] {
             tokens.extend(chat::system(&m.content));
+            ends.push(tokens.len() as u32);
         }
 
         // Tools the model may not call (`tool_choice: none`) are still
@@ -37,6 +41,7 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
         if !req.tools.is_empty() {
             let equipped = tools::equip(&req.tools).map_err(|e| format!("equip tools: {e:?}"))?;
             tokens.extend(equipped);
+            ends.push(tokens.len() as u32);
         }
 
         let mut seen_user = false;
@@ -66,15 +71,26 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
                     &m.content,
                 )),
             }
+            ends.push(tokens.len() as u32);
         }
 
-        tokens.extend(chat::cue_thinking(req.thinking != Thinking::Disabled));
+        tokens.extend(chat::cue_thinking(thinks(req)));
     }
     // The prefill needs at least one token.
     if tokens.is_empty() {
         tokens.push(0);
     }
-    Ok(Prompt { tokens, images })
+    Ok(Prompt {
+        tokens,
+        images,
+        ends,
+    })
+}
+
+/// Whether `req` asks for a thinking answer; [`build`] cues it so, and the
+/// demux reads the same cue.
+pub(crate) fn thinks(req: &Request) -> bool {
+    req.thinking != Thinking::Disabled
 }
 
 /// Where `text` begins in its rendered `turn`, so pictures sit inside the

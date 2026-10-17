@@ -301,13 +301,14 @@ fn bools(value: &Value) -> Vec<bool> {
 #[test]
 fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     the_device_answers_what_the_interpreter_answers();
+    a_row_every_row_shares_broadcasts_to_each_row();
     the_acceptance_rule_agrees_with_the_interpreter();
     the_gaussian_draw_and_the_transcendentals_agree_with_the_interpreter();
 }
 
 fn the_device_answers_what_the_interpreter_answers() {
     if !engine_rocm::device::present() {
-        eprintln!("no CUDA device: skipping");
+        eprintln!("no ROCm device: skipping");
         return;
     }
     let profile = ModelProfile {
@@ -358,6 +359,97 @@ fn the_device_answers_what_the_interpreter_answers() {
         1e-5,
         "probability at the row's argmax (a row block's gather)",
     );
+}
+
+const COLUMNS: u32 = 0;
+const HITS: u32 = 1;
+const POOL: u32 = 16;
+
+fn shared_row() -> TraceContainer {
+    use eta_ir::types::Literal;
+    let ops = vec![
+        Op::IntrinsicVal {
+            intr: IntrinsicId::Logits,
+            shape: Shape::matrix(ROWS, VOCAB),
+            dtype: Dtype::F32,
+        },
+        Op::ReduceArgmax(0),
+        Op::Cast {
+            value: 1,
+            dtype: Dtype::U32,
+        },
+        Op::Const(Literal::U32(POOL)),
+        Op::Broadcast {
+            value: 3,
+            shape: Shape::vector(ROWS),
+        },
+        Op::Rem(2, 4),
+        Op::Reshape {
+            value: 5,
+            shape: Shape::matrix(ROWS, 1),
+        },
+        Op::Broadcast {
+            value: 6,
+            shape: Shape::matrix(ROWS, POOL),
+        },
+        Op::Iota { len: POOL },
+        Op::Reshape {
+            value: 8,
+            shape: Shape::matrix(1, POOL),
+        },
+        Op::Broadcast {
+            value: 9,
+            shape: Shape::matrix(ROWS, POOL),
+        },
+        Op::Eq(10, 7),
+        Op::ChanPut {
+            chan: COLUMNS,
+            value: 10,
+        },
+        Op::ChanPut {
+            chan: HITS,
+            value: 11,
+        },
+    ];
+    TraceContainer {
+        names: Vec::new(),
+        channels: vec![
+            reader(Shape::matrix(ROWS, POOL), Dtype::U32),
+            reader(Shape::matrix(ROWS, POOL), Dtype::Bool),
+        ],
+        ports: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops,
+        }],
+        externs: Vec::new(),
+    }
+}
+
+fn a_row_every_row_shares_broadcasts_to_each_row() {
+    if !engine_rocm::device::present() {
+        eprintln!("no ROCm device: skipping");
+        return;
+    }
+    let profile = ModelProfile {
+        vocab: VOCAB,
+        ..ModelProfile::dummy()
+    };
+    let bound = bind(shared_row(), profile).expect("the shared row binds");
+    let plane = logits();
+    let channels = [COLUMNS, HITS];
+    let want = host_outputs(&bound, &[], Some(&plane), &channels);
+    let got = device_outputs(&bound, &[], ROWS, Some(&plane), &channels);
+    let columns: Vec<u32> = (0..ROWS).flat_map(|_| 0..POOL).collect();
+    assert_eq!(want[0], Value::U32(columns), "the interpreter's broadcast");
+    assert_eq!(
+        got[0],
+        want[0].to_le_bytes(),
+        "every row holds the shared row"
+    );
+    let hits = wire_bools(&got[1], (ROWS * POOL) as usize);
+    assert_eq!(hits, bools(&want[1]), "each row's slot is the one it names");
+    assert_eq!(hits.iter().filter(|&&hit| hit).count(), ROWS as usize);
 }
 
 const ENTROPY: u32 = 0;
@@ -469,7 +561,7 @@ fn acceptance() -> TraceContainer {
 
 fn the_acceptance_rule_agrees_with_the_interpreter() {
     if !engine_rocm::device::present() {
-        eprintln!("no CUDA device: skipping");
+        eprintln!("no ROCm device: skipping");
         return;
     }
     let profile = ModelProfile {
@@ -605,7 +697,7 @@ fn latent() -> Vec<f32> {
 
 fn the_gaussian_draw_and_the_transcendentals_agree_with_the_interpreter() {
     if !engine_rocm::device::present() {
-        eprintln!("no CUDA device: skipping");
+        eprintln!("no ROCm device: skipping");
         return;
     }
     let profile = ModelProfile {

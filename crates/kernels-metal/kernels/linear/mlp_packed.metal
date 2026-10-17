@@ -16,6 +16,23 @@ template <typename T>
   out[row + i] = static_cast<T>((g / (1.0f + metal::exp(-g))) * u);
 }
 
+// packed_swiglu over a routed stack's sorted rows, skipping its padding rows
+// (perm < 0), which no pass reads.
+[[kernel]] void packed_swiglu_sorted(
+    const device bfloat* packed [[buffer(0)]],
+    device bfloat* out          [[buffer(1)]],
+    const constant uint& intermediate [[buffer(2)]],
+    const device int* perm      [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  if (perm[gid.y] < 0) return;
+  const uint i = gid.x;
+  const size_t row = size_t(gid.y) * size_t(intermediate);
+  const size_t packed_row = row * 2;
+  const float g = float(packed[packed_row + i]);
+  const float u = float(packed[packed_row + intermediate + i]);
+  out[row + i] = static_cast<bfloat>((g / (1.0f + metal::exp(-g))) * u);
+}
+
 #define instantiate_packed_swiglu(name, itype)                     \
   template [[host_name("packed_swiglu_" #name)]]                   \
   [[kernel]] void packed_swiglu<itype>(                            \

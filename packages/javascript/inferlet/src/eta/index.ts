@@ -1,6 +1,6 @@
 // `inferlet/eta` — the ETA authoring surface for JavaScript inferlets: the
 // tracing eDSL (`Tensor` + ops), the container encoder, and the WIT bridge
-// (`Channel`, `WorkingSet`, `ForwardPass`, `Pipeline`, `runAhead`).
+// (`Channel`, `WorkingSet`, `ForwardPass`, `Pipeline`).
 //
 // A stage body is an ordinary function traced once at first submit:
 //
@@ -22,23 +22,20 @@ export {
   Channel,
   ForwardPass,
   InferletError,
-  PageGrant,
   Pipeline,
-  RsWorkingSet,
   WorkingSet,
   channelCapacity,
   frameSize,
   kvPageSize,
-  maxEmbedLength,
+  maxReadoutRows,
   mm,
   padTokens,
-  prefillChunkHint,
-  prefillChunks,
+  readoutSpans,
   scale,
   submitDeadlineUs,
   unpadTokens,
 } from './bridge.js';
-export type { ForwardKind, KvBinding, KvGeometry, PageDecl, PageRange, RsGeometry } from './bridge.js';
+export type { Fold, ForwardKind, StateGeometry } from './bridge.js';
 export { Dtype, Port, Stage, dtype } from './ir.js';
 export type { Shape } from './ir.js';
 export { TraceError } from './trace.js';

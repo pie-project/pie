@@ -6,7 +6,9 @@ use checkpoint::contract::ModelContract;
 use poem_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, FireRows, PatchLadder, compile_axes,
 };
-use poem_exec::fire::{Composition, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
+use poem_exec::fire::{
+    At, Composition, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, fallback, walk,
+};
 use poem_ir::{Dtype, Layout, Operation, RuntimeInput, Trace, Ty, ValueId};
 
 use crate::arena::Arena;
@@ -23,7 +25,7 @@ use crate::settle::{Airborne, Arms, Done};
 use crate::store::Pools;
 use crate::store::kv::{self, Paging, Seat};
 use crate::weights::{AdapterPlane, Weights};
-use crate::window::{At, Cursor, Windows};
+use crate::window::Windows;
 
 use engine::fire::{Boundary, Masking};
 use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Supply};
@@ -330,6 +332,14 @@ pub struct Shell {
 
 impl Shell {
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
+        Self::prepare(boot)?.load()
+    }
+
+    /// The part of a load that places no memory: the device bound, the chip
+    /// measured, the trace fused for it and its axes compiled. Apart so the
+    /// residency check can price the arena scratch the compile reserves before
+    /// it chooses which weights stay resident.
+    pub fn prepare(boot: Boot<'_>) -> Result<PreparedLoad<'_>> {
         // Diffusion and conditioning activations leave the fp16 range.
         let wide_range = boot.trace.values.iter().any(|decl| {
             matches!(
@@ -363,7 +373,7 @@ impl Shell {
             None
         };
 
-        let profile = boot.profile.unwrap_or_else(|| {
+        let profile = boot.profile.clone().unwrap_or_else(|| {
             DeviceProfile::of(
                 &chip,
                 crate::chip::pricing_cores(&chip, device.cores()),
@@ -382,6 +392,58 @@ impl Shell {
             }
         };
         let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
+        Ok(PreparedLoad {
+            boot,
+            device,
+            perf_cores,
+            chip,
+            tuning,
+            elsewhere,
+            keepalive,
+            budgets,
+            compiled,
+        })
+    }
+}
+
+/// A load compiled and not yet placed; [`PreparedLoad::load`] places it.
+pub struct PreparedLoad<'a> {
+    boot: Boot<'a>,
+    device: Context,
+    perf_cores: u32,
+    chip: profile::Profile,
+    tuning: kernels_metal::Tuning,
+    elsewhere: u64,
+    keepalive: Option<crate::keepalive::KeepAlive>,
+    budgets: Budgets,
+    compiled: CompiledModel,
+}
+
+impl PreparedLoad<'_> {
+    /// The scratch the compiled axes reserve, which the load wires beside the
+    /// weights and the kv pool.
+    #[must_use]
+    pub fn arena_bytes(&self) -> u64 {
+        self.compiled.arena.bytes
+    }
+
+    /// The weight residency this load places, once priced with the scratch.
+    pub fn set_residency(&mut self, residency: Plan) {
+        self.boot.residency = residency;
+    }
+
+    pub fn load(self) -> Result<Shell> {
+        let PreparedLoad {
+            boot,
+            device,
+            perf_cores,
+            chip,
+            tuning,
+            elsewhere,
+            keepalive,
+            budgets,
+            compiled,
+        } = self;
 
         let facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
@@ -601,7 +663,13 @@ impl Shell {
         {
             let acct = accounting(demand.bytes(pages));
             acct.admit(Some(weights.bytes()), boot.memory_share)?;
-            let source = boot.residency.source_bytes();
+            // A bank read out of the artifact's own mapping is already in the
+            // weights, as the windows that span it: only what lies outside them
+            // is streamed on top.
+            let source = boot
+                .residency
+                .source_bytes()
+                .saturating_sub(weights.spanned());
             let ram = Context::physical_memory();
             let wired = acct.weights + acct.scratch + acct.minimum + acct.floor;
             if source > 0 && ram > 0 && wired + source > ram - ram / 6 {
@@ -654,7 +722,7 @@ impl Shell {
             .max()
             .unwrap_or(0);
         let arms = boot.runahead.frames().max(1);
-        let gathers = crate::window::gathers(&boot.trace, &compiled);
+        let gathers = fallback::gathers(&boot.trace, &compiled);
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
                 let (poem_ir::Def::Input(RuntimeInput::Patches), Ty::Tensor { shape, dtype }) =
@@ -1061,7 +1129,9 @@ impl Shell {
             rebound: crate::icb::Rebound::default(),
         })
     }
+}
 
+impl Shell {
     pub fn open(&mut self, slot: u32) -> Result<()> {
         if self.pools.has_state() {
             self.drain()?;
@@ -1087,17 +1157,108 @@ impl Shell {
         Ok(())
     }
 
-    /// Opens `budget` bytes of disk kv pages under `dir`, if any.
-    pub fn seat_disk_kv(&mut self, budget: u64, dir: Option<&std::path::Path>) -> Result<u32> {
-        match dir.filter(|_| budget > 0) {
-            Some(dir) => self.pools.seat_disk(dir, budget),
-            None => Ok(0),
+    /// Unstated `budget`: `seats` sequences at `context` and at least the pool,
+    /// within a quarter of the free space.
+    pub fn seat_disk_kv(
+        &mut self,
+        budget: Option<u64>,
+        dir: Option<&std::path::Path>,
+        seats: u32,
+        context: u32,
+    ) -> Result<u32> {
+        let Some(dir) = dir else { return Ok(0) };
+        let paging = self.pools.paging();
+        let buffered = self
+            .rs_buffers
+            .as_ref()
+            .map_or(0, crate::rs::Buffers::page_bytes);
+        let unstated = budget.is_none();
+        let budget = match budget {
+            Some(bytes) => bytes,
+            None => engine::disk::unstated_budget(
+                dir,
+                u64::from(paging.slots),
+                self.pools.state_slot_bytes() + buffered,
+                paging.pages(),
+                u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1))),
+                self.pools.page_bytes()?,
+            ),
+        };
+        match self.pools.seat_disk(dir, budget, buffered) {
+            Err(_) if unstated => {
+                self.pools.unseat_disk();
+                Ok(0)
+            }
+            seated => seated,
         }
+    }
+
+    #[must_use]
+    pub fn parked_state_slots(&self) -> u32 {
+        self.pools.parked_slots()
+    }
+
+    #[must_use]
+    pub fn parked_buffer_pages(&self) -> u32 {
+        self.pools.parked_pages()
+    }
+
+    #[must_use]
+    pub fn buffer_pages(&self) -> u32 {
+        self.rs_buffers
+            .as_ref()
+            .map_or(0, crate::rs::Buffers::page_count)
     }
 
     pub fn spill_kv(&mut self, to_disk: bool, pages: &[u32], slots: &[u32]) -> Result<()> {
         self.drain()?;
         self.pools.spill_kv(to_disk, pages, slots)
+    }
+
+    pub fn park_state(&mut self, out: bool, device: &[u32], rows: &[u32]) -> Result<()> {
+        self.drain()?;
+        self.pools.park_state(out, device, rows)
+    }
+
+    pub fn park_pages(&mut self, out: bool, pages: &[u32], rows: &[u32]) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        self.drain()?;
+        let buffers = self.rs_buffers.as_mut().ok_or(Fault::Ceiling {
+            what: "recurrent buffer pages",
+            need: 1,
+            have: 0,
+        })?;
+        self.pools.park_pages(out, pages, rows, buffers.pages())
+    }
+
+    pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
+        if moves.is_empty() {
+            return Ok(());
+        }
+        self.drain()?;
+        let (slab, bytes) = self
+            .rs_buffers
+            .as_mut()
+            .ok_or(Fault::Ceiling {
+                what: "recurrent buffer pages",
+                need: 1,
+                have: 0,
+            })?
+            .pages();
+        let mut frame = self.device.frame()?;
+        for &(src, dst) in moves {
+            frame.copy_span(
+                slab,
+                u64::from(src) * bytes,
+                slab,
+                u64::from(dst) * bytes,
+                bytes,
+            )?;
+        }
+        self.grafted = Some(frame.commit_async(None)?);
+        Ok(())
     }
 
     pub fn copy_state(&mut self, moves: &[(u32, u32)]) -> Result<()> {
@@ -2354,7 +2515,7 @@ impl Shell {
             have: self.arms.depth() as u64,
         })?;
 
-        let mut resolved: Vec<crate::program::Envelope> = Vec::new();
+        let mut resolved: Vec<engine::ports::Envelope> = Vec::new();
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
         if !attachments.is_empty() {
             let instances: Vec<u64> = attachments.iter().map(|a| a.instance).collect();
@@ -2398,6 +2559,7 @@ impl Shell {
             }
         }
 
+        let page_tokens = self.pools.paging().page_size.max(1);
         let mut device_pages: Vec<Option<Vec<u32>>> = vec![None; lanes.len()];
         let mut device_writes: Vec<Option<(Vec<u32>, Vec<u32>)>> = vec![None; lanes.len()];
         let mut device_masks: Vec<Option<Masking>> = vec![None; lanes.len()];
@@ -2425,31 +2587,24 @@ impl Shell {
                     )
                 })
             };
-            device_pages[source] = ports
-                .pages()?
-                .map(|relative| {
-                    relative
-                        .iter()
-                        .map(|&page| translate(page, "pages"))
-                        .collect::<Result<Vec<u32>>>()
-                })
-                .transpose()?;
-            if ports.owns_pages() {
+            if ports.owns_slots() {
                 lane_rows[source] = ports.rows();
             }
             let rows = lane_rows[source] as usize;
-            device_writes[source] = ports
-                .writes(rows)?
-                .map(|(slots, offsets)| {
-                    Ok::<(Vec<u32>, Vec<u32>), Fault>((
-                        slots
-                            .iter()
-                            .map(|&page| translate(page, "w_slot"))
-                            .collect::<Result<Vec<u32>>>()?,
-                        offsets.to_vec(),
-                    ))
-                })
-                .transpose()?;
+            if let (Some(slots), Some(reach)) = (ports.slots(rows)?, ports.reach(rows)?) {
+                device_pages[source] = Some(
+                    (0..reach.div_ceil(page_tokens))
+                        .map(|page| translate(page, "slots"))
+                        .collect::<Result<Vec<u32>>>()?,
+                );
+                device_writes[source] = Some((
+                    slots
+                        .iter()
+                        .map(|&slot| translate(slot / page_tokens, "slots"))
+                        .collect::<Result<Vec<u32>>>()?,
+                    slots.iter().map(|&slot| slot % page_tokens).collect(),
+                ));
+            }
             if let Some((cells, stride)) = ports.mask(rows)? {
                 if rows != 1 {
                     return Err(Fault::program(
@@ -2457,13 +2612,12 @@ impl Shell {
                         format!(
                             "lane {source} resolves its attention mask from a channel and \
                              carries {rows} query rows; the expansion intersects each row \
-                             with the order the cache is written in, and a lane whose \
-                             write descriptor is the guest's has no such order this shell \
-                             can derive"
+                             with the order the cache is written in, and a lane that \
+                             states its own slots has no such order this shell can derive"
                         ),
                     ));
                 }
-                device_masks[source] = Some(crate::mask::from_dense(cells, stride));
+                device_masks[source] = Some(engine::ports::from_dense(cells, stride));
             }
         }
 
@@ -2627,7 +2781,7 @@ impl Shell {
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
-        let mut rs_plans: Vec<crate::rs::LanePlan> = Vec::with_capacity(lanes.len());
+        let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
         let mut rs_active = false;
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut slot_of_row: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -2647,16 +2801,15 @@ impl Shell {
                 Some((held, at)) => Some(resolved[held].lane(at, source)?),
                 None => None,
             };
-            let have = match ports.as_ref().filter(|ports| ports.owns_pages()) {
+            let have = match ports.as_ref().filter(|ports| ports.owns_slots()) {
                 Some(ports) => {
-                    let after = ports.extent().ok_or_else(|| {
+                    let after = ports.reach(row.rows as usize)?.ok_or_else(|| {
                         Fault::program(
                             "serve::prepare",
                             format!(
-                                "lane {source} states its own page table and binds no \
-                                 `kv_len` port; the page count, the last page's fill and \
-                                 the attention schedules are all carved from the extent, \
-                                 and no seat in this shell knows it"
+                                "lane {source} states where its rows land and reaches no \
+                                 slot; the page count, the last page's fill and the \
+                                 attention schedules are all carved from what it reads"
                             ),
                         )
                     })?;
@@ -2664,10 +2817,9 @@ impl Shell {
                         return Err(Fault::program(
                             "serve::prepare",
                             format!(
-                                "lane {source} states a readable KV extent of {after} on \
-                                 its `kv_len` port and this fire writes {} row(s) into \
-                                 it; the extent is AFTER the append, so it can never be \
-                                 shorter than what the append adds",
+                                "lane {source} reads a KV extent of {after} and this fire \
+                                 writes {} row(s) into it; the extent is AFTER the append, \
+                                 so it can never be shorter than what the append adds",
                                 row.rows
                             ),
                         ));
@@ -2775,14 +2927,21 @@ impl Shell {
                 }
                 rs_active = true;
             }
-            let plan = crate::rs::LanePlan::of(
+            let stated = match &ports {
+                Some(ports) => ports.slots(row.rows as usize)?,
+                None => None,
+            };
+            let first = stated
+                .and_then(|slots| slots.first().copied())
+                .unwrap_or(have);
+            let plan = engine::rs::LanePlan::of(
                 seated.rs,
                 row.rows,
-                row.source,
-                ports
-                    .as_ref()
-                    .and_then(crate::program::ports::LanePorts::fold_len),
-            )?;
+                first,
+                masking,
+                ports.as_ref().and_then(engine::ports::LanePorts::fold),
+            )
+            .map_err(|error| Fault::program("serve::rs", format!("lane {source}: {error}")))?;
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) && crate::diag::on().rs_trace {
                 eprintln!(
                     "recurrent seat: lane {} rows {} replay {} commit {} gather {:?} scatter {:?}",
@@ -3748,7 +3907,9 @@ impl Shell {
                     &self.handles,
                 );
                 #[cfg(target_vendor = "apple")]
-                let sink = sink.with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff));
+                let sink = sink
+                    .with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff))
+                    .flushing_after(HEAD_LAUNCHES);
                 Encoded::Live(sink)
             }
             Mode::Record | Mode::Replay => {
@@ -4124,6 +4285,14 @@ pub struct Landed {
     pub lanes: usize,
     pub launches: u32,
 }
+
+/// Launches a live encode commits ahead of the rest of its fire. Encoding
+/// a launch costs the host a fraction of a microsecond and running one costs
+/// the device tens, so a head this long keeps the device busy while the host
+/// encodes the tail: a 64-layer verify fire is some 1700 launches and 0.6 ms
+/// of encoding the device otherwise sat out.
+#[cfg(target_vendor = "apple")]
+const HEAD_LAUNCHES: u32 = 64;
 
 fn fire_trace(line: impl FnOnce() -> String) {
     use std::sync::OnceLock;

@@ -8,8 +8,9 @@
 use engine_metal::Fault;
 use engine_metal::inputs::window_ints;
 use engine_metal::store::kv::Paging;
-use engine_metal::window::{Copies, Windows, gathers};
+use engine_metal::window::{Copies, Windows};
 use poem_compiler::{Budget, CompiledModel, DeviceProfile, compile};
+use poem_exec::fire::fallback::gathers;
 use poem_exec::fire::{ClassWindow, WindowTable, fallback, max_runs};
 use poem_ir::{ClassSet, Platform, RowAxis, Trace};
 

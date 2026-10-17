@@ -114,6 +114,7 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                     | TileMapKind::Scale
                     | TileMapKind::Bias
                     | TileMapKind::Unary
+                    | TileMapKind::Gather
             ) || (*kind == TileMapKind::Encode
                 && matches!(
                     transform.to,

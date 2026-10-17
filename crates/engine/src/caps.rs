@@ -36,6 +36,9 @@ pub struct FireLimits {
     /// this many rows.
     #[serde(default)]
     pub prefill_rows: u32,
+    /// 0: as many as `max_tokens`.
+    #[serde(default)]
+    pub max_readouts: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +47,10 @@ pub struct PoolFacts {
     pub kv_page_size: u32,
     pub state_slots: u32,
     pub state_slot_bytes: u64,
+    /// Buffer pages of `kv_page_size` unfolded rows, a pool beside the state
+    /// slots.
+    #[serde(default)]
+    pub buffer_pages: u32,
     pub adapter_banks: u32,
     pub elastic_page_bytes: u64,
     pub elastic_budget_pages: u64,
@@ -56,9 +63,10 @@ pub struct PoolFacts {
     #[serde(default)]
     pub window_tokens: u32,
     /// The tiers below the device: host pages kv can be suspended into by
-    /// `kv_copy`, host windowed pages for a ring's pages, host rows a
-    /// `StateCopy` may park rs slots in, and slot-file pages `kv_copy` serves
-    /// to and from `MemoryDomain::LocalDisk`. Zero means the engine serves no
+    /// `kv_copy`, host windowed pages for a ring's pages, the state slots and
+    /// buffer pages a `StateCopy` may park in (host memory, or slot files on
+    /// an engine with no host tier), and slot-file pages `kv_copy` serves to
+    /// and from `MemoryDomain::LocalDisk`. Zero means the engine serves no
     /// such copies.
     #[serde(default)]
     pub host_kv_pages: u32,
@@ -67,13 +75,9 @@ pub struct PoolFacts {
     #[serde(default)]
     pub host_state_slots: u32,
     #[serde(default)]
-    pub disk_kv_pages: u32,
-    /// The engine would rather post one frame a lane than seat fewer lanes
-    /// than it batches when its state slots are short: the runtime then
-    /// dispatches one frame deep, so a lane holds one slot. False keeps the
-    /// configured depth whatever the slots seat.
+    pub host_buffer_pages: u32,
     #[serde(default)]
-    pub one_frame_when_short: bool,
+    pub disk_kv_pages: u32,
 }
 
 impl PoolFacts {
@@ -84,6 +88,7 @@ impl PoolFacts {
             self.host_kv_pages = self.host_kv_pages.min(rank.host_kv_pages);
             self.host_window_pages = self.host_window_pages.min(rank.host_window_pages);
             self.host_state_slots = self.host_state_slots.min(rank.host_state_slots);
+            self.host_buffer_pages = self.host_buffer_pages.min(rank.host_buffer_pages);
             self.disk_kv_pages = self.disk_kv_pages.min(rank.disk_kv_pages);
         }
     }
@@ -108,6 +113,9 @@ pub struct Capabilities {
 
     #[serde(default)]
     pub bidirectional_attention: bool,
+
+    #[serde(default)]
+    pub adapter_attachments: bool,
 
     /// The facts the loaded trace's rows branch on, which a lane's word is
     /// classified by.

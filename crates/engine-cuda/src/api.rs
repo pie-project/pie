@@ -237,8 +237,6 @@ fn fault(fault: Fault) -> Error {
 
 fn extents(stated: &BindExtents) -> eta_exec::Extents {
     eta_exec::Extents {
-        kv_len: stated.kv_len,
-        page_count: stated.page_count,
         row_count: stated.row_count,
         token_count: stated.token_count,
         sampled_rows: stated.sampled_rows,
@@ -513,7 +511,12 @@ impl Engine for Cuda {
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
         let host_kv_pages = shell
-            .seat_host_kv(residency.host_kv_budget, self.boot.world.size)
+            .seat_host_kv(
+                residency.host_kv_budget,
+                residency.kv_seats.unwrap_or(budgets.max_lanes),
+                budgets.max_context,
+                self.boot.world.size,
+            )
             .map_err(fault)?;
         let disk_kv_pages = shell
             .seat_disk_kv(
@@ -554,6 +557,7 @@ impl Engine for Cuda {
                 kv_page_size: paging.page_size,
                 state_slots: if state_rows { paging.slots } else { 0 },
                 state_slot_bytes: shell.state_slot_bytes(),
+                buffer_pages: shell.buffer_pages(),
                 adapter_banks: shell
                     .banks()
                     .iter()
@@ -569,8 +573,8 @@ impl Engine for Cuda {
                 host_kv_pages,
                 host_window_pages: shell.host_window_pages(),
                 host_state_slots: shell.host_state_slots(),
+                host_buffer_pages: shell.host_buffer_pages(),
                 disk_kv_pages,
-                one_frame_when_short: shell.one_frame_when_short(),
             },
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
@@ -580,11 +584,13 @@ impl Engine for Cuda {
                     .saturating_mul(shell.budget().max_lanes),
                 max_context: paging.context(),
                 prefill_rows: 0,
+                max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
+                    .unwrap_or(u32::MAX),
             },
             profile,
             ports: PortMask::DEVICE_GEOMETRY
                 .with(Port::AttnMask)
-                .with(Port::RsFoldLen),
+                .with(Port::Fold),
             geometry: GeometryClass::DeviceGeometry,
             kv_copy: KvCopyDomains {
                 device_to_device: true,
@@ -597,6 +603,7 @@ impl Engine for Cuda {
             device_channel_commit: true,
             rs_verbs: true,
             bidirectional_attention: true,
+            adapter_attachments: true,
             facts: shell.trace().facts.clone(),
         };
 
@@ -636,17 +643,11 @@ impl Engine for Cuda {
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        frame.validate_for(engine::Serves {
-            device_channel_commit: self
-                .caps
+        frame.validate_for(
+            self.caps
                 .as_ref()
-                .is_some_and(|caps| caps.device_channel_commit),
-            rs_verbs: self.caps.as_ref().is_some_and(|caps| caps.rs_verbs),
-            bidirectional: self
-                .caps
-                .as_ref()
-                .is_some_and(|caps| caps.bidirectional_attention),
-        })?;
+                .map_or(engine::Serves::NONE, engine::Serves::of),
+        )?;
         let id = self.next_frame;
         self.next_frame = self.next_frame.wrapping_add(1);
         self.pending = None;
@@ -868,30 +869,39 @@ impl Engine for Cuda {
             }
         }
         let shell = self.loaded_mut()?;
+        let pairs = |moves: &[engine::transfer::StateMove]| -> Vec<(u32, u32)> {
+            moves
+                .iter()
+                .map(|m| (m.src_slot_id, m.dst_slot_id))
+                .collect()
+        };
+        let (states, pages) = (pairs(&copy.moves), pairs(&copy.pages));
         let to_host = match copy.direction {
             StateDirection::DeviceToDevice => {
-                for move_ in &copy.moves {
-                    shell
-                        .copy_state(move_.src_slot_id, move_.dst_slot_id)
-                        .map_err(fault)?;
+                for &(src, dst) in &states {
+                    shell.copy_state(src, dst).map_err(fault)?;
                 }
-                return Ok(());
+                return shell.copy_pages(&pages).map_err(fault);
             }
             StateDirection::DeviceToHost => true,
             StateDirection::HostToDevice => false,
         };
-        let moves: Vec<(u32, u32)> = copy
-            .moves
-            .iter()
-            .map(|m| {
-                if to_host {
-                    (m.src_slot_id, m.dst_slot_id)
-                } else {
-                    (m.dst_slot_id, m.src_slot_id)
-                }
-            })
-            .collect();
-        shell.copy_state_host(to_host, &moves).map_err(fault)
+        let device_host = |pairs: Vec<(u32, u32)>| -> Vec<(u32, u32)> {
+            if to_host {
+                pairs
+            } else {
+                pairs
+                    .into_iter()
+                    .map(|(host, device)| (device, host))
+                    .collect()
+            }
+        };
+        shell
+            .copy_state_host(to_host, &device_host(states))
+            .map_err(fault)?;
+        shell
+            .copy_pages_host(to_host, &device_host(pages))
+            .map_err(fault)
     }
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
@@ -979,18 +989,13 @@ impl Cuda {
             .iter()
             .enumerate()
             .map(|(at, lane)| {
-                if !lane.positions.is_empty() {
-                    return Err(Error::Unsupported {
-                        verb: "explicit lane positions",
-                        engine: "cuda",
-                    });
-                }
                 Ok(Seated {
                     lane: Lane {
                         slot: lane.slot,
                         word: words[at],
                         tokens: &lane.tokens,
                     },
+                    positions: &lane.positions,
                     pages: &lane.kv.pages,
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                     kv_less: lane.kv_less,
@@ -1015,6 +1020,7 @@ impl Cuda {
                     peer: lane.peer,
                     ports: &lane.ports,
                     attn_classes: lane.attn_classes.as_ref(),
+                    reports: lane.reports,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

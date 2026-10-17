@@ -2,33 +2,6 @@ use engine::fire::{Mask, Masking};
 
 use crate::error::{Fault, Result};
 
-#[must_use]
-pub fn from_dense(cells: &[bool], stride: usize) -> Masking {
-    let rows = cells.len().checked_div(stride).unwrap_or(0);
-    Masking::Rows(
-        (0..rows)
-            .map(|row| {
-                let mut runs: Vec<u32> = Vec::new();
-                let mut keeping = false;
-                let mut run = 0u32;
-                for &kept in &cells[row * stride..(row + 1) * stride] {
-                    if kept == keeping {
-                        run += 1;
-                        continue;
-                    }
-                    runs.push(run);
-                    keeping = kept;
-                    run = 1;
-                }
-                if run != 0 {
-                    runs.push(run);
-                }
-                Mask::new(runs, stride as u64)
-            })
-            .collect(),
-    )
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct LaneMask<'a> {
     pub mask: Option<&'a Masking>,

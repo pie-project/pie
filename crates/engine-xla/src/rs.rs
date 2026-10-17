@@ -1,12 +1,12 @@
 //! Recurrent-state verbs: which rows of a hybrid model's recurrence
 //! inputs are buffered per lane, replayed ahead of its own rows, and how
-//! much of the extended run commits its state. The host half (the layout
-//! the trace implies and each lane's plan) is engine-wgpu's; the device half
-//! is `Seat` below and `dispatch/rs.rs`.
+//! much of the extended run commits its state. The host half is the layout
+//! the trace implies and each lane's [`LanePlan`]; the device half is `Seat`
+//! below and `dispatch/rs.rs`.
 
 use std::collections::HashMap;
 
-use engine::fire::{FoldLen, RsVerb};
+use engine::rs::{LanePlan, Run};
 use poem_ir::{Attention, Def, Dim, Dtype, Operation, Trace, Ty, ValueId};
 
 use crate::error::{Fault, Result};
@@ -266,151 +266,6 @@ impl Layout {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Run {
-    pub pages: Vec<u32>,
-    pub from: u32,
-    pub count: u32,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct LanePlan {
-    pub replay: u32,
-
-    pub commit: u32,
-
-    pub rows: u32,
-
-    pub gather: Option<Run>,
-
-    pub scatter: Option<Run>,
-
-    pub override_rows: bool,
-}
-
-impl LanePlan {
-    pub fn of(verb: &RsVerb, rows: u32, lane: u32, device_fold: Option<u32>) -> Result<LanePlan> {
-        let host = |len: FoldLen| -> Result<u32> {
-            match len {
-                FoldLen::Host(n) => Ok(n),
-                FoldLen::Device(port) => device_fold.ok_or_else(|| {
-                    program(
-                        "serve::rs",
-                        format!(
-                            "lane {lane} states a device-resident fold length on port {}, and the \
-                             program attached to it resolved no such port this fire",
-                            port.name()
-                        ),
-                    )
-                }),
-            }
-        };
-        Ok(match verb {
-            RsVerb::Fold => LanePlan {
-                replay: 0,
-                commit: rows,
-                rows,
-                ..LanePlan::default()
-            },
-            RsVerb::Buffer {
-                pages,
-                at,
-                fold,
-                replay,
-            } => {
-                let commit = host(*fold)?;
-                if commit > replay.saturating_add(rows) {
-                    return Err(program(
-                        "serve::rs",
-                        format!(
-                            "lane {lane} folds {commit} of the {rows} rows it carries plus the \
-                             {replay} it replays"
-                        ),
-                    ));
-                }
-                if *replay > *at {
-                    return Err(program(
-                        "serve::rs",
-                        format!(
-                            "lane {lane} replays {replay} buffered token(s) below buffer position \
-                             {at}, which has only {at}"
-                        ),
-                    ));
-                }
-                LanePlan {
-                    replay: *replay,
-                    commit,
-                    rows,
-                    gather: (*replay > 0).then(|| Run {
-                        pages: pages.clone(),
-                        from: at - replay,
-                        count: *replay,
-                    }),
-                    scatter: (rows > 0).then(|| Run {
-                        pages: pages.clone(),
-                        from: *at,
-                        count: rows,
-                    }),
-                    override_rows: false,
-                }
-            }
-            RsVerb::Window { read, write, fold } => {
-                let fold = host(*fold)?;
-                LanePlan {
-                    replay: fold,
-                    commit: fold,
-                    rows,
-                    gather: (fold > 0).then(|| Run {
-                        pages: read.clone(),
-                        from: 0,
-                        count: fold,
-                    }),
-                    scatter: (rows > 0).then(|| Run {
-                        pages: write.clone(),
-                        from: 0,
-                        count: rows,
-                    }),
-                    override_rows: false,
-                }
-            }
-            RsVerb::FoldBuffered {
-                pages,
-                at,
-                bound,
-                len,
-            } => {
-                if *bound != rows {
-                    return Err(program(
-                        "serve::rs",
-                        format!(
-                            "lane {lane} replays a buffer bounded at {bound} tokens in a fire that \
-                             gave it {rows} rows — the bound IS what sizes the launch, so the two \
-                             are one number"
-                        ),
-                    ));
-                }
-                let commit = host(*len)?.min(*bound);
-                LanePlan {
-                    replay: 0,
-                    commit,
-                    rows,
-                    gather: Some(Run {
-                        pages: pages.clone(),
-                        from: *at,
-                        count: *bound,
-                    }),
-                    scatter: None,
-                    override_rows: true,
-                }
-            }
-        })
-    }
-}
-
-fn program(at: &'static str, why: String) -> Fault {
-    Fault::Program { at, why }
-}
-
 /// Where the recurrence inputs of one window sit in its extended rows:
 /// for each extended row, whether it is replayed from the buffer (and from
 /// which buffer row) or is one of the window's own rows (and which); for each
@@ -467,19 +322,6 @@ impl WindowMap {
                 continue;
             };
             let begin = map.from_buffer.len() as i32;
-            if plan.override_rows {
-                if let Some(run) = &plan.gather {
-                    for t in 0..run.count {
-                        map.from_buffer.push(1);
-                        map.buffer_row.push(locate(run, run.from + t)?);
-                        map.own_row.push(0);
-                    }
-                }
-                for i in 0..rows {
-                    map.land[(start + i) as usize] = begin + i as i32;
-                }
-                continue;
-            }
             if let Some(run) = &plan.gather {
                 for t in 0..run.count {
                     map.from_buffer.push(1);

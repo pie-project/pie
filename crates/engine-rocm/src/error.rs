@@ -455,6 +455,12 @@ impl From<eta_exec::Error> for Fault {
     }
 }
 
+impl From<engine::ports::PortError> for Fault {
+    fn from(error: engine::ports::PortError) -> Fault {
+        Fault::program("program::ports", error.0)
+    }
+}
+
 impl From<poem_exec::KernelError> for Fault {
     fn from(error: poem_exec::KernelError) -> Fault {
         Fault::Fire(poem_exec::Error::Kernel(error))

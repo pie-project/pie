@@ -1,85 +1,26 @@
-use eta_ir::container::{PortSource, TraceContainer};
+use eta_compiler::eval::pareval::GeometryTaint;
+use eta_ir::container::{ChanDType, PortSource, TraceContainer};
 use eta_ir::op::Op;
 use eta_ir::registry::{Port, PortMask};
 use eta_ir::types::Dtype;
 use grammar::brle::RunMask;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DecodeEnvelope {
-    pub token_count: u32,
-    #[allow(dead_code)]
-    pub lane_count: u32,
-    pub token_indptr: Vec<u32>,
-    #[allow(dead_code)]
-    pub loop_carried: bool,
-    pub device_positions: bool,
-    pub device_fold_len: bool,
-    pub device_mask: bool,
-}
-
-#[cfg(test)]
-impl DecodeEnvelope {
-    pub fn template(&self, container: &TraceContainer) -> Result<ReqGeometry, GeometryError> {
-        let token_count = self.token_count;
-        let qo_indptr = match const_port(container, Port::EmbedIndptr) {
-            Some(bytes) => as_u32(Port::EmbedIndptr, bytes)?,
-            None => self.token_indptr.clone(),
-        };
-        let position_ids = match const_port(container, Port::Positions) {
-            Some(bytes) => as_u32(Port::Positions, bytes)?,
-            None => vec![0; token_count as usize],
-        };
-        let mut readout_defaulted = false;
-        let readout = match const_port(container, Port::Readout) {
-            Some(bytes) => as_u32(Port::Readout, bytes)?,
-            None => {
-                readout_defaulted = true;
-                qo_indptr
-                    .windows(2)
-                    .map(|lane| lane[1].saturating_sub(1))
-                    .collect()
-            }
-        };
-        let mut sampling_indices = Vec::with_capacity(readout.len());
-        let mut sampling_indptr = Vec::with_capacity(qo_indptr.len());
-        sampling_indptr.push(0);
-        for lane in qo_indptr.windows(2) {
-            for &index in &readout {
-                if index >= lane[0] && index < lane[1] {
-                    sampling_indices.push(index - lane[0]);
-                }
-            }
-            sampling_indptr.push(sampling_indices.len() as u32);
-        }
-        if sampling_indices.len() != readout.len() {
-            return Err(GeometryError::BadCsr {
-                port: Port::Readout,
-            });
-        }
-        Ok(ReqGeometry {
-            token_ids: vec![0; token_count as usize],
-            position_ids,
-            qo_indptr,
-            sampling_indptr,
-            sampling_indices,
-            readout_defaulted,
-            ..ReqGeometry::default()
-        })
-    }
-}
-
 #[cfg(test)]
 pub fn classify_decode_envelope(
     container: &TraceContainer,
-) -> Result<Option<DecodeEnvelope>, String> {
-    classify_decode_envelope_why(container, &mut String::new())
+    taint: &GeometryTaint,
+) -> Result<Option<PortMask>, String> {
+    classify_decode_envelope_why(container, taint, &mut String::new())
 }
 
+/// Tokens (and mask, fold and positions) are the device's; where rows land
+/// stays the host's.
 pub fn classify_decode_envelope_why(
     container: &TraceContainer,
+    taint: &GeometryTaint,
     why: &mut String,
-) -> Result<Option<DecodeEnvelope>, String> {
-    let mut decline = |reason: String| -> Result<Option<DecodeEnvelope>, String> {
+) -> Result<Option<PortMask>, String> {
+    let mut decline = |reason: String| -> Result<Option<PortMask>, String> {
         *why = reason;
         Ok(None)
     };
@@ -99,11 +40,14 @@ pub fn classify_decode_envelope_why(
         Some(PortSource::Channel(channel)) => Some(*channel as usize),
         _ => None,
     };
+    let device = |port| taint.device_dependent_ports.contains(&port);
+    if device(Port::Slots) || device(Port::KvLen) {
+        return decline(
+            "where its rows land or what they read is computed on the device".to_string(),
+        );
+    }
     let Some(token_channel) = channel_index(Port::EmbedTokens) else {
         return decline("EmbedTokens is not bound to a channel".to_string());
-    };
-    let Some(kv_len_channel) = channel_index(Port::KvLen) else {
-        return decline("KvLen is not bound to a channel".to_string());
     };
     let puts_channel = |channel: usize| {
         container.stages.iter().any(|stage| {
@@ -118,38 +62,15 @@ pub fn classify_decode_envelope_why(
         .channels
         .get(token_channel)
         .ok_or_else(|| "decode envelope token channel is out of range".to_string())?;
-    let kv_len = container
-        .channels
-        .get(kv_len_channel)
-        .ok_or_else(|| "decode envelope KV-length channel is out of range".to_string())?;
-    if (!token.seeded && !loop_carried) || !puts_channel(kv_len_channel) {
-        return decline(format!(
-            "the token channel must be seeded or loop-carried and the KV-length \
-             channel must be put by a stage (token seeded={}, token loop-carried={}, \
-             kv-len put={})",
-            token.seeded,
-            loop_carried,
-            puts_channel(kv_len_channel)
-        ));
-    }
-    for port in [
-        Port::Positions,
-        Port::Pages,
-        Port::PageIndptr,
-        Port::WSlot,
-        Port::WOff,
-    ] {
-        if channel_for(port).is_none() {
-            return decline(format!("{port:?} has no port binding at all"));
-        }
+    if !token.seeded && !loop_carried {
+        return decline("the token channel is neither seeded nor loop-carried".to_string());
     }
     let token_dims = token.shape.dims();
     if token_dims.len() != 1
         || token_dims[0] == 0
         || !matches!(
             token.dtype,
-            eta_ir::container::ChanDType::Concrete(Dtype::I32)
-                | eta_ir::container::ChanDType::Concrete(Dtype::U32)
+            ChanDType::Concrete(Dtype::I32) | ChanDType::Concrete(Dtype::U32)
         )
     {
         return Err("decode envelope tokens must be a non-empty i32/u32 vector".to_string());
@@ -178,22 +99,17 @@ pub fn classify_decode_envelope_why(
             if dims.len() != 1
                 || dims[0] < 2
                 || dims[0] > token_count + 1
-                || !matches!(
-                    declaration.dtype,
-                    eta_ir::container::ChanDType::Concrete(Dtype::U32)
-                )
+                || !matches!(declaration.dtype, ChanDType::Concrete(Dtype::U32))
             {
                 return Err(format!(
                     "decode envelope EmbedIndptr channel must be a [lanes + 1] u32 vector with \
-                     at most {} lane(s)",
-                    token_count
+                     at most {token_count} lane(s)"
                 ));
             }
             if dims[0] == token_count + 1 {
                 (0..=token_count).collect()
             } else if declaration.seeded && !puts_channel(*channel as usize) {
-                let lanes = dims[0] - 1;
-                if lanes == 1 {
+                if dims[0] == 2 {
                     vec![0, token_count]
                 } else {
                     Vec::new()
@@ -226,258 +142,224 @@ pub fn classify_decode_envelope_why(
         }
         _ => (qo_indptr.len() - 1) as u32,
     };
-    if kv_len.shape.dims() != [lane_count]
-        || !matches!(
-            kv_len.dtype,
-            eta_ir::container::ChanDType::Concrete(Dtype::U32)
-        )
-    {
-        return Err(format!(
-            "decode envelope KV length must be a [{lane_count}] u32 vector"
-        ));
+    let device_positions = device(Port::Positions);
+    if device_positions {
+        if channel_for(Port::Slots).is_none() {
+            return decline(
+                "its positions are computed on the device and it states no slots, so they \
+                 are where its rows land"
+                    .to_string(),
+            );
+        }
+        let declaration = container
+            .channels
+            .get(channel_index(Port::Positions).unwrap_or(usize::MAX))
+            .ok_or_else(|| "decode envelope position channel is out of range".to_string())?;
+        if declaration.shape.dims() != [token_count]
+            || !matches!(declaration.dtype, ChanDType::Concrete(Dtype::U32))
+        {
+            return Err(format!(
+                "device-carried positions must be a [{token_count}] u32 vector"
+            ));
+        }
     }
-
-    let mut device_positions = false;
-    let mut device_fold_len = false;
-    let mut device_mask = false;
-    for binding in &container.ports {
-        match (&binding.port, &binding.source) {
-            (Port::EmbedTokens | Port::KvLen, PortSource::Channel(_)) => {}
-            (Port::RsFoldLen, PortSource::Channel(channel)) => {
-                let declaration = container.channels.get(*channel as usize).ok_or_else(|| {
-                    "decode envelope rs_fold_len channel is out of range".to_string()
-                })?;
-                let dims = declaration.shape.dims();
-                if !(dims == [lane_count] || dims == [1])
-                    || !matches!(
-                        declaration.dtype,
-                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
-                            | eta_ir::container::ChanDType::Concrete(Dtype::I32)
-                    )
-                {
-                    return Err(format!(
-                        "device rs_fold_len must be a [{lane_count}] (or [1]) u32/i32 vector"
-                    ));
-                }
-                device_fold_len = true;
-            }
-            (Port::RsFoldLen, _) => {}
-            (Port::EmbedIndptr, PortSource::Const { dtype, shape, data })
-                if *dtype == Dtype::U32
-                    && shape.dims() == [lane_count + 1]
-                    && data.len() == (lane_count as usize + 1) * 4 => {}
-            (Port::EmbedIndptr, PortSource::Channel(channel)) => {
-                let declaration = container.channels.get(*channel as usize).ok_or_else(|| {
-                    "decode envelope EmbedIndptr channel is out of range".to_string()
-                })?;
-                if declaration.shape.dims() != [lane_count + 1]
-                    || !matches!(
-                        declaration.dtype,
-                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
-                    )
-                {
-                    return Err("device EmbedIndptr must be a [lanes+1] u32 vector".to_string());
-                }
-            }
-            (Port::Positions, PortSource::Const { dtype, shape, .. })
-                if *dtype == Dtype::U32 && shape.dims() == [token_count] => {}
-            (Port::Readout, PortSource::Const { dtype, shape, data })
-                if *dtype == Dtype::U32
-                    && shape.dims().len() == 1
-                    && data.len() == shape.dims()[0] as usize * 4
-                    && data
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .all(|bytes| u32::from_le_bytes(*bytes) < token_count) => {}
-            (Port::Readout, PortSource::Channel(channel)) => {
-                let declaration = container
-                    .channels
-                    .get(*channel as usize)
-                    .ok_or_else(|| "decode envelope Readout channel is out of range".to_string())?;
-                if declaration.shape.dims().len() != 1
-                    || !matches!(
-                        declaration.dtype,
-                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
-                    )
-                {
-                    return Err("device Readout must be a u32 vector".to_string());
-                }
-            }
-            (Port::PageIndptr, PortSource::Const { dtype, shape, data })
-                if *dtype == Dtype::U32
-                    && shape.dims() == [lane_count + 1]
-                    && data.len() == (lane_count as usize + 1) * 4 => {}
-            (Port::Positions, PortSource::Channel(channel)) => {
-                device_positions = true;
-                let declaration = container.channels.get(*channel as usize).ok_or_else(|| {
-                    "decode envelope position channel is out of range".to_string()
-                })?;
-                if declaration.shape.dims() != [token_count]
-                    || !matches!(
-                        declaration.dtype,
-                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
-                    )
-                {
-                    return Err(format!(
-                        "device-carried positions must be a [{token_count}] u32 vector"
-                    ));
-                }
-            }
-            (Port::Pages, PortSource::Channel(channel)) => {
-                let declaration = container
-                    .channels
-                    .get(*channel as usize)
-                    .ok_or_else(|| "decode envelope pages channel is out of range".to_string())?;
-                let dims = declaration.shape.dims();
-                let valid_shape = match dims {
-                    [flat] => *flat > 0,
-                    [lanes, stride] => *lanes == lane_count && *stride > 0,
-                    _ => false,
-                };
-                if !valid_shape
-                    || !matches!(
-                        declaration.dtype,
-                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
-                    )
-                {
-                    return Err(
-                        "device pages must be a non-empty flat or [lanes,pages] u32 pool"
-                            .to_string(),
-                    );
-                }
-            }
-            (Port::PageIndptr, PortSource::Channel(channel)) => {
-                let declaration = container.channels.get(*channel as usize).ok_or_else(|| {
-                    "decode envelope page-indptr channel is out of range".to_string()
-                })?;
-                if declaration.shape.dims() != [lane_count + 1]
-                    || !matches!(
-                        declaration.dtype,
-                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
-                    )
-                {
-                    return Err("device PageIndptr must be a [lanes+1] u32 vector".to_string());
-                }
-            }
-            (Port::WSlot | Port::WOff, PortSource::Channel(channel)) => {
-                let declaration = container
-                    .channels
-                    .get(*channel as usize)
-                    .ok_or_else(|| "decode envelope write channel is out of range".to_string())?;
-                if declaration.shape.dims() != [token_count]
-                    || !matches!(
-                        declaration.dtype,
-                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
-                    )
-                {
-                    return Err("device WSlot/WOff must be a [tokens] u32 vector".to_string());
-                }
-            }
-            (Port::AttnMask, PortSource::Channel(channel)) => {
-                let declaration = container
-                    .channels
-                    .get(*channel as usize)
-                    .ok_or_else(|| "decode envelope mask channel is out of range".to_string())?;
-                if !matches!(
-                    declaration.dtype,
-                    eta_ir::container::ChanDType::Concrete(Dtype::Bool)
-                ) {
-                    return Err("device attention mask must be a bool channel".to_string());
-                }
-                let dims = declaration.shape.dims();
-                let rows_per_fire = match dims {
-                    [rows, keys] if *keys > 0 => *rows,
-                    [keys] if *keys > 0 => 1,
-                    _ => {
-                        return decline(format!(
-                            "a device attention mask is a [tokens, keys] (or [keys]) bool \
-                             channel; this one is {dims:?}"
-                        ));
-                    }
-                };
-                if rows_per_fire != token_count {
-                    return decline(format!(
-                        "the device attention mask holds {rows_per_fire} row(s) and the \
-                         fire embeds {token_count} token(s); one row per token"
-                    ));
-                }
-                device_mask = true;
-            }
-            (Port::AttnMask, _) => {
-                return Ok(None);
-            }
+    let device_fold = device(Port::Fold);
+    if device_fold {
+        let declaration = container
+            .channels
+            .get(channel_index(Port::Fold).unwrap_or(usize::MAX))
+            .ok_or_else(|| "decode envelope fold channel is out of range".to_string())?;
+        let dims = declaration.shape.dims();
+        if !(dims == [lane_count] || dims == [1])
+            || !matches!(
+                declaration.dtype,
+                ChanDType::Concrete(Dtype::U32) | ChanDType::Concrete(Dtype::I32)
+            )
+        {
+            return Err(format!(
+                "a fold computed on the device must be a [{lane_count}] (or [1]) u32/i32 vector"
+            ));
+        }
+    }
+    let device_mask = device(Port::AttnMask);
+    if device_mask {
+        let declaration = container
+            .channels
+            .get(channel_index(Port::AttnMask).unwrap_or(usize::MAX))
+            .ok_or_else(|| "decode envelope mask channel is out of range".to_string())?;
+        if !matches!(declaration.dtype, ChanDType::Concrete(Dtype::Bool)) {
+            return Err("device attention mask must be a bool channel".to_string());
+        }
+        let dims = declaration.shape.dims();
+        let rows_per_fire = match dims {
+            [rows, keys] if *keys > 0 => *rows,
+            [keys] if *keys > 0 => 1,
             _ => {
-                return Err(format!(
-                    "decode envelope cannot resolve {:?} from this source",
-                    binding.port
+                return decline(format!(
+                    "a device attention mask is a [tokens, keys] (or [keys]) bool channel; \
+                     this one is {dims:?}"
                 ));
             }
+        };
+        if rows_per_fire != token_count {
+            return decline(format!(
+                "the device attention mask holds {rows_per_fire} row(s) and the fire embeds \
+                 {token_count} token(s); one row per token"
+            ));
         }
     }
-    Ok(Some(DecodeEnvelope {
-        token_count,
-        lane_count,
-        token_indptr: qo_indptr,
-        loop_carried,
-        device_positions,
-        device_fold_len,
-        device_mask,
-    }))
-}
-
-pub fn envelope_required_ports(envelope: &DecodeEnvelope) -> PortMask {
-    let mut required = PortMask::of(&[Port::EmbedTokens, Port::KvLen]);
-    if envelope.device_positions {
+    if let Some(port) = taint.device_dependent_ports.iter().find(|port| {
+        !matches!(
+            port,
+            Port::EmbedTokens | Port::Positions | Port::Fold | Port::AttnMask
+        )
+    }) {
+        return decline(format!("{port:?} is computed on the device"));
+    }
+    let mut required = PortMask::of(&[Port::EmbedTokens]);
+    if device_positions {
         required = required.with(Port::Positions);
     }
-    if envelope.device_fold_len {
-        required = required.with(Port::RsFoldLen);
+    if device_fold {
+        required = required.with(Port::Fold);
     }
-    if envelope.device_mask {
+    if device_mask {
         required = required.with(Port::AttnMask);
     }
-    required
+    Ok(Some(required))
 }
 
-#[cfg(test)]
-fn const_port(container: &TraceContainer, port: Port) -> Option<&[u8]> {
-    container.ports.iter().find_map(|binding| {
-        if binding.port != port {
+/// A pass whose program re-publishes its tokens and where they land in a stage.
+pub fn detect_pooled_device_geometry(container: &TraceContainer) -> Option<Vec<u32>> {
+    let channel_of = |port: Port| {
+        container
+            .ports
+            .iter()
+            .find_map(|binding| match &binding.source {
+                PortSource::Channel(channel) if binding.port == port => Some(*channel as usize),
+                _ => None,
+            })
+    };
+    let republished = |channel: usize| {
+        container.stages.iter().any(|stage| {
+            stage
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::ChanPut { chan, .. } if *chan as usize == channel))
+        })
+    };
+
+    if let Some(mask) = channel_of(Port::AttnMask) {
+        if !matches!(
+            container.channels.get(mask)?.dtype,
+            ChanDType::Concrete(Dtype::Bool)
+        ) {
             return None;
         }
-        match &binding.source {
-            PortSource::Const { data, .. } => Some(data.as_slice()),
-            PortSource::Channel(_) => None,
+        if !republished(mask) {
+            return None;
         }
-    })
+    }
+    let lands = channel_of(Port::Slots).or_else(|| channel_of(Port::Positions))?;
+    if !republished(lands) || !republished(channel_of(Port::EmbedTokens)?) {
+        return None;
+    }
+    for port in [Port::Positions, Port::Slots, Port::KvLen] {
+        if let Some(channel) = channel_of(port)
+            && !republished(channel)
+        {
+            return None;
+        }
+    }
+
+    let tokens = container.channels.get(channel_of(Port::EmbedTokens)?)?;
+    let dims = tokens.shape.dims();
+    if dims.len() != 1 || dims[0] == 0 {
+        return None;
+    }
+    if !matches!(
+        tokens.dtype,
+        ChanDType::Concrete(Dtype::I32) | ChanDType::Concrete(Dtype::U32)
+    ) {
+        return None;
+    }
+    let count = dims[0];
+    match channel_of(Port::EmbedIndptr) {
+        Some(split) if !republished(split) => {
+            let declaration = container.channels.get(split)?;
+            if !declaration.seeded || !matches!(declaration.dtype, ChanDType::Concrete(Dtype::U32))
+            {
+                return None;
+            }
+            match declaration.shape.dims() {
+                [2] => Some(vec![0, count]),
+                [bounds] if *bounds == count + 1 => Some((0..=count).collect()),
+                _ => None,
+            }
+        }
+        _ => Some((0..=count).collect()),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReqGeometry {
     pub token_ids: Vec<u32>,
-    pub position_ids: Vec<u32>,
     pub qo_indptr: Vec<u32>,
-    pub kv_page_indices: Vec<u32>,
-    pub kv_page_indptr: Vec<u32>,
-    pub kv_len: Vec<u32>,
+    pub positions: Option<Vec<u32>>,
+    pub slots: Option<Vec<u32>>,
+    pub kv_len: Option<Vec<u32>>,
+    pub fold: Fold,
     pub sampling_indices: Vec<u32>,
     pub sampling_indptr: Vec<u32>,
-    pub readout_defaulted: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum GeometryError {
-    MissingChannelValue { port: Port, channel: u32 },
-    BadPayload { port: Port, bytes: usize },
-    BadCsr { port: Port },
-    NoEmbed,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Fold {
+    #[default]
+    None,
+    Host(Vec<u32>),
+    Device,
+}
+
+impl Fold {
+    pub fn of(&self, lane: usize) -> Option<u32> {
+        match self {
+            Fold::None => Some(0),
+            Fold::Host(counts) => counts.get(lane).or(counts.first()).copied(),
+            Fold::Device => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Place {
+    pub folded: u32,
+    pub folded_exact: bool,
+    pub tail: Option<u32>,
+    pub shared: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Landing {
+    pub start: u32,
+    pub rows: u32,
+}
+
+impl Landing {
+    pub fn end(self) -> u32 {
+        self.start + self.rows
+    }
 }
 
 impl ReqGeometry {
-    #[must_use]
-    pub fn lanes(&self) -> Vec<::engine::Lane> {
-        let cut = |values: &[u32], indptr: &[u32], lane: usize| -> Vec<u32> {
+    /// Rows land at their slots or after the last slot written, and read every
+    /// slot before their last.
+    pub fn lanes(
+        &self,
+        places: &[Place],
+        page: u32,
+    ) -> Result<(Vec<::engine::Lane>, Vec<Landing>), String> {
+        let cut_by = |values: &[u32], indptr: &[u32], lane: usize| -> Vec<u32> {
             let (Some(&start), Some(&end)) = (indptr.get(lane), indptr.get(lane + 1)) else {
                 return Vec::new();
             };
@@ -486,68 +368,112 @@ impl ReqGeometry {
                 .unwrap_or_default()
                 .to_vec()
         };
+        let cut = |values: &[u32], lane: usize| cut_by(values, &self.qo_indptr, lane);
         let count = self.qo_indptr.len().saturating_sub(1);
-        (0..count)
-            .map(|lane| {
-                let tokens = cut(&self.token_ids, &self.qo_indptr, lane);
-                let positions = cut(&self.position_ids, &self.qo_indptr, lane);
-                let pages = cut(&self.kv_page_indices, &self.kv_page_indptr, lane);
-                let rows = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
-                let held = self
-                    .kv_len
-                    .get(lane)
-                    .copied()
-                    .unwrap_or(rows)
-                    .saturating_sub(rows);
-                let readout = cut(&self.sampling_indices, &self.sampling_indptr, lane);
-                ::engine::Lane {
-                    slot: 0,
-                    word: 0,
-                    tokens,
-                    positions: if positions
+        if places.len() != count {
+            return Err(format!(
+                "the pass binds {} working set(s) for its {count} lane(s); give one per lane",
+                places.len()
+            ));
+        }
+        let page = page.max(1);
+        let mut lanes = Vec::with_capacity(count);
+        let mut landings = Vec::with_capacity(count);
+        for (lane, place) in places.iter().enumerate() {
+            let tokens = cut(&self.token_ids, lane);
+            let rows = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+            let start = match &self.slots {
+                Some(slots) => {
+                    let slots = cut(slots, lane);
+                    let Some(&first) = slots.first() else {
+                        return Err(format!("lane {lane} states no slot for its rows"));
+                    };
+                    if slots
                         .iter()
                         .enumerate()
-                        .all(|(at, &position)| position == held + at as u32)
+                        .any(|(at, &slot)| slot != first + at as u32)
+                    {
+                        return Err(format!(
+                            "lane {lane} writes slots {slots:?}; a lane's rows write \
+                             consecutive slots"
+                        ));
+                    }
+                    first
+                }
+                None if place.shared => {
+                    return Err(format!(
+                        "lane {lane} shares its working set with another lane and states no \
+                         slots; lanes that share a working set state where their rows land"
+                    ));
+                }
+                None => place.tail.ok_or_else(|| {
+                    format!(
+                        "lane {lane} appends, but where its working set's last write ended was \
+                         computed on the device; state its slots"
+                    )
+                })?,
+            };
+            if place.folded_exact && start < place.folded {
+                return Err(format!(
+                    "lane {lane} writes slot {start}, inside the frozen prefix (0..{}); write \
+                     at or after it",
+                    place.folded
+                ));
+            }
+            let end = start + rows;
+            let kv_len = match &self.kv_len {
+                Some(lens) => {
+                    let len = lens.get(lane).copied().ok_or_else(|| {
+                        format!("kv-len states {} length(s) for {count} lane(s)", lens.len())
+                    })?;
+                    if len != end {
+                        return Err(format!(
+                            "lane {lane} reads {len} slot(s) but its last row is slot {}; a lane \
+                             the host places reads up to its last row",
+                            end.saturating_sub(1)
+                        ));
+                    }
+                    len
+                }
+                None => end,
+            };
+            let positions = match &self.positions {
+                Some(positions) => {
+                    let positions = cut(positions, lane);
+                    if positions
+                        .iter()
+                        .enumerate()
+                        .all(|(at, &position)| position == start + at as u32)
                     {
                         Vec::new()
                     } else {
                         positions
-                    },
-                    kv: ::engine::KvDelta {
-                        held,
-                        pages,
-                        ..Default::default()
-                    },
-                    mask: None,
-                    adapter: None,
-                    drafts: false,
-                    captures_scores: false,
-                    block_draft: false,
-                    bidirectional: false,
-                    self_cond: None,
-                    rs: ::engine::RsVerb::Fold,
-                    rs_reset: ::engine::RsReset::Inferred,
-                    rs_slot: None,
-                    channels: Vec::new(),
-                    readout: match readout.as_slice() {
-                        [] => ::engine::Readout::None,
-                        [only] if *only + 1 == rows => ::engine::Readout::Last,
-                        rows => ::engine::Readout::Rows(rows.to_vec()),
-                    },
-                    stream: engine::fire::LaneStream::Text,
-                    group: None,
-                    peer: None,
-                    reading: 0,
-                    ports: Vec::new(),
-                    kv_less: false,
-                    attn_classes: None,
+                    }
                 }
-            })
-            .collect()
-    }
-
-    pub fn apply_to(&self, req: &mut crate::engine::FireRequest) {
-        req.lanes = self.lanes();
+                None => Vec::new(),
+            };
+            let readout = cut_by(&self.sampling_indices, &self.sampling_indptr, lane);
+            lanes.push(::engine::Lane {
+                tokens,
+                positions,
+                kv: ::engine::KvDelta {
+                    held: start,
+                    pages: (0..kv_len.div_ceil(page)).collect(),
+                    ..Default::default()
+                },
+                rs: ::engine::RsVerb::Fold,
+                rs_reset: ::engine::RsReset::Inferred,
+                readout: match readout.as_slice() {
+                    [] => ::engine::Readout::None,
+                    [only] if *only + 1 == rows => ::engine::Readout::Last,
+                    rows => ::engine::Readout::Rows(rows.to_vec()),
+                },
+                stream: engine::fire::LaneStream::Text,
+                ..::engine::Lane::default()
+            });
+            landings.push(Landing { start, rows });
+        }
+        Ok((lanes, landings))
     }
 }
 
@@ -683,8 +609,6 @@ pub(crate) fn evaluate_attn_mask(
     lower_attn_mask_evaluated(&bound.container, qo_indptr, &evaluated)
 }
 
-pub type ChannelValues<'a> = &'a [Option<Vec<u8>>];
-
 pub type PortEvaluations = Vec<(Port, Result<eta_compiler::eval::interp::Value, String>)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -706,21 +630,6 @@ impl std::fmt::Display for EvaluatedGeometryError {
     }
 }
 
-fn port_dims(container: &TraceContainer, port: Port) -> Option<Vec<u32>> {
-    let binding = container.ports.iter().find(|b| b.port == port)?;
-    match &binding.source {
-        PortSource::Const { shape, .. } => Some(shape.dims().to_vec()),
-        PortSource::Channel(chan) => Some(
-            container
-                .channels
-                .get(*chan as usize)?
-                .shape
-                .dims()
-                .to_vec(),
-        ),
-    }
-}
-
 pub fn map_geometry_evaluated_with(
     bound: &eta_ir::validate::BoundTrace,
     known: &mut dyn FnMut(u32) -> Option<eta_compiler::eval::interp::Value>,
@@ -728,7 +637,6 @@ pub fn map_geometry_evaluated_with(
 ) -> Result<(ReqGeometry, PortEvaluations), EvaluatedGeometryError> {
     use eta_compiler::eval::interp::Value;
 
-    let container = &bound.container;
     let ports =
         eta_compiler::eval::pareval::eval_descriptor_ports(bound, known).map_err(|blocker| {
             EvaluatedGeometryError::BadValue {
@@ -741,16 +649,6 @@ pub fn map_geometry_evaluated_with(
             (*p == port).then(|| slot.clone().map_err(|blocker| blocker.to_string()))
         })
     };
-    let required_u32 = |port: Port| -> Result<Vec<u32>, EvaluatedGeometryError> {
-        match port_value(port) {
-            Some(Ok(value)) => Ok(value_as_u32(&value)),
-            Some(Err(blocker)) => Err(EvaluatedGeometryError::NotDerivable { port, blocker }),
-            None => Err(EvaluatedGeometryError::BadValue {
-                port,
-                reason: "port is not bound".to_string(),
-            }),
-        }
-    };
     let optional_u32 = |port: Port| -> Result<Option<Vec<u32>>, EvaluatedGeometryError> {
         match port_value(port) {
             Some(Ok(value)) => Ok(Some(value_as_u32(&value))),
@@ -758,57 +656,91 @@ pub fn map_geometry_evaluated_with(
             None => Ok(None),
         }
     };
+    let required_u32 = |port: Port| -> Result<Vec<u32>, EvaluatedGeometryError> {
+        optional_u32(port)?.ok_or_else(|| EvaluatedGeometryError::BadValue {
+            port,
+            reason: "port is not bound".to_string(),
+        })
+    };
 
     let qo_indptr = required_u32(Port::EmbedIndptr)?;
-    let spanned_rows = qo_indptr.last().copied().unwrap_or(0) as usize;
+    let spanned = qo_indptr.last().copied().unwrap_or(0) as usize;
+    let lanes = qo_indptr.len().saturating_sub(1);
     let token_ids = match required_u32(Port::EmbedTokens) {
         Ok(ids) => ids,
-        Err(EvaluatedGeometryError::NotDerivable { port, blocker })
+        Err(EvaluatedGeometryError::NotDerivable { .. })
             if device_resolved.contains(Port::EmbedTokens) =>
         {
-            let _ = (port, blocker);
-            vec![0; spanned_rows]
+            vec![0; spanned]
+        }
+        Err(error) => return Err(error),
+    };
+    let positions = match optional_u32(Port::Positions) {
+        Ok(positions) => positions,
+        Err(EvaluatedGeometryError::NotDerivable { .. })
+            if device_resolved.contains(Port::Positions) =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let fold = match optional_u32(Port::Fold) {
+        Ok(Some(counts)) => Fold::Host(counts),
+        Ok(None) => Fold::None,
+        Err(EvaluatedGeometryError::NotDerivable { .. })
+            if device_resolved.contains(Port::Fold) =>
+        {
+            Fold::Device
         }
         Err(error) => return Err(error),
     };
     let mut g = ReqGeometry {
         token_ids,
         qo_indptr,
+        positions,
+        slots: optional_u32(Port::Slots)?,
+        kv_len: optional_u32(Port::KvLen)?,
+        fold,
         ..ReqGeometry::default()
     };
-
-    let kv_len = required_u32(Port::KvLen)?;
-    let lanes = g.qo_indptr.len().saturating_sub(1);
-    g.position_ids = required_u32(Port::Positions)?;
-
-    let spanned = g.qo_indptr.last().copied().unwrap_or(0) as usize;
-    for (port, tokens) in [
-        (Port::EmbedTokens, &mut g.token_ids),
-        (Port::Positions, &mut g.position_ids),
+    for (port, rows) in [
+        (Port::EmbedTokens, Some(&mut g.token_ids)),
+        (Port::Positions, g.positions.as_mut()),
+        (Port::Slots, g.slots.as_mut()),
     ] {
+        let Some(rows) = rows else { continue };
         if spanned == 0 {
-            tokens.clear();
-        } else if tokens.len() != spanned {
+            rows.clear();
+        } else if rows.len() != spanned {
             return Err(EvaluatedGeometryError::BadValue {
                 port,
                 reason: format!(
                     "the token CSR spans {spanned} rows but {} were supplied",
-                    tokens.len()
+                    rows.len()
                 ),
             });
         }
     }
+    if let Some(kv_len) = &g.kv_len
+        && kv_len.len() != lanes
+    {
+        return Err(EvaluatedGeometryError::BadValue {
+            port: Port::KvLen,
+            reason: format!(
+                "expected one length for each of {lanes} lanes, got {}",
+                kv_len.len()
+            ),
+        });
+    }
 
     let readout = match optional_u32(Port::Readout)? {
         Some(readout) => readout,
-        None => {
-            g.readout_defaulted = true;
-            g.qo_indptr
-                .windows(2)
-                .filter(|lane| lane[1] > lane[0])
-                .map(|lane| lane[1] - 1)
-                .collect()
-        }
+        None => g
+            .qo_indptr
+            .windows(2)
+            .filter(|lane| lane[1] > lane[0])
+            .map(|lane| lane[1] - 1)
+            .collect(),
     };
     let mut sampling_indices = Vec::with_capacity(readout.len());
     let mut sampling_indptr = Vec::with_capacity(g.qo_indptr.len());
@@ -830,27 +762,6 @@ pub fn map_geometry_evaluated_with(
     g.sampling_indices = sampling_indices;
     g.sampling_indptr = sampling_indptr;
 
-    let pages = required_u32(Port::Pages)?;
-    let page_indptr = required_u32(Port::PageIndptr)?;
-    g.kv_page_indices =
-        compact_page_envelope(container, pages, &page_indptr).map_err(|reason| {
-            EvaluatedGeometryError::BadValue {
-                port: Port::Pages,
-                reason,
-            }
-        })?;
-    g.kv_page_indptr = page_indptr;
-    if kv_len.len() != lanes {
-        return Err(EvaluatedGeometryError::BadValue {
-            port: Port::KvLen,
-            reason: format!(
-                "expected one length for each of {lanes} lanes, got {}",
-                kv_len.len()
-            ),
-        });
-    }
-    g.kv_len = kv_len.clone();
-
     let evaluated = ports
         .into_iter()
         .map(|(port, slot)| (port, slot.map_err(|blocker| blocker.to_string())))
@@ -868,168 +779,14 @@ pub(crate) fn value_as_u32(value: &eta_compiler::eval::interp::Value) -> Vec<u32
     }
 }
 
-pub(crate) fn compact_page_envelope(
-    container: &TraceContainer,
-    pages: Vec<u32>,
-    page_indptr: &[u32],
-) -> Result<Vec<u32>, String> {
-    let dims = port_dims(container, Port::Pages).unwrap_or_default();
-    if dims.len() != 2 {
-        let live = page_indptr.last().copied().unwrap_or_default() as usize;
-        if live > pages.len() {
-            return Err(format!(
-                "page CSR claims {live} live pages from a {}-page pool",
-                pages.len()
-            ));
-        }
-        return Ok(pages[..live].to_vec());
-    }
-    let stride = dims[1] as usize;
-    let mut compact = Vec::new();
-    for (lane, window) in page_indptr.windows(2).enumerate() {
-        let count = window[1].saturating_sub(window[0]) as usize;
-        if count > stride {
-            return Err(format!(
-                "lane {lane} claims {count} live pages over a [{},{}] envelope",
-                dims[0], dims[1]
-            ));
-        }
-        let row = lane * stride;
-        if row + count > pages.len() {
-            return Err("page envelope is shorter than its lane CSR".to_string());
-        }
-        compact.extend_from_slice(&pages[row..row + count]);
-    }
-    Ok(compact)
-}
-
-pub fn map_geometry(
-    container: &TraceContainer,
-    values: ChannelValues<'_>,
-) -> Result<ReqGeometry, GeometryError> {
-    let mut g = ReqGeometry::default();
-
-    let tokens = match resolve(container, values, Port::EmbedTokens)? {
-        Some(t) => t,
-        None => return Err(GeometryError::NoEmbed),
-    };
-    g.token_ids = as_u32(Port::EmbedTokens, &tokens)?;
-    g.qo_indptr = match resolve(container, values, Port::EmbedIndptr)? {
-        Some(b) => as_u32(Port::EmbedIndptr, &b)?,
-        None => {
-            return Err(GeometryError::BadCsr {
-                port: Port::EmbedIndptr,
-            });
-        }
-    };
-    let lanes = g.qo_indptr.len().saturating_sub(1);
-
-    let kv_len = match resolve(container, values, Port::KvLen)? {
-        Some(b) => as_u32(Port::KvLen, &b)?,
-        None => return Err(GeometryError::BadCsr { port: Port::KvLen }),
-    };
-    g.position_ids = match resolve(container, values, Port::Positions)? {
-        Some(b) => as_u32(Port::Positions, &b)?,
-        None => {
-            return Err(GeometryError::BadCsr {
-                port: Port::Positions,
-            });
-        }
-    };
-
-    match resolve(container, values, Port::Readout)? {
-        Some(b) => {
-            g.sampling_indices = as_u32(Port::Readout, &b)?;
-            let n = g.sampling_indices.len() as u32;
-            g.sampling_indptr = vec![0, n];
-        }
-        None => {
-            g.sampling_indices = (0..lanes)
-                .map(|l| g.qo_indptr[l + 1].saturating_sub(1))
-                .collect();
-            g.sampling_indptr = (0..=lanes as u32).collect();
-        }
-    }
-
-    let explicit_pages = resolve(container, values, Port::Pages)?
-        .map(|b| as_u32(Port::Pages, &b))
-        .transpose()?;
-    let explicit_indptr = resolve(container, values, Port::PageIndptr)?
-        .map(|b| as_u32(Port::PageIndptr, &b))
-        .transpose()?;
-    match (explicit_pages, explicit_indptr) {
-        (Some(pages), Some(indptr)) => {
-            g.kv_page_indices = compact_page_envelope(container, pages, &indptr)
-                .map_err(|_| GeometryError::BadCsr { port: Port::Pages })?;
-            g.kv_page_indptr = indptr;
-        }
-        (Some(_), None) => {
-            return Err(GeometryError::BadCsr {
-                port: Port::PageIndptr,
-            });
-        }
-        (None, _) => return Err(GeometryError::BadCsr { port: Port::Pages }),
-    }
-    g.kv_len = kv_len.clone();
-
-    Ok(g)
-}
-
-fn resolve(
-    container: &TraceContainer,
-    values: ChannelValues<'_>,
-    port: Port,
-) -> Result<Option<Vec<u8>>, GeometryError> {
-    let Some(binding) = container.ports.iter().find(|p| p.port == port) else {
-        return Ok(None);
-    };
-    match &binding.source {
-        PortSource::Const { data, .. } => Ok(Some(data.clone())),
-        PortSource::Channel(c) => match values.get(*c as usize).and_then(|v| v.clone()) {
-            Some(v) => Ok(Some(v)),
-            None => Err(GeometryError::MissingChannelValue { port, channel: *c }),
-        },
-    }
-}
-
-fn as_u32(port: Port, bytes: &[u8]) -> Result<Vec<u32>, GeometryError> {
-    if !bytes.len().is_multiple_of(4) {
-        return Err(GeometryError::BadPayload {
-            port,
-            bytes: bytes.len(),
-        });
-    }
-    Ok(bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| u32::from_le_bytes(*c))
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eta_ir::container::{
-        ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
-    };
-    use eta_ir::op::Op;
+    use eta_ir::container::{ChannelDecl, HostRole, PortBinding, StageProgram};
     use eta_ir::registry::Stage;
-    use eta_ir::types::{Dtype, Shape};
+    use eta_ir::types::Shape;
+    use std::collections::BTreeSet;
 
-    fn u32_bytes(v: &[u32]) -> Vec<u8> {
-        v.iter().flat_map(|w| w.to_le_bytes()).collect()
-    }
-    fn const_port(port: Port, words: &[u32]) -> PortBinding {
-        PortBinding {
-            port,
-            source: PortSource::Const {
-                dtype: Dtype::U32,
-                shape: Shape::vector(words.len() as u32),
-                data: u32_bytes(words),
-            },
-        }
-    }
     fn chan(shape: Shape, dtype: Dtype) -> ChannelDecl {
         ChannelDecl {
             shape,
@@ -1040,359 +797,302 @@ mod tests {
         }
     }
 
-    fn section3_container() -> TraceContainer {
-        TraceContainer {
+    fn decode(lanes: u32, extra: &[(Port, Shape, Dtype)]) -> TraceContainer {
+        let mut container = TraceContainer {
             names: vec![],
             externs: vec![],
-            channels: vec![
-                chan(Shape::vector(1), Dtype::I32),
-                chan(Shape::vector(1), Dtype::U32),
-            ],
-            ports: vec![
-                PortBinding {
-                    port: Port::EmbedTokens,
-                    source: PortSource::Channel(0),
-                },
-                const_port(Port::EmbedIndptr, &[0, 1]),
-                PortBinding {
-                    port: Port::KvLen,
-                    source: PortSource::Channel(1),
-                },
-            ],
+            channels: vec![chan(Shape::vector(lanes), Dtype::I32)],
+            ports: vec![PortBinding {
+                port: Port::EmbedTokens,
+                source: PortSource::Channel(0),
+            }],
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
-                ops: vec![Op::ChanTake(0)],
+                ops: vec![Op::ChanPut { chan: 0, value: 0 }],
             }],
+        };
+        for (port, shape, dtype) in extra {
+            let index = container.channels.len() as u32;
+            container.channels.push(chan(*shape, *dtype));
+            container.ports.push(PortBinding {
+                port: *port,
+                source: PortSource::Channel(index),
+            });
+        }
+        container
+    }
+
+    fn taint(ports: &[Port]) -> GeometryTaint {
+        GeometryTaint {
+            device_decided: BTreeSet::new(),
+            device_dependent_ports: ports.iter().copied().collect(),
         }
     }
 
-    fn add_explicit_geometry(container: &mut TraceContainer, tokens: u32, lanes: u32) {
-        let position = container.channels.len() as u32;
-        container
-            .channels
-            .push(chan(Shape::vector(tokens), Dtype::U32));
-        let pages = container.channels.len() as u32;
-        container
-            .channels
-            .push(chan(Shape::matrix(lanes, 2), Dtype::U32));
-        let page_indptr = container.channels.len() as u32;
-        container
-            .channels
-            .push(chan(Shape::vector(lanes + 1), Dtype::U32));
-        let w_slot = container.channels.len() as u32;
-        container
-            .channels
-            .push(chan(Shape::vector(tokens), Dtype::U32));
-        let w_off = container.channels.len() as u32;
-        container
-            .channels
-            .push(chan(Shape::vector(tokens), Dtype::U32));
-        for (port, channel) in [
-            (Port::Positions, position),
-            (Port::Pages, pages),
-            (Port::PageIndptr, page_indptr),
-            (Port::WSlot, w_slot),
-            (Port::WOff, w_off),
-        ] {
+    fn place(tail: u32) -> Place {
+        Place {
+            folded: 0,
+            folded_exact: true,
+            tail: Some(tail),
+            shared: false,
+        }
+    }
+
+    fn geometry(rows: &[u32]) -> ReqGeometry {
+        let mut qo_indptr = vec![0];
+        for &n in rows {
+            qo_indptr.push(qo_indptr.last().unwrap() + n);
+        }
+        let total = *qo_indptr.last().unwrap();
+        ReqGeometry {
+            token_ids: (0..total).collect(),
+            sampling_indices: rows.iter().map(|&n| n - 1).collect(),
+            sampling_indptr: (0..=rows.len() as u32).collect(),
+            qo_indptr,
+            ..ReqGeometry::default()
+        }
+    }
+
+    fn masked_decode(lanes: u32, pool: u32) -> TraceContainer {
+        let decls = [
+            (Port::EmbedTokens, Shape::vector(lanes), Dtype::I32),
+            (Port::Positions, Shape::vector(lanes), Dtype::U32),
+            (Port::KvLen, Shape::vector(lanes), Dtype::U32),
+            (Port::AttnMask, Shape::matrix(lanes, pool), Dtype::Bool),
+            (Port::Slots, Shape::vector(lanes), Dtype::U32),
+        ];
+        let mut container = TraceContainer {
+            names: vec![],
+            externs: vec![],
+            channels: vec![],
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![],
+            }],
+        };
+        for (port, shape, dtype) in decls {
+            let index = container.channels.len() as u32;
+            container.channels.push(chan(shape, dtype));
             container.ports.push(PortBinding {
                 port,
-                source: PortSource::Channel(channel),
+                source: PortSource::Channel(index),
+            });
+            container.stages[0].ops.push(Op::ChanPut {
+                chan: index,
+                value: 0,
             });
         }
+        container
+    }
+
+    fn channel_of(container: &TraceContainer, port: Port) -> u32 {
+        container
+            .ports
+            .iter()
+            .find_map(|binding| match (&binding.port, &binding.source) {
+                (bound, PortSource::Channel(channel)) if *bound == port => Some(*channel),
+                _ => None,
+            })
+            .expect("port bound")
     }
 
     #[test]
     fn geometry_every_case() {
-        section3_single_seq_decode_geometry();
-        decode_envelope_accepts_shape_equivalent_variants();
-        decode_envelope_accepts_channel_embed_indptr();
-        a_device_carried_bool_mask_rides_the_envelope_as_a_device_mask();
-        decode_envelope_accepts_seeded_prefill_tokens();
-        decode_envelope_derives_multitoken_and_multilane_shapes();
-        beam_rectangular_batch_geometry();
-        unfilled_device_ports_are_rejected();
+        a_decode_that_states_nothing_rides_the_envelope();
+        a_device_mask_and_fold_ride_the_envelope();
+        slots_computed_on_the_device_leave_the_envelope();
+        device_positions_ride_only_beside_stated_slots();
+        a_lane_appends_after_its_tail();
+        stated_slots_land_where_they_say();
+        a_write_inside_the_frozen_prefix_is_refused();
+        lanes_sharing_a_working_set_state_their_slots();
+        a_host_lane_reads_up_to_its_last_row();
+        masked_loop_carried_decode_is_pooled_device_geometry();
+        a_mask_free_decode_that_republishes_every_port_is_pooled_too();
+        a_decode_whose_slots_the_host_states_keeps_the_envelope_path();
+        a_decode_stating_no_slots_is_not_pooled();
     }
 
-    fn section3_single_seq_decode_geometry() {
-        let mut c = section3_container();
-        add_explicit_geometry(&mut c, 1, 1);
-        let values: Vec<Option<Vec<u8>>> = vec![
-            Some(42i32.to_le_bytes().to_vec()),
-            Some(5u32.to_le_bytes().to_vec()),
-            Some(4u32.to_le_bytes().to_vec()),
-            Some([0u32, 0].into_iter().flat_map(u32::to_le_bytes).collect()),
-            Some([0u32, 1].into_iter().flat_map(u32::to_le_bytes).collect()),
-            Some(0u32.to_le_bytes().to_vec()),
-            Some(4u32.to_le_bytes().to_vec()),
-        ];
-        let g = map_geometry(&c, &values).unwrap();
-
-        assert_eq!(g.token_ids, vec![42]);
-        assert_eq!(g.qo_indptr, vec![0, 1], "one lane, one token");
+    fn a_decode_that_states_nothing_rides_the_envelope() {
         assert_eq!(
-            g.position_ids,
-            vec![4],
-            "len 5 places the write at position 4"
-        );
-        assert_eq!(
-            g.sampling_indices,
-            vec![0],
-            "read out the lane's last (only) token"
-        );
-        assert_eq!(g.sampling_indptr, vec![0, 1]);
-        assert_eq!(
-            g.kv_len,
-            vec![5],
-            "the lane's readable extent after the append is 5"
-        );
-        assert_eq!(g.kv_page_indices, vec![0]);
-        assert_eq!(g.kv_page_indptr, vec![0, 1]);
-    }
-
-    fn decode_envelope_accepts_shape_equivalent_variants() {
-        let mut container = section3_container();
-        container.stages[0].ops = vec![
-            Op::ChanTake(0),
-            Op::ChanPut { chan: 0, value: 0 },
-            Op::ChanTake(1),
-            Op::ChanPut { chan: 1, value: 1 },
-        ];
-        add_explicit_geometry(&mut container, 1, 1);
-        let envelope = classify_decode_envelope(&container)
-            .unwrap()
-            .expect("plain loop-carried decode");
-        assert_eq!(envelope.token_count, 1);
-        assert!(envelope.loop_carried);
-        assert!(envelope.device_positions, "channel-fed positions");
-
-        let mut readout = container;
-        readout.ports.push(const_port(Port::Readout, &[0]));
-        let envelope = classify_decode_envelope(&readout)
-            .unwrap()
-            .expect("const readout decode");
-        assert_eq!(
-            envelope.template(&readout).unwrap().sampling_indices,
-            vec![0]
+            classify_decode_envelope(&decode(1, &[]), &taint(&[Port::EmbedTokens])),
+            Ok(Some(PortMask::of(&[Port::EmbedTokens]))),
+            "an appending decode is the envelope's"
         );
     }
 
-    fn decode_envelope_accepts_channel_embed_indptr() {
-        let mut container = section3_container();
-        container.stages[0].ops = vec![
-            Op::ChanTake(0),
-            Op::ChanPut { chan: 0, value: 0 },
-            Op::ChanTake(1),
-            Op::ChanPut { chan: 1, value: 1 },
-        ];
-        add_explicit_geometry(&mut container, 1, 1);
-        let indptr = container.channels.len() as u32;
-        container.channels.push(chan(Shape::vector(2), Dtype::U32));
+    fn a_device_mask_and_fold_ride_the_envelope() {
+        let container = decode(
+            1,
+            &[
+                (Port::AttnMask, Shape::matrix(1, 64), Dtype::Bool),
+                (Port::Fold, Shape::vector(1), Dtype::U32),
+            ],
+        );
+        assert_eq!(
+            classify_decode_envelope(
+                &container,
+                &taint(&[Port::EmbedTokens, Port::AttnMask, Port::Fold]),
+            ),
+            Ok(Some(PortMask::of(&[
+                Port::EmbedTokens,
+                Port::AttnMask,
+                Port::Fold
+            ]))),
+            "mask and fold may come from the device"
+        );
+    }
+
+    fn slots_computed_on_the_device_leave_the_envelope() {
+        let container = decode(2, &[(Port::Slots, Shape::vector(2), Dtype::U32)]);
+        assert_eq!(
+            classify_decode_envelope(&container, &taint(&[Port::EmbedTokens, Port::Slots])),
+            Ok(None)
+        );
+    }
+
+    fn device_positions_ride_only_beside_stated_slots() {
+        let alone = decode(1, &[(Port::Positions, Shape::vector(1), Dtype::U32)]);
+        let device = taint(&[Port::EmbedTokens, Port::Positions]);
+        assert_eq!(classify_decode_envelope(&alone, &device), Ok(None));
+        let beside = decode(
+            1,
+            &[
+                (Port::Positions, Shape::vector(1), Dtype::U32),
+                (Port::Slots, Shape::vector(1), Dtype::U32),
+            ],
+        );
+        assert_eq!(
+            classify_decode_envelope(&beside, &device),
+            Ok(Some(PortMask::of(&[Port::EmbedTokens, Port::Positions]))),
+            "RoPE from the device, slots from the host"
+        );
+    }
+
+    fn a_lane_appends_after_its_tail() {
+        let (lanes, landings) = geometry(&[3]).lanes(&[place(40)], 16).unwrap();
+        assert_eq!(landings, vec![Landing { start: 40, rows: 3 }]);
+        assert_eq!(lanes[0].kv.held, 40);
+        assert_eq!(
+            lanes[0].kv.pages,
+            vec![0, 1, 2],
+            "slots 0..43 span three pages"
+        );
+        assert!(lanes[0].positions.is_empty(), "positions follow the slots");
+        assert_eq!(lanes[0].readout, ::engine::Readout::Last);
+    }
+
+    fn stated_slots_land_where_they_say() {
+        let mut g = geometry(&[2, 1]);
+        g.slots = Some(vec![5, 6, 9]);
+        g.positions = Some(vec![5, 6, 2]);
+        let (lanes, landings) = g.lanes(&[place(7), place(0)], 4).unwrap();
+        assert_eq!(
+            landings,
+            vec![Landing { start: 5, rows: 2 }, Landing { start: 9, rows: 1 }]
+        );
+        assert!(lanes[0].positions.is_empty());
+        assert_eq!(
+            lanes[1].positions,
+            vec![2],
+            "a RoPE position apart from its slot"
+        );
+        g.slots = Some(vec![5, 7, 9]);
+        assert!(
+            g.lanes(&[place(7), place(0)], 4)
+                .unwrap_err()
+                .contains("consecutive")
+        );
+    }
+
+    fn a_write_inside_the_frozen_prefix_is_refused() {
+        let mut g = geometry(&[1]);
+        g.slots = Some(vec![3]);
+        let frozen = Place {
+            folded: 4,
+            ..place(8)
+        };
+        assert!(
+            g.lanes(&[frozen], 16)
+                .unwrap_err()
+                .contains("frozen prefix")
+        );
+        let unsure = Place {
+            folded_exact: false,
+            ..frozen
+        };
+        assert!(
+            g.lanes(&[unsure], 16).is_ok(),
+            "past a fold on the device the host cannot tell"
+        );
+    }
+
+    fn lanes_sharing_a_working_set_state_their_slots() {
+        let shared = Place {
+            shared: true,
+            ..place(0)
+        };
+        assert!(
+            geometry(&[1, 1])
+                .lanes(&[shared, shared], 16)
+                .unwrap_err()
+                .contains("state where their rows land")
+        );
+    }
+
+    fn a_host_lane_reads_up_to_its_last_row() {
+        let mut g = geometry(&[2]);
+        g.kv_len = Some(vec![12]);
+        assert!(g.lanes(&[place(10)], 16).is_ok());
+        g.kv_len = Some(vec![20]);
+        assert!(g.lanes(&[place(10)], 16).unwrap_err().contains("last row"));
+    }
+
+    fn masked_loop_carried_decode_is_pooled_device_geometry() {
+        assert_eq!(
+            detect_pooled_device_geometry(&masked_decode(1, 128)),
+            Some(vec![0, 1])
+        );
+        assert_eq!(
+            detect_pooled_device_geometry(&masked_decode(2, 128)),
+            Some(vec![0, 1, 2])
+        );
+    }
+
+    fn a_mask_free_decode_that_republishes_every_port_is_pooled_too() {
+        let mut container = masked_decode(2, 128);
         container
             .ports
-            .iter_mut()
-            .find(|binding| binding.port == Port::EmbedIndptr)
-            .unwrap()
-            .source = PortSource::Channel(indptr);
-
-        let envelope = classify_decode_envelope(&container)
-            .unwrap()
-            .expect("channel indptr decode");
-        assert_eq!(envelope.token_indptr, vec![0, 1]);
-        assert_eq!(envelope.template(&container).unwrap().qo_indptr, vec![0, 1]);
+            .retain(|binding| binding.port != Port::AttnMask);
+        assert_eq!(
+            detect_pooled_device_geometry(&container),
+            Some(vec![0, 1, 2])
+        );
     }
 
-    fn a_device_carried_bool_mask_rides_the_envelope_as_a_device_mask() {
-        let mut container = section3_container();
-        container.stages[0].ops = vec![
-            Op::ChanTake(0),
-            Op::ChanPut { chan: 0, value: 0 },
-            Op::ChanTake(1),
-            Op::ChanPut { chan: 1, value: 1 },
-        ];
-        add_explicit_geometry(&mut container, 1, 1);
-        let mask = container.channels.len() as u32;
+    fn a_decode_whose_slots_the_host_states_keeps_the_envelope_path() {
+        let mut container = masked_decode(1, 128);
+        let slots = channel_of(&container, Port::Slots);
+        container.stages[0]
+            .ops
+            .retain(|op| !matches!(op, Op::ChanPut { chan, .. } if *chan == slots));
+        assert_eq!(
+            detect_pooled_device_geometry(&container),
+            None,
+            "slots the program never re-publishes are the host's"
+        );
+    }
+
+    fn a_decode_stating_no_slots_is_not_pooled() {
+        let mut container = masked_decode(1, 128);
         container
-            .channels
-            .push(chan(Shape::matrix(1, 8), Dtype::Bool));
-        container.ports.push(PortBinding {
-            port: Port::AttnMask,
-            source: PortSource::Channel(mask),
-        });
-
-        let envelope = classify_decode_envelope(&container)
-            .unwrap()
-            .expect("a [tokens, keys] bool mask channel is a device-resolved mask");
-        assert!(
-            envelope.device_mask,
-            "the envelope names the mask as device-resolved"
-        );
-        assert!(
-            envelope_required_ports(&envelope).contains(Port::AttnMask),
-            "an engine must serve AttnMask to take this envelope"
-        );
-
-        let bad = container.channels.len() - 1;
-        container.channels[bad].shape = Shape::matrix(2, 8);
-        let mut why = String::new();
-        assert!(
-            classify_decode_envelope_why(&container, &mut why)
-                .unwrap()
-                .is_none()
-        );
-        assert!(why.contains("one row per token"), "got {why:?}");
-
-        container.channels[bad].shape = Shape::matrix(1, 8);
-        container.channels[bad].dtype = ChanDType::Concrete(Dtype::U32);
-        assert!(classify_decode_envelope(&container).is_err());
-    }
-    fn decode_envelope_accepts_seeded_prefill_tokens() {
-        let mut container = section3_container();
-        container.channels[0].seeded = true;
-        container.stages[0].ops = vec![
-            Op::ChanTake(0),
-            Op::ChanTake(1),
-            Op::ChanPut { chan: 1, value: 1 },
-        ];
-        add_explicit_geometry(&mut container, 1, 1);
-
-        let envelope = classify_decode_envelope(&container)
-            .unwrap()
-            .expect("seeded prefill envelope");
-        assert!(!envelope.loop_carried);
-    }
-
-    fn decode_envelope_derives_multitoken_and_multilane_shapes() {
-        let mut multi_token = section3_container();
-        multi_token.channels[0].shape = Shape::vector(4);
-        multi_token.ports[1] = const_port(Port::EmbedIndptr, &[0, 4]);
-        multi_token.stages[0].ops = vec![
-            Op::ChanPut { chan: 0, value: 0 },
-            Op::ChanPut { chan: 1, value: 1 },
-        ];
-        add_explicit_geometry(&mut multi_token, 4, 1);
-        let envelope = classify_decode_envelope(&multi_token).unwrap().unwrap();
-        assert_eq!((envelope.token_count, envelope.lane_count), (4, 1));
-        assert_eq!(envelope.token_indptr, vec![0, 4]);
+            .ports
+            .retain(|binding| !matches!(binding.port, Port::Slots | Port::Positions));
         assert_eq!(
-            envelope.template(&multi_token).unwrap().qo_indptr,
-            vec![0, 4]
-        );
-
-        let mut seeded_window = section3_container();
-        seeded_window.channels[0].shape = Shape::vector(4);
-        let split = seeded_window.channels.len() as u32;
-        seeded_window
-            .channels
-            .push(chan(Shape::vector(2), Dtype::U32));
-        seeded_window.channels[split as usize].seeded = true;
-        seeded_window.ports[1] = PortBinding {
-            port: Port::EmbedIndptr,
-            source: PortSource::Channel(split),
-        };
-        seeded_window.stages[0].ops = vec![
-            Op::ChanPut { chan: 0, value: 0 },
-            Op::ChanPut { chan: 1, value: 1 },
-        ];
-        add_explicit_geometry(&mut seeded_window, 4, 1);
-        let envelope = classify_decode_envelope(&seeded_window).unwrap().unwrap();
-        assert_eq!((envelope.token_count, envelope.lane_count), (4, 1));
-        assert_eq!(envelope.token_indptr, vec![0, 4]);
-        seeded_window.stages[0].ops.push(Op::ChanPut {
-            chan: split,
-            value: 1,
-        });
-        assert!(classify_decode_envelope(&seeded_window).is_err());
-
-        let mut multi_lane = section3_container();
-        multi_lane.channels[0].shape = Shape::vector(4);
-        multi_lane.channels[1].shape = Shape::vector(4);
-        multi_lane.ports[1] = const_port(Port::EmbedIndptr, &[0, 1, 2, 3, 4]);
-        multi_lane.stages[0].ops = vec![
-            Op::ChanPut { chan: 0, value: 0 },
-            Op::ChanPut { chan: 1, value: 1 },
-        ];
-        add_explicit_geometry(&mut multi_lane, 4, 4);
-        let envelope = classify_decode_envelope(&multi_lane).unwrap().unwrap();
-        assert_eq!((envelope.token_count, envelope.lane_count), (4, 4));
-        assert_eq!(
-            envelope.template(&multi_lane).unwrap().qo_indptr,
-            vec![0, 1, 2, 3, 4]
-        );
-        let template = envelope.template(&multi_lane).unwrap();
-        assert_eq!(template.sampling_indices, vec![0, 0, 0, 0]);
-        assert_eq!(template.sampling_indptr, vec![0, 1, 2, 3, 4]);
-    }
-
-    fn beam_container(b: u32, p: u32) -> TraceContainer {
-        TraceContainer {
-            names: vec![],
-            externs: vec![],
-            channels: vec![
-                chan(Shape::vector(b), Dtype::I32),
-                chan(Shape::vector(b), Dtype::U32),
-                chan(Shape::matrix(b, p), Dtype::U32),
-                chan(Shape::vector(b), Dtype::U32),
-            ],
-            ports: vec![
-                PortBinding {
-                    port: Port::EmbedTokens,
-                    source: PortSource::Channel(0),
-                },
-                const_port(Port::EmbedIndptr, &(0..=b).collect::<Vec<_>>()),
-                PortBinding {
-                    port: Port::Positions,
-                    source: PortSource::Channel(1),
-                },
-                PortBinding {
-                    port: Port::Pages,
-                    source: PortSource::Channel(2),
-                },
-                const_port(
-                    Port::PageIndptr,
-                    &(0..=b).map(|i| i * p).collect::<Vec<_>>(),
-                ),
-                PortBinding {
-                    port: Port::KvLen,
-                    source: PortSource::Channel(3),
-                },
-            ],
-            stages: vec![StageProgram {
-                stage: Stage::Epilogue,
-                ops: vec![Op::ChanTake(0)],
-            }],
-        }
-    }
-
-    fn beam_rectangular_batch_geometry() {
-        let c = beam_container(2, 3);
-        let values: Vec<Option<Vec<u8>>> = vec![
-            Some(u32_bytes(&[100, 200])),
-            Some(u32_bytes(&[7, 9])),
-            Some(u32_bytes(&[10, 11, 12, 20, 21, 22])),
-            Some(u32_bytes(&[20, 33])),
-        ];
-        let g = map_geometry(&c, &values).unwrap();
-
-        assert_eq!(g.token_ids, vec![100, 200]);
-        assert_eq!(g.qo_indptr, vec![0, 1, 2], "one token per lane");
-        assert_eq!(g.position_ids, vec![7, 9]);
-        assert_eq!(
-            g.sampling_indices,
-            vec![0, 1],
-            "last token of each of 2 lanes"
-        );
-        assert_eq!(g.sampling_indptr, vec![0, 1, 2]);
-        assert_eq!(g.kv_page_indices, vec![10, 11, 12, 20, 21, 22]);
-        assert_eq!(g.kv_page_indptr, vec![0, 3, 6]);
-        assert_eq!(g.kv_len, vec![20, 33]);
-    }
-
-    fn unfilled_device_ports_are_rejected() {
-        let c = beam_container(2, 3);
-        let values: Vec<Option<Vec<u8>>> = vec![None, None, None, None];
-        assert!(
-            map_geometry(&c, &values).is_err(),
-            "strict gate errors on device-resolved ports"
+            detect_pooled_device_geometry(&container),
+            None,
+            "a decode that appends is the host's to place"
         );
     }
 }

@@ -24,7 +24,7 @@
 //! to back so the wait-all seal composes them into ONE fire: the prompt
 //! lane (the stream the reading's `Context` port lists — `Text` for FLUX.2,
 //! `Context` for Z-Image) carrying the encoder's rows, and the image lane
-//! carrying the latent. Neither `embed` nor `attention` is called: a
+//! carrying the latent. Neither `embed` nor `state` is called: a
 //! denoise reading declares no tokens and no KV space.
 //!
 //! The sampler is an EPILOGUE (D4). Fire 0 seeds the latent with a keyed
@@ -340,10 +340,10 @@ struct Roles {
 }
 
 fn roles() -> Result<Roles> {
-    if model::pass_kind() != model::ForwardKind::Attention {
+    if model::pass_kind() != model::ForwardKind::Text {
         return Err(
-            "a DiT's readings are attention-kind passes with no kv bound; this model's \
-                    pass kind is not attention"
+            "a DiT's readings are `forward` passes with no state bound; this model's \
+                    pass kind is not text"
                 .into(),
         );
     }

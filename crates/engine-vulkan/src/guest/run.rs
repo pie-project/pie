@@ -361,7 +361,7 @@ fn host_reads_not(package: &LaunchPackage, channel: u32) -> bool {
     let read_at_fire = package.ports.iter().any(|binding| {
         binding.channel == channel
             && !binding.is_const
-            && binding.port == eta_ir::registry::Port::RsFoldLen
+            && binding.port == eta_ir::registry::Port::Fold
     });
     !read_at_fire
         && package

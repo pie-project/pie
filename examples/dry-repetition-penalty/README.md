@@ -10,8 +10,7 @@ p-e-w, ***DRY*** — first shipped in oobabooga/text-generation-webui, since
 adopted by [llama.cpp](https://github.com/ggml-org/llama.cpp)
 (`src/llama-sampler.cpp`) and KoboldCpp.
 
-**Faithfulness: Faithful with two bounded deviations** (below). See
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+**Faithfulness: Faithful with two bounded deviations** (below).
 
 ## What it does
 

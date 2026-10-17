@@ -518,6 +518,7 @@ impl Shell {
                     word: lane.word,
                     tokens: &lane.tokens,
                 },
+                positions: &[],
                 pages: &lane.pages,
                 held: lane.held,
                 kv_less: false,
@@ -539,6 +540,7 @@ impl Shell {
                 peer: None,
                 ports: &[],
                 attn_classes: None,
+                reports: 0,
             })
             .collect();
 

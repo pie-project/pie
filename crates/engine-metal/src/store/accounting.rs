@@ -75,6 +75,7 @@ impl Accounting {
     #[must_use]
     pub fn weight_headroom(&self) -> u64 {
         self.ceiling
+            .saturating_sub(self.scratch)
             .saturating_sub(self.floor)
             .saturating_sub(self.minimum)
     }
@@ -130,9 +131,37 @@ mod tests {
     #[test]
     fn accounting_every_case() {
         the_arena_scratch_counts_against_the_ceiling();
+        the_weight_headroom_leaves_the_arena_scratch_out();
         a_load_under_the_ceiling_is_admitted_and_one_over_it_refuses();
         a_non_finite_fraction_is_read_as_the_whole_working_set();
         what_other_processes_hold_comes_off_the_ceiling();
+    }
+
+    fn the_weight_headroom_leaves_the_arena_scratch_out() {
+        let ws = 21_800 * (GIB / 1000);
+        let util = 0.9;
+        let without = Accounting::of(ws, 0, util, 11 * GIB, 4 * GIB);
+        let with = Accounting::with_scratch(ws, 0, util, 11 * GIB, 6 * GIB, 4 * GIB);
+        assert_eq!(with.weight_headroom(), without.weight_headroom() - 6 * GIB);
+        // Weights that fit the headroom priced without scratch do not fit the
+        // load that wires it: the check must see the scratch to re-plan them.
+        let weights = without.weight_headroom();
+        assert!(
+            Accounting::of(ws, 0, util, weights, 4 * GIB)
+                .admit(Some(weights), util)
+                .is_ok()
+        );
+        assert!(
+            Accounting::with_scratch(ws, 0, util, weights, 6 * GIB, 4 * GIB)
+                .admit(Some(weights), util)
+                .is_err()
+        );
+        let shrunk = with.weight_headroom();
+        assert!(
+            Accounting::with_scratch(ws, 0, util, shrunk, 6 * GIB, 4 * GIB)
+                .admit(Some(shrunk), util)
+                .is_ok()
+        );
     }
 
     fn the_arena_scratch_counts_against_the_ceiling() {

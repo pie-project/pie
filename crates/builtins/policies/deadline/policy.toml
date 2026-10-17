@@ -1,0 +1,9 @@
+# Earliest deadline first: a process given `deadline-ms` is due that long
+# after it arrives, and the soonest due runs first.
+plane = "engine"
+subscribe = ["arrived", "prop-changed"]
+grants = ["schedule"]
+
+[props.deadline-ms]
+type = "int"
+doc = "Due this many ms after arriving. Without one, after every process that has one."

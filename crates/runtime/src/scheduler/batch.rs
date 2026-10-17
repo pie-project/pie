@@ -222,7 +222,6 @@ pub(crate) fn build_frame_submission(
             .enumerate()
             .map(|(arrival, req)| fire_plan::MemberFacts {
                 hook_program: req.hook_program,
-                lora: req.lora_program,
                 custom_mask: req.request.has_user_mask,
                 truncated: req.request.max_layers.is_some(),
                 max_layers: req.request.max_layers,
@@ -231,10 +230,8 @@ pub(crate) fn build_frame_submission(
                 arrival,
             })
             .collect();
-        let plan = fire_plan::plan_fire_with_model(&facts, &[]);
         let mut slots: Vec<Option<Box<PendingRequest>>> = group.into_iter().map(Some).collect();
-        let group: Vec<Box<PendingRequest>> = plan
-            .member_order
+        let group: Vec<Box<PendingRequest>> = fire_plan::member_order(&facts)
             .iter()
             .map(|&index| slots[index].take().expect("member_order is a permutation"))
             .collect();
@@ -274,15 +271,17 @@ pub(crate) fn build_frame_submission(
         let mut attachments = Vec::new();
         let lanes = build.lanes;
         for (member, &instance) in build.instance_ids.iter().enumerate() {
-            if !build.boundary_programs[member] {
+            // The fire that ends a pass runs its program; any other fire of
+            // an adapted pass still runs the adapter.
+            let at = if build.boundary_programs[member] {
+                ::engine::Boundary::Epilogue
+            } else if group[member].lora_program {
+                ::engine::Boundary::Adapter
+            } else {
                 continue;
-            }
+            };
             let lane = build.member_lane_indptr[member];
-            attachments.push(::engine::Attachment {
-                lane,
-                instance,
-                at: ::engine::Boundary::Epilogue,
-            });
+            attachments.push(::engine::Attachment { lane, instance, at });
         }
         steps.push(StepFire {
             submission: ::engine::Step {
@@ -337,6 +336,7 @@ mod tests {
             max_page_refs: 64,
             max_context: 0,
             prefill_rows: 0,
+            max_readouts: 0,
         }
     }
 
@@ -349,6 +349,7 @@ mod tests {
         two_seated_members_batch_into_a_fire_the_contract_accepts();
         a_device_geometry_member_seriates_into_the_suffix();
         a_frames_cells_are_one_per_member_and_never_shared();
+        a_device_resolved_lane_counts_against_the_token_cap();
     }
 
     fn every_member_owns_a_span_of_the_steps_lanes() {
@@ -439,9 +440,9 @@ mod tests {
             (0, 0),
             "both fires arrive at the seat stamp unseated — this is the defect's shape"
         );
-        crate::pipeline::fire::stamp_lane_slots(&mut first, &stores, first_ws)
+        crate::pipeline::fire::stamp_lane_slots(&mut first, &stores, &vec![(first_ws, vec![0])])
             .expect("a two-slot pool seats one sequence");
-        crate::pipeline::fire::stamp_lane_slots(&mut second, &stores, second_ws)
+        crate::pipeline::fire::stamp_lane_slots(&mut second, &stores, &vec![(second_ws, vec![0])])
             .expect("and its peer");
 
         let (frame, _) = build_frame_submission(
@@ -483,6 +484,37 @@ mod tests {
             "host first, device-resolved as the suffix run"
         );
         assert_eq!(step.instances, vec![12, 13]);
+    }
+
+    fn a_device_resolved_lane_counts_against_the_token_cap() {
+        // A decode whose token the device resolves carries no tokens here,
+        // and the engine still runs its row: with a prefill filling the cap
+        // they cannot share a step.
+        let mut pooled = decode(11, 3);
+        pooled.geometry = GeometryClass::DeviceGeometry;
+        pooled.lanes[0].tokens.clear();
+        let prefill = FireRequest::one(crate::engine::fire::lane_of(
+            1,
+            vec![7; limits().max_forward_tokens],
+            0,
+            vec![4, 5, 6, 7],
+        ));
+        let (frame, _) = build_frame_submission(
+            vec![vec![pending(pooled, 1), pending(prefill, 2)]],
+            limits(),
+            16,
+            &SchedulerStats::default(),
+        );
+        assert_eq!(frame.steps.len(), 2, "the prefill takes a step of its own");
+        for step in &frame.steps {
+            let rows: usize = step
+                .submission
+                .lanes
+                .iter()
+                .map(|lane| lane.tokens.len().max(1))
+                .sum();
+            assert!(rows <= limits().max_forward_tokens, "{rows} rows in a step");
+        }
     }
 
     fn a_frames_cells_are_one_per_member_and_never_shared() {

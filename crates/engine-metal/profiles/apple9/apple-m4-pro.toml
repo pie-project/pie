@@ -7,5 +7,7 @@ device = "Apple M4 Pro"
 measured = ["kernel.qmm_splitk", "kernel.ane.mlp"]
 
 [kernel]
-qmm_splitk = { use = "fill", fill_tg = 896, max = 8 }
-ane.mlp    = [{ when = "ane", use = "share", percent = 71 }, "gpu"]
+qmm_splitk      = { use = "fill", fill_tg = 896, max = 8 }
+ane.mlp         = [{ when = "ane", use = "share", percent = 74 }, "gpu"]
+ane.projections = "gpu"
+ane.min_rows    = 512

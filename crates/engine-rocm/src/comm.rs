@@ -21,8 +21,9 @@ impl std::str::FromStr for Transport {
             "nccl" => Ok(Transport::Nccl),
             other => Err(format!(
                 "`{other}` does not name an NCCL transport; the spellings are \
-                 `shm` (P2P off, the default), `peer` (P2P on), and `nccl` \
-                 (whatever NCCL's own environment says)"
+                 `shm` (no device-to-device path: P2P and NVLS off, the \
+                 default), `peer` (P2P on), and `nccl` (whatever NCCL's own \
+                 environment says)"
             )),
         }
     }
@@ -348,16 +349,22 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_rocm::collective::P
     Ok(Some(peers))
 }
 
+/// `shm` takes no device-to-device path, and NVLS (NVSwitch multicast) is
+/// one: left on, NCCL tries it even with P2P off, and in a container
+/// without the multicast capability every communicator fails to open
+/// (#500). RCCL reads the same environment.
 #[cfg(feature = "rocm")]
 fn transport_defaults(transport: Transport) {
-    let disable_p2p = match transport {
-        Transport::Shm => "1",
-        Transport::Peer => "0",
+    let set: &[(&str, &str)] = match transport {
+        Transport::Shm => &[("NCCL_P2P_DISABLE", "1"), ("NCCL_NVLS_ENABLE", "0")],
+        Transport::Peer => &[("NCCL_P2P_DISABLE", "0")],
         Transport::Nccl => return,
     };
-    // SAFETY: called before any communicator exists, from the group opener,
-    // on the thread that starts the rank threads.
-    unsafe { std::env::set_var("NCCL_P2P_DISABLE", disable_p2p) };
+    for (key, value) in set {
+        // SAFETY: called before any communicator exists, from the group
+        // opener, on the thread that starts the rank threads.
+        unsafe { std::env::set_var(key, value) };
+    }
 }
 
 #[cfg(feature = "rocm")]

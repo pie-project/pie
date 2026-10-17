@@ -63,12 +63,6 @@ def submit_deadline_us() -> int:
     return _model.submit_deadline_us()
 
 
-def is_linear() -> bool:
-    """Whether the bound model carries irreversibly-folded recurrent state
-    (a ``RECURRENT`` or ``HYBRID`` pass kind)."""
-    return _model.pass_kind() in (ForwardKind.RECURRENT, ForwardKind.HYBRID)
-
-
 @dataclass(frozen=True)
 class BlockDrafter:
     """What a guest needs to seed a BLOCK drafter's draft pass."""
@@ -108,8 +102,7 @@ def run_ahead_window() -> int:
 
 
 def pass_kind() -> _model.ForwardKind:
-    """Which forward-pass interface the bound model requires. Selects the
-    binding surface; do not derive it by parsing :func:`architecture`."""
+    """The bound model's forward-pass interface; never derive it from :func:`architecture`."""
     return _model.pass_kind()
 
 
@@ -135,16 +128,9 @@ def channel_capacity() -> int:
     return _model.channel_capacity()
 
 
-def max_embed_length() -> int:
-    """Max embed tokens in a single pass — the prefill chunk budget."""
-    return _model.max_embed_length()
-
-
-def prefill_chunk_hint() -> int:
-    """The prefill chunk the scheduler would like right now: the forward
-    token budget shared among live processes, in whole KV pages. A hint,
-    read per call — it moves as processes come and go."""
-    return _model.prefill_chunk_hint()
+def max_readout_rows(kind: ReadoutKind) -> int:
+    """The most rows one pass may read out through `kind`; the pass itself may be any length."""
+    return _model.max_readout_rows(kind)
 
 
 def rs_state_size() -> int:
@@ -152,22 +138,7 @@ def rs_state_size() -> int:
     return _model.rs_state_size()
 
 
-def rs_buffer_page_size() -> int:
-    """Tokens per buffered RS page. 0 if the model has no recurrent state."""
-    return _model.rs_buffer_page_size()
-
-
-def rs_fold_granularity() -> int:
-    """Fold granularity in tokens. 1 (or 0) means unconstrained."""
-    return _model.rs_fold_granularity()
-
-
-def arena_block_size() -> int:
-    """Bytes in one unified-arena accounting block."""
-    return _model.arena_block_size()
-
-
-# -- generative facts (imagegen design D12) ----------------------------------
+# -- generative facts ----------------------------------------------------------
 
 
 def readings() -> list:

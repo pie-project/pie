@@ -9,8 +9,11 @@ def caches(d, c, space):
         c.kv(space, a.kv, [plane, plane], a.head_dim, heads = True)
 
 def reads_a_mask(d):
-    """Whether a block attends through the lane's mask: one with no window
-    attends every row the mask shows it, both ways."""
+    """Whether a block attends through the lane's mask: one with no window,
+    or any block of a head that reads its block both ways, attends every row
+    the mask shows it."""
+    if d.bidirectional:
+        return True
     for b in d.blocks:
         if b.window == None:
             return True
@@ -80,10 +83,10 @@ def arm(d, inputs, fused, h_block, mask, block_draft):
         k = ops.elemwise.rmsnorm_per_head_plus_one(k, a.k_norm, hd, a.k_norm_eps)
         q, k = ops.elemwise.rope_partial(q, k, block_positions, a.rotary_dim, hd, a.theta)
         ops.attn.kv_append(k, v, inputs.kv(a.kv), inputs.write_page(a.kv), inputs.write_offset(a.kv))
-        if b.window != None:
+        if b.window != None and not d.bidirectional:
             o = ops.attn.prefill(q, plan, inputs.kv(a.kv), b.window, hd, a.kv_heads, a.sm_scale)
         else:
-            o = ops.attn.masked(q, plan, mask, inputs.kv(a.kv), None, hd, a.kv_heads, False, a.sm_scale)
+            o = ops.attn.masked(q, plan, mask, inputs.kv(a.kv), b.window, hd, a.kv_heads, False, a.sm_scale)
         o = biased(ops.linear.matmul(o, a.o_proj), a.o_bias)
         o = conv_finish(o, b.attn_conv, attn_coeff)
         h = ops.elemwise.residual_add(o, h)

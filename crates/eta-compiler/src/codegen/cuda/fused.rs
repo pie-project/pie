@@ -327,13 +327,19 @@ pub(crate) fn row_geometry(stage: &CompiledStage, region: &Region) -> Option<(u6
 }
 
 pub(crate) fn row_kinds(stage: &CompiledStage, region: &Region, geometry: (u64, u32)) -> Vec<u8> {
-    let (fixed, extent) = geometry;
+    // Rows that are a role the stage also states as a count: the region was
+    // formed on the role, whichever form its witness takes, and reads values
+    // of either form as its rows.
+    let (fixed, extent) = match (geometry, region.row_alias) {
+        ((n, u32::MAX), Some((role, m))) if n == m => (1, role),
+        _ => geometry,
+    };
+    let alias = region.row_alias.map(|(_, count)| count);
     stage
         .normalized
         .value_types
         .iter()
         .map(|ty| {
-            let alias = region.row_alias;
             if ty.dims.len() >= 2
                 && crate::plan::value_rows(&ty.dims)
                     .is_some_and(|shape| crate::plan::same_rows(shape, (fixed, extent), alias))

@@ -47,13 +47,12 @@ emit   = keep + first target correction, or keep + bonus if all draft tokens mat
 
 ## Implementation notes
 
-Each verification window rebuilds the target state from the committed sequence
-plus the draft. That is slower than rolling back speculative KV, but it makes
-the correctness property explicit: rejected draft state cannot leak into later
-steps. It is also what lets the program run unchanged on a hybrid
-(attention + recurrent) model: nothing persists between windows, so the
-rejected tail is folded into a fresh `RsWorkingSet` that is dropped with the
-window rather than into a state a later fire would read. The returned JSON includes the exact generated token ids plus
+Each verification window is written at the slots after the committed
+sequence and stays in the working set's buffer. The next window is written
+from the slot after the accepted prefix, so the rejected tail is replaced, and
+the same fire freezes the accepted prefix (`fold`). Rejected draft state never
+reaches the frozen prefix, which is what lets the program run unchanged on a
+model with recurrent layers. The returned JSON includes the exact generated token ids plus
 `verification_steps`, `drafted`, `accepted`, and `acceptance_rate`, so the
 `draft_length = 0` control can compare token sequences directly.
 

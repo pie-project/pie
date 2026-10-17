@@ -6,8 +6,12 @@
 
 load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
 
-CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
-CHATML_INTERLEAVED = template("chatml", thinking = True, preserve_thinking = True, tools = True, stop = QWEN_STOP)
+# Qwen 3.5, 3.6 and 3.8 templates end a thinking request's prompt inside an open `<think>`.
+THINKING_CUE = "<think>\n"
+CHATML = template("chatml", thinking = True, tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
+CHATML_INTERLEAVED = template("chatml", thinking = True, preserve_thinking = True, tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
+# Qwen3.8's template opens a thinking request's system turn with its reasoning-effort instruction.
+CHATML_QWEN38 = template("chatml", thinking = True, preserve_thinking = True, reasoning_effort = True, tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP], parts = {"vision": [QWEN_VISION]})
 TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"vision": [QWEN_VISION]})
 
@@ -19,14 +23,14 @@ def fixture(id):
 
 MODELS = [
     qwen("qwen36-27b", parts = ["vision"], drafters = ["mtp", "dflash"], layers = 64),
-    qwen("qwen38-27b", template = CHATML_INTERLEAVED, tokenizer = TOKENIZER_38, parts = ["vision"], drafters = ["mtp", "dflash2", "dspark"], layers = 64),
+    qwen("qwen38-27b", template = CHATML_QWEN38, tokenizer = TOKENIZER_38, parts = ["vision"], drafters = ["mtp", "dflash2", "dspark"], layers = 64),
     qwen("qwen35-d0.8b", parts = ["vision"], drafters = ["eagle"], layers = 24),
     qwen("qwen35-d2b", layers = 24),
     qwen("qwen35-d3b", layers = 24, vocab = 151936),
     qwen("qwen35-d4b", layers = 32),
     qwen("qwen35-a3b", layers = 40),
     qwen("qwen35-d9b", drafters = ["dflash"], layers = 32),
-    qwen("qwen36-35b-a3b", drafters = ["mtp", "dflash"], layers = 40),
+    qwen("qwen36-35b-a3b", drafters = ["mtp", "dflash", "dflash2"], layers = 40),
     qwen("ornith15-397b", template = CHATML_INTERLEAVED, parts = ["vision"], layers = 60),
     qwen("ornith15-397b-mini", mini = True, template = CHATML_INTERLEAVED, layers = 5),
     qwen("qwen38-max", template = CHATML_INTERLEAVED, tokenizer = TOKENIZER_38, layers = 92),
@@ -60,6 +64,7 @@ DEPLOYMENTS = [
     deployment("qwen35-d9b", weights = U4, kv = BF, drafter = "dflash"),
     deployment("qwen35-d9b", weights = U4, kv = BF),
     deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "dflash"),
+    deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "dflash2"),
     deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "mtp"),
     deployment("qwen36-35b-a3b", weights = U4, kv = BF),
     deployment("qwen36-35b-a3b-mini", weights = U4, kv = BF),
@@ -101,5 +106,6 @@ PUBLISHED = [
     published(target = "mlx-community/Qwen3.8-27B-4bit", head = "z-lab/Qwen3.8-27B-DFlash2", drafter = "dflash2", deployment = "qwen38-27b-dflash2-u4g64-kv-bf16"),
     published(target = "mlx-community/Qwen3.8-27B-4bit", head = "DimInfer/Qwen3.8-27B-Dspark-v1", drafter = "dspark", deployment = "qwen38-27b-dspark-u4g64-kv-bf16"),
     published(target = "mlx-community/Qwen3.6-35B-A3B-4bit", head = "z-lab/Qwen3.6-35B-A3B-DFlash", drafter = "dflash", deployment = "qwen36-35b-a3b-dflash-u4g64-kv-bf16"),
+    published(target = "mlx-community/Qwen3.6-35B-A3B-4bit", head = "incoai/Qwen3.6-35B-A3B-DFlash2", drafter = "dflash2", deployment = "qwen36-35b-a3b-dflash2-u4g64-kv-bf16"),
     published(target = "mlx-community/Qwen3.5-9B-4bit", head = "z-lab/Qwen3.5-9B-DFlash", drafter = "dflash", deployment = "qwen35-d9b-dflash-u4g64-kv-bf16"),
 ]

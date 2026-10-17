@@ -566,11 +566,13 @@ constant constexpr uint kMaxExperts = 1024;
     uint2 gid                  [[thread_position_in_grid]]) {
     if (gid.x >= width || gid.y >= padded) return;
     const int sel = perm[gid.y];
+    // A padding row is left as it is: every matmul over the stack is row by
+    // row, and no pass reads a padding row's output.
+    if (sel < 0) return;
     const uint k = experts_per_token < 1u ? 1u : experts_per_token;
 
     const uint pitch = x_pitch != 0u ? x_pitch : width;
-    out[uint(gid.y) * width + gid.x] =
-        sel < 0 ? bfloat(0) : x[(uint(sel) / k) * pitch + gid.x];
+    out[uint(gid.y) * width + gid.x] = x[(uint(sel) / k) * pitch + gid.x];
 }
 
 
@@ -618,6 +620,27 @@ constant constexpr uint kMaxExperts = 1024;
   for (uint e = 0; e < k; ++e) {
     const size_t at = base + size_t(e);
     acc += expert_weights[at] * float(y[at * size_t(width) + size_t(c)]);
+  }
+  out[size_t(row) * size_t(width) + size_t(c)] = static_cast<bfloat>(acc);
+}
+
+// expert_combine over rows a routed chain left sorted: route at's row is y[inv[at]].
+[[kernel]] void expert_combine_sorted(
+    const device bfloat* y             [[buffer(0)]],
+    const device float* expert_weights [[buffer(1)]],
+    device bfloat* out                 [[buffer(2)]],
+    const constant uint& width             [[buffer(3)]],
+    const constant uint& experts_per_token [[buffer(4)]],
+    const device int* inv              [[buffer(5)]],
+    uint2 gid                          [[thread_position_in_grid]]) {
+  const uint c = gid.x;
+  const uint row = gid.y;
+  const uint k = experts_per_token;
+  const size_t base = size_t(row) * size_t(k);
+  float acc = 0.0f;
+  for (uint e = 0; e < k; ++e) {
+    const size_t at = base + size_t(e);
+    acc += expert_weights[at] * float(y[size_t(inv[at]) * size_t(width) + size_t(c)]);
   }
   out[size_t(row) * size_t(width) + size_t(c)] = static_cast<bfloat>(acc);
 }

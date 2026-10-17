@@ -80,6 +80,11 @@ pub trait ChatDecoder: Send {
 pub trait ReasoningDecoder: Send {
     fn feed(&mut self, tokens: &[u32]) -> Vec<ReasoningEvent>;
     fn reset(&mut self);
+    /// The first token is already inside a thinking block, which the cue
+    /// opened; no [`ReasoningEvent::Start`] precedes it.
+    fn starts_inside(&self) -> bool {
+        false
+    }
 }
 
 pub trait ToolDecoder: Send {
@@ -110,6 +115,14 @@ pub trait Instruct: Send + Sync {
 
     fn cue(&self) -> Vec<u32>;
 
+    /// The system turn of a request the model answers with thinking, as its
+    /// template renders it: the template's reasoning-effort instruction ahead
+    /// of `msg`, in a system turn of its own when `msg` is `None`. A template
+    /// without one writes [`Instruct::system`], or nothing for `None`.
+    fn system_thinking(&self, msg: Option<&str>, _effort: Effort) -> Vec<u32> {
+        msg.map(|msg| self.system(msg)).unwrap_or_default()
+    }
+
     /// [`Instruct::cue`] for a turn the model answers without thinking, as
     /// the reference template renders `enable_thinking: false`.
     fn cue_without_thinking(&self) -> Vec<u32> {
@@ -130,11 +143,27 @@ pub trait Instruct: Send + Sync {
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder>;
 
+    /// [`Instruct::reasoning_decoder`] for the turn `cue` began: inside a
+    /// thinking block from the first token when the cue left one open.
+    fn reasoning_decoder_for_cue(&self, _cue: &[u32]) -> Box<dyn ReasoningDecoder> {
+        self.reasoning_decoder()
+    }
+
     fn tool_decoder(&self) -> Box<dyn ToolDecoder>;
 
     fn tool_call_grammar(&self, _tools: &[String]) -> Option<ToolGrammar> {
         None
     }
+}
+
+/// The reasoning effort a template names for a thinking request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Effort {
+    /// The template's default when a request names none.
+    #[default]
+    Xhigh,
+    Medium,
+    Low,
 }
 
 pub type Build = fn(Arc<Tokenizer>) -> Arc<dyn Instruct>;

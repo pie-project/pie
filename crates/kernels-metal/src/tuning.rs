@@ -29,6 +29,11 @@ pub enum Qmm {
     Mpp,
     #[partial]
     Staged,
+    /// Up to 8 rows of 4-bit, 64-group banks on the simdgroup-matrix MMA,
+    /// operands built in registers: the tile for GPUs without neural
+    /// accelerators (Apple9), whose MMA runs on the FP32 pipe.
+    #[partial]
+    Register,
     /// The tiled kernels (fp16 precast, split-k, plain), where the
     /// contraction is whole 32-code tiles and a tile fills the device.
     #[partial]
@@ -81,6 +86,9 @@ impl Qmm {
                 at.bits == 4 && at.group == 64 && at.rows >= 8 && at.n % i64::from(bn) == 0
             }
             Qmm::Staged => at.bits == 4 && at.group == 64 && at.rows <= 8 && at.n % 64 == 0,
+            Qmm::Register => {
+                at.bits == 4 && at.group == 64 && at.rows <= 8 && at.n % 64 == 0 && at.k % 256 == 0
+            }
             Qmm::Tiled { .. } => at.k % i64::from(crate::linear::quant::QMM_BK) == 0,
             Qmm::Qmv { .. } => true,
         }
@@ -226,6 +234,13 @@ pub struct SdpaTileRowsPerRequest(pub u32);
 #[decision(id = "kernel.sdpa.mma", flag, default = true, tune = search)]
 pub struct SdpaMma;
 
+/// Whether a few rows a request (verify rows) over a bf16 pool attend through the split
+/// paged kernel, one threadgroup a KV head and history slice sharing each page across the
+/// rows' grouped query heads, as Splash runs its verify attention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.split_bf16", flag, default = false, tune = search)]
+pub struct SdpaSplitBf16;
+
 /// Whether attention reads keys and values through the 8-bit kernel. It
 /// halves the pool and changes what attention reads: the operator's call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -272,6 +287,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaTileRowsPerRequest>()
         .add::<SdpaMma>()
         .add::<SdpaKvQ8>()
+        .add::<SdpaSplitBf16>()
         .add::<GdnScan>();
 }
 
@@ -312,6 +328,12 @@ impl Tuning {
         }
     }
 
+    /// The GPU's cores, where the device says.
+    #[must_use]
+    pub fn cores(&self) -> Option<u32> {
+        self.cores
+    }
+
     #[must_use]
     pub fn profile(&self) -> &Profile {
         &self.profile
@@ -340,6 +362,17 @@ impl Tuning {
             .ladder::<Qmm>()
             .values()
             .any(|q| *q == Qmm::Mpp)
+    }
+
+    /// Whether any dense matmul may take the register tile, whose input
+    /// table shares the precast room with no split partials: its partials
+    /// are reserved past that room at load.
+    #[must_use]
+    pub fn qmm_register(&self) -> bool {
+        self.profile
+            .ladder::<Qmm>()
+            .values()
+            .any(|q| *q == Qmm::Register)
     }
 
     #[must_use]
@@ -381,6 +414,11 @@ impl Tuning {
     #[must_use]
     pub fn sdpa_mma(&self) -> bool {
         self.profile.on::<SdpaMma>(&profile::Anywhere)
+    }
+
+    #[must_use]
+    pub fn sdpa_split_bf16(&self) -> bool {
+        self.profile.on::<SdpaSplitBf16>(&profile::Anywhere)
     }
 
     #[must_use]

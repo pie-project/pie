@@ -13,7 +13,6 @@ pub mod guest;
 pub mod inputs;
 pub mod mask;
 pub mod pjrt;
-pub mod ports;
 pub mod program;
 pub mod readout;
 pub mod rows;

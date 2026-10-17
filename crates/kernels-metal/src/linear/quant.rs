@@ -760,6 +760,68 @@ fn act_x_wt_over(
                     return staged(ctx, op, act, w, biases, y, scratch, (m, n, k, cols, ld));
                 }
             }
+            Qmm::Register => {
+                if cols % REGISTER_COLUMNS == 0 && m <= 8 {
+                    // Without room for the partials it runs whole.
+                    let split = register_split(cols, k, tuning.cores());
+                    let partial = (split > 1)
+                        .then(|| {
+                            (scratch.partials)(
+                                m.unsigned_abs() * split.unsigned_abs(),
+                                n.unsigned_abs(),
+                            )
+                        })
+                        .flatten();
+                    let split = if partial.is_some() { split } else { 1 };
+                    // The rows' inputs as the lanes take them (8 x k bf16), their sums (k / 4
+                    // f32) and, split, one arrival counter per 64 columns, in 2k-byte rows.
+                    let counters = if split > 1 {
+                        cols / REGISTER_COLUMNS
+                    } else {
+                        0
+                    };
+                    let bytes = 16 * k + k + 4 * counters;
+                    let table = (scratch.precast)(
+                        bytes.unsigned_abs().div_ceil(2 * k.unsigned_abs()),
+                        contraction,
+                    );
+                    let Some(table) = table else {
+                        continue;
+                    };
+                    ctx.fire(
+                        Fire::at(REGISTER_FILE, "qmm_sg_table")
+                            .apply(Grid::of([32, (k / 64).unsigned_abs(), 1], [32, 4, 1])),
+                        &[act.arg(), table.arg_mut(), k.arg(), m.arg(), counters.arg()],
+                    )?;
+                    let entry = symbol(&format!("affine_qmm_sg_k{split}"));
+                    let stamp = symbol(&format!("PIE_SG_POINT(\"{entry}\",{split})"));
+                    return ctx.fire(
+                        Fire::at(REGISTER_FILE, entry).stamp(stamp).apply(Grid::of(
+                            [
+                                128 * (cols / REGISTER_COLUMNS).unsigned_abs(),
+                                split.unsigned_abs(),
+                                1,
+                            ],
+                            [128, 1, 1],
+                        )),
+                        &[
+                            w.codes.arg(),
+                            w.scales.arg(),
+                            biases.arg(),
+                            table.arg(),
+                            y.arg_mut(),
+                            k.arg(),
+                            n.arg(),
+                            match partial {
+                                Some(partial) => partial.arg_mut(),
+                                None => ctx.absent()?,
+                            },
+                            m.arg(),
+                            ld.arg(),
+                        ],
+                    );
+                }
+            }
             Qmm::Tiled { crossover_tg } => {
                 let crossover = i32::try_from(crossover_tg).unwrap_or(i32::MAX);
                 let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
@@ -954,6 +1016,35 @@ fn act_x_wt_over(
 
 const STAGED_TILE: i32 = 8;
 
+const REGISTER_FILE: &str = "linear/quant_qmm_sg.metal";
+
+/// The columns of one threadgroup of the register tile: four simdgroups of 16.
+const REGISTER_COLUMNS: i32 = 64;
+
+/// The contraction span the register tile stages and splits by.
+const REGISTER_SPAN: i32 = 256;
+
+/// The register tile's contraction partitions, as Splash's Apple9 register
+/// tile takes them: doubled (to 8) while the grid stays under 4 threadgroups
+/// a core with 256 inputs a partition, or under 32 a core with 1024. Partitions
+/// take whole 256-input units, as many as fall to them, so an uneven count splits too.
+#[must_use]
+pub fn register_split(cols: i32, k: i32, cores: Option<u32>) -> i32 {
+    let cores = i64::from(cores.unwrap_or(32));
+    let grid = i64::from(cols / REGISTER_COLUMNS);
+    let spans = k / REGISTER_SPAN;
+    let mut split = 1i32;
+    while split < 8 && spans >= 2 * split {
+        let s = i64::from(split);
+        let holds = |tg: i64, inputs: i32| grid * s < tg * cores && k / (2 * split) >= inputs;
+        if !(holds(4, 256) || holds(32, 1024)) {
+            break;
+        }
+        split *= 2;
+    }
+    split
+}
+
 const STAGED_SPLIT_WIDE: i32 = 8;
 
 const STAGED_SPLIT: i32 = 4;
@@ -961,6 +1052,17 @@ const STAGED_SPLIT: i32 = 4;
 const STAGED_DEEP: i32 = 8192;
 
 const STAGED_FEW_TILES: i32 = 32;
+
+/// The contraction span the register-fed tile permutes within: four quant groups.
+const COOP_SPAN: i32 = 256;
+
+/// Narrower than this the staged tile is as quick (a 1024-column projection is 32 tiles).
+const COOP_LEAST_COLUMNS: i32 = 4096;
+
+/// From this many columns the register-fed tile fills the device without a k cut.
+const COOP_WHOLE_COLUMNS: i32 = 12288;
+
+const COOP_SPLIT: i32 = 4;
 
 #[allow(clippy::too_many_arguments)]
 fn staged(
@@ -974,6 +1076,49 @@ fn staged(
     (m, n, k, cols, ld): (i32, i32, i32, i32, i32),
 ) -> Result<(), Error> {
     let tiles = cols / 64;
+    if cols >= COOP_LEAST_COLUMNS && k % COOP_SPAN == 0 {
+        // Wide enough to fill the device from its columns alone, it runs whole; narrower, the
+        // contraction is cut in four so a 5120-column projection is not 160 simdgroups.
+        let split = if cols >= COOP_WHOLE_COLUMNS || (k / COOP_SPAN) % COOP_SPLIT != 0 {
+            1
+        } else {
+            COOP_SPLIT
+        };
+        let partial = if split > 1 {
+            (scratch.partials)(m.unsigned_abs() * split.unsigned_abs(), n.unsigned_abs())
+        } else {
+            None
+        };
+        if split == 1 || partial.is_some() {
+            let entry = symbol(&format!("affine_qmm_coop_m{STAGED_TILE}_k{split}"));
+            let stamp = symbol(&format!("PIE_COOP_POINT(\"{entry}\",{split})"));
+            ctx.fire(
+                Fire::at(STAGED_FILE, entry).stamp(stamp).apply(Grid::of(
+                    [64 * tiles.unsigned_abs(), split.unsigned_abs(), 1],
+                    [64, 1, 1],
+                )),
+                &[
+                    w.codes.arg(),
+                    w.scales.arg(),
+                    biases.arg(),
+                    act.arg(),
+                    y.arg_mut(),
+                    k.arg(),
+                    n.arg(),
+                    match partial {
+                        Some(partial) => partial.arg_mut(),
+                        None => ctx.absent()?,
+                    },
+                    m.arg(),
+                    ld.arg(),
+                ],
+            )?;
+            return match partial {
+                Some(partial) => splitk_reduce(ctx, op, y, partial, (m, n, cols), split),
+                None => Ok(()),
+            };
+        }
+    }
     let mut split = if k >= STAGED_DEEP || tiles < STAGED_FEW_TILES {
         STAGED_SPLIT_WIDE
     } else {
@@ -1013,9 +1158,21 @@ fn staged(
             ld.arg(),
         ],
     )?;
-    let Some(partial) = partial else {
-        return Ok(());
-    };
+    match partial {
+        Some(partial) => splitk_reduce(ctx, op, y, partial, (m, n, cols), split),
+        None => Ok(()),
+    }
+}
+
+/// Folds the `split` stacked f32 partials of an `m x n` product into `y`, over `cols` columns.
+fn splitk_reduce(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    y: Tensor,
+    partial: Tensor,
+    (m, n, cols): (i32, i32, i32),
+    split: i32,
+) -> Result<(), Error> {
     let stride = m
         .checked_mul(n)
         .ok_or_else(|| refuse(op, format!("{m} x {n} partials will not stack")))?;

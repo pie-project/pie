@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::Props;
+
 pub const CHUNK_SIZE_BYTES: usize = 256 * 1024;
 pub const QUERY_MODEL_STATUS: &str = "model_status";
 
@@ -45,6 +47,15 @@ pub enum ClientMessage {
         inferlet: String,
         input: String,
         capture_outputs: bool,
+        // Always written: msgpack reads fields by place, so none may be
+        // skipped.
+        #[serde(default)]
+        props: Props,
+        #[serde(default)]
+        session: Option<String>,
+        /// Set by the worker, never on the wire.
+        #[serde(skip)]
+        router_props: Props,
     },
 
     #[serde(rename = "attach_process")]

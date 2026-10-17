@@ -272,6 +272,10 @@ pub struct ServerConfig {
     /// Largest blob a client may upload in one request.
     #[serde(default = "default_max_upload")]
     pub max_upload: ByteSize,
+    /// A built-in policy's name or a component path; omit to run none. The
+    /// engine's own is `[runtime] policy`.
+    #[serde(default)]
+    pub policy: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -282,6 +286,7 @@ impl Default for ServerConfig {
             verbose: false,
             worker_threads: default_worker_threads(),
             max_upload: default_max_upload(),
+            policy: None,
         }
     }
 }
@@ -501,16 +506,21 @@ pub struct ModelConfig {
     /// How many pinned host bytes a preempted process's kv pages and
     /// recurrent-state slots may be suspended into (`"32GiB"`), shared by
     /// the tensor-parallel ranks: one rs row per device slot, then kv pages.
-    /// Omit for one device pool's worth; either is capped by the host
-    /// memory the load leaves free. `"0B"` turns host swap off, so kv
-    /// pressure restarts processes instead.
+    /// Omit for every seat at full context, and at least one device pool;
+    /// either is capped by the host memory the load leaves free. pie cannot
+    /// compute kv again, so this is where memory contention goes: it cannot
+    /// be turned off.
     #[serde(default)]
     pub host_kv_budget: Option<ByteSize>,
     /// How many disk bytes suspended kv may spill into once host swap is
     /// full (`"200GiB"`), shared by the ranks, each in its own slot file
     /// under `disk_kv_path` (default `$PIE_HOME/cache/kv/<checkpoint
-    /// digest>`), unlinked once open so it never outlives the server. `"0B"`,
-    /// the default, turns the disk tier off.
+    /// digest>`), unlinked once open so it never outlives the server. Metal
+    /// and Vulkan keep no host tier, so there it is the only one, and
+    /// suspended rs slots go to it too. Omit for four host tiers' worth on
+    /// cuda, or every seat at full context elsewhere, within a quarter of
+    /// the free space there (skipped when the disk cannot take it); `"0B"`
+    /// turns the disk tier off.
     #[serde(default)]
     pub disk_kv_budget: Option<ByteSize>,
     #[serde(default)]
@@ -700,7 +710,8 @@ impl ModelConfig {
             device_kv_budget: self.device_kv_budget.map(|b| b.as_bytes()),
             device_memory_share: self.device_memory_share,
             host_kv_budget: self.host_kv_budget.map(|b| b.as_bytes()),
-            disk_kv_budget: self.disk_kv_budget.map_or(0, |b| b.as_bytes()),
+            kv_seats: None,
+            disk_kv_budget: self.disk_kv_budget.map(|b| b.as_bytes()),
             disk_kv_dir: self.disk_kv_path.clone(),
         }
     }
@@ -806,6 +817,12 @@ impl ModelConfig {
             "model.device_kv_budget is zero, and no load serves without a kv pool; \
              state a real budget or omit the key to fill what device_memory_share leaves"
         );
+        ensure!(
+            self.host_kv_budget.is_none_or(|b| b.as_bytes() > 0),
+            "model.host_kv_budget is zero, but pie cannot compute kv again: under \
+             memory contention suspended kv has to go to host memory. State a real \
+             budget or omit the key for every seat at full context"
+        );
         for (key, budget) in [
             ("device_weight_budget", self.device_weight_budget),
             ("host_weight_budget", self.host_weight_budget),
@@ -853,6 +870,10 @@ pub struct RuntimeConfig {
     /// engine's `max_forward_requests`, which is what fills a batch.
     #[serde(default)]
     pub max_concurrent_processes: Option<usize>,
+    /// A built-in policy's name (`noop`, `priority`) or a component path; omit
+    /// to run none.
+    #[serde(default)]
+    pub policy: Option<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -863,6 +884,7 @@ impl Default for RuntimeConfig {
             frame_size: default_frame_size(),
             frame_dispatch_depth: default_frame_dispatch_depth(),
             max_concurrent_processes: None,
+            policy: None,
         }
     }
 }

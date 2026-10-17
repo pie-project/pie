@@ -44,7 +44,6 @@ from inferlet.eta.value import (
     gt,
     gumbel,
     gumbel_max,
-    indptr,
     iota,
     l2norm,
     le,
@@ -159,40 +158,20 @@ def test_s3_matches_lowering_rs_golden():
 
 
 def test_text_completion_decode():
-    n = 5
-    page_size = PAGE
     tok_in = ch_from([42], dtype.i32, "tok_in")
     embed_indptr = ch_from([0, 1], dtype.u32, "embed_indptr")
-    positions = ch_from([n], dtype.u32, "positions")
-    pages = ch_from(list(range(3)), dtype.u32, "pages")
-    page_indptr = ch_from([0, -(-(n + 1) // page_size)], dtype.u32, "page_indptr")
-    w_slot = ch_from([n // page_size], dtype.u32, "w_slot")
-    w_off = ch_from([n % page_size], dtype.u32, "w_off")
-    kv_len = ch_from([n + 1], dtype.u32, "kv_len")
+    fold = ch_from([0xFFFF_FFFF], dtype.u32, "fold")
     tok_out = ch_new([1], dtype.i32, "tok_out")
 
     b = Builder(VOCAB, PAGE)
     for port, c in [
         (Port.EMBED_TOKENS, tok_in),
         (Port.EMBED_INDPTR, embed_indptr),
-        (Port.KV_LEN, kv_len),
-        (Port.PAGES, pages),
-        (Port.PAGE_INDPTR, page_indptr),
-        (Port.W_SLOT, w_slot),
-        (Port.W_OFF, w_off),
-        (Port.POSITIONS, positions),
+        (Port.FOLD, fold),
     ]:
         b.bind_port(port, c)
 
     def epilogue():
-        length = kv_len.take()
-        next_length = length + 1
-        page_count = next_length.div_ceil(page_size)
-        kv_len.put_tensor(next_length)
-        positions.put_tensor(length)
-        w_slot.put_tensor(length // page_size)
-        w_off.put_tensor(length % page_size)
-        page_indptr.put_tensor(indptr(1, page_count))
         tok_out.put_tensor(reshape(reduce_argmax(intrinsics.logits()), [1]))
 
     b.stage(Stage.EPILOGUE, epilogue)
@@ -201,8 +180,6 @@ def test_text_completion_decode():
 
 
 def test_naive_decode():
-    n = 7
-    page_size = PAGE
     temperature = 0.7
     cap = 8
     tok_in = ch_from([3], dtype.i32, "tok_in")
@@ -211,41 +188,23 @@ def test_naive_decode():
     s1_out = ch_new([1], dtype.f32, "s1_out").capacity(cap)
     s2_out = ch_new([1], dtype.f32, "s2_out").capacity(cap)
     lane1 = ch_from([0, 1], dtype.u32, "embed_indptr")
-    positions = ch_from([n], dtype.u32, "positions")
-    pages = ch_from(list(range(4)), dtype.u32, "pages")
-    page_indptr = ch_from([0, -(-(n + 1) // page_size)], dtype.u32, "page_indptr")
-    w_slot = ch_from([n // page_size], dtype.u32, "w_slot")
-    w_off = ch_from([n % page_size], dtype.u32, "w_off")
-    kv_len = ch_from([n + 1], dtype.u32, "kv_len")
+    fold = ch_from([0xFFFF_FFFF], dtype.u32, "fold")
 
     b = Builder(VOCAB, PAGE)
     for port, c in [
         (Port.EMBED_TOKENS, tok_in),
         (Port.EMBED_INDPTR, lane1),
-        (Port.KV_LEN, kv_len),
-        (Port.PAGES, pages),
-        (Port.PAGE_INDPTR, page_indptr),
-        (Port.W_SLOT, w_slot),
-        (Port.W_OFF, w_off),
-        (Port.POSITIONS, positions),
+        (Port.FOLD, fold),
     ]:
         b.bind_port(port, c)
 
     def epilogue():
-        length = kv_len.take()
         r = rng_ch.take()
         logits = intrinsics.logits()
         scaled = logits / temperature
         token = gumbel_max(scaled, r)
         r_next = r + iota(2)
-        next_length = length + 1
-        page_count = next_length.div_ceil(page_size)
         tok_in.put_tensor(token)
-        kv_len.put_tensor(next_length)
-        positions.put_tensor(length)
-        w_slot.put_tensor(length // page_size)
-        w_off.put_tensor(length % page_size)
-        page_indptr.put_tensor(indptr(1, page_count))
         tok_out.put_tensor(token)
         mirror = reshape(cast(token, dtype.f32), [1])
         s1_out.put_tensor(mirror)
@@ -448,16 +407,10 @@ def test_diffusion_step_matches_rust():
 
     length, taps, base = 8, 4, 5
     end = base + length
-    page_size = PAGE
-    max_pages = 2
     bound, confidence = 0.5, 0.1
     toks = ch_from([(i * 7919) % 1000 for i in range(length)], dtype.i32, "canvas")
     embed_indptr = ch_from([0, length], dtype.u32, "embed_indptr")
     positions = ch_from(range(base, end), dtype.u32, "positions")
-    pages = ch_from(range(max_pages), dtype.u32, "pages")
-    page_indptr = ch_from([0, -(-end // page_size)], dtype.u32, "page_indptr")
-    w_slot = ch_from([p // page_size for p in range(base, end)], dtype.u32, "w_slot")
-    w_off = ch_from([p % page_size for p in range(base, end)], dtype.u32, "w_off")
     kv_len = ch_from([end], dtype.u32, "kv_len")
     readout = ch_from(range(length), dtype.u32, "readout")
     temp = ch_from([1.0], dtype.f32, "temperature")
@@ -473,15 +426,12 @@ def test_diffusion_step_matches_rust():
     b = Builder(VOCAB, PAGE)
     for port, c in [
         (Port.EMBED_TOKENS, toks), (Port.EMBED_INDPTR, embed_indptr), (Port.KV_LEN, kv_len),
-        (Port.PAGES, pages), (Port.PAGE_INDPTR, page_indptr), (Port.W_SLOT, w_slot),
-        (Port.W_OFF, w_off), (Port.POSITIONS, positions), (Port.READOUT, readout),
+        (Port.POSITIONS, positions), (Port.READOUT, readout),
     ]:
         b.bind_port(port, c)
 
     def epilogue():
         positions.put_tensor(positions.take())
-        w_slot.put_tensor(w_slot.take())
-        w_off.put_tensor(w_off.take())
         r = rng_state.take()
         t = reshape(temp.read(), [])
         logits = intrinsics.logits()
@@ -516,12 +466,8 @@ def test_beam_step_matches_rust():
     """`inferlet_goldens.rs::beam_step` — beam-search's epilogue: the `mask` port,
     `from_shaped`, `capacity`, `top_k` / `gather` / `or_` over `[B, V]`."""
     B = 2
-    pool_pages = 8
-    page_t = PAGE
-    pool_len = pool_pages * page_t
+    pool_len = 8 * PAGE
     v = VOCAB
-    pool_ids = list(range(pool_pages))
-    tiled = [pool_ids[0]] * (B * pool_pages)
     init_mask = [p == 0 for _ in range(B) for p in range(pool_len)]
     mask = DslChannel.from_const(ConstData(shape_of([B, pool_len]), Dtype.BOOL, pack_elems(init_mask, Dtype.BOOL))).named("mask")
     scores = ch_from([0.0, float("-inf")], dtype.f32, "scores")
@@ -529,12 +475,8 @@ def test_beam_step_matches_rust():
     pos = ch_from([0] * B, dtype.u32, "pos")
     fill = ch_from([1], dtype.u32, "fill")
     klen = ch_from([1] * B, dtype.u32, "klen")
-    w_slot = ch_from([pool_ids[0]] * B, dtype.u32, "w_slot")
-    w_off = ch_from([0] * B, dtype.u32, "w_off")
-    pages = ch_from(tiled, dtype.u32, "pages")
-    page_indptr = ch_from(range(B + 1), dtype.u32, "page_indptr")
+    slots = ch_from([0] * B, dtype.u32, "slots")
     lanes_b = ch_from(range(B + 1), dtype.u32, "embed_indptr")
-    pool_ids_ch = ch_from(pool_ids, dtype.u32, "pool_ids")
     out = ch_new([B], dtype.i32, "out").capacity(8)
     out_par = ch_new([B], dtype.u32, "out_par").capacity(8)
     out_scr = ch_new([B], dtype.f32, "out_scr").capacity(8)
@@ -542,8 +484,7 @@ def test_beam_step_matches_rust():
 
     b = Builder(VOCAB, PAGE)
     for port, c in [
-        (Port.KV_LEN, klen), (Port.PAGES, pages), (Port.PAGE_INDPTR, page_indptr), (Port.W_SLOT, w_slot),
-        (Port.W_OFF, w_off), (Port.POSITIONS, pos), (Port.ATTN_MASK, mask),
+        (Port.KV_LEN, klen), (Port.POSITIONS, pos), (Port.SLOTS, slots), (Port.ATTN_MASK, mask),
         (Port.EMBED_TOKENS, toks), (Port.EMBED_INDPTR, lanes_b),
     ]:
         b.bind_port(port, c)
@@ -563,26 +504,17 @@ def test_beam_step_matches_rust():
         wpos_b = broadcast(reshape(wpos, [B, 1]), [B, pool_len])
         newpos = eq(col, wpos_b)
         mask.put_tensor(or_(inherited, newpos))
-        pids = pool_ids_ch.take()
-        logical_slot = wpos // page_t
-        w_slot_v = gather(pids, logical_slot)
-        w_off_v = wpos % page_t
-        w_slot.put_tensor(w_slot_v)
-        w_off.put_tensor(w_off_v)
+        slots.put_tensor(wpos)
         filled = base + B
         klen.put_tensor(broadcast(reshape(filled, [1]), [B]))
         pos.put_tensor(pos.take() + 1)
         fill.put_tensor(filled)
         scores.put_tensor(s)
         toks.put_tensor(tok_i)
-        page_count = filled.div_ceil(page_t)
-        pages.put_tensor(gather(pids, iota(B * pool_pages) % broadcast(page_count, [B * pool_pages])))
-        page_indptr.put_tensor(iota(B + 1) * broadcast(page_count, [B + 1]))
         out.put_tensor(tok_i)
         out_par.put_tensor(parent)
         out_scr.put_tensor(s)
         out_greedy.put_tensor(reshape(reduce_argmax(logits), [B]))
-        pool_ids_ch.put_tensor(pids)
 
     b.stage(Stage.EPILOGUE, epilogue)
     check("beam_step", b.build())
@@ -599,10 +531,6 @@ def test_latent_step_matches_rust():
     readout = ch_from(range(rows), dtype.u32, "readout")
     kv_len = ch_from([rows], dtype.u32, "kv_len")
     positions = ch_from(range(rows), dtype.u32, "positions")
-    pages = ch_from([0], dtype.u32, "pages")
-    page_indptr = ch_from([0, -(-rows // PAGE)], dtype.u32, "page_indptr")
-    w_slot = ch_from([q // PAGE for q in range(rows)], dtype.u32, "w_slot")
-    w_off = ch_from([q % PAGE for q in range(rows)], dtype.u32, "w_off")
     latent = ch_new([rows, channels], dtype.f32, "latent")
     dsigma = ch_from([-0.25], dtype.f32, "dsigma")
     rng_ch = ch_from([9, 0], dtype.u32, "rng")
@@ -613,15 +541,12 @@ def test_latent_step_matches_rust():
     b = Builder(VOCAB, PAGE)
     for port, c in [
         (Port.EMBED_TOKENS, tok), (Port.EMBED_INDPTR, indptr_ch), (Port.KV_LEN, kv_len),
-        (Port.PAGES, pages), (Port.PAGE_INDPTR, page_indptr), (Port.W_SLOT, w_slot),
-        (Port.W_OFF, w_off), (Port.POSITIONS, positions), (Port.READOUT, readout),
+        (Port.POSITIONS, positions), (Port.READOUT, readout),
     ]:
         b.bind_port(port, c)
 
     def epilogue():
         positions.put_tensor(positions.take())
-        w_slot.put_tensor(w_slot.take())
-        w_off.put_tensor(w_off.take())
         v = intrinsics.velocity(channels)
         x = latent.take()
         d = reshape(dsigma.read(), [])

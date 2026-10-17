@@ -7,15 +7,14 @@ traces it from ordinary Python and encodes the canonical container bytes —
 the same bytes the Rust `inferlet` crate's `eta-dsl` emits for the same program, so a
 Python inferlet and a Rust inferlet share the host's program cache.
 
-    from inferlet import model, session, chat, reasoning
+    from inferlet import model
     from inferlet.eta import *          # Channel, ForwardPass, Pipeline, ops…
 
     async def main(input):
-        ws = WorkingSet()
-        ws.reserve(max_pages)
+        ws, pipe = WorkingSet(), Pipeline()
         fwd = ForwardPass()
-        fwd.embed(tokens)
-        fwd.bind_state(ws, ws.geometry(0, len(tokens)))
+        fwd.embed(model.encode(input["prompt"]))
+        fwd.state([ws], StateGeometry.folding())
         tok_out = fwd.epilogue(lambda: reduce_argmax(intrinsics.logits()))
         pipe.submit(fwd)
         token = await tok_out

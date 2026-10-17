@@ -5,20 +5,20 @@ to the model.
 
 ```python
 from inferlet import chat, model
-from inferlet.eta import ForwardPass, Pipeline, WorkingSet, intrinsics, reduce_argmax
+from inferlet.eta import ForwardPass, Pipeline, StateGeometry, WorkingSet, intrinsics, reduce_argmax
 
 
 async def main(input: dict) -> dict:
     tokens = chat.prefix() + model.encode(input.get("prompt", "The capital of France is"))
     max_tokens = int(input.get("max_tokens", 8))
-    ws = WorkingSet(tokens=len(tokens) + max_tokens)  # KV pages (and recurrent state on a hybrid model)
+    ws = WorkingSet()  # the sequence's state, whatever the model keeps
     pipe = Pipeline()
 
-    done = 0  # tokens already in the KV cache
+    done = 0  # tokens already in the working set
     for _ in range(max_tokens):
-        fwd = ForwardPass()                             # the model's pass kind
+        fwd = ForwardPass()
         fwd.embed(tokens[done:])                        # the new tokens
-        fwd.bind_state(ws, ws.geometry(done, len(tokens)))
+        fwd.state([ws], StateGeometry.folding())        # appended, and final
         out = fwd.epilogue(lambda: reduce_argmax(intrinsics.logits()))  # traced once, runs on the device
         pipe.submit(fwd)
         done = len(tokens)
@@ -29,19 +29,19 @@ async def main(input: dict) -> dict:
 ```
 
 That is `examples/quickstart-py`. Every line above stands for device state:
-`embed(list)` seeds the token and row channels, `ws.geometry(start, end)`
-derives the six KV-geometry channels of one contiguous span (edit its fields
-for anything else), and an `epilogue` that returns a tensor publishes it on a
-channel the host `await`s. The explicit spellings — `Channel.from_(...,
-dtype.u32)`, `KvGeometry(...)`, `ch.put(tensor)` inside the stage — are the
+`embed(list)` seeds the token and row channels, `state([ws], ...)` says where
+the rows land (by default after what the working set holds) and what freezes,
+and an `epilogue` that returns a tensor publishes it on a channel the host
+`await`s. The explicit spellings — `Channel.from_(..., dtype.u32)`,
+`StateGeometry(slots=..., fold=...)`, `ch.put(tensor)` inside the stage — are the
 same objects and stay available; `examples/text-completion-py` uses them for
-chunked prefill and a device loop-carried decode.
+a one-pass prefill and a device loop-carried decode.
 
 ## What is here
 
 | Module | Interface | Notes |
 |---|---|---|
-| `inferlet.eta` | `forward*`, `channel`, `working-set`, `pipeline` | The ETA authoring surface: `Tensor` + the op set, `Channel`, `WorkingSet`, `RsWorkingSet`, `ForwardPass`, `Pipeline` (`submit`, `run_ahead`), `prefill_chunks`, and `eta.diffusion` (the diffusion pass's `Mode` plus `entropy_bound_accept` / `stable_and_confident` / `linear_temperature`). A port of the Rust `eta-dsl`/`eta-ir` crates and `inferlet::eta`; the container bytes it emits are **byte-identical** to the Rust `inferlet` crate's for the same program (`tests/test_eta_goldens.py` pins them), so a Python and a Rust inferlet share the host's program cache. |
+| `inferlet.eta` | `forward*`, `channel`, `working-set`, `pipeline` | The ETA authoring surface: `Tensor` + the op set, `Channel`, `WorkingSet`, `StateGeometry`, `ForwardPass`, `Pipeline` (`submit`, `run_ahead`), `readout_spans`, and `eta.diffusion` (the diffusion pass's `Mode` plus `entropy_bound_accept` / `stable_and_confident` / `linear_temperature`). A port of the Rust `eta-dsl`/`eta-ir` crates and `inferlet::eta`; the container bytes it emits are **byte-identical** to the Rust `inferlet` crate's for the same program (`tests/test_eta_goldens.py` pins them), so a Python and a Rust inferlet share the host's program cache. |
 | `inferlet.model` / `inferlet.tokenizer` | `model`, `tokenizer` | The bound model's facts; `model` re-exports the tokenizer functions. |
 | `inferlet.grammar` / `inferlet.mask` | `grammar` | JSON-Schema / regex / EBNF constraints and the packed-bitmask helpers a `masked_argmax` epilogue reads. |
 | `inferlet.chat` / `inferlet.reasoning` / `inferlet.tools` | `chat`, `reasoning`, `tools` | The host's chat template, thinking-block and tool-call decoders. |

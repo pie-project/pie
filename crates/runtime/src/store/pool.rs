@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub trait PoolId: Copy {
     fn from_index(index: u32) -> Self;
     fn index(self) -> u32;
@@ -70,11 +68,15 @@ impl<I: PoolId> Pool<I> {
         self.free.len()
     }
 
-    pub fn pending_recycle(&self) -> usize {
-        self.pending.iter().map(|(_, ids)| ids.len()).sum()
-    }
-
     pub fn capacity(&self) -> u32 {
         self.capacity
+    }
+
+    pub fn base(&self) -> u32 {
+        self.base
+    }
+
+    pub fn contains(&self, id: I) -> bool {
+        (self.base..self.base.saturating_add(self.capacity)).contains(&id.index())
     }
 }

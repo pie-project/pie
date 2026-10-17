@@ -591,6 +591,8 @@ async def cli_pie_client(args: argparse.Namespace):
             f"--no-default-features --features {feature}"
         )
 
+    # launch to the ready banner: the model load, as other engines' servers report it
+    launched = time.perf_counter()
     proc = await asyncio.create_subprocess_exec(
         str(pie_bin),
         "--config",
@@ -693,6 +695,7 @@ async def cli_pie_client(args: argparse.Namespace):
             # gateway edge landed; match the phrase, not the scheme.
             if "Server ready at " in text:
                 server_ready = True
+                engine_config["server load s"] = round(time.perf_counter() - launched, 3)
                 break
             if proc.returncode is not None:
                 raise RuntimeError(
@@ -781,7 +784,6 @@ async def run(args: argparse.Namespace):
                 # token out on `g0` and back as the decode's seed) and an A/B
                 # against the device handoff is worth being able to run.
                 **({"host_first_token": True} if getattr(args, "host_first_token", False) else {}),
-                **({"no_prefix_cache": True} if getattr(args, "no_prefix_cache", False) else {}),
                 **(
                     {"run_ahead_frames": args.run_ahead_frames}
                     if getattr(args, "run_ahead_frames", None)
@@ -1586,18 +1588,6 @@ def build_parser() -> argparse.ArgumentParser:
                      "frames (forwarded as the bench input's "
                      "run_ahead_frames; the ring grows to match). "
                      "Default: the inferlet's own sizing.",
-            )
-        if not any(
-            "--no-prefix-cache" in a.option_strings for a in sp._actions
-        ):
-            sp.add_argument(
-                "--no-prefix-cache",
-                dest="no_prefix_cache",
-                action="store_true",
-                help="Prefill every prompt from scratch: no cached prefix is "
-                     "mapped in or published, and a hybrid model's prefill is "
-                     "not cut at the cache's state snapshots (pages 1, 2, 4, "
-                     "...). For cold-prefill measurements.",
             )
         if not any(
             "--host-first-token" in a.option_strings for a in sp._actions

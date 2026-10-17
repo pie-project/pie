@@ -7,9 +7,7 @@ world inferlet {
     import pipeline;
     import working-set;
     import channel;
-    import forward;             // attention-only
-    import forward-recurrent;
-    import forward-hybrid;
+    import forward;             // every text model
     import forward-diffusion;   // paged KV plus a denoised canvas
     import grammar;
     import chat;

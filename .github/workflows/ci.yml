@@ -396,9 +396,12 @@ jobs:
     name: "cuda: wake the pod"
     if: vars.RUNPOD_POD_ID != '' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-cuda'))
     runs-on: ubuntu-latest
+    outputs:
+      up: ${{ steps.wake.outputs.up }}
     steps:
       - uses: actions/checkout@v7
-      - run: bash scripts/ci/runpod.sh start
+      - id: wake
+        run: bash scripts/ci/runpod.sh start
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           RUNPOD_POD_ID: ${{ vars.RUNPOD_POD_ID }}
@@ -406,6 +409,7 @@ jobs:
   cuda:
     name: "cuda: serve on hardware"
     needs: cuda-up
+    if: needs.cuda-up.outputs.up == 'true'
     runs-on: [self-hosted, cuda]
     timeout-minutes: 90
     # The pod is billed by the minute: its catalog-wide tests and the e2e
@@ -431,7 +435,7 @@ jobs:
   cuda-down:
     name: "cuda: stop the pod"
     needs: [cuda-up, cuda]
-    if: always() && needs.cuda-up.result == 'success'
+    if: always() && needs.cuda-up.result == 'success' && needs.cuda-up.outputs.up == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

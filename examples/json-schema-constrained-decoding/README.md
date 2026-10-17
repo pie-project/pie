@@ -51,10 +51,8 @@ accept when state_t is terminated and decode(tokens) parses as JSON
 The grammar mask is host-derived from the immediately preceding output token, so
 this inferlet is structurally **depth-1**. It must submit one fire, wait for its
 token, advance the matcher, publish the next mask, and only then submit the next
-fire. The earlier run-ahead version silently reused a stale grammar mask, which
-meant the schema was not actually enforced on those steps; the audit documents
-that failure mode in
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+fire. Running ahead would apply a stale grammar mask, and the schema would not
+be enforced on those steps.
 
 The device side is intentionally simple: `masked_argmax(intrinsics::logits(),
 allowed)` in the epilogue. All schema semantics live in the host `JsonSchema`

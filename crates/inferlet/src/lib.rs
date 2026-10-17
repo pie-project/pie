@@ -42,13 +42,8 @@ pub use wit_bindgen;
 
 pub use pie::inferlet::types;
 
-pub mod working_set {
-    pub use crate::pie::inferlet::working_set::*;
-}
-
 pub mod eta;
 pub mod mask;
-pub mod prefix_cache;
 
 pub mod chat;
 
@@ -58,10 +53,9 @@ pub mod model {
     pub use crate::pie::inferlet::model::{
         AxisRole, BlockDrafter, CanvasShape, ForwardKind, LaneStream, LatentSpace, PortFact,
         PortKind, PositionConvention, ReadingFact, ReadoutKind, ScheduleFact, ScheduleKind,
-        architecture, arena_block_size, canvas, channel_capacity, default_system_speculation,
-        draft_block, frame_size, kv_page_size, latent, max_embed_length, max_latent_rows,
-        mtp_depth, name, output_vocab_size, pass_kind, prefill_chunk_hint, readings,
-        rs_buffer_page_size, rs_fold_granularity, rs_state_size, run_ahead_window, schedule,
+        architecture, canvas, channel_capacity, default_system_speculation, draft_block,
+        frame_size, kv_page_size, latent, max_latent_rows, max_readout_rows, mtp_depth, name,
+        output_vocab_size, pass_kind, readings, rs_state_size, run_ahead_window, schedule,
         submit_deadline_us,
     };
 

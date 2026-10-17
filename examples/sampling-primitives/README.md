@@ -17,9 +17,7 @@ terminated, leaving the GPU pegged.
 The fix ported the block-cooperative selection loop into the generated path.
 This crate pins that fix by publishing the nucleus keep-mask as a standalone
 value in a shape that **cannot** match the library nucleus pattern, forcing the
-generated `pivot_threshold` path. See "A GPU hang in the generated sampler path"
-in
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+generated `pivot_threshold` path.
 
 ## What it validates
 

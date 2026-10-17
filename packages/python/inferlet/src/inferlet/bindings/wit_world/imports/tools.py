@@ -13,6 +13,14 @@ import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
 
+@dataclass
+class ToolCall:
+    """
+    A complete tool call parsed out of the model's output.
+    """
+    name: str
+    arguments_json: str
+
 
 @dataclass
 class Event_Start:
@@ -21,14 +29,20 @@ class Event_Start:
 
 @dataclass
 class Event_Call:
-    value: Tuple[str, str]
+    value: ToolCall
 
 
 Event = Union[Event_Start, Event_Call]
 
 
 class Decoder:
+    """
+    Detects tool calls in generated tokens.
+    """
     
+    def __init__(self) -> None:
+        raise NotImplementedError
+
     def feed(self, tokens: List[int]) -> Event:
         """
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
@@ -58,11 +72,6 @@ def equip(tools: List[str]) -> List[int]:
 def answer(name: str, value: str) -> List[int]:
     """
     Provide a tool result (after a tool-call reply)
-    """
-    raise NotImplementedError
-def create_decoder() -> Decoder:
-    """
-    Create a decoder to detect tool calls in generated tokens
     """
     raise NotImplementedError
 def format(tools: List[str]) -> Optional[grammar.Grammar]:

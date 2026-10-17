@@ -67,4 +67,13 @@ interface session {
     /// `receive-file` for the same guests.
     receive-file-blocking: func() -> option<blob>;
 
+    /// Merges `props`, a JSON object, into this process's PLEX props; a `null`
+    /// removes a name. `router/` names are dropped and props over the limits
+    /// refused.
+    set-props: func(props: string) -> result<_, error>;
+
+    /// This process's own token counts, for the scheduling policy: report
+    /// `prompt` as soon as it is tokenized.
+    set-tokens: func(prompt: u32, generated: u32);
+
 }

@@ -11,8 +11,6 @@ struct PtirLaneRecord {
   m1_u64 logits_base;
   m1_u32 logits_row_offset;
   m1_u32 logits_row_count;
-  m1_u32 kv_len;
-  m1_u32 page_count;
   m1_u32 row_count;
   m1_u32 token_count;
   m1_u32 sampled_rows;
@@ -42,7 +40,7 @@ struct PtirLaneChannelSlot {
 };
 
 static_assert(sizeof(PtirLaneTableHeader) == 16, "lane header ABI");
-static_assert(sizeof(PtirLaneRecord) == 128, "lane record ABI");
+static_assert(sizeof(PtirLaneRecord) == 120, "lane record ABI");
 static_assert(sizeof(PtirLaneChannelSlot) == 32, "lane channel ABI");
 
 __device__ __forceinline__ void ptir_parallel_copy(
@@ -414,6 +412,12 @@ __device__ __forceinline__ void ptir_parallel_broadcast(
     }
     return;
   }
+  // A row-parallel region narrows the output to one row and leaves an input
+  // every row shares whole: its leading dims, all 1, are the ones the output
+  // dropped, so they are skipped.
+  const m1_u32 skip = input_desc.rank > output_desc.rank
+      ? input_desc.rank - output_desc.rank
+      : 0u;
   for (m1_u32 linear = threadIdx.x;
        linear < output_desc.len;
        linear += blockDim.x) {
@@ -423,8 +427,8 @@ __device__ __forceinline__ void ptir_parallel_broadcast(
     for (int dim = (int)output_desc.rank - 2; dim >= 0; --dim) {
       source_stride[dim] =
           source_stride[dim + 1] *
-          ((m1_u32)(dim + 1) < input_desc.rank
-               ? input_desc.dims[dim + 1]
+          ((m1_u32)(dim + 1) + skip < input_desc.rank
+               ? input_desc.dims[dim + 1 + skip]
                : 1u);
     }
     for (m1_u32 dim = 0; dim < output_desc.rank; ++dim) {
@@ -435,7 +439,7 @@ __device__ __forceinline__ void ptir_parallel_broadcast(
       const m1_u32 coordinate = rem / stride;
       rem %= stride;
       const m1_u32 source_dim =
-          dim < input_desc.rank ? input_desc.dims[dim] : 1u;
+          dim + skip < input_desc.rank ? input_desc.dims[dim + skip] : 1u;
       if (source_dim != 1u)
         source_index += coordinate * source_stride[dim];
     }

@@ -56,7 +56,7 @@ pub struct Region {
     pub outputs: Vec<ValueId>,
     pub sinks: Vec<ChannelSink>,
     pub row_value: Option<ValueId>,
-    pub row_alias: Option<u64>,
+    pub row_alias: Option<(u32, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,9 +197,7 @@ fn flush_generated_run(
     let (witness, row_alias) = match run.take() {
         Some((Geometry::Rows { fixed, extent }, witness)) => (
             witness,
-            alias
-                .filter(|&(role, _)| fixed == 1 && role == extent)
-                .map(|(_, n)| n),
+            alias.filter(|&(role, _)| fixed == 1 && role == extent),
         ),
         _ => (None, None),
     };

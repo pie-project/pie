@@ -8,13 +8,28 @@ builds' `deps/` trees (kept in sync via `scripts/sync-wit.sh` / `wit-deps`);
 this file is the source of truth.
 
 Model-agnostic by construction: the inferlet hands the host raw encoded
-bytes (a PNG/JPEG, an animated GIF, a WAV) and the host — which knows the
-bound model — does ALL of the model-specific work (decode, resize, patchify,
-log-mel, video frame-sampling, and the model's own span delimiters). An
+bytes (a PNG/JPEG, an animated GIF) and the host decodes, frames the still
+as the bound model's package states, cuts it into patch rows and spells
+it with the package's delimiters; the tower normalizes in the forward. An
 inferlet never branches on the model. An encoded input becomes ordinary
 context KV, so fork / snapshot / prefix-cache all apply for free;
 the inferlet only ever holds a handle (pixels/features never cross into WASM
-linear memory, and there are no `<image>` placeholder token ids).
+linear memory, and there are no placeholder ids THE GUEST SPELLS).
+
+`tokens()` ANSWERS the bound model's delimiter + placeholder ids — the
+span's full spelling, ready to splice — so a guest writes
+`toks.extend(img.tokens())` and never types `<|vision_start|>`, never
+counts a pad run, and never branches on which model it is bound to.
+
+THE CACHE STATUTE. Two DIFFERENT images produce
+IDENTICAL token lists — the run is `token-count` copies of one reserved pad
+either way — so tokens alone are not a content key for anything holding a
+media span. Any reuse keyed on tokens (a guest prefix tree, fork/snapshot
+bookkeeping, a future host-side prefix cache) MUST fold `digest()` into its
+key for any prefix that overlaps a media run, or it will serve one image's
+KV for another's. `digest()` exists exactly so that obeying this costs one
+call: it hashes the PREPROCESSED span — patches, not source bytes — so two
+encodings of one picture collide, correctly, and two pictures do not.
 """
 from typing import TypeVar, Generic, Union, Optional, Protocol, Tuple, List, Any, Self, Callable
 from types import TracebackType
@@ -28,28 +43,67 @@ import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
 
+@dataclass
+class MergedGrid:
+    """
+    A visual span's extent in merged-token units.
+    """
+    t: int
+    h: int
+    w: int
+
 class Image:
     """
-    A host-side handle to a preprocessed still image (also used for one
-    decoded video frame). `from-bytes` decodes + resizes + patchifies per the
-    bound model's processor, so the layout queries below are answerable
+    A host-side handle to a cut still image (also used for one decoded
+    video frame). `from-bytes` decodes, frames and cuts it as the bound
+    model's package states, so the layout queries below are answerable
     synchronously, before the span is ever fed to a forward pass.
     """
     
     @classmethod
     def from_bytes(cls, bytes: bytes) -> Self:
         """
-        Encoded still image (PNG / JPEG / …). The host decodes it, then
-        resizes + patchifies + normalizes exactly as the bound model's image
-        processor requires (Gemma SigLIP2 vs Qwen smart-resize, etc.). Errors
-        if the model has no vision front-end or the bytes don't decode.
+        Encoded still image (PNG / JPEG / …). The host decodes it, frames
+        it by the package's `frame` and cuts it into patch rows. Errors if
+        the model reads no stills or the bytes don't decode.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    def tokens(self) -> List[int]:
+        """
+        THE SPAN, AS THE SEQUENCE CARRIES IT: prefix + placeholder run
+        (exactly `token-count` long) + suffix, in the bound model's own ids.
+        
+        This is the one ledger. A span enters the context
+        as `toks.extend(img.tokens())` and as nothing else — no anchor list,
+        no guest-side splicing of `prefix-tokens` around a run the guest
+        built itself, no second bookkeeping structure beside the tokens. The
+        handle then crosses again beside them, through
+        `forward.forward-pass.media`, carrying only the payload.
+        
+        The ids are the host's answer, never the guest's spelling: the guest
+        hardcodes nothing and stays model-agnostic. See the cache statute in
+        this interface's header before keying anything on the result.
+        """
+        raise NotImplementedError
+    def digest(self) -> bytes:
+        """
+        A stable content hash of the PREPROCESSED span — patches, not source
+        bytes, so two encodings of one image collide correctly and two
+        images do not. 32 bytes.
+        
+        Exists for the cache statute above: `tokens()` cannot tell two
+        images apart and this can, cheaply, so a guest that caches across a
+        media run has no excuse for keying on the run alone.
         """
         raise NotImplementedError
     def token_count(self) -> int:
         """
         Hidden-state rows / KV slots this visual span occupies.
+        
+        Introspection: `tokens()` already places exactly this many
+        placeholders, so nothing on the happy path needs to ask.
         """
         raise NotImplementedError
     def position_span(self) -> int:
@@ -59,17 +113,19 @@ class Image:
         (M-RoPE), where the next text token's three components all begin.
         """
         raise NotImplementedError
-    def grid(self) -> Tuple[int, int, int]:
+    def grid(self) -> MergedGrid:
         """
-        (t, h, w) in merged-token units.
+        Extent in merged-token units.
         """
         raise NotImplementedError
     def prefix_tokens(self) -> List[int]:
         """
-        Model-specific delimiter tokens the context must place immediately
-        before / after this span (e.g. Qwen `<|vision_start|>` /
-        `<|vision_end|>`); empty for models that need none. The library's
-        `append-image` applies these so the inferlet stays model-agnostic.
+        The delimiter tokens `tokens()` already placed around the run (e.g.
+        Qwen `<|vision_start|>` / `<|vision_end|>`); empty for models that
+        need none.
+        
+        Introspection, not a step: what a span will cost. Nothing on the
+        happy path calls them.
         """
         raise NotImplementedError
     def suffix_tokens(self) -> List[int]:
@@ -151,9 +207,26 @@ class Audio:
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
+    def tokens(self) -> List[int]:
+        """
+        THE SPAN, AS THE SEQUENCE CARRIES IT — `image.tokens()`'s contract,
+        with this model's audio delimiters and pad. One ledger for both
+        modalities is why `forward.media` takes a variant rather than two
+        verbs: audio joined the door without changing it.
+        """
+        raise NotImplementedError
+    def digest(self) -> bytes:
+        """
+        A stable content hash of the PREPROCESSED clip — log-mel features,
+        not source bytes. The cache statute in this interface's header binds
+        audio runs exactly as it binds visual ones. 32 bytes.
+        """
+        raise NotImplementedError
     def token_count(self) -> int:
         """
         Hidden-state rows / KV slots this clip occupies == audio soft tokens.
+        
+        Introspection: `tokens()` already places exactly this many.
         """
         raise NotImplementedError
     def position_span(self) -> int:
@@ -164,8 +237,9 @@ class Audio:
         raise NotImplementedError
     def prefix_tokens(self) -> List[int]:
         """
-        Model-specific delimiter tokens placed before / after the span (e.g.
+        The delimiter tokens `tokens()` already placed around the run (e.g.
         Gemma `<|audio>` / `<audio|>`); empty for models that need none.
+        Introspection, like `image`'s — see the note there.
         """
         raise NotImplementedError
     def suffix_tokens(self) -> List[int]:

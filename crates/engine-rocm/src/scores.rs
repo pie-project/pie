@@ -7,7 +7,7 @@ use crate::error::Result;
 
 pub(crate) const KV_MAX: u32 = eta_ir::registry::ATTN_SCORE_KV_MAX;
 
-pub(crate) const OBSERVE: u32 = 32;
+pub(crate) const OBSERVE: u32 = eta_ir::registry::ATTN_SCORE_OBSERVE;
 
 /// Where a load's score planes sit inside a lane's block. A program declares
 /// `layers * heads` planes, layer-major and head-minor, over the WHOLE model's

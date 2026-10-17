@@ -221,8 +221,15 @@ fn land(
         -1,
         frames_in_flight,
     )?;
-    if request.residency.disk_kv_budget > 0 && request.residency.disk_kv_dir.is_none() {
-        request.residency.disk_kv_dir = Some(crate::disk::kv_dir(cache_dir, snapshot_dir)?);
+    if request.residency.disk_kv_budget != Some(0) && request.residency.disk_kv_dir.is_none() {
+        match crate::disk::kv_dir(cache_dir, snapshot_dir) {
+            Ok(dir) => request.residency.disk_kv_dir = Some(dir),
+            Err(error) if request.residency.disk_kv_budget.is_none() => {
+                tracing::warn!(%error, "no directory for the default disk kv tier; serving without it");
+                request.residency.disk_kv_budget = Some(0);
+            }
+            Err(error) => return Err(error),
+        }
     }
     let deployment = request.trace.name.clone();
     let loaded = backend.load(request).map_err(anyhow::Error::from)?;

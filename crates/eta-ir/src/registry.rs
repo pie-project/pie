@@ -64,34 +64,17 @@ crate::declare_tagged_enum! {
         EmbedTokens = 0, "embed_tokens";
         EmbedIndptr = 1, "embed_indptr";
         Positions = 2, "positions";
-        Pages = 3, "pages";
-        PageIndptr = 4, "page_indptr";
         KvLen = 5, "kv_len";
-        WSlot = 6, "w_slot";
-        WOff = 7, "w_off";
         Readout = 8, "readout";
         AttnMask = 9, "attn_mask";
-        RsBufferPages = 10, "rs_buffer_pages";
-        RsBufferIndptr = 11, "rs_buffer_indptr";
-        RsBufferLen = 12, "rs_buffer_len";
-        RsWSlot = 13, "rs_w_slot";
-        RsWOff = 14, "rs_w_off";
-        RsFoldLen = 15, "rs_fold_len";
+        Slots = 16, "slots";
+        Fold = 17, "fold";
     }
 }
 
 impl Port {
     pub fn consumes(self) -> bool {
-        matches!(
-            self,
-            Port::EmbedTokens
-                | Port::Positions
-                | Port::WSlot
-                | Port::WOff
-                | Port::RsWSlot
-                | Port::RsWOff
-                | Port::RsFoldLen
-        )
+        matches!(self, Port::EmbedTokens | Port::Positions | Port::Slots)
     }
 }
 
@@ -102,26 +85,10 @@ pub struct PortMask(u32);
 impl PortMask {
     pub const NONE: PortMask = PortMask(0);
 
-    pub const DECODE_ENVELOPE: PortMask =
-        PortMask::of(&[Port::EmbedTokens, Port::Positions, Port::KvLen]);
+    pub const DECODE_ENVELOPE: PortMask = PortMask::of(&[Port::EmbedTokens]);
 
-    pub const DEVICE_GEOMETRY: PortMask = PortMask::of(&[
-        Port::EmbedTokens,
-        Port::Positions,
-        Port::KvLen,
-        Port::Pages,
-        Port::PageIndptr,
-        Port::WSlot,
-        Port::WOff,
-    ]);
-
-    pub const RS_BUFFER: PortMask = PortMask::of(&[
-        Port::RsBufferPages,
-        Port::RsBufferIndptr,
-        Port::RsBufferLen,
-        Port::RsWSlot,
-        Port::RsWOff,
-    ]);
+    pub const DEVICE_GEOMETRY: PortMask =
+        PortMask::of(&[Port::EmbedTokens, Port::Positions, Port::Slots, Port::KvLen]);
 
     pub const fn of(ports: &[Port]) -> PortMask {
         let mut bits = 0u32;
@@ -207,6 +174,9 @@ pub const KNOWN_SINKS: &[(&str, SinkScope)] = &[
 ];
 
 pub const ATTN_SCORE_KV_MAX: u32 = 2048;
+
+/// The last this many query rows of a fire's lane.
+pub const ATTN_SCORE_OBSERVE: u32 = 32;
 
 pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
     match intr {

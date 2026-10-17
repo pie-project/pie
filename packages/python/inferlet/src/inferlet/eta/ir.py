@@ -140,33 +140,21 @@ class Port(IntEnum):
     EMBED_TOKENS = 0
     EMBED_INDPTR = 1
     POSITIONS = 2
-    PAGES = 3
-    PAGE_INDPTR = 4
     KV_LEN = 5
-    W_SLOT = 6
-    W_OFF = 7
     READOUT = 8
     ATTN_MASK = 9
-    RS_BUFFER_PAGES = 10
-    RS_BUFFER_INDPTR = 11
-    RS_BUFFER_LEN = 12
-    RS_W_SLOT = 13
-    RS_W_OFF = 14
-    RS_FOLD_LEN = 15
+    SLOTS = 16
+    FOLD = 17
 
     @property
     def consumes(self) -> bool:
         """True iff a channel bound to this port is consumed (take) by the
-        pass; false = peeked (read). Token-indexed ports consume; geometry and
-        masks are state, peeked."""
+        pass; false = peeked (read). Token-indexed ports consume; what a lane
+        reads, masks and fold counts are state, peeked."""
         return self in (
             Port.EMBED_TOKENS,
             Port.POSITIONS,
-            Port.W_SLOT,
-            Port.W_OFF,
-            Port.RS_W_SLOT,
-            Port.RS_W_OFF,
-            Port.RS_FOLD_LEN,
+            Port.SLOTS,
         )
 
     @property

@@ -199,8 +199,9 @@ pub fn decoded_weight_reserve(widest_plane_bytes: u64, streams: u32) -> u64 {
 
 /// What a host pool of `budget` bytes seats: one rs row per device slot
 /// first (`rows` of `row_bytes`), then kv pages (`pages` of `page_bytes`),
-/// then windowed pages (`window_pages` of `window_page_bytes`) with the
-/// rest. Each is what the budget holds of it, so zero seats nothing.
+/// then windowed pages (`window_pages` of `window_page_bytes`), then more
+/// kv pages with the rest, which can be more than the device holds. Each is
+/// what the budget holds of it, so zero seats nothing.
 #[must_use]
 pub fn host_pool(
     budget: u64,
@@ -217,6 +218,8 @@ pub fn host_pool(
     let pages = pages.min(left.checked_div(page_bytes).unwrap_or(0));
     let left = left - pages * page_bytes;
     let window_pages = window_pages.min(left.checked_div(window_page_bytes).unwrap_or(0));
+    let left = left - window_pages * window_page_bytes;
+    let pages = pages + left.checked_div(page_bytes).unwrap_or(0);
     (clamp(rows), clamp(pages), clamp(window_pages))
 }
 fn slot_file(error: std::io::Error) -> Fault {
@@ -463,7 +466,10 @@ pub struct Pools {
     committed_kv_pages: u32,
     committed_state_slots: u32,
     backed_pages: Vec<u64>,
-    windowed_backed: bool,
+    /// The window pages the windowed rows are backed through, 0 before the
+    /// first fire: the load's second fit can widen the window after arming
+    /// backed it.
+    windowed_backed: u64,
     buffered: (u64, u64),
     host: Option<HostKv>,
     disk: Option<DiskKv>,
@@ -619,7 +625,7 @@ impl Pools {
             committed_kv_pages: 0,
             committed_state_slots: 0,
             backed_pages: Vec::new(),
-            windowed_backed: false,
+            windowed_backed: 0,
             buffered: (0, 1),
             host: None,
             disk: None,
@@ -790,7 +796,7 @@ impl Pools {
         self.ceiling = pages;
         self.paging.pages = pages;
         self.paging.slots = slots;
-        self.windowed_backed = false;
+        self.windowed_backed = 0;
         Ok(())
     }
 
@@ -1021,11 +1027,14 @@ impl Pools {
             .any(|shape| matches!(shape, Shape::Kv { windowed: true, .. }))
     }
 
-    /// Zeroes page 0 of the windowed rows once they are backed: every page
-    /// behind a window reads it, and a masked column still multiplies its
-    /// value, so it must hold no NaN.
-    fn zero_null_page(&mut self) -> Result<()> {
-        if self.windowed_backed || !self.has_windowed() {
+    /// Notes the windowed rows backed through the window the pool spans now,
+    /// and zeroes their page 0 the first time: every page behind a window
+    /// reads it, and a masked column still multiplies its value, so it must
+    /// hold no NaN.
+    fn note_windowed(&mut self) -> Result<()> {
+        let fresh = self.windowed_backed == 0;
+        self.windowed_backed = self.paging.window_pages();
+        if !fresh || !self.has_windowed() {
             return Ok(());
         }
         let page_size = self.paging.page_size;
@@ -1041,7 +1050,6 @@ impl Pools {
                 )?;
             }
         }
-        self.windowed_backed = true;
         Ok(())
     }
 
@@ -1382,8 +1390,13 @@ impl Pools {
     /// Opens `dir`'s slot file for this rank with `budget` bytes of kv pages;
     /// a budget short of one page seats none.
     pub fn seat_disk(&mut self, dir: &std::path::Path, rank: u32, budget: u64) -> Result<()> {
-        let file = engine::disk::SlotFile::open(dir, rank, self.paged_page_bytes(), budget)
-            .map_err(slot_file)?;
+        let file = engine::disk::SlotFile::open(
+            dir,
+            &format!("r{rank}.kv"),
+            self.paged_page_bytes(),
+            budget,
+        )
+        .map_err(slot_file)?;
         self.disk = file
             .map(|file| {
                 crate::device::Pinned::mapped_uninit(file.stride()).map(|stage| DiskKv {
@@ -1394,6 +1407,10 @@ impl Pools {
             })
             .transpose()?;
         Ok(())
+    }
+
+    pub fn unseat_disk(&mut self) {
+        self.disk = None;
     }
 
     #[must_use]
@@ -1612,7 +1629,7 @@ impl Pools {
     ) -> Result<()> {
         if demand.kv_pages <= self.committed_kv_pages
             && demand.state_slots <= self.committed_state_slots
-            && (self.windowed_backed || !self.has_windowed())
+            && (self.windowed_backed >= self.paging.window_pages() || !self.has_windowed())
             && kv_ranges
                 .iter()
                 .all(|&(first, count)| self.pages_backed(first, count))
@@ -1622,7 +1639,7 @@ impl Pools {
         match self.commit_ranges(demand.kv_pages, demand.state_slots, Some(kv_ranges))? {
             Commit::Committed => {
                 self.note_backed(kv_ranges);
-                self.zero_null_page()
+                self.note_windowed()
             }
             refusal => Err(refuse(&self.pool, refusal)),
         }
@@ -1986,7 +2003,7 @@ mod tests {
         let mib = 1u64 << 20;
         assert_eq!(
             host_pool(100 * mib, 8, mib, 1000, mib / 16, 0, 0),
-            (8, 1000, 0)
+            (8, 1472, 0)
         );
         assert_eq!(
             host_pool(20 * mib, 8, mib, 1000, mib / 16, 100, mib / 16),
@@ -1994,7 +2011,7 @@ mod tests {
         );
         assert_eq!(
             host_pool(30 * mib, 8, mib, 100, mib / 16, 100, mib / 16),
-            (8, 100, 100)
+            (8, 252, 100)
         );
         assert_eq!(host_pool(4 * mib, 8, mib, 1000, mib / 16, 0, 0), (4, 0, 0));
         assert_eq!(host_pool(0, 8, mib, 1000, mib / 16, 0, 0), (0, 0, 0));

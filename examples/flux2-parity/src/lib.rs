@@ -17,7 +17,7 @@
 //! all in one group, which packs them `[txt ‖ target ‖ refs]` — the
 //! reference's own layout. Every lane binds the timestep (and the guidance
 //! scale: the miniature has `guidance_embeds`), because the shared
-//! modulation is per lane. Neither `attention` nor `embed` is called: a
+//! modulation is per lane. Neither `state` nor `embed` is called: a
 //! denoise reading declares no kv space and no tokens.
 //!
 //! Only the target lane reads out: the head runs on `Stream::Image` rows
@@ -227,10 +227,8 @@ async fn step(case: &Case, ports: &Ports, reading: &str, pipes: &Pipes) -> Resul
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Attention {
-        return Err(
-            "flux_2 is an attention-kind pass with no kv bound on its denoise reading".into(),
-        );
+    if model::pass_kind() != model::ForwardKind::Text {
+        return Err("flux_2 is a `forward` pass with no state bound on its denoise reading".into());
     }
     let pieces: String = [
         &input.case_0,

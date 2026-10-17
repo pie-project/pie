@@ -27,14 +27,6 @@ sdpa.selected_mma = true
 # 4.8 -> 3.0 s; TPOT p50 rises (37 -> 57, 24 -> 32 ms) with the batch twice
 # as wide, as vLLM runs it. A 183 GB card holds the doubled slab beside the
 # kv pages; a smaller one may not, so it is this card's decision.
-#
-# A hybrid trunk whose state slots seat fewer lanes than it batches posts one
-# frame a lane rather than two: Qwen3.8-Flash-Next W4A16 fills this card, its
-# load cuts the slab to 230 slots, and two frames a lane seat 115. One seats
-# 230: 256 requests of 1024 in / 256 out at once go 1334 -> 1756 output
-# tok/s, TTFT p50 20.7 -> 6.1 s (TPOT p50 74 -> 93 ms, twice the lanes),
-# while its offline decode loses under 2% (bs1 8.99 -> 9.16 ms, bs64 37.01
-# -> 37.12 ms).
 
 # A fire of 16384 rows where `max_forward_tokens` is unstated (8192 elsewhere)
 # batches twice the prompt chunks into one pass of the weights. 256 requests
@@ -53,7 +45,6 @@ sdpa.selected_mma = true
 # 37.2 (37.1 -> 37.6 in a second pair).
 [engine]
 host_planes = true
-one_frame_when_short = true
 state_slots_per_lane = 2
 forward_tokens = 16384
 
@@ -85,7 +76,6 @@ measured = [
   "engine.forward_tokens",
   "engine.host_planes",
   "engine.lattice_steps",
-  "engine.one_frame_when_short",
   "engine.recording",
   "engine.state_slots_per_lane",
   "engine.working_set_percent",

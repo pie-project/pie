@@ -33,11 +33,15 @@ pub struct Outcome {
     /// The stop sequence that ended generation, when one did.
     pub stop_sequence: Option<String>,
     pub prompt_tokens: usize,
+    pub cached_tokens: usize,
     pub completion_tokens: usize,
     pub content: String,
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
 }
+
+/// Each report takes a lock on the host.
+const REPORT_EVERY: u32 = 32;
 
 /// The constraint a request puts on the output, as a live matcher.
 fn constraint(req: &Request) -> Result<Option<Matcher>, String> {
@@ -103,9 +107,13 @@ impl Output {
 /// Run `req`, handing every event to `sink` as it happens.
 pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, String> {
     let prompt = prompt::build(req)?;
+    // The worker's policy sees the prompt while this process still waits.
+    let prompt_tokens = prompt.tokens.len() as u32;
+    inferlet::session::set_tokens(prompt_tokens, 0);
+    let mut generated = 0u32;
     let matcher = constraint(req)?;
     let stop_tokens = chat::stop_tokens();
-    let mut demux = Demux::new();
+    let mut demux = Demux::new(&chat::cue_thinking(prompt::thinks(req)));
     let mut out = Output {
         stops: HoldBack::new(req.stop.clone()),
         content: String::new(),
@@ -113,12 +121,14 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
         stop_hit: None,
     };
     let mut error: Option<String> = None;
-    let mut seen = 0usize;
 
     let mut on_token = |token: u32| -> ControlFlow<()> {
-        seen += 1;
+        generated += 1;
+        if generated == 1 || generated.is_multiple_of(REPORT_EVERY) {
+            inferlet::session::set_tokens(prompt_tokens, generated);
+        }
         if stop_tokens.contains(&token) {
-            if req.ignore_eos || seen <= req.min_tokens {
+            if req.ignore_eos || generated as usize <= req.min_tokens {
                 return ControlFlow::Continue(());
             }
             out.finish = Some(Finish::Stop);
@@ -132,7 +142,7 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
             }
         }
     };
-    let sampled = generate(
+    let (sampled, cached_tokens) = generate(
         &prompt,
         req.sampling,
         req.max_tokens,
@@ -140,6 +150,7 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
         &mut on_token,
     )
     .await?;
+    inferlet::session::set_tokens(prompt_tokens, generated);
     if let Some(e) = error {
         return Err(e);
     }
@@ -163,6 +174,7 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
         finish,
         stop_sequence: out.stop_hit.and_then(|i| req.stop.get(i).cloned()),
         prompt_tokens: prompt.tokens.len(),
+        cached_tokens,
         completion_tokens: sampled,
         content: out.content,
         reasoning: demux.reasoning_text,

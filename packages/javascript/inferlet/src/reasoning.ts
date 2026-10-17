@@ -65,8 +65,20 @@ export const Event = {
 export class Decoder {
   readonly #inner: _reasoning.Decoder;
 
-  constructor() {
-    this.#inner = new _reasoning.Decoder();
+  constructor(inner?: _reasoning.Decoder) {
+    this.#inner = inner ?? new _reasoning.Decoder();
+  }
+
+  /** A decoder for the turn `cue` began: inside a thinking block from the
+   *  first token when the cue left one open, so no `Event.Start()` comes
+   *  (see `startsInside`). */
+  static forCue(cue: ArrayLike<number>): Decoder {
+    return new Decoder(_reasoning.Decoder.forCue(Uint32Array.from(cue)));
+  }
+
+  /** Whether the first token is already inside a thinking block. */
+  startsInside(): boolean {
+    return this.#inner.startsInside();
   }
 
   /** Feed a token batch and get back the event that fired. Returns

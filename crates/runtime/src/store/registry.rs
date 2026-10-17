@@ -70,13 +70,14 @@ pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_slots: &[us
     )
 }
 
-/// One engine's recurrent-state pool: device and host slots, or, for a
-/// model with a window, the window its state is read through and the
-/// device and host pages of the ring that holds it instead.
+/// For a model with a window: the window and its ring's device and host pages
+/// instead.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StatePool {
     pub slots: u32,
     pub host_slots: u32,
+    pub pages: u32,
+    pub host_pages: u32,
     pub window_tokens: u32,
     pub window_pages: u32,
     pub host_window_pages: u32,
@@ -92,13 +93,20 @@ pub fn register_model_with_swap(
 ) -> usize {
     let stores: Vec<Option<Stores>> = (0..num_kv_pages.len())
         .map(|d| {
-            let kv = Arc::new(parking_lot::Mutex::new(KvStore::new_with_swap(
+            let mut kv = KvStore::new_with_swap(
                 num_kv_pages[d] as u32,
                 num_host_pages.get(d).copied().unwrap_or(0) as u32,
                 num_disk_pages.get(d).copied().unwrap_or(0),
                 rand::random::<[u8; 32]>(),
-            )));
+            );
+            if let Some(seed) = crate::model::kv_fingerprint() {
+                kv.set_domain(&seed);
+            }
             let pool = state.get(d).copied().unwrap_or_default();
+            // KV alone resumes a model only when it has no recurrent state.
+            kv.set_keeps(kv_sharing() && pool.slots == 0 && pool.window_tokens == 0);
+            kv.set_page_size(kv_page_size);
+            let kv = Arc::new(parking_lot::Mutex::new(kv));
             let slots = pool.slots;
             let max_context = max_context.get(d).copied().unwrap_or(0);
             let rs = if pool.window_tokens > 0 {
@@ -111,7 +119,7 @@ pub fn register_model_with_swap(
                     pool.host_window_pages,
                 )
             } else {
-                RsStore::new_with_host(slots, pool.host_slots)
+                RsStore::new(slots, pool.pages, pool.host_slots, pool.host_pages)
             };
             Some(Stores {
                 kv,
@@ -124,6 +132,12 @@ pub fn register_model_with_swap(
         })
         .collect();
     REGISTRY.push(RwLock::new(stores))
+}
+
+/// `PIE_KV_SHARE`, on unless `0`.
+pub fn kv_sharing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PIE_KV_SHARE").is_none_or(|value| value != "0"))
 }
 
 pub fn unregister_engine(model_idx: usize, engine_idx: usize) -> anyhow::Result<()> {
@@ -168,12 +182,10 @@ pub fn all_for_model(model_idx: usize) -> Vec<Stores> {
 mod tests {
     use super::*;
 
-    #[allow(clippy::too_many_arguments)]
     fn register_engine_with_swap(
         model_idx: usize,
         engine_idx: usize,
         kv_page_size: u32,
-        base_page: u32,
         num_kv_pages: usize,
         num_host_pages: usize,
         num_slots: usize,
@@ -197,8 +209,7 @@ mod tests {
                 existing.kv_page_size
             );
         }
-        let kv = Arc::new(parking_lot::Mutex::new(KvStore::new_with_swap_range(
-            base_page,
+        let kv = Arc::new(parking_lot::Mutex::new(KvStore::new_with_swap(
             num_kv_pages as u32,
             num_host_pages as u32,
             0,
@@ -206,7 +217,12 @@ mod tests {
         )));
         stores[engine_idx] = Some(Stores {
             kv,
-            rs: Arc::new(Mutex::new(RsStore::new(num_slots as u32))),
+            rs: Arc::new(Mutex::new(RsStore::new(
+                num_slots as u32,
+                num_slots as u32,
+                0,
+                0,
+            ))),
             seats: Arc::new(Mutex::new(SeatBook::new(num_slots as u32))),
             seats_freed: Arc::new(tokio::sync::Notify::new()),
             kv_page_size,
@@ -223,17 +239,17 @@ mod tests {
 
     fn dynamic_store_slots_unregister_without_reusing_engine_ids() {
         let model = register_model(16, &[8], &[0]);
-        register_engine_with_swap(model, 1, 16, 10, 4, 0, 0, 0).unwrap();
+        register_engine_with_swap(model, 1, 16, 4, 0, 0, 0).unwrap();
         assert!(try_get(model, 1).is_some());
         unregister_engine(model, 1).unwrap();
         assert!(try_get(model, 1).is_none());
-        register_engine_with_swap(model, 2, 16, 20, 4, 0, 0, 0).unwrap();
+        register_engine_with_swap(model, 2, 16, 4, 0, 0, 0).unwrap();
         assert!(try_get(model, 2).is_some());
     }
 
     fn dynamic_store_slots_allow_global_engine_id_gaps() {
         let model = register_model(16, &[8], &[0]);
-        register_engine_with_swap(model, 4, 16, 40, 4, 0, 0, 0).unwrap();
+        register_engine_with_swap(model, 4, 16, 4, 0, 0, 0).unwrap();
         assert!(try_get(model, 1).is_none());
         assert!(try_get(model, 3).is_none());
         assert!(try_get(model, 4).is_some());

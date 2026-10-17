@@ -315,6 +315,53 @@ pub fn masked_lse(
     )
 }
 
+/// Decode rows (a speculative verify or a drafter's block) through the split where
+/// `kernel.sdpa.split_bf16` says, as Splash attends its verify and draft rows: one
+/// threadgroup a KV head and history slice, each page read once for every grouped query
+/// head of the tile's eight rows. Anything the split does not seat takes the vector decode.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_with_scratch(
+    ctx: &Ctx<'_>,
+    tuning: &Tuning,
+    q: Tensor,
+    plan: &DecodePlan,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    o: Tensor,
+    requests: u32,
+    partials: &dyn Fn(u32, u32) -> Option<Tensor>,
+) -> Result<(), Error> {
+    if tuning.sdpa_split_bf16()
+        && q.rows >= 8
+        && super::split::try_tables(
+            ctx,
+            q,
+            pool,
+            &super::split::Tables {
+                positions: plan.positions,
+                request_of_token: plan.request_of_token,
+                mask: plan.mask,
+                mask_enabled: plan.mask_enabled,
+                mask_stride: plan.mask_stride,
+            },
+            window,
+            true,
+            head_dim,
+            sm_scale,
+            o,
+            requests,
+            partials,
+            tuning.sdpa_split(),
+            true,
+        )?
+    {
+        return Ok(());
+    }
+    super::decode(ctx, tuning, q, plan, pool, window, head_dim, sm_scale, o)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_with_scratch(
     ctx: &Ctx<'_>,
@@ -330,7 +377,7 @@ pub fn prefill_with_scratch(
     tuning: &Tuning,
     partials: &dyn Fn(u32, u32) -> Option<Tensor>,
 ) -> Result<(), Error> {
-    if tuning.sdpa_mpp()
+    if (tuning.sdpa_mpp() || tuning.sdpa_split_bf16())
         && super::split::try_paged(
             ctx,
             q.data,
@@ -345,6 +392,7 @@ pub fn prefill_with_scratch(
             requests,
             partials,
             tuning.sdpa_split(),
+            tuning.sdpa_split_bf16(),
         )?
     {
         return Ok(());
@@ -371,7 +419,7 @@ pub fn masked_with_scratch(
     tuning: &Tuning,
     partials: &dyn Fn(u32, u32) -> Option<Tensor>,
 ) -> Result<(), Error> {
-    if tuning.sdpa_mpp()
+    if (tuning.sdpa_mpp() || tuning.sdpa_split_bf16())
         && super::split::try_paged(
             ctx,
             q.data,
@@ -386,6 +434,7 @@ pub fn masked_with_scratch(
             requests,
             partials,
             tuning.sdpa_split(),
+            tuning.sdpa_split_bf16(),
         )?
     {
         return Ok(());

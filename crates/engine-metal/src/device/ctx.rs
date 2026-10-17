@@ -375,6 +375,7 @@ impl Context {
                 encoder: RefCell::new(Some(encoder)),
                 blit: None,
                 committed: RefCell::new(Vec::new()),
+                flushed: RefCell::new(Vec::new()),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -406,6 +407,10 @@ pub struct Frame {
     /// What runs once the buffer is committed, in the order it was added.
     #[cfg(target_vendor = "apple")]
     committed: RefCell<Vec<Box<dyn FnOnce() + Send>>>,
+    /// The buffers [`Frame::flush`] committed ahead of the one open now, in
+    /// the order the queue runs them.
+    #[cfg(target_vendor = "apple")]
+    flushed: RefCell<Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
 }
 
 // SAFETY: a `Frame` is created, encoded into and committed on one thread —
@@ -428,6 +433,38 @@ impl Frame {
     #[cfg(target_vendor = "apple")]
     pub(crate) fn on_commit(&self, then: Box<dyn FnOnce() + Send>) {
         self.committed.borrow_mut().push(then);
+    }
+
+    /// Commits what is encoded so far and opens a fresh buffer on the same
+    /// queue for the rest, so the device starts on the head of a long fire
+    /// while its tail is still being encoded. The queue runs the two in
+    /// order and the buffers' resources are tracked, so nothing reads ahead
+    /// of what it waits for. Refused (`false`) while a blit pass is open.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn flush(&self) -> Result<bool> {
+        if self.blit.is_some() {
+            return Ok(false);
+        }
+        let head = self.buffer.borrow().clone();
+        let tail = head.commandQueue().commandBuffer().ok_or(Fault::Device {
+            call: "commandBuffer",
+            why: "the queue would not open the buffer a flushed frame goes on in".to_string(),
+        })?;
+        if let Some(encoder) = self.encoder.borrow_mut().take() {
+            encoder.endEncoding();
+        }
+        let encoder = tail.computeCommandEncoder().ok_or(Fault::Device {
+            call: "computeCommandEncoder",
+            why: "the command buffer would not open a compute pass".to_string(),
+        })?;
+        head.commit();
+        for then in self.committed.borrow_mut().drain(..) {
+            then();
+        }
+        *self.buffer.borrow_mut() = tail;
+        *self.encoder.borrow_mut() = Some(encoder);
+        self.flushed.borrow_mut().push(head);
+        Ok(true)
     }
 
     #[cfg(target_vendor = "apple")]
@@ -650,11 +687,13 @@ impl Frame {
         {
             let buffer = self.commit_buffer();
             buffer.waitUntilCompleted();
-            if let Some(error) = buffer.error() {
-                return Err(Fault::Device {
-                    call: "waitUntilCompleted",
-                    why: error.localizedDescription().to_string(),
-                });
+            for buffer in self.flushed.get_mut().iter().chain([&buffer]) {
+                if let Some(error) = buffer.error() {
+                    return Err(Fault::Device {
+                        call: "waitUntilCompleted",
+                        why: error.localizedDescription().to_string(),
+                    });
+                }
             }
             Ok(())
         }
@@ -670,13 +709,20 @@ impl Frame {
         {
             let buffer = self.commit_buffer();
             buffer.waitUntilCompleted();
-            if let Some(error) = buffer.error() {
-                return Err(Fault::Device {
-                    call: "waitUntilCompleted",
-                    why: error.localizedDescription().to_string(),
-                });
+            for buffer in self.flushed.get_mut().iter().chain([&buffer]) {
+                if let Some(error) = buffer.error() {
+                    return Err(Fault::Device {
+                        call: "waitUntilCompleted",
+                        why: error.localizedDescription().to_string(),
+                    });
+                }
             }
-            Ok(buffer.GPUEndTime() - buffer.GPUStartTime())
+            let start = self
+                .flushed
+                .get_mut()
+                .first()
+                .map_or_else(|| buffer.GPUStartTime(), |head| head.GPUStartTime());
+            Ok(buffer.GPUEndTime() - start)
         }
         #[cfg(not(target_vendor = "apple"))]
         {
@@ -692,18 +738,23 @@ impl Frame {
     ) -> Result<Pending> {
         #[cfg(target_vendor = "apple")]
         {
+            let flushed = std::mem::take(self.flushed.get_mut());
             if let Some(on_done) = on_done {
+                let heads = Flushed(flushed.clone());
                 let handler = block2::RcBlock::new(
                     move |buffer: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                         // SAFETY: Metal hands the handler a live reference to
                         // the command buffer it is about to retire, valid for
                         // the length of this call.
                         let buffer = unsafe { buffer.as_ref() };
-                        on_done(
-                            buffer
-                                .error()
-                                .map(|error| error.localizedDescription().to_string()),
-                        );
+                        // The queue retired every flushed head before this
+                        // tail, so their verdicts are in.
+                        let refused = heads
+                            .0
+                            .iter()
+                            .find_map(|head| head.error())
+                            .or_else(|| buffer.error());
+                        on_done(refused.map(|error| error.localizedDescription().to_string()));
                     },
                 );
                 // SAFETY: `addCompletedHandler:` copies the block, so the
@@ -717,6 +768,7 @@ impl Frame {
             }
             Ok(Pending {
                 buffer: self.commit_buffer(),
+                flushed,
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -734,9 +786,25 @@ impl Drop for Frame {
     }
 }
 
+/// Flushed heads a completion handler reads the verdicts of.
+#[cfg(target_vendor = "apple")]
+struct Flushed(Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>);
+
+// SAFETY: the handler only reads `error` off buffers already retired, which
+// is documented safe from any thread.
+#[cfg(target_vendor = "apple")]
+unsafe impl Send for Flushed {}
+
+// SAFETY: as for `Send`; nothing but `error` is read through a shared one.
+#[cfg(target_vendor = "apple")]
+unsafe impl Sync for Flushed {}
+
 pub struct Pending {
     #[cfg(target_vendor = "apple")]
     buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    /// The heads a flushed frame committed ahead of `buffer`.
+    #[cfg(target_vendor = "apple")]
+    flushed: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     #[cfg(not(target_vendor = "apple"))]
     #[allow(dead_code)]
     buffer: (),
@@ -775,7 +843,11 @@ impl Pending {
         {
             // SAFETY: documented safe to read after completion; both are plain
             // `CFTimeInterval` getters.
-            let (start, end) = (self.buffer.GPUStartTime(), self.buffer.GPUEndTime());
+            let start = self
+                .flushed
+                .first()
+                .map_or_else(|| self.buffer.GPUStartTime(), |head| head.GPUStartTime());
+            let end = self.buffer.GPUEndTime();
             ((start * 1e6) as u64, (end * 1e6) as u64)
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -788,11 +860,13 @@ impl Pending {
         #[cfg(target_vendor = "apple")]
         {
             self.buffer.waitUntilCompleted();
-            if let Some(error) = self.buffer.error() {
-                return Err(Fault::Device {
-                    call: "waitUntilCompleted",
-                    why: error.localizedDescription().to_string(),
-                });
+            for buffer in self.flushed.iter().chain([&self.buffer]) {
+                if let Some(error) = buffer.error() {
+                    return Err(Fault::Device {
+                        call: "waitUntilCompleted",
+                        why: error.localizedDescription().to_string(),
+                    });
+                }
             }
             Ok(())
         }

@@ -275,7 +275,7 @@ impl Plane {
         Ok(PortCell::Host { bytes, dtype })
     }
 
-    pub fn envelope_fold_len(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
+    pub fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
             id: instance,
@@ -285,14 +285,14 @@ impl Plane {
             .package
             .ports
             .iter()
-            .find(|binding| binding.port == Port::RsFoldLen && !binding.is_const)
+            .find(|binding| binding.port == Port::Fold && !binding.is_const)
         else {
             return Ok(None);
         };
         let ring = &seat.inst.channels[binding.channel as usize];
         if ring.is_empty() {
             return Err(Refusal::Program(format!(
-                "instance {instance}: the `rs_fold_len` ring is empty at the fire"
+                "instance {instance}: the `fold` ring is empty at the fire"
             )));
         }
         let len = match ring.front() {
@@ -300,15 +300,13 @@ impl Plane {
             Value::I32(cells) => cells.first().map(|&n| n.max(0) as u32),
             other => {
                 return Err(Refusal::Program(format!(
-                    "instance {instance}: `rs_fold_len` holds {:?}, not a count",
+                    "instance {instance}: `fold` holds {:?}, not a count",
                     other.dtype()
                 )));
             }
         };
         len.map(Some).ok_or_else(|| {
-            Refusal::Program(format!(
-                "instance {instance}: `rs_fold_len` holds an empty cell"
-            ))
+            Refusal::Program(format!("instance {instance}: `fold` holds an empty cell"))
         })
     }
 
@@ -802,8 +800,6 @@ impl Plane {
             }
         }
         let extents = eta_exec::Extents {
-            kv_len: binding.extents.kv_len,
-            page_count: binding.extents.page_count,
             row_count: binding.extents.row_count,
             token_count: binding.extents.token_count,
             sampled_rows: binding.extents.sampled_rows,

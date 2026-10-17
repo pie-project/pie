@@ -167,9 +167,9 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
     let verify = Seated {
         rs: RsVerb::Buffer {
             pages: (paging.slots - 3..paging.slots).collect(),
-            at: 0,
+            base: 0,
+            folded: 0,
             fold: FoldLen::Host(0),
-            replay: 0,
         },
         rs_reset: RsReset::Fresh,
         readout: Some(&readout),

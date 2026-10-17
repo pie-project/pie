@@ -42,7 +42,6 @@ The harness validates completion plumbing rather than a decoding paper:
 | `wasm_delay_us` | int | `0` | Busy-wait per drained token to simulate guest-side token work |
 | `return_text` | bool | `true` | Decode and return generated text; benchmarks can disable it and use counts only |
 | `wait_for_start` | bool | `false` | Send a `ready` session message and wait for the benchmark client to start |
-| `system_speculation` | bool, optional | `null` | Accepted for input compatibility; speculation is engine-side now |
 | `batch_concurrency` | int, optional | `null` | Maximum number of batched requests to run concurrently; defaults to the batch size |
 | `report_timing` | bool | `false` | Return guest first-token latency, inter-token gaps, and prologue timings |
 | `report_arrivals` | bool | `false` | Return shared-host monotonic arrival stamps without the live `t0` message |

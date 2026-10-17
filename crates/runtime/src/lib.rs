@@ -23,6 +23,7 @@ pub mod model;
 pub mod offload;
 pub(crate) mod pipeline;
 pub mod planner;
+pub mod policy;
 pub mod rt;
 pub mod scheduler;
 pub mod server;

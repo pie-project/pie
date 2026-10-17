@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use client_api::{ClientMessage, ServerMessage};
 use controller_api::GatewayEndpoint;
 use futures::StreamExt;
-use ids::{ReqId, SessionId, WorkerId};
+use ids::{ReqId, SessionId, TenantId, WorkerId};
 use runtime::server::ClientId;
 use tarpc::serde_transport::tcp;
 #[cfg(unix)]
@@ -224,6 +224,23 @@ impl WorkerControl for WorkerControlServer {
         }
     }
 
+    async fn plex_session(
+        self,
+        _: tarpc::context::Context,
+        session: String,
+        changes: Option<String>,
+    ) {
+        match changes {
+            None => runtime::policy::session_closed(session),
+            Some(text) => match serde_json::from_str::<client_api::Props>(&text) {
+                Ok(changes) => runtime::policy::session_props(session, changes),
+                Err(error) => {
+                    tracing::warn!(%session, %error, "session props are not a JSON object")
+                }
+            },
+        }
+    }
+
     async fn cancel(self, _: tarpc::context::Context, req_id: ReqId) {
         let session = self.sessions.active.lock().await.get(&req_id).copied();
         if let Some(session) = session
@@ -273,7 +290,7 @@ impl WorkerControlServer {
             );
         }
 
-        let turns = self.session_turns(req.session).await?;
+        let turns = self.session_turns(req.session, &req.tenant).await?;
         turns
             .send(req)
             .await
@@ -281,15 +298,19 @@ impl WorkerControlServer {
         Ok(())
     }
 
-    async fn session_turns(&self, session: SessionId) -> Result<mpsc::Sender<Request>> {
+    async fn session_turns(
+        &self,
+        session: SessionId,
+        tenant: &TenantId,
+    ) -> Result<mpsc::Sender<Request>> {
         let mut map = self.sessions.sessions.lock().await;
         if let Some(handle) = map.get(&session)
             && !handle.turns.is_closed()
         {
             return Ok(handle.turns.clone());
         }
-        let client_id =
-            runtime::server::open_session().map_err(|e| anyhow!("open session: {e}"))?;
+        let client_id = runtime::server::open_session_for(tenant.0.clone())
+            .map_err(|e| anyhow!("open session: {e}"))?;
         let (turns_tx, turns_rx) = mpsc::channel::<Request>(TURN_QUEUE_DEPTH);
         let cancels: Arc<Mutex<HashMap<ReqId, Arc<Notify>>>> = Arc::default();
         tokio::spawn(session_driver(
@@ -415,7 +436,11 @@ async fn session_driver(
             reg.active.lock().await.insert(req_id, session);
         }
 
-        let fed = feed_turn(client_id, req_id, req.message);
+        let mut message = req.message;
+        if let ClientMessage::LaunchProcess { router_props, .. } = &mut message {
+            *router_props = req.router_props;
+        }
+        let fed = feed_turn(client_id, req_id, message);
 
         let gateway = gateway.clone();
         let routes = routes.clone();
@@ -535,6 +560,10 @@ async fn run_turn(
                     return TurnEnd::Aborted;
                 };
                 let terminal = turn_terminal(&msg, corr, proc_launch, &mut process_id);
+                if terminal {
+                    // Ahead of the exit, which its client may leave on.
+                    push_counted(gateway, req_id, process_id.as_deref()).await;
+                }
                 match gateway.push_tokens(push_ctx(), req_id, Tokens::Chunk(msg)).await {
                     Ok(Control::Continue) => {}
                     Ok(Control::Abort) => {
@@ -555,6 +584,19 @@ async fn run_turn(
             }
         }
     }
+}
+
+async fn push_counted(gateway: &GatewayInboundClient, req_id: ReqId, process_id: Option<&str>) {
+    let Some(counts) = process_id
+        .and_then(|pid| pid.parse().ok())
+        .and_then(runtime::policy::tokens::get)
+    else {
+        return;
+    };
+    // A transport error is the Eos's to report.
+    let _ = gateway
+        .counted(push_ctx(), req_id, counts.prompt, counts.generated)
+        .await;
 }
 
 async fn push_eos(gateway: &GatewayInboundClient, req_id: ReqId) -> TurnEnd {

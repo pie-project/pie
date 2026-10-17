@@ -735,6 +735,27 @@ fn batched_point(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Where a batched routed matmul's rows come from and go: a chain that keeps
+/// a routed MLP's rows sorted, as Splash's does, skips the sort and gather of
+/// a pass whose input is already the sorted stack and the scatter of one whose
+/// output the next pass reads sorted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sorted {
+    /// `scratch.x` already holds the input's rows in this routing's order.
+    pub input: bool,
+    /// Leave the output's rows sorted in `scratch.y`; `y` is not written.
+    pub output: bool,
+}
+
+/// The rows a batched routed matmul sorts `pairs` routes into, and its tile,
+/// when it runs at all.
+#[must_use]
+pub fn sorted_stack(pairs: u32, experts: u32, tuning: &crate::Tuning) -> Option<(u32, u32)> {
+    let tile = tile_rows(pairs, experts, tuning);
+    (tile > 1).then(|| (sorted_rows(pairs, experts, tuning), tile))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn matmul_select_batched(
     ctx: &Ctx<'_>,
     op: &'static str,
@@ -746,6 +767,7 @@ pub fn matmul_select_batched(
     scratch: RoutedScratch,
     y: Tensor,
     tuning: &crate::Tuning,
+    sorted: Sorted,
 ) -> Result<bool, Error> {
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     let fan = selected(op, x, routes, y)?;
@@ -753,13 +775,13 @@ pub fn matmul_select_batched(
     let pairs = y.rows;
     let mut tile = tile_rows(pairs, experts, tuning);
     if tile <= 1 {
-        return Ok(false);
+        return unsorted(op, sorted);
     }
     let Some(bn) = tile_cols(y.width) else {
-        return Ok(false);
+        return unsorted(op, sorted);
     };
     if !x.width.is_multiple_of(QMM_BK) {
-        return Ok(false);
+        return unsorted(op, sorted);
     }
     let fp16 = tuning.fp16_gemm_format(bank.bits, bank.group);
     if tile == MOE_TILE_ROWS[0] && !(fp16 && bank.affine() && bank.bits == 4 && bank.group == 64) {
@@ -803,25 +825,27 @@ pub fn matmul_select_batched(
         0u32.arg(),
     ];
     let lanes = router_lanes(op, experts)?;
-    ctx.fire(
-        Fire::at(ROUTE_FILE, "route_sort").apply(Grid::of([lanes, 1, 1], [lanes, 1, 1])),
-        &sort,
-    )?;
-    ctx.fire(
-        Fire::at(ROUTE_FILE, "route_gather").apply(route_rows(op, x.width, padded)?),
-        &[
-            x.arg(),
-            scratch.x.arg_mut(),
-            scratch.perm.arg(),
-            pairs.arg(),
-            experts.arg(),
-            gather_fan.arg(),
-            tile.arg(),
-            padded.arg(),
-            x.width.arg(),
-            0u32.arg(),
-        ],
-    )?;
+    if !sorted.input {
+        ctx.fire(
+            Fire::at(ROUTE_FILE, "route_sort").apply(Grid::of([lanes, 1, 1], [lanes, 1, 1])),
+            &sort,
+        )?;
+        ctx.fire(
+            Fire::at(ROUTE_FILE, "route_gather").apply(route_rows(op, x.width, padded)?),
+            &[
+                x.arg(),
+                scratch.x.arg_mut(),
+                scratch.perm.arg(),
+                pairs.arg(),
+                experts.arg(),
+                gather_fan.arg(),
+                tile.arg(),
+                padded.arg(),
+                x.width.arg(),
+                0u32.arg(),
+            ],
+        )?;
+    }
 
     if let Some((m, n, simdgroups)) = mpp {
         const FILE: &str = "linear/quant_qmm_mpp.metal";
@@ -890,6 +914,9 @@ pub fn matmul_select_batched(
         )?;
     }
 
+    if sorted.output {
+        return Ok(true);
+    }
     ctx.fire(
         Fire::at(ROUTE_FILE, "route_scatter").apply(route_rows(op, y.width, pairs)?),
         &[
@@ -902,6 +929,18 @@ pub fn matmul_select_batched(
         ],
     )?;
     Ok(true)
+}
+
+/// A pass whose input a chain left sorted cannot fall back to the per-route
+/// path, which reads the unsorted rows the chain never wrote.
+fn unsorted(op: &'static str, sorted: Sorted) -> Result<bool, Error> {
+    if sorted.input {
+        return Err(refuse(
+            op,
+            "a sorted chain's pass did not take the batched path".to_string(),
+        ));
+    }
+    Ok(false)
 }
 
 fn zero_points(ctx: &Ctx<'_>, bank: Bank) -> Result<crate::encode::ArgValue, Error> {
@@ -948,6 +987,37 @@ pub fn weighted_sum(
             y.arg_mut(),
             stated(OP, y.width)?.arg(),
             stated(OP, top_k)?.arg(),
+        ],
+    )
+}
+
+/// [`weighted_sum`] over routed rows a chain left sorted: route `at`'s row
+/// is `sorted[inv[at]]`, so every token sums the same rows in the same order.
+pub fn weighted_sum_sorted(
+    ctx: &Ctx<'_>,
+    sorted: Tensor,
+    inv: Tensor,
+    weights: Tensor,
+    top_k: u32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_weighted_sum";
+    dtype_dispatch!(OP, sorted.dtype, { Bf16 => () });
+    nonzero(OP, "the token rows this fold lands on", y.rows)?;
+    debug_assert_eq!(
+        sorted.width, y.width,
+        "the sorted rows are the routed width"
+    );
+    ctx.fire(
+        Fire::at("linear/moe_route.metal", "expert_combine_sorted")
+            .apply(route_rows(OP, y.width, y.rows)?),
+        &[
+            sorted.arg(),
+            weights.arg(),
+            y.arg_mut(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, top_k)?.arg(),
+            inv.arg(),
         ],
     )
 }

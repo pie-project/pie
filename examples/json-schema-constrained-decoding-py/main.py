@@ -3,8 +3,7 @@
 
 The host grammar matcher advances after every accepted token and supplies
 the next allowed-token mask to an ETA `masked_argmax` epilogue. Exercises the
-`grammar` + `mask` modules and a host-writer mask channel, and runs on any
-pass kind through `bind_state`.
+`grammar` + `mask` modules and a host-writer mask channel.
 """
 
 import json
@@ -12,17 +11,13 @@ import json
 from inferlet import chat, grammar, mask, model
 from inferlet.eta import (
     Channel,
-    ForwardKind,
     ForwardPass,
-    KvGeometry,
     Pipeline,
-    RsWorkingSet,
+    StateGeometry,
     WorkingSet,
     channel_capacity,
     dtype,
-    indptr,
     intrinsics,
-    kv_page_size,
     masked_argmax,
     reshape,
 )
@@ -51,10 +46,7 @@ async def main(input: dict) -> str:
         raise ValueError("max_tokens must be at least 1")
 
     vocab = model.output_vocab_size()
-    kind = model.pass_kind()
     ws = WorkingSet()
-    rs_ws = [RsWorkingSet()] if kind != ForwardKind.ATTENTION else []
-    page_size = kv_page_size()
     constraint = grammar.Matcher(grammar.Grammar.from_json_schema(schema))
 
     prompt = chat.system_user(
@@ -63,34 +55,15 @@ async def main(input: dict) -> str:
     if not prompt:
         prompt = [0]
     n = len(prompt)
-    max_pages = max(-(-(n + max_tokens + 1) // page_size), 1)
-    ws.reserve(max_pages)
 
     prompt_tokens = Channel.from_(prompt, dtype.i32)
     prefill_indptr = Channel.from_([0, n], dtype.u32).named("prefill_indptr")
-    prefill_positions = Channel.from_(range(n), dtype.u32).named("prefill_positions")
-    prefill_pages = Channel.from_(range(max_pages), dtype.u32).named("prefill_pages")
-    prefill_page_indptr = Channel.from_([0, -(-n // page_size)], dtype.u32).named("prefill_page_indptr")
-    prefill_w_slot = Channel.from_([p // page_size for p in range(n)], dtype.u32).named("prefill_w_slot")
-    prefill_w_off = Channel.from_([p % page_size for p in range(n)], dtype.u32).named("prefill_w_off")
     prefill_mask = Channel([vocab], dtype.bool).named("prefill_mask")
     first_out = Channel([1], dtype.i32).named("first_token")
-    prefill_kv_len = Channel.from_([n], dtype.u32).named("prefill_kv_len")
 
-    prefill = ForwardPass(kind)
+    prefill = ForwardPass()
     prefill.embed(prompt_tokens, prefill_indptr)
-    prefill.bind_state(
-        ws,
-        KvGeometry(
-            kv_len=prefill_kv_len,
-            pages=prefill_pages,
-            page_indptr=prefill_page_indptr,
-            w_slot=prefill_w_slot,
-            w_off=prefill_w_off,
-            positions=prefill_positions,
-        ),
-        rs_ws,
-    )
+    prefill.state([ws], StateGeometry.folding())
 
     @prefill.epilogue
     def _prefill():
@@ -109,43 +82,17 @@ async def main(input: dict) -> str:
         token_in = Channel.from_([first], dtype.i32).named("token_in")
         grammar_mask = Channel([vocab], dtype.bool).named("grammar_mask")
         embed_indptr = Channel.from_([0, 1], dtype.u32).named("embed_indptr")
-        positions = Channel.from_([n], dtype.u32).named("positions")
-        pages = Channel.from_(range(max_pages), dtype.u32).named("pages")
-        page_indptr = Channel.from_([0, -(-(n + 1) // page_size)], dtype.u32).named("page_indptr")
-        w_slot = Channel.from_([n // page_size], dtype.u32).named("w_slot")
-        w_off = Channel.from_([n % page_size], dtype.u32).named("w_off")
         token_out = Channel([1], dtype.i32).capacity(channel_capacity()).named("token_out")
-        kv_len = Channel.from_([n + 1], dtype.u32).named("kv_len")
 
-        decode = ForwardPass(kind)
+        decode = ForwardPass()
         decode.embed(token_in, embed_indptr)
-        decode.bind_state(
-            ws,
-            KvGeometry(
-                kv_len=kv_len,
-                pages=pages,
-                page_indptr=page_indptr,
-                w_slot=w_slot,
-                w_off=w_off,
-                positions=positions,
-                writable_pages=n // page_size,
-            ),
-            rs_ws,
-        )
+        decode.state([ws], StateGeometry.folding())
 
         @decode.epilogue
         def _decode():
-            length = kv_len.take()
             allowed = grammar_mask.take()
             token = reshape(masked_argmax(intrinsics.logits(), allowed), [1])
-            next_length = length + 1
-            page_count = next_length.div_ceil(page_size)
             token_in.put(token)
-            kv_len.put(next_length)
-            positions.put(length)
-            w_slot.put(length // page_size)
-            w_off.put(length % page_size)
-            page_indptr.put(indptr(1, page_count))
             token_out.put(token)
 
         # The grammar mask for fire k+1 is only known once fire k's token has

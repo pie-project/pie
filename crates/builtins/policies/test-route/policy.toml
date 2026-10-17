@@ -1,0 +1,20 @@
+plane = "router"
+subscribe = ["arrived", "dispatched", "exited"]
+grants = ["schedule", "placement", "terminate"]
+gate-ms = 50
+
+[props.key]
+type = "int"
+doc = "The process's key; below 1 holds it. Absent is 1."
+
+[props.worker]
+type = "text"
+doc = "The worker to send it to."
+
+[props.refuse]
+type = "text"
+doc = "Terminate it while it waits, for this reason."
+
+[props.stop]
+type = "boolean"
+doc = "Terminate it once it runs."

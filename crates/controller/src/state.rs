@@ -52,10 +52,7 @@ impl Cluster {
                 addr,
                 neighbors: Vec::new(),
                 last_hb: now,
-                load: WorkerStatus {
-                    kv_pressure_bucket: 0,
-                    inflight: 0,
-                },
+                load: WorkerStatus::default(),
             },
         );
         id

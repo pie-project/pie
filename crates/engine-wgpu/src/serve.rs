@@ -6,7 +6,9 @@ use checkpoint::contract::ModelContract;
 use poem_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, FireRows, PatchLadder, compile_axes,
 };
-use poem_exec::fire::{Composition, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
+use poem_exec::fire::{
+    At, Composition, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, fallback, walk,
+};
 use poem_ir::{Dtype, Layout, Operation, RuntimeInput, Trace, Ty, ValueId};
 
 use crate::arena::Arena;
@@ -21,7 +23,7 @@ use crate::settle::{Airborne, Arms, Done};
 use crate::store::Pools;
 use crate::store::kv::{self, Paging, Seat};
 use crate::weights::Weights;
-use crate::window::{At, Cursor, Windows};
+use crate::window::Windows;
 
 use engine::fire::{Boundary, Masking};
 use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Supply};
@@ -485,7 +487,7 @@ impl Shell {
 
         let arms = boot.runahead.frames().max(1);
 
-        let gathers = crate::window::gathers(&boot.trace, &compiled);
+        let gathers = fallback::gathers(&boot.trace, &compiled);
 
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
@@ -892,6 +894,32 @@ impl Shell {
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
         let mut frame = self.device.frame()?;
         self.pools.copy_slot(&mut frame, src, dst)?;
+        self.grafted = Some(frame.commit_async(None)?);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn buffer_pages(&self) -> u32 {
+        self.rs_buffers
+            .as_ref()
+            .map_or(0, crate::rs::Buffers::page_count)
+    }
+
+    pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
+        let Some(buffers) = self.rs_buffers.as_ref().filter(|_| !moves.is_empty()) else {
+            return Ok(());
+        };
+        let (slab, bytes) = buffers.pages();
+        let mut frame = self.device.frame()?;
+        for &(src, dst) in moves {
+            frame.copy(
+                slab,
+                u64::from(src) * bytes,
+                slab,
+                u64::from(dst) * bytes,
+                bytes,
+            )?;
+        }
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
     }
@@ -1484,7 +1512,7 @@ impl Shell {
 
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
 
-        let mut rs_plans: Vec<crate::rs::LanePlan> = Vec::with_capacity(lanes.len());
+        let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
         let mut rs_active = false;
 
         let mut slot_of_row: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -1608,9 +1636,11 @@ impl Shell {
                 }
                 rs_active = true;
             }
-            rs_plans.push(crate::rs::LanePlan::of(
-                seated.rs, row.rows, row.source, None,
-            )?);
+            rs_plans.push(
+                engine::rs::LanePlan::of(seated.rs, row.rows, have, masking, None).map_err(
+                    |error| program("serve::rs", format!("lane {}: {error}", row.source)),
+                )?,
+            );
 
             if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
                 return Err(Fault::Positions {

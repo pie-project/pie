@@ -164,20 +164,11 @@ async fn text_rows(ids: &[u32], reading: &model::ReadingFact) -> Result<Vec<f32>
     let width = reading.readout_width;
     let len = u32::try_from(ids.len()).map_err(|_| "the prompt is too long")?;
     let toks: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
-    let page_size = kv_page_size().max(1);
-    let pages = len.div_ceil(page_size);
     let ws = WorkingSet::new();
-    ws.reserve(pages)?;
     let pipe = Pipeline::new();
 
     let toks = Channel::from(toks).named("ids");
     let embed_indptr = Channel::from([0u32, len]);
-    let positions = Channel::from_iter(0..len);
-    let page_ids = Channel::from_iter(0..pages);
-    let page_indptr = Channel::from([0u32, pages]);
-    let w_slot = Channel::from_iter((0..len).map(|p| p / page_size));
-    let w_off = Channel::from_iter((0..len).map(|p| p % page_size));
-    let kv_len = Channel::from([len]);
     let readout = Channel::from_iter(0..len);
     let out = Channel::new([len, width], dtype::f32).named("hidden");
 
@@ -185,20 +176,7 @@ async fn text_rows(ids: &[u32], reading: &model::ReadingFact) -> Result<Vec<f32>
     pass.reading(&reading.name)?;
     pass.embed(&toks, &embed_indptr)?;
     pass.readout(&readout)?;
-    pass.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &kv_len,
-            pages: &page_ids,
-            page_indptr: &page_indptr,
-            w_slot: &w_slot,
-            w_off: &w_off,
-            positions: &positions,
-            mask: None,
-        },
-    )?;
+    pass.state(&[&ws], StateGeometry::default())?;
     let readback = out.clone();
     pass.epilogue(move || {
         readback.put(intrinsics::hidden(width));
@@ -341,8 +319,8 @@ async fn trajectory(
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Attention {
-        return Err("flux_2 is an attention-kind pass".into());
+    if model::pass_kind() != model::ForwardKind::Text {
+        return Err("flux_2 is a `forward` pass".into());
     }
     let instance = inferlet::runtime::instance_id();
     inferlet::session::send(&format!("instance {instance}"));

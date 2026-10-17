@@ -821,7 +821,64 @@ pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result
     )
 }
 
+/// Up to four word copies in one launch, `(src, dst, bytes)` each; the
+/// copies must not overlap one another, since they run side by side.
+pub fn copy_words_batch(ctx: &Ctx<'_>, copies: &[(Tensor, Tensor, u64)]) -> Result<(), Error> {
+    const OP: &str = "layout.rs_copy";
+    let copies: Vec<&(Tensor, Tensor, u64)> = copies.iter().filter(|c| c.2 > 0).collect();
+    match copies.as_slice() {
+        [] => return Ok(()),
+        [(src, dst, bytes)] => return copy_words(ctx, *src, *dst, *bytes),
+        _ => {}
+    }
+    if copies.len() > 4 {
+        return Err(refuse(
+            OP,
+            format!("{} copies is more than one launch takes", copies.len()),
+        ));
+    }
+    let mut words = [0u32; 4];
+    let mut args = Vec::with_capacity(12);
+    for (at, word) in words.iter_mut().enumerate() {
+        match copies.get(at) {
+            Some((src, dst, bytes)) => {
+                if !bytes.is_multiple_of(4) {
+                    return Err(refuse(
+                        OP,
+                        format!("{bytes} bytes is not a whole number of 32-bit words"),
+                    ));
+                }
+                *word = u32::try_from(bytes / 4).map_err(|_| {
+                    refuse(
+                        OP,
+                        format!("{bytes} bytes is more than one launch addresses"),
+                    )
+                })?;
+                args.push(src.arg());
+                args.push(dst.arg_mut());
+            }
+            None => {
+                args.push(ctx.absent()?);
+                args.push(ctx.absent()?);
+            }
+        }
+    }
+    let widest = words.iter().copied().max().unwrap_or(1).max(1);
+    args.extend(words.iter().map(|w| w.arg()));
+    ctx.fire(
+        Fire::at("layout/blit.metal", "rs_copy_words4").apply(Grid::of(
+            [widest, copies.len() as u32, 1],
+            [widest.min(256), 1, 1],
+        )),
+        &args,
+    )
+}
+
 const TOPK_THREADS: u32 = 128;
+/// A row this wide is a vocabulary: one 128-thread group a row left the
+/// device a few cores' worth of work for a draft block's eight rows.
+const TOPK_WIDE_FROM: u32 = 16_384;
+const TOPK_WIDE_THREADS: u32 = 1024;
 
 pub fn topk(
     ctx: &Ctx<'_>,
@@ -831,12 +888,17 @@ pub fn topk(
     indices: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "layout.topk";
-    let entry = match (x.dtype, k) {
-        (Dtype::Bf16, 8) => "topk_rows_bfloat16_k_8",
-        (Dtype::Bf16, 16) => "topk_rows_bfloat16_k_16",
-        (Dtype::F32, 8) => "topk_rows_float32_k_8",
-        (Dtype::F32, 16) => "topk_rows_float32_k_16",
-        (dtype, k) => {
+    let wide = x.width >= TOPK_WIDE_FROM;
+    let entry = match (x.dtype, k, wide) {
+        (Dtype::Bf16, 8, false) => "topk_rows_bfloat16_k_8",
+        (Dtype::Bf16, 16, false) => "topk_rows_bfloat16_k_16",
+        (Dtype::F32, 8, false) => "topk_rows_float32_k_8",
+        (Dtype::F32, 16, false) => "topk_rows_float32_k_16",
+        (Dtype::Bf16, 8, true) => "topk_rows_wide_bfloat16_k_8",
+        (Dtype::Bf16, 16, true) => "topk_rows_wide_bfloat16_k_16",
+        (Dtype::F32, 8, true) => "topk_rows_wide_float32_k_8",
+        (Dtype::F32, 16, true) => "topk_rows_wide_float32_k_16",
+        (dtype, k, _) => {
             return Err(refuse(
                 OP,
                 format!(
@@ -859,9 +921,13 @@ pub fn topk(
             format!("the indices plane is not [{rows}, {k}] i32"),
         ));
     }
+    let threads = if wide {
+        TOPK_WIDE_THREADS
+    } else {
+        TOPK_THREADS
+    };
     ctx.fire(
-        Fire::at("layout/topk.metal", entry)
-            .apply(Grid::of([TOPK_THREADS, rows, 1], [TOPK_THREADS, 1, 1])),
+        Fire::at("layout/topk.metal", entry).apply(Grid::of([threads, rows, 1], [threads, 1, 1])),
         &[
             x.arg(),
             values.arg_mut(),

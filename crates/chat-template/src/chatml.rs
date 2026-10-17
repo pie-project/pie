@@ -1,16 +1,21 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
 use crate::decode::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder, ThinkingDecoder};
 use crate::{
-    ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar, special, specials,
+    ChatDecoder, Effort, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar, special,
+    specials,
 };
 
 #[derive(Clone, Debug)]
 pub struct ChatML {
     pub thinking: bool,
     pub preserve_thinking: bool,
+    /// The template opens a thinking request's system turn with its
+    /// reasoning-effort instruction (Qwen3.8).
+    pub reasoning_effort: bool,
     pub tools: bool,
     pub generation_suffix: String,
     pub stop_tokens: Vec<String>,
@@ -108,12 +113,30 @@ impl ChatMLInstruct {
         }
     }
 
-    fn replay_body<'a>(config: &ChatML, msg: &'a str) -> &'a str {
-        if config.thinking && !config.preserve_thinking {
-            Self::without_thinking(msg)
-        } else {
-            msg
+    /// A template that preserves thinking (Qwen3.8) writes every earlier
+    /// assistant turn as `<think>\n{reasoning}\n</think>\n\n{answer}`, an empty
+    /// block where the turn had no reasoning; one that strips it replays the
+    /// answer alone.
+    fn replay_body<'a>(config: &ChatML, msg: &'a str) -> Cow<'a, str> {
+        if !config.thinking {
+            return Cow::Borrowed(msg);
         }
+        if !config.preserve_thinking {
+            return Cow::Borrowed(Self::without_thinking(msg));
+        }
+        let (reasoning, answer) = match msg.rfind(THINK_CLOSE) {
+            Some(at) => {
+                let head = &msg[..at];
+                let reasoning = head
+                    .rfind(THINK_OPEN)
+                    .map_or(head, |open| &head[open + THINK_OPEN.len()..]);
+                (reasoning.trim(), msg[at + THINK_CLOSE.len()..].trim())
+            }
+            None => ("", msg.trim()),
+        };
+        Cow::Owned(format!(
+            "{THINK_OPEN}\n{reasoning}\n{THINK_CLOSE}\n\n{answer}"
+        ))
     }
 
     fn tool_system_prompt(tools: &[String]) -> String {
@@ -180,9 +203,29 @@ json-array ::= "[" ws (json-value (ws "," ws json-value)* ws)? "]"
 ws ::= [ \t\n\r]{0,20}
 "#;
 
+/// Qwen3.8's `chat_template.jinja`, word for word; `medium` writes none.
+const EFFORT_XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+const EFFORT_LOW: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+
 impl Instruct for ChatMLInstruct {
     fn system(&self, msg: &str) -> Vec<u32> {
         self.turn(&self.system_prefix, msg)
+    }
+
+    fn system_thinking(&self, msg: Option<&str>, effort: Effort) -> Vec<u32> {
+        let instruction = match effort {
+            _ if !(self.config.thinking && self.config.reasoning_effort) => None,
+            Effort::Xhigh => Some(EFFORT_XHIGH),
+            Effort::Low => Some(EFFORT_LOW),
+            Effort::Medium => None,
+        };
+        let content = msg.map(str::trim).filter(|m| !m.is_empty());
+        match (instruction, content) {
+            (Some(i), Some(c)) => self.turn(&self.system_prefix, &format!("{i}\n\n{c}")),
+            (Some(i), None) => self.turn(&self.system_prefix, i),
+            (None, Some(c)) => self.system(c),
+            (None, None) => Vec::new(),
+        }
     }
 
     fn user(&self, msg: &str) -> Vec<u32> {
@@ -190,7 +233,10 @@ impl Instruct for ChatMLInstruct {
     }
 
     fn assistant(&self, msg: &str) -> Vec<u32> {
-        self.turn(&self.assistant_prefix, Self::replay_body(&self.config, msg))
+        self.turn(
+            &self.assistant_prefix,
+            &Self::replay_body(&self.config, msg),
+        )
     }
 
     fn cue(&self) -> Vec<u32> {
@@ -239,6 +285,18 @@ impl Instruct for ChatMLInstruct {
             self.tokenizer.clone(),
             self.think_open.clone(),
             self.think_close,
+        ))
+    }
+
+    fn reasoning_decoder_for_cue(&self, cue: &[u32]) -> Box<dyn ReasoningDecoder> {
+        if !self.config.thinking {
+            return Box::new(NoopReasoningDecoder);
+        }
+        Box::new(ThinkingDecoder::for_cue(
+            self.tokenizer.clone(),
+            self.think_open.clone(),
+            self.think_close,
+            cue,
         ))
     }
 
@@ -345,6 +403,7 @@ mod tests {
         ChatML {
             thinking,
             preserve_thinking,
+            reasoning_effort: false,
             tools: true,
             generation_suffix: String::new(),
             stop_tokens: vec!["<|im_end|>".to_string()],
@@ -367,6 +426,10 @@ mod tests {
 
     fn a_preserving_model_replays_the_turn_whole() {
         assert_eq!(ChatMLInstruct::replay_body(&config(true, true), TURN), TURN);
+        assert_eq!(
+            ChatMLInstruct::replay_body(&config(true, true), "four"),
+            "<think>\n\n</think>\n\nfour"
+        );
     }
 
     fn a_non_thinking_model_replays_verbatim() {

@@ -2,9 +2,9 @@ use wasmtime::component::Resource;
 
 use super::context::FireContext;
 use super::{
-    FireKv, PendingFire, PendingOp, TicketReservation, container_has_attention_stages,
-    container_has_lora_sink, drain_settled, pipeline_failed, record_submit_failure,
-    seat_lane_slots, settle_and_wait_resident, stamp_lane_words, wire_channels_to_pipeline,
+    FireWs, PendingFire, PendingOp, TicketReservation, advance_shadow, hook_program_of,
+    open_pipeline, record_submit_failure, seat_lane_slots, settle_and_wait_resident,
+    stamp_lane_facts, stamp_lane_words,
 };
 use crate::pipeline::Pipeline;
 use crate::pipeline::instance::ForwardPass;
@@ -18,37 +18,13 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
     fwd: Resource<ForwardPass>,
     frame: Option<crate::scheduler::FrameStamp>,
 ) -> Anyhow<Result<(), String>> {
-    let (pipe_fires, pipeline_failure, pipeline_scope) = {
-        let pipeline = ctx.resources().get(&this)?;
-        if pipeline.scope.is_closed() {
-            return Ok(Err("pipeline: pipeline is closed".to_string()));
-        }
-        (
-            pipeline.fires.clone(),
-            pipeline.failure.clone(),
-            pipeline.scope.clone(),
-        )
-    };
-    drain_settled(ctx, Some(&pipe_fires)).await?;
-    if let Some(error) = pipeline_failed(&pipeline_failure) {
-        return Ok(Err(error));
-    }
-    if let Err(error) = wire_channels_to_pipeline(ctx, &fwd, &pipe_fires)? {
-        return Ok(Err(error));
-    }
+    let (pipe_fires, pipeline_failure, pipeline_scope) =
+        match open_pipeline(ctx, &this, &fwd).await? {
+            Ok(opened) => opened,
+            Err(error) => return Ok(Err(error)),
+        };
 
-    let (
-        rows,
-        clips,
-        embed_ids,
-        lane_facts,
-        ws_rep,
-        cells,
-        accesses,
-        instance_id,
-        scheduler,
-        fwd_rep,
-    ) = {
+    let (rows, clips, embed_ids, ws_rep, cells, accesses, instance_id, scheduler, fwd_rep) = {
         let pass = ctx.resources().get(&fwd)?;
         if let Some(error) = &pass.failed {
             return Ok(Err(format!(
@@ -82,8 +58,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
                         }
                     })
             }),
-            pass.lane.clone(),
-            pass.kv_ws,
+            pass.kv_lanes[0],
             pass.cells.clone(),
             pass.instance.program.channel_accesses.clone(),
             pass.bound_instance.instance_id,
@@ -157,9 +132,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         },
         ..crate::engine::FireRequest::default()
     };
-    lane_facts.stamp(&mut req);
-    req.cohort =
-        crate::pipeline::instance::cohort_of(ctx.resources(), lane_facts.group, lane_facts.peer);
+    stamp_lane_facts(ctx, &fwd, &mut req)?;
     {
         let pass = ctx.resources().get(&fwd)?;
         let program = &pass.instance.program;
@@ -172,7 +145,8 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
     }
     req.single_token_mode = false;
     stamp_lane_words(&mut req, false, false, None);
-    if let Err(refusal) = seat_lane_slots(&mut req, &stores, ws.id).await {
+    let groups = vec![(ws.id, (0..req.lanes.len()).collect())];
+    if let Err(refusal) = seat_lane_slots(&mut req, &stores, &groups).await {
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));
     }
@@ -184,14 +158,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         .reserve_completion();
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
-    let (hook_program, lora_program) = {
-        let pass = ctx.resources().get(&fwd)?;
-        let container = &pass.instance.program.bound.container;
-        (
-            container_has_attention_stages(container),
-            container_has_lora_sink(container),
-        )
-    };
+    let (hook_program, lora_program) = hook_program_of(ctx, &fwd)?;
     let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         &scheduler,
         req,
@@ -201,8 +168,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         completion.clone(),
         Vec::new(),
         Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        None,
         frame,
         hook_program,
         lora_program,
@@ -215,29 +181,26 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         return Ok(Err(reason));
     }
     ticket_reservation.commit();
-    {
-        let pass = ctx.resources().get_mut(&fwd)?;
-        let pass = pass.bound_mut().map_err(anyhow::Error::msg)?;
-        let crate::pipeline::instance::BoundForwardPass {
-            host_shadow,
-            instance,
-            cells,
-            ..
-        } = pass;
-        host_shadow.advance(&instance.program.bound, cells);
-    }
+    advance_shadow(ctx, &fwd)?;
     pipe_fires
         .lock()
         .unwrap()
         .push_back(PendingOp::Fire(PendingFire {
             completion,
-            kv: FireKv::Host(None),
+            checkpoint: None,
+            kv: vec![FireWs {
+                ws: ws.id,
+                kvtxn: None,
+                log: None,
+                lease: ws_guard,
+                fold: None,
+                reports: Vec::new(),
+            }],
+            device_geometry: false,
             rstxn: super::RsTxnsGuard::new(ws.model, ws.engine, None),
-            ws_guard,
             model: ws.model,
             engine: ws.engine,
             fwd_rep,
-            instance_id,
             cells,
             failure: pipeline_failure,
         }));

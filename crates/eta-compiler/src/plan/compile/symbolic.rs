@@ -9,13 +9,11 @@ use eta_ir::validate::BoundTrace;
 eta_ir::declare_tagged_enum! {
     #[derive(serde::Serialize, serde::Deserialize)]
     pub enum SymbolicExtent {
-        KvLen = 0, "kv_len";
-        PageCount = 1, "page_count";
-        RowCount = 2, "row_count";
-        TokenCount = 3, "token_count";
-        SampledRows = 4, "sampled_rows";
-        QueryLen = 5, "query_len";
-        KeyLen = 6, "key_len";
+        RowCount = 0, "row_count";
+        TokenCount = 1, "token_count";
+        SampledRows = 2, "sampled_rows";
+        QueryLen = 3, "query_len";
+        KeyLen = 4, "key_len";
     }
 }
 
@@ -279,12 +277,10 @@ pub(crate) fn symbolic_channel_type(
 pub(crate) fn symbolic_port_type(port: Port, value_type: ValueType) -> SymbolicType {
     let mut ty = SymbolicType::static_type(value_type);
     match port {
-        Port::EmbedTokens | Port::Positions | Port::WSlot | Port::WOff => {
+        Port::EmbedTokens | Port::Positions | Port::Slots => {
             set_first_symbolic(&mut ty, SymbolicExtent::TokenCount)
         }
-        Port::Pages => set_first_symbolic(&mut ty, SymbolicExtent::PageCount),
-        Port::PageIndptr => set_first_symbolic(&mut ty, SymbolicExtent::RowCount),
-        Port::KvLen => set_first_symbolic(&mut ty, SymbolicExtent::RowCount),
+        Port::KvLen | Port::Fold => set_first_symbolic(&mut ty, SymbolicExtent::RowCount),
         Port::Readout => set_first_symbolic(&mut ty, SymbolicExtent::SampledRows),
         Port::AttnMask => {
             if !ty.dims.is_empty() {
@@ -296,11 +292,6 @@ pub(crate) fn symbolic_port_type(port: Port, value_type: ValueType) -> SymbolicT
             }
         }
         Port::EmbedIndptr => set_first_symbolic(&mut ty, SymbolicExtent::RowCount),
-        Port::RsBufferPages => set_first_symbolic(&mut ty, SymbolicExtent::PageCount),
-        Port::RsBufferIndptr | Port::RsBufferLen | Port::RsFoldLen => {
-            set_first_symbolic(&mut ty, SymbolicExtent::RowCount)
-        }
-        Port::RsWSlot | Port::RsWOff => set_first_symbolic(&mut ty, SymbolicExtent::TokenCount),
     }
     ty
 }
