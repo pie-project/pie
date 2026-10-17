@@ -551,26 +551,3 @@ fn the_epilogue_matches_the_host_rings() {
         check(lanes);
     }
 }
-
-#[test]
-#[ignore = "benchmark"]
-fn bench_channel_epilogue() {
-    let Some(gpu) = Gpu::open() else { return };
-    for lanes in [1usize, 32, 128, 512] {
-        let rig = Rig::new(lanes, |_| false);
-        let ctx = gpu.ctx();
-        let n = lanes as u32;
-        let pull = gpu.time_graph(50, || rig.pull_validate(&gpu));
-        let bump = gpu.time_graph(50, || channel::commit_bump(&ctx, rig.table(4), n).unwrap());
-        let publish = gpu.time_graph(50, || {
-            channel::scatter_publish(&ctx, rig.table(0), rig.table(5), n).unwrap()
-        });
-        let settle = gpu.time_graph(50, || {
-            channel::settle(&ctx, rig.table(0), rig.table(6), n).unwrap()
-        });
-        println!(
-            "channel lanes{lanes}: pull_validate {pull:.1} us, commit_bump {bump:.1} us, \
-             scatter_publish {publish:.1} us, settle {settle:.1} us"
-        );
-    }
-}

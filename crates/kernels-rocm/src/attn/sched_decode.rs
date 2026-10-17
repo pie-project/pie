@@ -14,7 +14,6 @@ pub struct Request<'a> {
     pub page_size: u32,
     pub head_dim: u32,
     pub enable_cuda_graph: bool,
-    pub chunk_floor_128: bool,
     /// The fewest keys a split chunk carries; 0 takes `CHUNK_FLOOR_TOKENS`.
     pub chunk_floor_tokens: u32,
 }
@@ -66,12 +65,7 @@ pub fn estimate(
         0 => CHUNK_FLOOR_TOKENS,
         f => f,
     };
-    let floor_tokens = if req.chunk_floor_128 {
-        floor.min(128)
-    } else {
-        floor
-    };
-    let mut low = (floor_tokens / req.page_size).max(1);
+    let mut low = (floor / req.page_size).max(1);
     let mut high = pages.iter().copied().max().unwrap_or(0);
     while low < high {
         let mid = u32::midpoint(low, high);
@@ -309,7 +303,7 @@ pub fn can_use_static_nonsplit(
     enable_cuda_graph: bool,
     toggles: Toggles,
 ) -> bool {
-    !enable_cuda_graph && !toggles.force_split_small && num_requests <= toggles.static_max_requests
+    !enable_cuda_graph && num_requests <= toggles.static_max_requests
 }
 
 pub fn static_nonsplit(

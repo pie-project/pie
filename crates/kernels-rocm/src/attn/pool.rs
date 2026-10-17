@@ -332,7 +332,7 @@ fn attend_pool(
         None => (0, 0),
     };
 
-    if head_dim == latent::RANK && !ctx.tuning().mla_naive {
+    if head_dim == latent::RANK {
         let max_list = if selection != 0 {
             i64::from(top_k)
         } else {

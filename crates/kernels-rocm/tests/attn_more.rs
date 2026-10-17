@@ -658,50 +658,6 @@ fn check_selected_heads(
     }
 }
 
-/// Device time of the selected decode at the model's shape, every block
-/// selected (contexts short of the budget), replayed from a graph.
-/// `cargo test --release --features rocm --test attn_more bench_selected -- --ignored --nocapture`
-#[test]
-#[ignore = "benchmark"]
-fn bench_selected_decode() {
-    let Some(gpu) = Gpu::open() else { return };
-    let ctx = gpu.ctx();
-    let (hq, hk, d, ps, ratio, top_k) = (24u32, 2u32, 256u32, 16usize, 4u32, 2048u32);
-    for (lanes, len) in [
-        (1usize, 1100u32),
-        (32, 1100),
-        (128, 1100),
-        (128, 4096),
-        (512, 1100),
-    ] {
-        let kv_lens = vec![len; lanes];
-        let Cache { pool, .. } = paged_cache(&gpu, hk as usize, d as usize, ps, &kv_lens, 5);
-        let qo = indptr_of(&vec![1u32; lanes]);
-        let qs = bf16s(lanes * (hq * d) as usize, 3, 1.0);
-        let sel: Vec<i32> = (0..lanes)
-            .flat_map(|_| (0..top_k as i32).map(|n| if n < (len / ratio) as i32 { n } else { -1 }))
-            .collect();
-        let q = RaggedTensor {
-            data: gpu.tensor(&qs, lanes as u32, hq * d, Dtype::Bf16),
-            indptr: gpu.column(&qo),
-        };
-        let selection = gpu.ints_shaped(&sel, lanes as u32, top_k);
-        let mut o = gpu.zeros(lanes as u32, hq * d, Dtype::Bf16);
-        let us = gpu.time_graph(50, || {
-            selected::attention_decode_selected(
-                &ctx, q, selection, &pool, None, d, 0.0625, ratio, false, &mut o,
-            )
-            .unwrap();
-        });
-        let keys = (len.min(top_k * ratio) as usize) * lanes;
-        let bytes = keys * (hk * d) as usize * 2 * 2;
-        println!(
-            "selected decode lanes{lanes} ctx{len}: {us:.1} us ({:.0} GB/s of kv)",
-            bytes as f64 / us / 1e3
-        );
-    }
-}
-
 // ------------------------------------------------------------ selector --
 
 #[test]
@@ -1302,55 +1258,6 @@ fn ple_ngram_ids_at_the_models_shape() {
             }
             assert_eq!(state, want_state, "ple rows{rows} state map={with_map}");
         }
-    }
-}
-
-/// Device time of the decode update at the model's shape.
-/// `cargo test --release --features rocm --test attn_more bench_ple -- --ignored --nocapture`
-#[test]
-#[ignore = "benchmark"]
-fn bench_ple_ngram_ids() {
-    let Some(gpu) = Gpu::open() else { return };
-    let ctx = gpu.ctx();
-    let raw = Raw::default();
-    let shape = ple_shape();
-    let map_t = raw.upload(&shape.map, PLE_VOCAB as u32, 1, Dtype::I64);
-    for rows in [1usize, 32, 128, 512] {
-        let slots: Vec<i32> = (0..rows as i32).collect();
-        let ids: Vec<i32> = (0..rows)
-            .map(|r| ((r * 7907 + 3) % PLE_VOCAB) as i32)
-            .collect();
-        let slab = raw.upload(&vec![5i32; rows * 4], rows as u32, 4, Dtype::I32);
-        let pool = RecurrentPool {
-            slab,
-            slot_ids: gpu.column(&slots),
-            slot_stride_elems: 4,
-            conv_slab: Tensor::ABSENT,
-            conv_stride: 0,
-            write_state: true,
-            write_state_mask: Tensor::ABSENT,
-            commit_len: Tensor::ABSENT,
-            begin_at: Tensor::ABSENT,
-            fused_decay: false,
-        };
-        let ids_t = gpu.column(&ids);
-        let mut out = raw.upload(&vec![0i32; rows * 16], rows as u32, 16, Dtype::I32);
-        let us = gpu.time_graph(50, || {
-            kernels_rocm::attn_ple::ngram_ids(
-                &ctx,
-                ids_t,
-                &pool,
-                PLE_EOS as u32,
-                &shape.mults,
-                &shape.primes,
-                &shape.offsets,
-                8,
-                Some(map_t),
-                &mut out,
-            )
-            .unwrap();
-        });
-        println!("ple_ngram_ids rows{rows}: {us:.1} us");
     }
 }
 

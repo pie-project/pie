@@ -40,23 +40,6 @@ pub mod hip;
 pub mod jit;
 pub mod layout;
 pub mod linear;
-#[cfg(feature = "rocm")]
-pub mod prof;
-/// Without a runtime there is nothing to time.
-#[cfg(not(feature = "rocm"))]
-pub mod prof {
-    #[must_use]
-    pub fn on() -> bool {
-        false
-    }
-
-    #[must_use]
-    pub fn begin(_: *mut core::ffi::c_void) -> Option<()> {
-        None
-    }
-
-    pub fn end(_: *mut core::ffi::c_void, _: Option<()>, _: impl FnOnce() -> String) {}
-}
 pub mod seat;
 pub mod source;
 pub mod spatial;

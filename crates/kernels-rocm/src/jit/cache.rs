@@ -240,8 +240,6 @@ fn put_str(out: &mut Vec<u8>, text: &str) {
 }
 
 /// The device's architecture, read once per ordinal: `gfx942` on MI300.
-/// `PIE_ROCM_ARCH` overrides it, for a device whose name hiprtc does not
-/// know yet.
 #[must_use]
 pub fn arch(ordinal: i32) -> Option<&'static str> {
     static ARCHES: OnceLock<Mutex<HashMap<i32, Option<&'static str>>>> = OnceLock::new();
@@ -250,9 +248,7 @@ pub fn arch(ordinal: i32) -> Option<&'static str> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *map.entry(ordinal).or_insert_with(|| {
-        let name = std::env::var("PIE_ROCM_ARCH")
-            .ok()
-            .or_else(|| crate::jit::device::arch_name(ordinal))?;
+        let name = crate::jit::device::arch_name(ordinal)?;
         Some(Box::leak(name.into_boxed_str()))
     })
 }

@@ -14,9 +14,7 @@ mod gemv;
 #[cfg(feature = "rocm")]
 pub(crate) use gemv::compute_units;
 #[cfg(feature = "rocm")]
-mod mgemm;
 #[cfg(feature = "rocm")]
-pub use mgemm::force as force_mgemm;
 pub mod skinny;
 
 pub mod lora;

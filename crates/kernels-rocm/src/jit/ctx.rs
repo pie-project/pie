@@ -467,26 +467,6 @@ impl Ctx {
         if fire.launch.empty() {
             return Err(refuse(op, "the grid is empty"));
         }
-        if trace_fires() {
-            let now = std::time::Instant::now();
-            let gap = {
-                static LAST: std::sync::Mutex<Option<std::time::Instant>> =
-                    std::sync::Mutex::new(None);
-                let mut last = LAST
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let gap = last.map_or(0, |at| now.duration_since(at).as_micros());
-                *last = Some(now);
-                gap
-            };
-            eprintln!("fire: {gap} {op} {}", fire.entrypoint);
-        }
-        if crate::prof::on() {
-            let start = crate::prof::begin(self.stream);
-            let issued = self.issue(op, &root, fire.entrypoint, fire.launch, args);
-            crate::prof::end(self.stream, start, || format!("{op} {}", fire.entrypoint));
-            return issued;
-        }
         self.issue(op, &root, fire.entrypoint, fire.launch, args)
     }
 
@@ -547,11 +527,6 @@ fn said(root: &str, instantiation: &str, why: crate::jit::Fault) -> crate::jit::
         );
     }
     why
-}
-
-fn trace_fires() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIE_ROCM_TRACE_FIRES").is_some_and(|v| v == "1"))
 }
 
 #[cfg(test)]

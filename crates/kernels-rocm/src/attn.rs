@@ -338,10 +338,7 @@ pub fn prefill_selected_tiled(
     o: &mut Tensor,
 ) -> Result<bool, Error> {
     const OP: &str = "attention.prefill_selected";
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let off = *OFF.get_or_init(|| std::env::var_os("PIE_SEL_TILED").is_some_and(|v| v == "0"));
-    if off
-        || window.is_some()
+    if window.is_some()
         || q.data.dtype != Dtype::Bf16
         || pool.keys.dtype != Dtype::Bf16
         || pool.key_scales.ptr != 0

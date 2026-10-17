@@ -4,8 +4,6 @@
 //! sampler (a lane's row split over several blocks), drawing the token the
 //! host interpreter draws, over rows a trained model's and a random mini's
 //! next-token distributions span and bf16 logits' runs of equal values.
-//! `PIE_LANE_SAMPLER_BLOCKS` caps the blocks a lane takes (the split must not
-//! move a draw).
 
 use engine::ProgramRegistration;
 use engine_cuda::device::Context;

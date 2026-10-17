@@ -453,10 +453,6 @@ pub fn matmul_select(
     }
     if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
         if x.width.is_multiple_of(8) {
-            #[cfg(feature = "rocm")]
-            if select_lt(ctx, OP, x, bank, routes, y, count, &fan)? {
-                return Ok(());
-            }
             return select_grouped(ctx, OP, x, bank, routes, y, count, &fan);
         }
         // A row the native legs cannot read in 16-byte pieces: rocBLAS's
@@ -545,15 +541,9 @@ fn grouped_lt(
         groups,
     };
     let workspace = ctx.scratch_shared(op, "linear.lt_workspace", lt::WORKSPACE)? as u64;
-    let start = crate::prof::on()
-        .then(|| crate::prof::begin(ctx.stream()))
-        .flatten();
     // SAFETY: x is [m, groups·k], y [m, groups·n] and w groups blocks of
     // [n, k], device planes the caller sized; the workspace is this stream's.
     let landed = unsafe { lt::matmul(shape, x, w, 0, y, workspace, ctx.stream()) };
-    crate::prof::end(ctx.stream(), start, || {
-        format!("{op} hipblaslt groups={groups} m={m} n={n} k={k}")
-    });
     landed.map_err(|why| refuse(op, format!("{why} at {groups} x M={m} N={n} K={k}")))
 }
 
@@ -722,111 +712,6 @@ fn wide_items(ctx: &Ctx, fan: &Selected, experts: u32, x: Tensor) -> Option<u32>
     })
 }
 
-/// A bf16 bank in the matrix core's order (`act_quant::bf16_shuffle` of each
-/// expert's plane) against the routes' rows. One token: each route its own
-/// item, unordered. To items of 64 routes an expert (decode batches; the
-/// item holding the busiest expert of a random routing, `stream_items`):
-/// streamed whole 1 KB units a lane-order strip into the matrix core's
-/// operands, an expert past its item taking another. Past that, the prefill
-/// tile (`group_shape`): items of 128 routes against 256 or 512 weight rows a
-/// block, the weight straight into registers and the routes through LDS.
-pub fn matmul_select_bf16_stream(
-    ctx: &Ctx,
-    x: Tensor,
-    bank: Tensor,
-    routes: Tensor,
-    y: &mut Tensor,
-    experts: u32,
-) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select";
-    let op = OP;
-    dtype_dispatch!(op, x.dtype, { Bf16 => () });
-    let fan = selected(op, x, routes, y)?;
-    if !x.width.is_multiple_of(64) || !y.width.is_multiple_of(16) || experts > ORDER_EXPERT_CAP {
-        return Err(refuse(op, "the streamed bank takes whole 16-row strips of 64-element stages"));
-    }
-    let k = stated(op, x.width)?;
-    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
-    let act_div = if fan.by_token { fan.top_k } else { 1 };
-    if routes.rows == 1 {
-        return ctx.fire(
-            op,
-            Fire::at("linear/fp8.hip", "::pie::linear::moe_bf16_route<::pie::i32(1)>")
-                .apply(Launch::grid([fan.route_count, y.width.div_ceil(64), 1], [GROUP_BLOCK, 1, 1])),
-            &[x.arg(), routes.arg(), bank.arg(), y.arg(), act_div.arg(), n.arg(), k.arg(), stated(op, experts)?.arg()],
-        );
-    }
-    let need = stream_items(&fan, experts);
-    if need <= 64 {
-        let mt = crate::linear::act_quant::fp8_item_rows(need);
-        // Two strips a wave at 64 routes, the routes' rows read half as often.
-        let nb = if mt == 64 { 2 } else { 1 };
-        let ordered = route_order(ctx, op, routes, &fan, experts, mt)?;
-        return ctx.fire(
-            op,
-            Fire::at(
-                "linear/fp8.hip",
-                symbol(&format!("::pie::linear::moe_bf16_stream<::pie::i32({mt}), ::pie::i32({nb})>")),
-            )
-            .apply(Launch::grid([ordered.work_cap, y.width.div_ceil(64 * nb), 1], [GROUP_BLOCK, 1, 1])),
-            &[
-                x.arg(),
-                ArgValue::Ptr(ordered.order),
-                ArgValue::Ptr(ordered.offsets),
-                ArgValue::Ptr(ordered.work),
-                bank.arg(),
-                y.arg(),
-                act_div.arg(),
-                n.arg(),
-                k.arg(),
-                stated(op, experts)?.arg(),
-            ],
-        );
-    }
-    // The prefill tile reads the activation at 32-bit offsets from its base.
-    if u64::from(x.rows) * u64::from(x.width) * 2 > u64::from(u32::MAX) {
-        return Err(refuse(op, "the prefill tile reads an activation under 4 GiB"));
-    }
-    let (nw, splits) = group_shape(experts.min(fan.route_count) * need.div_ceil(128), y.width, x.width);
-    let ordered = route_order(ctx, op, routes, &fan, experts, 128)?;
-    let stages = x.width / 64;
-    let per = stages.div_ceil(splits);
-    let splits = stages.div_ceil(per);
-    let part = crate::linear::act_quant::fp8_partials(ctx, op, splits, y.rows, y.width)?;
-    ctx.fire(
-        op,
-        Fire::at(
-            "linear/fp8.hip",
-            symbol(&format!("::pie::linear::moe_bf16_group<::pie::i32({nw})>")),
-        )
-        .apply(Launch::grid([ordered.work_cap, y.width.div_ceil(64 * nw), splits], [64 * nw, 1, 1])),
-        &[
-            x.arg(),
-            ArgValue::Ptr(ordered.order),
-            ArgValue::Ptr(ordered.offsets),
-            ArgValue::Ptr(ordered.work),
-            bank.arg(),
-            y.arg(),
-            part,
-            act_div.arg(),
-            n.arg(),
-            k.arg(),
-            stated(op, experts)?.arg(),
-            stated(op, y.rows)?.arg(),
-            stated(op, per)?.arg(),
-        ],
-    )?;
-    if splits == 1 {
-        return Ok(());
-    }
-    let grid = u32::try_from((u64::from(y.rows) * u64::from(y.width)).div_ceil(256).min(4096)).unwrap_or(4096);
-    ctx.fire(
-        op,
-        Fire::at("linear/fp8.hip", "::pie::linear::fp8_mfma_finalize").apply(Launch::grid([grid, 1, 1], [GROUP_BLOCK, 1, 1])),
-        &[part, y.arg(), stated(op, y.rows)?.arg(), n.arg(), stated(op, splits)?.arg(), ArgValue::ABSENT],
-    )
-}
-
 /// The routes an item would hold the busiest expert in: what they average,
 /// exactly where every token takes every expert, else past the average by
 /// two of its square roots and one (`batch_items`' margin).
@@ -838,21 +723,6 @@ fn stream_items(fan: &Selected, experts: u32) -> u32 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let margin = (2.0 * f64::from(per).sqrt()).ceil() as u32;
     per + margin + 1
-}
-
-/// The prefill tile's shape for `items` work items over an n x k bank: its
-/// waves (64 weight rows each) and K slices. Eight waves once their blocks
-/// hold most of the card (a block a CU) and leave little of the last block
-/// row idle; short of that four, two blocks a CU, and a long K sliced in two
-/// while those blocks still leave CUs idle.
-fn group_shape(items: u32, n: u32, k: u32) -> (u32, u32) {
-    if items * n.div_ceil(512) >= 192 && n.div_ceil(512) * 512 <= n + n / 8 {
-        (8, 1)
-    } else if items * n.div_ceil(256) < 256 && k / 64 >= 96 {
-        (4, 2)
-    } else {
-        (4, 1)
-    }
 }
 
 /// A bf16 bank's select on the GEMM tile (`linear/fp8.hip`'s eight-wave
@@ -1227,19 +1097,6 @@ mod ordered {
     }
 }
 
-/// The hipBLASLt grouped leg forced from outside, for tests and benches:
-/// `Some(true)` takes it wherever it launches, past the profile's
-/// thresholds; `Some(false)` never.
-#[cfg(feature = "rocm")]
-static LT_FORCED: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
-
-#[cfg(feature = "rocm")]
-pub fn force_lt_grouped(on: Option<bool>) {
-    *LT_FORCED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = on;
-}
-
 /// Grouped GEMMs the hipBLASLt leg has launched, for tests.
 #[cfg(feature = "rocm")]
 static LT_FIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1255,16 +1112,10 @@ const LT_STAGE_CAP: u64 = 3 << 30;
 
 /// Whether the hipBLASLt leg takes `per` routes an expert where the profile
 /// starts it at `from` (0: never) and the shape is of the class it takes
-/// (`fits`), or as forced.
+/// (`fits`).
 #[cfg(feature = "rocm")]
 fn lt_wanted(ctx: &Ctx, per: u32, from: u32, fits: bool) -> bool {
-    match *LT_FORCED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
-        Some(forced) => forced,
-        None => ctx.tuning().moe_lt_grouped && fits && from > 0 && per >= from,
-    }
+    ctx.tuning().moe_lt_grouped && fits && from > 0 && per >= from
 }
 
 /// The library and the solution the profile names for a contraction of `k`
@@ -1284,44 +1135,6 @@ fn lt_solution(
         t.moe_lt_tile_shallow
     };
     Some((lib, lib.pick(tile)?))
-}
-
-/// The hipBLASLt grouped leg (`hip::lt_grouped`) of a routed select: routes
-/// ordered by expert, their rows gathered by expert while the same launch
-/// writes each expert's device `UserArguments`, one grouped GEMM over a
-/// worst-case grid, and the rows scattered back to route order. From
-/// `kernel.moe.lt_select_from` routes an expert; `Ok(false)` leaves the fire
-/// to the native grouped leg.
-#[cfg(feature = "rocm")]
-#[allow(clippy::too_many_arguments)]
-fn select_lt(
-    ctx: &Ctx,
-    op: &'static str,
-    x: Tensor,
-    bank: Tensor,
-    routes: Tensor,
-    y: &mut Tensor,
-    experts: u32,
-    fan: &Selected,
-) -> Result<bool, Error> {
-    let (n, k, rows) = (y.width, x.width, fan.route_count);
-    if !matches!(x.dtype, Dtype::Bf16 | Dtype::F16)
-        || bank.dtype != x.dtype
-        || y.dtype != x.dtype
-        || !n.is_multiple_of(8)
-        || n < 64
-        || u64::from(rows) * (u64::from(n) + u64::from(k)) * 2 > LT_STAGE_CAP
-        || !lt_wanted(ctx, rows / experts, ctx.tuning().moe_lt_select_from, true)
-    {
-        return Ok(false);
-    }
-    let Some((lib, at)) = lt_solution(ctx, x.dtype, k) else {
-        return Ok(false);
-    };
-    let stage = stage_lt(ctx, op, x, bank, routes, n, experts, fan, 0)?;
-    gemm_lt(op, lib, at, &stage, n, rows, experts, ctx.stream())?;
-    unscatter_lt(ctx, op, &stage, y, experts, rows)?;
-    Ok(true)
 }
 
 /// The hipBLASLt leg's planes: routes in expert order, the staged result
@@ -1412,16 +1225,9 @@ fn lt_launch(
     stream: *mut core::ffi::c_void,
 ) -> Result<(), Error> {
     let grid = lib.solutions[at].worst_grid(n, rows, experts);
-    let start = crate::prof::on().then(|| crate::prof::begin(stream)).flatten();
     // SAFETY: the argument array was written on this stream, its records
     // naming staged planes and the bank, all live through the fire.
     unsafe { lib.launch(at, experts + 1, args, grid, stream) }.map_err(|why| refuse(op, why))?;
-    crate::prof::end(stream, start, || {
-        format!(
-            "{op} hipblaslt grouped {} experts={experts} routes={rows} n={n}",
-            lib.solutions[at].label()
-        )
-    });
     LT_FIRES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
@@ -1439,31 +1245,6 @@ fn gemm_lt(
     stream: *mut core::ffi::c_void,
 ) -> Result<(), Error> {
     lt_launch(op, lib, at, stage.args, n, rows, experts, stream)
-}
-
-#[cfg(feature = "rocm")]
-fn unscatter_lt(
-    ctx: &Ctx,
-    op: &'static str,
-    stage: &LtStage,
-    y: &Tensor,
-    experts: u32,
-    rows: u32,
-) -> Result<(), Error> {
-    let t = dtype_dispatch!(op, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    ctx.fire(
-        op,
-        Fire::at(FILE, symbol(&format!("::pie::linear::moe_lt_unscatter<{t}>")))
-            .apply(Launch::grid([copy_blocks(rows, y.width), 1, 1], [256, 1, 1])),
-        &[
-            ArgValue::Ptr(stage.staged_out),
-            ArgValue::Ptr(stage.ordered.order),
-            ArgValue::Ptr(stage.ordered.offsets),
-            y.arg(),
-            stated(op, y.width)?.arg(),
-            stated(op, experts)?.arg(),
-        ],
-    )
 }
 
 /// The routed swiglu MLP with its rows kept by expert from the gate-up to

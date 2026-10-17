@@ -28,10 +28,6 @@ __global__ void wave_sum(const float* x, float* out) {
 }
 "#;
 
-fn arch() -> String {
-    std::env::var("PIE_ROCM_ARCH").unwrap_or_else(|_| "gfx942".to_owned())
-}
-
 #[test]
 fn a_jit_kernel_runs_on_the_device() {
     let Ok(count) = hip::device_count() else {
@@ -48,7 +44,7 @@ fn a_jit_kernel_runs_on_the_device() {
     let built = hip::compile(
         "smoke",
         SOURCE,
-        &arch(),
+        kernels_rocm::jit::cache::arch(0).expect("the device names its architecture"),
         &["-O3", "-std=c++17"],
         &["axpy<float>", "wave_sum"],
     )

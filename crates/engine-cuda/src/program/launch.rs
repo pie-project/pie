@@ -1282,7 +1282,7 @@ impl Prepared {
         // its own arena; the lanes' barrier words start at zero.
         let rows = if sampler {
             self.zero_barriers(stream)?;
-            (device_units() / self.filled.max(1)).clamp(1, sampler_blocks().min(rows))
+            (device_units() / self.filled.max(1)).clamp(1, LANE_SAMPLER_BLOCKS.min(rows))
         } else {
             rows
         };
@@ -1438,18 +1438,6 @@ impl Prepared {
         let _ = stream;
         Ok(())
     }
-}
-
-/// The most blocks a sampler lane takes: `LANE_SAMPLER_BLOCKS`, or fewer
-/// under `PIE_LANE_SAMPLER_BLOCKS` (a test's lever on the split).
-fn sampler_blocks() -> u32 {
-    static BLOCKS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *BLOCKS.get_or_init(|| {
-        std::env::var("PIE_LANE_SAMPLER_BLOCKS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .map_or(LANE_SAMPLER_BLOCKS, |v| v.clamp(1, LANE_SAMPLER_BLOCKS))
-    })
 }
 
 /// The device's multiprocessors, which a sampler fire's blocks may fill.

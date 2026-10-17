@@ -700,24 +700,6 @@ __global__ __launch_bounds__(256) void moe_lt_args(const i32* __restrict__ offse
     lt_write_args<T>(offsets, args, bank, staged_in, staged_out, n, k, num_experts);
 }
 
-// The grouped leg's rows back in route order: out[order[p]] = staged[p]
-// for the routed rows; n a multiple of 8.
-template <class T>
-__global__ __launch_bounds__(256) void moe_lt_unscatter(const T* __restrict__ staged, const i32* __restrict__ order,
-                                                        const i32* __restrict__ offsets, T* __restrict__ out, int n,
-                                                        int num_experts) {
-    using V = uint4;
-    const int pieces = n / 8;
-    const long long live = static_cast<long long>(offsets[num_experts]) * pieces;
-    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < live;
-         i += static_cast<long long>(gridDim.x) * blockDim.x) {
-        const long long p = i / pieces;
-        const int c = static_cast<int>(i - p * pieces);
-        reinterpret_cast<V*>(out + static_cast<long long>(order[p]) * n)[c] =
-            reinterpret_cast<const V*>(staged + p * n)[c];
-    }
-}
-
 // The sorted routed MLP's fold: y[n][h] = Σ_k weights[n][k] ·
 // sorted[pos[n·top_k + k]][h], summed in f32 and rounded once; a dead route
 // (expert < 0) adds nothing. As moe_weighted_sum, over the staged window.

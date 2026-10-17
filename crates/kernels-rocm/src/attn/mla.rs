@@ -851,11 +851,11 @@ fn dispatch_dense(
 ) -> Result<(), Error> {
     let window = window_of(op, window)?;
     let num_requests = kv::lanes_of(op, qo_indptr)?;
-    let matrix_core = !ctx.tuning().mla_naive && latent::supported(layer.kv_lora_rank, layer.rope_dim);
+    let matrix_core = latent::supported(layer.kv_lora_rank, layer.rope_dim);
     // A windowed row reads a band of keys of its own: the gathered walk,
     // a block per token, takes it from its window's floor (at a 512 or a
     // 1024 latent).
-    if !ctx.tuning().mla_naive && window > 0 && latent::gather_supported(layer.kv_lora_rank, layer.rope_dim) {
+    if window > 0 && latent::gather_supported(layer.kv_lora_rank, layer.rope_dim) {
         return latent::gather(
             ctx,
             op,
@@ -1021,7 +1021,7 @@ fn selected(
     let num_requests = kv::lanes_of(op, q.indptr)?;
     let top_k = stated(op, selection.width)?;
     let lse = lse_plane(op, lse, o.rows, heads)?;
-    if !ctx.tuning().mla_naive && latent::gather_supported(layer.kv_lora_rank, layer.rope_dim) {
+    if latent::gather_supported(layer.kv_lora_rank, layer.rope_dim) {
         return latent::gather(
             ctx,
             op,

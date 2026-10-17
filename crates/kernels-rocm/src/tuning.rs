@@ -1,4 +1,4 @@
-//! The hardware-dependent decisions the CUDA kernels read, and [`Tuning`]:
+//! The hardware-dependent decisions the HIP kernels read, and [`Tuning`]:
 //! the values one load runs under.
 
 use profile::{Anywhere, Decision, Profile, Registry};
@@ -14,12 +14,6 @@ pub struct MoeGrouped;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.lt_grouped", flag, default = false, tune = search)]
 pub struct MoeLtGrouped;
-
-/// Routes an expert from which a routed select's grouped leg is hipBLASLt's
-/// grouped GEMM over rows gathered by expert and scattered back (0: never).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.lt_select_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
-pub struct MoeLtSelectFrom(pub u32);
 
 /// Routes an expert from which a routed swiglu MLP keeps its rows by expert
 /// from the gate-up to the fold over hipBLASLt's grouped GEMM (0: never).
@@ -50,31 +44,6 @@ pub struct MoeLtDeepK(pub u32);
 #[decision(id = "kernel.moe.ordered_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
 pub struct MoeOrderedFrom(pub u32);
 
-/// Whether a resident bf16 expert bank only routed selects read lands in
-/// the matrix core's order (`linear::act_quant::bf16_shuffle`, one copy),
-/// its selects on the tiles that stream it so (`moe::matmul_select_bf16_stream`)
-/// at every batch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.bf16_order", flag, default = false, tune = search)]
-pub struct MoeBf16Order;
-
-/// Whether a resident mxfp4 expert bank only routed selects of bf16 rows
-/// read lands in the matrix core's lane order (`linear::moe::mxfp4_lanes`,
-/// one copy), its selects at every batch on the tiles that stream it so
-/// (`moe::matmul_select_mxfp4_lanes`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.mxfp4_order", flag, default = false, tune = search)]
-pub struct MoeMxfp4Order;
-
-/// Whether a resident `fp8b32` projection (e4m3 under ue8m0 exponents a
-/// 32x32 block) only its W8A8 products read lands in the FP8 matrix core's
-/// order, made canonical (`linear::act_quant::e4m3fn_shuffle`, one copy),
-/// its products on the tiles that read it so
-/// (`act_quant::matmul_fp8b32_lanes`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.fp8.b32_order", flag, default = false, tune = search)]
-pub struct Fp8B32Order;
-
 /// The same for mxfp4 banks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.mxfp4_grouped", flag, default = true, tune = search)]
@@ -86,51 +55,16 @@ pub struct MoeMxfp4Grouped;
 #[decision(id = "kernel.moe.mxfp4_wmma", flag, default = true, tune = search)]
 pub struct MoeMxfp4Wmma;
 
-/// Whether a small decode batch still splits its keys across blocks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.split_small", flag, default = false, tune = search)]
-pub struct DecodeSplitSmall;
-
-/// Whether a sliding-window decode splits its keys across blocks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.split_window", flag, default = false, tune = search)]
-pub struct DecodeSplitWindow;
-
-/// Whether a split decode chunk holds at least 128 keys, as the scheduler
-/// once floored it, rather than one page.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.chunk_floor_128", flag, default = false, tune = search)]
-pub struct DecodeChunkFloor128;
-
 /// The fewest keys a split decode chunk carries (the flag above lowers it
 /// to 128 at most).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.decode.chunk_floor_tokens", constant(range(16..=4096)), default = 64, tune = search)]
 pub struct DecodeChunkFloorTokens(pub u32);
 
-/// How a bf16 GEMV (one activation row) is laid out: `wide` (an 8-warp
-/// split-K block up to `kernel.gemv.splitk_max_n` columns, 4 rows x 4 warps
-/// past it), or `narrow` (4 warps x 2 for both), which Blackwell prefers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gemv.bf16", default = "wide", tune = search)]
-pub enum GemvBf16 {
-    Wide,
-    Narrow,
-}
-
 /// The widest bf16 GEMV that splits its contraction across warps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.gemv.splitk_max_n", constant(range(0..=1_048_576)), default = 4096, tune = search)]
 pub struct GemvSplitkMaxN(pub u32);
-
-/// How MLA attention runs: the FA2 kernel at the widest shared-memory arm
-/// that fits, or the naive kernel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.mla.path", default = "fa2", tune = search)]
-pub enum MlaPath {
-    Fa2,
-    Naive,
-}
 
 /// The fewest rows a held affine-quantised bank decodes to bf16 for
 /// hipBLASLt, fewer taking the native kernels (on MI300X the decode starts
@@ -294,24 +228,15 @@ pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
         .add::<MoeLtGrouped>()
-        .add::<MoeLtSelectFrom>()
         .add::<MoeLtMlpFrom>()
         .add::<MoeLtTileDeep>()
         .add::<MoeLtTileShallow>()
         .add::<MoeLtDeepK>()
         .add::<MoeOrderedFrom>()
-        .add::<MoeBf16Order>()
-        .add::<MoeMxfp4Order>()
-        .add::<Fp8B32Order>()
         .add::<MoeMxfp4Grouped>()
         .add::<MoeMxfp4Wmma>()
-        .add::<DecodeSplitSmall>()
-        .add::<DecodeSplitWindow>()
-        .add::<DecodeChunkFloor128>()
         .add::<DecodeChunkFloorTokens>()
-        .add::<GemvBf16>()
         .add::<GemvSplitkMaxN>()
-        .add::<MlaPath>()
         .add::<QmmGemmFrom>()
         .add::<QmmLongRows>()
         .add::<QmmSplitWarpsPerSm>()
@@ -346,26 +271,15 @@ pub fn register(registry: &mut Registry) {
 pub struct Tuning {
     pub moe_grouped: bool,
     pub moe_lt_grouped: bool,
-    pub moe_lt_select_from: u32,
     pub moe_lt_mlp_from: u32,
     pub moe_lt_tile_deep: u32,
     pub moe_lt_tile_shallow: u32,
     pub moe_lt_deep_k: u32,
     pub moe_ordered_from: u32,
-    pub moe_bf16_order: bool,
-    pub moe_mxfp4_order: bool,
-    pub fp8_b32_order: bool,
     pub mxfp4_grouped: bool,
     pub mxfp4_wmma: bool,
-    pub decode_split_small: bool,
-    pub decode_split_window: bool,
-    pub decode_chunk_floor_128: bool,
     pub decode_chunk_floor_tokens: u32,
-    /// `kernel.gemv.bf16 = narrow`.
-    pub gemv_narrow: bool,
     pub gemv_splitk_max_n: u32,
-    /// `kernel.mla.path = naive`.
-    pub mla_naive: bool,
     pub qmm_gemm_from: u32,
     pub qmm_long_rows: u32,
     pub qmm_split_warps_per_sm: u32,
@@ -400,24 +314,15 @@ impl Tuning {
     pub const DEFAULT: Tuning = Tuning {
         moe_grouped: true,
         moe_lt_grouped: false,
-        moe_lt_select_from: 0,
         moe_lt_mlp_from: 0,
         moe_lt_tile_deep: 256_192_064,
         moe_lt_tile_shallow: 256_160_032,
         moe_lt_deep_k: 2048,
         moe_ordered_from: 0,
-        moe_bf16_order: false,
-        moe_mxfp4_order: false,
-        fp8_b32_order: false,
         mxfp4_grouped: true,
         mxfp4_wmma: true,
-        decode_split_small: false,
-        decode_split_window: false,
-        decode_chunk_floor_128: false,
         decode_chunk_floor_tokens: 64,
-        gemv_narrow: false,
         gemv_splitk_max_n: 4096,
-        mla_naive: false,
         qmm_gemm_from: 128,
         qmm_long_rows: 512,
         qmm_split_warps_per_sm: 58,
@@ -452,24 +357,15 @@ impl Tuning {
         Tuning {
             moe_grouped: profile.on::<MoeGrouped>(&Anywhere),
             moe_lt_grouped: profile.on::<MoeLtGrouped>(&Anywhere),
-            moe_lt_select_from: profile.get::<MoeLtSelectFrom>().0,
             moe_lt_mlp_from: profile.get::<MoeLtMlpFrom>().0,
             moe_lt_tile_deep: profile.get::<MoeLtTileDeep>().0,
             moe_lt_tile_shallow: profile.get::<MoeLtTileShallow>().0,
             moe_lt_deep_k: profile.get::<MoeLtDeepK>().0,
             moe_ordered_from: profile.get::<MoeOrderedFrom>().0,
-            moe_bf16_order: profile.on::<MoeBf16Order>(&Anywhere),
-            moe_mxfp4_order: profile.on::<MoeMxfp4Order>(&Anywhere),
-            fp8_b32_order: profile.on::<Fp8B32Order>(&Anywhere),
             mxfp4_grouped: profile.on::<MoeMxfp4Grouped>(&Anywhere),
             mxfp4_wmma: profile.on::<MoeMxfp4Wmma>(&Anywhere),
-            decode_split_small: profile.on::<DecodeSplitSmall>(&Anywhere),
-            decode_split_window: profile.on::<DecodeSplitWindow>(&Anywhere),
-            decode_chunk_floor_128: profile.on::<DecodeChunkFloor128>(&Anywhere),
             decode_chunk_floor_tokens: profile.get::<DecodeChunkFloorTokens>().0,
-            gemv_narrow: *profile.get::<GemvBf16>() == GemvBf16::Narrow,
             gemv_splitk_max_n: profile.get::<GemvSplitkMaxN>().0,
-            mla_naive: *profile.get::<MlaPath>() == MlaPath::Naive,
             qmm_gemm_from: profile.get::<QmmGemmFrom>().0,
             qmm_long_rows: profile.get::<QmmLongRows>().0,
             qmm_split_warps_per_sm: profile.get::<QmmSplitWarpsPerSm>().0,

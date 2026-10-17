@@ -245,12 +245,6 @@ pub fn head_dim_instantiated(head_dim: u32) -> bool {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Toggles {
-    pub force_split_small: bool,
-
-    pub window_split: bool,
-
-    pub chunk_floor_128: bool,
-
     /// The fewest keys a split decode chunk carries; 0 takes 256.
     pub chunk_floor_tokens: u32,
 
@@ -263,9 +257,6 @@ impl Toggles {
     #[must_use]
     pub const fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            force_split_small: tuning.decode_split_small,
-            window_split: tuning.decode_split_window,
-            chunk_floor_128: tuning.decode_chunk_floor_128,
             chunk_floor_tokens: tuning.decode_chunk_floor_tokens,
             prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
             static_max_requests: tuning.decode_static_max_requests,
@@ -337,9 +328,8 @@ pub fn plan_decode(
     some_requests(OP, &shape)?;
     let window_left = window_left(OP, window)?;
 
-    let windowed_split = toggles.window_split && window_left >= 0;
-    let built = if !windowed_split
-        && sched_decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles)
+    let _ = window_left;
+    let built = if sched_decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles)
     {
         sched_decode::static_nonsplit(
             OP,
@@ -359,7 +349,6 @@ pub fn plan_decode(
             page_size: shape.page_size,
             head_dim: shape.head_dim,
             enable_cuda_graph,
-            chunk_floor_128: toggles.chunk_floor_128,
             chunk_floor_tokens: toggles.chunk_floor_tokens,
         };
         sched_decode::plan(
