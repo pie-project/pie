@@ -1813,6 +1813,10 @@ def main() -> int:
                     help="DeepSeek-V4.1: re-carve each Engram hash table to this "
                          "bucket base (the release hashes at 16,000,000; a "
                          "miniature at 20,000 keeps ~480k of 384M rows per table)")
+    ap.add_argument("--keep-fp8", action="store_true",
+                    help="DeepSeek-V4/V4.1: keep the fp8 planes as released, beside "
+                         "their `.scale` e8m0 exponents (the release format), rather "
+                         "than reading them out to bf16")
     ap.add_argument("--cache", default=None,
                     help="raw tensor cache dir (default: <out>/.srccache)")
     ap.add_argument("--keep-cache", action="store_true")
@@ -1898,7 +1902,8 @@ def main() -> int:
     outs = assign_rows(pairs, src, plan)
     checks = apply_ple_carve(outs, src, plan)
     src_names = apply_engram_carve(outs, src, plan, weight_map, src_names)
-    outs = mark_fp8_readout(outs, plan)
+    if not args.keep_fp8:
+        outs = mark_fp8_readout(outs, plan)
     raw_total = sum(src[n].nbytes for n in src_names)
     total = sum(src[n].keep_bytes for n in src_names)
     if total < raw_total:
