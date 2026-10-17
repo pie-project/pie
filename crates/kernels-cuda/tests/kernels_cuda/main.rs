@@ -43,6 +43,7 @@ mod the_sinusoid_embedding_matches_the_diffusers_formula;
 mod the_sparse_mla_lands_on_tcgen05;
 mod the_spatial_attention_answers_the_cpu_reference;
 mod the_spatial_attention_segments_by_frame;
+mod the_tcgen05_epilogues_land_quantized_rows;
 mod the_tcgen05_gemms_answer_the_dequantized_dot;
 mod the_voxel_reshapes_land_the_reference_ordering;
 mod the_word_gather_lands_each_run_where_its_table_says;

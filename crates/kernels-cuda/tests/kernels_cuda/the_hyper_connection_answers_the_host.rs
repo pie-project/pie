@@ -5,7 +5,7 @@
 //! 4096-wide streams, against the host: the projection's split walk, the
 //! gates' Sinkhorn walk, the fold, the per-head norm and the stream norm.
 
-use crate::common::attn_ref::{dot, landed, near, rmsnorm, ten, wide};
+use crate::common::attn_ref::{dot, landed, near, rmsnorm, ten, tuned, wide};
 use crate::common::{Gpu, Lcg, to_bf16};
 use dtype::Dtype::{Bf16, F32};
 use kernels_cuda::elemwise::{hc, norm};
@@ -185,4 +185,38 @@ fn the_fold_and_the_norms_answer_the_host() {
         1e-3,
         "the stream norm",
     );
+}
+
+/// B200's one-pass stream norm and projection on the tensor cores
+/// (`hc_tile`, `hc_mma`), a prefill's rows folding a thread a row.
+#[test]
+fn the_tensor_core_prenorm_projection_answers_the_host() {
+    let (rows, fan, eps) = (1024usize, M * H, 1e-6f32);
+    let mut lcg = Lcg::seeded(0x9e7);
+    let (x, x_bits) = bf16s(&mut lcg, rows * fan, 3.0);
+    let w: Vec<f32> = (0..MIX * fan).map(|_| lcg.unit() * 0.01).collect();
+    let mut gpu = Gpu::open();
+    let (x_at, w_at, m_at) = (gpu.up(&x_bits), gpu.up(&w), gpu.zeros(rows * MIX * 4));
+    let ctx = gpu
+        .ctx()
+        .with_tuning(tuned(|t| (t.hc_tile, t.hc_mma) = (true, true)));
+    let (x_t, w_t) = (ten(x_at, rows, fan, Bf16), ten(w_at, MIX, fan, F32));
+    let mixes = &mut ten(m_at, rows, MIX, F32);
+    let landed = hc::prenorm_project(&ctx, x_t, eps, w_t, M as u32, mixes);
+    assert!(
+        landed.expect("the projection fires"),
+        "a 16384-wide row is the tile's"
+    );
+    gpu.sync();
+    let want: Vec<f32> = x
+        .chunks(fan)
+        .flat_map(|r| {
+            let s = (r.iter().map(|v| v * v).sum::<f32>() / fan as f32 + eps)
+                .sqrt()
+                .recip();
+            w.chunks(fan).map(move |o| dot(r, o) * s)
+        })
+        .collect();
+    let got = gpu.down::<f32>(m_at, rows * MIX);
+    near(&got, &want, 2e-3, 1.0, "the tensor-core prenorm projection");
 }

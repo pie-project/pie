@@ -1,7 +1,7 @@
 #![cfg(feature = "cuda")]
 
-//! The paged attention launchers (`decode_lse`, FA2's `prefill_lse` and
-//! their sinked forms) against the host softmax, one case a route.
+//! The paged attention launchers (`decode_lse`, FA2's and tcgen05's
+//! `prefill_lse` and their sinked forms) against the host softmax, one case a route.
 
 use crate::common::attn_ref::{attend, col, landed, near, pool, ten, tuned};
 use crate::common::{Gpu, Lcg, from_bf16, host::upload_to};
@@ -143,9 +143,13 @@ fn check(
             let plan = p.expect("the prefill plans");
             plan.stage(&ctx).expect("the plan uploads");
             let (w, s) = (window, scale);
-            match sinked {
-                true => attn::prefill_lse_sink(&ctx, qt, &plan, &kvp, w, d, kvh, s, o, lse, sink_t),
-                false => attn::prefill_lse(&ctx, qt, &plan, &kvp, w, d, kvh, s, o, lse),
+            // The tcgen05 prefill lands no log-sum-exp: B200 reads it lse-less.
+            match (sinked, tuning.prefill_tc5) {
+                (_, true) => attn::prefill(&ctx, qt, &plan, &kvp, w, d, kvh, s, o),
+                (true, _) => {
+                    attn::prefill_lse_sink(&ctx, qt, &plan, &kvp, w, d, kvh, s, o, lse, sink_t)
+                }
+                (false, _) => attn::prefill_lse(&ctx, qt, &plan, &kvp, w, d, kvh, s, o, lse),
             }
         };
         fired.expect("the attention fires");
@@ -160,9 +164,11 @@ fn check(
     want_o[..ra * qw].fill(from_bf16(0x7f7f));
     want_o[rb * qw..].fill(from_bf16(0x7f7f));
     landed(&gpu, o_at, &want_o, 2e-2, 1.0, &what);
-    let got_lse: Vec<f32> = gpu.down(lse_at, rows * qh as usize);
-    let span = ra * qh as usize..rb * qh as usize;
-    near(&got_lse[span.clone()], &want_lse[span], 1e-2, 1.0, &what);
+    if !tuning.prefill_tc5 {
+        let got_lse: Vec<f32> = gpu.down(lse_at, rows * qh as usize);
+        let span = ra * qh as usize..rb * qh as usize;
+        near(&got_lse[span.clone()], &want_lse[span], 1e-2, 1.0, &what);
+    }
 }
 
 #[test]
@@ -189,6 +195,9 @@ fn the_paged_attention_answers_the_reference() {
         ([64, 8, 64], dec, w200, both, pre, read(true, true, 0, 0)),
         ([32, 4, 512], chunks, None, own, pre, fa2),
         ([8, 2, 128], chunks, w100, sunk, pre, fa2),
+        // B200's tcgen05 prefill: the 64-key kernel, and a sliding 256-wide head on the 128-key one.
+        ([32, 4, 128], chunks, None, rec, pre, tuned(|t| t.prefill_tc5 = true)),
+        ([16, 8, 256], chunks, w100, own, pre, tuned(|t| (t.prefill_tc5, t.prefill_wide_sliding) = (true, true))),
     ];
     for (heads, reqs, window, flags, lanes, tuning) in cases {
         check(heads, reqs, window, flags, lanes, tuning);
