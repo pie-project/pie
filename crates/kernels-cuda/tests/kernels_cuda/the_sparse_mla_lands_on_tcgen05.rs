@@ -861,9 +861,13 @@ fn glm_fp8_latent_rows_read_as_their_widened_bf16() {
 #[test]
 #[ignore = "pacing; run with --ignored --nocapture"]
 fn glm_decodes_a_short_context() {
+    let kv: usize = std::env::var("PIE_MLA_KV")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(768);
     for reqs in [1, 8, 64] {
-        let (_, bf16) = decode_short(reqs, 768, false, 200);
-        let (_, fp8) = decode_short(reqs, 768, true, 200);
-        eprintln!("| {reqs} rows, 768 keys | bf16 {bf16:.1} us | fp8 {fp8:.1} us |");
+        let (_, bf16) = decode_short(reqs, kv, false, 200);
+        let (_, fp8) = decode_short(reqs, kv, true, 200);
+        eprintln!("| {reqs} rows, {kv} keys | bf16 {bf16:.1} us | fp8 {fp8:.1} us |");
     }
 }

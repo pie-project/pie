@@ -163,6 +163,11 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
     u64* list_free = list_full + kLists;
     u32* tmem_slot = reinterpret_cast<u32*>(list_free + kLists);
     float* row_max = reinterpret_cast<float*>(tmem_slot + 4);  // [128]
+    // A unit's row, found once by the lists warp and read by the others: two
+    // in flight, each held until its eleven readers (the six issuers, the
+    // MMA warp, the four softmax warps) have taken it.
+    u64* row_full = reinterpret_cast<u64*>(row_max + 128);
+    u64* row_free = row_full + 2;
 
     const u32 warp = threadIdx.x / 32;
     const u32 lane = threadIdx.x % 32;
@@ -185,6 +190,10 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
         for (int s = 0; s < kLists; ++s) {
             bar_init(&list_full[s], 1);
             bar_init(&list_free[s], 129);
+        }
+        for (int s = 0; s < 2; ++s) {
+            bar_init(&row_full[s], 1);
+            bar_init(&row_free[s], kIssuers + 1 + 4);
         }
         bar_init_fence();
     }
@@ -210,17 +219,28 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
         const int r = u / splits;
         w.split = u % splits;
         w.row = base + r;
-        int lo = 0, hi = requests - 1;
-        while (lo < hi) {
-            const int mid = (lo + hi) >> 1;
-            if (r < static_cast<int>(p.qo_indptr[mid + 1])) hi = mid; else lo = mid + 1;
+        // The first request whose rows end past r, 32 requests a round with
+        // their loads in flight (a search's halvings are as many dependent
+        // loads, each a cold read at the pass's start); then its bounds,
+        // read together.
+        int req = requests - 1;
+        for (int b = 0; b < requests; b += 32) {
+            const int i = b + static_cast<int>(lane);
+            const bool past = i < requests && r < static_cast<int>(__ldg(&p.qo_indptr[i + 1]));
+            const unsigned m = __ballot_sync(0xffffffffu, past);
+            if (m != 0u) {
+                req = b + __ffs(m) - 1;
+                break;
+            }
         }
-        const int req = lo;
-        const int qo_lo = static_cast<int>(p.qo_indptr[req]);
-        const int fresh = static_cast<int>(p.qo_indptr[req + 1]) - qo_lo;
-        const int pages_first = static_cast<int>(p.page_indptr[req]);
-        const int num_pages = static_cast<int>(p.page_indptr[req + 1]) - pages_first;
-        const int kv_len = (num_pages - 1) * p.page + static_cast<int>(p.last_page_lens[req]);
+        const int qo_lo = static_cast<int>(__ldg(&p.qo_indptr[req]));
+        const int qo_hi = static_cast<int>(__ldg(&p.qo_indptr[req + 1]));
+        const int pages_first = static_cast<int>(__ldg(&p.page_indptr[req]));
+        const int pages_end = static_cast<int>(__ldg(&p.page_indptr[req + 1]));
+        const int last_len = static_cast<int>(__ldg(&p.last_page_lens[req]));
+        const int fresh = qo_hi - qo_lo;
+        const int num_pages = pages_end - pages_first;
+        const int kv_len = (num_pages - 1) * p.page + last_len;
         w.pos = kv_len - fresh + (r - qo_lo);
         // The last key the row sees: its own (causal), or the request's.
         w.last = p.causal ? w.pos : kv_len - 1;
@@ -258,11 +278,25 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
         }
         return w;
     };
+    Row* shared_rows = reinterpret_cast<Row*>(row_free + 2);
+    // Unit `n` of this block's walk (its `n`th), as the lists warp found it.
+    auto take_row = [&](int n) {
+        bar_wait(&row_full[n % 2], (n / 2) & 1);
+        const Row w = shared_rows[n % 2];
+        __syncwarp();
+        if (lane == 0) bar_arrive(&row_free[n % 2]);
+        return w;
+    };
 
     if (warp == 11) {
         int J = 0;
-        for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x)) {
+        int n = 0;
+        for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
+            if (n >= 2) bar_wait(&row_free[n % 2], ((n / 2) - 1) & 1);
             const Row w = row_at(r);
+            if (lane == 0) shared_rows[n % 2] = w;
+            __syncwarp();
+            if (lane == 0) bar_arrive(&row_full[n % 2]);
             for (int j = 0; j < w.nt; ++j, ++J) {
                 if (J >= kLists) bar_wait(&list_free[J % kLists], ((J / kLists) - 1) & 1);
                 u32* l = lists + (J % kLists) * kBK;
@@ -286,8 +320,9 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
         const int share = lead ? 0 : static_cast<int>(warp) - 5;
         constexpr int kOps = kFp8 ? 0 : 16 * 8 + (kRope > 0 ? 16 * 2 : 0);
         int J = 0;
-        for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x)) {
-            const Row w = row_at(r);
+        int n = 0;
+        for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
+            const Row w = take_row(n);
             for (int j = 0; j < w.nt; ++j, ++J) {
                 const int slot = J % kSlots;
                 const u32* l = lists + (J % kLists) * kBK;
@@ -448,7 +483,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
         };
         int J = 0, rr = 0;
         for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++rr) {
-            const Row w = row_at(r);
+            const Row w = take_row(rr);
             bar_wait(q_ready, rr & 1);
             if (rr > 0) bar_wait(o_free, (rr - 1) & 1);
             tc_fence_after();
@@ -523,10 +558,15 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
             bar_arrive(q_ready);
         };
         int J = 0;
-        for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x)) {
-            const Row w = row_at(r);
+        int n = 0;
+        // The first unit's Q goes in while the lists warp finds its row.
+        if (static_cast<int>(blockIdx.x) < live) {
+            load_q(base + static_cast<int>(blockIdx.x) / splits);
+        }
+        for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
+            const Row w = take_row(n);
             const int row = w.row;
-            if (r == static_cast<int>(blockIdx.x)) load_q(row);
+
             float m_used = neg_inf();
             float l = 0.f;
             for (int j = 0; j < w.nt; ++j, ++J) {
