@@ -422,9 +422,9 @@ pub fn rmsnorm_gated(
         "`{OP}` norms an f32 accumulator, or one landed in bf16"
     );
     let xin = if x.dtype == Dtype::Bf16 {
-        "bf16"
+        "::pie::bf16"
     } else {
-        "f32"
+        "float"
     };
     debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
     let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -461,7 +461,7 @@ pub fn rmsnorm_gated(
             Fire::at(
                 FILE,
                 symbol(&format!(
-                    "::pie::elemwise::rmsnorm_gated_{xin}_in_warp<{t}, {}>",
+                    "::pie::elemwise::rmsnorm_gated_in_warp<{xin}, {t}, {}>",
                     width / 32
                 )),
             )
@@ -484,7 +484,7 @@ pub fn rmsnorm_gated(
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::elemwise::rmsnorm_gated_{xin}_in<{t}, 256>"
+                "::pie::elemwise::rmsnorm_gated_in<{xin}, {t}, 256>"
             )),
         )
         .apply(launch),

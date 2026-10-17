@@ -413,12 +413,13 @@ pub fn attention_lse(
 
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_lse_paged").apply(
+        Fire::at(FILE, "::pie::attn::pool_lse_paged<false>").apply(
             Launch::grid([o.rows, num_q_heads.unsigned_abs(), 1], [ATTN_BLOCK, 1, 1]).smem(smem),
         ),
         &[
             q.arg(),
             entries.keys.arg(),
+            ArgValue::Ptr(0),
             o.arg(),
             lse.arg(),
             positions.arg(),
@@ -428,6 +429,7 @@ pub fn attention_lse(
             num_q_heads.arg(),
             head_dim.arg(),
             ratio.arg(),
+            0i32.arg(),
             entries.page_size.arg(),
             sm_scale.arg(),
             i32::from(compact(entries, ratio.unsigned_abs(), i64::from(head_dim))).arg(),
@@ -530,7 +532,7 @@ pub fn attention_lse_selected(
 
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_lse_selected_paged").apply(
+        Fire::at(FILE, "::pie::attn::pool_lse_paged<true>").apply(
             Launch::grid([o.rows, num_q_heads.unsigned_abs(), 1], [ATTN_BLOCK, 1, 1]).smem(smem),
         ),
         &[

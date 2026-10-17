@@ -169,10 +169,10 @@ pub fn project(
         && normed.ptr % 16 == 0
         && hc_fn.ptr % 16 == 0
     {
-        return project_tile(ctx, OP, normed, hc_fn, mixes, rows, fan, mix_hc);
+        return project_sliced(ctx, OP, normed, hc_fn, mixes, rows, fan, mix_hc, true);
     }
     if fan.is_multiple_of(4) && mix_hc <= 8 * PROJECT_COLS {
-        return project_split(ctx, OP, normed, hc_fn, mixes, rows, fan, mix_hc);
+        return project_sliced(ctx, OP, normed, hc_fn, mixes, rows, fan, mix_hc, false);
     }
     ctx.fire(
         OP,
@@ -1065,10 +1065,12 @@ pub fn pre(
     Ok(true)
 }
 
-/// `hc_project` on `hc_project_tile` (and `hc_project_fold` past one slice):
-/// a decode fire's few rows cut the row into slices across blocks.
+/// `hc_project` on `hc_project_tile` (`tile`) or `hc_project_split`, the
+/// row cut into slices across blocks for a decode's few rows, and
+/// `hc_project_fold` past one slice. At most 2048 partial rows: a region
+/// captured on its own holds its own partial slab.
 #[allow(clippy::too_many_arguments)]
-fn project_tile(
+fn project_sliced(
     ctx: &Ctx,
     op: &'static str,
     normed: Tensor,
@@ -1077,18 +1079,23 @@ fn project_tile(
     rows: u32,
     fan: u32,
     mix_hc: u32,
+    tile: bool,
 ) -> Result<(), Error> {
-    const SLICE_FLOOR: u32 = 512;
     const PARTIAL_ROWS: u32 = 2048;
     let want = 2 * ctx.multiprocessors().unwrap_or(132);
     let (br, kg, kt, stages) = (TILE_ROWS, TILE_GROUPS, TILE_K, TILE_STAGES);
-    let smem = stages * (br + TILE_COLS) * (kt + 4) * 4;
-    let row_blocks = rows.div_ceil(br);
+    let (block_rows, floor, most, step) = if tile {
+        (br, 512, u32::MAX, kt)
+    } else {
+        (PROJECT_ROWS, 256, 64, 4)
+    };
+    let row_blocks = rows.div_ceil(block_rows);
     let slices = want
         .div_ceil(row_blocks)
-        .clamp(1, (fan / SLICE_FLOOR).max(1))
+        .clamp(1, (fan / floor).max(1))
+        .min(most)
         .min((PARTIAL_ROWS / rows).max(1));
-    let slice = fan.div_ceil(slices).next_multiple_of(kt);
+    let slice = fan.div_ceil(slices).next_multiple_of(step);
     let slices = fan.div_ceil(slice);
     let out = if slices > 1 {
         ctx.scratch_shared(
@@ -1099,8 +1106,7 @@ fn project_tile(
     } else {
         mixes.ptr
     };
-    ctx.fire(
-        op,
+    let fire = if tile {
         Fire::at(
             FILE,
             symbol(&format!(
@@ -1108,81 +1114,21 @@ fn project_tile(
             )),
         )
         .apply(Launch {
-            smem,
+            smem: stages * (br + TILE_COLS) * (kt + 4) * 4,
             ..Launch::grid([row_blocks, slices, 1], [br * kg, 1, 1])
-        }),
-        &[
-            normed.arg(),
-            hc_fn.arg(),
-            crate::jit::ArgValue::Ptr(out),
-            stated(op, fan)?.arg(),
-            stated(op, mix_hc)?.arg(),
-            stated(op, rows)?.arg(),
-            stated(op, slice)?.arg(),
-            ctx.stage(),
-        ],
-    )?;
-    if slices == 1 {
-        return Ok(());
-    }
-    ctx.fire(
-        op,
-        Fire::at(FILE, "::pie::elemwise::hc_project_fold")
-            .apply(Launch::flat(rows * mix_hc, BLOCK)),
-        &[
-            crate::jit::ArgValue::Ptr(out),
-            mixes.arg(),
-            stated(op, mix_hc)?.arg(),
-            stated(op, rows)?.arg(),
-            stated(op, slices)?.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-/// `hc_project` on `hc_project_split` (and `hc_project_fold` past one slice).
-#[allow(clippy::too_many_arguments)]
-fn project_split(
-    ctx: &Ctx,
-    op: &'static str,
-    normed: Tensor,
-    hc_fn: Tensor,
-    mixes: &mut Tensor,
-    rows: u32,
-    fan: u32,
-    mix_hc: u32,
-) -> Result<(), Error> {
-    const SLICE_FLOOR: u32 = 256;
-    let row_blocks = rows.div_ceil(PROJECT_ROWS);
-    let want = 2 * ctx.multiprocessors().unwrap_or(132);
-    // At most 2048 partial rows: a region captured on its own holds its own
-    // partial slab.
-    const PARTIAL_ROWS: u32 = 2048;
-    let slices = want
-        .div_ceil(row_blocks)
-        .clamp(1, (fan / SLICE_FLOOR).max(1))
-        .min(64)
-        .min((PARTIAL_ROWS / rows).max(1));
-    let slice = fan.div_ceil(slices).next_multiple_of(4);
-    let slices = fan.div_ceil(slice);
-    let out = if slices > 1 {
-        ctx.scratch_shared(
-            op,
-            "elementwise.hc_project_partial",
-            (slices * rows * mix_hc) as usize * core::mem::size_of::<f32>(),
-        )? as usize as u64
+        })
     } else {
-        mixes.ptr
-    };
-    ctx.fire(
-        op,
         Fire::at(
             FILE,
             symbol(&format!(
                 "::pie::elemwise::hc_project_split<{PROJECT_ROWS}, {PROJECT_COLS}>"
             )),
         )
-        .apply(Launch::grid([row_blocks, slices, 1], [BLOCK, 1, 1])),
+        .apply(Launch::grid([row_blocks, slices, 1], [BLOCK, 1, 1]))
+    };
+    ctx.fire(
+        op,
+        fire,
         &[
             normed.arg(),
             hc_fn.arg(),

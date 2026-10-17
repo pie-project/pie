@@ -1,6 +1,6 @@
 #pragma once
 
-// `pool_lse_paged` and `pool_lse_selected_paged` on tensor cores. Every query
+// `pool_lse_paged` (both forms) on tensor cores. Every query
 // head of a row reads the same compressed rows (one latent, its own key and
 // value), so a block serves one row's 16 heads (an mma's M) and walks the
 // row's compressed rows 16 at a time: gathered once into shared memory, then
