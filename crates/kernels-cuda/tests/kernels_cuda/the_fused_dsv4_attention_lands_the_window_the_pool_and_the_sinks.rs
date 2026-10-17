@@ -495,24 +495,6 @@ fn the_fused_dsv4_attention_lands_the_window_the_pool_and_the_sinks() {
         check(64, Pool::None, false, fp8, true);
     }
 }
-
-/// The fused launch's device time at DeepSeek-V4-Flash's decode widths.
-#[test]
-#[ignore = "a timing report"]
-fn the_fused_dsv4_attention_reports_its_time() {
-    for rows in [1, 8, 32, 64, 128] {
-        for fp8 in [
-            None,
-            Some((Rows::Ds, Rows::Ds)),
-            Some((Rows::Mx8, Rows::Nv4)),
-        ] {
-            check(rows, Pool::Selected(4, 512), true, fp8, false);
-            check(rows, Pool::Dense(128), true, fp8, false);
-            check(rows, Pool::None, true, fp8, false);
-        }
-    }
-}
-
 /// An e4m3 code's value.
 fn e4m3(code: u8) -> f32 {
     let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };

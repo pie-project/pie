@@ -127,56 +127,6 @@ fn the_norm_and_tail_rotation_land_in_one_pass() {
         }
     }
 }
-
-/// DeepSeek-V4's q norm and rotation at a prefill's and a decode's rows,
-/// the one pass against the two launches.
-#[test]
-#[ignore = "pacing; run with --ignored --nocapture"]
-fn the_norm_and_tail_rotation_pace_deepseeks_q() {
-    let width = 64 * 512u32;
-    let mut gpu = Gpu::open();
-    let most = 8192usize;
-    let x = gpu.zeros(most * width as usize * 2);
-    let y = gpu.zeros(most * width as usize * 2);
-    let positions: Vec<i32> = (0..most as i32).collect();
-    let positions = gpu.up(&positions);
-    for rows in [8u32, 64, 8192] {
-        for vec in [false, true] {
-            let ctx = gpu.ctx().with_tuning(Tuning {
-                rows_vec: vec,
-                ..Tuning::DEFAULT
-            });
-            let fire = || {
-                rope::norm_rope_last(
-                    &ctx,
-                    Tensor::new(x, rows, width, Dtype::Bf16),
-                    None,
-                    512,
-                    1e-6,
-                    Tensor::new(positions, rows, 1, Dtype::I32),
-                    64,
-                    10000.0,
-                    true,
-                    false,
-                    None,
-                    &mut Tensor::new(y, rows, width, Dtype::Bf16),
-                )
-                .unwrap();
-            };
-            fire();
-            gpu.sync();
-            let iters = 200;
-            let t0 = std::time::Instant::now();
-            for _ in 0..iters {
-                fire();
-            }
-            gpu.sync();
-            let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
-            eprintln!("| rows {rows:5} | one pass {vec:5} | {us:7.1} us |");
-        }
-    }
-}
-
 /// An e4m3 code's value.
 fn e4m3(code: u8) -> f32 {
     let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };

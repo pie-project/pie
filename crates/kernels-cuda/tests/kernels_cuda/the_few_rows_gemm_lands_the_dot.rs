@@ -11,7 +11,6 @@
 
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use kernels_cuda::linear::gemm_rows_bf16;
-use std::time::Instant;
 
 fn lands(m: usize, n: usize, k: usize, with_bias: bool) {
     let mut gpu = Gpu::open();
@@ -60,62 +59,4 @@ fn the_few_rows_gemm_lands_the_dot() {
     lands(5, 300, 1032, false);
     lands(3, 7, 64, true);
     lands(8, 2048, 256, false);
-}
-
-#[test]
-#[ignore = "a measurement: run alone, on an idle GPU"]
-fn the_few_rows_gemm_paces_dsv4() {
-    use kernels_cuda::linear::gemm::matmul;
-    use kernels_cuda::tensor::Tensor;
-    let mut gpu = Gpu::open();
-    println!("| m | n | k | cuBLAS (tuned) us | few rows us |");
-    println!("|---|---|---|---|---|");
-    for (m, n, k) in [
-        (8usize, 512usize, 4096usize),
-        (8, 256, 4096),
-        (8, 64, 4096),
-        (8, 1024, 4096),
-        (2, 512, 4096),
-        (4, 512, 4096),
-    ] {
-        // Planes past the L2, cycled, so each fire reads its weight cold.
-        let copies = (256 << 20) / (n * k * 2) + 1;
-        let mut rng = Lcg::seeded(0x5e7 + n as u64);
-        let (w_raw, _) = rng.row(n * k);
-        let ws: Vec<u64> = (0..copies).map(|_| gpu.up(&w_raw)).collect();
-        let (a_raw, _) = rng.row(m * k);
-        let a_at = gpu.up(&a_raw);
-        let y_at = gpu.zeros(m * n * 2);
-        let ctx = gpu.ctx();
-        let time = |f: &dyn Fn(usize)| {
-            const REPS: usize = 400;
-            (0..32).for_each(&f);
-            gpu.sync();
-            let t0 = Instant::now();
-            (0..REPS).for_each(&f);
-            gpu.sync();
-            t0.elapsed().as_secs_f64() * 1e6 / REPS as f64
-        };
-        let cublas = time(&|i| {
-            let act = Tensor::new(a_at, m as u32, k as u32, dtype::Dtype::Bf16);
-            let w = Tensor::new(ws[i % ws.len()], n as u32, k as u32, dtype::Dtype::Bf16);
-            let mut y = Tensor::new(y_at, m as u32, n as u32, dtype::Dtype::Bf16);
-            matmul(&ctx, act, w, &mut y).expect("cuBLAS fires");
-        });
-        let rows = time(&|i| {
-            gemm_rows_bf16(
-                &ctx,
-                ws[i % ws.len()],
-                a_at,
-                0,
-                y_at,
-                m as i32,
-                n as i32,
-                k as i32,
-                false,
-            )
-            .expect("the few-rows GEMM fires");
-        });
-        println!("| {m} | {n} | {k} | {cublas:.1} | {rows:.1} |");
-    }
 }

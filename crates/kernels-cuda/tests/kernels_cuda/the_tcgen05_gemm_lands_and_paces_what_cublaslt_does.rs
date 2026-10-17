@@ -16,15 +16,7 @@ use core::ffi::c_void;
 use crate::common::Gpu;
 use kernels_cuda::cudarc::cublaslt::sys as lt;
 use kernels_cuda::cudarc::runtime::sys as rt;
-use kernels_cuda::linear::tc5::{
-    Elem, Epilogue, Glu, Operand, Plan, atom_bytes, gemm, gemm_epi, gemm_epi_with, supported,
-};
-
-pub(crate) const FLUSH: usize = 512 << 20;
-const ROUNDS: usize = 7;
-pub(crate) const BATCH: usize = 16;
-/// Weight copies a batch cycles through cover at least this many bytes.
-pub(crate) const COLD: usize = 384 << 20;
+use kernels_cuda::linear::tc5::{Elem, Operand, atom_bytes, gemm, supported};
 
 fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -43,48 +35,6 @@ pub(crate) fn noise(bytes: usize, mask: u8, base: u8, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-pub(crate) struct Timer {
-    pub(crate) flush: u64,
-    pub(crate) stream: rt::cudaStream_t,
-}
-
-impl Timer {
-    /// The median over `ROUNDS` of the mean microseconds a launch takes in a
-    /// back-to-back batch of `BATCH`, launch `i` reading weight copy `i`.
-    pub(crate) fn median(&self, mut launch: impl FnMut(usize)) -> f64 {
-        launch(0);
-        let mut times = Vec::with_capacity(ROUNDS);
-        unsafe {
-            let (mut start, mut stop): (rt::cudaEvent_t, rt::cudaEvent_t) =
-                (core::ptr::null_mut(), core::ptr::null_mut());
-            rt::cudaEventCreate(&raw mut start);
-            rt::cudaEventCreate(&raw mut stop);
-            for _ in 0..ROUNDS {
-                rt::cudaMemsetAsync(self.flush as *mut c_void, 0, FLUSH, self.stream);
-                rt::cudaEventRecord(start, self.stream);
-                for i in 0..BATCH {
-                    launch(i);
-                }
-                rt::cudaEventRecord(stop, self.stream);
-                rt::cudaEventSynchronize(stop);
-                let mut ms = 0f32;
-                rt::cudaEventElapsedTime(&raw mut ms, start, stop);
-                times.push(f64::from(ms) * 1e3 / BATCH as f64);
-            }
-            rt::cudaEventDestroy(start);
-            rt::cudaEventDestroy(stop);
-        }
-        times.sort_by(f64::total_cmp);
-        times[ROUNDS / 2]
-    }
-}
-
-/// Copies of one weight, enough to cover `COLD` bytes (at most `BATCH`).
-fn copies(gpu: &mut Gpu, bytes: &[u8]) -> Vec<u64> {
-    let count = COLD.div_ceil(bytes.len().max(1)).clamp(1, BATCH);
-    (0..count).map(|_| gpu.up(bytes)).collect()
-}
-
 /// One cuBLASLt matmul, `D[m][n] = act . w^T` in bf16, planned once.
 struct Lt {
     handle: lt::cublasLtHandle_t,
@@ -98,7 +48,6 @@ struct Lt {
 
 #[derive(Clone, Copy)]
 enum LtKind {
-    Bf16,
     /// fp8 e4m3 with ue8m0 a 32 (MXFP8).
     Mxfp8,
     /// e2m1 with ue4m3 a 16.
@@ -148,7 +97,6 @@ impl Lt {
             set(A::CUBLASLT_MATMUL_DESC_TRANSA, (&raw const t).cast(), 4)?;
             set(A::CUBLASLT_MATMUL_DESC_TRANSB, (&raw const nn).cast(), 4)?;
             let (ty, mode) = match kind {
-                LtKind::Bf16 => (D::CUDA_R_16BF, None),
                 LtKind::Mxfp8 => (
                     D::CUDA_R_8F_E4M3,
                     Some(lt::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0),
@@ -343,267 +291,6 @@ fn the_block_scaled_kinds_land_what_cublaslt_lands_from_the_same_scales() {
                 exact += usize::from(o == t);
             }
             eprintln!("{m}x{n}x{k}: {exact} of {} bit-equal to cuBLASLt", m * n);
-        }
-    }
-}
-
-fn tflops(m: usize, n: usize, k: usize, us: f64) -> f64 {
-    2.0 * (m * n * k) as f64 / us * 1e-6
-}
-
-#[test]
-#[ignore = "a measurement: run alone, on an idle GPU"]
-fn the_tcgen05_gemm_reports_its_rate_beside_cublaslt() {
-    if !supported() {
-        eprintln!("skipped: no tcgen05 on this device");
-        return;
-    }
-    let mut gpu = Gpu::open();
-    // `PIE_TC5_TICKETS=1` sums a split tile in its last split
-    // (`kernel.gemm.tc5_split_tickets`), no finalize launch.
-    let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
-        gemm_tc5_split_tickets: if std::env::var("PIE_TC5_TICKETS").is_ok_and(|v| v == "1") {
-            65_536
-        } else {
-            0
-        },
-        ..kernels_cuda::tuning::Tuning::DEFAULT
-    });
-    let stream: rt::cudaStream_t = ctx.stream().cast();
-    let timer = Timer {
-        flush: gpu.zeros(FLUSH),
-        stream,
-    };
-    let ws_bytes = 64 << 20;
-    let ws = gpu.zeros(ws_bytes);
-
-    println!(
-        "| M | N | K | cuBLASLt bf16 | tc5 bf16 | cuBLASLt mxfp8 | tc5 fp8 per-tensor | tc5 fp8 1x128 ue8m0 | tc5 fp8 mx32 | cuBLASLt nvfp4 | tc5 nvfp4 | tc5 w4a8 |"
-    );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
-    // `PIE_TC5_SHAPE=m,n,k` measures that shape alone.
-    let only: Option<Vec<usize>> = std::env::var("PIE_TC5_SHAPE")
-        .ok()
-        .map(|v| v.split(',').filter_map(|d| d.trim().parse().ok()).collect());
-    let shapes = match &only {
-        Some(s) if s.len() == 3 => vec![(s[1], s[2])],
-        _ => vec![(4096, 4096), (7168, 2048), (2048, 7168), (14336, 4096)],
-    };
-    for (n, k) in shapes {
-        let w16 = copies(&mut gpu, &noise(n * k * 2, 0xbf, 0x00, 1));
-        let w8 = copies(&mut gpu, &noise(n * k, 0xb7, 0x00, 2));
-        let w4 = copies(&mut gpu, &noise(n * k / 2, 0xff, 0x00, 3));
-        let sw128 = gpu.up(&noise(atom_bytes(n, k, 128), 0x03, 0x7c, 4));
-        let sw32 = gpu.up(&noise(atom_bytes(n, k, 32), 0x03, 0x7c, 5));
-        let sw16 = gpu.up(&noise(atom_bytes(n, k, 16), 0x07, 0x30, 6));
-        let ms = match &only {
-            Some(s) if s.len() == 3 => vec![s[0]],
-            _ => vec![1usize, 16, 128, 1024, 8192],
-        };
-        for m in ms {
-            let a16 = gpu.up(&noise(m * k * 2, 0xbf, 0x00, 7));
-            let a8 = gpu.up(&noise(m * k, 0xb7, 0x00, 8));
-            let a4 = gpu.up(&noise(m * k / 2, 0xff, 0x00, 9));
-            let sa128 = gpu.up(&noise(atom_bytes(m, k, 128), 0x03, 0x7c, 10));
-            let sa32 = gpu.up(&noise(atom_bytes(m, k, 32), 0x03, 0x7c, 11));
-            let sa16 = gpu.up(&noise(atom_bytes(m, k, 16), 0x07, 0x30, 12));
-            let y = gpu.zeros(m * n * 2);
-            let shape = [m as u32, n as u32, k as u32];
-
-            let lt_rate = |kind: LtKind, w: &[u64], a: u64, sw: u64, sa: u64| -> String {
-                match unsafe { Lt::plan(kind, [m, n, k], sw, sa, ws, ws_bytes) } {
-                    Ok(plan) => {
-                        let us = timer.median(|i| plan.run(w[i % w.len()], a, y, stream));
-                        format!("{:.0} ({us:.1}us)", tflops(m, n, k, us))
-                    }
-                    Err(why) => format!("n/a: {why}"),
-                }
-            };
-            let tc_rate = |a: Operand, w: Operand, ptrs: &[u64]| -> String {
-                let at = |i: usize| Operand {
-                    ptr: ptrs[i % ptrs.len()],
-                    ..w
-                };
-                // `PIE_TC5_RATE_PLAN=swap,pair,bn,stages,splits` states the plan.
-                let stated = std::env::var("PIE_TC5_RATE_PLAN").ok().map(|v| {
-                    let d: Vec<u32> = v.split(',').filter_map(|d| d.trim().parse().ok()).collect();
-                    kernels_cuda::linear::tc5::Plan {
-                        swap: d[0] == 1,
-                        pair: d[1] == 1,
-                        bn: d[2],
-                        stages: d[3],
-                        splits: d[4],
-                    }
-                });
-                let fire = |w: Operand| match stated {
-                    Some(plan) => {
-                        kernels_cuda::linear::tc5::gemm_with(&ctx, a, w, y, shape, 1.0, plan)
-                    }
-                    None => gemm(&ctx, a, w, y, shape, 1.0),
-                };
-                match fire(at(0)) {
-                    Ok(()) => {
-                        let us = timer.median(|i| {
-                            fire(at(i)).expect("fires again");
-                        });
-                        format!("{:.0} ({us:.1}us)", tflops(m, n, k, us))
-                    }
-                    Err(why) => format!("n/a: {why}"),
-                }
-            };
-            let row = [
-                lt_rate(LtKind::Bf16, &w16, a16, 0, 0),
-                tc_rate(
-                    Operand::plain(a16, Elem::Bf16),
-                    Operand::plain(0, Elem::Bf16),
-                    &w16,
-                ),
-                lt_rate(LtKind::Mxfp8, &w8, a8, sw32, sa32),
-                tc_rate(
-                    Operand::plain(a8, Elem::E4m3),
-                    Operand::plain(0, Elem::E4m3),
-                    &w8,
-                ),
-                tc_rate(
-                    Operand::scaled(a8, Elem::E4m3, sa128, 128),
-                    Operand::scaled(0, Elem::E4m3, sw128, 128),
-                    &w8,
-                ),
-                tc_rate(
-                    Operand::scaled(a8, Elem::E4m3, sa32, 32),
-                    Operand::scaled(0, Elem::E4m3, sw32, 32),
-                    &w8,
-                ),
-                lt_rate(LtKind::Nvfp4, &w4, a4, sw16, sa16),
-                tc_rate(
-                    Operand::scaled(a4, Elem::E2m1, sa16, 16),
-                    Operand::scaled(0, Elem::E2m1, sw16, 16),
-                    &w4,
-                ),
-                tc_rate(
-                    Operand::scaled(a8, Elem::E4m3, sa128, 128),
-                    Operand::scaled(0, Elem::E2m1, sw32, 32),
-                    &w4,
-                ),
-            ];
-            println!("| {m} | {n} | {k} | {} |", row.join(" | "));
-        }
-    }
-}
-
-/// The power a sustained bf16 GEMM draws, cuBLASLt's beside tc5's: each
-/// runs back to back for three seconds at a shape, its phase's wall-clock
-/// bounds printed (`PHASE name m n k start_ms end_ms launches TFLOPS`, Unix
-/// milliseconds) for a power sampler running beside it to cut at. Shapes
-/// default to Gemma-4-31B's prefill GEMMs over a 16384-row fire;
-/// `PIE_POWER_SHAPES=m,n,k;m,n,k` names others, `PIE_POWER_PLAN=pair,bn,stages`
-/// states tc5's plan, and `PIE_POWER_GLU=1` runs tc5 with the GEGLU epilogue
-/// (half of `n` landing), as a dense gate-up projection does.
-#[test]
-#[ignore = "a measurement: run alone, on an idle GPU, beside a power sampler"]
-fn the_bf16_gemm_reports_its_power_beside_cublaslt() {
-    if !supported() {
-        eprintln!("skipped: no tcgen05 on this device");
-        return;
-    }
-    let mut gpu = Gpu::open();
-    // `PIE_POWER_RASTER` states tc5's raster band.
-    let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
-        gemm_tc5_raster: std::env::var("PIE_POWER_RASTER")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8),
-        ..kernels_cuda::tuning::Tuning::DEFAULT
-    });
-    let stream: rt::cudaStream_t = ctx.stream().cast();
-    let ws_bytes = 64 << 20;
-    let ws = gpu.zeros(ws_bytes);
-    let shapes: Vec<[usize; 3]> = std::env::var("PIE_POWER_SHAPES")
-        .ok()
-        .map(|v| {
-            v.split(';')
-                .map(|s| {
-                    let d: Vec<usize> =
-                        s.split(',').filter_map(|d| d.trim().parse().ok()).collect();
-                    [d[0], d[1], d[2]]
-                })
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            vec![
-                [16384, 43008, 5376],
-                [16384, 5376, 21504],
-                [16384, 16384, 5376],
-            ]
-        });
-    let now_ms = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis())
-    };
-    for [m, n, k] in shapes {
-        let w = gpu.up(&noise(n * k * 2, 0xbf, 0x00, 1));
-        let a = gpu.up(&noise(m * k * 2, 0xbf, 0x00, 7));
-        let y = gpu.zeros(m * n * 2);
-        let shape = [m as u32, n as u32, k as u32];
-        let lt_plan = unsafe { Lt::plan(LtKind::Bf16, [m, n, k], 0, 0, ws, ws_bytes) }
-            .expect("cuBLASLt plans the shape");
-        let glu = std::env::var("PIE_POWER_GLU").is_ok_and(|v| v == "1");
-        let plan = std::env::var("PIE_POWER_PLAN").ok().map(|v| {
-            let d: Vec<u32> = v.split(',').filter_map(|d| d.trim().parse().ok()).collect();
-            Plan {
-                swap: false,
-                pair: d[0] == 1,
-                bn: d[1],
-                stages: d[2],
-                splits: 0,
-            }
-        });
-        let mut tc5 = || {
-            let epi = if glu {
-                Epilogue {
-                    glu: Some(Glu::GegluTanh),
-                    ..Epilogue::STORE
-                }
-            } else {
-                Epilogue::STORE
-            };
-            let out = if glu {
-                [shape[0], shape[1] / 2, shape[2]]
-            } else {
-                shape
-            };
-            let (act, wt) = (Operand::plain(a, Elem::Bf16), Operand::plain(w, Elem::Bf16));
-            match plan {
-                Some(plan) => gemm_epi_with(&ctx, act, wt, y, out, 1.0, epi, plan),
-                None => gemm_epi(&ctx, act, wt, y, out, 1.0, epi),
-            }
-            .expect("the tc5 GEMM fires");
-        };
-        let mut lt = || lt_plan.run(w, a, y, stream);
-        for (name, launch) in [
-            ("cublaslt", &mut lt as &mut dyn FnMut()),
-            ("tc5", &mut tc5 as &mut dyn FnMut()),
-        ] {
-            launch();
-            gpu.sync();
-            let start = now_ms();
-            let t0 = std::time::Instant::now();
-            let mut launches = 0usize;
-            while t0.elapsed().as_secs_f64() < 3.0 {
-                for _ in 0..8 {
-                    launch();
-                }
-                launches += 8;
-                gpu.sync();
-            }
-            let secs = t0.elapsed().as_secs_f64();
-            let end = now_ms();
-            println!(
-                "PHASE {name} {m} {n} {k} {start} {end} {launches} {:.0}",
-                2.0 * (m * n * k) as f64 * launches as f64 / secs * 1e-12
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1500));
         }
     }
 }

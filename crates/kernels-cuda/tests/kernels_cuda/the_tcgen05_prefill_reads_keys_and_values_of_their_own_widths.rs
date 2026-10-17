@@ -156,30 +156,3 @@ fn the_tcgen05_prefill_reads_keys_and_values_of_their_own_widths() {
     // GLM-5.3's expanded heads: 256 over 256, 64-key tiles.
     reads(&[(129, 129), (40, 200), (7, 7)], 2, 256, 256);
 }
-
-/// A Kimi-K3 MLA layer's expanded prefill: 32 x 4096 rows, 96 heads.
-#[test]
-#[ignore = "timing fixture: run by hand under the GPU lock"]
-fn the_tcgen05_prefill_paces_an_expanded_latent_layer() {
-    let lens = vec![(4096usize, 4096usize); 32];
-    let mut gpu = Gpu::open();
-    if !planes_take(192, 128) {
-        return;
-    }
-    let f = fixture(&mut gpu, &lens, 96, 192, 128, false);
-    let ctx = gpu.ctx();
-    prefill_planes(&ctx, "test.prefill_planes", &f.planes).expect("the prefill fires");
-    gpu.sync();
-    let n = 5;
-    let t = std::time::Instant::now();
-    for _ in 0..n {
-        prefill_planes(&ctx, "test.prefill_planes", &f.planes).expect("the prefill fires");
-    }
-    gpu.sync();
-    let ms = t.elapsed().as_secs_f64() * 1e3 / f64::from(n);
-    let flops = 2.0 * 32.0 * 96.0 * (4096.0 * 4096.0 / 2.0) * 320.0;
-    eprintln!(
-        "PACE 32 x 4096, 96 heads, 192 / 128: {ms:.2} ms, {:.0} TFLOPS",
-        flops / ms / 1e9
-    );
-}
