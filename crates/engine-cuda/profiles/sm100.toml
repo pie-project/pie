@@ -21,6 +21,12 @@ mla.expanded_from = 256
 # activations, its codes streamed once: GLM-5.3's FP8 projections at bs1
 # spent 710 us a step in the tcgen05 GEMM and 128 us quantizing for it.
 gemm.fp8_gemv_until = 4
+# A block-FP8 projection at 2 to 8 rows on the mma.sync fp8 kernel, its
+# rows quantized in the same launch, where it leads the GEMV and the
+# tcgen05 GEMM (moe::dense_fp8_shape): DeepSeek-V4-Flash's shared gate-up
+# at 8 rows 12.9 -> 10.0 us, its shared down 11.4 -> 6.7, index q up 10.2
+# -> 5.9.
+gemm.fp8_mma_gemv_until = 8
 # DeepSeek-V4's compressed-pool attention on mma.sync, a block a row's 16
 # heads, rather than the scalar walk a block a row and head.
 sdpa.pool_mma = true

@@ -167,6 +167,13 @@ pub struct MlaExpandedFrom(pub u32);
 #[decision(id = "kernel.gemm.fp8_gemv_until", constant(range(0..=64)), default = 0, tune = search)]
 pub struct GemmFp8GemvUntil(pub u32);
 
+/// The most rows a dense fp8b128 projection runs on the mma.sync fp8
+/// kernel (`moe::dense_fp8_shape` says where it leads, in which CTA
+/// shape), its rows quantized in the same launch. 0: never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.fp8_mma_gemv_until", constant(range(0..=8)), default = 0, tune = search)]
+pub struct GemmFp8MmaGemvUntil(pub u32);
+
 /// Whether AttnRes's blend and the RMS norm of its row run as one pass
 /// (`res_blend_norm`, 512 threads a row, the row in registers). Off but
 /// where a chip's profile turns it on (B200's).
@@ -601,6 +608,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeW4a8FusedFrom>()
         .add::<MlaExpandedFrom>()
         .add::<GemmFp8GemvUntil>()
+        .add::<GemmFp8MmaGemvUntil>()
         .add::<AttnResFusedNorm>()
         .add::<SsmKdaChunked>()
         .add::<SsmKdaStepFused>()
@@ -686,6 +694,7 @@ pub struct Tuning {
     pub moe_w4a8_fused_from: u32,
     pub mla_expanded_from: u32,
     pub gemm_fp8_gemv_until: u32,
+    pub gemm_fp8_mma_gemv_until: u32,
     pub attn_res_fused_norm: bool,
     pub ssm_kda_chunked: bool,
     pub ssm_kda_step_fused: bool,
@@ -769,6 +778,7 @@ impl Tuning {
         moe_w4a8_fused_from: 65_536,
         mla_expanded_from: 65_536,
         gemm_fp8_gemv_until: 0,
+        gemm_fp8_mma_gemv_until: 0,
         attn_res_fused_norm: false,
         ssm_kda_chunked: false,
         ssm_kda_step_fused: false,
@@ -852,6 +862,7 @@ impl Tuning {
             moe_w4a8_fused_from: profile.get::<MoeW4a8FusedFrom>().0,
             mla_expanded_from: profile.get::<MlaExpandedFrom>().0,
             gemm_fp8_gemv_until: profile.get::<GemmFp8GemvUntil>().0,
+            gemm_fp8_mma_gemv_until: profile.get::<GemmFp8MmaGemvUntil>().0,
             attn_res_fused_norm: profile.on::<AttnResFusedNorm>(&Anywhere),
             ssm_kda_chunked: profile.on::<SsmKdaChunked>(&Anywhere),
             ssm_kda_step_fused: profile.on::<SsmKdaStepFused>(&Anywhere),

@@ -2736,13 +2736,80 @@ pub fn matmul_grouped_fp8(
     y: &mut Tensor,
     groups: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.matmul_grouped";
     // Four 16-row tiles a CTA (the rows quantized once for 64 rows of the
     // plane), K in quarters a tile, two steps of codes in flight a warp: at
     // DeepSeek-V4-Flash's planes 9.9 / 11.3 / 13.1 us at 1 / 4 / 8 rows past
     // L2, where cuBLAS's bf16 takes 13.7 / 13.7 / 13.4 (two tiles: 9.8 /
     // 12.4 / 16.4; eight: 21 and up; K in eighths: 14 and up).
-    let (tiles, split, depth) = (4u32, 4u32, 2u32);
+    matmul_grouped_fp8_with(ctx, x, codes, scales, y, groups, Fp8Shape::GROUPED)
+}
+
+/// How [`matmul_grouped_fp8_with`] lays a plane's rows and K over a CTA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fp8Shape {
+    /// 16-row tiles of the plane a CTA.
+    pub tiles: u32,
+    /// Warps a tile, each a share of K (`k` whole `128 split`s).
+    pub split: u32,
+    /// 128-wide steps of codes in flight a warp.
+    pub depth: u32,
+}
+
+impl Fp8Shape {
+    /// DeepSeek-V4's grouped output projection's.
+    pub const GROUPED: Fp8Shape = Fp8Shape {
+        tiles: 4,
+        split: 4,
+        depth: 2,
+    };
+}
+
+/// The CTA shape a dense fp8b128 projection (`n x k`) at `rows` decode
+/// rows runs [`matmul_grouped_fp8_with`] in, where it leads both the
+/// tcgen05 GEMM and `act_quant::fp8_block_gemv`; `None` where one of those
+/// does. Read off DeepSeek-V4-Flash's seven projections past L2 at 1, 4 and
+/// 8 rows (`the_dense_fp8_projections_pace`): at one row, and at up to 4
+/// rows of a narrow plane (`n` 1024 and under), the GEMV leads or ties; a
+/// 32 MiB plane past 4 rows keeps the GEMM.
+#[must_use]
+pub fn dense_fp8_shape(rows: u32, n: u32, k: u32) -> Option<Fp8Shape> {
+    let big = u64::from(n) * u64::from(k) >= 32 << 20;
+    let shape = |tiles, split, depth| Fp8Shape {
+        tiles,
+        split,
+        depth,
+    };
+    let picked = match rows {
+        0 | 1 => return None,
+        2..=4 if n <= 1024 => return None,
+        2..=4 if big && n >= 16384 => shape(2, 4, 2),
+        _ if rows > GROUPED_FP8_ROWS => return None,
+        5.. if big => return None,
+        _ if n >= 8192 => shape(4, 4, 2),
+        5.. if n <= 1024 => shape(1, 8, 4),
+        _ => shape(2, 8, 2),
+    };
+    (k.is_multiple_of(128 * picked.split) && n.is_multiple_of(16 * picked.tiles)).then_some(picked)
+}
+
+/// [`matmul_grouped_fp8`] in the CTA shape `shape` (`k` whole `128
+/// shape.split`s, `n` whole `16 shape.tiles`s).
+#[cfg(feature = "cuda")]
+pub fn matmul_grouped_fp8_with(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: u64,
+    scales: u64,
+    y: &mut Tensor,
+    groups: u32,
+    shape: Fp8Shape,
+) -> Result<(), Error> {
+    const OP: &str = "linear.matmul_grouped";
+    let Fp8Shape {
+        tiles,
+        split,
+        depth,
+    } = shape;
     if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
         return Err(refuse(OP, "the fp8 grouped leg reads and lands bf16 rows"));
     }
@@ -2759,8 +2826,10 @@ pub fn matmul_grouped_fp8(
         return Err(refuse(
             OP,
             format!(
-                "the fp8 grouped leg takes K in whole 512s, N in whole 64s and at most \
+                "the fp8 grouped leg takes K in whole {}s, N in whole {}s and at most \
                  {GROUPED_FP8_ROWS} rows, not {} rows of [{n}, {k}]",
+                128 * split,
+                16 * tiles,
                 y.rows
             ),
         ));

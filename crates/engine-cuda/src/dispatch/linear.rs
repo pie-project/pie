@@ -1667,11 +1667,28 @@ impl Run<'_> {
             gran: 128,
             laid: true,
         };
-        // A decode's few rows: a GEMV over the activations as they are,
-        // where the profile says (`kernel.gemm.fp8_gemv_until`).
-        if self.held_e4m3(act_id, &act).is_none()
-            && act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)?
+        // A decode's few rows on the mma.sync fp8 kernel, its rows quantized
+        // in the same launch, where it leads (`kernel.gemm.fp8_mma_gemv_until`,
+        // `moe::dense_fp8_shape`).
+        #[cfg(feature = "cuda")]
+        if act.rows <= self.ctx().tuning().gemm_fp8_mma_gemv_until
+            && let Some(shape) = linear::moe::dense_fp8_shape(act.rows, n, k)
         {
+            return linear::moe::matmul_grouped_fp8_with(
+                self.ctx(),
+                act,
+                codes.ptr,
+                atoms.ptr,
+                &mut out,
+                1,
+                shape,
+            );
+        }
+        // Else a GEMV over the activations as they are, where the profile
+        // says (`kernel.gemm.fp8_gemv_until`): ahead of the tcgen05 GEMM on
+        // codes a producer held for it too (at one row 10.2 -> 7.0 us for
+        // DeepSeek-V4-Flash's shared gate-up, 8.8 -> 4.4 its q down).
+        if act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)? {
             return Ok(());
         }
         // Its producer landed the codes itself: no quantize launch.

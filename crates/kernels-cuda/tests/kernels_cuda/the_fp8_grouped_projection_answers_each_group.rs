@@ -9,7 +9,9 @@
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::act_quant::{self, Format, Source};
-use kernels_cuda::linear::moe::{matmul_grouped_fp8, matmul_grouped_strided};
+use kernels_cuda::linear::moe::{
+    Fp8Shape, dense_fp8_shape, matmul_grouped_fp8, matmul_grouped_fp8_with, matmul_grouped_strided,
+};
 use kernels_cuda::tensor::Tensor;
 
 /// An e4m3 code's value.
@@ -57,6 +59,11 @@ fn atoms(gpu: &mut Gpu, plane: &[u8], rows: usize, k: usize) -> u64 {
 }
 
 fn check(rows: usize, groups: usize, k: usize, n: usize) {
+    check_with(rows, groups, k, n, None);
+}
+
+/// [`check`] in the CTA shape `shape` (the grouped projection's where none).
+fn check_with(rows: usize, groups: usize, k: usize, n: usize, shape: Option<Fp8Shape>) {
     let mut lcg = Lcg::seeded(0xf8 + rows as u64);
     let (x_bits, _) = lcg.row(rows * groups * k);
     let w = codes(0x51 + n as u64, groups * n * k);
@@ -83,8 +90,11 @@ fn check(rows: usize, groups: usize, k: usize, n: usize) {
     )
     .expect("the read-back fires");
     let mut y = Tensor::new(y_at, rows as u32, (groups * n) as u32, Dtype::Bf16);
-    matmul_grouped_fp8(&ctx, x, w_at, s_at, &mut y, groups as u32)
-        .expect("the fp8 grouped projection fires");
+    match shape {
+        None => matmul_grouped_fp8(&ctx, x, w_at, s_at, &mut y, groups as u32),
+        Some(shape) => matmul_grouped_fp8_with(&ctx, x, w_at, s_at, &mut y, groups as u32, shape),
+    }
+    .expect("the fp8 grouped projection fires");
     gpu.sync();
     let backs: Vec<f32> = gpu
         .down::<u16>(back_at, rows * groups * k)
@@ -117,6 +127,19 @@ fn check(rows: usize, groups: usize, k: usize, n: usize) {
 
 #[test]
 fn the_fp8_grouped_projection_answers_each_group() {
+    // One group, a dense projection, in each shape `dense_fp8_shape` picks.
+    for (rows, n, k) in [
+        (2, 4096, 2048),
+        (4, 8192, 1024),
+        (4, 32768, 1024),
+        (8, 1024, 4096),
+        (8, 4096, 2048),
+        (8, 8192, 1024),
+    ] {
+        let shape = dense_fp8_shape(rows as u32, n as u32, k as u32)
+            .unwrap_or_else(|| panic!("the mma.sync kernel takes {rows} rows of [{n}, {k}]"));
+        check_with(rows, 1, k, n, Some(shape));
+    }
     check(1, 8, 4096, 1024);
     check(3, 2, 1024, 256);
     check(8, 4, 512, 128);

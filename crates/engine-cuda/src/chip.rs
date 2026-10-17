@@ -448,6 +448,11 @@ mod tests {
                 );
                 assert_eq!(tuning.fp8_o_down, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
+                    tuning.gemm_fp8_mma_gemv_until,
+                    if major == 10 && minor == 0 { 8 } else { 0 },
+                    "{gpu}"
+                );
+                assert_eq!(
                     tuning.mxfp4_cvt_ksplit_until,
                     if major == 10 && minor == 0 { 6 } else { 0 },
                     "{gpu}"
@@ -514,6 +519,7 @@ mod tests {
                         mxfp4_a8_until: 0,
                         mxfp4_a8_from: 0,
                         fp8_o_down: false,
+                        gemm_fp8_mma_gemv_until: 0,
                         mxfp4_cvt_ksplit_until: 0,
                         ..tuning
                     },
