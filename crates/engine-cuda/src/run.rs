@@ -655,6 +655,12 @@ impl<'c> Run<'c> {
         Ok(planes)
     }
 
+    /// Forgets the planes held for a producer that did not land them.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn drop_held(&mut self) {
+        self.held = None;
+    }
+
     /// The planes [`Run::hold_e4m3`] gave `act`'s producer, when `act` (at
     /// `t`) is the value they hold, on this stream.
     #[cfg(feature = "cuda")]

@@ -43,6 +43,9 @@ sdpa.mla_sparse = true
 # DeepSeek-V4-Flash's indexer over 2048 rows of a 4096-position request,
 # top 512, 169 -> 89 us (turned queries 175 -> 98).
 sdpa.index_tc5 = true
+# A prefill's hyper-connection pre-mix norm lands the next fp8 GEMMs' e4m3
+# 1x128 operand beside its bf16 row, in place of their quantize launch.
+elemwise.norm_emit = true
 # A pooled index's top-k by radix select rather than forty bisection passes
 # (DSV4-Flash's 512 of up to 1024 blocks, 2048 rows: 417 -> 220 us).
 sdpa.index_radix = true

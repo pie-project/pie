@@ -104,6 +104,27 @@ impl Run<'_> {
             )?
         {
             self.elementwise(gates)?;
+            // The normed row lands its e4m3 1x128 operand beside it for the
+            // GEMMs that read it next, where the profile says
+            // (`kernel.elemwise.norm_emit`).
+            #[cfg(feature = "cuda")]
+            if self.ctx().tuning().norm_emit
+                && let poem_ir::Elementwise::Rmsnorm { x, weight, eps, y } = &**rmsnorm
+                && self.tensor(*y).width == 4096
+            {
+                let planes = self.hold_e4m3(*y)?;
+                if kernels_cuda::elemwise::hc::rmsnorm_emit(
+                    self.ctx(),
+                    self.tensor(*x),
+                    self.tensor(*weight),
+                    *eps,
+                    &mut self.tensor(*y),
+                    planes,
+                )? {
+                    return Ok(());
+                }
+                self.drop_held();
+            }
             return self.elementwise(rmsnorm);
         }
         if self.ctx().tuning().hc_tile

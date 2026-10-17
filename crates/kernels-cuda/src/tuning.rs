@@ -311,6 +311,13 @@ pub struct SdpaIndexMma;
 #[decision(id = "kernel.sdpa.index_tc5", flag, default = false, tune = search)]
 pub struct SdpaIndexTc5;
 
+/// Whether a prefill's hyper-connection pre-mix norm lands its row's e4m3
+/// 1x128 operand beside it, for the fp8 GEMMs that read it next, in place of
+/// their quantize launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.norm_emit", flag, default = false, tune = search)]
+pub struct ElemwiseNormEmit;
+
 /// Whether a pooled index (`attention.index_topk`) finds its best blocks by
 /// a radix select (four histogram passes, then a block scan) rather than
 /// forty bisection passes and a one-thread walk. Off bisects.
@@ -640,6 +647,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<SdpaIndexTc5>()
+        .add::<ElemwiseNormEmit>()
         .add::<SdpaIndexRadix>()
         .add::<SdpaPoolMma>()
         .add::<SdpaDsv4PrefillFrom>()
@@ -727,6 +735,7 @@ pub struct Tuning {
     pub selected_mma: bool,
     pub index_mma: bool,
     pub index_tc5: bool,
+    pub norm_emit: bool,
     pub index_radix: bool,
     pub pool_mma: bool,
     pub dsv4_prefill_from: u32,
@@ -812,6 +821,7 @@ impl Tuning {
         selected_mma: false,
         index_mma: false,
         index_tc5: false,
+        norm_emit: false,
         index_radix: false,
         pool_mma: false,
         dsv4_prefill_from: 0,
@@ -897,6 +907,7 @@ impl Tuning {
             selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),
             index_mma: profile.on::<SdpaIndexMma>(&Anywhere),
             index_tc5: profile.on::<SdpaIndexTc5>(&Anywhere),
+            norm_emit: profile.on::<ElemwiseNormEmit>(&Anywhere),
             index_radix: profile.on::<SdpaIndexRadix>(&Anywhere),
             pool_mma: profile.on::<SdpaPoolMma>(&Anywhere),
             dsv4_prefill_from: profile.get::<SdpaDsv4PrefillFrom>().0,

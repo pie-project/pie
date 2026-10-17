@@ -1211,3 +1211,44 @@ fn project_split(
         ],
     )
 }
+
+/// A prefill's RMS norm of a 4096-wide row landing, beside the bf16 row, its
+/// e4m3 1x128 operand in `planes` (`[codes, atoms]`, act_quant's layout) for
+/// the GEMM that reads it next (`rmsnorm_emit_e4m3`). `Ok(false)` where the
+/// row is not that shape: the caller norms as before.
+pub fn rmsnorm_emit(
+    ctx: &Ctx,
+    x: Tensor,
+    weight: Tensor,
+    eps: f32,
+    y: &mut Tensor,
+    planes: [u64; 2],
+) -> Result<bool, Error> {
+    const OP: &str = "elementwise.rmsnorm_emit";
+    if x.dtype != Dtype::Bf16
+        || y.dtype != Dtype::Bf16
+        || weight.dtype != Dtype::Bf16
+        || x.width != 4096
+        || y.width != 4096
+        || weight.rows * weight.width != 4096
+        || ![x.ptr, y.ptr, weight.ptr].iter().all(|at| at % 16 == 0)
+    {
+        return Ok(false);
+    }
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::elemwise::rmsnorm_emit_e4m3<::pie::bf16>")
+            .apply(Launch::per_row(y.rows, 256)),
+        &[
+            x.arg(),
+            weight.arg(),
+            y.arg(),
+            stated(OP, y.width)?.arg(),
+            eps.arg(),
+            crate::jit::ArgValue::Ptr(planes[0]),
+            crate::jit::ArgValue::Ptr(planes[1]),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}

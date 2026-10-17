@@ -1900,4 +1900,103 @@ __global__ void __launch_bounds__(128) hc_fold_rows4(
     }
 }
 
+// A prefill's RMS norm of a 4096-wide row (the hyper-connection pre-mix's
+// normed row) that also lands the row's e4m3 1x128 operand for the GEMM
+// reading it next (`Run::hold_e4m3`): a block a row, a thread 16
+// consecutive values, eight threads a 128-wide block. The bf16 row and the
+// codes and atoms act_quant_e4m3 lands from it, in one pass.
+template <class T>
+__global__ void __launch_bounds__(256) rmsnorm_emit_e4m3(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    T* __restrict__ y,
+    int hidden,
+    float eps,
+    u8* __restrict__ codes,
+    u8* __restrict__ atoms,
+    const u32* __restrict__ win)
+{
+    static_assert(sizeof(T) == 2, "16 values are two 16-byte runs");
+    const int n = static_cast<int>(blockIdx.x);
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int e0 = tid * 16;
+    const bool live = e0 < hidden;
+    const T* xr = x + static_cast<long long>(row) * hidden;
+    float v[16];
+    float ss = 0.f;
+    if (live) {
+        const uint4 a = *reinterpret_cast<const uint4*>(xr + e0);
+        const uint4 b = *reinterpret_cast<const uint4*>(xr + e0 + 8);
+        const T* pa = reinterpret_cast<const T*>(&a);
+        const T* pb = reinterpret_cast<const T*>(&b);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            v[i] = Elem<T>::to_f32(pa[i]);
+            v[8 + i] = Elem<T>::to_f32(pb[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) ss = fmaf(v[i], v[i], ss);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    __shared__ float warp_ss[8];
+    if (lane == 0) warp_ss[tid >> 5] = ss;
+    __syncthreads();
+    float total = 0.f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) total += warp_ss[w];
+    const float inv = rsqrtf(total / static_cast<float>(hidden) + eps);
+    // The normed row, rounded to T as the plane holds it.
+    float q[16];
+    float amax = 0.f;
+    if (live) {
+        const uint4 wa = *reinterpret_cast<const uint4*>(weight + e0);
+        const uint4 wb = *reinterpret_cast<const uint4*>(weight + e0 + 8);
+        const T* pa = reinterpret_cast<const T*>(&wa);
+        const T* pb = reinterpret_cast<const T*>(&wb);
+        uint4 oa, ob;
+        T* qa = reinterpret_cast<T*>(&oa);
+        T* qb = reinterpret_cast<T*>(&ob);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            qa[i] = Elem<T>::from_f32(v[i] * inv * Elem<T>::to_f32(pa[i]));
+            qb[i] = Elem<T>::from_f32(v[8 + i] * inv * Elem<T>::to_f32(pb[i]));
+            q[i] = Elem<T>::to_f32(qa[i]);
+            q[8 + i] = Elem<T>::to_f32(qb[i]);
+        }
+        T* yr = y + static_cast<long long>(row) * hidden;
+        *reinterpret_cast<uint4*>(yr + e0) = oa;
+        *reinterpret_cast<uint4*>(yr + e0 + 8) = ob;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) amax = fmaxf(amax, fabsf(q[i]));
+    }
+    // A 128-wide block's eight threads (aligned in the warp) share its amax.
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+    if (!live) return;
+    amax = fmaxf(amax, 1e-4f);
+    const unsigned bits = __float_as_uint(amax * (1.f / 448.f));
+    const int e = static_cast<int>((bits >> 23) & 0xFFu) - 127 + ((bits & 0x7FFFFFu) != 0u ? 1 : 0);
+    const float s = __uint_as_float(static_cast<unsigned>(e + 127) << 23);
+    u32 w4[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        u32 word = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const u32 c = __nv_cvt_float_to_fp8(fminf(fmaxf(q[4 * j + i] / s, -448.f), 448.f), __NV_SATFINITE, __NV_E4M3);
+            word |= c << (8 * i);
+        }
+        w4[j] = word;
+    }
+    *reinterpret_cast<uint4*>(codes + static_cast<long long>(row) * hidden + e0) = make_uint4(w4[0], w4[1], w4[2], w4[3]);
+    if ((tid & 7) == 0) {
+        atoms[pie::linear::atom_offset(row, e0 / 128, hidden / 128)] = static_cast<u8>(e + 127);
+    }
+}
+
 }

@@ -874,3 +874,94 @@ fn the_pre_mix_times_cold() {
         eprintln!("cold rows {rows:3} pre {us:6.2} us");
     }
 }
+
+/// A prefill's pre-mix norm landing its e4m3 1x128 operand: the bf16 row the
+/// plain norm lands (to its reduction order's last bit), and the codes and
+/// atoms act_quant_e4m3 makes of that row.
+#[test]
+fn a_prefills_norm_lands_its_gemms_fp8_operand() {
+    use kernels_cuda::linear::tc5::{atom_bytes, atom_offset};
+    let (rows, h) = (300usize, 4096usize);
+    let mut lcg = Lcg::seeded(0x0e17);
+    let x: Vec<u16> = (0..rows * h).map(|_| to_bf16(lcg.unit() * 3.0)).collect();
+    let w: Vec<u16> = (0..h).map(|_| to_bf16(0.5 + lcg.unit())).collect();
+    let mut gpu = Gpu::open();
+    let x_at = gpu.up(&x);
+    let w_at = gpu.up(&w);
+    let y_at = gpu.zeros(rows * h * 2);
+    let r_at = gpu.zeros(rows * h * 2);
+    let c_at = gpu.zeros(rows * h);
+    let a_at = gpu.zeros(atom_bytes(rows, h, 128));
+    let ctx = gpu.ctx();
+    let xt = Tensor::new(x_at, rows as u32, h as u32, Dtype::Bf16);
+    let wt = Tensor::new(w_at, h as u32, 1, Dtype::Bf16);
+    assert!(
+        hc::rmsnorm_emit(
+            &ctx,
+            xt,
+            wt,
+            1e-6,
+            &mut Tensor::new(y_at, rows as u32, h as u32, Dtype::Bf16),
+            [c_at, a_at]
+        )
+        .expect("the emitting norm fires")
+    );
+    norm::rmsnorm(
+        &ctx,
+        xt,
+        wt,
+        1e-6,
+        &mut Tensor::new(r_at, rows as u32, h as u32, Dtype::Bf16),
+    )
+    .expect("the plain norm fires");
+    gpu.sync();
+    let y: Vec<u16> = gpu.down(y_at, rows * h);
+    let r: Vec<u16> = gpu.down(r_at, rows * h);
+    let codes: Vec<u8> = gpu.down(c_at, rows * h);
+    let atoms: Vec<u8> = gpu.down(a_at, atom_bytes(rows, h, 128));
+    for (i, (&a, &b)) in y.iter().zip(&r).enumerate() {
+        assert!(
+            a.abs_diff(b) <= 1,
+            "element {i}: {a:#x} against the plain norm's {b:#x}"
+        );
+    }
+    let e4m3 = |c: u8| -> f32 {
+        let sign = if c & 0x80 != 0 { -1.0 } else { 1.0 };
+        let exp = i32::from((c >> 3) & 0xf);
+        let man = f32::from(c & 7);
+        sign * if exp == 0 {
+            man / 8.0 * 2f32.powi(-6)
+        } else {
+            (1.0 + man / 8.0) * 2f32.powi(exp - 7)
+        }
+    };
+    for row in 0..rows {
+        for b in 0..h / 128 {
+            let vals: Vec<f32> = (0..128)
+                .map(|i| from_bf16(y[row * h + b * 128 + i]))
+                .collect();
+            let amax = vals.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-4);
+            let e = (amax / 448.0).log2().ceil() as i32;
+            assert_eq!(
+                atoms[atom_offset(row, b, h / 128)],
+                (e + 127) as u8,
+                "row {row} block {b}"
+            );
+            let s = 2f32.powi(e);
+            for (i, v) in vals.iter().enumerate() {
+                let c = codes[row * h + b * 128 + i];
+                let got = e4m3(c);
+                // The nearest code: no code lies nearer v / s.
+                let err = (got - v / s).abs();
+                let best = (0..=255u8)
+                    .filter(|c| c & 0x7f != 0x7f)
+                    .map(|c| (e4m3(c) - v / s.clamp(f32::MIN, f32::MAX)).abs())
+                    .fold(f32::INFINITY, f32::min);
+                assert!(
+                    err <= best || (v / s).abs() > 448.0,
+                    "row {row} block {b} element {i}: code {c:#x}"
+                );
+            }
+        }
+    }
+}
