@@ -7,6 +7,7 @@
 
 use cudarc::driver::sys as dr;
 
+use crate::attn::dsv4::Rows;
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, symbol};
 use crate::linear::tc5::{Map, encode, supported};
@@ -30,6 +31,8 @@ struct SparseParams {
     selection: u64,
     sinks: u64,
     live: u64,
+    win_raw: u64,
+    ent_raw: u64,
     sinks_f32: i32,
     ent_runs: i32,
     win_page: i32,
@@ -160,6 +163,42 @@ pub fn prefill(
         );
     }
     let (ent_view, ent_compact) = entries_of(pooled);
+    // V4.1's rows (an MXFP8 window over NVFP4 entries, or the window alone)
+    // below a prefill's width (`kernel.sdpa.dsv4_prefill_from`): the pass
+    // widens them itself, no plane staged. A prefill's many rows a tile
+    // read the staged bf16 pages faster.
+    let from = ctx.tuning().dsv4_prefill_from;
+    if let Some(Rows::Mx8) = crate::attn::dsv4::rows_of(window_pool)
+        && (from == 0 || rows < from)
+    {
+        let alone = pooled.entries.keys.ptr == window_pool.keys.ptr;
+        let pf = if alone {
+            Rows::Mx8
+        } else {
+            crate::attn::dsv4::rows_of(&ent_view).unwrap_or(Rows::Mx8)
+        };
+        let viewed = Pooled {
+            entries: &ent_view,
+            ratio: pooled.ratio,
+            selection: pooled.selection,
+        };
+        return sparse(
+            ctx,
+            op,
+            q,
+            positions,
+            requests,
+            floors,
+            window_pool,
+            &viewed,
+            ent_compact,
+            Some((Rows::Mx8, pf)),
+            sinks,
+            sm_scale,
+            turn,
+            o,
+        );
+    }
     if let Some(wf) = crate::attn::dsv4::rows_of(window_pool) {
         // DeepSeek's quantized rows: every page of both pools' tables widened
         // into bf16 planes laid out in table order (as vLLM gathers its
@@ -188,6 +227,7 @@ pub fn prefill(
             &window_bf16,
             &staged,
             ent_compact,
+            None,
             sinks,
             sm_scale,
             turn,
@@ -209,6 +249,7 @@ pub fn prefill(
         window_pool,
         &viewed,
         ent_compact,
+        None,
         sinks,
         sm_scale,
         turn,
@@ -216,8 +257,10 @@ pub fn prefill(
     )
 }
 
-/// The pass over bf16 planes: `pooled.entries` a row a position (its
-/// entries at each group's last), or with `ent_compact` a row an entry.
+/// The pass over bf16 planes, or with `quantized` (the window's and the
+/// entries' formats) over DeepSeek's rows, widened as the tiles land:
+/// `pooled.entries` a row a position (its entries at each group's last), or
+/// with `ent_compact` a row an entry.
 #[allow(clippy::too_many_arguments)]
 fn sparse(
     ctx: &Ctx,
@@ -229,6 +272,7 @@ fn sparse(
     window_pool: &KvPool,
     pooled: &Pooled<'_>,
     ent_compact: bool,
+    quantized: Option<(Rows, Rows)>,
     sinks: Tensor,
     sm_scale: f32,
     turn: Option<crate::attn::dsv4::Turn>,
@@ -246,47 +290,6 @@ fn sparse(
             swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
         })
     };
-    let map_win = plane(window_pool)?;
-    let map_ent = plane(pooled.entries)?;
-    // A run of sixteen window positions: sixteen rows a box.
-    let map_win_run = encode(Map {
-        ptr: window_pool.keys.ptr,
-        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        dims: [HEAD_DIM, window_pool.keys.rows, 0],
-        strides: [u64::try_from(window_pool.seq_stride).unwrap_or(0) * 2, 0],
-        boxes: [64, 16, 1],
-        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-    })?;
-    // A page's entries sit `ratio` rows apart at its last row of each
-    // stride: viewed as [ratio, cells / ratio] rows, sixteen of one phase a
-    // box, where the page and the plane hold whole strides.
-    // A compact pool's entries are rows of their own: a run is sixteen
-    // consecutive rows, as the window's are.
-    let ratio = if ent_compact { 1 } else { pooled.ratio };
-    let ent_cells = pooled.entries.keys.rows;
-    let ent_runs = ent_compact
-        || (ratio > 1
-            && ratio <= 16
-            && u32::try_from(pooled.entries.page_size)
-                .is_ok_and(|page| page.is_multiple_of(ratio))
-            && ent_cells.is_multiple_of(ratio));
-    let ent_stride = u64::try_from(pooled.entries.seq_stride).unwrap_or(0) * 2;
-    let map_ent_run = encode(Map {
-        ptr: pooled.entries.keys.ptr,
-        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        dims: if ent_runs {
-            [HEAD_DIM, ratio, ent_cells / ratio.max(1)]
-        } else {
-            [HEAD_DIM, 1, ent_cells]
-        },
-        strides: if ent_runs {
-            [ent_stride, ent_stride * u64::from(ratio)]
-        } else {
-            [ent_stride, ent_stride]
-        },
-        boxes: [64, 1, 16],
-        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-    })?;
     // Q a row: 64 heads of 512, eight boxes of 64 dims by the 64 heads.
     let map_q = encode(Map {
         ptr: q.ptr,
@@ -296,6 +299,53 @@ fn sparse(
         boxes: [64, HEADS, 1],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
     })?;
+    // A quantized pass reads no plane through a tensor map: Q's stands in.
+    let (map_win, map_ent, map_win_run, map_ent_run, ent_runs) = if quantized.is_some() {
+        (map_q, map_q, map_q, map_q, false)
+    } else {
+        let map_win = plane(window_pool)?;
+        let map_ent = plane(pooled.entries)?;
+        // A run of sixteen window positions: sixteen rows a box.
+        let map_win_run = encode(Map {
+            ptr: window_pool.keys.ptr,
+            ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            dims: [HEAD_DIM, window_pool.keys.rows, 0],
+            strides: [u64::try_from(window_pool.seq_stride).unwrap_or(0) * 2, 0],
+            boxes: [64, 16, 1],
+            swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+        })?;
+        // A page's entries sit `ratio` rows apart at its last row of each
+        // stride: viewed as [ratio, cells / ratio] rows, sixteen of one phase a
+        // box, where the page and the plane hold whole strides.
+        // A compact pool's entries are rows of their own: a run is sixteen
+        // consecutive rows, as the window's are.
+        let ratio = if ent_compact { 1 } else { pooled.ratio };
+        let ent_cells = pooled.entries.keys.rows;
+        let ent_runs = ent_compact
+            || (ratio > 1
+                && ratio <= 16
+                && u32::try_from(pooled.entries.page_size)
+                    .is_ok_and(|page| page.is_multiple_of(ratio))
+                && ent_cells.is_multiple_of(ratio));
+        let ent_stride = u64::try_from(pooled.entries.seq_stride).unwrap_or(0) * 2;
+        let map_ent_run = encode(Map {
+            ptr: pooled.entries.keys.ptr,
+            ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            dims: if ent_runs {
+                [HEAD_DIM, ratio, ent_cells / ratio.max(1)]
+            } else {
+                [HEAD_DIM, 1, ent_cells]
+            },
+            strides: if ent_runs {
+                [ent_stride, ent_stride * u64::from(ratio)]
+            } else {
+                [ent_stride, ent_stride]
+            },
+            boxes: [64, 1, 16],
+            swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+        })?;
+        (map_win, map_ent, map_win_run, map_ent_run, ent_runs)
+    };
     let (selection, top_k) = pooled
         .selection
         .map_or((0, 0), |(selection, top_k)| (selection.ptr, top_k));
@@ -324,6 +374,16 @@ fn sparse(
             selection,
             sinks: sinks.ptr,
             live,
+            win_raw: if quantized.is_some() {
+                window_pool.keys.ptr
+            } else {
+                0
+            },
+            ent_raw: if quantized.is_some() {
+                pooled.entries.keys.ptr
+            } else {
+                0
+            },
             sinks_f32: i32::from(sinks.dtype == Dtype::F32),
             ent_runs: i32::from(ent_runs),
             win_page: window_pool.page_size,
@@ -341,7 +401,14 @@ fn sparse(
             op,
             Fire::at(
                 SPARSE_FILE,
-                symbol(&format!("::pie::attn::dsv4s::dsv4_sparse<{selected}>")),
+                symbol(&match quantized {
+                    Some((wf, pf)) => format!(
+                        "::pie::attn::dsv4s::dsv4_sparse<{selected}, {}, {}>",
+                        wf.code(),
+                        pf.code()
+                    ),
+                    None => format!("::pie::attn::dsv4s::dsv4_sparse<{selected}>"),
+                }),
             )
             .apply(
                 Launch::grid(

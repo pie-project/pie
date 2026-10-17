@@ -268,10 +268,16 @@ __device__ __forceinline__ unsigned e2m1_code(float v) {
     return signbit(v) ? (m | 8u) : m;
 }
 
-__device__ __forceinline__ float e2m1_value(unsigned c) {
+// An e2m1 code's bf16 bits: 0.5 at magnitude 1, 2^(e - 1) (1 + m / 2) from
+// 2 on, built from the code's bits with no conversion.
+__device__ __forceinline__ unsigned e2m1_bf16(unsigned c) {
     const unsigned m = c & 7u;
-    const float v = m < 4u ? 0.5f * static_cast<float>(m) : static_cast<float>(1u << (m / 2u - 1u)) * (m & 1u ? 1.5f : 1.f);
-    return (c & 8u) ? -v : v;
+    const unsigned mag = m < 2u ? m * 0x3F00u : (((m >> 1) + 126u) << 7) | ((m & 1u) << 6);
+    return mag | ((c & 8u) << 12);
+}
+
+__device__ __forceinline__ float e2m1_value(unsigned c) {
+    return __uint_as_float(e2m1_bf16(c) << 16);
 }
 
 __device__ __forceinline__ float e4m3_float(std::uint8_t b) {
@@ -336,6 +342,46 @@ __device__ __forceinline__ void rows_store_warp(const bf16* __restrict__ src, Ds
     }
 }
 
+// 8 MXFP8 codes under a ue8m0 scale `s`, widened to bf16.
+__device__ __forceinline__ uint4 mx8_widen8(uint2 codes, float s) {
+    const std::uint16_t c2[4] = {static_cast<std::uint16_t>(codes.x), static_cast<std::uint16_t>(codes.x >> 16),
+                                 static_cast<std::uint16_t>(codes.y), static_cast<std::uint16_t>(codes.y >> 16)};
+    uint4 out;
+    std::uint32_t* o32 = reinterpret_cast<std::uint32_t*>(&out);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float lo, hi;
+        asm("{\n\t.reg .b32 h2;\n\t.reg .b16 l, h;\n\t"
+            "cvt.rn.f16x2.e4m3x2 h2, %2;\n\t"
+            "mov.b32 {l, h}, h2;\n\t"
+            "cvt.f32.f16 %0, l;\n\t"
+            "cvt.f32.f16 %1, h;\n\t}"
+            : "=f"(lo), "=f"(hi)
+            : "h"(c2[i]));
+        const __nv_bfloat162 b = __floats2bfloat162_rn(lo * s, hi * s);
+        o32[i] = *reinterpret_cast<const std::uint32_t*>(&b);
+    }
+    return out;
+}
+
+// 8 e2m1 codes (two a byte, the lower dim in the low nibble) under an e4m3
+// scale `s2` (as bf16, twice). An e2m1 value times an e4m3 scale has at most
+// five significant bits, so the bf16 product is exact: the codes widen as
+// bf16 bits and one bf16x2 multiply a pair lands what the f32 product rounds
+// to.
+__device__ __forceinline__ uint4 nv4_widen8(std::uint32_t nib, __nv_bfloat162 s2) {
+    uint4 out;
+    std::uint32_t* o32 = reinterpret_cast<std::uint32_t*>(&out);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const unsigned byte = (nib >> (8 * i)) & 0xffu;
+        const std::uint32_t pair = e2m1_bf16(byte & 0xfu) | (e2m1_bf16(byte >> 4) << 16);
+        const __nv_bfloat162 b = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&pair), s2);
+        o32[i] = *reinterpret_cast<const std::uint32_t*>(&b);
+    }
+    return out;
+}
+
 // 8 dims of a row from its data and scale bytes: `j` the first dim (a
 // multiple of 8).
 template <int F>
@@ -343,38 +389,10 @@ __device__ __forceinline__ uint4 rows_load8(const std::uint8_t* data, const std:
     if constexpr (F == kV4) {
         return ds_load8(data, scales, j);
     } else if constexpr (F == kMx8) {
-        const float s = ue8m0(scales[j / 32]);
-        const uint2 codes = *reinterpret_cast<const uint2*>(data + j);
-        const std::uint16_t* c2 = reinterpret_cast<const std::uint16_t*>(&codes);
-        uint4 out;
-        std::uint32_t* o32 = reinterpret_cast<std::uint32_t*>(&out);
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            float lo, hi;
-            asm("{\n\t.reg .b32 h2;\n\t.reg .b16 l, h;\n\t"
-                "cvt.rn.f16x2.e4m3x2 h2, %2;\n\t"
-                "mov.b32 {l, h}, h2;\n\t"
-                "cvt.f32.f16 %0, l;\n\t"
-                "cvt.f32.f16 %1, h;\n\t}"
-                : "=f"(lo), "=f"(hi)
-                : "h"(c2[i]));
-            const __nv_bfloat162 b = __floats2bfloat162_rn(lo * s, hi * s);
-            o32[i] = *reinterpret_cast<const std::uint32_t*>(&b);
-        }
-        return out;
+        return mx8_widen8(*reinterpret_cast<const uint2*>(data + j), ue8m0(scales[j / 32]));
     } else {
-        const float s = e4m3_float(scales[j / 16]);
-        const std::uint32_t nib = *reinterpret_cast<const std::uint32_t*>(data + j / 2);
-        uint4 out;
-        std::uint32_t* o32 = reinterpret_cast<std::uint32_t*>(&out);
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const unsigned byte = (nib >> (8 * i)) & 0xffu;
-            const __nv_bfloat162 b =
-                __floats2bfloat162_rn(e2m1_value(byte & 0xfu) * s, e2m1_value(byte >> 4) * s);
-            o32[i] = *reinterpret_cast<const std::uint32_t*>(&b);
-        }
-        return out;
+        return nv4_widen8(*reinterpret_cast<const std::uint32_t*>(data + j / 2),
+                          __float2bfloat162_rn(e4m3_float(scales[j / 16])));
     }
 }
 

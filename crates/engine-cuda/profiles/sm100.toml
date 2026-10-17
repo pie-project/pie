@@ -39,6 +39,11 @@ sdpa.dsv4_prefill_from = 512
 # prompt's leading rows through the encoder alone, the decoder replaying its
 # last window (the window held above each sequence's replay floor).
 sdpa.dsv4_replay = true
+# DeepSeek-V4.1's FP4 cache from 40 rows on that pass too, widening each
+# row's keys once for its 64 heads where the decode launch's four blocks a
+# row widen them each: the truncated model's decode TPOT at 48 rows 3.45 ->
+# 3.20 ms, 64 rows 3.55 -> 3.14; 32 rows stay (2.96 against 3.04).
+sdpa.dsv4_fp4_pass_from = 40
 # GLM-5.3's DSA (sparse MLA, top-2048 tokens a row) a block a row on
 # tcgen05, the selected keys' latent and rotated part gathered whole.
 sdpa.mla_sparse = true

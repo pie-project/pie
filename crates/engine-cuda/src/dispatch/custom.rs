@@ -487,7 +487,11 @@ impl Run<'_> {
         // A decode's rows, up to what the profile says
         // (`kernel.sdpa.dsv4_decode_until`): the four in one launch.
         let rows = self.tensor(*o_out).rows;
+        // V4.1's FP4 cache from the rows the profile says
+        // (`kernel.sdpa.dsv4_fp4_pass_from`): the tcgen05 pass.
+        let fp4_pass = self.fp4_pass(window, rows);
         if rows <= self.ctx().tuning().dsv4_decode_until
+            && !fp4_pass
             && let Some(landed) = self.dsv4_decode(window, Some(pool), *sink, *o_out, turn)
         {
             return landed.map(|()| turn.is_some());
@@ -527,8 +531,7 @@ impl Run<'_> {
             let from = self.ctx().tuning().dsv4_prefill_from;
             let mut out = self.tensor(*o_out);
             // Its request ids index the whole fire's page tables too.
-            if from > 0
-                && out.rows >= from
+            if (fp4_pass || from > 0 && out.rows >= from)
                 && let (Some(window_pool), Some(entries)) =
                     (self.pool_whole(*cache), self.pool_whole(*entries))
             {
@@ -582,6 +585,17 @@ impl Run<'_> {
             o_out: *o_out,
         })
         .map(|()| false)
+    }
+
+    /// Whether `window` reads V4.1's FP4 cache at `rows` the profile sends
+    /// to the tcgen05 pass (`kernel.sdpa.dsv4_fp4_pass_from`).
+    fn fp4_pass(&self, window: &poem_ir::Attention, rows: u32) -> bool {
+        let from = self.ctx().tuning().dsv4_fp4_pass_from;
+        from > 0
+            && rows >= from
+            && matches!(*window, poem_ir::Attention::PrefillLse { cache, .. }
+                if matches!(kernels_cuda::attn::dsv4::rows_of(&self.pool(cache)),
+                    Some(kernels_cuda::attn::dsv4::Rows::Mx8)))
     }
 
     /// Whether `window`'s cache holds DeepSeek's quantized rows.

@@ -57,6 +57,10 @@ struct Params {
     const int* selection;
     const void* sinks;
     const u32* live;
+    // DeepSeek's quantized planes (formats kWF, kPF), read where the pass
+    // widens their rows itself.
+    const std::uint8_t* win_raw;
+    const std::uint8_t* ent_raw;
     int sinks_f32;
     int ent_runs;
     int win_page;
@@ -145,7 +149,105 @@ __device__ __forceinline__ void pair_sync(u32 warp) {
 constexpr int kIssuers = 6;  // warp 4 and warps 6-10; warp 11 lists
 __device__ __forceinline__ void issue_sync() { asm volatile("bar.sync 2, %0;" ::"n"(kIssuers * 32) : "memory"); }
 
-template <bool kSelected>
+// A key's 64 dims of one atom (`a`) in format F: its bytes, loaded before
+// any is widened (MXFP8 rows: 64 codes under two ue8m0 scales; NVFP4 rows:
+// 32 bytes of e2m1 pairs under four e4m3 scales).
+struct AtomBytes {
+    uint4 d[4];
+    std::uint32_t sc;
+};
+
+template <int F>
+__device__ __forceinline__ void load_atom(const std::uint8_t* plane, u32 cell, int ps, int a, AtomBytes& b) {
+    const dsv4::DsRow r = dsv4::rows_at<F>(const_cast<std::uint8_t*>(plane), cell / ps,
+                                           static_cast<int>(cell % ps), ps);
+    if constexpr (F == dsv4::kMx8) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) b.d[i] = reinterpret_cast<const uint4*>(r.data + a * 64)[i];
+        b.sc = *reinterpret_cast<const std::uint16_t*>(r.scales + a * 2);
+    } else {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) b.d[i] = reinterpret_cast<const uint4*>(r.data + a * 32)[i];
+        b.sc = *reinterpret_cast<const std::uint32_t*>(r.scales + a * 4);
+    }
+}
+
+// The loaded atom widened to eight 16-byte pieces of bf16.
+template <int F>
+__device__ __forceinline__ void widen_atom(const AtomBytes& b, uint4 (&v)[8]) {
+    if constexpr (F == dsv4::kMx8) {
+        const float s0 = dsv4::ue8m0(static_cast<std::uint8_t>(b.sc));
+        const float s1 = dsv4::ue8m0(static_cast<std::uint8_t>(b.sc >> 8));
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            const uint4& d = b.d[c / 2];
+            const uint2 codes = (c & 1) ? make_uint2(d.z, d.w) : make_uint2(d.x, d.y);
+            v[c] = dsv4::mx8_widen8(codes, c < 4 ? s0 : s1);
+        }
+    } else {
+        __nv_bfloat162 s2[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            s2[i] = __float2bfloat162_rn(dsv4::e4m3_float(static_cast<std::uint8_t>(b.sc >> (8 * i))));
+        }
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            const uint4& d = b.d[c / 4];
+            const int w = c % 4;
+            const std::uint32_t nib = w == 0 ? d.x : w == 1 ? d.y : w == 2 ? d.z : d.w;
+            v[c] = dsv4::nv4_widen8(nib, s2[c / 2]);
+        }
+    }
+}
+
+// A tile's 64 keys by 8 atoms widened into its swizzled bf16 rows (16-byte
+// pieces swizzled by the row, as the TMA lands them): unit u (key u / 8,
+// atom u % 8) is lane t's for u = t, t + 192, t + 384, so a key's eight
+// atoms are eight neighbouring lanes' and its row is read whole between
+// them; every unit's bytes are in flight before any is widened.
+template <int WF, int PF>
+__device__ __forceinline__ void widen_tile(unsigned char* tile, const u32* l, const Params& p, int t) {
+    constexpr int kStride = kIssuers * 32;
+    constexpr int kUnits = (kBK * 8 + kStride - 1) / kStride;
+    AtomBytes b[kUnits];
+    u32 e[kUnits];
+#pragma unroll
+    for (int k = 0; k < kUnits; ++k) {
+        const int u = t + k * kStride;
+        e[k] = u < kBK * 8 ? l[u / 8] : kSlotMask;
+        const u32 cell = e[k] & kSlotMask;
+        if (cell == kSlotMask) continue;
+        if ((e[k] & kPool) != 0) {
+            load_atom<PF>(p.ent_raw, cell, p.ent_page, u % 8, b[k]);
+        } else {
+            load_atom<WF>(p.win_raw, cell, p.win_page, u % 8, b[k]);
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < kUnits; ++k) {
+        const int u = t + k * kStride;
+        if (u >= kBK * 8) break;
+        const int key = u / 8;
+        uint4 v[8];
+        if ((e[k] & kSlotMask) == kSlotMask) {
+#pragma unroll
+            for (int c = 0; c < 8; ++c) v[c] = make_uint4(0u, 0u, 0u, 0u);
+        } else if ((e[k] & kPool) != 0) {
+            widen_atom<PF>(b[k], v);
+        } else {
+            widen_atom<WF>(b[k], v);
+        }
+        unsigned char* row = tile + atom_at(u % 8) + key * 128;
+#pragma unroll
+        for (int c = 0; c < 8; ++c) *reinterpret_cast<uint4*>(row + ((c ^ (key & 7)) << 4)) = v[c];
+    }
+}
+
+// With kWF and kPF (`attn/dsv4_kv.cuh`; 0 is bf16) the window's and the
+// entries' planes are DeepSeek's quantized rows (V4.1's MXFP8 window over
+// NVFP4 entries): the issuers load a key's bytes and widen them into the
+// tile's swizzled bf16 rows themselves, in place of the TMA gathers.
+template <bool kSelected, int kWF = 0, int kPF = 0>
 __global__ __launch_bounds__(384, 1) void dsv4_sparse(
     const __grid_constant__ tc5::TmaMap map_win, const __grid_constant__ tc5::TmaMap map_ent,
     const __grid_constant__ tc5::TmaMap map_win_run, const __grid_constant__ tc5::TmaMap map_ent_run,
@@ -323,13 +425,16 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
             bar_wait(&list_full[J % kLists], (J / kLists) & 1);
             if (lead) {
                 bar_wait(&empty[slot], ((R / kSlots) & 1) ^ 1);
-                if (lane == 0) bar_arrive_expect_tx(&full[slot], kTile);
+                if (lane == 0 && kWF == 0) bar_arrive_expect_tx(&full[slot], kTile);
             }
             issue_sync();
             // 16 groups of four keys by 8 atoms, dealt round the three warps;
             // a run of 16 rows (window positions, or a page's entries one
             // stride apart) lands as one box from its first group.
             unsigned char* dst = smem + kOffRing + slot * kTile;
+            if constexpr (kWF != 0) {
+                widen_tile<kWF, kPF>(dst, l, p, share * 32 + static_cast<int>(lane));
+            } else
             for (int op = static_cast<int>(lane) * kIssuers + share; op < 16 * 8; op += 32 * kIssuers) {
                 const int g = op % 16;
                 const int a = op / 16;
@@ -366,8 +471,13 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
                             r[3]);
                 }
             }
+            if constexpr (kWF != 0) fence_async_shared();
             issue_sync();
-            if (lead && lane == 0) bar_arrive(&list_free[J % kLists]);
+            if (lead && lane == 0) {
+                // The widened tile is the issuers' stores, every one landed.
+                if constexpr (kWF != 0) bar_arrive(&full[slot]);
+                bar_arrive(&list_free[J % kLists]);
+            }
         }
         }
     } else if (warp == 5) {

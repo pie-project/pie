@@ -300,6 +300,15 @@ pub struct SdpaDsv4PrefillFrom(pub u32);
 #[decision(id = "kernel.sdpa.dsv4_replay", flag, default = false, tune = never)]
 pub struct SdpaDsv4Replay;
 
+/// The fewest rows DeepSeek-V4.1's attention over its FP4 cache (an MXFP8
+/// window over NVFP4 entries) takes the tcgen05 pass a block a row, which
+/// widens each row's keys once for all 64 heads as its tiles land, rather
+/// than the decode launch, whose four blocks a row widen them each. 0 never
+/// does below `kernel.sdpa.dsv4_prefill_from`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.dsv4_fp4_pass_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct SdpaDsv4Fp4PassFrom(pub u32);
+
 /// Whether a sparse MLA's selected attention (64 absorbed heads over a
 /// 512-wide bf16 latent and a 64-wide rotated part or none: GLM-5.3's and
 /// GLM-5.3-Flash's DSA) runs a block a row on tcgen05
@@ -664,6 +673,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaPoolMma>()
         .add::<SdpaDsv4PrefillFrom>()
         .add::<SdpaDsv4Replay>()
+        .add::<SdpaDsv4Fp4PassFrom>()
         .add::<SdpaMlaSparse>()
         .add::<GemmNarrowN>();
 }
@@ -753,6 +763,7 @@ pub struct Tuning {
     pub pool_mma: bool,
     pub dsv4_prefill_from: u32,
     pub dsv4_replay: bool,
+    pub dsv4_fp4_pass_from: u32,
     pub mla_sparse: bool,
     pub gemm_narrow_n: u32,
 }
@@ -840,6 +851,7 @@ impl Tuning {
         pool_mma: false,
         dsv4_prefill_from: 0,
         dsv4_replay: false,
+        dsv4_fp4_pass_from: 0,
         mla_sparse: false,
         gemm_narrow_n: 0,
     };
@@ -927,6 +939,7 @@ impl Tuning {
             pool_mma: profile.on::<SdpaPoolMma>(&Anywhere),
             dsv4_prefill_from: profile.get::<SdpaDsv4PrefillFrom>().0,
             dsv4_replay: profile.on::<SdpaDsv4Replay>(&Anywhere),
+            dsv4_fp4_pass_from: profile.get::<SdpaDsv4Fp4PassFrom>().0,
             mla_sparse: profile.on::<SdpaMlaSparse>(&Anywhere),
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,
         }

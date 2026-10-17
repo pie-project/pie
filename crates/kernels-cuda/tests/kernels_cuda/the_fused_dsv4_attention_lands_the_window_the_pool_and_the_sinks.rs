@@ -348,8 +348,43 @@ fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>, floor
         } else {
             0.0
         };
+        // The tcgen05 pass a block a row (all 64 heads), over the same rows.
+        // (V4.1's rows widened as the pass reads them; V4's are staged.)
+        let v41 = fmts == Some((Rows::Mx8, Rows::Nv4));
+        let sparse = if ratio > 0 && (fmts.is_none() || v41) {
+            let (win_pool, ent_pool) = if v41 {
+                (&window_pool, &entries)
+            } else {
+                (&window_bf16, &entries_bf16)
+            };
+            let pooled = kernels_cuda::attn::dsv4_prefill::Pooled {
+                entries: ent_pool,
+                ratio: ratio as u32,
+                selection: sel_t,
+            };
+            time(&gpu, flush, &|| {
+                let mut o = Tensor::new(o_at, rows as u32, (HEADS * D) as u32, Dtype::Bf16);
+                kernels_cuda::attn::dsv4_prefill::prefill(
+                    &gpu.ctx(),
+                    "attention.pool_attention",
+                    q_t,
+                    pos_t,
+                    req_t,
+                    None,
+                    win_pool,
+                    &pooled,
+                    sink_t,
+                    scale,
+                    None,
+                    &mut o,
+                )
+                .expect("the sparse pass fires");
+            })
+        } else {
+            0.0
+        };
         println!(
-            "| pool_lse_mma | {rows} rows | ratio {ratio} | top_k {top_k} | {pool_only:.1} us |"
+            "| pool_lse_mma | {rows} rows | ratio {ratio} | top_k {top_k} | {pool_only:.1} us | sparse {sparse:.1} us |"
         );
         println!(
             "| dsv4 fused | {rows} rows | ratio {ratio} | top_k {top_k} | rows {fmts:?} | {fused:.1} us |"
