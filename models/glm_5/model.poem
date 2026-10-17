@@ -114,8 +114,6 @@ DIMS = {
     # The first seven layers at full width with the first eight routed
     # experts: three dense layers that rank, three that share, one that ranks.
     "glm53-mini": glm53(layers = 7, experts = 8),
-    # The same seven layers with every routed expert.
-    "glm53-l7": glm53(layers = 7),
 }
 
 def ranks(d, l):

@@ -141,8 +141,6 @@ DIMS = {
     # The first eight layers at full width with the first 32 routed experts:
     # three dense KDA, DSA + MoE, three KDA + MoE, DSA.
     "glm53-flash-mini": flash(layers = 8, experts = 32),
-    # The same eight layers with every routed expert.
-    "glm53-flash-l8": flash(layers = 8),
 }
 
 def layout(id, deploy):

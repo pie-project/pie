@@ -1,7 +1,7 @@
 # GLM-5: a mixture of experts behind multi-head latent attention, its keys
 # chosen per query by a lightning indexer; GLM-5.3 (indexers on one layer in
 # four, the rest reusing their selection), with or without its draft head,
-# its seven-layer miniature, and those seven layers with every expert.
+# and its seven-layer miniature.
 
 STOP = ["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"]
 CHATML = template("chatml", thinking = True, tools = True, stop = STOP)
@@ -14,14 +14,11 @@ MODELS = [
     model("glm5-a12b", template = CHATML, tokenizer = TOKENIZER, arch = "glm_moe_dsa", layers = 46, vocab = 151552),
     model("glm53", template = GLM, tokenizer = GLM_TOKENIZER, drafters = ["mtp"], arch = "glm_moe_dsa", layers = 78, vocab = 154880),
     model("glm53-mini", mini = True, template = GLM, tokenizer = GLM_TOKENIZER, arch = "glm_moe_dsa", layers = 7, vocab = 154880),
-    model("glm53-l7", mini = True, template = GLM, tokenizer = GLM_TOKENIZER, arch = "glm_moe_dsa", layers = 7, vocab = 154880),
 ]
 
 BF = dtype.bf16
 U4 = dtype.u4g64
-A8 = dtype.mxfp4a8
 F8 = dtype.e4m3tile128a8
-NV = dtype.nvfp4
 NV4 = dtype.nvfp4a4
 
 DEPLOYMENTS = [
@@ -30,16 +27,10 @@ DEPLOYMENTS = [
     deployment("glm53", weights = [BF, U4, U4], kv = BF, drafter = "mtp"),
     deployment("glm53-mini", weights = BF, kv = BF),
     deployment("glm53-mini", weights = [BF, U4], kv = BF),
-    deployment("glm53-l7", weights = [BF, U4], kv = BF),
-    deployment("glm53-l7", weights = BF, kv = BF),
-    deployment("glm53-l7", weights = [BF, A8], kv = BF),
-    deployment("glm53-mini", weights = [BF, A8], kv = BF),
     # The release's own FP8 experts (128x128 blocks under f32 factors), as
     # vLLM serves them: the like-for-like row.
-    deployment("glm53-l7", weights = [BF, F8], kv = BF),
     deployment("glm53-mini", weights = [BF, F8], kv = BF),
     # Every FP8 tensor of the release as released: the projections too.
-    deployment("glm53-l7", weights = [F8, F8], kv = BF),
     deployment("glm53-mini", weights = [F8, F8], kv = BF),
     # modelopt's NVFP4 export as vLLM serves it: routed experts NVFP4 against
     # NVFP4 or bf16 activations, attention and shared experts bf16, the dense
@@ -50,5 +41,4 @@ DEPLOYMENTS = [
     # projection as every 128-square block's factor), as vLLM serves it.
     deployment("glm53", weights = [BF, NV4, F8], kv = BF),
     deployment("glm53-mini", weights = [BF, NV4, F8], kv = BF),
-    deployment("glm53-mini", weights = [BF, NV], kv = BF),
 ]
