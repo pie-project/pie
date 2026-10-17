@@ -1015,7 +1015,9 @@ fn experts_w4a4(
             OP,
             routes,
             experts,
-            act_quant::BLOCK_ROWS,
+            // An expert's rows start on a 64-row half block: a decode's few
+            // rows an expert fill half the tiles a 128-row block would pad.
+            tc5::GROUP_ALIGN,
             false,
             Some((
                 act_quant::AlphaFrom {
