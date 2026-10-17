@@ -1147,12 +1147,7 @@ impl FrameShell for Shell {
                 }
             }
         }
-        self.pools.commit_frame(demand, &kv_ranges)?;
-        super::btrace::mark("commit_frame");
-
-        let indptr_host = kv::indptr(&seats)?;
         let paging = self.pools.paging();
-        let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
         let window_tables = if self.pools.has_windowed() {
             seats
                 .iter()
@@ -1170,6 +1165,19 @@ impl FrameShell for Shell {
         } else {
             Vec::new()
         };
+        // The windowed pages this fire's tables name, backed as they are
+        // first used.
+        let window_pages: Vec<u64> = window_tables
+            .iter()
+            .zip(&kv_less_seats)
+            .filter(|(_, kv_less)| !**kv_less)
+            .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
+            .collect();
+        self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;
+        super::btrace::mark("commit_frame");
+
+        let indptr_host = kv::indptr(&seats)?;
+        let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
         let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
         let mut geometries = (0..self.spaces)
             .map(|space| {

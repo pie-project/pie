@@ -455,6 +455,10 @@ pub struct Pools {
     committed_kv_pages: u32,
     committed_state_slots: u32,
     backed_pages: Vec<u64>,
+    /// The windowed pages backed so far, a bit each: the windowed rows and
+    /// the compressor slabs their pages key are backed a page at a time, as
+    /// the fires' windowed tables (and the windowed moves) first touch it.
+    backed_windowed: Vec<u64>,
     windowed_backed: bool,
     buffered: (u64, u64),
     host: Option<HostKv>,
@@ -599,12 +603,13 @@ impl Pools {
         }
         let mut pooled = Vec::new();
         for (space, width) in pooled_spaces(trace) {
-            // A slab keyed by a windowed space's pages is as long as its
-            // windowed pool.
+            // A slab keyed by a windowed row's pages (`space` is the cache row
+            // its gather reads) is as long as its windowed pool.
             let windowed = paging.window.is_some()
-                && shapes.iter().any(|shape| {
-                    matches!(shape, Shape::Kv { space: at, windowed: true, .. } if *at == space)
-                });
+                && matches!(
+                    shapes.get(space as usize),
+                    Some(Shape::Kv { windowed: true, .. })
+                );
             let row = PoolRow {
                 space,
                 width,
@@ -634,6 +639,7 @@ impl Pools {
             committed_kv_pages: 0,
             committed_state_slots: 0,
             backed_pages: Vec::new(),
+            backed_windowed: Vec::new(),
             windowed_backed: false,
             buffered: (0, 1),
             host: None,
@@ -811,6 +817,7 @@ impl Pools {
         self.paging.pages = pages;
         self.paging.slots = slots;
         self.windowed_backed = false;
+        self.backed_windowed.clear();
         Ok(())
     }
 
@@ -1043,21 +1050,101 @@ impl Pools {
         if self.windowed_backed || !self.has_windowed() {
             return Ok(());
         }
-        let page_size = self.paging.page_size;
-        for (planes, shape) in self.rows.iter().zip(&self.shapes) {
-            if !matches!(shape, Shape::Kv { windowed: true, .. }) {
-                continue;
-            }
-            for (at, arena) in planes.iter().enumerate() {
-                let bytes = watermark_bytes(shape, at, 0, 1, 0, page_size);
-                crate::device::zero_span(
-                    arena.span(0, bytes)?,
-                    usize::try_from(bytes).unwrap_or(0),
-                )?;
-            }
+        for (arena, bytes) in self.windowed_planes() {
+            crate::device::zero_span(arena.span(0, bytes)?, usize::try_from(bytes).unwrap_or(0))?;
         }
         self.windowed_backed = true;
         Ok(())
+    }
+
+    /// Backs the windowed pages `pages` (and the null page every page behind
+    /// a window reads) in the windowed rows and the compressor slabs their
+    /// pages key, those not backed yet: the windowed pool grows as its pages
+    /// are first used rather than whole on the first fire, so a pool sized
+    /// for every seat costs only the windows the seated sequences hold.
+    pub fn ensure_windowed(&mut self, pages: impl IntoIterator<Item = u64>) -> Result<()> {
+        if !self.has_windowed() {
+            return Ok(());
+        }
+        let capacity = self.paging.window_pages();
+        let mut fresh: Vec<u64> = core::iter::once(0)
+            .chain(pages)
+            .filter(|&page| {
+                !self
+                    .backed_windowed
+                    .get((page / 64) as usize)
+                    .is_some_and(|word| word & (1u64 << (page % 64)) != 0)
+            })
+            .collect();
+        fresh.sort_unstable();
+        fresh.dedup();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        if let Some(&page) = fresh.iter().find(|&&page| page >= capacity) {
+            return Err(Fault::Ceiling {
+                what: "windowed kv pages",
+                need: page + 1,
+                have: capacity,
+            });
+        }
+        // Runs of consecutive pages, a range each.
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for &page in &fresh {
+            match runs.last_mut() {
+                Some((first, count)) if *first + *count == page => *count += 1,
+                _ => runs.push((page, 1)),
+            }
+        }
+        let page_size = u64::from(self.paging.page_size);
+        let Pools {
+            pool,
+            rows,
+            shapes,
+            pooled,
+            ..
+        } = self;
+        let mut targets = Vec::new();
+        let ranges = |page_bytes: u64| {
+            elastic::Want::Ranges(
+                runs.iter()
+                    .map(|&(first, count)| (first * page_bytes, count * page_bytes))
+                    .collect(),
+            )
+        };
+        for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
+            if !matches!(shape, Shape::Kv { windowed: true, .. }) {
+                continue;
+            }
+            for (at, arena) in planes.iter_mut().enumerate() {
+                let page_bytes = watermark_bytes(shape, at, 0, 1, 0, self.paging.page_size);
+                targets.push(elastic::Target {
+                    arena,
+                    want: ranges(page_bytes),
+                });
+            }
+        }
+        for row in pooled.iter_mut().filter(|row| row.windowed) {
+            let page_bytes = page_size * row.width * u64::from(elem_size(POOL_STATE));
+            for arena in row.planes.iter_mut() {
+                targets.push(elastic::Target {
+                    arena,
+                    want: ranges(page_bytes),
+                });
+            }
+        }
+        match elastic::commit_atomically(pool, &mut targets)? {
+            Commit::Committed => {}
+            refusal => return Err(refuse(&self.pool, refusal)),
+        }
+        for &page in &fresh {
+            let (word, bit) = ((page / 64) as usize, page % 64);
+            if self.backed_windowed.len() <= word {
+                self.backed_windowed.resize(word + 1, 0);
+            }
+            self.backed_windowed[word] |= 1u64 << bit;
+        }
+        self.zero_null_page()
     }
 
     #[must_use]
@@ -1240,6 +1327,11 @@ impl Pools {
             highest = highest.max(u64::from(span.src_page.max(span.dst_page)) + 1);
         }
         self.ensure_kv(u32::try_from(highest).unwrap_or(u32::MAX))?;
+        self.ensure_windowed(
+            windowed
+                .iter()
+                .flat_map(|span| [u64::from(span.src_page), u64::from(span.dst_page)]),
+        )?;
         for (planes, shape) in self.rows.iter().zip(&self.shapes) {
             let Shape::Kv {
                 windowed: in_window,
@@ -1534,6 +1626,7 @@ impl Pools {
         }
         let highest = device.iter().map(|&page| page + 1).max().unwrap_or(0);
         self.ensure_kv(highest)?;
+        self.ensure_windowed(windowed.iter().map(|&(page, _)| u64::from(page)))?;
         let Some(buffer) = self.host.as_ref().map(|host| host.buffer.host() as u64) else {
             return Ok(());
         };
@@ -1642,23 +1735,20 @@ impl Pools {
         &mut self,
         demand: engine::frame::Demand,
         kv_ranges: &[(u64, u64)],
+        window_pages: &[u64],
     ) -> Result<()> {
-        if demand.kv_pages <= self.committed_kv_pages
+        if !(demand.kv_pages <= self.committed_kv_pages
             && demand.state_slots <= self.committed_state_slots
-            && (self.windowed_backed || !self.has_windowed())
             && kv_ranges
                 .iter()
-                .all(|&(first, count)| self.pages_backed(first, count))
+                .all(|&(first, count)| self.pages_backed(first, count)))
         {
-            return Ok(());
-        }
-        match self.commit_ranges(demand.kv_pages, demand.state_slots, Some(kv_ranges))? {
-            Commit::Committed => {
-                self.note_backed(kv_ranges);
-                self.zero_null_page()
+            match self.commit_ranges(demand.kv_pages, demand.state_slots, Some(kv_ranges))? {
+                Commit::Committed => self.note_backed(kv_ranges),
+                refusal => return Err(refuse(&self.pool, refusal)),
             }
-            refusal => Err(refuse(&self.pool, refusal)),
         }
+        self.ensure_windowed(window_pages.iter().copied())
     }
 
     fn pages_backed(&self, first: u64, count: u64) -> bool {
@@ -1702,11 +1792,9 @@ impl Pools {
         for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
             for (at, arena) in planes.iter_mut().enumerate() {
                 let want = match (shape, kv_ranges) {
-                    // The windowed pool is what a window per sequence
-                    // takes, so it is backed whole on the first fire.
-                    (Shape::Kv { windowed: true, .. }, _) => {
-                        elastic::Want::Prefix(watermark_bytes(shape, at, 0, windowed, 0, page_size))
-                    }
+                    // The windowed pool backs its pages as they are first
+                    // used (`ensure_windowed`).
+                    (Shape::Kv { windowed: true, .. }, _) => continue,
                     (Shape::Kv { .. }, Some(ranges)) => {
                         let page_bytes = watermark_bytes(shape, at, 1, 0, 0, page_size);
                         elastic::Want::Ranges(
@@ -1728,8 +1816,7 @@ impl Pools {
                 targets.push(elastic::Target { arena, want });
             }
         }
-        for row in pooled.iter_mut() {
-            // A windowed space's slabs are backed whole, as its pool is.
+        for row in pooled.iter_mut().filter(|row| !row.windowed) {
             let bytes = row.watermark_bytes(kv_pages, windowed, page_size);
             for arena in row.planes.iter_mut() {
                 targets.push(elastic::Target {
