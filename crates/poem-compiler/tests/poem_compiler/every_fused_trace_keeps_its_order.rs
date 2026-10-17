@@ -34,94 +34,55 @@ fn every_fused_trace_keeps_its_order() {
     assert!(broken.is_empty(), "{}", broken.join("\n"));
 }
 
-/// Gemma 4's attention prologue is a pattern the compiler folds, on every
-/// layer whose q, k and v share one projection.
+/// A catalog model's pattern folds on every layer it appears in: the kernel
+/// replaces each `unfused` op one for one.
 #[test]
-fn gemma_4_writes_its_kv_through_the_fused_kernel() {
-    let deployment = poem_compiler::catalog::deployment("gemma4-31b-bf16-kv-bf16")
-        .expect("the catalog states gemma4-31b");
-    let trace = deployment.trace(Platform::Cuda);
+fn catalog_models_fold_their_patterns_on_every_layer() {
     let count = |t: &poem_ir::Trace, op: &str| {
         t.nodes
             .iter()
             .filter(|node| poem_ir::Operands::name(&node.op) == op)
             .count()
     };
-    let layers = count(&trace, "layout.split_qkv");
-    let fused =
-        poem_compiler::fuse::fuse(trace, &["custom_cuda.qkv_fused_qknorm_rope_vnorm_write"]);
-    assert!(layers > 0);
-    assert_eq!(count(&fused, "layout.split_qkv"), 0);
-    assert_eq!(
-        count(&fused, "custom_cuda.qkv_fused_qknorm_rope_vnorm_write"),
-        layers
-    );
-}
-
-#[test]
-fn gpt_oss_rotates_and_writes_its_kv_from_the_packed_row() {
-    let deployment = poem_compiler::catalog::deployment("gptoss-120b-bf16-mxfp4-kv-bf16")
-        .expect("the catalog states gptoss-120b");
-    let trace = deployment.trace(Platform::Cuda);
-    let count = |t: &poem_ir::Trace, op: &str| {
-        t.nodes
-            .iter()
-            .filter(|node| poem_ir::Operands::name(&node.op) == op)
-            .count()
-    };
-    let layers = count(&trace, "layout.split_qkv");
-    let fused = poem_compiler::fuse::fuse(
-        trace,
-        &[
-            "elementwise.split_rope_yarn_append",
-            "elementwise.rope_yarn_append",
-        ],
-    );
-    assert!(layers > 0);
-    assert_eq!(
+    for (deployment, unfused, kernels, landed) in [
         (
-            count(&fused, "layout.split_qkv"),
-            count(&fused, "elementwise.split_rope_yarn_append")
+            "gemma4-31b-bf16-kv-bf16",
+            "layout.split_qkv",
+            &["custom_cuda.qkv_fused_qknorm_rope_vnorm_write"][..],
+            "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
         ),
-        (0, layers)
-    );
-}
-
-/// Kimi-K3's latent attention prefill (its query cut, absorbs and scoring)
-/// is a pattern the compiler folds, on every MLA layer.
-#[test]
-fn kimi_k3_folds_its_latent_prefill() {
-    let deployment = poem_compiler::catalog::deployment("kimik3-l4-bf16-mxfp4a8-kv-bf16")
-        .expect("the catalog states kimik3-l4");
-    let trace = deployment.trace(Platform::Cuda);
-    let count = |t: &poem_ir::Trace, op: &str| {
-        t.nodes
-            .iter()
-            .filter(|node| poem_ir::Operands::name(&node.op) == op)
-            .count()
-    };
-    let prefills = count(&trace, "attention.mla_prefill");
-    let fused = poem_compiler::fuse::fuse(trace, &["attention.mla_prefill_expanded"]);
-    assert!(prefills > 0);
-    assert_eq!(count(&fused, "attention.mla_prefill"), 0);
-    assert_eq!(count(&fused, "attention.mla_prefill_expanded"), prefills);
-}
-
-/// Kimi-K3's AttnRes blends whose rows only a norm reads fold with it.
-#[test]
-fn kimi_k3_folds_its_blends_into_their_norms() {
-    let deployment = poem_compiler::catalog::deployment("kimik3-l4-bf16-mxfp4a8-kv-bf16")
-        .expect("the catalog states kimik3-l4");
-    let trace = deployment.trace(Platform::Cuda);
-    let count = |t: &poem_ir::Trace, op: &str| {
-        t.nodes
-            .iter()
-            .filter(|node| poem_ir::Operands::name(&node.op) == op)
-            .count()
-    };
-    let blends = count(&trace, "elementwise.res_blend");
-    let fused = poem_compiler::fuse::fuse(trace, &["elementwise.res_blend_rmsnorm"]);
-    assert!(blends > 0);
-    assert_eq!(count(&fused, "elementwise.res_blend_rmsnorm"), blends);
-    assert_eq!(count(&fused, "elementwise.res_blend"), 0);
+        (
+            "gptoss-120b-bf16-mxfp4-kv-bf16",
+            "layout.split_qkv",
+            &[
+                "elementwise.split_rope_yarn_append",
+                "elementwise.rope_yarn_append",
+            ][..],
+            "elementwise.split_rope_yarn_append",
+        ),
+        (
+            "kimik3-l4-bf16-mxfp4a8-kv-bf16",
+            "attention.mla_prefill",
+            &["attention.mla_prefill_expanded"][..],
+            "attention.mla_prefill_expanded",
+        ),
+        (
+            "kimik3-l4-bf16-mxfp4a8-kv-bf16",
+            "elementwise.res_blend",
+            &["elementwise.res_blend_rmsnorm"][..],
+            "elementwise.res_blend_rmsnorm",
+        ),
+    ] {
+        let trace = poem_compiler::catalog::deployment(deployment)
+            .unwrap_or_else(|| panic!("the catalog states {deployment}"))
+            .trace(Platform::Cuda);
+        let layers = count(&trace, unfused);
+        let fused = poem_compiler::fuse::fuse(trace, kernels);
+        assert!(layers > 0, "{deployment}: {unfused}");
+        assert_eq!(
+            (count(&fused, unfused), count(&fused, landed)),
+            (0, layers),
+            "{deployment}: {landed}"
+        );
+    }
 }
