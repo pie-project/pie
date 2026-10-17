@@ -10,8 +10,7 @@ Park, Wang, Berg-Kirkpatrick, Polikarpova and D'Antoni, ***Grammar-Aligned
 Decoding*** (NeurIPS 2024) — <https://arxiv.org/abs/2405.21047>. Implements
 Eq. 3–4 and Algorithm 1.
 
-**Faithfulness: Exact (equivalent form).** See
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+**Faithfulness: Exact (equivalent form).**
 
 ## What it does
 

@@ -8,27 +8,233 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
+from ..imports import pie_inferlet_types
 import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
 
+@dataclass
+class BlockDrafter:
+    """
+    What a guest needs to seed a BLOCK drafter's draft pass: the rows one
+    pass carries (the anchor and `rows - 1` mask slots), the id every row
+    but the first carries in, and whether the block sees itself — in which
+    case the guest states the mask that says so. Facts the head was trained
+    at, not policy: which rows to verify, and whether to draft at all, stay
+    the guest's. `none` for a model with no block drafter (a chained head
+    is `mtp-depth`). Static, like `mtp-depth`.
+    """
+    rows: int
+    mask_token: int
+    bidirectional: bool
+    proposals_from: int
+
 class ForwardKind(Enum):
     """
-    Which forward-pass kind the bound model requires. A guest may only
-    construct the `forward-pass` of the matching interface; the other
-    interfaces' constructors error immediately.
+    Which forward-pass interface the bound model takes: `forward` for every
+    text model, whatever state it keeps; `forward-diffusion` for a
+    block-diffusion text.
     
-    Do NOT derive this by parsing `architecture()` — that is an open set and
-    every new model family would break guests. This enum is closed over
-    STATE SEMANTICS, so it does not grow with the model zoo.
-    
-    Relationship to `is-linear`: `is-linear()` == (`pass-kind()` !=
-    attention). `is-linear` remains as the commit-policy hint (irreversible
-    fold ⇒ FOLD-COMMIT); `pass-kind` is what selects the binding surface.
+    Do NOT derive this by parsing `architecture()` -- that is an open set.
     """
-    ATTENTION = 0
-    RECURRENT = 1
-    HYBRID = 2
+    TEXT = 0
+    DIFFUSION = 1
+
+@dataclass
+class CanvasShape:
+    """
+    The canvas a diffusion model denoises: how many tokens one block is,
+    and the trunk's hidden width (the row width of a self-conditioning
+    signal). `none` for every other kind — the same fact as
+    `pass-kind() == diffusion`, stated once with its numbers.
+    """
+    length: int
+    hidden: int
+    self_cond_taps: int
+
+class LaneStream(Enum):
+    """
+    ── Generative facts ────────────────────────────────────────────────
+    What a guest sizes an image/video job from, so it never parses
+    `architecture()`: the family's readings (the arms a pass can run),
+    its latent space, the schedule it was trained under, and the widest
+    float lane one pass carries. A text model answers an empty list,
+    `none`, `none` and 0: it has one implicit reading and no latent.
+    A lane's stream — which of the model's rectangles its rows belong to
+    (a lane is one request's rows of ONE stream; a request with text and
+    image rows submits one pass per stream, both in one attention group).
+    Codes agree with `poem_ir::Stream`.
+    """
+    TEXT = 0
+    IMAGE = 1
+    VIDEO = 2
+    AUDIO = 3
+    CONTEXT = 4
+    REFERENCE = 5
+
+class PortKind(Enum):
+    """
+    Which runtime input a float port feeds, and so what shape its channel
+    is. `latents`: `[rows, width]`, the lane's own rows, fed
+    from the channel's COMMITTED cell at every submit. `lane-vector`: one
+    `[width]` (or `[1, width]`) row per lane — a timestep, a guidance
+    scale. `context`: `[rows, width]`, an encoder's output, the rows of a
+    `context` lane. `axis-positions`: `[rows, width]` with `width` the
+    axis count (1..=4), the per-row RoPE coordinates. `voxels`: a VAE's
+    tile on the voxel axis — the channel is `[h, w, width]`
+    for a still or `[t, h, w, width]` for a clip, one clip per pass, its
+    shape being the clip's box.
+    """
+    LATENTS = 0
+    LANE_VECTOR = 1
+    CONTEXT = 2
+    AXIS_POSITIONS = 3
+    VOXELS = 4
+
+@dataclass
+class PortFact:
+    """
+    One float input port a reading declares. `dtype` is the CHANNEL's
+    element type the guest must declare (always `f32` today: the WIT
+    dtype set has no bf16; the model's own element type is the engine's
+    marshal). `width` is the trailing extent.
+    """
+    name: str
+    kind: PortKind
+    width: int
+    dtype: pie_inferlet_types.Dtype
+    streams: List[LaneStream]
+    rows: Optional[int]
+
+class AxisRole(Enum):
+    """
+    What one axis of an `axis-positions` port means. The rotary space a
+    DiT was trained in is 1..=4 axes wide and every family orders them
+    differently; this names them so a guest can fill the grid without
+    knowing the family.
+    """
+    TIME = 0
+    HEIGHT = 1
+    WIDTH = 2
+    INDEX = 3
+
+@dataclass
+class PositionConvention:
+    """
+    WHERE A READING'S LANES SIT IN THE ROTARY SPACE.
+    
+    A denoise reading's `axis-positions` port takes one coordinate vector
+    per row, and which coordinate goes where is a family contract the
+    guest must not spell (`flux_2`'s `(0, h, w, j)`, `z_image`'s
+    `(L + 1, a, b)`). This fact states it, so `latent::positions_for`
+    builds both from the same code:
+    
+      * a TEXT or CONTEXT lane's row `j` sits at `text-origin + j` on
+        axis `text-axis`, and at 0 on every other axis;
+      * an IMAGE lane's patch `(a, b)` sits at `a` on the `height` axis
+        and `b` on the `width` axis; on `text-axis` it sits at
+        `text-origin + text-rows` when `image-follows-text`, else 0; on
+        every remaining axis, 0.
+      * a REFERENCE lane's patch `(a, b)` of reference `i` sits where an
+        image lane's would, except on the `time` axis, where it sits at
+        `reference-stride * (i + 1)` -- the offset that keeps each
+        reference picture in a rotary neighbourhood of its own, clear of
+        the target grid at 0.
+    
+    `axes` has exactly the port's `width` entries. A family whose
+    positions do not fit this shape states `none` and its guests build
+    their own.
+    """
+    axes: List[AxisRole]
+    text_axis: int
+    text_origin: int
+    image_follows_text: bool
+    reference_stride: Optional[int]
+
+class ReadoutKind(Enum):
+    """
+    Which export seam a reading's epilogue reads: `logits()` for a text
+    head, `velocity()` for a denoiser, `hidden()` for an encoder,
+    `pixels` for a VAE reading on the voxel axis (one row per output
+    voxel of the pass's clip, `readout-width` wide).
+    """
+    LOGITS = 0
+    VELOCITY = 1
+    HIDDEN = 2
+    PIXELS = 3
+
+@dataclass
+class ReadingFact:
+    """
+    One reading of the bound model: the arm a pass runs when it names
+    this reading (`forward-pass.reading`). `index` is the fact value a
+    lane is stamped with; `has-kv` says whether `state` is required
+    (else refused) on its pass, `takes-tokens` the same for `embed`;
+    `streams` are the lane streams a request submits (one pass per
+    stream, `forward-pass.stream`; empty means text only); `ports` are
+    the float ports `forward-pass.input` binds; `positions` says where
+    its lanes' rows sit in the rotary space; `readout`/`readout-width`
+    say what the epilogue may read and how wide one row is (the
+    `velocity(width)` / `hidden(width)` declaration to make).
+    """
+    name: str
+    index: int
+    has_kv: bool
+    takes_tokens: bool
+    streams: List[LaneStream]
+    ports: List[PortFact]
+    positions: Optional[PositionConvention]
+    readout: ReadoutKind
+    readout_width: int
+
+@dataclass
+class LatentSpace:
+    """
+    The latent space a denoiser works in: one latent row is
+    `patch-t × patch-h × patch-w` cells of `channels` values, one cell
+    is `spatial-compression²` pixels by `temporal-compression` frames.
+    `none` for a model with no latent.
+    """
+    channels: int
+    patch_t: int
+    patch_h: int
+    patch_w: int
+    spatial_compression: int
+    temporal_compression: int
+
+class ScheduleKind(Enum):
+    """
+    The prediction target a schedule's velocity is.
+    """
+    FLOW = 0
+    EPSILON = 1
+    V = 2
+
+@dataclass
+class StreamShift:
+    """
+    The noise schedule the denoiser was trained under: `shift` is the
+    trained timestep shift (1.0 = none; a flow model's base `mu` when it
+    shifts by token count), `train-steps` scales the timestep axis,
+    `boundary` is the sigma a two-backbone family hands over at (`none`
+    for one backbone), `pinned-sigmas` a distilled model's fixed sigma
+    list, descending, without the final 0 (empty when the guest builds
+    its own), and `stream-shifts` names the per-modality shifts of a
+    family that runs several schedules at once. The library's
+    `latent::FlowMatchEuler` is built from this.
+    `none` when no reading denoises.
+    """
+    lane: LaneStream
+    shift: float
+
+@dataclass
+class ScheduleFact:
+    kind: ScheduleKind
+    shift: float
+    train_steps: int
+    boundary: Optional[float]
+    pinned_sigmas: List[float]
+    stream_shifts: List[StreamShift]
 
 
 def name() -> str:
@@ -50,23 +256,38 @@ def default_system_speculation() -> bool:
     Whether the bound model enables system speculation by default
     """
     raise NotImplementedError
-def is_linear() -> bool:
+def mtp_depth() -> int:
     """
-    Whether the bound model is linear/recurrent — i.e. it carries a fused
-    recurrent state that folds tokens IRREVERSIBLY (linear-attention / SSM:
-    Qwen3.5 GDN, Nemotron-H Mamba2), as opposed to pure attention whose KV is
-    per-token and reversibly discardable. TRUE iff the model has recurrent
-    state (equivalently `rs-state-size() > 0`). The runtime uses this to pick
-    the speculative-commit strategy — FOLD-COMMIT (fold only the accepted
-    prefix, holding the uncertain tail in the RS buffer; folding is
-    runtime-managed in-forward) for linear models vs KV-SLOT DISCARD for
-    attention — so the inferlet's spec-decode loop can stay model-agnostic.
-    Prefer this over
-    reading `rs-state-size()` as a class flag: this pins the commit CONTRACT
-    (irreversible fold ⇒ fold-commit), not a byte-accounting accident.
+    The draft head's chain depth: how many tokens past each readout row
+    the `mtp_drafts` intrinsic carries (`[n_out × depth]`, row-major,
+    each row's chain conditioned on the trunk's argmax at that row). Zero
+    for a model with no draft head, in which case `mtp_drafts` and
+    `mtp_logits` are unavailable. Static, like `frame-size`.
     """
     raise NotImplementedError
+def draft_block() -> Optional[BlockDrafter]:
+    raise NotImplementedError
 def pass_kind() -> ForwardKind:
+    raise NotImplementedError
+def canvas() -> Optional[CanvasShape]:
+    raise NotImplementedError
+def readings() -> List[ReadingFact]:
+    """
+    Every reading the bound model declares, in index order. Empty for a
+    model with one implicit reading (every text row), on which
+    `forward-pass.reading` is refused. Static.
+    """
+    raise NotImplementedError
+def latent() -> Optional[LatentSpace]:
+    raise NotImplementedError
+def schedule() -> Optional[ScheduleFact]:
+    raise NotImplementedError
+def max_latent_rows() -> int:
+    """
+    The most latent rows one pass may carry: the guest sizes its latent
+    channels (`[rows, width]`) under this. 0 for a model with no float
+    lane. Static.
+    """
     raise NotImplementedError
 def output_vocab_size() -> int:
     """
@@ -92,6 +313,54 @@ def frame_size() -> int:
     frame and never adapted from runtime timing.
     """
     raise NotImplementedError
+def submit_deadline_us() -> int:
+    """
+    How long (microseconds) a pipeline may hold a frame's wait-set without
+    submitting before the engine stops waiting for it.
+    
+    A frame does not dispatch until every participating pipeline has
+    submitted its slot, so membership is a promise to keep submitting, and
+    this is that promise's bound. The clock is per pipeline, measures
+    CONSECUTIVE silence while actually blocking a seal, and is suspended
+    whenever the engine is what the pipeline is waiting on — so it is not a
+    latency budget and a pipeline that keeps submitting can never trip it
+    however long it runs.
+    
+    A pipeline that intends to stop — blocked on a user turn, waiting on a
+    peer, or simply done for now — calls `forward.park` instead, which
+    leaves the wait-set and stops the clock. What this bound catches is
+    therefore only the case the engine cannot otherwise distinguish: a
+    member that will never submit again.
+    
+    Small (50ms by default) because it measures a much narrower interval
+    than its size suggests: run-ahead, an unsettled dispatch, a bind in
+    flight and `forward.park` all stop the clock, so what is left is a
+    pipeline hard-blocking the seal with nothing owed to it. It is not
+    smaller because the one-off cost of BUILDING the first pass of a loop
+    — tracing and compiling it after the prefill result lands — is on the
+    clock and was measured between 5ms and 20ms; a steady decode turnaround
+    is far below that.
+    
+    The corollary is the one thing a pipeline has to be deliberate about:
+    work done between receiving a result and submitting the next fire is
+    ON the clock, because during it the fleet is stalled on this pipeline
+    and nothing is owed back. Anything that can outlast this bound —
+    tokenizing a large document, compiling a grammar, an RPC, a decision
+    that waits on another pipeline — should be preceded by `forward.park`
+    and is rejoined by simply submitting again. Parking is cheap and
+    unparking is implicit, so when in doubt, park.
+    
+    Overrunning it is not fatal. The engine simply stops waiting: the slot
+    leaves the frame, already-submitted work still runs, and the next
+    submit rejoins. What it costs is a boundary — so treat this as the
+    budget that keeps you IN each frame, not as a deadline you die to.
+    (Termination is reserved for a pipeline that goes silent for orders of
+    magnitude longer without ever parking, i.e. an abandoned one.)
+    
+    Static, like frame-size and unlike channel-capacity: guests read it
+    once and size their work against it, so it must not move.
+    """
+    raise NotImplementedError
 def channel_capacity() -> int:
     """
     Host-reader channel capacity, in cells, that lets one lane sustain the
@@ -109,48 +378,27 @@ def channel_capacity() -> int:
     don't cache it across a run.
     """
     raise NotImplementedError
-def max_embed_length() -> int:
+def run_ahead_window() -> int:
     """
-    Max embed tokens in a single pass (C) — the prefill chunk budget.
-    Guests split a prompt of L tokens into ceil(L / C) chunk passes;
-    chunking is guest-side, against this static constant.
+    Fires one lane may have submitted and not yet taken -- the run-ahead
+    window, in fires. A host-reader ring of `channel-capacity` cells holds
+    exactly this many plus the visibility margin, so a guest that keeps
+    this many fires in flight never serialises and never overruns. The
+    runtime derives both numbers from one source (`engine::runahead`);
+    guests read this rather than recovering it from `channel-capacity`.
+    Not static, for the same reason `channel-capacity` is not.
     """
     raise NotImplementedError
-def prefill_chunk_hint() -> int:
+def max_readout_rows(kind: ReadoutKind) -> int:
     """
-    The prefill chunk the scheduler would like to see right now, in
-    tokens: the per-forward token budget shared evenly among the live
-    processes, rounded down to whole KV pages, never below one page and
-    never above `max-embed-length`. A hint, not a limit: the runtime never
-    splits a fire. Not static: it moves with the number of live processes.
+    The most rows one pass may read out through `kind`: what a pass returns,
+    not how long it is. A pass whose rows cannot run in pieces is refused
+    past one fire.
     """
     raise NotImplementedError
 def rs_state_size() -> int:
     """
-    ── Working-set / arena capabilities (global, over the bound model) ──
-    Memory-shaping parameters of the bound model's engine, so an inferlet
-    can size working sets and validate fold lengths before allocating.
-    Size in bytes of one folded recurrent-state object. 0 if the model has
-    no recurrent state (pure attention).
-    """
-    raise NotImplementedError
-def rs_buffer_page_size() -> int:
-    """
-    Tokens per buffered RS page. 0 if the model has no recurrent state.
-    """
-    raise NotImplementedError
-def rs_fold_granularity() -> int:
-    """
-    Fold granularity in tokens: an RS fold of `n` tokens requires `n` to
-    be a positive multiple of this value. 1 (or 0) means unconstrained;
-    0 also implies the model has no recurrent state. (Token-causal RS models
-    — Qwen3.5 GDN, Nemotron-H Mamba2 — report 1.)
-    """
-    raise NotImplementedError
-def arena_block_size() -> int:
-    """
-    Size in bytes of one unified-arena accounting block. In v1 the KV page is
-    exactly one block, so this is the byte size of one KV page; an RS slab
-    occupies an integer number of these blocks.
+    Size in bytes of one folded recurrent state. 0 if the model keeps
+    none (attention only, windowed or not).
     """
     raise NotImplementedError

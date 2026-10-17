@@ -51,14 +51,20 @@ pub(crate) fn init(max_upload_bytes: usize) {
     inbox::spawn();
 }
 
+pub const DEFAULT_TENANT: &str = "default";
+
 pub fn open_session() -> Result<ClientId> {
+    open_session_for(DEFAULT_TENANT.to_string())
+}
+
+pub fn open_session_for(tenant: String) -> Result<ClientId> {
     let state = get_state()?;
     let id = state.next_client_id.fetch_add(1, Ordering::Relaxed);
 
     let (out_tx, out_rx) = mpsc::channel(1000);
     SESSION_OUTBOX.insert(id, Arc::new(TokioMutex::new(out_rx)));
 
-    let session = Session::new_inproc(id, state, out_tx);
+    let session = Session::new_inproc(id, state, out_tx, tenant);
     CLIENT_SERVICES.spawn(id, || session)?;
     Ok(id)
 }
@@ -204,6 +210,7 @@ pub(super) const MAX_INFLIGHT_UPLOADS: usize = 16;
 struct Session {
     pub(super) id: ClientId,
     pub(super) username: String,
+    pub(super) tenant: String,
     state: Arc<ServerState>,
     pub(super) inflight_uploads: DashMap<UploadKey, InFlightUpload>,
     pub(super) attached_processes: Vec<ProcessId>,
@@ -221,10 +228,12 @@ impl Session {
         id: ClientId,
         state: Arc<ServerState>,
         out_tx: mpsc::Sender<WireServerMessage>,
+        tenant: String,
     ) -> Self {
         Session {
             id,
             username: "internal".to_string(),
+            tenant,
             state,
             inflight_uploads: DashMap::new(),
             attached_processes: Vec::new(),
@@ -374,9 +383,20 @@ impl Session {
                 inferlet,
                 input,
                 capture_outputs,
+                props,
+                session,
+                router_props,
             } => {
-                self.handle_launch_process(corr_id, inferlet, input, capture_outputs)
-                    .await
+                self.handle_launch_process(
+                    corr_id,
+                    inferlet,
+                    input,
+                    capture_outputs,
+                    props,
+                    session,
+                    router_props,
+                )
+                .await
             }
 
             ClientMessage::AttachProcess {
@@ -438,7 +458,12 @@ mod tests {
         let seen_attached = probe::spawn(attached);
         let mut seen_background = probe::spawn(background);
 
-        let mut session = Session::new_inproc(7, install_state(0), mpsc::channel(1).0);
+        let mut session = Session::new_inproc(
+            7,
+            install_state(0),
+            mpsc::channel(1).0,
+            DEFAULT_TENANT.to_string(),
+        );
         session.attached_processes = vec![launched, attached];
         session.launched_processes.insert(launched);
         drop(session);

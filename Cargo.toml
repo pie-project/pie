@@ -34,6 +34,7 @@ members = [
 
     "crates/inferlet",
     "crates/inferlet-macros",
+    "crates/policy",
     "crates/wasmtime-web",
 
     "crates/poem-ir",
@@ -104,6 +105,7 @@ default-members = [
 exclude = [
     "examples",
     "crates/builtins/inferlets",
+    "crates/builtins/policies",
     ".claude",
 ]
 

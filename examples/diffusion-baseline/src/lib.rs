@@ -9,7 +9,7 @@
 //! stable-and-confident stopping rule. The host moves the canvas ids across
 //! (256 ints a step), sets the step's temperature, and reads the stop flag.
 //! The finished block — the last argmax canvas — is committed by an `encode`
-//! pass over the same pages, which becomes the prefix of the next block.
+//! pass over the same slots, which freezes it as the prefix of the next block.
 //!
 //! Self-conditioning rides as the guest's taps: each step's epilogue also
 //! emits the top-`taps` of the temperature-scaled softmax per canvas row,
@@ -97,17 +97,17 @@ async fn main(input: Input) -> Result<Output> {
     let shape = model::canvas().ok_or("a diffusion model states its canvas")?;
     let length = shape.length;
     let taps = shape.self_cond_taps;
-    if max_embed_length() < length as usize {
+    // The canvas attends both ways, so the runtime cannot cut it: one fire reads every row.
+    let readable = max_readout_rows(model::ReadoutKind::Logits);
+    if readable < length as usize {
         return Err(format!(
-            "the engine embeds at most {} tokens a pass and a canvas is {length}",
-            max_embed_length()
+            "the engine reads out at most {readable} rows a fire and a canvas is {length}"
         ));
     }
     if !(input.t_min > 0.0 && input.t_max >= input.t_min) {
         return Err("temperatures must satisfy 0 < t_min <= t_max".into());
     }
     let vocab = model::output_vocab_size();
-    let page_size = kv_page_size();
     let stop_tokens = inferlet::chat::stop_tokens();
     let max_tokens = input.max_tokens.unwrap_or(length as usize);
     if max_tokens == 0 {
@@ -127,19 +127,14 @@ async fn main(input: Input) -> Result<Output> {
         prompt.push(0);
     }
     let n = u32::try_from(prompt.len()).map_err(|_| "prompt is too long")?;
-    let max_pages = (n + canvases * length).div_ceil(page_size).max(1);
 
     let ws = WorkingSet::new();
-    ws.reserve(max_pages).context("reserve KV")?;
     let pipe = Pipeline::new();
 
-    // ── 1. Prefill: encode passes over the prompt, chunked ────────────────
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    for &(base, end) in &prefill_chunks(n, None) {
-        encode(&ws, &pipe, &prompt_i32[base as usize..end as usize], base, max_pages, page_size)
-            .await
-            .with_context(|| format!("prefill @{base}"))?;
-    }
+    encode(&ws, &pipe, &prompt_i32, 0)
+        .await
+        .context("prefill")?;
 
     // ── 2. Canvases ───────────────────────────────────────────────────────
     let mut generated: Vec<u32> = Vec::new();
@@ -153,18 +148,14 @@ async fn main(input: Input) -> Result<Output> {
         let base = n + block * length;
         let end = base + length;
 
-        // The canvas and its geometry: constant across the block's steps, so
-        // the consumed ports (tokens, positions, write descriptor) are
-        // re-put — the tokens by the host, the rest by the epilogue.
-        let toks = Channel::from(noise_canvas(input.seed ^ block.wrapping_mul(0x9e37_79b9), length, vocab))
-            .named("canvas");
+        let toks = Channel::from(noise_canvas(
+            input.seed ^ block.wrapping_mul(0x9e37_79b9),
+            length,
+            vocab,
+        ))
+        .named("canvas");
         let embed_indptr = Channel::from([0u32, length]).named("embed_indptr");
-        let positions = Channel::from_iter(base..end).named("positions");
-        let pages = Channel::from_iter(0..max_pages).named("pages");
-        let page_indptr = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot");
-        let w_off = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off");
-        let kv_len = Channel::from([end]).named("kv_len");
+        let slots = Channel::from_iter(base..end).named("slots");
         let readout = Channel::from_iter(0..length).named("readout");
         // The step counter, device-carried: the temperature schedule is
         // computed from it in the epilogue (the same `linear_temperature`
@@ -194,32 +185,19 @@ async fn main(input: Input) -> Result<Output> {
         let fwd = ForwardPass::new();
         fwd.canvas(Mode::Denoise)?;
         fwd.embed(&toks, &embed_indptr)?;
-        fwd.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &positions,
-                mask: None,
+        fwd.state(
+            &[&ws],
+            StateGeometry {
+                slots: Some(&slots),
+                ..StateGeometry::default()
             },
         )?;
         fwd.readout(&readout)?;
         fwd.self_conditioning_from(&tap_ids_out, &tap_weights_out)
             .context("bind self-conditioning to the tap channels")?;
         fwd.epilogue(move || {
-            // The geometry is the same every step; consumed ports go back —
-            // the kv length too, so the whole geometry is the device's
-            // (the runtime's decode envelope) and the canvas need never
-            // cross the host.
-            positions.put(positions.take());
-            w_slot.put(w_slot.take());
-            w_off.put(w_off.take());
-            kv_len.put(kv_len.take());
+            // Re-put unchanged: every step writes the same canvas slots.
+            slots.put(slots.take());
 
             let r = rng_state.take();
             // `t = t_min + (t_max - t_min) * (remaining / max_steps)`, with
@@ -305,7 +283,7 @@ async fn main(input: Input) -> Result<Output> {
         entropy_trace.push(trace);
 
         // ── 3. Commit: the argmax canvas, read causally, becomes the prefix.
-        encode(&ws, &pipe, &argmax_canvas, base, max_pages, page_size)
+        encode(&ws, &pipe, &argmax_canvas, base)
             .await
             .with_context(|| format!("commit block {block}"))?;
 
@@ -334,45 +312,26 @@ async fn main(input: Input) -> Result<Output> {
     })
 }
 
-/// One `encode` pass over `tokens` at positions `base..`: the causal
-/// reading, whose K/V become the sequence. Reads out its last row so the
+/// One `encode` pass over `tokens` at slots `base..`: the causal reading,
+/// whose K/V become the sequence and freeze. Reads out its last row so the
 /// fire has a drained output (an epilogue put that is never taken fills the
 /// ring; a pass with nothing to say still says one word).
-async fn encode(
-    ws: &WorkingSet,
-    pipe: &Pipeline,
-    tokens: &[i32],
-    base: u32,
-    max_pages: u32,
-    page_size: u32,
-) -> Result<()> {
+async fn encode(ws: &WorkingSet, pipe: &Pipeline, tokens: &[i32], base: u32) -> Result<()> {
     let len = u32::try_from(tokens.len()).map_err(|_| "an encode span is too long")?;
-    let end = base + len;
     let toks = Channel::from(tokens).named("toks_e");
     let embed_indptr = Channel::from([0u32, len]).named("embed_indptr_e");
-    let positions = Channel::from_iter(base..end).named("positions_e");
-    let pages = Channel::from_iter(0..max_pages).named("pages_e");
-    let page_indptr = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr_e");
-    let w_slot = Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot_e");
-    let w_off = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_e");
-    let kv_len = Channel::from([end]).named("kv_len_e");
+    // Stated, not appended: a commit replaces the canvas scratch at `base..`.
+    let slots = Channel::from_iter(base..base + len).named("slots_e");
     let last = Channel::new([1], dtype::i32).named("last_e");
 
     let fwd = ForwardPass::new();
     fwd.canvas(Mode::Encode)?;
     fwd.embed(&toks, &embed_indptr)?;
-    fwd.attention(
-        ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &kv_len,
-            pages: &pages,
-            page_indptr: &page_indptr,
-            w_slot: &w_slot,
-            w_off: &w_off,
-            positions: &positions,
-            mask: None,
+    fwd.state(
+        &[ws],
+        StateGeometry {
+            slots: Some(&slots),
+            ..StateGeometry::folding()
         },
     )?;
     fwd.epilogue(move || {

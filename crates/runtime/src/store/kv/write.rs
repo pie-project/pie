@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::hash::Hash256;
 use super::page_table::{PhysicalKvPageId, WorkingSetId};
 
@@ -29,6 +27,7 @@ impl PreparedTarget {
         }
     }
 
+    #[cfg(test)]
     pub fn dst(&self) -> PhysicalKvPageId {
         match *self {
             PreparedTarget::Fresh { dst, .. }
@@ -43,20 +42,11 @@ pub struct KvPreparedWrite {
     pub(crate) ws: WorkingSetId,
     pub(crate) targets: Vec<PreparedTarget>,
     pub(crate) allocated: Vec<PhysicalKvPageId>,
-    pub(crate) old_mapped: u64,
     pub(crate) cow_start: Option<u64>,
     pub(crate) seq: u64,
 }
 
 impl KvPreparedWrite {
-    pub fn working_set(&self) -> WorkingSetId {
-        self.ws
-    }
-
-    pub fn seq(&self) -> u64 {
-        self.seq
-    }
-
     pub fn targets(&self) -> &[PreparedTarget] {
         &self.targets
     }

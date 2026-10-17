@@ -7,7 +7,7 @@ use crate::run::Run;
 
 fn extended_origin(
     indptr: &[i32],
-    lanes: &[crate::rs::LanePlan],
+    lanes: &[engine::rs::LanePlan],
     lane0: u32,
     r: usize,
 ) -> (u32, u32) {
@@ -68,7 +68,7 @@ impl Run<'_> {
         op: &'static str,
         seat: &Seat,
         plane: usize,
-        run: &crate::rs::Run,
+        run: &engine::rs::Run,
         rect: Tensor,
         row0: u32,
         into_slab: bool,
@@ -117,12 +117,6 @@ impl Run<'_> {
             let Some(plan) = seat.lanes.get(lane0 as usize + r) else {
                 continue;
             };
-            if plan.override_rows {
-                if let Some(run) = &plan.gather {
-                    self.rs_move(op, seat, plane, run, ext, begin, false)?;
-                }
-                continue;
-            }
             if let Some(run) = &plan.gather {
                 self.rs_move(op, seat, plane, run, ext, begin, false)?;
             }

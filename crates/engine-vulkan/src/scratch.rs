@@ -2,6 +2,7 @@ use kernels_vulkan::Tensor;
 use kernels_vulkan::attn::ple;
 use kernels_vulkan::linear::moe::{self, RoutedScratch};
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
+use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
 use poem_ir::{Attention, Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
 
@@ -489,10 +490,10 @@ fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Opt
                     .then_some(budget.max_tokens)
             });
         let Some(rows) = rows else { continue };
-        if !crate::window::copyable_mask(trace, compiled, &region.mask) {
+        if !fallback::copyable_mask(trace, compiled, &region.mask) {
             continue;
         }
-        let Some((ins, outs)) = crate::window::operands(&trace.nodes, region) else {
+        let Some((ins, outs)) = fallback::operands(&trace.nodes, region) else {
             continue;
         };
         let mut seen: Vec<u64> = Vec::new();

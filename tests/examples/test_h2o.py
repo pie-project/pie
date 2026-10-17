@@ -7,7 +7,7 @@ layers on every step. A flat mass trace means the loop-carried channel is
 being re-seeded behind the program's back; a jumpy one means it is reading
 stale device memory.
 
-Then the same two enforcement questions `test_mask_enforced.py` asks of Quest.
+Then whether the keep-set it selects is enforced.
 
 Run from the repo root with PYTHONPATH=packages/python/server/python.
 """

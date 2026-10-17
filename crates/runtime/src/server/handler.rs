@@ -358,11 +358,7 @@ impl Session {
 impl Session {
     #[allow(
         clippy::too_many_arguments,
-        reason = "one add-program frame exactly as it arrives off the wire: the \
-                  correlation id, the program it belongs to, and the chunked-upload \
-                  triple (`chunk_index`, `total_chunks`, `chunk_data`). These are \
-                  decoded fields of a protocol message, so re-bundling them into a \
-                  host-side struct would just re-encode what the wire already framed"
+        reason = "the add-program frame's fields, as they arrive off the wire"
     )]
     pub(super) async fn handle_add_program(
         &mut self,
@@ -460,13 +456,35 @@ impl Session {
 }
 
 impl Session {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launch message's fields, destructured where it is matched: a \
+                  struct for them would be the message again"
+    )]
     pub(super) async fn handle_launch_process(
         &mut self,
         corr_id: u32,
         inferlet: String,
         input: String,
         capture_outputs: bool,
+        mut props: client_api::Props,
+        session: Option<String>,
+        router_props: client_api::Props,
     ) {
+        // A worker also takes clients that did not come through a gateway.
+        if let Err(why) = client_api::props::from_client(&mut props)
+            .and_then(|()| client_api::props::check_session(session.as_deref()))
+        {
+            self.send_response(corr_id, false, format!("launch refused: {why}"))
+                .await;
+            return;
+        }
+        // The gateway's router policy speaks for itself, under its prefix.
+        props.extend(
+            router_props.into_iter().map(|(name, value)| {
+                (format!("{}{name}", client_api::props::ROUTER_PREFIX), value)
+            }),
+        );
         // A bare `name` is its newest installed version: how the gateway's
         // fixed routes reach the built-in inferlets.
         let program_name = if inferlet.contains('@') {
@@ -520,6 +538,11 @@ impl Session {
             client_id,
             capture_outputs,
             None,
+            crate::policy::Arrival {
+                tenant: self.tenant.clone(),
+                session,
+                props,
+            },
         ) {
             Ok(process_id) => {
                 if capture_outputs {

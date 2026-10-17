@@ -585,7 +585,7 @@ fn lower_region(stage: &CompiledStage, region: &Region) -> LaunchRegion {
         inputs: region.inputs.clone(),
         outputs: region.outputs.clone(),
         row_value: region.row_value,
-        row_alias: region.row_alias,
+        row_alias: region.row_alias.map(|(_, count)| count),
         sinks: region
             .sinks
             .iter()

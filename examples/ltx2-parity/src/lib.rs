@@ -307,8 +307,8 @@ async fn refine(case: &Case) -> Result<((Vec<f32>, u32), (Vec<f32>, u32))> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Attention {
-        return Err("ltx_2 is an attention-kind pass with no kv bound on any reading".into());
+    if model::pass_kind() != model::ForwardKind::Text {
+        return Err("ltx_2 is a `forward` pass with no state bound on any reading".into());
     }
     let pieces: String = [
         &input.case_0,

@@ -12,6 +12,7 @@ pub type Clips<'a> = crate::voxels::Clips<'a>;
 #[derive(Debug, Clone)]
 pub struct Seated<'a> {
     pub lane: Lane<'a>,
+    pub positions: &'a [u32],
     pub pages: &'a [u32],
     pub held: Option<u32>,
     pub kv_less: bool,
@@ -33,6 +34,7 @@ pub struct Seated<'a> {
     pub peer: Option<u32>,
     pub ports: &'a [PortFeed],
     pub attn_classes: Option<&'a AttnClasses>,
+    pub reports: u64,
 }
 
 impl<'a> Seated<'a> {
@@ -40,6 +42,7 @@ impl<'a> Seated<'a> {
     pub fn of(lane: Lane<'a>) -> Seated<'a> {
         Seated {
             lane,
+            positions: &[],
             pages: &[],
             held: None,
             kv_less: false,
@@ -61,6 +64,7 @@ impl<'a> Seated<'a> {
             peer: None,
             ports: &[],
             attn_classes: None,
+            reports: 0,
         }
     }
 

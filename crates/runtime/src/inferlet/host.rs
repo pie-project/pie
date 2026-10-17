@@ -2,18 +2,17 @@ pub mod chat;
 pub mod forward;
 pub mod frames;
 pub mod grammar;
-pub mod kv_working_set;
 pub mod media;
 pub mod model;
 pub mod pipeline;
 pub mod reasoning;
-pub mod rs_working_set;
 pub mod session;
 pub mod speech;
 pub mod system;
 pub mod tokenizer;
 pub mod tools;
 pub mod types;
+pub mod working_set;
 
 use crate::inferlet::ProcessCtx;
 use wasmtime::component::HasSelf;
@@ -43,16 +42,13 @@ wasmtime::component::bindgen!({
         "wasi:http": wasmtime_wasi_http::p3::bindings::http,
         "wasi:clocks": wasmtime_wasi::p3::bindings::clocks,
         "wasi:filesystem": wasmtime_wasi::p3::bindings::filesystem,
-        "pie:inferlet/working-set.kv-working-set": crate::store::kv::working_set::KvWorkingSet,
+        "pie:inferlet/working-set.working-set": working_set::WorkingSet,
         "pie:inferlet/grammar.grammar": grammar::Grammar,
         "pie:inferlet/grammar.matcher": grammar::Matcher,
         "pie:inferlet/channel.channel": forward::Channel,
         "pie:inferlet/forward.forward-pass": forward::ForwardPass,
-        "pie:inferlet/forward-recurrent.forward-pass": forward::ForwardPass,
-        "pie:inferlet/forward-hybrid.forward-pass": forward::ForwardPass,
         "pie:inferlet/forward-diffusion.forward-pass": forward::ForwardPass,
         "pie:inferlet/pipeline.pipeline": pipeline::Pipeline,
-        "pie:inferlet/working-set.rs-working-set": crate::store::rs::working_set::RsWorkingSet,
         "pie:inferlet/media.image": media::Image,
         "pie:inferlet/media.video": media::Video,
         "pie:inferlet/media.audio": media::Audio,
@@ -79,8 +75,6 @@ pub fn add_to_linker(
     pie::inferlet::grammar::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::channel::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::forward::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
-    pie::inferlet::forward_recurrent::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
-    pie::inferlet::forward_hybrid::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::forward_diffusion::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::session::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::media::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;

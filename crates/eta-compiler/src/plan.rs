@@ -10,6 +10,4 @@ pub use compile::{
     stage_identity,
 };
 pub(crate) use compile::{StageIndex, direct_topk};
-pub use lane_table::{
-    LANE_TABLE_ABI_VERSION, LaneChannelSlot, LaneRecord, LaneTableHeader, RuntimeExtents,
-};
+pub use lane_table::{LANE_TABLE_ABI_VERSION, LaneChannelSlot, LaneRecord, LaneTableHeader};

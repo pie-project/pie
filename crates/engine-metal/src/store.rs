@@ -177,17 +177,93 @@ pub struct Pools {
     shapes: Vec<Shape>,
     paging: Paging,
     watermark: engine::frame::Demand,
-    disk: Option<DiskKv>,
+    disk: Option<Spill>,
+    /// This pool already is host memory, so parked rs rows go to disk too.
+    parked: Option<Spill>,
+    parked_pages: Option<Spill>,
     /// The budget every elastic plane draws on; `None` for a fixed pool.
     arena: Option<elastic::Arena>,
 }
 
-/// The slot file kv is suspended into, and the page a copy to or from it
-/// gathers the planes in, in slot layout.
 #[derive(Debug)]
-struct DiskKv {
+struct Spill {
     file: engine::disk::SlotFile,
     stage: engine::disk::Aligned,
+}
+
+impl Spill {
+    fn open(
+        dir: &std::path::Path,
+        name: &str,
+        slot_bytes: u64,
+        budget: u64,
+    ) -> Result<Option<Spill>> {
+        let file =
+            engine::disk::SlotFile::open(dir, name, slot_bytes, budget).map_err(slot_file)?;
+        Ok(file.map(|file| Spill {
+            stage: engine::disk::Aligned::zeroed(file.stride()),
+            file,
+        }))
+    }
+
+    fn slots(spill: Option<&Spill>) -> u32 {
+        spill.map_or(0, |spill| spill.file.slots())
+    }
+
+    fn room(spill: Option<&Spill>, what: &'static str, slots: &[u32]) -> Result<()> {
+        let have = Spill::slots(spill);
+        match slots.iter().find(|&&slot| slot >= have) {
+            Some(&slot) => Err(Fault::Ceiling {
+                what,
+                need: u64::from(slot) + 1,
+                have: u64::from(have),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// The planes are host memory: the caller has drained every command buffer
+    /// that touches them.
+    fn copy(
+        &mut self,
+        planes: &mut [Plane],
+        layout: &[(usize, u64)],
+        mut extra: Option<(&mut Buffer, u64)>,
+        to_disk: bool,
+        ids: &[u32],
+        slots: &[u32],
+    ) -> Result<()> {
+        for (&id, &slot) in ids.iter().zip(slots) {
+            let staged = self.stage.as_mut_slice();
+            if !to_disk {
+                self.file.read(slot, staged).map_err(slot_file)?;
+            }
+            let mut offset = 0;
+            for &(plane, bytes) in layout {
+                let on_device = u64::from(id) * bytes;
+                let on_host = &mut staged[offset..offset + bytes as usize];
+                if to_disk {
+                    planes[plane].read(on_device, on_host)?;
+                } else {
+                    planes[plane].write(on_device, on_host)?;
+                }
+                offset += bytes as usize;
+            }
+            if let Some((buffer, bytes)) = extra.as_mut() {
+                let on_device = u64::from(id) * *bytes;
+                let on_host = &mut staged[offset..offset + *bytes as usize];
+                if to_disk {
+                    buffer.read(on_device, on_host)?;
+                } else {
+                    buffer.write(on_device, on_host)?;
+                }
+            }
+            if to_disk {
+                self.file.write(slot, staged).map_err(slot_file)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What one cache row needs of its planes, as bytes per token cell.
@@ -252,6 +328,8 @@ impl Pools {
             paging,
             watermark: engine::frame::Demand::ZERO,
             disk: None,
+            parked: None,
+            parked_pages: None,
             arena,
         })
     }
@@ -713,7 +791,7 @@ impl Pools {
         Ok(planes)
     }
 
-    fn page_bytes(&self) -> Result<u64> {
+    pub fn page_bytes(&self) -> Result<u64> {
         let page_size = u64::from(self.paging.page_size);
         Ok(self
             .kv_planes()?
@@ -722,79 +800,112 @@ impl Pools {
             .sum())
     }
 
-    /// Opens `dir`'s slot file with `budget` bytes of kv pages; a budget
-    /// short of one page seats none.
-    pub fn seat_disk(&mut self, dir: &std::path::Path, budget: u64) -> Result<u32> {
-        let file =
-            engine::disk::SlotFile::open(dir, 0, self.page_bytes()?, budget).map_err(slot_file)?;
-        self.disk = file.map(|file| DiskKv {
-            stage: engine::disk::Aligned::zeroed(file.stride()),
-            file,
-        });
-        Ok(self.disk.as_ref().map_or(0, |disk| disk.file.slots()))
+    fn state_planes(&self) -> Vec<(usize, u64)> {
+        self.shapes
+            .iter()
+            .filter_map(|shape| match *shape {
+                Shape::State {
+                    stride,
+                    dtype,
+                    plane,
+                } => Some((plane, stride * u64::from(elem_size(dtype)))),
+                Shape::Kv { .. } | Shape::Compressed { .. } => None,
+            })
+            .collect()
+    }
+
+    pub fn seat_disk(
+        &mut self,
+        dir: &std::path::Path,
+        budget: u64,
+        page_bytes: u64,
+    ) -> Result<u32> {
+        let stride = |bytes: u64| bytes.next_multiple_of(engine::disk::ALIGN as u64);
+        let (state, page) = (self.state_slot_bytes(), page_bytes);
+        let pair = stride(state) + stride(page);
+        let rows = u64::from(self.paging.slots).min(budget.checked_div(pair).unwrap_or(0));
+        self.parked = Spill::open(dir, "r0.rs", state, rows * stride(state))?;
+        self.parked_pages = Spill::open(dir, "r0.rsb", page, rows * stride(page))?;
+        self.disk = Spill::open(dir, "r0.kv", self.page_bytes()?, budget - rows * pair)?;
+        Ok(Spill::slots(self.disk.as_ref()))
+    }
+
+    pub fn unseat_disk(&mut self) {
+        self.disk = None;
+        self.parked = None;
+        self.parked_pages = None;
+    }
+
+    #[must_use]
+    pub fn parked_slots(&self) -> u32 {
+        Spill::slots(self.parked.as_ref())
+    }
+
+    #[must_use]
+    pub fn parked_pages(&self) -> u32 {
+        Spill::slots(self.parked_pages.as_ref())
     }
 
     /// Copies whole kv pages between the pool and the slot file, `pages[i]`
-    /// with `slots[i]`, one page through the stage at a time. The planes are
-    /// host-addressable memory, so the caller has drained every command
-    /// buffer that touches them.
+    /// with `slots[i]`.
     pub fn spill_kv(&mut self, to_disk: bool, pages: &[u32], slots: &[u32]) -> Result<()> {
-        let have = self.disk.as_ref().map_or(0, |disk| disk.file.slots());
-        if let Some(&slot) = slots.iter().find(|&&slot| slot >= have) {
-            return Err(Fault::Ceiling {
-                what: "disk kv pages",
-                need: u64::from(slot) + 1,
-                have: u64::from(have),
-            });
-        }
-        let highest = pages.iter().map(|&page| page + 1).max().unwrap_or(0);
+        Spill::room(self.disk.as_ref(), "disk kv pages", slots)?;
         engine::frame::Supply::commit(
             self,
             engine::frame::Demand {
-                kv_pages: highest,
+                kv_pages: pages.iter().map(|&page| page + 1).max().unwrap_or(0),
                 state_slots: 0,
                 workspace: 0,
             },
         )?;
-        let Some(mut disk) = self.disk.take() else {
-            return Ok(());
-        };
-        let copied = self.spill_through(&mut disk, to_disk, pages, slots);
-        self.disk = Some(disk);
-        copied
+        let page_size = u64::from(self.paging.page_size);
+        let layout: Vec<(usize, u64)> = self
+            .kv_planes()?
+            .into_iter()
+            .map(|(plane, cell)| (plane, page_size * cell))
+            .collect();
+        match self.disk.as_mut() {
+            Some(disk) => disk.copy(&mut self.planes, &layout, None, to_disk, pages, slots),
+            None => Ok(()),
+        }
     }
 
-    fn spill_through(
-        &mut self,
-        disk: &mut DiskKv,
-        to_disk: bool,
-        pages: &[u32],
-        slots: &[u32],
-    ) -> Result<()> {
-        let page_size = u64::from(self.paging.page_size);
-        let planes = self.kv_planes()?;
-        for (&page, &slot) in pages.iter().zip(slots) {
-            let staged = disk.stage.as_mut_slice();
-            if !to_disk {
-                disk.file.read(slot, staged).map_err(slot_file)?;
-            }
-            let mut offset = 0;
-            for &(plane, cell) in &planes {
-                let bytes = page_size * cell;
-                let on_device = u64::from(page) * bytes;
-                let on_host = &mut staged[offset..offset + bytes as usize];
-                if to_disk {
-                    self.planes[plane].read(on_device, on_host)?;
-                } else {
-                    self.planes[plane].write(on_device, on_host)?;
-                }
-                offset += bytes as usize;
-            }
-            if to_disk {
-                disk.file.write(slot, staged).map_err(slot_file)?;
-            }
+    pub fn park_state(&mut self, out: bool, device: &[u32], rows: &[u32]) -> Result<()> {
+        if let Some(&slot) = device.iter().find(|&&slot| slot >= self.paging.slots) {
+            return Err(Fault::Ceiling {
+                what: "recurrent slots",
+                need: u64::from(slot) + 1,
+                have: u64::from(self.paging.slots),
+            });
         }
-        Ok(())
+        Spill::room(self.parked.as_ref(), "parked rs rows", rows)?;
+        engine::frame::Supply::commit(
+            self,
+            engine::frame::Demand {
+                kv_pages: 0,
+                state_slots: device.iter().map(|&slot| slot + 1).max().unwrap_or(0),
+                workspace: 0,
+            },
+        )?;
+        let layout = self.state_planes();
+        match self.parked.as_mut() {
+            Some(parked) => parked.copy(&mut self.planes, &layout, None, out, device, rows),
+            None => Ok(()),
+        }
+    }
+
+    pub fn park_pages(
+        &mut self,
+        out: bool,
+        pages: &[u32],
+        rows: &[u32],
+        buffer: (&mut Buffer, u64),
+    ) -> Result<()> {
+        Spill::room(self.parked_pages.as_ref(), "parked rs buffer pages", rows)?;
+        match self.parked_pages.as_mut() {
+            Some(parked) => parked.copy(&mut [], &[], Some(buffer), out, pages, rows),
+            None => Ok(()),
+        }
     }
 
     pub fn copy_state(&mut self, frame: &mut Frame, moves: &[(u32, u32)]) -> Result<()> {
@@ -1136,7 +1247,7 @@ fn split(name: &str, planes: &[u64]) -> Result<Planes> {
 
 fn slot_file(error: std::io::Error) -> Fault {
     Fault::Device {
-        call: "kv slot file",
+        call: "slot file",
         why: error.to_string(),
     }
 }
@@ -1226,6 +1337,8 @@ mod tests {
             paging: paging(slots),
             watermark: engine::frame::Demand::ZERO,
             disk: None,
+            parked: None,
+            parked_pages: None,
             arena: None,
         }
     }
@@ -1321,6 +1434,8 @@ mod tests {
             paging,
             watermark: engine::frame::Demand::ZERO,
             disk: None,
+            parked: None,
+            parked_pages: None,
             arena,
         }
     }
@@ -1468,7 +1583,7 @@ mod tests {
             .expect("the values written");
         let dir =
             std::env::temp_dir().join(format!("pie-metal-kv-{}-{backing:?}", std::process::id()));
-        assert_eq!(pools.seat_disk(&dir, 1 << 20).expect("a slot file"), 256);
+        assert_eq!(pools.seat_disk(&dir, 1 << 20, 0).expect("a slot file"), 256);
         pools.spill_kv(true, &[1, 3], &[7, 8]).expect("suspended");
         pools.planes[0].zero(0, plane).expect("the keys cleared");
         pools.planes[1].zero(0, plane).expect("the values cleared");
@@ -1553,6 +1668,8 @@ mod tests {
             paging: paging(2),
             watermark: engine::frame::Demand::ZERO,
             disk: None,
+            parked: None,
+            parked_pages: None,
             arena: None,
         };
         let mut frame = device.frame().expect("a frame");

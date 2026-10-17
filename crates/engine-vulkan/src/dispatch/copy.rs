@@ -1,7 +1,7 @@
 use kernels_vulkan::{Tensor, layout};
 use poem_compiler::Region;
 use poem_exec::KernelError;
-use poem_exec::fire::Serve;
+use poem_exec::fire::{Serve, fallback};
 use poem_ir::{Def, Dim, Ty, ValueId};
 
 use crate::run::Run;
@@ -110,7 +110,7 @@ impl Run<'_> {
             });
         };
 
-        let Some((ins, outs)) = crate::window::operands(self.nodes(), region) else {
+        let Some((ins, outs)) = fallback::operands(self.nodes(), region) else {
             return plan;
         };
         for id in ins {

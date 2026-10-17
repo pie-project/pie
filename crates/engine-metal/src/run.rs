@@ -3,12 +3,13 @@ use kernels_metal::linear::moe::RoutedScratch;
 use kernels_metal::{
     Bank, Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor,
 };
+use poem_exec::fire::At;
 use poem_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
 use crate::device::Handles;
 use crate::dispatch::copy::CopyPlan;
 use crate::scratch::Scratch;
-use crate::window::{At, Window, Windows};
+use crate::window::{Window, Windows};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WeightRow {

@@ -1,6 +1,6 @@
 # prefix-tree-kv-cache
 
-A small prompt tree that shares KV cache pages across common prefixes, then
+A small prompt tree that shares model state across common prefixes, then
 forks into independent leaves for generation.
 
 ## Source
@@ -9,7 +9,7 @@ Zheng et al., ***SGLang: Efficient Execution of Structured Language Model
 Programs*** — <https://arxiv.org/abs/2312.07104>. Demonstrates the RadixAttention
 prefix-sharing mechanism in explicit ETA working sets.
 
-**Faithfulness: Structural — explicit copy-on-write tree, not runtime RadixAttention.**
+**Faithfulness: Structural — explicit fork tree, not runtime RadixAttention.**
 It shows prefix KV reuse over a fixed two-level tree, but the tree is authored by
 the inferlet rather than discovered automatically by the scheduler.
 
@@ -23,8 +23,8 @@ programs that fan out from a prompt template into many suffixes.
 This inferlet builds that shape directly. It pre-fills `Write a short scene set`,
 forks two branches (`in a city`, `in a forest`), forks each of those into two
 leaves (`at dawn`, `at night`), and then generates from all four leaves. The
-interesting operation is `WorkingSet::fork`: descendants inherit the parent's KV
-pages and append their own tokens copy-on-write.
+interesting operation is `WorkingSet::fork`: a child shares its parent's frozen
+slots and appends its own tokens after them.
 
 ## The rule
 
@@ -48,11 +48,11 @@ for a in [" in a city", " in a forest"]:
 
 ## Implementation notes
 
-A KV working set is scoped to the first pipeline that fires it, so the whole tree
-build and all four leaf generations stay on one pipeline. The append and decode
-passes keep the page CSR aligned with the true sequence length using
-`page_count = ceil(kv_len / page_size)`, then run the usual device-carried greedy
-decode loop for each leaf.
+Every append folds what it wrote (`StateGeometry::folding()`), so the prefix
+is frozen before it is forked and the branches share it rather than copy it.
+The tree is built on one pipeline, which orders each fork after the append it
+forks from; each leaf then decodes on its own pipeline with the usual
+device-carried greedy loop.
 
 ## Run
 

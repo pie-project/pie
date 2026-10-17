@@ -965,6 +965,11 @@ impl Inputs {
     }
 
     #[must_use]
+    pub fn tokens_at(&self) -> u64 {
+        self.store.ptr() + self.tokens
+    }
+
+    #[must_use]
     pub fn port(&self, kind: engine::fire::PortKind, port: u8, rows: u32) -> Option<Tensor> {
         let at = self
             .ports

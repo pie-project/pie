@@ -6,9 +6,8 @@
 (`crates/eta-dsl/tests/eta_dsl/inferlet_goldens.rs`), so the gate here is the end-to-end
 one: the same prompt produces the SAME TOKENS from every language.
 
-The naive twins are compared to each other (and to Rust on an attention-only
-model: `naive-baseline` binds the attention-only pass, which a hybrid model
-refuses by name), since their Gumbel-max draw is seeded and replayable.
+The naive twins are compared to each other and to Rust, since their Gumbel-max
+draw is seeded and replayable.
 
 Run against a live server::
 
@@ -36,12 +35,14 @@ async def _tokens(client, args, name: str, inputs: dict) -> list[int]:
 
 
 async def test_text_completion_twins_agree(client, args):
-    inputs = {"prompt": PROMPT, "max_tokens": 16}
-    rust = await _tokens(client, args, "text-completion", inputs)
-    py = await _tokens(client, args, "text-completion-py", inputs)
-    js = await _tokens(client, args, "text-completion-js", inputs)
-    assert py == rust, f"python twin diverged: {py} vs {rust}"
-    assert js == rust, f"javascript twin diverged: {js} vs {rust}"
+    # A long prompt too: where the runtime cuts a pass is its own, so the twins agree on both.
+    long_prompt = " ".join(["The capital of France is Paris."] * 40) + " " + PROMPT
+    for inputs in ({"prompt": PROMPT, "max_tokens": 16}, {"prompt": long_prompt, "max_tokens": 4}):
+        rust = await _tokens(client, args, "text-completion", inputs)
+        py = await _tokens(client, args, "text-completion-py", inputs)
+        js = await _tokens(client, args, "text-completion-js", inputs)
+        assert py == rust, f"python twin diverged: {py} vs {rust}"
+        assert js == rust, f"javascript twin diverged: {js} vs {rust}"
 
 
 async def test_naive_baseline_twins_agree(client, args):
@@ -49,22 +50,8 @@ async def test_naive_baseline_twins_agree(client, args):
     py = await _tokens(client, args, "naive-baseline-py", inputs)
     js = await _tokens(client, args, "naive-baseline-js", inputs)
     assert js == py, f"javascript twin diverged: {js} vs {py}"
-    try:
-        rust = await _tokens(client, args, "naive-baseline", inputs)
-    except RuntimeError as e:
-        # An attention-only pass on a hybrid model is refused by name.
-        if "forward-hybrid" in str(e):
-            return
-        raise
+    rust = await _tokens(client, args, "naive-baseline", inputs)
     assert py == rust, f"python twin diverged: {py} vs {rust}"
-
-
-async def test_python_twin_long_prompt_chunks(client, args):
-    """A prompt past one chunk exercises `prefill_chunks` in the port."""
-    inputs = {"prompt": " ".join(["The capital of France is Paris."] * 40) + " The capital of France is", "max_tokens": 4}
-    rust = await _tokens(client, args, "text-completion", inputs)
-    py = await _tokens(client, args, "text-completion-py", inputs)
-    assert py == rust
 
 
 SCHEMA = '{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}'
@@ -84,32 +71,20 @@ async def _constrained(client, args, name: str) -> str:
     return output[start:]
 
 
-def _attention_only_refusal(e: BaseException) -> bool:
-    """The Rust reference binds the attention-only pass, which a hybrid model
-    refuses by name; the twins are kind-aware, so they still compare to each
-    other there."""
-    return "forward-hybrid" in str(e)
-
-
 async def test_constrained_decoding_twins_agree(client, args):
     """The grammar/mask path: the Python and JS twins must produce the same
     JSON as the Rust inferlet (greedy under the same mask)."""
     py = await _constrained(client, args, "json-schema-constrained-decoding-py")
     js = await _constrained(client, args, "json-schema-constrained-decoding-js")
     assert json.loads(js) == json.loads(py), f"javascript twin diverged: {js} vs {py}"
-    try:
-        rust = await _constrained(client, args, "json-schema-constrained-decoding")
-    except RuntimeError as e:
-        if _attention_only_refusal(e):
-            return
-        raise
+    rust = await _constrained(client, args, "json-schema-constrained-decoding")
     assert json.loads(py) == json.loads(rust), f"python twin diverged: {py} vs {rust}"
 
 
 class EngineNondeterministic(FileNotFoundError):
     """Raised (and reported as SKIP by the harness) when the engine itself
     does not reproduce a greedy program run-to-run on this model, so a
-    cross-language comparison cannot say anything about the inferlet librarys."""
+    cross-language comparison cannot say anything about the inferlet libraries."""
 
 
 async def test_prefix_tree_twins_agree(client, args):
@@ -131,12 +106,7 @@ async def test_prefix_tree_twins_agree(client, args):
     js = await run_inferlet(client, "prefix-tree-kv-cache-js", inputs, timeout=args.timeout)
     assert "city at dawn:" in py and "forest at night:" in py, py
     assert js.strip() == py.strip(), f"javascript twin diverged:\n{js}\nvs\n{py}"
-    try:
-        rust = await run_inferlet(client, "prefix-tree-kv-cache", inputs, timeout=args.timeout)
-    except RuntimeError as e:
-        if _attention_only_refusal(e):
-            return
-        raise
+    rust = await run_inferlet(client, "prefix-tree-kv-cache", inputs, timeout=args.timeout)
     assert py.strip() == rust.strip(), f"python twin diverged:\n{py}\nvs\n{rust}"
 
 
@@ -157,12 +127,7 @@ async def test_top_a_sampling_twins_agree(client, args):
     assert py["min_kept"] >= 1 and py["count"] == 8, py
     assert js["tokens"] == py["tokens"], f"javascript twin diverged: {js} vs {py}"
     assert abs(js["mean_kept"] - py["mean_kept"]) < 1e-6 and abs(js["mean_mass"] - py["mean_mass"]) < 1e-6, (js, py)
-    try:
-        rust = await _report(client, args, "top-a-sampling", inputs)
-    except RuntimeError as e:
-        if _attention_only_refusal(e):
-            return
-        raise
+    rust = await _report(client, args, "top-a-sampling", inputs)
     # The Rust output carries no token list; text + count + stats pin it.
     assert rust["text"] == py["text"] and rust["count"] == py["count"], (rust, py)
     assert abs(rust["mean_kept"] - py["mean_kept"]) < 1e-6 and abs(rust["mean_mass"] - py["mean_mass"]) < 1e-6, (rust, py)
@@ -171,8 +136,8 @@ async def test_top_a_sampling_twins_agree(client, args):
 async def test_beam_search_twins_agree(client, args):
     """On-device beam search — the widest surface of the twins: the `mask`
     port, `from_shaped`, `capacity`, `top_k` / `gather` / `or` over a `[B, V]`
-    block, `run_ahead` (attention) or per-lane `RsWorkingSet.fork` + rebind
-    (hybrid). Every beam starts from BOS, so the whole report line is exact."""
+    block, and `run_ahead` over one working set every beam shares. Every beam
+    starts from BOS, so the whole report line is exact."""
     for inputs in ({"max_tokens": 6, "beams": 3}, {"max_tokens": 6, "beams": 1}):
         py = await run_inferlet(client, "beam-search-py", inputs, timeout=args.timeout)
         js = await run_inferlet(client, "beam-search-js", inputs, timeout=args.timeout)
@@ -186,7 +151,6 @@ def tests():
     return [
         test_text_completion_twins_agree,
         test_naive_baseline_twins_agree,
-        test_python_twin_long_prompt_chunks,
         test_constrained_decoding_twins_agree,
         test_prefix_tree_twins_agree,
         test_top_a_sampling_twins_agree,

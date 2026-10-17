@@ -14,8 +14,7 @@ The **scope split** — repetition reads `prompt ∪ output`, while frequency an
 presence read the output only — follows
 [vLLM](https://github.com/vllm-project/vllm)'s sampler.
 
-**Faithfulness: Exact.** See
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+**Faithfulness: Exact.**
 
 ## What it does
 

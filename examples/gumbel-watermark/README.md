@@ -15,8 +15,6 @@ The greenlist scheme this is contrasted with is Kirchenbauer et al. —
 [`greenlist-watermarking`](../greenlist-watermarking).
 
 **Faithfulness: Exact (equivalent form)**, with one bounded deviation (below).
-See
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 ## What it does
 

@@ -1,0 +1,8 @@
+# Sends a session's processes where its last one went, so a conversation's
+# turns find their prefix cached. A first turn goes by the router's default.
+plane = "router"
+subscribe = ["arrived", "dispatched", "exited", "worker-removed"]
+grants = ["placement"]
+# Long enough for the call that places a new arrival to answer.
+gate-ms = 20
+gate-fail = "open"

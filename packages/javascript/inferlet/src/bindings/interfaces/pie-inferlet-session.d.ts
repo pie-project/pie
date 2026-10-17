@@ -63,6 +63,17 @@ export function receiveBlocking(): string | undefined;
  * `receive-file` for the same guests.
  */
 export function receiveFileBlocking(): Blob | undefined;
+/**
+ * Merges `props`, a JSON object, into this process's PLEX props; a `null`
+ * removes a name. `router/` names are dropped and props over the limits
+ * refused.
+ */
+export function setProps(props: string): void;
+/**
+ * This process's own token counts, for the scheduling policy: report
+ * `prompt` as soon as it is tokenized.
+ */
+export function setTokens(prompt: number, generated: number): void;
 export type Blob = import('./pie-inferlet-types.js').Blob;
 export type Error = import('./pie-inferlet-types.js').Error;
 export type Frames = import('./pie-inferlet-frames.js').Frames;

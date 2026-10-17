@@ -130,26 +130,9 @@ fn mixed(at: u32, fold: u32) -> RsVerb {
 fn replaying(at: u32, fold: u32, replay: u32) -> RsVerb {
     RsVerb::Buffer {
         pages: (0..PAGES as u32).collect(),
-        at,
+        base: 0,
+        folded: at - replay,
         fold: FoldLen::Host(fold),
-        replay,
-    }
-}
-
-fn fold_buffered(len: u32) -> RsVerb {
-    bounded_fold(WINDOW as u32, len)
-}
-
-fn bounded_fold(bound: u32, len: u32) -> RsVerb {
-    fold_buffered_at(0, bound, len)
-}
-
-fn fold_buffered_at(at: u32, bound: u32, len: u32) -> RsVerb {
-    RsVerb::FoldBuffered {
-        pages: (0..PAGES as u32).collect(),
-        at,
-        bound,
-        len: FoldLen::Host(len),
     }
 }
 
@@ -197,7 +180,7 @@ fn a_state_parked_on_host_resumes_in_another_slot() {
         fire(shell, &[lane]).expect("the fold runs")
     };
 
-    shell.seat_host_kv(None, 1).expect("host rows pin");
+    shell.seat_host_kv(None, 0, 0, 1).expect("host rows pin");
     for slot in 4..8 {
         shell.open(slot).expect("slot opens");
     }
@@ -289,87 +272,6 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
          buffer is that a rejected draft is pure host bookkeeping"
     );
 
-    fire(
-        &mut shell,
-        &[seated(
-            1,
-            &tokens,
-            fold_buffered(WINDOW as u32),
-            RsReset::Held,
-        )],
-    )
-    .expect("the fold-buffered fire runs");
-    let replayed = shell.state_bytes(1).expect("slot 1 reads back");
-    assert_eq!(
-        replayed.len(),
-        folded.len(),
-        "the two slots hold different amounts of state, which is a pool bug"
-    );
-    let differing = folded.iter().zip(&replayed).filter(|(a, b)| a != b).count();
-    let (worst, coarse, any) = bank_gap(&folded, &replayed);
-    eprintln!(
-        "claim 2: {differing} bytes differ; as f32 cells: worst |d| {worst:.3e}, {coarse} cells past 1e-3 relative, {any} cells differ at all"
-    );
-    if std::env::var_os("PIE_GATE_PROBE").is_none() {
-        assert_eq!(
-            differing,
-            0,
-            "buffer-then-fold-buffered left {differing} of {} state bytes different from the \
-             fold it replaces",
-            folded.len(),
-        );
-    }
-
-    shell.open(2).expect("slot 2 opens");
-    fire(&mut shell, &[seated(2, &tokens, buffer(0), RsReset::Fresh)])
-        .expect("the second buffering fire runs");
-    fire(
-        &mut shell,
-        &[seated(2, &tokens, fold_buffered(4), RsReset::Held)],
-    )
-    .expect("the truncated fold-buffered fire runs");
-    let truncated = shell.state_bytes(2).expect("slot 2 reads back");
-    assert_ne!(
-        truncated, zeroed,
-        "a fold truncated at 4 tokens folded nothing at all"
-    );
-    assert_ne!(
-        truncated, replayed,
-        "a fold truncated at 4 tokens left the same bytes as one over all {WINDOW}, so \
-         `commit_len` reached the launch and was ignored"
-    );
-
-    shell.open(3).expect("slot 3 opens");
-    fire(
-        &mut shell,
-        &[seated(3, &tokens[..4], bounded_fold(4, 4), RsReset::Fresh)],
-    )
-    .expect("the shorter-bounded fold-buffered fire runs");
-    let shorter = shell.state_bytes(3).expect("slot 3 reads back");
-    {
-        let (w, c, a) = bank_gap(&truncated, &shorter);
-        eprintln!("claim 4: truncated(4) vs bounded(4): worst {w:.3e}, {c} coarse, {a} differ");
-        let (w, c, a) = bank_gap(&folded, &truncated);
-        eprintln!("claim 3: fold(20) vs truncated(4): worst {w:.3e}, {c} coarse, {a} differ");
-    }
-    assert_ne!(
-        shorter, zeroed,
-        "a replay bounded at 4 tokens folded nothing at all"
-    );
-    let differing = truncated
-        .iter()
-        .zip(&shorter)
-        .filter(|(a, b)| a != b)
-        .count();
-    assert_eq!(
-        differing,
-        0,
-        "a fold of {WINDOW} buffered tokens truncated at 4 left {differing} of {} state \
-         bytes different from a fold of the same 4 over a buffer bounded there — the \
-         length seat is still changing the arithmetic and not only the count",
-        truncated.len(),
-    );
-
     shell.open(4).expect("slot 4 opens");
     let mixed_out = fire(
         &mut shell,
@@ -377,41 +279,14 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
     )
     .expect("the mixed fire runs");
     let mixed_state = shell.state_bytes(4).expect("slot 4 reads back");
-    {
-        let (w, c, a) = bank_gap(&truncated, &mixed_state);
-        eprintln!("claim 5: mixed(0,4) vs truncated(4): worst {w:.3e}, {c} coarse, {a} differ");
-        shell.open(5).expect("slot 5 opens");
-        fire(
-            &mut shell,
-            &[seated(5, &tokens[..4], RsVerb::Fold, RsReset::Fresh)],
-        )
-        .expect("four fold plainly");
-        let four = shell.state_bytes(5).expect("slot 5 reads back");
-        let (w, c, a) = bank_gap(&four, &mixed_state);
-        eprintln!("probe: fold(4) vs mixed(0,4): worst {w:.3e}, {c} coarse, {a} differ");
-        let (w, c, a) = bank_gap(&four, &truncated);
-        eprintln!("probe: fold(4) vs truncated replay(4): worst {w:.3e}, {c} coarse, {a} differ");
-        shell.open(5).expect("slot 5 reopens");
-        fire(
-            &mut shell,
-            &[seated(5, &tokens, RsVerb::Fold, RsReset::Fresh)],
-        )
-        .expect("fold again");
-        let again = shell.state_bytes(5).expect("slot 5 reads back");
-        let (w, c, a) = bank_gap(&folded, &again);
-        eprintln!("probe: fold(20) twice: worst {w:.3e}, {c} coarse, {a} differ");
-    }
-    let differing = truncated
-        .iter()
-        .zip(&mixed_state)
-        .filter(|(a, b)| a != b)
-        .count();
-    assert_eq!(
-        differing,
-        0,
-        "one fire that buffers {WINDOW} tokens and folds 4 of them left {differing} of {} \
-         state bytes different from buffering them and folding 4 in two fires",
-        truncated.len(),
+    assert_ne!(
+        mixed_state, zeroed,
+        "a fire folding 4 of its rows folded nothing at all"
+    );
+    assert_ne!(
+        mixed_state, folded,
+        "a fire folding 4 of its {WINDOW} rows left the banks a fold of all of them leaves, \
+         so `commit_len` reached the launch and was ignored"
     );
 
     let mixed_row = mixed_out.first().expect("the mixed fire reads a row back");
@@ -535,6 +410,8 @@ fn the_read_path_replays_the_buffer_it_folds() {
     let first = window();
     let k = WINDOW as u32;
     let second: Vec<u32> = (0..6u32).map(|at| 3000 + at * 41).collect();
+    let third: Vec<u32> = (0..4u32).map(|at| 5000 + at * 43).collect();
+    let b = second.len() as u32;
 
     shell.open(6).expect("slot 6 opens");
     fire(
@@ -582,9 +459,9 @@ fn the_read_path_replays_the_buffer_it_folds() {
 
     fire(
         &mut shell,
-        &[seated(7, &second, fold_buffered_at(k, 6, 6), RsReset::Held)],
+        &[seated(7, &third, replaying(k + b, b, b), RsReset::Held)],
     )
-    .expect("B's buffer folds");
+    .expect("window C replays B and folds it");
     let differing = folded_ab
         .iter()
         .zip(&shell.state_bytes(7).expect("slot 7 reads back"))
@@ -615,31 +492,25 @@ fn the_read_path_replays_the_buffer_it_folds() {
     .expect("window B replays A and folds four of it");
     let truncated = shell.state_bytes(3).expect("slot 3 reads back");
     shell.open(4).expect("slot 4 opens");
-    fire(&mut shell, &[seated(4, &first, buffer(0), RsReset::Fresh)]).expect("A buffers");
     fire(
         &mut shell,
-        &[seated(
-            4,
-            &first[..4],
-            fold_buffered_at(0, 4, 4),
-            RsReset::Held,
-        )],
+        &[seated(4, &first, mixed(0, 4), RsReset::Fresh)],
     )
-    .expect("four of A's buffer folds");
-    let two_fire = shell.state_bytes(4).expect("slot 4 reads back");
+    .expect("A buffers and folds four of its rows");
+    let one_fire = shell.state_bytes(4).expect("slot 4 reads back");
     let (worst, coarse, _) = bank_gap(&folded_a4, &truncated);
     eprintln!(
         "read path, truncated fold vs a plain Fold(A[..4]): worst {worst:.3e}, {coarse} coarse (printed)"
     );
-    let (worst, coarse, any) = bank_gap(&two_fire, &truncated);
+    let (worst, coarse, any) = bank_gap(&one_fire, &truncated);
     eprintln!(
-        "read path, truncated fold vs buffer-then-fold-four: worst {worst:.3e}, {coarse} coarse, {any} differ"
+        "read path, truncated fold vs a fire folding four of its own rows: worst {worst:.3e}, {coarse} coarse, {any} differ"
     );
     assert_eq!(
         (coarse, any),
         (0, 0),
-        "a round replaying {k} and folding 4 left banks {worst} off buffering {k} and folding \
-         4 in two fires — the truncated commit lands somewhere else on the read path"
+        "a round replaying {k} and folding 4 left banks {worst} off a fire folding 4 of its \
+         own rows — the truncated commit lands somewhere else on the read path"
     );
     let d = spread(&plain[0], &partial[0]);
     eprintln!("read path, truncated fold: last-row logit spread {d:.4}");

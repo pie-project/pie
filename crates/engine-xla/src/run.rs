@@ -9,12 +9,13 @@
 use kernels_xla::{
     Bank, Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor,
 };
+use poem_exec::fire::At;
 use poem_ir::{Def, Dim, Dtype, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
 use crate::store::{CachePool, CacheTable};
 use crate::trace::Handles;
 use crate::weights::{WeightRow, WeightTable};
-use crate::window::{At, Window, Windows};
+use crate::window::{Window, Windows};
 
 #[derive(Clone, Debug, Default)]
 pub struct SlotTable(pub Vec<Option<Tensor>>);

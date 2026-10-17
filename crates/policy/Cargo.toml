@@ -1,0 +1,18 @@
+[package]
+name = "policy"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Writing a PLEX serving policy for pie: the plex:policy contract and the support library a policy builds against"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+keywords = ["wasi", "wasm", "pie", "plex", "policy"]
+categories = ["wasm"]
+
+include = ["src/**/*", "wit/**/*"]
+
+[dependencies]
+wit-bindgen = "0.62.0"
+
+[lints]
+workspace = true

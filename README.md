@@ -87,7 +87,7 @@ traced once and runs on the GPU after each forward pass; the host only sees
 the token it publishes. The same program in JavaScript is
 [`examples/quickstart-js`](examples/quickstart-js); Rust inferlets use the
 [`inferlet`](https://crates.io/crates/inferlet) crate and compile to
-`wasm32-wasip2`. [`examples/`](examples) goes on from here: chunked prefill
+`wasm32-wasip2`. [`examples/`](examples) goes on from here: a one-pass prefill
 with a device loop-carried decode, beam search, speculative decoding,
 constrained decoding, KV-cache sharing, diffusion.
 

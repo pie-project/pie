@@ -6,7 +6,9 @@ use checkpoint::contract::ModelContract;
 use poem_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, FireRows, PatchLadder, compile_axes,
 };
-use poem_exec::fire::{Composition, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
+use poem_exec::fire::{
+    At, Composition, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, fallback, walk,
+};
 use poem_ir::{Dtype, Layout, Operation, RuntimeInput, Trace, Ty, ValueId};
 
 use crate::arena::Arena;
@@ -21,7 +23,7 @@ use crate::settle::{Airborne, Arms, Done};
 use crate::store::Pools;
 use crate::store::kv::{self, Paging, Seat};
 use crate::weights::Weights;
-use crate::window::{At, Cursor, Windows};
+use crate::window::Windows;
 
 use engine::fire::{Boundary, Masking};
 use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Supply};
@@ -517,7 +519,7 @@ impl Shell {
 
         let arms = boot.runahead.frames().max(1);
 
-        let gathers = crate::window::gathers(&boot.trace, &compiled);
+        let gathers = fallback::gathers(&boot.trace, &compiled);
 
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
@@ -1107,24 +1109,109 @@ impl Shell {
         Ok(())
     }
 
-    /// Opens the slot file under `dir` with `budget` bytes of kv pages.
-    pub fn seat_disk_kv(&mut self, budget: u64, dir: Option<&Path>) -> Result<u32> {
-        if let Some(dir) = dir.filter(|_| budget > 0) {
-            self.pools.seat_disk(&self.device, dir, budget)?;
+    /// Unstated `budget`: `seats` sequences at `context` and at least the pool,
+    /// within a quarter of the free space.
+    pub fn seat_disk_kv(
+        &mut self,
+        budget: Option<u64>,
+        dir: Option<&Path>,
+        seats: u32,
+        context: u32,
+    ) -> Result<u32> {
+        let Some(dir) = dir else { return Ok(0) };
+        let paging = self.pools.paging();
+        let buffered = self
+            .rs_buffers
+            .as_ref()
+            .map_or(0, |buffers| buffers.pages().1);
+        let unstated = budget.is_none();
+        let budget = budget.unwrap_or_else(|| {
+            engine::disk::unstated_budget(
+                dir,
+                u64::from(paging.slots),
+                self.pools.state_slot_bytes() + buffered,
+                paging.pages(),
+                u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1))),
+                self.pools.page_bytes(),
+            )
+        });
+        if let Err(error) = self.pools.seat_disk(&self.device, dir, budget, buffered) {
+            if !unstated {
+                return Err(error);
+            }
+            self.pools.unseat_disk();
         }
         Ok(self.pools.disk_pages())
+    }
+
+    #[must_use]
+    pub fn parked_state_slots(&self) -> u32 {
+        self.pools.parked_slots()
+    }
+
+    #[must_use]
+    pub fn parked_buffer_pages(&self) -> u32 {
+        self.pools.parked_pages()
+    }
+
+    #[must_use]
+    pub fn buffer_pages(&self) -> u32 {
+        self.rs_buffers
+            .as_ref()
+            .map_or(0, crate::rs::Buffers::page_count)
     }
 
     pub fn spill_kv(&mut self, to_disk: bool, device: &[u32], disk: &[u32]) -> Result<()> {
         self.pools.spill_kv(&self.device, to_disk, device, disk)
     }
 
+    pub fn park_state(&mut self, out: bool, device: &[u32], rows: &[u32]) -> Result<()> {
+        self.pools.park_state(&self.device, out, device, rows)
+    }
+
+    pub fn park_pages(&mut self, out: bool, pages: &[u32], rows: &[u32]) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let buffers = self.rs_buffers.as_ref().ok_or(Fault::Ceiling {
+            what: "recurrent buffer pages",
+            need: 1,
+            have: 0,
+        })?;
+        self.pools
+            .park_pages(&self.device, out, pages, rows, buffers.pages())
+    }
+
+    pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
+        if moves.is_empty() {
+            return Ok(());
+        }
+        let (slab, bytes) = self
+            .rs_buffers
+            .as_ref()
+            .ok_or(Fault::Ceiling {
+                what: "recurrent buffer pages",
+                need: 1,
+                have: 0,
+            })?
+            .pages();
+        let mut frame = self.device.frame()?;
+        for &(src, dst) in moves {
+            frame.copy(
+                slab,
+                u64::from(src) * bytes,
+                slab,
+                u64::from(dst) * bytes,
+                bytes,
+            )?;
+        }
+        self.grafted = Some(frame.commit_async(None)?);
+        Ok(())
+    }
+
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
         let mut frame = self.device.frame()?;
         self.pools.copy_slot(&mut frame, src, dst)?;
-        if let Some(buffers) = &self.rs_buffers {
-            buffers.copy_pages(&mut frame, &[(src, dst)])?;
-        }
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
     }
@@ -2065,7 +2152,7 @@ impl Shell {
 
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
 
-        let mut rs_plans: Vec<crate::rs::LanePlan> = Vec::with_capacity(lanes.len());
+        let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
         let mut rs_active = false;
 
         let mut slot_of_row: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -2204,9 +2291,11 @@ impl Shell {
                 }
                 rs_active = true;
             }
-            rs_plans.push(crate::rs::LanePlan::of(
-                seated.rs, row.rows, row.source, None,
-            )?);
+            rs_plans.push(
+                engine::rs::LanePlan::of(seated.rs, row.rows, have, masking, None).map_err(
+                    |error| program("serve::rs", format!("lane {}: {error}", row.source)),
+                )?,
+            );
 
             if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
                 return Err(Fault::Positions {

@@ -8,9 +8,8 @@
 #   2. Does either library reach the forward-pass surface at all?
 #      (drift upward: a live-looking package that cannot run a model)
 #
-# Why this exists: when `pie:core/inference` was replaced by `forward` /
-# `forward-recurrent` / `forward-hybrid` / `forward-diffusion`, both libraries kept
-# importing the interface that had been deleted, and nothing said so.
+# Why this exists: when a WIT interface is replaced, a library can keep
+# importing the deleted one, and nothing says so.
 # `release-pypi.yml`'s own smoke test comments that it CANNOT verify
 # `import inferlet`, because `wit_world` only exists inside a componentize-py
 # build. ci.yml's `packages` job and both release workflows run this.
@@ -45,12 +44,12 @@ known=$(
 
 # The forward-pass surface. A library that binds none of these can do everything
 # except the one thing an inferlet exists to do, so publishing it is worse than
-# publishing nothing: it looks like a working library. `forward` / `-recurrent` /
-# `-hybrid` are alternatives -- a model needs exactly one -- so any ONE of them
+# publishing nothing: it looks like a working library. `forward` and
+# `-diffusion` are alternatives -- a model needs exactly one -- so any ONE of them
 # satisfies the requirement; the supporting resources are all mandatory,
 # because a pass cannot be built without a channel to bind, a working set to
 # bind it against, or a pipeline to submit on.
-forward_any="forward forward-recurrent forward-hybrid forward-diffusion"
+forward_any="forward forward-diffusion"
 forward_all="channel working-set pipeline"
 
 fail=0

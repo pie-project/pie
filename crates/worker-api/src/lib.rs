@@ -16,6 +16,9 @@ pub trait GatewayInbound {
 
     async fn push_tokens(req_id: ReqId, chunk: Tokens) -> Control;
 
+    /// For the router policy, ahead of the exit event.
+    async fn counted(req_id: ReqId, prompt: u64, generated: u64);
+
     async fn report(worker_id: WorkerId, status: WorkerStatus);
 
     async fn redirect(req_id: ReqId);
@@ -36,4 +39,8 @@ pub trait WorkerControl {
     async fn end_session(session: SessionId);
 
     async fn drain();
+
+    /// `changes` is a JSON object whose `null`s remove names; none closes the
+    /// session.
+    async fn plex_session(session: String, changes: Option<String>);
 }

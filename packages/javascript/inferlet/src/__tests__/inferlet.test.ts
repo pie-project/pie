@@ -1,9 +1,8 @@
 // Unit tests for the inferlet library's hand-written layer, against the stubs in
 // `./stubs.ts` (vitest aliases every `pie:inferlet/*` specifier to them).
 //
-// The non-forward interfaces are covered here; the forward-pass surface —
-// the `eta` port of the tracing eDSL and container encoder — is covered by
-// `eta_goldens.test.ts`, which pins its bytes to the Rust encoder's.
+// The container bytes the `eta` port encodes are pinned to the Rust
+// encoder's by `eta_goldens.test.ts`.
 
 import { beforeEach, describe, expect, it } from 'vitest';
 
@@ -13,7 +12,8 @@ import * as session from '../session.js';
 import * as chat from '../chat.js';
 import * as reasoning from '../reasoning.js';
 import * as inferlet from '../index.js';
-import { chatScript, reasoningScript, sessionSpy } from './stubs.js';
+import { Channel, ForwardPass, InferletError, Port, WorkingSet, dtype } from '../eta/index.js';
+import { ForwardPassStub, chatScript, reasoningScript, sessionSpy } from './stubs.js';
 
 describe('package surface', () => {
   it('exports only the live modules', () => {
@@ -48,28 +48,23 @@ describe('model', () => {
     expect(model.defaultSystemSpeculation()).toBe(false);
   });
 
-  it('keeps passKind and isLinear consistent', () => {
-    // `isLinear() === (passKind() !== 'attention')` is a documented invariant
-    // of the WIT interface, and the reason both exist.
-    expect(model.passKind()).toBe('hybrid');
-    expect(model.isLinear()).toBe(model.passKind() !== 'attention');
+  it('takes the one text interface whatever state the model keeps', () => {
+    expect(model.passKind()).toBe('text');
+    expect(model.rsStateSize()).toBeGreaterThan(0);
   });
 
   it('exposes memory-shaping capabilities', () => {
     expect(model.kvPageSize()).toBe(16);
     expect(model.frameSize()).toBe(1);
     expect(model.channelCapacity()).toBe(8);
-    expect(model.maxEmbedLength()).toBe(2048);
-    expect(model.arenaBlockSize()).toBe(8192);
+    expect(model.maxReadoutRows('logits')).toBe(256);
+    expect(model.maxReadoutRows('hidden')).toBe(2048);
   });
 
-  it('exposes recurrent capabilities', () => {
-    expect(model.rsStateSize()).toBe(4096);
+  it('exposes diffusion and drafting facts', () => {
     expect(model.canvas()).toEqual({ length: 32, hidden: 2560, selfCondTaps: 4 });
     expect(model.draftBlock()).toBeUndefined();
     expect(model.runAheadWindow()).toBe(4);
-    expect(model.rsBufferPageSize()).toBe(64);
-    expect(model.rsFoldGranularity()).toBe(1);
   });
 
   it('reports an output vocab that may exceed the tokenizer vocab', () => {
@@ -224,5 +219,40 @@ describe('reasoning decoder', () => {
   it('turns an empty delta into idle', () => {
     const d = decoder([{ tag: 'delta', val: '' }]);
     expect(d.feed(Uint32Array.from([1]))).toEqual(reasoning.Event.Idle());
+  });
+});
+
+describe('eta state binding', () => {
+  const stub = (fwd: ForwardPass) => fwd.wit as unknown as ForwardPassStub;
+  const ports = (fwd: ForwardPass) => (fwd as unknown as { ports: [Port, Channel][] }).ports.map(([p]) => p);
+
+  it('binds one working set per lane and only the stated ports', () => {
+    const a = new WorkingSet();
+    const b = new WorkingSet();
+    const slots = Channel.from([3, 4], dtype.u32);
+    const fwd = new ForwardPass();
+    fwd.state([a, b, a], { slots });
+    const [lanes, geom] = stub(fwd).stateArgs!;
+    expect(lanes).toEqual([a.ws, b.ws, a.ws]);
+    expect(geom).toEqual({ slots: slots.wit() });
+    expect(ports(fwd)).toEqual([Port.SLOTS]);
+  });
+
+  it("folds 'all' through one constant channel per pass", () => {
+    const fwd = new ForwardPass();
+    fwd.state([new WorkingSet()], { fold: 'all' });
+    const first = stub(fwd).stateArgs![1].fold;
+    expect(ports(fwd)).toEqual([Port.FOLD]);
+    expect(() => fwd.state([new WorkingSet()], { fold: 'all' })).toThrow(/fold is already bound/);
+    (fwd as unknown as { programAttached: boolean }).programAttached = true; // a rebind
+    fwd.state([new WorkingSet()], { fold: 'all' });
+    expect(stub(fwd).stateArgs![1].fold).toBe(first);
+  });
+
+  it('keeps checkpoints on the text pass', () => {
+    const fwd = new ForwardPass();
+    fwd.checkpoints([16, 32]);
+    expect(stub(fwd).checkpointSlots).toEqual([16, 32]);
+    expect(() => new ForwardPass('diffusion').checkpoints([16])).toThrow(InferletError);
   });
 });

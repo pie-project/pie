@@ -30,9 +30,11 @@ impl FireRequest {
         self.lanes.len()
     }
 
+    /// At least one a lane: a lane whose tokens the device resolves carries
+    /// none here but still runs.
     #[must_use]
     pub fn tokens(&self) -> usize {
-        self.lanes.iter().map(|lane| lane.tokens.len()).sum()
+        self.lanes.iter().map(|lane| lane.tokens.len().max(1)).sum()
     }
 
     pub fn pages(&self) -> impl Iterator<Item = u32> + '_ {

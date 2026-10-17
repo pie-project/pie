@@ -6,10 +6,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use client_api::ClientMessage;
+use client_api::{ClientMessage, ServerMessage};
 use ids::{ReqId, SessionId, TenantId, WorkerId};
 use tokio::sync::{mpsc, watch};
 use worker_api::{BlobRef, Priority, Request, Tokens};
+
+use crate::policy::wit::{By, Outcome};
 
 const DEFAULT_PIPE_CAP: usize = 256;
 
@@ -41,6 +43,8 @@ pub enum SessionError {
     Admission(String),
     NoWorker,
     Draining,
+    Launch(String),
+    Refused(String),
 }
 
 impl std::fmt::Display for SessionError {
@@ -49,6 +53,8 @@ impl std::fmt::Display for SessionError {
             SessionError::Admission(r) => write!(f, "admission rejected: {r}"),
             SessionError::NoWorker => f.write_str("no worker available"),
             SessionError::Draining => f.write_str("gateway draining"),
+            SessionError::Launch(r) => write!(f, "launch refused: {r}"),
+            SessionError::Refused(r) => write!(f, "refused by the router policy: {r}"),
         }
     }
 }
@@ -66,7 +72,10 @@ impl TokenRx {
 }
 
 #[derive(Debug, Clone)]
-pub struct AdmitReject(pub String);
+pub enum AdmitReject {
+    Full(String),
+    Refused(String),
+}
 
 #[derive(Debug, Clone)]
 pub struct DispatchFail;
@@ -86,6 +95,12 @@ pub trait TurnRouter: Send + Sync + 'static {
     async fn end_session(&self, session: SessionId);
 
     fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>>;
+
+    fn launched(&self, _req: ReqId, _process: &str, _worker: WorkerId) {}
+
+    fn counted(&self, _req: &Request, _prompt: u64, _generated: u64) {}
+
+    fn ended(&self, _req: &Request, _outcome: Outcome, _by: By) {}
 }
 
 struct TurnState {
@@ -95,6 +110,7 @@ struct TurnState {
     emitted: bool,
     sink: mpsc::Sender<Tokens>,
     open: Arc<AtomicBool>,
+    outcome: Option<Outcome>,
 }
 
 struct Inner {
@@ -112,10 +128,14 @@ impl Inner {
         self: &Arc<Self>,
         session: SessionId,
         tenant: &TenantId,
-        input: TurnInput,
+        mut input: TurnInput,
         affinity: Option<u64>,
         open: &Arc<AtomicBool>,
     ) -> Result<(ReqId, TokenRx), SessionError> {
+        if let ClientMessage::LaunchProcess { props, session, .. } = &mut input.message {
+            client_api::props::from_client(props).map_err(SessionError::Launch)?;
+            client_api::props::check_session(session.as_deref()).map_err(SessionError::Launch)?;
+        }
         let req_id = ReqId(self.next_req.fetch_add(1, Ordering::Relaxed));
         let request = Request {
             req_id,
@@ -124,9 +144,14 @@ impl Inner {
             priority: input.priority,
             blobs: input.blobs,
             message: input.message,
+            router_props: Default::default(),
         };
 
-        if let Err(r) = self.router.admit(&request).await {
+        if let Err(refusal) = self.router.admit(&request).await {
+            let r = match refusal {
+                AdmitReject::Refused(why) => return Err(SessionError::Refused(why)),
+                AdmitReject::Full(why) => why,
+            };
             // The client hears each refusal under its own id; the server log
             // hears the first and then every doubling, so a pool that admits
             // nothing for minutes leaves a trace without a line per launch.
@@ -137,10 +162,10 @@ impl Inner {
                     tenant = %tenant,
                     refused,
                     "turn refused at admission: {}",
-                    r.0
+                    r
                 );
             }
-            return Err(SessionError::Admission(r.0));
+            return Err(SessionError::Admission(r));
         }
 
         let (tx, rx) = mpsc::channel(self.pipe_cap);
@@ -155,6 +180,7 @@ impl Inner {
                     emitted: false,
                     sink: tx,
                     open: open.clone(),
+                    outcome: None,
                 },
             );
         }
@@ -184,7 +210,7 @@ impl Inner {
         let worker = match self.router.dispatch(request, affinity).await {
             Ok(worker) => worker,
             Err(DispatchFail) => {
-                self.turns.lock().unwrap().remove(&req_id);
+                self.end(req_id, Outcome::Failed, By::Host);
                 return Err(DispatchFail);
             }
         };
@@ -196,7 +222,9 @@ impl Inner {
                     true
                 }
                 Some(_) => {
-                    turns.remove(&req_id);
+                    let turn = turns.remove(&req_id).expect("just found");
+                    self.router
+                        .ended(&turn.request, Outcome::Cancelled, By::Client);
                     false
                 }
                 None => false,
@@ -212,11 +240,16 @@ impl Inner {
     }
 
     fn abort_turn(&self, req_id: ReqId) -> Option<WorkerId> {
-        self.turns
-            .lock()
-            .unwrap()
-            .remove(&req_id)
-            .and_then(|t| t.worker)
+        self.end(req_id, Outcome::Cancelled, By::Client)
+    }
+
+    /// A stream that already said how it ends is believed: a client that leaves
+    /// with its answer cancelled nothing.
+    fn end(&self, req_id: ReqId, outcome: Outcome, by: By) -> Option<WorkerId> {
+        let turn = self.turns.lock().unwrap().remove(&req_id)?;
+        let (outcome, by) = turn.outcome.map_or((outcome, by), |said| (said, By::Host));
+        self.router.ended(&turn.request, outcome, by);
+        turn.worker
     }
 }
 
@@ -283,30 +316,70 @@ impl Sessions {
         use worker_api::Control;
 
         let sink = {
-            let turns = self.inner.turns.lock().unwrap();
-            match turns.get(&req_id) {
-                Some(turn) => turn.sink.clone(),
-                None => return Control::Abort,
+            let mut turns = self.inner.turns.lock().unwrap();
+            let Some(turn) = turns.get_mut(&req_id) else {
+                return Control::Abort;
+            };
+            if let Tokens::Chunk(message) = &chunk {
+                self.note(turn, req_id, message);
             }
+            turn.sink.clone()
         };
 
         let is_eos = matches!(chunk, Tokens::Eos);
         match sink.send(chunk).await {
             Ok(()) => {
-                {
-                    let mut turns = self.inner.turns.lock().unwrap();
-                    if is_eos {
-                        turns.remove(&req_id);
-                    } else if let Some(turn) = turns.get_mut(&req_id) {
-                        turn.emitted = true;
-                    }
+                if is_eos {
+                    self.inner.end(req_id, Outcome::Completed, By::Host);
+                } else if let Some(turn) = self.inner.turns.lock().unwrap().get_mut(&req_id) {
+                    turn.emitted = true;
                 }
                 Control::Continue
             }
             Err(_) => {
-                self.inner.turns.lock().unwrap().remove(&req_id);
+                self.inner.end(req_id, Outcome::Cancelled, By::Client);
                 Control::Abort
             }
+        }
+    }
+
+    pub fn counted(&self, req_id: ReqId, prompt: u64, generated: u64) {
+        if let Some(turn) = self.inner.turns.lock().unwrap().get(&req_id) {
+            self.inner.router.counted(&turn.request, prompt, generated);
+        }
+    }
+
+    fn note(&self, turn: &mut TurnState, req_id: ReqId, message: &ServerMessage) {
+        let ClientMessage::LaunchProcess { corr_id, .. } = &turn.request.message else {
+            return;
+        };
+        match message {
+            ServerMessage::Response {
+                corr_id: answered,
+                ok,
+                result,
+            } if answered == corr_id => {
+                if !ok {
+                    turn.outcome = Some(Outcome::Failed);
+                } else if let Some(worker) = turn.worker
+                    && !result.is_empty()
+                {
+                    self.inner.router.launched(req_id, result, worker);
+                }
+            }
+            ServerMessage::ProcessEvent { event, .. } if event == "return" => {
+                turn.outcome = Some(Outcome::Completed);
+            }
+            ServerMessage::ProcessEvent { event, .. } if event == "error" => {
+                turn.outcome = Some(Outcome::Failed);
+            }
+            _ => {}
+        }
+    }
+
+    pub async fn terminate(&self, req_id: ReqId) {
+        if let Some(worker) = self.inner.end(req_id, Outcome::Cancelled, By::Policy) {
+            self.inner.router.cancel(worker, req_id).await;
         }
     }
 
@@ -439,7 +512,7 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
 
             for (req_id, emitted, request, affinity, open) in affected {
                 if emitted {
-                    inner.turns.lock().unwrap().remove(&req_id);
+                    inner.end(req_id, Outcome::Failed, By::Host);
                     continue;
                 }
                 {
@@ -469,6 +542,8 @@ mod tests {
         cancels: Mutex<Vec<(WorkerId, ReqId)>>,
         ended: Mutex<Vec<SessionId>>,
         held: AtomicBool,
+        launches: Mutex<Vec<(ReqId, String, WorkerId)>>,
+        endings: Mutex<Vec<(ReqId, Outcome, By)>>,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
         _connected_tx: watch::Sender<Arc<HashSet<WorkerId>>>,
@@ -487,6 +562,8 @@ mod tests {
                 cancels: Mutex::new(Vec::new()),
                 ended: Mutex::new(Vec::new()),
                 held: AtomicBool::new(false),
+                launches: Mutex::new(Vec::new()),
+                endings: Mutex::new(Vec::new()),
                 entered: tokio::sync::Notify::new(),
                 release: tokio::sync::Notify::new(),
                 _connected_tx: tx,
@@ -501,7 +578,7 @@ mod tests {
             if self.admit_ok.load(Ordering::Acquire) {
                 Ok(())
             } else {
-                Err(AdmitReject("full".into()))
+                Err(AdmitReject::Full("full".into()))
             }
         }
         async fn dispatch(
@@ -529,6 +606,84 @@ mod tests {
         fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>> {
             self.connected_rx.clone()
         }
+        fn launched(&self, req: ReqId, process: &str, worker: WorkerId) {
+            self.launches
+                .lock()
+                .unwrap()
+                .push((req, process.to_string(), worker));
+        }
+        fn ended(&self, req: &Request, outcome: Outcome, by: By) {
+            self.endings.lock().unwrap().push((req.req_id, outcome, by));
+        }
+    }
+
+    fn launch() -> TurnInput {
+        TurnInput {
+            message: ClientMessage::LaunchProcess {
+                corr_id: 4,
+                inferlet: "chat".into(),
+                input: String::new(),
+                capture_outputs: true,
+                props: Default::default(),
+                session: None,
+                router_props: Default::default(),
+            },
+            blobs: Vec::new(),
+            priority: Priority::Normal,
+        }
+    }
+
+    fn event(event: &str) -> Tokens {
+        Tokens::Chunk(ServerMessage::ProcessEvent {
+            process_id: "p".into(),
+            event: event.into(),
+            value: String::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn the_router_hears_where_a_launch_started_and_how_each_turn_ended() {
+        let router = MockRouter::new(Some(WorkerId(7)));
+        let sessions = Sessions::new(router.clone());
+        let (handle, mut rx) = sessions
+            .create(ident(), launch(), Affinity::Sticky)
+            .await
+            .unwrap();
+        let req = router.dispatched.lock().unwrap()[0];
+        let started = Tokens::Chunk(ServerMessage::Response {
+            corr_id: 4,
+            ok: true,
+            result: "p".into(),
+        });
+        for chunk in [started, event("return"), Tokens::Eos] {
+            sessions.feed(req, chunk).await;
+            rx.recv().await;
+        }
+        assert_eq!(
+            *router.launches.lock().unwrap(),
+            [(req, "p".to_string(), WorkerId(7))]
+        );
+
+        let failing = handle.turn(launch()).await.unwrap();
+        let failed = router.dispatched.lock().unwrap()[1];
+        sessions.feed(failed, event("error")).await;
+        sessions.feed(failed, Tokens::Eos).await;
+        let answered = handle.turn(launch()).await.unwrap();
+        let answered_req = router.dispatched.lock().unwrap()[2];
+        sessions.feed(answered_req, event("return")).await;
+        let _cancelled = handle.turn(input()).await.unwrap();
+        let cancelled = router.dispatched.lock().unwrap()[3];
+        handle.cancel().await;
+        drop((failing, answered));
+        assert_eq!(
+            *router.endings.lock().unwrap(),
+            [
+                (req, Outcome::Completed, By::Host),
+                (failed, Outcome::Failed, By::Host),
+                (answered_req, Outcome::Completed, By::Host),
+                (cancelled, Outcome::Cancelled, By::Client),
+            ]
+        );
     }
 
     fn ident() -> Identity {

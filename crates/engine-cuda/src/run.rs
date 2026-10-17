@@ -122,12 +122,11 @@ pub enum RsMove<'a> {
         pages: &'a [u32],
         at: u32,
         fold: u32,
-        replay: u32,
     },
-    Gather {
-        pages: &'a [u32],
-        at: u32,
-    },
+}
+
+pub(crate) fn replayed(reads: &[std::ops::Range<u32>]) -> u32 {
+    reads.iter().map(|span| span.end - span.start).sum()
 }
 
 #[derive(Debug)]
@@ -178,12 +177,12 @@ impl RsScratch {
 pub struct RsSeat<'a> {
     pub buffers: &'a crate::store::rs::Buffers,
     pub lanes: &'a [RsMove<'a>],
-    pub replays: &'a [u32],
+    pub reads: &'a [Vec<std::ops::Range<u32>>],
     pub scratch: Option<&'a RsScratch>,
 }
 
 impl RsSeat<'_> {
-    fn run(
+    fn scatter(
         &self,
         stream: *mut core::ffi::c_void,
         plane: crate::store::rs::Plane,
@@ -204,14 +203,13 @@ impl RsSeat<'_> {
             });
         }
         for (at, pair) in bounds.windows(2).enumerate() {
-            let Some(&verb) = self.lanes.get(lane_offset as usize + at) else {
+            let Some(&RsMove::Scatter {
+                pages, at: from, ..
+            }) = self.lanes.get(lane_offset as usize + at)
+            else {
                 continue;
             };
-            let (pages, from, count) = match verb {
-                RsMove::None => continue,
-                RsMove::Scatter { pages, at, .. } => (pages, at, (pair[1] - pair[0]) as u32),
-                RsMove::Gather { pages, at } => (pages, at, (pair[1] - pair[0]) as u32),
-            };
+            let count = (pair[1] - pair[0]) as u32;
             if count == 0 {
                 continue;
             }
@@ -241,11 +239,7 @@ impl RsSeat<'_> {
                     rows.ptr + (u64::from(pair[0] as u32) + u64::from(done)) * plane.width * elem;
                 let bytes =
                     usize::try_from(u64::from(take) * plane.width * elem).unwrap_or(usize::MAX);
-                let (dst, src) = match verb {
-                    RsMove::Scatter { .. } => (slab, rows_at),
-                    _ => (rows_at, slab),
-                };
-                crate::device::copy_d2d(stream, dst, src, bytes)?;
+                crate::device::copy_d2d(stream, slab, rows_at, bytes)?;
                 done += take;
             }
         }
@@ -669,7 +663,7 @@ impl<'c> Run<'c> {
         let span = self.window().span();
         let bounds = self.qo_indptr_host();
         let rows = self.windowed(rows);
-        seat.run(self.ctx.stream(), plane, span.lane_offset, bounds, rows)
+        seat.scatter(self.ctx.stream(), plane, span.lane_offset, bounds, rows)
             .map_err(|fault| kernels_cuda::Error::Backend {
                 op,
                 detail: fault.to_string(),
@@ -685,11 +679,11 @@ impl<'c> Run<'c> {
         }
         let lane0 = self.window().span().lane_offset as usize;
         let lanes = self.qo_indptr_host().len().saturating_sub(1);
-        seat.replays
+        seat.reads
             .iter()
             .skip(lane0)
             .take(lanes)
-            .any(|&replay| replay > 0)
+            .any(|reads| !reads.is_empty())
     }
 
     fn rs_ext_layout(&self, seat: &RsSeat<'_>) -> (Vec<(u32, u32, u32)>, Vec<i32>) {
@@ -701,7 +695,7 @@ impl<'c> Run<'c> {
         csr.push(0i32);
         for (r, pair) in bounds.windows(2).enumerate() {
             let rows = (pair[1] - pair[0]).max(0) as u32;
-            let replay = seat.replays.get(lane0 + r).copied().unwrap_or(0);
+            let replay = seat.reads.get(lane0 + r).map_or(0, |reads| replayed(reads));
             lanes.push((begin, replay, rows));
             begin += replay + rows;
             csr.push(i32::try_from(begin).unwrap_or(i32::MAX));
@@ -787,9 +781,7 @@ impl<'c> Run<'c> {
         for (r, &(begin, replay, rows)) in lanes.iter().enumerate() {
             if replay > 0
                 && let Some(plane) = plane
-                && let Some(RsMove::Scatter {
-                    pages, at: token, ..
-                }) = seat.lanes.get(lane0 + r)
+                && let Some(RsMove::Scatter { pages, .. }) = seat.lanes.get(lane0 + r)
             {
                 if plane.width != u64::from(own.width) {
                     return Err(kernels_cuda::Error::Backend {
@@ -800,23 +792,20 @@ impl<'c> Run<'c> {
                         ),
                     });
                 }
-                let from = token.checked_sub(replay).ok_or_else(|| {
-                    kernels_cuda::Error::Backend {
-                        op,
-                        detail: format!(
-                            "lane replays {replay} buffered token(s) below buffer position {token}"
-                        ),
-                    }
-                })?;
-                seat.pages_to_rows(
-                    stream,
-                    plane,
-                    pages,
-                    from,
-                    replay,
-                    at + u64::from(begin) * row_bytes,
-                )
-                .map_err(|f| Self::rs_fault(op, f))?;
+                let mut done = 0u32;
+                for span in seat.reads.get(lane0 + r).map_or(&[][..], Vec::as_slice) {
+                    let count = span.end - span.start;
+                    seat.pages_to_rows(
+                        stream,
+                        plane,
+                        pages,
+                        span.start,
+                        count,
+                        at + u64::from(begin + done) * row_bytes,
+                    )
+                    .map_err(|f| Self::rs_fault(op, f))?;
+                    done += count;
+                }
             }
             if rows > 0 {
                 let src = own.ptr + u64::from(bounds[r].max(0) as u32) * row_bytes;

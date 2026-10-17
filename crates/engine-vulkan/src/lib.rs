@@ -62,7 +62,7 @@ pub use serve::{
 pub use settle::{Airborne, Arms, Done};
 pub use store::Pools;
 pub use weights::{AdapterPlane, BankSeat, Weights};
-pub use window::{Copies, Cursor, Gathered, GatheredSpace, Window, Windows};
+pub use window::{Copies, Gathered, GatheredSpace, Window, Windows};
 
 /// The fused kernels this backend ships; the compiler forms only these.
 pub const FUSED: [&str; 0] = [];

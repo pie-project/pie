@@ -61,10 +61,6 @@ pub enum ValidateError {
     PortConstPayload {
         port: Port,
     },
-    EmbedTokensWithoutKvLen,
-    EmbedTokensWithoutGeometry {
-        port: Port,
-    },
     ZeroCapacity {
         chan: u32,
     },
@@ -134,14 +130,6 @@ impl fmt::Display for ValidateError {
             }
             PortConstPayload { port } => {
                 write!(f, "port {}: const payload length mismatch", port.name())
-            }
-            EmbedTokensWithoutKvLen => f.write_str("embed_tokens requires a kv_len port binding"),
-            EmbedTokensWithoutGeometry { port } => {
-                write!(
-                    f,
-                    "embed_tokens requires an explicit {} port binding",
-                    port.name()
-                )
             }
             ZeroCapacity { chan } => write!(f, "channel {chan}: capacity must be >= 1"),
             SecondProducer { chan, stage } => write!(
@@ -325,25 +313,6 @@ fn check_structure(container: &TraceContainer) -> Result<(), ValidateError> {
                 if expect != Some(data.len() as u64) {
                     return Err(ValidateError::PortConstPayload { port: p.port });
                 }
-            }
-        }
-    }
-    const GEOMETRY: [Port; 5] = [
-        Port::Positions,
-        Port::Pages,
-        Port::PageIndptr,
-        Port::WSlot,
-        Port::WOff,
-    ];
-    let bound = |port: Port| container.ports.iter().any(|binding| binding.port == port);
-    let attends = bound(Port::KvLen) || GEOMETRY.iter().copied().any(bound);
-    if attends {
-        if !bound(Port::KvLen) {
-            return Err(ValidateError::EmbedTokensWithoutKvLen);
-        }
-        for port in GEOMETRY {
-            if !bound(port) {
-                return Err(ValidateError::EmbedTokensWithoutGeometry { port });
             }
         }
     }

@@ -1,4 +1,4 @@
-//! The generation loop: chunked prefill, then a device-carried decode pass
+//! The generation loop: a one-pass prefill, then a device-carried decode pass
 //! whose epilogue samples the next token and feeds it straight back into the
 //! channel `embed` reads. The host drains a mirror of the sampled tokens
 //! behind the runtime's run-ahead window.
@@ -15,7 +15,7 @@
 
 use std::ops::ControlFlow;
 
-use inferlet::eta::hybrid::prelude::*;
+use inferlet::eta::prelude::*;
 use inferlet::grammar::Matcher;
 use inferlet::mask::unpack_mask;
 use inferlet::media;
@@ -146,7 +146,8 @@ fn sample(
 /// prefilled whole in a fire of its own. Every sampled token — the
 /// stop token included, if one comes — goes to `on_token`, which ends
 /// generation by returning `Break`; the return value is how many tokens
-/// were sampled.
+/// were sampled, and how many of the prompt's were mapped in from the
+/// prefix cache.
 ///
 /// With a `matcher`, every fire's logits are masked to what the grammar
 /// allows next, and generation ends when the grammar terminates.
@@ -156,12 +157,13 @@ pub async fn generate(
     max_tokens: usize,
     matcher: Option<&Matcher>,
     on_token: &mut dyn FnMut(u32) -> ControlFlow<()>,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     sampling.validate()?;
     let images = &prompt.images;
+    let ends = &prompt.ends;
     let prompt = &prompt.tokens[..];
     if max_tokens == 0 {
-        return Ok(0);
+        return Ok((0, 0));
     }
     if sampling.speculative
         && sampling.temperature == 0.0
@@ -174,28 +176,17 @@ pub async fn generate(
         && draft.proposals_from == 1
         && (2..=16).contains(&draft.rows)
     {
-        return crate::speculative::generate(prompt, max_tokens, draft, on_token).await;
+        return crate::speculative::generate(prompt, ends, max_tokens, draft, on_token).await;
     }
-    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
-        model::ForwardKind::Attention => Vec::new(),
-        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
-        model::ForwardKind::Recurrent => {
-            return Err("this program has no recurrent-only path (it needs a KV cache)".into());
-        }
-        model::ForwardKind::Diffusion => {
-            return Err(
-                "this program decodes a token at a time; a diffusion model wants a canvas loop"
-                    .into(),
-            );
-        }
-    };
+    if model::pass_kind() == model::ForwardKind::Diffusion {
+        return Err(
+            "this program decodes a token at a time; a diffusion model wants a canvas loop".into(),
+        );
+    }
     let vocab = model::output_vocab_size();
-    let page_t = kv_page_size();
     let n = prompt.len() as u32;
-    let pool_pages = (n + max_tokens as u32 + 2).div_ceil(page_t);
+
     let ws = WorkingSet::new();
-    let slots = ws.reserve(pool_pages).context("reserve KV pages")?;
-    let pool_ids = slots.ids().to_vec();
     let pipe = Pipeline::new();
 
     let penalized = sampling.penalized();
@@ -220,35 +211,29 @@ pub async fn generate(
         })
         .collect();
     let rope_delta: u32 = runs.iter().map(|r| r.2).sum();
-    let mut pieces = Vec::new();
-    let mut at = 0u32;
+    let mut spans = Vec::new();
+    let mut at = 0;
     for &(start, end, _) in runs.iter().chain([(n, n, 0)].iter()) {
-        pieces.extend(
-            prefill_chunks(start - at, None)
-                .into_iter()
-                .map(|(b, e)| (at + b, at + e)),
-        );
+        if start > at {
+            spans.push((at, start));
+        }
         if end > start {
-            pieces.push((start, end));
+            spans.push((start, end));
         }
         at = end;
     }
 
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let mut g0 = 0i32;
-    for (k, &(base, end)) in pieces.iter().enumerate() {
+    for (k, &(base, end)) in spans.iter().enumerate() {
         let len = end - base;
         let lag: u32 = runs.iter().filter(|r| r.1 <= base).map(|r| r.2).sum();
         let carried = images.iter().position(|(start, _)| *start == base);
         let toks = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
         let embed_indptr = Channel::from([0u32, len]).named("embed_indptr_p");
-        let positions = Channel::from_iter((base..end).map(|row| row - lag)).named("positions_p");
-        let w_slot = Channel::from_iter((base..end).map(|c| pool_ids[(c / page_t) as usize]))
-            .named("w_slot_p");
-        let w_off = Channel::from_iter((base..end).map(|c| c % page_t)).named("w_off_p");
-        let klen = Channel::from([end]).named("klen_p");
-        let pages = Channel::from(pool_ids.clone()).named("pages_p");
-        let page_indptr = Channel::from([0u32, end.div_ceil(page_t)]).named("pidx_p");
+        // Past an image's M-RoPE span, rows are roped behind their slots.
+        let positions = (lag > 0)
+            .then(|| Channel::from_iter((base..end).map(|row| row - lag)).named("positions_p"));
         let rng = Channel::from([sampling.seed, k as u32]).named("rng_p");
         let hist = penalized.then(|| {
             (
@@ -264,25 +249,11 @@ pub async fn generate(
         if let Some(at) = carried {
             fwd.media(&[media::Span::Image(&images[at].1)])?;
         }
-        fwd.attention(
-            Some(KvBinding {
-                working_set: &ws,
-                geometry: KvGeometry {
-                    readable_pages: ..,
-                    writable_pages: ..,
-                    kv_len: &klen,
-                    pages: &pages,
-                    page_indptr: &page_indptr,
-                    w_slot: &w_slot,
-                    w_off: &w_off,
-                    positions: &positions,
-                    mask: None,
-                },
-            }),
-            &rs_ws,
-            RsGeometry {
-                fold_len: None,
-                buffer: 0..0,
+        fwd.state(
+            &[&ws],
+            StateGeometry {
+                positions: positions.as_ref(),
+                ..StateGeometry::folding()
             },
         )?;
         fwd.epilogue(move || {
@@ -301,6 +272,8 @@ pub async fn generate(
         if let (Some(m), Some(matcher)) = (mask, matcher) {
             m.put(unpack_mask(&matcher.mask(), vocab));
         }
+        // Checkpoints only where messages end: each costs a state slot.
+        fwd.checkpoints(ends)?;
         fwd.submit(&pipe)
             .with_context(|| format!("prefill submit @{base}"))?;
         g0 = g0_ch
@@ -308,6 +281,7 @@ pub async fn generate(
             .await
             .with_context(|| format!("prefill drain @{base}"))?;
     }
+    let cached = ws.cached_tokens();
 
     let mut sampled = 1usize;
     if let Some(matcher) = matcher {
@@ -320,19 +294,16 @@ pub async fn generate(
         || matcher.is_some_and(|m| m.is_terminated())
     {
         pipe.close();
-        return Ok(sampled);
+        return Ok((sampled, cached as usize));
     }
 
-    let slot_n = pool_ids[(n / page_t) as usize];
     let tok_in = Channel::from([g0]).named("tok_in");
-    let pos = Channel::from([n - rope_delta]).named("pos");
-    let fill = Channel::from([n + 1]).named("fill");
-    let klen = Channel::from([n + 1]).named("klen");
-    let w_slot = Channel::from([slot_n]).named("w_slot");
-    let w_off = Channel::from([n % page_t]).named("w_off");
-    let pages = Channel::from(pool_ids.clone()).named("pages");
-    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_t)]).named("page_indptr");
-    let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
+    let pos = (rope_delta > 0).then(|| {
+        (
+            Channel::from([n - rope_delta]).named("pos"),
+            Channel::from([n - rope_delta + 1]).named("next_pos"),
+        )
+    });
     let out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
         .named("out");
@@ -354,30 +325,14 @@ pub async fn generate(
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
-    fwd.attention(
-        Some(KvBinding {
-            working_set: &ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: (n / page_t)..,
-                kv_len: &klen,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &pos,
-                mask: None,
-            },
-        }),
-        &rs_ws,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
+    fwd.state(
+        &[&ws],
+        StateGeometry {
+            positions: pos.as_ref().map(|(pos, _)| pos),
+            ..StateGeometry::folding()
         },
     )?;
     fwd.epilogue(move || {
-        let base = fill.take(); // [1] u32 — the position this fire writes
-        let pids = pool_ids_ch.take();
         let r = rng.take();
         let taken = hist.map(|(c, p)| (c.take(), p.take()));
         let m = mask.map(|m| m.take());
@@ -392,26 +347,14 @@ pub async fn generate(
         let token = reshape(token, [1]);
         let r_next = &r + iota(2);
 
-        let logical_slot = &base / page_t;
-        let w_slot_v = gather(&pids, &logical_slot);
-        let w_off_v = &base % page_t;
-        let klen_v = &base + 1u32;
-        let next_free = &base + 1u32;
-        let pages_v = reshape(&pids, [pool_pages]);
-        let page_count = klen_v.div_ceil(page_t);
-        let pidx_v = indptr(1, &page_count);
-
         tok_in.put(&token);
         out.put(&token);
-        w_slot.put(&w_slot_v);
-        w_off.put(&w_off_v);
-        klen.put(&klen_v);
-        pos.put(&(&base - rope_delta));
-        fill.put(&next_free);
-        pages.put(&pages_v);
-        page_indptr.put(&pidx_v);
+        if let Some((pos, next)) = pos {
+            let at = next.take();
+            pos.put(&at);
+            next.put(&(&at + 1u32));
+        }
         rng.put(&r_next);
-        pool_ids_ch.put(&pids);
         if let (Some((c, p)), Some(next), Some((_, present))) = (hist, counts_next, taken) {
             c.put(&next);
             p.put(&present);
@@ -446,5 +389,5 @@ pub async fn generate(
         }
     }
     pipe.close();
-    Ok(sampled)
+    Ok((sampled, cached as usize))
 }

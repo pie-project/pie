@@ -1,8 +1,5 @@
-//! The slot file an engine suspends kv pages into below host memory: one
-//! per rank, one kv page per fixed slot, written and read around the page
-//! cache where the filesystem allows it. Preallocated where blocks are
-//! written in place, and unlinked once open, so it never outlives the
-//! process that holds it.
+//! Slot files below host memory, one per rank and kind, unlinked once open so
+//! they never outlive the process.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -21,22 +18,23 @@ pub struct SlotFile {
 }
 
 impl SlotFile {
-    /// `dir/r<rank>.kv` with as many slots of `slot_bytes` as `budget`
-    /// holds; `None` when that is none. The path is unlinked once the file
+    /// `dir/<name>` (`r<rank>.kv`, `r<rank>.rs`) with as many slots of
+    /// `slot_bytes` as `budget` holds; `None` when that is none. The path is unlinked once the file
     /// is open and locked: what it holds means nothing to the next run, and
     /// the space comes back when the process exits, however it exits. The
     /// lock covers the moment before the unlink, so two servers never share
     /// one file.
-    pub fn open(dir: &Path, rank: u32, slot_bytes: u64, budget: u64) -> io::Result<Option<Self>> {
+    pub fn open(dir: &Path, name: &str, slot_bytes: u64, budget: u64) -> io::Result<Option<Self>> {
         let stride = usize::try_from(slot_bytes)
             .map_err(io::Error::other)?
             .next_multiple_of(ALIGN);
-        let slots = u32::try_from(budget / stride as u64).unwrap_or(u32::MAX);
+        let slots =
+            u32::try_from(budget.checked_div(stride as u64).unwrap_or(0)).unwrap_or(u32::MAX);
         if slot_bytes == 0 || slots == 0 {
             return Ok(None);
         }
         std::fs::create_dir_all(dir)?;
-        let path = dir.join(format!("r{rank}.kv"));
+        let path = dir.join(name);
         let file = open_direct(&path)?;
         file.try_lock().map_err(|_| {
             io::Error::other(format!(
@@ -102,6 +100,31 @@ impl SlotFile {
         }
         Ok(u64::from(slot) * self.stride as u64)
     }
+}
+
+/// Zero when the filesystem does not say.
+#[must_use]
+pub fn free_space(dir: &Path) -> u64 {
+    dir.ancestors()
+        .find(|path| path.exists())
+        .and_then(|at| rustix::fs::statvfs(at).ok())
+        .map_or(0, |stat| stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+#[must_use]
+pub fn unstated_budget(
+    dir: &Path,
+    rows: u64,
+    row_bytes: u64,
+    pages: u64,
+    seated: u64,
+    page_bytes: u64,
+) -> u64 {
+    let slot = |bytes: u64| bytes.next_multiple_of(ALIGN as u64);
+    let wanted = rows
+        .saturating_mul(slot(row_bytes))
+        .saturating_add(pages.max(seated).saturating_mul(slot(page_bytes)));
+    wanted.min(free_space(dir) / 4)
 }
 
 #[cfg(target_os = "linux")]
@@ -206,7 +229,9 @@ mod tests {
     #[test]
     fn a_slot_reads_back_what_was_written_and_each_server_has_its_own_file() {
         let dir = std::env::temp_dir().join(format!("pie-slot-file-{}", std::process::id()));
-        let file = SlotFile::open(&dir, 0, 5000, 4 * 8192).unwrap().unwrap();
+        let file = SlotFile::open(&dir, "r0.kv", 5000, 4 * 8192)
+            .unwrap()
+            .unwrap();
         assert_eq!((file.slots(), file.stride()), (4, 8192));
         let mut stage = Aligned::zeroed(8192);
         stage
@@ -215,7 +240,9 @@ mod tests {
             .enumerate()
             .for_each(|(i, b)| *b = i as u8);
         file.write(3, stage.as_slice()).unwrap();
-        let other = SlotFile::open(&dir, 0, 5000, 4 * 8192).unwrap().unwrap();
+        let other = SlotFile::open(&dir, "r0.kv", 5000, 4 * 8192)
+            .unwrap()
+            .unwrap();
         other.write(3, Aligned::zeroed(8192).as_slice()).unwrap();
         let mut back = Aligned::zeroed(8192);
         file.read(3, back.as_mut_slice()).unwrap();
@@ -232,7 +259,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pie-slot-budget-{}", std::process::id()));
         let path = dir.join("r0.kv");
         let budget = 64 * 8192;
-        let file = SlotFile::open(&dir, 0, 8192, budget).unwrap().unwrap();
+        let file = SlotFile::open(&dir, "r0.kv", 8192, budget)
+            .unwrap()
+            .unwrap();
         assert!(!path.exists(), "the slot file outlives its process");
         let used = || file.file.metadata().unwrap().blocks() * 512;
         let stage = Aligned::zeroed(file.stride());

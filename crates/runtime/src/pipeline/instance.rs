@@ -30,68 +30,25 @@ impl Instance {
         }
         v
     }
-
-    pub fn fire_geometry(
-        &self,
-    ) -> Result<
-        crate::pipeline::fire::geometry::ReqGeometry,
-        crate::pipeline::fire::geometry::GeometryError,
-    > {
-        crate::pipeline::fire::geometry::map_geometry(
-            &self.program.bound.container,
-            &self.channel_values(),
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KvPageSpan {
-    pub start: u64,
-    pub end: Option<u64>,
-}
-
-impl KvPageSpan {
-    pub fn resolve(self, page_len: u64) -> Result<std::ops::Range<u64>, String> {
-        let end = self.end.unwrap_or(page_len);
-        if self.start > end || end > page_len {
-            return Err(format!(
-                "KV page declaration {}..{} exceeds lease extent {page_len}",
-                self.start, end
-            ));
-        }
-        Ok(self.start..end)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KvDeclaration {
-    pub readable: KvPageSpan,
-    pub writable: KvPageSpan,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PassKind {
-    Attention,
-    Recurrent,
-    Hybrid,
+    Text,
     Diffusion,
 }
 
 impl PassKind {
     pub fn name(self) -> &'static str {
         match self {
-            PassKind::Attention => "attention",
-            PassKind::Recurrent => "recurrent",
-            PassKind::Hybrid => "hybrid",
+            PassKind::Text => "text",
             PassKind::Diffusion => "diffusion",
         }
     }
 
     pub fn interface(self) -> &'static str {
         match self {
-            PassKind::Attention => "pie:inferlet/forward",
-            PassKind::Recurrent => "pie:inferlet/forward-recurrent",
-            PassKind::Hybrid => "pie:inferlet/forward-hybrid",
+            PassKind::Text => "pie:inferlet/forward",
             PassKind::Diffusion => "pie:inferlet/forward-diffusion",
         }
     }
@@ -106,13 +63,11 @@ pub enum CanvasMode {
 #[derive(Default)]
 pub struct ForwardBindings {
     pub embed: Option<EmbedBinding>,
-    pub attention: Option<AttentionBinding>,
+    pub state: Option<StateBinding>,
     pub readout: Option<u32>,
-    pub rs_ws: Vec<u32>,
-    pub rs_geom: Option<RsGeometryBinding>,
-    pub rs_fold_len: Option<Vec<u32>>,
     pub max_layers: Option<u32>,
     pub block_draft: bool,
+    pub checkpoints: Vec<u32>,
     pub media: Vec<std::sync::Arc<media::front::EncodedSpan>>,
     pub canvas: Option<CanvasMode>,
     pub self_cond: Option<SelfCondPayload>,
@@ -235,48 +190,20 @@ pub struct SelfCondPayload {
     pub channels: Option<(u64, u64)>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct RsGeometryBinding {
-    pub fold_len: u32,
-    #[allow(
-        dead_code,
-        reason = "written at bind time from the guest's `rs-geometry` record \
-                  (`host/forward.rs`, where `page_span` still rejects a malformed \
-                  span) and read by nothing. That is not a missing check. The WIT \
-                  doc justifies the field by saying a fire needing an ungranted \
-                  page must fail rather than have the runtime quietly find one -- \
-                  and the runtime has no way to find one: `RsStore::alloc_buffer` \
-                  is reachable ONLY from the guest's own `alloc-buffer` call, so \
-                  nothing grows a buffer mid-fire. What could actually overrun is \
-                  a fold, and `validate_fold` refuses that against both physical \
-                  capacity and live occupancy on every `prepare_*` path. So the \
-                  grant is the SEVENTH buffer-addressing channel, not a ceiling: \
-                  the six above it were deleted for exactly this reason -- the \
-                  runtime derives them from the store it is already authoritative \
-                  for. Removing it is a WIT change and wants the deliberation the \
-                  other six got, so it is described here rather than done here"
-    )]
-    pub buffer: KvPageSpan,
-}
-
 #[derive(Clone, Copy)]
 pub struct EmbedBinding {
     pub tokens: u32,
     pub indptr: u32,
 }
 
-#[derive(Clone, Copy)]
-pub struct AttentionBinding {
-    pub kv_ws: u32,
-    pub readable: KvPageSpan,
-    pub writable: KvPageSpan,
-    pub kv_len: u32,
-    pub pages: u32,
-    pub page_indptr: u32,
-    pub w_slot: u32,
-    pub w_off: u32,
-    pub positions: u32,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateBinding {
+    pub lanes: Vec<u32>,
+    pub positions: Option<u32>,
+    pub slots: Option<u32>,
+    pub kv_len: Option<u32>,
     pub mask: Option<u32>,
+    pub fold: Option<u32>,
 }
 
 pub struct ForwardPass {
@@ -344,16 +271,14 @@ pub struct BoundForwardPass {
     pub cells: crate::pipeline::channel::BoundCells,
     pub channel_reps: Vec<u32>,
     pub fires: Option<crate::pipeline::fire::PendingFires>,
-    pub kv_ws: u32,
-    pub kv_declaration: KvDeclaration,
+    pub lanes: Vec<u32>,
+    pub kv_lanes: Vec<u32>,
     pub max_layers: Option<u32>,
     pub block_draft: bool,
     pub rs_ws: Vec<u32>,
-    pub rs_fold_len: Option<Vec<u32>>,
-    pub kv_declaration_realized: bool,
     pub failed: Option<String>,
-    pub devgeo: Option<crate::pipeline::fire::lease::DevGeo>,
-    pub decode_envelope: Option<crate::pipeline::fire::geometry::DecodeEnvelope>,
+    pub devgeo: Option<Vec<u32>>,
+    pub decode_envelope: Option<eta_ir::registry::PortMask>,
     pub host_shadow: crate::pipeline::fire::shadow::HostShadow,
     pub lane: LaneFacts,
     pub float: Option<FloatLane>,
@@ -361,7 +286,12 @@ pub struct BoundForwardPass {
 }
 
 impl BoundForwardPass {
-    pub fn replace_rs_working_sets(&mut self, reps: Vec<u32>) -> Result<(), String> {
+    pub fn replace_lanes(
+        &mut self,
+        lanes: Vec<u32>,
+        kv_lanes: Vec<u32>,
+        rs_ws: Vec<u32>,
+    ) -> Result<(), String> {
         let pending = self
             .fires
             .as_ref()
@@ -369,10 +299,12 @@ impl BoundForwardPass {
             .unwrap_or(0);
         if pending != 0 {
             return Err(format!(
-                "cannot replace rs-working-sets while {pending} operation(s) remain in the pass FIFO"
+                "cannot bind other working sets while {pending} operation(s) remain in the pass FIFO"
             ));
         }
-        self.rs_ws = reps;
+        self.lanes = lanes;
+        self.kv_lanes = kv_lanes;
+        self.rs_ws = rs_ws;
         Ok(())
     }
 
@@ -393,9 +325,6 @@ impl BoundForwardPass {
         }
         for cell in &self.cells {
             cell.lock().unwrap().detach(self.bound_instance.instance_id);
-        }
-        if let Some(devgeo) = self.devgeo.as_mut() {
-            let _ = devgeo.lease.reclaim_all();
         }
     }
 
@@ -422,12 +351,8 @@ impl Drop for BoundForwardPass {
                     .as_ref()
                     .map(|fifo| fifo.lock().unwrap().len())
                     .unwrap_or(0),
-                "forward-pass dropped with its fires FIFO non-empty, bypassing \
-                 HostForwardPass::drop's async drain; skipping native teardown \
-                 (close_instance / channel detach / device-geometry reclaim) to avoid \
-                 racing a live engine completion into a use-after-free or premature \
-                 page reuse — this leaks the engine instance and its channel \
-                 attachments until process exit"
+                "forward pass dropped with fires in flight; its engine instance and \
+                 channel attachments leak until exit rather than race a live completion"
             );
         }
     }

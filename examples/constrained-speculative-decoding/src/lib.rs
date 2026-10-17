@@ -52,9 +52,9 @@
 //! rather than assumed.
 
 use inferlet::chat;
+use inferlet::eta::prelude::*;
 use inferlet::grammar::{Grammar, Matcher};
 use inferlet::mask::unpack_mask;
-use inferlet::eta::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -165,91 +165,89 @@ fn draft_from_cache(tokens: &[u32], draft_length: usize, max_ngram: usize) -> Ve
     Vec::new()
 }
 
-/// One target forward over `committed ++ draft`, reading out `draft.len() + 1`
-/// rows and taking a grammar-masked argmax at each.
-///
-/// `masks[i]` is the allowed set for the position that row `i` predicts, i.e.
-/// the grammar state after `committed ++ draft[..i]`. The KV working set is
-/// rebuilt per call, so a rejected draft can never leak into a later window.
-async fn verify(
-    committed: &[u32],
-    draft: &[u32],
-    masks: &[Vec<bool>],
-    vocab: u32,
-    page_size: u32,
-) -> Result<Vec<u32>> {
-    if committed.is_empty() {
-        return Err("cannot verify from an empty committed sequence".into());
-    }
-    let rows = draft.len() as u32 + 1;
-    if masks.len() != rows as usize {
-        return Err(format!(
-            "verification needs one mask per row: got {} for {rows} rows",
-            masks.len()
-        ));
+/// The last committed token is not written yet: it is the next window's first row.
+struct Target {
+    ws: WorkingSet,
+    pipeline: Pipeline,
+    computed: u32,
+    folded: u32,
+}
+
+impl Target {
+    fn new() -> Self {
+        Self {
+            ws: WorkingSet::new(),
+            pipeline: Pipeline::new(),
+            computed: 0,
+            folded: 0,
+        }
     }
 
-    let mut input = committed.to_vec();
-    input.extend_from_slice(draft);
-    let total = input.len() as u32;
-    let readout_start = committed.len() as u32 - 1;
-    let readout = (readout_start..readout_start + rows).collect::<Vec<_>>();
+    /// `masks[i]` is the grammar state after `committed ++ draft[..i]`. A rejected draft's
+    /// slots are written again by the next window: that is the rollback.
+    async fn verify(
+        &mut self,
+        committed: &[u32],
+        draft: &[u32],
+        masks: &[Vec<bool>],
+        vocab: u32,
+    ) -> Result<Vec<u32>> {
+        if committed.is_empty() {
+            return Err("cannot verify from an empty committed sequence".into());
+        }
+        let rows = draft.len() as u32 + 1;
+        if masks.len() != rows as usize {
+            return Err(format!(
+                "verification needs one mask per row: got {} for {rows} rows",
+                masks.len()
+            ));
+        }
 
-    let ws = WorkingSet::new();
-    let max_pages = total.div_ceil(page_size);
-    ws.reserve(max_pages).context("reserve verification KV")?;
-    let tokens = Channel::from_iter(input.iter().map(|&token| token as i32));
-    let embed_indptr = Channel::from([0u32, total]).named("embed_indptr");
-    let positions = Channel::from_iter(0..total).named("positions");
-    let pages = Channel::from_iter(0..max_pages).named("pages");
-    let page_indptr = Channel::from([0u32, max_pages]).named("page_indptr");
-    let w_slot = Channel::from_iter((0..total).map(|p| p / page_size)).named("w_slot");
-    let w_off = Channel::from_iter((0..total).map(|p| p % page_size)).named("w_off");
-    let kv_len = Channel::from([total]).named("kv_len");
-    let readout = Channel::from(readout).named("readout");
-    // One row of the allowed-token mask per readout row. The library reshapes a
-    // single-row `logits` to `[vocab]`, so the mask has to follow suit or the
-    // `Select` inside `masked_argmax` sees mismatched ranks.
-    let allowed = if rows == 1 {
-        Channel::new([vocab], dtype::bool)
-    } else {
-        Channel::new([rows, vocab], dtype::bool)
+        let start = self.computed;
+        let mut window = committed[start as usize..].to_vec();
+        window.extend_from_slice(draft);
+        let len = window.len() as u32;
+
+        let tokens = Channel::from_iter(window.iter().map(|&token| token as i32));
+        let embed_indptr = Channel::from([0u32, len]).named("embed_indptr");
+        let readout = Channel::from_iter(len - rows..len).named("readout");
+        let slots = Channel::from_iter(start..start + len).named("slots");
+        let fold = Channel::from([start - self.folded]).named("fold");
+        // A one-row `logits` is `[vocab]`, and `masked_argmax` needs the mask at the same rank.
+        let allowed = if rows == 1 {
+            Channel::new([vocab], dtype::bool)
+        } else {
+            Channel::new([rows, vocab], dtype::bool)
+        }
+        .named("allowed");
+        let target_out = Channel::new([rows], dtype::i32).named("target_tokens");
+
+        let fwd = ForwardPass::new();
+        fwd.embed(&tokens, &embed_indptr)?;
+        fwd.readout(&readout)?;
+        fwd.state(
+            &[&self.ws],
+            StateGeometry {
+                slots: Some(&slots),
+                fold: Fold::Count(&fold),
+                ..StateGeometry::default()
+            },
+        )?;
+        fwd.epilogue(move || {
+            target_out.put(masked_argmax(intrinsics::logits(), allowed.take()));
+        });
+
+        allowed.put(masks.concat());
+        fwd.submit(&self.pipeline)
+            .context("verify constrained draft")?;
+        self.folded = start;
+        Ok(target_out
+            .take_host::<Vec<i32>>()
+            .await?
+            .into_iter()
+            .map(|token| token as u32)
+            .collect())
     }
-    .named("allowed");
-    let target_out = Channel::new([rows], dtype::i32).named("target_tokens");
-
-    let fwd = ForwardPass::new();
-    fwd.embed(&tokens, &embed_indptr)?;
-    fwd.readout(&readout)?;
-    fwd.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &kv_len,
-            pages: &pages,
-            page_indptr: &page_indptr,
-            w_slot: &w_slot,
-            w_off: &w_off,
-            positions: &positions,
-            mask: None,
-        },
-    )?;
-    fwd.epilogue(move || {
-        target_out.put(masked_argmax(intrinsics::logits(), allowed.take()));
-    });
-
-    allowed.put(masks.concat());
-    let pipeline = Pipeline::new();
-    fwd.submit(&pipeline).context("verify constrained draft")?;
-    let target = target_out
-        .take_host::<Vec<i32>>()
-        .await?
-        .into_iter()
-        .map(|token| token as u32)
-        .collect();
-    pipeline.close();
-    Ok(target)
 }
 
 #[inferlet::main]
@@ -259,7 +257,6 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let vocab = model::output_vocab_size();
-    let page_size = kv_page_size();
     let constraint = Matcher::new(&Grammar::from_json_schema(&input.schema)?);
 
     let mut committed = chat::system_user(
@@ -271,6 +268,7 @@ async fn main(input: Input) -> Result<Output> {
         committed.push(0);
     }
 
+    let mut target_model = Target::new();
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
     let mut total_drafted = 0usize;
     let mut total_accepted = 0usize;
@@ -306,12 +304,12 @@ async fn main(input: Input) -> Result<Output> {
             }
             masks.push(unpack_mask(&constraint.mask(), vocab));
         }
-        // The bonus row exists only when the grammar is still open.
+        // Every draft walked the grammar; the bonus row exists only while it is still open.
+        let walked = draft.len() as u32;
         draft.truncate(masks.len() - 1);
 
         // Wind the speculative walk all the way back, then prove it landed
         // exactly where it started before committing anything.
-        let walked = draft.len() as u32;
         if walked > constraint.rollback_capacity() {
             return Err(format!(
                 "draft of {walked} exceeds rollback capacity {}",
@@ -329,7 +327,9 @@ async fn main(input: Input) -> Result<Output> {
 
         total_drafted += draft.len();
         verification_steps += 1;
-        let target = verify(&committed, &draft, &masks, vocab, page_size).await?;
+        let target = target_model
+            .verify(&committed, &draft, &masks, vocab)
+            .await?;
         if target.len() != draft.len() + 1 {
             return Err(format!(
                 "verification returned {} tokens for a {}-token draft",
@@ -357,6 +357,8 @@ async fn main(input: Input) -> Result<Output> {
             accepted.push(target[draft.len()]);
         }
 
+        // Every committed token but the newest now has its state written.
+        target_model.computed = (committed.len() + accepted.len() - 1) as u32;
         for token in accepted {
             constraint
                 .accept_tokens(&[token])
@@ -369,6 +371,7 @@ async fn main(input: Input) -> Result<Output> {
         }
     }
 
+    target_model.pipeline.close();
     if !constraint.is_terminated() {
         return Err(format!(
             "JSON generation did not terminate within {} tokens; got {:?}",

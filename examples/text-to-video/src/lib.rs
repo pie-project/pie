@@ -122,11 +122,6 @@
 //! `(own = u, peer = c)`), so both latents step in lockstep and neither
 //! crosses the host between fires.
 //!
-//! This path used to fail at the first readback with "no cell available",
-//! because the host combine took both branches' `out` cells in one turn and
-//! one had none committed yet. Moving the combine onto the device removed
-//! the turn, and with it the failure.
-//!
 //! # THE PROMPT, AND THE ROW WHOSE TOKENIZER PIE CANNOT SPELL
 //!
 //! `--prompt` renders the bound model's template and tokenizes with the
@@ -798,9 +793,9 @@ fn rgb8(pixels: &[f32]) -> Vec<u8> {
 ///
 /// `None` (FLUX.2, Z-Image) means the encoder's rows are the lane's rows
 /// and this hands the channel straight back. A prompt LONGER than the
-/// stated height is refused rather than truncated: the encoder already
-/// truncated at `max-embed-length` if it had to, and silently dropping rows
-/// here would drop the end of a caption.
+/// stated height is refused rather than truncated, as the encoder refuses
+/// ids past the hidden rows one fire reads out: silently dropping rows here
+/// would drop the end of a caption.
 fn pad_context(mut rows: Vec<f32>, width: u32, port: &model::PortFact) -> Result<Channel> {
     if width != port.width {
         return Err(format!(
@@ -1445,4 +1440,3 @@ async fn main(input: Input) -> Result<Output> {
         std: var.sqrt(),
     })
 }
-

@@ -1,15 +1,14 @@
 use crate::rt::Instant;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::{ProcessId, ResidencyPlanner};
 
 use crate::scheduler::{TierKind, TierMove};
 use crate::store::kv::page_table::WorkingSetId;
 use crate::store::kv::working_set::KvSuspendHandle;
-use crate::store::kv::{
-    KvRestoreTxn, KvStoreError, KvSuspendPrepare, KvSuspendTxn, SuspendDisposition,
-};
+use crate::store::kv::{KvResidencyTxn, KvStoreError};
 use crate::store::rs::RsResidencyTxn;
 use ::engine::transfer::MemoryDomain;
 
@@ -43,6 +42,53 @@ pub(super) fn spawn_evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     }
 }
 
+/// No process reads them, so a failure only puts them back.
+pub(super) fn spawn_move_out(
+    planner: Arc<ResidencyPlanner>,
+    txn: KvResidencyTxn,
+    label: &'static str,
+    done: fn(&Arc<ResidencyPlanner>, bool),
+) {
+    let (model, engine) = planner.locus();
+    // The guard owns the move from here: a task that never runs drops it,
+    // and that gives back what the move took.
+    let guard = MoveGuard::new(
+        model,
+        engine,
+        Move::Suspend {
+            kv: Some(txn),
+            rs: None,
+        },
+    );
+    let task = move_out(planner.clone(), guard, label, done);
+    let spawned = spawn_watched(
+        planner.clone(),
+        ProcessId::nil(),
+        label,
+        task,
+        move |planner, _| done(planner, false),
+    );
+    if !spawned {
+        done(&planner, false);
+    }
+}
+
+pub(super) fn spawn_reseat(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
+    let task = {
+        let planner = planner.clone();
+        async move {
+            let seat = crate::inferlet::process::take_seat(pid).await;
+            planner.reseated(pid, seat);
+        }
+    };
+    let spawned = spawn_watched(planner.clone(), pid, "reseat", task, |planner, pid| {
+        planner.reseat_failed(pid)
+    });
+    if !spawned {
+        planner.reseat_failed(pid);
+    }
+}
+
 pub(super) fn spawn_restore(
     planner: Arc<ResidencyPlanner>,
     pid: ProcessId,
@@ -54,7 +100,7 @@ pub(super) fn spawn_restore(
         planner.restore_failed(pid, "restore executor died")
     });
     if !spawned {
-        planner.restore_deferred(pid, "no tokio runtime for the restore executor");
+        planner.requeue_restore(pid, Some("no tokio runtime for the restore executor"));
     }
 }
 
@@ -95,11 +141,11 @@ impl Drop for FenceGuard {
 /// be absent when that store holds nothing to move.
 enum Move {
     Suspend {
-        kv: Option<KvSuspendTxn>,
+        kv: Option<KvResidencyTxn>,
         rs: Option<RsResidencyTxn>,
     },
     Restore {
-        kv: Option<KvRestoreTxn>,
+        kv: Option<KvResidencyTxn>,
         rs: Option<RsResidencyTxn>,
     },
 }
@@ -109,12 +155,12 @@ impl Move {
     /// backed in, then the rs slots.
     fn copies(&self) -> Vec<TierMove> {
         let (out, kv, rs) = match self {
-            Move::Suspend { kv, rs } => (true, kv.as_ref().map(KvSuspendTxn::copy_plans), rs),
-            Move::Restore { kv, rs } => (false, kv.as_ref().map(KvRestoreTxn::copy_plans), rs),
+            Move::Suspend { kv, rs } => (true, kv, rs),
+            Move::Restore { kv, rs } => (false, kv, rs),
         };
         let mut copies: Vec<TierMove> = kv
-            .unwrap_or_default()
-            .into_iter()
+            .iter()
+            .flat_map(KvResidencyTxn::copy_plans)
             .map(|(tier, device, slots)| TierMove {
                 kind: TierKind::Kv,
                 tier,
@@ -123,19 +169,26 @@ impl Move {
                 slots,
             })
             .collect();
-        if let Some(rs) = rs.as_ref().filter(|rs| rs.slot_count() > 0) {
-            let (device, slots) = rs.copy_plan();
-            copies.push(TierMove {
-                kind: if rs.is_ring() {
-                    TierKind::Window
-                } else {
-                    TierKind::Rs
-                },
-                tier: MemoryDomain::HostPinned,
-                out,
-                device,
-                slots,
-            });
+        if let Some(rs) = rs.as_ref() {
+            let plan = rs.copy_plan();
+            let pages = if rs.is_ring() {
+                TierKind::Window
+            } else {
+                TierKind::RsPages
+            };
+            for (kind, pairs) in [(TierKind::Rs, &plan.slots), (pages, &plan.pages)] {
+                if pairs.is_empty() {
+                    continue;
+                }
+                let (device, slots) = pairs.iter().copied().unzip();
+                copies.push(TierMove {
+                    kind,
+                    tier: MemoryDomain::HostPinned,
+                    out,
+                    device,
+                    slots,
+                });
+            }
         }
         copies
     }
@@ -277,6 +330,7 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let rs_working_sets =
         crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine);
     if working_sets.is_empty() && rs_working_sets.is_empty() {
+        tracing::debug!(pid = %pid, "planner: eviction found no working set");
         planner.eviction_failed(pid);
         return;
     }
@@ -291,12 +345,7 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         kv.prepare_suspend(&working_sets)
     });
     let kv = match prepared {
-        Ok(KvSuspendPrepare::Prepared(txn)) => Some(txn),
-        Ok(KvSuspendPrepare::Deferred(SuspendDisposition::NothingReclaimable)) => None,
-        Ok(KvSuspendPrepare::Deferred(SuspendDisposition::GraceDeferred)) => {
-            planner.eviction_failed_prepare_deferred(pid);
-            return;
-        }
+        Ok(kv) => kv,
         Err(error @ KvStoreError::HostSwapFull { .. }) => {
             tracing::warn!(pid = %pid, %error, "planner: eviction blocked on swap room");
             planner.eviction_failed_host_swap_full(pid);
@@ -310,7 +359,8 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     };
     let rs = stores.rs.lock().unwrap().prepare_suspend(&rs_working_sets);
     if kv.is_none() && rs.is_none() {
-        planner.eviction_failed_prepare_deferred(pid);
+        tracing::debug!(pid = %pid, "planner: eviction found nothing reclaimable");
+        planner.eviction_found_nothing(pid);
         return;
     }
     let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs });
@@ -337,11 +387,46 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
                 }
             }
         }
-        None => 0,
+        None => {
+            crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
+                kv.mark_suspended(&working_sets)
+            });
+            0
+        }
     };
-    let rs_freed = rs.map_or(0, |txn| stores.rs.lock().unwrap().commit_suspend(txn));
+    let rs_freed = rs.map_or(Default::default(), |txn| {
+        stores.rs.lock().unwrap().commit_suspend(txn)
+    });
     fence.keep_raised();
-    planner.report_evicted(pid, freed as u32, rs_freed as u32);
+    planner.report_evicted(pid, freed as u32, rs_freed);
+}
+
+const MOVE_WAIT: Duration = Duration::from_secs(10);
+
+async fn move_out(
+    planner: Arc<ResidencyPlanner>,
+    mut guard: MoveGuard,
+    label: &'static str,
+    done: fn(&Arc<ResidencyPlanner>, bool),
+) {
+    let (model, engine) = planner.locus();
+    if let Err(error) = guard.copy(&planner, ProcessId::nil()).await {
+        tracing::warn!(%error, "planner: {label} copy failed");
+        drop(guard);
+        done(&planner, false);
+        return;
+    }
+    let Move::Suspend { kv: Some(txn), .. } = guard.take() else {
+        unreachable!("a {label} carries a kv suspend")
+    };
+    let stores = crate::store::registry::get(model, engine);
+    let moved = crate::store::registry::with_kv_lock(&stores.kv, "planner-move-out", |kv| {
+        kv.commit_suspend(txn)
+    });
+    if let Err(error) = &moved {
+        tracing::warn!(%error, "planner: {label} commit failed");
+    }
+    done(&planner, moved.is_ok());
 }
 
 async fn restore(
@@ -358,14 +443,39 @@ async fn restore(
     let stores = crate::store::registry::get(model, engine);
     let mut kv = None;
     if !working_sets.is_empty() {
-        let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
-            kv.prepare_restore(&working_sets, pages.lend())
+        // Another move may hold pages this process shares: it lands soon,
+        // and this waits for it rather than for a clock.
+        let ended = crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
+            kv.moves_ended()
         });
-        match prepared {
-            Ok(txn) => kv = Some(txn),
-            Err(error) => {
-                planner.restore_deferred(pid, &error.to_string());
-                return;
+        let deadline = Instant::now() + MOVE_WAIT;
+        loop {
+            let notified = ended.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            let prepared =
+                crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
+                    kv.prepare_restore(&working_sets, pages.lend())
+                });
+            match prepared {
+                Ok(txn) => {
+                    kv = Some(txn);
+                    break;
+                }
+                Err(KvStoreError::MoveInFlight) if Instant::now() < deadline => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    let _ = crate::rt::time::timeout(left, notified).await;
+                }
+                // Still moving, or its pages moved meanwhile: queue again,
+                // which is no failure of this restore.
+                Err(KvStoreError::MoveInFlight | KvStoreError::GrantMismatch { .. }) => {
+                    planner.requeue_restore(pid, None);
+                    return;
+                }
+                Err(error) => {
+                    planner.requeue_restore(pid, Some(&error.to_string()));
+                    return;
+                }
             }
         }
     }
@@ -381,7 +491,7 @@ async fn restore(
             Ok(txn) => rs = Some(txn),
             Err(error) => {
                 abort(model, engine, Move::Restore { kv, rs: None });
-                planner.restore_deferred(pid, &error.to_string());
+                planner.requeue_restore(pid, Some(&error.to_string()));
                 return;
             }
         }
@@ -389,7 +499,7 @@ async fn restore(
     drop(slots);
     let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs });
     if let Err(error) = guard.copy(&planner, pid).await {
-        planner.restore_deferred(pid, &error);
+        planner.requeue_restore(pid, Some(&error));
         return;
     }
     let Move::Restore { kv, rs } = guard.take() else {
