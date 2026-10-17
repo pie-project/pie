@@ -3,11 +3,8 @@
 
 use super::from_bf16;
 use super::tc5::{e2m1, e4m3, ue8m0};
-use super::{Gpu, Lcg};
-use dtype::Dtype;
 use kernels_cuda::attn::dsv4::{self, Rows};
 use kernels_cuda::cudarc::runtime::sys as rt;
-use kernels_cuda::tensor::Tensor;
 
 /// Asserts a runtime call answered success.
 pub fn cuda_ok(code: rt::cudaError, call: &str) {
@@ -82,25 +79,6 @@ pub fn spatial_attention_ref(
         off += b.voxels();
     }
     y
-}
-
-/// A zeroed bf16 `[rows][width]` tensor.
-pub fn bf16_zeros(gpu: &mut Gpu, rows: usize, width: usize) -> Tensor {
-    Tensor::new(
-        gpu.zeros(rows * width * 2),
-        rows as u32,
-        width as u32,
-        Dtype::Bf16,
-    )
-}
-
-/// A random bf16 `[rows][width]` tensor, with its values.
-pub fn bf16_rows(gpu: &mut Gpu, lcg: &mut Lcg, rows: usize, width: usize) -> (Tensor, Vec<f32>) {
-    let (raw, exact) = lcg.row(rows * width);
-    (
-        Tensor::new(gpu.up(&raw), rows as u32, width as u32, Dtype::Bf16),
-        exact,
-    )
 }
 
 /// The nearest of `codes` positive codes to `|v|` under `value`, ties to the
@@ -187,18 +165,6 @@ pub fn ragged_attention(
         }
     }
     o
-}
-
-/// Every bf16 `got` within `tol` of `want` (relative, at least 1 absolute).
-pub fn assert_near(got: &[u16], want: &[f32], tol: f32, what: &str) {
-    assert_eq!(got.len(), want.len(), "{what}: lengths");
-    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
-        let g = from_bf16(g);
-        assert!(
-            (g - w).abs() <= tol * w.abs().max(1.0),
-            "{what}: element {i} landed {g} against {w}"
-        );
-    }
 }
 
 /// What DeepSeek's quantized rows of `fmt` say, `page` cells a page (a
