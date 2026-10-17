@@ -89,9 +89,10 @@ pub fn quantized(ctx: &Ctx, op: &'static str, x: Tensor, gran: u32) -> Result<Te
     Ok(y)
 }
 
-/// That `codes` (e4m3, `[n, k]`) and `scales` (e8m0, one a 128x128 block)
-/// are one fp8b128 projection.
-fn fp8b128_planes(op: &'static str, codes: Tensor, scales: Tensor) -> Result<(u32, u32), Error> {
+/// That `codes` (e4m3, `[n, k]`) and `scales` (e8m0, one a 128x128 block,
+/// or one a 32x32 block: `fp8b32`) are one block-FP8 projection; with its
+/// block side.
+fn fp8b128_planes(op: &'static str, codes: Tensor, scales: Tensor) -> Result<(u32, u32, u32), Error> {
     let (n, k) = (codes.rows, codes.width);
     if !matches!(codes.dtype, Dtype::E4m3 | Dtype::U8) || !matches!(scales.dtype, Dtype::E8m0 | Dtype::U8) {
         return Err(refuse(
@@ -102,25 +103,25 @@ fn fp8b128_planes(op: &'static str, codes: Tensor, scales: Tensor) -> Result<(u3
             ),
         ));
     }
-    if scales.rows != n.div_ceil(FP8_BLOCK) || scales.width != k.div_ceil(FP8_BLOCK) {
+    let Some(side) = [FP8_BLOCK, 32]
+        .into_iter()
+        .find(|&b| scales.rows == n.div_ceil(b) && scales.width == k.div_ceil(b))
+    else {
         return Err(refuse(
             op,
             format!(
-                "a [{n}, {k}] fp8b128 projection's exponents are [{}, {}], not [{}, {}]",
-                scales.rows,
-                scales.width,
-                n.div_ceil(FP8_BLOCK),
-                k.div_ceil(FP8_BLOCK)
+                "a [{n}, {k}] block-FP8 projection's exponents are [{}, {}], one a 128x128 or a 32x32 block",
+                scales.rows, scales.width,
             ),
         ));
-    }
+    };
     if n == 0 || k == 0 || !k.is_multiple_of(16) || codes.ptr % 16 != 0 {
         return Err(refuse(
             op,
             format!("a [{n}, {k}] e4m3 plane is not whole 16-byte runs a row"),
         ));
     }
-    Ok((n, k))
+    Ok((n, k, side))
 }
 
 /// An fp8b128 projection's values in bf16 at `dst`, `[n, k]`.
@@ -131,12 +132,12 @@ pub fn fp8b128_decode_into(
     scales: Tensor,
     dst: u64,
 ) -> Result<Tensor, Error> {
-    let (n, k) = fp8b128_planes(op, codes, scales)?;
+    let (n, k, side) = fp8b128_planes(op, codes, scales)?;
     let threads = u32::try_from((u64::from(n) * u64::from(k)).div_ceil(8))
         .map_err(|_| refuse(op, "the decode's threads do not fit a 32-bit extent"))?;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::fp8b128_decode").apply(Launch::flat(threads, BLOCK)),
+        Fire::at(FILE, symbol(&format!("::pie::linear::fp8b128_decode<{side}>"))).apply(Launch::flat(threads, BLOCK)),
         &[
             codes.arg(),
             scales.arg(),
@@ -164,7 +165,7 @@ pub fn matmul_fp8b128(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
-    let (n, k) = fp8b128_planes(op, codes, scales)?;
+    let (n, k, side) = fp8b128_planes(op, codes, scales)?;
     if act.width != k || y.width != n || y.rows != act.rows || y.dtype != Dtype::Bf16 {
         return Err(refuse(
             op,
@@ -185,7 +186,7 @@ pub fn matmul_fp8b128(
         nonzero(op, "the projection's rows", n)?;
         return ctx.fire(
             op,
-            Fire::at(FILE, symbol(&format!("::pie::linear::fp8b128_gemv<{}>", 4)))
+            Fire::at(FILE, symbol(&format!("::pie::linear::fp8b128_gemv<{}, {side}>", 4)))
                 .apply(Launch::flat(threads, BLOCK)),
             &[
                 q.arg(),

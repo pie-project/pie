@@ -189,7 +189,8 @@ def layer(m, rows, w, streams, trail, following = None):
     q_a = ops.linear.matmul(x, at.q_down)
     q_a = ops.elemwise.rmsnorm(q_a, at.q_norm, at.q_norm_eps)
     q = ops.linear.matmul(q_a, at.q_up)
-    q = ops.elemwise.rmsnorm_no_scale(q, m.head_dim, at.q_norm_eps)
+    if getattr(at, "q_head_norm", True):
+        q = ops.elemwise.rmsnorm_no_scale(q, m.head_dim, at.q_norm_eps)
     q = rope(q, pos, at.rope_dim, m.head_dim, at.theta, at.yarn)
     seam.at(seam.ATTN_Q, [q])
 

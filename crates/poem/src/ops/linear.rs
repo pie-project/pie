@@ -39,7 +39,7 @@ pub fn matmul(act: &Value, w: &Weight) -> Value {
 /// Raw e4m3 codes beside a plane of 128x128 block factors: DeepSeek's e8m0
 /// exponents (`fp8b128`) or transformers' f32 factors (`e4m3tile128`).
 fn block_fp8(dtype: Dtype) -> bool {
-    matches!(dtype, Dtype::Fp8b128 | Dtype::E4m3tile128)
+    matches!(dtype, Dtype::Fp8b128 | Dtype::Fp8b32 | Dtype::E4m3tile128)
 }
 
 /// The static global a format quantizes `w`'s activations under, the

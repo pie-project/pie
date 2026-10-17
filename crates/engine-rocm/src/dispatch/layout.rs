@@ -51,6 +51,16 @@ impl Run<'_> {
                 vocab,
                 y,
             } => match self.maybe_planes(*table) {
+                Some((codes, scales, None, _)) => {
+                    kernels_rocm::layout_embed_concat::embed_concat_mxfp8(
+                        self.ctx(),
+                        self.tensor(*ids),
+                        codes,
+                        scales,
+                        *vocab,
+                        &mut self.tensor(*y),
+                    )
+                }
                 Some((codes, scales, biases, seat)) => {
                     kernels_rocm::layout_embed_concat::embed_concat_mlxu4(
                         self.ctx(),

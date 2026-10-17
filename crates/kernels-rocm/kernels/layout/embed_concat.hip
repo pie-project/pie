@@ -5,6 +5,7 @@
 // lands zeros. One thread per element.
 
 #include "prelude/device.hip"
+#include "linear/act_quant.hip"
 
 namespace pie::layout {
 
@@ -105,6 +106,27 @@ __global__ void embed_concat_mlxu8(const i32* __restrict__ ids, const u8* __rest
                                    u32* __restrict__ hits, const u32* __restrict__ win) {
     embed_affine<T, 8>(ids, codes, scales, biases, y, rows, heads, width, group, vocab, offset, bases, hits,
                        win);
+}
+
+// An MXFP8 table: e4m3 codes under one ue8m0 exponent a 1x32 block, v =
+// code · 2^(e - 127), exact in bf16.
+template <class T>
+__global__ void embed_concat_mxfp8(const i32* __restrict__ ids, const u8* __restrict__ codes,
+                                   const u8* __restrict__ scales, T* __restrict__ y, int rows, int heads, int width,
+                                   int vocab, const u32* __restrict__ win) {
+    ConcatAt at;
+    if (!concat_at(rows, heads, width, win, at)) return;
+    const long long slot = at.row * heads + at.head;
+    const int id = ids[slot];
+    T* dst = y + slot * width + at.w;
+    if (id < 0 || id >= vocab) {
+        *dst = from_f32<T>(0.f);
+        return;
+    }
+    const long long r = static_cast<long long>(id);
+    const float v = pie::linear::e4m3fn_value(codes[r * width + at.w]) *
+                    pie::linear::e8m0_value(scales[r * (width / 32) + at.w / 32]);
+    *dst = from_f32<T>(v);
 }
 
 }  // namespace pie::layout

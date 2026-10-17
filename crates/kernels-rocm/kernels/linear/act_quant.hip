@@ -91,13 +91,15 @@ __global__ __launch_bounds__(256) void act_quant_e4m3_values(const bf16* __restr
 __device__ __forceinline__ float e8m0_value(u32 e) { return __uint_as_float(e == 0u ? 0x400000u : e << 23); }
 
 // An fp8b128 projection's values in bf16, `[n, k]`: eight codes a thread.
+// B: the block side, 128 (`fp8b128`) or 32 (`fp8b32`).
+template <int B = 128>
 __global__ __launch_bounds__(256) void fp8b128_decode(const u8* __restrict__ codes, const u8* __restrict__ scales,
                                                       bf16* __restrict__ out, i32 n, i32 k) {
     const long long i8 = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) * 8;
     if (i8 >= static_cast<long long>(n) * k) return;
     const int r = static_cast<int>(i8 / k), c = static_cast<int>(i8 % k);
-    const int kb = (k + 127) / 128;
-    const float s = e8m0_value(scales[static_cast<long long>(r / 128) * kb + c / 128]);
+    const int kb = (k + B - 1) / B;
+    const float s = e8m0_value(scales[static_cast<long long>(r / B) * kb + c / B]);
     const unsigned long long word = *reinterpret_cast<const unsigned long long*>(codes + i8);
     Pack8<bf16> o;
 #pragma unroll
@@ -109,7 +111,7 @@ __global__ __launch_bounds__(256) void fp8b128_decode(const u8* __restrict__ cod
 // the codes decoded in registers: a wavefront an output column, sixteen
 // codes a lane a step (one 128-block scale each), the rows' sums kept per
 // lane and reduced at the end. ROWS rows of x a pass.
-template <int ROWS>
+template <int ROWS, int B = 128>
 __global__ __launch_bounds__(256) void fp8b128_gemv(const bf16* __restrict__ x, const u8* __restrict__ codes,
                                                     const u8* __restrict__ scales, bf16* __restrict__ y, i32 m,
                                                     i32 n, i32 k, const u32* __restrict__ win) {
@@ -118,9 +120,9 @@ __global__ __launch_bounds__(256) void fp8b128_gemv(const bf16* __restrict__ x, 
     const int col = static_cast<int>((static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) / kWave);
     if (col >= n) return;
     const int l = lane();
-    const int kb = (k + 127) / 128;
+    const int kb = (k + B - 1) / B;
     const u8* wrow = codes + static_cast<long long>(col) * k;
-    const u8* srow = scales + static_cast<long long>(col / 128) * kb;
+    const u8* srow = scales + static_cast<long long>(col / B) * kb;
     const long long first = window.plane(0);
     for (int r0 = 0; r0 < m; r0 += ROWS) {
         float acc[ROWS];
@@ -128,7 +130,7 @@ __global__ __launch_bounds__(256) void fp8b128_gemv(const bf16* __restrict__ x, 
         for (int r = 0; r < ROWS; ++r) acc[r] = 0.f;
         for (int c = 16 * l; c < k; c += 16 * kWave) {
             const uint4 word = *reinterpret_cast<const uint4*>(wrow + c);
-            const float s = e8m0_value(srow[c / 128]);
+            const float s = e8m0_value(srow[c / B]);
             float w[16];
             const u32 parts[4] = {word.x, word.y, word.z, word.w};
 #pragma unroll

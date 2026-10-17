@@ -93,6 +93,8 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         | Dtype::E4m3tile128
         | Dtype::E4m3tensor
         | Dtype::Fp8b128
+        | Dtype::Fp8b32
+        | Dtype::Mxfp8
         | Dtype::U2g16k
         | Dtype::I3g16k
         | Dtype::U4g32k

@@ -888,6 +888,20 @@ fn pairings<'a>(
             out.insert(param.name.as_str(), Pairing { scales, biases: None });
         }
     }
+    // An MXFP8 table: its e4m3 rows beside, by name, one e8m0 exponent a
+    // 1x32 block of each, which its gather reads with them.
+    for param in &trace.params {
+        if param.dtype != Dtype::E4m3 || param.shape.len() != 2 || out.contains_key(param.name.as_str()) {
+            continue;
+        }
+        let factors = format!("{}{}", param.name, poem_ir::SCALES);
+        if let Some(&scales) = index.get(factors.as_str())
+            && trace.params[scales].dtype == Dtype::E8m0
+            && trace.params[scales].shape == [param.shape[0], param.shape[1].div_ceil(32)]
+        {
+            out.insert(param.name.as_str(), Pairing { scales, biases: None });
+        }
+    }
     Ok(out)
 }
 

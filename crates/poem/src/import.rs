@@ -357,7 +357,7 @@ fn claim(w: &Weight, tp: u32) -> Claim {
             "a {:?} weight is served but no load contract declares one",
             w.dtype
         ),
-        Dtype::Fp8b128 | Dtype::E4m3tile128 => panic!(
+        Dtype::Fp8b128 | Dtype::Fp8b32 | Dtype::Mxfp8 | Dtype::E4m3tile128 => panic!(
             "`{}`: a {} weight is claimed plane by plane, its raw codes and \
              block factors each their own",
             w.name, w.dtype
@@ -642,7 +642,7 @@ fn planes(
     from: impl Into<String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let from = from.into();
-    if matches!(w.dtype, Dtype::Fp8b128 | Dtype::E4m3tile128) {
+    if matches!(w.dtype, Dtype::Fp8b128 | Dtype::Fp8b32 | Dtype::Mxfp8 | Dtype::E4m3tile128) {
         return fp8_block_planes(src, w, vec![from]);
     }
     if stored_raw(src, &from)? {
@@ -690,7 +690,7 @@ fn planes_fused(
     parts: impl IntoIterator<Item = String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let parts: Vec<String> = parts.into_iter().collect();
-    if matches!(w.dtype, Dtype::Fp8b128 | Dtype::E4m3tile128) {
+    if matches!(w.dtype, Dtype::Fp8b128 | Dtype::Fp8b32 | Dtype::Mxfp8 | Dtype::E4m3tile128) {
         return fp8_block_planes(src, w, parts);
     }
     if parts.iter().try_fold(true, |all, part| {
@@ -1259,6 +1259,12 @@ fn fp8_block_planes(
         name: w.name.clone(),
         detail,
     };
+    // Each scale's block: rows by codes.
+    let (tall, side): (i64, i64) = match w.dtype {
+        Dtype::Fp8b32 => (32, 32),
+        Dtype::Mxfp8 => (1, 32),
+        _ => (128, 128),
+    };
     if w.shape.len() != 2 {
         return Err(illegible(format!(
             "it is declared {:?}; an fp8b128 weight is one projection",
@@ -1293,7 +1299,7 @@ fn fp8_block_planes(
                 "`{part}` is stored {held:?}, not a matrix"
             )));
         };
-        if stored != Encoding::Raw(DType::E4m3) || (at + 1 < parts.len() && rows % 128 != 0) {
+        if stored != Encoding::Raw(DType::E4m3) || (at + 1 < parts.len() && rows % tall != 0) {
             return Err(illegible(format!(
                 "`{part}` is stored {stored:?} {held:?}; an fp8b128 leg is e4m3, a whole \
                  number of 128-row blocks but the last"
@@ -1301,17 +1307,17 @@ fn fp8_block_planes(
         }
         // DeepSeek's e8m0 exponents beside the stem, or transformers' f32
         // factors beside the whole name.
-        let (scale, factor, spelled) = if w.dtype == Dtype::Fp8b128 {
+        let (scale, factor, spelled) = if w.dtype != Dtype::E4m3tile128 {
             (format!("{stem}.scale"), DType::E8m0, "e8m0")
         } else {
             (format!("{part}_scale_inv"), DType::F32, "f32")
         };
-        let blocks = vec![(rows + 127) / 128, (cols + 127) / 128];
+        let blocks = vec![(rows + tall - 1) / tall, (cols + side - 1) / side];
         let stored = stored_encoding(src, &scale)?;
         if stored != Encoding::Raw(factor) || shape_of(&scale) != blocks {
             return Err(illegible(format!(
                 "`{scale}` is stored {stored:?} {:?}; {} factors are one {spelled} a \
-                 128x128 block, {blocks:?}",
+                 {tall}x{side} block, {blocks:?}",
                 shape_of(&scale),
                 w.dtype,
             )));
@@ -1334,8 +1340,8 @@ fn fp8_block_planes(
         TensorContract::new(
             crate::scales_name(&w.name),
             joined(axis, scales),
-            vec![(n + 127) / 128, (k + 127) / 128],
-            encoding(if w.dtype == Dtype::Fp8b128 { Dtype::E8m0 } else { Dtype::F32 }),
+            vec![(n + tall - 1) / tall, (k + side - 1) / side],
+            encoding(if w.dtype == Dtype::E4m3tile128 { Dtype::F32 } else { Dtype::E8m0 }),
         ),
     ])
 }
@@ -2059,7 +2065,7 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             "a {:?} weight is served but no load contract declares one",
             dtype
         ),
-        Dtype::Fp8b128 | Dtype::E4m3tile128 => panic!(
+        Dtype::Fp8b128 | Dtype::Fp8b32 | Dtype::Mxfp8 | Dtype::E4m3tile128 => panic!(
             "a {dtype} weight is encoded plane by plane, its raw codes and block factors \
              each their own"
         ),

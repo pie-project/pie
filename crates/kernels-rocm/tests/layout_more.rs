@@ -11,7 +11,7 @@ mod common;
 
 use common::{Gpu, bf16, close_bf16, round_bf16, values};
 use dtype::Dtype;
-use kernels_rocm::layout_embed_concat::{embed_concat, embed_concat_mlxu4, embed_mlx_affine};
+use kernels_rocm::layout_embed_concat::{embed_concat, embed_concat_mlxu4, embed_concat_mxfp8, embed_mlx_affine};
 use kernels_rocm::layout_embed_weighted::embed_weighted;
 use kernels_rocm::layout_fold::{merge_rows, pool_rows};
 use kernels_rocm::layout_pixels::{grid_taps, pixels};
@@ -886,4 +886,50 @@ fn envelope_update_appended() {
         assert_eq!(gpu.read(&env_min), lo, "envelope min, {lanes} lanes");
         assert_eq!(gpu.read(&env_max), hi, "envelope max, {lanes} lanes");
     }
+}
+
+/// The value of OCP e4m3fn code `b`.
+fn e4m3fn(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let (e, m) = (i32::from((b >> 3) & 0xF), f32::from(b & 7));
+    sign * if e == 0 { m / 8.0 * 2f32.powi(-6) } else { (1.0 + m / 8.0) * 2f32.powi(e - 7) }
+}
+
+fn byte_tensor(gpu: &Gpu, b: &[u8], rows: u32, width: u32, dtype: Dtype) -> Tensor {
+    let mut padded = b.to_vec();
+    padded.resize(b.len().div_ceil(4) * 4, 0);
+    let words: Vec<i32> = padded.chunks(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let t = gpu.ints_shaped(&words, 1, words.len() as u32);
+    Tensor::new(t.ptr, rows, width, dtype)
+}
+
+#[test]
+fn an_mxfp8_table_gathers_its_rows_exactly() {
+    // DeepSeek-V4.1's Engram table: e4m3 codes under one e8m0 exponent a
+    // 1x32 block; an id past the table lands zeros.
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let (vocab, width, heads) = (40u32, 64u32, 3u32);
+    let w = width as usize;
+    let codes: Vec<u8> = (0..vocab as usize * w).map(|i| ((i * 37 + 11) % 256) as u8).map(|b| if b & 0x7F == 0x7F { 0 } else { b }).collect();
+    let exps: Vec<u8> = (0..vocab as usize * w / 32).map(|i| 118 + (i % 12) as u8).collect();
+    let table = byte_tensor(&gpu, &codes, vocab, width, Dtype::E4m3);
+    let scales = byte_tensor(&gpu, &exps, vocab, width / 32, Dtype::E8m0);
+    let idv = [1, 39, 40, -2, 0, 7, 12, 12, 3, 5, 6, 8];
+    let rows = idv.len() as u32 / heads;
+    let ids = gpu.ints_shaped(&idv, rows, heads);
+    let mut y = gpu.zeros(rows, heads * width, Dtype::Bf16);
+    embed_concat_mxfp8(&ctx, ids, table, scales, vocab, &mut y).unwrap();
+    let mut want = Vec::new();
+    for &id in &idv {
+        for c in 0..w {
+            want.push(if (0..vocab as i32).contains(&id) {
+                let r = id as usize;
+                round_bf16(e4m3fn(codes[r * w + c]) * 2f32.powi(i32::from(exps[r * (w / 32) + c / 32]) - 127))
+            } else {
+                0.0
+            });
+        }
+    }
+    assert_eq!(gpu.read(&y), want, "embed_concat_mxfp8");
 }

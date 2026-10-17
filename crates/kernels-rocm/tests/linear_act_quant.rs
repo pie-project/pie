@@ -122,6 +122,12 @@ fn e4m3_activations_land_their_exact_values() {
 
 /// `[m, k] · [n, k]ᵀ` for an fp8b128 weight against quantized activations.
 fn run_fp8b128(m: usize, n: usize, k: usize, tile_holds: bool) {
+    run_fp8b(m, n, k, tile_holds, 128);
+}
+
+/// The same at block side `side` (128, or V4.1's 32), the activations in
+/// 1x`side` blocks.
+fn run_fp8b(m: usize, n: usize, k: usize, tile_holds: bool, side: usize) {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
     let mut seed = 0x9E37_79B9u32 ^ (m * 31 + n) as u32;
@@ -140,13 +146,13 @@ fn run_fp8b128(m: usize, n: usize, k: usize, tile_holds: bool) {
             }
         })
         .collect();
-    let (nb, kb) = (n.div_ceil(128), k.div_ceil(128));
+    let (nb, kb) = (n.div_ceil(side), k.div_ceil(side));
     let exps: Vec<u8> = (0..nb * kb).map(|_| 120 + (next() % 10) as u8).collect();
     let w = |r: usize, c: usize| {
-        e4m3_value(codes[r * k + c]) * 2f32.powi(i32::from(exps[(r / 128) * kb + c / 128]) - 127)
+        e4m3_value(codes[r * k + c]) * 2f32.powi(i32::from(exps[(r / side) * kb + c / side]) - 127)
     };
     let x: Vec<f32> = values(m * k, 21, 2.0).into_iter().map(round_bf16).collect();
-    let xq = host_quantized(&x, k, 128);
+    let xq = host_quantized(&x, k, side);
     let want: Vec<f32> = (0..m * n)
         .map(|i| {
             let (r, c) = (i / n, i % n);
@@ -160,14 +166,14 @@ fn run_fp8b128(m: usize, n: usize, k: usize, tile_holds: bool) {
         gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
         bytes(&gpu, &codes, n as u32, k as u32, Dtype::E4m3),
         bytes(&gpu, &exps, nb as u32, kb as u32, Dtype::E8m0),
-        128,
+        side as u32,
         tile_holds,
         &mut y,
     )
     .unwrap();
     let big = want.iter().fold(0f32, |a, v| a.max(v.abs()));
     close_abs(
-        &format!("fp8b128 m{m} n{n} k{k} tile {tile_holds}"),
+        &format!("fp8b{side} m{m} n{n} k{k} tile {tile_holds}"),
         &gpu.read(&y),
         &want,
         big * 1e-2,
@@ -182,6 +188,14 @@ fn an_fp8b128_projection_answers_the_quantized_dot() {
     run_fp8b128(13, 256, 512, true);
     run_fp8b128(100, 320, 768, true);
     run_fp8b128(40, 200, 256, false);
+}
+
+#[test]
+fn an_fp8b32_projection_answers_the_quantized_dot() {
+    run_fp8b(1, 384, 1024, true, 32);
+    run_fp8b(13, 256, 512, true, 32);
+    run_fp8b(100, 320, 768, true, 32);
+    run_fp8b(40, 200, 256, false, 32);
 }
 
 /// Codes past the NaNs and f32 factors of no particular form (as a
