@@ -1340,7 +1340,7 @@ impl FrameShell for Shell {
         // recorded under is what it replays under.
         let key = key.with_islands(&record::widen(
             &self.compiled,
-            &windows.admits_axes(totals, &self.shifted, &self.lane_shifted),
+            &windows.admits_axes(totals, &self.shifted, &self.lane_shifted, self.staging()),
         ));
         let ladder = key.classes.clone();
         let patch_ladder = key.patch.as_ref().map(|axis| axis.classes.clone());

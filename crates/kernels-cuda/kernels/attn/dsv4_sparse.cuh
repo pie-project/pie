@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_fp16.h>
+
 #include "attn/dsv4_kv.cuh"
 #include "attn/tc5_fmha.cuh"
 
@@ -151,7 +153,9 @@ __device__ __forceinline__ void issue_sync() { asm volatile("bar.sync 2, %0;" ::
 
 // A key's 64 dims of one atom (`a`) in format F: its bytes, loaded before
 // any is widened (MXFP8 rows: 64 codes under two ue8m0 scales; NVFP4 rows:
-// 32 bytes of e2m1 pairs under four e4m3 scales).
+// 32 bytes of e2m1 pairs under four e4m3 scales; V4's rows: 64 codes under
+// one ue8m0 scale, or at the last atom the rotated dims' 128 bytes of bf16,
+// read as they are when the atom is stored).
 struct AtomBytes {
     uint4 d[4];
     std::uint32_t sc;
@@ -165,6 +169,12 @@ __device__ __forceinline__ void load_atom(const std::uint8_t* plane, u32 cell, i
 #pragma unroll
         for (int i = 0; i < 4; ++i) b.d[i] = reinterpret_cast<const uint4*>(r.data + a * 64)[i];
         b.sc = *reinterpret_cast<const std::uint16_t*>(r.scales + a * 2);
+    } else if constexpr (F == dsv4::kV4) {
+        if (a * 64 < dsv4::kDsNope) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) b.d[i] = reinterpret_cast<const uint4*>(r.data + a * 64)[i];
+            b.sc = r.scales[a];
+        }
     } else {
 #pragma unroll
         for (int i = 0; i < 2; ++i) b.d[i] = reinterpret_cast<const uint4*>(r.data + a * 32)[i];
@@ -172,10 +182,63 @@ __device__ __forceinline__ void load_atom(const std::uint8_t* plane, u32 cell, i
     }
 }
 
+// Eight e2m1 codes (two a byte, the lower dim low) under an e4m3 scale, as
+// bf16: on sm_100a's e2m1 conversion, each pair widened to f16, multiplied
+// by the scale in f16 (exact: at most five significant bits, inside f16's
+// range) and narrowed to bf16 through f32 (exact again). What the f32
+// product rounds to, in a third of the instructions.
+__device__ __forceinline__ uint4 nv4_widen8_fast(std::uint32_t nib, std::uint32_t scale2) {
+#if defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM103_ALL)
+    uint4 out;
+    asm("{\n\t"
+        ".reg .b8 b0, b1, b2, b3;\n\t"
+        ".reg .b32 h0, h1, h2, h3;\n\t"
+        ".reg .b16 l, h;\n\t"
+        ".reg .f32 fl, fh;\n\t"
+        "mov.b32 {b0, b1, b2, b3}, %4;\n\t"
+        "cvt.rn.f16x2.e2m1x2 h0, b0;\n\t"
+        "cvt.rn.f16x2.e2m1x2 h1, b1;\n\t"
+        "cvt.rn.f16x2.e2m1x2 h2, b2;\n\t"
+        "cvt.rn.f16x2.e2m1x2 h3, b3;\n\t"
+        "mul.rn.f16x2 h0, h0, %5;\n\t"
+        "mul.rn.f16x2 h1, h1, %5;\n\t"
+        "mul.rn.f16x2 h2, h2, %5;\n\t"
+        "mul.rn.f16x2 h3, h3, %5;\n\t"
+        "mov.b32 {l, h}, h0;\n\t cvt.f32.f16 fl, l;\n\t cvt.f32.f16 fh, h;\n\t cvt.rn.bf16x2.f32 %0, fh, fl;\n\t"
+        "mov.b32 {l, h}, h1;\n\t cvt.f32.f16 fl, l;\n\t cvt.f32.f16 fh, h;\n\t cvt.rn.bf16x2.f32 %1, fh, fl;\n\t"
+        "mov.b32 {l, h}, h2;\n\t cvt.f32.f16 fl, l;\n\t cvt.f32.f16 fh, h;\n\t cvt.rn.bf16x2.f32 %2, fh, fl;\n\t"
+        "mov.b32 {l, h}, h3;\n\t cvt.f32.f16 fl, l;\n\t cvt.f32.f16 fh, h;\n\t cvt.rn.bf16x2.f32 %3, fh, fl;\n\t"
+        "}"
+        : "=r"(out.x), "=r"(out.y), "=r"(out.z), "=r"(out.w)
+        : "r"(nib), "r"(scale2));
+    return out;
+#else
+    const std::uint32_t s = scale2 & 0xffffu;
+    const __half hs = *reinterpret_cast<const __half*>(&s);
+    return dsv4::nv4_widen8(nib, __float2bfloat162_rn(__half2float(hs)));
+#endif
+}
+
+// An e4m3 scale byte as f16, twice (an f16x2).
+__device__ __forceinline__ std::uint32_t e4m3_f16x2(std::uint32_t byte) {
+    std::uint32_t h2;
+    const std::uint16_t pair = static_cast<std::uint16_t>(byte | (byte << 8));
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(pair));
+    return h2;
+}
+
 // The loaded atom widened to eight 16-byte pieces of bf16.
 template <int F>
 __device__ __forceinline__ void widen_atom(const AtomBytes& b, uint4 (&v)[8]) {
-    if constexpr (F == dsv4::kMx8) {
+    if constexpr (F == dsv4::kV4) {
+        const float s = dsv4::ue8m0(static_cast<std::uint8_t>(b.sc));
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            const uint4& d = b.d[c / 2];
+            const uint2 codes = (c & 1) ? make_uint2(d.z, d.w) : make_uint2(d.x, d.y);
+            v[c] = dsv4::mx8_widen8(codes, s);
+        }
+    } else if constexpr (F == dsv4::kMx8) {
         const float s0 = dsv4::ue8m0(static_cast<std::uint8_t>(b.sc));
         const float s1 = dsv4::ue8m0(static_cast<std::uint8_t>(b.sc >> 8));
 #pragma unroll
@@ -185,17 +248,15 @@ __device__ __forceinline__ void widen_atom(const AtomBytes& b, uint4 (&v)[8]) {
             v[c] = dsv4::mx8_widen8(codes, c < 4 ? s0 : s1);
         }
     } else {
-        __nv_bfloat162 s2[4];
+        std::uint32_t s2[4];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            s2[i] = __float2bfloat162_rn(dsv4::e4m3_float(static_cast<std::uint8_t>(b.sc >> (8 * i))));
-        }
+        for (int i = 0; i < 4; ++i) s2[i] = e4m3_f16x2((b.sc >> (8 * i)) & 0xffu);
 #pragma unroll
         for (int c = 0; c < 8; ++c) {
             const uint4& d = b.d[c / 4];
             const int w = c % 4;
             const std::uint32_t nib = w == 0 ? d.x : w == 1 ? d.y : w == 2 ? d.z : d.w;
-            v[c] = dsv4::nv4_widen8(nib, s2[c / 2]);
+            v[c] = nv4_widen8_fast(nib, s2[c / 2]);
         }
     }
 }
@@ -205,6 +266,14 @@ __device__ __forceinline__ void widen_atom(const AtomBytes& b, uint4 (&v)[8]) {
 // atom u % 8) is lane t's for u = t, t + 192, t + 384, so a key's eight
 // atoms are eight neighbouring lanes' and its row is read whole between
 // them; every unit's bytes are in flight before any is widened.
+// V4's rotated dims (its last atom), bf16 as the row holds them.
+__device__ __forceinline__ void rope_atom(const std::uint8_t* plane, u32 cell, int ps, uint4 (&v)[8]) {
+    const dsv4::DsRow r = dsv4::rows_at<dsv4::kV4>(const_cast<std::uint8_t*>(plane), cell / ps,
+                                                   static_cast<int>(cell % ps), ps);
+#pragma unroll
+    for (int c = 0; c < 8; ++c) v[c] = reinterpret_cast<const uint4*>(r.data + dsv4::kDsNope)[c];
+}
+
 template <int WF, int PF>
 __device__ __forceinline__ void widen_tile(unsigned char* tile, const u32* l, const Params& p, int t) {
     constexpr int kStride = kIssuers * 32;
@@ -214,30 +283,34 @@ __device__ __forceinline__ void widen_tile(unsigned char* tile, const u32* l, co
 #pragma unroll
     for (int k = 0; k < kUnits; ++k) {
         const int u = t + k * kStride;
-        e[k] = u < kBK * 8 ? l[u / 8] : kSlotMask;
+        e[k] = u < kBK * 8 ? l[u % kBK] : kSlotMask;
         const u32 cell = e[k] & kSlotMask;
         if (cell == kSlotMask) continue;
         if ((e[k] & kPool) != 0) {
-            load_atom<PF>(p.ent_raw, cell, p.ent_page, u % 8, b[k]);
+            load_atom<PF>(p.ent_raw, cell, p.ent_page, u / kBK, b[k]);
         } else {
-            load_atom<WF>(p.win_raw, cell, p.win_page, u % 8, b[k]);
+            load_atom<WF>(p.win_raw, cell, p.win_page, u / kBK, b[k]);
         }
     }
 #pragma unroll
     for (int k = 0; k < kUnits; ++k) {
         const int u = t + k * kStride;
         if (u >= kBK * 8) break;
-        const int key = u / 8;
+        const int key = u % kBK;
         uint4 v[8];
         if ((e[k] & kSlotMask) == kSlotMask) {
 #pragma unroll
             for (int c = 0; c < 8; ++c) v[c] = make_uint4(0u, 0u, 0u, 0u);
+        } else if (WF == dsv4::kV4 && (u / kBK) * 64 >= dsv4::kDsNope) {
+            // (V4's rows are both planes'.)
+            const bool pool = (e[k] & kPool) != 0;
+            rope_atom(pool ? p.ent_raw : p.win_raw, e[k] & kSlotMask, pool ? p.ent_page : p.win_page, v);
         } else if ((e[k] & kPool) != 0) {
             widen_atom<PF>(b[k], v);
         } else {
             widen_atom<WF>(b[k], v);
         }
-        unsigned char* row = tile + atom_at(u % 8) + key * 128;
+        unsigned char* row = tile + atom_at(u / kBK) + key * 128;
 #pragma unroll
         for (int c = 0; c < 8; ++c) *reinterpret_cast<uint4*>(row + ((c ^ (key & 7)) << 4)) = v[c];
     }

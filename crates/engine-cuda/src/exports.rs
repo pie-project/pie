@@ -375,6 +375,42 @@ pub(crate) fn regions_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<b
         .collect()
 }
 
+/// The regions holding DeepSeek's attention over its quantized rows, which
+/// at a prefill's width widen whole page tables into staged bf16 planes,
+/// sized by the tables the fire states: a graph replaying them against a
+/// later fire's tables would read past what it staged.
+#[must_use]
+pub(crate) fn regions_staging(trace: &Trace, compiled: &CompiledModel) -> Vec<bool> {
+    let quantized = |attn: &poem_ir::Attention| match attn {
+        poem_ir::Attention::PrefillLse { cache, .. } => matches!(
+            trace.values.get(cache.0 as usize).map(|decl| &decl.def),
+            Some(poem_ir::Def::Cache(row)) if matches!(
+                trace.caches.get(*row as usize),
+                Some(poem_ir::CacheRow::Kv { dtype: poem_ir::Dtype::U8, .. })
+            )
+        ),
+        _ => false,
+    };
+    compiled
+        .template()
+        .iter()
+        .map(|region| {
+            region.nodes.clone().any(|node| {
+                trace
+                    .nodes
+                    .get(node as usize)
+                    .is_some_and(|node| match &node.op {
+                        poem_ir::Operation::Fused(
+                            poem_ir::Fused::PoolAttention { window, .. }
+                            | poem_ir::Fused::LseSink { attn: window, .. },
+                        ) => quantized(window),
+                        _ => false,
+                    })
+            })
+        })
+        .collect()
+}
+
 #[must_use]
 pub(crate) fn regions_lane_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<bool> {
     compiled

@@ -39,11 +39,12 @@ sdpa.dsv4_prefill_from = 512
 # prompt's leading rows through the encoder alone, the decoder replaying its
 # last window (the window held above each sequence's replay floor).
 sdpa.dsv4_replay = true
-# DeepSeek-V4.1's FP4 cache from 40 rows on that pass too, widening each
+# DeepSeek-V4.1's FP4 cache from 32 rows on that pass too, widening each
 # row's keys once for its 64 heads where the decode launch's four blocks a
-# row widen them each: the truncated model's decode TPOT at 48 rows 3.45 ->
-# 3.20 ms, 64 rows 3.55 -> 3.14; 32 rows stay (2.96 against 3.04).
-sdpa.dsv4_fp4_pass_from = 40
+# row widen them each: the truncated model's decode TPOT at 32 rows 2.98 ->
+# 2.86 ms, 64 rows 3.55 -> 3.14 (before the pass widened on sm_100a's e2m1
+# conversion); 16 rows stay (2.57 against 2.66).
+sdpa.dsv4_fp4_pass_from = 32
 # GLM-5.3's DSA (sparse MLA, top-2048 tokens a row) a block a row on
 # tcgen05, the selected keys' latent and rotated part gathered whole.
 sdpa.mla_sparse = true
@@ -152,6 +153,11 @@ moe.mxfp4_cvt_ksplit_until = 6
 # 88064 blocks checked), against the rows in e4m3 1x128 on mma.sync. Wider
 # fires keep the bf16 on cuBLAS, ahead of the grouped tcgen05 GEMM there.
 gemm.fp8_o_down = true
+# Past the mma.sync kernel's eight rows, up to 512, the requantized plane on
+# the grouped tcgen05 GEMM (a row's groups its routes) rather than widened to
+# bf16 for cuBLAS a call: 64 rows of DeepSeek's [8 x 1024, 4096] wo_a 28 us
+# against 38.
+gemm.fp8_grouped_tc5_until = 512
 # AttnRes's blend and the norm of its row in one pass, 512 threads a row:
 # Kimi-K3's sublayer inputs lose a launch and a row's round trip each.
 attn_res.fused_norm = true

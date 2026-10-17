@@ -717,6 +717,41 @@ impl Run<'_> {
                             *groups,
                         );
                     }
+                    // Past them, where the profile says
+                    // (`kernel.gemm.fp8_grouped_tc5_until`): each group on the
+                    // tcgen05 GEMM against its rows of the fp8 plane, no bf16
+                    // plane widened a call.
+                    if out.rows <= self.ctx().tuning().gemm_fp8_grouped_tc5_until
+                        && x.width.is_multiple_of(*groups)
+                        && out.width.is_multiple_of(*groups)
+                    {
+                        // A row's groups are its routes (`linear.group_routes`):
+                        // the rows a group each, its slice quantized to e4m3
+                        // 1x128, on the grouped tcgen05 GEMM.
+                        let (k, n) = (x.width / groups, out.width / groups);
+                        let xr = Tensor::new(x.ptr, x.rows * groups, k, Dtype::Bf16);
+                        let mut yr = Tensor::new(out.ptr, out.rows * groups, n, Dtype::Bf16);
+                        return linear::act_quant::select(
+                            self.ctx(),
+                            OP,
+                            linear::act_quant::Format::E4m3 { gran: 128 },
+                            xr,
+                            self.tensor(*routes),
+                            None,
+                            linear::act_quant::Bank {
+                                codes: codes.ptr,
+                                atoms: atoms.ptr,
+                                experts: *groups,
+                                n,
+                                k,
+                                elem: linear::tc5::Elem::E4m3,
+                                gran: 128,
+                                alpha_e: 0,
+                                alpha_from: None,
+                            },
+                            &mut yr,
+                        );
+                    }
                     let bytes = codes.rows as usize * codes.width as usize * 2;
                     let plane = self.ctx().scratch_stream(OP, FP8_PLANE_BF16, bytes)? as u64;
                     linear::moe::dequantize_fp8b128(

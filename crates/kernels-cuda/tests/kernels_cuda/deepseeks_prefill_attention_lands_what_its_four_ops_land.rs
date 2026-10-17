@@ -167,6 +167,19 @@ fn check_with(
     fmts: Option<(Rows, Rows)>,
     floored: bool,
 ) {
+    check_safe(ratio, top_k, sparse, fmts, floored, false);
+}
+
+/// [`check_with`], with `graph_safe` the pass a CUDA graph records (every
+/// quantized row widened as its tiles land, nothing staged).
+fn check_safe(
+    ratio: usize,
+    top_k: Option<usize>,
+    sparse: bool,
+    fmts: Option<(Rows, Rows)>,
+    floored: bool,
+    graph_safe: bool,
+) {
     let fp8 = fmts.is_some();
     let per = 18;
     let cells = 2 * per * PAGE;
@@ -257,6 +270,7 @@ fn check_with(
         pos_t,
         req_t,
         floor_t,
+        graph_safe,
         &win,
         &pooled,
         sink_t,
@@ -289,6 +303,7 @@ fn check_with(
             pos_t,
             req_t,
             floor_t,
+            graph_safe,
             &win,
             &pooled,
             sink_t,
@@ -364,7 +379,7 @@ fn check_with(
     }
     assert!(
         worst <= 4e-2,
-        "ratio {ratio}, top_k {top_k:?}, sparse {sparse}, fp8 {fp8}, floored {floored}: an output element differs by {worst} relative"
+        "ratio {ratio}, top_k {top_k:?}, sparse {sparse}, fp8 {fp8}, floored {floored}, graph-safe {graph_safe}: an output element differs by {worst} relative"
     );
 }
 
@@ -388,6 +403,125 @@ fn deepseeks_prefill_attention_lands_what_its_four_ops_land() {
     check_with(2, Some(512), true, v41, true);
     check_with(1, Some(512), true, v41, true);
     check_with(4, Some(64), true, None, true);
+    // The pass a graph records: V4's rows widened as V4.1's are, not staged.
+    check_safe(4, Some(64), true, Some((Rows::Ds, Rows::Ds)), false, true);
+    check_safe(128, None, true, Some((Rows::Ds, Rows::Ds)), false, true);
+    check_safe(2, Some(512), true, v41, true, true);
+}
+
+/// `values` written over the device bytes at `at`.
+fn write<T: Copy>(at: u64, values: &[T]) {
+    use kernels_cuda::cudarc::runtime::sys as rt;
+    let _legacy = crate::common::legacy();
+    // SAFETY: `at` holds at least `values`' bytes, allocated by the test.
+    let code = unsafe {
+        rt::cudaMemcpy(
+            at as usize as *mut core::ffi::c_void,
+            values.as_ptr().cast(),
+            core::mem::size_of_val(values),
+            rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+        )
+    };
+    assert_eq!(code, rt::cudaError::cudaSuccess, "cudaMemcpy H2D");
+}
+
+/// The pass as a CUDA graph records it (`graph_safe`), replayed against a
+/// page table that has grown since: the replay lands what a fresh launch
+/// over the grown table does, bit for bit, over V4's rows and V4.1's. A
+/// staged pass sizes its planes by the table it was recorded over, which
+/// the grown table outruns.
+#[test]
+fn a_recorded_pass_reads_the_page_tables_its_replay_states() {
+    if !kernels_cuda::linear::tc5::supported() {
+        return;
+    }
+    for (fmts, ratio) in [((Rows::Ds, Rows::Ds), 4usize), ((Rows::Mx8, Rows::Nv4), 4)] {
+        let most = 40usize;
+        let cells = most * PAGE;
+        // The request's pages, scattered over the plane.
+        let pages: Vec<u32> = (0..most as u32).map(|i| (i * 7) % most as u32).collect();
+        let indptr_full = vec![0u32, most as u32];
+        let mut lcg = Lcg::seeded(0x9a);
+        let n = 6usize;
+        let (q_bits, _) = lcg.row(n * HEADS * D);
+        let (w_bits, _) = lcg.row(cells * D);
+        let (e_bits, _) = lcg.row(cells * D);
+        let mut gpu = Gpu::open();
+        let w_at = gpu.up(&w_bits);
+        let e_at = gpu.up(&e_bits);
+        let (win, _) = rows_plane(&mut gpu, w_at, cells, &pages, &indptr_full, fmts.0);
+        let (ent, _) = rows_plane(&mut gpu, e_at, cells, &pages, &indptr_full, fmts.1);
+        // The tables the pass reads, rewritten between replays.
+        let table_at = gpu.zeros(most * 4);
+        let indptr_at = gpu.zeros(2 * 4);
+        let pos_at = gpu.zeros(n * 4);
+        let req_t = Tensor::new(gpu.up(&vec![0i32; n]), n as u32, 1, Dtype::I32);
+        let q_t = Tensor::new(gpu.up(&q_bits), n as u32, (HEADS * D) as u32, Dtype::Bf16);
+        let pos_t = Tensor::new(pos_at, n as u32, 1, Dtype::I32);
+        let sinks: Vec<f32> = (0..HEADS).map(|h| (h as f32 - 32.0) / 16.0).collect();
+        let sink_t = Tensor::new(gpu.up(&sinks), HEADS as u32, 1, Dtype::F32);
+        let o_at = gpu.zeros(n * HEADS * D * 2);
+        let fresh_at = gpu.zeros(n * HEADS * D * 2);
+        let scale = 1.0 / (D as f32).sqrt();
+        // A table of `held` pages and rows at its last positions.
+        let table = |held: usize| {
+            write(table_at, &pages[..held]);
+            write(indptr_at, &[0u32, held as u32]);
+            let end = held * PAGE - 5;
+            let positions: Vec<i32> = (0..n).map(|r| (end - n + r) as i32).collect();
+            write(pos_at, &positions);
+            let view = |pool: &KvPool| KvPool {
+                page_indices: Tensor::new(table_at, held as u32, 1, Dtype::U32),
+                page_indptr: Tensor::new(indptr_at, 2, 1, Dtype::U32),
+                pages_in_batch: held as i32,
+                ..*pool
+            };
+            (view(&win), view(&ent))
+        };
+        let fire = |w: &KvPool, e: &KvPool, at: u64| {
+            let pooled = Pooled {
+                entries: e,
+                ratio: ratio as u32,
+                selection: None,
+            };
+            let mut o = Tensor::new(at, n as u32, (HEADS * D) as u32, Dtype::Bf16);
+            dsv4_prefill::prefill(
+                &gpu.ctx(),
+                "attention.pool_attention",
+                q_t,
+                pos_t,
+                req_t,
+                None,
+                true,
+                w,
+                &pooled,
+                sink_t,
+                scale,
+                None,
+                &mut o,
+            )
+            .expect("the pass fires");
+        };
+        let (w, e) = table(11);
+        let exec = crate::common::captured(&gpu.ctx(), || fire(&w, &e, o_at));
+        for held in [11usize, 23, most] {
+            let (w, e) = table(held);
+            crate::common::replay(&gpu.ctx(), exec);
+            fire(&w, &e, fresh_at);
+            gpu.sync();
+            let replayed: Vec<u16> = gpu.down(o_at, n * HEADS * D);
+            let fresh: Vec<u16> = gpu.down(fresh_at, n * HEADS * D);
+            assert!(
+                fresh.iter().any(|&v| v != 0),
+                "{fmts:?}: the pass lands something"
+            );
+            assert_eq!(
+                replayed, fresh,
+                "{fmts:?}: the pass recorded over 11 pages, replayed over {held}"
+            );
+        }
+        crate::common::forget(exec);
+    }
 }
 
 /// A layer with a window and no pool: the pass reads the window alone and
@@ -440,6 +574,7 @@ fn a_window_only_layer_lands_its_window_alone() {
             q_t,
             pos_t,
             req_t,
+            false,
             &win,
             sink_t,
             scale,
@@ -553,6 +688,7 @@ fn pace(ratio: usize, top_k: Option<usize>) {
                 pos_t,
                 req_t,
                 None,
+                false,
                 &win,
                 &pooled,
                 sink_t,

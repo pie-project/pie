@@ -121,7 +121,9 @@ pub fn takes_window(heads: u32, head_dim: u32, window: Option<u32>, window_pool:
 /// Lands the sinked attention of every row of `q` in `o`: the row's window
 /// of `window_pool` and its compressed entries in one softmax, scaled by
 /// `sigmoid(lse - sink)` a head; with `floors` (i32 a row) a row's window
-/// reads no key below its floor. The caller checks [`takes`] first.
+/// reads no key below its floor. With `graph_safe` (a launch a CUDA graph
+/// records, to replay against other page tables) nothing is sized by the
+/// tables this fire states. The caller checks [`takes`] first.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill(
     ctx: &Ctx,
@@ -130,6 +132,7 @@ pub fn prefill(
     positions: Tensor,
     requests: Tensor,
     floors: Option<Tensor>,
+    graph_safe: bool,
     window_pool: &KvPool,
     pooled: &Pooled<'_>,
     sinks: Tensor,
@@ -151,6 +154,7 @@ pub fn prefill(
             positions,
             requests,
             floors,
+            graph_safe,
             window_pool,
             pooled,
             sinks,
@@ -167,15 +171,20 @@ pub fn prefill(
     // below a prefill's width (`kernel.sdpa.dsv4_prefill_from`): the pass
     // widens them itself, no plane staged. A prefill's many rows a tile
     // read the staged bf16 pages faster.
+    //
+    // A pass a CUDA graph records (`graph_safe`) reads every quantized row
+    // so, V4's too: the staged planes are sized by the page tables a fire
+    // states, which a replay's fire outgrows.
     let from = ctx.tuning().dsv4_prefill_from;
-    if let Some(Rows::Mx8) = crate::attn::dsv4::rows_of(window_pool)
-        && (from == 0 || rows < from)
+    let wf = crate::attn::dsv4::rows_of(window_pool);
+    if let Some(wf @ (Rows::Mx8 | Rows::Ds)) = wf
+        && (graph_safe || wf == Rows::Mx8 && (from == 0 || rows < from))
     {
         let alone = pooled.entries.keys.ptr == window_pool.keys.ptr;
         let pf = if alone {
-            Rows::Mx8
+            wf
         } else {
-            crate::attn::dsv4::rows_of(&ent_view).unwrap_or(Rows::Mx8)
+            crate::attn::dsv4::rows_of(&ent_view).unwrap_or(wf)
         };
         let viewed = Pooled {
             entries: &ent_view,
@@ -192,7 +201,7 @@ pub fn prefill(
             window_pool,
             &viewed,
             ent_compact,
-            Some((Rows::Mx8, pf)),
+            Some((wf, pf)),
             sinks,
             sm_scale,
             turn,
@@ -441,6 +450,7 @@ pub fn window_only(
     q: Tensor,
     positions: Tensor,
     requests: Tensor,
+    graph_safe: bool,
     window_pool: &KvPool,
     sinks: Tensor,
     sm_scale: f32,
@@ -458,6 +468,7 @@ pub fn window_only(
         positions,
         requests,
         None,
+        graph_safe,
         window_pool,
         &pooled,
         sinks,

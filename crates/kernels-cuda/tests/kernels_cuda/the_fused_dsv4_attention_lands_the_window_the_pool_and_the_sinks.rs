@@ -371,6 +371,7 @@ fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>, floor
                     pos_t,
                     req_t,
                     None,
+                    false,
                     win_pool,
                     &pooled,
                     sink_t,

@@ -650,6 +650,7 @@ impl Shell {
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
+        let staging = crate::exports::regions_staging(&boot.trace, &compiled);
         let schedule_readers = regions_launching_schedules(&boot.trace, &compiled);
         crate::voxels::relabel_conv_weights(&device, &boot.trace, weights.table())?;
         weights.rotate(&boot.trace, &compiled)?;
@@ -856,6 +857,7 @@ impl Shell {
             media,
             shifted,
             lane_shifted,
+            staging,
             schedule_readers,
             adapters: crate::blob::Adapters::new(adapter_seats),
             scores,

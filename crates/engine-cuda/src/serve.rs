@@ -81,6 +81,9 @@ pub struct Shell {
     media: poem_ir::ClassSet,
     shifted: Vec<bool>,
     lane_shifted: Vec<bool>,
+    /// `exports::regions_staging`: which regions launch eagerly at a
+    /// prefill's width.
+    staging: Vec<bool>,
     schedule_readers: Vec<Option<u32>>,
     adapter_fact: Option<u32>,
     adapters: crate::blob::Adapters,

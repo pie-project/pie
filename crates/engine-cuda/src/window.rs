@@ -626,13 +626,19 @@ impl Windows {
                 poem_ir::PerAxis::new([rows, 0, 0]),
                 shifted,
                 lane_shifted,
+                Staging::NONE,
             ) == Admit::Captured
         })
     }
 
     #[must_use]
     pub fn admits(&self, rows: u32, shifted: &[bool], lane_shifted: &[bool]) -> Vec<Admit> {
-        self.admits_axes(poem_ir::PerAxis::new([rows, 0, 0]), shifted, lane_shifted)
+        self.admits_axes(
+            poem_ir::PerAxis::new([rows, 0, 0]),
+            shifted,
+            lane_shifted,
+            Staging::NONE,
+        )
     }
 
     #[must_use]
@@ -641,9 +647,10 @@ impl Windows {
         totals: poem_ir::PerAxis<u32>,
         shifted: &[bool],
         lane_shifted: &[bool],
+        staging: Staging<'_>,
     ) -> Vec<Admit> {
         (0..self.of_region.len() as u32)
-            .map(|region| self.admit_axes(region, totals, shifted, lane_shifted))
+            .map(|region| self.admit_axes(region, totals, shifted, lane_shifted, staging))
             .collect()
     }
 
@@ -662,8 +669,21 @@ impl Windows {
         totals: poem_ir::PerAxis<u32>,
         shifted: &[bool],
         lane_shifted: &[bool],
+        staging: Staging<'_>,
     ) -> Admit {
         if self.axis_of(region) == poem_ir::RowAxis::Voxels {
+            return Admit::Island;
+        }
+        // A staging attention at a prefill's width launches eagerly: what it
+        // stages is sized by this fire's page tables (`regions_staging`).
+        if staging.from > 0
+            && staging
+                .regions
+                .get(region as usize)
+                .copied()
+                .unwrap_or(false)
+            && (0..self.runs(region)).any(|run| self.at(region, run).span().rows >= staging.from)
+        {
             return Admit::Island;
         }
         let moves = shifted.get(region as usize).copied().unwrap_or(false);
@@ -693,6 +713,22 @@ impl Windows {
         });
         if held { Admit::Captured } else { Admit::Island }
     }
+}
+
+/// The regions whose DeepSeek attention stages its quantized rows
+/// (`exports::regions_staging`), and the rows from which it does
+/// (`kernel.sdpa.dsv4_prefill_from`; 0: none does).
+#[derive(Debug, Clone, Copy)]
+pub struct Staging<'a> {
+    pub regions: &'a [bool],
+    pub from: u32,
+}
+
+impl Staging<'_> {
+    pub const NONE: Staging<'static> = Staging {
+        regions: &[],
+        from: 0,
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

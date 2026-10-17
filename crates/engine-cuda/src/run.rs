@@ -1021,6 +1021,16 @@ impl<'c> Run<'c> {
         self.place.region.get()
     }
 
+    /// Whether this region's launches are being recorded into a body a
+    /// later fire replays, against the page tables that fire states.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn recorded(&self) -> bool {
+        matches!(
+            self.ceilings.admit(self.place.region.get()),
+            Some(Admit::Captured)
+        )
+    }
+
     pub(crate) fn uncut(&self, id: ValueId) -> Tensor {
         self.whole(id)
     }

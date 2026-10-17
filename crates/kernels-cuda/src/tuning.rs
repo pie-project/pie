@@ -309,6 +309,14 @@ pub struct SdpaDsv4Replay;
 #[decision(id = "kernel.sdpa.dsv4_fp4_pass_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
 pub struct SdpaDsv4Fp4PassFrom(pub u32);
 
+/// The most rows a grouped projection on an fp8 plane (`kernel.gemm.fp8_o_down`)
+/// runs group by group on the tcgen05 GEMM against the plane as it is, past
+/// the mma.sync kernel's eight; more widen the plane to bf16 for cuBLAS's
+/// strided batch. 0 always widens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.fp8_grouped_tc5_until", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct GemmFp8GroupedTc5Until(pub u32);
+
 /// Whether a sparse MLA's selected attention (64 absorbed heads over a
 /// 512-wide bf16 latent and a 64-wide rotated part or none: GLM-5.3's and
 /// GLM-5.3-Flash's DSA) runs a block a row on tcgen05
@@ -674,6 +682,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaDsv4PrefillFrom>()
         .add::<SdpaDsv4Replay>()
         .add::<SdpaDsv4Fp4PassFrom>()
+        .add::<GemmFp8GroupedTc5Until>()
         .add::<SdpaMlaSparse>()
         .add::<GemmNarrowN>();
 }
@@ -764,6 +773,7 @@ pub struct Tuning {
     pub dsv4_prefill_from: u32,
     pub dsv4_replay: bool,
     pub dsv4_fp4_pass_from: u32,
+    pub gemm_fp8_grouped_tc5_until: u32,
     pub mla_sparse: bool,
     pub gemm_narrow_n: u32,
 }
@@ -852,6 +862,7 @@ impl Tuning {
         dsv4_prefill_from: 0,
         dsv4_replay: false,
         dsv4_fp4_pass_from: 0,
+        gemm_fp8_grouped_tc5_until: 0,
         mla_sparse: false,
         gemm_narrow_n: 0,
     };
@@ -940,6 +951,7 @@ impl Tuning {
             dsv4_prefill_from: profile.get::<SdpaDsv4PrefillFrom>().0,
             dsv4_replay: profile.on::<SdpaDsv4Replay>(&Anywhere),
             dsv4_fp4_pass_from: profile.get::<SdpaDsv4Fp4PassFrom>().0,
+            gemm_fp8_grouped_tc5_until: profile.get::<GemmFp8GroupedTc5Until>().0,
             mla_sparse: profile.on::<SdpaMlaSparse>(&Anywhere),
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,
         }
