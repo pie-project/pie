@@ -8,7 +8,7 @@
 //! product (the f32 walk of `code * factor`) to e4m3's rounding, at a
 //! decode's width and a prefill's.
 
-use crate::common::host_a::routes_of;
+use crate::common::host::routes_of;
 use crate::common::tc5::e4m3;
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;

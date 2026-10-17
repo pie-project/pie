@@ -5,7 +5,7 @@
 // `TOP_K` best, ascending (all of them when it sees no more), over a fresh
 // prefill and a continuation whose page tables are out of order.
 
-use crate::common::host_b::to_e2m1;
+use crate::common::host::to_e2m1;
 use crate::common::tc5::e2m1;
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;

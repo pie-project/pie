@@ -1,6 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use crate::common::host_b::assert_near;
+use crate::common::host::assert_near;
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn_dense;

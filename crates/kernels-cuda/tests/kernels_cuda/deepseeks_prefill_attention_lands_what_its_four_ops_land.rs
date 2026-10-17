@@ -5,7 +5,7 @@
 //! sinks, against the same arithmetic in f64. Rows pair up within a request
 //! and across a request's end, and the fire ends on a lone row.
 
-use crate::common::host_b::rows_read;
+use crate::common::host::rows_read;
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::dsv4;

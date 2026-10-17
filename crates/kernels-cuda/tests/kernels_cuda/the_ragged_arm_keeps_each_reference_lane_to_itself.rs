@@ -1,6 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use crate::common::host_b::{assert_near, ragged_attention};
+use crate::common::host::{assert_near, ragged_attention};
 use crate::common::{Gpu, Lcg};
 use dtype::Dtype;
 use kernels_cuda::attn_ragged::{self, RaggedMask};

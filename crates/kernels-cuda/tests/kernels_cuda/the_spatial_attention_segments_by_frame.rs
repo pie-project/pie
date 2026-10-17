@@ -3,7 +3,7 @@
 //! Spatial attention segmented by frame (one, two, a whole lane) answers
 //! the host reference, and each segment lands its own answer.
 
-use crate::common::host_a::spatial_attention_ref;
+use crate::common::host::spatial_attention_ref;
 use crate::common::spatial::{Box3, table};
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;

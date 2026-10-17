@@ -3,7 +3,7 @@
 //! Spatial attention over whole lanes answers the host reference at each
 //! width the kernel instantiates.
 
-use crate::common::host_a::spatial_attention_ref;
+use crate::common::host::spatial_attention_ref;
 use crate::common::spatial::{Box3, table};
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;

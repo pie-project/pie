@@ -6,7 +6,7 @@
 //! `attn::dsv4::append` writes them (V4.1's bit for bit against its
 //! reference's quantizers).
 
-use crate::common::host_b::{nearest, rows_read};
+use crate::common::host::{nearest, rows_read};
 use crate::common::tc5::{e2m1, e4m3};
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;

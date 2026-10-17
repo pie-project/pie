@@ -5,7 +5,7 @@
 //! the unfused ops, at both ratios, the 512-wide latent (bf16 and fp8 pools)
 //! and the 128-wide index keys, on a staged window too.
 
-use crate::common::host_b::rows_read;
+use crate::common::host::rows_read;
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::{dsv4, pool};

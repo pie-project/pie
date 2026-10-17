@@ -1,6 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use crate::common::host_b::{to_e2m1, to_e4m3};
+use crate::common::host::{to_e2m1, to_e4m3};
 use crate::common::tc5::{e2m1, e4m3};
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;

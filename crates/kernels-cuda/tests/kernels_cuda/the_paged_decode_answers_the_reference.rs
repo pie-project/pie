@@ -175,7 +175,7 @@ impl Fixture {
         if count != all {
             let seat = [count, first, count, first];
             self.gpu.sync();
-            common::host_a::upload_to(self.stage, &seat);
+            common::host::upload_to(self.stage, &seat);
             ctx.arm_stage(self.stage);
         }
         let shape = Shape {

@@ -4,7 +4,7 @@
 //! the gate-up select to the weighted sum answers what the gate-up select
 //! with its GLU, the down select and the weighted sum answer apart.
 
-use crate::common::host_a::{bf16_zeros, routes_of};
+use crate::common::host::{bf16_zeros, routes_of};
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::Ctx;
@@ -537,7 +537,7 @@ fn check_w4a8_weighted_first(
     let limit = 7.0f32;
     let mut gpu = Gpu::open();
     let f = fire(&mut gpu, 0xd54, tokens, hidden, n_experts, top);
-    let (shared, _) = crate::common::host_a::bf16_rows(
+    let (shared, _) = crate::common::host::bf16_rows(
         &mut gpu,
         &mut Lcg::seeded(0xd55 ^ tokens as u64),
         tokens,

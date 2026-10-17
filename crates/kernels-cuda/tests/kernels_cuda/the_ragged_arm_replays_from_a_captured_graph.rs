@@ -1,6 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use crate::common::host_a::upload_to as upload;
+use crate::common::host::upload_to as upload;
 use crate::common::{Gpu, Lcg, captured, forget, from_bf16, replay};
 use dtype::Dtype;
 use kernels_cuda::attn_ragged::{self, RaggedMask};

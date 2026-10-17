@@ -3,7 +3,7 @@
 use core::ffi::c_void;
 
 use crate::common::Gpu;
-use crate::common::host_a::cuda_ok as check;
+use crate::common::host::cuda_ok as check;
 use kernels_cuda::Ctx;
 use kernels_cuda::cudarc::runtime::sys as rt;
 
