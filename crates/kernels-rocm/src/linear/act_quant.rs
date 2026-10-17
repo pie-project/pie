@@ -426,10 +426,6 @@ pub fn matmul_fp8_quantized(
     fire_fp8_dense(ctx, op, q, act_scales, codes, factors, y, 0)
 }
 
-/// The rows past which an fp8b32 projection in the matrix core's order runs
-/// on hipBLASLt over its decoded values rather than the FP8 tile.
-pub const FP8B32_TILE_ROWS: u32 = 512;
-
 /// An `fp8b32` projection (e4m3 codes `[n, k]` in the FP8 matrix core's
 /// order and made canonical at load, `e4m3fn_shuffle`; ue8m0 exponents a
 /// 32x32 block, `[⌈n / 32⌉, k / 32]`) against `act` (bf16) quantized as
@@ -476,24 +472,6 @@ pub fn matmul_fp8b32_lanes(
     if act.rows == 0 {
         return Ok(());
     }
-    if act.rows > FP8B32_TILE_ROWS {
-        // Past the tile's rows hipBLASLt's bf16 GEMM over the values (the
-        // plane decoded out of the matrix core's order, the rows as
-        // `quantized`) runs faster than the FP8 tile folding each 32-code
-        // step (DeepSeek-V4.1-Flash at 2048 rows: 1401 -> 1839 us over its
-        // seven projections on the tile).
-        let q = quantized(ctx, op, act, 32)?;
-        let tile = ctx.scratch_stream(op, DECODED_WEIGHT, (n as usize).saturating_mul(k as usize).saturating_mul(2))?
-            as usize as u64;
-        let threads = u32::try_from(u64::from(n) * u64::from(k) / 16)
-            .map_err(|_| refuse(op, "the decode's threads do not fit a 32-bit extent"))?;
-        ctx.fire(
-            op,
-            Fire::at(FILE, "::pie::linear::fp8b32_lanes_decode").apply(Launch::flat(threads, BLOCK)),
-            &[codes.arg(), scales.arg(), ArgValue::Ptr(tile), stated(op, n)?.arg(), stated(op, k)?.arg()],
-        )?;
-        return gemm::act_x_wt(ctx, op, q, Tensor::new(tile, n, k, Dtype::Bf16), None, y);
-    }
     // One slab a stream: the product right after consumes them.
     let at = ctx.scratch_stream(op, "linear.act_quant_codes", (act.rows as usize * k as usize).max(16))? as usize as u64;
     let eat = ctx.scratch_stream(op, "linear.act_quant_scales", (act.rows as usize * (k / 32) as usize).max(16))? as usize
@@ -510,10 +488,26 @@ pub fn matmul_fp8b32_lanes(
     fire_fp8_dense(ctx, op, q, exps, codes, scales, y, 32)
 }
 
+/// `matmul_fp8b32_lanes` past its quantizer: `q` e4m3 row codes beside
+/// `exps` (ue8m0, one a 1x32 block) as `act_quant_e4m3_e8m0` lands them.
+pub fn matmul_fp8b32_quantized(
+    ctx: &Ctx,
+    op: &'static str,
+    q: Tensor,
+    exps: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    fire_fp8_dense(ctx, op, q, exps, codes, scales, y, 32)
+}
+
 /// The FP8 matrix core's dense product of `q` (e4m3 row codes) beside
-/// `act_scales` against `codes` beside `factors`: SB 0 f32 scales a 1x128
-/// block and factors a 128x128 one, SB 32 ue8m0 exponents a 1x32 and a
-/// 32x32 block (the same bytes a 128-code stage).
+/// `act_scales` against `codes` (in the matrix core's order) beside
+/// `factors`: SB 0 f32 scales a 1x128 block and factors a 128x128 one, SB 32
+/// ue8m0 exponents a 1x32 and a 32x32 block (the same bytes a 128-code
+/// stage). Up to 64 rows on the decode tile (`dense_fp8_mfma`), past them on
+/// the prefill tiles (`dense_fp8_tiles`).
 #[allow(clippy::too_many_arguments)]
 fn fire_fp8_dense(
     ctx: &Ctx,
@@ -528,72 +522,43 @@ fn fire_fp8_dense(
     let act = q;
     let (n, k) = (codes.rows, codes.width);
     let stages = k / FP8_BLOCK;
-    let (splits, part) = if act.rows > 64 {
-        // The prefill tile; K sliced while the tiles are fewer than 128
-        // (measured at GLM-5.3's shapes: past that, slicing costs more than
-        // the blocks win).
-        let (items, tiles) = (act.rows.div_ceil(128), n.div_ceil(128));
-        let mut splits = 1u32;
-        while splits < 8 && tiles * items * splits < 128 && stages / (2 * splits) >= 4 {
-            splits *= 2;
-        }
-        let part = fp8_partials(ctx, op, splits, act.rows, n)?;
-        ctx.fire(
-            op,
-            Fire::at("linear/fp8.hip", symbol(&format!("::pie::linear::dense_fp8_gemm8<::pie::i32({sb})>")))
-                .apply(Launch::grid([items, tiles, splits], [2 * BLOCK, 1, 1])),
-            &[
-                q.arg(),
-                act_scales.arg(),
-                codes.arg(),
-                factors.arg(),
-                y.arg(),
-                part,
-                stated(op, act.rows)?.arg(),
-                stated(op, n)?.arg(),
-                stated(op, k)?.arg(),
-                stated(op, stages.div_ceil(splits))?.arg(),
-                ctx.stage(),
-            ],
-        )?;
-        (splits, part)
-    } else {
-        // The decode tile; K sliced while the tiles and items are short of
-        // two blocks a CU.
-        let mt = fp8_item_rows(act.rows);
-        let nb = fp8_strips();
-        let (items, tiles) = (act.rows.div_ceil(mt), n.div_ceil(64 * nb));
-        let mut splits = 1u32;
-        while splits < 8 && tiles * items * splits < 608 && stages / (2 * splits) >= 4 {
-            splits *= 2;
-        }
-        let part = fp8_partials(ctx, op, splits, act.rows, n)?;
-        ctx.fire(
-            op,
-            Fire::at(
-                "linear/fp8.hip",
-                symbol(&format!("::pie::linear::dense_fp8_mfma<::pie::i32({mt}), ::pie::i32({nb}), ::pie::i32({sb})>")),
-            )
-                .apply(Launch::grid([tiles.div_ceil(8) * 8 * items * splits, 1, 1], [BLOCK, 1, 1])),
-            &[
-                q.arg(),
-                act_scales.arg(),
-                codes.arg(),
-                factors.arg(),
-                y.arg(),
-                part,
-                stated(op, act.rows)?.arg(),
-                stated(op, n)?.arg(),
-                stated(op, k)?.arg(),
-                stated(op, items)?.arg(),
-                stated(op, tiles)?.arg(),
-                stated(op, splits)?.arg(),
-                stated(op, stages.div_ceil(splits))?.arg(),
-                ctx.stage(),
-            ],
-        )?;
-        (splits, part)
-    };
+    if act.rows > 64 {
+        return fire_fp8_tiles(ctx, op, act, act_scales, codes, factors, y, sb);
+    }
+    // The decode tile; K sliced while the tiles and items are short of two
+    // blocks a CU.
+    let mt = fp8_item_rows(act.rows);
+    let nb = fp8_strips();
+    let (items, tiles) = (act.rows.div_ceil(mt), n.div_ceil(64 * nb));
+    let mut splits = 1u32;
+    while splits < 8 && tiles * items * splits < 608 && stages / (2 * splits) >= 4 {
+        splits *= 2;
+    }
+    let part = fp8_partials(ctx, op, splits, act.rows, n)?;
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/fp8.hip",
+            symbol(&format!("::pie::linear::dense_fp8_mfma<::pie::i32({mt}), ::pie::i32({nb}), ::pie::i32({sb})>")),
+        )
+        .apply(Launch::grid([tiles.div_ceil(8) * 8 * items * splits, 1, 1], [BLOCK, 1, 1])),
+        &[
+            q.arg(),
+            act_scales.arg(),
+            codes.arg(),
+            factors.arg(),
+            y.arg(),
+            part,
+            stated(op, act.rows)?.arg(),
+            stated(op, n)?.arg(),
+            stated(op, k)?.arg(),
+            stated(op, items)?.arg(),
+            stated(op, tiles)?.arg(),
+            stated(op, splits)?.arg(),
+            stated(op, stages.div_ceil(splits))?.arg(),
+            ctx.stage(),
+        ],
+    )?;
     if splits == 1 {
         return Ok(());
     }
@@ -601,12 +566,131 @@ fn fire_fp8_dense(
     ctx.fire(
         op,
         Fire::at("linear/fp8.hip", "::pie::linear::fp8_mfma_finalize").apply(Launch::grid([grid, 1, 1], [BLOCK, 1, 1])),
+        &[part, y.arg(), stated(op, act.rows)?.arg(), n.arg(), stated(op, splits)?.arg(), ctx.stage()],
+    )
+}
+
+/// One shape of `dense_fp8_tiles`: its ring of stages, waves along the
+/// weight and the activation, strips and 16-row blocks a wave, waves a SIMD.
+#[derive(Clone, Copy)]
+struct PrefillTile {
+    nb: u32,
+    wn: u32,
+    wm: u32,
+    ns: u32,
+    ms: u32,
+    occ: u32,
+}
+
+impl PrefillTile {
+    const fn rows(self) -> u32 {
+        self.wm * self.ms * 16
+    }
+    const fn cols(self) -> u32 {
+        self.wn * self.ns * 16
+    }
+    /// The blocks a CU holds at once.
+    const fn held_a_cu(self) -> u32 {
+        let per = 4 * self.occ / (self.wn * self.wm);
+        if per == 0 { 1 } else { per }
+    }
+}
+
+/// The prefill tile a product's shape takes (measured on MI300X over
+/// DeepSeek-V4.1-Flash's and GLM-5.3's projections, `bench_fp8_prefill`):
+/// SB 32 64 rows x 256 columns at four waves a SIMD (its every step's fold
+/// leaves the registers for no wider tile); SB 0 128 x 256 at two a SIMD,
+/// 64 x 256 where those leave more than two fifths of a round of CUs idle
+/// (wo_b's 5120 x 8192 at 1024 rows 643 -> 723 TFLOP/s, shared w1's 2304 x
+/// 5120 at 2048 rows 757 -> 918).
+fn prefill_tile(ctx: &Ctx, sb: u32, rows: u32, n: u32) -> PrefillTile {
+    if sb == 32 {
+        return PrefillTile { nb: 2, wn: 8, wm: 1, ns: 2, ms: 4, occ: 4 };
+    }
+    let wide = PrefillTile { nb: 3, wn: 8, wm: 1, ns: 2, ms: 8, occ: 2 };
+    let cus = ctx.multiprocessors().unwrap_or(304);
+    let tiles = rows.div_ceil(wide.rows()) * n.div_ceil(wide.cols());
+    if 5 * tiles < 3 * cus * wide.held_a_cu() {
+        PrefillTile { ms: 4, ..wide }
+    } else {
+        wide
+    }
+}
+
+/// The prefill tiles: whole rounds of the card's blocks a tile each, the
+/// last, partial round's tiles sliced along K to fill it, the slices summed
+/// in order by the last to finish.
+#[allow(clippy::too_many_arguments)]
+fn fire_fp8_tiles(
+    ctx: &Ctx,
+    op: &'static str,
+    q: Tensor,
+    act_scales: Tensor,
+    codes: Tensor,
+    factors: Tensor,
+    y: &mut Tensor,
+    sb: u32,
+) -> Result<(), Error> {
+    let (n, k) = (codes.rows, codes.width);
+    if !n.is_multiple_of(16) {
+        return Err(refuse(op, format!("the prefill tile takes whole 16-row strips, not {n} rows")));
+    }
+    // The tile reads the activation at 32-bit offsets from its base.
+    if u64::from(q.rows) * u64::from(k) > u64::from(u32::MAX) {
+        return Err(refuse(op, "the prefill tile reads an activation under 4 GiB"));
+    }
+    let stages = k / FP8_BLOCK;
+    let t = prefill_tile(ctx, sb, q.rows, n);
+    let tiles = q.rows.div_ceil(t.rows()) * n.div_ceil(t.cols());
+    let held = ctx.multiprocessors().unwrap_or(304) * t.held_a_cu();
+    let rem = if tiles < held {
+        tiles
+    } else {
+        tiles % held
+    };
+    // The slices that finish the last round soonest: its rounds of blocks
+    // times a slice's stages and the three a block spends filling and
+    // draining its ring, a slice's partial about a stage, each slice at
+    // least four stages.
+    let splits = (1..=(stages / 4).clamp(1, 8))
+        .min_by_key(|&s| (rem * s).div_ceil(held) * (stages.div_ceil(s) + 3) + s - 1)
+        .unwrap_or(1);
+    let per = stages.div_ceil(splits);
+    let splits = stages.div_ceil(per);
+    let rem = if splits == 1 { 0 } else { rem };
+    let ts = (t.rows() * t.cols()) as usize;
+    let part = if rem == 0 {
+        0
+    } else {
+        ctx.scratch_stream(op, "linear.fp8_tile_parts", rem as usize * splits as usize * ts * 4)? as usize as u64
+    };
+    let tickets = if rem == 0 { 0 } else { ctx.tickets(op, rem)? };
+    let live = tiles - rem + rem * splits;
+    let PrefillTile { nb, wn, wm, ns, ms, occ } = t;
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/fp8.hip",
+            symbol(&format!(
+                "::pie::linear::dense_fp8_tiles<::pie::i32({sb}), ::pie::i32({nb}), ::pie::i32({wn}), ::pie::i32({wm}), \
+                 ::pie::i32({ns}), ::pie::i32({ms}), ::pie::i32({occ})>"
+            )),
+        )
+        .apply(Launch::grid([live, 1, 1], [64 * wn * wm, 1, 1])),
         &[
-            part,
+            q.arg(),
+            act_scales.arg(),
+            codes.arg(),
+            factors.arg(),
             y.arg(),
-            stated(op, act.rows)?.arg(),
+            ArgValue::Ptr(part),
+            ArgValue::Ptr(tickets),
+            stated(op, q.rows)?.arg(),
             stated(op, n)?.arg(),
+            stated(op, k)?.arg(),
+            stated(op, rem)?.arg(),
             stated(op, splits)?.arg(),
+            stated(op, per)?.arg(),
             ctx.stage(),
         ],
     )

@@ -235,8 +235,10 @@ fn an_fp8b32_projection_on_the_matrix_core_folds_each_step() {
     run_fp8b_on(64, 2048, 1024, true, 32, true);
     run_fp8b_on(100, 320, 768, true, 32, true);
     run_fp8b_on(300, 336, 768, true, 32, true);
-    // Past the tile's rows: hipBLASLt over the plane decoded out of order.
+    // The prefill tiles: whole tiles and a last round's K slices summed by
+    // the last to finish, a ragged last weight tile.
     run_fp8b_on(600, 336, 768, true, 32, true);
+    run_fp8b_on(1100, 1040, 1536, true, 32, true);
 }
 
 /// Codes past the NaNs and f32 factors of no particular form (as a
@@ -355,6 +357,9 @@ fn an_fp8_projection_on_the_matrix_core_folds_each_block() {
     // tile.
     run_fp8_mfma(300, 320, 768, true);
     run_fp8_mfma(128, 4096, 2048, false);
+    // Both prefill tiles: whole tiles and sliced ones.
+    run_fp8_mfma(1100, 1040, 1536, false);
+    run_fp8_mfma(3000, 4096, 1024, true);
 }
 
 #[test]
@@ -522,6 +527,71 @@ fn bench_fp8b32_projections() {
                 "{name:10} m={m:5} n={n:6} k={k:6}: {old:8.1} -> {new:8.1} us ({:6.0} GB/s, {:5.0} TFLOP/s) [tile128 {t128:8.1}]",
                 (n * k) as f64 / new / 1e3,
                 2.0 * (m * n * k) as f64 / new / 1e6
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "benchmark: cargo test --release --features rocm --test linear_act_quant -- --ignored --nocapture"]
+fn bench_fp8_prefill() {
+    // The FP8 products past their quantizers at prefill rows (fp8b32 and
+    // e4m3tile128 planes in the matrix core's order) against hipBLASLt's
+    // bf16 GEMM over the same shape, cold over copies 1 GB together.
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    // The best of three timings of 16 fires each: the card's clocks wander.
+    fn best(gpu: &Gpu, mut f: impl FnMut()) -> f64 {
+        (0..3).map(|_| gpu.time_graph(16, &mut f)).fold(f64::INFINITY, f64::min)
+    }
+    let rows: Vec<usize> = std::env::var("FP8_M").map_or(vec![1024, 2048, 8192], |v| v.split(',').map(|x| x.parse().unwrap()).collect());
+    for (name, n, k) in [
+        ("wq_b", 32768usize, 1280usize),
+        ("wo_b", 5120, 8192),
+        ("shared w1", 2304, 5120),
+        ("glm q_b", 16384, 2048),
+        ("glm gate_up", 24576, 6144),
+    ] {
+        if std::env::var("FP8_SHAPE").is_ok_and(|v| !name.contains(v.as_str())) {
+            continue;
+        }
+        let copies = (1usize << 30).div_ceil(2 * n * k).clamp(2, 8);
+        let (codes, _) = tile_planes(n * k, 1, 7);
+        let ct = bytes(&gpu, &codes, n as u32, k as u32, Dtype::E4m3);
+        let lanes: Vec<Tensor> = (0..copies).map(|_| canonical(&gpu, ct, n, k).0).collect();
+        let exps: Vec<u8> = (0..n.div_ceil(32) * (k / 32)).map(|i| 118 + (i % 7) as u8).collect();
+        let et = bytes(&gpu, &exps, n.div_ceil(32) as u32, (k / 32) as u32, Dtype::E8m0);
+        let f128 = gpu.tensor(&vec![1e-3f32; n.div_ceil(128) * (k / 128)], n.div_ceil(128) as u32, (k / 128) as u32, Dtype::F32);
+        let wb: Vec<Tensor> = (0..copies).map(|_| gpu.zeros(n as u32, k as u32, Dtype::Bf16)).collect();
+        for &m in &rows {
+            let x: Vec<f32> = values(m * k, 5, 1.0);
+            let xt = gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16);
+            let q = gpu.zeros(m as u32, (k / 2) as u32, Dtype::Bf16);
+            let q = Tensor::new(q.ptr, m as u32, k as u32, Dtype::U8);
+            let qe = gpu.zeros(m as u32, (k / 32) as u32, Dtype::F32);
+            let qe = Tensor::new(qe.ptr, m as u32, (k / 32) as u32, Dtype::U8);
+            let qs = gpu.tensor(&vec![1e-2f32; m * (k / 128)], m as u32, (k / 128) as u32, Dtype::F32);
+            let y = gpu.zeros(m as u32, n as u32, Dtype::Bf16);
+            let mut i = 0usize;
+            let b32 = best(&gpu, || {
+                let mut yt = y;
+                act_quant::matmul_fp8b32_quantized(&ctx, "bench", q, qe, lanes[i % copies], et, &mut yt).unwrap();
+                i += 1;
+            });
+            let b128 = best(&gpu, || {
+                let mut yt = y;
+                act_quant::matmul_fp8_quantized(&ctx, "bench", q, qs, lanes[i % copies], f128, &mut yt).unwrap();
+                i += 1;
+            });
+            let lt = best(&gpu, || {
+                let mut yt = y;
+                kernels_rocm::linear::gemm::act_x_wt(&ctx, "bench", xt, wb[i % copies], None, &mut yt).unwrap();
+                i += 1;
+            });
+            let tf = |us: f64| 2.0 * (m * n * k) as f64 / us / 1e6;
+            eprintln!(
+                "{name:12} m={m:5} n={n:6} k={k:6}: fp8b32 {b32:8.1} us ({:5.0} TF)  e4m3tile128 {b128:8.1} us ({:5.0} TF)  hipBLASLt bf16 {lt:8.1} us ({:5.0} TF)",
+                tf(b32), tf(b128), tf(lt)
             );
         }
     }

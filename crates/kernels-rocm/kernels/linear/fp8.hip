@@ -93,6 +93,16 @@ __device__ __forceinline__ fp8_f4 mma_fp8(u32 a0, u32 a1, u32 b0, u32 b1, fp8_f4
     return __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(a, b, c, 0, 0, 0);
 }
 
+// A wave's 4-byte reads from `base + voff` landing as 256 contiguous bytes
+// of LDS at `lds` (a wave-uniform LDS address), hand-issued: the compiler
+// would wait on it before every read of LDS, and the tile waits it itself.
+__device__ __forceinline__ void lds_dma4(const void* base, u32 voff, u32 lds) {
+    asm volatile("s_mov_b32 m0, %2\n\tglobal_load_lds_dword %0, %1" ::"v"(voff), "s"(base), "s"(lds) : "memory", "m0");
+}
+__device__ __forceinline__ u32 lds_address(const void* p) {
+    return __builtin_amdgcn_readfirstlane(static_cast<u32>(reinterpret_cast<size_t>(p)));
+}
+
 // The bits of e4m3fn value nearest `q` (|q| ≤ 448), ties to even: steps
 // of 2^-9 below 2^-6, else three mantissa bits under the binade; zero is
 // 0x00 whatever its sign, as the matrix core reads it.
@@ -357,10 +367,7 @@ __device__ __forceinline__ void fp8_tile(const u8* __restrict__ act, const float
 // core, a stage 64 elements (the same 128 bytes a row), no scales to fold:
 // the tile at the decode batches past 64 routes an expert that the batch
 // legs read as many items.
-// SB 32: an `fp8b32` weight against rows under ue8m0 exponents a 1x32 block,
-// as `fp8_tile`'s; the tile's 128 rows are four 32-row blocks, a word of
-// four exponents each a stage.
-template <bool FP8 = true, int SB = 0>
+template <bool FP8 = true>
 __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const float* __restrict__ act_scales,
                                                const i32* __restrict__ order, int begin, int count,
                                                const u8* __restrict__ codes, const float* __restrict__ factors,
@@ -372,7 +379,7 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
     constexpr int EB = FP8 ? 1 : 2;                 // bytes an element
     __shared__ __align__(16) u8 wl[TN * PITCH];
     __shared__ __align__(16) u8 xl[TM * PITCH];
-    __shared__ float xsc[TM + 4];  // the rows' scales, then the weight's factor (exponents)
+    __shared__ float xsc[TM + 1];  // the rows' scales, then the weight's factor
     const int tid = threadIdx.x, l = lane(), r16 = l % 16, g = l / 16;
     const int wave = tid / kWave, wm = wave / 2, wn = wave % 2;  // wm: 32 activation rows, wn: 64 weight rows
     const int row0 = tile * TN;
@@ -400,12 +407,7 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
     }
     const float* srow =
         FP8 ? act_scales + static_cast<long long>(route(min(tid % TM, max(count - 1, 0))) / act_div) * kb : nullptr;
-    // Thread TM + j reads the weight's factor (under SB 32 the exponents of
-    // row block j); every thread reads one, so the counts agree.
-    const float* frow = !FP8 ? nullptr
-                        : SB == 32
-                            ? factors + static_cast<long long>(min(row0 + 32 * min(max(tid - TM, 0), 3), n - 1) / 32) * kb
-                            : factors + static_cast<long long>(min(row0, n - 1) / 128) * kb;
+    const float* frow = FP8 ? factors + static_cast<long long>(min(row0, n - 1) / 128) * kb : nullptr;
 
     i32x4 wv[2][NR], xv[2][NR];
     moe_i2 as[2], ws[2];
@@ -444,7 +446,7 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
         }
         if constexpr (FP8) {
             if (tid < TM) xsc[tid] = __int_as_float(as[S][0]);
-            if (tid >= TM && tid < TM + 4) xsc[tid] = __int_as_float(ws[S][0]);
+            if (tid == TM) xsc[TM] = __int_as_float(ws[S][0]);
         }
     };
 
@@ -471,35 +473,6 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
 #pragma unroll
                     for (int mb = 0; mb < 2; ++mb)
                         acc[nb][mb] = mma16x16<bf16>(a[nb][0], a[nb][1], b[mb][0], b[mb][1], acc[nb][mb]);
-            }
-            return;
-        }
-        if constexpr (SB == 32) {
-            // Each 32-code step folded under its own exponents: the wave's
-            // 64 rows are row blocks 2·wn and 2·wn + 1.
-            const u32 we[2] = {__float_as_uint(xsc[TM + 2 * wn]), __float_as_uint(xsc[TM + 2 * wn + 1])};
-            const u32 ae[2] = {__float_as_uint(xsc[wm * 32 + r16]), __float_as_uint(xsc[wm * 32 + 16 + r16])};
-#pragma unroll
-            for (int kk = 0; kk < KC / 32; ++kk) {
-                moe_u2 a[4], b[2];
-#pragma unroll
-                for (int nb = 0; nb < 4; ++nb)
-                    a[nb] = *reinterpret_cast<const moe_u2*>(wl + (wn * 64 + nb * 16 + r16) * PITCH + 32 * kk + 8 * g);
-#pragma unroll
-                for (int mb = 0; mb < 2; ++mb)
-                    b[mb] = *reinterpret_cast<const moe_u2*>(xl + (wm * 32 + mb * 16 + r16) * PITCH + 32 * kk + 8 * g);
-                const float fw[2] = {4.f * fp8_e8m0((we[0] >> (8 * kk)) & 0xFFu),
-                                     4.f * fp8_e8m0((we[1] >> (8 * kk)) & 0xFFu)};
-#pragma unroll
-                for (int mb = 0; mb < 2; ++mb) {
-                    const float fa = fp8_e8m0((ae[mb] >> (8 * kk)) & 0xFFu);
-#pragma unroll
-                    for (int nb = 0; nb < 4; ++nb) {
-                        const fp8_f4 p = mma_fp8(a[nb][0], a[nb][1], b[mb][0], b[mb][1], fp8_f4{0.f, 0.f, 0.f, 0.f});
-                        const float f = fw[nb / 2] * fa;
-                        acc[nb][mb] = __builtin_elementwise_fma(fp8_f4{f, f, f, f}, p, acc[nb][mb]);
-                    }
-                }
             }
             return;
         }
@@ -592,30 +565,316 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
     }
 }
 
-template <int SB = 0>
-__global__ __launch_bounds__(512) void dense_fp8_gemm8(const u8* __restrict__ act, const float* __restrict__ act_scales,
-                                                       const u8* __restrict__ codes, const float* __restrict__ factors,
-                                                       bf16* __restrict__ y, float* __restrict__ part, int m, int n,
-                                                       int k, int per, const u32* __restrict__ win) {
-    const int rows = m;
-    if (win != nullptr) m = min(m, static_cast<int>(win[0]));
-    const int begin = static_cast<int>(blockIdx.x) * 128;
-    if (begin >= m) return;
-    const long long first = win != nullptr ? Window{win}.plane(0) : 0;
-    const int split = static_cast<int>(blockIdx.z);
-    fp8_gemm_tile8<true, SB>(act + first * k, act_scales + first * (k / 128), nullptr, begin, min(128, m - begin), codes,
-                   factors, y + first * n, 1, n, k, blockIdx.y, split * per, (split + 1) * per,
-                   gridDim.z > 1 ? part + static_cast<long long>(split) * rows * n : nullptr);
+// 16 bytes of a partial one block lands and another sums, past the XCD's
+// L2 (sc1, the aux bit 16: coherent at agent scope across the XCDs), as
+// buffer stores and loads the compiler counts.
+__device__ __forceinline__ __amdgpu_buffer_rsrc_t shared_plane(const float* base, int bytes) {
+    return __builtin_amdgcn_make_buffer_rsrc(const_cast<float*>(base), 0, bytes, 0x00020000);
+}
+__device__ __forceinline__ void store_shared16(__amdgpu_buffer_rsrc_t r, u32 off, fp8_f4 v) {
+    __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4, v), r, off, 0, 16);
+}
+__device__ __forceinline__ fp8_f4 load_shared16(__amdgpu_buffer_rsrc_t r, u32 off) {
+    return __builtin_bit_cast(fp8_f4, __builtin_amdgcn_raw_buffer_load_b128(r, off, 0, 16));
 }
 
-// A wave's 4-byte reads from `base + voff` landing as 256 contiguous bytes
-// of LDS at `lds` (a wave-uniform LDS address), hand-issued: the compiler
-// would wait on it before every read of LDS, and the tile waits it itself.
-__device__ __forceinline__ void lds_dma4(const void* base, u32 voff, u32 lds) {
-    asm volatile("s_mov_b32 m0, %2\n\tglobal_load_lds_dword %0, %1" ::"v"(voff), "s"(base), "s"(lds) : "memory", "m0");
+// The FP8 prefill tile: 128 activation rows against 256 weight rows, eight
+// waves of 64 weight rows x 64 activation rows (wn along the weight, wm
+// along the activation). The weight, in the matrix core's order, goes
+// straight to each wave's registers (its four strips, two 1 KB units a
+// stage: the A operands as they land); the activation codes and their scales
+// go through NB stages of LDS, read by the card straight into it, 16-byte
+// chunks XOR-swizzled by row. A stage is 128 codes of K; each 128-wide block
+// (SB 0: f32 scales a 1x128 block, factors a 128x128 one) or each 32-code
+// step (SB 32: ue8m0 exponents a 1x32 and a 32x32 block) folds into the
+// sums under its scales. Tile (tm, tn) of y = act · codesᵀ, rows [m) live.
+template <int SB, int NB, int WN, int WM, int NS, int MS>
+__device__ __forceinline__ void fp8_prefill_tile(const u8* __restrict__ act, const u8* __restrict__ act_scales,
+                                                 const u8* __restrict__ codes, const u8* __restrict__ factors,
+                                                 bf16* __restrict__ y, int m, int n, int k, int tm, int tn,
+                                                 int s_begin, int s_end, float* __restrict__ slot) {
+    constexpr int MR = WM * MS * 16, KS = 128;          // activation rows a tile, codes a stage
+    constexpr int XI = MR * KS / 256 / (WN * WM);       // activation DMA reads a wave a stage
+    constexpr int FW = SB == 32 ? (NS + 1) / 2 : 1;     // factor words a wave a stage
+    constexpr int PER = XI + 1 + 2 * NS + FW;           // reads a lane a stage
+    constexpr int D = NB - 1;
+    static_assert(XI * 256 * WN * WM == MR * KS, "a stage is whole wave reads");
+    static_assert((D - 1) * PER < 64, "vmcnt counts to 63");
+    __shared__ __align__(16) u8 xl[NB][MR * KS];
+    __shared__ __align__(16) u32 sl[NB][MR];
+    const int tid = threadIdx.x, l = lane(), r16 = l % 16, g = l / 16;
+    const int wave = tid / kWave, wn = wave % WN, wm = wave / WN;
+    const int m0 = tm * MR, n0 = tn * WN * NS * 16 + wn * NS * 16;
+    const int stages = s_end - s_begin, sb = k / 32;  // scale bytes a row
+    // 8-byte slots of a row's stage, slot e at e ^ (r % 16): a B read's 16
+    // rows land in 16 distinct slots.
+    auto at8 = [](int r, int e) { return r * KS + 8 * (e ^ (r & 15)); };
+
+    // The activation: wave read j lands rows 2q, 2q + 1 of the stage (q =
+    // wave·XI + j), lane l's dword at 4l, from the slot the swizzle puts
+    // there.
+    u32 xo[XI];
+#pragma unroll
+    for (int j = 0; j < XI; ++j) {
+        const int q = wave * XI + j, r = 2 * q + l / 32, d = l % 32;
+        const int row = min(m0 + r, m - 1);
+        xo[j] = static_cast<u32>(row) * static_cast<u32>(k) + 8 * ((d / 2) ^ (r & 15)) + 4 * (d % 2);
+    }
+    // The scales: wave w lands rows 64·(w % (MR / 64)) .. +64 (waves past
+    // the tile's rows land the same words again).
+    static_assert(MR % 64 == 0, "the scales land 64 rows a wave");
+    constexpr int SH = MR / 64;
+    const u32 so = static_cast<u32>(min(m0 + 64 * (wave % SH) + l, m - 1)) * static_cast<u32>(sb);
+    const u32 uw = static_cast<u32>(__builtin_amdgcn_readfirstlane(wave));
+    const u32 xl0 = lds_address(xl[0]) + uw * XI * 256, sl0 = lds_address(sl[0]) + (uw % SH) * 256;
+    // The weight: strip ns of the wave, lane l's 16 bytes of each unit.
+    const moe_rsrc cr = batch_plane(codes, 1ull * n * k);
+    u32 co[NS];
+#pragma unroll
+    for (int ns = 0; ns < NS; ++ns)
+        co[ns] = static_cast<u32>(min(n0 / 16 + ns, n / 16 - 1)) * static_cast<u32>(16 * k) + 16 * l;
+    constexpr int BLK = SB == 32 ? 32 : 128;
+    const moe_rsrc fr = batch_plane(factors, 1ull * ((n + BLK - 1) / BLK) * sb);
+    u32 fo[FW];
+#pragma unroll
+    for (int f = 0; f < FW; ++f) fo[f] = static_cast<u32>(min(n0 + 32 * f, n - 1) / BLK) * static_cast<u32>(sb);
+
+    i32x4 wv[NB][2 * NS];
+    moe_i2 wf[NB][FW];
+    auto issue = [&](int sl_, int b) {
+        const int s = s_begin + sl_;
+#pragma unroll
+        for (int j = 0; j < XI; ++j) lds_dma4(act, xo[j] + s * KS, xl0 + b * (MR * KS) + j * 256);
+        lds_dma4(act_scales, so + 4 * s, sl0 + b * (MR * 4));
+#pragma unroll
+        for (int ns = 0; ns < NS; ++ns)
+#pragma unroll
+            for (int u = 0; u < 2; ++u) bload_kept(wv[b][2 * ns + u], cr, co[ns] + (2 * s + u) * 1024);
+#pragma unroll
+        for (int f = 0; f < FW; ++f) bload_run<4>(wf[b][f], fr, fo[f] + 4 * s);
+    };
+
+    fp8_f4 acc[NS][MS];
+#pragma unroll
+    for (int ns = 0; ns < NS; ++ns)
+#pragma unroll
+        for (int ms = 0; ms < MS; ++ms) acc[ns][ms] = fp8_f4{0.f, 0.f, 0.f, 0.f};
+    int units[FW][MS];  // SB 32: each sum's biased exponents (`step`)
+#pragma unroll
+    for (int f = 0; f < FW; ++f)
+#pragma unroll
+        for (int ms = 0; ms < MS; ++ms) units[f][ms] = 254;
+
+    auto step = [&](int s, int b) {
+        tie(wv[b]);
+#pragma unroll
+        for (int f = 0; f < FW; ++f) batch_hold(wf[b][f]);
+        const u8* xc = xl[b];
+        u32 ae[MS];
+#pragma unroll
+        for (int ms = 0; ms < MS; ++ms) ae[ms] = sl[b][wm * MS * 16 + ms * 16 + r16];
+        if constexpr (SB == 32) {
+            // Each sum in units of its last step's scale, 4·2^(E − 254), E
+            // the step's two biased exponents: a step's products chain onto
+            // the sum once it moves to the new step's units, a power of two
+            // and so exact.
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                moe_u2 bv[MS];
+#pragma unroll
+                for (int ms = 0; ms < MS; ++ms) {
+                    const int r = wm * MS * 16 + ms * 16 + r16;
+                    bv[ms] = *reinterpret_cast<const moe_u2*>(xc + at8(r, 4 * kk + g));
+                }
+#pragma unroll
+                for (int f = 0; f < FW; ++f)
+#pragma unroll
+                    for (int ms = 0; ms < MS; ++ms) {
+                        const int e = static_cast<int>(((static_cast<u32>(wf[b][f][0]) >> (8 * kk)) & 0xFFu) +
+                                                       ((ae[ms] >> (8 * kk)) & 0xFFu));
+                        const float to = __builtin_ldexpf(1.f, units[f][ms] - e);
+                        units[f][ms] = e;
+#pragma unroll
+                        for (int ns = f * NS / FW; ns < (f + 1) * NS / FW; ++ns)
+                            acc[ns][ms] = acc[ns][ms] * fp8_f4{to, to, to, to};
+                    }
+#pragma unroll
+                for (int ns = 0; ns < NS; ++ns) {
+                    const i32x4& u = wv[b][2 * ns + kk / 2];
+#pragma unroll
+                    for (int ms = 0; ms < MS; ++ms)
+                        acc[ns][ms] = mma_fp8(static_cast<u32>(u[2 * (kk % 2)]), static_cast<u32>(u[2 * (kk % 2) + 1]),
+                                              bv[ms][0], bv[ms][1], acc[ns][ms]);
+                }
+            }
+        } else {
+            fp8_f4 p[NS][MS];
+#pragma unroll
+            for (int ns = 0; ns < NS; ++ns)
+#pragma unroll
+                for (int ms = 0; ms < MS; ++ms) p[ns][ms] = fp8_f4{0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                moe_u2 bv[MS];
+#pragma unroll
+                for (int ms = 0; ms < MS; ++ms) {
+                    const int r = wm * MS * 16 + ms * 16 + r16;
+                    bv[ms] = *reinterpret_cast<const moe_u2*>(xc + at8(r, 4 * kk + g));
+                }
+#pragma unroll
+                for (int ns = 0; ns < NS; ++ns) {
+                    const i32x4& u = wv[b][2 * ns + kk / 2];
+#pragma unroll
+                    for (int ms = 0; ms < MS; ++ms)
+                        p[ns][ms] = mma_fp8(static_cast<u32>(u[2 * (kk % 2)]), static_cast<u32>(u[2 * (kk % 2) + 1]),
+                                            bv[ms][0], bv[ms][1], p[ns][ms]);
+                }
+            }
+            const float wsc = 4.f * __int_as_float(wf[b][0][0]);
+#pragma unroll
+            for (int ms = 0; ms < MS; ++ms) {
+                const float f = wsc * __uint_as_float(ae[ms]);
+#pragma unroll
+                for (int ns = 0; ns < NS; ++ns)
+                    acc[ns][ms] = __builtin_elementwise_fma(fp8_f4{f, f, f, f}, p[ns][ms], acc[ns][ms]);
+            }
+        }
+        // Stage s + 1 landed; the stages past it may still be in flight.
+        if (s + D < stages) vm_wait<(D - 1) * PER>(); else vm_wait<0>();
+        lds_barrier();
+    };
+#pragma unroll
+    for (int d = 0; d < D; ++d)
+        if (d < stages) issue(d, d);
+    if (D < stages) vm_wait<(D - 1) * PER>(); else vm_wait<0>();
+    lds_barrier();
+    if constexpr (SB == 32) {
+        // The sums start in their first step's units (zero in any).
+#pragma unroll
+        for (int f = 0; f < FW; ++f) batch_hold(wf[0][f]);
+#pragma unroll
+        for (int f = 0; f < FW; ++f)
+#pragma unroll
+            for (int ms = 0; ms < MS; ++ms)
+                units[f][ms] = static_cast<int>((static_cast<u32>(wf[0][f][0]) & 0xFFu) +
+                                                (sl[0][wm * MS * 16 + ms * 16 + r16] & 0xFFu));
+    }
+    for (int s0 = 0; s0 < stages; s0 += NB) {
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            const int s = s0 + b;
+            if (s >= stages) break;
+            if (s + D < stages) issue(s + D, (b + D) % NB);
+            step(s, b);
+        }
+    }
+
+    if (slot != nullptr) {
+        // A slice of the tile's K for `dense_fp8_tiles`: its f32 partial, the
+        // tile's own rows and columns.
+        const __amdgpu_buffer_rsrc_t sr = shared_plane(slot, 4 * MR * WN * NS * 16);
+#pragma unroll
+        for (int ms = 0; ms < MS; ++ms)
+#pragma unroll
+            for (int ns = 0; ns < NS; ++ns) {
+                const float f = SB == 32 ? __builtin_ldexpf(4.f, units[ns * FW / NS][ms] - 254) : 1.f;
+                const int r = wm * MS * 16 + ms * 16 + r16, c = wn * NS * 16 + ns * 16 + 4 * g;
+                store_shared16(sr, 4 * (r * (WN * NS * 16) + c), acc[ns][ms] * fp8_f4{f, f, f, f});
+            }
+        return;
+    }
+#pragma unroll
+    for (int ms = 0; ms < MS; ++ms) {
+        const int row = m0 + wm * MS * 16 + ms * 16 + r16;
+        if (row >= m) continue;
+        bf16* o = y + static_cast<long long>(row) * n;
+#pragma unroll
+        for (int ns = 0; ns < NS; ++ns) {
+            const int c = n0 + ns * 16 + 4 * g;
+            if (c >= n) continue;
+            const float f = SB == 32 ? __builtin_ldexpf(4.f, units[ns * FW / NS][ms] - 254) : 1.f;
+            bf16 v[4];
+#pragma unroll
+            for (int t = 0; t < 4; ++t) v[t] = from_f32<bf16>(acc[ns][ms][t] * f);
+            *reinterpret_cast<moe_u2*>(o + c) = __builtin_bit_cast(moe_u2, v);
+        }
+    }
 }
-__device__ __forceinline__ u32 lds_address(const void* p) {
-    return __builtin_amdgcn_readfirstlane(static_cast<u32>(reinterpret_cast<size_t>(p)));
+
+// A dense FP8 projection's prefill rows, the tiles taken whole (tile-major
+// along M within a weight tile) but for the last `rem` tiles, short of a
+// round, whose K goes in `splits` slices of `per` stages a block: blocks [0,
+// tiles − rem) a tile each (renumbered so that an XCD runs a contiguous
+// range), then a slice each, round the XCDs. A slice's f32 partial lands in
+// `part` ([rem, splits, tile rows x cols], the tile's own layout) past the
+// L2s, and the last of a tile's slices to finish (by its ticket in
+// `tickets`, zero between launches) sums them in slice order and lands the
+// tile, so the sum's order is the slices' whatever order they finish in. A
+// staged window bounds the rows.
+template <int SB, int NB, int WN, int WM, int NS, int MS, int OCC>
+__global__ __launch_bounds__(64 * WN * WM) __attribute__((amdgpu_waves_per_eu(OCC, OCC))) void dense_fp8_tiles(
+    const u8* __restrict__ act, const u8* __restrict__ act_scales, const u8* __restrict__ codes,
+    const u8* __restrict__ factors, bf16* __restrict__ y, float* __restrict__ part, u32* __restrict__ tickets, int m,
+    int n, int k, int rem, int splits, int per, const u32* __restrict__ win) {
+    constexpr int TMR = WM * MS * 16, TNR = WN * NS * 16, TS = TMR * TNR, T = 64 * WN * WM;
+    // The tiles over the stated rows, as the launch dealt them; a staged
+    // window's rows bound what lands, its tiles past them idle (every slice
+    // of such a tile alike, so none waits on a ticket).
+    const int tms = (m + TMR - 1) / TMR, tns = (n + TNR - 1) / TNR, tiles = tms * tns, dp = tiles - rem;
+    if (win != nullptr) m = min(m, static_cast<int>(win[0]));
+    const long long first = win != nullptr ? Window{win}.plane(0) : 0;
+    const int live = dp + rem * splits;
+    const int b = static_cast<int>(blockIdx.x);
+    if (b >= live) return;
+    // The whole tiles renumbered so that an XCD runs a contiguous range; the
+    // slices after them as dealt, round the XCDs.
+    int at = b;
+    if (b < dp) {
+        const int xcd = b % 8, slots = dp / 8, extra = dp % 8;
+        at = xcd * slots + min(xcd, extra) + b / 8;
+    }
+    const int t = at < dp ? at : dp + (at - dp) / splits, split = at < dp ? 0 : (at - dp) % splits;
+    const int stages = k / 128, tm = t % tms, tn = t / tms;
+    if (tm * TMR >= m) return;
+    act += first * k;
+    act_scales += first * (k / 32);
+    y += first * n;
+    float* mine = at < dp ? nullptr : part + (static_cast<long long>(t - dp) * splits + split) * TS;
+    fp8_prefill_tile<SB, NB, WN, WM, NS, MS>(act, act_scales, codes, factors, y, m, n, k, tm, tn,
+                                             at < dp ? 0 : split * per, at < dp ? stages : min((split + 1) * per, stages),
+                                             mine);
+    if (at < dp) return;
+    __shared__ int last;
+    // Every lane's partial at the memory the XCDs share before the ticket
+    // moves; the ticket there too (sc0 sc1).
+    vm_wait<0>();
+    __syncthreads();
+    if (threadIdx.x == 0)
+        last = __hip_atomic_fetch_add(&tickets[t - dp], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) ==
+               static_cast<u32>(splits - 1);
+    __syncthreads();
+    if (!last) return;
+    constexpr int PER_T = TS / (T * 4);  // 16-byte pieces a thread
+    static_assert(PER_T * T * 4 == TS, "a tile is whole pieces a thread");
+    fp8_f4 v[PER_T];
+#pragma unroll
+    for (int q = 0; q < PER_T; ++q) v[q] = fp8_f4{0.f, 0.f, 0.f, 0.f};
+    for (int sp = 0; sp < splits; ++sp) {
+        const __amdgpu_buffer_rsrc_t src = shared_plane(part + (static_cast<long long>(t - dp) * splits + sp) * TS, 4 * TS);
+#pragma unroll
+        for (int q = 0; q < PER_T; ++q) v[q] += load_shared16(src, 16 * (q * T + threadIdx.x));
+    }
+    const int r0 = tm * TMR, c0 = tn * TNR;
+#pragma unroll
+    for (int q = 0; q < PER_T; ++q) {
+        const int e = (q * T + threadIdx.x) * 4, r = e / TNR, c = e % TNR;
+        if (r0 + r >= m || c0 + c >= n) continue;
+        bf16 o[4];
+#pragma unroll
+        for (int z = 0; z < 4; ++z) o[z] = from_f32<bf16>(v[q][z]);
+        *reinterpret_cast<moe_u2*>(y + static_cast<long long>(r0 + r) * n + c0 + c) = __builtin_bit_cast(moe_u2, o);
+    }
+    if (threadIdx.x == 0) __hip_atomic_store(&tickets[t - dp], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 // The bf16 prefill tile over a bank in the matrix core's order: up to TM·16

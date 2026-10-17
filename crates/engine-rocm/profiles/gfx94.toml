@@ -51,5 +51,5 @@ moe.bf16_order = false
 moe.mxfp4_order = true
 # fp8b32 projections in the FP8 matrix core's order: DeepSeek-V4.1-Flash's
 # seven at 8 / 32 / 128 rows 375 / 383 / 450 -> 125 / 140 / 290 us, the same
-# at one row, and past 512 rows hipBLASLt over the values as before.
+# at one row, and past 64 rows on the FP8 prefill tiles.
 fp8.b32_order = true

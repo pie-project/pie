@@ -154,7 +154,7 @@ fn entry_by_name(
     let code =
         unsafe { (api.hip.hipModuleGetFunction)(&raw mut function, module, c_name.as_ptr()) };
     match code {
-        sys::HIP_SUCCESS => Ok(function),
+        sys::HIP_SUCCESS => spill_free(root, instantiation, function),
         NOT_FOUND => Err(Fault::Compile {
             unit: root,
             log: format!("`{instantiation}` compiled and is not in the image"),
@@ -164,6 +164,34 @@ fn entry_by_name(
             code: other,
         }),
     }
+}
+
+/// The roots whose kernels count their own reads (hand-issued loads the
+/// compiler does not see): a spill there could store a register before its
+/// read lands, or wait on the wrong count, so such a kernel that spills is
+/// refused rather than run.
+const HAND_COUNTED: &[&str] = &["linear/fp8"];
+
+/// `hipFuncAttributeLocalSizeBytes`: a lane's scratch.
+const LOCAL_SIZE_BYTES: i32 = 3;
+
+fn spill_free(root: &'static str, instantiation: &str, function: sys::Function) -> Result<sys::Function, Fault> {
+    if !HAND_COUNTED.contains(&root) {
+        return Ok(function);
+    }
+    let mut local: i32 = 0;
+    // SAFETY: a live out-parameter and the function this module just named.
+    let code = unsafe { crate::hip::rt::hipFuncGetAttribute(&raw mut local, LOCAL_SIZE_BYTES, function.cast()) };
+    if code == sys::HIP_SUCCESS && local > 0 {
+        return Err(Fault::Compile {
+            unit: root,
+            log: format!(
+                "`{instantiation}` spills {local} bytes a lane; its hand-counted reads cannot share registers \
+                 with spills"
+            ),
+        });
+    }
+    Ok(function)
 }
 
 fn disk_path(key: &str) -> Option<PathBuf> {
