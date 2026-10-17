@@ -25,9 +25,12 @@ import glob
 import json
 import math
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import parity_ref  # noqa: E402
 import time
 
-import numpy as np
 import torch
 from safetensors import safe_open
 
@@ -212,24 +215,9 @@ def main():
     probes = json.load(open(args.probes))["probes"]
     print(f"reference over {ref.layers} layers: {ref.c['layer_types']}")
     for probe in probes:
-        name, ids = probe["name"], list(probe["ids"])
-        t0 = time.time()
-        tf = ref.logits(ids)
-        gen_rows = [tf[-1]]
-        gen = []
-        cur = list(ids)
-        for _ in range(args.steps):
-            nxt = int(np.argmax(gen_rows[-1]))
-            gen.append(nxt)
-            cur.append(nxt)
-            gen_rows.append(ref.logits(cur)[-1])
-        tf.astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.tf.f32"))
-        np.stack(gen_rows).astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.gen.f32"))
-        json.dump(
-            {"ids": ids, "argmax": tf.argmax(-1).tolist(), "gen": gen, "vocab": int(tf.shape[1])},
-            open(os.path.join(args.out, f"{name}.{args.tag}.json"), "w"),
-        )
-        print(f"  {name}: {len(ids)} tokens, {args.steps} steps, {time.time() - t0:.1f}s, gen={gen[:12]}")
+        started = time.time()
+        tf, rows, gen = parity_ref.greedy(ref.logits, probe["ids"], args.steps)
+        parity_ref.dump(args, probe["name"], probe["ids"], tf, rows, gen, started)
 
 
 if __name__ == "__main__":

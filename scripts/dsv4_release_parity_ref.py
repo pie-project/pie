@@ -44,12 +44,14 @@ the indexer's fp4 after a Hadamard rotation) are not applied, as pie applies
 none of them.
 """
 
-import argparse
 import json
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import parity_ref  # noqa: E402
 import time
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
@@ -57,10 +59,7 @@ from safetensors.torch import save_file
 from transformers import AutoTokenizer, DeepseekV4ForCausalLM
 
 PROMPTS = [
-    ("capital", "The capital of France is"),
-    ("haiku", "Write a haiku about the sea."),
-    ("code", "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n"),
-    ("story", "Once upon a time, in a small village by the river,"),
+    *parity_ref.PROMPTS,
 ]
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
@@ -184,15 +183,9 @@ def bf16_view(snapshot, view):
     json.dump(config, open(os.path.join(view, "config.json"), "w"), indent=1)
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("snapshot")
-    ap.add_argument("out")
-    ap.add_argument("--steps", type=int, default=16)
-    ap.add_argument("--probes", default=None)
-    ap.add_argument("--device", default="cuda")
+    ap = parity_ref.parser()
     ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     ap.add_argument("--act-quant", default=None, const="dense,experts", nargs="?")
-    ap.add_argument("--tag", default="ref")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -204,44 +197,13 @@ def main():
     if args.act_quant:
         at_release_precision(model, args.act_quant.split(","))
 
-    if args.probes:
-        probes = json.load(open(args.probes))["probes"]
-    else:
-        bos = [tokenizer.bos_token_id] if tokenizer.bos_token_id is not None else []
-        probes = []
-        for name, text in PROMPTS:
-            probes.append({"name": name, "ids": bos + tokenizer.encode(text, add_special_tokens=False)})
-        json.dump({"probes": probes}, open(os.path.join(args.out, "probes.json"), "w"), indent=1)
-
-    for probe in probes:
-        name, ids = probe["name"], probe["ids"]
+    bos = [tokenizer.bos_token_id] if tokenizer.bos_token_id is not None else []
+    encode = lambda text: bos + tokenizer.encode(text, add_special_tokens=False)  # noqa: E731
+    for probe in parity_ref.probes(args, encode, PROMPTS):
         started = time.time()
-        with torch.no_grad():
-            out = model(input_ids=torch.tensor([ids], device=args.device), use_cache=True)
-            tf = out.logits[0].float().cpu().numpy()
-            past = out.past_key_values
-            gen_rows = [tf[-1].copy()]
-            produced = []
-            last = int(tf[-1].argmax())
-            for _ in range(args.steps):
-                produced.append(last)
-                step = model(
-                    input_ids=torch.tensor([[last]], device=args.device),
-                    past_key_values=past,
-                    use_cache=True,
-                )
-                past = step.past_key_values
-                row = step.logits[0, -1].float().cpu().numpy()
-                gen_rows.append(row)
-                last = int(row.argmax())
-        vocab = tf.shape[-1]
-        tf.astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.tf.f32"))
-        np.stack(gen_rows).astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.gen.f32"))
-        json.dump(
-            {"ids": ids, "argmax": [int(a) for a in tf.argmax(-1)], "gen": produced, "vocab": vocab},
-            open(os.path.join(args.out, f"{name}.{args.tag}.json"), "w"),
-        )
-        print(f"  {name}: {len(ids)} tokens, vocab {vocab}, gen={produced[:12]}  ({time.time() - started:.1f}s)")
+        tf, rows, gen = parity_ref.greedy_cached(model, probe["ids"], args.steps, args.device)
+        parity_ref.dump(args, probe["name"], probe["ids"], tf, rows, gen, started)
+
 
 if __name__ == "__main__":
     main()

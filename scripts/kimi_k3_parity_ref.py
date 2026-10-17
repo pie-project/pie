@@ -32,10 +32,13 @@ snapshot whose experts are `mxfp4-pack-quantized` is first read out to bf16
 bf16) into a scratch copy beside OUT, served unquantized, and removed.
 """
 
-import argparse
 import json
 import math
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import parity_ref  # noqa: E402
 import shutil
 import tempfile
 import time
@@ -85,13 +88,6 @@ def unpacked(snapshot, into):
         config["text_config"].pop("quantization_config", None)
     json.dump(config, open(os.path.join(into, "config.json"), "w"), indent=1)
 
-PROMPTS = [
-    ("capital", "The capital of France is"),
-    ("haiku", "Write a haiku about the sea."),
-    ("code", "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n"),
-    ("story", "Once upon a time, in a small village by the river,"),
-]
-
 def dense(row, vocab):
     out = np.full(vocab, -np.inf, dtype=np.float32)
     for token, lp in row.items():
@@ -101,11 +97,7 @@ def dense(row, vocab):
     return out
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("snapshot")
-    ap.add_argument("out")
-    ap.add_argument("--steps", type=int, default=16)
-    ap.add_argument("--probes", default=None)
+    ap = parity_ref.parser()
     ap.add_argument("--memory", type=float, default=0.15)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -145,14 +137,7 @@ def main():
     )
     tokenizer = llm.get_tokenizer()
 
-    if args.probes:
-        probes = json.load(open(args.probes))["probes"]
-    else:
-        probes = []
-        for name, text in PROMPTS:
-            ids = tokenizer.encode(text, add_special_tokens=False)
-            probes.append({"name": name, "ids": ids})
-        json.dump({"probes": probes}, open(os.path.join(args.out, "probes.json"), "w"), indent=1)
+    probes = parity_ref.probes(args, lambda text: tokenizer.encode(text, add_special_tokens=False))
 
     params = SamplingParams(
         temperature=0.0,
@@ -173,15 +158,7 @@ def main():
         gen_rows = [dense(row, vocab) for row in sample.logprobs]
         tf.append(gen_rows[0])
         produced = list(sample.token_ids[: args.steps])
-        tf = np.stack(tf)
-        tf.astype(np.float32).tofile(os.path.join(args.out, f"{name}.ref.tf.f32"))
-        np.stack(gen_rows).astype(np.float32).tofile(os.path.join(args.out, f"{name}.ref.gen.f32"))
-        json.dump(
-            {"ids": ids, "argmax": [int(a) for a in tf.argmax(-1)], "gen": produced, "vocab": vocab},
-            open(os.path.join(args.out, f"{name}.ref.json"), "w"),
-        )
-        print(f"  {name}: {len(ids)} tokens, vocab {vocab}, gen={produced[:12]}  ({time.time() - started:.1f}s)")
-        print(f"      {tokenizer.decode(produced)!r}")
+        parity_ref.dump(args, name, ids, np.stack(tf), gen_rows, produced, started, tokenizer.decode)
 
     if scratch is not None:
         shutil.rmtree(scratch, ignore_errors=True)

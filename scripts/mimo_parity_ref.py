@@ -29,14 +29,14 @@ What the release stores and the remote code does not read itself:
   first) beside `.weight_scale` e8m0 exponents, one per 32 columns.
 """
 
-import argparse
 import json
-import math
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import parity_ref  # noqa: E402
 import time
 
-import numpy as np
 import torch
 from safetensors import safe_open
 
@@ -117,12 +117,7 @@ def load_state(snapshot, config):
     return state
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("snapshot")
-    ap.add_argument("out")
-    ap.add_argument("--steps", type=int, default=16)
-    ap.add_argument("--probes", default=None)
-    ap.add_argument("--device", default="cuda")
+    ap = parity_ref.parser()
     ap.add_argument("--long", type=int, default=300, help="tokens in the probe past the window")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -153,12 +148,9 @@ def main():
             sys.exit(f"buffer {name} was never built")
     model.to(args.device).eval()
 
-    if args.probes:
-        probes = json.load(open(args.probes))["probes"]
-    else:
-        probes = [{"name": n, "ids": tokenizer(t, add_special_tokens=False)["input_ids"]} for n, t in PROMPTS]
-        probes.append({"name": "window", "ids": long_prompt(tokenizer, args.long)})
-        json.dump({"probes": probes}, open(os.path.join(args.out, "probes.json"), "w"))
+    window_probe = [] if args.probes else [{"name": "window", "ids": long_prompt(tokenizer, args.long)}]
+    encode = lambda text: tokenizer(text, add_special_tokens=False)["input_ids"]  # noqa: E731
+    probes = parity_ref.probes(args, encode, PROMPTS, window_probe)
 
     window = raw["sliding_window"]
 
@@ -182,25 +174,9 @@ def main():
         return out.logits[0].float().cpu().numpy()
 
     for probe in probes:
-        name, ids = probe["name"], list(probe["ids"])
-        t0 = time.time()
-        tf = logits(ids)
-        rows = [tf[-1]]
-        gen = []
-        cur = list(ids)
-        for _ in range(args.steps):
-            nxt = int(np.argmax(rows[-1]))
-            gen.append(nxt)
-            cur.append(nxt)
-            rows.append(logits(cur)[-1])
-        tf.astype(np.float32).tofile(os.path.join(args.out, f"{name}.ref.tf.f32"))
-        np.stack(rows).astype(np.float32).tofile(os.path.join(args.out, f"{name}.ref.gen.f32"))
-        json.dump(
-            {"ids": ids, "argmax": tf.argmax(-1).tolist(), "gen": gen, "vocab": int(tf.shape[1])},
-            open(os.path.join(args.out, f"{name}.ref.json"), "w"),
-        )
-        print(f"  {name}: {len(ids)} tokens, {args.steps} steps, {time.time() - t0:.1f}s, "
-              f"gen={tokenizer.decode(gen)!r}")
+        started = time.time()
+        tf, rows, gen = parity_ref.greedy(logits, probe["ids"], args.steps)
+        parity_ref.dump(args, probe["name"], probe["ids"], tf, rows, gen, started, tokenizer.decode)
 
 if __name__ == "__main__":
     main()

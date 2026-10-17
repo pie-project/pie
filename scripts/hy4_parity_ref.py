@@ -25,12 +25,13 @@ Writes `OUT/probes.json` (a stated file is used instead) and, per probe NAME:
 against these.
 """
 
-import argparse
-import json
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import parity_ref  # noqa: E402
 import time
 
-import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import apply_rotary_pos_emb_interleave
@@ -55,54 +56,26 @@ def interleaved(q, k, cos, sin, unsqueeze_dim=1):
     return apply_rotary_pos_emb_interleave(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
-def logits_of(model, ids):
-    with torch.no_grad():
-        return model(input_ids=torch.tensor([ids])).logits[0].float().numpy()
-
-
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("snapshot")
-    ap.add_argument("out")
-    ap.add_argument("--steps", type=int, default=16)
-    ap.add_argument("--probes", default=None)
+    ap = parity_ref.parser()
     ap.add_argument("--dtype", default="float32", help="float32, or bfloat16 for the bf16 floor")
-    ap.add_argument("--tag", default="ref")
     args = ap.parse_args()
-    os.makedirs(args.out, exist_ok=True)
-
     modeling_hy_v4.apply_rotary_pos_emb = interleaved
     tokenizer = AutoTokenizer.from_pretrained(args.snapshot)
-    model = AutoModelForCausalLM.from_pretrained(args.snapshot, dtype=getattr(torch, args.dtype))
-    model.eval()
+    model = AutoModelForCausalLM.from_pretrained(args.snapshot, dtype=getattr(torch, args.dtype)).eval()
     for layer in model.model.layers:
         if layer.self_attn.indexer is not None:
             layer.self_attn.indexer.k_norm.eps = 1e-6
-    if args.probes:
-        probes = json.load(open(args.probes))["probes"]
-    else:
-        probes = [{"name": name, "ids": tokenizer.encode(text, add_special_tokens=False)} for name, text in PROMPTS]
-        json.dump({"probes": probes}, open(os.path.join(args.out, "probes.json"), "w"))
 
-    for probe in probes:
-        name, ids = probe["name"], probe["ids"]
+    @torch.no_grad()
+    def logits(ids):
+        return model(input_ids=torch.tensor([ids])).logits[0].float().numpy()
+
+    encode = lambda text: tokenizer.encode(text, add_special_tokens=False)  # noqa: E731
+    for probe in parity_ref.probes(args, encode, PROMPTS):
         started = time.time()
-        tf = logits_of(model, ids)
-        tf.astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.tf.f32"))
-        # greedy by re-reading the whole sequence: the reference's answer at
-        # each step, independent of its own cache
-        seq, gen, gen_rows = list(ids), [], [tf[-1]]
-        for _ in range(args.steps):
-            nxt = int(gen_rows[-1].argmax())
-            gen.append(nxt)
-            seq.append(nxt)
-            gen_rows.append(logits_of(model, seq)[-1])
-        np.stack(gen_rows).astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.gen.f32"))
-        json.dump(
-            {"ids": ids, "argmax": [int(i) for i in tf.argmax(-1)], "gen": gen, "vocab": int(tf.shape[-1])},
-            open(os.path.join(args.out, f"{name}.{args.tag}.json"), "w"),
-        )
-        print(f"{name}: {len(ids)} tokens, gen={gen[:12]} -> {tokenizer.decode(gen)!r}  ({time.time() - started:.1f}s)")
+        tf, rows, gen = parity_ref.greedy(logits, probe["ids"], args.steps)
+        parity_ref.dump(args, probe["name"], probe["ids"], tf, rows, gen, started, tokenizer.decode)
 
 
 if __name__ == "__main__":

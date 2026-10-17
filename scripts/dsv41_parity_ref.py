@@ -49,10 +49,12 @@ decode steps after it. The teacher-forced logits stay the full model's
 against these.
 """
 
-import argparse
 import json
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import parity_ref  # noqa: E402
 import time
 import types
 import urllib.request
@@ -65,10 +67,7 @@ REVISION = "314113f8a7dadb388215396ba5fbee2c610a04d6"
 SOURCES = ["model.py", "engram.py", "vision.py", "image_processor.py"]
 
 PROMPTS = [
-    ("capital", "The capital of France is"),
-    ("haiku", "Write a haiku about the sea."),
-    ("code", "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n"),
-    ("story", "Once upon a time, in a small village by the river,"),
+    *parity_ref.PROMPTS,
 ]
 
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
@@ -324,11 +323,7 @@ def logits_all(model, mod, ids, start_pos, taps=None):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("snapshot")
-    ap.add_argument("out")
-    ap.add_argument("--steps", type=int, default=16)
-    ap.add_argument("--probes", default=None)
+    ap = parity_ref.parser()
     ap.add_argument("--sim", default="kv,index,o")
     ap.add_argument("--act", default="fp8", choices=["fp8", "bf16"],
                     help="bf16: projections read their activations unquantized (the weights still "
@@ -340,7 +335,6 @@ def main():
                     help="generate under bounded replay: the decoder's windows hold the prompt's last window alone")
     ap.add_argument("--dspark", action="store_true",
                     help="draft with the snapshot's DSpark head after each greedy step")
-    ap.add_argument("--tag", default="ref")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     sim = set(args.sim.split(",")) - {"none", ""}
@@ -407,14 +401,9 @@ def main():
     if args.replay:
         REPLAY["decoder"] = list(text["compress_ratios"]).index(1)
 
-    if args.probes:
-        probes = json.load(open(args.probes))["probes"]
-    else:
-        bos = [tokenizer.bos_token_id] if tokenizer.bos_token_id is not None else []
-        probes = [{"name": n, "ids": bos + tokenizer.encode(t, add_special_tokens=False)} for n, t in PROMPTS]
-        json.dump({"probes": probes}, open(os.path.join(args.out, "probes.json"), "w"), indent=1)
-
-    for probe in probes:
+    bos = [tokenizer.bos_token_id] if tokenizer.bos_token_id is not None else []
+    encode = lambda text: bos + tokenizer.encode(text, add_special_tokens=False)  # noqa: E731
+    for probe in parity_ref.probes(args, encode, PROMPTS):
         name, ids = probe["name"], probe["ids"]
         started = time.time()
         with torch.inference_mode():
@@ -448,15 +437,11 @@ def main():
                     drafts.append([int(t) for t in out_ids[0, 1:]])
                     draft_rows.append(block_logits[0].float().cpu().numpy())
                 pos += 1
-        vocab = tf.shape[-1]
-        tf.astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.tf.f32"))
-        np.stack(gen_rows).astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.gen.f32"))
-        summary = {"ids": ids, "argmax": [int(a) for a in tf.argmax(-1)], "gen": produced, "vocab": vocab}
+        extra = {}
         if args.dspark:
             np.stack(draft_rows).astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.dspark.f32"))
-            summary["drafts"] = drafts
-        json.dump(summary, open(os.path.join(args.out, f"{name}.{args.tag}.json"), "w"))
-        print(f"  {name}: {len(ids)} tokens, vocab {vocab}, gen={produced[:12]}  ({time.time() - started:.1f}s)")
+            extra["drafts"] = drafts
+        parity_ref.dump(args, name, ids, tf, gen_rows, produced, started, **extra)
 
 
 if __name__ == "__main__":

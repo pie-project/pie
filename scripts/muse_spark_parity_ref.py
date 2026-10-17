@@ -17,22 +17,17 @@ Writes, per probe NAME, `OUT/NAME.ref.{tf,gen}.f32` and `OUT/NAME.ref.json`
 as `scripts/muse_glimmer_parity_ref.py` does.
 """
 
-import argparse
 import json
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import parity_ref  # noqa: E402
 import time
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
-
-PROMPTS = [
-    ("capital", "The capital of France is"),
-    ("haiku", "Write a haiku about the sea."),
-    ("code", "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n"),
-    ("story", "Once upon a time, in a small village by the river,"),
-]
 
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 TRUNK = "model.language_model."
@@ -110,7 +105,7 @@ def rope(x, positions, theta, dim):
 def forward(w, tc, ids):
     """Every position's logits for `ids` (one sequence), the cacheless forward."""
     dev = w.device
-    H, nh, nkv, hd = tc["hidden_size"], tc["num_attention_heads"], tc["num_key_value_heads"], tc["head_dim"]
+    nh, nkv, hd = tc["num_attention_heads"], tc["num_key_value_heads"], tc["head_dim"]
     eps, post_eps = tc["rms_norm_eps"], tc["post_norm_eps"]
     T = len(ids)
     pos = torch.arange(T, device=dev)
@@ -179,49 +174,19 @@ def forward(w, tc, ids):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("snapshot")
-    ap.add_argument("out")
-    ap.add_argument("--steps", type=int, default=16)
-    ap.add_argument("--probes", default=None)
-    ap.add_argument("--device", default="cuda")
-    ap.add_argument("--tag", default="ref")
-    args = ap.parse_args()
-    os.makedirs(args.out, exist_ok=True)
+    args = parity_ref.parser().parse_args()
     cfg = json.load(open(os.path.join(args.snapshot, "config.json")))
     tc = cfg.get("text_config", cfg)
     w = Weights(args.snapshot, args.device)
-    if args.probes:
-        probes = json.load(open(args.probes))["probes"]
-    else:
-        from transformers import PreTrainedTokenizerFast
+    from transformers import PreTrainedTokenizerFast
 
-        tok = PreTrainedTokenizerFast(tokenizer_file=os.path.join(args.snapshot, "tokenizer.json"))
-        bos = tc.get("bos_token_id")
-        probes = [{"name": n, "ids": ([bos] if bos is not None else []) + tok.encode(t, add_special_tokens=False)}
-                  for n, t in PROMPTS]
-        json.dump({"probes": probes}, open(os.path.join(args.out, "probes.json"), "w"), indent=1)
+    tok = PreTrainedTokenizerFast(tokenizer_file=os.path.join(args.snapshot, "tokenizer.json"))
+    bos = [tc["bos_token_id"]] if tc.get("bos_token_id") is not None else []
     torch.set_grad_enabled(False)
-    for probe in probes:
-        name, ids = probe["name"], list(probe["ids"])
+    for probe in parity_ref.probes(args, lambda text: bos + tok.encode(text, add_special_tokens=False)):
         started = time.time()
-        tf = forward(w, tc, ids).cpu().numpy()
-        rows = [tf[-1].copy()]
-        seq = list(ids)
-        produced = []
-        last = int(rows[0].argmax())
-        for _ in range(args.steps):
-            produced.append(last)
-            seq.append(last)
-            row = forward(w, tc, seq)[-1].cpu().numpy()
-            rows.append(row)
-            last = int(row.argmax())
-        vocab = tf.shape[-1]
-        tf.astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.tf.f32"))
-        np.stack(rows).astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.gen.f32"))
-        json.dump({"ids": ids, "argmax": [int(a) for a in tf.argmax(-1)], "gen": produced, "vocab": vocab},
-                  open(os.path.join(args.out, f"{name}.{args.tag}.json"), "w"))
-        print(f"  {name}: {len(ids)} tokens, gen={produced[:12]}  ({time.time() - started:.1f}s)", flush=True)
+        tf, rows, gen = parity_ref.greedy(lambda ids: forward(w, tc, ids).cpu().numpy(), probe["ids"], args.steps)
+        parity_ref.dump(args, probe["name"], probe["ids"], tf, rows, gen, started)
 
 
 if __name__ == "__main__":
