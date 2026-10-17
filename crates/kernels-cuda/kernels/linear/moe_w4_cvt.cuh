@@ -68,6 +68,28 @@ __device__ __forceinline__ unsigned f16_of_bf16(unsigned x) {
     return d;
 }
 
+/// `at` in cluster rank `rank`'s shared memory, read.
+__device__ __forceinline__ float ld_rank(const float* at, unsigned rank) {
+    unsigned remote;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+                 : "=r"(remote)
+                 : "r"(static_cast<unsigned>(__cvta_generic_to_shared(at))), "r"(rank));
+    float v;
+    asm volatile("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(remote));
+    return v;
+}
+
+__device__ __forceinline__ void sync_ranks() {
+    asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::
+                     : "memory");
+}
+
+__device__ __forceinline__ unsigned rank_in_cluster() {
+    unsigned r;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
+    return r;
+}
+
 /// 16 bytes from `gmem` into `smem` by cp.async, or 16 zeros (nothing
 /// read) where `live` is false.
 __device__ __forceinline__ void cp16_or_zero(void* smem, const void* gmem, bool live) {
@@ -149,7 +171,13 @@ __device__ __forceinline__ void compute(const Codes<kTiles>& cc, const uint4* xs
 /// scales row-major, or with `scale_atoms` in tcgen05's atoms), grid and
 /// landing, and `kNb * kWin * 4 KiB` of dynamic shared memory (two
 /// windows of `kNb` 8-route blocks' f16 activations).
-template <int kNb, int kGlu, int kDepth, int kWin, int kMinBlocks>
+///
+/// With `kKSplit` above 1 a work item's K splits across a cluster of that
+/// many CTAs along x (rank r its r-th share of the chunks), and rank 0 sums
+/// the others' through the cluster's shared memory before it lands the
+/// rows: more CTAs streaming the bank where a decode's few routes leave
+/// most SMs idle.
+template <int kNb, int kGlu, int kDepth, int kWin, int kMinBlocks, int kKSplit = 1>
 __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
@@ -186,8 +214,9 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
                 row[j] = f32_to_bf16(0.f);
         }
     }
-    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
-    const int item = work[blockIdx.x];
+    const int item_at = static_cast<int>(blockIdx.x) / kKSplit;
+    if (item_at >= offsets[num_experts + 1]) return;
+    const int item = work[item_at];
     const int expert = item >> 16;
     const int slice = item & 0xFFFF;
     const int begin = offsets[expert] + slice * kSlice;
@@ -205,12 +234,19 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
     // activations: the window barriers count it.
     const bool rows = row_base < span;
 
-    const int groups = k >> 5;
-    const int chunks = (groups + 3) >> 2;
+    const int g_all = k >> 5;
+    const int chunks_all = (g_all + 3) >> 2;
+    // This rank's share of the chunks, from chunk `cb` on.
+    const int rank = kKSplit > 1 ? static_cast<int>(w4cvt::rank_in_cluster()) : 0;
+    const int share = (chunks_all + kKSplit - 1) / kKSplit;
+    const int cb = min(rank * share, chunks_all);
+    const int chunks = min(chunks_all - cb, share);
+    // The code groups from the share's first chunk on.
+    const int groups = g_all - cb * 4;
     const int windows = (chunks + kWin - 1) / kWin;
     const long long row_bytes = k >> 1;
     const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * groups;
+    const u8* s_e = scales + static_cast<long long>(expert) * n * g_all;
     // A chunk's scales: the next 4 bytes of a row-major plane, or the next
     // 512-byte atom column of the tcgen05 layout (`scale_atoms`, the bank's
     // rows counted across its experts).
@@ -226,18 +262,21 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
             wrow[t][h] = w_e + r * row_bytes + c * 16;
             if (scale_atoms != 0) {
                 const long long at = static_cast<long long>(expert) * n + r;
-                srow[t][h] = scales + (at / 128) * ((groups + 3) / 4) * 512 + (at % 32) * 16
+                srow[t][h] = scales + (at / 128) * ((g_all + 3) / 4) * 512 + (at % 32) * 16
                     + ((at / 32) % 4) * 4 + c;
             } else {
-                srow[t][h] = s_e + static_cast<long long>(r) * groups + c;
+                srow[t][h] = s_e + static_cast<long long>(r) * g_all + c;
             }
+            // From this rank's first chunk on.
+            wrow[t][h] += cb * 64;
+            srow[t][h] += cb * s_step;
         }
     const bf16* xrow[kNb];
 #pragma unroll
     for (int b = 0; b < kNb; ++b) {
         const int tok = 8 * b + g;
         xrow[b] = tok < count
-            ? act + static_cast<long long>(order[begin + tok] / act_div) * k + c * 32
+            ? act + static_cast<long long>(order[begin + tok] / act_div) * k + c * 32 + cb * 128
             : nullptr;
     }
 
@@ -355,7 +394,6 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
         }
     }
     w4cvt::wait<0>();
-    if (!rows) return;
 
     // An activation past f16's range turns the sums non-finite: the warp
     // walks K again on the bf16 path alone.
@@ -379,6 +417,38 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
             fallback(ch, cc, acc);
         }
     }
+
+    // A split K's shares: each rank's sums in its shared memory (the
+    // windows', all read), rank 0 adding the others' and landing the rows,
+    // the others held until it has read them.
+    if constexpr (kKSplit > 1) {
+        __syncthreads();
+        constexpr int kPer = kTiles * kNb * 4;
+        float* red = reinterpret_cast<float*>(w4cvt_xs) + warp * kPer * 32;
+        if (rows) {
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int b = 0; b < kNb; ++b)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) red[((t * kNb + b) * 4 + e) * 32 + lane] = acc[t][b][e];
+        }
+        w4cvt::sync_ranks();
+        if (rank == 0 && rows) {
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int b = 0; b < kNb; ++b)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+#pragma unroll
+                        for (unsigned q = 1; q < kKSplit; ++q)
+                            acc[t][b][e] += w4cvt::ld_rank(red + ((t * kNb + b) * 4 + e) * 32 + lane, q);
+        }
+        w4cvt::sync_ranks();
+        if (rank != 0) return;
+    }
+    if (!rows) return;
 
     const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
     if constexpr (kGlu != 0) {

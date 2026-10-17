@@ -113,6 +113,11 @@ moe.mxfp4_a8_until = 48
 # register-dequant select streams the six experts where the grouped tcgen05
 # GEMM lays them out first (decode bs1 13.66 -> 13.00 ms a token).
 moe.mxfp4_a8_from = 1
+# Up to 6 routes (DeepSeek-V4's one token) the e2m1-convert select splits K
+# across a cluster of two CTAs: 224 CTAs a fire leave the card idle, and the
+# select's gate-up 32.6 -> 27.1 us, down 21.7 -> 19.4 (at two tokens the
+# split loses).
+moe.mxfp4_cvt_ksplit_until = 6
 # DeepSeek-V4's grouped output projection (`wo_a`) at decode widths (up
 # to 8 rows) on fp8b128 as vLLM reads it: the bf16 plane the import
 # dequantized from the checkpoint's fp8 gains a twin requantized at load,

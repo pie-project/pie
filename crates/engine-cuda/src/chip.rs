@@ -448,6 +448,11 @@ mod tests {
                 );
                 assert_eq!(tuning.fp8_o_down, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
+                    tuning.mxfp4_cvt_ksplit_until,
+                    if major == 10 && minor == 0 { 6 } else { 0 },
+                    "{gpu}"
+                );
+                assert_eq!(
                     tuning.decode_xqa_from_64,
                     if b200 { 16 } else { 0 },
                     "{gpu}"
@@ -509,6 +514,7 @@ mod tests {
                         mxfp4_a8_until: 0,
                         mxfp4_a8_from: 0,
                         fp8_o_down: false,
+                        mxfp4_cvt_ksplit_until: 0,
                         ..tuning
                     },
                     defaults,
@@ -678,6 +684,7 @@ mod tests {
         assert_eq!(b200.mla_expanded_from, 256);
         assert_eq!(b200.gemm_fp8_gemv_until, 4);
         assert_eq!((b200.mxfp4_a8_from, b200.mxfp4_a8_until), (1, 48));
+        assert_eq!(b200.mxfp4_cvt_ksplit_until, 6);
         assert!(b200.attn_res_fused_norm);
     }
 

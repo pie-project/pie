@@ -194,6 +194,14 @@ pub struct MoeMxfp4MmaFrom(pub u32);
 #[decision(id = "kernel.moe.mxfp4_cvt", flag, default = false, tune = search)]
 pub struct MoeMxfp4Cvt;
 
+/// The most routes an e2m1-convert select (`kernel.moe.mxfp4_cvt`) splits
+/// each work item's K across a cluster of two CTAs for, their sums met in
+/// the cluster's shared memory: a fire that few leaves most SMs idle. 0:
+/// never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_cvt_ksplit_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMxfp4CvtKsplitUntil(pub u32);
+
 /// A grouped bf16 projection on routes that send each group to its own
 /// plane (DeepSeek-V4's `wo_a`, dequantized at import from the checkpoint's
 /// fp8b128) requantized at load to fp8b128, each value exactly the
@@ -575,6 +583,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
         .add::<MoeMxfp4Cvt>()
+        .add::<MoeMxfp4CvtKsplitUntil>()
         .add::<GemmFp8ODown>()
         .add::<MoeMxfp4A8Until>()
         .add::<MoeMxfp4A8From>()
@@ -658,6 +667,7 @@ pub struct Tuning {
     pub mxfp4_mma_until: u32,
     pub mxfp4_mma_from: u32,
     pub mxfp4_cvt: bool,
+    pub mxfp4_cvt_ksplit_until: u32,
     pub fp8_o_down: bool,
     pub mxfp4_a8_until: u32,
     pub mxfp4_a8_from: u32,
@@ -739,6 +749,7 @@ impl Tuning {
         mxfp4_mma_until: 0,
         mxfp4_mma_from: 64,
         mxfp4_cvt: false,
+        mxfp4_cvt_ksplit_until: 0,
         fp8_o_down: false,
         mxfp4_a8_until: 0,
         mxfp4_a8_from: 0,
@@ -820,6 +831,7 @@ impl Tuning {
             mxfp4_mma_until: profile.get::<MoeMxfp4MmaUntil>().0,
             mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,
             mxfp4_cvt: profile.on::<MoeMxfp4Cvt>(&Anywhere),
+            mxfp4_cvt_ksplit_until: profile.get::<MoeMxfp4CvtKsplitUntil>().0,
             fp8_o_down: profile.on::<GemmFp8ODown>(&Anywhere),
             mxfp4_a8_until: profile.get::<MoeMxfp4A8Until>().0,
             mxfp4_a8_from: profile.get::<MoeMxfp4A8From>().0,

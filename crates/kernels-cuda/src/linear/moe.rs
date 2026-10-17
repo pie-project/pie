@@ -2042,7 +2042,17 @@ fn select_mxfp4_mma(
             Share::Take
         },
     )?;
-    let grid = [work_cap, y.width.div_ceil(cols), 1];
+    // A fire of a few routes leaves most SMs idle: K splits across a
+    // cluster of two CTAs (`kernel.moe.mxfp4_cvt_ksplit_until`), each
+    // streaming half the bank's rows' codes. DeepSeek-V4-Flash's W4A8 select
+    // at one token (6 routes): gate-up 32.6 -> 27.1 us, down 21.7 -> 19.4;
+    // at two tokens and up the split loses.
+    let ksplit = if cvt && fan.route_count <= ctx.tuning().mxfp4_cvt_ksplit_until {
+        2
+    } else {
+        1
+    };
+    let grid = [work_cap * ksplit, y.width.div_ceil(cols), 1];
     // The e2m1 converts exist on the arch-specific Blackwells alone, the
     // ones that run tcgen05. Two chunks in flight a warp and a window of 8
     // chunks of one 8-route block (32 KiB for the two): four CTAs an SM at
@@ -2060,10 +2070,15 @@ fn select_mxfp4_mma(
         Fire::at(
             "linear/moe_w4_cvt.cuh",
             symbol(&format!(
-                "::pie::linear::moe_select_mxfp4_cvt<{nb}, {code}, {DEPTH}, {win}, {blocks}>"
+                "::pie::linear::moe_select_mxfp4_cvt<{nb}, {code}, {DEPTH}, {win}, {blocks}, \
+                 {ksplit}>"
             )),
         )
-        .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(nb * win * 4096))
+        .apply(
+            Launch::grid(grid, [THREADS, 1, 1])
+                .smem(nb * win * 4096)
+                .cluster(ksplit),
+        )
     } else {
         Fire::at(
             "linear/moe_w4.cuh",
