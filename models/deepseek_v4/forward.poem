@@ -95,7 +95,9 @@ def caches(m, c):
             return [MX8_ROW]
         return [at.kv_down.shape[0]]
 
-    kv = c.kv_space(rows)
+    # The window's plane is read only through its window: a windowed space,
+    # so a sequence keeps just its last `m.window` positions of it.
+    kv = c.kv_space(rows, m.window)
     for w in m.layers:
         at = w.attn
         c.kv(kv, at.kv, row(at), m.head_dim, heads = at.kv_down.cut_axis != None)

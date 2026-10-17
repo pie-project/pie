@@ -599,16 +599,27 @@ impl Pools {
         }
         let mut pooled = Vec::new();
         for (space, width) in pooled_spaces(trace) {
-            let cells = paging.pages() * u64::from(paging.page_size);
-            let bytes = cells * width * u64::from(elem_size(POOL_STATE));
+            // A slab keyed by a windowed space's pages is as long as its
+            // windowed pool.
+            let windowed = paging.window.is_some()
+                && shapes.iter().any(|shape| {
+                    matches!(shape, Shape::Kv { space: at, windowed: true, .. } if *at == space)
+                });
+            let row = PoolRow {
+                space,
+                width,
+                windowed,
+                planes: Vec::new(),
+            };
+            let bytes = row.watermark_bytes(
+                narrow_pages(paging.pages()),
+                narrow_pages(paging.window_pages()),
+                paging.page_size,
+            );
             let planes = (0..2)
                 .map(|_| Arena::reserve(&pool, bytes, "bytes of a compressor state slab"))
                 .collect::<Result<Vec<Arena>>>()?;
-            pooled.push(PoolRow {
-                space,
-                width,
-                planes,
-            });
+            pooled.push(PoolRow { planes, ..row });
         }
         Ok(Pools {
             pool,
@@ -654,10 +665,15 @@ impl Pools {
 
     #[must_use]
     pub fn pool_slabs(&self) -> Vec<(u32, PoolSlabs)> {
-        let cells = self.paging.pages() * u64::from(self.paging.page_size);
         self.pooled
             .iter()
             .map(|row| {
+                let pages = if row.windowed {
+                    self.paging.window_pages()
+                } else {
+                    self.paging.pages()
+                };
+                let cells = pages * u64::from(self.paging.page_size);
                 let plane = |at: usize| {
                     Tensor::new(
                         row.planes.get(at).map_or(0, elastic::Arena::base),
@@ -734,7 +750,7 @@ impl Pools {
             .pooled
             .iter()
             .map(|row| {
-                let bytes = row.watermark_bytes(pages, page_size);
+                let bytes = row.watermark_bytes(pages, windowed, page_size);
                 row.planes
                     .iter()
                     .map(|arena| mapped(bytes, arena))
@@ -785,7 +801,7 @@ impl Pools {
             }
         }
         for row in &mut self.pooled {
-            let bytes = row.watermark_bytes(narrow, page_size);
+            let bytes = row.watermark_bytes(narrow, windowed, page_size);
             for arena in &mut row.planes {
                 fresh(arena)?;
                 *arena = Arena::reserve(&self.pool, bytes, "bytes of a compressor state slab")?;
@@ -1269,11 +1285,29 @@ impl Pools {
     /// indexed by the same pages. Windowed rows name their own pages.
     fn paged_planes(&self) -> Vec<(&Arena, u64)> {
         let mut planes = self.kv_planes(false);
+        planes.extend(self.pooled_planes(false));
+        planes
+    }
+
+    /// The compressor slabs keyed by a windowed space's pages (or not), and
+    /// the bytes a page holds in each.
+    fn pooled_planes(&self, windowed: bool) -> Vec<(&Arena, u64)> {
         let page_size = u64::from(self.paging.page_size);
-        for row in &self.pooled {
-            let bytes = page_size * row.width * u64::from(elem_size(POOL_STATE));
-            planes.extend(row.planes.iter().map(|arena| (arena, bytes)));
-        }
+        self.pooled
+            .iter()
+            .filter(|row| row.windowed == windowed)
+            .flat_map(|row| {
+                let bytes = page_size * row.width * u64::from(elem_size(POOL_STATE));
+                row.planes.iter().map(move |arena| (arena, bytes))
+            })
+            .collect()
+    }
+
+    /// The windowed planes a windowed page spans: the windowed kv rows' and
+    /// the compressor slabs their pages key.
+    fn windowed_planes(&self) -> Vec<(&Arena, u64)> {
+        let mut planes = self.kv_planes(true);
+        planes.extend(self.pooled_planes(true));
         planes
     }
 
@@ -1307,7 +1341,7 @@ impl Pools {
     /// The bytes one windowed kv page holds over every windowed plane.
     #[must_use]
     pub fn window_page_bytes(&self) -> u64 {
-        self.kv_planes(true).iter().map(|&(_, bytes)| bytes).sum()
+        self.windowed_planes().iter().map(|&(_, bytes)| bytes).sum()
     }
 
     /// The bytes one kv page holds over every paged plane.
@@ -1506,7 +1540,7 @@ impl Pools {
         let mut base = 0u64;
         let spaces = [
             (self.paged_planes(), &paged[..], have[0]),
-            (self.kv_planes(true), windowed, have[1]),
+            (self.windowed_planes(), windowed, have[1]),
         ];
         for (planes, pairs, have) in spaces {
             let mut runs: Vec<(u32, u32, u32)> = Vec::new();
@@ -1695,7 +1729,8 @@ impl Pools {
             }
         }
         for row in pooled.iter_mut() {
-            let bytes = row.watermark_bytes(kv_pages, page_size);
+            // A windowed space's slabs are backed whole, as its pool is.
+            let bytes = row.watermark_bytes(kv_pages, windowed, page_size);
             for arena in row.planes.iter_mut() {
                 targets.push(elastic::Target {
                     arena,
@@ -1728,7 +1763,7 @@ impl Pools {
             }
         }
         for row in pooled.iter_mut() {
-            let bytes = row.watermark_bytes(kv_pages, page_size);
+            let bytes = row.watermark_bytes(kv_pages, windowed, page_size);
             for arena in row.planes.iter_mut() {
                 arena.release_tail(pool, bytes);
             }
@@ -1745,12 +1780,19 @@ const POOL_STATE: Dtype = Dtype::Bf16;
 struct PoolRow {
     space: u32,
     width: u64,
+    /// Keyed by a windowed space's pages: as long as its windowed pool.
+    windowed: bool,
     planes: Vec<Arena>,
 }
 
 impl PoolRow {
-    fn watermark_bytes(&self, kv_pages: u32, page_size: u32) -> u64 {
-        u64::from(kv_pages) * u64::from(page_size) * self.width * u64::from(elem_size(POOL_STATE))
+    fn watermark_bytes(&self, kv_pages: u32, window_pages: u32, page_size: u32) -> u64 {
+        let pages = if self.windowed {
+            window_pages
+        } else {
+            kv_pages
+        };
+        u64::from(pages) * u64::from(page_size) * self.width * u64::from(elem_size(POOL_STATE))
     }
 }
 
