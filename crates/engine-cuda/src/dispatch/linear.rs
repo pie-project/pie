@@ -95,10 +95,6 @@ impl Run<'_> {
                 packed,
                 y,
             } => {
-                #[cfg(feature = "cuda")]
-                if self.dense_glu(*act, *w, *y, linear::tc5::Glu::Swiglu)? {
-                    return Ok(());
-                }
                 self.linear(&Linear::Matmul {
                     act: *act,
                     w: *w,
@@ -117,10 +113,6 @@ impl Run<'_> {
                 packed,
                 y,
             } => {
-                #[cfg(feature = "cuda")]
-                if self.dense_glu(*act, *w, *y, linear::tc5::Glu::GegluTanh)? {
-                    return Ok(());
-                }
                 // The skinny leg reads the weight as one dense handle; a split-plane
                 // bank resolves only through the matmul below.
                 if self.dense_weight(*w) {
@@ -942,66 +934,6 @@ impl Run<'_> {
                 &mut self.tensor(*y),
             ),
         }
-    }
-
-    /// A dense bf16 gate-up projection and its GLU as one tcgen05 GEMM, the
-    /// GLU in its epilogue, from `kernel.gemm.tc5_glu_from` rows on; `false`
-    /// leaves the projection and the GLU to run apart.
-    #[cfg(feature = "cuda")]
-    fn dense_glu(
-        &mut self,
-        act: ValueId,
-        w: ValueId,
-        y: ValueId,
-        glu: linear::tc5::Glu,
-    ) -> Result<bool, kernels_cuda::Error> {
-        use linear::tc5;
-        let a = self.tensor(act);
-        let out = self.tensor(y);
-        if a.dtype != Dtype::Bf16
-            || !self.dense_weight(w)
-            || a.rows < self.ctx().tuning().gemm_tc5_glu_from
-            || !tc5::supported()
-        {
-            return Ok(false);
-        }
-        let weight = self.tensor(w);
-        let (k, inter) = (a.width, out.width);
-        if weight.dtype != Dtype::Bf16
-            || weight.rows != 2 * inter
-            || weight.width != k
-            || !k.is_multiple_of(64)
-            || !inter.is_multiple_of(8)
-        {
-            return Ok(false);
-        }
-        // Every row the padded extent holds, as the GEMM it stands for.
-        let m = u32::try_from(
-            self.ctx()
-                .opaque_rows(i32::try_from(a.rows).unwrap_or(i32::MAX)),
-        )
-        .unwrap_or(a.rows);
-        // Too few 128-row GLU tiles to reach a quarter of the SMs (a narrow shared
-        // expert at decode) run slower fused than the GEMM and the GLU apart.
-        let sms = self.ctx().multiprocessors().unwrap_or(148);
-        if inter.div_ceil(128) * m.div_ceil(128) < sms / 4 {
-            return Ok(false);
-        }
-        // A tcgen05 launch that fails leaves the projection and the GLU to
-        // run apart.
-        Ok(tc5::gemm_epi(
-            self.ctx(),
-            tc5::Operand::plain(a.ptr, tc5::Elem::Bf16),
-            tc5::Operand::plain(weight.ptr, tc5::Elem::Bf16),
-            out.ptr,
-            [m, inter, k],
-            1.0,
-            tc5::Epilogue {
-                glu: Some(glu),
-                ..tc5::Epilogue::STORE
-            },
-        )
-        .is_ok())
     }
 
     /// A gate-up select and its GLU as one grouped tcgen05 GEMM, the GLU in

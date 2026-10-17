@@ -506,18 +506,7 @@ __device__ __forceinline__ bool route_live(int r, int top, const u32* __restrict
     return t >= 0 && t < static_cast<int>(win[0]);
 }
 
-__global__ void route_count(
-    const i32* __restrict__ routes,
-    int count,
-    int top,
-    const u32* __restrict__ win,
-    i32* __restrict__ counts)
-{
-    const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r < count && routes[r] >= 0 && route_live(r, top, win)) atomicAdd(&counts[routes[r]], 1);
-}
-
-// `route_count` and `route_place` a block of routes at a time: the block
+// Routes counted and placed a block at a time: the block
 // tallies its routes' experts in shared memory and adds each expert's tally
 // to the global count (or takes its rows from the cursor) once, not once a
 // route. A route's row within its expert is its rank in the block's tally
@@ -584,25 +573,7 @@ __global__ void route_place_tally(
     }
 }
 
-__global__ void route_offsets(
-    const i32* __restrict__ counts,
-    int experts,
-    int m_max,
-    int align,
-    i32* __restrict__ offsets,
-    i32* __restrict__ cursor)
-{
-    if (threadIdx.x != 0) return;
-    int at = 0;
-    for (int e = 0; e < experts; ++e) {
-        offsets[e] = at;
-        cursor[e] = at;
-        at += m_max > 0 ? m_max : (counts[e] + align - 1) / align * align;
-    }
-    offsets[experts] = at;
-}
-
-// `route_offsets` across a block: each thread sums a run of consecutive
+// The experts' starts across a block: each thread sums a run of consecutive
 // experts' rows, the block scans the runs, and each thread writes its run's
 // starts. The same integers, without one thread walking every expert.
 constexpr int kOffsetThreads = 1024;
@@ -727,19 +698,6 @@ __global__ void __launch_bounds__(kOffsetThreads) route_offsets_scan(
         at += rows(e);
     }
     if (tid == kOffsetThreads - 1) offsets[experts] = run_sum[tid];
-}
-
-__global__ void route_place(
-    const i32* __restrict__ routes,
-    int count,
-    int top,
-    const u32* __restrict__ win,
-    i32* __restrict__ cursor,
-    i32* __restrict__ pos)
-{
-    const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= count) return;
-    pos[r] = routes[r] >= 0 && route_live(r, top, win) ? atomicAdd(&cursor[routes[r]], 1) : -1;
 }
 
 // `y[r] = grouped[pos[r]]`, a dropped route zeros, a route past the live

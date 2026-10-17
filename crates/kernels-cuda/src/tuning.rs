@@ -48,14 +48,6 @@ pub struct MoeMxfp4MmaUntil(pub u32);
 #[decision(id = "kernel.gemm.nvfp4_k128", flag, default = false, tune = search)]
 pub struct GemmNvfp4K128;
 
-/// Whether a softmax router of up to 512 experts and 16 picks ranks a row
-/// a warp (the same routes and weights to the bit) instead of a 64-thread
-/// block with a barrier a pick. Off but where a chip's profile turns it on
-/// (B200's).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.topk_warp", flag, default = false, tune = search)]
-pub struct MoeTopkWarp;
-
 /// The routes a routed NVFP4 select of bf16 activations (W4A16) runs on the
 /// register-dequant MMA kernel from and up to (each expert's rows
 /// dequantized in registers on mma.sync); never (until 0) but where a
@@ -235,13 +227,6 @@ pub struct MoeMxfp4A8Until(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.mxfp4_a8_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4A8From(pub u32);
-
-/// The fewest rows a dense gate-up projection lands its GLU from the
-/// tcgen05 GEMM's epilogue at; fewer keep the skinny kernel or the GEMM and
-/// the GLU apart. 65536 (never) but where a chip's profile says (B200's).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gemm.tc5_glu_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
-pub struct GemmTc5GluFrom(pub u32);
 
 /// The fewest rows a projection cut into two row halves (Qwen3.5's qkv|z)
 /// lands as two GEMMs off the weight's two slices, where
@@ -636,7 +621,6 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeAffineGroupedFrom>()
         .add::<MoeTc5>()
         .add::<MoeTc5From>()
-        .add::<GemmTc5GluFrom>()
         .add::<GemmSplitRowsFrom>()
         .add::<QgPrologueUntil>()
         .add::<Dsv4DecodeUntil>()
@@ -673,7 +657,6 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmTc5SplitTickets>()
         .add::<MoeNvfp4MmaUntil>()
         .add::<MoeNvfp4MmaFrom>()
-        .add::<MoeTopkWarp>()
         .add::<PrefillTc5>()
         .add::<PrefillWideSliding>()
         .add::<DecodeGroupedPrefillFrom>()
@@ -728,7 +711,6 @@ pub struct Tuning {
     pub affine_grouped_from: u32,
     pub moe_tc5: bool,
     pub moe_tc5_from: u32,
-    pub gemm_tc5_glu_from: u32,
     pub gemm_split_rows_from: u32,
     pub qg_prologue_until: u32,
     pub dsv4_decode_until: u32,
@@ -765,7 +747,6 @@ pub struct Tuning {
     pub gemm_tc5_split_tickets: u32,
     pub nvfp4_mma_from: u32,
     pub nvfp4_mma_until: u32,
-    pub moe_topk_warp: bool,
     pub prefill_tc5: bool,
     pub prefill_wide_sliding: bool,
     pub decode_grouped_prefill_from: u32,
@@ -818,7 +799,6 @@ impl Tuning {
         affine_grouped_from: 16,
         moe_tc5: false,
         moe_tc5_from: 16,
-        gemm_tc5_glu_from: 65_536,
         gemm_split_rows_from: 256,
         qg_prologue_until: 0,
         dsv4_decode_until: 0,
@@ -855,7 +835,6 @@ impl Tuning {
         gemm_tc5_split_tickets: 0,
         nvfp4_mma_from: 1,
         nvfp4_mma_until: 0,
-        moe_topk_warp: false,
         prefill_tc5: false,
         prefill_wide_sliding: false,
         decode_grouped_prefill_from: 0,
@@ -908,7 +887,6 @@ impl Tuning {
             affine_grouped_from: profile.get::<MoeAffineGroupedFrom>().0,
             moe_tc5: profile.on::<MoeTc5>(&Anywhere),
             moe_tc5_from: profile.get::<MoeTc5From>().0,
-            gemm_tc5_glu_from: profile.get::<GemmTc5GluFrom>().0,
             gemm_split_rows_from: profile.get::<GemmSplitRowsFrom>().0,
             qg_prologue_until: profile.get::<QgPrologueUntil>().0,
             dsv4_decode_until: profile.get::<Dsv4DecodeUntil>().0,
@@ -945,7 +923,6 @@ impl Tuning {
             gemm_tc5_split_tickets: profile.get::<GemmTc5SplitTickets>().0,
             nvfp4_mma_from: profile.get::<MoeNvfp4MmaFrom>().0,
             nvfp4_mma_until: profile.get::<MoeNvfp4MmaUntil>().0,
-            moe_topk_warp: profile.on::<MoeTopkWarp>(&Anywhere),
             prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),
             prefill_wide_sliding: profile.on::<PrefillWideSliding>(&Anywhere),
             decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,

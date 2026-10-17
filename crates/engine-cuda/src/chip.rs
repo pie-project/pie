@@ -466,7 +466,6 @@ mod tests {
                         gemv_narrow: false,
                         mla_naive: false,
                         moe_tc5: defaults.moe_tc5,
-                        gemm_tc5_glu_from: defaults.gemm_tc5_glu_from,
                         ssm_gdn_fused_scan: false,
                         ssm_gdn_tc5: false,
                         rows_vec: false,
@@ -498,7 +497,6 @@ mod tests {
                         gemm_tc5_split_tickets: 0,
                         nvfp4_mma_from: defaults.nvfp4_mma_from,
                         nvfp4_mma_until: defaults.nvfp4_mma_until,
-                        moe_topk_warp: false,
                         decode_grouped_prefill_lse: false,
                         decode_xqa: false,
                         decode_xqa_from_64: 0,
@@ -676,10 +674,7 @@ mod tests {
     fn the_b200_moe_decisions_are_what_the_kernel_tests_run() {
         let b200 =
             kernels_cuda::tuning::Tuning::of(&resolve("NVIDIA B200", &facts(10, 0, 148), None).0);
-        assert_eq!(
-            (b200.moe_tc5, b200.moe_tc5_from, b200.gemm_tc5_glu_from),
-            (true, 16, 65_536)
-        );
+        assert_eq!((b200.moe_tc5, b200.moe_tc5_from), (true, 16));
         assert_eq!(
             (b200.mxfp4_mma_from, b200.mxfp4_mma_until, b200.mxfp4_cvt),
             (28, 1024, true)
@@ -703,9 +698,6 @@ mod tests {
         };
         let b200 = tuning(10, 0, 148);
         assert!(b200.moe_tc5);
-        // A prefill's GLU too stays apart from cuBLAS's gate-up on B200: at
-        // the power cap its GEMM does more work a watt than the epilogue's.
-        assert_eq!(b200.gemm_tc5_glu_from, 65_536);
         assert_eq!((b200.mxfp4_mma_from, b200.mxfp4_mma_until), (28, 1024));
         assert!(b200.merge_warp);
         assert!(b200.pdl);
@@ -727,10 +719,6 @@ mod tests {
             assert!(
                 !other.merge_warp,
                 "sm_{major}{minor} keeps the staged merge"
-            );
-            assert_eq!(
-                other.gemm_tc5_glu_from, 65_536,
-                "sm_{major}{minor} keeps the GLU apart"
             );
             assert_eq!(
                 other.mxfp4_mma_until, 0,
@@ -759,10 +747,6 @@ mod tests {
             assert!(
                 !other.pdl,
                 "sm_{major}{minor} launches no kernel as a programmatic dependent"
-            );
-            assert!(
-                !other.moe_topk_warp,
-                "sm_{major}{minor} ranks its router a block a row"
             );
             assert_eq!(
                 other.moe_w4a4_fused_from, 65_536,

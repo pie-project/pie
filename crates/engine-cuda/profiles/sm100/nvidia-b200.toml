@@ -31,7 +31,6 @@ measured = [
   "kernel.gemm.heuristics",
   "kernel.gemm.narrow_n",
   "kernel.gemm.skinny_rows",
-  "kernel.gemm.tc5_glu_from",
   "kernel.gemm.workspace_mb",
   "kernel.gemv.bf16",
   "kernel.gemv.splitk_max_n",

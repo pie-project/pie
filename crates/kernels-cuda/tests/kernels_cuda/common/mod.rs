@@ -294,11 +294,10 @@ impl Lcg {
 
 pub const TOLERANCE: f32 = 3.0e-2;
 
-/// The registry's tuning with the tcgen05 selects and GLU epilogues on, as
+/// The registry's tuning with the tcgen05 selects on, as
 /// B200's profile has them.
 pub const TC5: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {
     moe_tc5: true,
-    gemm_tc5_glu_from: 64,
     ..kernels_cuda::tuning::Tuning::DEFAULT
 };
 
@@ -310,7 +309,6 @@ pub const TC5: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {
 pub const SM100: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {
     moe_tc5: true,
     moe_tc5_from: 16,
-    gemm_tc5_glu_from: 65_536,
     mxfp4_mma_from: 28,
     mxfp4_mma_until: 1024,
     mxfp4_cvt: true,
