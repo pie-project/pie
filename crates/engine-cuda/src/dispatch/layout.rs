@@ -61,6 +61,21 @@ impl Run<'_> {
             Layout::EmbedConcat {
                 ids,
                 table,
+                scales: Some(scales),
+                vocab,
+                y,
+            } => kernels_cuda::layout_embed_e4m3::embed_concat_mxfp8(
+                self.ctx(),
+                self.tensor(*ids),
+                self.tensor(*table),
+                self.tensor(*scales),
+                *vocab,
+                &mut self.tensor(*y),
+            ),
+            Layout::EmbedConcat {
+                ids,
+                table,
+                scales: None,
                 vocab,
                 y,
             } => match self.maybe_planes(*table) {

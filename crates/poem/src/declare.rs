@@ -339,11 +339,12 @@ impl Weight {
             ],
             // Its codes and its block exponents are planes of their own, raw
             // e4m3 and e8m0, which a W8A8 product reads beside each other.
-            Dtype::Fp8b128 | Dtype::Fp8b32 => {
-                let b = u64::from(self.dtype.fp8_block().unwrap_or(128));
+            Dtype::Fp8b128 | Dtype::Fp8b32 | Dtype::Mxfp8 => {
+                let (br, bc) = self.dtype.fp8_blocks().unwrap_or((128, 128));
+                let (br, bc) = (u64::from(br), u64::from(bc));
                 let [n, k] = self.shape[..] else {
                     panic!(
-                        "`{}` is a block-fp8 weight declared {:?}; its {b}x{b} blocks \
+                        "`{}` is a block-fp8 weight declared {:?}; its {br}x{bc} blocks \
                          scale a two-dimensional projection",
                         self.name, self.shape,
                     )
@@ -356,7 +357,7 @@ impl Weight {
                     },
                     BankPlane {
                         suffix: SCALES,
-                        shape: vec![n.div_ceil(b), k.div_ceil(b)],
+                        shape: vec![n.div_ceil(br), k.div_ceil(bc)],
                         dtype: Dtype::E8m0,
                     },
                 ]
@@ -657,6 +658,7 @@ pub fn compute_dtype(dtype: Dtype) -> Option<Dtype> {
         | Dtype::E4m3tensor
         | Dtype::Fp8b128
         | Dtype::Fp8b32
+        | Dtype::Mxfp8
         | Dtype::Ptq1_0 => Some(Dtype::Bf16),
         Dtype::I64 => Some(Dtype::I64),
         Dtype::I32

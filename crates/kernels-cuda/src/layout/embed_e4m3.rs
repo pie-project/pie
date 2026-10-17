@@ -1,6 +1,7 @@
-//! A hashed table stored e4m3 under one f32 scale (`Dtype::E4m3tensor`),
-//! gathered and widened only at the rows its ids name, so the table stays
-//! at a byte a value on the device.
+//! A hashed table stored e4m3 under one f32 scale (`Dtype::E4m3tensor`) or
+//! one ue8m0 exponent a 32 of each row (`Dtype::Mxfp8`), gathered and
+//! widened only at the rows its ids name, so the table stays at a byte a
+//! value on the device.
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -74,6 +75,77 @@ pub fn embed_concat_e4m3(
             ids.arg(),
             codes.arg(),
             scale.arg(),
+            y.arg(),
+            stated(OP, rows)?.arg(),
+            stated(OP, heads)?.arg(),
+            stated(OP, width)?.arg(),
+            stated(OP, vocab)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// `y[r, h * width ..]` is `codes[ids[r, h]]` under its row's exponents:
+/// `codes` the `[vocab, width]` MXFP8 table's e4m3 codes, `exps` its
+/// `[vocab, width / 32]` ue8m0 exponents.
+pub fn embed_concat_mxfp8(
+    ctx: &Ctx,
+    ids: Tensor,
+    codes: Tensor,
+    exps: Tensor,
+    vocab: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "layout.embed_concat";
+    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 rows");
+    let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let heads = nonzero(OP, "the hashed head count", ids.width)?;
+    if y.width == 0 || !y.width.is_multiple_of(heads) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the {}-wide output is not a whole number of {heads} head slices",
+                y.width
+            ),
+        ));
+    }
+    let width = y.width / heads;
+    if !width.is_multiple_of(32) || codes.ptr % 16 != 0 {
+        return Err(refuse(
+            OP,
+            format!("an MXFP8 row is whole 32-wide blocks on 16-byte runs, not {width} wide"),
+        ));
+    }
+    let held = u64::from(codes.rows) * u64::from(codes.width);
+    let scales = u64::from(exps.rows) * u64::from(exps.width);
+    if held != u64::from(vocab) * u64::from(width) || scales != held / 32 {
+        return Err(refuse(
+            OP,
+            format!(
+                "{held} codes under {scales} exponents are not a [{vocab} x {width}] MXFP8 table"
+            ),
+        ));
+    }
+    debug_assert_eq!(y.rows, ids.rows, "one output row per id row");
+    let rows = nonzero(OP, "rows", ids.rows)?;
+    let total = u64::from(rows) * u64::from(heads) * u64::from(width / 16);
+    let lanes = u32::try_from(total).map_err(|_| {
+        refuse(
+            OP,
+            format!("{total} runs do not fit a 32-bit launch extent"),
+        )
+    })?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::layout::embed_concat_mxfp8_vec16<{t}>")),
+        )
+        .apply(Launch::flat(lanes, BLOCK)),
+        &[
+            ids.arg(),
+            codes.arg(),
+            exps.arg(),
             y.arg(),
             stated(OP, rows)?.arg(),
             stated(OP, heads)?.arg(),

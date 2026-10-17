@@ -36,8 +36,14 @@ impl Run<'_> {
             },
 
             Layout::EmbedConcat {
+                scales: Some(_), ..
+            } => Err(kernels_wgpu::Error::Unsupported {
+                op: "layout.embed_concat(mxfp8)",
+            }),
+            Layout::EmbedConcat {
                 ids,
                 table,
+                scales: None,
                 vocab,
                 y,
             } => match self.banked(*table) {

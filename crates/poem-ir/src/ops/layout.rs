@@ -74,6 +74,9 @@ pub enum Layout {
     EmbedConcat {
         ids: ValueId,
         table: ValueId,
+        /// An MXFP8 table's ue8m0 exponents, one a 32 of each row.
+        #[serde(default)]
+        scales: Option<ValueId>,
         vocab: u32,
         y: ValueId,
     },
@@ -172,7 +175,12 @@ impl Operands for Layout {
             Self::PoolRows { x, .. } => sink.push(*x),
             Self::MergeRows { x, .. } => sink.push(*x),
             Self::ScatterLiveRows { src, routes, y, .. } => sink.extend([*src, *routes, *y]),
-            Self::EmbedConcat { ids, table, .. } => sink.extend([*ids, *table]),
+            Self::EmbedConcat {
+                ids, table, scales, ..
+            } => {
+                sink.extend([*ids, *table]);
+                sink.extend(*scales);
+            }
             Self::Argmax { xs, .. } => sink.extend(xs.iter().copied()),
             Self::TopK { x, .. } => sink.push(*x),
             Self::PackRows { x, perm, .. } => sink.extend([*x, *perm]),

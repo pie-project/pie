@@ -357,7 +357,7 @@ fn claim(w: &Weight, tp: u32) -> Claim {
             "a {:?} weight is served but no load contract declares one",
             w.dtype
         ),
-        Dtype::Fp8b128 | Dtype::Fp8b32 => panic!(
+        Dtype::Fp8b128 | Dtype::Fp8b32 | Dtype::Mxfp8 => panic!(
             "`{}`: a block-fp8 weight is claimed plane by plane, its raw codes and \
              exponents each their own",
             w.name
@@ -642,7 +642,7 @@ fn planes(
     from: impl Into<String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let from = from.into();
-    if w.dtype.fp8_block().is_some() {
+    if w.dtype.fp8_blocks().is_some() {
         return fp8_block_planes(src, w, vec![from]);
     }
     if stored_raw(src, &from)? {
@@ -690,7 +690,7 @@ fn planes_fused(
     parts: impl IntoIterator<Item = String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let parts: Vec<String> = parts.into_iter().collect();
-    if w.dtype.fp8_block().is_some() {
+    if w.dtype.fp8_blocks().is_some() {
         return fp8_block_planes(src, w, parts);
     }
     if parts.iter().try_fold(true, |all, part| {
@@ -1259,11 +1259,11 @@ fn fp8_block_planes(
         name: w.name.clone(),
         detail,
     };
-    let b = i64::from(
-        w.dtype
-            .fp8_block()
-            .expect("only a block-fp8 weight reads its exponent planes"),
-    );
+    let (br, bc) = w
+        .dtype
+        .fp8_blocks()
+        .expect("only a block-fp8 weight reads its exponent planes");
+    let (br, bc) = (i64::from(br), i64::from(bc));
     if w.shape.len() != 2 {
         return Err(illegible(format!(
             "it is declared {:?}; a block-fp8 weight is one projection",
@@ -1298,19 +1298,19 @@ fn fp8_block_planes(
                 "`{part}` is stored {held:?}, not a matrix"
             )));
         };
-        if stored != Encoding::Raw(DType::E4m3) || (at + 1 < parts.len() && rows % b != 0) {
+        if stored != Encoding::Raw(DType::E4m3) || (at + 1 < parts.len() && rows % br != 0) {
             return Err(illegible(format!(
                 "`{part}` is stored {stored:?} {held:?}; a block-fp8 leg is e4m3, a whole \
-                 number of {b}-row blocks but the last"
+                 number of {br}-row blocks but the last"
             )));
         }
         let scale = format!("{stem}.scale");
-        let blocks = vec![(rows + b - 1) / b, (cols + b - 1) / b];
+        let blocks = vec![(rows + br - 1) / br, (cols + bc - 1) / bc];
         let stored = stored_encoding(src, &scale)?;
         if stored != Encoding::Raw(DType::E8m0) || shape_of(&scale) != blocks {
             return Err(illegible(format!(
                 "`{scale}` is stored {stored:?} {:?}; block-fp8 exponents are one e8m0 a \
-                 {b}x{b} block, {blocks:?}",
+                 {br}x{bc} block, {blocks:?}",
                 shape_of(&scale)
             )));
         }
@@ -1332,7 +1332,7 @@ fn fp8_block_planes(
         TensorContract::new(
             crate::scales_name(&w.name),
             joined(axis, scales),
-            vec![(n + b - 1) / b, (k + b - 1) / b],
+            vec![(n + br - 1) / br, (k + bc - 1) / bc],
             encoding(Dtype::E8m0),
         ),
     ])
@@ -2059,7 +2059,7 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             "a {:?} weight is served but no load contract declares one",
             dtype
         ),
-        Dtype::Fp8b128 | Dtype::Fp8b32 => panic!(
+        Dtype::Fp8b128 | Dtype::Fp8b32 | Dtype::Mxfp8 => panic!(
             "a block-fp8 weight is encoded plane by plane, its raw codes and exponents \
              each their own"
         ),

@@ -535,7 +535,9 @@ def flash41(w, r, kv, d, quant = None):
                 rows += p
             cols = (e.ngram - 1) * e.heads
             engram = struct(
-                table = weight(n("engram.embed"), [rows, e.head_dim], dense),
+                # The release's table as it ships (MXFP8) where the release's
+                # precision is served, widened only at the rows a token reads.
+                table = weight(n("engram.embed"), [rows, e.head_dim], dtype.mxfp8 if quant != None else dense),
                 wkv = weight(n("engram.wkv"), [(streams + 1) * hidden, cols * e.head_dim], q)
                     .packed([streams * hidden, hidden]),
                 q_weight = weight(n("engram.q_weight"), [streams, hidden], dense),

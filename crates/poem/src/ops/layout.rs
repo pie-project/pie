@@ -11,6 +11,7 @@ pub fn embed_concat(ids: &Value, table: &Weight, vocab: u32) -> Value {
         Layout::EmbedConcat {
             ids: ids.id(),
             table: r.weight(table),
+            scales: (table.dtype == Dtype::Mxfp8).then(|| r.weight_plane(table, poem_ir::SCALES)),
             vocab,
             y: y.id(),
         },
