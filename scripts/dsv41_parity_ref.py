@@ -14,13 +14,13 @@ does (the same scale rules, e2m1 rounding to nearest even, and the sparse
 attention's probabilities rounded to bf16 before they weigh the values).
 
     python3 scripts/dsv41_parity_ref.py <snapshot-dir> OUT [--steps 16] [--probes probes.json]
-        [--sim kv,o] [--tag ref]
+        [--sim kv,index,o] [--tag ref]
 
-`--sim` names the quant-dequant simulations to keep (default `kv,o`, all
-of them): `kv` the window KV's fp8 and the compressed KV's and indexer's
-FP4, `o` the attention output's fp8 before `wo_a`. `--sim none` reads the
-KV and `wo_a`'s input at bf16, the reference for a deployment whose cache
-is bf16.
+`--sim` names the quant-dequant simulations to keep (default `kv,index,o`,
+all of them): `kv` the window KV's fp8 and the compressed KV's FP4, `index`
+the indexer's FP4 keys and queries, `o` the attention output's fp8 before
+`wo_a`. `--sim none` reads the KV and `wo_a`'s input at bf16, the reference
+for a deployment whose cache is bf16.
 
 Writes, per probe NAME (`OUT/probes.json` when no file is stated):
 
@@ -172,7 +172,12 @@ def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20, ep
 def install_kernel(sim):
     k = types.ModuleType("kernel")
     k.act_quant = act_quant
-    k.fp4_act_quant = fp4_act_quant if "kv" in sim else (lambda x, *a, **kw: x)
+    def fp4_sim(x, block_size=32, inplace=False, scale_dtype=torch.float8_e8m0fnu):
+        # e4m3 scales a 16 are the compressed KV's; ue8m0 a 32 the indexer's.
+        which = "kv" if scale_dtype == torch.float8_e4m3fn else "index"
+        return fp4_act_quant(x, block_size, inplace, scale_dtype) if which in sim else x
+
+    k.fp4_act_quant = fp4_sim
     k.fp8_gemm = fp8_gemm
     k.fp4_gemm = fp4_gemm
     k.sparse_attn = sparse_attn
@@ -267,7 +272,7 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--steps", type=int, default=16)
     ap.add_argument("--probes", default=None)
-    ap.add_argument("--sim", default="kv,o")
+    ap.add_argument("--sim", default="kv,index,o")
     ap.add_argument("--act", default="fp8", choices=["fp8", "bf16"],
                     help="bf16: projections read their activations unquantized (the weights still "
                          "read out exactly), the reference for a deployment at bf16 activations")

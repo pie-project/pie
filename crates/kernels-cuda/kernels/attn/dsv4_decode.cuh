@@ -14,9 +14,11 @@
 // the two halves meet in shared memory and every warp keeps the same online
 // softmax over the whole tile. For O += P V warp w takes 64 columns.
 //
-// With `kFp8` the planes are DeepSeek's fp8 rows (`attn/dsv4_kv.cuh`): a
-// tile's bytes land in a staging ring and are widened to bf16 before the
-// products, as FlashMLA does on sm100.
+// With formats WF and PF (`attn/dsv4_kv.cuh`; 0 is bf16) the window's and
+// the pool's planes are DeepSeek's quantized rows: a tile's bytes land in a
+// staging ring and are widened to bf16 before the products, as FlashMLA
+// does on sm100. V4 keeps both planes in its fp8 rows; V4.1's FP4 cache its
+// window in MXFP8 rows and its compressed rows in NVFP4 ones.
 //
 // A cluster of R blocks (along x) splits a row's keys; the blocks fold their
 // running max, sum and output through distributed shared memory, each rank
@@ -43,8 +45,11 @@ constexpr int kKeys = 32;
 constexpr int kChunkTiles = 32;
 constexpr float kLog2e = 1.44269504088896340736f;
 
-template <int D, bool kFp8>
+template <int D, int WF, int PF>
 struct Shape {
+    static constexpr bool kFp8 = WF != 0;
+    static constexpr int kRawData = kFp8 ? (Rows<WF>::kData > Rows<PF>::kData ? Rows<WF>::kData : Rows<PF>::kData) : 0;
+    static constexpr int kRawScale = kFp8 ? (Rows<WF>::kScale > Rows<PF>::kScale ? Rows<WF>::kScale : Rows<PF>::kScale) : 0;
     static constexpr int kLd = D + 8;              // a bf16 row, padded
     static constexpr int kSLd = kKeys + 8;         // a partial score row, padded
     static constexpr int kOLd = D + 8;             // the fold's f32 row, padded
@@ -52,7 +57,7 @@ struct Shape {
     static constexpr int kStages = kFp8 ? 6 : 4;
     static constexpr int kQBytes = kGroup * kLd * 2;
     static constexpr int kTileBytes = kKeys * kLd * 2;
-    static constexpr int kRawBytes = kKeys * (kDsData + kDsScaleBytes);
+    static constexpr int kRawBytes = kKeys * (kRawData + kRawScale);
     // bf16: the ring is the tiles; fp8: the ring is raw bytes, widened into
     // one tile.
     static constexpr int kRingBytes = kFp8 ? kStages * kRawBytes + kTileBytes : kStages * kTileBytes;
@@ -141,7 +146,24 @@ __device__ __forceinline__ unsigned rank_in_cluster() {
 // otherwise the row's `top_k` ids, ended early by a negative one.
 // bf16 planes are `stride` elements a position; fp8 planes are DeepSeek's
 // 584-byte rows, page by page.
-template <int D, class SinkT, int R, bool kFp8>
+// Key `slot`'s raw bytes in format F into a ring key's data and scale
+// bytes: `part` of the key's kPer threads.
+template <int F, int kPer>
+__device__ __forceinline__ void stage_raw(std::uint8_t* plane, long long slot, int ps, int part,
+                                          std::uint8_t* data, std::uint8_t* sc) {
+    using T = Rows<F>;
+    const DsRow r = rows_at<F>(plane, slot / ps, static_cast<int>(slot % ps), ps);
+    for (int i = part; i < T::kData / 16; i += kPer) __pipeline_memcpy_async(data + i * 16, r.data + i * 16, 16);
+    if (part == 0) {
+        if constexpr (T::kScale % 16 == 0) {
+            for (int i = 0; i < T::kScale / 16; ++i) __pipeline_memcpy_async(sc + i * 16, r.scales + i * 16, 16);
+        } else {
+            __pipeline_memcpy_async(sc, r.scales, T::kScale);
+        }
+    }
+}
+
+template <int D, class SinkT, int R, int WF, int PF>
 __global__ __launch_bounds__(kThreads, 1) void decode(
     const bf16* __restrict__ q,
     const void* __restrict__ win_keys,
@@ -166,7 +188,9 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
     Turn turn,
     const u32* __restrict__ win)
 {
-    using S = Shape<D, kFp8>;
+    using S = Shape<D, WF, PF>;
+    constexpr bool kFp8 = S::kFp8;
+    static_assert((WF == 0) == (PF == 0), "both planes quantized, or neither");
     constexpr int kLd = S::kLd;
     constexpr int kSLd = S::kSLd;
     constexpr int kHalf = D / 2;
@@ -257,16 +281,17 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
         const bool win_key = n < n_win;
         if constexpr (kFp8) {
             std::uint8_t* raw = reinterpret_cast<std::uint8_t*>(sRing) + buf * S::kRawBytes;
-            std::uint8_t* data = raw + key * kDsData;
-            std::uint8_t* sc = raw + kKeys * kDsData + key * kDsScaleBytes;
+            std::uint8_t* data = raw + key * S::kRawData;
+            std::uint8_t* sc = raw + kKeys * S::kRawData + key * S::kRawScale;
             if (slot >= 0) {
                 const int ps = win_key ? win_page_size : pool_page_size;
                 std::uint8_t* plane = const_cast<std::uint8_t*>(
                     static_cast<const std::uint8_t*>(win_key ? win_keys : pool_keys));
-                const DsRow r = ds_row(plane, slot / ps, static_cast<int>(slot % ps), ps);
-                for (int i = part; i < kDsData / 16; i += kPerKey)
-                    __pipeline_memcpy_async(data + i * 16, r.data + i * 16, 16);
-                if (part == 0) __pipeline_memcpy_async(sc, r.scales, 8);
+                if (win_key) {
+                    stage_raw<WF, kPerKey>(plane, slot, ps, part, data, sc);
+                } else {
+                    stage_raw<PF, kPerKey>(plane, slot, ps, part, data, sc);
+                }
             }
         } else {
             bf16* dst = reinterpret_cast<bf16*>(sRing) + buf * kKeys * kLd + key * kLd;
@@ -334,8 +359,11 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
                 const int key = c / kChunks;
                 const int j = (c % kChunks) * 8;
                 uint4 v = make_uint4(0, 0, 0, 0);
-                if (tslot[key] >= 0)
-                    v = ds_load8(raw + key * kDsData, raw + kKeys * kDsData + key * kDsScaleBytes, j);
+                if (tslot[key] >= 0) {
+                    const std::uint8_t* kd = raw + key * S::kRawData;
+                    const std::uint8_t* ks = raw + kKeys * S::kRawData + key * S::kRawScale;
+                    v = t * kKeys + key < n_win ? rows_load8<WF>(kd, ks, j) : rows_load8<PF>(kd, ks, j);
+                }
                 *reinterpret_cast<uint4*>(sTile + key * kLd + j) = v;
             }
             __syncthreads();

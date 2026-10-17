@@ -574,11 +574,11 @@ impl Run<'_> {
         .map(|()| false)
     }
 
-    /// Whether `window`'s cache holds DeepSeek's fp8 rows.
+    /// Whether `window`'s cache holds DeepSeek's quantized rows.
     fn fp8_rows(&self, window: &poem_ir::Attention) -> bool {
         match *window {
             poem_ir::Attention::PrefillLse { cache, .. } => {
-                kernels_cuda::attn::dsv4::fp8_ds(&self.pool(cache))
+                kernels_cuda::attn::dsv4::ds_rows(&self.pool(cache))
             }
             _ => false,
         }
@@ -1301,6 +1301,16 @@ impl Run<'_> {
                 if fp8 {
                     return Ok(());
                 }
+                if kernels_cuda::attn::dsv4::ds_rows(&pool) {
+                    // V4.1's rows: the write quantizes them apart.
+                    return kernels_cuda::attn::dsv4::append(
+                        self.ctx(),
+                        self.ragged_lanes(*ky).data,
+                        &pool,
+                        self.tensor(*write_page),
+                        self.tensor(*write_offset),
+                    );
+                }
                 return kernels_cuda::attn::kv_append_shared(
                     self.ctx(),
                     self.ragged_lanes(*ky),
@@ -1383,7 +1393,7 @@ impl Run<'_> {
             yarn,
             &mut self.tensor(*y),
         )?;
-        if fp8 {
+        if kernels_cuda::attn::dsv4::ds_rows(&pool) {
             kernels_cuda::attn::dsv4::append(
                 self.ctx(),
                 self.ragged_lanes(*y).data,

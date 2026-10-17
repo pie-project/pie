@@ -6,12 +6,15 @@
 //! with ids past the visible ones and an early end), folded together with
 //! the sinks, against an f32 walk over the same rows; at row counts that
 //! split a row's keys over clusters of 8, 4, 2 and 1 blocks. The planes are
-//! bf16, or DeepSeek's fp8 rows as `attn::dsv4::append` writes them, read
-//! back against what the bytes say (and the bytes against the bf16 rows).
+//! bf16, or DeepSeek's quantized rows as `attn::dsv4::append` writes them
+//! (V4's fp8 rows, or V4.1's MXFP8 window and NVFP4 compressed rows), read
+//! back against what the bytes say (V4's bytes against the bf16 rows, and
+//! V4.1's bit for bit against its reference's quantizers).
 
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::dsv4;
+use kernels_cuda::attn::dsv4::Rows;
 use kernels_cuda::tensor::{KvPool, Tensor};
 
 const PAGE: usize = 64;
@@ -25,12 +28,11 @@ fn pool_of(
     cells: usize,
     pages: &[u32],
     indptr: &[u32],
-    fp8: bool,
+    fmt: Option<Rows>,
 ) -> KvPool {
-    let (width, dtype) = if fp8 {
-        (dsv4::DS_ROW, Dtype::U8)
-    } else {
-        (D as u32, Dtype::Bf16)
+    let (width, dtype) = match fmt {
+        Some(r) => (r.bytes(), Dtype::U8),
+        None => (D as u32, Dtype::Bf16),
     };
     KvPool {
         keys: Tensor::new(keys, cells as u32, width, dtype),
@@ -64,7 +66,8 @@ enum Pool {
     Selected(usize, usize),
 }
 
-fn check(rows: usize, pool: Pool, bench: bool, fp8: bool) {
+fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>) {
+    let fp8 = fmts.is_some();
     // Two requests of 2304 positions each, their pages interleaved; the
     // window and the compressed rows are two planes on the same tables.
     let span = 2304usize;
@@ -97,23 +100,41 @@ fn check(rows: usize, pool: Pool, bench: bool, fp8: bool) {
     let mut gpu = Gpu::open();
     let wkeys = gpu.up(&w_bits);
     let ekeys = gpu.up(&e_bits);
-    let window_bf16 = pool_of(&mut gpu, wkeys, cells, &pages, &indptr, false);
-    let entries_bf16 = pool_of(&mut gpu, ekeys, cells, &pages, &indptr, false);
-    let (window_pool, entries, wk, ek) = if fp8 {
+    let window_bf16 = pool_of(&mut gpu, wkeys, cells, &pages, &indptr, None);
+    let entries_bf16 = pool_of(&mut gpu, ekeys, cells, &pages, &indptr, None);
+    let (window_pool, entries, wk, ek) = if let Some((wf, pf)) = fmts {
         // Every cell written through the fp8 append, then read back.
         let at_page: Vec<u32> = (0..cells as u32).map(|c| c / PAGE as u32).collect();
         let at_off: Vec<u32> = (0..cells as u32).map(|c| c % PAGE as u32).collect();
         let at_page = Tensor::new(gpu.up(&at_page), cells as u32, 1, Dtype::U32);
         let at_off = Tensor::new(gpu.up(&at_off), cells as u32, 1, Dtype::U32);
-        let bytes = cells * dsv4::DS_ROW as usize;
         let mut planes = Vec::new();
-        for (src, exact) in [(wkeys, &wk), (ekeys, &ek)] {
+        for (src, exact, fmt) in [(wkeys, &wk, wf), (ekeys, &ek, pf)] {
+            let bytes = cells * fmt.bytes() as usize;
             let plane = gpu.zeros(bytes);
-            let pool = pool_of(&mut gpu, plane, cells, &pages, &indptr, true);
+            let pool = pool_of(&mut gpu, plane, cells, &pages, &indptr, Some(fmt));
             let rows_t = Tensor::new(src, cells as u32, D as u32, Dtype::Bf16);
-            dsv4::append(&gpu.ctx(), rows_t, &pool, at_page, at_off).expect("the fp8 append fires");
+            dsv4::append(&gpu.ctx(), rows_t, &pool, at_page, at_off).expect("the append fires");
             gpu.sync();
             let raw: Vec<u8> = gpu.down(plane, bytes);
+            if fmt != Rows::Ds {
+                // V4.1's rows: the reference's quantizers, byte for byte.
+                let want = v41_rows(exact, cells, fmt);
+                let off = raw.iter().zip(&want).filter(|(a, b)| a != b).count();
+                if let Some(at) = raw.iter().zip(&want).position(|(a, b)| a != b) {
+                    panic!(
+                        "{fmt:?}: {off} of {} row bytes off the reference's quantizers, the \
+                         first at {at} (page {}, byte {}): {} for {}",
+                        raw.len(),
+                        at / (PAGE * fmt.bytes() as usize),
+                        at % (PAGE * fmt.bytes() as usize),
+                        raw[at],
+                        want[at]
+                    );
+                }
+                planes.push((pool, v41_read(&raw, cells, fmt)));
+                continue;
+            }
             let read = ds_read(&raw, cells);
             for (i, (&got, &want)) in read.iter().zip(exact.iter()).enumerate() {
                 // A code is within half its step of the value: 1/16 of it,
@@ -314,7 +335,7 @@ fn check(rows: usize, pool: Pool, bench: bool, fp8: bool) {
             "| pool_lse_mma | {rows} rows | ratio {ratio} | top_k {top_k} | {pool_only:.1} us |"
         );
         println!(
-            "| dsv4 fused | {rows} rows | ratio {ratio} | top_k {top_k} | fp8 {fp8} | {fused:.1} us |"
+            "| dsv4 fused | {rows} rows | ratio {ratio} | top_k {top_k} | rows {fmts:?} | {fused:.1} us |"
         );
         return;
     }
@@ -322,7 +343,7 @@ fn check(rows: usize, pool: Pool, bench: bool, fp8: bool) {
     gpu.sync();
     let got: Vec<u16> = gpu.down(o_at, rows * HEADS * D);
 
-    let label = format!("{rows} rows, ratio {ratio}, top_k {top_k}, fp8 {fp8}");
+    let label = format!("{rows} rows, ratio {ratio}, top_k {top_k}, rows {fmts:?}");
     let mut worst = 0f32;
     let mut at = 0;
     for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
@@ -399,7 +420,12 @@ fn check(rows: usize, pool: Pool, bench: bool, fp8: bool) {
 
 #[test]
 fn the_fused_dsv4_attention_lands_the_window_the_pool_and_the_sinks() {
-    for fp8 in [false, true] {
+    // bf16; V4's fp8 rows; V4.1's MXFP8 window over NVFP4 compressed rows.
+    for fp8 in [
+        None,
+        Some((Rows::Ds, Rows::Ds)),
+        Some((Rows::Mx8, Rows::Nv4)),
+    ] {
         check(1, Pool::Selected(4, 512), false, fp8);
         check(8, Pool::Selected(4, 512), false, fp8);
         check(8, Pool::Dense(128), false, fp8);
@@ -416,7 +442,11 @@ fn the_fused_dsv4_attention_lands_the_window_the_pool_and_the_sinks() {
 #[ignore = "a timing report"]
 fn the_fused_dsv4_attention_reports_its_time() {
     for rows in [1, 8, 32, 64, 128] {
-        for fp8 in [false, true] {
+        for fp8 in [
+            None,
+            Some((Rows::Ds, Rows::Ds)),
+            Some((Rows::Mx8, Rows::Nv4)),
+        ] {
             check(rows, Pool::Selected(4, 512), true, fp8);
             check(rows, Pool::Dense(128), true, fp8);
             check(rows, Pool::None, true, fp8);
@@ -434,6 +464,111 @@ fn e4m3(code: u8) -> f32 {
     } else {
         (1.0 + man / 8.0) * 2f32.powi(exp - 7)
     }
+}
+
+/// An e2m1 code's value.
+fn e2m1(code: u8) -> f32 {
+    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let v = MAG[usize::from(code & 7)];
+    if code & 8 != 0 { -v } else { v }
+}
+
+/// The nearest of `codes` codes to `v` under `value`, ties to the even code
+/// (the hardware's `cvt.rn`), the sign bit `sign` kept on a negative value,
+/// zero included, as the hardware keeps it.
+fn nearest(v: f32, codes: u8, value: impl Fn(u8) -> f32, sign: u8) -> u8 {
+    let a = v.abs();
+    let mut best = 0u8;
+    for c in 1..codes {
+        let (d, db) = ((value(c) - a).abs(), (value(best) - a).abs());
+        if d < db || (d == db && c % 2 == 0) {
+            best = c;
+        }
+    }
+    if v.is_sign_negative() {
+        best | sign
+    } else {
+        best
+    }
+}
+
+/// DeepSeek-V4.1's reference quantizers over `cells` rows of 512: the
+/// window's `act_quant(kv, 32, ue8m0)` (MXFP8) or the compressed KV's
+/// `fp4_act_quant(kv, 16, e4m3)` (NVFP4), laid out page by page as the
+/// kernels lay them.
+fn v41_rows(x: &[f32], cells: usize, fmt: Rows) -> Vec<u8> {
+    let (data, scale) = match fmt {
+        Rows::Mx8 => (512usize, 16usize),
+        Rows::Nv4 => (256, 32),
+        Rows::Ds => unreachable!("V4's rows are read, not rebuilt"),
+    };
+    let mut out = vec![0u8; cells * (data + scale)];
+    for cell in 0..cells {
+        let page = cell / PAGE * PAGE * (data + scale);
+        let off = cell % PAGE;
+        let row = &x[cell * D..(cell + 1) * D];
+        let (d_at, s_at) = (page + off * data, page + PAGE * data + off * scale);
+        match fmt {
+            Rows::Mx8 => {
+                for b in 0..16 {
+                    let block = &row[b * 32..(b + 1) * 32];
+                    let amax = block.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-4);
+                    let bits = (amax * (1.0 / 448.0)).to_bits();
+                    let e = ((bits >> 23) & 0xff) as i32 + i32::from(bits & 0x7f_ffff != 0);
+                    out[s_at + b] = e as u8;
+                    let s = 2f32.powi(e - 127);
+                    for (i, v) in block.iter().enumerate() {
+                        out[d_at + b * 32 + i] =
+                            nearest((v / s).clamp(-448.0, 448.0), 0x7f, e4m3, 0x80);
+                    }
+                }
+            }
+            _ => {
+                for b in 0..32 {
+                    let block = &row[b * 16..(b + 1) * 16];
+                    let amax = block
+                        .iter()
+                        .fold(0f32, |m, v| m.max(v.abs()))
+                        .max(6.0 * 2f32.powi(-9));
+                    let sb = nearest(amax / 6.0, 0x7f, e4m3, 0x80);
+                    out[s_at + b] = sb;
+                    let s = e4m3(sb);
+                    for i in 0..8 {
+                        let lo = nearest((block[2 * i] / s).clamp(-6.0, 6.0), 8, e2m1, 8);
+                        let hi = nearest((block[2 * i + 1] / s).clamp(-6.0, 6.0), 8, e2m1, 8);
+                        out[d_at + b * 8 + i] = lo | (hi << 4);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What V4.1's rows say: every cell's 512 values.
+fn v41_read(raw: &[u8], cells: usize, fmt: Rows) -> Vec<f32> {
+    let (data, scale) = match fmt {
+        Rows::Mx8 => (512usize, 16usize),
+        Rows::Nv4 => (256, 32),
+        Rows::Ds => unreachable!("V4's rows read through `ds_read`"),
+    };
+    let mut out = vec![0f32; cells * D];
+    for cell in 0..cells {
+        let page = cell / PAGE * PAGE * (data + scale);
+        let off = cell % PAGE;
+        let (d_at, s_at) = (page + off * data, page + PAGE * data + off * scale);
+        for d in 0..D {
+            out[cell * D + d] = match fmt {
+                Rows::Mx8 => e4m3(raw[d_at + d]) * 2f32.powi(i32::from(raw[s_at + d / 32]) - 127),
+                _ => {
+                    let byte = raw[d_at + d / 2];
+                    let code = if d % 2 == 0 { byte & 0xf } else { byte >> 4 };
+                    e2m1(code) * e4m3(raw[s_at + d / 16])
+                }
+            };
+        }
+    }
+    out
 }
 
 /// What DeepSeek's fp8 rows say, page by page: every cell's 512 values.

@@ -413,10 +413,10 @@ impl Run<'_> {
                 o,
                 lse,
             } => {
-                if attn::dsv4::fp8_ds(&self.pool(*cache)) {
+                if attn::dsv4::ds_rows(&self.pool(*cache)) {
                     return Err(kernels_cuda::Error::Backend {
                         op: "attention.prefill_lse",
-                        detail: "the cache holds DeepSeek's fp8 rows, which only the fused \
+                        detail: "the cache holds DeepSeek's quantized rows, which only the fused \
                                  `attention.pool_attention` and `attention.lse_sink` read"
                             .to_string(),
                     });
@@ -494,8 +494,8 @@ impl Run<'_> {
                 write_offset,
             } => {
                 let pool = self.pool(*cache);
-                if attn::dsv4::fp8_ds(&pool) {
-                    // DeepSeek's fp8 rows, quantized on the way in.
+                if attn::dsv4::ds_rows(&pool) {
+                    // DeepSeek's quantized rows, quantized on the way in.
                     attn::dsv4::append(
                         self.ctx(),
                         self.ragged_lanes(*plane).data,
@@ -1371,7 +1371,7 @@ impl Run<'_> {
                 write_offset,
             } => {
                 let into = self.pool(*into);
-                if attn::dsv4::fp8_ds(&into) {
+                if attn::dsv4::ds_rows(&into) {
                     attn::dsv4::store_entries(
                         self.ctx(),
                         self.tensor(*entries),

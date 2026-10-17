@@ -9,6 +9,7 @@
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::dsv4;
+use kernels_cuda::attn::dsv4::Rows;
 use kernels_cuda::attn::dsv4_prefill::{self, Pooled};
 use kernels_cuda::tensor::{KvPool, Tensor};
 
@@ -53,9 +54,9 @@ fn paging(per: usize) -> (Vec<u32>, Vec<u32>) {
 }
 
 fn check(ratio: usize, top_k: Option<usize>) {
-    check_with(ratio, top_k, true, false);
+    check_with(ratio, top_k, true, None);
     // DeepSeek's fp8 rows, which only the block-a-row kernel reads.
-    check_with(ratio, top_k, true, true);
+    check_with(ratio, top_k, true, Some((Rows::Ds, Rows::Ds)));
 }
 
 /// An e4m3 code's value.
@@ -70,6 +71,13 @@ fn e4m3(code: u8) -> f32 {
     }
 }
 
+/// An e2m1 code's value.
+fn e2m1(code: u8) -> f32 {
+    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let v = MAG[usize::from(code & 7)];
+    if code & 8 != 0 { -v } else { v }
+}
+
 /// `src`'s cells written as DeepSeek's fp8 rows through the fp8 append:
 /// the u8 pool, and what its rows read as.
 fn fp8_plane(
@@ -79,15 +87,28 @@ fn fp8_plane(
     pages: &[u32],
     indptr: &[u32],
 ) -> (KvPool, Vec<f32>) {
-    let row = dsv4::DS_ROW as usize;
+    rows_plane(gpu, src, cells, pages, indptr, Rows::Ds)
+}
+
+/// `src`'s cells written as DeepSeek's quantized rows of format `fmt`
+/// through the append: the u8 pool, and what its rows read as.
+fn rows_plane(
+    gpu: &mut Gpu,
+    src: u64,
+    cells: usize,
+    pages: &[u32],
+    indptr: &[u32],
+    fmt: Rows,
+) -> (KvPool, Vec<f32>) {
+    let row = fmt.bytes() as usize;
     let data = dsv4::DS_DATA as usize;
     let nope = dsv4::DS_NOPE as usize;
     let bytes = cells * row;
     let plane = gpu.zeros(bytes);
     let pool = KvPool {
-        keys: Tensor::new(plane, cells as u32, dsv4::DS_ROW, Dtype::U8),
-        values: Tensor::new(plane, cells as u32, dsv4::DS_ROW, Dtype::U8),
-        seq_stride: i64::from(dsv4::DS_ROW),
+        keys: Tensor::new(plane, cells as u32, fmt.bytes(), Dtype::U8),
+        values: Tensor::new(plane, cells as u32, fmt.bytes(), Dtype::U8),
+        seq_stride: i64::from(fmt.bytes()),
         ..pool_of(gpu, plane, cells, pages, indptr)
     };
     let at_page: Vec<u32> = (0..cells as u32).map(|c| c / PAGE as u32).collect();
@@ -99,6 +120,28 @@ fn fp8_plane(
     gpu.sync();
     let raw: Vec<u8> = gpu.down(plane, bytes);
     let mut read = vec![0f32; cells * D];
+    if fmt != Rows::Ds {
+        // V4.1's rows: MXFP8 (a ue8m0 a 32) or NVFP4 (an e4m3 a 16).
+        let (data, scale) = if fmt == Rows::Mx8 {
+            (512, 16)
+        } else {
+            (256, 32)
+        };
+        for c in 0..cells {
+            let base = c / PAGE * PAGE * row;
+            let off = c % PAGE;
+            let (b, sc) = (base + off * data, base + PAGE * data + off * scale);
+            for d in 0..D {
+                read[c * D + d] = if fmt == Rows::Mx8 {
+                    e4m3(raw[b + d]) * 2f32.powi(i32::from(raw[sc + d / 32]) - 127)
+                } else {
+                    let byte = raw[b + d / 2];
+                    e2m1(if d % 2 == 0 { byte & 0xf } else { byte >> 4 }) * e4m3(raw[sc + d / 16])
+                };
+            }
+        }
+        return (pool, read);
+    }
     for c in 0..cells {
         let base = c / PAGE * PAGE * row;
         let off = c % PAGE;
@@ -116,7 +159,8 @@ fn fp8_plane(
     (pool, read)
 }
 
-fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool, fp8: bool) {
+fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool, fmts: Option<(Rows, Rows)>) {
+    let fp8 = fmts.is_some();
     let per = 18;
     let cells = 2 * per * PAGE;
     let (pages, indptr) = paging(per);
@@ -158,9 +202,9 @@ fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool, fp8: bool) {
     let win = pool_of(&mut gpu, w_at, cells, &pages, &indptr);
     let e_at = gpu.up(&e_bits);
     let ent = pool_of(&mut gpu, e_at, cells, &pages, &indptr);
-    let (win, ent) = if fp8 {
-        let (wp, wr) = fp8_plane(&mut gpu, w_at, cells, &pages, &indptr);
-        let (ep, er) = fp8_plane(&mut gpu, e_at, cells, &pages, &indptr);
+    let (win, ent) = if let Some((wf, pf)) = fmts {
+        let (wp, wr) = rows_plane(&mut gpu, w_at, cells, &pages, &indptr, wf);
+        let (ep, er) = rows_plane(&mut gpu, e_at, cells, &pages, &indptr, pf);
         (w, e) = (wr, er);
         (wp, ep)
     } else {
@@ -312,6 +356,12 @@ fn deepseeks_prefill_attention_lands_what_its_four_ops_land() {
     check(128, None);
     // Every visible entry at ratio 4: a page's sixteen entries land as one box.
     check(4, None);
+    // DeepSeek-V4.1's FP4 cache: an MXFP8 window over NVFP4 compressed rows,
+    // at its ratios 2 (selected) and 1.
+    let v41 = Some((Rows::Mx8, Rows::Nv4));
+    check_with(2, Some(512), true, v41);
+    check_with(1, Some(512), true, v41);
+    check_with(2, None, true, v41);
 }
 
 /// A layer with a window and no pool: the pass reads the window alone and

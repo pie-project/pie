@@ -79,8 +79,8 @@ pub fn takes(
     window_pool: &KvPool,
     pooled: &Pooled<'_>,
 ) -> bool {
-    // DeepSeek's fp8 rows (both planes), staged to bf16 pages first.
-    let fp8 = crate::attn::dsv4::fp8_ds(window_pool) && crate::attn::dsv4::fp8_ds(pooled.entries);
+    // DeepSeek's quantized rows (both planes), staged to bf16 pages first.
+    let fp8 = crate::attn::dsv4::ds_rows(window_pool) && crate::attn::dsv4::ds_rows(pooled.entries);
     supported()
         && heads == HEADS
         && head_dim == HEAD_DIM
@@ -142,16 +142,17 @@ pub fn prefill(
             ctx, o, positions, wide.dim, HEAD_DIM, wide.theta, true, true, wide.yarn,
         );
     }
-    if crate::attn::dsv4::fp8_ds(window_pool) {
-        // DeepSeek's fp8 rows: every page of both pools' tables widened into
-        // bf16 planes laid out in table order (as vLLM gathers its prefill's
-        // rows to bf16), read through the same page_indptr.
-        let window_bf16 = stage(ctx, op, window_pool, Staged::Window)?;
+    if let Some(wf) = crate::attn::dsv4::rows_of(window_pool) {
+        // DeepSeek's quantized rows: every page of both pools' tables widened
+        // into bf16 planes laid out in table order (as vLLM gathers its
+        // prefill's rows to bf16), read through the same page_indptr.
+        let window_bf16 = stage(ctx, op, window_pool, Staged::Window, wf)?;
         // A window-only layer's entries are its window (none of them seen).
         let entries_bf16 = if pooled.entries.keys.ptr == window_pool.keys.ptr {
             window_bf16
         } else {
-            stage(ctx, op, pooled.entries, Staged::Entries)?
+            let pf = crate::attn::dsv4::rows_of(pooled.entries).unwrap_or(wf);
+            stage(ctx, op, pooled.entries, Staged::Entries, pf)?
         };
         let staged = Pooled {
             entries: &entries_bf16,
@@ -340,10 +341,16 @@ enum Staged {
     Entries,
 }
 
-/// `pool`'s pages, every one its table names, widened from DeepSeek's fp8
-/// rows into a bf16 plane in table order (`stage_pages`): the pool the pass
+/// `pool`'s pages, every one its table names, widened from DeepSeek's
+/// quantized rows (`fmt`) into a bf16 plane in table order (`stage_pages`): the pool the pass
 /// reads instead, its table the identity.
-fn stage(ctx: &Ctx, op: &'static str, pool: &KvPool, which: Staged) -> Result<KvPool, Error> {
+fn stage(
+    ctx: &Ctx,
+    op: &'static str,
+    pool: &KvPool,
+    which: Staged,
+    fmt: crate::attn::dsv4::Rows,
+) -> Result<KvPool, Error> {
     let (plane_name, table_name) = match which {
         Staged::Window => ("dsv4.stage.window", "dsv4.stage.window_table"),
         Staged::Entries => ("dsv4.stage.entries", "dsv4.stage.entries_table"),
@@ -357,8 +364,11 @@ fn stage(ctx: &Ctx, op: &'static str, pool: &KvPool, which: Staged) -> Result<Kv
     if pages > 0 {
         ctx.fire(
             op,
-            Fire::at(SPARSE_FILE, "::pie::attn::dsv4s::stage_pages")
-                .apply(Launch::grid([pages, 1, 1], [256, 1, 1])),
+            Fire::at(
+                SPARSE_FILE,
+                symbol(&format!("::pie::attn::dsv4s::stage_pages<{}>", fmt.code())),
+            )
+            .apply(Launch::grid([pages, 1, 1], [256, 1, 1])),
             &[
                 pool.keys.arg(),
                 ArgValue::Ptr(plane),

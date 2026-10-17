@@ -197,4 +197,231 @@ __device__ __forceinline__ uint4 ds_load8(const std::uint8_t* data, const std::u
     return out;
 }
 
+
+// DeepSeek-V4.1's rows, as its reference quantizes its caches and as vLLM's
+// sm100 kernels read them. A page of `ps` positions is `ps` data rows, then
+// `ps` scale rows, as V4's.
+//   kMx8: the window's plane, all 512 dims e4m3 under one ue8m0 exponent a
+//         32 (the reference's `act_quant(kv, 32, ue8m0)`): 512 + 16 bytes.
+//   kNv4: the compressed rows, 512 dims e2m1 (two a byte, the lower dim in
+//         the low nibble) under one e4m3 scale a 16 (`fp4_act_quant(kv, 16,
+//         e4m3)`): 256 + 32 bytes.
+// kV4 names V4's 584-byte rows above.
+constexpr int kV4 = 1;
+constexpr int kMx8 = 2;
+constexpr int kNv4 = 3;
+
+template <int F>
+struct Rows;
+
+// bf16 planes: no quantized row.
+template <>
+struct Rows<0> {
+    static constexpr int kData = 0;
+    static constexpr int kScale = 0;
+};
+
+template <>
+struct Rows<kV4> {
+    static constexpr int kData = kDsData;
+    static constexpr int kScale = kDsScaleBytes;
+};
+
+template <>
+struct Rows<kMx8> {
+    static constexpr int kData = kDsDim;
+    static constexpr int kScale = kDsDim / 32;
+};
+
+template <>
+struct Rows<kNv4> {
+    static constexpr int kData = kDsDim / 2;
+    static constexpr int kScale = kDsDim / 16;
+};
+
+template <int F>
+__device__ __forceinline__ DsRow rows_at(std::uint8_t* plane, long long page, int off, int ps) {
+    using T = Rows<F>;
+    std::uint8_t* base = plane + page * static_cast<long long>(ps) * (T::kData + T::kScale);
+    return {base + static_cast<long long>(off) * T::kData,
+            base + static_cast<long long>(ps) * T::kData + static_cast<long long>(off) * T::kScale};
+}
+
+// 2^ceil(log2(amax / 448)) as its biased exponent, from the quotient's bits
+// (the reference's `fast_round_scale`), amax at least 1e-4.
+__device__ __forceinline__ int ue8m0_ceil(float amax) {
+    const unsigned bits = __float_as_uint(fmaxf(amax, 1e-4f) * (1.f / kFp8Max));
+    return static_cast<int>((bits >> 23) & 0xffu) + ((bits & 0x7fffffu) != 0u ? 1 : 0);
+}
+
+// The nearest e2m1 code of `v` (within ±6), ties to the even code and the
+// sign kept on a zero, as the hardware's `cvt.rn` rounds.
+__device__ __forceinline__ unsigned e2m1_code(float v) {
+    const float a = fabsf(v);
+    const unsigned m = static_cast<unsigned>(a > 0.25f) + static_cast<unsigned>(a >= 0.75f) +
+                       static_cast<unsigned>(a > 1.25f) + static_cast<unsigned>(a >= 1.75f) +
+                       static_cast<unsigned>(a > 2.5f) + static_cast<unsigned>(a >= 3.5f) +
+                       static_cast<unsigned>(a > 5.f);
+    return signbit(v) ? (m | 8u) : m;
+}
+
+__device__ __forceinline__ float e2m1_value(unsigned c) {
+    const unsigned m = c & 7u;
+    const float v = m < 4u ? 0.5f * static_cast<float>(m) : static_cast<float>(1u << (m / 2u - 1u)) * (m & 1u ? 1.5f : 1.f);
+    return (c & 8u) ? -v : v;
+}
+
+__device__ __forceinline__ float e4m3_float(std::uint8_t b) {
+    const unsigned e = (b >> 3) & 0xFu;
+    const unsigned m = b & 0x7u;
+    const float v = e != 0u ? __uint_as_float(((e + 120u) << 23) | (m << 20))
+                            : static_cast<float>(m) * 0.001953125f;
+    return (b & 0x80u) != 0u ? -v : v;
+}
+
+// One row of 512 into `row`, by one warp: lane l quantizes dims 16l..16l+15.
+template <int F>
+__device__ __forceinline__ void rows_store_warp(const bf16* __restrict__ src, DsRow row, int lane) {
+    if constexpr (F == kV4) {
+        ds_store_warp(src, row, lane);
+    } else {
+        const int d0 = lane * 16;
+        float x[16];
+        {
+            const uint4 a = *reinterpret_cast<const uint4*>(src + d0);
+            const uint4 b = *reinterpret_cast<const uint4*>(src + d0 + 8);
+            const bf16* pa = reinterpret_cast<const bf16*>(&a);
+            const bf16* pb = reinterpret_cast<const bf16*>(&b);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                x[i] = Elem<bf16>::to_f32(pa[i]);
+                x[8 + i] = Elem<bf16>::to_f32(pb[i]);
+            }
+        }
+        float amax = 0.f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) amax = fmaxf(amax, fabsf(x[i]));
+        if constexpr (F == kMx8) {
+            // A 32-wide block is two lanes' runs.
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+            const int e = ue8m0_ceil(amax);
+            const float inv = __uint_as_float(static_cast<unsigned>(254 - e) << 23);
+            std::uint8_t codes[16];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const float v = fminf(fmaxf(x[i] * inv, -kFp8Max), kFp8Max);
+                codes[i] = static_cast<std::uint8_t>(__nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3));
+            }
+            *reinterpret_cast<uint4*>(row.data + d0) = *reinterpret_cast<const uint4*>(codes);
+            if ((lane & 1) == 0) row.scales[lane >> 1] = static_cast<std::uint8_t>(e);
+        } else {
+            // The reference's training floor keeps an all-zero group's scale
+            // nonzero; the scale rounds to e4m3, the codes to e2m1 under it.
+            const std::uint8_t sb = static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp8(fmaxf(amax, 6.f * 0.001953125f) / 6.f, __NV_SATFINITE, __NV_E4M3));
+            const float sv = e4m3_float(sb);
+            std::uint8_t packed[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const unsigned lo = e2m1_code(fminf(fmaxf(__fdiv_rn(x[2 * i], sv), -6.f), 6.f));
+                const unsigned hi = e2m1_code(fminf(fmaxf(__fdiv_rn(x[2 * i + 1], sv), -6.f), 6.f));
+                packed[i] = static_cast<std::uint8_t>(lo | (hi << 4));
+            }
+            *reinterpret_cast<uint2*>(row.data + d0 / 2) = *reinterpret_cast<const uint2*>(packed);
+            row.scales[lane] = sb;
+        }
+    }
+}
+
+// 8 dims of a row from its data and scale bytes: `j` the first dim (a
+// multiple of 8).
+template <int F>
+__device__ __forceinline__ uint4 rows_load8(const std::uint8_t* data, const std::uint8_t* scales, int j) {
+    if constexpr (F == kV4) {
+        return ds_load8(data, scales, j);
+    } else if constexpr (F == kMx8) {
+        const float s = ue8m0(scales[j / 32]);
+        const uint2 codes = *reinterpret_cast<const uint2*>(data + j);
+        const std::uint16_t* c2 = reinterpret_cast<const std::uint16_t*>(&codes);
+        uint4 out;
+        std::uint32_t* o32 = reinterpret_cast<std::uint32_t*>(&out);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float lo, hi;
+            asm("{\n\t.reg .b32 h2;\n\t.reg .b16 l, h;\n\t"
+                "cvt.rn.f16x2.e4m3x2 h2, %2;\n\t"
+                "mov.b32 {l, h}, h2;\n\t"
+                "cvt.f32.f16 %0, l;\n\t"
+                "cvt.f32.f16 %1, h;\n\t}"
+                : "=f"(lo), "=f"(hi)
+                : "h"(c2[i]));
+            const __nv_bfloat162 b = __floats2bfloat162_rn(lo * s, hi * s);
+            o32[i] = *reinterpret_cast<const std::uint32_t*>(&b);
+        }
+        return out;
+    } else {
+        const float s = e4m3_float(scales[j / 16]);
+        const std::uint32_t nib = *reinterpret_cast<const std::uint32_t*>(data + j / 2);
+        uint4 out;
+        std::uint32_t* o32 = reinterpret_cast<std::uint32_t*>(&out);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const unsigned byte = (nib >> (8 * i)) & 0xffu;
+            const __nv_bfloat162 b =
+                __floats2bfloat162_rn(e2m1_value(byte & 0xfu) * s, e2m1_value(byte >> 4) * s);
+            o32[i] = *reinterpret_cast<const std::uint32_t*>(&b);
+        }
+        return out;
+    }
+}
+
+// The window's plane in format F: row b of `plane_rows` at its page and
+// offset (`kv_append_shared`). A warp a row.
+template <int F>
+__global__ __launch_bounds__(128) void rows_append(
+    const bf16* __restrict__ plane_rows,
+    std::uint8_t* __restrict__ pages,
+    const u32* __restrict__ w_page,
+    const u32* __restrict__ w_off,
+    const u8* __restrict__ row_valid,
+    int B,
+    int page_size,
+    const u32* __restrict__ win)
+{
+    const int b = static_cast<int>(blockIdx.x) * 4 + static_cast<int>(threadIdx.x >> 5);
+    const int lane = static_cast<int>(threadIdx.x & 31);
+    if (b >= B) return;
+    if (win != nullptr && b >= static_cast<int>(win[0])) return;
+    const int b_row = win != nullptr ? b + static_cast<int>(win[1]) : b;
+    if (row_valid != nullptr && row_valid[b_row] == 0) return;
+    const int page = static_cast<int>(w_page[b_row]);
+    const int off = static_cast<int>(w_off[b_row]);
+    if (off < 0 || off >= page_size) return;
+    rows_store_warp<F>(plane_rows + static_cast<long long>(b_row) * kDsDim,
+                       rows_at<F>(pages, page, off, page_size), lane);
+}
+
+// The compressed rows in format F: entry c at its boundary's position in its
+// request's pages (`pool_kv_append`). A warp an entry.
+template <int F>
+__global__ __launch_bounds__(128) void rows_store_entries(
+    const bf16* __restrict__ entries,
+    std::uint8_t* __restrict__ pages,
+    const i32* __restrict__ boundary_pos,
+    const i32* __restrict__ boundary_req,
+    const u32* __restrict__ page_indices,
+    const u32* __restrict__ page_indptr,
+    int n,
+    int page_size)
+{
+    const int c = static_cast<int>(blockIdx.x) * 4 + static_cast<int>(threadIdx.x >> 5);
+    const int lane = static_cast<int>(threadIdx.x & 31);
+    if (c >= n) return;
+    const int pos = boundary_pos[c];
+    if (pos < 0) return;
+    const u32 page = page_indices[page_indptr[boundary_req[c]] + pos / page_size];
+    rows_store_warp<F>(entries + static_cast<long long>(c) * kDsDim,
+                       rows_at<F>(pages, page, pos % page_size, page_size), lane);
+}
+
 }  // namespace pie::attn::dsv4

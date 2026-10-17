@@ -537,11 +537,17 @@ impl Pools {
                     let restated = facts.row(index);
                     if let Some(seat) = restated.filter(|seat| seat.kv_heads != 0) {
                         let heads = u64::from(seat.kv_heads) * u64::from(seat.head_dim);
-                        // DeepSeek's fp8 rows hold a 512-wide head in a u8
-                        // plane 584 bytes wide.
+                        // DeepSeek's quantized rows hold a 512-wide head in
+                        // a u8 plane of their format's width.
                         let ds_row = *dtype == Dtype::U8
                             && heads == 512
-                            && keys_width == u64::from(kernels_cuda::attn::dsv4::DS_ROW)
+                            && [
+                                kernels_cuda::attn::dsv4::Rows::Ds,
+                                kernels_cuda::attn::dsv4::Rows::Mx8,
+                                kernels_cuda::attn::dsv4::Rows::Nv4,
+                            ]
+                            .iter()
+                            .any(|r| keys_width == u64::from(r.bytes()))
                             && values_width == keys_width;
                         if !ds_row && (heads != keys_width || heads != values_width) {
                             return Err(Fault::Unbound {

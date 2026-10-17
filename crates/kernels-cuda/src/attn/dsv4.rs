@@ -9,6 +9,11 @@
 //! [`DS_DATA`] bytes (448 e4m3 codes, then the 64 rotated dims in bf16), then
 //! `ps` rows of [`DS_SCALES`] bytes (seven ue8m0 exponents, one a 64 codes,
 //! and a zero pad). A pool holding them is a u8 plane [`DS_ROW`] wide.
+//!
+//! And DeepSeek-V4.1's rows ([`Rows`]), laid out alike: its window's plane
+//! in MXFP8 (all 512 dims e4m3 under one ue8m0 a 32, 528 bytes) and its
+//! compressed rows in NVFP4 (e2m1 under one e4m3 a 16, 288 bytes), as its
+//! reference quantizes them.
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -39,10 +44,62 @@ const KEYS: u32 = 32;
 /// The most blocks a row's keys split over (one portable cluster).
 const MAX_RANKS: u32 = 8;
 
-/// Whether `pool` holds DeepSeek's fp8 rows: a u8 plane [`DS_ROW`] wide.
+/// The quantized rows a DeepSeek pool may hold, each a u8 plane of its
+/// own width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rows {
+    /// V4's fp8 rows, [`DS_ROW`] bytes a position.
+    Ds,
+    /// V4.1's window: 512 e4m3 codes and 16 ue8m0 exponents.
+    Mx8,
+    /// V4.1's compressed rows: 256 bytes of e2m1 pairs and 32 e4m3 scales.
+    Nv4,
+}
+
+impl Rows {
+    /// The bytes of a position.
+    #[must_use]
+    pub const fn bytes(self) -> u32 {
+        match self {
+            Self::Ds => DS_ROW,
+            Self::Mx8 => 528,
+            Self::Nv4 => 288,
+        }
+    }
+
+    /// The kernels' format constant (`attn/dsv4_kv.cuh`).
+    #[must_use]
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Ds => 1,
+            Self::Mx8 => 2,
+            Self::Nv4 => 3,
+        }
+    }
+}
+
+/// The quantized rows `pool` holds, by its width: none where it is not a u8
+/// plane of one of [`Rows`]' widths.
+#[must_use]
+pub fn rows_of(pool: &KvPool) -> Option<Rows> {
+    if pool.keys.dtype != Dtype::U8 || pool.layout != 0 {
+        return None;
+    }
+    [Rows::Ds, Rows::Mx8, Rows::Nv4]
+        .into_iter()
+        .find(|r| pool.seq_stride == i64::from(r.bytes()))
+}
+
+/// Whether `pool` holds DeepSeek's quantized rows of any format.
+#[must_use]
+pub fn ds_rows(pool: &KvPool) -> bool {
+    rows_of(pool).is_some()
+}
+
+/// Whether `pool` holds V4's fp8 rows: a u8 plane [`DS_ROW`] wide.
 #[must_use]
 pub fn fp8_ds(pool: &KvPool) -> bool {
-    pool.keys.dtype == Dtype::U8 && pool.seq_stride == i64::from(DS_ROW) && pool.layout == 0
+    rows_of(pool) == Some(Rows::Ds)
 }
 
 fn plain_bf16(pool: &KvPool) -> bool {
@@ -62,10 +119,10 @@ pub struct Pooled<'a> {
 /// over fp8 rows (window and pool alike).
 #[must_use]
 pub fn takes(heads: u32, head_dim: u32, window: &KvPool, pooled: Option<&Pooled<'_>>) -> bool {
-    let fp8 = fp8_ds(window);
+    let fp8 = ds_rows(window);
     let alike = |p: &KvPool| {
         if fp8 {
-            fp8_ds(p) && p.page_size % 2 == 0
+            ds_rows(p) && p.page_size % 2 == 0
         } else {
             plain_bf16(p)
         }
@@ -88,13 +145,19 @@ fn ranks(ctx: &Ctx, rows: u32) -> u32 {
     r
 }
 
-fn smem(fp8: bool) -> u32 {
+fn smem(rows: Option<(Rows, Rows)>) -> u32 {
     let ld = HEAD_DIM + 8;
     let tile = KEYS * ld * 2;
-    // Tiles in flight: six of fp8 rows (and the one they widen into), four
-    // of bf16.
-    let ring = if fp8 {
-        6 * KEYS * DS_ROW + tile
+    // Tiles in flight: six of quantized rows (and the one they widen into),
+    // four of bf16. A raw key holds the wider format's data and scales.
+    let ring = if let Some((w, p)) = rows {
+        let split = |r: Rows| match r {
+            Rows::Ds => (DS_DATA, DS_SCALES),
+            Rows::Mx8 => (512, 16),
+            Rows::Nv4 => (256, 32),
+        };
+        let ((wd, ws), (pd, ps)) = (split(w), split(p));
+        6 * KEYS * (wd.max(pd) + ws.max(ps)) + tile
     } else {
         4 * tile
     };
@@ -201,10 +264,21 @@ pub fn decode(
     if rows == 0 {
         return Ok(());
     }
-    let fp8 = fp8_ds(window_pool);
+    // The window's and the pool's row formats (a window-only layer reads
+    // no pool; its format stands in).
+    let formats = rows_of(window_pool).map(|w| {
+        (
+            w,
+            pooled
+                .as_ref()
+                .and_then(|p| rows_of(p.entries))
+                .unwrap_or(w),
+        )
+    });
+    let (wf, pf) = formats.map_or((0, 0), |(w, p)| (w.code(), p.code()));
     let window = count(OP, "the sliding window", window)?;
     let ranks = ranks(ctx, rows);
-    let launch = Launch::grid([ranks, HEADS / GROUP, rows], [THREADS, 1, 1]).smem(smem(fp8));
+    let launch = Launch::grid([ranks, HEADS / GROUP, rows], [THREADS, 1, 1]).smem(smem(formats));
     let launch = if ranks > 1 {
         launch.cluster(ranks)
     } else {
@@ -237,7 +311,7 @@ pub fn decode(
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::attn::dsv4::decode<{HEAD_DIM}, {sink_ty}, {ranks}, {fp8}>"
+                "::pie::attn::dsv4::decode<{HEAD_DIM}, {sink_ty}, {ranks}, {wf}, {pf}>"
             )),
         )
         .apply(launch),
@@ -271,17 +345,17 @@ pub fn decode(
     )
 }
 
-fn ds_pool(op: &'static str, pool: &KvPool) -> Result<(), Error> {
-    if !fp8_ds(pool) || pool.page_size % 2 != 0 {
-        return Err(refuse(
+fn ds_pool(op: &'static str, pool: &KvPool) -> Result<Rows, Error> {
+    match rows_of(pool) {
+        Some(rows) if pool.page_size % 2 == 0 => Ok(rows),
+        _ => Err(refuse(
             op,
             format!(
-                "the pool is {:?} at {} a position, not DeepSeek's {DS_ROW}-byte fp8 rows",
+                "the pool is {:?} at {} a position, not DeepSeek's quantized rows",
                 pool.keys.dtype, pool.seq_stride
             ),
-        ));
+        )),
     }
-    Ok(())
 }
 
 /// The window's plane rows (bf16, 512 wide) quantized into DeepSeek's fp8
@@ -294,7 +368,7 @@ pub fn append(
     write_offset: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.kv_append_shared";
-    ds_pool(OP, pool)?;
+    let fmt = ds_pool(OP, pool)?;
     if rows.dtype != Dtype::Bf16 || rows.width != HEAD_DIM {
         return Err(refuse(OP, "an fp8 row is written from a bf16 row of 512"));
     }
@@ -303,7 +377,7 @@ pub fn append(
     }
     ctx.fire(
         OP,
-        Fire::at(KV_FILE, "::pie::attn::dsv4::ds_append")
+        Fire::at(KV_FILE, rows_symbol("append", fmt))
             .apply(Launch::grid([rows.rows.div_ceil(4), 1, 1], [128, 1, 1])),
         &[
             rows.arg(),
@@ -328,7 +402,7 @@ pub fn store_entries(
     pool: &KvPool,
 ) -> Result<(), Error> {
     const OP: &str = "attention.pool_kv_append";
-    ds_pool(OP, pool)?;
+    let fmt = ds_pool(OP, pool)?;
     if entries.dtype != Dtype::Bf16 || entries.width != HEAD_DIM {
         return Err(refuse(OP, "an fp8 row is written from a bf16 row of 512"));
     }
@@ -337,7 +411,7 @@ pub fn store_entries(
     }
     ctx.fire(
         OP,
-        Fire::at(KV_FILE, "::pie::attn::dsv4::ds_store_entries")
+        Fire::at(KV_FILE, rows_symbol("store_entries", fmt))
             .apply(Launch::grid([entries.rows.div_ceil(4), 1, 1], [128, 1, 1])),
         &[
             entries.arg(),
@@ -350,4 +424,13 @@ pub fn store_entries(
             pool.page_size.arg(),
         ],
     )
+}
+
+/// A row writer's symbol: V4's own kernel for its fp8 rows, the format's
+/// instance of the generic one for V4.1's.
+fn rows_symbol(what: &str, fmt: Rows) -> &'static str {
+    match fmt {
+        Rows::Ds => symbol(&format!("::pie::attn::dsv4::ds_{what}")),
+        other => symbol(&format!("::pie::attn::dsv4::rows_{what}<{}>", other.code())),
+    }
 }

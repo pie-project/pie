@@ -629,10 +629,11 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
     }
 }
 
-// DeepSeek's fp8 rows (`attn/dsv4_kv.cuh`) widened for the pass above, a
-// page at a time: page i of `out` is page indices[i] of the fp8 plane, and
-// out_indices[i] = i, so the pass reads the staged plane through the same
-// page_indptr. A warp a row, a lane two 8-dim runs.
+// DeepSeek's quantized rows (`attn/dsv4_kv.cuh`, format F) widened for the
+// pass above, a page at a time: page i of `out` is page indices[i] of the
+// quantized plane, and out_indices[i] = i, so the pass reads the staged
+// plane through the same page_indptr. A warp a row, a lane two 8-dim runs.
+template <int F>
 __global__ __launch_bounds__(256) void stage_pages(
     const std::uint8_t* __restrict__ fp8,
     bf16* __restrict__ out,
@@ -647,11 +648,11 @@ __global__ __launch_bounds__(256) void stage_pages(
     const long long src = indices[i];
     const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
     for (int r = warp; r < page; r += 8) {
-        const dsv4::DsRow row = dsv4::ds_row(const_cast<std::uint8_t*>(fp8), src, r, page);
+        const dsv4::DsRow row = dsv4::rows_at<F>(const_cast<std::uint8_t*>(fp8), src, r, page);
         bf16* dst = out + (static_cast<long long>(i) * page + r) * kD;
 #pragma unroll
         for (int c = lane; c < kD / 8; c += 32) {
-            *reinterpret_cast<uint4*>(dst + c * 8) = dsv4::ds_load8(row.data, row.scales, c * 8);
+            *reinterpret_cast<uint4*>(dst + c * 8) = dsv4::rows_load8<F>(row.data, row.scales, c * 8);
         }
     }
 }
