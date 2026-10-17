@@ -521,6 +521,9 @@ mod tests {
                         fp8_o_down: false,
                         gemm_fp8_mma_gemv_until: 0,
                         mxfp4_cvt_ksplit_until: 0,
+                        hc_mma: false,
+                        index_tc5: false,
+                        norm_emit: false,
                         ..tuning
                     },
                     defaults,
