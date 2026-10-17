@@ -4,285 +4,105 @@ api = 1
 tier    = "sm_100"
 assumes = { cc = 100 }
 
+# Each line's measured win is in the commit that set it.
 [kernel]
 gemv.bf16 = "narrow"
-# Dense latent attention on the FA2 arms (a selected one is the naive
-# kernel's whatever this says): Kimi-K3's first four layers prefill 32 x
-# 4096 in 1.50 s against 1.83 s on the naive kernel, decode bs1/8/64 2.33 /
-# 3.53 / 8.58 ms against 2.36 / 3.46 / 8.90.
+# Dense latent attention on the FA2 arms.
 mla.path  = "fa2"
-# A latent attention's prefill from 256 rows expanded, as vLLM's MLA prefill
-# runs it: the fire's latent rows through kv_b into a 192-wide key and
-# 128-wide value head a query head, then the tcgen05 prefill at those
-# widths. Kimi-K3's MLA layer prefills 32 x 4096 in ~25 ms against 240 ms
-# absorbed (its 576 / 512 widths on the FA2 arm).
+# A latent prefill from 256 rows runs expanded, as vLLM's MLA prefill does.
 mla.expanded_from = 256
-# A block-FP8 projection at up to 4 rows as a GEMV over the bf16
-# activations, its codes streamed once: GLM-5.3's FP8 projections at bs1
-# spent 710 us a step in the tcgen05 GEMM and 128 us quantizing for it.
+# Block-FP8 projections: a GEMV up to 4 rows, mma.sync up to 8.
 gemm.fp8_gemv_until = 4
-# A block-FP8 projection at 2 to 8 rows on the mma.sync fp8 kernel, its
-# rows quantized in the same launch, where it leads the GEMV and the
-# tcgen05 GEMM (moe::dense_fp8_shape): DeepSeek-V4-Flash's shared gate-up
-# at 8 rows 12.9 -> 10.0 us, its shared down 11.4 -> 6.7, index q up 10.2
-# -> 5.9.
 gemm.fp8_mma_gemv_until = 8
-# DeepSeek-V4's compressed-pool attention on mma.sync, a block a row's 16
-# heads, rather than the scalar walk a block a row and head.
+# DeepSeek-V4's attention: pool on mma.sync, prefill from 512 rows and
+# decode up to 64 in one launch, V4.1's bounded replay, its FP4 pass from 32.
 sdpa.pool_mma = true
-# DeepSeek-V4's attention at prefill widths in one tcgen05 pass: the window,
-# the pool (selected or whole), their merge and the sinks. DSV4-Flash
-# prefills 32 x 4096 in 9.9 s against 12.2 s as the four ops (two runs
-# each); below 512 rows the four ops stay.
 sdpa.dsv4_prefill_from = 512
-# DeepSeek-V4.1 prefills by bounded replay, as its release describes: a
-# prompt's leading rows through the encoder alone, the decoder replaying its
-# last window (the window held above each sequence's replay floor).
 sdpa.dsv4_replay = true
-# DeepSeek-V4.1's FP4 cache from 32 rows on that pass too, widening each
-# row's keys once for its 64 heads where the decode launch's four blocks a
-# row widen them each: the truncated model's decode TPOT at 32 rows 2.98 ->
-# 2.86 ms, 64 rows 3.55 -> 3.14 (before the pass widened on sm_100a's e2m1
-# conversion); 16 rows stay (2.57 against 2.66).
 sdpa.dsv4_fp4_pass_from = 32
-# GLM-5.3's DSA (sparse MLA, top-2048 tokens a row) a block a row on
-# tcgen05, the selected keys' latent and rotated part gathered whole.
-sdpa.mla_sparse = true
-# A row that sees no more keys than its selection holds (GLM-5.3 under 2048
-# tokens) read dense, its keys in order and its selection unread.
-sdpa.mla_dense_short = true
-# A prefill's pooled index (512 rows and up) scored on tcgen05, two rows'
-# 64 heads an MMA's 128 lanes against tiles of 128 blocks, then ranked:
-# DeepSeek-V4-Flash's indexer over 2048 rows of a 4096-position request,
-# top 512, 169 -> 89 us (turned queries 175 -> 98).
-sdpa.index_tc5 = true
-# A prefill's hyper-connection pre-mix norm lands the next fp8 GEMMs' e4m3
-# 1x128 operand beside its bf16 row, in place of their quantize launch.
-elemwise.norm_emit = true
-# A pooled index's top-k by radix select rather than forty bisection passes
-# (DSV4-Flash's 512 of up to 1024 blocks, 2048 rows: 417 -> 220 us).
-sdpa.index_radix = true
-# DeepSeek-V4's attention at decode widths in one launch (mma.sync, a block
-# a row's 16 heads, a row's keys over a cluster): DSV4-Flash decodes 8 rows
-# at 22.37 ms a token against 24.09 ms as the four ops, 64 rows at 68.8
-# against 74.1.
 sdpa.dsv4_decode_until = 64
-# The tcgen05 GEMMs (B200): routed selects from 16 tokens. A dense
-# projection's GLU stays apart from cuBLAS's gate-up at every row count
-# (`gemm.tc5_glu_from` at its default): below 512 rows the pair is faster
-# outright (Gemma-4-31B's 21504 wide over 5376 takes 77 us at 64 rows where
-# the epilogue GEMM takes 107, 92 / 109 at 256), and from there they tie
-# alone but not at the power cap a prefill runs at, where cuBLAS's GEMM
-# does more work a watt (1425 TFLOPS against the GEGLU epilogue GEMM's 1295
-# at 16384 x 43008 x 5376, both at 950 W): Gemma-4-31B prefills 32 x 4096
-# at 19,105 tok/s where it took 18,690 with the epilogue from 512 rows,
-# Qwen3.8-27B at 23,520 where it took 23,220.
+# GLM-5.3's DSA on tcgen05; a row under its selection size read dense.
+sdpa.mla_sparse = true
+sdpa.mla_dense_short = true
+# A prefill's pooled index scored on tcgen05 and ranked by radix select.
+sdpa.index_tc5 = true
+sdpa.index_radix = true
+# The hyper-connection pre-mix norm emits the next fp8 GEMM's operand.
+elemwise.norm_emit = true
+# Routed bf16 selects on the tcgen05 grouped GEMM from 16 tokens.
 moe.tc5           = true
 moe.tc5_from      = 16
-# Every sm_100 block opts into 227 KiB, past the 123 KiB the two-launch
-# gated delta scan holds; 32 x 4096 tokens take 7.8 ms a layer there where
-# the three wmma launches took about 97 (Qwen3.8-27B's head).
+# Gated delta: the fused scan, one tcgen05 prefill launch, bf16 output.
 ssm.gdn_fused_scan = true
-# The gated delta prefill in one tcgen05 launch, the state in TMEM: at
-# Qwen3.6-35B-A3B's head (16 key heads, 32 value heads) a layer over
-# 32 x 4096 tokens takes 2.84 ms where the two-launch scan takes 5.11, and
-# over 4 x 4096 0.34 where it takes 0.70.
 ssm.gdn_tc5 = true
-# The row kernels a prefill streams 16 bytes a lane: over 16384 of
-# Qwen3.6-35B-A3B's tokens the per-head q norm (16 x 256 wide) takes 54 us
-# where a block a head took 463, the q/gate cut 76 where it took 197, the
-# sigmoid gate 69 where it took 262; a long fire's packed qkv|z lands as two
-# GEMMs off the weight's two slices, never cut.
-elemwise.rows_vec = true
-# The hyper-connection kernels tiled and 16 bytes a lane (DeepSeek-V4-Flash,
-# a 16384-row prefill fire, us a call): the stream norm and mix projection in
-# one pass over the bf16 streams 472 where the two took ~530 + 1339, the fold
-# 869 -> 383, the gates' pre-mix 297 -> 218, the 64 x 512 scale-free q norm a
-# warp a head 1785 -> 432. A 32 x 4096 prefill 11.69 -> 6.62 s, decode at 64
-# requests 93.3 -> 84.5 ms a step.
-elemwise.hc_tile = true
-# A prefill's stream norm and mix projection on the tensor cores (mma.sync,
-# the f32 weights as two bf16 halves, 16 bits of each against tf32's 10):
-# DeepSeek-V4-Flash's 16384 rows by 16384 by 24, 472 -> 203 us a call.
-elemwise.hc_mma = true
-# The chunked causal conv four channels a thread: Qwen3.6-35B-A3B's 8192
-# channels over 16384 tokens take 166 us where eight a thread took 258
-# (its 168 registers held three blocks an SM).
-ssm.conv_vec4 = true
-# A chunked gated delta walk read only by its gated norm lands bf16, as
-# vLLM's does: half the bytes out of the walk and into the norm.
 ssm.gdn_out_bf16 = true
-# Qwen3.5's attention prologue (q/gate cut, per-head q/k norms, partial
-# rotation, cache write) in one launch up to 64 rows (decode); a prefill
-# runs the five launches, which stream faster there. Qwen3.8-27B decode
-# TPOT, two A/B pairs: bs1 11.10 / 11.10 -> 10.96 / 10.96 ms, bs8 11.85 /
-# 11.94 -> 11.87 / 11.68, bs64 16.14 / 16.80 -> 16.59 / 15.99.
+ssm.conv_vec4 = true
+# Row kernels 16 bytes a lane; hyper-connection kernels tiled and on mma.sync.
+elemwise.rows_vec = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+# Qwen3.5's attention prologue in one launch up to 64 rows.
 elemwise.qg_prologue_until = 64
-# A wide decode's split partials fold a warp a row: gpt-oss-120b's layers
-# at 64 requests fold in about 4 us where the staged merge took 17.
+# A wide decode's split partials fold a warp a row.
 sdpa.merge_warp = true
 
-# gpt-oss's mxfp4 selects from 28 routes to 1024 dequantize in registers on
-# mma.sync: at decode widths that reads the bank about twice as fast as the
-# tcgen05 GEMM; past 1024 routes the GEMM's reuse wins. Below 28 routes the
-# per-route GEMV is faster (gpt-oss-120b, a layer's gate-up + down at 4
-# tokens: 91 us GEMV, 107 us register-dequant; at 7: 152 / 136; at 8: 171 /
-# 145).
+# MXFP4 selects: register-dequant mma.sync from 28 to 1024 routes, e2m1
+# converts, W4A8 up to 48 routes from one, K split over two CTAs up to 6.
 moe.mxfp4_mma_from  = 28
 moe.mxfp4_mma_until = 1024
-# ... and turn the codes into f16 with sm_100a's e2m1 converts, the
-# activations f16 once a CTA: gpt-oss-120b at 8 tokens, a layer's gate-up
-# 92 -> 74 us and down 54 -> 49; at 64 tokens 289 -> 224 and 160 -> 124.
 moe.mxfp4_cvt = true
-# DeepSeek-V4's W4A8 selects (e4m3 activations) read their activations back
-# to bf16 and take the same kernel up to 48 routes (8 tokens of 6): a decode
-# step at 8 requests 24.85 -> 22.36 ms. Wider fires lose end to end though
-# the select alone is faster (at 32 requests 39.3 -> 44.2 ms, at 64 82.9 ->
-# 90.9), so they keep the grouped tcgen05 GEMM.
 moe.mxfp4_a8_until = 48
-# From one route: at DeepSeek-V4-Flash's single row (6 routes) the
-# register-dequant select streams the six experts where the grouped tcgen05
-# GEMM lays them out first (decode bs1 13.66 -> 13.00 ms a token).
 moe.mxfp4_a8_from = 1
-# Up to 6 routes (DeepSeek-V4's one token) the e2m1-convert select splits K
-# across a cluster of two CTAs: 224 CTAs a fire leave the card idle, and the
-# select's gate-up 32.6 -> 27.1 us, down 21.7 -> 19.4 (at two tokens the
-# split loses).
 moe.mxfp4_cvt_ksplit_until = 6
-# DeepSeek-V4's grouped output projection (`wo_a`) at decode widths (up
-# to 8 rows) on fp8b128 as vLLM reads it: the bf16 plane the import
-# dequantized from the checkpoint's fp8 gains a twin requantized at load,
-# each value exactly the checkpoint's (every one of DeepSeek-V4-Flash's
-# 88064 blocks checked), against the rows in e4m3 1x128 on mma.sync. Wider
-# fires keep the bf16 on cuBLAS, ahead of the grouped tcgen05 GEMM there.
+# DeepSeek-V4's wo_a on its requantized fp8 plane: mma.sync, then the
+# grouped tcgen05 GEMM up to 512 rows.
 gemm.fp8_o_down = true
-# Past the mma.sync kernel's eight rows, up to 512, the requantized plane on
-# the grouped tcgen05 GEMM (a row's groups its routes) rather than widened to
-# bf16 for cuBLAS a call: 64 rows of DeepSeek's [8 x 1024, 4096] wo_a 28 us
-# against 38.
 gemm.fp8_grouped_tc5_until = 512
-# AttnRes's blend and the norm of its row in one pass, 512 threads a row:
-# Kimi-K3's sublayer inputs lose a launch and a row's round trip each.
+# AttnRes's blend and its row's norm in one pass.
 attn_res.fused_norm = true
-# The tcgen05 prefill FMHA (sm_100a): a causal 4096-token prefill at
-# Qwen3.8-27B's 256-wide, six-way-grouped head runs at about 900 TFLOPS
-# where FA2 runs at about 300.
+# The tcgen05 prefill FMHA; Gemma 4's sliding layers on its 128-key tiles.
 sdpa.prefill.tc5 = true
-# Gemma-4-31B's sliding layers (256 wide, two query heads a key head, a
-# 1024-key window) on the 128-key-tile kernel: a recorded 4 x 4096 fire,
-# its pages one run a request, 0.69 -> 0.64 ms; in a 32 x 4096 prefill
-# 0.41 -> 0.38 s, the prefill's wall time unmoved (the GPU runs it at its
-# power cap, where a kernel's saved time goes to the others' clock).
 sdpa.prefill.wide_sliding = true
-# A single-token row of a four-way or wider head group reads the cache
-# through the prefill kernel, whose tensor cores take the group's rows as
-# one tile: Qwen3.8-27B's 64-row decode step spends 0.64 ms in attention
-# where the decode kernel spends 1.62.
+# Decode rows of a group of four or wider through the prefill kernel,
+# sinks too.
 sdpa.decode.grouped_prefill_from = 4
-# gpt-oss-120b's full-attention rows join them, sinks and all: its decode
-# step takes 18.21 ms at 64 requests where it took 19.27, and 9.76 at eight
-# where it took 10.10. Its 128-wide windows stay on the decode kernel, which
-# reads a window that short faster.
 sdpa.decode.grouped_prefill_lse = true
-# Gemma 4's 256-wide sliding layers (two query heads a KV head) read their
-# cache on tensor cores (attn/xqa.cuh), the group one MMA tile: a 64-request
-# layer over 640-key requests takes 138.8 us where the FA2 decode took 185.8,
-# and Gemma-4-31B decodes a step at 64 requests in 21.70 ms where it took
-# 25.97 (13.23 / 13.51 at eight, 12.84 / 12.96 at one).
+# Tensor-core decode (attn/xqa.cuh): 64-wide heads from 16 requests, short
+# windows whole, unwindowed rows over a cluster of eight.
 sdpa.decode.xqa = true
-# gpt-oss's 64-wide sliding layers (groups of eight; its full-attention rows
-# read through the prefill kernel) take it from 16 requests; narrower, the
-# FA2 decode reads them faster.
 sdpa.decode.xqa_from_64 = 16
-# A window of up to 128 keys reads whole on the tensor cores at any batch, a
-# block a (request, kv head) landing its rows and sinks with no split to
-# fold: gpt-oss-120b's 128-key sliding layers drop their merge, and its
-# decode step takes 3.45 / 8.94 / 15.42 ms at 1 / 8 / 64 requests where it
-# took 3.55 / 9.02 / 16.54.
 sdpa.decode.xqa_whole_window = 128
-# Its unwindowed rows read across a cluster of up to eight blocks a (request,
-# kv head), the cluster folding the slices through distributed shared memory:
-# no split partials and no fold launch, and gpt-oss's full-attention rows stay
-# decodes rather than the prefill rewrite. A layer at eight requests takes
-# 11.4 us where the prefill and its fold took 15.6, and gpt-oss-120b decodes
-# a step in 3.27 / 8.74 / 16.44 ms at 1 / 8 / 64 requests where it took
-# 3.36 / 8.82 / 16.49 (three rounds each).
 sdpa.decode.xqa_cluster = 8
-# A dense projection's bias from the cuBLASLt epilogue, not a separate add
-# (gpt-oss's qkv and o: about 0.44 ms a bs64 decode step).
+# A dense bias from the cuBLASLt epilogue.
 gemm.bias_epilogue = true
-# An unswapped NVFP4 x NVFP4 GEMM at 128 K a stage (64-byte rows): twice the
-# ring in the same shared memory; W4A4 gate-up 5% ahead at 1024 tokens.
+# NVFP4 GEMM at 128 K a stage.
 gemm.nvfp4_k128 = true
-# A W4A4 routed MLP kept by expert, its GLU landing the down leg's NVFP4
-# operand from the gate-up epilogue (swapped at a decode's few rows an
-# expert): Flash-Next prefill 34.6k -> 38.4k tok/s, TPOT bs64 20.0 -> 19.1
-# ms, bs16 13.5 -> 12.8 ms. A fire of 64 routes or fewer stays apart.
+# Routed MLPs kept by expert with the GLU in the gate-up epilogue: W4A4
+# always, W4A8 from 512 tokens.
 moe.w4a4_fused_from = 1
-# A W4A8 routed MLP (MXFP4 banks against e4m3 activations) kept by expert,
-# its GLU landing the down leg's e4m3 operand from the gate-up epilogue.
-# A fire of 64 routes or fewer stays apart, and so does a decode-wide one:
-# DeepSeek-V4-Flash at 0.95 share, prefill 32 x 4096 5.85 -> 5.41 s fused,
-# but a decode step at 64 requests 62.9 -> 70.0 ms (the fused gate-up GEMM
-# with its GLU epilogue reads the bank slower at ~2 routes an expert), so
-# from 512 tokens.
 moe.w4a8_fused_from = 512
-# A KDA prefill walks its chunks on the tensor cores (a chunk's update
-# directions in parallel, then the state chunk by chunk), not a row at a
-# time: its block asks 219 KiB of shared memory.
+# KDA: chunked prefill on the tensor cores, a fused decode step.
 ssm.kda_chunked = true
-# A KDA decode step reads its packed rows itself, a block a row, head and
-# quarter of the state's value rows: Kimi-K3's three KDA layers lose two
-# staging launches each at bs1.
 ssm.kda_step_fused = true
-# A routed NVFP4 select of bf16 activations (W4A16) of 32 to 8192 routes on
-# the register-dequant MMA kernel: the tcgen05 W4A16 path's transform and
-# kind::f16 MMAs (four a 64-K stage) held a decode's gate-up to ~300 us.
-# Flash-Next W4A16 TPOT bs64 34.8 -> 22.6 ms, bs8 15.4 -> 13.5 ms; serve
-# 10.3 -> 13.5 req/s, TPOT 76.7 -> 54.6 ms. 10 routes (bs1) stay on tcgen05
-# (8.6 ms there, 10.1 on this kernel); wider fires gain nothing past 8192.
+# W4A16 NVFP4 selects on the register-dequant MMA from 32 to 8192 routes.
 moe.nvfp4_mma_from = 32
 moe.nvfp4_mma_until = 8192
-# A dense bf16 product's tactic is timed with a K-splitting algorithm's
-# reduce launch charged 2 us (a captured step pays it), split algorithms
-# reduced in place joining the timing.
+# Tactic timing charges a split's reduce launch 2 us, at every row count.
 gemm.split_launch_ns = 2000
-# Every row count is charged (kernel.gemm.split_launch_from stays 0). Bounding
-# it to two rows or more, on shared tactic caches: Gemma-4-31B bs1 12.97 ->
-# 12.96 ms (no charge at all 12.92), Flash-Next W4A4 bs64 18.4 -> 19.1.
-# A dense tcgen05 GEMM rasters 16 P tiles a band, not 8: at the power cap
-# (bf16, 16384-row prefill shapes, ~950 W) tc5 lands 1338 / 1182 / 1354
-# TFLOPS against 1254 / 1161 / 1348 at 8 (12 ties 16, 24 and 32 lose);
-# DeepSeek-V4-Flash's fp8 prefill 10.37k / 10.57k -> 10.57k / 10.58k tok/s.
+# Dense tcgen05 GEMMs raster 16 tiles a band.
 gemm.tc5_raster = 16
 
-# A tcgen05 split-K GEMM of 8 rows or fewer sums its splits in the tile's
-# last split to land, not a finalize launch (the same bits); and the GEMM
-# and its finalize launch as programmatic dependents of the kernel before.
-# DeepSeek-V4-Flash TPOT, both against neither's tickets (PDL on in both):
-# bs1 11.97 -> 11.27 ms, bs8 15.51 -> 14.77, bs64 68.2 -> 65.9; PDL alone
-# 12.17 -> 11.98, 15.65 -> 15.23, 69.8 -> 67.7.
+# Split-K of 8 rows or fewer folded in the last split, and launches as
+# programmatic dependents.
 gemm.tc5_split_tickets = 8
 pdl = true
 
-# A dense bf16 product of 2 to 8 rows may time the few-rows kernel (one
-# launch, warps streaming the weight's rows) beside cuBLAS's split pairs:
-# DeepSeek-V4-Flash's narrow projections at 8 x 512 x 4096 4.7 us on the GPU
-# against 3.9 + 2.4 (it takes N = 512 and 64; N = 256 and 1024 stay on
-# cuBLAS); TPOT bs8 13.27 -> 13.20 ms, three rounds on a shared tactic cache.
+# Bf16 products of 2 to 8 rows may time the few-rows kernel.
 gemm.rows_m = 8
 
 [compiler]
-# A join's independent chains forked onto side streams (the shared and routed
-# experts a MoE sums, an attention's query chain beside its key/value or index
-# chain), as vLLM runs DeepSeek-V4's: Flash decodes one row at 10.78 -> 10.13
-# ms a token, 8 rows at 14.70 -> 13.80, 64 rows level (50.96 -> 50.55).
+# A join's independent chains, and up to 256 rows every region, on side
+# streams, as vLLM runs DeepSeek-V4's.
 branches = true
-# Every region a graph can launch scheduled onto the streams by its
-# dependencies, a region an op: an attention's query, key/value, compressor
-# and index chains side by side (they share ops and caches, so no join's
-# branches are disjoint), as vLLM runs them on its streams.
 dag_streams = true
-# Up to 256 rows: a prefill's launches each fill the card, and the side
-# streams cost it 2% (3.808 -> 3.890 s).
 dag_streams_until = 256
