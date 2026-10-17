@@ -78,9 +78,13 @@ pub fn e4m3_values(
     )
 }
 
-/// `x` quantized as `e4m3_values` does, into this fire's scratch.
+/// `x` quantized as `e4m3_values` does, into this fire's scratch: as many
+/// rows as a product reading it launches over (`Ctx::opaque_rows`, the
+/// bucket a forward's rows pad to), so a GEMM over the padded rows reads
+/// memory this slab holds.
 pub fn quantized(ctx: &Ctx, op: &'static str, x: Tensor, gran: u32) -> Result<Tensor, Error> {
-    let bytes = (x.rows as usize)
+    let rows = usize::try_from(ctx.opaque_rows(i32::try_from(x.rows).unwrap_or(i32::MAX))).unwrap_or(x.rows as usize);
+    let bytes = rows.max(x.rows as usize)
         .saturating_mul(x.width as usize)
         .saturating_mul(2);
     let at = ctx.scratch(op, "linear.act_quant_values", bytes.max(16))? as usize as u64;
