@@ -197,19 +197,40 @@ def tower(reads, own, v, t):
     read_concat(reads, own, mg.gate_up, [v("merger.gate_proj.weight"), v("merger.up_proj.weight")])
     read(reads, own, mg.down, v("merger.down_proj.weight"))
 
+def fp8_bank(reads, w, experts):
+    """The bank `w` as stored: each expert's legs' e4m3 codes stacked, and
+    beside them the legs' f32 factors, one a 128x128 block."""
+    rows, cols = w.shape[1], w.shape[2]
+    blocks = [(rows + 127) // 128, (cols + 127) // 128]
+    joined = lambda parts: concat(0, parts) if len(parts) > 1 else parts[0]
+    codes = [joined([src(part) for part in legs]).transmute([1, rows, cols], encoding(dtype.e4m3)) for legs in experts]
+    factors = [joined([src(part + "_scale_inv") for part in legs]).transmute([1] + blocks, encoding(dtype.f32)) for legs in experts]
+    reads.extend([
+        tensor(w.name, concat(0, codes), encoding(dtype.e4m3)),
+        tensor(scales_name(w.name), concat(0, factors), encoding(dtype.f32), shape = [len(experts)] + blocks),
+    ])
+
 def moe(reads, own, n, f):
     read(reads, own, f.router, n("mlp.gate.weight"))
     read(reads, own, f.bias, n("mlp.gate.e_score_correction_bias"))
-    read_stack(reads, own, f.gate_up, [
-        [n("mlp.experts.{}.gate_proj.weight".format(e)), n("mlp.experts.{}.up_proj.weight".format(e))]
-        for e in range(f.experts)
-    ])
-    read_stack(reads, own, f.down, [[n("mlp.experts.{}.down_proj.weight".format(e))] for e in range(f.experts)])
+    if not own and f.gate_up.dtype == dtype.e4m3tile128:
+        leg = lambda e, leaf: n("mlp.experts.{}.{}.weight".format(e, leaf))
+        fp8_bank(reads, f.gate_up, [[leg(e, "gate_proj"), leg(e, "up_proj")] for e in range(f.experts)])
+        fp8_bank(reads, f.down, [[leg(e, "down_proj")] for e in range(f.experts)])
+    else:
+        bank(reads, own, n, f)
     read_concat(reads, own, f.shared.gate_up, [
         n("mlp.shared_experts.gate_proj.weight"),
         n("mlp.shared_experts.up_proj.weight"),
     ])
     read(reads, own, f.shared.down, n("mlp.shared_experts.down_proj.weight"))
+
+def bank(reads, own, n, f):
+    read_stack(reads, own, f.gate_up, [
+        [n("mlp.experts.{}.gate_proj.weight".format(e)), n("mlp.experts.{}.up_proj.weight".format(e))]
+        for e in range(f.experts)
+    ])
+    read_stack(reads, own, f.down, [[n("mlp.experts.{}.down_proj.weight".format(e))] for e in range(f.experts)])
 
 def mla(reads, own, n, a):
     for w, name in named(a, n):

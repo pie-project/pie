@@ -23,6 +23,9 @@ DEPLOYMENTS = [
     deployment("glm53-flash", weights = [dtype.u8g64, dtype.u2g64, dtype.u4g64], kv = dtype.bf16, drafter = "mtp"),
     deployment("glm53-flash-mini", weights = [dtype.u4g64, dtype.u4g64], kv = dtype.bf16),
     deployment("glm53-flash-mini", weights = [dtype.bf16, dtype.bf16], kv = dtype.bf16),
+    # The FP8 release as stored (`model.FP8`).
+    deployment("glm53-flash-mini", weights = [dtype.e4m3tile128a8f, dtype.e4m3tile128a8f], kv = dtype.bf16),
+    deployment("glm53-flash", weights = [dtype.e4m3tile128a8f, dtype.e4m3tile128a8f], kv = dtype.bf16),
     deployment("glm53-flash", weights = [dtype.u8g64, dtype.u2g64], kv = dtype.bf16),
     deployment(
         "glm53-flash",

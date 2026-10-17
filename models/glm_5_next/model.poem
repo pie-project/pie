@@ -65,8 +65,9 @@ def kda(n, l, k, hidden, weights, conv, eps, gate_floor, gate_rank = None, **ext
         **extra
     )
 
-def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False, **extra):
-    """The latent attention named by `n`, its projections in `weights` and
+def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False, up = None, **extra):
+    """The latent attention named by `n`, its projections in `weights` (its
+    latent up-projection, which the attention absorbs, in `up` if given) and
     its norms in `norms`, caching under `kv`. Its rope part is rotated at
     `theta`, or left as it is with none; `gated` adds a sigmoid gate on its
     output. `extra` rides along (an indexer, say)."""
@@ -90,7 +91,7 @@ def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False
         kv_b_proj = weight(
             n("kv_b_proj"),
             [d.heads * (d.qk_nope_head_dim + d.v_head_dim), d.kv_lora_rank],
-            weights,
+            up if up != None else weights,
         ).columns(),
         gate = weight(n("o_gate"), [v_width, hidden], weights).columns() if gated else None,
         o_proj = weight(n("o_proj"), [hidden, v_width], weights).rows(),
@@ -136,6 +137,14 @@ def flash(layers = 45, experts = 288):
         norm_eps = 1e-5,
     )
 
+# The FP8 release as stored (W8A8): the latent attention's projections, the
+# dense MLPs, the shared experts and the routed experts e4m3 in 128x128
+# blocks under f32 factors against e4m3 activations in 1x128 blocks; what it
+# keeps bf16 (the KDA mixers, the indexer, the latent up-projection the
+# attention absorbs, the hyper-connections, the norms, the router, the
+# embedding and the head) at bf16.
+FP8 = dtype.e4m3tile128a8f
+
 DIMS = {
     "glm53-flash": flash(),
     # The first eight layers at full width with the first 32 routed experts:
@@ -155,6 +164,12 @@ def layout(id, deploy):
         weights, experts = deploy.weights
         draft = None
     d = DIMS[id]
+    # `lin`: the projections the release stores FP8.
+    lin = weights
+    if weights == FP8:
+        if experts != FP8:
+            fail("{}'s FP8 release stores its routed experts FP8 too, not {}".format(id, experts))
+        weights = dtype.bf16
     dense = compute(weights)
     # The vocabulary tables quantize with the weights, except in a bf16
     # deployment, which keeps them bf16.
@@ -171,10 +186,11 @@ def layout(id, deploy):
             n,
             a,
             hidden,
-            weights = weights,
+            weights = lin,
             norms = dense,
             eps = d.norm_eps,
             kv = kv,
+            up = weights,
             indexer = struct(
                 heads = d.index_heads,
                 head_dim = d.index_head_dim,
@@ -206,8 +222,8 @@ def layout(id, deploy):
             gate_up = weight(n("experts_gate_up"), [m.experts, 2 * iw, hidden], banks_dtype).bank([iw, iw]),
             down = weight(n("experts_down"), [m.experts, hidden, iw], banks_dtype).rows(),
             shared = struct(
-                gate_up = weight(n("shared_gate_up"), [2 * sw, hidden], weights).packed([sw, sw]),
-                down = weight(n("shared_down"), [hidden, sw], weights).rows(),
+                gate_up = weight(n("shared_gate_up"), [2 * sw, hidden], lin).packed([sw, sw]),
+                down = weight(n("shared_down"), [hidden, sw], lin).rows(),
                 inter = sw,
             ),
             experts = m.experts,
@@ -242,8 +258,8 @@ def layout(id, deploy):
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight(n("gate_up"), [2 * iw, hidden], weights).packed([iw, iw]),
-                down = weight(n("down"), [hidden, iw], weights).rows(),
+                gate_up = weight(n("gate_up"), [2 * iw, hidden], lin).packed([iw, iw]),
+                down = weight(n("down"), [hidden, iw], lin).rows(),
                 inter = iw,
                 limit = d.swiglu_limit,
             )
