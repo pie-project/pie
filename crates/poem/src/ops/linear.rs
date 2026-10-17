@@ -4,8 +4,8 @@ use super::*;
 /// them quantized first.
 pub fn matmul(act: &Value, w: &Weight) -> Value {
     assert!(
-        w.act.is_some() || w.dtype != Dtype::Fp8b128,
-        "`{}` is stored fp8b128, which a W8A8 product reads; declare it at fp8b128a8",
+        w.act.is_some() || w.dtype.fp8_block().is_none(),
+        "`{}` is stored block-fp8, which a W8A8 product reads; declare it at fp8b128a8 or fp8b32a8g32",
         w.name,
     );
     let r = act.rec();
@@ -25,7 +25,7 @@ pub fn matmul(act: &Value, w: &Weight) -> Value {
                 w: r.weight(w),
                 quant,
                 input_scales: input_scales(r, w, quant),
-                scales: matches!(w.dtype, Dtype::Fp8b128 | Dtype::E4m3tile128)
+                scales: matches!(w.dtype, Dtype::Fp8b128 | Dtype::Fp8b32 | Dtype::E4m3tile128)
                     .then(|| r.weight_plane(w, poem_ir::SCALES)),
                 y: y.id(),
             },
@@ -46,7 +46,7 @@ fn input_scales(r: &Recorder, w: &Weight, quant: ActQuant) -> Option<ValueId> {
 /// `w` is read by `op`, which multiplies activations as they are.
 fn unquantized(w: &Weight, op: &str) {
     assert!(
-        w.act.is_none() && w.dtype != Dtype::Fp8b128,
+        w.act.is_none() && w.dtype.fp8_block().is_none(),
         "`{}` quantizes its activations, and {op} reads them at their own dtype; \
          declare it at its stored dtype",
         w.name,

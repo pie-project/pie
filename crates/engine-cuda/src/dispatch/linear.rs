@@ -1627,9 +1627,10 @@ impl Run<'_> {
         }
     }
 
-    /// An fp8b128 projection against e4m3 activations in 1x128 blocks on
-    /// one tcgen05 GEMM (DeepSeek's W8A8): raw e4m3 codes beside the block
-    /// exponents the load spread into atoms.
+    /// A block-FP8 projection against e4m3 activations on one tcgen05 GEMM
+    /// (DeepSeek's W8A8): raw e4m3 codes beside the block exponents the load
+    /// spread into atoms, 128x128 blocks against 1x128 activations (V4's
+    /// fp8b128) or 32x32 against 1x32 (V4.1's MXFP8).
     #[cfg(feature = "cuda")]
     fn fp8_block_matmul(
         &mut self,
@@ -1640,15 +1641,6 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.matmul_act_quant";
-        if quant != (ActQuant::E4m3 { gran: 128 }) {
-            return Err(kernels_cuda::Error::Backend {
-                op: OP,
-                detail: format!(
-                    "an fp8b128 projection reads e4m3 activations in 1x128 blocks, not \
-                     {quant:?}"
-                ),
-            });
-        }
         let codes = self.tensor(w);
         let atoms = self.tensor(block_scales);
         if atoms.dtype != Dtype::U8 {
@@ -1658,47 +1650,71 @@ impl Run<'_> {
         let act = self.tensor(act);
         let mut out = self.tensor(y);
         let (n, k) = (out.width, act.width);
+        // The atoms hold one exponent a block of K a row.
+        let block = if atoms.width == 0 {
+            0
+        } else {
+            k.div_ceil(atoms.width)
+        };
+        if !matches!(block, 32 | 128) || quant != (ActQuant::E4m3 { gran: block }) {
+            return Err(kernels_cuda::Error::Backend {
+                op: OP,
+                detail: format!(
+                    "a block-fp8 projection of {block}-wide blocks reads e4m3 activations in \
+                     1x{block} blocks, not {quant:?}"
+                ),
+            });
+        }
         let weight = act_quant::Weight {
             codes: codes.ptr,
             scales: atoms.ptr,
             n,
             k,
             elem: linear::tc5::Elem::E4m3,
-            gran: 128,
+            gran: block,
             laid: true,
         };
-        // A decode's few rows on the mma.sync fp8 kernel, its rows quantized
-        // in the same launch, where it leads (`kernel.gemm.fp8_mma_gemv_until`,
-        // `moe::dense_fp8_shape`).
-        #[cfg(feature = "cuda")]
-        if act.rows <= self.ctx().tuning().gemm_fp8_mma_gemv_until
-            && let Some(shape) = linear::moe::dense_fp8_shape(act.rows, n, k)
-        {
-            return linear::moe::matmul_grouped_fp8_with(
-                self.ctx(),
-                act,
-                codes.ptr,
-                atoms.ptr,
-                &mut out,
-                1,
-                shape,
-            );
-        }
-        // Else a GEMV over the activations as they are, where the profile
-        // says (`kernel.gemm.fp8_gemv_until`): ahead of the tcgen05 GEMM on
-        // codes a producer held for it too (at one row 10.2 -> 7.0 us for
-        // DeepSeek-V4-Flash's shared gate-up, 8.8 -> 4.4 its q down).
-        if act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)? {
-            return Ok(());
-        }
-        // Its producer landed the codes itself: no quantize launch.
-        if let Some(planes) = self.held_e4m3(act_id, &act) {
-            return act_quant::matmul_held(self.ctx(), OP, planes, act.rows, weight, &mut out, 1.0);
+        if block == 128 {
+            // A decode's few rows on the mma.sync fp8 kernel, its rows quantized
+            // in the same launch, where it leads (`kernel.gemm.fp8_mma_gemv_until`,
+            // `moe::dense_fp8_shape`).
+            if act.rows <= self.ctx().tuning().gemm_fp8_mma_gemv_until
+                && let Some(shape) = linear::moe::dense_fp8_shape(act.rows, n, k)
+            {
+                return linear::moe::matmul_grouped_fp8_with(
+                    self.ctx(),
+                    act,
+                    codes.ptr,
+                    atoms.ptr,
+                    &mut out,
+                    1,
+                    shape,
+                );
+            }
+            // Else a GEMV over the activations as they are, where the profile
+            // says (`kernel.gemm.fp8_gemv_until`): ahead of the tcgen05 GEMM on
+            // codes a producer held for it too (at one row 10.2 -> 7.0 us for
+            // DeepSeek-V4-Flash's shared gate-up, 8.8 -> 4.4 its q down).
+            if act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)? {
+                return Ok(());
+            }
+            // Its producer landed the codes itself: no quantize launch.
+            if let Some(planes) = self.held_e4m3(act_id, &act) {
+                return act_quant::matmul_held(
+                    self.ctx(),
+                    OP,
+                    planes,
+                    act.rows,
+                    weight,
+                    &mut out,
+                    1.0,
+                );
+            }
         }
         act_quant::matmul(
             self.ctx(),
             OP,
-            act_quant::Format::E4m3 { gran: 128 },
+            act_quant::Format::E4m3 { gran: block },
             act_quant::Source::rows(act, None),
             weight,
             &mut out,

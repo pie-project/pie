@@ -339,10 +339,11 @@ impl Weight {
             ],
             // Its codes and its block exponents are planes of their own, raw
             // e4m3 and e8m0, which a W8A8 product reads beside each other.
-            Dtype::Fp8b128 => {
+            Dtype::Fp8b128 | Dtype::Fp8b32 => {
+                let b = u64::from(self.dtype.fp8_block().unwrap_or(128));
                 let [n, k] = self.shape[..] else {
                     panic!(
-                        "`{}` is an fp8b128 weight declared {:?}; its 128x128 blocks \
+                        "`{}` is a block-fp8 weight declared {:?}; its {b}x{b} blocks \
                          scale a two-dimensional projection",
                         self.name, self.shape,
                     )
@@ -355,7 +356,7 @@ impl Weight {
                     },
                     BankPlane {
                         suffix: SCALES,
-                        shape: vec![n.div_ceil(128), k.div_ceil(128)],
+                        shape: vec![n.div_ceil(b), k.div_ceil(b)],
                         dtype: Dtype::E8m0,
                     },
                 ]
@@ -550,7 +551,7 @@ impl Precision {
     /// deployment's name spells each: NVFP4 against NVFP4 (W4A4, vLLM's
     /// modelopt product), and MXFP4 (W4A8) and DeepSeek's 128x128-block FP8
     /// (W8A8) against e4m3 in its 1x128 blocks.
-    pub const ACTED: [Precision; 4] = [
+    pub const ACTED: [Precision; 6] = [
         Precision {
             dtype: Dtype::Nvfp4,
             act: Some(ActQuant::Nvfp4),
@@ -568,6 +569,16 @@ impl Precision {
         Precision {
             dtype: Dtype::E4m3tile128,
             act: Some(ActQuant::E4m3 { gran: 128 }),
+        },
+        // DeepSeek-V4.1's release: MXFP8 dense weights (32x32 blocks) and
+        // MXFP4 experts, each against e4m3 in 1x32 blocks.
+        Precision {
+            dtype: Dtype::Fp8b32,
+            act: Some(ActQuant::E4m3 { gran: 32 }),
+        },
+        Precision {
+            dtype: Dtype::Mxfp4,
+            act: Some(ActQuant::E4m3 { gran: 32 }),
         },
     ];
 
@@ -645,6 +656,7 @@ pub fn compute_dtype(dtype: Dtype) -> Option<Dtype> {
         | Dtype::E4m3tile128
         | Dtype::E4m3tensor
         | Dtype::Fp8b128
+        | Dtype::Fp8b32
         | Dtype::Ptq1_0 => Some(Dtype::Bf16),
         Dtype::I64 => Some(Dtype::I64),
         Dtype::I32

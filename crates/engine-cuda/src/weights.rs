@@ -1699,7 +1699,16 @@ fn lay_tile_banks(
     Ok(())
 }
 
-/// Each fp8b128 projection's block exponents spread into the tcgen05 GEMM's
+/// The square block an `[n, k]` projection's exponent plane `shape` scales:
+/// 128 when it holds one exponent a 128x128 block, 32 a 32x32 block.
+#[cfg(feature = "cuda")]
+fn fp8_block_of(n: u64, k: u64, shape: &[u64]) -> Option<u64> {
+    [128, 32]
+        .into_iter()
+        .find(|&b| shape == [n.div_ceil(b), k.div_ceil(b)])
+}
+
+/// Each block-FP8 projection's block exponents spread into the tcgen05 GEMM's
 /// atoms, one row of them a weight row, in a buffer of their own (the atoms
 /// are 128 times the plane), bound in the plane's place as raw bytes: a
 /// low-precision projection reads a `u8` scale plane as laid.
@@ -1736,8 +1745,14 @@ fn lay_block_atoms(
         let [n, k] = trace.params[codes].shape[..] else {
             continue;
         };
-        let (rows, cols) = (n, k.div_ceil(128));
-        let bytes = kernels_cuda::linear::tc5::atom_bytes(rows as usize, k as usize, 128);
+        // The block the exponents scale: 128x128 (V4's fp8b128) or 32x32
+        // (V4.1's fp8b32), read off the exponent plane's own shape.
+        let Some(block) = fp8_block_of(n, k, &trace.params[at].shape) else {
+            continue;
+        };
+        let (rows, cols) = (n, k.div_ceil(block));
+        let bytes =
+            kernels_cuda::linear::tc5::atom_bytes(rows as usize, k as usize, block as usize);
         let atoms = Buffer::zeroed(bytes)?;
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
@@ -1749,6 +1764,9 @@ fn lay_block_atoms(
             let Some(Some(WeightRow::Dense(c))) = table.get(codes).copied() else {
                 continue;
             };
+            if block != 128 {
+                continue;
+            }
             let held_exps =
                 Buffer::zeroed(usize::try_from(rows.div_ceil(128) * cols).unwrap_or(usize::MAX))?;
             kernels_cuda::linear::act_quant::fp8_tile_requant(
@@ -1769,7 +1787,7 @@ fn lay_block_atoms(
             atoms.ptr(),
             u32::try_from(rows).unwrap_or(u32::MAX),
             u32::try_from(cols).unwrap_or(u32::MAX),
-            128,
+            u32::try_from(block).unwrap_or(u32::MAX),
         )?;
         table[at] = Some(WeightRow::Dense(Tensor::new(
             atoms.ptr(),

@@ -677,13 +677,13 @@ fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard 
     let Some(&stored) = plane.get(at) else {
         return Shard::Replicated;
     };
-    // An axis before the cut is stored verbatim, or (an fp8b128 projection's
-    // block exponents) one a 128-wide block.
+    // An axis before the cut is stored verbatim, or (a block-fp8
+    // projection's block exponents) one a 128- or 32-wide block.
     assert!(
         logical[..at]
             .iter()
             .zip(&plane[..at])
-            .all(|(l, p)| p == l || *p == l.div_ceil(128)),
+            .all(|(l, p)| p == l || *p == l.div_ceil(128) || *p == l.div_ceil(32)),
         "`{name}`: the axes before its cut, {:?}, are stored {:?}",
         &logical[..at],
         &plane[..at],

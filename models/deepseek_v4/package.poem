@@ -25,10 +25,16 @@ FP4 = dtype.mxfp4
 # read e4m3 activations in 1x128 blocks (W8A8 and W4A8).
 W8A8 = [dtype.fp8b128a8, dtype.mxfp4a8]
 
+# V4.1's release as DeepSeek serves it: MXFP8 projections (32x32 blocks)
+# and MXFP4 experts, each against e4m3 activations in 1x32 blocks.
+MX8 = [dtype.fp8b32a8g32, dtype.mxfp4a8g32]
+
 DEPLOYMENTS = [
     deployment("dsv41-flash", weights = U4, kv = BF),
     deployment("dsv41-flash", weights = [BF, FP4], kv = BF),
     deployment("dsv41-flash-mini", weights = [BF, FP4], kv = BF),
+    deployment("dsv41-flash", weights = MX8, kv = BF),
+    deployment("dsv41-flash-mini", weights = MX8, kv = BF),
     deployment("dsv4-flash", weights = [BF, FP4], kv = BF, drafter = "mtp"),
     deployment("dsv4-flash", weights = [BF, FP4], kv = BF),
     deployment("dsv4-flash", weights = W8A8, kv = BF),

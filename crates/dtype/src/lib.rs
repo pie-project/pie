@@ -48,12 +48,13 @@ pub enum Dtype {
     E4m3tile128,
     E4m3tensor,
     Fp8b128,
+    Fp8b32,
     Ptq1_0,
     KvU4,
 }
 
 impl Dtype {
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::F32,
         Self::F16,
         Self::Bf16,
@@ -88,6 +89,7 @@ impl Dtype {
         Self::E4m3tile128,
         Self::E4m3tensor,
         Self::Fp8b128,
+        Self::Fp8b32,
         Self::Ptq1_0,
         Self::KvU4,
     ];
@@ -238,6 +240,15 @@ impl Dtype {
                 gain: &Fmt::Elem(Elem::E { e: 8, m: 0 }),
                 offset: None,
             },
+            // DeepSeek-V4.1's MXFP8 dense weights as released: e4m3 codes
+            // under one ue8m0 exponent a 32x32 block, read by a W8A8 product
+            // against e4m3 in 1x32 blocks.
+            Self::Fp8b32 => &Fmt::Q {
+                g: Group::Tile(32, 32),
+                elem: Elem::E { e: 4, m: 3 },
+                gain: &Fmt::Elem(Elem::E { e: 8, m: 0 }),
+                offset: None,
+            },
             Self::E4m3tile128 => &Fmt::Q {
                 g: Group::Tile(128, 128),
                 elem: Elem::E { e: 4, m: 3 },
@@ -311,8 +322,20 @@ impl Dtype {
             Self::E4m3tile128 => "g128x128_e4m3_f32_n",
             Self::E4m3tensor => "gt_e4m3_f32_n",
             Self::Fp8b128 => "g128x128_e4m3_e8m0_n",
+            Self::Fp8b32 => "g32x32_e4m3_e8m0_n",
             Self::Ptq1_0 => "g128_t3_f16_n",
             Self::KvU4 => "g256_u4_f16_n",
+        }
+    }
+
+    /// The square block a DeepSeek block-FP8 weight scales by (one ue8m0
+    /// exponent a block): 128 for `fp8b128`, 32 for `fp8b32`.
+    #[must_use]
+    pub const fn fp8_block(self) -> Option<u32> {
+        match self {
+            Self::Fp8b128 => Some(128),
+            Self::Fp8b32 => Some(32),
+            _ => None,
         }
     }
 
