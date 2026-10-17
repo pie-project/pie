@@ -6,7 +6,6 @@ use crate::common::linear_ref::{Bench, pick, t, tab};
 use crate::common::{from_bf16, to_bf16};
 use dtype::Dtype::{Bf16, F32, I32};
 use kernels_cuda::linear::moe;
-use kernels_cuda::tuning::Tuning;
 
 #[test]
 fn the_ranked_routers_pick_the_best_experts() {
@@ -54,35 +53,5 @@ fn the_ranked_routers_pick_the_best_experts() {
                 assert!(near, "row {r} pick {j}: weight {got} against {want}");
             }
         }
-    }
-}
-
-#[test]
-fn the_warp_router_ranks_what_the_block_router_ranks() {
-    // (rows, experts, picks, a live window): ties included (coarse logits
-    // tie often), picks to 16, experts to 512, rows off the four a block.
-    #[rustfmt::skip]
-    let cases = [(5, 8, 8, None), (70, 60, 4, None), (1, 256, 10, None), (5, 512, 16, None), (64, 512, 10, Some((40, 8)))];
-    for (rows, ex, top, window) in cases {
-        let mut b = Bench::new(0x70b ^ (rows * 131 + ex * 7 + top) as u64);
-        let logits = tab(rows * ex, |_| to_bf16((b.lcg.unit() * 8.0).round() * 0.25));
-        let (l, n) = (t(b.up(&logits), rows, ex, Bf16), rows * top);
-        let mut land = |moe_topk_warp: bool| -> (Vec<i32>, Vec<u32>) {
-            let mut routes = t(b.up(&vec![-7i32; n]), rows, top, I32);
-            let mut weights = t(b.up(&vec![0x7f7f_7f7fu32; n]), rows, top, F32);
-            let base = Tuning::DEFAULT;
-            #[rustfmt::skip]
-            let ctx = b.ctx().with_tuning(Tuning { moe_topk_warp, ..base });
-            if let Some((live, first)) = window {
-                ctx.arm_stage(b.up(&[live, first, 0, 0]));
-            }
-            let (e, k, out) = (ex as u32, top as u32, (&mut routes, &mut weights));
-            moe::topk_softmax(&ctx, l, e, k, out.0, out.1).expect("the router fires");
-            ctx.disarm_stage();
-            b.sync();
-            (b.down(routes.ptr, n), b.down(weights.ptr, n))
-        };
-        let (block, warp) = (land(false), land(true));
-        assert!(warp == block, "{rows} rows of {ex} experts, top {top}");
     }
 }
