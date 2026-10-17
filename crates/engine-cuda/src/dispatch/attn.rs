@@ -910,6 +910,86 @@ impl Run<'_> {
                 *mark,
                 &mut self.tensor(*floor),
             ),
+            Attention::KvEnds {
+                request_of_token,
+                cache,
+                ends,
+            } => {
+                // Each row's request against the whole fire's tables, as
+                // the window that reads these ends does.
+                let pool = self
+                    .pool_whole(*cache)
+                    .ok_or_else(|| kernels_cuda::Error::Backend {
+                        op: "attention.kv_ends",
+                        detail: "a cache over gathered seats".to_string(),
+                    })?;
+                kernels_cuda::attn_replay::kv_ends(
+                    self.ctx(),
+                    self.tensor(*request_of_token),
+                    &pool,
+                    &mut self.tensor(*ends),
+                )
+            }
+            Attention::WindowSink {
+                q,
+                positions,
+                request_of_token,
+                cache,
+                sink,
+                window,
+                head_dim,
+                sm_scale,
+                o,
+            } => {
+                const OP: &str = "attention.window_sink";
+                // Each row reads its request's pages against the whole
+                // fire's tables, as DeepSeek's fused decode does.
+                let pool = self
+                    .pool_whole(*cache)
+                    .ok_or_else(|| kernels_cuda::Error::Backend {
+                        op: OP,
+                        detail: "a window over gathered seats".to_string(),
+                    })?;
+                let q = self.tensor(*q);
+                kernels_cuda::attn::dsv4::decode(
+                    self.ctx(),
+                    q,
+                    self.tensor(*positions),
+                    self.tensor(*request_of_token),
+                    None,
+                    &pool,
+                    *window,
+                    None,
+                    self.tensor(*sink),
+                    q.width / (*head_dim).max(1),
+                    *head_dim,
+                    *sm_scale,
+                    None,
+                    &mut self.tensor(*o),
+                )
+            }
+            Attention::MarkovWalk {
+                logits,
+                tokens,
+                positions,
+                ends,
+                embed,
+                head,
+                block,
+                biased,
+                picks,
+            } => kernels_cuda::attn::markov::walk(
+                self.ctx(),
+                self.tensor(*logits),
+                self.tensor(*tokens),
+                self.tensor(*positions),
+                self.tensor(*ends),
+                self.tensor(*embed),
+                self.tensor(*head),
+                *block,
+                &mut self.tensor(*biased),
+                &mut self.tensor(*picks),
+            ),
             Attention::PleNgramIdsChunked {
                 ids,
                 state,

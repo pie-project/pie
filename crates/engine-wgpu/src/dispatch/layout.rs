@@ -135,6 +135,8 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
+            // DSpark's taps side by side are DeepSeek-V4.1's, served on CUDA.
+            Layout::ConcatCols { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
             Layout::GridTaps {
                 positions,
                 grids,

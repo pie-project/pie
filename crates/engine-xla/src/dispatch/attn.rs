@@ -139,7 +139,12 @@ impl Run<'_> {
                 ..
             } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             // Bounded replay's floors are DeepSeek-V4.1's, served on CUDA.
-            Attention::ReplayFloor { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
+            Attention::ReplayFloor { .. }
+            | Attention::KvEnds { .. }
+            | Attention::WindowSink { .. }
+            | Attention::MarkovWalk { .. } => {
+                Err(kernels_xla::Error::Unsupported { op: op.name() })
+            }
             Attention::DecodeSelected {
                 q,
                 plan,

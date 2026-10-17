@@ -2,9 +2,9 @@
 
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::attn::selector;
+use kernels_cuda::attn::{markov, selector};
 use kernels_cuda::layout;
-use kernels_cuda::tensor::{RaggedTensor, Tensor};
+use kernels_cuda::tensor::{KvPool, RaggedTensor, Tensor};
 
 fn beats(av: f32, ai: usize, bv: f32, bi: usize) -> bool {
     av > bv || (av == bv && ai < bi)
@@ -52,6 +52,8 @@ fn the_dspark_readout_points_answer_their_host_reference_every_case() {
     the_argmax_lands_the_lowest_tied_column_and_skips_a_nan();
     the_topk_is_sorted_with_ties_to_the_lower_column();
     the_selector_walk_follows_the_best_successor_from_the_anchor();
+    the_markov_walk_biases_each_row_by_the_pick_before_it();
+    the_kv_ends_and_column_concat_land_what_the_host_lands();
 }
 
 fn the_argmax_lands_the_lowest_tied_column_and_skips_a_nan() {
@@ -258,6 +260,191 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
                 }
                 prev = got[row] as usize;
             }
+        }
+    }
+}
+
+fn the_markov_walk_biases_each_row_by_the_pick_before_it() {
+    // A vocabulary off the 128-row tile; blocks read out 5, 1, 3 and 5 rows
+    // deep; f32 logits and the trunk's bf16 ones.
+    let (vocab, rank, block) = (1000usize, markov::RANK as usize, 5u32);
+    let indptr: [i32; 5] = [0, 5, 6, 9, 14];
+    let rows = 14usize;
+    let firsts = [100i32, 7, 50, 200];
+    let (mut positions, mut ends) = (Vec::new(), Vec::new());
+    for lane in 0..4 {
+        for row in 0..(indptr[lane + 1] - indptr[lane]) {
+            positions.push(firsts[lane] + row);
+            ends.push(firsts[lane] + block as i32 - 1);
+        }
+    }
+    let mut lcg = Lcg::seeded(0x4d);
+    let (embed_raw, embed) = lcg.row(vocab * rank);
+    let (head_raw, head) = lcg.row(vocab * rank);
+    let logits: Vec<f32> = (0..rows * vocab)
+        .map(|_| from_bf16(to_bf16(lcg.unit() * 4.0)))
+        .collect();
+    let logits_raw: Vec<u16> = logits.iter().map(|&v| to_bf16(v)).collect();
+    let tokens: Vec<i32> = (0..rows).map(|r| ((r * 131 + 17) % vocab) as i32).collect();
+
+    let mut gpu = Gpu::open();
+    let positions_at = gpu.up(&positions);
+    let ends_at = gpu.up(&ends);
+    let tokens_at = gpu.up(&tokens);
+    let embed_at = gpu.up(&embed_raw);
+    let head_at = gpu.up(&head_raw);
+    for dtype in [Dtype::F32, Dtype::Bf16] {
+        let (logits_at, elem) = if dtype == Dtype::F32 {
+            (gpu.up(&logits), 4)
+        } else {
+            (gpu.up(&logits_raw), 2)
+        };
+        let biased_at = gpu.zeros(rows * vocab * elem);
+        let picks_at = gpu.zeros(rows * 4);
+        let mut biased = Tensor::new(biased_at, rows as u32, vocab as u32, dtype);
+        let mut picks = Tensor::new(picks_at, rows as u32, 1, Dtype::I32);
+        markov::walk(
+            &gpu.ctx(),
+            Tensor::new(logits_at, rows as u32, vocab as u32, dtype),
+            Tensor::new(tokens_at, rows as u32, 1, Dtype::I32),
+            Tensor::new(positions_at, rows as u32, 1, Dtype::I32),
+            Tensor::new(ends_at, rows as u32, 1, Dtype::I32),
+            Tensor::new(embed_at, vocab as u32, rank as u32, Dtype::Bf16),
+            Tensor::new(head_at, vocab as u32, rank as u32, Dtype::Bf16),
+            block,
+            &mut biased,
+            &mut picks,
+        )
+        .expect("the walk fires");
+        gpu.sync();
+        let got: Vec<f32> = if dtype == Dtype::F32 {
+            gpu.down(biased_at, rows * vocab)
+        } else {
+            gpu.down::<u16>(biased_at, rows * vocab)
+                .into_iter()
+                .map(from_bf16)
+                .collect()
+        };
+        let got_picks: Vec<i32> = gpu.down(picks_at, rows);
+        // bf16 lands the sum to half its last place.
+        let tol = |want: f32| {
+            if dtype == Dtype::F32 {
+                1e-2
+            } else {
+                1e-2 + want.abs() / 256.0
+            }
+        };
+
+        for lane in 0..4 {
+            let (begin, end) = (indptr[lane] as usize, indptr[lane + 1] as usize);
+            let mut prev = tokens[begin] as usize;
+            for row in begin..end {
+                let want: Vec<f32> = (0..vocab)
+                    .map(|v| {
+                        let dot: f32 = (0..rank)
+                            .map(|k| head[v * rank + k] * embed[prev * rank + k])
+                            .sum();
+                        logits[row * vocab + v] + dot
+                    })
+                    .collect();
+                let line = &got[row * vocab..(row + 1) * vocab];
+                for v in 0..vocab {
+                    assert!(
+                        (line[v] - want[v]).abs() < tol(want[v]),
+                        "{dtype:?} lane {lane} row {row} column {v}: {} against {}",
+                        line[v],
+                        want[v]
+                    );
+                }
+                // The pick is the biased row's argmax; the next row's bias
+                // is the pick's.
+                let pick = got_picks[row] as usize;
+                let best = want.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                assert!(
+                    pick < vocab && want[pick] >= best - 1e-2,
+                    "{dtype:?} lane {lane} row {row} picked {pick} ({}) against the best {best}",
+                    want.get(pick).copied().unwrap_or(f32::NAN)
+                );
+                prev = pick;
+            }
+        }
+    }
+}
+
+fn the_kv_ends_and_column_concat_land_what_the_host_lands() {
+    let mut gpu = Gpu::open();
+    // Three lanes over 16-position pages: 2 pages 5 deep, 1 page 16 deep,
+    // 3 pages 1 deep; rows of each, and a padded row of none.
+    const PAGE: i32 = 16;
+    let indptr: [u32; 4] = [0, 2, 3, 6];
+    let last: [u32; 3] = [5, 16, 1];
+    let req: Vec<i32> = vec![0, 0, 1, 2, 2, 2, -1];
+    let pool = KvPool {
+        keys: Tensor::ABSENT,
+        values: Tensor::ABSENT,
+        bf16_keys: Tensor::ABSENT,
+        bf16_values: Tensor::ABSENT,
+        key_scales: Tensor::ABSENT,
+        value_scales: Tensor::ABSENT,
+        page_indices: Tensor::ABSENT,
+        page_indptr: Tensor::new(gpu.up(&indptr), 4, 1, Dtype::U32),
+        last_page_lens: Tensor::new(gpu.up(&last), 3, 1, Dtype::U32),
+        row_valid: Tensor::ABSENT,
+        env_min: Tensor::ABSENT,
+        env_max: Tensor::ABSENT,
+        has_envelopes: false,
+        page_size: PAGE,
+        seq_stride: 0,
+        head_stride: 0,
+        layout: 0,
+        scheme_byte: 0,
+        block_size: 0,
+        max_pages_per_request: 3,
+        pages_in_batch: 6,
+    };
+    let req_at = gpu.up(&req);
+    let ends_at = gpu.zeros(req.len() * 4);
+    let mut ends = Tensor::new(ends_at, req.len() as u32, 1, Dtype::I32);
+    kernels_cuda::attn_replay::kv_ends(
+        &gpu.ctx(),
+        Tensor::new(req_at, req.len() as u32, 1, Dtype::I32),
+        &pool,
+        &mut ends,
+    )
+    .expect("the kv ends fire");
+    gpu.sync();
+    let got: Vec<i32> = gpu.down(ends_at, req.len());
+    assert_eq!(got, vec![20, 20, 15, 32, 32, 32, -1]);
+
+    // Unaligned widths (a byte a thread) and 16-byte runs.
+    let rows = 37usize;
+    for widths in [vec![8usize, 3, 16], vec![8, 16, 64]] {
+        let mut lcg = Lcg::seeded(0x91);
+        let parts: Vec<Vec<u16>> = widths.iter().map(|w| lcg.row(rows * w).0).collect();
+        let total: usize = widths.iter().sum();
+        let ats: Vec<u64> = parts.iter().map(|p| gpu.up(p)).collect();
+        let y_at = gpu.zeros(rows * total * 2);
+        let xs: Vec<Tensor> = ats
+            .iter()
+            .zip(&widths)
+            .map(|(&at, &w)| Tensor::new(at, rows as u32, w as u32, Dtype::Bf16))
+            .collect();
+        let mut y = Tensor::new(y_at, rows as u32, total as u32, Dtype::Bf16);
+        kernels_cuda::layout_concat_cols::concat_cols(&gpu.ctx(), &xs, &mut y)
+            .expect("the concat fires");
+        gpu.sync();
+        let got: Vec<u16> = gpu.down(y_at, rows * total);
+        for r in 0..rows {
+            let want: Vec<u16> = parts
+                .iter()
+                .zip(&widths)
+                .flat_map(|(p, &w)| p[r * w..(r + 1) * w].iter().copied())
+                .collect();
+            assert_eq!(
+                &got[r * total..(r + 1) * total],
+                &want[..],
+                "{widths:?} row {r}"
+            );
         }
     }
 }

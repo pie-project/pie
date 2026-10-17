@@ -41,4 +41,25 @@ __global__ void replay_floor(
     }
 }
 
+// Each row's lane's last key position: its kv extent (the lane's pages,
+// the last one `last_page_lens` deep) less one; -1 for a row of no lane.
+__global__ void kv_ends(
+    const int* __restrict__ request_of_token,
+    const u32* __restrict__ page_indptr,
+    const u32* __restrict__ last_page_lens,
+    int page_size,
+    int* __restrict__ ends,
+    int rows)
+{
+    const int t = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (t >= rows) return;
+    const int req = request_of_token[t];
+    if (req < 0) {
+        ends[t] = -1;
+        return;
+    }
+    const int pages = static_cast<int>(page_indptr[req + 1]) - static_cast<int>(page_indptr[req]);
+    ends[t] = pages > 0 ? (pages - 1) * page_size + static_cast<int>(last_page_lens[req]) - 1 : -1;
+}
+
 }  // namespace pie::attn

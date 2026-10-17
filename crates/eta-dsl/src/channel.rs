@@ -85,6 +85,7 @@ impl Channel {
             host_reads: Vec::new(),
             desc_takes: Vec::new(),
             desc_reads: Vec::new(),
+            queued: false,
         }));
         context::register_channel_state(gid, state.clone());
         Channel { state }
@@ -97,6 +98,16 @@ impl Channel {
 
     pub fn named(self, name: &str) -> Channel {
         self.state.borrow_mut().name = String::from(name);
+        self
+    }
+
+    /// A queue between passes: another pass consumes it, so a pass that
+    /// only puts it is no terminal output; and a pass that peeks it as a
+    /// port takes each value itself, so another pass's put appends rather
+    /// than replacing the value a peek would read (the latest-value drain a
+    /// pass that re-publishes its own descriptor takes).
+    pub fn queued(self) -> Channel {
+        self.state.borrow_mut().queued = true;
         self
     }
 

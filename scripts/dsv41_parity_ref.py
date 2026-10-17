@@ -36,6 +36,14 @@ positions, so their windows read none there, at the prefill and the
 decode steps after it. The teacher-forced logits stay the full model's
 (pie reads them a token a fire, which never skips a row).
 
+`--dspark` also drafts with the release's DSpark head (a snapshot cut with
+`shrink_checkpoint.py --dspark`) after each greedy step, as DeepSeek's
+`forward_spec` does: the window seeded at the prefill, then a block of
+`dspark_block_size` rows a step, anchored at the step's pick. Writes
+
+    OUT/NAME.ref.dspark.f32   float32 [steps, block, vocab] each step's block logits, Markov-biased
+    OUT/NAME.ref.json         ... and "drafts": [steps][block] the head's picks
+
 `scripts/dsv4_mini_parity_compare.py OUT --a pie --b ref` reads the pie side
 (`crates/engine-cuda/tests/engine_cuda/a_family_is_read_against_its_reference.rs`)
 against these.
@@ -192,7 +200,7 @@ def install_kernel(sim):
     sys.modules["kernel"] = k
 
 
-def model_args(model_mod, cfg):
+def model_args(model_mod, cfg, dspark=False):
     t = cfg.get("text_config", cfg)
     q = cfg.get("quantization_config", t.get("quantization_config", {}))
     fields = dict(
@@ -226,6 +234,16 @@ def model_args(model_mod, cfg):
         engram_compressed_vocab_size=t.get("engram_compressed_vocab_size", 0),
         vision_n_layers=0, dspark_block_size=0,
     )
+    if dspark:
+        fields.update(
+            n_mtp_layers=t["num_nextn_predict_layers"],
+            dspark_block_size=t["dspark_block_size"],
+            dspark_noise_token_id=t["dspark_noise_token_id"],
+            dspark_target_layer_ids=tuple(t["dspark_target_layer_ids"]),
+            dspark_markov_rank=t.get("dspark_markov_rank", 256),
+            dspark_n_routed_experts=t.get("dspark_n_routed_experts", 0),
+            dspark_n_activated_experts=t.get("dspark_num_experts_per_tok", 0),
+        )
     return model_mod.ModelArgs(**fields)
 
 
@@ -285,17 +303,23 @@ def install_replay(mod):
     mod.Attention._window_kv = floored
 
 
-def logits_all(model, mod, ids, start_pos):
-    """`Transformer.forward` with every position's logits."""
+def logits_all(model, mod, ids, start_pos, taps=None):
+    """`Transformer.forward` with every position's logits; with `taps` (a
+    list) the DSpark head's `main_hidden` appended to it."""
     engram_hashes = model.engram_hash(ids, start_pos, None) if model.engram_hash is not None else None
     h = model.embed(ids)
     h = h.unsqueeze(2).repeat(1, 1, model.hc_mult, 1)
     pre_mix = mod.make_identity_pre_mix(h, model.hc_mult)
-    for layer in model.layers:
+    main_hiddens = []
+    for i, layer in enumerate(model.layers):
         if layer.engram is not None:
             h = layer.engram(h, engram_hashes[:, :, layer.engram.layer_hash_index, :], None)
+        if i in model.target_layer_ids:
+            main_hiddens.append(h.mean(dim=2))
         h, pre_mix = layer(h, start_pos, pre_mix, None)
     h = layer.hc_pre(h, pre_mix)
+    if taps is not None:
+        taps.append(torch.cat(main_hiddens, dim=-1))
     return model.head(model.norm(h), full_logits=True)
 
 
@@ -314,6 +338,8 @@ def main():
                     help="run only the first N layers (then the head), to bisect a disagreement")
     ap.add_argument("--replay", action="store_true",
                     help="generate under bounded replay: the decoder's windows hold the prompt's last window alone")
+    ap.add_argument("--dspark", action="store_true",
+                    help="draft with the snapshot's DSpark head after each greedy step")
     ap.add_argument("--tag", default="ref")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -370,7 +396,7 @@ def main():
     torch.set_default_device("cuda")
     cfg = json.load(open(os.path.join(args.snapshot, "config.json")))
     tokenizer = AutoTokenizer.from_pretrained(args.snapshot)
-    margs = model_args(mod, cfg)
+    margs = model_args(mod, cfg, args.dspark)
     if args.layers is not None:
         margs.n_layers = args.layers
     with torch.device("cuda"):
@@ -394,29 +420,42 @@ def main():
         with torch.inference_mode():
             x = torch.tensor([ids], device="cuda")
             REPLAY["floor"] = 0
-            tf = logits_all(model, mod, x, 0)[0].float().cpu().numpy()
+            taps = [] if args.dspark else None
+            tf = logits_all(model, mod, x, 0, taps)[0].float().cpu().numpy()
             gen_rows = [tf[-1].copy()]
             if args.replay and len(ids) > text["sliding_window"]:
                 # The prefill again, the decoder replaying the last window.
                 REPLAY["floor"] = len(ids) - text["sliding_window"]
-                gen_rows = [logits_all(model, mod, x, 0)[0, -1].float().cpu().numpy()]
+                taps = [] if args.dspark else None
+                gen_rows = [logits_all(model, mod, x, 0, taps)[0, -1].float().cpu().numpy()]
             produced = []
             last = int(gen_rows[0].argmax())
+            if args.dspark:
+                # The prefill seeds each stage's window.
+                model.forward_spec(torch.tensor([last], device="cuda"), taps[-1], 0)
+            drafts, draft_rows = [], []
             pos = len(ids)
             for _ in range(args.steps):
                 produced.append(last)
-                row = logits_all(model, mod, torch.tensor([[last]], device="cuda"), pos)[0, -1]
+                taps = [] if args.dspark else None
+                row = logits_all(model, mod, torch.tensor([[last]], device="cuda"), pos, taps)[0, -1]
                 row = row.float().cpu().numpy()
                 gen_rows.append(row)
                 last = int(row.argmax())
+                if args.dspark:
+                    out_ids, block_logits, _ = model.forward_spec(
+                        torch.tensor([last], device="cuda"), taps[-1], pos)
+                    drafts.append([int(t) for t in out_ids[0, 1:]])
+                    draft_rows.append(block_logits[0].float().cpu().numpy())
                 pos += 1
         vocab = tf.shape[-1]
         tf.astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.tf.f32"))
         np.stack(gen_rows).astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.gen.f32"))
-        json.dump(
-            {"ids": ids, "argmax": [int(a) for a in tf.argmax(-1)], "gen": produced, "vocab": vocab},
-            open(os.path.join(args.out, f"{name}.{args.tag}.json"), "w"),
-        )
+        summary = {"ids": ids, "argmax": [int(a) for a in tf.argmax(-1)], "gen": produced, "vocab": vocab}
+        if args.dspark:
+            np.stack(draft_rows).astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.dspark.f32"))
+            summary["drafts"] = drafts
+        json.dump(summary, open(os.path.join(args.out, f"{name}.{args.tag}.json"), "w"))
         print(f"  {name}: {len(ids)} tokens, vocab {vocab}, gen={produced[:12]}  ({time.time() - started:.1f}s)")
 
 

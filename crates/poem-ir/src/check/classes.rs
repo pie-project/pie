@@ -447,6 +447,9 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::SsmGdnPrep { .. }
             | Attention::BlockDynConv { .. }
             | Attention::SelectorWalk { .. }
+            | Attention::KvEnds { .. }
+            | Attention::WindowSink { .. }
+            | Attention::MarkovWalk { .. }
             | Attention::IndexLayernormRope { .. }
             | Attention::IndexRope { .. }
             | Attention::IndexTopk { .. }

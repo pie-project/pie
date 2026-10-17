@@ -316,7 +316,31 @@ fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, boo
 }
 
 pub fn geometry_taint(bound: &BoundTrace) -> GeometryTaint {
-    let mut device_decided: BTreeSet<u32> = BTreeSet::new();
+    // A channel no host writes, no seed fills and no stage of this pass
+    // puts is another pass's: a queue between passes of one program, decided
+    // on the device where that pass put it.
+    let put_here: BTreeSet<u32> = bound
+        .container
+        .stages
+        .iter()
+        .flat_map(|program| program.ops.iter())
+        .filter_map(|op| match op {
+            Op::ChanPut { chan, .. } => Some(*chan),
+            _ => None,
+        })
+        .collect();
+    let mut device_decided: BTreeSet<u32> = bound
+        .container
+        .channels
+        .iter()
+        .enumerate()
+        .filter(|(at, declared)| {
+            declared.host_role == eta_ir::container::HostRole::None
+                && !declared.seeded
+                && !put_here.contains(&(*at as u32))
+        })
+        .map(|(at, _)| at as u32)
+        .collect();
     loop {
         let mut grew = false;
         for program in &bound.container.stages {

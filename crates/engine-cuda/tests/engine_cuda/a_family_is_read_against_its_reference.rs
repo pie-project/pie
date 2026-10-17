@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use engine_cuda::experts::{Budgets, Plan};
-use engine_cuda::{Boot, Graphs, Knobs, Lane, Shell, World};
+use engine_cuda::{Boot, Graphs, Knobs, Lane, Seated, Shell, World};
 use poem::{Platform, Request};
 use poem_compiler::Budget;
 
@@ -126,6 +126,15 @@ fn every_probe_is_dumped() {
     let trace = deployment.trace(Platform::Cuda);
     let facts = deployment.trace(poem::Platform::Cuda).facts;
     let word = |query_len: u32| facts.word(&Request::new(query_len, false));
+    // `PIE_PARITY_DSPARK`: after each greedy step, a drafted block anchored
+    // at the step's pick (the deployment's block drafter, read out every
+    // row), its logits beside the reference's `forward_spec`.
+    let drafter = std::env::var_os("PIE_PARITY_DSPARK").map(|_| {
+        trace
+            .drafter
+            .expect("PIE_PARITY_DSPARK reads a deployment that drafts a block")
+    });
+    let block_word = |rows: u32| facts.word(&Request::new(rows, false).drafting_a_block(true));
     let budget = |key: &str| -> Option<u64> {
         let text = std::env::var(key).ok()?;
         let text = text.trim();
@@ -284,29 +293,67 @@ fn every_probe_is_dumped() {
             .expect("the prefill fires");
         let mut gen_rows: Vec<Vec<f32>> = vec![got.into_iter().next().expect("one row")];
         let mut produced: Vec<u32> = Vec::with_capacity(steps);
-        for _ in 0..steps {
+        let mut draft_rows: Vec<Vec<f32>> = Vec::new();
+        let mut drafts: Vec<Vec<u32>> = Vec::new();
+        for step in 0..steps {
             let nxt = argmax(gen_rows.last().expect("a row"));
             produced.push(nxt);
             let fed = [nxt];
+            // The committed length: a drafted block above it never was.
+            let held = (ids.len() + step) as u32;
             let got = shell
-                .fire(&[Lane {
-                    slot: gen_slot,
-                    word: word(1),
-                    tokens: &fed,
-                }])
+                .fire_rows(
+                    &[Seated {
+                        held: Some(held),
+                        ..Seated::of(Lane {
+                            slot: gen_slot,
+                            word: word(1),
+                            tokens: &fed,
+                        })
+                    }],
+                    &[],
+                )
                 .expect("a decode fires");
             gen_rows.push(got.into_iter().next().expect("one row"));
+            if let Some(d) = drafter {
+                let mut block = vec![d.mask_token; d.rows as usize];
+                block[0] = argmax(gen_rows.last().expect("a row"));
+                let rows: Vec<u32> = (0..d.rows).collect();
+                let got = shell
+                    .fire_rows(
+                        &[Seated {
+                            held: Some(held + 1),
+                            readout: Some(&rows),
+                            ..Seated::of(Lane {
+                                slot: gen_slot,
+                                word: block_word(d.rows),
+                                tokens: &block,
+                            })
+                        }],
+                        &[engine::fire::Readout::Rows(rows.clone())],
+                    )
+                    .expect("a drafted block fires");
+                let flat = got.into_iter().next().expect("one lane");
+                let vocab = flat.len() / d.rows as usize;
+                let picks: Vec<u32> = flat.chunks(vocab).map(argmax).collect();
+                draft_rows.extend(flat.chunks(vocab).map(<[f32]>::to_vec));
+                drafts.push(picks);
+            }
         }
 
         write_rows(&out.join(format!("{name}.{tag}.tf.f32")), &tf_rows);
         write_rows(&out.join(format!("{name}.{tag}.gen.f32")), &gen_rows);
         let argmaxes: Vec<u32> = tf_rows.iter().map(|r| argmax(r)).collect();
+        let mut summary = serde_json::json!({
+            "ids": ids, "argmax": argmaxes, "gen": produced, "vocab": tf_rows[0].len(),
+        });
+        if drafter.is_some() {
+            write_rows(&out.join(format!("{name}.{tag}.dspark.f32")), &draft_rows);
+            summary["drafts"] = serde_json::json!(drafts);
+        }
         std::fs::write(
             out.join(format!("{name}.{tag}.json")),
-            serde_json::to_string(&serde_json::json!({
-                "ids": ids, "argmax": argmaxes, "gen": produced, "vocab": tf_rows[0].len(),
-            }))
-            .expect("json"),
+            serde_json::to_string(&summary).expect("json"),
         )
         .expect("the summary is written");
         eprintln!(

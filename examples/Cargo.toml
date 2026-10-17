@@ -31,6 +31,7 @@ members = [
     "rs-mtp-speculative-bench",
     "rs-speculative-decoding",
     "dflash-speculative-bench",
+    "dspark-speculative-bench",
     "rs-window-decode",
     "dry-repetition-penalty",
     "frames-probe",

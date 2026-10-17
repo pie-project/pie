@@ -507,6 +507,29 @@ impl Shell {
         Ok(std::mem::take(&mut settled.logits))
     }
 
+    /// [`Shell::fire_media`] over text lanes alone, each lane's logits the
+    /// rows `want` names of it (its last where it names none).
+    pub fn fire_rows(
+        &mut self,
+        lanes: &[Seated<'_>],
+        want: &[engine::fire::Readout],
+    ) -> Result<Vec<Vec<f32>>> {
+        let prepared = FrameShell::prepare(
+            self,
+            StepView {
+                lanes,
+                attachments: &[],
+                media: &[],
+                voxels: &[],
+            },
+            None,
+        )?;
+        let enqueued = FrameShell::enqueue(self, prepared)?;
+        let mut settled = FrameShell::settle(self, enqueued)?;
+        Shell::read_out_rows(self, &mut settled, want)?;
+        Ok(std::mem::take(&mut settled.logits))
+    }
+
     pub fn drain(&mut self) -> Result<()> {
         self.device.synchronize()
     }

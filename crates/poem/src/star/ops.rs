@@ -2936,6 +2936,104 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "layout",
+        name: "concat_cols",
+        params: &["xs"],
+        call: |a, heap| {
+            let xs: Vec<Value> = a.next()?;
+            result(
+                heap,
+                dsl("layout.concat_cols", || {
+                    ops::layout::concat_cols(&xs.iter().collect::<Vec<_>>())
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "kv_ends",
+        params: &["request_of_token", "pages"],
+        call: |a, heap| {
+            let request_of_token: Value = a.next()?;
+            let pages: ValueId = a.next()?;
+            result(
+                heap,
+                dsl("attn.kv_ends", || {
+                    ops::attn::kv_ends(&request_of_token, pages)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "window_sink",
+        params: &[
+            "q",
+            "positions",
+            "request_of_token",
+            "pages",
+            "sink",
+            "window",
+            "head_dim",
+            "sm_scale",
+        ],
+        call: |a, heap| {
+            let q: Value = a.next()?;
+            let positions: Value = a.next()?;
+            let request_of_token: Value = a.next()?;
+            let pages: ValueId = a.next()?;
+            let sink: Weight = a.next()?;
+            let window: u32 = a.next()?;
+            let head_dim: u32 = a.next()?;
+            let sm_scale: f32 = a.next()?;
+            result(
+                heap,
+                dsl("attn.window_sink", || {
+                    ops::attn::window_sink(
+                        &q,
+                        &positions,
+                        &request_of_token,
+                        pages,
+                        &sink,
+                        window,
+                        head_dim,
+                        sm_scale,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "markov_walk",
+        params: &[
+            "logits",
+            "tokens",
+            "positions",
+            "ends",
+            "embed",
+            "head",
+            "block",
+        ],
+        call: |a, heap| {
+            let logits: Value = a.next()?;
+            let tokens: Value = a.next()?;
+            let positions: Value = a.next()?;
+            let ends: Value = a.next()?;
+            let embed: Weight = a.next()?;
+            let head: Weight = a.next()?;
+            let block: u32 = a.next()?;
+            result(
+                heap,
+                dsl("attn.markov_walk", || {
+                    ops::attn::markov_walk(
+                        &logits, &tokens, &positions, &ends, &embed, &head, block,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "layout",
         name: "topk",
         params: &["x", "k"],
         call: |a, heap| {

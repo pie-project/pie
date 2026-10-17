@@ -121,6 +121,15 @@ pub fn detect_pooled_device_geometry(
         }
     }
 
+    // A port the pass's own epilogue re-publishes, or one no host can write
+    // and no seed fills (unseeded, host role none): another pass of the
+    // same program puts it on the device (a queue between passes).
+    let device_fed = |channel: usize| {
+        republished(channel)
+            || container.channels.get(channel).is_some_and(|declared| {
+                declared.host_role == eta_ir::container::HostRole::None && !declared.seeded
+            })
+    };
     for port in [
         Port::EmbedTokens,
         Port::Positions,
@@ -131,7 +140,7 @@ pub fn detect_pooled_device_geometry(
         Port::WOff,
     ] {
         let channel = channel_of(port)?;
-        if !republished(channel) {
+        if !device_fed(channel) {
             return None;
         }
     }
@@ -397,6 +406,35 @@ mod pooled_tests {
         a_mask_free_decode_that_republishes_every_port_is_pooled_too();
         a_decode_whose_pages_are_a_constant_keeps_the_envelope_path();
         a_host_driven_descriptor_is_not_pooled_device_geometry();
+        a_decode_another_pass_lays_out_is_pooled_device_geometry();
+    }
+
+    fn a_decode_another_pass_lays_out_is_pooled_device_geometry() {
+        // A block drafter's loop: the verify lays out the draft's geometry,
+        // so the draft's ports are unseeded, host-blind and never put by
+        // the draft itself; a seeded split states its one lane of rows.
+        let mut container = masked_decode(1, 128);
+        let mask = container
+            .ports
+            .iter()
+            .position(|binding| binding.port == Port::AttnMask)
+            .expect("mask port");
+        container.ports.remove(mask);
+        container.stages[0].ops.clear();
+        for declared in &mut container.channels {
+            declared.seeded = false;
+        }
+        assert_eq!(
+            detect_pooled_device_geometry(&container),
+            Some(vec![0, 1]),
+            "a port another pass of the program puts is device-resolvable"
+        );
+        container.channels[0].host_role = HostRole::Writer;
+        assert_eq!(
+            detect_pooled_device_geometry(&container),
+            None,
+            "a port the host writes is not"
+        );
     }
 
     fn masked_loop_carried_decode_is_pooled_device_geometry() {

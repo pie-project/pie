@@ -734,6 +734,11 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 &[(In(0), I32), (In(1), CACHE), (Out(0), I32)]
             }
             Attention::ReplayFloor { .. } => &[(In(0), I32), (In(1), CACHE), (Out(0), I32)],
+            Attention::KvEnds { .. } => &[(In(0), I32), (In(1), CACHE), (Out(0), I32)],
+            Attention::WindowSink { .. } => &[(In(1), I32), (In(2), I32), (In(3), CACHE)],
+            Attention::MarkovWalk { .. } => {
+                &[(In(1), I32), (In(2), I32), (In(3), I32), (Out(1), I32)]
+            }
         },
         Operation::Linear(op) => match op {
             Linear::MoeTopkSoftmax { .. }
@@ -854,6 +859,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Layout::TopK { .. } => &[(Out(0), F32), (Out(1), I32)],
             Layout::PackRows { .. } | Layout::UnpackRows { .. } => &[(In(1), I32)],
             Layout::Pixels { .. } => &[(In(0), U8)],
+            Layout::ConcatCols { .. } => &[],
             Layout::GridTaps { .. } => &[
                 (In(0), I32),
                 (In(1), I32),

@@ -1204,7 +1204,10 @@ async fn main(input: Input) -> Result<Output> {
     // The first block row whose pick is a proposal: 1 when the anchor row
     // proposes nothing (DFlash), 0 when it proposes the next token (DSpark).
     let from = advertised.map_or(1, |d| d.proposals_from) as usize;
-    let pinned = (input.verify_rows != 0).then(|| input.verify_rows.clamp(2, block));
+    // The widest verify a block feeds: the anchor and every proposal (a
+    // head whose anchor row proposes, DSpark's, proposes a whole block).
+    let widest = block + 1 - from.min(1) as u32;
+    let pinned = (input.verify_rows != 0).then(|| input.verify_rows.clamp(2, widest));
     let page_size = kv_page_size();
     let rs_page = model::rs_buffer_page_size().max(1);
     // The harness's tokens when it sent them; else the chat template the
@@ -1431,7 +1434,7 @@ async fn main(input: Input) -> Result<Output> {
                 // and its yield is the first positions', which is where a
                 // workload that changed shows first (`Gate::plan` does the same).
                 if gate.closed {
-                    pinned.unwrap_or(Gate::RUNGS[0]).min(block)
+                    pinned.unwrap_or(Gate::RUNGS[0]).min(widest)
                 } else {
                     pinned.unwrap_or_else(|| gate.width(block))
                 }
@@ -1504,7 +1507,7 @@ async fn main(input: Input) -> Result<Output> {
         // ladder or from `verify_rows`; only `margin_width` picks it after,
         // off margins this readout would otherwise not contain, so that one
         // still reads the block.
-        let shown = if input.margin_width { block } else { verify };
+        let shown = if input.margin_width { block } else { verify.min(block) };
         let readout = Channel::from_iter(0..shown).named("readout_d");
         // **THE PROPOSALS ARE THE HEAD'S READOUT, OFF THE `mtp.drafts`
         // SEAM.** A v1 head plants its per-slot argmax there; DFlash2 plants

@@ -521,6 +521,7 @@ def build_config(args: argparse.Namespace):
             # derives them from the working set when unset.
             precision=getattr(args, "precision", None),
             kv=getattr(args, "kv", None),
+            drafter=getattr(args, "drafter", None),
             device_weight_budget=getattr(args, "device_weight_budget", None),
             host_weight_budget=getattr(args, "host_weight_budget", None),
             device_kv_budget=getattr(args, "device_kv_budget", None),
@@ -1551,6 +1552,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--kv", default=None,
                         help="[model] kv, e.g. e4m3: the cache rows' dtype over the "
                              "artifact's own (DeepSeek-V4's fp8 rows)")
+        sp.add_argument("--drafter", default=None,
+                        help="[model] drafter, e.g. dspark: the draft head to serve with")
         sp.add_argument("--device-weight-budget", default=None,
                         help="[model] device_weight_budget, e.g. 20GiB (metal residency)")
         sp.add_argument("--host-weight-budget", default=None,

@@ -143,6 +143,7 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
+            Layout::ConcatCols { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Layout::GridTaps {
                 positions,
                 grids,

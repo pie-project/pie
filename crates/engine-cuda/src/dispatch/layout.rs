@@ -201,6 +201,10 @@ impl Run<'_> {
                 *temporal,
                 &mut self.tensor(*y),
             ),
+            Layout::ConcatCols { xs, y } => {
+                let xs: Vec<_> = xs.iter().map(|x| self.tensor(*x)).collect();
+                kernels_cuda::layout_concat_cols::concat_cols(self.ctx(), &xs, &mut self.tensor(*y))
+            }
             Layout::GridTaps {
                 positions,
                 grids,

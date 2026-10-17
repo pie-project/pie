@@ -579,6 +579,48 @@ pub enum Attention {
         mark: bool,
         floor: ValueId,
     },
+    /// Each row's lane's last key position in `cache` (i32 a row): its kv
+    /// extent less one, whatever row of the lane it is.
+    KvEnds {
+        request_of_token: ValueId,
+        cache: ValueId,
+        ends: ValueId,
+    },
+    /// DeepSeek's window attention with its sinks, each row reading the
+    /// `window` positions that end at `positions` (not necessarily its own:
+    /// a drafted block's rows each read the whole block), its output's tail
+    /// not turned back.
+    WindowSink {
+        q: ValueId,
+        positions: ValueId,
+        request_of_token: ValueId,
+        cache: ValueId,
+        sink: ValueId,
+        window: u32,
+        head_dim: u32,
+        sm_scale: f32,
+        o: ValueId,
+    },
+    /// DSpark's Markov head over a drafted block's readouts: a readout's
+    /// depth in its block is its position past the block's first
+    /// (`ends - block + 1`, `ends` its lane's last key); one at depth `i`
+    /// takes the bias `head . embed[t]` of the token `t` the readout before
+    /// it (depth `i - 1`) picked (depth 0, its own token in `tokens`), and
+    /// picks its biased logits' argmax. `tokens`, `positions` and `ends` i32
+    /// a readout, `biased` the logits as biased.
+    MarkovWalk {
+        logits: ValueId,
+        tokens: ValueId,
+        positions: ValueId,
+        ends: ValueId,
+        embed: ValueId,
+        head: ValueId,
+        /// The most readouts a lane's run holds (the drafted block's rows).
+        block: u32,
+        biased: ValueId,
+        /// Each readout's pick (i32), its biased row's argmax.
+        picks: ValueId,
+    },
 }
 
 /// How `attention.index_topk` scores a block of keys.
@@ -987,6 +1029,28 @@ impl Operands for Attention {
             Self::ReplayFloor {
                 positions, state, ..
             } => sink.extend([*positions, *state]),
+            Self::KvEnds {
+                request_of_token,
+                cache,
+                ..
+            } => sink.extend([*request_of_token, *cache]),
+            Self::WindowSink {
+                q,
+                positions,
+                request_of_token,
+                cache,
+                sink: sinks,
+                ..
+            } => sink.extend([*q, *positions, *request_of_token, *cache, *sinks]),
+            Self::MarkovWalk {
+                logits,
+                tokens,
+                positions,
+                ends,
+                embed,
+                head,
+                ..
+            } => sink.extend([*logits, *tokens, *positions, *ends, *embed, *head]),
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -1072,6 +1136,9 @@ impl Operands for Attention {
             Self::PleNgramIds { ngram_ids, .. } => sink.push(*ngram_ids),
             Self::PleNgramIdsChunked { ngram_ids, .. } => sink.push(*ngram_ids),
             Self::ReplayFloor { floor, .. } => sink.push(*floor),
+            Self::KvEnds { ends, .. } => sink.push(*ends),
+            Self::WindowSink { o, .. } => sink.push(*o),
+            Self::MarkovWalk { biased, picks, .. } => sink.extend([*biased, *picks]),
         }
     }
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
@@ -1131,6 +1198,7 @@ impl Operands for Attention {
             Self::PleNgramIds { .. } => {}
             Self::PleNgramIdsChunked { .. } => {}
             Self::ReplayFloor { .. } => {}
+            Self::KvEnds { .. } | Self::WindowSink { .. } | Self::MarkovWalk { .. } => {}
         }
     }
     fn name(&self) -> &'static str {
@@ -1191,6 +1259,9 @@ impl Operands for Attention {
             Self::PleNgramIds { .. } => "attention.ple_ngram_ids",
             Self::PleNgramIdsChunked { .. } => "attention.ple_ngram_ids_chunked",
             Self::ReplayFloor { .. } => "attention.replay_floor",
+            Self::KvEnds { .. } => "attention.kv_ends",
+            Self::WindowSink { .. } => "attention.window_sink",
+            Self::MarkovWalk { .. } => "attention.markov_walk",
         }
     }
 }

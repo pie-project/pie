@@ -82,6 +82,8 @@ def bench_args(args: argparse.Namespace) -> argparse.Namespace:
         argv += ["--precision", args.precision]
     if getattr(args, "kv", None):
         argv += ["--kv", args.kv]
+    if getattr(args, "drafter", None):
+        argv += ["--drafter", args.drafter]
     if getattr(args, "frame_dispatch_depth", None):
         argv += ["--frame-dispatch-depth", str(args.frame_dispatch_depth)]
     if getattr(args, "device_weight_budget", None):
@@ -98,6 +100,9 @@ async def pie_session(args: argparse.Namespace, server_log: str):
     from pie_client import Event
 
     wasm = pie_bench.bench_inferlet_wasm(args.inferlet_dir)
+    # `--extra-input KEY=VALUE`: fields the inferlet under `--inferlet-dir`
+    # reads beyond the plain bench's (a speculative loop's knobs).
+    extra = pie_bench._typed_pairs(getattr(args, "extra_input", None)) or {}
     os.environ["PIE_BENCH_SERVER_LOG"] = server_log
     async with pie_bench.cli_pie_client(bench_args(args)) as (client, engine_config):
         pkg = await client.install_program(wasm, force_overwrite=True)
@@ -108,6 +113,7 @@ async def pie_session(args: argparse.Namespace, server_log: str):
                 "prompt": "", "prompt_tokens": ids, "max_tokens": output_len,
                 "temperature": 0.0, "top_p": 1.0, "ignore_eos": True,
                 "return_text": False, "no_prefix_cache": True, "report_timing": timing,
+                **extra,
             })
             ttft = None
             while True:
@@ -198,6 +204,9 @@ def main() -> None:
     ap.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
     ap.add_argument("--engine-option", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--precision", default=None, help="[model] precision, e.g. bf16+nvfp4a4")
+    ap.add_argument("--drafter", default=None, help="[model] drafter, e.g. dspark")
+    ap.add_argument("--extra-input", action="append", default=None, metavar="KEY=VALUE",
+                    help="an inferlet input field beyond the plain bench's; repeatable")
     ap.add_argument("--kv", default=None, help="[model] kv, e.g. e4m3 (DeepSeek-V4's fp8 rows)")
     ap.add_argument("--frame-dispatch-depth", type=int, default=None,
                     help="[runtime] frame_dispatch_depth: frames a lane keeps posted (its state slots)")

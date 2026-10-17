@@ -134,6 +134,7 @@ def base(w, kv, d):
                     if ratio != None else None,
                 indexer = None,
                 selection = "none",
+                window_sink = None,
             ),
             mlp_mix = mix(n, "mlp_mix", streams, hidden, dynamic = False),
             mlp = mlp,
@@ -159,6 +160,7 @@ def base(w, kv, d):
         mtp = None,
         token_map = None,
         decoder = None,
+        dspark = None,
     )
 
 # ---------------------------------------------------------------------------
@@ -205,10 +207,10 @@ def pro_dims(layers, pool, hash, experts = 384):
         moe_inter = 3072, shared_inter = 3072, scaling = 2.5,
     )
 
-def moe_flash(n, d, experts, gate, banks, weights, dense):
-    """A DeepSeekMoE block of `experts` routed by `gate`, its routed banks
-    stored as `banks` says, its shared expert in `weights` and its router in
-    `dense`."""
+def moe_flash(n, d, experts, gate, banks, weights, dense, top_k = None):
+    """A DeepSeekMoE block of `experts` routed by `gate` (each row to
+    `top_k` of them, else the model's), its routed banks stored as `banks`
+    says, its shared expert in `weights` and its router in `dense`."""
     mi = d.moe_inter
     si = d.shared_inter
     hidden = d.hidden
@@ -230,7 +232,7 @@ def moe_flash(n, d, experts, gate, banks, weights, dense):
         shared_gate_up = weight(n("shared_gate_up"), [2 * si, hidden], weights).packed([si, si]),
         shared_down = weight(n("shared_down"), [hidden, si], weights).rows(),
         experts = experts,
-        top_k = d.top_k,
+        top_k = top_k if top_k != None else d.top_k,
         inter = mi,
         shared_inter = si,
         limit = d.swiglu_limit,
@@ -323,6 +325,7 @@ def flash(w, r, kv, d, quant = None):
                 pool = pool,
                 indexer = indexer,
                 selection = "own" if has_indexer else "none",
+                window_sink = None,
             ),
             mlp_mix = mix(n, "mlp_mix", streams, hidden),
             mlp = moe_flash(n, d, experts, gate, routed_banks, q, sdense),
@@ -384,6 +387,7 @@ def flash(w, r, kv, d, quant = None):
         mtp = mtp,
         token_map = None,
         decoder = None,
+        dspark = None,
     )
 
 # ---------------------------------------------------------------------------
@@ -401,6 +405,7 @@ V41_PLAN = struct(
     index_sources = [2, 8, 14, 20, 24, 28, 32, 36],
     engram_layers = [1, 14],
     decoder = 20,
+    dspark_targets = [37, 38, 39],
 )
 
 # The miniature: source layers 0,1,2,3,20,21,24,25 of the release, so every
@@ -413,6 +418,7 @@ V41_MINI_PLAN = struct(
     index_sources = [2, 4, 6],
     engram_layers = [1],
     decoder = 4,
+    dspark_targets = [5, 6, 7],
 )
 
 def dims41(plan, experts = 384, base_vocab = 16000000):
@@ -425,6 +431,11 @@ def dims41(plan, experts = 384, base_vocab = 16000000):
         vocab = 129280, norm_eps = 1e-20,
         engram = struct(ngram = 4, heads = 8, head_dim = 256, base_vocab = base_vocab,
                         compressed_vocab = 99092, pad = 2),
+        # DSpark: three draft stages over a block of five rows (an anchor and
+        # four noise tokens), each stage's experts 128 (or the miniature's
+        # all) taken three a row, a rank-256 Markov head over the drafts.
+        dspark = struct(stages = 3, block = 5, noise = 128799, experts = min(128, experts),
+                        top_k = 3, rank = 256),
     )
 
 def csa_of(plan, layer):
@@ -467,12 +478,12 @@ def engram_hash_constants(e, engram_layers, which):
     mults = [v * 2 + 1 for v in numpy_integers(10007 * layer, bound, e.ngram)]
     return mults, primes, offsets
 
-def flash41(w, r, kv, d, quant = None):
+def flash41(w, r, kv, d, quant = None, dspark = False):
     """V4.1-Flash at `w`, its routed banks as `r` says; with `quant` the
     projections DeepSeek's reference reads at fp8 (attention's q and kv
     downs and ups, its output's up, the indexer's q up, the shared expert
     and Engram's key-value projection) are stored and read at that
-    precision, the rest at `w`."""
+    precision, the rest at `w`. With `dspark`, its DSpark draft head."""
     plan = d.plan
     dense = compute(w)
     q = quant if quant != None else w
@@ -560,6 +571,19 @@ def flash41(w, r, kv, d, quant = None):
                 ids_state = "engram.{}".format(l),
             )
 
+        return block(prefix, l, "kv.{}".format(l), ratio, pool, indexer, selection, engram,
+                     d.experts, d.top_k)
+
+    def block(prefix, l, kv_name, ratio, pool, indexer, selection, engram, experts, top_k,
+              window_sink = None):
+        """A V4.1 block under `prefix` (its routed banks stored as layer
+        `l`'s): its attention over the window `kv_name` and `pool`, its MoE
+        of `experts` taken `top_k` a row. With `window_sink`, a DSpark
+        stage's: its rows read that many window positions ending at their
+        lane's last."""
+        n = lambda s: "{}.{}".format(prefix, s)
+        norm = lambda s, dim: weight(n(s), [dim], dense)
+        lora_a, lora_b = banks(prefix, hidden, dense)
         return struct(
             attn_mix = mix(n, "attn_mix", streams, hidden),
             attn_norm = norm("attn_norm", hidden),
@@ -581,24 +605,49 @@ def flash41(w, r, kv, d, quant = None):
                 o_up = weight(n("o_up"), [hidden, o_out], q).rows(),
                 o_groups = d.o_groups,
                 sink = weight(n("attn_sink"), [d.heads], dense).columns(),
-                kv = "kv.{}".format(l),
+                kv = kv_name,
                 pool = pool,
                 indexer = indexer,
                 selection = selection,
+                window_sink = window_sink,
             ),
             mlp_mix = mix(n, "mlp_mix", streams, hidden),
             mlp = moe_flash(
                 n,
                 d,
-                d.experts,
-                gate = struct(kind = "bias", bias = weight(n("gate.bias"), [d.experts], dtype.f32)),
+                experts,
+                gate = struct(kind = "bias", bias = weight(n("gate.bias"), [experts], dtype.f32)),
                 banks = banks_at(r, l),
                 weights = q,
                 dense = dense,
+                top_k = top_k,
             ),
             lora_a = lora_a,
             lora_b = lora_b,
             engram = engram,
+        )
+
+    def draft_head():
+        """DSpark (`mtp.*` in the release): its stages, each a window-only
+        block over its own window cache; the target layers' inputs it
+        projects into the window keys; and the Markov head over its drafts."""
+        ds = d.dspark
+        targets = plan.dspark_targets
+        stages = [
+            block("dspark.{}".format(s), plan.layers + s, "dspark.{}".format(s), 0, None, None, "none",
+                  None, ds.experts, ds.top_k, window_sink = d.window + ds.block)
+            for s in range(ds.stages)
+        ]
+        return struct(
+            block = ds.block,
+            noise = ds.noise,
+            targets = targets,
+            main_proj = weight("dspark.main_proj", [hidden, hidden * len(targets)], q),
+            main_norm = weight("dspark.main_norm", [hidden], dense),
+            stages = stages,
+            norm = weight("dspark.norm", [hidden], dense),
+            markov_embed = weight("dspark.markov_embed", [d.vocab, ds.rank], dense),
+            markov_head = weight("dspark.markov_head", [d.vocab, ds.rank], dense),
         )
 
     return struct(
@@ -618,6 +667,7 @@ def flash41(w, r, kv, d, quant = None):
         mtp = None,
         token_map = weight("engram.token_map", [d.vocab], dtype.i64) if plan.engram_layers else None,
         decoder = plan.decoder,
+        dspark = draft_head() if dspark else None,
     )
 
 def layout(id, deploy):
@@ -631,6 +681,7 @@ def layout(id, deploy):
     mxg32 = dtype.mxfp4a8g32
     kv = deploy.kv
     mtp = deploy.drafter == "mtp"
+    dspark = deploy.drafter == "dspark"
     if id == "dsv41-flash" and ws == [u4]:
         return flash41(u4, split_of(u4), kv, dims41(V41_PLAN))
     if id == "dsv41-flash" and ws == [bf, mx]:
@@ -638,9 +689,10 @@ def layout(id, deploy):
     if id == "dsv41-flash-mini" and ws == [bf, mx]:
         return flash41(bf, split_of(mx), kv, dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000))
     if id == "dsv41-flash" and ws == [fp8b32, mxg32]:
-        return flash41(bf, split_of(mxg32), kv, dims41(V41_PLAN), quant = fp8b32)
+        return flash41(bf, split_of(mxg32), kv, dims41(V41_PLAN), quant = fp8b32, dspark = dspark)
     if id == "dsv41-flash-mini" and ws == [fp8b32, mxg32]:
-        return flash41(bf, split_of(mxg32), kv, dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000), quant = fp8b32)
+        return flash41(bf, split_of(mxg32), kv, dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000),
+                       quant = fp8b32, dspark = dspark)
     if id == "dsv4-flash":
         if ws == [bf] and not mtp:
             return flash(bf, uniform(bf), kv, flash_dims(43, flash_ratios(), 3))

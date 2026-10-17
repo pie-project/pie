@@ -123,6 +123,11 @@ pub enum Layout {
         ids: ValueId,
         weights: ValueId,
     },
+    /// `xs` side by side, a row each's columns after the one before's.
+    ConcatCols {
+        xs: Vec<ValueId>,
+        y: ValueId,
+    },
 }
 
 /// How a patch row's columns are laid out: channel-major over the pixels,
@@ -192,6 +197,7 @@ impl Operands for Layout {
                 segments,
                 ..
             } => sink.extend([*positions, *grids, *segments]),
+            Self::ConcatCols { xs, .. } => sink.extend(xs.iter().copied()),
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -216,6 +222,7 @@ impl Operands for Layout {
             Self::UnpackRows { y, .. } => sink.push(*y),
             Self::Pixels { y, .. } => sink.push(*y),
             Self::GridTaps { ids, weights, .. } => sink.extend([*ids, *weights]),
+            Self::ConcatCols { y, .. } => sink.push(*y),
         }
     }
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
@@ -235,7 +242,8 @@ impl Operands for Layout {
             | Self::PackRows { .. }
             | Self::UnpackRows { .. }
             | Self::Pixels { .. }
-            | Self::GridTaps { .. } => {}
+            | Self::GridTaps { .. }
+            | Self::ConcatCols { .. } => {}
             Self::ScatterRows { y_out, y, .. } | Self::ScatterLiveRows { y_out, y, .. } => {
                 sink.push((*y_out, *y))
             }
@@ -261,6 +269,7 @@ impl Operands for Layout {
             Self::UnpackRows { .. } => "layout.unpack_rows",
             Self::Pixels { .. } => "layout.pixels",
             Self::GridTaps { .. } => "layout.grid_taps",
+            Self::ConcatCols { .. } => "layout.concat_cols",
         }
     }
 }

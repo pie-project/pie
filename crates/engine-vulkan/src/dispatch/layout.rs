@@ -135,6 +135,10 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
+            // DSpark's taps side by side are DeepSeek-V4.1's, served on CUDA.
+            Layout::ConcatCols { .. } => Err(kernels_vulkan::Error::Unsupported {
+                op: "layout.concat_cols",
+            }),
             Layout::GridTaps {
                 positions,
                 grids,

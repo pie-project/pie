@@ -10,6 +10,8 @@ pub mod index;
 
 pub mod kv;
 
+pub mod markov;
+
 pub mod mla;
 
 pub mod plan;

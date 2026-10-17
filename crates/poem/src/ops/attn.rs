@@ -606,6 +606,86 @@ pub fn block_dyn_conv(
     y
 }
 
+/// Each row's lane's last key position in `pages` (`attention.kv_ends`).
+pub fn kv_ends(request_of_token: &Value, pages: ValueId) -> Value {
+    let r = request_of_token.rec();
+    let ends = r.fresh(tensor(request_of_token.rows(), 1u64, Dtype::I32));
+    r.push(
+        Attention::KvEnds {
+            request_of_token: request_of_token.id(),
+            cache: pages,
+            ends: ends.id(),
+        },
+        &[request_of_token],
+    );
+    ends
+}
+
+/// DeepSeek's window attention with its sinks, each row reading the
+/// `window` positions that end at its `positions` (`attention.window_sink`).
+#[allow(clippy::too_many_arguments)]
+pub fn window_sink(
+    q: &Value,
+    positions: &Value,
+    request_of_token: &Value,
+    pages: ValueId,
+    sink: &Weight,
+    window: u32,
+    head_dim: u32,
+    sm_scale: f32,
+) -> Value {
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    r.push(
+        Attention::WindowSink {
+            q: q.id(),
+            positions: positions.id(),
+            request_of_token: request_of_token.id(),
+            cache: pages,
+            sink: r.weight(sink),
+            window,
+            head_dim,
+            sm_scale,
+            o: o.id(),
+        },
+        &[q, positions, request_of_token],
+    );
+    o
+}
+
+/// DSpark's Markov head over a drafted block's readouts
+/// (`attention.markov_walk`): the logits as biased, each row by the token
+/// the row before it picked, and each row's pick (i32).
+#[allow(clippy::too_many_arguments)]
+pub fn markov_walk(
+    logits: &Value,
+    tokens: &Value,
+    positions: &Value,
+    ends: &Value,
+    embed: &Weight,
+    head: &Weight,
+    block: u32,
+) -> (Value, Value) {
+    let r = logits.rec();
+    let biased = r.fresh(logits.ty().clone());
+    let picks = r.fresh(tensor(logits.rows(), 1u64, Dtype::I32));
+    r.push(
+        Attention::MarkovWalk {
+            logits: logits.id(),
+            tokens: tokens.id(),
+            positions: positions.id(),
+            ends: ends.id(),
+            embed: r.weight(embed),
+            head: r.weight(head),
+            block,
+            biased: biased.id(),
+            picks: picks.id(),
+        },
+        &[logits, tokens, positions, ends],
+    );
+    (biased, picks)
+}
+
 pub fn selector_walk(
     cand: &Value,
     unary: &Value,

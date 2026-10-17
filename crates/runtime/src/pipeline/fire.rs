@@ -2736,6 +2736,14 @@ async fn fire_device_geometry<C: FireContext>(
             lane.captures_scores = captures;
         }
     }
+    // A drafted block whose layout the device carries (a block drafter's
+    // loop on the device): its lanes are the block's, as on the host path.
+    if ctx.resources().get(&fwd)?.block_draft {
+        for lane in &mut req.lanes {
+            lane.block_draft = true;
+        }
+        stamp_block_masks(&mut req);
+    }
     stamp_lane_words(&mut req, fire_wide_mask, false);
     if let Err(refusal) = seat_lane_slots(&mut req, &stores, ws.id).await {
         reclaim_pending_device_grant(ctx, &fwd);
@@ -2761,7 +2769,7 @@ async fn fire_device_geometry<C: FireContext>(
         lanes = req.lanes.len(),
         qo_indptr = ?resolved_qo_indptr,
         reads_mtp_logits = req.lanes.first().is_some_and(|lane| lane.drafts),
-        "fire geometry resolved on device path; block_draft is resolved on the host path only"
+        "fire geometry resolved on device path"
     );
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);

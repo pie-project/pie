@@ -187,6 +187,22 @@ pub fn argmax(xs: &[&Value]) -> Value {
     y
 }
 
+/// `xs` side by side: a row's columns of each, in order.
+pub fn concat_cols(xs: &[&Value]) -> Value {
+    let first = xs.first().expect("a concat of at least one value");
+    let r = first.rec();
+    let width: u64 = xs.iter().map(|x| x.width()).sum();
+    let y = r.fresh(tensor(first.rows(), width, first.dtype()));
+    r.push(
+        Layout::ConcatCols {
+            xs: xs.iter().map(|x| x.id()).collect(),
+            y: y.id(),
+        },
+        xs,
+    );
+    y
+}
+
 pub fn topk(x: &Value, k: u32) -> (Value, Value) {
     let r = x.rec();
     let values = r.fresh(tensor(x.rows(), u64::from(k), Dtype::F32));
