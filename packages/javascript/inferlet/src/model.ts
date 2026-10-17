@@ -2,9 +2,7 @@
 //
 // The engine serves exactly one model, so these are module-level functions
 // over `pie:inferlet/model` — there is no model handle to load or pass
-// around. The tokenizer surface (encode/decode/vocabs/special-tokens/
-// split-regex) moved to the sibling `tokenizer` module when the WIT split
-// separated the two interfaces.
+// around.
 
 import * as _model from 'pie:inferlet/model@0.3.0';
 import type { BlockDrafter, CanvasShape, LatentSpace, ReadingFact, ScheduleFact } from 'pie:inferlet/model@0.3.0';
@@ -39,13 +37,6 @@ export function submitDeadlineUs(): number {
   return Number(_model.submitDeadlineUs());
 }
 
-/** Whether the bound model carries irreversibly-folded recurrent state (a
- *  `recurrent` or `hybrid` pass kind). */
-export function isLinear(): boolean {
-  const k = _model.passKind();
-  return k === 'recurrent' || k === 'hybrid';
-}
-
 /** The bound model's block drafter, if it carries one. */
 export function draftBlock(): BlockDrafter | undefined {
   return _model.draftBlock();
@@ -62,8 +53,7 @@ export function runAheadWindow(): number {
 }
 
 /**
- * Which forward-pass interface the bound model requires. Selects the binding
- * surface; do not derive it by parsing `architecture()`.
+ * The bound model's forward-pass interface; never derive it by parsing `architecture()`.
  */
 export function passKind(): _model.ForwardKind {
   return _model.passKind();
@@ -92,16 +82,9 @@ export function channelCapacity(): number {
   return _model.channelCapacity();
 }
 
-/** Max embed tokens in a single pass — the prefill chunk budget. */
-export function maxEmbedLength(): number {
-  return _model.maxEmbedLength();
-}
-
-/** The prefill chunk the scheduler would like right now: the forward token
- * budget shared among live processes, in whole KV pages. A hint, read per
- * call — it moves as processes come and go. */
-export function prefillChunkHint(): number {
-  return _model.prefillChunkHint();
+/** The most rows one pass may read out through `kind`; the pass itself may be any length. */
+export function maxReadoutRows(kind: _model.ReadoutKind): number {
+  return _model.maxReadoutRows(kind);
 }
 
 /** Bytes in one folded recurrent-state object. 0 for pure attention. */
@@ -109,22 +92,7 @@ export function rsStateSize(): number {
   return Number(_model.rsStateSize());
 }
 
-/** Tokens per buffered RS page. 0 if the model has no recurrent state. */
-export function rsBufferPageSize(): number {
-  return _model.rsBufferPageSize();
-}
-
-/** Fold granularity in tokens. 1 (or 0) means unconstrained. */
-export function rsFoldGranularity(): number {
-  return _model.rsFoldGranularity();
-}
-
-/** Bytes in one unified-arena accounting block. */
-export function arenaBlockSize(): number {
-  return Number(_model.arenaBlockSize());
-}
-
-// -- generative facts (imagegen design D12) ---------------------------------
+// -- generative facts ---------------------------------------------------------
 
 /** Every reading the bound model declares, in index order; empty for a text
  *  row (one implicit reading). */

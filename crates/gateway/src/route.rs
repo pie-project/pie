@@ -83,6 +83,14 @@ impl RoutingHandle {
         self
     }
 
+    pub fn max_queued_launches(&self) -> usize {
+        self.admission.max_queued_launches
+    }
+
+    pub fn table_watch(&self) -> watch::Receiver<RoutingTable> {
+        self.routing.clone()
+    }
+
     // Admission sheds what takes a seat on a worker, and only a launch does:
     // a ping, an upload, a query or a terminate holds no KV and no lane, and a
     // client whose first frame is one of those (installing its program, or
@@ -149,12 +157,18 @@ impl RoutingHandle {
         workers: &W,
         req: &Request,
         affinity: Option<AffinityKey>,
+        preferred: Option<WorkerId>,
     ) -> Result<Dispatched, RouteError> {
         let candidates = {
             let table = self.routing.borrow();
             let connected = self.connected.borrow();
             let mut rng = next_rand;
-            select_candidates(&table, &connected, None, affinity, &mut rng)
+            let mut candidates = select_candidates(&table, &connected, None, affinity, &mut rng);
+            if let Some(at) = preferred.and_then(|p| candidates.iter().position(|&w| w == p)) {
+                let worker = candidates.remove(at);
+                candidates.insert(0, worker);
+            }
+            candidates
         };
         if candidates.is_empty() {
             return Err(RouteError::NoCandidate);
@@ -288,6 +302,7 @@ mod tests {
             coarse_load: WorkerStatus {
                 kv_pressure_bucket: kv,
                 inflight,
+                ..WorkerStatus::default()
             },
         }
     }
@@ -357,6 +372,7 @@ mod tests {
             tenant: TenantId("t".to_string()),
             priority: Priority::Normal,
             blobs: Vec::new(),
+            router_props: Default::default(),
             message: ClientMessage::Query {
                 corr_id: 1,
                 subject: "s".to_string(),
@@ -416,6 +432,9 @@ mod tests {
                 inferlet: "chat".into(),
                 input: String::new(),
                 capture_outputs: false,
+                props: Default::default(),
+                session: None,
+                router_props: Default::default(),
             };
             assert!(matches!(h.admit(&request), AdmissionDecision::Reject(_)));
         }
@@ -435,6 +454,9 @@ mod tests {
             inferlet: "chat".into(),
             input: String::new(),
             capture_outputs: false,
+            props: Default::default(),
+            session: None,
+            router_props: Default::default(),
         };
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut waiting = Vec::new();
@@ -478,7 +500,7 @@ mod tests {
             request.message = ClientMessage::ListProcesses { corr_id: 1 };
             assert_eq!(h.admit(&request), AdmissionDecision::Admit);
             assert_eq!(
-                h.dispatch_with_retry(&reg, &request, None)
+                h.dispatch_with_retry(&reg, &request, None, None)
                     .await
                     .unwrap_err(),
                 RouteError::NoCandidate
@@ -501,7 +523,10 @@ mod tests {
             .into(),
             calls: Mutex::new(Vec::new()),
         };
-        let d = h.dispatch_with_retry(&reg, &req(), Some(42)).await.unwrap();
+        let d = h
+            .dispatch_with_retry(&reg, &req(), Some(42), None)
+            .await
+            .unwrap();
         assert_eq!(d.worker_id, WorkerId(1));
         assert_eq!(
             d.accepted,
@@ -531,9 +556,49 @@ mod tests {
             .into(),
             calls: Mutex::new(Vec::new()),
         };
-        let d = h.dispatch_with_retry(&reg, &req(), Some(99)).await.unwrap();
+        let d = h
+            .dispatch_with_retry(&reg, &req(), Some(99), None)
+            .await
+            .unwrap();
         assert_eq!(d.worker_id, accepting);
         assert_eq!(*reg.calls.lock().unwrap(), vec![first, second, accepting]);
+    }
+
+    #[tokio::test]
+    async fn a_preferred_worker_goes_first_when_it_is_eligible() {
+        let t = table(
+            (1..=3)
+                .map(|i| worker(i, "m", Health::Healthy, 10, 0))
+                .collect(),
+        );
+        let h = handle_with(t, &[1, 2, 3]);
+        let order = h.select_worker(Some(99));
+        let preferred = order[2];
+        let accept_all = || StubRegistry {
+            answers: (1..=3)
+                .map(|i| {
+                    (
+                        WorkerId(i),
+                        Ok(Accepted::Ok {
+                            worker: WorkerId(i),
+                        }),
+                    )
+                })
+                .collect(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let d = h
+            .dispatch_with_retry(&accept_all(), &req(), Some(99), Some(preferred))
+            .await
+            .unwrap();
+        assert_eq!(d.worker_id, preferred);
+
+        // One that is not connected is no candidate: the default order holds.
+        let d = h
+            .dispatch_with_retry(&accept_all(), &req(), Some(99), Some(WorkerId(9)))
+            .await
+            .unwrap();
+        assert_eq!(d.worker_id, order[0]);
     }
 
     #[tokio::test]
@@ -544,7 +609,10 @@ mod tests {
             answers: Default::default(),
             calls: Mutex::new(Vec::new()),
         };
-        let err = h.dispatch_with_retry(&reg, &req(), None).await.unwrap_err();
+        let err = h
+            .dispatch_with_retry(&reg, &req(), None, None)
+            .await
+            .unwrap_err();
         assert_eq!(err, RouteError::NoCandidate);
     }
 
@@ -565,7 +633,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         let err = h
-            .dispatch_with_retry(&reg, &req(), Some(5))
+            .dispatch_with_retry(&reg, &req(), Some(5), None)
             .await
             .unwrap_err();
         assert_eq!(err, RouteError::Exhausted { attempts: 2 });

@@ -518,6 +518,12 @@ impl FireCtx<'_> {
                 crate::device::alloc::zero_span_on(self.device.stream(), at, bytes)?;
             }
         }
+        // A lane that folds part of its extended rows splits its scan there.
+        let commit_len = if p.rs.truncates {
+            self.predicate.commit_len(lane_count)
+        } else {
+            kernels_cuda::Tensor::ABSENT
+        };
         let caches = self.pools.table(
             &self
                 .inputs
@@ -529,17 +535,9 @@ impl FireCtx<'_> {
                     } else {
                         kernels_cuda::Tensor::ABSENT
                     },
-                    if p.rs.truncates {
-                        self.predicate.commit_len(lane_count)
-                    } else {
-                        kernels_cuda::Tensor::ABSENT
-                    },
+                    commit_len,
                 )
-                .splitting(if p.rs.splits {
-                    self.predicate.commit_len(lane_count)
-                } else {
-                    kernels_cuda::Tensor::ABSENT
-                }),
+                .splitting(commit_len),
         )?;
         let paging = self.pools.paging();
         Ok(Staged {
@@ -746,7 +744,7 @@ impl FireCtx<'_> {
             run = run.buffered(RsSeat {
                 buffers: pool,
                 lanes: &p.rs.moves,
-                replays: &p.rs.replays,
+                reads: &p.rs.reads,
                 scratch: rs_scratch.as_ref(),
             });
         }

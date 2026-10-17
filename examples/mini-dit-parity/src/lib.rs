@@ -21,10 +21,10 @@
 //!
 //! `mini-dit`'s `denoise` reading declares three streams (D2), so one step
 //! is three passes — caption, image, context — each stating its
-//! [`stream`](inferlet::eta::attention::ForwardPass::stream) and all in one
-//! [`group`](inferlet::eta::attention::ForwardPass::group), which is what
+//! [`stream`](inferlet::eta::ForwardPass::stream) and all in one
+//! [`group`](inferlet::eta::ForwardPass::group), which is what
 //! lets the caption rows join the image rows' attention and the context
-//! rows serve as block 2's keys. Neither `attention` nor `embed` is called
+//! rows serve as block 2's keys. Neither `state` nor `embed` is called
 //! on any of them: a denoise reading declares no kv space and no tokens,
 //! and the image lane's row count comes from its latents channel.
 //!
@@ -1004,8 +1004,8 @@ async fn step(
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Attention {
-        return Err("mini-dit is an attention-kind pass with no kv bound".into());
+    if model::pass_kind() != model::ForwardKind::Text {
+        return Err("mini-dit is a `forward` pass with no state bound".into());
     }
     let pieces: String = [
         &input.case_0,

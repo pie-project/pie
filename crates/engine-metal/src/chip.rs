@@ -402,7 +402,9 @@ mod tests {
         );
         assert_eq!(report.measured, ["kernel.ane.mlp", "kernel.qmm_splitk"]);
         assert!(!report.untuned());
-        assert_eq!(*profile.get::<AneMlp>(), AneMlp::Share { percent: 71 });
+        assert_eq!(*profile.get::<AneMlp>(), AneMlp::Share { percent: 74 });
+        assert_eq!(*profile.get::<AneProjections>(), AneProjections::Gpu);
+        assert_eq!(profile.get::<AneMinRows>().0, 512);
     }
 
     #[test]
@@ -441,7 +443,7 @@ mod tests {
                 .ladder::<kernels_metal::tuning::Qmm>()
                 .values()
                 .next(),
-            Some(&kernels_metal::tuning::Qmm::Tiled { crossover_tg: 96 }),
+            Some(&kernels_metal::tuning::Qmm::Register),
             "the Apple9 family file again"
         );
         std::fs::remove_dir_all(&dir).unwrap();

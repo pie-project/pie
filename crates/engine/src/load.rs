@@ -65,14 +65,17 @@ pub struct Residency {
     /// set and pool. What other processes hold when it begins comes off it.
     #[serde(default = "default_share")]
     pub device_memory_share: f64,
-    /// Pinned host bytes suspended kv pages and rs slots go to; `None` is
-    /// one device pool's worth, zero turns the host tier off.
+    /// `None`: every seat at full context, and at least one device pool.
     #[serde(default)]
     pub host_kv_budget: Option<u64>,
+    /// `None` takes the engine's lane ceiling.
+    #[serde(default)]
+    pub kv_seats: Option<u32>,
     /// Bytes of slot files under `disk_kv_dir` kv pages may be suspended
     /// into below host memory, shared by the ranks; zero turns it off.
+    /// `None`: the engine's default.
     #[serde(default)]
-    pub disk_kv_budget: u64,
+    pub disk_kv_budget: Option<u64>,
     #[serde(default)]
     pub disk_kv_dir: Option<PathBuf>,
 }
@@ -109,7 +112,8 @@ impl Residency {
             device_kv_budget: None,
             device_memory_share: DEFAULT_DEVICE_MEMORY_SHARE,
             host_kv_budget: None,
-            disk_kv_budget: 0,
+            kv_seats: None,
+            disk_kv_budget: Some(0),
             disk_kv_dir: None,
         }
     }

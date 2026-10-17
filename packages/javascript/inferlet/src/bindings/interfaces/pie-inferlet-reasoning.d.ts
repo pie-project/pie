@@ -24,6 +24,16 @@ export interface EventComplete {
 
 export class Decoder {
   constructor()
+  /**
+   * A decoder for the turn `cue` began: inside a thinking block from
+   * the first token when the cue left one open (a template that writes
+   * `<think>` into its generation cue), so no `start` comes.
+   */
+  static forCue(cue: Uint32Array): Decoder;
   feed(tokens: Uint32Array): Event;
   reset(): void;
+  /**
+   * Whether the first token is already inside a thinking block.
+   */
+  startsInside(): boolean;
 }

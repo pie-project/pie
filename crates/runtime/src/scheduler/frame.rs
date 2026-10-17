@@ -605,11 +605,16 @@ impl FramePolicy {
 
     pub fn earmarked(&self) -> impl Iterator<Item = ProcessId> + '_ {
         let slots = self.pending_slots as usize + self.departing.len();
-        self.admission_queue
-            .iter()
+        // The queue the execution gate grants from, in the order it grants:
+        // arrival, unless a schedule ranks it.
+        let mut queue: Vec<ProcessId> = self.admission_queue.iter().copied().collect();
+        if let Some(schedule) = crate::policy::schedule::current() {
+            queue.sort_by_key(|pid| std::cmp::Reverse(schedule.key(*pid)));
+        }
+        queue
+            .into_iter()
             .filter(|pid| self.staged.contains(pid))
             .take(slots)
-            .copied()
     }
 
     pub fn is_joining(&self) -> bool {
@@ -787,6 +792,21 @@ impl FramePolicy {
             }
             if mid_boundary && fresh.is_empty() {
                 return None;
+            }
+            // The policy's schedule ranks lanes by their process's key; a
+            // stable sort keeps lane order among equals, so with no schedule
+            // nothing moves.
+            if let Some(schedule) = crate::policy::schedule::current() {
+                let key = |lane: &ProcessId| {
+                    std::cmp::Reverse(
+                        self.lanes
+                            .get(lane)
+                            .and_then(|l| l.owner)
+                            .map_or(0, |owner| schedule.key(owner)),
+                    )
+                };
+                fresh.sort_by_key(key);
+                continuing.sort_by_key(key);
             }
             let mut order: Vec<ProcessId> = Vec::with_capacity(fresh.len() + continuing.len());
             let mut rest = fresh.as_slice();

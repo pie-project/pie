@@ -44,6 +44,15 @@ fn old_qmm(family: u32, at: &QmmAt) -> Qmm {
     {
         return Qmm::Staged;
     }
+    if family == 9
+        && (5..=8).contains(&at.rows)
+        && at.bits == 4
+        && at.group == 64
+        && at.n % 64 == 0
+        && at.k % 256 == 0
+    {
+        return Qmm::Register;
+    }
     let bn = if at.rows <= 8 { 64 } else { 128 };
     if mpp
         && at.bits == 4
@@ -99,6 +108,7 @@ fn assert_old_tuning(
     cores: Option<u32>,
     fill_tg: u32,
     mlp: Option<AneMlp>,
+    projections: Option<AneProjections>,
 ) {
     let (profile, report) = chip::resolve(device, &chip::facts(family, cores, 10, true), None);
     assert_eq!(
@@ -164,15 +174,22 @@ fn assert_old_tuning(
     assert_eq!(t.sdpa_tile_rows_per_request(), 32, "{device}");
     assert!(t.sdpa_mma() && !t.kv_q8(), "{device}");
     assert_eq!(t.gdn_scan(), gdn_scan, "{device}");
-    let mlp = mlp.unwrap_or(if mpp {
-        AneMlp::Units { units: 8 }
+    // An Apple10 GPU reads a prompt faster alone than beside the Neural
+    // Engine, as Splash keeps a 512-token prompt there.
+    let mlp = mlp.unwrap_or(if family == 10 {
+        AneMlp::Gpu
     } else {
         AneMlp::Share { percent: 47 }
     });
     assert_eq!(*profile.get::<AneMlp>(), mlp, "{device}");
     assert_eq!(
         *profile.get::<AneProjections>(),
-        AneProjections::Share { percent: 47 }
+        projections.unwrap_or(if family == 10 {
+            AneProjections::Gpu
+        } else {
+            AneProjections::Share { percent: 47 }
+        }),
+        "{device}"
     );
     assert_eq!(
         *profile.get::<WeightsLayout>(),
@@ -204,7 +221,7 @@ fn assert_old_tuning(
 #[test]
 fn each_checked_in_profile_runs_its_familys_old_tuning() {
     for &(family, device, cores) in CHIPS {
-        assert_old_tuning(device, family, cores, 512, None);
+        assert_old_tuning(device, family, cores, 512, None, None);
     }
 }
 
@@ -215,7 +232,8 @@ fn the_m4_pro_runs_its_family_and_the_two_values_it_measured() {
         9,
         Some(20),
         896,
-        Some(AneMlp::Share { percent: 71 }),
+        Some(AneMlp::Share { percent: 74 }),
+        Some(AneProjections::Gpu),
     );
     let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(9, Some(20), 10, true), None);
     assert_eq!(report.measured, ["kernel.ane.mlp", "kernel.qmm_splitk"]);
@@ -259,7 +277,7 @@ fn a_device_file_applies_only_within_its_family() {
     let (profile, report) =
         chip::resolve("Apple M4 Pro", &chip::facts(10, Some(40), 10, true), None);
     assert_eq!(report.layers, [Source::Seeded("apple10.toml".into())]);
-    assert_eq!(*profile.get::<AneMlp>(), AneMlp::Units { units: 8 });
+    assert_eq!(*profile.get::<AneMlp>(), AneMlp::Gpu);
     let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(11, Some(40), 10, true), None);
     assert_eq!(report.used, Source::Defaults, "no family applies");
 }

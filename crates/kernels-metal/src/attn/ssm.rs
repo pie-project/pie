@@ -7,6 +7,10 @@ use crate::tuning::GdnScan;
 
 const CONV_GROUP: u32 = 256;
 
+/// The rows one thread of a prompt's conv runs in turn. One thread a channel
+/// running a whole 555-row prompt left most of the GPU idle.
+const CONV_RUN_ROWS: u32 = 16;
+
 const SCAN_WIDTH: u32 = 128;
 
 const GDN_SCAN_FILE: &str = "attn/ssm_gdn_scan.metal";
@@ -345,8 +349,13 @@ pub fn causal_conv1d_chunked(
         "the state bank a dilated conv reads is `(width - 1) * dilation + 1` rows of channels"
     );
     let lanes = requests(OP, x)?;
+    // A lane holds at most every row, so this many runs cover the longest.
+    let runs = x.data.rows.div_ceil(CONV_RUN_ROWS);
     ctx.fire(
-        Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(conv_grid(channels, lanes)),
+        Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(Grid::of(
+            [channels, lanes, runs],
+            [channels.min(CONV_GROUP), 1, 1],
+        )),
         &[
             x.data.arg(),
             x.indptr.arg(),
@@ -358,6 +367,7 @@ pub fn causal_conv1d_chunked(
             stated(OP, x.data.width)?.arg(),
             taps.arg(),
             stated(OP, dilation)?.arg(),
+            stated(OP, CONV_RUN_ROWS)?.arg(),
         ],
     )
 }

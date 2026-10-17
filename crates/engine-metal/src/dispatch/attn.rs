@@ -130,7 +130,7 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
-            } => attn::decode(
+            } => attn::arbiter::decode_with_scratch(
                 self.ctx(),
                 self.tuning(),
                 self.tensor(*q),
@@ -140,6 +140,8 @@ impl Run<'_> {
                 *head_dim,
                 *sm_scale,
                 self.tensor(*o),
+                self.requests(),
+                &|rows, width| self.partials(rows, width),
             ),
             Attention::Prefill {
                 q,

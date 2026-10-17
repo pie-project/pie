@@ -57,10 +57,19 @@ pub struct GatewayInfo {
     pub addr: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkerStatus {
     pub kv_pressure_bucket: u8,
     pub inflight: u32,
+    #[serde(default)]
+    pub running: u32,
+    #[serde(default)]
+    pub waiting: u32,
+    /// Cached KV counts as free; 0 when unknown.
+    #[serde(default)]
+    pub capacity_tokens: u64,
+    #[serde(default)]
+    pub used_tokens: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -158,6 +167,7 @@ mod tests {
                 coarse_load: WorkerStatus {
                     kv_pressure_bucket: 42,
                     inflight: 5,
+                    ..WorkerStatus::default()
                 },
             }],
         };

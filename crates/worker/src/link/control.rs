@@ -132,7 +132,7 @@ pub async fn dial_controller(addr: &str) -> Result<ControlClient> {
     }
 }
 
-fn report_band(status: &WorkerStatus) -> (u8, bool) {
+fn report_band(status: &WorkerStatus) -> (u8, bool, u32, u32) {
     let bucket = status.kv_pressure_bucket;
     let band = if bucket >= 240 {
         u8::MAX
@@ -141,7 +141,14 @@ fn report_band(status: &WorkerStatus) -> (u8, bool) {
     } else {
         bucket / 16
     };
-    (band, status.inflight == 0)
+    // Seats and the queue move the router's load attrs: report a change
+    // in either (the queue by quarters, so a long one is not chattier).
+    (
+        band,
+        status.inflight == 0,
+        status.running,
+        status.waiting.div_ceil(4),
+    )
 }
 
 pub fn spawn_control_tasks<C: ControlLink>(
@@ -181,11 +188,17 @@ pub fn spawn_control_tasks<C: ControlLink>(
         let mut last: Option<(WorkerStatus, Instant)> = None;
         loop {
             ticker.tick().await;
+            let (running, waiting) = runtime::inferlet::process::seats();
+            let (capacity_tokens, used_tokens) = runtime::store::kv_tokens();
             let status = WorkerStatus {
                 kv_pressure_bucket: runtime::store::kv_pressure_bucket(),
                 inflight: runtime::inferlet::process::list()
                     .len()
                     .min(u32::MAX as usize) as u32,
+                running: running.min(u32::MAX as usize) as u32,
+                waiting: waiting.min(u32::MAX as usize) as u32,
+                capacity_tokens,
+                used_tokens,
             };
             let due = match &last {
                 None => true,
@@ -293,6 +306,7 @@ pub fn spawn_executor_control_tasks<C: ControlLink>(
             let status = WorkerStatus {
                 kv_pressure_bucket: stats.kv_pressure_bucket(total_pages),
                 inflight: stats.inflight(),
+                ..WorkerStatus::default()
             };
             if let Err(error) = report_ctrl.report_worker(worker_id, status).await {
                 tracing::warn!(

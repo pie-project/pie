@@ -96,9 +96,16 @@ impl FrameShell for Shell {
                         self.programs
                             .token_device_source(attached.instance)
                             .is_some()
-                            && lanes
-                                .get(attached.lane as usize)
-                                .is_some_and(|seated| seated.lane.tokens.len() == 1)
+                            && lanes.get(attached.lane as usize).is_some_and(|seated| {
+                                seated.lane.tokens.len() == 1
+                                    && !matches!(
+                                        seated.rs,
+                                        RsVerb::Buffer {
+                                            fold: FoldLen::Device,
+                                            ..
+                                        }
+                                    )
+                            })
                     }
                     Some(eta_ir::registry::GeometryClass::DeviceGeometry) => false,
                 }
@@ -115,9 +122,10 @@ impl FrameShell for Shell {
             self.reap_guests_at("prepare")?;
         }
         super::btrace::mark("reap");
-        let mut resolved: Vec<crate::program::Envelope> = Vec::new();
+        let mut resolved: Vec<engine::ports::Envelope> = Vec::new();
         let mut token_src_of: Vec<Option<(u64, u32)>> = vec![None; lanes.len()];
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
+        let mut fold_at: Vec<Option<u64>> = vec![None; lanes.len()];
         for attached in attachments {
             let first = attached.lane as usize;
             let src = self.programs.token_device_source(attached.instance);
@@ -125,8 +133,30 @@ impl FrameShell for Shell {
                 && self.programs.geometry_of(attached.instance)
                     == Some(eta_ir::registry::GeometryClass::DecodeEnvelope)
             {
+                if let Some((src, native)) = src {
+                    let mut at = 0u32;
+                    let mut slices = Vec::new();
+                    for (lane, seated) in lanes.iter().enumerate().skip(first) {
+                        let bytes = seated.lane.tokens.len() as u32 * 4;
+                        if at >= native || at + bytes > native {
+                            break;
+                        }
+                        slices.push((lane, (src + u64::from(at), bytes)));
+                        at += bytes;
+                    }
+                    if at == native {
+                        for (lane, slice) in slices {
+                            token_src_of[lane] = Some(slice);
+                        }
+                    } else if first < lanes.len() {
+                        token_src_of[first] = Some((src, native));
+                    }
+                }
                 if first < lanes.len() {
-                    token_src_of[first] = src;
+                    fold_at[first] = self
+                        .programs
+                        .fold_device_source(attached.instance)
+                        .map(|(cell, _)| cell);
                 }
                 continue;
             }
@@ -166,6 +196,7 @@ impl FrameShell for Shell {
             resolved.push(envelope);
         }
 
+        let page_tokens = self.pools.paging().page_size.max(1);
         let mut device_pages: Vec<Option<Vec<u32>>> = vec![None; lanes.len()];
         let mut device_window: Vec<Option<Vec<u32>>> = vec![None; lanes.len()];
         let mut device_writes: Vec<Option<(Vec<u32>, Vec<u32>)>> = vec![None; lanes.len()];
@@ -194,40 +225,35 @@ impl FrameShell for Shell {
                     )
                 })
             };
-            let relative = ports.pages()?;
-            device_pages[source] = relative
-                .map(|relative| {
-                    relative
-                        .iter()
-                        .map(|&page| translate(page, "pages"))
-                        .collect::<Result<Vec<u32>>>()
-                })
-                .transpose()?;
-            let window = lanes[source].window;
-            if !window.is_empty() {
-                device_window[source] = relative.map(|relative| {
-                    relative
-                        .iter()
-                        .map(|&page| window.get(page as usize).copied().unwrap_or(0))
-                        .collect()
-                });
-            }
-            if ports.owns_pages() {
+            if ports.owns_slots() {
                 lane_rows[source] = ports.rows();
             }
             let rows = lane_rows[source] as usize;
-            device_writes[source] = ports
-                .writes(rows)?
-                .map(|(slots, offsets)| {
-                    Ok::<(Vec<u32>, Vec<u32>), Fault>((
-                        slots
+            if let (Some(slots), Some(reach)) = (ports.slots(rows)?, ports.reach(rows)?) {
+                let relative: Vec<u32> = (0..reach.div_ceil(page_tokens)).collect();
+                device_pages[source] = Some(
+                    relative
+                        .iter()
+                        .map(|&page| translate(page, "slots"))
+                        .collect::<Result<Vec<u32>>>()?,
+                );
+                let window = lanes[source].window;
+                if !window.is_empty() {
+                    device_window[source] = Some(
+                        relative
                             .iter()
-                            .map(|&page| translate(page, "w_slot"))
-                            .collect::<Result<Vec<u32>>>()?,
-                        offsets.to_vec(),
-                    ))
-                })
-                .transpose()?;
+                            .map(|&page| window.get(page as usize).copied().unwrap_or(0))
+                            .collect(),
+                    );
+                }
+                device_writes[source] = Some((
+                    slots
+                        .iter()
+                        .map(|&slot| translate(slot / page_tokens, "slots"))
+                        .collect::<Result<Vec<u32>>>()?,
+                    slots.iter().map(|&slot| slot % page_tokens).collect(),
+                ));
+            }
             if let Some((cells, stride)) = ports.mask(rows)? {
                 if rows != 1 {
                     return Err(Fault::program(
@@ -235,13 +261,12 @@ impl FrameShell for Shell {
                         format!(
                             "lane {source} resolves its attention mask from a channel and \
                              carries {rows} query rows; the expansion intersects each row \
-                             with the order the cache is written in, and a lane whose \
-                             write descriptor is the guest's has no such order this shell \
-                             can derive"
+                             with the order the cache is written in, and a lane that \
+                             states its own slots has no such order this shell can derive"
                         ),
                     ));
                 }
-                device_masks[source] = Some(crate::mask::from_dense(cells, stride));
+                device_masks[source] = Some(engine::ports::from_dense(cells, stride));
             }
         }
 
@@ -710,6 +735,8 @@ impl FrameShell for Shell {
         let mut fresh: Vec<u32> = Vec::new();
         let mut rs_pages_named = 0u32;
         let mut rs_moves: Vec<RsMove<'a>> = Vec::with_capacity(lanes.len());
+        let mut rs_reads: Vec<Vec<std::ops::Range<u32>>> = vec![Vec::new(); lanes.len()];
+        let mut rs_folded: Vec<Option<u32>> = vec![None; lanes.len()];
         let mut rs_lens: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut rs_order: Vec<u32> = vec![0; lanes.len()];
         let mut adapter_routes: Vec<i32> = Vec::new();
@@ -725,17 +752,16 @@ impl FrameShell for Shell {
                 Some((held, at)) => Some(resolved[held].lane(at, source)?),
                 None => None,
             };
-            let have = match ports.as_ref().filter(|ports| ports.owns_pages()) {
+            let have = match ports.as_ref().filter(|ports| ports.owns_slots()) {
                 _ if seated.kv_less => 0,
                 Some(ports) => {
-                    let after = ports.extent().ok_or_else(|| {
+                    let after = ports.reach(row.rows as usize)?.ok_or_else(|| {
                         Fault::program(
                             "serve::prepare",
                             format!(
-                                "lane {source} states its own page table and binds no \
-                                 `kv_len` port; the page count, the last page's fill and \
-                                 the attention schedules are all carved from the extent, \
-                                 and no seat in this shell knows it"
+                                "lane {source} states where its rows land and reaches no \
+                                 slot; the page count, the last page's fill and the \
+                                 attention schedules are all carved from what it reads"
                             ),
                         )
                     })?;
@@ -743,10 +769,9 @@ impl FrameShell for Shell {
                         return Err(Fault::program(
                             "serve::prepare",
                             format!(
-                                "lane {source} states a readable KV extent of {after} on \
-                                 its `kv_len` port and this fire writes {} row(s) into \
-                                 it; the extent is AFTER the append, so it can never be \
-                                 shorter than what the append adds",
+                                "lane {source} reads a KV extent of {after} and this fire \
+                                 writes {} row(s) into it; the extent is AFTER the append, \
+                                 so it can never be shorter than what the append adds",
                                 row.rows
                             ),
                         ));
@@ -815,8 +840,8 @@ impl FrameShell for Shell {
             slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
             let fire_lane = rs_moves.len();
             rs_order[row.source as usize] = fire_lane as u32;
-            let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold_len.as_deref());
-            if let RsVerb::Buffer { pages, .. } | RsVerb::FoldBuffered { pages, .. } = &seated.rs {
+            let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold.as_deref());
+            if let RsVerb::Buffer { pages, .. } = &seated.rs {
                 rs_pages_named =
                     rs_pages_named.max(pages.iter().copied().max().map_or(0, |page| page + 1));
             }
@@ -824,69 +849,54 @@ impl FrameShell for Shell {
                 RsVerb::Fold => (RsMove::None, row.rows),
                 RsVerb::Buffer {
                     pages,
-                    at,
+                    base,
+                    folded,
                     fold,
-                    replay,
                 } => {
-                    if *replay > *at {
+                    let stated = match &ports {
+                        Some(ports) => ports.slots(row.rows as usize)?,
+                        None => None,
+                    };
+                    let first = stated
+                        .and_then(|slots| slots.first().copied())
+                        .unwrap_or(have);
+                    if first < *folded || *folded < *base {
                         return Err(Fault::program(
                             "serve::rs",
                             format!(
-                                "lane {} replays {replay} buffered token(s) below buffer \
-                                 position {at}, which has only {at}",
+                                "lane {} lands its rows at slot {first}, and its state holds \
+                                 slots below {folded} with its buffer from slot {base}; a lane \
+                                 writes past what its state holds, into its buffer",
                                 row.source
                             ),
                         ));
                     }
-                    let extended = replay.saturating_add(row.rows);
-                    let fold = match fold {
-                        FoldLen::Host(0) => 0,
-                        stated => resolve_fold_len(*stated, extended, fire_lane, port)?,
-                    };
+                    let reads = engine::fire::buffered_reads(masking, *folded, first, row.rows)
+                        .map_err(|error| {
+                            Fault::program("serve::rs", format!("lane {}: {error}", row.source))
+                        })?;
+                    let replay = crate::run::replayed(&reads);
+                    let cell = envelope_of[source].map_or(fire_lane, |(_, at)| at);
+                    let to = folded
+                        .saturating_add(stated_fold(*fold, cell, port)?)
+                        .min(first + row.rows);
+                    rs_folded[source] = Some(to - folded);
+                    let below: u32 = reads
+                        .iter()
+                        .map(|span| span.end.min(to).saturating_sub(span.start))
+                        .sum();
+                    let fold = below + to.saturating_sub(first).min(row.rows);
+                    rs_reads[fire_lane] = reads
+                        .iter()
+                        .map(|span| span.start - base..span.end - base)
+                        .collect();
                     (
                         RsMove::Scatter {
                             pages: pages.as_slice(),
-                            at: *at,
+                            at: first - base,
                             fold,
-                            replay: *replay,
                         },
-                        if fold == 0 { extended } else { fold },
-                    )
-                }
-                RsVerb::Window { .. } => {
-                    return Err(Fault::program(
-                        "serve::rs",
-                        format!(
-                            "lane {} asks the device-resident window verb, which this plane does \
-                             not serve yet (it replays a buffered prefix ahead of the rows)",
-                            row.source
-                        ),
-                    ));
-                }
-                RsVerb::FoldBuffered {
-                    pages,
-                    at,
-                    bound,
-                    len,
-                } => {
-                    let (bound, len) = (*bound, *len);
-                    if bound != row.rows {
-                        return Err(Fault::program(
-                            "serve::rs",
-                            format!(
-                                "lane {} replays a buffer bounded at {bound} tokens in a fire \
-                                 that gave it {} rows — the bound IS what sizes the launch, so \
-                                 the two are one number",
-                                row.source, row.rows
-                            ),
-                        ));
-                    }
-                    (
-                        RsMove::Gather {
-                            pages: pages.as_slice(),
-                            at: *at,
-                        },
-                        resolve_fold_len(len, bound, fire_lane, port)?,
+                        if fold == 0 { replay + row.rows } else { fold },
                     )
                 }
             };
@@ -976,6 +986,9 @@ impl FrameShell for Shell {
                     }
                     match ports.positions_for(have, rows_here)? {
                         Some(stated) => positions.extend(stated.iter().map(|&p| p as i32)),
+                        None if !seated.positions.is_empty() => {
+                            positions.extend(seated.positions.iter().map(|&p| p as i32))
+                        }
                         None => positions
                             .extend((0..rows_here).map(|at| narrow(u64::from(have) + at as u64))),
                     }
@@ -1001,7 +1014,12 @@ impl FrameShell for Shell {
                     }
                     for (at, token) in lane.tokens.iter().enumerate() {
                         tokens.push(*token as i32);
-                        positions.push(narrow(u64::from(have) + at as u64));
+                        positions.push(
+                            seated
+                                .positions
+                                .get(at)
+                                .map_or_else(|| narrow(u64::from(have) + at as u64), |&p| p as i32),
+                        );
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
@@ -1462,30 +1480,67 @@ impl FrameShell for Shell {
             },
         )?;
 
-        let rs_replays: Vec<u32> = rs_moves
+        let rs_replays: Vec<u32> = rs_reads
             .iter()
-            .map(|verb| match verb {
-                RsMove::Scatter { replay, .. } => *replay,
-                _ => 0,
-            })
+            .map(|reads| crate::run::replayed(reads))
             .collect();
         let rs_truncates = rs_lens
             .iter()
             .zip(&seats)
             .zip(&rs_replays)
             .any(|((len, seat), replay)| *len < narrow(u64::from(seat.rows) + u64::from(*replay)));
-        let rs_splits = rs_moves.iter().zip(&seats).any(|(verb, seat)| {
-            matches!(verb, RsMove::Scatter { fold, replay, .. } if *fold > 0 && *fold < seat.rows + *replay)
-        });
         let rs_rows_ext = if rs_replays.iter().any(|replay| *replay > 0) {
             rows.saturating_add(rs_replays.iter().sum::<u32>())
         } else {
             0
         };
+        let placed = match geometries.as_slice() {
+            [space] if !self.pools.windowed_space(0) => Some(space),
+            _ => None,
+        };
+        let kv_reports: Vec<super::KvReport> = composition
+            .lanes()
+            .iter()
+            .filter(|row| lanes[row.source as usize].reports != 0)
+            .map(|row| {
+                let fold = rs_folded[row.source as usize].or_else(|| {
+                    envelope_of[row.source as usize].and_then(|(held, at)| {
+                        let cells = resolved[held].fold.as_ref()?;
+                        cells.get(at).or_else(|| cells.first()).copied()
+                    })
+                });
+                let report = super::KvReport {
+                    tag: lanes[row.source as usize].reports,
+                    first_row: row.row_offset,
+                    tokens: Some(Vec::new()),
+                    positions: Vec::new(),
+                    pages: Vec::new(),
+                    offsets: Vec::new(),
+                    fold,
+                    fold_at: fold_at[row.source as usize].filter(|_| fold.is_none()),
+                };
+                let Some(space) = placed else {
+                    return report;
+                };
+                let unsigned = |values: &[i32]| values.iter().map(|&v| v as u32).collect();
+                let span = row.row_offset as usize..(row.row_offset + row.rows) as usize;
+                let fed = token_injects
+                    .iter()
+                    .any(|inject| inject.dst_off == u64::from(row.row_offset) * 4);
+                super::KvReport {
+                    tokens: (!fed).then(|| unsigned(&tokens[span.clone()])),
+                    positions: unsigned(&positions[span.clone()]),
+                    pages: unsigned(&space.write_page[span.clone()]),
+                    offsets: unsigned(&space.write_offset[span]),
+                    ..report
+                }
+            })
+            .collect();
         Ok(Prepared {
             slot: Some(slot),
             lengths: staged_lens,
             token_injects,
+            kv_reports,
             bodied,
             admits,
             islands: key.islands.clone(),
@@ -1538,12 +1593,11 @@ impl FrameShell for Shell {
                     (scatters != 0 && scatters != rs_moves.len()) || prologue
                 },
                 truncates: rs_truncates,
-                splits: rs_splits,
                 buffered: rs_moves.iter().any(|verb| !matches!(verb, RsMove::None)),
                 moves: rs_moves,
                 lens: rs_lens,
                 order: rs_order,
-                replays: rs_replays,
+                reads: rs_reads,
                 rows_ext: rs_rows_ext,
             },
         })
@@ -1589,17 +1643,16 @@ impl FrameShell for Shell {
     }
 }
 
-fn resolve_fold_len(len: FoldLen, bound: u32, lane: usize, port: Option<&[u32]>) -> Result<u32> {
-    let stated = match len {
+fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
+    Ok(match len {
         FoldLen::Host(n) => n,
-        FoldLen::Device(which) => {
+        FoldLen::Device => {
             let cells = port.ok_or_else(|| {
                 Fault::program(
                     "serve::rs",
                     format!(
-                        "lane {lane} states a device-resident fold length on port {}, and the \
-                         program attached to it resolved no such port",
-                        which.name()
+                        "lane {lane} states a device-resident fold length, and the program \
+                         attached to it resolved no `fold` port"
                     ),
                 )
             })?;
@@ -1607,27 +1660,14 @@ fn resolve_fold_len(len: FoldLen, bound: u32, lane: usize, port: Option<&[u32]>)
                 Fault::program(
                     "serve::rs",
                     format!(
-                        "lane {lane} states a device-resident fold length on port {} whose \
-                         cell carries {} entries",
-                        which.name(),
+                        "lane {lane} states a device-resident fold length on a `fold` port \
+                         whose cell carries {} entries",
                         cells.len()
                     ),
                 )
             })?
         }
-    };
-    let folded = stated.min(bound);
-    if folded == 0 {
-        return Err(Fault::program(
-            "serve::rs",
-            format!(
-                "lane {lane}'s fold length resolved to 0 against a bound of {bound}, which is \
-                 not a dispatchable commit — a speculative commit must fold at least the \
-                 bonus token it is guaranteed to accept"
-            ),
-        ));
-    }
-    Ok(folded)
+    })
 }
 
 fn narrow(n: u64) -> i32 {
@@ -1727,46 +1767,12 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{FoldLen, readout_extent, resolve_fold_len};
-
-    const PORT: eta_ir::registry::Port = eta_ir::registry::Port::RsFoldLen;
+    use super::readout_extent;
 
     #[test]
-    fn prepare_every_case() {
-        a_device_fold_length_is_clamped_to_the_bound_it_was_promised();
-        a_fold_length_that_resolves_to_zero_is_refused_by_name();
-        a_readout_as_tall_as_the_fire_holds_the_bucket();
-    }
-
     fn a_readout_as_tall_as_the_fire_holds_the_bucket() {
         assert_eq!(readout_extent(133, 256, 133), 256);
         assert_eq!(readout_extent(133, 256, 5), 5);
         assert_eq!(readout_extent(133, 133, 133), 133);
-    }
-
-    fn a_device_fold_length_is_clamped_to_the_bound_it_was_promised() {
-        let cells = [3u32, 9, 5];
-        let port = Some(&cells[..]);
-        assert_eq!(
-            resolve_fold_len(FoldLen::Device(PORT), 8, 0, port).unwrap(),
-            3
-        );
-        assert_eq!(
-            resolve_fold_len(FoldLen::Device(PORT), 8, 1, port).unwrap(),
-            8
-        );
-        assert_eq!(resolve_fold_len(FoldLen::Host(9), 8, 0, port).unwrap(), 8);
-        assert_eq!(resolve_fold_len(FoldLen::Host(4), 8, 0, None).unwrap(), 4);
-    }
-
-    fn a_fold_length_that_resolves_to_zero_is_refused_by_name() {
-        let cells = [0u32];
-        for len in [FoldLen::Device(PORT), FoldLen::Host(0)] {
-            let error = resolve_fold_len(len, 8, 0, Some(&cells[..])).unwrap_err();
-            let said = error.to_string();
-            assert!(said.contains("bonus token"), "{said}");
-        }
-        let error = resolve_fold_len(FoldLen::Host(4), 0, 0, None).unwrap_err();
-        assert!(error.to_string().contains("bonus token"), "{error}");
     }
 }

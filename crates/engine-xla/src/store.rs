@@ -601,15 +601,71 @@ impl Pools {
         self.check_slot(src)?;
         self.check_slot(dst)?;
         let tracer = Tracer::new(handles);
-        let rows: Vec<Tensor> = self.state_rows().map(|r| r.1).collect();
-        for &t in &rows {
+        // A recurrent slot is its state row and its buffered page (rows
+        // `slot * page ..` of each buffer plane): a copy that left the page
+        // behind would hand the next fold whatever `dst` last held.
+        let page = i64::from(self.paging.page_size.max(1));
+        let rows = self
+            .state_rows()
+            .map(|r| (r.1, 1))
+            .chain(self.rs_buffers.iter().map(|&t| (t, page)));
+        for (t, span) in rows.collect::<Vec<_>>() {
             tracer.emit(&mut |cx| {
                 let whole = cx.read(t)?;
-                let row = cx.slice_axis(whole, 0, i64::from(src), i64::from(src) + 1)?;
-                let at = cx.const_i(Elem::I32, i64::from(dst), &[]);
+                let from = i64::from(src) * span;
+                let row = cx.slice_axis(whole, 0, from, from + span)?;
+                let at = cx.const_i(Elem::I32, i64::from(dst) * span, &[]);
                 let col = cx.const_i(Elem::I32, 0, &[]);
                 let next = cx.dynamic_update_slice(whole, row, &[at, col])?;
                 cx.write(t, next)
+            })?;
+        }
+        crate::exec::maintain(device, tracer, self)
+    }
+
+    #[must_use]
+    pub fn buffer_pages(&self) -> u32 {
+        if self.rs_buffers.is_empty() {
+            0
+        } else {
+            self.paging.slots.max(1)
+        }
+    }
+
+    pub fn copy_pages(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        moves: &[(u32, u32)],
+    ) -> Result<()> {
+        if moves.is_empty() {
+            return Ok(());
+        }
+        let pages = self.buffer_pages();
+        if let Some(&page) = moves
+            .iter()
+            .flat_map(|(a, b)| [a, b])
+            .find(|&&page| page >= pages)
+        {
+            return Err(Fault::Ceiling {
+                what: "recurrent buffer pages",
+                need: u64::from(page) + 1,
+                have: u64::from(pages),
+            });
+        }
+        let rows = i64::from(self.paging.page_size.max(1));
+        let tracer = Tracer::new(handles);
+        for &t in &self.rs_buffers {
+            tracer.emit(&mut |cx| {
+                let mut whole = cx.read(t)?;
+                for &(src, dst) in moves {
+                    let page =
+                        cx.slice_axis(whole, 0, i64::from(src) * rows, i64::from(src + 1) * rows)?;
+                    let at = cx.const_i(Elem::I32, i64::from(dst) * rows, &[]);
+                    let col = cx.const_i(Elem::I32, 0, &[]);
+                    whole = cx.dynamic_update_slice(whole, page, &[at, col])?;
+                }
+                cx.write(t, whole)
             })?;
         }
         crate::exec::maintain(device, tracer, self)

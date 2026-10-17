@@ -3,6 +3,7 @@ use std::cell::RefCell;
 #[cfg(target_vendor = "apple")]
 use kernels_metal::Tensor;
 use kernels_metal::{ArgValue, Encode, Error, Fire};
+use poem_exec::fire::At;
 #[cfg(target_vendor = "apple")]
 use poem_exec::fire::MaskSpan;
 use poem_ir::ValueId;
@@ -12,7 +13,7 @@ use crate::device::{Buffer, Context, Handles, Pipelines, handles::NIL};
 use crate::error::Fault;
 use crate::experts::Tier;
 use crate::run::SlotTable;
-use crate::window::{At, Windows};
+use crate::window::Windows;
 
 #[cfg(target_vendor = "apple")]
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
@@ -45,6 +46,9 @@ pub struct Sink<'a> {
     /// load hands work to the Neural Engine.
     #[cfg(target_vendor = "apple")]
     handoff: Option<&'a kernels_metal::ane::Handoff>,
+    /// Launches left before the borrowed frame commits its head and goes on
+    /// in a fresh buffer; zero never.
+    flush_in: std::cell::Cell<u32>,
 }
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
@@ -111,6 +115,7 @@ impl<'a> Sink<'a> {
             cuts: None,
             #[cfg(target_vendor = "apple")]
             handoff: None,
+            flush_in: std::cell::Cell::new(0),
         }
     }
 
@@ -130,6 +135,7 @@ impl<'a> Sink<'a> {
             cuts: Some(cuts),
             #[cfg(target_vendor = "apple")]
             handoff: None,
+            flush_in: std::cell::Cell::new(0),
         }
     }
 
@@ -408,6 +414,15 @@ impl Encode for Sink<'_> {
                 encoder.dispatchThreads_threadsPerThreadgroup(lanes, group);
                 Ok(())
             })?;
+            if let Held::Borrowed(frame) = &self.frame
+                && let left = self.flush_in.get()
+                && left > 0
+            {
+                self.flush_in.set(left - 1);
+                if left == 1 {
+                    frame.flush().map_err(|fault| Sink::refuse(fire, fault))?;
+                }
+            }
             if profiling()
                 && let Held::Owned(cell) = &self.frame
             {
@@ -455,6 +470,14 @@ impl Encode for Sink<'_> {
 }
 
 impl<'a> Sink<'a> {
+    /// Commits the borrowed frame's head once `launches` are encoded, so the
+    /// device starts on them while the rest of the fire is still encoding.
+    #[must_use]
+    pub fn flushing_after(self, launches: u32) -> Self {
+        self.flush_in.set(launches);
+        self
+    }
+
     /// Arms the hand-off `signal` and `wait` fence on.
     #[cfg(target_vendor = "apple")]
     #[must_use]

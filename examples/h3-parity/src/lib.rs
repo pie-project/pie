@@ -338,9 +338,9 @@ async fn denoise(case: &Case) -> Result<(Vec<f32>, Vec<f32>)> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Attention {
+    if model::pass_kind() != model::ForwardKind::Text {
         return Err(
-            "minimax_h3 is an attention-kind pass with no kv bound on its denoise reading".into(),
+            "minimax_h3 is a `forward` pass with no state bound on its denoise reading".into(),
         );
     }
     let pieces: String = [

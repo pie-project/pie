@@ -11,7 +11,7 @@
 //! token — most of the token — and pinned the loop to one fire in flight.
 
 use inferlet::chat;
-use inferlet::eta::hybrid::prelude::*;
+use inferlet::eta::prelude::*;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -78,23 +78,6 @@ async fn main(input: Input) -> Result<String> {
 
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-    // One recurrent working set for this one sequence on a hybrid model (the
-    // engine requires one per request row); none on a pure-attention one. It
-    // is bound to every pass of the sequence — the prefill and the decode.
-    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
-        model::ForwardKind::Attention => Vec::new(),
-        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
-        model::ForwardKind::Recurrent => {
-            return Err(
-                "this program has no recurrent-only path (no registered model reports that kind)"
-                    .into(),
-            );
-        }
-        model::ForwardKind::Diffusion => {
-            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
-        }
-    };
-    let page_size = kv_page_size();
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
     prompt.extend(chat::cue());
@@ -106,44 +89,15 @@ async fn main(input: Input) -> Result<String> {
     let delta = input.delta;
     let gamma = input.gamma;
     let last_prompt = *prompt.last().unwrap_or(&0);
-    let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages).context("reserve KV")?;
 
     let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
     let prefill_indptr = Channel::from([0u32, n]).named("prefill_indptr");
-    let prefill_positions = Channel::from_iter(0..n).named("prefill_positions");
-    let prefill_pages = Channel::from_iter(0..max_pages).named("prefill_pages");
-    let prefill_page_indptr =
-        Channel::from([0u32, n.div_ceil(page_size)]).named("prefill_page_indptr");
-    let prefill_w_slot = Channel::from_iter((0..n).map(|p| p / page_size)).named("prefill_w_slot");
-    let prefill_w_off = Channel::from_iter((0..n).map(|p| p % page_size)).named("prefill_w_off");
     let prefill_rng = Channel::from([0x51ed_u32, 0]).named("prefill_rng");
     let first_out = Channel::new([1], dtype::i32).named("first_token");
 
     let prefill = ForwardPass::new();
     prefill.embed(&prompt_tokens, &prefill_indptr)?;
-    let prefill_kv_len = Channel::from([n]).named("prefill_kv_len");
-    prefill.attention(
-        Some(KvBinding {
-            working_set: &ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &prefill_kv_len,
-                pages: &prefill_pages,
-                page_indptr: &prefill_page_indptr,
-                w_slot: &prefill_w_slot,
-                w_off: &prefill_w_off,
-                positions: &prefill_positions,
-                mask: None,
-            },
-        }),
-        &rs_ws,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
-        },
-    )?;
+    prefill.state(&[&ws], StateGeometry::folding())?;
     prefill.epilogue(move || {
         let green = green_mask(&broadcast(last_prompt, [1]), gamma, vocab);
         let rng = prefill_rng.take();
@@ -152,13 +106,8 @@ async fn main(input: Input) -> Result<String> {
         prefill_rng.put(&rng + iota(2));
     });
 
-    // ONE pipeline for the whole stream (R4-4): prefill and decode are one
-    // sequential stream. The host round-trip on `first` stays — it seeds the
-    // decode channels.
     let pipeline = Pipeline::new();
     prefill.submit(&pipeline).context("watermark prefill")?;
-    // max_tokens == 1: the prefill spends the whole budget, so it was the
-    // stream's last submit — finish() right after it (F7).
     let first = first_out.take_host::<i32>().await? as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
@@ -170,55 +119,21 @@ async fn main(input: Input) -> Result<String> {
         let token_in = Channel::from([first as i32]).named("token_in");
         let rng = Channel::from([0x9e37_u32, 0]).named("rng");
         let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
-        let positions = Channel::from([n]).named("positions");
-        let pages = Channel::from_iter(0..max_pages).named("pages");
-        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from([n / page_size]).named("w_slot");
-        let w_off = Channel::from([n % page_size]).named("w_off");
         let token_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("token_out");
 
         let decode = ForwardPass::new();
         decode.embed(&token_in, &embed_indptr)?;
-        let kv_len = Channel::from([n + 1]).named("kv_len");
-        decode.attention(
-            Some(KvBinding {
-                working_set: &ws,
-                geometry: KvGeometry {
-                    readable_pages: ..,
-                    writable_pages: (n / page_size)..,
-                    kv_len: &kv_len,
-                    pages: &pages,
-                    page_indptr: &page_indptr,
-                    w_slot: &w_slot,
-                    w_off: &w_off,
-                    positions: &positions,
-                    mask: None,
-                },
-            }),
-            &rs_ws,
-            RsGeometry {
-                fold_len: None,
-                buffer: 0..0,
-            },
-        )?;
+        decode.state(&[&ws], StateGeometry::folding())?;
         decode.epilogue(move || {
-            let length = kv_len.take();
             // The token this step embedded is the previous output: the key.
             let previous = cast(token_in.take(), dtype::u32);
             let green = green_mask(&previous, gamma, vocab);
             let rng_value = rng.take();
             let token = watermarked_sample(&intrinsics::logits(), &green, &rng_value, delta, vocab);
-            let next_length = &length + 1u32;
-            let page_count = next_length.div_ceil(page_size);
 
             token_in.put(&token);
-            kv_len.put(&next_length);
-            positions.put(&length);
-            w_slot.put(&length / page_size);
-            w_off.put(&length % page_size);
-            page_indptr.put(indptr(1, &page_count));
             token_out.put(&token);
             rng.put(&rng_value + iota(2));
         });

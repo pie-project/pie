@@ -96,19 +96,11 @@ export enum Port {
   EMBED_TOKENS = 0,
   EMBED_INDPTR = 1,
   POSITIONS = 2,
-  PAGES = 3,
-  PAGE_INDPTR = 4,
   KV_LEN = 5,
-  W_SLOT = 6,
-  W_OFF = 7,
   READOUT = 8,
   ATTN_MASK = 9,
-  RS_BUFFER_PAGES = 10,
-  RS_BUFFER_INDPTR = 11,
-  RS_BUFFER_LEN = 12,
-  RS_W_SLOT = 13,
-  RS_W_OFF = 14,
-  RS_FOLD_LEN = 15,
+  SLOTS = 16,
+  FOLD = 17,
 }
 
 /** True iff a channel bound to this port is consumed (take) by the pass. */
@@ -116,11 +108,7 @@ export function portConsumes(p: Port): boolean {
   switch (p) {
     case Port.EMBED_TOKENS:
     case Port.POSITIONS:
-    case Port.W_SLOT:
-    case Port.W_OFF:
-    case Port.RS_W_SLOT:
-    case Port.RS_W_OFF:
-    case Port.RS_FOLD_LEN:
+    case Port.SLOTS:
       return true;
     default:
       return false;

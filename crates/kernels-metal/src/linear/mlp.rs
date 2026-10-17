@@ -45,6 +45,29 @@ pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Re
     )
 }
 
+/// [`swiglu`] over a routed stack's sorted rows: padding rows, whose `perm`
+/// is negative, are left as they are.
+pub fn swiglu_sorted(
+    ctx: &Ctx<'_>,
+    packed: Tensor,
+    intermediate: u32,
+    perm: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mlp_swiglu";
+    dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
+    let cut = halves(OP, packed, intermediate, y)?;
+    ctx.fire(
+        Fire::at("linear/mlp_packed.metal", "packed_swiglu_sorted").apply(cut.grid),
+        &[
+            cut.packed.arg(),
+            cut.y.arg_mut(),
+            cut.intermediate.arg(),
+            perm.arg(),
+        ],
+    )
+}
+
 pub fn swiglu_clamp(
     ctx: &Ctx<'_>,
     packed: Tensor,

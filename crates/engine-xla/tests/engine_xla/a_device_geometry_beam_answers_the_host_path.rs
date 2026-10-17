@@ -1,8 +1,8 @@
 //! A beam-style program bound in `GeometryClass::DeviceGeometry`: two beams
-//! forked off one prompt publish their token ids, positions, page tables
-//! (relative to the working set, translated by the lane's table) and KV
-//! extents on channels, and the engine resolves the fire's geometry from
-//! those cells (engine-cuda `program/ports.rs` + `serve/prepare.rs`). Each
+//! forked off one prompt publish their token ids, positions, the slots
+//! their rows land in (working-set slots, whose pages the lane's
+//! translation table names) and KV extents on channels, and the engine
+//! resolves the fire's geometry from those cells (engine-cuda `program/ports.rs` + `serve/prepare.rs`). Each
 //! beam's logits, read back through the guest's `logits` intrinsic, answer
 //! what the host path answers for the same beams stated on the lanes, for
 //! two decode steps.
@@ -31,8 +31,6 @@ const SM_SCALE: f32 = 0.125;
 const KV_ROW: &str = "trunk.kv";
 const PAGE: u32 = 16;
 const BEAMS: u32 = 2;
-/// Pages per beam: the shared prompt's page, then the beam's own.
-const PAGES: u32 = 2;
 
 struct Tiny;
 
@@ -98,9 +96,6 @@ fn const_port(port: Port, words: &[u32]) -> PortBinding {
     }
 }
 
-/// The beam program: token ids, positions, page table and extents on
-/// channels 0..4, the token and page CSRs constant, each beam's logits
-/// put on channel 4.
 fn beam_program() -> TraceContainer {
     let bound = |port: Port, chan: u32| PortBinding {
         port,
@@ -111,24 +106,16 @@ fn beam_program() -> TraceContainer {
         channels: vec![
             channel(Shape::vector(BEAMS), EtaDtype::I32, HostRole::Writer),
             channel(Shape::vector(BEAMS), EtaDtype::U32, HostRole::Writer),
-            channel(Shape::matrix(BEAMS, PAGES), EtaDtype::U32, HostRole::Writer),
+            channel(Shape::vector(BEAMS), EtaDtype::U32, HostRole::Writer),
             channel(Shape::vector(BEAMS), EtaDtype::U32, HostRole::Writer),
             channel(Shape::matrix(BEAMS, VOCAB), EtaDtype::F32, HostRole::Reader),
-            channel(Shape::vector(BEAMS), EtaDtype::U32, HostRole::Writer),
-            channel(Shape::vector(BEAMS), EtaDtype::U32, HostRole::Writer),
         ],
         ports: vec![
             bound(Port::EmbedTokens, 0),
             const_port(Port::EmbedIndptr, &(0..=BEAMS).collect::<Vec<_>>()),
             bound(Port::Positions, 1),
-            bound(Port::Pages, 2),
-            const_port(
-                Port::PageIndptr,
-                &(0..=BEAMS).map(|b| b * PAGES).collect::<Vec<_>>(),
-            ),
+            bound(Port::Slots, 2),
             bound(Port::KvLen, 3),
-            bound(Port::WSlot, 5),
-            bound(Port::WOff, 6),
         ],
         stages: vec![StageProgram {
             stage: Stage::Epilogue,
@@ -137,14 +124,12 @@ fn beam_program() -> TraceContainer {
                 Op::ChanTake(1),
                 Op::ChanTake(2),
                 Op::ChanTake(3),
-                Op::ChanTake(5),
-                Op::ChanTake(6),
                 Op::IntrinsicVal {
                     intr: IntrinsicId::Logits,
                     shape: Shape::matrix(BEAMS, VOCAB),
                     dtype: EtaDtype::F32,
                 },
-                Op::ChanPut { chan: 4, value: 6 },
+                Op::ChanPut { chan: 4, value: 4 },
             ],
         }],
         externs: Vec::new(),
@@ -193,21 +178,19 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
         Vec::new(),
     );
 
-    // Host beams write their own pages 2, 3; device beams 4, 5, which the
-    // device path names relatively through the lane's translation table.
+    // Host beams write their own pages 2, 3; device beams 4, 5, which each
+    // device lane's translation table names as its working set's second
+    // page, after the shared prompt's.
     let host_own = [2u32, 3];
     let device_own = [4u32, 5];
-    let translation = vec![shared, device_own[0], device_own[1]];
 
     let program = rig.register(beam_program());
     let channels = vec![
         rig.channel_of(vec![BEAMS], EtaDtype::I32, HostRole::Writer),
         rig.channel_of(vec![BEAMS], EtaDtype::U32, HostRole::Writer),
-        rig.channel_of(vec![BEAMS, PAGES], EtaDtype::U32, HostRole::Writer),
+        rig.channel_of(vec![BEAMS], EtaDtype::U32, HostRole::Writer),
         rig.channel_of(vec![BEAMS], EtaDtype::U32, HostRole::Writer),
         rig.channel_of(vec![BEAMS, VOCAB], EtaDtype::F32, HostRole::Reader),
-        rig.channel_of(vec![BEAMS], EtaDtype::U32, HostRole::Writer),
-        rig.channel_of(vec![BEAMS], EtaDtype::U32, HostRole::Writer),
     ];
     let instance = rig
         .engine
@@ -247,11 +230,8 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
         for (chan, cell) in [
             (0u32, words(beam_tokens)),
             (1, words(&[held, held])),
-            (2, words(&[0, 1, 0, 2])),
+            (2, words(&[held, held])),
             (3, words(&[held + 1, held + 1])),
-            // Each beam writes its row into its own page (relative 1, 2).
-            (5, words(&[1, 2])),
-            (6, words(&[held - PAGE, held - PAGE])),
         ] {
             assert!(
                 rig.engine
@@ -269,7 +249,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
                     readout: Readout::Last,
                     ..Lane::default()
                 };
-                lane.kv.translation = translation.clone();
+                lane.kv.translation = vec![shared, device_own[b as usize]];
                 lane
             })
             .collect();

@@ -3,7 +3,8 @@
 #
 # A head states the drafter's shape: `taps` (the trunk layers it reads),
 # `windows` (one per block, `None` attending the whole masked block both
-# ways), its attention and MLP widths, the `block` it drafts and the
+# ways), whether a windowed block also reads its own block both ways
+# (`bidirectional`), its attention and MLP widths, the `block` it drafts and the
 # `mask_token` that fills it, an optional dynamic `conv` around each block's
 # branches, and its `readout`: "argmax", or a `selector` or `markov` walk
 # over the top candidates.
@@ -21,7 +22,8 @@ def head(
         proposals_from = 1,
         conv = None,
         readout = "argmax",
-        attn_bias = False):
+        attn_bias = False,
+        bidirectional = False):
     return struct(
         taps = taps,
         windows = windows,
@@ -36,6 +38,7 @@ def head(
         conv = conv,
         readout = readout,
         attn_bias = attn_bias,
+        bidirectional = bidirectional,
     )
 
 def selector(rank, top_k):
@@ -142,4 +145,5 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense):
         mask_token = head.mask_token,
         selector = chooser,
         proposals_from = head.proposals_from,
+        bidirectional = head.bidirectional,
     )

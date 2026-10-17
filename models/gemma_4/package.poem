@@ -1,6 +1,6 @@
 # Gemma 4: 26B-A4B (experts; with a DFlash drafter, its MTP assistant or its
-# vision tower), 31B (with its assistant or vision tower), E4B (with an EAGLE
-# head or vision tower) and E4B's miniatures; and DiffusionGemma, 26B-A4B
+# vision tower), 31B (with its assistant or vision tower), 12B, E4B (with an EAGLE
+# head or vision tower), E2B and E4B's miniatures; and DiffusionGemma, 26B-A4B
 # as a block-diffusion text model.
 
 GEMMA = template("gemma")
@@ -11,6 +11,8 @@ TOKENIZER = tokenizer(markers = [["<turn|>", "<eos>"]], parts = {"vision": [["<|
 MODELS = [
     model("gemma4-26b-a4b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["mtp", "dflash"], arch = "gemma4", layers = 30, vocab = 262144),
     model("gemma4-31b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["mtp"], arch = "gemma4", layers = 60, vocab = 262144),
+    model("gemma4-12b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, arch = "gemma4", layers = 48, vocab = 262144),
+    model("gemma4-e2b", template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 35, vocab = 262144),
     model("gemma4-e4b", template = GEMMA, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["eagle"], arch = "gemma4", layers = 42, vocab = 262144),
     model("gemma4-e4b-mini-l1", mini = True, template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 1, vocab = 262144),
     model("gemma4-e4b-mini-l6", mini = True, template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 6, vocab = 262144),
@@ -29,6 +31,11 @@ DEPLOYMENTS = [
     deployment("gemma4-26b-a4b", weights = U4, kv = BF),
     deployment("gemma4-31b", weights = U4, kv = BF, drafter = "mtp"),
     deployment("gemma4-31b", weights = U4, kv = BF),
+    deployment("gemma4-12b", weights = U4, kv = BF),
+    deployment("gemma4-12b", weights = BF, kv = BF),
+    deployment("gemma4-e2b", weights = BF, kv = BF),
+    deployment("gemma4-e2b", weights = U4, kv = BF),
+    deployment("gemma4-e4b", weights = U4, kv = BF),
     deployment("gemma4-e4b", weights = BF, kv = BF, drafter = "eagle"),
     deployment("gemma4-e4b", weights = BF, kv = BF),
     deployment("gemma4-31b", weights = BF, kv = BF),

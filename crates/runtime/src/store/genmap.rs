@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::marker::PhantomData;
 
 pub struct GenKey<M> {
@@ -50,7 +48,6 @@ struct Slot<T> {
 pub struct GenMap<M, T> {
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
-    len: usize,
     _marker: PhantomData<M>,
 }
 
@@ -65,13 +62,11 @@ impl<M, T> GenMap<M, T> {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
-            len: 0,
             _marker: PhantomData,
         }
     }
 
     pub fn insert(&mut self, value: T) -> GenKey<M> {
-        self.len += 1;
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             debug_assert!(slot.value.is_none());
@@ -115,16 +110,7 @@ impl<M, T> GenMap<M, T> {
         let value = slot.value.take();
         slot.generation = slot.generation.wrapping_add(1);
         self.free.push(key.index);
-        self.len -= 1;
         value
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (GenKey<M>, &T)> {
@@ -133,9 +119,5 @@ impl<M, T> GenMap<M, T> {
                 .as_ref()
                 .map(|value| (GenKey::new(index as u32, slot.generation), value))
         })
-    }
-
-    pub fn keys(&self) -> impl Iterator<Item = GenKey<M>> + '_ {
-        self.iter().map(|(key, _)| key)
     }
 }

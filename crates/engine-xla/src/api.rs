@@ -164,6 +164,13 @@ fn refusal(refusal: crate::program::Refusal) -> Error {
     }
 }
 
+fn port_error(error: engine::ports::PortError) -> Error {
+    fault(Fault::Program {
+        at: "program::ports",
+        why: error.0,
+    })
+}
+
 pub(crate) fn fault(fault: Fault) -> Error {
     match fault {
         Fault::Deviceless | Fault::Device { .. } | Fault::NoDevice { .. } => {
@@ -421,6 +428,7 @@ impl Engine for Xla {
                 kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
                 kv_page_size: paging.page_size,
                 state_slots: if state_rows { paging.slots } else { 0 },
+                buffer_pages: shell.buffer_pages(),
                 state_slot_bytes: shell.state_slot_bytes(),
                 adapter_banks: u32::try_from(shell.banks().len()).unwrap_or(u32::MAX),
                 elastic_page_bytes: 0,
@@ -437,11 +445,15 @@ impl Engine for Xla {
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
                 prefill_rows: 0,
+                max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
+                    &budgets,
+                )))
+                .unwrap_or(u32::MAX),
             },
             profile,
             ports: PortMask::DEVICE_GEOMETRY
                 .with(eta_ir::registry::Port::AttnMask)
-                .with(eta_ir::registry::Port::RsFoldLen),
+                .with(eta_ir::registry::Port::Fold),
             geometry: GeometryClass::DeviceGeometry,
             kv_copy: KvCopyDomains {
                 device_to_device: true,
@@ -454,6 +466,7 @@ impl Engine for Xla {
             device_channel_commit: true,
             rs_verbs: shell.serves_rs_verbs(),
             bidirectional_attention: true,
+            adapter_attachments: false,
             facts: shell.trace().facts.clone(),
         };
         self.shell = Some(shell);
@@ -475,11 +488,11 @@ impl Engine for Xla {
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        frame.validate_for(engine::fire::Serves {
-            device_channel_commit: true,
-            rs_verbs: self.caps.as_ref().is_some_and(|caps| caps.rs_verbs),
-            bidirectional: true,
-        })?;
+        frame.validate_for(
+            self.caps
+                .as_ref()
+                .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
+        )?;
         let id = self.next_frame;
         self.next_frame = self.next_frame.wrapping_add(1);
         self.pending = None;
@@ -654,6 +667,7 @@ impl Engine for Xla {
     }
 
     fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
+        copy.device_only("xla")?;
         for (at, move_) in copy.moves.iter().enumerate() {
             if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
                 return Err(Error::Invalid(format!(
@@ -667,7 +681,12 @@ impl Engine for Xla {
                 .copy_state(move_.src_slot_id, move_.dst_slot_id)
                 .map_err(fault)?;
         }
-        Ok(())
+        let pages: Vec<(u32, u32)> = copy
+            .pages
+            .iter()
+            .map(|m| (m.src_slot_id, m.dst_slot_id))
+            .collect();
+        shell.copy_pages(&pages).map_err(fault)
     }
 }
 
@@ -725,6 +744,7 @@ struct DeviceLane {
     /// The rows the cache holds before this fire, when the ports state it.
     have: Option<u32>,
     writes: Option<(Vec<u32>, Vec<u32>)>,
+    first: Option<u32>,
     mask: Option<engine::fire::Masking>,
     /// The lane's windowed ids for `pages`, when the runtime handed any.
     window: Option<Vec<u32>>,
@@ -732,9 +752,9 @@ struct DeviceLane {
 
 impl Xla {
     /// Resolves every lane an instance bound in `DeviceGeometry` describes
-    /// on its descriptor ports: its tokens, positions, KV extent, page
-    /// table (translated from the working set's relative indexes to pool
-    /// ids), write descriptor and attention mask.
+    /// on its descriptor ports: its tokens, positions, KV extent, the slots
+    /// its rows land in (whose page table and write descriptor come from
+    /// the working set's table, in pool ids) and attention mask.
     fn device_lanes(
         &self,
         submission: &engine::fire::Step,
@@ -742,6 +762,11 @@ impl Xla {
         let lanes = &submission.lanes;
         let mut out: Vec<Option<DeviceLane>> = (0..lanes.len()).map(|_| None).collect();
         let program = |why: String| Error::Program(why);
+        let page_tokens = self
+            .shell
+            .as_ref()
+            .map_or(1, |shell| shell.paging().page_size)
+            .max(1);
         for attached in &submission.attachments {
             if self.programs.geometry_of(attached.instance) != Some(GeometryClass::DeviceGeometry) {
                 continue;
@@ -772,7 +797,7 @@ impl Xla {
                     )));
                 }
                 let lane = &lanes[source];
-                let ports = envelope.lane(at, source).map_err(fault)?;
+                let ports = envelope.lane(at, source).map_err(port_error)?;
                 let table = &lane.kv.translation;
                 let translate = |page: u32, port: &str| -> EngineResult<u32> {
                     table.get(page as usize).copied().ok_or_else(|| {
@@ -785,74 +810,69 @@ impl Xla {
                         ))
                     })
                 };
-                let relative = ports.pages().map_err(fault)?;
-                let pages = relative
-                    .map(|relative| {
-                        relative
-                            .iter()
-                            .map(|&page| translate(page, "pages"))
-                            .collect::<EngineResult<Vec<u32>>>()
-                    })
-                    .transpose()?;
-                // The windowed ids are aligned with the translation: the
-                // same relative index picks a page's windowed id.
-                let window = (!lane.kv.window.is_empty())
-                    .then_some(relative)
-                    .flatten()
-                    .map(|relative| {
-                        relative
-                            .iter()
-                            .map(|&page| lane.kv.window.get(page as usize).copied().unwrap_or(0))
-                            .collect::<Vec<u32>>()
-                    });
-                let rows = if ports.owns_pages() {
+                let rows = if ports.owns_slots() {
                     ports.rows() as usize
                 } else {
                     lane.tokens.len()
                 };
-                let writes = ports
-                    .writes(rows)
-                    .map_err(fault)?
-                    .map(|(slots, offsets)| {
-                        Ok::<_, Error>((
+                let slots = ports.slots(rows).map_err(port_error)?;
+                let first = slots.and_then(|slots| slots.first().copied());
+                let (pages, window, writes) = match (slots, ports.reach(rows).map_err(port_error)?)
+                {
+                    (Some(slots), Some(reach)) => {
+                        let relative: Vec<u32> = (0..reach.div_ceil(page_tokens)).collect();
+                        let pages = relative
+                            .iter()
+                            .map(|&page| translate(page, "slots"))
+                            .collect::<EngineResult<Vec<u32>>>()?;
+                        // The windowed ids are aligned with the translation:
+                        // the same relative index picks a page's windowed id.
+                        let window = (!lane.kv.window.is_empty()).then(|| {
+                            relative
+                                .iter()
+                                .map(|&page| {
+                                    lane.kv.window.get(page as usize).copied().unwrap_or(0)
+                                })
+                                .collect::<Vec<u32>>()
+                        });
+                        let writes = (
                             slots
                                 .iter()
-                                .map(|&page| translate(page, "w_slot"))
+                                .map(|&slot| translate(slot / page_tokens, "slots"))
                                 .collect::<EngineResult<Vec<u32>>>()?,
-                            offsets.to_vec(),
-                        ))
-                    })
-                    .transpose()?;
-                let mask = match ports.mask(rows).map_err(fault)? {
+                            slots.iter().map(|&slot| slot % page_tokens).collect(),
+                        );
+                        (Some(pages), window, Some(writes))
+                    }
+                    _ => (None, None, None),
+                };
+                let mask = match ports.mask(rows).map_err(port_error)? {
                     Some(_) if rows != 1 => {
                         return Err(program(format!(
                             "lane {source} resolves its attention mask from a channel and \
                              carries {rows} query rows; the expansion intersects each row \
-                             with the order the cache is written in, and a lane whose write \
-                             descriptor is the guest's has no such order this shell can \
-                             derive"
+                             with the order the cache is written in, and a lane that states \
+                             its own slots has no such order this shell can derive"
                         )));
                     }
-                    Some((cells, stride)) => Some(crate::ports::from_dense(cells, stride)),
+                    Some((cells, stride)) => Some(engine::ports::from_dense(cells, stride)),
                     None => None,
                 };
                 let have = match () {
                     () if lane.kv_less => Some(0),
-                    () if ports.owns_pages() => {
-                        let after = ports.extent().ok_or_else(|| {
+                    () if ports.owns_slots() => {
+                        let after = ports.reach(rows).map_err(port_error)?.ok_or_else(|| {
                             program(format!(
-                                "lane {source} states its own page table and binds no \
-                                 `kv_len` port; the page count, the last page's fill and the \
-                                 attention schedules are all carved from the extent, and no \
-                                 seat in this shell knows it"
+                                "lane {source} states where its rows land and reaches no \
+                                 slot; the page count, the last page's fill and the \
+                                 attention schedules are all carved from what it reads"
                             ))
                         })?;
                         if (after as usize) < rows {
                             return Err(program(format!(
-                                "lane {source} states a readable KV extent of {after} on its \
-                                 `kv_len` port and this fire writes {rows} row(s) into it; \
-                                 the extent is AFTER the append, so it can never be shorter \
-                                 than what the append adds"
+                                "lane {source} reads a KV extent of {after} and this fire \
+                                 writes {rows} row(s) into it; the extent is AFTER the \
+                                 append, so it can never be shorter than what the append adds"
                             )));
                         }
                         Some(after - rows as u32)
@@ -862,13 +882,13 @@ impl Xla {
                 if let Some(have) = have {
                     ports
                         .check_extent(have.saturating_add(rows as u32))
-                        .map_err(fault)?;
+                        .map_err(port_error)?;
                 }
-                let tokens = ports.tokens_for(rows).map_err(fault)?.to_vec();
+                let tokens = ports.tokens_for(rows).map_err(port_error)?.to_vec();
                 let positions = match have {
                     Some(have) => ports
                         .positions_for(have, rows)
-                        .map_err(fault)?
+                        .map_err(port_error)?
                         .map(<[u32]>::to_vec),
                     None => None,
                 };
@@ -878,6 +898,7 @@ impl Xla {
                     pages,
                     have,
                     writes,
+                    first,
                     mask,
                     window,
                 });
@@ -1135,20 +1156,14 @@ impl Xla {
             .map(|lane| lane.rs.clone())
             .collect();
         for attachment in &submission.attachments {
-            let verb = &mut verbs[attachment.lane as usize];
-            let len = match verb {
-                engine::fire::RsVerb::Buffer { fold, .. }
-                | engine::fire::RsVerb::Window { fold, .. } => fold,
-                engine::fire::RsVerb::FoldBuffered { len, .. } => len,
-                engine::fire::RsVerb::Fold => continue,
-            };
-            if matches!(len, engine::fire::FoldLen::Device(_))
+            if let engine::fire::RsVerb::Buffer { fold, .. } = &mut verbs[attachment.lane as usize]
+                && *fold == engine::fire::FoldLen::Device
                 && let Some(n) = self
                     .programs
-                    .envelope_fold_len(attachment.instance)
+                    .envelope_fold(attachment.instance)
                     .map_err(refusal)?
             {
-                *len = engine::fire::FoldLen::Host(n);
+                *fold = engine::fire::FoldLen::Host(n);
             }
         }
 
@@ -1237,6 +1252,7 @@ impl Xla {
                     .as_ref()
                     .and_then(|resolved| resolved.writes.as_ref())
                     .map(|(pages, offsets)| (pages.as_slice(), offsets.as_slice())),
+                first: device[at].as_ref().and_then(|resolved| resolved.first),
                 attn_classes: lane.attn_classes.as_ref(),
                 window: match &device[at] {
                     Some(DeviceLane {

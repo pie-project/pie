@@ -9,8 +9,7 @@ No canonical paper. Reference implementations:
 [KoboldAI](https://github.com/KoboldAI/KoboldAI-Client) and
 oobabooga/text-generation-webui.
 
-**Faithfulness: Exact.** See
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+**Faithfulness: Exact.**
 
 ## What it does
 

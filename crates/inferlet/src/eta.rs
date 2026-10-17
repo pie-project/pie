@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ops::{Bound, RangeBounds};
 use std::rc::Rc;
 
 use eta_dsl::builder::Builder;
@@ -9,14 +8,12 @@ use eta_dsl::value::ConstData;
 use eta_dsl::{Channel as DslChannel, IntoConst, IntoPut, IntoShape, Port, Shape, Stage, Tensor};
 
 use crate::pie::inferlet::channel as wit_channel;
-use crate::pie::inferlet::forward as wit_attention;
+use crate::pie::inferlet::forward as wit_forward;
 use crate::pie::inferlet::forward_diffusion as wit_diffusion;
-use crate::pie::inferlet::forward_hybrid as wit_hybrid;
-use crate::pie::inferlet::forward_recurrent as wit_recurrent;
 pub use crate::pie::inferlet::model::LaneStream;
 use crate::pie::inferlet::pipeline as wit_pipeline;
 use crate::pie::inferlet::types::Dtype as WitDtype;
-use crate::working_set::{KvWorkingSet, PageRange, PageSpan};
+use crate::pie::inferlet::working_set as wit_ws;
 
 pub use eta_dsl::intrinsics;
 
@@ -371,71 +368,42 @@ from_channel!(u32);
 from_channel!(f32);
 from_channel!(bool);
 
+/// One sequence's model state. Slots below [`WorkingSet::folded`] are frozen;
+/// the rest is a buffer a pass may write again.
 pub struct WorkingSet {
-    kv: Rc<KvWorkingSet>,
+    ws: Rc<wit_ws::WorkingSet>,
 }
 
 impl WorkingSet {
     pub fn new() -> WorkingSet {
         WorkingSet {
-            kv: Rc::new(KvWorkingSet::new()),
+            ws: Rc::new(wit_ws::WorkingSet::new()),
         }
     }
 
-    pub fn page_len(&self) -> u32 {
-        self.kv.page_len()
+    /// Lets passes write slots below `end`: needed only by a pass whose slots
+    /// are computed on the device.
+    pub fn reserve(&self, end: u32) -> Result<(), String> {
+        self.ws.reserve(end)
     }
 
-    pub fn reserve(&self, pages: u32) -> Result<PageGrant, String> {
-        let range = self.kv.reserve(pages)?;
-        Ok(PageGrant {
-            start: range.start,
-            ids: (range.start..range.start + range.len).collect(),
-        })
+    /// The frozen length; while a device-counted fold is in flight, the length
+    /// before it.
+    pub fn folded(&self) -> u32 {
+        self.ws.folded()
     }
 
-    pub fn update_index(&self, key: &[u8]) -> Result<(), String> {
-        self.kv.update_index(key)
+    /// Slots mapped in from state the runtime already held: a prompt's cached
+    /// tokens.
+    pub fn cached_tokens(&self) -> u32 {
+        self.ws.cached_tokens()
     }
 
-    pub fn from_index(key: &[u8]) -> Result<Option<WorkingSet>, String> {
-        Ok(KvWorkingSet::from_index(key)?.map(|kv| WorkingSet { kv: Rc::new(kv) }))
-    }
-
-    pub fn remove_index(key: &[u8]) -> Result<bool, String> {
-        KvWorkingSet::remove_index(key)
-    }
-
-    pub fn discard(&self, on: &Pipeline, ranges: &[PageRange]) -> Result<(), String> {
-        self.kv.discard(&on.wit, ranges)
-    }
-
+    /// A child sharing the frozen part, with a copy of the buffer.
     pub fn fork(&self, on: &Pipeline) -> Result<WorkingSet, String> {
         Ok(WorkingSet {
-            kv: Rc::new(self.kv.fork(&on.wit)?),
+            ws: Rc::new(self.ws.fork(&on.wit)?),
         })
-    }
-
-    pub fn slice(&self, on: &Pipeline, start: u32, len: u32) -> Result<WorkingSet, String> {
-        let child = self.kv.slice(&on.wit, PageRange { start, len })?;
-        Ok(WorkingSet { kv: Rc::new(child) })
-    }
-
-    pub fn copy_into(
-        &self,
-        on: &Pipeline,
-        dst_page_ids: &[u32],
-        dst_tok_idx: &[u32],
-        src_page_ids: &[u32],
-        src_tok_idx: &[u32],
-    ) -> Result<(), String> {
-        self.kv.copy_into(
-            &on.wit,
-            dst_page_ids,
-            dst_tok_idx,
-            src_page_ids,
-            src_tok_idx,
-        )
     }
 }
 
@@ -445,98 +413,42 @@ impl Default for WorkingSet {
     }
 }
 
-pub struct PageGrant {
-    start: u32,
-    ids: Vec<u32>,
+/// How many more slots each lane freezes after a fire writes.
+#[derive(Clone, Copy, Default)]
+pub enum Fold<'a> {
+    /// None: everything stays in the buffer.
+    #[default]
+    None,
+    /// Everything the lane has written.
+    All,
+    /// Per lane (or one for all), possibly computed on the device; lanes
+    /// sharing a working set fold by the first one's.
+    Count(&'a Channel),
 }
 
-impl PageGrant {
-    pub fn ids(&self) -> &[u32] {
-        &self.ids
-    }
+/// Where a pass's rows land and what they read. Left out, rows append, are
+/// roped at their slot and read every slot up to their own.
+#[derive(Clone, Copy, Default)]
+pub struct StateGeometry<'a> {
+    /// Per row, the RoPE position.
+    pub positions: Option<&'a Channel>,
+    /// Per row, the slot it writes; a lane's rows write consecutive slots.
+    pub slots: Option<&'a Channel>,
+    /// Per lane, how many slots the lane reads.
+    pub kv_len: Option<&'a Channel>,
+    /// Per row, the slots it may read; a recurrent layer needs the same mask
+    /// over buffered slots for every row of a lane.
+    pub mask: Option<&'a Channel>,
+    pub fold: Fold<'a>,
+}
 
-    pub fn range(&self) -> PageRange {
-        PageRange {
-            start: self.start,
-            len: self.ids.len() as u32,
+impl StateGeometry<'_> {
+    /// Append and freeze everything written.
+    pub fn folding() -> StateGeometry<'static> {
+        StateGeometry {
+            fold: Fold::All,
+            ..StateGeometry::default()
         }
-    }
-}
-
-impl IntoPut for PageGrant {
-    fn into_put(self) -> PutValue {
-        PutValue::Data(self.ids.into_const())
-    }
-}
-
-pub struct RsWorkingSet {
-    rs: Rc<crate::working_set::RsWorkingSet>,
-}
-
-impl RsWorkingSet {
-    pub fn new() -> RsWorkingSet {
-        RsWorkingSet {
-            rs: Rc::new(crate::working_set::RsWorkingSet::new()),
-        }
-    }
-
-    pub fn state_size(&self) -> u64 {
-        thread_local! {
-            static SIZE: std::cell::OnceCell<u64> = const { std::cell::OnceCell::new() };
-        }
-        SIZE.with(|c| *c.get_or_init(crate::model::rs_state_size))
-    }
-
-    pub fn buffer_size(&self) -> u32 {
-        self.rs.buffer_size()
-    }
-
-    pub fn buffer_page_size(&self) -> u32 {
-        thread_local! {
-            static SIZE: std::cell::OnceCell<u32> = const { std::cell::OnceCell::new() };
-        }
-        SIZE.with(|c| *c.get_or_init(crate::model::rs_buffer_page_size))
-    }
-
-    pub fn alloc_buffer(&self, n: u32) -> Result<crate::working_set::PageRange, String> {
-        self.rs.alloc_buffer(n)
-    }
-
-    pub fn free_buffer(&self, indices: &[u32]) -> Result<(), String> {
-        self.rs.free_buffer(indices)
-    }
-
-    pub fn discard_buffered(&self, count: u32) -> Result<(), String> {
-        self.rs.discard_buffered(count)
-    }
-
-    pub fn reorder_buffer(&self, perm: &[u32]) -> Result<(), String> {
-        self.rs.reorder_buffer(perm)
-    }
-
-    pub fn fork(&self, on: &Pipeline) -> Result<RsWorkingSet, String> {
-        Ok(RsWorkingSet {
-            rs: Rc::new(self.rs.fork(&on.wit)?),
-        })
-    }
-
-    pub fn update_index(&self, key: &[u8]) -> Result<(), String> {
-        self.rs.update_index(key)
-    }
-
-    pub fn from_index(key: &[u8]) -> Result<Option<RsWorkingSet>, String> {
-        Ok(crate::working_set::RsWorkingSet::from_index(key)?
-            .map(|rs| RsWorkingSet { rs: Rc::new(rs) }))
-    }
-
-    pub fn remove_index(key: &[u8]) -> Result<bool, String> {
-        crate::working_set::RsWorkingSet::remove_index(key)
-    }
-}
-
-impl Default for RsWorkingSet {
-    fn default() -> Self {
-        RsWorkingSet::new()
     }
 }
 
@@ -544,218 +456,97 @@ type StageClosure = Box<dyn Fn()>;
 
 pub trait PassWit: Sized + 'static {
     fn new() -> Self;
-
+    fn state(
+        &self,
+        lanes: &[&wit_ws::WorkingSet],
+        geom: &wit_forward::StateGeometry<'_>,
+    ) -> Result<(), String>;
     fn embed(
         &self,
         tokens: &wit_channel::Channel,
         indptr: &wit_channel::Channel,
     ) -> Result<(), String>;
-
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String>;
-
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String>;
-
-    fn set_drafting_block(&self, on: bool) -> Result<(), String>;
-
+    fn media(&self, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String>;
+    fn reading(&self, name: &str) -> Result<(), String>;
+    fn input(&self, port: &str, ch: &wit_channel::Channel) -> Result<(), String>;
+    fn stream(&self, s: LaneStream) -> Result<(), String>;
+    fn group(&self, id: u32) -> Result<(), String>;
+    fn peer(&self, group: u32) -> Result<(), String>;
+    fn attention_classes(&self, classes: &[i32], table: &[u8], count: u32) -> Result<(), String>;
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String>;
-
     fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String>;
-
-    fn reading(&self, name: &str) -> Result<(), String> {
-        Err(format!(
-            "this pass interface carries no readings; `reading(\"{name}\")` is a `forward` / \
-             `forward-diffusion` verb"
-        ))
-    }
-    fn input(&self, port: &str, _ch: &wit_channel::Channel) -> Result<(), String> {
-        Err(format!(
-            "this pass interface carries no float ports; `input(\"{port}\")` is a `forward` / \
-             `forward-diffusion` verb"
-        ))
-    }
-    fn stream(&self, _s: LaneStream) -> Result<(), String> {
-        Err(
-            "this pass interface carries no streams; `stream` is a `forward` / \
-             `forward-diffusion` verb"
-                .to_string(),
-        )
-    }
-    fn group(&self, _id: u32) -> Result<(), String> {
-        Err(
-            "this pass interface carries no groups; `group` is a `forward` / \
-             `forward-diffusion` verb"
-                .to_string(),
-        )
-    }
-    fn peer(&self, _ordinal: u32) -> Result<(), String> {
-        Err("this pass interface carries no peers; `peer` is a \
-             `forward-diffusion` verb, and a peer is a velocity to guide with"
-            .to_string())
-    }
-    fn attention_classes(
-        &self,
-        _classes: &[i32],
-        _table: &[u8],
-        _count: u32,
-    ) -> Result<(), String> {
-        Err(
-            "this pass interface carries no attention classes; `attention-classes` is a \
-             `forward` / `forward-diffusion` verb over group-packed attention"
-                .to_string(),
-        )
-    }
 }
 
-impl PassWit for wit_attention::ForwardPass {
-    fn new() -> Self {
-        wit_attention::ForwardPass::new()
-    }
-    fn embed(
-        &self,
-        tokens: &wit_channel::Channel,
-        indptr: &wit_channel::Channel,
-    ) -> Result<(), String> {
-        wit_attention::ForwardPass::embed(self, tokens, indptr)
-    }
-    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
-        wit_attention::ForwardPass::readout(self, indices)
-    }
-    fn set_drafting_block(&self, on: bool) -> Result<(), String> {
-        wit_attention::ForwardPass::set_drafting_block(self, on).map_err(|e| e.to_string())
-    }
-
-    fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
-        wit_attention::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
-    }
-    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
-        wit_attention::ForwardPass::program(self, bytes, channels)
-    }
-    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
-        wit_attention::submit(on, slots)
-    }
-    fn reading(&self, name: &str) -> Result<(), String> {
-        wit_attention::ForwardPass::reading(self, name)
-    }
-    fn input(&self, port: &str, ch: &wit_channel::Channel) -> Result<(), String> {
-        wit_attention::ForwardPass::input(self, port, ch)
-    }
-    fn stream(&self, s: LaneStream) -> Result<(), String> {
-        wit_attention::ForwardPass::stream(self, s)
-    }
-    fn group(&self, id: u32) -> Result<(), String> {
-        wit_attention::ForwardPass::group(self, id)
-    }
-    fn peer(&self, ordinal: u32) -> Result<(), String> {
-        wit_attention::ForwardPass::peer(self, ordinal)
-    }
-    fn attention_classes(&self, classes: &[i32], table: &[u8], count: u32) -> Result<(), String> {
-        wit_attention::ForwardPass::attention_classes(self, classes, table, count)
-    }
+macro_rules! pass_wit {
+    ($wit:ident) => {
+        impl PassWit for $wit::ForwardPass {
+            fn new() -> Self {
+                $wit::ForwardPass::new()
+            }
+            fn state(
+                &self,
+                lanes: &[&wit_ws::WorkingSet],
+                geom: &wit_forward::StateGeometry<'_>,
+            ) -> Result<(), String> {
+                $wit::ForwardPass::state(self, lanes, geom)
+            }
+            fn embed(
+                &self,
+                tokens: &wit_channel::Channel,
+                indptr: &wit_channel::Channel,
+            ) -> Result<(), String> {
+                $wit::ForwardPass::embed(self, tokens, indptr)
+            }
+            fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
+                $wit::ForwardPass::readout(self, indices)
+            }
+            fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
+                $wit::ForwardPass::set_max_layers(self, max_layers)
+            }
+            fn media(&self, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String> {
+                $wit::ForwardPass::media(self, spans)
+            }
+            fn reading(&self, name: &str) -> Result<(), String> {
+                $wit::ForwardPass::reading(self, name)
+            }
+            fn input(&self, port: &str, ch: &wit_channel::Channel) -> Result<(), String> {
+                $wit::ForwardPass::input(self, port, ch)
+            }
+            fn stream(&self, s: LaneStream) -> Result<(), String> {
+                $wit::ForwardPass::stream(self, s)
+            }
+            fn group(&self, id: u32) -> Result<(), String> {
+                $wit::ForwardPass::group(self, id)
+            }
+            fn peer(&self, group: u32) -> Result<(), String> {
+                $wit::ForwardPass::peer(self, group)
+            }
+            fn attention_classes(
+                &self,
+                classes: &[i32],
+                table: &[u8],
+                count: u32,
+            ) -> Result<(), String> {
+                $wit::ForwardPass::attention_classes(self, classes, table, count)
+            }
+            fn program(
+                &self,
+                bytes: &[u8],
+                channels: &[&wit_channel::Channel],
+            ) -> Result<(), String> {
+                $wit::ForwardPass::program(self, bytes, channels)
+            }
+            fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
+                $wit::submit(on, slots)
+            }
+        }
+    };
 }
 
-impl PassWit for wit_diffusion::ForwardPass {
-    fn new() -> Self {
-        wit_diffusion::ForwardPass::new()
-    }
-    fn embed(
-        &self,
-        tokens: &wit_channel::Channel,
-        indptr: &wit_channel::Channel,
-    ) -> Result<(), String> {
-        wit_diffusion::ForwardPass::embed(self, tokens, indptr)
-    }
-    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
-        wit_diffusion::ForwardPass::readout(self, indices)
-    }
-    fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
-        wit_diffusion::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
-    }
-    fn set_drafting_block(&self, on: bool) -> Result<(), String> {
-        wit_diffusion::ForwardPass::set_drafting_block(self, on).map_err(|e| e.to_string())
-    }
-    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
-        wit_diffusion::ForwardPass::program(self, bytes, channels)
-    }
-    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
-        wit_diffusion::submit(on, slots)
-    }
-    fn reading(&self, name: &str) -> Result<(), String> {
-        wit_diffusion::ForwardPass::reading(self, name)
-    }
-    fn input(&self, port: &str, ch: &wit_channel::Channel) -> Result<(), String> {
-        wit_diffusion::ForwardPass::input(self, port, ch)
-    }
-    fn stream(&self, s: LaneStream) -> Result<(), String> {
-        wit_diffusion::ForwardPass::stream(self, s)
-    }
-    fn group(&self, id: u32) -> Result<(), String> {
-        wit_diffusion::ForwardPass::group(self, id)
-    }
-    fn peer(&self, ordinal: u32) -> Result<(), String> {
-        wit_diffusion::ForwardPass::peer(self, ordinal)
-    }
-    fn attention_classes(&self, classes: &[i32], table: &[u8], count: u32) -> Result<(), String> {
-        wit_diffusion::ForwardPass::attention_classes(self, classes, table, count)
-    }
-}
-
-impl PassWit for wit_recurrent::ForwardPass {
-    fn new() -> Self {
-        wit_recurrent::ForwardPass::new()
-    }
-    fn embed(
-        &self,
-        tokens: &wit_channel::Channel,
-        indptr: &wit_channel::Channel,
-    ) -> Result<(), String> {
-        wit_recurrent::ForwardPass::embed(self, tokens, indptr)
-    }
-    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
-        wit_recurrent::ForwardPass::readout(self, indices)
-    }
-    fn set_drafting_block(&self, on: bool) -> Result<(), String> {
-        wit_recurrent::ForwardPass::set_drafting_block(self, on).map_err(|e| e.to_string())
-    }
-
-    fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
-        wit_recurrent::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
-    }
-    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
-        wit_recurrent::ForwardPass::program(self, bytes, channels)
-    }
-    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
-        wit_recurrent::submit(on, slots)
-    }
-}
-
-impl PassWit for wit_hybrid::ForwardPass {
-    fn new() -> Self {
-        wit_hybrid::ForwardPass::new()
-    }
-    fn embed(
-        &self,
-        tokens: &wit_channel::Channel,
-        indptr: &wit_channel::Channel,
-    ) -> Result<(), String> {
-        wit_hybrid::ForwardPass::embed(self, tokens, indptr)
-    }
-    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
-        wit_hybrid::ForwardPass::readout(self, indices)
-    }
-    fn set_drafting_block(&self, on: bool) -> Result<(), String> {
-        wit_hybrid::ForwardPass::set_drafting_block(self, on).map_err(|e| e.to_string())
-    }
-
-    fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
-        wit_hybrid::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
-    }
-    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
-        wit_hybrid::ForwardPass::program(self, bytes, channels)
-    }
-    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
-        wit_hybrid::submit(on, slots)
-    }
-}
+pass_wit!(wit_forward);
+pass_wit!(wit_diffusion);
 
 pub mod adapter {
     use super::Channel;
@@ -836,112 +627,13 @@ struct ForwardInner {
     stages: Vec<(Stage, StageClosure)>,
     vocab: u32,
     page_size: u32,
-    attention_ws: Option<Rc<KvWorkingSet>>,
-    rs_working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
+    lanes: Vec<Rc<wit_ws::WorkingSet>>,
+    fold_all: Option<Channel>,
     program_attached: bool,
     adapter_lowrank_sites: u32,
     adapter_scale_sites: u32,
     port_inputs: Vec<(String, DslChannel)>,
     latent_rows: Option<u32>,
-}
-
-struct StagedKv {
-    ws: Rc<KvWorkingSet>,
-    readable: PageDeclaration,
-    writable: PageDeclaration,
-    kv_len: Rc<wit_channel::Channel>,
-    pages: Rc<wit_channel::Channel>,
-    page_indptr: Rc<wit_channel::Channel>,
-    w_slot: Rc<wit_channel::Channel>,
-    w_off: Rc<wit_channel::Channel>,
-    positions: Rc<wit_channel::Channel>,
-    mask: Option<Rc<wit_channel::Channel>>,
-}
-
-pub struct KvGeometry<'a, R, W> {
-    pub readable_pages: R,
-    pub writable_pages: W,
-    pub kv_len: &'a Channel,
-    pub pages: &'a Channel,
-    pub page_indptr: &'a Channel,
-    pub w_slot: &'a Channel,
-    pub w_off: &'a Channel,
-    pub positions: &'a Channel,
-    pub mask: Option<&'a Channel>,
-}
-
-pub struct RsGeometry<'a, B> {
-    pub fold_len: Option<&'a Channel>,
-    pub buffer: B,
-}
-
-pub struct KvBinding<'a, R, W> {
-    pub working_set: &'a WorkingSet,
-    pub geometry: KvGeometry<'a, R, W>,
-}
-
-thread_local! {
-    static FOLD_ALL: Channel = Channel::from(vec![u32::MAX]);
-}
-
-struct StagedRs {
-    working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
-    fold_len: Rc<wit_channel::Channel>,
-    buffer: PageDeclaration,
-}
-
-#[derive(Clone, Copy)]
-struct PageDeclaration {
-    start: u32,
-    end: Option<u32>,
-}
-
-impl PageDeclaration {
-    fn from_range(range: impl RangeBounds<u32>) -> Result<Self, String> {
-        let start = match range.start_bound() {
-            Bound::Unbounded => 0,
-            Bound::Included(&start) => start,
-            Bound::Excluded(&start) => start
-                .checked_add(1)
-                .ok_or_else(|| "attention page-span start overflows u32".to_string())?,
-        };
-        let end = match range.end_bound() {
-            Bound::Unbounded => None,
-            Bound::Excluded(&end) => Some(end),
-            Bound::Included(&end) => Some(
-                end.checked_add(1)
-                    .ok_or_else(|| "attention page-span end overflows u32".to_string())?,
-            ),
-        };
-        if end.is_some_and(|end| start > end) {
-            return Err(format!(
-                "attention page-span start {start} exceeds end {}",
-                end.unwrap()
-            ));
-        }
-        Ok(Self { start, end })
-    }
-
-    fn wit(self) -> PageSpan {
-        PageSpan {
-            start: self.start,
-            end: self.end,
-        }
-    }
-}
-
-#[cfg(test)]
-mod page_declaration_tests {
-    use super::*;
-
-    #[test]
-    fn normalizes_inclusive_and_exclusive_bounds() {
-        let closed = PageDeclaration::from_range(2..5).unwrap();
-        assert_eq!((closed.start, closed.end), (2, Some(5)));
-
-        let inclusive = PageDeclaration::from_range(2..=5).unwrap();
-        assert_eq!((inclusive.start, inclusive.end), (2, Some(6)));
-    }
 }
 
 impl<W: PassWit> Pass<W> {
@@ -963,8 +655,8 @@ impl<W: PassWit> Pass<W> {
                 stages: Vec::new(),
                 vocab,
                 page_size,
-                attention_ws: None,
-                rs_working_sets: Vec::new(),
+                lanes: Vec::new(),
+                fold_all: None,
                 program_attached: false,
                 adapter_lowrank_sites: 0,
                 adapter_scale_sites: 0,
@@ -1074,103 +766,62 @@ impl<W: PassWit> Pass<W> {
         Ok(())
     }
 
-    fn stage_kv<R, Wr>(
-        &self,
-        ws: &WorkingSet,
-        geom: KvGeometry<'_, R, Wr>,
-    ) -> Result<StagedKv, String>
-    where
-        R: RangeBounds<u32>,
-        Wr: RangeBounds<u32>,
-    {
-        let KvGeometry {
-            readable_pages,
-            writable_pages,
-            kv_len,
-            pages,
-            page_indptr,
-            w_slot,
-            w_off,
-            positions,
-            mask,
-        } = geom;
+    /// Binds one working set per lane and where rows land; after attach it may
+    /// bind other working sets (a beam's forks).
+    pub fn state(&self, lanes: &[&WorkingSet], geom: StateGeometry<'_>) -> Result<(), String> {
         let rebind = self.inner.borrow().program_attached;
+        let fold = match geom.fold {
+            Fold::None => None,
+            Fold::Count(channel) => Some(*channel),
+            Fold::All => Some(
+                *self
+                    .inner
+                    .borrow_mut()
+                    .fold_all
+                    .get_or_insert_with(|| Channel::from(vec![u32::MAX])),
+            ),
+        };
+        let stated = [
+            (Port::Positions, geom.positions.copied()),
+            (Port::Slots, geom.slots.copied()),
+            (Port::KvLen, geom.kv_len.copied()),
+            (Port::AttnMask, geom.mask.copied()),
+            (Port::Fold, fold),
+        ];
         if !rebind {
-            let mut ports = vec![
-                Port::KvLen,
-                Port::Pages,
-                Port::PageIndptr,
-                Port::WSlot,
-                Port::WOff,
-                Port::Positions,
-            ];
-            if mask.is_some() {
-                ports.push(Port::AttnMask);
-            }
+            let ports: Vec<Port> = stated
+                .iter()
+                .filter(|(_, channel)| channel.is_some())
+                .map(|(port, _)| *port)
+                .collect();
             self.ensure_ports_available(&ports)?;
         }
-        let staged = StagedKv {
-            ws: ws.kv.clone(),
-            readable: PageDeclaration::from_range(readable_pages)?,
-            writable: PageDeclaration::from_range(writable_pages)?,
-            kv_len: kv_len.wit(),
-            pages: pages.wit(),
-            page_indptr: page_indptr.wit(),
-            w_slot: w_slot.wit(),
-            w_off: w_off.wit(),
-            positions: positions.wit(),
-            mask: mask.map(Channel::wit),
-        };
+        let wits: Vec<Option<Rc<wit_channel::Channel>>> = stated
+            .iter()
+            .map(|(_, channel)| channel.as_ref().map(Channel::wit))
+            .collect();
+        let handles: Vec<Rc<wit_ws::WorkingSet>> = lanes.iter().map(|ws| ws.ws.clone()).collect();
+        let borrows: Vec<&wit_ws::WorkingSet> = handles.iter().map(Rc::as_ref).collect();
+        self.wit.state(
+            &borrows,
+            &wit_forward::StateGeometry {
+                positions: wits[0].as_deref(),
+                slots: wits[1].as_deref(),
+                kv_len: wits[2].as_deref(),
+                mask: wits[3].as_deref(),
+                fold: wits[4].as_deref(),
+            },
+        )?;
         let mut inner = self.inner.borrow_mut();
-        inner.attention_ws = Some(ws.kv.clone());
+        inner.lanes = handles;
         if !rebind {
-            inner.ports.extend([
-                (Port::KvLen, claim_port(Port::KvLen, kv_len)),
-                (Port::Pages, claim_port(Port::Pages, pages)),
-                (Port::PageIndptr, claim_port(Port::PageIndptr, page_indptr)),
-                (Port::WSlot, claim_port(Port::WSlot, w_slot)),
-                (Port::WOff, claim_port(Port::WOff, w_off)),
-                (Port::Positions, claim_port(Port::Positions, positions)),
-            ]);
-            if let Some(mask) = mask {
-                inner
-                    .ports
-                    .push((Port::AttnMask, claim_port(Port::AttnMask, mask)));
+            for (port, channel) in &stated {
+                if let Some(channel) = channel {
+                    inner.ports.push((*port, claim_port(*port, channel)));
+                }
             }
         }
-        Ok(staged)
-    }
-
-    fn stage_rs<B>(
-        &self,
-        working_sets: &[RsWorkingSet],
-        geom: RsGeometry<'_, B>,
-    ) -> Result<StagedRs, String>
-    where
-        B: RangeBounds<u32>,
-    {
-        let buffer = PageDeclaration::from_range(geom.buffer)?;
-        let staged = match geom.fold_len {
-            Some(fold_len) => {
-                if !self.inner.borrow().program_attached {
-                    self.ensure_ports_available(&[Port::RsFoldLen])?;
-                    let mut inner = self.inner.borrow_mut();
-                    inner
-                        .ports
-                        .push((Port::RsFoldLen, claim_port(Port::RsFoldLen, fold_len)));
-                }
-                fold_len.wit()
-            }
-            None => FOLD_ALL.with(Channel::wit),
-        };
-        let working_sets: Vec<Rc<crate::working_set::RsWorkingSet>> =
-            working_sets.iter().map(|rs| rs.rs.clone()).collect();
-        self.inner.borrow_mut().rs_working_sets = working_sets.clone();
-        Ok(StagedRs {
-            working_sets,
-            fold_len: staged,
-            buffer,
-        })
+        Ok(())
     }
 
     pub fn readout(&self, indices: &Channel) -> Result<(), String> {
@@ -1188,8 +839,8 @@ impl<W: PassWit> Pass<W> {
         self.wit.set_max_layers(max_layers)
     }
 
-    pub fn set_drafting_block(&self, on: bool) -> Result<(), String> {
-        self.wit.set_drafting_block(on)
+    pub fn media(&self, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String> {
+        self.wit.media(spans)
     }
 
     pub fn adapter(
@@ -1289,6 +940,12 @@ impl<W: PassWit> Pass<W> {
     }
     pub fn epilogue(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::Epilogue, body);
+    }
+    pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
+        self.set_stage(Stage::OnAttnProj, body);
+    }
+    pub fn on_attn(&self, body: impl Fn() + 'static) {
+        self.set_stage(Stage::OnAttn, body);
     }
 
     fn set_stage(&self, stage: Stage, body: impl Fn() + 'static) {
@@ -1392,23 +1049,16 @@ pub fn kv_page_size() -> u32 {
     PAGE.with(|c| *c.get_or_init(crate::model::kv_page_size))
 }
 
-pub fn max_embed_length() -> usize {
-    thread_local! {
-        static MAX_EMBED: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
-    }
-    MAX_EMBED.with(|c| *c.get_or_init(|| crate::model::max_embed_length().max(1) as usize))
+/// The most rows one pass may read out through `kind`; a pass of any length
+/// runs, the runtime cuts it.
+pub fn max_readout_rows(kind: crate::model::ReadoutKind) -> usize {
+    (crate::model::max_readout_rows(kind) as usize).max(1)
 }
 
-pub fn prefill_chunk_hint() -> usize {
-    (crate::model::prefill_chunk_hint().max(1) as usize).min(max_embed_length())
-}
-
-pub fn prefill_chunks(n: u32, cap: Option<u32>) -> Vec<(u32, u32)> {
-    let cap = cap
-        .unwrap_or_else(|| prefill_chunk_hint() as u32)
-        .min(max_embed_length().max(1) as u32)
-        .max(1);
-    even_spans(n, cap)
+/// Even spans of `n` rows, each at most [`max_readout_rows`] of `kind`.
+pub fn readout_spans(n: u32, kind: crate::model::ReadoutKind) -> Vec<(u32, u32)> {
+    let max = u32::try_from(max_readout_rows(kind)).unwrap_or(u32::MAX);
+    even_spans(n, max)
 }
 
 fn even_spans(n: u32, cap: u32) -> Vec<(u32, u32)> {
@@ -1538,7 +1188,7 @@ impl Pipeline {
     }
 
     pub fn park(&self) {
-        wit_attention::park(&self.wit);
+        wit_forward::park(&self.wit);
     }
 }
 
@@ -1550,9 +1200,8 @@ impl Default for Pipeline {
 
 pub mod shared_prelude {
     pub use super::{
-        Channel, KvBinding, KvGeometry, LaneStream, PageGrant, Pipeline, RsGeometry, RsWorkingSet,
-        TOKEN_PAD, WorkingSet, channel_capacity, frame_size, kv_page_size, max_embed_length,
-        prefill_chunk_hint, prefill_chunks,
+        Channel, Fold, LaneStream, Pipeline, StateGeometry, TOKEN_PAD, WorkingSet,
+        channel_capacity, frame_size, kv_page_size, max_readout_rows, readout_spans,
     };
     pub use crate::{Context, Result, model};
     pub use eta_dsl::Stage;
@@ -1570,128 +1219,20 @@ pub mod shared_prelude {
     pub use std::ops::ControlFlow;
 }
 
-impl Pass<wit_attention::ForwardPass> {
-    pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
-        self.set_stage(Stage::OnAttnProj, body);
-    }
-    pub fn on_attn(&self, body: impl Fn() + 'static) {
-        self.set_stage(Stage::OnAttn, body);
-    }
-
-    pub fn attention<R, W>(&self, ws: &WorkingSet, geom: KvGeometry<'_, R, W>) -> Result<(), String>
-    where
-        R: RangeBounds<u32>,
-        W: RangeBounds<u32>,
-    {
-        let kv = self.stage_kv(ws, geom)?;
-        wit_attention::ForwardPass::attention(
-            &self.wit,
-            kv.ws.as_ref(),
-            &wit_attention::KvGeometry {
-                readable_pages: kv.readable.wit(),
-                writable_pages: kv.writable.wit(),
-                kv_len: kv.kv_len.as_ref(),
-                pages: kv.pages.as_ref(),
-                page_indptr: kv.page_indptr.as_ref(),
-                w_slot: kv.w_slot.as_ref(),
-                w_off: kv.w_off.as_ref(),
-                positions: kv.positions.as_ref(),
-                mask: kv.mask.as_deref(),
-            },
-        )
+impl Pass<wit_forward::ForwardPass> {
+    /// Slots at which the runtime keeps a recurrent state, so a later pass over
+    /// the same tokens resumes there.
+    pub fn checkpoints(&self, slots: &[u32]) -> Result<(), String> {
+        wit_forward::ForwardPass::checkpoints(&self.wit, slots)
     }
 
-    pub fn media(&self, spans: &[wit_attention::MediaSpan<'_>]) -> Result<(), String> {
-        wit_attention::ForwardPass::media(&self.wit, spans)
-    }
-}
-
-impl Pass<wit_hybrid::ForwardPass> {
-    pub fn media(&self, spans: &[wit_attention::MediaSpan<'_>]) -> Result<(), String> {
-        wit_hybrid::ForwardPass::media(&self.wit, spans)
-    }
-
-    pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
-        self.set_stage(Stage::OnAttnProj, body);
-    }
-    pub fn on_attn(&self, body: impl Fn() + 'static) {
-        self.set_stage(Stage::OnAttn, body);
-    }
-
-    pub fn attention<R, W, B>(
-        &self,
-        kv: Option<KvBinding<'_, R, W>>,
-        rs: &[RsWorkingSet],
-        rs_geom: RsGeometry<'_, B>,
-    ) -> Result<(), String>
-    where
-        R: RangeBounds<u32>,
-        W: RangeBounds<u32>,
-        B: RangeBounds<u32>,
-    {
-        let kv = kv
-            .map(|kv| self.stage_kv(kv.working_set, kv.geometry))
-            .transpose()?;
-        let rs = self.stage_rs(rs, rs_geom)?;
-        let binding = kv.as_ref().map(|kv| wit_hybrid::KvBinding {
-            working_set: kv.ws.as_ref(),
-            geometry: wit_hybrid::KvGeometry {
-                readable_pages: kv.readable.wit(),
-                writable_pages: kv.writable.wit(),
-                kv_len: kv.kv_len.as_ref(),
-                pages: kv.pages.as_ref(),
-                page_indptr: kv.page_indptr.as_ref(),
-                w_slot: kv.w_slot.as_ref(),
-                w_off: kv.w_off.as_ref(),
-                positions: kv.positions.as_ref(),
-                mask: kv.mask.as_deref(),
-            },
-        });
-        let borrows: Vec<&crate::working_set::RsWorkingSet> =
-            rs.working_sets.iter().map(Rc::as_ref).collect();
-        wit_hybrid::ForwardPass::attention(
-            &self.wit,
-            binding.as_ref(),
-            &borrows,
-            &wit_hybrid::RsGeometry {
-                fold_len: rs.fold_len.as_ref(),
-                buffer: rs.buffer.wit(),
-            },
-        )
+    /// These rows are a block drafter's proposal, not the sequence's own.
+    pub fn set_drafting_block(&self, on: bool) -> Result<(), String> {
+        wit_forward::ForwardPass::set_drafting_block(&self.wit, on)
     }
 }
 
 impl Pass<wit_diffusion::ForwardPass> {
-    pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
-        self.set_stage(Stage::OnAttnProj, body);
-    }
-    pub fn on_attn(&self, body: impl Fn() + 'static) {
-        self.set_stage(Stage::OnAttn, body);
-    }
-
-    pub fn attention<R, W>(&self, ws: &WorkingSet, geom: KvGeometry<'_, R, W>) -> Result<(), String>
-    where
-        R: RangeBounds<u32>,
-        W: RangeBounds<u32>,
-    {
-        let kv = self.stage_kv(ws, geom)?;
-        wit_diffusion::ForwardPass::attention(
-            &self.wit,
-            kv.ws.as_ref(),
-            &wit_diffusion::KvGeometry {
-                readable_pages: kv.readable.wit(),
-                writable_pages: kv.writable.wit(),
-                kv_len: kv.kv_len.as_ref(),
-                pages: kv.pages.as_ref(),
-                page_indptr: kv.page_indptr.as_ref(),
-                w_slot: kv.w_slot.as_ref(),
-                w_off: kv.w_off.as_ref(),
-                positions: kv.positions.as_ref(),
-                mask: kv.mask.as_deref(),
-            },
-        )
-    }
-
     pub fn canvas(&self, mode: wit_diffusion::Mode) -> Result<(), String> {
         wit_diffusion::ForwardPass::canvas(&self.wit, mode)
     }
@@ -1703,39 +1244,14 @@ impl Pass<wit_diffusion::ForwardPass> {
     pub fn self_conditioning_from(&self, rows: &Channel, weights: &Channel) -> Result<(), String> {
         wit_diffusion::ForwardPass::self_conditioning_from(&self.wit, &rows.wit(), &weights.wit())
     }
-
-    pub fn media(&self, spans: &[wit_attention::MediaSpan<'_>]) -> Result<(), String> {
-        wit_diffusion::ForwardPass::media(&self.wit, spans)
-    }
 }
 
-impl Pass<wit_recurrent::ForwardPass> {
-    pub fn attention<B>(&self, rs: &[RsWorkingSet], geom: RsGeometry<'_, B>) -> Result<(), String>
-    where
-        B: RangeBounds<u32>,
-    {
-        let rs = self.stage_rs(rs, geom)?;
-        let borrows: Vec<&crate::working_set::RsWorkingSet> =
-            rs.working_sets.iter().map(Rc::as_ref).collect();
-        wit_recurrent::ForwardPass::attention(
-            &self.wit,
-            &borrows,
-            &wit_recurrent::RsGeometry {
-                fold_len: rs.fold_len.as_ref(),
-                buffer: rs.buffer.wit(),
-            },
-        )
-    }
-}
+/// Every text model's pass, whatever state the model keeps.
+pub type ForwardPass = Pass<wit_forward::ForwardPass>;
 
-pub mod attention {
-    pub type ForwardPass = super::Pass<super::wit_attention::ForwardPass>;
-    pub use super::{run_ahead, submit_frame};
-
-    pub mod prelude {
-        pub use super::{ForwardPass, run_ahead, submit_frame};
-        pub use crate::eta::shared_prelude::*;
-    }
+pub mod prelude {
+    pub use super::{ForwardPass, run_ahead, submit_frame};
+    pub use crate::eta::shared_prelude::*;
 }
 
 pub mod diffusion {
@@ -1779,25 +1295,5 @@ pub mod diffusion {
         let stable = eq(&unchanged, n as i32);
         let mean = &reduce_sum(entropy) / (n as f32);
         and(&stable, lt(&mean, threshold))
-    }
-}
-
-pub mod recurrent {
-    pub type ForwardPass = super::Pass<super::wit_recurrent::ForwardPass>;
-    pub use super::{run_ahead, submit_frame};
-
-    pub mod prelude {
-        pub use super::{ForwardPass, run_ahead, submit_frame};
-        pub use crate::eta::shared_prelude::*;
-    }
-}
-
-pub mod hybrid {
-    pub type ForwardPass = super::Pass<super::wit_hybrid::ForwardPass>;
-    pub use super::{run_ahead, submit_frame};
-
-    pub mod prelude {
-        pub use super::{ForwardPass, run_ahead, submit_frame};
-        pub use crate::eta::shared_prelude::*;
     }
 }

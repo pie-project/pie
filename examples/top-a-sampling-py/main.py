@@ -9,11 +9,9 @@ masked logits. Exercises `softmax`/`reduce_max`/`ge`/`select`/`cast`/
 from inferlet import chat, model
 from inferlet.eta import (
     Channel,
-    ForwardKind,
     ForwardPass,
-    KvGeometry,
     Pipeline,
-    RsWorkingSet,
+    StateGeometry,
     WorkingSet,
     broadcast,
     cast,
@@ -21,10 +19,8 @@ from inferlet.eta import (
     dtype,
     ge,
     gumbel_max,
-    indptr,
     intrinsics,
     iota,
-    kv_page_size,
     reduce_max,
     reduce_sum,
     reshape,
@@ -65,10 +61,7 @@ async def main(input: dict) -> dict:
         raise ValueError("temperature must be finite and greater than 0")
 
     vocab = model.output_vocab_size()
-    kind = model.pass_kind()
     ws = WorkingSet()
-    rs_ws = [RsWorkingSet()] if kind != ForwardKind.ATTENTION else []
-    page_size = kv_page_size()
     if max_tokens == 0:
         return {"sampler": "top-a", "text": "", "count": 0, "a": a, "mean_kept": 0.0, "min_kept": 0, "mean_mass": 0.0}
 
@@ -76,8 +69,6 @@ async def main(input: dict) -> dict:
     # gemma without it answers noise.
     prompt = (chat.prefix() + model.encode(prompt_text)) or [0]
     n = len(prompt)
-    max_pages = max(-(-(n + max_tokens + 1) // page_size), 1)
-    ws.reserve(max_pages)
 
     generated: list[int] = []
     s1: list[float] = []
@@ -86,24 +77,14 @@ async def main(input: dict) -> dict:
     # ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
     toks_p = Channel.from_(prompt, dtype.i32).named("toks_p")
     embed_indptr_p = Channel.from_([0, n], dtype.u32).named("embed_indptr_p")
-    positions_p = Channel.from_(range(n), dtype.u32).named("positions_p")
-    pages_p = Channel.from_(range(max_pages), dtype.u32).named("pages_p")
-    page_indptr_p = Channel.from_([0, -(-n // page_size)], dtype.u32).named("page_indptr_p")
-    w_slot_p = Channel.from_([p // page_size for p in range(n)], dtype.u32).named("w_slot_p")
-    w_off_p = Channel.from_([p % page_size for p in range(n)], dtype.u32).named("w_off_p")
-    kv_len_p = Channel.from_([n], dtype.u32).named("kv_len_p")
     rng_p = Channel.from_([seed, 0], dtype.u32).named("rng_p")
     tok_out_p = Channel([1], dtype.i32).named("tok_out_p")
     s1_out_p = Channel([1], dtype.f32).named("s1_out_p")
     s2_out_p = Channel([1], dtype.f32).named("s2_out_p")
 
-    fwd_p = ForwardPass(kind)
+    fwd_p = ForwardPass()
     fwd_p.embed(toks_p, embed_indptr_p)
-    fwd_p.bind_state(
-        ws,
-        KvGeometry(kv_len=kv_len_p, pages=pages_p, page_indptr=page_indptr_p, w_slot=w_slot_p, w_off=w_off_p, positions=positions_p),
-        rs_ws,
-    )
+    fwd_p.state([ws], StateGeometry.folding())
 
     @fwd_p.epilogue
     def _prefill():
@@ -131,39 +112,18 @@ async def main(input: dict) -> dict:
         s1_out = Channel([1], dtype.f32).capacity(cap).named("s1_out")
         s2_out = Channel([1], dtype.f32).capacity(cap).named("s2_out")
         lane1 = Channel.from_([0, 1], dtype.u32).named("embed_indptr")
-        positions = Channel.from_([n], dtype.u32).named("positions")
-        pages = Channel.from_(range(max_pages), dtype.u32).named("pages")
-        page_indptr = Channel.from_([0, -(-(n + 1) // page_size)], dtype.u32).named("page_indptr")
-        w_slot = Channel.from_([n // page_size], dtype.u32).named("w_slot")
-        w_off = Channel.from_([n % page_size], dtype.u32).named("w_off")
-        kv_len = Channel.from_([n + 1], dtype.u32).named("kv_len")
 
-        fwd = ForwardPass(kind)
+        fwd = ForwardPass()
         fwd.embed(tok_in, lane1)
-        fwd.bind_state(
-            ws,
-            KvGeometry(
-                kv_len=kv_len, pages=pages, page_indptr=page_indptr, w_slot=w_slot, w_off=w_off,
-                positions=positions, writable_pages=n // page_size,
-            ),
-            rs_ws,
-        )
+        fwd.state([ws], StateGeometry.folding())
 
         @fwd.epilogue
         def _decode():
-            length = kv_len.take()
             r = rng.take()
             logits = intrinsics.logits()
             token, kept, mass = step(logits, vocab, a, temperature, r)
             r_next = r + iota(2)
-            next_length = length + 1
-            page_count = next_length.div_ceil(page_size)
             tok_in.put(token)
-            kv_len.put(next_length)
-            positions.put(length)
-            w_slot.put(length // page_size)
-            w_off.put(length % page_size)
-            page_indptr.put(indptr(1, page_count))
             tok_out.put(token)
             s1_out.put(kept)
             s2_out.put(mass)

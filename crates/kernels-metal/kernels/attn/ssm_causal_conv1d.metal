@@ -56,7 +56,12 @@ template <typename T>
     const constant int& channels   [[buffer(7)]],
     const constant int& conv_width [[buffer(8)]],
     const constant int& dilation   [[buffer(9)]],
-    uint2 pos [[thread_position_in_grid]]) {
+    const constant int& run_rows   [[buffer(10)]],
+    uint3 pos [[thread_position_in_grid]]) {
+  // One thread a channel, a lane and a run of at least `run_rows` rows. Only
+  // a run that starts before the history ends reads the carried state, and
+  // runs are at least that long, so only a lane's first run reads it; that
+  // run writes the new state after, as the bank may be the one it read.
   const int c = int(pos.x);
   const int r = int(pos.y);
   const int begin = indptr[r];
@@ -77,7 +82,13 @@ template <typename T>
   const size_t slab = size_t(slots[begin]) * size_t(hist) * chans;
   const size_t tap0 = size_t(c) * taps;
 
-  for (int t = 0; t < span; ++t) {
+  const int run = max(run_rows, hist);
+  const int first = int(pos.z) * run;
+  if (first >= span) {
+    return;
+  }
+  const int last = min(span, first + run);
+  for (int t = first; t < last; ++t) {
     float acc = 0.0f;
     for (int k = 0; k < width; ++k) {
       const int src = t - (width - 1 - k) * dil;
@@ -87,6 +98,9 @@ template <typename T>
       acc += tap * float(weight[tap0 + size_t(k)]);
     }
     y[size_t(begin + t) * chans + col] = T(causal_conv1d_silu(acc));
+  }
+  if (first != 0) {
+    return;
   }
 
   for (int s = 0; s < hist; ++s) {
@@ -111,7 +125,7 @@ template <typename T>
       const device itype*, const device int*, const device itype*,      \
       const device float*, device float*, const device uint*,           \
       device itype*, const constant int&, const constant int&,          \
-      const constant int&, uint2);
+      const constant int&, const constant int&, uint3);
 
 instantiate_causal_conv1d(bfloat16, bfloat)
 

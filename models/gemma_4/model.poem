@@ -17,12 +17,16 @@ ASSISTANT_HIDDEN = 1024
 ASSISTANT_INTER = 8192
 ASSISTANT_READINGS = [SLIDING, SLIDING, SLIDING, GLOBAL]
 
-def trunk(hidden, layers, q_heads, kv_heads, global_kv_heads, inter, window, shared_tail = None, ple_dim = None, moe = None):
+def trunk(hidden, layers, q_heads, kv_heads, global_kv_heads, inter, window, shared_tail = None, ple_dim = None, moe = None,
+          full_every = 6, wide_tail = False):
+    """`full_every`: every that many layers one reads globally, the last of
+    each run. `wide_tail`: the layers that borrow their kv run an MLP twice as
+    wide (E2B's `use_double_wide_mlp`)."""
     return struct(
         hidden = hidden, layers = layers, q_heads = q_heads, kv_heads = kv_heads,
         global_kv_heads = global_kv_heads, inter = inter, window = window,
-        shared_tail = shared_tail, ple_dim = ple_dim, moe = moe,
-        full_every = 6, head_dim = 256, global_head_dim = 512, global_rotary_dim = 128,
+        shared_tail = shared_tail, ple_dim = ple_dim, moe = moe, wide_tail = wide_tail,
+        full_every = full_every, head_dim = 256, global_head_dim = 512, global_rotary_dim = 128,
         theta_local = 10000.0, theta_global = 1000000.0, sm_scale = 1.0, vocab = 262144,
         softcap = 30.0, norm_eps = 1e-6,
     )
@@ -32,6 +36,9 @@ def e4b(layers):
     return trunk(hidden = 2560, layers = layers, q_heads = 8, kv_heads = 2, global_kv_heads = 2, inter = 10240,
                  window = 512, shared_tail = layers - owned if layers > owned else None, ple_dim = 256)
 
+E2B = trunk(hidden = 1536, layers = 35, q_heads = 8, kv_heads = 1, global_kv_heads = 1, inter = 6144,
+            window = 512, shared_tail = 20, ple_dim = 256, full_every = 5, wide_tail = True)
+
 A4B = trunk(hidden = 2816, layers = 30, q_heads = 16, kv_heads = 8, global_kv_heads = 2, inter = 2112,
             window = 1024, moe = struct(experts = 128, top_k = 8, inter = 704))
 
@@ -39,6 +46,9 @@ TRUNKS = {
     "gemma4-26b-a4b": A4B,
     "gemma4-31b": trunk(hidden = 5376, layers = 60, q_heads = 32, kv_heads = 16, global_kv_heads = 4,
                         inter = 21504, window = 1024),
+    "gemma4-12b": trunk(hidden = 3840, layers = 48, q_heads = 16, kv_heads = 8, global_kv_heads = 1,
+                        inter = 15360, window = 1024),
+    "gemma4-e2b": E2B,
     "gemma4-e4b": e4b(42),
     "gemma4-e4b-mini-l1": e4b(1),
     "gemma4-e4b-mini-l6": e4b(6),
@@ -138,7 +148,7 @@ def layout(id, deploy):
         head_dim, row_heads = (sliding.head_dim, sliding.kv_heads) if reading == SLIDING else (glob.head_dim, glob.kv_heads)
         q_w = d.q_heads * head_dim
         kv_w = row_heads * head_dim
-        iw = d.inter
+        iw = d.inter * 2 if d.wide_tail and shared_at(l) else d.inter
         if shared_at(l):
             attn_banks = struct(shared = True, q_proj = weight(n("q_proj"), [q_w, hidden], proj).columns())
         else:

@@ -25,6 +25,7 @@ version of this file kept passing against `pie:core/inference`.
 
 from __future__ import annotations
 
+import enum
 import sys
 import types
 from dataclasses import dataclass
@@ -37,10 +38,8 @@ from enum import Enum
 
 
 class ForwardKind(Enum):
-    ATTENTION = 0
-    RECURRENT = 1
-    HYBRID = 2
-    DIFFUSION = 3
+    TEXT = 0
+    DIFFUSION = 1
 
 
 class DiffusionMode(Enum):
@@ -98,17 +97,13 @@ def _make_model() -> types.ModuleType:
     m.default_system_speculation = lambda: False
     m.mtp_depth = lambda: 0
     m.submit_deadline_us = lambda: 50_000
-    m.pass_kind = lambda: ForwardKind.HYBRID
+    m.pass_kind = lambda: ForwardKind.TEXT
     m.output_vocab_size = lambda: 151936
     m.kv_page_size = lambda: 16
     m.frame_size = lambda: 1
     m.channel_capacity = lambda: 8
-    m.max_embed_length = lambda: 2048
-    m.prefill_chunk_hint = lambda: 2048
+    m.max_readout_rows = lambda kind: 256 if kind == ReadoutKind.LOGITS else 2048
     m.rs_state_size = lambda: 4096
-    m.rs_buffer_page_size = lambda: 64
-    m.rs_fold_granularity = lambda: 1
-    m.arena_block_size = lambda: 8192
     m.run_ahead_window = lambda: 4
     m.BlockDrafter = BlockDrafterStub
     m.CanvasShape = CanvasShapeStub
@@ -276,6 +271,8 @@ def _make_chat() -> types.ModuleType:
     m.assistant = lambda message: [5, *(ord(c) for c in message)]
     m.cue = lambda: [6]
     m.cue_without_thinking = lambda: [6, 7]
+    m.ReasoningEffort = enum.Enum("ReasoningEffort", ["XHIGH", "MEDIUM", "LOW"])
+    m.system_thinking = lambda message, effort: [1, effort.value, *(ord(c) for c in message or "")]
     m.seal = lambda: [7]
     m.stop_tokens = lambda: [8, 9]
     m.create_decoder = ChatDecoderStub
@@ -299,6 +296,16 @@ class ReasoningComplete:
 
 class ReasoningDecoderStub(_ScriptedDecoder):
     script: list[object] = []
+    inside = False
+
+    @classmethod
+    def for_cue(cls, cue: list[int]) -> ReasoningDecoderStub:
+        decoder = cls()
+        decoder.inside = bool(cue) and cue[-1] == 6
+        return decoder
+
+    def starts_inside(self) -> bool:
+        return self.inside
 
 
 def _make_reasoning() -> types.ModuleType:
@@ -315,7 +322,7 @@ def _make_reasoning() -> types.ModuleType:
 
 # ---------------------------------------------------------------------------
 # The forward-pass surface: pie:inferlet/{types, channel, pipeline,
-# working-set, forward, forward-recurrent, forward-hybrid} + the
+# working-set, forward, forward-diffusion} + the
 # componentize-py `Err` type. Enough for `inferlet.eta.bridge` to import and
 # for its host-side plumbing to be exercised without a device: a `Channel`
 # remembers what was put; `take()` hands it back.
@@ -397,74 +404,33 @@ def _make_pipeline() -> types.ModuleType:
     return m
 
 
-@dataclass
-class PageRange:
-    start: int
-    len: int
-
-
-@dataclass
-class PageSpan:
-    start: int
-    end: int | None
-
-
-class KvWorkingSetStub:
-    def __init__(self) -> None:
-        self.pages = 0
-
-    def page_len(self) -> int:
-        return self.pages
-
-    def reserve(self, pages: int) -> PageRange:
-        r = PageRange(self.pages, pages)
-        self.pages += pages
-        return r
-
-    def fork(self, on):
-        return KvWorkingSetStub()
-
-
-class RsWorkingSetStub:
-    def __init__(self) -> None:
+class WorkingSetStub:
+    def reserve(self, end: int) -> None:
         pass
 
-    def buffer_size(self) -> int:
+    def folded(self) -> int:
         return 0
+
+    def cached_tokens(self) -> int:
+        return 0
+
+    def fork(self, on):
+        return WorkingSetStub()
 
 
 def _make_working_set() -> types.ModuleType:
     m = types.ModuleType("wit_world.imports.working_set")
-    m.PageRange = PageRange
-    m.PageSpan = PageSpan
-    m.KvWorkingSet = KvWorkingSetStub
-    m.RsWorkingSet = RsWorkingSetStub
+    m.WorkingSet = WorkingSetStub
     return m
 
 
 @dataclass
-class KvGeometry:
-    readable_pages: PageSpan
-    writable_pages: PageSpan
-    kv_len: object
-    pages: object
-    page_indptr: object
-    w_slot: object
-    w_off: object
+class StateGeometry:
     positions: object
+    slots: object
+    kv_len: object
     mask: object
-
-
-@dataclass
-class RsGeometry:
-    fold_len: object
-    buffer: PageSpan
-
-
-@dataclass
-class KvBinding:
-    working_set: object
-    geometry: KvGeometry
+    fold: object
 
 
 class ForwardPassStub:
@@ -474,7 +440,8 @@ class ForwardPassStub:
 
     def __init__(self) -> None:
         self.embedded = None
-        self.attention_args = None
+        self.state_args = None
+        self.checkpoint_slots = None
         self.program_bytes: bytes | None = None
         self.program_channels: list | None = None
 
@@ -484,8 +451,11 @@ class ForwardPassStub:
     def readout(self, indices) -> None:
         self.readout_ch = indices
 
-    def attention(self, *args) -> None:
-        self.attention_args = args
+    def state(self, lanes, geom) -> None:
+        self.state_args = (list(lanes), geom)
+
+    def checkpoints(self, slots) -> None:
+        self.checkpoint_slots = list(slots)
 
     def set_max_layers(self, n: int) -> None:
         self.max_layers = n
@@ -510,9 +480,7 @@ class ForwardPassStub:
 def _make_forward(name: str) -> types.ModuleType:
     m = types.ModuleType(f"wit_world.imports.{name}")
     m.ForwardPass = ForwardPassStub
-    m.KvGeometry = KvGeometry
-    m.RsGeometry = RsGeometry
-    m.KvBinding = KvBinding
+    m.StateGeometry = StateGeometry
     m.MediaSpan_Image = lambda v: ("image", v)
     m.MediaSpan_Audio = lambda v: ("audio", v)
     m.Mode = DiffusionMode
@@ -713,8 +681,6 @@ def install() -> None:
         "pipeline": _make_pipeline(),
         "working_set": _make_working_set(),
         "forward": _make_forward("forward"),
-        "forward_recurrent": _make_forward("forward_recurrent"),
-        "forward_hybrid": _make_forward("forward_hybrid"),
         "forward_diffusion": _make_forward("forward_diffusion"),
         "grammar": _make_grammar(),
         "tools": _make_tools(),

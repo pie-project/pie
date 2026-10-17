@@ -11,20 +11,28 @@ status() { call GET "" | jq -r '"\(.desiredStatus) gpu=\(.machine.gpuTypeId // .
 case "${1:?start|stop|status}" in
   status) status ;;
   start)
+    # A stopped pod resumes only when its host has the GPU free. RunPod answers
+    # 500 while it does not: keep asking for a while, then say so and leave
+    # `up=false` for the workflow, which skips the CUDA job instead of failing.
+    up() { [[ -n "${GITHUB_OUTPUT:-}" ]] && echo "up=$1" >> "$GITHUB_OUTPUT"; return 0; }
     s=$(status); echo "$s"
-    case "$s" in RUNNING*) exit 0 ;; esac
-    for attempt in 1 2 3; do
-      call POST /start >/dev/null && break
-      echo "start attempt $attempt failed; retrying" >&2; sleep 20
+    case "$s" in RUNNING*) up true; exit 0 ;; esac
+    for attempt in $(seq 1 20); do
+      if out=$(call POST /start 2>&1); then
+        for _ in $(seq 1 30); do
+          s=$(status); echo "$s"
+          case "$s" in RUNNING*) up true; exit 0 ;; esac
+          sleep 10
+        done
+      else
+        echo "start attempt $attempt: $out" >&2
+      fi
+      sleep 45
     done
-    # A stopped pod resumes only when its host has the GPU free; say so
-    # rather than leaving the job to queue for a runner that never comes.
-    for _ in $(seq 1 30); do
-      s=$(status); echo "$s"
-      case "$s" in RUNNING*) exit 0 ;; esac
-      sleep 10
-    done
-    echo "pod ${RUNPOD_POD_ID} did not reach RUNNING" >&2; exit 1 ;;
+    # a start RunPod accepted late must not keep billing after the run gave up on it
+    call POST /stop >/dev/null 2>&1 || true
+    echo "::warning::RunPod could not resume pod ${RUNPOD_POD_ID} (no free GPU on its host); the CUDA job is skipped"
+    up false ;;
   stop)
     # Another run's GPU job may be queued for or on the pod; that run's own
     # stop step turns it off.

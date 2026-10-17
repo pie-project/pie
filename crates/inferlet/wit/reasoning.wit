@@ -13,7 +13,13 @@ interface reasoning {
     /// Detects reasoning blocks in generated tokens.
     resource decoder {
         constructor();
+        /// A decoder for the turn `cue` began: inside a thinking block from
+        /// the first token when the cue left one open (a template that writes
+        /// `<think>` into its generation cue), so no `start` comes.
+        for-cue: static func(cue: list<u32>) -> decoder;
         feed: func(tokens: list<u32>) -> result<event, error>;
         reset: func();
+        /// Whether the first token is already inside a thinking block.
+        starts-inside: func() -> bool;
     }
 }

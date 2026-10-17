@@ -2315,6 +2315,7 @@ dependencies = [
  "async-trait",
  "axum",
  "blake3",
+ "builtins",
  "bytes",
  "controller-api",
  "futures",
@@ -2324,10 +2325,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tarpc",
+ "thiserror 2.0.21",
  "tokio",
  "toml",
  "tower",
  "tracing",
+ "wasmparser 0.259.0",
+ "wasmtime",
+ "wasmtime-wasi",
  "worker-api",
 ]
 
@@ -4241,8 +4246,10 @@ dependencies = [
 name = "pie-client-api"
 version = "0.5.4"
 dependencies = [
+ "rmp-serde",
  "serde",
  "serde_bytes",
+ "serde_json",
 ]
 
 [[package]]
@@ -4471,6 +4478,13 @@ dependencies = [
  "fdeflate",
  "flate2",
  "miniz_oxide 0.8.9",
+]
+
+[[package]]
+name = "policy"
+version = "0.5.4"
+dependencies = [
+ "wit-bindgen 0.62.0",
 ]
 
 [[package]]
@@ -5109,6 +5123,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "boxcar",
+ "builtins",
  "bytes",
  "chat-template",
  "checkpoint",
@@ -5150,6 +5165,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokenizer",
  "tokio",
+ "toml",
  "tracing",
  "tracing-appender",
  "tracing-opentelemetry 0.34.0",

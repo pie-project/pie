@@ -353,7 +353,13 @@ impl Builder<'_> {
     }
 
     fn affine(&mut self, expr: &Expr, decl: &TensorDecl) -> Result<Value> {
-        let lowering = compile(expr, self.resolver.checked(), MAX_RUNS)?;
+        // A copy list moves a computed buffer only whole; a gather over one
+        // is a permutation of it, however few runs it makes.
+        let max_runs = match expr {
+            Expr::Gather { src, .. } if matches!(**src, Expr::Out(_)) => 0,
+            _ => MAX_RUNS,
+        };
+        let lowering = compile(expr, self.resolver.checked(), max_runs)?;
         self.emit(&lowering, decl, Role::Declared)
     }
 
@@ -368,12 +374,33 @@ impl Builder<'_> {
         let geometry = gather.byte_geometry(&decl.encoding)?;
         let output_bytes = encoding_nbytes(&decl.shape, &decl.encoding)
             .or_overflow(format!("'{}' size overflow", decl.name))?;
-        let Value::Source(source) = self.leaf(gather.leaves.as_slice(), gather.leaf)? else {
-            return Err(Error::Unsupported(format!(
-                "'{}' gathers from a computed buffer; the gather lowering reads \
-                 the checkpoint",
-                decl.name
-            )));
+        let spec = GatherSpec {
+            indices: gather.indices.clone(),
+            block_bytes: geometry.block_bytes,
+            rows: geometry.rows,
+            src_row_bytes: geometry.src_row_bytes,
+        };
+        let source = match self.leaf(gather.leaves.as_slice(), gather.leaf)? {
+            Value::Source(source) => source,
+            Value::Buffer(buffer) => {
+                let out = self.allocate(decl, true)?;
+                self.tile_map(
+                    TileMapKind::Gather,
+                    None,
+                    Some(DestExtent {
+                        buffer: out,
+                        offset: 0,
+                        stride: storage_extent_for_shape(&decl.shape, &decl.encoding)?,
+                    }),
+                    vec![buffer],
+                    vec![out],
+                    TransformSpec {
+                        gather: Some(spec),
+                        ..TransformSpec::default()
+                    },
+                );
+                return Ok(Value::Buffer(out));
+            }
         };
         let raw = self.raw(source.tensor_id)?;
         let (file_id, tensor_id, base) = (raw.file_id, raw.id, raw.file_offset);
@@ -400,12 +427,7 @@ impl Builder<'_> {
                 offset: 0,
                 stride: Extent::byte_run(output_bytes),
             },
-            gather: GatherSpec {
-                indices: gather.indices.clone(),
-                block_bytes: geometry.block_bytes,
-                rows: geometry.rows,
-                src_row_bytes: geometry.src_row_bytes,
-            },
+            gather: spec,
         });
         self.program.schedule.push(instr);
         Ok(Value::Buffer(out))

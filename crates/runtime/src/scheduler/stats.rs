@@ -28,6 +28,7 @@ pub struct SchedulerStats {
     pub max_forward_requests_observed: AtomicU64,
     pub batch_size_hist: [AtomicU64; 8],
     pub last_batch_latency_us: AtomicU64,
+    pub last_batch_size: AtomicU64,
     pub cumulative_latency_us: AtomicU64,
     pub bubble_us_hist: [AtomicU64; BUBBLE_HIST_UPPER_US.len()],
     pub fire: crate::scheduler::probe::FireProbes,
@@ -78,6 +79,7 @@ pub(crate) fn record_fire_stats(
         stats
             .last_batch_latency_us
             .store(latency.as_micros() as u64, Relaxed);
+        stats.last_batch_size.store(batch_size, Relaxed);
         stats
             .cumulative_latency_us
             .fetch_add(latency.as_micros() as u64, Relaxed);

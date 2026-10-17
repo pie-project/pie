@@ -25,14 +25,10 @@
 //! window and nothing drafted — the controlled A/B `test_eagle.py` reads.
 //! Acceptance is reported, not asserted: it is a property of the head.
 //!
-//! **ATTENTION-ONLY.** Rejected rows leave KV cells above the committed
-//! length that the next fire overwrites (`nb + i`), so nothing is discarded
-//! explicitly. A hybrid (recurrent-state) text binds the same `m` as its
-//! `fold_len` — the fold-commit contract `model.wit` states — and is the RS
-//! half's business, not this file's.
+//! **ROLLBACK IS OVERWRITE.** The next fire writes again the slots past the accepted run.
 
 use inferlet::chat;
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -47,13 +43,6 @@ struct Input {
     /// geometry, fire and commit arithmetic.
     #[serde(default = "default_k")]
     k: u32,
-    /// DIAGNOSTIC: at `k = 0` the accepted count is a constant and the
-    /// geometry folds on the host; this makes it device-decided (a zero read
-    /// off the logits) so the one-row loop takes the pool-owned
-    /// device-geometry class the wider windows take — separating "that class
-    /// moves the answer" from "the drafting window does".
-    #[serde(default)]
-    device_geometry: bool,
     /// DIAGNOSTIC: extra lanes carrying the correction token again, verified
     /// and rejected like any wrong draft, so a run with no drafts can be
     /// given the fire SHAPE of one with `pad` of them — separating "a wider
@@ -64,11 +53,6 @@ struct Input {
     /// door), to bisect a divergence by depth.
     #[serde(default)]
     max_layers: Option<u32>,
-    /// Prefill chunk cap in tokens. A streamed-expert artifact seats a bounded
-    /// number of distinct experts per segment, and a long prompt routes past
-    /// it; chunking the prefill keeps every fire under the seat count.
-    #[serde(default)]
-    prefill_chunk: Option<u32>,
     /// DIAGNOSTIC: record the first rounds' proposals and answers
     /// (`proposed_trace`/`truth_trace`) instead of the per-round margin — a
     /// pass binds at most twelve channels, and this is the twelfth.
@@ -76,8 +60,7 @@ struct Input {
     trace: bool,
     /// DIAGNOSTIC: record lane 0's top-1/top-2 logit margin every round
     /// (`margin_trace`). Opt-in because it is a `top_k` over the whole
-    /// vocabulary in the epilogue, ~170 ms a fire on the full dsv4 — a third
-    /// of the fire — and a gate's tie-judging is the only reader.
+    /// vocabulary in the epilogue.
     #[serde(default)]
     margin: bool,
 }
@@ -114,10 +97,7 @@ struct Output {
     k: u32,
     /// The model's draft depth.
     depth: u32,
-    /// Where the generation started (prompt tokens) and the KV page size —
-    /// what a divergence between two widths is read against.
     prompt_tokens: u32,
-    page_size: u32,
     /// Per round, lane 0's top-1 minus top-2 logit — whether a divergence
     /// between two widths is a near-tie (the bf16 floor: a one-row and a
     /// many-row fire take different kernel paths and differ in the last
@@ -148,7 +128,6 @@ impl Output {
             k,
             depth,
             prompt_tokens: 0,
-            page_size: 0,
             margin_trace: Vec::new(),
             commits_trace: Vec::new(),
             proposed_trace: Vec::new(),
@@ -164,12 +143,10 @@ const NONE: i32 = -1;
 async fn main(input: Input) -> Result<Output> {
     let depth = model::mtp_depth();
     let k = input.k.min(depth);
-    let device_geometry = input.device_geometry;
     if input.max_tokens == 0 {
         return Ok(Output::empty(k, depth));
     }
     let w = k + 1 + input.pad;
-    let page_size = kv_page_size();
 
     // The raw encoding, so the identity against `naive-baseline` compares the
     // same context.
@@ -183,34 +160,28 @@ async fn main(input: Input) -> Result<Output> {
     let n = prompt.len() as u32;
     let stop_tokens = chat::stop_tokens();
 
-    // One working set for the generation: the prompt's KV, every token the
-    // host may keep, and one window of rejected cells above the committed
-    // length that the next fire writes over.
     let ws = WorkingSet::new();
-    // A round commits up to `w` tokens and the loop stops on the host, so
-    // the device may have advanced one window past `max_tokens` and laid out
-    // the window after that; a page of slack keeps every `pages` cut inside
-    // the run every lane carries.
-    let max_extent = n + input.max_tokens as u32 + 2 * w + page_size;
-    let max_pages = max_extent.div_ceil(page_size);
-    ws.reserve(max_pages).context("reserve KV")?;
+    // The device picks the slots, so they are reserved up front; `2 * w` because it may run a
+    // window past `max_tokens` and lay out the one after it.
+    let max_extent = n + input.max_tokens as u32 + 2 * w;
+    ws.reserve(max_extent)
+        .context("reserve the decode's slots")?;
     let pipe = Pipeline::new();
 
-    // ── PREFILL: the prompt, chunked; the last chunk seeds the loop ──────
+    // The `mtp_drafts` pass is not cut by the runtime, so it is no wider than a fire reads out.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let spans = prefill_chunks(n, input.prefill_chunk);
+    let tail = u32::try_from(max_readout_rows(model::ReadoutKind::Logits)).unwrap_or(u32::MAX);
+    let spans = if k > 0 && n > tail {
+        vec![(0, n - tail), (n - tail, n)]
+    } else {
+        vec![(0, n)]
+    };
     let last_span = spans.len() - 1;
     let mut seed: Vec<i32> = Vec::new();
     for (at, &(base, end)) in spans.iter().enumerate() {
         let len = end - base;
         let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
         let indptr_p = Channel::from([0u32, len]).named("embed_indptr_p");
-        let positions_p = Channel::from_iter(base..end).named("positions_p");
-        let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
-        let page_indptr_p = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr_p");
-        let w_slot_p = Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot_p");
-        let w_off_p = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_p");
-        let kv_len_p = Channel::from([end]).named("kv_len_p");
         // The last row only: the first window is seeded off it.
         let readout_p = Channel::from([len - 1]).named("readout_p");
         let seed_p = Channel::new([w], dtype::i32).named("seed_p");
@@ -222,20 +193,7 @@ async fn main(input: Input) -> Result<Output> {
         }
         fwd_p.embed(&toks_p, &indptr_p)?;
         fwd_p.readout(&readout_p)?;
-        fwd_p.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len_p,
-                pages: &pages_p,
-                page_indptr: &page_indptr_p,
-                w_slot: &w_slot_p,
-                w_off: &w_off_p,
-                positions: &positions_p,
-                mask: None,
-            },
-        )?;
+        fwd_p.state(&[&ws], StateGeometry::folding())?;
         fwd_p.epilogue(move || {
             // One readout row: `logits()` is `[vocab]`, its argmax a scalar.
             let t = reshape(reduce_argmax(intrinsics::logits()), [1]);
@@ -259,7 +217,6 @@ async fn main(input: Input) -> Result<Output> {
         fwd_p
             .submit(&pipe)
             .with_context(|| format!("prefill submit @{base}"))?;
-        // Every chunk's put is drained; only the last chunk's seeds the loop.
         seed = seed_p
             .take_host::<Vec<i32>>()
             .await
@@ -279,38 +236,24 @@ async fn main(input: Input) -> Result<Output> {
     // ── DECODE: one window per fire, loop-carried on the device ──────────
     //
     // **THE WINDOW IS `w` LANES OF ONE TOKEN, NOT ONE LANE OF `w` TOKENS.**
-    // The runtime's device-geometry class (the decode envelope) admits one
-    // token per lane, and that shape is also the staircase without a mask:
-    // lane `i` holds the window's `i`-th token at position `nb + i` and
-    // reads `nb + i + 1` keys — its prefix, itself, and nothing drafted
-    // after it — over the pages every lane shares (beam-search's shape,
-    // with a per-lane `kv_len` where beam search has a mask). Every lane's
-    // key is appended before any lane attends, so lane `i + 1` sees lane
-    // `i`'s.
+    // The runtime admits one token per lane; every lane's slot is written before any lane
+    // attends, so lane `i + 1` sees lane `i`'s.
     if !stopped {
         let win = Channel::from(seed.as_slice()).named("win");
         let base = Channel::from([n]).named("base");
         let indptr_d = Channel::from_iter(0..=w).named("embed_indptr");
-        let positions = Channel::from_iter(n..n + w).named("positions");
-        let page_count0 = (n + w).div_ceil(page_size);
-        let pages = Channel::from_iter((0..w * max_pages).map(|j| j % page_count0)).named("pages");
-        let page_indptr =
-            Channel::from_iter((0..=w).map(|lane| lane * page_count0)).named("page_indptr");
-        let w_slot = Channel::from_iter((n..n + w).map(|p| p / page_size)).named("w_slot");
-        let w_off = Channel::from_iter((n..n + w).map(|p| p % page_size)).named("w_off");
+        let slots = Channel::from_iter(n..n + w).named("slots");
         let kv_len = Channel::from_iter((n..n + w).map(|p| p + 1)).named("kv_len");
+        // Lane 0 carries the fold count for the shared working set; the others fold nothing more.
+        let fold = Channel::from(vec![0u32; w as usize]).named("fold");
         let out = Channel::new([w], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("out");
-        // The twelfth channel is either the margin or the trace: a declared
-        // channel is bound whether or not a stage touches it, and the pass
-        // has room for twelve.
         let tracing = input.trace;
         let margin = input.margin;
         // One diagnostic channel, the margin or the trace: a declared channel
         // takes a reader cell whether or not a stage touches it, and the pass
-        // has room for exactly this many. f32 for both — a token id is exact
-        // in f32.
+        // has room for twelve. f32 for both — a token id is exact in f32.
         let aux = Channel::new([if tracing { 2 * w } else { 1 }], dtype::f32)
             .capacity(channel_capacity() as u32)
             .named("aux");
@@ -320,18 +263,14 @@ async fn main(input: Input) -> Result<Output> {
             fwd.set_max_layers(layers)?;
         }
         fwd.embed(&win, &indptr_d)?;
-        fwd.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &positions,
-                mask: None,
+        let lanes: Vec<&WorkingSet> = (0..w).map(|_| &ws).collect();
+        fwd.state(
+            &lanes,
+            StateGeometry {
+                slots: Some(&slots),
+                kv_len: Some(&kv_len),
+                fold: Fold::Count(&fold),
+                ..StateGeometry::default()
             },
         )?;
         fwd.epilogue(move || {
@@ -370,10 +309,6 @@ async fn main(input: Input) -> Result<Output> {
                 let said = gather(&truth, iota(k)); // truth[0..k]
                 let hit = cast(eq(&proposed, &said), dtype::u32);
                 reshape(reduce_sum(cumprod(&hit)), [1])
-            } else if device_geometry {
-                // Zero, but read off the logits so the host cannot fold it.
-                let t0 = gather(&truth, iota(1));
-                cast(ne(&t0, &t0), dtype::u32)
             } else {
                 &b - &b
             };
@@ -382,7 +317,11 @@ async fn main(input: Input) -> Result<Output> {
             // ── commit: window[1..=m], then truth[m]; -1 past that
             let next_of = gather(&window, min_elem(&i + &one, Tensor::constant(w - 1)));
             let correction = broadcast(gather(&truth, &m), [w]);
-            let committed = select(lt(&i, &mb), &next_of, select(eq(&i, &mb), &correction, &none));
+            let committed = select(
+                lt(&i, &mb),
+                &next_of,
+                select(eq(&i, &mb), &correction, &none),
+            );
             out.put(&committed);
 
             // ── the next window: the correction, then row m's chain
@@ -399,21 +338,15 @@ async fn main(input: Input) -> Result<Output> {
             win.put(&next);
 
             // ── the geometry of that window, from the new committed length:
-            //    lane i at nb + i, reading nb + i + 1 keys, every lane over
-            //    the same page run.
+            //    lane i at slot nb + i, reading nb + i + 1 slots; the next
+            //    fire freezes the m + 1 this one accepted.
             let nb = &b + &m + &one; // [1]
             base.put(&nb);
             let p = broadcast(&nb, [w]) + &i; // [w]
-            positions.put(&p);
-            w_slot.put(&p / page_size);
-            w_off.put(&p % page_size);
+            slots.put(&p);
             kv_len.put(&p + &one);
-            let page_count = (&nb + Tensor::constant(w)).div_ceil(page_size); // [1]
-            pages.put(gather(
-                iota(max_pages),
-                iota(w * max_pages) % broadcast(&page_count, [w * max_pages]),
-            ));
-            page_indptr.put(iota(w + 1) * broadcast(&page_count, [w + 1]));
+            let none_more = broadcast(Tensor::constant(0u32), [w]);
+            fold.put(select(&first, broadcast(&m + &one, [w]), &none_more));
         });
 
         let budget = input.max_tokens;
@@ -482,7 +415,6 @@ async fn main(input: Input) -> Result<Output> {
         k,
         depth,
         prompt_tokens: n,
-        page_size,
         margin_trace,
         commits_trace,
         proposed_trace,

@@ -1,11 +1,9 @@
-use std::cell::Cell;
-
 use kernels_metal::Tensor;
-use poem_compiler::{CompiledModel, Lowering, Region};
-use poem_exec::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
+use poem_compiler::CompiledModel;
+use poem_exec::fire::{MaskSpan, WindowTable, fallback};
 use poem_exec::store::check::{self, rebase};
 use poem_exec::store::kv::Geometry;
-use poem_ir::{Def, Dim, Dtype, GeomKind, Operands, Operation, RuntimeInput, Trace, Ty};
+use poem_ir::{Dtype, Trace};
 
 use crate::device::Handles;
 use crate::device::handles::NIL;
@@ -74,98 +72,6 @@ pub struct Windows {
     windows: Vec<Window>,
     runs: Vec<u32>,
     of_region: Vec<(u32, u32)>,
-}
-
-pub(crate) fn operands(
-    nodes: &[poem_ir::Node],
-    region: &Region,
-) -> Option<(Vec<poem_ir::ValueId>, Vec<poem_ir::ValueId>)> {
-    let mut ins: Vec<poem_ir::ValueId> = Vec::new();
-    let mut outs: Vec<poem_ir::ValueId> = Vec::new();
-    for node in region.nodes.clone() {
-        let node = nodes.get(node as usize)?;
-        macro_rules! collect {
-            ($op:expr) => {{
-                $op.inputs(&mut ins);
-                $op.outputs(&mut outs);
-            }};
-        }
-        match &node.op {
-            Operation::Attention(op) => collect!(op),
-            Operation::Linear(op) => collect!(op),
-            Operation::Elementwise(op) => collect!(op),
-            Operation::Layout(op) => collect!(op),
-            Operation::Collective(op) => collect!(op),
-            Operation::Fused(op) => collect!(op),
-            Operation::Spatial(op) => collect!(op),
-        }
-    }
-    Some((ins, outs))
-}
-
-pub(crate) fn copyable(trace: &Trace, region: &Region) -> bool {
-    let Some((ins, outs)) = operands(&trace.nodes, region) else {
-        return false;
-    };
-    ins.iter().chain(outs.iter()).all(|id| {
-        let Some(decl) = trace.values.get(id.0 as usize) else {
-            return false;
-        };
-        match &decl.def {
-            Def::Cache(c) => matches!(
-                trace.caches.get(*c as usize),
-                Some(poem_ir::CacheRow::Kv { .. })
-            ),
-            Def::Input(RuntimeInput::Geometry { kind, .. }) => matches!(
-                kind,
-                GeomKind::Indptr | GeomKind::Indices | GeomKind::LastPageLen | GeomKind::KvLen
-            ),
-            Def::Input(RuntimeInput::Mask { .. }) => false,
-            _ => match &decl.ty {
-                Ty::Struct(_) => true,
-                Ty::Tensor { shape, dtype } => match shape.first() {
-                    Some(Dim::Tokens) => matches!(dtype, Dtype::Bf16 | Dtype::F32),
-                    Some(Dim::TokensTimes(_)) => false,
-                    Some(Dim::Const(_)) | None => true,
-                    Some(Dim::Lanes | Dim::LanesPlus(_)) => false,
-                    Some(Dim::Readouts) => false,
-                    Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
-                    Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => {
-                        false
-                    }
-                },
-            },
-        }
-    })
-}
-
-pub(crate) fn copyable_mask(
-    trace: &Trace,
-    compiled: &CompiledModel,
-    mask: &poem_ir::ClassSet,
-) -> bool {
-    compiled
-        .template()
-        .iter()
-        .filter(|region| &region.mask == mask)
-        .all(|region| copyable(trace, region))
-}
-
-#[must_use]
-pub fn gathers(trace: &Trace, compiled: &CompiledModel) -> usize {
-    let mut masks: Vec<&poem_ir::ClassSet> = Vec::new();
-    for region in compiled.template() {
-        let owed = compiled.fallback.rows.iter().any(|row| {
-            region.nodes.contains(&row.node) && row.fallback == poem_compiler::Fallback::Copy
-        });
-        if !owed || masks.contains(&&region.mask) {
-            continue;
-        }
-        if copyable_mask(trace, compiled, &region.mask) {
-            masks.push(&region.mask);
-        }
-    }
-    masks.len()
 }
 
 fn seat(windows: &mut Vec<Window>, window: Window) -> u32 {
@@ -332,7 +238,7 @@ impl Windows {
             if spans.len() > 1
                 && copies.enabled
                 && fallback::copies(compiled, axis, &region.mask, copies.bucket)
-                && copyable_mask(trace, compiled, &region.mask)
+                && fallback::copyable_mask(trace, compiled, &region.mask)
             {
                 let mut gathered = gather_of(&spans, indptr_host, copies);
                 gathered.patch = patch;
@@ -493,62 +399,6 @@ impl Windows {
 
 pub fn no_schedule_straddles_its_readers(trace: &Trace, compiled: &CompiledModel) -> Result<()> {
     Ok(check::no_schedule_straddles_its_readers(trace, compiled)?)
-}
-
-#[derive(Debug, Default)]
-pub struct At {
-    pub region: Cell<u32>,
-    pub run: Cell<u32>,
-    pub tail: Cell<bool>,
-}
-
-impl At {
-    #[must_use]
-    pub fn new() -> At {
-        At::default()
-    }
-}
-
-#[derive(Debug)]
-pub struct Cursor<'a> {
-    at: u32,
-    place: &'a At,
-}
-
-impl<'a> Cursor<'a> {
-    #[must_use]
-    pub fn new(place: &'a At) -> Cursor<'a> {
-        place.region.set(0);
-        place.run.set(0);
-        Cursor { at: 0, place }
-    }
-
-    #[allow(clippy::unnecessary_wraps, reason = "the seam: see the item doc")]
-    pub fn settle(self) -> Result<()> {
-        Ok(())
-    }
-}
-
-impl Sink for Cursor<'_> {
-    fn region_begin(&mut self, _region: &Region) {
-        self.place.region.set(self.at);
-        self.place.run.set(0);
-        self.at += 1;
-    }
-    fn region_end(&mut self, _region: &Region) {}
-
-    fn run(&mut self, run: u32, _runs: u32) {
-        self.place.run.set(run);
-        self.place.tail.set(false);
-    }
-    fn tail(&mut self, in_tail: bool) {
-        self.place.tail.set(in_tail);
-    }
-    fn cond_begin(&mut self, _lowering: &Lowering) {}
-    fn cond_arm(&mut self, _arm: u8) {}
-    fn cond_end(&mut self) {}
-    fn fork(&mut self, _event: EventId) {}
-    fn join(&mut self, _event: EventId) {}
 }
 
 #[cfg(test)]

@@ -116,29 +116,8 @@ fn pages() -> Vec<u32> {
 fn buffer(at: u32, fold: u32, replay: u32) -> RsVerb {
     RsVerb::Buffer {
         pages: pages(),
-        at,
-        fold: FoldLen::Host(fold),
-        replay,
-    }
-}
-
-fn fold_buffered(bound: u32, len: u32) -> RsVerb {
-    fold_buffered_at(0, bound, len)
-}
-
-fn fold_buffered_at(at: u32, bound: u32, len: u32) -> RsVerb {
-    RsVerb::FoldBuffered {
-        pages: pages(),
-        at,
-        bound,
-        len: FoldLen::Host(len),
-    }
-}
-
-fn window_verb(read: Vec<u32>, write: Vec<u32>, fold: u32) -> RsVerb {
-    RsVerb::Window {
-        read,
-        write,
+        base: 0,
+        folded: at - replay,
         fold: FoldLen::Host(fold),
     }
 }
@@ -223,16 +202,7 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
         "a buffered fire answers other logits than the fold it defers: {d}"
     );
 
-    shell
-        .fire_seated(&[seated(1, &tokens, &fold_buffered(k, k), RsReset::Held)])
-        .expect("the fold-buffered fire runs");
-    let replayed = shell.state_bytes(1).expect("slot 1");
-    assert_eq!(replayed.len(), folded.len());
-    assert_eq!(
-        replayed, folded,
-        "`Buffer` then `FoldBuffered(k)` did not leave the banks `Fold` leaves"
-    );
-
+    let second = window(101);
     let j = 3u32;
     shell.open(2).expect("slot 2 opens");
     shell
@@ -248,8 +218,8 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
         .fire_seated(&[seated(3, &tokens, &buffer(0, 0, 0), RsReset::Fresh)])
         .expect("the buffering fire runs");
     shell
-        .fire_seated(&[seated(3, &tokens, &fold_buffered(k, j), RsReset::Held)])
-        .expect("the truncated fold runs");
+        .fire_seated(&[seated(3, &second, &buffer(k, j, k), RsReset::Held)])
+        .expect("window B replays A and folds part of it");
     assert_eq!(
         shell.state_bytes(3).expect("slot 3"),
         folded_j,
@@ -272,7 +242,6 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
         "the mixed row answers other logits than the fold: {d}"
     );
 
-    let second = window(101);
     shell.open(5).expect("slot 5 opens");
     shell
         .fire_seated(&[seated(5, &tokens, &buffer(0, 0, 0), RsReset::Fresh)])
@@ -301,28 +270,6 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
     assert!(
         d <= LOGIT_FLOOR,
         "the read path answers other logits than a plain fold of the prefix: {d}"
-    );
-    shell
-        .fire_seated(&[seated(
-            5,
-            &second,
-            &fold_buffered_at(k, k, k),
-            RsReset::Held,
-        )])
-        .expect("B's buffer folds");
-    shell.open(6).expect("slot 6 reopens");
-    shell
-        .fire_seated(&[seated(6, &tokens, &fold, RsReset::Fresh)])
-        .expect("A folds plainly again");
-    for row in 0..second.len() {
-        shell
-            .fire_seated(&[seated(6, &second[row..=row], &fold, RsReset::Held)])
-            .expect("one row of B folds");
-    }
-    assert_eq!(
-        shell.state_bytes(5).expect("slot 5"),
-        shell.state_bytes(6).expect("slot 6"),
-        "folding the round's buffer did not leave the banks Fold(A) then Fold(B), a row at a time, leaves"
     );
 
     let third = window(203);
@@ -354,129 +301,6 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
     assert!(
         d <= LOGIT_FLOOR,
         "a folding lane answers differently beside a buffering peer: {d}"
-    );
-
-    let (run_a, run_b) = (vec![1u32], vec![2u32]);
-    shell.open(1).expect("slot 1 reopens");
-    shell
-        .fire_seated(&[seated(
-            1,
-            &tokens,
-            &window_verb(Vec::new(), run_a.clone(), 0),
-            RsReset::Fresh,
-        )])
-        .expect("window round 1 runs");
-    assert_eq!(
-        shell.state_bytes(1).expect("slot 1"),
-        zeroed,
-        "round 1 folded something with fold 0"
-    );
-    let round2 = shell
-        .fire_seated(&[seated_at(
-            1,
-            &second,
-            &window_verb(run_a.clone(), run_b.clone(), j),
-            RsReset::Held,
-            j,
-        )])
-        .expect("window round 2 runs");
-    assert_eq!(
-        shell.state_bytes(1).expect("slot 1"),
-        folded_j,
-        "round 2 did not leave the banks Fold(A[..j]) leaves"
-    );
-    shell.open(2).expect("slot 2 reopens");
-    shell
-        .fire_seated(&[seated(2, &tokens[..j as usize], &fold, RsReset::Fresh)])
-        .expect("A[..j] folds plainly");
-    let plain = shell
-        .fire_seated(&[seated(2, &second, &fold, RsReset::Held)])
-        .expect("B folds after it");
-    let d = spread(&plain[0], &round2[0]);
-    eprintln!("claim 7: window round 2 vs B after fold(A[..j]), last-row logit spread {d:.4}");
-    assert!(
-        d <= LOGIT_FLOOR,
-        "the window verb answers other logits than a plain fold of the prefix: {d}"
-    );
-    let third = window(307);
-    shell
-        .fire_seated(&[seated_at(
-            1,
-            &third,
-            &window_verb(run_b, run_a, j),
-            RsReset::Held,
-            2 * j,
-        )])
-        .expect("window round 3 runs");
-    shell.open(3).expect("slot 3 reopens");
-    shell
-        .fire_seated(&[seated(3, &tokens[..j as usize], &fold, RsReset::Fresh)])
-        .expect("A[..j] folds plainly");
-    shell
-        .fire_seated(&[seated(3, &second[..j as usize], &fold, RsReset::Held)])
-        .expect("B[..j] folds after it");
-    assert_eq!(
-        shell.state_bytes(1).expect("slot 1"),
-        shell.state_bytes(3).expect("slot 3"),
-        "round 3 did not leave the banks Fold(A[..j]) then Fold(B[..j]) leaves"
-    );
-
-    let steps = window(401);
-    shell.open(4).expect("slot 4 reopens");
-    shell
-        .fire_seated(&[seated(4, &tokens, &fold, RsReset::Fresh)])
-        .expect("A folds");
-    shell.open(5).expect("slot 5 reopens");
-    shell
-        .fire_seated(&[seated(5, &tokens, &fold, RsReset::Fresh)])
-        .expect("A folds for the reference");
-    let held0 = k;
-    let mut worst = 0f32;
-    for step in 0..3usize {
-        let row = &steps[step..step + 1];
-        let (read, write) = if step % 2 == 0 {
-            (vec![3u32], vec![4u32])
-        } else {
-            (vec![4u32], vec![3u32])
-        };
-        let fold_now = if step == 0 { 0 } else { 1 };
-        let windowed = shell
-            .fire_seated(&[seated_at(
-                4,
-                row,
-                &window_verb(read, write, fold_now),
-                RsReset::Held,
-                held0 + step as u32,
-            )])
-            .expect("a one-row window fires");
-        let plain = shell
-            .fire_seated(&[seated(5, row, &fold, RsReset::Held)])
-            .expect("a one-row fold fires");
-        let d = spread(&plain[0], &windowed[0]);
-        eprintln!(
-            "claim 8: step {step} one-row window (fold {fold_now}) vs plain fold: logit spread {d:.4}; argmax {} vs {}",
-            argmax(&windowed[0]),
-            argmax(&plain[0])
-        );
-        worst = worst.max(d);
-    }
-    assert!(
-        worst <= LOGIT_FLOOR,
-        "one-row windows answer other logits than one-row folds: {worst}"
-    );
-    shell
-        .fire_seated(&[seated_at(
-            4,
-            &steps[3..4],
-            &window_verb(vec![4u32], vec![3u32], 1),
-            RsReset::Held,
-            held0 + 3,
-        )])
-        .expect("the closing window fires");
-    assert_eq!(
-        shell.state_bytes(4).expect("slot 4"),
-        shell.state_bytes(5).expect("slot 5"),
-        "three one-row window rounds did not leave the banks three one-row folds leave"
     );
 
     let steps: Vec<u32> = (0..12u32).map(|i| (503 + i * 37) % 256).collect();

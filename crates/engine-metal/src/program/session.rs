@@ -1,3 +1,4 @@
+use engine::ports::Envelope;
 use eta_compiler::codegen::launch::LaunchPackage;
 use eta_exec::{ExecPlan, Extents};
 use eta_ir::op::IntrinsicId;
@@ -11,7 +12,7 @@ use crate::error::{Fault, Result};
 
 use super::compile::Compiled;
 use super::launch::{ChannelShape, Cursor, Prepared, Rings};
-use super::ports::{self, Envelope};
+use super::ports;
 use super::shared::SharedRing;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -29,6 +29,8 @@ pub struct Request {
     pub priority: Priority,
     pub blobs: Vec<BlobRef>,
     pub message: ClientMessage,
+    #[serde(default)]
+    pub router_props: client_api::Props,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

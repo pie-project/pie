@@ -249,8 +249,9 @@ async def test_churn_two_waves(client, args):
 # --model google/gemma-4-E4B-it, which selects the masked fleet instead.
 MASKED_FLEET = [
     ("text-completion", {"prompt": ATTEND, "max_tokens": 12}, _gate_attends, 0.0),
-    ("sliding-window-attention",
-     {"prompt": "Count upward.", "max_tokens": 8, "window_size": 2}, _gate_json("count"), 0.0),
+    ("attention-sink",
+     {"prompt": "Count upward.", "max_tokens": 8, "sink_size": 0, "window_size": 2},
+     _gate_json("count"), 0.0),
     ("attention-sink",
      {"prompt": "Count upward.", "max_tokens": 8, "sink_size": 1, "window_size": 2},
      _gate_json("count"), 0.1),

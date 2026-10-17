@@ -2,6 +2,7 @@
 use anyhow::Context;
 use anyhow::{Result, ensure};
 
+use std::borrow::Cow;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 use std::path::PathBuf;
@@ -78,6 +79,7 @@ pub struct Config {
     pub model: ModelConfig,
     pub skip_tracing: bool,
     pub max_concurrent_processes: Option<usize>,
+    pub policy: Option<(String, Cow<'static, [u8]>)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -139,6 +141,8 @@ pub struct EngineConfig {
     pub seated_first: bool,
     pub rs_cache_slot_bytes: u64,
     pub rs_host_slots: usize,
+    pub rs_buffer_pages: u32,
+    pub rs_host_buffer_pages: u32,
     pub has_mtp_logits: bool,
     pub mtp_depth: u32,
     pub draft_block: u32,
@@ -150,6 +154,9 @@ pub struct EngineConfig {
     pub has_attn_score: bool,
     pub has_attn_page_mask: bool,
     pub has_lora: bool,
+    /// The engine takes an attachment for an adapter alone
+    /// ([`::engine::fire::Boundary::Adapter`]): an adapted pass can be cut.
+    pub adapter_attachments: bool,
     pub device_geometry_port_mask: eta_ir::registry::PortMask,
     pub limits: crate::engine::SchedulerLimits,
     /// The facts the engine's trace branches on.
@@ -249,22 +256,25 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     } = config.model;
 
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
-    let rs_pool = engine_configs
+    // A running recurrent sequence holds one state slot, so the pool seats
+    // as many as it has slots; what it buffers unfolded is in pages of
+    // their own.
+    let rs_seat_cap = engine_configs
         .iter()
-        .filter(|d| d.rs_cache_slots > 0)
-        .min_by_key(|d| d.rs_cache_slots)
-        .map(|d| (d.rs_cache_slots, d.total_pages));
-    // A lane holds a state slot per posted frame. Where every engine asks
-    // for it and the slots seat fewer lanes than the engines batch, post one
-    // frame a lane: up to twice the lanes seated, for the run-ahead a second
-    // frame bought.
+        .map(|d| d.rs_cache_slots)
+        .filter(|&slots| slots > 0)
+        .min();
+    // Each posted frame buffers what it leaves unfolded. Where every engine
+    // asks for it and the slots seat fewer lanes than the engines batch at
+    // the configured depth, post one frame a lane, for the run-ahead a
+    // second frame bought.
     let lanes = engine_configs
         .iter()
         .map(|d| d.limits.max_forward_requests)
         .min()
         .unwrap_or(0);
     let depth = crate::scheduler::configured_dispatch_depth().max(1);
-    if let Some((slots, _)) = rs_pool
+    if let Some(slots) = rs_seat_cap
         && depth > 1
         && slots / depth < lanes
         && engine_configs
@@ -281,8 +291,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         );
         crate::scheduler::set_dispatch_depth(1);
     }
-    let seat_cost = crate::scheduler::configured_dispatch_depth().max(1);
-    let rs_seat_cap = rs_pool.map(|(slots, _)| (slots / seat_cost).max(1));
     let admission_cap = config
         .max_concurrent_processes
         .or_else(|| {
@@ -294,17 +302,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })
         .map(|cap| match rs_seat_cap {
             Some(seats) if cap > seats => {
-                let (slots, _) = rs_pool.unwrap_or((0, 0));
                 tracing::warn!(
                     requested = cap,
                     seated = seats,
-                    seat_cost,
-                    state_slots = slots,
                     "admission: more lanes than the state pool seats; capping, because each \
-                     lane holds one recurrent-state slot per posted frame. To seat \
-                     `requested * seat_cost` sequences raise `[engine] max_state_slots`. \
-                     Every batch this deployment fires is bounded by `seated`, not by the \
-                     engine's max_lanes"
+                     running sequence holds one recurrent-state slot. Raise `[engine] \
+                     max_state_slots` to seat more"
                 );
                 seats
             }
@@ -317,7 +320,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         let mut caps = model::RsCaps {
             state_size: d0.map(|d| d.rs_cache_slot_bytes).unwrap_or(0),
             buffer_page_size: 0,
-            fold_granularity: 1,
             window_tokens: d0.map_or(0, |d| d.window_tokens),
         };
         if caps.has_state() {
@@ -325,10 +327,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         }
         caps
     };
+    let all = |has: fn(&EngineConfig) -> bool| {
+        !engine_configs.is_empty() && engine_configs.iter().all(has)
+    };
     let eta_caps = model::EtaCaps {
-        has_lora: !engine_configs.is_empty() && engine_configs.iter().all(|d| d.has_lora),
-        has_mtp_logits: !engine_configs.is_empty()
-            && engine_configs.iter().all(|d| d.has_mtp_logits),
+        has_lora: all(|d| d.has_lora),
+        has_mtp_logits: all(|d| d.has_mtp_logits),
         mtp_depth: match engine_configs.first().map(|d| d.mtp_depth) {
             Some(depth) if engine_configs.iter().all(|d| d.mtp_depth == depth) => depth,
             _ => 0,
@@ -338,17 +342,13 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             _ => 0,
         },
         draft_mask_token: engine_configs.first().map_or(0, |d| d.draft_mask_token),
-        draft_bidirectional: !engine_configs.is_empty()
-            && engine_configs.iter().all(|d| d.draft_bidirectional),
+        draft_bidirectional: all(|d| d.draft_bidirectional),
         draft_proposals_from: engine_configs.first().map_or(1, |d| d.draft_proposals_from),
-        has_value_head: !engine_configs.is_empty()
-            && engine_configs.iter().all(|d| d.has_value_head),
-        has_kv_envelopes: !engine_configs.is_empty()
-            && engine_configs.iter().all(|d| d.has_kv_envelopes),
-        has_attn_score: !engine_configs.is_empty()
-            && engine_configs.iter().all(|d| d.has_attn_score),
-        has_attn_page_mask: !engine_configs.is_empty()
-            && engine_configs.iter().all(|d| d.has_attn_page_mask),
+        has_value_head: all(|d| d.has_value_head),
+        has_kv_envelopes: all(|d| d.has_kv_envelopes),
+        has_attn_score: all(|d| d.has_attn_score),
+        has_attn_page_mask: all(|d| d.has_attn_page_mask),
+        adapter_attachments: all(|d| d.adapter_attachments),
     };
     let facts = engine_configs
         .first()
@@ -381,6 +381,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .map(|d| crate::store::registry::StatePool {
             slots: d.rs_cache_slots as u32,
             host_slots: d.rs_host_slots as u32,
+            pages: d.rs_buffer_pages,
+            host_pages: d.rs_host_buffer_pages,
             window_tokens: d.window_tokens,
             window_pages: d.window_pages,
             host_window_pages: d.cpu_window_pages,
@@ -394,6 +396,22 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .first()
         .is_some_and(|d| d.cpu_pages > 0 || d.disk_pages > 0);
     let seated_first = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seated_first);
+    if let Some(d) = engine_configs.first() {
+        if kv_swap_capable {
+            tracing::info!(
+                device_pages = d.total_pages,
+                host_pages = d.cpu_pages,
+                disk_pages = d.disk_pages,
+                "kv tiers: suspended kv goes to the host, then the disk"
+            );
+        } else {
+            tracing::warn!(
+                device_pages = d.total_pages,
+                "no host or disk kv tier: pie cannot compute kv again, so kv \
+                 pressure restarts processes"
+            );
+        }
+    }
     let engine_count = engine_configs.len();
     let engines: Vec<usize> = engine_configs
         .into_iter()
@@ -428,6 +446,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         ))
         .seated_first(seated_first),
     );
+    // After the gates and the planner it orders exist.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some((name, component)) = &config.policy {
+        crate::policy::start(name, component).with_context(|| format!("engine policy {name}"))?;
+    }
     if let Some(period) = std::env::var("PIE_CONTENTION_TRACE_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
@@ -465,9 +488,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.device_pages_total,
                     d.host_slots_free,
                     d.host_slots_total,
-                    d.queue.first().map_or(0, |w| w.rs_slots),
-                    d.rs_slots_free,
-                    d.rs_slots_total,
+                    d.queue.first().map_or(0, |w| w.rs.slots),
+                    d.rs_free.slots,
+                    d.rs_total.slots,
                     d.parks_total,
                     d.serves_total,
                     d.evictions_total,

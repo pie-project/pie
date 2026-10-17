@@ -78,8 +78,15 @@ pub(crate) fn load_model_engines(
         let snapshot_dir = resolved_model.path().to_path_buf();
         let mut group_engines: Vec<GroupEngine> = Vec::with_capacity(topology.len());
         for (group_idx, group) in topology.iter().enumerate() {
+            // The default swap tiers hold every seat the runtime admits.
+            let mut residency = m.residency();
+            residency.kv_seats = user_cfg
+                .runtime
+                .max_concurrent_processes
+                .and_then(|n| u32::try_from(n).ok());
             group_engines.push(create_engine_group(
                 m,
+                residency,
                 group_idx,
                 group,
                 flavor,
@@ -291,7 +298,8 @@ fn load_without_engine(
         .map(|stamp| stamp.deployment)
         .ok_or_else(|| anyhow!("{} carries no serving stamp", artifact.display()))?;
     let config =
-        translate::build_without_engine(user_cfg, home, builtins, &artifact, &deployment, metadata);
+        translate::build_without_engine(user_cfg, home, builtins, &artifact, &deployment, metadata)
+            .context("translating to bootstrap::Config")?;
     Ok(Loaded {
         model: m.name.clone(),
         partner: None,
@@ -331,6 +339,7 @@ fn artifact_name(path: &Path) -> String {
 )]
 fn create_engine_group(
     m: &config::ModelConfig,
+    residency: engine::Residency,
     group_idx: usize,
     group: &[usize],
     flavor: Flavor,
@@ -355,7 +364,7 @@ fn create_engine_group(
                 component,
                 frames_in_flight,
                 &m.adapters,
-                m.residency(),
+                residency.clone(),
                 m.patch_ceilings(),
                 m.voxel_ceilings(),
                 &m.overrides()?,
@@ -390,7 +399,7 @@ fn create_engine_group(
         component,
         frames_in_flight,
         &m.adapters,
-        m.residency(),
+        residency,
         m.patch_ceilings(),
         m.voxel_ceilings(),
         &m.overrides()?,

@@ -23,8 +23,6 @@ import * as witPipeline from 'pie:inferlet/pipeline@0.3.0';
 import * as witWorkingSet from 'pie:inferlet/working-set@0.3.0';
 import * as witChannel from 'pie:inferlet/channel@0.3.0';
 import * as witForward from 'pie:inferlet/forward@0.3.0';
-import * as witForwardRecurrent from 'pie:inferlet/forward-recurrent@0.3.0';
-import * as witForwardHybrid from 'pie:inferlet/forward-hybrid@0.3.0';
 import * as witForwardDiffusion from 'pie:inferlet/forward-diffusion@0.3.0';
 import * as witGrammar from 'pie:inferlet/grammar@0.3.0';
 import * as witChat from 'pie:inferlet/chat@0.3.0';
@@ -68,8 +66,6 @@ const HOST = {
   'working-set': witWorkingSet,
   channel: witChannel,
   forward: witForward,
-  'forward-recurrent': witForwardRecurrent,
-  'forward-hybrid': witForwardHybrid,
   'forward-diffusion': witForwardDiffusion,
   grammar: witGrammar,
   chat: witChat,

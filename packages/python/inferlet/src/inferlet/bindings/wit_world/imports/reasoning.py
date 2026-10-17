@@ -32,7 +32,13 @@ Event = Union[Event_Start, Event_Delta, Event_Complete]
 
 
 class Decoder:
+    """
+    Detects reasoning blocks in generated tokens.
+    """
     
+    def __init__(self) -> None:
+        raise NotImplementedError
+
     def feed(self, tokens: List[int]) -> Event:
         """
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
@@ -52,8 +58,3 @@ class Decoder:
 
 
 
-def create_decoder() -> Decoder:
-    """
-    Create a decoder to detect reasoning blocks in generated tokens
-    """
-    raise NotImplementedError

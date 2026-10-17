@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use serde::{Deserialize, Serialize};
 
 use crate::channel::Ticket;
@@ -33,6 +35,20 @@ impl Mask {
     #[must_use]
     pub fn words(&self) -> usize {
         usize::try_from(self.total.div_ceil(32)).unwrap_or(usize::MAX)
+    }
+
+    pub fn admitted(&self, range: Range<u64>) -> impl Iterator<Item = Range<u64>> + '_ {
+        let mut at = 0u64;
+        self.runs
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, &run)| {
+                let span = at..at.saturating_add(u64::from(run)).min(self.total);
+                at = span.end;
+                (index % 2 == 1).then_some(span)
+            })
+            .map(move |span| span.start.max(range.start)..span.end.min(range.end))
+            .filter(|span| !span.is_empty())
     }
 
     pub fn expand_into(&self, dst: &mut [u32]) {
@@ -77,6 +93,58 @@ impl Masking {
             Masking::Rows(rows) => Some(rows.len()),
         }
     }
+}
+
+/// The recurrent layers replay one run for all of a lane's rows, so every row
+/// must admit the same buffered slots.
+pub fn buffered_reads(
+    masking: Option<&Masking>,
+    folded: u32,
+    first: u32,
+    rows: u32,
+) -> Result<Vec<Range<u32>>> {
+    let whole = || {
+        (folded < first)
+            .then_some(folded..first)
+            .into_iter()
+            .collect()
+    };
+    let read = |mask: &Mask| -> Vec<Range<u32>> {
+        mask.admitted(u64::from(folded)..u64::from(first))
+            .map(|span| span.start as u32..span.end as u32)
+            .collect()
+    };
+    let Some(masking) = masking else {
+        return Ok(whole());
+    };
+    let masks = masking.masks();
+    let Some(reads) = masks.first().map(read) else {
+        return Ok(whole());
+    };
+    for (row, mask) in masks.iter().enumerate() {
+        if read(mask) != reads {
+            return Err(Error::Invalid(format!(
+                "row {row} admits other buffered slots than the lane's first row; its \
+                 recurrent layers replay one run of them for all its rows"
+            )));
+        }
+        let before = match masking {
+            Masking::Rows(_) => row as u64,
+            Masking::Extent(_) => u64::from(rows.saturating_sub(1)),
+        };
+        let own = u64::from(first)..u64::from(first) + before;
+        let kept: u64 = mask
+            .admitted(own.clone())
+            .map(|span| span.end - span.start)
+            .sum();
+        if kept != own.end - own.start {
+            return Err(Error::Invalid(format!(
+                "row {row} hides a row of its own lane before it; its recurrent layers \
+                 run the lane's rows in order"
+            )));
+        }
+    }
+    Ok(reads)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +227,10 @@ pub struct Lane {
     pub kv_less: bool,
     #[serde(default)]
     pub attn_classes: Option<AttnClasses>,
+    /// An engine that cannot report says nothing, and the step is plainly
+    /// committed.
+    #[serde(default)]
+    pub reports: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -271,28 +343,6 @@ impl Lane {
         if !matches!(self.rs, RsVerb::Fold) && !serves.rs_verbs {
             return Err(Error::unsupported("engine", RS_VERBS_WITHOUT_DEVICE_HALF));
         }
-        if let RsVerb::Buffer {
-            fold: FoldLen::Host(fold),
-            replay,
-            ..
-        } = &self.rs
-            && *fold > replay.saturating_add(self.rows())
-        {
-            return Err(Error::Invalid(if *replay == 0 {
-                format!(
-                    "lane in slot {} folds {fold} of the {} rows it carries",
-                    self.slot,
-                    self.rows()
-                )
-            } else {
-                format!(
-                    "lane in slot {} folds {fold} of the {} rows it carries plus the {replay} \
-                     buffered token(s) it replays ahead of them",
-                    self.slot,
-                    self.rows()
-                )
-            }));
-        }
         Ok(())
     }
 }
@@ -310,6 +360,7 @@ pub struct Serves {
     pub device_channel_commit: bool,
     pub rs_verbs: bool,
     pub bidirectional: bool,
+    pub adapter_attachments: bool,
 }
 
 impl Serves {
@@ -317,7 +368,18 @@ impl Serves {
         device_channel_commit: false,
         rs_verbs: false,
         bidirectional: false,
+        adapter_attachments: false,
     };
+
+    #[must_use]
+    pub fn of(caps: &crate::Capabilities) -> Serves {
+        Serves {
+            device_channel_commit: caps.device_channel_commit,
+            rs_verbs: caps.rs_verbs,
+            bidirectional: caps.bidirectional_attention,
+            adapter_attachments: caps.adapter_attachments,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,36 +429,30 @@ pub enum RsReset {
 pub enum RsVerb {
     #[default]
     Fold,
+    /// Replays the buffered slots `folded..first` its mask admits, then freezes
+    /// `fold` slots past `folded` into the state.
     Buffer {
+        /// The buffer's pages: token `t` of page `p` holds slot
+        /// `base + p * page + t`.
         pages: Vec<u32>,
-        at: u32,
+        base: u32,
+        folded: u32,
         fold: FoldLen,
-        #[serde(default)]
-        replay: u32,
-    },
-    Window {
-        read: Vec<u32>,
-        write: Vec<u32>,
-        fold: FoldLen,
-    },
-    FoldBuffered {
-        pages: Vec<u32>,
-        at: u32,
-        bound: u32,
-        len: FoldLen,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FoldLen {
     Host(u32),
-    Device(eta_ir::registry::Port),
+    Device,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Boundary {
     Prologue,
     Epilogue,
+    /// A pass cut into several fires sends it on every one but the last.
+    Adapter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -553,6 +609,11 @@ impl Step {
         }
         let lanes = u32::try_from(self.lanes.len()).unwrap_or(u32::MAX);
         for (index, attachment) in self.attachments.iter().enumerate() {
+            if attachment.at == Boundary::Adapter && !serves.adapter_attachments {
+                return Err(Error::Invalid(format!(
+                    "attachment {index} is for an adapter alone, which this engine does not serve"
+                )));
+            }
             if attachment.lane >= lanes {
                 return Err(Error::Invalid(format!(
                     "attachment names lane {} of the {lanes} this fire has",
@@ -826,4 +887,45 @@ fn partition(indptr: &[u32], name: &str, bytes: usize, align: usize, strict: boo
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mask(kept: &[bool]) -> Mask {
+        let mut runs = vec![0u32];
+        let mut keeping = false;
+        for &bit in kept {
+            if bit != keeping {
+                runs.push(0);
+                keeping = bit;
+            }
+            *runs.last_mut().unwrap() += 1;
+        }
+        Mask::new(runs, kept.len() as u64)
+    }
+
+    #[test]
+    fn a_lane_replays_the_buffered_slots_its_mask_admits() {
+        // Slots 0..2 are folded; the lane's one row is at slot 6.
+        let ancestry = mask(&[true, true, false, true, false, true, true]);
+        assert_eq!(
+            ancestry.admitted(2..6).collect::<Vec<_>>(),
+            vec![3..4, 5..6],
+            "the kept spans in the range, in order"
+        );
+        let reads = buffered_reads(Some(&Masking::Rows(vec![ancestry.clone()])), 2, 6, 1);
+        assert_eq!(reads.unwrap(), vec![3..4, 5..6]);
+        assert_eq!(buffered_reads(None, 2, 6, 1).unwrap(), vec![2..6]);
+
+        // Two rows from slot 5 that admit different buffered slots, and a
+        // second row that hides the first: a recurrence runs neither.
+        let other = mask(&[true, true, true, false, false, true, true]);
+        let rows = Masking::Rows(vec![ancestry.clone(), other]);
+        assert!(buffered_reads(Some(&rows), 2, 5, 2).is_err());
+        let blind = mask(&[true, true, false, true, false, false, true]);
+        let rows = Masking::Rows(vec![ancestry, blind]);
+        assert!(buffered_reads(Some(&rows), 2, 5, 2).is_err());
+    }
 }

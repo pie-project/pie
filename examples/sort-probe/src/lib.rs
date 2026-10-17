@@ -1,4 +1,4 @@
-use inferlet::eta::hybrid::prelude::*;
+use inferlet::eta::prelude::*;
 use serde::Deserialize;
 
 const TOP_P: f32 = 0.9;
@@ -169,41 +169,15 @@ async fn main(input: Input) -> Result<String> {
     let light = input.light;
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
-        model::ForwardKind::Attention => Vec::new(),
-        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
-        model::ForwardKind::Recurrent => {
-            return Err(
-                "this program has no recurrent-only path (it measures the sampling epilogue of a \
-                 KV-paged fire)"
-                    .into(),
-            );
-        }
-        model::ForwardKind::Diffusion => {
-            return Err(
-                "this program decodes a token at a time; a diffusion model wants a canvas loop"
-                    .into(),
-            );
-        }
-    };
-    let page_size = kv_page_size();
 
     let mut prompt = model::encode("The capital of France is");
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
-    let max_pages = n.div_ceil(page_size).max(1);
-    ws.reserve(max_pages).context("reserve KV")?;
 
     let toks = Channel::from_iter(prompt.iter().map(|&token| token as i32));
     let embed_indptr = Channel::from([0u32, n]).named("embed_indptr");
-    let positions = Channel::from_iter(0..n).named("positions");
-    let pages = Channel::from_iter(0..max_pages).named("pages");
-    let page_indptr = Channel::from([0u32, max_pages]).named("page_indptr");
-    let w_slot = Channel::from_iter((0..n).map(|p| p / page_size)).named("w_slot");
-    let w_off = Channel::from_iter((0..n).map(|p| p % page_size)).named("w_off");
-    let kv_len = Channel::from([n]).named("kv_len");
     let logits_out = Channel::new([vocab], dtype::f32).named("logits");
     let probs_out = Channel::new([vocab], dtype::f32).named("probabilities");
     let keep_out = Channel::new([vocab], dtype::i32).named("nucleus_keep");
@@ -244,27 +218,7 @@ async fn main(input: Input) -> Result<String> {
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;
-    fwd.attention(
-        Some(KvBinding {
-            working_set: &ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &positions,
-                mask: None,
-            },
-        }),
-        &rs_ws,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
-        },
-    )?;
+    fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
         let logits = intrinsics::logits();
         let logprobs = log_softmax(&logits);

@@ -33,6 +33,7 @@ pub(crate) enum Read {
     Stack(Weight, Vec<Vec<String>>),
     Over(Weight, String, Expr),
     Expr(Weight, Expr),
+    Columns(Weight, String, i64, i64),
     Own(Weight),
     Push(TensorContract),
     Extend(Vec<TensorContract>),
@@ -50,6 +51,7 @@ impl Read {
             Read::Stack(w, rows) => b.read_stack(&w, rows),
             Read::Over(w, from, over) => b.read_over(&w, from, |_| over),
             Read::Expr(w, expr) => b.read_expr(&w, expr),
+            Read::Columns(w, from, start, len) => b.read_columns(&w, from, start, len),
             Read::Own(w) => b.read_own(&w),
             Read::Push(t) => {
                 b.push(t);
@@ -399,6 +401,20 @@ fn reads_methods(builder: &mut MethodsBuilder) {
     ) -> anyhow::Result<NoneType> {
         let w = weight(w)?;
         READS.with(|r| r.borrow_mut().push(Read::One(w, name)));
+        Ok(NoneType)
+    }
+
+    /// `w` lands columns `start .. start + len` (the last axis) of the
+    /// checkpoint's tensor `name`, packed codes included.
+    fn read_columns<'v>(
+        #[starlark(this)] _this: &ReadsHandle,
+        #[starlark(require = pos)] w: Value<'v>,
+        #[starlark(require = pos)] name: String,
+        #[starlark(require = pos)] start: i64,
+        #[starlark(require = pos)] len: i64,
+    ) -> anyhow::Result<NoneType> {
+        let w = weight(w)?;
+        READS.with(|r| r.borrow_mut().push(Read::Columns(w, name, start, len)));
         Ok(NoneType)
     }
 

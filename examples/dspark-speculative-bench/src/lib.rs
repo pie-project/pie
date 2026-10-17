@@ -15,17 +15,16 @@
 //!
 //! A round is the two passes, draft then verify, and the runtime is kept a
 //! window of them ahead (`run_ahead`'s shape over two passes). Each pass is
-//! ONE lane of a host-constant row count (`rs-mtp-speculative-bench`'s
-//! pool-owned device geometry): the draft's `B` rows read every key up to
-//! the block's end (its `kv_len`), the head finding each row's depth in its
-//! block from its position against that end; the verify's `B + 1` rows are
-//! the prefill arm's causal staircase.
+//! ONE lane of a host-constant row count whose slots the device states: the
+//! draft's `B` rows read every slot up to the block's end (its `kv_len`),
+//! the head finding each row's depth in its block from its position against
+//! that end; the verify's `B + 1` rows are the prefill arm's causal
+//! staircase.
 //!
-//! **THE RECURRENCE IS DRIVEN THROUGH THE WINDOW VERB** on the verify (V4.1's
-//! Engram n-gram state, its replay floor): two buffer runs the runtime
-//! alternates, the epilogue putting the fold — the accepted rows and the
-//! correction — so a rejected row's state is never folded. The draft's
-//! rows are the head's alone and touch no state: it binds the plain fold.
+//! **THE VERIFY FREEZES WHAT THE ROUND BEFORE IT ACCEPTED**: its epilogue
+//! puts the fold count — the accepted rows and the correction — which the
+//! next verify reads, so a rejected row is never frozen and the next round
+//! writes over it. The draft's rows are the head's alone and fold nothing.
 //!
 //! **THE ANSWER IS THE ANSWER, BY CONSTRUCTION.** Verification keeps the
 //! trunk's argmax at every position, so the text equals greedy decoding
@@ -35,7 +34,7 @@
 //! discarded explicitly. Attention-only texts: a recurrence's fold is not
 //! this file's.
 
-use inferlet::eta::hybrid::prelude::*;
+use inferlet::eta::prelude::*;
 use inferlet::{chat, session};
 use serde::{Deserialize, Serialize};
 
@@ -118,8 +117,6 @@ async fn main(input: Input) -> Result<Output> {
     // The verify window: the anchor and `k` proposals.
     let w = k + 1;
     let noise = head.mask_token as i32;
-    let page_size = kv_page_size();
-    let rs_page = model::rs_buffer_page_size().max(1);
 
     let mut prompt: Vec<u32> = match &input.prompt_tokens {
         Some(tokens) => tokens.clone(),
@@ -133,34 +130,26 @@ async fn main(input: Input) -> Result<Output> {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
-    let stop_tokens: Vec<u32> = if input.ignore_eos { Vec::new() } else { chat::stop_tokens() };
+    let stop_tokens: Vec<u32> = if input.ignore_eos {
+        Vec::new()
+    } else {
+        chat::stop_tokens()
+    };
     if input.wait_for_start {
         session::send("ready");
         let _ = session::receive().await;
     }
 
-    // The prompt's KV, every token the host may keep, and the cells a round
-    // writes above the committed length (a block, or a window) that the
-    // next round writes over; the device may run a window of rounds past
-    // the host's stop, and a page of slack keeps every cut inside the run.
+    // The prompt's slots, every token the host may keep, and the slots a
+    // round writes above the committed length (a block, or a window) that
+    // the next round writes over; the device may run a window of rounds past
+    // the host's stop, and a block of slack keeps every cut inside the run.
+    // The device picks the slots, so they are reserved up front.
     let ws = WorkingSet::new();
     let reach = block.max(w);
-    let max_extent = n + input.max_tokens as u32 + 2 * reach + page_size;
-    let max_pages = max_extent.div_ceil(page_size);
-    ws.reserve(max_pages).context("reserve KV")?;
-    // A hybrid text's recurrence: two runs of one verify window each, the
-    // runtime alternating them per verify fire.
-    let rs_set: Vec<RsWorkingSet> = match model::pass_kind() {
-        model::ForwardKind::Attention => Vec::new(),
-        model::ForwardKind::Hybrid => {
-            let rs = RsWorkingSet::new();
-            rs.alloc_buffer(2 * w.div_ceil(rs_page).max(1))
-                .map_err(|why| format!("alloc rs window runs: {why}"))?;
-            vec![rs]
-        }
-        _ => return Err("a block drafter's loop reads attention kv".into()),
-    };
-    let run_pages = if rs_set.is_empty() { 0 } else { w.div_ceil(rs_page).max(1) };
+    let max_extent = n + input.max_tokens as u32 + 3 * reach;
+    ws.reserve(max_extent)
+        .context("reserve the decode's slots")?;
     let pipe = Pipeline::new();
 
     // ── the draft's inputs: one lane of the block's rows, every one put by
@@ -170,14 +159,9 @@ async fn main(input: Input) -> Result<Output> {
     let lane = |name: &str, len: u32, dt| Channel::new([len], dt).capacity(ring).named(name);
     let blk = lane("blk", block, dtype::i32);
     let base_d = lane("base_d", 1, dtype::u32).queued();
-    let positions_d = lane("positions_d", block, dtype::u32);
-    // The pages a lane reads and its extent are ports the draft peeks: a
-    // queue it takes each value from, the verify's put appending.
-    let pages_d = lane("pages_d", max_pages, dtype::u32).queued();
-    let page_indptr_d = lane("page_indptr_d", 2, dtype::u32).queued();
-    let w_slot_d = lane("w_slot_d", block, dtype::u32);
-    let w_off_d = lane("w_off_d", block, dtype::u32);
-    // Every row reads every key up to the block's end.
+    let slots_d = lane("slots_d", block, dtype::u32);
+    // Every row reads every slot up to the block's end: a port the draft
+    // peeks, a queue it takes each value from, the verify's put appending.
     let kv_len_d = lane("kv_len_d", 1, dtype::u32).queued();
     // Lays out the block anchored at `a` (`[1]` i32) at `b` (`[1]` u32).
     let lay_block = move |a: &Tensor, b: &Tensor| {
@@ -188,14 +172,8 @@ async fn main(input: Input) -> Result<Output> {
             broadcast(Tensor::constant(noise), [block]),
         ));
         base_d.put(b);
-        let p = broadcast(b, [block]) + &j;
-        positions_d.put(&p);
-        w_slot_d.put(&p / page_size);
-        w_off_d.put(&p % page_size);
-        let end = b + Tensor::constant(block); // [1]
-        kv_len_d.put(&end);
-        page_indptr_d.put(indptr(1, &end.div_ceil(page_size)));
-        pages_d.put(iota(max_pages));
+        slots_d.put(broadcast(b, [block]) + &j);
+        kv_len_d.put(b + Tensor::constant(block));
     };
 
     // The passes are built before anything is submitted: a channel's host
@@ -207,19 +185,22 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── the verify pass: one lane of `w` rows, laid out by the draft ──
     let win = Channel::new([w], dtype::i32).capacity(ring).named("win");
-    let base_v = Channel::new([1], dtype::u32).capacity(ring).named("base_v").queued();
+    let base_v = Channel::new([1], dtype::u32)
+        .capacity(ring)
+        .named("base_v")
+        .queued();
     let indptr_v = Channel::from([0u32, w]).named("embed_indptr_v");
     let readout_v = Channel::from_iter(0..w).named("readout_v");
-    let positions_v = Channel::new([w], dtype::u32).capacity(ring).named("positions_v");
-    let pages_v = Channel::new([max_pages], dtype::u32).capacity(ring).named("pages_v").queued();
-    let page_indptr_v =
-        Channel::new([2], dtype::u32).capacity(ring).named("page_indptr_v").queued();
-    let w_slot_v = Channel::new([w], dtype::u32).capacity(ring).named("w_slot_v");
-    let w_off_v = Channel::new([w], dtype::u32).capacity(ring).named("w_off_v");
-    let kv_len_v = Channel::new([1], dtype::u32).capacity(ring).named("kv_len_v").queued();
-    // The fold: the prefill folded everything, so the first window
-    // replays nothing; every verify's epilogue puts the next.
-    let fold_len = Channel::from([0u32]).named("fold_len");
+    let slots_v = Channel::new([w], dtype::u32)
+        .capacity(ring)
+        .named("slots_v");
+    let kv_len_v = Channel::new([1], dtype::u32)
+        .capacity(ring)
+        .named("kv_len_v")
+        .queued();
+    // The fold: the prefill froze everything, so the first verify freezes
+    // nothing more; every verify's epilogue puts what the next one freezes.
+    let fold = Channel::from([0u32]).named("fold");
     let out = Channel::new([w], dtype::i32).capacity(ring).named("out");
 
     let draft = ForwardPass::new();
@@ -228,31 +209,18 @@ async fn main(input: Input) -> Result<Output> {
         .map_err(|why| format!("stating the draft block: {why}"))?;
     draft.embed(&blk, &indptr_d)?;
     draft.readout(&readout_d)?;
-    draft.attention(
-        Some(KvBinding {
-            working_set: &ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: (n / page_size)..,
-                kv_len: &kv_len_d,
-                pages: &pages_d,
-                page_indptr: &page_indptr_d,
-                w_slot: &w_slot_d,
-                w_off: &w_off_d,
-                positions: &positions_d,
-                mask: None,
-            },
-        }),
-        &rs_set,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
+    draft.state(
+        &[&ws],
+        StateGeometry {
+            slots: Some(&slots_d),
+            kv_len: Some(&kv_len_d),
+            ..StateGeometry::default()
         },
     )?;
     draft.epilogue(move || {
         let tokens = blk.take(); // [block] i32: the anchor, then noise
-        // The peeked geometry, taken: the verify laid out the next one.
-        let _ = (kv_len_d.take(), page_indptr_d.take(), pages_d.take());
+        // The peeked extent, taken: the verify laid out the next one.
+        let _ = kv_len_d.take();
         let b = base_d.take(); // [1] u32: the anchor's position
         let picks = reshape(intrinsics::mtp_drafts(block), [block]); // [block] i32
         let i = iota(w);
@@ -263,51 +231,25 @@ async fn main(input: Input) -> Result<Output> {
         let a = broadcast(gather(&tokens, iota(1)), [w]);
         win.put(&select(&first, &a, gather(&picks, &at)));
         base_v.put(&b);
-        let p = broadcast(&b, [w]) + &i;
-        positions_v.put(&p);
-        w_slot_v.put(&p / page_size);
-        w_off_v.put(&p % page_size);
-        let extent = &b + Tensor::constant(w); // [1]
-        kv_len_v.put(&extent);
-        page_indptr_v.put(indptr(1, &extent.div_ceil(page_size)));
-        pages_v.put(iota(max_pages));
+        slots_v.put(broadcast(&b, [w]) + &i);
+        kv_len_v.put(&b + Tensor::constant(w));
     });
 
     let verify = ForwardPass::new();
     verify.embed(&win, &indptr_v)?;
     verify.readout(&readout_v)?;
-    verify.attention(
-        Some(KvBinding {
-            working_set: &ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: (n / page_size)..,
-                kv_len: &kv_len_v,
-                pages: &pages_v,
-                page_indptr: &page_indptr_v,
-                w_slot: &w_slot_v,
-                w_off: &w_off_v,
-                positions: &positions_v,
-                mask: None,
-            },
-        }),
-        &rs_set,
-        if rs_set.is_empty() {
-            RsGeometry {
-                fold_len: None,
-                buffer: 0..0,
-            }
-        } else {
-            RsGeometry {
-                fold_len: Some(&fold_len),
-                buffer: 0..run_pages,
-            }
+    verify.state(
+        &[&ws],
+        StateGeometry {
+            slots: Some(&slots_v),
+            kv_len: Some(&kv_len_v),
+            fold: Fold::Count(&fold),
+            ..StateGeometry::default()
         },
     )?;
-    let folds = !rs_set.is_empty();
     verify.epilogue(move || {
         let window = win.take(); // [w] i32
-        let _ = (kv_len_v.take(), page_indptr_v.take(), pages_v.take());
+        let _ = kv_len_v.take();
         let b = base_v.take(); // [1] u32
         let truth = reshape(reduce_argmax(intrinsics::logits()), [w]); // [w] i32
         let i = iota(w);
@@ -330,57 +272,31 @@ async fn main(input: Input) -> Result<Output> {
             select(eq(&i, &mb), broadcast(&correction, [w]), &none),
         );
         out.put(&committed);
-        if folds {
-            // The accepted rows and the correction's own were real.
-            fold_len.put(&(&m + &one));
-        }
+        // The accepted rows and the correction's own were real: the next
+        // verify freezes them.
+        fold.put(&(&m + &one));
 
         // ── the next block: the correction, then noise, at b + m + 1
         lay_block(&correction, &(&b + &m + &one));
     });
 
-    // ── PREFILL: the prompt, chunked; the last chunk's pick anchors ──────
+    // ── PREFILL: the prompt, a pass per readout span; the last one's pick
+    //    anchors, and its epilogue lays out the first block ──────────────
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let mut anchor: i32 = 0;
-    let spans = prefill_chunks(n, None);
+    let spans = readout_spans(n, model::ReadoutKind::Logits);
     let last_span = spans.len() - 1;
     for (at, &(base, end)) in spans.iter().enumerate() {
         let len = end - base;
         let toks = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
         let indptr = Channel::from([0u32, len]).named("embed_indptr_p");
-        let positions = Channel::from_iter(base..end).named("positions_p");
-        let pages = Channel::from_iter(0..max_pages).named("pages_p");
-        let page_indptr = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr_p");
-        let w_slot = Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot_p");
-        let w_off = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_p");
-        let kv_len = Channel::from([end]).named("kv_len_p");
         let readout = Channel::from([len - 1]).named("readout_p");
         let next = Channel::new([1], dtype::i32).named("next_p");
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &indptr)?;
         fwd.readout(&readout)?;
-        fwd.attention(
-            Some(KvBinding {
-                working_set: &ws,
-                geometry: KvGeometry {
-                    readable_pages: ..,
-                    writable_pages: ..,
-                    kv_len: &kv_len,
-                    pages: &pages,
-                    page_indptr: &page_indptr,
-                    w_slot: &w_slot,
-                    w_off: &w_off,
-                    positions: &positions,
-                    mask: None,
-                },
-            }),
-            &rs_set,
-            RsGeometry {
-                fold_len: None,
-                buffer: 0..0,
-            },
-        )?;
+        fwd.state(&[&ws], StateGeometry::folding())?;
         let last = at == last_span;
         fwd.epilogue(move || {
             let t = reshape(reduce_argmax(intrinsics::logits()), [1]);
@@ -390,7 +306,10 @@ async fn main(input: Input) -> Result<Output> {
             next.put(&t);
         });
         fwd.submit(&pipe).context("prefill submit")?;
-        anchor = next.take_host::<Vec<i32>>().await.context("prefill readback")?[0];
+        anchor = next
+            .take_host::<Vec<i32>>()
+            .await
+            .context("prefill readback")?[0];
     }
     if input.report_timing {
         session::send("t0");
@@ -406,8 +325,8 @@ async fn main(input: Input) -> Result<Output> {
         // a frame's slots, so every lane's draft lands in one fire and every
         // lane's verify in the next — fires of one kind, which replay their
         // recorded bodies, where lone passes from lanes out of step mix the
-        // two kinds and run eagerly. The draft folds no recurrence, so the
-        // verify's window verb is the frame's one recurrent slot.
+        // two kinds and run eagerly. The draft freezes nothing, so the
+        // verify's fold is the frame's one.
         let pair = frame_size() >= 2;
         let rounds_ahead = input
             .ahead
@@ -469,7 +388,11 @@ async fn main(input: Input) -> Result<Output> {
         rounds,
         drafted,
         accepted,
-        acceptance_rate: if drafted == 0 { 0.0 } else { accepted as f64 / drafted as f64 },
+        acceptance_rate: if drafted == 0 {
+            0.0
+        } else {
+            accepted as f64 / drafted as f64
+        },
         k,
         block,
     })

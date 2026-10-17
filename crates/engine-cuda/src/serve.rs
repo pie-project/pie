@@ -111,9 +111,22 @@ pub struct Shell {
     runahead: engine::runahead::Runahead,
     programs: ProgramPlane,
     settlement: crate::settle::Settlement,
+    taps: Vec<Option<crate::device::Pinned>>,
     airborne: crate::settle::Airborne,
     owed: Option<GuestBatch>,
     guest_landed: crate::device::graph::Event,
+}
+
+#[derive(Debug)]
+pub(crate) struct KvReport {
+    pub(crate) tag: u64,
+    pub(crate) first_row: u32,
+    pub(crate) tokens: Option<Vec<u32>>,
+    pub(crate) positions: Vec<u32>,
+    pub(crate) pages: Vec<u32>,
+    pub(crate) offsets: Vec<u32>,
+    pub(crate) fold: Option<u32>,
+    pub(crate) fold_at: Option<u64>,
 }
 
 impl Shell {
@@ -136,39 +149,77 @@ impl Shell {
         self.seated_first
     }
 
-    /// Host rs slots, one per device slot so every slot can be parked once.
+    /// Host rs rows: a state slot and a buffer page each, parked apart.
     #[must_use]
     pub fn host_state_slots(&self) -> u32 {
         self.pools.host_rows().0
+    }
+
+    #[must_use]
+    pub fn host_buffer_pages(&self) -> u32 {
+        self.buffers
+            .as_ref()
+            .map_or(0, |_| self.pools.host_rows().0)
+    }
+
+    #[must_use]
+    pub fn buffer_pages(&self) -> u32 {
+        self.buffers.as_ref().map_or(0, Buffers::pages)
     }
 
     fn state_row_bytes(&self) -> u64 {
         self.pools.state_slot_bytes() + self.buffers.as_ref().map_or(0, Buffers::slot_bytes)
     }
 
-    /// Moves whole rs slots, `(device, host)` pairs, out to host rows or
-    /// back: the folded state rows, then the buffered page.
     pub fn copy_state_host(&mut self, to_host: bool, moves: &[(u32, u32)]) -> Result<()> {
         let stream = self.device.stream();
-        let state_bytes = self.pools.state_slot_bytes();
         for &(slot, host) in moves {
-            let row = self.pools.host_row(host)?;
-            let mut at = row;
+            let mut at = self.pools.host_row(host)?;
             for (span, bytes) in self.pools.state_spans(slot)? {
                 let (dst, src) = if to_host { (at, span) } else { (span, at) };
                 crate::device::copy_any(stream, dst, src, bytes as usize)?;
                 at += bytes;
             }
-            if let Some(buffers) = self.buffers.as_mut() {
-                buffers.ensure(&mut self.pools, slot + 1)?;
-                if let Some((span, bytes)) = buffers.page_span(slot) {
-                    let page = row + state_bytes;
-                    let (dst, src) = if to_host { (page, span) } else { (span, page) };
-                    crate::device::copy_any(stream, dst, src, bytes as usize)?;
-                }
-            }
         }
         self.device.synchronize()
+    }
+
+    pub fn copy_pages_host(&mut self, to_host: bool, moves: &[(u32, u32)]) -> Result<()> {
+        let stream = self.device.stream();
+        let state_bytes = self.pools.state_slot_bytes();
+        for &(page, host) in moves {
+            let (span, bytes) = self.page_span(page)?;
+            let at = self.pools.host_row(host)? + state_bytes;
+            let (dst, src) = if to_host { (at, span) } else { (span, at) };
+            crate::device::copy_any(stream, dst, src, bytes as usize)?;
+        }
+        self.device.synchronize()
+    }
+
+    pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
+        let stream = self.device.stream();
+        for &(src, dst) in moves {
+            let (from, bytes) = self.page_span(src)?;
+            let (to, _) = self.page_span(dst)?;
+            crate::device::copy_any(stream, to, from, bytes as usize)?;
+        }
+        self.device.synchronize()
+    }
+
+    fn page_span(&mut self, page: u32) -> Result<(u64, u64)> {
+        let Some(buffers) = self.buffers.as_mut() else {
+            return Err(Fault::Ceiling {
+                what: "rs buffer pages",
+                need: u64::from(page) + 1,
+                have: 0,
+            });
+        };
+        buffers.ensure(&mut self.pools, page + 1)?;
+        buffers.page_span(page).ok_or(Fault::Ceiling {
+            what: "rs buffer pages",
+            need: u64::from(page) + 1,
+            have: u64::from(buffers.pages()),
+        })
     }
     /// Copies full pages and token cells in the full kv rows. A windowed
     /// row's pages are named by the fire that reads them, so cells moved
@@ -185,9 +236,17 @@ impl Shell {
     }
 
     /// Pins this rank's host pool: one rs row per device slot, then kv
-    /// pages, then windowed pages, from `stated` bytes (or one device pool's
-    /// worth of each) shared by `ranks`, within the host memory the load left.
-    pub fn seat_host_kv(&mut self, stated: Option<u64>, ranks: u32) -> Result<u32> {
+    /// pages, then windowed pages, from `stated` bytes shared by `ranks`,
+    /// within the host memory the load left. Unstated, it holds `seats`
+    /// sequences at `context` tokens, and at least one device pool's worth
+    /// of each.
+    pub fn seat_host_kv(
+        &mut self,
+        stated: Option<u64>,
+        seats: u32,
+        context: u32,
+        ranks: u32,
+    ) -> Result<u32> {
         let ranks = u64::from(ranks.max(1));
         let row = self.state_row_bytes();
         let rows = if row > 0 {
@@ -204,7 +263,10 @@ impl Shell {
             0
         };
         let whole = u64::from(rows) * row + pages * page + window_pages * window_page;
-        let asked = stated.map_or(whole, |bytes| bytes / ranks);
+        let page_tokens = u64::from(self.pools.paging().page_size.max(1));
+        let seated = u64::from(rows) * row
+            + u64::from(seats) * u64::from(context).div_ceil(page_tokens) * page;
+        let asked = stated.map_or(whole.max(seated), |bytes| bytes / ranks);
         let budget = asked.min(crate::weights::available_memory() / ranks);
         let (rows, pages, window_pages) =
             crate::store::host_pool(budget, rows, row, pages, page, window_pages, window_page);
@@ -219,13 +281,23 @@ impl Shell {
     /// Opens this rank's share of `budget` disk kv bytes under `dir`.
     pub fn seat_disk_kv(
         &mut self,
-        budget: u64,
+        budget: Option<u64>,
         dir: Option<&std::path::Path>,
         world: crate::World,
     ) -> Result<u32> {
-        if let Some(dir) = dir.filter(|_| budget > 0) {
-            self.pools
-                .seat_disk(dir, world.rank, budget / u64::from(world.size.max(1)))?;
+        let ranks = u64::from(world.size.max(1));
+        match (budget, dir) {
+            (Some(0), _) | (_, None) => {}
+            (Some(bytes), Some(dir)) => self.pools.seat_disk(dir, world.rank, bytes / ranks)?,
+            (None, Some(dir)) => {
+                let host = u64::from(self.pools.host_pages()) * self.pools.paged_page_bytes();
+                let bytes = host
+                    .saturating_mul(4)
+                    .min(engine::disk::free_space(dir) / 4 / ranks);
+                if self.pools.seat_disk(dir, world.rank, bytes).is_err() {
+                    self.pools.unseat_disk();
+                }
+            }
         }
         Ok(self.pools.disk_pages())
     }
@@ -579,9 +651,8 @@ struct RsFire<'a> {
     write_state: bool,
     predicated: bool,
     truncates: bool,
-    splits: bool,
     buffered: bool,
-    replays: Vec<u32>,
+    reads: Vec<Vec<std::ops::Range<u32>>>,
     rows_ext: u32,
 }
 
@@ -652,6 +723,7 @@ pub struct Prepared<'a> {
     slot: Option<crate::inputs::SlotGuard>,
     lengths: crate::inputs::Staged,
     token_injects: Vec<crate::inputs::TokenInject>,
+    kv_reports: Vec<KvReport>,
     bodied: bool,
     admits: std::sync::Arc<[crate::window::Admit]>,
     /// The key's island bits, so the fire records and replays under the key

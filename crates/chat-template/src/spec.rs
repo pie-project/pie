@@ -21,6 +21,7 @@ pub struct Spec {
     /// ChatML, gemma, hy.
     pub thinking: bool,
     pub preserve_thinking: bool,
+    pub reasoning_effort: bool,
     pub tools: bool,
     pub generation_suffix: String,
     /// ChatML, lines, raw.
@@ -47,6 +48,9 @@ impl Spec {
         if self.preserve_thinking {
             set.push("preserve_thinking");
         }
+        if self.reasoning_effort {
+            set.push("reasoning_effort");
+        }
         if self.tools {
             set.push("tools");
         }
@@ -70,6 +74,7 @@ impl Spec {
             "chatml" => &[
                 "thinking",
                 "preserve_thinking",
+                "reasoning_effort",
                 "tools",
                 "generation_suffix",
                 "stop",
@@ -113,6 +118,7 @@ pub fn build(spec: &Spec, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>
             ChatML {
                 thinking: spec.thinking,
                 preserve_thinking: spec.preserve_thinking,
+                reasoning_effort: spec.reasoning_effort,
                 tools: spec.tools,
                 generation_suffix: spec.generation_suffix.clone(),
                 stop_tokens: spec.stop.clone(),

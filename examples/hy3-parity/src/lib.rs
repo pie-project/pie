@@ -19,7 +19,7 @@
 //! denoise    the canvas: those h*w rows through the `latents` port plus
 //!            ONE <timestep> row the plan lands from the lane's timestep
 //!            vector, bidirectional over [prefix | canvas] against the
-//!            pages `encode` wrote                         -> hidden
+//!            prefix `encode` wrote and froze              -> hidden
 //! image.out  those rows back on the voxel axis through `final_layer`
 //!                                                        -> pixels [h*w, 32]
 //! ```
@@ -41,7 +41,7 @@
 //! ```text
 //! A  prefill(prompt)        -> denoise(t0)   the answer the golden gates
 //! B  prefill(<cfg>-masked)  -> denoise(t0)   THE PREFIX MATTERS
-//! C  A's working set again  -> denoise(t1)   THE PREFIX PAGES ARE FROZEN
+//! C  A's working set again  -> denoise(t1)   THE PREFIX IS FROZEN
 //! D  prefill(prompt) fresh  -> denoise(t1)   ... and C is exactly D
 //! ```
 //!
@@ -58,16 +58,16 @@
 //! harness asserts the canvas MOVED by far more than the gate.
 //!
 //! **C and D are design D10's exactness claim.** After step 0 the prefix
-//! K/V is never recomputed: C fires a second denoise over A's pages, whose
-//! canvas slots step 0 already wrote and whose prefix pages nothing has
-//! touched. D does the same step from a fresh prefill. The two must agree
+//! K/V is never recomputed: C fires a second denoise over A's working set,
+//! whose canvas slots step 0 already wrote and whose frozen prefix nothing
+//! has touched. D does the same step from a fresh prefill. The two must agree
 //! to the last bit, and the harness gates on it.
 //!
 //! # The canvas lane
 //!
-//! `h*w + 1` rows, the `<timestep>` row FIRST: the CUDA fire path derives a
-//! lane's KV positions as `held .. held + rows` and refuses an explicit
-//! list by name, so the lane's rows must BE the sequence's own run. The
+//! `h*w + 1` rows, the `<timestep>` row FIRST: a lane's rows write
+//! consecutive slots, so the lane's rows must BE the sequence's own run,
+//! rewritten in place on every step (the canvas is buffer, never folded). The
 //! `special` port flags the row the plan overwrites with `timestep_emb(t)`;
 //! every other row takes its `latents` row.
 //!
@@ -159,7 +159,7 @@ struct Output {
     /// The same fire over the `<cfg>`-masked prefix: the harness asserts
     /// this is FAR from `canvas_hidden`.
     canvas_hidden_uncond: Vec<f32>,
-    /// Step 1 over the frozen prefix pages, and step 1 from a fresh
+    /// Step 1 over the frozen prefix, and step 1 from a fresh
     /// prefill: the harness asserts these agree exactly.
     canvas_hidden_reused: Vec<f32>,
     canvas_hidden_fresh: Vec<f32>,
@@ -196,15 +196,11 @@ struct Shape {
     prefix_len: u32,
     canvas_len: u32,
     kv_len: u32,
-    page_size: u32,
-    max_pages: u32,
     /// The sequence index of the `<timestep>` row — the causal bound of the
     /// one row that is not bidirectional.
     t_at: u32,
 }
 
-/// One causal `encode` fire over `ids`, whose K/V become the sequence.
-/// Answers the per-row argmax and winning logit.
 fn prefill(
     case: &Case,
     shape: &Shape,
@@ -217,17 +213,8 @@ fn prefill(
     let n = shape.prefix_len;
     let toks = Channel::from(ids.to_vec()).named(&format!("prefix_ids_{tag}"));
     let indptr = Channel::from([0u32, n]).named(&format!("prefix_indptr_{tag}"));
-    let kv_positions = Channel::from_iter(0..n).named(&format!("prefix_kv_positions_{tag}"));
     let rope = Channel::from_shaped([n, shape.axes], case.prefix_positions.as_slice())
         .named(&format!("prefix_positions_{tag}"));
-    let pages = Channel::from_iter(0..shape.max_pages).named(&format!("prefix_pages_{tag}"));
-    let page_indptr = Channel::from([0u32, n.div_ceil(shape.page_size)])
-        .named(&format!("prefix_page_indptr_{tag}"));
-    let slot = Channel::from_iter((0..n).map(|p| p / shape.page_size))
-        .named(&format!("prefix_w_slot_{tag}"));
-    let off = Channel::from_iter((0..n).map(|p| p % shape.page_size))
-        .named(&format!("prefix_w_off_{tag}"));
-    let kv_len = Channel::from([n]).named(&format!("prefix_kv_len_{tag}"));
     let readout = Channel::from_iter(0..n).named(&format!("prefix_readout_{tag}"));
     let argmax = Channel::new([n], dtype::i32).named(&format!("encode_argmax_{tag}"));
     let max = Channel::new([n], dtype::f32).named(&format!("encode_max_{tag}"));
@@ -237,20 +224,7 @@ fn prefill(
     pass.canvas(Mode::Encode)?;
     pass.embed(&toks, &indptr)?;
     pass.input(&port_of(encode, "positions")?, &rope)?;
-    pass.attention(
-        ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &kv_len,
-            pages: &pages,
-            page_indptr: &page_indptr,
-            w_slot: &slot,
-            w_off: &off,
-            positions: &kv_positions,
-            mask: None,
-        },
-    )?;
+    pass.state(&[ws], StateGeometry::folding())?;
     // Every row reads out: the default is the lane's LAST row, and the
     // golden's logits are the whole causal pass.
     pass.readout(&readout)?;
@@ -265,7 +239,7 @@ fn prefill(
     Ok((argmax, max))
 }
 
-/// One `denoise` fire over `ws`'s pages at `timestep`: the canvas lane's
+/// One `denoise` fire over `ws`'s prefix at `timestep`: the canvas lane's
 /// `h*w + 1` rows, read back on the `hidden` seam.
 #[allow(clippy::too_many_arguments)]
 fn denoise_step(
@@ -305,16 +279,7 @@ fn denoise_step(
     let t = Channel::from([timestep]).named(&name("timestep"));
     let rope = Channel::from_shaped([canvas_len, shape.axes], case.canvas_positions.as_slice())
         .named(&name("positions"));
-    let kv_positions = Channel::from(case.canvas_sequence.clone()).named(&name("kv_positions"));
-    // Its OWN page list: a seeded channel attaches to one pass only.
-    let pages = Channel::from_iter(0..shape.max_pages).named(&name("pages"));
-    let page_indptr =
-        Channel::from([0u32, kv_len.div_ceil(shape.page_size)]).named(&name("page_indptr"));
-    let slot = Channel::from_iter(case.canvas_sequence.iter().map(|p| p / shape.page_size))
-        .named(&name("w_slot"));
-    let off = Channel::from_iter(case.canvas_sequence.iter().map(|p| p % shape.page_size))
-        .named(&name("w_off"));
-    let len = Channel::from([kv_len]).named(&name("kv_len"));
+    let slots = Channel::from(case.canvas_sequence.clone()).named(&name("slots"));
     let slab = Channel::from_shaped([canvas_len, kv_len], mask.as_slice()).named(&name("mask"));
     let readout = Channel::from_iter(0..canvas_len).named(&name("readout"));
     let out = Channel::new([canvas_len, case.hidden], dtype::f32).named(&name("hidden"));
@@ -328,18 +293,12 @@ fn denoise_step(
     pass.input(&port_of(denoise, "special")?, &flag)?;
     pass.input(&port_of(denoise, "timestep")?, &t)?;
     pass.input(&port_of(denoise, "positions")?, &rope)?;
-    pass.attention(
-        ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &len,
-            pages: &pages,
-            page_indptr: &page_indptr,
-            w_slot: &slot,
-            w_off: &off,
-            positions: &kv_positions,
+    pass.state(
+        &[ws],
+        StateGeometry {
+            slots: Some(&slots),
             mask: Some(&slab),
+            ..StateGeometry::default()
         },
     )?;
     pass.readout(&readout)?;
@@ -464,7 +423,6 @@ async fn main(input: Input) -> Result<Output> {
         .max()
         .ok_or("an empty canvas")?
         + 1;
-    let page_size = kv_page_size();
     let shape = Shape {
         axes: encode
             .ports
@@ -475,15 +433,9 @@ async fn main(input: Input) -> Result<Output> {
         prefix_len,
         canvas_len,
         kv_len,
-        page_size,
-        max_pages: kv_len.div_ceil(page_size).max(1),
         t_at: case.canvas_sequence[0],
     };
 
-    let reserve = |ws: &WorkingSet| -> Result<()> {
-        ws.reserve(shape.max_pages).context("reserve KV")?;
-        Ok(())
-    };
     let pipe = Pipeline::new();
 
     // ---- the image head, going in: `patch_embed` on the voxel axis -------
@@ -509,7 +461,6 @@ async fn main(input: Input) -> Result<Output> {
 
     // ---- A: the prompt's prefix, then step 0 -----------------------------
     let ws_a = WorkingSet::new();
-    reserve(&ws_a)?;
     let (argmax, max) = prefill(&case, &shape, &encode, &ws_a, &pipe, &case.prefix, "a")?;
     let a = denoise_step(
         &case,
@@ -527,7 +478,6 @@ async fn main(input: Input) -> Result<Output> {
 
     // ---- B: the SAME step over the unconditional prefix -------------------
     let ws_b = WorkingSet::new();
-    reserve(&ws_b)?;
     prefill(&case, &shape, &encode, &ws_b, &pipe, &case.prefix_alt, "b")?;
     let b = denoise_step(
         &case,
@@ -541,7 +491,7 @@ async fn main(input: Input) -> Result<Output> {
     )?;
     let canvas_hidden_uncond = b.take_host::<Vec<f32>>().await?;
 
-    // ---- C: step 1 over A's pages, whose prefix nothing has touched -------
+    // ---- C: step 1 over A's working set, whose prefix nothing has touched -
     let c = denoise_step(
         &case,
         &shape,
@@ -556,7 +506,6 @@ async fn main(input: Input) -> Result<Output> {
 
     // ---- D: the same step from a fresh prefill ----------------------------
     let ws_d = WorkingSet::new();
-    reserve(&ws_d)?;
     prefill(&case, &shape, &encode, &ws_d, &pipe, &case.prefix, "d")?;
     let d = denoise_step(
         &case,

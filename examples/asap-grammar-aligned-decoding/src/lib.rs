@@ -57,11 +57,10 @@
 //! Faithfulness: **Exact (equivalent form)** — the paper's `EXPAND` walks a
 //! shared trie in place; this rebuilds the path each round from the stored
 //! `Vec<Vec<u32>>` of approximations, which is the same recurrence with
-//! different storage. See
-//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+//! different storage.
 
 use inferlet::chat;
-use inferlet::eta::hybrid::prelude::*;
+use inferlet::eta::prelude::*;
 use inferlet::grammar::{Grammar, Matcher};
 use inferlet::mask::unpack_mask;
 use serde::{Deserialize, Serialize};
@@ -236,37 +235,13 @@ async fn main(input: Input) -> Result<Output> {
         let root_alpha_before = trie.alpha[0];
         let constraint = Matcher::new(&Grammar::from_json_schema(&input.schema)?);
 
-        // A fresh KV state per round: ASAp resamples the whole string, and a
+        // A fresh state per round: ASAp resamples the whole string, and a
         // WorkingSet permanently claims the first pipeline it fires on, so all
         // rounds share this inferlet's single pipeline.
         let ws = WorkingSet::new();
-        // The recurrent half of that fresh state: one working set per round,
-        // because each round is a fresh sequence (the engine wants one per
-        // request row). Empty on a pure-attention model.
-        let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
-            model::ForwardKind::Attention => Vec::new(),
-            model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
-            model::ForwardKind::Recurrent => {
-                return Err(
-                    "ASAp needs a KV cache; this model's forward pass is recurrent-only".into(),
-                );
-            }
-            model::ForwardKind::Diffusion => {
-                return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
-            }
-        };
-        let page_size = kv_page_size();
-        let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
-        ws.reserve(max_pages).context("reserve KV")?;
 
         let prompt_tokens = Channel::from_iter(prompt.iter().map(|&t| t as i32));
         let pre_indptr = Channel::from([0u32, n]).named("pre_indptr");
-        let pre_positions = Channel::from_iter(0..n).named("pre_positions");
-        let pre_pages = Channel::from_iter(0..max_pages).named("pre_pages");
-        let pre_page_indptr = Channel::from([0u32, n.div_ceil(page_size)]).named("pre_page_indptr");
-        let pre_w_slot = Channel::from_iter((0..n).map(|p| p / page_size)).named("pre_w_slot");
-        let pre_w_off = Channel::from_iter((0..n).map(|p| p % page_size)).named("pre_w_off");
-        let pre_kv_len = Channel::from([n]).named("pre_kv_len");
         let pre_mask = Channel::new([vocab], dtype::bool).named("pre_mask");
         let pre_alpha_idx = Channel::new([pairs as u32], dtype::u32).named("pre_alpha_idx");
         let pre_alpha_val = Channel::new([pairs as u32], dtype::f32).named("pre_alpha_val");
@@ -278,27 +253,7 @@ async fn main(input: Input) -> Result<Output> {
 
         let prefill = ForwardPass::new();
         prefill.embed(&prompt_tokens, &pre_indptr)?;
-        prefill.attention(
-            Some(KvBinding {
-                working_set: &ws,
-                geometry: KvGeometry {
-                    readable_pages: ..,
-                    writable_pages: ..,
-                    kv_len: &pre_kv_len,
-                    pages: &pre_pages,
-                    page_indptr: &pre_page_indptr,
-                    w_slot: &pre_w_slot,
-                    w_off: &pre_w_off,
-                    positions: &pre_positions,
-                    mask: None,
-                },
-            }),
-            &rs_ws,
-            RsGeometry {
-                fold_len: None,
-                buffer: 0..0,
-            },
-        )?;
+        prefill.state(&[&ws], StateGeometry::folding())?;
         prefill.epilogue(move || {
             let allowed = pre_mask.take();
             let idx = pre_alpha_idx.take();
@@ -336,13 +291,6 @@ async fn main(input: Input) -> Result<Output> {
         if !constraint.is_terminated() && generated.len() < input.max_tokens {
             let token_in = Channel::from([first]).named("token_in");
             let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
-            let positions = Channel::from([n]).named("positions");
-            let pages = Channel::from_iter(0..max_pages).named("pages");
-            let page_indptr =
-                Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-            let w_slot = Channel::from([n / page_size]).named("w_slot");
-            let w_off = Channel::from([n % page_size]).named("w_off");
-            let kv_len = Channel::from([n + 1]).named("kv_len");
             let mask_ch = Channel::new([vocab], dtype::bool).named("mask");
             let alpha_idx = Channel::new([pairs as u32], dtype::u32).named("alpha_idx");
             let alpha_val = Channel::new([pairs as u32], dtype::f32).named("alpha_val");
@@ -355,29 +303,8 @@ async fn main(input: Input) -> Result<Output> {
 
             let decode = ForwardPass::new();
             decode.embed(&token_in, &embed_indptr)?;
-            decode.attention(
-                Some(KvBinding {
-                    working_set: &ws,
-                    geometry: KvGeometry {
-                        readable_pages: ..,
-                        writable_pages: (n / page_size)..,
-                        kv_len: &kv_len,
-                        pages: &pages,
-                        page_indptr: &page_indptr,
-                        w_slot: &w_slot,
-                        w_off: &w_off,
-                        positions: &positions,
-                        mask: None,
-                    },
-                }),
-                &rs_ws,
-                RsGeometry {
-                    fold_len: None,
-                    buffer: 0..0,
-                },
-            )?;
+            decode.state(&[&ws], StateGeometry::folding())?;
             decode.epilogue(move || {
-                let length = kv_len.take();
                 let allowed = mask_ch.take();
                 let idx = alpha_idx.take();
                 let val = alpha_val.take();
@@ -385,14 +312,7 @@ async fn main(input: Input) -> Result<Output> {
                 let (token, mass, prob, wmass) =
                     asap_step(intrinsics::logits(), vocab, &allowed, &idx, &val, &r);
 
-                let next_length = &length + 1u32;
-                let page_count = next_length.div_ceil(page_size);
                 token_in.put(&token);
-                kv_len.put(&next_length);
-                positions.put(&length);
-                w_slot.put(&length / page_size);
-                w_off.put(&length % page_size);
-                page_indptr.put(indptr(1, &page_count));
                 rng.put(&r + iota(2));
                 token_out.put(&token);
                 mass_out.put(&mass);

@@ -32,7 +32,13 @@ Event = Union[Event_Delta, Event_Interrupt, Event_Done]
 
 
 class Decoder:
+    """
+    Classifies generated tokens.
+    """
     
+    def __init__(self) -> None:
+        raise NotImplementedError
+
     def feed(self, tokens: List[int]) -> Event:
         """
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
@@ -52,6 +58,13 @@ class Decoder:
 
 
 
+def prefix() -> List[int]:
+    """
+    The tokens a conversation or a raw completion prompt starts with —
+    `<bos>` where the model needs one, empty otherwise. The role fillers
+    below include it; a raw prompt is `prefix() ++ encode(text)`.
+    """
+    raise NotImplementedError
 def system(message: str) -> List[int]:
     """
     Fill roles for history replay
@@ -70,6 +83,13 @@ def cue() -> List[int]:
     Cue the model to generate (fills generation header)
     """
     raise NotImplementedError
+def cue_without_thinking() -> List[int]:
+    """
+    `cue` for a turn the model answers without thinking: an empty thinking
+    block where the model has one, as its template renders
+    `enable_thinking: false`.
+    """
+    raise NotImplementedError
 def seal() -> List[int]:
     """
     Seal the current turn (insert stop token)
@@ -78,10 +98,5 @@ def seal() -> List[int]:
 def stop_tokens() -> List[int]:
     """
     Returns the stop token IDs for the model
-    """
-    raise NotImplementedError
-def create_decoder() -> Decoder:
-    """
-    Create a decoder to classify generated tokens
     """
     raise NotImplementedError

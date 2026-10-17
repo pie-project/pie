@@ -12,6 +12,16 @@ import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
 
+@dataclass
+class Token:
+    """
+    One entry of a token table: the id the model uses and the raw bytes it
+    stands for. A record rather than two parallel lists, so a caller cannot
+    zip them wrong and no comment is needed to say which is which.
+    """
+    id: int
+    bytes: bytes
+
 
 def encode(text: str) -> List[int]:
     """
@@ -27,9 +37,31 @@ def decode(tokens: List[int]) -> str:
     Raises: `componentize_py_types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError
-def vocabs() -> Tuple[List[int], List[bytes]]:
+def vocabs() -> List[Token]:
     """
-    Returns the model's vocabulary as a list of byte sequences (tokens)
+    Returns the model's vocabulary
+    
+    IT IS THE EXPENSIVE DOOR, AND MOST CALLERS WANT ONE OF THE TWO BELOW.
+    A vocabulary is a quarter of a million records; lowering that list
+    across this boundary and looping over it guest-side cost token healing
+    ~115 ms on every launch (palo build log 23), to answer a byte-prefix
+    question the host can answer by scanning a table it already holds.
+    """
+    raise NotImplementedError
+def token_bytes(tokens: List[int]) -> List[bytes]:
+    """
+    The raw bytes each of `tokens` stands for, in order. An id the
+    vocabulary does not hold answers an empty list, which is what indexing
+    a table built from `vocabs` gave for the same id.
+    """
+    raise NotImplementedError
+def tokens_with_prefix(prefix: bytes) -> List[int]:
+    """
+    Every token id whose bytes begin with `prefix`, ascending.
+    
+    The host-side spelling of the loop a caller would otherwise write over
+    `vocabs`, and the answer is the same set. An empty prefix matches every
+    token in the vocabulary, because every byte string starts with nothing.
     """
     raise NotImplementedError
 def split_regex() -> str:
@@ -37,7 +69,7 @@ def split_regex() -> str:
     Returns the split regular expression used by the tokenizer
     """
     raise NotImplementedError
-def special_tokens() -> Tuple[List[int], List[bytes]]:
+def special_tokens() -> List[Token]:
     """
     Returns the special tokens recognized by the model
     """

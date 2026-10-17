@@ -14,5 +14,3 @@ qmm = [
 moe.path        = "mpp"
 sdpa.prefill    = "mpp"
 gdn.scan        = { use = "staged", min_rows = 32 }
-ane.mlp         = [{ when = "ane", use = "units", units = 8 }, "gpu"]
-ane.projections = [{ when = "ane", use = "share", percent = 47 }, "gpu"]

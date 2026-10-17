@@ -10,8 +10,7 @@ Trenton Bricken, ***Tail Free Sampling*** (2019) —
 llama.cpp `src/llama-sampler.cpp` and oobabooga/text-generation-webui
 `modules/sampler_hijack.py`.
 
-**Faithfulness: Exact (equivalent form).** See
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+**Faithfulness: Exact (equivalent form).**
 
 ## What it does
 

@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::OwnedSemaphorePermit;
+
+use super::ordered::OrderedPermit;
 use wasmtime::component::{ResourceAny, ResourceTable};
 #[cfg(not(target_arch = "wasm32"))]
 use wasmtime_wasi::FsPerms;
@@ -44,10 +45,10 @@ pub struct ProcessCtx {
 
     guest_resource_map: Vec<(ResourceAny, u32)>,
     residency: Arc<Mutex<ProcessResidency>>,
-    prewarm_permit: Option<OwnedSemaphorePermit>,
-    bind_permit: Option<OwnedSemaphorePermit>,
+    prewarm_permit: Option<OrderedPermit>,
+    props: client_api::Props,
     bind_admitted: bool,
-    execution_permit: Option<OwnedSemaphorePermit>,
+    execution_seated: bool,
     execution_admitted: bool,
     admission_wait_us: u64,
     residency_flag: Option<Arc<AtomicBool>>,
@@ -56,16 +57,18 @@ pub struct ProcessCtx {
 
 impl Drop for ProcessCtx {
     fn drop(&mut self) {
-        let execution_permit = self.execution_permit.take();
-        let bind_permit = self.bind_permit.take();
+        let seated = std::mem::take(&mut self.execution_seated);
+        // A paused process gave its permits back already.
+        let mut seat = super::take_permits(self.id);
+        let bind_permit = seat.as_mut().and_then(|seat| seat.bind.take());
         self.execution_admitted = false;
         self.bind_admitted = false;
-        let terminate_fences = execution_permit.as_ref().map(|_| {
-            let fences = crate::scheduler::worker::post_process_terminate_fenced(self.id);
+        let terminate_fences =
+            seated.then(|| crate::scheduler::worker::post_process_terminate_fenced(self.id));
+        if seat.as_ref().is_some_and(|seat| seat.exec.is_some()) {
             crate::scheduler::worker::notify_execution_slot_released(self.id);
-            fences
-        });
-        drop(execution_permit);
+        }
+        drop(seat);
         let resources = std::mem::replace(&mut self.resource_table, ResourceTable::new());
         super::teardown::defer_resource_teardown(
             self.id,
@@ -216,9 +219,9 @@ impl ProcessCtx {
                 residency
             },
             prewarm_permit: None,
-            bind_permit: None,
+            props: client_api::Props::new(),
             bind_admitted: false,
-            execution_permit: None,
+            execution_seated: false,
             execution_admitted: false,
             admission_wait_us: 0,
             residency_flag: None,
@@ -249,8 +252,16 @@ impl ProcessCtx {
         }
     }
 
-    pub(crate) fn install_prewarm_permit(&mut self, permit: Option<OwnedSemaphorePermit>) {
+    pub(crate) fn install_prewarm_permit(&mut self, permit: Option<OrderedPermit>) {
         self.prewarm_permit = permit;
+    }
+
+    pub(crate) fn props(&self) -> &client_api::Props {
+        &self.props
+    }
+
+    pub(crate) fn set_props(&mut self, props: client_api::Props) {
+        self.props = props;
     }
 
     pub(crate) fn release_prewarm_permit(&mut self) {
@@ -265,14 +276,13 @@ impl ProcessCtx {
         self.bind_admitted
     }
 
-    pub(crate) fn admit_bind(&mut self, permit: Option<OwnedSemaphorePermit>) {
-        self.bind_permit = permit;
+    pub(crate) fn admit_bind(&mut self) {
         self.bind_admitted = true;
         self.prewarm_permit = None;
     }
 
-    pub(crate) fn admit_execution(&mut self, permit: Option<OwnedSemaphorePermit>, wait_us: u64) {
-        self.execution_permit = permit;
+    pub(crate) fn admit_execution(&mut self, seated: bool, wait_us: u64) {
+        self.execution_seated = seated;
         self.execution_admitted = true;
         self.admission_wait_us = wait_us;
         self.prewarm_permit = None;
@@ -300,6 +310,13 @@ impl ProcessCtx {
             .unwrap()
             .kv_working_sets
             .insert((ws.model, ws.engine, ws.id), ws.suspend_handle());
+        let stores = crate::store::registry::get(ws.model, ws.engine);
+        let owned = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+            kv.set_owner(ws.id, self.id())
+        });
+        if let Err(error) = owned {
+            tracing::warn!(pid = %self.id(), %error, "a working set has no owner");
+        }
     }
 
     pub(crate) fn unregister_kv_working_set(

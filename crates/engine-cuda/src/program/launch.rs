@@ -985,8 +985,6 @@ impl Prepared {
                 &mut table_host,
                 at,
                 &LaneRecord {
-                    kv_len: extents.kv_len,
-                    page_count: extents.page_count,
                     row_count: extents.row_count,
                     token_count: extents.token_count,
                     sampled_rows: extents.sampled_rows,

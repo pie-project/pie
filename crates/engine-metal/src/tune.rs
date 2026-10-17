@@ -61,13 +61,13 @@ const CENSUS: &[(u32, u32, u32)] = &[
     (6656, 19968, 52),
     (8192, 4096, 202),
     (5376, 8192, 150),
+    (30720, 3840, 48),
     (12288, 4096, 104),
     (8192, 2816, 225),
     (4096, 12288, 88),
-    (4096, 2048, 472),
+    (12288, 2048, 164),
+    (4096, 2048, 478),
     (2560, 6144, 246),
-    (16384, 4096, 57),
-    (20480, 5376, 30),
 ];
 
 struct Grid {
@@ -105,7 +105,7 @@ impl Grid {
                 // Small shapes too: a crossover learned on large banks alone
                 // misplaces small ones.
                 shapes: shapes(
-                    [0, 1, 2, 3, 9, 15, 20, 21]
+                    [0, 1, 2, 3, 9, 15, 22, 23]
                         .iter()
                         .map(|&i| CENSUS[i])
                         .collect(),
@@ -180,6 +180,7 @@ fn candidates(base: &Profile) -> Vec<Qmm> {
         });
     }
     out.push(Qmm::Staged);
+    out.push(Qmm::Register);
     for q in base.ladder::<Qmm>().values() {
         if !out.contains(q) {
             out.push(*q);
@@ -192,6 +193,7 @@ fn body(q: &Qmm) -> String {
     match *q {
         Qmm::Mpp => "use = \"mpp\"".to_string(),
         Qmm::Staged => "use = \"staged\"".to_string(),
+        Qmm::Register => "use = \"register\"".to_string(),
         Qmm::Tiled { crossover_tg } => format!("use = \"tiled\", crossover_tg = {crossover_tg}"),
         Qmm::Qmv {
             rows_max,
@@ -221,10 +223,19 @@ fn ran(files: &[&str], q: &Qmm) -> bool {
     match q {
         Qmm::Mpp => has("quant_qmm_mpp"),
         Qmm::Staged => has("quant_qmm_staged"),
+        Qmm::Register => has("quant_qmm_sg"),
         Qmm::Tiled { .. } => {
-            !has("quant_qmm_mpp") && !has("quant_qmm_staged") && has("quant_qmm_t")
+            !has("quant_qmm_mpp")
+                && !has("quant_qmm_staged")
+                && !has("quant_qmm_sg")
+                && has("quant_qmm_t")
         }
-        Qmm::Qmv { .. } => !has("quant_qmm_mpp") && !has("quant_qmm_staged") && !has("quant_qmm_t"),
+        Qmm::Qmv { .. } => {
+            !has("quant_qmm_mpp")
+                && !has("quant_qmm_staged")
+                && !has("quant_qmm_sg")
+                && !has("quant_qmm_t")
+        }
     }
 }
 
@@ -1298,7 +1309,7 @@ mod tests {
                     let times = candidates
                         .iter()
                         .map(|q| match *q {
-                            Qmm::Mpp | Qmm::Staged => None,
+                            Qmm::Mpp | Qmm::Staged | Qmm::Register => None,
                             Qmm::Tiled { crossover_tg } => {
                                 (rows >= 4).then(|| 12.0 + f64::from(crossover_tg) / 1000.0)
                             }

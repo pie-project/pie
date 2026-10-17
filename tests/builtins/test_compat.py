@@ -336,7 +336,9 @@ def test_bad_requests(http: Http):
         http,
         messages=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}],
     )
-    assert status == 400 and "image_url" in json.loads(text)["error"]["message"], text
+    assert status == 400, (status, text)
+    err = json.loads(text)["error"]
+    assert err["param"] == "messages[0]" and "data:" in err["message"], err
 
     status, _, text = http.post("/v1/chat/completions", {"messages": "nope"})
     assert status == 400, text

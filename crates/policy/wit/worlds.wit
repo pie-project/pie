@@ -1,0 +1,17 @@
+package plex:policy@1.0.0;
+
+/// Runs at the cluster's front door: pie's gateway.
+world router {
+    import reads;
+    import writes;
+    import router-writes;
+    export policy;
+}
+
+/// Runs inside each worker: pie's runtime.
+world engine {
+    import reads;
+    import writes;
+    import engine-writes;
+    export policy;
+}

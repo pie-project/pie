@@ -3,13 +3,14 @@ use kernels_wgpu::linear::moe::RoutedScratch;
 use kernels_wgpu::{
     Bank, Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor,
 };
+use poem_exec::fire::At;
 use poem_ir::{Def, Dim, Dtype, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
 use crate::device::Handles;
 use crate::device::ctx::Frame;
 use crate::dispatch::copy::CopyPlan;
 use crate::scratch::Scratch;
-use crate::window::{At, Window, Windows};
+use crate::window::{Window, Windows};
 
 type Seated = (Option<Bank>, Option<Tensor>, Tensor);
 

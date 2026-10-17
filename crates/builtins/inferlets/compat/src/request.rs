@@ -99,6 +99,7 @@ pub struct Request {
     pub stop: Vec<String>,
     pub thinking: Thinking,
     pub stream: bool,
+    pub ignore_eos: bool,
 }
 
 /// The cap when a request names none. OpenAI's default is "up to the
@@ -119,6 +120,7 @@ impl Request {
             stop: Vec::new(),
             thinking: Thinking::ModelDefault,
             stream: false,
+            ignore_eos: false,
         }
     }
 

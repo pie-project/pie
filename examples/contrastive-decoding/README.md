@@ -50,14 +50,12 @@ pick         = argmax score(x) over plausible tokens
 
 ## Implementation notes
 
-The amateur and expert use separate KV working sets. The amateur attends only a
+The amateur and expert use separate working sets. The amateur attends only a
 sliding `amateur_window`; the expert attends the complete context. The amateur
 logits are passed through a host `Writer` channel into the expert epilogue, where
 the contrastive argmax runs in ETA.
 
-This loop is structurally depth-1, as noted in
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`:
-the amateur input for step `k + 1` is the expert's just-selected output token from
+This loop is structurally depth-1: the amateur input for step `k + 1` is the expert's just-selected output token from
 step `k`, so the decode loop cannot run ahead. That is an algorithmic dependency,
 not a missing optimization.
 

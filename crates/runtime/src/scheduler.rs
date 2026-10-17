@@ -16,8 +16,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 
 pub(crate) use dispatch::{
-    TierKind, TierMove, close_channels, copy_kv_cells, copy_tier_tracked,
-    register_channels_bind_classified,
+    TierKind, TierMove, close_channels, copy_tier_tracked, register_channels_bind_classified,
 };
 pub use stats::{AggregateStats, HostSubmitStats};
 pub use worker::BatchScheduler;
@@ -238,37 +237,6 @@ pub async fn spawn(engine_indices: &[usize], page_size: u32) -> Result<Scheduler
     Ok(SchedulerShutdownHandle { schedulers })
 }
 
-fn rs_state_copy_plan(
-    src_slots: Vec<u32>,
-    dst_slots: Vec<u32>,
-) -> Result<Option<::engine::StateCopy>> {
-    if src_slots.len() != dst_slots.len() {
-        return Err(anyhow!(
-            "recurrent-state copy source/destination lengths differ: {} != {}",
-            src_slots.len(),
-            dst_slots.len()
-        ));
-    }
-    if src_slots.is_empty() {
-        return Ok(None);
-    }
-    let slot_ranges = src_slots
-        .into_iter()
-        .zip(dst_slots)
-        .map(|(src_slot_id, dst_slot_id)| ::engine::StateMove {
-            src_slot_id,
-            dst_slot_id,
-            src_token_offset: 0,
-            dst_token_offset: 0,
-            token_count: 0,
-        })
-        .collect();
-    Ok(Some(::engine::StateCopy {
-        moves: slot_ranges,
-        ..::engine::StateCopy::default()
-    }))
-}
-
 pub(crate) fn device_domain(engine_idx: usize) -> ::engine::MemoryDomain {
     crate::engine::get_spec(engine_idx)
         .map_or(::engine::MemoryDomain::HostPinned, |s| s.device_domain)
@@ -344,8 +312,7 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     completion: crate::engine::WorkItemCompletion,
     copy_src: Vec<u32>,
     copy_dst: Vec<u32>,
-    rs_copy_src: Vec<u32>,
-    rs_copy_dst: Vec<u32>,
+    rs_copy: Option<::engine::StateCopy>,
     frame: Option<FrameStamp>,
     hook_program: bool,
     lora_program: bool,
@@ -365,7 +332,7 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         process_id,
         pipeline_id,
         prelaunch_copy,
-        rs_state_copy_plan(rs_copy_src, rs_copy_dst)?,
+        rs_copy,
         frame,
         hook_program,
         lora_program,
@@ -380,6 +347,46 @@ pub async fn get_stats() -> AggregateStats {
         .filter_map(|slot| slot.as_ref().map(|handle| handle.stats()))
         .collect();
     stats::aggregate(&scheduler_stats)
+}
+
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(dead_code, reason = "no policy runs in the browser")
+)]
+pub(crate) fn last_batch_us() -> Option<u64> {
+    handle_registry()
+        .read()
+        .unwrap()
+        .iter()
+        .flatten()
+        .map(|handle| {
+            handle
+                .stats()
+                .last_batch_latency_us
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .filter(|&us| us > 0)
+        .max()
+}
+
+/// The processes in each engine's last fire, summed over engines.
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(dead_code, reason = "no policy runs in the browser")
+)]
+pub(crate) fn last_batch_size() -> u64 {
+    handle_registry()
+        .read()
+        .unwrap()
+        .iter()
+        .flatten()
+        .map(|handle| {
+            handle
+                .stats()
+                .last_batch_size
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .sum()
 }
 
 #[cfg(test)]

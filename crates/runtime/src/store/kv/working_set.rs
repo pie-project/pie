@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use super::page_table::WorkingSetId;
@@ -158,8 +158,6 @@ pub struct KvWorkingSet {
     pub engine: EngineId,
     pub id: WorkingSetId,
     pub page_size: u32,
-    page_len: Arc<AtomicU64>,
-    translation: Arc<crate::store::kv::KvTranslation>,
     lifecycle: Arc<KvLifecycle>,
 }
 
@@ -175,23 +173,11 @@ impl KvWorkingSet {
         page_size: u32,
         pipeline_scope: Option<crate::store::PipelineScope>,
     ) -> Self {
-        let stores = crate::store::registry::get(model, engine);
-        let (translation, page_len) =
-            crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
-                (
-                    kv.translation(id)
-                        .expect("new working set has a translation state"),
-                    kv.page_len_mirror(id)
-                        .expect("new working set has a page-length mirror"),
-                )
-            });
         KvWorkingSet {
             model,
             engine,
             id,
             page_size,
-            page_len,
-            translation,
             lifecycle: Arc::new(KvLifecycle {
                 released: AtomicBool::new(false),
                 release_requested: AtomicBool::new(false),
@@ -206,13 +192,6 @@ impl KvWorkingSet {
         }
     }
 
-    pub fn page_len(&self) -> Result<u64, crate::store::kv::KvTableError> {
-        match self.page_len.load(Ordering::Acquire) {
-            u64::MAX => Err(crate::store::kv::KvTableError::UnknownWorkingSet),
-            page_len => Ok(page_len),
-        }
-    }
-
     pub fn forked(&self, id: WorkingSetId) -> Self {
         let scope = self.lifecycle.pipeline_scope.lock().unwrap().clone();
         Self::new_with_scope(self.model, self.engine, id, self.page_size, scope)
@@ -222,20 +201,7 @@ impl KvWorkingSet {
         &self,
         scope: &crate::store::PipelineScope,
     ) -> Result<(), crate::store::PipelineScopeId> {
-        let mut owner = self.lifecycle.pipeline_scope.lock().unwrap();
-        match owner.as_ref() {
-            Some(existing) if existing.id() == scope.id() => Ok(()),
-            Some(existing) if !scope.is_closed() && existing.is_releasable() => {
-                *owner = Some(scope.clone());
-                Ok(())
-            }
-            Some(existing) => Err(existing.id()),
-            None if scope.is_closed() => Err(scope.id()),
-            None => {
-                *owner = Some(scope.clone());
-                Ok(())
-            }
-        }
+        scope.claim(&self.lifecycle.pipeline_scope)
     }
 
     pub fn fire_lease(&self) -> Result<KvFireLease, FireLeaseError> {
@@ -248,21 +214,7 @@ impl KvWorkingSet {
         }
     }
 
-    pub fn is_settled(&self) -> bool {
-        self.lifecycle.active_fire_leases.load(Ordering::Acquire) == 0
-            && !self.lifecycle.release_requested.load(Ordering::Acquire)
-    }
-
-    pub fn translation(&self) -> Result<(u64, Arc<[u32]>), &'static str> {
-        self.translation.snapshot()
-    }
-
     pub fn release(&self) {
         self.lifecycle.release();
-    }
-
-    #[cfg(test)]
-    pub fn is_released(&self) -> bool {
-        self.lifecycle.released.load(Ordering::Acquire)
     }
 }

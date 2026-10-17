@@ -9,8 +9,7 @@ p-e-w, ***Exclude Top Choices (XTC)*** — oobabooga/text-generation-webui
 [PR #6335](https://github.com/oobabooga/text-generation-webui/pull/6335),
 merged 2024-09-28. Also in llama.cpp `src/llama-sampler.cpp`.
 
-**Faithfulness: Faithful with one bounded deviation** (below). See
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+**Faithfulness: Faithful with one bounded deviation** (below).
 
 ## What it does
 

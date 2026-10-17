@@ -84,40 +84,8 @@ pub(super) fn program(prefix_constant: u32, global_channel_offset: usize) -> Bou
                 },
             },
             PortBinding {
-                port: Port::Pages,
-                source: PortSource::Const {
-                    dtype: Dtype::U32,
-                    shape: Shape::vector(1),
-                    data: 0u32.to_le_bytes().to_vec(),
-                },
-            },
-            PortBinding {
-                port: Port::PageIndptr,
-                source: PortSource::Const {
-                    dtype: Dtype::U32,
-                    shape: Shape::vector(2),
-                    data: [0u32, 1].into_iter().flat_map(u32::to_le_bytes).collect(),
-                },
-            },
-            PortBinding {
                 port: Port::KvLen,
                 source: PortSource::Channel(kv_len),
-            },
-            PortBinding {
-                port: Port::WSlot,
-                source: PortSource::Const {
-                    dtype: Dtype::U32,
-                    shape: Shape::vector(1),
-                    data: 0u32.to_le_bytes().to_vec(),
-                },
-            },
-            PortBinding {
-                port: Port::WOff,
-                source: PortSource::Const {
-                    dtype: Dtype::U32,
-                    shape: Shape::vector(1),
-                    data: 0u32.to_le_bytes().to_vec(),
-                },
             },
         ],
         stages,

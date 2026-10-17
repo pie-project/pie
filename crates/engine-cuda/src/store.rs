@@ -200,8 +200,9 @@ pub fn decoded_weight_reserve(widest_plane_bytes: u64, streams: u32) -> u64 {
 
 /// What a host pool of `budget` bytes seats: one rs row per device slot
 /// first (`rows` of `row_bytes`), then kv pages (`pages` of `page_bytes`),
-/// then windowed pages (`window_pages` of `window_page_bytes`) with the
-/// rest. Each is what the budget holds of it, so zero seats nothing.
+/// then windowed pages (`window_pages` of `window_page_bytes`), then more
+/// kv pages with the rest, which can be more than the device holds. Each is
+/// what the budget holds of it, so zero seats nothing.
 #[must_use]
 pub fn host_pool(
     budget: u64,
@@ -218,6 +219,8 @@ pub fn host_pool(
     let pages = pages.min(left.checked_div(page_bytes).unwrap_or(0));
     let left = left - pages * page_bytes;
     let window_pages = window_pages.min(left.checked_div(window_page_bytes).unwrap_or(0));
+    let left = left - window_pages * window_page_bytes;
+    let pages = pages + left.checked_div(page_bytes).unwrap_or(0);
     (clamp(rows), clamp(pages), clamp(window_pages))
 }
 fn slot_file(error: std::io::Error) -> Fault {
@@ -1507,8 +1510,13 @@ impl Pools {
     /// Opens `dir`'s slot file for this rank with `budget` bytes of kv pages;
     /// a budget short of one page seats none.
     pub fn seat_disk(&mut self, dir: &std::path::Path, rank: u32, budget: u64) -> Result<()> {
-        let file = engine::disk::SlotFile::open(dir, rank, self.paged_page_bytes(), budget)
-            .map_err(slot_file)?;
+        let file = engine::disk::SlotFile::open(
+            dir,
+            &format!("r{rank}.kv"),
+            self.paged_page_bytes(),
+            budget,
+        )
+        .map_err(slot_file)?;
         self.disk = file
             .map(|file| {
                 crate::device::Pinned::mapped_uninit(file.stride()).map(|stage| DiskKv {
@@ -1519,6 +1527,10 @@ impl Pools {
             })
             .transpose()?;
         Ok(())
+    }
+
+    pub fn unseat_disk(&mut self) {
+        self.disk = None;
     }
 
     #[must_use]
@@ -2120,7 +2132,7 @@ mod tests {
         let mib = 1u64 << 20;
         assert_eq!(
             host_pool(100 * mib, 8, mib, 1000, mib / 16, 0, 0),
-            (8, 1000, 0)
+            (8, 1472, 0)
         );
         assert_eq!(
             host_pool(20 * mib, 8, mib, 1000, mib / 16, 100, mib / 16),
@@ -2128,7 +2140,7 @@ mod tests {
         );
         assert_eq!(
             host_pool(30 * mib, 8, mib, 100, mib / 16, 100, mib / 16),
-            (8, 100, 100)
+            (8, 252, 100)
         );
         assert_eq!(host_pool(4 * mib, 8, mib, 1000, mib / 16, 0, 0), (4, 0, 0));
         assert_eq!(host_pool(0, 8, mib, 1000, mib / 16, 0, 0), (0, 0, 0));
