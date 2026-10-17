@@ -596,16 +596,13 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
 
 
 # The fixed points every engine is held to (`vllm_baseline.py`,
-# `pie_baseline.py`, `scoreboard.py`): one prefill batch, three decode
+# `pie_baseline.py`): one prefill batch, three decode
 # batches timed at 256 outputs and at 1 so a step is (t256 - t1) / 255, and
 # one serving burst offered all at once.
 FIXED_PREFILL = dict(batch=32, input_len=4096, output_len=1)
 FIXED_DECODE_BATCHES = (1, 8, 64)
 FIXED_DECODE_INPUT, FIXED_DECODE_OUTPUT = 512, 256
 FIXED_SERVE = dict(num_prompts=256, input_len=1024, output_len=256)
-# Below this much device memory in use, and with no compute process on it,
-# the device is free for a measurement.
-IDLE_GPU_MIB = 2048
 
 
 def fixed_prompt_ids(rng: random.Random, vocab: int, batch: int, input_len: int) -> list[list[int]]:
@@ -657,27 +654,6 @@ def _descends_from(pid: int, root: int) -> bool:
         except (OSError, ValueError, IndexError):
             return False
     return False
-
-
-def wait_for_idle_gpu(log=print, poll_s: float = 20.0, timeout_s: float = 6 * 3600) -> float:
-    """Block until the device holds < IDLE_GPU_MIB and no compute process;
-    return the seconds waited. A measurement needs the device to itself, and
-    the neighbours' processes are theirs to end, never ours."""
-    t0 = time.time()
-    said = 0.0
-    while True:
-        try:
-            used, apps = _gpu_compute_apps()
-        except Exception:
-            used, apps = 0, {}
-        if used < IDLE_GPU_MIB and not apps:
-            return time.time() - t0
-        if time.time() - t0 > timeout_s:
-            raise TimeoutError(f"device still busy after {timeout_s:.0f}s: {used} MiB, {apps}")
-        if time.time() - said > 300:
-            log(f"[gpu] busy: {used} MiB in use, compute pids {apps}; waiting")
-            said = time.time()
-        time.sleep(poll_s)
 
 
 class MemSampler:
