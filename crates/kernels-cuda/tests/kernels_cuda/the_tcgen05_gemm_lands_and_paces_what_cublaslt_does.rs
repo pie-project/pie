@@ -24,7 +24,7 @@ pub(crate) const FLUSH: usize = 512 << 20;
 const ROUNDS: usize = 7;
 pub(crate) const BATCH: usize = 16;
 /// Weight copies a batch cycles through cover at least this many bytes.
-const COLD: usize = 384 << 20;
+pub(crate) const COLD: usize = 384 << 20;
 
 fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);

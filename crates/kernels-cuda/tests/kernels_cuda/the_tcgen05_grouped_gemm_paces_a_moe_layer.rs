@@ -20,7 +20,9 @@
 
 use crate::common::Gpu;
 use crate::common::tc5::random;
-use crate::the_tcgen05_gemm_lands_and_paces_what_cublaslt_does::{BATCH, FLUSH, Timer, noise};
+use crate::the_tcgen05_gemm_lands_and_paces_what_cublaslt_does::{
+    BATCH, COLD, FLUSH, Timer, noise,
+};
 use kernels_cuda::cudarc::runtime::sys as rt;
 use kernels_cuda::linear::tc5::{
     Elem, Epilogue, GROUP_ALIGN, Glu, Grouped, Groups, Operand, Out, Plan, atom_bytes,
@@ -122,7 +124,24 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
     let bank_atoms = kind.w.1.map_or(0, |g| {
         atom_bytes(experts * n, k, g as usize).max(experts * n * k / g as usize)
     });
-    let w = operand(&mut gpu, kind.w, experts * n, k, bank_atoms, 3);
+    // A bank small enough to stay in L2 across a batch (GLM-5.3's
+    // eight-expert miniature) is copied until the copies a batch cycles
+    // through read cold, as the model's layers do one after another.
+    let bank_bytes = Kind::bytes(kind.w.0, experts * n * k) + bank_atoms;
+    let copies = COLD.div_ceil(bank_bytes.max(1)).clamp(1, BATCH);
+    let ws: Vec<Operand> = (0..copies)
+        .map(|c| {
+            operand(
+                &mut gpu,
+                kind.w,
+                experts * n,
+                k,
+                bank_atoms,
+                3 + 2 * c as u64,
+            )
+        })
+        .collect();
+    let w = ws[0];
     let alpha_e = gpu.up(&vec![1f32; experts]);
     for skewed in [false, true] {
         let only: Option<usize> = std::env::var("PIE_TC5_TOKENS")
@@ -224,8 +243,17 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
                 let shape = [n as u32, k as u32];
                 let us = match run(&ctx, act, w, y, grouped(0), shape, 1.0, routed as u32) {
                     Ok(()) => timer.median(|i| {
-                        run(&ctx, act, w, y, grouped(i), shape, 1.0, routed as u32)
-                            .expect("fires again");
+                        run(
+                            &ctx,
+                            act,
+                            ws[i % copies],
+                            y,
+                            grouped(i),
+                            shape,
+                            1.0,
+                            routed as u32,
+                        )
+                        .expect("fires again");
                     }),
                     Err(why) => panic!("{name} {}: {why}", kind.name),
                 };
@@ -286,7 +314,7 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
                         grouped_gemm_epi_with(
                             &ctx,
                             act,
-                            w,
+                            ws[i % copies],
                             y,
                             g,
                             shape,
