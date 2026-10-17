@@ -43,6 +43,22 @@ pub struct SideStreams(pub u32);
 #[decision(id = "compiler.branches", flag, default = false, tune = engine)]
 pub struct Branches;
 
+/// Whether every region a graph can launch is scheduled onto the main and
+/// side streams by its dependencies (`stream::fork_dag`), each a region of
+/// its own op, rather than only a join's disjoint branches: an attention's
+/// query, key/value, compressor and index chains, which share ops and
+/// caches, run side by side. Off but where a chip's profile turns it on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "compiler.dag_streams", flag, default = false, tune = engine)]
+pub struct DagStreams;
+
+/// The widest fire, in rows, that runs `compiler.dag_streams`' schedule on
+/// the side streams; wider fires walk every region on the main stream
+/// (each launch fills the card alone). 0: every fire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "compiler.dag_streams_until", constant(range(0..=1_000_000)), default = 0, tune = engine)]
+pub struct DagStreamsUntil(pub u32);
+
 /// Register the cost decisions, with this backend's own side-stream default.
 pub fn register(registry: &mut Registry, side_streams: u32) {
     registry
@@ -59,6 +75,8 @@ pub fn register(registry: &mut Registry, side_streams: u32) {
         .add::<CustomUs>()
         .add::<SpatialUs>()
         .add::<Branches>()
+        .add::<DagStreams>()
+        .add::<DagStreamsUntil>()
         .add_defaulting::<SideStreams>(&side_streams.to_string());
 }
 
@@ -78,6 +96,8 @@ impl DeviceProfile {
             side_streams: profile.get::<SideStreams>().0,
             fork_floor_us: us(profile.get::<ForkFloorUs>().0),
             branches: profile.on::<Branches>(&profile::Anywhere),
+            dag_streams: profile.on::<DagStreams>(&profile::Anywhere),
+            dag_streams_until: profile.get::<DagStreamsUntil>().0,
 
             family_us: FamilyCosts {
                 attention: us(profile.get::<AttentionUs>().0),

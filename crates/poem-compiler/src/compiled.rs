@@ -16,6 +16,12 @@ pub struct CompiledModel {
     pub order: ClassOrder,
     pub fallback: FallbackTable,
     pub arena: ArenaMap,
+    /// The arena the fires that run the side streams carve, where they are
+    /// only fires of up to `streams.forked_until` rows: carved under the
+    /// streams' concurrency at budgets of those rows, so the side streams'
+    /// apart buffers cost a decode's widths, not a prefill's, and `arena`
+    /// (the regions in order) keeps the widest fire as it was.
+    pub arena_forked: Option<ArenaMap>,
     pub concurrency: Concurrency,
     pub streams: StreamPlan,
     pub units: Vec<RowAxis>,

@@ -464,8 +464,18 @@ impl FireCtx<'_> {
         } else {
             u64::from(p.composition.patch_rows())
         };
+        // A fire that runs the side streams carves the arena laid out for
+        // them (`CompiledModel::arena_forked`); the rest the one in order.
+        let forks = !self.device.side_ctx().is_empty() && {
+            let until = self.compiled.streams.forked_until;
+            until == 0 || p.composition.bucket() <= until
+        };
+        let map = match &self.compiled.arena_forked {
+            Some(forked) if forks => forked,
+            _ => &self.compiled.arena,
+        };
         let slots = self.arena.slots(
-            &self.compiled.arena,
+            map,
             poem_compiler::FireRows {
                 tokens: carve_rows,
                 lanes: carve_lanes,
@@ -755,7 +765,12 @@ impl FireCtx<'_> {
                     compiled: self.compiled,
                     descriptor: &p.descriptor,
                     stream: self.device.stream(),
-                    lanes: forked,
+                    // Side streams for the fires narrow enough to leave the
+                    // card room for them (`compiler.dag_streams_until`).
+                    lanes: forked.filter(|_| {
+                        let until = self.compiled.streams.forked_until;
+                        until == 0 || p.composition.bucket() <= until
+                    }),
                     conditionals,
                     decoding: self.decoding,
                     tiers: self.tiers,

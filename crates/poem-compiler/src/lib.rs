@@ -75,15 +75,30 @@ pub fn compile_axes(
 
     // Branches the trace lays side by side (`branch::split`), where the
     // profile forks them: each its own region.
-    let blocks = if profile.branches {
+    let blocks = if profile.branches && !profile.dag_streams {
         branch::blocks(trace)
     } else {
         Vec::new()
     };
-    let breaks: std::collections::BTreeSet<u32> = blocks
-        .iter()
-        .flat_map(|b| b.branches.iter().map(|r| r.start).chain([b.join]))
-        .collect();
+    // Scheduled by dependencies (`compiler.dag_streams`): each op's lane
+    // found over regions of an op each, then regions broken only where the
+    // lane changes (a region an op costs a prefill 2%).
+    let lanes = if profile.dag_streams {
+        let every: std::collections::BTreeSet<u32> = (0..trace.nodes.len() as u32).collect();
+        let mut fine = region::coalesce_breaking(trace, &classes, &every)?;
+        region::hoist(trace, &mut fine)?;
+        lowering::lower(trace, &mut fine, &classes, budget, profile);
+        Some(stream::dag_lanes(trace, &mut fine, profile))
+    } else {
+        None
+    };
+    let breaks: std::collections::BTreeSet<u32> = match &lanes {
+        Some((_, breaks)) => breaks.clone(),
+        None => blocks
+            .iter()
+            .flat_map(|b| b.branches.iter().map(|r| r.start).chain([b.join]))
+            .collect(),
+    };
     let mut regions = region::coalesce_breaking(trace, &classes, &breaks)?;
 
     region::hoist(trace, &mut regions)?;
@@ -92,7 +107,11 @@ pub fn compile_axes(
 
     lowering::lower(trace, &mut regions, &classes, budget, profile);
 
-    let streams = stream::fork_with(trace, &mut regions, profile, &blocks);
+    let streams = if let Some((lanes, _)) = &lanes {
+        stream::fork_dag(trace, &mut regions, profile, Some(lanes))
+    } else {
+        stream::fork_with(trace, &mut regions, profile, &blocks)
+    };
     let concurrency =
         Concurrency::with_pairs(&regions, trace.nodes.len(), streams.pairs.iter().copied());
 
@@ -125,7 +144,22 @@ pub fn compile_axes(
         profile,
     );
 
-    let arena = arena::carve(trace, budgets, &classes, &concurrency)?;
+    // Side streams only up to `forked_until` rows: the arena in order for
+    // every fire, and one under the streams' concurrency at those rows' budgets
+    // for the fires that fork.
+    let (arena, arena_forked) = if lanes.is_some() && streams.forked_until > 0 {
+        let until = streams.forked_until;
+        let serial = Concurrency::sequential(&regions, trace.nodes.len());
+        let main = arena::carve(trace, budgets, &classes, &serial)?;
+        let mut narrow = budgets.clone();
+        narrow.tokens.max_tokens = narrow.tokens.max_tokens.min(until);
+        narrow.tokens.max_lanes = narrow.tokens.max_lanes.min(until);
+        narrow.tokens.buckets.retain(|&b| b <= until);
+        let forked = arena::carve(trace, &narrow, &classes, &concurrency)?;
+        (main, Some(forked))
+    } else {
+        (arena::carve(trace, budgets, &classes, &concurrency)?, None)
+    };
 
     Ok(CompiledModel {
         classes,
@@ -133,6 +167,7 @@ pub fn compile_axes(
         order,
         fallback,
         arena,
+        arena_forked,
         concurrency,
         streams,
         fold_refused: unit::fold_refused(&units),

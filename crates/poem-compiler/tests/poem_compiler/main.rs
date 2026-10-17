@@ -11,6 +11,7 @@ mod wan_2_dims;
 mod z_image_dims;
 
 mod a_banded_head_gathers_the_logits_it_holds_a_band_of;
+mod a_dag_schedule_orders_every_wait_after_its_close;
 mod a_fused_kernel_replaces_what_its_pattern_matches;
 mod a_joins_branches_lie_side_by_side;
 mod a_kv_head_is_held_by_a_group_of_ranks;

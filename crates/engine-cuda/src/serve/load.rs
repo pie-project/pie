@@ -687,7 +687,13 @@ impl Shell {
         // Committed whole: a fire reading out past one row a lane (a verify
         // reads every row) would otherwise grow it outside the fit.
         let mut arena = Arena::reserve(&compiled.arena, &pools)?;
-        arena.ensure(&mut pools, compiled.arena.bytes)?;
+        // The fires that run the side streams carve their own arena
+        // (`CompiledModel::arena_forked`): the larger of the two is held.
+        let forked_bytes = compiled
+            .arena_forked
+            .as_ref()
+            .map_or(0, |forked| forked.bytes);
+        arena.ensure(&mut pools, compiled.arena.bytes.max(forked_bytes))?;
         let predicate = crate::store::rs::Predicate::reserve(boot.budget.max_lanes)?;
         let spaces = boot
             .trace

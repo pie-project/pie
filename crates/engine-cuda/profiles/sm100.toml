@@ -260,3 +260,11 @@ gemm.rows_m = 8
 # chain), as vLLM runs DeepSeek-V4's: Flash decodes one row at 10.78 -> 10.13
 # ms a token, 8 rows at 14.70 -> 13.80, 64 rows level (50.96 -> 50.55).
 branches = true
+# Every region a graph can launch scheduled onto the streams by its
+# dependencies, a region an op: an attention's query, key/value, compressor
+# and index chains side by side (they share ops and caches, so no join's
+# branches are disjoint), as vLLM runs them on its streams.
+dag_streams = true
+# Up to 256 rows: a prefill's launches each fill the card, and the side
+# streams cost it 2% (3.808 -> 3.890 s).
+dag_streams_until = 256

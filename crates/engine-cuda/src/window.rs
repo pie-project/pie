@@ -1093,7 +1093,9 @@ impl Sink for Cursor<'_> {
         if let Some(lanes) = self.lanes {
             lanes.at.set(region.stream);
         } else if let Some(cond) = self.cond {
-            cond.at.set(region.stream);
+            // No lanes (a serial walk, or a fire wider than the side streams
+            // run for): every region on the main stream, its waits moot.
+            cond.at.set(0);
         }
     }
     fn region_end(&mut self, _region: &Region) {}

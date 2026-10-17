@@ -183,6 +183,14 @@ pub struct DeviceProfile {
     /// onto side streams.
     pub branches: bool,
 
+    /// Whether every launchable region is scheduled onto the streams by its
+    /// dependencies (`stream::fork_dag`), a region an op.
+    pub dag_streams: bool,
+
+    /// The widest fire, in rows, that runs the dependency schedule on the
+    /// side streams (0: every fire).
+    pub dag_streams_until: u32,
+
     pub family_us: FamilyCosts,
 
     pub exclusive: Vec<String>,
@@ -273,6 +281,8 @@ impl Default for DeviceProfile {
             side_streams: 2,
             fork_floor_us: 20.0,
             branches: false,
+            dag_streams: false,
+            dag_streams_until: 0,
             family_us: FamilyCosts::default(),
             exclusive: Vec::new(),
             grouped: Vec::new(),
