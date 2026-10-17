@@ -297,6 +297,7 @@ mod tests {
             want.moe_lt_tile_shallow = 128_288_032;
             want.moe_lt_deep_k = 2048;
             want.moe_ordered_from = 256;
+            want.moe_mxfp4_order = true;
             assert_eq!(kernels_rocm::tuning::Tuning::of(&profile), want, "{gpu}");
         }
     }

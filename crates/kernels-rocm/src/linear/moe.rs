@@ -2105,6 +2105,143 @@ fn matmul_select_mxfp4(
     )
 }
 
+/// An MXFP4 plane of `rows` x `k` (codes `[rows, k / 2]` at `codes`,
+/// e8m0 exponents `[rows, k / 32]` at `scales`; `rows` a multiple of 16,
+/// `k` of 128) into `out_codes` and `out_scales` in the matrix core's lane
+/// order, which `matmul_select_mxfp4_lanes` reads: each 16-row strip as K /
+/// 128 units of 1 KB of codes (lane l's 16 bytes one 32-code block of row
+/// l % 16, each word's codes k 0 .. 3 in its bytes' low nibbles, 4 .. 7 in
+/// the high ones) and 64 bytes of exponents (lane l's that block's).
+#[allow(clippy::too_many_arguments)]
+pub fn mxfp4_lanes(
+    ctx: &Ctx,
+    op: &'static str,
+    codes: u64,
+    out_codes: u64,
+    scales: u64,
+    out_scales: u64,
+    rows: u64,
+    k: u64,
+) -> Result<(), Error> {
+    if rows == 0 || k == 0 {
+        return Ok(());
+    }
+    if !rows.is_multiple_of(16) || !k.is_multiple_of(128) || !codes.is_multiple_of(16) || !out_codes.is_multiple_of(16) {
+        return Err(refuse(
+            op,
+            format!("an mxfp4 plane of {rows} x {k} is not whole 16-row strips of 128-code units"),
+        ));
+    }
+    let (r, kk) = (
+        i32::try_from(rows).map_err(|_| refuse(op, "the plane's rows pass an i32"))?,
+        i32::try_from(k).map_err(|_| refuse(op, "the plane's width passes an i32"))?,
+    );
+    let chunks = rows * k / 32;
+    let grid = u32::try_from(chunks.div_ceil(256).min(16384)).unwrap_or(16384);
+    ctx.fire(
+        op,
+        Fire::at("linear/fp8.hip", "::pie::linear::mxfp4_lanes").apply(Launch::grid([grid, 1, 1], [256, 1, 1])),
+        &[
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(out_codes),
+            ArgValue::Ptr(scales),
+            ArgValue::Ptr(out_scales),
+            ArgValue::I32(r),
+            ArgValue::I32(kk),
+        ],
+    )
+}
+
+/// An MXFP4 bank in the matrix core's lane order (`mxfp4_lanes`, resident)
+/// against the routes' bf16 rows: a token's routes each their own item
+/// (`moe_mxfp4_route`), more in expert order, items of 16, 32 or 64 routes
+/// holding what an expert takes (`moe_mxfp4_group`). The codes decode to
+/// bf16 in registers under their block's exponent, exactly, onto the bf16
+/// matrix core.
+pub fn matmul_select_mxfp4_lanes(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_matmul_select_quant";
+    let op = OP;
+    dtype_dispatch!(op, x.dtype, { Bf16 => () });
+    let fan = selected(op, x, routes, y)?;
+    let experts = codes.rows;
+    if !x.width.is_multiple_of(128) || !y.width.is_multiple_of(16) || experts == 0 || experts > ORDER_EXPERT_CAP {
+        return Err(refuse(op, "a bank in lane order takes whole 16-row strips of 128-code units"));
+    }
+    // The tile reads the activation at 32-bit offsets from its base.
+    if u64::from(x.rows) * u64::from(x.width) * 2 > u64::from(u32::MAX) {
+        return Err(refuse(op, "the lane-order tile reads an activation under 4 GiB"));
+    }
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    if routes.rows == 1 {
+        // Four waves a block, a strip each, three stages read ahead.
+        let (rnw, rtn, rnb) = (4, 1, 4);
+        return ctx.fire(
+            op,
+            Fire::at("linear/fp8.hip", symbol(&format!("::pie::linear::moe_mxfp4_route<::pie::i32({rnw}), ::pie::i32({rtn}), ::pie::i32({rnb})>")))
+                .apply(Launch::grid([fan.route_count, y.width.div_ceil(16 * rnw * rtn), 1], [64 * rnw, 1, 1])),
+            &[
+                x.arg(),
+                routes.arg(),
+                codes.arg(),
+                scales.arg(),
+                y.arg(),
+                act_div.arg(),
+                n.arg(),
+                k.arg(),
+                stated(op, experts)?.arg(),
+            ],
+        );
+    }
+    let (nw, tm, nb, tn) = mxfp4_lanes_shape(stream_items(&fan, experts));
+    let ordered = route_order(ctx, op, routes, &fan, experts, 16 * tm)?;
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/fp8.hip",
+            symbol(&format!(
+                "::pie::linear::moe_mxfp4_group<::pie::i32({nw}), ::pie::i32({tm}), ::pie::i32({nb}), ::pie::i32({tn})>"
+            )),
+        )
+        .apply(Launch::grid([ordered.work_cap, y.width.div_ceil(16 * tn * nw), 1], [64 * nw, 1, 1])),
+        &[
+            x.arg(),
+            ArgValue::Ptr(ordered.order),
+            ArgValue::Ptr(ordered.offsets),
+            ArgValue::Ptr(ordered.work),
+            codes.arg(),
+            scales.arg(),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+        ],
+    )
+}
+
+/// The lane-order group tile's shape for items holding `need` routes: its
+/// waves, 16-route blocks, ring depth and strips a wave. Decoding a block's
+/// codes costs more than its matrix-core steps, so the items grow with the
+/// routes to share each decode; past 32 routes eight waves share a stage's
+/// 64 rows of activations in LDS (dsv41's banks: 1024 tokens 1380 -> 686 us,
+/// 8192 tokens 3895 -> 2398 us).
+fn mxfp4_lanes_shape(need: u32) -> (u32, u32, u32, u32) {
+    match need {
+        0..=16 => (4, 1, 2, 2),
+        17..=32 => (4, 2, 2, 2),
+        _ => (8, 4, 2, 2),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_select_bias(
     ctx: &Ctx,

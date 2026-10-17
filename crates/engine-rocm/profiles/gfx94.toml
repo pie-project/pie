@@ -45,3 +45,7 @@ moe.ordered_from = 256
 # sorted MLP (GLM-5.3-Flash -17%, Qwen3.8-Max -15%, Hy4 -8%) and
 # Inkling-Small at 128 / 1024 tokens (-8% / -13%).
 moe.bf16_order = false
+# mxfp4 expert banks in the matrix core's lane order win every batch at
+# dsv41's banks (gate n 2304 k 5120: 1 token 19.3 -> 18.1 us, 128 tokens
+# 763 -> 511, 1024 tokens 1387 -> 707, 8192 tokens 3871 -> 2393).
+moe.mxfp4_order = true

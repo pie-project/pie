@@ -58,6 +58,14 @@ pub struct MoeOrderedFrom(pub u32);
 #[decision(id = "kernel.moe.bf16_order", flag, default = false, tune = search)]
 pub struct MoeBf16Order;
 
+/// Whether a resident mxfp4 expert bank only routed selects of bf16 rows
+/// read lands in the matrix core's lane order (`linear::moe::mxfp4_lanes`,
+/// one copy), its selects at every batch on the tiles that stream it so
+/// (`moe::matmul_select_mxfp4_lanes`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_order", flag, default = false, tune = search)]
+pub struct MoeMxfp4Order;
+
 /// The same for mxfp4 banks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.mxfp4_grouped", flag, default = true, tune = search)]
@@ -284,6 +292,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeLtDeepK>()
         .add::<MoeOrderedFrom>()
         .add::<MoeBf16Order>()
+        .add::<MoeMxfp4Order>()
         .add::<MoeMxfp4Grouped>()
         .add::<MoeMxfp4Wmma>()
         .add::<DecodeSplitSmall>()
@@ -334,6 +343,7 @@ pub struct Tuning {
     pub moe_lt_deep_k: u32,
     pub moe_ordered_from: u32,
     pub moe_bf16_order: bool,
+    pub moe_mxfp4_order: bool,
     pub mxfp4_grouped: bool,
     pub mxfp4_wmma: bool,
     pub decode_split_small: bool,
@@ -386,6 +396,7 @@ impl Tuning {
         moe_lt_deep_k: 2048,
         moe_ordered_from: 0,
         moe_bf16_order: false,
+        moe_mxfp4_order: false,
         mxfp4_grouped: true,
         mxfp4_wmma: true,
         decode_split_small: false,
@@ -436,6 +447,7 @@ impl Tuning {
             moe_lt_deep_k: profile.get::<MoeLtDeepK>().0,
             moe_ordered_from: profile.get::<MoeOrderedFrom>().0,
             moe_bf16_order: profile.on::<MoeBf16Order>(&Anywhere),
+            moe_mxfp4_order: profile.on::<MoeMxfp4Order>(&Anywhere),
             mxfp4_grouped: profile.on::<MoeMxfp4Grouped>(&Anywhere),
             mxfp4_wmma: profile.on::<MoeMxfp4Wmma>(&Anywhere),
             decode_split_small: profile.on::<DecodeSplitSmall>(&Anywhere),

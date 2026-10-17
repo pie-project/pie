@@ -806,6 +806,149 @@ fn order_bf16_banks(
     })
 }
 
+/// The mxfp4 expert banks that may land in the matrix core's lane order:
+/// `[experts, n, ..]` banks (n a multiple of 16) under e8m0
+/// exponents alone, held on the device, that only routed selects of bf16
+/// rows read (`MoeMatmulSelectQuant`, or its e4m3-quantized twin).
+fn lane_banks(trace: &Trace, tier: Option<&crate::experts::Tier>, pairings: &BTreeMap<&str, Pairing>) -> Vec<(usize, usize)> {
+    use poem_ir::{ActQuant, Def, Fused, Linear, Operands, Operation, Ty};
+    let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|decl| &decl.def) {
+        Some(Def::Weight(w)) => Some(*w as usize),
+        _ => None,
+    };
+    let bf16 = |id: poem_ir::ValueId| {
+        matches!(
+            trace.values.get(id.0 as usize).map(|decl| &decl.ty),
+            Some(Ty::Tensor { dtype: Dtype::Bf16, .. })
+        )
+    };
+    let mut reads = vec![0u32; trace.params.len()];
+    let mut selects = vec![0u32; trace.params.len()];
+    let mut ins = Vec::new();
+    for node in &trace.nodes {
+        ins.clear();
+        node.op.inputs(&mut ins);
+        for &id in &ins {
+            if let Some(w) = weight(id) {
+                reads[w] += 1;
+            }
+        }
+        let legs: Vec<&Linear> = match &node.op {
+            Operation::Linear(op) => vec![op],
+            Operation::Fused(Fused::MoeExperts { select, down, .. }) => vec![&**select, &**down],
+            Operation::Fused(Fused::MoeSelectGlu { select, .. }) => vec![&**select],
+            _ => Vec::new(),
+        };
+        for leg in legs {
+            let (x, bank) = match leg {
+                Linear::MoeMatmulSelectQuant { x, bank, .. } => (*x, *bank),
+                Linear::MoeMatmulSelectActQuant {
+                    x,
+                    bank,
+                    quant: ActQuant::E4m3 { .. },
+                    ..
+                } => (*x, *bank),
+                _ => continue,
+            };
+            if let Some(w) = weight(bank)
+                && bf16(x)
+            {
+                selects[w] += 1;
+            }
+        }
+    }
+    trace
+        .params
+        .iter()
+        .enumerate()
+        .filter_map(|(at, param)| {
+            let pairing = pairings.get(param.name.as_str())?;
+            (param.dtype == Dtype::Mxfp4
+                && pairing.biases.is_none()
+                && param.shape.len() >= 3
+                && param.shape[1] % 16 == 0
+                && selects[at] > 0
+                && selects[at] == reads[at]
+                && !tier.is_some_and(|tier| {
+                    [at, pairing.scales]
+                        .iter()
+                        .any(|&p| tier.handles(p).is_some() || tier.group_handles(p).is_some() || tier.offloaded_at(p).is_some())
+                }))
+            .then_some((at, pairing.scales))
+        })
+        .collect()
+}
+
+/// Puts `lane_banks` in the matrix core's lane order where they lie, codes
+/// and exponents through one staging span, and marks their rows.
+fn order_mxfp4_banks(
+    trace: &Trace,
+    places: &[Place],
+    store: &Buffer,
+    tier: Option<&crate::experts::Tier>,
+    pairings: &BTreeMap<&str, Pairing>,
+    table: &mut [Option<WeightRow>],
+    stream: *mut core::ffi::c_void,
+) -> Result<()> {
+    // Each bank's experts, rows (n) and K, from its codes' row: n · K / 2
+    // bytes an expert. K a whole number of 128-code units.
+    let banks: Vec<(usize, usize, u64, u64, u64)> = lane_banks(trace, tier, pairings)
+        .into_iter()
+        .filter_map(|(at, scales)| {
+            let Some(Some(WeightRow::Planes { codes, .. })) = table.get(at) else {
+                return None;
+            };
+            let n = trace.params[at].shape[1];
+            let k = 2 * u64::from(codes.width) / n;
+            (2 * u64::from(codes.width) == n * k && k % 128 == 0).then_some((at, scales, u64::from(codes.rows), n, k))
+        })
+        .collect();
+    let Some(widest) = banks.iter().map(|&(_, _, e, n, k)| e * n * k).max() else {
+        return Ok(());
+    };
+    // SAFETY: `stream` is the load's stream, live for the load.
+    let ctx = unsafe { kernels_rocm::Ctx::on(stream.cast()) };
+    // Codes (half a byte an element) then exponents (one a 32), 16-aligned.
+    let codes_span = (widest / 2).next_multiple_of(16);
+    let staging = Buffer::zeroed(usize::try_from(codes_span + widest / 32).unwrap_or(usize::MAX))?;
+    for &(at, scales, experts, n, k) in &banks {
+        let rows = experts * n;
+        let codes = address(tier, store, places[at].offset, at)?;
+        let exps = address(tier, store, places[scales].offset, scales)?;
+        let (staged_codes, staged_exps) = (staging.ptr(), staging.ptr() + codes_span);
+        kernels_rocm::linear::moe::mxfp4_lanes(
+            &ctx,
+            "linear.moe_matmul_select_quant",
+            codes,
+            staged_codes,
+            exps,
+            staged_exps,
+            rows,
+            k,
+        )?;
+        for (to, from, bytes) in [(codes, staged_codes, rows * k / 2), (exps, staged_exps, rows * k / 32)] {
+            // SAFETY: both spans are device memory this load holds, `bytes`
+            // each; the copy is ordered on the load's stream.
+            crate::device::ctx::check("hipMemcpyAsync", unsafe {
+                kernels_rocm::hip::rt::hipMemcpyAsync(
+                    to as *mut core::ffi::c_void,
+                    from as *const core::ffi::c_void,
+                    usize::try_from(bytes).unwrap_or(usize::MAX),
+                    kernels_rocm::hip::rt::hipMemcpyDeviceToDevice,
+                    stream.cast(),
+                )
+            })?;
+        }
+        if let Some(Some(WeightRow::Planes { lanes, .. })) = table.get_mut(at) {
+            *lanes = true;
+        }
+    }
+    // SAFETY: the load's stream, live for the load.
+    crate::device::ctx::check("hipStreamSynchronize", unsafe {
+        kernels_rocm::hip::rt::hipStreamSynchronize(stream.cast())
+    })
+}
+
 fn pairings<'a>(
     landing: &'a LoadPlan,
     trace: &'a Trace,
@@ -917,6 +1060,7 @@ impl Weights {
         decode_dense: bool,
         deferred_tier: bool,
         order_bf16: bool,
+        order_mxfp4: bool,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -1082,6 +1226,7 @@ impl Weights {
                 }
                 Some(pairing) => WeightRow::Planes {
                     repacked: place.dtype == Dtype::U4g64tiled,
+                    lanes: false,
                     codes: packed(experts.as_ref(), &store, &places, at)?,
                     scales: packed(experts.as_ref(), &store, &places, pairing.scales)?,
                     biases: match pairing.biases {
@@ -1118,6 +1263,9 @@ impl Weights {
         canonical_fp8(trace, &index, &places, &store, experts.as_ref(), stream)?;
         if order_bf16 {
             order_bf16_banks(trace, &places, &store, experts.as_ref(), &mut table, stream)?;
+        }
+        if order_mxfp4 {
+            order_mxfp4_banks(trace, &places, &store, experts.as_ref(), &pairings, &mut table, stream)?;
         }
         if let Some(tier) = experts.as_mut() {
             let slabs: Vec<u64> = tier

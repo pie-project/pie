@@ -732,6 +732,9 @@ impl Run<'_> {
     ) -> Result<(), kernels_rocm::Error> {
         let (codes, scales, biases, seat) = self.planes(bank);
         let routes = self.tensor(routes);
+        if self.planes_in_lanes(bank) {
+            return linear::moe::matmul_select_mxfp4_lanes(self.ctx(), x, codes, scales, routes, &mut self.tensor(y));
+        }
         let (codes, scales, biases, routes, seat) =
             match self.staged_experts(codes, scales, biases, routes) {
                 Some((codes, scales, biases, routes)) => {

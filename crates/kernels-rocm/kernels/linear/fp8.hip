@@ -688,6 +688,247 @@ __device__ __forceinline__ void bf16_group_tile(const bf16* __restrict__ act, co
     }
 }
 
+// An MXFP4 bank (e2m1 nibble pairs, the low one first, under an e8m0
+// exponent a 1x32 block, in the matrix core's lane order: `mxfp4_lanes`) on the bf16 matrix core: each lane
+// reads 16 bytes of its row a stage, one block, and decodes them to bf16
+// in registers under the block's exponent (exact: every e2m1 value times a
+// power of two is a bf16). The k a matrix-core step takes is permuted alike
+// in A and B: lane group g's step kk holds k 32g + 4kk .. +3 of the stage, so
+// a lane's 32 elements are one block and one read. A stage is 128 k; the
+// routes' rows go through LDS as `bf16_group_tile`'s. NW waves side by side
+// along the rows, TN strips a wave, TM 16-route blocks.
+template <int NW, int TN, int TM, int NB>
+__device__ __forceinline__ void fp4_group_tile(const bf16* __restrict__ act, const i32* __restrict__ order,
+                                               int begin, int count, const u8* __restrict__ codes,
+                                               const u8* __restrict__ scales, bf16* __restrict__ out, int act_div,
+                                               int n, int k, int tile) {
+    constexpr int KS = 128, RB = 2 * KS;       // k a stage, bytes a route row a stage
+    constexpr int NR = NW * TN * 16, MR = TM * 16;
+    constexpr int XI = MR * RB / 256 / NW;     // activation reads a wave a stage
+    static_assert(XI * NW * 256 == MR * RB, "a stage is whole wave reads");
+    constexpr int SB = MR * RB;
+    constexpr int PER = XI + 2 * TN;           // reads a thread a stage
+    constexpr int D = NB - 1;                  // stages read ahead
+    static_assert((D - 1) * PER < 64, "vmcnt counts to 63");
+    __shared__ __align__(16) u8 xl[NB][SB];
+    const int tid = threadIdx.x, l = lane(), r16 = l % 16, g = l / 16;
+    const int wave = tid / kWave;
+    const int row0 = tile * NR;
+    const int stages = k / KS;
+    auto route = [&](int m) { return order != nullptr ? order[begin + m] : begin + m; };
+    auto xat = [&](int r, int c) { return r * RB + 16 * (c ^ (r & 7)); };
+
+    // A strip's unit (128 k of 16 rows): 1 KB of codes, lane l's 16 bytes
+    // at 16·l, and 64 bytes of exponents, lane l's at l. A strip past the
+    // bank reads the last.
+    const moe_rsrc cr = batch_plane(codes, 1ull * n * (k / 2));
+    const moe_rsrc sr = batch_plane(scales, 1ull * n * (k / 32));
+    u32 co[TN], so[TN];
+#pragma unroll
+    for (int nb = 0; nb < TN; ++nb) {
+        const int strip = min(row0 / 16 + wave * TN + nb, n / 16 - 1);
+        co[nb] = static_cast<u32>(strip) * static_cast<u32>(8 * k) + 16 * l;
+        so[nb] = static_cast<u32>(strip) * static_cast<u32>(k / 2) + l;
+    }
+    const u8* xb = reinterpret_cast<const u8*>(act);
+    u32 xo[XI];
+#pragma unroll
+    for (int j = 0; j < XI; ++j) {
+        const int q = wave * XI + j;
+        const int byte = q * 256 + 4 * l;
+        const int r = byte / RB, cl = byte % RB / 16;
+        const int c = cl ^ (r & 7);
+        xo[j] = static_cast<u32>(route(r < count ? r : 0) / act_div) * static_cast<u32>(2 * k) + 16 * c + 4 * (l % 4);
+    }
+    const u32 uw = static_cast<u32>(__builtin_amdgcn_readfirstlane(wave));
+    const u32 xl0 = lds_address(xl[0]) + uw * XI * 256;
+
+    i32x4 wc[NB][TN];
+    moe_i2 ws[NB][TN];
+    auto issue = [&](int s, int b) {
+#pragma unroll
+        for (int j = 0; j < XI; ++j) lds_dma4(xb, xo[j] + s * RB, xl0 + b * SB + j * 256);
+#pragma unroll
+        for (int nb = 0; nb < TN; ++nb) {
+            bload_nt(wc[b][nb], cr, co[nb] + s * 1024);
+            bload_run<1>(ws[b][nb], sr, so[nb] + s * 64);
+        }
+    };
+
+    mfma_cd acc[TN][TM];
+#pragma unroll
+    for (int nb = 0; nb < TN; ++nb)
+#pragma unroll
+        for (int mb = 0; mb < TM; ++mb) acc[nb][mb] = mfma_zero();
+
+    // e2m1 magnitudes 0 .. 7 as bf16 (0, 0.5, 1, 1.5, 2, 3, 4, 6), two a
+    // word, 0 and 1 in the first.
+    constexpr u32 kBase[4] = {0x3F000000u, 0x3FC03F80u, 0x40404000u, 0x40C04080u};
+    using u16x2 = unsigned short __attribute__((ext_vector_type(2)));
+    auto step = [&](int s, const u8* xc, i32x4 (&wset)[TN], moe_i2 (&eset)[TN]) {
+        tie(wset);
+#pragma unroll
+        for (int nb = 0; nb < TN; ++nb) batch_hold(eset[nb]);
+        u32 pairs[TN][16];
+#pragma unroll
+        for (int nb = 0; nb < TN; ++nb) {
+            // The block's table: each magnitude's bf16 under its exponent
+            // (its exponent field moved by e - 127, a halfword at a time;
+            // zero kept zero), then split into high and low bytes, 0..3 in
+            // the first word.
+            const u32 d16 = (((static_cast<u32>(eset[nb][0]) & 0xFFu) - 127u) << 7) & 0xFFFFu;
+            const u16x2 dv = __builtin_bit_cast(u16x2, d16 * 0x10001u);
+            u32 q[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) q[j] = __builtin_bit_cast(u32, __builtin_bit_cast(u16x2, kBase[j]) + dv);
+            q[0] &= 0xFFFF0000u;
+            const u32 hi[2] = {__builtin_amdgcn_perm(q[1], q[0], 0x07050301u), __builtin_amdgcn_perm(q[3], q[2], 0x07050301u)};
+            const u32 lo[2] = {__builtin_amdgcn_perm(q[1], q[0], 0x06040200u), __builtin_amdgcn_perm(q[3], q[2], 0x06040200u)};
+            // A word's byte j holds k j (low nibble) and k j + 4 (high), as
+            // `mxfp4_lanes` packs them: one perm a bf16 pair.
+#pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                const u32 w = static_cast<u32>(wset[nb][d]);
+                const u32 ml = w & 0x07070707u, mh = (w >> 4) & 0x07070707u;
+                const u32 hl = __builtin_amdgcn_perm(hi[1], hi[0], ml) | ((w & 0x08080808u) << 4);
+                const u32 ll = __builtin_amdgcn_perm(lo[1], lo[0], ml);
+                const u32 hh = __builtin_amdgcn_perm(hi[1], hi[0], mh) | (w & 0x80808080u);
+                const u32 lh = __builtin_amdgcn_perm(lo[1], lo[0], mh);
+                pairs[nb][4 * d + 0] = __builtin_amdgcn_perm(hl, ll, 0x05010400u);  // k 0, 1
+                pairs[nb][4 * d + 1] = __builtin_amdgcn_perm(hl, ll, 0x07030602u);  // k 2, 3
+                pairs[nb][4 * d + 2] = __builtin_amdgcn_perm(hh, lh, 0x05010400u);  // k 4, 5
+                pairs[nb][4 * d + 3] = __builtin_amdgcn_perm(hh, lh, 0x07030602u);  // k 6, 7
+            }
+        }
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) {
+            moe_u2 bv[TM];
+#pragma unroll
+            for (int mb = 0; mb < TM; ++mb) {
+                const int r = mb * 16 + r16;
+                bv[mb] = *reinterpret_cast<const moe_u2*>(xc + xat(r, 4 * g + kk / 2) + 8 * (kk % 2));
+            }
+#pragma unroll
+            for (int nb = 0; nb < TN; ++nb)
+#pragma unroll
+                for (int mb = 0; mb < TM; ++mb)
+                    acc[nb][mb] = mma16x16<bf16>(pairs[nb][2 * kk], pairs[nb][2 * kk + 1], bv[mb][0], bv[mb][1],
+                                                 acc[nb][mb]);
+        }
+        // Stage s + 1 landed; the stages past it may still be in flight.
+        if (s + D < stages) vm_wait<(D - 1) * PER>(); else vm_wait<0>();
+        lds_barrier();
+    };
+#pragma unroll
+    for (int d = 0; d < D; ++d)
+        if (d < stages) issue(d, d);
+    if (D < stages) vm_wait<(D - 1) * PER>(); else vm_wait<0>();
+    lds_barrier();
+    for (int s0 = 0; s0 < stages; s0 += NB) {
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            const int s = s0 + b;
+            if (s >= stages) break;
+            if (s + D < stages) issue(s + D, (b + D) % NB);
+            step(s, xl[b], wc[b], ws[b]);
+        }
+    }
+
+#pragma unroll
+    for (int mb = 0; mb < TM; ++mb) {
+        const int m = mb * 16 + r16;
+        if (m >= count) continue;
+        bf16* o = out + static_cast<long long>(route(m)) * n;
+#pragma unroll
+        for (int nb = 0; nb < TN; ++nb) {
+            const int c = row0 + (wave * TN + nb) * 16 + 4 * g;
+            bf16 v[4];
+#pragma unroll
+            for (int t = 0; t < 4; ++t) v[t] = from_f32<bf16>(acc[nb][mb][t]);
+            if (c + 3 < n && n % 4 == 0) {
+                *reinterpret_cast<moe_u2*>(o + c) = __builtin_bit_cast(moe_u2, v);
+            } else {
+#pragma unroll
+                for (int t = 0; t < 4; ++t)
+                    if (c + t < n) o[c + t] = v[t];
+            }
+        }
+    }
+}
+
+// An MXFP4 plane of `rows` x `k` (codes [rows, k/2], exponents [rows,
+// k/32], rows a multiple of 16, k of 128) into the matrix core's lane order:
+// strip q (16 rows), unit u (128 k): 1 KB of codes, lane l's 16 bytes the
+// bytes 16·(l / 16) .. +16 of row l % 16 in the unit (its 32 k, one block),
+// and 64 bytes of exponents, lane l's the block l / 16 of row l % 16; each
+// 4-byte word's codes k 0 .. 3 in its bytes' low nibbles, k 4 .. 7 in their
+// high ones. A thread a 16-byte chunk of codes and its lane's exponent.
+__global__ __launch_bounds__(256) void mxfp4_lanes(const u8* __restrict__ codes, u8* __restrict__ out_codes,
+                                                   const u8* __restrict__ scales, u8* __restrict__ out_scales,
+                                                   i32 rows, i32 k) {
+    const long long units = k / 128, chunks = static_cast<long long>(rows / 16) * units * 64;
+    for (long long c = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; c < chunks;
+         c += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long strip = c / (units * 64), u = c / 64 % units;
+        const int l = static_cast<int>(c % 64);
+        const long long row = strip * 16 + l % 16;
+        uint4 v = *reinterpret_cast<const uint4*>(codes + row * (k / 2) + u * 64 + 16 * (l / 16));
+        // Each word's eight codes (k 2j low, 2j + 1 high in byte j) repacked
+        // as k j low, j + 4 high.
+        u32* wv = reinterpret_cast<u32*>(&v);
+#pragma unroll
+        for (int d = 0; d < 4; ++d) {
+            const u32 w = wv[d];
+            u32 o = 0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const u32 code = (w >> (4 * j)) & 0xFu;
+                o |= code << (j < 4 ? 8 * j : 8 * (j - 4) + 4);
+            }
+            wv[d] = o;
+        }
+        *reinterpret_cast<uint4*>(out_codes + 16 * c) = v;
+        out_scales[c] = scales[row * (k / 32) + u * 4 + l / 16];
+    }
+}
+
+// The same select by route, for a token's few routes: route r (blockIdx.x)
+// its own item of one row against expert routes[r], unordered (grid
+// (routes, ⌈n / (16·TN·NW)⌉)).
+template <int NW, int TN, int NB>
+__global__ __launch_bounds__(NW * 64) void moe_mxfp4_route(const bf16* __restrict__ act, const i32* __restrict__ routes,
+                                                           const u8* __restrict__ codes, const u8* __restrict__ scales,
+                                                           bf16* __restrict__ out, int act_div, int n, int k,
+                                                           int num_experts) {
+    const int r = static_cast<int>(blockIdx.x), e = routes[r];
+    if (e < 0 || e >= num_experts) return;
+    fp4_group_tile<NW, TN, 1, NB>(act, nullptr, r, 1, codes + static_cast<long long>(e) * n * (k / 2),
+                                 scales + static_cast<long long>(e) * n * (k / 32), out, act_div, n, k, blockIdx.y);
+}
+
+// An MXFP4 bank's routed select on the bf16 matrix core: one work item of up
+// to 16·TM routes of one expert a block row of NW·64 weight rows (grid (work
+// cap, ⌈n / (64·NW)⌉), 64·NW threads), the blocks renumbered so an XCD runs
+// a contiguous range, every item at one block row before the next.
+template <int NW, int TM, int NB = 4, int TN = 4>
+__global__ __launch_bounds__(NW * 64) void moe_mxfp4_group(const bf16* __restrict__ act, const i32* __restrict__ order,
+                                                           const i32* __restrict__ offsets, const i32* __restrict__ work,
+                                                           const u8* __restrict__ codes, const u8* __restrict__ scales,
+                                                           bf16* __restrict__ out, int act_div, int n, int k,
+                                                           int num_experts) {
+    const int items = offsets[num_experts + 1];
+    const int live = items * static_cast<int>(gridDim.y);
+    const int b = static_cast<int>(blockIdx.x + gridDim.x * blockIdx.y);
+    if (b >= live) return;
+    const int xcd = b % 8, slots = live / 8, extra = live % 8;
+    const int at = xcd * slots + min(xcd, extra) + b / 8;
+    GroupItem item;
+    if (!group_item(offsets, work, num_experts, 16 * TM, item, at % items)) return;
+    const long long e = item.expert;
+    fp4_group_tile<NW, TN, TM, NB>(act, order, item.begin, item.count, codes + e * n * (k / 2), scales + e * n * (k / 32), out,
+                              act_div, n, k, at / items);
+}
+
 // A bf16 bank in the matrix core's order: its routed select past 64 routes
 // an expert, one work item of up to 128 routes a block row of 64·NW weight
 // rows (grid (work cap, ⌈n / (64·NW)⌉, slices), 64·NW threads). The card

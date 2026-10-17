@@ -841,6 +841,60 @@ fn moe_matmul_mxfp4() {
     }
 }
 
+#[test]
+fn moe_matmul_mxfp4_lanes() {
+    // A bank put in the matrix core's lane order at load, read by route (one
+    // token) and in expert order (items of 16, 32 and 64 routes, a ragged
+    // last strip block).
+    let Some(gpu) = Gpu::open() else { return };
+    let planes = Planes::default();
+    let ctx = tuned(&gpu, |_| {});
+    for (experts, tokens, top_k, n, k) in [
+        (8u32, 1u32, 4u32, 1280u32, 2560u32),
+        (6, 1, 6, 208, 640),
+        (6, 2, 3, 2560, 640),
+        (8, 50, 4, 384, 512),
+        (5, 33, 3, 144, 2304),
+        (4, 72, 4, 256, 512),
+        (3, 200, 2, 208, 1024),
+    ] {
+        let (e, t, kk, nn, kd) = (experts as usize, tokens as usize, top_k as usize, n as usize, k as usize);
+        let (codes, scales, bank) = mxfp4_bank(e, nn, kd, u64::from(n + k));
+        let ct = planes.bytes(&codes, experts, n * k / 2);
+        let st = planes.bytes(&scales, experts, n * k / 32);
+        let lc = planes.bytes(&vec![0u8; codes.len()], experts, n * k / 2);
+        let ls = planes.bytes(&vec![0u8; scales.len()], experts, n * k / 32);
+        moe::mxfp4_lanes(
+            &ctx,
+            "test",
+            ct.ptr,
+            lc.ptr,
+            st.ptr,
+            ls.ptr,
+            u64::from(experts * n),
+            u64::from(k),
+        )
+        .unwrap();
+        for by_token in [true, false] {
+            let routes = make_routes(t, kk, e, u64::from(k), true);
+            let x_rows = if by_token { t } else { t * kk };
+            let x = bf16s(x_rows * kd, 32, 1.0);
+            let xt = gpu.tensor(&x, x_rows as u32, k, Dtype::Bf16);
+            let rt = planes.i32s(&routes, tokens, top_k);
+            let mut y = gpu.zeros(tokens * top_k, n, Dtype::Bf16);
+            moe::matmul_select_mxfp4_lanes(&ctx, xt, lc, ls, rt, &mut y).unwrap();
+            let (want, mag) = reference(&bank, &x, &routes, kk, by_token, None);
+            close_dot(
+                &format!("mxfp4 lanes {experts}e {tokens}x{top_k} {n}x{k} by_token={by_token}"),
+                &gpu.read(&y),
+                &want,
+                &mag,
+                1e-5,
+            );
+        }
+    }
+}
+
 /// A random MLX affine bank: `bits`-bit codes in little-endian u32 words, a
 /// bf16 scale and bias every `group` codes, and its dense expansion (bf16
 /// rounded when `rounded`, as the matrix-core leg holds it).
@@ -1584,6 +1638,8 @@ fn bench_moe_crossover() {
 enum Codec {
     Bf16,
     Mxfp4,
+    /// Mxfp4 in the matrix core's lane order (`moe::mxfp4_lanes`).
+    Mxfp4Lanes,
     Affine4,
 }
 
@@ -1593,7 +1649,7 @@ impl Codec {
         let e = u64::from(n) * u64::from(k);
         match self {
             Codec::Bf16 => 2 * e,
-            Codec::Mxfp4 => e / 2 + e / 32,
+            Codec::Mxfp4 | Codec::Mxfp4Lanes => e / 2 + e / 32,
             Codec::Affine4 => e / 2 + 4 * e / 64,
         }
     }
@@ -1618,7 +1674,7 @@ fn bench_bank(planes: &Planes, codec: Codec, experts: u32, n: u32, k: u32) -> [T
             b.dtype = Dtype::Bf16;
             [b, b, b]
         }
-        Codec::Mxfp4 => [
+        Codec::Mxfp4 | Codec::Mxfp4Lanes => [
             alloc(rows * e / 2, e / 2),
             alloc(rows * e / 32, e / 32),
             alloc(1, 1),
@@ -1665,6 +1721,7 @@ fn bench_fire(
             y,
             moe::GroupSeat::RESIDENT,
         ),
+        Codec::Mxfp4Lanes => moe::matmul_select_mxfp4_lanes(ctx, x, at(bank[0]), at(bank[1]), routes, y),
         Codec::Affine4 => moe::matmul_select_quant(
             ctx,
             x,
@@ -1725,6 +1782,8 @@ fn bench_moe_models() {
         ("kimi-k3 down mxfp4", Codec::Mxfp4, 896, 16, 3584, 3072),
         ("dsv41 gate mxfp4", Codec::Mxfp4, 384, 6, 2304, 5120),
         ("dsv41 down mxfp4", Codec::Mxfp4, 384, 6, 5120, 2304),
+        ("dsv41 gate mxfp4 lanes", Codec::Mxfp4Lanes, 384, 6, 2304, 5120),
+        ("dsv41 down mxfp4 lanes", Codec::Mxfp4Lanes, 384, 6, 5120, 2304),
         // The mini's 16 experts: 128 tokens give each 48 routes.
         ("dsv41-mini gate mxfp4", Codec::Mxfp4, 16, 6, 2304, 5120),
         ("dsv41-mini down mxfp4", Codec::Mxfp4, 16, 6, 5120, 2304),

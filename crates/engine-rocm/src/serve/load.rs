@@ -492,6 +492,7 @@ impl Shell {
             decode_dense,
             boot.deferred_tier,
             device.ctx().tuning().moe_bf16_order,
+            device.ctx().tuning().moe_mxfp4_order,
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
@@ -1126,6 +1127,7 @@ fn decoded_weight_planes(
                     row,
                     crate::run::WeightRow::Planes {
                         repacked: false,
+                        lanes: false,
                         ..
                     }
                 )
