@@ -1,16 +1,10 @@
-//! Independent branches that meet at one op, laid side by side so the stream
-//! pass can run them at once.
+//! Independent branches meeting at one op (a join: a MoE's shared and routed
+//! experts, an attention's q, kv and index chains), laid out so the stream
+//! pass can run them at once: [`split`] makes each one contiguous run just
+//! ahead of its join.
 //!
-//! A join is an op whose inputs come from two or more chains that share no
-//! op since they parted: the shared expert and the routed experts a MoE sums,
-//! the query, key/value and index chains an attention reads. [`split`]
-//! reorders the trace so each such chain is one contiguous run just ahead of
-//! its join (the ops between that read none of them first).
-//!
-//! Order is kept: an op reads what it read and writes what it wrote, an op
-//! touching a cache stays after every earlier op touching that cache, one
-//! writing into another value's buffer after every earlier reader of it, and
-//! nothing crosses a collective.
+//! Order is kept: data dependencies, per-cache op order, writes into a buffer
+//! after its earlier readers, and nothing crosses a collective.
 
 use std::collections::BTreeSet;
 

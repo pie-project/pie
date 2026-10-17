@@ -1,13 +1,11 @@
-# The weights of MiMo-V2.6: grouped-query attention, full on a few layers
-# and over a 128-token window (with sinks) on the rest, its keys 192 wide
-# and its values 128, a dense first layer and then routed experts behind a
-# biased sigmoid router, the banks stored as the second dtype of a
-# deployment's weights.
+# The weights of MiMo-V2.6: GQA, full on a few layers and windowed (128,
+# with sinks) on the rest, keys 192 wide and values 128; a dense first layer
+# then routed experts behind a biased sigmoid router (banks at the
+# deployment's second dtype).
 #
-# The attention kernels read a head 64, 128, 256 or 512 wide, so every head
-# is read 256 wide: queries and keys zero past their 192, values past their
-# 128. The output projection reads each head's first 128 (its values), the
-# padding cut off ahead of it. The scale stays the 192-wide head's.
+# The kernels read heads 64/128/256/512 wide, so heads are zero-padded to 256;
+# the output projection reads each head's first 128. The scale stays the
+# 192-wide head's.
 
 load("//lib/adapters/model.poem", "banks")
 

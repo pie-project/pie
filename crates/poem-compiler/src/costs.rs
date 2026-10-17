@@ -35,19 +35,16 @@ micros! {
 #[decision(id = "compiler.side_streams", constant(range(0..=8)), default = 2, tune = engine)]
 pub struct SideStreams(pub u32);
 
-/// Whether a join's independent branches (the shared and routed experts a
-/// MoE sums, the query, key/value and index chains an attention reads) are
-/// laid side by side and forked onto side streams. Off but where a chip's
-/// profile turns it on.
+/// Whether a join's independent branches (a MoE's shared and routed experts,
+/// an attention's q, kv and index chains) are forked onto side streams. Off
+/// unless a chip's profile turns it on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "compiler.branches", flag, default = false, tune = engine)]
 pub struct Branches;
 
-/// Whether every region a graph can launch is scheduled onto the main and
-/// side streams by its dependencies (`stream::fork_dag`), each a region of
-/// its own op, rather than only a join's disjoint branches: an attention's
-/// query, key/value, compressor and index chains, which share ops and
-/// caches, run side by side. Off but where a chip's profile turns it on.
+/// Whether every launchable region (one an op) is scheduled onto the streams
+/// by its dependencies (`stream::fork_dag`), not only a join's disjoint
+/// branches. Off unless a chip's profile turns it on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "compiler.dag_streams", flag, default = false, tune = engine)]
 pub struct DagStreams;

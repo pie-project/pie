@@ -92,10 +92,9 @@ pub enum ParamLayout {
     },
 }
 
-/// Where a plane may be served from. `Host` names a plane read only by row
-/// gathers (a hashed table), which a card whose profile asks serves from
-/// pinned, device-mapped host memory; every other card, and every plane left
-/// `Device`, holds it in device memory.
+/// Where a plane may be served from. `Host`: read only by row gathers (a
+/// hashed table), so a card whose profile asks serves it from pinned,
+/// device-mapped host memory; otherwise it lives in device memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ParamPlacement {
     #[default]

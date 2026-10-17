@@ -1,10 +1,8 @@
 # How a DeepSeek-V4 checkpoint is laid out. V4.1-Flash: its per-expert
 # release layout, or MLX's stacked one. V4-Flash, V4-Pro and the base: the
-# per-expert release layout (its dense planes bf16, or fp8 beside `.scale`
-# e8m0 exponents; V4-Flash's draft head under `mtp.0.`), an artifact with an
-# `--aux` overlay, the flash mlx spelling, transformers' deepseek-v3 one, or
-# GGUF's; the flash spellings share their names, so a reading is what tells
-# them apart.
+# release layout (dense planes bf16, or fp8 beside `.scale` exponents), an
+# `--aux` artifact, mlx, transformers' deepseek-v3 or GGUF names; the flash
+# spellings share names, so a reading tells them apart.
 
 AFFINE = [dtype.u4g64, dtype.u8g64, dtype.u4g32, dtype.u2g32, dtype.u2g64, dtype.u2g128]
 

@@ -1,9 +1,6 @@
-# Muse Spark Open, and its eight-layer, sixteen-expert miniature (the first
-# eight layers of the release, the first sixteen experts of each bank). The
-# release ships bf16, and NVFP4 experts (modelopt's export: e2m1 under an
-# e4m3 scale a 16, its first and last layers' experts kept bf16), served
-# against bf16 activations or, as vLLM serves them, NVFP4 ones under each
-# expert's calibrated input scale.
+# Muse Spark Open and its eight-layer, sixteen-expert miniature. Ships bf16
+# and modelopt NVFP4 experts (first and last layers' kept bf16), served
+# against bf16 activations or, as vLLM does, NVFP4 ones.
 
 ATEM = template("atem")
 TOKENIZER = tokenizer(markers = [["<|eot|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"]])

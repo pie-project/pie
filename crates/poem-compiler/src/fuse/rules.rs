@@ -205,10 +205,9 @@ fn hc_prenorm_project() -> Rule {
     })
 }
 
-/// DeepSeek-V4's attention: the windowed log-sum-exp attention, the
-/// compressed-pool one over the same q (every visible entry, or those an
-/// index selected), their merge and the sinks over it; the window held
-/// above each row's replay floor where it states one.
+/// DeepSeek-V4's attention: windowed and compressed-pool (all entries or the
+/// indexed ones) log-sum-exp attention over one q, their merge and the sinks;
+/// the window floored at each row's replay floor where it states one.
 fn pool_attention() -> Rule {
     let chain = |selected: bool, rotated: bool, floored: bool| {
         template(move |p| {
@@ -320,10 +319,9 @@ fn pool_attention() -> Rule {
     )
 }
 
-/// A latent attention's prefill: the query absorb, the scoring over every
-/// cached latent row and the output absorb through one `kv_b`, opening on
-/// the cut of `q_b`'s rows where the query reaches it unturned, or on the
-/// two halves.
+/// A latent attention's prefill: query absorb, scoring over every cached
+/// latent row and output absorb through one `kv_b`, opening on the cut of
+/// `q_b`'s rows where the query reaches it unturned, else on the two halves.
 fn mla_prefill_expanded() -> Rule {
     let chain = |split: bool| {
         template(move |p| {
@@ -422,9 +420,6 @@ fn lse_sink() -> Rule {
     })
 }
 
-/// A packed q/k/v row split, YaRN over its q and k, and the rotated k
-/// written to the cache with its v: what `rope_yarn_append` does, reading the
-/// three from the packed row rather than from a split's copies.
 /// Qwen3.5's attention prologue: q cut from its gate, q and k normed per
 /// head (plus-one weights), turned, and k with its v written to the cache,
 /// through the `attn.qv` marker the model sets on the cut q and v.
@@ -488,6 +483,8 @@ fn qg_qknorm_rope_append() -> Rule {
     .when(|m| m.dtype("qg") == Some(Dtype::Bf16))
 }
 
+/// `rope_yarn_append` reading q, k and v straight from a packed q/k/v row
+/// rather than from a split's copies.
 fn split_rope_yarn_append() -> Rule {
     let pattern = template(|p| {
         let packed = p.rows("packed", 3 * W);
@@ -865,13 +862,9 @@ fn mlp_swiglu() -> Rule {
     })
 }
 
-/// A routed gate-up select and its GLU: the select over a dense bank, a
-/// biased one (gpt-oss) or a quantized one, then SwiGLU, its clamp or its
-/// clamp-alpha form, or GeGLU (Gemma 4), over the packed gate|up rows. The packed rows stay
-/// inside the match.
 /// A routed MLP: a gate-up select and its GLU (each `moe_select_glu` form,
-/// or SiTU),
-/// the down select of the GLU on the same routes, and the weighted sum.
+/// or SiTU), the down select of the GLU on the same routes, and the weighted
+/// sum.
 fn moe_experts() -> Rule {
     let mut alternatives = Vec::new();
     // Each leg's select: over a dense bank, a biased one, a quantized one,
@@ -1036,6 +1029,9 @@ fn moe_experts() -> Rule {
     })
 }
 
+/// A routed gate-up select (over a dense, biased or quantized bank) and its
+/// GLU (SwiGLU, its clamp or clamp-alpha form, or GeGLU) over the packed
+/// gate|up rows, which stay inside the match.
 fn moe_select_glu() -> Rule {
     let mut alternatives = Vec::new();
     for select in 0..3 {
@@ -1433,10 +1429,9 @@ fn index_topk_rope() -> Rule {
     )
 }
 
-/// DeepSeek-V4's q (a scale-free norm a head, its tail rotated) and its kv
-/// plane (a scaled norm of a row one head wide, rotated alike and written to
-/// the cache) of one layer: the two read the same positions at the same
-/// rotation, and nothing between them reads either.
+/// DeepSeek-V4's q (scale-free per-head norm, tail rotated) and kv plane
+/// (scaled norm of a one-head row, rotated and cached) of one layer: same
+/// positions and rotation, and nothing between them reads either.
 fn norm_rope_pair() -> Rule {
     let pattern = template(|p| {
         p.free("interleaved");

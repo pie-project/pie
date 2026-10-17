@@ -1,8 +1,7 @@
-# The weights of MiniMax-M3's language model. Every layer is GQA attention
-# with plus-one q/k norms and a partial NeoX rope; the first three are dense,
-# attention over every key and a dense MLP, and every later one reads only the
-# blocks its indexer picks for each kv head, beside routed experts and one
-# shared. Every MLP is a clamped SwiGLU-OAI.
+# The weights of MiniMax-M3's language model: GQA with plus-one q/k norms and
+# a partial NeoX rope; three dense layers, then layers reading only the blocks
+# their indexer picks per kv head, with routed experts and one shared. Every
+# MLP is a clamped SwiGLU-OAI.
 
 def dims(layers = 60, experts = 128):
     return struct(

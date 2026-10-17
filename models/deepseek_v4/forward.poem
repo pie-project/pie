@@ -144,11 +144,9 @@ def caches(m, c):
 # The dtype the forward computes in on every deployment.
 ACT = dtype.bf16
 
-# A causal encoder-decoder's bounded replay (V4.1): a backend may run a long
-# prompt's leading rows through the encoder alone (`fact.encode()` lanes),
-# the decoder replaying only its last window. A sequence's state holds the
-# floor below which its decoder layers hold no window keys, and their
-# windows read none below it.
+# A causal encoder-decoder's bounded replay (V4.1): a long prompt's leading
+# rows may run through the encoder alone (`fact.encode()` lanes), the decoder
+# replaying its last window; its windows read no keys below a lane's floor.
 REPLAY = "replay"
 
 def replay_floor(inputs, positions):
@@ -398,10 +396,8 @@ def layer(m, rows, w, streams, trail, following = None, narrow = False, replays 
         entries = inputs.kv(p.entries)
         row_valid = inputs.row_valid()
         request_of_token = inputs.request_of_token()
-        # Each layer finds its own pool's boundaries. Found once a ratio in
-        # the forward and held across every layer, they cost decode64 5.7 ms
-        # a step and decode8 0.3 ms (fp8 kv, graphs on).
-        # (A CSA2 layer reading its source's pool closes none.)
+        # Each layer finds its own pool's boundaries (cheaper than holding
+        # them across layers). A CSA2 layer reading its source's pool closes none.
         own_index = at.selection == "own" and at.indexer.compressor != None
         if not narrow and (p.owner or own_index):
             bpos, breq, brope = boundaries(pos, row_valid, p.ratio)

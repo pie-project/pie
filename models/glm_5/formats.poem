@@ -1,10 +1,8 @@
 # How a GLM-5 checkpoint is laid out: transformers' names, each expert's
 # projections a tensor of their own; GLM-5.3's draft head the layer after
-# the last. A GLM-5.3 checkpoint stores its projections FP8 in 128-square
-# blocks, their factors beside them as `*_scale_inv`; nvidia's modelopt
-# export of it keeps the attention and shared experts bf16, the dense
-# layers' MLP e4m3 under one scale a projection, and the routed experts
-# NVFP4.
+# the last. GLM-5.3 stores its projections FP8 in 128-square blocks beside
+# `*_scale_inv`; modelopt's export keeps attention and shared experts bf16,
+# the dense MLP per-tensor e4m3, and the routed experts NVFP4.
 
 load("//lib/modelopt/formats.poem", "fp8_tensor_leg", "nvfp4_bank")
 
@@ -158,10 +156,9 @@ def released_fp8(w):
     return w.dtype in [dtype.e4m3tile128, dtype.e4m3tile128a8]
 
 def fp8_bank(reads, w, legs):
-    """A routed bank as the release stores its experts, byte for byte: each
-    expert's legs (`legs[e]`, its gate and up projections or its down) e4m3
-    codes and their `*.weight_scale_inv` f32 block factors, stacked on the
-    leading axis and re-read as the bank's `[experts, ...]` rectangle."""
+    """A routed bank as the release stores it, byte for byte: each expert's
+    legs (`legs[e]`) e4m3 codes and `*.weight_scale_inv` block factors,
+    stacked on the leading axis as the bank's `[experts, ...]` rectangle."""
     experts, rows, cols = w.shape[0], w.shape[1], w.shape[2]
     per = rows // len(legs[0])
     codes = []

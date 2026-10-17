@@ -915,12 +915,9 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Fused::QgQknormRopeAppend { .. } => {
                 &[(In(3), I32), (In(6), CACHE), (In(7), I32), (In(8), I32)]
             }
-            // The attention's own, and the sink's f32 log-sum-exp is its.
-            // The window's plan and cache (inputs 1, 2), the pool's
-            // positions, requests, selection and entries from input 4, and
-            // the three f32 log-sum-exp planes (outputs 1, 3, 5).
-            // A floored window reads its floor at input 3, the pool's
-            // inputs one further on.
+            // The window's plan and cache (inputs 1, 2), the pool's from input
+            // 4 (5 under a floored window, whose floor is input 3), and the
+            // three f32 log-sum-exp planes (outputs 1, 3, 5).
             Fused::PoolAttention { window, pool, .. }
                 if matches!(**window, Attention::PrefillLse { floor: Some(_), .. }) =>
             {
@@ -993,6 +990,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 &[(In(2), MLA_PLAN), (In(3), CACHE)]
             }
             Fused::MlaPrefillExpanded { split: None, .. } => &[(In(2), MLA_PLAN), (In(4), CACHE)],
+            // The attention's own, and the sink's f32 log-sum-exp is its.
             Fused::LseSink { attn, .. } => match **attn {
                 Attention::DecodeLse { .. } => {
                     &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)]

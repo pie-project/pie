@@ -548,10 +548,9 @@ pub struct Precision {
 }
 
 impl Precision {
-    /// The stored dtypes that quantize their activations, by the word a
-    /// deployment's name spells each: NVFP4 against NVFP4 (W4A4, vLLM's
-    /// modelopt product), and MXFP4 (W4A8) and DeepSeek's 128x128-block FP8
-    /// (W8A8) against e4m3 in its 1x128 blocks.
+    /// The stored dtypes that quantize their activations, by deployment-name
+    /// word: NVFP4 against NVFP4 (W4A4), and MXFP4 (W4A8) and DeepSeek's
+    /// 128x128-block FP8 (W8A8) against e4m3 in 1x128 blocks.
     pub const ACTED: [Precision; 6] = [
         Precision {
             dtype: Dtype::Nvfp4,

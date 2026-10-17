@@ -1,8 +1,7 @@
-# The weights of Hy4-preview: latent attention with a sigmoid output gate
-# and a learned sink per head, over the keys a lightning indexer picks (a
-# layer ranks its own or reads the last ranking), a dense first layer and then
-# routed experts, the residual stream carried as four independently
-# hyper-connected streams; an optional MTP draft head.
+# The weights of Hy4-preview: gated latent attention with a sink per head
+# over the keys a lightning indexer picks (own or the last ranking's), a dense
+# first layer then routed experts, four hyper-connected residual streams, and
+# an optional MTP draft head.
 
 load("//lib/adapters/model.poem", "banks")
 

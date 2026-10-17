@@ -1,8 +1,6 @@
-# Muse Spark Open: Muse Glimmer's gated attention (sliding windows, a full
-# NoPE layer every fourth) with a normed head output, residual gates on both
-# sublayers, and a mixture of experts run at a pooled width: the row pooled
-# down and normed, its routed experts each normed on the way out, and the
-# weighted sum unpooled.
+# Muse Spark Open: gated attention (sliding windows, a full NoPE layer every
+# fourth), residual gates on both sublayers, and a mixture of experts at a
+# pooled width (the row pooled and normed, each expert's output normed).
 
 load("//lib/adapters/model.poem", "banks")
 

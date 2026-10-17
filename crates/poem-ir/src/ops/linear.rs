@@ -3,10 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::operands::Operands;
 use crate::value::ValueId;
 
-/// The precision a product quantizes its bf16 activations to before it
-/// multiplies them by a weight's stored codes: a property of the weight's
-/// deployment (`nvfp4a4`, `mxfp4a8`), not of the trace's activations, which
-/// stay bf16 between products.
+/// The precision a product quantizes its bf16 activations to before reading
+/// a weight's codes: a property of the weight's deployment (`nvfp4a4`,
+/// `mxfp4a8`); activations stay bf16 between products.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ActQuant {
     /// NVFP4: e2m1 under an e4m3 scale a 16, the scales under the static

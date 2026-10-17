@@ -1438,10 +1438,9 @@ fn mx_planes(
     ])
 }
 
-/// An fp8b128 weight as DeepSeek releases it: each leg `{stem}.weight` raw
-/// e4m3 codes beside `{stem}.scale`, one e8m0 exponent a 128x128 block, both
-/// landed as stored; legs join along their rows, each a whole number of
-/// blocks.
+/// An fp8b128 weight as DeepSeek releases it: raw e4m3 `{stem}.weight` beside
+/// `{stem}.scale` (one e8m0 exponent a 128x128 block), landed as stored; legs
+/// join along their rows, each a whole number of blocks.
 fn fp8_block_planes(
     src: &ztensor::Source,
     w: &Weight,
@@ -1530,13 +1529,11 @@ fn fp8_block_planes(
     ])
 }
 
-/// An NVFP4 weight from modelopt's planes: each leg `{stem}.weight` packs
-/// two e2m1 codes a byte, `{stem}.weight_scale` holds an e4m3 per 16 codes,
-/// `{stem}.weight_scale_2` the leg's f32 tensor scale and
-/// `{stem}.input_scale` the static scale its activations were calibrated to.
-/// The tensor scale lands once per row, so legs joined along their rows keep
-/// their own; joined legs read one activation, so the first leg's input
-/// scale is the weight's.
+/// An NVFP4 weight from modelopt's planes: `{stem}.weight` (two e2m1 codes a
+/// byte), `.weight_scale` (e4m3 per 16), `.weight_scale_2` (f32 tensor scale)
+/// and `.input_scale` (static activation scale). Legs joined along rows keep
+/// their own tensor scale (it lands per row) but read one activation, so the
+/// first leg's input scale is the weight's.
 fn nv_planes(
     src: &ztensor::Source,
     w: &Weight,

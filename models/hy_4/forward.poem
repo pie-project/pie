@@ -1,8 +1,6 @@
-# The forward of Hy4-preview: each sublayer's input gated out of the four
-# hyper-connected streams and its output folded back onto each of them; latent
-# attention over the keys the last ranking layer picked, rescaled by a sink
-# and gated; the streams collapsed into the row the head reads; and the MTP
-# head drafting from the trunk's last normed rows.
+# The forward of Hy4-preview: sublayers gated out of and folded back into
+# four hyper-connected streams; latent attention over the keys the last
+# ranking layer picked, sink-rescaled and gated; and the MTP draft head.
 
 def gate(streams, mix, hy):
     """The sublayer input `mix` reads out of `streams`, and the post and

@@ -1,11 +1,7 @@
-# How a MiMo-V2.6 checkpoint is laid out: transformers' names, the routed
-# experts one plane per expert (MXFP4 codes as `.weight` beside their
-# `.weight_scale` exponents), the dense projections fp8 beside their
-# `weight_scale_inv` block factors.
-#
-# The fused qkv is stored pre-sharded at `shards` chunks, each chunk its own
-# heads' queries, then keys, then values ([Q_0|K_0|V_0|Q_1|...]), so each
-# head is read out of its chunk and laid out 256 wide.
+# How a MiMo-V2.6 checkpoint is laid out: transformers' names, routed experts
+# one MXFP4 plane each (`.weight` beside `.weight_scale`), dense projections
+# fp8 beside `weight_scale_inv`. The fused qkv is pre-sharded in `shards`
+# chunks ([Q_0|K_0|V_0|Q_1|...]); each head is read out and laid 256 wide.
 
 FP8 = raw(dtype.e4m3)
 

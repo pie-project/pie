@@ -141,10 +141,9 @@ def layout(id, deploy):
         fail("{} stores its weights at one dtype, or its weights and experts at a dtype each (and its dense layers' MLP at a third), and its draft experts at a third with the draft head; not {}".format(id, ws))
     if not (not mtp and len(ws) == 3):
         dense_mlp = None
-    # The release's FP8 projections as released: the projections at their
-    # 128x128-block FP8 against e4m3 activations, the norms, tables, router,
-    # indexer weights and the latent's up-projection (which the absorbs read
-    # as bf16) at bf16, as the release keeps or vLLM reads them.
+    # The release's FP8 as released: projections at 128x128-block FP8 against
+    # e4m3 activations; norms, tables, router, indexer and the latent's
+    # up-projection (the absorbs read it as bf16) at bf16, as vLLM reads them.
     proj = w
     if w == dtype.e4m3tile128a8:
         w = dtype.bf16

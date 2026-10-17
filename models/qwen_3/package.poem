@@ -1,8 +1,7 @@
-# Qwen 3.5 / 3.6 / 3.8, Qwen3.8 Max and Ornith-1.5: gated-delta (GDN)
-# layers with a gated attention one every few, dense or routed MLPs, a vision
-# tower, and the drafters each pairs with (MTP, EAGLE, DFlash, DFlash2,
-# DSpark). The Ternary-Bonsai 27B and the test geometries are models of it
-# too, listed nowhere: a test traces and imports them by id.
+# Qwen 3.5 / 3.6 / 3.8, Qwen3.8 Max and Ornith-1.5: GDN layers with gated
+# attention every few, dense or routed MLPs, a vision tower, and their
+# drafters. Ternary-Bonsai 27B and the test geometries are unlisted models of
+# it that tests trace and import by id.
 
 load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
 

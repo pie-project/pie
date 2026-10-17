@@ -242,9 +242,8 @@ def moe_flash(n, d, experts, gate, banks, weights, dense, top_k = None):
 
 def flash(w, r, kv, d, quant = None):
     """V4-Flash or V4-Pro at `w`, its routed banks as `r` says; with `quant`
-    the projections DeepSeek's reference reads at fp8 (attention's q and kv
-    downs and ups, its output's up, the indexer's q up and the shared
-    expert) are stored and read at that precision, the rest at `w`."""
+    the projections DeepSeek's reference reads at fp8 are at that precision,
+    the rest at `w`."""
     dense = compute(w)
     hidden = d.hidden
     streams = d.streams
@@ -480,10 +479,8 @@ def engram_hash_constants(e, engram_layers, which):
 
 def flash41(w, r, kv, d, quant = None, dspark = False):
     """V4.1-Flash at `w`, its routed banks as `r` says; with `quant` the
-    projections DeepSeek's reference reads at fp8 (attention's q and kv
-    downs and ups, its output's up, the indexer's q up, the shared expert
-    and Engram's key-value projection) are stored and read at that
-    precision, the rest at `w`. With `dspark`, its DSpark draft head."""
+    projections DeepSeek's reference reads at fp8 are at that precision, the
+    rest at `w`. With `dspark`, its DSpark draft head."""
     plan = d.plan
     dense = compute(w)
     q = quant if quant != None else w
@@ -576,11 +573,10 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
 
     def block(prefix, l, kv_name, ratio, pool, indexer, selection, engram, experts, top_k,
               window_sink = None):
-        """A V4.1 block under `prefix` (its routed banks stored as layer
-        `l`'s): its attention over the window `kv_name` and `pool`, its MoE
-        of `experts` taken `top_k` a row. With `window_sink`, a DSpark
-        stage's: its rows read that many window positions ending at their
-        lane's last."""
+        """A V4.1 block under `prefix` (routed banks stored as layer `l`'s):
+        attention over the window `kv_name` and `pool`, MoE of `experts` taken
+        `top_k` a row. With `window_sink`, a DSpark stage's: its rows read that
+        many window positions ending at their lane's last."""
         n = lambda s: "{}.{}".format(prefix, s)
         norm = lambda s, dim: weight(n(s), [dim], dense)
         lora_a, lora_b = banks(prefix, hidden, dense)

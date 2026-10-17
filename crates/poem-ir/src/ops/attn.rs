@@ -569,10 +569,9 @@ pub enum Attention {
         ngram_ids: ValueId,
     },
     /// Bounded replay's floor, a lane's least position whose window keys a
-    /// replaying layer holds: with `mark` the lane's rows are the ones it
-    /// skips, and its state takes the position past its last row; without,
-    /// each row reads the floor its lane's state holds (0 for a lane that
-    /// never skipped). `floor` is i32 a row.
+    /// replaying layer holds: with `mark` the rows are ones it skips and the
+    /// lane's state moves past them; without, each row reads its lane's floor
+    /// (0 if it never skipped). `floor` is i32 a row.
     ReplayFloor {
         positions: ValueId,
         state: ValueId,
@@ -601,13 +600,11 @@ pub enum Attention {
         sm_scale: f32,
         o: ValueId,
     },
-    /// DSpark's Markov head over a drafted block's readouts: a readout's
-    /// depth in its block is its position past the block's first
-    /// (`ends - block + 1`, `ends` its lane's last key); one at depth `i`
-    /// takes the bias `head . embed[t]` of the token `t` the readout before
-    /// it (depth `i - 1`) picked (depth 0, its own token in `tokens`), and
-    /// picks its biased logits' argmax. `tokens`, `positions` and `ends` i32
-    /// a readout, `biased` the logits as biased.
+    /// DSpark's Markov head over a drafted block's readouts: the one at depth
+    /// `i` (its position past `ends - block + 1`, `ends` its lane's last key)
+    /// adds the bias `head . embed[t]` of the token `t` picked at depth `i - 1`
+    /// (at depth 0, its own in `tokens`) and picks the argmax. `tokens`,
+    /// `positions` and `ends` are i32 a readout; `biased` the biased logits.
     MarkovWalk {
         logits: ValueId,
         tokens: ValueId,
@@ -634,11 +631,9 @@ pub enum IndexScore {
     /// run of `top_k` blocks for each head, ascending, the row's own block
     /// always in it, and every visible block when they fit.
     BlockMax,
-    /// `Pooled`'s ranking, its `top_k` closed blocks read back as the raw
-    /// tokens each stands for (`ratio` a block), then the row's own open
-    /// block's tokens: `top_k * ratio + ratio - 1` token indices a row,
-    /// unused ones -1 (GLM-5.3-Flash's k-pool indexer, whose attention reads
-    /// the latent rows themselves).
+    /// `Pooled`'s ranking, its `top_k` closed blocks expanded to their raw
+    /// tokens (`ratio` a block), then the row's own open block's: `top_k *
+    /// ratio + ratio - 1` token indices a row, unused -1 (GLM-5.3-Flash).
     PooledTokens,
 }
 

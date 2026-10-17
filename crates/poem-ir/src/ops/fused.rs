@@ -127,13 +127,11 @@ pub enum Fused {
     /// DeepSeek-V4's q (`NormRopeLast`, scale-free) and its kv plane
     /// (`NormRopeLastAppend`) of one layer, landed together.
     NormRopePair { q: Box<Fused>, kv: Box<Fused> },
-    /// DeepSeek-V4's compressor at its boundaries: the gathered entries
-    /// (`PoolGather`), their RMS norm times `weight` into `latent`, its tail
-    /// rotated (`rotate`, a `RopePartialLast` over `latent`) and written to
-    /// the pool (`append`, a `PoolKvAppend` of the rotation's output). The
-    /// gathered and normed rows are read by nothing else. `state`, where
-    /// the fire's compressor state is written just before (a
-    /// `PoolStateWrite` into the gather's pages), lands it too.
+    /// DeepSeek-V4's compressor at its boundaries: gathered entries
+    /// (`PoolGather`) RMS-normed by `weight` into `latent`, its tail rotated
+    /// (`rotate`) and appended to the pool (`append`); the gathered and normed
+    /// rows are read by nothing else. `state`, if set, also lands the fire's
+    /// compressor state written just before (a `PoolStateWrite`).
     PoolCompress {
         gather: Box<Attention>,
         weight: ValueId,
@@ -217,73 +215,60 @@ pub enum Fused {
         left: ValueId,
         right: ValueId,
     },
-    /// A routed gate-up select (`MoeMatmulSelect`, `..Bias` or `..Quant`,
-    /// its `y` the packed gate|up rows) and the GLU of it (`MlpSwiglu`,
-    /// `..Clamp`, `..ClampAlpha` or `MlpGegluTanhPacked`): a backend may land the GLU from the
-    /// select's epilogue, or run the two. The packed rows are still an
-    /// output, read by nothing else.
+    /// A routed gate-up select (`MoeMatmulSelect`, `..Bias` or `..Quant`, `y`
+    /// the packed gate|up rows) and its GLU (`MlpSwiglu`, `..Clamp`,
+    /// `..ClampAlpha` or `MlpGegluTanhPacked`), landable from the select's
+    /// epilogue. The packed rows are still an output, read by nothing else.
     MoeSelectGlu {
         select: Box<Linear>,
         glu: Box<Linear>,
     },
-    /// A log-sum-exp attention (`DecodeLse` or `PrefillLse`) and the sinks
-    /// over its output (`Sink`): a backend lands the sinked output in
-    /// `o_out`, in the attention's fold of a split or after it. The
-    /// attention's `o` (read by nothing else) and `lse` are still outputs.
+    /// A log-sum-exp attention (`DecodeLse` or `PrefillLse`) and its sinks
+    /// (`Sink`), the sinked output landed in `o_out`. The attention's `o`
+    /// (read by nothing else) and `lse` are still outputs.
     LseSink {
         attn: Box<Attention>,
         sink: ValueId,
         head_dim: u32,
         o_out: ValueId,
     },
-    /// A sublayer's whole hyper-connection pre-mix: the stream norm
-    /// (`norm`, an `HcRmsnormF32`), the mix projection over it (`project`, an
-    /// `HcProject`), the combined gates over the mixes (`gates`, an
-    /// `HcGates`) and the RMS norm over the row they pre-mix (`rmsnorm`, an
-    /// `Rmsnorm`): a backend lands the post and combine mixes and the normed
-    /// row in two passes, or runs the four. The normed streams, the mixes
-    /// and the pre-mixed row are still outputs, read by nothing else.
+    /// A sublayer's whole hyper-connection pre-mix: stream norm (`norm`, an
+    /// `HcRmsnormF32`), mix projection (`project`, an `HcProject`), combined
+    /// gates (`gates`, an `HcGates`) and the pre-mixed row's `rmsnorm`. The
+    /// intermediates are still outputs, read by nothing else.
     HcPre {
         norm: Box<Elementwise>,
         project: Box<Elementwise>,
         gates: Box<Elementwise>,
         rmsnorm: Box<Elementwise>,
     },
-    /// The combined hyper-connection gates and the RMS norm over the row
-    /// they pre-mix (`gates` an `HcGates`, `norm` an `Rmsnorm` of its `x`):
-    /// a backend lands the post and combine mixes and the normed row in one
-    /// pass, or runs the two. The pre-mixed row is still an output, read by
-    /// nothing else.
+    /// The combined hyper-connection gates (`gates`, an `HcGates`) and the RMS
+    /// norm of the row they pre-mix (`norm`), landable in one pass. The
+    /// pre-mixed row is still an output, read by nothing else.
     HcGatesNorm {
         gates: Box<Elementwise>,
         norm: Box<Elementwise>,
     },
-    /// AttnRes's blend and the RMS norm over the row it blends (`blend` a
-    /// `ResBlend`, `norm` an `Rmsnorm` of its `y`): a backend lands the
-    /// normed row in one pass, or runs the two. The blended row is still an
-    /// output, read by nothing else.
+    /// AttnRes's blend (`blend`, a `ResBlend`) and the RMS norm of its row
+    /// (`norm`), landable in one pass. The blended row is still an output,
+    /// read by nothing else.
     ResBlendRmsnorm {
         blend: Box<Elementwise>,
         norm: Box<Elementwise>,
     },
-    /// A hyper-connection stream norm and the mix projection it feeds
-    /// (`norm` an `HcRmsnormF32`, `project` an `HcProject` of its rows): a
-    /// backend lands the mixes from the streams in one pass, the norm's
-    /// scale a row taken out of the dot, or runs the two. The normed rows
-    /// are still an output, read by nothing else.
+    /// A hyper-connection stream norm (`norm`, an `HcRmsnormF32`) and the mix
+    /// projection it feeds (`project`, an `HcProject`), landable in one pass
+    /// with the norm's per-row scale taken out of the dot. The normed rows are
+    /// still an output, read by nothing else.
     HcPrenormProject {
         norm: Box<Elementwise>,
         project: Box<Elementwise>,
     },
-    /// DeepSeek-V4's attention whole: a windowed log-sum-exp attention
-    /// (`window`, a `PrefillLse`), a compressed-pool one over the same q
-    /// (`pool`, a `PoolLse` or `PoolLseSelected`), their merge (`merge`, a
-    /// `MergeLse` of the two) and the sinks over the merged output: a
-    /// backend lands the sinked output in `o_out` in one pass, or runs the
-    /// four. Every intermediate is still an output, read by nothing else.
-    /// `rotate`, where the sinked output's tail is turned next (a
-    /// `RopePartialLast` of `o_out` at the pool's positions, DeepSeek-V4's
-    /// inverse rotation), lands its rotated rows too.
+    /// DeepSeek-V4's whole attention: windowed (`window`, a `PrefillLse`) and
+    /// compressed-pool (`pool`, a `PoolLse` or `PoolLseSelected`) attention
+    /// over one q, their `merge` (a `MergeLse`) and the sinks, landed in
+    /// `o_out`; every intermediate is still an output, read by nothing else.
+    /// `rotate` (the inverse rotation of `o_out`'s tail) lands too.
     PoolAttention {
         window: Box<Attention>,
         pool: Box<Attention>,
@@ -293,14 +278,12 @@ pub enum Fused {
         o_out: ValueId,
         rotate: Option<Box<Elementwise>>,
     },
-    /// A latent attention's prefill whole: where it opens on them, the cut
-    /// of `q_b`'s rows into their two halves (`split`, an `MlaSplitQB`),
-    /// the query absorb (`absorb_q`), the scoring over every cached latent
-    /// row (`prefill`, an `MlaPrefill`) and the output absorb
-    /// (`absorb_out`) through the same `kv_b`. A backend may land the
-    /// output absorb's rows expanded (a key and value head a query head),
-    /// or run the ops. Every intermediate is still an output, read by
-    /// nothing else.
+    /// A latent attention's whole prefill: the optional cut of `q_b`'s rows
+    /// (`split`, an `MlaSplitQB`), query absorb (`absorb_q`), scoring over
+    /// every cached latent row (`prefill`) and output absorb (`absorb_out`)
+    /// through one `kv_b`, whose rows a backend may land expanded (a k and v
+    /// head a q head). Every intermediate is still an output, read by nothing
+    /// else.
     MlaPrefillExpanded {
         split: Option<Box<Attention>>,
         absorb_q: Box<Attention>,
@@ -329,12 +312,10 @@ pub enum Fused {
         q_out: ValueId,
         k_out: ValueId,
     },
-    /// Qwen3.5's attention prologue: the q heads cut from their `[q | gate]`
-    /// rows (`split_q_gate`), q and k normed per head with plus-one weights
-    /// (`rmsnorm_per_head_plus_one`), their rotary prefixes turned
-    /// (`rope_partial`), and the turned k with its v landed in the paged
-    /// cache (`kv_append`). `q_split`, `q_normed`, `k_normed` and `k_out` are
-    /// read by nothing else; a backend may leave them unwritten.
+    /// Qwen3.5's attention prologue: q cut from `[q | gate]` (`split_q_gate`),
+    /// q and k normed per head (`rmsnorm_per_head_plus_one`), their rotary
+    /// prefixes turned (`rope_partial`) and k with v cached (`kv_append`).
+    /// `q_split`, `q_normed`, `k_normed` and `k_out` may be left unwritten.
     QgQknormRopeAppend {
         qg: ValueId,
         k: ValueId,
@@ -358,11 +339,9 @@ pub enum Fused {
         q_out: ValueId,
         k_out: ValueId,
     },
-    /// A packed q/k/v row split (`split_qkv`), YaRN over its q and k, and
-    /// the rotated k with its v landed in the paged cache (`kv_append`):
-    /// `RopeYarnAppend` reading its three straight from the packed row.
-    /// `k_out` and `v_out` (the split's k and v) are read by nothing else; a
-    /// backend may leave them unwritten.
+    /// `RopeYarnAppend` reading q, k and v straight from a packed row split by
+    /// `split_qkv`. `k_out` and `v_out` (the split's k and v) may be left
+    /// unwritten.
     SplitRopeYarnAppend {
         packed: ValueId,
         q_width: u32,
@@ -383,13 +362,11 @@ pub enum Fused {
         k_out: ValueId,
         v_out: ValueId,
     },
-    /// A routed MLP: the gate-up select and its GLU (as in `MoeSelectGlu`),
-    /// the down select of the GLU on the same routes, and the weighted sum
-    /// of its rows a token (`MoeWeightedSum`), and where it follows, the
-    /// shared expert's row added under its sigmoid gate
-    /// (`MoeSigmoidGateAdd`). A backend may keep the rows between in its own
-    /// layout, or run the ops. The packed, GLU and routed rows (and the sum,
-    /// under a gate) are still outputs, read by nothing else.
+    /// A routed MLP: gate-up select and GLU (as in `MoeSelectGlu`), the down
+    /// select on the same routes, the per-token weighted sum (`MoeWeightedSum`)
+    /// and, where it follows, the sigmoid-gated shared expert
+    /// (`MoeSigmoidGateAdd`). The rows between (and the sum, under a gate) are
+    /// still outputs, read by nothing else.
     MoeExperts {
         select: Box<Linear>,
         glu: Box<Linear>,
@@ -601,9 +578,6 @@ impl Operands for Fused {
                 attn.inputs(sink);
                 sink.push(*sinks);
             }
-            // The window's (q, plan, cache), the pool's (q, positions,
-            // requests, its selection, entries), then the sinks: the merge
-            // reads only what the two land.
             // The streams, the plane, the gates' scale and base, the weight.
             Self::HcPre {
                 norm,
@@ -640,6 +614,9 @@ impl Operands for Fused {
                     sink.push(weight);
                 }
             }
+            // The window's (q, plan, cache), the pool's (q, positions,
+            // requests, its selection, entries), then the sinks: the merge
+            // reads only what the two land.
             Self::PoolAttention {
                 window,
                 pool,

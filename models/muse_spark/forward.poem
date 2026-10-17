@@ -1,8 +1,6 @@
-# The forward of Muse Spark Open: Muse Glimmer's gated attention over a
-# sliding window (every fourth layer over the whole context, unrotated), its
-# heads normed before the gate, each sublayer's output normed and joined to
-# the stream through a residual gate, and a mixture of experts at a pooled
-# width.
+# The forward of Muse Spark Open: gated sliding-window attention (every
+# fourth layer full and unrotated), sublayer outputs normed and joined to the
+# stream through a residual gate, and a mixture of experts at a pooled width.
 
 WINDOWED = 0
 FULL = 1

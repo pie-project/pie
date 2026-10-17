@@ -1,9 +1,7 @@
-# How a GLM-5.3-Flash checkpoint is laid out: mlx's names, as mlx quantizes
-# them; the release's own (transformers' names, its projections FP8 in
-# 128-square blocks beside `*_scale_inv`, each expert's projections a tensor
-# of their own); or an artifact already imported, its draft head and vision
-# tower overlaid under `aux.` (`pie model import --aux`), the trunk read as
-# the artifact holds it.
+# How a GLM-5.3-Flash checkpoint is laid out: mlx's names and quantization;
+# the release's own (transformers' names, FP8 in 128-square blocks beside
+# `*_scale_inv`); or an imported artifact with its draft head and vision
+# tower overlaid under `aux.` (`pie model import --aux`).
 
 BF = raw(dtype.bf16)
 

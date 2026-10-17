@@ -305,11 +305,9 @@ MIXED_2BIT = struct(
     table = dtype.u4g32,
 )
 
-# modelopt's NVFP4 export as stored: the routed experts e2m1 under e4m3
-# scales, read against bf16 activations (`dtype.nvfp4`) or NVFP4 ones
-# (`dtype.nvfp4a4`); the n-gram table e4m3 under one scale (its 320M rows a
-# byte a value, widened only where a token's hashes gather them); the rest
-# bf16.
+# modelopt's NVFP4 export as stored: routed experts NVFP4, against bf16
+# (`dtype.nvfp4`) or NVFP4 activations (`dtype.nvfp4a4`); the n-gram table
+# e4m3 under one scale, widened only at gathered rows; the rest bf16.
 def nvfp4_mix(experts):
     return struct(
         embed = dtype.bf16,

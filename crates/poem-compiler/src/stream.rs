@@ -58,15 +58,11 @@ pub(crate) fn fork_with(
     forks
 }
 
-/// Every region scheduled onto the main stream and `side_streams` side
-/// streams by its dependencies, a list schedule over the regions' priced
-/// costs: each launchable region starts on the lane it can start soonest on
-/// (the main lane where no other starts it sooner, so a chain comes back to
-/// it and its scratch is the main stream's, not a second copy sized to the
-/// widest fire that forks), waiting on the close of the last region it
-/// follows on each other lane; a region a graph cannot fork (or
-/// the last) runs on the main lane after every lane's last region. Regions
-/// on different lanes that no lane order or wait orders run side by side.
+/// Every region list-scheduled by its dependencies and priced cost onto the
+/// main and `side_streams` side streams: a launchable region starts on the
+/// lane it can start soonest (the main one on ties, so scratch stays the main
+/// stream's), waiting on the last region it follows on each other lane; an
+/// unforkable region (and the last) runs on the main lane after every lane.
 ///
 /// With `fixed` (each node's lane), a forkable region takes its first
 /// node's lane rather than choosing one.

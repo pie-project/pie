@@ -73,9 +73,8 @@ pub fn compile_axes(
 
     struct_readers_share_one_window(trace, &classes)?;
 
-    // Scheduled by dependencies (`compiler.dag_streams`): each op's lane
-    // found over regions of an op each, then regions broken only where the
-    // lane changes (a region an op costs a prefill 2%).
+    // Scheduled by dependencies (`compiler.dag_streams`): each op's lane is
+    // found over one-op regions, then regions break only where lanes change.
     let lanes = if profile.dag_streams {
         let every: std::collections::BTreeSet<u32> = (0..trace.nodes.len() as u32).collect();
         let mut fine = region::coalesce_breaking(trace, &classes, &every)?;

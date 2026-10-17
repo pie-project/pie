@@ -8,14 +8,11 @@ F32 = raw(dtype.f32)
 BF16 = raw(dtype.bf16)
 
 def nvfp4_bank(reads, w, experts):
-    """A routed bank of modelopt NVFP4 experts, `experts` the stems of each
-    expert's legs (gate and up, or down): `{stem}.weight` packs two e2m1 codes
-    a byte beside `{stem}.weight_scale`, an e4m3 per 16 codes, and the scalars
-    `{stem}.weight_scale_2` (the leg's tensor scale) and `{stem}.input_scale`
-    (its activations'). The legs stack on the leading axis, which is the
-    bank's `[experts, rows, cols]` rectangle byte for byte; a leg's tensor
-    scale lands once a row of it, and an expert's legs read one activation,
-    so its first leg's input scale is the expert's."""
+    """A routed bank of modelopt NVFP4 experts, `experts` each expert's leg
+    stems: `.weight` (e2m1 pairs), `.weight_scale` (e4m3 per 16), and scalars
+    `.weight_scale_2` (tensor scale, landed once a row) and `.input_scale`.
+    Legs stack into `[experts, rows, cols]`; an expert's legs read one
+    activation, so its first leg's input scale is the expert's."""
     if w.dtype != dtype.nvfp4:
         fail("`{}`: this checkpoint's experts are NVFP4, and this deployment reads them as {}; import the deployment that keeps them NVFP4".format(w.name, w.dtype))
     count, rows, cols = w.shape[0], w.shape[1], w.shape[2]
@@ -67,14 +64,11 @@ def fp8_tensor_leg(reads, name):
 
 
 def nvfp4_stacked_bank(reads, w, stem, legs = None):
-    """A routed bank of modelopt NVFP4 experts stored stacked, one tensor a
-    bank: `{stem}` packs `[experts, rows, cols / 2]` e2m1 code pairs beside
-    `{stem}_weight_scale` (an e4m3 per 16 codes), `{stem}_weight_scale_2`
-    (each expert's tensor scale, `[experts]`, or `[experts, legs]` a leg
-    where its gate and up legs stack) and `{stem}_input_scale` (its
-    activations', the same shape: an expert's legs read one activation, so
-    its first leg's is the expert's). A leg's tensor scale lands once a row
-    of it."""
+    """A routed bank of modelopt NVFP4 experts stored stacked: `{stem}` e2m1
+    pairs `[experts, rows, cols / 2]`, `_weight_scale` (e4m3 per 16), and
+    `_weight_scale_2` / `_input_scale` (`[experts]`, or `[experts, legs]`
+    where gate and up stack). Tensor scales land once a row; an expert's
+    legs read one activation, so its first leg's input scale is the expert's."""
     if w.dtype not in [dtype.nvfp4, dtype.nvfp4a4]:
         fail("`{}`: this checkpoint's experts are NVFP4, and this deployment reads them as {}; import the deployment that keeps them NVFP4".format(w.name, w.dtype))
     count, rows, cols = w.shape[0], w.shape[1], w.shape[2]
