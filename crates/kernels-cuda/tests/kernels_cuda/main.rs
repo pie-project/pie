@@ -1,10 +1,10 @@
 //! kernels-cuda's integration tests, one binary: each module was a test file.
 #![cfg(feature = "cuda")]
 
-mod common;
 mod a_body_captured_on_its_own_stream_takes_its_owners_tile;
 mod a_qkv_split_reaches_every_row_of_a_tall_fire;
 mod a_trimmed_pixel_shuffle_drops_its_anchor_frames;
+mod common;
 mod deepseeks_attention_answers_the_reference;
 mod every_dit_seat_entry_retires_the_staged_windows_padded_rows;
 mod the_axial_rope_answers_the_one_axis_kernel_and_the_three_axis_reference;
