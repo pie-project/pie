@@ -13,6 +13,64 @@ const FILE: &str = "layout/embed_e4m3.cuh";
 
 const BLOCK: u32 = 256;
 
+/// The heads `ids` names a row and each one's width of `y`.
+fn head_width(op: &'static str, ids: Tensor, y: &Tensor) -> Result<(u32, u32), Error> {
+    debug_assert_eq!(ids.dtype, Dtype::I32, "`{op}` gathers by i32 rows");
+    let heads = nonzero(op, "the hashed head count", ids.width)?;
+    if y.width == 0 || !y.width.is_multiple_of(heads) {
+        return Err(refuse(
+            op,
+            format!(
+                "the {}-wide output is not a whole number of {heads} head slices",
+                y.width
+            ),
+        ));
+    }
+    debug_assert_eq!(y.rows, ids.rows, "one output row per id row");
+    Ok((heads, y.width / heads))
+}
+
+/// The gather a thread `per` of each head's slice of a row.
+#[allow(clippy::too_many_arguments)]
+fn gather(
+    ctx: &Ctx,
+    op: &'static str,
+    entry: &str,
+    ids: Tensor,
+    codes: Tensor,
+    scale: Tensor,
+    vocab: u32,
+    (heads, width, per): (u32, u32, u32),
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let t = dtype_dispatch!(op, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let rows = nonzero(op, "rows", ids.rows)?;
+    let total = u64::from(rows) * u64::from(heads) * u64::from(per);
+    let lanes = u32::try_from(total).map_err(|_| {
+        refuse(
+            op,
+            format!("{total} elements do not fit a 32-bit launch extent"),
+        )
+    })?;
+    let entry = entry.replace('T', t);
+    ctx.fire(
+        op,
+        Fire::at(FILE, symbol(&format!("::pie::layout::{entry}")))
+            .apply(Launch::flat(lanes, BLOCK)),
+        &[
+            ids.arg(),
+            codes.arg(),
+            scale.arg(),
+            y.arg(),
+            stated(op, rows)?.arg(),
+            stated(op, heads)?.arg(),
+            stated(op, width)?.arg(),
+            stated(op, vocab)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 /// `y[r, h * width ..]` is `codes[ids[r, h]] · scale`: `codes` the `[vocab,
 /// width]` table bound as bytes, `scale` its one f32 bound as four bytes.
 pub fn embed_concat_e4m3(
@@ -24,19 +82,7 @@ pub fn embed_concat_e4m3(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "layout.embed_concat";
-    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 rows");
-    let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let heads = nonzero(OP, "the hashed head count", ids.width)?;
-    if y.width == 0 || !y.width.is_multiple_of(heads) {
-        return Err(refuse(
-            OP,
-            format!(
-                "the {}-wide output is not a whole number of {heads} head slices",
-                y.width
-            ),
-        ));
-    }
-    let width = y.width / heads;
+    let (heads, width) = head_width(OP, ids, y)?;
     let held = u64::from(codes.rows) * u64::from(codes.width);
     if held != u64::from(vocab) * u64::from(width) || scale.rows * scale.width != 4 {
         return Err(refuse(
@@ -48,40 +94,23 @@ pub fn embed_concat_e4m3(
             ),
         ));
     }
-    debug_assert_eq!(y.rows, ids.rows, "one output row per id row");
-    let rows = nonzero(OP, "rows", ids.rows)?;
     // Sixteen codes a thread where every row is whole 16-byte runs of an
-    // aligned table: the same widening, code for code, in a sixteenth of
-    // the requests (which is what counts where the table is mapped host
-    // memory).
-    let vec16 = width.is_multiple_of(16) && codes.ptr % 16 == 0;
-    let (entry, per) = if vec16 {
-        ("embed_concat_e4m3_vec16", width / 16)
+    // aligned table: the same widening in a sixteenth of the requests.
+    let (entry, per) = if width.is_multiple_of(16) && codes.ptr % 16 == 0 {
+        ("embed_concat_e4m3_vec16<T, false>", width / 16)
     } else {
-        ("embed_concat_e4m3", width)
+        ("embed_concat_e4m3<T>", width)
     };
-    let total = u64::from(rows) * u64::from(heads) * u64::from(per);
-    let lanes = u32::try_from(total).map_err(|_| {
-        refuse(
-            OP,
-            format!("{total} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    ctx.fire(
+    gather(
+        ctx,
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::layout::{entry}<{t}>")))
-            .apply(Launch::flat(lanes, BLOCK)),
-        &[
-            ids.arg(),
-            codes.arg(),
-            scale.arg(),
-            y.arg(),
-            stated(OP, rows)?.arg(),
-            stated(OP, heads)?.arg(),
-            stated(OP, width)?.arg(),
-            stated(OP, vocab)?.arg(),
-            ctx.stage(),
-        ],
+        entry,
+        ids,
+        codes,
+        scale,
+        vocab,
+        (heads, width, per),
+        y,
     )
 }
 
@@ -97,19 +126,7 @@ pub fn embed_concat_mxfp8(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "layout.embed_concat";
-    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 rows");
-    let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let heads = nonzero(OP, "the hashed head count", ids.width)?;
-    if y.width == 0 || !y.width.is_multiple_of(heads) {
-        return Err(refuse(
-            OP,
-            format!(
-                "the {}-wide output is not a whole number of {heads} head slices",
-                y.width
-            ),
-        ));
-    }
-    let width = y.width / heads;
+    let (heads, width) = head_width(OP, ids, y)?;
     if !width.is_multiple_of(32) || codes.ptr % 16 != 0 {
         return Err(refuse(
             OP,
@@ -126,32 +143,16 @@ pub fn embed_concat_mxfp8(
             ),
         ));
     }
-    debug_assert_eq!(y.rows, ids.rows, "one output row per id row");
-    let rows = nonzero(OP, "rows", ids.rows)?;
-    let total = u64::from(rows) * u64::from(heads) * u64::from(width / 16);
-    let lanes = u32::try_from(total).map_err(|_| {
-        refuse(
-            OP,
-            format!("{total} runs do not fit a 32-bit launch extent"),
-        )
-    })?;
-    ctx.fire(
+    let entry = "embed_concat_e4m3_vec16<T, true>";
+    gather(
+        ctx,
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!("::pie::layout::embed_concat_mxfp8_vec16<{t}>")),
-        )
-        .apply(Launch::flat(lanes, BLOCK)),
-        &[
-            ids.arg(),
-            codes.arg(),
-            exps.arg(),
-            y.arg(),
-            stated(OP, rows)?.arg(),
-            stated(OP, heads)?.arg(),
-            stated(OP, width)?.arg(),
-            stated(OP, vocab)?.arg(),
-            ctx.stage(),
-        ],
+        entry,
+        ids,
+        codes,
+        exps,
+        vocab,
+        (heads, width, width / 16),
+        y,
     )
 }
