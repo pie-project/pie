@@ -39,7 +39,8 @@ constexpr u32 kOffK = 2 * kTile;
 constexpr u32 kOffRed = kOffK + kSlots * kTile;  // [8 warps][128] f32
 constexpr u32 kOffW = kOffRed + 8 * 128 * 4;     // [2 buffers][128] f32
 constexpr u32 kOffBar = kOffW + 2 * 128 * 4;
-constexpr u32 kCols = 256;
+constexpr u32 kCols = 512;
+constexpr int kSBufs = 4;  // S buffers in TMEM, a tile each
 
 __host__ __device__ constexpr u32 smem_bytes() { return kOffBar + 256u + 1024u; }
 
@@ -177,8 +178,8 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
     u64* q_full = k_empty + kSlots;
     u64* q_empty = q_full + 2;
     u64* s_full = q_empty + 2;
-    u64* s_free = s_full + 2;
-    u32* tmem_slot = reinterpret_cast<u32*>(s_free + 2);
+    u64* s_free = s_full + kSBufs;
+    u32* tmem_slot = reinterpret_cast<u32*>(s_free + kSBufs);
 
     const u32 warp = threadIdx.x / 32;
     const u32 lane = threadIdx.x % 32;
@@ -191,6 +192,8 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
             bar_init(&q_full[s], 64);
             // The MMAs' commit and the epilogue's 256 (done with the weights).
             bar_init(&q_empty[s], 257);
+        }
+        for (int s = 0; s < kSBufs; ++s) {
             bar_init(&s_full[s], 1);
             bar_init(&s_free[s], 128);
         }
@@ -269,8 +272,8 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
                 const int tiles = (s.nkeys + kBN - 1) / kBN;
                 for (int jt = 0; jt < tiles; ++jt, ++J) {
                     const int slot = J % kSlots;
-                    const int sb = J & 1;
-                    if (J >= 2) bar_wait(&s_free[sb], ((J - 2) >> 1) & 1);
+                    const int sb = J % kSBufs;
+                    if (J >= kSBufs) bar_wait(&s_free[sb], ((J / kSBufs) - 1) & 1);
                     bar_wait(&k_full[slot], (J / kSlots) & 1);
                     tc_fence_after();
                     if (lane == 0) {
@@ -411,9 +414,9 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
                 float* frow = p.scores + static_cast<long long>(s.t[rr]) * p.score_stride;
                 const int tiles = (s.nkeys + kBN - 1) / kBN;
                 for (int jt = 0; jt < tiles; ++jt, ++J) {
-                    const int sb = J & 1;
-                    if (sb != wg) continue;
-                    bar_wait(&s_full[sb], (J >> 1) & 1);
+                    const int sb = J % kSBufs;
+                    if ((J & 1) != wg) continue;
+                    bar_wait(&s_full[sb], (J / kSBufs) & 1);
                     tc_fence_after();
 #pragma unroll 1
                     for (int c = 0; c < kBN / 32; ++c) {
