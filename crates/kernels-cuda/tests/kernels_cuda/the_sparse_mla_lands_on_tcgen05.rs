@@ -395,128 +395,6 @@ fn the_sparse_mla_lands_on_tcgen05() {
     // selections here read none past a row's position, so both answer alike.
     check(64, None, true, false);
 }
-
-/// One 4096-row prefill selecting up to 2048 tokens a row, both forms.
-#[test]
-#[ignore = "pacing; run with --ignored --nocapture"]
-fn the_sparse_mla_paces_a_prefill() {
-    const ROWS: usize = 4096;
-    const K: usize = 2048;
-    const PG: usize = 64;
-    let pages = ROWS / PG;
-    let mut gpu = Gpu::open();
-    let page_ids: Vec<i32> = (0..pages as i32).rev().collect();
-    let mut sel = vec![-1i32; ROWS * K];
-    for t in 0..ROWS {
-        let lo = (t + 1).saturating_sub(K);
-        for (n, j) in (lo..=t).enumerate() {
-            sel[t * K + n] = j as i32;
-        }
-    }
-    let ckv = gpu.zeros(ROWS * RANK * 2);
-    let kpe = gpu.zeros(ROWS * 64 * 2);
-    let pool = KvPool {
-        keys: Tensor::new(ckv, ROWS as u32, RANK as u32, Dtype::Bf16),
-        values: Tensor::new(kpe, ROWS as u32, 64, Dtype::Bf16),
-        bf16_keys: Tensor::ABSENT,
-        bf16_values: Tensor::ABSENT,
-        key_scales: Tensor::ABSENT,
-        value_scales: Tensor::ABSENT,
-        page_indices: Tensor::new(gpu.up(&page_ids), pages as u32, 1, Dtype::I32),
-        page_indptr: Tensor::new(gpu.up(&[0i32, pages as i32]), 2, 1, Dtype::I32),
-        last_page_lens: Tensor::new(gpu.up(&[PG as i32]), 1, 1, Dtype::I32),
-        row_valid: Tensor::ABSENT,
-        env_min: Tensor::ABSENT,
-        env_max: Tensor::ABSENT,
-        has_envelopes: false,
-        page_size: PG as i32,
-        seq_stride: RANK as i64,
-        head_stride: RANK as i64,
-        layout: 0,
-        scheme_byte: 0,
-        block_size: 0,
-        max_pages_per_request: pages as i32,
-        pages_in_batch: pages as i32,
-    };
-    let qo = [0i32, ROWS as i32];
-    let case = Case {
-        rope: 64,
-        pooled: false,
-        q_nope: Vec::new(),
-        q_pe: Vec::new(),
-        ckv: Vec::new(),
-        kpe: Vec::new(),
-        qo_indptr: qo.to_vec(),
-        sm_scale: 0.05,
-    };
-    let device = Device::probe(&gpu.ctx()).expect("the device answers its attributes");
-    let workspace = Workspace {
-        int_ptr: gpu.zeros(INT_BYTES),
-        int_bytes: INT_BYTES,
-        float_ptr: gpu.zeros(FLOAT_BYTES),
-        float_bytes: FLOAT_BYTES,
-    };
-    let plan = plan::plan_mla(
-        &case.qo_indptr,
-        &[0, pages as i32],
-        &[ROWS as i32],
-        ROWS as u32,
-        1,
-        Live {
-            requests: 1,
-            lane_offset: 0,
-            row_offset: 0,
-            rows: ROWS as u32,
-        },
-        HEADS as u32,
-        RANK as u32,
-        true,
-        &device,
-        workspace,
-    )
-    .expect("the plan schedules");
-    let q = gpu.zeros(ROWS * HEADS * RANK * 2);
-    let q_pe = gpu.zeros(ROWS * HEADS * 64 * 2);
-    let qo_at = gpu.up(&qo);
-    let sel_at = gpu.up(&sel);
-    let out = gpu.zeros(ROWS * HEADS * RANK * 2);
-    for tc in [false, true] {
-        let ctx = gpu.ctx().with_tuning(Tuning {
-            mla_sparse: tc,
-            ..Tuning::DEFAULT
-        });
-        let fire = || {
-            mla::attention_prefill_selected(
-                &ctx,
-                RaggedTensor {
-                    data: Tensor::new(q, ROWS as u32, (HEADS * RANK) as u32, Dtype::Bf16),
-                    indptr: Tensor::new(qo_at, 2, 1, Dtype::I32),
-                },
-                &plan,
-                Tensor::new(q_pe, ROWS as u32, (HEADS * 64) as u32, Dtype::Bf16),
-                Tensor::new(sel_at, ROWS as u32, K as u32, Dtype::I32),
-                &pool,
-                HEADS as u32,
-                RANK as u32,
-                0.05,
-                &mut Tensor::new(out, ROWS as u32, (HEADS * RANK) as u32, Dtype::Bf16),
-                None,
-            )
-            .unwrap();
-        };
-        fire();
-        gpu.sync();
-        let iters = if tc { 10 } else { 1 };
-        let t0 = std::time::Instant::now();
-        for _ in 0..iters {
-            fire();
-        }
-        gpu.sync();
-        let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
-        eprintln!("| {ROWS} rows, top {K} | tcgen05 {tc:5} | {us:9.0} us |");
-    }
-}
-
 /// GLM-5.3's decode at 8 rows: each request's one row selecting 2048 of its
 /// keys, the selected attention dealt over splits a row on tcgen05 and
 /// folded, against the warp-a-key form; then both paced.
@@ -666,19 +544,6 @@ fn glm_decodes_selected_attention_lands_split_over_the_multiprocessors() {
         );
     }
 }
-
-#[test]
-#[ignore = "pacing; run with --ignored --nocapture"]
-fn glm_decodes_selected_attention_paces_8_rows() {
-    let (_, naive) = decode_bs8(false, 20);
-    let (_, tc) = decode_bs8(true, 200);
-    eprintln!("| 8 rows, top 2048 | warp a key {naive:.1} us | tcgen05 split {tc:.1} us |");
-    for reqs in [1, 32, 64] {
-        let (_, us) = decode_rows(reqs, true, 200);
-        eprintln!("| {reqs} rows, top 2048 | tcgen05 split {us:.1} us |");
-    }
-}
-
 /// An e4m3 byte's value (no NaN is drawn).
 fn e4m3(b: u8) -> f32 {
     let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
@@ -873,23 +738,6 @@ fn glm_reads_a_short_selection_dense() {
             i / (HEADS * RANK),
             (i / RANK) % HEADS,
             i % RANK
-        );
-    }
-}
-
-#[test]
-#[ignore = "pacing; run with --ignored --nocapture"]
-fn glm_decodes_a_short_context() {
-    let kv: usize = std::env::var("PIE_MLA_KV")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(768);
-    for reqs in [1, 8, 64] {
-        let (_, bf16) = decode_short(reqs, kv, false, false, 200);
-        let (_, fp8) = decode_short(reqs, kv, true, false, 200);
-        let (_, dense) = decode_short(reqs, kv, true, true, 200);
-        eprintln!(
-            "| {reqs} rows, {kv} keys | bf16 {bf16:.1} us | fp8 {fp8:.1} us | fp8 dense {dense:.1} us |"
         );
     }
 }
