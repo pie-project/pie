@@ -678,3 +678,192 @@ fn glm_decodes_selected_attention_paces_8_rows() {
         eprintln!("| {reqs} rows, top 2048 | tcgen05 split {us:.1} us |");
     }
 }
+
+/// An e4m3 byte's value (no NaN is drawn).
+fn e4m3(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from((b >> 3) & 0xf);
+    let man = f32::from(b & 7);
+    sign * if exp == 0 {
+        man / 8.0 * 2f32.powi(-6)
+    } else {
+        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
+    }
+}
+
+/// GLM-5.3's decode at a short context: `reqs` requests of one row, each
+/// reading every one of its `kv` keys, over bf16 latent rows or over the
+/// same values as fp8_ds_mla rows (656 bytes: 512 e4m3 codes, four f32
+/// scales, 64 bf16 rotated dims). The bf16 rows hold each code times its
+/// scale rounded to bf16, which is what the fp8 pass widens a tile to.
+fn decode_short(reqs: usize, kv: usize, fp8: bool, iters: u32) -> (Vec<u16>, f64) {
+    const PG: usize = 64;
+    const ROPE: usize = 64;
+    const ROW: usize = 656;
+    let pages_per = kv.div_ceil(PG);
+    let total = pages_per * reqs;
+    let indptr: Vec<i32> = (0..=reqs as i32).map(|r| r * pages_per as i32).collect();
+    let page_ids: Vec<i32> = (0..total as i32).rev().collect();
+    let last = vec![((kv - 1) % PG + 1) as i32; reqs];
+    let slots = total * PG;
+    let mut rng = Lcg::seeded(0x5407);
+    let (q_raw, _) = rng.row(reqs * HEADS * RANK);
+    let (qpe_raw, _) = rng.row(reqs * HEADS * ROPE);
+    let (kpe_raw, _) = rng.row(slots * ROPE);
+    let mut rows = vec![0u8; slots * ROW];
+    let mut ckv = vec![0u16; slots * RANK];
+    for s in 0..slots {
+        let row = &mut rows[s * ROW..(s + 1) * ROW];
+        for t in 0..4 {
+            let scale = 0.002 + 0.004 * rng.unit().abs();
+            row[512 + 4 * t..516 + 4 * t].copy_from_slice(&scale.to_le_bytes());
+            for d in 0..128 {
+                // Any finite code: the low seven bits short of 0x7f.
+                let b = ((rng.unit().abs() * 255.0) as u8) % 0xff;
+                let b = if b & 0x7f == 0x7f { b & 0xfe } else { b };
+                row[t * 128 + d] = b;
+                ckv[s * RANK + t * 128 + d] = crate::common::to_bf16(e4m3(b) * scale);
+            }
+        }
+        for d in 0..ROPE {
+            row[528 + 2 * d..530 + 2 * d].copy_from_slice(&kpe_raw[s * ROPE + d].to_le_bytes());
+        }
+    }
+    let mut sel = vec![-1i32; reqs * 2048];
+    for r in 0..reqs {
+        for j in 0..kv {
+            sel[r * 2048 + j] = j as i32;
+        }
+    }
+    let qo: Vec<i32> = (0..=reqs as i32).collect();
+    let mut gpu = Gpu::open();
+    let device = Device::probe(&gpu.ctx()).expect("the device answers its attributes");
+    let workspace = Workspace {
+        int_ptr: gpu.zeros(INT_BYTES),
+        int_bytes: INT_BYTES,
+        float_ptr: gpu.zeros(FLOAT_BYTES),
+        float_bytes: FLOAT_BYTES,
+    };
+    let plan = plan::plan_mla(
+        &qo,
+        &indptr,
+        &vec![kv as i32; reqs],
+        reqs as u32,
+        reqs as u32,
+        Live {
+            requests: reqs as u32,
+            lane_offset: 0,
+            row_offset: 0,
+            rows: reqs as u32,
+        },
+        HEADS as u32,
+        RANK as u32,
+        false,
+        &device,
+        workspace,
+    )
+    .expect("the plan schedules");
+    plan.stage(&gpu.ctx()).expect("the plan stages");
+    let (keys, values) = if fp8 {
+        let at = gpu.up(&rows);
+        (
+            Tensor::new(at, slots as u32, ROW as u32, Dtype::U8),
+            Tensor::new(at, slots as u32, ROW as u32, Dtype::U8),
+        )
+    } else {
+        (
+            Tensor::new(gpu.up(&ckv), slots as u32, RANK as u32, Dtype::Bf16),
+            Tensor::new(gpu.up(&kpe_raw), slots as u32, ROPE as u32, Dtype::Bf16),
+        )
+    };
+    let pool = KvPool {
+        keys,
+        values,
+        bf16_keys: Tensor::ABSENT,
+        bf16_values: Tensor::ABSENT,
+        key_scales: Tensor::ABSENT,
+        value_scales: Tensor::ABSENT,
+        page_indices: Tensor::new(gpu.up(&page_ids), total as u32, 1, Dtype::I32),
+        page_indptr: Tensor::new(gpu.up(&indptr), indptr.len() as u32, 1, Dtype::I32),
+        last_page_lens: Tensor::new(gpu.up(&last), reqs as u32, 1, Dtype::I32),
+        row_valid: Tensor::ABSENT,
+        env_min: Tensor::ABSENT,
+        env_max: Tensor::ABSENT,
+        has_envelopes: false,
+        page_size: PG as i32,
+        seq_stride: RANK as i64,
+        head_stride: RANK as i64,
+        layout: 0,
+        scheme_byte: 0,
+        block_size: 0,
+        max_pages_per_request: pages_per as i32,
+        pages_in_batch: total as i32,
+    };
+    let q_at = gpu.up(&q_raw);
+    let qpe_at = gpu.up(&qpe_raw);
+    let qo_at = gpu.up(&qo);
+    let sel_at = gpu.up(&sel);
+    let out = gpu.zeros(reqs * HEADS * RANK * 2);
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        mla_sparse: true,
+        ..Tuning::DEFAULT
+    });
+    let fire = || {
+        mla::attention_decode_selected(
+            &ctx,
+            RaggedTensor {
+                data: Tensor::new(q_at, reqs as u32, (HEADS * RANK) as u32, Dtype::Bf16),
+                indptr: Tensor::new(qo_at, (reqs + 1) as u32, 1, Dtype::I32),
+            },
+            &plan,
+            Tensor::new(qpe_at, reqs as u32, (HEADS * ROPE) as u32, Dtype::Bf16),
+            Tensor::new(sel_at, reqs as u32, 2048, Dtype::I32),
+            &pool,
+            HEADS as u32,
+            RANK as u32,
+            0.04,
+            &mut Tensor::new(out, reqs as u32, (HEADS * RANK) as u32, Dtype::Bf16),
+            None,
+        )
+        .expect("the decode's selected attention fires");
+    };
+    fire();
+    gpu.sync();
+    let got: Vec<u16> = gpu.down(out, reqs * HEADS * RANK);
+    let mut us = 0.0;
+    if iters > 0 {
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            fire();
+        }
+        gpu.sync();
+        us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+    }
+    (got, us)
+}
+
+#[test]
+fn glm_fp8_latent_rows_read_as_their_widened_bf16() {
+    let (want, _) = decode_short(4, 300, false, 0);
+    let (got, _) = decode_short(4, 300, true, 0);
+    for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+        let (g, w) = (from_bf16(g), from_bf16(w));
+        assert!(
+            close(g, w),
+            "row {} head {} dim {}: {g} against {w}",
+            i / (HEADS * RANK),
+            (i / RANK) % HEADS,
+            i % RANK
+        );
+    }
+}
+
+#[test]
+#[ignore = "pacing; run with --ignored --nocapture"]
+fn glm_decodes_a_short_context() {
+    for reqs in [1, 8, 64] {
+        let (_, bf16) = decode_short(reqs, 768, false, 200);
+        let (_, fp8) = decode_short(reqs, 768, true, 200);
+        eprintln!("| {reqs} rows, 768 keys | bf16 {bf16:.1} us | fp8 {fp8:.1} us |");
+    }
+}
