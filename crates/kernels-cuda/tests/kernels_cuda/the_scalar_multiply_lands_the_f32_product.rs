@@ -1,5 +1,8 @@
 #![cfg(feature = "cuda")]
 
+//! `mul_scalar` scales an f32 plane exactly and a bf16 one to the rounded
+//! product.
+
 use crate::common;
 
 use common::{Gpu, Lcg, from_bf16};
@@ -13,11 +16,6 @@ const SCALE: f32 = 1000.0 / 3.0;
 
 #[test]
 fn the_scalar_multiply_lands_the_f32_product_every_case() {
-    an_f32_plane_scales_exactly();
-    a_bf16_plane_scales_to_the_rounded_product();
-}
-
-fn an_f32_plane_scales_exactly() {
     let mut rng = Lcg::seeded(41);
     let x: Vec<f32> = (0..ROWS * WIDTH).map(|_| rng.unit()).collect();
     let mut gpu = Gpu::open();
@@ -39,14 +37,10 @@ fn an_f32_plane_scales_exactly() {
             x * SCALE
         );
     }
-}
 
-fn a_bf16_plane_scales_to_the_rounded_product() {
     let mut rng = Lcg::seeded(43);
     let (bits, x) = rng.row(ROWS * WIDTH);
-    let mut gpu = Gpu::open();
     let at = gpu.up(&bits);
-    let ctx = gpu.ctx();
     mul_scalar(
         &ctx,
         SCALE,

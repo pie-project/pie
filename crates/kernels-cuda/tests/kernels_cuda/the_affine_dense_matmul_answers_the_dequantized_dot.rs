@@ -1,5 +1,8 @@
 #![cfg(feature = "cuda")]
 
+//! The dense affine matmul (a bf16 scale and bias a group of 64) answers
+//! the dequantized dot at eight bits and at four.
+
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::moe::GroupSeat;
@@ -65,8 +68,7 @@ fn check(bits: u32, n: usize, k: usize, rows: usize, seed: u64) {
     gpu.sync();
     let got: Vec<u16> = gpu.down(y_at, rows * n);
 
-    let mut bad = 0usize;
-    let mut worst = 0f32;
+    let mut bad = Vec::new();
     for t in 0..rows {
         for r in 0..n {
             let mut want = 0f32;
@@ -74,33 +76,23 @@ fn check(bits: u32, n: usize, k: usize, rows: usize, seed: u64) {
                 want += dequant[r * k + c] * x[t * k + c];
             }
             let g = from_bf16(got[t * n + r]);
-            worst = worst.max((g - want).abs() / want.abs().max(1.0));
             if !close(g, want) {
-                bad += 1;
-                if bad <= 5 {
-                    eprintln!("row {t} col {r}: got {g} want {want}");
-                }
+                bad.push((t, r, g, want));
             }
         }
     }
-    assert_eq!(
-        bad,
-        0,
-        "{bits}-bit: {bad} of {} outputs differ (worst relative error {worst:.4})",
-        rows * n
+    assert!(
+        bad.is_empty(),
+        "{bits}-bit: {} of {} outputs differ; first (row, col, got, want) {:?}",
+        bad.len(),
+        rows * n,
+        &bad[..bad.len().min(5)]
     );
 }
 
 #[test]
 fn the_affine_dense_matmul_answers_the_dequantized_dot_every_case() {
-    the_router_shape_at_eight_bits();
-    a_projection_at_four_bits();
-}
-
-fn the_router_shape_at_eight_bits() {
+    // A router's shape at eight bits, a projection at four.
     check(8, 128, 2816, 26, 0x61);
-}
-
-fn a_projection_at_four_bits() {
     check(4, 256, 2816, 26, 0x62);
 }

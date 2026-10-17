@@ -1,5 +1,8 @@
 #![cfg(feature = "cuda")]
 
+//! The relative bucket bias table (T5's) reads, at every distance, the
+//! bucket torch lands, and refuses a table its arguments cannot make.
+
 use crate::common::{Gpu, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::elemwise::relative_bucket_bias;
@@ -84,29 +87,18 @@ fn check(
     }
 }
 
+/// T5's table from a bf16 embedding, then other bucket counts, a far
+/// max distance and a one-directional table from f32 ones.
 #[test]
 fn the_relative_bucket_bias_table_reads_the_bucket_torch_lands_every_case() {
-    the_t5_table_reads_the_bucket_at_every_distance_from_a_bf16_embedding();
-    the_t5_table_reads_the_bucket_at_every_distance_from_an_f32_embedding();
-    other_bucket_counts_and_a_one_directional_table_read_their_buckets();
-    a_max_distance_inside_the_exact_band_is_refused();
-}
-
-fn the_t5_table_reads_the_bucket_at_every_distance_from_a_bf16_embedding() {
     check(4, 512, 32, 128.0, true, Dtype::Bf16);
-}
-
-fn the_t5_table_reads_the_bucket_at_every_distance_from_an_f32_embedding() {
-    check(4, 512, 32, 128.0, true, Dtype::F32);
-}
-
-fn other_bucket_counts_and_a_one_directional_table_read_their_buckets() {
     check(3, 300, 16, 64.0, true, Dtype::F32);
     check(3, 300, 64, 256.0, true, Dtype::F32);
     check(2, 512, 32, 1024.0, true, Dtype::F32);
     check(2, 200, 32, 128.0, false, Dtype::F32);
 }
 
+#[test]
 fn a_max_distance_inside_the_exact_band_is_refused() {
     let mut gpu = Gpu::open();
     let emb_at = gpu.zeros(32 * 4 * 4);

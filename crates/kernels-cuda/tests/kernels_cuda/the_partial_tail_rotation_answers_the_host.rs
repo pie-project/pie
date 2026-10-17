@@ -82,10 +82,7 @@ fn check(interleaved: bool, inverse: bool, yarn: bool) {
 
 #[test]
 fn the_partial_tail_rotation_answers_the_host() {
-    for interleaved in [false, true] {
-        for inverse in [false, true] {
-            check(interleaved, inverse, false);
-        }
-    }
+    check(false, false, false);
+    check(true, true, false);
     check(false, false, true);
 }

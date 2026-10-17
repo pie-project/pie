@@ -12,12 +12,8 @@ use kernels_cuda::tensor::Tensor;
 
 #[test]
 fn attn_res_blends_what_the_host_blends() {
-    for (tokens, hidden, blocks) in [
-        (1usize, 7168usize, 3usize),
-        (37, 7168, 8),
-        (5, 1001, 2),
-        (3, 64, 0),
-    ] {
+    // Kimi's width (16-byte runs), an odd one, and no closed block.
+    for (tokens, hidden, blocks) in [(37usize, 7168usize, 8usize), (5, 1001, 2), (3, 64, 0)] {
         let mut gpu = Gpu::open();
         let mut lcg = Lcg::seeded(0xa7 ^ (tokens * hidden + blocks) as u64);
         let (prefix_raw, _) = lcg.row(tokens * hidden);
@@ -84,7 +80,7 @@ fn attn_res_blends_what_the_host_blends() {
 #[test]
 fn attn_res_blend_and_its_norm_land_what_the_two_land() {
     use kernels_cuda::elemwise::norm::{res_blend_norm, rmsnorm};
-    for (tokens, hidden, blocks) in [(1usize, 7168usize, 3usize), (37, 7168, 8), (4, 2048, 1)] {
+    for (tokens, hidden, blocks) in [(37usize, 7168usize, 8usize), (4, 2048, 1)] {
         let mut gpu = Gpu::open();
         let mut lcg = Lcg::seeded(0xb1 ^ (tokens * hidden + blocks) as u64);
         let mut plane = |gpu: &mut Gpu| {

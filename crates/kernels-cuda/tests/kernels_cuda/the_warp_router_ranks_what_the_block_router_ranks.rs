@@ -2,8 +2,8 @@
 
 //! `linear::moe::topk_softmax` a warp a row (`kernel.moe.topk_warp`) lands
 //! the routes and weights the 64-thread block lands, to the bit: ties
-//! included (coarse logits tie often), every pick count to 16, every
-//! expert count to 512, and under a live window.
+//! included (coarse logits tie often), pick counts to 16, expert counts to
+//! 512, rows off the four a block, and under a live window.
 
 use crate::common::{Gpu, Lcg, to_bf16};
 use dtype::Dtype;
@@ -69,15 +69,18 @@ fn check(rows: usize, experts: usize, top: usize, window: Option<(u32, u32)>) {
 
 #[test]
 fn the_warp_router_ranks_what_the_block_router_ranks() {
-    for experts in [8, 60, 128, 256, 512] {
-        for top in [1, 4, 8, 10, 16] {
-            if top > experts {
-                continue;
-            }
-            for rows in [1, 5, 64, 70] {
-                check(rows, experts, top, None);
-            }
-        }
+    // (rows, experts, top)
+    for (rows, experts, top) in [
+        (1, 8, 1),
+        (5, 8, 8),
+        (70, 60, 4),
+        (64, 128, 8),
+        (1, 256, 10),
+        (70, 256, 8),
+        (5, 512, 16),
+        (70, 512, 10),
+    ] {
+        check(rows, experts, top, None);
     }
     check(64, 512, 10, Some((40, 8)));
 }

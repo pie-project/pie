@@ -1,5 +1,8 @@
 #![cfg(feature = "cuda")]
 
+//! The modulate forms (scale-shift, scale, tanh gate, gated residual)
+//! answer the host with their modulation read per token or per lane.
+
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::elemwise::modulate;
@@ -88,20 +91,12 @@ fn check(lane_of_row: Option<Vec<i32>>) {
 
 #[test]
 fn the_modulate_forms_answer_the_broadcast_and_the_per_token_reference_every_case() {
-    the_forms_answer_the_reference_with_m_read_per_lane();
-    the_forms_answer_the_reference_with_m_read_per_token();
-    a_modulation_may_write_the_rectangle_it_read();
-}
-
-fn the_forms_answer_the_reference_with_m_read_per_lane() {
-    let map: Vec<i32> = (0..ROWS).map(|r| (r % LANES) as i32).collect();
-    check(Some(map));
-}
-
-fn the_forms_answer_the_reference_with_m_read_per_token() {
+    let lanes: Vec<i32> = (0..ROWS).map(|r| (r % LANES) as i32).collect();
+    check(Some(lanes));
     check(None);
 }
 
+#[test]
 fn a_modulation_may_write_the_rectangle_it_read() {
     let mut lcg = Lcg::seeded(0xa11a5);
     let (x_raw, x) = lcg.row(ROWS * WIDTH);

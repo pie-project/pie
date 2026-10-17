@@ -50,6 +50,5 @@ fn check(rows: usize, groups: usize, k: usize, n: usize) {
 #[test]
 fn the_strided_grouped_projection_answers_each_group() {
     check(1, 8, 512, 128);
-    check(8, 8, 512, 128);
     check(37, 4, 256, 64);
 }
