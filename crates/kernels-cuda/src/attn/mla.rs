@@ -417,6 +417,18 @@ pub fn kv_append(
     const OP: &str = "attention.mla_kv_append";
     let _ = (write_page, write_offset);
     dtype_dispatch!(OP, kv_c.data.dtype, { Bf16 => () });
+    // The latent rows land and are read as bf16: a pool laid out at another
+    // width (an e4m3 one is half as wide) would take them past its end.
+    if pool.values.dtype != Dtype::Bf16 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the latent pool holds {:?} rows, and MLA appends and reads bf16 ones; \
+                 serve this deployment with bf16 kv",
+                pool.values.dtype
+            ),
+        ));
+    }
     debug_assert_eq!(
         k_pe.rows, kv_c.data.rows,
         "the rope plane is appended beside the latent plane, one row each"
