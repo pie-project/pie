@@ -65,6 +65,203 @@ fn the_pooled_index_selects_its_best_blocks() {
     check(64);
 }
 
+/// The nearest e2m1 code of `v` (within ±6), ties to the even code and the
+/// sign kept, as the hardware's `cvt.rn` rounds.
+fn e2m1_code(v: f32) -> u8 {
+    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let a = v.abs();
+    let mut best = 0u8;
+    for c in 1..8u8 {
+        let (d, db) = ((MAG[c as usize] - a).abs(), (MAG[best as usize] - a).abs());
+        if d < db || (d == db && c % 2 == 0) {
+            best = c;
+        }
+    }
+    if v.is_sign_negative() { best | 8 } else { best }
+}
+
+fn e2m1(code: u8) -> f32 {
+    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let v = MAG[usize::from(code & 7)];
+    if code & 8 != 0 { -v } else { v }
+}
+
+/// DeepSeek-V4.1's `fp4_act_quant(x, 32, ue8m0)` of one 32-block: its codes
+/// and biased exponent.
+fn fp4_block(block: &[f32]) -> (Vec<u8>, u8) {
+    let amax = block
+        .iter()
+        .fold(0f32, |m, v| m.max(v.abs()))
+        .max(6.0 * 2f32.powi(-126));
+    let bits = (amax * (1.0 / 6.0)).to_bits();
+    let e = ((bits >> 23) & 0xff) as i32 + i32::from(bits & 0x7f_ffff != 0);
+    let s = 2f32.powi(e - 127);
+    let codes = block
+        .iter()
+        .map(|v| e2m1_code((v / s).clamp(-6.0, 6.0)))
+        .collect();
+    (codes, e as u8)
+}
+
+/// `x` read at FP4, a 32-block at a time.
+fn fp4_read(x: &[f32]) -> Vec<f32> {
+    x.chunks(32)
+        .flat_map(|b| {
+            let (codes, e) = fp4_block(b);
+            let s = 2f32.powi(i32::from(e) - 127);
+            codes.into_iter().map(move |c| e2m1(c) * s)
+        })
+        .collect()
+}
+
+/// DeepSeek-V4.1's FP4 index keys (68 bytes a position: e2m1 pairs, then
+/// ue8m0 exponents, a page's data rows before its scale rows): written at
+/// each block's boundary bit for bit as its reference quantizes them, and
+/// ranked against its queries read at FP4 as the reference ranks them, on
+/// the tensor cores as they are and widened to bf16 for the scalar scorer.
+#[test]
+fn fp4_index_keys_rank_as_deepseeks_reference_reads_them() {
+    for heads in [4, 64] {
+        check_fp4(heads);
+    }
+}
+
+fn check_fp4(heads: usize) {
+    let mut gpu = Gpu::open();
+    let mut rng = Lcg::seeded(0xf4f4 + heads as u64);
+    let tokens: usize = Q_LENS.iter().sum();
+    let slots = PAGE_INDICES.len() * PAGE;
+    let (q_raw, q) = rng.row(tokens * heads * DIM);
+    let w: Vec<f32> = (0..tokens * heads)
+        .map(|_| from_bf16(to_bf16(rng.unit().abs() + 0.25)))
+        .collect();
+    let w_raw: Vec<u16> = w.iter().map(|&x| to_bf16(x)).collect();
+    // One key a block, at its boundary, in each request.
+    let mut bpos = Vec::new();
+    let mut breq = Vec::new();
+    for (r, &len) in KV_LENS.iter().enumerate() {
+        for j in 0..len / RATIO {
+            bpos.push(((j + 1) * RATIO - 1) as i32);
+            breq.push(r as i32);
+        }
+    }
+    let n = bpos.len();
+    let (e_raw, e) = rng.row(n * DIM);
+    let mut qo_indptr = vec![0i32];
+    for len in Q_LENS {
+        qo_indptr.push(qo_indptr.last().unwrap() + len as i32);
+    }
+    let tables = [
+        gpu.up(&PAGE_INDICES),
+        gpu.up(&PAGE_INDPTR),
+        gpu.up(&LAST_PAGE_LENS),
+    ];
+    let row = index::FP4_ROW as usize;
+    let plane = gpu.zeros(slots * row);
+    let keys = KvPool {
+        keys: Tensor::new(plane, slots as u32, index::FP4_ROW, Dtype::U8),
+        values: Tensor::new(plane, slots as u32, index::FP4_ROW, Dtype::U8),
+        seq_stride: i64::from(index::FP4_ROW),
+        ..pool(plane, tables)
+    };
+    let ctx = gpu.ctx();
+    index::store_fp4(
+        &ctx,
+        Tensor::new(gpu.up(&e_raw), n as u32, DIM as u32, Dtype::Bf16),
+        Tensor::new(gpu.up(&bpos), n as u32, 1, Dtype::I32),
+        Tensor::new(gpu.up(&breq), n as u32, 1, Dtype::I32),
+        &keys,
+    )
+    .expect("the FP4 keys land");
+    gpu.sync();
+    let raw: Vec<u8> = gpu.down(plane, slots * row);
+    // The bytes, and what each request's keys read as.
+    let mut k = vec![0f32; slots * DIM];
+    for c in 0..n {
+        let s = slot(breq[c] as usize, bpos[c] as usize);
+        let (page, off) = (s / PAGE, s % PAGE);
+        let base = page * PAGE * row;
+        for b in 0..DIM / 32 {
+            let (codes, ex) = fp4_block(&e[c * DIM + b * 32..c * DIM + (b + 1) * 32]);
+            assert_eq!(
+                raw[base + PAGE * 64 + off * 4 + b],
+                ex,
+                "key {c} block {b}'s exponent"
+            );
+            for i in 0..16 {
+                let byte = raw[base + off * 64 + b * 16 + i];
+                assert_eq!(
+                    (byte & 0xf, byte >> 4),
+                    (codes[2 * i], codes[2 * i + 1]),
+                    "key {c} block {b} pair {i}"
+                );
+            }
+        }
+        k[s * DIM..(s + 1) * DIM].copy_from_slice(&fp4_read(&e[c * DIM..(c + 1) * DIM]));
+    }
+    let q4 = fp4_read(&q);
+    let indptr = gpu.up(&qo_indptr);
+    let q_at = gpu.up(&q_raw);
+    let w_at = gpu.up(&w_raw);
+    for mma in [true, false] {
+        let sel_at = gpu.zeros(tokens * TOP_K * 4);
+        let mut selection = Tensor::new(sel_at, tokens as u32, TOP_K as u32, Dtype::I32);
+        let ctx = gpu.ctx().with_tuning(Tuning {
+            index_mma: mma,
+            ..Tuning::DEFAULT
+        });
+        index::topk(
+            &ctx,
+            RaggedTensor {
+                data: Tensor::new(q_at, tokens as u32, (heads * DIM) as u32, Dtype::Bf16),
+                indptr: Tensor::new(indptr, qo_indptr.len() as u32, 1, Dtype::I32),
+            },
+            Some(Tensor::new(w_at, tokens as u32, heads as u32, Dtype::Bf16)),
+            &keys,
+            heads as u32,
+            DIM as u32,
+            TOP_K as u32,
+            RATIO as u32,
+            &mut selection,
+        )
+        .expect("attention.index_topk ranks the FP4 keys");
+        gpu.sync();
+        let got: Vec<i32> = gpu.down(sel_at, tokens * TOP_K);
+        let mut t = 0;
+        let mut ranked = 0;
+        for r in 0..Q_LENS.len() {
+            for i in 0..Q_LENS[r] {
+                let seen = (KV_LENS[r] - Q_LENS[r] + i + 1) / RATIO;
+                if seen > TOP_K {
+                    let score = |j: usize| -> f32 {
+                        let at = slot(r, (j + 1) * RATIO - 1) * DIM;
+                        (0..heads)
+                            .map(|h| {
+                                let qh = &q4[(t * heads + h) * DIM..][..DIM];
+                                let dot: f32 =
+                                    qh.iter().zip(&k[at..at + DIM]).map(|(a, b)| a * b).sum();
+                                dot.max(0.0) * w[t * heads + h]
+                            })
+                            .sum()
+                    };
+                    let mut order: Vec<usize> = (0..seen).collect();
+                    order.sort_by(|&a, &b| score(b).total_cmp(&score(a)));
+                    let mut want: Vec<i32> = order[..TOP_K].iter().map(|&j| j as i32).collect();
+                    want.sort_unstable();
+                    assert_eq!(
+                        &got[t * TOP_K..(t + 1) * TOP_K],
+                        &want[..],
+                        "{heads} heads, mma {mma}: row {t}: the best {TOP_K} of {seen} FP4 blocks"
+                    );
+                    ranked += 1;
+                }
+                t += 1;
+            }
+        }
+        assert!(ranked > 0, "rows were ranked");
+    }
+}
+
 #[allow(non_snake_case)]
 fn check(HEADS: usize) {
     let mut gpu = Gpu::open();

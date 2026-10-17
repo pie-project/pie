@@ -117,6 +117,123 @@ pub fn rope(
     )
 }
 
+/// The bytes of one DeepSeek-V4.1 FP4 index key (`attn/index.cuh`'s
+/// `index_fp4`): 128 dims as 64 bytes of e2m1 pairs and 4 ue8m0 exponents.
+pub const FP4_ROW: u32 = 68;
+
+/// Whether `keys` holds FP4 index keys: a u8 plane [`FP4_ROW`] wide.
+#[must_use]
+pub fn fp4_keys(keys: &KvPool) -> bool {
+    keys.keys.dtype == Dtype::U8 && keys.layout == 0 && keys.seq_stride == i64::from(FP4_ROW)
+}
+
+/// The index keys (bf16, 128 wide) quantized into FP4 rows at their
+/// boundaries' positions, as DeepSeek-V4.1's reference stores them:
+/// `pool_kv_append` onto an FP4 key pool.
+pub fn store_fp4(
+    ctx: &Ctx,
+    entries: Tensor,
+    boundary_pos: Tensor,
+    boundary_req: Tensor,
+    keys: &KvPool,
+) -> Result<(), Error> {
+    const OP: &str = "attention.pool_kv_append";
+    if !fp4_keys(keys) {
+        return Err(refuse(OP, "the pool does not hold FP4 index keys"));
+    }
+    if entries.dtype != Dtype::Bf16 || entries.width != 128 {
+        return Err(refuse(
+            OP,
+            "an FP4 index key is written from a bf16 key of 128",
+        ));
+    }
+    if entries.rows == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::index_store_fp4")
+            .apply(Launch::grid([entries.rows.div_ceil(4), 1, 1], [128, 1, 1])),
+        &[
+            entries.arg(),
+            keys.keys.arg(),
+            boundary_pos.arg(),
+            boundary_req.arg(),
+            keys.page_indices.arg(),
+            keys.page_indptr.arg(),
+            stated(OP, entries.rows)?.arg(),
+            keys.page_size.arg(),
+        ],
+    )
+}
+
+/// `q`'s rows read at FP4 (each 32-block quantized under a ue8m0 exponent
+/// and read back), as DeepSeek-V4.1's reference reads its index queries
+/// against FP4 keys, into a scratch plane of their own.
+fn fp4_queries(ctx: &Ctx, op: &'static str, q: RaggedTensor) -> Result<RaggedTensor, Error> {
+    let width = q.data.width;
+    if !width.is_multiple_of(32) {
+        return Err(refuse(op, "an FP4 query is whole 32-wide blocks"));
+    }
+    let bytes = q.data.rows as usize * width as usize * 2;
+    let out = ctx.scratch_shared(op, "attn.index_fp4_queries", bytes)? as usize as u64;
+    let runs = u64::from(q.data.rows) * u64::from(width / 8);
+    if runs > 0 {
+        let lanes = u32::try_from(runs).map_err(|_| refuse(op, "the queries overflow a launch"))?;
+        ctx.fire(
+            op,
+            Fire::at(FILE, "::pie::attn::index_q_fp4").apply(Launch::flat(lanes, 256)),
+            &[
+                q.data.arg(),
+                ArgValue::Ptr(out),
+                ArgValue::I64(i64::try_from(runs).unwrap_or(i64::MAX)),
+                ctx.stage(),
+                stated(op, width)?.arg(),
+            ],
+        )?;
+    }
+    Ok(RaggedTensor {
+        data: Tensor::new(out, q.data.rows, width, Dtype::Bf16),
+        ..q
+    })
+}
+
+/// FP4 index-key pages, every one the table names, widened into a bf16
+/// plane in table order: the pool a bf16 ranking reads instead, its table
+/// the identity.
+fn stage_fp4(ctx: &Ctx, op: &'static str, keys: &KvPool) -> Result<KvPool, Error> {
+    let pages = keys.page_indices.rows;
+    let page = u32::try_from(keys.page_size).unwrap_or(0);
+    let cells = pages.saturating_mul(page);
+    let plane =
+        ctx.scratch_shared(op, "attn.index_fp4_stage", cells as usize * 128 * 2)? as usize as u64;
+    let table =
+        ctx.scratch_shared(op, "attn.index_fp4_stage_table", pages as usize * 4)? as usize as u64;
+    if pages > 0 {
+        ctx.fire(
+            op,
+            Fire::at(FILE, "::pie::attn::index_stage_fp4")
+                .apply(Launch::grid([pages, 1, 1], [256, 1, 1])),
+            &[
+                keys.keys.arg(),
+                ArgValue::Ptr(plane),
+                keys.page_indices.arg(),
+                ArgValue::Ptr(table),
+                ArgValue::I32(i32::try_from(pages).unwrap_or(i32::MAX)),
+                ArgValue::I32(keys.page_size),
+            ],
+        )?;
+    }
+    Ok(KvPool {
+        keys: Tensor::new(plane, cells, 128, Dtype::Bf16),
+        values: Tensor::new(plane, cells, 128, Dtype::Bf16),
+        page_indices: Tensor::new(table, pages, 1, Dtype::U32),
+        seq_stride: 128,
+        head_stride: 128,
+        ..*keys
+    })
+}
+
 pub fn kv_append(
     ctx: &Ctx,
     k: RaggedTensor,
@@ -336,7 +453,39 @@ fn ranked(
     let head_dim = count(OP, "the key width this ranking states", head_dim)?;
     let top_k = count(OP, "the selection budget this ranking states", top_k)?;
 
-    pool_pitch(OP, keys, head_dim)?;
+    // DeepSeek-V4.1's FP4 keys, read against its queries read at FP4: by
+    // the tensor-core scorer as they are, where it takes the shape and the
+    // tcgen05 one does not; else widened to bf16 pages for the others.
+    let fp4 = fp4_keys(keys);
+    let q = if fp4 {
+        if turn.is_some() || head_dim != 128 {
+            return Ok(false);
+        }
+        let q = fp4_queries(ctx, OP, q)?;
+        #[cfg(feature = "cuda")]
+        let tc5 = ctx.tuning().index_tc5 && selection.rows >= TC5_FROM;
+        #[cfg(not(feature = "cuda"))]
+        let tc5 = false;
+        if !(ctx.tuning().index_mma && heads <= 64) || tc5 {
+            let staged = stage_fp4(ctx, OP, keys)?;
+            return ranked(
+                ctx,
+                q,
+                weights,
+                &staged,
+                heads.unsigned_abs(),
+                head_dim.unsigned_abs(),
+                top_k.unsigned_abs(),
+                ratio,
+                None,
+                selection,
+            );
+        }
+        q
+    } else {
+        pool_pitch(OP, keys, head_dim)?;
+        q
+    };
     let q_width = stated(OP, q.data.width)?;
     if q_width != heads.saturating_mul(head_dim) {
         return Err(refuse(
@@ -383,6 +532,7 @@ fn ranked(
 
     #[cfg(feature = "cuda")]
     if ctx.tuning().index_tc5
+        && !fp4
         && head_dim == 128
         && heads <= 64
         && selection.rows >= TC5_FROM
@@ -418,7 +568,7 @@ fn ranked(
                 _ => 4,
             };
             (
-                format!("::pie::attn::index_topk_paged_mma<::pie::bf16, {tiles}, {radix}>"),
+                format!("::pie::attn::index_topk_paged_mma<::pie::bf16, {tiles}, {radix}, {fp4}>"),
                 // The query, 16 rows a tile, and each warp's two chunks of 16
                 // keys, at 128 + 8 bf16 a row.
                 (16 * tiles + 2 * (K_BLOCK / 32) * 16) * (128 + 8) * 2,

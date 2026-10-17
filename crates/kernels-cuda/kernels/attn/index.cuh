@@ -2,10 +2,169 @@
 
 #include <cstdint>
 
+#include "attn/dsv4_kv.cuh"
 #include "prelude/device.cuh"
 #include "prelude/rope.cuh"
 
 namespace pie::attn {
+
+// DeepSeek-V4.1's FP4 index keys: a position's 128 dims as e2m1 pairs (64
+// bytes, the lower dim in the low nibble) under one ue8m0 exponent a 32 (4
+// bytes), a page of `ps` positions its `ps` data rows then its `ps` scale
+// rows. The reference's `fp4_act_quant(k, 32, ue8m0)`: the exponent
+// 2^ceil(log2(amax / 6)), amax floored at 6 * 2^-126, the codes e2m1 of
+// x / 2^e. Its queries are read alike.
+namespace index_fp4 {
+
+constexpr int kD = 128;
+constexpr int kData = kD / 2;
+constexpr int kScale = kD / 32;
+constexpr int kRow = kData + kScale;
+
+// The biased exponent of 2^ceil(log2(amax * (1/6))), as the reference's
+// `fast_round_scale` takes it off the product's bits.
+__device__ __forceinline__ int e8m0_ceil6(float amax) {
+    const unsigned bits = __float_as_uint(fmaxf(amax, 6.f * 1.1754943508222875e-38f) * (1.f / 6.f));
+    return static_cast<int>((bits >> 23) & 0xffu) + ((bits & 0x7fffffu) != 0u ? 1 : 0);
+}
+
+__device__ __forceinline__ float pow2_of(int e) {
+    return e != 0 ? __uint_as_float(static_cast<unsigned>(e) << 23) : __uint_as_float(0x00400000u);
+}
+
+// Eight dims of a key from its page plane: `slot` its page * ps + offset,
+// `run` which 8 of its 128.
+__device__ __forceinline__ uint4 load8(const std::uint8_t* plane, long long slot, int ps, int run) {
+    const long long page = slot / ps;
+    const int off = static_cast<int>(slot % ps);
+    const std::uint8_t* base = plane + page * ps * kRow;
+    const std::uint32_t nib = *reinterpret_cast<const std::uint32_t*>(base + off * kData + run * 4);
+    const float s = pow2_of(base[ps * kData + off * kScale + run / 4]);
+    uint4 out;
+    std::uint32_t* o32 = reinterpret_cast<std::uint32_t*>(&out);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const unsigned byte = (nib >> (8 * i)) & 0xffu;
+        const __nv_bfloat162 b = __floats2bfloat162_rn(dsv4::e2m1_value(byte & 0xfu) * s,
+                                                       dsv4::e2m1_value(byte >> 4) * s);
+        o32[i] = *reinterpret_cast<const std::uint32_t*>(&b);
+    }
+    return out;
+}
+
+}  // namespace index_fp4
+
+// The index keys `entries` ([n, 128] bf16) as FP4 rows at their boundaries'
+// positions (`pool_kv_append` onto an FP4 key pool). A warp an entry, a lane
+// four dims, eight lanes a 32-block.
+__global__ __launch_bounds__(128) void index_store_fp4(
+    const bf16* __restrict__ entries,
+    std::uint8_t* __restrict__ pages,
+    const i32* __restrict__ boundary_pos,
+    const i32* __restrict__ boundary_req,
+    const u32* __restrict__ page_indices,
+    const u32* __restrict__ page_indptr,
+    int n,
+    int page_size)
+{
+    using namespace index_fp4;
+    const int c = static_cast<int>(blockIdx.x) * 4 + static_cast<int>(threadIdx.x >> 5);
+    const int lane = static_cast<int>(threadIdx.x & 31);
+    if (c >= n) return;
+    const int pos = boundary_pos[c];
+    if (pos < 0) return;
+    const long long page = page_indices[page_indptr[boundary_req[c]] + pos / page_size];
+    const int off = pos % page_size;
+    const uint2 raw = *reinterpret_cast<const uint2*>(entries + static_cast<long long>(c) * kD + lane * 4);
+    const bf16* x = reinterpret_cast<const bf16*>(&raw);
+    float v[4];
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        v[i] = Elem<bf16>::to_f32(x[i]);
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+    const int e = e8m0_ceil6(amax);
+    const float inv = __uint_as_float(static_cast<unsigned>(254 - e) << 23);
+    unsigned code[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) code[i] = dsv4::e2m1_code(fminf(fmaxf(v[i] * inv, -6.f), 6.f));
+    std::uint8_t* base = pages + page * page_size * kRow;
+    *reinterpret_cast<std::uint16_t*>(base + off * kData + lane * 2) =
+        static_cast<std::uint16_t>(code[0] | (code[1] << 4) | (code[2] << 8) | (code[3] << 12));
+    if ((lane & 7) == 0) base[page_size * kData + off * kScale + lane / 8] = static_cast<std::uint8_t>(e);
+}
+
+// The index queries ([rows, heads * 128] bf16) read at FP4 as the reference
+// reads them: each 32-block quantized and read back, `out` the values. A
+// thread eight dims, four threads a block.
+__global__ __launch_bounds__(256) void index_q_fp4(
+    const bf16* __restrict__ q,
+    bf16* __restrict__ out,
+    long long runs,
+    const u32* __restrict__ win,
+    int width)
+{
+    using namespace index_fp4;
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    // Every lane reaches the shuffles; a 32-block is four lanes of one row.
+    const bool live = i < runs && (win == nullptr || i / (width / 8) < static_cast<long long>(win[0]));
+    const long long at = (win != nullptr ? static_cast<long long>(win[1]) * (width / 8) : 0) + i;
+    float v[8];
+    float amax = 0.f;
+    if (live) {
+        const uint4 raw = *reinterpret_cast<const uint4*>(q + at * 8);
+        const bf16* x = reinterpret_cast<const bf16*>(&raw);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            v[k] = Elem<bf16>::to_f32(x[k]);
+            amax = fmaxf(amax, fabsf(v[k]));
+        }
+    }
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    if (!live) return;
+    const int e = e8m0_ceil6(amax);
+    const float s = pow2_of(e);
+    const float inv = __uint_as_float(static_cast<unsigned>(254 - e) << 23);
+    uint4 o;
+    std::uint32_t* o32 = reinterpret_cast<std::uint32_t*>(&o);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const float a = dsv4::e2m1_value(dsv4::e2m1_code(fminf(fmaxf(v[2 * k] * inv, -6.f), 6.f))) * s;
+        const float b = dsv4::e2m1_value(dsv4::e2m1_code(fminf(fmaxf(v[2 * k + 1] * inv, -6.f), 6.f))) * s;
+        const __nv_bfloat162 pr = __floats2bfloat162_rn(a, b);
+        o32[k] = *reinterpret_cast<const std::uint32_t*>(&pr);
+    }
+    *reinterpret_cast<uint4*>(out + at * 8) = o;
+}
+
+// FP4 index-key pages widened into a bf16 plane in table order: page i of
+// `out` is page indices[i] of the FP4 plane, out_indices[i] = i. A thread a
+// run of 8 dims.
+__global__ __launch_bounds__(256) void index_stage_fp4(
+    const std::uint8_t* __restrict__ plane,
+    bf16* __restrict__ out,
+    const u32* __restrict__ indices,
+    u32* __restrict__ out_indices,
+    int n,
+    int page_size)
+{
+    using namespace index_fp4;
+    const int i = static_cast<int>(blockIdx.x);
+    if (i >= n) return;
+    if (threadIdx.x == 0) out_indices[i] = static_cast<u32>(i);
+    const long long src = indices[i];
+    for (int c = threadIdx.x; c < page_size * (kD / 8); c += blockDim.x) {
+        const int r = c / (kD / 8);
+        const int run = c % (kD / 8);
+        *reinterpret_cast<uint4*>(out + (static_cast<long long>(i) * page_size + r) * kD + run * 8) =
+            load8(plane, src * page_size + r, page_size, run);
+    }
+}
 
 constexpr int kBlock = 256;
 
@@ -546,7 +705,7 @@ __device__ __forceinline__ void mma_m16n8k16(float (&d)[4], const std::uint32_t 
 
 }  // namespace index_mma
 
-template <class T, int kTiles = 1, bool kRadix = false>
+template <class T, int kTiles = 1, bool kRadix = false, bool kFp4 = false>
 __global__ void index_topk_paged_mma(
     const T* __restrict__ idx_q,
     const T* __restrict__ idx_w,
@@ -664,6 +823,20 @@ __global__ void index_topk_paged_mma(
         }
         __syncwarp();
         T* kb = k_s0 + (warp * 2 + buf) * kKeys * kLd;
+        if constexpr (kFp4) {
+            // FP4 keys, widened as they land.
+            const std::uint8_t* plane = reinterpret_cast<const std::uint8_t*>(key_pages);
+            for (int c = lane; c < kKeys * (kD / 8); c += 32) {
+                const int key = c / (kD / 8);
+                const int run = c % (kD / 8);
+                const long long slot = slot_s[warp][buf][key];
+                uint4 v = make_uint4(0, 0, 0, 0);
+                if (slot >= 0) v = index_fp4::load8(plane, slot, page_size, run);
+                *reinterpret_cast<uint4*>(kb + key * kLd + run * 8) = v;
+            }
+            asm volatile("cp.async.commit_group;\n" ::: "memory");
+            return;
+        }
         for (int c = lane; c < kKeys * (kD / 8); c += 32) {
             const int key = c / (kD / 8);
             const int d = (c % (kD / 8)) * 8;

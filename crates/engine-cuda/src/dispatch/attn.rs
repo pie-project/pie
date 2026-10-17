@@ -1379,6 +1379,15 @@ impl Run<'_> {
                         self.tensor(*boundary_req),
                         &into,
                     )
+                } else if attn::index::fp4_keys(&into) {
+                    // DeepSeek-V4.1's FP4 index keys, quantized on the way in.
+                    attn::index::store_fp4(
+                        self.ctx(),
+                        self.tensor(*entries),
+                        self.tensor(*boundary_pos),
+                        self.tensor(*boundary_req),
+                        &into,
+                    )
                 } else {
                     pool::kv_append(
                         self.ctx(),

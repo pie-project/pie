@@ -71,10 +71,12 @@ DS_ROW = 584
 
 # An nvfp4 kv deployment keeps V4.1's caches as its reference quantizes
 # them: the window's plane as MXFP8 rows (all 512 dims e4m3 under one ue8m0
-# a 32, 528 bytes a position) and the compressed rows as NVFP4 ones (e2m1
-# under one e4m3 a 16, 288 bytes). The index keys stay at bf16.
+# a 32, 528 bytes a position), the compressed rows as NVFP4 ones (e2m1 under
+# one e4m3 a 16, 288 bytes) and the index keys as FP4 ones (e2m1 under one
+# ue8m0 a 32, 68 bytes), its index queries read at FP4 against them.
 MX8_ROW = 528
 NV4_ROW = 288
+FP4_KEY_ROW = 68
 
 def fp8_rows(m):
     return m.kv == dtype.e4m3
@@ -86,7 +88,7 @@ def caches(m, c):
     fp8 = fp8_rows(m)
     fp4 = fp4_rows(m)
     rows = dtype.u8 if fp8 or fp4 else m.kv
-    keys = dtype.bf16 if fp8 or fp4 else m.kv
+    keys = dtype.u8 if fp4 else dtype.bf16 if fp8 else m.kv
 
     def row(at):
         if fp8:
@@ -106,7 +108,7 @@ def caches(m, c):
             c.kv(pool, at.pool.entries, [DS_ROW] if fp8 else [NV4_ROW] if fp4 else [m.head_dim], m.head_dim)
         if at.indexer != None and at.indexer.owns_keys:
             index = c.kv_space(keys)
-            c.kv(index, at.indexer.keys, [at.indexer.head_dim], at.indexer.head_dim)
+            c.kv(index, at.indexer.keys, [FP4_KEY_ROW] if fp4 else [at.indexer.head_dim], at.indexer.head_dim)
         if w.engram != None:
             c.state(w.engram.ids_state, [w.engram.ngram - 1], dtype.i32)
     if m.mtp != None:
