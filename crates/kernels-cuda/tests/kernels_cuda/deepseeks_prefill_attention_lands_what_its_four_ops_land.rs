@@ -1,12 +1,11 @@
 #![cfg(feature = "cuda")]
 
-//! DeepSeek-V4's attention at prefill widths in one tcgen05 pass: each row's
-//! 128-key window and its compressed entries (every visible one, or an
-//! index's ascending selection) in one softmax, the sinks over it, against
-//! the same arithmetic in f64. Rows pair up within a request and across a
-//! request's end, and the fire ends on a lone row; and with each row's
-//! window held above a replay floor.
+//! `attn::dsv4_prefill`: each row's 128-key window and its compressed
+//! entries (all visible, or an index's selection) in one softmax with the
+//! sinks, against the same arithmetic in f64. Rows pair up within a request
+//! and across a request's end, and the fire ends on a lone row.
 
+use crate::common::host_b::rows_read;
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::dsv4;
@@ -54,43 +53,6 @@ fn paging(per: usize) -> (Vec<u32>, Vec<u32>) {
     (pages, vec![0, per as u32, 2 * per as u32])
 }
 
-fn check(ratio: usize, top_k: Option<usize>) {
-    check_with(ratio, top_k, true, None, false);
-    // DeepSeek's fp8 rows, which only the block-a-row kernel reads.
-    check_with(ratio, top_k, true, Some((Rows::Ds, Rows::Ds)), false);
-}
-
-/// An e4m3 code's value.
-fn e4m3(code: u8) -> f32 {
-    let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };
-    let exp = i32::from((code >> 3) & 0xf);
-    let man = f32::from(code & 7);
-    sign * if exp == 0 {
-        man / 8.0 * 2f32.powi(-6)
-    } else {
-        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
-    }
-}
-
-/// An e2m1 code's value.
-fn e2m1(code: u8) -> f32 {
-    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let v = MAG[usize::from(code & 7)];
-    if code & 8 != 0 { -v } else { v }
-}
-
-/// `src`'s cells written as DeepSeek's fp8 rows through the fp8 append:
-/// the u8 pool, and what its rows read as.
-fn fp8_plane(
-    gpu: &mut Gpu,
-    src: u64,
-    cells: usize,
-    pages: &[u32],
-    indptr: &[u32],
-) -> (KvPool, Vec<f32>) {
-    rows_plane(gpu, src, cells, pages, indptr, Rows::Ds)
-}
-
 /// `src`'s cells written as DeepSeek's quantized rows of format `fmt`
 /// through the append: the u8 pool, and what its rows read as.
 fn rows_plane(
@@ -101,10 +63,7 @@ fn rows_plane(
     indptr: &[u32],
     fmt: Rows,
 ) -> (KvPool, Vec<f32>) {
-    let row = fmt.bytes() as usize;
-    let data = dsv4::DS_DATA as usize;
-    let nope = dsv4::DS_NOPE as usize;
-    let bytes = cells * row;
+    let bytes = cells * fmt.bytes() as usize;
     let plane = gpu.zeros(bytes);
     let pool = KvPool {
         keys: Tensor::new(plane, cells as u32, fmt.bytes(), Dtype::U8),
@@ -120,62 +79,15 @@ fn rows_plane(
     dsv4::append(&gpu.ctx(), rows_t, &pool, at_page, at_off).expect("the fp8 append fires");
     gpu.sync();
     let raw: Vec<u8> = gpu.down(plane, bytes);
-    let mut read = vec![0f32; cells * D];
-    if fmt != Rows::Ds {
-        // V4.1's rows: MXFP8 (a ue8m0 a 32) or NVFP4 (an e4m3 a 16).
-        let (data, scale) = if fmt == Rows::Mx8 {
-            (512, 16)
-        } else {
-            (256, 32)
-        };
-        for c in 0..cells {
-            let base = c / PAGE * PAGE * row;
-            let off = c % PAGE;
-            let (b, sc) = (base + off * data, base + PAGE * data + off * scale);
-            for d in 0..D {
-                read[c * D + d] = if fmt == Rows::Mx8 {
-                    e4m3(raw[b + d]) * 2f32.powi(i32::from(raw[sc + d / 32]) - 127)
-                } else {
-                    let byte = raw[b + d / 2];
-                    e2m1(if d % 2 == 0 { byte & 0xf } else { byte >> 4 }) * e4m3(raw[sc + d / 16])
-                };
-            }
-        }
-        return (pool, read);
-    }
-    for c in 0..cells {
-        let base = c / PAGE * PAGE * row;
-        let off = c % PAGE;
-        let b = &raw[base + off * data..base + (off + 1) * data];
-        let sc = &raw[base + PAGE * data + off * 8..base + PAGE * data + off * 8 + 8];
-        for d in 0..D {
-            read[c * D + d] = if d < nope {
-                e4m3(b[d]) * 2f32.powi(i32::from(sc[d / 64]) - 127)
-            } else {
-                let at = nope + (d - nope) * 2;
-                from_bf16(u16::from_le_bytes([b[at], b[at + 1]]))
-            };
-        }
-    }
+    let read = rows_read(&raw, cells, PAGE, fmt);
     (pool, read)
 }
 
-fn check_with(
+/// With `graph_safe` the pass a CUDA graph records (every quantized row
+/// widened as its tiles land, nothing staged).
+fn check(
     ratio: usize,
     top_k: Option<usize>,
-    sparse: bool,
-    fmts: Option<(Rows, Rows)>,
-    floored: bool,
-) {
-    check_safe(ratio, top_k, sparse, fmts, floored, false);
-}
-
-/// [`check_with`], with `graph_safe` the pass a CUDA graph records (every
-/// quantized row widened as its tiles land, nothing staged).
-fn check_safe(
-    ratio: usize,
-    top_k: Option<usize>,
-    sparse: bool,
     fmts: Option<(Rows, Rows)>,
     floored: bool,
     graph_safe: bool,
@@ -323,7 +235,7 @@ fn check_safe(
             let (a, b) = (from_bf16(a), from_bf16(b));
             assert!(
                 (a - b).abs() <= b.abs() / 64.0 + 1e-2,
-                "ratio {ratio} sparse {sparse} fp8 {fp8}: turned element {i} is {a} against {b}"
+                "ratio {ratio} fp8 {fp8}: turned element {i} is {a} against {b}"
             );
         }
     }
@@ -379,34 +291,36 @@ fn check_safe(
     }
     assert!(
         worst <= 4e-2,
-        "ratio {ratio}, top_k {top_k:?}, sparse {sparse}, fp8 {fp8}, floored {floored}, graph-safe {graph_safe}: an output element differs by {worst} relative"
+        "ratio {ratio}, top_k {top_k:?}, fp8 {fp8}, floored {floored}, graph-safe {graph_safe}: an output element differs by {worst} relative"
     );
 }
 
 #[test]
 fn deepseeks_prefill_attention_lands_what_its_four_ops_land() {
-    // A CSA layer: ratio 4, a selection of 64 a row; an HCA layer: ratio
-    // 128, every visible entry.
-    check(4, Some(64));
-    // Selections longer than a tile: the merge walks them over several.
-    check(4, Some(512));
-    check(128, None);
-    // Every visible entry at ratio 4: a page's sixteen entries land as one box.
-    check(4, None);
-    // DeepSeek-V4.1's FP4 cache: an MXFP8 window over NVFP4 compressed rows,
-    // at its ratios 2 (selected) and 1.
-    let v41 = Some((Rows::Mx8, Rows::Nv4));
-    check_with(2, Some(512), true, v41, false);
-    check_with(1, Some(512), true, v41, false);
-    check_with(2, None, true, v41, false);
-    // Windows held above their rows' replay floors (V4.1's bounded replay).
-    check_with(2, Some(512), true, v41, true);
-    check_with(1, Some(512), true, v41, true);
-    check_with(4, Some(64), true, None, true);
-    // The pass a graph records: V4's rows widened as V4.1's are, not staged.
-    check_safe(4, Some(64), true, Some((Rows::Ds, Rows::Ds)), false, true);
-    check_safe(128, None, true, Some((Rows::Ds, Rows::Ds)), false, true);
-    check_safe(2, Some(512), true, v41, true, true);
+    let (ds, v41) = (Some((Rows::Ds, Rows::Ds)), Some((Rows::Mx8, Rows::Nv4)));
+    // (ratio, top_k, rows, floored, graph_safe): a CSA layer (ratio 4, 64
+    // picks; 512 walk several tiles), an HCA layer (ratio 128, every entry),
+    // every entry at ratio 4 (a page's sixteen as one box), V4.1's MXFP8
+    // window over NVFP4 entries at ratios 2 and 1; windows held above replay
+    // floors; and the pass a graph records.
+    for (ratio, top_k, fmts, floored, graph_safe) in [
+        (4, Some(64), None, false, false),
+        (4, Some(64), ds, false, false),
+        (4, Some(512), None, false, false),
+        (128, None, None, false, false),
+        (128, None, ds, false, false),
+        (4, None, None, false, false),
+        (2, Some(512), v41, false, false),
+        (1, Some(512), v41, false, false),
+        (2, None, v41, false, false),
+        (2, Some(512), v41, true, false),
+        (4, Some(64), None, true, false),
+        (4, Some(64), ds, false, true),
+        (128, None, ds, false, true),
+        (2, Some(512), v41, true, true),
+    ] {
+        check(ratio, top_k, fmts, floored, graph_safe);
+    }
 }
 
 /// `values` written over the device bytes at `at`.
@@ -553,7 +467,7 @@ fn a_window_only_layer_lands_its_window_alone() {
     let scale = 1.0 / (D as f32).sqrt();
     for fp8 in [false, true] {
         let win = if fp8 {
-            fp8_plane(&mut gpu, w_at, cells, &pages, &indptr).0
+            rows_plane(&mut gpu, w_at, cells, &pages, &indptr, Rows::Ds).0
         } else {
             pool_of(&mut gpu, w_at, cells, &pages, &indptr)
         };

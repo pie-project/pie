@@ -1,14 +1,11 @@
 #![cfg(feature = "cuda")]
 
-//! DeepSeek-V4's compressor at its boundaries in one pass
-//! (`pool::compress`, under `kernel.elemwise.rows_vec`): the gathered entry,
-//! its scaled RMS norm, its tail rotated at the boundary's rope position and
-//! written into the entries pool, against the gather, the norm and rotation
-//! and the append the unfused ops fire: at both ratios, the main latent (512
-//! wide, bf16 and DeepSeek's fp8 pool) and the index keys (128), on a staged
-//! window too. The pools land alike within rounding (the fp8 one as its rows
-//! read).
+//! DeepSeek-V4's compressor in one pass (`pool::compress` under
+//! `rows_vec`: gather, scaled RMS norm, tail rotation and append) against
+//! the unfused ops, at both ratios, the 512-wide latent (bf16 and fp8 pools)
+//! and the 128-wide index keys, on a staged window too.
 
+use crate::common::host_b::rows_read;
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::{dsv4, pool};
@@ -50,17 +47,6 @@ fn pool_of(
         block_size: 0,
         max_pages_per_request: PAGES_PER as i32,
         pages_in_batch: pages.len() as i32,
-    }
-}
-
-fn e4m3(code: u8) -> f32 {
-    let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };
-    let exp = i32::from((code >> 3) & 0xf);
-    let man = f32::from(code & 7);
-    sign * if exp == 0 {
-        man / 8.0 * 2f32.powi(-6)
-    } else {
-        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
     }
 }
 
@@ -199,27 +185,7 @@ fn pass(one: bool, ratio: usize, d: usize, fp8: bool, window: Option<(u32, u32)>
         return raw.iter().map(|&b| from_bf16(b)).collect();
     }
     let raw: Vec<u8> = gpu.down(out_at, cells * out_row);
-    let (row, data, nope) = (
-        dsv4::DS_ROW as usize,
-        dsv4::DS_DATA as usize,
-        dsv4::DS_NOPE as usize,
-    );
-    let mut read = vec![0f32; cells * d];
-    for c in 0..cells {
-        let base = c / PAGE * PAGE * row;
-        let off = c % PAGE;
-        let b = &raw[base + off * data..base + (off + 1) * data];
-        let sc = &raw[base + PAGE * data + off * 8..base + PAGE * data + off * 8 + 8];
-        for k in 0..d {
-            read[c * d + k] = if k < nope {
-                e4m3(b[k]) * 2f32.powi(i32::from(sc[k / 64]) - 127)
-            } else {
-                let at = nope + (k - nope) * 2;
-                from_bf16(u16::from_le_bytes([b[at], b[at + 1]]))
-            };
-        }
-    }
-    read
+    rows_read(&raw, cells, PAGE, dsv4::Rows::Ds)
 }
 
 fn check(ratio: usize, d: usize, fp8: bool, window: Option<(u32, u32)>) {
@@ -239,12 +205,16 @@ fn check(ratio: usize, d: usize, fp8: bool, window: Option<(u32, u32)>) {
 
 #[test]
 fn the_pool_compressor_lands_in_one_pass() {
-    for (ratio, d) in [(4, 512), (128, 512), (4, 128)] {
-        check(ratio, d, false, None);
+    for (ratio, d, fp8, window) in [
+        (4, 512, false, None),
+        (128, 512, false, None),
+        (4, 128, false, None),
+        (4, 512, true, None),
+        (128, 512, true, None),
+        (4, 512, false, Some((150, 40))),
+    ] {
+        check(ratio, d, fp8, window);
     }
-    check(4, 512, true, None);
-    check(128, 512, true, None);
-    check(4, 512, false, Some((150, 40)));
 }
 
 /// A decode's fire, one row a request: the compressor's state written in the

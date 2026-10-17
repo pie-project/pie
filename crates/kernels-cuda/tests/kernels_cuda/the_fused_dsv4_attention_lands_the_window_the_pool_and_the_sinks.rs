@@ -1,17 +1,13 @@
 #![cfg(feature = "cuda")]
 
-//! DeepSeek-V4's attention at decode widths in one launch
-//! (`attn::dsv4::decode`): a row's 128-position window of the shared
-//! key/value plane, its compressed rows (all it sees, or an indexer's picks
-//! with ids past the visible ones and an early end), folded together with
-//! the sinks, against an f32 walk over the same rows; at row counts that
-//! split a row's keys over clusters of 8, 4, 2 and 1 blocks. The planes are
-//! bf16, or DeepSeek's quantized rows as `attn::dsv4::append` writes them
-//! (V4's fp8 rows, or V4.1's MXFP8 window and NVFP4 compressed rows), read
-//! back against what the bytes say (V4's bytes against the bf16 rows, and
-//! V4.1's bit for bit against its reference's quantizers); and with each
-//! row's window held above a replay floor (V4.1's bounded replay).
+//! `attn::dsv4::decode`: a row's 128-position window, its compressed rows
+//! (all it sees, or an indexer's picks) and the sinks, against an f32 walk
+//! over the same rows. The planes are bf16 or DeepSeek's quantized rows as
+//! `attn::dsv4::append` writes them (V4.1's bit for bit against its
+//! reference's quantizers).
 
+use crate::common::host_b::{nearest, rows_read};
+use crate::common::tc5::{e2m1, e4m3};
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::dsv4;
@@ -67,8 +63,7 @@ enum Pool {
     Selected(usize, usize),
 }
 
-fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>, floored: bool) {
-    let fp8 = fmts.is_some();
+fn check(rows: usize, pool: Pool, fmts: Option<(Rows, Rows)>, floored: bool) {
     // Two requests of 2304 positions each, their pages interleaved; the
     // window and the compressed rows are two planes on the same tables.
     let span = 2304usize;
@@ -146,10 +141,10 @@ fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>, floor
                         want[at]
                     );
                 }
-                planes.push((pool, v41_read(&raw, cells, fmt)));
+                planes.push((pool, rows_read(&raw, cells, PAGE, fmt)));
                 continue;
             }
-            let read = ds_read(&raw, cells);
+            let read = rows_read(&raw, cells, PAGE, fmt);
             for (i, (&got, &want)) in read.iter().zip(exact.iter()).enumerate() {
                 // A code is within half its step of the value: 1/16 of it,
                 // or half the subnormal step under the tile's scale.
@@ -205,7 +200,7 @@ fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>, floor
     // Sharper than 1/sqrt(d), so a few keys carry a head.
     let scale = 4.0 / (D as f32).sqrt();
     let mut want = vec![0f32; rows * HEADS * D];
-    for r in 0..if bench { 0 } else { rows } {
+    for r in 0..rows {
         let pos = positions[r] as usize;
         let req = reqs[r] as usize;
         let mut keys: Vec<&[f32]> = Vec::new();
@@ -268,15 +263,6 @@ fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>, floor
         ))
     };
     let o_at = gpu.zeros(rows * HEADS * D * 2);
-    let (flush, po_at, plse_at) = if bench {
-        (
-            gpu.zeros(FLUSH),
-            gpu.zeros(rows * HEADS * D * 2),
-            gpu.zeros(rows * HEADS * 4),
-        )
-    } else {
-        (0, 0, 0)
-    };
     let pooled = (ratio > 0).then_some(dsv4::Pooled {
         entries: &entries,
         ratio: ratio as u32,
@@ -302,96 +288,6 @@ fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>, floor
         )
         .expect("the fused attention fires");
     };
-    if bench {
-        let fused = time(&gpu, flush, &fire);
-        // The pool walk alone on the tensor cores, as the four launches run it.
-        let pool_only = if ratio > 0 && !fp8 {
-            let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
-                pool_mma: true,
-                ..kernels_cuda::tuning::Tuning::DEFAULT
-            });
-            time(&gpu, flush, &|| {
-                let mut po = Tensor::new(po_at, rows as u32, (HEADS * D) as u32, Dtype::Bf16);
-                let mut plse = Tensor::new(plse_at, rows as u32, HEADS as u32, Dtype::F32);
-                match sel_t {
-                    Some((sel, k)) => kernels_cuda::attn::pool::attention_lse_selected(
-                        &ctx,
-                        q_t,
-                        pos_t,
-                        req_t,
-                        sel,
-                        &entries_bf16,
-                        ratio as u32,
-                        k,
-                        HEADS as u32,
-                        D as u32,
-                        scale,
-                        &mut po,
-                        &mut plse,
-                    ),
-                    None => kernels_cuda::attn::pool::attention_lse(
-                        &ctx,
-                        q_t,
-                        pos_t,
-                        req_t,
-                        &entries_bf16,
-                        ratio as u32,
-                        HEADS as u32,
-                        D as u32,
-                        scale,
-                        &mut po,
-                        &mut plse,
-                    ),
-                }
-                .expect("the pool walk fires");
-            })
-        } else {
-            0.0
-        };
-        // The tcgen05 pass a block a row (all 64 heads), over the same rows.
-        // (V4.1's rows widened as the pass reads them; V4's are staged.)
-        let v41 = fmts == Some((Rows::Mx8, Rows::Nv4));
-        let sparse = if ratio > 0 && (fmts.is_none() || v41) {
-            let (win_pool, ent_pool) = if v41 {
-                (&window_pool, &entries)
-            } else {
-                (&window_bf16, &entries_bf16)
-            };
-            let pooled = kernels_cuda::attn::dsv4_prefill::Pooled {
-                entries: ent_pool,
-                ratio: ratio as u32,
-                selection: sel_t,
-            };
-            time(&gpu, flush, &|| {
-                let mut o = Tensor::new(o_at, rows as u32, (HEADS * D) as u32, Dtype::Bf16);
-                kernels_cuda::attn::dsv4_prefill::prefill(
-                    &gpu.ctx(),
-                    "attention.pool_attention",
-                    q_t,
-                    pos_t,
-                    req_t,
-                    None,
-                    false,
-                    win_pool,
-                    &pooled,
-                    sink_t,
-                    scale,
-                    None,
-                    &mut o,
-                )
-                .expect("the sparse pass fires");
-            })
-        } else {
-            0.0
-        };
-        println!(
-            "| pool_lse_mma | {rows} rows | ratio {ratio} | top_k {top_k} | {pool_only:.1} us | sparse {sparse:.1} us |"
-        );
-        println!(
-            "| dsv4 fused | {rows} rows | ratio {ratio} | top_k {top_k} | rows {fmts:?} | {fused:.1} us |"
-        );
-        return;
-    }
     fire();
     gpu.sync();
     let got: Vec<u16> = gpu.down(o_at, rows * HEADS * D);
@@ -475,61 +371,28 @@ fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>, floor
 
 #[test]
 fn the_fused_dsv4_attention_lands_the_window_the_pool_and_the_sinks() {
+    // 1, 8, 16 and 40 rows split a row's keys over 8, 4, 2 and 1 blocks;
+    // Dense(2) at 40 rows holds more keys than a chunk gathers at once; the
+    // floored cases hold each window above its row's replay floor.
+    let cases = [
+        (1, Pool::Selected(4, 512), false),
+        (8, Pool::Selected(4, 512), false),
+        (8, Pool::None, false),
+        (16, Pool::Dense(4), false),
+        (40, Pool::Selected(4, 64), false),
+        (40, Pool::Dense(2), false),
+        (8, Pool::Selected(4, 512), true),
+        (64, Pool::None, true),
+    ];
     // bf16; V4's fp8 rows; V4.1's MXFP8 window over NVFP4 compressed rows.
-    for fp8 in [
+    for fmts in [
         None,
         Some((Rows::Ds, Rows::Ds)),
         Some((Rows::Mx8, Rows::Nv4)),
     ] {
-        check(1, Pool::Selected(4, 512), false, fp8, false);
-        check(8, Pool::Selected(4, 512), false, fp8, false);
-        check(8, Pool::Dense(128), false, fp8, false);
-        check(8, Pool::None, false, fp8, false);
-        check(16, Pool::Dense(4), false, fp8, false);
-        check(40, Pool::Selected(4, 64), false, fp8, false);
-        // More keys than a chunk gathers at once.
-        check(40, Pool::Dense(2), false, fp8, false);
-        // Windows held above their rows' replay floors.
-        check(8, Pool::Selected(4, 512), false, fp8, true);
-        check(40, Pool::Dense(2), false, fp8, true);
-        check(64, Pool::None, false, fp8, true);
-    }
-}
-/// An e4m3 code's value.
-fn e4m3(code: u8) -> f32 {
-    let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };
-    let exp = i32::from((code >> 3) & 0xf);
-    let man = f32::from(code & 7);
-    sign * if exp == 0 {
-        man / 8.0 * 2f32.powi(-6)
-    } else {
-        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
-    }
-}
-
-/// An e2m1 code's value.
-fn e2m1(code: u8) -> f32 {
-    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let v = MAG[usize::from(code & 7)];
-    if code & 8 != 0 { -v } else { v }
-}
-
-/// The nearest of `codes` codes to `v` under `value`, ties to the even code
-/// (the hardware's `cvt.rn`), the sign bit `sign` kept on a negative value,
-/// zero included, as the hardware keeps it.
-fn nearest(v: f32, codes: u8, value: impl Fn(u8) -> f32, sign: u8) -> u8 {
-    let a = v.abs();
-    let mut best = 0u8;
-    for c in 1..codes {
-        let (d, db) = ((value(c) - a).abs(), (value(best) - a).abs());
-        if d < db || (d == db && c % 2 == 0) {
-            best = c;
+        for (rows, pool, floored) in cases {
+            check(rows, pool, fmts, floored);
         }
-    }
-    if v.is_sign_negative() {
-        best | sign
-    } else {
-        best
     }
 }
 
@@ -584,110 +447,4 @@ fn v41_rows(x: &[f32], cells: usize, fmt: Rows) -> Vec<u8> {
         }
     }
     out
-}
-
-/// What V4.1's rows say: every cell's 512 values.
-fn v41_read(raw: &[u8], cells: usize, fmt: Rows) -> Vec<f32> {
-    let (data, scale) = match fmt {
-        Rows::Mx8 => (512usize, 16usize),
-        Rows::Nv4 => (256, 32),
-        Rows::Ds => unreachable!("V4's rows read through `ds_read`"),
-    };
-    let mut out = vec![0f32; cells * D];
-    for cell in 0..cells {
-        let page = cell / PAGE * PAGE * (data + scale);
-        let off = cell % PAGE;
-        let (d_at, s_at) = (page + off * data, page + PAGE * data + off * scale);
-        for d in 0..D {
-            out[cell * D + d] = match fmt {
-                Rows::Mx8 => e4m3(raw[d_at + d]) * 2f32.powi(i32::from(raw[s_at + d / 32]) - 127),
-                _ => {
-                    let byte = raw[d_at + d / 2];
-                    let code = if d % 2 == 0 { byte & 0xf } else { byte >> 4 };
-                    e2m1(code) * e4m3(raw[s_at + d / 16])
-                }
-            };
-        }
-    }
-    out
-}
-
-/// What DeepSeek's fp8 rows say, page by page: every cell's 512 values.
-fn ds_read(raw: &[u8], cells: usize) -> Vec<f32> {
-    let row = dsv4::DS_ROW as usize;
-    let data = dsv4::DS_DATA as usize;
-    let nope = dsv4::DS_NOPE as usize;
-    let mut out = vec![0f32; cells * D];
-    for cell in 0..cells {
-        let page = cell / PAGE * PAGE * row;
-        let off = cell % PAGE;
-        let bytes = &raw[page + off * data..page + (off + 1) * data];
-        let scales = &raw[page + PAGE * data + off * 8..page + PAGE * data + off * 8 + 8];
-        assert_eq!(scales[7], 0, "cell {cell}: the scale row's pad");
-        for d in 0..D {
-            out[cell * D + d] = if d < nope {
-                e4m3(bytes[d]) * 2f32.powi(i32::from(scales[d / 64]) - 127)
-            } else {
-                let at = nope + (d - nope) * 2;
-                from_bf16(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
-            };
-        }
-    }
-    out
-}
-
-const FLUSH: usize = 256 << 20;
-
-/// The median device time of `fire` captured in a graph (so the host's
-/// launch cost is out of it), each replay after the L2 is flushed.
-fn time(gpu: &Gpu, flush: u64, fire: &dyn Fn()) -> f64 {
-    use kernels_cuda::cudarc::runtime::sys as rt;
-    let stream: rt::cudaStream_t = gpu.ctx().stream().cast();
-    fire();
-    gpu.sync();
-    let mut times = Vec::new();
-    unsafe {
-        let mut graph: rt::cudaGraph_t = core::ptr::null_mut();
-        let mut exec: rt::cudaGraphExec_t = core::ptr::null_mut();
-        rt::cudaStreamBeginCapture(
-            stream,
-            rt::cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal,
-        );
-        fire();
-        rt::cudaStreamEndCapture(stream, &raw mut graph);
-        rt::cudaGraphInstantiate(&raw mut exec, graph, 0);
-        let (mut a, mut b): (rt::cudaEvent_t, rt::cudaEvent_t) =
-            (core::ptr::null_mut(), core::ptr::null_mut());
-        rt::cudaEventCreate(&raw mut a);
-        rt::cudaEventCreate(&raw mut b);
-        let mut host: *mut core::ffi::c_void = core::ptr::null_mut();
-        rt::cudaMallocHost(&raw mut host, FLUSH);
-        rt::cudaMemsetAsync(flush as *mut core::ffi::c_void, 1, FLUSH, stream);
-        for _ in 0..21 {
-            // `DSV4_TIME_WARM` leaves the L2 as the last replay left it.
-            if std::env::var_os("DSV4_TIME_WARM").is_none() {
-                rt::cudaMemcpyAsync(
-                    host,
-                    flush as *const core::ffi::c_void,
-                    FLUSH,
-                    rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
-                    stream,
-                );
-            }
-            rt::cudaEventRecord(a, stream);
-            rt::cudaGraphLaunch(exec, stream);
-            rt::cudaEventRecord(b, stream);
-            rt::cudaEventSynchronize(b);
-            let mut ms = 0f32;
-            rt::cudaEventElapsedTime(&raw mut ms, a, b);
-            times.push(f64::from(ms) * 1e3);
-        }
-        rt::cudaEventDestroy(a);
-        rt::cudaEventDestroy(b);
-        rt::cudaFreeHost(host);
-        rt::cudaGraphExecDestroy(exec);
-        rt::cudaGraphDestroy(graph);
-    }
-    times.sort_by(f64::total_cmp);
-    times[times.len() / 2]
 }

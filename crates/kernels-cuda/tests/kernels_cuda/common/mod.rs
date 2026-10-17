@@ -410,5 +410,6 @@ pub fn close(got: f32, want: f32) -> bool {
 }
 
 pub mod host_a;
+pub mod host_b;
 pub mod spatial;
 pub mod tc5;

@@ -1,5 +1,7 @@
 #![cfg(feature = "cuda")]
 
+use crate::common::host_b::{to_e2m1, to_e4m3};
+use crate::common::tc5::{e2m1, e4m3};
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::act_quant::{
@@ -10,46 +12,6 @@ use kernels_cuda::linear::tc5::{Elem, atom_bytes, atom_offset, supported};
 use kernels_cuda::tensor::Tensor;
 
 const OP: &str = "linear.act_quant";
-
-fn e4m3(code: u8) -> f32 {
-    let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };
-    let exp = i32::from((code >> 3) & 0xf);
-    let man = f32::from(code & 7);
-    sign * if exp == 0 {
-        man / 8.0 * 2f32.powi(-6)
-    } else {
-        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
-    }
-}
-
-fn e2m1(code: u8) -> f32 {
-    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let v = MAG[usize::from(code & 7)];
-    if code & 8 != 0 { -v } else { v }
-}
-
-/// The nearest of `codes` positive codes under `value`, ties to the even
-/// code, saturating at the largest; the sign in `sign`, kept on a zero as
-/// the hardware's conversions keep it.
-fn nearest(v: f32, codes: u8, value: impl Fn(u8) -> f32, sign: u8) -> u8 {
-    let a = v.abs();
-    let mut best = 0u8;
-    for c in 1..codes {
-        let (d, db) = ((value(c) - a).abs(), (value(best) - a).abs());
-        if d < db || (d == db && c % 2 == 0) {
-            best = c;
-        }
-    }
-    if v < 0.0 { best | sign } else { best }
-}
-
-fn to_e4m3(v: f32) -> u8 {
-    nearest(v, 0x7f, e4m3, 0x80)
-}
-
-fn to_e2m1(v: f32) -> u8 {
-    nearest(v, 8, e2m1, 8)
-}
 
 /// `rows x k` bf16 activations, each row at its own magnitude.
 fn activations(lcg: &mut Lcg, rows: usize, k: usize) -> (Vec<u16>, Vec<f32>) {
@@ -201,8 +163,7 @@ fn nvfp4_codes_and_atoms() {
             }
         }
     }
-    // The device's approximate reciprocals may tip a tie the exact ones
-    // round the other way.
+    // The device's approximate reciprocals may tip a tie.
     assert!(
         off_scales * 200 <= rows * cols,
         "{off_scales} of {} scales differ from the host's",
@@ -213,7 +174,6 @@ fn nvfp4_codes_and_atoms() {
         "{off_codes} of {} codes differ from the host's",
         rows * k
     );
-    eprintln!("nvfp4: {off_scales} scales and {off_codes} codes off the exact recipe");
 }
 
 /// A route's activations are its token's, under its expert's global; a
@@ -555,77 +515,64 @@ fn the_activation_quantizers_land_what_the_host_rounds_every_case() {
         eprintln!("skipped the tcgen05 products: no sm_100a or NVRTC 12.9 here");
         return;
     }
-    w4a8_matmul(7, 256, 512, 128);
-    w4a8_matmul(200, 384, 1024, 128);
-    w4a8_matmul(64, 128, 256, 32);
-    w8a8_block_matmul(5, 384, 640, 128);
-    w8a8_block_matmul(300, 256, 1024, 128);
-    // DeepSeek-V4.1's MXFP8: 32x32 weight blocks against 1x32 activations.
-    w8a8_block_matmul(5, 384, 640, 32);
-    w8a8_block_matmul(300, 1280, 5120, 32);
-    w8a8_block_matmul(130, 200, 4096, 32);
-    for tokens in [3, 40, 150] {
-        routed_select(Format::Nvfp4, tokens, true);
-        routed_select(Format::E4m3 { gran: 128 }, tokens, true);
+    for (m, n, k, gran) in [
+        (7, 256, 512, 128),
+        (200, 384, 1024, 128),
+        (64, 128, 256, 32),
+    ] {
+        w4a8_matmul(m, n, k, gran);
     }
-    routed_select(Format::Nvfp4, 70, false);
-    routed_select(Format::E4m3 { gran: 128 }, 5, false);
-    // A captured fire's live window: the routes past it were never written
-    // by this fire, so their ids are no expert's.
-    for (tokens, live) in [(4, 3), (40, 17)] {
-        routed_select_live(Format::Nvfp4, tokens, live);
-        routed_select_live(Format::E4m3 { gran: 128 }, tokens, live);
+    // 128: V4's fp8b128 (and the held / PDL replays); 32: V4.1's MXFP8.
+    for (m, n, k, block) in [
+        (5, 384, 640, 128),
+        (300, 256, 1024, 128),
+        (5, 384, 640, 32),
+        (130, 200, 4096, 32),
+    ] {
+        w8a8_block_matmul(m, n, k, block);
     }
-    // DeepSeek-V4-Flash's routed legs at one token.
-    routed_select_at(
-        Format::E4m3 { gran: 128 },
-        1,
-        true,
-        [16, 6, 2048, 4096],
-        None,
-    );
-    routed_select_at(
-        Format::E4m3 { gran: 128 },
-        1,
-        false,
-        [16, 6, 4096, 2048],
-        None,
-    );
-    // The same products read back to bf16 on the e2m1-convert
-    // register-dequant kernel, as a decode-wide W4A8 select runs.
-    for (tokens, by_token, live) in [(8, true, None), (5, false, None), (40, true, Some(17))] {
-        routed_select_cvt(tokens, by_token, [8, 3, 256, 512], live);
+    // (tokens, by_token, [experts, top_k, n, k], live): 3 tokens' 9 routes
+    // lay out masked, 40 tokens' 120 contiguous; a live window leaves the
+    // routes past it unwritten; [16, 6, ..] are V4-Flash's routed legs.
+    const SMALL: [usize; 4] = [8, 3, 256, 512];
+    let cases: [(usize, bool, [usize; 4], Option<usize>); 6] = [
+        (3, true, SMALL, None),
+        (40, true, SMALL, None),
+        (4, true, SMALL, Some(3)),
+        (40, true, SMALL, Some(17)),
+        (70, false, SMALL, None),
+        (5, false, SMALL, None),
+    ];
+    for fmt in [Format::Nvfp4, Format::E4m3 { gran: 128 }] {
+        for (tokens, by_token, dims, live) in cases {
+            routed_select_at(fmt, tokens, by_token, dims, live);
+        }
     }
-    routed_select_cvt(8, true, [16, 6, 2048, 4096], None);
-    routed_select_cvt(8, false, [16, 6, 4096, 2048], None);
+    let flash = Format::E4m3 { gran: 128 };
+    routed_select_at(flash, 1, true, [16, 6, 2048, 4096], None);
+    routed_select_at(flash, 1, false, [16, 6, 4096, 2048], None);
+    // The same products on the e2m1-convert register-dequant kernel.
+    for (tokens, by_token, dims, live) in [
+        (8, true, SMALL, None),
+        (5, false, SMALL, None),
+        (40, true, SMALL, Some(17)),
+        (8, true, [16, 6, 2048, 4096], None),
+        (8, false, [16, 6, 4096, 2048], None),
+    ] {
+        CVT.with(|c| c.set(true));
+        routed_select_at(flash, tokens, by_token, dims, live);
+        CVT.with(|c| c.set(false));
+    }
 }
 
 thread_local! {
     static CVT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// [`routed_select_at`] (e4m3 in 128s) with the activations read back and
-/// the bank's atoms read by `moe::select_mxfp4_atoms`.
-fn routed_select_cvt(tokens: usize, by_token: bool, dims: [usize; 4], live: Option<usize>) {
-    CVT.with(|c| c.set(true));
-    routed_select_at(Format::E4m3 { gran: 128 }, tokens, by_token, dims, live);
-    CVT.with(|c| c.set(false));
-}
-
-/// A routed bank on the grouped tcgen05 GEMM, masked (few tokens) or
-/// contiguous: each route the dot of its read-back activations (under its
-/// expert's global) and its expert's dequantized weight, times the expert's
-/// product scale.
-fn routed_select(fmt: Format, tokens: usize, by_token: bool) {
-    routed_select_at(fmt, tokens, by_token, [8, 3, 256, 512], None);
-}
-
-/// The select under a live window of `live` tokens from the first: the
-/// routes past it hold ids no expert has, and are neither read nor written.
-fn routed_select_live(fmt: Format, tokens: usize, live: usize) {
-    routed_select_at(fmt, tokens, true, [8, 3, 256, 512], Some(live));
-}
-
+/// A routed bank on the grouped tcgen05 GEMM: each route the dot of its
+/// read-back activations (under its expert's global) and its expert's
+/// dequantized weight, times the expert's product scale; with `CVT` set,
+/// the bank's atoms read by `moe::select_mxfp4_atoms` instead.
 fn routed_select_at(
     fmt: Format,
     tokens: usize,

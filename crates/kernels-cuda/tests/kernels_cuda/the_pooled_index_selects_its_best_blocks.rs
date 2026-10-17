@@ -1,12 +1,12 @@
 #![cfg(feature = "cuda")]
 
-// Qwen3.8-Flash-Next's indexer: a row scores each whole block of `RATIO` keys
-// it sees by the block's last key, `sum_h w_h · relu(q_h · k)`, and selects
-// the `TOP_K` best, ascending; a row that sees no more than `TOP_K` blocks
-// selects them all. Read against a host reference over a fresh prefill and a
-// continuation whose page tables are out of order, scored the scalar way
-// and on the tensor cores (`kernel.sdpa.index_mma`), at 4, 20 and 64 heads.
+// The indexer: a row scores each whole block of `RATIO` keys it sees by
+// the block's last key, `sum_h w_h · relu(q_h · k)`, and selects the
+// `TOP_K` best, ascending (all of them when it sees no more), over a fresh
+// prefill and a continuation whose page tables are out of order.
 
+use crate::common::host_b::to_e2m1;
+use crate::common::tc5::e2m1;
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::index;
@@ -56,34 +56,26 @@ fn pool(keys: u64, tables: [u64; 3]) -> KvPool {
     }
 }
 
+/// Scored the scalar way and on the tensor cores (`index_mma`, at 4 heads
+/// and the two- and four-tile forms), with the radix select on and off; and
+/// DeepSeek-V4.1's FP4 keys.
 #[test]
 fn the_pooled_index_selects_its_best_blocks() {
-    // Flash-Next's four heads, and the tensor cores' two- and four-tile
-    // forms (DeepSeek-V4's indexer is 64 heads wide).
-    check(4);
-    check(20);
-    check(64);
-}
-
-/// The nearest e2m1 code of `v` (within ±6), ties to the even code and the
-/// sign kept, as the hardware's `cvt.rn` rounds.
-fn e2m1_code(v: f32) -> u8 {
-    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let a = v.abs();
-    let mut best = 0u8;
-    for c in 1..8u8 {
-        let (d, db) = ((MAG[c as usize] - a).abs(), (MAG[best as usize] - a).abs());
-        if d < db || (d == db && c % 2 == 0) {
-            best = c;
-        }
+    for heads in [4, 20, 64] {
+        check(heads);
     }
-    if v.is_sign_negative() { best | 8 } else { best }
+    for heads in [4, 64] {
+        check_fp4(heads);
+    }
 }
 
-fn e2m1(code: u8) -> f32 {
-    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let v = MAG[usize::from(code & 7)];
-    if code & 8 != 0 { -v } else { v }
+/// The best `TOP_K` of `seen` blocks under `score`, ascending.
+fn best(seen: usize, score: impl Fn(usize) -> f32) -> Vec<i32> {
+    let mut order: Vec<usize> = (0..seen).collect();
+    order.sort_by(|&a, &b| score(b).total_cmp(&score(a)));
+    let mut want: Vec<i32> = order[..TOP_K].iter().map(|&j| j as i32).collect();
+    want.sort_unstable();
+    want
 }
 
 /// DeepSeek-V4.1's `fp4_act_quant(x, 32, ue8m0)` of one 32-block: its codes
@@ -98,7 +90,7 @@ fn fp4_block(block: &[f32]) -> (Vec<u8>, u8) {
     let s = 2f32.powi(e - 127);
     let codes = block
         .iter()
-        .map(|v| e2m1_code((v / s).clamp(-6.0, 6.0)))
+        .map(|v| to_e2m1((v / s).clamp(-6.0, 6.0)))
         .collect();
     (codes, e as u8)
 }
@@ -115,17 +107,8 @@ fn fp4_read(x: &[f32]) -> Vec<f32> {
 }
 
 /// DeepSeek-V4.1's FP4 index keys (68 bytes a position: e2m1 pairs, then
-/// ue8m0 exponents, a page's data rows before its scale rows): written at
-/// each block's boundary bit for bit as its reference quantizes them, and
-/// ranked against its queries read at FP4 as the reference ranks them, on
-/// the tensor cores as they are and widened to bf16 for the scalar scorer.
-#[test]
-fn fp4_index_keys_rank_as_deepseeks_reference_reads_them() {
-    for heads in [4, 64] {
-        check_fp4(heads);
-    }
-}
-
+/// ue8m0 exponents): written bit for bit as its reference quantizes them,
+/// and ranked against its queries read at FP4.
 fn check_fp4(heads: usize) {
     let mut gpu = Gpu::open();
     let mut rng = Lcg::seeded(0xf4f4 + heads as u64);
@@ -244,10 +227,7 @@ fn check_fp4(heads: usize) {
                             })
                             .sum()
                     };
-                    let mut order: Vec<usize> = (0..seen).collect();
-                    order.sort_by(|&a, &b| score(b).total_cmp(&score(a)));
-                    let mut want: Vec<i32> = order[..TOP_K].iter().map(|&j| j as i32).collect();
-                    want.sort_unstable();
+                    let want = best(seen, score);
                     assert_eq!(
                         &got[t * TOP_K..(t + 1) * TOP_K],
                         &want[..],
@@ -341,10 +321,7 @@ fn check(HEADS: usize) {
                             })
                             .sum()
                     };
-                    let mut order: Vec<usize> = (0..seen).collect();
-                    order.sort_by(|&a, &b| score(b).total_cmp(&score(a)));
-                    let mut want: Vec<i32> = order[..TOP_K].iter().map(|&j| j as i32).collect();
-                    want.sort_unstable();
+                    let want = best(seen, score);
                     assert_eq!(
                         row,
                         &want[..],
@@ -358,6 +335,7 @@ fn check(HEADS: usize) {
         assert!(ranked > 0 && whole > 0, "both kinds of row were read");
     }
 }
+
 /// DeepSeek-V4's indexer turns its queries' tail just before ranking: the
 /// tensor-core scorer turning them as it loads them selects what turning
 /// them first, then ranking, selects.
@@ -511,8 +489,7 @@ fn the_indexers_rotations_land_the_same_a_pair_a_thread() {
 /// selections alike but for blocks whose scores tie to f32 rounding.
 #[test]
 fn a_prefills_ranking_on_tcgen05_selects_what_the_mma_scorer_selects() {
-    // DeepSeek-V4-Flash's 16-position pages (four blocks a page) and 64's.
-    // Pages out of order, and in order (eight a box).
+    // 16-position pages (V4-Flash's) out of order and in order; 64's.
     check_tc5(16, true);
     check_tc5(16, false);
     check_tc5(64, true);
@@ -534,8 +511,6 @@ fn check_tc5(PG: usize, shuffled: bool) {
     let w_raw: Vec<u16> = (0..rows * H)
         .map(|_| to_bf16(rng.unit().abs() + 0.25))
         .collect();
-    // Pages out of order (request r's page i near pool page 7 i + 3 r), or
-    // in order.
     let mut page_indices = Vec::new();
     let mut taken = vec![false; total_pages];
     for (r, &n) in pages_of.iter().enumerate() {

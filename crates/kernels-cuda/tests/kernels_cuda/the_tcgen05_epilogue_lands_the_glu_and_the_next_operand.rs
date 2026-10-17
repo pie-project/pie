@@ -280,7 +280,6 @@ fn dense(
     for (r, want) in wants.iter().enumerate() {
         compare(&what, &landed, r, r, want);
     }
-    eprintln!("{what}: lands");
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -420,7 +419,6 @@ fn grouped(
     for (&(r, sr, _, _), want) in rows_of.iter().zip(&wants) {
         compare(&what, &landed, r, sr, want);
     }
-    eprintln!("{what}: lands");
 }
 
 #[test]
@@ -439,77 +437,47 @@ fn the_tcgen05_epilogue_lands_the_glu_and_the_next_operand_every_case() {
         limit: 7.0,
         alpha: 1.702,
     });
-    for (a, w) in [(bf, bf), (ds, ds), (nv, nv), (ds, w4)] {
-        dense(a, w, sw, 0, 200, [256, 512], false, false);
-        dense(a, w, sw, 0, 5, [256, 512], true, false);
-    }
-    dense(bf, bf, clamp, 0, 130, [128, 256], false, false);
-    dense(bf, bf, alpha, 0, 33, [256, 256], true, false);
-    // GeGLU (Gemma's), and a gate width that ends mid-block.
-    dense(
-        bf,
-        bf,
-        Some(Glu::GegluTanh),
-        0,
-        300,
-        [192, 512],
-        false,
-        false,
-    );
-    dense(bf, bf, Some(Glu::GegluTanh), 0, 20, [192, 512], true, false);
+    let geglu = Some(Glu::GegluTanh);
     // SiTU (Kimi-K3's), capped and not.
     let situ = Some(Glu::Situ {
         beta: 4.0,
         cap: 25.0,
     });
-    dense(bf, bf, situ, 0, 130, [256, 512], false, false);
-    dense(
-        bf,
-        bf,
-        Some(Glu::Situ {
-            beta: 1.0,
-            cap: 0.0,
-        }),
-        0,
-        20,
-        [256, 512],
-        true,
-        false,
-    );
-    dense(ds, w4, situ, 1, 140, [256, 512], false, false);
-    dense(ds, ds, alpha, 0, 129, [384, 640], false, true);
-    dense(bf, bf, None, 0, 150, [256, 512], false, true);
-    dense(nv, nv, None, 0, 7, [256, 512], true, true);
-    for out in [1, 2] {
-        let (a, w) = if out == 2 { (bf, bf) } else { (ds, ds) };
-        dense(a, w, sw, out, 140, [256, 512], false, false);
-        dense(nv, nv, clamp, out, 9, [256, 512], true, true);
+    let situ_bare = Some(Glu::Situ {
+        beta: 1.0,
+        cap: 0.0,
+    });
+    for (a, w) in [(bf, bf), (ds, ds), (nv, nv), (ds, w4)] {
+        dense(a, w, sw, 0, 200, [256, 512], false, false);
+        dense(a, w, sw, 0, 5, [256, 512], true, false);
+    }
+    // (a, w, glu, out, m, [n, k], swap, routed); GeGLU's 192 ends mid-block.
+    for (a, w, f, out, m, nk, swap, routed) in [
+        (bf, bf, clamp, 0, 130, [128, 256], false, false),
+        (bf, bf, alpha, 0, 33, [256, 256], true, false),
+        (bf, bf, geglu, 0, 300, [192, 512], false, false),
+        (bf, bf, geglu, 0, 20, [192, 512], true, false),
+        (bf, bf, situ, 0, 130, [256, 512], false, false),
+        (bf, bf, situ_bare, 0, 20, [256, 512], true, false),
+        (ds, w4, situ, 1, 140, [256, 512], false, false),
+        (ds, ds, alpha, 0, 129, [384, 640], false, true),
+        (bf, bf, None, 0, 150, [256, 512], false, true),
+        (nv, nv, None, 0, 7, [256, 512], true, true),
+        (ds, ds, sw, 1, 140, [256, 512], false, false),
+        (nv, nv, clamp, 1, 9, [256, 512], true, true),
+        (bf, bf, sw, 2, 140, [256, 512], false, false),
+        (nv, nv, clamp, 2, 9, [256, 512], true, true),
+    ] {
+        dense(a, w, f, out, m, nk, swap, routed);
     }
     // NVFP4 swapped contiguous: its GLU landing the next NVFP4 operand.
-    grouped(
-        nv,
-        nv,
-        Glu::Swiglu,
-        0,
-        Layout::ContiguousSwapped,
-        6,
-        [256, 512],
-        false,
-    );
-    grouped(
-        nv,
-        nv,
-        Glu::Swiglu,
-        2,
-        Layout::ContiguousSwapped,
-        6,
-        [256, 512],
-        false,
-    );
+    for out in [0, 2] {
+        let layout = Layout::ContiguousSwapped;
+        grouped(nv, nv, Glu::Swiglu, out, layout, 6, [256, 512], false);
+    }
     for layout in [Layout::Contiguous, Layout::ContiguousPair, Layout::Masked] {
         for out in [0, 1, 2] {
-            // NVFP4 spans 448 x 6 of dynamic range a tensor: the heavy-tailed
-            // fp8 products would flush whole blocks to zero, so bf16 feeds it.
+            // bf16 feeds NVFP4: fp8's heavy-tailed products would flush blocks.
             let (a, w) = if out == 2 { (bf, bf) } else { (ds, ds) };
             grouped(a, w, Glu::Swiglu, out, layout, 6, [256, 512], out == 0);
         }

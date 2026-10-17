@@ -50,11 +50,10 @@ fn check(case: Case) {
     )
     .unwrap_or_else(|e| panic!("{case:?}: {e}"));
     gpu.sync();
-    // Split along K, a second launch lands the same bits: each split sums
-    // into its own slab, added in split order. The repeats launch the
-    // finalize as the GEMM's programmatic dependent, eagerly and from a
-    // captured graph, each behind a launch at half the scale: a finalize that
-    // read the slabs before its GEMM had landed them would add stale halves.
+    // Split along K, a repeat lands the same bits, the finalize launched as
+    // the GEMM's programmatic dependent (eagerly and from a graph) behind a
+    // launch at half the scale: a finalize that read the slabs early would
+    // add stale halves.
     if SPLITS.load(std::sync::atomic::Ordering::Relaxed) {
         let first: Vec<u16> = gpu.down(y, tall * n);
         let pdl = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
@@ -97,9 +96,8 @@ fn check(case: Case) {
             );
         }
         crate::common::forget(exec);
-        // Under `kernel.gemm.tc5_split_tickets` a tile's last split sums
-        // the slabs in place of the finalize: the same bits, eagerly and
-        // from a graph, behind a launch at half the scale.
+        // Under `gemm_tc5_split_tickets` a tile's last split sums the slabs
+        // in place of the finalize: the same bits.
         let tickets = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
             gemm_tc5_split_tickets: 65_536,
             ..ctx.tuning()
@@ -143,7 +141,6 @@ fn check(case: Case) {
     }
     let got: Vec<u16> = gpu.down(y, tall * n);
 
-    let mut worst = 0f32;
     for r in 0..m {
         for c in 0..n {
             let (mut dot, mut mass) = (0f64, 0f64);
@@ -155,7 +152,6 @@ fn check(case: Case) {
             let want = (dot * f64::from(case.alpha)) as f32;
             let slack = want.abs() / 128.0 + (mass * f64::from(case.alpha)) as f32 * 1e-5 + 1e-6;
             let g = from_bf16(got[r * n + c]);
-            worst = worst.max((g - want).abs() / slack);
             assert!(
                 (g - want).abs() <= slack,
                 "{case:?} plan {plan:?}: y[{r}][{c}] = {g}, want {want} (slack {slack})"
@@ -166,18 +162,23 @@ fn check(case: Case) {
         got[m * n..].iter().all(|&v| v == 0x7fc0),
         "{case:?}: the row past m moved"
     );
-    eprintln!("{case:?}: worst error {worst:.3} of the slack");
 }
 
-fn bf16(m: usize, n: usize, k: usize, plan: Option<Plan>) -> Case {
-    Case {
-        act: (Elem::Bf16, None),
-        w: (Elem::Bf16, None),
-        m,
-        n,
-        k,
-        plan,
-        alpha: 1.0,
+type Spec = (Elem, Option<usize>);
+
+const BF: Spec = (Elem::Bf16, None);
+
+fn checks(cases: &[(Spec, Spec, [usize; 3], Option<Plan>, f32)]) {
+    for &(act, w, [m, n, k], plan, alpha) in cases {
+        check(Case {
+            act,
+            w,
+            m,
+            n,
+            k,
+            plan,
+            alpha,
+        });
     }
 }
 
@@ -191,30 +192,94 @@ fn plan(swap: bool, bn: u32) -> Option<Plan> {
     })
 }
 
+fn pair(bn: u32) -> Option<Plan> {
+    Some(Plan {
+        swap: false,
+        pair: true,
+        bn,
+        stages: 0,
+        splits: 0,
+    })
+}
+
+/// Each kind against the host's dequantized dot at whole and ragged tiles,
+/// each tile width, CTA pairs and the chosen plan (`None`, swapped at decode
+/// widths); then the split, wide-tile, cuBLAS and dependent-launch checks.
 #[test]
 fn the_tcgen05_gemm_answers_the_dequantized_dot_every_case() {
     if !supported() {
         eprintln!("skipped: no tcgen05 on this device");
         return;
     }
-    the_bf16_kind_lands_the_dot_at_whole_and_ragged_tiles();
-    the_bf16_kind_lands_what_cublas_lands_over_many_waves();
+    let f8 = (Elem::E4m3, None);
+    let ds = (Elem::E4m3, Some(128));
+    let mx = (Elem::E4m3, Some(32));
+    let nv = (Elem::E2m1, Some(16));
+    let w4 = (Elem::E2m1, Some(32));
+    checks(&[
+        (BF, BF, [128, 128, 64], plan(false, 128), 1.0),
+        (BF, BF, [300, 200, 520], plan(false, 128), 1.0),
+        (BF, BF, [256, 512, 1024], plan(false, 256), 1.0),
+        (BF, BF, [130, 96, 136], plan(false, 64), 1.0),
+        (BF, BF, [1, 384, 512], None, 1.0),
+        (BF, BF, [37, 1000, 264], None, 1.0),
+        (BF, BF, [16, 256, 4104], None, 1.0),
+        (BF, BF, [520, 512, 1024], pair(256), 1.0),
+        (BF, BF, [257, 96, 136], pair(64), 1.0),
+        (f8, f8, [128, 128, 128], plan(false, 128), 0.25),
+        (f8, f8, [200, 160, 400], plan(false, 32), 0.5),
+        (f8, f8, [3, 256, 1024], None, 1.0),
+        // DeepSeek's blocks through ue8m0; V4.1's MXFP8 in 32s.
+        (ds, ds, [128, 128, 512], plan(false, 128), 1.0),
+        (ds, ds, [300, 256, 1152], plan(false, 128), 1.0),
+        (ds, ds, [129, 192, 640], plan(false, 64), 1.0),
+        (ds, ds, [64, 512, 896], plan(false, 256), 1.0),
+        (ds, ds, [1, 384, 1024], None, 1.0),
+        (ds, ds, [300, 256, 1152], pair(256), 1.0),
+        (ds, ds, [129, 192, 640], pair(64), 1.0),
+        (mx, mx, [130, 128, 320], plan(false, 128), 1.0),
+        // NVFP4's sixteen-wide scales under a global alpha.
+        (nv, nv, [128, 128, 256], plan(false, 128), 1.0),
+        (nv, nv, [140, 256, 1024], plan(false, 128), 0.03),
+        (nv, nv, [128, 128, 288], plan(false, 64), 1.0),
+        (nv, nv, [130, 512, 512], plan(false, 256), 1.0),
+        (nv, nv, [5, 384, 768], None, 2.0),
+        (nv, nv, [140, 256, 1024], pair(256), 1.0),
+        (nv, nv, [300, 128, 288], pair(128), 1.0),
+        // MXFP4 weights against themselves and fp8 activations.
+        (w4, w4, [128, 128, 128], plan(false, 128), 1.0),
+    ]);
+    for act in [ds, mx] {
+        checks(&[
+            (act, w4, [150, 192, 640], plan(false, 64), 1.0),
+            (act, w4, [7, 256, 1024], None, 1.0),
+            (act, w4, [150, 192, 640], pair(64), 1.0),
+            (act, w4, [130, 256, 2048], None, 1.0),
+        ]);
+    }
+    // The decode widths split along K (and one split by hand), repeated.
+    SPLITS.store(true, std::sync::atomic::Ordering::Relaxed);
+    let by_hand = Some(Plan {
+        splits: 4,
+        ..plan(false, 128).unwrap()
+    });
+    checks(&[
+        (f8, f8, [3, 256, 1024], None, 1.0),
+        (ds, ds, [1, 384, 1024], None, 1.0),
+        (ds, ds, [8, 1024, 4096], None, 1.0),
+        (ds, ds, [64, 512, 8192], None, 1.0),
+        (BF, BF, [16, 512, 4096], None, 1.0),
+        (ds, ds, [128, 256, 4096], by_hand, 1.0),
+    ]);
+    SPLITS.store(false, std::sync::atomic::Ordering::Relaxed);
     the_wide_tiles_shared_columns_land_what_the_narrow_tile_lands();
-    the_fp8_kind_lands_the_scaled_dot();
-    the_deepseek_blocks_land_through_ue8m0();
-    nvfp4_lands_its_sixteen_wide_scales_and_global_alpha();
-    mxfp4_weights_meet_fp8_activations();
-    a_split_launch_lands_the_same_bits_each_time();
+    the_bf16_kind_lands_what_cublas_lands_over_many_waves();
     a_dependent_gemm_reads_what_its_producer_landed();
 }
 
-/// Under `kernel.pdl` a tcgen05 GEMM launches as the programmatic dependent
-/// of the kernel before it, and a GEMM lets its own dependent launch once
-/// its set-up is done. A chain h = x w1, out = h w2, unsplit, each pair
-/// behind one at half the scale, eagerly and from a graph, lands what it
-/// lands launched plainly. (A dependent's CTA that lands on its producer's
-/// SM waits on its TMEM anyway, so this alone may not catch a missing wait;
-/// the split-K repeats above do, for the finalize.)
+/// Under `kernel.pdl` a chain h = x w1, out = h w2, each GEMM the
+/// programmatic dependent of the one before, behind a chain at half the
+/// scale, eagerly and from a graph, lands what it lands launched plainly.
 fn a_dependent_gemm_reads_what_its_producer_landed() {
     let (m, k, n, n2) = (8usize, 8192usize, 1024usize, 512usize);
     let mut lcg = Lcg::seeded(0xd9);
@@ -288,55 +353,11 @@ fn a_dependent_gemm_reads_what_its_producer_landed() {
     crate::common::forget(exec);
 }
 
-/// The decode-width cases, split along K, run four times: each launch's
-/// bits the first's.
+/// Set while the split cases run: each repeat's bits the first's.
 static SPLITS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn a_split_launch_lands_the_same_bits_each_time() {
-    SPLITS.store(true, std::sync::atomic::Ordering::Relaxed);
-    let f8 = (Elem::E4m3, None);
-    let ds = (Elem::E4m3, Some(128));
-    check(scaled(f8, f8, [3, 256, 1024], None, 1.0));
-    check(scaled(ds, ds, [1, 384, 1024], None, 1.0));
-    check(scaled(ds, ds, [8, 1024, 4096], None, 1.0));
-    check(scaled(ds, ds, [40, 256, 2048], None, 1.0));
-    check(scaled(ds, ds, [64, 512, 8192], None, 1.0));
-    check(bf16(16, 512, 4096, None));
-    // Unswapped, split by hand.
-    check(scaled(
-        ds,
-        ds,
-        [128, 256, 4096],
-        Some(Plan {
-            splits: 4,
-            ..plan(false, 128).unwrap()
-        }),
-        1.0,
-    ));
-    SPLITS.store(false, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn scaled(
-    act: (Elem, Option<usize>),
-    w: (Elem, Option<usize>),
-    [m, n, k]: [usize; 3],
-    plan: Option<Plan>,
-    alpha: f32,
-) -> Case {
-    Case {
-        act,
-        w,
-        m,
-        n,
-        k,
-        plan,
-        alpha,
-    }
-}
-
-/// Every scaled kind at more tiles than SMs on a 256-wide Q tile, where the
-/// two accumulator stages share columns, lands what the 128-wide tile (whose
-/// stages do not, and which the host reference holds above) lands.
+/// Every scaled kind at more tiles than SMs on a 256-wide tile (whose two
+/// accumulator stages share columns) lands the 128-wide tile's bits.
 fn the_wide_tiles_shared_columns_land_what_the_narrow_tile_lands() {
     let kinds = [
         ((Elem::E4m3, Some(128)), (Elem::E4m3, Some(128))),
@@ -381,16 +402,6 @@ fn the_wide_tiles_shared_columns_land_what_the_narrow_tile_lands() {
     }
 }
 
-fn pair(bn: u32) -> Option<Plan> {
-    Some(Plan {
-        swap: false,
-        pair: true,
-        bn,
-        stages: 0,
-        splits: 0,
-    })
-}
-
 /// More tiles than SMs, so each CTA walks several and both accumulator
 /// stages turn over; cuBLAS is the reference.
 fn the_bf16_kind_lands_what_cublas_lands_over_many_waves() {
@@ -413,7 +424,6 @@ fn the_bf16_kind_lands_what_cublas_lands_over_many_waves() {
         gpu.sync();
         let want: Vec<u16> = gpu.down(want.ptr, m * n);
         let got: Vec<u16> = gpu.down(got, m * n);
-        let mut off = 0usize;
         for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
             let (g, w) = (from_bf16(g), from_bf16(w));
             let slack = w.abs() / 64.0 + 2e-2;
@@ -423,72 +433,6 @@ fn the_bf16_kind_lands_what_cublas_lands_over_many_waves() {
                 i / n,
                 i % n
             );
-            off += usize::from(g != w);
         }
-        eprintln!(
-            "m={m} n={n} k={k}: {off} of {} differ from cuBLAS by a rounding",
-            m * n
-        );
     }
-}
-
-fn the_fp8_kind_lands_the_scaled_dot() {
-    let f8 = (Elem::E4m3, None);
-    check(scaled(f8, f8, [128, 128, 128], plan(false, 128), 0.25));
-    check(scaled(f8, f8, [200, 160, 400], plan(false, 32), 0.5));
-    check(scaled(f8, f8, [3, 256, 1024], None, 1.0));
-}
-
-fn the_deepseek_blocks_land_through_ue8m0() {
-    let f8 = (Elem::E4m3, Some(128));
-    check(scaled(f8, f8, [128, 128, 512], plan(false, 128), 1.0));
-    check(scaled(f8, f8, [300, 256, 1152], plan(false, 128), 1.0));
-    check(scaled(f8, f8, [129, 192, 640], plan(false, 64), 1.0));
-    check(scaled(f8, f8, [64, 512, 896], plan(false, 256), 1.0));
-    check(scaled(f8, f8, [1, 384, 1024], None, 1.0));
-    check(scaled(f8, f8, [40, 256, 2048], None, 1.0));
-    check(scaled(f8, f8, [300, 256, 1152], pair(256), 1.0));
-    check(scaled(f8, f8, [129, 192, 640], pair(64), 1.0));
-    check(scaled(f8, f8, [256, 512, 8192], pair(256), 1.0));
-    let mx = (Elem::E4m3, Some(32));
-    check(scaled(mx, mx, [130, 128, 320], plan(false, 128), 1.0));
-}
-
-fn nvfp4_lands_its_sixteen_wide_scales_and_global_alpha() {
-    let nv = (Elem::E2m1, Some(16));
-    check(scaled(nv, nv, [128, 128, 256], plan(false, 128), 1.0));
-    check(scaled(nv, nv, [140, 256, 1024], plan(false, 128), 0.03));
-    check(scaled(nv, nv, [128, 128, 288], plan(false, 64), 1.0));
-    check(scaled(nv, nv, [130, 512, 512], plan(false, 256), 1.0));
-    check(scaled(nv, nv, [5, 384, 768], None, 2.0));
-    check(scaled(nv, nv, [9, 256, 4096], None, 0.5));
-    check(scaled(nv, nv, [140, 256, 1024], pair(256), 1.0));
-    check(scaled(nv, nv, [300, 128, 288], pair(128), 1.0));
-}
-
-fn mxfp4_weights_meet_fp8_activations() {
-    let w4 = (Elem::E2m1, Some(32));
-    check(scaled(w4, w4, [128, 128, 128], plan(false, 128), 1.0));
-    for act in [(Elem::E4m3, Some(128)), (Elem::E4m3, Some(32))] {
-        check(scaled(act, w4, [128, 128, 256], plan(false, 128), 1.0));
-        check(scaled(act, w4, [150, 192, 640], plan(false, 64), 1.0));
-        check(scaled(act, w4, [7, 256, 1024], None, 1.0));
-        check(scaled(act, w4, [150, 192, 640], pair(64), 1.0));
-        check(scaled(act, w4, [130, 256, 2048], None, 1.0));
-    }
-}
-
-fn the_bf16_kind_lands_the_dot_at_whole_and_ragged_tiles() {
-    check(bf16(128, 128, 64, plan(false, 128)));
-    check(bf16(128, 128, 256, plan(false, 128)));
-    check(bf16(300, 200, 520, plan(false, 128)));
-    check(bf16(256, 512, 1024, plan(false, 256)));
-    check(bf16(130, 96, 136, plan(false, 64)));
-    check(bf16(1, 384, 512, None));
-    check(bf16(37, 1000, 264, None));
-    check(bf16(16, 256, 4104, None));
-    check(bf16(300, 200, 520, pair(128)));
-    check(bf16(520, 512, 1024, pair(256)));
-    check(bf16(257, 96, 136, pair(64)));
-    check(bf16(200, 384, 2056, None));
 }
