@@ -564,7 +564,8 @@ __device__ __forceinline__ u32 lds_address(const void* p) {
 template <int KS, int NW, int TN, int TM, int NB>
 __device__ __forceinline__ void bf16_group_tile(const bf16* __restrict__ act, const i32* __restrict__ order,
                                                 int begin, int count, const bf16* __restrict__ w,
-                                                bf16* __restrict__ out, int act_div, int n, int k, int tile) {
+                                                bf16* __restrict__ out, int act_div, int n, int k, int tile,
+                                                int s_begin, int s_end, float* __restrict__ part) {
     static_assert(KS % 32 == 0, "a stage is whole 1 KB units a strip");
     constexpr int U = KS / 32;                 // units a strip a stage
     constexpr int RB = 2 * KS;                 // bytes a route row a stage
@@ -581,7 +582,7 @@ __device__ __forceinline__ void bf16_group_tile(const bf16* __restrict__ act, co
     const int tid = threadIdx.x, l = lane(), r16 = l % 16, g = l / 16;
     const int wave = tid / kWave;
     const int row0 = tile * NR;
-    const int kbytes = 2 * k, stages = k / KS;
+    const int kbytes = 2 * k, stages = s_end - s_begin;
     auto route = [&](int m) { return order != nullptr ? order[begin + m] : begin + m; };
     auto swz = [&](int r) { return (r / RPL) % CR; };
     auto xat = [&](int r, int c) { return r * RB + 16 * (c ^ swz(r)); };
@@ -591,7 +592,7 @@ __device__ __forceinline__ void bf16_group_tile(const bf16* __restrict__ act, co
 #pragma unroll
     for (int nb = 0; nb < TN; ++nb) {
         const int strip = min(row0 / 16 + wave * TN + nb, n / 16 - 1);
-        wo[nb] = static_cast<u32>(strip) * static_cast<u32>(16 * kbytes) + 16 * l;
+        wo[nb] = static_cast<u32>(strip) * static_cast<u32>(16 * kbytes) + s_begin * U * 1024 + 16 * l;
     }
     const u8* xb = reinterpret_cast<const u8*>(act);
     u32 xo[XI];
@@ -601,7 +602,8 @@ __device__ __forceinline__ void bf16_group_tile(const bf16* __restrict__ act, co
         const int byte = q * 256 + 4 * l;
         const int r = byte / RB, cl = byte % RB / 16;
         const int c = cl ^ swz(r);
-        xo[j] = static_cast<u32>(route(r < count ? r : 0) / act_div) * static_cast<u32>(kbytes) + 16 * c + 4 * (l % 4);
+        xo[j] = static_cast<u32>(route(r < count ? r : 0) / act_div) * static_cast<u32>(kbytes) + s_begin * RB + 16 * c +
+                4 * (l % 4);
     }
     const u32 uw = static_cast<u32>(__builtin_amdgcn_readfirstlane(wave));
     const u32 xl0 = lds_address(xl[0]) + uw * XI * 256;
@@ -662,10 +664,16 @@ __device__ __forceinline__ void bf16_group_tile(const bf16* __restrict__ act, co
     for (int mb = 0; mb < TM; ++mb) {
         const int m = mb * 16 + r16;
         if (m >= count) continue;
-        bf16* o = out + static_cast<long long>(route(m)) * n;
+        const long long at = static_cast<long long>(route(m)) * n;
+        bf16* o = out + at;
 #pragma unroll
         for (int nb = 0; nb < TN; ++nb) {
             const int c = row0 + (wave * TN + nb) * 16 + 4 * g;
+            if (part != nullptr) {
+                // A slice of K: its f32 partial, summed after.
+                if (c < n) *reinterpret_cast<mfma_cd*>(part + at + c) = acc[nb][mb];
+                continue;
+            }
             bf16 v[4];
 #pragma unroll
             for (int t = 0; t < 4; ++t) v[t] = from_f32<bf16>(acc[nb][mb][t]);
@@ -681,26 +689,33 @@ __device__ __forceinline__ void bf16_group_tile(const bf16* __restrict__ act, co
 }
 
 // A bf16 bank in the matrix core's order: its routed select past 64 routes
-// an expert, one work item of up to 128 routes a block row of 512 weight
-// rows (grid (work cap, ⌈n / 512⌉), 512 threads). The card deals block b
-// to XCD b % 8, each with its own L2: the blocks are renumbered so that an
-// XCD runs a contiguous range, every item at one block row before the
-// next, so the blocks an XCD holds at once read the one weight tile.
-__global__ __launch_bounds__(512) void moe_bf16_group(const bf16* __restrict__ act, const i32* __restrict__ order,
-                                                      const i32* __restrict__ offsets, const i32* __restrict__ work,
-                                                      const bf16* __restrict__ bank, bf16* __restrict__ out,
-                                                      int act_div, int n, int k, int num_experts) {
+// an expert, one work item of up to 128 routes a block row of 64·NW weight
+// rows (grid (work cap, ⌈n / (64·NW)⌉, slices), 64·NW threads). The card
+// deals block b to XCD b % 8, each with its own L2: the blocks are
+// renumbered so that an XCD runs a contiguous range, every item at one block
+// row before the next, so the blocks an XCD holds at once read the one
+// weight tile. Slice z of K (`per` stages of 64) of `gridDim.z`; under slices
+// each one's f32 partial lands in `part` ([slices, routes, n], by route) for
+// `fp8_mfma_finalize`.
+template <int NW>
+__global__ __launch_bounds__(NW * 64) void moe_bf16_group(const bf16* __restrict__ act, const i32* __restrict__ order,
+                                                          const i32* __restrict__ offsets, const i32* __restrict__ work,
+                                                          const bf16* __restrict__ bank, bf16* __restrict__ out,
+                                                          float* __restrict__ part, int act_div, int n, int k,
+                                                          int num_experts, int routes, int per) {
     const int items = offsets[num_experts + 1];
     const int live = items * static_cast<int>(gridDim.y);
     const int b = static_cast<int>(blockIdx.x + gridDim.x * blockIdx.y);
     if (b >= live) return;
-    const int xcd = b % 8, per = live / 8, extra = live % 8;
-    const int at = xcd * per + min(xcd, extra) + b / 8;
+    const int xcd = b % 8, slots = live / 8, extra = live % 8;
+    const int at = xcd * slots + min(xcd, extra) + b / 8;
     GroupItem item;
     if (!group_item(offsets, work, num_experts, 128, item, at % items)) return;
-    bf16_group_tile<64, 8, 4, 8, 2>(act, order, item.begin, item.count,
-                                    bank + static_cast<long long>(item.expert) * n * k, out, act_div, n, k,
-                                    at / items);
+    const int split = static_cast<int>(blockIdx.z);
+    bf16_group_tile<64, NW, 4, 8, 2>(act, order, item.begin, item.count,
+                                     bank + static_cast<long long>(item.expert) * n * k, out, act_div, n, k,
+                                     at / items, split * per, min((split + 1) * per, k / 64),
+                                     gridDim.z > 1 ? part + static_cast<long long>(split) * routes * n : nullptr);
 }
 
 // A bf16 bank's routed select past 64 routes an expert: one work item of up

@@ -502,7 +502,7 @@ pub fn matmul_fp8_quantized(
 
 /// The f32 partials of `splits` slices of K over `[rows, n]` (one slab a
 /// stream: the sum right after consumes them), none for one slice.
-fn fp8_partials(ctx: &Ctx, op: &'static str, splits: u32, rows: u32, n: u32) -> Result<ArgValue, Error> {
+pub(crate) fn fp8_partials(ctx: &Ctx, op: &'static str, splits: u32, rows: u32, n: u32) -> Result<ArgValue, Error> {
     if splits <= 1 {
         return Ok(ArgValue::ABSENT);
     }
