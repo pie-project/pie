@@ -476,6 +476,34 @@ pub fn fold(
         post_mix.dtype == Dtype::F32 && comb_mix.dtype == Dtype::F32,
         "`{OP}` reads f32 gate matrices"
     );
+    // A prefill's rows of four streams a block a row (`hc_fold_rows4`, under
+    // `kernel.elemwise.hc_mma`): the gates read once a thread, the same sums
+    // in the same order.
+    if ctx.tuning().hc_mma
+        && y.rows >= 128
+        && fan == 4
+        && whole_runs(x.width, &[x.ptr, streams.ptr, y.ptr])
+        && [post_mix.ptr, comb_mix.ptr].iter().all(|at| at % 16 == 0)
+    {
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!("::pie::elemwise::hc_fold_rows4<{t}>")),
+            )
+            .apply(Launch::per_row(y.rows, 128)),
+            &[
+                x.arg(),
+                streams.arg(),
+                post_mix.arg(),
+                comb_mix.arg(),
+                y.arg(),
+                stated(OP, y.rows)?.arg(),
+                stated(OP, x.width)?.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     // Eight columns a thread where the rows are whole 16-byte runs: the same
     // sums in the same order.
     let (entry, width) =

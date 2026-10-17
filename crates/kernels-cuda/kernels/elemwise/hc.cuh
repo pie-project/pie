@@ -1835,4 +1835,69 @@ __global__ void __launch_bounds__(256) hc_prenorm_project_fold_rows(
     }
 }
 
+// `hc_fold_vec8` a block a row for a prefill's rows (four streams): the
+// row's post and combine gates read once a thread as float4s, then each
+// thread's 16-byte runs (every 128th of the row) folded with the same
+// sums in the same order, the next run's loads in flight while one stores.
+template <class T>
+__global__ void __launch_bounds__(128) hc_fold_rows4(
+    const T* __restrict__ x,
+    const T* residual,
+    const float* __restrict__ post_mix,
+    const float* __restrict__ comb_mix,
+    T* out,
+    int N,
+    int H,
+    const u32* __restrict__ win)
+{
+    static_assert(sizeof(T) == 2, "eight elements are one 16-byte run");
+    constexpr int M = 4;
+    const int n = static_cast<int>(blockIdx.x);
+    if (n >= N) return;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const unsigned runs = static_cast<unsigned>(H) / 8u;
+    const float4 pw = *reinterpret_cast<const float4*>(post_mix + static_cast<long long>(row) * M);
+    const float p[M] = {pw.x, pw.y, pw.z, pw.w};
+    float c[M][M];
+#pragma unroll
+    for (int i = 0; i < M; ++i) {
+        const float4 cw = *reinterpret_cast<const float4*>(comb_mix + static_cast<long long>(row) * M * M + i * M);
+        c[i][0] = cw.x;
+        c[i][1] = cw.y;
+        c[i][2] = cw.z;
+        c[i][3] = cw.w;
+    }
+    const uint4* x_n = reinterpret_cast<const uint4*>(x + static_cast<long long>(row) * H);
+    const uint4* res_n = reinterpret_cast<const uint4*>(residual + static_cast<long long>(row) * M * H);
+    uint4* out_n = reinterpret_cast<uint4*>(out + static_cast<long long>(row) * M * H);
+    for (unsigned v = threadIdx.x; v < runs; v += 128) {
+        const uint4 xw = x_n[v];
+        uint4 rw[M];
+#pragma unroll
+        for (int i = 0; i < M; ++i) rw[i] = res_n[static_cast<long long>(i) * runs + v];
+        const T* x8 = reinterpret_cast<const T*>(&xw);
+        float r[M][8];
+#pragma unroll
+        for (int i = 0; i < M; ++i) {
+            const T* r8 = reinterpret_cast<const T*>(&rw[i]);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) r[i][e] = Elem<T>::to_f32(r8[e]);
+        }
+#pragma unroll
+        for (int j = 0; j < M; ++j) {
+            uint4 ow;
+            T* o8 = reinterpret_cast<T*>(&ow);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                float acc = p[j] * Elem<T>::to_f32(x8[e]);
+#pragma unroll
+                for (int i = 0; i < M; ++i) acc += c[i][j] * r[i][e];
+                o8[e] = Elem<T>::from_f32(acc);
+            }
+            out_n[static_cast<long long>(j) * runs + v] = ow;
+        }
+    }
+}
+
 }

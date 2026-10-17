@@ -98,6 +98,10 @@ fn the_tiled_projection_answers_the_dot() {
 
 /// The fold, the gates and the scale-free norm under one form.
 fn rows_pass(tile: bool, window: Option<(u32, u32, u32)>) -> Vec<Vec<u16>> {
+    rows_pass_on(tuning(tile), window)
+}
+
+fn rows_pass_on(tuning: Tuning, window: Option<(u32, u32, u32)>) -> Vec<Vec<u16>> {
     let (rows, live, base) = window.unwrap_or((37, 37, 0));
     let planes = (base + rows) as usize;
     let h = 4096usize;
@@ -130,7 +134,7 @@ fn rows_pass(tile: bool, window: Option<(u32, u32, u32)>) -> Vec<Vec<u16>> {
     let post_out = gpu.zeros(planes * M * 4);
     let comb_out = gpu.zeros(planes * M * M * 4);
     let normed = gpu.zeros(planes * heads * head_dim * 2);
-    let ctx = gpu.ctx().with_tuning(tuning(tile));
+    let ctx = gpu.ctx().with_tuning(tuning);
     if window.is_some() {
         let win_at = gpu.up(&[live, base, 0u32, 0u32]);
         ctx.arm_stage(win_at);
@@ -206,6 +210,26 @@ fn compare(window: Option<(u32, u32, u32)>) {
 fn the_vector_forms_land_what_the_forms_before_land() {
     compare(None);
     compare(Some((24, 17, 5)));
+}
+
+/// A prefill's rows under `kernel.elemwise.hc_mma` (the fold a block a row)
+/// land what the vector forms land, bit for bit, whole and windowed.
+#[test]
+fn a_prefills_rows_fold_alike_a_block_a_row() {
+    for window in [(200, 200, 0), (300, 170, 9)] {
+        let before = rows_pass(true, Some(window));
+        let after = rows_pass_on(
+            Tuning {
+                hc_mma: true,
+                ..tuning(true)
+            },
+            Some(window),
+        );
+        assert_eq!(
+            before[0], after[0],
+            "the fold lands bit for bit ({window:?})"
+        );
+    }
 }
 
 /// The projection, gates, fold and q norm at DeepSeek-V4-Flash's shapes, the
@@ -342,6 +366,21 @@ fn the_hyper_connection_forms_time() {
                     &mut Tensor::new(out_x, r, h as u32, Dtype::Bf16),
                     &mut Tensor::new(out_p, r, M as u32, Dtype::F32),
                     &mut Tensor::new(out_c, r, (M * M) as u32, Dtype::F32),
+                )
+                .unwrap();
+            });
+            let fold_ctx = gpu.ctx().with_tuning(Tuning {
+                hc_mma: true,
+                ..tuning(tile)
+            });
+            time("fold mma", &|| {
+                hc::fold(
+                    &fold_ctx,
+                    Tensor::new(x, r, h as u32, Dtype::Bf16),
+                    Tensor::new(streams, r, fan as u32, Dtype::Bf16),
+                    Tensor::new(post, r, M as u32, Dtype::F32),
+                    Tensor::new(comb, r, (M * M) as u32, Dtype::F32),
+                    &mut Tensor::new(out_s, r, fan as u32, Dtype::Bf16),
                 )
                 .unwrap();
             });
