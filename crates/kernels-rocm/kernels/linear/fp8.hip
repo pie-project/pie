@@ -113,6 +113,10 @@ __device__ __forceinline__ u32 e4m3fn_bits(float q) {
 // The recipe's scale of a block whose amax is `amax`.
 __device__ __forceinline__ float e4m3_block_scale(float amax) { return fmaxf(amax, 1e-10f) / 448.f; }
 
+// The power of two e8m0 exponent `e` stands for: 2^(e − 127), 2^-127 (an
+// f32 denormal) at e = 0.
+__device__ __forceinline__ float fp8_e8m0(u32 e) { return __uint_as_float(e == 0u ? 0x400000u : e << 23); }
+
 // y[route] = W·act[route / act_div] over routes order[begin .. begin +
 // count) (rows begin .. begin + count without an order), count ≤ MT, for
 // the weight rows [tile·64, +64) of `codes` / `factors` (n x k, k a multiple
@@ -124,7 +128,11 @@ __device__ __forceinline__ float e4m3_block_scale(float amax) { return fmaxf(ama
 // codes, lane l's 8 bytes a k-step four elements of its row) against bf16
 // rows, a stage 64 elements, nothing to fold (`act_scales`, `factors`
 // unread).
-template <int MT, int DEPTH, int NB = 1, bool FP8 = true>
+// SB 32: an `fp8b32` weight (ue8m0 exponents a 32x32 block, `factors` their
+// bytes) against rows under ue8m0 exponents a 1x32 block (`act_scales`
+// their bytes, `act_quant_e4m3_e8m0`): the same bytes a stage as the f32
+// forms, each 32-code step's products folded under its own two exponents.
+template <int MT, int DEPTH, int NB = 1, bool FP8 = true, int SB = 0>
 __device__ __forceinline__ void fp8_tile(const u8* __restrict__ act, const float* __restrict__ act_scales,
                                          const i32* __restrict__ order, int begin, int count,
                                          const u8* __restrict__ codes, const float* __restrict__ factors,
@@ -177,8 +185,11 @@ __device__ __forceinline__ void fp8_tile(const u8* __restrict__ act, const float
 #pragma unroll
     for (int nb = 0; nb < NB; ++nb)
         wv[nb] = static_cast<u32>(min(row0 + 16 * nb, n - 16) / 16) * static_cast<u32>(16 * kbytes) + 16 * l;
-    // The wave's 16 rows lie in one 128-row block: its factor a stage.
-    const float* frow = FP8 ? factors + static_cast<long long>(min(row0, n - 1) / 128) * kb : nullptr;
+    // The wave's 16 rows lie in one 128-row block (one 32-row block under
+    // SB 32): its factor a stage (four exponents).
+    static_assert(SB == 0 || (SB == 32 && NB <= 2), "f32 128x128 factors, or ue8m0 exponents a 32x32 block");
+    const float* frow =
+        FP8 ? factors + static_cast<long long>(min(row0, n - 1) / (SB == 32 ? 32 : 128)) * kb : nullptr;
 
     i32x4 w[R][NL];
     i32x4 a[R][NA];
@@ -233,6 +244,24 @@ __device__ __forceinline__ void fp8_tile(const u8* __restrict__ act, const float
                         acc[nb][mb] = mma16x16<bf16>(static_cast<u32>(u[2 * (kk % 2)]),
                                                      static_cast<u32>(u[2 * (kk % 2) + 1]), xb[kk][0], xb[kk][1],
                                                      acc[nb][mb]);
+                    }
+                continue;
+            }
+            if constexpr (SB == 32) {
+                const u32 we = static_cast<u32>(ws[S][0]), ae = __float_as_uint(xsc[buf][16 * mb + r16]);
+                float f[4];
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk)
+                    f[kk] = 4.f * fp8_e8m0((we >> (8 * kk)) & 0xFFu) * fp8_e8m0((ae >> (8 * kk)) & 0xFFu);
+#pragma unroll
+                for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+                    for (int kk = 0; kk < 4; ++kk) {
+                        const i32x4& u = w[S][2 * nb + kk / 2];
+                        const fp8_f4 p = mma_fp8(static_cast<u32>(u[2 * (kk % 2)]), static_cast<u32>(u[2 * (kk % 2) + 1]),
+                                                 xb[kk][0], xb[kk][1], fp8_f4{0.f, 0.f, 0.f, 0.f});
+                        // Two lanes' cells an instruction (v_pk_fma_f32).
+                        acc[nb][mb] = __builtin_elementwise_fma(fp8_f4{f[kk], f[kk], f[kk], f[kk]}, p, acc[nb][mb]);
                     }
                 continue;
             }
@@ -328,7 +357,10 @@ __device__ __forceinline__ void fp8_tile(const u8* __restrict__ act, const float
 // core, a stage 64 elements (the same 128 bytes a row), no scales to fold:
 // the tile at the decode batches past 64 routes an expert that the batch
 // legs read as many items.
-template <bool FP8 = true>
+// SB 32: an `fp8b32` weight against rows under ue8m0 exponents a 1x32 block,
+// as `fp8_tile`'s; the tile's 128 rows are four 32-row blocks, a word of
+// four exponents each a stage.
+template <bool FP8 = true, int SB = 0>
 __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const float* __restrict__ act_scales,
                                                const i32* __restrict__ order, int begin, int count,
                                                const u8* __restrict__ codes, const float* __restrict__ factors,
@@ -340,7 +372,7 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
     constexpr int EB = FP8 ? 1 : 2;                 // bytes an element
     __shared__ __align__(16) u8 wl[TN * PITCH];
     __shared__ __align__(16) u8 xl[TM * PITCH];
-    __shared__ float xsc[TM + 1];  // the rows' scales, then the weight's factor
+    __shared__ float xsc[TM + 4];  // the rows' scales, then the weight's factor (exponents)
     const int tid = threadIdx.x, l = lane(), r16 = l % 16, g = l / 16;
     const int wave = tid / kWave, wm = wave / 2, wn = wave % 2;  // wm: 32 activation rows, wn: 64 weight rows
     const int row0 = tile * TN;
@@ -368,7 +400,12 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
     }
     const float* srow =
         FP8 ? act_scales + static_cast<long long>(route(min(tid % TM, max(count - 1, 0))) / act_div) * kb : nullptr;
-    const float* frow = FP8 ? factors + static_cast<long long>(min(row0, n - 1) / 128) * kb : nullptr;
+    // Thread TM + j reads the weight's factor (under SB 32 the exponents of
+    // row block j); every thread reads one, so the counts agree.
+    const float* frow = !FP8 ? nullptr
+                        : SB == 32
+                            ? factors + static_cast<long long>(min(row0 + 32 * min(max(tid - TM, 0), 3), n - 1) / 32) * kb
+                            : factors + static_cast<long long>(min(row0, n - 1) / 128) * kb;
 
     i32x4 wv[2][NR], xv[2][NR];
     moe_i2 as[2], ws[2];
@@ -407,7 +444,7 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
         }
         if constexpr (FP8) {
             if (tid < TM) xsc[tid] = __int_as_float(as[S][0]);
-            if (tid == TM) xsc[TM] = __int_as_float(ws[S][0]);
+            if (tid >= TM && tid < TM + 4) xsc[tid] = __int_as_float(ws[S][0]);
         }
     };
 
@@ -434,6 +471,35 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
 #pragma unroll
                     for (int mb = 0; mb < 2; ++mb)
                         acc[nb][mb] = mma16x16<bf16>(a[nb][0], a[nb][1], b[mb][0], b[mb][1], acc[nb][mb]);
+            }
+            return;
+        }
+        if constexpr (SB == 32) {
+            // Each 32-code step folded under its own exponents: the wave's
+            // 64 rows are row blocks 2·wn and 2·wn + 1.
+            const u32 we[2] = {__float_as_uint(xsc[TM + 2 * wn]), __float_as_uint(xsc[TM + 2 * wn + 1])};
+            const u32 ae[2] = {__float_as_uint(xsc[wm * 32 + r16]), __float_as_uint(xsc[wm * 32 + 16 + r16])};
+#pragma unroll
+            for (int kk = 0; kk < KC / 32; ++kk) {
+                moe_u2 a[4], b[2];
+#pragma unroll
+                for (int nb = 0; nb < 4; ++nb)
+                    a[nb] = *reinterpret_cast<const moe_u2*>(wl + (wn * 64 + nb * 16 + r16) * PITCH + 32 * kk + 8 * g);
+#pragma unroll
+                for (int mb = 0; mb < 2; ++mb)
+                    b[mb] = *reinterpret_cast<const moe_u2*>(xl + (wm * 32 + mb * 16 + r16) * PITCH + 32 * kk + 8 * g);
+                const float fw[2] = {4.f * fp8_e8m0((we[0] >> (8 * kk)) & 0xFFu),
+                                     4.f * fp8_e8m0((we[1] >> (8 * kk)) & 0xFFu)};
+#pragma unroll
+                for (int mb = 0; mb < 2; ++mb) {
+                    const float fa = fp8_e8m0((ae[mb] >> (8 * kk)) & 0xFFu);
+#pragma unroll
+                    for (int nb = 0; nb < 4; ++nb) {
+                        const fp8_f4 p = mma_fp8(a[nb][0], a[nb][1], b[mb][0], b[mb][1], fp8_f4{0.f, 0.f, 0.f, 0.f});
+                        const float f = fw[nb / 2] * fa;
+                        acc[nb][mb] = __builtin_elementwise_fma(fp8_f4{f, f, f, f}, p, acc[nb][mb]);
+                    }
+                }
             }
             return;
         }
@@ -526,6 +592,7 @@ __device__ __forceinline__ void fp8_gemm_tile8(const u8* __restrict__ act, const
     }
 }
 
+template <int SB = 0>
 __global__ __launch_bounds__(512) void dense_fp8_gemm8(const u8* __restrict__ act, const float* __restrict__ act_scales,
                                                        const u8* __restrict__ codes, const float* __restrict__ factors,
                                                        bf16* __restrict__ y, float* __restrict__ part, int m, int n,
@@ -536,7 +603,7 @@ __global__ __launch_bounds__(512) void dense_fp8_gemm8(const u8* __restrict__ ac
     if (begin >= m) return;
     const long long first = win != nullptr ? Window{win}.plane(0) : 0;
     const int split = static_cast<int>(blockIdx.z);
-    fp8_gemm_tile8(act + first * k, act_scales + first * (k / 128), nullptr, begin, min(128, m - begin), codes,
+    fp8_gemm_tile8<true, SB>(act + first * k, act_scales + first * (k / 128), nullptr, begin, min(128, m - begin), codes,
                    factors, y + first * n, 1, n, k, blockIdx.y, split * per, (split + 1) * per,
                    gridDim.z > 1 ? part + static_cast<long long>(split) * rows * n : nullptr);
 }
@@ -1009,7 +1076,7 @@ constexpr int kFp8MfmaDepth = 3;
 // XCDs). Under splits a slice's f32 partial lands in `part` ([splits, rows,
 // n]) for `fp8_mfma_finalize`. A staged window bounds the rows, which the
 // planes hold from its first.
-template <int MT, int NB>
+template <int MT, int NB, int SB = 0>
 __global__ __launch_bounds__(256) void dense_fp8_mfma(const u8* __restrict__ act, const float* __restrict__ act_scales,
                                                       const u8* __restrict__ codes,
                                                       const float* __restrict__ factors, bf16* __restrict__ y,
@@ -1024,7 +1091,7 @@ __global__ __launch_bounds__(256) void dense_fp8_mfma(const u8* __restrict__ act
     const int begin = item * MT;
     if (begin >= m) return;
     const long long first = win != nullptr ? Window{win}.plane(0) : 0;
-    fp8_tile<MT, kFp8MfmaDepth, NB>(act + first * k, act_scales + first * (k / 128), nullptr, begin, min(MT, m - begin),
+    fp8_tile<MT, kFp8MfmaDepth, NB, true, SB>(act + first * k, act_scales + first * (k / 128), nullptr, begin, min(MT, m - begin),
                                 codes, factors, y + first * n,
                                 splits > 1 ? part + static_cast<long long>(split) * rows * n : nullptr, 1, n, k, tile,
                                 split * per, (split + 1) * per);
@@ -1094,6 +1161,42 @@ __global__ __launch_bounds__(256) void moe_fp8_mfma(const u8* __restrict__ act, 
 // `amax / 448` (the amax floored at 1e-10), rounded to nearest even: the
 // OCP bytes in `codes` ([rows, k]), negative zero as zero (the matrix core
 // reads them as fnuz), each block's scale in `scales` ([rows, k / GRAN]).
+// x's rows quantized as DeepSeek's recipe does (`act_quant_e4m3_values`:
+// a ue8m0 scale a 32-wide block, 2^ceil(log2(max(amax, 1e-4) / 448))) into
+// e4m3 codes as the matrix core reads them (zero 0x00) beside each block's
+// exponent byte. A thread eight elements, four a block.
+__global__ __launch_bounds__(256) void act_quant_e4m3_e8m0(const bf16* __restrict__ x, u8* __restrict__ codes,
+                                                           u8* __restrict__ exps, i32 rows, i32 k,
+                                                           const u32* __restrict__ win) {
+    const Window window{win};
+    const long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int per = k / 8;
+    if (t >= static_cast<long long>(rows) * per) return;
+    const long long r = t / per;
+    if (!window.live(r)) return;
+    const long long row = window.plane(r);
+    const long long at = row * k + (t % per) * 8;
+    const Pack8<bf16> in = *reinterpret_cast<const Pack8<bf16>*>(x + at);
+    float v[8];
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        v[i] = to_f32(in.v[i]);
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+    amax = fmaxf(amax, __shfl_xor(amax, 1, kWave));
+    amax = fmaxf(amax, __shfl_xor(amax, 2, kWave));
+    amax = fmaxf(amax, 1e-4f);
+    const u32 bits = __float_as_uint(amax * (1.f / 448.f));
+    const int e = static_cast<int>((bits >> 23) & 0xFFu) - 127 + ((bits & 0x7FFFFFu) != 0u ? 1 : 0);
+    const float sc = __uint_as_float(static_cast<u32>(e + 127) << 23);
+    u32 word[2] = {0u, 0u};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) word[i / 4] |= e4m3fn_bits(fminf(fmaxf(v[i] / sc, -448.f), 448.f)) << (8 * (i % 4));
+    *reinterpret_cast<uint2*>(codes + at) = uint2{word[0], word[1]};
+    if (t % 4 == 0) exps[at / 32] = static_cast<u8>(e + 127);
+}
+
 template <int GRAN>
 __global__ __launch_bounds__(256) void act_quant_e4m3_codes(const bf16* __restrict__ x, u8* __restrict__ codes,
                                                             float* __restrict__ scales, i32 rows, i32 k,

@@ -49,3 +49,7 @@ moe.bf16_order = false
 # dsv41's banks (gate n 2304 k 5120: 1 token 19.3 -> 18.1 us, 128 tokens
 # 763 -> 511, 1024 tokens 1387 -> 707, 8192 tokens 3871 -> 2393).
 moe.mxfp4_order = true
+# fp8b32 projections in the FP8 matrix core's order: DeepSeek-V4.1-Flash's
+# seven at 8 / 32 / 128 rows 375 / 383 / 450 -> 125 / 140 / 290 us, the same
+# at one row, and past 512 rows hipBLASLt over the values as before.
+fp8.b32_order = true

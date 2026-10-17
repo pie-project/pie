@@ -107,6 +107,33 @@ __global__ __launch_bounds__(256) void fp8b128_decode(const u8* __restrict__ cod
     *reinterpret_cast<Pack8<bf16>*>(out + i8) = o;
 }
 
+// An fp8b32 projection in the FP8 matrix core's order (`fp8_unit_at` in
+// linear/fp8.hip: each 16-row strip K / 64 units of 1 KB, lane l's 16 bytes
+// row l % 16's codes 8·(l / 16) .. +8 of the unit's first 32-code step, then
+// of its second) back to row-major bf16 values under its exponents, `[n, k]`.
+// A thread a lane's 16 bytes.
+__global__ __launch_bounds__(256) void fp8b32_lanes_decode(const u8* __restrict__ codes, const u8* __restrict__ scales,
+                                                           bf16* __restrict__ out, i32 n, i32 k) {
+    const long long q = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (q >= static_cast<long long>(n) * k / 16) return;
+    const long long strip = q / k;
+    const int within = static_cast<int>(q % k), unit = within / 64, l = within % 64;
+    const long long row = strip * 16 + l % 16;
+    const int col = unit * 64 + 8 * (l / 16);
+    const int kb = k / 32;
+    const uint4 v = *reinterpret_cast<const uint4*>(codes + q * 16);
+    const u32 w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int c = col + 32 * half;
+        const float s = e8m0_value(scales[(row / 32) * kb + c / 32]);
+        Pack8<bf16> o;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) o.v[j] = from_f32<bf16>(e4m3fn_value((w[2 * half + j / 4] >> (8 * (j % 4))) & 0xFFu) * s);
+        *reinterpret_cast<Pack8<bf16>*>(out + row * k + c) = o;
+    }
+}
+
 // y = x · wᵀ for an fp8b128 w and few rows of x (bf16, the quantized values),
 // the codes decoded in registers: a wavefront an output column, sixteen
 // codes a lane a step (one 128-block scale each), the rows' sums kept per

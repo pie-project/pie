@@ -35,9 +35,11 @@ pub enum WeightRow {
         counts: u64,
     },
 
-    /// A resident bf16 expert bank in the matrix core's order
-    /// (`linear::act_quant::bf16_shuffle` of each expert's plane), which
-    /// only routed selects read (`linear::moe::matmul_select_bf16_stream`).
+    /// A resident plane in the matrix core's order, which only the products
+    /// that read it so take: a bf16 expert bank (`linear::act_quant::
+    /// bf16_shuffle` of each expert's plane, `linear::moe::
+    /// matmul_select_bf16_stream`), or an fp8b32 projection
+    /// (`e4m3fn_shuffle`, `act_quant::matmul_fp8b32_lanes`).
     Ordered(Tensor),
 }
 

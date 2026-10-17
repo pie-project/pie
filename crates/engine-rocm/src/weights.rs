@@ -806,6 +806,127 @@ fn order_bf16_banks(
     })
 }
 
+/// The fp8b32 projections that land in the FP8 matrix core's order: `[n,
+/// k]` e4m3 planes (n a multiple of 16, k of 128) beside ue8m0 exponents a
+/// 32x32 block, held on the device, that only W8A8 products of bf16 rows
+/// under e4m3 a 1x32 block read; with their exponents.
+fn fp8b32_planes(trace: &Trace, tier: Option<&crate::experts::Tier>) -> Vec<usize> {
+    use poem_ir::{ActQuant, Def, Linear, Operands, Operation, Ty};
+    let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|decl| &decl.def) {
+        Some(Def::Weight(w)) => Some(*w as usize),
+        _ => None,
+    };
+    let bf16 = |id: poem_ir::ValueId| {
+        matches!(
+            trace.values.get(id.0 as usize).map(|decl| &decl.ty),
+            Some(Ty::Tensor { dtype: Dtype::Bf16, .. })
+        )
+    };
+    let mut reads = vec![0u32; trace.params.len()];
+    let mut products = vec![0u32; trace.params.len()];
+    let mut ins = Vec::new();
+    for node in &trace.nodes {
+        ins.clear();
+        node.op.inputs(&mut ins);
+        for &id in &ins {
+            if let Some(w) = weight(id) {
+                reads[w] += 1;
+            }
+        }
+        if let Operation::Linear(Linear::MatmulActQuant {
+            act,
+            w,
+            quant: ActQuant::E4m3 { gran: 32 },
+            input_scales: None,
+            scales: Some(scales),
+            ..
+        }) = &node.op
+            && let (Some(w), Some(s)) = (weight(*w), weight(*scales))
+            && bf16(*act)
+        {
+            let (param, exps) = (&trace.params[w], &trace.params[s]);
+            if param.dtype == Dtype::E4m3
+                && exps.dtype == Dtype::E8m0
+                && param.shape.len() == 2
+                && param.shape[0] % 16 == 0
+                && param.shape[1] % 128 == 0
+                && exps.shape == [param.shape[0].div_ceil(32), param.shape[1] / 32]
+            {
+                products[w] += 1;
+            }
+        }
+    }
+    (0..trace.params.len())
+        .filter(|&at| {
+            products[at] > 0
+                && products[at] == reads[at]
+                && !tier.is_some_and(|tier| tier.handles(at).is_some() || tier.group_handles(at).is_some())
+        })
+        .collect()
+}
+
+/// Puts `fp8b32_planes` in the FP8 matrix core's order where they lie, made
+/// canonical (a NaN code refused), through one staging plane, and rebinds
+/// their rows as ordered.
+fn order_fp8b32_planes(
+    trace: &Trace,
+    places: &[Place],
+    store: &Buffer,
+    tier: Option<&crate::experts::Tier>,
+    table: &mut [Option<WeightRow>],
+    stream: *mut core::ffi::c_void,
+) -> Result<()> {
+    let planes = fp8b32_planes(trace, tier);
+    let Some(widest) = planes.iter().map(|&at| trace.params[at].shape.iter().product::<u64>()).max() else {
+        return Ok(());
+    };
+    // SAFETY: `stream` is the load's stream, live for the load.
+    let ctx = unsafe { kernels_rocm::Ctx::on(stream.cast()) };
+    let staging = Buffer::zeroed(usize::try_from(widest).unwrap_or(usize::MAX))?;
+    let nans = Buffer::zeroed(4)?;
+    for &at in &planes {
+        let (rows, k) = (trace.params[at].shape[0], trace.params[at].shape[1]);
+        let plane = address(tier, store, places[at].offset, at)?;
+        kernels_rocm::linear::act_quant::e4m3fn_shuffle(
+            &ctx,
+            "linear.matmul_act_quant",
+            plane,
+            staging.ptr(),
+            rows,
+            k,
+            nans.ptr(),
+        )?;
+        // SAFETY: both spans are device memory this load holds, `rows · k`
+        // bytes each; the copy is ordered on the load's stream.
+        crate::device::ctx::check("hipMemcpyAsync", unsafe {
+            kernels_rocm::hip::rt::hipMemcpyAsync(
+                plane as *mut core::ffi::c_void,
+                staging.ptr() as *const core::ffi::c_void,
+                usize::try_from(rows * k).unwrap_or(usize::MAX),
+                kernels_rocm::hip::rt::hipMemcpyDeviceToDevice,
+                stream.cast(),
+            )
+        })?;
+        if let Some(Some(WeightRow::Dense(handle))) = table.get(at).copied() {
+            table[at] = Some(WeightRow::Ordered(handle));
+        }
+    }
+    // SAFETY: the load's stream, live for the load.
+    crate::device::ctx::check("hipStreamSynchronize", unsafe {
+        kernels_rocm::hip::rt::hipStreamSynchronize(stream.cast())
+    })?;
+    let mut count = [0u8; 4];
+    nans.read(0, &mut count)?;
+    if u32::from_le_bytes(count) != 0 {
+        return Err(Fault::Param {
+            name: trace.params[planes[0]].name.clone(),
+            why: "is one of the fp8b32 planes, which together hold NaN codes (0x7f, 0xff); the FP8 \
+                  matrix core reads e4m3fnuz, where they are numbers, so this load refuses them",
+        });
+    }
+    Ok(())
+}
+
 /// The mxfp4 expert banks that may land in the matrix core's lane order:
 /// `[experts, n, ..]` banks (n a multiple of 16) under e8m0
 /// exponents alone, held on the device, that only routed selects of bf16
@@ -1073,6 +1194,7 @@ impl Weights {
         deferred_tier: bool,
         order_bf16: bool,
         order_mxfp4: bool,
+        order_fp8b32: bool,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -1278,6 +1400,9 @@ impl Weights {
         }
         if order_mxfp4 {
             order_mxfp4_banks(trace, &places, &store, experts.as_ref(), &pairings, &mut table, stream)?;
+        }
+        if order_fp8b32 {
+            order_fp8b32_planes(trace, &places, &store, experts.as_ref(), &mut table, stream)?;
         }
         if let Some(tier) = experts.as_mut() {
             let slabs: Vec<u64> = tier

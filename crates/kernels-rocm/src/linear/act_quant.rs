@@ -423,6 +423,110 @@ pub fn matmul_fp8_quantized(
     if act.dtype != Dtype::U8 || act_scales.dtype != Dtype::F32 || act_scales.rows != act.rows || act_scales.width != k / FP8_BLOCK {
         return Err(refuse(op, "the FP8 product reads e4m3 row codes beside f32 scales a 128-wide block"));
     }
+    fire_fp8_dense(ctx, op, q, act_scales, codes, factors, y, 0)
+}
+
+/// The rows past which an fp8b32 projection in the matrix core's order runs
+/// on hipBLASLt over its decoded values rather than the FP8 tile.
+pub const FP8B32_TILE_ROWS: u32 = 512;
+
+/// An `fp8b32` projection (e4m3 codes `[n, k]` in the FP8 matrix core's
+/// order and made canonical at load, `e4m3fn_shuffle`; ue8m0 exponents a
+/// 32x32 block, `[⌈n / 32⌉, k / 32]`) against `act` (bf16) quantized as
+/// DeepSeek's recipe quantizes it (`act_quant_e4m3_e8m0`: e4m3 under a
+/// ue8m0 scale a 1x32 block), on the FP8 matrix core: each 32-code step's
+/// products sum in f32 there, then fold under the weight's exponent and the
+/// row's (and the four of reading both as fnuz) into the row's sum, the
+/// W8A8 GEMM's sum in its order up to f32 rounding.
+pub fn matmul_fp8b32_lanes(
+    ctx: &Ctx,
+    op: &'static str,
+    act: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    dtype_dispatch!(op, act.dtype, { Bf16 => () });
+    let (n, k) = (codes.rows, codes.width);
+    if n == 0
+        || !n.is_multiple_of(16)
+        || !k.is_multiple_of(FP8_BLOCK)
+        || scales.rows != n.div_ceil(32)
+        || scales.width != k / 32
+        || !codes.ptr.is_multiple_of(16)
+    {
+        return Err(refuse(
+            op,
+            format!(
+                "a [{n}, {k}] fp8b32 projection in the matrix core's order is whole 16-row strips of 128-code \
+                 stages under [{}, {}] exponents, one a 32x32 block",
+                scales.rows, scales.width
+            ),
+        ));
+    }
+    if act.width != k || y.width != n || y.rows != act.rows || y.dtype != Dtype::Bf16 {
+        return Err(refuse(
+            op,
+            format!(
+                "a [{}, {}] act against a [{n}, {k}] projection does not land [{}, {}]",
+                act.rows, act.width, y.rows, y.width
+            ),
+        ));
+    }
+    if act.rows == 0 {
+        return Ok(());
+    }
+    if act.rows > FP8B32_TILE_ROWS {
+        // Past the tile's rows hipBLASLt's bf16 GEMM over the values (the
+        // plane decoded out of the matrix core's order, the rows as
+        // `quantized`) runs faster than the FP8 tile folding each 32-code
+        // step (DeepSeek-V4.1-Flash at 2048 rows: 1401 -> 1839 us over its
+        // seven projections on the tile).
+        let q = quantized(ctx, op, act, 32)?;
+        let tile = ctx.scratch_stream(op, DECODED_WEIGHT, (n as usize).saturating_mul(k as usize).saturating_mul(2))?
+            as usize as u64;
+        let threads = u32::try_from(u64::from(n) * u64::from(k) / 16)
+            .map_err(|_| refuse(op, "the decode's threads do not fit a 32-bit extent"))?;
+        ctx.fire(
+            op,
+            Fire::at(FILE, "::pie::linear::fp8b32_lanes_decode").apply(Launch::flat(threads, BLOCK)),
+            &[codes.arg(), scales.arg(), ArgValue::Ptr(tile), stated(op, n)?.arg(), stated(op, k)?.arg()],
+        )?;
+        return gemm::act_x_wt(ctx, op, q, Tensor::new(tile, n, k, Dtype::Bf16), None, y);
+    }
+    // One slab a stream: the product right after consumes them.
+    let at = ctx.scratch_stream(op, "linear.act_quant_codes", (act.rows as usize * k as usize).max(16))? as usize as u64;
+    let eat = ctx.scratch_stream(op, "linear.act_quant_scales", (act.rows as usize * (k / 32) as usize).max(16))? as usize
+        as u64;
+    let q = Tensor::new(at, act.rows, k, Dtype::U8);
+    let exps = Tensor::new(eat, act.rows, k / 32, Dtype::U8);
+    let threads = u32::try_from(u64::from(act.rows) * u64::from(k / 8))
+        .map_err(|_| refuse(op, "the quantizer's threads do not fit a 32-bit extent"))?;
+    ctx.fire(
+        op,
+        Fire::at("linear/fp8.hip", "::pie::linear::act_quant_e4m3_e8m0").apply(Launch::flat(threads, BLOCK)),
+        &[act.arg(), q.arg(), exps.arg(), stated(op, act.rows)?.arg(), stated(op, k)?.arg(), ctx.stage()],
+    )?;
+    fire_fp8_dense(ctx, op, q, exps, codes, scales, y, 32)
+}
+
+/// The FP8 matrix core's dense product of `q` (e4m3 row codes) beside
+/// `act_scales` against `codes` beside `factors`: SB 0 f32 scales a 1x128
+/// block and factors a 128x128 one, SB 32 ue8m0 exponents a 1x32 and a
+/// 32x32 block (the same bytes a 128-code stage).
+#[allow(clippy::too_many_arguments)]
+fn fire_fp8_dense(
+    ctx: &Ctx,
+    op: &'static str,
+    q: Tensor,
+    act_scales: Tensor,
+    codes: Tensor,
+    factors: Tensor,
+    y: &mut Tensor,
+    sb: u32,
+) -> Result<(), Error> {
+    let act = q;
+    let (n, k) = (codes.rows, codes.width);
     let stages = k / FP8_BLOCK;
     let (splits, part) = if act.rows > 64 {
         // The prefill tile; K sliced while the tiles are fewer than 128
@@ -436,7 +540,7 @@ pub fn matmul_fp8_quantized(
         let part = fp8_partials(ctx, op, splits, act.rows, n)?;
         ctx.fire(
             op,
-            Fire::at("linear/fp8.hip", "::pie::linear::dense_fp8_gemm8")
+            Fire::at("linear/fp8.hip", symbol(&format!("::pie::linear::dense_fp8_gemm8<::pie::i32({sb})>")))
                 .apply(Launch::grid([items, tiles, splits], [2 * BLOCK, 1, 1])),
             &[
                 q.arg(),
@@ -466,7 +570,10 @@ pub fn matmul_fp8_quantized(
         let part = fp8_partials(ctx, op, splits, act.rows, n)?;
         ctx.fire(
             op,
-            Fire::at("linear/fp8.hip", symbol(&format!("::pie::linear::dense_fp8_mfma<::pie::i32({mt}), ::pie::i32({nb})>")))
+            Fire::at(
+                "linear/fp8.hip",
+                symbol(&format!("::pie::linear::dense_fp8_mfma<::pie::i32({mt}), ::pie::i32({nb}), ::pie::i32({sb})>")),
+            )
                 .apply(Launch::grid([tiles.div_ceil(8) * 8 * items * splits, 1, 1], [BLOCK, 1, 1])),
             &[
                 q.arg(),

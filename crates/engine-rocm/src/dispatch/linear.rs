@@ -892,6 +892,10 @@ impl Run<'_> {
                     .to_string(),
             });
         }
+        // An fp8b32 plane in the FP8 matrix core's order.
+        if self.ordered_bank(w).is_some() {
+            return linear::act_quant::matmul_fp8b32_lanes(self.ctx(), OP, self.tensor(act), codes, scales, &mut self.tensor(y));
+        }
         let (n, k) = (codes.rows, codes.width);
         let holds = self.decoded_tile_holds(n, k);
         linear::act_quant::matmul_fp8b128(

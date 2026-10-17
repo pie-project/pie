@@ -493,6 +493,7 @@ impl Shell {
             boot.deferred_tier,
             device.ctx().tuning().moe_bf16_order,
             device.ctx().tuning().moe_mxfp4_order,
+            device.ctx().tuning().fp8_b32_order,
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(

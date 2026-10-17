@@ -128,6 +128,12 @@ fn run_fp8b128(m: usize, n: usize, k: usize, tile_holds: bool) {
 /// The same at block side `side` (128, or V4.1's 32), the activations in
 /// 1x`side` blocks.
 fn run_fp8b(m: usize, n: usize, k: usize, tile_holds: bool, side: usize) {
+    run_fp8b_on(m, n, k, tile_holds, side, false);
+}
+
+/// The same, `lanes`: an fp8b32 plane put in the FP8 matrix core's order at
+/// load, on the matrix core.
+fn run_fp8b_on(m: usize, n: usize, k: usize, tile_holds: bool, side: usize, lanes: bool) {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
     let mut seed = 0x9E37_79B9u32 ^ (m * 31 + n) as u32;
@@ -160,6 +166,29 @@ fn run_fp8b(m: usize, n: usize, k: usize, tile_holds: bool, side: usize) {
         })
         .collect();
     let mut y = gpu.zeros(m as u32, n as u32, Dtype::Bf16);
+    let big = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+    if lanes {
+        let (wt, nans) = canonical(&gpu, bytes(&gpu, &codes, n as u32, k as u32, Dtype::E4m3), n, k);
+        assert_eq!(nans, 0);
+        act_quant::matmul_fp8b32_lanes(
+            &ctx,
+            "linear.matmul_act_quant",
+            gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
+            wt,
+            bytes(&gpu, &exps, nb as u32, kb as u32, Dtype::E8m0),
+            &mut y,
+        )
+        .unwrap();
+        for (i, (g, w)) in gpu.read(&y).iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() <= w.abs() * 2f32.powi(-8) + 1e-5 * big,
+                "fp8b32 lanes m{m} n{n} k{k}: [{}, {}] is {g}, the quantized dot {w}",
+                i / n,
+                i % n
+            );
+        }
+        return;
+    }
     act_quant::matmul_fp8b128(
         &ctx,
         "linear.matmul_act_quant",
@@ -171,7 +200,6 @@ fn run_fp8b(m: usize, n: usize, k: usize, tile_holds: bool, side: usize) {
         &mut y,
     )
     .unwrap();
-    let big = want.iter().fold(0f32, |a, v| a.max(v.abs()));
     close_abs(
         &format!("fp8b{side} m{m} n{n} k{k} tile {tile_holds}"),
         &gpu.read(&y),
@@ -196,6 +224,19 @@ fn an_fp8b32_projection_answers_the_quantized_dot() {
     run_fp8b(13, 256, 512, true, 32);
     run_fp8b(100, 320, 768, true, 32);
     run_fp8b(40, 200, 256, false, 32);
+}
+
+#[test]
+fn an_fp8b32_projection_on_the_matrix_core_folds_each_step() {
+    // Decode rows (one slice and several), rows past one item, and the
+    // prefill tile past one 128-row item over a ragged last weight tile.
+    run_fp8b_on(1, 384, 1024, true, 32, true);
+    run_fp8b_on(13, 256, 512, true, 32, true);
+    run_fp8b_on(64, 2048, 1024, true, 32, true);
+    run_fp8b_on(100, 320, 768, true, 32, true);
+    run_fp8b_on(300, 336, 768, true, 32, true);
+    // Past the tile's rows: hipBLASLt over the plane decoded out of order.
+    run_fp8b_on(600, 336, 768, true, 32, true);
 }
 
 /// Codes past the NaNs and f32 factors of no particular form (as a
@@ -419,6 +460,69 @@ fn bench_fp8_projections() {
                 act_quant::matmul_fp8(&ctx, "bench", xt, c, f, &mut yt).unwrap();
             });
             eprintln!("{name:15} m={m:4} n={n:6} k={k:6}: {us:8.1} us {:6.0} GB/s", (n * k) as f64 / us / 1e3);
+        }
+    }
+}
+
+#[test]
+#[ignore = "benchmark: cargo test --release --features rocm --test linear_act_quant -- --ignored --nocapture"]
+fn bench_fp8b32_projections() {
+    // DeepSeek-V4.1-Flash's fp8b32 projections, quantizer included: the
+    // decoded GEMV / bf16 GEMM legs against the FP8 matrix core over the
+    // plane in its order, cold over copies 1 GB together.
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let rows: Vec<usize> =
+        std::env::var("FP8_M").map_or(vec![1, 8, 32, 128, 512, 2048, 8192], |v| v.split(',').map(|x| x.parse().unwrap()).collect());
+    for (name, n, k) in [
+        ("wq_a", 1280usize, 5120usize),
+        ("wq_b", 32768, 1280),
+        ("wkv", 512, 5120),
+        ("wo_b", 5120, 8192),
+        ("idx wq_b", 4096, 1280),
+        ("shared w1", 2304, 5120),
+        ("shared w2", 5120, 2304),
+    ] {
+        let (nb, kb) = (n.div_ceil(32), k / 32);
+        let copies = (1usize << 30).div_ceil(n * k).clamp(2, 16);
+        let planes: Vec<(Tensor, Tensor, Tensor)> = (0..copies)
+            .map(|c| {
+                let (codes, _) = tile_planes(n * k, 1, 77 + c as u32);
+                let exps: Vec<u8> = (0..nb * kb).map(|i| 118 + (i % 7) as u8).collect();
+                let ct = bytes(&gpu, &codes, n as u32, k as u32, Dtype::E4m3);
+                let (lt, _) = canonical(&gpu, ct, n, k);
+                (ct, lt, bytes(&gpu, &exps, nb as u32, kb as u32, Dtype::E8m0))
+            })
+            .collect();
+        for &m in &rows {
+            let x: Vec<f32> = values(m * k, 5, 1.0);
+            let xt = gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16);
+            let y = gpu.zeros(m as u32, n as u32, Dtype::Bf16);
+            let mut i = 0usize;
+            let old = gpu.time_graph(16, || {
+                let (c, _, e) = planes[i % copies];
+                i += 1;
+                let mut yt = y;
+                act_quant::matmul_fp8b128(&ctx, "bench", xt, c, e, 32, true, &mut yt).unwrap();
+            });
+            let new = gpu.time_graph(16, || {
+                let (_, c, e) = planes[i % copies];
+                i += 1;
+                let mut yt = y;
+                act_quant::matmul_fp8b32_lanes(&ctx, "bench", xt, c, e, &mut yt).unwrap();
+            });
+            let f128 = gpu.tensor(&vec![1e-3f32; n.div_ceil(128) * (k / 128)], n.div_ceil(128) as u32, (k / 128) as u32, Dtype::F32);
+            let t128 = gpu.time_graph(16, || {
+                let (_, c, _) = planes[i % copies];
+                i += 1;
+                let mut yt = y;
+                act_quant::matmul_fp8(&ctx, "bench", xt, c, f128, &mut yt).unwrap();
+            });
+            eprintln!(
+                "{name:10} m={m:5} n={n:6} k={k:6}: {old:8.1} -> {new:8.1} us ({:6.0} GB/s, {:5.0} TFLOP/s) [tile128 {t128:8.1}]",
+                (n * k) as f64 / new / 1e3,
+                2.0 * (m * n * k) as f64 / new / 1e6
+            );
         }
     }
 }
