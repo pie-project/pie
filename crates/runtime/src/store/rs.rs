@@ -64,9 +64,8 @@ struct RingState {
 /// sequence it continues, so the ring catches up to it. `positioned` says
 /// the host knows the fire's positions: the pages behind the committed
 /// position's window retire, through the sequence order of its kv page
-/// indexes. A fire whose positions the device decides retires behind
-/// `reach` instead, the first token it may write: each of its rows lands
-/// past it, so no row's window reaches back past `reach`'s.
+/// indexes. A device-positioned fire retires behind `reach`, the first token
+/// it may write, as no row's window reaches back past it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RingAdvance {
     pub(crate) positioned: bool,

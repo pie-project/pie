@@ -387,10 +387,8 @@ pub struct TokenInject {
 /// each is copied on its own.
 const GATHERED_INJECTS: usize = 4;
 
-/// Lands each lane's device-carried tokens at its rows of `tokens`. A
-/// decode fire carries one a lane, so past a few lanes they go in one
-/// gather launch from a staged run table instead of a copy each. Inside a
-/// stream capture they are copied each, as a recording keeps them.
+/// Lands each lane's device-carried tokens at its rows of `tokens`: past a few
+/// lanes in one gather launch; one copy each inside a stream capture.
 fn inject_tokens(
     device: &crate::device::Context,
     runs: &mut Option<Buffer>,

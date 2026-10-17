@@ -68,10 +68,8 @@ impl Run<'_> {
         Ok(None)
     }
 
-    /// A sublayer's whole pre-mix: in two launches where the profile's tiled
-    /// hyper-connection kernels run (the normed streams, the mixes and the
-    /// pre-mixed row left unwritten, as nothing reads them), else the four as
-    /// the trace had them.
+    /// A sublayer's whole pre-mix: two launches where the profile's tiled
+    /// hyper-connection kernels run (unread rows left unwritten), else as traced.
     fn hc_pre(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         let Fused::HcPre {
             norm,
@@ -192,10 +190,6 @@ impl Run<'_> {
         self.elementwise(rmsnorm)
     }
 
-    /// The combined gates and the RMS norm over their pre-mixed row: in one
-    /// launch where the profile's tiled hyper-connection kernels run (the
-    /// pre-mixed row left unwritten, as nothing reads it), else the two as
-    /// the trace had them.
     /// AttnRes's blend and the norm of its row: in one pass where the
     /// profile says (`kernel.attn_res.fused_norm`) and the row takes it,
     /// else the two.
@@ -288,10 +282,8 @@ impl Run<'_> {
         self.elementwise(norm)
     }
 
-    /// A stream norm and the mix projection over it: in one pass over the
-    /// streams where the profile's tiled hyper-connection kernels run (the
-    /// normed rows left unwritten, as nothing reads them), else the two as
-    /// the trace had them.
+    /// A stream norm and the mix projection over it: one pass where the profile's
+    /// tiled hyper-connection kernels run (normed rows unwritten), else the two.
     fn hc_prenorm_project(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         let Fused::HcPrenormProject { norm, project } = op else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
@@ -325,10 +317,8 @@ impl Run<'_> {
         self.elementwise(project)
     }
 
-    /// A latent attention's prefill: expanded (a key and value head a query
-    /// head, as vLLM's MLA prefill runs it) from `kernel.mla.expanded_from`
-    /// rows where the device and the heads take it, else the split, the
-    /// absorbs and the scoring as the trace had them.
+    /// A latent attention's prefill, expanded (a KV head a query head, as vLLM's
+    /// MLA prefill) from `kernel.mla.expanded_from` rows where it fits, else as traced.
     fn mla_prefill_expanded(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         let Fused::MlaPrefillExpanded {
             split,
@@ -617,10 +607,9 @@ impl Run<'_> {
             .map(|at| poem_ir::ValueId(at as u32))
     }
 
-    /// DeepSeek-V4's window (`window`, a `PrefillLse`), its pool if any
-    /// (`PoolLse` or `PoolLseSelected`) and the sinks in one launch
-    /// (`attn::dsv4::decode`), the sinked output in `o_out`; `None` where it
-    /// does not take the shape or the region reads gathered seats.
+    /// DeepSeek-V4's window (`PrefillLse`), pool if any (`PoolLse[Selected]`) and
+    /// sinks in one launch (`attn::dsv4::decode`) into `o_out`; `None` where the
+    /// shape doesn't fit or the region reads gathered seats.
     fn dsv4_decode(
         &mut self,
         window: &poem_ir::Attention,
@@ -855,13 +844,8 @@ impl Run<'_> {
         }
     }
 
-    /// The packed row's q, k and v rotated and written in one launch where
-    /// the pool is the plain bf16 one; else split, then YaRN and the write as
-    /// `rope_yarn_append` runs them.
-    /// Qwen3.5's attention prologue: one launch up to the rows the profile
-    /// says (`kernel.elemwise.qg_prologue_until`) where the cache is a bf16
-    /// NHD pool, else the cut, the two norms, the rotation and the append as
-    /// the trace had them.
+    /// Qwen3.5's attention prologue in one launch up to
+    /// `kernel.elemwise.qg_prologue_until` rows on a bf16 NHD pool, else as traced.
     fn qg_qknorm_rope_append(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         use kernels_cuda::elemwise::{norm, rope};
         let Fused::QgQknormRopeAppend {
@@ -1051,10 +1035,8 @@ impl Run<'_> {
         )
     }
 
-    /// DeepSeek-V4's compressor at its boundaries in one launch where the
-    /// profile says (`kernel.elemwise.rows_vec`) and the shape fits; else the
-    /// gather, the norm and rotation (`norm_rope_last`), and the append, as
-    /// the unfused ops fire them.
+    /// DeepSeek-V4's compressor at its boundaries in one launch where the profile
+    /// says (`kernel.elemwise.rows_vec`) and the shape fits, else unfused.
     fn pool_compress(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         use kernels_cuda::elemwise::rope;
         let Fused::PoolCompress {
@@ -1241,10 +1223,9 @@ impl Run<'_> {
         self.attention(rank)
     }
 
-    /// DeepSeek-V4's q and kv plane normed and rotated in one launch (the
-    /// plane written as its fp8 row there too, or after it to a bf16 pool)
-    /// where the profile says (`kernel.elemwise.rows_vec`) and the shape
-    /// fits; else each as its own fused op.
+    /// DeepSeek-V4's q and kv planes normed and rotated in one launch (kv written
+    /// as its fp8 row there, or after to a bf16 pool) under `kernel.elemwise.rows_vec`
+    /// where the shape fits; else each as its own fused op.
     fn norm_rope_pair(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         use kernels_cuda::elemwise::rope;
         let Fused::NormRopePair { q, kv } = op else {
@@ -1354,10 +1335,8 @@ impl Run<'_> {
         self.norm_rope_last_append(kv)
     }
 
-    /// DeepSeek-V4's kv plane normed, rotated and written in one launch
-    /// where the pool holds DeepSeek's fp8 rows (and the profile says,
-    /// `kernel.elemwise.rows_vec`); else the norm and rotation, then the
-    /// write, as the unfused ops fire them.
+    /// DeepSeek-V4's kv plane normed, rotated and written in one launch into a pool
+    /// of DeepSeek's fp8 rows (under `kernel.elemwise.rows_vec`); else unfused.
     fn norm_rope_last_append(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         use kernels_cuda::elemwise::rope;
         let Fused::NormRopeLastAppend {

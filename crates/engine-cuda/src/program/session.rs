@@ -525,10 +525,9 @@ impl Session {
         })
     }
 
-    /// The shared rings whose cells the host reads to resolve this
-    /// instance's descriptor ports under `class` ([`Self::envelope`]); the
-    /// tokens' ring not, where the device copies them
-    /// ([`Self::token_device_source`]).
+    /// Shared rings whose cells the host reads to resolve descriptor ports under
+    /// `class` ([`Self::envelope`]); not the tokens' ring where the device copies
+    /// them ([`Self::token_device_source`]).
     pub fn host_resolved_rings(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<usize> {
         let tokens_on_device = self.token_device_source(plan, class).is_some();
         plan.package

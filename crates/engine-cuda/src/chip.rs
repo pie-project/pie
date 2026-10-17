@@ -70,10 +70,8 @@ pub struct WorkingSetPercent(pub u32);
 #[decision(id = "engine.lattice_steps", constant(set(1, 2)), default = 1, tune = engine)]
 pub struct LatticeSteps(pub u32);
 
-/// Recurrent-state slots a lane is given when `[engine] max_state_slots` is
-/// not stated, so a hybrid trunk seats every lane it batches (a lane holds a
-/// slot per posted frame, two at the default dispatch depth); 0 keeps the
-/// fixed 256, which seats 128 lanes at that depth.
+/// Recurrent-state slots a lane gets when `[engine] max_state_slots` is unset,
+/// so a hybrid trunk seats every lane it batches; 0 keeps the fixed 256.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.state_slots_per_lane", constant(range(0..=8)), default = 0, tune = engine)]
 pub struct StateSlotsPerLane(pub u32);
@@ -85,10 +83,9 @@ pub struct StateSlotsPerLane(pub u32);
 #[decision(id = "engine.one_frame_when_short", flag, default = false, tune = engine)]
 pub struct OneFrameWhenShort;
 
-/// Whether a lane already decoding claims its next pages before a prompt
-/// waiting to be seated, and a prompt waits for a lane to finish rather than
-/// suspending one (the runtime's planner, `PoolFacts::seated_first`). Off
-/// keeps the order of arrival, an older prompt preempting a younger lane.
+/// Whether a decoding lane's next pages come before seating a waiting prompt,
+/// and a prompt waits rather than suspending a lane
+/// (`PoolFacts::seated_first`). Off keeps arrival order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.seated_first", flag, default = false, tune = engine)]
 pub struct SeatedFirst;
@@ -100,18 +97,14 @@ pub struct SeatedFirst;
 #[decision(id = "engine.forward_tokens", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct ForwardTokens(pub u32);
 
-/// The prompt rows a lane brings to a fire, as the chunked gated delta walk
-/// sizes its fire by: where a trace has chunked gated delta layers of `H`
-/// value heads and `max_forward_tokens` is not stated, a fire takes at most
-/// `floor(SMs / H)` lanes of this many rows, so the walk's one block a (lane,
-/// value head) runs in one wave. 0 leaves the fire as `forward_tokens` says.
+/// Prompt rows a lane brings to a fire over chunked gated delta layers of `H`
+/// value heads when `max_forward_tokens` is unset: a fire takes at most
+/// `floor(SMs / H)` such lanes, so the walk runs in one wave. 0: `forward_tokens`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.walk_fire_rows", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct WalkFireRows(pub u32);
-/// Whether a plane its package declares `host` (read only by row gathers, as
-/// a hashed n-gram table) is served from pinned, device-mapped host memory,
-/// its device bytes left to KV pages and state slots. Off holds every plane
-/// in device memory.
+/// Whether a plane declared `host` (read only by row gathers) lives in pinned,
+/// device-mapped host memory, leaving device bytes to KV pages and state slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.host_planes", flag, default = false, tune = engine)]
 pub struct HostPlanes;
@@ -715,7 +708,6 @@ mod tests {
         assert_eq!(b200.gemm_tc5_glu_from, 65_536);
         assert_eq!((b200.mxfp4_mma_from, b200.mxfp4_mma_until), (28, 1024));
         assert!(b200.merge_warp);
-        // DeepSeek-V4-Flash's decode, on a binary that read it: 1.6-3% TPOT.
         assert!(b200.pdl);
         assert_eq!(b200.gemm_tc5_split_tickets, 8);
         assert_eq!(b200.gemm_rows_m, 8);

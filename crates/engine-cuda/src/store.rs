@@ -1060,11 +1060,9 @@ impl Pools {
         Ok(())
     }
 
-    /// Backs the windowed pages `pages` (and the null page every page behind
-    /// a window reads) in the windowed rows and the compressor slabs their
-    /// pages key, those not backed yet: the windowed pool grows as its pages
-    /// are first used rather than whole on the first fire, so a pool sized
-    /// for every seat costs only the windows the seated sequences hold.
+    /// Backs the not-yet-backed windowed pages `pages` (and the null page behind a
+    /// window) in the windowed rows and compressor slabs: the pool grows on first
+    /// use, costing only the windows the seated sequences hold.
     pub fn ensure_windowed(&mut self, pages: impl IntoIterator<Item = u64>) -> Result<()> {
         if !self.has_windowed() {
             return Ok(());

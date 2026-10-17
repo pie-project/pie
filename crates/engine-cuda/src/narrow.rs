@@ -1,7 +1,6 @@
-//! The trace rewrite `kernel.ssm.gdn_out_bf16` asks for: a chunked gated
-//! delta walk whose only reader is a gated norm of its rows (the gate not
-//! its own output, no seam holding it) lands that output in bf16, and the
-//! norm reads it so. Every other walk, and every other chip, keeps f32.
+//! The `kernel.ssm.gdn_out_bf16` rewrite: a chunked gated delta walk whose only
+//! reader is a gated norm (the gate not its own output, no seam holding it)
+//! lands that output in bf16. Every other walk keeps f32.
 
 use poem_ir::{Attention, Dtype, Elementwise, Operands, Operation, Trace, Ty};
 

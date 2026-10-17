@@ -775,11 +775,8 @@ pub fn write_raw(at: u64, bytes: &[u8]) -> Result<()> {
     }
 }
 
-/// The least copy that goes through pinned memory. A pageable source past
-/// the driver's own staging buffer makes the copy wait for every launch
-/// already queued on its stream, so a fire's table staged behind the fire
-/// before it holds the host until the device drains, and the next fire is
-/// assembled on an idle device.
+/// The least copy that goes through pinned memory: a larger pageable copy waits
+/// for every launch already queued on its stream, stalling the host.
 #[cfg(feature = "cuda")]
 const BOUNCED: usize = 32 << 10;
 

@@ -743,10 +743,8 @@ impl Inner {
         }
     }
 
-    /// What an unseated claim on `need` leaves free for the seated lanes
-    /// to grow into: `growth` each. A prompt is seated only on what the
-    /// lanes already decoding will not need, so seating it never leaves one
-    /// of them short at its next window page.
+    /// What an unseated claim on `need` leaves free for seated lanes to grow into
+    /// (`growth` each), so seating a prompt never leaves one short at its next page.
     fn seating_reserve(
         &self,
         pid: ProcessId,
@@ -780,12 +778,9 @@ impl Inner {
         }
     }
 
-    /// A seated lane's growth takes free pages at once rather than parking
-    /// behind claims the queue would not serve before it: a higher-ranked
-    /// waiter that holds nothing yet (a prompt waiting to be seated) is not
-    /// one, a higher-ranked seated waiter or preempted process is. A
-    /// decode's page boundary would otherwise park, leaving the frame wait
-    /// set, behind a burst of prompts waiting for a window ring.
+    /// A seated lane's growth takes free pages at once rather than parking behind
+    /// claims served after it anyway (a waiting prompt holding nothing); a
+    /// higher-ranked seated waiter or preempted process still goes first.
     fn growth_first(&self, pid: ProcessId) -> bool {
         let Some(proc) = self.procs.get(&pid) else {
             return false;
@@ -1082,11 +1077,9 @@ impl ResidencyPlanner {
         }
     }
 
-    /// The planner serving a seated lane's growth before a prompt waiting to
-    /// be seated, as the engine's profile asks (`PoolFacts::seated_first`):
-    /// the growth takes free pages without parking behind it, the prompt is
-    /// seated only on what leaves the window rings' growth room
-    /// (`PoolPort::rs_growth`), and it suspends no lane but an idle one.
+    /// With `PoolFacts::seated_first`, seated growth doesn't park behind a waiting
+    /// prompt, which is seated only within the rings' growth room
+    /// (`PoolPort::rs_growth`) and suspends only an idle lane.
     #[must_use]
     pub fn seated_first(mut self, on: bool) -> Self {
         self.seated_first = on;

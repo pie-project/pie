@@ -264,10 +264,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .map(|d| d.rs_cache_slots)
         .filter(|&slots| slots > 0)
         .min();
-    // Each posted frame buffers what it leaves unfolded. Where every engine
-    // asks for it and the slots seat fewer lanes than the engines batch at
-    // the configured depth, post one frame a lane, for the run-ahead a
-    // second frame bought.
+    // Each posted frame buffers what it leaves unfolded: where every engine asks
+    // and the slots seat fewer lanes than they batch at the configured depth, post
+    // one frame a lane.
     let lanes = engine_configs
         .iter()
         .map(|d| d.limits.max_forward_requests)

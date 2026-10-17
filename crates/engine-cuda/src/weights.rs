@@ -968,15 +968,10 @@ impl Weights {
         })
     }
 
-    /// `kernel.gemm.fp8_o_down`: each grouped bf16 projection whose routes
-    /// send group g to plane g (DeepSeek-V4's `wo_a`, which the import
-    /// dequantizes from the checkpoint's fp8b128), read by that projection
-    /// alone, requantized to fp8b128 in its own slot: e4m3 codes, then each
-    /// 128x128 block's exponent spread to its rows in tcgen05's atoms, each
-    /// value the bf16's exactly, so the checkpoint's own. In place, so the
-    /// card holds no more than it did (a twin beside the bf16 costs the
-    /// pools 1.4 GB, and a prefill 1% on DeepSeek-V4-Flash). Returns the
-    /// planes it requantized.
+    /// `kernel.gemm.fp8_o_down`: each grouped bf16 projection whose routes send
+    /// group g to plane g (DeepSeek-V4's `wo_a`), read by it alone, requantized in
+    /// place to fp8b128 (e4m3 codes, block exponents in tcgen05 atoms), exactly the
+    /// checkpoint's values. Returns the planes it requantized.
     #[cfg(feature = "cuda")]
     pub fn requantize_grouped(
         &mut self,
@@ -1538,10 +1533,8 @@ fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
     banks
 }
 
-/// Each low-precision bank's scales laid into the tcgen05 GEMM's atoms in
-/// place, once: a resident bank whose rows are whole 128-row blocks and
-/// whose rows' scales are whole atoms of four, where the atoms take the
-/// bytes the row-major plane does. A bank this cannot lay keeps its
+/// Each low-precision bank's scales laid into the tcgen05 GEMM's atoms in place,
+/// once, where the bank is resident and tiles whole atoms. Any other keeps its
 /// row-major scales, and its product refuses it.
 #[cfg(feature = "cuda")]
 fn lay_atoms(
@@ -1625,11 +1618,9 @@ fn lay_atoms(
     Ok(())
 }
 
-/// Each 128x128-block FP8 expert bank stored as released (e4m3 codes under
-/// f32 block factors) requantized in place to ue8m0 exponents, as vLLM's
-/// DeepGEMM path does on Blackwell, and the exponents spread into the
-/// tcgen05 GEMM's atoms a weight row an atom row (rows counted across the
-/// experts) in a buffer of their own, bound in the factors' place.
+/// Each released 128x128-block FP8 expert bank's f32 factors requantized in place
+/// to ue8m0 exponents (as vLLM's DeepGEMM path on Blackwell), spread into tcgen05
+/// atoms a weight row an atom row, in a buffer bound in the factors' place.
 #[cfg(feature = "cuda")]
 fn lay_tile_banks(
     trace: &Trace,
@@ -1708,10 +1699,8 @@ fn fp8_block_of(n: u64, k: u64, shape: &[u64]) -> Option<u64> {
         .find(|&b| shape == [n.div_ceil(b), k.div_ceil(b)])
 }
 
-/// Each block-FP8 projection's block exponents spread into the tcgen05 GEMM's
-/// atoms, one row of them a weight row, in a buffer of their own (the atoms
-/// are 128 times the plane), bound in the plane's place as raw bytes: a
-/// low-precision projection reads a `u8` scale plane as laid.
+/// Each block-FP8 projection's block exponents spread into tcgen05 atoms, a row a
+/// weight row, in their own buffer bound in the plane's place as raw `u8` scales.
 #[cfg(feature = "cuda")]
 fn lay_block_atoms(
     trace: &Trace,

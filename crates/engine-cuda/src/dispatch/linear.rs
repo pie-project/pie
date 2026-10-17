@@ -37,11 +37,9 @@ impl Run<'_> {
                 if self.moe_experts(select, glu, down, sum, gate_add.as_deref())? {
                     return Ok(());
                 }
-                // Apart, the gate-up select and its GLU as their own fusion.
-                // The down select reads the same routes right after, so the
-                // gate-up select keeps its route order for it; and where the
-                // down select reads its rows back through e4m3, the GLU (its
-                // rows read by nothing else) lands them so.
+                // Apart: the gate-up select and its GLU as their own fusion, keeping route
+                // order for the down select; the GLU lands its rows e4m3-read-back where the
+                // down select reads them so.
                 #[cfg(feature = "cuda")]
                 {
                     let pair = Fused::MoeSelectGlu {
@@ -700,10 +698,8 @@ impl Run<'_> {
                 y,
             } => {
                 const OP: &str = "linear.matmul_grouped";
-                // A plane requantized in place to fp8b128 at load
-                // (`kernel.gemm.fp8_o_down`): a decode's rows on it; a
-                // prefill's on its bf16 again, landed in a scratch for
-                // cuBLAS (ahead of the grouped tcgen05 GEMM there).
+                // A plane requantized to fp8b128 at load (`kernel.gemm.fp8_o_down`): decode
+                // rows run on it; a prefill's on its bf16 again, via a scratch for cuBLAS.
                 #[cfg(feature = "cuda")]
                 if let Some((codes, atoms)) = self.fp8_grouped_plane(*w) {
                     let (x, mut out) = (self.tensor(*x), self.tensor(*y));
@@ -717,10 +713,8 @@ impl Run<'_> {
                             *groups,
                         );
                     }
-                    // Past them, where the profile says
-                    // (`kernel.gemm.fp8_grouped_tc5_until`): each group on the
-                    // tcgen05 GEMM against its rows of the fp8 plane, no bf16
-                    // plane widened a call.
+                    // Past them (`kernel.gemm.fp8_grouped_tc5_until`): each group on the tcgen05
+                    // GEMM against its rows of the fp8 plane, no bf16 widened.
                     if out.rows <= self.ctx().tuning().gemm_fp8_grouped_tc5_until
                         && x.width.is_multiple_of(*groups)
                         && out.width.is_multiple_of(*groups)
@@ -987,10 +981,8 @@ impl Run<'_> {
                 .opaque_rows(i32::try_from(a.rows).unwrap_or(i32::MAX)),
         )
         .unwrap_or(a.rows);
-        // A GLU tile is 128 gate rows and their up rows over every K: a
-        // product of too few tiles to reach a quarter of the SMs (a narrow
-        // shared expert at decode widths) streams its weight through those
-        // few, slower than the GEMM and the GLU apart.
+        // Too few 128-row GLU tiles to reach a quarter of the SMs (a narrow shared
+        // expert at decode) run slower fused than the GEMM and the GLU apart.
         let sms = self.ctx().multiprocessors().unwrap_or(148);
         if inter.div_ceil(128) * m.div_ceil(128) < sms / 4 {
             return Ok(false);
@@ -1049,10 +1041,9 @@ impl Run<'_> {
         linear::moe::select_glu(self.ctx(), x, bank, routes, &mut out, glu, experts)
     }
 
-    /// A routed select's operands for the grouped tcgen05 GEMM: its input,
-    /// routes and output, and the bank as the GEMM reads it. `None` for a
-    /// bank it does not read (streamed, scales in atoms, host-seated, a
-    /// biased NVFP4 or affine one).
+    /// A routed select's operands for the grouped tcgen05 GEMM. `None` for a bank
+    /// it does not read (streamed, scales in atoms, host-seated, a biased NVFP4 or
+    /// affine one).
     #[cfg(feature = "cuda")]
     fn routed_bank(
         &mut self,
@@ -1528,10 +1519,9 @@ impl Run<'_> {
             return Err(unlaid(OP));
         }
         let atoms = scales.ptr;
-        // At decode widths an MXFP4 bank's e4m3 select reads its activations
-        // quantized and read back to bf16 (exact, the same products) on the
-        // e2m1-convert register-dequant kernel, which streams the bank far
-        // faster than the grouped GEMM does a handful of rows an expert.
+        // At decode widths an MXFP4 bank's e4m3 select reads its activations read back
+        // to bf16 (exact) on the register-dequant kernel, which streams the bank far
+        // faster than the grouped GEMM at a handful of rows an expert.
         if let act_quant::Format::E4m3 { .. } = fmt
             && elem == linear::tc5::Elem::E2m1
             && kernels_cuda::linear::moe::select_mxfp4_atoms_takes(self.ctx(), route_t, x)
@@ -1662,10 +1652,8 @@ impl Run<'_> {
         }
     }
 
-    /// A block-FP8 projection against e4m3 activations on one tcgen05 GEMM
-    /// (DeepSeek's W8A8): raw e4m3 codes beside the block exponents the load
-    /// spread into atoms, 128x128 blocks against 1x128 activations (V4's
-    /// fp8b128) or 32x32 against 1x32 (V4.1's MXFP8).
+    /// A block-FP8 projection against e4m3 activations on one tcgen05 GEMM (W8A8):
+    /// 128x128 blocks against 1x128 (V4's fp8b128) or 32x32 against 1x32 (V4.1's MXFP8).
     #[cfg(feature = "cuda")]
     fn fp8_block_matmul(
         &mut self,
@@ -1726,10 +1714,8 @@ impl Run<'_> {
                     shape,
                 );
             }
-            // Else a GEMV over the activations as they are, where the profile
-            // says (`kernel.gemm.fp8_gemv_until`): ahead of the tcgen05 GEMM on
-            // codes a producer held for it too (at one row 10.2 -> 7.0 us for
-            // DeepSeek-V4-Flash's shared gate-up, 8.8 -> 4.4 its q down).
+            // Else a GEMV over the activations as they are, where the profile says
+            // (`kernel.gemm.fp8_gemv_until`): ahead of the tcgen05 GEMM even on held codes.
             if act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)? {
                 return Ok(());
             }

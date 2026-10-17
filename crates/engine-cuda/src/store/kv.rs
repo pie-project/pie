@@ -370,10 +370,8 @@ mod tests {
             "and prefill ones: {kinds:?}"
         );
 
-        // Where the profile reads single-token rows of a four-way group
-        // through the prefill kernel (sm_100), every schedule is a prefill
-        // one, the single-token rows' among them; off (every other chip),
-        // the trace is the one it was.
+        // Where the profile reads four-way groups' single-token rows through the
+        // prefill kernel (sm_100), every schedule is a prefill one.
         assert_eq!(crate::grouped_decode::rewrite(plan.clone(), 0), plan);
         assert_eq!(crate::grouped_decode::rewrite(plan.clone(), 5), plan);
         let grouped = probe(&crate::grouped_decode::rewrite(plan.clone(), 4))

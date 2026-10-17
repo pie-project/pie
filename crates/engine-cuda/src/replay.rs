@@ -1,11 +1,8 @@
 //! Bounded replay (DeepSeek-V4.1's Causal Encoder-Decoder): a long prompt's
-//! leading rows run the encoder alone, and the decoder replays only the
-//! prompt's last window, as the model's release describes ("8B parameters
-//! a token at prefill"). A step whose lanes carry such prompts fires as two:
-//! first each prompt's leading rows as lanes of the `encode` fact (the
-//! program's decoder skips them, and its replay floor op stamps where their
-//! decoder windows start), unannounced; then the step itself with each such
-//! prompt cut to its last window.
+//! leading rows run the encoder alone and the decoder replays only its last
+//! window. Such a step fires twice: the leading rows as `encode` lanes
+//! (unannounced; the replay floor op stamps where decoder windows start), then
+//! the step with each prompt cut to its last window.
 
 use engine::fire::{Readout, RsReset, RsVerb, Step};
 use poem_ir::{Attention, Fact, Fused, Operation, Request};
@@ -107,11 +104,9 @@ impl Replay {
         Some((head, tail))
     }
 
-    /// Whether lane `at` of `step` is a plain prompt longer than the window:
-    /// its rows its own (no mask, scores, drafted block, conditioning, media
-    /// or ports a program resolves them through), its pages stated, its
-    /// readouts in its last window. A program attached to it (its sampler)
-    /// and its channels ride the step after, which lands its readouts.
+    /// Whether lane `at` of `step` is a plain prompt longer than the window (no mask,
+    /// scores, draft, conditioning, media or resolved ports; pages stated; readouts
+    /// in its last window). Its program and channels ride the second fire.
     fn cuts(self, step: &Step, at: usize) -> bool {
         let lane = &step.lanes[at];
         let window = self.window as usize;

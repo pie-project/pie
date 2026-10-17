@@ -1,19 +1,12 @@
-//! Single-token rows of a wide head group read the cache through the
-//! prefill kernel, where the profile says so
-//! (`kernel.sdpa.decode.grouped_prefill_from`, on for sm_100 from four
-//! query heads a KV head): the prefill kernel's tensor cores take the
-//! group's rows as one tile, where the decode kernel walks them on CUDA
-//! cores. The trace is rewritten before anything reads its plans' kinds, so
-//! the schedules, the workspaces and the dispatch all see prefill plans.
-//! At 0 (the default, and every other chip's profile) the trace is returned
-//! untouched.
+//! Single-token rows of a wide head group read the cache through the prefill
+//! kernel where the profile says (`kernel.sdpa.decode.grouped_prefill_from`):
+//! its tensor cores take the group's rows as one tile. The trace is rewritten
+//! before anything reads its plans' kinds; at 0 (the default) it is untouched.
 //!
-//! A decode that also lands its log-sum-exp (gpt-oss's, for its sinks)
-//! joins them where `kernel.sdpa.decode.grouped_prefill_lse` says so and its
-//! plan has no sliding window: a 128-wide window leaves the tensor-core tile
-//! too few keys to pay for itself. A plan the tensor-core decode reads across
-//! a cluster (`kernel.sdpa.decode.xqa_cluster`) stays a decode plan: the
-//! cluster folds its own split, which the prefill's split leaves to a launch.
+//! A decode landing its log-sum-exp (gpt-oss's sinks) joins under
+//! `kernel.sdpa.decode.grouped_prefill_lse` unless windowed (too few keys a
+//! tile). A plan read across a cluster (`kernel.sdpa.decode.xqa_cluster`)
+//! stays a decode: the cluster folds its own split.
 
 use std::collections::BTreeMap;
 
@@ -183,10 +176,9 @@ mod tests {
         counts
     }
 
-    /// gpt-oss's full-attention layers read their single-token rows through
-    /// the prefill kernel where the profile turns log-sum-exp decodes on; its
-    /// sliding layers, and every layer without it, keep the decode kernel.
-    /// So with its sinks fused onto the attentions, and without.
+    /// gpt-oss's full-attention layers read single-token rows through the prefill
+    /// kernel when log-sum-exp decodes are on; sliding layers keep the decode
+    /// kernel. With its sinks fused onto the attentions, and without.
     #[test]
     fn a_sinked_decode_without_a_window_takes_the_prefill_where_the_profile_says() {
         let row = poem_compiler::catalog::deployment("gptoss-120b-bf16-mxfp4-kv-bf16")

@@ -609,10 +609,8 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// Whether `y`, a routed GLU's rows (`mlp_swiglu_clamp_routed`), lands
-    /// as its e4m3 1x128 read-back: inside a routed MLP whose down select
-    /// (its rows' one reader) reads them back at 128-column blocks
-    /// ([`Run::reading_back`]).
+    /// Whether `y`, a routed GLU's rows, lands as its e4m3 1x128 read-back: its one
+    /// reader, the routed down select, reads it back ([`Run::reading_back`]).
     #[cfg(feature = "cuda")]
     pub(crate) fn lands_read_back(&self, y: ValueId) -> bool {
         self.read_back.get() == Some(y)
@@ -627,10 +625,9 @@ impl<'c> Run<'c> {
         r
     }
 
-    /// Planes a producer of `y` lands its fp8 1x128 codes and atoms in,
-    /// beside its bf16 row ([`kernels_cuda::linear::act_quant::held_planes`],
-    /// `e4m3_block_store`): a projection reading `y` next on this stream
-    /// takes them in place of quantizing it. The latest producer's only.
+    /// Planes the latest producer of `y` lands its fp8 1x128 codes and atoms in
+    /// ([`kernels_cuda::linear::act_quant::held_planes`]): the next projection on
+    /// this stream reading `y` takes them instead of quantizing.
     #[cfg(feature = "cuda")]
     pub(crate) fn hold_e4m3(&mut self, y: ValueId) -> Result<[u64; 2], kernels_cuda::Error> {
         let t = self.tensor(y);
@@ -1826,10 +1823,8 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// `id`'s pool with the whole fire's page tables, for a reader that
-    /// indexes them by the fire's own request ids (`request_of_token`)
-    /// whatever lanes this region starts at; `None` where the region reads
-    /// gathered seats instead.
+    /// `id`'s pool with the whole fire's page tables, indexed by the fire's own
+    /// request ids (`request_of_token`); `None` where the region reads gathered seats.
     pub(crate) fn pool_whole(&self, id: ValueId) -> Option<KvPool> {
         if self.window().gathered.is_some() {
             return None;
