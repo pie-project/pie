@@ -1,5 +1,6 @@
 #![cfg(feature = "cuda")]
 
+use crate::common::host_b::{assert_near, indptr, ragged_attention};
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn_dense;
@@ -7,80 +8,6 @@ use kernels_cuda::attn_ragged::{self, RaggedMask};
 use kernels_cuda::tensor::Tensor;
 
 const TOLERANCE: f32 = 1.0e-2;
-
-fn indptr(sizes: &[u32]) -> Vec<i32> {
-    let mut out = vec![0i32];
-    for &n in sizes {
-        out.push(out.last().unwrap() + n as i32);
-    }
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
-fn reference(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    q_indptr: &[i32],
-    kv_indptr: &[i32],
-    q_heads: usize,
-    kv_heads: usize,
-    hd: usize,
-    sm_scale: f32,
-) -> Vec<f32> {
-    let q_rows = q.len() / (q_heads * hd);
-    let mut o = vec![0f32; q_rows * q_heads * hd];
-    let group = q_heads / kv_heads;
-    for g in 0..q_indptr.len() - 1 {
-        let (q0, q1) = (q_indptr[g] as usize, q_indptr[g + 1] as usize);
-        let (k0, k1) = (kv_indptr[g] as usize, kv_indptr[g + 1] as usize);
-        for r in q0..q1 {
-            for h in 0..q_heads {
-                let kh = h / group;
-                let qv = &q[(r * q_heads + h) * hd..][..hd];
-                let mut scores: Vec<f32> = (k0..k1)
-                    .map(|j| {
-                        let kv = &k[(j * kv_heads + kh) * hd..][..hd];
-                        qv.iter().zip(kv).map(|(a, b)| a * b).sum::<f32>() * sm_scale
-                    })
-                    .collect();
-                if scores.is_empty() {
-                    continue;
-                }
-                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0f32;
-                for s in &mut scores {
-                    *s = (*s - m).exp();
-                    sum += *s;
-                }
-                let out = &mut o[(r * q_heads + h) * hd..][..hd];
-                for (j, p) in (k0..k1).zip(&scores) {
-                    let vv = &v[(j * kv_heads + kh) * hd..][..hd];
-                    for (d, x) in out.iter_mut().zip(vv) {
-                        *d += p / sum * x;
-                    }
-                }
-            }
-        }
-    }
-    o
-}
-
-fn assert_close(got: &[u16], want: &[f32], what: &str, live_rows: usize, width: usize) {
-    let mut worst = 0f32;
-    for r in 0..live_rows {
-        for c in 0..width {
-            let (g, w) = (from_bf16(got[r * width + c]), want[r * width + c]);
-            let err = (g - w).abs();
-            assert!(
-                err <= TOLERANCE * w.abs().max(1.0),
-                "{what}: row {r} column {c} landed {g} against {w}"
-            );
-            worst = worst.max(err);
-        }
-    }
-    eprintln!("{what}: worst |diff| {worst:.2e} over {live_rows} rows");
-}
 
 fn against_dense(sizes: &[u32], hd: u32, q_heads: u32, kv_heads: u32, seed: u64) {
     let table = indptr(sizes);
@@ -127,34 +54,18 @@ fn against_dense(sizes: &[u32], hd: u32, q_heads: u32, kv_heads: u32, seed: u64)
     let want: Vec<u16> = gpu.down(o_dense, rows * qw);
     let want: Vec<f32> = want.into_iter().map(from_bf16).collect();
     let got: Vec<u16> = gpu.down(o_ragged, rows * qw);
-    assert_close(
-        &got,
-        &want,
-        &format!("head width {hd}, {q_heads}/{kv_heads} heads, groups {sizes:?}"),
-        rows,
-        qw,
-    );
+    let what = format!("head width {hd}, {q_heads}/{kv_heads} heads, groups {sizes:?}");
+    assert_near(&got, &want, TOLERANCE, &what);
 }
 
 #[test]
 fn the_ragged_arm_answers_the_naive_dense_kernel_every_case() {
-    the_ragged_arm_answers_the_dense_kernel_at_head_width_64();
-    the_ragged_arm_answers_the_dense_kernel_at_head_width_128();
-    the_ragged_arm_answers_the_dense_kernel_at_head_width_256();
+    for (hd, q_heads, kv_heads, seed) in [(64, 4, 2, 0x64), (128, 4, 2, 0x128), (256, 2, 1, 0x256)]
+    {
+        against_dense(&[37, 512, 4096], hd, q_heads, kv_heads, seed);
+    }
     the_ragged_arm_answers_an_f32_host_reference();
     the_ragged_arm_serves_every_group_the_table_names_under_an_armed_seat();
-}
-
-fn the_ragged_arm_answers_the_dense_kernel_at_head_width_64() {
-    against_dense(&[37, 512, 4096], 64, 4, 2, 0x64);
-}
-
-fn the_ragged_arm_answers_the_dense_kernel_at_head_width_128() {
-    against_dense(&[37, 512, 4096], 128, 4, 2, 0x128);
-}
-
-fn the_ragged_arm_answers_the_dense_kernel_at_head_width_256() {
-    against_dense(&[37, 512, 4096], 256, 2, 1, 0x256);
 }
 
 fn the_ragged_arm_answers_an_f32_host_reference() {
@@ -169,16 +80,14 @@ fn the_ragged_arm_answers_an_f32_host_reference() {
         let (k_raw, k_f) = lcg.row(rows * kw);
         let (v_raw, v_f) = lcg.row(rows * kw);
         let sm_scale = 2.5 / (hd as f32).sqrt();
-        let want = reference(
-            &q_f,
-            &k_f,
-            &v_f,
+        let heads = [q_heads as usize, kv_heads as usize, hd as usize];
+        let want = ragged_attention(
+            [&q_f, &k_f, &v_f],
             &table,
             &table,
-            q_heads as usize,
-            kv_heads as usize,
-            hd as usize,
+            heads,
             sm_scale,
+            |_, _, _, _| Some(0.0),
         );
 
         let mut gpu = Gpu::open();
@@ -208,12 +117,11 @@ fn the_ragged_arm_answers_an_f32_host_reference() {
         .expect("the ragged arm fires");
         gpu.sync();
         let got: Vec<u16> = gpu.down(o_at, rows * qw);
-        assert_close(
+        assert_near(
             &got,
             &want,
+            TOLERANCE,
             &format!("host reference at head width {hd}"),
-            rows,
-            qw,
         );
     }
 }
@@ -233,16 +141,14 @@ fn the_ragged_arm_serves_every_group_the_table_names_under_an_armed_seat() {
     let (fill_raw, _) = lcg.row(plane_rows * qw);
     let sm_scale = 1.0 / (hd as f32).sqrt();
     let (first, live) = (1usize, 2usize);
-    let want = reference(
-        &q_f,
-        &k_f,
-        &v_f,
+    let heads = [q_heads as usize, kv_heads as usize, hd as usize];
+    let want = ragged_attention(
+        [&q_f, &k_f, &v_f],
         &table,
         &table,
-        q_heads as usize,
-        kv_heads as usize,
-        hd as usize,
+        heads,
         sm_scale,
+        |_, _, _, _| Some(0.0),
     );
 
     let mut gpu = Gpu::open();

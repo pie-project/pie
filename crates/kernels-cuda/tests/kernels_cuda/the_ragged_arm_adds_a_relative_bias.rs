@@ -1,6 +1,7 @@
 #![cfg(feature = "cuda")]
 
-use crate::common::{Gpu, Lcg, from_bf16};
+use crate::common::host_b::{assert_near, indptr, ragged_attention};
+use crate::common::{Gpu, Lcg};
 use dtype::Dtype;
 use kernels_cuda::attn_ragged::{self, RaggedMask};
 use kernels_cuda::tensor::Tensor;
@@ -10,69 +11,10 @@ const HEAD_DIM: u32 = 64;
 const SIZES: [u32; 3] = [37, 130, 64];
 const MAX_LEN: u32 = 130;
 
-fn indptr(sizes: &[u32]) -> Vec<i32> {
-    let mut out = vec![0i32];
-    for &n in sizes {
-        out.push(out.last().unwrap() + n as i32);
-    }
-    out
-}
-
 fn random_table(rng: &mut Lcg, heads: usize, max_len: usize) -> Vec<f32> {
     (0..heads * (2 * max_len - 1))
         .map(|_| 2.0 * rng.unit())
         .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn reference(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    table: &[i32],
-    bias: &[f32],
-    max_len: usize,
-    q_heads: usize,
-    kv_heads: usize,
-    sm_scale: f32,
-) -> Vec<f32> {
-    let hd = HEAD_DIM as usize;
-    let span = 2 * max_len - 1;
-    let rows = q.len() / (q_heads * hd);
-    let mut o = vec![0f32; rows * q_heads * hd];
-    let group = q_heads / kv_heads;
-    for g in 0..table.len() - 1 {
-        let (r0, r1) = (table[g] as usize, table[g + 1] as usize);
-        for r in r0..r1 {
-            for h in 0..q_heads {
-                let kh = h / group;
-                let qv = &q[(r * q_heads + h) * hd..][..hd];
-                let mut scores: Vec<f32> = (r0..r1)
-                    .map(|j| {
-                        let kv = &k[(j * kv_heads + kh) * hd..][..hd];
-                        let dot = qv.iter().zip(kv).map(|(a, b)| a * b).sum::<f32>();
-                        let d =
-                            (j as i64 - r as i64 + max_len as i64 - 1).clamp(0, span as i64 - 1);
-                        dot * sm_scale + bias[h * span + d as usize]
-                    })
-                    .collect();
-                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0f32;
-                for s in &mut scores {
-                    *s = (*s - m).exp();
-                    sum += *s;
-                }
-                let out = &mut o[(r * q_heads + h) * hd..][..hd];
-                for (j, p) in (r0..r1).zip(&scores) {
-                    let vv = &v[(j * kv_heads + kh) * hd..][..hd];
-                    for (d, x) in out.iter_mut().zip(vv) {
-                        *d += p / sum * x;
-                    }
-                }
-            }
-        }
-    }
-    o
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -111,16 +53,19 @@ fn check(q_heads: u32, kv_heads: u32, seed: u64) {
     let (v_raw, v_f) = lcg.row(rows * kw);
     let bias = random_table(&mut lcg, q_heads as usize, MAX_LEN as usize);
     let sm_scale = 2.0 / (HEAD_DIM as f32).sqrt();
-    let want = reference(
-        &q_f,
-        &k_f,
-        &v_f,
+    // The bias at the key's offset from the query, clamped to the table.
+    let span = 2 * MAX_LEN as usize - 1;
+    let heads = [q_heads as usize, kv_heads as usize, HEAD_DIM as usize];
+    let want = ragged_attention(
+        [&q_f, &k_f, &v_f],
         &table,
-        &bias,
-        MAX_LEN as usize,
-        q_heads as usize,
-        kv_heads as usize,
+        &table,
+        heads,
         sm_scale,
+        |_, h, r, j| {
+            let d = (j as i64 - r as i64 + i64::from(MAX_LEN) - 1).clamp(0, span as i64 - 1);
+            Some(bias[h * span + d as usize])
+        },
     );
 
     let mut gpu = Gpu::open();
@@ -138,37 +83,20 @@ fn check(q_heads: u32, kv_heads: u32, seed: u64) {
         max_len: MAX_LEN,
     };
     let got = fire(&mut gpu, q, k, v, groups, sm_scale, mask, rows, qw);
-    let mut worst = 0f32;
-    for r in 0..rows {
-        for c in 0..qw {
-            let (g, w) = (from_bf16(got[r * qw + c]), want[r * qw + c]);
-            let err = (g - w).abs();
-            assert!(
-                err <= TOLERANCE * w.abs().max(1.0),
-                "{q_heads}/{kv_heads} heads: row {r} column {c} landed {g} against {w}"
-            );
-            worst = worst.max(err);
-        }
-    }
-    eprintln!(
-        "{q_heads}/{kv_heads} heads, groups {SIZES:?}, max_len {MAX_LEN}: worst |diff| {worst:.2e}"
+    assert_near(
+        &got,
+        &want,
+        TOLERANCE,
+        &format!("{q_heads}/{kv_heads} heads"),
     );
 }
 
 #[test]
 fn the_ragged_arm_adds_a_relative_bias_every_case() {
-    the_relative_bias_lands_the_host_reference_at_four_heads();
-    the_relative_bias_lands_the_host_reference_at_sixty_four_heads();
+    check(4, 2, 0x5b1a);
+    check(64, 16, 0x5b64);
     a_zero_table_is_the_plain_arm_bit_for_bit();
     a_misshapen_table_is_refused();
-}
-
-fn the_relative_bias_lands_the_host_reference_at_four_heads() {
-    check(4, 2, 0x5b1a);
-}
-
-fn the_relative_bias_lands_the_host_reference_at_sixty_four_heads() {
-    check(64, 16, 0x5b64);
 }
 
 fn a_zero_table_is_the_plain_arm_bit_for_bit() {

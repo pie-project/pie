@@ -142,60 +142,31 @@ fn check_tuned(
 
 #[test]
 fn the_grouped_expert_select_answers_the_routed_dot_every_case() {
-    the_token_read_leg_answers_the_dot();
-    the_route_read_leg_answers_the_dot();
-    a_fire_wider_than_the_gemvs_grid_is_still_answered();
-    a_gemv_run_past_grid_y_is_answered();
-    a_decode_width_fire_is_still_served();
-    a_dominant_expert_still_fits_the_block_budget();
-    a_ragged_expert_count_still_lands();
-    the_tcgen05_widths_land_masked_and_contiguous();
-}
-
-/// Widths the grouped tcgen05 GEMM takes (on a device that has it): a
-/// decode fire laid out masked, prefill fires contiguous, one of them past
-/// 65535 routes, and one expert taking most of them.
-fn the_tcgen05_widths_land_masked_and_contiguous() {
-    check(16, 20, 2, 256, 128, true, Spread::Mixed);
-    check(16, 9, 2, 256, 128, true, Spread::Mixed);
-    check(16, 64, 4, 256, 192, false, Spread::Mixed);
-    check(16, 70, 4, 256, 192, true, Spread::Mixed);
-    check(16, 300, 4, 512, 320, true, Spread::Dominant);
-    check(8, 33_000, 2, 64, 64, true, Spread::Mixed);
-}
-
-fn the_token_read_leg_answers_the_dot() {
-    check(8, 48, 2, 64, 96, true, Spread::Mixed);
-}
-
-fn the_route_read_leg_answers_the_dot() {
-    check(8, 48, 2, 64, 96, false, Spread::Mixed);
-}
-
-fn a_fire_wider_than_the_gemvs_grid_is_still_answered() {
-    check(8, 33_000, 2, 32, 32, true, Spread::Mixed);
-}
-
-/// A route run past grid.y's 65535 rows on the GEMV itself (the grouped
-/// and tcgen05 legs off), read by token and by route: DeepSeek-V4's grouped
-/// o-projection at an 8192-row fire is 65536 routes.
-fn a_gemv_run_past_grid_y_is_answered() {
+    use Spread::{Dominant, Mixed};
+    // (experts, tokens, top_k, k, n, by_token, spread): the token- and
+    // route-read legs, a decode-width fire, a dominant expert inside the
+    // block budget, a ragged expert count; then widths the grouped tcgen05
+    // GEMM takes, masked (40 routes) and contiguous, one past 65535 routes.
+    for (experts, tokens, top_k, k, n, by_token, spread) in [
+        (8, 48, 2, 64, 96, true, Mixed),
+        (8, 48, 2, 64, 96, false, Mixed),
+        (8, 1, 2, 64, 96, true, Mixed),
+        (8, 48, 2, 64, 96, true, Dominant),
+        (48, 40, 3, 64, 96, true, Mixed),
+        (16, 20, 2, 256, 128, true, Mixed),
+        (16, 64, 4, 256, 192, false, Mixed),
+        (16, 70, 4, 256, 192, true, Mixed),
+        (16, 300, 4, 512, 320, true, Dominant),
+        (8, 33_000, 2, 64, 64, true, Mixed),
+    ] {
+        check(experts, tokens, top_k, k, n, by_token, spread);
+    }
+    // A route run past grid.y's 65535 rows on the GEMV itself (the grouped
+    // leg off): DeepSeek-V4's grouped o-projection at 8192 rows.
     let gemv = Tuning {
         moe_grouped: false,
         ..Tuning::DEFAULT
     };
-    check_tuned(gemv, 8, 33_000, 2, 32, 32, true, Spread::Mixed);
-    check_tuned(gemv, 8, 8_192, 8, 32, 32, false, Spread::Mixed);
-}
-
-fn a_decode_width_fire_is_still_served() {
-    check(8, 1, 2, 64, 96, true, Spread::Mixed);
-}
-
-fn a_dominant_expert_still_fits_the_block_budget() {
-    check(8, 48, 2, 64, 96, true, Spread::Dominant);
-}
-
-fn a_ragged_expert_count_still_lands() {
-    check(48, 40, 3, 64, 96, true, Spread::Mixed);
+    check_tuned(gemv, 8, 33_000, 2, 32, 32, true, Mixed);
+    check_tuned(gemv, 8, 8_192, 8, 32, 32, false, Mixed);
 }

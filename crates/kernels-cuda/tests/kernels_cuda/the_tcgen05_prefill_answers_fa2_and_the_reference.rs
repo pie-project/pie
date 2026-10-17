@@ -242,122 +242,71 @@ fn check_with(case: &Case, wide_sliding: bool) {
             }
         }
     }
-    eprintln!(
-        "head {d}, group {g}{}: worst against the host {worst_ref}, against FA2 {worst_fa2}",
-        if wide_sliding {
-            ", sliding on 128-key tiles"
-        } else {
-            ""
-        }
-    );
     assert!(
         worst_ref < 2e-2,
-        "the prefill strays {worst_ref} from the host's attention"
+        "head {d}, group {g}, wide sliding {wide_sliding}: the prefill strays {worst_ref} from the host's attention"
     );
     assert!(
         worst_fa2 < 2e-2,
-        "the prefill strays {worst_fa2} from FA2's"
+        "head {d}, group {g}, wide sliding {wide_sliding}: the prefill strays {worst_fa2} from FA2's"
     );
 }
 
 #[test]
 fn the_tcgen05_prefill_answers_fa2_and_the_reference() {
-    check(&Case {
-        head_dim: 128,
-        kv_heads: 2,
-        group: 4,
-        requests: &[(70, 0), (33, 17), (200, 40), (129, 0)],
-        window: None,
-        scale: None,
-    });
-    check(&Case {
-        head_dim: 256,
-        kv_heads: 2,
-        group: 6,
-        requests: &[(70, 0), (65, 33), (200, 17)],
-        window: None,
-        scale: None,
-    });
-    check(&Case {
-        head_dim: 256,
-        kv_heads: 4,
-        group: 2,
-        requests: &[(300, 0), (90, 120)],
-        window: Some(100),
-        scale: None,
-    });
-    // Gemma-4-31B's sliding layers: a 1024-key window over a 256-wide head
-    // of two query heads a KV head, at a unit scale (its queries and keys
-    // are normed), so scores run far past a 1/sqrt(d) head's.
-    check(&Case {
-        head_dim: 256,
-        kv_heads: 2,
-        group: 2,
-        requests: &[(329, 0), (1300, 0)],
-        window: Some(1024),
-        scale: Some(1.0),
-    });
-    // Long enough that most key tiles are whole to every row of a block,
-    // their pages one falling run: one box an atom of the head.
-    check(&Case {
-        head_dim: 128,
-        kv_heads: 1,
-        group: 4,
-        requests: &[(600, 0), (200, 300)],
-        window: None,
-        scale: None,
-    });
-    check(&Case {
-        head_dim: 256,
-        kv_heads: 1,
-        group: 6,
-        requests: &[(500, 0)],
-        window: None,
-        scale: None,
-    });
-    check(&Case {
-        head_dim: 64,
-        kv_heads: 3,
-        group: 1,
-        requests: &[(150, 0), (90, 12)],
-        window: None,
-        scale: None,
-    });
-    // Gemma-4-31B's global layers: a 512-wide head, eight query heads a
-    // key head, at a unit scale; each block lands half of O.
-    check(&Case {
-        head_dim: 512,
-        kv_heads: 2,
-        group: 8,
-        requests: &[(70, 0), (33, 17), (200, 40), (129, 0)],
-        window: None,
-        scale: Some(1.0 / 16.0),
-    });
-    // A serve's mixed fire: decode rows beside a chunk resuming a prefix.
-    check(&Case {
-        head_dim: 512,
-        kv_heads: 4,
-        group: 8,
-        requests: &[(1, 300), (256, 1793), (1, 47), (3, 20)],
-        window: None,
-        scale: Some(1.0),
-    });
-    // A whole 2049-token prompt at once, its last page one token: scores
-    // as steep as Gemma's normed queries and keys give.
-    check(&Case {
-        head_dim: 512,
-        kv_heads: 4,
-        group: 8,
-        requests: &[(2049, 0)],
-        window: None,
-        scale: Some(2.0),
-    });
-    check(&Case {
-        head_dim: 512,
-        kv_heads: 1,
-        group: 2,
-        requests: &[(600, 0), (90, 120)],
-        window: None,
-        scale: None,
-    });
+    // (head_dim, kv_heads, group, requests, window, scale).
+    let cases: [(
+        usize,
+        usize,
+        usize,
+        &'static [(usize, usize)],
+        Option<u32>,
+        Option<f32>,
+    ); 9] = [
+        (
+            128,
+            2,
+            4,
+            &[(70, 0), (33, 17), (200, 40), (129, 0)],
+            None,
+            None,
+        ),
+        (256, 2, 6, &[(70, 0), (65, 33), (200, 17)], None, None),
+        (256, 4, 2, &[(300, 0), (90, 120)], Some(100), None),
+        // Gemma-4's sliding layers: a 1024-key window at a unit scale.
+        (256, 2, 2, &[(329, 0), (1300, 0)], Some(1024), Some(1.0)),
+        // Most key tiles whole to every row, their pages one falling run.
+        (128, 1, 4, &[(600, 0), (200, 300)], None, None),
+        (64, 3, 1, &[(150, 0), (90, 12)], None, None),
+        // Gemma-4's global layers: each block lands half of O.
+        (
+            512,
+            2,
+            8,
+            &[(70, 0), (33, 17), (200, 40), (129, 0)],
+            None,
+            Some(1.0 / 16.0),
+        ),
+        // A serve's mixed fire: decode rows beside a chunk resuming a prefix.
+        (
+            512,
+            4,
+            8,
+            &[(1, 300), (256, 1793), (1, 47), (3, 20)],
+            None,
+            Some(1.0),
+        ),
+        // A whole 2049-token prompt, its last page one token, steep scores.
+        (512, 4, 8, &[(2049, 0)], None, Some(2.0)),
+    ];
+    for (head_dim, kv_heads, group, requests, window, scale) in cases {
+        check(&Case {
+            head_dim,
+            kv_heads,
+            group,
+            requests,
+            window,
+            scale,
+        });
+    }
 }

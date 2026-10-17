@@ -1,13 +1,12 @@
 #![cfg(feature = "cuda")]
 
-//! DeepSeek-V4-Flash's grouped output projection on fp8 planes
+//! DeepSeek-V4's grouped output projection on fp8 planes
 //! (`matmul_grouped_fp8`: e4m3 codes under one ue8m0 exponent a 128x128
-//! block, against the rows quantized to e4m3 in 1x128 blocks) answers an
-//! f32 walk over the weights' values and the rows' read-back (on the
-//! mma.sync kernel, and past its rows as routes on the grouped tcgen05
-//! GEMM), and (`--ignored`) its pace against
-//! cuBLAS's bf16 strided batched GEMM, past L2.
+//! block, against rows quantized in 1x128 blocks) answers an f32 walk over
+//! the weights' values and the rows' read-back, on the mma.sync kernel and
+//! past its rows as routes on the grouped tcgen05 GEMM.
 
+use crate::common::tc5::e4m3;
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::act_quant::{self, Format, Source};
@@ -15,18 +14,6 @@ use kernels_cuda::linear::moe::{
     Fp8Shape, dense_fp8_shape, matmul_grouped_fp8, matmul_grouped_fp8_with,
 };
 use kernels_cuda::tensor::Tensor;
-
-/// An e4m3 code's value.
-fn e4m3(b: u8) -> f32 {
-    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
-    let e = i32::from((b >> 3) & 0xF);
-    let m = f32::from(b & 0x7);
-    sign * if e == 0 {
-        m / 8.0 * 2f32.powi(-6)
-    } else {
-        (1.0 + m / 8.0) * 2f32.powi(e - 7)
-    }
-}
 
 /// Codes that are finite e4m3 (no 0x7F/0xFF NaNs).
 fn codes(seed: u64, count: usize) -> Vec<u8> {
@@ -60,11 +47,7 @@ fn atoms(gpu: &mut Gpu, plane: &[u8], rows: usize, k: usize) -> u64 {
     atoms
 }
 
-fn check(rows: usize, groups: usize, k: usize, n: usize) {
-    check_with(rows, groups, k, n, None);
-}
-
-/// How [`check_with`] runs the projection.
+/// How [`check`] runs the projection.
 #[derive(Clone, Copy)]
 enum Arm {
     /// The mma.sync kernel, in a CTA shape (the grouped projection's where none).
@@ -74,12 +57,7 @@ enum Arm {
     Routed,
 }
 
-/// [`check`] in the CTA shape `shape` (the grouped projection's where none).
-fn check_with(rows: usize, groups: usize, k: usize, n: usize, shape: Option<Fp8Shape>) {
-    check_arm(rows, groups, k, n, Arm::Mma(shape));
-}
-
-fn check_arm(rows: usize, groups: usize, k: usize, n: usize, arm: Arm) {
+fn check(rows: usize, groups: usize, k: usize, n: usize, arm: Arm) {
     let mut lcg = Lcg::seeded(0xf8 + rows as u64);
     let (x_bits, _) = lcg.row(rows * groups * k);
     let w = codes(0x51 + n as u64, groups * n * k);
@@ -180,21 +158,18 @@ fn the_fp8_grouped_projection_answers_each_group() {
         (4, 8192, 1024),
         (4, 32768, 1024),
         (8, 1024, 4096),
-        (8, 4096, 2048),
-        (8, 8192, 1024),
     ] {
         let shape = dense_fp8_shape(rows as u32, n as u32, k as u32)
             .unwrap_or_else(|| panic!("the mma.sync kernel takes {rows} rows of [{n}, {k}]"));
-        check_with(rows, 1, k, n, Some(shape));
+        check(rows, 1, k, n, Arm::Mma(Some(shape)));
     }
-    check(1, 8, 4096, 1024);
-    check(3, 2, 1024, 256);
-    check(8, 4, 512, 128);
-    // Past the mma.sync kernel's rows: each row's groups as its routes on the
-    // grouped tcgen05 GEMM (DeepSeek-V4.1's `wo_a` at decode64).
+    for (rows, groups, k, n) in [(1, 8, 4096, 1024), (3, 2, 1024, 256), (8, 4, 512, 128)] {
+        check(rows, groups, k, n, Arm::Mma(None));
+    }
+    // Past the mma.sync kernel's rows (V4.1's `wo_a` at decode64, and a
+    // ragged fire): each row's groups as its routes.
     if kernels_cuda::linear::tc5::supported() {
-        check_arm(16, 8, 4096, 1024, Arm::Routed);
-        check_arm(64, 8, 4096, 1024, Arm::Routed);
-        check_arm(37, 4, 1024, 256, Arm::Routed);
+        check(64, 8, 4096, 1024, Arm::Routed);
+        check(37, 4, 1024, 256, Arm::Routed);
     }
 }

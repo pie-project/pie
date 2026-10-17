@@ -1,5 +1,6 @@
 #![cfg(feature = "cuda")]
 
+use crate::common::tc5::{e2m1, e4m3};
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::moe::GroupSeat;
@@ -9,20 +10,13 @@ use kernels_cuda::tuning::Tuning;
 
 const GROUP: usize = 16;
 
-const E2M1: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
-];
-
-fn e4m3(b: u8) -> f32 {
-    let e = i32::from((b >> 3) & 0xF);
-    let m = f32::from(b & 7);
-    let v = if e == 0 {
-        m / 512.0
-    } else {
-        (1.0 + m / 8.0) * 2f32.powi(e - 7)
-    };
-    if b & 0x80 != 0 { -v } else { v }
-}
+/// The register-dequant MMA kernel on, and the MXFP4 e2m1-convert kernel,
+/// which an NVFP4 bank must not take.
+const MMA: Tuning = Tuning {
+    nvfp4_mma_until: 65_536,
+    mxfp4_cvt: true,
+    ..crate::common::TC5
+};
 
 struct Bank {
     codes: Vec<u8>,
@@ -50,8 +44,8 @@ fn bank(lcg: &mut Lcg, slabs: usize, n: usize, k: usize) -> Bank {
                 let b = byte();
                 let at = row * k / 2 + g * GROUP / 2 + j;
                 codes[at] = b;
-                dequant[row * k + g * GROUP + 2 * j] = E2M1[usize::from(b & 0xF)] * gain;
-                dequant[row * k + g * GROUP + 2 * j + 1] = E2M1[usize::from(b >> 4)] * gain;
+                dequant[row * k + g * GROUP + 2 * j] = e2m1(b & 0xF) * gain;
+                dequant[row * k + g * GROUP + 2 * j + 1] = e2m1(b >> 4) * gain;
             }
         }
     }
@@ -63,8 +57,8 @@ fn bank(lcg: &mut Lcg, slabs: usize, n: usize, k: usize) -> Bank {
     }
 }
 
-/// Each case on the old arm, on the tcgen05 one (where the device has it)
-/// and on the register-dequant MMA kernel.
+/// Each case on the old arm, on the tcgen05 one (where the device has it),
+/// on the register-dequant MMA kernel, and at B200's own decisions.
 #[allow(clippy::too_many_arguments)]
 fn routed(
     experts: usize,
@@ -75,17 +69,12 @@ fn routed(
     by_token: bool,
     seed: u64,
 ) {
-    let mma = Tuning {
-        nvfp4_mma_until: 65_536,
-        // As sm100 runs it: the MXFP4 e2m1-convert kernel on, which NVFP4 banks
-        // must not take.
-        mxfp4_cvt: true,
-        ..crate::common::TC5
-    };
-    // B200's own decisions too: the arm its profile picks (the e2m1-convert
-    // form must not take an NVFP4 bank).
-    let sm100 = crate::common::SM100;
-    for tuning in [Tuning::DEFAULT, crate::common::TC5, mma, sm100] {
+    for tuning in [
+        Tuning::DEFAULT,
+        crate::common::TC5,
+        MMA,
+        crate::common::SM100,
+    ] {
         routed_tuned(tuning, experts, n, k, tokens, top_k, by_token, seed);
     }
 }
@@ -180,11 +169,9 @@ fn dense(n: usize, k: usize, rows: usize, seed: u64) {
 
 fn verdict(rows: usize, n: usize, got: &[u16], want: impl Fn(usize, usize) -> f32) {
     let mut bad = 0usize;
-    let mut worst = 0f32;
     for row in 0..rows {
         for r in 0..n {
             let (g, w) = (from_bf16(got[row * n + r]), want(row, r));
-            worst = worst.max((g - w).abs() / w.abs().max(1.0));
             if !close(g, w) {
                 bad += 1;
                 if bad <= 5 {
@@ -196,25 +183,31 @@ fn verdict(rows: usize, n: usize, got: &[u16], want: impl Fn(usize, usize) -> f3
     assert_eq!(
         bad,
         0,
-        "{bad} of {} outputs differ from the dequantized dot (worst relative error {worst:.4})",
+        "{bad} of {} outputs differ from the dequantized dot",
         rows * n
     );
-    eprintln!("ok: worst relative error {worst:.5}");
 }
 
 #[test]
 fn the_nvfp4_select_answers_the_dequantized_dot_every_case() {
-    the_gate_up_leg_read_by_token_route_by_route();
-    the_down_leg_read_by_route_route_by_route();
-    a_wide_fire_takes_the_grouped_kernel_on_the_gate_up_leg();
-    a_wide_fire_takes_the_grouped_kernel_on_the_down_leg_with_a_ragged_row_tile();
-    a_dense_projection_answers_at_one_row_and_at_many();
-    the_register_dequant_gate_up_lands_its_swiglu(Tuning {
-        nvfp4_mma_until: 65_536,
-        // The MXFP4 e2m1-convert kernel on, which NVFP4 banks must not take.
-        mxfp4_cvt: true,
-        ..crate::common::TC5
-    });
+    // (experts, n, k, tokens, top_k, by_token): the gate-up leg read by
+    // token and the down leg by route, at decode widths and at a fire wide
+    // enough for the grouped kernel (the down leg's 200 rows a ragged tile).
+    for (i, (experts, n, k, tokens, top_k, by_token)) in [
+        (16, 1280, 2560, 3, 10, true),
+        (16, 2560, 640, 2, 10, false),
+        (16, 1280, 2560, 48, 10, true),
+        (16, 200, 640, 48, 10, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        routed(experts, n, k, tokens, top_k, by_token, 0x71 + i as u64);
+    }
+    // A dense projection at one row and at many.
+    dense(320, 2560, 1, 0x75);
+    dense(320, 2560, 7, 0x76);
+    the_register_dequant_gate_up_lands_its_swiglu(MMA);
     the_register_dequant_gate_up_lands_its_swiglu(crate::common::SM100);
 }
 
@@ -273,25 +266,4 @@ fn the_register_dequant_gate_up_lands_its_swiglu(tuning: Tuning) {
         g / (1.0 + (-g).exp()) * u
     };
     verdict(tokens * top_k, inter, &got, want);
-}
-
-fn the_gate_up_leg_read_by_token_route_by_route() {
-    routed(16, 1280, 2560, 3, 10, true, 0x71);
-}
-
-fn the_down_leg_read_by_route_route_by_route() {
-    routed(16, 2560, 640, 2, 10, false, 0x72);
-}
-
-fn a_wide_fire_takes_the_grouped_kernel_on_the_gate_up_leg() {
-    routed(16, 1280, 2560, 48, 10, true, 0x73);
-}
-
-fn a_wide_fire_takes_the_grouped_kernel_on_the_down_leg_with_a_ragged_row_tile() {
-    routed(16, 200, 640, 48, 10, false, 0x74);
-}
-
-fn a_dense_projection_answers_at_one_row_and_at_many() {
-    dense(320, 2560, 1, 0x75);
-    dense(320, 2560, 7, 0x76);
 }

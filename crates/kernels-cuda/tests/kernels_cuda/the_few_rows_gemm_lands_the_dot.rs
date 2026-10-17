@@ -3,11 +3,7 @@
 // The few-rows GEMM (`kernel.gemm.rows_m`), one launch for a decode's 2..=8
 // rows, lands each row's dot with every weight row and the bias as the
 // gemv lands it, at every K split it picks (wide N one warp a row, narrow N
-// eight warps a row) and ragged N. Paced beside cuBLAS at DeepSeek-V4-Flash's
-// narrow bf16 projections (ignored, a measurement):
-//
-//     cargo test -p kernels-cuda --features cuda --release --test kernels_cuda \
-//         the_few_rows_gemm_paces -- --ignored --nocapture
+// eight warps a row) and ragged N.
 
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use kernels_cuda::linear::gemm_rows_bf16;

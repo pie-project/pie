@@ -1,20 +1,10 @@
 #![cfg(feature = "cuda")]
 
+use crate::common::tc5::{e4m3, ue8m0};
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::layout_embed_e4m3::{embed_concat_e4m3, embed_concat_mxfp8};
 use kernels_cuda::tensor::Tensor;
-
-fn e4m3(b: u8) -> f32 {
-    let e = i32::from((b >> 3) & 0xF);
-    let m = f32::from(b & 7);
-    let v = if e == 0 {
-        m / 512.0
-    } else {
-        (1.0 + m / 8.0) * 2f32.powi(e - 7)
-    };
-    if b & 0x80 != 0 { -v } else { v }
-}
 
 #[test]
 fn the_e4m3_table_gather_widens_only_its_rows() {
@@ -72,7 +62,7 @@ fn mxfp8_gather_at(width: usize) {
                 0.0
             } else {
                 let at = id as usize * width + w;
-                e4m3(table[at]) * 2f32.powi(i32::from(exps[at / 32]) - 127)
+                e4m3(table[at]) * ue8m0(exps[at / 32])
             };
             assert_eq!(
                 from_bf16(got[slot * width + w]),

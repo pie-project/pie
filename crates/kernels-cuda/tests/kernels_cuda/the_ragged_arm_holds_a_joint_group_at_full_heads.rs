@@ -1,5 +1,6 @@
 #![cfg(feature = "cuda")]
 
+use crate::common::host_b::assert_near;
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn_dense;
@@ -50,53 +51,24 @@ fn against_dense(rows: u32, hd: u32, heads: u32, seed: u64) {
     .expect("the ragged arm fires");
     gpu.sync();
 
-    let want: Vec<u16> = gpu.down(o_dense, rows * width);
+    let want: Vec<f32> = gpu
+        .down::<u16>(o_dense, rows * width)
+        .into_iter()
+        .map(from_bf16)
+        .collect();
     let got: Vec<u16> = gpu.down(o_ragged, rows * width);
-    let mut worst = 0f32;
-    let mut worst_row = 0;
-    let mut bad_rows = 0;
-    for r in 0..rows {
-        let mut row_bad = false;
-        for c in 0..width {
-            let (g, w) = (
-                from_bf16(got[r * width + c]),
-                from_bf16(want[r * width + c]),
-            );
-            let err = (g - w).abs();
-            if err > TOLERANCE * w.abs().max(1.0) {
-                row_bad = true;
-            }
-            if err > worst {
-                worst = err;
-                worst_row = r;
-            }
-        }
-        bad_rows += usize::from(row_bad);
-    }
-    eprintln!(
-        "{rows} rows, {heads} heads of {hd}: worst |diff| {worst:.2e} at row {worst_row}, {bad_rows} rows past tolerance"
-    );
-    assert_eq!(
-        bad_rows, 0,
-        "{rows} rows, {heads} heads of {hd}: {bad_rows} rows disagree with the dense kernel (worst {worst:.2e} at row {worst_row})"
+    assert_near(
+        &got,
+        &want,
+        TOLERANCE,
+        &format!("{rows} rows, {heads} heads of {hd}"),
     );
 }
 
+/// One joint group of 512 + n rows at 24 full heads of 128.
 #[test]
 fn the_ragged_arm_holds_a_joint_group_at_full_heads_every_case() {
-    a_512_plus_4096_row_group_at_24_full_heads();
-    a_512_plus_1024_row_group_at_24_full_heads();
-    a_512_plus_2500_row_group_at_24_full_heads();
-}
-
-fn a_512_plus_4096_row_group_at_24_full_heads() {
-    against_dense(512 + 4096, 128, 24, 0x4608);
-}
-
-fn a_512_plus_1024_row_group_at_24_full_heads() {
-    against_dense(512 + 1024, 128, 24, 0x1536);
-}
-
-fn a_512_plus_2500_row_group_at_24_full_heads() {
-    against_dense(512 + 2500, 128, 24, 0x3012);
+    for (n, seed) in [(4096, 0x4608), (1024, 0x1536), (2500, 0x3012)] {
+        against_dense(512 + n, 128, 24, seed);
+    }
 }
