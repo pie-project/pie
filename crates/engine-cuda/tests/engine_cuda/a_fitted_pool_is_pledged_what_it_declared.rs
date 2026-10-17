@@ -52,7 +52,7 @@ fn container(snapshot: &Path) -> Option<PathBuf> {
 }
 
 fn device_bytes() -> (u64, u64) {
-    use cudarc::runtime::sys as rt;
+    use engine_cuda::device::rt;
 
     let (mut free, mut total) = (0usize, 0usize);
     // SAFETY: two live locals; the call only writes them.

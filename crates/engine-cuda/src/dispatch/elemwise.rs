@@ -193,6 +193,21 @@ impl Run<'_> {
                 *span,
                 &mut self.tensor(*y),
             ),
+            #[cfg(feature = "rocm")]
+            Fused::HcNormProject {
+                streams,
+                eps,
+                weight,
+                stream_count,
+                mixes,
+            } => elemwise::hc::norm_project(
+                self.ctx(),
+                self.tensor(*streams),
+                self.tensor(*weight),
+                *eps,
+                *stream_count,
+                &mut self.tensor(*mixes),
+            ),
             Fused::NormModulate {
                 x,
                 norm,
@@ -514,6 +529,9 @@ impl Run<'_> {
             } => (match form {
                 MropeForm::Interleaved => elemwise::rope_mrope::interleaved,
                 MropeForm::Blocked => elemwise::rope_mrope::blocked,
+                #[cfg(feature = "rocm")]
+                MropeForm::Split => elemwise::rope_mrope::split,
+                #[cfg(not(feature = "rocm"))]
                 MropeForm::Split => {
                     return Err(kernels_cuda::Error::Unsupported {
                         op: "elementwise.rope_mrope",

@@ -146,7 +146,7 @@ impl Lanes {
 
 #[cfg(feature = "cuda")]
 fn run_lane(device: i32, lane: &mut Lane, run: &[Transfer]) -> Result<()> {
-    use cudarc::runtime::sys as rt;
+    use crate::device::rt;
 
     if run.is_empty() {
         return Ok(());
@@ -190,7 +190,7 @@ fn run_lane(device: i32, lane: &mut Lane, run: &[Transfer]) -> Result<()> {
 
 #[cfg(feature = "cuda")]
 fn current_device() -> Result<i32> {
-    use cudarc::runtime::sys as rt;
+    use crate::device::rt;
 
     let mut ordinal: i32 = 0;
     // SAFETY: a live local out-parameter.
@@ -200,7 +200,7 @@ fn current_device() -> Result<i32> {
 
 #[cfg(feature = "cuda")]
 fn new_stream() -> Result<*mut c_void> {
-    use cudarc::runtime::sys as rt;
+    use crate::device::rt;
 
     let mut stream: rt::cudaStream_t = core::ptr::null_mut();
     // SAFETY: a live local out-parameter; the stream is this pool's and is
@@ -219,7 +219,7 @@ impl Drop for Lanes {
                 // SAFETY: handle from this module's own cudaStreamCreate,
                 // destroyed exactly once; every pump drained before returning.
                 unsafe {
-                    let _ = cudarc::runtime::sys::cudaStreamDestroy(lane.stream.cast());
+                    let _ = crate::device::rt::cudaStreamDestroy(lane.stream.cast());
                 }
             }
         }

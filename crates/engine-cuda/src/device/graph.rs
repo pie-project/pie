@@ -17,7 +17,7 @@ impl Graph {
     pub fn capture(stream: *mut c_void, body: impl FnOnce() -> Result<()>) -> Result<Graph> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             // SAFETY: `stream` is the shell's, live for the whole call, and
             // this thread is the one that bound the device.
@@ -66,7 +66,7 @@ impl Graph {
     pub fn debug_dot(&self, path: &str) -> bool {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
             let Ok(c_path) = std::ffi::CString::new(path) else {
                 return false;
             };
@@ -87,7 +87,7 @@ impl Graph {
     pub fn nodes(&self) -> Option<usize> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::driver::sys as dr;
+            use crate::device::dr;
 
             let mut count: usize = 0;
             // SAFETY: null node array + live count is the documented way to
@@ -108,7 +108,7 @@ impl Graph {
     pub fn edges(&self) -> Option<usize> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::driver::sys as dr;
+            use crate::device::dr;
 
             let mut count: usize = 0;
             // SAFETY: null endpoint/edge-data arrays + live count asks for
@@ -145,7 +145,7 @@ impl Graph {
     pub fn instantiate(&self, stream: *mut c_void) -> Result<GraphExec> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             let mut raw: rt::cudaGraphExec_t = core::ptr::null_mut();
             // SAFETY: `raw` is a live local; `self.raw` is this graph's
@@ -188,7 +188,7 @@ impl GraphExec {
             unsafe {
                 crate::device::ctx::check(
                     "cudaGraphLaunch",
-                    cudarc::runtime::sys::cudaGraphLaunch(self.raw.cast(), stream.cast()),
+                    crate::device::rt::cudaGraphLaunch(self.raw.cast(), stream.cast()),
                 )
             }
         }
@@ -217,7 +217,7 @@ impl Drop for Graph {
             // SAFETY: handle came from this graph's own capture, destroyed
             // once; an exec instantiated from it does not borrow it.
             unsafe {
-                let _ = cudarc::runtime::sys::cudaGraphDestroy(self.raw.cast());
+                let _ = crate::device::rt::cudaGraphDestroy(self.raw.cast());
             }
         }
     }
@@ -230,7 +230,7 @@ impl Drop for GraphExec {
             // SAFETY: destroyed once, and the shell synchronizes its stream
             // before it drops a cache entry (`record.rs`'s eviction).
             unsafe {
-                let _ = cudarc::runtime::sys::cudaGraphExecDestroy(self.raw.cast());
+                let _ = crate::device::rt::cudaGraphExecDestroy(self.raw.cast());
             }
         }
     }
@@ -246,7 +246,7 @@ impl Event {
     pub fn new() -> Result<Event> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
             let mut raw: rt::cudaEvent_t = core::ptr::null_mut();
             // SAFETY: `raw` is a live out-parameter and this thread bound the
             // device.
@@ -267,7 +267,7 @@ impl Event {
     pub fn timing() -> Result<Event> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
             let mut raw: rt::cudaEvent_t = core::ptr::null_mut();
             // SAFETY: `raw` is a live out-parameter; this thread bound the
             // device. Flag 0 is `cudaEventDefault` (timing enabled).
@@ -288,7 +288,7 @@ impl Event {
     pub fn done(&self) -> Result<bool> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
             // SAFETY: the handle is live and this crate created it.
             let status = unsafe { rt::cudaEventQuery(self.raw.cast()) };
             match status {
@@ -315,7 +315,7 @@ impl Event {
     pub fn settle(&self) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
             // SAFETY: the handle is live and this crate created it.
             let status = unsafe { rt::cudaEventSynchronize(self.raw.cast()) };
             if status != rt::cudaError::cudaSuccess {
@@ -339,7 +339,7 @@ impl Event {
             unsafe {
                 crate::device::ctx::check(
                     "cudaEventRecord",
-                    cudarc::runtime::sys::cudaEventRecord(self.raw.cast(), stream.cast()),
+                    crate::device::rt::cudaEventRecord(self.raw.cast(), stream.cast()),
                 )
             }
         }
@@ -357,7 +357,7 @@ impl Event {
             unsafe {
                 crate::device::ctx::check(
                     "cudaStreamWaitEvent",
-                    cudarc::runtime::sys::cudaStreamWaitEvent(stream.cast(), self.raw.cast(), 0),
+                    crate::device::rt::cudaStreamWaitEvent(stream.cast(), self.raw.cast(), 0),
                 )
             }
         }
@@ -376,7 +376,7 @@ impl Drop for Event {
             // SAFETY: created by this handle's `new`, destroyed once, and the
             // shell synchronizes before it tears a load down.
             unsafe {
-                let _ = cudarc::runtime::sys::cudaEventDestroy(self.raw.cast());
+                let _ = crate::device::rt::cudaEventDestroy(self.raw.cast());
             }
         }
     }

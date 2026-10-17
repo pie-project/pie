@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::ffi::c_void;
 
-use cudarc::runtime::sys as rt;
+use crate::device::rt;
 use kernels_cuda::linear::quant;
 use kernels_cuda::{Ctx, Tensor};
 use poem_ir::Dtype;

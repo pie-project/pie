@@ -23,6 +23,9 @@ pub struct Endpoint {
     predicted_head: AtomicU64,
     predicted_tail: AtomicU64,
     seeded: AtomicU32,
+    /// On ROCm, the pool this endpoint's memory returns to.
+    #[cfg(feature = "rocm")]
+    pooled: Option<pool::PoolKey>,
 }
 
 impl Endpoint {
@@ -49,14 +52,27 @@ impl Endpoint {
             ));
         }
         let cells = (wire_bytes as usize).saturating_mul(cap1 as usize);
-        let device_cells = match role {
-            HostRole::None => Some(Buffer::zeroed(cells.max(1))?),
-            _ => None,
+        #[cfg(feature = "rocm")]
+        let pooled = pool::key(matches!(role, HostRole::None), cells.max(1));
+        #[cfg(feature = "rocm")]
+        let held = pooled.and_then(pool::take);
+        #[cfg(not(feature = "rocm"))]
+        let held = None;
+        let (words, mirror, device_cells) = match held {
+            Some(held) => held,
+            None => (
+                Pinned::mapped(WORDS * size_of::<u64>())?,
+                Pinned::mapped(cells.max(1))?,
+                match role {
+                    HostRole::None => Some(Buffer::zeroed(cells.max(1))?),
+                    _ => None,
+                },
+            ),
         };
         Ok(Endpoint {
             role,
-            words: Pinned::mapped(WORDS * size_of::<u64>())?,
-            mirror: Pinned::mapped(cells.max(1))?,
+            words,
+            mirror,
             wire_bytes,
             cap1,
             device_cells,
@@ -64,6 +80,8 @@ impl Endpoint {
             predicted_tail: AtomicU64::new(0),
             attachments: AtomicU32::new(0),
             seeded: AtomicU32::new(0),
+            #[cfg(feature = "rocm")]
+            pooled,
         })
     }
 
@@ -241,3 +259,21 @@ impl Endpoint {
         }
     }
 }
+
+/// On ROCm a closed channel's memory goes back to the pool for the next of
+/// its shape rather than to the runtime (`device::hip::held::pool`).
+#[cfg(feature = "rocm")]
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        let Some(key) = self.pooled else {
+            return;
+        };
+        let words = core::mem::replace(&mut self.words, Pinned::empty());
+        let mirror = core::mem::replace(&mut self.mirror, Pinned::empty());
+        let cells = self.device_cells.take();
+        pool::give(key, (words, mirror, cells));
+    }
+}
+
+#[cfg(feature = "rocm")]
+use crate::device::hip::held::pool;

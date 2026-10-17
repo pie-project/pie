@@ -62,7 +62,7 @@ impl Arena {
         }
         #[cfg(feature = "cuda")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
             // SAFETY: `at..at + len` lies inside the committed prefix.
             unsafe {
                 crate::device::ctx::check(

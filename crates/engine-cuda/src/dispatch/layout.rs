@@ -64,6 +64,7 @@ impl Run<'_> {
                 vocab,
                 y,
             } => match self.maybe_planes(*table) {
+                #[cfg(not(feature = "rocm"))]
                 Some((codes, ..)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
                     Err(kernels_cuda::Error::Backend {
                         op: "layout.embed_concat",
@@ -72,8 +73,22 @@ impl Run<'_> {
                             .to_string(),
                     })
                 }
+                #[cfg(not(feature = "rocm"))]
                 Some((codes, scales, _, _)) if codes.dtype == poem_ir::Dtype::E4m3tensor => {
                     kernels_cuda::layout_embed_e4m3::embed_concat_e4m3(
+                        self.ctx(),
+                        self.tensor(*ids),
+                        codes,
+                        scales,
+                        *vocab,
+                        &mut self.tensor(*y),
+                    )
+                }
+                // On ROCm an MXFP8 table: e4m3 rows under an e8m0 exponent a
+                // 1x32 block.
+                #[cfg(feature = "rocm")]
+                Some((codes, scales, None, _)) => {
+                    kernels_cuda::layout_embed_concat::embed_concat_mxfp8(
                         self.ctx(),
                         self.tensor(*ids),
                         codes,

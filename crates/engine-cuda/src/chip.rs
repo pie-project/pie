@@ -1,5 +1,6 @@
 //! The GPU's profile: the CUDA registry, the facts this engine measures, the
-//! checked-in profiles, and resolution for one load.
+//! checked-in profiles, and resolution for one load. A ROCm build reads the
+//! same registry against AMD's chips: `cc` is the gfx version there.
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -10,7 +11,8 @@ use crate::{Graphs, Recording};
 
 /// What this engine measures about its GPU.
 pub const FACTS: &[Var] = &[
-    // Compute capability as major * 10 + minor: 89 is sm_89.
+    // Compute capability as major * 10 + minor: 89 is sm_89 (on ROCm the gfx
+    // version: 94 is gfx94x).
     Var::fixed("cc", Domain::COUNT),
     Var::fixed("sms", Domain::COUNT),
 ];
@@ -92,6 +94,13 @@ pub struct ForwardTokens(pub u32);
 #[decision(id = "engine.host_planes", flag, default = false, tune = engine)]
 pub struct HostPlanes;
 
+/// Rows from which the default bucket lattice takes four buckets a doubling
+/// whatever `engine.lattice_steps` says (a prefill's GEMMs run its bucket's
+/// rows); 0 never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.prefill_lattice_from", constant(range(0..=65536)), default = 0, tune = engine)]
+pub struct PrefillLatticeFrom(pub u32);
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
     kernels_cuda::tuning::register(&mut r);
@@ -103,9 +112,15 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<LatticeSteps>()
         .add::<StateSlotsPerLane>()
         .add::<ForwardTokens>()
-        .add::<HostPlanes>();
+        .add::<HostPlanes>()
+        .add::<PrefillLatticeFrom>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
+    #[cfg(not(feature = "rocm"))]
     poem_compiler::costs::register(&mut r, 2);
+    // HIP graphs have no conditional node: one is priced past any launch it
+    // could skip, so the compiler lowers every region to `AlwaysLaunch`.
+    #[cfg(feature = "rocm")]
+    poem_compiler::costs::register_for(&mut r, 2, poem_compiler::costs::Conditionals::Absent);
     r
 });
 
@@ -114,14 +129,31 @@ pub fn registry() -> &'static Registry {
     &REGISTRY
 }
 
+/// The checked-in profiles' directory: AMD's chips have their own.
+#[cfg(not(feature = "rocm"))]
+macro_rules! profiles {
+    () => {
+        "profiles"
+    };
+}
+#[cfg(feature = "rocm")]
+macro_rules! profiles {
+    () => {
+        "profiles-rocm"
+    };
+}
+
 macro_rules! seeded {
     ($($file:literal),* $(,)?) => {
         pub const SEEDED: &[(&str, &str)] = &[
-            $(($file, include_str!(concat!("../profiles/", $file)))),*
+            $(($file, include_str!(concat!("../", profiles!(), "/", $file)))),*
         ];
     };
 }
 
+#[cfg(feature = "rocm")]
+seeded!("gfx94.toml");
+#[cfg(not(feature = "rocm"))]
 seeded!(
     "sm80.toml",
     "sm86.toml",
@@ -162,6 +194,7 @@ pub struct Engine {
     pub state_slots_per_lane: u32,
     pub forward_tokens: u32,
     pub host_planes: bool,
+    pub prefill_lattice_from: u32,
 }
 
 impl Engine {
@@ -187,6 +220,7 @@ impl Engine {
             state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
             forward_tokens: profile.get::<ForwardTokens>().0,
             host_planes: profile.on::<HostPlanes>(&Anywhere),
+            prefill_lattice_from: profile.get::<PrefillLatticeFrom>().0,
         }
     }
 }
@@ -195,9 +229,31 @@ impl Engine {
 /// for `pie profile` and doctor. `None` without a CUDA runtime or device.
 #[must_use]
 pub fn probe(ordinal: i32) -> Option<(String, Facts)> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "rocm")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
+        if !crate::device::present() {
+            return None;
+        }
+        let attribute = |which| {
+            let mut value = 0i32;
+            // SAFETY: a live out-parameter.
+            let status = unsafe { rt::cudaDeviceGetAttribute(&raw mut value, which, ordinal) };
+            (status == rt::cudaError::cudaSuccess)
+                .then_some(value)
+                .and_then(|v| u32::try_from(v).ok())
+        };
+        let name = kernels_cuda::hip::device_name(u32::try_from(ordinal).ok()?)?;
+        let facts = facts(
+            attribute(rt::cudaDeviceAttr::cudaDevAttrComputeCapabilityMajor)?,
+            attribute(rt::cudaDeviceAttr::cudaDevAttrComputeCapabilityMinor)?,
+            attribute(rt::cudaDeviceAttr::cudaDevAttrMultiProcessorCount)?,
+        );
+        Some((name, facts))
+    }
+    #[cfg(all(feature = "cuda", not(feature = "rocm")))]
+    {
+        use crate::device::rt;
         // A box with no CUDA runtime has no GPU to name: cudarc panics on the
         // first call that loads the library, which `present` catches.
         if !crate::device::present() {
@@ -281,7 +337,7 @@ mod tests {
 
     #[test]
     fn the_checked_in_profiles_hold_together_and_each_family_names_its_tier() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(profiles!());
         SHELF
             .check(registry(), &dir)
             .unwrap_or_else(|e| panic!("{e}"));
@@ -296,14 +352,20 @@ mod tests {
                 .find(|(i, _)| FACTS[*i].name == "cc")
                 .map(|(_, cc)| *cc)
                 .expect("a family file assumes its compute capability");
+            let tier = if cfg!(feature = "rocm") {
+                format!("gfx{cc}")
+            } else {
+                format!("sm_{cc}")
+            };
             assert_eq!(
                 file.target.tier.as_deref(),
-                Some(format!("sm_{cc}").as_str()),
+                Some(tier.as_str()),
                 "{name}: the tier is the capability it assumes"
             );
         }
     }
 
+    #[cfg(not(feature = "rocm"))]
     use crate::DEFAULT_BODIES_MEGABYTES;
 
     #[test]
@@ -328,6 +390,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "rocm"))]
     #[test]
     fn each_capability_takes_its_family_and_from_10_0_the_blackwell_kernels() {
         let defaults = kernels_cuda::tuning::Tuning::of(&registry().defaults());
@@ -434,6 +497,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "rocm"))]
     #[test]
     fn a_capability_with_no_family_runs_the_defaults_untuned() {
         let (profile, report) = resolve("NVIDIA Next", &facts(13, 0, 200), None);
@@ -446,6 +510,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "rocm"))]
     #[test]
     fn the_defaults_are_what_cuda_ran_before_profiles() {
         let engine = Engine::of(&registry().defaults());
@@ -463,6 +528,7 @@ mod tests {
                 state_slots_per_lane: 0,
                 forward_tokens: 0,
                 host_planes: false,
+                prefill_lattice_from: 0,
             }
         );
         assert_eq!(
@@ -476,6 +542,7 @@ mod tests {
         assert_eq!(fused, shipped);
     }
 
+    #[cfg(not(feature = "rocm"))]
     #[test]
     fn the_b200_runs_its_family_measured_with_the_skinny_gemm_off() {
         let (b200, report) = resolve("NVIDIA B200", &facts(10, 0, 148), None);
@@ -529,6 +596,7 @@ mod tests {
 
     /// The two-launch gated delta scan is an sm_100 family decision; every
     /// other family keeps the three wmma launches it ran before.
+    #[cfg(not(feature = "rocm"))]
     #[test]
     fn only_the_sm100_family_runs_the_two_launch_gated_delta_scan() {
         for (name, major, minor, sms) in [("NVIDIA B200", 10, 0, 148), ("NVIDIA GB200", 10, 0, 152)]
@@ -558,6 +626,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "rocm"))]
     #[test]
     fn only_a_b200_runs_the_tcgen05_selects_and_glu_epilogues() {
         let tuning = |major, minor, sms| {
@@ -610,6 +679,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "rocm"))]
     #[test]
     fn the_l40s_runs_its_family_measured_and_another_ada_the_same_unmeasured() {
         let (l40s, report) = resolve("NVIDIA L40S", &facts(8, 9, 142), None);
@@ -648,19 +718,93 @@ mod tests {
     }
 }
 
+#[cfg(all(test, feature = "rocm"))]
+mod hip {
+    use super::*;
+
+    #[test]
+    fn a_cdna3_gpu_takes_its_family() {
+        for gpu in ["AMD Instinct MI300X", "AMD Instinct MI325X"] {
+            let (profile, report) = resolve(gpu, &facts(9, 4, 304), None);
+            assert_eq!(
+                report.layers,
+                [profile::Source::Seeded("gfx94.toml".into())],
+                "{gpu}"
+            );
+            assert!(report.untuned(), "{gpu}");
+            assert_eq!(
+                Engine::of(&profile),
+                Engine {
+                    forward_tokens: 10240,
+                    prefill_lattice_from: 2048,
+                    ..Engine::of(&registry().defaults())
+                }
+            );
+            // The defaults, but for the routed MLP's paths the family measured.
+            let mut want = kernels_cuda::tuning::Tuning::of(&registry().defaults());
+            want.moe_lt_grouped = true;
+            want.moe_lt_mlp_from = 128;
+            want.moe_lt_select_from = 0;
+            want.moe_lt_tile_deep = 256_192_064;
+            want.moe_lt_tile_shallow = 128_288_032;
+            want.moe_lt_deep_k = 2048;
+            want.moe_ordered_from = 256;
+            want.moe_mxfp4_order = true;
+            want.fp8_b32_order = true;
+            assert_eq!(kernels_cuda::tuning::Tuning::of(&profile), want, "{gpu}");
+        }
+    }
+
+    #[test]
+    fn a_gfx_version_with_no_family_runs_the_defaults_untuned() {
+        let (profile, report) = resolve("AMD Instinct Next", &facts(9, 6, 256), None);
+        assert_eq!(report.used, profile::Source::Defaults);
+        assert!(report.layers.is_empty());
+        assert!(report.untuned());
+        assert_eq!(
+            kernels_cuda::tuning::Tuning::of(&profile),
+            kernels_cuda::tuning::Tuning::of(&registry().defaults())
+        );
+    }
+
+    #[test]
+    fn the_defaults_price_conditionals_past_any_launch() {
+        // HIP graphs have no conditional node: one is priced past any launch
+        // it could skip, so the compiler lowers every region to AlwaysLaunch.
+        assert_eq!(
+            poem_compiler::DeviceProfile::of(&registry().defaults(), 132, &[], &[]),
+            poem_compiler::DeviceProfile {
+                cond_fixed_us: 1_000_000.0,
+                ..poem_compiler::DeviceProfile::default()
+            }
+        );
+        let mut fused = poem_compiler::fuse::flags::kernels(&registry().defaults());
+        let mut shipped = crate::FUSED.to_vec();
+        fused.sort_unstable();
+        shipped.sort_unstable();
+        assert_eq!(fused, shipped);
+    }
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod device {
     #[test]
     fn the_probe_reads_the_gpu_it_names() {
         let Some((name, facts)) = super::probe(0) else {
-            eprintln!("not asked: no CUDA device answers");
+            eprintln!("not asked: no device answers");
             return;
         };
         assert!(!name.is_empty(), "the driver names the GPU");
         let cc = facts.get("cc").expect("probed");
+        #[cfg(not(feature = "rocm"))]
         assert!(
             cc >= 80,
             "{name} is sm_{cc}: the CUDA engine serves sm_80 and newer"
+        );
+        #[cfg(feature = "rocm")]
+        assert!(
+            (90..100).contains(&cc),
+            "{name} is gfx{cc}: the ROCm engine serves CDNA (gfx9)"
         );
         assert!(facts.get("sms").is_some_and(|n| n > 0));
     }

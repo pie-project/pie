@@ -51,6 +51,9 @@ pub struct Session {
     poisoned: bool,
     fires: u64,
     commit: Pinned,
+    /// On ROCm, the pool the commit slot returns to.
+    #[cfg(feature = "rocm")]
+    commit_key: Option<crate::device::hip::held::pool::PoolKey>,
     pending: Option<Minted>,
     shadow: bool,
 }
@@ -86,6 +89,14 @@ impl Session {
         let rings = Rings::allocate(&shapes, endpoints)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
+        #[cfg(feature = "rocm")]
+        let commit_key = crate::device::hip::held::pool::commit_key(2 * size_of::<u32>());
+        #[cfg(feature = "rocm")]
+        let commit = match commit_key.and_then(crate::device::hip::held::pool::take) {
+            Some((commit, _, _)) => commit,
+            None => Pinned::mapped(2 * size_of::<u32>())?,
+        };
+        #[cfg(not(feature = "rocm"))]
         let commit = Pinned::mapped(2 * size_of::<u32>())?;
 
         let mut session = Session {
@@ -98,6 +109,8 @@ impl Session {
             poisoned: false,
             fires: 0,
             commit,
+            #[cfg(feature = "rocm")]
+            commit_key,
             pending: None,
             shadow,
         };
@@ -861,5 +874,16 @@ mod tests {
             text.contains("scratch") || text.contains("descriptors"),
             "and what would go wrong: {text}"
         );
+    }
+}
+
+/// On ROCm the commit slot goes back to the pool for the next session.
+#[cfg(feature = "rocm")]
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(key) = self.commit_key {
+            let commit = core::mem::replace(&mut self.commit, Pinned::empty());
+            crate::device::hip::held::pool::give(key, (commit, Pinned::empty(), None));
+        }
     }
 }

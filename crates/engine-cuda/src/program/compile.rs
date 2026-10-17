@@ -32,7 +32,12 @@ pub struct Target {
     pub major: i32,
     pub minor: i32,
     pub device: u64,
-    pub nvrtc: (i32, i32),
+    /// The runtime compiler's version, NVRTC's or hiprtc's: a compile also
+    /// reads its headers.
+    pub rtc: (i32, i32),
+    /// The device's architecture (`gfx942`), which hiprtc emits for.
+    #[cfg(feature = "rocm")]
+    pub arch: &'static str,
 }
 
 impl Target {
@@ -42,18 +47,58 @@ impl Target {
             major,
             minor,
             device: context.ordinal() as u64,
-            nvrtc: nvrtc_version()?,
+            rtc: rtc_version()?,
+            #[cfg(feature = "rocm")]
+            arch: kernels_cuda::jit::cache::arch(context.ordinal()).ok_or(Fault::Compile(
+                Failure::Retryable {
+                    reason: format!("device {} answered no gfx architecture", context.ordinal()),
+                },
+            ))?,
         })
     }
+
+    /// The architecture the runtime compiler emits for.
+    #[must_use]
+    pub fn architecture(&self) -> String {
+        #[cfg(not(feature = "rocm"))]
+        {
+            arch_flag(self.major, self.minor)
+        }
+        #[cfg(feature = "rocm")]
+        {
+            self.arch.to_string()
+        }
+    }
 }
+
+/// The codegen backend a fused region is emitted for.
+#[cfg(not(feature = "rocm"))]
+const BACKEND: Backend = Backend::Cuda;
+#[cfg(feature = "rocm")]
+const BACKEND: Backend = Backend::Hip;
 
 #[must_use]
 pub fn arch_flag(major: i32, minor: i32) -> String {
     format!("--gpu-architecture=sm_{major}{minor}")
 }
 
-pub fn nvrtc_version() -> Result<(i32, i32)> {
-    #[cfg(feature = "cuda")]
+pub fn rtc_version() -> Result<(i32, i32)> {
+    #[cfg(feature = "rocm")]
+    {
+        let api = kernels_cuda::hip::sys::api()
+            .map_err(|reason| Fault::Compile(Failure::Retryable { reason }))?;
+        let (mut major, mut minor) = (0, 0);
+        // SAFETY: both out-parameters are live `i32`s for the call's duration.
+        let status = unsafe { (api.rtc.hiprtcVersion)(&raw mut major, &raw mut minor) };
+        if status == kernels_cuda::hip::sys::HIPRTC_SUCCESS {
+            Ok((major, minor))
+        } else {
+            Err(Fault::Compile(Failure::Retryable {
+                reason: format!("cannot query hiprtc's version: it answered {status}"),
+            }))
+        }
+    }
+    #[cfg(all(feature = "cuda", not(feature = "rocm")))]
     {
         use cudarc::nvrtc::sys as nvrtc;
 
@@ -75,8 +120,33 @@ pub fn nvrtc_version() -> Result<(i32, i32)> {
     }
 }
 
+/// The options a region compiles under on ROCm: no contraction of a*b+c
+/// into an fma, so a region rounds as the host evaluator does.
+#[cfg(feature = "rocm")]
+const HIPRTC_OPTIONS: [&str; 3] = ["-std=c++17", "-O3", "-ffp-contract=off"];
+
 pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>, Failure> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "rocm")]
+    {
+        use kernels_cuda::hip::{self, CompileError};
+        match hip::compile(
+            "ptir_fused_region",
+            source,
+            architecture,
+            &HIPRTC_OPTIONS,
+            &[],
+        ) {
+            Ok(built) if built.code.is_empty() => Err(Failure::Retryable {
+                reason: "hiprtc produced an empty code object".into(),
+            }),
+            Ok(built) => Ok(built.code),
+            Err(CompileError::Rejected(log)) => Err(Failure::Deterministic {
+                reason: format!("hiprtc refused the emitted region: {log}"),
+            }),
+            Err(CompileError::Failed(reason)) => Err(Failure::Retryable { reason }),
+        }
+    }
+    #[cfg(all(feature = "cuda", not(feature = "rocm")))]
     {
         use cudarc::nvrtc::sys as nvrtc;
         use std::ffi::CString;
@@ -123,7 +193,7 @@ pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>,
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "rocm")))]
 fn compile_into(
     program: cudarc::nvrtc::sys::nvrtcProgram,
     architecture: &str,
@@ -186,7 +256,7 @@ fn compile_into(
     Ok(cubin)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "rocm")))]
 fn log(program: cudarc::nvrtc::sys::nvrtcProgram) -> String {
     use cudarc::nvrtc::sys as nvrtc;
 
@@ -208,7 +278,7 @@ fn log(program: cudarc::nvrtc::sys::nvrtcProgram) -> String {
         .to_string()
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "rocm")))]
 fn describe(status: cudarc::nvrtc::sys::nvrtcResult) -> String {
     // SAFETY: `nvrtcGetErrorString` returns a static string per enumerator;
     // null is checked anyway, in case a version mismatch hands back a code it
@@ -226,9 +296,9 @@ fn describe(status: cudarc::nvrtc::sys::nvrtcResult) -> String {
 #[derive(Debug)]
 pub struct Module {
     #[cfg(feature = "cuda")]
-    module: cudarc::driver::sys::CUmodule,
+    module: crate::device::dr::CUmodule,
     #[cfg(feature = "cuda")]
-    function: cudarc::driver::sys::CUfunction,
+    function: crate::device::dr::CUfunction,
     block_threads: u32,
     entry_name: String,
 }
@@ -248,7 +318,7 @@ impl Module {
         }
         #[cfg(feature = "cuda")]
         {
-            use cudarc::driver::sys as dr;
+            use crate::device::dr;
 
             let Ok(entry_c) = std::ffi::CString::new(entry_name) else {
                 return Err(Fault::program(
@@ -298,7 +368,7 @@ impl Module {
 
     #[cfg(feature = "cuda")]
     #[must_use]
-    pub const fn function(&self) -> cudarc::driver::sys::CUfunction {
+    pub const fn function(&self) -> crate::device::dr::CUfunction {
         self.function
     }
 
@@ -319,14 +389,14 @@ impl Drop for Module {
         if !self.module.is_null() {
             // SAFETY: loaded in `load`, dropped once. The return code is
             // ignored because a `Drop` has nowhere to report it.
-            unsafe { cudarc::driver::sys::cuModuleUnload(self.module) };
+            unsafe { crate::device::dr::cuModuleUnload(self.module) };
         }
     }
 }
 
 #[cfg(feature = "cuda")]
-fn launch_width(function: cudarc::driver::sys::CUfunction) -> u32 {
-    use cudarc::driver::sys as dr;
+fn launch_width(function: crate::device::dr::CUfunction) -> u32 {
+    use crate::device::dr;
 
     let mut max_threads = 0i32;
     // SAFETY: `max_threads` is a live out-parameter and `function` was just
@@ -591,7 +661,7 @@ impl Cache {
         }
 
         let program_identity = cache_identity(
-            Backend::Cuda,
+            BACKEND,
             target.device,
             combined_signature(&plan.package.plans),
             versions,
@@ -638,24 +708,20 @@ impl Cache {
                 duplicate.kind as u32, duplicate.stage, duplicate.region
             ),
         })?;
-        let architecture = arch_flag(target.major, target.minor);
+        let architecture = target.architecture();
 
         let mut stages = Vec::with_capacity(plan.package.plans.len());
         for (stage_index, stage_plan) in plan.package.plans.iter().enumerate() {
             let stage_index = u32::try_from(stage_index).map_err(|_| Failure::Deterministic {
                 reason: "a program with more than four billion stages is not a program".into(),
             })?;
-            let identity = cache_identity(
-                Backend::Cuda,
-                target.device,
-                stage_plan.signature_hash,
-                versions,
-            );
+            let identity =
+                cache_identity(BACKEND, target.device, stage_plan.signature_hash, versions);
             let key = fnv1a64_with(
                 identity.as_bytes(),
                 &[
-                    target.nvrtc.0.to_le_bytes().as_slice(),
-                    target.nvrtc.1.to_le_bytes().as_slice(),
+                    target.rtc.0.to_le_bytes().as_slice(),
+                    target.rtc.1.to_le_bytes().as_slice(),
                 ],
             );
             let (lookup, hit) = self.stages.lookup(key, stage_plan.identity);

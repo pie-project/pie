@@ -22,6 +22,12 @@ use super::{Boot, FireCost, Golden, Graphs, Shell};
 /// prefill chunk a frame, which serves, and under it the halving stops.
 const TOKENS_FLOOR: u32 = 1024;
 
+/// Where the kernels' compiled code lands under the cache directory.
+#[cfg(not(feature = "rocm"))]
+const CODE_DIR: &str = kernels_cuda::disk::CUBINS;
+#[cfg(feature = "rocm")]
+const CODE_DIR: &str = kernels_cuda::disk::CODE_OBJECTS;
+
 /// The recurrent-state slots a load holds when neither the config nor the
 /// chip's profile states them.
 const DEFAULT_STATE_SLOTS: u32 = 256;
@@ -82,6 +88,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         stated_buckets.clone(),
         boot.budget.max_tokens,
         engine.lattice_steps,
+        engine.prefill_lattice_from,
     );
 
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
@@ -91,13 +98,16 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         kernels.retain(|kernel| crate::UNCHAINED.contains(kernel));
     }
     boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), &kernels);
-    let tuning = kernels_cuda::tuning::Tuning::of(&chip);
-    boot.trace = crate::grouped_decode::rewrite_with(
-        boot.trace.clone(),
-        tuning.decode_grouped_prefill_from,
-        tuning.decode_grouped_prefill_lse,
-        kernels_cuda::attn::xqa::Gate::of(tuning),
-    );
+    #[cfg(not(feature = "rocm"))]
+    {
+        let tuning = kernels_cuda::tuning::Tuning::of(&chip);
+        boot.trace = crate::grouped_decode::rewrite_with(
+            boot.trace.clone(),
+            tuning.decode_grouped_prefill_from,
+            tuning.decode_grouped_prefill_lse,
+            kernels_cuda::attn::xqa::Gate::of(tuning),
+        );
+    }
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
@@ -141,7 +151,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         if !stated_buckets.is_empty() {
             buckets.push(tokens);
         }
-        budget.buckets = crate::api::lattice(buckets, tokens, engine.lattice_steps);
+        budget.buckets = crate::api::lattice(
+            buckets,
+            tokens,
+            engine.lattice_steps,
+            engine.prefill_lattice_from,
+        );
         budget
     };
     let asked_tokens = boot.budget.max_tokens;
@@ -305,7 +320,12 @@ fn refit(
             .filter(|bucket| *bucket < tokens)
             .collect();
         buckets.push(tokens);
-        budget.buckets = crate::api::lattice(buckets, tokens, engine.lattice_steps);
+        budget.buckets = crate::api::lattice(
+            buckets,
+            tokens,
+            engine.lattice_steps,
+            engine.prefill_lattice_from,
+        );
         budget
     };
     let budgets_at = |budget: &Budget| Budgets {
@@ -852,8 +872,7 @@ impl Shell {
                 cache
             },
             programs: ProgramPlane::new(crate::program::compile::Disk::rooted(
-                boot.cache_dir
-                    .map(|dir| dir.join(kernels_cuda::disk::CUBINS)),
+                boot.cache_dir.map(|dir| dir.join(CODE_DIR)),
             )),
             settlement: crate::settle::Settlement::open(boot.runahead.staging_depth())?,
             taps: Vec::new(),
@@ -941,6 +960,19 @@ impl Shell {
             })?;
             decoded = decoded.saturating_add(tile);
         }
+        // The tickets the fused launches draw, taken on every stream now:
+        // the bodies armed at load capture before any eager fire.
+        #[cfg(feature = "rocm")]
+        for ctx in core::iter::once(shell.device.ctx())
+            .chain(shell.device.side_ctx())
+            .chain(shell.device.conditional_ctx())
+        {
+            ctx.warm_tickets().map_err(|why| {
+                Fault::Residency(format!(
+                    "the fused launches' tickets would not allocate ({why})"
+                ))
+            })?;
+        }
         let held_for_fires = programs;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
@@ -982,9 +1014,22 @@ impl Shell {
             0
         };
         let resident = footprint(&shell);
-        let fitted = shell
-            .pools
-            .fit_the_card(bodies, held_for_fires, &resident)?;
+        // On ROCm, arming the tall buckets grows the kernels' scratch slabs
+        // (top-k scores, chunked-recurrence planes, attention partials) after
+        // this fit, by about the activation arena again at a 16K-token
+        // budget; held for them here, the cache rows leave the bodies the
+        // room they were allowed (GLM's mini armed 11 of 49 compositions
+        // without it, its prefill buckets walking eagerly).
+        let scratch_growth = if cfg!(feature = "rocm") && shell.records_bodies() {
+            shell.arena.bytes()
+        } else {
+            0
+        };
+        let fitted = shell.pools.fit_the_card(
+            bodies,
+            held_for_fires.saturating_add(scratch_growth),
+            &resident,
+        )?;
         if fitted.bodies < bodies {
             eprintln!(
                 "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
@@ -1132,6 +1177,7 @@ fn decoded_weight_planes(
                     row,
                     crate::run::WeightRow::Planes {
                         repacked: false,
+                        lanes: false,
                         ..
                     }
                 )
@@ -1176,10 +1222,12 @@ fn decoded_weight_planes(
             };
             let at_tokens = match &node.op {
                 // A low-precision product decodes no bf16 tile.
+                #[cfg(not(feature = "rocm"))]
                 poem_ir::Operation::Linear(
                     poem_ir::Linear::MatmulActQuant { .. }
                     | poem_ir::Linear::MoeMatmulSelectActQuant { .. },
                 ) => continue,
+                #[cfg(not(feature = "rocm"))]
                 poem_ir::Operation::Fused(
                     poem_ir::Fused::MoeSelectGlu { select, .. }
                     | poem_ir::Fused::MoeExperts { select, .. },
@@ -1214,6 +1262,29 @@ fn decoded_weight_planes(
                     if at_tokens {
                         slot.at_tokens = slot.at_tokens.max(bytes);
                     }
+                }
+            }
+            // On ROCm an fp8b128 projection is one dense e4m3 plane, decoded
+            // to bf16 for a prefill's GEMM like a split-plane one.
+            #[cfg(feature = "rocm")]
+            if let poem_ir::Operation::Linear(poem_ir::Linear::MatmulActQuant {
+                w,
+                scales: Some(_),
+                ..
+            }) = &node.op
+                && let Some(poem_ir::Ty::Tensor { shape, .. }) =
+                    trace.values.get(w.0 as usize).map(|decl| &decl.ty)
+            {
+                let bytes = shape
+                    .iter()
+                    .map(|dim| match dim {
+                        poem_ir::Dim::Const(n) => *n,
+                        _ => 1,
+                    })
+                    .fold(2u64, u64::saturating_mul);
+                slot.widest = slot.widest.max(bytes);
+                if at_tokens {
+                    slot.at_tokens = slot.at_tokens.max(bytes);
                 }
             }
         }

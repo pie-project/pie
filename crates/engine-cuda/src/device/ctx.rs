@@ -14,8 +14,8 @@ pub fn count() -> usize {
         }
         let mut count: i32 = 0;
         // SAFETY: a live local; the runtime is loaded (`present` said so).
-        let status = unsafe { cudarc::runtime::sys::cudaGetDeviceCount(&raw mut count) };
-        if status == cudarc::runtime::sys::cudaError::cudaSuccess {
+        let status = unsafe { crate::device::rt::cudaGetDeviceCount(&raw mut count) };
+        if status == crate::device::rt::cudaError::cudaSuccess {
             usize::try_from(count).unwrap_or(0)
         } else {
             0
@@ -36,13 +36,13 @@ pub fn present() -> bool {
         let probe = std::panic::catch_unwind(|| {
             let mut count: i32 = 0;
             // SAFETY: count is a live local, and this is the process's first cudarc call.
-            let status = unsafe { cudarc::runtime::sys::cudaGetDeviceCount(&raw mut count) };
+            let status = unsafe { crate::device::rt::cudaGetDeviceCount(&raw mut count) };
             (status, count)
         });
         std::panic::set_hook(hook);
         matches!(
             probe,
-            Ok((cudarc::runtime::sys::cudaError::cudaSuccess, count)) if count > 0
+            Ok((crate::device::rt::cudaError::cudaSuccess, count)) if count > 0
         )
     }
     #[cfg(not(feature = "cuda"))]
@@ -79,8 +79,8 @@ impl Context {
     pub fn bind(ordinal: i32, comm: Option<&crate::comm::Comm>) -> Result<Context> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::cublas::sys as blas;
-            use cudarc::runtime::sys as rt;
+            use crate::device::blas;
+            use crate::device::rt;
 
             // SAFETY: each call takes a live out-parameter and the handles
             // the prior calls produced. cudaSetDevice binds this thread.
@@ -88,11 +88,13 @@ impl Context {
                 check("cudaSetDevice", rt::cudaSetDevice(ordinal))?;
                 let mut stream: rt::cudaStream_t = core::ptr::null_mut();
                 check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
+                #[cfg(feature = "rocm")]
+                crate::device::hip::held::pool::adopt_stream(ordinal, stream.cast());
 
                 let mut handle: blas::cublasHandle_t = core::ptr::null_mut();
                 let status = blas::cublasCreate_v2(&raw mut handle);
                 if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                    rt::cudaStreamDestroy(stream);
+                    destroy_stream(ordinal, stream.cast());
                     return Err(Fault::Device {
                         call: "cublasCreate_v2",
                         code: status as i32,
@@ -101,7 +103,7 @@ impl Context {
                 let status = blas::cublasSetStream_v2(handle, stream.cast());
                 if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
                     blas::cublasDestroy_v2(handle);
-                    rt::cudaStreamDestroy(stream);
+                    destroy_stream(ordinal, stream.cast());
                     return Err(Fault::Device {
                         call: "cublasSetStream_v2",
                         code: status as i32,
@@ -112,7 +114,7 @@ impl Context {
                 let status = rt::cudaStreamCreateWithFlags(&raw mut notify, 1);
                 if status != rt::cudaError::cudaSuccess {
                     blas::cublasDestroy_v2(handle);
-                    rt::cudaStreamDestroy(stream);
+                    destroy_stream(ordinal, stream.cast());
                     return Err(Fault::Device {
                         call: "cudaStreamCreateWithFlags",
                         code: status as i32,
@@ -124,7 +126,10 @@ impl Context {
                 let cublas: *mut c_void = handle.cast();
                 let slabs = Slabs::open();
                 slabs.attach(stream);
+                #[cfg(not(feature = "rocm"))]
                 let ctx = Ctx::on(stream).with_cublas(cublas).with_slabs(slabs);
+                #[cfg(feature = "rocm")]
+                let ctx = Ctx::on(stream).with_blas(cublas).with_slabs(slabs);
                 // SAFETY: `comm` is the rank's live communicator, and its peer
                 // stages live as long, owned by the boot for as long as this
                 // shell fires on it.
@@ -141,10 +146,21 @@ impl Context {
                          capability or shared memory"
                     )));
                 };
+                #[cfg(not(feature = "rocm"))]
                 if device.cc_major < Device::FLOOR_MAJOR {
                     return Err(Fault::Unsupported(format!(
                         "device {ordinal} is compute capability {}.x; the CUDA engine serves \
                          sm_80 (Ampere) and newer",
+                        device.cc_major
+                    )));
+                }
+                // The kernels are wave64, and the prefill attention's bf16
+                // MFMA arrived with CDNA 2.
+                #[cfg(feature = "rocm")]
+                if device.cc_major != 9 {
+                    return Err(Fault::Unsupported(format!(
+                        "device {ordinal} is gfx{}; the ROCm engine serves CDNA (gfx9: MI200 \
+                         and MI300 series)",
                         device.cc_major
                     )));
                 }
@@ -195,7 +211,7 @@ impl Context {
     pub fn host_fn(&self, work: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             let carried: *mut Box<dyn FnOnce() + Send + 'static> = Box::into_raw(Box::new(work));
             // SAFETY: carried is a live leaked allocation, reclaimed exactly
@@ -245,8 +261,8 @@ impl Context {
 
     #[cfg(feature = "cuda")]
     fn open_side(&mut self) -> Result<Side> {
-        use cudarc::cublas::sys as blas;
-        use cudarc::runtime::sys as rt;
+        use crate::device::blas;
+        use crate::device::rt;
 
         // SAFETY: each call takes a live out-parameter, using handles the
         // prior calls produced; this thread bound the device.
@@ -277,8 +293,14 @@ impl Context {
             Ok(Side {
                 stream,
                 cublas,
+                #[cfg(not(feature = "rocm"))]
                 ctx: Ctx::on(stream)
                     .with_cublas(cublas)
+                    .with_slabs(self.slabs)
+                    .with_tuning(self.ctx.tuning()),
+                #[cfg(feature = "rocm")]
+                ctx: Ctx::on(stream)
+                    .with_blas(cublas)
                     .with_slabs(self.slabs)
                     .with_tuning(self.ctx.tuning()),
             })
@@ -371,11 +393,11 @@ impl Context {
             unsafe {
                 check(
                     "cudaStreamSynchronize",
-                    cudarc::runtime::sys::cudaStreamSynchronize(self.stream.cast()),
+                    crate::device::rt::cudaStreamSynchronize(self.stream.cast()),
                 )?;
                 check(
                     "cudaStreamSynchronize",
-                    cudarc::runtime::sys::cudaStreamSynchronize(self.notify.cast()),
+                    crate::device::rt::cudaStreamSynchronize(self.notify.cast()),
                 )
             }
         }
@@ -397,20 +419,20 @@ impl Drop for Context {
                 self.slabs.release();
                 for side in self.side.drain(..).chain(self.conditional.take()) {
                     if !side.cublas.is_null() {
-                        let _ = cudarc::cublas::sys::cublasDestroy_v2(side.cublas.cast());
+                        let _ = crate::device::blas::cublasDestroy_v2(side.cublas.cast());
                     }
                     if !side.stream.is_null() {
-                        let _ = cudarc::runtime::sys::cudaStreamDestroy(side.stream.cast());
+                        let _ = crate::device::rt::cudaStreamDestroy(side.stream.cast());
                     }
                 }
                 if !self.cublas.is_null() {
-                    let _ = cudarc::cublas::sys::cublasDestroy_v2(self.cublas.cast());
+                    let _ = crate::device::blas::cublasDestroy_v2(self.cublas.cast());
                 }
                 if !self.stream.is_null() {
-                    let _ = cudarc::runtime::sys::cudaStreamDestroy(self.stream.cast());
+                    destroy_stream(self.ordinal, self.stream);
                 }
                 if !self.notify.is_null() {
-                    let _ = cudarc::runtime::sys::cudaStreamDestroy(self.notify.cast());
+                    let _ = crate::device::rt::cudaStreamDestroy(self.notify.cast());
                 }
             }
         }
@@ -441,7 +463,7 @@ impl std::fmt::Debug for Context {
 fn capability(ordinal: i32) -> (i32, i32) {
     #[cfg(feature = "cuda")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         let attribute = |which: rt::cudaDeviceAttr| -> i32 {
             let mut value = 0i32;
@@ -474,7 +496,7 @@ pub fn current() -> Result<i32> {
         unsafe {
             check(
                 "cudaGetDevice",
-                cudarc::runtime::sys::cudaGetDevice(&raw mut ordinal),
+                crate::device::rt::cudaGetDevice(&raw mut ordinal),
             )?;
         }
         Ok(ordinal)
@@ -489,12 +511,7 @@ pub fn bind_thread(ordinal: i32) -> Result<()> {
     #[cfg(feature = "cuda")]
     {
         // SAFETY: an ordinal the runtime itself answered with.
-        unsafe {
-            check(
-                "cudaSetDevice",
-                cudarc::runtime::sys::cudaSetDevice(ordinal),
-            )
-        }
+        unsafe { check("cudaSetDevice", crate::device::rt::cudaSetDevice(ordinal)) }
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -510,7 +527,7 @@ pub fn sync(stream: *mut c_void) -> Result<()> {
         unsafe {
             check(
                 "cudaStreamSynchronize",
-                cudarc::runtime::sys::cudaStreamSynchronize(stream.cast()),
+                crate::device::rt::cudaStreamSynchronize(stream.cast()),
             )
         }
     }
@@ -521,9 +538,30 @@ pub fn sync(stream: *mut c_void) -> Result<()> {
     }
 }
 
+/// Destroys a context's compute stream; on ROCm, out of the reach of the
+/// memory held behind it first.
+///
+/// # Safety
+///
+/// `stream` is a live stream nothing launches on again.
 #[cfg(feature = "cuda")]
-pub(crate) fn check(call: &'static str, status: cudarc::runtime::sys::cudaError) -> Result<()> {
-    if status == cudarc::runtime::sys::cudaError::cudaSuccess {
+unsafe fn destroy_stream(ordinal: i32, stream: *mut c_void) {
+    #[cfg(feature = "rocm")]
+    crate::device::hip::held::pool::retire_stream(ordinal, stream, || {
+        // SAFETY: as the caller promises.
+        let _ = unsafe { crate::device::rt::cudaStreamDestroy(stream.cast()) };
+    });
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = ordinal;
+        // SAFETY: as the caller promises.
+        let _ = unsafe { crate::device::rt::cudaStreamDestroy(stream.cast()) };
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn check(call: &'static str, status: crate::device::rt::cudaError) -> Result<()> {
+    if status == crate::device::rt::cudaError::cudaSuccess {
         Ok(())
     } else {
         Err(Fault::Device {

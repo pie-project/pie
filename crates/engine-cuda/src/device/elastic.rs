@@ -8,6 +8,21 @@ const HANDLES_PER_ARENA: u64 = 256;
 
 const SAFETY_FLOOR_BYTES: u64 = 128 * 1024 * 1024;
 
+/// The handle a flat arena's units carry: they are backed by the arena's
+/// one allocation, and own nothing to release.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const FLAT: u64 = u64::MAX;
+
+/// Whether arenas map pages on demand through the virtual memory API, or
+/// each is backed flat by one allocation on its first commit. ROCm backs
+/// them flat: on some runtime and kernel driver pairs `hipMemSetAccess`
+/// blocks forever rather than failing, which no probe can tell from a slow
+/// call. A flat arena gives nothing back until it drops.
+#[must_use]
+pub const fn mapped_on_demand() -> bool {
+    !cfg!(feature = "rocm")
+}
+
 #[must_use]
 pub const fn safety_floor_bytes(total: u64) -> u64 {
     let tenth = total / 10;
@@ -70,7 +85,7 @@ impl PhysicalPool {
     pub fn open(device: i32, utilization: f64) -> Result<PhysicalPool> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             let granularity = allocation_granularity(device)?;
             let (mut free, mut total) = (0usize, 0usize);
@@ -150,7 +165,7 @@ impl PhysicalPool {
     pub fn spare_bytes(&self, reserve: u64) -> Result<u64> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             let (mut free, mut total) = (0usize, 0usize);
             // SAFETY: two live locals; the call only writes them.
@@ -228,7 +243,7 @@ impl PhysicalPool {
     pub fn recalibrate(&mut self) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             let (mut free, mut total) = (0usize, 0usize);
             // SAFETY: two live locals; the call only writes them.
@@ -253,7 +268,7 @@ impl PhysicalPool {
     fn acquire_handle(&self, bytes: u64) -> Result<u64> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::driver::sys as dr;
+            use crate::device::dr;
 
             let prop = allocation_prop(self.device);
             let mut handle: dr::CUmemGenericAllocationHandle = 0;
@@ -274,7 +289,7 @@ impl PhysicalPool {
     fn release_handle(&self, handle: u64) {
         #[cfg(feature = "cuda")]
         if handle != 0 {
-            use cudarc::driver::sys as dr;
+            use crate::device::dr;
 
             // SAFETY: the handle came from this pool's own `cuMemCreate` and
             // is released exactly once.
@@ -300,6 +315,9 @@ pub struct Arena {
     mapped: u64,
     cached: Vec<u64>,
     high_water: u64,
+    /// Backed flat (one allocation of `virtual_bytes`, made on the first
+    /// commit) rather than mapped unit by unit.
+    flat: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -338,7 +356,14 @@ pub fn map_unit_for(max_bytes: u64, granularity: u64, handle_bytes: u64) -> u64 
 
 impl Arena {
     pub fn reserve(pool: &PhysicalPool, max_bytes: u64, label: &'static str) -> Result<Arena> {
-        let map_unit = map_unit_for(max_bytes, pool.granularity, pool.handle_bytes);
+        // A flat arena maps nothing, so its unit is only the pool's page: the
+        // whole range is allocated at once, and a coarser unit would round
+        // every arena up past what the fit priced it at.
+        let map_unit = if mapped_on_demand() {
+            map_unit_for(max_bytes, pool.granularity, pool.handle_bytes)
+        } else {
+            LOGICAL_PAGE_BYTES
+        };
         let virtual_bytes = align_up(max_bytes, map_unit);
         if virtual_bytes == 0 {
             return Ok(Arena {
@@ -351,11 +376,26 @@ impl Arena {
                 mapped: 0,
                 cached: Vec::new(),
                 high_water: 0,
+                flat: !mapped_on_demand(),
+            });
+        }
+        if !mapped_on_demand() {
+            return Ok(Arena {
+                label,
+                base: 0,
+                max_bytes,
+                virtual_bytes,
+                map_unit,
+                units: vec![None; (virtual_bytes / map_unit) as usize],
+                mapped: 0,
+                cached: Vec::new(),
+                high_water: 0,
+                flat: true,
             });
         }
         #[cfg(feature = "cuda")]
         {
-            use cudarc::driver::sys as dr;
+            use crate::device::dr;
 
             let mut base: dr::CUdeviceptr = 0;
             // SAFETY: `base` is a live local; the range is this arena's own
@@ -380,6 +420,7 @@ impl Arena {
                 mapped: 0,
                 cached: Vec::new(),
                 high_water: 0,
+                flat: false,
             })
         }
         #[cfg(not(feature = "cuda"))]
@@ -450,17 +491,64 @@ impl Arena {
     fn unbacked(&self, u: usize) -> bool {
         self.units.get(u).is_none_or(Option::is_none)
     }
+    /// The units committing `units` backs anew: the unbacked ones, or for a
+    /// flat arena not yet allocated, every unit it has (one allocation backs
+    /// them all) and none after.
+    fn fresh_count(&self, units: &[usize]) -> u64 {
+        if self.flat {
+            let wants = units.iter().any(|&u| self.unbacked(u));
+            return if wants && self.base == 0 {
+                self.units.len() as u64
+            } else {
+                0
+            };
+        }
+        units.iter().filter(|&&u| self.unbacked(u)).count() as u64
+    }
     fn target_bytes_of(&self, units: &[usize]) -> u64 {
-        let fresh = units.iter().filter(|&&u| self.unbacked(u)).count() as u64;
-        self.committed_bytes() + fresh * self.map_unit
+        self.committed_bytes() + self.fresh_count(units) * self.map_unit
     }
     fn growth_pages(&self, units: &[usize]) -> u64 {
-        let fresh = units.iter().filter(|&&u| self.unbacked(u)).count() as u64;
-        let fresh = fresh.saturating_sub(self.cached.len() as u64);
+        let fresh = self
+            .fresh_count(units)
+            .saturating_sub(self.cached.len() as u64);
         pages_for_bytes(fresh * self.map_unit)
     }
 
+    /// A flat arena's one allocation, backing every unit.
+    fn grow_flat(&mut self) -> Result<()> {
+        if self.base != 0 {
+            return Ok(());
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use crate::device::rt;
+
+            let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
+            // SAFETY: a live out-parameter; freed exactly once, in `Drop`.
+            crate::device::ctx::check("cudaMalloc", unsafe {
+                rt::cudaMalloc(&raw mut base, self.virtual_bytes as usize)
+            })?;
+            self.base = base as u64;
+            self.units.fill(Some(FLAT));
+            self.mapped = self.units.len() as u64;
+            self.high_water = self.high_water.max(self.committed_bytes());
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Err(Fault::Runtimeless)
+        }
+    }
+
     fn grow(&mut self, pool: &PhysicalPool, units: &[usize]) -> Result<()> {
+        if self.flat {
+            return if units.iter().any(|&u| self.unbacked(u)) {
+                self.grow_flat()
+            } else {
+                Ok(())
+            };
+        }
         let cached_before = self.cached.len();
         let mut fresh: Vec<usize> = Vec::new();
         for &unit in units {
@@ -502,7 +590,7 @@ impl Arena {
     fn map(&self, pool: &PhysicalPool, at: u64, handle: u64) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::driver::sys as dr;
+            use crate::device::dr;
 
             // SAFETY: `at` is inside this arena's own reserved range and is
             // not currently mapped; `handle` is this pool's own allocation of
@@ -530,6 +618,21 @@ impl Arena {
     }
 
     fn rollback(&mut self, pool: &PhysicalPool, fresh: &[usize], cached_goal: usize) {
+        if self.flat {
+            // `fresh` is non-empty only when this commit made the allocation.
+            if !fresh.is_empty() && self.base != 0 {
+                #[cfg(feature = "cuda")]
+                // SAFETY: the allocation `grow_flat` just made, freed once.
+                unsafe {
+                    let _ = crate::device::rt::cudaFree(self.base as *mut core::ffi::c_void);
+                }
+                self.base = 0;
+                self.units.iter_mut().for_each(|unit| *unit = None);
+                self.mapped = 0;
+            }
+            let _ = (pool, cached_goal);
+            return;
+        }
         for &unit in fresh.iter().rev() {
             let Some(handle) = self.units.get_mut(unit).and_then(Option::take) else {
                 continue;
@@ -544,6 +647,11 @@ impl Arena {
         }
     }
     pub fn release_outside(&mut self, pool: &mut PhysicalPool, want: &Want) -> u64 {
+        if self.flat {
+            // One allocation backs every unit: none goes back before the arena.
+            let _ = (pool, want);
+            return 0;
+        }
         let keep = self.units_of(want);
         let cache_goal = usize::from(keep.len() >= 2);
         let mut released = 0u64;
@@ -579,7 +687,7 @@ impl Arena {
     fn unmap(&self, at: u64) {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::driver::sys as dr;
+            use crate::device::dr;
 
             // SAFETY: `at` is a range this arena mapped and has not unmapped.
             unsafe {
@@ -614,8 +722,17 @@ impl Drop for Arena {
     fn drop(&mut self) {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::driver::sys as dr;
+            use crate::device::dr;
 
+            if self.flat {
+                if self.base != 0 {
+                    // SAFETY: the flat arena's one allocation, freed once.
+                    unsafe {
+                        let _ = crate::device::rt::cudaFree(self.base as *mut core::ffi::c_void);
+                    }
+                }
+                return;
+            }
             for unit in 0..self.units.len() {
                 let Some(handle) = self.units[unit].take() else {
                     continue;
@@ -726,7 +843,7 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
 /// that may be spinning in a collective (#745). Held for the process's life.
 #[cfg(feature = "cuda")]
 pub fn shared(device: i32, readers: &[i32], bytes: u64) -> Result<u64> {
-    use cudarc::driver::sys as dr;
+    use crate::device::dr;
 
     let granularity = allocation_granularity(device)?;
     let bytes = align_up(bytes, granularity) as usize;
@@ -758,8 +875,8 @@ pub fn shared(device: i32, readers: &[i32], bytes: u64) -> Result<u64> {
 }
 
 #[cfg(feature = "cuda")]
-fn said(call: &'static str, code: cudarc::driver::sys::CUresult) -> Result<()> {
-    if code == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+fn said(call: &'static str, code: crate::device::dr::CUresult) -> Result<()> {
+    if code == crate::device::dr::CUresult::CUDA_SUCCESS {
         Ok(())
     } else {
         Err(Fault::Device {
@@ -770,8 +887,8 @@ fn said(call: &'static str, code: cudarc::driver::sys::CUresult) -> Result<()> {
 }
 
 #[cfg(feature = "cuda")]
-fn allocation_prop(device: i32) -> cudarc::driver::sys::CUmemAllocationProp {
-    use cudarc::driver::sys as dr;
+fn allocation_prop(device: i32) -> crate::device::dr::CUmemAllocationProp {
+    use crate::device::dr;
 
     let mut prop: dr::CUmemAllocationProp = unsafe { core::mem::zeroed() };
     prop.type_ = dr::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -781,8 +898,8 @@ fn allocation_prop(device: i32) -> cudarc::driver::sys::CUmemAllocationProp {
 }
 
 #[cfg(feature = "cuda")]
-fn access_desc(device: i32) -> cudarc::driver::sys::CUmemAccessDesc {
-    use cudarc::driver::sys as dr;
+fn access_desc(device: i32) -> crate::device::dr::CUmemAccessDesc {
+    use crate::device::dr;
 
     let mut desc: dr::CUmemAccessDesc = unsafe { core::mem::zeroed() };
     desc.location.type_ = dr::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
@@ -793,7 +910,7 @@ fn access_desc(device: i32) -> cudarc::driver::sys::CUmemAccessDesc {
 
 #[cfg(feature = "cuda")]
 fn allocation_granularity(device: i32) -> Result<u64> {
-    use cudarc::driver::sys as dr;
+    use crate::device::dr;
 
     let prop = allocation_prop(device);
     let mut granularity: usize = 0;

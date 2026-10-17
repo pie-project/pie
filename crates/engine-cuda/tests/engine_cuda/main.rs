@@ -1,5 +1,9 @@
 //! engine-cuda's integration tests, one binary: each module was a test file.
 
+// On ROCm the engine's kernels are kernels-rocm's, under kernels-cuda's name.
+#[cfg(feature = "rocm")]
+extern crate kernels_rocm as kernels_cuda;
+
 #[cfg(feature = "cuda")]
 mod common_dit;
 #[cfg(feature = "cuda")]
@@ -11,6 +15,7 @@ mod common_vae;
 
 mod a_bank_says_which_site_it_corrects;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
+mod a_buffer_frees_after_another_context_closes;
 mod a_buffered_fold_is_the_fold_it_replaces;
 mod a_channel_fed_voxel_port_lands_the_committed_cell;
 mod a_context_port_merged_into_the_stream_lands_its_rows;
@@ -25,7 +30,9 @@ mod a_fused_geglu_reads_its_affine_bank_as_planes;
 mod a_fused_swiglu_sizes_the_decoded_tile_to_its_packed_plane;
 mod a_group_with_two_reference_lanes_keeps_each_to_itself;
 mod a_grouped_window_is_one_window_and_a_segment_list;
+mod a_lane_sampler_draws_what_the_interpreter_draws;
 mod a_missing_or_misshapen_port_feed_is_refused_by_name;
+mod a_nucleus_cut_agrees_with_the_host_interpreter;
 mod a_prefill_past_the_gemvs_grid_is_served;
 mod a_regions_own_values_outlive_its_last_pass;
 mod a_repacked_projection_serves_what_the_row_major_one_serves;

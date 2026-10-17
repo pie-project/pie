@@ -1,5 +1,7 @@
 #[cfg(feature = "cuda")]
 pub mod arena;
+#[cfg(feature = "rocm")]
+mod hip;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -170,14 +172,18 @@ pub fn prospect(
         .enumerate()
         .map(|(at, param)| (param.name.as_str(), at))
         .collect();
-    let planes = attachments(&landing, &index)?;
+    let planes = attachments(&landing, trace, &index)?;
     let ranking = crate::experts::Ranking::of(trace, &planes)?;
     Ok(Prospect { ranking, planes })
 }
 
-fn attachments(landing: &LoadPlan, index: &BTreeMap<&str, usize>) -> Result<Attachments> {
+fn attachments(
+    landing: &LoadPlan,
+    trace: &Trace,
+    index: &BTreeMap<&str, usize>,
+) -> Result<Attachments> {
     let mut planes = Attachments::new();
-    for (name, pairing) in pairings(landing, index)? {
+    for (name, pairing) in pairings(landing, trace, index)? {
         let Some(&at) = index.get(name) else {
             continue;
         };
@@ -628,6 +634,7 @@ struct Pairing {
 
 fn pairings<'a>(
     landing: &'a LoadPlan,
+    trace: &'a Trace,
     index: &BTreeMap<&str, usize>,
 ) -> Result<BTreeMap<&'a str, Pairing>> {
     let named: BTreeMap<u32, &str> = landing
@@ -664,7 +671,18 @@ fn pairings<'a>(
                 "is an affine bank whose zero points this plan does not publish as a \
                  param of their own",
             )?),
+            #[cfg(feature = "rocm")]
+            ScaleForm::E4m3TensorScaled | ScaleForm::F32Tensor => {
+                return Err(Fault::Param {
+                    name: (*name).to_string(),
+                    why: "is an NVFP4 plane (e4m3 scales under f32 tensor scales) or a \
+                          per-tensor e4m3 table, which rocm has no products for; serve a \
+                          bf16, u4g64 or mxfp4 deployment of this model",
+                });
+            }
+            #[cfg(not(feature = "rocm"))]
             ScaleForm::F32Tensor => None,
+            #[cfg(not(feature = "rocm"))]
             ScaleForm::E4m3TensorScaled => Some(row(
                 attachment.zero_point_tensor.ok_or_else(|| Fault::Param {
                     name: (*name).to_string(),
@@ -696,6 +714,10 @@ fn pairings<'a>(
             },
         );
     }
+    #[cfg(feature = "rocm")]
+    hip::pair_by_name(trace, index, &mut out);
+    #[cfg(not(feature = "rocm"))]
+    let _ = trace;
     Ok(out)
 }
 
@@ -827,7 +849,7 @@ impl Weights {
             arm_refill(tier);
         }
 
-        let pairings = pairings(&landing, &index)?;
+        let pairings = pairings(&landing, trace, &index)?;
 
         let mut table = Vec::with_capacity(places.len());
         let mut decoded: Vec<Buffer> = Vec::new();
@@ -876,6 +898,7 @@ impl Weights {
                 Some(pairing) => WeightRow::Planes {
                     repacked: place.dtype == Dtype::U4g64tiled,
                     atoms: false,
+                    lanes: false,
                     codes: packed(experts.as_ref(), &store, &places, at)?,
                     scales: packed(experts.as_ref(), &store, &places, pairing.scales)?,
                     biases: match pairing.biases {
@@ -909,10 +932,17 @@ impl Weights {
             };
             table.push(Some(row));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", not(feature = "rocm")))]
         lay_atoms(trace, &mut table, stream)?;
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", not(feature = "rocm")))]
         lay_block_atoms(trace, &mut table, &mut decoded, stream)?;
+        #[cfg(feature = "rocm")]
+        {
+            let tier = experts.as_ref();
+            hip::canonical_fp8(trace, &index, &places, &store, tier, stream)?;
+            hip::order_mxfp4_banks(trace, &places, &store, tier, &pairings, &mut table, stream)?;
+            hip::order_fp8b32_planes(trace, &places, &store, tier, &mut table, stream)?;
+        }
         if let Some(tier) = experts.as_mut() {
             let slabs: Vec<u64> = tier
                 .plan()
@@ -1359,7 +1389,7 @@ mod tests {
 
 /// The banks a low-precision product reads, and the K a scale of each covers:
 /// their scales are read only by that product, which takes them in atoms.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "rocm")))]
 fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
     use poem_ir::{Def, Fused, Linear, Operation};
     let lowp = |op: &Linear| match op {
@@ -1402,7 +1432,7 @@ fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
 /// whose rows' scales are whole atoms of four, where the atoms take the
 /// bytes the row-major plane does. A bank this cannot lay keeps its
 /// row-major scales, and its product refuses it.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "rocm")))]
 fn lay_atoms(
     trace: &Trace,
     table: &mut [Option<WeightRow>],
@@ -1485,7 +1515,7 @@ fn lay_atoms(
 /// atoms, one row of them a weight row, in a buffer of their own (the atoms
 /// are 128 times the plane), bound in the plane's place as raw bytes: a
 /// low-precision projection reads a `u8` scale plane as laid.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "rocm")))]
 fn lay_block_atoms(
     trace: &Trace,
     table: &mut [Option<WeightRow>],

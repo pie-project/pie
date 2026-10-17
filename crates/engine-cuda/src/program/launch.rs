@@ -36,9 +36,7 @@ const LANE_SAMPLER_ARENA: u64 = 64 + 2 * 24_576 + 2 * 512 * 8;
 pub fn lane_sampler(kind: RegionKind) -> bool {
     matches!(
         kind,
-        RegionKind::Library(
-            LibraryOp::NucleusSample | LibraryOp::RankSample | LibraryOp::LaneCut
-        )
+        RegionKind::Library(LibraryOp::NucleusSample | LibraryOp::RankSample | LibraryOp::LaneCut)
     )
 }
 
@@ -873,7 +871,11 @@ impl Prepared {
         let temporary_bytes = u32::try_from(scratch_layout.temporary_bytes)
             .map_err(|_| Fault::program("program::launch", "a temporary arena past a u32"))?;
         let region_rows = region_rows(plan, &descriptors);
-        let samplers = plan.fused.iter().map(|region| lane_sampler(region.kind)).collect();
+        let samplers = plan
+            .fused
+            .iter()
+            .map(|region| lane_sampler(region.kind))
+            .collect();
 
         let mut records = Vec::with_capacity(plan.ops.len());
         let mut result_base = 0u32;
@@ -1412,7 +1414,7 @@ impl Prepared {
     fn zero_barriers(&self, stream: *mut core::ffi::c_void) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::driver::sys as dr;
+            use crate::device::dr;
             // SAFETY: the scratch holds `filled` lanes `scratch_stride` apart,
             // each with its temporary arena at `temporary_offset`.
             let code = unsafe {
@@ -1456,7 +1458,7 @@ fn device_units() -> u32 {
     *UNITS.get_or_init(|| {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::driver::sys as dr;
+            use crate::device::dr;
             let mut device: dr::CUdevice = 0;
             let mut count: core::ffi::c_int = 0;
             // SAFETY: out-parameters for the current context's device.
@@ -1511,7 +1513,7 @@ pub fn launch(
     }
     #[cfg(feature = "cuda")]
     {
-        use cudarc::driver::sys as dr;
+        use crate::device::dr;
 
         // SAFETY: the function is live for this borrow, and `args` holds every
         // scalar the pointer array points at for the duration of the call.

@@ -18,6 +18,7 @@ libc = "0.2"
 serde_json = "1"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 kernels-cuda = { path = "../kernels-cuda" }
+kernels-rocm = { path = "../kernels-rocm", optional = true }
 
 engine = { path = "../engine" }
 
@@ -48,6 +49,10 @@ default = ["probe"]
 probe = []
 
 cuda = ["dep:cudarc", "kernels-cuda/cuda", "cudarc/cuda-13000"]
+
+# The same engine on AMD GPUs over HIP: kernels-rocm's kernels, hiprtc and
+# the HIP runtime in place of kernels-cuda, NVRTC and the CUDA runtime.
+rocm = ["cuda", "dep:kernels-rocm", "kernels-rocm/rocm"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }

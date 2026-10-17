@@ -36,7 +36,7 @@ impl Id {
     pub fn new(transport: Transport) -> Result<Id> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::nccl::sys as nccl;
+            use crate::device::nccl;
             transport_defaults(transport);
             let mut id = nccl::ncclUniqueId { internal: [0; 128] };
             // SAFETY: a live out-parameter of the exact type NCCL writes.
@@ -69,7 +69,7 @@ impl Comm {
     pub fn open(id: &Id, rank: u32, size: u32) -> Result<Comm> {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::nccl::sys as nccl;
+            use crate::device::nccl;
             let unique = nccl::ncclUniqueId {
                 internal: id.0.map(|byte| byte as core::ffi::c_char),
             };
@@ -107,7 +107,7 @@ impl Comm {
     pub fn abort(&self) {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::nccl::sys as nccl;
+            use crate::device::nccl;
             if self.raw.is_null() {
                 return;
             }
@@ -195,7 +195,7 @@ pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peer
 
 #[cfg(feature = "cuda")]
 fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::Peers>>> {
-    use cudarc::runtime::sys as rt;
+    use crate::device::rt;
 
     use crate::device::ctx::check;
 
@@ -210,13 +210,13 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
         let mut vmm = 0;
         // SAFETY: a live out-parameter; a driver device is its ordinal.
         let asked = unsafe {
-            cudarc::driver::sys::cuDeviceGetAttribute(
+            crate::device::dr::cuDeviceGetAttribute(
                 &raw mut vmm,
-                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
+                crate::device::dr::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
                 a,
             )
         };
-        if asked != cudarc::driver::sys::CUresult::CUDA_SUCCESS || vmm == 0 {
+        if asked != crate::device::dr::CUresult::CUDA_SUCCESS || vmm == 0 {
             return Err(off(format!("cuda:{a} does not map memory for peers")));
         }
         for &b in ordinals.iter().filter(|&&b| b != a) {
@@ -366,8 +366,8 @@ fn transport_defaults(transport: Transport) {
 }
 
 #[cfg(feature = "cuda")]
-fn answered(call: &'static str, code: cudarc::nccl::sys::ncclResult_t) -> Result<()> {
-    if code == cudarc::nccl::sys::ncclResult_t::ncclSuccess {
+fn answered(call: &'static str, code: crate::device::nccl::ncclResult_t) -> Result<()> {
+    if code == crate::device::nccl::ncclResult_t::ncclSuccess {
         Ok(())
     } else {
         Err(Fault::Device {

@@ -374,7 +374,7 @@ pub fn weight_tier_bytes(trace: &Trace, stated: u64, extra_resident: u64) -> Res
 pub fn device_memory() -> Result<(u64, u64)> {
     #[cfg(feature = "cuda")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         let (mut free, mut total) = (0usize, 0usize);
         // SAFETY: two live locals; the call only writes them.
@@ -926,6 +926,11 @@ impl Pools {
             )));
         }
         self.paging.pages = fit;
+        // A flat arena allocates its whole range on its first commit, so its
+        // range is the fitted one, not the one the asked count reserved.
+        if !elastic::mapped_on_demand() && self.committed_bytes() == 0 {
+            self.reshape(fit, self.paging.slots)?;
+        }
         // The runtime admits frames against this watermark, so the pool is
         // pledged it beside what its other arenas hold now: a frame inside
         // it is a frame the fit already sized the card for, and what a fire

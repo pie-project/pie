@@ -416,8 +416,8 @@ impl Drop for Rotor {
             // destroyed exactly once. Stream destroy is async w.r.t. its
             // work; buffers below are freed after it either way.
             unsafe {
-                let _ = cudarc::runtime::sys::cudaStreamSynchronize(self.copy.cast());
-                let _ = cudarc::runtime::sys::cudaStreamDestroy(self.copy.cast());
+                let _ = crate::device::rt::cudaStreamSynchronize(self.copy.cast());
+                let _ = crate::device::rt::cudaStreamDestroy(self.copy.cast());
             }
         }
     }
@@ -426,7 +426,7 @@ impl Drop for Rotor {
 fn copy_stream() -> Result<*mut c_void> {
     #[cfg(feature = "cuda")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         let mut stream: rt::cudaStream_t = core::ptr::null_mut();
         // SAFETY: live local out-parameter; stream is this rotor's,
@@ -448,7 +448,7 @@ fn copy_stream() -> Result<*mut c_void> {
 fn copy_in(stream: *mut c_void, dst: u64, src: *const u8, bytes: u64) -> Result<()> {
     #[cfg(feature = "cuda")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         // SAFETY: `dst` is a slot this rotor allocated at least `bytes`
         // long; `src` is page-locked host memory the tier holds for the

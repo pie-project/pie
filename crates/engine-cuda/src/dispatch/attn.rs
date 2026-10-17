@@ -1,4 +1,8 @@
-use kernels_cuda::attn::{self, fa2, index, mla, plan, pool, selected};
+#[cfg(not(feature = "rocm"))]
+use kernels_cuda::attn::fa2;
+#[cfg(feature = "rocm")]
+use kernels_cuda::attn::paged;
+use kernels_cuda::attn::{self, index, mla, plan, pool, selected};
 use kernels_cuda::attn_dense;
 use poem_exec::{DispatchAttention, KernelError};
 use poem_ir::{Attention, IndexScore, StructKind};
@@ -70,12 +74,16 @@ impl Run<'_> {
                 let built = {
                     let fire = self.bindings();
                     let seat = self.planning(*kv_indptr, *plan);
+                    #[cfg(not(feature = "rocm"))]
                     let max_grid = fa2::decode_max_grid_size(
                         seat.shape.head_dim,
                         seat.shape.num_q_heads,
                         seat.shape.num_kv_heads,
                         &fire.device,
                     );
+                    #[cfg(feature = "rocm")]
+                    let max_grid =
+                        paged::decode_max_grid_size(seat.shape.num_kv_heads, fire.device.num_sm);
                     plan::plan_decode(
                         seat.kv_indptr,
                         seat.kv_len,
@@ -217,7 +225,7 @@ impl Run<'_> {
             ),
             Attention::PrefillSelected {
                 q,
-                plan: _,
+                plan,
                 selection,
                 cache,
                 window,
@@ -227,19 +235,45 @@ impl Run<'_> {
                 ratio,
                 per_head,
                 o,
-            } => selected::attention_prefill_selected(
-                self.ctx(),
-                self.ragged_q(*q),
-                self.tensor(*selection),
-                &self.pool_absolute(*cache),
-                *window,
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                *ratio,
-                *per_head,
-                &mut self.tensor(*o),
-            ),
+            } => {
+                #[cfg(not(feature = "rocm"))]
+                let _ = plan;
+                // On ROCm the rows' causal plan walks them a tile at a time,
+                // the selection masking each row's keys; the per-row walk
+                // takes what the tiled one does not cover.
+                #[cfg(feature = "rocm")]
+                if let StructSlot::Prefill(planned) = self.slot(*plan)
+                    && attn::prefill_selected_tiled(
+                        self.ctx(),
+                        self.ragged_q(*q),
+                        planned,
+                        self.tensor(*selection),
+                        &self.pool_absolute(*cache),
+                        *window,
+                        *head_dim,
+                        *kv_heads,
+                        *sm_scale,
+                        *ratio,
+                        *per_head,
+                        &mut self.tensor(*o),
+                    )?
+                {
+                    return Ok(());
+                }
+                selected::attention_prefill_selected(
+                    self.ctx(),
+                    self.ragged_q(*q),
+                    self.tensor(*selection),
+                    &self.pool_absolute(*cache),
+                    *window,
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    *ratio,
+                    *per_head,
+                    &mut self.tensor(*o),
+                )
+            }
             Attention::DecodeRel {
                 q,
                 plan,
@@ -1523,6 +1557,7 @@ impl Run<'_> {
         k: u32,
     ) -> Result<kernels_cuda::Tensor, kernels_cuda::Error> {
         match self.maybe_planes(w) {
+            #[cfg(not(feature = "rocm"))]
             Some((codes, ..)) if codes.dtype == poem_ir::Dtype::E4m3tensor => {
                 Err(kernels_cuda::Error::Backend {
                     op,
@@ -1530,6 +1565,7 @@ impl Run<'_> {
                         .to_string(),
                 })
             }
+            #[cfg(not(feature = "rocm"))]
             Some((codes, scales, biases, seat)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
                 kernels_cuda::linear::nvfp4::decoded_plane(
                     self.ctx(),

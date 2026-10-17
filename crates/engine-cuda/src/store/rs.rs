@@ -167,6 +167,43 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
         let mut layers = 0u32;
         let mut decode_layers = 0u32;
         for (at, node) in trace.nodes.iter().enumerate() {
+            // The fused decode step reads the planes its primitives would:
+            // the conv's rows (the split it lands) and the gate prep's
+            // `[b | a]`.
+            if let Operation::Fused(poem_ir::Fused::GdnStep { qkv, ba, .. }) = &node.op {
+                let page = u64::from(paging);
+                let mut here = 0u64;
+                for (what, id) in [
+                    ("the conv's rows", *qkv),
+                    ("the gate prep's `[b | a]`", *ba),
+                ] {
+                    let width = width_of(trace, id).ok_or_else(|| unsized_plane(what, id))?;
+                    planes.insert(
+                        id.0,
+                        Plane {
+                            layer: decode_layers,
+                            at: page * here,
+                            width,
+                        },
+                    );
+                    here += width;
+                }
+                match per_token {
+                    None => per_token = Some(here),
+                    Some(first) if first == here => {}
+                    Some(first) => {
+                        return Err(Fault::Unbound {
+                            what: format!(
+                                "recurrent layer {decode_layers} buffers {here} elements a token \
+                                 where layer 0 buffers {first} — this pool cuts one page-slot \
+                                 stride for every layer"
+                            ),
+                        });
+                    }
+                }
+                decode_layers += 1;
+                continue;
+            }
             let (reads, chunked) = match &node.op {
                 Operation::Attention(Attention::SsmGatedDeltaChunked { qkv, gates, .. }) => (
                     Reads::GatedDelta {

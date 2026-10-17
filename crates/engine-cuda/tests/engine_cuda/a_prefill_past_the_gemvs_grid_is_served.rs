@@ -152,10 +152,17 @@ fn fixture(text: Text) -> Fixture {
 /// it), the cuBLAS grouped GEMM, or one GEMV a route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Leg {
+    #[cfg_attr(feature = "rocm", allow(dead_code))]
     Tcgen05,
     Grouped,
     Gemv,
 }
+
+/// The grouped legs this build has: ROCm's grouped GEMM is hipBLASLt's.
+#[cfg(not(feature = "rocm"))]
+const GROUPED: [Leg; 2] = [Leg::Grouped, Leg::Tcgen05];
+#[cfg(feature = "rocm")]
+const GROUPED: [Leg; 1] = [Leg::Grouped];
 
 fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
     let (tc5, grouped) = match leg {
@@ -163,8 +170,13 @@ fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
         Leg::Grouped => (false, true),
         Leg::Gemv => (false, false),
     };
+    let tc5 = if cfg!(feature = "rocm") {
+        String::new()
+    } else {
+        format!("moe.tc5 = {tc5}\n")
+    };
     let chip = engine_cuda::chip::profile(&format!(
-        "[kernel]\nmoe.grouped = {grouped}\nmoe.tc5 = {tc5}\n[engine]\ngraphs = \"off\"\n"
+        "[kernel]\nmoe.grouped = {grouped}\n{tc5}[engine]\ngraphs = \"off\"\n"
     ));
     Shell::load(Boot {
         trace: fixture.trace.clone(),
@@ -233,7 +245,7 @@ fn a_prefill_past_the_gemvs_grid_is_served() {
         )
     };
 
-    for leg in [Leg::Grouped, Leg::Tcgen05] {
+    for leg in GROUPED {
         let (logits, _) = fire_at(&fixture, WIDE, leg).unwrap_or_else(|why| {
             panic!(
                 "a prefill of 65600 routes fires on the {leg:?} leg — if this refused, the \
@@ -245,10 +257,21 @@ fn a_prefill_past_the_gemvs_grid_is_served() {
     }
 
     // The GEMV carries a route run past its grid's y axis on z, so it serves the fire too.
-    let (logits, _) = fire_at(&fixture, WIDE, Leg::Gemv).unwrap_or_else(|why| {
-        panic!("a prefill of 65600 routes fires on the GEMV leg past grid y: {why}")
-    });
-    finite(&logits[0], "the wide prefill on the GEMV");
+    #[cfg(not(feature = "rocm"))]
+    {
+        let (logits, _) = fire_at(&fixture, WIDE, Leg::Gemv).unwrap_or_else(|why| {
+            panic!("a prefill of 65600 routes fires on the GEMV leg past grid y: {why}")
+        });
+        finite(&logits[0], "the wide prefill on the GEMV");
+    }
+    // ROCm's refuses it, naming the route run against the grid it does not fit.
+    #[cfg(feature = "rocm")]
+    {
+        let why = fire_at(&fixture, WIDE, Leg::Gemv)
+            .expect_err("with the grouped leg declined, a 65600-route fire is past the GEMV's grid")
+            .to_string();
+        assert!(why.contains("65600") || why.contains("65535"), "{why}");
+    }
 }
 
 fn the_two_legs_answer_the_same_model() {
@@ -261,7 +284,7 @@ fn the_two_legs_answer_the_same_model() {
 
     let (gemv, gemv_ms) = fire_at(&fixture, BOTH, Leg::Gemv).expect("the per-route GEMV fires");
     finite(&gemv[0], "gemv");
-    for leg in [Leg::Grouped, Leg::Tcgen05] {
+    for leg in GROUPED {
         let (grouped, grouped_ms) = fire_at(&fixture, BOTH, leg).expect("the grouped leg fires");
         finite(&grouped[0], "grouped");
         agree(leg, &grouped, grouped_ms, &gemv, gemv_ms);
@@ -331,7 +354,7 @@ fn a_bank_past_the_cache_is_where_grouping_pays() {
 
     let (gemv, gemv_ms) = fire_at(&fixture, BOTH, Leg::Gemv).expect("the per-route GEMV fires");
     finite(&gemv[0], "gemv");
-    for leg in [Leg::Grouped, Leg::Tcgen05] {
+    for leg in GROUPED {
         let (grouped, grouped_ms) = fire_at(&fixture, BOTH, leg).expect("the grouped leg fires");
         finite(&grouped[0], "grouped");
         pays(leg, &grouped, grouped_ms, &gemv, gemv_ms);

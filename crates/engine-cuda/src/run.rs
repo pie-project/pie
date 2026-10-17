@@ -26,6 +26,9 @@ pub enum WeightRow {
         /// The scales lie in the tcgen05 GEMM's atoms, laid there at load
         /// for a low-precision product, not row-major.
         atoms: bool,
+        /// An mxfp4 bank in the matrix core's lane order (ROCm:
+        /// `linear::moe::mxfp4_lanes`), which only routed selects read.
+        lanes: bool,
     },
 
     Streamed {
@@ -33,6 +36,11 @@ pub enum WeightRow {
         table: u64,
         counts: u64,
     },
+
+    /// A resident plane in the matrix core's order, which only the products
+    /// that read it so take (ROCm: an fp8b32 projection, `e4m3fn_shuffle`,
+    /// read by `act_quant::matmul_fp8b32_lanes`).
+    Ordered(Tensor),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -503,6 +511,19 @@ impl Standing {
     }
 }
 
+/// Rows quantized for the FP8 products, where they are held.
+#[cfg(feature = "rocm")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Fp8Rows {
+    pub value: u32,
+    pub stage: u64,
+    pub ctx: usize,
+    pub region: u32,
+    pub hold: usize,
+    pub codes: Tensor,
+    pub scales: Tensor,
+}
+
 pub struct Run<'c> {
     ctx: &'c Ctx,
 
@@ -540,6 +561,15 @@ pub struct Run<'c> {
     ceilings: Ceilings<'c>,
 
     stood: Cell<Option<(u32, u32, Standing)>>,
+
+    /// Rows this walk quantized for the FP8 products, by value, staged
+    /// window and context, with the region and hold they sit in: their codes
+    /// and scales, for the later products of the same rows.
+    #[cfg(feature = "rocm")]
+    pub(crate) fp8_rows: Vec<Fp8Rows>,
+    /// The holds each region has handed out this walk.
+    #[cfg(feature = "rocm")]
+    pub(crate) fp8_holds: Vec<(u32, usize)>,
 }
 
 impl<'c> Run<'c> {
@@ -576,6 +606,10 @@ impl<'c> Run<'c> {
             copy: CopyPlan::default(),
             ceilings: Ceilings::default(),
             stood: Cell::new(None),
+            #[cfg(feature = "rocm")]
+            fp8_rows: Vec::new(),
+            #[cfg(feature = "rocm")]
+            fp8_holds: Vec::new(),
         }
     }
 
@@ -1311,7 +1345,7 @@ impl<'c> Run<'c> {
             Some(Def::Op(_) | Def::Merge(_)) => self.arena.0.get(at).copied().flatten().is_some(),
             Some(Def::Weight(w)) => matches!(
                 self.weights.0.get(*w as usize).copied().flatten(),
-                Some(WeightRow::Dense(_) | WeightRow::Streamed { .. })
+                Some(WeightRow::Dense(_) | WeightRow::Streamed { .. } | WeightRow::Ordered(_))
             ),
             _ => false,
         }
@@ -1482,9 +1516,11 @@ impl<'c> Run<'c> {
             Def::Weight(w) => {
                 let row = *w as usize;
                 match self.weights.0.get(row).copied().flatten() {
-                    Some(WeightRow::Dense(handle) | WeightRow::Streamed { slab: handle, .. }) => {
-                        handle
-                    }
+                    Some(
+                        WeightRow::Dense(handle)
+                        | WeightRow::Streamed { slab: handle, .. }
+                        | WeightRow::Ordered(handle),
+                    ) => handle,
                     Some(WeightRow::Planes { .. }) => panic!(
                         "value {at} is weight {row}, a split-plane bank; it resolves \
                          through `Run::planes`, never as one dense handle"
@@ -1554,6 +1590,7 @@ impl<'c> Run<'c> {
                 seat,
                 repacked: false,
                 atoms: false,
+                lanes: false,
             }) => Some((codes, scales, biases, seat)),
             _ => None,
         }
@@ -1575,6 +1612,7 @@ impl<'c> Run<'c> {
                 seat,
                 repacked: true,
                 atoms: false,
+                lanes: _,
             }) => Some((codes, scales, biases, seat)),
             _ => None,
         }
@@ -1622,17 +1660,20 @@ impl<'c> Run<'c> {
                 seat,
                 repacked: _,
                 atoms: _,
+                lanes: _,
             }) => (codes, scales, biases, seat),
-            Some(WeightRow::Dense(_) | WeightRow::Streamed { .. }) => panic!(
-                "value {at} is weight {row}, bound as one dense handle, and this op reads \
+            Some(WeightRow::Dense(_) | WeightRow::Streamed { .. } | WeightRow::Ordered(_)) => {
+                panic!(
+                    "value {at} is weight {row}, bound as one dense handle, and this op reads \
                  a split-plane bank"
-            ),
+                )
+            }
             None => panic!("value {at} is weight {row}, which the shell has not bound"),
         }
     }
 
     /// Whether weight `id`'s scales were laid into tcgen05 atoms at load.
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", not(feature = "rocm")))]
     pub(crate) fn scales_in_atoms(&self, id: ValueId) -> bool {
         let Def::Weight(w) = &self.values[id.0 as usize].def else {
             return false;
@@ -1641,6 +1682,45 @@ impl<'c> Run<'c> {
             self.weights.0.get(*w as usize).copied().flatten(),
             Some(WeightRow::Planes { atoms: true, .. })
         )
+    }
+
+    /// Whether `id` is `linear.group_routes`' over `groups` (route g for
+    /// every row's group g).
+    #[cfg(feature = "rocm")]
+    pub(crate) fn group_routes_of(&self, id: ValueId, groups: u32) -> bool {
+        let Def::Op(at) = self.values[id.0 as usize].def else {
+            return false;
+        };
+        matches!(
+            self.nodes.get(at as usize).map(|node| &node.op),
+            Some(poem_ir::Operation::Linear(poem_ir::Linear::GroupRoutes { groups: g, routes }))
+                if *g == groups && *routes == id
+        )
+    }
+
+    /// Whether the split-plane bank `id` names landed in the matrix core's
+    /// lane order.
+    #[cfg(feature = "rocm")]
+    pub(crate) fn planes_in_lanes(&self, id: ValueId) -> bool {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return false;
+        };
+        matches!(
+            self.weights.0.get(*w as usize).copied().flatten(),
+            Some(WeightRow::Planes { lanes: true, .. })
+        )
+    }
+
+    /// The bank `id` names, if it landed in the matrix core's order.
+    #[cfg(feature = "rocm")]
+    pub(crate) fn ordered_bank(&self, id: ValueId) -> Option<Tensor> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        match self.weights.0.get(*w as usize).copied().flatten() {
+            Some(WeightRow::Ordered(handle)) => Some(self.cut(id, handle)),
+            _ => None,
+        }
     }
 
     pub(crate) fn expert_bank(&self, id: ValueId) -> (Tensor, ExpertTable) {
@@ -1665,6 +1745,10 @@ impl<'c> Run<'c> {
             Some(WeightRow::Planes { .. }) => panic!(
                 "value {at} is weight {row}, a split-plane bank; a dense routed select \
                  does not read one"
+            ),
+            Some(WeightRow::Ordered(_)) => panic!(
+                "value {at} is weight {row}, a bank in the matrix core's order; only \
+                 `Run::ordered_bank`'s readers take it"
             ),
             None => panic!("value {at} is weight {row}, which the shell has not bound"),
         }

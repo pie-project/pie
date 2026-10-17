@@ -1,3 +1,8 @@
+// On ROCm the engine launches kernels-rocm's kernels, under the name it
+// calls kernels-cuda's by.
+#[cfg(feature = "rocm")]
+extern crate kernels_rocm as kernels_cuda;
+
 pub mod adapter;
 pub mod api;
 pub mod arena;
@@ -12,6 +17,7 @@ mod error;
 pub mod experts;
 pub mod exports;
 pub mod group;
+#[cfg(not(feature = "rocm"))]
 pub mod grouped_decode;
 pub mod inputs;
 pub mod mask;
@@ -36,6 +42,7 @@ pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 /// The fused kernels this backend ships; the compiler forms only these. A
 /// rule it does not list (`linear.mlp_swiglu`, which Metal splits across
 /// engines) leaves its primitives alone here.
+#[cfg(not(feature = "rocm"))]
 pub const FUSED: [&str; 18] = [
     "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
     "elementwise.rmsnorm_residual_add",
@@ -56,12 +63,34 @@ pub const FUSED: [&str; 18] = [
     "elementwise.rope_yarn_append",
     "attention.lse_sink",
 ];
+#[cfg(feature = "rocm")]
+pub const FUSED: [&str; 16] = [
+    "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
+    "elementwise.rmsnorm_residual_add",
+    "elementwise.embed_scale_add_select",
+    "elementwise.embed_scale_add",
+    "elementwise.residual_add_rmsnorm",
+    "linear.matmul_geglu",
+    "linear.lm_head_softcap",
+    "linear.matmul_bias",
+    "linear.mlp_swiglu",
+    "linear.moe_experts",
+    "elementwise.gated_residual_norm_modulate",
+    "elementwise.norm_modulate",
+    "elementwise.rmsnorm_rope_partial_q",
+    "elementwise.hc_norm_project",
+    "attention.ssm_gdn_step",
+    "attention.q_gate_k_norm_rope_append",
+];
 
 /// The fused kernels left on with `fuse-chains=off`.
+#[cfg(not(feature = "rocm"))]
 pub const UNCHAINED: [&str; 2] = [
     "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
     "elementwise.residual_add_rmsnorm",
 ];
+#[cfg(feature = "rocm")]
+pub const UNCHAINED: [&str; 1] = ["elementwise.residual_add_rmsnorm"];
 
 #[must_use]
 pub fn shifted(op: &str) -> bool {

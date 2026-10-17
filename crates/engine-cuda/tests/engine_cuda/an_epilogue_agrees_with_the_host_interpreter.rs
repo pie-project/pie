@@ -181,7 +181,7 @@ fn device_outputs(
     let context = Context::bind(0, None).expect("a CUDA context");
     let stages = compile_bound(bound);
     let launch = eta_compiler::codegen::launch::build(bound, &stages);
-    let backend = Backend::parse("cuda").expect("the cuda backend");
+    let backend = Backend::parse(engine_cuda::api::CODEGEN).expect("the engine's codegen backend");
     let registration = ProgramRegistration {
         program_hash: 0x5eed ^ u64::from(rows),
         emitted_kernels: emit_program(backend, &stages, bound),

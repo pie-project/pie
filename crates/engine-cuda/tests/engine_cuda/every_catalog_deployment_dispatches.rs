@@ -16,16 +16,21 @@ struct Refusal {
 
 const REFUSED: &[Refusal] = &[];
 
+/// ROCm serves the split M-RoPE (`rope_mrope::split`).
 fn refuses_split_mrope(op: &poem_ir::ops::Operation) -> bool {
-    matches!(
-        op,
-        poem_ir::ops::Operation::Elementwise(poem_ir::ops::Elementwise::RopeMrope {
-            form: poem_ir::ops::MropeForm::Split,
-            ..
-        })
-    )
+    !cfg!(feature = "rocm")
+        && matches!(
+            op,
+            poem_ir::ops::Operation::Elementwise(poem_ir::ops::Elementwise::RopeMrope {
+                form: poem_ir::ops::MropeForm::Split,
+                ..
+            })
+        )
 }
 
+#[cfg(feature = "rocm")]
+const CANNOT_SERVE: &[(&str, &[&str])] = &[];
+#[cfg(not(feature = "rocm"))]
 const CANNOT_SERVE: &[(&str, &[&str])] = &[
     ("gemma4-26b-a4b-vision-u4g64-kv-bf16", &[SPLIT_MROPE]),
     ("gemma4-31b-vision-u4g64-kv-bf16", &[SPLIT_MROPE]),
