@@ -122,9 +122,9 @@ pub fn prefill(
     if rows == 0 {
         return Ok(());
     }
-    // The pass turns at most 32 pairs (a lane's frequency each); a wider
-    // turn runs after it.
-    if let Some(wide) = turn.filter(|t| t.dim > 64) {
+    // The pass turns at most 32 pairs (a lane's angle each) in whole
+    // 32-dim chunks; another turn runs after it.
+    if let Some(wide) = turn.filter(|t| t.dim > 64 || t.dim % 32 != 0) {
         prefill(
             ctx,
             op,

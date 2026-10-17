@@ -449,6 +449,10 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
         // a tail pair reads it from its lane.
         const float lane_freq =
             static_cast<int>(lane) < p.turn.dim / 2 ? dsv4::turn_freq(static_cast<int>(lane), p.turn) : 0.f;
+        // The head's sink, read once.
+        const float sink =
+            p.sinks_f32 ? static_cast<const float*>(p.sinks)[head]
+                        : __uint_as_float(static_cast<u32>(static_cast<const u16*>(p.sinks)[head]) << 16);
         int J = 0;
         for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x)) {
         const Row w = row_at(r);
@@ -564,31 +568,45 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
         if (l_all > 0.f) {
             constexpr float kLn2 = 0.69314718055994530942f;
             const float lse = (m_used + __log2f(l_all)) * kLn2;
-            const float sink =
-                p.sinks_f32 ? static_cast<const float*>(p.sinks)[head]
-                            : __uint_as_float(static_cast<u32>(static_cast<const u16*>(p.sinks)[head])
-                                              << 16);
             scale = 1.f / (l_all * (1.f + __expf(sink - lse)));
         }
         u16* dst = p.o + static_cast<long long>(row) * p.o_stride + static_cast<long long>(head) * kD;
+        // The turn's angle for pair `lane` at this row's position, once a row
+        // (the tail's chunks read it by shuffle).
+        const int tail0 = kD - p.turn.dim;
+        float turn_c = 1.f, turn_s = 0.f;
+        if (p.turn.dim > 0) __sincosf(-static_cast<float>(w.pos) * lane_freq, &turn_s, &turn_c);
+        // Two 32-column loads in flight a wait, half the waits.
 #pragma unroll 1
-        for (u32 c = 0; c < 256; c += 32) {
-            u32 v[32];
-            tmem_ld32(tmem + lane_base + kColO + c, v);
+        for (u32 c2 = 0; c2 < 256; c2 += 64) {
+            u32 vv[2][32];
+            tmem_ld32(tmem + lane_base + kColO + c2, vv[0]);
+            tmem_ld32(tmem + lane_base + kColO + c2 + 32, vv[1]);
             tmem_wait_ld();
+#pragma unroll
+            for (int h2 = 0; h2 < 2; ++h2) {
+            const u32 c = c2 + 32 * h2;
+            const u32 (&v)[32] = vv[h2];
             // Columns [128 v', + 128) are dims [256 v' + 128 half, + 128).
             const int d0 = static_cast<int>(c / 128) * 256 + half * 128 + static_cast<int>(c % 128);
             u32 out[16];
+            if (p.turn.dim > 0 && d0 >= tail0) {
+                // A chunk of the tail (whole chunks, alike across the warp):
+                // pair `first + i`'s angle from its lane.
+                const int first = (d0 - tail0) / 2;
 #pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                float a = __uint_as_float(v[2 * i]) * scale;
-                float b = __uint_as_float(v[2 * i + 1]) * scale;
-                // Whether a pair is the tail's is the same across the warp.
-                const int at = d0 + 2 * i - (kD - p.turn.dim);
-                if (p.turn.dim > 0 && at >= 0) {
-                    dsv4::turn_pair(a, b, w.pos, __shfl_sync(0xffffffffu, lane_freq, at / 2));
+                for (int i = 0; i < 16; ++i) {
+                    const float a = __uint_as_float(v[2 * i]) * scale;
+                    const float b = __uint_as_float(v[2 * i + 1]) * scale;
+                    const float cs = __shfl_sync(0xffffffffu, turn_c, first + i);
+                    const float sn = __shfl_sync(0xffffffffu, turn_s, first + i);
+                    out[i] = pack_bf16(a * cs - b * sn, b * cs + a * sn);
                 }
-                out[i] = pack_bf16(a, b);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    out[i] = pack_bf16(__uint_as_float(v[2 * i]) * scale, __uint_as_float(v[2 * i + 1]) * scale);
+                }
             }
             // A thread's 64 bytes as two whole 32-byte sectors.
 #pragma unroll
@@ -598,6 +616,7 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
                     "r"(out[8 * i]), "r"(out[8 * i + 1]), "r"(out[8 * i + 2]), "r"(out[8 * i + 3]),
                     "r"(out[8 * i + 4]), "r"(out[8 * i + 5]), "r"(out[8 * i + 6]), "r"(out[8 * i + 7])
                     : "memory");
+            }
             }
         }
         }
