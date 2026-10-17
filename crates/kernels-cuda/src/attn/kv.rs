@@ -452,6 +452,7 @@ pub(crate) fn dequant_active(
     }
 }
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 /// The latent rows `ckv` and their rotated dims `kpe` (64 a row) landed in
 /// `pool` as fp8_ds_mla rows (`attn/mla.cuh`'s `mla_kv_append_fp8`).
