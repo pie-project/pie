@@ -1624,5 +1624,215 @@ __global__ void __launch_bounds__(256) hc_prenorm_project_fold(
             dot * rsqrtf(sq / static_cast<float>(fan_in) + eps);
 }
 
+// `hc_fn` (f32, [mix_hc][fan_in]) as two bf16 planes summing to it, for the
+// tensor-core projection: rows [0, 24) the high halves, [24, 48) what each
+// leaves, rows past mix_hc zero. A thread four columns of a row.
+__global__ void __launch_bounds__(256) hc_fn_split(
+    const float* __restrict__ hc_fn,
+    bf16* __restrict__ split,
+    int fan_in,
+    int mix_hc)
+{
+    const long long i = (static_cast<long long>(blockIdx.x) * 256 + threadIdx.x) * 4;
+    if (i >= 24LL * fan_in) return;
+    const int o = static_cast<int>(i / fan_in);
+    const int k = static_cast<int>(i % fan_in);
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        const float w = o < mix_hc ? hc_fn[static_cast<long long>(o) * fan_in + k + u] : 0.f;
+        const bf16 hi = Elem<bf16>::from_f32(w);
+        split[static_cast<long long>(o) * fan_in + k + u] = hi;
+        split[static_cast<long long>(o + 24) * fan_in + k + u] = Elem<bf16>::from_f32(w - Elem<bf16>::to_f32(hi));
+    }
+}
+
+// `hc_prenorm_project_tile` on the tensor cores (mma.sync bf16): the 48
+// half-columns (the projection's high and low halves, summed at the end:
+// the bf16 products are exact and the sums f32, so the halves carry 16 bits
+// of each weight against tf32's 10) are the mma's rows, three tiles of 16,
+// and a warp's 8 NT stream rows its columns (NT tiles of 8), so each weight
+// fragment serves NT row tiles and each row fragment three: a block 32 NT
+// rows over four warps. A row's sum of squares comes off its B fragments.
+// One slice lands `mixes`; several land `partial[slice][row][mix_hc + 1]`.
+template <int STAGES, int NT>
+__global__ void __launch_bounds__(128) hc_prenorm_project_mma_t(
+    const bf16* __restrict__ streams,
+    const bf16* __restrict__ split,
+    float* __restrict__ out,
+    int fan_in,
+    int mix_hc,
+    int rows,
+    int slice,
+    float eps,
+    const u32* __restrict__ win)
+{
+    constexpr int BR = 4 * 8 * NT;
+    constexpr int KT = 64;
+    constexpr int LD = KT + 8;
+    constexpr int NC = 48;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    bf16* xs = reinterpret_cast<bf16*>(smem_raw);
+    bf16* ws = xs + STAGES * BR * LD;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int n0 = static_cast<int>(blockIdx.x) * BR;
+    const int live = win != nullptr ? min(static_cast<int>(win[0]), rows) : rows;
+    if (n0 >= live) return;
+    const int base = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const int d0 = static_cast<int>(blockIdx.y) * slice;
+    const int d1 = min(d0 + slice, fan_in);
+    const int tiles = (d1 - d0) / KT;
+
+    auto issue = [&](int tile) {
+        const int k0 = d0 + tile * KT;
+        bf16* xd = xs + (tile % STAGES) * BR * LD;
+        bf16* wd = ws + (tile % STAGES) * NC * LD;
+        for (int c = tid; c < BR * (KT / 8); c += 128) {
+            const int row = c / (KT / 8);
+            const int q = c % (KT / 8);
+            const int n = min(n0 + row, live - 1);
+            hc_cp16(xd + row * LD + q * 8, streams + static_cast<long long>(base + n) * fan_in + k0 + q * 8);
+        }
+        for (int c = tid; c < NC * (KT / 8); c += 128) {
+            const int col = c / (KT / 8);
+            const int q = c % (KT / 8);
+            hc_cp16(wd + col * LD + q * 8, split + static_cast<long long>(col) * fan_in + k0 + q * 8);
+        }
+    };
+
+    float acc[3][NT][4];
+#pragma unroll
+    for (int mt = 0; mt < 3; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[mt][nt][i] = 0.f;
+    float sq[NT];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) sq[nt] = 0.f;
+
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < tiles) issue(s);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+    for (int tile = 0; tile < tiles; ++tile) {
+        asm volatile("cp.async.wait_group %0;" ::"n"(STAGES - 2) : "memory");
+        __syncthreads();
+        if (tile + STAGES - 1 < tiles) issue(tile + STAGES - 1);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+        const bf16* xt = xs + (tile % STAGES) * BR * LD + warp * 8 * NT * LD;
+        const bf16* wt = ws + (tile % STAGES) * NC * LD;
+#pragma unroll
+        for (int k0 = 0; k0 < KT; k0 += 16) {
+            u32 a[3][4];
+#pragma unroll
+            for (int mt = 0; mt < 3; ++mt) {
+                const bf16* rp = wt + (mt * 16 + (lane & 15)) * LD + k0 + ((lane & 16) ? 8 : 0);
+                const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(rp));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                             : "=r"(a[mt][0]), "=r"(a[mt][1]), "=r"(a[mt][2]), "=r"(a[mt][3])
+                             : "r"(at));
+            }
+#pragma unroll
+            for (int np = 0; np < NT / 2; ++np) {
+                // Two row tiles a load: lanes 0-7 / 8-15 tile 2np at k0 / k0 + 8,
+                // lanes 16-23 / 24-31 tile 2np + 1.
+                u32 b[4];
+                const bf16* rp = xt + ((2 * np + (lane >> 4)) * 8 + (lane & 7)) * LD + k0 + ((lane & 8) ? 8 : 0);
+                const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(rp));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                             : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3])
+                             : "r"(at));
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int nt = 2 * np + h;
+#pragma unroll
+                    for (int r = 0; r < 2; ++r) {
+                        const float x0 = __uint_as_float(b[2 * h + r] << 16);
+                        const float x1 = __uint_as_float(b[2 * h + r] & 0xffff0000u);
+                        sq[nt] = fmaf(x0, x0, fmaf(x1, x1, sq[nt]));
+                    }
+#pragma unroll
+                    for (int mt = 0; mt < 3; ++mt) {
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                            : "+f"(acc[mt][nt][0]), "+f"(acc[mt][nt][1]), "+f"(acc[mt][nt][2]),
+                              "+f"(acc[mt][nt][3])
+                            : "r"(a[mt][0]), "r"(a[mt][1]), "r"(a[mt][2]), "r"(a[mt][3]), "r"(b[2 * h]),
+                              "r"(b[2 * h + 1]));
+                    }
+                }
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    // A row tile's row g sum of squares over the quad's lanes.
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        sq[nt] += __shfl_xor_sync(0xffffffffu, sq[nt], 1);
+        sq[nt] += __shfl_xor_sync(0xffffffffu, sq[nt], 2);
+    }
+    const int g = lane >> 2;
+    const int pc = (lane & 3) * 2;
+    // Half-column o (< 24) and its low half o + 24 in this thread's tiles:
+    // o = g (mt 0, i 0-1) with 24 + g (mt 1, i 2-3); 8 + g (mt 0, i 2-3)
+    // with 32 + g (mt 2, i 0-1); 16 + g (mt 1, i 0-1) with 40 + g (mt 2, i 2-3).
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            const int n = n0 + warp * 8 * NT + nt * 8 + pc + c;
+            const float rsq = __shfl_sync(0xffffffffu, sq[nt], (pc + c) * 4);
+            if (n >= live) continue;
+            const float v0 = acc[0][nt][c] + acc[1][nt][2 + c];
+            const float v1 = acc[0][nt][2 + c] + acc[2][nt][c];
+            const float v2 = acc[1][nt][c] + acc[2][nt][2 + c];
+            float* o_row;
+            float s = 1.f;
+            if (gridDim.y == 1) {
+                o_row = out + static_cast<long long>(base + n) * mix_hc;
+                s = rsqrtf(rsq / static_cast<float>(fan_in) + eps);
+            } else {
+                o_row = out + (static_cast<long long>(blockIdx.y) * rows + n) * (mix_hc + 1);
+                if (g == 0) o_row[mix_hc] = rsq;
+            }
+            if (g < mix_hc) o_row[g] = v0 * s;
+            if (8 + g < mix_hc) o_row[8 + g] = v1 * s;
+            if (16 + g < mix_hc) o_row[16 + g] = v2 * s;
+        }
+    }
+}
+
+// `hc_prenorm_project_fold` for a few slices (a prefill's): a thread a row,
+// its slices' dots and sums of squares summed in slice order, the dots
+// scaled by the row's norm.
+__global__ void __launch_bounds__(256) hc_prenorm_project_fold_rows(
+    const float* __restrict__ partial,
+    float* __restrict__ mixes,
+    int mix_hc,
+    int rows,
+    int slices,
+    int fan_in,
+    float eps,
+    const u32* __restrict__ win)
+{
+    const int n = static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x);
+    const int live = win != nullptr ? min(static_cast<int>(win[0]), rows) : rows;
+    if (n >= live) return;
+    const int base = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const int w = mix_hc + 1;
+    float sq = 0.f;
+    for (int s = 0; s < slices; ++s) sq += partial[(static_cast<long long>(s) * rows + n) * w + mix_hc];
+    const float scale = rsqrtf(sq / static_cast<float>(fan_in) + eps);
+    for (int o = 0; o < mix_hc; ++o) {
+        float dot = 0.f;
+        for (int s = 0; s < slices; ++s) dot += partial[(static_cast<long long>(s) * rows + n) * w + o];
+        mixes[static_cast<long long>(base + n) * mix_hc + o] = dot * scale;
+    }
+}
 
 }

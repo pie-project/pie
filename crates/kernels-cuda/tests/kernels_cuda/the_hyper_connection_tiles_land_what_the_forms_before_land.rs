@@ -272,6 +272,21 @@ fn the_hyper_connection_forms_time() {
                 .unwrap();
             });
             if tile {
+                let mma_ctx = gpu.ctx().with_tuning(Tuning {
+                    hc_mma: true,
+                    ..tuning(true)
+                });
+                time("prenorm mma", &|| {
+                    hc::prenorm_project(
+                        &mma_ctx,
+                        Tensor::new(streams, r, fan as u32, Dtype::Bf16),
+                        1e-6,
+                        Tensor::new(w, mix_hc as u32, fan as u32, Dtype::F32),
+                        M as u32,
+                        &mut Tensor::new(out_m, r, mix_hc as u32, Dtype::F32),
+                    )
+                    .unwrap();
+                });
                 time("prenorm", &|| {
                     hc::prenorm_project(
                         &ctx,
@@ -358,6 +373,14 @@ fn the_hyper_connection_forms_time() {
 /// The norm and the projection in one pass over the bf16 streams against a
 /// host norm and dot, at decode and prefill row counts and on a window.
 fn check_prenorm(rows: usize, mix_hc: usize, window: Option<(u32, u32)>) {
+    check_prenorm_on(rows, mix_hc, window, false);
+    // The tensor-core form (`kernel.elemwise.hc_mma`), a prefill's rows.
+    if rows >= 128 {
+        check_prenorm_on(rows, mix_hc, window, true);
+    }
+}
+
+fn check_prenorm_on(rows: usize, mix_hc: usize, window: Option<(u32, u32)>, mma: bool) {
     let fan = M * 4096;
     let eps = 1e-6f32;
     let planes = rows + window.map_or(0, |(_, base)| base as usize);
@@ -370,7 +393,10 @@ fn check_prenorm(rows: usize, mix_hc: usize, window: Option<(u32, u32)>) {
     let x_at = gpu.up(&x);
     let w_at = gpu.up(&w);
     let m_at = gpu.zeros(planes * mix_hc * 4);
-    let ctx = gpu.ctx().with_tuning(tuning(true));
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        hc_mma: mma,
+        ..tuning(true)
+    });
     if let Some((live, base)) = window {
         let win_at = gpu.up(&[live, base, 0u32, 0u32]);
         ctx.arm_stage(win_at);
@@ -408,7 +434,7 @@ fn check_prenorm(rows: usize, mix_hc: usize, window: Option<(u32, u32)>) {
                 .sum();
             assert!(
                 (g - want).abs() <= 1e-5 * mag.max(1e-3),
-                "{rows} rows, {mix_hc} columns: row {r} column {o} is {g}, the normed dot {want}"
+                "{rows} rows, {mix_hc} columns, mma {mma}: row {r} column {o} is {g}, the normed dot {want}"
             );
         }
     }

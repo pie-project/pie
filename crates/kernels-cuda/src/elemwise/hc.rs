@@ -782,6 +782,9 @@ fn prenorm_launch(
     } else {
         256
     };
+    if wide && ctx.tuning().hc_mma {
+        return prenorm_launch_mma(ctx, op, streams, eps, hc_fn, mixes);
+    }
     let (br, kt) = (if wide { TILE_ROWS } else { 32 }, TILE_K);
     let row_blocks = rows.div_ceil(br);
     let want = 2 * ctx.multiprocessors().unwrap_or(132);
@@ -831,6 +834,87 @@ fn prenorm_launch(
     Ok(Landed { out, slices })
 }
 
+/// [`prenorm_launch`] on the tensor cores (`hc_prenorm_project_mma_t`): the
+/// weights split into two bf16 halves first (`hc_fn_split`), then 256 rows
+/// a block, the row cut into as many slices as fill the multiprocessors
+/// four times over (DeepSeek-V4-Flash, 16384 rows: 64 rows a warp and two
+/// stages, 134 us where 16 rows a warp and three stages took 152).
+fn prenorm_launch_mma(
+    ctx: &Ctx,
+    op: &'static str,
+    streams: &Tensor,
+    eps: f32,
+    hc_fn: &Tensor,
+    mixes: &Tensor,
+) -> Result<Landed, Error> {
+    const STAGES: u32 = 2;
+    // A warp's row tiles of 8: 64 rows a warp, four warps a block.
+    const TILES: u32 = 8;
+    const ROWS: u32 = 32 * TILES;
+    const PARTIAL_ROWS: u32 = 65536;
+    let fan = streams.width;
+    let mix_hc = hc_fn.rows;
+    let rows = nonzero(op, "rows", mixes.rows)?;
+    let split =
+        ctx.scratch_shared(op, "elementwise.hc_fn_split", (48 * fan) as usize * 2)? as usize as u64;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::elemwise::hc_fn_split").apply(Launch::grid(
+            [(24 * fan).div_ceil(4 * 256), 1, 1],
+            [256, 1, 1],
+        )),
+        &[
+            hc_fn.arg(),
+            crate::jit::ArgValue::Ptr(split),
+            stated(op, fan)?.arg(),
+            stated(op, mix_hc)?.arg(),
+        ],
+    )?;
+    let row_blocks = rows.div_ceil(ROWS);
+    let want = 4 * ctx.multiprocessors().unwrap_or(132);
+    let slices = want
+        .div_ceil(row_blocks)
+        .clamp(1, (fan / 1024).max(1))
+        .min((PARTIAL_ROWS / rows).max(1));
+    let slice = fan.div_ceil(slices).next_multiple_of(TILE_K);
+    let slices = fan.div_ceil(slice);
+    let out = if slices > 1 {
+        ctx.scratch_shared(
+            op,
+            "elementwise.hc_project_partial",
+            (slices * rows * (mix_hc + 1)) as usize * core::mem::size_of::<f32>(),
+        )? as usize as u64
+    } else {
+        mixes.ptr
+    };
+    let smem = STAGES * (ROWS + 48) * (TILE_K + 8) * 2;
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_prenorm_project_mma_t<{STAGES}, {TILES}>"
+            )),
+        )
+        .apply(Launch {
+            smem,
+            ..Launch::grid([row_blocks, slices, 1], [128, 1, 1])
+        }),
+        &[
+            streams.arg(),
+            crate::jit::ArgValue::Ptr(split),
+            crate::jit::ArgValue::Ptr(out),
+            stated(op, fan)?.arg(),
+            stated(op, mix_hc)?.arg(),
+            stated(op, rows)?.arg(),
+            stated(op, slice)?.arg(),
+            eps.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(Landed { out, slices })
+}
+
 /// The stream norm and the mix projection over it in one pass over the bf16
 /// `streams` (`hc_prenorm_project_tile`, and
 /// `hc_prenorm_project_fold` past one slice): `mixes = (x . w) *
@@ -851,12 +935,20 @@ pub fn prenorm_project(
     let landed = prenorm_launch(ctx, OP, &streams, eps, &hc_fn, mixes)?;
     if landed.slices > 1 {
         let (rows, mix_hc) = (mixes.rows, hc_fn.rows);
-        ctx.fire(
-            OP,
+        // A few slices over many rows (the tensor-core form's) fold a
+        // thread a row; a decode's many slices a warp a mix.
+        let fold = if ctx.tuning().hc_mma && landed.slices <= 8 && rows >= 1024 {
+            Fire::at(FILE, "::pie::elemwise::hc_prenorm_project_fold_rows")
+                .apply(Launch::grid([rows.div_ceil(256), 1, 1], [256, 1, 1]))
+        } else {
             Fire::at(FILE, "::pie::elemwise::hc_prenorm_project_fold").apply(Launch::grid(
                 [(rows * mix_hc).div_ceil(8), 1, 1],
                 [BLOCK, 1, 1],
-            )),
+            ))
+        };
+        ctx.fire(
+            OP,
+            fold,
             &[
                 crate::jit::ArgValue::Ptr(landed.out),
                 mixes.arg(),
