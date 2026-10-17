@@ -23,6 +23,8 @@ BF = dtype.bf16
 U4 = dtype.u4g64
 A8 = dtype.mxfp4a8
 F8 = dtype.e4m3tile128a8
+NV = dtype.nvfp4
+NV4 = dtype.nvfp4a4
 
 DEPLOYMENTS = [
     deployment("glm5-a12b", weights = BF, kv = BF),
@@ -41,4 +43,11 @@ DEPLOYMENTS = [
     # Every FP8 tensor of the release as released: the projections too.
     deployment("glm53-l7", weights = [F8, F8], kv = BF),
     deployment("glm53-mini", weights = [F8, F8], kv = BF),
+    # nvidia's modelopt NVFP4 export, as vLLM's recipe serves it: the routed
+    # experts NVFP4 against NVFP4 activations (the tcgen05 grouped GEMMs) or
+    # against bf16 ones, the attention and shared experts bf16, the dense
+    # layers' MLP widened from its per-tensor FP8.
+    deployment("glm53", weights = [BF, NV4], kv = BF),
+    deployment("glm53-mini", weights = [BF, NV4], kv = BF),
+    deployment("glm53-mini", weights = [BF, NV], kv = BF),
 ]
