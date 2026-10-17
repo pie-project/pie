@@ -306,10 +306,6 @@ class Plan:
     engram_carve: "EngramCarve | None" = None
 
 
-# The top-k a Hy4 miniature's indexer ranks (see `_rewrite_hy_v4`).
-HY_V4_MINI_TOPK = 16
-
-
 def _text_cfg(cfg: dict, plan: Plan) -> dict:
     return cfg[plan.text_cfg_key] if plan.text_cfg_key else cfg
 
@@ -358,21 +354,6 @@ def _rewrite_glm(cfg: dict, plan: Plan) -> None:
         for key in ("kda_layers", "full_attn_layers"):
             if isinstance(lac.get(key), list):
                 lac[key] = [remap[s] for s in lac[key] if s in remap]
-
-
-def _rewrite_hy_v4(cfg: dict, plan: Plan) -> None:
-    _rewrite_common(cfg, plan)
-    for key in ("mlp_layer_types", "indexer_types", "layer_types"):
-        if isinstance(cfg.get(key), list):
-            cfg[key] = _slice_list(cfg[key], plan.src_layers)
-    # A "shared" indexer layer reads the last "full" layer's top-k.
-    it = cfg.get("indexer_types")
-    if isinstance(it, list) and it and it[0] != "full":
-        raise SystemExit("hy_v4: selected layer block must start on a 'full' indexer layer")
-    # The release ranks 2048 keys, past every sequence a parity probe holds;
-    # sixteen makes the indexer's choice (and the shared layers' reuse of it)
-    # part of what the miniature is read against.
-    cfg["index_topk"] = HY_V4_MINI_TOPK
 
 
 def _rewrite_dsv4(cfg: dict, plan: Plan) -> None:
@@ -541,14 +522,6 @@ def _rewrite_kimi_k3(cfg: dict, plan: Plan) -> None:
         _flatten_text_only(cfg, plan)
 
 
-def _rewrite_dots3(cfg: dict, plan: Plan) -> None:
-    _rewrite_common(cfg, plan)
-    # `layer_types` says full (DSA) or sliding per layer, and layer 0 is the
-    # one dense MLP, so the cut keeps it up front.
-    cfg["layer_types"] = _slice_list(cfg["layer_types"], plan.src_layers)
-    cfg["first_k_dense_replace"] = _dense_prefix_len(plan, cfg["first_k_dense_replace"])
-
-
 def _rewrite_muse_glimmer(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     # Both per-layer lists live in `text_config`: `layer_types` says sliding
@@ -578,24 +551,6 @@ def _rewrite_inkling(cfg: dict, plan: Plan) -> None:
         cfg["mtp_config"]["local_layer_ids"] = []
 
 
-def _rewrite_minimax_m3(cfg: dict, plan: Plan) -> None:
-    _rewrite_common(cfg, plan)
-    tc = _text_cfg(cfg, plan)
-    # Both per-layer plans are lists of 0/1 by source layer: `moe_layer_freq`
-    # says dense vs routed MLP, `sparse_attention_freq` dense vs indexed
-    # attention (and `sparse_disable_index_value` rides with it).
-    if isinstance(tc.get("moe_layer_freq"), list):
-        tc["moe_layer_freq"] = _slice_list(tc["moe_layer_freq"], plan.src_layers)
-    sparse = tc.get("sparse_attention_config")
-    if isinstance(sparse, dict):
-        for key in ("sparse_attention_freq", "sparse_disable_index_value"):
-            if isinstance(sparse.get(key), list):
-                sparse[key] = _slice_list(sparse[key], plan.src_layers)
-    # The draft modules are not shipped; nothing may claim them.
-    if "num_mtp_modules" in tc:
-        tc["num_mtp_modules"] = 0
-
-
 def _rewrite_gpt_oss(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     # `layer_types` is what makes a layer sliding vs full attention.
@@ -604,23 +559,6 @@ def _rewrite_gpt_oss(cfg: dict, plan: Plan) -> None:
     # gpt-oss carries the top-k under two names and HF reads both.
     if plan.experts is not None and isinstance(cfg.get("experts_per_token"), int):
         cfg["experts_per_token"] = min(cfg["experts_per_token"], plan.experts)
-
-
-def _rewrite_mimo_v2(cfg: dict, plan: Plan) -> None:
-    """MiMo-V2.6: `hybrid_layer_pattern` (1 = sliding) and `moe_layer_freq`
-    (0 = dense) are per-layer lists, cut with the layers. The towers' planes
-    are not kept, so their configs go too and the miniature is text-only."""
-    _rewrite_common(cfg, plan)
-    for key in ("hybrid_layer_pattern", "moe_layer_freq"):
-        if isinstance(cfg.get(key), list):
-            cfg[key] = _slice_list(cfg[key], plan.src_layers)
-    for key in ("vision_config", "audio_config"):
-        if key in cfg:
-            cfg[key] = None
-    # The fused qkv is stored pre-sharded at `num_key_value_heads` chunks; the
-    # depth cut moves no width, so every kept projection keeps its layout.
-    if "num_nextn_predict_layers" not in cfg:
-        cfg["num_nextn_predict_layers"] = 0
 
 
 def _rewrite_qwen3_5_moe(cfg: dict, plan: Plan) -> None:
@@ -761,69 +699,6 @@ def _rewrite_qwen4_exp(cfg: dict, plan: Plan) -> None:
 
     if "language_model_only" in cfg:
         cfg["language_model_only"] = True
-
-
-def _modelopt_modules(name: str, plan: Plan) -> list[str]:
-    """A module (or module glob) a modelopt recipe names, as the miniature
-    names it: once per output layer its source layer became, not at all when
-    the miniature drops it (the MTP head, an unselected layer), unchanged when
-    it is no layer's."""
-    if name.startswith("mtp."):
-        return []
-    if not name.startswith(plan.layer_prefix):
-        return [name]
-    head, dot, tail = name[len(plan.layer_prefix):].partition(".")
-    if not head.isdigit():
-        return [name]
-    return [f"{plan.layer_prefix}{out}{dot}{tail}"
-            for out, src in enumerate(plan.src_layers) if src == int(head)]
-
-
-def _modelopt_renamed(names: list[str], plan: Plan) -> list[str]:
-    return [out for name in names for out in _modelopt_modules(name, plan)]
-
-
-def _rewrite_qwen4_exp_modelopt(cfg: dict, plan: Plan) -> None:
-    """Qwen3.8-Flash-Next as NVIDIA's modelopt exports it: the `qwen4_exp`
-    rewrite, and the recipe's module lists moved onto the miniature's names.
-
-    The recipe is MIXED_PRECISION -- NVFP4 routed experts, an fp8 n-gram
-    table, fp8 block-128 MTP experts -- and states it per module, by source
-    name. A reader (vLLM's) quantizes exactly the modules the recipe lists, so
-    a kept layer must keep its entry under its new number and a dropped one
-    must lose it; the MTP head's goes with the head. Each kept expert keeps
-    its own `weight_scale_2` and `input_scale`: dropping experts slices no
-    plane of a survivor, so every scale still describes the codes beside it."""
-    _rewrite_qwen4_exp(cfg, plan)
-    q = cfg.get("quantization_config")
-    if not isinstance(q, dict):
-        return
-    for group in (q.get("config_groups") or {}).values():
-        if isinstance(group, dict) and isinstance(group.get("targets"), list):
-            group["targets"] = _modelopt_renamed(group["targets"], plan)
-    _rename_modelopt_lists(q, plan)
-    q["config_groups"] = {k: g for k, g in (q.get("config_groups") or {}).items()
-                          if not isinstance(g, dict) or g.get("targets")}
-
-
-def _rename_modelopt_lists(q: dict, plan: Plan) -> None:
-    for key in ("ignore", "exclude_modules"):
-        if isinstance(q.get(key), list):
-            q[key] = _modelopt_renamed(q[key], plan)
-    if isinstance(q.get("quantized_layers"), dict):
-        q["quantized_layers"] = {out: spec for name, spec in q["quantized_layers"].items()
-                                 for out in _modelopt_modules(name, plan)}
-
-
-def _rewrite_modelopt_quant_file(out_dir: Path, plan: Plan) -> None:
-    """`hf_quant_config.json`, modelopt's own statement of the recipe, moved
-    onto the miniature's names as the config's twin is."""
-    path = out_dir / "hf_quant_config.json"
-    if not path.exists():
-        return
-    doc = json.loads(path.read_text())
-    _rename_modelopt_lists(doc.get("quantization", {}), plan)
-    path.write_text(json.dumps(doc, indent=2) + "\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -1133,15 +1008,10 @@ def carry_quant_overrides(cfg: dict, pairs: list[tuple[str, str]]) -> dict[str, 
     kept: dict[str, int] = {}
     for key in ("quantization", "quantization_config"):
         table = cfg.get(key)
-        if not isinstance(table, dict) or table.get("quant_method") == "modelopt":
-            # A modelopt recipe names modules in lists, which the family's
-            # own rewrite moves.
+        if not isinstance(table, dict):
             continue
-        # An override is a module's own `bits` / `group_size`; any other dict
-        # (compressed-tensors' `config_groups`) is the recipe itself.
-        override = lambda v: isinstance(v, dict) and ("bits" in v or "group_size" in v)
-        modules = {k: v for k, v in table.items() if override(v)}
-        rebuilt = {k: v for k, v in table.items() if not override(v)}
+        modules = {k: v for k, v in table.items() if isinstance(v, dict)}
+        rebuilt = {k: v for k, v in table.items() if not isinstance(v, dict)}
         for module, spec in modules.items():
             head = module + "."
             for out_name, src_name in pairs:
@@ -1178,23 +1048,6 @@ FAMILIES: dict[str, dict[str, Any]] = {
         config_rewrite=_rewrite_qwen3_5_moe,
         text_cfg_key="text_config",
         keep_res=(re.compile(r"^model\.visual\."),),
-    ),
-    # The same decoder shipped text-only, as `Qwen3_5MoeForCausalLM` (Qwen3.8
-    # Max): the trunk at `model.layers.` with no wrapper, the configuration
-    # flat at the top level, no tower to keep.
-    "qwen3_5_moe_text": dict(
-        layer_prefix="model.layers.",
-        expert_re=None,
-        router_suffixes=(
-            "mlp.gate.weight",
-            "mlp.experts.gate_up_proj",
-            "mlp.experts.down_proj",
-        ),
-        globals_keep=("model.embed_tokens.weight",
-                      "model.norm.weight",
-                      "lm_head.weight"),
-        default_layers="0-7",
-        config_rewrite=_rewrite_qwen3_5_moe,
     ),
     # The same architecture as `mlx_lm.convert` leaves it, which is a different
     # *checkpoint* -- the `deepseek_v4` / `deepseek_v4_mlx` split again. Two
@@ -1292,38 +1145,6 @@ FAMILIES: dict[str, dict[str, Any]] = {
         globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
         default_layers="0-6",
         config_rewrite=_rewrite_glm,
-    ),
-    # Hy4-preview: the routed bank stacked on dim 0 (`gate_up_proj` /
-    # `down_proj`, one plane each per layer). Layers 0-5: the dense layer, the
-    # three "full" indexer layers 0, 1 and 5 and the "shared" 2-4 that reuse
-    # layer 1's choice. The MTP head (`model.mtp_layers.`) is dropped.
-    "hy_v4": dict(
-        layer_prefix="model.layers.",
-        expert_re=None,
-        router_suffixes=(
-            "mlp.gate.weight",
-            "mlp.gate.e_score_correction_bias",
-            "mlp.experts.gate_up_proj",
-            "mlp.experts.down_proj",
-        ),
-        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
-                      "model.hc_head.hc_head_fn", "model.hc_head.hc_head_scale",
-                      "model.hc_head.hc_head_base"),
-        default_layers="0-5",
-        config_rewrite=_rewrite_hy_v4,
-    ),
-    # Dots3 NOTE: DSA layers (full) and sliding-window latent layers, a
-    # dense layer 0, then routed experts. Layers 0-5 are both full layers up
-    # front, three sliding ones and a full one, so both latent widths and both
-    # caches are read. The vision and audio towers and the MTP head (layer 46,
-    # `model.mtp.embed_tokens`) are not kept.
-    "dots3_note": dict(
-        layer_prefix="model.layers.",
-        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
-        router_suffixes=("mlp.gate.weight", "mlp.gate.e_score_correction_bias"),
-        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
-        default_layers="0-5",
-        config_rewrite=_rewrite_dots3,
     ),
     # GLM-5.3-Flash as `mlx_lm` publishes it (Vontra/GLM-5.3-Flash-MLX-*): the
     # trunk under `model.language_model.layers.`, one affine trio per expert,
@@ -1482,35 +1303,6 @@ FAMILIES: dict[str, dict[str, Any]] = {
         default_layers="0-3",
         config_rewrite=_rewrite_qwen4_exp,
         text_cfg_key="text_config",
-        marker_re=re.compile(r"\.mlp\.experts\.gate_up_proj$"),
-    ),
-    # NVIDIA's modelopt NVFP4 export of the same names: every routed expert
-    # its own `gate_proj`/`up_proj`/`down_proj`, each a `weight` of packed
-    # e2m1 pairs beside an e4m3 `weight_scale` per 16 codes and the scalars
-    # `weight_scale_2` and `input_scale` -- so the bank shrinks by dropping
-    # whole experts, every survivor's scales untouched. The n-gram shards are
-    # e4m3 under one `ngram_embedding.weight_scale`, which the carve leaves
-    # true of every row it moves. The MTP head (fp8 block-128 experts) goes,
-    # as it does from the bf16 export.
-    "qwen4_exp_modelopt": dict(
-        model_type="qwen4_exp",
-        layer_prefix="model.language_model.layers.",
-        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
-        router_suffixes=("mlp.gate.weight",),
-        part_re=re.compile(r"\.ngram_embedding\.shard_(\d+)\."),
-        default_parts=8,
-        globals_keep=("model.language_model.embed_tokens.weight",
-                      "lm_head.weight",
-                      "model.language_model.hyper_connection_mixer.hc_norm.weight",
-                      "model.language_model.hyper_connection_mixer."
-                      "input_mix_weight_down.weight",
-                      "model.language_model.hyper_connection_mixer."
-                      "input_mix_weight_up.weight"),
-        default_layers="0-3",
-        config_rewrite=_rewrite_qwen4_exp_modelopt,
-        aux_rewrite=_rewrite_modelopt_quant_file,
-        text_cfg_key="text_config",
-        marker_re=re.compile(r"\.mlp\.experts\.\d+\.gate_proj\.weight_scale$"),
     ),
     "kimi_k25": dict(
         layer_prefix="language_model.model.layers.",
@@ -1588,25 +1380,6 @@ FAMILIES: dict[str, dict[str, Any]] = {
         # the miniature loads unmodified as `InklingForConditionalGeneration`.
         keep_res=(re.compile(r"^model\.visual\."), re.compile(r"^model\.audio\.")),
     ),
-    "minimax_m3_vl": dict(
-        layer_prefix="language_model.model.layers.",
-        expert_re=re.compile(r"\.block_sparse_moe\.experts\.(\d+)\."),
-        router_suffixes=("block_sparse_moe.gate.weight",
-                         "block_sparse_moe.e_score_correction_bias"),
-        globals_keep=("language_model.model.embed_tokens.weight",
-                      "language_model.model.norm.weight",
-                      "language_model.lm_head.weight"),
-        # Layers 0-2 are dense attention over a dense MLP, 3 on indexed
-        # attention over routed experts: 0-5 is every kind, the second three
-        # times.
-        default_layers="0-5",
-        config_rewrite=_rewrite_minimax_m3,
-        text_cfg_key="text_config",
-        # The tower is kept so the miniature loads unmodified as
-        # `MiniMaxM3SparseForConditionalGeneration`.
-        keep_res=(re.compile(r"^vision_tower\."), re.compile(r"^multi_modal_projector\."),
-                  re.compile(r"^patch_merge_mlp\.")),
-    ),
     "gpt_oss": dict(
         layer_prefix="model.layers.",
         # gpt-oss stacks the whole expert bank on dim 0 of a handful of
@@ -1629,20 +1402,6 @@ FAMILIES: dict[str, dict[str, Any]] = {
         # covers both.
         default_layers="0-3",
         config_rewrite=_rewrite_gpt_oss,
-    ),
-    # MiMo-V2.6 (Flash and Pro): one plane per expert (MXFP4 codes as
-    # `.weight` beside `.weight_scale` exponents), fp8 dense planes beside
-    # `weight_scale_inv`, the MTP head under `model.mtp.` (dropped) and the
-    # vision and audio towers (dropped).
-    "mimo_v2": dict(
-        layer_prefix="model.layers.",
-        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
-        router_suffixes=("mlp.gate.weight", "mlp.gate.e_score_correction_bias"),
-        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
-        # Flash: the dense full layer 0, four sliding layers, the full layer
-        # 5. Pro's next full layer is 7 (`--layers 0-2,7`).
-        default_layers="0-5",
-        config_rewrite=_rewrite_mimo_v2,
     ),
 }
 
@@ -1671,9 +1430,7 @@ def resolve_family(cfg: dict, weight_map: dict[str, str],
     if len(named) == 1:
         return named[0]
     fits = [k for k in named
-            if any(n.startswith(FAMILIES[k]["layer_prefix"]) for n in weight_map)
-            and ("marker_re" not in FAMILIES[k]
-                 or any(FAMILIES[k]["marker_re"].search(n) for n in weight_map))]
+            if any(n.startswith(FAMILIES[k]["layer_prefix"]) for n in weight_map)]
     if len(fits) != 1:
         raise SystemExit(
             f"model_type {model_type!r} is described by {named}, and the index "
@@ -1980,8 +1737,6 @@ def main() -> int:
               f"renumbered names")
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
     copy_aux_files(args.repo, args.revision, out_dir)
-    if fam.get("aux_rewrite") is not None:
-        fam["aux_rewrite"](out_dir, plan)
     write_index(out_dir, shard_files)
     if plan.family == "deepseek_v41":
         write_engram_token_map(out_dir)
@@ -2125,9 +1880,8 @@ def apply_engram_carve(outs: list["OutTensor"], src: dict[str, SrcTensor], plan:
 def mark_fp8_readout(outs: list["OutTensor"], plan: Plan) -> list["OutTensor"]:
     """Pair every fp8 plane with its `.scale` exponents so it is written as
     bf16, and drop the exponent planes from the output. The fp4 experts
-    (int8 code pairs) are not touched: pie reads them as MXFP4. DeepSeek-V4's
-    release layout (V4-Pro) stores its dense planes the same way."""
-    if plan.family not in ("deepseek_v41", "deepseek_v4"):
+    (int8 code pairs) are not touched: pie reads them as MXFP4."""
+    if plan.family != "deepseek_v41":
         return outs
     by_name = {ot.name: ot for ot in outs}
     kept: list[OutTensor] = []
@@ -2240,9 +1994,7 @@ def assign_rows(pairs: list[tuple[str, str]], src: dict[str, SrcTensor],
         t = src[src_name]
         ot = OutTensor(out_name, t)
         if router_rows is not None:
-            # The source name: `--text-only` strips the wrapper off `out_name`,
-            # and with it the layer prefix the suffix is found after.
-            tail = src_name.split(plan.layer_prefix, 1)[-1]
+            tail = out_name.split(plan.layer_prefix, 1)[-1]
             tail = tail.split(".", 1)[-1] if "." in tail else tail
             if tail in plan.router_suffixes and t.shape and t.shape[0] > router_rows:
                 ot.rows = router_rows

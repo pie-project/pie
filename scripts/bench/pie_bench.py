@@ -519,7 +519,6 @@ def build_config(args: argparse.Namespace):
             # `[model] device_weight_budget` / `host_weight_budget`: the
             # residency lever (what stays on the device, what streams). Metal
             # derives them from the working set when unset.
-            precision=getattr(args, "precision", None),
             device_weight_budget=getattr(args, "device_weight_budget", None),
             host_weight_budget=getattr(args, "host_weight_budget", None),
             device_kv_budget=getattr(args, "device_kv_budget", None),
@@ -1546,9 +1545,6 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--worker-threads", type=int, default=None)
         sp.add_argument("--extra-input", action="append", default=None, metavar="KEY=VALUE",
                         help="Extra inferlet input field (typed like --engine-option); repeatable.")
-        sp.add_argument("--precision", default=None,
-                        help="[model] precision, e.g. bf16+nvfp4a4: picks between the "
-                             "deployments one artifact serves")
         sp.add_argument("--device-weight-budget", default=None,
                         help="[model] device_weight_budget, e.g. 20GiB (metal residency)")
         sp.add_argument("--host-weight-budget", default=None,
