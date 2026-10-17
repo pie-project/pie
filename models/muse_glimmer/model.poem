@@ -1,5 +1,9 @@
 # Muse Glimmer: a dense decoder of sliding-window layers with a full-attention
-# layer every fourth, gated attention and sandwich norms.
+# layer every fourth, gated attention and sandwich norms. Muse Spark: the same
+# gated attention (its heads' outputs normalised before the gate), residual
+# gates in place of the sums, and a latent MoE (the hidden projected down and
+# normalised before the routed experts, each expert's output normalised, the
+# routes' sum projected back up).
 
 load("//lib/adapters/model.poem", "banks")
 
@@ -27,7 +31,121 @@ DIMS = {
     "muse-glimmer-30b-mini-l8": dims(layers = 8),
 }
 
+def spark_dims(layers, layer_types, rope_thetas, experts, bf16_expert_layers = []):
+    return struct(
+        hidden = 8192,
+        layers = layers,
+        layer_types = layer_types,
+        rope_thetas = rope_thetas,
+        q_heads = 128,
+        kv_heads = 16,
+        head_dim = 64,
+        vocab = 202048,
+        window = 2048,
+        qk_scale = 5.4730064863875,
+        softcap = 20.0,
+        output_multiplier = 0.17677669529663687,
+        norm_eps = 1e-5,
+        post_norm_eps = 1e-8,
+        gate_temperature = 0.3,
+        gate_eps = 1e-3,
+        moe_hidden = 4096,
+        moe_inter = 4096,
+        experts = experts,
+        top_k = min(8, experts),
+        scaling = 1.0,
+        bf16_expert_layers = bf16_expert_layers,
+    )
+
+# The release's first four layers, the first 16 of its 256 experts: one of
+# its full (NoPE) layers among sliding ones. AMD's Quark MXFP4 release keeps
+# layer 0's experts bf16.
+SPARK_MINI_TYPES = ["sliding", "full", "sliding", "sliding"]
+SPARK_MINI_THETAS = [500000.0, 0.0, 500000.0, 500000.0]
+SPARK = {
+    "muse-spark-mini-l4-e16": spark_dims(4, SPARK_MINI_TYPES, SPARK_MINI_THETAS, 16),
+    "muse-spark-mxfp4-mini-l4-e16": spark_dims(4, SPARK_MINI_TYPES, SPARK_MINI_THETAS, 16, bf16_expert_layers = [0]),
+}
+
+def spark_layout(id, deploy):
+    d = SPARK[id]
+    if len(deploy.weights) == 1:
+        w, experts = deploy.weights[0], deploy.weights[0]
+    elif len(deploy.weights) == 2:
+        w, experts = deploy.weights
+    else:
+        fail("{} stores its weights and its experts at a dtype each, not {}".format(id, deploy.weights))
+    dense = compute(w)
+    hidden = d.hidden
+    hd = d.head_dim
+    q_w = d.q_heads * hd
+    kv_w = d.kv_heads * hd
+    mh = d.moe_hidden
+    mi = d.moe_inter
+
+    def layer(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        vec = lambda s, dim: weight(n(s), [dim], dense)
+        bank = dense if l in d.bf16_expert_layers else experts
+        return struct(
+            full = d.layer_types[l] == "full",
+            theta = d.rope_thetas[l],
+            qkv = weight(n("qkv"), [q_w + 2 * kv_w, hidden], w).packed([q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+            gate = weight(n("gate"), [q_w, hidden], w).columns(),
+            o_proj = weight(n("o_proj"), [hidden, q_w], w).rows(),
+            kv = "kv.{}".format(l),
+            attn_norm = vec("attn_norm", hidden),
+            # Each residual gate as the two per-channel factors it blends by.
+            attn_alpha = vec("attn_alpha", hidden),
+            attn_beta = vec("attn_beta", hidden),
+            pre_ffw_norm = vec("pre_ffw_norm", hidden),
+            # The input-scaled norms' factors, `1 + weight`.
+            post_ffw_scale = vec("post_ffw_scale", hidden),
+            ffw_alpha = vec("ffw_alpha", hidden),
+            ffw_beta = vec("ffw_beta", hidden),
+            router = weight(n("router"), [d.experts, hidden], dense),
+            router_bias = weight(n("router_bias"), [d.experts], dtype.f32),
+            pre_expert = weight(n("pre_expert"), [mh, hidden], w),
+            pre_expert_norm = vec("pre_expert_norm", mh),
+            gate_up = weight(n("experts_gate_up"), [d.experts, 2 * mi, mh], bank).bank([mi, mi]),
+            down = weight(n("experts_down"), [d.experts, mh, mi], bank).rows(),
+            post_expert_scale = vec("post_expert_scale", mh),
+            post_expert = weight(n("post_expert"), [hidden, mh], w),
+        )
+
+    return struct(
+        kind = "spark",
+        hidden = hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        kv_heads = d.kv_heads,
+        head_dim = hd,
+        window = d.window,
+        sm_scale = f32(f32(d.qk_scale) / f32(sqrt(hd))),
+        norm_eps = d.norm_eps,
+        post_norm_eps = d.post_norm_eps,
+        gate_temperature = d.gate_temperature,
+        gate_eps = d.gate_eps,
+        output_multiplier = d.output_multiplier,
+        softcap = d.softcap,
+        kv = deploy.kv,
+        experts = d.experts,
+        top_k = d.top_k,
+        scaling = d.scaling,
+        moe_inter = mi,
+        embed = weight("embed", [d.vocab, hidden], dense),
+        lm_head = weight("lm_head", [d.vocab, hidden], w).packed([d.vocab]),
+        # Zeros the per-channel products (`standardize`) subtract.
+        zeros = weight("zeros", [hidden], dense),
+        zeros_moe = weight("zeros_moe", [mh], dense),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight("final_norm", [hidden], dense),
+        final_norm_eps = d.norm_eps,
+    )
+
 def layout(id, deploy):
+    if id in SPARK:
+        return spark_layout(id, deploy)
     if len(deploy.weights) != 1:
         fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
     d = DIMS[id]
@@ -67,6 +185,7 @@ def layout(id, deploy):
 
     lm_head = weight("lm_head", [d.vocab, hidden], proj).packed([d.vocab])
     return struct(
+        kind = "glimmer",
         hidden = hidden,
         vocab = d.vocab,
         q_heads = d.q_heads,

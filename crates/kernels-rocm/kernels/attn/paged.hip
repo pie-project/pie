@@ -771,9 +771,11 @@ __device__ __forceinline__ int window_reach(int wl, int G) {
     return wl + (kPrefillTileQ + G - 1) / G + 1;
 }
 
+// Keys a kv tile: a tile is whole 16-byte reads for every thread (64-wide
+// heads take 64 keys).
 template <int D>
 constexpr int prefill_bc() {
-    return D >= 512 ? 16 : 32;
+    return D >= 512 ? 16 : D <= 64 ? 64 : 32;
 }
 
 template <int D, bool HND, bool CAUSAL>

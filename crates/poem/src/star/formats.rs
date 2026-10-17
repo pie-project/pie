@@ -279,14 +279,23 @@ fn expr_methods(builder: &mut MethodsBuilder) {
         Ok(ExprValue(this.0.clone().bias(by.0 as f32)))
     }
 
-    /// The values put through `op`: "neg_ln" (`ln(-x)`), "sqrt" or "rsqrt".
+    /// The values at least `floor`.
+    fn at_least(this: &ExprValue, #[starlark(require = pos)] floor: UnpackFloat) -> anyhow::Result<ExprValue> {
+        use checkpoint::contract::UnaryOp;
+        Ok(ExprValue(this.0.clone().unary(UnaryOp::AtLeast((floor.0 as f32).to_bits()))))
+    }
+
+    /// The values put through `op`: "neg_ln" (`ln(-x)`), "sqrt", "rsqrt" or
+    /// "sigmoid".
     fn unary(this: &ExprValue, #[starlark(require = pos)] op: &str) -> anyhow::Result<ExprValue> {
         use checkpoint::contract::UnaryOp;
         let op = match op {
             "neg_ln" => UnaryOp::NegLn,
             "sqrt" => UnaryOp::Sqrt,
             "rsqrt" => UnaryOp::Rsqrt,
-            other => anyhow::bail!("a unary op is neg_ln, sqrt or rsqrt, not {other:?}"),
+            "sigmoid" => UnaryOp::Sigmoid,
+            "square" => UnaryOp::Square,
+            other => anyhow::bail!("a unary op is neg_ln, sqrt, rsqrt, sigmoid or square, not {other:?}"),
         };
         Ok(ExprValue(this.0.clone().unary(op)))
     }

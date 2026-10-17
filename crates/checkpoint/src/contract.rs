@@ -97,6 +97,10 @@ pub enum UnaryOp {
     NegLn,
     Sqrt,
     Rsqrt,
+    Sigmoid,
+    Square,
+    /// `max(x, floor)`, the floor an f32's bits.
+    AtLeast(u32),
 }
 
 impl UnaryOp {
@@ -106,6 +110,9 @@ impl UnaryOp {
             Self::NegLn => (-x).ln(),
             Self::Sqrt => x.sqrt(),
             Self::Rsqrt => x.sqrt().recip(),
+            Self::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+            Self::Square => x * x,
+            Self::AtLeast(floor) => x.max(f64::from(f32::from_bits(floor))),
         }
     }
 
@@ -115,6 +122,7 @@ impl UnaryOp {
             Self::NegLn => x < 0.0,
             Self::Sqrt => x >= 0.0,
             Self::Rsqrt => x > 0.0,
+            Self::Sigmoid | Self::Square | Self::AtLeast(_) => !x.is_nan(),
         }
     }
 
@@ -124,6 +132,7 @@ impl UnaryOp {
             Self::NegLn => "strictly negative",
             Self::Sqrt => "non-negative",
             Self::Rsqrt => "strictly positive",
+            Self::Sigmoid | Self::Square | Self::AtLeast(_) => "a number",
         }
     }
 }

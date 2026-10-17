@@ -1,9 +1,11 @@
-# How a Muse Glimmer checkpoint is laid out: transformers' names, the text
+# How a Muse Glimmer or Muse Spark checkpoint is laid out: transformers' names, the text
 # model under `model.language_model.`.
 
 TRUNK = "model.language_model."
 
 def formats(m):
+    if m.kind == "spark":
+        return [format("huggingface", read = lambda reads: spark(m, reads))]
     return [format("huggingface", read = lambda reads: huggingface(m, reads))]
 
 def huggingface(m, reads):
@@ -26,3 +28,100 @@ def huggingface(m, reads):
         reads.read(w.o_proj, n("self_attn.o_proj.weight"))
         reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
         reads.read(w.down, n("mlp.down_proj.weight"))
+
+# ---------------------------------------------------------------------------
+# Muse Spark: the release's names (the experts stacked as transformers holds
+# them), or AMD's Quark MXFP4 release (one plane an expert and leg, its
+# MXFP4 legs `weight` nibble pairs beside `weight_scale` e8m0 exponents).
+# ---------------------------------------------------------------------------
+
+F32 = encoding(dtype.f32)
+BF16 = encoding(dtype.bf16)
+
+def spark(m, reads):
+    at = lambda leaf: TRUNK + leaf
+    reads.read(m.embed, at("embed_tokens.weight"))
+    reads.read(m.final_norm, at("norm.weight"))
+    reads.read(m.lm_head, "lm_head.weight")
+    for z in [m.zeros, m.zeros_moe]:
+        reads.push(tensor(z.name, fill(0.0, z.shape, BF16), BF16, shape = z.shape))
+    for l, w in enumerate(m.layers):
+        n = lambda leaf: "{}layers.{}.{}".format(TRUNK, l, leaf)
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        reads.read(w.pre_ffw_norm, n("pre_feedforward_layernorm.weight"))
+        # The input-scaled norms read `1 + weight`, rounded as the weight is.
+        reads.read_expr(w.post_ffw_scale, src(n("post_feedforward_layernorm.weight")).bias(1.0))
+        residual_gate(reads, w.attn_alpha, w.attn_beta, n("post_attention_residual_gate.gate"), m)
+        residual_gate(reads, w.ffw_alpha, w.ffw_beta, n("post_feedforward_residual_gate.gate"), m)
+        reads.read_concat(w.qkv, [
+            n("self_attn.q_proj.weight"),
+            n("self_attn.k_proj.weight"),
+            n("self_attn.v_proj.weight"),
+        ])
+        reads.read(w.gate, n("self_attn.gate_proj.weight"))
+        reads.read(w.o_proj, n("self_attn.o_proj.weight"))
+        # The router's logits scaled by the output multiplier, folded in.
+        scaled = w.router.name + ".scaled"
+        reads.push(tensor(scaled, src(n("mlp.gate.weight")).scale(m.output_multiplier), F32, shape = list(w.router.shape), internal = True))
+        reads.push(tensor(w.router.name, out(scaled).cast(BF16), BF16, shape = list(w.router.shape)))
+        reads.read(w.router_bias, n("mlp.gate.e_score_correction_bias"))
+        reads.read(w.pre_expert, n("mlp.pre_expert_proj.weight"))
+        reads.read(w.pre_expert_norm, n("mlp.pre_expert_norm.weight"))
+        reads.read_expr(w.post_expert_scale, src(n("mlp.experts.post_expert_norm.weight")).bias(1.0))
+        reads.read(w.post_expert, n("mlp.post_expert_proj.weight"))
+        if has(n("mlp.experts.gate_up_proj")):
+            reads.read(w.gate_up, n("mlp.experts.gate_up_proj"))
+            reads.read(w.down, n("mlp.experts.down_proj"))
+        else:
+            leg = lambda e, which: n("mlp.experts.{}.{}_proj.weight".format(e, which))
+            expert_bank(reads, w.gate_up, [[leg(e, "gate"), leg(e, "up")] for e in range(m.experts)])
+            expert_bank(reads, w.down, [[leg(e, "down")] for e in range(m.experts)])
+
+def residual_gate(reads, alpha, beta, name, m):
+    """The gate's blend factors, each step rounded to bf16 as the reference
+    rounds them: w = g / T, beta = sigmoid(w), alpha = sqrt(max(sigmoid(-w)
+    (1 + beta), eps)), which is sqrt(max(1 - beta^2, eps)) as sigmoid(-w) =
+    1 - beta; every step its own internal tensor, as a contract transforms
+    one operand a step."""
+    at = lambda step: "{}.{}".format(alpha.name, step)
+    reads.push(tensor(at("w"), src(name).scale(1.0 / m.gate_temperature), BF16, shape = beta.shape, internal = True))
+    reads.push(tensor(beta.name, out(at("w")).unary("sigmoid"), BF16, shape = beta.shape))
+    steps = [
+        ("beta2", out(beta.name).unary("square")),
+        ("neg", out(at("beta2")).scale(-1.0)),
+        ("one_minus", out(at("neg")).bias(1.0)),
+        ("floored", out(at("one_minus")).at_least(m.gate_eps)),
+    ]
+    for step, expr in steps:
+        reads.push(tensor(at(step), expr, BF16, shape = beta.shape, internal = True))
+    reads.push(tensor(alpha.name, out(at("floored")).unary("sqrt"), BF16, shape = alpha.shape))
+
+def expert_bank(reads, w, experts):
+    """A bank `[experts, rows, cols]` from one plane an expert and leg: bf16
+    rows stacked, or MXFP4 legs with their exponents."""
+    rows, cols = w.shape[1], w.shape[2]
+    if w.dtype != dtype.mxfp4:
+        reads.read_expr(w, concat(0, [src(p) for legs in experts for p in legs]).transmute(list(w.shape), BF16))
+        return
+    codes = []
+    scales = []
+    for legs in experts:
+        for part in legs:
+            scale = part + "_scale"
+            if not has(scale):
+                fail("`{}`: `{}` holds MXFP4 codes whose exponents are stored beside it as `{}`, and the checkpoint holds none".format(w.name, part, scale))
+            per = rows // len(legs)
+            codes.append(src(part).transmute([1, per, cols], encoding(dtype.mxfp4)))
+            scales.append(src(scale).transmute([1, per, cols // 32], encoding(dtype.e8m0)))
+    counted = scales_shape(w)
+    codes = concat(0, codes)
+    scales = concat(0, scales)
+    # Two legs an expert stack to `[2E, inter, cols]`, the declared `[E,
+    # 2 inter, cols]` byte for byte; one leg an expert already is it.
+    if len(experts[0]) > 1:
+        codes = codes.transmute(list(w.shape), encoding(dtype.mxfp4))
+        scales = scales.transmute(counted, encoding(dtype.e8m0))
+    reads.extend([
+        tensor(w.name, codes, encoding(dtype.mxfp4)),
+        tensor(scales_name(w.name), scales, encoding(dtype.e8m0), shape = counted, scaling = w),
+    ])

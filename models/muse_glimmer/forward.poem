@@ -1,5 +1,8 @@
 # The forward of Muse Glimmer: sandwich-normed gated attention over a sliding
-# window, every fourth layer over the whole context, then a SwiGLU MLP.
+# window, every fourth layer over the whole context, then a SwiGLU MLP. Muse
+# Spark's: the same attention, its heads' outputs normalised before the gate,
+# each sublayer blended into the residual by its gate's per-channel factors,
+# and a latent MoE.
 
 WINDOWED = 0
 FULL = 1
@@ -12,6 +15,8 @@ def caches(m, c):
         c.kv(kv, w.kv, [plane, plane], m.head_dim, heads = True)
 
 def forward(m, inputs):
+    if m.kind == "spark":
+        return spark_forward(m, inputs)
     d = m.head_dim
     windows = [m.window, None]
     ([input_m, input_s, input_d], input_p) = inputs.partition(CLASSES)
@@ -77,6 +82,90 @@ def forward(m, inputs):
             ops.elemwise.rmsnorm_plus_one(f, w.post_ffw_norm, w.post_ffw_norm_eps),
             y,
         )
+
+    y = inputs.fold_layers(m.layers, y, block)
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps) * m.output_multiplier
+    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    return ops.attn.logit_softcap(ops.linear.lm_head(x, m.lm_head), m.softcap)
+
+def spark_forward(m, inputs):
+    d = m.head_dim
+    windows = [m.window, None]
+    ([input_m, input_s, input_d], input_p) = inputs.partition(CLASSES)
+
+    def plans(input, plan):
+        return [plan(input, m.q_heads, m.kv_heads, d, win) for win in windows]
+
+    plan_m = plans(input_m, ops.attn.plan_prefill)
+    plan_s = plans(input_s, ops.attn.plan_prefill)
+    plan_d = plans(input_d, ops.attn.plan_decode)
+    plan_p = plans(input_p, ops.attn.plan_prefill)
+    mask = inputs.mask()
+    positions = inputs.positions()
+
+    y = ops.elemwise.rmsnorm_no_scale(
+        ops.layout.embed(inputs.tokens(), m.embed, m.vocab),
+        m.hidden,
+        m.norm_eps,
+    )
+
+    def per_channel(x, factor):
+        zeros = m.zeros if factor.shape[0] == m.hidden else m.zeros_moe
+        return ops.elemwise.standardize(x, zeros, factor)
+
+    def blend(residual, x, alpha, beta):
+        return ops.elemwise.residual_add(per_channel(residual, alpha), per_channel(x, beta))
+
+    def input_scaled(x, factor, width):
+        return ops.elemwise.rmsnorm_no_scale(per_channel(x, factor), width, m.post_norm_eps)
+
+    def select(act, bank, routes):
+        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
+            return ops.linear.moe_matmul_select(act, bank, routes, m.top_k)
+        return ops.linear.moe_matmul_select_quant(act, bank, routes, m.top_k)
+
+    def block(l, w, y):
+        reading = FULL if w.full else WINDOWED
+        win = windows[reading]
+        normed = ops.elemwise.rmsnorm_plus_one(y, w.attn_norm, m.norm_eps)
+        pages = inputs.kv(w.kv)
+
+        q, k, v = ops.layout.split_qkv(ops.linear.matmul(normed, w.qkv), m.q_heads * d, m.kv_heads * d)
+        q = ops.elemwise.rmsnorm_no_scale(q, d, m.norm_eps)
+        k = ops.elemwise.rmsnorm_no_scale(k, d, m.norm_eps)
+        if w.theta != 0.0:
+            q, k = ops.elemwise.rope_full(q, k, positions, d, w.theta, False)
+        ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
+        seam.at(seam.ATTN_Q, [q])
+
+        ([mq, sq, dq], p) = q.partition(CLASSES)
+        if w.full:
+            so, lse = ops.attn.prefill_lse(sq, plan_s[reading], pages, win, d, m.kv_heads, m.sm_scale)
+            seam.at(seam.SCORES, [lse])
+        else:
+            so = ops.attn.prefill(sq, plan_s[reading], pages, win, d, m.kv_heads, m.sm_scale)
+        a = merge([
+            ops.attn.masked(mq, plan_m[reading], mask, pages, win, d, m.kv_heads, True, m.sm_scale),
+            so,
+            ops.attn.decode(dq, plan_d[reading], pages, win, d, m.sm_scale),
+            ops.attn.prefill(p, plan_p[reading], pages, win, d, m.kv_heads, m.sm_scale),
+        ])
+        seam.at(seam.ATTN_OUT, [a])
+
+        a = ops.elemwise.rmsnorm_no_scale(a, d, m.norm_eps)
+        o = ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(a, ops.linear.matmul(normed, w.gate)), w.o_proj)
+        o = ops.elemwise.rmsnorm_no_scale(o, m.hidden, m.post_norm_eps)
+        y = blend(y, o, w.attn_alpha, w.attn_beta)
+
+        x = ops.elemwise.rmsnorm_plus_one(y, w.pre_ffw_norm, m.norm_eps)
+        routes, weights = ops.linear.moe_topk_sigmoid_biased(
+            ops.linear.matmul(x, w.router), w.router_bias, m.experts, m.top_k, True, m.scaling)
+        h = ops.elemwise.rmsnorm_plus_one(ops.linear.matmul(x, w.pre_expert), w.pre_expert_norm, m.norm_eps)
+        act = ops.linear.mlp_swiglu(select(h, w.gate_up, routes), m.moe_inter)
+        e = input_scaled(select(act, w.down, routes), w.post_expert_scale, w.post_expert_scale.shape[0])
+        f = ops.linear.matmul(ops.linear.moe_weighted_sum(e, weights), w.post_expert)
+        f = input_scaled(f, w.post_ffw_scale, m.hidden)
+        return blend(y, f, w.ffw_alpha, w.ffw_beta)
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps) * m.output_multiplier
