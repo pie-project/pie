@@ -27,9 +27,24 @@ pub const ROWS: [u32; 10] = [1, 4, 6, 8, 16, 64, 256, 1024, 4096, 8192];
 #[ignore = "benchmark"]
 fn bench_linear() {
     let Some(gpu) = Gpu::open() else { return };
-    for (name, n, k) in SHAPES {
+    // BENCH_LINEAR_SHAPES="n,k;n,k" and BENCH_LINEAR_ROWS="m,m" replace the
+    // defaults.
+    let shapes: Vec<(&str, u32, u32)> = std::env::var("BENCH_LINEAR_SHAPES").map_or_else(
+        |_| SHAPES.to_vec(),
+        |v| {
+            v.split(';')
+                .map(|s| {
+                    let mut it = s.split(',').map(|x| x.parse().unwrap());
+                    ("custom", it.next().unwrap(), it.next().unwrap())
+                })
+                .collect()
+        },
+    );
+    let rows: Vec<u32> = std::env::var("BENCH_LINEAR_ROWS")
+        .map_or_else(|_| ROWS.to_vec(), |v| v.split(',').map(|x| x.parse().unwrap()).collect());
+    for (name, n, k) in shapes {
         let w = gpu.tensor(&values((n * k) as usize, 2, 0.05), n, k, Dtype::Bf16);
-        for m in ROWS {
+        for &m in &rows {
             if name == "lm_head" && m > 1024 {
                 continue;
             }
