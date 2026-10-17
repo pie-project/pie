@@ -303,6 +303,14 @@ pub struct SdpaMlaSparse;
 #[decision(id = "kernel.sdpa.index_mma", flag, default = false, tune = search)]
 pub struct SdpaIndexMma;
 
+/// Whether a prefill's pooled index (512 rows and up, 64 heads of 128)
+/// scores on tcgen05 (`attn/index_tc5.cuh`: two rows' heads an MMA's 128
+/// lanes against tiles of 128 blocks), then ranks in a launch of its own;
+/// off, the mma.sync scorer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.index_tc5", flag, default = false, tune = search)]
+pub struct SdpaIndexTc5;
+
 /// Whether a pooled index (`attention.index_topk`) finds its best blocks by
 /// a radix select (four histogram passes, then a block scan) rather than
 /// forty bisection passes and a one-thread walk. Off bisects.
@@ -631,6 +639,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeXqaCluster>()
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
+        .add::<SdpaIndexTc5>()
         .add::<SdpaIndexRadix>()
         .add::<SdpaPoolMma>()
         .add::<SdpaDsv4PrefillFrom>()
@@ -717,6 +726,7 @@ pub struct Tuning {
     pub decode_xqa_cluster: u32,
     pub selected_mma: bool,
     pub index_mma: bool,
+    pub index_tc5: bool,
     pub index_radix: bool,
     pub pool_mma: bool,
     pub dsv4_prefill_from: u32,
@@ -801,6 +811,7 @@ impl Tuning {
         decode_xqa_cluster: 0,
         selected_mma: false,
         index_mma: false,
+        index_tc5: false,
         index_radix: false,
         pool_mma: false,
         dsv4_prefill_from: 0,
@@ -885,6 +896,7 @@ impl Tuning {
             decode_xqa_cluster: profile.get::<DecodeXqaCluster>().0,
             selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),
             index_mma: profile.on::<SdpaIndexMma>(&Anywhere),
+            index_tc5: profile.on::<SdpaIndexTc5>(&Anywhere),
             index_radix: profile.on::<SdpaIndexRadix>(&Anywhere),
             pool_mma: profile.on::<SdpaPoolMma>(&Anywhere),
             dsv4_prefill_from: profile.get::<SdpaDsv4PrefillFrom>().0,

@@ -38,6 +38,11 @@ sdpa.dsv4_prefill_from = 512
 # GLM-5.3's DSA (sparse MLA, top-2048 tokens a row) a block a row on
 # tcgen05, the selected keys' latent and rotated part gathered whole.
 sdpa.mla_sparse = true
+# A prefill's pooled index (512 rows and up) scored on tcgen05, two rows'
+# 64 heads an MMA's 128 lanes against tiles of 128 blocks, then ranked:
+# DeepSeek-V4-Flash's indexer over 2048 rows of a 4096-position request,
+# top 512, 169 -> 89 us (turned queries 175 -> 98).
+sdpa.index_tc5 = true
 # A pooled index's top-k by radix select rather than forty bisection passes
 # (DSV4-Flash's 512 of up to 1024 blocks, 2048 rows: 417 -> 220 us).
 sdpa.index_radix = true

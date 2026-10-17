@@ -381,6 +381,29 @@ fn ranked(
             .saturating_mul(core::mem::size_of::<f32>()),
     )?;
 
+    #[cfg(feature = "cuda")]
+    if ctx.tuning().index_tc5
+        && head_dim == 128
+        && heads <= 64
+        && selection.rows >= TC5_FROM
+        && ranked_tc5(
+            ctx,
+            q,
+            weights,
+            keys,
+            heads,
+            top_k,
+            ratio,
+            turn,
+            score_stride,
+            scores as usize as u64,
+            num_requests,
+            selection,
+        )?
+    {
+        return Ok(true);
+    }
+
     // The tensor-core scorer where the profile asks for it and the heads fit
     // one mma's rows at its key width.
     // (one to four tiles of 16 heads: DeepSeek-V4's indexer is 64 wide).
@@ -577,4 +600,191 @@ pub fn topk_block_max(
             ctx.stage(),
         ],
     )
+}
+
+/// A prefill's rows, from which the pooled index scores on tcgen05 where
+/// `kernel.sdpa.index_tc5` says.
+#[cfg(feature = "cuda")]
+const TC5_FROM: u32 = 512;
+
+/// `pie::attn::index_tc5::Params`, field for field.
+#[cfg(feature = "cuda")]
+#[repr(C)]
+struct Tc5Params {
+    q: u64,
+    w: u64,
+    qo_indptr: u64,
+    page_indices: u64,
+    page_indptr: u64,
+    last_page_lens: u64,
+    scores: u64,
+    turn_pos: u64,
+    win: u64,
+    requests: i32,
+    heads: i32,
+    page_size: i32,
+    score_stride: i32,
+    top_k: i32,
+    ratio: i32,
+    per: i32,
+    rows: i32,
+    turn_dim: i32,
+    turn_theta: f32,
+    turn_factor: f32,
+    turn_low: f32,
+    turn_high: f32,
+}
+
+/// `pie::attn::index_tc5::smem_bytes`: two Q buffers and three key tiles of
+/// 32 KB, the warps' sums, the weights, barriers and the alignment.
+#[cfg(feature = "cuda")]
+const TC5_SMEM: u32 = (2 + 3) * 32768 + 8 * 128 * 4 + 2 * 128 * 4 + 256 + 1024;
+
+/// The pooled index scored on tcgen05 (`index_logits_tc5`) and ranked a
+/// block a row (`index_select_rows`): `Ok(false)` where the pool's pages do
+/// not land as the kernel reads them (a page's entries whole boxes of 4 to
+/// 128 that tile 128 blocks), and the caller scores as before.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn ranked_tc5(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    weights: Option<Tensor>,
+    keys: &KvPool,
+    heads: i32,
+    top_k: i32,
+    ratio: i32,
+    turn: Option<QueryTurn>,
+    score_stride: i32,
+    scores: u64,
+    num_requests: i32,
+    selection: &mut Tensor,
+) -> Result<bool, Error> {
+    use crate::linear::tc5::{Map, encode, supported};
+    use cudarc::driver::sys as dr;
+    const OP: &str = "attention.index_topk";
+    const TC5_FILE: &str = "attn/index_tc5.cuh";
+    let page = keys.page_size;
+    let cells = keys.keys.rows;
+    let per = if ratio > 0 && page % ratio == 0 {
+        page / ratio
+    } else {
+        0
+    };
+    if !supported()
+        || !matches!(per, 4 | 8 | 16 | 32 | 64 | 128)
+        || !cells.is_multiple_of(ratio.unsigned_abs())
+        || keys.seq_stride != 128
+        || !keys.keys.ptr.is_multiple_of(16)
+        || !q.data.ptr.is_multiple_of(16)
+    {
+        return Ok(false);
+    }
+    let (turn_pos, turn_dim, turn_theta, turn_factor, turn_low, turn_high) = match turn {
+        Some(t) if t.dim > 0 && t.dim <= 128 && t.dim.is_multiple_of(8) => {
+            let dim = stated(OP, t.dim)?;
+            let (factor, low, high) = match t.yarn {
+                Some(y) => {
+                    let (low, high) = crate::elemwise::rope::ramp_bounds(
+                        dim,
+                        t.theta,
+                        y.beta_fast,
+                        y.beta_slow,
+                        i32::try_from(y.original_max_position).unwrap_or(i32::MAX),
+                    );
+                    (y.factor, low, high)
+                }
+                None => (1.0, 0.0, 0.0),
+            };
+            (t.positions.ptr, dim, t.theta, factor, low, high)
+        }
+        Some(_) => return Ok(false),
+        None => (0, 0, 0.0, 1.0, 0.0, 0.0),
+    };
+    let ratio_u = ratio.unsigned_abs();
+    let map = encode(Map {
+        ptr: keys.keys.ptr,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        dims: [128, ratio_u, cells / ratio_u],
+        strides: [256, 256 * u64::from(ratio_u)],
+        boxes: [64, 1, per.unsigned_abs()],
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    })?;
+    // Eight consecutive pages' entries a box, where a tile holds eight pages.
+    let map8 = encode(Map {
+        ptr: keys.keys.ptr,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        dims: [128, ratio_u, cells / ratio_u],
+        strides: [256, 256 * u64::from(ratio_u)],
+        boxes: [64, 1, (8 * per.unsigned_abs()).min(256)],
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    })?;
+    let win = match ctx.stage() {
+        ArgValue::Ptr(at) => at,
+        _ => 0,
+    };
+    let rows = stated(OP, selection.rows)?;
+    let params = Tc5Params {
+        q: q.data.ptr,
+        w: weights.map_or(0, |w| w.ptr),
+        qo_indptr: q.indptr.ptr,
+        page_indices: keys.page_indices.ptr,
+        page_indptr: keys.page_indptr.ptr,
+        last_page_lens: keys.last_page_lens.ptr,
+        scores,
+        turn_pos,
+        win,
+        requests: num_requests,
+        heads,
+        page_size: page,
+        score_stride,
+        top_k,
+        ratio,
+        per,
+        rows,
+        turn_dim,
+        turn_theta,
+        turn_factor,
+        turn_low,
+        turn_high,
+    };
+    let bytes = ArgValue::Bytes {
+        ptr: (&raw const params).cast(),
+        len: core::mem::size_of::<Tc5Params>(),
+    };
+    let pairs = selection.rows.div_ceil(2);
+    ctx.fire(
+        OP,
+        Fire::at(TC5_FILE, "::pie::attn::index_tc5::index_logits_tc5").apply(
+            Launch::grid(
+                [pairs.min(ctx.multiprocessors().unwrap_or(148)), 1, 1],
+                [384, 1, 1],
+            )
+            .smem(TC5_SMEM),
+        ),
+        &[
+            ArgValue::Bytes {
+                ptr: map.as_ptr().cast(),
+                len: 128,
+            },
+            ArgValue::Bytes {
+                ptr: map8.as_ptr().cast(),
+                len: 128,
+            },
+            bytes,
+        ],
+    )?;
+    let radix = ctx.tuning().index_radix;
+    ctx.fire(
+        OP,
+        Fire::at(
+            TC5_FILE,
+            symbol(&format!(
+                "::pie::attn::index_tc5::index_select_rows<{radix}>"
+            )),
+        )
+        .apply(Launch::grid([selection.rows, 1, 1], [K_BLOCK, 1, 1])),
+        &[bytes, selection.arg()],
+    )?;
+    Ok(true)
 }

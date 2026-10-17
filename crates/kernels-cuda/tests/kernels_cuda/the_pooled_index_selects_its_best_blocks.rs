@@ -172,7 +172,8 @@ fn the_pooled_index_paces_a_prefill() {
     const K: usize = 512;
     const SPAN: usize = 4096;
     const ROWS: usize = 2048;
-    const PG: usize = 64;
+    // DeepSeek-V4-Flash's 16-position pages.
+    const PG: usize = 16;
     let pages = SPAN / PG;
     let mut gpu = Gpu::open();
     let mut rng = Lcg::seeded(0x5a11);
@@ -201,10 +202,17 @@ fn the_pooled_index_paces_a_prefill() {
     let mut selection = Tensor::new(sel_at, ROWS as u32, K as u32, Dtype::I32);
     let positions: Vec<i32> = (0..ROWS as i32).map(|r| (SPAN - ROWS) as i32 + r).collect();
     let pos_t = Tensor::new(gpu.up(&positions), ROWS as u32, 1, Dtype::I32);
-    for (radix, turned) in [(false, false), (true, false), (true, true)] {
+    for (radix, turned, tc5) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+        (true, true, true),
+    ] {
         let ctx = gpu.ctx().with_tuning(Tuning {
             index_mma: true,
             index_radix: radix,
+            index_tc5: tc5,
             ..Tuning::DEFAULT
         });
         let mut fire = || {
@@ -259,7 +267,7 @@ fn the_pooled_index_paces_a_prefill() {
         gpu.sync();
         let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
         println!(
-            "| index top-{K}, {ROWS} rows of a {SPAN}-position request, radix {radix}, turned {turned} | {us:.0} us |"
+            "| index top-{K}, {ROWS} rows of a {SPAN}-position request, radix {radix}, turned {turned}, tcgen05 {tc5} | {us:.0} us |"
         );
     }
 }
@@ -407,6 +415,153 @@ fn the_indexers_rotations_land_the_same_a_pair_a_thread() {
         assert!(
             (a - b).abs() <= b.abs() / 128.0 + 1e-3,
             "key element {i}: {a} a warp a row against {b} a block a row"
+        );
+    }
+}
+
+/// A prefill's ranking on tcgen05 (`kernel.sdpa.index_tc5`) selects what the
+/// mma.sync scorer selects: two requests' rows (the second's run starting
+/// mid-pair, one row alone at the end), their tails turned or not, the
+/// selections alike but for blocks whose scores tie to f32 rounding.
+#[test]
+fn a_prefills_ranking_on_tcgen05_selects_what_the_mma_scorer_selects() {
+    // DeepSeek-V4-Flash's 16-position pages (four blocks a page) and 64's.
+    // Pages out of order, and in order (eight a box).
+    check_tc5(16, true);
+    check_tc5(16, false);
+    check_tc5(64, true);
+}
+
+#[allow(non_snake_case)]
+fn check_tc5(PG: usize, shuffled: bool) {
+    const H: usize = 64;
+    const K: usize = 128;
+    let spans = [1531usize, 2048];
+    let rows_of = [767usize, 1024];
+    let rows: usize = rows_of.iter().sum();
+    let pages_of: Vec<usize> = spans.iter().map(|s| s.div_ceil(PG)).collect();
+    let total_pages: usize = pages_of.iter().sum();
+    let mut gpu = Gpu::open();
+    let mut rng = Lcg::seeded(0x7c5);
+    let (q_raw, _) = rng.row(rows * H * DIM);
+    let (k_raw, _) = rng.row(total_pages * PG * DIM);
+    let w_raw: Vec<u16> = (0..rows * H)
+        .map(|_| to_bf16(rng.unit().abs() + 0.25))
+        .collect();
+    // Pages out of order (request r's page i near pool page 7 i + 3 r), or
+    // in order.
+    let mut page_indices = Vec::new();
+    let mut taken = vec![false; total_pages];
+    for (r, &n) in pages_of.iter().enumerate() {
+        for i in 0..n {
+            let mut at = if shuffled {
+                (i * 7 + r * 3) % total_pages
+            } else {
+                page_indices.len()
+            };
+            while taken[at] {
+                at = (at + 1) % total_pages;
+            }
+            taken[at] = true;
+            page_indices.push(at as i32);
+        }
+    }
+    let indptr_pages = vec![0i32, pages_of[0] as i32, total_pages as i32];
+    let last: Vec<i32> = spans.iter().map(|s| ((s - 1) % PG + 1) as i32).collect();
+    let k_at = gpu.up(&k_raw);
+    let keys = KvPool {
+        keys: Tensor::new(k_at, (total_pages * PG) as u32, DIM as u32, Dtype::Bf16),
+        values: Tensor::new(k_at, (total_pages * PG) as u32, DIM as u32, Dtype::Bf16),
+        page_indices: Tensor::new(gpu.up(&page_indices), total_pages as u32, 1, Dtype::I32),
+        page_indptr: Tensor::new(gpu.up(&indptr_pages), 3, 1, Dtype::I32),
+        last_page_lens: Tensor::new(gpu.up(&last), 2, 1, Dtype::I32),
+        page_size: PG as i32,
+        max_pages_per_request: pages_of.iter().copied().max().unwrap() as i32,
+        pages_in_batch: total_pages as i32,
+        ..pool(k_at, [0, 0, 0])
+    };
+    let qo = vec![0i32, rows_of[0] as i32, rows as i32];
+    let positions: Vec<i32> = (0..rows)
+        .map(|t| {
+            if t < rows_of[0] {
+                (spans[0] - rows_of[0] + t) as i32
+            } else {
+                (spans[1] - rows_of[1] + t - rows_of[0]) as i32
+            }
+        })
+        .collect();
+    let q_at = gpu.up(&q_raw);
+    let w_at = gpu.up(&w_raw);
+    let qo_at = gpu.up(&qo);
+    let pos_t = Tensor::new(gpu.up(&positions), rows as u32, 1, Dtype::I32);
+    for turned in [false, true] {
+        let mut picks = Vec::new();
+        for tc5 in [false, true] {
+            let ctx = gpu.ctx().with_tuning(Tuning {
+                index_mma: true,
+                index_radix: true,
+                index_tc5: tc5,
+                ..Tuning::DEFAULT
+            });
+            let sel_at = gpu.zeros(rows * K * 4);
+            let mut selection = Tensor::new(sel_at, rows as u32, K as u32, Dtype::I32);
+            let q = RaggedTensor {
+                data: Tensor::new(q_at, rows as u32, (H * DIM) as u32, Dtype::Bf16),
+                indptr: Tensor::new(qo_at, 3, 1, Dtype::I32),
+            };
+            let w = Some(Tensor::new(w_at, rows as u32, H as u32, Dtype::Bf16));
+            if turned {
+                let turn = index::QueryTurn {
+                    positions: pos_t,
+                    dim: 64,
+                    theta: 1e4,
+                    yarn: None,
+                };
+                assert!(
+                    index::topk_turned(
+                        &ctx,
+                        q,
+                        w,
+                        &keys,
+                        H as u32,
+                        DIM as u32,
+                        K as u32,
+                        RATIO as u32,
+                        turn,
+                        &mut selection
+                    )
+                    .expect("the turned ranking fires"),
+                    "the scorer turns its queries"
+                );
+            } else {
+                index::topk(
+                    &ctx,
+                    q,
+                    w,
+                    &keys,
+                    H as u32,
+                    DIM as u32,
+                    K as u32,
+                    RATIO as u32,
+                    &mut selection,
+                )
+                .expect("the ranking fires");
+            }
+            gpu.sync();
+            picks.push(gpu.down::<i32>(sel_at, rows * K));
+        }
+        let mut differ = 0usize;
+        for t in 0..rows {
+            let a: std::collections::BTreeSet<i32> =
+                picks[0][t * K..(t + 1) * K].iter().copied().collect();
+            let b: std::collections::BTreeSet<i32> =
+                picks[1][t * K..(t + 1) * K].iter().copied().collect();
+            differ += a.symmetric_difference(&b).count();
+        }
+        assert!(
+            differ * 2000 <= rows * K,
+            "pages {PG}, shuffled {shuffled}, turned {turned}: {differ} of {} picks differ between the scorers",
+            rows * K
         );
     }
 }
