@@ -65,7 +65,7 @@ def velocity(width: int) -> Tensor:
 
 
 def pixels(rows: int, width: int) -> Tensor:
-    """The pixels a VAE reading lands (design D8), `[rows, width]` F32 at the
+    """The pixels a VAE reading lands, `[rows, width]` F32 at the
     epilogue: one row per OUTPUT voxel of the lane's clip. `rows` is declared
     (a VAE lane has no token rows to derive it from); `width` is checked at
     bind against the model's `pixels_width` when it states one."""

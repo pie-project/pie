@@ -18,7 +18,21 @@ pub struct StepDone {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepOutcome {
     Committed,
+    Wrote(Vec<KvWrites>),
     Faulted(String),
+}
+
+/// What one lane wrote to the KV cache in a step, row by row: the token it
+/// embedded at its position, into the slot at `offsets[i]` of pool page
+/// `pages[i]`. Rows are empty where the engine cannot place them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KvWrites {
+    pub tag: u64,
+    pub tokens: Vec<u32>,
+    pub positions: Vec<u32>,
+    pub pages: Vec<u32>,
+    pub offsets: Vec<u32>,
+    pub fold: Option<u32>,
 }
 
 pub type CompletionSink = std::sync::Arc<dyn Fn(StepDone, StepOutcome) + Send + Sync>;

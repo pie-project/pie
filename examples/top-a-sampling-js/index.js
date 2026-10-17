@@ -7,12 +7,9 @@
 import { chat, eta, model } from '@pie-project/inferlet';
 
 const {
-  Channel, ForwardPass, Pipeline, RsWorkingSet, WorkingSet, broadcast, cast, channelCapacity, constant, dtype, ge, gumbelMax,
-  indptr, intrinsics, iota, kvPageSize, reduceMax, reduceSum, reshape, select, softmax,
+  Channel, ForwardPass, Pipeline, WorkingSet, broadcast, cast, channelCapacity, constant, dtype, ge, gumbelMax,
+  intrinsics, iota, reduceMax, reduceSum, reshape, select, softmax,
 } = eta;
-
-const range = (a, b) => Array.from({ length: b - a }, (_, i) => a + i);
-const divCeil = (a, b) => Math.floor((a + b - 1) / b);
 
 /** The top-a keep-mask: [keep, keptCount, keptMass]. */
 function topAKeep(logits, vocab, a) {
@@ -44,10 +41,7 @@ export function main(input) {
   if (!(temperature > 0) || !Number.isFinite(temperature)) throw new Error('temperature must be finite and greater than 0');
 
   const vocab = model.outputVocabSize();
-  const kind = model.passKind();
   const ws = new WorkingSet();
-  const rsWs = kind !== 'attention' ? [new RsWorkingSet()] : [];
-  const pageSize = kvPageSize();
   if (maxTokens === 0) return { sampler: 'top-a', text: '', count: 0, a, mean_kept: 0, min_kept: 0, mean_mass: 0 };
 
   // The model's opening (`<bos>` where it has one) before the raw text: a
@@ -55,8 +49,6 @@ export function main(input) {
   let prompt = [...chat.prefix(), ...model.encode(promptText)];
   if (prompt.length === 0) prompt = [0];
   const n = prompt.length;
-  const maxPages = Math.max(divCeil(n + maxTokens + 1, pageSize), 1);
-  ws.reserve(maxPages);
 
   const generated = [];
   const s1 = [];
@@ -65,20 +57,14 @@ export function main(input) {
   // ── PREFILL FIRE (N-wide) ──
   const toksP = Channel.from(prompt, dtype.i32).named('toks_p');
   const embedIndptrP = Channel.from([0, n], dtype.u32).named('embed_indptr_p');
-  const positionsP = Channel.from(range(0, n), dtype.u32).named('positions_p');
-  const pagesP = Channel.from(range(0, maxPages), dtype.u32).named('pages_p');
-  const pageIndptrP = Channel.from([0, divCeil(n, pageSize)], dtype.u32).named('page_indptr_p');
-  const wSlotP = Channel.from(range(0, n).map((p) => Math.floor(p / pageSize)), dtype.u32).named('w_slot_p');
-  const wOffP = Channel.from(range(0, n).map((p) => p % pageSize), dtype.u32).named('w_off_p');
-  const kvLenP = Channel.from([n], dtype.u32).named('kv_len_p');
   const rngP = Channel.from([seed, 0], dtype.u32).named('rng_p');
   const tokOutP = new Channel([1], dtype.i32).named('tok_out_p');
   const s1OutP = new Channel([1], dtype.f32).named('s1_out_p');
   const s2OutP = new Channel([1], dtype.f32).named('s2_out_p');
 
-  const fwdP = new ForwardPass(kind);
+  const fwdP = new ForwardPass();
   fwdP.embed(toksP, embedIndptrP);
-  fwdP.bindState(ws, { kvLen: kvLenP, pages: pagesP, pageIndptr: pageIndptrP, wSlot: wSlotP, wOff: wOffP, positions: positionsP }, rsWs);
+  fwdP.state([ws], { fold: 'all' });
   fwdP.epilogue(() => {
     const r = rngP.take();
     const logits = intrinsics.logits();
@@ -105,30 +91,16 @@ export function main(input) {
     const s1Out = new Channel([1], dtype.f32).capacity(cap).named('s1_out');
     const s2Out = new Channel([1], dtype.f32).capacity(cap).named('s2_out');
     const lane1 = Channel.from([0, 1], dtype.u32).named('embed_indptr');
-    const positions = Channel.from([n], dtype.u32).named('positions');
-    const pages = Channel.from(range(0, maxPages), dtype.u32).named('pages');
-    const pageIndptr = Channel.from([0, divCeil(n + 1, pageSize)], dtype.u32).named('page_indptr');
-    const wSlot = Channel.from([Math.floor(n / pageSize)], dtype.u32).named('w_slot');
-    const wOff = Channel.from([n % pageSize], dtype.u32).named('w_off');
-    const kvLen = Channel.from([n + 1], dtype.u32).named('kv_len');
 
-    const fwd = new ForwardPass(kind);
+    const fwd = new ForwardPass();
     fwd.embed(tokIn, lane1);
-    fwd.bindState(ws, { kvLen, pages, pageIndptr, wSlot, wOff, positions, writablePages: Math.floor(n / pageSize) }, rsWs);
+    fwd.state([ws], { fold: 'all' });
     fwd.epilogue(() => {
-      const length = kvLen.take();
       const r = rng.take();
       const logits = intrinsics.logits();
       const [token, kept, mass] = step(logits, vocab, a, temperature, r);
       const rNext = r.add(iota(2));
-      const nextLength = length.add(1);
-      const pageCount = nextLength.divCeil(pageSize);
       tokIn.put(token);
-      kvLen.put(nextLength);
-      positions.put(length);
-      wSlot.put(length.div(pageSize));
-      wOff.put(length.rem(pageSize));
-      pageIndptr.put(indptr(1, pageCount));
       tokOut.put(token);
       s1Out.put(kept);
       s2Out.put(mass);

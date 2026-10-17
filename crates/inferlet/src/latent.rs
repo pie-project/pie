@@ -1,6 +1,6 @@
 use crate::eta::{
-    Channel, KvGeometry, Pipeline, WorkingSet, attention::ForwardPass, broadcast, eq, gather,
-    intrinsics, max_elem, min_elem, normal, reduce_sum, reshape, select, sqrt,
+    Channel, ForwardPass, Pipeline, StateGeometry, WorkingSet, broadcast, eq, gather, intrinsics,
+    max_elem, min_elem, normal, reduce_sum, reshape, select, sqrt,
 };
 use crate::model::{AxisRole, PositionConvention, ReadoutKind, ScheduleFact, ScheduleKind};
 use eta_dsl::Tensor;
@@ -12,7 +12,7 @@ pub mod prelude {
         euler_step, guided_velocity, host_noise, inpaint_step, noise, positions_for,
         positions_grid, resume_or_step, rng_state, seed_or_step, step,
     };
-    pub use crate::eta::attention::prelude::*;
+    pub use crate::eta::prelude::*;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -652,10 +652,16 @@ pub async fn encode_ids_rows(ids: &[u32], reading: &str) -> Result<(Vec<f32>, u3
         ));
     }
     let width = fact.readout_width;
-    let cap = crate::eta::max_embed_length().max(1);
+    // Every row is read out, so a pass holds no more than one reads out.
+    let cap = crate::eta::max_readout_rows(ReadoutKind::Hidden);
+    if ids.len() > cap {
+        return Err(format!(
+            "{} ids read out as hidden rows exceed the {cap} one pass reads out",
+            ids.len()
+        ));
+    }
     let ids: Vec<i32> = ids
         .iter()
-        .take(cap)
         .map(|id| i32::try_from(*id).unwrap_or(0))
         .collect();
     let len = u32::try_from(ids.len()).map_err(|_| "the prompt is too long")?;
@@ -668,35 +674,13 @@ pub async fn encode_ids_rows(ids: &[u32], reading: &str) -> Result<(Vec<f32>, u3
     let readout = Channel::from_iter(0..len);
     let out = Channel::new([len, width], crate::eta::Dtype::F32);
 
-    let pass = crate::eta::attention::ForwardPass::new();
+    let pass = ForwardPass::new();
     pass.reading(reading)?;
     pass.embed(&toks, &embed_indptr)?;
     pass.readout(&readout)?;
     let ws = WorkingSet::new();
     if fact.has_kv {
-        let page_size = crate::eta::kv_page_size().max(1);
-        let pages = len.div_ceil(page_size);
-        ws.reserve(pages)?;
-        let positions = Channel::from_iter(0..len);
-        let page_ids = Channel::from_iter(0..pages);
-        let page_indptr = Channel::from([0u32, pages]);
-        let w_slot = Channel::from_iter((0..len).map(|p| p / page_size));
-        let w_off = Channel::from_iter((0..len).map(|p| p % page_size));
-        let kv_len = Channel::from([len]);
-        pass.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len,
-                pages: &page_ids,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &positions,
-                mask: None,
-            },
-        )?;
+        pass.state(&[&ws], StateGeometry::default())?;
     }
     let readback = out;
     pass.epilogue(move || {

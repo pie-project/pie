@@ -65,25 +65,7 @@ impl RsWorkingSet {
         &self,
         scope: &crate::store::PipelineScope,
     ) -> Result<(), crate::store::PipelineScopeId> {
-        let mut owner = self.lifecycle.pipeline_scope.lock().unwrap();
-        match owner.as_ref() {
-            Some(existing) if existing.id() == scope.id() => Ok(()),
-            Some(existing) if !scope.is_closed() && existing.is_releasable() => {
-                *owner = Some(scope.clone());
-                Ok(())
-            }
-            Some(existing) => Err(existing.id()),
-            None if scope.is_closed() => Err(scope.id()),
-            None => {
-                *owner = Some(scope.clone());
-                Ok(())
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub fn is_released(&self) -> bool {
-        self.lifecycle.released.load(Ordering::Acquire)
+        scope.claim(&self.lifecycle.pipeline_scope)
     }
 }
 
@@ -96,20 +78,11 @@ mod tests {
         RsGeometry {
             state_size: 4096,
             buffer_page_tokens: 4,
-            fold_granularity: 4,
         }
     }
 
     fn fresh_model(capacity: usize) -> usize {
         registry::register_model(16, &[0], &[capacity])
-    }
-
-    fn commit_state_write(model: usize, id: RsWorkingSetId, _epoch: u64) {
-        let stores = registry::get(model, 0);
-        let mut rs = stores.rs.lock().unwrap();
-        let prepared = rs.prepare_write(id, true, None).unwrap();
-        let published = rs.publish_prepared(prepared).unwrap();
-        rs.settle(published);
     }
 
     #[test]

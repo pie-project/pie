@@ -410,6 +410,12 @@ impl From<eta_exec::Error> for Fault {
     }
 }
 
+impl From<engine::ports::PortError> for Fault {
+    fn from(error: engine::ports::PortError) -> Self {
+        Self::program("program::ports", error.0)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Fault>;
 
 impl From<kernels_metal::Error> for Fault {

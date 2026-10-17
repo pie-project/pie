@@ -91,9 +91,9 @@ fn a_replayed_buffer_folds_to_the_plain_walk() {
     let two: &'static [u32] = Box::leak(tail[..2].to_vec().into_boxed_slice());
     let buffer = RsVerb::Buffer {
         pages: vec![3],
-        at: 0,
+        base: p,
+        folded: p,
         fold: FoldLen::Host(0),
-        replay: 0,
     };
     let mut s = seat(1, two, pages_b, p);
     s.rs_reset = RsReset::Held;
@@ -102,9 +102,9 @@ fn a_replayed_buffer_folds_to_the_plain_walk() {
     let one: &'static [u32] = Box::leak(vec![tail[2]].into_boxed_slice());
     let replay = RsVerb::Buffer {
         pages: vec![3],
-        at: 2,
+        base: p,
+        folded: p,
         fold: FoldLen::Host(3),
-        replay: 2,
     };
     let mut s = seat(1, one, pages_b, p + 2);
     s.rs_reset = RsReset::Held;

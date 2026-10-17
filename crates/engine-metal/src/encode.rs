@@ -3,6 +3,7 @@ use std::cell::RefCell;
 #[cfg(target_vendor = "apple")]
 use kernels_metal::Tensor;
 use kernels_metal::{ArgValue, Encode, Error, Fire};
+use poem_exec::fire::At;
 #[cfg(target_vendor = "apple")]
 use poem_exec::fire::MaskSpan;
 use poem_ir::ValueId;
@@ -12,7 +13,7 @@ use crate::device::{Buffer, Context, Handles, Pipelines, handles::NIL};
 use crate::error::Fault;
 use crate::experts::Tier;
 use crate::run::SlotTable;
-use crate::window::{At, Windows};
+use crate::window::Windows;
 
 #[cfg(target_vendor = "apple")]
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};

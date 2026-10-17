@@ -1,0 +1,9 @@
+# Keeps a session's KV for its next turn: a process given `keep-ms` leaves
+# its cached working-set above every other until that long after it exits.
+plane = "engine"
+subscribe = ["arrived", "prop-changed", "exited", "retained", "discarded"]
+grants = ["retention", "discard"]
+
+[props.keep-ms]
+type = "int"
+doc = "Keep this process's KV this long after it completes, for the session's next turn."

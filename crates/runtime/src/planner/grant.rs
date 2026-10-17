@@ -2,17 +2,17 @@ use std::sync::Arc;
 
 use super::PoolPort;
 use crate::store::kv::page_table::PhysicalKvPageId;
-use crate::store::rs::RsSlotId;
+use crate::store::rs::{RsGrant, RsUnits};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Demand {
     pub kv_pages: u32,
-    pub rs_slots: u32,
+    pub rs: RsUnits,
 }
 
 impl Demand {
     pub fn is_zero(&self) -> bool {
-        self.kv_pages == 0 && self.rs_slots == 0
+        self.kv_pages == 0 && self.rs.is_zero()
     }
 }
 
@@ -87,45 +87,45 @@ impl Drop for DevicePageReservation {
 }
 
 pub struct RsSlotReservation {
-    slots: Vec<RsSlotId>,
+    grant: RsGrant,
     port: Option<Arc<dyn PoolPort>>,
 }
 
 impl std::fmt::Debug for RsSlotReservation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RsSlotReservation")
-            .field("slots", &self.slots)
+            .field("grant", &self.grant)
             .finish_non_exhaustive()
     }
 }
 
 impl RsSlotReservation {
-    pub(super) fn new(slots: Vec<RsSlotId>, port: Arc<dyn PoolPort>) -> Self {
+    pub(super) fn new(grant: RsGrant, port: Arc<dyn PoolPort>) -> Self {
         Self {
-            slots,
+            grant,
             port: Some(port),
         }
     }
 
     pub(super) fn empty() -> Self {
         Self {
-            slots: Vec::new(),
+            grant: RsGrant::default(),
             port: None,
         }
     }
 
-    pub(super) fn lend(&mut self) -> &mut Vec<RsSlotId> {
-        &mut self.slots
+    pub(super) fn lend(&mut self) -> &mut RsGrant {
+        &mut self.grant
     }
 }
 
 impl Drop for RsSlotReservation {
     fn drop(&mut self) {
-        if self.slots.is_empty() {
+        if self.grant.is_empty() {
             return;
         }
         if let Some(port) = self.port.take() {
-            port.release_rs(std::mem::take(&mut self.slots));
+            port.release_rs(std::mem::take(&mut self.grant));
         }
     }
 }
@@ -158,15 +158,15 @@ impl AllocationGrant {
         self.kv.len()
     }
 
-    pub fn remaining_rs(&self) -> usize {
-        self.rs.slots.len()
+    pub fn remaining_rs(&self) -> RsUnits {
+        self.rs.grant.units()
     }
 
     pub fn lend_kv(&mut self) -> &mut Vec<PhysicalKvPageId> {
         self.kv.lend()
     }
 
-    pub fn lend_rs(&mut self) -> &mut Vec<RsSlotId> {
-        &mut self.rs.slots
+    pub fn lend_rs(&mut self) -> &mut RsGrant {
+        &mut self.rs.grant
     }
 }

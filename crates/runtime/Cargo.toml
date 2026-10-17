@@ -26,6 +26,7 @@ parking_lot = "0.12"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 wasmparser = "0.259"
+toml = "1.1"
 rand = { version = "0.10.2", features = ["std_rng", "sys_rng"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing = "0.1.44"
@@ -140,4 +141,5 @@ profile-fire = []
 
 [dev-dependencies]
 tempfile = "3"
+builtins = { path = "../builtins", features = ["test-policies"] }
 wasmtime = { version = "49", default-features = false, features = ["wat"] }

@@ -12,28 +12,14 @@ import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
 
-
-@dataclass
-class Dtype_F32:
-    pass
-
-
-@dataclass
-class Dtype_I32:
-    pass
-
-
-@dataclass
-class Dtype_U32:
-    pass
-
-
-@dataclass
-class Dtype_Bool:
-    pass
-
-
-Dtype = Union[Dtype_F32, Dtype_I32, Dtype_U32, Dtype_Bool]
-
+class Dtype(Enum):
+    """
+    Element type of a tensor payload. Closed set, no payloads — an `enum`,
+    like `model.forward-kind`.
+    """
+    F32 = 0
+    I32 = 1
+    U32 = 2
+    BOOL = 3
 
 

@@ -40,7 +40,6 @@ import {
   gt,
   gumbel,
   gumbelMax,
-  indptr,
   iota,
   l2norm,
   le,
@@ -112,7 +111,6 @@ const range = (a: number, b?: number) => {
   const [lo, hi] = b === undefined ? [0, a] : [a, b];
   return Array.from({ length: hi - lo }, (_, i) => lo + i);
 };
-const divCeil = (a: number, b: number) => Math.floor((a + b - 1) / b);
 
 function check(name: string, traced: Traced) {
   const want = GOLDENS.get(name)!;
@@ -158,36 +156,17 @@ describe('eta goldens', () => {
   });
 
   it('text_completion_decode', () => {
-    const n = 5;
     const tokIn = chFrom([42], dtype.i32, 'tok_in');
     const embedIndptr = chFrom([0, 1], dtype.u32, 'embed_indptr');
-    const positions = chFrom([n], dtype.u32, 'positions');
-    const pages = chFrom(range(3), dtype.u32, 'pages');
-    const pageIndptr = chFrom([0, divCeil(n + 1, PAGE)], dtype.u32, 'page_indptr');
-    const wSlot = chFrom([Math.floor(n / PAGE)], dtype.u32, 'w_slot');
-    const wOff = chFrom([n % PAGE], dtype.u32, 'w_off');
-    const kvLen = chFrom([n + 1], dtype.u32, 'kv_len');
+    const fold = chFrom([0xffff_ffff], dtype.u32, 'fold');
     const tokOut = chNew([1], dtype.i32, 'tok_out');
     const b = new Builder(VOCAB, PAGE);
     bindGeometry(b, [
       [Port.EMBED_TOKENS, tokIn],
       [Port.EMBED_INDPTR, embedIndptr],
-      [Port.KV_LEN, kvLen],
-      [Port.PAGES, pages],
-      [Port.PAGE_INDPTR, pageIndptr],
-      [Port.W_SLOT, wSlot],
-      [Port.W_OFF, wOff],
-      [Port.POSITIONS, positions],
+      [Port.FOLD, fold],
     ]);
     b.stage(Stage.EPILOGUE, () => {
-      const length = kvLen.take();
-      const nextLength = length.add(1);
-      const pageCount = nextLength.divCeil(PAGE);
-      kvLen.putTensor(nextLength);
-      positions.putTensor(length);
-      wSlot.putTensor(length.div(PAGE));
-      wOff.putTensor(length.rem(PAGE));
-      pageIndptr.putTensor(indptr(1, pageCount));
       tokOut.putTensor(reshape(reduceArgmax(intrinsics.logits()), [1]));
     });
     tokOut.noteHostTake();
@@ -195,7 +174,6 @@ describe('eta goldens', () => {
   });
 
   it('naive_decode', () => {
-    const n = 7;
     const temperature = 0.7;
     const cap = 8;
     const tokIn = chFrom([3], dtype.i32, 'tok_in');
@@ -204,38 +182,20 @@ describe('eta goldens', () => {
     const s1 = chNew([1], dtype.f32, 's1_out').capacity(cap);
     const s2 = chNew([1], dtype.f32, 's2_out').capacity(cap);
     const lane1 = chFrom([0, 1], dtype.u32, 'embed_indptr');
-    const positions = chFrom([n], dtype.u32, 'positions');
-    const pages = chFrom(range(4), dtype.u32, 'pages');
-    const pageIndptr = chFrom([0, divCeil(n + 1, PAGE)], dtype.u32, 'page_indptr');
-    const wSlot = chFrom([Math.floor(n / PAGE)], dtype.u32, 'w_slot');
-    const wOff = chFrom([n % PAGE], dtype.u32, 'w_off');
-    const kvLen = chFrom([n + 1], dtype.u32, 'kv_len');
+    const fold = chFrom([0xffff_ffff], dtype.u32, 'fold');
     const b = new Builder(VOCAB, PAGE);
     bindGeometry(b, [
       [Port.EMBED_TOKENS, tokIn],
       [Port.EMBED_INDPTR, lane1],
-      [Port.KV_LEN, kvLen],
-      [Port.PAGES, pages],
-      [Port.PAGE_INDPTR, pageIndptr],
-      [Port.W_SLOT, wSlot],
-      [Port.W_OFF, wOff],
-      [Port.POSITIONS, positions],
+      [Port.FOLD, fold],
     ]);
     b.stage(Stage.EPILOGUE, () => {
-      const length = kvLen.take();
       const r = rngCh.take();
       const logits = intrinsics.logits();
       const scaled = logits.div(temperature);
       const token = gumbelMax(scaled, r);
       const rNext = r.add(iota(2));
-      const nextLength = length.add(1);
-      const pageCount = nextLength.divCeil(PAGE);
       tokIn.putTensor(token);
-      kvLen.putTensor(nextLength);
-      positions.putTensor(length);
-      wSlot.putTensor(length.div(PAGE));
-      wOff.putTensor(length.rem(PAGE));
-      pageIndptr.putTensor(indptr(1, pageCount));
       tokOut.putTensor(token);
       const mirror = reshape(cast(token, dtype.f32), [1]);
       s1.putTensor(mirror);
@@ -414,17 +374,11 @@ describe('diffusion golden', () => {
     const taps = 4;
     const base = 5;
     const end = base + length;
-    const pageSize = PAGE;
-    const maxPages = 2;
     const bound = 0.5;
     const confidence = 0.1;
     const toks = chFrom(range(length).map((i) => (i * 7919) % 1000), dtype.i32, 'canvas');
     const embedIndptr = chFrom([0, length], dtype.u32, 'embed_indptr');
     const positions = chFrom(range(base, end), dtype.u32, 'positions');
-    const pages = chFrom(range(maxPages), dtype.u32, 'pages');
-    const pageIndptr = chFrom([0, divCeil(end, pageSize)], dtype.u32, 'page_indptr');
-    const wSlot = chFrom(range(base, end).map((p) => Math.floor(p / pageSize)), dtype.u32, 'w_slot');
-    const wOff = chFrom(range(base, end).map((p) => p % pageSize), dtype.u32, 'w_off');
     const kvLen = chFrom([end], dtype.u32, 'kv_len');
     const readout = chFrom(range(length), dtype.u32, 'readout');
     const temp = chFrom([1.0], dtype.f32, 'temperature');
@@ -440,13 +394,10 @@ describe('diffusion golden', () => {
     const b = new Builder(VOCAB, PAGE);
     bindGeometry(b, [
       [Port.EMBED_TOKENS, toks], [Port.EMBED_INDPTR, embedIndptr], [Port.KV_LEN, kvLen],
-      [Port.PAGES, pages], [Port.PAGE_INDPTR, pageIndptr], [Port.W_SLOT, wSlot],
-      [Port.W_OFF, wOff], [Port.POSITIONS, positions], [Port.READOUT, readout],
+      [Port.POSITIONS, positions], [Port.READOUT, readout],
     ]);
     b.stage(Stage.EPILOGUE, () => {
       positions.putTensor(positions.take());
-      wSlot.putTensor(wSlot.take());
-      wOff.putTensor(wOff.take());
       const r = rngState.take();
       const t = reshape(temp.read(), []);
       const logits = intrinsics.logits();
@@ -479,12 +430,8 @@ describe('diffusion golden', () => {
 describe('beam golden', () => {
   it('beam_step matches inferlet_goldens.rs', () => {
     const B = 2;
-    const poolPages = 8;
-    const pageT = PAGE;
-    const poolLen = poolPages * pageT;
+    const poolLen = 8 * PAGE;
     const v = VOCAB;
-    const poolIds = range(poolPages);
-    const tiled = new Array(B * poolPages).fill(poolIds[0]);
     const initMask: boolean[] = [];
     for (let b = 0; b < B; b++) for (let p = 0; p < poolLen; p++) initMask.push(p === 0);
     const mask = DslChannel.fromConst(new ConstData(shapeOf([B, poolLen]), Dtype.BOOL, packElems(initMask, Dtype.BOOL))).named('mask');
@@ -493,12 +440,8 @@ describe('beam golden', () => {
     const pos = chFrom(new Array(B).fill(0), dtype.u32, 'pos');
     const fill = chFrom([1], dtype.u32, 'fill');
     const klen = chFrom(new Array(B).fill(1), dtype.u32, 'klen');
-    const wSlot = chFrom(new Array(B).fill(poolIds[0]), dtype.u32, 'w_slot');
-    const wOff = chFrom(new Array(B).fill(0), dtype.u32, 'w_off');
-    const pages = chFrom(tiled, dtype.u32, 'pages');
-    const pageIndptr = chFrom(range(B + 1), dtype.u32, 'page_indptr');
+    const slots = chFrom(new Array(B).fill(0), dtype.u32, 'slots');
     const lanesB = chFrom(range(B + 1), dtype.u32, 'embed_indptr');
-    const poolIdsCh = chFrom(poolIds, dtype.u32, 'pool_ids');
     const out = chNew([B], dtype.i32, 'out').capacity(8);
     const outPar = chNew([B], dtype.u32, 'out_par').capacity(8);
     const outScr = chNew([B], dtype.f32, 'out_scr').capacity(8);
@@ -506,8 +449,7 @@ describe('beam golden', () => {
 
     const b = new Builder(VOCAB, PAGE);
     bindGeometry(b, [
-      [Port.KV_LEN, klen], [Port.PAGES, pages], [Port.PAGE_INDPTR, pageIndptr], [Port.W_SLOT, wSlot],
-      [Port.W_OFF, wOff], [Port.POSITIONS, pos], [Port.ATTN_MASK, mask],
+      [Port.KV_LEN, klen], [Port.POSITIONS, pos], [Port.SLOTS, slots], [Port.ATTN_MASK, mask],
       [Port.EMBED_TOKENS, toks], [Port.EMBED_INDPTR, lanesB],
     ]);
     b.stage(Stage.EPILOGUE, () => {
@@ -525,26 +467,17 @@ describe('beam golden', () => {
       const wposB = broadcast(reshape(wpos, [B, 1]), [B, poolLen]);
       const newpos = eq(col, wposB);
       mask.putTensor(or(inherited, newpos));
-      const pids = poolIdsCh.take();
-      const logicalSlot = wpos.div(pageT);
-      const wSlotV = gather(pids, logicalSlot);
-      const wOffV = wpos.rem(pageT);
-      wSlot.putTensor(wSlotV);
-      wOff.putTensor(wOffV);
+      slots.putTensor(wpos);
       const filled = base.add(B);
       klen.putTensor(broadcast(reshape(filled, [1]), [B]));
       pos.putTensor(pos.take().add(1));
       fill.putTensor(filled);
       scores.putTensor(s);
       toks.putTensor(tokI);
-      const pageCount = filled.divCeil(pageT);
-      pages.putTensor(gather(pids, iota(B * poolPages).rem(broadcast(pageCount, [B * poolPages]))));
-      pageIndptr.putTensor(iota(B + 1).mul(broadcast(pageCount, [B + 1])));
       out.putTensor(tokI);
       outPar.putTensor(parent);
       outScr.putTensor(s);
       outGreedy.putTensor(reshape(reduceArgmax(logits), [B]));
-      poolIdsCh.putTensor(pids);
     });
     check('beam_step', b.build());
   });
@@ -563,10 +496,6 @@ describe('sampler golden', () => {
     const readout = chFrom(range(rows), dtype.u32, 'readout');
     const kvLen = chFrom([rows], dtype.u32, 'kv_len');
     const positions = chFrom(range(rows), dtype.u32, 'positions');
-    const pages = chFrom([0], dtype.u32, 'pages');
-    const pageIndptr = chFrom([0, divCeil(rows, PAGE)], dtype.u32, 'page_indptr');
-    const wSlot = chFrom(range(rows).map((q) => Math.floor(q / PAGE)), dtype.u32, 'w_slot');
-    const wOff = chFrom(range(rows).map((q) => q % PAGE), dtype.u32, 'w_off');
     const latent = chNew([rows, channels], dtype.f32, 'latent');
     const dsigma = chFrom([-0.25], dtype.f32, 'dsigma');
     const rngCh = chFrom([9, 0], dtype.u32, 'rng');
@@ -577,13 +506,10 @@ describe('sampler golden', () => {
     const b = new Builder(VOCAB, PAGE);
     bindGeometry(b, [
       [Port.EMBED_TOKENS, tok], [Port.EMBED_INDPTR, indptrCh], [Port.KV_LEN, kvLen],
-      [Port.PAGES, pages], [Port.PAGE_INDPTR, pageIndptr], [Port.W_SLOT, wSlot],
-      [Port.W_OFF, wOff], [Port.POSITIONS, positions], [Port.READOUT, readout],
+      [Port.POSITIONS, positions], [Port.READOUT, readout],
     ]);
     b.stage(Stage.EPILOGUE, () => {
       positions.putTensor(positions.take());
-      wSlot.putTensor(wSlot.take());
-      wOff.putTensor(wOff.take());
       const v = intrinsics.velocity(channels);
       const x = latent.take();
       const d = reshape(dsigma.read(), []);

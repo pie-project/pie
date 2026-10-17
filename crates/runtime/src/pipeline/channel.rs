@@ -338,10 +338,6 @@ impl ChannelCell {
         Ok(())
     }
 
-    pub fn put(&mut self, native: Vec<u8>) -> Result<(), ChannelError> {
-        self.put_ref(&native)
-    }
-
     pub fn put_ref(&mut self, native: &[u8]) -> Result<(), ChannelError> {
         let expected = self.native_len();
         if native.len() != expected {
@@ -736,24 +732,6 @@ impl ChannelCell {
         Ok(())
     }
 
-    pub fn latest_reader_value(
-        &mut self,
-        _instance_id: u64,
-    ) -> Result<Option<Vec<u8>>, ChannelError> {
-        let dtype = self.dtype;
-        let numel = self.numel();
-        let native_len = self.native_len();
-        let Some(reader) = self.reader.as_ref() else {
-            return Ok(None);
-        };
-        let tail = load_word(reader.word_base, reader.tail_word_index);
-        if tail == 0 {
-            return Ok(None);
-        }
-        let wire = read_mirror_cell(reader, tail - 1);
-        decode_reader_cell(dtype, numel, native_len, wire).map(Some)
-    }
-
     fn refresh_reader_mirrors(&mut self) -> Result<(), ChannelError> {
         let dtype = self.dtype;
         let numel = self.numel();
@@ -1000,12 +978,12 @@ mod tests {
 
     fn prebind_put_stages_and_seed_pops() {
         let mut c = ChannelCell::new(vec![1], Dtype::I32, 1);
-        c.put(7i32.to_le_bytes().to_vec()).unwrap();
+        c.put_ref(&7i32.to_le_bytes()).unwrap();
         c.bind(&decl(Shape::vector(1), Dtype::I32, HostRole::None, true));
         assert_eq!(c.take_seed().unwrap(), 7i32.to_le_bytes().to_vec());
         assert!(c.seed_taken);
         assert_eq!(
-            c.put(9i32.to_le_bytes().to_vec()).unwrap_err(),
+            c.put_ref(&9i32.to_le_bytes()).unwrap_err(),
             ChannelError::WrongRole {
                 role: HostRole::None,
                 op: "put"
@@ -1023,10 +1001,10 @@ mod tests {
             ChannelError::Empty
         );
 
-        cell.put(1i32.to_le_bytes().to_vec()).unwrap();
-        cell.put(2i32.to_le_bytes().to_vec()).unwrap();
+        cell.put_ref(&1i32.to_le_bytes()).unwrap();
+        cell.put_ref(&2i32.to_le_bytes()).unwrap();
         assert_eq!(
-            cell.put(3i32.to_le_bytes().to_vec()).unwrap_err(),
+            cell.put_ref(&3i32.to_le_bytes()).unwrap_err(),
             ChannelError::Full
         );
         assert_eq!(

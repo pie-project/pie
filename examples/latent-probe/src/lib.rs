@@ -2,7 +2,7 @@
 //! whose `readings()` declare a token-less reading with a velocity readout
 //! (the mini-DiT family, then every DiT).
 //!
-//! One `forward` pass in that reading, with no `embed` and no `attention`:
+//! One `forward` pass in that reading, with no `embed` and no `state`:
 //! a `[rows, width]` f32 latent channel bound as `input("latents")`, a
 //! `[1]` timestep channel bound as `input("timestep")`, every other port
 //! the reading declares bound to a plausible constant (an axis-position
@@ -83,10 +83,10 @@ fn positions_for(rows: u32, axes: u32) -> Vec<f32> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Attention {
+    if model::pass_kind() != model::ForwardKind::Text {
         return Err(
             "this program drives a stateless `forward` reading; the bound model's pass kind is \
-             not attention"
+             not text"
                 .into(),
         );
     }

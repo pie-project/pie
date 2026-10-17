@@ -317,8 +317,6 @@ impl Grouped {
         let record = LaneRecord {
             commit_slot,
             channel_slot_offset: shape.slot_index(THE_LANE).unwrap_or(0),
-            kv_len: extents.kv_len,
-            page_count: extents.page_count,
             row_count: extents.row_count,
             token_count: extents.token_count,
             sampled_rows: extents.sampled_rows,

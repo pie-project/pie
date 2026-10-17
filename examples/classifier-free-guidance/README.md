@@ -10,8 +10,7 @@ Sanchez, Fan, Spangher, Levi, Ammanamanchi and Biderman, ***Stay on topic with
 Classifier-Free Guidance*** — <https://arxiv.org/abs/2306.17806>. Implements
 Eq. 7.
 
-**Faithfulness: Exact (equivalent form).** See
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+**Faithfulness: Exact (equivalent form).**
 
 ## What it does
 

@@ -1,0 +1,67 @@
+package plex:policy@1.0.0;
+
+/// Reads. Every read within one `react` call sees one snapshot.
+interface reads {
+    use types.{id, subject, subject-kind, value};
+
+    /// The subjects of `kind` the host knows.
+    candidates: func(kind: subject-kind) -> list<id>;
+
+    /// A value the host measured or authenticated. Trusted.
+    attr: func(of: subject, name: string) -> option<value>;
+
+    /// A value supplied from outside the host: by the client, or by the
+    /// router program under the reserved prefix `router/`. Untrusted unless
+    /// the policy decides otherwise.
+    prop: func(of: subject, name: string) -> option<value>;
+
+    /// Whether this plane's host has a capability.
+    capability: func(name: string) -> bool;
+}
+
+/// Writes both planes take. Writes take effect when `react` returns; a call
+/// that traps or overruns its deadline has all of its writes discarded, and a
+/// fresh instance, without the program's state, takes the next call.
+interface writes {
+    use types.{id};
+
+    /// Delivers a `timer` edge at or after `at-ms`. A later call replaces
+    /// an earlier one.
+    set-alarm: func(at-ms: u64);
+
+    /// Rejects a pending process or stops a running one. The client sees it.
+    terminate: func(process: id, reason: string);
+}
+
+/// The engine plane's tables and verb.
+interface engine-writes {
+    use types.{id, key, retain};
+
+    /// Admission, run order, preemption victim and resume all follow the
+    /// key. A process below `floor` is not started, and is paused if running.
+    install-schedule: func(entries: list<tuple<id, key>>, floor: option<key>);
+
+    /// KV is evicted in ascending key; a position no entry covers is 0.
+    install-retention: func(entries: list<retain>);
+
+    /// Drops a retained working-set's KV now.
+    discard: func(working-set: id);
+}
+
+/// The router plane's tables.
+interface router-writes {
+    use types.{id, key, placement};
+
+    /// The router's queue: released in key order, held below `floor`.
+    install-schedule: func(entries: list<tuple<id, key>>, floor: option<key>);
+
+    install-placement: func(entries: list<placement>);
+}
+
+/// The one hook.
+interface policy {
+    use types.{edge};
+
+    /// Edges since the last call, batched, each delivered at most once.
+    react: func(edges: list<edge>, now-ms: u64);
+}

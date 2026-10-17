@@ -25,59 +25,80 @@ fn main() {
         .canonicalize()
         .expect("repository root");
     let inferlets = Path::new(env!("CARGO_MANIFEST_DIR")).join("inferlets");
+    let policies = Path::new(env!("CARGO_MANIFEST_DIR")).join("policies");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    let target_dir = match env::var_os("PIE_BUILTINS_TARGET_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => inferlets.join("target"),
-    };
+    let target_dir = env::var_os("PIE_BUILTINS_TARGET_DIR").map(PathBuf::from);
 
     println!("cargo:rerun-if-env-changed=PIE_BUILTINS");
     println!("cargo:rerun-if-env-changed=PIE_BUILTINS_TARGET_DIR");
     for dep in ["compat", "Cargo.toml", "Cargo.lock"] {
         println!("cargo:rerun-if-changed={}", inferlets.join(dep).display());
     }
+    for dep in ["Cargo.toml", "Cargo.lock"] {
+        println!("cargo:rerun-if-changed={}", policies.join(dep).display());
+    }
     for dep in [
         "crates/inferlet/src",
         "crates/inferlet/wit",
         "crates/inferlet-macros/src",
         "crates/eta-dsl/src",
+        "crates/policy/src",
+        "crates/policy/wit",
     ] {
         println!("cargo:rerun-if-changed={}", root.join(dep).display());
     }
 
     let builtins = find_builtins(&inferlets);
-    for builtin in &builtins {
+    let test_policies = env::var_os("CARGO_FEATURE_TEST_POLICIES").is_some();
+    let policy_builtins: Vec<Builtin> = find_builtins(&policies)
+        .into_iter()
+        .filter(|policy| test_policies || !policy.name.starts_with("test-"))
+        .collect();
+    for builtin in builtins.iter().chain(&policy_builtins) {
         println!("cargo:rerun-if-changed={}", builtin.dir.display());
     }
 
-    let mut generated = String::from("static ALL: &[Builtin] = &[\n");
-    if env::var("PIE_BUILTINS").is_ok_and(|v| v == "skip") {
+    let skip = env::var("PIE_BUILTINS").is_ok_and(|v| v == "skip");
+    if skip {
         println!("cargo:warning=PIE_BUILTINS=skip: this pie embeds no built-in inferlets");
-    } else {
-        build(&inferlets, &target_dir, &builtins);
-        for builtin in &builtins {
-            let wasm = target_dir
-                .join("wasm32-wasip2/release")
-                .join(format!("{}.wasm", builtin.name.replace('-', "_")));
-            let staged = out_dir.join(format!("{}.wasm", builtin.name));
-            fs::copy(&wasm, &staged)
-                .unwrap_or_else(|e| panic!("{} was not built: {e}", wasm.display()));
-            generated.push_str(&format!(
-                "    Builtin {{ name: {:?}, version: {:?}, component: include_bytes!({:?}) }},\n",
-                builtin.name,
-                builtin.version,
-                staged.display().to_string(),
-            ));
-        }
     }
-    generated.push_str("];\n");
+    let mut generated = String::new();
+    for (name, workspace, set) in [
+        ("ALL", &inferlets, &builtins),
+        ("POLICIES", &policies, &policy_builtins),
+    ] {
+        let staged_dir = out_dir.join(name.to_lowercase());
+        fs::create_dir_all(&staged_dir).expect("create staging directory");
+        generated.push_str(&format!("static {name}: &[Builtin] = &[\n"));
+        if !skip {
+            let target_dir = target_dir
+                .clone()
+                .unwrap_or_else(|| workspace.join("target"));
+            build(workspace, &target_dir, set);
+            for builtin in set {
+                let wasm = target_dir
+                    .join("wasm32-wasip2/release")
+                    .join(format!("{}.wasm", builtin.name.replace('-', "_")));
+                let staged = staged_dir.join(format!("{}.wasm", builtin.name));
+                fs::copy(&wasm, &staged)
+                    .unwrap_or_else(|e| panic!("{} was not built: {e}", wasm.display()));
+                generated.push_str(&format!(
+                    "    Builtin {{ name: {:?}, version: {:?}, component: include_bytes!({:?}) }},\n",
+                    builtin.name,
+                    builtin.version,
+                    staged.display().to_string(),
+                ));
+            }
+        }
+        generated.push_str("];\n");
+    }
     fs::write(out_dir.join("builtins.rs"), generated).expect("write builtins.rs");
 }
 
-fn find_builtins(inferlets: &Path) -> Vec<Builtin> {
+fn find_builtins(workspace: &Path) -> Vec<Builtin> {
     let mut builtins = Vec::new();
     let entries =
-        fs::read_dir(inferlets).unwrap_or_else(|e| panic!("reading {}: {e}", inferlets.display()));
+        fs::read_dir(workspace).unwrap_or_else(|e| panic!("reading {}: {e}", workspace.display()));
     for entry in entries.flatten() {
         let cargo_toml = entry.path().join("Cargo.toml");
         let Ok(text) = fs::read_to_string(&cargo_toml) else {
@@ -104,7 +125,7 @@ fn find_builtins(inferlets: &Path) -> Vec<Builtin> {
     assert!(
         !builtins.is_empty(),
         "no crate under {} builds a component",
-        inferlets.display()
+        workspace.display()
     );
     builtins
 }
@@ -120,20 +141,20 @@ fn string_value(line: &str, key: &str) -> Option<String> {
     v.strip_prefix('"')?.strip_suffix('"').map(str::to_string)
 }
 
-fn build(inferlets: &Path, target_dir: &Path, builtins: &[Builtin]) {
+fn build(workspace: &Path, target_dir: &Path, builtins: &[Builtin]) {
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let mut command = Command::new(cargo);
     command
         .arg("build")
         .arg("--manifest-path")
-        .arg(inferlets.join("Cargo.toml"))
+        .arg(workspace.join("Cargo.toml"))
         .arg("--release")
         .arg("--target")
         .arg("wasm32-wasip2");
     for builtin in builtins {
         command.arg("-p").arg(&builtin.name);
     }
-    // The outer build's flags are for the host; the inferlets are wasm.
+    // The outer build's flags are for the host; the built-ins are wasm.
     for var in [
         "CARGO_ENCODED_RUSTFLAGS",
         "CARGO_BUILD_RUSTFLAGS",
@@ -147,7 +168,7 @@ fn build(inferlets: &Path, target_dir: &Path, builtins: &[Builtin]) {
     command.env("CARGO_TARGET_DIR", target_dir);
     let output = command
         .output()
-        .unwrap_or_else(|e| panic!("running cargo for the built-in inferlets: {e}"));
+        .unwrap_or_else(|e| panic!("running cargo for {}: {e}", workspace.display()));
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let hint =
@@ -157,8 +178,9 @@ fn build(inferlets: &Path, target_dir: &Path, builtins: &[Builtin]) {
                 ""
             };
         panic!(
-            "building the built-in inferlets (crates/builtins/inferlets) for wasm32-wasip2 failed:\n{stderr}{hint}\n\n\
-             PIE_BUILTINS=skip builds a pie with no built-in inferlets (every compat route then answers 404)"
+            "building the built-ins in {} for wasm32-wasip2 failed:\n{stderr}{hint}\n\n\
+             PIE_BUILTINS=skip builds a pie with no built-in inferlets (every compat route then answers 404)",
+            workspace.display()
         );
     }
 }

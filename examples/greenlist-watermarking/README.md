@@ -49,9 +49,7 @@ token_t = gumbel_max(logits_t + bias_t, rng_t)
 The greenlist mask is host-derived from the immediately preceding output token,
 so the decode loop is structurally **depth-1**. It cannot submit
 `DEFAULT_RUNAHEAD_DEPTH` fires ahead: fire `k + 1` needs the token produced by
-fire `k` before the host can publish its green mask. This is one of the depth-1
-cases called out in
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+fire `k` before the host can publish its green mask.
 
 The ETA epilogue itself is small: take the host-provided boolean mask, select a
 `delta` or zero bias for every vocabulary entry, add it to `intrinsics::logits()`,

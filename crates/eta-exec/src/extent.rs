@@ -7,10 +7,6 @@ pub use eta_compiler::plan::SymbolicExtent as Role;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Extents {
-    pub kv_len: u32,
-
-    pub page_count: u32,
-
     pub row_count: u32,
 
     pub token_count: u32,
@@ -25,8 +21,6 @@ pub struct Extents {
 impl Default for Extents {
     fn default() -> Self {
         Extents {
-            kv_len: 1,
-            page_count: 1,
             row_count: 1,
             token_count: 1,
             sampled_rows: 1,
@@ -40,8 +34,6 @@ impl Extents {
     #[must_use]
     pub fn get(&self, role: Role) -> u32 {
         match role {
-            Role::KvLen => self.kv_len,
-            Role::PageCount => self.page_count,
             Role::RowCount => self.row_count,
             Role::TokenCount => self.token_count,
             Role::SampledRows => self.sampled_rows,

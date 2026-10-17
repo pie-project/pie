@@ -2,13 +2,14 @@ pub mod admission;
 pub mod blob;
 pub mod controller;
 pub mod ingress;
+pub mod policy;
 pub mod route;
 pub mod session;
 pub mod worker;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -21,6 +22,7 @@ use worker_api::Request;
 
 use crate::admission::AdmissionDecision;
 use crate::blob::{BlobStore, GatewayOriginStore};
+use crate::policy::wit::{By, Outcome};
 use crate::route::RoutingHandle;
 use crate::session::{AdmitReject, DispatchFail, Sessions, TurnRouter};
 use crate::worker::WorkerRegistry;
@@ -36,6 +38,10 @@ pub struct Config {
     pub worker_listen: SocketAddr,
     #[serde(default = "default_controller")]
     pub controller: String,
+    /// A built-in policy's name or a component path; none keeps the gateway's
+    /// own order.
+    #[serde(default)]
+    pub policy: Option<String>,
 }
 
 fn default_listen() -> SocketAddr {
@@ -54,6 +60,7 @@ impl Default for Config {
             listen: default_listen(),
             worker_listen: default_worker_listen(),
             controller: default_controller(),
+            policy: None,
         }
     }
 }
@@ -72,19 +79,51 @@ pub struct GatewayState {
     pub routing: RoutingHandle,
     pub workers: WorkerRegistry,
     pub blobs: Arc<dyn BlobStore>,
+    pub router: Option<Arc<policy::Router>>,
 }
 
 struct RouteBackend {
     routing: RoutingHandle,
     workers: WorkerRegistry,
+    located: Mutex<Located>,
+    router: Option<Arc<policy::Router>>,
+}
+
+impl RouteBackend {
+    fn router_for(&self, req: &Request) -> Option<&policy::Router> {
+        let launch = matches!(req.message, client_api::ClientMessage::LaunchProcess { .. });
+        self.router.as_deref().filter(|_| launch)
+    }
+}
+
+/// Where launched processes run, so a later turn about one goes there, not
+/// where its session would.
+#[derive(Default)]
+struct Located {
+    workers: HashMap<String, WorkerId>,
+    launches: HashMap<ReqId, String>,
+}
+
+fn addressed(req: &Request) -> Option<&str> {
+    use client_api::ClientMessage::*;
+    match &req.message {
+        AttachProcess { process_id, .. }
+        | TerminateProcess { process_id, .. }
+        | SignalProcess { process_id, .. }
+        | TransferFile { process_id, .. } => Some(process_id),
+        _ => None,
+    }
 }
 
 #[async_trait::async_trait]
 impl TurnRouter for RouteBackend {
     async fn admit(&self, req: &Request) -> std::result::Result<(), AdmitReject> {
+        if let Some(router) = self.router_for(req) {
+            return router.admit(req, &self.routing).await;
+        }
         match self.routing.admit_queued(req).await {
             AdmissionDecision::Admit => Ok(()),
-            AdmissionDecision::Reject(reason) => Err(AdmitReject(reason.to_string())),
+            AdmissionDecision::Reject(reason) => Err(AdmitReject::Full(reason.to_string())),
         }
     }
 
@@ -93,11 +132,33 @@ impl TurnRouter for RouteBackend {
         req: &Request,
         affinity: Option<u64>,
     ) -> std::result::Result<WorkerId, DispatchFail> {
-        self.routing
-            .dispatch_with_retry(&self.workers, req, affinity)
+        let router = self.router_for(req);
+        let placed: Request;
+        let (req, preferred) = match router {
+            Some(router) => {
+                let (preferred, router_props) = router.placement(req);
+                placed = Request {
+                    router_props,
+                    ..req.clone()
+                };
+                (&placed, preferred)
+            }
+            None => {
+                let located = &self.located.lock().unwrap().workers;
+                let preferred = addressed(req).and_then(|process| located.get(process).copied());
+                (req, preferred)
+            }
+        };
+        let worker = self
+            .routing
+            .dispatch_with_retry(&self.workers, req, affinity, preferred)
             .await
-            .map(|d| d.worker_id)
-            .map_err(|_| DispatchFail)
+            .map_err(|_| DispatchFail)?
+            .worker_id;
+        if let Some(router) = router {
+            router.dispatched(req, worker);
+        }
+        Ok(worker)
     }
 
     async fn cancel(&self, worker: WorkerId, req: ReqId) {
@@ -116,6 +177,30 @@ impl TurnRouter for RouteBackend {
 
     fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>> {
         self.workers.connected_watch()
+    }
+
+    fn launched(&self, req: ReqId, process: &str, worker: WorkerId) {
+        let mut located = self.located.lock().unwrap();
+        located.workers.insert(process.to_string(), worker);
+        located.launches.insert(req, process.to_string());
+    }
+
+    fn counted(&self, req: &Request, prompt: u64, generated: u64) {
+        if let Some(router) = self.router_for(req) {
+            router.counted(req, prompt, generated);
+        }
+    }
+
+    fn ended(&self, req: &Request, outcome: Outcome, _by: By) {
+        {
+            let mut located = self.located.lock().unwrap();
+            if let Some(process) = located.launches.remove(&req.req_id) {
+                located.workers.remove(&process);
+            }
+        }
+        if let Some(router) = self.router_for(req) {
+            router.exited(req, outcome);
+        }
     }
 }
 
@@ -194,10 +279,35 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
 
     let workers = WorkerRegistry::new();
     let routing = RoutingHandle::new(routing_rx, workers.connected_watch());
+    let router = match &config.policy {
+        Some(spec) => {
+            let component = builtins::policy_component(spec)?;
+            let (router, cancelled) = policy::Router::start(
+                spec,
+                &component,
+                routing.table_watch(),
+                workers.connected_watch(),
+            )
+            .with_context(|| format!("load the router policy `{spec}`"))?;
+            Some((router, cancelled))
+        }
+        None => None,
+    };
+    let policy_router = router.as_ref().map(|(router, _)| router.clone());
     let sessions = Sessions::new(Arc::new(RouteBackend {
         routing: routing.clone(),
         workers: workers.clone(),
+        located: Mutex::default(),
+        router: policy_router.clone(),
     }));
+    if let Some((_, mut cancelled)) = router {
+        let sessions = sessions.clone();
+        tokio::spawn(async move {
+            while let Some(req) = cancelled.recv().await {
+                sessions.terminate(req).await;
+            }
+        });
+    }
     let blobs: Arc<dyn BlobStore> =
         Arc::new(GatewayOriginStore::new(format!("http://{}", config.listen)));
     let state = GatewayState {
@@ -205,6 +315,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
         routing,
         workers: workers.clone(),
         blobs: blobs.clone(),
+        router: policy_router,
     };
 
     let worker_server = worker::serve(config.worker_listen, sessions, workers)

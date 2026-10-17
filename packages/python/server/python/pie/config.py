@@ -83,9 +83,10 @@ class ModelConfig:
     device_kv_budget: Optional[str] = None
     # The share of the device's memory the load may take; omit for 0.9.
     device_memory_share: Optional[float] = None
-    # Pinned host bytes for suspended kv; omit for one device kv pool, "0B" for off.
+    # Pinned host bytes for suspended kv; omit for every seat at full context.
     host_kv_budget: Optional[str] = None
-    # Disk bytes suspended kv spills to once host is full; "0B"/omitted is off.
+    # Disk bytes suspended kv spills to below the host (the only tier on metal
+    # and vulkan); omit for the engine's default, "0B" for off.
     disk_kv_budget: Optional[str] = None
     disk_kv_path: Optional[str] = None
     engine: EngineConfig = field(default_factory=EngineConfig)

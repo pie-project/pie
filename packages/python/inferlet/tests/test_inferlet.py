@@ -2,9 +2,8 @@
 Unit tests for the inferlet library's hand-written layer, against the stub
 `wit_world` in `conftest.py`.
 
-The non-forward interfaces are covered here; the forward-pass surface — the
-`eta` port of the tracing eDSL and container encoder — is covered by
-`test_eta_goldens.py`, which pins its bytes to the Rust encoder's.
+The container bytes the `eta` port encodes are pinned to the Rust
+encoder's by `test_eta_goldens.py`.
 """
 
 from __future__ import annotations
@@ -87,13 +86,11 @@ class TestModel:
         assert model.architecture() == "qwen3_5"
         assert model.default_system_speculation() is False
 
-    def test_pass_kind_and_is_linear_agree(self):
-        """`is_linear()` == (`pass_kind()` != attention) is a documented
-        invariant of the WIT interface, and the reason both exist."""
+    def test_pass_kind(self):
         from inferlet import model
 
-        assert model.pass_kind() is ForwardKind.HYBRID
-        assert model.is_linear() == (model.pass_kind() is not ForwardKind.ATTENTION)
+        assert model.pass_kind() is ForwardKind.TEXT
+        assert model.rs_state_size() > 0
 
     def test_memory_shaping_capabilities(self):
         from inferlet import model
@@ -101,15 +98,8 @@ class TestModel:
         assert model.kv_page_size() == 16
         assert model.frame_size() == 1
         assert model.channel_capacity() == 8
-        assert model.max_embed_length() == 2048
-        assert model.arena_block_size() == 8192
-
-    def test_recurrent_capabilities(self):
-        from inferlet import model
-
-        assert model.rs_state_size() == 4096
-        assert model.rs_buffer_page_size() == 64
-        assert model.rs_fold_granularity() == 1
+        assert model.max_readout_rows(model.ReadoutKind.LOGITS) == 256
+        assert model.max_readout_rows(model.ReadoutKind.HIDDEN) == 2048
 
     def test_output_vocab_may_exceed_tokenizer_vocab(self):
         """These are different numbers on purpose -- logits are padded. Use
@@ -356,18 +346,44 @@ class TestReasoningDecoder:
         assert dec.feed([1]) == reasoning.Event.End("done")
 
 
-class TestForwardPassKinds:
-    def test_per_kind_binders_refuse_the_wrong_pass(self):
+class TestForwardPassState:
+    def test_state_binds_lanes_and_only_the_stated_ports(self):
+        from inferlet.eta import Channel, ForwardPass, Port, StateGeometry, WorkingSet, dtype
+
+        a, b = WorkingSet(), WorkingSet()
+        slots = Channel.from_([3, 4], dtype.u32)
+        fwd = ForwardPass()
+        fwd.state([a, b, a], StateGeometry(slots=slots))
+        lanes, geom = fwd.wit.state_args
+        assert lanes == [a.ws, b.ws, a.ws]
+        assert geom.slots is slots._wit()
+        assert (geom.positions, geom.kv_len, geom.mask, geom.fold) == (None, None, None, None)
+        assert [p for p, _ in fwd._ports] == [Port.SLOTS]
+
+    def test_fold_all_is_one_constant_channel_per_pass(self):
+        from inferlet.eta import ForwardPass, InferletError, Port, StateGeometry, WorkingSet
+
+        fwd = ForwardPass()
+        fwd.state([WorkingSet()], StateGeometry.folding())
+        (_, first) = fwd.wit.state_args
+        assert [p for p, _ in fwd._ports] == [Port.FOLD]
+        with pytest.raises(InferletError, match="fold is already bound"):
+            fwd.state([WorkingSet()], StateGeometry.folding())
+        fwd._program_attached = True  # a rebind once the program is attached
+        fwd.state([WorkingSet()], StateGeometry.folding())
+        (_, again) = fwd.wit.state_args
+        assert again.fold is first.fold
+        with pytest.raises(ValueError):
+            ForwardPass().state([WorkingSet()], StateGeometry(fold="some"))  # type: ignore[arg-type]
+
+    def test_checkpoints_are_a_text_pass_verb(self):
         from inferlet.eta import ForwardKind, ForwardPass, InferletError
 
-        hybrid = ForwardPass(ForwardKind.HYBRID)
-        with pytest.raises(InferletError, match="attention binds"):
-            hybrid.attention(None, None)  # type: ignore[arg-type]
-        with pytest.raises(InferletError, match="bind_recurrent binds"):
-            hybrid.bind_recurrent([], None)  # type: ignore[arg-type]
-        attention = ForwardPass(ForwardKind.ATTENTION)
-        with pytest.raises(InferletError, match="bind_hybrid binds"):
-            attention.bind_hybrid(None, [], None)  # type: ignore[arg-type]
+        fwd = ForwardPass()
+        fwd.checkpoints([16, 32])
+        assert fwd.wit.checkpoint_slots == [16, 32]
+        with pytest.raises(InferletError, match="checkpoints binds"):
+            ForwardPass(ForwardKind.DIFFUSION).checkpoints([16])
 
 
 class TestDiffusionSurface:
@@ -377,7 +393,6 @@ class TestDiffusionSurface:
         assert model.canvas() == model.CanvasShape(32, 2560, 4)
         assert model.draft_block() is None
         assert model.run_ahead_window() == 4
-        assert model.is_linear()  # the stub is a hybrid model
 
     def test_diffusion_pass_binds_canvas_and_taps(self):
         from inferlet.eta import ForwardKind, ForwardPass, InferletError, diffusion
@@ -388,7 +403,7 @@ class TestDiffusionSurface:
         assert fwd.wit.mode is diffusion.Mode.DENOISE
         assert fwd.wit.self_cond == ([1, 2, 3, 4], [0.4, 0.3, 0.2, 0.1])
         with pytest.raises(InferletError, match="canvas binds"):
-            ForwardPass(ForwardKind.ATTENTION).canvas(diffusion.Mode.ENCODE)
+            ForwardPass(ForwardKind.TEXT).canvas(diffusion.Mode.ENCODE)
 
     def test_linear_temperature_is_the_reference_schedule(self):
         from inferlet.eta.diffusion import linear_temperature

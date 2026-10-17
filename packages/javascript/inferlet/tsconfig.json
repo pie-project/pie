@@ -37,18 +37,6 @@
       "pie:inferlet/forward-diffusion@0.3.0": [
         "./src/bindings/interfaces/pie-inferlet-forward-diffusion.js"
       ],
-      "pie:inferlet/forward-hybrid": [
-        "./src/bindings/interfaces/pie-inferlet-forward-hybrid.js"
-      ],
-      "pie:inferlet/forward-hybrid@0.3.0": [
-        "./src/bindings/interfaces/pie-inferlet-forward-hybrid.js"
-      ],
-      "pie:inferlet/forward-recurrent": [
-        "./src/bindings/interfaces/pie-inferlet-forward-recurrent.js"
-      ],
-      "pie:inferlet/forward-recurrent@0.3.0": [
-        "./src/bindings/interfaces/pie-inferlet-forward-recurrent.js"
-      ],
       "pie:inferlet/forward@0.3.0": [
         "./src/bindings/interfaces/pie-inferlet-forward.js"
       ],

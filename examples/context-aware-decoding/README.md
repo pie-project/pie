@@ -10,8 +10,7 @@ Shi, Han, Lewis, Tsvetkov, Zettlemoyer and Yih, ***Trusting Your Evidence:
 Hallucinate Less with Context-aware Decoding*** —
 <https://arxiv.org/abs/2305.14739>. Implements §2.2.
 
-**Faithfulness: Exact (equivalent form).** See
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+**Faithfulness: Exact (equivalent form).**
 
 ## What it does
 

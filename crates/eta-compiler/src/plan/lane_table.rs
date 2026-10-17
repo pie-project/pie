@@ -1,15 +1,4 @@
-pub const LANE_TABLE_ABI_VERSION: u32 = 4;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RuntimeExtents {
-    pub kv_len: u32,
-    pub page_count: u32,
-    pub row_count: u32,
-    pub token_count: u32,
-    pub sampled_rows: u32,
-    pub query_len: u32,
-    pub key_len: u32,
-}
+pub const LANE_TABLE_ABI_VERSION: u32 = 5;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -26,8 +15,6 @@ pub struct LaneRecord {
     pub logits_base: u64,
     pub logits_row_offset: u32,
     pub logits_row_count: u32,
-    pub kv_len: u32,
-    pub page_count: u32,
     pub row_count: u32,
     pub token_count: u32,
     pub sampled_rows: u32,

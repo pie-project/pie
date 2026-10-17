@@ -3,8 +3,8 @@
 
     python3 scripts/tiny_qwen35.py <out-dir> [--tokenizer <dir-with-tokenizer.json>]
 
-The tensors follow the Transformers spelling `crates/models/src/qwen_3/import.rs`
-reads, at the dimensions `Model::tiny` declares (crates/models/src/qwen_3/model.rs).
+The tensors follow the Transformers spelling, at the `qwen35-tiny` row's
+dimensions.
 The weights are small random bf16 values, so the model serves any prompt and says
 nothing in particular; the tokenizer beside it is the real Qwen3.5 one, fetched from
 Hugging Face when no `--tokenizer` directory is given. Then:

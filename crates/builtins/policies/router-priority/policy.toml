@@ -1,0 +1,10 @@
+# Priority at the gateway: launches leave its queue by their `priority`,
+# and pass it on as `router/priority` for the engine's `priority` policy.
+plane = "router"
+subscribe = ["arrived", "prop-changed"]
+grants = ["schedule", "placement"]
+gate-ms = 20
+
+[props.priority]
+type = "int"
+doc = "Larger leaves the gateway first; a process without one is 0."

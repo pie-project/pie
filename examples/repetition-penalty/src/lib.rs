@@ -49,10 +49,9 @@
 //! vLLM `model_executor/layers/sampler.py` —
 //! <https://github.com/vllm-project/vllm>.
 //!
-//! Faithfulness: **Exact**. See
-//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+//! Faithfulness: **Exact**.
 
-use inferlet::eta::hybrid::prelude::*;
+use inferlet::eta::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -204,24 +203,6 @@ async fn main(input: Input) -> Result<Output> {
         temperature: input.temperature,
     };
     let ws = WorkingSet::new();
-    // One recurrent working set for this sequence on a hybrid model (the
-    // engine requires one per request row); none on a pure-attention one,
-    // where an empty `rs` IS the attention pass. Fold policy at every fire
-    // below: never buffer, fold straight into the recurrence.
-    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
-        model::ForwardKind::Attention => Vec::new(),
-        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
-        model::ForwardKind::Recurrent => {
-            return Err(
-                "this program has no recurrent-only path: the penalties ride a paged-KV decode"
-                    .into(),
-            );
-        }
-        model::ForwardKind::Diffusion => {
-            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
-        }
-    };
-    let page_size = kv_page_size();
 
     if max_tokens == 0 {
         return Ok(Output {
@@ -245,8 +226,6 @@ async fn main(input: Input) -> Result<Output> {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
-    let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages).context("reserve KV")?;
 
     // The repetition penalty's scope includes the prompt, so seed the presence
     // vector on the host — one pass over the prompt beats a device scatter that
@@ -266,12 +245,6 @@ async fn main(input: Input) -> Result<Output> {
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
     let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from_iter(0..n).named("positions_p");
-    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
-    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p = Channel::from_iter((0..n).map(|p| p / page_size)).named("w_slot_p");
-    let w_off_p = Channel::from_iter((0..n).map(|p| p % page_size)).named("w_off_p");
-    let kv_len_p = Channel::from([n]).named("kv_len_p");
     let rng_p = Channel::from([input.seed, 0]).named("rng_p");
     let counts_p = Channel::from(vec![0.0f32; vocab as usize]).named("counts_p");
     let present_p = Channel::from(present.clone()).named("present_p");
@@ -281,27 +254,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.attention(
-        Some(KvBinding {
-            working_set: &ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len_p,
-                pages: &pages_p,
-                page_indptr: &page_indptr_p,
-                w_slot: &w_slot_p,
-                w_off: &w_off_p,
-                positions: &positions_p,
-                mask: None,
-            },
-        }),
-        &rs_ws,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
-        },
-    )?;
+    fwd_p.state(&[&ws], StateGeometry::folding())?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
         let counts = counts_p.take();
@@ -350,39 +303,12 @@ async fn main(input: Input) -> Result<Output> {
             .capacity(channel_capacity() as u32)
             .named("peak_out");
         let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from([n]).named("positions");
-        let pages = Channel::from_iter(0..max_pages).named("pages");
-        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from([n / page_size]).named("w_slot");
-        let w_off = Channel::from([n % page_size]).named("w_off");
-        let kv_len = Channel::from([n + 1]).named("kv_len");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
-        fwd.attention(
-            Some(KvBinding {
-                working_set: &ws,
-                geometry: KvGeometry {
-                    readable_pages: ..,
-                    writable_pages: (n / page_size)..,
-                    kv_len: &kv_len,
-                    pages: &pages,
-                    page_indptr: &page_indptr,
-                    w_slot: &w_slot,
-                    w_off: &w_off,
-                    positions: &positions,
-                    mask: None,
-                },
-            }),
-            &rs_ws,
-            RsGeometry {
-                fold_len: None,
-                buffer: 0..0,
-            },
-        )?;
+        fwd.state(&[&ws], StateGeometry::folding())?;
         fwd.epilogue(move || {
             // Takes and compute first, puts last (value-id discipline).
-            let length = kv_len.take();
             let r = rng.take();
             let counts = counts_c.take();
             let present = present_c.take();
@@ -390,15 +316,8 @@ async fn main(input: Input) -> Result<Output> {
             let (token, counts_next, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
 
             let r_next = &r + iota(2);
-            let next_length = &length + 1u32;
-            let page_count = next_length.div_ceil(page_size);
 
             tok_in.put(&token);
-            kv_len.put(&next_length);
-            positions.put(&length);
-            w_slot.put(&length / page_size);
-            w_off.put(&length % page_size);
-            page_indptr.put(indptr(1, &page_count));
             tok_out.put(&token);
             pen_out.put(&n_pen);
             peak_out.put(&peak);
@@ -408,19 +327,13 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget as usize, async || {
+        run_ahead(&pipe, &fwd, budget, async || {
             let t = tok_out
                 .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
-            let p = pen_out
-                .take_host::<f32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            let k = peak_out
-                .take_host::<f32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
+            let p = pen_out.take_host::<f32>().await?;
+            let k = peak_out.take_host::<f32>().await?;
             generated.push(t as u32);
             penalized.push(p);
             peaks.push(k);

@@ -8,6 +8,7 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
+from ..imports import frames
 import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
@@ -20,7 +21,19 @@ def send(message: str) -> None:
     raise NotImplementedError
 async def receive() -> Optional[str]:
     """
-    Receives an incoming message from the remote user client
+    Receives an incoming message from the remote user client, or from
+    another process through `send-to`
+    """
+    raise NotImplementedError
+def send_to(process: str, message: str) -> None:
+    """
+    A pipe between processes: delivers `message` to the inbox of `process`
+    (its `system.instance-id`), where its `receive` returns it, without
+    the message leaving the engine. Both processes must belong to the same
+    client. The receiver counts as woken at once, so if it was parked its
+    KV starts coming back before it reads the message.
+    
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError
 def send_file(data: bytes) -> None:
@@ -28,8 +41,77 @@ def send_file(data: bytes) -> None:
     Sends a file to the remote user client
     """
     raise NotImplementedError
+def send_file_as(data: bytes, name: str) -> None:
+    """
+    `send-file` with a suggested file name, so what arrives at the client
+    is a named file rather than an anonymous blob.
+    
+    The bytes are already a guest value here -- that is what makes this
+    `send-file` and not `send-frames`. What it adds is the one thing
+    `send-file` cannot say: WHAT THE FILE IS. `pie run -o DIR` writes an
+    unnamed file as `file-0000.bin`, which is the right answer for a blob
+    nobody described and the wrong one for a guest that knows it just
+    produced `image.latent.f32`.
+    
+    `name` is a suggestion and not a path, exactly as in `send-frames`:
+    the host keeps the last component and the client sanitises again.
+    """
+    raise NotImplementedError
 async def receive_file() -> Optional[bytes]:
     """
     Receives an incoming file from the remote user client
+    """
+    raise NotImplementedError
+def send_frames(f: frames.Frames, format: frames.ImageFormat, name: str) -> None:
+    """
+    Encodes `f` and streams the bytes to the client under `name`, WITHOUT
+    the encoded file ever entering WASM linear memory.
+    
+    This is `send-file` for a handle rather than a buffer, and the
+    difference is the whole point: `send-file(f.encode(format))` produces
+    the same file having first copied every byte of it into the guest's
+    heap. A 121-frame clip is tens of megabytes; a guest that only wants
+    the client to have it should never hold it.
+    
+    `name` is a suggested file name, carried beside the bytes to the
+    client (`pie run -o DIR` writes it there under this name). It is a
+    suggestion, not a path: the client sanitises it.
+    
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    """
+    raise NotImplementedError
+def send_pcm(p: frames.Pcm, format: frames.AudioFormat, name: str) -> None:
+    """
+    `send-frames` for audio. Same statute: the samples are encoded
+    host-side and streamed out, never materialized in linear memory.
+    
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    """
+    raise NotImplementedError
+def receive_blocking() -> Optional[str]:
+    """
+    `receive` for a guest that cannot lower an `async func` (see
+    `channel.take-blocking`): the guest's task blocks until a message
+    arrives.
+    """
+    raise NotImplementedError
+def receive_file_blocking() -> Optional[bytes]:
+    """
+    `receive-file` for the same guests.
+    """
+    raise NotImplementedError
+def set_props(props: str) -> None:
+    """
+    Merges `props`, a JSON object, into this process's PLEX props; a `null`
+    removes a name. `router/` names are dropped and props over the limits
+    refused.
+    
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    """
+    raise NotImplementedError
+def set_tokens(prompt: int, generated: int) -> None:
+    """
+    This process's own token counts, for the scheduling policy: report
+    `prompt` as soon as it is tokenized.
     """
     raise NotImplementedError

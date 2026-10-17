@@ -148,14 +148,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dflash-block-acceptance"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
 name = "dflash-speculative-bench"
 version = "0.1.0"
 dependencies = [
@@ -534,14 +526,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mtp-speculative-bench"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
 name = "mtp-speculative-decoding"
 version = "0.1.0"
 dependencies = [
@@ -642,38 +626,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rs-mtp-speculative-bench"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "rs-mtp-speculative-decoding"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "rs-speculative-decoding"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "rs-window-decode"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
 name = "sampling-primitives"
 version = "0.1.0"
 dependencies = [
@@ -743,14 +695,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "sliding-window-attention"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
 name = "snapkv-eviction"
 version = "0.1.0"
 dependencies = [
@@ -795,15 +739,6 @@ dependencies = [
 name = "tail-free-sampling"
 version = "0.1.0"
 dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "tart-masked"
-version = "0.1.0"
-dependencies = [
- "anyhow",
  "inferlet",
  "serde",
 ]

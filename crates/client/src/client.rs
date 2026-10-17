@@ -1,5 +1,5 @@
 use crate::crypto::ParsedPrivateKey;
-use crate::message::{CHUNK_SIZE_BYTES, ClientMessage, ServerMessage};
+use crate::message::{CHUNK_SIZE_BYTES, ClientMessage, Props, ServerMessage};
 use crate::utils::IdPool;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -434,11 +434,26 @@ impl Client {
         input: String,
         capture_outputs: bool,
     ) -> Result<Process> {
+        self.launch_process_with(inferlet, input, capture_outputs, None, Props::new())
+            .await
+    }
+
+    pub async fn launch_process_with(
+        &self,
+        inferlet: String,
+        input: String,
+        capture_outputs: bool,
+        session: Option<String>,
+        props: Props,
+    ) -> Result<Process> {
         let msg = ClientMessage::LaunchProcess {
             corr_id: 0,
             inferlet,
             input,
             capture_outputs,
+            props,
+            session,
+            router_props: Props::new(),
         };
         let (ok, result) = self.send_msg_and_wait(msg).await?;
 

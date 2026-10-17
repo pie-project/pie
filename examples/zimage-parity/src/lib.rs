@@ -403,19 +403,10 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     if len == 0 {
         return Err("the prompt tokenizes to nothing".into());
     }
-    let page_size = kv_page_size().max(1);
-    let pages = len.div_ceil(page_size);
     let ws = WorkingSet::new();
-    ws.reserve(pages)?;
 
     let toks = Channel::from(ids);
     let embed_indptr = Channel::from([0u32, len]);
-    let positions = Channel::from_iter(0..len);
-    let page_ids = Channel::from_iter(0..pages);
-    let page_indptr = Channel::from([0u32, pages]);
-    let w_slot = Channel::from_iter((0..len).map(|p| p / page_size));
-    let w_off = Channel::from_iter((0..len).map(|p| p % page_size));
-    let kv_len = Channel::from([len]);
     let readout = Channel::from_iter(0..len);
     let out = Channel::new([len, width], dtype::f32).named("text");
 
@@ -423,20 +414,8 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     pass.reading(&fact.name)?;
     pass.embed(&toks, &embed_indptr)?;
     pass.readout(&readout)?;
-    pass.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &kv_len,
-            pages: &page_ids,
-            page_indptr: &page_indptr,
-            w_slot: &w_slot,
-            w_off: &w_off,
-            positions: &positions,
-            mask: None,
-        },
-    )?;
+    // The encoder's state is scratch: nothing folds, and it goes with `ws`.
+    pass.state(&[&ws], StateGeometry::default())?;
     let readback = out.clone();
     pass.epilogue(move || {
         readback.put(intrinsics::hidden(width));
@@ -448,8 +427,8 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Attention {
-        return Err("z-image is an attention-kind pass with no kv bound".into());
+    if model::pass_kind() != model::ForwardKind::Text {
+        return Err("z-image is a `forward` pass with no state bound".into());
     }
     if input.text_only {
         let prompt = input

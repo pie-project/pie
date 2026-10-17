@@ -1,24 +1,14 @@
 //! Same-model contrastive decoding.
 //!
-//! Two forward passes use the bound model with independent KV states. The
+//! Two forward passes use the bound model with independent states. The
 //! expert sees the complete causal context; the amateur sees only a short
 //! attention window. Tokens are selected by
 //! `log p_expert - lambda * log p_amateur`, restricted to tokens whose expert
 //! probability is at least `alpha` times the expert's maximum probability.
-//!
-//! The body is written once against the hybrid forward interface, so the
-//! same algorithm runs on a pure-attention model and on a hybrid
-//! (attention + recurrent) one. The expert and the amateur are two independent
-//! sequences, so on a hybrid model each carries its OWN recurrent working set
-//! beside its own KV pool — the engine wants one per request row, and the
-//! amateur's bounded-context state must no more contaminate the expert's
-//! recurrence than its KV pages do.
 
 use inferlet::chat;
-use inferlet::eta::hybrid::prelude::*;
+use inferlet::eta::prelude::*;
 use serde::Deserialize;
-
-const PAGE_T: u32 = 16;
 
 #[derive(Deserialize)]
 struct Input {
@@ -66,21 +56,6 @@ fn contrastive_pick(amateur_logits: &Tensor, lambda: f32, alpha: f32, vocab: u32
     reshape(reduce_argmax(select(plausible, score, neg_inf)), [1])
 }
 
-/// The recurrent working set of ONE sequence. On a hybrid model each of the
-/// two sequences carries its own beside its own KV pool; on a pure-attention
-/// model there is none to carry, and an empty binding IS the attention pass.
-fn sequence_rs() -> Result<Vec<RsWorkingSet>> {
-    match model::pass_kind() {
-        model::ForwardKind::Attention => Ok(Vec::new()),
-        model::ForwardKind::Hybrid => Ok(vec![RsWorkingSet::new()]),
-        model::ForwardKind::Recurrent => Err(
-            "this program has no recurrent-only path (no registered model reports that kind)"
-                .into(),
-        ),
-        model::ForwardKind::Diffusion => Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into()),
-    }
-}
-
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     if input.amateur_window == 0 {
@@ -106,50 +81,27 @@ async fn main(input: Input) -> Result<String> {
         prompt.push(0);
     }
     let n = u32::try_from(prompt.len()).map_err(|_| "prompt is too long")?;
-    let required_tokens = n
+    let span = n
         .checked_add(max_tokens)
         .and_then(|value| value.checked_add(1))
         .ok_or("prompt and generation length exceed the u32 range")?;
-    let pool_pages = required_tokens.div_ceil(PAGE_T);
-    let pool_len = pool_pages
-        .checked_mul(PAGE_T)
-        .ok_or("page-rounded KV capacity exceeds the u32 range")?;
-    let window = input.amateur_window.min(pool_len);
-    pool_len
-        .checked_add(window)
+    let window = input.amateur_window.min(span);
+    span.checked_add(window)
         .ok_or("amateur attention geometry exceeds the u32 range")?;
     let stop_tokens = chat::stop_tokens();
 
-    // The amateur uses a dedicated KV pool so its bounded-context hidden states
-    // never contaminate the expert's full-context state. On a hybrid model the
-    // same separation holds for the recurrent half: its own working set.
+    // Not shared with the expert: the amateur's windowed state must not leak into it.
     let amateur_ws = WorkingSet::new();
-    let amateur_rs = sequence_rs()?;
-    let amateur_slots = amateur_ws
-        .reserve(pool_pages)
-        .context("reserve amateur KV")?;
-    let amateur_ids = amateur_slots.ids().to_vec();
 
     let prompt_i32 = prompt.iter().map(|&token| token as i32).collect::<Vec<_>>();
     let amateur_prompt = Channel::from(prompt_i32.clone()).named("amateur_prompt");
     let amateur_prefill_embed_indptr =
         Channel::from([0u32, n]).named("amateur_prefill_embed_indptr");
-    let amateur_prefill_positions = Channel::from_iter(0..n).named("amateur_prefill_positions");
-    let amateur_prefill_slots =
-        Channel::from_iter((0..n).map(|position| amateur_ids[(position / PAGE_T) as usize]));
-    let amateur_prefill_offsets = Channel::from_iter((0..n).map(|position| position % PAGE_T));
-    let amateur_prefill_klen = Channel::from([n]);
-    let amateur_prefill_pages = Channel::from(amateur_ids.clone());
-    // The page CSR is the wire's source of truth for kv_len: the engine derives
-    // `kv_len = (page_count-1)*PAGE_T + last_page_len`. A pool-wide constant page
-    // count claims a kv length the pass does not have and silently corrupts
-    // attention, so the count must track `kv_len` exactly (as the expert pass does).
-    let amateur_prefill_indptr = Channel::from([0u32, n.div_ceil(PAGE_T)]);
     let amateur_prefill_mask = Channel::from_shaped(
-        [n, pool_len],
+        [n, span],
         (0..n)
             .flat_map(|query| {
-                (0..pool_len).map(move |key| key <= query && key.saturating_add(window) > query)
+                (0..span).map(move |key| key <= query && key.saturating_add(window) > query)
             })
             .collect::<Vec<_>>(),
     );
@@ -157,35 +109,17 @@ async fn main(input: Input) -> Result<String> {
 
     let amateur_prefill = ForwardPass::new();
     amateur_prefill.embed(&amateur_prompt, &amateur_prefill_embed_indptr)?;
-    amateur_prefill.attention(
-        Some(KvBinding {
-            working_set: &amateur_ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &amateur_prefill_klen,
-                pages: &amateur_prefill_pages,
-                page_indptr: &amateur_prefill_indptr,
-                w_slot: &amateur_prefill_slots,
-                w_off: &amateur_prefill_offsets,
-                positions: &amateur_prefill_positions,
-                mask: Some(&amateur_prefill_mask),
-            },
-        }),
-        &amateur_rs,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
+    amateur_prefill.state(
+        &[&amateur_ws],
+        StateGeometry {
+            mask: Some(&amateur_prefill_mask),
+            ..StateGeometry::folding()
         },
     )?;
     amateur_prefill.epilogue(move || {
         amateur_prefill_out.put(intrinsics::logits());
     });
 
-    // ONE PIPELINE for the whole inferlet: a KV working set is scoped to the
-    // first pipeline that fires it, so the amateur's prefill and its decode
-    // must share a FIFO (and likewise the expert's). The two streams are
-    // sequential anyway — the expert prefill consumes the amateur's logits.
     let pipeline = Pipeline::new();
     amateur_prefill
         .submit(&pipeline)
@@ -195,18 +129,8 @@ async fn main(input: Input) -> Result<String> {
     // The expert keeps the complete context and consumes the amateur logits in
     // its epilogue to perform the contrastive token selection on-device.
     let expert_ws = WorkingSet::new();
-    let expert_rs = sequence_rs()?;
-    expert_ws.reserve(pool_pages).context("reserve expert KV")?;
     let expert_prompt = Channel::from(prompt_i32).named("expert_prompt");
     let expert_prefill_embed_indptr = Channel::from([0u32, n]).named("expert_prefill_embed_indptr");
-    let expert_prefill_positions = Channel::from_iter(0..n).named("expert_prefill_positions");
-    let expert_prefill_pages = Channel::from_iter(0..pool_pages).named("expert_prefill_pages");
-    let expert_prefill_indptr =
-        Channel::from([0u32, n.div_ceil(PAGE_T)]).named("expert_prefill_indptr");
-    let expert_prefill_slots =
-        Channel::from_iter((0..n).map(|p| p / PAGE_T)).named("expert_prefill_slots");
-    let expert_prefill_offsets =
-        Channel::from_iter((0..n).map(|p| p % PAGE_T)).named("expert_prefill_offsets");
     let expert_prefill_amateur = Channel::new([vocab], dtype::f32).named("expert_prefill_amateur");
     let first_out = Channel::new([1], dtype::i32).named("first_token");
     let lambda = input.lambda;
@@ -214,28 +138,7 @@ async fn main(input: Input) -> Result<String> {
 
     let expert_prefill = ForwardPass::new();
     expert_prefill.embed(&expert_prompt, &expert_prefill_embed_indptr)?;
-    let expert_prefill_kv_len = Channel::from([n]).named("expert_prefill_kv_len");
-    expert_prefill.attention(
-        Some(KvBinding {
-            working_set: &expert_ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &expert_prefill_kv_len,
-                pages: &expert_prefill_pages,
-                page_indptr: &expert_prefill_indptr,
-                w_slot: &expert_prefill_slots,
-                w_off: &expert_prefill_offsets,
-                positions: &expert_prefill_positions,
-                mask: None,
-            },
-        }),
-        &expert_rs,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
-        },
-    )?;
+    expert_prefill.state(&[&expert_ws], StateGeometry::folding())?;
     expert_prefill.epilogue(move || {
         let token = contrastive_pick(&expert_prefill_amateur.take(), lambda, alpha, vocab);
         first_out.put(token);
@@ -254,20 +157,13 @@ async fn main(input: Input) -> Result<String> {
     }
 
     let amateur_token = Channel::new([1], dtype::i32).named("amateur_token");
-    let amateur_position = Channel::from([n]).named("amateur_position");
     let amateur_fill = Channel::from([n + 1]).named("amateur_fill");
-    let amateur_klen = Channel::from([n + 1]).named("amateur_klen");
-    let amateur_write_slot = Channel::from([amateur_ids[(n / PAGE_T) as usize]]);
-    let amateur_write_offset = Channel::from([n % PAGE_T]);
     let amateur_mask = Channel::from_shaped(
-        [1, pool_len],
-        (0..pool_len)
+        [1, span],
+        (0..span)
             .map(|key| key <= n && key.saturating_add(window) > n)
             .collect::<Vec<_>>(),
     );
-    let amateur_pages = Channel::from(amateur_ids.clone());
-    let amateur_page_indptr = Channel::from([0u32, (n + 1).div_ceil(PAGE_T)]);
-    let amateur_ids_input = Channel::from(amateur_ids.clone()).named("amateur_pool_ids");
     let amateur_logits_out = Channel::new([vocab], dtype::f32)
         .capacity(channel_capacity() as u32)
         .named("amateur_logits");
@@ -275,62 +171,32 @@ async fn main(input: Input) -> Result<String> {
     let amateur_decode = ForwardPass::new();
     let amateur_embed_indptr = Channel::from([0u32, 1]).named("amateur_embed_indptr");
     amateur_decode.embed(&amateur_token, &amateur_embed_indptr)?;
-    amateur_decode.attention(
-        Some(KvBinding {
-            working_set: &amateur_ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: (n / kv_page_size())..,
-                kv_len: &amateur_klen,
-                pages: &amateur_pages,
-                page_indptr: &amateur_page_indptr,
-                w_slot: &amateur_write_slot,
-                w_off: &amateur_write_offset,
-                positions: &amateur_position,
-                mask: Some(&amateur_mask),
-            },
-        }),
-        &amateur_rs,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
+    amateur_decode.state(
+        &[&amateur_ws],
+        StateGeometry {
+            mask: Some(&amateur_mask),
+            ..StateGeometry::folding()
         },
     )?;
     amateur_decode.epilogue(move || {
         let base = amateur_fill.take();
-        let ids = amateur_ids_input.take();
-        let columns = iota(pool_len);
-        let base_columns = broadcast(reshape(&base, [1]), [pool_len]);
+        let columns = iota(span);
+        let base_columns = broadcast(reshape(&base, [1]), [span]);
         let next_mask = reshape(
             and(
                 le(&columns, &base_columns),
                 gt(&columns + window, &base_columns),
             ),
-            [1, pool_len],
+            [1, span],
         );
-        let next = &base + 1u32;
 
         amateur_logits_out.put(intrinsics::logits());
-        amateur_position.put(&base);
-        amateur_fill.put(&next);
-        amateur_klen.put(&next);
-        amateur_write_slot.put(gather(&ids, &base / PAGE_T));
-        amateur_write_offset.put(&base % PAGE_T);
+        amateur_fill.put(&base + 1u32);
         amateur_mask.put(next_mask);
-        amateur_pages.put(reshape(&ids, [pool_pages]));
-        let amateur_page_count = next.div_ceil(PAGE_T);
-        amateur_page_indptr.put(indptr(1, &amateur_page_count));
-        amateur_ids_input.put(&ids);
     });
 
     let expert_token = Channel::from([first as i32]).named("expert_token");
     let expert_embed_indptr = Channel::from([0u32, 1]).named("expert_embed_indptr");
-    let expert_position = Channel::from([n]).named("expert_position");
-    let expert_pages = Channel::from_iter(0..pool_pages).named("expert_pages");
-    let expert_page_indptr =
-        Channel::from([0u32, (n + 1).div_ceil(PAGE_T)]).named("expert_page_indptr");
-    let expert_write_slot = Channel::from([n / PAGE_T]).named("expert_write_slot");
-    let expert_write_offset = Channel::from([n % PAGE_T]).named("expert_write_offset");
     let expert_amateur = Channel::writer([vocab], dtype::f32).named("expert_amateur_logits");
     let expert_token_out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
@@ -338,40 +204,10 @@ async fn main(input: Input) -> Result<String> {
 
     let expert_decode = ForwardPass::new();
     expert_decode.embed(&expert_token, &expert_embed_indptr)?;
-    let expert_kv_len = Channel::from([n + 1]).named("expert_kv_len");
-    expert_decode.attention(
-        Some(KvBinding {
-            working_set: &expert_ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: (n / kv_page_size())..,
-                kv_len: &expert_kv_len,
-                pages: &expert_pages,
-                page_indptr: &expert_page_indptr,
-                w_slot: &expert_write_slot,
-                w_off: &expert_write_offset,
-                positions: &expert_position,
-                mask: None,
-            },
-        }),
-        &expert_rs,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
-        },
-    )?;
+    expert_decode.state(&[&expert_ws], StateGeometry::folding())?;
     expert_decode.epilogue(move || {
-        let length = expert_kv_len.take();
         let token = contrastive_pick(&expert_amateur.take(), lambda, alpha, vocab);
-        let next_length = &length + 1u32;
-        let page_count = next_length.div_ceil(PAGE_T);
-
         expert_token.put(&token);
-        expert_kv_len.put(&next_length);
-        expert_position.put(&length);
-        expert_write_slot.put(&length / PAGE_T);
-        expert_write_offset.put(&length % PAGE_T);
-        expert_page_indptr.put(indptr(1, &page_count));
         expert_token_out.put(&token);
     });
 

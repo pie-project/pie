@@ -420,7 +420,7 @@ pub struct Builder<'a> {
     device: &'a Context,
     pipelines: &'a Pipelines,
     handles: &'a Handles,
-    place: &'a crate::window::At,
+    place: &'a poem_exec::fire::At,
     icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
     constants: RefCell<Buffer>,
     cursor: std::cell::Cell<u64>,
@@ -434,7 +434,7 @@ impl<'a> Builder<'a> {
         device: &'a Context,
         pipelines: &'a Pipelines,
         handles: &'a Handles,
-        place: &'a crate::window::At,
+        place: &'a poem_exec::fire::At,
         slots: usize,
         constants: u64,
     ) -> Result<Builder<'a>> {

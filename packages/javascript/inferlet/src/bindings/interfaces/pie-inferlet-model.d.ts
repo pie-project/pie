@@ -37,7 +37,7 @@ export function schedule(): ScheduleFact | undefined;
 /**
  * The most latent rows one pass may carry: the guest sizes its latent
  * channels (`[rows, width]`) under this. 0 for a model with no float
- * lane. Static, like `max-embed-length`.
+ * lane. Static.
  */
 export function maxLatentRows(): number;
 /**
@@ -135,49 +135,16 @@ export function channelCapacity(): number;
  */
 export function runAheadWindow(): number;
 /**
- * Max embed tokens in a single pass (C) — the prefill chunk budget.
- * Guests split a prompt of L tokens into ceil(L / C) chunk passes;
- * chunking is guest-side, against this static constant.
+ * The most rows one pass may read out through `kind`: what a pass returns,
+ * not how long it is. A pass whose rows cannot run in pieces is refused
+ * past one fire.
  */
-export function maxEmbedLength(): number;
+export function maxReadoutRows(kind: ReadoutKind): number;
 /**
- * The prefill chunk the scheduler would like to see right now, in
- * tokens: the per-forward token budget less one decode row for each
- * other live process, rounded down to whole KV pages, never below one page and
- * never above `max-embed-length`. A prefill fire that fills the whole
- * budget holds every other lane's decode for as long as it runs; a fire
- * of this size leaves the step room for them. A hint, not a limit: the
- * runtime never splits a fire, and a guest may chunk larger or smaller
- * — the inferlet library's `prefill_chunks` takes it as its default cap. Not static:
- * it moves with the number of live processes.
- */
-export function prefillChunkHint(): number;
-/**
- * ── Working-set / arena capabilities (global, over the bound model) ──
- * Memory-shaping parameters of the bound model's engine, so an inferlet
- * can size working sets and validate fold lengths before allocating.
- * Size in bytes of one folded recurrent-state object. 0 if the model has
- * no recurrent state (pure attention, or a window, whose state is pages).
+ * Size in bytes of one folded recurrent state. 0 if the model keeps
+ * none (attention only, windowed or not).
  */
 export function rsStateSize(): bigint;
-/**
- * Tokens per buffered RS page; for a window, the kv page size. 0 if the
- * model has no bounded state.
- */
-export function rsBufferPageSize(): number;
-/**
- * Fold granularity in tokens: an RS fold of `n` tokens requires `n` to
- * be a positive multiple of this value. 1 (or 0) means unconstrained;
- * 0 also implies the model has no recurrent state. (Token-causal RS models
- * — Qwen3.5 GDN, Nemotron-H Mamba2 — report 1.)
- */
-export function rsFoldGranularity(): number;
-/**
- * Size in bytes of one unified-arena accounting block. In v1 the KV page is
- * exactly one block, so this is the byte size of one KV page; an RS slab
- * occupies an integer number of these blocks.
- */
-export function arenaBlockSize(): bigint;
 export type Dtype = import('./pie-inferlet-types.js').Dtype;
 /**
  * What a guest needs to seed a BLOCK drafter's draft pass: the rows one
@@ -200,43 +167,22 @@ export interface BlockDrafter {
   proposalsFrom: number,
 }
 /**
- * Which forward-pass kind the bound model requires. A guest may only
- * construct the `forward-pass` of the matching interface; the other
- * interfaces' constructors error immediately.
+ * Which forward-pass interface the bound model takes: `forward` for every
+ * text model, whatever state it keeps; `forward-diffusion` for a
+ * block-diffusion text.
  * 
- * Do NOT derive this by parsing `architecture()` — that is an open set and
- * every new model family would break guests. This enum is closed over
- * STATE SEMANTICS, so it does not grow with the model zoo.
- * 
- * This is also the ONE place the bounded-state class is asked about.
- * `!= attention` means the model carries, beside or instead of its KV, a
- * bounded state reusable only as a snapshot: a recurrent state that folds
- * tokens IRREVERSIBLY (linear-attention / SSM: Qwen3.5 GDN, Nemotron-H
- * Mamba2) or a sliding window (Gemma-4's windowed layers), as opposed to
- * pure attention whose KV is per-token and reversibly discardable. That
- * in turn pins the speculative-commit CONTRACT — FOLD-COMMIT (fold only
- * the accepted prefix, holding the uncertain tail in the RS buffer;
- * folding is runtime-managed in-forward) vs KV-SLOT DISCARD — so a
- * spec-decode loop can stay model-agnostic.
- * Do not re-derive the class from `rs-state-size() > 0`: that is a
- * byte-accounting accident that happens to agree.
+ * Do NOT derive this by parsing `architecture()` -- that is an open set.
  * # Variants
  * 
- * ## `"attention"`
+ * ## `"text"`
  * 
- * Per-token, reversibly discardable KV only  -> `forward`
- * ## `"recurrent"`
- * 
- * Irreversibly folded recurrent state only   -> `forward-recurrent`
- * ## `"hybrid"`
- * 
- * KV plus a bounded state (recurrent or a window) -> `forward-hybrid`
+ * Tokens one by one -> `forward`
  * ## `"diffusion"`
  * 
- * Paged KV plus a canvas the model denoises in place, one trunk
- * read causally or bidirectionally per pass -> `forward-diffusion`
+ * A canvas the model denoises in place, one trunk read causally or
+ * bidirectionally per pass -> `forward-diffusion`
  */
-export type ForwardKind = 'attention' | 'recurrent' | 'hybrid' | 'diffusion';
+export type ForwardKind = 'text' | 'diffusion';
 /**
  * The canvas a diffusion model denoises: how many tokens one block is,
  * and the trunk's hidden width (the row width of a self-conditioning
@@ -253,16 +199,16 @@ export interface CanvasShape {
   selfCondTaps: number,
 }
 /**
- * ── Generative facts (imagegen design D12) ──────────────────────────
+ * ── Generative facts ────────────────────────────────────────────────
  * What a guest sizes an image/video job from, so it never parses
  * `architecture()`: the family's readings (the arms a pass can run),
  * its latent space, the schedule it was trained under, and the widest
  * float lane one pass carries. A text model answers an empty list,
  * `none`, `none` and 0: it has one implicit reading and no latent.
  * A lane's stream — which of the model's rectangles its rows belong to
- * (design D2: a lane is one request's rows of ONE stream; a request
- * with text and image rows submits one pass per stream, both in one
- * attention group). Codes agree with `poem_ir::Stream`.
+ * (a lane is one request's rows of ONE stream; a request with text and
+ * image rows submits one pass per stream, both in one attention group).
+ * Codes agree with `poem_ir::Stream`.
  * # Variants
  * 
  * ## `"text"`
@@ -280,13 +226,13 @@ export interface CanvasShape {
 export type LaneStream = 'text' | 'image' | 'video' | 'audio' | 'context' | 'reference';
 /**
  * Which runtime input a float port feeds, and so what shape its channel
- * is (design D3). `latents`: `[rows, width]`, the lane's own rows, fed
+ * is. `latents`: `[rows, width]`, the lane's own rows, fed
  * from the channel's COMMITTED cell at every submit. `lane-vector`: one
  * `[width]` (or `[1, width]`) row per lane — a timestep, a guidance
  * scale. `context`: `[rows, width]`, an encoder's output, the rows of a
  * `context` lane. `axis-positions`: `[rows, width]` with `width` the
  * axis count (1..=4), the per-row RoPE coordinates. `voxels`: a VAE's
- * tile on the voxel axis (design D8) — the channel is `[h, w, width]`
+ * tile on the voxel axis — the channel is `[h, w, width]`
  * for a still or `[t, h, w, width]` for a clip, one clip per pass, its
  * shape being the clip's box.
  * # Variants
@@ -358,7 +304,7 @@ export interface PortFact {
  */
 export type AxisRole = 'time' | 'height' | 'width' | 'index';
 /**
- * WHERE A READING'S LANES SIT IN THE ROTARY SPACE (design D7/D12).
+ * WHERE A READING'S LANES SIT IN THE ROTARY SPACE.
  * 
  * A denoise reading's `axis-positions` port takes one coordinate vector
  * per row, and which coordinate goes where is a family contract the
@@ -417,7 +363,7 @@ export type ReadoutKind = 'logits' | 'velocity' | 'hidden' | 'pixels';
 /**
  * One reading of the bound model: the arm a pass runs when it names
  * this reading (`forward-pass.reading`). `index` is the fact value a
- * lane is stamped with; `has-kv` says whether `attention` is required
+ * lane is stamped with; `has-kv` says whether `state` is required
  * (else refused) on its pass, `takes-tokens` the same for `embed`;
  * `streams` are the lane streams a request submits (one pass per
  * stream, `forward-pass.stream`; empty means text only); `ports` are

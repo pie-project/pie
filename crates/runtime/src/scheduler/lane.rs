@@ -317,6 +317,15 @@ impl Lane {
             }
             if engine.settles_asynchronously() {
                 engine.on_complete(std::sync::Arc::new(move |at: engine::StepDone, outcome| {
+                    // What lanes wrote is kept before their step is published
+                    // settled, so the fires that asked find it.
+                    let outcome = match outcome {
+                        engine::StepOutcome::Wrote(writes) => {
+                            crate::pipeline::fire::record_kv_writes(writes);
+                            engine::StepOutcome::Committed
+                        }
+                        outcome => outcome,
+                    };
                     let _ = landed_tx.send(LaneRequest::Landed {
                         frame: at.frame,
                         step: at.step,
@@ -453,21 +462,15 @@ impl Lane {
     fn commit_on_failure(item: &QueuedItem, why: &str) -> LaneCommit {
         match item {
             QueuedItem::Launch(_) => unreachable!(),
-            QueuedItem::BindInstance { pipeline_id, .. }
-            | QueuedItem::RegisterChannelsBind { pipeline_id, .. } => LaneCommit::BindFinished {
+            QueuedItem::RegisterChannelsBind { pipeline_id, .. } => LaneCommit::BindFinished {
                 pipeline_id: *pipeline_id,
             },
-            QueuedItem::PreLaunchCopy { .. }
-            | QueuedItem::CopyKv { .. }
-            | QueuedItem::CopyTracked { .. }
-            | QueuedItem::CopyState { .. } => LaneCommit::AsyncControl {
-                result: Err(why.to_string()),
-            },
-            QueuedItem::RegisterProgram { .. }
-            | QueuedItem::RegisterChannel { .. }
-            | QueuedItem::RegisterChannels { .. }
-            | QueuedItem::CloseInstance { .. }
-            | QueuedItem::CloseChannels { .. } => LaneCommit::None,
+            QueuedItem::PreLaunchCopy { .. } | QueuedItem::CopyTracked { .. } => {
+                LaneCommit::AsyncControl {
+                    result: Err(why.to_string()),
+                }
+            }
+            QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. } => LaneCommit::None,
         }
     }
 
@@ -633,138 +636,6 @@ impl Lane {
                     }
                 }
             }
-            QueuedItem::RegisterProgram { plan, response } => {
-                if response.is_closed() {
-                    tracing::warn!(
-                        operation = "register_program",
-                        "scheduler RPC cancelled before resource creation"
-                    );
-                    return LaneCommit::None;
-                }
-                let result = backend(engine).and_then(|engine| {
-                    let backend = crate::engine::verbs::codegen_backend(engine);
-                    let plan = crate::pipeline::program::with_host_codegen(&plan, backend);
-                    engine.register_program(&plan).map_err(anyhow::Error::from)
-                });
-                match result {
-                    Ok(program_id) => {
-                        if response.send(Ok(program_id)).is_err() {
-                            tracing::warn!(
-                                operation = "register_program",
-                                program_hash = format_args!("0x{:016x}", plan.program_hash),
-                                "scheduler RPC cancelled after program registration; retaining engine-lifetime program"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        let _ = response.send(Err(error));
-                    }
-                }
-                LaneCommit::None
-            }
-            QueuedItem::RegisterChannel { plan, response } => {
-                if response.is_closed() {
-                    tracing::warn!(
-                        operation = "register_channel",
-                        channel_id = plan.id,
-                        "scheduler RPC cancelled before resource creation"
-                    );
-                    return LaneCommit::None;
-                }
-                let result = if channels.contains(plan.id) {
-                    Err(anyhow!("channel {} is already registered", plan.id))
-                } else {
-                    backend(engine).and_then(|engine| {
-                        crate::engine::verbs::register_channel(engine, engine_idx, &plan).inspect(
-                            |channel| {
-                                channels.insert(channel.clone(), plan.host_role);
-                            },
-                        )
-                    })
-                };
-                match result {
-                    Ok(channel) => {
-                        if let Err(Ok(channel)) = response.send(Ok(channel)) {
-                            if let Some(engine) = engine.as_mut() {
-                                Self::rollback_channel_set(
-                                    engine,
-                                    channels,
-                                    std::slice::from_ref(&channel),
-                                    "register_channel",
-                                    true,
-                                );
-                            }
-                            Self::release_registered_channel_wait_slots(std::slice::from_ref(
-                                &channel,
-                            ));
-                        }
-                    }
-                    Err(error) => {
-                        let _ = response.send(Err(error));
-                    }
-                }
-                LaneCommit::None
-            }
-            QueuedItem::RegisterChannels { plans, response } => {
-                if response.is_closed() {
-                    tracing::warn!(
-                        operation = "register_channels",
-                        "scheduler RPC cancelled before resource creation"
-                    );
-                    return LaneCommit::None;
-                }
-                let result = backend(engine).and_then(|engine| {
-                    Self::register_channel_set(engine, engine_idx, channels, &plans)
-                });
-                match result {
-                    Ok(registered) => {
-                        if let Err(Ok(registered)) = response.send(Ok(registered)) {
-                            if let Some(engine) = engine.as_mut() {
-                                Self::rollback_channel_set(
-                                    engine,
-                                    channels,
-                                    &registered,
-                                    "register_channels",
-                                    true,
-                                );
-                            }
-                            Self::release_registered_channel_wait_slots(&registered);
-                        }
-                    }
-                    Err(error) => {
-                        let _ = response.send(Err(error));
-                    }
-                }
-                LaneCommit::None
-            }
-            QueuedItem::BindInstance {
-                pipeline_id,
-                plan,
-                response,
-            } => {
-                if response.is_closed() {
-                    Lane::release_wait_slots([plan.pacing_wait_id]);
-                    tracing::warn!(
-                        operation = "bind_instance",
-                        program_id = plan.program_id(),
-                        "scheduler RPC cancelled before resource creation"
-                    );
-                    return LaneCommit::BindFinished { pipeline_id };
-                }
-                match backend(engine).and_then(|engine| Self::bind(engine, channels, &plan)) {
-                    Ok(bound) => LaneCommit::BindInstance {
-                        pipeline_id,
-                        bound,
-                        respond: BindRespond::Bind(response),
-                    },
-                    Err(error) => {
-                        if response.send(Err(error)).is_err() {
-                            Self::release_wait_slots([plan.pacing_wait_id]);
-                        }
-                        LaneCommit::BindFinished { pipeline_id }
-                    }
-                }
-            }
             QueuedItem::RegisterChannelsBind {
                 pipeline_id,
                 plans,
@@ -861,7 +732,7 @@ impl Lane {
                     Ok(bound) => LaneCommit::BindInstance {
                         pipeline_id,
                         bound,
-                        respond: BindRespond::ChannelsBind {
+                        respond: BindRespond {
                             registered,
                             program_id: bind.program_id(),
                             program_registered,
@@ -884,16 +755,6 @@ impl Lane {
                     }
                 }
             }
-            QueuedItem::CopyKv { plan, response } => Self::answer_copy(
-                backend(engine)
-                    .and_then(|engine| crate::engine::verbs::settled(engine.copy_kv(&plan))),
-                response,
-            ),
-            QueuedItem::CopyState { plan, response } => Self::answer_copy(
-                backend(engine)
-                    .and_then(|engine| crate::engine::verbs::settled(engine.copy_state(&plan))),
-                response,
-            ),
             QueuedItem::CopyTracked { plan, completion } => {
                 match backend(engine).and_then(|engine| {
                     crate::engine::verbs::settled(match plan {
@@ -954,25 +815,6 @@ impl Lane {
         let bound = BoundInstance::new(plan.engine_id, &bound, plan.pacing_wait_id);
         channels.bind(bound.instance_id, plan.binding.channels.clone());
         Ok(bound)
-    }
-
-    fn answer_copy(
-        submitted: Result<SubmissionCompletion>,
-        response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
-    ) -> LaneCommit {
-        match submitted {
-            Ok(completion) => {
-                let _ = response.send(Ok(completion.clone()));
-                LaneCommit::AsyncControl {
-                    result: Ok(completion),
-                }
-            }
-            Err(error) => {
-                let message = format!("{error:#}");
-                let _ = response.send(Err(error));
-                LaneCommit::refused(message)
-            }
-        }
     }
 
     fn close_channel(engine: &mut EngineBox, id: u64) -> Result<()> {

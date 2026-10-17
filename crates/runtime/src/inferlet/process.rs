@@ -1,5 +1,6 @@
 mod ctx;
 pub(crate) mod gate;
+mod ordered;
 mod output;
 pub(crate) mod residency;
 pub(crate) mod teardown;
@@ -16,14 +17,16 @@ use std::time::Duration;
 
 use crate::rt::JoinHandle;
 use anyhow::{Result, anyhow};
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 type SharedResultTx = Arc<Mutex<Option<oneshot::Sender<Result<String, String>>>>>;
 
+use crate::policy::{Arrival, By, Outcome};
 use crate::server::{self, ClientId};
 use crate::service::{ServiceHandler, ServiceMap};
 
+use self::ordered::{OrderedPermit, OrderedSemaphore};
 use super::linker;
 use super::program::ProgramName;
 
@@ -106,10 +109,70 @@ pub type ProcessId = Uuid;
 
 static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> = LazyLock::new(ServiceMap::new);
 
-static ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
-static BIND_ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
-static PREWARM_ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+static ADMISSION: OnceLock<Option<Arc<OrderedSemaphore>>> = OnceLock::new();
+static BIND_ADMISSION: OnceLock<Option<Arc<OrderedSemaphore>>> = OnceLock::new();
+static PREWARM_ADMISSION: OnceLock<Option<Arc<OrderedSemaphore>>> = OnceLock::new();
 static EXECUTION_SLOT_CAPACITY: OnceLock<Option<usize>> = OnceLock::new();
+/// A process's bind permit, then its execution seat; a process the schedule
+/// pauses gives both back.
+#[derive(Default)]
+pub(crate) struct Seat {
+    bind: Option<OrderedPermit>,
+    exec: Option<OrderedPermit>,
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        release_bind_permit(self.bind.take());
+    }
+}
+
+static SEATS: LazyLock<Mutex<HashMap<ProcessId, Seat>>> = LazyLock::new(Default::default);
+
+fn seats_held() -> std::sync::MutexGuard<'static, HashMap<ProcessId, Seat>> {
+    SEATS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub(crate) fn seats_capped() -> bool {
+    ADMISSION.get().is_some_and(Option::is_some)
+        || BIND_ADMISSION.get().is_some_and(Option::is_some)
+}
+
+fn take_permits(pid: ProcessId) -> Option<Seat> {
+    seats_held().remove(&pid)
+}
+
+pub(crate) fn vacate_seat(pid: ProcessId) -> bool {
+    let Some(seat) = take_permits(pid) else {
+        return false;
+    };
+    if seat.exec.is_some() {
+        crate::scheduler::worker::notify_execution_slot_released(pid);
+    }
+    true
+}
+
+pub(crate) async fn take_seat(pid: ProcessId) -> Seat {
+    let mut seat = Seat::default();
+    if let Some(semaphore) = BIND_ADMISSION.get().and_then(Option::as_ref) {
+        seat.bind = Some(Arc::clone(semaphore).acquire_owned(pid).await);
+    }
+    if let Some(semaphore) = ADMISSION.get().and_then(Option::as_ref) {
+        seat.exec = Some(Arc::clone(semaphore).acquire_owned(pid).await);
+    }
+    seat
+}
+
+pub(crate) fn reseat(pid: ProcessId, seat: Seat) {
+    let seated = seat.exec.is_some();
+    let replaced = seats_held().insert(pid, seat);
+    drop(replaced);
+    if seated {
+        crate::scheduler::worker::notify_execution_slot_consumed(pid);
+    }
+}
 
 pub(crate) fn execution_slot_capacity() -> Option<usize> {
     EXECUTION_SLOT_CAPACITY.get().copied().flatten()
@@ -117,6 +180,19 @@ pub(crate) fn execution_slot_capacity() -> Option<usize> {
 
 pub fn live_count() -> usize {
     SERVICES.len()
+}
+
+pub fn seats() -> (usize, usize) {
+    let live = live_count();
+    let running = match (
+        ADMISSION.get().and_then(Option::as_ref),
+        execution_slot_capacity(),
+    ) {
+        (Some(semaphore), Some(capacity)) => capacity.saturating_sub(semaphore.available_permits()),
+        _ => live,
+    }
+    .min(live);
+    (running, live - running)
 }
 
 const UNCAPPED_PREWARM_PROCESSES: usize = 64;
@@ -194,12 +270,14 @@ pub fn get_runtime_stats() -> RuntimeProcessStats {
 
 pub fn init_admission(max_concurrent: Option<usize>) {
     let limit = max_concurrent.filter(|&n| n > 0);
-    let sem = limit.map(|n| Arc::new(Semaphore::new(n)));
-    let prewarm = Some(Arc::new(Semaphore::new(
+    // Only the first gate, prewarm, holds below the floor.
+    let sem = limit.map(|n| OrderedSemaphore::new(n, false));
+    let prewarm = Some(OrderedSemaphore::new(
         limit.unwrap_or(UNCAPPED_PREWARM_PROCESSES),
-    )));
+        true,
+    ));
     const STAGED_COHORTS: usize = 1;
-    let bind_ahead = limit.map(|n| Arc::new(Semaphore::new(n)));
+    let bind_ahead = limit.map(|n| OrderedSemaphore::new(n, false));
     BIND_STAGED_RESERVE.store(
         limit.map_or(0, |n| n.saturating_mul(STAGED_COHORTS)),
         Relaxed,
@@ -246,9 +324,9 @@ fn open_staged_bind_pool() {
 }
 
 static BIND_RELEASE_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static HELD_BIND_PERMITS: Mutex<Vec<tokio::sync::OwnedSemaphorePermit>> = Mutex::new(Vec::new());
+static HELD_BIND_PERMITS: Mutex<Vec<OrderedPermit>> = Mutex::new(Vec::new());
 
-pub(crate) fn release_bind_permit(permit: Option<tokio::sync::OwnedSemaphorePermit>) {
+pub(crate) fn release_bind_permit(permit: Option<OrderedPermit>) {
     let Some(permit) = permit else {
         return;
     };
@@ -277,21 +355,31 @@ pub(crate) fn set_bind_release_hold(hold: bool) {
     drop(drained);
 }
 
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(dead_code, reason = "no policy runs in the browser")
+)]
+pub(crate) fn regrant_admission() {
+    for gate in [&PREWARM_ADMISSION, &BIND_ADMISSION, &ADMISSION] {
+        if let Some(Some(semaphore)) = gate.get() {
+            semaphore.regrant();
+        }
+    }
+}
+
 pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     if ctx.bind_admitted() {
         return;
     }
     let permit = match BIND_ADMISSION.get().and_then(|value| value.as_ref()) {
-        Some(semaphore) => Some(
-            Arc::clone(semaphore)
-                .acquire_owned()
-                .await
-                .expect("bind admission semaphore closed"),
-        ),
+        Some(semaphore) => Some(Arc::clone(semaphore).acquire_owned(ctx.id()).await),
         None => None,
     };
     ctx.release_prewarm_permit();
-    ctx.admit_bind(permit);
+    if let Some(permit) = permit {
+        seats_held().entry(ctx.id()).or_default().bind = Some(permit);
+    }
+    ctx.admit_bind();
 }
 
 pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
@@ -300,25 +388,24 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
         return;
     }
     let started = Instant::now();
-    let permit = match ADMISSION.get().and_then(|value| value.as_ref()) {
+    let seated = match ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => {
             let _queued = AdmissionQueued::enter(ctx.id());
-            let permit = Arc::clone(semaphore)
-                .acquire_owned()
-                .await
-                .expect("admission semaphore closed");
+            let permit = Arc::clone(semaphore).acquire_owned(ctx.id()).await;
             if semaphore.available_permits() == 0 {
                 open_staged_bind_pool();
             }
+            seats_held().entry(ctx.id()).or_default().exec = Some(permit);
             crate::scheduler::worker::notify_execution_slot_consumed(ctx.id());
-            Some(permit)
+            true
         }
-        None => None,
+        None => false,
     };
-    ctx.admit_execution(permit, duration_us(started.elapsed()));
+    ctx.admit_execution(seated, duration_us(started.elapsed()));
     if let Some(planner) = crate::planner::planner() {
         planner.note_admitted(ctx.id());
     }
+    crate::policy::report(crate::policy::Event::Started(ctx.id()));
 }
 
 pub fn spawn(
@@ -328,6 +415,7 @@ pub fn spawn(
     client_id: Option<ClientId>,
     capture_outputs: bool,
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
+    arrival: Arrival,
 ) -> Result<ProcessId> {
     spawn_inner(
         username,
@@ -338,17 +426,13 @@ pub fn spawn(
         Arc::new(Mutex::new(result_tx)),
         None,
         None,
+        arrival,
     )
 }
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "one spawn request in full: who is asking, what program on what input, \
-              which client to report to, whether to capture output, where the result \
-              goes, and the two inheritance fields (`inherit_seq`, \
-              `inherit_client_pid`) that are set only when a process spawns a child. \
-              The last two are exactly why a struct would not help — they are \
-              `None` for every top-level spawn"
+    reason = "one spawn request, as its callers have it"
 )]
 fn spawn_inner(
     username: String,
@@ -359,8 +443,10 @@ fn spawn_inner(
     result_tx: SharedResultTx,
     inherit_seq: Option<u64>,
     inherit_client_pid: Option<ProcessId>,
+    arrival: Arrival,
 ) -> Result<ProcessId> {
     let id = Uuid::new_v4();
+    crate::policy::schedule::alias(id, inherit_client_pid.unwrap_or(id));
     if let Some(planner) = crate::planner::planner() {
         match inherit_seq {
             Some(seq) => planner.register_with_seq(id, seq),
@@ -376,6 +462,7 @@ fn spawn_inner(
         client_id,
         capture_outputs,
         result_tx,
+        arrival,
     );
     if let Err(error) = SERVICES.spawn(id, || process) {
         if let Some(planner) = crate::planner::planner() {
@@ -407,8 +494,12 @@ pub fn detach(process_id: ProcessId) {
 /// Ends a process on its owner's behalf, never re-running it. A send that
 /// misses because a restart retired the resolved id follows the new alias.
 pub fn terminate(process_id: ProcessId, result: Result<String, String>) {
+    terminate_by(process_id, result, By::Client);
+}
+
+pub fn terminate_by(process_id: ProcessId, result: Result<String, String>, by: By) {
     let mut target = resolve(process_id);
-    while !send_terminate(target, result.clone(), false) {
+    while !send_terminate(target, result.clone(), false, by) {
         let next = resolve(process_id);
         if next == target {
             return;
@@ -417,9 +508,21 @@ pub fn terminate(process_id: ProcessId, result: Result<String, String>) {
     }
 }
 
-fn send_terminate(process_id: ProcessId, result: Result<String, String>, from_run: bool) -> bool {
+fn send_terminate(
+    process_id: ProcessId,
+    result: Result<String, String>,
+    from_run: bool,
+    by: By,
+) -> bool {
     let sent = SERVICES
-        .send(&process_id, Message::Terminate { result, from_run })
+        .send(
+            &process_id,
+            Message::Terminate {
+                result,
+                from_run,
+                by,
+            },
+        )
         .is_ok();
     if sent {
         crate::scheduler::worker::post_process_terminate(process_id);
@@ -476,6 +579,7 @@ enum Message {
         result: Result<String, String>,
         /// Only the run task's own end may be replaced by a parked restart.
         from_run: bool,
+        by: By,
     },
 
     Stdout {
@@ -509,15 +613,13 @@ struct Process {
     capture_outputs: bool,
     output_buffer: VecDeque<ProcessEvent>,
     result_tx: SharedResultTx,
+    arrival: Arrival,
 }
 
 impl Process {
     #[allow(
         clippy::too_many_arguments,
-        reason = "the resolved form of `spawn_inner`'s argument list, one level down: \
-                  both process ids are now known, and the rest is carried through \
-                  unchanged. Introducing a struct here would only move the same \
-                  fields across one call"
+        reason = "`spawn_inner`'s arguments, with both process ids known"
     )]
     fn new(
         process_id: ProcessId,
@@ -528,6 +630,7 @@ impl Process {
         client_id: Option<ClientId>,
         capture_outputs: bool,
         result_tx: SharedResultTx,
+        arrival: Arrival,
     ) -> Self {
         let task = Self::run(
             process_id,
@@ -536,6 +639,7 @@ impl Process {
             input.clone(),
             capture_outputs,
             result_tx.clone(),
+            arrival.clone(),
         );
         let handle = crate::rt::spawn(task);
 
@@ -551,6 +655,7 @@ impl Process {
             capture_outputs,
             output_buffer: VecDeque::new(),
             result_tx,
+            arrival,
         }
     }
 
@@ -592,19 +697,19 @@ impl Process {
         input: String,
         capture_outputs: bool,
         result_tx: SharedResultTx,
+        arrival: Arrival,
     ) {
+        // A process arrives, as a policy sees it, before it waits: every gate
+        // below orders by its key.
+        let props = arrival.props.clone();
+        crate::policy::report(crate::policy::Event::Arrived(process_id, arrival));
         // Held ahead of every admission permit: a preempted process coming
         // back must not queue behind permits the held-back processes own.
         if let Some(planner) = crate::planner::planner() {
             planner.admit(process_id).await;
         }
         let prewarm_permit = match PREWARM_ADMISSION.get().and_then(|s| s.as_ref()) {
-            Some(sem) => Some(
-                Arc::clone(sem)
-                    .acquire_owned()
-                    .await
-                    .expect("prewarm admission semaphore closed"),
-            ),
+            Some(sem) => Some(Arc::clone(sem).acquire_owned(process_id).await),
             None => None,
         };
         let mut admission_wait_us = 0u64;
@@ -623,6 +728,7 @@ impl Process {
                 .map_err(|e| e.to_string())?;
             instantiate_us = duration_us(instantiate_start.elapsed());
             store.data_mut().install_prewarm_permit(prewarm_permit);
+            store.data_mut().set_props(props);
 
             let run_interface = RUN_INTERFACE;
 
@@ -695,7 +801,7 @@ impl Process {
             let _ = tx.send(result.clone());
         }
 
-        send_terminate(process_id, result, true);
+        send_terminate(process_id, result, true, By::Host);
     }
 
     fn restart(&mut self) -> bool {
@@ -709,6 +815,7 @@ impl Process {
             self.result_tx.clone(),
             seq,
             Some(self.client_pid),
+            self.arrival.clone(),
         );
         match spawned {
             Ok(new_id) => {
@@ -732,11 +839,11 @@ impl Process {
         }
     }
 
-    fn terminate(&mut self, result: Result<String, String>, from_run: bool) {
+    fn terminate(&mut self, result: Result<String, String>, from_run: bool, by: By) {
         // Queued here before a restart handed the client's pid over.
         let current = resolve(self.client_pid);
         if current != self.process_id {
-            terminate(self.client_pid, result);
+            terminate_by(self.client_pid, result, by);
             return;
         }
         self.handle.abort();
@@ -745,6 +852,15 @@ impl Process {
         forget_restart_state(self.process_id);
 
         if !restarted {
+            let outcome = match (&result, from_run, by) {
+                (Ok(_), true, _) => Outcome::Completed,
+                (Err(_), true, _) | (_, false, By::Host) => Outcome::Failed,
+                (_, false, By::Client | By::Policy) => Outcome::Cancelled,
+            };
+            // Before the client hears of the exit, so whoever it tells
+            // can read the process's last counts.
+            crate::policy::tokens::exit(self.client_pid);
+            crate::policy::report(crate::policy::Event::Exited(self.client_pid, outcome));
             if let Some(tx) = self.result_tx.lock().unwrap().take() {
                 let _ = tx.send(result.clone());
             }
@@ -765,6 +881,7 @@ impl Process {
 
         let _ = server::inbox::clear(self.process_id.to_string());
         SERVICES.remove(&self.process_id);
+        crate::policy::schedule::forget(self.process_id);
 
         if !restarted {
             RESTART_ALIAS.write().unwrap().remove(&self.client_pid);
@@ -798,8 +915,12 @@ impl ServiceHandler for Process {
                 self.client_id = None;
             }
 
-            Message::Terminate { result, from_run } => {
-                self.terminate(result, from_run);
+            Message::Terminate {
+                result,
+                from_run,
+                by,
+            } => {
+                self.terminate(result, from_run, by);
             }
 
             Message::Stdout { content } => self.deliver_event(ProcessEvent::Stdout(content)),
@@ -894,6 +1015,7 @@ mod tests {
             capture_outputs: true,
             output_buffer: VecDeque::new(),
             result_tx,
+            arrival: Arrival::default(),
         }
     }
 
@@ -908,6 +1030,7 @@ mod tests {
             .handle(Message::Terminate {
                 result: Err("closed".to_string()),
                 from_run: false,
+                by: By::Client,
             })
             .await;
 

@@ -11,8 +11,6 @@ use wasmtime_wasi::WasiView;
 
 impl pie::inferlet::grammar::Host for ProcessCtx {}
 
-impl pie::inferlet::working_set::Host for ProcessCtx {}
-
 pub struct Grammar {
     pub(crate) compiled: Arc<CompiledGrammar>,
 }

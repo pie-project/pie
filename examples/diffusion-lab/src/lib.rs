@@ -168,7 +168,6 @@ struct Output {
     /// Mean log-probability of each committed block's tokens under the
     /// causal reading (`quality`), empty otherwise.
     self_logprob: Vec<f32>,
-    /// Denoise fires submitted, and encode fires.
     denoise_fires: u32,
     encode_fires: u32,
 }
@@ -187,7 +186,10 @@ enum Rule {
 impl Rule {
     /// Rules that decode a row once and keep it (masked-diffusion decoding).
     fn sticky(self) -> bool {
-        matches!(self, Rule::Llada | Rule::Threshold | Rule::Remdm | Rule::Klass)
+        matches!(
+            self,
+            Rule::Llada | Rule::Threshold | Rule::Remdm | Rule::Klass
+        )
     }
     /// Rules whose count of rows to accept the host schedules (`count`).
     fn counted(self) -> bool {
@@ -235,13 +237,10 @@ struct Block<'a> {
     vocab: u32,
     taps_width: u32,
     taps_used: u32,
-    page_size: u32,
-    max_pages: u32,
     clamps: &'a [(u32, i32)],
 }
 
 impl Block<'_> {
-    /// Denoise one canvas at positions `base..base+length`, seeded by `seed`.
     async fn denoise(&self, base: u32, seed: u32) -> Result<Denoised> {
         let Block {
             input,
@@ -252,8 +251,6 @@ impl Block<'_> {
             vocab,
             taps_width,
             taps_used,
-            page_size,
-            max_pages,
             clamps,
         } = *self;
         let end = base + length;
@@ -277,12 +274,7 @@ impl Block<'_> {
         }
         let toks = Channel::from(canvas.clone()).named("canvas");
         let embed_indptr = Channel::from([0u32, length]).named("embed_indptr");
-        let positions = Channel::from_iter(base..end).named("positions");
-        let pages = Channel::from_iter(0..max_pages).named("pages");
-        let page_indptr = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot");
-        let w_off = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off");
-        let kv_len = Channel::from([end]).named("kv_len");
+        let slots = Channel::from_iter(base..end).named("slots");
         let readout = Channel::from_iter(0..length).named("readout");
         // Control words, host-`set` before each submit.
         let temp = Channel::from([input.t_max]).named("temperature");
@@ -302,10 +294,11 @@ impl Block<'_> {
         // for `a` the previous argmax — the one term of the full KL a
         // per-row gather can reach; the whole [canvas, vocab] plane of the
         // previous step (268 MB) is more than a guest can seed.
-        let prev_id = (rule == Rule::Klass).then(|| Channel::from(vec![0u32; n]).named("prev_argmax"));
+        let prev_id =
+            (rule == Rule::Klass).then(|| Channel::from(vec![0u32; n]).named("prev_argmax"));
         let prev_p = (rule == Rule::Klass).then(|| Channel::from(vec![0f32; n]).named("prev_top1"));
-        let prev_kl = (rule == Rule::Klass)
-            .then(|| Channel::from(vec![1e30f32; n]).named("prev_kl"));
+        let prev_kl =
+            (rule == Rule::Klass).then(|| Channel::from(vec![1e30f32; n]).named("prev_kl"));
         // `remdm`: the step index, device-carried, switches remasking off
         // for the schedule's last fifth.
         let step_index = Channel::from([0u32]).named("step_index");
@@ -314,35 +307,26 @@ impl Block<'_> {
         let commit_out = Channel::new([length], dtype::i32).named("commit_out");
         let stop = Channel::new([1], dtype::bool).named("stop");
         let mean_out = Channel::new([1], dtype::f32).named("mean_entropy");
-        let tap_ids_out = (taps_used > 0)
-            .then(|| Channel::new([length, taps_used], dtype::u32).named("tap_ids"));
+        let tap_ids_out =
+            (taps_used > 0).then(|| Channel::new([length, taps_used], dtype::u32).named("tap_ids"));
         let tap_weights_out = (taps_used > 0)
             .then(|| Channel::new([length, taps_used], dtype::f32).named("tap_weights"));
 
         let fwd = ForwardPass::new();
         fwd.canvas(Mode::Denoise)?;
         fwd.embed(&toks, &embed_indptr)?;
-        fwd.attention(
-            ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &positions,
-                mask: None,
+        fwd.state(
+            &[ws],
+            StateGeometry {
+                slots: Some(&slots),
+                ..StateGeometry::default()
             },
         )?;
         fwd.readout(&readout)?;
         {
             let (tap_ids_out, tap_weights_out) = (tap_ids_out.clone(), tap_weights_out.clone());
             fwd.epilogue(move || {
-                positions.put(positions.take());
-                w_slot.put(w_slot.take());
-                w_off.put(w_off.take());
+                slots.put(slots.take());
 
                 let r = rng_state.take();
                 let t = reshape(temp.read(), []);
@@ -351,7 +335,11 @@ impl Block<'_> {
                 let probs = softmax(&scaled);
                 let h = entropy(&probs); // [length]
                 let argmax = reduce_argmax(&scaled);
-                let sampled = if greedy { argmax.clone() } else { gumbel_max(&scaled, &r) };
+                let sampled = if greedy {
+                    argmax.clone()
+                } else {
+                    gumbel_max(&scaled, &r)
+                };
                 // Top-1 probability per row: what LLaDA, Fast-dLLM and
                 // KLASS call confidence.
                 let conf = reduce_max(&probs); // [length]
@@ -402,11 +390,16 @@ impl Block<'_> {
                         top_by_conf()
                     }
                     Rule::Klass => {
-                        let (prev_id, prev_p, prev_kl) =
-                            (prev_id.as_ref().unwrap(), prev_p.as_ref().unwrap(), prev_kl.as_ref().unwrap());
+                        let (prev_id, prev_p, prev_kl) = (
+                            prev_id.as_ref().unwrap(),
+                            prev_p.as_ref().unwrap(),
+                            prev_kl.as_ref().unwrap(),
+                        );
                         // log p_t at the previous argmax, off the scaled row's max and partition sum.
                         let m = reduce_max(&scaled);
-                        let lz = log(&reduce_sum(&exp(&scaled - &broadcast(reshape(&m, [length, 1]), [length, vocab]))));
+                        let lz = log(&reduce_sum(&exp(
+                            &scaled - &broadcast(reshape(&m, [length, 1]), [length, vocab])
+                        )));
                         let id_before = prev_id.take();
                         let lp_at = &(&gather_row(&scaled, &id_before) - &m) - &lz; // [length]
                         let p_before = max_elem(&prev_p.take(), 1e-30f32);
@@ -440,7 +433,11 @@ impl Block<'_> {
                     let commit = select(&now, &next, &argmax);
                     (next, commit, eq(&count_frozen, length as i32))
                 } else {
-                    (select(&accept, &sampled, &noise), argmax.clone(), lt(iota(1), 0u32))
+                    (
+                        select(&accept, &sampled, &noise),
+                        argmax.clone(),
+                        lt(iota(1), 0u32),
+                    )
                 };
 
                 // ── the stopping rule: stable for `stability` steps + confident ──
@@ -460,10 +457,13 @@ impl Block<'_> {
                     // probabilities off the row's max and partition sum, so
                     // `probs` need not be read by a library op here.
                     let m = reduce_max(&scaled);
-                    let z = reduce_sum(&exp(&scaled - &broadcast(reshape(&m, [length, 1]), [length, vocab])));
+                    let z = reduce_sum(&exp(
+                        &scaled - &broadcast(reshape(&m, [length, 1]), [length, vocab])
+                    ));
                     let (top_vals, tap_ids) = top_k(&scaled, taps_used);
-                    let tap_weights = &exp(&top_vals - &broadcast(reshape(&m, [length, 1]), [length, taps_used]))
-                        / &broadcast(reshape(&z, [length, 1]), [length, taps_used]);
+                    let tap_weights =
+                        &exp(&top_vals - &broadcast(reshape(&m, [length, 1]), [length, taps_used]))
+                            / &broadcast(reshape(&z, [length, 1]), [length, taps_used]);
                     ids_out.put(&tap_ids);
                     weights_out.put(&tap_weights);
                 }
@@ -480,7 +480,13 @@ impl Block<'_> {
         let mut mean = f32::NAN;
         let max_steps = input.max_steps;
         for remaining in (1..=max_steps).rev() {
-            let t = temperature(&input.schedule, remaining, max_steps, input.t_max, input.t_min);
+            let t = temperature(
+                &input.schedule,
+                remaining,
+                max_steps,
+                input.t_max,
+                input.t_min,
+            );
             // Rows to accept this step under `remask`: a linear count schedule
             // reaching the whole canvas on the last step.
             let step_index = max_steps - remaining; // 0-based
@@ -493,16 +499,26 @@ impl Block<'_> {
                     count.set([k_t]).context("set count")?;
                 }
             }
-            fwd.submit(pipe).with_context(|| format!("denoise submit @{base} step {steps}"))?;
+            fwd.submit(pipe)
+                .with_context(|| format!("denoise submit @{base} step {steps}"))?;
             steps += 1;
-            let mut next = canvas_out.take_host::<Vec<i32>>().await.context("canvas drain")?;
-            commit = commit_out.take_host::<Vec<i32>>().await.context("commit drain")?;
+            let mut next = canvas_out
+                .take_host::<Vec<i32>>()
+                .await
+                .context("canvas drain")?;
+            commit = commit_out
+                .take_host::<Vec<i32>>()
+                .await
+                .context("commit drain")?;
             let done = stop.take_host::<bool>().await.context("stop drain")?;
             mean = mean_out.take_host::<f32>().await.context("entropy drain")?;
             let taps_data = match (&tap_ids_out, &tap_weights_out) {
                 (Some(ids), Some(weights)) => Some((
                     ids.take_host::<Vec<u32>>().await.context("tap ids drain")?,
-                    weights.take_host::<Vec<f32>>().await.context("tap weights drain")?,
+                    weights
+                        .take_host::<Vec<f32>>()
+                        .await
+                        .context("tap weights drain")?,
                 )),
                 _ => None,
             };
@@ -518,14 +534,17 @@ impl Block<'_> {
                 // The host wants the model's full width per row; pad the
                 // narrower staging with zero-weight taps.
                 if taps_used == taps_width {
-                    fwd.self_conditioning(&ids, &weights).context("stage self-conditioning")?;
+                    fwd.self_conditioning(&ids, &weights)
+                        .context("stage self-conditioning")?;
                 } else {
                     let (w, u) = (taps_width as usize, taps_used as usize);
                     let mut full_ids = vec![0u32; n * w];
                     let mut full_weights = vec![0f32; n * w];
                     for row in 0..n {
-                        full_ids[row * w..row * w + u].copy_from_slice(&ids[row * u..(row + 1) * u]);
-                        full_weights[row * w..row * w + u].copy_from_slice(&weights[row * u..(row + 1) * u]);
+                        full_ids[row * w..row * w + u]
+                            .copy_from_slice(&ids[row * u..(row + 1) * u]);
+                        full_weights[row * w..row * w + u]
+                            .copy_from_slice(&weights[row * u..(row + 1) * u]);
                     }
                     fwd.self_conditioning(&full_ids, &full_weights)
                         .context("stage self-conditioning")?;
@@ -544,16 +563,19 @@ impl Block<'_> {
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     if model::pass_kind() != model::ForwardKind::Diffusion {
-        return Err("this program drives a block-diffusion model; the bound model is not one".into());
+        return Err(
+            "this program drives a block-diffusion model; the bound model is not one".into(),
+        );
     }
     let shape = model::canvas().ok_or("a diffusion model states its canvas")?;
     let length = shape.length;
     let taps_width = shape.self_cond_taps;
     let taps_used = input.taps.unwrap_or(taps_width).min(taps_width);
-    if max_embed_length() < length as usize {
+    // The canvas attends both ways, so the runtime cannot cut it: one fire reads every row.
+    let readable = max_readout_rows(model::ReadoutKind::Logits);
+    if readable < length as usize {
         return Err(format!(
-            "the engine embeds at most {} tokens a pass and a canvas is {length}",
-            max_embed_length()
+            "the engine reads out at most {readable} rows a fire and a canvas is {length}"
         ));
     }
     if !(input.t_min > 0.0 && input.t_max >= input.t_min) {
@@ -575,7 +597,8 @@ async fn main(input: Input) -> Result<Output> {
     };
     let clamps: Vec<(u32, i32)> = match &input.clamp {
         Some(text) => {
-            let pairs: Vec<(u32, i32)> = serde_json::from_str(text).map_err(|e| format!("clamp: {e}"))?;
+            let pairs: Vec<(u32, i32)> =
+                serde_json::from_str(text).map_err(|e| format!("clamp: {e}"))?;
             if pairs.iter().any(|&(p, _)| p >= length) {
                 return Err("clamp: a position is past the canvas".into());
             }
@@ -584,7 +607,6 @@ async fn main(input: Input) -> Result<Output> {
         None => Vec::new(),
     };
     let vocab = model::output_vocab_size();
-    let page_size = kv_page_size();
     let stop_tokens = inferlet::chat::stop_tokens();
     let max_tokens = input.max_tokens.unwrap_or(length as usize);
     let best_of = input.best_of.max(1);
@@ -596,22 +618,17 @@ async fn main(input: Input) -> Result<Output> {
         prompt.push(0);
     }
     let n = u32::try_from(prompt.len()).map_err(|_| "prompt is too long")?;
-    let max_pages = (n + canvases * length).div_ceil(page_size).max(1);
 
     let ws = WorkingSet::new();
-    ws.reserve(max_pages).context("reserve KV")?;
     let pipe = Pipeline::new();
     let mut encode_fires = 0u32;
     let mut denoise_fires = 0u32;
 
-    // ── 1. Prefill ────────────────────────────────────────────────────────
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    for &(base, end) in &prefill_chunks(n, None) {
-        encode(&ws, &pipe, &prompt_i32[base as usize..end as usize], base, max_pages, page_size, false)
-            .await
-            .with_context(|| format!("prefill @{base}"))?;
-        encode_fires += 1;
-    }
+    encode(&ws, &pipe, &prompt_i32, 0, false)
+        .await
+        .context("prefill")?;
+    encode_fires += 1;
 
     // ── 2. Blocks ─────────────────────────────────────────────────────────
     let mut generated: Vec<u32> = Vec::new();
@@ -632,13 +649,9 @@ async fn main(input: Input) -> Result<Output> {
             vocab,
             taps_width,
             taps_used,
-            page_size,
-            max_pages,
             clamps: block_clamps,
         };
-        // Best-of-K: K canvases on the same prefix (the denoise reading
-        // writes no KV, so they share the pages untouched), the lowest final
-        // entropy committed.
+        // Best-of-K on one prefix: a denoise writes only the canvas slots.
         let mut best: Option<Denoised> = None;
         let mut entropies = Vec::new();
         for k in 0..best_of {
@@ -672,7 +685,7 @@ async fn main(input: Input) -> Result<Output> {
         }
         let done = finished || generated.len() >= max_tokens;
         if input.quality || !(input.elide_commit && (last_block || done)) {
-            let q = encode(&ws, &pipe, &chosen.commit, base, max_pages, page_size, input.quality)
+            let q = encode(&ws, &pipe, &chosen.commit, base, input.quality)
                 .await
                 .with_context(|| format!("commit @{base}"))?;
             encode_fires += 1;
@@ -699,8 +712,8 @@ async fn main(input: Input) -> Result<Output> {
     })
 }
 
-/// One `encode` pass over `tokens` at positions `base..`: the causal
-/// reading, whose K/V become the sequence. With `quality`, every row is read
+/// One `encode` pass over `tokens` at slots `base..`: the causal reading,
+/// whose K/V become the sequence and freeze. With `quality`, every row is read
 /// out and the mean log-probability of `tokens[1..]` under the rows that
 /// predict them comes back; otherwise only the last row is read (a pass
 /// with nothing to say still says one word, so the fire has a drained
@@ -710,36 +723,22 @@ async fn encode(
     pipe: &Pipeline,
     tokens: &[i32],
     base: u32,
-    max_pages: u32,
-    page_size: u32,
     quality: bool,
 ) -> Result<Option<f32>> {
     let len = u32::try_from(tokens.len()).map_err(|_| "an encode span is too long")?;
-    let end = base + len;
     let toks = Channel::from(tokens).named("toks_e");
     let embed_indptr = Channel::from([0u32, len]).named("embed_indptr_e");
-    let positions = Channel::from_iter(base..end).named("positions_e");
-    let pages = Channel::from_iter(0..max_pages).named("pages_e");
-    let page_indptr = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr_e");
-    let w_slot = Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot_e");
-    let w_off = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_e");
-    let kv_len = Channel::from([end]).named("kv_len_e");
+    // Stated, not appended: a commit replaces the canvas scratch at `base..`.
+    let slots = Channel::from_iter(base..base + len).named("slots_e");
 
     let fwd = ForwardPass::new();
     fwd.canvas(Mode::Encode)?;
     fwd.embed(&toks, &embed_indptr)?;
-    fwd.attention(
-        ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &kv_len,
-            pages: &pages,
-            page_indptr: &page_indptr,
-            w_slot: &w_slot,
-            w_off: &w_off,
-            positions: &positions,
-            mask: None,
+    fwd.state(
+        &[ws],
+        StateGeometry {
+            slots: Some(&slots),
+            ..StateGeometry::folding()
         },
     )?;
     if quality && len > 1 {
@@ -767,7 +766,10 @@ async fn encode(
     } else {
         let last = Channel::new([1], dtype::i32).named("last_e");
         fwd.epilogue(move || {
-            last.put(reshape(cast(reduce_argmax(intrinsics::logits()), dtype::i32), [1]));
+            last.put(reshape(
+                cast(reduce_argmax(intrinsics::logits()), dtype::i32),
+                [1],
+            ));
         });
         fwd.submit(pipe)?;
         last.take_host::<i32>().await?;

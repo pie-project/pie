@@ -81,50 +81,6 @@ struct Output {
     encode_canvas: Rows,
 }
 
-/// The geometry of one span of `len` rows at `base`, over a working set of
-/// `max_pages` pages; every channel seeded, nothing device-advanced.
-struct Span {
-    embed_indptr: Channel,
-    positions: Channel,
-    pages: Channel,
-    page_indptr: Channel,
-    w_slot: Channel,
-    w_off: Channel,
-    kv_len: Channel,
-}
-
-impl Span {
-    fn new(base: u32, len: u32, max_pages: u32, page_size: u32, tag: &str) -> Span {
-        let end = base + len;
-        Span {
-            embed_indptr: Channel::from([0u32, len]).named(&format!("embed_indptr_{tag}")),
-            positions: Channel::from_iter(base..end).named(&format!("positions_{tag}")),
-            pages: Channel::from_iter(0..max_pages).named(&format!("pages_{tag}")),
-            page_indptr: Channel::from([0u32, end.div_ceil(page_size)])
-                .named(&format!("page_indptr_{tag}")),
-            w_slot: Channel::from_iter((base..end).map(|p| p / page_size))
-                .named(&format!("w_slot_{tag}")),
-            w_off: Channel::from_iter((base..end).map(|p| p % page_size))
-                .named(&format!("w_off_{tag}")),
-            kv_len: Channel::from([end]).named(&format!("kv_len_{tag}")),
-        }
-    }
-
-    fn geometry(&self) -> KvGeometry<'_, std::ops::RangeFull, std::ops::RangeFull> {
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &self.kv_len,
-            pages: &self.pages,
-            page_indptr: &self.page_indptr,
-            w_slot: &self.w_slot,
-            w_off: &self.w_off,
-            positions: &self.positions,
-            mask: None,
-        }
-    }
-}
-
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     if model::pass_kind() != model::ForwardKind::Diffusion {
@@ -143,7 +99,9 @@ async fn main(input: Input) -> Result<Output> {
         (None, Some(name)) => std::fs::read_to_string(format!("/scratch/{name}"))
             .map_err(|why| format!("reading /scratch/{name}: {why}"))?,
         (None, None) if !pieces.is_empty() => pieces,
-        (None, None) => return Err("pass `case` (json), `case_0..7` (its pieces) or `case_file`".into()),
+        (None, None) => {
+            return Err("pass `case` (json), `case_0..7` (its pieces) or `case_file`".into());
+        }
     };
     let case: Case = inferlet::serde_json::from_str(&text)
         .map_err(|why| format!("case json: {why}"))?;
@@ -159,24 +117,22 @@ async fn main(input: Input) -> Result<Output> {
         )
         .into());
     }
-    let page_size = kv_page_size();
     let n = u32::try_from(case.prompt_ids.len()).map_err(|_| "prompt is too long")?;
-    let max_pages = (n + length).div_ceil(page_size).max(1);
     let temperature = case.temperature;
 
     let ws = WorkingSet::new();
-    ws.reserve(max_pages).context("reserve KV")?;
     let pipe = Pipeline::new();
 
-    // ── prefill: encode passes, the last one read out ─────────────────────
     let prompt_i32: Vec<i32> = case.prompt_ids.iter().map(|&t| t as i32).collect();
-    let chunks = prefill_chunks(n, None);
+    let spans = readout_spans(n, model::ReadoutKind::Logits);
     let mut prefill_rows = Rows::default();
-    for (at, &(base, end)) in chunks.iter().enumerate() {
+    for (at, &(base, end)) in spans.iter().enumerate() {
         let len = end - base;
         let tag = format!("p{at}");
-        let toks = Channel::from(&prompt_i32[base as usize..end as usize]).named(&format!("toks_{tag}"));
-        let span = Span::new(base, len, max_pages, page_size, &tag);
+        let toks =
+            Channel::from(&prompt_i32[base as usize..end as usize]).named(&format!("toks_{tag}"));
+        let embed_indptr = Channel::from([0u32, len]).named(&format!("embed_indptr_{tag}"));
+        let slots = Channel::from_iter(base..end).named(&format!("slots_{tag}"));
         let readout = Channel::from_iter(0..len).named(&format!("readout_{tag}"));
         let arg_out = Channel::new([len], dtype::i32).named(&format!("arg_{tag}"));
         let ent_out = Channel::new([len], dtype::f32).named(&format!("ent_{tag}"));
@@ -188,8 +144,15 @@ async fn main(input: Input) -> Result<Output> {
         if let Some(k) = input.max_layers {
             fwd.set_max_layers(k)?;
         }
-        fwd.embed(&toks, &span.embed_indptr)?;
-        fwd.attention(&ws, span.geometry())?;
+        fwd.embed(&toks, &embed_indptr)?;
+        fwd.state(
+            &[&ws],
+            StateGeometry {
+                slots: Some(&slots),
+                fold: Fold::All,
+                ..StateGeometry::default()
+            },
+        )?;
         fwd.readout(&readout)?;
         fwd.epilogue(move || {
             let logits = intrinsics::logits(); // [len, vocab]
@@ -221,7 +184,8 @@ async fn main(input: Input) -> Result<Output> {
     for (at, canvas) in canvases.into_iter().enumerate() {
         let tag = format!("d{at}");
         let toks = Channel::from(canvas.as_slice()).named(&format!("canvas_{tag}"));
-        let span = Span::new(n, length, max_pages, page_size, &tag);
+        let embed_indptr = Channel::from([0u32, length]).named(&format!("embed_indptr_{tag}"));
+        let slots = Channel::from_iter(n..n + length).named(&format!("slots_{tag}"));
         let readout = Channel::from_iter(0..length).named(&format!("readout_{tag}"));
         let arg_out = Channel::new([length], dtype::i32).named(&format!("arg_{tag}"));
         let ent_out = Channel::new([length], dtype::f32).named(&format!("ent_{tag}"));
@@ -229,9 +193,18 @@ async fn main(input: Input) -> Result<Output> {
         let probs_out = Channel::new([length, 8], dtype::f32).named(&format!("probs_{tag}"));
 
         let fwd = ForwardPass::new();
-        fwd.canvas(if at == 2 { Mode::Encode } else { Mode::Denoise })?;
-        fwd.embed(&toks, &span.embed_indptr)?;
-        fwd.attention(&ws, span.geometry())?;
+        let commit = at == 2;
+        fwd.canvas(if commit { Mode::Encode } else { Mode::Denoise })?;
+        fwd.embed(&toks, &embed_indptr)?;
+        // A committed canvas folds; one the next step rewrites does not.
+        fwd.state(
+            &[&ws],
+            StateGeometry {
+                slots: Some(&slots),
+                fold: if commit { Fold::All } else { Fold::None },
+                ..StateGeometry::default()
+            },
+        )?;
         fwd.readout(&readout)?;
         fwd.epilogue(move || {
             let logits = intrinsics::logits(); // [length, vocab]

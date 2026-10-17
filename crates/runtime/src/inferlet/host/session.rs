@@ -59,6 +59,37 @@ async fn stream_out(ctx: &mut ProcessCtx, bytes: Vec<u8>, name: String) -> Resul
 }
 
 impl pie::inferlet::session::Host for ProcessCtx {
+    async fn set_props(&mut self, props: String) -> Result<Result<(), String>> {
+        let changes: client_api::Props = match serde_json::from_str(&props) {
+            Ok(changes) => changes,
+            Err(e) => return Ok(Err(format!("set-props: not a JSON object: {e}"))),
+        };
+        let (merged, changed) = match client_api::props::merge(self.props(), changes) {
+            Ok(merged) => merged,
+            Err(why) => return Ok(Err(format!("set-props: {why}"))),
+        };
+        if !changed.is_empty() {
+            self.set_props(merged.clone());
+            crate::policy::report(crate::policy::Event::PropsChanged(
+                self.id(),
+                merged,
+                changed,
+            ));
+        }
+        Ok(Ok(()))
+    }
+
+    async fn set_tokens(&mut self, prompt: u32, generated: u32) -> Result<()> {
+        crate::policy::tokens::set(
+            crate::policy::schedule::plex_id(self.id()),
+            crate::policy::tokens::Counts {
+                prompt: prompt.into(),
+                generated: generated.into(),
+            },
+        );
+        Ok(())
+    }
+
     async fn send_to(&mut self, process: String, message: String) -> Result<Result<(), String>> {
         let Ok(target) = process.parse::<crate::inferlet::ProcessId>() else {
             return Ok(Err(format!("send-to: {process} is not a process id")));

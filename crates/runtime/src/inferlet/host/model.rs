@@ -115,9 +115,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
         use crate::pipeline::instance::PassKind;
         use pie::inferlet::model::ForwardKind;
         Ok(match model::model().pass_kind() {
-            PassKind::Attention => ForwardKind::Attention,
-            PassKind::Hybrid => ForwardKind::Hybrid,
-            PassKind::Recurrent => ForwardKind::Recurrent,
+            PassKind::Text => ForwardKind::Text,
             PassKind::Diffusion => ForwardKind::Diffusion,
         })
     }
@@ -203,48 +201,41 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(crate::scheduler::run_ahead_window() as u32)
     }
 
-    async fn max_embed_length(&mut self) -> Result<u32> {
-        Ok(crate::engine::get_spec(0)?.limits.max_forward_tokens as u32)
-    }
-
-    async fn prefill_chunk_hint(&mut self) -> Result<u32> {
-        let budget = prefill_budget(crate::engine::get_spec(0)?.limits);
-        let live = crate::inferlet::process::live_count();
-        let page = model::model().kv_page_size() as usize;
-        Ok(prefill_share(budget, live, page))
+    async fn max_readout_rows(&mut self, kind: pie::inferlet::model::ReadoutKind) -> Result<u32> {
+        let limits = crate::engine::get_spec(0)?.limits;
+        Ok(u32::try_from(readout_rows(limits, kind)).unwrap_or(u32::MAX))
     }
 
     async fn rs_state_size(&mut self) -> Result<u64> {
         Ok(model::model().rs_caps().state_size)
     }
+}
 
-    async fn rs_buffer_page_size(&mut self) -> Result<u32> {
-        Ok(model::model().rs_caps().buffer_page_size)
-    }
-
-    async fn rs_fold_granularity(&mut self) -> Result<u32> {
-        Ok(model::model().rs_caps().fold_granularity)
-    }
-
-    async fn arena_block_size(&mut self) -> Result<u64> {
-        Ok(crate::store::registry::get(0, 0).kv_page_size as u64)
+fn readout_rows(
+    limits: crate::engine::SchedulerLimits,
+    kind: pie::inferlet::model::ReadoutKind,
+) -> usize {
+    match kind {
+        pie::inferlet::model::ReadoutKind::Logits if limits.max_readouts > 0 => {
+            limits.max_readouts.min(limits.max_forward_tokens)
+        }
+        _ => limits.max_forward_tokens,
     }
 }
 
-// A step spends one row on each other live lane's decode, so a prefill chunk
-// gets the rest of the forward budget; chunks that overflow a wave are
-// deferred by the frame seal, not split into more passes.
 /// The rows a prefill chunk may take: the fire's token budget, or fewer when
 /// the engine prefers it (Metal, while the Neural Engine shares a fire only
 /// up to its rows).
-fn prefill_budget(limits: crate::engine::SchedulerLimits) -> usize {
+pub(crate) fn prefill_budget(limits: crate::engine::SchedulerLimits) -> usize {
     match limits.prefill_rows {
         0 => limits.max_forward_tokens,
         rows => rows.min(limits.max_forward_tokens),
     }
 }
 
-fn prefill_share(budget: usize, live: usize, page: usize) -> u32 {
+/// A step spends one row on each other live lane's decode, so the fires a
+/// prefill is cut into get the rest of the forward budget.
+pub(crate) fn prefill_share(budget: usize, live: usize, page: usize) -> u32 {
     let page = page.max(1);
     let share = budget.saturating_sub(live.saturating_sub(1)) / page * page;
     share.clamp(page.min(budget.max(1)), budget.max(1)) as u32
@@ -255,6 +246,7 @@ mod tests {
     #[test]
     fn a_prefill_chunk_stops_at_the_rows_the_engine_prefers() {
         let limits = |max_forward_tokens, prefill_rows| crate::engine::SchedulerLimits {
+            max_readouts: 0,
             max_forward_requests: 8,
             max_forward_tokens,
             max_page_refs: 64,

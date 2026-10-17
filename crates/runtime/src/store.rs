@@ -65,12 +65,52 @@ impl PipelineScope {
     fn is_releasable(&self) -> bool {
         self.is_closed() && (self.state.drained)()
     }
+
+    pub(crate) fn claim(
+        &self,
+        owner: &std::sync::Mutex<Option<PipelineScope>>,
+    ) -> Result<(), PipelineScopeId> {
+        let mut owner = owner.lock().unwrap();
+        match owner.as_ref() {
+            Some(existing) if existing.id() == self.id() => Ok(()),
+            Some(existing) if !self.is_closed() && existing.is_releasable() => {
+                *owner = Some(self.clone());
+                Ok(())
+            }
+            Some(existing) => Err(existing.id()),
+            None if self.is_closed() => Err(self.id()),
+            None => {
+                *owner = Some(self.clone());
+                Ok(())
+            }
+        }
+    }
 }
 
 impl std::fmt::LowerHex for PipelineScopeId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::LowerHex::fmt(&self.0, formatter)
     }
+}
+
+/// Cached pages are reclaimable, so they count as free.
+pub fn kv_tokens() -> (u64, u64) {
+    let mut capacity = 0u64;
+    let mut used = 0u64;
+    for stores in registry::all_for_model(0) {
+        let page = u64::from(stores.kv_page_size);
+        let (total, available, cached) = registry::with_kv_lock(&stores.kv, "other", |kv| {
+            let cached: u64 = kv.cached_working_sets().iter().map(|set| set.pages).sum();
+            (
+                u64::from(kv.capacity_pages()),
+                kv.available_pages() as u64,
+                cached,
+            )
+        });
+        capacity += total * page;
+        used += total.saturating_sub(available).saturating_sub(cached) * page;
+    }
+    (capacity, used)
 }
 
 pub fn kv_pressure_bucket() -> u8 {

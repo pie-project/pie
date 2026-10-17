@@ -2,7 +2,10 @@ use core::ops::Range;
 
 use crate::error::KernelError;
 use poem_compiler::{CompiledModel, Fallback, Phase, PqTree, Region};
-use poem_ir::{ClassSet, RowAxis};
+use poem_ir::{
+    CacheRow, ClassSet, Def, Dim, Dtype, GeomKind, Node, Operands, Operation, RowAxis,
+    RuntimeInput, Trace, Ty, ValueId,
+};
 
 #[must_use]
 pub fn answers(compiled: &CompiledModel, axis: RowAxis, nodes: Range<u32>) -> Vec<Fallback> {
@@ -115,6 +118,92 @@ pub fn max_runs(compiled: &CompiledModel) -> u32 {
         .max()
         .unwrap_or(1)
         .max(1)
+}
+
+#[must_use]
+pub fn operands(nodes: &[Node], region: &Region) -> Option<(Vec<ValueId>, Vec<ValueId>)> {
+    let mut ins: Vec<ValueId> = Vec::new();
+    let mut outs: Vec<ValueId> = Vec::new();
+    for node in region.nodes.clone() {
+        let node = nodes.get(node as usize)?;
+        macro_rules! collect {
+            ($op:expr) => {{
+                $op.inputs(&mut ins);
+                $op.outputs(&mut outs);
+            }};
+        }
+        match &node.op {
+            Operation::Attention(op) => collect!(op),
+            Operation::Linear(op) => collect!(op),
+            Operation::Elementwise(op) => collect!(op),
+            Operation::Layout(op) => collect!(op),
+            Operation::Collective(op) => collect!(op),
+            Operation::Fused(op) => collect!(op),
+            Operation::Spatial(op) => collect!(op),
+        }
+    }
+    Some((ins, outs))
+}
+
+fn copyable(trace: &Trace, region: &Region) -> bool {
+    let Some((ins, outs)) = operands(&trace.nodes, region) else {
+        return false;
+    };
+    ins.iter().chain(outs.iter()).all(|id| {
+        let Some(decl) = trace.values.get(id.0 as usize) else {
+            return false;
+        };
+        match &decl.def {
+            Def::Cache(c) => matches!(trace.caches.get(*c as usize), Some(CacheRow::Kv { .. })),
+            Def::Input(RuntimeInput::Geometry { kind, .. }) => matches!(
+                kind,
+                GeomKind::Indptr | GeomKind::Indices | GeomKind::LastPageLen | GeomKind::KvLen
+            ),
+            Def::Input(RuntimeInput::Mask { .. }) => false,
+            _ => match &decl.ty {
+                Ty::Struct(_) => true,
+                Ty::Tensor { shape, dtype } => match shape.first() {
+                    Some(Dim::Tokens) => matches!(dtype, Dtype::Bf16 | Dtype::F32),
+                    Some(Dim::TokensTimes(_)) => false,
+                    Some(Dim::Const(_)) | None => true,
+                    Some(Dim::Lanes | Dim::LanesPlus(_)) => false,
+                    Some(Dim::Readouts) => false,
+                    Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
+                    Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => {
+                        false
+                    }
+                },
+            },
+        }
+    })
+}
+
+#[must_use]
+pub fn copyable_mask(trace: &Trace, compiled: &CompiledModel, mask: &ClassSet) -> bool {
+    compiled
+        .template()
+        .iter()
+        .filter(|region| &region.mask == mask)
+        .all(|region| copyable(trace, region))
+}
+
+#[must_use]
+pub fn gathers(trace: &Trace, compiled: &CompiledModel) -> usize {
+    let mut masks: Vec<&ClassSet> = Vec::new();
+    for region in compiled.template() {
+        let owed = compiled
+            .fallback
+            .rows
+            .iter()
+            .any(|row| region.nodes.contains(&row.node) && row.fallback == Fallback::Copy);
+        if !owed || masks.contains(&&region.mask) {
+            continue;
+        }
+        if copyable_mask(trace, compiled, &region.mask) {
+            masks.push(&region.mask);
+        }
+    }
+    masks.len()
 }
 
 #[cfg(test)]

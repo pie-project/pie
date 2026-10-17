@@ -1,0 +1,97 @@
+package plex:policy@1.0.0;
+
+/// The vocabulary both planes share. `docs/plex-1.0.md` in the plex
+/// repository is the prose contract; this is its letter.
+interface types {
+    /// Host-issued, opaque, compared byte-for-byte.
+    type id = string;
+
+    /// Larger runs earlier and is kept longer. Anything unnamed is 0.
+    type key = s64;
+
+    enum subject-kind { session, process, working-set, worker }
+
+    variant subject {
+        session(id),
+        process(id),
+        working-set(id),
+        worker(id),
+    }
+
+    /// WIT has no recursive types: a prop that is a JSON array or object
+    /// arrives as `json` text, for the policy to parse if it cares.
+    variant value {
+        boolean(bool),
+        int(s64),
+        float(f64),
+        text(string),
+        json(string),
+    }
+
+    enum outcome { completed, failed, cancelled }
+
+    /// Who caused a transition.
+    enum by { policy, host, client }
+
+    record exit {
+        process: id,
+        outcome: outcome,
+    }
+
+    /// `subject`'s props named in `names` changed.
+    record change {
+        subject: subject,
+        names: list<string>,
+    }
+
+    record dispatch {
+        process: id,
+        worker: id,
+    }
+
+    /// A discarded working-set, and who discarded it.
+    record transition {
+        subject: id,
+        by: by,
+    }
+
+    variant edge {
+        // Both planes.
+        arrived(id),
+        exited(exit),
+        prop-changed(change),
+        /// A session, closed by the client.
+        closed(id),
+        /// The alarm set by `set-alarm` is due.
+        timer,
+
+        // Router plane.
+        dispatched(dispatch),
+        worker-removed(id),
+        worker-draining(id),
+
+        // Engine plane.
+        started(id),
+        paused(id),
+        /// A working-set whose owner exited while its KV stays cached.
+        retained(id),
+        discarded(transition),
+    }
+
+    /// A key on a working-set's first `upto` tokens, or on all of it. A block
+    /// takes the highest key among the entries that cover it.
+    record retain {
+        working-set: id,
+        key: key,
+        upto: option<u32>,
+    }
+
+    record placement {
+        process: id,
+        /// None leaves the worker to the router's default choice.
+        worker: option<id>,
+        /// Passed on with the process; the engine sees each as prop
+        /// `router/<name>`.
+        props: list<tuple<string, value>>,
+    }
+}
