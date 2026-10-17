@@ -28,7 +28,6 @@ const QWEN_VOCAB: u32 = 151_936;
 enum Cut {
     Mass,
     Rank,
-    Floor,
 }
 
 fn program(rows: u32, len: u32, cut: Cut) -> TraceContainer {
@@ -36,7 +35,6 @@ fn program(rows: u32, len: u32, cut: Cut) -> TraceContainer {
     let predicate = match cut {
         Cut::Mass => Predicate::CummassLe(1),
         Cut::Rank => Predicate::RankLe(1),
-        Cut::Floor => Predicate::ProbGe(1),
     };
     let threshold_dtype = match cut {
         Cut::Rank => Dtype::I32,
@@ -101,12 +99,6 @@ impl Rig {
         let launch = eta_compiler::codegen::launch::build(bound, &stages);
         let backend =
             Backend::parse(engine_cuda::api::CODEGEN).expect("the engine's codegen backend");
-        if let Ok(dir) = std::env::var("CUT_DUMP") {
-            for kernel in emit_program(backend, &stages, bound) {
-                let path = format!("{dir}/{}.{}", kernel.entry_name, engine_cuda::api::CODEGEN);
-                std::fs::write(&path, &kernel.source).expect("the dump writes");
-            }
-        }
         let registration = ProgramRegistration {
             program_hash: 0x70_9c07 ^ u64::from(rows),
             emitted_kernels: emit_program(backend, &stages, bound),
@@ -514,61 +506,4 @@ fn a_row_outside_the_mass_contract_still_matches() {
     let thresholds: Vec<f32> = rows.iter().map(|r| r.2).collect();
     let data: Vec<f32> = rows.into_iter().flat_map(|r| r.1).collect();
     compare(count, len, data, thresholds, &what);
-}
-
-fn time_cut(name: &str, cut: Cut, row: &[f32], threshold: f32, fires: u32) {
-    let len = row.len() as u32;
-    let profile = ModelProfile {
-        vocab: len,
-        ..ModelProfile::dummy()
-    };
-    let bound = bind(program(1, len, cut), profile).expect("the cut binds");
-    let threshold = match cut {
-        Cut::Rank => Value::I32(vec![threshold as i32]),
-        _ => Value::F32(vec![threshold]),
-    };
-    let seeds = vec![(INPUT, Value::F32(row.to_vec())), (THRESHOLD, threshold)];
-    let mut rig = Rig::new(&bound, &seeds, 1);
-    rig.fire();
-    let start = std::time::Instant::now();
-    for _ in 0..fires {
-        rig.fire();
-    }
-    let each = start.elapsed().as_secs_f64() * 1e6 / f64::from(fires);
-    eprintln!("{name}: {each:.1} us a fire");
-}
-
-/// `cargo test ... a_nucleus_cut_times -- --ignored --nocapture`: one row of
-/// Qwen's vocabulary through the cut, a fire's wall time with the ProbGe
-/// floor (one elementwise pass) as the fire's own overhead.
-#[test]
-#[ignore = "a timing, not a check"]
-fn a_nucleus_cut_times() {
-    if !engine_cuda::device::present() {
-        return;
-    }
-    let len = QWEN_VOCAB;
-    let fires: u32 = std::env::var("CUT_FIRES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
-    // CUT_CASE picks one case (so a kernel trace holds one program's
-    // kernel): `floor`, or `{p|k}-{peaked|broad|flat}`.
-    let only = std::env::var("CUT_CASE").ok();
-    let mut noise = Noise(0x1357_9bdf_2468_ace0);
-    let flat = softmax(&mut noise, len, 2.0);
-    let peak = peaked(&mut noise, len);
-    let broad = gaussian(&mut noise, len, 3.0);
-    let wanted = |case: &str| only.as_deref().is_none_or(|o| o == case);
-    if wanted("floor") {
-        time_cut("floor (overhead)", Cut::Floor, &flat, 1e-6, fires);
-    }
-    for (name, row) in [("peaked", &peak), ("broad", &broad), ("flat", &flat)] {
-        if wanted(&format!("p-{name}")) {
-            time_cut(&format!("top-p 0.9 {name}"), Cut::Mass, row, 0.9, fires);
-        }
-        if wanted(&format!("k-{name}")) {
-            time_cut(&format!("top-k 50 {name}"), Cut::Rank, row, 50.0, fires);
-        }
-    }
 }

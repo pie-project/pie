@@ -896,7 +896,6 @@ fn moe_matmul_mxfp4_lanes() {
 }
 
 #[test]
-#[ignore = "guard: cargo test --release --features rocm --test linear_moe -- --ignored mxfp4_lanes_guard"]
 fn mxfp4_lanes_guard() {
     // The lane-order tiles at a prefill's batches write no row past y's.
     let Some(gpu) = Gpu::open() else { return };

@@ -239,7 +239,12 @@ fn the_sorted_routed_mlp_answers_the_steps() {
     let mut have = planes.up(&vec![0; tokens * hidden], tokens as u32, hidden as u32, dt);
     let steps = gpu.ctx().with_tuning(tuning(0, 0, None));
     moe::mlp_swiglu(&steps, &m.p, &mut want).unwrap();
-    let sorted = gpu.ctx().with_tuning(tuning(1, 0, None));
+    // The leg takes contractions from `lt_deep_k`; these are short of the
+    // profile's.
+    let sorted = gpu.ctx().with_tuning(Tuning {
+        moe_lt_deep_k: 64,
+        ..tuning(1, 0, None)
+    });
     let fired = moe::lt_grouped_fires();
     moe::mlp_swiglu(&sorted, &m.p, &mut have).unwrap();
     assert_eq!(
