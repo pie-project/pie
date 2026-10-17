@@ -114,7 +114,11 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
         return;
     }
     let mut gpu = Gpu::open();
-    let ctx = gpu.ctx();
+    // `PIE_TC5_K128=1`: NVFP4 at 128 K a stage, as B200's profile runs it.
+    let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+        gemm_nvfp4_k128: std::env::var("PIE_TC5_K128").is_ok_and(|v| v == "1"),
+        ..kernels_cuda::tuning::Tuning::DEFAULT
+    });
     let stream: rt::cudaStream_t = ctx.stream().cast();
     let timer = Timer {
         flush: gpu.zeros(FLUSH),

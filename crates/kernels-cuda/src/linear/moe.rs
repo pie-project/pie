@@ -928,9 +928,13 @@ pub fn experts(
 /// where it lies. A fire under `kernel.moe.w4a4_fused_from` tokens runs the
 /// four apart, as does one narrow enough to lay its routes out masked; a
 /// decode's few rows an expert run the gate-up swapped.
-/// The most routes an expert on average whose W4A4 gate-up runs swapped.
+/// The most routes an expert on average whose W4A4 gate-up and down run
+/// swapped. Paced at GLM-5.3's eight-expert miniature (4096 x 6144 and
+/// 6144 x 2048, weights read cold, NVFP4 at 128 K a stage): at 64 routes an
+/// expert swapped 41.4 + 21.6 us against 56.4 + 24.5, at 128 unswapped
+/// 36.9 + 25.8 against 55.1 + 33.1.
 #[cfg(feature = "cuda")]
-const SWAPPED_UP_ROUTES: u32 = 16;
+const SWAPPED_UP_ROUTES: u32 = 64;
 
 /// A W4A8 routed MLP of this many routes an expert or fewer runs its
 /// gate-up swapped, in 64-row Q tiles. Measured at DeepSeek-V4-Flash's
@@ -1061,14 +1065,15 @@ fn experts_w4a4(
         // a weight row, its epilogue over the expert's rows alone (unswapped,
         // a thread a row, the whole 128-row block's).
         let sms = ctx.multiprocessors().unwrap_or(148);
+        let swapped = tc5::Plan {
+            swap: true,
+            pair: false,
+            bn: 64,
+            stages: 0,
+            splits: 1,
+        };
         let plan = if count <= SWAPPED_UP_ROUTES * experts {
-            tc5::Plan {
-                swap: true,
-                pair: false,
-                bn: 64,
-                stages: 0,
-                splits: 1,
-            }
+            swapped
         } else {
             tc5::Plan::grouped(&grouped_up, inter, k, count, sms)
         };
@@ -1094,23 +1099,29 @@ fn experts_w4a4(
             plan,
         )?;
         let ys = ctx.scratch_stream(OP, W4A4_Y, rows * n as usize * 2)? as u64;
-        tc5::grouped_gemm_epi(
+        let grouped_down = tc5::Grouped {
+            experts,
+            groups: layout.groups,
+            alpha_e: down_alpha,
+        };
+        let down_plan = if count <= SWAPPED_UP_ROUTES * experts {
+            swapped
+        } else {
+            tc5::Plan::grouped(&grouped_down, n, inter, count, sms)
+        };
+        tc5::grouped_gemm_epi_with(
             ctx,
             tc5::Operand::scaled(hq, tc5::Elem::E2m1, hs, 16),
             tc5::Operand::scaled(down_codes.ptr, tc5::Elem::E2m1, down_atoms.ptr, 16),
             ys,
-            tc5::Grouped {
-                experts,
-                groups: layout.groups,
-                alpha_e: down_alpha,
-            },
+            grouped_down,
             [n, inter],
             1.0,
             tc5::Epilogue {
                 live_rows: layout.live_rows(),
                 ..tc5::Epilogue::STORE
             },
-            count,
+            down_plan,
         )?;
         act_quant::weighted_gather(ctx, OP, ys, layout.pos, weights, gate, y)
     };
