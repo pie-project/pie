@@ -3,7 +3,8 @@
 //!
 //! Supported: `prompt` (one string, or a one-element array), `max_tokens`
 //! (default 16), `temperature`, `top_p`, `top_k`, `stop`, `seed`, `echo`,
-//! the penalties, `stream` and `stream_options.include_usage`.
+//! the penalties, `stream`, `stream_options.include_usage` and `ignore_eos`
+//! (vLLM's and SGLang's extension).
 //!
 //! Refused with 400: more than one prompt, token-array prompts, `suffix`,
 //! `logprobs`, and `n > 1`. Anything a thinking model emits as a thinking
@@ -20,6 +21,7 @@ use crate::{invalid, stop_sequences, usage};
 struct Body {
     prompt: Option<Value>,
     max_tokens: Option<usize>,
+    ignore_eos: bool,
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<u32>,
@@ -86,6 +88,7 @@ fn parse(body: Value) -> Result<Parsed, ApiError> {
     req.raw_prompt = Some(prompt.clone());
     req.stream = body.stream;
     req.max_tokens = body.max_tokens.unwrap_or(16);
+    req.ignore_eos = body.ignore_eos;
     if req.max_tokens == 0 {
         return Err(invalid("max_tokens must be at least 1", Some("max_tokens")));
     }
@@ -176,7 +179,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         if parsed.include_usage {
             emit::send(&json!({
                 "id": ids.id, "object": "text_completion", "created": ids.created, "model": ids.model,
-                "choices": [], "usage": usage(outcome.prompt_tokens, outcome.completion_tokens),
+                "choices": [], "usage": usage(&outcome),
             }));
         }
         emit::send_raw("[DONE]");
@@ -193,7 +196,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         "created": ids.created,
         "model": ids.model,
         "choices": [{"index": 0, "text": text, "logprobs": null, "finish_reason": finish_reason(outcome.finish)}],
-        "usage": usage(outcome.prompt_tokens, outcome.completion_tokens),
+        "usage": usage(&outcome),
     })
     .to_string())
 }

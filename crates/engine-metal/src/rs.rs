@@ -2,11 +2,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use engine::fire::{FoldLen, RsVerb};
+use engine::rs::{LanePlan, Run};
 use kernels_metal::Tensor;
 use poem_ir::{Attention, Def, Dim, Dtype, Operation, Trace, Ty, ValueId};
 
-use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
 use crate::store::kv::Paging;
@@ -311,169 +310,22 @@ impl Buffers {
         self.page_tokens
     }
 
-    /// Copies each `(src, dst)` slot's buffered page: a recurrent slot is
-    /// its state and its buffer page, and a copy of one that left the rows
-    /// behind would hand the fold whatever the destination last held.
-    pub fn copy_pages(&self, frame: &mut Frame, moves: &[(u32, u32)]) -> Result<()> {
-        for &(src, dst) in moves {
-            if src == dst {
-                continue;
-            }
-            let need = src.max(dst) + 1;
-            if need > self.slots {
-                return Err(Fault::Ceiling {
-                    what: "recurrent buffer page slots",
-                    need: u64::from(need),
-                    have: u64::from(self.slots),
-                });
-            }
-            let (from, to) = (
-                u64::from(src) * self.page_bytes,
-                u64::from(dst) * self.page_bytes,
-            );
-            frame.copy_span(&self.slab, from, &self.slab, to, self.page_bytes)?;
-        }
-        Ok(())
+    pub fn pages(&mut self) -> (&mut Buffer, u64) {
+        (&mut self.slab, self.page_bytes)
+    }
+
+    #[must_use]
+    pub fn page_bytes(&self) -> u64 {
+        self.page_bytes
+    }
+
+    #[must_use]
+    pub fn page_count(&self) -> u32 {
+        self.slots
     }
 
     fn handle(&self, handles: &Handles) -> Result<u32> {
         handles.bind(&self.slab, 0, self.slab.bytes())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Run {
-    pub pages: Vec<u32>,
-    pub from: u32,
-    pub count: u32,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct LanePlan {
-    pub replay: u32,
-    pub commit: u32,
-    pub rows: u32,
-    pub gather: Option<Run>,
-    pub scatter: Option<Run>,
-    pub override_rows: bool,
-}
-
-impl LanePlan {
-    pub fn of(verb: &RsVerb, rows: u32, lane: u32, device_fold: Option<u32>) -> Result<LanePlan> {
-        let host = |len: FoldLen| -> Result<u32> {
-            match len {
-                FoldLen::Host(n) => Ok(n),
-                FoldLen::Device(port) => device_fold.ok_or_else(|| {
-                    Fault::program(
-                        "serve::rs",
-                        format!(
-                            "lane {lane} states a device-resident fold length on port {}, and the \
-                             program attached to it resolved no such port this fire",
-                            port.name()
-                        ),
-                    )
-                }),
-            }
-        };
-        Ok(match verb {
-            RsVerb::Fold => LanePlan {
-                replay: 0,
-                commit: rows,
-                rows,
-                ..LanePlan::default()
-            },
-            RsVerb::Buffer {
-                pages,
-                at,
-                fold,
-                replay,
-            } => {
-                let commit = host(*fold)?;
-                if commit > replay.saturating_add(rows) {
-                    return Err(Fault::program(
-                        "serve::rs",
-                        format!(
-                            "lane {lane} folds {commit} of the {rows} rows it carries plus the \
-                             {replay} it replays"
-                        ),
-                    ));
-                }
-                if *replay > *at {
-                    return Err(Fault::program(
-                        "serve::rs",
-                        format!(
-                            "lane {lane} replays {replay} buffered token(s) below buffer position \
-                             {at}, which has only {at}"
-                        ),
-                    ));
-                }
-                LanePlan {
-                    replay: *replay,
-                    commit,
-                    rows,
-                    gather: (*replay > 0).then(|| Run {
-                        pages: pages.clone(),
-                        from: at - replay,
-                        count: *replay,
-                    }),
-                    scatter: (rows > 0).then(|| Run {
-                        pages: pages.clone(),
-                        from: *at,
-                        count: rows,
-                    }),
-                    override_rows: false,
-                }
-            }
-            RsVerb::Window { read, write, fold } => {
-                let fold = host(*fold)?;
-                LanePlan {
-                    replay: fold,
-                    commit: fold,
-                    rows,
-                    gather: (fold > 0).then(|| Run {
-                        pages: read.clone(),
-                        from: 0,
-                        count: fold,
-                    }),
-                    scatter: (rows > 0).then(|| Run {
-                        pages: write.clone(),
-                        from: 0,
-                        count: rows,
-                    }),
-                    override_rows: false,
-                }
-            }
-            RsVerb::FoldBuffered {
-                pages,
-                at,
-                bound,
-                len,
-            } => {
-                if *bound != rows {
-                    return Err(Fault::program(
-                        "serve::rs",
-                        format!(
-                            "lane {lane} replays a buffer bounded at {bound} tokens in a fire that \
-                             gave it {rows} rows — the bound IS what sizes the launch, so the two \
-                             are one number"
-                        ),
-                    ));
-                }
-                let commit = host(*len)?.min(*bound);
-                LanePlan {
-                    replay: 0,
-                    commit,
-                    rows,
-                    gather: Some(Run {
-                        pages: pages.clone(),
-                        from: *at,
-                        count: *bound,
-                    }),
-                    scatter: None,
-                    override_rows: true,
-                }
-            }
-        })
     }
 }
 

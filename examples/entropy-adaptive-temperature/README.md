@@ -9,8 +9,7 @@ Zhang, Bao and Huang, ***EDT: Improving Large Language Models' Generation by
 Entropy-based Dynamic Temperature Sampling*** —
 <https://arxiv.org/abs/2403.14541>. Implements Eq. 7.
 
-**Faithfulness: Exact.** See
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+**Faithfulness: Exact.**
 
 ## What it does
 

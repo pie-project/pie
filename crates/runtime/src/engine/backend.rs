@@ -15,6 +15,8 @@ pub struct SchedulerLimits {
     pub max_context: usize,
     /// The rows one prefill fire takes best (0: up to `max_forward_tokens`).
     pub prefill_rows: usize,
+    /// 0: up to `max_forward_tokens`.
+    pub max_readouts: usize,
 }
 
 #[derive(Debug, Clone)]

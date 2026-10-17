@@ -303,12 +303,12 @@ fn parse(body: Value) -> Result<Request, ApiError> {
     Ok(req)
 }
 
-fn usage(input: usize, output: usize) -> Value {
+fn usage(outcome: &compat::Outcome) -> Value {
     json!({
-        "input_tokens": input,
-        "output_tokens": output,
-        "total_tokens": input + output,
-        "input_tokens_details": {"cached_tokens": 0},
+        "input_tokens": outcome.prompt_tokens,
+        "output_tokens": outcome.completion_tokens,
+        "total_tokens": outcome.prompt_tokens + outcome.completion_tokens,
+        "input_tokens_details": {"cached_tokens": outcome.cached_tokens},
         "output_tokens_details": {"reasoning_tokens": 0},
     })
 }
@@ -527,7 +527,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         }
         state.close();
         let output = std::mem::take(&mut state.output);
-        let usage = usage(outcome.prompt_tokens, outcome.completion_tokens);
+        let usage = usage(&outcome);
         let response = shell.response(status, output, Some(usage), Some(outcome.finish));
         let kind = if status == "completed" {
             "response.completed"
@@ -560,7 +560,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
             "completed",
         ));
     }
-    let usage = usage(outcome.prompt_tokens, outcome.completion_tokens);
+    let usage = usage(&outcome);
     Ok(shell
         .response(status, output, Some(usage), Some(outcome.finish))
         .to_string())

@@ -1,0 +1,74 @@
+package plex:policy@1.0.0;
+
+/// Reads. Every read within one `react` call sees one snapshot.
+interface reads {
+    use types.{id, subject, subject-kind, lookup, level, value};
+
+    /// Up to `n` ids of the subjects of `kind` the host knows, from
+    /// position `cursor`. Fewer than `n` means there are no more.
+    candidates: func(kind: subject-kind, cursor: u32, n: u32) -> list<id>;
+
+    /// A value the host measured or authenticated. Trusted.
+    attr: func(of: subject, name: string) -> lookup;
+
+    /// A value supplied from outside the host: by the client, or by the
+    /// router program under the reserved prefix `router/`. Untrusted unless
+    /// the policy decides otherwise.
+    prop: func(of: subject, name: string) -> lookup;
+
+    /// How far this plane's host honours a capability.
+    capability: func(name: string) -> level;
+
+    /// The program's own scratch. It survives a restart of the instance.
+    get: func(name: string) -> option<value>;
+}
+
+/// Writes both planes take. Writes take effect when `react` returns; a call
+/// that traps or overruns its deadline has all of its writes discarded.
+interface writes {
+    use types.{id, value, refusal};
+
+    /// `none` deletes.
+    put: func(name: string, val: option<value>);
+
+    /// Delivers a `timer` edge at or after `at-ms`. A later call replaces
+    /// an earlier one.
+    set-alarm: func(at-ms: u64);
+
+    /// Rejects a pending process or stops a running one. The client sees it.
+    terminate: func(process: id, reason: string) -> result<_, refusal>;
+}
+
+/// The engine plane's tables and verb.
+interface engine-writes {
+    use types.{id, key, retain, refusal};
+
+    /// Admission, run order, preemption victim and resume all follow the
+    /// key. A process below `floor` is not started, and is paused if running.
+    install-schedule: func(entries: list<tuple<id, key>>, floor: option<key>) -> result<_, refusal>;
+
+    /// KV is evicted in ascending key. A position no entry covers takes its
+    /// owner's key. KV below `floor` is discarded instead of demoted.
+    install-retention: func(entries: list<retain>, floor: option<key>) -> result<_, refusal>;
+
+    /// Drops a retained working-set's KV now.
+    discard: func(working-set: id) -> result<_, refusal>;
+}
+
+/// The router plane's tables.
+interface router-writes {
+    use types.{id, key, placement, refusal};
+
+    /// The router's queue: released in key order, held below `floor`.
+    install-schedule: func(entries: list<tuple<id, key>>, floor: option<key>) -> result<_, refusal>;
+
+    install-placement: func(entries: list<placement>) -> result<_, refusal>;
+}
+
+/// The one hook.
+interface policy {
+    use types.{edge};
+
+    /// Edges since the last call, batched, each delivered at most once.
+    react: func(edges: list<edge>, now-ms: u64);
+}

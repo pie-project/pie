@@ -11,15 +11,8 @@
 //!   - `"rank"` with `k_min>0`: OR with a top-`k_min` rank mask
 //!     (`pivot_threshold(logits, rank_le(k_min))`).
 //!   - `k_min=0` (no floor override): the plain, degenerate control.
-//!
-//! Nothing here reads an attention intrinsic or edits a KV page — the sampler
-//! only ever sees `intrinsics::logits()` — so the same body runs on a hybrid
-//! model as well, with the recurrent working set bound beside the KV one. The
-//! body is written ONCE, against the hybrid forward interface: the recurrent
-//! state is a value (empty on a pure-attention model, one row per sequence on a
-//! folding one), not a second kind of pass.
 
-use inferlet::eta::hybrid::prelude::*;
+use inferlet::eta::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -144,24 +137,6 @@ async fn main(input: Input) -> Result<Output> {
 
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-    // ONE sequence, so one recurrent working set for the whole generation on a
-    // hybrid model (the engine requires one per request row); none on a
-    // pure-attention one, where the empty binding IS the attention pass. Fold
-    // policy at every call site below: everything, every fire — this sampler
-    // never buffers.
-    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
-        model::ForwardKind::Attention => Vec::new(),
-        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
-        model::ForwardKind::Recurrent => {
-            return Err(
-                "this program has no recurrent-only path (mirostat-v2 needs KV pages)".into(),
-            );
-        }
-        model::ForwardKind::Diffusion => {
-            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
-        }
-    };
-    let page_size = kv_page_size();
 
     let mut mu = input.mu0.unwrap_or_else(|| (vocab as f32).ln() + 1.0);
     if max_tokens == 0 {
@@ -184,8 +159,6 @@ async fn main(input: Input) -> Result<Output> {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
-    let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages).context("reserve KV")?;
 
     let mut surprises: Vec<f32> = Vec::with_capacity(max_tokens);
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
@@ -194,11 +167,6 @@ async fn main(input: Input) -> Result<Output> {
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
     let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from_iter(0..n).named("positions_p");
-    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
-    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p = Channel::from_iter((0..n).map(|p| p / page_size)).named("w_slot_p");
-    let w_off_p = Channel::from_iter((0..n).map(|p| p % page_size)).named("w_off_p");
     let mu_p = Channel::new([1], dtype::f32).named("mu_p");
     let rng_p = Channel::from([0x9e37_u32, 0]).named("rng_p");
     let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
@@ -206,28 +174,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    let kv_len_p = Channel::from([n]).named("kv_len_p");
-    fwd_p.attention(
-        Some(KvBinding {
-            working_set: &ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len_p,
-                pages: &pages_p,
-                page_indptr: &page_indptr_p,
-                w_slot: &w_slot_p,
-                w_off: &w_off_p,
-                positions: &positions_p,
-                mask: None,
-            },
-        }),
-        &rs_ws,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
-        },
-    )?;
+    fwd_p.state(&[&ws], StateGeometry::folding())?;
     fwd_p.epilogue(move || {
         let mu_v = mu_p.take();
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
@@ -240,13 +187,8 @@ async fn main(input: Input) -> Result<Output> {
     });
 
     mu_p.put(vec![mu]);
-    // ONE pipeline for the whole stream (R4-4): prefill and decode are one
-    // sequential stream. The host round-trip on g0/s0 stays — the host mu
-    // update seeds the decode channels below.
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
-    // max_tokens == 1: the prefill spends the whole budget, so it was the
-    // stream's last submit — finish() right after it (F7).
     let g0 = tok_out_p.take_host::<i32>().await?;
     let s0 = s_out_p.take_host::<f32>().await?;
 
@@ -266,39 +208,12 @@ async fn main(input: Input) -> Result<Output> {
             .capacity(channel_capacity() as u32)
             .named("s_out");
         let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from([n]).named("positions");
-        let pages = Channel::from_iter(0..max_pages).named("pages");
-        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from([n / page_size]).named("w_slot");
-        let w_off = Channel::from([n % page_size]).named("w_off");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
-        let kv_len = Channel::from([n + 1]).named("kv_len");
-        fwd.attention(
-            Some(KvBinding {
-                working_set: &ws,
-                geometry: KvGeometry {
-                    readable_pages: ..,
-                    writable_pages: (n / page_size)..,
-                    kv_len: &kv_len,
-                    pages: &pages,
-                    page_indptr: &page_indptr,
-                    w_slot: &w_slot,
-                    w_off: &w_off,
-                    positions: &positions,
-                    mask: None,
-                },
-            }),
-            &rs_ws,
-            RsGeometry {
-                fold_len: None,
-                buffer: 0..0,
-            },
-        )?;
+        fwd.state(&[&ws], StateGeometry::folding())?;
         fwd.epilogue(move || {
             // Takes + compute first, PUTS last (value-id discipline).
-            let length = kv_len.take();
             let mu_v = mu_state.take(); // [1] f32, device loop-carried
             let r = rng.take(); // [2] u32 rng state
             let logits = intrinsics::logits(); // [vocab] f32
@@ -306,15 +221,8 @@ async fn main(input: Input) -> Result<Output> {
 
             let r_next = &r + iota(2);
             let mu_next = &mu_v - (&surprise - tau) * lr;
-            let next_length = &length + 1u32;
-            let page_count = next_length.div_ceil(page_size);
 
             tok_in.put(&token);
-            kv_len.put(&next_length);
-            positions.put(&length);
-            w_slot.put(&length / page_size);
-            w_off.put(&length % page_size);
-            page_indptr.put(indptr(1, &page_count));
             tok_out.put(&token);
             s_out.put(&surprise);
             rng.put(&r_next);
@@ -322,15 +230,12 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget as usize, async || {
+        run_ahead(&pipe, &fwd, budget, async || {
             let t = tok_out
                 .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
-            let s = s_out
-                .take_host::<f32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
+            let s = s_out.take_host::<f32>().await?;
             generated.push(t as u32);
             surprises.push(s);
             mu -= lr * (s - tau);

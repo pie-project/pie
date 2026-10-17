@@ -10,20 +10,16 @@ system and user message, pre-fills the prompt once, then streams sampled tokens
 through the chat decoder while the next token remains device-carried into the
 following pass.
 
-Other inferlets use it as a reference for output-equivalence checks. It is also
-covered by `tests/gpu/tests/cuda_chat_completion_e2e.rs`, which asserts on output
-content — the continuation of "The capital of France is" must contain "Paris" —
-not just liveness. That ignored e2e was the test that exposed a silent decode
-KV-corruption bug affecting six inferlets; see
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+Other inferlets use it as a reference for output-equivalence checks, and
+`tests/examples/test_curated.py` asserts on its content — the continuation of
+"The capital of France is" must mention France or Paris — not just liveness.
 
 ## What it validates
 
 The harness validates the production chat skeleton:
 
 - chat-template tokenization of system, user, and assistant cue;
-- one N-wide prefill fire followed by a 1-wide decode loop;
-- page-CSR geometry that tracks the true KV length, not the reserved pool;
+- one prefill pass followed by a 1-wide decode loop;
 - nucleus sampling at positive temperature and exact greedy decoding at
   `temperature = 0`;
 - host-side streaming and stop-token handling.
@@ -41,9 +37,10 @@ The harness validates the production chat skeleton:
 ## Implementation notes
 
 The prefill epilogue samples the first token and mirrors it to the host. The
-decode pass then carries token, position, KV length, mask, page CSR and RNG state
-through device channels. The host drains tokens only for streaming text and stop
-checks; it does not feed the sampled token back into the next pass.
+decode pass then carries the token and RNG state through device channels; where
+each token's row lands is the runtime's. The host drains tokens only for
+streaming text and stop checks; it does not feed the sampled token back into the
+next pass.
 
 ## Run
 

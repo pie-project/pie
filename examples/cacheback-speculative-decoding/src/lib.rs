@@ -19,27 +19,9 @@
 //! is therefore a controlled A/B in which the token sequence must come out
 //! **identical**. If a rejected draft ever leaked into later state, the two
 //! would diverge.
-//!
-//! ## How the state is kept — and why nothing is rebuilt
-//!
-//! One KV working set lives for the whole generation. A rejected draft's KV
-//! cells are addressed, so the next round simply overwrites them: its rows
-//! land at the positions the rejected tail occupied, and `kv_len` never
-//! counts past the committed prefix plus the window in flight.
-//!
-//! On a hybrid model the recurrence is a fold, not an addressed cell, so the
-//! window is *buffered* rather than folded (`forward-hybrid.wit`,
-//! `rs-geometry`): each fire folds the previously accepted run ahead of its
-//! own rows, replays those rows over the recurrent buffer, and the rejected
-//! tail is dropped from the buffer with `discard_buffered` before the next
-//! fire. The state that persists is exactly the state of the committed
-//! prefix — the same shape `rs-speculative-decoding` documents — and the
-//! per-window rebuild the previous revision paid for (O(n) per round) is gone.
-//! On a pure-attention model the recurrent binding is empty and the same
-//! loop is plain KV speculation.
 
 use inferlet::chat;
-use inferlet::eta::hybrid::prelude::*;
+use inferlet::eta::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -125,66 +107,38 @@ fn draft_from_cache(tokens: &[u32], draft_length: usize, max_ngram: usize) -> Ve
     Vec::new()
 }
 
-/// The pages the recurrent buffer must hold for one fire: the survivors
-/// (at most a page's worth of head offset before them), plus the window.
-fn buffer_pages_for(survivors: u32, window: u32, page: u32) -> u32 {
-    (page.saturating_sub(1) + survivors + window).div_ceil(page.max(1)).max(1)
-}
-
-/// One fire over `rows` token ids at positions `base ..`, folding `fold`
-/// buffered tokens ahead of them and buffering the rows themselves;
-/// `fold == None` folds everything in the forward (the prefill's shape, and
-/// the only shape on a pure-attention model, where `rs` is empty).
-/// Answers the target's argmax at every row.
-#[allow(clippy::too_many_arguments)]
 async fn fire(
     ws: &WorkingSet,
-    rs: &[RsWorkingSet],
     pipeline: &Pipeline,
     tokens: &[u32],
     base: u32,
     fold: Option<u32>,
-    buffer_pages: u32,
-    page_size: u32,
+    last_only: bool,
 ) -> Result<Vec<u32>> {
     let rows = tokens.len() as u32;
     let total = base + rows;
-    let pages = total.div_ceil(page_size);
 
     let ids = Channel::from_iter(tokens.iter().map(|&t| t as i32));
     let embed_indptr = Channel::from([0u32, rows]).named("embed_indptr");
-    let positions = Channel::from_iter(base..total).named("positions");
-    let page_list = Channel::from_iter(0..pages).named("pages");
-    let page_indptr = Channel::from([0u32, pages]).named("page_indptr");
-    let w_slot = Channel::from_iter((base..total).map(|p| p / page_size)).named("w_slot");
-    let w_off = Channel::from_iter((base..total).map(|p| p % page_size)).named("w_off");
-    let kv_len = Channel::from([total]).named("kv_len");
-    let readout = Channel::from_iter(0..rows).named("readout");
-    let truth_out = Channel::new([rows], dtype::i32).named("truth");
+    let slots = Channel::from_iter(base..total).named("slots");
+    let read = if last_only { rows - 1 } else { 0 };
+    let readout = Channel::from_iter(read..rows).named("readout");
+    let truth_out = Channel::new([rows - read], dtype::i32).named("truth");
     let fold_len = fold.map(|n| Channel::from([n]).named("fold_len"));
+    let fold = match &fold_len {
+        Some(count) => Fold::Count(count),
+        None => Fold::All,
+    };
 
     let fwd = ForwardPass::new();
     fwd.embed(&ids, &embed_indptr)?;
     fwd.readout(&readout)?;
-    fwd.attention(
-        Some(KvBinding {
-            working_set: ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len,
-                pages: &page_list,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &positions,
-                mask: None,
-            },
-        }),
-        rs,
-        RsGeometry {
-            fold_len: fold_len.as_ref(),
-            buffer: 0..buffer_pages,
+    fwd.state(
+        &[ws],
+        StateGeometry {
+            slots: Some(&slots),
+            fold,
+            ..StateGeometry::default()
         },
     )?;
     fwd.epilogue(move || {
@@ -218,21 +172,9 @@ async fn main(input: Input) -> Result<Output> {
     if input.max_tokens == 0 {
         return Ok(empty());
     }
-    let hybrid = match model::pass_kind() {
-        model::ForwardKind::Attention => false,
-        model::ForwardKind::Hybrid => true,
-        other => {
-            return Err(format!(
-                "this program verifies drafts against a KV cache; the model's forward is {other:?}"
-            )
-            .into())
-        }
-    };
 
     let k = input.draft_length as u32;
     let w_max = k + 1;
-    let page_size = kv_page_size();
-    let rs_page = model::rs_buffer_page_size().max(1);
 
     let mut prompt = chat::system_user("Continue the requested text.", &input.prompt);
     prompt.extend(chat::cue());
@@ -242,34 +184,11 @@ async fn main(input: Input) -> Result<Output> {
     let n = prompt.len() as u32;
     let stop_tokens = chat::stop_tokens();
 
-    // One KV working set (and on a hybrid model one recurrent working set)
-    // for the whole generation. The KV lease covers the prompt, every token
-    // the host may keep, and a window whose drafts are all rejected.
     let ws = WorkingSet::new();
-    let max_pages = (n + input.max_tokens as u32 + w_max).div_ceil(page_size).max(1);
-    ws.reserve(max_pages).context("reserve KV")?;
-    let rs: Vec<RsWorkingSet> = if hybrid { vec![RsWorkingSet::new()] } else { Vec::new() };
     let pipeline = Pipeline::new();
 
-    // ── Prefill: folds everything, buffers nothing, and seeds the first window.
-    let mut first = 0u32;
-    let chunks = prefill_chunks(n, None);
-    for (at, &(from, to)) in chunks.iter().enumerate() {
-        let truth = fire(
-            &ws,
-            &rs,
-            &pipeline,
-            &prompt[from as usize..to as usize],
-            from,
-            None,
-            0,
-            page_size,
-        )
-        .await?;
-        if at + 1 == chunks.len() {
-            first = *truth.last().expect("a prefill answers one row per token");
-        }
-    }
+    let truth = fire(&ws, &pipeline, &prompt, 0, None, true).await?;
+    let first = *truth.last().expect("a prefill answers its last row");
 
     let mut committed: Vec<u32> = prompt.clone();
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
@@ -284,8 +203,6 @@ async fn main(input: Input) -> Result<Output> {
         generated.push(x);
     }
     let mut base = n;
-    // How many tokens survive in the recurrent buffer, unfolded: the seed is
-    // the prefill's own fold, so the first round replays nothing.
     let mut survivors: u32 = 0;
 
     while !stopped && generated.len() < input.max_tokens {
@@ -294,31 +211,8 @@ async fn main(input: Input) -> Result<Output> {
         let mut window = Vec::with_capacity(w_max as usize);
         window.push(x);
         window.extend(drafts.iter().copied());
-        let w = window.len() as u32;
 
-        // ── On a hybrid model the buffer must hold the survivors and the
-        //    window; the grant is the guest's one allocation decision.
-        let need = if hybrid { buffer_pages_for(survivors, w, rs_page) } else { 0 };
-        if hybrid {
-            let have = rs[0].buffer_size();
-            if have < need {
-                rs[0]
-                    .alloc_buffer(need - have)
-                    .map_err(|why| format!("alloc {} rs buffer page(s): {why}", need - have))?;
-            }
-        }
-
-        let truth = fire(
-            &ws,
-            &rs,
-            &pipeline,
-            &window,
-            base,
-            hybrid.then_some(survivors),
-            need,
-            page_size,
-        )
-        .await?;
+        let truth = fire(&ws, &pipeline, &window, base, Some(survivors), false).await?;
         verification_steps += 1;
         let proposed = window.len() - 1;
         drafted += proposed;
@@ -330,15 +224,7 @@ async fn main(input: Input) -> Result<Output> {
         }
         accepted += m;
 
-        // ── The rejected tail never happened: forget it in the buffer before
-        //    the next fire, whose fold reaches exactly the accepted prefix.
-        //    Its KV cells are overwritten by the next window's rows.
-        let rejected = (proposed - m) as u32;
-        if hybrid && rejected > 0 {
-            rs[0]
-                .discard_buffered(rejected)
-                .map_err(|why| format!("discard {rejected} rejected token(s): {why}"))?;
-        }
+        // No explicit rollback: the next fire overwrites the rejected tail's slots.
 
         // ── Commit `window[1 ..= m]` — `window[0]` was committed last round as
         //    the correction that produced it — then the new correction.
@@ -364,7 +250,7 @@ async fn main(input: Input) -> Result<Output> {
         committed.push(correction);
         generated.push(correction);
 
-        // Only the accepted run advances the length and survives in the
+        // Only the accepted run advances the sequence and survives in the
         // buffer; the next fire folds it ahead of its own rows.
         base += (m + 1) as u32;
         survivors = (m + 1) as u32;

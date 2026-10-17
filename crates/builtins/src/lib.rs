@@ -3,6 +3,8 @@
 //!
 //! `build.rs` does the compiling; this crate only holds the bytes.
 
+use std::borrow::Cow;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Builtin {
     pub name: &'static str,
@@ -18,6 +20,24 @@ pub fn all() -> &'static [Builtin] {
 
 pub fn find(name: &str) -> Option<&'static Builtin> {
     ALL.iter().find(|b| b.name == name)
+}
+
+pub fn policies() -> &'static [Builtin] {
+    POLICIES
+}
+
+pub fn policy(name: &str) -> Option<&'static Builtin> {
+    POLICIES.iter().find(|b| b.name == name)
+}
+
+pub fn policy_component(spec: &str) -> std::io::Result<Cow<'static, [u8]>> {
+    if let Some(builtin) = policy(spec) {
+        return Ok(Cow::Borrowed(builtin.component));
+    }
+    std::fs::read(spec).map(Cow::Owned).map_err(|e| {
+        let why = format!("`{spec}` is neither a built-in policy nor a readable file: {e}");
+        std::io::Error::new(e.kind(), why)
+    })
 }
 
 #[cfg(test)]

@@ -380,6 +380,7 @@ impl Engine for Group {
             pools.host_kv_pages = tiers.host_kv_pages;
             pools.host_window_pages = tiers.host_window_pages;
             pools.host_state_slots = tiers.host_state_slots;
+            pools.host_buffer_pages = tiers.host_buffer_pages;
             pools.disk_kv_pages = tiers.disk_kv_pages;
             loaded.caps.kv_copy.device_to_host &= tiers.host_kv_pages > 0;
             loaded.caps.kv_copy.host_to_device &= tiers.host_kv_pages > 0;

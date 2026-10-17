@@ -65,7 +65,7 @@ Each step:
    masked argmax. On the first mismatch the target's token is taken instead and
    the rest of the draft is discarded.
 
-The KV working set is rebuilt per verification window, so rejected draft state
+Each verification window prefills a fresh working set, so rejected draft state
 can never leak into a later step.
 
 ### Constraint satisfaction is structural

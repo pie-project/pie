@@ -24,11 +24,12 @@ fn invalid(message: impl Into<String>, param: Option<&str>) -> ApiError {
     )
 }
 
-fn usage(prompt: usize, completion: usize) -> Value {
+fn usage(outcome: &compat::Outcome) -> Value {
     json!({
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "total_tokens": prompt + completion,
+        "prompt_tokens": outcome.prompt_tokens,
+        "completion_tokens": outcome.completion_tokens,
+        "total_tokens": outcome.prompt_tokens + outcome.completion_tokens,
+        "prompt_tokens_details": {"cached_tokens": outcome.cached_tokens},
     })
 }
 

@@ -5,41 +5,14 @@
  * pass may share a frame.
  */
 export function submit(on: Pipeline, slots: Array<ForwardPass | undefined>): void;
-/**
- * Leave the frame's wait-set on `on` until this pipeline submits again.
- * `forward.park`'s contract, unchanged.
- */
-export function park(on: Pipeline): void;
 export type Error = import('./pie-inferlet-types.js').Error;
 export type Data = import('./pie-inferlet-types.js').Data;
 export type Channel = import('./pie-inferlet-channel.js').Channel;
-export type KvWorkingSet = import('./pie-inferlet-working-set.js').KvWorkingSet;
-export type PageSpan = import('./pie-inferlet-working-set.js').PageSpan;
+export type WorkingSet = import('./pie-inferlet-working-set.js').WorkingSet;
 export type Pipeline = import('./pie-inferlet-pipeline.js').Pipeline;
 export type MediaSpan = import('./pie-inferlet-forward.js').MediaSpan;
+export type StateGeometry = import('./pie-inferlet-forward.js').StateGeometry;
 export type LaneStream = import('./pie-inferlet-model.js').LaneStream;
-/**
- * Attention geometry, field for field `forward`'s. Declared separately
- * per interface ON PURPOSE (D8/D3).
- * 
- * On a `denoise` pass the geometry describes the canvas: `positions`
- * are the canvas's (the prefix length onward), `w-slot`/`w-off` land
- * its rows in the canvas pages, and `kv-len` is prefix plus canvas — the
- * same numbers on every step, which is what lets one pass be
- * resubmitted for the whole denoising loop. `mask`, when bound, narrows
- * the bidirectional reading; it never has to widen anything.
- */
-export interface KvGeometry {
-  readablePages: PageSpan,
-  writablePages: PageSpan,
-  kvLen: Channel,
-  pages: Channel,
-  pageIndptr: Channel,
-  wSlot: Channel,
-  wOff: Channel,
-  positions: Channel,
-  mask?: Channel,
-}
 /**
  * Which of the model's two readings a pass runs. See the file note.
  * # Variants
@@ -53,11 +26,11 @@ export type Mode = 'encode' | 'denoise';
 export class ForwardPass {
   constructor()
   /**
-  * State binding. REQUIRED — `forward.attention`, unchanged — on
-  * every reading that declares a KV space (a diffusion text's one
-  * implicit reading does); refused by name on one that does not.
+  * `forward.state`. On a `denoise` pass the geometry describes the
+  * canvas, the same on every step, so one pass serves the whole
+  * denoising loop.
   */
-  attention(kv: KvWorkingSet, geom: KvGeometry): void;
+  state(lanes: Array<WorkingSet>, geom: StateGeometry): void;
   /**
   * `forward.reading`, unchanged: which declared reading this pass
   * runs. Optional when the model declares at most one.
@@ -78,45 +51,11 @@ export class ForwardPass {
   */
   group(id: number): void;
   /**
-  * Name the attention group whose same-stream lane is this lane's
-  * PEER: the lane whose velocity this one's epilogue reads with
-  * `intrinsics::peer_velocity(width)`.
-  * 
-  * This is the classifier-free guidance verb, and it names a group
-  * rather than a lane of one's own because guidance's two branches
-  * must NOT attend each other — they are two independent denoisings
-  * of the same canvas, one holding the prompt and one the negative
-  * one, and putting them in one attention group would make each see
-  * the other's rows. So they are two groups of ONE fire, and this
-  * says which of them is the other.
-  * 
-  * The peer is the lane of that group carrying THIS pass's stream;
-  * a group seating no such lane, or more than one, is refused by
-  * name at submit rather than guessed at. Naming one's own group is
-  * refused too: a lane is not its own peer, and `u + s(u - u)` is a
-  * picture that looks fine and is not guided.
-  * 
-  * It costs a row offset and nothing else. The velocity plane is
-  * fire-wide and written by the forward walk before any epilogue
-  * block runs, so both branches' predictions are already sitting in
-  * one rectangle by the time either epilogue reads. A pass that
-  * reads `peer_velocity` without naming a peer is refused, so
-  * guidance cannot silently degrade into a lane reading its own
-  * rows twice.
-  * 
-  * Set before `program`, and after `group`. A model that predicts
-  * no velocity refuses the whole program at bind.
+  * `forward.peer`, unchanged.
   */
   peer(group: number): void;
   /**
-  * A structured attention mask over this pass's rows, applied to the
-  * reading's group-packed attention: `classes` names one class in
-  * `0..count` per row (or -1: the row attends, and is attended by,
-  * every row); `table[q * count + kv]` non-zero lets a q-class row
-  * attend a kv-class row. `count` is at most 64. Every lane of one
-  * attention group states the same table; rows of lanes that state
-  * nothing are class -1. Regional prompting, attention coupling and
-  * cross-frame restriction are all one table. Set before `program`.
+  * `forward.attention-classes`, unchanged.
   */
   attentionClasses(classes: Int32Array, table: Uint8Array, count: number): void;
   /**
@@ -175,23 +114,15 @@ export class ForwardPass {
   */
   readout(indices: Channel): void;
   /**
-  * The media payload beside the ledger, exactly as `forward.media`
-  * states it — an `encode` pass's concern, since a prompt is what
-  * carries images.
+  * `forward.media`, unchanged: an `encode` pass's concern, since a
+  * prompt is what carries images.
   */
   media(spans: Array<MediaSpan>): void;
   /**
-  * tart: run only the first `max-layers` layers and take the head
-  * there. Zero rejected; unset = full model. Per pass, so an early
+  * `forward.set-max-layers`, unchanged. Per pass, so an early
   * denoising step may run shallow and the last ones deep.
   */
   setMaxLayers(maxLayers: number): void;
-  /**
-  * The attention interface's verb, same host half: these rows are a
-  * block drafter's proposal, not the sequence's own. A denoiser has no
-  * use for it; it is here so the four pass interfaces stay one shape.
-  */
-  setDraftingBlock(on: boolean): void;
   /**
   * Attach canonical ETA bytes and channel handles in dense declaration
   * order. Validation uses the engine-owned ModelProfile and rejects

@@ -8,7 +8,7 @@ pub(crate) const KV_MAX: u32 = eta_ir::registry::ATTN_SCORE_KV_MAX;
 
 const SLOT: u64 = 4;
 
-pub(crate) const OBSERVE: u32 = 32;
+pub(crate) const OBSERVE: u32 = eta_ir::registry::ATTN_SCORE_OBSERVE;
 
 #[derive(Debug)]
 pub(crate) struct Scores {

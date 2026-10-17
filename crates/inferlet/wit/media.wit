@@ -13,15 +13,12 @@
 // the inferlet only ever holds a handle (pixels/features never cross into WASM
 // linear memory, and there are no placeholder ids THE GUEST SPELLS).
 //
-// That last clause is the one media-door.md §0 rewrote, and the principle it
-// protects survives the rewrite whole. `tokens()` ANSWERS the bound model's
-// delimiter + placeholder ids — the span's full spelling, ready to splice —
-// so a guest writes `toks.extend(img.tokens())` and still never types
-// `<|vision_start|>`, never counts a pad run, and never branches on which
-// model it is bound to. What collapsed is the ergonomics, not the layering:
-// the host still knows the model and the guest still does not.
+// `tokens()` ANSWERS the bound model's delimiter + placeholder ids — the
+// span's full spelling, ready to splice — so a guest writes
+// `toks.extend(img.tokens())` and never types `<|vision_start|>`, never
+// counts a pad run, and never branches on which model it is bound to.
 //
-// THE CACHE STATUTE (media-door.md §5). Two DIFFERENT images produce
+// THE CACHE STATUTE. Two DIFFERENT images produce
 // IDENTICAL token lists — the run is `token-count` copies of one reserved pad
 // either way — so tokens alone are not a content key for anything holding a
 // media span. Any reuse keyed on tokens (a guest prefix tree, fork/snapshot
@@ -56,7 +53,7 @@ interface media {
         // THE SPAN, AS THE SEQUENCE CARRIES IT: prefix + placeholder run
         // (exactly `token-count` long) + suffix, in the bound model's own ids.
         //
-        // This is the one ledger (media-door.md §0). A span enters the context
+        // This is the one ledger. A span enters the context
         // as `toks.extend(img.tokens())` and as nothing else — no anchor list,
         // no guest-side splicing of `prefix-tokens` around a run the guest
         // built itself, no second bookkeeping structure beside the tokens. The
@@ -95,11 +92,8 @@ interface media {
         // Qwen `<|vision_start|>` / `<|vision_end|>`); empty for models that
         // need none.
         //
-        // INTROSPECTION, NOT A STEP (media-door.md §1). These were the guest's
-        // splicing instructions back when the guest assembled the run; they
-        // stay because a caller inspecting what a span will cost is a real
-        // question, and because a WIT verb is cheap to keep and expensive to
-        // re-add. Nothing on the happy path calls them.
+        // Introspection, not a step: what a span will cost. Nothing on the
+        // happy path calls them.
         prefix-tokens: func() -> list<u32>;
         suffix-tokens: func() -> list<u32>;
     }

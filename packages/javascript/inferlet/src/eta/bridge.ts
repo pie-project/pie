@@ -11,10 +11,8 @@
 // and the guest's task simply blocks until the cell fills.
 
 import * as witChannel from 'pie:inferlet/channel@0.3.0';
-import * as witAttention from 'pie:inferlet/forward@0.3.0';
+import * as witForward from 'pie:inferlet/forward@0.3.0';
 import * as witDiffusion from 'pie:inferlet/forward-diffusion@0.3.0';
-import * as witHybrid from 'pie:inferlet/forward-hybrid@0.3.0';
-import * as witRecurrent from 'pie:inferlet/forward-recurrent@0.3.0';
 import * as witModel from 'pie:inferlet/model@0.3.0';
 import * as witPipeline from 'pie:inferlet/pipeline@0.3.0';
 import * as witWs from 'pie:inferlet/working-set@0.3.0';
@@ -230,7 +228,7 @@ export class Channel {
     try {
       this.wit().put(data.data);
     } catch {
-      // Fire-and-forget, like the Rust `inferlet` crate: failures surface at take.
+      // Fire-and-forget: failures surface at take.
     }
   }
 
@@ -274,149 +272,39 @@ export class Channel {
 // Working sets
 // ---------------------------------------------------------------------------
 
-export interface PageRange {
-  start: number;
-  len: number;
-}
-
-/** A grant of fresh logical page indexes from `WorkingSet.reserve`. */
-export class PageGrant {
-  readonly ids: number[];
-  constructor(
-    readonly start: number,
-    length: number,
-  ) {
-    this.ids = Array.from({ length }, (_, i) => start + i);
-  }
-  range(): PageRange {
-    return { start: this.start, len: this.ids.length };
-  }
-}
-
-/** The attention working set — a logical page address space over the KV
- * mapping trie. Every page reference is working-set-relative. */
+/** One sequence's model state; slots below `folded()` are frozen, the rest is a buffer. */
 export class WorkingSet {
-  readonly kv: witWs.KvWorkingSet;
-  /** The first `reserve` grant; `geometry()` addresses it. */
-  grant: PageGrant | undefined;
-  private rs_: RsWorkingSet[] | undefined;
-
-  /** `{ tokens: n }` reserves the pages `n` tokens need up front (`grant`). */
-  constructor(opts: { tokens?: number } = {}) {
-    this.kv = new witWs.KvWorkingSet();
-    if (opts.tokens !== undefined) this.reserve(Math.max(Math.ceil(opts.tokens / kvPageSize()), 1));
-  }
-
   /** @internal */
-  static wrap(kv: witWs.KvWorkingSet): WorkingSet {
-    const ws = Object.create(WorkingSet.prototype) as { -readonly [K in keyof WorkingSet]: WorkingSet[K] };
-    ws.kv = kv;
-    ws.grant = undefined;
-    return ws as WorkingSet;
+  ws: witWs.WorkingSet;
+
+  constructor() {
+    this.ws = new witWs.WorkingSet();
   }
 
-  pageLen(): number {
-    return this.kv.pageLen();
+  private static wrap(ws: witWs.WorkingSet): WorkingSet {
+    const out: WorkingSet = Object.create(WorkingSet.prototype);
+    out.ws = ws;
+    return out;
   }
 
-  /** Reserve `pages` fresh pages. The first grant is kept as `grant`. */
-  reserve(pages: number): PageGrant {
-    const r = wit('reserve KV', () => this.kv.reserve(pages));
-    const grant = new PageGrant(r.start, r.len);
-    this.grant ??= grant;
-    return grant;
+  /** Lets passes write slots below `end`; needed only when the device computes the slots. */
+  reserve(end: number): void {
+    wit('reserve', () => this.ws.reserve(end));
   }
 
-  /** The recurrent state a hybrid model folds this sequence into: one
-   * `RsWorkingSet`, made on first use; empty on an attention model. */
-  get rs(): RsWorkingSet[] {
-    this.rs_ ??= witModel.passKind() === 'hybrid' ? [new RsWorkingSet()] : [];
-    return this.rs_;
+  /** The frozen length; while a device-counted fold is in flight, the length before it. */
+  folded(): number {
+    return this.ws.folded();
   }
 
-  /** The `KvGeometry` of a fire that embeds tokens `[start, end)` of one
-   * contiguous sequence into this working set's pages: `kvLen`,
-   * `pageIndptr`, `wSlot`, `wOff`, `positions` are all derived from the
-   * span, and `pages` is the reserved grant. Edit the returned fields
-   * (`mask`, `writablePages`, ...) for anything else. */
-  geometry(start: number, end: number): KvGeometry {
-    if (!(0 <= start && start < end)) throw new InferletError(`geometry: [${start}, ${end}) is not a span of tokens to embed`);
-    const page = kvPageSize();
-    const span = Array.from({ length: end - start }, (_, i) => start + i);
-    const pages = this.grant?.ids ?? Array.from({ length: Math.ceil(end / page) }, (_, i) => i);
-    return {
-      kvLen: Channel.from([end], Dtype.U32),
-      pages: Channel.from(pages, Dtype.U32),
-      pageIndptr: Channel.from([0, Math.ceil(end / page)], Dtype.U32),
-      wSlot: Channel.from(span.map((p) => Math.floor(p / page)), Dtype.U32),
-      wOff: Channel.from(span.map((p) => p % page), Dtype.U32),
-      positions: Channel.from(span, Dtype.U32),
-    };
+  /** Slots the runtime mapped in from state it already held rather than computed. */
+  cachedTokens(): number {
+    return this.ws.cachedTokens();
   }
 
-  updateIndex(key: Uint8Array): void {
-    wit('updateIndex', () => this.kv.updateIndex(key));
-  }
-
-  static fromIndex(key: Uint8Array): WorkingSet | undefined {
-    const kv = wit('fromIndex', () => witWs.KvWorkingSet.fromIndex(key));
-    return kv ? WorkingSet.wrap(kv) : undefined;
-  }
-
-  static removeIndex(key: Uint8Array): boolean {
-    return wit('removeIndex', () => witWs.KvWorkingSet.removeIndex(key));
-  }
-
-  discard(on: Pipeline, ranges: PageRange[]): void {
-    wit('discard', () => this.kv.discard(on.wit, ranges));
-  }
-
+  /** A child sharing the frozen part, with a copy of the buffer. */
   fork(on: Pipeline): WorkingSet {
-    return WorkingSet.wrap(wit('fork', () => this.kv.fork(on.wit)));
-  }
-
-  slice(on: Pipeline, start: number, len: number): WorkingSet {
-    return WorkingSet.wrap(wit('slice', () => this.kv.slice(on.wit, { start, len })));
-  }
-
-  copyInto(on: Pipeline, dstPageIds: ArrayLike<number>, dstTokIdx: ArrayLike<number>, srcPageIds: ArrayLike<number>, srcTokIdx: ArrayLike<number>): void {
-    wit('copyInto', () =>
-      this.kv.copyInto(on.wit, Uint32Array.from(dstPageIds), Uint32Array.from(dstTokIdx), Uint32Array.from(srcPageIds), Uint32Array.from(srcTokIdx)),
-    );
-  }
-}
-
-/** Runtime recurrent-state slots for hybrid / linear-attention models. */
-export class RsWorkingSet {
-  readonly rs: witWs.RsWorkingSet;
-
-  constructor(rs?: witWs.RsWorkingSet) {
-    this.rs = rs ?? new witWs.RsWorkingSet();
-  }
-
-  stateSize(): number {
-    return Number(witModel.rsStateSize());
-  }
-  bufferSize(): number {
-    return this.rs.bufferSize();
-  }
-  bufferPageSize(): number {
-    return witModel.rsBufferPageSize();
-  }
-  allocBuffer(n: number): PageRange {
-    return wit('allocBuffer', () => this.rs.allocBuffer(n));
-  }
-  freeBuffer(indices: ArrayLike<number>): void {
-    wit('freeBuffer', () => this.rs.freeBuffer(Uint32Array.from(indices)));
-  }
-  discardBuffered(count: number): void {
-    wit('discardBuffered', () => this.rs.discardBuffered(count));
-  }
-  reorderBuffer(perm: ArrayLike<number>): void {
-    wit('reorderBuffer', () => this.rs.reorderBuffer(Uint32Array.from(perm)));
-  }
-  fork(on: Pipeline): RsWorkingSet {
-    return new RsWorkingSet(wit('fork', () => this.rs.fork(on.wit)));
+    return WorkingSet.wrap(wit('fork', () => this.ws.fork(on.wit)));
   }
 }
 
@@ -435,7 +323,7 @@ export class Pipeline {
 
   /** Leave the frame wait-set until this pipeline submits again. */
   park(): void {
-    witAttention.park(this.wit);
+    witForward.park(this.wit);
   }
 
   /** Enqueue one pass as a single-slot frame. */
@@ -464,12 +352,12 @@ export class Pipeline {
   runAhead(fwd: ForwardPass, budget: number, onToken: () => boolean | void): number {
     if (budget === 0) return 0;
     // Live slots per frame. A pass that binds a dense device mask takes one;
-    // so does a pass on a recurrent or hybrid model, whose frame's waves carry
-    // the same sequence's state one into the next (a frame of one live slot
-    // measured faster than a full one on Qwen3.5-0.8B). A dense attention pass
-    // fills the frame.
-    const r = fwd.bindsDeviceMask() || fwd.kind !== 'attention' ? 1 : frameSize();
-    const windowFrames = Math.max(Math.floor((channelCapacity() - 1) / Math.max(r, 1)), 1);
+    // so does a pass on a model with recurrent state, whose frame's waves
+    // carry the same sequence's state one into the next (a frame of one live
+    // slot measured faster than a full one on Qwen3.5-0.8B), and a canvas,
+    // which is redrawn whole. Any other pass fills the frame.
+    const r = fwd.bindsDeviceMask() || rsStateSize() > 0 || fwd.kind === 'diffusion' ? 1 : frameSize();
+    const windowFrames = Math.max(Math.floor(witModel.runAheadWindow() / Math.max(r, 1)), 1);
     let submitted = 0;
     let consumed = 0;
     const submitOneFrame = () => {
@@ -505,52 +393,27 @@ export class Pipeline {
 }
 
 // ---------------------------------------------------------------------------
-// Geometry
+// State geometry
 // ---------------------------------------------------------------------------
 
-/** A page span: `undefined` = everything; a number = `start..`; `[start, end]`
- * (end may be undefined) = `start..end`. */
-export type PageDecl = undefined | number | [number, number | undefined];
+/** How many more slots each lane freezes after a fire: none, `'all'`, or a u32 count channel. */
+export type Fold = undefined | 'all' | Channel;
 
-function pageDecl(r: PageDecl): [number, number | undefined] {
-  if (r === undefined) return [0, undefined];
-  if (typeof r === 'number') return [r, undefined];
-  const [start, end] = r;
-  if (end !== undefined && start > end) throw new Error(`attention page-span start ${start} exceeds end ${end}`);
-  return [start ?? 0, end];
-}
-
-function pageSpan(d: [number, number | undefined]): witWs.PageSpan {
-  return d[1] === undefined ? { start: d[0] } : { start: d[0], end: d[1] };
-}
-
-/** The attention geometry of one fire — mirrors WIT `kv-geometry`. */
-export interface KvGeometry {
-  kvLen: Channel;
-  pages: Channel;
-  pageIndptr: Channel;
-  wSlot: Channel;
-  wOff: Channel;
-  positions: Channel;
+/** Where a pass's rows land and what they read; omitted fields mean a causal append. */
+export interface StateGeometry {
+  /** Per row, the RoPE position. */
+  positions?: Channel;
+  /** Per row, the slot it writes; a lane's rows write consecutive slots. */
+  slots?: Channel;
+  /** Per lane, how many slots the lane reads. */
+  kvLen?: Channel;
+  /** Per row, bool over the slots it may read. */
   mask?: Channel;
-  readablePages?: PageDecl;
-  writablePages?: PageDecl;
-}
-
-/** Where the bound recurrent state's folded boundary lands. `foldLen`
- * absent folds everything. */
-export interface RsGeometry {
-  foldLen?: Channel;
-  buffer?: PageDecl;
-}
-
-export interface KvBinding {
-  workingSet: WorkingSet;
-  geometry: KvGeometry;
+  fold?: Fold;
 }
 
 // ---------------------------------------------------------------------------
-// Model constants (cached where the Rust `inferlet` crate caches)
+// Model constants
 // ---------------------------------------------------------------------------
 
 const cache = new Map<string, number>();
@@ -569,9 +432,12 @@ export const submitDeadlineUs = () => cached('submitDeadlineUs', () => Number(wi
 /** Host-reader channel capacity that sustains run-ahead (not cached). */
 export const channelCapacity = () => Math.max(witModel.channelCapacity(), 2);
 export const kvPageSize = () => cached('kvPageSize', () => witModel.kvPageSize());
-export const maxEmbedLength = () => cached('maxEmbedLength', () => Math.max(witModel.maxEmbedLength(), 1));
+const rsStateSize = () => cached('rsStateSize', () => Number(witModel.rsStateSize()));
+/** The most rows one pass may read out through `kind`; the pass itself may be any length. */
+export const maxReadoutRows = (kind: witModel.ReadoutKind) =>
+  cached(`maxReadoutRows:${kind}`, () => Math.max(witModel.maxReadoutRows(kind), 1));
 
-export function evenSpans(n: number, cap: number): [number, number][] {
+function evenSpans(n: number, cap: number): [number, number][] {
   if (n === 0) return [];
   cap = Math.max(Math.min(cap, n), 1);
   const k = Math.max(Math.ceil(n / cap), 1);
@@ -587,59 +453,27 @@ export function evenSpans(n: number, cap: number): [number, number][] {
   return out;
 }
 
-/** The prefill chunk the scheduler would like right now, in tokens
- * (`model.prefill-chunk-hint`): the forward token budget shared among the
- * live processes, in whole KV pages. Read per call — it moves as processes
- * come and go. A hint: the runtime never splits a fire. */
-export function prefillChunkHint(): number {
-  return Math.min(Math.max(witModel.prefillChunkHint(), 1), maxEmbedLength());
-}
-
-/** The `[start, end)` spans a prompt of `n` tokens must be prefilled in.
- * `cap` overrides the limit; omitted, it takes `prefillChunkHint()`, so a
- * prompt prefilled beside other live processes is cut into chunks that
- * leave the step room for their decodes. */
-export function prefillChunks(n: number, cap?: number): [number, number][] {
-  const c = Math.min(cap ?? prefillChunkHint(), Math.max(maxEmbedLength(), 1));
-  return evenSpans(n, Math.max(c, 1));
+/** Even `[start, end)` spans of `n` rows, each at most `maxReadoutRows(kind)`. */
+export function readoutSpans(n: number, kind: witModel.ReadoutKind): [number, number][] {
+  return evenSpans(n, maxReadoutRows(kind));
 }
 
 // ---------------------------------------------------------------------------
 // ForwardPass
 // ---------------------------------------------------------------------------
 
-type AttentionMod = typeof witAttention;
-type DiffusionMod = typeof witDiffusion;
-type HybridMod = typeof witHybrid;
-type RecurrentMod = typeof witRecurrent;
-type AnyPass = witAttention.ForwardPass | witDiffusion.ForwardPass | witHybrid.ForwardPass | witRecurrent.ForwardPass;
-
-interface StagedKv {
-  ws: witWs.KvWorkingSet;
-  readable: [number, number | undefined];
-  writable: [number, number | undefined];
-  kvLen: witChannel.Channel;
-  pages: witChannel.Channel;
-  pageIndptr: witChannel.Channel;
-  wSlot: witChannel.Channel;
-  wOff: witChannel.Channel;
-  positions: witChannel.Channel;
-  mask: witChannel.Channel | undefined;
-}
+type AnyPass = witForward.ForwardPass | witDiffusion.ForwardPass;
 
 const SITE_BITS: Record<string, number> = { q: 1, k: 2, v: 4, o: 8, gate_up: 16, down: 32 };
 
 /**
  * The forward-pass builder over one `pie:inferlet/forward*` interface,
- * selected by `kind` (default: `model.passKind()`). Attach stage bodies with
- * `epilogue(fn)`, bind state with `bindState(...)` (kind-independent; or the
- * per-kind `attention` / `bindHybrid` / `bindRecurrent`), and `submit(pipe)`.
- * The first submit traces the stage bodies once.
+ * selected by `kind` (default: `model.passKind()`).
  */
 export class ForwardPass {
   readonly kind: ForwardKind;
   readonly wit: AnyPass;
-  private readonly mod: AttentionMod | DiffusionMod | HybridMod | RecurrentMod;
+  private readonly mod: typeof witForward | typeof witDiffusion;
   private ports: [Port, Channel][] = [];
   private stages: [Stage, () => void][] = [];
   private readonly vocab: number;
@@ -647,13 +481,13 @@ export class ForwardPass {
   private programAttached = false;
   private adapterLowrankSites = 0;
   private adapterScaleSites = 0;
+  /** Keeps the bound working sets alive while the pass is bound. */
+  private lanes: WorkingSet[] = [];
   private foldAll: Channel | undefined;
 
   constructor(kind?: ForwardKind) {
     this.kind = kind ?? witModel.passKind();
-    if (this.kind === 'attention') this.mod = witAttention;
-    else if (this.kind === 'hybrid') this.mod = witHybrid;
-    else if (this.kind === 'recurrent') this.mod = witRecurrent;
+    if (this.kind === 'text') this.mod = witForward;
     else if (this.kind === 'diffusion') this.mod = witDiffusion;
     else throw new Error(`unknown forward kind ${String(this.kind)}`);
     this.wit = new this.mod.ForwardPass();
@@ -693,125 +527,78 @@ export class ForwardPass {
     wit('setMaxLayers', () => this.wit.setMaxLayers(maxLayers));
   }
 
+  /** These rows are a block drafter's proposal, not the sequence's own. */
   setDraftingBlock(on: boolean): void {
-    wit('setDraftingBlock', () => this.wit.setDraftingBlock(on));
+    this.requireKind(['text'], 'setDraftingBlock');
+    wit('setDraftingBlock', () => (this.wit as witForward.ForwardPass).setDraftingBlock(on));
   }
 
   /** Carry the payloads of `media.Image` / `media.Audio` spans, order-matched
    * to their placeholder token runs in the embed. */
   media(spans: (Image | Audio)[]): void {
-    if (this.kind === 'recurrent') throw new InferletError('a recurrent-only pass carries no media');
-    const wrapped: witAttention.MediaSpan[] = spans.map((s) => {
+    const wrapped: witForward.MediaSpan[] = spans.map((s) => {
       if (s instanceof Audio) return { tag: 'audio', val: s.handle };
       if (s instanceof Image) return { tag: 'image', val: s.handle };
       throw new TypeError('media span must be a media.Image or media.Audio');
     });
-    wit('media', () => (this.wit as witAttention.ForwardPass).media(wrapped));
+    wit('media', () => this.wit.media(wrapped));
   }
 
-  private stageKv(ws: WorkingSet, geom: KvGeometry): StagedKv {
+  /** Bind one working set per lane, in lane order; lanes sharing a set must state `slots`. */
+  state(lanes: WorkingSet[], geom: StateGeometry = {}): void {
     const rebind = this.programAttached;
-    if (!rebind) {
-      const ports = [Port.KV_LEN, Port.PAGES, Port.PAGE_INDPTR, Port.W_SLOT, Port.W_OFF, Port.POSITIONS];
-      if (geom.mask) ports.push(Port.ATTN_MASK);
-      this.ensurePortsAvailable(ports);
-    }
-    const staged: StagedKv = {
-      ws: ws.kv,
-      readable: pageDecl(geom.readablePages),
-      writable: pageDecl(geom.writablePages),
-      kvLen: geom.kvLen.wit(),
-      pages: geom.pages.wit(),
-      pageIndptr: geom.pageIndptr.wit(),
-      wSlot: geom.wSlot.wit(),
-      wOff: geom.wOff.wit(),
-      positions: geom.positions.wit(),
-      mask: geom.mask?.wit(),
-    };
-    if (!rebind) {
-      this.ports.push(
-        [Port.KV_LEN, geom.kvLen],
-        [Port.PAGES, geom.pages],
-        [Port.PAGE_INDPTR, geom.pageIndptr],
-        [Port.W_SLOT, geom.wSlot],
-        [Port.W_OFF, geom.wOff],
-        [Port.POSITIONS, geom.positions],
-      );
-      if (geom.mask) this.ports.push([Port.ATTN_MASK, geom.mask]);
-    }
-    return staged;
+    const fold = geom.fold === 'all' ? (this.foldAll ??= Channel.from([0xffff_ffff], Dtype.U32)) : geom.fold;
+    const stated: [Port, Channel | undefined][] = [
+      [Port.POSITIONS, geom.positions],
+      [Port.SLOTS, geom.slots],
+      [Port.KV_LEN, geom.kvLen],
+      [Port.ATTN_MASK, geom.mask],
+      [Port.FOLD, fold],
+    ];
+    if (!rebind) this.ensurePortsAvailable(stated.filter(([, ch]) => ch !== undefined).map(([port]) => port));
+    const g: witForward.StateGeometry = {};
+    if (geom.positions) g.positions = geom.positions.wit();
+    if (geom.slots) g.slots = geom.slots.wit();
+    if (geom.kvLen) g.kvLen = geom.kvLen.wit();
+    if (geom.mask) g.mask = geom.mask.wit();
+    if (fold) g.fold = fold.wit();
+    wit('state', () => this.wit.state(lanes.map((l) => l.ws), g));
+    this.lanes = [...lanes];
+    if (!rebind) for (const [port, ch] of stated) if (ch !== undefined) this.ports.push([port, ch]);
   }
 
-  private kvGeometryWit(s: StagedKv): witAttention.KvGeometry {
-    const g: witAttention.KvGeometry = {
-      readablePages: pageSpan(s.readable),
-      writablePages: pageSpan(s.writable),
-      kvLen: s.kvLen,
-      pages: s.pages,
-      pageIndptr: s.pageIndptr,
-      wSlot: s.wSlot,
-      wOff: s.wOff,
-      positions: s.positions,
-    };
-    if (s.mask) g.mask = s.mask;
-    return g;
-  }
-
-  private stageRs(workingSets: RsWorkingSet[], geom: RsGeometry) {
-    if (!workingSets.length) throw new InferletError('forward pass needs one recurrent-state working set per request');
-    const buffer = pageDecl(geom.buffer ?? [0, 0]);
-    let foldLen: witChannel.Channel;
-    if (geom.foldLen) {
-      if (!this.programAttached) {
-        this.ensurePortsAvailable([Port.RS_FOLD_LEN]);
-        this.ports.push([Port.RS_FOLD_LEN, geom.foldLen]);
-      }
-      foldLen = geom.foldLen.wit();
-    } else {
-      this.foldAll ??= Channel.from([0xffff_ffff], Dtype.U32);
-      foldLen = this.foldAll.wit();
-    }
-    return { workingSets: workingSets.map((r) => r.rs), foldLen, buffer };
+  /** Slots to keep a recurrent state at, so a later pass over these tokens resumes there. */
+  checkpoints(slots: ArrayLike<number>): void {
+    this.requireKind(['text'], 'checkpoints');
+    wit('checkpoints', () => (this.wit as witForward.ForwardPass).checkpoints(Uint32Array.from(slots)));
   }
 
   private requireKind(kinds: ForwardKind[], what: string): void {
     if (!kinds.includes(this.kind)) throw new InferletError(`${what} binds a ${kinds.join(' / ')} pass; this pass is ${this.kind}`);
   }
 
-  /** Bind the KV working set + geometry of an attention or diffusion pass
-   * (on a denoise pass the geometry is the canvas's). */
-  attention(ws: WorkingSet, geom: KvGeometry): void {
-    this.requireKind(['attention', 'diffusion'], 'attention');
-    const kv = this.stageKv(ws, geom);
-    wit('attention', () => (this.wit as witAttention.ForwardPass).attention(kv.ws, this.kvGeometryWit(kv)));
-  }
-
   /** Which of the family's declared readings (`model.readings()`) this pass
-   * runs — `"text"`, `"denoise"`, `"vae.decode"`, ... (imagegen design D1).
-   * Optional when the model declares at most one; before the program. */
+   * runs — `"text"`, `"denoise"`, `"vae.decode"`, ... Optional when the model
+   * declares at most one; before the program. */
   reading(name: string): void {
-    this.requireKind(['attention', 'diffusion'], 'reading');
-    wit('reading', () => (this.wit as witAttention.ForwardPass).reading(name));
+    wit('reading', () => this.wit.reading(name));
   }
 
   /** Bind `ch` to the reading's float port `port`, read at every submit from
    * its committed cell. The host validates the shape; the program must
    * declare the channel (a stage of the author's must touch it). */
   input(port: string, ch: Channel): void {
-    this.requireKind(['attention', 'diffusion'], 'input');
-    wit('input', () => (this.wit as witAttention.ForwardPass).input(port, ch.wit()));
+    wit('input', () => this.wit.input(port, ch.wit()));
   }
 
-  /** Which lane stream this pass's rows are (design D2). Default `'text'`. */
+  /** Which lane stream this pass's rows are. Default `'text'`. */
   stream(s: witModel.LaneStream): void {
-    this.requireKind(['attention', 'diffusion'], 'stream');
-    wit('stream', () => (this.wit as witAttention.ForwardPass).stream(s));
+    wit('stream', () => this.wit.stream(s));
   }
 
   /** Put this pass's lanes in attention group `id` within a frame. */
   group(id: number): void {
-    this.requireKind(['attention', 'diffusion'], 'group');
-    wit('group', () => (this.wit as witAttention.ForwardPass).group(id));
+    wit('group', () => this.wit.group(id));
   }
 
   /** Which reading this diffusion pass runs (`'encode'` or `'denoise'`).
@@ -827,38 +614,6 @@ export class ForwardPass {
   selfConditioning(rows: ArrayLike<number>, weights: ArrayLike<number>): void {
     this.requireKind(['diffusion'], 'selfConditioning');
     wit('selfConditioning', () => (this.wit as witDiffusion.ForwardPass).selfConditioning(Uint32Array.from(rows), Float32Array.from(weights)));
-  }
-
-  /** Bind a hybrid pass: the KV binding (`undefined` for a fire that touches
-   * no attention layer) plus the recurrent working set(s) and where their
-   * folded boundary lands. */
-  bindHybrid(kv: KvBinding | undefined, rs: RsWorkingSet[], rsGeom: RsGeometry): void {
-    this.requireKind(['hybrid'], 'bindHybrid');
-    const stagedKv = kv ? this.stageKv(kv.workingSet, kv.geometry) : undefined;
-    const stagedRs = this.stageRs(rs, rsGeom);
-    const binding = stagedKv ? { workingSet: stagedKv.ws, geometry: this.kvGeometryWit(stagedKv) } : undefined;
-    wit('bindHybrid', () =>
-      (this.wit as witHybrid.ForwardPass).attention(binding, stagedRs.workingSets, { foldLen: stagedRs.foldLen, buffer: pageSpan(stagedRs.buffer) }),
-    );
-  }
-
-  /** Bind a recurrent-only pass: the recurrent working set(s) and where
-   * their folded boundary lands. */
-  bindRecurrent(rs: RsWorkingSet[], geom: RsGeometry): void {
-    this.requireKind(['recurrent'], 'bindRecurrent');
-    const stagedRs = this.stageRs(rs, geom);
-    wit('bindRecurrent', () =>
-      (this.wit as witRecurrent.ForwardPass).attention(stagedRs.workingSets, { foldLen: stagedRs.foldLen, buffer: pageSpan(stagedRs.buffer) }),
-    );
-  }
-
-  /** Kind-independent binding for the common text program: the KV geometry,
-   * plus — on a hybrid model — the recurrent working set(s) (`ws.rs` unless
-   * given), folding every token straight into the recurrence. */
-  bindState(ws: WorkingSet, geom: KvGeometry, rs?: RsWorkingSet[]): void {
-    if (this.kind === 'attention' || this.kind === 'diffusion') this.attention(ws, geom);
-    else if (this.kind === 'hybrid') this.bindHybrid({ workingSet: ws, geometry: geom }, rs ?? ws.rs, { buffer: [0, 0] });
-    else throw new InferletError('bindState: a recurrent-only model has no KV geometry to bind');
   }
 
   /** Attach a PEFT adapter at `site` ("q"|"k"|"v"|"o"|"gate_up"|"down"). */
@@ -931,11 +686,9 @@ export class ForwardPass {
     return out;
   }
   onAttnProj(body: () => void): void {
-    if (this.kind === 'recurrent') throw new InferletError('a recurrent-only pass has no attention layer to tap');
     this.setStage(Stage.ON_ATTN_PROJ, body);
   }
   onAttn(body: () => void): void {
-    if (this.kind === 'recurrent') throw new InferletError('a recurrent-only pass has no attention layer to tap');
     this.setStage(Stage.ON_ATTN, body);
   }
 

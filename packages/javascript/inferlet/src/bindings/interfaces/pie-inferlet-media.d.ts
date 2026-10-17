@@ -69,7 +69,7 @@ export class Image {
   * THE SPAN, AS THE SEQUENCE CARRIES IT: prefix + placeholder run
   * (exactly `token-count` long) + suffix, in the bound model's own ids.
   * 
-  * This is the one ledger (media-door.md §0). A span enters the context
+  * This is the one ledger. A span enters the context
   * as `toks.extend(img.tokens())` and as nothing else — no anchor list,
   * no guest-side splicing of `prefix-tokens` around a run the guest
   * built itself, no second bookkeeping structure beside the tokens. The
@@ -113,11 +113,8 @@ export class Image {
   * Qwen `<|vision_start|>` / `<|vision_end|>`); empty for models that
   * need none.
   * 
-  * INTROSPECTION, NOT A STEP (media-door.md §1). These were the guest's
-  * splicing instructions back when the guest assembled the run; they
-  * stay because a caller inspecting what a span will cost is a real
-  * question, and because a WIT verb is cheap to keep and expensive to
-  * re-add. Nothing on the happy path calls them.
+  * Introspection, not a step: what a span will cost. Nothing on the
+  * happy path calls them.
   */
   prefixTokens(): Uint32Array;
   suffixTokens(): Uint32Array;

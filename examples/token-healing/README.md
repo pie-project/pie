@@ -11,8 +11,7 @@ No paper. Reference implementations:
 [llguidance](https://github.com/guidance-ai/llguidance) backend, and llama.cpp's
 `--token-healing`.
 
-**Faithfulness: Exact.** See
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+**Faithfulness: Exact.**
 
 ## What it does
 

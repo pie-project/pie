@@ -35,7 +35,7 @@
 mod png;
 
 use inferlet::chat;
-use inferlet::eta::hybrid::prelude::*;
+use inferlet::eta::prelude::*;
 use inferlet::media;
 use serde::{Deserialize, Serialize};
 
@@ -140,21 +140,6 @@ fn sample_token() -> Tensor {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    // One recurrent working set for the whole generation on a hybrid model
-    // (the engine requires one per request row); none on a pure-attention one.
-    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
-        model::ForwardKind::Attention => Vec::new(),
-        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
-        model::ForwardKind::Recurrent => {
-            return Err(
-                "this program has no recurrent-only path (no registered model reports that kind)"
-                    .into(),
-            );
-        }
-        model::ForwardKind::Diffusion => {
-            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
-        }
-    };
     let rgb = if input.image_b64.is_some() {
         [0, 0, 0]
     } else {
@@ -220,20 +205,11 @@ async fn main(input: Input) -> Result<Output> {
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
 
-    let page_t = kv_page_size();
-    let pool_pages = (n + max_tokens as u32 + 2).div_ceil(page_t);
     let ws = WorkingSet::new();
-    let slots = ws.reserve(pool_pages).context("ws.reserve")?;
-    let pool_ids = slots.ids().to_vec();
     let pipe = Pipeline::new();
 
-    // ───────────────────── 1. THE MEDIA PREFILL (ONE FIRE) ──────────────────
+    // ───────────────────────── 1. THE MEDIA PREFILL ─────────────────────────
     //
-    // **ONE FIRE AND NOT A CHUNKED ONE**, which is a real constraint and not a
-    // simplification: the host scans each fire's own token list for maximal
-    // placeholder runs, so a prefill split across two fires would hand it half
-    // a run twice — `MediaRunLength` on one and `MediaOrphanRuns` on the other.
-    // A span's run and its payload arrive together or the door refuses them.
     // **THE RUN WHOLE IN ONE FIRE, THE TEXT AROUND IT IN ITS OWN.** The host
     // scans each fire's own tokens for the run, so a run cut across fires is
     // refused; the text before and after is prefilled separately. Keeping the
@@ -268,15 +244,6 @@ async fn main(input: Input) -> Result<Output> {
             .map(|(_, image)| image.token_count() - image.position_span())
             .sum();
         let positions_p = Channel::from_iter((base..end).map(|row| row - lag)).named("positions_p");
-        let w_slot_pv: Vec<u32> = (base..end)
-            .map(|c| pool_ids[(c / page_t) as usize])
-            .collect();
-        let w_off_pv: Vec<u32> = (base..end).map(|c| c % page_t).collect();
-        let w_slot_p = Channel::from(w_slot_pv).named("w_slot_p");
-        let w_off_p = Channel::from(w_off_pv).named("w_off_p");
-        let klen_p = Channel::from([end]).named("klen_p");
-        let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
-        let page_indptr_p = Channel::from([0u32, end.div_ceil(page_t)]).named("pidx_p");
         let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
         let fwd_p = ForwardPass::new();
@@ -287,25 +254,11 @@ async fn main(input: Input) -> Result<Output> {
             // correspondence by ordering alone and can state nothing else.
             fwd_p.media(&[media::Span::Image(&images[at])])?;
         }
-        fwd_p.attention(
-            Some(KvBinding {
-                working_set: &ws,
-                geometry: KvGeometry {
-                    readable_pages: ..,
-                    writable_pages: ..,
-                    kv_len: &klen_p,
-                    pages: &pages_p,
-                    page_indptr: &page_indptr_p,
-                    w_slot: &w_slot_p,
-                    w_off: &w_off_p,
-                    positions: &positions_p,
-                    mask: None,
-                },
-            }),
-            &rs_ws,
-            RsGeometry {
-                fold_len: None,
-                buffer: 0..0,
+        fwd_p.state(
+            &[&ws],
+            StateGeometry {
+                positions: Some(&positions_p),
+                ..StateGeometry::folding()
             },
         )?;
         fwd_p.epilogue(move || {
@@ -335,16 +288,18 @@ async fn main(input: Input) -> Result<Output> {
     // fire that re-attached it would be a second submission of one picture.
     // Its tokens are sampled ids, so the run scan finds nothing in them —
     // which is exactly the right answer for a fire that attached nothing.
-    let slot_n = pool_ids[(n / page_t) as usize];
+    let budget = if done {
+        0
+    } else {
+        max_tokens.saturating_sub(1)
+    };
+    // The device computes the rotation and so the slots: reserve the decode's up front.
+    ws.reserve(n + budget as u32)?;
     let tok_in = Channel::from([g0]).named("tok_in");
+    let slot = Channel::from([n]).named("slot");
+    let kv_len = Channel::from([n + 1]).named("kv_len");
     let pos = Channel::from([n - rope_delta]).named("pos");
-    let fill_ch = Channel::from([n + 1]).named("fill");
-    let klen = Channel::from([n + 1]).named("klen");
-    let w_slot = Channel::from([slot_n]).named("w_slot");
-    let w_off = Channel::from([n % page_t]).named("w_off");
-    let pages = Channel::from(pool_ids.clone()).named("pages");
-    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_t)]).named("page_indptr");
-    let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
+    let fold = Channel::from([1u32]).named("fold");
     let out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
         .named("out");
@@ -352,58 +307,28 @@ async fn main(input: Input) -> Result<Output> {
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
-    fwd.attention(
-        Some(KvBinding {
-            working_set: &ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: (n / page_t)..,
-                kv_len: &klen,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &pos,
-                mask: None,
-            },
-        }),
-        &rs_ws,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
+    // The token's rotation runs `rope_delta` behind its slot.
+    fwd.state(
+        &[&ws],
+        StateGeometry {
+            slots: Some(&slot),
+            kv_len: Some(&kv_len),
+            positions: Some(&pos),
+            fold: Fold::Count(&fold),
+            ..StateGeometry::default()
         },
     )?;
     fwd.epilogue(move || {
-        let base = fill_ch.take();
-        let pids = pool_ids_ch.take();
+        let at = pos.take();
+        let next = &slot.take() + 1u32;
         let tok = sample_token();
-
-        let logical_slot = &base / page_t;
-        let w_slot_v = gather(&pids, &logical_slot);
-        let w_off_v = &base % page_t;
-        let klen_v = &base + 1u32;
-        let next_free = &base + 1u32;
-        let pages_v = reshape(&pids, [pool_pages]);
-        let page_count = klen_v.div_ceil(page_t);
-        let pidx_v = indptr(1, &page_count);
-
         tok_in.put(&tok);
         out.put(&tok);
-        w_slot.put(&w_slot_v);
-        w_off.put(&w_off_v);
-        klen.put(&klen_v);
-        pos.put(&(&base - rope_delta));
-        fill_ch.put(&next_free);
-        pages.put(&pages_v);
-        page_indptr.put(&pidx_v);
-        pool_ids_ch.put(&pids);
+        slot.put(&next);
+        kv_len.put(&(&next + 1u32));
+        pos.put(&(&at + 1u32));
     });
 
-    let budget = if done {
-        0
-    } else {
-        max_tokens.saturating_sub(1)
-    };
     run_ahead(&pipe, &fwd, budget, async || {
         let t = out.take_host::<Vec<i32>>().await?;
         let token = *t.first().unwrap_or(&0) as u32;

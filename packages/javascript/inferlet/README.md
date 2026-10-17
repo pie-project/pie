@@ -10,14 +10,14 @@ const { ForwardPass, Pipeline, WorkingSet, intrinsics, reduceArgmax } = eta;
 export function main(input) {
   const tokens = [...chat.prefix(), ...model.encode(input.prompt ?? 'The capital of France is')];
   const maxTokens = Number(input.max_tokens ?? 8);
-  const ws = new WorkingSet({ tokens: tokens.length + maxTokens }); // KV pages (and recurrent state on a hybrid model)
+  const ws = new WorkingSet(); // the sequence's state, whatever the model keeps
   const pipe = new Pipeline();
 
-  let done = 0; // tokens already in the KV cache
+  let done = 0; // tokens already in the working set
   for (let i = 0; i < maxTokens; i++) {
-    const fwd = new ForwardPass();                       // the model's pass kind
+    const fwd = new ForwardPass();
     fwd.embed(tokens.slice(done));                       // the new tokens
-    fwd.bindState(ws, ws.geometry(done, tokens.length));
+    fwd.state([ws], { fold: 'all' });                    // appended, and final
     const out = fwd.epilogue(() => reduceArgmax(intrinsics.logits())); // traced once, runs on the device
     pipe.submit(fwd);
     done = tokens.length;
@@ -30,21 +30,21 @@ export function main(input) {
 ```
 
 That is `examples/quickstart-js`. Every line above stands for device state:
-`embed(array)` seeds the token and row channels, `ws.geometry(start, end)`
-derives the six KV-geometry channels of one contiguous span (edit its fields
-for anything else), and an `epilogue` that returns a tensor publishes it on a
-channel the host reads. The explicit spellings — `Channel.from(...,
-dtype.u32)`, a `{ kvLen, pages, ... }` geometry, `ch.put(tensor)` inside the
-stage — are the same objects and stay available; `examples/text-completion-js`
-uses them for chunked prefill and a device loop-carried decode.
+`embed(array)` seeds the token and row channels, `state([ws], ...)` says where
+the rows land (by default after what the working set holds) and what freezes,
+and an `epilogue` that returns a tensor publishes it on a channel the host
+reads. The explicit spellings — `Channel.from(..., dtype.u32)`,
+`{ slots, fold }` geometry channels, `ch.put(tensor)` inside the stage — are
+the same objects and stay available; `examples/text-completion-js` uses them
+for a one-pass prefill and a device loop-carried decode.
 
 ## What is here
 
 `eta` is the ETA authoring surface (a port of the Rust `eta-dsl`/`eta-ir`
 crates and `inferlet::eta`): `Tensor` with `.add/.sub/.mul/.div/.rem/.neg/
 .divCeil`, the op set (`reduceArgmax`, `gumbelMax`, `nucleusSample`,
-`softmax`, `topK`, …), `Channel`, `WorkingSet`, `RsWorkingSet`,
-`ForwardPass`, `Pipeline` (`submit`, `runAhead`), `prefillChunks`, and `eta.diffusion`
+`softmax`, `topK`, …), `Channel`, `WorkingSet`, `StateGeometry`,
+`ForwardPass`, `Pipeline` (`submit`, `runAhead`), `readoutSpans`, and `eta.diffusion`
 (the diffusion pass's `Mode` plus `entropyBoundAccept` / `stableAndConfident` /
 `linearTemperature`). The container bytes
 it emits are **byte-identical** to the Rust `inferlet` crate's for the same program

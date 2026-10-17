@@ -196,7 +196,7 @@ impl Registry {
             };
             if matches!(
                 binding.port,
-                Port::EmbedTokens | Port::Positions | Port::WSlot | Port::WOff
+                Port::EmbedTokens | Port::Positions | Port::Slots
             ) {
                 accesses[*channel as usize].0 = true;
             }

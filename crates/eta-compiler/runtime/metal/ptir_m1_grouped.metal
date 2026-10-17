@@ -4,8 +4,6 @@ struct M3LaneRecord {
   ulong logits_base;
   uint logits_row_offset;
   uint logits_row_count;
-  uint kv_len;
-  uint page_count;
   uint row_count;
   uint token_count;
   uint sampled_rows;

@@ -9,9 +9,7 @@ Wiseman and Rush, ***Sequence-to-Sequence Learning as Beam-Search Optimization**
 (EMNLP) — <https://arxiv.org/abs/1606.02960>. Implements the standard
 left-to-right beam-search recurrence used by neural sequence decoders.
 
-**Faithfulness: Exact for fixed-width cumulative-logprob beam search.** The
-inferlet's width-1 identity check is documented in
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+**Faithfulness: Exact for fixed-width cumulative-logprob beam search.**
 
 ## What it does
 
@@ -53,10 +51,13 @@ Qwen BOS token.
 
 ## Implementation notes
 
-The KV cache is a shared fixed pool. Forking is logical: each survivor inherits
-its parent's boolean attention mask, appends one new pool cell, and updates a
-parent pointer emitted by the epilogue. Dead cells are not compacted, so
-`max_tokens` is bounded by the fixed pool capacity.
+The beams share one working set, a pool repeated for every lane and reserved
+for the whole search (BOS plus one slot per beam per step). Forking is logical:
+each survivor inherits its parent's boolean attention mask, appends one new pool
+slot chosen on the device, and updates a parent pointer emitted by the epilogue.
+Dead cells are masked, not compacted. On a model with recurrent layers the same
+program runs: each beam's recurrent layers replay the slots its mask admits, its
+ancestry, before its own token.
 
 The suite includes the beam identity as a real check. With `beams = 1`,
 `beam-search` produced **0 mismatches** against greedy decoding over 16 steps.

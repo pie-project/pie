@@ -103,6 +103,10 @@ pub(crate) fn notify_execution_slot_consumed(pid: ProcessId) {
     broadcast(|| SchedulerItem::ExecutionSlotConsumed(pid));
 }
 
+pub(crate) fn notify_schedule_changed() {
+    broadcast(|| SchedulerItem::Nudge);
+}
+
 pub(crate) fn notify_admission_queued(pid: ProcessId) {
     broadcast(|| SchedulerItem::AdmissionQueued(pid));
 }
@@ -218,55 +222,23 @@ fn has_wire_masks(request: &crate::engine::FireRequest) -> bool {
 
 #[allow(
     clippy::large_enum_variant,
-    reason = "measured: the enum is 1408 bytes and `Launch { pending: PendingRequest }` \
-              IS those 1408 (next largest is `RegisterProgram` at 232). But `Launch` \
-              is the hot variant — one per forward step — and every other variant is \
-              a rare control. Boxing it would put an allocation on the launch path to \
-              shrink messages that are sent orders of magnitude less often, which is \
-              backwards. The cold-variant case is handled the other way: see \
-              `LaneRequest::Control`, which IS boxed"
+    reason = "`Launch` is the hot variant: boxing it would allocate per step"
 )]
 enum SchedulerItem {
     Launch {
         pending: PendingRequest,
     },
-    RegisterProgram {
-        plan: ProgramRegistration,
-        response: tokio::sync::oneshot::Sender<Result<u64>>,
-    },
-    RegisterChannel {
-        plan: ChannelRegistration,
-        response: tokio::sync::oneshot::Sender<Result<RegisteredChannel>>,
-    },
-    RegisterChannels {
-        plans: Vec<ChannelRegistration>,
-        response: tokio::sync::oneshot::Sender<Result<Vec<RegisteredChannel>>>,
-    },
-    BindInstance {
-        pipeline_id: Option<ProcessId>,
-        plan: InstanceBindingPlan,
-        response: tokio::sync::oneshot::Sender<Result<BoundInstance>>,
-    },
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
         plans: Vec<ChannelRegistration>,
-        program: Option<ProgramRegistration>,
+        program: Option<Box<ProgramRegistration>>,
         bind: InstanceBindingPlan,
         response:
             tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
     },
-    CopyKv {
-        plan: ::engine::KvCopy,
-        response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
-    },
     CopyTracked {
         plan: PreLaunchCopy,
         completion: ControlCompletion,
-    },
-    #[allow(dead_code)]
-    CopyState {
-        plan: StateCopy,
-        response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     CloseInstance {
         id: u64,
@@ -391,15 +363,12 @@ impl PreLaunchCopy {
     }
 }
 
-pub(super) enum BindRespond {
-    Bind(tokio::sync::oneshot::Sender<Result<BoundInstance>>),
-    ChannelsBind {
-        registered: Vec<RegisteredChannel>,
-        program_id: u64,
-        program_registered: bool,
-        response:
-            tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
-    },
+pub(super) struct BindRespond {
+    pub(super) registered: Vec<RegisteredChannel>,
+    pub(super) program_id: u64,
+    pub(super) program_registered: bool,
+    pub(super) response:
+        tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
 }
 
 pub(super) enum QueuedItem {
@@ -410,42 +379,17 @@ pub(super) enum QueuedItem {
         process_id: Option<ProcessId>,
         pipeline_id: Option<ProcessId>,
     },
-    RegisterProgram {
-        plan: ProgramRegistration,
-        response: tokio::sync::oneshot::Sender<Result<u64>>,
-    },
-    RegisterChannel {
-        plan: ChannelRegistration,
-        response: tokio::sync::oneshot::Sender<Result<RegisteredChannel>>,
-    },
-    RegisterChannels {
-        plans: Vec<ChannelRegistration>,
-        response: tokio::sync::oneshot::Sender<Result<Vec<RegisteredChannel>>>,
-    },
-    BindInstance {
-        pipeline_id: Option<ProcessId>,
-        plan: InstanceBindingPlan,
-        response: tokio::sync::oneshot::Sender<Result<BoundInstance>>,
-    },
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
         plans: Vec<ChannelRegistration>,
-        program: Option<ProgramRegistration>,
+        program: Option<Box<ProgramRegistration>>,
         bind: InstanceBindingPlan,
         response:
             tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
     },
-    CopyKv {
-        plan: ::engine::KvCopy,
-        response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
-    },
     CopyTracked {
         plan: PreLaunchCopy,
         completion: ControlCompletion,
-    },
-    CopyState {
-        plan: StateCopy,
-        response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     CloseInstance {
         id: u64,
@@ -861,54 +805,6 @@ impl SchedulerHandle {
     pub(crate) fn nudge(&self) -> Result<()> {
         self.send(SchedulerItem::Nudge)
     }
-    pub async fn register_program(&self, plan: ProgramRegistration) -> Result<u64> {
-        let program_hash = plan.program_hash;
-        {
-            let program_ids = self.inner.program_ids.lock().unwrap();
-            if let Some((program_id, launch)) = program_ids.get(&program_hash) {
-                if launch != &plan.launch {
-                    return Err(anyhow!("program hash collision for 0x{program_hash:016x}"));
-                }
-                return Ok(*program_id);
-            }
-        }
-        let launch = plan.launch.clone();
-        let program_id = self
-            .request(|response| SchedulerItem::RegisterProgram { plan, response })
-            .await??;
-        self.inner
-            .program_ids
-            .lock()
-            .unwrap()
-            .insert(program_hash, (program_id, launch));
-        Ok(program_id)
-    }
-
-    pub async fn register_channel(&self, plan: ChannelRegistration) -> Result<RegisteredChannel> {
-        self.request(|response| SchedulerItem::RegisterChannel { plan, response })
-            .await?
-    }
-
-    pub async fn register_channels(
-        &self,
-        plans: Vec<ChannelRegistration>,
-    ) -> Result<Vec<RegisteredChannel>> {
-        self.request(|response| SchedulerItem::RegisterChannels { plans, response })
-            .await?
-    }
-
-    pub async fn bind_instance(
-        &self,
-        pipeline_id: Option<ProcessId>,
-        plan: InstanceBindingPlan,
-    ) -> Result<BoundInstance> {
-        self.request(|response| SchedulerItem::BindInstance {
-            pipeline_id,
-            plan,
-            response,
-        })
-        .await?
-    }
 
     pub async fn register_channels_bind(
         &self,
@@ -935,7 +831,7 @@ impl SchedulerHandle {
                 bind.binding.program = program_id;
                 (None, None)
             }
-            None => (Some(program.clone()), Some(program.launch)),
+            None => (Some(Box::new(program.clone())), Some(program.launch)),
         };
         let (registered, program_id, bound) = self
             .request(|response| SchedulerItem::RegisterChannelsBind {
@@ -956,11 +852,6 @@ impl SchedulerHandle {
         Ok((registered, bound))
     }
 
-    pub async fn copy_kv(&self, plan: ::engine::KvCopy) -> Result<SubmissionCompletion> {
-        self.request(|response| SchedulerItem::CopyKv { plan, response })
-            .await?
-    }
-
     pub(crate) fn copy_tracked(&self, plan: PreLaunchCopy) -> Result<ControlCompletion> {
         let completion = ControlCompletion::new();
         self.send(SchedulerItem::CopyTracked {
@@ -977,12 +868,6 @@ impl SchedulerHandle {
         )
         .await
         .map_err(|_| anyhow!("scheduler did not answer the debug dump"))?
-    }
-
-    #[allow(dead_code)]
-    pub async fn copy_state(&self, plan: StateCopy) -> Result<SubmissionCompletion> {
-        self.request(|response| SchedulerItem::CopyState { plan, response })
-            .await?
     }
 
     pub fn close_instance(&self, id: u64, pacing_wait_id: u64) -> Result<()> {
@@ -1435,16 +1320,8 @@ impl BatchScheduler {
                 QueuedItem::PreLaunchCopy {
                     plan, pipeline_id, ..
                 } => format!("PreLaunchCopy({}) pipeline {pipeline_id:?}", plan.label()),
-                QueuedItem::RegisterProgram { .. } => "RegisterProgram".to_string(),
-                QueuedItem::RegisterChannel { .. } => "RegisterChannel".to_string(),
-                QueuedItem::RegisterChannels { plans, .. } => {
-                    format!("RegisterChannels({})", plans.len())
-                }
-                QueuedItem::BindInstance { .. } => "BindInstance".to_string(),
                 QueuedItem::RegisterChannelsBind { .. } => "RegisterChannelsBind".to_string(),
-                QueuedItem::CopyKv { .. } => "CopyKv".to_string(),
                 QueuedItem::CopyTracked { plan, .. } => format!("CopyTracked({})", plan.label()),
-                QueuedItem::CopyState { .. } => "CopyState".to_string(),
                 QueuedItem::CloseInstance { id, .. } => format!("CloseInstance {id}"),
                 QueuedItem::CloseChannels { ids } => format!("CloseChannels x{}", ids.len()),
             };
@@ -1649,37 +1526,6 @@ impl BatchScheduler {
             SchedulerItem::LanePark { lane, seq } => {
                 frame_policy.on_lane_park(lane, seq);
             }
-            SchedulerItem::RegisterProgram { plan, response } => {
-                pending.push_back(QueuedItem::RegisterProgram { plan, response });
-            }
-            SchedulerItem::RegisterChannel { plan, response } => {
-                pending.push_back(QueuedItem::RegisterChannel { plan, response });
-            }
-            SchedulerItem::RegisterChannels { plans, response } => {
-                pending.push_back(QueuedItem::RegisterChannels { plans, response });
-            }
-            SchedulerItem::BindInstance {
-                pipeline_id,
-                plan,
-                response,
-            } => {
-                if pipeline_id.is_some_and(|pid| terminated_processes.contains(&pid)) {
-                    Lane::release_wait_slots([plan.pacing_wait_id]);
-                    let _ = response.send(Err(anyhow!(
-                        "process departed before instance bind admission"
-                    )));
-                    return;
-                }
-                frame_policy.on_bind_enqueued(pipeline_id);
-                Self::queue_bind_control(
-                    pending,
-                    QueuedItem::BindInstance {
-                        pipeline_id,
-                        plan,
-                        response,
-                    },
-                );
-            }
             SchedulerItem::RegisterChannelsBind {
                 pipeline_id,
                 plans,
@@ -1695,25 +1541,16 @@ impl BatchScheduler {
                     return;
                 }
                 frame_policy.on_bind_enqueued(pipeline_id);
-                Self::queue_bind_control(
-                    pending,
-                    QueuedItem::RegisterChannelsBind {
-                        pipeline_id,
-                        plans,
-                        program,
-                        bind,
-                        response,
-                    },
-                );
-            }
-            SchedulerItem::CopyKv { plan, response } => {
-                pending.push_back(QueuedItem::CopyKv { plan, response });
+                pending.insert_before_closes(QueuedItem::RegisterChannelsBind {
+                    pipeline_id,
+                    plans,
+                    program,
+                    bind,
+                    response,
+                });
             }
             SchedulerItem::CopyTracked { plan, completion } => {
                 pending.push_back(QueuedItem::CopyTracked { plan, completion });
-            }
-            SchedulerItem::CopyState { plan, response } => {
-                pending.push_back(QueuedItem::CopyState { plan, response });
             }
             SchedulerItem::CloseInstance { id, pacing_wait_id } => {
                 pending.push_back(QueuedItem::CloseInstance { id, pacing_wait_id });
@@ -1811,12 +1648,7 @@ impl BatchScheduler {
     }
 
     const fn standalone_copy(item: &QueuedItem) -> bool {
-        matches!(
-            item,
-            QueuedItem::CopyKv { .. }
-                | QueuedItem::CopyTracked { .. }
-                | QueuedItem::CopyState { .. }
-        )
+        matches!(item, QueuedItem::CopyTracked { .. })
     }
 
     const fn rotation_target(item: &QueuedItem) -> bool {
@@ -1833,10 +1665,6 @@ impl BatchScheduler {
             || matches!(
                 item,
                 QueuedItem::PreLaunchCopy { .. }
-                    | QueuedItem::RegisterProgram { .. }
-                    | QueuedItem::RegisterChannel { .. }
-                    | QueuedItem::RegisterChannels { .. }
-                    | QueuedItem::BindInstance { .. }
                     | QueuedItem::RegisterChannelsBind { .. }
                     | QueuedItem::CloseChannels { .. }
             )
@@ -1845,11 +1673,7 @@ impl BatchScheduler {
     const fn lifecycle_control(item: &QueuedItem) -> bool {
         matches!(
             item,
-            QueuedItem::RegisterProgram { .. }
-                | QueuedItem::RegisterChannel { .. }
-                | QueuedItem::RegisterChannels { .. }
-                | QueuedItem::BindInstance { .. }
-                | QueuedItem::RegisterChannelsBind { .. }
+            QueuedItem::RegisterChannelsBind { .. }
                 | QueuedItem::CloseInstance { .. }
                 | QueuedItem::CloseChannels { .. }
         )
@@ -1864,10 +1688,6 @@ impl BatchScheduler {
         } else {
             pending.push_back(QueuedItem::CloseChannels { ids: vec![id] });
         }
-    }
-
-    fn queue_bind_control(pending: &mut PendingQueue, item: QueuedItem) {
-        pending.insert_before_closes(item);
     }
 
     fn rotate_launch_for_wave_work(
@@ -2077,17 +1897,6 @@ impl BatchScheduler {
                     holds_launches,
                 });
             }
-            QueuedItem::CopyKv { .. } => {
-                in_flight_control.push(PendingControl {
-                    state: ControlSlotState::Posted { id },
-                    logical_completion: None,
-                    process_id: None,
-                    pipeline_id: None,
-                    tracked_completion: None,
-                    operation: "KV copy",
-                    holds_launches,
-                });
-            }
             QueuedItem::CopyTracked { completion, .. } => {
                 in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { id },
@@ -2096,17 +1905,6 @@ impl BatchScheduler {
                     pipeline_id: None,
                     tracked_completion: Some(completion.clone()),
                     operation: "tracked KV copy",
-                    holds_launches,
-                });
-            }
-            QueuedItem::CopyState { .. } => {
-                in_flight_control.push(PendingControl {
-                    state: ControlSlotState::Posted { id },
-                    logical_completion: None,
-                    process_id: None,
-                    pipeline_id: None,
-                    tracked_completion: None,
-                    operation: "state copy",
                     holds_launches,
                 });
             }
@@ -2131,9 +1929,14 @@ impl BatchScheduler {
                     if stopping {
                         scan.drain_eligible.push(launch.fire_id);
                     }
+                    // A launch never overtakes a copy its pipeline queued
+                    // ahead of it: the copy fills what the launch reads.
+                    let behind_copy = launch
+                        .pipeline_id
+                        .is_some_and(|pipeline| scan.blocked_lanes.contains(&pipeline));
                     if launch.framed {
                         scan.queued_ids.push(launch.fire_id);
-                    } else if scan.untracked.is_none() {
+                    } else if scan.untracked.is_none() && !behind_copy {
                         scan.untracked = Some(launch.fire_id);
                     }
                 }
@@ -2258,7 +2061,11 @@ impl BatchScheduler {
                         for (pid, doom) in doomed {
                             let reason = doom.to_string();
                             tracing::error!(pid = %pid, "scheduler: terminating pipeline: {reason}");
-                            crate::inferlet::process::terminate(pid, Err(reason));
+                            crate::inferlet::process::terminate_by(
+                                pid,
+                                Err(reason),
+                                crate::policy::By::Host,
+                            );
                         }
                         continue;
                     }
@@ -2612,7 +2419,13 @@ impl BatchScheduler {
             LaneCommit::BindInstance {
                 pipeline_id,
                 bound,
-                respond,
+                respond:
+                    BindRespond {
+                        registered,
+                        program_id,
+                        program_registered,
+                        response,
+                    },
             } => {
                 frame_policy.on_bind_completed(pipeline_id);
                 if instances.contains_key(&bound.instance_id) {
@@ -2621,91 +2434,53 @@ impl BatchScheduler {
                         "bind committed an already-bound instance id"
                     );
                     let error = anyhow!("instance {} is already bound", bound.instance_id);
-                    match respond {
-                        BindRespond::Bind(response) => {
-                            let _ = response.send(Err(error));
-                        }
-                        BindRespond::ChannelsBind { response, .. } => {
-                            let _ = response.send(Err(error));
-                        }
-                    }
+                    let _ = response.send(Err(error));
                     return;
                 }
                 let instance_id = bound.instance_id;
                 instances.insert(instance_id, TrackedInstance::from_bound(&bound));
-                match respond {
-                    BindRespond::Bind(response) => {
-                        if let Err(Ok(bound)) = response.send(Ok(bound)) {
-                            tracing::warn!(
-                                operation = "bind_instance",
-                                instance_id = bound.instance_id,
-                                "scheduler cancellation rollback enqueued bound instance"
-                            );
-                            if rollback_tx
-                                .send(SchedulerItem::CloseInstance {
-                                    id: bound.instance_id,
-                                    pacing_wait_id: bound.pacing_wait_id,
-                                })
-                                .is_err()
-                            {
-                                tracing::error!(
-                                    operation = "bind_instance",
-                                    instance_id = bound.instance_id,
-                                    "scheduler cancellation rollback enqueue failed"
-                                );
-                            }
-                        }
+                if let Err(Ok((registered, _, bound))) =
+                    response.send(Ok((registered, program_id, bound)))
+                {
+                    tracing::warn!(
+                        operation = "register_channels_bind",
+                        instance_id = bound.instance_id,
+                        channel_count = registered.len(),
+                        "scheduler cancellation rollback enqueued bound instance and channels"
+                    );
+                    if program_registered {
+                        tracing::warn!(
+                            operation = "register_channels_bind",
+                            program_id,
+                            "scheduler RPC cancelled after program registration; retaining engine-lifetime program"
+                        );
                     }
-                    BindRespond::ChannelsBind {
-                        registered,
-                        program_id,
-                        program_registered,
-                        response,
-                    } => {
-                        if let Err(Ok((registered, _, bound))) =
-                            response.send(Ok((registered, program_id, bound)))
+                    Lane::release_registered_channel_wait_slots(&registered);
+                    let instance_id = bound.instance_id;
+                    if rollback_tx
+                        .send(SchedulerItem::CloseInstance {
+                            id: instance_id,
+                            pacing_wait_id: bound.pacing_wait_id,
+                        })
+                        .is_err()
+                    {
+                        tracing::error!(
+                            operation = "register_channels_bind",
+                            instance_id,
+                            "scheduler cancellation rollback close_instance enqueue failed"
+                        );
+                    }
+                    for channel in registered {
+                        let channel_id = channel.binding.channel_id;
+                        if rollback_tx
+                            .send(SchedulerItem::CloseChannel { id: channel_id })
+                            .is_err()
                         {
-                            tracing::warn!(
+                            tracing::error!(
                                 operation = "register_channels_bind",
-                                instance_id = bound.instance_id,
-                                channel_count = registered.len(),
-                                "scheduler cancellation rollback enqueued bound instance and channels"
+                                channel_id,
+                                "scheduler cancellation rollback close_channel enqueue failed"
                             );
-                            if program_registered {
-                                tracing::warn!(
-                                    operation = "register_channels_bind",
-                                    program_id,
-                                    "scheduler RPC cancelled after program registration; retaining engine-lifetime program"
-                                );
-                            }
-                            Lane::release_registered_channel_wait_slots(&registered);
-                            let instance_id = bound.instance_id;
-                            if rollback_tx
-                                .send(SchedulerItem::CloseInstance {
-                                    id: instance_id,
-                                    pacing_wait_id: bound.pacing_wait_id,
-                                })
-                                .is_err()
-                            {
-                                tracing::error!(
-                                    operation = "register_channels_bind",
-                                    instance_id,
-                                    "scheduler cancellation rollback close_instance enqueue failed"
-                                );
-                            }
-                            for channel in registered {
-                                let channel_id = channel.binding.channel_id;
-                                if rollback_tx
-                                    .send(SchedulerItem::CloseChannel { id: channel_id })
-                                    .is_err()
-                                {
-                                    tracing::error!(
-                                        operation = "register_channels_bind",
-                                        channel_id,
-                                        "scheduler cancellation rollback close_channel enqueue failed"
-                                    );
-                                }
-                            }
                         }
                     }
                 }
@@ -2822,6 +2597,35 @@ mod tests {
     fn worker_every_case() {
         a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight();
         a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
+        a_launch_waits_for_the_copy_queued_ahead_of_it();
+    }
+
+    fn a_launch_waits_for_the_copy_queued_ahead_of_it() {
+        let pipeline = ProcessId::from_u128(5);
+        let request = PendingRequest {
+            hook_program: false,
+            lora_program: false,
+            logical_fire_id: 9,
+            request: crate::engine::FireRequest::default(),
+            instance_id: 1,
+            completion: crate::engine::WorkItemCompletion::new(1, 0),
+            process_id: None,
+            pipeline_id: Some(pipeline),
+            prelaunch_copy: None,
+            prelaunch_state_copy: Some(StateCopy::default()),
+            frame: None,
+        };
+        let mut pending = PendingQueue::default();
+        BatchScheduler::queue_attempt(&mut pending, request);
+        let mut cache = ScanCache::default();
+        let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
+        assert_eq!(scan.untracked, None, "behind its copy");
+        // The copy is dispatched: the launch rides.
+        let copy = pending.pop_front();
+        assert!(matches!(copy, Some(QueuedItem::PreLaunchCopy { .. })));
+        let mut cache = ScanCache::default();
+        let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
+        assert_eq!(scan.untracked, Some(9));
     }
 
     fn a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight() {

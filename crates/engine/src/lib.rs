@@ -18,7 +18,9 @@ pub mod fire;
 pub mod fit;
 pub mod frame;
 pub mod load;
+pub mod ports;
 pub mod program;
+pub mod rs;
 pub mod runahead;
 pub mod transfer;
 
@@ -27,7 +29,7 @@ pub use caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
 pub use channel::{
     ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel, Ticket,
 };
-pub use engine::{CompletionSink, Engine, StepDone, StepOutcome};
+pub use engine::{CompletionSink, Engine, KvWrites, StepDone, StepOutcome};
 pub use error::{Error, Result};
 pub use fire::{
     Attachment, Boundary, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket,

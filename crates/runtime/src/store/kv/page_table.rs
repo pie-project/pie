@@ -1,14 +1,11 @@
-#![allow(dead_code)]
-
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustc_hash::FxHashSet;
 use smallvec::{SmallVec, smallvec};
 
-use super::hash::{self, Hash256};
+use super::hash::Hash256;
+use crate::inferlet::process::ProcessId;
 use crate::store::genmap::{GenKey, GenMap};
 use crate::store::pool::PoolId;
 
@@ -74,7 +71,6 @@ pub enum NoReclaim {
     HoldsNothing,
     AllShared,
     AllSwapped,
-    Pinned,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -107,7 +103,6 @@ struct KvTrieNode {
     parent: Option<NodeId>,
     children: SmallVec<[NodeId; 2]>,
     pages: Pages,
-    cached_path_hash: Option<Hash256>,
     exact_anchors: u32,
     path_anchors: u32,
 }
@@ -115,49 +110,46 @@ struct KvTrieNode {
 struct WorkingSetEntry {
     terminal: Option<NodeId>,
     page_len: u64,
-    page_len_mirror: Arc<AtomicU64>,
     mapped_len: u64,
-    chain_state: Option<Hash256>,
+    suspended: bool,
+    folded: u64,
+    /// Past them a decode wrote, and the cache lets that go first.
+    prompt_pages: u64,
+    owner: Option<ProcessId>,
+    supplied: u64,
+    /// As far as every write since is known.
+    logged: Vec<u32>,
+    /// One that never settles leaves the log cut there.
+    pending: BTreeMap<u64, u64>,
 }
 
 impl WorkingSetEntry {
-    const TORN_DOWN: u64 = u64::MAX;
-
-    fn new(
-        terminal: Option<NodeId>,
-        page_len: u64,
-        mapped_len: u64,
-        chain_state: Option<Hash256>,
-    ) -> Self {
+    fn new(terminal: Option<NodeId>, page_len: u64, mapped_len: u64) -> Self {
         Self {
             terminal,
             page_len,
-            page_len_mirror: Arc::new(AtomicU64::new(page_len)),
             mapped_len,
-            chain_state,
+            suspended: false,
+            folded: 0,
+            prompt_pages: 0,
+            owner: None,
+            supplied: 0,
+            logged: Vec::new(),
+            pending: BTreeMap::new(),
         }
-    }
-
-    fn set_page_len(&mut self, page_len: u64) {
-        self.page_len = page_len;
-        self.page_len_mirror.store(page_len, Ordering::Release);
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct IndexedWorkingSet {
-    pub(super) terminal: Option<NodeId>,
-    page_len: u64,
-    mapped_len: u64,
-    chain_state: Option<Hash256>,
+pub(super) struct KeptPath {
+    pub(super) terminal: NodeId,
+    pub(super) pages: u64,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KvTableError {
     #[error("unknown working set")]
     UnknownWorkingSet,
-    #[error("page index {index} out of range (page_len {page_len})")]
-    IndexOutOfRange { index: u64, page_len: u64 },
     #[error("page index {index} is reserved but unwritten (mapped {mapped_len})")]
     Unwritten { index: u64, mapped_len: u64 },
     #[error("range {start}..{end} invalid (mapped {mapped_len}, page_len {page_len})")]
@@ -175,17 +167,10 @@ pub enum KvTableError {
         mapped_len: u64,
         page_len: u64,
     },
-    #[error("interior discard on a shared path is rejected (growth-boundary invariant)")]
-    SharedInteriorDiscard,
     #[error("working set page {index} is swapped out")]
     NonResident { index: u64 },
     #[error("page backing changed while a residency transaction was in flight")]
     BackingChanged,
-    #[error(
-        "working set cannot be indexed with an unmapped logical tail \
-         (mapped {mapped_len}, page_len {page_len})"
-    )]
-    UnmappedTail { mapped_len: u64, page_len: u64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -207,8 +192,12 @@ pub struct KvPageTable {
     nodes: GenMap<NodeMarker, KvTrieNode>,
     cache_roots: HashMap<NodeId, u32>,
     pins: HashMap<NodeId, u32>,
-    swap_locations: HashMap<TriePageLocation, u32>,
+    swap_locations: HashSet<TriePageLocation>,
+    node_starts: HashMap<Hash256, SmallVec<[NodeId; 2]>>,
 }
+
+/// Pages sealed apart are copies, and one may be off the device.
+const NODE_COPIES: usize = 4;
 
 impl KvPageTable {
     pub fn new() -> Self {
@@ -216,103 +205,116 @@ impl KvPageTable {
     }
 
     pub fn create_working_set(&mut self) -> WorkingSetId {
-        self.working_sets
-            .insert(WorkingSetEntry::new(None, 0, 0, None))
+        self.working_sets.insert(WorkingSetEntry::new(None, 0, 0))
     }
 
     pub fn fork(&mut self, ws: WorkingSetId) -> Result<WorkingSetId, KvTableError> {
         let entry = self.entry(ws)?;
-        let (terminal, page_len, mapped_len, chain_state) = (
-            entry.terminal,
-            entry.page_len,
-            entry.mapped_len,
-            entry.chain_state,
-        );
-        let child = self.working_sets.insert(WorkingSetEntry::new(
-            terminal,
-            page_len,
-            mapped_len,
-            chain_state,
-        ));
+        let (terminal, page_len, mapped_len) = (entry.terminal, entry.page_len, entry.mapped_len);
+        // The child holds what the parent's log knows, short of what the
+        // parent's fires on their way may still change, and what it froze.
+        let mut logged = entry.logged.clone();
+        if let Some(&cut) = entry.pending.values().min() {
+            logged.truncate(cut as usize);
+        }
+        let (folded, prompt_pages) = (entry.folded, entry.prompt_pages);
+        let mut child_entry = WorkingSetEntry::new(terminal, page_len, mapped_len);
+        child_entry.logged = logged;
+        child_entry.folded = folded;
+        child_entry.prompt_pages = prompt_pages;
+        let child = self.working_sets.insert(child_entry);
         if let Some(terminal) = terminal {
             self.add_anchor(terminal);
         }
         Ok(child)
     }
 
-    pub(super) fn index_snapshot(
-        &self,
-        ws: WorkingSetId,
-    ) -> Result<IndexedWorkingSet, KvTableError> {
-        let entry = self.entry(ws)?;
-        if entry.page_len != entry.mapped_len {
-            return Err(KvTableError::UnmappedTail {
-                mapped_len: entry.mapped_len,
-                page_len: entry.page_len,
-            });
-        }
-        Ok(IndexedWorkingSet {
-            terminal: entry.terminal,
-            page_len: entry.page_len,
-            mapped_len: entry.mapped_len,
-            chain_state: entry.chain_state,
-        })
-    }
-
-    #[allow(
-        clippy::wrong_self_convention,
-        reason = "not a conversion: it mutates the table to seat a new working set, \
-                  and is named for the `from-index` WIT call it serves (see \
-                  `KvStore::from_index`, its only caller)"
-    )]
-    pub(super) fn from_index_snapshot(&mut self, snapshot: IndexedWorkingSet) -> WorkingSetId {
-        let ws = self.working_sets.insert(WorkingSetEntry::new(
-            snapshot.terminal,
-            snapshot.page_len,
-            snapshot.mapped_len,
-            snapshot.chain_state,
-        ));
-        if let Some(terminal) = snapshot.terminal {
-            self.add_anchor(terminal);
-        }
-        ws
-    }
-
-    pub fn slice(
+    /// What follows `start` is dropped first; logged only where the log reaches
+    /// `start`.
+    pub fn log_rows(
         &mut self,
         ws: WorkingSetId,
-        range: Range<u64>,
-    ) -> Result<WorkingSetId, KvTableError> {
-        let entry = self.entry(ws)?;
-        let (terminal, page_len, mapped_len) = (entry.terminal, entry.page_len, entry.mapped_len);
-        if range.start > range.end || range.end > mapped_len {
-            return Err(KvTableError::BadRange {
-                start: range.start,
-                end: range.end,
-                mapped_len,
-                page_len,
-            });
+        start: u64,
+        tokens: &[u32],
+    ) -> Result<(), KvTableError> {
+        let logged = &mut self.entry_mut(ws)?.logged;
+        logged.truncate(start as usize);
+        if logged.len() as u64 == start {
+            logged.extend_from_slice(tokens);
         }
-        let len = range.end - range.start;
-        let child_terminal = if len == 0 {
-            None
-        } else {
-            let segs = self.segments(terminal, mapped_len);
-            Some(self.boundary_terminal(&segs, range.end))
+        Ok(())
+    }
+
+    pub fn log_begin(&mut self, ws: WorkingSetId, seq: u64, cut: u64) -> Result<(), KvTableError> {
+        self.entry_mut(ws)?.pending.insert(seq, cut);
+        Ok(())
+    }
+
+    pub fn log_end(
+        &mut self,
+        ws: WorkingSetId,
+        seq: u64,
+        rows: Option<(u64, &[u32])>,
+    ) -> Result<(), KvTableError> {
+        let entry = self.entry_mut(ws)?;
+        let Some(cut) = entry.pending.remove(&seq) else {
+            return Ok(());
         };
-        let child = self
-            .working_sets
-            .insert(WorkingSetEntry::new(child_terminal, len, len, None));
-        if let Some(terminal) = child_terminal {
-            self.add_anchor(terminal);
+        match rows {
+            Some((start, tokens)) => self.log_rows(ws, start, tokens),
+            None => {
+                entry.logged.truncate(cut as usize);
+                Ok(())
+            }
         }
-        Ok(child)
+    }
+
+    pub fn logged(&self, ws: WorkingSetId) -> Result<&[u32], KvTableError> {
+        let entry = self.entry(ws)?;
+        let end = entry
+            .pending
+            .values()
+            .min()
+            .map_or(entry.logged.len(), |&cut| {
+                entry.logged.len().min(cut as usize)
+            });
+        Ok(&entry.logged[..end])
+    }
+
+    pub fn sealed_prefix(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
+        self.prefix_while(ws, |location| self.sealed_at(location))
+    }
+
+    fn prefix_while(
+        &self,
+        ws: WorkingSetId,
+        kept: impl Fn(TriePageLocation) -> bool,
+    ) -> Result<u64, KvTableError> {
+        let (mut pages, mut open) = (0, false);
+        self.visit_working_set_locations(ws, |location| {
+            open = open || !kept(location);
+            pages += u64::from(!open);
+        })?;
+        Ok(pages)
+    }
+
+    fn sealed_at(&self, location: TriePageLocation) -> bool {
+        matches!(
+            self.nodes.get(location.node).map(|n| &n.pages),
+            Some(Pages::Owned { page_hashes, .. })
+                if page_hashes.get(location.local as usize).is_some_and(Option::is_some)
+        )
+    }
+
+    fn settled_at(&self, location: &TriePageLocation) -> bool {
+        !self.swap_locations.contains(location)
+            && matches!(self.backing_at(location), Ok(KvPageBacking::Resident(_)))
     }
 
     pub fn reserve(&mut self, ws: WorkingSetId, pages: u64) -> Result<Range<u64>, KvTableError> {
         let entry = self.entry_mut(ws)?;
         let start = entry.page_len;
-        entry.set_page_len(entry.page_len + pages);
+        entry.page_len += pages;
         Ok(start..entry.page_len)
     }
 
@@ -359,7 +361,6 @@ impl KvPageTable {
                     }
                     Pages::ParentSelection { .. } => unreachable!("checked owned"),
                 }
-                self.invalidate_subtree(t);
                 t
             }
             _ => {
@@ -371,7 +372,6 @@ impl KvPageTable {
                         token_hashes,
                         page_hashes,
                     },
-                    cached_path_hash: None,
                     exact_anchors: 0,
                     path_anchors: 0,
                 });
@@ -440,21 +440,7 @@ impl KvPageTable {
         token_hashes: Vec<Option<Hash256>>,
         page_hash: Option<Hash256>,
     ) -> Result<(), KvTableError> {
-        let entry = self.entry(ws)?;
-        if index >= entry.mapped_len {
-            return Err(KvTableError::Unwritten {
-                index,
-                mapped_len: entry.mapped_len,
-            });
-        }
-        let segs = self.segments(entry.terminal, entry.mapped_len);
-        let seg = segs
-            .iter()
-            .find(|s| (index as i64) >= s.start)
-            .copied()
-            .expect("published mapping covers [0, mapped_len)");
-        let local = (index as i64 - seg.start) as u64;
-        let (owner, owner_local) = self.resolve_owner(seg.node, local);
+        let (owner, owner_local) = self.page_owner(ws, index)?;
         let node = self.nodes.get_mut(owner).expect("live node");
         match &mut node.pages {
             Pages::Owned {
@@ -467,68 +453,186 @@ impl KvPageTable {
             }
             Pages::ParentSelection { .. } => unreachable!("resolved to owner"),
         }
-        self.invalidate_subtree(owner);
         Ok(())
     }
 
-    pub fn privately_writable(&self, ws: WorkingSetId, index: u64) -> Result<bool, KvTableError> {
+    pub fn folded(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
+        Ok(self.entry(ws)?.folded)
+    }
+
+    /// What is frozen stays frozen.
+    pub fn freeze(&mut self, ws: WorkingSetId, to: u64) -> Result<u64, KvTableError> {
+        let entry = self.entry_mut(ws)?;
+        entry.folded = entry.folded.max(to);
+        Ok(entry.folded)
+    }
+
+    pub fn prompt_pages(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
+        Ok(self.entry(ws)?.prompt_pages)
+    }
+
+    pub fn reach_prompt(&mut self, ws: WorkingSetId, pages: u64) -> Result<(), KvTableError> {
+        let entry = self.entry_mut(ws)?;
+        entry.prompt_pages = entry.prompt_pages.max(pages);
+        Ok(())
+    }
+
+    /// Node by node: the copy of a node start that runs furthest, then the node
+    /// its last key ends or branches at.
+    pub fn sealed_run(&self, keys: &[Hash256], resident: bool) -> Vec<TriePageLocation> {
+        let mut run = Vec::new();
+        while let Some(copies) = keys
+            .get(run.len())
+            .and_then(|key| self.node_starts.get(key))
+        {
+            let from = run.len();
+            let Some((node, matched)) = copies
+                .iter()
+                .map(|&node| (node, self.node_run(node, &keys[from..], resident)))
+                .max_by_key(|&(_, matched)| matched)
+                .filter(|&(_, matched)| matched > 0)
+            else {
+                break;
+            };
+            run.extend((0..matched as u64).map(|local| TriePageLocation { node, local }));
+        }
+        run
+    }
+
+    fn node_run(&self, node: NodeId, keys: &[Hash256], resident: bool) -> usize {
+        let Some(Pages::Owned {
+            page_hashes,
+            backings,
+            ..
+        }) = self.nodes.get(node).map(|n| &n.pages)
+        else {
+            return 0;
+        };
+        page_hashes
+            .iter()
+            .zip(backings)
+            .zip(keys)
+            .enumerate()
+            .take_while(|&(local, ((hash, backing), key))| {
+                *hash == Some(*key)
+                    && (!resident || matches!(backing, KvPageBacking::Resident(_)))
+                    && !self.swap_locations.contains(&TriePageLocation {
+                        node,
+                        local: local as u64,
+                    })
+            })
+            .count()
+    }
+
+    #[cfg(test)]
+    pub fn sealed_page_at(
+        &self,
+        location: TriePageLocation,
+        key: Hash256,
+    ) -> Option<PhysicalKvPageId> {
+        let Some(Pages::Owned {
+            page_hashes,
+            backings,
+            ..
+        }) = self.nodes.get(location.node).map(|n| &n.pages)
+        else {
+            return None;
+        };
+        let local = location.local as usize;
+        match (page_hashes.get(local), backings.get(local)) {
+            (Some(Some(hash)), Some(KvPageBacking::Resident(id))) if *hash == key => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Whole, computed and keyed, so it never changes in place.
+    pub fn sealed(&self, ws: WorkingSetId, index: u64) -> Result<bool, KvTableError> {
+        Ok(self.page_hash_at(ws, index)?.is_some())
+    }
+
+    pub fn commit_hashes(
+        &mut self,
+        ws: WorkingSetId,
+        first: u64,
+        pages: Vec<(Vec<Option<Hash256>>, Option<Hash256>)>,
+    ) -> Result<(), KvTableError> {
         let entry = self.entry(ws)?;
-        if index >= entry.mapped_len {
+        let end = first + pages.len() as u64;
+        if end > entry.mapped_len {
             return Err(KvTableError::Unwritten {
-                index,
+                index: end - 1,
                 mapped_len: entry.mapped_len,
             });
         }
         let segs = self.segments(entry.terminal, entry.mapped_len);
-        let seg = segs
-            .iter()
-            .find(|s| (index as i64) >= s.start)
-            .copied()
-            .expect("published mapping covers [0, mapped_len)");
-        let local = (index as i64 - seg.start) as u64;
-        let (owner, _) = self.resolve_owner(seg.node, local);
-        let mut targets = HashSet::new();
-        targets.insert(owner);
-        Ok(self.is_private_to(ws, &targets))
-    }
-
-    pub fn discard(
-        &mut self,
-        ws: WorkingSetId,
-        ranges: &[Range<u64>],
-    ) -> Result<Vec<KvPageBacking>, KvTableError> {
-        let entry = self.entry(ws)?;
-        let (terminal, page_len, mapped_len) = (entry.terminal, entry.page_len, entry.mapped_len);
-
-        let mut norm: Vec<Range<u64>> =
-            ranges.iter().filter(|r| r.start < r.end).cloned().collect();
-        norm.sort_by_key(|r| r.start);
-        let mut merged: Vec<Range<u64>> = Vec::with_capacity(norm.len());
-        for r in norm {
-            if r.end > page_len {
-                return Err(KvTableError::BadRange {
-                    start: r.start,
-                    end: r.end,
-                    mapped_len,
-                    page_len,
-                });
+        for (offset, (tokens, page)) in pages.into_iter().enumerate() {
+            let index = first + offset as u64;
+            let seg = segs
+                .iter()
+                .find(|s| (index as i64) >= s.start)
+                .copied()
+                .expect("published mapping covers [0, mapped_len)");
+            let (owner, local) = self.resolve_owner(seg.node, (index as i64 - seg.start) as u64);
+            match &mut self.nodes.get_mut(owner).expect("live node").pages {
+                Pages::Owned {
+                    token_hashes,
+                    page_hashes,
+                    ..
+                } => {
+                    token_hashes[local as usize] = tokens;
+                    page_hashes[local as usize] = page;
+                }
+                Pages::ParentSelection { .. } => unreachable!("resolved to owner"),
             }
-            match merged.last_mut() {
-                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
-                _ => merged.push(r),
+            if let Some(key) = page.filter(|_| local == 0) {
+                self.index_node_start(key, owner);
             }
         }
-        merged.reverse();
-
-        self.classify_discard(ws, terminal, mapped_len, &merged)?;
-
-        let mut freed = Vec::new();
-        for r in &merged {
-            self.apply_discard_range(ws, r.clone(), &mut freed)?;
-        }
-        Ok(freed)
+        Ok(())
     }
 
+    /// The latest few copies that still start with it.
+    fn index_node_start(&mut self, key: Hash256, node: NodeId) {
+        let mut copies = self.node_starts.remove(&key).unwrap_or_default();
+        copies.retain(|copy| {
+            *copy != node
+                && matches!(
+                    self.nodes.get(*copy).map(|n| &n.pages),
+                    Some(Pages::Owned { page_hashes, .. }) if page_hashes.first() == Some(&Some(key))
+                )
+        });
+        copies.push(node);
+        if copies.len() > NODE_COPIES {
+            copies.remove(0);
+        }
+        self.node_starts.insert(key, copies);
+    }
+
+    pub fn privately_writable(&self, ws: WorkingSetId, index: u64) -> Result<bool, KvTableError> {
+        let (owner, local) = self.page_owner(ws, index)?;
+        Ok(self.page_readers(owner, local) == 1)
+    }
+
+    /// An owned child takes all of them, a selection its runs.
+    fn page_readers(&self, owner: NodeId, local: u64) -> u32 {
+        let node = self.nodes.get(owner).expect("live node");
+        let mut readers = node.exact_anchors;
+        for &child in &node.children {
+            let child = self.nodes.get(child).expect("live child");
+            let takes = match &child.pages {
+                Pages::Owned { .. } => true,
+                Pages::ParentSelection { runs } => {
+                    runs.iter().any(|run| run.contains(&(local as u32)))
+                }
+            };
+            if takes {
+                readers += child.path_anchors;
+            }
+        }
+        readers
+    }
+
+    #[cfg(test)]
     pub fn release_working_set(&mut self, ws: WorkingSetId) -> Vec<PhysicalKvPageId> {
         self.release_working_set_backings(ws)
             .into_iter()
@@ -547,37 +651,15 @@ impl KvPageTable {
             return Vec::new();
         };
         entry
-            .page_len_mirror
-            .store(WorkingSetEntry::TORN_DOWN, Ordering::Release);
-        entry
             .terminal
             .map_or_else(Vec::new, |terminal| self.remove_anchor(terminal))
     }
 
+    #[cfg(test)]
     pub fn lookup(&self, ws: WorkingSetId, index: u64) -> Result<PhysicalKvPageId, KvTableError> {
-        let entry = self.entry(ws)?;
-        if index >= entry.page_len {
-            return Err(KvTableError::IndexOutOfRange {
-                index,
-                page_len: entry.page_len,
-            });
-        }
-        if index >= entry.mapped_len {
-            return Err(KvTableError::Unwritten {
-                index,
-                mapped_len: entry.mapped_len,
-            });
-        }
-        let segs = self.segments(entry.terminal, entry.mapped_len);
-        for seg in &segs {
-            if (index as i64) >= seg.start {
-                let local = (index as i64 - seg.start) as u64;
-                return self
-                    .resolve_id(seg.node, local)
-                    .ok_or(KvTableError::NonResident { index });
-            }
-        }
-        unreachable!("published mapping covers [0, mapped_len)");
+        let (owner, local) = self.page_owner(ws, index)?;
+        self.resolve_id(owner, local)
+            .ok_or(KvTableError::NonResident { index })
     }
 
     pub fn flatten(&self, ws: WorkingSetId) -> Result<Vec<PhysicalKvPageId>, KvTableError> {
@@ -600,96 +682,29 @@ impl KvPageTable {
         Ok(out)
     }
 
-    pub fn chain_state(&self, ws: WorkingSetId) -> Result<Option<Hash256>, KvTableError> {
-        Ok(self.entry(ws)?.chain_state)
-    }
-
-    pub fn set_chain_state(
-        &mut self,
-        ws: WorkingSetId,
-        state: Option<Hash256>,
-    ) -> Result<(), KvTableError> {
-        self.entry_mut(ws)?.chain_state = state;
-        Ok(())
-    }
-
     pub fn page_token_hashes(
         &self,
         ws: WorkingSetId,
         index: u64,
     ) -> Result<Vec<Option<Hash256>>, KvTableError> {
-        let entry = self.entry(ws)?;
-        if index >= entry.mapped_len {
-            return Err(KvTableError::Unwritten {
-                index,
-                mapped_len: entry.mapped_len,
-            });
+        let (owner, local) = self.page_owner(ws, index)?;
+        match &self.nodes.get(owner).expect("live node").pages {
+            Pages::Owned { token_hashes, .. } => Ok(token_hashes[local as usize].clone()),
+            Pages::ParentSelection { .. } => unreachable!("resolved to owner"),
         }
-        let segs = self.segments(entry.terminal, entry.mapped_len);
-        for seg in &segs {
-            if (index as i64) >= seg.start {
-                let local = (index as i64 - seg.start) as u64;
-                let (owner, owner_local) = self.resolve_owner(seg.node, local);
-                match &self.nodes.get(owner).expect("live node").pages {
-                    Pages::Owned { token_hashes, .. } => {
-                        return Ok(token_hashes[owner_local as usize].clone());
-                    }
-                    Pages::ParentSelection { .. } => unreachable!("resolved to owner"),
-                }
-            }
-        }
-        unreachable!("published mapping covers [0, mapped_len)");
     }
 
-    pub fn visible_page_identities(
-        &self,
-        ws: WorkingSetId,
-    ) -> Result<Vec<Option<Hash256>>, KvTableError> {
-        let entry = self.entry(ws)?;
-        let mut out = Vec::with_capacity(entry.mapped_len as usize);
-        let segs = self.segments(entry.terminal, entry.mapped_len);
+    pub fn path_locations(&self, node: NodeId, local: u64) -> Vec<TriePageLocation> {
+        let end = self.path_prefix_len(node, local);
+        let full = end + (self.contribution_len(node) - (local + 1));
+        let segs = self.segments(Some(node), full);
+        let mut out = Vec::with_capacity(end as usize);
         for seg in segs.iter().rev() {
-            let from = (-seg.start).max(0) as u64;
-            for local in from..seg.len {
-                let (owner, owner_local) = self.resolve_owner(seg.node, local);
-                match &self.nodes.get(owner).expect("live node").pages {
-                    Pages::Owned {
-                        token_hashes,
-                        page_hashes,
-                        ..
-                    } => {
-                        let i = owner_local as usize;
-                        out.push(match page_hashes[i] {
-                            Some(h) => Some(h),
-                            None if !token_hashes[i].is_empty() => {
-                                Some(hash::page_hash(&token_hashes[i]))
-                            }
-                            None => None,
-                        });
-                    }
-                    Pages::ParentSelection { .. } => unreachable!("resolved to owner"),
-                }
+            for at in seg.start.max(0)..seg.end().min(end as i64) {
+                out.push(self.resolve_location(seg.node, (at - seg.start) as u64));
             }
         }
-        Ok(out)
-    }
-
-    pub fn locate_page(&self, ws: WorkingSetId, index: u64) -> Result<(NodeId, u64), KvTableError> {
-        let entry = self.entry(ws)?;
-        if index >= entry.mapped_len {
-            return Err(KvTableError::Unwritten {
-                index,
-                mapped_len: entry.mapped_len,
-            });
-        }
-        let segs = self.segments(entry.terminal, entry.mapped_len);
-        for seg in &segs {
-            if (index as i64) >= seg.start {
-                let local = (index as i64 - seg.start) as u64;
-                return Ok(self.resolve_owner(seg.node, local));
-            }
-        }
-        unreachable!("published mapping covers [0, mapped_len)");
+        out
     }
 
     pub fn path_prefix_len(&self, node: NodeId, local: u64) -> u64 {
@@ -702,7 +717,8 @@ impl KvPageTable {
         full
     }
 
-    pub fn adopt_path_prefix(
+    /// The pages `ws` holds are the path's own, and none past them is written.
+    pub fn attach(
         &mut self,
         ws: WorkingSetId,
         node: NodeId,
@@ -711,45 +727,94 @@ impl KvPageTable {
         let node_len = self.contribution_len(node);
         debug_assert!(local < node_len);
         let end = self.path_prefix_len(node, local);
+        let full = end + (node_len - (local + 1));
+        let segs = self.segments(Some(node), full);
         let reserved_len = {
             let entry = self.entry(ws)?;
-            if entry.terminal.is_some()
-                || entry.mapped_len != 0
-                || (entry.page_len != 0 && entry.page_len < end)
-            {
-                return Err(KvTableError::BadRange {
-                    start: 0,
-                    end,
-                    mapped_len: entry.mapped_len,
-                    page_len: entry.page_len,
-                });
+            let held = entry.mapped_len;
+            let refused = KvTableError::BadRange {
+                start: held,
+                end,
+                mapped_len: entry.mapped_len,
+                page_len: entry.page_len,
+            };
+            if held >= end {
+                return Err(refused);
+            }
+            if held > 0 {
+                let mut mine = Vec::with_capacity(held as usize);
+                self.visit_working_set_locations(ws, |location| mine.push(location))?;
+                let mut path = Vec::with_capacity(held as usize);
+                for segment in segs.iter().rev() {
+                    let from = (-segment.start).max(0) as u64;
+                    for at in from..segment.len {
+                        if path.len() as u64 == held {
+                            break;
+                        }
+                        path.push(self.resolve_location(segment.node, at));
+                    }
+                }
+                if mine != path {
+                    return Err(refused);
+                }
             }
             entry.page_len
         };
-        let full = end + (node_len - (local + 1));
-        let segs = self.segments(Some(node), full);
         let terminal = self.boundary_terminal(&segs, end);
         let freed = self.move_terminal(ws, Some(terminal))?;
-        debug_assert!(freed.is_empty(), "adoption starts without an old terminal");
+        debug_assert!(freed.is_empty(), "the old path is a prefix of the new one");
         let entry = self.entry_mut(ws)?;
-        entry.set_page_len(reserved_len.max(end));
+        entry.page_len = reserved_len.max(end);
         entry.mapped_len = end;
         Ok(end)
     }
 
-    pub fn is_cache_root(&self, node: NodeId) -> bool {
-        self.cache_roots.contains_key(&node)
+    pub fn resident_run(&self, run: &[TriePageLocation]) -> usize {
+        run.iter()
+            .take_while(|location| self.settled_at(location))
+            .count()
     }
 
-    pub fn node_page_last_slot_hash(&self, node: NodeId, local: u64) -> Option<Hash256> {
-        match self.nodes.get(node).map(|n| &n.pages) {
-            Some(Pages::Owned { token_hashes, .. }) => token_hashes
-                .get(local as usize)?
-                .iter()
-                .rev()
-                .find_map(|h| *h),
-            _ => None,
-        }
+    pub fn sealed_resident_prefix(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
+        self.prefix_while(ws, |location| {
+            self.sealed_at(location) && self.settled_at(&location)
+        })
+    }
+
+    pub(super) fn keep_prefix_of(&mut self, path: KeptPath, pages: u64) -> KeptPath {
+        let segs = self.segments(Some(path.terminal), path.pages);
+        let terminal = self.boundary_terminal(&segs, pages);
+        KeptPath { terminal, pages }
+    }
+
+    pub(super) fn keep_prefix(
+        &mut self,
+        ws: WorkingSetId,
+        pages: u64,
+    ) -> Result<KeptPath, KvTableError> {
+        let entry = self.entry(ws)?;
+        let segs = self.segments(entry.terminal, entry.mapped_len);
+        let terminal = self.boundary_terminal(&segs, pages);
+        Ok(KeptPath { terminal, pages })
+    }
+
+    pub fn set_owner(&mut self, ws: WorkingSetId, owner: ProcessId) -> Result<(), KvTableError> {
+        self.entry_mut(ws)?.owner = Some(owner);
+        Ok(())
+    }
+
+    pub fn owner(&self, ws: WorkingSetId) -> Result<Option<ProcessId>, KvTableError> {
+        Ok(self.entry(ws)?.owner)
+    }
+
+    pub fn add_supplied(&mut self, ws: WorkingSetId, tokens: u64) -> Result<u64, KvTableError> {
+        let entry = self.entry_mut(ws)?;
+        entry.supplied += tokens;
+        Ok(entry.supplied)
+    }
+
+    pub fn supplied(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
+        Ok(self.entry(ws)?.supplied)
     }
 
     pub fn page_hash_at(
@@ -757,113 +822,86 @@ impl KvPageTable {
         ws: WorkingSetId,
         index: u64,
     ) -> Result<Option<Hash256>, KvTableError> {
-        let entry = self.entry(ws)?;
-        if index >= entry.mapped_len {
-            return Err(KvTableError::Unwritten {
-                index,
-                mapped_len: entry.mapped_len,
-            });
+        let (owner, local) = self.page_owner(ws, index)?;
+        match &self.nodes.get(owner).expect("live node").pages {
+            Pages::Owned { page_hashes, .. } => Ok(page_hashes[local as usize]),
+            Pages::ParentSelection { .. } => unreachable!("resolved to owner"),
         }
-        let segs = self.segments(entry.terminal, entry.mapped_len);
-        for seg in &segs {
-            if (index as i64) >= seg.start {
-                let local = (index as i64 - seg.start) as u64;
-                let (owner, owner_local) = self.resolve_owner(seg.node, local);
-                let node = self.nodes.get(owner).expect("live node");
-                match &node.pages {
-                    Pages::Owned { page_hashes, .. } => {
-                        return Ok(page_hashes[owner_local as usize]);
-                    }
-                    Pages::ParentSelection { .. } => unreachable!("resolved to owner"),
-                }
-            }
-        }
-        unreachable!("published mapping covers [0, mapped_len)");
-    }
-
-    pub fn terminal_path_hash(
-        &mut self,
-        ws: WorkingSetId,
-    ) -> Result<Option<Hash256>, KvTableError> {
-        let terminal = self.entry(ws)?.terminal;
-        Ok(match terminal {
-            Some(node) => self.node_path_hash(node),
-            None => None,
-        })
     }
 
     pub fn lease_cache_root(&mut self, node: NodeId) {
-        let first = !self.cache_roots.contains_key(&node);
-        *self.cache_roots.entry(node).or_insert(0) += 1;
-        if first {
+        if hold(&mut self.cache_roots, node) {
             self.add_anchor(node);
         }
     }
 
     pub fn release_cache_root(&mut self, node: NodeId) -> Vec<KvPageBacking> {
-        let mut remove = false;
-        if let Some(count) = self.cache_roots.get_mut(&node) {
-            *count -= 1;
-            if *count == 0 {
-                remove = true;
-            }
-        }
-        if !remove {
+        if !let_go(&mut self.cache_roots, node) {
             return Vec::new();
         }
-        self.cache_roots.remove(&node);
         self.remove_anchor(node)
     }
 
     pub fn pin(&mut self, node: NodeId) {
-        let first = !self.pins.contains_key(&node);
-        *self.pins.entry(node).or_insert(0) += 1;
-        if first {
+        if hold(&mut self.pins, node) {
             self.add_anchor(node);
         }
     }
 
     pub fn unpin(&mut self, node: NodeId) -> Vec<KvPageBacking> {
-        let mut remove = false;
-        if let Some(count) = self.pins.get_mut(&node) {
-            *count -= 1;
-            if *count == 0 {
-                remove = true;
-            }
-        }
-        if !remove {
+        if !let_go(&mut self.pins, node) {
             return Vec::new();
         }
-        self.pins.remove(&node);
         self.remove_anchor(node)
     }
 
+    #[cfg(test)]
     pub fn terminal(&self, ws: WorkingSetId) -> Result<Option<NodeId>, KvTableError> {
         Ok(self.entry(ws)?.terminal)
     }
 
     pub fn page_len(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
-        let entry = self.entry(ws)?;
-        debug_assert_eq!(
-            entry.page_len_mirror.load(Ordering::Relaxed),
-            entry.page_len,
-            "page_len mirror drifted: a write bypassed set_page_len"
-        );
-        Ok(entry.page_len)
-    }
-
-    pub fn page_len_mirror(&self, ws: WorkingSetId) -> Result<Arc<AtomicU64>, KvTableError> {
-        Ok(Arc::clone(&self.entry(ws)?.page_len_mirror))
+        Ok(self.entry(ws)?.page_len)
     }
 
     pub fn mapped_len(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
         Ok(self.entry(ws)?.mapped_len)
     }
 
-    pub fn node_count(&self) -> usize {
-        self.nodes.len()
+    pub fn within(&self, root: NodeId, location: TriePageLocation, len: u64) -> bool {
+        let Some(node) = self.nodes.get(root) else {
+            return false;
+        };
+        let (owner, last) = match &node.pages {
+            Pages::Owned { backings, .. } => (root, backings.len() as u64),
+            Pages::ParentSelection { runs } => (
+                node.parent.expect("selection has owner"),
+                runs.iter().map(|run| u64::from(run.end)).max().unwrap_or(0),
+            ),
+        };
+        last > 0
+            && self.descends_from(location.node, owner)
+            && (owner != location.node || last <= location.local + 1)
+            && self.path_prefix_len(owner, last - 1) <= len
     }
 
+    pub fn descends_from(&self, node: NodeId, ancestor: NodeId) -> bool {
+        let mut cursor = Some(node);
+        while let Some(current) = cursor {
+            if current == ancestor {
+                return true;
+            }
+            cursor = self.nodes.get(current).and_then(|n| n.parent);
+        }
+        false
+    }
+
+    #[cfg(test)]
+    pub fn node_count(&self) -> usize {
+        self.nodes.iter().count()
+    }
+
+    #[cfg(test)]
     pub fn node_parent(&self, node: NodeId) -> Option<NodeId> {
         self.nodes.get(node).and_then(|n| n.parent)
     }
@@ -873,10 +911,6 @@ impl KvPageTable {
             self.nodes.get(node).map(|n| &n.pages),
             Some(Pages::ParentSelection { .. })
         )
-    }
-
-    pub fn node_len(&self, node: NodeId) -> u64 {
-        self.contribution_len(node)
     }
 
     fn entry(&self, ws: WorkingSetId) -> Result<&WorkingSetEntry, KvTableError> {
@@ -889,6 +923,22 @@ impl KvPageTable {
         self.working_sets
             .get_mut(ws)
             .ok_or(KvTableError::UnknownWorkingSet)
+    }
+
+    fn page_owner(&self, ws: WorkingSetId, index: u64) -> Result<(NodeId, u64), KvTableError> {
+        let entry = self.entry(ws)?;
+        if index >= entry.mapped_len {
+            return Err(KvTableError::Unwritten {
+                index,
+                mapped_len: entry.mapped_len,
+            });
+        }
+        let segs = self.segments(entry.terminal, entry.mapped_len);
+        let seg = segs
+            .iter()
+            .find(|s| (index as i64) >= s.start)
+            .expect("published mapping covers [0, mapped_len)");
+        Ok(self.resolve_owner(seg.node, (index as i64 - seg.start) as u64))
     }
 
     fn move_terminal(
@@ -973,6 +1023,15 @@ impl KvPageTable {
             && let Some(parent) = self.nodes.get_mut(parent)
         {
             parent.children.retain(|child| *child != node);
+        }
+        if let Pages::Owned { page_hashes, .. } = &self.nodes.get(node).expect("live").pages
+            && let Some(&Some(first)) = page_hashes.first()
+            && let Some(copies) = self.node_starts.get_mut(&first)
+        {
+            copies.retain(|copy| *copy != node);
+            if copies.is_empty() {
+                self.node_starts.remove(&first);
+            }
         }
         let removed = self.nodes.remove(node).expect("unreferenced node is live");
         if let Pages::Owned { backings, .. } = removed.pages {
@@ -1088,30 +1147,12 @@ impl KvPageTable {
         self.insert_selection(owner, runs)
     }
 
-    fn selection_excluding(&mut self, node: NodeId, a: u64, b: u64) -> NodeId {
-        let (owner, runs) = {
-            let n = self.nodes.get(node).expect("live node");
-            match &n.pages {
-                Pages::Owned { backings, .. } => {
-                    let full: Runs = smallvec![0..backings.len() as u32];
-                    (node, runs_remove(&full, a, b))
-                }
-                Pages::ParentSelection { runs } => {
-                    let owner = n.parent.expect("selection has owner");
-                    (owner, runs_remove(runs, a, b))
-                }
-            }
-        };
-        self.insert_selection(owner, runs)
-    }
-
     fn insert_selection(&mut self, owner: NodeId, runs: Runs) -> NodeId {
         debug_assert!(!self.node_is_selection(owner), "owner must be owned");
         let node = self.nodes.insert(KvTrieNode {
             parent: Some(owner),
             children: SmallVec::new(),
             pages: Pages::ParentSelection { runs },
-            cached_path_hash: None,
             exact_anchors: 0,
             path_anchors: 0,
         });
@@ -1121,29 +1162,6 @@ impl KvPageTable {
             .children
             .push(node);
         node
-    }
-
-    fn is_private_to(&self, ws: WorkingSetId, targets: &HashSet<NodeId>) -> bool {
-        let Some(terminal) = self.entry(ws).ok().and_then(|entry| entry.terminal) else {
-            return false;
-        };
-        self.chain_touches(terminal, targets)
-            && targets.iter().all(|node| {
-                self.nodes
-                    .get(*node)
-                    .is_some_and(|entry| entry.path_anchors == 1)
-            })
-    }
-
-    fn chain_touches(&self, start: NodeId, targets: &HashSet<NodeId>) -> bool {
-        let mut cursor = Some(start);
-        while let Some(node) = cursor {
-            if targets.contains(&node) {
-                return true;
-            }
-            cursor = self.nodes.get(node).expect("live node").parent;
-        }
-        false
     }
 
     fn can_extend_in_place(&self, ws: WorkingSetId, terminal: NodeId) -> bool {
@@ -1157,225 +1175,75 @@ impl KvPageTable {
             && node.path_anchors == 1
     }
 
-    fn invalidate_subtree(&mut self, node: NodeId) {
-        let mut stack = vec![node];
-        while let Some(n) = stack.pop() {
-            let node = self.nodes.get_mut(n).expect("live node");
-            node.cached_path_hash = None;
-            stack.extend(node.children.iter().copied());
-        }
-    }
-
-    fn drain_node(&mut self, node: NodeId, a: u64, b: u64) -> Vec<KvPageBacking> {
-        let (owner, mut freed) = {
-            let n = self.nodes.get_mut(node).expect("live node");
-            match &mut n.pages {
-                Pages::Owned {
-                    backings,
-                    token_hashes,
-                    page_hashes,
-                } => {
-                    let freed: Vec<_> = backings.drain(a as usize..b as usize).collect();
-                    token_hashes.drain(a as usize..b as usize);
-                    page_hashes.drain(a as usize..b as usize);
-                    (None, freed)
-                }
-                Pages::ParentSelection { runs } => {
-                    let owner = n.parent.expect("selection has owner");
-                    *runs = runs_remove(runs, a, b);
-                    (Some(owner), Vec::new())
-                }
-            }
-        };
-        if let Some(owner) = owner {
-            freed.extend(self.compact_owner(owner));
-        }
-        freed
-    }
-
-    fn classify_discard(
-        &self,
-        ws: WorkingSetId,
-        terminal: Option<NodeId>,
-        mapped_len: u64,
-        ranges: &[Range<u64>],
-    ) -> Result<(), KvTableError> {
-        let segs = self.segments(terminal, mapped_len);
-        let mut sim_mapped = mapped_len;
-        let mut sim_term_start: i64 = segs.first().map(|s| s.start).unwrap_or(0);
-        for r in ranges {
-            if r.start >= sim_mapped {
-                continue;
-            }
-            let m = r.start..r.end.min(sim_mapped);
-            let m_len = m.end - m.start;
-            let affected: HashSet<NodeId> = segs
-                .iter()
-                .filter(|s| s.start < m.end as i64 && (m.start as i64) < s.end())
-                .map(|s| s.node)
-                .collect();
-            if self.is_private_to(ws, &affected) {
-                let removed_below = (m.end as i64)
-                    .min(sim_term_start)
-                    .saturating_sub(m.start as i64)
-                    .max(0);
-                sim_term_start -= removed_below;
-                sim_mapped -= m_len;
-            } else if (m.start as i64) >= sim_term_start {
-                sim_mapped -= m_len;
-            } else if m.end == sim_mapped {
-                if m.start == 0 {
-                    sim_mapped = 0;
-                    sim_term_start = 0;
-                } else {
-                    let b = m.start as i64;
-                    let seg = segs
-                        .iter()
-                        .find(|s| s.start < b && b <= s.end())
-                        .expect("boundary within published mapping");
-                    sim_term_start = seg.start;
-                    sim_mapped = m.start;
-                }
-            } else if m.start == 0 {
-                sim_mapped -= m_len;
-            } else {
-                return Err(KvTableError::SharedInteriorDiscard);
-            }
-        }
-        Ok(())
-    }
-
-    fn apply_discard_range(
-        &mut self,
-        ws: WorkingSetId,
-        r: Range<u64>,
-        freed: &mut Vec<KvPageBacking>,
-    ) -> Result<(), KvTableError> {
-        let entry = self.entry(ws)?;
-        let (terminal, mapped_len) = (entry.terminal, entry.mapped_len);
-        let page_reduction = r.end - r.start;
-
-        if r.start >= mapped_len {
-            let entry = self.entry_mut(ws)?;
-            entry.set_page_len(entry.page_len - page_reduction);
-            return Ok(());
-        }
-        let m = r.start..r.end.min(mapped_len);
-        let m_len = m.end - m.start;
-        let segs = self.segments(terminal, mapped_len);
-        let affected: Vec<Segment> = segs
+    /// `None` for all of it, else the runs their selections take of it.
+    fn live_reads(&self) -> HashMap<NodeId, Option<Vec<Range<u32>>>> {
+        let anchors = self
+            .working_sets
             .iter()
-            .filter(|s| s.start < m.end as i64 && (m.start as i64) < s.end())
-            .copied()
-            .collect();
-        let affected_set: HashSet<NodeId> = affected.iter().map(|s| s.node).collect();
-
-        if self.is_private_to(ws, &affected_set) {
-            for seg in &affected {
-                let lo = seg.start.max(m.start as i64);
-                let hi = seg.end().min(m.end as i64);
-                let a = (lo - seg.start) as u64;
-                let b = (hi - seg.start) as u64;
-                freed.extend(self.drain_node(seg.node, a, b));
-            }
-            let shallowest = affected.last().expect("nonempty affected").node;
-            self.invalidate_subtree(shallowest);
-            let entry = self.entry_mut(ws)?;
-            entry.mapped_len -= m_len;
-            entry.set_page_len(entry.page_len - page_reduction);
-        } else if (m.start as i64) >= segs[0].start {
-            let t = segs[0].node;
-            let a = (m.start as i64 - segs[0].start) as u64;
-            let b = (m.end as i64 - segs[0].start) as u64;
-            let selection = self.selection_excluding(t, a, b);
-            freed.extend(self.move_terminal(ws, Some(selection))?);
-            let entry = self.entry_mut(ws)?;
-            entry.mapped_len -= m_len;
-            entry.set_page_len(entry.page_len - page_reduction);
-        } else if m.end == mapped_len {
-            let new_terminal = if m.start == 0 {
-                None
-            } else {
-                Some(self.boundary_terminal(&segs, m.start))
-            };
-            freed.extend(self.move_terminal(ws, new_terminal)?);
-            let entry = self.entry_mut(ws)?;
-            entry.mapped_len = m.start;
-            entry.set_page_len(entry.page_len - page_reduction);
-        } else if m.start == 0 {
-            let entry = self.entry_mut(ws)?;
-            entry.mapped_len -= m_len;
-            entry.set_page_len(entry.page_len - page_reduction);
-        } else {
-            debug_assert!(false, "discard apply diverged from legality pre-pass");
-            return Err(KvTableError::SharedInteriorDiscard);
-        }
-        Ok(())
-    }
-
-    fn mark_chains(&self, anchors: impl IntoIterator<Item = NodeId>) -> HashSet<NodeId> {
-        let mut marked: HashSet<NodeId> = HashSet::new();
+            .filter_map(|(_, e)| e.terminal)
+            .chain(self.pins.keys().copied());
+        let mut reads: HashMap<NodeId, Option<Vec<Range<u32>>>> = HashMap::new();
         for anchor in anchors {
-            let mut cursor = Some(anchor);
-            while let Some(node) = cursor {
-                if !marked.insert(node) {
+            let (mut cursor, mut read) = (anchor, None);
+            loop {
+                let seen = reads.contains_key(&cursor);
+                let entry = reads.entry(cursor).or_insert_with(|| Some(Vec::new()));
+                match (entry, read) {
+                    (Some(runs), Some(more)) => runs.extend(more),
+                    (entry, None) => *entry = None,
+                    (None, Some(_)) => {}
+                }
+                // What a node passes up to its parent depends on the node
+                // alone, so a chain already walked from here is done.
+                if seen {
                     break;
                 }
-                cursor = self.nodes.get(node).expect("live node").parent;
+                let node = self.nodes.get(cursor).expect("live node");
+                read = match &node.pages {
+                    Pages::ParentSelection { runs } => Some(runs.to_vec()),
+                    Pages::Owned { .. } => None,
+                };
+                match node.parent {
+                    Some(parent) => cursor = parent,
+                    None => break,
+                }
             }
         }
-        marked
+        reads
     }
 
-    /// The cache leases nothing live reads through: no working set's chain
-    /// and no pin passes their node.
-    fn unused_cache_roots(&self) -> Vec<NodeId> {
+    /// A prefix a live working set published is a selection beside its chain:
+    /// dropping it would cost the key and free none of its pages.
+    pub(super) fn unused_cache_roots(&self) -> Vec<NodeId> {
         if self.cache_roots.is_empty() {
             return Vec::new();
         }
-        let live = self.mark_chains(
-            self.working_sets
-                .iter()
-                .filter_map(|(_, e)| e.terminal)
-                .chain(self.pins.keys().copied()),
-        );
+        let reads = self.live_reads();
         self.cache_roots
             .keys()
             .copied()
-            .filter(|node| !live.contains(node))
+            .filter(|&root| {
+                let node = self.nodes.get(root).expect("live node");
+                let (source, runs) = match &node.pages {
+                    Pages::ParentSelection { runs } => {
+                        (node.parent.expect("selection has owner"), runs.clone())
+                    }
+                    Pages::Owned { backings, .. } => (root, smallvec![0..backings.len() as u32]),
+                };
+                match reads.get(&source) {
+                    None => true,
+                    Some(None) => false,
+                    Some(Some(read)) => !covers(read, &runs),
+                }
+            })
             .collect()
     }
 
-    /// The device pages [`Self::drop_unused_cache_leases`] would free now,
-    /// counted without freeing them: a node goes when every anchor on its
-    /// path is a dropped lease, and takes the pages it owns outright with it.
     pub fn unused_cache_lease_pages(&self) -> u32 {
-        let mut leases: HashMap<NodeId, u32> = HashMap::new();
-        for root in self.unused_cache_roots() {
-            let mut cursor = Some(root);
-            while let Some(node) = cursor {
-                *leases.entry(node).or_insert(0) += 1;
-                cursor = self.nodes.get(node).expect("live node").parent;
-            }
-        }
-        leases
-            .into_iter()
-            .map(
-                |(node, dropped)| match self.nodes.get(node).expect("live node") {
-                    KvTrieNode {
-                        path_anchors,
-                        pages: Pages::Owned { backings, .. },
-                        ..
-                    } if *path_anchors == dropped => backings
-                        .iter()
-                        .filter(|backing| matches!(backing, KvPageBacking::Resident(_)))
-                        .count() as u32,
-                    _ => 0,
-                },
-            )
-            .sum()
+        self.device_pages_freed(&self.unused_cache_roots())
     }
 
+    #[cfg(test)]
     pub fn drop_unused_cache_leases(&mut self) -> (usize, Vec<KvPageBacking>) {
         let dropped = self.unused_cache_roots();
         let mut freed = Vec::new();
@@ -1421,17 +1289,13 @@ impl KvPageTable {
         if mine.is_empty() {
             return ReclaimQuote::Nothing(NoReclaim::HoldsNothing);
         }
-        if !self.locations_held_by_pins(mine).is_empty() {
-            return ReclaimQuote::Nothing(NoReclaim::Pinned);
-        }
-        let shared_ws = match self.locations_shared_outward(working_sets, mine) {
-            Ok(shared) => shared,
+        let staying = match self.staying(working_sets, mine) {
+            Ok(staying) => staying,
             Err(_) => return ReclaimQuote::Nothing(NoReclaim::AllShared),
         };
-        let cache_held = self.locations_held_by_cache_roots(mine);
         let (mut pages, mut shared, mut swapped) = (0u32, 0usize, 0usize);
         for location in mine {
-            if cache_held.contains(location) || shared_ws.contains(location) {
+            if staying.contains(location) {
                 shared += 1;
                 continue;
             }
@@ -1448,50 +1312,17 @@ impl KvPageTable {
         }
     }
 
-    pub fn private_resident_pages(
-        &self,
-        working_sets: &HashSet<WorkingSetId>,
-    ) -> Result<(Vec<(TriePageLocation, PhysicalKvPageId)>, bool), KvTableError> {
-        let mut target = FxHashSet::default();
-        for &ws in working_sets {
-            self.visit_working_set_locations(ws, |location| {
-                target.insert(location);
-            })?;
-        }
-
-        if !self.locations_held_by_pins(&target).is_empty() {
-            return Ok((Vec::new(), true));
-        }
-
-        let shared_ws_set = self.locations_shared_outward(working_sets, &target)?;
-        let cache_only = self.locations_held_by_cache_roots(&target);
-
-        let pages: Vec<_> = target
-            .into_iter()
-            .filter(|location| !shared_ws_set.contains(location) && !cache_only.contains(location))
-            .filter_map(|location| match self.backing_at(&location).ok()? {
-                KvPageBacking::Resident(id) => Some((location, id)),
-                KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => None,
-            })
-            .collect();
-        Ok((pages, false))
-    }
-
-    pub fn post_drain_private_resident_pages(
+    /// pie cannot compute a dropped page again, so what a suspended process
+    /// reads must stay somewhere, and the device is for what runs.
+    pub fn movable_resident_pages(
         &self,
         working_sets: &HashSet<WorkingSetId>,
     ) -> Result<Vec<(TriePageLocation, PhysicalKvPageId)>, KvTableError> {
-        let mut target = FxHashSet::default();
-        for &ws in working_sets {
-            self.visit_working_set_locations(ws, |location| {
-                target.insert(location);
-            })?;
-        }
-        let shared_ws_set = self.locations_shared_outward(working_sets, &target)?;
-        let cache_only = self.locations_held_by_cache_roots(&target);
+        let target = self.locations(working_sets)?;
+        let staying = self.staying(working_sets, &target)?;
         Ok(target
             .into_iter()
-            .filter(|location| !shared_ws_set.contains(location) && !cache_only.contains(location))
+            .filter(|location| !staying.contains(location))
             .filter_map(|location| match self.backing_at(&location).ok()? {
                 KvPageBacking::Resident(id) => Some((location, id)),
                 KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => None,
@@ -1499,7 +1330,222 @@ impl KvPageTable {
             .collect())
     }
 
-    fn locations_shared_outward(
+    /// Only those pages stay; the rest of `working_sets` can still go.
+    fn staying(
+        &self,
+        working_sets: &HashSet<WorkingSetId>,
+        target: &FxHashSet<TriePageLocation>,
+    ) -> Result<FxHashSet<TriePageLocation>, KvTableError> {
+        let mut staying = self.locations_read_by_running(working_sets, target)?;
+        staying.extend(self.locations_held_by_pins(target));
+        Ok(staying)
+    }
+
+    /// A running reader kept them on the device and has gone since.
+    pub fn stranded_pages(
+        &self,
+        keep: &HashSet<WorkingSetId>,
+    ) -> Vec<(TriePageLocation, PhysicalKvPageId)> {
+        let mut running = FxHashSet::default();
+        for (ws, entry) in self.working_sets.iter() {
+            if !entry.suspended || keep.contains(&ws) {
+                let _ = self.visit_working_set_locations(ws, |location| {
+                    running.insert(location);
+                });
+            }
+        }
+        for &terminal in self.pins.keys() {
+            self.visit_anchor_locations(terminal, |location| {
+                running.insert(location);
+            });
+        }
+        // Reader by reader, so a sweep short of room moves whole readers.
+        let (mut seen, mut pages) = (FxHashSet::default(), Vec::new());
+        for (ws, entry) in self.working_sets.iter() {
+            if !entry.suspended {
+                continue;
+            }
+            let _ = self.visit_working_set_locations(ws, |location| {
+                if running.contains(&location) || !seen.insert(location) {
+                    return;
+                }
+                if let Ok(KvPageBacking::Resident(id)) = self.backing_at(&location) {
+                    pages.push((location, id));
+                }
+            });
+        }
+        pages
+    }
+
+    /// What the cache would drop, it can keep below the device instead.
+    pub fn cache_only_pages(
+        &self,
+        roots: &[NodeId],
+        above: &[NodeId],
+    ) -> Vec<(TriePageLocation, PhysicalKvPageId)> {
+        if roots.is_empty() {
+            return Vec::new();
+        }
+        let mut read = FxHashSet::default();
+        for (ws, _) in self.working_sets.iter() {
+            let _ = self.visit_working_set_locations(ws, |location| {
+                read.insert(location);
+            });
+        }
+        for &terminal in self.pins.keys().chain(above) {
+            self.visit_anchor_locations(terminal, |location| {
+                read.insert(location);
+            });
+        }
+        let (mut seen, mut pages) = (FxHashSet::default(), Vec::new());
+        for &root in roots {
+            if !self.nodes.contains(root) {
+                continue;
+            }
+            self.visit_anchor_locations(root, |location| {
+                if read.contains(&location)
+                    || self.swap_locations.contains(&location)
+                    || !seen.insert(location)
+                {
+                    return;
+                }
+                if let Ok(KvPageBacking::Resident(id)) = self.backing_at(&location) {
+                    pages.push((location, id));
+                }
+            });
+        }
+        pages
+    }
+
+    fn path_nodes(&self, root: NodeId) -> Vec<NodeId> {
+        let mut nodes = Vec::new();
+        let mut cursor = self.nodes.contains(root).then_some(root);
+        while let Some(node) = cursor {
+            nodes.push(node);
+            cursor = self.nodes.get(node).and_then(|n| n.parent);
+        }
+        nodes
+    }
+
+    pub fn holds_resident(&self, root: NodeId) -> bool {
+        self.path_nodes(root).into_iter().any(|node| {
+            matches!(
+                self.nodes.get(node).map(|n| &n.pages),
+                Some(Pages::Owned { backings, .. })
+                    if backings.iter().any(|backing| matches!(backing, KvPageBacking::Resident(_)))
+            )
+        })
+    }
+
+    /// A root whose pages all went below the device, or that shares them with a
+    /// live reader, frees none.
+    pub fn device_pages_freed(&self, roots: &[NodeId]) -> u32 {
+        let mut through: HashMap<NodeId, u32> = HashMap::new();
+        let mut exact: HashMap<NodeId, u32> = HashMap::new();
+        for &root in roots {
+            *exact.entry(root).or_insert(0) += 1;
+            for node in self.path_nodes(root) {
+                *through.entry(node).or_insert(0) += 1;
+            }
+        }
+        through
+            .iter()
+            .map(|(&node, &dropped)| {
+                let Some(entry) = self.nodes.get(node) else {
+                    return 0;
+                };
+                let Pages::Owned { backings, .. } = &entry.pages else {
+                    return 0;
+                };
+                let resident =
+                    |index: &usize| matches!(backings[*index], KvPageBacking::Resident(_));
+                if entry.path_anchors == dropped {
+                    return (0..backings.len()).filter(resident).count() as u32;
+                }
+                // Only selections still read it: it keeps the pages they take.
+                if entry.exact_anchors != exact.get(&node).copied().unwrap_or(0)
+                    || self
+                        .swap_locations
+                        .iter()
+                        .any(|location| location.node == node)
+                {
+                    return 0;
+                }
+                let mut taken = Vec::new();
+                for child in &entry.children {
+                    let child_entry = self.nodes.get(*child).expect("live child");
+                    if child_entry.path_anchors == through.get(child).copied().unwrap_or(0) {
+                        continue;
+                    }
+                    match &child_entry.pages {
+                        Pages::ParentSelection { runs } => taken.extend(runs.iter().cloned()),
+                        Pages::Owned { .. } => return 0,
+                    }
+                }
+                let kept: HashSet<u32> = union(taken).into_iter().flatten().collect();
+                (0..backings.len())
+                    .filter(|index| resident(index) && !kept.contains(&(*index as u32)))
+                    .count() as u32
+            })
+            .sum()
+    }
+
+    /// Dropping what holds it would change pages under the move.
+    pub fn in_move_at(&self, root: NodeId) -> bool {
+        if self.swap_locations.is_empty() {
+            return false;
+        }
+        let path: FxHashSet<NodeId> = self.path_nodes(root).into_iter().collect();
+        self.swap_locations
+            .iter()
+            .any(|location| path.contains(&location.node))
+    }
+
+    pub fn suspended_readers(
+        &self,
+        pages: &[(TriePageLocation, PhysicalKvPageId)],
+    ) -> HashSet<WorkingSetId> {
+        let pages: FxHashSet<TriePageLocation> = pages.iter().map(|(at, _)| *at).collect();
+        let mut readers = HashSet::new();
+        for (ws, entry) in self.working_sets.iter() {
+            if !entry.suspended {
+                continue;
+            }
+            let mut reads = false;
+            let _ = self.visit_working_set_locations(ws, |location| {
+                reads |= pages.contains(&location);
+            });
+            if reads {
+                readers.insert(ws);
+            }
+        }
+        readers
+    }
+
+    pub fn set_suspended(&mut self, working_sets: &HashSet<WorkingSetId>, suspended: bool) {
+        for &ws in working_sets {
+            if let Ok(entry) = self.entry_mut(ws) {
+                entry.suspended = suspended;
+            }
+        }
+    }
+
+    pub fn in_move(&self, working_sets: &HashSet<WorkingSetId>) -> Result<bool, KvTableError> {
+        Ok(self
+            .locations(working_sets)?
+            .iter()
+            .any(|location| self.swap_locations.contains(location)))
+    }
+
+    pub(super) fn settled_on_device(&self, terminal: NodeId) -> bool {
+        let mut settled = true;
+        self.visit_anchor_locations(terminal, |location| {
+            settled &= self.settled_at(&location);
+        });
+        settled
+    }
+
+    fn locations_read_by_running(
         &self,
         working_sets: &HashSet<WorkingSetId>,
         target: &FxHashSet<TriePageLocation>,
@@ -1508,11 +1554,11 @@ impl KvPageTable {
         if target.is_empty() {
             return Ok(shared);
         }
-        for (ws, _) in self.working_sets.iter() {
+        for (ws, entry) in self.working_sets.iter() {
             if shared.len() == target.len() {
                 break;
             }
-            if working_sets.contains(&ws) {
+            if entry.suspended || working_sets.contains(&ws) {
                 continue;
             }
             self.visit_working_set_locations(ws, |location| {
@@ -1522,27 +1568,6 @@ impl KvPageTable {
             })?;
         }
         Ok(shared)
-    }
-
-    fn locations_held_by_cache_roots(
-        &self,
-        target: &FxHashSet<TriePageLocation>,
-    ) -> FxHashSet<TriePageLocation> {
-        let mut held = FxHashSet::default();
-        if target.is_empty() {
-            return held;
-        }
-        for &terminal in self.cache_roots.keys() {
-            if held.len() == target.len() {
-                break;
-            }
-            self.visit_anchor_locations(terminal, |location| {
-                if target.contains(&location) {
-                    held.insert(location);
-                }
-            });
-        }
-        held
     }
 
     fn locations_held_by_pins(
@@ -1570,11 +1595,8 @@ impl KvPageTable {
         &self,
         working_sets: &HashSet<WorkingSetId>,
     ) -> Result<Vec<(TriePageLocation, KvPageBacking)>, KvTableError> {
-        let mut locations = HashSet::new();
-        for &ws in working_sets {
-            locations.extend(self.working_set_locations(ws)?);
-        }
-        Ok(locations
+        Ok(self
+            .locations(working_sets)?
             .into_iter()
             .filter_map(|location| match self.backing_at(&location).ok()? {
                 KvPageBacking::Resident(_) => None,
@@ -1584,11 +1606,7 @@ impl KvPageTable {
     }
 
     pub fn held_pages(&self, working_sets: &HashSet<WorkingSetId>) -> Result<usize, KvTableError> {
-        let mut locations = HashSet::new();
-        for &ws in working_sets {
-            locations.extend(self.working_set_locations(ws)?);
-        }
-        Ok(locations.len())
+        Ok(self.locations(working_sets)?.len())
     }
 
     pub fn pin_working_sets(
@@ -1630,12 +1648,15 @@ impl KvPageTable {
     }
 
     pub fn page_location_pinned(&self, location: TriePageLocation) -> bool {
-        self.swap_locations.contains_key(&location)
+        self.swap_locations.contains(&location)
     }
 
+    /// One move has a page at a time: every move leaves out, or waits for, the
+    /// pages another holds.
     pub fn pin_swap_locations<I: IntoIterator<Item = TriePageLocation>>(&mut self, locations: I) {
         for location in locations {
-            *self.swap_locations.entry(location).or_insert(0) += 1;
+            let fresh = self.swap_locations.insert(location);
+            debug_assert!(fresh, "a page in two residency moves");
         }
     }
 
@@ -1645,12 +1666,8 @@ impl KvPageTable {
     ) -> Vec<KvPageBacking> {
         let mut owners = HashSet::new();
         for location in locations {
-            if let Some(count) = self.swap_locations.get_mut(&location) {
-                *count -= 1;
-                if *count == 0 {
-                    self.swap_locations.remove(&location);
-                    owners.insert(location.node);
-                }
+            if self.swap_locations.remove(&location) {
+                owners.insert(location.node);
             }
         }
         let mut freed = Vec::new();
@@ -1684,35 +1701,16 @@ impl KvPageTable {
         Ok(())
     }
 
-    pub fn backing_counts(&self) -> (usize, usize) {
-        self.nodes
-            .iter()
-            .fold((0, 0), |(resident, swapped), (_, node)| match &node.pages {
-                Pages::Owned { backings, .. } => {
-                    backings
-                        .iter()
-                        .fold(
-                            (resident, swapped),
-                            |(resident, swapped), backing| match backing {
-                                KvPageBacking::Resident(_) => (resident + 1, swapped),
-                                KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => {
-                                    (resident, swapped + 1)
-                                }
-                            },
-                        )
-                }
-                Pages::ParentSelection { .. } => (resident, swapped),
-            })
-    }
-
-    fn working_set_locations(
+    fn locations(
         &self,
-        ws: WorkingSetId,
-    ) -> Result<HashSet<TriePageLocation>, KvTableError> {
-        let mut locations = HashSet::new();
-        self.visit_working_set_locations(ws, |location| {
-            locations.insert(location);
-        })?;
+        working_sets: &HashSet<WorkingSetId>,
+    ) -> Result<FxHashSet<TriePageLocation>, KvTableError> {
+        let mut locations = FxHashSet::default();
+        for &ws in working_sets {
+            self.visit_working_set_locations(ws, |location| {
+                locations.insert(location);
+            })?;
+        }
         Ok(locations)
     }
 
@@ -1729,14 +1727,6 @@ impl KvPageTable {
             }
         }
         Ok(())
-    }
-
-    fn anchor_locations(&self, terminal: NodeId) -> HashSet<TriePageLocation> {
-        let mut locations = HashSet::new();
-        self.visit_anchor_locations(terminal, |location| {
-            locations.insert(location);
-        });
-        locations
     }
 
     fn visit_anchor_locations(&self, terminal: NodeId, mut visit: impl FnMut(TriePageLocation)) {
@@ -1770,24 +1760,29 @@ impl KvPageTable {
         if node.exact_anchors != 0
             || self
                 .swap_locations
-                .keys()
+                .iter()
                 .any(|location| location.node == owner)
         {
             return Vec::new();
         }
-        let (sole_child, runs) = {
+        // Below a node nothing anchors, only selections read it: it keeps
+        // the pages some selection takes, and its other pages go.
+        let (children, kept) = {
             let n = self.nodes.get(owner).expect("live node");
-            if !matches!(n.pages, Pages::Owned { .. }) || n.children.len() != 1 {
+            if !matches!(n.pages, Pages::Owned { .. }) || n.children.is_empty() {
                 return Vec::new();
             }
-            let child = n.children[0];
-            match &self.nodes.get(child).expect("live child").pages {
-                Pages::ParentSelection { runs } => (child, runs.clone()),
-                Pages::Owned { .. } => return Vec::new(),
+            let mut taken = Vec::new();
+            for &child in &n.children {
+                match &self.nodes.get(child).expect("live child").pages {
+                    Pages::ParentSelection { runs } => taken.extend(runs.iter().cloned()),
+                    Pages::Owned { .. } => return Vec::new(),
+                }
             }
+            (n.children.clone(), union(taken))
         };
 
-        let kept: Vec<u32> = runs.iter().flat_map(|r| r.clone()).collect();
+        let kept: Vec<u32> = kept.iter().flat_map(|r| r.clone()).collect();
         let node = self.nodes.get_mut(owner).expect("live node");
         let (backings, token_hashes, page_hashes) = match &mut node.pages {
             Pages::Owned {
@@ -1819,56 +1814,42 @@ impl KvPageTable {
         *backings = new_backings;
         *token_hashes = new_tokens;
         *page_hashes = new_pages;
-        node.cached_path_hash = None;
 
-        let kept_len = kept.len() as u32;
-        match &mut self.nodes.get_mut(sole_child).expect("live child").pages {
-            Pages::ParentSelection { runs } => *runs = smallvec![0..kept_len],
-            Pages::Owned { .. } => unreachable!("checked selection"),
+        // A kept page's new index is its rank among the kept, so a run of
+        // consecutive pages stays one.
+        for child in children {
+            match &mut self.nodes.get_mut(child).expect("live child").pages {
+                Pages::ParentSelection { runs } => {
+                    let mut moved: Runs = SmallVec::new();
+                    for r in runs.iter() {
+                        let start = kept.partition_point(|&index| index < r.start) as u32;
+                        push_coalesced(&mut moved, start..start + (r.end - r.start));
+                    }
+                    *runs = moved;
+                }
+                Pages::Owned { .. } => unreachable!("checked selections"),
+            }
         }
         freed
     }
+}
 
-    fn node_path_hash(&mut self, node: NodeId) -> Option<Hash256> {
-        let mut chain = Vec::new();
-        let mut base: Option<Hash256> = None;
-        let mut cursor = Some(node);
-        while let Some(n) = cursor {
-            if let Some(hash) = self.nodes.get(n).expect("live node").cached_path_hash {
-                base = Some(hash);
-                break;
-            }
-            chain.push(n);
-            cursor = self.predecessor(n);
-        }
-        let mut acc = base;
-        for &n in chain.iter().rev() {
-            let pages = self.contribution_page_hashes(n)?;
-            acc = hash::fold_path_hash(acc, &pages);
-            if let Some(hash) = acc {
-                self.nodes.get_mut(n).expect("live node").cached_path_hash = Some(hash);
-            }
-        }
-        acc
-    }
+fn hold(holds: &mut HashMap<NodeId, u32>, node: NodeId) -> bool {
+    let count = holds.entry(node).or_insert(0);
+    *count += 1;
+    *count == 1
+}
 
-    fn contribution_page_hashes(&self, node: NodeId) -> Option<Vec<Hash256>> {
-        let n = self.nodes.get(node).expect("live node");
-        match &n.pages {
-            Pages::Owned { page_hashes, .. } => page_hashes.iter().copied().collect(),
-            Pages::ParentSelection { runs } => {
-                let owner = n.parent.expect("selection has owner");
-                match &self.nodes.get(owner).expect("live owner").pages {
-                    Pages::Owned { page_hashes, .. } => runs
-                        .iter()
-                        .flat_map(|r| r.clone())
-                        .map(|i| page_hashes[i as usize])
-                        .collect(),
-                    Pages::ParentSelection { .. } => unreachable!("owner must be owned"),
-                }
-            }
-        }
+fn let_go(holds: &mut HashMap<NodeId, u32>, node: NodeId) -> bool {
+    let Some(count) = holds.get_mut(&node) else {
+        return false;
+    };
+    *count -= 1;
+    if *count > 0 {
+        return false;
     }
+    holds.remove(&node);
+    true
 }
 
 fn runs_len(runs: &Runs) -> u64 {
@@ -1903,13 +1884,24 @@ fn runs_slice(runs: &Runs, sel: Range<u64>) -> Runs {
     out
 }
 
-fn runs_remove(runs: &Runs, a: u64, b: u64) -> Runs {
-    let total = runs_len(runs);
-    let mut out = runs_slice(runs, 0..a);
-    for r in runs_slice(runs, b..total) {
-        push_coalesced(&mut out, r);
+fn union(mut runs: Vec<Range<u32>>) -> Vec<Range<u32>> {
+    runs.retain(|r| !r.is_empty());
+    runs.sort_unstable_by_key(|r| r.start);
+    let mut merged: Vec<Range<u32>> = Vec::new();
+    for r in runs {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
     }
-    out
+    merged
+}
+
+fn covers(read: &[Range<u32>], runs: &Runs) -> bool {
+    let read = union(read.to_vec());
+    runs.iter()
+        .filter(|r| !r.is_empty())
+        .all(|r| read.iter().any(|m| m.start <= r.start && r.end <= m.end))
 }
 
 fn push_coalesced(out: &mut Runs, range: Range<u32>) {

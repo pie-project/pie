@@ -23,7 +23,7 @@ pub fn build(
         );
     }
     let model = build_model(&user.model, &user.runtime, engines, metadata)?;
-    Ok(runtime_config(user, home, builtins, model))
+    runtime_config(user, home, builtins, model)
 }
 
 /// A runtime with no engine over `artifact`, keyed by its stamped `deployment`.
@@ -34,7 +34,7 @@ pub fn build_without_engine(
     artifact: &Path,
     deployment: &str,
     metadata: runtime::model::ModelMetadata,
-) -> runtime::bootstrap::Config {
+) -> Result<runtime::bootstrap::Config> {
     let model = runtime::bootstrap::ModelConfig {
         name: user.model.name.clone(),
         model_id: deployment.to_string(),
@@ -66,8 +66,16 @@ fn runtime_config(
     home: &Path,
     builtin_programs: Vec<runtime::bootstrap::BuiltinProgram>,
     model: runtime::bootstrap::ModelConfig,
-) -> runtime::bootstrap::Config {
-    runtime::bootstrap::Config {
+) -> Result<runtime::bootstrap::Config> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let policy = match user.runtime.policy.as_deref() {
+        Some(spec) => Some((spec.to_string(), builtins::policy_component(spec)?)),
+        None => None,
+    };
+    // The browser runs no policy.
+    #[cfg(target_arch = "wasm32")]
+    let policy = None;
+    Ok(runtime::bootstrap::Config {
         host: user.server.host.clone(),
         port: user.server.port,
         cache_dir: home.join("inferlets"),
@@ -96,7 +104,8 @@ fn runtime_config(
         model,
         skip_tracing: true,
         max_concurrent_processes: user.runtime.max_concurrent_processes,
-    }
+        policy,
+    })
 }
 
 fn scheduler(runtime: &config::RuntimeConfig) -> runtime::bootstrap::SchedulerConfig {
@@ -146,6 +155,8 @@ fn build_model(
                 rs_cache_slots: g.caps.pools.state_slots as usize,
                 rs_cache_slot_bytes: g.caps.pools.state_slot_bytes,
                 rs_host_slots: g.caps.pools.host_state_slots as usize,
+                rs_buffer_pages: g.caps.pools.buffer_pages,
+                rs_host_buffer_pages: g.caps.pools.host_buffer_pages,
                 has_mtp_logits: g.caps.profile.has_mtp_logits,
                 mtp_depth: g.caps.profile.mtp_depth,
                 draft_block: g.caps.profile.draft_block,
@@ -157,6 +168,7 @@ fn build_model(
                 has_attn_page_mask: g.caps.profile.has_attn_page_mask,
                 has_attn_score: g.caps.profile.has_attn_score,
                 has_lora: g.caps.profile.has_lora,
+                adapter_attachments: g.caps.adapter_attachments,
                 device_geometry_port_mask: g.caps.ports,
                 facts: g.caps.facts.clone(),
                 limits: runtime::engine::SchedulerLimits {
@@ -165,6 +177,7 @@ fn build_model(
                     max_page_refs: g.caps.limits.max_page_refs as usize,
                     max_context: g.caps.limits.max_context as usize,
                     prefill_rows: g.caps.limits.prefill_rows as usize,
+                    max_readouts: g.caps.limits.max_readouts as usize,
                 },
                 engine_backend: g.backend,
             }

@@ -1,6 +1,6 @@
 //! Classifier-free guidance for language models (Sanchez et al., 2306.17806).
 //!
-//! Each decode fire runs the bound model over two rows with independent KV states: the
+//! Each decode fire runs the bound model over two lanes with independent states: the
 //! conditional stream sees the full prompt, the unconditional stream sees only
 //! the negative prompt (empty by default). The paper's Eqn 4 is applied to
 //! **log-probabilities**, not raw logits — the two streams have different
@@ -23,11 +23,10 @@
 //! log-probabilities and this works in logits, which differ by the per-stream
 //! `logsumexp` constant. That constant is uniform over the vocabulary, so it
 //! shifts every entry of the blended vector by the same amount and cancels in
-//! the softmax. See
-//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+//! the softmax.
 
 use inferlet::chat;
-use inferlet::eta::hybrid::prelude::*;
+use inferlet::eta::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -56,12 +55,7 @@ fn default_guidance() -> f32 {
 
 /// The report the other sampler programs answer with (`tova-attention`,
 /// `entropy-adaptive-temperature`, ...): the text, the counts, and what the
-/// rule did. `#[inferlet::main]` serialises a struct with serde_json and
-/// returns a `String` verbatim, so the prose this program used to return
-/// ("<text>\n\n[cfg] guidance=...") reached `scripts/bench/pie_bench.py` as a
-/// reply it could not parse -- "Expecting value" at the first character of the
-/// continuation, or an unescaped control character once the continuation
-/// happened to open with a quote.
+/// rule did, as JSON `scripts/bench/pie_bench.py` can parse.
 #[derive(Serialize)]
 struct Output {
     sampler: &'static str,
@@ -108,37 +102,15 @@ fn guided_pick(
     )
 }
 
-/// One recurrent working set PER SEQUENCE on a hybrid model (the engine
-/// requires one per request row, and guidance runs two rows: the conditional
-/// stream and the unconditional one); none on a pure-attention model, where an
-/// empty binding IS the attention pass. Guidance never buffers: every fire
-/// folds straight into the recurrence, so the fold boundary is the fire's own
-/// extent.
-fn rs_for_sequence() -> Result<Vec<RsWorkingSet>> {
-    match model::pass_kind() {
-        model::ForwardKind::Attention => Ok(Vec::new()),
-        model::ForwardKind::Hybrid => Ok(vec![RsWorkingSet::new()]),
-        model::ForwardKind::Recurrent => Err(
-            "classifier-free guidance has no recurrent-only path: it reads two KV streams".into(),
-        ),
-        model::ForwardKind::Diffusion => Err(
-            "this program decodes a token at a time; a diffusion model wants a canvas loop".into(),
-        ),
-    }
-}
-
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     if !input.guidance.is_finite() || input.guidance < 0.0 {
         return Err("guidance must be finite and non-negative".into());
     }
 
-    let max_tokens =
-        u32::try_from(input.max_tokens).map_err(|_| "max_tokens exceeds the u32 range")?;
     let vocab = model::output_vocab_size();
     let gamma = input.guidance;
     let stop_tokens = chat::stop_tokens();
-    let page_t = kv_page_size();
 
     let mut cond_prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
     cond_prompt.extend(chat::cue());
@@ -160,19 +132,12 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let nu = u32::try_from(uncond_prompt.len()).map_err(|_| "negative prompt is too long")?;
-    // Both streams are rows of one working set: row 0 (unconditional) owns
-    // pages [0, up), row 1 (conditional) owns [up, up + cp).
-    let up = (nu + max_tokens).div_ceil(page_t);
-    let cp = (nc + max_tokens).div_ceil(page_t);
-    let ws = WorkingSet::new();
-    ws.reserve(up + cp).context("reserve KV")?;
-    let rs: Vec<RsWorkingSet> = rs_for_sequence()?
-        .into_iter()
-        .chain(rs_for_sequence()?)
-        .collect();
+    let uncond_ws = WorkingSet::new();
+    let cond_ws = WorkingSet::new();
+    let streams = [&uncond_ws, &cond_ws];
     let pipeline = Pipeline::new();
 
-    // Both prompts but their last tokens prefill as the two rows of one fire;
+    // Both prompts but their last tokens prefill as the two lanes of one pass;
     // the last tokens are the first decode fire's input, so both logit rows
     // are born together.
     if nu < 2 || nc < 2 {
@@ -184,44 +149,12 @@ async fn main(input: Input) -> Result<Output> {
         .chain(&cond_prompt[..pc as usize])
         .map(|&t| t as i32)
         .collect();
-    let rows = || (0..pu).map(|p| (0, p)).chain((0..pc).map(|p| (up, p)));
     let pre_toks = Channel::from(toks).named("prefill_tokens");
     let pre_indptr = Channel::from([0u32, pu, pu + pc]).named("prefill_embed_indptr");
-    let pre_pages =
-        Channel::from_iter((0..pu.div_ceil(page_t)).chain(up..up + pc.div_ceil(page_t)));
-    let pre_page_indptr = Channel::from([
-        0u32,
-        pu.div_ceil(page_t),
-        pu.div_ceil(page_t) + pc.div_ceil(page_t),
-    ]);
-    let pre_slot = Channel::from_iter(rows().map(|(base, p)| base + p / page_t));
-    let pre_off = Channel::from_iter(rows().map(|(_, p)| p % page_t));
-    let pre_pos = Channel::from_iter(rows().map(|(_, p)| p));
-    let pre_klen = Channel::from([pu, pc]);
     let drop = Channel::new([1], dtype::i32).named("prefill_drop");
     let prefill = ForwardPass::new();
     prefill.embed(&pre_toks, &pre_indptr)?;
-    prefill.attention(
-        Some(KvBinding {
-            working_set: &ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &pre_klen,
-                pages: &pre_pages,
-                page_indptr: &pre_page_indptr,
-                w_slot: &pre_slot,
-                w_off: &pre_off,
-                positions: &pre_pos,
-                mask: None,
-            },
-        }),
-        &rs,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
-        },
-    )?;
+    prefill.state(&streams, StateGeometry::folding())?;
     // A pass needs an epilogue; this one's output is drained and dropped.
     prefill.epilogue(move || {
         let flat = reshape(intrinsics::logits(), [2 * vocab]);
@@ -230,80 +163,28 @@ async fn main(input: Input) -> Result<Output> {
     prefill.submit(&pipeline).context("prefill")?;
     drop.take_host::<i32>().await?;
 
-    // ---- decode: one two-row fire per token, device-resident -------------
-    // Row 0 is the unconditional stream, row 1 the conditional one. The epilogue
-    // mixes both logit rows on the device and feeds the guided token back to
-    // both rows, so only the token and its two diagnostics cross to the host.
-    let n_pages = up + cp;
-    let live_pages = |pc0: u32, pc1: u32| -> (Vec<u32>, [u32; 3]) {
-        let pages = (0..n_pages)
-            .map(|i| if i < pc0 { i } else { i + up - pc0 })
-            .collect();
-        (pages, [0, pc0, pc0 + pc1])
-    };
-    let (pages0, indptr0) = live_pages(nu.div_ceil(page_t), nc.div_ceil(page_t));
     let toks = Channel::from([
         *uncond_prompt.last().unwrap() as i32,
         *cond_prompt.last().unwrap() as i32,
     ])
     .named("toks");
     let embed_indptr = Channel::from([0u32, 1, 2]).named("embed_indptr");
-    let pos = Channel::from([nu - 1, nc - 1]).named("positions");
-    let klen = Channel::from([nu, nc]).named("kv_len");
-    let pages = Channel::from(pages0).named("pages");
-    let page_indptr = Channel::from(indptr0).named("page_indptr");
-    let w_slot = Channel::from([(nu - 1) / page_t, up + (nc - 1) / page_t]).named("w_slot");
-    let w_off = Channel::from([(nu - 1) % page_t, (nc - 1) % page_t]).named("w_off");
     let out = Channel::new([3], dtype::f32)
         .capacity(channel_capacity() as u32)
         .named("out");
 
     let decode = ForwardPass::new();
     decode.embed(&toks, &embed_indptr)?;
-    decode.attention(
-        Some(KvBinding {
-            working_set: &ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &klen,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &pos,
-                mask: None,
-            },
-        }),
-        &rs,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
-        },
-    )?;
+    decode.state(&streams, StateGeometry::folding())?;
     decode.epilogue(move || {
         let logits = reshape(intrinsics::logits(), [2, vocab]);
         let uncond = reshape(gather(&logits, iota(1)), [vocab]);
         let cond = reshape(gather(&logits, iota(1) + 1u32), [vocab]);
         let (token, shift, kl) = guided_pick(&cond, &uncond, gamma);
 
-        let length = klen.take();
-        let next_length = &length + 1u32;
-        let base = iota(2) * up;
         toks.put(broadcast(&token, [2]));
-        pos.put(&length);
-        klen.put(&next_length);
-        w_slot.put(&base + &length / page_t);
-        w_off.put(&length % page_t);
 
-        let page_count = next_length.div_ceil(page_t);
-        let pc0 = broadcast(gather(&page_count, iota(1)), [n_pages]);
-        let i = iota(n_pages);
-        pages.put(select(lt(&i, &pc0), &i, &i + up - &pc0));
         let k = iota(3);
-        let prefix = gather(cumsum(&page_count), max_elem(&k, 1u32) - 1u32);
-        page_indptr.put(&prefix * cast(gt(&k, 0u32), dtype::u32));
-
         let token_f = broadcast(cast(&token, dtype::f32), [3]);
         let shift_f = broadcast(cast(&shift, dtype::f32), [3]);
         let kl_b = broadcast(&kl, [3]);

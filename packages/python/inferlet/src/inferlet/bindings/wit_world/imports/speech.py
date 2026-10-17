@@ -5,8 +5,8 @@ Native audio OUTPUT — the inverse of media.wit. See AUDIO_OUTPUT.md.
 
 The engine owns the CSM backbone (16-layer Llama, reuses the verified naive
 forward) + the depth decoder (4-layer RVQ frame sampler, verified by
-crates/driver-cuda/csrc/tests/csm_depth_decoder_parity.cu) + the Mimi decoder (codes ->
-waveform, verified by crates/driver-cuda/csrc/tests/mimi_decoder_full_parity.cu).
+driver/cuda/tests/csm_depth_decoder_parity.cu) + the Mimi decoder (codes ->
+waveform, verified by driver/cuda/tests/mimi_decoder_full_parity.cu).
 
 **Model-agnostic by construction, mirroring media.wit.** The inferlet supplies
 neutral intent — the text to speak, a voice selector, an optional target

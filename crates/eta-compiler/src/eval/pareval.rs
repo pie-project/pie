@@ -402,11 +402,8 @@ mod tests {
             ports: vec![
                 port(Port::EmbedTokens, 0),
                 port(Port::Positions, 2),
-                port(Port::Pages, 3),
-                port(Port::PageIndptr, 4),
                 port(Port::KvLen, 5),
-                port(Port::WSlot, 6),
-                port(Port::WOff, 7),
+                port(Port::Slots, 6),
             ],
             stages: vec![StageProgram {
                 stage: Stage::Prologue,
@@ -530,13 +527,12 @@ mod tests {
                 Port::EmbedTokens => {
                     assert_eq!(slot, Err(EvalBlocker::UnknownChannel(0)));
                 }
-                Port::Positions | Port::KvLen | Port::WSlot | Port::WOff | Port::PageIndptr => {
+                Port::Positions | Port::KvLen | Port::Slots => {
                     assert!(
                         matches!(slot, Err(EvalBlocker::UnknownChannel(0 | 1))),
                         "{port:?}: {slot:?}"
                     );
                 }
-                Port::Pages => assert!(slot.is_ok()),
                 other => panic!("unexpected port {other:?}"),
             }
         }

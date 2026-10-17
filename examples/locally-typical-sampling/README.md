@@ -9,8 +9,7 @@ simply most probable.
 Meister, Pimentel, Wiher and Cotterell, ***Locally Typical Sampling*** (TACL) —
 <https://arxiv.org/abs/2202.00666>. Implements §3, Eq. 6.
 
-**Faithfulness: Exact.** See the per-line reduction in
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+**Faithfulness: Exact.**
 
 ## What it does
 

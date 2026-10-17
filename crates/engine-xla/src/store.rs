@@ -623,6 +623,54 @@ impl Pools {
         crate::exec::maintain(device, tracer, self)
     }
 
+    #[must_use]
+    pub fn buffer_pages(&self) -> u32 {
+        if self.rs_buffers.is_empty() {
+            0
+        } else {
+            self.paging.slots.max(1)
+        }
+    }
+
+    pub fn copy_pages(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        moves: &[(u32, u32)],
+    ) -> Result<()> {
+        if moves.is_empty() {
+            return Ok(());
+        }
+        let pages = self.buffer_pages();
+        if let Some(&page) = moves
+            .iter()
+            .flat_map(|(a, b)| [a, b])
+            .find(|&&page| page >= pages)
+        {
+            return Err(Fault::Ceiling {
+                what: "recurrent buffer pages",
+                need: u64::from(page) + 1,
+                have: u64::from(pages),
+            });
+        }
+        let rows = i64::from(self.paging.page_size.max(1));
+        let tracer = Tracer::new(handles);
+        for &t in &self.rs_buffers {
+            tracer.emit(&mut |cx| {
+                let mut whole = cx.read(t)?;
+                for &(src, dst) in moves {
+                    let page =
+                        cx.slice_axis(whole, 0, i64::from(src) * rows, i64::from(src + 1) * rows)?;
+                    let at = cx.const_i(Elem::I32, i64::from(dst) * rows, &[]);
+                    let col = cx.const_i(Elem::I32, 0, &[]);
+                    whole = cx.dynamic_update_slice(whole, page, &[at, col])?;
+                }
+                cx.write(t, whole)
+            })?;
+        }
+        crate::exec::maintain(device, tracer, self)
+    }
+
     /// Applies kv `moves` to every full kv plane and `windowed` (whole
     /// pages, in the windowed pool's own ids) to every windowed one: per
     /// plane, one gather of the source cells, one scatter onto the

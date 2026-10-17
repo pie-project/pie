@@ -819,6 +819,7 @@ impl Shell {
                     .map(|dir| dir.join(kernels_cuda::disk::CUBINS)),
             )),
             settlement: crate::settle::Settlement::open(boot.runahead.staging_depth())?,
+            taps: Vec::new(),
             airborne,
             owed: None,
             guest_landed: crate::device::graph::Event::new()?,

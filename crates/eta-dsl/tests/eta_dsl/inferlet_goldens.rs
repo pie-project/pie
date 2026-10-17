@@ -42,36 +42,15 @@ fn s3() -> Traced {
 }
 
 fn text_completion_decode() -> Traced {
-    let n = 5u32;
-    let page_size = PAGE;
     let tok_in: &'static Channel = leak(Channel::from([42i32]).named("tok_in"));
     let embed_indptr: &'static Channel = leak(Channel::from([0u32, 1]).named("embed_indptr"));
-    let positions: &'static Channel = leak(Channel::from([n]).named("positions"));
-    let pages: &'static Channel = leak(Channel::from((0..3u32).collect::<Vec<_>>()).named("pages"));
-    let page_indptr: &'static Channel =
-        leak(Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr"));
-    let w_slot: &'static Channel = leak(Channel::from([n / page_size]).named("w_slot"));
-    let w_off: &'static Channel = leak(Channel::from([n % page_size]).named("w_off"));
-    let kv_len: &'static Channel = leak(Channel::from([n + 1]).named("kv_len"));
+    let fold: &'static Channel = leak(Channel::from([u32::MAX]).named("fold"));
     let tok_out: &'static Channel = leak(Channel::new([1], dtype::i32).named("tok_out"));
     let mut b = Builder::new(VOCAB, PAGE);
     b.bind_port(Port::EmbedTokens, tok_in);
     b.bind_port(Port::EmbedIndptr, embed_indptr);
-    b.bind_port(Port::KvLen, kv_len);
-    b.bind_port(Port::Pages, pages);
-    b.bind_port(Port::PageIndptr, page_indptr);
-    b.bind_port(Port::WSlot, w_slot);
-    b.bind_port(Port::WOff, w_off);
-    b.bind_port(Port::Positions, positions);
+    b.bind_port(Port::Fold, fold);
     b.stage(Stage::Epilogue, move || {
-        let length = kv_len.take();
-        let next_length = &length + 1u32;
-        let page_count = next_length.div_ceil(page_size);
-        kv_len.put(&next_length);
-        positions.put(&length);
-        w_slot.put(&length / page_size);
-        w_off.put(&length % page_size);
-        page_indptr.put(indptr(1, &page_count));
         tok_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
     });
     tok_out.note_host_take();
@@ -79,8 +58,6 @@ fn text_completion_decode() -> Traced {
 }
 
 fn naive_decode() -> Traced {
-    let n = 7u32;
-    let page_size = PAGE;
     let temperature = 0.7f32;
     let cap = 8u32;
     let tok_in: &'static Channel = leak(Channel::from([3i32]).named("tok_in"));
@@ -92,37 +69,18 @@ fn naive_decode() -> Traced {
     let s2_out: &'static Channel =
         leak(Channel::new([1], dtype::f32).capacity(cap).named("s2_out"));
     let lane1: &'static Channel = leak(Channel::from([0u32, 1u32]).named("embed_indptr"));
-    let positions: &'static Channel = leak(Channel::from([n]).named("positions"));
-    let pages: &'static Channel = leak(Channel::from((0..4u32).collect::<Vec<_>>()).named("pages"));
-    let page_indptr: &'static Channel =
-        leak(Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr"));
-    let w_slot: &'static Channel = leak(Channel::from([n / page_size]).named("w_slot"));
-    let w_off: &'static Channel = leak(Channel::from([n % page_size]).named("w_off"));
-    let kv_len: &'static Channel = leak(Channel::from([n + 1]).named("kv_len"));
+    let fold: &'static Channel = leak(Channel::from([u32::MAX]).named("fold"));
     let mut b = Builder::new(VOCAB, PAGE);
     b.bind_port(Port::EmbedTokens, tok_in);
     b.bind_port(Port::EmbedIndptr, lane1);
-    b.bind_port(Port::KvLen, kv_len);
-    b.bind_port(Port::Pages, pages);
-    b.bind_port(Port::PageIndptr, page_indptr);
-    b.bind_port(Port::WSlot, w_slot);
-    b.bind_port(Port::WOff, w_off);
-    b.bind_port(Port::Positions, positions);
+    b.bind_port(Port::Fold, fold);
     b.stage(Stage::Epilogue, move || {
-        let length = kv_len.take();
         let r = rng.take();
         let logits = intrinsics::logits();
         let scaled = &logits / temperature;
         let token = gumbel_max(scaled, &r);
         let r_next = &r + iota(2);
-        let next_length = &length + 1u32;
-        let page_count = next_length.div_ceil(page_size);
         tok_in.put(&token);
-        kv_len.put(&next_length);
-        positions.put(&length);
-        w_slot.put(&length / page_size);
-        w_off.put(&length % page_size);
-        page_indptr.put(indptr(1, &page_count));
         tok_out.put(&token);
         let mirror = reshape(cast(&token, dtype::f32), [1]);
         s1_out.put(&mirror);
@@ -251,8 +209,6 @@ fn diffusion_step() -> Traced {
     let taps = 4u32;
     let base = 5u32;
     let end = base + length;
-    let page_size = PAGE;
-    let max_pages = 2u32;
     let bound = 0.5f32;
     let confidence = 0.1f32;
     let toks: &'static Channel = leak(
@@ -266,14 +222,6 @@ fn diffusion_step() -> Traced {
     let embed_indptr: &'static Channel = leak(Channel::from([0u32, length]).named("embed_indptr"));
     let positions: &'static Channel =
         leak(Channel::from((base..end).collect::<Vec<_>>()).named("positions"));
-    let pages: &'static Channel =
-        leak(Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages"));
-    let page_indptr: &'static Channel =
-        leak(Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr"));
-    let w_slot: &'static Channel =
-        leak(Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot"));
-    let w_off: &'static Channel =
-        leak(Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off"));
     let kv_len: &'static Channel = leak(Channel::from([end]).named("kv_len"));
     let readout: &'static Channel =
         leak(Channel::from((0..length).collect::<Vec<_>>()).named("readout"));
@@ -293,16 +241,10 @@ fn diffusion_step() -> Traced {
     b.bind_port(Port::EmbedTokens, toks);
     b.bind_port(Port::EmbedIndptr, embed_indptr);
     b.bind_port(Port::KvLen, kv_len);
-    b.bind_port(Port::Pages, pages);
-    b.bind_port(Port::PageIndptr, page_indptr);
-    b.bind_port(Port::WSlot, w_slot);
-    b.bind_port(Port::WOff, w_off);
     b.bind_port(Port::Positions, positions);
     b.bind_port(Port::Readout, readout);
     b.stage(Stage::Epilogue, move || {
         positions.put(positions.take());
-        w_slot.put(w_slot.take());
-        w_off.put(w_off.take());
 
         let r = rng_state.take();
         let t = reshape(temp.read(), []);
@@ -361,12 +303,8 @@ fn diffusion_step() -> Traced {
 fn beam_step() -> Traced {
     #[allow(non_snake_case)]
     let B = 2u32;
-    let pool_pages = 8u32;
-    let page_t = PAGE;
-    let pool_len = pool_pages * page_t;
+    let pool_len = 8 * PAGE;
     let v = VOCAB;
-    let pool_ids: Vec<u32> = (0..pool_pages).collect();
-    let tiled: Vec<u32> = (0..B * pool_pages).map(|_| pool_ids[0]).collect();
     let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..pool_len).map(|p| p == 0)).collect();
     let mask: &'static Channel = leak(Channel::from_shaped([B, pool_len], init_mask).named("mask"));
     let scores: &'static Channel =
@@ -375,15 +313,9 @@ fn beam_step() -> Traced {
     let pos: &'static Channel = leak(Channel::from(vec![0u32; B as usize]).named("pos"));
     let fill: &'static Channel = leak(Channel::from([1u32]).named("fill"));
     let klen: &'static Channel = leak(Channel::from(vec![1u32; B as usize]).named("klen"));
-    let w_slot: &'static Channel =
-        leak(Channel::from(vec![pool_ids[0]; B as usize]).named("w_slot"));
-    let w_off: &'static Channel = leak(Channel::from(vec![0u32; B as usize]).named("w_off"));
-    let pages: &'static Channel = leak(Channel::from(tiled).named("pages"));
-    let page_indptr: &'static Channel =
-        leak(Channel::from_shaped([B + 1], (0..=B).collect::<Vec<_>>()).named("page_indptr"));
+    let slots: &'static Channel = leak(Channel::from(vec![0u32; B as usize]).named("slots"));
     let lanes_b: &'static Channel =
         leak(Channel::from((0..=B).collect::<Vec<_>>()).named("embed_indptr"));
-    let pool_ids_ch: &'static Channel = leak(Channel::from(pool_ids).named("pool_ids"));
     let out: &'static Channel = leak(Channel::new([B], dtype::i32).capacity(8).named("out"));
     let out_par: &'static Channel =
         leak(Channel::new([B], dtype::u32).capacity(8).named("out_par"));
@@ -396,11 +328,8 @@ fn beam_step() -> Traced {
     );
     let mut b = Builder::new(VOCAB, PAGE);
     b.bind_port(Port::KvLen, klen);
-    b.bind_port(Port::Pages, pages);
-    b.bind_port(Port::PageIndptr, page_indptr);
-    b.bind_port(Port::WSlot, w_slot);
-    b.bind_port(Port::WOff, w_off);
     b.bind_port(Port::Positions, pos);
+    b.bind_port(Port::Slots, slots);
     b.bind_port(Port::AttnMask, mask);
     b.bind_port(Port::EmbedTokens, toks);
     b.bind_port(Port::EmbedIndptr, lanes_b);
@@ -425,13 +354,7 @@ fn beam_step() -> Traced {
         let newpos = eq(col, wpos_b);
         let new_mask = or(inherited, &newpos);
         mask.put(&new_mask);
-
-        let pids = pool_ids_ch.take();
-        let logical_slot = div(&wpos, page_t);
-        let w_slot_v = gather(&pids, &logical_slot);
-        let w_off_v = rem(&wpos, page_t);
-        w_slot.put(&w_slot_v);
-        w_off.put(&w_off_v);
+        slots.put(&wpos);
 
         let filled = add(&base, B);
         klen.put(broadcast(reshape(&filled, [1]), [B]));
@@ -440,22 +363,11 @@ fn beam_step() -> Traced {
         fill.put(&filled);
         scores.put(&s);
         toks.put(&tok_i);
-        let page_count = filled.div_ceil(page_t);
-        let pages_ig = gather(
-            &pids,
-            rem(
-                iota(B * pool_pages),
-                broadcast(&page_count, [B * pool_pages]),
-            ),
-        );
-        pages.put(&pages_ig);
-        page_indptr.put(mul(iota(B + 1), broadcast(&page_count, [B + 1])));
 
         out.put(&tok_i);
         out_par.put(&parent);
         out_scr.put(&s);
         out_greedy.put(reshape(reduce_argmax(&logits), [B]));
-        pool_ids_ch.put(&pids);
     });
     b.build().unwrap()
 }
@@ -470,13 +382,6 @@ fn latent_step() -> Traced {
     let kv_len: &'static Channel = leak(Channel::from([rows]).named("kv_len"));
     let positions: &'static Channel =
         leak(Channel::from((0..rows).collect::<Vec<_>>()).named("positions"));
-    let pages: &'static Channel = leak(Channel::from([0u32]).named("pages"));
-    let page_indptr: &'static Channel =
-        leak(Channel::from([0u32, rows.div_ceil(PAGE)]).named("page_indptr"));
-    let w_slot: &'static Channel =
-        leak(Channel::from((0..rows).map(|p| p / PAGE).collect::<Vec<_>>()).named("w_slot"));
-    let w_off: &'static Channel =
-        leak(Channel::from((0..rows).map(|p| p % PAGE).collect::<Vec<_>>()).named("w_off"));
     let latent: &'static Channel = leak(Channel::new([rows, channels], dtype::f32).named("latent"));
     let dsigma: &'static Channel = leak(Channel::from([-0.25f32]).named("dsigma"));
     let rng_ch: &'static Channel = leak(Channel::from([9u32, 0]).named("rng"));
@@ -488,16 +393,10 @@ fn latent_step() -> Traced {
     b.bind_port(Port::EmbedTokens, tok);
     b.bind_port(Port::EmbedIndptr, indptr_ch);
     b.bind_port(Port::KvLen, kv_len);
-    b.bind_port(Port::Pages, pages);
-    b.bind_port(Port::PageIndptr, page_indptr);
-    b.bind_port(Port::WSlot, w_slot);
-    b.bind_port(Port::WOff, w_off);
     b.bind_port(Port::Positions, positions);
     b.bind_port(Port::Readout, readout);
     b.stage(Stage::Epilogue, move || {
         positions.put(positions.take());
-        w_slot.put(w_slot.take());
-        w_off.put(w_off.take());
         let v = intrinsics::velocity(channels);
         let x = latent.take();
         let d = reshape(dsigma.read(), []);

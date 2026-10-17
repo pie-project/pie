@@ -21,7 +21,7 @@ use engine::fire::Masking;
 use engine::frame::{Demand, Supply};
 use kernels_xla::Tensor;
 use poem_compiler::{Budget, Budgets, CompiledModel, FireRows, compile_axes};
-use poem_exec::fire::{Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
+use poem_exec::fire::{At, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
 use poem_ir::{Dtype, Trace, ValueId};
 
 use crate::device::Device;
@@ -32,7 +32,7 @@ use crate::store::kv::{self, Paging, Seat};
 use crate::store::{Pools, SpaceSeat};
 use crate::trace::{Handles, Root, Source, Tracer};
 use crate::weights::Weights;
-use crate::window::{At, Cursor, Windows};
+use crate::window::Windows;
 
 pub use crate::dit::{Clips, Pixels, PortCell, SelfCond};
 
@@ -171,9 +171,11 @@ pub struct Seated<'a> {
     pub kv_less: bool,
 
     /// A guest's own write descriptor: the pool page and in-page offset of
-    /// each of the lane's rows (device-resolved `w_slot`/`w_off`), in place
+    /// each of the lane's rows (from its device-resolved `slots`), in place
     /// of the ones this shell derives from the extent and the page table.
     pub writes: Option<(&'a [u32], &'a [u32])>,
+
+    pub first: Option<u32>,
 
     /// The lane's attention classes, for a group-packed ragged attention.
     pub attn_classes: Option<&'a engine::fire::AttnClasses>,
@@ -211,6 +213,7 @@ impl<'a> Seated<'a> {
             self_cond: None,
             kv_less: false,
             writes: None,
+            first: None,
             attn_classes: None,
             window: &[],
             window_copies: &[],
@@ -871,6 +874,15 @@ impl Shell {
         self.pools.copy_slot(&self.device, &self.handles, src, dst)
     }
 
+    #[must_use]
+    pub fn buffer_pages(&self) -> u32 {
+        self.pools.buffer_pages()
+    }
+
+    pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
+        self.pools.copy_pages(&self.device, &self.handles, moves)
+    }
+
     pub fn state_bytes(&self, slot: u32) -> Result<Vec<u8>> {
         self.pools.read_slot(slot)
     }
@@ -1213,7 +1225,7 @@ impl Shell {
         let mut beginning: Vec<u32> = Vec::new();
         let mut demand_pages = 0u64;
         let mut demand_slots = 0u32;
-        let mut rs_plans: Vec<crate::rs::LanePlan> = Vec::with_capacity(submitted.len());
+        let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(submitted.len());
         let mut rs_active = false;
 
         for row in composition.lanes() {
@@ -1250,12 +1262,10 @@ impl Shell {
                 if any_adapter {
                     adapter_routes.extend(std::iter::repeat_n(-1, row.rows as usize));
                 }
-                rs_plans.push(crate::rs::LanePlan::of(
-                    &engine::fire::RsVerb::Fold,
-                    row.rows,
-                    row.source,
-                    None,
-                )?);
+                rs_plans.push(engine::rs::LanePlan {
+                    commit: row.rows,
+                    ..engine::rs::LanePlan::default()
+                });
                 continue;
             }
             let seated = &lanes[source];
@@ -1365,9 +1375,19 @@ impl Shell {
                 }
                 rs_active = true;
             }
-            rs_plans.push(crate::rs::LanePlan::of(
-                seated.rs, row.rows, row.source, None,
-            )?);
+            rs_plans.push(
+                engine::rs::LanePlan::of(
+                    seated.rs,
+                    row.rows,
+                    seated.first.unwrap_or(have),
+                    seated.mask,
+                    None,
+                )
+                .map_err(|error| Fault::Program {
+                    at: "serve::rs",
+                    why: format!("lane {}: {error}", row.source),
+                })?,
+            );
             slot_ids.push(state_slot as i32);
             if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
                 return Err(Fault::Positions {

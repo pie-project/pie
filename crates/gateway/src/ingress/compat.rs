@@ -13,7 +13,12 @@
 //!   any other error text is a 500.
 //!
 //! These routes carry no authentication: pie is an offline, single-user
-//! server, and every compat request runs as one fixed identity.
+//! server, and every compat request runs as tenant `default` unless an
+//! `x-plex-tenant` header names another.
+//!
+//! Props come from `x-plex-prop-<name>` headers (JSON if it parses) over a
+//! `plex` body object; `x-plex-session` names the session; `prompt` defaults to
+//! the request's text.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -30,7 +35,7 @@ use axum::{
     },
     routing::{MethodRouter, post},
 };
-use client_api::{ClientMessage, ServerMessage};
+use client_api::{ClientMessage, Props, ServerMessage};
 use futures::{Stream, StreamExt};
 use ids::TenantId;
 use serde_json::{Value, json};
@@ -38,7 +43,7 @@ use worker_api::{Priority, Tokens};
 
 use crate::GatewayState;
 use crate::ingress::identity::REQUEST_ID_HEADER;
-use crate::session::{Affinity, Identity, SessionHandle, TokenRx, TurnInput};
+use crate::session::{Affinity, Identity, SessionError, SessionHandle, TokenRx, TurnInput};
 
 /// Route → the built-in inferlet that serves it.
 pub const ROUTES: &[(&str, &str)] = &[
@@ -60,9 +65,18 @@ pub fn route(inferlet: &'static str) -> MethodRouter<GatewayState> {
     )
 }
 
+pub fn tenant(headers: &HeaderMap) -> String {
+    headers
+        .get(TENANT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|t| !t.is_empty() && !t.contains('/'))
+        .unwrap_or("default")
+        .to_string()
+}
+
 fn identity(headers: &HeaderMap) -> Identity {
     Identity {
-        tenant: TenantId("default".to_string()),
+        tenant: TenantId(tenant(headers)),
         user: "http".to_string(),
         client_ip: None,
         request_id: headers
@@ -71,6 +85,82 @@ fn identity(headers: &HeaderMap) -> Identity {
             .map(str::to_string)
             .filter(|s| !s.is_empty()),
     }
+}
+
+const PROP_HEADER_PREFIX: &str = "x-plex-prop-";
+const TENANT_HEADER: &str = "x-plex-tenant";
+const SESSION_HEADER: &str = "x-plex-session";
+
+fn props(headers: &HeaderMap, body: &Value) -> Props {
+    let mut props: Props = match body.get("plex") {
+        Some(Value::Object(plex)) => plex.clone().into_iter().collect(),
+        _ => Props::new(),
+    };
+    for (name, value) in headers {
+        let (Some(name), Ok(value)) = (
+            name.as_str().strip_prefix(PROP_HEADER_PREFIX),
+            value.to_str(),
+        ) else {
+            continue;
+        };
+        let value =
+            serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()));
+        props.insert(name.to_string(), value);
+    }
+    if !props.contains_key(client_api::props::PROMPT)
+        && let Some(text) = prompt_text(body)
+    {
+        props.insert(client_api::props::PROMPT.to_string(), Value::String(text));
+    }
+    if !props.contains_key(client_api::props::MAX_TOKENS)
+        && let Some(limit) = ["max_completion_tokens", "max_tokens", "max_output_tokens"]
+            .iter()
+            .find_map(|key| body.get(*key).and_then(Value::as_u64))
+    {
+        props.insert(
+            client_api::props::MAX_TOKENS.to_string(),
+            Value::from(limit),
+        );
+    }
+    props
+}
+
+/// In order, so a later turn's text starts with an earlier one's.
+fn prompt_text(body: &Value) -> Option<String> {
+    fn gather(value: &Value, text: &mut String) {
+        match value {
+            Value::String(part) => {
+                text.push_str(part);
+                text.push('\n');
+            }
+            Value::Array(items) => items.iter().for_each(|item| gather(item, text)),
+            Value::Object(map) => ["role", "content", "text", "parts"]
+                .iter()
+                .filter_map(|key| map.get(*key))
+                .for_each(|value| gather(value, text)),
+            _ => {}
+        }
+    }
+    let mut text = String::new();
+    for key in [
+        "system",
+        "instructions",
+        "systemInstruction",
+        "messages",
+        "contents",
+        "input",
+        "prompt",
+    ] {
+        if let Some(value) = body.get(key) {
+            gather(value, &mut text);
+        }
+    }
+    let mut end = text.len().min(client_api::props::MAX_PROMPT_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    (!text.is_empty()).then_some(text)
 }
 
 fn error_body(status: StatusCode, message: impl Into<String>) -> Response {
@@ -107,6 +197,7 @@ async fn relay(
             Err(e) => return error_body(StatusCode::BAD_REQUEST, format!("body is not JSON: {e}")),
         }
     };
+    let props = props(&headers, &body);
     let input = json!({
         "path": uri.path(),
         "query": query,
@@ -119,6 +210,12 @@ async fn relay(
             inferlet: inferlet.to_string(),
             input: input.to_string(),
             capture_outputs: true,
+            props,
+            session: headers
+                .get(SESSION_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            router_props: Props::new(),
         },
         blobs: Vec::new(),
         priority: Priority::Normal,
@@ -129,6 +226,12 @@ async fn relay(
         .await
     {
         Ok(pair) => pair,
+        Err(e @ SessionError::Launch(_)) => {
+            return error_body(StatusCode::BAD_REQUEST, e.to_string());
+        }
+        Err(e @ SessionError::Refused(_)) => {
+            return error_body(StatusCode::TOO_MANY_REQUESTS, e.to_string());
+        }
         Err(e) => return error_body(StatusCode::SERVICE_UNAVAILABLE, format!("admission: {e}")),
     };
 
@@ -324,6 +427,81 @@ mod tests {
         let _ = frame(&raw);
         let _ = frame("not json");
         let _ = frame(&json!({"event": "a\nb", "data": "x\r\ny"}).to_string());
+    }
+
+    #[test]
+    fn a_front_end_names_the_tenant() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(tenant(&headers), "default");
+        headers.insert("x-plex-tenant", "acme".parse().unwrap());
+        assert_eq!(tenant(&headers), "acme");
+        headers.insert("x-plex-tenant", "a/b".parse().unwrap());
+        assert_eq!(tenant(&headers), "default", "a tenant has no `/`");
+    }
+
+    #[test]
+    fn props_come_from_the_body_and_the_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-plex-prop-priority", "3".parse().unwrap());
+        headers.insert("x-plex-prop-tier", "gold".parse().unwrap());
+        headers.insert("x-plex-prop-tags", r#"["a","b"]"#.parse().unwrap());
+        headers.insert("x-request-id", "r".parse().unwrap());
+        let body = json!({"model": "m", "plex": {"priority": 1, "deadline-ms": 500}});
+        let expected: Props = serde_json::from_value(json!({
+            "priority": 3,
+            "tier": "gold",
+            "tags": ["a", "b"],
+            "deadline-ms": 500,
+        }))
+        .unwrap();
+        assert_eq!(props(&headers, &body), expected);
+        assert!(props(&HeaderMap::new(), &json!({"plex": "not a dict"})).is_empty());
+    }
+
+    #[test]
+    fn the_output_limit_is_a_prop_unless_the_client_set_one() {
+        let limit = |body: Value| props(&HeaderMap::new(), &body).get("max-tokens").cloned();
+        assert_eq!(limit(json!({"max_tokens": 64})), Some(json!(64)));
+        assert_eq!(
+            limit(json!({"max_completion_tokens": 32, "max_tokens": 64})),
+            Some(json!(32))
+        );
+        assert_eq!(
+            limit(json!({"max_tokens": 64, "plex": {"max-tokens": 8}})),
+            Some(json!(8))
+        );
+        assert_eq!(limit(json!({"model": "m"})), None);
+    }
+
+    #[test]
+    fn the_prompt_prop_is_the_requests_own_text() {
+        let turn = |messages: Value| json!({"model": "m", "messages": messages});
+        let first = turn(json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        ]));
+        let second = turn(json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "more"},
+        ]));
+        let text = |body: &Value| {
+            props(&HeaderMap::new(), body)["prompt"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(text(&first), "system\nbe brief\nuser\nhi\n");
+        assert!(
+            text(&second).starts_with(&text(&first)),
+            "a later turn extends it"
+        );
+        assert_eq!(text(&json!({"prompt": "once upon"})), "once upon\n");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-plex-prop-prompt", "the client's".parse().unwrap());
+        assert_eq!(props(&headers, &first)["prompt"], json!("the client's"));
+        assert!(!props(&HeaderMap::new(), &json!({"model": "m"})).contains_key("prompt"));
     }
 
     #[test]

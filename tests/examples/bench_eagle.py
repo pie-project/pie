@@ -33,7 +33,6 @@ async def _timed(client, args, name, inputs):
 
 async def bench(client, args):
     spec = lambda k: {"prompt": PROMPT, "max_tokens": MAX_TOKENS, "k": k}
-    # BENCH_NAME picks the loop (the hybrid `rs-mtp-speculative-decoding` for a GDN model).
     loop = os.environ.get("BENCH_NAME", "mtp-speculative-decoding")
     # Warm: the artifact into the page cache, the seats filled.
     await _timed(client, args, loop, spec(0))

@@ -638,7 +638,7 @@ impl Plane {
             })
     }
 
-    pub fn envelope_fold_len(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
+    pub fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
             id: instance,
@@ -648,7 +648,7 @@ impl Plane {
             .package
             .ports
             .iter()
-            .find(|binding| binding.port == Port::RsFoldLen && !binding.is_const)
+            .find(|binding| binding.port == Port::Fold && !binding.is_const)
         else {
             return Ok(None);
         };
@@ -656,7 +656,7 @@ impl Plane {
         self.settle_ring(ring);
         if ring.is_empty() {
             return Err(Refusal::Program(format!(
-                "instance {instance}: the `rs_fold_len` ring is empty at the fire"
+                "instance {instance}: the `fold` ring is empty at the fire"
             )));
         }
         let len = match ring.front() {
@@ -664,15 +664,13 @@ impl Plane {
             Value::I32(cells) => cells.first().map(|&n| n.max(0) as u32),
             other => {
                 return Err(Refusal::Program(format!(
-                    "instance {instance}: `rs_fold_len` holds {:?}, not a count",
+                    "instance {instance}: `fold` holds {:?}, not a count",
                     other.dtype()
                 )));
             }
         };
         len.map(Some).ok_or_else(|| {
-            Refusal::Program(format!(
-                "instance {instance}: `rs_fold_len` holds an empty cell"
-            ))
+            Refusal::Program(format!("instance {instance}: `fold` holds an empty cell"))
         })
     }
 
@@ -1402,7 +1400,7 @@ impl Plane {
     pub fn device_envelope(
         &self,
         instance: InstanceId,
-    ) -> Result<Option<crate::ports::Envelope>, Refusal> {
+    ) -> Result<Option<engine::ports::Envelope>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
             id: instance,
@@ -1410,9 +1408,9 @@ impl Plane {
         if seat.geometry == GeometryClass::Host {
             return Ok(None);
         }
-        let mut out = crate::ports::Envelope::default();
+        let mut out = engine::ports::Envelope::default();
         for binding in &seat.plan.package.ports {
-            if !crate::ports::resolves(seat.geometry, binding.port) {
+            if !engine::ports::resolves(seat.geometry, binding.port) {
                 continue;
             }
             if binding.port == Port::AttnMask {
@@ -1436,12 +1434,9 @@ impl Plane {
                 Port::EmbedIndptr => &mut out.qo_indptr,
                 Port::EmbedTokens => &mut out.tokens,
                 Port::Positions => &mut out.positions,
+                Port::Slots => &mut out.slots,
                 Port::KvLen => &mut out.kv_len,
-                Port::Pages => &mut out.pages,
-                Port::PageIndptr => &mut out.page_indptr,
-                Port::WSlot => &mut out.w_slot,
-                Port::WOff => &mut out.w_off,
-                Port::RsFoldLen => &mut out.fold_len,
+                Port::Fold => &mut out.fold,
                 _ => continue,
             };
             let value = if binding.is_const {

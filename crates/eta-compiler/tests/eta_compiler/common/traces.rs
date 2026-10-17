@@ -109,14 +109,10 @@ pub fn section3_trace() -> TraceContainer {
             },
             const_port(Port::EmbedIndptr, Dtype::U32, Shape::vector(2), &[0, 1]),
             const_port(Port::Positions, Dtype::U32, Shape::vector(1), &[0]),
-            const_port(Port::Pages, Dtype::U32, Shape::vector(1), &[0]),
-            const_port(Port::PageIndptr, Dtype::U32, Shape::vector(2), &[0, 1]),
             PortBinding {
                 port: Port::KvLen,
                 source: PortSource::Channel(3),
             },
-            const_port(Port::WSlot, Dtype::U32, Shape::vector(1), &[0]),
-            const_port(Port::WOff, Dtype::U32, Shape::vector(1), &[0]),
         ],
         stages: vec![StageProgram {
             stage: Stage::Epilogue,
@@ -404,30 +400,16 @@ pub fn beam_trace() -> TraceContainer {
                 source: PortSource::Channel(4),
             },
             PortBinding {
-                port: Port::Pages,
-                source: PortSource::Channel(0),
-            },
-            const_port(
-                Port::PageIndptr,
-                Dtype::U32,
-                Shape::vector(BB + 1),
-                &[0, P, 2 * P],
-            ),
-            PortBinding {
                 port: Port::KvLen,
                 source: PortSource::Channel(2),
             },
             PortBinding {
-                port: Port::WSlot,
-                source: PortSource::Channel(8),
-            },
-            PortBinding {
-                port: Port::WOff,
-                source: PortSource::Channel(9),
-            },
-            PortBinding {
                 port: Port::AttnMask,
                 source: PortSource::Channel(3),
+            },
+            PortBinding {
+                port: Port::Slots,
+                source: PortSource::Channel(8),
             },
         ],
         stages: vec![StageProgram {

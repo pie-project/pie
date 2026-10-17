@@ -32,6 +32,58 @@ pub struct Settled {
     pub(super) readback: Option<Readback>,
 }
 
+struct Tap(*const u32);
+
+// SAFETY: the tap is the shell's, alive as long as it is, and read only by
+// the host function of the step that filled it, before that step's event is
+// given back for another to claim.
+unsafe impl Send for Tap {}
+
+fn written(reports: Vec<super::KvReport>, tap: Option<Tap>) -> Vec<engine::KvWrites> {
+    let folds_from = tap_rows(&reports);
+    let mut folds = 0usize;
+    reports
+        .into_iter()
+        .map(|report| {
+            let rows = report.positions.len();
+            let tokens = report.tokens.unwrap_or_else(|| match &tap {
+                // SAFETY: the copy into the tap was ordered before the event
+                // this host function waits on, and spans these rows.
+                Some(Tap(host)) => unsafe {
+                    std::slice::from_raw_parts(host.add(report.first_row as usize), rows).to_vec()
+                },
+                None => Vec::new(),
+            });
+            let fold = report.fold.or_else(|| {
+                report.fold_at?;
+                let Tap(host) = tap.as_ref()?;
+                folds += 1;
+                // SAFETY: as above; each read-back count follows the rows.
+                Some(unsafe { *host.add(folds_from + folds - 1) })
+            });
+            engine::KvWrites {
+                tag: report.tag,
+                tokens,
+                positions: report.positions,
+                pages: report.pages,
+                offsets: report.offsets,
+                fold,
+            }
+        })
+        .collect()
+}
+
+fn tap_rows(reports: &[super::KvReport]) -> usize {
+    if reports.iter().all(|report| report.tokens.is_some()) {
+        return 0;
+    }
+    reports
+        .iter()
+        .map(|report| report.first_row as usize + report.positions.len())
+        .max()
+        .unwrap_or(0)
+}
+
 pub struct Done {
     pub at: engine::StepDone,
     pub sink: engine::CompletionSink,
@@ -48,10 +100,23 @@ impl Shell {
             readback,
         } = enqueued;
 
+        let reports = if done.is_some() {
+            std::mem::take(&mut prepared.kv_reports)
+        } else {
+            Vec::new()
+        };
         let slot = prepared.slot.take();
         drop(prepared);
 
         let at = self.settlement.claim()?;
+        let tap = match self.tap_tokens(at, &reports) {
+            Ok(tap) => tap,
+            Err(fault) => {
+                self.settlement.recycler().give(at);
+                drop(slot);
+                return Err(fault);
+            }
+        };
         let airborne = self.airborne.clone();
         airborne.enter();
 
@@ -74,11 +139,17 @@ impl Shell {
 
         let recycler = self.settlement.recycler();
         let posted = self.device.host_fn(Box::new(move || {
+            // Read before the event goes back: its tap is the next step's then.
+            let outcome = if reports.is_empty() {
+                engine::StepOutcome::Committed
+            } else {
+                engine::StepOutcome::Wrote(written(reports, tap))
+            };
             drop(slot);
             recycler.give(at);
             airborne.leave();
             if let Some(done) = done {
-                (done.sink)(done.at, engine::StepOutcome::Committed);
+                (done.sink)(done.at, outcome);
             }
         }));
         if let Err(fault) = posted {
@@ -102,6 +173,42 @@ impl Shell {
             pixels: Vec::new(),
             readback,
         })
+    }
+
+    /// In stream order, before the next fire writes its own over them.
+    fn tap_tokens(&mut self, at: u32, reports: &[super::KvReport]) -> Result<Option<Tap>> {
+        let cells: Vec<u64> = reports.iter().filter_map(|report| report.fold_at).collect();
+        if reports.iter().all(|report| report.tokens.is_some()) && cells.is_empty() {
+            return Ok(None);
+        }
+        let rows = tap_rows(reports);
+        let bytes = (rows + cells.len()) * 4;
+        let at = at as usize;
+        if self.taps.len() <= at {
+            self.taps.resize_with(at + 1, || None);
+        }
+        if self.taps[at].as_ref().is_none_or(|tap| tap.bytes() < bytes) {
+            let floor = self.budget.max_tokens as usize * 4;
+            self.taps[at] = Some(crate::device::Pinned::mapped_uninit(bytes.max(floor))?);
+        }
+        let tap = self.taps[at].as_ref().expect("made just above");
+        if rows > 0 {
+            crate::device::copy_d2d(
+                self.device.stream(),
+                tap.device(),
+                self.inputs.tokens_at(),
+                rows * 4,
+            )?;
+        }
+        for (index, &cell) in cells.iter().enumerate() {
+            crate::device::copy_d2d(
+                self.device.stream(),
+                tap.device() + ((rows + index) * 4) as u64,
+                cell,
+                4,
+            )?;
+        }
+        Ok(Some(Tap(tap.host().cast::<u32>().cast_const())))
     }
 
     pub fn read_out(&mut self, settled: &mut Settled) -> Result<()> {

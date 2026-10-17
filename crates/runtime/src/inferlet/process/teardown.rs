@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct TeardownFireContext {
     process_id: uuid::Uuid,
     resources: wasmtime::component::ResourceTable,
-    bind_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    bind_permit: Option<super::ordered::OrderedPermit>,
 }
 
 impl crate::pipeline::fire::FireContext for TeardownFireContext {
@@ -27,7 +27,7 @@ pub(crate) fn defer_resource_teardown(
     resources: wasmtime::component::ResourceTable,
     residency: Arc<Mutex<crate::inferlet::process::ProcessResidency>>,
     terminate_fences: Option<Vec<crate::scheduler::worker::TerminateFence>>,
-    bind_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    bind_permit: Option<super::ordered::OrderedPermit>,
     scratch_dir: Option<std::path::PathBuf>,
 ) {
     let capped_execution = terminate_fences.is_some();

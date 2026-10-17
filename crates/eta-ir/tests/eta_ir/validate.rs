@@ -105,14 +105,10 @@ fn section3() -> TraceContainer {
                 },
             },
             u32_port(Port::Positions, Shape::vector(1), &[0]),
-            u32_port(Port::Pages, Shape::vector(1), &[0]),
-            u32_port(Port::PageIndptr, Shape::vector(2), &[0, 1]),
             PortBinding {
                 port: Port::KvLen,
                 source: PortSource::Channel(3),
             },
-            u32_port(Port::WSlot, Shape::vector(1), &[0]),
-            u32_port(Port::WOff, Shape::vector(1), &[0]),
         ],
         stages: vec![StageProgram {
             stage: Stage::Epilogue,
@@ -124,20 +120,18 @@ fn section3() -> TraceContainer {
 
 #[test]
 fn validate_every_case() {
-    embed_tokens_requires_kv_len();
+    geometry_ports_are_optional();
     spsc_second_producer_rejected();
     sink_precedence_t11();
     lora_honour_gate_and_placement();
     name_table_must_be_strictly_sorted_and_unique();
 }
 
-fn embed_tokens_requires_kv_len() {
+fn geometry_ports_are_optional() {
     let mut c = section3();
-    c.ports.retain(|binding| binding.port != Port::KvLen);
-    assert!(matches!(
-        bind(c, ModelProfile::dummy()),
-        Err(ValidateError::EmbedTokensWithoutKvLen)
-    ));
+    c.ports
+        .retain(|binding| !matches!(binding.port, Port::KvLen | Port::Positions));
+    assert!(bind(c, ModelProfile::dummy()).is_ok());
 }
 
 fn spsc_second_producer_rejected() {

@@ -10,7 +10,7 @@
 //! and `tool_choice` (`none`/`auto`/`required`/named), `response_format`
 //! (`text`/`json_object`/`json_schema`), `stream` and
 //! `stream_options.include_usage`, `temperature`, `top_p`, `top_k`,
-//! `max_tokens`/`max_completion_tokens`, `stop`, `seed`,
+//! `max_tokens`/`max_completion_tokens`, `ignore_eos`, `stop`, `seed`,
 //! `presence_penalty`, `frequency_penalty`, `repetition_penalty`,
 //! `reasoning_effort: "none"` and `chat_template_kwargs.enable_thinking` to
 //! switch thinking off or on.
@@ -42,6 +42,7 @@ struct Body {
     top_k: Option<u32>,
     max_tokens: Option<usize>,
     max_completion_tokens: Option<usize>,
+    ignore_eos: bool,
     stop: Option<Value>,
     seed: Option<i64>,
     n: Option<u32>,
@@ -320,6 +321,7 @@ fn parse(body: Value) -> Result<(Request, bool), ApiError> {
         req.max_tokens = max;
     }
     req.stop = stop_sequences(body.stop)?;
+    req.ignore_eos = body.ignore_eos;
     req.thinking = match body.reasoning_effort.as_deref() {
         Some("none") => Thinking::Disabled,
         Some(_) => Thinking::Enabled,
@@ -418,13 +420,14 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
                 "created": ids.created,
                 "model": ids.model,
                 "choices": [],
-                "usage": usage(outcome.prompt_tokens, outcome.completion_tokens),
+                "usage": usage(&outcome),
             }));
         }
         emit::send_raw("[DONE]");
         return Ok(String::new());
     }
 
+    let usage = usage(&outcome);
     let mut message = json!({"role": "assistant"});
     message["content"] = if outcome.content.is_empty() && !outcome.tool_calls.is_empty() {
         Value::Null
@@ -451,7 +454,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         "created": ids.created,
         "model": ids.model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason(outcome.finish), "logprobs": null}],
-        "usage": usage(outcome.prompt_tokens, outcome.completion_tokens),
+        "usage": usage,
     })
     .to_string())
 }

@@ -4,38 +4,24 @@
 // `pie:inferlet/*` specifiers only resolve to real host functions inside a
 // component, so vitest aliases them here (see vitest.config.ts). These stubs
 // stand in for the imports the hand-written layer actually uses, and no more.
-//
-// SCOPE: the non-forward interfaces only, which is the inferlet library's entire surface
-// today. The forward-pass interfaces have no JavaScript counterpart -- see
-// src/index.ts and scripts/check-inferlet-interfaces.sh. When they land, their
-// stubs belong here.
-//
-// These are stubs, not a simulator, and a stub can be made to agree with a
-// world that no longer exists. What proves the inferlet library matches the REAL world is
-// `npm run generate-bindings && npm run build`: tsc resolves every specifier
-// through the generated `paths` map, so a member the host stopped offering is
-// a compile error.
+// What proves the library matches the real world is `npm run build`: tsc
+// resolves every specifier through the generated bindings.
 
 // ── pie:inferlet/model ──────────────────────────────────────────────────────
 
-export type ForwardKind = 'attention' | 'recurrent' | 'hybrid' | 'diffusion';
+export type ForwardKind = 'text' | 'diffusion';
 
 export const modelStub = {
   name: () => 'mock-model',
   architecture: () => 'qwen3_5',
   defaultSystemSpeculation: () => false,
-  isLinear: () => true,
-  passKind: (): ForwardKind => 'hybrid',
+  passKind: (): ForwardKind => 'text',
   outputVocabSize: () => 151936,
   kvPageSize: () => 16,
   frameSize: () => 1,
   channelCapacity: () => 8,
-  maxEmbedLength: () => 2048,
-  prefillChunkHint: () => 2048,
+  maxReadoutRows: (kind: string) => (kind === 'logits' ? 256 : 2048),
   rsStateSize: () => 4096n,
-  rsBufferPageSize: () => 64,
-  rsFoldGranularity: () => 1,
-  arenaBlockSize: () => 8192n,
   mtpDepth: () => 0,
   submitDeadlineUs: () => 50_000n,
   runAheadWindow: () => 4,
@@ -131,31 +117,24 @@ export class PipelineStub {
   }
 }
 
-export class KvWorkingSetStub {
-  pages = 0;
-  pageLen() {
-    return this.pages;
+export class WorkingSetStub {
+  reserve() {}
+  folded() {
+    return 0;
   }
-  reserve(pages: number) {
-    const r = { start: this.pages, len: pages };
-    this.pages += pages;
-    return r;
+  cachedTokens() {
+    return 0;
   }
   fork() {
-    return new KvWorkingSetStub();
-  }
-}
-
-export class RsWorkingSetStub {
-  bufferSize() {
-    return 0;
+    return new WorkingSetStub();
   }
 }
 
 export class ForwardPassStub {
   static submitted: [unknown, unknown[]][] = [];
   embedded: unknown[] | null = null;
-  attentionArgs: unknown[] | null = null;
+  stateArgs: [unknown[], Record<string, unknown>] | null = null;
+  checkpointSlots: number[] | null = null;
   programBytes: Uint8Array | null = null;
   programChannels: unknown[] | null = null;
   spans: unknown[] | null = null;
@@ -163,8 +142,11 @@ export class ForwardPassStub {
     this.embedded = [tokens, indptr];
   }
   readout() {}
-  attention(...args: unknown[]) {
-    this.attentionArgs = args;
+  state(lanes: unknown[], geom: Record<string, unknown>) {
+    this.stateArgs = [[...lanes], geom];
+  }
+  checkpoints(slots: Uint32Array) {
+    this.checkpointSlots = Array.from(slots);
   }
   setMaxLayers() {}
   setDraftingBlock() {}

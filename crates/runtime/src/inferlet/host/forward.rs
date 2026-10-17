@@ -6,15 +6,15 @@ use wasmtime_wasi::WasiView;
 use crate::inferlet::ProcessCtx;
 pub use crate::pipeline::channel::Channel;
 use crate::pipeline::channel::{BoundCells, ChannelCell, ChannelError};
-use crate::pipeline::fire::lease::DevGeo;
 pub use crate::pipeline::instance::ForwardPass;
 use crate::pipeline::instance::Instance;
 use crate::pipeline::instance::{
-    AttentionBinding, BoundForwardPass, CanvasMode, EmbedBinding, FloatLane, LaneFacts, PassKind,
-    PortBinding, RsGeometryBinding, lane_stream_of,
+    BoundForwardPass, CanvasMode, EmbedBinding, FloatLane, LaneFacts, PassKind, PortBinding,
+    StateBinding, lane_stream_of,
 };
 use crate::store::kv::working_set::KvWorkingSet;
-use crate::store::rs::working_set::RsWorkingSet;
+
+use super::working_set::WorkingSet;
 
 use eta_ir::container::{HostRole, PortSource, TraceContainer};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
@@ -164,58 +164,36 @@ pub(crate) fn port_rows(ports: &[PortBinding]) -> Result<Option<u32>, String> {
     Ok(rows.map(|(rows, _)| rows).or(context_rows))
 }
 
-fn page_span(
-    span: pie::inferlet::working_set::PageSpan,
-) -> Result<crate::pipeline::instance::KvPageSpan, String> {
-    let start = u64::from(span.start);
-    let end = span.end.map(u64::from);
-    if end.is_some_and(|end| start > end) {
-        return Err(format!(
-            "attention page-span start {start} exceeds end {}",
-            end.unwrap()
-        ));
-    }
-    Ok(crate::pipeline::instance::KvPageSpan { start, end })
-}
-
-fn attention_rebind_diff(
-    existing: &AttentionBinding,
-    next: &AttentionBinding,
-) -> Option<&'static str> {
-    if existing.kv_ws != next.kv_ws {
-        return Some("kv-working-set");
-    }
-    if existing.readable != next.readable {
-        return Some("readable-pages");
-    }
-    if existing.writable != next.writable {
-        return Some("writable-pages");
-    }
-    if existing.kv_len != next.kv_len {
-        return Some("kv-len");
-    }
-    if existing.pages != next.pages {
-        return Some("pages");
-    }
-    if existing.page_indptr != next.page_indptr {
-        return Some("page-indptr");
-    }
-    if existing.w_slot != next.w_slot {
-        return Some("w-slot");
-    }
-    if existing.w_off != next.w_off {
-        return Some("w-off");
+/// After attach a pass may bind other working sets, never other channels.
+fn state_rebind_diff(existing: &StateBinding, next: &StateBinding) -> Option<&'static str> {
+    if existing.lanes.len() != next.lanes.len() {
+        return Some("lanes (a different count)");
     }
     if existing.positions != next.positions {
         return Some("positions");
     }
-    if existing.mask.is_some() != next.mask.is_some() {
-        return Some("mask (present on one binding, absent on the other)");
+    if existing.slots != next.slots {
+        return Some("slots");
+    }
+    if existing.kv_len != next.kv_len {
+        return Some("kv-len");
     }
     if existing.mask != next.mask {
         return Some("mask");
     }
+    if existing.fold != next.fold {
+        return Some("fold");
+    }
     None
+}
+
+fn first_repeat(reps: &[u32]) -> Option<(usize, usize)> {
+    reps.iter().enumerate().find_map(|(again, rep)| {
+        reps[..again]
+            .iter()
+            .position(|earlier| earlier == rep)
+            .map(|first| (first, again))
+    })
 }
 
 fn validate_descriptor_bindings(
@@ -223,28 +201,8 @@ fn validate_descriptor_bindings(
     channel_reps: &[u32],
     expected: &[(Port, Option<u32>)],
 ) -> Result<(), String> {
-    validate_bindings(container, channel_reps, expected, false)
-}
-
-fn validate_optional_descriptor_bindings(
-    container: &TraceContainer,
-    channel_reps: &[u32],
-    expected: &[(Port, Option<u32>)],
-) -> Result<(), String> {
-    validate_bindings(container, channel_reps, expected, true)
-}
-
-fn validate_bindings(
-    container: &TraceContainer,
-    channel_reps: &[u32],
-    expected: &[(Port, Option<u32>)],
-    optional: bool,
-) -> Result<(), String> {
     for &(port, expected_rep) in expected {
         let binding = container.ports.iter().find(|binding| binding.port == port);
-        if optional && binding.is_none() {
-            continue;
-        }
         match (binding, expected_rep) {
             (None, None) => {}
             (None, Some(_)) => {
@@ -579,7 +537,7 @@ impl ProcessCtx {
     ) -> Anyhow<Result<(), String>> {
         let kind = self.ctx().table.get(this)?.kind;
         let actual = crate::model::model().pass_kind();
-        if kind == PassKind::Attention {
+        if kind == PassKind::Text {
             let reading = match named {
                 Some(reading) => Ok(Some(reading)),
                 None => reading_of(self.ctx().table.get(this)?),
@@ -590,14 +548,10 @@ impl ProcessCtx {
                 return Ok(Ok(()));
             }
         }
-        if kind == PassKind::Hybrid && actual == PassKind::Attention {
-            return Ok(Ok(()));
-        }
         if kind != actual {
             return Ok(Err(format!(
                 "this model's forward pass is `{}`, but the pass was built through the `{}` \
-                 interface; use `{}` instead. Attention-only state algorithms are not valid on \
-                 a folded recurrent state.",
+                 interface; use `{}` instead",
                 actual.name(),
                 kind.interface(),
                 actual.interface(),
@@ -639,80 +593,121 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn core_attention(
+    async fn core_state(
         &mut self,
         this: Resource<ForwardPass>,
-        kv_working_set: Resource<KvWorkingSet>,
-        readable_pages: pie::inferlet::working_set::PageSpan,
-        writable_pages: pie::inferlet::working_set::PageSpan,
-        kv_len: Resource<Channel>,
-        pages: Resource<Channel>,
-        page_indptr: Resource<Channel>,
-        w_slot: Resource<Channel>,
-        w_off: Resource<Channel>,
-        positions: Resource<Channel>,
-        mask: Option<Resource<Channel>>,
+        lanes: Vec<Resource<WorkingSet>>,
+        geom: pie::inferlet::forward::StateGeometry,
     ) -> Anyhow<Result<(), String>> {
+        let pie::inferlet::forward::StateGeometry {
+            positions,
+            slots,
+            kv_len,
+            mask,
+            fold,
+        } = geom;
         if let Err(error) = self.core_gate(&this, None)? {
             return Ok(Err(error));
         }
-        let readable = match page_span(readable_pages) {
-            Ok(span) => span,
-            Err(error) => return Ok(Err(error)),
-        };
-        let writable = match page_span(writable_pages) {
-            Ok(span) => span,
-            Err(error) => return Ok(Err(error)),
-        };
-        let _ = self.ctx().table.get(&kv_working_set)?;
-        for channel in [&kv_len, &pages, &page_indptr, &w_slot, &w_off, &positions] {
+        if lanes.is_empty() {
+            return Ok(Err(
+                "forward pass state binding names no working set; give one per lane".to_string(),
+            ));
+        }
+        for lane in &lanes {
+            let _ = self.ctx().table.get(lane)?;
+        }
+        for channel in [&positions, &slots, &kv_len, &mask, &fold]
+            .into_iter()
+            .flatten()
+        {
             let _ = self.ctx().table.get(channel)?;
         }
-        if let Some(mask) = mask.as_ref() {
-            let _ = self.ctx().table.get(mask)?;
+        let reps: Vec<u32> = lanes.iter().map(Resource::rep).collect();
+        if crate::model::model().rs_caps().window_tokens > 0
+            && let Some((first, again)) = first_repeat(&reps)
+        {
+            return Ok(Err(format!(
+                "lanes {first} and {again} name the same working set; on a model whose \
+                 state is a window each lane needs a working set of its own"
+            )));
         }
-        let binding = AttentionBinding {
-            kv_ws: kv_working_set.rep(),
-            readable,
-            writable,
-            kv_len: kv_len.rep(),
-            pages: pages.rep(),
-            page_indptr: page_indptr.rep(),
-            w_slot: w_slot.rep(),
-            w_off: w_off.rep(),
-            positions: positions.rep(),
+        let binding = StateBinding {
+            lanes: reps,
+            positions: positions.map(|resource| resource.rep()),
+            slots: slots.map(|resource| resource.rep()),
+            kv_len: kv_len.map(|resource| resource.rep()),
             mask: mask.map(|resource| resource.rep()),
+            fold: fold.map(|resource| resource.rep()),
         };
-        let pass = self.ctx().table.get_mut(&this)?;
+        let pass = self.ctx().table.get(&this)?;
         if pass.is_bound() {
-            let Some(existing) = pass.bindings.attention else {
+            let Some(existing) = pass.bindings.state.clone() else {
                 return Ok(Err("forward pass program is already attached".to_string()));
             };
-            return Ok(match attention_rebind_diff(&existing, &binding) {
-                None => Ok(()),
-                Some(field) => Err(format!(
-                    "forward pass attention binding cannot change after the program is \
-                     attached (`{field}` differs); rebind with the same KV geometry, or build \
-                     a new pass"
-                )),
-            });
+            if let Some(field) = state_rebind_diff(&existing, &binding) {
+                return Ok(Err(format!(
+                    "forward pass state binding cannot change its geometry after the program \
+                     is attached (`{field}` differs); bind the same channels, or build a new \
+                     pass"
+                )));
+            }
+            let (kv_lanes, rs_ws) = self.lane_parts(&binding.lanes)?;
+            let pass = self.ctx().table.get_mut(&this)?;
+            let bound = match pass.bound_mut() {
+                Ok(bound) => bound,
+                Err(error) => return Ok(Err(error)),
+            };
+            if let Err(error) = bound.replace_lanes(binding.lanes.clone(), kv_lanes, rs_ws) {
+                return Ok(Err(format!("pipeline: {error}")));
+            }
+            pass.bindings.state = Some(binding);
+            return Ok(Ok(()));
         }
-        if pass.bindings.attention.is_some() {
+        if pass.bindings.state.is_some() {
             return Ok(Err(
-                "forward pass attention binding is already attached".to_string()
+                "forward pass state binding is already attached".to_string()
             ));
         }
         if let Ok(Some(reading)) = reading_of(pass)
             && !reading.has_kv
         {
             return Ok(Err(format!(
-                "reading `{}` declares no KV space; `attention` is refused on its pass (nothing \
+                "reading `{}` declares no KV space; `state` is refused on its pass (nothing \
                  there is a sequence)",
                 reading.name
             )));
         }
-        pass.bindings.attention = Some(binding);
+        self.ctx().table.get_mut(&this)?.bindings.state = Some(binding);
+        Ok(Ok(()))
+    }
+
+    fn lane_parts(&mut self, lanes: &[u32]) -> Anyhow<(Vec<u32>, Vec<u32>)> {
+        let mut kv = Vec::with_capacity(lanes.len());
+        let mut rs = Vec::new();
+        for &rep in lanes {
+            let res: Resource<WorkingSet> = Resource::new_borrow(rep);
+            let ws = self.ctx().table.get(&res)?;
+            kv.push(ws.kv);
+            if let Some(state) = ws.rs {
+                rs.push(state);
+            }
+        }
+        Ok((kv, rs))
+    }
+
+    async fn core_checkpoints(
+        &mut self,
+        this: Resource<ForwardPass>,
+        mut slots: Vec<u32>,
+    ) -> Anyhow<Result<(), String>> {
+        slots.sort_unstable();
+        slots.dedup();
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        pass.bindings.checkpoints = slots;
         Ok(Ok(()))
     }
 
@@ -754,9 +749,9 @@ impl ProcessCtx {
                 reading.name
             )));
         }
-        if !reading.has_kv && pass.bindings.attention.is_some() {
+        if !reading.has_kv && pass.bindings.state.is_some() {
             return Ok(Err(format!(
-                "reading `{}` declares no KV space, but this pass already bound `attention`",
+                "reading `{}` declares no KV space, but this pass already bound `state`",
                 reading.name
             )));
         }
@@ -1236,11 +1231,8 @@ impl ProcessCtx {
     ) -> Anyhow<Result<(), String>> {
         let (
             embed,
-            attention,
+            state,
             readout,
-            rs_working_sets,
-            rs_fold_len,
-            rs_fold_len_rep,
             pass_max_layers,
             pass_block_draft,
             lane_facts,
@@ -1306,17 +1298,16 @@ impl ProcessCtx {
                 }
                 (None, false) => None,
             };
-            let attention = match (pass.bindings.attention, wants_kv) {
-                (Some(attention), true) => Some(attention),
+            let state = match (pass.bindings.state.clone(), wants_kv) {
+                (Some(state), true) => Some(state),
                 (None, true) => {
                     return Ok(Err(
-                        "forward pass attention binding must be attached before program"
-                            .to_string(),
+                        "forward pass state binding must be attached before program".to_string(),
                     ));
                 }
                 (Some(_), false) => {
                     return Ok(Err(format!(
-                        "reading `{}` declares no KV space, but this pass bound `attention`",
+                        "reading `{}` declares no KV space, but this pass bound `state`",
                         reading.map_or("", |reading| reading.name.as_str())
                     )));
                 }
@@ -1465,16 +1456,8 @@ impl ProcessCtx {
             };
             (
                 embed,
-                attention,
+                state,
                 pass.bindings.readout,
-                pass.bindings
-                    .rs_ws
-                    .iter()
-                    .copied()
-                    .map(Resource::new_borrow)
-                    .collect::<Vec<Resource<RsWorkingSet>>>(),
-                pass.bindings.rs_fold_len.clone(),
-                pass.bindings.rs_geom.map(|geom| geom.fold_len),
                 pass.bindings.max_layers,
                 pass.bindings.block_draft,
                 lane_facts,
@@ -1518,25 +1501,15 @@ impl ProcessCtx {
                 )));
             }
             let channel_reps = channels.iter().map(Resource::rep).collect::<Vec<_>>();
+            let geometry = |pick: fn(&StateBinding) -> Option<u32>| state.as_ref().and_then(pick);
             let expected = [
                 (Port::EmbedTokens, embed.map(|embed| embed.tokens)),
                 (Port::EmbedIndptr, embed.map(|embed| embed.indptr)),
-                (Port::KvLen, attention.map(|attention| attention.kv_len)),
-                (Port::Pages, attention.map(|attention| attention.pages)),
-                (
-                    Port::PageIndptr,
-                    attention.map(|attention| attention.page_indptr),
-                ),
-                (Port::WSlot, attention.map(|attention| attention.w_slot)),
-                (Port::WOff, attention.map(|attention| attention.w_off)),
-                (
-                    Port::Positions,
-                    attention.map(|attention| attention.positions),
-                ),
-                (
-                    Port::AttnMask,
-                    attention.and_then(|attention| attention.mask),
-                ),
+                (Port::Positions, geometry(|state| state.positions)),
+                (Port::Slots, geometry(|state| state.slots)),
+                (Port::KvLen, geometry(|state| state.kv_len)),
+                (Port::AttnMask, geometry(|state| state.mask)),
+                (Port::Fold, geometry(|state| state.fold)),
                 (Port::Readout, readout),
             ];
             if let Err(error) =
@@ -1553,15 +1526,6 @@ impl ProcessCtx {
                      read it in a stage (the inferlet library's `input` does) so the program declares it",
                     port.name
                 )));
-            }
-            if let Some(fold_len) = rs_fold_len_rep
-                && let Err(error) = validate_optional_descriptor_bindings(
-                    &prog.bound.container,
-                    &channel_reps,
-                    &[(Port::RsFoldLen, Some(fold_len))],
-                )
-            {
-                return Ok(Err(error));
             }
             let mut cells: BoundCells = Vec::with_capacity(channels.len());
             for (i, ch) in channels.iter().enumerate() {
@@ -1601,198 +1565,101 @@ impl ProcessCtx {
                 cells.push(cell);
             }
 
-            let (ws_rep, readable, writable, devgeo, decode_envelope, geometry_class) =
-                if let Some(attention) = attention {
-                    let readable = attention.readable;
-                    let writable = attention.writable;
-                    let ws_rep = attention.kv_ws;
-                    let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-                    let bound_ws = self.ctx().table.get(&ws_res)?.clone();
-                    let stores = crate::store::registry::get(bound_ws.model, bound_ws.engine);
-                    let page_len =
-                        match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-                            kv.page_len(bound_ws.id)
-                        }) {
-                            Ok(page_len) => page_len,
-                            Err(error) => {
-                                return Ok(Err(format!("pipeline: KV page extent: {error}")));
-                            }
-                        };
-                    if let Err(error) = readable.resolve(page_len) {
-                        return Ok(Err(error));
-                    }
-                    if let Err(error) = writable.resolve(page_len) {
-                        return Ok(Err(error));
-                    }
-                    let device_port_mask =
-                        crate::engine::get_spec(bound_ws.engine)?.device_geometry_port_mask;
-
-                    let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
-                        matches!(binding.port, eta_ir::registry::Port::AttnMask)
-                            && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
-                    });
-                    let devgeo_capable = device_port_mask.covers(PortMask::DEVICE_GEOMETRY)
-                        && (!needs_mask_port
-                            || device_port_mask.covers(PortMask::of(&[Port::AttnMask])));
-                    let devgeo = match crate::pipeline::fire::lease::detect_device_geometry(
+            let lanes: Vec<u32> = state
+                .as_ref()
+                .map(|state| state.lanes.clone())
+                .unwrap_or_default();
+            let (kv_lanes, rs_reps) = if state.is_some() {
+                self.lane_parts(&lanes)?
+            } else {
+                (vec![self.mint_scratch_working_set()?], Vec::new())
+            };
+            let (devgeo, decode_envelope, geometry_class) = if state.is_some() {
+                let engine = super::working_set::kv_of(self, kv_lanes[0])?.engine;
+                let device_port_mask = crate::engine::get_spec(engine)?.device_geometry_port_mask;
+                let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
+                    matches!(binding.port, eta_ir::registry::Port::AttnMask)
+                        && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
+                });
+                let devgeo_capable = device_port_mask.covers(PortMask::DEVICE_GEOMETRY)
+                    && (!needs_mask_port
+                        || device_port_mask.covers(PortMask::of(&[Port::AttnMask])));
+                let taint = prog.geometry_taint();
+                let devgeo = if !taint.host_derivable() {
+                    match crate::pipeline::fire::geometry::detect_pooled_device_geometry(
                         &prog.bound.container,
                     ) {
                         Some(_) if !devgeo_capable => {
                             tracing::info!(
-                                "device-geometry program on an engine without device geometry ports \
-                         (mask {device_port_mask:?}): falling back to host-evaluated \
-                         serialized execution"
+                                "device-geometry program on an engine without device geometry \
+                                 ports (mask {device_port_mask:?}): falling back to \
+                                 host-evaluated serialized execution"
                             );
                             None
                         }
-                        Some((b, fresh_dense, w_cont_dense)) => {
-                            if readable.start != 0
-                                || readable.end.is_some()
-                                || writable.start != 0
-                                || writable.end.is_some()
-                            {
-                                return Ok(Err(
-                                "pipeline: device-geometry passes require full open readable and writable page spans"
-                                    .to_string(),
-                            ));
-                            }
-                            let reserved = crate::store::registry::with_kv_lock(
-                                &stores.kv,
-                                "host-other",
-                                |kv| kv.reserve(bound_ws.id, b as u64),
+                        Some(qo_indptr) => {
+                            tracing::info!(
+                                "device-carried decode ({} lane(s), {} row(s)) re-publishes \
+                                 where its rows land: executes as a device-geometry pass",
+                                qo_indptr.len().saturating_sub(1),
+                                qo_indptr.last().copied().unwrap_or(0)
                             );
-                            let seed_pages: Vec<u32> = match reserved {
-                                Ok(range) => (range.start as u32..range.end as u32).collect(),
-                                Err(e) => {
-                                    return Ok(Err(format!(
-                                        "pipeline: device-geometry seed alloc: {e}"
-                                    )));
-                                }
-                            };
-                            let mut lease = crate::pipeline::fire::lease::PageLease::new(b);
-                            lease.seed(seed_pages);
-                            let has_mask = prog.bound.container.ports.iter().any(|p| {
-                                matches!(p.port, eta_ir::registry::Port::AttnMask)
-                                    && matches!(p.source, eta_ir::container::PortSource::Channel(_))
-                            });
-                            Some(DevGeo {
-                                lease,
-                                b,
-                                fresh_dense,
-                                w_cont_dense,
-                                has_mask,
-                                pooled: false,
-                                qo_indptr: None,
-                            })
+                            Some(qo_indptr)
                         }
                         None => None,
-                    };
-
-                    let taint = prog.geometry_taint();
-                    let devgeo = match devgeo {
-                Some(devgeo) => Some(devgeo),
-                None if devgeo_capable
-                    && !taint.host_derivable()
-                    && readable.start == 0
-                    && readable.end.is_none() =>
-                {
-                    crate::pipeline::fire::lease::detect_pooled_device_geometry(
+                    }
+                } else {
+                    None
+                };
+                let decode_envelope = if devgeo.is_some() || taint.host_derivable() {
+                    None
+                } else {
+                    let mut why = String::new();
+                    match crate::pipeline::fire::geometry::classify_decode_envelope_why(
                         &prog.bound.container,
-                    )
-                    .map(|qo_indptr| {
-                        tracing::info!(
-                            "device-carried decode ({} lane(s), {} row(s)) re-publishes every \
-                             descriptor port: executes as a pool-owned device-geometry pass",
-                            qo_indptr.len().saturating_sub(1),
-                            qo_indptr.last().copied().unwrap_or(0)
-                        );
-                        crate::pipeline::fire::lease::DevGeo::pooled(qo_indptr, needs_mask_port)
-                    })
-                }
-                None => None,
-            };
-                    let decode_envelope = if devgeo.is_some() || taint.host_derivable() {
-                        None
-                    } else {
-                        let mut why = String::new();
-                        match crate::pipeline::fire::geometry::classify_decode_envelope_why(
-                            &prog.bound.container,
-                            &mut why,
-                        ) {
-                            Ok(Some(envelope)) => {
-                                let required =
-                                    crate::pipeline::fire::geometry::envelope_required_ports(
-                                        &envelope,
-                                    );
-                                if device_port_mask.covers(required) {
-                                    Some(envelope)
-                                } else {
-                                    tracing::info!(
-                                        "decode envelope on an engine without device geometry ports \
-                                 (mask {device_port_mask:?}, needs {required:?}): falling \
-                                 back to host-evaluated serialized execution"
-                                    );
-                                    None
-                                }
-                            }
-                            Ok(None) => {
+                        taint,
+                        &mut why,
+                    ) {
+                        Ok(Some(required)) => {
+                            if device_port_mask.covers(required) {
+                                Some(required)
+                            } else {
                                 tracing::info!(
-                                    "not a decode envelope: {why}; falling back to \
-                             host-evaluated execution"
-                                );
-                                None
-                            }
-                            Err(reason) => {
-                                tracing::warn!(
-                                    "device-dependent geometry is not a decode envelope ({reason}); \
-                             falling back to host-evaluated execution — fires block loudly \
-                             on values the host cannot derive"
+                                    "decode envelope on an engine without device geometry ports \
+                                     (mask {device_port_mask:?}, needs {required:?}): falling \
+                                     back to host-evaluated serialized execution"
                                 );
                                 None
                             }
                         }
-                    };
-                    if decode_envelope.is_some() && (readable.start != 0 || readable.end.is_some())
-                    {
-                        return Ok(Err(
-                    "pipeline: device-resolved passes require a full open readable page span"
-                        .to_string(),
-                ));
+                        Ok(None) => {
+                            tracing::info!(
+                                "not a decode envelope: {why}; falling back to host-evaluated \
+                                 execution"
+                            );
+                            None
+                        }
+                        Err(reason) => {
+                            tracing::warn!(
+                                "device-dependent geometry is not a decode envelope \
+                                 ({reason}); falling back to host-evaluated execution — fires \
+                                 block loudly on values the host cannot derive"
+                            );
+                            None
+                        }
                     }
-                    let geometry_class = if devgeo.is_some() {
-                        GeometryClass::DeviceGeometry
-                    } else if decode_envelope.is_some() {
-                        GeometryClass::DecodeEnvelope
-                    } else {
-                        GeometryClass::Host
-                    };
-                    (
-                        ws_rep,
-                        readable,
-                        writable,
-                        devgeo,
-                        decode_envelope,
-                        geometry_class,
-                    )
-                } else {
-                    let open = crate::pipeline::instance::KvPageSpan {
-                        start: 0,
-                        end: None,
-                    };
-                    (
-                        self.mint_scratch_working_set()?,
-                        open,
-                        open,
-                        None,
-                        None,
-                        GeometryClass::Host,
-                    )
                 };
-            let rs_reps: Vec<u32> = rs_working_sets.iter().map(Resource::rep).collect();
-            if float_rows.is_some() && !rs_reps.is_empty() {
-                self.release_scratch_working_set(ws_rep)?;
-                return Ok(Err("a float lane binds no recurrent state".to_string()));
-            }
+                let geometry_class = if devgeo.is_some() {
+                    GeometryClass::DeviceGeometry
+                } else if decode_envelope.is_some() {
+                    GeometryClass::DecodeEnvelope
+                } else {
+                    GeometryClass::Host
+                };
+                (devgeo, decode_envelope, geometry_class)
+            } else {
+                (None, None, GeometryClass::Host)
+            };
 
             let instance_id = crate::pipeline::instance::next_instance_id();
             for (dense, cell) in cells.iter().enumerate() {
@@ -1947,13 +1814,11 @@ impl ProcessCtx {
                 cells,
                 channel_reps,
                 fires: None,
-                kv_ws: ws_rep,
-                kv_declaration: crate::pipeline::instance::KvDeclaration { readable, writable },
+                lanes,
+                kv_lanes,
                 max_layers: pass_max_layers,
                 block_draft: pass_block_draft,
                 rs_ws: rs_reps,
-                rs_fold_len,
-                kv_declaration_realized: false,
                 failed: None,
                 devgeo,
                 decode_envelope,
@@ -1979,9 +1844,8 @@ impl ProcessCtx {
 
     fn mint_scratch_working_set(&mut self) -> Anyhow<u32> {
         let stores = crate::store::registry::get(0, 0);
-        let prepared = crate::store::kv::PreparedWorkingSet::new();
-        let id = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", move |kv| {
-            kv.install_working_set(prepared)
+        let id = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+            kv.create_working_set()
         });
         let ws = KvWorkingSet::new(0, 0, id, stores.kv_page_size);
         self.register_kv_working_set(&ws);
@@ -1994,162 +1858,6 @@ impl ProcessCtx {
         self.unregister_kv_working_set(ws.model, ws.engine, ws.id);
         ws.release();
         Ok(())
-    }
-
-    async fn core_set_rs_working_sets(
-        &mut self,
-        this: Resource<ForwardPass>,
-        rs_working_sets: Vec<Resource<RsWorkingSet>>,
-        geometry: RsGeometryBinding,
-    ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
-        if rs_working_sets.is_empty() {
-            if crate::model::model().pass_kind() == PassKind::Attention {
-                return Ok(Ok(()));
-            }
-            return Ok(Err(
-                "forward pass recurrent-state binding needs one working set per request"
-                    .to_string(),
-            ));
-        }
-        let fold_len = match self.read_fold_len(&geometry, rs_working_sets.len())? {
-            Ok(lens) => lens,
-            Err(error) => return Ok(Err(error)),
-        };
-        if !self.ctx().table.get(&this)?.is_bound() {
-            for resource in &rs_working_sets {
-                let _ = self.ctx().table.get(resource)?;
-            }
-            let pass = self.ctx().table.get_mut(&this)?;
-            pass.bindings.rs_ws = rs_working_sets.iter().map(Resource::rep).collect();
-            pass.bindings.rs_geom = Some(geometry);
-            pass.bindings.rs_fold_len = fold_len;
-            return Ok(Ok(()));
-        }
-        let has_recurrent_state = crate::model::model().rs_caps().has_state();
-        let (kv_rep, qo_indptr) = {
-            let pass = self.ctx().table.get(&this)?;
-            let pending = pass
-                .fires
-                .as_ref()
-                .map(|fifo| fifo.lock().unwrap().len())
-                .unwrap_or(0);
-            if pending != 0 {
-                return Ok(Err(format!(
-                    "pipeline: cannot replace rs-working-sets while {pending} operation(s) \
-                     remain in the pass FIFO"
-                )));
-            }
-            let qo_indptr = if let Some(devgeo) = pass.devgeo.as_ref() {
-                vec![0; devgeo.b + 1]
-            } else if has_recurrent_state {
-                match pass.instance.fire_geometry() {
-                    Ok(geometry) => geometry.qo_indptr,
-                    Err(error) => {
-                        return Ok(Err(format!(
-                            "pipeline: cannot resolve request rows for rs-working-set rebind: \
-                             {error:?}"
-                        )));
-                    }
-                }
-            } else {
-                Vec::new()
-            };
-            (pass.kv_ws, qo_indptr)
-        };
-
-        if let Err(error) = crate::pipeline::fire::rs::validate_count(
-            rs_working_sets.len(),
-            &qo_indptr,
-            has_recurrent_state,
-        ) {
-            return Ok(Err(format!("pipeline: recurrent-state binding: {error}")));
-        }
-
-        let kv_resource: Resource<KvWorkingSet> = Resource::new_borrow(kv_rep);
-        let kv = self.ctx().table.get(&kv_resource)?.clone();
-        let mut reps = Vec::with_capacity(rs_working_sets.len());
-        let mut ids = Vec::with_capacity(rs_working_sets.len());
-        for (row, resource) in rs_working_sets.iter().enumerate() {
-            let rs = self.ctx().table.get(resource)?;
-            if rs.model != kv.model || rs.engine != kv.engine {
-                return Ok(Err(format!(
-                    "pipeline: rs-working-set at request row {row} belongs to model/engine \
-                     ({}, {}), expected ({}, {})",
-                    rs.model, rs.engine, kv.model, kv.engine
-                )));
-            }
-            if ids.contains(&rs.id) {
-                return Ok(Err(format!(
-                    "pipeline: rs-working-set at request row {row} aliases an earlier row"
-                )));
-            }
-            ids.push(rs.id);
-            reps.push(resource.rep());
-        }
-
-        let replacement = reps.clone();
-        let result = self
-            .ctx()
-            .table
-            .get_mut(&this)?
-            .replace_rs_working_sets(reps)
-            .map_err(|error| format!("pipeline: {error}"));
-        if result.is_ok() {
-            let pass = self.ctx().table.get_mut(&this)?;
-            pass.bindings.rs_ws = replacement;
-            pass.bindings.rs_geom = Some(geometry);
-            pass.bindings.rs_fold_len = fold_len.clone();
-            if let Ok(bound) = pass.bound_mut() {
-                bound.rs_fold_len = fold_len;
-            }
-        }
-        Ok(result)
-    }
-
-    fn read_fold_len(
-        &mut self,
-        geometry: &RsGeometryBinding,
-        rows: usize,
-    ) -> Anyhow<Result<Option<Vec<u32>>, String>> {
-        let resource: Resource<Channel> = Resource::new_borrow(geometry.fold_len);
-        let cell = self.ctx().table.get(&resource)?.cell.clone();
-        let cell = cell.lock().unwrap();
-        if !matches!(cell.dtype, Dtype::U32 | Dtype::I32) {
-            return Ok(Err(format!(
-                "forward pass: rs-geometry.fold-len must be a u32/i32 channel, got {:?}",
-                cell.dtype
-            )));
-        }
-        let Ok(bytes) = cell.peek_seed() else {
-            return Ok(Ok(None));
-        };
-        if bytes.len() % 4 != 0 {
-            return Ok(Err(format!(
-                "forward pass: rs-geometry.fold-len holds {} byte(s), which is not a whole number \
-                 of 32-bit values",
-                bytes.len()
-            )));
-        }
-        let mut lens: Vec<u32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|chunk| u32::from_le_bytes(*chunk))
-            .collect();
-        if lens.len() == 1 && rows > 1 {
-            lens = vec![lens[0]; rows];
-        }
-        if lens.len() != rows {
-            return Ok(Err(format!(
-                "forward pass: rs-geometry.fold-len supplies {} value(s) for {rows} bound \
-                 recurrent-state working set(s)",
-                lens.len()
-            )));
-        }
-        Ok(Ok(Some(lens)))
     }
 
     async fn core_drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
@@ -2169,7 +1877,7 @@ impl ProcessCtx {
             .bound()
             .ok()
             .filter(|bound| bound.float.is_some())
-            .map(|bound| bound.kv_ws);
+            .map(|bound| bound.kv_lanes[0]);
         if let Ok(bound) = pass.bound_mut() {
             bound.close_native();
         }
@@ -2182,9 +1890,26 @@ impl ProcessCtx {
 }
 
 macro_rules! forward_pass_common {
-    ($iface:ident, $kind:expr) => {
+    ($kind:expr) => {
         async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
             self.core_new($kind).await
+        }
+
+        async fn state(
+            &mut self,
+            this: Resource<ForwardPass>,
+            lanes: Vec<Resource<WorkingSet>>,
+            geom: pie::inferlet::forward::StateGeometry,
+        ) -> Anyhow<Result<(), String>> {
+            self.core_state(this, lanes, geom).await
+        }
+
+        async fn media(
+            &mut self,
+            this: Resource<ForwardPass>,
+            spans: Vec<pie::inferlet::forward::MediaSpan>,
+        ) -> Anyhow<Result<(), String>> {
+            self.core_media(this, spans).await
         }
 
         async fn embed(
@@ -2212,14 +1937,6 @@ macro_rules! forward_pass_common {
             self.core_set_max_layers(this, max_layers).await
         }
 
-        async fn set_drafting_block(
-            &mut self,
-            this: Resource<ForwardPass>,
-            on: bool,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_set_drafting_block(this, on).await
-        }
-
         async fn program(
             &mut self,
             this: Resource<ForwardPass>,
@@ -2232,11 +1949,7 @@ macro_rules! forward_pass_common {
         async fn drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
             self.core_drop(this).await
         }
-    };
-}
 
-macro_rules! forward_pass_readings {
-    () => {
         async fn reading(
             &mut self,
             this: Resource<ForwardPass>,
@@ -2291,21 +2004,6 @@ macro_rules! forward_pass_readings {
     };
 }
 
-macro_rules! rs_geometry_binding {
-    ($self:ident, $geom:expr) => {{
-        let geom = $geom;
-        let buffer = match page_span(geom.buffer) {
-            Ok(span) => span,
-            Err(error) => return Ok(Err(error)),
-        };
-        let _ = $self.ctx().table.get(&geom.fold_len)?;
-        RsGeometryBinding {
-            fold_len: geom.fold_len.rep(),
-            buffer,
-        }
-    }};
-}
-
 impl pie::inferlet::forward::Host for ProcessCtx {
     async fn submit(
         &mut self,
@@ -2321,128 +2019,22 @@ impl pie::inferlet::forward::Host for ProcessCtx {
 }
 
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
-    forward_pass_common!(forward, PassKind::Attention);
-    forward_pass_readings!();
+    forward_pass_common!(PassKind::Text);
 
-    async fn media(
+    async fn checkpoints(
         &mut self,
         this: Resource<ForwardPass>,
-        spans: Vec<pie::inferlet::forward::MediaSpan>,
+        slots: Vec<u32>,
     ) -> Anyhow<Result<(), String>> {
-        self.core_media(this, spans).await
+        self.core_checkpoints(this, slots).await
     }
 
-    async fn attention(
+    async fn set_drafting_block(
         &mut self,
         this: Resource<ForwardPass>,
-        kv: Resource<crate::store::kv::working_set::KvWorkingSet>,
-        geom: pie::inferlet::forward::KvGeometry,
+        on: bool,
     ) -> Anyhow<Result<(), String>> {
-        self.core_attention(
-            this,
-            kv,
-            geom.readable_pages,
-            geom.writable_pages,
-            geom.kv_len,
-            geom.pages,
-            geom.page_indptr,
-            geom.w_slot,
-            geom.w_off,
-            geom.positions,
-            geom.mask,
-        )
-        .await
-    }
-}
-
-impl pie::inferlet::forward_recurrent::Host for ProcessCtx {
-    async fn submit(
-        &mut self,
-        on: Resource<crate::pipeline::Pipeline>,
-        slots: Vec<Option<Resource<ForwardPass>>>,
-    ) -> Anyhow<Result<(), String>> {
-        self.core_submit(on, slots).await
-    }
-
-    async fn park(&mut self, on: Resource<crate::pipeline::Pipeline>) -> Anyhow<()> {
-        crate::pipeline::fire::park_frame(self, on)
-    }
-}
-
-impl pie::inferlet::forward_recurrent::HostForwardPass for ProcessCtx {
-    forward_pass_common!(forward_recurrent, PassKind::Recurrent);
-
-    async fn attention(
-        &mut self,
-        this: Resource<ForwardPass>,
-        rs: Vec<Resource<RsWorkingSet>>,
-        geom: pie::inferlet::forward_recurrent::RsGeometry,
-    ) -> Anyhow<Result<(), String>> {
-        let geometry = rs_geometry_binding!(self, geom);
-        self.core_set_rs_working_sets(this, rs, geometry).await
-    }
-}
-
-impl pie::inferlet::forward_hybrid::Host for ProcessCtx {
-    async fn submit(
-        &mut self,
-        on: Resource<crate::pipeline::Pipeline>,
-        slots: Vec<Option<Resource<ForwardPass>>>,
-    ) -> Anyhow<Result<(), String>> {
-        self.core_submit(on, slots).await
-    }
-
-    async fn park(&mut self, on: Resource<crate::pipeline::Pipeline>) -> Anyhow<()> {
-        crate::pipeline::fire::park_frame(self, on)
-    }
-}
-
-impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
-    forward_pass_common!(forward_hybrid, PassKind::Hybrid);
-
-    async fn media(
-        &mut self,
-        this: Resource<ForwardPass>,
-        spans: Vec<pie::inferlet::forward_hybrid::MediaSpan>,
-    ) -> Anyhow<Result<(), String>> {
-        self.core_media(this, spans).await
-    }
-
-    async fn attention(
-        &mut self,
-        this: Resource<ForwardPass>,
-        kv: Option<pie::inferlet::forward_hybrid::KvBinding>,
-        rs: Vec<Resource<RsWorkingSet>>,
-        rs_geom: pie::inferlet::forward_hybrid::RsGeometry,
-    ) -> Anyhow<Result<(), String>> {
-        let Some(kv) = kv else {
-            return Ok(Err(
-                "forward pass: a hybrid pass with no attention binding is not supported yet; \
-                 bind the KV working set even for a recurrent-only fire"
-                    .to_string(),
-            ));
-        };
-        let geometry = rs_geometry_binding!(self, rs_geom);
-        let geom = kv.geometry;
-        if let Err(error) = self
-            .core_attention(
-                Resource::new_borrow(this.rep()),
-                kv.working_set,
-                geom.readable_pages,
-                geom.writable_pages,
-                geom.kv_len,
-                geom.pages,
-                geom.page_indptr,
-                geom.w_slot,
-                geom.w_off,
-                geom.positions,
-                geom.mask,
-            )
-            .await?
-        {
-            return Ok(Err(error));
-        }
-        self.core_set_rs_working_sets(this, rs, geometry).await
+        self.core_set_drafting_block(this, on).await
     }
 }
 
@@ -2454,45 +2046,10 @@ impl pie::inferlet::forward_diffusion::Host for ProcessCtx {
     ) -> Anyhow<Result<(), String>> {
         self.core_submit(on, slots).await
     }
-
-    async fn park(&mut self, on: Resource<crate::pipeline::Pipeline>) -> Anyhow<()> {
-        crate::pipeline::fire::park_frame(self, on)
-    }
 }
 
 impl pie::inferlet::forward_diffusion::HostForwardPass for ProcessCtx {
-    forward_pass_common!(forward_diffusion, PassKind::Diffusion);
-    forward_pass_readings!();
-
-    async fn media(
-        &mut self,
-        this: Resource<ForwardPass>,
-        spans: Vec<pie::inferlet::forward_diffusion::MediaSpan>,
-    ) -> Anyhow<Result<(), String>> {
-        self.core_media(this, spans).await
-    }
-
-    async fn attention(
-        &mut self,
-        this: Resource<ForwardPass>,
-        kv: Resource<crate::store::kv::working_set::KvWorkingSet>,
-        geom: pie::inferlet::forward_diffusion::KvGeometry,
-    ) -> Anyhow<Result<(), String>> {
-        self.core_attention(
-            this,
-            kv,
-            geom.readable_pages,
-            geom.writable_pages,
-            geom.kv_len,
-            geom.pages,
-            geom.page_indptr,
-            geom.w_slot,
-            geom.w_off,
-            geom.positions,
-            geom.mask,
-        )
-        .await
-    }
+    forward_pass_common!(PassKind::Diffusion);
 
     async fn self_conditioning(
         &mut self,
@@ -2528,8 +2085,8 @@ impl pie::inferlet::forward_diffusion::HostForwardPass for ProcessCtx {
 
 #[cfg(test)]
 mod tests {
-    use super::{attention_rebind_diff, port_rows, validate_port_channel};
-    use crate::pipeline::instance::{AttentionBinding, KvPageSpan, PortBinding};
+    use super::{port_rows, state_rebind_diff, validate_port_channel};
+    use crate::pipeline::instance::{PortBinding, StateBinding};
     use eta_ir::types::Dtype;
 
     fn port(
@@ -2563,8 +2120,7 @@ mod tests {
     fn forward_every_case() {
         a_port_channel_is_validated_against_its_fact();
         a_pass_s_row_ports_agree_on_their_rows();
-        identical_rebind_is_a_no_op();
-        differing_rebind_names_the_field();
+        a_rebind_changes_working_sets_not_geometry();
     }
 
     fn a_port_channel_is_validated_against_its_fact() {
@@ -2717,58 +2273,24 @@ mod tests {
         Ok(())
     }
 
-    fn binding() -> AttentionBinding {
-        AttentionBinding {
-            kv_ws: 1,
-            readable: KvPageSpan {
-                start: 0,
-                end: None,
-            },
-            writable: KvPageSpan {
-                start: 0,
-                end: None,
-            },
-            kv_len: 2,
-            pages: 3,
-            page_indptr: 4,
-            w_slot: 5,
-            w_off: 6,
-            positions: 7,
-            mask: Some(8),
-        }
-    }
-
-    fn identical_rebind_is_a_no_op() {
-        assert_eq!(attention_rebind_diff(&binding(), &binding()), None);
-    }
-
-    fn differing_rebind_names_the_field() {
-        let mut next = binding();
-        next.kv_ws = 9;
-        assert_eq!(
-            attention_rebind_diff(&binding(), &next),
-            Some("kv-working-set")
-        );
-        let mut next = binding();
-        next.writable = KvPageSpan {
-            start: 0,
-            end: Some(4),
+    fn a_rebind_changes_working_sets_not_geometry() {
+        let bound = StateBinding {
+            lanes: vec![1, 2],
+            positions: Some(3),
+            slots: None,
+            kv_len: Some(4),
+            mask: Some(5),
+            fold: Some(6),
         };
-        assert_eq!(
-            attention_rebind_diff(&binding(), &next),
-            Some("writable-pages")
-        );
-        let mut next = binding();
-        next.positions = 9;
-        assert_eq!(attention_rebind_diff(&binding(), &next), Some("positions"));
-        let mut next = binding();
-        next.mask = None;
-        assert_eq!(
-            attention_rebind_diff(&binding(), &next),
-            Some("mask (present on one binding, absent on the other)")
-        );
-        let mut next = binding();
-        next.mask = Some(9);
-        assert_eq!(attention_rebind_diff(&binding(), &next), Some("mask"));
+        let forks = StateBinding {
+            lanes: vec![7, 8],
+            ..bound.clone()
+        };
+        assert_eq!(state_rebind_diff(&bound, &forks), None);
+        let moved = StateBinding {
+            positions: Some(9),
+            ..forks
+        };
+        assert_eq!(state_rebind_diff(&bound, &moved), Some("positions"));
     }
 }

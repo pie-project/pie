@@ -14,7 +14,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
+use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
 use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
 use eta_ir::types::Dtype;
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
@@ -175,8 +175,6 @@ fn fault(fault: Fault) -> Error {
 
 fn extents(stated: &BindExtents) -> eta_exec::Extents {
     eta_exec::Extents {
-        kv_len: stated.kv_len,
-        page_count: stated.page_count,
         row_count: stated.row_count,
         token_count: stated.token_count,
         sampled_rows: stated.sampled_rows,
@@ -517,9 +515,15 @@ impl Engine for Metal {
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
         // The device pool already is host memory, so a host tier would only
-        // move kv within the same DRAM; suspended kv goes straight to disk.
+        // move kv and rs slots within the same DRAM; suspended ones go
+        // straight to disk.
         let disk_kv_pages = shell
-            .seat_disk_kv(residency.disk_kv_budget, residency.disk_kv_dir.as_deref())
+            .seat_disk_kv(
+                residency.disk_kv_budget,
+                residency.disk_kv_dir.as_deref(),
+                residency.kv_seats.unwrap_or(budgets.max_lanes),
+                budgets.max_context,
+            )
             .map_err(fault)?;
 
         let trace_name = shell.trace().name.clone();
@@ -562,6 +566,9 @@ impl Engine for Metal {
                 elastic_page_bytes,
                 elastic_budget_pages,
                 disk_kv_pages,
+                buffer_pages: shell.buffer_pages(),
+                host_state_slots: shell.parked_state_slots(),
+                host_buffer_pages: shell.parked_buffer_pages(),
                 // The sliding rows are paged in full here: the model's window
                 // is a fact of the model, its pool is not.
                 window_tokens: poem_exec::store::kv::declared_window(shell.trace()).unwrap_or(0),
@@ -575,11 +582,15 @@ impl Engine for Metal {
                 prefill_rows: shell
                     .neural_engine()
                     .map_or(0, crate::ane::Ane::prefill_rows),
+                max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
+                    &budgets,
+                )))
+                .unwrap_or(u32::MAX),
             },
             profile,
             ports: PortMask::DEVICE_GEOMETRY
                 .with(Port::AttnMask)
-                .with(Port::RsFoldLen),
+                .with(Port::Fold),
             geometry: GeometryClass::DeviceGeometry,
             kv_copy: KvCopyDomains {
                 device_to_device: true,
@@ -592,6 +603,7 @@ impl Engine for Metal {
             device_channel_commit: false,
             rs_verbs: shell.serves_rs_verbs(),
             bidirectional_attention: true,
+            adapter_attachments: false,
             facts: shell.trace().facts.clone(),
         };
 
@@ -628,11 +640,11 @@ impl Engine for Metal {
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        frame.validate_for(engine::fire::Serves {
-            device_channel_commit: false,
-            rs_verbs: self.caps.as_ref().is_some_and(|caps| caps.rs_verbs),
-            bidirectional: true,
-        })?;
+        frame.validate_for(
+            self.caps
+                .as_ref()
+                .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
+        )?;
         let id = self.next_frame;
         self.next_frame = self.next_frame.wrapping_add(1);
         self.pending = None;
@@ -873,7 +885,6 @@ impl Engine for Metal {
     }
 
     fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        copy.device_only("metal")?;
         for (at, move_) in copy.moves.iter().enumerate() {
             if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
                 return Err(Error::Invalid(format!(
@@ -883,12 +894,25 @@ impl Engine for Metal {
                 )));
             }
         }
-        let moves: Vec<(u32, u32)> = copy
-            .moves
-            .iter()
-            .map(|move_| (move_.src_slot_id, move_.dst_slot_id))
-            .collect();
-        self.loaded_mut()?.copy_state(&moves).map_err(fault)
+        let ends = |moves: &[engine::transfer::StateMove]| -> (Vec<u32>, Vec<u32>) {
+            moves.iter().map(|m| (m.src_slot_id, m.dst_slot_id)).unzip()
+        };
+        let ((src, dst), (page_src, page_dst)) = (ends(&copy.moves), ends(&copy.pages));
+        let shell = self.loaded_mut()?;
+        let copied: crate::error::Result<()> = match copy.direction {
+            StateDirection::DeviceToDevice => shell
+                .copy_state(&src.into_iter().zip(dst).collect::<Vec<_>>())
+                .and_then(|()| {
+                    shell.copy_pages(&page_src.into_iter().zip(page_dst).collect::<Vec<_>>())
+                }),
+            StateDirection::DeviceToHost => shell
+                .park_state(true, &src, &dst)
+                .and_then(|()| shell.park_pages(true, &page_src, &page_dst)),
+            StateDirection::HostToDevice => shell
+                .park_state(false, &dst, &src)
+                .and_then(|()| shell.park_pages(false, &page_dst, &page_src)),
+        };
+        copied.map_err(fault)
     }
 }
 

@@ -1,26 +1,6 @@
-//! MEASUREMENT INSTRUMENT — naive decode with an optional semantically-causal
-//! custom AttnMask. NOT a policy inferlet; exists only to measure what a
-//! plain-decode fire loses when it is forced onto the engine's custom-mask
-//! path (`has_custom_mask` disables `use_decode_path` and
-//! `fused_decode_qkv_post` fire-wide — Stage 2 verdict item A).
-//!
-//! The decode pass is chat-completion's decode shape (every descriptor port
-//! channel-bound and re-put each fire — the device-geometry wire-form) with
-//! naive-baseline's gumbel sampler. `mask_mode="none"` runs the identical
-//! pass without the AttnMask binding, so the A/B differs ONLY in
-//! the mask binding plus the mask-evolution epilogue ops (iota/le/put) —
-//! the attention-path swap is the measured object.
-//!
-//! Runs on both forward-pass kinds through the one hybrid interface: the
-//! recurrent working set is a VALUE (empty on an attention model, one per
-//! sequence on a hybrid one), so the body is written once. On a hybrid model
-//! the bound mask applies to the ATTENTION layers only — that is what
-//! `kv-geometry.mask` means on `forward-hybrid`, and it is exactly the object
-//! this instrument measures. The recurrent layers of a hybrid model fold
-//! every token unconditionally; the instrument does not try to emulate a mask
-//! for them.
+//! A measurement instrument: naive decode forced onto the engine's custom-mask path.
 
-use inferlet::eta::hybrid::prelude::*;
+use inferlet::eta::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
@@ -41,22 +21,15 @@ struct Input {
     ///   "structured" causal mask via the CausalMask opcode sugar — the
     ///                engine recognizes it and takes the window-override
     ///                decode path (structured_window_left = -1)
-    ///   "dense-prefill" causal host mask on the PREFILL chunks instead
-    ///                (decode unmasked) — the chunk fires are
-    ///                wire-geometry, so their BRLE rows are the
-    ///                dense-mask-compose producer: concurrent decode
-    ///                envelopes co-batch with them and the frame
-    ///                assembles wire rows + causal fill host-side
+    ///   "dense-prefill" causal host mask on the PREFILL instead (decode
+    ///                unmasked), so concurrent decodes co-batch with its
+    ///                dense rows
+    ///   "doc-isolation" causal decode mask that also hides the prompt's
+    ///                first half, a RAG document-isolation policy
     #[serde(default = "default_mask_mode")]
     mask_mode: String,
-    /// STRUCTURAL: run only the first k layers (fire-level uniform
-    /// truncation — composes with every mask mode).
     #[serde(default)]
     max_layers: Option<u32>,
-    /// Step-logit probe: emit reduce_max(logits) per decode step into
-    /// `lg` — the fingerprint the state-effect oracle diffs.
-    #[serde(default)]
-    logit_probe: bool,
 }
 
 fn default_prompt() -> String {
@@ -85,8 +58,6 @@ struct Output {
     mask_mode: String,
     text: String,
     count: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    lg: Vec<f32>,
 }
 
 /// One sampling step: temperature, then a Gumbel-max draw over the full vocab.
@@ -107,39 +78,17 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let mask_mode = input.mask_mode.clone();
-    let probe = input.logit_probe;
-    let mut lg: Vec<f32> = Vec::new();
     if !matches!(
         mask_mode.as_str(),
-        "none" | "dense" | "structured" | "dense-prefill" | "dense-prefill-hole" | "doc-isolation"
+        "none" | "dense" | "structured" | "dense-prefill" | "doc-isolation"
     ) {
         return Err(format!("unknown mask_mode: {mask_mode}"));
     }
     let masked = matches!(mask_mode.as_str(), "dense" | "structured" | "doc-isolation");
 
     let structured = mask_mode == "structured";
-    let masked_prefill = matches!(mask_mode.as_str(), "dense-prefill" | "dense-prefill-hole");
-    // The hole: knock column 1 out of the causal envelope for rows p >= 2.
-    // Non-causal by construction, so `is_pure_causal` cannot elide it — a
-    // composed batch is forced through the wire-mask ASSEMBLY branch.
-    let holed = mask_mode == "dense-prefill-hole";
+    let masked_prefill = mask_mode == "dense-prefill";
     let ws = WorkingSet::new();
-    // One recurrent working set for this one sequence on a hybrid model (the
-    // engine requires one per request row); none on a pure-attention one.
-    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
-        model::ForwardKind::Attention => Vec::new(),
-        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
-        model::ForwardKind::Recurrent => {
-            return Err(
-                "this program has no recurrent-only path (it measures the attention mask path)"
-                    .into(),
-            );
-        }
-        model::ForwardKind::Diffusion => {
-            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
-        }
-    };
-    let page_size = kv_page_size();
 
     if max_tokens == 0 {
         return Ok(Output {
@@ -147,7 +96,6 @@ async fn main(input: Input) -> Result<Output> {
             mask_mode,
             text: String::new(),
             count: 0,
-            lg: Vec::new(),
         });
     }
 
@@ -168,122 +116,68 @@ async fn main(input: Input) -> Result<Output> {
     } else {
         0
     };
-    let pool_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    let pool_len = pool_pages * page_size;
-    let slots = ws
-        .reserve(pool_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
-    let pool_ids = slots.ids().to_vec();
+    let span = n + max_tokens as u32 + 1;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
-    // ── PREFILL (chunked, C-wide): identical to naive-baseline, no mask. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let spans = prefill_chunks(n, None);
     let pipe = Pipeline::new();
 
-    let mut g0 = 0i32;
-    for &(base, end) in &spans {
-        let len = end - base;
+    let toks_p = Channel::from(prompt_i32.clone()).named("toks_p");
+    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+    let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
+    let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
+    let mask_p = masked_prefill.then(|| {
+        let rows: Vec<bool> = (0..n)
+            .flat_map(|p| (0..span).map(move |j| j <= p))
+            .collect();
+        Channel::from_shaped([n, span], rows).named("mask_p")
+    });
 
-        let toks_p =
-            Channel::from(prompt_i32[base as usize..end as usize].to_vec()).named("toks_p");
-        let embed_indptr_p = Channel::from(vec![0u32, len]).named("embed_indptr_p");
-        let positions_p = Channel::from((base..end).collect::<Vec<_>>()).named("positions_p");
-        let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
-        let page_indptr_p =
-            Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr_p");
-        let w_slot_p = Channel::from(
-            (base..end)
-                .map(|p| pool_ids[(p / page_size) as usize])
-                .collect::<Vec<_>>(),
-        )
-        .named("w_slot_p");
-        let w_off_p =
-            Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-        let kv_len_p = Channel::from(vec![end]).named("kv_len_p");
-        let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
-        let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
-        // dense-prefill: a semantically-causal host mask over the chunk's
-        // query rows (row for position p allows j <= p). The chunk fire is
-        // wire-geometry, so this lowers to wire BRLE rows — the lane shape
-        // the dense-mask compose admits into shared batches.
-        let mask_p = masked_prefill.then(|| {
-            let rows: Vec<bool> = (base..end)
-                .flat_map(|p| (0..pool_len).map(move |j| j <= p && !(holed && j == 1 && p >= 2)))
-                .collect();
-            Channel::from_shaped([len, pool_len], rows).named("mask_p")
-        });
-
-        let fwd_p = ForwardPass::new();
-        if let Some(k) = input.max_layers {
-            fwd_p.set_max_layers(k)?;
-        }
-        fwd_p.embed(&toks_p, &embed_indptr_p)?;
-        fwd_p.attention(
-            Some(KvBinding {
-                working_set: &ws,
-                geometry: KvGeometry {
-                    readable_pages: ..,
-                    writable_pages: ..,
-                    kv_len: &kv_len_p,
-                    pages: &pages_p,
-                    page_indptr: &page_indptr_p,
-                    w_slot: &w_slot_p,
-                    w_off: &w_off_p,
-                    positions: &positions_p,
-                    mask: mask_p.as_ref(),
-                },
-            }),
-            &rs_ws,
-            RsGeometry {
-                fold_len: None,
-                buffer: 0..0,
-            },
-        )?;
-        fwd_p.epilogue(move || {
-            let r = rng_p.take();
-            let logits = intrinsics::logits();
-            let token = step(logits, temperature, &r);
-            let r_next = &r + iota(2);
-            tok_out_p.put(&token);
-            rng_p.put(&r_next);
-        });
-
-        fwd_p
-            .submit(&pipe)
-            .map_err(|e| format!("prefill submit @{base}: {e}"))?;
-
-        g0 = tok_out_p
-            .take_host::<i32>()
-            .await
-            .map_err(|e| format!("g0 take @{base}: {e}"))?;
+    let fwd_p = ForwardPass::new();
+    if let Some(k) = input.max_layers {
+        fwd_p.set_max_layers(k)?;
     }
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
+    fwd_p.state(
+        &[&ws],
+        StateGeometry {
+            mask: mask_p.as_ref(),
+            ..StateGeometry::folding()
+        },
+    )?;
+    fwd_p.epilogue(move || {
+        let r = rng_p.take();
+        let logits = intrinsics::logits();
+        let token = step(logits, temperature, &r);
+        let r_next = &r + iota(2);
+        tok_out_p.put(&token);
+        rng_p.put(&r_next);
+    });
+
+    fwd_p
+        .submit(&pipe)
+        .map_err(|e| format!("prefill submit: {e}"))?;
+
+    let g0 = tok_out_p
+        .take_host::<i32>()
+        .await
+        .map_err(|e| format!("g0 take: {e}"))?;
     generated.push(g0 as u32);
 
     // ── DECODE LOOP (1-wide, run-ahead) — chat-completion's decode shape. ──
     if generated.len() < max_tokens {
-        let slot_n = pool_ids[(n / page_size) as usize];
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-        let pos = Channel::from(vec![n; 1]).named("pos");
         let fill = Channel::from(vec![n + 1; 1]).named("fill");
-        let klen = Channel::from(vec![n + 1; 1]).named("klen");
-        let w_slot = Channel::from(vec![slot_n; 1]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size; 1]).named("w_off");
         // Causal row for the fire-0 query at position n: attend all j <= n
         // (doc-isolation additionally blocks j < doc_start).
-        let seed_mask: Vec<bool> = (0..pool_len).map(|j| j >= doc_start && j <= n).collect();
-        let mask = Channel::from_shaped([1, pool_len], seed_mask).named("mask");
+        let seed_mask: Vec<bool> = (0..span).map(|j| j >= doc_start && j <= n).collect();
+        let mask = Channel::from_shaped([1, span], seed_mask).named("mask");
         let doc_row = Channel::from_shaped(
-            [pool_len],
-            (0..pool_len).map(|j| j >= doc_start).collect::<Vec<bool>>(),
+            [span],
+            (0..span).map(|j| j >= doc_start).collect::<Vec<bool>>(),
         )
         .named("doc_row");
-        let pages = Channel::from(pool_ids.clone()).named("pages");
-        let page_indptr =
-            Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
-        let lg_out = Channel::new([1], dtype::f32).capacity(8).named("lg_out");
         let tok_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("tok_out");
@@ -295,49 +189,21 @@ async fn main(input: Input) -> Result<Output> {
             fwd.set_max_layers(k)?;
         }
         fwd.embed(&tok_in, &lane1)?;
-        fwd.attention(
-            Some(KvBinding {
-                working_set: &ws,
-                geometry: KvGeometry {
-                    readable_pages: ..,
-                    writable_pages: (n / page_size)..,
-                    kv_len: &klen,
-                    pages: &pages,
-                    page_indptr: &page_indptr,
-                    w_slot: &w_slot,
-                    w_off: &w_off,
-                    positions: &pos,
-                    mask: if masked { Some(&mask) } else { None },
-                },
-            }),
-            &rs_ws,
-            RsGeometry {
-                fold_len: None,
-                buffer: 0..0,
+        fwd.state(
+            &[&ws],
+            StateGeometry {
+                mask: if masked { Some(&mask) } else { None },
+                ..StateGeometry::folding()
             },
         )?;
         fwd.epilogue(move || {
             // TAKES + compute first, PUTS last (value-id discipline).
-            let base = fill.take(); // [1] u32 — position this fire writes
-            let pids = pool_ids_ch.take();
+            let base = fill.take(); // [1] u32
             let r = rng.take();
 
-            let logits = intrinsics::logits();
-            if probe {
-                lg_out.put(&reduce_max(&logits));
-            }
-            let token = step(logits, temperature, &r);
+            let token = step(intrinsics::logits(), temperature, &r);
             let r_next = &r + iota(2);
-
-            let logical_slot = &base / page_size;
-            let w_slot_v = gather(&pids, &logical_slot);
-            let w_off_v = &base % page_size;
-            let klen_v = &base + 1u32;
             let next_free = &base + 1u32;
-            let pages_v = reshape(&pids, [pool_pages]);
-            // Page count tracks the new kv length, never the pool size.
-            let page_count = klen_v.div_ceil(page_size);
-            let pidx_v = indptr(1, &page_count);
 
             tok_in.take();
             tok_in.put(&token);
@@ -347,43 +213,27 @@ async fn main(input: Input) -> Result<Output> {
                 let new_mask = if structured {
                     // CausalMask opcode — the engine's structured-mask
                     // recognizer lowers it to a runtime window override.
-                    reshape(causal_mask(&base, pool_len), [1, pool_len])
+                    reshape(causal_mask(&base, span), [1, span])
                 } else {
                     // Same semantics from generic ops — packs a dense
                     // custom mask (the custom-mask prefill path).
-                    let col = iota(pool_len);
-                    let base_b = broadcast(reshape(&base, [1]), [pool_len]);
-                    reshape(le(&col, &base_b), [1, pool_len])
+                    let col = iota(span);
+                    let base_b = broadcast(reshape(&base, [1]), [span]);
+                    reshape(le(&col, &base_b), [1, span])
                 };
                 // doc-isolation: AND the static document-boundary row in
                 // (a seeded channel read — the causal half evolves, the
                 // document block is a constant of the request).
                 let new_mask = if doc_start > 0 {
-                    reshape(
-                        and(&reshape(new_mask, [pool_len]), &doc_row.read()),
-                        [1, pool_len],
-                    )
+                    reshape(and(&reshape(new_mask, [span]), &doc_row.read()), [1, span])
                 } else {
                     new_mask
                 };
                 mask.take();
                 mask.put(&new_mask);
             }
-            w_slot.take();
-            w_slot.put(&w_slot_v);
-            w_off.take();
-            w_off.put(&w_off_v);
-            klen.take();
-            klen.put(&klen_v);
-            pos.take();
-            pos.put(&base);
             fill.put(&next_free);
-            pages.take();
-            pages.put(&pages_v);
-            page_indptr.take();
-            page_indptr.put(&pidx_v);
             rng.put(&r_next);
-            pool_ids_ch.put(&pids);
         });
 
         let budget = max_tokens - 1;
@@ -392,13 +242,6 @@ async fn main(input: Input) -> Result<Output> {
                 .take_host::<i32>()
                 .await
                 .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?;
-            if probe {
-                let v = lg_out
-                    .take_host::<f32>()
-                    .await
-                    .map_err(|e| format!("lg_out.take: {e}"))?;
-                lg.push(v);
-            }
             generated.push(t as u32);
             Ok(ControlFlow::Continue(()))
         })
@@ -411,6 +254,5 @@ async fn main(input: Input) -> Result<Output> {
         mask_mode,
         text: wit_model::decode(&generated)?,
         count: generated.len(),
-        lg,
     })
 }

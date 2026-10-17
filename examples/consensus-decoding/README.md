@@ -59,16 +59,15 @@ With one candidate, centrality is defined as `1.0` and the lone response wins.
 
 ## Implementation notes
 
-The shared prompt prefix is prefilled once. Candidate lanes share those KV cells,
-and the decode loop uses per-lane masks so each continuation attends the shared
-prefix plus its own appended cells. The top-p sampling in the decode loop is
-really `[B, vocab]`, with independent per-lane Gumbel noise.
+The shared prompt prefix is prefilled once and frozen. Each candidate lane is a
+`WorkingSet::fork` of it, so the lanes share the prefix and each appends its own
+continuation; no mask is needed.
+The top-p sampling in the decode loop is really `[B, vocab]`, with independent
+per-lane Gumbel noise.
 
 The prefill deliberately samples a single `[1, vocab]` read-out row and starts
 all `B` candidates from that same first token. Broadcasting the prefill row to
-`[B, vocab]` would trigger the nucleus-sampler scratch-elision bug documented in
-`inference-time-algorithms/11-ptir-limits.md`
-under "Four unchecked contracts that fail silently", contract 4. The verified
+`[B, vocab]` would trigger a nucleus-sampler scratch-elision bug. The verified
 behaviour is that at `temperature = 1.2` candidates diverge by the second
 sentence; at `0.6` they are identical because the nucleus keep-set is a single
 token.

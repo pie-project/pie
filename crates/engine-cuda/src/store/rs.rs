@@ -339,8 +339,11 @@ impl Buffers {
         self.slot_bytes().saturating_mul(u64::from(self.slots))
     }
 
-    /// One page across the layers. The runtime names a buffered page by an
-    /// rs slot, so a fire may commit these up to the highest slot seated.
+    #[must_use]
+    pub fn pages(&self) -> u32 {
+        self.slots
+    }
+
     #[must_use]
     pub fn slot_bytes(&self) -> u64 {
         self.per_page

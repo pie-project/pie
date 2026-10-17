@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use engine::ports::Envelope;
 use eta_exec::{ExecPlan, Extents};
 use eta_ir::container::HostRole;
 use eta_ir::registry::{GeometryClass, Port};
@@ -12,7 +13,7 @@ use crate::error::{Fault, Result};
 use super::compile::Compiled;
 use super::endpoint::Endpoint;
 use super::launch::{ChannelShape, Cursor, Prepared, Rings, native_to_wire, wire_to_native};
-use super::ports::{self, Envelope};
+use super::ports;
 use super::wave::Wave;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -284,14 +285,18 @@ impl Session {
 
     #[must_use]
     pub fn token_device_source(&self, plan: &ExecPlan, class: GeometryClass) -> Option<(u64, u32)> {
-        if !ports::resolves(class, Port::EmbedTokens) {
+        if !engine::ports::resolves(class, Port::EmbedTokens) {
             return None;
         }
+        self.port_device_source(plan, Port::EmbedTokens)
+    }
+
+    pub fn port_device_source(&self, plan: &ExecPlan, port: Port) -> Option<(u64, u32)> {
         let binding = plan
             .package
             .ports
             .iter()
-            .find(|binding| binding.port == Port::EmbedTokens && !binding.is_const)?;
+            .find(|binding| binding.port == port && !binding.is_const)?;
         let channel = binding.channel as usize;
         let endpoint = self.rings.endpoint(channel)?;
         if endpoint.role() != HostRole::None {

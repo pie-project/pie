@@ -494,7 +494,7 @@ async def _run_tests_on(client, tests: list[TestFn], args: argparse.Namespace) -
 #: `attn_page_mask` wants a shell that CONSUMES the sink -- and the audit
 #: (`.wiki/alto/attn-score.md` section 7) found nobody knocking: every
 #: enforcing program here, `trackb-h2o` and `trackb-snapkv` included, goes
-#: through the mask door (`KvGeometry.mask` -> `Port::AttnMask`), which both
+#: through the mask door (`StateGeometry.mask` -> `Port::AttnMask`), which both
 #: shells advertise. The sink's sole caller is `quest`, behind
 #: `envelope_dot`; on Metal its legal stages and the plane's one boundary
 #: do not even intersect. The entry below stays because the WORD is still

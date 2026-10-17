@@ -1,0 +1,9 @@
+# Orders processes by priority: the router's `router/priority` where a
+# router policy passed one on, else the client's own `priority`.
+plane = "engine"
+subscribe = ["arrived", "exited", "prop-changed"]
+grants = ["schedule"]
+
+[props.priority]
+type = "int"
+doc = "Larger runs first; a process without one is 0. `router/priority`, when present, wins."

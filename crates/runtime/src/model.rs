@@ -271,6 +271,12 @@ pub fn model() -> &'static Arc<Model> {
     MODEL.get().expect("model accessed before registration")
 }
 
+/// So a key means the same KV across restarts and the workers serving it.
+pub fn kv_fingerprint() -> Option<Vec<u8>> {
+    let m = MODEL.get()?;
+    Some(format!("{}|{}|{}", m.deployment.name, m.kv_page_size, m.num_layers).into_bytes())
+}
+
 pub fn media_pad() -> Option<u32> {
     static PAD: OnceLock<Option<u32>> = OnceLock::new();
     *PAD.get_or_init(|| {
@@ -304,7 +310,6 @@ pub struct Model {
 pub struct RsCaps {
     pub state_size: u64,
     pub buffer_page_size: u32,
-    pub fold_granularity: u32,
     /// The window the model's state is read through, when it is one:
     /// its bounded half is then a ring of windowed kv pages, not a slot.
     pub window_tokens: u32,
@@ -330,6 +335,7 @@ pub struct EtaCaps {
     pub has_attn_score: bool,
     pub has_attn_page_mask: bool,
     pub has_lora: bool,
+    pub adapter_attachments: bool,
 }
 
 impl std::fmt::Debug for Model {
@@ -480,17 +486,12 @@ impl Model {
         self.rs_caps
     }
 
-    /// What a forward pass of the model is: kv, a bounded state, both, or
-    /// a canvas.
     pub fn pass_kind(&self) -> crate::pipeline::instance::PassKind {
         use crate::pipeline::instance::PassKind;
         if self.diffusion().is_some() {
-            return PassKind::Diffusion;
-        }
-        match (self.kv_page_size > 0, self.rs_caps.has_state()) {
-            (_, false) => PassKind::Attention,
-            (true, true) => PassKind::Hybrid,
-            (false, true) => PassKind::Recurrent,
+            PassKind::Diffusion
+        } else {
+            PassKind::Text
         }
     }
 

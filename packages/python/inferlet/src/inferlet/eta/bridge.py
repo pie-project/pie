@@ -12,14 +12,12 @@ from __future__ import annotations
 import functools
 import inspect
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Sequence, TypeAlias
+from typing import Awaitable, Callable, Literal, Sequence, TypeAlias
 
 from componentize_py_types import Err as _WitErr
 from wit_world.imports import channel as _wit_channel
-from wit_world.imports import forward as _wit_attention
+from wit_world.imports import forward as _wit_forward
 from wit_world.imports import forward_diffusion as _wit_diffusion
-from wit_world.imports import forward_hybrid as _wit_hybrid
-from wit_world.imports import forward_recurrent as _wit_recurrent
 from wit_world.imports import model as _wit_model
 from wit_world.imports import pie_inferlet_types as _wit_types
 from wit_world.imports import pipeline as _wit_pipeline
@@ -242,7 +240,7 @@ class Channel:
         try:
             self._wit().put(data.data)
         except _WitErr:
-            # Fire-and-forget, like the Rust `inferlet` crate: failures surface at take.
+            # Fire-and-forget: failures surface at take.
             pass
 
     def set(self, v, dtype: Dtype | None = None) -> None:
@@ -290,158 +288,35 @@ class Channel:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class PageRange:
-    start: int
-    len: int
-
-    def _wit(self):
-        return _wit_ws.PageRange(self.start, self.len)
-
-
-class PageGrant:
-    """A grant of fresh logical page indexes from `WorkingSet.reserve`."""
-
-    def __init__(self, start: int, length: int) -> None:
-        self.start = start
-        self.ids = list(range(start, start + length))
-
-    def range(self) -> PageRange:
-        return PageRange(self.start, len(self.ids))
-
-
 class WorkingSet:
-    """The attention working set — a logical page address space over the KV
-    mapping trie. Every page reference is working-set-relative."""
+    """One sequence's model state; slots below `folded()` are frozen, the rest is a buffer."""
 
-    __slots__ = ("kv", "grant", "_rs")
-
-    def __init__(self, *, tokens: int | None = None) -> None:
-        """`tokens=n` reserves the pages `n` tokens need up front (`grant`);
-        `geometry()` then addresses them."""
-        self.kv = _wit_ws.KvWorkingSet()
-        self.grant = None
-        self._rs = None
-        if tokens is not None:
-            self.reserve(max(-(-tokens // kv_page_size()), 1))
-
-    @classmethod
-    def _wrap(cls, kv) -> "WorkingSet":
-        ws = cls.__new__(cls)
-        ws.kv = kv
-        ws.grant = None
-        ws._rs = None
-        return ws
-
-    def page_len(self) -> int:
-        return self.kv.page_len()
-
-    def reserve(self, pages: int) -> PageGrant:
-        """Reserve `pages` fresh pages. The first grant is kept as `grant`."""
-        r = _wit(self.kv.reserve, pages, what="reserve KV")
-        grant = PageGrant(r.start, r.len)
-        if self.grant is None:
-            self.grant = grant
-        return grant
-
-    @property
-    def rs(self) -> list["RsWorkingSet"]:
-        """The recurrent state a hybrid model folds this sequence into: one
-        `RsWorkingSet`, made on first use; empty on an attention model."""
-        if self._rs is None:
-            self._rs = [RsWorkingSet()] if _wit_model.pass_kind() == ForwardKind.HYBRID else []
-        return self._rs
-
-    def geometry(self, start: int, end: int) -> "KvGeometry":
-        """The `KvGeometry` of a fire that embeds tokens `[start, end)` of one
-        contiguous sequence into this working set's pages: `kv_len`,
-        `page_indptr`, `w_slot`, `w_off`, `positions` are all derived from the
-        span, and `pages` is the reserved grant. Edit the returned fields
-        (`mask`, `writable_pages`, ...) for anything else."""
-        if not 0 <= start < end:
-            raise InferletError(f"geometry: [{start}, {end}) is not a span of tokens to embed")
-        page = kv_page_size()
-        pages = self.grant.ids if self.grant is not None else list(range(-(-end // page)))
-        return KvGeometry(
-            kv_len=Channel.from_([end], Dtype.U32),
-            pages=Channel.from_(pages, Dtype.U32),
-            page_indptr=Channel.from_([0, -(-end // page)], Dtype.U32),
-            w_slot=Channel.from_([p // page for p in range(start, end)], Dtype.U32),
-            w_off=Channel.from_([p % page for p in range(start, end)], Dtype.U32),
-            positions=Channel.from_(range(start, end), Dtype.U32),
-        )
-
-    def update_index(self, key: bytes) -> None:
-        _wit(self.kv.update_index, bytes(key), what="update_index")
-
-    @staticmethod
-    def from_index(key: bytes) -> "WorkingSet | None":
-        kv = _wit(_wit_ws.KvWorkingSet.from_index, bytes(key), what="from_index")
-        return WorkingSet._wrap(kv) if kv is not None else None
-
-    @staticmethod
-    def remove_index(key: bytes) -> bool:
-        return _wit(_wit_ws.KvWorkingSet.remove_index, bytes(key), what="remove_index")
-
-    def discard(self, on: "Pipeline", ranges: Sequence[PageRange]) -> None:
-        _wit(self.kv.discard, on.wit, [r._wit() for r in ranges], what="discard")
-
-    def fork(self, on: "Pipeline") -> "WorkingSet":
-        return WorkingSet._wrap(_wit(self.kv.fork, on.wit, what="fork"))
-
-    def slice(self, on: "Pipeline", start: int, length: int) -> "WorkingSet":
-        return WorkingSet._wrap(_wit(self.kv.slice, on.wit, _wit_ws.PageRange(start, length), what="slice"))
-
-    def copy_into(self, on: "Pipeline", dst_page_ids, dst_tok_idx, src_page_ids, src_tok_idx) -> None:
-        _wit(
-            self.kv.copy_into,
-            on.wit,
-            list(dst_page_ids),
-            list(dst_tok_idx),
-            list(src_page_ids),
-            list(src_tok_idx),
-            what="copy_into",
-        )
-
-
-class RsWorkingSet:
-    """Runtime recurrent-state slots for hybrid / linear-attention models."""
-
-    __slots__ = ("rs",)
+    __slots__ = ("ws",)
 
     def __init__(self) -> None:
-        self.rs = _wit_ws.RsWorkingSet()
+        self.ws = _wit_ws.WorkingSet()
 
     @classmethod
-    def _wrap(cls, rs) -> "RsWorkingSet":
-        ws = cls.__new__(cls)
-        ws.rs = rs
-        return ws
+    def _wrap(cls, ws) -> "WorkingSet":
+        out = cls.__new__(cls)
+        out.ws = ws
+        return out
 
-    def state_size(self) -> int:
-        return _wit_model.rs_state_size()
+    def reserve(self, end: int) -> None:
+        """Lets passes write slots below `end`; needed only when the device computes the slots."""
+        _wit(self.ws.reserve, end, what="reserve")
 
-    def buffer_size(self) -> int:
-        return self.rs.buffer_size()
+    def folded(self) -> int:
+        """The frozen length; while a device-counted fold is in flight, the length before it."""
+        return self.ws.folded()
 
-    def buffer_page_size(self) -> int:
-        return _wit_model.rs_buffer_page_size()
+    def cached_tokens(self) -> int:
+        """Slots the runtime mapped in from state it already held rather than computed."""
+        return self.ws.cached_tokens()
 
-    def alloc_buffer(self, n: int) -> PageRange:
-        r = _wit(self.rs.alloc_buffer, n, what="alloc_buffer")
-        return PageRange(r.start, r.len)
-
-    def free_buffer(self, indices: Sequence[int]) -> None:
-        _wit(self.rs.free_buffer, list(indices), what="free_buffer")
-
-    def discard_buffered(self, count: int) -> None:
-        _wit(self.rs.discard_buffered, count, what="discard_buffered")
-
-    def reorder_buffer(self, perm: Sequence[int]) -> None:
-        _wit(self.rs.reorder_buffer, list(perm), what="reorder_buffer")
-
-    def fork(self, on: "Pipeline") -> "RsWorkingSet":
-        return RsWorkingSet._wrap(_wit(self.rs.fork, on.wit, what="fork"))
+    def fork(self, on: "Pipeline") -> "WorkingSet":
+        """A child sharing the frozen part, with a copy of the buffer."""
+        return WorkingSet._wrap(_wit(self.ws.fork, on.wit, what="fork"))
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +337,7 @@ class Pipeline:
 
     def park(self) -> None:
         """Leave the frame wait-set until this pipeline submits again."""
-        _wit_attention.park(self.wit)
+        _wit_forward.park(self.wit)
 
     def submit(self, fwd: "ForwardPass") -> None:
         """Enqueue one pass as a single-slot frame."""
@@ -496,12 +371,13 @@ class Pipeline:
         if budget == 0:
             return 0
         # Live slots per frame. A pass that binds a dense device mask takes one;
-        # so does a pass on a recurrent or hybrid model, whose frame's waves carry
-        # the same sequence's state one into the next (a frame of one live slot
-        # measured faster than a full one on Qwen3.5-0.8B). A dense attention
-        # pass fills the frame.
-        r = 1 if fwd.binds_device_mask() or fwd.kind != ForwardKind.ATTENTION else frame_size()
-        window_frames = max((channel_capacity() - 1) // max(r, 1), 1)
+        # so does a pass on a model with recurrent state, whose frame's waves
+        # carry the same sequence's state one into the next (a frame of one
+        # live slot measured faster than a full one on Qwen3.5-0.8B), and a
+        # canvas, which is redrawn whole. Any other pass fills the frame.
+        single = fwd.binds_device_mask() or _rs_state_size() > 0 or fwd.kind == ForwardKind.DIFFUSION
+        r = 1 if single else frame_size()
+        window_frames = max(_wit_model.run_ahead_window() // max(r, 1), 1)
         submitted = 0
         consumed = 0
 
@@ -542,63 +418,36 @@ class Pipeline:
 
 
 # ---------------------------------------------------------------------------
-# Geometry
+# State geometry
 # ---------------------------------------------------------------------------
 
 
-PageDecl: TypeAlias = "int | tuple[int, int | None] | None"
-"""A page span over the working set: `None` = everything, an `int` =
-`start..` (open-ended), `(start, end)` = `start..end` (`end=None` for
-open-ended) — the Rust `inferlet` crate's `..`, `n..`, `a..b`."""
-
-
-def _page_decl(r: PageDecl) -> tuple[int, int | None]:
-    if r is None:
-        return 0, None
-    if isinstance(r, int):
-        return r, None
-    start, end = r
-    if end is not None and start > end:
-        raise ValueError(f"attention page-span start {start} exceeds end {end}")
-    return start, end
-
-
-def _page_span(decl: tuple[int, int | None]):
-    return _wit_ws.PageSpan(decl[0], decl[1])
+Fold: TypeAlias = "Channel | Literal['all'] | None"
+"""How many more slots each lane freezes after a fire: `None`, `"all"`, or a u32 count channel."""
 
 
 @dataclass
-class KvGeometry:
-    """The attention geometry of one fire — mirrors WIT `kv-geometry`."""
+class StateGeometry:
+    """Where a pass's rows land and what they read; omitted fields mean a causal append."""
 
-    kv_len: Channel
-    pages: Channel
-    page_indptr: Channel
-    w_slot: Channel
-    w_off: Channel
-    positions: Channel
+    positions: Channel | None = None
+    """Per row, the RoPE position."""
+    slots: Channel | None = None
+    """Per row, the slot it writes; a lane's rows write consecutive slots."""
+    kv_len: Channel | None = None
+    """Per lane, how many slots the lane reads."""
     mask: Channel | None = None
-    readable_pages: PageDecl = None
-    writable_pages: PageDecl = None
+    """Per row, bool over the slots it may read."""
+    fold: Fold = None
 
-
-@dataclass
-class RsGeometry:
-    """Where the bound recurrent state's folded boundary lands — mirrors WIT
-    `rs-geometry`. `fold_len=None` folds everything."""
-
-    fold_len: Channel | None = None
-    buffer: PageDecl = (0, 0)
-
-
-@dataclass
-class KvBinding:
-    working_set: WorkingSet
-    geometry: KvGeometry
+    @staticmethod
+    def folding(**fields) -> "StateGeometry":
+        """Append and freeze everything written: for a prompt or a decode of final tokens."""
+        return StateGeometry(fold="all", **fields)
 
 
 # ---------------------------------------------------------------------------
-# Model constants (cached where the Rust `inferlet` crate caches)
+# Model constants
 # ---------------------------------------------------------------------------
 
 @functools.cache
@@ -624,11 +473,17 @@ def kv_page_size() -> int:
 
 
 @functools.cache
-def max_embed_length() -> int:
-    return max(_wit_model.max_embed_length(), 1)
+def _rs_state_size() -> int:
+    return _wit_model.rs_state_size()
 
 
-def even_spans(n: int, cap: int) -> list[tuple[int, int]]:
+@functools.cache
+def max_readout_rows(kind: "_wit_model.ReadoutKind") -> int:
+    """The most rows one pass may read out through `kind`; the pass itself may be any length."""
+    return max(_wit_model.max_readout_rows(kind), 1)
+
+
+def _even_spans(n: int, cap: int) -> list[tuple[int, int]]:
     if n == 0:
         return []
     cap = max(min(cap, n), 1)
@@ -643,21 +498,9 @@ def even_spans(n: int, cap: int) -> list[tuple[int, int]]:
     return out
 
 
-def prefill_chunk_hint() -> int:
-    """The prefill chunk the scheduler would like right now, in tokens
-    (`model.prefill-chunk-hint`): the forward token budget shared among the
-    live processes, in whole KV pages. Read per call — it moves as processes
-    come and go. A hint: the runtime never splits a fire."""
-    return min(max(_wit_model.prefill_chunk_hint(), 1), max_embed_length())
-
-
-def prefill_chunks(n: int, cap: int | None = None) -> list[tuple[int, int]]:
-    """The `[start, end)` spans a prompt of `n` tokens must be prefilled in,
-    respecting `max_embed_length()`. `cap` overrides the limit; `None` takes
-    `prefill_chunk_hint()`, so a prompt prefilled beside other live processes
-    is cut into chunks that leave the step room for their decodes."""
-    c = min(cap if cap is not None else prefill_chunk_hint(), max(max_embed_length(), 1))
-    return even_spans(n, max(c, 1))
+def readout_spans(n: int, kind: "_wit_model.ReadoutKind") -> list[tuple[int, int]]:
+    """Even `[start, end)` spans of `n` rows, each at most `max_readout_rows(kind)`."""
+    return _even_spans(n, max_readout_rows(kind))
 
 
 # ---------------------------------------------------------------------------
@@ -672,21 +515,17 @@ class ForwardPass:
     selected by `kind` (default: `model.pass_kind()`).
 
     Attach stage bodies with `epilogue(fn)` (also usable as a decorator),
-    bind state with `bind_state(...)` (kind-independent; or the per-kind
-    `attention` / `bind_hybrid` / `bind_recurrent`), and `submit(pipe)`. The
-    first submit traces the stage bodies once into the ETA container.
+    bind the lanes' working sets with `state([ws], geometry)`, and
+    `submit(pipe)`. The first submit traces the stage bodies once into the
+    ETA container.
     """
 
     def __init__(self, kind: ForwardKind | None = None) -> None:
         if kind is None:
             kind = _wit_model.pass_kind()
         self.kind = kind
-        if kind == ForwardKind.ATTENTION:
-            self._mod = _wit_attention
-        elif kind == ForwardKind.HYBRID:
-            self._mod = _wit_hybrid
-        elif kind == ForwardKind.RECURRENT:
-            self._mod = _wit_recurrent
+        if kind == ForwardKind.TEXT:
+            self._mod = _wit_forward
         elif kind == ForwardKind.DIFFUSION:
             self._mod = _wit_diffusion
         else:
@@ -699,6 +538,8 @@ class ForwardPass:
         self._program_attached = False
         self._adapter_lowrank_sites = 0
         self._adapter_scale_sites = 0
+        # Keeps the bound working sets alive while the pass is bound.
+        self._lanes: list[WorkingSet] = []
         self._fold_all: Channel | None = None
 
     # -- ports ----------------------------------------------------------------
@@ -737,164 +578,86 @@ class ForwardPass:
         _wit(self.wit.set_max_layers, max_layers, what="set_max_layers")
 
     def set_drafting_block(self, on: bool) -> None:
+        """These rows are a block drafter's proposal, not the sequence's own."""
+        self._require_kind((ForwardKind.TEXT,), "set_drafting_block")
         _wit(self.wit.set_drafting_block, on, what="set_drafting_block")
 
     def media(self, spans: Sequence[Image | Audio]) -> None:
         """Carry the payloads of `media.Image` / `media.Audio` spans,
         order-matched to their placeholder token runs in the embed."""
-        if self.kind == ForwardKind.RECURRENT:
-            raise InferletError("a recurrent-only pass carries no media")
         wrapped = []
         for s in spans:
             if isinstance(s, Audio):
-                wrapped.append(self._mod.MediaSpan_Audio(s.handle))
+                wrapped.append(_wit_forward.MediaSpan_Audio(s.handle))
             elif isinstance(s, Image):
-                wrapped.append(self._mod.MediaSpan_Image(s.handle))
+                wrapped.append(_wit_forward.MediaSpan_Image(s.handle))
             else:
                 raise TypeError(f"media span must be media.Image or media.Audio, got {type(s).__name__}")
         _wit(self.wit.media, wrapped, what="media")
 
-    def _stage_kv(self, ws: WorkingSet, geom: KvGeometry) -> dict:
+    def state(self, lanes: Sequence[WorkingSet], geom: StateGeometry | None = None) -> None:
+        """Bind one working set per lane, in lane order; lanes sharing a set must state `slots`."""
+        geom = geom if geom is not None else StateGeometry()
         rebind = self._program_attached
-        if not rebind:
-            ports = [Port.KV_LEN, Port.PAGES, Port.PAGE_INDPTR, Port.W_SLOT, Port.W_OFF, Port.POSITIONS]
-            if geom.mask is not None:
-                ports.append(Port.ATTN_MASK)
-            self._ensure_ports_available(ports)
-        staged = {
-            "ws": ws.kv,
-            "readable": _page_decl(geom.readable_pages),
-            "writable": _page_decl(geom.writable_pages),
-            "kv_len": geom.kv_len._wit(),
-            "pages": geom.pages._wit(),
-            "page_indptr": geom.page_indptr._wit(),
-            "w_slot": geom.w_slot._wit(),
-            "w_off": geom.w_off._wit(),
-            "positions": geom.positions._wit(),
-            "mask": geom.mask._wit() if geom.mask is not None else None,
-        }
-        if not rebind:
-            self._ports += [
-                (Port.KV_LEN, geom.kv_len),
-                (Port.PAGES, geom.pages),
-                (Port.PAGE_INDPTR, geom.page_indptr),
-                (Port.W_SLOT, geom.w_slot),
-                (Port.W_OFF, geom.w_off),
-                (Port.POSITIONS, geom.positions),
-            ]
-            if geom.mask is not None:
-                self._ports.append((Port.ATTN_MASK, geom.mask))
-        return staged
-
-    def _kv_geometry_wit(self, staged: dict):
-        return self._mod.KvGeometry(
-            readable_pages=_page_span(staged["readable"]),
-            writable_pages=_page_span(staged["writable"]),
-            kv_len=staged["kv_len"],
-            pages=staged["pages"],
-            page_indptr=staged["page_indptr"],
-            w_slot=staged["w_slot"],
-            w_off=staged["w_off"],
-            positions=staged["positions"],
-            mask=staged["mask"],
-        )
-
-    def _stage_rs(self, working_sets: Sequence[RsWorkingSet], geom: RsGeometry) -> dict:
-        if not working_sets:
-            raise InferletError("forward pass needs one recurrent-state working set per request")
-        buffer = _page_decl(geom.buffer)
-        if geom.fold_len is not None:
-            if not self._program_attached:
-                self._ensure_ports_available([Port.RS_FOLD_LEN])
-                self._ports.append((Port.RS_FOLD_LEN, geom.fold_len))
-            fold_len = geom.fold_len._wit()
-        else:
+        fold = geom.fold
+        if isinstance(fold, str):
+            if fold != "all":
+                raise ValueError(f"fold is None, 'all' or a channel, not {fold!r}")
             if self._fold_all is None:
                 self._fold_all = Channel.from_([0xFFFF_FFFF], Dtype.U32)
-            fold_len = self._fold_all._wit()
-        return {"working_sets": [rs.rs for rs in working_sets], "fold_len": fold_len, "buffer": buffer}
+            fold = self._fold_all
+        stated = [
+            (Port.POSITIONS, geom.positions),
+            (Port.SLOTS, geom.slots),
+            (Port.KV_LEN, geom.kv_len),
+            (Port.ATTN_MASK, geom.mask),
+            (Port.FOLD, fold),
+        ]
+        if not rebind:
+            self._ensure_ports_available([port for port, ch in stated if ch is not None])
+        wits = [ch._wit() if ch is not None else None for _, ch in stated]
+        _wit(
+            self.wit.state,
+            [lane.ws for lane in lanes],
+            _wit_forward.StateGeometry(
+                positions=wits[0], slots=wits[1], kv_len=wits[2], mask=wits[3], fold=wits[4]
+            ),
+            what="state",
+        )
+        self._lanes = list(lanes)
+        if not rebind:
+            self._ports += [(port, ch) for port, ch in stated if ch is not None]
+
+    def checkpoints(self, slots: Sequence[int]) -> None:
+        """Slots to keep a recurrent state at, so a later pass over these tokens resumes there."""
+        self._require_kind((ForwardKind.TEXT,), "checkpoints")
+        _wit(self.wit.checkpoints, [int(s) for s in slots], what="checkpoints")
 
     def _require_kind(self, kinds: tuple[ForwardKind, ...], what: str) -> None:
         if self.kind not in kinds:
             names = " / ".join(k.name.lower() for k in kinds)
             raise InferletError(f"{what} binds a {names} pass; this pass is {self.kind.name.lower()}")
 
-    def attention(self, ws: WorkingSet, geom: KvGeometry) -> None:
-        """Bind the KV working set + geometry of an attention or diffusion
-        pass (on a denoise pass the geometry is the canvas's)."""
-        self._require_kind((ForwardKind.ATTENTION, ForwardKind.DIFFUSION), "attention")
-        kv = self._stage_kv(ws, geom)
-        _wit(self.wit.attention, kv["ws"], self._kv_geometry_wit(kv), what="attention")
-
-    def bind_hybrid(self, kv: KvBinding | None, rs: Sequence[RsWorkingSet], rs_geom: RsGeometry) -> None:
-        """Bind a hybrid pass: the KV binding (None for a fire that touches
-        no attention layer) plus the recurrent working set(s) and where
-        their folded boundary lands."""
-        self._require_kind((ForwardKind.HYBRID,), "bind_hybrid")
-        staged_kv = self._stage_kv(kv.working_set, kv.geometry) if kv is not None else None
-        staged_rs = self._stage_rs(rs, rs_geom)
-        binding = (
-            _wit_hybrid.KvBinding(working_set=staged_kv["ws"], geometry=self._kv_geometry_wit(staged_kv))
-            if staged_kv is not None
-            else None
-        )
-        _wit(
-            self.wit.attention,
-            binding,
-            staged_rs["working_sets"],
-            _wit_hybrid.RsGeometry(fold_len=staged_rs["fold_len"], buffer=_page_span(staged_rs["buffer"])),
-            what="bind_hybrid",
-        )
-
-    def bind_recurrent(self, rs: Sequence[RsWorkingSet], geom: RsGeometry) -> None:
-        """Bind a recurrent-only pass: the recurrent working set(s) and where
-        their folded boundary lands."""
-        self._require_kind((ForwardKind.RECURRENT,), "bind_recurrent")
-        staged_rs = self._stage_rs(rs, geom)
-        _wit(
-            self.wit.attention,
-            staged_rs["working_sets"],
-            _wit_recurrent.RsGeometry(fold_len=staged_rs["fold_len"], buffer=_page_span(staged_rs["buffer"])),
-            what="bind_recurrent",
-        )
-
-    def bind_state(self, ws: WorkingSet, geom: KvGeometry, rs: Sequence[RsWorkingSet] | None = None) -> None:
-        """Kind-independent binding for the common text program: the KV
-        geometry, plus — on a hybrid model — the recurrent working set(s)
-        (`ws.rs` unless given), folding every token straight into the
-        recurrence."""
-        if self.kind in (ForwardKind.ATTENTION, ForwardKind.DIFFUSION):
-            self.attention(ws, geom)
-        elif self.kind == ForwardKind.HYBRID:
-            self.bind_hybrid(KvBinding(ws, geom), list(ws.rs if rs is None else rs), RsGeometry(fold_len=None, buffer=(0, 0)))
-        else:
-            raise InferletError("bind_state: a recurrent-only model has no KV geometry to bind")
-
-    # -- readings and float ports (imagegen design D1) ---------------------------
+    # -- readings and float ports ---------------------------------------------
 
     def reading(self, name: str) -> None:
         """Which of the family's declared readings (`model.readings()`) this
         pass runs — `"text"`, `"denoise"`, `"vae.decode"`, ... Optional when
         the model declares at most one; before the program."""
-        self._require_kind((ForwardKind.ATTENTION, ForwardKind.DIFFUSION), "reading")
         _wit(self.wit.reading, name, what="reading")
 
     def input(self, port: str, ch: Channel) -> None:
         """Bind `ch` to the reading's float port `port`, read at every submit
         from its committed cell. The host validates the shape; the program
-        must declare the channel (read it in a stage — the Rust `inferlet` crate adds a
-        prologue read; here the author's stages must touch it)."""
-        self._require_kind((ForwardKind.ATTENTION, ForwardKind.DIFFUSION), "input")
+        must declare the channel, so a stage of the author's must touch it."""
         _wit(self.wit.input, port, ch._wit(), what="input")
 
     def stream(self, s: "_wit_model.LaneStream") -> None:
         """Which lane stream this pass's rows are (`model.LaneStream`)."""
-        self._require_kind((ForwardKind.ATTENTION, ForwardKind.DIFFUSION), "stream")
         _wit(self.wit.stream, s, what="stream")
 
     def group(self, id: int) -> None:
         """Put this pass's lanes in attention group `id` within a frame."""
-        self._require_kind((ForwardKind.ATTENTION, ForwardKind.DIFFUSION), "group")
         _wit(self.wit.group, int(id), what="group")
 
     # -- diffusion --------------------------------------------------------------
@@ -1004,13 +767,9 @@ class ForwardPass:
         return out
 
     def on_attn_proj(self, body: Callable[[], None]) -> Callable[[], None]:
-        if self.kind == ForwardKind.RECURRENT:
-            raise InferletError("a recurrent-only pass has no attention layer to tap")
         return self._set_stage(Stage.ON_ATTN_PROJ, body)
 
     def on_attn(self, body: Callable[[], None]) -> Callable[[], None]:
-        if self.kind == ForwardKind.RECURRENT:
-            raise InferletError("a recurrent-only pass has no attention layer to tap")
         return self._set_stage(Stage.ON_ATTN, body)
 
     # -- program + submit -----------------------------------------------------

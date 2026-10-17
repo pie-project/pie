@@ -10,7 +10,7 @@ Xiao et al., ***Efficient Streaming Language Models with Attention Sinks***
 StreamingLLM sink-plus-window cache policy.
 
 **Faithfulness: Structural — demonstrates the mask, not bounded-memory eviction.**
-It applies the paper's positional visibility rule, but masked KV pages remain
+It applies the paper's positional visibility rule, but masked KV remains
 allocated in this example.
 
 ## What it does
@@ -24,7 +24,7 @@ what each decode step may attend to.
 This inferlet pre-fills the prompt normally, then decodes with a custom attention
 mask. A query may see keys that are either in the first `sink_size` positions or
 within the last `window_size` positions. Everything else is hidden from
-attention, although its backing KV pages are left in the working set.
+attention, although its KV is left in the working set.
 
 ## The rule
 
@@ -41,7 +41,7 @@ token  = argmax(logits)
 | --- | --- | --- | --- |
 | `prompt` | string | `"Tell me a long story about a cat."` | User prompt to send to the model |
 | `max_tokens` | int | `512` | Maximum number of generated tokens |
-| `sink_size` | int | `4` | Number of initial positions that remain visible forever |
+| `sink_size` | int | `4` | Number of initial positions that remain visible forever; `0` is a plain sliding window |
 | `window_size` | int | `64` | Number of recent positions visible outside the sink |
 
 ## Output
@@ -54,17 +54,14 @@ last fire) and `visible_kv` (keys the last fire's query could see, at most
 
 ## Implementation notes
 
-This is in the suite because it selects KV entries by **position**, which ETA's
-geometry exposes. The attention-score eviction family — H2O, SnapKV, TOVA,
-Quest, RetrievalAttention — is not implementable today because `IntrinsicId`
-exposes logits, embeddings and geometry but no attention weights.
+This policy selects KV entries by **position**, which a mask row states
+directly. The score-based family — [`trackb-h2o`](../trackb-h2o),
+[`trackb-snapkv`](../trackb-snapkv), [`tova-attention`](../tova-attention) —
+ranks them by `intrinsics::attn_score` instead.
 
-The page CSR has to track the logical KV length exactly. The CUDA engine derives
-`kv_len = (page_count - 1) * page_size + last_page_len` from the page CSR, not
-from the `KvLen` port, so the inferlet uses `page_count = ceil(kv_len / page_size)`
-instead of declaring the whole page pool. Over-declaring pages makes attention
-read uninitialised KV and produces fluent garbage; this is contract 3 in
-`inference-time-algorithms/11-ptir-limits.md`.
+Every pass appends and folds what it wrote, and the mask is the whole policy. A mask row is a bool per slot of the
+sequence; the decode epilogue rebuilds the next row on the device
+(`sink_window_mask`) beside the token it feeds back.
 
 ## Run
 

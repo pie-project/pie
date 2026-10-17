@@ -1,0 +1,21 @@
+# The PLEX policies built into the pie binary, one cargo workspace targeting
+# wasm32-wasip2. `test-*` policies misbehave on purpose; they are embedded
+# only with the `test-policies` feature, for the hosts' own tests.
+[workspace]
+resolver = "2"
+members = [
+    "noop",
+    "priority",
+    "fair",
+    "deadline",
+    "keep-session",
+    "session-affinity",
+    "router-priority",
+    "test-spin",
+    "test-trap",
+    "test-scratch",
+    "test-route",
+]
+
+[profile.release]
+lto = true

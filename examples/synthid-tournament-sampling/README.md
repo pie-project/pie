@@ -9,8 +9,7 @@ Dathathri et al., ***Scalable watermarking for identifying large language model
 outputs***, *Nature* **634**, 818–823 (2024) —
 <https://doi.org/10.1038/s41586-024-08025-4>.
 
-**Faithfulness: Exact (equivalent form).** See
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+**Faithfulness: Exact (equivalent form).**
 
 ## What it does
 
@@ -77,9 +76,7 @@ should be read as an upper bound; the fast mode's slope is ≈2.4 ms/token.
 The response is **bit-identical** in both modes (same text, same `z_score`), so
 this is purely a latency effect. It is host-bound — the GPU is ~25 % utilised in
 both modes — and it is not explained by run-ahead depth, ring capacity, GPU
-contention, or compiler nondeterminism, all of which were tested. See the "A10
-is bimodal" section of
-`inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+contention, or compiler nondeterminism, all of which were tested.
 
 Separately: the **first** call against a plan shape it has not seen before pays
 a 12–31 s NVRTC compile, cached thereafter under `$PIE_HOME/cache/cubins`. All

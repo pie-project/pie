@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::{RsSlotId, RsWorkingSetId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,12 +6,6 @@ pub struct RsStateTarget {
     pub reset: bool,
     pub copy_from: Option<RsSlotId>,
     pub fold_tokens: Option<u32>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RsBufferIntent {
-    Write,
-    Replay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,24 +48,10 @@ pub struct RsPreparedWrite {
     pub(crate) state: Option<RsStateTarget>,
     pub(crate) buffers: Vec<RsBufferTarget>,
     pub(crate) allocated: Vec<RsSlotId>,
-    pub(crate) buffer_span: Option<(u32, u32, RsBufferIntent)>,
     pub(crate) seq: u64,
-    pub(crate) fold_len_is_bound: bool,
 }
 
 impl RsPreparedWrite {
-    pub fn working_set(&self) -> RsWorkingSetId {
-        self.ws
-    }
-
-    pub fn mark_fold_len_device(&mut self) {
-        self.fold_len_is_bound = true;
-    }
-
-    pub fn fold_len_is_bound(&self) -> bool {
-        self.fold_len_is_bound
-    }
-
     pub fn seq(&self) -> u64 {
         self.seq
     }
@@ -102,7 +80,6 @@ pub struct RsPendingFolds(pub(crate) Vec<RsPendingFold>);
 pub struct RsPendingFold {
     pub(crate) ws: super::RsWorkingSetId,
     pub(crate) tokens: u32,
-    pub(crate) len_is_bound: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,15 +92,7 @@ impl RsPublished {
         Self { seqs }
     }
 
-    pub fn seq(&self) -> u64 {
-        self.seqs.iter().copied().max().unwrap_or(0)
-    }
-
     pub fn seqs(&self) -> &[u64] {
         &self.seqs
-    }
-
-    pub fn rows(&self) -> usize {
-        self.seqs.len()
     }
 }
