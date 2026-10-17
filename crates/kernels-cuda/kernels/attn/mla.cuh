@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_pipeline.h>
 #include <math_constants.h>
 
@@ -195,6 +196,61 @@ __global__ void mla_kv_append(
         qk_rope_head_dim;
     for (int i = threadIdx.x; i < qk_rope_head_dim; i += blockDim.x) {
         kpe_pages[kpe_dst + i] = kpe_curr[kpe_src + i];
+    }
+}
+
+// The latent rows as vLLM's fp8_ds_mla keeps them, 656 bytes a position:
+// the 512 latent dims e4m3 under one f32 scale a 128 (amax / 448), the four
+// scales, then the 64 rotated dims bf16. A block a token, a warp a tile of
+// 128 dims, a lane four of them.
+constexpr int kMlaFp8Row = 656;
+constexpr int kMlaFp8Scales = 512;
+constexpr int kMlaFp8Rope = 528;
+
+__global__ __launch_bounds__(128) void mla_kv_append_fp8(
+    const bf16* __restrict__ ckv_curr,
+    const bf16* __restrict__ kpe_curr,
+    u8* __restrict__ rows,
+    const u32* __restrict__ qo_indptr,
+    const u32* __restrict__ kv_page_indices,
+    const u32* __restrict__ kv_page_indptr,
+    const u32* __restrict__ kv_last_page_lens,
+    const u8* __restrict__ row_valid,
+    int R,
+    int page_size)
+{
+    const int t = blockIdx.x;
+    if (row_valid != nullptr && row_valid[t] == 0) return;
+    int actual_page = 0;
+    int offset_in_page = 0;
+    mla_resolve_dst(qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, R, page_size, t, actual_page,
+                    offset_in_page);
+    u8* row = rows + (static_cast<long long>(actual_page) * page_size + offset_in_page) * kMlaFp8Row;
+    const int i = static_cast<int>(threadIdx.x);
+    const bf16* src = ckv_curr + static_cast<long long>(t) * 512 + 4 * i;
+    float v[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) v[k] = __bfloat162float(src[k]);
+    float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float scale = fmaxf(amax / 448.0f, 1.17549435e-38f);
+    const float inv = 1.0f / scale;
+    std::uint32_t packed = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const std::uint32_t b = __nv_cvt_float_to_fp8(v[k] * inv, __NV_SATFINITE, __NV_E4M3);
+        packed |= (b & 0xffu) << (8 * k);
+    }
+    *reinterpret_cast<std::uint32_t*>(row + 4 * i) = packed;
+    if (i % 32 == 0) {
+        *reinterpret_cast<float*>(row + kMlaFp8Scales + 4 * (i / 32)) = scale;
+    }
+    if (i < 32) {
+        const __nv_bfloat162 pe =
+            reinterpret_cast<const __nv_bfloat162*>(kpe_curr + static_cast<long long>(t) * 64)[i];
+        reinterpret_cast<__nv_bfloat162*>(row + kMlaFp8Rope)[i] = pe;
     }
 }
 

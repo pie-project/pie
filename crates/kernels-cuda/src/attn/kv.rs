@@ -453,6 +453,46 @@ pub(crate) fn dequant_active(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The latent rows `ckv` and their rotated dims `kpe` (64 a row) landed in
+/// `pool` as fp8_ds_mla rows (`attn/mla.cuh`'s `mla_kv_append_fp8`).
+pub(crate) fn write_mla_fp8_rows(
+    ctx: &Ctx,
+    op: &'static str,
+    ckv: Tensor,
+    kpe: Tensor,
+    indptr: Tensor,
+    pool: &KvPool,
+) -> Result<(), Error> {
+    if ckv.width != 512 || kpe.width != 64 || kpe.rows != ckv.rows {
+        return Err(refuse(
+            op,
+            format!(
+                "fp8 latent rows hold 512 latent and 64 rotated dims a position, and this \
+                 append brings {} x {} and {} x {}",
+                ckv.rows, ckv.width, kpe.rows, kpe.width
+            ),
+        ));
+    }
+    let num_requests = lanes_of(op, indptr)?;
+    ctx.fire(
+        op,
+        Fire::at("attn/mla.cuh", "::pie::attn::mla_kv_append_fp8")
+            .apply(Launch::per_row(ckv.rows, 128)),
+        &[
+            ckv.arg(),
+            kpe.arg(),
+            pool.keys.arg(),
+            indptr.arg(),
+            pool.page_indices.arg(),
+            pool.page_indptr.arg(),
+            pool.last_page_lens.arg(),
+            pool.row_valid.arg(),
+            num_requests.arg(),
+            pool.page_size.arg(),
+        ],
+    )
+}
+
 pub(crate) fn write_mla_to_pages(
     ctx: &Ctx,
     op: &'static str,

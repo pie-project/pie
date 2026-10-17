@@ -66,7 +66,16 @@ struct Params {
     float* part_o;
     float* part_lse;
     int splits;
+    // fp8_ds_mla rows (`attn/mla.cuh`'s `mla_kv_append_fp8`), 656 bytes a
+    // cell: the instance that reads them widens a tile's latent into the
+    // ring itself and gathers the rotated dims from byte 528.
+    const unsigned char* fp8_rows;
 };
+
+constexpr int kFp8Row = 656;
+constexpr int kFp8Scales = 512;
+// The rotated dims' column in a bf16 view of a row (byte 528).
+constexpr int kFp8RopeCol = 264;
 
 constexpr int kD = 512;
 constexpr int kBK = 64;
@@ -100,7 +109,28 @@ struct Layout {
 
 __device__ __forceinline__ void issue_sync() { asm volatile("bar.sync 2, %0;" ::"n"(kIssuers * 32) : "memory"); }
 
-template <int kRope>
+// Sixteen e4m3 codes under `scale`, as eight packed bf16 pairs.
+__device__ __forceinline__ void widen16(uint4 codes, float scale, u32* out) {
+    const u32 w[4] = {codes.x, codes.y, codes.z, codes.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const unsigned short pair = static_cast<unsigned short>(w[i] >> (16 * h));
+            float a, b;
+            asm("{\n\t.reg .b32 h2;\n\t.reg .b16 l, hh;\n\t"
+                "cvt.rn.f16x2.e4m3x2 h2, %2;\n\t"
+                "mov.b32 {l, hh}, h2;\n\t"
+                "cvt.f32.f16 %0, l;\n\t"
+                "cvt.f32.f16 %1, hh;\n\t}"
+                : "=f"(a), "=f"(b)
+                : "h"(pair));
+            out[2 * i + h] = pack_bf16(a * scale, b * scale);
+        }
+    }
+}
+
+template <int kRope, bool kFp8 = false>
 __global__ __launch_bounds__(384, 1) void mla_sparse(
     const __grid_constant__ tc5::TmaMap map_ckv, const __grid_constant__ tc5::TmaMap map_ckv_run,
     const __grid_constant__ tc5::TmaMap map_kpe, const Params p) {
@@ -139,7 +169,9 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
 
     if (threadIdx.x == 0) {
         for (int s = 0; s < kSlots; ++s) {
-            bar_init(&full[s], 1);
+            // An fp8 tile is landed by its issuers' stores as well as the
+            // rotated dims' copies: each of them arrives.
+            bar_init(&full[s], kFp8 ? 1 + kIssuers * 32 : 1);
             bar_init(&empty[s], 1);
         }
         bar_init(s_full, 1);
@@ -252,7 +284,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
     } else if (warp == 4 || warp >= 6) {
         const bool lead = warp == 4;
         const int share = lead ? 0 : static_cast<int>(warp) - 5;
-        constexpr int kOps = 16 * 8 + (kRope > 0 ? 16 * 2 : 0);
+        constexpr int kOps = kFp8 ? 0 : 16 * 8 + (kRope > 0 ? 16 * 2 : 0);
         int J = 0;
         for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x)) {
             const Row w = row_at(r);
@@ -262,10 +294,84 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
                 bar_wait(&list_full[J % kLists], (J / kLists) & 1);
                 if (lead) {
                     bar_wait(&empty[slot], ((J / kSlots) & 1) ^ 1);
-                    if (lane == 0) bar_arrive_expect_tx(&full[slot], L::kSlot);
+                    if (lane == 0) {
+                        if constexpr (!kFp8) {
+                            bar_arrive_expect_tx(&full[slot], L::kSlot);
+                        } else if constexpr (kRope > 0) {
+                            bar_arrive_expect_tx(&full[slot], kRopeBytes);
+                        } else {
+                            bar_arrive(&full[slot]);
+                        }
+                    }
                 }
                 issue_sync();
                 unsigned char* dst = smem + L::kOffRing + slot * L::kSlot;
+                if constexpr (kFp8) {
+                    if constexpr (kRope > 0) {
+                        // The rotated dims: 16 groups of four keys, twice,
+                        // from each row's bf16 tail.
+                        for (int op = static_cast<int>(lane) * kIssuers + share; op < 32;
+                             op += 32 * kIssuers) {
+                            const int g = op % 16;
+                            const int copy = op / 16;
+                            const u32* e = l + 4 * g;
+                            int rr[4];
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                const u32 sl = e[i] & kSlotMask;
+                                rr[i] = sl == kSlotMask ? kAbsentRow : static_cast<int>(sl);
+                            }
+                            unsigned char* at = dst + kTile + copy * kAtom + g * 4 * 128;
+                            gather4(at, &full[slot], &map_kpe, kFp8RopeCol, rr[0], rr[1], rr[2], rr[3]);
+                        }
+                    }
+                    // The latent: a key's 16-code run a step, widened under
+                    // its tile's scale into the two 16-byte chunks it covers
+                    // (128-byte swizzle: chunk c of row r lands at c ^ r % 8).
+                    // Every load of the tile in flight before the first
+                    // widening: a thread's runs are 192 apart, a warp's one
+                    // key's 512 contiguous bytes.
+                    const int tid = share * 32 + static_cast<int>(lane);
+                    constexpr int kPer = (kBK * 32 + kIssuers * 32 - 1) / (kIssuers * 32);
+                    uint4 codes[kPer];
+                    float scales[kPer];
+#pragma unroll
+                    for (int k = 0; k < kPer; ++k) {
+                        const int it = tid + k * kIssuers * 32;
+                        codes[k] = make_uint4(0u, 0u, 0u, 0u);
+                        scales[k] = 0.f;
+                        if (it < kBK * 32) {
+                            const u32 sl = l[it / 32] & kSlotMask;
+                            if (sl != kSlotMask) {
+                                const unsigned char* row = p.fp8_rows + static_cast<long long>(sl) * kFp8Row;
+                                codes[k] = __ldg(reinterpret_cast<const uint4*>(row) + it % 32);
+                                scales[k] = __ldg(reinterpret_cast<const float*>(row + kFp8Scales) + (it % 32) / 8);
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (int k = 0; k < kPer; ++k) {
+                        const int it = tid + k * kIssuers * 32;
+                        if (it >= kBK * 32) break;
+                        const int key = it / 32;
+                        const int run = it % 32;
+                        u32 out[8];
+                        widen16(codes[k], scales[k], out);
+                        const int d0 = run * 16;
+                        const int c = (d0 % 64) / 8;
+                        const u32 at = sbase + L::kOffRing + slot * L::kSlot + atom_at(d0 / 64) + key * 128;
+#pragma unroll
+                        for (int h = 0; h < 2; ++h) {
+                            asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};" ::"r"(
+                                             at + (((c + h) ^ (key % 8)) * 16)),
+                                         "r"(out[4 * h]), "r"(out[4 * h + 1]), "r"(out[4 * h + 2]),
+                                         "r"(out[4 * h + 3])
+                                         : "memory");
+                        }
+                    }
+                    fence_async_shared();
+                    bar_arrive(&full[slot]);
+                }
                 for (int op = static_cast<int>(lane) * kIssuers + share; op < kOps; op += 32 * kIssuers) {
                     if (op < 16 * 8) {
                         // The latent: 16 groups of four keys by 8 atoms; a run

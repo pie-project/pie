@@ -417,8 +417,12 @@ pub fn kv_append(
     const OP: &str = "attention.mla_kv_append";
     let _ = (write_page, write_offset);
     dtype_dispatch!(OP, kv_c.data.dtype, { Bf16 => () });
-    // The latent rows land and are read as bf16: a pool laid out at another
-    // width (an e4m3 one is half as wide) would take them past its end.
+    #[cfg(feature = "cuda")]
+    if sparse::fp8_rows(pool) {
+        return kv::write_mla_fp8_rows(ctx, OP, kv_c.data, k_pe, kv_c.indptr, pool);
+    }
+    // The latent rows land and are read as bf16 (or as fp8_ds_mla rows,
+    // above): a pool laid out at another width would take them past its end.
     if pool.values.dtype != Dtype::Bf16 {
         return Err(refuse(
             OP,
@@ -682,7 +686,12 @@ mod sparse {
         part_o: u64,
         part_lse: u64,
         splits: i32,
+        fp8_rows: u64,
     }
+
+    /// Bytes a cell of an fp8 latent pool (`attn/mla.cuh`'s
+    /// `mla_kv_append_fp8`): 512 e4m3 codes, four f32 scales, 64 bf16 dims.
+    pub(super) const FP8_ROW: u32 = 656;
 
     /// `pie::attn::mlas::Layout<kRope>::kSmem`: two slots of 64 keys' latent
     /// (and their rotated dims twice), P twice, the score exchange, six key
@@ -718,13 +727,14 @@ mod sparse {
     ) -> Option<Result<(), Error>> {
         let pool = s.pool;
         let cells = pool.keys.rows;
+        let fp8 = fp8_rows(pool);
         let fits = ctx.tuning().mla_sparse
             && supported()
             && s.heads == 64
             && s.kv_lora_rank == 512
             && (s.rope == 0 || s.rope == 64)
             && s.q.dtype == Dtype::Bf16
-            && pool.keys.dtype == Dtype::Bf16
+            && (pool.keys.dtype == Dtype::Bf16 || fp8)
             && pool.page_size > 0
             && cells > 0
             && s.selection.width > 0
@@ -734,14 +744,25 @@ mod sparse {
                 .iter()
                 .all(|&at| aligned16(at))
             && (s.rope == 0
-                || (pool.values.dtype == Dtype::Bf16
-                    && aligned16(pool.values.ptr)
+                || ((fp8 || (pool.values.dtype == Dtype::Bf16 && aligned16(pool.values.ptr)))
                     && aligned16(s.q_pe.ptr)
                     && s.q_pe.width == 64 * 64));
         if !fits {
-            return None;
+            // An fp8 pool has no other reader.
+            return fp8.then(|| {
+                Err(crate::jit::refuse(
+                    op,
+                    "fp8 latent rows are read by the tcgen05 sparse pass alone, and this \
+                     shape or device is not one it serves",
+                ))
+            });
         }
         Some(launch(ctx, op, s, o))
+    }
+
+    /// Whether `pool` holds fp8_ds_mla rows: one u8 plane, [`FP8_ROW`] a cell.
+    pub(super) fn fp8_rows(pool: &KvPool) -> bool {
+        pool.keys.dtype == Dtype::U8 && pool.keys.width == FP8_ROW
     }
 
     fn launch(ctx: &Ctx, op: &'static str, s: &Shape<'_>, o: &mut Tensor) -> Result<(), Error> {
@@ -762,13 +783,30 @@ mod sparse {
                 swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
             })
         };
-        let map_ckv = map(pool.keys.ptr, 512, 1)?;
-        let map_ckv_run = map(pool.keys.ptr, 512, 16)?;
-        // No rotated part: the map is never read; any valid one stands in.
-        let map_kpe = if s.rope > 0 {
-            map(pool.values.ptr, 64, 1)?
+        let fp8 = fp8_rows(pool);
+        // fp8 rows: one bf16 view of the u8 plane (a row 328 wide, its
+        // rotated dims from column 264) stands for every map; the latent
+        // is widened by the kernel itself.
+        let (map_ckv, map_ckv_run, map_kpe) = if fp8 {
+            let rows = encode(Map {
+                ptr: pool.keys.ptr,
+                ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                dims: [FP8_ROW / 2, cells, 0],
+                strides: [u64::from(FP8_ROW), 0],
+                boxes: [64, 1, 1],
+                swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            })?;
+            (rows, rows, rows)
         } else {
-            map_ckv
+            let map_ckv = map(pool.keys.ptr, 512, 1)?;
+            let map_ckv_run = map(pool.keys.ptr, 512, 16)?;
+            // No rotated part: the map is never read; any valid one stands in.
+            let map_kpe = if s.rope > 0 {
+                map(pool.values.ptr, 64, 1)?
+            } else {
+                map_ckv
+            };
+            (map_ckv, map_ckv_run, map_kpe)
         };
         let live = match ctx.stage() {
             ArgValue::Ptr(at) => at,
@@ -814,6 +852,7 @@ mod sparse {
             part_o,
             part_lse,
             splits: int(splits),
+            fp8_rows: if fp8 { pool.keys.ptr } else { 0 },
         };
         let bytes = |m: &[u64; 16]| ArgValue::Bytes {
             ptr: m.as_ptr().cast(),
@@ -823,7 +862,7 @@ mod sparse {
             op,
             Fire::at(
                 FILE,
-                symbol(&format!("::pie::attn::mlas::mla_sparse<{}>", s.rope)),
+                symbol(&format!("::pie::attn::mlas::mla_sparse<{}, {fp8}>", s.rope)),
             )
             .apply(Launch::grid([(rows * splits).min(sms), 1, 1], [384, 1, 1]).smem(smem(s.rope))),
             &[
