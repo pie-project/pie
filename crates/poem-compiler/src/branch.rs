@@ -5,10 +5,7 @@
 //! op since they parted: the shared expert and the routed experts a MoE sums,
 //! the query, key/value and index chains an attention reads. [`split`]
 //! reorders the trace so each such chain is one contiguous run just ahead of
-//! its join (the ops between that read none of them first), and [`blocks`]
-//! finds those runs again for the region and stream passes: each run its own
-//! region, the runs of one join forked onto side streams and joined before
-//! the join's region.
+//! its join (the ops between that read none of them first).
 //!
 //! Order is kept: an op reads what it read and writes what it wrote, an op
 //! touching a cache stays after every earlier op touching that cache, one
@@ -16,20 +13,11 @@
 //! nothing crosses a collective.
 
 use std::collections::BTreeSet;
-use std::ops::Range;
 
 use poem_ir::{Def, Operands, Operation, Trace, ValueId};
 
 /// How far back from a join its branches are looked for, in ops.
 const WINDOW: usize = 256;
-
-/// One join's branches, each a contiguous run of ops, in order, the last
-/// ending where the join starts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Block {
-    pub branches: Vec<Range<u32>>,
-    pub join: u32,
-}
 
 /// The ops each op must follow (its direct predecessors), over the whole
 /// trace: producers of what it reads (through merges), earlier ops touching
@@ -244,45 +232,4 @@ fn permute(mut trace: Trace, order: &[u32]) -> Trace {
         }
     }
     trace
-}
-
-/// The joins whose branches lie contiguous just ahead of them, as [`split`]
-/// lays them.
-#[must_use]
-pub fn blocks(trace: &Trace) -> Vec<Block> {
-    let preds = predecessors(trace);
-    let mut out: Vec<Block> = Vec::new();
-    for join in 0..trace.nodes.len() as u32 {
-        let Some((branches, between)) = branches_at(trace, &preds, join) else {
-            continue;
-        };
-        if !between.is_empty() {
-            continue;
-        }
-        let mut ranges: Vec<Range<u32>> = Vec::new();
-        let mut next = branches[0][0];
-        let mut contiguous = true;
-        for b in &branches {
-            let (first, last) = (b[0], *b.last().unwrap_or(&b[0]));
-            if first != next || last + 1 - first != b.len() as u32 {
-                contiguous = false;
-                break;
-            }
-            ranges.push(first..last + 1);
-            next = last + 1;
-        }
-        if !contiguous || next != join {
-            continue;
-        }
-        // A block inside a later one's branch gives way to it: the outer
-        // fork runs whole chains at once.
-        while out.last().is_some_and(|prev| prev.join >= ranges[0].start) {
-            out.pop();
-        }
-        out.push(Block {
-            branches: ranges,
-            join,
-        });
-    }
-    out
 }

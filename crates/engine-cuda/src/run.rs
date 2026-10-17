@@ -632,7 +632,6 @@ impl<'c> Run<'c> {
     /// `e4m3_block_store`): a projection reading `y` next on this stream
     /// takes them in place of quantizing it. The latest producer's only.
     #[cfg(feature = "cuda")]
-    #[allow(dead_code)] // the first producer to land its codes (DeepSeek's HcPre) calls it
     pub(crate) fn hold_e4m3(&mut self, y: ValueId) -> Result<[u64; 2], kernels_cuda::Error> {
         let t = self.tensor(y);
         let ctx = self.ctx();

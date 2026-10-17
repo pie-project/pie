@@ -7,8 +7,6 @@ assumes = { cc = 100 }
 # Each line's measured win is in the commit that set it.
 [kernel]
 gemv.bf16 = "narrow"
-# Dense latent attention on the FA2 arms.
-mla.path  = "fa2"
 # A latent prefill from 256 rows runs expanded, as vLLM's MLA prefill does.
 mla.expanded_from = 256
 # Block-FP8 projections: a GEMV up to 4 rows, mma.sync up to 8.
@@ -29,9 +27,8 @@ sdpa.index_tc5 = true
 sdpa.index_radix = true
 # The hyper-connection pre-mix norm emits the next fp8 GEMM's operand.
 elemwise.norm_emit = true
-# Routed bf16 selects on the tcgen05 grouped GEMM from 16 tokens.
+# Routed bf16 selects on the tcgen05 grouped GEMM.
 moe.tc5           = true
-moe.tc5_from      = 16
 # Gated delta: the fused scan, one tcgen05 prefill launch, bf16 output.
 ssm.gdn_fused_scan = true
 ssm.gdn_tc5 = true

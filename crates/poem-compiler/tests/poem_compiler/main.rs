@@ -13,7 +13,6 @@ mod z_image_dims;
 mod a_banded_head_gathers_the_logits_it_holds_a_band_of;
 mod a_dag_schedule_orders_every_wait_after_its_close;
 mod a_fused_kernel_replaces_what_its_pattern_matches;
-mod a_joins_branches_lie_side_by_side;
 mod a_kv_head_is_held_by_a_group_of_ranks;
 mod a_ptq1_0_trunk_traces_and_places;
 mod a_ragged_attention_over_two_arms_bakes_into_one_region;

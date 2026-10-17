@@ -73,13 +73,6 @@ pub fn compile_axes(
 
     struct_readers_share_one_window(trace, &classes)?;
 
-    // Branches the trace lays side by side (`branch::split`), where the
-    // profile forks them: each its own region.
-    let blocks = if profile.branches && !profile.dag_streams {
-        branch::blocks(trace)
-    } else {
-        Vec::new()
-    };
     // Scheduled by dependencies (`compiler.dag_streams`): each op's lane
     // found over regions of an op each, then regions broken only where the
     // lane changes (a region an op costs a prefill 2%).
@@ -94,10 +87,7 @@ pub fn compile_axes(
     };
     let breaks: std::collections::BTreeSet<u32> = match &lanes {
         Some((_, breaks)) => breaks.clone(),
-        None => blocks
-            .iter()
-            .flat_map(|b| b.branches.iter().map(|r| r.start).chain([b.join]))
-            .collect(),
+        None => std::collections::BTreeSet::new(),
     };
     let mut regions = region::coalesce_breaking(trace, &classes, &breaks)?;
 
@@ -110,7 +100,7 @@ pub fn compile_axes(
     let streams = if let Some((lanes, _)) = &lanes {
         stream::fork_dag(trace, &mut regions, profile, Some(lanes))
     } else {
-        stream::fork_with(trace, &mut regions, profile, &blocks)
+        stream::fork_with(trace, &mut regions, profile)
     };
     let concurrency =
         Concurrency::with_pairs(&regions, trace.nodes.len(), streams.pairs.iter().copied());

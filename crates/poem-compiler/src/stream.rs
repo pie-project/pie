@@ -13,15 +13,11 @@ pub struct StreamPlan {
     pub forked_until: u32,
 }
 
-/// The regions forked onto side streams, each of `blocks`' branches
-/// (`branch::blocks`) first: a branch's regions one chain on one stream, the first branch on the main one, the
-/// others on side streams from where the first starts, all joined before
-/// the join's region.
+/// The regions forked onto side streams.
 pub(crate) fn fork_with(
     trace: &Trace,
     regions: &mut [Region],
     profile: &DeviceProfile,
-    blocks: &[crate::branch::Block],
 ) -> StreamPlan {
     if profile.side_streams == 0 || regions.len() < 3 {
         return StreamPlan {
@@ -45,9 +41,6 @@ pub(crate) fn fork_with(
         streams: 1,
         forked_until: 0,
     };
-    for block in blocks {
-        seat_block(regions, &costs, profile, block, &mut forks);
-    }
     let mut at = 0usize;
     while at < regions.len() {
         let Some(group) = group_at(regions, &ordered, at) else {
@@ -323,84 +316,6 @@ fn forkable(region: &Region) -> bool {
         && region.wait.is_empty()
         && region.open.is_none()
         && region.close.is_none()
-}
-
-/// One block's branches onto streams, where every region of it is forkable
-/// and each branch its own run of regions.
-fn seat_block(
-    regions: &mut [Region],
-    costs: &[f32],
-    profile: &DeviceProfile,
-    block: &crate::branch::Block,
-    forks: &mut StreamPlan,
-) {
-    let Some(join) = regions.iter().position(|r| r.nodes.start == block.join) else {
-        return;
-    };
-    let mut clusters: Vec<core::ops::Range<usize>> = Vec::new();
-    for branch in &block.branches {
-        let Some(first) = regions.iter().position(|r| r.nodes.start == branch.start) else {
-            return;
-        };
-        let Some(last) = regions.iter().position(|r| r.nodes.end == branch.end) else {
-            return;
-        };
-        if last < first || regions[first..=last].iter().any(|r| !forkable(r)) {
-            return;
-        }
-        clusters.push(first..last + 1);
-    }
-    if clusters.len() < 2 || clusters.last().is_none_or(|c| c.end != join) {
-        return;
-    }
-    let cost = |c: &core::ops::Range<usize>| costs[c.clone()].iter().sum::<f32>();
-    let main = clusters[0].clone();
-    let mut seated: Vec<(core::ops::Range<usize>, u32)> = Vec::new();
-    let mut next = 0u32;
-    for cluster in clusters.iter().skip(1) {
-        if cost(&main).min(cost(cluster)) < profile.fork_floor_us {
-            continue;
-        }
-        let stream = 1 + next % profile.side_streams;
-        next += 1;
-        seated.push((cluster.clone(), stream));
-    }
-    if seated.is_empty() {
-        return;
-    }
-    let enter = EventId(forks.events);
-    forks.events += 1;
-    regions[main.start].open = Some(enter);
-    let mut exits = Vec::new();
-    for (cluster, stream) in &seated {
-        let exit = EventId(forks.events);
-        forks.events += 1;
-        for at in cluster.clone() {
-            regions[at].stream = *stream;
-        }
-        regions[cluster.start].wait.push(enter);
-        regions[cluster.end - 1].close = Some(exit);
-        exits.push(exit);
-        forks.streams = forks.streams.max(stream + 1);
-    }
-    for exit in exits {
-        regions[join].wait.push(exit);
-    }
-    let lanes: Vec<(core::ops::Range<usize>, u32)> = core::iter::once((main, 0u32))
-        .chain(seated.iter().cloned())
-        .collect();
-    for (i, (a, sa)) in lanes.iter().enumerate() {
-        for (b, sb) in &lanes[i + 1..] {
-            if sa == sb {
-                continue;
-            }
-            for x in a.clone() {
-                for y in b.clone() {
-                    forks.pairs.push((x.min(y) as u32, x.max(y) as u32));
-                }
-            }
-        }
-    }
 }
 
 fn candidates(regions: &[Region], ordered: &Ordered, a: usize, b: usize) -> bool {

@@ -179,8 +179,8 @@ pub struct DeviceProfile {
 
     pub fork_floor_us: f32,
 
-    /// Whether a join's independent branches (`branch::blocks`) are forked
-    /// onto side streams.
+    /// Whether a join's independent branches are laid side by side
+    /// (`branch::split`) for the dependency schedule.
     pub branches: bool,
 
     /// Whether every launchable region is scheduled onto the streams by its
