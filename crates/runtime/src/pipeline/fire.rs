@@ -2467,7 +2467,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             _ => Vec::new(),
         };
         let forced: Vec<u32> = checkpoints.iter().map(|&row| (row - held) as u32).collect();
-        let mut frame = frame;
         // Several lanes run in pieces only where none carries recurrent
         // state, which is bound lane by lane.
         let cuts = pass_pieces(
@@ -2529,6 +2528,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 why.join("; ")
             )));
         }
+        // The pieces in frames of their own, in the order they are cut, so
+        // the pieces of concurrent prompts seal together.
+        let piece_frames = {
+            let pipeline = ctx.resources().get(&this)?;
+            piece_frames(frame, cuts.len(), || pipeline.next_frame_seq())
+        };
         let mut settles = Vec::new();
         for (at, piece) in cuts.iter().enumerate() {
             let last = at + 1 == cuts.len();
@@ -2701,7 +2706,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     copy_src,
                     copy_dst,
                     rs_copy,
-                    if last { frame.take() } else { None },
+                    piece_frames[at],
                     attention_stages,
                     adapted,
                 )
@@ -2750,6 +2755,38 @@ pub async fn submit_pass_stamped<C: FireContext>(
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
         crate::probe_fire_count!(submit_probe.submits);
         Ok(Ok(()))
+    }
+}
+
+/// The frame each of a pass's `pieces` fires carries, the pass's frame
+/// `frame`. A piece is submitted once the one before it has retired (it
+/// reads the KV and state that one writes), so a pass alone in its frame
+/// runs each piece as a frame of its own: the first takes `frame`'s sequence
+/// and each later one the next the pipeline hands out (`next_seq`). A lane's
+/// pieces queue in their order, one frame each, and the pieces of concurrent
+/// lanes seal together rather than one launch at a time. A pass sharing its
+/// frame keeps that frame for its last piece, its earlier pieces unframed.
+pub(crate) fn piece_frames(
+    frame: Option<crate::scheduler::FrameStamp>,
+    pieces: usize,
+    mut next_seq: impl FnMut() -> u64,
+) -> Vec<Option<crate::scheduler::FrameStamp>> {
+    match frame {
+        Some(stamp) if stamp.fires == 1 => (0..pieces)
+            .map(|at| {
+                Some(if at == 0 {
+                    stamp
+                } else {
+                    crate::scheduler::FrameStamp {
+                        seq: next_seq(),
+                        ..stamp
+                    }
+                })
+            })
+            .collect(),
+        frame => (0..pieces)
+            .map(|at| if at + 1 == pieces { frame } else { None })
+            .collect(),
     }
 }
 
