@@ -33,6 +33,7 @@ struct SparseParams {
     ent_runs: i32,
     win_page: i32,
     ent_page: i32,
+    ent_compact: i32,
     top_k: i32,
     ratio: i32,
     rows: i32,
@@ -58,6 +59,18 @@ pub struct Pooled<'a> {
     pub entries: &'a KvPool,
     pub ratio: u32,
     pub selection: Option<(Tensor, u32)>,
+}
+
+/// The pooled entries as the pass reads them: a compact pool's view (an
+/// entry a row of its width, `page_size / ratio` a page), and whether it is
+/// one.
+fn entries_of(pooled: &Pooled<'_>) -> (KvPool, bool) {
+    if pooled.ratio == NO_ENTRY {
+        return (*pooled.entries, false);
+    }
+    let row = crate::attn::dsv4::rows_packed(pooled.entries)
+        .map_or(i64::from(HEAD_DIM), |(rows, _)| i64::from(rows.bytes()));
+    crate::attn::dsv4::entries_view(pooled.entries, pooled.ratio, row)
 }
 
 fn plain_bf16(pool: &KvPool) -> bool {
@@ -87,7 +100,7 @@ pub fn takes(
         && window == Some(WINDOW)
         && pooled.ratio > 0
         && (fp8 || plain_bf16(window_pool))
-        && (fp8 || plain_bf16(pooled.entries))
+        && (fp8 || plain_bf16(&entries_of(pooled).0))
 }
 
 /// Whether [`window_only`] serves this window.
@@ -142,24 +155,26 @@ pub fn prefill(
             ctx, o, positions, wide.dim, HEAD_DIM, wide.theta, true, true, wide.yarn,
         );
     }
+    let (ent_view, ent_compact) = entries_of(pooled);
     if let Some(wf) = crate::attn::dsv4::rows_of(window_pool) {
         // DeepSeek's quantized rows: every page of both pools' tables widened
         // into bf16 planes laid out in table order (as vLLM gathers its
-        // prefill's rows to bf16), read through the same page_indptr.
+        // prefill's rows to bf16), read through the same page_indptr. A
+        // compact pool's pages widen a row an entry, as its view reads them.
         let window_bf16 = stage(ctx, op, window_pool, Staged::Window, wf)?;
         // A window-only layer's entries are its window (none of them seen).
         let entries_bf16 = if pooled.entries.keys.ptr == window_pool.keys.ptr {
             window_bf16
         } else {
-            let pf = crate::attn::dsv4::rows_of(pooled.entries).unwrap_or(wf);
-            stage(ctx, op, pooled.entries, Staged::Entries, pf)?
+            let pf = crate::attn::dsv4::rows_of(&ent_view).unwrap_or(wf);
+            stage(ctx, op, &ent_view, Staged::Entries, pf)?
         };
         let staged = Pooled {
             entries: &entries_bf16,
             ratio: pooled.ratio,
             selection: pooled.selection,
         };
-        return prefill(
+        return sparse(
             ctx,
             op,
             q,
@@ -167,12 +182,52 @@ pub fn prefill(
             requests,
             &window_bf16,
             &staged,
+            ent_compact,
             sinks,
             sm_scale,
             turn,
             o,
         );
     }
+    let viewed = Pooled {
+        entries: &ent_view,
+        ratio: pooled.ratio,
+        selection: pooled.selection,
+    };
+    sparse(
+        ctx,
+        op,
+        q,
+        positions,
+        requests,
+        window_pool,
+        &viewed,
+        ent_compact,
+        sinks,
+        sm_scale,
+        turn,
+        o,
+    )
+}
+
+/// The pass over bf16 planes: `pooled.entries` a row a position (its
+/// entries at each group's last), or with `ent_compact` a row an entry.
+#[allow(clippy::too_many_arguments)]
+fn sparse(
+    ctx: &Ctx,
+    op: &'static str,
+    q: Tensor,
+    positions: Tensor,
+    requests: Tensor,
+    window_pool: &KvPool,
+    pooled: &Pooled<'_>,
+    ent_compact: bool,
+    sinks: Tensor,
+    sm_scale: f32,
+    turn: Option<crate::attn::dsv4::Turn>,
+    o: &mut Tensor,
+) -> Result<(), Error> {
+    let rows = o.rows;
     let int = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
     let plane = |pool: &KvPool| {
         encode(Map {
@@ -198,18 +253,22 @@ pub fn prefill(
     // A page's entries sit `ratio` rows apart at its last row of each
     // stride: viewed as [ratio, cells / ratio] rows, sixteen of one phase a
     // box, where the page and the plane hold whole strides.
-    let ratio = pooled.ratio;
+    // A compact pool's entries are rows of their own: a run is sixteen
+    // consecutive rows, as the window's are.
+    let ratio = if ent_compact { 1 } else { pooled.ratio };
     let ent_cells = pooled.entries.keys.rows;
-    let ent_runs = ratio > 1
-        && ratio <= 16
-        && u32::try_from(pooled.entries.page_size).is_ok_and(|page| page.is_multiple_of(ratio))
-        && ent_cells.is_multiple_of(ratio);
+    let ent_runs = ent_compact
+        || (ratio > 1
+            && ratio <= 16
+            && u32::try_from(pooled.entries.page_size)
+                .is_ok_and(|page| page.is_multiple_of(ratio))
+            && ent_cells.is_multiple_of(ratio));
     let ent_stride = u64::try_from(pooled.entries.seq_stride).unwrap_or(0) * 2;
     let map_ent_run = encode(Map {
         ptr: pooled.entries.keys.ptr,
         ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
         dims: if ent_runs {
-            [HEAD_DIM, ratio, ent_cells / ratio]
+            [HEAD_DIM, ratio, ent_cells / ratio.max(1)]
         } else {
             [HEAD_DIM, 1, ent_cells]
         },
@@ -261,6 +320,7 @@ pub fn prefill(
             ent_runs: i32::from(ent_runs),
             win_page: window_pool.page_size,
             ent_page: pooled.entries.page_size,
+            ent_compact: i32::from(ent_compact),
             top_k: int(top_k),
             ratio: int(pooled.ratio),
             rows: int(rows),

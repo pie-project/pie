@@ -285,6 +285,43 @@ pub fn gather(
     )
 }
 
+/// Whether `pool` holds its compressed entries compact, a row each: its
+/// positions `row / ratio` wide (in its plane's elements), a page of
+/// `page_size` positions `page_size / ratio` entries `row` wide. Else an
+/// entry is a position's row at its group's last position.
+#[must_use]
+pub fn compact(pool: &KvPool, ratio: u32, row: i64) -> bool {
+    ratio > 1
+        && pool.layout == 0
+        && pool.page_size > 0
+        && pool.page_size % i32::try_from(ratio).unwrap_or(i32::MAX) == 0
+        && pool.seq_stride.saturating_mul(i64::from(ratio)) == row
+}
+
+/// The ratio a writer packs `row`-wide entries into `pool` by: the times its
+/// positions' rows divide one (a compact pool's ratio), 1 where an entry is a
+/// position's row.
+pub fn packing(op: &'static str, pool: &KvPool, row: i64) -> Result<i32, Error> {
+    let stride = pool.seq_stride;
+    if stride <= 0 || stride >= row {
+        return Ok(1);
+    }
+    let div = row / stride;
+    if row % stride != 0
+        || pool.page_size <= 0
+        || pool.page_size % i32::try_from(div).unwrap_or(i32::MAX) != 0
+    {
+        return Err(refuse(
+            op,
+            format!(
+                "a {row}-wide entry does not pack into a pool {stride} wide a position at {} a page",
+                pool.page_size
+            ),
+        ));
+    }
+    Ok(i32::try_from(div).unwrap_or(1))
+}
+
 pub fn kv_append(
     ctx: &Ctx,
     entries: Tensor,
@@ -299,6 +336,7 @@ pub fn kv_append(
     dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
     boundary_tables(OP, &boundary_pos, &boundary_req);
     let head_dim = count(OP, "the pooled entry's width", entries.width)?;
+    let div = packing(OP, pool, i64::from(head_dim))?;
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::pool_store_entries<::pie::bf16>")
@@ -312,6 +350,7 @@ pub fn kv_append(
             pool.page_indptr.arg(),
             head_dim.arg(),
             pool.page_size.arg(),
+            div.arg(),
             ctx.stage(),
         ],
     )
@@ -391,6 +430,7 @@ pub fn attention_lse(
             ratio.arg(),
             entries.page_size.arg(),
             sm_scale.arg(),
+            i32::from(compact(entries, ratio.unsigned_abs(), i64::from(head_dim))).arg(),
             ctx.stage(),
         ],
     )
@@ -509,6 +549,7 @@ pub fn attention_lse_selected(
             top_k.arg(),
             entries.page_size.arg(),
             sm_scale.arg(),
+            i32::from(compact(entries, ratio.unsigned_abs(), i64::from(head_dim))).arg(),
             ctx.stage(),
         ],
     )
@@ -577,6 +618,7 @@ fn pool_mma(
             top_k.arg(),
             entries.page_size.arg(),
             sm_scale.arg(),
+            i32::from(compact(entries, ratio.unsigned_abs(), i64::from(head_dim))).arg(),
             ctx.stage(),
         ],
     )
@@ -611,7 +653,14 @@ pub fn compress(
     state: Option<StateRows>,
 ) -> Result<bool, Error> {
     const OP: &str = "attention.pool_compress";
-    let fp8 = crate::attn::dsv4::fp8_ds(out);
+    // V4's fp8 rows, or a bf16 pool; either a row a position or compact.
+    let fp8 = crate::attn::dsv4::rows_packed(out)
+        .is_some_and(|(rows, _)| rows == crate::attn::dsv4::Rows::Ds);
+    let out_div = if fp8 {
+        crate::attn::dsv4::rows_packed(out).map_or(1, |(_, div)| div)
+    } else {
+        packing(OP, out, i64::from(head_dim))?
+    };
     let run = head_dim / 8;
     let pitch = state_kv.width;
     let fits = ctx.tuning().rows_vec
@@ -629,6 +678,7 @@ pub fn compress(
             .iter()
             .all(|&at| aligned16(at))
         && (ape.is_absent() || aligned16(ape.ptr))
+        && (out_div == 1 || u32::try_from(out_div) == Ok(ratio))
         && if fp8 {
             head_dim == 512
         } else {
@@ -708,6 +758,7 @@ pub fn compress(
             out.page_indices.arg(),
             out.page_indptr.arg(),
             out.page_size.arg(),
+            out_div.arg(),
             head_dim_i.arg(),
             ratio.arg(),
             coff.arg(),

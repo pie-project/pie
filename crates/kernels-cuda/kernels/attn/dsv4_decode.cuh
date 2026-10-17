@@ -186,6 +186,7 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
     bf16* __restrict__ o,
     float scale,
     Turn turn,
+    int pool_compact,
     const u32* __restrict__ win)
 {
     using S = Shape<D, WF, PF>;
@@ -266,7 +267,9 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
         const int j = n - n_win;
         const int c = srow != nullptr ? srow[j] : j;
         if (c < 0 || c >= num_visible) return -1;
-        const int pos = (c + 1) * ratio - 1;
+        // A compact pool's page holds its entries a row each (`pool_page_size`
+        // of them); else entry c sits at its group's last position.
+        const int pos = pool_compact ? c : (c + 1) * ratio - 1;
         return static_cast<long long>(pool_indices[pool_indptr[req] + pos / pool_page_size]) *
                    pool_page_size +
                pos % pool_page_size;

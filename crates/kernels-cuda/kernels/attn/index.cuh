@@ -65,7 +65,8 @@ __global__ __launch_bounds__(128) void index_store_fp4(
     const u32* __restrict__ page_indices,
     const u32* __restrict__ page_indptr,
     int n,
-    int page_size)
+    int page_size,
+    int div)
 {
     using namespace index_fp4;
     const int c = static_cast<int>(blockIdx.x) * 4 + static_cast<int>(threadIdx.x >> 5);
@@ -73,8 +74,12 @@ __global__ __launch_bounds__(128) void index_store_fp4(
     if (c >= n) return;
     const int pos = boundary_pos[c];
     if (pos < 0) return;
-    const long long page = page_indices[page_indptr[boundary_req[c]] + pos / page_size];
-    const int off = pos % page_size;
+    // A compact pool (`div` its ratio): the key at its index, `page_size /
+    // div` rows a page; else at the boundary's position.
+    const int cell = pos / div;
+    page_size /= div;
+    const long long page = page_indices[page_indptr[boundary_req[c]] + cell / page_size];
+    const int off = cell % page_size;
     const uint2 raw = *reinterpret_cast<const uint2*>(entries + static_cast<long long>(c) * kD + lane * 4);
     const bf16* x = reinterpret_cast<const bf16*>(&raw);
     float v[4];
@@ -600,6 +605,7 @@ __global__ void index_topk_paged(
     i32* __restrict__ selection,
     i32 R, i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk,
     i32 ratio,
+    i32 compact,
     const u32* __restrict__ win)
 {
     const int t = static_cast<int>(blockIdx.x);
@@ -648,13 +654,16 @@ __global__ void index_topk_paged(
         for (int i = tid; i < H * D; i += kBlock) q_s[i] = Elem<T>::to_f32(qi[i]);
     }
     __syncthreads();
+    // A compact pool holds its keys a row each, `page_size / stride` a page;
+    // else key j sits at its group's last position.
+    const int kps = compact ? page_size / stride : page_size;
     for (int j = tid; j < nkeys; j += kBlock) {
-        const int cell = (j + 1) * stride - 1;
+        const int cell = compact ? j : (j + 1) * stride - 1;
         const int page =
-            static_cast<int>(kv_page_indices[pages_first + cell / page_size]);
-        const int off = cell % page_size;
+            static_cast<int>(kv_page_indices[pages_first + cell / kps]);
+        const int off = cell % kps;
         const T* kj =
-            key_pages + (static_cast<long long>(page) * page_size + off) * D;
+            key_pages + (static_cast<long long>(page) * kps + off) * D;
         float acc = 0.f;
         for (int h = 0; h < H; ++h) {
             const T* qh = qi + static_cast<long long>(h) * D;
@@ -718,6 +727,7 @@ __global__ void index_topk_paged_mma(
     i32* __restrict__ selection,
     i32 R, i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk,
     i32 ratio,
+    i32 compact,
     const i32* __restrict__ turn_pos,
     i32 turn_dim,
     float turn_theta,
@@ -808,6 +818,9 @@ __global__ void index_topk_paged_mma(
     __syncthreads();
 
     const int g = lane >> 2, p = (lane & 3) << 1;
+    // A compact pool holds its keys a row each, `page_size / stride` a page;
+    // else key j sits at its group's last position.
+    const int kps = compact ? page_size / stride : page_size;
     // Each warp's chunks two deep: the next chunk's keys copy in
     // (cp.async, zero-filled past the row's keys) while this one's score.
     auto fetch = [&](int base, int buf) {
@@ -815,9 +828,8 @@ __global__ void index_topk_paged_mma(
             const int j = base + lane;
             long long slot = -1;
             if (j < nkeys) {
-                const int cell = (j + 1) * stride - 1;
-                slot = static_cast<long long>(kv_page_indices[pages_first + cell / page_size]) * page_size
-                    + cell % page_size;
+                const int cell = compact ? j : (j + 1) * stride - 1;
+                slot = static_cast<long long>(kv_page_indices[pages_first + cell / kps]) * kps + cell % kps;
             }
             slot_s[warp][buf][lane] = slot;
         }
@@ -831,7 +843,7 @@ __global__ void index_topk_paged_mma(
                 const int run = c % (kD / 8);
                 const long long slot = slot_s[warp][buf][key];
                 uint4 v = make_uint4(0, 0, 0, 0);
-                if (slot >= 0) v = index_fp4::load8(plane, slot, page_size, run);
+                if (slot >= 0) v = index_fp4::load8(plane, slot, kps, run);
                 *reinterpret_cast<uint4*>(kb + key * kLd + run * 8) = v;
             }
             asm volatile("cp.async.commit_group;\n" ::: "memory");

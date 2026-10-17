@@ -90,10 +90,61 @@ pub fn rows_of(pool: &KvPool) -> Option<Rows> {
         .find(|r| pool.seq_stride == i64::from(r.bytes()))
 }
 
-/// Whether `pool` holds DeepSeek's quantized rows of any format.
+/// The quantized rows `pool` holds and how many of its positions' rows one
+/// entry spans: 1 a row a position, `ratio` a compact pool's (its entries a
+/// row each, `page_size / ratio` a page).
+#[must_use]
+pub fn rows_packed(pool: &KvPool) -> Option<(Rows, i32)> {
+    if pool.keys.dtype != Dtype::U8 || pool.layout != 0 || pool.seq_stride <= 0 {
+        return None;
+    }
+    for div in [1i64, 2, 4, 8, 16] {
+        for rows in [Rows::Ds, Rows::Mx8, Rows::Nv4] {
+            if pool.seq_stride * div == i64::from(rows.bytes())
+                && i64::from(pool.page_size) % div == 0
+            {
+                return Some((rows, i32::try_from(div).unwrap_or(1)));
+            }
+        }
+    }
+    None
+}
+
+/// `pool` as its compressed entries read at `ratio`: a compact pool's view,
+/// an entry a row of its format's width and `page_size / ratio` a page, and
+/// whether it is one.
+#[must_use]
+pub fn entries_view(pool: &KvPool, ratio: u32, row: i64) -> (KvPool, bool) {
+    if !crate::attn::pool::compact(pool, ratio, row) {
+        return (*pool, false);
+    }
+    let r = i64::from(ratio);
+    let cells = u32::try_from(i64::from(pool.keys.rows) / r).unwrap_or(0);
+    let width = u32::try_from(row).unwrap_or(0);
+    (
+        KvPool {
+            keys: Tensor::new(pool.keys.ptr, cells, width, pool.keys.dtype),
+            values: Tensor::new(pool.values.ptr, cells, width, pool.values.dtype),
+            page_size: pool.page_size / i32::try_from(ratio).unwrap_or(1),
+            seq_stride: row,
+            head_stride: row,
+            ..*pool
+        },
+        true,
+    )
+}
+
+/// The natural width of an entry `pool` holds: its quantized rows' bytes,
+/// or a bf16 head of 512.
+fn entry_row(pool: &KvPool) -> i64 {
+    rows_packed(pool).map_or(i64::from(HEAD_DIM), |(rows, _)| i64::from(rows.bytes()))
+}
+
+/// Whether `pool` holds DeepSeek's quantized rows of any format, a row a
+/// position or compact.
 #[must_use]
 pub fn ds_rows(pool: &KvPool) -> bool {
-    rows_of(pool).is_some()
+    rows_packed(pool).is_some()
 }
 
 /// Whether `pool` holds V4's fp8 rows: a u8 plane [`DS_ROW`] wide.
@@ -130,7 +181,9 @@ pub fn takes(heads: u32, head_dim: u32, window: &KvPool, pooled: Option<&Pooled<
     heads == HEADS
         && head_dim == HEAD_DIM
         && alike(window)
-        && pooled.is_none_or(|p| alike(p.entries) && p.ratio > 0)
+        && pooled.is_none_or(|p| {
+            p.ratio > 0 && alike(&entries_view(p.entries, p.ratio, entry_row(p.entries)).0)
+        })
 }
 
 /// How many blocks split a row's keys: enough that the rows' four head
@@ -266,15 +319,13 @@ pub fn decode(
     }
     // The window's and the pool's row formats (a window-only layer reads
     // no pool; its format stands in).
-    let formats = rows_of(window_pool).map(|w| {
-        (
-            w,
-            pooled
-                .as_ref()
-                .and_then(|p| rows_of(p.entries))
-                .unwrap_or(w),
-        )
+    // A compact pool read through its view: an entry a row, `page_size /
+    // ratio` a page.
+    let (view, pool_compact) = pooled.as_ref().map_or((None, false), |p| {
+        let (v, compact) = entries_view(p.entries, p.ratio, entry_row(p.entries));
+        (Some(v), compact)
     });
+    let formats = rows_of(window_pool).map(|w| (w, view.as_ref().and_then(rows_of).unwrap_or(w)));
     let (wf, pf) = formats.map_or((0, 0), |(w, p)| (w.code(), p.code()));
     let window = count(OP, "the sliding window", window)?;
     let ranks = ranks(ctx, rows);
@@ -286,6 +337,10 @@ pub fn decode(
     };
     let (entries, ratio, selection, top_k) = match pooled {
         Some(p) => {
+            let p = Pooled {
+                entries: view.as_ref().unwrap_or(p.entries),
+                ..p
+            };
             let (sel, top_k) = p
                 .selection
                 .map_or((ArgValue::ABSENT, 0), |(s, k)| (s.arg(), k));
@@ -340,14 +395,15 @@ pub fn decode(
                 ptr: (&raw const turn).cast(),
                 len: core::mem::size_of::<TurnArgs>(),
             },
+            i32::from(pool_compact).arg(),
             ctx.stage(),
         ],
     )
 }
 
-fn ds_pool(op: &'static str, pool: &KvPool) -> Result<Rows, Error> {
-    match rows_of(pool) {
-        Some(rows) if pool.page_size % 2 == 0 => Ok(rows),
+fn ds_pool(op: &'static str, pool: &KvPool) -> Result<(Rows, i32), Error> {
+    match rows_packed(pool) {
+        Some((rows, div)) if pool.page_size % 2 == 0 => Ok((rows, div)),
         _ => Err(refuse(
             op,
             format!(
@@ -368,7 +424,10 @@ pub fn append(
     write_offset: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.kv_append_shared";
-    let fmt = ds_pool(OP, pool)?;
+    let (fmt, div) = ds_pool(OP, pool)?;
+    if div != 1 {
+        return Err(refuse(OP, "the window's plane holds a row a position"));
+    }
     if rows.dtype != Dtype::Bf16 || rows.width != HEAD_DIM {
         return Err(refuse(OP, "an fp8 row is written from a bf16 row of 512"));
     }
@@ -402,7 +461,7 @@ pub fn store_entries(
     pool: &KvPool,
 ) -> Result<(), Error> {
     const OP: &str = "attention.pool_kv_append";
-    let fmt = ds_pool(OP, pool)?;
+    let (fmt, div) = ds_pool(OP, pool)?;
     if entries.dtype != Dtype::Bf16 || entries.width != HEAD_DIM {
         return Err(refuse(OP, "an fp8 row is written from a bf16 row of 512"));
     }
@@ -422,6 +481,7 @@ pub fn store_entries(
             pool.page_indptr.arg(),
             stated(OP, entries.rows)?.arg(),
             pool.page_size.arg(),
+            div.arg(),
         ],
     )
 }

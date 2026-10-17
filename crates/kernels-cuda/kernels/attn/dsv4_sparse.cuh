@@ -59,6 +59,8 @@ struct Params {
     int ent_runs;
     int win_page;
     int ent_page;
+    // A compact pool: its entries a row each, `ent_page` rows a page.
+    int ent_compact;
     int top_k;
     int ratio;
     int rows;
@@ -212,7 +214,8 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
         w.row = base + r;
         const int req = p.requests[w.row];
         w.pos = p.positions[w.row];
-        w.vis = min((w.pos + 1) / p.ratio, owned(p.ent_indptr, req, p.ent_page) / p.ratio);
+        w.vis = min((w.pos + 1) / p.ratio,
+                    owned(p.ent_indptr, req, p.ent_page) / (p.ent_compact ? 1 : p.ratio));
         w.sel = kSelected ? p.selection + static_cast<long long>(w.row) * p.top_k : nullptr;
         w.win_pages = p.win_indices + p.win_indptr[req];
         w.ent_pages = p.ent_indices + p.ent_indptr[req];
@@ -271,7 +274,8 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
                                      kValid
                                : kSlotMask;
                 } else if (k < total) {
-                    e[u] = static_cast<u32>(row_in(ent_pages, (id[u] + 1) * p.ratio - 1, p.ent_page)) |
+                    e[u] = static_cast<u32>(row_in(ent_pages, p.ent_compact ? id[u] : (id[u] + 1) * p.ratio - 1,
+                                                   p.ent_page)) |
                            kPool | (id[u] < vis ? kValid : 0u);
                 } else {
                     e[u] = kSlotMask | kPool;
@@ -329,7 +333,7 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
                 const u32* e = l + 4 * g;
                 const bool pool = (e[0] & kPool) != 0;
                 const u32* run = l + 16 * (g / 4);
-                const int stride = pool ? p.ratio : 1;
+                const int stride = pool && !p.ent_compact ? p.ratio : 1;
                 const u32 first = run[0] & kSlotMask;
                 bool whole = (!pool || p.ent_runs) && first != kSlotMask;
 #pragma unroll
@@ -341,8 +345,8 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
                 if (whole) {
                     if (g % 4 == 0) {
                         if (pool) {
-                            tma_load_3d(at, &full[slot], &map_ent_run, a * 64, p.ratio - 1,
-                                        static_cast<int>(first) / p.ratio);
+                            tma_load_3d(at, &full[slot], &map_ent_run, a * 64, p.ent_compact ? 0 : p.ratio - 1,
+                                        static_cast<int>(first) / stride);
                         } else {
                             tma_load_2d(at, &full[slot], &map_win_run, a * 64,
                                         static_cast<int>(first));

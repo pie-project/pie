@@ -55,6 +55,7 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
     int top_k,
     int page_size,
     float scale,
+    int compact,
     const u32* __restrict__ win)
 {
     using S = PoolShape<D>;
@@ -119,7 +120,7 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
                 if (c < 0 || c >= num_visible) c = -1;
             }
             s_slot[buf][tid] = c < 0 ? -1
-                : paged_slot(kv_page_indices, kv_page_indptr, req, (c + 1) * ratio - 1, page_size);
+                : entry_slot(kv_page_indices, kv_page_indptr, req, c, ratio, page_size, compact);
         }
         __syncthreads();
         bf16* sK = sK0 + buf * kPoolKeys * kLd;

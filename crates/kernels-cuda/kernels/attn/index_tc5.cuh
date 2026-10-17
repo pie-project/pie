@@ -67,6 +67,9 @@ struct Params {
     float turn_factor;
     float turn_low;
     float turn_high;
+    // The row of its group a page's keys sit at: the last (`ratio - 1`), or 0
+    // in a compact pool, its keys a row each.
+    int sub;
 };
 
 // One row's request, first page, page count and the blocks it sees.
@@ -244,13 +247,13 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
                     if (run) {
 #pragma unroll
                         for (int a = 0; a < 2; ++a) {
-                            tma_load_3d(dst + a * kAtom + pg * p.per * 128, &k_full[slot], &map8, a * 64, p.ratio - 1,
+                            tma_load_3d(dst + a * kAtom + pg * p.per * 128, &k_full[slot], &map8, a * 64, p.sub,
                                         id * p.per);
                         }
                     } else if (pg < pages && !in_run) {
 #pragma unroll
                         for (int a = 0; a < 2; ++a) {
-                            tma_load_3d(dst + a * kAtom + pg * p.per * 128, &k_full[slot], &map, a * 64, p.ratio - 1,
+                            tma_load_3d(dst + a * kAtom + pg * p.per * 128, &k_full[slot], &map, a * 64, p.sub,
                                         id * p.per);
                         }
                     }

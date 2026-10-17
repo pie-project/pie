@@ -160,16 +160,19 @@ __global__ __launch_bounds__(128) void ds_store_entries(
     const u32* __restrict__ page_indices,
     const u32* __restrict__ page_indptr,
     int n,
-    int page_size)
+    int page_size,
+    int div)
 {
     const int c = static_cast<int>(blockIdx.x) * 4 + static_cast<int>(threadIdx.x >> 5);
     const int lane = static_cast<int>(threadIdx.x & 31);
     if (c >= n) return;
     const int pos = boundary_pos[c];
     if (pos < 0) return;
-    const u32 page = page_indices[page_indptr[boundary_req[c]] + pos / page_size];
-    ds_store_warp(entries + static_cast<long long>(c) * kDsDim,
-                  ds_row(pages, page, pos % page_size, page_size), lane);
+    // A compact pool (`div` its ratio): the entry at its index, `page_size /
+    // div` rows a page; else at the boundary's position.
+    const int cell = pos / div, rows = page_size / div;
+    const u32 page = page_indices[page_indptr[boundary_req[c]] + cell / rows];
+    ds_store_warp(entries + static_cast<long long>(c) * kDsDim, ds_row(pages, page, cell % rows, rows), lane);
 }
 
 // 8 dims of a row from its data and scale bytes: `j` the first dim (a
@@ -412,16 +415,18 @@ __global__ __launch_bounds__(128) void rows_store_entries(
     const u32* __restrict__ page_indices,
     const u32* __restrict__ page_indptr,
     int n,
-    int page_size)
+    int page_size,
+    int div)
 {
     const int c = static_cast<int>(blockIdx.x) * 4 + static_cast<int>(threadIdx.x >> 5);
     const int lane = static_cast<int>(threadIdx.x & 31);
     if (c >= n) return;
     const int pos = boundary_pos[c];
     if (pos < 0) return;
-    const u32 page = page_indices[page_indptr[boundary_req[c]] + pos / page_size];
-    rows_store_warp<F>(entries + static_cast<long long>(c) * kDsDim,
-                       rows_at<F>(pages, page, pos % page_size, page_size), lane);
+    const int cell = pos / div, rows = page_size / div;
+    const u32 page = page_indices[page_indptr[boundary_req[c]] + cell / rows];
+    rows_store_warp<F>(entries + static_cast<long long>(c) * kDsDim, rows_at<F>(pages, page, cell % rows, rows),
+                       lane);
 }
 
 }  // namespace pie::attn::dsv4

@@ -124,7 +124,10 @@ pub const FP4_ROW: u32 = 68;
 /// Whether `keys` holds FP4 index keys: a u8 plane [`FP4_ROW`] wide.
 #[must_use]
 pub fn fp4_keys(keys: &KvPool) -> bool {
-    keys.keys.dtype == Dtype::U8 && keys.layout == 0 && keys.seq_stride == i64::from(FP4_ROW)
+    keys.keys.dtype == Dtype::U8
+        && keys.layout == 0
+        && keys.seq_stride > 0
+        && i64::from(FP4_ROW) % keys.seq_stride == 0
 }
 
 /// The index keys (bf16, 128 wide) quantized into FP4 rows at their
@@ -150,6 +153,7 @@ pub fn store_fp4(
     if entries.rows == 0 {
         return Ok(());
     }
+    let div = crate::attn::pool::packing(OP, keys, i64::from(FP4_ROW))?;
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::index_store_fp4")
@@ -163,6 +167,7 @@ pub fn store_fp4(
             keys.page_indptr.arg(),
             stated(OP, entries.rows)?.arg(),
             keys.page_size.arg(),
+            div.arg(),
         ],
     )
 }
@@ -202,8 +207,11 @@ fn fp4_queries(ctx: &Ctx, op: &'static str, q: RaggedTensor) -> Result<RaggedTen
 /// plane in table order: the pool a bf16 ranking reads instead, its table
 /// the identity.
 fn stage_fp4(ctx: &Ctx, op: &'static str, keys: &KvPool) -> Result<KvPool, Error> {
+    // A compact pool's keys a row each, `page_size / div` a page: staged a
+    // row a key, the staged pool as compact (128 / div wide a position).
+    let div = crate::attn::pool::packing(op, keys, i64::from(FP4_ROW))?;
     let pages = keys.page_indices.rows;
-    let page = u32::try_from(keys.page_size).unwrap_or(0);
+    let page = u32::try_from(keys.page_size / div).unwrap_or(0);
     let cells = pages.saturating_mul(page);
     let plane =
         ctx.scratch_shared(op, "attn.index_fp4_stage", cells as usize * 128 * 2)? as usize as u64;
@@ -220,16 +228,18 @@ fn stage_fp4(ctx: &Ctx, op: &'static str, keys: &KvPool) -> Result<KvPool, Error
                 keys.page_indices.arg(),
                 ArgValue::Ptr(table),
                 ArgValue::I32(i32::try_from(pages).unwrap_or(i32::MAX)),
-                ArgValue::I32(keys.page_size),
+                ArgValue::I32(i32::try_from(page).unwrap_or(i32::MAX)),
             ],
         )?;
     }
+    let width = u32::try_from(128 / div).unwrap_or(128);
+    let positions = cells.saturating_mul(div.unsigned_abs());
     Ok(KvPool {
-        keys: Tensor::new(plane, cells, 128, Dtype::Bf16),
-        values: Tensor::new(plane, cells, 128, Dtype::Bf16),
+        keys: Tensor::new(plane, positions, width, Dtype::Bf16),
+        values: Tensor::new(plane, positions, width, Dtype::Bf16),
         page_indices: Tensor::new(table, pages, 1, Dtype::U32),
-        seq_stride: 128,
-        head_stride: 128,
+        seq_stride: i64::from(width),
+        head_stride: i64::from(width),
         ..*keys
     })
 }
@@ -483,9 +493,21 @@ fn ranked(
         }
         q
     } else {
-        pool_pitch(OP, keys, head_dim)?;
+        if !crate::attn::pool::compact(keys, ratio.max(1), i64::from(head_dim)) {
+            pool_pitch(OP, keys, head_dim)?;
+        }
         q
     };
+    // The keys a row each (`page_size / ratio` a page) in a compact pool.
+    let compact = crate::attn::pool::compact(
+        keys,
+        ratio.max(1),
+        if fp4 {
+            i64::from(FP4_ROW)
+        } else {
+            i64::from(head_dim)
+        },
+    );
     let q_width = stated(OP, q.data.width)?;
     if q_width != heads.saturating_mul(head_dim) {
         return Err(refuse(
@@ -548,6 +570,7 @@ fn ranked(
             score_stride,
             scores as usize as u64,
             num_requests,
+            compact,
             selection,
         )?
     {
@@ -635,6 +658,7 @@ fn ranked(
             score_stride.arg(),
             top_k.arg(),
             ratio.arg(),
+            i32::from(compact).arg(),
         ]
         .into_iter()
         .chain(turn_args)
@@ -783,6 +807,7 @@ struct Tc5Params {
     turn_factor: f32,
     turn_low: f32,
     turn_high: f32,
+    sub: i32,
 }
 
 /// `pie::attn::index_tc5::smem_bytes`: two Q buffers and three key tiles of
@@ -808,6 +833,7 @@ fn ranked_tc5(
     score_stride: i32,
     scores: u64,
     num_requests: i32,
+    compact: bool,
     selection: &mut Tensor,
 ) -> Result<bool, Error> {
     use crate::linear::tc5::{Map, encode, supported};
@@ -824,7 +850,7 @@ fn ranked_tc5(
     if !supported()
         || !matches!(per, 4 | 8 | 16 | 32 | 64 | 128)
         || !cells.is_multiple_of(ratio.unsigned_abs())
-        || keys.seq_stride != 128
+        || keys.seq_stride * if compact { i64::from(ratio) } else { 1 } != 128
         || !keys.keys.ptr.is_multiple_of(16)
         || !q.data.ptr.is_multiple_of(16)
     {
@@ -851,12 +877,15 @@ fn ranked_tc5(
         Some(_) => return Ok(false),
         None => (0, 0, 0.0, 1.0, 0.0, 0.0),
     };
+    // A page's keys `ratio` rows apart at each group's last row, viewed as
+    // [ratio, cells / ratio] rows; a compact pool's a row each.
     let ratio_u = ratio.unsigned_abs();
+    let step = if compact { 1 } else { ratio_u };
     let map = encode(Map {
         ptr: keys.keys.ptr,
         ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        dims: [128, ratio_u, cells / ratio_u],
-        strides: [256, 256 * u64::from(ratio_u)],
+        dims: [128, step, cells / ratio_u],
+        strides: [256, 256 * u64::from(step)],
         boxes: [64, 1, per.unsigned_abs()],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
     })?;
@@ -864,8 +893,8 @@ fn ranked_tc5(
     let map8 = encode(Map {
         ptr: keys.keys.ptr,
         ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        dims: [128, ratio_u, cells / ratio_u],
-        strides: [256, 256 * u64::from(ratio_u)],
+        dims: [128, step, cells / ratio_u],
+        strides: [256, 256 * u64::from(step)],
         boxes: [64, 1, (8 * per.unsigned_abs()).min(256)],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
     })?;
@@ -897,6 +926,7 @@ fn ranked_tc5(
         turn_factor,
         turn_low,
         turn_high,
+        sub: if compact { 0 } else { ratio - 1 },
     };
     let bytes = ArgValue::Bytes {
         ptr: (&raw const params).cast(),

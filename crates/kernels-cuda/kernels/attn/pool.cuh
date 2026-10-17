@@ -287,6 +287,22 @@ __device__ __forceinline__ long long paged_slot(
     return static_cast<long long>(page) * page_size + (pos % page_size);
 }
 
+// Compressed entry `c` of a pool at `ratio`: compact, one a row (a page of
+// `page_size` positions holds `page_size / ratio` of them, rows `head_dim`
+// wide where the pool's positions are `head_dim / ratio`); else a row a
+// position, at the last position of its group.
+__device__ __forceinline__ long long entry_slot(
+    const u32* __restrict__ kv_page_indices,
+    const u32* __restrict__ kv_page_indptr,
+    int req, int c, int ratio, int page_size, int compact) {
+    if (compact) {
+        const int per = page_size / ratio;
+        const u32 page = kv_page_indices[kv_page_indptr[req] + c / per];
+        return static_cast<long long>(page) * per + c % per;
+    }
+    return paged_slot(kv_page_indices, kv_page_indptr, req, (c + 1) * ratio - 1, page_size);
+}
+
 // The positions request `req`'s pages hold: a padded lane owns none, and no
 // position at or past this is read through `paged_slot`.
 __device__ __forceinline__ int owned_positions(
@@ -649,6 +665,7 @@ __global__ void __launch_bounds__(256) pool_compress(
     const u32* __restrict__ out_indices,
     const u32* __restrict__ out_indptr,
     int out_page_size,
+    int out_div,
     int head_dim,
     int ratio,
     int coff,
@@ -802,17 +819,21 @@ __global__ void __launch_bounds__(256) pool_compress(
         row[offset + 2 * d + 1] = f32_to_bf16(b * cos_v + a * sin_v);
     }
     __syncthreads();
-    const u32 page = out_indices[out_indptr[req] + bpos / out_page_size];
-    const int off = bpos % out_page_size;
+    // A compact pool (`out_div` its ratio) holds the entry at its index, a
+    // page its `out_page_size / out_div`; else at the boundary's position.
+    const int cell = bpos / out_div;
+    const int out_rows = out_page_size / out_div;
+    const u32 page = out_indices[out_indptr[req] + cell / out_rows];
+    const int off = cell % out_rows;
     if constexpr (FP8) {
         if (threadIdx.x < 32) {
             ::pie::attn::dsv4::ds_store_warp(
-                row, ::pie::attn::dsv4::ds_row(static_cast<std::uint8_t*>(out_pages), page, off, out_page_size),
+                row, ::pie::attn::dsv4::ds_row(static_cast<std::uint8_t*>(out_pages), page, off, out_rows),
                 static_cast<int>(threadIdx.x));
         }
     } else {
         bf16* dst = static_cast<bf16*>(out_pages) +
-                    (static_cast<long long>(page) * out_page_size + off) * head_dim;
+                    (static_cast<long long>(page) * out_rows + off) * head_dim;
         for (int i = threadIdx.x; i < head_dim / 8; i += blockDim.x) {
             *reinterpret_cast<uint4*>(dst + 8 * i) = *reinterpret_cast<const uint4*>(row + 8 * i);
         }
@@ -829,6 +850,7 @@ __global__ void pool_store_entries(
     const u32* __restrict__ kv_page_indptr,
     int head_dim,
     int page_size,
+    int div,
     const u32* __restrict__ win) {
     const int cb = blockIdx.x;
     if (win != nullptr && cb >= static_cast<int>(win[0])) return;
@@ -836,8 +858,10 @@ __global__ void pool_store_entries(
     if (boundary_pos[c] < 0 ||
         boundary_pos[c] >= owned_positions(kv_page_indptr, boundary_req[c], page_size))
         return;
+    // A compact pool (`div` its ratio): the entry at its index, `page_size /
+    // div` a page; else at the boundary's position.
     const long long slot = paged_slot(kv_page_indices, kv_page_indptr,
-                                      boundary_req[c], boundary_pos[c], page_size);
+                                      boundary_req[c], boundary_pos[c] / div, page_size / div);
     const T* src = entries + static_cast<long long>(c) * head_dim;
     T* dst = comp_kv_pages + slot * head_dim;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) dst[d] = src[d];
@@ -857,6 +881,7 @@ __global__ void pool_lse_paged(
     int ratio,
     int page_size,
     float scale,
+    int compact,
     const u32* __restrict__ win) {
     const int qi = blockIdx.x;
 
@@ -898,8 +923,8 @@ __global__ void pool_lse_paged(
 
     float local_max = neg_inf();
     for (int c = tid; c < num_visible; c += ATTN_BLOCK) {
-        const long long slot = paged_slot(kv_page_indices, kv_page_indptr, req,
-                                          (c + 1) * ratio - 1, page_size);
+        const long long slot = entry_slot(kv_page_indices, kv_page_indptr, req, c, ratio,
+                                          page_size, compact);
         const bf16* k_row = comp_kv_pages + slot * head_dim;
         float dot = 0.f;
         for (int d = 0; d < head_dim; ++d) {
@@ -920,8 +945,8 @@ __global__ void pool_lse_paged(
     float local_z = 0.f;
 
     for (int c = 0; c < num_visible; ++c) {
-        const long long slot = paged_slot(kv_page_indices, kv_page_indptr, req,
-                                          (c + 1) * ratio - 1, page_size);
+        const long long slot = entry_slot(kv_page_indices, kv_page_indptr, req, c, ratio,
+                                          page_size, compact);
         const bf16* k_row = comp_kv_pages + slot * head_dim;
         float dot = 0.f;
         for (int d = tid; d < head_dim; d += ATTN_BLOCK) {
@@ -978,6 +1003,7 @@ __global__ void pool_lse_selected_paged(
     int top_k,
     int page_size,
     float scale,
+    int compact,
     const u32* __restrict__ win) {
     const int qi = blockIdx.x;
 
@@ -1013,8 +1039,8 @@ __global__ void pool_lse_selected_paged(
             const int c = srow[n];
             if (c < 0) break;
             if (c >= num_visible) continue;
-            const long long slot = paged_slot(kv_page_indices, kv_page_indptr, req,
-                                              (c + 1) * ratio - 1, page_size);
+            const long long slot = entry_slot(kv_page_indices, kv_page_indptr, req, c, ratio,
+                                              page_size, compact);
             const bf16* k_row = comp_kv_pages + slot * head_dim;
             float dot = 0.f;
             for (int d = 0; d < head_dim; ++d) {
@@ -1050,8 +1076,8 @@ __global__ void pool_lse_selected_paged(
         const int c = srow[n];
         if (c < 0) break;
         if (c >= num_visible) continue;
-        const long long slot = paged_slot(kv_page_indices, kv_page_indptr, req,
-                                          (c + 1) * ratio - 1, page_size);
+        const long long slot = entry_slot(kv_page_indices, kv_page_indptr, req, c, ratio,
+                                          page_size, compact);
         const bf16* k_row = comp_kv_pages + slot * head_dim;
         float dot = 0.f;
         for (int d = tid; d < head_dim; d += ATTN_BLOCK) {
