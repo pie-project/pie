@@ -1079,7 +1079,15 @@ impl Sink for Cursor<'_> {
     fn region_begin(&mut self, region: &Region) {
         self.place.region.set(self.at);
         self.place.run.set(0);
-        self.place.lane.set(region.stream);
+        // The lane keys a region's shared scratch (`Ctx::scratch_shared`):
+        // a fire walked without lanes runs every region on the main stream,
+        // so they take the main lane's, not a side lane's sized to the widest
+        // fire again.
+        self.place.lane.set(if self.lanes.is_some() {
+            region.stream
+        } else {
+            0
+        });
         if let Some(pump) = self.pump
             && self.fault.is_none()
             && let Err(fault) = pump.rotor.at(self.at, pump.compute)

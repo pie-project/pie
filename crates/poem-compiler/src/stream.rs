@@ -68,8 +68,10 @@ pub(crate) fn fork_with(
 /// Every region scheduled onto the main stream and `side_streams` side
 /// streams by its dependencies, a list schedule over the regions' priced
 /// costs: each launchable region starts on the lane it can start soonest on
-/// (its latest dependency's lane first), waiting on the close of the last
-/// region it follows on each other lane; a region a graph cannot fork (or
+/// (the main lane where no other starts it sooner, so a chain comes back to
+/// it and its scratch is the main stream's, not a second copy sized to the
+/// widest fire that forks), waiting on the close of the last region it
+/// follows on each other lane; a region a graph cannot fork (or
 /// the last) runs on the main lane after every lane's last region. Regions
 /// on different lanes that no lane order or wait orders run side by side.
 ///
@@ -116,7 +118,6 @@ pub(crate) fn fork_dag(
     for r in 0..n {
         let mut ready = 0f32;
         let mut need: Vec<Option<usize>> = vec![None; lanes];
-        let mut latest: Option<usize> = None;
         for a in 0..r {
             if !ordered.path(a, r) {
                 continue;
@@ -124,9 +125,6 @@ pub(crate) fn fork_dag(
             ready = ready.max(finish[a]);
             let l = lane_of[a];
             need[l] = Some(need[l].map_or(a, |held| held.max(a)));
-            if latest.is_none_or(|b| finish[a] > finish[b]) {
-                latest = Some(a);
-            }
         }
         let barrier = !eligible[r] || r + 1 == n;
         let lane = if barrier {
@@ -137,14 +135,8 @@ pub(crate) fn fork_dag(
                 .map_or(0, |&l| (l as usize).min(lanes - 1))
         } else {
             let start = |l: usize| ready.max(free[l]);
-            let prefer = latest.map(|a| lane_of[a]);
             (0..lanes)
-                .min_by(|&x, &y| {
-                    start(x)
-                        .total_cmp(&start(y))
-                        .then_with(|| (Some(y) == prefer).cmp(&(Some(x) == prefer)))
-                        .then_with(|| x.cmp(&y))
-                })
+                .min_by(|&x, &y| start(x).total_cmp(&start(y)).then_with(|| x.cmp(&y)))
                 .unwrap_or(0)
         };
         if barrier {
