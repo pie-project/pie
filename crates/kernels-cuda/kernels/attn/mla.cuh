@@ -125,8 +125,17 @@ constexpr int kMaxRopePairs = 128;
 __device__ __forceinline__ int mla_find_request(const u32* qo_indptr,
                                                 int R,
                                                 int token_idx) {
-    for (int r = 0; r < R; ++r) {
-        if (token_idx < static_cast<int>(qo_indptr[r + 1])) return r;
+    // The first request whose rows end past the token, as a walk finds it
+    // (the indptr is not ordered past the live requests, so no search may
+    // halve it): 32 requests a round, a lane each, their loads in flight
+    // together, the lowest lane past the token taken. Every caller's warps
+    // are whole and alike.
+    const int lane = static_cast<int>(threadIdx.x % 32);
+    for (int b = 0; b < R; b += 32) {
+        const int r = b + lane;
+        const bool past = r < R && token_idx < static_cast<int>(__ldg(&qo_indptr[r + 1]));
+        const unsigned m = __ballot_sync(0xffffffffu, past);
+        if (m != 0u) return b + __ffs(m) - 1;
     }
     return R - 1;
 }
