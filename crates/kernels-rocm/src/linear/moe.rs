@@ -704,6 +704,83 @@ fn wide_items(ctx: &Ctx, fan: &Selected, experts: u32, x: Tensor) -> Option<u32>
     })
 }
 
+/// A bf16 bank in the matrix core's order (`act_quant::bf16_shuffle` of each
+/// expert's plane) against the routes' rows. Up to 64 routes an expert
+/// (decode batches), streamed whole 1 KB units a lane-order strip into the
+/// matrix core's operands: items of the least of 16, 32 and 64 routes
+/// holding what an expert averages, an expert past its item taking another.
+/// Past 64, the prefill tile: items of 128 routes against 512 weight rows
+/// a block, the weight straight into registers and the routes through LDS.
+pub fn matmul_select_bf16_stream(
+    ctx: &Ctx,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    experts: u32,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_matmul_select";
+    let op = OP;
+    dtype_dispatch!(op, x.dtype, { Bf16 => () });
+    let fan = selected(op, x, routes, y)?;
+    if !x.width.is_multiple_of(64) || !y.width.is_multiple_of(16) || experts > ORDER_EXPERT_CAP {
+        return Err(refuse(
+            op,
+            "the streamed bank takes whole 16-row strips of 64-element stages",
+        ));
+    }
+    let per = fan.route_count.div_ceil(experts.max(1));
+    let group = per > 64;
+    // The prefill tile reads the activation at 32-bit offsets from its base.
+    if group && u64::from(x.rows) * u64::from(x.width) * 2 > u64::from(u32::MAX) {
+        return Err(refuse(
+            op,
+            "the prefill tile reads an activation under 4 GiB",
+        ));
+    }
+    let mt = if group {
+        128
+    } else {
+        crate::linear::act_quant::fp8_item_rows(per)
+    };
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let ordered = route_order(ctx, op, routes, &fan, experts, mt)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let (entry, rows, threads) = if group {
+        (
+            "::pie::linear::moe_bf16_group".to_string(),
+            512,
+            2 * GROUP_BLOCK,
+        )
+    } else {
+        (
+            format!("::pie::linear::moe_bf16_stream<::pie::i32({mt})>"),
+            64,
+            GROUP_BLOCK,
+        )
+    };
+    ctx.fire(
+        op,
+        Fire::at("linear/fp8.hip", symbol(&entry)).apply(Launch::grid(
+            [ordered.work_cap, y.width.div_ceil(rows), 1],
+            [threads, 1, 1],
+        )),
+        &[
+            x.arg(),
+            ArgValue::Ptr(ordered.order),
+            ArgValue::Ptr(ordered.offsets),
+            ArgValue::Ptr(ordered.work),
+            bank.arg(),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+        ],
+    )
+}
+
 /// A bf16 bank's select on the GEMM tile (`linear/fp8.hip`'s eight-wave
 /// tile at bf16): routes ordered by expert into items of 128, each against
 /// 128 weight rows a block.

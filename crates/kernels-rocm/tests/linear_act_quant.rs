@@ -408,3 +408,132 @@ fn bench_fp8_projections() {
         }
     }
 }
+
+#[test]
+fn a_bf16_bank_streams_in_the_matrix_cores_order() {
+    use kernels_rocm::linear::moe;
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let experts = 6usize;
+    for (tokens, top_k, n, k) in [
+        (8usize, 4usize, 256usize, 512usize),
+        (300, 4, 320, 512),
+        (700, 2, 384, 1024),
+    ] {
+        let w: Vec<f32> = values(experts * n * k, 61, 0.5)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let x: Vec<f32> = values(tokens * k, 63, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let routes: Vec<i32> = (0..tokens * top_k)
+            .map(|i| ((i / top_k * 5 + (i % top_k) * 7 + i / 3) % experts) as i32)
+            .collect();
+        let wt = gpu.tensor(&w, (experts * n) as u32, k as u32, Dtype::Bf16);
+        let ws = gpu.zeros((experts * n) as u32, k as u32, Dtype::Bf16);
+        act_quant::bf16_shuffle(&ctx, "test", wt.ptr, ws.ptr, (experts * n) as u64, k as u64)
+            .unwrap();
+        let bank = Tensor::new(ws.ptr, experts as u32, (n * k) as u32, Dtype::Bf16);
+        let mut y = gpu.zeros((tokens * top_k) as u32, n as u32, Dtype::Bf16);
+        let rt = gpu.ints_shaped(&routes, tokens as u32, top_k as u32);
+        moe::matmul_select_bf16_stream(
+            &ctx,
+            gpu.tensor(&x, tokens as u32, k as u32, Dtype::Bf16),
+            bank,
+            rt,
+            &mut y,
+            experts as u32,
+        )
+        .unwrap();
+        let want: Vec<f32> = (0..tokens * top_k * n)
+            .map(|i| {
+                let (route, c) = (i / n, i % n);
+                let (e, t) = (routes[route] as usize, route / top_k);
+                (0..k)
+                    .map(|j| f64::from(x[t * k + j]) * f64::from(w[(e * n + c) * k + j]))
+                    .sum::<f64>() as f32
+            })
+            .collect();
+        let big = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+        for (i, (g, v)) in gpu.read(&y).iter().zip(&want).enumerate() {
+            assert!(
+                (g - v).abs() <= v.abs() * 2f32.powi(-8) + 1e-5 * big,
+                "bf16 bank t{tokens} k{top_k} {n}x{k}: route {} column {} is {g}, the dot {v}",
+                i / n,
+                i % n
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "benchmark: cargo test --release --features rocm --test linear_act_quant -- --ignored --nocapture"]
+fn bench_bf16_bank_stream() {
+    // GLM-5.3's eight-expert mini banks at decode routes, every expert
+    // routed: the streamed tile over the matrix core's order.
+    use kernels_rocm::linear::moe;
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let experts = 8usize;
+    for (name, n, k) in [("gate_up", 4096usize, 6144usize), ("down", 6144, 2048)] {
+        let copies = 4usize;
+        let banks: Vec<Tensor> = (0..copies)
+            .map(|c| {
+                let w = gpu.tensor(
+                    &values(experts * n * k, 70 + c as u64, 0.5),
+                    (experts * n) as u32,
+                    k as u32,
+                    Dtype::Bf16,
+                );
+                let s = gpu.zeros((experts * n) as u32, k as u32, Dtype::Bf16);
+                act_quant::bf16_shuffle(
+                    &ctx,
+                    "bench",
+                    w.ptr,
+                    s.ptr,
+                    (experts * n) as u64,
+                    k as u64,
+                )
+                .unwrap();
+                Tensor::new(s.ptr, experts as u32, (n * k) as u32, Dtype::Bf16)
+            })
+            .collect();
+        let list: Vec<usize> = std::env::var("BANK_TOKENS").map_or(vec![16, 32, 64], |v| {
+            v.split(',').map(|x| x.parse().unwrap()).collect()
+        });
+        for tokens in list {
+            let routes: Vec<i32> = (0..tokens * experts)
+                .map(|i| (i % experts) as i32)
+                .collect();
+            let rt = gpu.ints_shaped(&routes, tokens as u32, experts as u32);
+            let x = gpu.tensor(
+                &values(tokens * k, 5, 1.0),
+                tokens as u32,
+                k as u32,
+                Dtype::Bf16,
+            );
+            let y = gpu.zeros((tokens * experts) as u32, n as u32, Dtype::Bf16);
+            let mut i = 0usize;
+            let us = gpu.time_graph(16, || {
+                let mut yt = y;
+                moe::matmul_select_bf16_stream(
+                    &ctx,
+                    x,
+                    banks[i % copies],
+                    rt,
+                    &mut yt,
+                    experts as u32,
+                )
+                .unwrap();
+                i += 1;
+            });
+            eprintln!(
+                "{name:8} routes/expert {tokens:5}: {us:8.1} us {:5.2} TB/s {:6.1} TFLOP/s",
+                (2 * experts * n * k) as f64 / us / 1e6,
+                (2 * tokens * experts * n * k) as f64 / us / 1e6
+            );
+        }
+    }
+}

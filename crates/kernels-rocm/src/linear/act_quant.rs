@@ -543,7 +543,8 @@ pub fn e4m3fn_shuffle(
     let grid = u32::try_from(chunks.div_ceil(u64::from(BLOCK)).min(16384)).unwrap_or(16384);
     ctx.fire(
         op,
-        Fire::at("linear/fp8.hip", "::pie::linear::e4m3fn_shuffle").apply(Launch::grid([grid, 1, 1], [BLOCK, 1, 1])),
+        Fire::at("linear/fp8.hip", "::pie::linear::e4m3fn_shuffle<true>")
+            .apply(Launch::grid([grid, 1, 1], [BLOCK, 1, 1])),
         &[ArgValue::Ptr(src), ArgValue::Ptr(dst), ArgValue::I32(r), ArgValue::I32(kk), ArgValue::Ptr(nans)],
     )
 }
@@ -553,4 +554,49 @@ pub fn e4m3fn_shuffle(
 #[must_use]
 pub const fn fp8_strips() -> u32 {
     1
+}
+
+/// A bf16 plane of `rows` x `k` (`rows` a multiple of 16, `k` of 32),
+/// row-major at `src`, into `dst` in the matrix core's order: a row's 2k
+/// bytes laid as `e4m3fn_shuffle` lays k codes, so lane l's 8 bytes of a
+/// k-step are the four elements its bf16 A operand takes.
+pub fn bf16_shuffle(
+    ctx: &Ctx,
+    op: &'static str,
+    src: u64,
+    dst: u64,
+    rows: u64,
+    k: u64,
+) -> Result<(), Error> {
+    if rows == 0 || k == 0 {
+        return Ok(());
+    }
+    if !rows.is_multiple_of(16)
+        || !k.is_multiple_of(32)
+        || !src.is_multiple_of(16)
+        || !dst.is_multiple_of(16)
+    {
+        return Err(refuse(
+            op,
+            format!("a bf16 plane of {rows} x {k} is not whole 16-row strips of 32-element units"),
+        ));
+    }
+    let (r, kb) = (
+        i32::try_from(rows).map_err(|_| refuse(op, "the plane's rows pass an i32"))?,
+        i32::try_from(2 * k).map_err(|_| refuse(op, "the plane's row bytes pass an i32"))?,
+    );
+    let grid =
+        u32::try_from((rows * 2 * k / 16).div_ceil(u64::from(BLOCK)).min(16384)).unwrap_or(16384);
+    ctx.fire(
+        op,
+        Fire::at("linear/fp8.hip", "::pie::linear::e4m3fn_shuffle<false>")
+            .apply(Launch::grid([grid, 1, 1], [BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(src),
+            ArgValue::Ptr(dst),
+            ArgValue::I32(r),
+            ArgValue::I32(kb),
+            ArgValue::ABSENT,
+        ],
+    )
 }
