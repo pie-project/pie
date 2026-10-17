@@ -448,3 +448,63 @@ fn the_kv_ends_and_column_concat_land_what_the_host_lands() {
         }
     }
 }
+
+/// `PIE_MARKOV_PACE=lanes` times the walk at the release's vocabulary over
+/// that many five-row blocks of bf16 logits (each depth a step).
+#[test]
+fn the_markov_walk_paces_a_release_block() {
+    let Some(lanes) = std::env::var("PIE_MARKOV_PACE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    else {
+        return;
+    };
+    let (vocab, rank, block) = (129_280usize, markov::RANK as usize, 5usize);
+    let rows = lanes * block;
+    let mut gpu = Gpu::open();
+    let mut lcg = Lcg::seeded(0x77);
+    let (embed_raw, _) = lcg.row(vocab * rank);
+    let (head_raw, _) = lcg.row(vocab * rank);
+    let logits_raw: Vec<u16> = (0..rows * vocab)
+        .map(|i| to_bf16(((i * 37) % 101) as f32 * 0.01))
+        .collect();
+    let positions: Vec<i32> = (0..rows).map(|r| (r % block) as i32 + 100).collect();
+    let ends: Vec<i32> = vec![104; rows];
+    let tokens: Vec<i32> = (0..rows).map(|r| ((r * 131) % vocab) as i32).collect();
+    let (logits_at, embed_at, head_at) =
+        (gpu.up(&logits_raw), gpu.up(&embed_raw), gpu.up(&head_raw));
+    let (pos_at, ends_at, tok_at) = (gpu.up(&positions), gpu.up(&ends), gpu.up(&tokens));
+    let biased_at = gpu.zeros(rows * vocab * 2);
+    let picks_at = gpu.zeros(rows * 4);
+    let fire = |gpu: &mut Gpu| {
+        let mut biased = Tensor::new(biased_at, rows as u32, vocab as u32, Dtype::Bf16);
+        let mut picks = Tensor::new(picks_at, rows as u32, 1, Dtype::I32);
+        markov::walk(
+            &gpu.ctx(),
+            Tensor::new(logits_at, rows as u32, vocab as u32, Dtype::Bf16),
+            Tensor::new(tok_at, rows as u32, 1, Dtype::I32),
+            Tensor::new(pos_at, rows as u32, 1, Dtype::I32),
+            Tensor::new(ends_at, rows as u32, 1, Dtype::I32),
+            Tensor::new(embed_at, vocab as u32, rank as u32, Dtype::Bf16),
+            Tensor::new(head_at, vocab as u32, rank as u32, Dtype::Bf16),
+            block as u32,
+            &mut biased,
+            &mut picks,
+        )
+        .expect("the walk fires");
+    };
+    for _ in 0..3 {
+        fire(&mut gpu);
+    }
+    gpu.sync();
+    let iters = 20;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        fire(&mut gpu);
+    }
+    gpu.sync();
+    println!(
+        "markov walk: {lanes} blocks x {block} rows, {:.1} us a walk",
+        t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters)
+    );
+}

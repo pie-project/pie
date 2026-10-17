@@ -65,6 +65,10 @@ struct Input {
     /// Proposals verified a round, at most the block (all of them, absent).
     #[serde(default)]
     k: Option<u32>,
+    /// Rounds kept in flight (the runtime's run-ahead window's frames,
+    /// absent).
+    #[serde(default)]
+    ahead: Option<usize>,
 }
 
 fn default_prompt() -> String {
@@ -398,9 +402,17 @@ async fn main(input: Input) -> Result<Output> {
 
     if !stopped {
         // ── the rounds: draft then verify, a window of them ahead ────────
-        // A recurrent state holds one slot a posted frame: a pass a frame.
-        let pair = rs_set.is_empty() && frame_size() >= 2;
-        let rounds_ahead = (model::run_ahead_window() as usize / 2).max(1);
+        // A round is ONE frame of the two passes: the scheduler's waves are
+        // a frame's slots, so every lane's draft lands in one fire and every
+        // lane's verify in the next — fires of one kind, which replay their
+        // recorded bodies, where lone passes from lanes out of step mix the
+        // two kinds and run eagerly. The draft folds no recurrence, so the
+        // verify's window verb is the frame's one recurrent slot.
+        let pair = frame_size() >= 2;
+        let rounds_ahead = input
+            .ahead
+            .unwrap_or_else(|| model::run_ahead_window() as usize / frame_size().max(1))
+            .max(1);
         let budget = input.max_tokens;
         let submit_round = || -> std::result::Result<(), String> {
             if pair {
