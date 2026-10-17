@@ -82,24 +82,15 @@ fn check(window: Option<(u32, u32, u32)>, hidden: usize, one_pass: bool) {
     }
 }
 
+/// Both forms (the two-pass block a row, and the one-pass form holding one
+/// to three vectors a thread in registers), and a bucket's padded rows
+/// retired off the staged window.
 #[test]
 fn the_fused_residual_norm_lands_what_the_two_launches_land_every_case() {
-    the_pair_lands_the_two_launches_bits();
-    the_pair_retires_a_buckets_padded_rows_off_the_staged_window();
-}
-
-/// Both forms: the two-pass block a row, and the one-pass form holding its
-/// vectors in registers (one to three a thread at these widths).
-fn the_pair_lands_the_two_launches_bits() {
     for one_pass in [false, true] {
         for hidden in [1024, 2048, 5120] {
             check(None, hidden, one_pass);
         }
-    }
-}
-
-fn the_pair_retires_a_buckets_padded_rows_off_the_staged_window() {
-    for one_pass in [false, true] {
         check(Some((4, 2, 1)), 5120, one_pass);
     }
 }

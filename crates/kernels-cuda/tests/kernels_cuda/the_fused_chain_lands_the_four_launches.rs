@@ -106,18 +106,12 @@ fn check(hidden: usize, window: Option<(u32, u32, u32)>) {
     }
 }
 
+/// 2560 wide takes the eight-wide chain, 2564 and 1028 the scalar one; with
+/// and without a staged window `(rows, live, base)`.
 #[test]
 fn the_fused_chain_lands_the_four_launches_every_case() {
-    the_eight_wide_chain_lands_the_four_launches();
-    the_scalar_chain_lands_the_four_launches();
-}
-
-fn the_eight_wide_chain_lands_the_four_launches() {
     check(2560, None);
     check(2560, Some((8, 5, 2)));
-}
-
-fn the_scalar_chain_lands_the_four_launches() {
     check(2564, None);
     check(1028, Some((8, 3, 1)));
 }
