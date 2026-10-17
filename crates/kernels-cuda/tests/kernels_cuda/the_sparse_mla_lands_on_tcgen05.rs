@@ -696,7 +696,7 @@ fn e4m3(b: u8) -> f32 {
 /// same values as fp8_ds_mla rows (656 bytes: 512 e4m3 codes, four f32
 /// scales, 64 bf16 rotated dims). The bf16 rows hold each code times its
 /// scale rounded to bf16, which is what the fp8 pass widens a tile to.
-fn decode_short(reqs: usize, kv: usize, fp8: bool, iters: u32) -> (Vec<u16>, f64) {
+fn decode_short(reqs: usize, kv: usize, fp8: bool, dense: bool, iters: u32) -> (Vec<u16>, f64) {
     const PG: usize = 64;
     const ROPE: usize = 64;
     const ROW: usize = 656;
@@ -729,10 +729,12 @@ fn decode_short(reqs: usize, kv: usize, fp8: bool, iters: u32) -> (Vec<u16>, f64
             row[528 + 2 * d..530 + 2 * d].copy_from_slice(&kpe_raw[s * ROPE + d].to_le_bytes());
         }
     }
+    // Every key, newest first, as an index ranks them in no order of
+    // position.
     let mut sel = vec![-1i32; reqs * 2048];
     for r in 0..reqs {
         for j in 0..kv {
-            sel[r * 2048 + j] = j as i32;
+            sel[r * 2048 + j] = (kv - 1 - j) as i32;
         }
     }
     let qo: Vec<i32> = (0..=reqs as i32).collect();
@@ -806,6 +808,7 @@ fn decode_short(reqs: usize, kv: usize, fp8: bool, iters: u32) -> (Vec<u16>, f64
     let out = gpu.zeros(reqs * HEADS * RANK * 2);
     let ctx = gpu.ctx().with_tuning(Tuning {
         mla_sparse: true,
+        mla_dense_short: dense,
         ..Tuning::DEFAULT
     });
     let fire = || {
@@ -844,8 +847,24 @@ fn decode_short(reqs: usize, kv: usize, fp8: bool, iters: u32) -> (Vec<u16>, f64
 
 #[test]
 fn glm_fp8_latent_rows_read_as_their_widened_bf16() {
-    let (want, _) = decode_short(4, 300, false, 0);
-    let (got, _) = decode_short(4, 300, true, 0);
+    let (want, _) = decode_short(4, 300, false, false, 0);
+    let (got, _) = decode_short(4, 300, true, false, 0);
+    for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+        let (g, w) = (from_bf16(g), from_bf16(w));
+        assert!(
+            close(g, w),
+            "row {} head {} dim {}: {g} against {w}",
+            i / (HEADS * RANK),
+            (i / RANK) % HEADS,
+            i % RANK
+        );
+    }
+}
+
+#[test]
+fn glm_reads_a_short_selection_dense() {
+    let (want, _) = decode_short(4, 300, true, false, 0);
+    let (got, _) = decode_short(4, 300, true, true, 0);
     for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
         let (g, w) = (from_bf16(g), from_bf16(w));
         assert!(
@@ -866,8 +885,11 @@ fn glm_decodes_a_short_context() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(768);
     for reqs in [1, 8, 64] {
-        let (_, bf16) = decode_short(reqs, kv, false, 200);
-        let (_, fp8) = decode_short(reqs, kv, true, 200);
-        eprintln!("| {reqs} rows, {kv} keys | bf16 {bf16:.1} us | fp8 {fp8:.1} us |");
+        let (_, bf16) = decode_short(reqs, kv, false, false, 200);
+        let (_, fp8) = decode_short(reqs, kv, true, false, 200);
+        let (_, dense) = decode_short(reqs, kv, true, true, 200);
+        eprintln!(
+            "| {reqs} rows, {kv} keys | bf16 {bf16:.1} us | fp8 {fp8:.1} us | fp8 dense {dense:.1} us |"
+        );
     }
 }

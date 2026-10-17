@@ -326,6 +326,15 @@ pub struct GemmFp8GroupedTc5Until(pub u32);
 #[decision(id = "kernel.sdpa.mla_sparse", flag, default = false, tune = search)]
 pub struct SdpaMlaSparse;
 
+/// Whether the tcgen05 sparse MLA pass reads a row that sees no more keys
+/// than its selection holds (a decode at a short context, a prefill's rows
+/// before the top-k) as dense: every key it sees in order, its selection
+/// unread, as its index (which ranks all of them) selected. Off reads every
+/// row's selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.mla_dense_short", flag, default = false, tune = search)]
+pub struct SdpaMlaDenseShort;
+
 /// Whether a pooled index (`attention.index_topk`) scores its blocks on the
 /// tensor cores rather than a thread a block. Off scores the scalar way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -684,6 +693,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaDsv4Fp4PassFrom>()
         .add::<GemmFp8GroupedTc5Until>()
         .add::<SdpaMlaSparse>()
+        .add::<SdpaMlaDenseShort>()
         .add::<GemmNarrowN>();
 }
 
@@ -775,6 +785,7 @@ pub struct Tuning {
     pub dsv4_fp4_pass_from: u32,
     pub gemm_fp8_grouped_tc5_until: u32,
     pub mla_sparse: bool,
+    pub mla_dense_short: bool,
     pub gemm_narrow_n: u32,
 }
 
@@ -864,6 +875,7 @@ impl Tuning {
         dsv4_fp4_pass_from: 0,
         gemm_fp8_grouped_tc5_until: 0,
         mla_sparse: false,
+        mla_dense_short: false,
         gemm_narrow_n: 0,
     };
 
@@ -953,6 +965,7 @@ impl Tuning {
             dsv4_fp4_pass_from: profile.get::<SdpaDsv4Fp4PassFrom>().0,
             gemm_fp8_grouped_tc5_until: profile.get::<GemmFp8GroupedTc5Until>().0,
             mla_sparse: profile.on::<SdpaMlaSparse>(&Anywhere),
+            mla_dense_short: profile.on::<SdpaMlaDenseShort>(&Anywhere),
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,
         }
     }

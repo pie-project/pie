@@ -687,6 +687,7 @@ mod sparse {
         part_lse: u64,
         splits: i32,
         fp8_rows: u64,
+        dense: i32,
     }
 
     /// Bytes a cell of an fp8 latent pool (`attn/mla.cuh`'s
@@ -853,6 +854,7 @@ mod sparse {
             part_lse,
             splits: int(splits),
             fp8_rows: if fp8 { pool.keys.ptr } else { 0 },
+            dense: i32::from(ctx.tuning().mla_dense_short),
         };
         let bytes = |m: &[u64; 16]| ArgValue::Bytes {
             ptr: m.as_ptr().cast(),

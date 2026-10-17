@@ -70,6 +70,9 @@ struct Params {
     // cell: the instance that reads them widens a tile's latent into the
     // ring itself and gathers the rotated dims from byte 528.
     const unsigned char* fp8_rows;
+    // Rows that see no more keys than `top_k` read every key they see, in
+    // order, their selection unread.
+    int dense;
 };
 
 constexpr int kFp8Row = 656;
@@ -210,7 +213,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
     // position in that request's keys, the keys it may see, and its selected
     // ids up to the first negative one.
     struct Row {
-        int row, pos, last, entries, nt, j0, split;
+        int row, pos, last, entries, nt, j0, split, dense;
         const int* sel;
         const u32* pages;
     };
@@ -250,8 +253,11 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
         // blocks): the stream runs to its last id, a -1 before it masked.
         // Found from the end, 512 ids a round with their loads all in flight
         // (a full selection's last id is in the first round).
-        w.entries = 0;
-        for (int end = p.top_k; end > 0 && w.entries == 0; end -= 16 * 32) {
+        // A row that sees no more keys than its selection holds reads them
+        // all, in order: its index ranked every one.
+        w.dense = p.dense != 0 && w.last + 1 <= p.top_k;
+        w.entries = w.dense ? max(w.last + 1, 0) : 0;
+        for (int end = p.top_k; !w.dense && end > 0 && w.entries == 0; end -= 16 * 32) {
             const int n0 = end - 16 * 32;
             int v[16];
 #pragma unroll
@@ -304,7 +310,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
                     const int k = (w.j0 + j) * kBK + c;
                     u32 e = kSlotMask;
                     if (k < w.entries) {
-                        const int id = w.sel[k];
+                        const int id = w.dense ? k : w.sel[k];
                         if (id >= 0 && id <= w.last) {
                             e = static_cast<u32>(row_in(w.pages, id, p.page)) | kValid;
                         }

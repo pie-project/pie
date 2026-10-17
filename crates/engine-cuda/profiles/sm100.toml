@@ -48,6 +48,9 @@ sdpa.dsv4_fp4_pass_from = 32
 # GLM-5.3's DSA (sparse MLA, top-2048 tokens a row) a block a row on
 # tcgen05, the selected keys' latent and rotated part gathered whole.
 sdpa.mla_sparse = true
+# A row that sees no more keys than its selection holds (GLM-5.3 under 2048
+# tokens) read dense, its keys in order and its selection unread.
+sdpa.mla_dense_short = true
 # A prefill's pooled index (512 rows and up) scored on tcgen05, two rows'
 # 64 heads an MMA's 128 lanes against tiles of 128 blocks, then ranked:
 # DeepSeek-V4-Flash's indexer over 2048 rows of a 4096-position request,
