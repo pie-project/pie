@@ -387,13 +387,14 @@ fn w4a8_matmul(m: usize, n: usize, k: usize, gran: usize) {
     assert_eq!(bad, 0, "{bad} of {} outputs off the read-back dot", m * n);
 }
 
-/// DeepSeek's W8A8: e4m3 activations in 1x128 blocks against e4m3 codes
-/// under one ue8m0 exponent a 128x128 block, the block's exponent spread to
-/// each of its rows' atoms.
-fn w8a8_block_matmul(m: usize, n: usize, k: usize) {
-    let mut lcg = Lcg::seeded(0x88 ^ (m * n + k) as u64);
+/// DeepSeek's W8A8: e4m3 activations in 1x`block` blocks against e4m3
+/// codes under one ue8m0 exponent a `block`-square block (128 for V4's
+/// fp8b128, 32 for V4.1's MXFP8), the block's exponent spread to each of
+/// its rows' atoms.
+fn w8a8_block_matmul(m: usize, n: usize, k: usize, block: usize) {
+    let mut lcg = Lcg::seeded(0x88 ^ (m * n + k + block) as u64);
     let (raw, _) = activations(&mut lcg, m, k);
-    let (bn, bk) = (n.div_ceil(128), k.div_ceil(128));
+    let (bn, bk) = (n.div_ceil(block), k.div_ceil(block));
     let blocks: Vec<u8> = (0..bn * bk).map(|i| 118 + (i * 5 % 9) as u8).collect();
     let mut codes = vec![0u8; n * k];
     let mut w = vec![0f32; n * k];
@@ -402,7 +403,7 @@ fn w8a8_block_matmul(m: usize, n: usize, k: usize) {
             let u = ((lcg.unit() + 1.0) * 128.0) as u32;
             let code = ((u & 0x80) | ((3 + (u >> 2) % 8) << 3) | (u & 7)) as u8;
             codes[r * k + c] = code;
-            let s = blocks[(r / 128) * bk + c / 128];
+            let s = blocks[(r / block) * bk + c / block];
             w[r * k + c] = e4m3(code) * 2f32.powi(i32::from(s) - 127);
         }
     }
@@ -410,13 +411,21 @@ fn w8a8_block_matmul(m: usize, n: usize, k: usize) {
     let x_at = gpu.up(&raw);
     let codes_at = gpu.up(&codes);
     let blocks_at = gpu.up(&blocks);
-    let atoms_at = gpu.zeros(atom_bytes(n, k, 128));
+    let atoms_at = gpu.zeros(atom_bytes(n, k, block));
     let y_at = gpu.zeros(m * n * 2);
     let values_at = gpu.zeros(m * k * 2);
     let ctx = gpu.ctx();
-    scales_to_atoms(&ctx, OP, blocks_at, atoms_at, n as u32, bk as u32, 128)
-        .expect("the exponents spread");
-    let fmt = Format::E4m3 { gran: 128 };
+    scales_to_atoms(
+        &ctx,
+        OP,
+        blocks_at,
+        atoms_at,
+        n as u32,
+        bk as u32,
+        block as u32,
+    )
+    .expect("the exponents spread");
+    let fmt = Format::E4m3 { gran: block as u32 };
     let src = Source::rows(Tensor::new(x_at, m as u32, k as u32, Dtype::Bf16), None);
     let mut y = Tensor::new(y_at, m as u32, n as u32, Dtype::Bf16);
     matmul(
@@ -430,7 +439,7 @@ fn w8a8_block_matmul(m: usize, n: usize, k: usize) {
             n: n as u32,
             k: k as u32,
             elem: Elem::E4m3,
-            gran: 128,
+            gran: block as u32,
             laid: true,
         },
         &mut y,
@@ -466,6 +475,10 @@ fn w8a8_block_matmul(m: usize, n: usize, k: usize) {
         "{bad} of {} W8A8 outputs off the read-back dot",
         m * n
     );
+    // Held codes are 1x128 blocks: a 32-block product quantizes its own.
+    if block != 128 {
+        return;
+    }
     // A producer's codes in the held planes (here the quantizer's bytes,
     // which `e4m3_block_store` lands too) read by the GEMM with no
     // quantize launch: the same product, bit for bit.
@@ -545,8 +558,12 @@ fn the_activation_quantizers_land_what_the_host_rounds_every_case() {
     w4a8_matmul(7, 256, 512, 128);
     w4a8_matmul(200, 384, 1024, 128);
     w4a8_matmul(64, 128, 256, 32);
-    w8a8_block_matmul(5, 384, 640);
-    w8a8_block_matmul(300, 256, 1024);
+    w8a8_block_matmul(5, 384, 640, 128);
+    w8a8_block_matmul(300, 256, 1024, 128);
+    // DeepSeek-V4.1's MXFP8: 32x32 weight blocks against 1x32 activations.
+    w8a8_block_matmul(5, 384, 640, 32);
+    w8a8_block_matmul(300, 1280, 5120, 32);
+    w8a8_block_matmul(130, 200, 4096, 32);
     for tokens in [3, 40, 150] {
         routed_select(Format::Nvfp4, tokens, true);
         routed_select(Format::E4m3 { gran: 128 }, tokens, true);
