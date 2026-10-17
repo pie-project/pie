@@ -240,6 +240,72 @@ pub fn rmsnorm_per_head_plus_one(
     )
 }
 
+/// Muse Spark's post-norm and residual gate (`elementwise.norm_gate`): a
+/// row's `x` times `scale` (rounded), RMS-normed unscaled (rounded), and with
+/// `res` and its f32 `gate` the residual's gated sum.
+#[allow(clippy::too_many_arguments)]
+pub fn norm_gate(
+    ctx: &Ctx,
+    x: Tensor,
+    scale: Option<Tensor>,
+    res: Option<Tensor>,
+    gate: Option<Tensor>,
+    eps: f32,
+    temperature: f32,
+    fan: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.norm_gate";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    if res.is_some() != gate.is_some() || gate.is_some_and(|g| g.dtype != Dtype::F32) {
+        return Err(refuse(OP, "a residual comes with its f32 gate"));
+    }
+    let rows = nonzero(OP, "rows", y.rows)?;
+    let absent = |t: Option<Tensor>| t.map_or(crate::jit::ArgValue::ABSENT, |t| t.arg());
+    // A row of whole 2048-element runs (Muse Spark's 8192 and 4096) lives
+    // in the block's registers, read in 16-byte runs.
+    let aligned = [
+        Some(&x),
+        scale.as_ref(),
+        res.as_ref(),
+        gate.as_ref(),
+        Some(&*y),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|t| aligned16(t.ptr));
+    let Some(runs) = hidden_runs(y.width).filter(|_| aligned) else {
+        return Err(refuse(OP, "a row of one to four aligned 2048-element runs"));
+    };
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::elemwise::norm_gate<{t}, {runs}>")),
+        )
+        .apply(Launch::per_row(rows, BLOCK)),
+        &[
+            x.arg(),
+            absent(scale),
+            absent(res),
+            absent(gate),
+            y.arg(),
+            eps.arg(),
+            temperature.arg(),
+            stated(OP, fan)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// The 2048-element runs `width` is whole of, where `norm_gate` holds it
+/// (one to four).
+fn hidden_runs(width: u32) -> Option<u32> {
+    (width % 2048 == 0)
+        .then_some(width / 2048)
+        .filter(|runs| (1..=4).contains(runs))
+}
+
 pub fn rmsnorm_no_scale(
     ctx: &Ctx,
     x: Tensor,

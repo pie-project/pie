@@ -1056,6 +1056,42 @@ pub fn hadamard_signed(x: &Value, block: u32, signs: &Weight) -> Value {
     x_out
 }
 
+/// Muse Spark's post-norm and residual gate (`elementwise.norm_gate`):
+/// `x` times `scale` (rounded), RMS-normed unscaled, and with `res` and its
+/// `gate` the residual's gated sum; else the norm alone.
+pub fn norm_gate(
+    x: &Value,
+    scale: Option<&Weight>,
+    res: Option<(&Value, &Weight)>,
+    eps: f32,
+    temperature: f32,
+) -> Value {
+    let r = x.rec();
+    let y = r.fresh(x.ty().clone());
+    let mut ins = vec![x];
+    if let Some((stream, _)) = res {
+        assert_eq!(
+            stream.ty(),
+            x.ty(),
+            "the residual and the normed row share a type"
+        );
+        ins.push(stream);
+    }
+    r.push(
+        Elementwise::NormGate {
+            x: x.id(),
+            scale: scale.map(|s| r.weight(s)),
+            res: res.map(|(stream, _)| stream.id()),
+            gate: res.map(|(_, gate)| r.weight(gate)),
+            eps,
+            temperature,
+            y: y.id(),
+        },
+        &ins,
+    );
+    y
+}
+
 pub fn mul(x: &Value, y: &Value) -> Value {
     let r = x.rec();
     assert_eq!(x.ty(), y.ty(), "a product's operands share a type");

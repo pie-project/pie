@@ -65,3 +65,31 @@ def fp8_tensor_leg(reads, name):
     ])
     return out(name + ".bf16")
 
+
+def nvfp4_stacked_bank(reads, w, stem, legs = None):
+    """A routed bank of modelopt NVFP4 experts stored stacked, one tensor a
+    bank: `{stem}` packs `[experts, rows, cols / 2]` e2m1 code pairs beside
+    `{stem}_weight_scale` (an e4m3 per 16 codes), `{stem}_weight_scale_2`
+    (each expert's tensor scale, `[experts]`, or `[experts, legs]` a leg
+    where its gate and up legs stack) and `{stem}_input_scale` (its
+    activations', the same shape: an expert's legs read one activation, so
+    its first leg's is the expert's). A leg's tensor scale lands once a row
+    of it."""
+    if w.dtype not in [dtype.nvfp4, dtype.nvfp4a4]:
+        fail("`{}`: this checkpoint's experts are NVFP4, and this deployment reads them as {}; import the deployment that keeps them NVFP4".format(w.name, w.dtype))
+    count, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    legs = legs if legs != None else 1
+    per_leg = rows // legs
+    counted = scales_shape(w)
+    picks = []
+    for leg in range(legs):
+        picks.extend([leg] * per_leg)
+    # One leg a bank stores its scalars `[experts]`; two, `[experts, legs]`.
+    per_expert = lambda name: src(name) if legs == 1 else src(name).slice(1, 0, 1).transmute([count], F32)
+    per_row = lambda name: (src(name).transmute([count, 1], F32) if legs == 1 else src(name)).gather(1, picks)
+    reads.extend([
+        tensor(w.name, src(stem).transmute(w.shape, grouped(w)), grouped(w)),
+        tensor(scales_name(w.name), src(stem + "_weight_scale"), E4M3, shape = counted, scaling = w),
+        tensor(global_scales_name(w.name), per_row(stem + "_weight_scale_2"), F32, shape = [count, rows], tensor_scaling = w),
+        tensor(input_scales_name(w.name), per_expert(stem + "_input_scale"), F32, shape = [count]),
+    ])

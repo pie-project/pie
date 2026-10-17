@@ -1848,6 +1848,30 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "elemwise",
+        name: "norm_gate",
+        params: &["x", "scale", "res", "gate", "eps", "temperature"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let scale: Option<Weight> = a.next()?;
+            let res: Option<Value> = a.next()?;
+            let gate: Option<Weight> = a.next()?;
+            let eps: f32 = a.next()?;
+            let temperature: f32 = a.next()?;
+            let joined = match (&res, &gate) {
+                (Some(stream), Some(gate)) => Some((stream, gate)),
+                (None, None) => None,
+                _ => anyhow::bail!("`elemwise.norm_gate` takes a residual and its gate together"),
+            };
+            result(
+                heap,
+                dsl("elemwise.norm_gate", || {
+                    ops::elemwise::norm_gate(&x, scale.as_ref(), joined, eps, temperature)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "elemwise",
         name: "rmsnorm_no_scale",
         params: &["x", "head_dim", "eps"],
         call: |a, heap| {

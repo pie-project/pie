@@ -55,6 +55,10 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
+            // Muse Spark's post-norm gate is served on CUDA.
+            Elementwise::NormGate { .. } => Err(kernels_wgpu::Error::Unsupported {
+                op: "elementwise.norm_gate",
+            }),
             Elementwise::RmsnormNoScale {
                 x,
                 head_dim,

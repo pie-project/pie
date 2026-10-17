@@ -1,0 +1,27 @@
+# Muse Spark Open, and its eight-layer, sixteen-expert miniature (the first
+# eight layers of the release, the first sixteen experts of each bank). The
+# release ships bf16, and NVFP4 experts (modelopt's export: e2m1 under an
+# e4m3 scale a 16, its first and last layers' experts kept bf16), served
+# against bf16 activations or, as vLLM serves them, NVFP4 ones under each
+# expert's calibrated input scale.
+
+ATEM = template("atem")
+TOKENIZER = tokenizer(markers = [["<|eot|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"]])
+
+MODELS = [
+    model("muse-spark-open", template = ATEM, tokenizer = TOKENIZER, arch = "muse_spark", layers = 62, vocab = 202048),
+    model("muse-spark-open-mini-l8", mini = True, template = ATEM, tokenizer = TOKENIZER, arch = "muse_spark", layers = 8, vocab = 202048),
+]
+
+NVFP4 = [dtype.bf16, dtype.nvfp4]
+
+NVFP4_A4 = [dtype.bf16, dtype.nvfp4a4]
+
+# An NVFP4 checkpoint identifies as NVFP4 activations, as vLLM serves it.
+DEPLOYMENTS = [
+    deployment("muse-spark-open", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("muse-spark-open", weights = NVFP4_A4, kv = dtype.bf16),
+    deployment("muse-spark-open-mini-l8", weights = NVFP4_A4, kv = dtype.bf16),
+    deployment("muse-spark-open", weights = NVFP4, kv = dtype.bf16),
+    deployment("muse-spark-open-mini-l8", weights = NVFP4, kv = dtype.bf16),
+]

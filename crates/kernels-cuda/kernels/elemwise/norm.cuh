@@ -510,6 +510,79 @@ __global__ void rmsnorm_no_scale(
     }
 }
 
+// Muse Spark's post-norm and residual gate, a block a row of `2048 * RUNS`
+// held in registers: `u = x * scale` rounded to T (`x` with no scale),
+// `n = u / rms(u)` rounded to T, and with a residual `y = alpha * res +
+// beta * n` in f32 (`w = gate / temperature`, `beta = sigmoid(w)`,
+// `alpha = sqrt(max(sigmoid(-w) * (1 + beta), 1e-3))`), else `y = n`.
+template <class T, int RUNS>
+__global__ void __launch_bounds__(256) norm_gate(
+    const T* __restrict__ x,
+    const T* __restrict__ scale,
+    const T* __restrict__ res,
+    const float* __restrict__ gate,
+    T* __restrict__ y,
+    float eps,
+    float temperature,
+    int fan,
+    const u32* __restrict__ win)
+{
+    constexpr int hidden = 2048 * RUNS;
+    // A routed plane holds `fan` rows a token; the window counts tokens.
+    const int row = blockIdx.x;
+    if (win != nullptr && row >= static_cast<int>(win[0]) * fan) return;
+    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) * fan : row;
+    const int at = threadIdx.x * 8;
+    const long long base = static_cast<long long>(plane_row) * hidden;
+    float u[RUNS][8];
+#pragma unroll
+    for (int r = 0; r < RUNS; ++r) {
+        T v[8];
+        *reinterpret_cast<uint4*>(v) = *reinterpret_cast<const uint4*>(x + base + r * 2048 + at);
+        if (scale != nullptr) {
+            T s[8];
+            *reinterpret_cast<uint4*>(s) = *reinterpret_cast<const uint4*>(scale + r * 2048 + at);
+#pragma unroll
+            for (int e = 0; e < 8; ++e)
+                u[r][e] = Elem<T>::to_f32(Elem<T>::from_f32(Elem<T>::to_f32(v[e]) * Elem<T>::to_f32(s[e])));
+        } else {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) u[r][e] = Elem<T>::to_f32(v[e]);
+        }
+    }
+    float local = 0.f;
+#pragma unroll
+    for (int r = 0; r < RUNS; ++r)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) local = fmaf(u[r][e], u[r][e], local);
+    __shared__ float buf[256];
+    const float sum = block_reduce_sum_fast<256>(local, buf);
+    const float inv_rms = rsqrtf(sum / static_cast<float>(hidden) + eps);
+#pragma unroll
+    for (int r = 0; r < RUNS; ++r) {
+        T out[8];
+        if (res == nullptr) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) out[e] = Elem<T>::from_f32(u[r][e] * inv_rms);
+        } else {
+            T rv[8];
+            *reinterpret_cast<uint4*>(rv) = *reinterpret_cast<const uint4*>(res + base + r * 2048 + at);
+            const float4 g0 = *reinterpret_cast<const float4*>(gate + r * 2048 + at);
+            const float4 g1 = *reinterpret_cast<const float4*>(gate + r * 2048 + at + 4);
+            const float g[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const float n = Elem<T>::to_f32(Elem<T>::from_f32(u[r][e] * inv_rms));
+                const float w = g[e] / temperature;
+                const float beta = 1.f / (1.f + __expf(-w));
+                const float alpha = sqrtf(fmaxf((1.f / (1.f + __expf(w))) * (1.f + beta), 1e-3f));
+                out[e] = Elem<T>::from_f32(alpha * Elem<T>::to_f32(rv[e]) + beta * n);
+            }
+        }
+        *reinterpret_cast<uint4*>(y + base + r * 2048 + at) = *reinterpret_cast<const uint4*>(out);
+    }
+}
+
 // `rmsnorm_no_scale` a warp a (row, head) unit, landing what the 256-thread
 // block form lands bit for bit: lane `l` takes the sums of the block's
 // threads `l`, `l + 32`, ... (each its elements `t`, `t + 256`, ... in

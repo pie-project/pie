@@ -44,6 +44,7 @@ mod the_mini_dit_row_bakes;
 mod the_mini_dit_tap_exports_an_intermediate;
 mod the_minimax_h3_import_reads_the_fl2va_index;
 mod the_minimax_h3_rows_bake;
+mod the_muse_spark_rows_bake;
 mod the_qwen4_text_reads_the_full_two_bit_flash;
 mod the_qwen_3_gguf_reads_gdn_heads_in_block_order;
 mod the_second_row_axis_costs_the_first_nothing;

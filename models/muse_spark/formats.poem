@@ -1,0 +1,43 @@
+# How a Muse Spark Open checkpoint is laid out: transformers' names, the text
+# model under `model.language_model.`, each layer's experts one stacked bank
+# a leg (bf16, or modelopt's NVFP4 under its scales).
+
+load("//lib/modelopt/formats.poem", "nvfp4_stacked_bank")
+
+TRUNK = "model.language_model."
+
+def formats(m):
+    return [format("huggingface", read = lambda reads: huggingface(m, reads))]
+
+def huggingface(m, reads):
+    at = lambda leaf: TRUNK + leaf
+    reads.read(m.embed, at("embed_tokens.weight"))
+    reads.read(m.final_norm, at("norm.weight"))
+    reads.read(m.lm_head, "lm_head.weight")
+    for l, w in enumerate(m.layers):
+        n = lambda leaf: "{}layers.{}.{}".format(TRUNK, l, leaf)
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        reads.read_concat(w.qkv, [
+            n("self_attn.q_proj.weight"),
+            n("self_attn.k_proj.weight"),
+            n("self_attn.v_proj.weight"),
+        ])
+        reads.read(w.gate, n("self_attn.gate_proj.weight"))
+        reads.read(w.o_proj, n("self_attn.o_proj.weight"))
+        reads.read(w.attn_gate, n("post_attention_residual_gate.gate"))
+        reads.read(w.pre_ffw_norm, n("pre_feedforward_layernorm.weight"))
+        # A post norm's scale is stored as its offset from one.
+        reads.read_over(w.post_ffw_scale, n("post_feedforward_layernorm.weight"), lambda x: x.bias(1.0))
+        reads.read(w.ffw_gate, n("post_feedforward_residual_gate.gate"))
+        reads.read(w.router, n("mlp.gate.weight"))
+        reads.read(w.router_bias, n("mlp.gate.e_score_correction_bias"))
+        reads.read(w.pool, n("mlp.pre_expert_proj.weight"))
+        reads.read(w.pool_norm, n("mlp.pre_expert_norm.weight"))
+        reads.read_over(w.expert_scale, n("mlp.experts.post_expert_norm.weight"), lambda x: x.bias(1.0))
+        reads.read(w.unpool, n("mlp.post_expert_proj.weight"))
+        for bank, leg in [(w.gate_up, "gate_up_proj"), (w.down, "down_proj")]:
+            stem = n("mlp.experts." + leg)
+            if bank.dtype == dtype.bf16:
+                reads.read(bank, stem)
+            else:
+                nvfp4_stacked_bank(reads, bank, stem, legs = 2 if leg == "gate_up_proj" else 1)
