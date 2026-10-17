@@ -22,27 +22,16 @@ const W4A8: Tuning = Tuning { moe_w4a8_fused_from: 1, ..SM100 };
 /// under atom-laid scales after a W4A8 read-back, and the W4A8 and W4A4
 /// selects that quantize their rows.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum K {
-    Bf16,
-    Affine,
-    Mx,
-    MxBias,
-    Nv,
-    Atoms,
-    A8,
-    A4,
-}
+#[rustfmt::skip]
+enum K { Bf16, Affine, Mx, MxBias, Nv, Atoms, A8, A4 }
 
 /// The act_quant bank of `codes` and `atoms`, `[e][n][k]` MXFP4, or NVFP4
 /// under an expert's `alpha` (where it lands, input and tensor scales).
 fn bank(codes: u64, atoms: u64, [e, n, k]: [usize; 3], alpha: Option<[u64; 3]>) -> Bank {
     let (experts, n, k, elem) = (e as u32, n as u32, k as u32, Elem::E2m1);
     let [alpha_e, input_scales, tensor_scales] = alpha.unwrap_or_default();
-    let from = AlphaFrom {
-        input_scales,
-        tensor_scales,
-        rows: n,
-    };
+    #[rustfmt::skip]
+    let from = AlphaFrom { input_scales, tensor_scales, rows: n };
     let (gran, alpha_from) = (pick(alpha.is_some(), 16, 32), alpha.map(|_| from));
     #[rustfmt::skip]
     let bank = Bank { codes, atoms, experts, n, k, elem, gran, alpha_e, alpha_from };
@@ -137,13 +126,9 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
         (K::Atoms, _) => {
             let xb = read_back(&ctx, "test", fmt, Source::rows(x, None), back).expect("reads");
             a = b.read(back, rows_x * k);
-            let mut fire = || moe::select_mxfp4_atoms(&ctx, xb, mx, atoms, r, &mut y);
-            let fired = if flags & 8 != 0 {
-                moe::keeping_order(fire)
-            } else {
-                fire()
-            };
-            fired.map(took)
+            let mut go = || moe::select_mxfp4_atoms(&ctx, xb, mx, atoms, r, &mut y);
+            let keep = flags & 8 != 0;
+            (if keep { moe::keeping_order(go) } else { go() }).map(took)
         }
         _ => {
             let globals = nv.then(|| t(inputs, ex, 1, F32));
@@ -168,29 +153,22 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
     let a_of = |r: usize, i: usize| a[pick(quant, r, r / div) * k + i];
     let e_of = |r: usize| routes[r].clamp(0, ex as i32 - 1) as usize;
     let gain = |r: usize| pick(kind == K::A4, f64::from(input[e_of(r)]), 1.0);
-    let w_of = |r: usize, c: usize, i: usize| f64::from(w[(e_of(r) * rows + c) * k + i]);
+    let w_of = |r: usize, c: usize, i: usize| f64::from(w[(e_of(r) * rows + c) * k + i]) * gain(r);
     let d = dot([live, rows, k], a_of, w_of);
     let bias = |r: usize, c: usize| pick(kind == K::MxBias, bv[e_of(r) * rows + c], 0.0);
-    let v = |r: usize, c: usize| (gain(r) * d[r * rows + c].0 + bias(r, c), d[r * rows + c].1);
+    let v = |r: usize, c: usize| (d[r * rows + c].0 + bias(r, c), d[r * rows + c].1);
     let glu = |r: usize, c: usize| f.map_or_else(|| v(r, c), |g| glu_want(g, v(r, c), v(r, n + c)));
-    let want = tab(live * n, |i| {
-        pick(routes[i / n] < 0, (0.0, 0.0), glu(i / n, i % n))
-    });
-    let (got, tol) = (
-        b.read(y.ptr, count * n),
-        pick(flags & 4 != 0, 4.0 * TOL, TOL),
-    );
+    let want_at = |i: usize| pick(routes[i / n] < 0, (0.0, 0.0), glu(i / n, i % n));
+    let (got, want) = (b.read(y.ptr, count * n), tab(live * n, want_at));
+    let tol = pick(flags & 4 != 0, 4.0 * TOL, TOL);
     check(&got[..live * n], &want, tol, &what);
-    let untouched = got[live * n..]
-        .iter()
-        .all(|&v| v == f64::from(from_bf16(0x7f7f)));
+    let sentinel = f64::from(from_bf16(0x7f7f));
+    let untouched = got[live * n..].iter().all(|&v| v == sentinel);
     assert!(untouched, "{what}: past the window");
     if flags & 8 != 0 {
         // The row-major select after takes the kept route order.
-        let (x, mut y) = (
-            pick(kind == K::Atoms, t(back, rows_x, k, Bf16), x),
-            b.out(count, rows),
-        );
+        let x = pick(kind == K::Atoms, t(back, rows_x, k, Bf16), x);
+        let mut y = b.out(count, rows);
         moe::matmul_select_quant(&ctx, x, mx, sc, None, r, &mut y, SEAT).expect("fires");
         b.check(y.ptr, &d, TOL, &format!("{what}: the select after"));
     }
@@ -208,10 +186,8 @@ fn the_routed_selects_answer_the_routed_dot() {
     #[rustfmt::skip]
     let nv_mma = Tuning { nvfp4_mma_until: 65_536, mxfp4_cvt: true, ..TC5 };
     let (sw, f, t) = (Some(Glu::Swiglu), false, true);
-    let alpha = Some(Glu::SwigluClampAlpha {
-        limit: 7.0,
-        alpha: 1.702,
-    });
+    #[rustfmt::skip]
+    let alpha = Some(Glu::SwigluClampAlpha { limit: 1e4, alpha: 1.702 });
     #[rustfmt::skip]
     let mut cases: Vec<Case> = vec![
         // bf16: the GEMV by token and by route (past grid.y's 65535 routes),
@@ -274,25 +250,17 @@ fn mlp_bank(b: &mut Bench, a: u8, [ex, rows, k]: [usize; 3]) -> (GluBank, Vec<f3
     let plane = |b: &mut Bench, v: &[u8], w: usize| t(b.up(v), ex, w, U8);
     if a == 16 {
         let (codes, atoms, w) = fp8_bank(b, ex * rows, k, 0x71 ^ k as u64);
-        let (codes, atoms) = (
-            t(codes, ex, rows * k, E4m3),
-            t(atoms, ex, rows * k / 128, U8),
-        );
+        let codes = t(codes, ex, rows * k, E4m3);
+        let atoms = t(atoms, ex, rows * k / 128, U8);
         return (GluBank::Fp8A8 { codes, atoms }, w);
     }
     let gran = pick(a == 4, 16, 32);
-    let s = b.side(
-        pick(a == 0, Elem::Bf16, Elem::E2m1),
-        (a != 0).then_some(gran),
-        ex * rows,
-        k,
-    );
+    let elem = pick(a == 0, Elem::Bf16, Elem::E2m1);
+    let s = b.side(elem, (a != 0).then_some(gran), ex * rows, k);
     let (codes, w) = (plane(b, &s.bytes, rows * k / 2), values(&s, k));
     let atoms = s.scales.as_ref().map_or(&s.codes, |x| &x.0);
-    let (atoms, scales) = (
-        plane(b, atoms, rows * k / gran),
-        plane(b, &s.codes, rows * k / gran),
-    );
+    let width = rows * k / gran;
+    let (atoms, scales) = (plane(b, atoms, width), plane(b, &s.codes, width));
     // W4A4's tensor scale an expert's rows, and input scale an expert.
     let ts = tab(ex * rows, |r| 0.01 + (r / rows) as f32 / 1024.0);
     let input = tab(ex, |e| 0.004 + 0.003 * e as f32);
@@ -339,15 +307,10 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         let (gates, gv) = b.bf16(tokens);
         let (up, uw) = mlp_bank(&mut b, a, [ex, 2 * inter, hidden]);
         let (down, dw) = mlp_bank(&mut b, a, [ex, hidden, inter]);
-        let (x, mut y, it) = (
-            t(x, tokens, hidden, Bf16),
-            b.out(tokens, hidden),
-            inter as u32,
-        );
-        let (r, wt) = (
-            t(b.up(&routes), tokens, top, I32),
-            t(b.up(&weights), tokens, top, F32),
-        );
+        let (x, it) = (t(x, tokens, hidden, Bf16), inter as u32);
+        let mut y = b.out(tokens, hidden);
+        let r = t(b.up(&routes), tokens, top, I32);
+        let wt = t(b.up(&weights), tokens, top, F32);
         let ctx = b.ctx().with_tuning(pick(a < 4, TC5, W4A8));
         if let Some((live, first)) = window {
             ctx.arm_stage(b.up(&[live, first]));
@@ -358,16 +321,11 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
             Some(true) => moe::experts_weighted_first(&ctx, x, up, g, down, r, wt, it, st, &mut y),
             _ => moe::experts(&ctx, x, up, g, down, r, wt, it, &mut y, RES, RES, gate.map(|_| (st, gt))),
         };
-        assert!(
-            took.expect("fires"),
-            "{what}: the grouped GEMM takes the fire"
-        );
+        assert!(took.expect("fires"), "{what}: the grouped GEMM takes it");
         let upv = |e: usize, o: usize, i: usize| f64::from(uw[(e * 2 * inter + o) * hidden + i]);
         let downv = |e: usize, o: usize, c: usize| f64::from(dw[(e * hidden + o) * inter + c]);
-        let (shared, first) = (
-            gate.map(|f| (&sv[..], (!f).then_some(&gv[..]))),
-            gate == Some(true),
-        );
+        let shared = gate.map(|f| (&sv[..], (!f).then_some(&gv[..])));
+        let first = gate == Some(true);
         #[rustfmt::skip]
         let want = mlp(&xv, (&routes, &weights), [hidden, inter, top], upv, downv, g, first, shared);
         let (lo, hi) = window.map_or((0, tokens), |(l, f)| (f as usize, (f + l) as usize));

@@ -58,11 +58,8 @@ fn operand(
 /// A dense product of `m` rows, or `e` experts' contiguous, or masked
 /// (`m_max` rows each).
 #[derive(Clone, Copy, Debug)]
-enum Lay {
-    D(usize),
-    C(usize),
-    M(usize, usize),
-}
+#[rustfmt::skip]
+enum Lay { D(usize), C(usize), M(usize, usize) }
 
 /// One case: the operands (an affine weight `(U4, group)`), the layout,
 /// `[n, k]`, the GLU, a row scale, the plan (`None`: chosen) and the tuning
@@ -81,13 +78,8 @@ fn run((a, w, lay, [n, k], f, rs, plan, tun): Case) {
     };
     // Each expert's rows: none, a few, a block and a half, ...; at offsets
     // in whole 64s contiguous, in `m_max`s masked.
-    let count = |x: usize| {
-        pick(
-            dense,
-            mm,
-            [0, 5, 150, 37, 64, 1][x % 6].min(pick(mm > 0, mm, 300)),
-        )
-    };
+    let few = |x: usize| [0, 5, 150, 37, 64, 1][x % 6].min(pick(mm > 0, mm, 300));
+    let count = |x: usize| pick(dense, mm, few(x));
     let mut off = vec![0usize];
     for x in 0..e {
         off.push(off[x] + pick(mm > 0, mm, count(x).next_multiple_of(64)));
@@ -105,10 +97,8 @@ fn run((a, w, lay, [n, k], f, rs, plan, tun): Case) {
         Lay::C(_) => Some(Groups::Contiguous { offsets: b.up(&offs), rows: rows as u32 }),
         Lay::M(..) => Some(Groups::Masked { counts: b.up(&counts), m_max: mm as u32 }),
     };
-    let (wrows, mixed) = (
-        n << u8::from(f.is_some()),
-        a.0 == Elem::Bf16 && w.1.is_some(),
-    );
+    let wrows = n << u8::from(f.is_some());
+    let mixed = a.0 == Elem::Bf16 && w.1.is_some();
     let (w_op, wt, ts) = if w.0 == Elem::U4 {
         let g = w.1.expect("a group");
         let (s, fs, zs) = affine(&mut b.lcg, [e * wrows, k, g, 4]);
@@ -120,23 +110,16 @@ fn run((a, w, lay, [n, k], f, rs, plan, tun): Case) {
         (op, s, ts)
     };
     // A masked activation's scale atoms pad each expert to whole blocks.
-    let at = |r: usize| {
-        pick(
-            dense || mm == 0,
-            r,
-            r / mm.max(1) * mm.next_multiple_of(128) + r % mm.max(1),
-        )
-    };
+    let pad = |r: usize| r / mm * mm.next_multiple_of(128) + r % mm;
+    let at = |r: usize| if dense || mm == 0 { r } else { pad(r) };
     let mut act = b.side(a.0, a.1, rows, k);
     let (a_op, _) = operand(&mut b, &mut act, a, false, k, at);
     let (alpha, ae) = (
         pick(mixed, 1.0, 0.5),
-        tab(e, |x| 0.5 + 0.25 * (x % 3) as f32),
+        tab(e, |x| 0.5 + (x % 3) as f32 / 4.0),
     );
-    let ((bias, bv), rsv) = (
-        b.bf16(e * wrows),
-        tab(rows, |r| 0.25 + (r % 7) as f32 / 8.0),
-    );
+    let rsv = tab(rows, |r| 0.25 + (r % 7) as f32 / 8.0);
+    let (bias, bv) = b.bf16(e * wrows);
     // Each routed row's dot, through the bias, the GLU and the row scale.
     let gain = |x: usize| f64::from(alpha * pick(dense || mixed, 1.0, ae[x]));
     let a_of = |j: usize, i: usize| f64::from(act.value(rows_of[j].0, k, i)) * gain(rows_of[j].1);
@@ -145,18 +128,13 @@ fn run((a, w, lay, [n, k], f, rs, plan, tun): Case) {
     let bias_of = |j: usize, c: usize| pick(mixed, bv[rows_of[j].1 * wrows + c], 0.0);
     let v = |j: usize, c: usize| (d[j * wrows + c].0 + bias_of(j, c), d[j * wrows + c].1);
     let glu = |j: usize, c: usize| f.map_or_else(|| v(j, c), |f| glu_want(f, v(j, c), v(j, n + c)));
+    let scale = |j: usize| pick(rs, f64::from(rsv[rows_of[j].0]), 1.0);
+    let scaled = |(x, s): (f64, f64), r: f64| (x * r, s * r);
     let wants = tab(rows_of.len() * n, |i| {
-        let ((x, s), r) = (
-            glu(i / n, i % n),
-            pick(rs, f64::from(rsv[rows_of[i / n].0]), 1.0),
-        );
-        (x * r, s * r)
+        scaled(glu(i / n, i % n), scale(i / n))
     });
-    let (y, row_scale, bias) = (
-        b.up(&vec![NAN; (rows + 1) * n]),
-        pick(rs, b.up(&rsv), 0),
-        pick(mixed, bias, 0),
-    );
+    let y = b.up(&vec![NAN; (rows + 1) * n]);
+    let (row_scale, bias) = (pick(rs, b.up(&rsv), 0), pick(mixed, bias, 0));
     #[rustfmt::skip]
     let epi = Epilogue { glu: f, row_scale, bias, weight_scale: ts, ..Epilogue::STORE };
     let (k128, tickets) = (tun & 1 != 0, pick(tun & 2 != 0, 65_536, 0));
@@ -171,11 +149,8 @@ fn run((a, w, lay, [n, k], f, rs, plan, tun): Case) {
             }
             Some(groups) => {
                 let alpha_e = pick(mixed, 0, alpha_e);
-                let g = Grouped {
-                    experts: e as u32,
-                    groups,
-                    alpha_e,
-                };
+                #[rustfmt::skip]
+                let g = Grouped { experts: e as u32, groups, alpha_e };
                 let plan = plan.unwrap_or_else(|| Plan::grouped(&g, n32, k32, m, 148));
                 grouped_gemm_epi_with(ctx, a_op, w_op, y, g, [n32, k32], alpha * s, epi, plan)
             }
@@ -184,12 +159,8 @@ fn run((a, w, lay, [n, k], f, rs, plan, tun): Case) {
     };
     fire(&ctx, 1.0);
     let got = b.read(y, (rows + 1) * n);
-    check(
-        &tab(wants.len(), |i| got[rows_of[i / n].0 * n + i % n]),
-        &wants,
-        TOL,
-        &what,
-    );
+    let landed = tab(wants.len(), |i| got[rows_of[i / n].0 * n + i % n]);
+    check(&landed, &wants, TOL, &what);
     // Rows past the product's are not touched.
     for &(from, to) in past.iter().filter(|_| !mixed && f.is_none()) {
         let nan = got[from * n..to * n].iter().all(|v| v.is_nan());
@@ -231,29 +202,14 @@ fn the_tcgen05_gemm_answers_the_dequantized_dot_every_case() {
         eprintln!("skipped: no tcgen05 on this device");
         return;
     }
-    let (sw, geglu, no) = (Some(Glu::Swiglu), Some(Glu::GegluTanh), None);
-    let clamp = Some(Glu::SwigluClamp { limit: 7.0 });
-    let alpha = Some(Glu::SwigluClampAlpha {
-        limit: 7.0,
-        alpha: 1.702,
-    });
-    let (situ, bare) = (
-        Glu::Situ {
-            beta: 4.0,
-            cap: 25.0,
-        },
-        Glu::Situ {
-            beta: 1.0,
-            cap: 0.0,
-        },
-    );
-    let (situ, bare) = (Some(situ), Some(bare));
-    let (u32_, u64_, u128_) = (
-        (Elem::U4, Some(32)),
-        (Elem::U4, Some(64)),
-        (Elem::U4, Some(128)),
-    );
-    let (f, t) = (false, true);
+    let (sw, geglu, no, f, t) = (Some(Glu::Swiglu), Some(Glu::GegluTanh), None, false, true);
+    #[rustfmt::skip]
+    let (clamp, alpha) = (Glu::SwigluClamp { limit: 7.0 }, Glu::SwigluClampAlpha { limit: 7.0, alpha: 1.702 });
+    #[rustfmt::skip]
+    let (situ, bare) = (Glu::Situ { beta: 4.0, cap: 25.0 }, Glu::Situ { beta: 1.0, cap: 0.0 });
+    let (clamp, alpha, situ, bare) = (Some(clamp), Some(alpha), Some(situ), Some(bare));
+    let u = |g: usize| (Elem::U4, Some(g));
+    let (u32_, u64_, u128_) = (u(32), u(64), u(128));
     #[rustfmt::skip]
     let cases: &[Case] = &[
         // Dense: each kind, each Q tile, swapped at decode widths, paired;
@@ -328,16 +284,11 @@ fn a_dependent_gemm_reads_what_its_producer_landed() {
     let mut b = Bench::new(0xd9);
     let (x, w1, w2) = (b.bf16(m * k).0, b.bf16(n * k).0, b.bf16(n2 * n).0);
     let (h, out, bf) = (b.zeros(m * n * 2), b.zeros(m * n2 * 2), |at| {
-        Operand::plain(at, Elem::Bf16)
+        Operand::plain(at, BF.0)
     });
-    let (s1, s2) = (
-        [m as u32, n as u32, k as u32],
-        [m as u32, n2 as u32, n as u32],
-    );
-    let unsplit = |s: [u32; 3]| Plan {
-        splits: 1,
-        ..Plan::choose(s[0], s[1], s[2], 148)
-    };
+    let [s1, s2] = [[m, n, k], [m, n2, n]].map(|s| s.map(|v| v as u32));
+    #[rustfmt::skip]
+    let unsplit = |s: [u32; 3]| Plan { splits: 1, ..Plan::choose(s[0], s[1], s[2], 148) };
     let chain = |ctx: &Ctx, alpha: f32| {
         gemm_with(ctx, bf(x), bf(w1), h, s1, alpha, unsplit(s1)).expect("the producer fires");
         gemm_with(ctx, bf(h), bf(w2), out, s2, 1.0, unsplit(s2)).expect("the dependent fires");

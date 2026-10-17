@@ -24,6 +24,11 @@ pub fn tab<T>(n: usize, f: impl FnMut(usize) -> T) -> Vec<T> {
     (0..n).map(f).collect()
 }
 
+/// `(0..n).map(f)`, summed.
+pub fn sum(n: usize, f: impl FnMut(usize) -> f64) -> f64 {
+    (0..n).map(f).sum()
+}
+
 /// `a` where `c` holds, else `b`.
 pub fn pick<T>(c: bool, a: T, b: T) -> T {
     if c { a } else { b }
@@ -217,13 +222,8 @@ pub fn quant_e4m3(block: &[f32]) -> (Vec<u8>, u8) {
     let amax = block.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-4);
     let bits = (amax * (1.0 / 448.0)).to_bits();
     let e = ((bits >> 23) & 0xff) as i32 - 127 + i32::from(bits & 0x7f_ffff != 0);
-    let s = 2f32.powi(e);
-    (
-        tab(block.len(), |i| {
-            to_e4m3((block[i] / s).clamp(-448.0, 448.0))
-        }),
-        (e + 127) as u8,
-    )
+    let q = |v: f32| to_e4m3((v / 2f32.powi(e)).clamp(-448.0, 448.0));
+    (tab(block.len(), |i| q(block[i])), (e + 127) as u8)
 }
 
 /// The NVFP4 recipe of one 16-block under global `gs`: its e2m1 codes and
@@ -257,17 +257,13 @@ pub fn mlp(
     let mut y = vec![0f64; routes.len() / top * hidden];
     for (r, &e) in routes.iter().enumerate() {
         let (t, e, wt) = (r / top, e as usize, f64::from(weights[r]));
-        let row = |o: usize| {
-            (0..hidden)
-                .map(|i| x[t * hidden + i] * up(e, o, i))
-                .sum::<f64>()
-        };
+        let row = |o: usize| sum(hidden, |i| x[t * hidden + i] * up(e, o, i));
         let h = tab(inter, |c| {
             let v = glu(f, row(c), row(inter + c)) * if first { wt } else { 1.0 };
             f64::from(from_bf16(to_bf16(v as f32)))
         });
         for o in 0..hidden {
-            let v = (0..inter).map(|c| h[c] * down(e, o, c)).sum::<f64>();
+            let v = sum(inter, |c| h[c] * down(e, o, c));
             y[t * hidden + o] += if first { v } else { wt * v };
         }
     }
