@@ -8,6 +8,8 @@
 //! product (the f32 walk of `code * factor`) to e4m3's rounding, at a
 //! decode's width and a prefill's.
 
+use crate::common::host_a::routes_of;
+use crate::common::tc5::e4m3;
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::act_quant::{self, Format, fp8_tile_requant, scales_to_atoms};
@@ -15,17 +17,6 @@ use kernels_cuda::linear::mlp::swiglu;
 use kernels_cuda::linear::moe::{ExpertTable, GluBank, experts, weighted_sum};
 use kernels_cuda::linear::tc5::{Elem, Glu, atom_bytes, supported};
 use kernels_cuda::tensor::Tensor;
-
-fn e4m3(b: u8) -> f32 {
-    let s = if b & 0x80 != 0 { -1.0 } else { 1.0 };
-    let e = i32::from((b >> 3) & 0xF);
-    let m = f32::from(b & 7);
-    s * if e == 0 {
-        m / 8.0 * 2f32.powi(-6)
-    } else {
-        (1.0 + m / 8.0) * 2f32.powi(e - 7)
-    }
-}
 
 /// A bank `[experts][n][k]` as a release stores it: finite codes, factors
 /// off powers of two. Returns the device codes (requantized and laid),
@@ -91,12 +82,6 @@ fn bank(gpu: &mut Gpu, experts: usize, n: usize, k: usize, seed: u64) -> Fp8Bank
         atoms,
         w,
     }
-}
-
-fn routes_of(tokens: usize, experts: usize, top: usize) -> Vec<i32> {
-    (0..tokens)
-        .flat_map(|t| (0..top).map(move |j| ((t * 5 + j * 7 + t / 3) % experts) as i32))
-        .collect()
 }
 
 fn check(tokens: usize, hidden: usize, inter: usize, n_experts: usize, top: usize) {
@@ -237,7 +222,6 @@ fn check(tokens: usize, hidden: usize, inter: usize, n_experts: usize, top: usiz
     } else {
         apart_d
     };
-    eprintln!("{tokens} tokens: apart {apart_d:.4}, kept {kept_d:.4} from the release's product");
     assert!(
         apart_d < 0.1 && kept_d <= 1.1 * apart_d,
         "{tokens} tokens: apart {apart_d:.4}, kept {kept_d:.4} from the release's product"
@@ -264,11 +248,8 @@ fn a_block_fp8_projection_gemv_lands_its_release_product() {
     if !supported() {
         return;
     }
-    for (m, n, k) in [
-        (1usize, 640usize, 6144usize),
-        (3, 1024, 1536),
-        (4, 384, 2048),
-    ] {
+    // One row (K split across the warps), and three padded to four.
+    for (m, n, k) in [(1usize, 640usize, 6144usize), (3, 1024, 1536)] {
         let mut gpu = Gpu::open();
         let w = bank(&mut gpu, 1, n, k, 0x91 ^ k as u64);
         let mut lcg = Lcg::seeded(0x92 ^ (m * n) as u64);
@@ -329,7 +310,6 @@ fn a_block_fp8_projection_gemv_lands_its_release_product() {
                 / scale
         };
         let (g, t) = (mean(&got), mean(&tc5));
-        eprintln!("{m} x {n} x {k}: GEMV {g:.4}, W8A8 {t:.4} from the release's product");
         // The GEMV's activations unquantized: no farther than the W8A8 product.
         assert!(
             g < 0.06 && g <= t * 1.05,

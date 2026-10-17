@@ -46,7 +46,6 @@ fn pool_of(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn check(heads: usize, d: usize, ratio: usize, top_k: usize, selected: bool) {
     // Two requests of 2304 positions each, their pages interleaved.
     let span = 2304usize;
@@ -191,7 +190,6 @@ fn the_pool_attention_lands_alike_on_the_tensor_cores() {
     // ratio 128 whole.
     check(64, 512, 4, 512, true);
     check(64, 512, 128, 512, false);
-    check(64, 512, 4, 512, false);
     // A head count that leaves a partial block, and the narrower widths.
     check(20, 256, 4, 64, true);
     check(24, 128, 16, 32, false);

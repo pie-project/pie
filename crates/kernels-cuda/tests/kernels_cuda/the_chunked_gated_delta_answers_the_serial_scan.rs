@@ -1,5 +1,8 @@
 #![cfg(feature = "cuda")]
 
+//! The chunked gated delta rule, on every prefill path, answers the serial
+//! scan: its output and its final states.
+
 use crate::common;
 
 use common::{Gpu, Lcg};
@@ -33,44 +36,35 @@ const PLAIN: Case = Case {
     window: None,
 };
 
+/// A plain fire; a request several chunks long at a three-way head fan; a
+/// replay that starts inside a row, commits a prefix and folds only the
+/// lanes its predicate names; a staged window, read and landed past its
+/// base and seated past its first seat.
 #[test]
 fn the_chunked_gated_delta_answers_the_serial_scan() {
-    check(&PLAIN);
-}
-
-/// A request several chunks long carries its state across them, at a
-/// three-way head fan.
-#[test]
-fn the_chunked_gated_delta_carries_the_state_across_chunks() {
-    check(&Case {
-        lens: &[300, 64, 129],
-        k_heads: 2,
-        v_heads: 6,
-        ..PLAIN
-    });
-}
-
-/// A replay that starts inside a row, commits a prefix of it, and folds only
-/// the lanes its predicate names answers the serial scan on the same seats.
-#[test]
-fn the_chunked_gated_delta_honours_the_begin_the_commit_and_the_fold_predicate() {
-    check(&Case {
-        commit_len: Some(&[50, 9, 100]),
-        begin_at: Some(&[3, 0, 64]),
-        folds: Some(&[1, 0, 1]),
-        ..PLAIN
-    });
-}
-
-/// A staged window reads and lands its rows past the window's base and
-/// seats its lanes past the window's first seat.
-#[test]
-fn the_chunked_gated_delta_reads_and_lands_where_the_window_says() {
-    check(&Case {
-        commit_len: Some(&[0, 70, 4, 120]),
-        window: Some((7, 1)),
-        ..PLAIN
-    });
+    let cases = [
+        PLAIN,
+        Case {
+            lens: &[300, 64, 129],
+            k_heads: 2,
+            v_heads: 6,
+            ..PLAIN
+        },
+        Case {
+            commit_len: Some(&[50, 9, 100]),
+            begin_at: Some(&[3, 0, 64]),
+            folds: Some(&[1, 0, 1]),
+            ..PLAIN
+        },
+        Case {
+            commit_len: Some(&[0, 70, 4, 120]),
+            window: Some((7, 1)),
+            ..PLAIN
+        },
+    ];
+    for case in &cases {
+        check(case);
+    }
 }
 
 /// Each case runs every prefill path: the three wmma launches every card
@@ -280,8 +274,5 @@ fn check_on(case: &Case, fused: Arm) {
     assert!(
         worst_state < 3e-2,
         "{fused:?}: the final states differ by {worst_state}"
-    );
-    eprintln!(
-        "chunked ({fused:?}) vs serial: worst output error {worst}, worst state error {worst_state}"
     );
 }

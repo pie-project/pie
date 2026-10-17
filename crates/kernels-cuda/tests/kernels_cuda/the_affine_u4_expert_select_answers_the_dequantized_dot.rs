@@ -1,5 +1,8 @@
 #![cfg(feature = "cuda")]
 
+//! The routed affine u4 select (a bf16 scale and bias a group of 64), on
+//! the old arms and on tcgen05, answers the dequantized dot.
+
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::moe::{GroupSeat, matmul_select_quant};
@@ -55,56 +58,10 @@ fn bank(lcg: &mut Lcg, experts: usize, n: usize, k: usize) -> Bank {
     }
 }
 
+/// A fire of `tokens` routed `top_k` ways; past 16 routes the weights read
+/// as bf16 (the grouped kernels' operand).
+#[allow(clippy::too_many_arguments)]
 fn check(
-    experts: usize,
-    n: usize,
-    k: usize,
-    tokens: usize,
-    top_k: usize,
-    by_token: bool,
-    seed: u64,
-) {
-    check_with(
-        experts,
-        n,
-        k,
-        tokens,
-        top_k,
-        by_token,
-        seed,
-        tokens * top_k >= 16,
-    );
-}
-
-/// Each case on the old arm and on the tcgen05 one (where the device has it).
-#[allow(clippy::too_many_arguments)]
-fn check_with(
-    experts: usize,
-    n: usize,
-    k: usize,
-    tokens: usize,
-    top_k: usize,
-    by_token: bool,
-    seed: u64,
-    bf16_weights: bool,
-) {
-    for tuning in [Tuning::DEFAULT, crate::common::TC5] {
-        check_with_tuned(
-            tuning,
-            experts,
-            n,
-            k,
-            tokens,
-            top_k,
-            by_token,
-            seed,
-            bf16_weights,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn check_with_tuned(
     tuning: Tuning,
     experts: usize,
     n: usize,
@@ -113,8 +70,8 @@ fn check_with_tuned(
     top_k: usize,
     by_token: bool,
     seed: u64,
-    bf16_weights: bool,
 ) {
+    let bf16_weights = tokens * top_k >= 16;
     let mut lcg = Lcg::seeded(seed);
     let bank = bank(&mut lcg, experts, n, k);
     let act_rows = if by_token { tokens } else { tokens * top_k };
@@ -164,8 +121,7 @@ fn check_with_tuned(
     gpu.sync();
     let got: Vec<u16> = gpu.down(y_at, tokens * top_k * n);
 
-    let mut worst = 0f32;
-    let mut bad = 0usize;
+    let mut bad = Vec::new();
     for route in 0..tokens * top_k {
         let e = routes[route] as usize;
         let xr = if by_token { route / top_k } else { route };
@@ -181,59 +137,37 @@ fn check_with_tuned(
                 want += w * x[xr * k + c];
             }
             let g = from_bf16(got[route * n + r]);
-            worst = worst.max((g - want).abs() / want.abs().max(1.0));
             if !close(g, want) {
-                bad += 1;
-                if bad <= 5 {
-                    eprintln!("route {route} (expert {e}) row {r}: got {g} want {want}");
-                }
+                bad.push((route, r, g, want));
             }
         }
     }
-    assert_eq!(
-        bad,
-        0,
-        "{bad} of {} outputs differ from the dequantized dot (worst relative error {worst:.4})",
-        tokens * top_k * n
+    assert!(
+        bad.is_empty(),
+        "{} of {} outputs differ from the dequantized dot; first (route, row, got, want) {:?}",
+        bad.len(),
+        tokens * top_k * n,
+        &bad[..bad.len().min(5)]
     );
-    eprintln!("ok: worst relative error {worst:.5}");
 }
 
 #[test]
 fn the_affine_u4_expert_select_answers_the_dequantized_dot_every_case() {
-    the_up_leg_read_by_token();
-    the_up_leg_read_by_token_at_one_token_takes_the_gemv();
-    the_down_leg_read_by_route_over_eleven_groups();
-    the_down_leg_read_by_route_at_one_token_takes_the_gemv();
-    every_expert_of_the_full_bank_is_addressed();
-    a_wide_fire_takes_the_grouped_kernel_on_the_up_leg();
-    a_wide_fire_takes_the_grouped_kernel_on_the_down_leg_with_ragged_tiles();
-}
-
-fn the_up_leg_read_by_token() {
-    check(16, 1408, 2816, 3, 8, true, 0x51);
-}
-
-fn the_up_leg_read_by_token_at_one_token_takes_the_gemv() {
-    check(16, 1408, 2816, 1, 8, true, 0x54);
-}
-
-fn the_down_leg_read_by_route_over_eleven_groups() {
-    check(16, 2816, 704, 3, 8, false, 0x52);
-}
-
-fn the_down_leg_read_by_route_at_one_token_takes_the_gemv() {
-    check(16, 2816, 704, 1, 8, false, 0x55);
-}
-
-fn every_expert_of_the_full_bank_is_addressed() {
-    check(128, 64, 704, 16, 8, true, 0x53);
-}
-
-fn a_wide_fire_takes_the_grouped_kernel_on_the_up_leg() {
-    check_with(16, 1408, 2816, 40, 8, true, 0x61, true);
-}
-
-fn a_wide_fire_takes_the_grouped_kernel_on_the_down_leg_with_ragged_tiles() {
-    check_with(16, 200, 704, 40, 8, false, 0x62, true);
+    // (experts, n, k, tokens, top k, read by token, seed): the GEMV at one
+    // token on the up and down legs, the per-route select over eleven
+    // groups, every expert of a full bank addressed, and a wide fire on the
+    // grouped kernel (the down leg's tiles ragged).
+    let cases = [
+        (16, 1408, 2816, 1, 8, true, 0x54),
+        (16, 2816, 704, 1, 8, false, 0x55),
+        (16, 2816, 704, 3, 8, false, 0x52),
+        (128, 64, 704, 16, 8, true, 0x53),
+        (16, 1408, 2816, 40, 8, true, 0x61),
+        (16, 200, 704, 40, 8, false, 0x62),
+    ];
+    for (experts, n, k, tokens, top_k, by_token, seed) in cases {
+        for tuning in [Tuning::DEFAULT, crate::common::TC5] {
+            check(tuning, experts, n, k, tokens, top_k, by_token, seed);
+        }
+    }
 }

@@ -1,5 +1,9 @@
 #![cfg(feature = "cuda")]
 
+//! The ragged attention arm over a query table and a key table of their
+//! own (cross-attention, empty groups on either side) answers the host
+//! softmax at each head width, and refuses tables of two lengths.
+
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn_ragged::{self, RaggedMask};
@@ -118,58 +122,26 @@ fn check(hd: u32, q_heads: u32, kv_heads: u32, q_sizes: &[u32], kv_sizes: &[u32]
     .expect("the ragged arm fires across two tables");
     gpu.sync();
     let got: Vec<u16> = gpu.down(o_at, q_rows * qw);
-    let mut worst = 0f32;
     for r in 0..q_rows {
         for c in 0..qw {
             let (g, w) = (from_bf16(got[r * qw + c]), want[r * qw + c]);
-            let err = (g - w).abs();
             assert!(
-                err <= TOLERANCE * w.abs().max(1.0),
+                (g - w).abs() <= TOLERANCE * w.abs().max(1.0),
                 "head width {hd}: row {r} column {c} landed {g} against {w}"
             );
-            worst = worst.max(err);
         }
     }
-    eprintln!(
-        "head width {hd}, {q_heads}/{kv_heads} heads, q {q_sizes:?} over kv {kv_sizes:?}: \
-         worst |diff| {worst:.2e}"
-    );
 }
 
 #[test]
 fn the_ragged_arm_serves_cross_attention_every_case() {
-    the_ragged_arm_serves_cross_attention_at_head_width_64();
-    the_ragged_arm_serves_cross_attention_at_head_width_128();
-    the_ragged_arm_serves_cross_attention_at_head_width_256();
-    the_ragged_arm_refuses_tables_of_two_lengths();
+    let (q_sizes, kv_sizes) = (&[7, 0, 200, 300, 3], &[300, 40, 0, 500, 1]);
+    for (hd, q_heads, kv_heads) in [(64, 4, 2), (128, 4, 2), (256, 2, 1)] {
+        check(hd, q_heads, kv_heads, q_sizes, kv_sizes, u64::from(hd));
+    }
 }
 
-fn the_ragged_arm_serves_cross_attention_at_head_width_64() {
-    check(64, 4, 2, &[7, 0, 200, 300, 3], &[300, 40, 0, 500, 1], 0x64);
-}
-
-fn the_ragged_arm_serves_cross_attention_at_head_width_128() {
-    check(
-        128,
-        4,
-        2,
-        &[7, 0, 200, 300, 3],
-        &[300, 40, 0, 500, 1],
-        0x128,
-    );
-}
-
-fn the_ragged_arm_serves_cross_attention_at_head_width_256() {
-    check(
-        256,
-        2,
-        1,
-        &[7, 0, 200, 300, 3],
-        &[300, 40, 0, 500, 1],
-        0x256,
-    );
-}
-
+#[test]
 fn the_ragged_arm_refuses_tables_of_two_lengths() {
     let mut gpu = Gpu::open();
     let q_at = gpu.zeros(8 * 128 * 2);

@@ -12,24 +12,12 @@
 use crate::common::Gpu;
 use dtype::Dtype;
 use kernels_cuda::linear::moe::{dequantize_fp8b128, quantize_fp8b128};
-use kernels_cuda::linear::tc5;
+use kernels_cuda::linear::tc5::{self, atom_offset};
 use kernels_cuda::tensor::Tensor;
 
 /// An e4m3 code's value.
 fn e4m3(b: u8) -> f64 {
-    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
-    let e = i32::from((b >> 3) & 0xF);
-    let m = f64::from(b & 0x7);
-    sign * if e == 0 {
-        m / 8.0 * 2f64.powi(-6)
-    } else {
-        (1.0 + m / 8.0) * 2f64.powi(e - 7)
-    }
-}
-
-/// The byte of scale `(row, col)` in tcgen05's atom layout of `cols` columns.
-fn atom_offset(row: usize, col: usize, cols: usize) -> usize {
-    (row / 128 * cols.div_ceil(4) + col / 4) * 512 + (row % 32) * 16 + (row / 32 % 4) * 4 + col % 4
+    f64::from(crate::common::tc5::e4m3(b))
 }
 
 /// A bf16's value.
@@ -239,7 +227,7 @@ fn every_dsv4_wo_a_block_requantizes_to_the_checkpoints_values() {
         .collect();
     let checkpoint = ztensor_compat::index_all(&shards).expect("the checkpoint indexes");
     let served = ztensor_compat::index(&artifact).expect("the artifact indexes");
-    let (mut total, mut drops, mut layers) = (0usize, [0usize; 4], 0usize);
+    let mut layers = 0usize;
     let mut differ = Vec::new();
     let mut gpu = Gpu::open();
     for l in 0.. {
@@ -288,22 +276,9 @@ fn every_dsv4_wo_a_block_requantizes_to_the_checkpoints_values() {
         }
         let (got, atoms) = requantize(&mut gpu, &bits, rows, k);
         let t = tally(&codes, &scales, &got, &atoms, rows, k);
-        total += (rows / 128) * blocks;
-        for (d, n) in t.drops.iter().enumerate() {
-            drops[d] += n;
-        }
         differ.extend(t.differ.iter().map(|&(rb, kb)| (l, rb, kb)));
         layers += 1;
     }
-    println!(
-        "{layers} layers, {total} blocks: {} differ; exponents kept {}, one lower {}, two {}, \
-         three or more {}",
-        differ.len(),
-        drops[0],
-        drops[1],
-        drops[2],
-        drops[3]
-    );
     assert!(layers > 0, "the checkpoint holds wo_a");
     assert!(
         differ.is_empty(),

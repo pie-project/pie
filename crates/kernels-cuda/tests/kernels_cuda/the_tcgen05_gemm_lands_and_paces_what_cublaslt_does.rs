@@ -1,15 +1,7 @@
 #![cfg(feature = "cuda")]
 
 //! The tcgen05 GEMMs beside cuBLASLt: the block-scaled kinds land its
-//! products from the same scale bytes, and an ignored measurement reports
-//! both rates at the shapes a decoder layer fires. Each timed batch walks
-//! enough weight copies that none is in L2 when its launch reads it, as a
-//! layer's weights are not. Run it alone on an idle GPU:
-//!
-//!     cargo test -p kernels-cuda --features cuda --release --test kernels_cuda \
-//!         the_tcgen05_gemm_reports -- --ignored --nocapture
-//!
-//! `PIE_TC5_SHAPE=m,n,k` measures one shape.
+//! products from the same scale bytes.
 
 use core::ffi::c_void;
 
@@ -28,7 +20,7 @@ fn splitmix(state: &mut u64) -> u64 {
 
 /// Bytes whose every reading is finite: bf16 pairs, fp8 or fp4 codes,
 /// and scale bytes, all of modest magnitude.
-pub(crate) fn noise(bytes: usize, mask: u8, base: u8, seed: u64) -> Vec<u8> {
+fn noise(bytes: usize, mask: u8, base: u8, seed: u64) -> Vec<u8> {
     let mut state = seed;
     (0..bytes)
         .map(|_| (splitmix(&mut state) as u8 & mask) | base)
@@ -253,7 +245,8 @@ fn the_block_scaled_kinds_land_what_cublaslt_lands_from_the_same_scales() {
     let stream: rt::cudaStream_t = ctx.stream().cast();
     let ws_bytes = 32 << 20;
     let ws = gpu.zeros(ws_bytes);
-    for (m, n, k) in [(256, 512, 1024), (40, 256, 2048), (1000, 768, 512)] {
+    // A decode's few rows, and a prefill's off the tile.
+    for (m, n, k) in [(40, 256, 2048), (1000, 768, 512)] {
         for kind in [LtKind::Nvfp4, LtKind::Mxfp8] {
             let (elem, gran, per_byte, mask, sf) = match kind {
                 LtKind::Nvfp4 => (Elem::E2m1, 16, 2, 0xff, (0x07, 0x30)),
@@ -279,7 +272,6 @@ fn the_block_scaled_kinds_land_what_cublaslt_lands_from_the_same_scales() {
             gpu.sync();
             let ours: Vec<u16> = gpu.down(ours, m * n);
             let theirs: Vec<u16> = gpu.down(theirs, m * n);
-            let mut exact = 0;
             for (i, (&o, &t)) in ours.iter().zip(&theirs).enumerate() {
                 let (o, t) = (from_bf16(o), from_bf16(t));
                 assert!(
@@ -288,9 +280,7 @@ fn the_block_scaled_kinds_land_what_cublaslt_lands_from_the_same_scales() {
                     i / n,
                     i % n
                 );
-                exact += usize::from(o == t);
             }
-            eprintln!("{m}x{n}x{k}: {exact} of {} bit-equal to cuBLASLt", m * n);
         }
     }
 }

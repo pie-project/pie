@@ -1,5 +1,8 @@
 #![cfg(feature = "cuda")]
 
+//! The tensor-core 3-D conv lands what the direct kernel lands, and the
+//! unnamed entry takes it where the shape vectorises.
+
 use crate::common::spatial::{Box3, near, out_boxes, table};
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
@@ -71,45 +74,30 @@ fn run(c_in: usize, c_out: usize, boxes: &[Box3], conv: Conv3d) {
     );
 }
 
+/// Over a causal cached block, and strided off the tile boundaries.
 #[test]
 fn the_tensor_core_conv_lands_what_the_direct_kernel_lands_every_case() {
-    the_two_kernels_agree_over_a_causal_cached_block();
-    the_two_kernels_agree_off_the_tile_boundaries();
-    the_unnamed_entry_takes_the_tensor_cores_on_a_vectorisable_shape();
+    let causal = Conv3d {
+        k: [3, 3, 3],
+        stride: [1, 1, 1],
+        pad: [2, 1, 1],
+        pad_back: [2, 1, 1],
+        causal_t: true,
+        time_pad: TimePad::Zero,
+    };
+    run(64, 64, &[Box3::new(3, 9, 17), Box3::new(2, 7, 13)], causal);
+    let strided = Conv3d {
+        k: [3, 3, 3],
+        stride: [2, 2, 2],
+        pad: [1, 1, 1],
+        pad_back: [1, 1, 1],
+        causal_t: false,
+        time_pad: TimePad::Zero,
+    };
+    run(40, 72, &[Box3::new(2, 11, 19), Box3::new(3, 5, 7)], strided);
 }
 
-fn the_two_kernels_agree_over_a_causal_cached_block() {
-    run(
-        64,
-        64,
-        &[Box3::new(3, 9, 17), Box3::new(2, 7, 13)],
-        Conv3d {
-            k: [3, 3, 3],
-            stride: [1, 1, 1],
-            pad: [2, 1, 1],
-            pad_back: [2, 1, 1],
-            causal_t: true,
-            time_pad: TimePad::Zero,
-        },
-    );
-}
-
-fn the_two_kernels_agree_off_the_tile_boundaries() {
-    run(
-        40,
-        72,
-        &[Box3::new(2, 11, 19), Box3::new(3, 5, 7)],
-        Conv3d {
-            k: [3, 3, 3],
-            stride: [2, 2, 2],
-            pad: [1, 1, 1],
-            pad_back: [1, 1, 1],
-            causal_t: false,
-            time_pad: TimePad::Zero,
-        },
-    );
-}
-
+#[test]
 fn the_unnamed_entry_takes_the_tensor_cores_on_a_vectorisable_shape() {
     let (c_in, c_out) = (32usize, 40usize);
     let boxes = [Box3::new(2, 5, 9)];

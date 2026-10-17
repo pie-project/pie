@@ -1,68 +1,16 @@
 #![cfg(feature = "cuda")]
 
-use core::ffi::c_void;
-
-use crate::common::{Gpu, Lcg, from_bf16};
+use crate::common::host_a::upload_to as upload;
+use crate::common::{Gpu, Lcg, captured, forget, from_bf16, replay};
 use dtype::Dtype;
 use kernels_cuda::attn_ragged::{self, RaggedMask};
-use kernels_cuda::cudarc::runtime::sys as rt;
 use kernels_cuda::tensor::Tensor;
 
 const TOLERANCE: f32 = 1.0e-2;
 
-fn check(code: rt::cudaError, call: &str) {
-    assert_eq!(
-        code,
-        rt::cudaError::cudaSuccess,
-        "`{call}` answered {code:?}"
-    );
-}
-
-fn upload(at: u64, values: &[u16]) {
-    let _legacy = crate::common::legacy();
-    unsafe {
-        check(
-            rt::cudaMemcpy(
-                at as *mut c_void,
-                values.as_ptr().cast(),
-                core::mem::size_of_val(values),
-                rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
-            ),
-            "cudaMemcpy H2D",
-        );
-    }
-}
-
-fn upload_u32(at: u64, values: &[u32]) {
-    let _legacy = crate::common::legacy();
-    unsafe {
-        check(
-            rt::cudaMemcpy(
-                at as *mut c_void,
-                values.as_ptr().cast(),
-                core::mem::size_of_val(values),
-                rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
-            ),
-            "cudaMemcpy H2D",
-        );
-    }
-}
-
-fn upload_i32(at: u64, values: &[i32]) {
-    let _legacy = crate::common::legacy();
-    unsafe {
-        check(
-            rt::cudaMemcpy(
-                at as *mut c_void,
-                values.as_ptr().cast(),
-                core::mem::size_of_val(values),
-                rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
-            ),
-            "cudaMemcpy H2D",
-        );
-    }
-}
-
+/// A ragged attention captured once replays over new values, and over a
+/// seat whose window leaves its first group out (that group keeps the last
+/// replay's bytes).
 #[test]
 fn the_ragged_arm_replays_from_a_captured_graph() {
     let hd = 128u32;
@@ -119,31 +67,11 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
     fire(&ctx, o_at).expect("the warm fire");
     gpu.sync();
 
-    let stream = ctx.stream();
-    let alone = crate::common::capturing();
-    let exec = unsafe {
-        check(
-            rt::cudaStreamBeginCapture(
-                stream.cast(),
-                rt::cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal,
-            ),
-            "cudaStreamBeginCapture",
-        );
-        let fired = fire(&ctx, o_at);
-        let mut graph: rt::cudaGraph_t = core::ptr::null_mut();
-        check(
-            rt::cudaStreamEndCapture(stream.cast(), &raw mut graph),
-            "cudaStreamEndCapture",
-        );
-        fired.expect("the entry fires under capture (the slab was warmed)");
-        let mut exec: rt::cudaGraphExec_t = core::ptr::null_mut();
-        check(
-            rt::cudaGraphInstantiateWithFlags(&raw mut exec, graph, 0),
-            "cudaGraphInstantiateWithFlags",
-        );
-        exec
-    };
-    drop(alone);
+    let mut fired = None;
+    let exec = captured(&ctx, || fired = Some(fire(&ctx, o_at)));
+    fired
+        .expect("the capture ran its body")
+        .expect("the entry fires under capture (the slab was warmed)");
 
     let (q1, _) = lcg.row(rows * qw);
     let (k1, _) = lcg.row(rows * kw);
@@ -153,9 +81,7 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
     upload(v_at, &v1);
     ctx.disarm_stage();
     fire(&ctx, o_eager).expect("the eager twin");
-    unsafe {
-        check(rt::cudaGraphLaunch(exec, stream.cast()), "cudaGraphLaunch");
-    }
+    replay(&ctx, exec);
     gpu.sync();
     let want: Vec<u16> = gpu.down(o_eager, rows * qw);
     let got: Vec<u16> = gpu.down(o_at, rows * qw);
@@ -173,14 +99,12 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
     upload(q_at, &q2);
     upload(k_at, &k2);
     upload(v_at, &v2);
-    upload_u32(win_at, &[rows as u32, 0, 2, 1]);
+    upload(win_at, &[rows as u32, 0, 2, 1]);
     let mut emptied = table.clone();
     emptied[0] = emptied[1];
-    upload_i32(table_at, &emptied);
+    upload(table_at, &emptied);
     fire(&ctx, o_eager).expect("the eager twin over the rewritten table");
-    unsafe {
-        check(rt::cudaGraphLaunch(exec, stream.cast()), "cudaGraphLaunch");
-    }
+    replay(&ctx, exec);
     gpu.sync();
     let want: Vec<u16> = gpu.down(o_eager, rows * qw);
     let got2: Vec<u16> = gpu.down(o_at, rows * qw);
@@ -198,7 +122,5 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
             split + i
         );
     }
-    unsafe {
-        rt::cudaGraphExecDestroy(exec);
-    }
+    forget(exec);
 }

@@ -6,33 +6,16 @@ use kernels_cuda::attn::ssm;
 use kernels_cuda::layout;
 use kernels_cuda::tensor::{RecurrentPool, Tensor};
 
+/// The causal conv update answers the convolution and shifts each lane's
+/// window: where the fire folds, nowhere when it buffers its rows (a
+/// rejected draft has nothing to roll back), on the lanes a predicate
+/// names, and on the per-channel arm a channel count off the eight-wide
+/// vector takes.
 #[test]
-fn the_conv_update_and_the_row_cut_move_whole_vectors_every_case() {
-    the_conv_update_convolves_the_window_and_shifts_it();
-    the_conv_update_leaves_the_window_when_the_fire_buffers_its_rows();
-    the_conv_update_shifts_the_window_where_the_fire_folds();
-    the_conv_update_leaves_the_window_on_the_per_channel_arm_too();
-    the_row_cut_lands_both_halves();
-    the_row_cut_lands_both_halves_past_the_grid_y_ceiling();
-}
-
 fn the_conv_update_convolves_the_window_and_shifts_it() {
     conv_update(true, None, 64);
-}
-
-/// A speculative window buffers its rows unfolded: the step answers the
-/// convolution and leaves every lane's window where it found it, so a
-/// rejected draft has nothing to roll back.
-fn the_conv_update_leaves_the_window_when_the_fire_buffers_its_rows() {
     conv_update(false, None, 64);
-}
-
-fn the_conv_update_shifts_the_window_where_the_fire_folds() {
     conv_update(true, Some([1, 0, 1]), 64);
-}
-
-/// A channel count off the eight-wide vector takes the per-channel arm.
-fn the_conv_update_leaves_the_window_on_the_per_channel_arm_too() {
     conv_update(false, Some([0, 1, 1]), 60);
 }
 
@@ -117,10 +100,17 @@ fn conv_update(write_state: bool, mask: Option<[u8; 3]>, channels: usize) {
     }
 }
 
+/// The row cut lands both halves, also past the grid's 65535-row y ceiling.
+#[test]
 fn the_row_cut_lands_both_halves() {
-    let (rows, left_w, right_w) = (5u32, 48usize, 80usize);
+    row_cut(5, &[0, 1, 2, 3, 4]);
+    row_cut(65_600, &[0, 1, 65_534, 65_535, 65_536, 65_599]);
+}
+
+fn row_cut(rows: u32, probes: &[usize]) {
+    let (left_w, right_w) = (48usize, 80usize);
     let total = left_w + right_w;
-    let mut lcg = Lcg::seeded(0x5e);
+    let mut lcg = Lcg::seeded(0x5e ^ u64::from(rows));
     let (x_raw, _) = lcg.row(rows as usize * total);
     let mut gpu = Gpu::open();
     let x_at = gpu.up(&x_raw);
@@ -139,42 +129,7 @@ fn the_row_cut_lands_both_halves() {
     gpu.sync();
     let got_l: Vec<u16> = gpu.down(l_at, rows as usize * left_w);
     let got_r: Vec<u16> = gpu.down(r_at, rows as usize * right_w);
-    for r in 0..rows as usize {
-        assert_eq!(
-            &got_l[r * left_w..(r + 1) * left_w],
-            &x_raw[r * total..r * total + left_w]
-        );
-        assert_eq!(
-            &got_r[r * right_w..(r + 1) * right_w],
-            &x_raw[r * total + left_w..(r + 1) * total]
-        );
-    }
-}
-
-fn the_row_cut_lands_both_halves_past_the_grid_y_ceiling() {
-    let (rows, left_w, right_w) = (65_600u32, 48usize, 80usize);
-    let total = left_w + right_w;
-    let mut lcg = Lcg::seeded(0x71);
-    let (x_raw, _) = lcg.row(rows as usize * total);
-    let mut gpu = Gpu::open();
-    let x_at = gpu.up(&x_raw);
-    let l_at = gpu.zeros(rows as usize * left_w * 2);
-    let r_at = gpu.zeros(rows as usize * right_w * 2);
-    let mut left = Tensor::new(l_at, rows, left_w as u32, Dtype::Bf16);
-    let mut right = Tensor::new(r_at, rows, right_w as u32, Dtype::Bf16);
-    layout::split_rows(
-        &gpu.ctx(),
-        Tensor::new(x_at, rows, total as u32, Dtype::Bf16),
-        left_w as u32,
-        &mut left,
-        &mut right,
-    )
-    .expect("the cut fires at 65_600 rows");
-    gpu.sync();
-    let got_l: Vec<u16> = gpu.down(l_at, rows as usize * left_w);
-    let got_r: Vec<u16> = gpu.down(r_at, rows as usize * right_w);
-    let probes = [0usize, 1, 65_534, 65_535, 65_536, rows as usize - 1];
-    for r in probes {
+    for &r in probes {
         assert_eq!(
             &got_l[r * left_w..(r + 1) * left_w],
             &x_raw[r * total..r * total + left_w],

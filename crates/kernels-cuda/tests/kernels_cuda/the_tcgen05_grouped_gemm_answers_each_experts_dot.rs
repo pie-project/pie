@@ -1,11 +1,15 @@
 #![cfg(feature = "cuda")]
 
+//! The grouped tcgen05 GEMM, contiguous and masked, on each operand format
+//! and plan, answers each expert's host dot and leaves padding rows alone.
+
 use crate::common::tc5::{Side, random, side};
 use crate::common::{Gpu, Lcg, from_bf16};
 use kernels_cuda::linear::tc5::{
     Elem, GROUP_ALIGN, Grouped, Groups, Operand, Plan, gemm_with, grouped_gemm, grouped_gemm_with,
     masked_atom_bytes, supported,
 };
+use kernels_cuda::tuning::Tuning;
 
 type Spec = (Elem, Option<usize>);
 
@@ -58,7 +62,6 @@ fn check_row(
     e: usize,
     [n, k]: [usize; 2],
     alpha: f32,
-    worst: &mut f32,
 ) {
     let alpha = alpha * b.alpha_e[e];
     for c in 0..n {
@@ -71,7 +74,6 @@ fn check_row(
         let want = (dot * f64::from(alpha)) as f32;
         let slack = want.abs() / 128.0 + (mass * f64::from(alpha)) as f32 * 1e-5 + 1e-6;
         let g = from_bf16(got[r * n + c]);
-        *worst = worst.max((g - want).abs() / slack);
         assert!(
             (g - want).abs() <= slack,
             "{what}: y[{r}][{c}] (expert {e}) = {g}, want {want} (slack {slack})"
@@ -79,7 +81,24 @@ fn check_row(
     }
 }
 
-fn contiguous(a: Spec, w: Spec, experts: usize, [n, k]: [usize; 2], plan: Option<Plan>) {
+/// The registry's tuning with NVFP4 at 128 K a stage (`k128`) and split
+/// tiles summed by their last split (`tickets`) as asked.
+fn tuning(k128: bool, tickets: bool) -> Tuning {
+    Tuning {
+        gemm_nvfp4_k128: k128,
+        gemm_tc5_split_tickets: if tickets { 65_536 } else { 0 },
+        ..Tuning::DEFAULT
+    }
+}
+
+fn contiguous(
+    a: Spec,
+    w: Spec,
+    experts: usize,
+    [n, k]: [usize; 2],
+    plan: Option<Plan>,
+    tuning: Tuning,
+) {
     let what = format!("contiguous {a:?} x {w:?} e={experts} n={n} k={k} {plan:?}");
     let mut lcg = Lcg::seeded(0xc0 ^ (n * k + experts) as u64);
     let mut bits = 0xc0 ^ k as u64;
@@ -118,15 +137,7 @@ fn contiguous(a: Spec, w: Spec, experts: usize, [n, k]: [usize; 2], plan: Option
     let y = gpu.up(&vec![NAN; rows * n]);
     let routed = counts.iter().sum::<usize>() as u32;
     let shape = [n as u32, k as u32];
-    let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
-        gemm_nvfp4_k128: K128.load(std::sync::atomic::Ordering::Relaxed),
-        gemm_tc5_split_tickets: if TICKETS.load(std::sync::atomic::Ordering::Relaxed) {
-            65_536
-        } else {
-            0
-        },
-        ..kernels_cuda::tuning::Tuning::DEFAULT
-    });
+    let ctx = gpu.ctx().with_tuning(tuning);
     match plan {
         Some(plan) => grouped_gemm_with(&ctx, a_op, w_op, y, g, shape, 0.75, plan),
         None => grouped_gemm(&ctx, a_op, w_op, y, g, shape, 0.75, routed),
@@ -134,21 +145,28 @@ fn contiguous(a: Spec, w: Spec, experts: usize, [n, k]: [usize; 2], plan: Option
     .unwrap_or_else(|e| panic!("{what}: {e}"));
     gpu.sync();
     let got: Vec<u16> = gpu.down(y, rows * n);
-    let mut worst = 0f32;
     for e in 0..experts {
         for i in 0..counts[e] {
             let r = offsets[e] + i;
-            check_row(&what, &got, r, &act, r, &b, e, [n, k], 0.75, &mut worst);
+            check_row(&what, &got, r, &act, r, &b, e, [n, k], 0.75);
         }
     }
     assert!(
         got[offsets[experts] * n..].iter().all(|&v| v == NAN),
         "{what}: a row past the routed ones moved"
     );
-    eprintln!("{what}: worst error {worst:.3} of the slack");
 }
 
-fn masked(a: Spec, w: Spec, experts: usize, m_max: usize, [n, k]: [usize; 2], splits: u32) {
+#[allow(clippy::too_many_arguments)]
+fn masked(
+    a: Spec,
+    w: Spec,
+    experts: usize,
+    m_max: usize,
+    [n, k]: [usize; 2],
+    splits: u32,
+    tickets: bool,
+) {
     let what =
         format!("masked {a:?} x {w:?} e={experts} m_max={m_max} n={n} k={k} splits={splits}");
     let mut lcg = Lcg::seeded(0x3a5 ^ (n * k + m_max) as u64);
@@ -192,24 +210,16 @@ fn masked(a: Spec, w: Spec, experts: usize, m_max: usize, [n, k]: [usize; 2], sp
             148,
         )
     };
-    let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
-        gemm_tc5_split_tickets: if TICKETS.load(std::sync::atomic::Ordering::Relaxed) {
-            65_536
-        } else {
-            0
-        },
-        ..kernels_cuda::tuning::Tuning::DEFAULT
-    });
+    let ctx = gpu.ctx().with_tuning(tuning(false, tickets));
     grouped_gemm_with(&ctx, a_op, w_op, y, g, [n as u32, k as u32], 1.25, plan)
         .unwrap_or_else(|e| panic!("{what}: {e}"));
     gpu.sync();
     let got: Vec<u16> = gpu.down(y, rows * n);
-    let mut worst = 0f32;
     for e in 0..experts {
         for i in 0..m_max {
             let r = e * m_max + i;
             if i < counts[e] {
-                check_row(&what, &got, r, &act, r, &b, e, [n, k], 1.25, &mut worst);
+                check_row(&what, &got, r, &act, r, &b, e, [n, k], 1.25);
             } else {
                 assert!(
                     got[r * n..(r + 1) * n].iter().all(|&v| v == NAN),
@@ -219,12 +229,16 @@ fn masked(a: Spec, w: Spec, experts: usize, m_max: usize, [n, k]: [usize; 2], sp
             }
         }
     }
-    eprintln!("{what}: worst error {worst:.3} of the slack");
 }
 
 /// A contiguous grouped GEMM lands what a loop of dense GEMMs over each
 /// expert's rows and weight lands.
+#[test]
 fn the_contiguous_group_lands_what_a_loop_of_dense_gemms_lands() {
+    if !supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
     let (experts, n, k) = (6usize, 512usize, 1024usize);
     let spec = (Elem::E4m3, Some(128));
     let mut lcg = Lcg::seeded(0x100);
@@ -289,7 +303,6 @@ fn the_contiguous_group_lands_what_a_loop_of_dense_gemms_lands() {
     gpu.sync();
     let grouped: Vec<u16> = gpu.down(grouped, rows * n);
     let looped: Vec<u16> = gpu.down(looped, rows * n);
-    let (mut equal, mut all) = (0, 0);
     for e in 0..experts {
         for r in offsets[e]..offsets[e] + counts[e] {
             for c in 0..n {
@@ -298,20 +311,10 @@ fn the_contiguous_group_lands_what_a_loop_of_dense_gemms_lands() {
                     (g - l).abs() <= l.abs() / 64.0 + 1e-3,
                     "expert {e}: y[{r}][{c}] grouped {g}, looped {l}"
                 );
-                equal += usize::from(g == l);
-                all += 1;
             }
         }
     }
-    eprintln!("contiguous vs dense loop: {equal} of {all} bit-equal");
 }
-
-/// The contiguous cases' `kernel.gemm.nvfp4_k128`: NVFP4 at 128 K a stage.
-static K128: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Split tiles summed by their last split (`kernel.gemm.tc5_split_tickets`)
-/// in place of the routed finalize.
-static TICKETS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[test]
 fn the_tcgen05_grouped_gemm_answers_each_experts_dot_every_case() {
@@ -324,81 +327,53 @@ fn the_tcgen05_grouped_gemm_answers_each_experts_dot_every_case() {
     let ds = (Elem::E4m3, Some(128));
     let nv = (Elem::E2m1, Some(16));
     let w4 = (Elem::E2m1, Some(32));
+    let plain = tuning(false, false);
     for (a, w) in [(bf, bf), (f8, f8), (ds, ds), (nv, nv), (ds, w4)] {
-        contiguous(a, w, 8, [256, 512], None);
-        masked(a, w, 8, 16, [256, 512], 0);
+        contiguous(a, w, 8, [256, 512], None, plain);
+        masked(a, w, 8, 16, [256, 512], 0, false);
     }
-    // NVFP4 at 128 K a stage (64-byte rows), a ragged K tail and a K split.
-    K128.store(true, std::sync::atomic::Ordering::Relaxed);
-    contiguous(nv, nv, 8, [256, 512], None);
-    contiguous(nv, nv, 3, [640, 640], None);
-    let lone = |bn| {
-        Some(Plan {
-            swap: false,
-            pair: false,
-            bn,
-            stages: 0,
-            splits: 0,
-        })
+    let lone = |bn| Plan {
+        swap: false,
+        pair: false,
+        bn,
+        stages: 0,
+        splits: 0,
     };
-    contiguous(bf, bf, 5, [384, 520], lone(128));
-    contiguous(ds, ds, 4, [512, 1152], lone(256));
-    contiguous(
-        nv,
-        nv,
-        3,
-        [640, 768],
-        Some(Plan {
-            splits: 3,
-            ..lone(128).unwrap()
-        }),
-    );
-    K128.store(false, std::sync::atomic::Ordering::Relaxed);
+    // NVFP4 at 128 K a stage (64-byte rows), a ragged K tail and a K split.
+    let k128 = tuning(true, false);
+    contiguous(nv, nv, 3, [640, 640], None, k128);
+    let split3 = Some(Plan {
+        splits: 3,
+        ..lone(128)
+    });
+    contiguous(nv, nv, 3, [640, 768], split3, k128);
+    contiguous(bf, bf, 5, [384, 520], Some(lone(128)), plain);
+    contiguous(ds, ds, 4, [512, 1152], Some(lone(256)), plain);
     // Swapped: the bank on P, an expert's rows on 64-row Q tiles (a
-    // decode's select), NVFP4, DeepSeek's fp8 1x128 and its W4A8.
+    // decode's select).
+    let swapped = Some(Plan {
+        swap: true,
+        splits: 1,
+        ..lone(64)
+    });
     for (a, w) in [(nv, nv), (ds, ds), (ds, w4)] {
-        contiguous(
-            a,
-            w,
-            8,
-            [256, 512],
-            Some(Plan {
-                swap: true,
-                splits: 1,
-                ..lone(64).unwrap()
-            }),
-        );
+        contiguous(a, w, 8, [256, 512], swapped, plain);
     }
     // CTA pairs: 256-row tiles, each CTA its expert's next 128 rows.
     let pair = Some(Plan {
         pair: true,
-        ..lone(256).unwrap()
+        ..lone(256)
     });
     for (a, w) in [(bf, bf), (ds, ds), (nv, nv), (ds, w4)] {
-        contiguous(a, w, 6, [512, 1024], pair);
+        contiguous(a, w, 6, [512, 1024], pair, plain);
     }
-    masked(bf, bf, 6, 1, [384, 4104], 1);
-    masked(bf, bf, 6, 1, [384, 4104], 0);
-    masked(nv, nv, 12, 40, [256, 2048], 4);
-    masked(ds, w4, 5, 130, [128, 1024], 2);
-    masked(ds, ds, 7, 64, [640, 512], 1);
-    // The split cases again, each tile summed by its last split.
-    TICKETS.store(true, std::sync::atomic::Ordering::Relaxed);
-    masked(bf, bf, 6, 1, [384, 4104], 0);
-    masked(nv, nv, 12, 40, [256, 2048], 4);
-    masked(ds, w4, 5, 130, [128, 1024], 2);
-    K128.store(true, std::sync::atomic::Ordering::Relaxed);
-    contiguous(
-        nv,
-        nv,
-        3,
-        [640, 768],
-        Some(Plan {
-            splits: 3,
-            ..lone(128).unwrap()
-        }),
-    );
-    K128.store(false, std::sync::atomic::Ordering::Relaxed);
-    TICKETS.store(false, std::sync::atomic::Ordering::Relaxed);
-    the_contiguous_group_lands_what_a_loop_of_dense_gemms_lands();
+    // Masked K splits, the routed finalize and each tile summed by its
+    // last split.
+    masked(bf, bf, 6, 1, [384, 4104], 0, false);
+    masked(ds, ds, 7, 64, [640, 512], 1, false);
+    for tickets in [false, true] {
+        masked(nv, nv, 12, 40, [256, 2048], 4, tickets);
+        masked(ds, w4, 5, 130, [128, 1024], 2, tickets);
+    }
+    contiguous(nv, nv, 3, [640, 768], split3, tuning(true, true));
 }

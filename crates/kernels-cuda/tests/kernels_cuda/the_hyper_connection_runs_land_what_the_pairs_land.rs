@@ -1,9 +1,10 @@
 #![cfg(feature = "cuda")]
 
-// The hyper-connection mix and inject read and write whole 16-byte runs
-// where the row width and the planes allow them, and an element at a time
-// otherwise. Both land the same bits: the runs are fired on aligned planes,
-// the element walk on the same values one element further in.
+//! The hyper-connection mix and inject, the routed SwiGLU and sum, the
+//! packed GeGLU and the logit soft cap read and write whole 16-byte runs
+//! where the row width and the planes allow them, and an element at a time
+//! otherwise. Both land the same bits: the runs are fired on aligned planes,
+//! the element walk on the same values one element further in.
 
 use crate::common::{Gpu, Lcg};
 use dtype::Dtype;
@@ -13,6 +14,15 @@ use kernels_cuda::tensor::Tensor;
 const ROWS: usize = 5;
 const STREAMS: usize = 4;
 const WIDTH: usize = 264;
+
+/// `v` one element further in: element `1` of the upload is element `0`.
+fn shifted(v: &[u16]) -> Vec<u16> {
+    [&[0u16][..], v].concat()
+}
+
+fn t(at: u64, rows: usize, width: usize) -> Tensor {
+    Tensor::new(at, rows as u32, width as u32, Dtype::Bf16)
+}
 
 #[test]
 fn the_hyper_connection_runs_land_what_the_pairs_land() {
@@ -24,9 +34,6 @@ fn the_hyper_connection_runs_land_what_the_pairs_land() {
     let (o, _) = rng.row(ROWS * WIDTH + 1);
     let (hyper, _) = rng.row(wide + 1);
     let (logits, _) = rng.row(ROWS * STREAMS);
-    // Element `1` of each plane is element `0` of the aligned one: the same
-    // values one element further in, so no plane there is 16-byte aligned.
-    let shifted = |v: &[u16]| -> Vec<u16> { [&[0u16][..], v].concat() };
     let (g_at, n_at) = (gpu.up(&gates), gpu.up(&normed));
     let (g1_at, n1_at) = (gpu.up(&shifted(&gates)), gpu.up(&shifted(&normed)));
     let (o_at, o1_at) = (gpu.up(&o), gpu.up(&shifted(&o)));
@@ -35,9 +42,6 @@ fn the_hyper_connection_runs_land_what_the_pairs_land() {
     let y_at = gpu.zeros(ROWS * WIDTH * 2 + 16);
     let y1_at = gpu.zeros(ROWS * WIDTH * 2 + 16);
     let ctx = gpu.ctx();
-    let t = |at: u64, rows: usize, width: usize| {
-        Tensor::new(at, rows as u32, width as u32, Dtype::Bf16)
-    };
     for (g, n, y) in [(g_at, n_at, y_at), (g1_at + 2, n1_at + 2, y1_at + 2)] {
         hc::mix(
             &ctx,
@@ -68,8 +72,7 @@ fn the_hyper_connection_runs_land_what_the_pairs_land() {
     assert_ne!(h, hyper[..wide], "the inject moved the streams");
 }
 
-// The routed SwiGLU and the routed weighted sum take the same 16-byte runs
-// and land the same bits as their element walks.
+/// The routed SwiGLU and the routed weighted sum.
 #[test]
 fn the_routed_swiglu_and_sum_runs_land_what_the_elements_land() {
     use kernels_cuda::linear::{mlp, moe};
@@ -83,7 +86,6 @@ fn the_routed_swiglu_and_sum_runs_land_what_the_elements_land() {
     let (packed, _) = rng.row(routes * 2 * INTER);
     let (routed, _) = rng.row(routes * HIDDEN);
     let weights: Vec<f32> = (0..routes).map(|_| rng.unit()).collect();
-    let shifted = |v: &[u16]| -> Vec<u16> { [&[0u16][..], v].concat() };
     let (p_at, p1_at) = (gpu.up(&packed), gpu.up(&shifted(&packed)));
     let (r_at, r1_at) = (gpu.up(&routed), gpu.up(&shifted(&routed)));
     let w_at = gpu.up(&weights);
@@ -96,9 +98,6 @@ fn the_routed_swiglu_and_sum_runs_land_what_the_elements_land() {
         gpu.zeros(TOKENS * HIDDEN * 2 + 16),
     );
     let ctx = gpu.ctx();
-    let t = |at: u64, rows: usize, width: usize| {
-        Tensor::new(at, rows as u32, width as u32, Dtype::Bf16)
-    };
     for (p, s) in [(p_at, s_at), (p1_at + 2, s1_at + 2)] {
         mlp::swiglu(
             &ctx,
@@ -131,8 +130,7 @@ fn the_routed_swiglu_and_sum_runs_land_what_the_elements_land() {
     assert!(y.iter().any(|&v| v != 0), "the sum landed");
 }
 
-// The packed tanh GeGLU takes the same 16-byte runs and lands the same bits
-// as its element walk, each the host's gelu(gate) * up.
+/// The packed tanh GeGLU, each the host's gelu(gate) * up.
 #[test]
 fn the_packed_geglu_runs_land_what_the_elements_land() {
     use kernels_cuda::linear::mlp;
@@ -141,16 +139,12 @@ fn the_packed_geglu_runs_land_what_the_elements_land() {
     let mut gpu = Gpu::open();
     let mut rng = Lcg::seeded(0x9e_61);
     let (packed, values) = rng.row(ROWS * 2 * INTER);
-    let shifted = |v: &[u16]| -> Vec<u16> { [&[0u16][..], v].concat() };
     let (p_at, p1_at) = (gpu.up(&packed), gpu.up(&shifted(&packed)));
     let (y_at, y1_at) = (
         gpu.zeros(ROWS * INTER * 2 + 16),
         gpu.zeros(ROWS * INTER * 2 + 16),
     );
     let ctx = gpu.ctx();
-    let t = |at: u64, rows: usize, width: usize| {
-        Tensor::new(at, rows as u32, width as u32, Dtype::Bf16)
-    };
     for (p, y) in [(p_at, y_at), (p1_at + 2, y1_at + 2)] {
         mlp::geglu_tanh_packed(
             &ctx,
@@ -180,8 +174,7 @@ fn the_packed_geglu_runs_land_what_the_elements_land() {
     }
 }
 
-// The logit soft cap takes 16-byte runs where the plane allows and lands the
-// same bits as its element walk, each cap * tanh(x / cap).
+/// The logit soft cap, each cap * tanh(x / cap).
 #[test]
 fn the_soft_capped_logit_runs_land_what_the_elements_land() {
     const N: usize = 3 * 1024;

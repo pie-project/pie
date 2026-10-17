@@ -1,56 +1,14 @@
 #![cfg(feature = "cuda")]
 
+//! Spatial attention segmented by frame (one, two, a whole lane) answers
+//! the host reference, and each segment lands its own answer.
+
+use crate::common::host_a::spatial_attention_ref;
 use crate::common::spatial::{Box3, table};
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::spatial::{Segment, attention};
 use kernels_cuda::tensor::Tensor;
-
-fn attention_ref(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    boxes: &[Box3],
-    c: usize,
-    seg: usize,
-    scale: f32,
-) -> Vec<f32> {
-    let rows = q.len() / c;
-    let mut y = vec![0f32; rows * c];
-    let mut off = 0usize;
-    for b in boxes {
-        let plane = b.plane();
-        let per = if seg == 0 { b.t } else { seg };
-        let mut frame = 0usize;
-        while frame < b.t {
-            let last = (frame + per).min(b.t);
-            let begin = off + frame * plane;
-            let end = off + last * plane;
-            for i in begin..end {
-                let mut s = vec![0f64; end - begin];
-                let mut m = f64::NEG_INFINITY;
-                for (jj, j) in (begin..end).enumerate() {
-                    let dot: f64 = (0..c)
-                        .map(|e| f64::from(q[i * c + e]) * f64::from(k[j * c + e]))
-                        .sum();
-                    s[jj] = dot * f64::from(scale);
-                    m = m.max(s[jj]);
-                }
-                let p: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
-                let l: f64 = p.iter().sum();
-                for e in 0..c {
-                    let acc: f64 = (0..end - begin)
-                        .map(|jj| p[jj] * f64::from(v[(begin + jj) * c + e]))
-                        .sum();
-                    y[i * c + e] = (acc / l) as f32;
-                }
-            }
-            frame = last;
-        }
-        off += b.voxels();
-    }
-    y
-}
 
 const C: usize = 1024;
 
@@ -99,7 +57,7 @@ fn the_attention_blocks_per_frame_run_rather_than_per_clip() {
         (Segment::Frames(2), 2),
         (Segment::Lane, 0),
     ] {
-        let want = attention_ref(&q, &k, &v, &BOXES, C, seg, scale);
+        let want = spatial_attention_ref([&q, &k, &v], &BOXES, C, seg, scale);
         run(&mut gpu, at, rows, segment, scale);
         let got: Vec<f32> = gpu
             .down::<u16>(y_at, rows * C)
@@ -107,12 +65,9 @@ fn the_attention_blocks_per_frame_run_rather_than_per_clip() {
             .map(from_bf16)
             .collect();
 
-        let mut worst = 0f32;
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-            let err = (g - w).abs();
-            worst = worst.max(err);
             assert!(
-                err <= 1e-2 + 1e-2 * w.abs(),
+                (g - w).abs() <= 1e-2 + 1e-2 * w.abs(),
                 "{segment:?}: row {} channel {}: got {g}, want {w}",
                 i / C,
                 i % C
@@ -122,7 +77,6 @@ fn the_attention_blocks_per_frame_run_rather_than_per_clip() {
             got[live * C..].iter().all(|x| *x == 0.0),
             "{segment:?}: the padded rows past the last clip land zeros"
         );
-        eprintln!("{segment:?}: {rows} rows of {C}, max |err| {worst:.5}");
         answers.push(got);
     }
 

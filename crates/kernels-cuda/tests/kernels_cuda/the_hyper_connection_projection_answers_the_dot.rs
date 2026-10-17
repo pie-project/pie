@@ -1,9 +1,7 @@
 #![cfg(feature = "cuda")]
 
-//! The hyper-connection projection (`elementwise.hc_project`) against a host
-//! dot: DeepSeek-V4's four 4096-wide streams projected to a layer's 24 mix
-//! columns, a sublayer's 8 without its combine, and a head's 4, at decode
-//! and prefill row counts.
+//! The hyper-connection projection, norm and gates against the host, at
+//! DeepSeek-V4's four 4096-wide streams.
 
 use crate::common::{Gpu, Lcg};
 use dtype::Dtype;
@@ -47,11 +45,11 @@ fn check(rows: usize, streams: usize, hidden: usize, mix_hc: usize) {
     }
 }
 
+/// The projection (`elementwise.hc_project`) to a head's 4 mix columns, on
+/// the registry's split walk (a layer's 24 and a sublayer's 8, and the
+/// tiles, are read in `the_hyper_connection_tiles_land_...`).
 #[test]
 fn the_hyper_connection_projection_answers_the_dot() {
-    check(8, 4, 4096, 24);
-    check(70, 4, 4096, 24);
-    check(3, 4, 4096, 8);
     check(5, 4, 4096, 4);
 }
 
