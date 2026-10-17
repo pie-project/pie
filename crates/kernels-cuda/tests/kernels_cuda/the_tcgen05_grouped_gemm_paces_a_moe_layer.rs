@@ -2,7 +2,8 @@
 
 //! The grouped tcgen05 GEMM's rate at real MoE layers' expert projections:
 //! DeepSeek-V4-Flash (256 experts, top 6, fp8 1x128 and W4A8) and
-//! Qwen3.8-Flash-Next (512 experts, top 10, NVFP4), uniform and skewed
+//! Qwen3.8-Flash-Next (512 experts, top 10, NVFP4), GLM-5.3 (256 experts,
+//! top 8, NVFP4, and its eight-expert miniature), uniform and skewed
 //! routing. Each batch cycles 16 routings, so each launch reads mostly
 //! other experts' weights than the last. Ignored: a measurement. Run alone
 //! on an idle GPU:
@@ -398,6 +399,12 @@ fn the_tcgen05_grouped_gemm_paces_a_moe_layer() {
     }
     layer("qwen gate_up", 512, 10, [1280, 2560], nvfp4);
     layer("qwen down", 512, 10, [2560, 640], nvfp4);
+    // GLM-5.3's NVFP4 export (256 experts, top 8), and its eight-expert
+    // miniature, every expert busy.
+    layer("glm gate_up", 256, 8, [4096, 6144], nvfp4);
+    layer("glm down", 256, 8, [6144, 2048], nvfp4);
+    layer("glm8 gate_up", 8, 8, [4096, 6144], nvfp4);
+    layer("glm8 down", 8, 8, [6144, 2048], nvfp4);
     let w4a16 = Kind {
         name: "w4a16 mxfp4",
         act: (Elem::Bf16, None),

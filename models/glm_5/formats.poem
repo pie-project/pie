@@ -23,6 +23,15 @@ def fp8_read(reads, w, names):
     factors = []
     for name in names:
         factor = name[:-len(".weight")] + ".weight_scale_inv"
+        if modelopt_fp8(name):
+            # modelopt's one scale a projection, every 128-square block's
+            # factor: the codes are read as they are.
+            leg_rows = shape(name)[0]
+            if leg_rows % 128 != 0 or cols % 128 != 0:
+                fail("`{}`: `{}` is {} and its one scale lands as 128-square block factors only on whole blocks".format(w.name, name, shape(name)))
+            one = src(name[:-len(".weight")] + ".weight_scale").transmute([1, 1], raw(dtype.f32))
+            factors.append(one.gather(1, [0] * (cols // 128)).gather(0, [0] * (leg_rows // 128)))
+            continue
         if not has(factor):
             fail("`{}`: `{}` holds FP8 codes whose block factors are stored beside it as `{}`, and the checkpoint holds none".format(w.name, name, factor))
         factors.append(src(factor))

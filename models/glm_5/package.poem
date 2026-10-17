@@ -49,5 +49,9 @@ DEPLOYMENTS = [
     # layers' MLP widened from its per-tensor FP8.
     deployment("glm53", weights = [BF, NV4], kv = BF),
     deployment("glm53-mini", weights = [BF, NV4], kv = BF),
+    # ... with the dense layers' MLP kept the export's FP8 (its one scale a
+    # projection as every 128-square block's factor), as vLLM serves it.
+    deployment("glm53", weights = [BF, NV4, F8], kv = BF),
+    deployment("glm53-mini", weights = [BF, NV4, F8], kv = BF),
     deployment("glm53-mini", weights = [BF, NV], kv = BF),
 ]

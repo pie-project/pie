@@ -133,8 +133,14 @@ def layout(id, deploy):
         draft = None
     elif not mtp and len(ws) == 1:
         w, experts, draft = ws[0], ws[0], None
+    elif not mtp and len(ws) == 3:
+        # The dense layers' MLP at a dtype of its own (modelopt's FP8 one).
+        w, experts, dense_mlp = ws
+        draft = None
     else:
-        fail("{} stores its weights at one dtype, or its weights and experts at a dtype each, and its draft experts at a third with the draft head; not {}".format(id, ws))
+        fail("{} stores its weights at one dtype, or its weights and experts at a dtype each (and its dense layers' MLP at a third), and its draft experts at a third with the draft head; not {}".format(id, ws))
+    if not (not mtp and len(ws) == 3):
+        dense_mlp = None
     # The release's FP8 projections as released: the projections at their
     # 128x128-block FP8 against e4m3 activations, the norms, tables, router,
     # indexer weights and the latent's up-projection (which the absorbs read
@@ -212,8 +218,8 @@ def layout(id, deploy):
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight(n("gate_up"), [2 * iw, hidden], proj).packed([iw, iw]),
-                down = weight(n("down"), [hidden, iw], proj).rows(),
+                gate_up = weight(n("gate_up"), [2 * iw, hidden], dense_mlp or proj).packed([iw, iw]),
+                down = weight(n("down"), [hidden, iw], dense_mlp or proj).rows(),
                 inter = iw,
             )
         else:
