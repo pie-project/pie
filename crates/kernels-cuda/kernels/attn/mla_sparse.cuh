@@ -292,6 +292,30 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
                 const int slot = J % kSlots;
                 const u32* l = lists + (J % kLists) * kBK;
                 bar_wait(&list_full[J % kLists], (J / kLists) & 1);
+                // An fp8 tile's codes are read as soon as its keys are
+                // listed, so their latency runs under the wait for the slot
+                // (a thread's runs are 192 apart, a warp's one key's 512
+                // contiguous bytes).
+                const int tid = share * 32 + static_cast<int>(lane);
+                constexpr int kPer = kFp8 ? (kBK * 32 + kIssuers * 32 - 1) / (kIssuers * 32) : 1;
+                uint4 codes[kPer];
+                float scales[kPer];
+                if constexpr (kFp8) {
+#pragma unroll
+                    for (int k = 0; k < kPer; ++k) {
+                        const int it = tid + k * kIssuers * 32;
+                        codes[k] = make_uint4(0u, 0u, 0u, 0u);
+                        scales[k] = 0.f;
+                        if (it < kBK * 32) {
+                            const u32 sl = l[it / 32] & kSlotMask;
+                            if (sl != kSlotMask) {
+                                const unsigned char* row = p.fp8_rows + static_cast<long long>(sl) * kFp8Row;
+                                codes[k] = __ldg(reinterpret_cast<const uint4*>(row) + it % 32);
+                                scales[k] = __ldg(reinterpret_cast<const float*>(row + kFp8Scales) + (it % 32) / 8);
+                            }
+                        }
+                    }
+                }
                 if (lead) {
                     bar_wait(&empty[slot], ((J / kSlots) & 1) ^ 1);
                     if (lane == 0) {
@@ -328,27 +352,6 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
                     // The latent: a key's 16-code run a step, widened under
                     // its tile's scale into the two 16-byte chunks it covers
                     // (128-byte swizzle: chunk c of row r lands at c ^ r % 8).
-                    // Every load of the tile in flight before the first
-                    // widening: a thread's runs are 192 apart, a warp's one
-                    // key's 512 contiguous bytes.
-                    const int tid = share * 32 + static_cast<int>(lane);
-                    constexpr int kPer = (kBK * 32 + kIssuers * 32 - 1) / (kIssuers * 32);
-                    uint4 codes[kPer];
-                    float scales[kPer];
-#pragma unroll
-                    for (int k = 0; k < kPer; ++k) {
-                        const int it = tid + k * kIssuers * 32;
-                        codes[k] = make_uint4(0u, 0u, 0u, 0u);
-                        scales[k] = 0.f;
-                        if (it < kBK * 32) {
-                            const u32 sl = l[it / 32] & kSlotMask;
-                            if (sl != kSlotMask) {
-                                const unsigned char* row = p.fp8_rows + static_cast<long long>(sl) * kFp8Row;
-                                codes[k] = __ldg(reinterpret_cast<const uint4*>(row) + it % 32);
-                                scales[k] = __ldg(reinterpret_cast<const float*>(row + kFp8Scales) + (it % 32) / 8);
-                            }
-                        }
-                    }
 #pragma unroll
                     for (int k = 0; k < kPer; ++k) {
                         const int it = tid + k * kIssuers * 32;
