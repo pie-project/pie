@@ -219,8 +219,7 @@ fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
         // Metal reads the PTQ1_0 ternary block as stored (the M1b decode-in-dot
         // kernel), so its inline-scale bank binds directly rather than decoding.
         BackendKind::Metal => matches!(scheme, QuantScheme::Ptq1_0),
-        // ROCm reads no block format in place yet: every bank decodes on load.
-        BackendKind::Rocm | BackendKind::Unknown => false,
+        BackendKind::Unknown => false,
     }
 }
 

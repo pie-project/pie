@@ -46,7 +46,6 @@ members = [
     "crates/kernels-rocm",
     "crates/kernels-metal",
     "crates/engine-cuda",
-    "crates/engine-rocm",
     "crates/engine-metal",
     "crates/kernels-vulkan",
     "crates/engine-vulkan",
@@ -144,7 +143,7 @@ path = "src/bin/pie-worker.rs"
 [features]
 default = []
 cuda = ["worker/cuda"]
-rocm = ["worker/rocm"]
+rocm = ["cuda", "worker/rocm"]
 metal = ["worker/metal"]
 vulkan = ["worker/vulkan"]
 wgpu = ["worker/wgpu"]

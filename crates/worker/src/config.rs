@@ -100,7 +100,7 @@ impl Config {
     /// nothing would be the same silence the typed record exists to end.
     pub fn state_diagnostics(&mut self, words: &str) -> Result<()> {
         match self.model.engine.kind {
-            EngineKind::CudaNative | EngineKind::RocmNative | EngineKind::Metal => {
+            EngineKind::CudaNative | EngineKind::Metal => {
                 self.model.engine.options.insert(
                     "diagnostics".to_string(),
                     toml::Value::String(words.to_string()),
@@ -979,7 +979,7 @@ impl EngineConfig {
     fn validate(&self) -> Result<()> {
         ensure!(!self.device.is_empty(), "engine.device must be non-empty");
         match self.kind {
-            EngineKind::CudaNative | EngineKind::RocmNative => {
+            EngineKind::CudaNative => {
                 let opts: CudaNativeEngineOptions = toml::Value::Table(self.options.clone())
                     .try_into()
                     .map_err(|e| {
@@ -1039,9 +1039,6 @@ pub enum EngineKind {
     /// Native CUDA engine — embedded as a static lib in `worker`
     /// (requires `--features cuda`).
     CudaNative,
-    /// Native ROCm engine for AMD Instinct GPUs (requires `--features rocm`);
-    /// it takes the native engine's options, as `cuda_native` does.
-    RocmNative,
     /// Native MLX + Metal engine for Apple Silicon.
     Metal,
     /// Pure-Rust Vulkan engine: portable rather than vendor-specific, on
@@ -1058,7 +1055,6 @@ impl EngineKind {
     pub fn as_str(self) -> &'static str {
         match self {
             EngineKind::CudaNative => "cuda_native",
-            EngineKind::RocmNative => "rocm_native",
             EngineKind::Metal => "metal",
             EngineKind::Vulkan => "vulkan",
             EngineKind::Wgpu => "wgpu",
@@ -1227,7 +1223,6 @@ device = ["cpu"]
     fn every_engine_kind_round_trips_through_its_config_string() {
         const KINDS: &[(EngineKind, &str)] = &[
             (EngineKind::CudaNative, "cuda_native"),
-            (EngineKind::RocmNative, "rocm_native"),
             (EngineKind::Metal, "metal"),
             (EngineKind::Vulkan, "vulkan"),
             (EngineKind::Wgpu, "wgpu"),
@@ -1249,7 +1244,7 @@ device = ["cpu"]
         }
         assert_eq!(
             KINDS.len(),
-            6,
+            5,
             "an engine kind was added without a line here, so nothing checks its \
              config spelling"
         );

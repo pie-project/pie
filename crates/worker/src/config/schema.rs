@@ -98,7 +98,7 @@ fn parse_structs() -> BTreeMap<String, Vec<Parsed>> {
 
 fn options_struct(engine: EngineKind) -> Option<&'static str> {
     match engine {
-        EngineKind::CudaNative | EngineKind::RocmNative => Some("CudaNativeEngineOptions"),
+        EngineKind::CudaNative => Some("CudaNativeEngineOptions"),
         EngineKind::Metal => Some("MetalEngineOptions"),
         EngineKind::Vulkan => Some("VulkanEngineOptions"),
         EngineKind::Wgpu => Some("WgpuEngineOptions"),
@@ -199,9 +199,7 @@ fn default_values(engine: EngineKind) -> toml::Value {
         toml::Value::try_from(parsed).ok()
     }
     let options = match engine {
-        EngineKind::CudaNative | EngineKind::RocmNative => {
-            defaults_of::<crate::config::CudaNativeEngineOptions>(&empty)
-        }
+        EngineKind::CudaNative => defaults_of::<crate::config::CudaNativeEngineOptions>(&empty),
         EngineKind::Metal => defaults_of::<crate::config::MetalEngineOptions>(&empty),
         EngineKind::Vulkan => defaults_of::<crate::config::VulkanEngineOptions>(&empty),
         EngineKind::Wgpu => defaults_of::<crate::config::WgpuEngineOptions>(&empty),

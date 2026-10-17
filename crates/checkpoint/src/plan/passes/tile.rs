@@ -34,8 +34,6 @@ pub const CONVERT_TILE_MAP_MASK: u32 =
 pub fn compilable_tile_maps(backend: BackendKind) -> u32 {
     match backend {
         BackendKind::Cuda => CUDA_TILE_MAP_MASK,
-        // No device tile kernels on ROCm yet: every map runs on the host.
-        BackendKind::Rocm => HOST_TILE_MAP_MASK,
         BackendKind::Metal => METAL_TILE_MAP_MASK,
         BackendKind::Vulkan => VULKAN_TILE_MAP_MASK,
         BackendKind::Wgpu => WGPU_TILE_MAP_MASK,
@@ -97,8 +95,7 @@ fn lower_tile_map(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering 
         BackendKind::Cuda => TileLowering {
             kernel: kernel(cuda_kernel(facts)),
         },
-        BackendKind::Rocm
-        | BackendKind::Metal
+        BackendKind::Metal
         | BackendKind::Vulkan
         | BackendKind::Wgpu
         | BackendKind::Xla

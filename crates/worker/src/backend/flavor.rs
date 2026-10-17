@@ -4,8 +4,6 @@ use crate::config::EngineKind;
 pub enum Flavor {
     #[cfg(feature = "cuda")]
     Cuda,
-    #[cfg(feature = "rocm")]
-    Rocm,
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     Metal,
     #[cfg(feature = "vulkan")]
@@ -17,32 +15,10 @@ pub enum Flavor {
 }
 
 impl Flavor {
-    /// This build's native GPU engine.
-    #[cfg(feature = "cuda")]
-    pub const NATIVE: Flavor = Flavor::Cuda;
-    #[cfg(feature = "rocm")]
-    pub const NATIVE: Flavor = Flavor::Rocm;
-
-    /// The native GPU engine (CUDA or ROCm): engine-rocm is engine-cuda's
-    /// shape on HIP, and the two take one set of options and one boot.
-    #[must_use]
-    pub fn is_native_gpu(self) -> bool {
-        match self {
-            #[cfg(feature = "cuda")]
-            Flavor::Cuda => true,
-            #[cfg(feature = "rocm")]
-            Flavor::Rocm => true,
-            #[allow(unreachable_patterns)]
-            _ => false,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             #[cfg(feature = "cuda")]
             Flavor::Cuda => "cuda",
-            #[cfg(feature = "rocm")]
-            Flavor::Rocm => "rocm",
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
             Flavor::Metal => "metal",
             #[cfg(feature = "vulkan")]
@@ -64,16 +40,6 @@ impl Flavor {
                 #[cfg(not(feature = "cuda"))]
                 {
                     Err(missing_feature_msg("cuda_native", "cuda"))
-                }
-            }
-            EngineKind::RocmNative => {
-                #[cfg(feature = "rocm")]
-                {
-                    Ok(Flavor::Rocm)
-                }
-                #[cfg(not(feature = "rocm"))]
-                {
-                    Err(missing_feature_msg("rocm_native", "rocm"))
                 }
             }
             EngineKind::Metal => {
@@ -137,7 +103,6 @@ fn non_apple_msg() -> String {
 
 #[cfg(not(all(
     feature = "cuda",
-    feature = "rocm",
     feature = "metal",
     feature = "vulkan",
     feature = "wgpu",
@@ -171,8 +136,6 @@ pub fn compiled_summary() -> String {
     let mut out: Vec<&'static str> = Vec::new();
     #[cfg(feature = "cuda")]
     out.push("cuda");
-    #[cfg(feature = "rocm")]
-    out.push("rocm");
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     out.push("metal");
     #[cfg(feature = "vulkan")]
@@ -184,10 +147,9 @@ pub fn compiled_summary() -> String {
     out.join(", ")
 }
 
-pub fn compiled_embedded() -> [(&'static str, bool); 6] {
+pub fn compiled_embedded() -> [(&'static str, bool); 5] {
     [
         ("cuda_native", cfg!(feature = "cuda")),
-        ("rocm_native", cfg!(feature = "rocm")),
         (
             "metal",
             cfg!(all(feature = "metal", target_vendor = "apple")),
@@ -202,8 +164,6 @@ pub fn default_flavor() -> Option<Flavor> {
     match runtime::engine::load::this_box()? {
         #[cfg(feature = "cuda")]
         runtime::engine::load::Platform::Cuda => Some(Flavor::Cuda),
-        #[cfg(feature = "rocm")]
-        runtime::engine::load::Platform::Rocm => Some(Flavor::Rocm),
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         runtime::engine::load::Platform::Metal => Some(Flavor::Metal),
         #[cfg(feature = "vulkan")]
