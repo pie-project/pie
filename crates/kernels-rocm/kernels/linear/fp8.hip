@@ -791,18 +791,39 @@ __global__ __launch_bounds__(256) void dense_fp8_mfma(const u8* __restrict__ act
 
 // A bf16 bank in the matrix core's order (each expert's plane by
 // `e4m3fn_shuffle<false>`): its routed select at decode batches, one work
-// item of up to MT routes of one expert a block row (grid (work cap,
-// ⌈n / 64⌉)).
-template <int MT>
+// item of up to MT routes of one expert against 64·NB weight rows a block
+// (grid (work cap, ⌈n / (64·NB)⌉)).
+template <int MT, int NB = 1>
 __global__ __launch_bounds__(256) void moe_bf16_stream(const bf16* __restrict__ act, const i32* __restrict__ order,
                                                        const i32* __restrict__ offsets, const i32* __restrict__ work,
                                                        const bf16* __restrict__ bank, bf16* __restrict__ out,
                                                        int act_div, int n, int k, int num_experts) {
+    // An XCD (block b runs on XCD b % 8) takes a contiguous run of the live
+    // blocks, an item's tiles in turn: the item's rows stay in its L2.
+    const int items = offsets[num_experts + 1], ny = static_cast<int>(gridDim.y);
+    const int live = items * ny;
+    const int b = static_cast<int>(blockIdx.x + gridDim.x * blockIdx.y);
+    if (b >= live) return;
+    const int xcd = b % 8, slots = live / 8, extra = live % 8;
+    const int at = xcd * slots + min(xcd, extra) + b / 8;
     GroupItem item;
-    if (!group_item(offsets, work, num_experts, MT, item)) return;
-    fp8_tile<MT, kFp8MfmaDepth, 1, false>(reinterpret_cast<const u8*>(act), nullptr, order, item.begin, item.count,
-                                          reinterpret_cast<const u8*>(bank + static_cast<long long>(item.expert) * n * k),
-                                          nullptr, out, nullptr, act_div, n, k, blockIdx.y, 0, 2 * k / 128);
+    if (!group_item(offsets, work, num_experts, MT, item, at / ny)) return;
+    fp8_tile<MT, kFp8MfmaDepth, NB, false>(reinterpret_cast<const u8*>(act), nullptr, order, item.begin, item.count,
+                                           reinterpret_cast<const u8*>(bank + static_cast<long long>(item.expert) * n * k),
+                                           nullptr, out, nullptr, act_div, n, k, at % ny, 0, 2 * k / 128);
+}
+
+// The same for one token: route r (blockIdx.x) its own item of one row
+// against expert routes[r], unordered (grid (routes, ⌈n / (64·NB)⌉)).
+template <int NB = 1>
+__global__ __launch_bounds__(256) void moe_bf16_route(const bf16* __restrict__ act, const i32* __restrict__ routes,
+                                                      const bf16* __restrict__ bank, bf16* __restrict__ out,
+                                                      int act_div, int n, int k, int num_experts) {
+    const int r = static_cast<int>(blockIdx.x), e = routes[r];
+    if (e < 0 || e >= num_experts) return;
+    fp8_tile<16, kFp8MfmaDepth, NB, false>(reinterpret_cast<const u8*>(act), nullptr, nullptr, r, 1,
+                                           reinterpret_cast<const u8*>(bank + static_cast<long long>(e) * n * k),
+                                           nullptr, out, nullptr, act_div, n, k, blockIdx.y, 0, 2 * k / 128);
 }
 
 // An `e4m3tile128` bank's routed select at decode batches: one

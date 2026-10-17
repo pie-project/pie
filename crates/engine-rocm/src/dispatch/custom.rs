@@ -98,6 +98,10 @@ impl Run<'_> {
         if routes != down_routes || glu_in != *packed || glu_out != *h || summed != routed {
             return Ok(false);
         }
+        // Banks in the matrix core's order run as their legs.
+        if self.ordered_bank(*gate_up).is_some() || self.ordered_bank(*down_bank).is_some() {
+            return Ok(false);
+        }
         let (gate_up, gate_up_experts) = self.expert_bank(*gate_up);
         let (down, down_experts) = self.expert_bank(*down_bank);
         let p = kernels_rocm::linear::moe::RoutedMlp {

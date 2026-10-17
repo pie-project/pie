@@ -30,6 +30,11 @@ pub enum WeightRow {
         table: u64,
         counts: u64,
     },
+
+    /// A resident bf16 expert bank in the matrix core's order
+    /// (`linear::act_quant::bf16_shuffle` of each expert's plane), which
+    /// only routed selects read (`linear::moe::matmul_select_bf16_stream`).
+    Ordered(Tensor),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1340,7 +1345,7 @@ impl<'c> Run<'c> {
             Some(Def::Op(_) | Def::Merge(_)) => self.arena.0.get(at).copied().flatten().is_some(),
             Some(Def::Weight(w)) => matches!(
                 self.weights.0.get(*w as usize).copied().flatten(),
-                Some(WeightRow::Dense(_) | WeightRow::Streamed { .. })
+                Some(WeightRow::Dense(_) | WeightRow::Streamed { .. } | WeightRow::Ordered(_))
             ),
             _ => false,
         }
@@ -1511,9 +1516,11 @@ impl<'c> Run<'c> {
             Def::Weight(w) => {
                 let row = *w as usize;
                 match self.weights.0.get(row).copied().flatten() {
-                    Some(WeightRow::Dense(handle) | WeightRow::Streamed { slab: handle, .. }) => {
-                        handle
-                    }
+                    Some(
+                        WeightRow::Dense(handle)
+                        | WeightRow::Streamed { slab: handle, .. }
+                        | WeightRow::Ordered(handle),
+                    ) => handle,
                     Some(WeightRow::Planes { .. }) => panic!(
                         "value {at} is weight {row}, a split-plane bank; it resolves \
                          through `Run::planes`, never as one dense handle"
@@ -1649,7 +1656,7 @@ impl<'c> Run<'c> {
                 seat,
                 repacked: _,
             }) => (codes, scales, biases, seat),
-            Some(WeightRow::Dense(_) | WeightRow::Streamed { .. }) => panic!(
+            Some(WeightRow::Dense(_) | WeightRow::Streamed { .. } | WeightRow::Ordered(_)) => panic!(
                 "value {at} is weight {row}, bound as one dense handle, and this op reads \
                  a split-plane bank"
             ),
@@ -1693,7 +1700,22 @@ impl<'c> Run<'c> {
                 "value {at} is weight {row}, a split-plane bank; a dense routed select \
                  does not read one"
             ),
+            Some(WeightRow::Ordered(_)) => panic!(
+                "value {at} is weight {row}, a bank in the matrix core's order; only \
+                 `Run::ordered_bank`'s readers take it"
+            ),
             None => panic!("value {at} is weight {row}, which the shell has not bound"),
+        }
+    }
+
+    /// The bank `id` names, if it landed in the matrix core's order.
+    pub(crate) fn ordered_bank(&self, id: ValueId) -> Option<Tensor> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        match self.weights.0.get(*w as usize).copied().flatten() {
+            Some(WeightRow::Ordered(handle)) => Some(self.cut(id, handle)),
+            _ => None,
         }
     }
 

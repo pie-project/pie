@@ -416,7 +416,9 @@ fn a_bf16_bank_streams_in_the_matrix_cores_order() {
     let ctx = gpu.ctx();
     let experts = 6usize;
     for (tokens, top_k, n, k) in [
-        (8usize, 4usize, 256usize, 512usize),
+        (1usize, 4usize, 256usize, 512usize),
+        (8, 4, 256, 512),
+        (40, 4, 320, 512),
         (300, 4, 320, 512),
         (700, 2, 384, 1024),
     ] {

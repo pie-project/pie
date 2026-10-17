@@ -617,6 +617,16 @@ impl Run<'_> {
                 )
             }
             Linear::MoeMatmulSelect { x, bank, routes, y } => {
+                if let Some(bank) = self.ordered_bank(*bank) {
+                    return linear::moe::matmul_select_bf16_stream(
+                        self.ctx(),
+                        self.tensor(*x),
+                        bank,
+                        self.tensor(*routes),
+                        &mut self.tensor(*y),
+                        bank.rows,
+                    );
+                }
                 let (bank, experts) = self.expert_bank(*bank);
                 linear::moe::matmul_select(
                     self.ctx(),

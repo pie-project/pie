@@ -712,6 +712,100 @@ fn canonical_fp8(
     Ok(())
 }
 
+/// The bf16 expert banks that land in the matrix core's order: `[experts,
+/// n, k]` planes (n a multiple of 16, k of 64) that routed selects read and
+/// nothing else does, held on the device.
+fn ordered_banks(trace: &Trace, tier: Option<&crate::experts::Tier>) -> Vec<usize> {
+    use poem_ir::{Def, Fused, Linear, Operands, Operation};
+    let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|decl| &decl.def) {
+        Some(Def::Weight(w)) => Some(*w as usize),
+        _ => None,
+    };
+    let mut reads = vec![0u32; trace.params.len()];
+    let mut selects = vec![0u32; trace.params.len()];
+    let mut ins = Vec::new();
+    for node in &trace.nodes {
+        ins.clear();
+        node.op.inputs(&mut ins);
+        for &id in &ins {
+            if let Some(w) = weight(id) {
+                reads[w] += 1;
+            }
+        }
+        let legs: Vec<&Linear> = match &node.op {
+            Operation::Linear(op) => vec![op],
+            Operation::Fused(Fused::MoeExperts { select, down, .. }) => vec![&**select, &**down],
+            Operation::Fused(Fused::MoeSelectGlu { select, .. }) => vec![&**select],
+            _ => Vec::new(),
+        };
+        for leg in legs {
+            if let Linear::MoeMatmulSelect { bank, .. } = leg
+                && let Some(w) = weight(*bank)
+            {
+                selects[w] += 1;
+            }
+        }
+    }
+    trace
+        .params
+        .iter()
+        .enumerate()
+        .filter(|&(at, param)| {
+            param.dtype == Dtype::Bf16
+                && param.shape.len() == 3
+                && param.shape[1] % 16 == 0
+                && param.shape[2] % 64 == 0
+                && selects[at] > 0
+                && selects[at] == reads[at]
+                && !tier.is_some_and(|tier| tier.handles(at).is_some() || tier.group_handles(at).is_some())
+        })
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// Puts `ordered_banks` in the matrix core's order where they lie, through
+/// one staging plane, and rebinds their rows.
+fn order_bf16_banks(
+    trace: &Trace,
+    places: &[Place],
+    store: &Buffer,
+    tier: Option<&crate::experts::Tier>,
+    table: &mut [Option<WeightRow>],
+    stream: *mut core::ffi::c_void,
+) -> Result<()> {
+    let banks = ordered_banks(trace, tier);
+    let Some(widest) = banks.iter().map(|&at| trace.params[at].shape.iter().product::<u64>()).max() else {
+        return Ok(());
+    };
+    // SAFETY: `stream` is the load's stream, live for the load.
+    let ctx = unsafe { kernels_rocm::Ctx::on(stream.cast()) };
+    let staging = Buffer::zeroed(usize::try_from(2 * widest).unwrap_or(usize::MAX))?;
+    for &at in &banks {
+        let shape = &trace.params[at].shape;
+        let (rows, k) = (shape[0] * shape[1], shape[2]);
+        let plane = address(tier, store, places[at].offset, at)?;
+        kernels_rocm::linear::act_quant::bf16_shuffle(&ctx, "linear.moe_matmul_select", plane, staging.ptr(), rows, k)?;
+        // SAFETY: both spans are device memory this load holds, `2 · rows ·
+        // k` bytes each; the copy is ordered on the load's stream.
+        crate::device::ctx::check("hipMemcpyAsync", unsafe {
+            kernels_rocm::hip::rt::hipMemcpyAsync(
+                plane as *mut core::ffi::c_void,
+                staging.ptr() as *const core::ffi::c_void,
+                usize::try_from(2 * rows * k).unwrap_or(usize::MAX),
+                kernels_rocm::hip::rt::hipMemcpyDeviceToDevice,
+                stream.cast(),
+            )
+        })?;
+        if let Some(Some(WeightRow::Dense(handle))) = table.get(at).copied() {
+            table[at] = Some(WeightRow::Ordered(handle));
+        }
+    }
+    // SAFETY: the load's stream, live for the load.
+    crate::device::ctx::check("hipStreamSynchronize", unsafe {
+        kernels_rocm::hip::rt::hipStreamSynchronize(stream.cast())
+    })
+}
+
 fn pairings<'a>(
     landing: &'a LoadPlan,
     trace: &'a Trace,
@@ -808,6 +902,7 @@ impl Weights {
         target: StorageTarget,
         decode_dense: bool,
         deferred_tier: bool,
+        order_bf16: bool,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -1007,6 +1102,9 @@ impl Weights {
             table.push(Some(row));
         }
         canonical_fp8(trace, &index, &places, &store, experts.as_ref(), stream)?;
+        if order_bf16 {
+            order_bf16_banks(trace, &places, &store, experts.as_ref(), &mut table, stream)?;
+        }
         if let Some(tier) = experts.as_mut() {
             let slabs: Vec<u64> = tier
                 .plan()

@@ -491,6 +491,7 @@ impl Shell {
             ),
             decode_dense,
             boot.deferred_tier,
+            device.ctx().tuning().moe_bf16_order,
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(

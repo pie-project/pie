@@ -705,12 +705,13 @@ fn wide_items(ctx: &Ctx, fan: &Selected, experts: u32, x: Tensor) -> Option<u32>
 }
 
 /// A bf16 bank in the matrix core's order (`act_quant::bf16_shuffle` of each
-/// expert's plane) against the routes' rows. Up to 32 routes an expert
-/// averages (decode batches), streamed whole 1 KB units a lane-order strip
-/// into the matrix core's operands: items of 16 or 32 routes, an expert past
-/// its item taking another. Past 32, the prefill tile (`group_shape`): items
-/// of 128 routes against 256 or 512 weight rows a block, the weight straight
-/// into registers and the routes through LDS.
+/// expert's plane) against the routes' rows. One token: each route its own
+/// item, unordered. To items of 64 routes an expert (decode batches; the
+/// item holding the busiest expert of a random routing, `stream_items`):
+/// streamed whole 1 KB units a lane-order strip into the matrix core's
+/// operands, an expert past its item taking another. Past that, the prefill
+/// tile (`group_shape`): items of 128 routes against 256 or 512 weight rows a
+/// block, the weight straight into registers and the routes through LDS.
 pub fn matmul_select_bf16_stream(
     ctx: &Ctx,
     x: Tensor,
@@ -724,39 +725,32 @@ pub fn matmul_select_bf16_stream(
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     let fan = selected(op, x, routes, y)?;
     if !x.width.is_multiple_of(64) || !y.width.is_multiple_of(16) || experts > ORDER_EXPERT_CAP {
-        return Err(refuse(
-            op,
-            "the streamed bank takes whole 16-row strips of 64-element stages",
-        ));
+        return Err(refuse(op, "the streamed bank takes whole 16-row strips of 64-element stages"));
     }
-    let per = fan.route_count.div_ceil(experts.max(1));
-    let group = per > 32;
-    // The prefill tile reads the activation at 32-bit offsets from its base.
-    if group && u64::from(x.rows) * u64::from(x.width) * 2 > u64::from(u32::MAX) {
-        return Err(refuse(
-            op,
-            "the prefill tile reads an activation under 4 GiB",
-        ));
-    }
-    let mt = if group {
-        128
-    } else {
-        crate::linear::act_quant::fp8_item_rows(per)
-    };
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
-    let ordered = route_order(ctx, op, routes, &fan, experts, mt)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
-    if group {
-        let (nw, splits) = group_shape(fan.route_count, experts, y.width, x.width);
-        let stages = x.width / 64;
-        let per = stages.div_ceil(splits);
-        let splits = stages.div_ceil(per);
-        let part = crate::linear::act_quant::fp8_partials(ctx, op, splits, y.rows, y.width)?;
-        ctx.fire(
+    if routes.rows == 1 {
+        return ctx.fire(
             op,
-            Fire::at("linear/fp8.hip", symbol(&format!("::pie::linear::moe_bf16_group<::pie::i32({nw})>")))
-                .apply(Launch::grid([ordered.work_cap, y.width.div_ceil(64 * nw), splits], [64 * nw, 1, 1])),
+            Fire::at("linear/fp8.hip", "::pie::linear::moe_bf16_route<::pie::i32(1)>")
+                .apply(Launch::grid([fan.route_count, y.width.div_ceil(64), 1], [GROUP_BLOCK, 1, 1])),
+            &[x.arg(), routes.arg(), bank.arg(), y.arg(), act_div.arg(), n.arg(), k.arg(), stated(op, experts)?.arg()],
+        );
+    }
+    let need = stream_items(&fan, experts);
+    if need <= 64 {
+        let mt = crate::linear::act_quant::fp8_item_rows(need);
+        // Two strips a wave at 64 routes, the routes' rows read half as often.
+        let nb = if mt == 64 { 2 } else { 1 };
+        let ordered = route_order(ctx, op, routes, &fan, experts, mt)?;
+        return ctx.fire(
+            op,
+            Fire::at(
+                "linear/fp8.hip",
+                symbol(&format!("::pie::linear::moe_bf16_stream<::pie::i32({mt}), ::pie::i32({nb})>")),
+            )
+            .apply(Launch::grid([ordered.work_cap, y.width.div_ceil(64 * nb), 1], [GROUP_BLOCK, 1, 1])),
             &[
                 x.arg(),
                 ArgValue::Ptr(ordered.order),
@@ -764,30 +758,30 @@ pub fn matmul_select_bf16_stream(
                 ArgValue::Ptr(ordered.work),
                 bank.arg(),
                 y.arg(),
-                part,
                 act_div.arg(),
                 n.arg(),
                 k.arg(),
                 stated(op, experts)?.arg(),
-                stated(op, y.rows)?.arg(),
-                stated(op, per)?.arg(),
             ],
-        )?;
-        if splits == 1 {
-            return Ok(());
-        }
-        let grid = u32::try_from((u64::from(y.rows) * u64::from(y.width)).div_ceil(256).min(4096)).unwrap_or(4096);
-        return ctx.fire(
-            op,
-            Fire::at("linear/fp8.hip", "::pie::linear::fp8_mfma_finalize")
-                .apply(Launch::grid([grid, 1, 1], [GROUP_BLOCK, 1, 1])),
-            &[part, y.arg(), stated(op, y.rows)?.arg(), n.arg(), stated(op, splits)?.arg(), ArgValue::ABSENT],
         );
     }
+    // The prefill tile reads the activation at 32-bit offsets from its base.
+    if u64::from(x.rows) * u64::from(x.width) * 2 > u64::from(u32::MAX) {
+        return Err(refuse(op, "the prefill tile reads an activation under 4 GiB"));
+    }
+    let (nw, splits) = group_shape(experts.min(fan.route_count) * need.div_ceil(128), y.width, x.width);
+    let ordered = route_order(ctx, op, routes, &fan, experts, 128)?;
+    let stages = x.width / 64;
+    let per = stages.div_ceil(splits);
+    let splits = stages.div_ceil(per);
+    let part = crate::linear::act_quant::fp8_partials(ctx, op, splits, y.rows, y.width)?;
     ctx.fire(
         op,
-        Fire::at("linear/fp8.hip", symbol(&format!("::pie::linear::moe_bf16_stream<::pie::i32({mt})>")))
-            .apply(Launch::grid([ordered.work_cap, y.width.div_ceil(64), 1], [GROUP_BLOCK, 1, 1])),
+        Fire::at(
+            "linear/fp8.hip",
+            symbol(&format!("::pie::linear::moe_bf16_group<::pie::i32({nw})>")),
+        )
+        .apply(Launch::grid([ordered.work_cap, y.width.div_ceil(64 * nw), splits], [64 * nw, 1, 1])),
         &[
             x.arg(),
             ArgValue::Ptr(ordered.order),
@@ -795,22 +789,46 @@ pub fn matmul_select_bf16_stream(
             ArgValue::Ptr(ordered.work),
             bank.arg(),
             y.arg(),
+            part,
             act_div.arg(),
             n.arg(),
             k.arg(),
             stated(op, experts)?.arg(),
+            stated(op, y.rows)?.arg(),
+            stated(op, per)?.arg(),
         ],
+    )?;
+    if splits == 1 {
+        return Ok(());
+    }
+    let grid = u32::try_from((u64::from(y.rows) * u64::from(y.width)).div_ceil(256).min(4096)).unwrap_or(4096);
+    ctx.fire(
+        op,
+        Fire::at("linear/fp8.hip", "::pie::linear::fp8_mfma_finalize").apply(Launch::grid([grid, 1, 1], [GROUP_BLOCK, 1, 1])),
+        &[part, y.arg(), stated(op, y.rows)?.arg(), n.arg(), stated(op, splits)?.arg(), ArgValue::ABSENT],
     )
 }
 
-/// The prefill tile's shape for `routes` over `experts` (each n x k): its
+/// The routes an item would hold the busiest expert in: what they average,
+/// exactly where every token takes every expert, else past the average by
+/// two of its square roots and one (`batch_items`' margin).
+fn stream_items(fan: &Selected, experts: u32) -> u32 {
+    let per = fan.route_count.div_ceil(experts.max(1));
+    if fan.top_k.unsigned_abs() >= experts {
+        return per;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let margin = (2.0 * f64::from(per).sqrt()).ceil() as u32;
+    per + margin + 1
+}
+
+/// The prefill tile's shape for `items` work items over an n x k bank: its
 /// waves (64 weight rows each) and K slices. Eight waves once their blocks
-/// hold most of the card (a block a CU); short of that four, two blocks a
-/// CU, and a long K sliced in two while those blocks still leave CUs idle.
-fn group_shape(routes: u32, experts: u32, n: u32, k: u32) -> (u32, u32) {
-    let per = routes.div_ceil(experts.max(1));
-    let items = experts.min(routes) * per.div_ceil(128);
-    if items * n.div_ceil(512) >= 192 {
+/// hold most of the card (a block a CU) and leave little of the last block
+/// row idle; short of that four, two blocks a CU, and a long K sliced in two
+/// while those blocks still leave CUs idle.
+fn group_shape(items: u32, n: u32, k: u32) -> (u32, u32) {
+    if items * n.div_ceil(512) >= 192 && n.div_ceil(512) * 512 <= n + n / 8 {
         (8, 1)
     } else if items * n.div_ceil(256) < 256 && k / 64 >= 96 {
         (4, 2)

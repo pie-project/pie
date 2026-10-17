@@ -38,3 +38,10 @@ moe.lt_tile_deep = 256_192_064
 moe.lt_tile_shallow = 128_288_032
 moe.lt_deep_k = 2048
 moe.ordered_from = 256
+# bf16 expert banks in the matrix core's order stay off: over the whole
+# routed MLP (lt_grouped's bench_moe_mlp_ordered, steady clocks) they win
+# decode on every mini (1-32 tokens +1..+72%) and GLM-5.3's mini at every
+# size, but lose the 512-token prefill of 16-32 expert banks to hipBLASLt's
+# sorted MLP (GLM-5.3-Flash -17%, Qwen3.8-Max -15%, Hy4 -8%) and
+# Inkling-Small at 128 / 1024 tokens (-8% / -13%).
+moe.bf16_order = false

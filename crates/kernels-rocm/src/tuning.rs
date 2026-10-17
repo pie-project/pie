@@ -50,6 +50,14 @@ pub struct MoeLtDeepK(pub u32);
 #[decision(id = "kernel.moe.ordered_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
 pub struct MoeOrderedFrom(pub u32);
 
+/// Whether a resident bf16 expert bank only routed selects read lands in
+/// the matrix core's order (`linear::act_quant::bf16_shuffle`, one copy),
+/// its selects on the tiles that stream it so (`moe::matmul_select_bf16_stream`)
+/// at every batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.bf16_order", flag, default = false, tune = search)]
+pub struct MoeBf16Order;
+
 /// The same for mxfp4 banks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.mxfp4_grouped", flag, default = true, tune = search)]
@@ -275,6 +283,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeLtTileShallow>()
         .add::<MoeLtDeepK>()
         .add::<MoeOrderedFrom>()
+        .add::<MoeBf16Order>()
         .add::<MoeMxfp4Grouped>()
         .add::<MoeMxfp4Wmma>()
         .add::<DecodeSplitSmall>()
@@ -324,6 +333,7 @@ pub struct Tuning {
     pub moe_lt_tile_shallow: u32,
     pub moe_lt_deep_k: u32,
     pub moe_ordered_from: u32,
+    pub moe_bf16_order: bool,
     pub mxfp4_grouped: bool,
     pub mxfp4_wmma: bool,
     pub decode_split_small: bool,
@@ -375,6 +385,7 @@ impl Tuning {
         moe_lt_tile_shallow: 256_160_032,
         moe_lt_deep_k: 2048,
         moe_ordered_from: 0,
+        moe_bf16_order: false,
         mxfp4_grouped: true,
         mxfp4_wmma: true,
         decode_split_small: false,
@@ -424,6 +435,7 @@ impl Tuning {
             moe_lt_tile_shallow: profile.get::<MoeLtTileShallow>().0,
             moe_lt_deep_k: profile.get::<MoeLtDeepK>().0,
             moe_ordered_from: profile.get::<MoeOrderedFrom>().0,
+            moe_bf16_order: profile.on::<MoeBf16Order>(&Anywhere),
             mxfp4_grouped: profile.on::<MoeMxfp4Grouped>(&Anywhere),
             mxfp4_wmma: profile.on::<MoeMxfp4Wmma>(&Anywhere),
             decode_split_small: profile.on::<DecodeSplitSmall>(&Anywhere),
