@@ -106,10 +106,8 @@ struct Epi {
 
 namespace tc5k {
 
-// The GLUs pie's MLPs use, over a gate and an up value. Fast exp and
-// divide: a precise division a value is most of a fused tile's epilogue,
-// and that epilogue then paces the MMAs. (A gate so negative its exp
-// overflows divides to 0, its limit.)
+// The GLUs pie's MLPs use. Fast exp and divide: a precise division would
+// pace the fused epilogue (an overflowing exp divides to 0, its limit).
 template <int kGlu>
 __device__ __forceinline__ float glu(float g, float u, float limit, float galpha) {
     if constexpr (kGlu == 1) {
@@ -353,22 +351,17 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     constexpr u32 kTx = kPair * ((kMixP ? kRawBytes : kTxP * kPT) + (kMixQ ? kRawBytes : kTxQ) +
                                  kSfP + kSfQ);
     constexpr u32 kSfCols = 4 * kAtomsP * kPT * kRowAtomsP + 4 * kAtomsQ * kRowAtomsQ;
-    // Scales go to TMEM from their own warp, up to four K steps ahead in
-    // their own slots: a copy in the MMA thread's stream would hold every
-    // MMA behind it until it lands, and a shallower ring would hold the
-    // copier on the MMAs.
+    // Scales go to TMEM from their own warp, up to four K steps ahead in their
+    // own slots, so neither the MMA thread nor the copier waits on the other.
     constexpr u32 kSfSlots = kStages < 4 ? kStages : 4;
-    // A W4A16 weight on the A side (swapped) lands in TMEM instead: an A
-    // slot a ring stage (so the stage's own barriers guard it) of each P
-    // tile's 64 K (32 columns of two bf16), past the accumulators where the
-    // scale slots would sit.
+    // A swapped W4A16 weight lands in TMEM instead: an A slot a ring stage of
+    // each P tile's 64 K, past the accumulators.
     constexpr u32 kASlots = kStages;
     constexpr u32 kSfAll = kScaled ? kSfSlots * kSfCols : kMixP ? kASlots * kPT * 32 : 0;
     static_assert(!kMixP || kASlots % kXGroups == 0, "W4A16's groups own alternate A slots");
-    // Two accumulator stages always. When they and the scale slots overrun
-    // TMEM the stages share kOv columns -- stage 0's tail is stage 1's head --
-    // and a tile's first MMA waits until the previous tile's epilogue has
-    // read them. The scale slots sit past both stages.
+    // Two accumulator stages; when they and the scale slots overrun TMEM the
+    // stages share kOv columns, and a tile's first MMA waits on the previous
+    // tile's epilogue to read them.
     constexpr u32 kOvRaw = 2 * kAccN + kSfAll > 512 ? 2 * kAccN + kSfAll - 512 : 0;
     constexpr u32 kOv = (kOvRaw + 15) / 16 * 16;
     constexpr u32 kOvChunks = (kOv + 31) / 32;
@@ -386,10 +379,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     // shared memory instead.
     constexpr u32 kOutBytes = kSwap ? (kOut != 0 ? 1024 : 0) : 4 * 2 * 2048;
     constexpr u32 kOffBar = kOffOut + kOutBytes;
-    // A grouped launch holds the routing (offsets or counts) in shared memory:
-    // every role reads it once a unit, empty units most.
-    // Offsets and tile starts an expert; a swapped contiguous launch, each
-    // expert's live rows too.
+    // A grouped launch holds the routing (offsets or counts, and a swapped
+    // contiguous launch's live rows) in shared memory, read once a unit.
     constexpr bool kLives = kGroup == 1 && kSwap;
     constexpr u32 kGroupInts = kGroup == 0 ? 0 : (kLives ? 3 : 2) * 1028;
     constexpr u32 kBytes = kOffBar + (3 * kStages + 16) * 8 + 8 + kGroupInts * 4;
@@ -448,15 +439,12 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         tmem_alloc<kPair>(tmem_slot, kCols);
         tmem_relinquish<kPair>();
     }
-    // Launched as its producer's programmatic dependent (`kernel.pdl`), the
-    // set-up above overlapped that kernel's tail; nothing it wrote, nor any
-    // byte it may still read, is touched before it has finished. Without the
-    // attribute the wait returns at once.
+    // As a programmatic dependent (`kernel.pdl`) the set-up above overlapped
+    // the producer's tail; wait for it before touching memory.
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    // A masked launch counts each expert's tiles up front, so units map
-    // straight onto the busy experts: walking empty ones costs every role
-    // a unit's bookkeeping each.
-    // An expert's output columns: its bank rows, or a GLU's gate rows.
+    // A masked launch counts each expert's tiles up front, so units map onto
+    // the busy experts alone. An expert's output columns: its bank rows, or a
+    // GLU's gate rows.
     const int span = kFused ? inter : n_per;
     const int masked_p = (span + 127) / 128;
     const int cont_q = (span + static_cast<int>(kQStep) - 1) / static_cast<int>(kQStep);
@@ -516,11 +504,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     }
     tc_fence_after();
     const u32 tmem = *tmem_slot;
-    // Every CTA of this persistent grid is resident and holds its TMEM, so
-    // its dependent (under `kernel.pdl`: a split-K finalize, or the next
-    // tcgen05 GEMM) may launch now; it waits for this grid to finish and
-    // flush before it touches memory. Not earlier: a dependent's CTA that
-    // took an SM's TMEM first would leave this one's alloc spinning on it.
+    // Every CTA is resident and holds its TMEM, so the dependent may launch
+    // now (not earlier: its CTA could take an SM's TMEM first).
     asm volatile("griddepcontrol.launch_dependents;");
 
     // Tiles along P and Q (of one expert, when grouped), and the experts.
@@ -772,11 +757,9 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             }
         }
     } else if (warp == 6) {
-        // The scale copier: each K step's scales into slot (step %
-        // kSfSlots) once the MMAs kSfSlots steps back have read it -- the
-        // commit that empties that step's stage says so, and the MMA thread
-        // commits nothing else for it. Shared memory holds [row block][atom];
-        // TMEM takes [atom][row block], a step's row blocks adjacent.
+        // The scale copier: each K step's scales into slot (step % kSfSlots) once
+        // the MMAs kSfSlots steps back have read it. Shared memory holds
+        // [row block][atom]; TMEM takes [atom][row block].
         if (kScaled && lane == 0 && leader) {
             u32 s = 0, phase = 0, step = 0;
             for (int t = first_tile; t < tiles; t += tile_step) {
@@ -920,15 +903,10 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             }
         }
     } else if (kMixed && warp >= 7) {
-        // The transform warps: each stage's raw weight codes as bf16 in the
-        // 128-byte-swizzled K-major tile TMA would have landed. A thread
-        // keeps one 16-byte chunk (8 codes) of every 16th row; its scales
-        // come row-major from global memory.
-        // Two groups of warps take turns a stage: a stage's few rows leave
-        // each group's round mostly latency. The ring is even, so each slot
-        // is one group's and every barrier a group waits on, it waits on in
-        // order (a parity wait a round ahead would pass on the round
-        // before).
+        // The transform warps: each stage's raw codes as bf16 in the swizzled tile
+        // TMA would have landed, a thread one 16-byte chunk of every 16th row, its
+        // scales row-major from global memory. Two groups of warps take turns a
+        // stage, each waiting on its own slots' barriers in order.
         constexpr u32 kGroupWarps = tc5k::kXWarps / kXGroups;
         const u32 xgroup = (warp - 7) / kGroupWarps;
         const u32 t = (threadIdx.x - 224) % (32 * kGroupWarps);
@@ -1214,11 +1192,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             // takes the plain path, not the per-column guards below (the
             // same sums: a zero bias's add turns -0 to +0 there too).
             const bool plain = !wscaled && !biased && epi.row_scale == nullptr;
-            // A SwiGLU landing an NVFP4 operand under each expert's global
-            // takes gate and up as the select's bf16 rows would hold them
-            // (the store rounds its row to bf16, as `linear.mlp_swiglu`
-            // lands it). Its quotient stays the fast one: the exact one held
-            // a prefill's epilogue to a third of its pace.
+            // A SwiGLU landing an NVFP4 operand under each expert's global takes gate
+            // and up rounded to bf16, as apart; its quotient stays the fast one.
             auto glu_of = [&](float g, float u) -> float {
                 if constexpr (kOut == 2 && kGlu == 1) {
                     if (epi.in_scale != nullptr) {
@@ -1287,10 +1262,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 tmem_wait_ld();
                 finish(c0, f, v, u, h);
             };
-            // The columns the next tile's MMA shares go first: stage 0
-            // drains tail first, stage 1 head first. A GLU's math is long
-            // enough to hold that MMA back, so its shared columns are all
-            // read before any of it, and the MMA released then.
+            // The columns the next tile's MMA shares drain first; a GLU reads them all
+            // before any of its math, so the MMA is released early.
             const bool reverse = kOv > 0 && acc == 0;
             auto col = [&](u32 chunk) {
                 return reverse ? 32 * (kChunks - 1 - chunk) : 32 * chunk;
@@ -1552,10 +1525,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     out_buf ^= 1;
                 }
             }
-            // A split tile's last split to land sums every split's slab in
-            // split order and rounds y, as the finalize did: the same bits,
-            // a launch fewer. Each thread sums what it stored itself (every
-            // split of a tile stores the same places), past a fence, and the
+            // A split tile's last split sums every split's slab in split order and
+            // rounds y, as the finalize did; each thread sums what it stored, and the
             // count is left at zero for the next launch.
             if constexpr (kOut == 0 && !kFused) {
                 if (splits > 1 && epi.tickets != nullptr) {

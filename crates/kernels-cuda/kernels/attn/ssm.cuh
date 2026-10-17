@@ -514,11 +514,9 @@ __global__ void ssm_causal_conv1d_chunked_batched_row_tile_vec8(
     }
 }
 
-// The row-tiled conv four channels a thread (one 8-byte vector a row) for
-// a four-tap, undilated kernel: the 16-byte form's registers held a block
-// to three an SM on sm_100, where four channels and a 64-register bound
-// keep eight resident and the SiLU's divide hides under the loads. The sums
-// run in the 16-byte form's order, so the two land the same bits.
+// The row-tiled conv four channels a thread (one 8-byte vector a row): a
+// 64-register bound keeps eight blocks resident on sm_100. Same sums, same
+// order, same bits as the 16-byte form.
 template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void __launch_bounds__(128, 8) ssm_causal_conv1d_chunked_batched_row_tile_vec4(
     const T* __restrict__ x,
@@ -2276,18 +2274,12 @@ __device__ __forceinline__ void gdn_rows_sum(float (&x)[8]) {
     }
 }
 
-// One decode step of the gated delta rule, streamed. A warp owns a
-// sixteen-wide value tile of one head at a time and keeps the whole
-// `K_d x 16` state tile in registers: lane `l` holds the eight columns
-// `(l & 1) * 8` of key rows `l / 2 + 16 m`, so each state row is one 32-byte
-// sector two lanes read whole, and the key and query rows a lane needs are
-// the rows it holds — the norms, both column sums and the update stay inside
-// the warp. The warps are persistent: each walks every `gridDim.x * W`-th
-// tile, and the next tile's state, q and k rows, value slice and gates
-// stream into the warp's other shared-memory stage while this one is
-// computed, so a warp keeps a tile's bytes in flight all the time. The host
-// keeps the state, the qkv row and the output 16-byte aligned and the key
-// width a whole number of sixteen-row steps no wider than 128.
+// One decode step of the gated delta rule, streamed: a warp owns a 16-wide
+// value tile of one head and keeps its `K_d x 16` state tile in registers
+// (lane `l` holds columns `(l & 1) * 8` of key rows `l / 2 + 16 m`), so the
+// norms, column sums and update stay in the warp. Persistent warps prefetch
+// the next tile's operands into their other shared stage. The host keeps the
+// planes 16-byte aligned and the key width a multiple of 16 up to 128.
 constexpr int GDN_STREAM_STAGE = 4096 + 512 + 32 + 32;
 
 template <int W>
@@ -2872,12 +2864,9 @@ __device__ __forceinline__ float* kda_state_or_copy(
     return copy;
 }
 
-// `ssm_kda_step_batched` over the packed rows themselves: a block a (row,
-// head) reads its head's query, key and value out of the post-convolution
-// `[q | k | v]` row, normalizes the query and key (a warp a vector, summed
-// as `ssm_kda_qkv_prep` sums them), forms its gates and beta from the raw
-// rows (as `ssm_kda_gate_beta` forms them), then steps its state: the same
-// values, without the three staged planes and their two launches.
+// `ssm_kda_step_batched` over the packed `[q | k | v]` rows themselves: the
+// query and key norms and the gates and beta formed in place, the same
+// values without the staged planes and their two launches.
 template <class ElemT>
 __global__ void ssm_kda_step_fused(
     const ElemT* __restrict__ mixed,
@@ -3632,18 +3621,12 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_prep(
     }
 }
 
-// The sequential half: one block per (request, value head, `BV`-wide value
-// tile) walks the request's chunks in order with the `BK x BV` state in f32
-// accumulators. Each chunk lands its output — the decayed state's reading
-// `exp(G_i) q_i S` plus the chunk's own causal part `P v_new`, with `P` the
-// prep's decayed causal scores and `v_new = u - w S` — and then folds the
-// chunk into the state, `S = exp(G_L) S + k^T (exp(G_L - G_j) v_new)`. The
-// chunk's rows split four ways and its value columns two ways over the
-// eight warps. Each operand of the next chunk streams in as soon as this
-// chunk is done with its buffer: q, w and u once `v_new` is formed, the
-// scores once the output is, and the decay into a second buffer. The keys,
-// read by the fold alone, land in one buffer during the chunk they fold:
-// so two blocks fit an SM, and one's syncs hide behind the other's work.
+// The sequential half: one block per (request, value head, `BV` values)
+// walks the request's chunks with the `BK x BV` state in f32 accumulators,
+// landing `exp(G_i) q_i S + P v_new` (`v_new = u - w S`) and folding
+// `S = exp(G_L) S + k^T (exp(G_L - G_j) v_new)`. Rows split four ways and
+// value columns two over the eight warps; each next-chunk operand streams in
+// as soon as its buffer frees, so two blocks fit an SM.
 template <int BV>
 __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
     const float* __restrict__ gcum,
@@ -3958,13 +3941,10 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
 // decay of one, so both land in bf16 and the tensor cores take them.
 constexpr int KDA_LDF = 132;
 
-// The prep's shared memory, in four regions reused as the chunk goes on, so
-// two blocks share an SM: the keys (bf16) and then `T` and then the scaled
-// values; the queries (bf16) and then `A`, a row of each the same 272 bytes,
-// so a block of `A` rows lands where its queries were read; the keys `w`
-// reads; the split-scaled keys and queries of a block and then the
-// inversion's scratch and then `T`'s two scalings; and the decay's running
-// sum in f32.
+// The prep's shared memory, four regions reused as the chunk goes on so
+// two blocks share an SM (keys, then `T`, then the scaled values; queries
+// then `A`; the keys `w` reads; the split-scaled rows, then scratch), plus
+// the decay's running sum in f32.
 constexpr int KDA_PREP_SMEM =
     3 * GDN_CH * GDN_LD * 2 + (GDN_CH + 32) * GDN_LD * 2 + GDN_CH * KDA_LDF * 4 + GDN_CH * 4;
 

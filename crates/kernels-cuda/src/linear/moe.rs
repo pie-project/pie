@@ -462,12 +462,9 @@ fn tc5_fell_back(op: &'static str, why: &Error) {
     }
 }
 
-/// Whether a select of `x` (bf16) runs on the grouped tcgen05 GEMM: a
-/// resident bank on a device that has it, at widths its tiles take (a live
-/// window lays out only its routes), for a fire of `kernel.moe.tc5_from`
-/// tokens or more -- narrower ones keep the GEMV, whose one launch beats
-/// the layout's four (Qwen3.6-35B-A3B decode: 3.9 ms a token on the GEMV,
-/// 5.3 ms on the grouped GEMM, at one token, and even at eight).
+/// Whether a bf16 select runs on the grouped tcgen05 GEMM: a resident bank
+/// at widths its tiles take, from `kernel.moe.tc5_from` tokens (narrower
+/// fires keep the one-launch GEMV).
 #[cfg(feature = "cuda")]
 pub(crate) fn tc5_worth(
     ctx: &Ctx,
@@ -489,10 +486,8 @@ pub(crate) fn tc5_worth(
 }
 
 /// `y[route] = x[route or its token] . W[routes[route]]^T` on one grouped
-/// tcgen05 GEMM: the routes laid out by expert on the device, the
-/// activations scattered into their experts' rows, and the product
-/// gathered back to route order. No route-count limit past the device's
-/// memory.
+/// tcgen05 GEMM: routes laid out by expert, rows scattered in, the product
+/// gathered back to route order.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select_tc5(
@@ -542,11 +537,8 @@ pub(crate) fn select_tc5(
     act_quant::gather_back(ctx, op, ys, layout.pos, routes.width, y)
 }
 
-/// A gate-up bank a fused select reads: bf16 `[experts][2 * inter * k]`,
-/// mxfp4 codes and row-major ue8m0 scales (with an optional bf16 bias a
-/// row), nvfp4 codes, e4m3 scales and an f32 tensor scale a row, or affine
-/// u4 codes and bf16 scales and zeros a group; each expert's gate rows,
-/// then its up rows.
+/// A gate-up bank a fused select reads (bf16, mxfp4 with an optional bias,
+/// nvfp4, or affine u4): each expert's gate rows, then its up rows.
 #[derive(Clone, Copy, Debug)]
 pub enum GluBank {
     Bf16(Tensor),
@@ -664,11 +656,9 @@ fn bank_operand(
     })
 }
 
-/// `y[route] = glu(x[route or its token] . W[routes[route]]^T)`, the GLU
-/// in the grouped tcgen05 GEMM's epilogue: `y` is `[routes][inter]`, the
-/// bank's experts `2 * inter` rows each. `Ok(false)` when this fire does
-/// not take it (no tcgen05, a narrow fire, a streamed bank, widths it does
-/// not tile): the caller runs the select and the GLU apart.
+/// `y[route] = glu(x[route or its token] . W[routes[route]]^T)`, the GLU in
+/// the grouped tcgen05 GEMM's epilogue. `Ok(false)` where the fire does not
+/// take it: the caller runs the select and the GLU apart.
 #[cfg(feature = "cuda")]
 pub fn select_glu(
     ctx: &Ctx,
@@ -762,13 +752,9 @@ pub fn select_glu(
 }
 
 /// A routed MLP on the grouped tcgen05 GEMM, its rows kept by expert from
-/// the gate-up select to the down select: `y[token]` is the sum over `j`
-/// of `weights[token][j]` times `down(glu(up(x[token])))` on expert
-/// `routes[token][j]`. The routes are laid out
-/// once, the activations scattered into their experts' rows once, the GLU
-/// lands from the gate-up GEMM's epilogue into the down GEMM's operand, and
-/// the weighted sum reads the down product where it lies. `Ok(false)` when
-/// a leg is not one the grouped GEMM takes: the caller runs the four apart.
+/// the gate-up select to the down select: routes laid out once, the GLU
+/// landing from the gate-up epilogue into the down operand, the weighted
+/// sum reading the down product in place. `Ok(false)`: run the four apart.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn experts(
@@ -894,31 +880,19 @@ pub fn experts(
     Ok(run().is_ok())
 }
 
-/// [`experts`] on two W4A4 banks: the routes laid out once (the gate-up
-/// leg's alpha with them), the activations quantized into their experts'
-/// rows under each expert's global, the gate-up GEMM's epilogue landing
-/// the GLU as the down GEMM's NVFP4 operand under the down leg's globals
-/// (rounded through bf16 first, as the GLU's row and the down select's
-/// quantizer would land it), and the weighted sum reading the down product
-/// where it lies. A fire under `kernel.moe.w4a4_fused_from` tokens runs the
-/// four apart, as does one narrow enough to lay its routes out masked; a
-/// decode's few rows an expert run the gate-up swapped.
-/// The most routes an expert on average whose W4A4 gate-up and down run
-/// swapped. Paced at GLM-5.3's eight-expert miniature (4096 x 6144 and
-/// 6144 x 2048, weights read cold, NVFP4 at 128 K a stage): at 64 routes an
-/// expert swapped 41.4 + 21.6 us against 56.4 + 24.5, at 128 unswapped
-/// 36.9 + 25.8 against 55.1 + 33.1.
+/// The most routes an expert on average whose W4A4 legs run swapped
+/// (GLM-5.3's experts, measured).
 #[cfg(feature = "cuda")]
 const SWAPPED_UP_ROUTES: u32 = 64;
 
 /// A W4A8 routed MLP of this many routes an expert or fewer runs its
-/// gate-up swapped, in 64-row Q tiles. Measured at DeepSeek-V4-Flash's
-/// layer (256 experts, top 6, 4096 x 2048), held at the power cap: the
-/// whole MLP 713 -> 679 us at 64 tokens, 916 -> 883 at 512, 938 -> 906 at
-/// 1024; at 2048 (48 an expert) unswapped wins, 982 against 1008.
+/// gate-up swapped, in 64-row Q tiles (DeepSeek-V4-Flash, measured).
 #[cfg(feature = "cuda")]
 const SWAPPED_W4A8_UP_ROUTES: u32 = 32;
 
+/// [`experts`] on two W4A4 banks: the GLU lands as the down GEMM's NVFP4
+/// operand (rounded through bf16 first, as apart). Under
+/// `kernel.moe.w4a4_fused_from` tokens, or masked, the four run apart.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn experts_w4a4(
@@ -1105,13 +1079,8 @@ fn experts_w4a4(
 }
 
 /// [`experts`] on two W4A8 banks (MXFP4 codes against e4m3 activations in
-/// 1x128 blocks): the routes laid out once, the activations quantized into
-/// their experts' rows, the gate-up GEMM's epilogue landing the GLU as the
-/// down GEMM's e4m3 operand (as the down select's quantizer would land the
-/// GLU's bf16 row, save the bf16 rounding between), and the weighted sum
-/// reading the down product where it lies. A fire under
-/// `kernel.moe.w4a8_fused_from` tokens runs the four apart, as does one
-/// narrow enough to lay its routes out masked.
+/// 1x128 blocks): the GLU lands as the down GEMM's e4m3 operand. Under
+/// `kernel.moe.w4a8_fused_from` tokens, or masked, the four run apart.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn experts_w4a8(
@@ -1153,11 +1122,9 @@ enum W4a8Sum {
     WeightedFirst(Tensor),
 }
 
-/// [`experts`]' W4A8 routed MLP the DeepSeek way: the route weights scale the
-/// GLU's rows before they quantize for the down leg
-/// (`mlp_swiglu_clamp_routed`), and the routes are summed plainly with the
-/// shared row added (`moe_sum_add`). `Ok(false)` where the grouped GEMM does
-/// not take it: the caller runs the four apart.
+/// [`experts`]' W4A8 routed MLP the DeepSeek way: route weights scale the
+/// GLU's rows before the down leg quantizes them, and the routes sum plainly
+/// with the shared row added. `Ok(false)`: run the four apart.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn experts_weighted_first(
@@ -1323,11 +1290,8 @@ fn experts_w4a8_as(
             groups: layout.groups,
             alpha_e: 0,
         };
-        // A few rows an expert run the gate-up swapped: the bank on P, the
-        // rows on 64-row Q tiles, where unswapped each expert's rows fill a
-        // 128-row MMA tile and its 256-row weight tile. The products are the
-        // same, at a quarter the MMA work, so the power cap (the W4A8 MMA's
-        // issue rate holds both near 4.3-4.7 TB/s) clocks less down.
+        // A few rows an expert run the gate-up swapped (bank on P, rows on 64-row
+        // Q tiles): the same products at a quarter the MMA work.
         let sms = ctx.multiprocessors().unwrap_or(148);
         let up_plan = if count <= SWAPPED_W4A8_UP_ROUTES * experts {
             tc5::Plan {
@@ -1581,10 +1545,9 @@ fn select_grouped(
 
     let alpha = 1.0f32;
     let beta = 0.0f32;
-    // SAFETY: `handle` is this context's live cuBLAS handle, already bound
-    // to its stream by the shell. The three pointer arrays hold `blocks`
-    // entries each, written by the launch above into slabs this context
-    // owns and holds for the fire's life.
+    // SAFETY: `handle` is this context's live cuBLAS handle bound to its
+    // stream; the pointer arrays hold `blocks` entries in slabs this context
+    // owns for the fire's life.
     let status = unsafe {
         cublasGemmBatchedEx(
             handle,
@@ -1767,10 +1730,7 @@ std::thread_local! {
 }
 
 /// Runs `f` with its select keeping the route order it lays, for the next
-/// select of the same routes (a gate-up select whose GLU runs apart, before
-/// its down select): the caller vouches that the next select to lay an
-/// order reads these routes unchanged, and that one takes the order rather
-/// than lay it again.
+/// select of the same routes, which takes the order rather than lay it again.
 pub fn keeping_order<R>(f: impl FnOnce() -> R) -> R {
     struct Reset(bool);
     impl Drop for Reset {
@@ -1818,10 +1778,8 @@ fn route_order_sliced(
         return Ok(order);
     }
     let offsets_at = (fan.route_count as usize).next_multiple_of(64);
-    // An expert's items are its whole slices and at most one part slice, and
-    // no more experts hold routes than there are routes: at decode widths
-    // the grid is the routes', not the bank's (8 tokens of top 6 over 256
-    // experts: 54 items, not 262).
+    // An expert's items are its whole slices and at most one part slice: at
+    // decode widths the grid is the routes', not the bank's.
     let work_cap = fan.route_count.div_ceil(slice) + experts.min(fan.route_count);
     let work_at = (offsets_at + experts as usize + 3).next_multiple_of(64);
     let order = ctx.scratch(
@@ -1867,10 +1825,8 @@ fn route_order_sliced(
     Ok(laid)
 }
 
-/// Whether a fire of `routes` routes is one the register-dequant MMA kernel
-/// takes: from `kernel.moe.mxfp4_mma_from` to `kernel.moe.mxfp4_mma_until`
-/// routes (until 0, never, but where a chip's profile says). Narrower fires
-/// keep the per-route GEMV, wider ones the grouped GEMMs.
+/// Whether the register-dequant MMA kernel takes a fire of `routes` routes:
+/// `kernel.moe.mxfp4_mma_from ..= kernel.moe.mxfp4_mma_until`.
 #[cfg(feature = "cuda")]
 fn mxfp4_mma_spans(ctx: &Ctx, routes: u32) -> bool {
     let t = ctx.tuning();
@@ -2030,23 +1986,16 @@ fn select_mxfp4_mma(
             Share::Take
         },
     )?;
-    // A fire of a few routes leaves most SMs idle: K splits across a
-    // cluster of two CTAs (`kernel.moe.mxfp4_cvt_ksplit_until`), each
-    // streaming half the bank's rows' codes. DeepSeek-V4-Flash's W4A8 select
-    // at one token (6 routes): gate-up 32.6 -> 27.1 us, down 21.7 -> 19.4;
-    // at two tokens and up the split loses.
+    // A fire of a few routes splits K across a cluster of two CTAs
+    // (`kernel.moe.mxfp4_cvt_ksplit_until`), each streaming half the codes.
     let ksplit = if cvt && fan.route_count <= ctx.tuning().mxfp4_cvt_ksplit_until {
         2
     } else {
         1
     };
     let grid = [work_cap * ksplit, y.width.div_ceil(cols), 1];
-    // The e2m1 converts exist on the arch-specific Blackwells alone, the
-    // ones that run tcgen05. Two chunks in flight a warp and a window of 8
-    // chunks of one 8-route block (32 KiB for the two): four CTAs an SM at
-    // one block, the registers' bound (gpt-oss at 8 tokens, gate-up 74 us
-    // and down 49 against 92 and 54 on the bf16 path; a third chunk, or
-    // five CTAs on fewer registers, no faster).
+    // The e2m1 converts exist on the tcgen05 Blackwells alone. Two chunks in
+    // flight a warp, a window of 8 chunks of one 8-route block: four CTAs an SM.
     let fire = if cvt {
         const DEPTH: u32 = 2;
         let win = 8 / nb;
@@ -2076,10 +2025,7 @@ fn select_mxfp4_mma(
                 None => format!("::pie::linear::moe_select_mxfp4_mma<{nb}, 1, {code}>"),
             }),
         )
-        // One chunk in flight a warp: its 93 registers seat five CTAs an SM,
-        // and the warps between them hide the loads better than a deeper
-        // ring in fewer warps (gpt-oss at 64 tokens, gate-up 308 -> 305 us,
-        // down 172 -> 164).
+        // One chunk in flight a warp: five CTAs an SM.
         .apply(Launch::grid(grid, [THREADS, 1, 1]))
     };
     let mut args = vec![
@@ -2124,13 +2070,9 @@ pub fn select_mxfp4_atoms_takes(ctx: &Ctx, routes: Tensor, x: Tensor) -> bool {
         && x.width.is_multiple_of(32)
 }
 
-/// A routed mxfp4 select whose scales are laid in tcgen05's atoms (a W4A8
-/// bank's, its rows counted across the experts) on the e2m1-convert
-/// register-dequant kernel, against bf16 activations (for a W4A8 select,
-/// [`crate::linear::act_quant::read_back`]'s). `Ok(false)` where that
-/// kernel does not take the fire: off in this chip's profile, a width
-/// outside `kernel.moe.mxfp4_a8_from ..= kernel.moe.mxfp4_a8_until`, or a
-/// K of part blocks.
+/// A routed mxfp4 select with tcgen05-atom scales (a W4A8 bank) on the
+/// e2m1-convert register-dequant kernel, against bf16 activations.
+/// `Ok(false)` where the kernel does not take the fire.
 #[cfg(feature = "cuda")]
 pub fn select_mxfp4_atoms(
     ctx: &Ctx,
@@ -2235,10 +2177,8 @@ fn matmul_select_mxfp4(
     let act_div = if fan.by_token { fan.top_k } else { 1 };
 
     let experts = codes.rows.clamp(1, EXPERT_CAP);
-    // The grouped kernels read an expert once per batch of its routes, the
-    // by-route one once per route but at the card's streaming rate, so grouping
-    // pays only once an expert serves more than `kernel.moe.mxfp4_grouped_reuse`
-    // routes on average; routes over experts is a floor on that average.
+    // Grouping pays once an expert serves more than
+    // `kernel.moe.mxfp4_grouped_reuse` routes on average.
     if fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts && ctx.tuning().mxfp4_grouped {
         let RouteOrder {
             order,
@@ -2707,14 +2647,11 @@ pub fn sigmoid_gate_add(
 /// took 20, 30 and 58 us to its 14 to 15, staged or split as it might be).
 pub const GROUPED_FP8_ROWS: u32 = 8;
 
-/// A grouped projection on fp8 planes (DeepSeek-V4's `wo_a` as its
-/// checkpoint stores it, and as vLLM reads it): `y[r, g*n ..] = q(x[r, g*k
-/// .. g*k + k]) . w_g^T`, each plane `[n, k]` of e4m3 codes under one ue8m0
-/// exponent a 128x128 block (`scales`, spread to the block's rows in
-/// tcgen05's atoms as the load lays them), `q` the rows' e4m3 1x128
-/// quantization (DeepSeek's `act_quant`), in the same launch: DeepSeek's
-/// W8A8 product on mma.sync, each plane streamed once. At most
-/// [`GROUPED_FP8_ROWS`] rows; `k` whole 512s, `n` whole 64s.
+/// A grouped projection on fp8 planes (DeepSeek-V4's `wo_a`):
+/// `y[r, g*n ..] = q(x[r, g*k .. g*k + k]) . w_g^T`, each plane e4m3 under a
+/// ue8m0 exponent a 128x128 block, `q` the rows' e4m3 1x128 quantization, in
+/// one launch on mma.sync. At most [`GROUPED_FP8_ROWS`] rows; `k` whole 512s,
+/// `n` whole 64s.
 #[cfg(feature = "cuda")]
 pub fn matmul_grouped_fp8(
     ctx: &Ctx,
@@ -2724,11 +2661,8 @@ pub fn matmul_grouped_fp8(
     y: &mut Tensor,
     groups: u32,
 ) -> Result<(), Error> {
-    // Four 16-row tiles a CTA (the rows quantized once for 64 rows of the
-    // plane), K in quarters a tile, two steps of codes in flight a warp: at
-    // DeepSeek-V4-Flash's planes 9.9 / 11.3 / 13.1 us at 1 / 4 / 8 rows past
-    // L2, where cuBLAS's bf16 takes 13.7 / 13.7 / 13.4 (two tiles: 9.8 /
-    // 12.4 / 16.4; eight: 21 and up; K in eighths: 14 and up).
+    // Four 16-row tiles a CTA, K in quarters a tile, two steps of codes in
+    // flight a warp (measured against cuBLAS's bf16 at DeepSeek-V4-Flash).
     matmul_grouped_fp8_with(ctx, x, codes, scales, y, groups, Fp8Shape::GROUPED)
 }
 
@@ -2752,13 +2686,9 @@ impl Fp8Shape {
     };
 }
 
-/// The CTA shape a dense fp8b128 projection (`n x k`) at `rows` decode
-/// rows runs [`matmul_grouped_fp8_with`] in, where it leads both the
-/// tcgen05 GEMM and `act_quant::fp8_block_gemv`; `None` where one of those
-/// does. Read off DeepSeek-V4-Flash's seven projections past L2 at 1, 4 and
-/// 8 rows (`the_dense_fp8_projections_pace`): at one row, and at up to 4
-/// rows of a narrow plane (`n` 1024 and under), the GEMV leads or ties; a
-/// 32 MiB plane past 4 rows keeps the GEMM.
+/// The CTA shape a dense fp8b128 projection (`n x k`) at `rows` decode rows
+/// runs [`matmul_grouped_fp8_with`] in where it leads the tcgen05 GEMM and the
+/// fp8 GEMV; `None` where one of those does (DeepSeek-V4-Flash, measured).
 #[must_use]
 pub fn dense_fp8_shape(rows: u32, n: u32, k: u32) -> Option<Fp8Shape> {
     let big = u64::from(n) * u64::from(k) >= 32 << 20;
@@ -2851,12 +2781,9 @@ pub fn matmul_grouped_fp8_with(
     )
 }
 
-/// A bf16 plane `[rows, k]` (whole 128x128 blocks) as fp8b128 in place of
-/// itself elsewhere: e4m3 codes `[rows, k]` at `codes`, and each block's
-/// ue8m0 exponent spread to its rows in tcgen05's atoms at `atoms`
-/// (`tc5::atom_bytes(rows, k, 128)` bytes, zeroed). Each block's exponent is
-/// the least that holds its amax (DeepSeek's rule), so a plane dequantized
-/// from fp8b128 (DeepSeek-V4's `wo_a`) lands codes of exactly its values.
+/// A bf16 plane `[rows, k]` as fp8b128: e4m3 codes at `codes`, each 128x128
+/// block's ue8m0 exponent spread in tcgen05's atoms at `atoms`. The exponent
+/// is the least that holds the block's amax (DeepSeek's rule).
 #[cfg(feature = "cuda")]
 pub fn quantize_fp8b128(ctx: &Ctx, src: Tensor, codes: u64, atoms: u64) -> Result<(), Error> {
     const OP: &str = "linear.quantize_fp8b128";
@@ -2924,12 +2851,9 @@ pub fn dequantize_fp8b128(
     )
 }
 
-/// A grouped projection whose routes send row group `g` to bank `g` (what
-/// `group_routes` lays): one strided batched GEMM, group `g` of every row
-/// against plane `g`, rather than the routed select's layout, gather,
-/// pointer table and reorder. `x` is `[rows, groups * k]`, `w` the plane
-/// `[groups * n, k]` (group `g`'s `n` rows after group `g - 1`'s), `y`
-/// `[rows, groups * n]`; bf16 throughout.
+/// A grouped projection whose routes send row group `g` to bank `g`: one
+/// strided batched bf16 GEMM, `x` `[rows, groups * k]`, `w`
+/// `[groups * n, k]`, `y` `[rows, groups * n]`.
 #[cfg(feature = "cuda")]
 pub fn matmul_grouped_strided(
     ctx: &Ctx,
@@ -2972,10 +2896,9 @@ pub fn matmul_grouped_strided(
     let handle = ctx.cublas(OP)?.cast::<cublasContext>();
     let alpha = 1.0f32;
     let beta = 0.0f32;
-    // Column-major: Y_g^T (n x rows) = W_g (row-major [n, k], so op T) x
-    // X_g^T (k x rows, a column every `groups * k`).
-    // SAFETY: `handle` is this context's live cuBLAS handle, bound to its
-    // stream by the shell; the three planes hold what the extents say.
+    // Column-major: Y_g^T = W_g (op T) x X_g^T.
+    // SAFETY: `handle` is this context's live cuBLAS handle bound to its stream;
+    // the planes hold what the extents say.
     let status = unsafe {
         cublasGemmStridedBatchedEx(
             handle,

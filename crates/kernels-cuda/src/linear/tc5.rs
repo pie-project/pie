@@ -38,12 +38,10 @@ pub enum Elem {
     U4,
 }
 
-/// A block-scale tensor in the atom layout -- except a W4A16 weight's (an
-/// e2m1 weight against bf16 activations), which lies row-major,
-/// `[rows][k / gran]`, as checkpoints store it: ue8m0 at gran 32 (mxfp4)
-/// or e4m3 at gran 16 (nvfp4, its per-tensor global left to `alpha` or
-/// `alpha_e`). The kernel dequantizes that weight to bf16 in shared memory,
-/// exactly, and multiplies on kind::f16.
+/// A block-scale tensor in the atom layout, except a W4A16 weight's, which
+/// lies row-major `[rows][k / gran]` as checkpoints store it (ue8m0 at 32,
+/// or e4m3 at 16 with its global left to alpha); the kernel dequantizes it
+/// to bf16 in shared memory and multiplies on kind::f16.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Scales {
     pub ptr: u64,
@@ -354,12 +352,9 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Rows of 64 or fewer put the weight on the 128-row side, the rows on
-    /// a narrow Q tile. Otherwise a pair of CTAs runs 256 x 256 tiles, each
-    /// streaming half of both operands' bytes a lone CTA would, unless lone
-    /// 128 x 128 tiles finish sooner for filling the `sms` better (a lone
-    /// SM runs at about 0.55 a paired one's rate). Either splits K when its
-    /// tiles leave SMs idle; see [`Plan::splits_for`].
+    /// Rows of 64 or fewer put the weight on the 128-row side. Otherwise a CTA
+    /// pair runs 256 x 256 tiles, unless lone 128 x 128 tiles fill the `sms`
+    /// sooner. Either splits K when its tiles leave SMs idle ([`Plan::splits_for`]).
     #[must_use]
     pub fn choose(m: u32, n: u32, k: u32, sms: u32) -> Self {
         if m <= 64 {
@@ -391,12 +386,9 @@ impl Plan {
         }
     }
 
-    /// K splits for `tiles` tiles of `steps` K steps on `slots` CTAs (or
-    /// pairs): enough to fill them once three or more fit, each keeping four
-    /// steps to pipeline. Fewer do not repay the f32 sum's zeroing, its
-    /// reductions (one a split per output) and its rounding pass (two
-    /// splits of a long-K mid-M tile measured slower for fp8 and NVFP4),
-    /// and more than one wave of splits only multiplies the reductions.
+    /// K splits for `tiles` tiles of `steps` K steps on `slots` CTAs (or pairs):
+    /// enough to fill them once three or more fit, each keeping four steps to
+    /// pipeline; never more than one wave of splits.
     #[must_use]
     pub fn splits_for(tiles: u32, steps: u32, slots: u32) -> u32 {
         let fit = slots / tiles.max(1);
@@ -786,13 +778,9 @@ pub const fn masked_atom_bytes(experts: usize, m_max: usize, k: usize, gran: usi
 }
 
 impl Plan {
-    /// A grouped GEMM's plan. Contiguous groups run unswapped on lone CTAs:
-    /// a stated plan may pair them (256-row tiles, an expert's rows padded
-    /// to 256 in the MMA), which measured 2-7% ahead only at uniform routing
-    /// of 8192 tokens, up to 1.7x behind at 1024 and 25% behind skewed;
-    /// masked groups swap, the Q tile the rows an expert may hold. `routed`
-    /// is the rows the routing is expected to fill in all (a decode's
-    /// tokens x top-k), which sizes the K splits without reading counts.
+    /// A grouped GEMM's plan: contiguous groups unswapped on lone CTAs (pairs
+    /// measured behind but at uniform routing), masked groups swapped. `routed`
+    /// is the rows the routing is expected to fill, which sizes the K splits.
     #[must_use]
     pub fn grouped(g: &Grouped, n: u32, k: u32, routed: u32, sms: u32) -> Self {
         let steps = k.div_ceil(128);
@@ -1077,14 +1065,9 @@ fn unpaired_if_mixed(act: Operand, w: Operand, plan: Plan) -> Plan {
     }
 }
 
-/// A wide W4A16 product runs swapped: its weight on the A side lands in
-/// TMEM, and a stage dequantizes 128 weight rows against up to 256 rows of
-/// activations, half the elements a GEMM step that the unswapped tile (256
-/// weight rows against 128) dequantizes. Measured on gpt-oss's legs: a
-/// contiguous select gains from 32768 routes (down 1308 -> 996 us) and with
-/// a GLU at any width (128 tokens: 894 -> 835 us), loses below (1024 tokens,
-/// down: 537 -> 588 us); a dense 4096 x 4096 gains from 1024 rows (88 ->
-/// 55 us) and loses at 128 (26 -> 32 us).
+/// A wide W4A16 product runs swapped (the weight's 128 rows on the A side),
+/// dequantizing half the elements a step: a contiguous select from 32768
+/// routes or with a GLU, a dense one from 1024 rows (gpt-oss, measured).
 fn swapped_if_mixed(act: Operand, w: Operand, plan: Plan, wide: bool) -> Plan {
     match Kind::of(act, w) {
         Ok(Kind::Mixed(_)) if !plan.swap && wide => Plan {
@@ -1151,10 +1134,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
         ..
     } = job;
     // NVFP4 at 128 K a stage where the profile says (`kernel.gemm.nvfp4_k128`):
-    // the ring doubles in the same shared memory. Unswapped only: a swapped
-    // (masked) select measured slower at it (Qwen3.8-Flash-Next's gate-up at
-    // 64 tokens, 140 -> 184 us), an unswapped one 5% ahead at 1024 tokens
-    // and even at 8192. Whole 128s of K.
+    // unswapped only (a swapped select measured slower), whole 128s of K.
     let kind = match kind {
         Kind::Nvf4 if ctx.tuning().gemm_nvfp4_k128 && !job.plan.swap && k.is_multiple_of(128) => {
             Kind::Nvf4K128

@@ -179,12 +179,10 @@ __global__ void hc_gates(
     }
 }
 
-// `hc_gates`' combined form with the combine's Sinkhorn walk held in one
-// warp's lanes (an entry a lane, `M * M <= 32`) and its sums taken by
-// shuffles, in the order the shared-memory walk takes them, rather than 40
-// block barriers; and the row's `H` spread over `gridDim.y` blocks, each of
-// which works the row's few gates out again. Block `y == 0` lands the post
-// and combine mixes.
+// `hc_gates`' combined form with the Sinkhorn walk in one warp (an entry a
+// lane, `M * M <= 32`, sums by shuffles in the shared walk's order) and the
+// row's `H` over `gridDim.y` blocks; block `y == 0` lands the post and
+// combine mixes.
 template <class T, int BLOCK = 256, bool VEC8 = false>
 __global__ void __launch_bounds__(BLOCK) hc_gates_warp(
     const float* __restrict__ mixes,
@@ -294,11 +292,9 @@ __global__ void __launch_bounds__(BLOCK) hc_gates_warp(
     }
 }
 
-// `hc_gates_warp`'s combined form with its two halves on blocks of their
-// own: blocks `y < gridDim.y - 1` work the pre gates out and land the
-// row's pre-mix eight columns a thread, the last block walks the combine's
-// Sinkhorn in one warp and lands the post and combine mixes. The pre-mix
-// waits on no Sinkhorn walk; every value is the one `hc_gates_warp` lands.
+// `hc_gates_warp` with its halves on blocks of their own: blocks
+// `y < gridDim.y - 1` land the pre-mix eight columns a thread, the last
+// walks the Sinkhorn. Every value is `hc_gates_warp`'s.
 template <class T, int BLOCK = 256>
 __global__ void __launch_bounds__(BLOCK) hc_gates_split(
     const float* __restrict__ mixes,
@@ -396,12 +392,9 @@ __global__ void __launch_bounds__(BLOCK) hc_gates_split(
 }
 
 // The combined gates and the RMS norm over the pre-mixed row in one launch:
-// blocks `y == 1` walk the combine's Sinkhorn and land the post and combine
-// mixes as `hc_gates_split` does; blocks `y == 0` take the row's pre-mix a
-// thread its columns `t`, `t + BLOCK`, ... (`PER` of them), each sum in the
-// gates' order rounded to the element as the gates land it, then the norm
-// as `rmsnorm` takes it: the squares in that order, the block's fold, the
-// weight. The pre-mixed row is never written; every value is the pair's.
+// blocks `y == 1` walk the Sinkhorn as `hc_gates_split` does; blocks
+// `y == 0` pre-mix the row (`PER` columns a thread, rounded as the gates
+// land it) and norm it as `rmsnorm` does. Every value is the pair's.
 template <class T, int PER, bool PARTIAL, int THREADS = 256, bool EMIT = false>
 __global__ void __launch_bounds__(THREADS) hc_gates_norm(
     const float* __restrict__ mixes,
@@ -432,11 +425,8 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int tid = threadIdx.x;
     const int mix_hc = M * 2 + M * M;
-    // Every load the fold does not feed is issued before it: the gates'
-    // scales and bases, the norm's weight and the streams the row pre-mixes.
-    // At a decode they come cold from memory (a step streams the experts'
-    // banks between one layer's use and the next), and each would otherwise
-    // be its own round trip after the fold.
+    // Every load the fold does not feed is issued before it: at a decode they
+    // come cold from memory.
     constexpr int COLS = H / THREADS;
     const int MM = M * M;
     float gate_s = 0.f, gate_b = 0.f, comb_s = 0.f, comb_b = 0.f;
@@ -478,11 +468,8 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
         const int warp = tid >> 5;
         const int lane = tid & 31;
         const int w = mix_hc + 1;
-        // The row's slices are runs of `w` adjacent values. A warp a slice
-        // group (slices `g`, `g + 32`, ...), its lanes the run's values, sums
-        // what lane `g` of a column's warp would; the groups' sums then fold
-        // a warp a column in that warp's order, so a warp's loads are a run's
-        // adjacent values rather than a value a run.
+        // A warp a slice group (slices `g`, `g + 32`, ...), its lanes the run's
+        // adjacent values; the groups' sums then fold in a column warp's order.
         if (THREADS == 1024 && w <= 32) {
             __shared__ float red[32][33];
             float sum = 0.f;
@@ -1178,12 +1165,9 @@ __global__ void ple_gate(
     }
 }
 
-// `hc_project` a block `kRows` rows and one of `gridDim.y` column slices: each
-// warp takes mix columns `warp`, `warp + 8`, ... (at most `kCols` of them),
-// its lanes walk the slice four floats at a time, a row read once for every
-// column and a column once for every row. One slice lands `mixes` itself;
-// several land `partial[slice][row][col]`, which `hc_project_fold` sums in
-// slice order.
+// `hc_project` a block `kRows` rows of one of `gridDim.y` column slices: a
+// warp a mix column at a time, a row read once for every column. Several
+// slices land `partial[slice][row][col]` for `hc_project_fold`.
 template <int kRows, int kCols>
 __global__ void __launch_bounds__(256) hc_project_split(
     const float* __restrict__ normed,
@@ -1279,14 +1263,11 @@ __global__ void hc_project_fold(
     mixes[static_cast<long long>(base) * mix_hc + i] = sum;
 }
 
-// `hc_project` tiled: a block `BR` rows of every mix column (up to 24) over a
-// slice of the row, the slice staged `KT` floats at a time in shared memory
-// by `cp.async` (`STAGES` deep), each thread four rows (strided a quarter
-// block apart, so a warp's 16-byte reads fall in distinct banks) by six
-// columns, four floats of the row a read; the tile's quads split over `KG`
-// thread groups whose sums fold in group order. A row is read once for all
-// its columns and a column once for `BR` rows. One slice lands `mixes`
-// itself; several land `partial[slice][row][col]` for `hc_project_fold`.
+// `hc_project` tiled: a block `BR` rows of every mix column (up to 24) over
+// a slice of the row, staged `KT` floats at a time by `cp.async` (`STAGES`
+// deep); each thread four rows by six columns, the quads split over `KG`
+// groups summed in group order. Several slices land `partial` for
+// `hc_project_fold`.
 __device__ __forceinline__ void hc_cp16(void* smem, const void* gmem)
 {
     const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(smem));
@@ -1424,12 +1405,9 @@ __global__ void __launch_bounds__(BR * KG) hc_project_tile(
 }
 
 // The stream norm and the mix projection in one pass over the bf16 streams:
-// `mixes = (x . w) * rsqrt(mean(x^2) + eps)`, the norm's one scale a row
-// taken out of the dot. `hc_project_tile`'s tiles over bf16 rows (eight a
-// 16-byte read), each thread's four rows' sums of squares taken beside the
-// dot by its tile's first column group. One slice lands `mixes` itself;
-// several land `partial[slice][row][mix_hc + 1]`, the dots then the sum of
-// squares, which `hc_prenorm_project_fold` sums in slice order and scales.
+// `mixes = (x . w) * rsqrt(mean(x^2) + eps)`, `hc_project_tile`'s tiles with
+// the sums of squares beside the dot. Several slices land
+// `partial[slice][row][mix_hc + 1]` for `hc_prenorm_project_fold`.
 template <int BR, int KG, int KT, int STAGES>
 __global__ void __launch_bounds__(BR * KG) hc_prenorm_project_tile(
     const bf16* __restrict__ streams,
@@ -1586,10 +1564,8 @@ __global__ void __launch_bounds__(BR * KG) hc_prenorm_project_tile(
     }
 }
 
-// The slices' partial dots and sums of squares summed, the dots scaled by
-// the row's norm into `mixes`: a warp a mix, its lanes over the slices
-// (lane `l` slices `l`, `l + 32`, ...) folded by shuffles, so a decode's
-// hundreds of slices are a few loads a lane rather than a walk.
+// The slices' partial dots and sums of squares summed and the dots scaled
+// by the row's norm: a warp a mix, its lanes over the slices.
 __global__ void __launch_bounds__(256) hc_prenorm_project_fold(
     const float* __restrict__ partial,
     float* __restrict__ mixes,
@@ -1646,14 +1622,10 @@ __global__ void __launch_bounds__(256) hc_fn_split(
     }
 }
 
-// `hc_prenorm_project_tile` on the tensor cores (mma.sync bf16): the 48
-// half-columns (the projection's high and low halves, summed at the end:
-// the bf16 products are exact and the sums f32, so the halves carry 16 bits
-// of each weight against tf32's 10) are the mma's rows, three tiles of 16,
-// and a warp's 8 NT stream rows its columns (NT tiles of 8), so each weight
-// fragment serves NT row tiles and each row fragment three: a block 32 NT
-// rows over four warps. A row's sum of squares comes off its B fragments.
-// One slice lands `mixes`; several land `partial[slice][row][mix_hc + 1]`.
+// `hc_prenorm_project_tile` on mma.sync bf16: the weight's high and low
+// bf16 halves (16 bits of each weight, summed in f32) are the mma's 48 rows,
+// a warp's 8 NT stream rows its columns; a row's sum of squares comes off its
+// B fragments. Several slices land `partial` as the tiled form does.
 template <int STAGES, int NT>
 __global__ void __launch_bounds__(128) hc_prenorm_project_mma_t(
     const bf16* __restrict__ streams,
@@ -1835,10 +1807,8 @@ __global__ void __launch_bounds__(256) hc_prenorm_project_fold_rows(
     }
 }
 
-// `hc_fold_vec8` a block a row for a prefill's rows (four streams): the
-// row's post and combine gates read once a thread as float4s, then each
-// thread's 16-byte runs (every 128th of the row) folded with the same
-// sums in the same order, the next run's loads in flight while one stores.
+// `hc_fold_vec8` a block a row for a prefill (four streams): the same sums
+// in the same order, the next run's loads in flight while one stores.
 template <class T>
 __global__ void __launch_bounds__(128) hc_fold_rows4(
     const T* __restrict__ x,
@@ -1900,11 +1870,8 @@ __global__ void __launch_bounds__(128) hc_fold_rows4(
     }
 }
 
-// A prefill's RMS norm of a 4096-wide row (the hyper-connection pre-mix's
-// normed row) that also lands the row's e4m3 1x128 operand for the GEMM
-// reading it next (`Run::hold_e4m3`): a block a row, a thread 16
-// consecutive values, eight threads a 128-wide block. The bf16 row and the
-// codes and atoms act_quant_e4m3 lands from it, in one pass.
+// A prefill's RMS norm of a 4096-wide row that also lands its e4m3 1x128
+// operand for the next GEMM (`Run::hold_e4m3`), in one pass.
 template <class T>
 __global__ void __launch_bounds__(256) rmsnorm_emit_e4m3(
     const T* __restrict__ x,
