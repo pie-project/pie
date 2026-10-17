@@ -504,8 +504,26 @@ pub fn matmul_grouped(
     matmul_select(ctx, x, bank, routes, y, experts)
 }
 
+/// Without a runtime there is no hipBLASLt.
+#[cfg(not(feature = "rocm"))]
+#[allow(clippy::too_many_arguments)]
+fn grouped_lt(
+    _: &Ctx,
+    _: &'static str,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+) -> Result<bool, Error> {
+    Ok(false)
+}
+
 /// `groups` strided bf16 matmuls in one hipBLASLt launch; `Ok(false)` where
 /// hipBLASLt is absent or offers no algorithm.
+#[cfg(feature = "rocm")]
 #[allow(clippy::too_many_arguments)]
 fn grouped_lt(
     ctx: &Ctx,
