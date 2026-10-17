@@ -1,9 +1,11 @@
 //! DeepSeek-V4.1-Flash's package lays out the release's plan: an Engram
 //! table as tall as the checkpoint states (`engram_num_embeddings:
 //! [384006168, 384016682]`), and CSA2's cross-layer reuse — a reuse layer
-//! reads its source's pool and index keys rather than writing its own.
+//! reads its source's pool and index keys rather than writing its own —
+//! and its Causal Encoder-Decoder's bounded replay, where a prompt's
+//! leading rows run the encoder alone.
 
-use poem_ir::{CacheRow, Platform};
+use poem_ir::{Attention, CacheRow, Fact, Operands, Operation, Platform};
 
 #[test]
 fn the_dsv41_plan_is_the_published_one() {
@@ -72,4 +74,46 @@ fn the_dsv41_plan_is_the_published_one() {
     );
     assert!(trace.params.iter().any(|p| p.name == "layer.20.indexer.wk"));
     assert!(trace.params.iter().all(|p| p.name != "layer.24.indexer.wk"));
+
+    // Bounded replay: a prompt's encoder-only rows run the encoder and the
+    // decoder's sources (layer 20's pool and index keys, from the encoder's
+    // last hidden states), and nothing past them; every decoder window
+    // reads above its rows' replay floor.
+    let encode = trace
+        .facts
+        .table
+        .iter()
+        .position(|fact| *fact == Fact::Flag("encode".into()))
+        .expect("the trace reads the encode flag");
+    let skipped = 1u64 << encode;
+    let mut floored = 0;
+    for node in &trace.nodes {
+        let Some(layer) = node.layer else { continue };
+        let runs_skipped = node.guard.holds(skipped);
+        let sources = matches!(
+            node.op,
+            Operation::Attention(
+                Attention::PoolKvAppend { .. } | Attention::PoolBoundaryPrefill { .. }
+            )
+        );
+        if layer > 20 || (layer == 20 && !sources && !runs_skipped) {
+            assert!(
+                !runs_skipped,
+                "layer {layer}'s `{}` runs on encoder-only rows",
+                node.op.name()
+            );
+        }
+        if layer == 20 && sources {
+            assert!(
+                runs_skipped,
+                "layer 20's `{}` skips encoder-only rows",
+                node.op.name()
+            );
+        }
+        if let Operation::Attention(Attention::PrefillLse { floor, .. }) = &node.op {
+            assert_eq!(floor.is_some(), layer >= 20, "layer {layer}'s window floor");
+            floored += usize::from(floor.is_some());
+        }
+    }
+    assert_eq!(floored, 20, "every decoder layer's window is floored");
 }

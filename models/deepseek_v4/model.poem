@@ -158,6 +158,7 @@ def base(w, kv, d):
         final_norm_eps = d.norm_eps,
         mtp = None,
         token_map = None,
+        decoder = None,
     )
 
 # ---------------------------------------------------------------------------
@@ -382,6 +383,7 @@ def flash(w, r, kv, d, quant = None):
         final_norm_eps = d.norm_eps,
         mtp = mtp,
         token_map = None,
+        decoder = None,
     )
 
 # ---------------------------------------------------------------------------
@@ -389,12 +391,16 @@ def flash(w, r, kv, d, quant = None):
 # reuse, Single-Pass mHC, and Engram conditional memory.
 # ---------------------------------------------------------------------------
 
+# `decoder`: the first decoder layer of the Causal Encoder-Decoder, whose
+# pool and index keys (projected from the encoder's last hidden states) are
+# the only ones the decoder reads.
 V41_PLAN = struct(
     layers = 40,
     ratios = [0, 0] + [2] * 18 + [1] * 20,
     kv_sources = [2, 8, 14, 20],
     index_sources = [2, 8, 14, 20, 24, 28, 32, 36],
     engram_layers = [1, 14],
+    decoder = 20,
 )
 
 # The miniature: source layers 0,1,2,3,20,21,24,25 of the release, so every
@@ -406,6 +412,7 @@ V41_MINI_PLAN = struct(
     kv_sources = [2, 4],
     index_sources = [2, 4, 6],
     engram_layers = [1],
+    decoder = 4,
 )
 
 def dims41(plan, experts = 384, base_vocab = 16000000):
@@ -610,6 +617,7 @@ def flash41(w, r, kv, d, quant = None):
         final_norm_eps = d.norm_eps,
         mtp = None,
         token_map = weight("engram.token_map", [d.vocab], dtype.i64) if plan.engram_layers else None,
+        decoder = plan.decoder,
     )
 
 def layout(id, deploy):

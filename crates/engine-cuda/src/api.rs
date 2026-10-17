@@ -64,6 +64,7 @@ pub struct Cuda {
     sink: Option<engine::CompletionSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
     adapters: BTreeMap<InstanceId, crate::Binding>,
+    replay: Option<crate::replay::Replay>,
 }
 
 impl Cuda {
@@ -81,6 +82,7 @@ impl Cuda {
             sink: None,
             pending: None,
             adapters: BTreeMap::new(),
+            replay: None,
         }
     }
 
@@ -601,6 +603,7 @@ impl Engine for Cuda {
             facts: shell.trace().facts.clone(),
         };
 
+        self.replay = crate::replay::Replay::of(&shell);
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -659,7 +662,19 @@ impl Engine for Cuda {
                 frame: id,
                 step: index as u32,
             };
-            let (ticket, step_settled) = match self.fire_step(step, at) {
+            // A causal encoder-decoder's long prompts: their leading rows
+            // through the encoder alone first, unannounced, then the step
+            // with each such prompt's last window (`crate::replay`).
+            let split = self.replay.and_then(|replay| replay.split(step));
+            if let Some((head, _)) = &split
+                && let Err(error) = self.fire_step(head, at, false)
+            {
+                self.pending = None;
+                let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
+                return Err(attributed(error, airborne));
+            }
+            let step = split.as_ref().map_or(step, |(_, tail)| tail);
+            let (ticket, step_settled) = match self.fire_step(step, at, true) {
                 Ok(both) => both,
                 Err(error) => {
                     self.pending = None;
@@ -934,18 +949,24 @@ impl Engine for Cuda {
 }
 
 impl Cuda {
+    /// `submission` fired; its completion told the sink where `announce`.
     fn fire_step(
         &mut self,
         submission: &Step,
         at: engine::StepDone,
+        announce: bool,
     ) -> EngineResult<(FireTicket, PendingStep)> {
         let id = self.next_fire;
         self.next_fire = self.next_fire.wrapping_add(1);
 
-        let done = self.sink.as_ref().map(|sink| crate::serve::Done {
-            at,
-            sink: std::sync::Arc::clone(sink),
-        });
+        let done = self
+            .sink
+            .as_ref()
+            .filter(|_| announce)
+            .map(|sink| crate::serve::Done {
+                at,
+                sink: std::sync::Arc::clone(sink),
+            });
         let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
         if !self.adapters.is_empty() {
             for attachment in &submission.attachments {

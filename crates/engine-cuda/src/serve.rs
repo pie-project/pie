@@ -421,6 +421,40 @@ impl Shell {
     }
 
     pub fn fire(&mut self, lanes: &[Lane<'_>]) -> Result<Vec<Vec<f32>>> {
+        // A causal encoder-decoder's long prompts: their leading rows
+        // through the encoder alone first (`crate::replay`).
+        if let Some(replay) = crate::replay::Replay::of(self) {
+            let window = replay.window as usize;
+            let cut = |lane: &Lane<'_>| lane.tokens.len() > window && lane.word & replay.bit == 0;
+            let heads: Vec<Seated<'_>> = lanes
+                .iter()
+                .filter(|lane| cut(lane))
+                .map(|lane| {
+                    Seated::of(Lane {
+                        word: lane.word | replay.bit,
+                        tokens: &lane.tokens[..lane.tokens.len() - window],
+                        ..*lane
+                    })
+                })
+                .collect();
+            if !heads.is_empty() {
+                self.fire_media(&heads, &[], &[], &mut Vec::new())?;
+                let tails: Vec<Seated<'_>> = lanes
+                    .iter()
+                    .map(|lane| {
+                        Seated::of(if cut(lane) {
+                            Lane {
+                                tokens: &lane.tokens[lane.tokens.len() - window..],
+                                ..*lane
+                            }
+                        } else {
+                            *lane
+                        })
+                    })
+                    .collect();
+                return self.fire_media(&tails, &[], &[], &mut Vec::new());
+            }
+        }
         let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
         self.fire_media(&seated, &[], &[], &mut Vec::new())
     }

@@ -22,6 +22,7 @@ struct SparseParams {
     q: u64,
     positions: u64,
     requests: u64,
+    floors: u64,
     win_indptr: u64,
     win_indices: u64,
     ent_indptr: u64,
@@ -116,7 +117,8 @@ pub fn takes_window(heads: u32, head_dim: u32, window: Option<u32>, window_pool:
 
 /// Lands the sinked attention of every row of `q` in `o`: the row's window
 /// of `window_pool` and its compressed entries in one softmax, scaled by
-/// `sigmoid(lse - sink)` a head. The caller checks [`takes`] first.
+/// `sigmoid(lse - sink)` a head; with `floors` (i32 a row) a row's window
+/// reads no key below its floor. The caller checks [`takes`] first.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill(
     ctx: &Ctx,
@@ -124,6 +126,7 @@ pub fn prefill(
     q: Tensor,
     positions: Tensor,
     requests: Tensor,
+    floors: Option<Tensor>,
     window_pool: &KvPool,
     pooled: &Pooled<'_>,
     sinks: Tensor,
@@ -144,6 +147,7 @@ pub fn prefill(
             q,
             positions,
             requests,
+            floors,
             window_pool,
             pooled,
             sinks,
@@ -180,6 +184,7 @@ pub fn prefill(
             q,
             positions,
             requests,
+            floors,
             &window_bf16,
             &staged,
             ent_compact,
@@ -200,6 +205,7 @@ pub fn prefill(
         q,
         positions,
         requests,
+        floors,
         window_pool,
         &viewed,
         ent_compact,
@@ -219,6 +225,7 @@ fn sparse(
     q: Tensor,
     positions: Tensor,
     requests: Tensor,
+    floors: Option<Tensor>,
     window_pool: &KvPool,
     pooled: &Pooled<'_>,
     ent_compact: bool,
@@ -309,6 +316,7 @@ fn sparse(
             q: q.ptr,
             positions: positions.ptr,
             requests: requests.ptr,
+            floors: floors.map_or(0, |f| f.ptr),
             win_indptr: window_pool.page_indptr.ptr,
             win_indices: window_pool.page_indices.ptr,
             ent_indptr: pooled.entries.page_indptr.ptr,
@@ -382,6 +390,7 @@ pub fn window_only(
         q,
         positions,
         requests,
+        None,
         window_pool,
         &pooled,
         sinks,

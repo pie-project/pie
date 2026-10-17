@@ -139,6 +139,10 @@ pub enum Attention {
         sm_scale: f32,
         o: ValueId,
         lse: ValueId,
+        /// Each row's least window position (i32 a row, from
+        /// `attention.replay_floor`): the window reads no key below it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        floor: Option<ValueId>,
     },
     DecodeSelected {
         q: ValueId,
@@ -564,6 +568,17 @@ pub enum Attention {
         map: Option<ValueId>,
         ngram_ids: ValueId,
     },
+    /// Bounded replay's floor, a lane's least position whose window keys a
+    /// replaying layer holds: with `mark` the lane's rows are the ones it
+    /// skips, and its state takes the position past its last row; without,
+    /// each row reads the floor its lane's state holds (0 for a lane that
+    /// never skipped). `floor` is i32 a row.
+    ReplayFloor {
+        positions: ValueId,
+        state: ValueId,
+        mark: bool,
+        floor: ValueId,
+    },
 }
 
 /// How `attention.index_topk` scores a block of keys.
@@ -652,7 +667,16 @@ impl Operands for Attention {
                 }
             }
             Self::DecodeLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
-            Self::PrefillLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
+            Self::PrefillLse {
+                q,
+                plan,
+                cache,
+                floor,
+                ..
+            } => {
+                sink.extend([*q, *plan, *cache]);
+                sink.extend(*floor);
+            }
             Self::DecodeSelected {
                 q,
                 plan,
@@ -960,6 +984,9 @@ impl Operands for Attention {
                 sink.extend([*ids, *state]);
                 sink.extend(*map);
             }
+            Self::ReplayFloor {
+                positions, state, ..
+            } => sink.extend([*positions, *state]),
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -1044,6 +1071,7 @@ impl Operands for Attention {
             Self::PoolLseSelected { o, lse, .. } => sink.extend([*o, *lse]),
             Self::PleNgramIds { ngram_ids, .. } => sink.push(*ngram_ids),
             Self::PleNgramIdsChunked { ngram_ids, .. } => sink.push(*ngram_ids),
+            Self::ReplayFloor { floor, .. } => sink.push(*floor),
         }
     }
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
@@ -1102,6 +1130,7 @@ impl Operands for Attention {
             Self::PoolLseSelected { .. } => {}
             Self::PleNgramIds { .. } => {}
             Self::PleNgramIdsChunked { .. } => {}
+            Self::ReplayFloor { .. } => {}
         }
     }
     fn name(&self) -> &'static str {
@@ -1161,6 +1190,7 @@ impl Operands for Attention {
             Self::PoolLseSelected { .. } => "attention.pool_lse_selected",
             Self::PleNgramIds { .. } => "attention.ple_ngram_ids",
             Self::PleNgramIdsChunked { .. } => "attention.ple_ngram_ids_chunked",
+            Self::ReplayFloor { .. } => "attention.replay_floor",
         }
     }
 }

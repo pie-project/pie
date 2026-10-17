@@ -18,6 +18,12 @@ impl Shell {
         &self.compiled
     }
 
+    /// The kernel decisions this load runs under.
+    #[must_use]
+    pub fn tuning(&self) -> kernels_cuda::tuning::Tuning {
+        self.device.ctx().tuning()
+    }
+
     #[must_use]
     pub fn budget(&self) -> &Budget {
         &self.budget

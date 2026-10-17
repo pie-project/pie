@@ -4,7 +4,8 @@
 //! 128-key window and its compressed entries (every visible one, or an
 //! index's ascending selection) in one softmax, the sinks over it, against
 //! the same arithmetic in f64. Rows pair up within a request and across a
-//! request's end, and the fire ends on a lone row.
+//! request's end, and the fire ends on a lone row; and with each row's
+//! window held above a replay floor.
 
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
@@ -54,9 +55,9 @@ fn paging(per: usize) -> (Vec<u32>, Vec<u32>) {
 }
 
 fn check(ratio: usize, top_k: Option<usize>) {
-    check_with(ratio, top_k, true, None);
+    check_with(ratio, top_k, true, None, false);
     // DeepSeek's fp8 rows, which only the block-a-row kernel reads.
-    check_with(ratio, top_k, true, Some((Rows::Ds, Rows::Ds)));
+    check_with(ratio, top_k, true, Some((Rows::Ds, Rows::Ds)), false);
 }
 
 /// An e4m3 code's value.
@@ -159,7 +160,13 @@ fn rows_plane(
     (pool, read)
 }
 
-fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool, fmts: Option<(Rows, Rows)>) {
+fn check_with(
+    ratio: usize,
+    top_k: Option<usize>,
+    sparse: bool,
+    fmts: Option<(Rows, Rows)>,
+    floored: bool,
+) {
     let fp8 = fmts.is_some();
     let per = 18;
     let cells = 2 * per * PAGE;
@@ -195,9 +202,22 @@ fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool, fmts: Option<(Ro
     let mut gpu = Gpu::open();
     let positions: Vec<i32> = rows.iter().map(|&(_, p)| p as i32).collect();
     let requests: Vec<i32> = rows.iter().map(|&(r, _)| r as i32).collect();
+    // A replay floor a row: below its window, inside it, or at the row.
+    let floors: Vec<i32> = rows
+        .iter()
+        .enumerate()
+        .map(|(r, &(_, p))| {
+            if floored {
+                (p as i32 - (r as i32 * 37) % 180).max(0)
+            } else {
+                0
+            }
+        })
+        .collect();
     let q_t = Tensor::new(gpu.up(&q_bits), n as u32, (HEADS * D) as u32, Dtype::Bf16);
     let pos_t = Tensor::new(gpu.up(&positions), n as u32, 1, Dtype::I32);
     let req_t = Tensor::new(gpu.up(&requests), n as u32, 1, Dtype::I32);
+    let floor_t = floored.then(|| Tensor::new(gpu.up(&floors), n as u32, 1, Dtype::I32));
     let w_at = gpu.up(&w_bits);
     let win = pool_of(&mut gpu, w_at, cells, &pages, &indptr);
     let e_at = gpu.up(&e_bits);
@@ -236,6 +256,7 @@ fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool, fmts: Option<(Ro
         q_t,
         pos_t,
         req_t,
+        floor_t,
         &win,
         &pooled,
         sink_t,
@@ -267,6 +288,7 @@ fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool, fmts: Option<(Ro
             q_t,
             pos_t,
             req_t,
+            floor_t,
             &win,
             &pooled,
             sink_t,
@@ -295,7 +317,7 @@ fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool, fmts: Option<(Ro
     for (r, &(req, pos)) in rows.iter().enumerate() {
         // The keys this row reads: its window, then its entries.
         let mut keys: Vec<&[f32]> = Vec::new();
-        for p in pos.saturating_sub(127)..=pos {
+        for p in pos.saturating_sub(127).max(floors[r] as usize)..=pos {
             let c = cell(req, p);
             keys.push(&w[c * D..(c + 1) * D]);
         }
@@ -342,7 +364,7 @@ fn check_with(ratio: usize, top_k: Option<usize>, sparse: bool, fmts: Option<(Ro
     }
     assert!(
         worst <= 4e-2,
-        "ratio {ratio}, top_k {top_k:?}, sparse {sparse}, fp8 {fp8}: an output element differs by {worst} relative"
+        "ratio {ratio}, top_k {top_k:?}, sparse {sparse}, fp8 {fp8}, floored {floored}: an output element differs by {worst} relative"
     );
 }
 
@@ -359,9 +381,13 @@ fn deepseeks_prefill_attention_lands_what_its_four_ops_land() {
     // DeepSeek-V4.1's FP4 cache: an MXFP8 window over NVFP4 compressed rows,
     // at its ratios 2 (selected) and 1.
     let v41 = Some((Rows::Mx8, Rows::Nv4));
-    check_with(2, Some(512), true, v41);
-    check_with(1, Some(512), true, v41);
-    check_with(2, None, true, v41);
+    check_with(2, Some(512), true, v41, false);
+    check_with(1, Some(512), true, v41, false);
+    check_with(2, None, true, v41, false);
+    // Windows held above their rows' replay floors (V4.1's bounded replay).
+    check_with(2, Some(512), true, v41, true);
+    check_with(1, Some(512), true, v41, true);
+    check_with(4, Some(64), true, None, true);
 }
 
 /// A layer with a window and no pool: the pass reads the window alone and
@@ -425,6 +451,7 @@ fn a_window_only_layer_lands_its_window_alone() {
             q_t,
             pos_t,
             req_t,
+            None,
             &win,
             128,
             None,
@@ -525,6 +552,7 @@ fn pace(ratio: usize, top_k: Option<usize>) {
                 q_t,
                 pos_t,
                 req_t,
+                None,
                 &win,
                 &pooled,
                 sink_t,

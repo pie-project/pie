@@ -415,7 +415,8 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::SsmKdaStep { .. }
             | Attention::SsmKdaChunked { .. }
             | Attention::PleNgramIds { .. }
-            | Attention::PleNgramIdsChunked { .. } => true,
+            | Attention::PleNgramIdsChunked { .. }
+            | Attention::ReplayFloor { .. } => true,
             Attention::PlanDecode { .. }
             | Attention::PlanPrefill { .. }
             | Attention::Decode { .. }

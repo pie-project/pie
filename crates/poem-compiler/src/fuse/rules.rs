@@ -207,9 +207,10 @@ fn hc_prenorm_project() -> Rule {
 
 /// DeepSeek-V4's attention: the windowed log-sum-exp attention, the
 /// compressed-pool one over the same q (every visible entry, or those an
-/// index selected), their merge and the sinks over it.
+/// index selected), their merge and the sinks over it; the window held
+/// above each row's replay floor where it states one.
 fn pool_attention() -> Rule {
-    let chain = |selected: bool, rotated: bool| {
+    let chain = |selected: bool, rotated: bool, floored: bool| {
         template(move |p| {
             let q = p.rows("q", W);
             let plan = p.value("plan", Ty::Struct(StructKind::AttnPrefillPlan));
@@ -217,8 +218,17 @@ fn pool_attention() -> Rule {
             let d = p.u32("d");
             let sm_scale = p.f32("sm_scale");
             p.free("window");
-            let (o, lse) =
-                attn::prefill_lse(&q, &plan, cache, None, d, p.u32("kv_heads"), sm_scale);
+            let floor = floored.then(|| p.indices("floor"));
+            let (o, lse) = attn::prefill_lse(
+                &q,
+                &plan,
+                cache,
+                None,
+                d,
+                p.u32("kv_heads"),
+                sm_scale,
+                floor.as_ref(),
+            );
             p.name("o", &o);
             p.name("lse", &lse);
             let positions = p.indices("positions");
@@ -276,10 +286,14 @@ fn pool_attention() -> Rule {
     Rule::new(
         "attention.pool_attention",
         [
-            chain(true, true),
-            chain(false, true),
-            chain(true, false),
-            chain(false, false),
+            chain(true, true, false),
+            chain(false, true, false),
+            chain(true, false, false),
+            chain(false, false, false),
+            chain(true, true, true),
+            chain(false, true, true),
+            chain(true, false, true),
+            chain(false, false, true),
         ],
         |m| {
             let attention = |name: &str| {
@@ -386,6 +400,7 @@ fn lse_sink() -> Rule {
                     d,
                     p.u32("kv_heads"),
                     p.f32("sm_scale"),
+                    None,
                 )
             };
             p.name("o", &o);

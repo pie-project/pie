@@ -18,6 +18,7 @@ pub mod mask;
 pub mod narrow;
 pub mod program;
 pub mod record;
+pub mod replay;
 pub mod rotate;
 pub mod run;
 pub mod scores;

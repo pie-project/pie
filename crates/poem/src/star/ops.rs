@@ -349,7 +349,7 @@ pub(crate) static OPS: &[Op] = &[
         module: "attn",
         name: "prefill_lse",
         params: &[
-            "q", "plan", "pages", "window", "head_dim", "kv_heads", "sm_scale",
+            "q", "plan", "pages", "window", "head_dim", "kv_heads", "sm_scale", "floor",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -359,10 +359,36 @@ pub(crate) static OPS: &[Op] = &[
             let head_dim: u32 = a.next()?;
             let kv_heads: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
+            let floor: Option<Value> = a.next()?;
             result(
                 heap,
                 dsl("attn.prefill_lse", || {
-                    ops::attn::prefill_lse(&q, &plan, pages, window, head_dim, kv_heads, sm_scale)
+                    ops::attn::prefill_lse(
+                        &q,
+                        &plan,
+                        pages,
+                        window,
+                        head_dim,
+                        kv_heads,
+                        sm_scale,
+                        floor.as_ref(),
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "replay_floor",
+        params: &["positions", "state", "mark"],
+        call: |a, heap| {
+            let positions: Value = a.next()?;
+            let state: ValueId = a.next()?;
+            let mark: bool = a.next()?;
+            result(
+                heap,
+                dsl("attn.replay_floor", || {
+                    ops::attn::replay_floor(&positions, state, mark)
                 })?,
             )
         },

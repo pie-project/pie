@@ -276,12 +276,15 @@ impl TurnArgs {
     }
 }
 
+/// DeepSeek-V4's window, pool and sinks in one launch, a row's window
+/// held above its replay floor where `floors` (i32 a row) states one.
 #[allow(clippy::too_many_arguments)]
 pub fn decode(
     ctx: &Ctx,
     q: Tensor,
     positions: Tensor,
     request_of_token: Tensor,
+    floors: Option<Tensor>,
     window_pool: &KvPool,
     window: u32,
     pooled: Option<Pooled<'_>>,
@@ -388,6 +391,7 @@ pub fn decode(
             top_k.arg(),
             positions.arg(),
             request_of_token.arg(),
+            floors.map_or(ArgValue::ABSENT, |f| f.arg()),
             sinks.arg(),
             o.arg(),
             sm_scale.arg(),

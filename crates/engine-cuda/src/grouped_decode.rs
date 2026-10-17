@@ -148,6 +148,7 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, xqa: Gate) -> Trace 
                 sm_scale,
                 o,
                 lse,
+                floor: None,
             },
             other => other,
         };

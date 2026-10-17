@@ -174,6 +174,10 @@ impl Run<'_> {
                 score: IndexScore::PooledTokens,
                 ..
             } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+            // Bounded replay's floors are DeepSeek-V4.1's, served on CUDA.
+            Attention::ReplayFloor { .. } => {
+                Err(kernels_metal::Error::Unsupported { op: op.name() })
+            }
             Attention::DecodeSelected {
                 q,
                 plan,
@@ -324,6 +328,8 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 lse,
+                // This backend splits no prompt's rows, so a replay floor stays 0.
+                floor: _,
             } => {
                 attn::arbiter::prefill_lse(
                     self.ctx(),

@@ -14,7 +14,7 @@ does (the same scale rules, e2m1 rounding to nearest even, and the sparse
 attention's probabilities rounded to bf16 before they weigh the values).
 
     python3 scripts/dsv41_parity_ref.py <snapshot-dir> OUT [--steps 16] [--probes probes.json]
-        [--sim kv,index,o] [--tag ref]
+        [--sim kv,index,o] [--replay] [--tag ref]
 
 `--sim` names the quant-dequant simulations to keep (default `kv,index,o`,
 all of them): `kv` the window KV's fp8 and the compressed KV's FP4, `index`
@@ -28,6 +28,13 @@ Writes, per probe NAME (`OUT/probes.json` when no file is stated):
     OUT/NAME.ref.gen.f32  float32 [steps + 1, vocab] logits at the last prompt position and
                                                        after each greedy step
     OUT/NAME.ref.json     {"ids", "argmax", "gen", "vocab"}
+
+`--replay` generates under the release's bounded replay (its Causal
+Encoder-Decoder's prefill): the decoder layers (the first ratio-1 layer
+on) hold no window keys below the prompt's last `sliding_window`
+positions, so their windows read none there, at the prefill and the
+decode steps after it. The teacher-forced logits stay the full model's
+(pie reads them a token a fire, which never skips a row).
 
 `scripts/dsv4_mini_parity_compare.py OUT --a pie --b ref` reads the pie side
 (`crates/engine-cuda/tests/engine_cuda/a_family_is_read_against_its_reference.rs`)
@@ -252,6 +259,32 @@ def load(model, snapshot):
         raise SystemExit(f"{len(missing)} parameters not in the snapshot, first {missing[:4]}")
 
 
+# Bounded replay: the first decoder layer, and the least position whose
+# window keys the decoder layers hold (0: every position).
+REPLAY = {"decoder": None, "floor": 0}
+
+
+def install_replay(mod):
+    """The decoder layers' windows held at or above `REPLAY["floor"]`."""
+    window_kv = mod.Attention._window_kv
+
+    def floored(self, x, freqs_cis, start_pos):
+        kv, idxs = window_kv(self, x, freqs_cis, start_pos)
+        floor, decoder = REPLAY["floor"], REPLAY["decoder"]
+        if floor > 0 and decoder is not None and self.layer_id >= decoder:
+            if start_pos == 0:
+                # a prefill's window index is the key's position
+                held = idxs
+            else:
+                # a decode's ring slot j holds the latest position q <= start_pos with q % win == j
+                win = self.window_size
+                held = start_pos - torch.remainder(start_pos - idxs, win)
+            idxs = torch.where((idxs >= 0) & (held < floor), torch.full_like(idxs, -1), idxs)
+        return kv, idxs
+
+    mod.Attention._window_kv = floored
+
+
 def logits_all(model, mod, ids, start_pos):
     """`Transformer.forward` with every position's logits."""
     engram_hashes = model.engram_hash(ids, start_pos, None) if model.engram_hash is not None else None
@@ -279,6 +312,8 @@ def main():
     ap.add_argument("--inference", default=None, help="DeepSeek's inference/ sources (fetched when absent)")
     ap.add_argument("--layers", type=int, default=None,
                     help="run only the first N layers (then the head), to bisect a disagreement")
+    ap.add_argument("--replay", action="store_true",
+                    help="generate under bounded replay: the decoder's windows hold the prompt's last window alone")
     ap.add_argument("--tag", default="ref")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -289,6 +324,8 @@ def main():
     sys.path.insert(0, src)
     import model as mod
     from transformers import AutoTokenizer
+
+    install_replay(mod)
 
     if "o" not in sim:
         mod_act_quant = mod.act_quant
@@ -340,6 +377,9 @@ def main():
         model = mod.Transformer(margs, tokenizer)
     model.eval()
     load(model, args.snapshot)
+    text = cfg.get("text_config", cfg)
+    if args.replay:
+        REPLAY["decoder"] = list(text["compress_ratios"]).index(1)
 
     if args.probes:
         probes = json.load(open(args.probes))["probes"]
@@ -353,10 +393,15 @@ def main():
         started = time.time()
         with torch.inference_mode():
             x = torch.tensor([ids], device="cuda")
+            REPLAY["floor"] = 0
             tf = logits_all(model, mod, x, 0)[0].float().cpu().numpy()
             gen_rows = [tf[-1].copy()]
+            if args.replay and len(ids) > text["sliding_window"]:
+                # The prefill again, the decoder replaying the last window.
+                REPLAY["floor"] = len(ids) - text["sliding_window"]
+                gen_rows = [logits_all(model, mod, x, 0)[0, -1].float().cpu().numpy()]
             produced = []
-            last = int(tf[-1].argmax())
+            last = int(gen_rows[0].argmax())
             pos = len(ids)
             for _ in range(args.steps):
                 produced.append(last)

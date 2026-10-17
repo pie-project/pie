@@ -640,6 +640,12 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             } => &[(In(3), I32), (In(4), I32), (In(5), F32)],
             Attention::Ragged { .. } => &[(In(3), I32), (In(4), I32)],
             Attention::DecodeLse { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)],
+            Attention::PrefillLse { floor: Some(_), .. } => &[
+                (In(1), PREFILL_PLAN),
+                (In(2), CACHE),
+                (In(3), I32),
+                (Out(1), F32),
+            ],
             Attention::PrefillLse { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)],
             Attention::DecodeSelected { .. } => {
                 &[(In(1), DECODE_PLAN), (In(2), I32), (In(3), CACHE)]
@@ -727,6 +733,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::PleNgramIds { .. } | Attention::PleNgramIdsChunked { .. } => {
                 &[(In(0), I32), (In(1), CACHE), (Out(0), I32)]
             }
+            Attention::ReplayFloor { .. } => &[(In(0), I32), (In(1), CACHE), (Out(0), I32)],
         },
         Operation::Linear(op) => match op {
             Linear::MoeTopkSoftmax { .. }
@@ -905,6 +912,37 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // The window's plan and cache (inputs 1, 2), the pool's
             // positions, requests, selection and entries from input 4, and
             // the three f32 log-sum-exp planes (outputs 1, 3, 5).
+            // A floored window reads its floor at input 3, the pool's
+            // inputs one further on.
+            Fused::PoolAttention { window, pool, .. }
+                if matches!(**window, Attention::PrefillLse { floor: Some(_), .. }) =>
+            {
+                match **pool {
+                    Attention::PoolLseSelected { .. } => &[
+                        (In(1), PREFILL_PLAN),
+                        (In(2), CACHE),
+                        (In(3), I32),
+                        (In(5), I32),
+                        (In(6), I32),
+                        (In(7), I32),
+                        (In(8), CACHE),
+                        (Out(1), F32),
+                        (Out(3), F32),
+                        (Out(5), F32),
+                    ],
+                    _ => &[
+                        (In(1), PREFILL_PLAN),
+                        (In(2), CACHE),
+                        (In(3), I32),
+                        (In(5), I32),
+                        (In(6), I32),
+                        (In(7), CACHE),
+                        (Out(1), F32),
+                        (Out(3), F32),
+                        (Out(5), F32),
+                    ],
+                }
+            }
             Fused::PoolAttention { pool, .. } => match **pool {
                 Attention::PoolLseSelected { .. } => &[
                     (In(1), PREFILL_PLAN),

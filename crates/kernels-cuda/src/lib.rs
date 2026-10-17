@@ -22,6 +22,9 @@ pub mod attn_score;
 #[path = "attn/ple.rs"]
 pub mod attn_ple;
 
+#[path = "attn/replay.rs"]
+pub mod attn_replay;
+
 #[path = "layout/embed_concat.rs"]
 pub mod layout_embed_concat;
 

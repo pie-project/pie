@@ -182,6 +182,7 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
     int top_k,
     const i32* __restrict__ positions,
     const i32* __restrict__ req_of_token,
+    const i32* __restrict__ floors,
     const SinkT* __restrict__ sinks,
     bf16* __restrict__ o,
     float scale,
@@ -228,7 +229,9 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
 
     const int req = req_of_token[row];
     const int qpos = positions[row];
-    const int n_win = max(0, min(qpos + 1, window));
+    // A replay floor: the window reads no key below the row's.
+    const int floor = floors != nullptr ? floors[row] : 0;
+    const int n_win = max(0, min(qpos + 1 - floor, window));
     const int num_visible = ratio > 0 ? max((qpos + 1) / ratio, 0) : 0;
     const i32* srow =
         selection != nullptr ? selection + static_cast<long long>(row) * top_k : nullptr;

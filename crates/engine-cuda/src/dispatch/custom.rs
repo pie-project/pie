@@ -477,6 +477,13 @@ impl Run<'_> {
             }
             _ => None,
         };
+        // A window held above a replay floor the profile may raise
+        // (`kernel.sdpa.dsv4_replay`): only the fused kernels read the floor.
+        let floored = self.ctx().tuning().dsv4_replay
+            && matches!(
+                **window,
+                poem_ir::Attention::PrefillLse { floor: Some(_), .. }
+            );
         // A decode's rows, up to what the profile says
         // (`kernel.sdpa.dsv4_decode_until`): the four in one launch.
         let rows = self.tensor(*o_out).rows;
@@ -495,6 +502,7 @@ impl Run<'_> {
                 window: span,
                 head_dim: d,
                 sm_scale,
+                floor,
                 ..
             },
             poem_ir::Attention::PoolLse {
@@ -542,6 +550,7 @@ impl Run<'_> {
                         self.tensor(*q),
                         self.tensor(*positions),
                         self.tensor(*request_of_token),
+                        floor.map(|floor| self.tensor(floor)),
                         &window_pool,
                         &pooled,
                         self.tensor(*sink),
@@ -553,9 +562,10 @@ impl Run<'_> {
                 }
             }
         }
-        // DeepSeek's fp8 rows have no other reader: the one launch at any
-        // width, or a refusal, never the four ops reading them as bf16.
-        if self.fp8_rows(window) {
+        // DeepSeek's fp8 rows have no other reader, nor has a floored
+        // window: the one launch at any width, or a refusal, never the four
+        // ops reading them as bf16 (or past the floor).
+        if self.fp8_rows(window) || floored {
             return self
                 .dsv4_decode(window, Some(pool), *sink, *o_out, turn)
                 .unwrap_or_else(|| Err(fp8_unread(op.name())))
@@ -611,6 +621,7 @@ impl Run<'_> {
             window: Some(span),
             head_dim,
             sm_scale,
+            floor,
             ..
         } = *window
         else {
@@ -676,6 +687,7 @@ impl Run<'_> {
             q,
             self.tensor(positions),
             self.tensor(request_of_token),
+            floor.map(|floor| self.tensor(floor)),
             &window_pool,
             span,
             pooled,
@@ -805,6 +817,8 @@ impl Run<'_> {
                 sm_scale,
                 o: _,
                 lse,
+                // (A floored window is no `lse_sink`'s: the rule takes none.)
+                floor: _,
             } => {
                 kernels_cuda::attn::prefill_lse_sink(
                     self.ctx(),

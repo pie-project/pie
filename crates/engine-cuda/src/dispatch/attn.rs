@@ -412,7 +412,18 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 lse,
+                floor,
             } => {
+                // A floor stays 0 unless the profile turns bounded replay on;
+                // then only the fused kernels read it.
+                if floor.is_some() && self.ctx().tuning().dsv4_replay {
+                    return Err(kernels_cuda::Error::Backend {
+                        op: "attention.prefill_lse",
+                        detail: "the window is held above a replay floor, which only the fused \
+                                 `attention.pool_attention` reads"
+                            .to_string(),
+                    });
+                }
                 if attn::dsv4::ds_rows(&self.pool(*cache)) {
                     return Err(kernels_cuda::Error::Backend {
                         op: "attention.prefill_lse",
@@ -886,6 +897,18 @@ impl Run<'_> {
                 *heads_per_ngram,
                 map.map(|id| self.tensor(id)),
                 &mut self.tensor(*ngram_ids),
+            ),
+            Attention::ReplayFloor {
+                positions,
+                state,
+                mark,
+                floor,
+            } => kernels_cuda::attn_replay::floor(
+                self.ctx(),
+                self.ragged_lanes(*positions),
+                &self.recurrent_absolute(*state),
+                *mark,
+                &mut self.tensor(*floor),
             ),
             Attention::PleNgramIdsChunked {
                 ids,

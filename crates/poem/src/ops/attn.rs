@@ -349,6 +349,7 @@ pub fn decode_lse(
     (o, lse)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prefill_lse(
     q: &Value,
     plan: &Value,
@@ -357,6 +358,7 @@ pub fn prefill_lse(
     head_dim: u32,
     kv_heads: u32,
     sm_scale: f32,
+    floor: Option<&Value>,
 ) -> (Value, Value) {
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
@@ -376,10 +378,32 @@ pub fn prefill_lse(
             sm_scale,
             o: o.id(),
             lse: lse.id(),
+            floor: floor.map(Value::id),
         },
-        &[q, plan],
+        &match floor {
+            Some(floor) => vec![q, plan, floor],
+            None => vec![q, plan],
+        },
     );
     (o, lse)
+}
+
+/// Bounded replay's floor (`attention.replay_floor`): with `mark` the rows
+/// of `positions` are ones a replaying layer skips, and their lane's state
+/// takes the position past them; without, each row's floor from its lane's.
+pub fn replay_floor(positions: &Value, state: ValueId, mark: bool) -> Value {
+    let r = positions.rec();
+    let floor = r.fresh(positions.ty().clone());
+    r.push(
+        Attention::ReplayFloor {
+            positions: positions.id(),
+            state,
+            mark,
+            floor: floor.id(),
+        },
+        &[positions],
+    );
+    floor
 }
 
 pub fn sink(o: &Value, lse: &Value, sink: &Weight, head_dim: u32) -> Value {

@@ -9,7 +9,8 @@
 //! bf16, or DeepSeek's quantized rows as `attn::dsv4::append` writes them
 //! (V4's fp8 rows, or V4.1's MXFP8 window and NVFP4 compressed rows), read
 //! back against what the bytes say (V4's bytes against the bf16 rows, and
-//! V4.1's bit for bit against its reference's quantizers).
+//! V4.1's bit for bit against its reference's quantizers); and with each
+//! row's window held above a replay floor (V4.1's bounded replay).
 
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
@@ -66,7 +67,7 @@ enum Pool {
     Selected(usize, usize),
 }
 
-fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>) {
+fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>, floored: bool) {
     let fp8 = fmts.is_some();
     // Two requests of 2304 positions each, their pages interleaved; the
     // window and the compressed rows are two planes on the same tables.
@@ -92,6 +93,19 @@ fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>) {
         .map(|r| base[r % 8] + (r / 8) as i32 % 5)
         .collect();
     let reqs: Vec<i32> = (0..rows).map(|r| (r % 2) as i32).collect();
+    // A replay floor a row: some below its window, some inside it, some at
+    // the row itself.
+    let floors: Vec<i32> = positions
+        .iter()
+        .enumerate()
+        .map(|(r, &pos)| {
+            if floored {
+                (pos - (r as i32 * 29) % 200).max(0)
+            } else {
+                0
+            }
+        })
+        .collect();
 
     let mut lcg = Lcg::seeded(0xd5f4 + rows as u64);
     let (q_bits, q) = lcg.row(rows * HEADS * D);
@@ -195,7 +209,8 @@ fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>) {
         let pos = positions[r] as usize;
         let req = reqs[r] as usize;
         let mut keys: Vec<&[f32]> = Vec::new();
-        for p in pos + 1 - (pos + 1).min(WINDOW)..=pos {
+        let first = (pos + 1 - (pos + 1).min(WINDOW)).max(floors[r] as usize);
+        for p in first..=pos {
             let s = slot(req, p);
             keys.push(&wk[s * D..(s + 1) * D]);
         }
@@ -242,6 +257,7 @@ fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>) {
     );
     let pos_t = Tensor::new(gpu.up(&positions), rows as u32, 1, Dtype::I32);
     let req_t = Tensor::new(gpu.up(&reqs), rows as u32, 1, Dtype::I32);
+    let floor_t = floored.then(|| Tensor::new(gpu.up(&floors), rows as u32, 1, Dtype::I32));
     let sink_t = Tensor::new(gpu.up(&sinks), HEADS as u32, 1, Dtype::F32);
     let sel_t = if sel.is_empty() {
         None
@@ -273,6 +289,7 @@ fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>) {
             q_t,
             pos_t,
             req_t,
+            floor_t,
             &window_pool,
             WINDOW as u32,
             pooled,
@@ -343,7 +360,8 @@ fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>) {
     gpu.sync();
     let got: Vec<u16> = gpu.down(o_at, rows * HEADS * D);
 
-    let label = format!("{rows} rows, ratio {ratio}, top_k {top_k}, rows {fmts:?}");
+    let label =
+        format!("{rows} rows, ratio {ratio}, top_k {top_k}, rows {fmts:?}, floored {floored}");
     let mut worst = 0f32;
     let mut at = 0;
     for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
@@ -382,6 +400,7 @@ fn check(rows: usize, pool: Pool, bench: bool, fmts: Option<(Rows, Rows)>) {
         q_t,
         pos_t,
         req_t,
+        floor_t,
         &window_pool,
         WINDOW as u32,
         pooled,
@@ -426,14 +445,18 @@ fn the_fused_dsv4_attention_lands_the_window_the_pool_and_the_sinks() {
         Some((Rows::Ds, Rows::Ds)),
         Some((Rows::Mx8, Rows::Nv4)),
     ] {
-        check(1, Pool::Selected(4, 512), false, fp8);
-        check(8, Pool::Selected(4, 512), false, fp8);
-        check(8, Pool::Dense(128), false, fp8);
-        check(8, Pool::None, false, fp8);
-        check(16, Pool::Dense(4), false, fp8);
-        check(40, Pool::Selected(4, 64), false, fp8);
+        check(1, Pool::Selected(4, 512), false, fp8, false);
+        check(8, Pool::Selected(4, 512), false, fp8, false);
+        check(8, Pool::Dense(128), false, fp8, false);
+        check(8, Pool::None, false, fp8, false);
+        check(16, Pool::Dense(4), false, fp8, false);
+        check(40, Pool::Selected(4, 64), false, fp8, false);
         // More keys than a chunk gathers at once.
-        check(40, Pool::Dense(2), false, fp8);
+        check(40, Pool::Dense(2), false, fp8, false);
+        // Windows held above their rows' replay floors.
+        check(8, Pool::Selected(4, 512), false, fp8, true);
+        check(40, Pool::Dense(2), false, fp8, true);
+        check(64, Pool::None, false, fp8, true);
     }
 }
 
@@ -447,9 +470,9 @@ fn the_fused_dsv4_attention_reports_its_time() {
             Some((Rows::Ds, Rows::Ds)),
             Some((Rows::Mx8, Rows::Nv4)),
         ] {
-            check(rows, Pool::Selected(4, 512), true, fp8);
-            check(rows, Pool::Dense(128), true, fp8);
-            check(rows, Pool::None, true, fp8);
+            check(rows, Pool::Selected(4, 512), true, fp8, false);
+            check(rows, Pool::Dense(128), true, fp8, false);
+            check(rows, Pool::None, true, fp8, false);
         }
     }
 }

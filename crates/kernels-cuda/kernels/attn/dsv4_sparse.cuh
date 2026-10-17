@@ -48,6 +48,8 @@ struct Params {
     const u16* q;
     const int* positions;
     const int* requests;
+    // Each row's replay floor (null: none): its window reads no key below.
+    const int* floors;
     const u32* win_indptr;
     const u32* win_indices;
     const u32* ent_indptr;
@@ -238,7 +240,8 @@ __global__ __launch_bounds__(384, 1) void dsv4_sparse(
                 }
             }
         }
-        w.nw = min(w.pos, kWindow - 1) + 1;
+        const int floor = p.floors != nullptr ? p.floors[w.row] : 0;
+        w.nw = max(min(w.pos - floor, kWindow - 1) + 1, 0);
         w.nwp = (w.nw + 3) & ~3;
         w.total = w.nwp + w.entries;
         w.nt = (w.total + kBK - 1) / kBK;

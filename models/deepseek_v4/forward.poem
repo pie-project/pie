@@ -127,12 +127,29 @@ def caches(m, c):
             c.kv(index, at.indexer.keys, packed(key, ratio), at.indexer.head_dim)
         if w.engram != None:
             c.state(w.engram.ids_state, [w.engram.ngram - 1], dtype.i32)
+    if m.decoder != None:
+        c.state(REPLAY, [1], dtype.i32)
     if m.mtp != None:
         at = m.mtp.block.attn
         c.kv(kv, at.kv, row(at), m.head_dim, heads = at.kv_down.cut_axis != None)
 
 # The dtype the forward computes in on every deployment.
 ACT = dtype.bf16
+
+# A causal encoder-decoder's bounded replay (V4.1): a backend may run a long
+# prompt's leading rows through the encoder alone (`fact.encode()` lanes),
+# the decoder replaying only its last window. A sequence's state holds the
+# floor below which its decoder layers hold no window keys, and their
+# windows read none below it.
+REPLAY = "replay"
+
+def replay_floor(inputs, positions):
+    """Each row's replay floor: an encoder-only lane's rows set it past
+    themselves, every other row reads its own."""
+    state = inputs.state(REPLAY)
+    skipped = fact.encode()
+    ops.attn.replay_floor(positions.on(skipped), state, True)
+    return ops.attn.replay_floor(positions.on(~skipped), state, False)
 
 # What a layer leaves the next: the last sublayer's input mix (under
 # Single-Pass mHC the next sublayer reads its input through it) and the
@@ -155,14 +172,24 @@ def forward(m, inputs):
     ids = inputs.tokens()
     streams = ops.elemwise.hc_expand(ops.layout.embed(ids, m.embed, m.vocab), hy.streams)
     adapters = inputs.adapter_routes()
-    rows = struct(inputs = inputs, plan = plan, positions = positions, ids = ids, adapters = adapters, kv_heads = kvh)
+    floor = None
+    replay_plan = None
+    if m.decoder != None:
+        floor = replay_floor(inputs, positions)
+        # The decoder's rows are its own classes': a plan of their own.
+        replayed = inputs.on(~fact.encode())
+        replay_plan = ops.attn.plan_prefill(replayed, m.heads, kvh, m.head_dim, m.window)
+    rows = struct(inputs = inputs, plan = plan, positions = positions, ids = ids, adapters = adapters,
+                  kv_heads = kvh, floor = floor, replay_plan = replay_plan)
 
     def block(l, w, carried):
         streams, trail = carried
         if w.engram != None:
             streams = engram(streams, ids, inputs, m, w.engram)
         following = m.layers[l + 1] if l + 1 < len(m.layers) else None
-        return layer(m, rows, w, streams, trail, following = following)
+        decoding = m.decoder != None and l >= m.decoder
+        return layer(m, rows, w, streams, trail, following = following,
+                     narrow = m.decoder != None and l == m.decoder, replays = decoding)
 
     streams, trail = inputs.fold_layers(m.layers, (streams, NO_TRAIL), block)
 
@@ -206,6 +233,8 @@ def draft(m, rows, streams, logits):
         ids = token,
         adapters = rows.adapters,
         kv_heads = rows.kv_heads,
+        floor = None,
+        replay_plan = None,
     )
     out, _ = layer(m, draft_rows, mtp.block, fused, NO_TRAIL)
     y = ops.elemwise.rmsnorm(collapse(out, mtp.hc_head, hy), mtp.norm, mtp.norm_eps)
@@ -223,9 +252,12 @@ def rope(x, pos, rope_dim, head_dim, theta, scaling, inverse = False):
         )
     return ops.elemwise.rope_partial_last_yarn(x, pos, rope_dim, head_dim, theta, True, inverse, scaling)
 
-def layer(m, rows, w, streams, trail, following = None):
+def layer(m, rows, w, streams, trail, following = None, narrow = False, replays = False):
     """The layer `w` over `rows`, given the `trail` earlier layers left it:
-    the streams it leaves and its own trail."""
+    the streams it leaves and its own trail. With `narrow` (a causal
+    encoder-decoder's first decoder layer) its pool and index keys are
+    written for every row and the rest runs on the rows the decoder
+    replays; with `replays` its window reads nothing below `rows.floor`."""
     hy = m.hyper
     inputs = rows.inputs
     pos = rows.positions
@@ -237,6 +269,18 @@ def layer(m, rows, w, streams, trail, following = None):
     x, post_mix, comb_mix, mix = sublayer_input(streams, w.attn_mix, m, trail.mix)
     if w.attn_norm != None:
         x = ops.elemwise.rmsnorm(x, w.attn_norm, hy.norm_eps)
+    floor = rows.floor if replays else None
+    plan = rows.replay_plan if replays else rows.plan
+
+    if narrow:
+        p = at.pool
+        if p == None or not p.owner:
+            fail("a decoder's first layer writes the pool its layers read")
+        bpos, breq, brope = boundaries(pos, inputs.row_valid(), p.ratio)
+        pool_sources(m, inputs, at, x, pages, write_page, write_offset, bpos, breq, brope)
+        # Every later op of the decoder reads x or what it leads to: the
+        # rows of encoder-only lanes go no further.
+        x = x.on(~fact.encode())
 
     q_a = ops.linear.matmul(x, at.q_down)
     q_a = ops.elemwise.rmsnorm(q_a, at.q_norm, at.q_norm_eps)
@@ -260,19 +304,13 @@ def layer(m, rows, w, streams, trail, following = None):
         # Each layer finds its own pool's boundaries. Found once a ratio in
         # the forward and held across every layer, they cost decode64 5.7 ms
         # a step and decode8 0.3 ms (fp8 kv, graphs on).
-        bpos, breq, brope = boundaries(pos, row_valid, p.ratio)
+        # (A CSA2 layer reading its source's pool closes none.)
+        own_index = at.selection == "own" and at.indexer.compressor != None
+        if not narrow and (p.owner or own_index):
+            bpos, breq, brope = boundaries(pos, row_valid, p.ratio)
 
-        if p.owner:
-            latent = compress(m, x, p, pages, write_page, write_offset, bpos, breq)
-            ix = at.indexer
-            if ix != None and ix.wk != None:
-                # CSA2: the index keys are a projection of the compressed
-                # latent, taken before its rotation.
-                k = ops.elemwise.rmsnorm(ops.linear.matmul(latent, ix.wk), ix.k_norm, hy.norm_eps)
-                k = rope(k, brope, ix.rope_dim, ix.head_dim, ix.theta, ix.yarn)
-                ops.attn.pool_kv_append(k, bpos, breq, inputs.kv(ix.keys), inputs.write_page(ix.keys), inputs.write_offset(ix.keys))
-            pooled = rope(latent, brope, at.rope_dim, m.head_dim, at.theta, at.yarn)
-            ops.attn.pool_kv_append(pooled, bpos, breq, entries, inputs.write_page(p.entries), inputs.write_offset(p.entries))
+        if p.owner and not narrow:
+            pool_sources(m, inputs, at, x, pages, write_page, write_offset, bpos, breq, brope)
 
         if at.selection == "own":
             ix = at.indexer
@@ -286,7 +324,7 @@ def layer(m, rows, w, streams, trail, following = None):
             fail("a CSA2 Reuse Mode layer follows a layer that ranked")
         # The window's attention runs beside the pool's, where a backend
         # may land the two, their merge and the sinks as one.
-        o, lse = ops.attn.prefill_lse(q, rows.plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale)
+        o, lse = ops.attn.prefill_lse(q, plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale, floor)
         if at.selection != "none":
             po, plse = ops.attn.pool_lse_selected(q, pos, request_of_token, selection.picked, entries,
                                                   p.ratio, selection.top_k, m.heads, m.head_dim, at.sm_scale)
@@ -294,7 +332,9 @@ def layer(m, rows, w, streams, trail, following = None):
             po, plse = ops.attn.pool_lse(q, pos, request_of_token, entries, p.ratio, m.heads, m.head_dim, at.sm_scale)
         o, lse = ops.attn.merge_lse(o, lse, po, plse, m.heads, m.head_dim)
     else:
-        o, lse = ops.attn.prefill_lse(q, rows.plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale)
+        if floor != None:
+            fail("a replaying layer pools")
+        o, lse = ops.attn.prefill_lse(q, plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale)
 
     o = ops.attn.sink(o, lse, at.sink, m.head_dim)
     o = rope(o, pos, at.rope_dim, m.head_dim, at.theta, at.yarn, inverse = True)
@@ -308,6 +348,10 @@ def layer(m, rows, w, streams, trail, following = None):
     o = ops.linear.matmul(o, at.o_up)
     adapted = fact.has(fact.Adapter)
     o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, rows.adapters, o.on(adapted))
+    if replays:
+        # The correction lands on every row it is read for: a replaying
+        # layer's, the decoder's.
+        o = o.on(~fact.encode())
     streams = ops.elemwise.hc_fold(o, streams, post_mix, comb_mix)
 
     x, post_mix, comb_mix, mix = sublayer_input(streams, w.mlp_mix, m, mix)
@@ -317,6 +361,22 @@ def layer(m, rows, w, streams, trail, following = None):
     f = mlp(x, rows.ids, w.mlp, streams, following if inputs.route_hints() else None, hy)
     streams = ops.elemwise.hc_fold(f, streams, post_mix, comb_mix)
     return streams, struct(mix = mix, selection = selection)
+
+def pool_sources(m, inputs, at, x, pages, write_page, write_offset, bpos, breq, brope):
+    """A pool owner's entries (and, under CSA2, its index keys) from `x`,
+    appended at the boundaries `bpos`."""
+    hy = m.hyper
+    p = at.pool
+    latent = compress(m, x, p, pages, write_page, write_offset, bpos, breq)
+    ix = at.indexer
+    if ix != None and ix.wk != None:
+        # CSA2: the index keys are a projection of the compressed
+        # latent, taken before its rotation.
+        k = ops.elemwise.rmsnorm(ops.linear.matmul(latent, ix.wk), ix.k_norm, hy.norm_eps)
+        k = rope(k, brope, ix.rope_dim, ix.head_dim, ix.theta, ix.yarn)
+        ops.attn.pool_kv_append(k, bpos, breq, inputs.kv(ix.keys), inputs.write_page(ix.keys), inputs.write_offset(ix.keys))
+    pooled = rope(latent, brope, at.rope_dim, m.head_dim, at.theta, at.yarn)
+    ops.attn.pool_kv_append(pooled, bpos, breq, inputs.kv(p.entries), inputs.write_page(p.entries), inputs.write_offset(p.entries))
 
 def compress(m, x, p, pages, write_page, write_offset, bpos, breq):
     c = p.compressor

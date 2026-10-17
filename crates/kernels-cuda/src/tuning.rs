@@ -288,6 +288,18 @@ pub struct SdpaPoolMma;
 #[decision(id = "kernel.sdpa.dsv4_prefill_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
 pub struct SdpaDsv4PrefillFrom(pub u32);
 
+/// Whether DeepSeek-V4.1's Causal Encoder-Decoder prefills by bounded
+/// replay, as its release describes: a long prompt's leading rows run the
+/// encoder alone (and the decoder's sources, its pool and index keys), the
+/// decoder replaying only the prompt's last window, its windows held above
+/// each sequence's replay floor (`attention.pool_attention` always on the
+/// fused kernels, which read the floor). Off runs every row through every
+/// layer, as vLLM does. It changes what the model computes, so no search
+/// turns it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.dsv4_replay", flag, default = false, tune = never)]
+pub struct SdpaDsv4Replay;
+
 /// Whether a sparse MLA's selected attention (64 absorbed heads over a
 /// 512-wide bf16 latent and a 64-wide rotated part or none: GLM-5.3's and
 /// GLM-5.3-Flash's DSA) runs a block a row on tcgen05
@@ -651,6 +663,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaIndexRadix>()
         .add::<SdpaPoolMma>()
         .add::<SdpaDsv4PrefillFrom>()
+        .add::<SdpaDsv4Replay>()
         .add::<SdpaMlaSparse>()
         .add::<GemmNarrowN>();
 }
@@ -739,6 +752,7 @@ pub struct Tuning {
     pub index_radix: bool,
     pub pool_mma: bool,
     pub dsv4_prefill_from: u32,
+    pub dsv4_replay: bool,
     pub mla_sparse: bool,
     pub gemm_narrow_n: u32,
 }
@@ -825,6 +839,7 @@ impl Tuning {
         index_radix: false,
         pool_mma: false,
         dsv4_prefill_from: 0,
+        dsv4_replay: false,
         mla_sparse: false,
         gemm_narrow_n: 0,
     };
@@ -911,6 +926,7 @@ impl Tuning {
             index_radix: profile.on::<SdpaIndexRadix>(&Anywhere),
             pool_mma: profile.on::<SdpaPoolMma>(&Anywhere),
             dsv4_prefill_from: profile.get::<SdpaDsv4PrefillFrom>().0,
+            dsv4_replay: profile.on::<SdpaDsv4Replay>(&Anywhere),
             mla_sparse: profile.on::<SdpaMlaSparse>(&Anywhere),
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,
         }

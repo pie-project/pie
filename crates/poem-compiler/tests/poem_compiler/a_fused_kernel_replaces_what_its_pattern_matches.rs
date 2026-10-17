@@ -327,7 +327,7 @@ fn deepseeks_window_pool_merge_and_sinks_land_as_one_op() {
                 "plan",
                 poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
             );
-            let (o, lse) = attn::prefill_lse(&q, &plan, cache, Some(128), 512, 1, 0.04);
+            let (o, lse) = attn::prefill_lse(&q, &plan, cache, Some(128), 512, 1, 0.04, None);
             let (o, lse) = if pooled {
                 let positions = p.indices("positions");
                 let requests = p.indices("requests");
@@ -405,7 +405,7 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
                     "plan",
                     poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
                 );
-                attn::prefill_lse(&q, &plan, cache, None, 64, 8, 0.125)
+                attn::prefill_lse(&q, &plan, cache, None, 64, 8, 0.125, None)
             };
             let out = attn::sink(&o, &lse, &p.weight("sinks", [8]), 64);
             elemwise::silu(&out);
@@ -716,7 +716,7 @@ fn deepseeks_attention_lands_its_output_turned_back() {
             "plan",
             poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
         );
-        let (o, lse) = attn::prefill_lse(&q, &plan, cache, Some(128), 512, 1, 0.04);
+        let (o, lse) = attn::prefill_lse(&q, &plan, cache, Some(128), 512, 1, 0.04, None);
         let positions = p.indices("positions");
         let requests = p.indices("requests");
         let entries = p.cache("entries");
