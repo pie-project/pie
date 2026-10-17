@@ -20,35 +20,6 @@ use super::singleton::valid_identifier;
 
 const SAMPLE_LANE: &str = include_str!("../../../runtime/cuda/sample_lane.cuh");
 
-/// How a lane's blocks meet on CDNA: the exchange words at device scope
-/// (each XCD's L2 written through and read past, never written back or
-/// invalidated whole), a barrier that waits for the stores it publishes.
-const HIP_LANE: &str = "
-#define M1_LANE_PAUSE() __builtin_amdgcn_s_sleep(1)
-#define M1_LANE_LOAD(p) __hip_atomic_load((p), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
-#define M1_LANE_PUT32(p, v) __hip_atomic_store((p), (m1_u32)(v), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
-#define M1_LANE_PUT64(p, v) __hip_atomic_store((p), (m1_u64)(v), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
-#define M1_LANE_GET32(p) __hip_atomic_load((p), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
-#define M1_LANE_GET64(p) __hip_atomic_load((p), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
-#define M1_LANE_RELEASE() asm volatile(\"s_waitcnt vmcnt(0)\" ::: \"memory\")
-#define M1_LANE_ACQUIRE() asm volatile(\"\" ::: \"memory\")
-#define M1_LANE_FADD(p, v) unsafeAtomicAdd((p), (v))
-";
-
-/// How a lane's blocks meet on a CUDA device: L2-coherent words behind the
-/// device-scope fences.
-const CUDA_LANE: &str = "
-#define M1_LANE_PAUSE() __nanosleep(32)
-#define M1_LANE_LOAD(p) (*reinterpret_cast<volatile m1_u32*>(p))
-#define M1_LANE_PUT32(p, v) (*reinterpret_cast<volatile m1_u32*>(p) = (m1_u32)(v))
-#define M1_LANE_PUT64(p, v) (*reinterpret_cast<volatile m1_u64*>(p) = (m1_u64)(v))
-#define M1_LANE_GET32(p) (*reinterpret_cast<volatile m1_u32*>(p))
-#define M1_LANE_GET64(p) (*reinterpret_cast<volatile m1_u64*>(p))
-#define M1_LANE_RELEASE() __threadfence()
-#define M1_LANE_ACQUIRE() __threadfence()
-#define M1_LANE_FADD(p, v) atomicAdd((p), (v))
-";
-
 /// A sampler block's threads: at most 512, so its walks and plans keep their
 /// state in registers (a 1024-thread block holds 128 a lane).
 const LAUNCH_BOUNDS: &str = "__launch_bounds__(512) ";
@@ -98,7 +69,12 @@ pub fn sampler_values(stage: &CompiledStage, region: &Region) -> Option<SamplerV
         match op.tag {
             tags::REDUCE_MAX => logits = op.args.first().copied(),
             tags::PIVOT_THRESHOLD => {
-                pivot = Some((op.args.first().copied()?, op.pred_payload, op.pred_tag, bases[index]))
+                pivot = Some((
+                    op.args.first().copied()?,
+                    op.pred_payload,
+                    op.pred_tag,
+                    bases[index],
+                ))
             }
             tags::RNG_KEYED => state = op.args.first().copied(),
             tags::REDUCE_ARGMAX => token = Some(bases[index]),
@@ -141,7 +117,7 @@ pub fn sampler_values(stage: &CompiledStage, region: &Region) -> Option<SamplerV
     })
 }
 
-pub fn emit_sampler_region_in(
+pub fn emit_sampler_region(
     dialect: Dialect,
     entry_name: &str,
     stage: &CompiledStage,
@@ -162,10 +138,7 @@ pub fn emit_sampler_region_in(
     };
     let mut source = runtime_source(dialect);
     source.push_str(&PROLOGUE[..cut]);
-    source.push_str(match dialect {
-        Dialect::Hip => HIP_LANE,
-        Dialect::Cuda => CUDA_LANE,
-    });
+    source.push_str(dialect.lane);
     source.push_str(SAMPLE_LANE);
     source.push('\n');
     source.push_str(ENTRY);

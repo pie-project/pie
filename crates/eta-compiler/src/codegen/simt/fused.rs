@@ -405,14 +405,6 @@ pub(crate) fn stream_rows(stage: &CompiledStage, region: &Region) -> Option<Vec<
 }
 
 pub fn emit_fused_region(
-    entry_name: &str,
-    stage: &CompiledStage,
-    region: &Region,
-) -> Result<String, EmitError> {
-    emit_fused_region_in(Dialect::Cuda, entry_name, stage, region)
-}
-
-pub fn emit_fused_region_in(
     dialect: Dialect,
     entry_name: &str,
     stage: &CompiledStage,

@@ -22,11 +22,7 @@ pub fn supported_tag(tag: u8) -> bool {
     OP_TABLE.iter().any(|entry| entry.tag == tag)
 }
 
-pub fn emit_singleton_region(entry_name: &str, op_tag: u8) -> Result<String, EmitError> {
-    emit_singleton_region_in(Dialect::Cuda, entry_name, op_tag)
-}
-
-pub fn emit_singleton_region_in(
+pub fn emit_singleton_region(
     dialect: Dialect,
     entry_name: &str,
     op_tag: u8,

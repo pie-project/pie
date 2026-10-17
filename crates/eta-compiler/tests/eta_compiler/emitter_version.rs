@@ -1,5 +1,6 @@
 use crate::msl_corpus::{corpus_bound, corpus_stages, extended_stages};
-use eta_compiler::codegen::cuda::{CUDA_GENERATED_EMITTER_VERSION, HIP_GENERATED_EMITTER_VERSION};
+use eta_compiler::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION;
+use eta_compiler::codegen::hip::HIP_GENERATED_EMITTER_VERSION;
 use eta_compiler::codegen::metal::METAL_M1_EMITTER_VERSION;
 use eta_compiler::codegen::program::{Backend, emit_program};
 

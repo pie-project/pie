@@ -1,4 +1,3 @@
-use crate::codegen::cuda::Dialect;
 use serde::{Deserialize, Serialize};
 
 use crate::codegen::error::{EmitError, EmitterKind};
@@ -92,7 +91,7 @@ impl Backend {
     pub fn emitter_version(self) -> u32 {
         match self {
             Backend::Cuda => crate::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION as u32,
-            Backend::Hip => crate::codegen::cuda::HIP_GENERATED_EMITTER_VERSION as u32,
+            Backend::Hip => crate::codegen::hip::HIP_GENERATED_EMITTER_VERSION as u32,
             Backend::Metal => crate::codegen::metal::METAL_M1_EMITTER_VERSION as u32,
         }
     }
@@ -107,12 +106,22 @@ pub fn emit_program(
     match backend {
         Backend::Cuda => {
             for (stage_index, stage) in stages.iter().enumerate() {
-                emit_cuda_stage(Dialect::Cuda, stage, stage_index, &mut kernels);
+                emit_simt_stage(
+                    crate::codegen::cuda::DIALECT,
+                    stage,
+                    stage_index,
+                    &mut kernels,
+                );
             }
         }
         Backend::Hip => {
             for (stage_index, stage) in stages.iter().enumerate() {
-                emit_cuda_stage(Dialect::Hip, stage, stage_index, &mut kernels);
+                emit_simt_stage(
+                    crate::codegen::hip::DIALECT,
+                    stage,
+                    stage_index,
+                    &mut kernels,
+                );
             }
         }
         Backend::Metal => {
@@ -129,8 +138,8 @@ fn signature(stage: &CompiledStage) -> String {
     format!("{:016x}", stage.signature.hash)
 }
 
-fn emit_cuda_stage(
-    dialect: Dialect,
+fn emit_simt_stage(
+    dialect: crate::codegen::simt::Dialect,
     stage: &CompiledStage,
     stage_index: usize,
     out: &mut Vec<EmittedKernel>,
@@ -138,7 +147,7 @@ fn emit_cuda_stage(
     let signature = signature(stage);
     for (region_index, region) in stage.fused.regions.iter().enumerate() {
         let entry = format!("ptir_fused_{signature}_r{region_index}");
-        let emitted = crate::codegen::cuda::emit_region_in(dialect, &entry, stage, region);
+        let emitted = crate::codegen::simt::emit_region(dialect, &entry, stage, region);
         out.push(EmittedKernel::new(
             KernelKind::Fused,
             stage_index,

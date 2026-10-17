@@ -72,14 +72,6 @@ pub fn is_scan_region(stage: &CompiledStage, region: &Region) -> bool {
 }
 
 pub fn emit_scan_region(
-    entry_name: &str,
-    stage: &CompiledStage,
-    region: &Region,
-) -> Result<String, EmitError> {
-    emit_scan_region_in(Dialect::Cuda, entry_name, stage, region)
-}
-
-pub fn emit_scan_region_in(
     dialect: Dialect,
     entry_name: &str,
     stage: &CompiledStage,
