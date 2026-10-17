@@ -1493,17 +1493,14 @@ async fn main(input: Input) -> Result<Output> {
             .flat_map(|_| (0..pool).map(move |j| j < held + block))
             .collect();
         let mask = Channel::from_shaped([block, pool], visible).named("mask_d");
-        // **ONLY THE ROWS THE VERIFY WILL READ.** A block drafter's rows go
-        // through the TARGET's one `lm_head`, so there is no separate draft
-        // plane — and that head is the widest matrix in the model. Reading
-        // all sixteen rows of it to then verify four is the same waste the
-        // width staircase found on the verify side, paid a second time.
-        //
-        // The width is known BEFORE this fire whenever it comes from the
-        // ladder or from `verify_rows`; only `margin_width` picks it after,
-        // off margins this readout would otherwise not contain, so that one
-        // still reads the block.
-        let shown = if input.margin_width { block } else { verify };
+        // **THE WHOLE BLOCK, NOT THE VERIFY WIDTH.** A DFlash2 head's selector
+        // takes its tokens, hidden projection and picks one row per block row
+        // (`attention.selector_walk` refuses anything else), so the readout
+        // has to cover the block. Reading only the verify's rows made the
+        // candidates four rows and the tokens eight, and every fire failed
+        // with "carry one row per candidate row". The proposals are cut to
+        // the verify width afterwards, so nothing downstream changes.
+        let shown = block;
         let readout = Channel::from_iter(0..shown).named("readout_d");
         // **THE PROPOSALS ARE THE HEAD'S READOUT, OFF THE `mtp.drafts`
         // SEAM.** A v1 head plants its per-slot argmax there; DFlash2 plants
