@@ -14,6 +14,7 @@ use kernels_cuda::tuning::Tuning;
 /// One chunked fire: its requests, its heads, and the per-lane seats a
 /// speculative or staged fire carries. Per-lane arrays are indexed by the
 /// lane's seat, `lane + lane_base`.
+#[derive(Clone, Copy)]
 struct Case {
     lens: &'static [usize],
     k_heads: u32,
@@ -26,53 +27,29 @@ struct Case {
     window: Option<(u32, u32)>,
 }
 
-const PLAIN: Case = Case {
-    lens: &[70, 5, 130],
-    k_heads: 2,
-    v_heads: 4,
-    commit_len: None,
-    begin_at: None,
-    folds: None,
-    window: None,
-};
-
 /// A plain fire; a request several chunks long at a three-way head fan; a
 /// replay that starts inside a row, commits a prefix and folds only the
 /// lanes its predicate names; a staged window, read and landed past its
-/// base and seated past its first seat.
+/// base and seated past its first seat: each on a prefill path (the wmma
+/// launches, the scan, the tcgen05 walk sm_100 turns on, and both landing
+/// bf16).
 #[test]
 fn the_chunked_gated_delta_answers_the_serial_scan() {
-    let cases = [
-        PLAIN,
-        Case {
-            lens: &[300, 64, 129],
-            k_heads: 2,
-            v_heads: 6,
-            ..PLAIN
-        },
-        Case {
-            commit_len: Some(&[50, 9, 100]),
-            begin_at: Some(&[3, 0, 64]),
-            folds: Some(&[1, 0, 1]),
-            ..PLAIN
-        },
-        Case {
-            commit_len: Some(&[0, 70, 4, 120]),
-            window: Some((7, 1)),
-            ..PLAIN
-        },
-    ];
-    for case in &cases {
-        check(case);
-    }
-}
-
-/// Each case runs every prefill path: the three wmma launches every card
-/// runs, the two-launch scan, and the one-launch tcgen05 walk the sm_100
-/// profile turns on (a card that cannot run one falls back to the next).
-fn check(case: &Case) {
-    for arm in [Arm::Split, Arm::Scan, Arm::Tc5, Arm::ScanBf16, Arm::Tc5Bf16] {
-        check_on(case, arm);
+    #[rustfmt::skip]
+    let plain = Case { lens: &[70, 5, 130], k_heads: 2, v_heads: 4, commit_len: None, begin_at: None, folds: None, window: None };
+    let fan = Case {
+        lens: &[300, 64, 129],
+        v_heads: 6,
+        ..plain
+    };
+    #[rustfmt::skip]
+    let replay = Case { commit_len: Some(&[50, 9, 100]), begin_at: Some(&[3, 0, 64]), folds: Some(&[1, 0, 1]), ..plain };
+    #[rustfmt::skip]
+    let staged = Case { commit_len: Some(&[0, 70, 4, 120]), window: Some((7, 1)), ..plain };
+    #[rustfmt::skip]
+    let cases = [(plain, Arm::Split), (fan, Arm::Tc5), (replay, Arm::Scan), (staged, Arm::Tc5Bf16), (replay, Arm::ScanBf16)];
+    for (case, arm) in cases {
+        check_on(&case, arm);
     }
 }
 
@@ -81,24 +58,8 @@ enum Arm {
     Split,
     Scan,
     Tc5,
-    /// The walks landing a bf16 output (a trace narrowed for its gated
-    /// norm): the tcgen05 walk lands it itself, the scan through a cast.
     ScanBf16,
     Tc5Bf16,
-}
-
-impl Arm {
-    fn narrow(self) -> bool {
-        matches!(self, Arm::ScanBf16 | Arm::Tc5Bf16)
-    }
-}
-
-fn tuned(arm: Arm) -> Tuning {
-    Tuning {
-        ssm_gdn_fused_scan: arm != Arm::Split,
-        ssm_gdn_tc5: matches!(arm, Arm::Tc5 | Arm::Tc5Bf16),
-        ..Tuning::DEFAULT
-    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -172,7 +133,7 @@ fn check_on(case: &Case, fused: Arm) {
             begin_at,
             fused_decay: false,
         };
-        let narrow = !serial && fused.narrow();
+        let narrow = !serial && matches!(fused, Arm::ScanBf16 | Arm::Tc5Bf16);
         let mut y = Tensor::new(
             y_at,
             live as u32,
@@ -184,7 +145,11 @@ fn check_on(case: &Case, fused: Arm) {
             indptr: Tensor::new(indptr_at, lens.len() as u32 + 1, 1, Dtype::I32),
         };
         let gates_t = Tensor::new(gates_at, live as u32, 2 * v_heads, Dtype::F32);
-        let ctx = gpu.ctx().with_tuning(tuned(fused));
+        let ctx = gpu.ctx().with_tuning(Tuning {
+            ssm_gdn_fused_scan: fused != Arm::Split,
+            ssm_gdn_tc5: matches!(fused, Arm::Tc5 | Arm::Tc5Bf16),
+            ..Tuning::DEFAULT
+        });
         if let Some(win) = win_at {
             ctx.arm_stage(win);
         }

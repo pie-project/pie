@@ -5,8 +5,8 @@
 //! over the window, the compressed entries and the sinks, on bf16 planes and
 //! on the rows `dsv4::append` writes.
 
-use crate::common::attn_ref::{Quant, YARN, attend, col, near, picks, pool};
-use crate::common::attn_ref::{quantized, ten, tuned, turn, wide};
+use crate::common::attn_ref::{Quant, YARN, attend, col, landed, near, owners, picks, pool};
+use crate::common::attn_ref::{quantized, ten, tuned, turn};
 use crate::common::host::rows_read;
 use crate::common::{Gpu, Lcg, captured, forget, host::upload_to, replay};
 use dtype::Dtype::{Bf16, F32, I32, U8, U32};
@@ -154,10 +154,8 @@ fn check(
             Pass::Window => pre::window_only(&ctx, op, qt, pos_t, req_t, false, &win, sink_t, s, o),
         };
         fired.expect("the attention fires");
-        gpu.sync();
-        let got = wide(&gpu.down::<u16>(o_at, n * H * D));
         let what = format!("{pass:?}, {n} rows, {ratio} {top_k}, {fmts:?}, {floored}, {turned:?}");
-        near(&got, &want, 4e-2, 0.05, &what);
+        landed(&gpu, o_at, &want, 4e-2, 0.05, &what);
         for (i, head) in want.chunks_mut(D).enumerate() {
             turn(head, pos[i / H], 64, true, true, yarn);
         }
@@ -167,17 +165,11 @@ fn check(
 #[test]
 fn deepseeks_attention_answers_the_reference() {
     let base = [2, 3, 50, 700, 2047, 2100, 1500, 127];
-    let spread = |n: usize| {
-        (0..n)
-            .map(|r| (r % 2, base[r % 8] + r / 8 % 5))
-            .collect::<Vec<_>>()
-    };
+    let at = |r: usize| (r % 2, base[r % 8] + r / 8 % 5);
+    let spread = |n: usize| (0..n).map(at).collect::<Vec<_>>();
     // Rows pair up within a request and across its end; the last stands alone.
-    let run: Vec<_> = (600..608)
-        .map(|p| (0, p))
-        .chain((1000..1005).map(|p| (1, p)))
-        .collect();
-    let short: Vec<_> = (0..5).map(|p| (0, p)).chain(run.iter().copied()).collect();
+    let run = owners(&[(8, 608), (5, 1005)]);
+    let short = [owners(&[(5, 5)]), run.clone()].concat();
     let (bf, ds) = ([None; 2], [Some(Rows::Ds); 2]);
     let v41 = [Some(Rows::Mx8), Some(Rows::Nv4)];
     let (dec, win) = (Pass::Decode, Pass::Window);
@@ -218,39 +210,28 @@ fn a_recorded_pass_reads_the_page_tables_its_replay_states() {
         let (ent, _) = plane(&mut gpu, w_at, &w, Some(fmts[1]));
         let (table_at, indptr_at, pos_at) = (gpu.zeros(PER * 4), gpu.zeros(8), gpu.zeros(n * 4));
         let (qt, pos_t) = (ten(gpu.up(&q_raw), n, H * D, Bf16), ten(pos_at, n, 1, I32));
-        let (req_t, sink_t) = (
-            col(&mut gpu, &[0i32; 6], I32),
-            col(&mut gpu, &[0.5f32; H], F32),
-        );
+        let req_t = col(&mut gpu, &[0i32; 6], I32);
+        let sink_t = col(&mut gpu, &[0.5f32; H], F32);
         let (o_at, fresh_at) = (gpu.zeros(n * H * D * 2), gpu.zeros(n * H * D * 2));
         let held = |held: usize| {
             let positions: Vec<i32> = (0..n).map(|r| (held * PAGE - 5 - n + r) as i32).collect();
-            upload_to(
-                table_at,
-                &(0..held as u32).map(|i| 2 * i).collect::<Vec<_>>(),
-            );
+            let table: Vec<u32> = (0..held as u32).map(|i| 2 * i).collect();
+            upload_to(table_at, &table);
             upload_to(indptr_at, &[0u32, held as u32]);
             upload_to(pos_at, &positions);
         };
         let (page_indices, page_indptr) = (ten(table_at, PER, 1, U32), ten(indptr_at, 2, 1, U32));
-        let win = KvPool {
+        let view = |p: KvPool| KvPool {
             page_indices,
             page_indptr,
-            ..win
+            ..p
         };
-        let ent = KvPool {
-            page_indices,
-            page_indptr,
-            ..ent
+        let (win, ent, op) = (view(win), view(ent), "attention.pool_attention");
+        let staged = pre::Pooled {
+            entries: &ent,
+            ratio: 4,
+            selection: None,
         };
-        let (op, staged) = (
-            "attention.pool_attention",
-            pre::Pooled {
-                entries: &ent,
-                ratio: 4,
-                selection: None,
-            },
-        );
         let fire = |at: u64| {
             let (ctx, o) = (gpu.ctx(), &mut ten(at, n, H * D, Bf16));
             let fired = pre::prefill(
@@ -286,27 +267,20 @@ fn the_pool_attention_answers_the_reference() {
         (20, 256, 4, 64, false),
         (24, 128, 16, 0, true),
     ];
+    let positions = [2i32, 3, 50, 700, 2047, 2100, 1500, 9];
+    let reqs = [0i32, 1, 0, 1, 0, 1, 1, 0];
     for (heads, d, ratio, top_k, mma) in cases {
-        let (positions, reqs) = (
-            [2i32, 3, 50, 700, 2047, 2100, 1500, 9],
-            [0i32, 1, 0, 1, 0, 1, 1, 0],
-        );
         let mut sel = Vec::new();
         for (r, &p) in positions.iter().enumerate() {
             let visible = (p as usize + 1) / ratio;
             let early = |i: usize| (r == 3 || r == 5) && i >= top_k / 2;
             let past = |i: usize| (r + i) % 9 == 0;
-            let id = |i: usize| {
-                if past(i) {
-                    visible + i % 7
-                } else {
-                    (i * 37 + r * 11) % (visible.max(1) + 3)
-                }
-            };
+            let wrap = visible.max(1) + 3;
+            let id = |i: usize| [(i * 37 + r * 11) % wrap, visible + i % 7][usize::from(past(i))];
             sel.extend((0..top_k).map(|i| if early(i) { -1 } else { id(i) as i32 }));
         }
-        let (mut gpu, mut lcg, n, s) =
-            (Gpu::open(), Lcg::seeded(0x9001), 8, 1.0 / (d as f32).sqrt());
+        let (mut gpu, mut lcg, n) = (Gpu::open(), Lcg::seeded(0x9001), 8);
+        let s = 1.0 / (d as f32).sqrt();
         let (q_raw, q) = lcg.row(n * heads * d);
         let (k_raw, k) = lcg.row(CELLS * d);
         let keys = ten(gpu.up(&k_raw), CELLS, d, Bf16);
@@ -314,16 +288,14 @@ fn the_pool_attention_answers_the_reference() {
         let (want, want_lse) = attend([&q, &k, &k], [heads, 1, d, d], s, None, |r, _| {
             let visible = (positions[r] as usize + 1) / ratio;
             let ids = picks(&sel, r, top_k, visible).into_iter();
-            ids.map(|c| slot(reqs[r] as usize, (c + 1) * ratio - 1))
-                .collect()
+            let req = reqs[r] as usize;
+            ids.map(|c| slot(req, (c + 1) * ratio - 1)).collect()
         });
         let qt = ten(gpu.up(&q_raw), n, heads * d, Bf16);
         let (pos_t, req_t) = (col(&mut gpu, &positions, I32), col(&mut gpu, &reqs, I32));
         let (o_at, lse_at) = (gpu.zeros(n * heads * d * 2), gpu.zeros(n * heads * 4));
-        let (o, lse) = (
-            &mut ten(o_at, n, heads * d, Bf16),
-            &mut ten(lse_at, n, heads, F32),
-        );
+        let o = &mut ten(o_at, n, heads * d, Bf16);
+        let lse = &mut ten(lse_at, n, heads, F32);
         let ctx = gpu.ctx().with_tuning(tuned(|t| t.pool_mma = mma));
         let (h, w, ratio, k) = (heads as u32, d as u32, ratio as u32, top_k as u32);
         let fired = if top_k > 0 {
@@ -335,15 +307,8 @@ fn the_pool_attention_answers_the_reference() {
             pools::attention_lse(&ctx, qt, pos_t, req_t, &ent, ratio, h, w, s, o, lse)
         };
         fired.expect("the pool attention fires");
-        gpu.sync();
         let what = format!("{heads} heads at {d}, ratio {ratio}, top {top_k}, mma {mma}");
-        near(
-            &wide(&gpu.down::<u16>(o_at, n * heads * d)),
-            &want,
-            3e-2,
-            0.05,
-            &what,
-        );
+        landed(&gpu, o_at, &want, 3e-2, 0.05, &what);
         let lse_got: Vec<f32> = gpu.down(lse_at, n * heads);
         let close = |(g, w): (&f32, &f32)| g == w || (g - w).abs() <= 2e-2 * w.abs().max(1.0);
         assert!(lse_got.iter().zip(&want_lse).all(close), "{what}: lse");
@@ -363,8 +328,8 @@ fn a_padded_lane_closes_no_pool_entry() {
     let (bpos_at, breq_at, rope_at) = (gpu.zeros(80), gpu.zeros(80), gpu.zeros(80));
     let (bp, br) = (&mut ten(bpos_at, 20, 1, I32), &mut ten(breq_at, 20, 1, I32));
     let (rope, absent, ctx) = (&mut ten(rope_at, 20, 1, I32), Tensor::ABSENT, gpu.ctx());
-    let fired =
-        pools::boundary_prefill(&ctx, RaggedTensor { data, indptr }, absent, 4, bp, br, rope);
+    let positions_t = RaggedTensor { data, indptr };
+    let fired = pools::boundary_prefill(&ctx, positions_t, absent, 4, bp, br, rope);
     fired.expect("the boundaries fire");
     gpu.sync();
     let (bpos, breq): (Vec<i32>, Vec<i32>) = (gpu.down(bpos_at, 20), gpu.down(breq_at, 20));
@@ -376,10 +341,8 @@ fn a_padded_lane_closes_no_pool_entry() {
     let mut lcg = Lcg::seeded(0x5eed);
     let kv = ten(gpu.up(&lcg.row(16 * 128).0), 16, 128, Bf16);
     let score = ten(gpu.up(&lcg.row(16 * 128).0), 16, 128, Bf16);
-    let (pages, owned) = (
-        col(&mut gpu, &[0u32], U32),
-        col(&mut gpu, &[0u32, 1, 1, 1], U32),
-    );
+    let pages = col(&mut gpu, &[0u32], U32);
+    let owned = col(&mut gpu, &[0u32, 1, 1, 1], U32);
     let state = pool(kv, pages, owned, 16);
     let bpos = col(&mut gpu, &[7i32, 7, 1_000_000_003], I32);
     let breq = col(&mut gpu, &[0i32, 2, -123_456_789], I32);
@@ -393,16 +356,11 @@ fn a_padded_lane_closes_no_pool_entry() {
         fired.expect("the gather fires");
         gpu.sync();
         let out: Vec<u16> = gpu.down(out_at, 3 * 64);
+        let (live, padded, past) = (&out[..64], &out[64..128], &out[128..]);
+        assert!(live.iter().any(|&b| b != 0), "vec {vec}: the live lane");
+        assert!(padded.iter().all(|&b| b == 0), "vec {vec}: the padded lane");
         assert!(
-            out[..64].iter().any(|&b| b != 0),
-            "vec {vec}: the live lane"
-        );
-        assert!(
-            out[64..128].iter().all(|&b| b == 0),
-            "vec {vec}: the padded lane"
-        );
-        assert!(
-            out[128..].iter().all(|&b| b == 0x3f80),
+            past.iter().all(|&b| b == 0x3f80),
             "vec {vec}: past the window"
         );
     }

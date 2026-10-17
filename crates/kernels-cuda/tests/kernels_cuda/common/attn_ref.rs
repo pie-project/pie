@@ -57,14 +57,7 @@ pub fn attend(
 /// The last `dim` dims of `head` turned by `pos` (`rope_partial_last`):
 /// interleaved pairs or split halves, backwards where `inverse`, the
 /// frequencies ramped where `yarn`.
-pub fn turn(
-    head: &mut [f32],
-    pos: i32,
-    dim: usize,
-    interleaved: bool,
-    inverse: bool,
-    yarn: Option<Yarn>,
-) {
+pub fn turn(head: &mut [f32], pos: i32, dim: usize, il: bool, inv: bool, yarn: Option<Yarn>) {
     let (half, off) = (dim / 2, head.len() - dim);
     let ramp = yarn.map(|y| {
         let max = y.original_max_position as i32;
@@ -77,12 +70,8 @@ pub fn turn(
             let r = f64::from(((p as f32 - lo) / den).clamp(0.0, 1.0));
             freq *= (1.0 - r) + r / f64::from(factor);
         }
-        let (s, c) = (if inverse { -1.0 } else { 1.0 } * f64::from(pos) * freq).sin_cos();
-        let (i, j) = if interleaved {
-            (off + 2 * p, off + 2 * p + 1)
-        } else {
-            (off + p, off + p + half)
-        };
+        let (s, c) = ([1.0, -1.0][usize::from(inv)] * f64::from(pos) * freq).sin_cos();
+        let (i, j) = [(off + p, off + p + half), (off + 2 * p, off + 2 * p + 1)][usize::from(il)];
         let (a, b) = (f64::from(head[i]), f64::from(head[j]));
         (head[i], head[j]) = ((a * c - b * s) as f32, (b * c + a * s) as f32);
     }
@@ -94,9 +83,9 @@ pub fn rmsnorm(x: &[f32], unit: usize, w: Option<&[f32]>, eps: f32) -> Vec<f32> 
     for c in y.chunks_mut(unit) {
         let ms = c.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / unit as f64;
         let inv = (1.0 / (ms + f64::from(eps)).sqrt()) as f32;
-        c.iter_mut()
-            .enumerate()
-            .for_each(|(i, v)| *v *= inv * w.map_or(1.0, |w| w[i]));
+        for (i, v) in c.iter_mut().enumerate() {
+            *v *= inv * w.map_or(1.0, |w| w[i]);
+        }
     }
     y
 }
@@ -109,12 +98,47 @@ pub fn wide(bits: &[u16]) -> Vec<f32> {
 /// Asserts `got` within `tol` of `want` relative to `want` (at least `floor`).
 pub fn near(got: &[f32], want: &[f32], tol: f32, floor: f32, what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: lengths");
-    let errs = got
-        .iter()
-        .zip(want)
-        .map(|(g, w)| (g - w).abs() / w.abs().max(floor));
-    let worst = errs.fold(0.0, f32::max);
+    let err = |(g, w): (&f32, &f32)| (g - w).abs() / w.abs().max(floor);
+    let worst = got.iter().zip(want).map(err).fold(0.0, f32::max);
     assert!(worst <= tol, "{what}: off by {worst} relative");
+}
+
+/// The bf16 values at `at` within `tol` of `want` (see [`near`]).
+pub fn landed(gpu: &Gpu, at: u64, want: &[f32], tol: f32, floor: f32, what: &str) {
+    gpu.sync();
+    let got = wide(&gpu.down::<u16>(at, want.len()));
+    near(&got, want, tol, floor, what);
+}
+
+/// `a . b`, summed in f64.
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| f64::from(x * y)).sum::<f64>() as f32
+}
+
+/// The running offsets of `sizes`, from 0.
+pub fn offsets(sizes: impl IntoIterator<Item = usize>) -> Vec<i32> {
+    let mut out = vec![0i32];
+    for n in sizes {
+        out.push(out[out.len() - 1] + n as i32);
+    }
+    out
+}
+
+/// Each row's `(request, position)` over requests of `(rows, keys)`, the
+/// rows the last of the keys.
+pub fn owners(lens: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let each = |(r, &(n, kv)): (usize, &(usize, usize))| (kv - n..kv).map(move |p| (r, p));
+    lens.iter().enumerate().flat_map(each).collect()
+}
+
+/// `p` reading `keys` and `values`.
+pub fn keyed(p: &KvPool, keys: Tensor, values: Tensor) -> KvPool {
+    KvPool {
+        keys,
+        values,
+        seq_stride: i64::from(keys.width),
+        ..*p
+    }
 }
 
 /// [`Tuning::DEFAULT`] with `set` applied.

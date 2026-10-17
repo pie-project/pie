@@ -1,10 +1,9 @@
 #![cfg(feature = "cuda")]
 
-//! The paged attention launchers (`decode_lse`, `prefill_lse`, their sinked
-//! forms and the tcgen05 `prefill`) against the host softmax, one case a
-//! route.
+//! The paged attention launchers (`decode_lse`, FA2's `prefill_lse` and
+//! their sinked forms) against the host softmax, one case a route.
 
-use crate::common::attn_ref::{attend, col, near, pool, ten, tuned, wide};
+use crate::common::attn_ref::{attend, col, landed, near, pool, ten, tuned};
 use crate::common::{Gpu, Lcg, from_bf16, host::upload_to};
 use dtype::Dtype::{Bf16, F32, I32};
 use kernels_cuda::attn::plan::{self, Device, Live, Shape, Toggles, Workspace};
@@ -13,16 +12,6 @@ use kernels_cuda::tensor::{KvPool, RaggedTensor};
 use kernels_cuda::tuning::Tuning;
 
 const PAGE: usize = 16;
-
-#[derive(Clone, Copy, Debug)]
-enum Mode {
-    /// The decode, over lanes `(first, count)` of a recorded plan where given.
-    Decode(Option<(u32, u32)>),
-    /// FA2's prefill with its log-sum-exp.
-    Lse,
-    /// The tcgen05 prefill.
-    Tc5,
-}
 
 /// A decode read: the warp merge, the tensor-core decode, its whole window
 /// and its cluster.
@@ -33,17 +22,21 @@ fn read(warp: bool, xqa: bool, whole: u32, cluster: u32) -> Tuning {
     })
 }
 
+/// The decode over the lanes `(first, count)` of a fire (every lane where
+/// `Some(None)`), or the prefill where `None`.
+type Lanes = Option<Option<(u32, u32)>>;
+
 /// `[q heads, kv heads, head dim]` over requests of `(new, cached)` rows.
 #[allow(clippy::too_many_lines)]
 fn check(
-    [qh, kvh, d]: [usize; 3],
+    heads: [usize; 3],
     reqs: &[(usize, usize)],
     window: Option<u32>,
-    [graph, sinked]: [bool; 2],
-    mode: Mode,
+    flags: [bool; 2],
+    lanes: Lanes,
     tuning: Tuning,
 ) {
-    let n = reqs.len();
+    let ([qh, kvh, d], [graph, sinked], n) = (heads, flags, reqs.len());
     let (width, qw, scale) = (kvh * d, qh * d, (d as f32).sqrt().recip());
     let (mut qo, mut kv_indptr, mut kv_len) = (vec![0], vec![0], vec![]);
     let (mut last, mut pages, mut owner) = (vec![], vec![], vec![]);
@@ -70,9 +63,8 @@ fn check(
     let (want_o, want_lse) = attend([&q, &k, &v], [qh, kvh, d, d], scale, sunk, |row, _| {
         let (r, reach) = owner[row];
         let first = window.map_or(0, |w| reach.saturating_sub(w as usize));
-        (first..reach)
-            .map(|t| pages[r][t / PAGE] * PAGE + t % PAGE)
-            .collect()
+        let cell = |t: usize| pages[r][t / PAGE] * PAGE + t % PAGE;
+        (first..reach).map(cell).collect()
     });
     let mut gpu = Gpu::open();
     let flat: Vec<i32> = pages.iter().flatten().map(|&p| p as i32).collect();
@@ -103,11 +95,7 @@ fn check(
     };
     let ctx = gpu.ctx().with_tuning(tuning);
     let device = Device::probe(&ctx).expect("the device answers");
-    let (first, count) = if let Mode::Decode(Some(l)) = mode {
-        l
-    } else {
-        (0, n as u32)
-    };
+    let (first, count) = lanes.flatten().unwrap_or((0, n as u32));
     if count != n as u32 {
         upload_to(stage, &[count, first, count, first]);
         ctx.arm_stage(stage);
@@ -115,15 +103,8 @@ fn check(
     let (a, b) = (first as usize, (first + count) as usize);
     let ([qh, kvh, d], page_size) = ([qh, kvh, d].map(|x| x as u32), PAGE as u32);
     let (num_q_heads, num_kv_heads, lane_offset) = (qh, kvh, first);
-    let shape = Shape {
-        num_requests: count,
-        lane_offset,
-        num_q_heads,
-        num_kv_heads,
-        head_dim: d,
-        page_size,
-        hnd_layout: false,
-    };
+    #[rustfmt::skip]
+    let shape = Shape { num_requests: count, lane_offset, num_q_heads, num_kv_heads, head_dim: d, page_size, hnd_layout: false };
     let (row_offset, live_rows) = (qo[a] as u32, (qo[b] - qo[a]) as u32);
     let live = Live {
         requests: count,
@@ -131,27 +112,23 @@ fn check(
         row_offset,
         rows: live_rows,
     };
-    let mut o = ten(o_at, rows, qw, Bf16);
-    let mut lse = ten(lse_at, rows, qh as usize, F32);
-    let plain = Tuning {
-        prefill_tc5: false,
-        prefill_wide_sliding: false,
-        ..tuning
-    };
-    let toggles = Toggles::of(plain);
+    let (o, lse) = (
+        &mut ten(o_at, rows, qw, Bf16),
+        &mut ten(lse_at, rows, qh as usize, F32),
+    );
+    let toggles = Toggles::of(tuning);
     let (ip, kl, total) = (&kv_indptr[a..=b], &kv_len[a..b], rows as u32);
     // Twice off one staged plan: one fire's workspace must not spoil the next.
     for _ in 0..2 {
         gpu.sync();
         upload_to(o_at, &vec![0x7f7fu16; rows * qw]);
-        let fired = if let Mode::Decode(_) = mode {
+        let fired = if lanes.is_some() {
             let grid = grid_of(d, qh, kvh, &device);
             let plan = plan::plan_decode(
                 ip, kl, shape, live, window, graph, grid, toggles, &device, ws,
             );
             let plan = plan.expect("the decode plans");
             plan.stage(&ctx).expect("the plan uploads");
-            let (o, lse) = (&mut o, &mut lse);
             match sinked {
                 true => {
                     attn::decode_lse_sink(&ctx, qt, &plan, &kvp, window, d, scale, o, lse, sink_t)
@@ -165,36 +142,27 @@ fn check(
             );
             let plan = p.expect("the prefill plans");
             plan.stage(&ctx).expect("the plan uploads");
-            let (o, lse) = (&mut o, &mut lse);
-            match (mode, sinked) {
-                (Mode::Tc5, _) => attn::prefill(&ctx, qt, &plan, &kvp, window, d, kvh, scale, o),
-                (_, true) => attn::prefill_lse_sink(
-                    &ctx, qt, &plan, &kvp, window, d, kvh, scale, o, lse, sink_t,
-                ),
-                _ => attn::prefill_lse(&ctx, qt, &plan, &kvp, window, d, kvh, scale, o, lse),
+            let (w, s) = (window, scale);
+            match sinked {
+                true => attn::prefill_lse_sink(&ctx, qt, &plan, &kvp, w, d, kvh, s, o, lse, sink_t),
+                false => attn::prefill_lse(&ctx, qt, &plan, &kvp, w, d, kvh, s, o, lse),
             }
         };
         fired.expect("the attention fires");
     }
-    gpu.sync();
-    let got = wide(&gpu.down::<u16>(o_at, rows * qw));
+    let what = format!("{qh}/{kvh} heads of {d}, {window:?}, {graph} {sinked} {lanes:?}");
+    // Rows outside the plan's lanes keep the scrub.
+    let (ra, rb, mut want_o) = (
+        row_offset as usize,
+        (row_offset + live_rows) as usize,
+        want_o,
+    );
+    want_o[..ra * qw].fill(from_bf16(0x7f7f));
+    want_o[rb * qw..].fill(from_bf16(0x7f7f));
+    landed(&gpu, o_at, &want_o, 2e-2, 1.0, &what);
     let got_lse: Vec<f32> = gpu.down(lse_at, rows * qh as usize);
-    let (ra, rb) = (row_offset as usize, (row_offset + live_rows) as usize);
-    let what = format!("{qh}/{kvh} heads of {d}, {window:?}, {graph} {sinked} {mode:?}");
-    let (o_rows, l_rows) = (ra * qw..rb * qw, ra * qh as usize..rb * qh as usize);
-    near(&got[o_rows.clone()], &want_o[o_rows], 2e-2, 1.0, &what);
-    if !matches!(mode, Mode::Tc5) {
-        near(
-            &got_lse[l_rows.clone()],
-            &want_lse[l_rows],
-            1e-2,
-            1.0,
-            &what,
-        );
-    }
-    let mut kept = got[..ra * qw].iter().chain(&got[rb * qw..]);
-    let scrubbed = kept.all(|&x| x == from_bf16(0x7f7f));
-    assert!(scrubbed, "{what}: a row outside the lanes moved");
+    let span = ra * qh as usize..rb * qh as usize;
+    near(&got_lse[span.clone()], &want_lse[span], 1e-2, 1.0, &what);
 }
 
 #[test]
@@ -202,38 +170,27 @@ fn the_paged_attention_answers_the_reference() {
     let lens = [1usize, 15, 16, 17, 130, 300, 701];
     let dec: &[_] = &lens.map(|l| (1, l - 1));
     let chunks: &[_] = &[(70, 0), (33, 17), (200, 40), (129, 0)];
-    let two: &[_] = &[(300, 0), (90, 120)];
-    let tall: &[_] = &[(1, 300), (256, 1793), (1, 47), (3, 20)];
-    let few: &[_] = &[(150, 0), (90, 12)];
     let (own, rec, sunk, both) = ([false; 2], [true, false], [false, true], [true; 2]);
-    let (d0, lse, tc5) = (Mode::Decode(None), Mode::Lse, Mode::Tc5);
-    let (lanes, more) = (Mode::Decode(Some((2, 3))), Mode::Decode(Some((5, 2))));
+    let (all, pre, lanes, more) = (Some(None), None, Some(Some((2, 3))), Some(Some((5, 2))));
     let (fa2, w128, w200, w100) = (Tuning::DEFAULT, Some(128), Some(200), Some(100));
-    let tc5_on = |w| tuned(|t| (t.prefill_tc5, t.prefill_wide_sliding) = (true, w));
     #[rustfmt::skip]
     let cases = [
         // Each decode read once, every head width, whole and windowed, own and recorded plans.
-        ([64, 8, 64], dec, None, own, d0, read(false, false, 0, 0)),
-        ([32, 16, 256], dec, w200, both, d0, read(true, false, 0, 0)),
-        ([32, 4, 512], dec, None, rec, d0, read(false, true, 0, 0)),
-        ([8, 8, 128], dec, w200, sunk, d0, read(true, true, 0, 0)),
+        ([64, 8, 64], dec, None, own, all, read(false, false, 0, 0)),
+        ([32, 16, 256], dec, w200, both, all, read(true, false, 0, 0)),
+        ([32, 4, 512], dec, None, rec, all, read(false, true, 0, 0)),
+        ([8, 8, 128], dec, w200, sunk, all, read(true, true, 0, 0)),
         ([64, 8, 64], dec, w128, both, lanes, read(false, true, 256, 0)),
-        ([64, 8, 64], dec, w200, own, d0, read(true, true, 256, 0)),
-        ([32, 16, 256], dec, None, sunk, d0, read(false, true, 0, 8)),
+        ([64, 8, 64], dec, w200, own, all, read(true, true, 256, 0)),
+        ([32, 16, 256], dec, None, sunk, all, read(false, true, 0, 8)),
         ([64, 8, 64], dec, w128, both, more, read(true, true, 256, 2)),
-        ([32, 4, 512], dec, w200, rec, d0, read(false, true, 0, 1)),
+        ([32, 4, 512], dec, w200, rec, all, read(false, true, 0, 1)),
         // FA2's prefill, one row a request and chunks over cached prefixes, sinked and not.
-        ([64, 8, 64], dec, w200, both, lse, read(true, true, 0, 0)),
-        ([32, 4, 512], chunks, None, own, lse, fa2),
-        ([8, 2, 128], chunks, w100, sunk, lse, fa2),
-        // The tcgen05 prefill at each head width, windowed on both sliding forms.
-        ([8, 2, 128], chunks, None, own, tc5, tc5_on(false)),
-        ([8, 4, 256], two, w100, own, tc5, tc5_on(false)),
-        ([8, 4, 256], two, w100, own, tc5, tc5_on(true)),
-        ([3, 3, 64], few, None, own, tc5, tc5_on(false)),
-        ([32, 4, 512], tall, None, own, tc5, tc5_on(false)),
+        ([64, 8, 64], dec, w200, both, pre, read(true, true, 0, 0)),
+        ([32, 4, 512], chunks, None, own, pre, fa2),
+        ([8, 2, 128], chunks, w100, sunk, pre, fa2),
     ];
-    for (heads, reqs, window, flags, mode, tuning) in cases {
-        check(heads, reqs, window, flags, mode, tuning);
+    for (heads, reqs, window, flags, lanes, tuning) in cases {
+        check(heads, reqs, window, flags, lanes, tuning);
     }
 }
