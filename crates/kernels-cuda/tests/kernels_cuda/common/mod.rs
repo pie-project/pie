@@ -409,5 +409,6 @@ pub fn close(got: f32, want: f32) -> bool {
     (got - want).abs() <= TOLERANCE * want.abs().max(1.0)
 }
 
+pub mod host_a;
 pub mod spatial;
 pub mod tc5;

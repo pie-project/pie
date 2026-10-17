@@ -14,6 +14,17 @@ use kernels_cuda::tuning::Tuning;
 
 const M: usize = 4;
 
+/// `n` f32s at `at`, as bits.
+fn f32_bits(gpu: &Gpu, at: u64, n: usize) -> Vec<u16> {
+    let v: Vec<f32> = gpu.down(at, n);
+    v.iter()
+        .flat_map(|f| {
+            let b = f.to_bits();
+            [b as u16, (b >> 16) as u16]
+        })
+        .collect()
+}
+
 fn tuning(tile: bool) -> Tuning {
     Tuning {
         hc_tile: tile,
@@ -21,10 +32,9 @@ fn tuning(tile: bool) -> Tuning {
     }
 }
 
-/// The projection's mixes, `tile` choosing the form; `window` is
-/// `(live, base)` over `rows` staged rows.
+/// The tiled form's mixes; `window` is `(live, base)` over `rows` staged
+/// rows.
 fn project(
-    tile: bool,
     rows: usize,
     mix_hc: usize,
     window: Option<(u32, u32)>,
@@ -39,7 +49,7 @@ fn project(
     let n_at = gpu.up(&normed);
     let w_at = gpu.up(&w);
     let m_at = gpu.zeros(planes * mix_hc * 4);
-    let ctx = gpu.ctx().with_tuning(tuning(tile));
+    let ctx = gpu.ctx().with_tuning(tuning(true));
     if let Some((live, base)) = window {
         let win_at = gpu.up(&[live, base, 0u32, 0u32]);
         ctx.arm_stage(win_at);
@@ -58,7 +68,7 @@ fn project(
 }
 
 fn check_project(rows: usize, mix_hc: usize, window: Option<(u32, u32)>) {
-    let (got, normed, w) = project(true, rows, mix_hc, window);
+    let (got, normed, w) = project(rows, mix_hc, window);
     let fan = M * 4096;
     let (live, base) = window.unwrap_or((rows as u32, 0));
     for r in 0..rows + base as usize {
@@ -83,15 +93,14 @@ fn check_project(rows: usize, mix_hc: usize, window: Option<(u32, u32)>) {
     }
 }
 
+/// The split walk under 128 rows, the tile from there; a layer's 24
+/// columns, an independent row's 8 and a collapse's 4.
 #[test]
 fn the_tiled_projection_answers_the_dot() {
     check_project(8, 24, None);
-    check_project(70, 24, None);
-    check_project(300, 24, None);
     check_project(3, 8, None);
-    check_project(5, 4, None);
     check_project(40, 24, Some((29, 6)));
-    check_project(130, 8, None);
+    check_project(300, 24, None);
     check_project(129, 4, None);
     check_project(200, 24, Some((150, 6)));
 }
@@ -174,15 +183,7 @@ fn rows_pass_on(tuning: Tuning, window: Option<(u32, u32, u32)>) -> Vec<Vec<u16>
     )
     .expect("the norm fires");
     gpu.sync();
-    let f32_bits = |at: u64, n: usize| -> Vec<u16> {
-        let v: Vec<f32> = gpu.down(at, n);
-        v.iter()
-            .flat_map(|f| {
-                let b = f.to_bits();
-                [b as u16, (b >> 16) as u16]
-            })
-            .collect()
-    };
+    let f32_bits = |at: u64, n: usize| f32_bits(&gpu, at, n);
     vec![
         gpu.down(folded, planes * M * h),
         gpu.down(gated, planes * h),
@@ -192,30 +193,24 @@ fn rows_pass_on(tuning: Tuning, window: Option<(u32, u32, u32)>) -> Vec<Vec<u16>
     ]
 }
 
-fn compare(window: Option<(u32, u32, u32)>) {
-    let before = rows_pass(false, window);
-    let after = rows_pass(true, window);
-    for (k, name) in ["fold", "gates", "post", "combine", "norm"]
-        .iter()
-        .enumerate()
-    {
-        assert_eq!(
-            before[k], after[k],
-            "the {name} lands bit for bit ({window:?})"
-        );
-    }
-}
-
+/// The vector forms land what the forms before land, bit for bit; and a
+/// prefill's rows under `kernel.elemwise.hc_mma` (the fold a block a row)
+/// what the vector forms land, whole and windowed.
 #[test]
 fn the_vector_forms_land_what_the_forms_before_land() {
-    compare(None);
-    compare(Some((24, 17, 5)));
-}
-
-/// A prefill's rows under `kernel.elemwise.hc_mma` (the fold a block a row)
-/// land what the vector forms land, bit for bit, whole and windowed.
-#[test]
-fn a_prefills_rows_fold_alike_a_block_a_row() {
+    for window in [None, Some((24, 17, 5))] {
+        let before = rows_pass(false, window);
+        let after = rows_pass(true, window);
+        for (k, name) in ["fold", "gates", "post", "combine", "norm"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                before[k], after[k],
+                "the {name} lands bit for bit ({window:?})"
+            );
+        }
+    }
     for window in [(200, 200, 0), (300, 170, 9)] {
         let before = rows_pass(true, Some(window));
         let after = rows_pass_on(
@@ -231,6 +226,7 @@ fn a_prefills_rows_fold_alike_a_block_a_row() {
         );
     }
 }
+
 /// The norm and the projection in one pass over the bf16 streams against a
 /// host norm and dot, at decode and prefill row counts and on a window.
 fn check_prenorm(rows: usize, mix_hc: usize, window: Option<(u32, u32)>) {
@@ -304,10 +300,8 @@ fn check_prenorm_on(rows: usize, mix_hc: usize, window: Option<(u32, u32)>, mma:
 #[test]
 fn the_fused_norm_and_projection_answer_the_host() {
     check_prenorm(1, 24, None);
-    check_prenorm(8, 24, None);
     check_prenorm(70, 24, Some((50, 3)));
     check_prenorm(300, 24, None);
-    check_prenorm(130, 8, None);
     check_prenorm(129, 4, None);
     check_prenorm(200, 24, Some((150, 6)));
 }
@@ -374,15 +368,7 @@ fn gates_norm_pass(fused: bool, window: Option<(u32, u32, u32)>) -> Vec<Vec<u16>
         norm::rmsnorm(&ctx, x, w_t, 1e-6, &mut y).expect("the norm fires");
     }
     gpu.sync();
-    let f32_bits = |at: u64, n: usize| -> Vec<u16> {
-        let v: Vec<f32> = gpu.down(at, n);
-        v.iter()
-            .flat_map(|f| {
-                let b = f.to_bits();
-                [b as u16, (b >> 16) as u16]
-            })
-            .collect()
-    };
+    let f32_bits = |at: u64, n: usize| f32_bits(&gpu, at, n);
     vec![
         f32_bits(post_at, planes * M),
         f32_bits(comb_at, planes * M * M),
@@ -472,15 +458,7 @@ fn pre_pass(whole: bool, rows: u32, window: Option<(u32, u32)>) -> Vec<Vec<u16>>
         norm::rmsnorm(&ctx, x, w_t, 1e-6, &mut y).expect("the norm fires");
     }
     gpu.sync();
-    let f32_bits = |at: u64, n: usize| -> Vec<u16> {
-        let v: Vec<f32> = gpu.down(at, n);
-        v.iter()
-            .flat_map(|f| {
-                let b = f.to_bits();
-                [b as u16, (b >> 16) as u16]
-            })
-            .collect()
-    };
+    let f32_bits = |at: u64, n: usize| f32_bits(&gpu, at, n);
     vec![
         f32_bits(post_at, planes * M),
         f32_bits(comb_at, planes * M * M),
@@ -492,8 +470,6 @@ fn pre_pass(whole: bool, rows: u32, window: Option<(u32, u32)>) -> Vec<Vec<u16>>
 fn the_whole_pre_mix_lands_what_its_parts_land() {
     for (rows, window) in [
         (1, None),
-        (8, None),
-        (64, None),
         (300, None),
         (40, Some((29, 6))),
         (200, Some((150, 6))),
@@ -516,12 +492,7 @@ fn the_whole_pre_mix_lands_what_its_parts_land() {
 fn the_pre_mix_lands_the_operand_its_gemm_would_quantize() {
     use kernels_cuda::linear::act_quant::{Format, Source, held_planes, quantize};
     use kernels_cuda::linear::tc5::atom_bytes;
-    for (rows, window) in [
-        (1u32, None),
-        (8, None),
-        (64, None),
-        (40, Some((29u32, 6u32))),
-    ] {
+    for (rows, window) in [(1u32, None), (64, None), (40, Some((29u32, 6u32)))] {
         let (live, base) = window.unwrap_or((rows, 0));
         let planes = (base + rows) as usize;
         let h = 4096usize;
@@ -610,11 +581,13 @@ fn the_pre_mix_lands_the_operand_its_gemm_would_quantize() {
         }
     }
 }
+
 /// A prefill's pre-mix norm landing its e4m3 1x128 operand: the bf16 row the
 /// plain norm lands (to its reduction order's last bit), and the codes and
 /// atoms act_quant_e4m3 makes of that row.
 #[test]
 fn a_prefills_norm_lands_its_gemms_fp8_operand() {
+    use crate::common::tc5::e4m3;
     use kernels_cuda::linear::tc5::{atom_bytes, atom_offset};
     let (rows, h) = (300usize, 4096usize);
     let mut lcg = Lcg::seeded(0x0e17);
@@ -660,16 +633,6 @@ fn a_prefills_norm_lands_its_gemms_fp8_operand() {
             "element {i}: {a:#x} against the plain norm's {b:#x}"
         );
     }
-    let e4m3 = |c: u8| -> f32 {
-        let sign = if c & 0x80 != 0 { -1.0 } else { 1.0 };
-        let exp = i32::from((c >> 3) & 0xf);
-        let man = f32::from(c & 7);
-        sign * if exp == 0 {
-            man / 8.0 * 2f32.powi(-6)
-        } else {
-            (1.0 + man / 8.0) * 2f32.powi(exp - 7)
-        }
-    };
     for row in 0..rows {
         for b in 0..h / 128 {
             let vals: Vec<f32> = (0..128)

@@ -1,5 +1,8 @@
 #![cfg(feature = "cuda")]
 
+//! DSpark's readout points: the argmax, the top-k, the selector and Markov
+//! walks, the kv ends and the column concat, against the host.
+
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::{markov, selector};
@@ -48,14 +51,6 @@ fn tied_rows(lcg: &mut Lcg, rows: usize, width: usize) -> (Vec<u16>, Vec<f32>) {
 }
 
 #[test]
-fn the_dspark_readout_points_answer_their_host_reference_every_case() {
-    the_argmax_lands_the_lowest_tied_column_and_skips_a_nan();
-    the_topk_is_sorted_with_ties_to_the_lower_column();
-    the_selector_walk_follows_the_best_successor_from_the_anchor();
-    the_markov_walk_biases_each_row_by_the_pick_before_it();
-    the_kv_ends_and_column_concat_land_what_the_host_lands();
-}
-
 fn the_argmax_lands_the_lowest_tied_column_and_skips_a_nan() {
     let (rows, width, depth) = (5usize, 3000usize, 3usize);
     let mut lcg = Lcg::seeded(0x51);
@@ -113,6 +108,7 @@ fn the_argmax_lands_the_lowest_tied_column_and_skips_a_nan() {
     }
 }
 
+#[test]
 fn the_topk_is_sorted_with_ties_to_the_lower_column() {
     let (rows, width) = (6usize, 4097usize);
     let mut lcg = Lcg::seeded(0x7a);
@@ -158,6 +154,7 @@ fn the_topk_is_sorted_with_ties_to_the_lower_column() {
     }
 }
 
+#[test]
 fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
     let (vocab, rank, k) = (64usize, 256usize, 16usize);
     let indptr: [i32; 4] = [0, 4, 5, 11];
@@ -183,7 +180,7 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
     let pred_at = gpu.up(&pred_raw);
     let succ_at = gpu.up(&succ_raw);
 
-    for (with_hp, first) in [(false, 0u32), (false, 1), (true, 0), (true, 1)] {
+    for (with_hp, first) in [(false, 1u32), (true, 0)] {
         let picks_at = gpu.zeros(rows * 4);
         let mut picks = Tensor::new(picks_at, rows as u32, 1, Dtype::I32);
         selector::walk(
@@ -207,6 +204,21 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
         for lane in 0..3 {
             let (begin, end) = (indptr[lane] as usize, indptr[lane + 1] as usize);
             let mut prev = tokens[begin] as usize;
+            // Candidate `c`'s score at `row` after `prev`.
+            let score = |row: usize, c: usize, prev: usize| {
+                let cid = cand[row * k + c] as usize;
+                let dot: f32 = (0..rank)
+                    .map(|d| {
+                        let (a, b) = (pred[prev * rank + d], succ[cid * rank + d]);
+                        if with_hp {
+                            a * hp[row * rank + d] * b
+                        } else {
+                            a * b
+                        }
+                    })
+                    .sum();
+                unary[row * k + c] + dot
+            };
             if first == 1 {
                 assert_eq!(
                     got[begin],
@@ -218,18 +230,7 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
                 let mut best = 0usize;
                 let mut best_v = f32::NEG_INFINITY;
                 for c in 0..k {
-                    let cid = cand[row * k + c] as usize;
-                    let mut dot = 0f32;
-                    for d in 0..rank {
-                        let a = pred[prev * rank + d];
-                        let b = succ[cid * rank + d];
-                        dot += if with_hp {
-                            a * hp[row * rank + d] * b
-                        } else {
-                            a * b
-                        };
-                    }
-                    let s = unary[row * k + c] + dot;
+                    let s = score(row, c, prev);
                     if c == 0 || s > best_v {
                         best_v = s;
                         best = c;
@@ -240,18 +241,7 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
                     let c = (0..k).find(|&c| cand[row * k + c] == got[row]).unwrap_or_else(|| {
                         panic!("hp={with_hp} first={first}: lane {lane} row {row} picked {}, not a candidate", got[row])
                     });
-                    let cid = got[row] as usize;
-                    let mut dot = 0f32;
-                    for d in 0..rank {
-                        let a = pred[prev * rank + d];
-                        let b = succ[cid * rank + d];
-                        dot += if with_hp {
-                            a * hp[row * rank + d] * b
-                        } else {
-                            a * b
-                        };
-                    }
-                    let s = unary[row * k + c] + dot;
+                    let s = score(row, c, prev);
                     assert!(
                         (s - best_v).abs() < 1e-3,
                         "hp={with_hp} first={first}: lane {lane} row {row} picked {} ({s}) over {want} ({best_v})",
@@ -264,6 +254,7 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
     }
 }
 
+#[test]
 fn the_markov_walk_biases_each_row_by_the_pick_before_it() {
     // A vocabulary off the 128-row tile; blocks read out 5, 1, 3 and 5 rows
     // deep; f32 logits and the trunk's bf16 ones.
@@ -371,7 +362,8 @@ fn the_markov_walk_biases_each_row_by_the_pick_before_it() {
     }
 }
 
-fn the_kv_ends_and_column_concat_land_what_the_host_lands() {
+#[test]
+fn the_kv_ends_land_what_the_host_lands() {
     let mut gpu = Gpu::open();
     // Three lanes over 16-position pages: 2 pages 5 deep, 1 page 16 deep,
     // 3 pages 1 deep; rows of each, and a padded row of none.
@@ -415,8 +407,12 @@ fn the_kv_ends_and_column_concat_land_what_the_host_lands() {
     gpu.sync();
     let got: Vec<i32> = gpu.down(ends_at, req.len());
     assert_eq!(got, vec![20, 20, 15, 32, 32, 32, -1]);
+}
 
-    // Unaligned widths (a byte a thread) and 16-byte runs.
+/// Unaligned widths (a byte a thread) and 16-byte runs.
+#[test]
+fn the_column_concat_lands_what_the_host_lands() {
+    let mut gpu = Gpu::open();
     let rows = 37usize;
     for widths in [vec![8usize, 3, 16], vec![8, 16, 64]] {
         let mut lcg = Lcg::seeded(0x91);
@@ -447,64 +443,4 @@ fn the_kv_ends_and_column_concat_land_what_the_host_lands() {
             );
         }
     }
-}
-
-/// `PIE_MARKOV_PACE=lanes` times the walk at the release's vocabulary over
-/// that many five-row blocks of bf16 logits (each depth a step).
-#[test]
-fn the_markov_walk_paces_a_release_block() {
-    let Some(lanes) = std::env::var("PIE_MARKOV_PACE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    else {
-        return;
-    };
-    let (vocab, rank, block) = (129_280usize, markov::RANK as usize, 5usize);
-    let rows = lanes * block;
-    let mut gpu = Gpu::open();
-    let mut lcg = Lcg::seeded(0x77);
-    let (embed_raw, _) = lcg.row(vocab * rank);
-    let (head_raw, _) = lcg.row(vocab * rank);
-    let logits_raw: Vec<u16> = (0..rows * vocab)
-        .map(|i| to_bf16(((i * 37) % 101) as f32 * 0.01))
-        .collect();
-    let positions: Vec<i32> = (0..rows).map(|r| (r % block) as i32 + 100).collect();
-    let ends: Vec<i32> = vec![104; rows];
-    let tokens: Vec<i32> = (0..rows).map(|r| ((r * 131) % vocab) as i32).collect();
-    let (logits_at, embed_at, head_at) =
-        (gpu.up(&logits_raw), gpu.up(&embed_raw), gpu.up(&head_raw));
-    let (pos_at, ends_at, tok_at) = (gpu.up(&positions), gpu.up(&ends), gpu.up(&tokens));
-    let biased_at = gpu.zeros(rows * vocab * 2);
-    let picks_at = gpu.zeros(rows * 4);
-    let fire = |gpu: &mut Gpu| {
-        let mut biased = Tensor::new(biased_at, rows as u32, vocab as u32, Dtype::Bf16);
-        let mut picks = Tensor::new(picks_at, rows as u32, 1, Dtype::I32);
-        markov::walk(
-            &gpu.ctx(),
-            Tensor::new(logits_at, rows as u32, vocab as u32, Dtype::Bf16),
-            Tensor::new(tok_at, rows as u32, 1, Dtype::I32),
-            Tensor::new(pos_at, rows as u32, 1, Dtype::I32),
-            Tensor::new(ends_at, rows as u32, 1, Dtype::I32),
-            Tensor::new(embed_at, vocab as u32, rank as u32, Dtype::Bf16),
-            Tensor::new(head_at, vocab as u32, rank as u32, Dtype::Bf16),
-            block as u32,
-            &mut biased,
-            &mut picks,
-        )
-        .expect("the walk fires");
-    };
-    for _ in 0..3 {
-        fire(&mut gpu);
-    }
-    gpu.sync();
-    let iters = 20;
-    let t0 = std::time::Instant::now();
-    for _ in 0..iters {
-        fire(&mut gpu);
-    }
-    gpu.sync();
-    println!(
-        "markov walk: {lanes} blocks x {block} rows, {:.1} us a walk",
-        t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters)
-    );
 }

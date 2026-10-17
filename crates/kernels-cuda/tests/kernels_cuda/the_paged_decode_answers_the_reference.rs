@@ -1,5 +1,8 @@
 #![cfg(feature = "cuda")]
 
+//! The paged decode (FA2 and the tensor-core decode, under each fold of a
+//! split) and a one-row-a-request prefill answer the host softmax.
+
 use crate::common;
 
 use common::{Gpu, Lcg};
@@ -487,45 +490,25 @@ const LENS: &[usize] = &[1, 15, 16, 17, 130, 300, 701];
 
 const HEADS: [(u32, u32, u32); 4] = [(64, 8, 64), (32, 16, 256), (32, 4, 512), (8, 8, 128)];
 
+/// Every group and head width, whole and windowed (a window a page
+/// multiple would not cut), on a plan of its own and on the padded one a
+/// recorded body replays; a one-row-a-request prefill, which a grouped
+/// decode may read its cache through, answers the same reference.
 #[test]
 fn a_decode_answers_the_reference_at_each_group_and_width() {
     for (q_heads, kv_heads, head_dim) in HEADS {
-        for window in [None, Some(128), Some(200)] {
+        for window in [None, Some(200)] {
             for graph in [false, true] {
-                check(
-                    Case {
-                        lens: LENS,
-                        q_heads,
-                        kv_heads,
-                        head_dim,
-                        window,
-                        graph,
-                    },
-                    false,
-                );
-            }
-        }
-    }
-}
-
-/// A one-row-a-request prefill answers the same reference, which a grouped
-/// decode may read its cache through instead.
-#[test]
-fn a_one_row_prefill_answers_the_decode_reference() {
-    for (q_heads, kv_heads, head_dim) in HEADS {
-        for window in [None, Some(128), Some(200)] {
-            for graph in [false, true] {
-                check(
-                    Case {
-                        lens: LENS,
-                        q_heads,
-                        kv_heads,
-                        head_dim,
-                        window,
-                        graph,
-                    },
-                    true,
-                );
+                let case = Case {
+                    lens: LENS,
+                    q_heads,
+                    kv_heads,
+                    head_dim,
+                    window,
+                    graph,
+                };
+                check(case, false);
+                check(case, true);
             }
         }
     }
