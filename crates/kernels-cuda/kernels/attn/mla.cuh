@@ -125,14 +125,10 @@ constexpr int kMaxRopePairs = 128;
 __device__ __forceinline__ int mla_find_request(const u32* qo_indptr,
                                                 int R,
                                                 int token_idx) {
-    // The first request whose rows end past the token: a binary search, as a
-    // walk's dependent loads cost a decode of 64 lanes about 4 us a launch.
-    int lo = 0, hi = R - 1;
-    while (lo < hi) {
-        const int mid = (lo + hi) >> 1;
-        if (token_idx < static_cast<int>(qo_indptr[mid + 1])) hi = mid; else lo = mid + 1;
+    for (int r = 0; r < R; ++r) {
+        if (token_idx < static_cast<int>(qo_indptr[r + 1])) return r;
     }
-    return R > 0 ? lo : R - 1;
+    return R - 1;
 }
 
 __device__ __forceinline__ void mla_resolve_dst(
