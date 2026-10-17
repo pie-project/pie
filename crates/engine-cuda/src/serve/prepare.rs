@@ -870,6 +870,16 @@ impl FrameShell for Shell {
                     folded,
                     fold,
                 } => {
+                    // A device-counted fold not yet settled left the state
+                    // past the runtime's length.
+                    let slot = seated.rs_slot.unwrap_or(lane.slot);
+                    let folded = &match self.rs_ahead.get(&slot) {
+                        Some(&at) if at > *folded && seated.rs_reset != RsReset::Fresh => at,
+                        _ => {
+                            self.rs_ahead.remove(&slot);
+                            *folded
+                        }
+                    };
                     let stated = match &ports {
                         Some(ports) => ports.slots(row.rows as usize)?,
                         None => None,
@@ -898,6 +908,9 @@ impl FrameShell for Shell {
                         .saturating_add(stated_fold(*fold, cell, port)?)
                         .min(first + row.rows);
                     rs_folded[source] = Some(to - folded);
+                    if *fold == FoldLen::Device {
+                        self.rs_ahead.insert(slot, to);
+                    }
                     let below: u32 = reads
                         .iter()
                         .map(|span| span.end.min(to).saturating_sub(span.start))

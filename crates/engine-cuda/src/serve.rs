@@ -115,6 +115,9 @@ pub struct Shell {
     airborne: crate::settle::Airborne,
     owed: Option<GuestBatch>,
     guest_landed: crate::device::graph::Event,
+    /// Where a device-counted fold left each recurrent slot, ahead of the
+    /// runtime's settled length until that fold settles.
+    rs_ahead: std::collections::HashMap<u32, u32>,
 }
 
 #[derive(Debug)]
@@ -131,6 +134,10 @@ pub(crate) struct KvReport {
 
 impl Shell {
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
+        match self.rs_ahead.get(&src).copied() {
+            Some(at) => self.rs_ahead.insert(dst, at),
+            None => self.rs_ahead.remove(&dst),
+        };
         self.pools.copy_slot(self.device.stream(), src, dst)?;
         self.device.synchronize()
     }

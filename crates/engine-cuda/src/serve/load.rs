@@ -892,6 +892,7 @@ impl Shell {
             airborne,
             owed: None,
             guest_landed: crate::device::graph::Event::new()?,
+            rs_ahead: std::collections::HashMap::new(),
         };
         if shell.weights.rotating() && shell.graphs.records() {
             eprintln!(
