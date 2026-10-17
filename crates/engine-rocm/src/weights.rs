@@ -903,41 +903,53 @@ fn order_mxfp4_banks(
             (2 * u64::from(codes.width) == n * k && k % 128 == 0).then_some((at, scales, u64::from(codes.rows), n, k))
         })
         .collect();
-    let Some(widest) = banks.iter().map(|&(_, _, e, n, k)| e * n * k).max() else {
+    // A run of whole experts at a time through one staging span of at most
+    // `STAGED` bytes (an expert's strips never cross into the next), so the
+    // load holds no bank-sized copy.
+    const STAGED: u64 = 256 << 20;
+    let Some(widest) = banks.iter().map(|&(_, _, _, n, k)| n * k).max() else {
         return Ok(());
     };
     // SAFETY: `stream` is the load's stream, live for the load.
     let ctx = unsafe { kernels_rocm::Ctx::on(stream.cast()) };
-    // Codes (half a byte an element) then exponents (one a 32), 16-aligned.
-    let codes_span = (widest / 2).next_multiple_of(16);
-    let staging = Buffer::zeroed(usize::try_from(codes_span + widest / 32).unwrap_or(usize::MAX))?;
+    // An expert's codes (half a byte an element) then exponents (one a 32).
+    let per_expert = widest / 2 + widest / 32;
+    let run = (STAGED / per_expert).max(1);
+    let codes_span = (run * widest / 2).next_multiple_of(16);
+    let staging = Buffer::zeroed(usize::try_from(codes_span + run * widest / 32).unwrap_or(usize::MAX))?;
     for &(at, scales, experts, n, k) in &banks {
-        let rows = experts * n;
         let codes = address(tier, store, places[at].offset, at)?;
         let exps = address(tier, store, places[scales].offset, scales)?;
         let (staged_codes, staged_exps) = (staging.ptr(), staging.ptr() + codes_span);
-        kernels_rocm::linear::moe::mxfp4_lanes(
-            &ctx,
-            "linear.moe_matmul_select_quant",
-            codes,
-            staged_codes,
-            exps,
-            staged_exps,
-            rows,
-            k,
-        )?;
-        for (to, from, bytes) in [(codes, staged_codes, rows * k / 2), (exps, staged_exps, rows * k / 32)] {
-            // SAFETY: both spans are device memory this load holds, `bytes`
-            // each; the copy is ordered on the load's stream.
-            crate::device::ctx::check("hipMemcpyAsync", unsafe {
-                kernels_rocm::hip::rt::hipMemcpyAsync(
-                    to as *mut core::ffi::c_void,
-                    from as *const core::ffi::c_void,
-                    usize::try_from(bytes).unwrap_or(usize::MAX),
-                    kernels_rocm::hip::rt::hipMemcpyDeviceToDevice,
-                    stream.cast(),
-                )
-            })?;
+        let mut first = 0;
+        while first < experts {
+            let take = run.min(experts - first);
+            let rows = take * n;
+            let (c, e) = (codes + first * n * k / 2, exps + first * n * k / 32);
+            kernels_rocm::linear::moe::mxfp4_lanes(
+                &ctx,
+                "linear.moe_matmul_select_quant",
+                c,
+                staged_codes,
+                e,
+                staged_exps,
+                rows,
+                k,
+            )?;
+            for (to, from, bytes) in [(c, staged_codes, rows * k / 2), (e, staged_exps, rows * k / 32)] {
+                // SAFETY: both spans are device memory this load holds,
+                // `bytes` each; the copy is ordered on the load's stream.
+                crate::device::ctx::check("hipMemcpyAsync", unsafe {
+                    kernels_rocm::hip::rt::hipMemcpyAsync(
+                        to as *mut core::ffi::c_void,
+                        from as *const core::ffi::c_void,
+                        usize::try_from(bytes).unwrap_or(usize::MAX),
+                        kernels_rocm::hip::rt::hipMemcpyDeviceToDevice,
+                        stream.cast(),
+                    )
+                })?;
+            }
+            first += take;
         }
         if let Some(Some(WeightRow::Planes { lanes, .. })) = table.get_mut(at) {
             *lanes = true;

@@ -895,6 +895,43 @@ fn moe_matmul_mxfp4_lanes() {
     }
 }
 
+#[test]
+#[ignore = "guard: cargo test --release --features rocm --test linear_moe -- --ignored mxfp4_lanes_guard"]
+fn mxfp4_lanes_guard() {
+    // The lane-order tiles at a prefill's batches write no row past y's.
+    let Some(gpu) = Gpu::open() else { return };
+    let planes = Planes::default();
+    let ctx = tuned(&gpu, |_| {});
+    for (experts, tokens, top_k, n, k, by_token) in [
+        (16u32, 16384u32, 6u32, 2304u32, 5120u32, true),
+        (16, 16384, 6, 5120, 2304, false),
+        (384, 2048, 6, 5120, 2304, false),
+        (384, 1, 6, 2304, 5120, true),
+        (384, 7, 6, 2304, 5120, true),
+    ] {
+        let (e, t, kk, nn, kd) = (experts as usize, tokens as usize, top_k as usize, n as usize, k as usize);
+        let codes: Vec<u8> = (0..e * nn * kd / 2).map(|i| (i * 2654435761usize >> 13) as u8).collect();
+        let scales: Vec<u8> = (0..e * nn * kd / 32).map(|i| 120 + (i % 9) as u8).collect();
+        let ct = planes.bytes(&codes, experts, n * k / 2);
+        let st = planes.bytes(&scales, experts, n * k / 32);
+        let routes = make_routes(t, kk, e, 5, true);
+        let x_rows = if by_token { t } else { t * kk };
+        let x = bf16s(x_rows * kd, 32, 1.0);
+        let xt = gpu.tensor(&x, x_rows as u32, k, Dtype::Bf16);
+        let rt = planes.i32s(&routes, tokens, top_k);
+        const GUARD: u32 = 64;
+        let full = gpu.zeros(tokens * top_k + GUARD, n, Dtype::Bf16);
+        let mut y = Tensor::new(full.ptr, tokens * top_k, n, Dtype::Bf16);
+        moe::matmul_select_mxfp4_lanes(&ctx, xt, ct, st, rt, &mut y).unwrap();
+        let got = gpu.read(&full);
+        let live = (tokens * top_k * n) as usize;
+        let past = got[live..].iter().filter(|v| **v != 0.0).count();
+        let written = got[..live].iter().filter(|v| **v != 0.0).count();
+        eprintln!("{experts}e {tokens}x{top_k} {n}x{k}: {written} of {live} written, {past} past y");
+        assert_eq!(past, 0, "a write past y");
+    }
+}
+
 /// A random MLX affine bank: `bits`-bit codes in little-endian u32 words, a
 /// bf16 scale and bias every `group` codes, and its dense expansion (bf16
 /// rounded when `rounded`, as the matrix-core leg holds it).
