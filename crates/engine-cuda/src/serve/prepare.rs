@@ -111,8 +111,25 @@ impl FrameShell for Shell {
                 }
             });
 
+        // A device-carried descriptor is read off its ring's cell on the
+        // host: the owed epilogues settle first where they put a ring this
+        // fire resolves so. One that puts only what the device copies (a
+        // draft's proposals into the next verify's tokens) leaves the fire
+        // free to go ahead of it.
+        let resolves_owed = |owed: &super::GuestBatch| {
+            let puts: std::collections::HashSet<usize> = owed
+                .instances()
+                .flat_map(|instance| self.programs.shared_puts(instance))
+                .collect();
+            attachments.iter().any(|attached| {
+                self.programs
+                    .host_resolved_rings(attached.instance)
+                    .iter()
+                    .any(|ring| puts.contains(ring))
+            })
+        };
         if !can_runahead
-            && self.owed.is_some()
+            && self.owed.as_ref().is_some_and(resolves_owed)
             && attachments.iter().any(|attached| {
                 self.programs
                     .geometry_of(attached.instance)

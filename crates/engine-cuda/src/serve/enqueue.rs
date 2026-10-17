@@ -35,6 +35,13 @@ pub(super) struct GuestBatch {
     pub(super) seq: u64,
 }
 
+impl GuestBatch {
+    /// The instances whose epilogues this batch launched.
+    pub(super) fn instances(&self) -> impl Iterator<Item = u64> + '_ {
+        self.launched.iter().map(|&(_, instance)| instance)
+    }
+}
+
 fn seating(lanes: &[super::Seated<'_>]) -> String {
     let mut out = String::new();
     for (at, lane) in lanes.iter().enumerate() {

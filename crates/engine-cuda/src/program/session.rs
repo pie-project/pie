@@ -512,6 +512,39 @@ impl Session {
         })
     }
 
+    /// The shared rings this instance's stages put.
+    pub fn shared_puts<'p>(&'p self, plan: &'p ExecPlan) -> impl Iterator<Item = usize> + 'p {
+        (0..self.shapes.len()).filter_map(move |channel| {
+            if !plan.puts_channel(channel as u32) {
+                return None;
+            }
+            self.rings
+                .endpoint(channel)
+                .filter(|endpoint| endpoint.role() == HostRole::None)
+                .map(|endpoint| Arc::as_ptr(endpoint) as usize)
+        })
+    }
+
+    /// The shared rings whose cells the host reads to resolve this
+    /// instance's descriptor ports under `class` ([`Self::envelope`]); the
+    /// tokens' ring not, where the device copies them
+    /// ([`Self::token_device_source`]).
+    pub fn host_resolved_rings(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<usize> {
+        let tokens_on_device = self.token_device_source(plan, class).is_some();
+        plan.package
+            .ports
+            .iter()
+            .filter(|binding| !binding.is_const && engine::ports::resolves(class, binding.port))
+            .filter(|binding| !(binding.port == Port::EmbedTokens && tokens_on_device))
+            .filter_map(|binding| {
+                self.rings
+                    .endpoint(binding.channel as usize)
+                    .filter(|endpoint| endpoint.role() == HostRole::None)
+                    .map(|endpoint| Arc::as_ptr(endpoint) as usize)
+            })
+            .collect()
+    }
+
     fn mint(&mut self, plan: &ExecPlan, wave: &mut Wave) -> std::result::Result<Minted, String> {
         let before = self.cursors_now();
         let mut next = before.clone();

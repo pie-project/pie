@@ -183,7 +183,7 @@ async fn main(input: Input) -> Result<Output> {
     let indptr_d = Channel::from([0u32, block]).named("embed_indptr_d");
     let readout_d = Channel::from_iter(0..block).named("readout_d");
 
-    // ── the verify pass: one lane of `w` rows, laid out by the draft ──
+    // ── the verify pass: one lane of `w` rows, laid out a round ahead ──
     let win = Channel::new([w], dtype::i32).capacity(ring).named("win");
     let base_v = Channel::new([1], dtype::u32)
         .capacity(ring)
@@ -202,6 +202,16 @@ async fn main(input: Input) -> Result<Output> {
     // nothing more; every verify's epilogue puts what the next one freezes.
     let fold = Channel::from([0u32]).named("fold");
     let out = Channel::new([w], dtype::i32).capacity(ring).named("out");
+    // Lays out the verify of the block anchored at `b` (`[1]` u32): its
+    // rows at b .. b + w, the lane reading b + w keys. Put a round ahead
+    // (by the prefill, then by each verify for the next), so a verify's
+    // descriptors have landed by the time its host reads them, its tokens
+    // the one thing the draft between them puts.
+    let lay_verify = move |b: &Tensor| {
+        base_v.put(b);
+        slots_v.put(broadcast(b, [w]) + iota(w));
+        kv_len_v.put(b + Tensor::constant(w));
+    };
 
     let draft = ForwardPass::new();
     draft
@@ -221,7 +231,8 @@ async fn main(input: Input) -> Result<Output> {
         let tokens = blk.take(); // [block] i32: the anchor, then noise
         // The peeked extent, taken: the verify laid out the next one.
         let _ = kv_len_d.take();
-        let b = base_d.take(); // [1] u32: the anchor's position
+        // The anchor's position, the verify's own to lay out.
+        let _ = base_d.take();
         let picks = reshape(intrinsics::mtp_drafts(block), [block]); // [block] i32
         let i = iota(w);
         let one = Tensor::constant(1u32);
@@ -229,10 +240,9 @@ async fn main(input: Input) -> Result<Output> {
         // The window: the anchor, then the first `k` picks.
         let at = min_elem(max_elem(&i, &one) - &one, Tensor::constant(block - 1));
         let a = broadcast(gather(&tokens, iota(1)), [w]);
+        // The window's tokens alone: its geometry is the verify's own
+        // (`lay_verify`), so the verify's host reads nothing this puts.
         win.put(&select(&first, &a, gather(&picks, &at)));
-        base_v.put(&b);
-        slots_v.put(broadcast(&b, [w]) + &i);
-        kv_len_v.put(&b + Tensor::constant(w));
     });
 
     let verify = ForwardPass::new();
@@ -277,7 +287,9 @@ async fn main(input: Input) -> Result<Output> {
         fold.put(&(&m + &one));
 
         // ── the next block: the correction, then noise, at b + m + 1
-        lay_block(&correction, &(&b + &m + &one));
+        let nb = &b + &m + &one;
+        lay_block(&correction, &nb);
+        lay_verify(&nb);
     });
 
     // ── PREFILL: the prompt, a pass per readout span; the last one's pick
@@ -301,7 +313,9 @@ async fn main(input: Input) -> Result<Output> {
         fwd.epilogue(move || {
             let t = reshape(reduce_argmax(intrinsics::logits()), [1]);
             if last {
-                lay_block(&t, &broadcast(Tensor::constant(n), [1]));
+                let b = broadcast(Tensor::constant(n), [1]);
+                lay_block(&t, &b);
+                lay_verify(&b);
             }
             next.put(&t);
         });
