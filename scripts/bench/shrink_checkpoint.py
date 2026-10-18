@@ -359,6 +359,19 @@ def _rewrite_glm(cfg: dict, plan: Plan) -> None:
                 lac[key] = [remap[s] for s in lac[key] if s in remap]
 
 
+def _rewrite_hy_v4(cfg: dict, plan: Plan) -> None:
+    _rewrite_glm(cfg, plan)
+    # `hy4-mini` selects 16 keys a query (`models/hy_4/model.poem`).
+    cfg["index_topk"] = 16
+
+
+def _rewrite_mimo_v2(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    for key in ("hybrid_layer_pattern", "moe_layer_freq"):
+        if isinstance(cfg.get(key), list):
+            cfg[key] = _slice_list(cfg[key], plan.src_layers)
+
+
 def _rewrite_dsv4(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     if isinstance(cfg.get("compress_ratios"), list):
@@ -1160,6 +1173,32 @@ FAMILIES: dict[str, dict[str, Any]] = {
         # all. Carrying the tower would put a third of the artifact's names
         # outside the census with nothing reading them, and the miniature is
         # here to be a bijection with the text.
+    ),
+    "hy_v4": dict(
+        layer_prefix="model.layers.",
+        # The routed bank stacked on dim 0, as Qwen3.5 ships it.
+        expert_re=None,
+        router_suffixes=(
+            "mlp.gate.weight",
+            "mlp.gate.e_score_correction_bias",
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.down_proj",
+        ),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+                      "model.hc_head.hc_head_base", "model.hc_head.hc_head_fn",
+                      "model.hc_head.hc_head_scale"),
+        # `hy4-mini`: six layers, a dense one first, two full indexers.
+        default_layers="0-5",
+        config_rewrite=_rewrite_hy_v4,
+    ),
+    "mimo_v2": dict(
+        layer_prefix="model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight", "mlp.gate.e_score_correction_bias"),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        # `mimo26-flash-mini`: six layers, full attention at 0 and 5.
+        default_layers="0-5",
+        config_rewrite=_rewrite_mimo_v2,
     ),
     "glm_moe_dsa": dict(
         layer_prefix="model.layers.",

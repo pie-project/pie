@@ -516,6 +516,10 @@ def build_config(args: argparse.Namespace):
         model=ModelConfig(
             name="default",
             hf_repo=resolved_model,
+            precision=getattr(args, "precision", None),
+            kv=getattr(args, "kv", None),
+            off=list(getattr(args, "off", None) or []),
+            drafter=getattr(args, "drafter", None),
             # `[model] device_weight_budget` / `host_weight_budget`: the
             # residency lever (what stays on the device, what streams). Metal
             # derives them from the working set when unset.
@@ -1485,6 +1489,12 @@ def build_parser() -> argparse.ArgumentParser:
                  "(or set PIE_BENCH_INFERLET_DIR).",
         )
         sp.add_argument("--device", default=PIE_BENCH_DEFAULT_DEVICE)
+        # The deployment: what it changes about the one its checkpoint states.
+        sp.add_argument("--precision", default=None)
+        sp.add_argument("--kv", default=None)
+        sp.add_argument("--off", action="append", default=None,
+                        help="a part left off (vision, ...); repeatable")
+        sp.add_argument("--drafter", default=None, help='"none" for no drafter')
         # `metal` is back: its engine is wired into `pie serve` again (P5), and
         # `EMBEDDED_CLI_ENGINES` above has named it the whole time. `vulkan`
         # and `wgpu` are still absent because no build of pie hosts them.
