@@ -1,0 +1,18 @@
+[package]
+name = "kernels-cerebras"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Pure Cerebras kernel definitions: every entry emits CSL source for its op into a program under construction. Mirrors kernels-wgpu's surface; an engine Run resolves plan ids to handles and calls these entry functions, then compiles what they emitted with cslc and runs it through the SDK runtime."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "kernels_cerebras"
+path = "src/lib.rs"
+
+[dependencies]
+dtype = { package = "pie-dtype", path = "../dtype" }
+
+[lints]
+workspace = true
