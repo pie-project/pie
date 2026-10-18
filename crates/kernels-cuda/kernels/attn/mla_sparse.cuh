@@ -109,7 +109,9 @@ __device__ __forceinline__ u32 e4_at(int a) { return (a & 1) * 2 * kAtom + (a >>
 
 template <int kRope, bool kE4>
 struct Layout {
-    static constexpr int kSlots = kE4 ? 3 : 2;
+    // As many slots as shared memory holds: a gather's latency spans the
+    // ring, the products of the slots ahead running under it.
+    static constexpr int kSlots = kE4 ? (kRope > 0 ? 3 : 5) : 2;
     static constexpr u32 kSlot = kE4 ? kE4Latent + (kRope > 0 ? 2 * kAtom : 0u) : kTile + (kRope > 0 ? kRopeBytes : 0u);
     static constexpr u32 kOffRing = 0;
     static constexpr u32 kOffP = kOffRing + kSlots * kSlot;
@@ -576,6 +578,12 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
         for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
             const Row w = take_row(n);
             const int row = w.row;
+            // The next unit's queries toward L2 while this one's tiles run.
+            if (t < 4 && r + static_cast<int>(gridDim.x) < live) {
+                const int next = base + (r + static_cast<int>(gridDim.x)) / splits;
+                const u16* nq = p.q + static_cast<long long>(next) * p.q_stride + t * (64 * kD / 4);
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(nq), "r"(64u * kD / 4 * 2u) : "memory");
+            }
             if (w.nt == 0) {
                 if (r + static_cast<int>(gridDim.x) < live) {
                     load_q(base + (r + static_cast<int>(gridDim.x)) / splits);

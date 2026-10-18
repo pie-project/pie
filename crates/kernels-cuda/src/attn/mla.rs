@@ -690,11 +690,11 @@ mod sparse {
 
     /// `pie::attn::mlas::Layout<kRope, kE4>::kSmem`: the ring (two slots of
     /// 64 keys' bf16 latent and rotated dims twice, or three of their e4m3
-    /// codes), P twice, the score exchange, six key lists, barriers, and the
+    /// codes, five without rotated dims), P twice, the score exchange, six key lists, barriers, and the
     /// 1024-byte alignment.
     const fn smem(rope: i32, e4: bool) -> u32 {
         let ring = if e4 {
-            3 * (32768 + if rope > 0 { 16384 } else { 0 })
+            if rope > 0 { 3 * (32768 + 16384) } else { 5 * 32768 }
         } else {
             2 * (65536 + if rope > 0 { 16384 } else { 0 })
         };
