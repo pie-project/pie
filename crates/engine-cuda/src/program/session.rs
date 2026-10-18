@@ -74,6 +74,7 @@ impl Session {
         extents: Extents,
         endpoints: Vec<Option<Arc<Endpoint>>>,
         shadow: bool,
+        stream: *mut core::ffi::c_void,
     ) -> Result<Session> {
         stages_and_plans_agree(compiled)?;
         if plan.package.channels.is_empty() {
@@ -86,7 +87,7 @@ impl Session {
 
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
-        let rings = Rings::allocate(&shapes, endpoints)?;
+        let rings = Rings::allocate(&shapes, endpoints, stream)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
         #[cfg(feature = "rocm")]

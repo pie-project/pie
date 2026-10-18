@@ -285,6 +285,7 @@ impl Plane {
             extents,
             endpoints,
             self.shadow,
+            stream,
         ) {
             Ok(session) => session,
             Err(why) => {
