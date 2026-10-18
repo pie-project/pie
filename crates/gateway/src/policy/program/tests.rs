@@ -6,6 +6,7 @@ use crate::policy::wit::Dispatch;
 struct Fake {
     processes: Vec<(String, Vec<(String, Value)>)>,
     attrs: Vec<(String, String, Value)>,
+    workers: Vec<String>,
 }
 
 impl Fake {
@@ -20,6 +21,11 @@ impl Fake {
         self
     }
 
+    fn worker(mut self, id: &str) -> Self {
+        self.workers.push(id.to_string());
+        self
+    }
+
     fn attr(mut self, process: &str, name: &str, value: Value) -> Self {
         self.attrs
             .push((process.to_string(), name.to_string(), value));
@@ -31,6 +37,7 @@ impl Plane for Fake {
     fn candidates(&self, kind: SubjectKind) -> Vec<String> {
         match kind {
             SubjectKind::Process => self.processes.iter().map(|(id, _)| id.clone()).collect(),
+            SubjectKind::Worker => self.workers.clone(),
             _ => Vec::new(),
         }
     }
@@ -71,12 +78,12 @@ fn load(name: &str) -> Result<Program, LoadError> {
 }
 
 #[test]
-fn router_policies_load_and_engine_policies_are_refused() {
-    let mut routers = 0;
+fn cluster_policies_load_and_worker_policies_are_refused() {
+    let mut clusters = 0;
     for builtin in builtins::policies() {
         match load(builtin.name) {
             Ok(_) => {
-                routers += 1;
+                clusters += 1;
                 let component = Component::new(engine(), builtin.component).unwrap();
                 let imports: Vec<String> = component
                     .component_type()
@@ -84,18 +91,18 @@ fn router_policies_load_and_engine_policies_are_refused() {
                     .map(|(name, _)| name.to_string())
                     .collect();
                 assert!(
-                    !imports.iter().any(|name| name.contains("engine-writes")),
+                    !imports.iter().any(|name| name.contains("worker-writes")),
                     "{}: {imports:?}",
                     builtin.name
                 );
             }
             Err(LoadError::Manifest(ManifestError::WrongPlane(plane))) => {
-                assert_eq!(plane, "engine", "{}", builtin.name);
+                assert_eq!(plane, "worker", "{}", builtin.name);
             }
             Err(error) => panic!("{}: {error}", builtin.name),
         }
     }
-    assert!(routers > 0, "test-route at least");
+    assert!(clusters > 0, "test-route at least");
 }
 
 #[test]
@@ -116,7 +123,7 @@ fn test_route_orders_holds_and_places_by_its_clients_props() {
 
     let placement = commit.placement.expect("a placement table");
     assert_eq!(placement["a"].worker.as_deref(), Some("7"));
-    assert_eq!(placement["b"].worker, None, "the router's default");
+    assert_eq!(placement["b"].worker, None, "the gateway's default");
     assert!(matches!(
         placement["a"].props.as_slice(),
         [(name, Value::Text(from))] if name == "from" && from == "a"
@@ -169,8 +176,52 @@ fn session_affinity_sends_a_session_where_its_last_process_went() {
 }
 
 #[test]
-fn router_priority_orders_the_gateway_and_passes_priority_on() {
-    let mut program = load("router-priority").unwrap();
+fn cache_aware_follows_the_cache_until_one_worker_piles_up() {
+    let mut program = load("cache-aware").unwrap();
+    let waiting = |plane: Fake, id: &str, prompt: i64, on_1: i64, on_2: i64| {
+        plane
+            .with(id, &[])
+            .attr(id, "state", Value::Text("pending".into()))
+            .attr(id, "prompt-tokens", Value::Int(prompt))
+            .attr(id, "cached-tokens/1", Value::Int(on_1))
+            .attr(id, "cached-tokens/2", Value::Int(on_2))
+    };
+    let running = |plane: Fake, id: &str, on: &str| {
+        plane
+            .with(id, &[])
+            .attr(id, "state", Value::Text("running".into()))
+            .attr(id, "worker", Value::Text(on.into()))
+    };
+    let two = Fake::default().worker("1").worker("2");
+    // Worker 2 holds most of "a"'s prompt; "b" is held nowhere much, so it
+    // goes to the less loaded, which "a" just made worker 1.
+    let plane = waiting(waiting(two.clone(), "a", 1000, 100, 800), "b", 1000, 200, 0);
+    let edges = vec![Edge::Arrived("a".into()), Edge::Arrived("b".into())];
+    let placement = program
+        .react(Box::new(plane), edges, 0)
+        .unwrap()
+        .placement
+        .unwrap();
+    assert_eq!(placement["a"].worker.as_deref(), Some("2"));
+    assert_eq!(placement["b"].worker.as_deref(), Some("1"));
+
+    // Worker 2 runs ten turns and 1 none: load wins over cache.
+    let mut busy = two.clone();
+    for i in 0..10 {
+        busy = running(busy, &format!("r{i}"), "2");
+    }
+    let plane = waiting(busy, "c", 1000, 0, 900);
+    let placement = program
+        .react(Box::new(plane), vec![Edge::Arrived("c".into())], 10)
+        .unwrap()
+        .placement
+        .unwrap();
+    assert_eq!(placement["c"].worker.as_deref(), Some("1"));
+}
+
+#[test]
+fn cluster_priority_orders_the_gateway_and_passes_priority_on() {
+    let mut program = load("cluster-priority").unwrap();
     let plane = Fake::default()
         .with("1", &[("priority", Value::Int(3))])
         .with("2", &[]);

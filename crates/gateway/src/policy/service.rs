@@ -1,4 +1,4 @@
-//! The router policy on its own thread, with its own record of processes built
+//! The cluster policy on its own thread, with its own record of processes built
 //! from the same events as its edges.
 
 use std::cmp::Reverse;
@@ -22,7 +22,23 @@ use crate::route::RoutingHandle;
 use crate::session::AdmitReject;
 
 fn capability(name: &str) -> bool {
-    name == "router.hold"
+    // Runs replicate to pools, and a GPU worker takes them as a pass needs
+    // them; a running turn of a built-in API moves by ending where it runs
+    // and resuming where it goes, after what its client was sent.
+    matches!(
+        name,
+        "cluster.hold" | "state.replicate" | "placement.migrate"
+    )
+}
+
+/// How often the policy hears what the directory holds, and its replication
+/// table is enacted again.
+const STATE_TICK: Duration = Duration::from_secs(1);
+/// A replication asked for and not yet seen done is asked again after this.
+const REPLICATE_RETRY: Duration = Duration::from_secs(30);
+
+fn hex(key: &[u8; 32]) -> String {
+    key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[derive(Default)]
@@ -36,12 +52,14 @@ struct Shared {
     waiting: Mutex<BTreeMap<u64, String>>,
     refused: Mutex<HashMap<String, Option<String>>>,
     cancels: mpsc::UnboundedSender<ReqId>,
+    /// Running processes the placement table moved, and where to.
+    migrations: mpsc::UnboundedSender<(ReqId, WorkerId)>,
     /// The last arrival a call has heard, or would have had it listened.
     heard: watch::Sender<u64>,
     changed: Notify,
 }
 
-pub struct Router {
+pub struct Cluster {
     events: Sender<Event>,
     shared: Arc<Shared>,
     gate: Duration,
@@ -78,29 +96,53 @@ enum Event {
     SessionClosed {
         id: String,
     },
+    Moved {
+        id: String,
+        worker: Option<String>,
+        why: String,
+    },
+    /// The directory's groups and pools, and what worker policies
+    /// published, as of now.
+    State(
+        HashMap<String, crate::directory::Group>,
+        Vec<String>,
+        HashMap<String, HashMap<String, serde_json::Value>>,
+    ),
 }
 
-impl Router {
+/// A started cluster policy, the launches it cancelled, and the moves it
+/// asked for: (process, the worker it is to run on).
+pub type Started = (
+    Arc<Cluster>,
+    mpsc::UnboundedReceiver<ReqId>,
+    mpsc::UnboundedReceiver<(ReqId, WorkerId)>,
+);
+
+impl Cluster {
     pub fn start(
         name: &str,
         component: &[u8],
         routing: watch::Receiver<RoutingTable>,
         mut connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
-    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<ReqId>), LoadError> {
+        fleet: crate::worker::WorkerRegistry,
+    ) -> Result<Started, LoadError> {
         let (cancels, cancelled) = mpsc::unbounded_channel();
+        let (migrations, moves) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             tables: RwLock::default(),
             waiting: Mutex::default(),
             refused: Mutex::default(),
             cancels,
+            migrations,
             heard: watch::Sender::new(0),
             changed: Notify::new(),
         });
         let (events, rx) = channel();
         let dead = Arc::new(AtomicBool::new(false));
-        let manifest = program::spawn(name, component, capability, "pie-router-policy", {
+        let manifest = program::spawn(name, component, capability, "pie-cluster-policy", {
             let (shared, dead) = (shared.clone(), dead.clone());
-            move |program| run(program, rx, shared, routing, dead)
+            let (fleet, handle) = (fleet.clone(), tokio::runtime::Handle::current());
+            move |program| run(program, rx, shared, routing, dead, fleet, handle)
         })?;
         let gate = Duration::from_millis(manifest.gate_ms);
 
@@ -118,7 +160,28 @@ impl Router {
                 }
             }
         });
-        tracing::info!(policy = name, "router policy started");
+        let ticks = events.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(STATE_TICK).await;
+                let directory = fleet.directory();
+                let groups = directory
+                    .groups()
+                    .into_iter()
+                    .map(|(last, group)| (hex(&last), group))
+                    .collect();
+                let pools = directory.pools().iter().map(|w| w.0.to_string()).collect();
+                let published = directory
+                    .published_by_workers()
+                    .into_iter()
+                    .map(|(w, map)| (w.0.to_string(), map))
+                    .collect();
+                if ticks.send(Event::State(groups, pools, published)).is_err() {
+                    return;
+                }
+            }
+        });
+        tracing::info!(policy = name, "cluster policy started");
         Ok((
             Arc::new(Self {
                 events,
@@ -128,6 +191,7 @@ impl Router {
                 dead,
             }),
             cancelled,
+            moves,
         ))
     }
 
@@ -176,7 +240,7 @@ impl Router {
     ) -> Result<(), AdmitReject> {
         let (id, seq) = (waiting.id, waiting.seq);
         if !self.gate.is_zero() && !self.dead.load(Ordering::Acquire) {
-            // Unanswered, the launch goes by the router's default.
+            // Unanswered, the launch goes by the gateway's default.
             let mut heard = self.shared.heard.subscribe();
             let _ = tokio::time::timeout(self.gate, heard.wait_for(|&h| h >= seq)).await;
         }
@@ -274,6 +338,15 @@ impl Router {
         self.send(Event::SessionClosed { id });
     }
 
+    /// A running process moved to `worker`, or (`None`) could not move.
+    pub fn moved(&self, req: &Request, worker: Option<WorkerId>, why: &str) {
+        self.send(Event::Moved {
+            id: req.req_id.0.to_string(),
+            worker: worker.map(|w| w.0.to_string()),
+            why: why.to_string(),
+        });
+    }
+
     pub fn exited(&self, req: &Request, outcome: Outcome) {
         self.send(Event::Exited {
             id: req.req_id.0.to_string(),
@@ -283,7 +356,7 @@ impl Router {
 }
 
 struct Waiting<'a> {
-    router: &'a Router,
+    router: &'a Cluster,
     seq: u64,
     id: &'a str,
     left: bool,
@@ -322,6 +395,8 @@ fn run(
     shared: Arc<Shared>,
     routing: watch::Receiver<RoutingTable>,
     dead: Arc<AtomicBool>,
+    fleet: crate::worker::WorkerRegistry,
+    handle: tokio::runtime::Handle,
 ) {
     let mut registry = Registry::default();
     loop {
@@ -352,9 +427,21 @@ fn run(
         if program.alarm().is_some_and(|at_ms| at_ms <= now) {
             edges.push(Edge::Timer);
         }
+        // A worker the controller now grades degraded is draining.
+        let degraded: BTreeSet<String> = routing
+            .borrow()
+            .workers
+            .iter()
+            .filter(|w| w.health == Health::Degraded)
+            .map(|w| w.id.0.to_string())
+            .collect();
+        for worker in degraded.difference(&registry.draining) {
+            edges.push(Edge::WorkerDraining(worker.clone()));
+        }
+        registry.draining = degraded;
 
         if !edges.is_empty() {
-            tracing::debug!(policy = program.name(), ?edges, "router policy edges");
+            tracing::debug!(policy = program.name(), ?edges, "cluster policy edges");
             let plane = registry.snapshot(&routing.borrow());
             match program.react(Box::new(plane), edges, now) {
                 Ok(commit) => {
@@ -363,12 +450,13 @@ fn run(
                         schedule = commit.schedule.as_ref().map(|t| t.keys.len()),
                         floor = commit.schedule.as_ref().and_then(|t| t.floor),
                         placement = commit.placement.as_ref().map(|t| t.len()),
-                        "router policy call"
+                        "cluster policy call"
                     );
                     enact(&shared, &mut registry, commit);
+                    replicate(&mut registry, &fleet, &handle);
                 }
                 Err(Fault::Dead(error)) => {
-                    tracing::error!(policy = program.name(), %error, "router policy is dead; its tables are withdrawn");
+                    tracing::error!(policy = program.name(), %error, "cluster policy is dead; its tables are withdrawn");
                     dead.store(true, Ordering::Release);
                     *shared.tables.write().unwrap() = Tables::default();
                     shared.heard.send_replace(u64::MAX);
@@ -376,9 +464,15 @@ fn run(
                     return;
                 }
                 Err(fault) => {
-                    tracing::warn!(policy = program.name(), %fault, "router policy call discarded");
+                    tracing::warn!(policy = program.name(), %fault, "cluster policy call discarded");
                 }
             }
+        }
+        // A replication table stands until replaced: what it asks for and
+        // is not yet so is asked for again.
+        if registry.ticked {
+            registry.ticked = false;
+            replicate(&mut registry, &fleet, &handle);
         }
         // Whether or not a call ran, the gate has nothing more to wait for.
         if let Some(seq) = heard {
@@ -387,7 +481,63 @@ fn run(
     }
 }
 
+/// Asks each site the replication table names, and that does not hold its
+/// group, to take the group from a site that does.
+fn replicate(
+    registry: &mut Registry,
+    fleet: &crate::worker::WorkerRegistry,
+    handle: &tokio::runtime::Handle,
+) {
+    let now = std::time::Instant::now();
+    registry
+        .asked
+        .retain(|_, at| now.duration_since(*at) < REPLICATE_RETRY);
+    let directory = fleet.directory();
+    for entry in &registry.replication {
+        let Some(group) = registry.groups.get(&entry.group) else {
+            continue;
+        };
+        for site in &entry.at {
+            let Ok(target) = site.worker.parse::<u64>().map(WorkerId) else {
+                continue;
+            };
+            if group.sites.contains(&target) {
+                continue;
+            }
+            let key = (entry.group.clone(), site.worker.clone());
+            if registry.asked.contains_key(&key) {
+                continue;
+            }
+            let Some(from) = group
+                .sites
+                .iter()
+                .find_map(|holder| directory.peer(*holder))
+            else {
+                continue;
+            };
+            let Some(client) = fleet.client(target) else {
+                continue;
+            };
+            registry.asked.insert(key, now);
+            let keys = group.keys.as_ref().clone();
+            let group_id = entry.group.clone();
+            handle.spawn(async move {
+                let mut ctx = tarpc::context::current();
+                ctx.deadline = std::time::Instant::now() + Duration::from_secs(120);
+                match client.replicate(ctx, keys, from).await {
+                    Ok(Ok(pages)) => tracing::info!(group = %group_id, worker = %target, pages, "replicated"),
+                    Ok(Err(why)) => tracing::warn!(group = %group_id, worker = %target, %why, "replication refused"),
+                    Err(error) => tracing::warn!(group = %group_id, worker = %target, %error, "replication not delivered"),
+                }
+            });
+        }
+    }
+}
+
 fn enact(shared: &Shared, registry: &mut Registry, commit: Commit) {
+    if let Some(replication) = commit.state.replication {
+        registry.replication = replication;
+    }
     let mut changed = false;
     {
         let mut tables = shared.tables.write().unwrap();
@@ -396,6 +546,23 @@ fn enact(shared: &Shared, registry: &mut Registry, commit: Commit) {
             changed = true;
         }
         if let Some(placement) = commit.placement {
+            // A running process given another worker moves there.
+            for (id, entry) in &placement {
+                let Some(target) = entry.worker.as_deref() else {
+                    continue;
+                };
+                let Some(proc) = registry.procs.get(id) else {
+                    continue;
+                };
+                let Some(at) = proc.worker.as_deref() else {
+                    continue;
+                };
+                if at != target
+                    && let (Ok(req), Ok(worker)) = (id.parse::<u64>(), target.parse::<u64>())
+                {
+                    let _ = shared.migrations.send((ReqId(req), WorkerId(worker)));
+                }
+            }
             tables.placement = placement;
         }
     }
@@ -447,6 +614,19 @@ struct Registry {
     terminated: HashSet<String>,
     /// As far as the router can tell: no worker reports its evictions.
     held: HashMap<String, Arc<PromptIndex>>,
+    /// The directory's groups, by their last key's hex, and its pools.
+    groups: HashMap<String, crate::directory::Group>,
+    pools: Vec<String>,
+    /// The replication table the policy installed.
+    replication: Vec<wit::Replicate>,
+    /// Replications asked for, by (group, worker), and when.
+    asked: HashMap<(String, String), std::time::Instant>,
+    /// The directory was heard since the table was last enacted.
+    ticked: bool,
+    /// What each worker's policy published about it, by name.
+    published: HashMap<String, HashMap<String, serde_json::Value>>,
+    /// Workers draining, as of the routing table last heard.
+    draining: BTreeSet<String>,
 }
 
 /// The prompt blocks the router counts a worker as holding: about 4M tokens
@@ -456,6 +636,64 @@ const HELD_BLOCKS: usize = 1 << 18;
 impl Registry {
     fn apply(&mut self, event: Event, edges: &mut Vec<Edge>) {
         match event {
+            Event::Moved { id, worker, why } => {
+                if let Some(proc) = self.procs.get_mut(&id) {
+                    match worker {
+                        Some(worker) => {
+                            proc.worker = Some(worker.clone());
+                            edges.push(Edge::Migrated(wit::Dispatch {
+                                process: id,
+                                worker,
+                            }));
+                        }
+                        None => {
+                            tracing::info!(process = %id, %why, "cluster policy: a move no worker took");
+                            edges.push(Edge::MigrationFailed(id));
+                        }
+                    }
+                }
+            }
+            Event::State(groups, pools, published) => {
+                self.published = published;
+                let tier = |pools: &[String], worker: &str| {
+                    if pools.iter().any(|p| p == worker) {
+                        wit::Tier::Pool
+                    } else {
+                        wit::Tier::Host
+                    }
+                };
+                for (id, group) in &groups {
+                    let before = self
+                        .groups
+                        .get(id)
+                        .map(|g| g.sites.as_slice())
+                        .unwrap_or(&[]);
+                    for site in group.sites.iter().filter(|s| !before.contains(s)) {
+                        edges.push(Edge::Copied(wit::Residency {
+                            group: id.clone(),
+                            site: wit::Site {
+                                worker: site.0.to_string(),
+                                tier: tier(&pools, &site.0.to_string()),
+                            },
+                        }));
+                    }
+                }
+                for (id, group) in &self.groups {
+                    let after = groups.get(id).map(|g| g.sites.as_slice()).unwrap_or(&[]);
+                    for site in group.sites.iter().filter(|s| !after.contains(s)) {
+                        edges.push(Edge::Dropped(wit::Residency {
+                            group: id.clone(),
+                            site: wit::Site {
+                                worker: site.0.to_string(),
+                                tier: tier(&self.pools, &site.0.to_string()),
+                            },
+                        }));
+                    }
+                }
+                self.groups = groups;
+                self.pools = pools;
+                self.ticked = true;
+            }
             Event::Arrived {
                 id,
                 tenant,
@@ -500,7 +738,7 @@ impl Registry {
                 prompt,
                 generated,
             } => {
-                tracing::debug!(process = %id, prompt, generated, "router policy: a process counted its tokens");
+                tracing::debug!(process = %id, prompt, generated, "cluster policy: a process counted its tokens");
                 if let Some(proc) = self.procs.get_mut(&id) {
                     proc.counted = Some((prompt, generated));
                 }
@@ -520,7 +758,7 @@ impl Registry {
                 let (merged, names) = match client_api::props::merge(&current, changes) {
                     Ok(merged) => merged,
                     Err(why) => {
-                        tracing::warn!(session = %id, %why, "router policy: session props refused");
+                        tracing::warn!(session = %id, %why, "cluster policy: session props refused");
                         (current, Vec::new())
                     }
                 };
@@ -550,6 +788,9 @@ impl Registry {
 
     fn snapshot(&self, routing: &RoutingTable) -> Snapshot {
         Snapshot {
+            groups: self.groups.clone(),
+            pools: self.pools.clone(),
+            published: self.published.clone(),
             procs: self.procs.clone(),
             exited: self.exited.clone(),
             sessions: self.sessions.clone(),
@@ -591,6 +832,9 @@ fn json(value: &Value) -> Option<serde_json::Value> {
 }
 
 struct Snapshot {
+    groups: HashMap<String, crate::directory::Group>,
+    pools: Vec<String>,
+    published: HashMap<String, HashMap<String, serde_json::Value>>,
     procs: BTreeMap<String, Proc>,
     exited: BTreeMap<String, Proc>,
     sessions: HashMap<String, Props>,
@@ -615,8 +859,18 @@ impl Plane for Snapshot {
                     .collect();
                 sessions.into_iter().cloned().collect()
             }
-            SubjectKind::Worker => self.workers.keys().cloned().collect(),
-            SubjectKind::WorkingSet => Vec::new(),
+            SubjectKind::Worker => self
+                .workers
+                .keys()
+                .cloned()
+                .chain(self.pools.iter().cloned())
+                .collect(),
+            SubjectKind::Group => {
+                let mut ids: Vec<String> = self.groups.keys().cloned().collect();
+                ids.sort_unstable();
+                ids
+            }
+            SubjectKind::WorkingSet | SubjectKind::Link => Vec::new(),
         }
     }
 
@@ -683,6 +937,34 @@ impl Plane for Snapshot {
                     _ => None,
                 }
             }
+            Subject::Worker(id) if name.starts_with("published/") => self
+                .published
+                .get(id)
+                .and_then(|map| map.get(&name["published/".len()..]))
+                .and_then(|value| prop_value((String::new(), value.clone())))
+                .map(|(_, value)| value),
+            Subject::Worker(id) if self.pools.contains(id) => match name {
+                "pool" => Some(Value::Boolean(true)),
+                _ => None,
+            },
+            Subject::Group(id) => {
+                let group = self.groups.get(id)?;
+                match name {
+                    "pages" => Some(Value::Int(group.keys.len() as i64)),
+                    // The workers holding a copy, as a JSON array of ids.
+                    "sites" => Some(Value::Json(
+                        serde_json::to_string(
+                            &group
+                                .sites
+                                .iter()
+                                .map(|w| w.0.to_string())
+                                .collect::<Vec<_>>(),
+                        )
+                        .unwrap_or_default(),
+                    )),
+                    _ => None,
+                }
+            }
             Subject::Worker(id) => {
                 let worker = self.workers.get(id)?;
                 match name {
@@ -712,7 +994,7 @@ impl Plane for Snapshot {
                     _ => None,
                 }
             }
-            Subject::WorkingSet(_) => None,
+            Subject::WorkingSet(_) | Subject::Link(_) => None,
         }
     }
 
@@ -765,6 +1047,7 @@ mod tests {
                     waiting: 5,
                     capacity_tokens: 1000,
                     used_tokens: 250,
+                    draining: false,
                 },
             }],
         }
@@ -784,9 +1067,9 @@ mod tests {
                 capture_outputs: true,
                 props: serde_json::from_value(props).unwrap(),
                 session: None,
-                router_props: Props::new(),
+                cluster_props: Props::new(),
             },
-            router_props: Props::new(),
+            cluster_props: Props::new(),
         }
     }
 
@@ -915,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_s_props_reach_the_router_program_between_launches() {
+    fn a_session_s_props_reach_the_cluster_program_between_launches() {
         let mut registry = Registry::default();
         let mut edges = Vec::new();
         let changes: Props =
@@ -951,7 +1234,7 @@ mod tests {
     }
 
     struct Rig {
-        router: Arc<Router>,
+        router: Arc<Cluster>,
         routing: RoutingHandle,
         table: watch::Sender<RoutingTable>,
         cancelled: mpsc::UnboundedReceiver<ReqId>,
@@ -963,8 +1246,14 @@ mod tests {
         let (connected, connected_rx) = watch::channel(Arc::new(HashSet::from([WorkerId(1)])));
         let routing = RoutingHandle::new(table_rx.clone(), connected_rx.clone());
         let component = builtins::policy("test-route").unwrap().component;
-        let (router, cancelled) =
-            Router::start("test-route", component, table_rx, connected_rx).unwrap();
+        let (router, cancelled, _moves) = Cluster::start(
+            "test-route",
+            component,
+            table_rx,
+            connected_rx,
+            crate::worker::WorkerRegistry::new(),
+        )
+        .unwrap();
         Rig {
             router,
             routing,

@@ -372,7 +372,7 @@ mod tests {
             tenant: TenantId("t".to_string()),
             priority: Priority::Normal,
             blobs: Vec::new(),
-            router_props: Default::default(),
+            cluster_props: Default::default(),
             message: ClientMessage::Query {
                 corr_id: 1,
                 subject: "s".to_string(),
@@ -434,7 +434,7 @@ mod tests {
                 capture_outputs: false,
                 props: Default::default(),
                 session: None,
-                router_props: Default::default(),
+                cluster_props: Default::default(),
             };
             assert!(matches!(h.admit(&request), AdmissionDecision::Reject(_)));
         }
@@ -456,7 +456,7 @@ mod tests {
             capture_outputs: false,
             props: Default::default(),
             session: None,
-            router_props: Default::default(),
+            cluster_props: Default::default(),
         };
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut waiting = Vec::new();

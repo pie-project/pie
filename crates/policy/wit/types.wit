@@ -1,6 +1,6 @@
 package plex:policy@1.0.0;
 
-/// The vocabulary both planes share. `docs/plex-1.0.md` in the plex
+/// The vocabulary both planes, cluster and worker, share. `docs/plex-1.0.md` in the plex
 /// repository is the prose contract; this is its letter.
 interface types {
     /// Host-issued, opaque, compared byte-for-byte.
@@ -9,13 +9,20 @@ interface types {
     /// Larger runs earlier and is kept longer. Anything unnamed is 0.
     type key = s64;
 
-    enum subject-kind { session, process, working-set, worker }
+    enum subject-kind { session, process, working-set, worker, group, link }
 
     variant subject {
         session(id),
         process(id),
         working-set(id),
         worker(id),
+        /// Cluster plane: sealed state the host keeps under one content key,
+        /// such as the pages one fold sealed, with the recurrent-state
+        /// checkpoint at its end. Immutable: its attrs say where copies are,
+        /// never what it holds.
+        group(id),
+        /// Cluster plane: the path between two workers, one way.
+        link(id),
     }
 
     /// WIT has no recursive types: a prop that is a JSON array or object
@@ -49,6 +56,27 @@ interface types {
         worker: id,
     }
 
+    /// Where a copy of a group lives.
+    enum tier { device, host, disk, pool }
+
+    record site {
+        worker: id,
+        tier: tier,
+    }
+
+    /// A group's copy, appeared or gone.
+    record residency {
+        group: id,
+        site: site,
+    }
+
+    /// A pass of `process` its worker ran elsewhere.
+    record offload-event {
+        process: id,
+        worker: id,
+        tokens: u32,
+    }
+
     /// A discarded working-set, and who discarded it.
     record transition {
         subject: id,
@@ -65,17 +93,33 @@ interface types {
         /// The alarm set by `set-alarm` is due.
         timer,
 
-        // Router plane.
+        // Cluster plane: processes.
         dispatched(dispatch),
         worker-removed(id),
         worker-draining(id),
+        /// A running process now runs on `worker`.
+        migrated(dispatch),
+        /// A move of this process no worker took; it runs on, or ended,
+        /// where it was. The host logs why.
+        migration-failed(id),
 
-        // Engine plane.
+        // Worker plane.
         started(id),
         paused(id),
         /// A working-set whose owner exited while its KV stays cached.
         retained(id),
         discarded(transition),
+        offloaded(offload-event),
+        /// A pass of this process that was to run elsewhere ran at home.
+        /// The host logs why.
+        offload-failed(id),
+
+        // Cluster plane: state. A group's own sealing is `copied` at its first site.
+        copied(residency),
+        dropped(residency),
+        /// A worker's tier crossed a pressure band; its attrs say which.
+        tier-pressure(id),
+        link-changed(id),
     }
 
     /// A key on a working-set's first `upto` tokens, or on all of it. A block
@@ -88,10 +132,80 @@ interface types {
 
     record placement {
         process: id,
-        /// None leaves the worker to the router's default choice.
+        /// None leaves the worker to the gateway's default choice. A running
+        /// process given another worker migrates there (`placement.migrate`).
         worker: option<id>,
-        /// Passed on with the process; the engine sees each as prop
-        /// `router/<name>`.
+        /// Workers its passes may run on, best first. Empty leaves them
+        /// to the worker plane's host.
+        executors: list<id>,
+        /// Passed on with the process; the worker plane sees each as
+        /// prop `cluster/<name>`.
         props: list<tuple<string, value>>,
+    }
+
+    /// How many workers of one shape the cluster should run. Level-
+    /// triggered: the host's actuator (pie's controller, or an operator
+    /// such as a Kubernetes one) converges on the table; a shape no entry
+    /// names keeps what it has. Honoured only where `cluster.scale` is.
+    record scale {
+        /// None: workers that load no model, holding state only.
+        model: option<id>,
+        /// An engine kind the host names, such as `cuda` or `cpu`.
+        engine: id,
+        workers: u32,
+    }
+
+    // ── Worker plane: passes run elsewhere ──
+
+    enum offload-mode {
+        /// Every pass runs at home.
+        never,
+        /// A pass runs where the host's cost estimate says it finishes
+        /// soonest without breaching home's decode budget.
+        cost,
+        /// Every pass that qualifies runs on an executor.
+        always,
+    }
+
+    /// How one process's (or, as the default, every process's) KV-producing
+    /// passes may leave home. The last page of a pass is always computed at
+    /// home, so its epilogue never leaves.
+    record offload {
+        mode: offload-mode,
+        /// A pass with fewer new tokens than this stays home.
+        min-tokens: u32,
+        /// Executors to use, best first. Empty takes the cluster's
+        /// `executors`, then any worker the host knows can serve the model.
+        executors: list<id>,
+    }
+
+    // ── Cluster plane: state ──
+
+    /// Keep copies of `group`'s first `upto` tokens (all of it if none) at
+    /// `at`, besides wherever it already is. Level-triggered: a copy no
+    /// entry asks for any more may be dropped, never the last one.
+    record replicate {
+        group: id,
+        upto: option<u32>,
+        at: list<site>,
+    }
+
+    /// Lets state that `producer` computed be used by `consumer`, for
+    /// `model`. Classes are host-issued (engine kind, weight variant, KV dtype).
+    /// Same-class use needs no entry.
+    record accept {
+        model: id,
+        producer: id,
+        consumer: id,
+    }
+
+    enum transfer-class {
+        /// An offloaded pass's state coming home.
+        %return,
+        /// State a pass is waiting on.
+        fetch,
+        prefetch,
+        replicate,
+        demote,
     }
 }

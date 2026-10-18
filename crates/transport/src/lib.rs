@@ -2,6 +2,8 @@ pub mod backends;
 pub mod core;
 pub mod error;
 pub mod registry;
+#[cfg(feature = "tcp")]
+pub mod tcp;
 
 pub use crate::core::{
     Backend, BackendKind, Completion, PageSet, PeerConn, RegisteredHandle, TransferId, WorkerId,

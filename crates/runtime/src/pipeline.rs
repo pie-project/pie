@@ -1,4 +1,5 @@
 pub mod channel;
+pub(crate) mod coalesce;
 pub mod fire;
 pub mod instance;
 pub mod media;

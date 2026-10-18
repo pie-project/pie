@@ -119,6 +119,7 @@ impl ControllerHandle {
                 role: info.role,
                 model: info.model,
                 addr: info.addr,
+                prior: info.prior,
                 reply,
             })
             .await;
@@ -131,6 +132,7 @@ impl ControllerHandle {
             .cmd
             .send(Command::RegisterGateway {
                 addr: info.addr,
+                prior: info.prior,
                 reply,
             })
             .await;

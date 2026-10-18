@@ -1,12 +1,12 @@
 //! Orders launches by their client's `priority` and passes it on as
-//! `router/priority`.
+//! `cluster/priority`.
 
-use policy::{Placement, Subject, SubjectKind, Value, candidates, prop, router};
+use policy::{Placement, Subject, SubjectKind, Value, candidates, cluster, prop};
 
 #[derive(Default)]
-struct RouterPriority;
+struct ClusterPriority;
 
-impl router::Policy for RouterPriority {
+impl cluster::Policy for ClusterPriority {
     fn plan(&mut self, _now_ms: u64) {
         let ranked: Vec<_> = candidates(SubjectKind::Process)
             .into_iter()
@@ -20,12 +20,13 @@ impl router::Policy for RouterPriority {
             .map(|(p, priority)| Placement {
                 process: p.clone(),
                 worker: None,
+                executors: Vec::new(),
                 props: vec![("priority".to_string(), Value::Int(*priority))],
             })
             .collect();
-        router::install_schedule(&ranked, None);
-        router::install_placement(&placements);
+        cluster::install_schedule(&ranked, None);
+        cluster::install_placement(&placements);
     }
 }
 
-policy::router!(RouterPriority);
+policy::cluster!(ClusterPriority);

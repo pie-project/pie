@@ -20,9 +20,18 @@ const EDGES: &[&str] = &[
     "prop-changed",
     "closed",
     "timer",
+    "offloaded",
+    "offload-failed",
 ];
 
-const GRANTS: &[&str] = &["schedule", "retention", "terminate", "discard"];
+const GRANTS: &[&str] = &[
+    "schedule",
+    "retention",
+    "offload",
+    "terminate",
+    "discard",
+    "publish",
+];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -38,7 +47,7 @@ pub struct Manifest {
     pub uses: Vec<String>,
     #[serde(default = "default_deadline_ms")]
     pub deadline_ms: u64,
-    /// Router only: present here is an error.
+    /// Cluster only: present here is an error.
     pub gate_ms: Option<u64>,
     /// For discovery; never enforced.
     #[serde(default)]
@@ -60,21 +69,21 @@ fn default_deadline_ms() -> u64 {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
-    #[error("the component has no `{SECTION}` section: was it exported with `policy::engine!`?")]
+    #[error("the component has no `{SECTION}` section: was it exported with `policy::worker!`?")]
     Missing,
     #[error("`{SECTION}` is not UTF-8")]
     NotText,
     #[error("`{SECTION}` does not parse: {0}")]
     Parse(#[from] toml::de::Error),
-    #[error("plane is `{0}`, and this host runs engine policies")]
+    #[error("plane is `{0}`, and this host runs worker policies")]
     WrongPlane(String),
-    #[error("`{0}` is a router setting")]
-    RouterOnly(&'static str),
-    #[error("an engine host has no edge `{0}`")]
+    #[error("`{0}` is a cluster setting")]
+    ClusterOnly(&'static str),
+    #[error("a worker host has no edge `{0}`")]
     UnknownEdge(String),
     #[error("no write is granted by `{0}`")]
     UnknownGrant(String),
-    #[error("an engine host has no capability `{0}`")]
+    #[error("a worker host has no capability `{0}`")]
     UnknownCapability(String),
     #[error("the program requires `{0}`, which this worker does not have")]
     Unmet(String),
@@ -92,11 +101,11 @@ impl Manifest {
     }
 
     fn check(&self, capability: &dyn Fn(&str) -> bool) -> Result<(), ManifestError> {
-        if self.plane != "engine" {
+        if self.plane != "worker" {
             return Err(ManifestError::WrongPlane(self.plane.clone()));
         }
         if self.gate_ms.is_some() {
-            return Err(ManifestError::RouterOnly("gate-ms"));
+            return Err(ManifestError::ClusterOnly("gate-ms"));
         }
         if let Some(edge) = self.subscribe.iter().find(|e| !EDGES.contains(&e.as_str())) {
             return Err(ManifestError::UnknownEdge(edge.clone()));
@@ -150,8 +159,8 @@ mod tests {
     }
 
     #[test]
-    fn a_minimal_engine_manifest_takes_the_defaults() {
-        let manifest = parse(r#"plane = "engine""#).unwrap();
+    fn a_minimal_worker_manifest_takes_the_defaults() {
+        let manifest = parse(r#"plane = "worker""#).unwrap();
         assert!(manifest.subscribe.is_empty());
         assert!(manifest.grants.is_empty());
         assert_eq!(manifest.deadline_ms, DEFAULT_DEADLINE_MS);
@@ -160,28 +169,28 @@ mod tests {
     }
 
     #[test]
-    fn what_an_engine_host_cannot_honour_is_refused() {
+    fn what_a_worker_host_cannot_honour_is_refused() {
         let cases = [
-            (r#"plane = "router""#, "WrongPlane"),
-            ("plane = \"engine\"\ngate-ms = 5", "RouterOnly"),
+            (r#"plane = "cluster""#, "WrongPlane"),
+            ("plane = \"worker\"\ngate-ms = 5", "ClusterOnly"),
             (
-                "plane = \"engine\"\nsubscribe = [\"dispatched\"]",
+                "plane = \"worker\"\nsubscribe = [\"dispatched\"]",
                 "UnknownEdge",
             ),
             (
-                "plane = \"engine\"\ngrants = [\"placement\"]",
+                "plane = \"worker\"\ngrants = [\"placement\"]",
                 "UnknownGrant",
             ),
             (
-                "plane = \"engine\"\nuses = [\"router.hold\"]",
+                "plane = \"worker\"\nuses = [\"cluster.hold\"]",
                 "UnknownCapability",
             ),
             (
-                "plane = \"engine\"\nrequires = [\"retention.tier\"]",
+                "plane = \"worker\"\nrequires = [\"retention.tier\"]",
                 "Unmet",
             ),
-            ("plane = \"engine\"\ndeadline-ms = 0", "Deadline"),
-            ("plane = \"engine\"\nsurprise = 1", "Parse"),
+            ("plane = \"worker\"\ndeadline-ms = 0", "Deadline"),
+            ("plane = \"worker\"\nsurprise = 1", "Parse"),
         ];
         for (text, want) in cases {
             let got = format!("{:?}", parse(text).unwrap_err());

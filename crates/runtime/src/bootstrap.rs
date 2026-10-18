@@ -455,7 +455,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // After the gates and the planner it orders exist.
     #[cfg(not(target_arch = "wasm32"))]
     if let Some((name, component)) = &config.policy {
-        crate::policy::start(name, component).with_context(|| format!("engine policy {name}"))?;
+        crate::policy::start(name, component).with_context(|| format!("worker policy {name}"))?;
     }
     if let Some(period) = std::env::var("PIE_CONTENTION_TRACE_MS")
         .ok()

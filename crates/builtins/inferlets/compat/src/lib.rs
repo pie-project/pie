@@ -27,6 +27,7 @@ pub mod generate;
 pub mod holdback;
 pub mod prompt;
 pub mod request;
+pub mod resume;
 pub mod run;
 mod speculative;
 
@@ -40,6 +41,9 @@ pub use run::{Finish, Outcome, run};
 /// A short id unique to this process: the instance id's leading characters.
 /// Every response id an adapter mints is built on it.
 pub fn short_id() -> String {
+    if let Some(resume) = resume::get() {
+        return resume.id;
+    }
     inferlet::runtime::instance_id()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())

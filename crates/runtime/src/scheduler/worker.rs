@@ -275,7 +275,23 @@ enum SchedulerItem {
     DebugDump {
         response: tokio::sync::oneshot::Sender<String>,
     },
+    HostKv {
+        op: HostKvOp,
+        response: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+    },
     Stop,
+}
+
+/// A read or write of host kv slots' bytes, behind every copy queued before
+/// it.
+#[derive(Debug)]
+pub(crate) enum HostKvOp {
+    Write(Vec<u32>, Vec<u8>),
+    /// The engine's host-tier layout, as JSON; empty when it cannot say.
+    Layout,
+    /// A copy of device pages into host slots, then a read of those slots:
+    /// one item on the lane, with no completion to settle between.
+    CopyRead(::engine::KvCopy, Vec<u32>),
 }
 
 type SchedTx = tokio::sync::mpsc::UnboundedSender<SchedulerItem>;
@@ -390,6 +406,10 @@ pub(super) enum QueuedItem {
     CopyTracked {
         plan: PreLaunchCopy,
         completion: ControlCompletion,
+    },
+    HostKv {
+        op: HostKvOp,
+        response: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
     },
     CloseInstance {
         id: u64,
@@ -880,6 +900,11 @@ impl SchedulerHandle {
         Ok(completion)
     }
 
+    pub(crate) async fn host_kv(&self, op: HostKvOp) -> Result<Vec<u8>> {
+        self.request(|response| SchedulerItem::HostKv { op, response })
+            .await?
+    }
+
     pub(crate) async fn debug_dump(&self) -> Result<String> {
         crate::rt::time::timeout(
             std::time::Duration::from_secs(2),
@@ -1341,6 +1366,7 @@ impl BatchScheduler {
                 } => format!("PreLaunchCopy({}) pipeline {pipeline_id:?}", plan.label()),
                 QueuedItem::RegisterChannelsBind { .. } => "RegisterChannelsBind".to_string(),
                 QueuedItem::CopyTracked { plan, .. } => format!("CopyTracked({})", plan.label()),
+                QueuedItem::HostKv { op, .. } => format!("HostKv({op:?})"),
                 QueuedItem::CloseInstance { id, .. } => format!("CloseInstance {id}"),
                 QueuedItem::CloseChannels { ids } => format!("CloseChannels x{}", ids.len()),
             };
@@ -1571,6 +1597,9 @@ impl BatchScheduler {
             SchedulerItem::CopyTracked { plan, completion } => {
                 pending.push_back(QueuedItem::CopyTracked { plan, completion });
             }
+            SchedulerItem::HostKv { op, response } => {
+                pending.push_back(QueuedItem::HostKv { op, response });
+            }
             SchedulerItem::CloseInstance { id, pacing_wait_id } => {
                 pending.push_back(QueuedItem::CloseInstance { id, pacing_wait_id });
             }
@@ -1667,7 +1696,10 @@ impl BatchScheduler {
     }
 
     const fn standalone_copy(item: &QueuedItem) -> bool {
-        matches!(item, QueuedItem::CopyTracked { .. })
+        matches!(
+            item,
+            QueuedItem::CopyTracked { .. } | QueuedItem::HostKv { .. }
+        )
     }
 
     const fn rotation_target(item: &QueuedItem) -> bool {

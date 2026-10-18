@@ -12,6 +12,7 @@ name = "engine_cuda"
 path = "src/lib.rs"
 
 [dependencies]
+state = { path = "../state" }
 memmap2 = "0.9"
 toml = "1.1"
 libc = "0.2"

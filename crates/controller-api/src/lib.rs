@@ -50,11 +50,19 @@ pub struct WorkerInfo {
     pub role: Role,
     pub model: String,
     pub addr: String,
+    /// The id this worker had, registering again (a controller restarted,
+    /// or one that timed it out): granted back if no one holds it, so the
+    /// worker keeps its links and its turns.
+    #[serde(default)]
+    pub prior: Option<WorkerId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayInfo {
     pub addr: String,
+    /// The id this gateway had, registering again; as for a worker.
+    #[serde(default)]
+    pub prior: Option<GatewayId>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -70,6 +78,10 @@ pub struct WorkerStatus {
     pub capacity_tokens: u64,
     #[serde(default)]
     pub used_tokens: u64,
+    /// Taking no new turns: it is about to go, once what it runs has moved
+    /// or ended.
+    #[serde(default)]
+    pub draining: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

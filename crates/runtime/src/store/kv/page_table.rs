@@ -829,6 +829,89 @@ impl KvPageTable {
         }
     }
 
+    /// Pages on the path to `node`'s last page, from the first.
+    pub fn path_len(&self, node: NodeId) -> u64 {
+        match self.contribution_len(node) {
+            0 => 0,
+            len => self.path_prefix_len(node, len - 1),
+        }
+    }
+
+    /// The keys of the path to `terminal`'s last page, from the first page;
+    /// `None` where a page on it is not sealed.
+    pub fn path_keys(&self, terminal: NodeId) -> Option<Vec<Hash256>> {
+        let len = self.contribution_len(terminal);
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        self.path_locations(terminal, len - 1)
+            .into_iter()
+            .map(|at| match &self.nodes.get(at.node)?.pages {
+                Pages::Owned { page_hashes, .. } => page_hashes.get(at.local as usize).copied()?,
+                Pages::ParentSelection { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Every sealed page's key, on any tier: what this worker can give a
+    /// peer that asks by key.
+    pub fn sealed_keys(&self) -> std::collections::HashSet<Hash256> {
+        let mut keys = std::collections::HashSet::new();
+        for (_, node) in self.nodes.iter() {
+            if let Pages::Owned { page_hashes, .. } = &node.pages {
+                keys.extend(page_hashes.iter().flatten().copied());
+            }
+        }
+        keys
+    }
+
+    /// A node of sealed pages that came from elsewhere. Grafted `after` the
+    /// page it extends, a pass that maps the prefix maps it too: attaching
+    /// takes the trie path to a run's last page. With no `after` it starts a
+    /// path of its own.
+    pub fn insert_cached(
+        &mut self,
+        after: Option<TriePageLocation>,
+        backings: Vec<KvPageBacking>,
+        token_hashes: Vec<Vec<Option<Hash256>>>,
+        page_hashes: Vec<Hash256>,
+    ) -> NodeId {
+        let parent = after.map(|at| {
+            let pages = match &self.nodes.get(at.node).expect("live node").pages {
+                Pages::Owned { backings, .. } => backings.len() as u64,
+                Pages::ParentSelection { .. } => unreachable!("a run names owned pages"),
+            };
+            if at.local + 1 == pages {
+                at.node
+            } else {
+                self.make_prefix_selection(at.node, at.local + 1)
+            }
+        });
+        let first = page_hashes.first().copied();
+        let node = self.nodes.insert(KvTrieNode {
+            parent,
+            children: SmallVec::new(),
+            pages: Pages::Owned {
+                backings,
+                token_hashes,
+                page_hashes: page_hashes.into_iter().map(Some).collect(),
+            },
+            exact_anchors: 0,
+            path_anchors: 0,
+        });
+        if let Some(parent) = parent {
+            self.nodes
+                .get_mut(parent)
+                .expect("live parent")
+                .children
+                .push(node);
+        }
+        if let Some(key) = first {
+            self.index_node_start(key, node);
+        }
+        node
+    }
+
     pub fn lease_cache_root(&mut self, node: NodeId) {
         if hold(&mut self.cache_roots, node) {
             self.add_anchor(node);

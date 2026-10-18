@@ -3,9 +3,9 @@
 
 use std::collections::HashMap;
 
-use policy::{By, Change, Exit, Id, Outcome, Retain, Subject, attr, engine, prop, set_alarm};
+use policy::{By, Change, Exit, Id, Outcome, Retain, Subject, attr, prop, set_alarm, worker};
 
-/// Above any key the engine gives a working set this policy does not name.
+/// Above any key the worker gives a working set this policy does not name.
 const KEEP: i64 = 1 << 40;
 
 struct Kept {
@@ -34,7 +34,7 @@ impl KeepSession {
     }
 }
 
-impl engine::Policy for KeepSession {
+impl worker::Policy for KeepSession {
     fn on_arrived(&mut self, process: &Id) {
         self.read(process);
     }
@@ -100,14 +100,14 @@ impl engine::Policy for KeepSession {
             .iter()
             .partition(|(_, kept)| kept.due_ms.is_some_and(|due| due <= now_ms));
         for (ws, _) in &due {
-            engine::discard(ws);
+            worker::discard(ws);
         }
         let entries: Vec<_> = kept
             .iter()
             .map(|(ws, _)| Retain::all((*ws).clone(), KEEP))
             .collect();
         let next = kept.iter().filter_map(|(_, k)| k.due_ms).min();
-        engine::install_retention(&entries);
+        worker::install_retention(&entries);
         if let Some(next) = next {
             set_alarm(next);
         }
@@ -118,4 +118,4 @@ impl engine::Policy for KeepSession {
     }
 }
 
-policy::engine!(KeepSession);
+policy::worker!(KeepSession);

@@ -2435,6 +2435,27 @@ pub async fn submit_pass_stamped<C: FireContext>(
         } else {
             Attach::No
         };
+        // Rows no worker here holds may be prefilled on a peer, whose pages
+        // land in the host tier for the promote below to find.
+        if matches!(attach, Attach::Kv)
+            && let Some(slots) = &pass_slots
+        {
+            let lane = &full.lanes[0];
+            // Pages another pass is computing now are waited for, not
+            // computed again.
+            crate::pipeline::coalesce::before_pass(&stores, ws.id, u64::from(lane.kv.held), slots)
+                .await;
+            crate::offload::prefill::before_pass(
+                pid,
+                &stores,
+                engine,
+                ws.id,
+                u64::from(lane.kv.held),
+                &lane.tokens,
+                slots,
+            )
+            .await;
+        }
         // Pages below the device come back up first; the run stays held
         // until it is mapped in just below.
         let promoted = match &pass_slots {

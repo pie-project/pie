@@ -74,6 +74,128 @@ impl ControlLink for ControlClient {
     }
 }
 
+/// A link to the controller that is dialed again when it goes, so a
+/// controller restarted on its address is found again: the watch starts
+/// over, and the next heartbeat hears it does not know this worker, which
+/// registers again under its id.
+#[derive(Clone)]
+pub struct Controller {
+    addr: std::sync::Arc<str>,
+    client: std::sync::Arc<std::sync::Mutex<(ControlClient, u64)>>,
+    dialing: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Controller {
+    pub async fn dial(addr: &str) -> Result<Self> {
+        let client = dial_controller(addr).await?;
+        Ok(Self {
+            addr: addr.into(),
+            client: std::sync::Arc::new(std::sync::Mutex::new((client, 0))),
+            dialing: Default::default(),
+        })
+    }
+
+    /// The client, and which dial it came from.
+    fn client(&self) -> (ControlClient, u64) {
+        self.client.lock().unwrap().clone()
+    }
+
+    /// After `error` on the link from dial `seen`: if the link is gone,
+    /// dials again, unless another caller already has.
+    async fn heal(&self, error: &tarpc::client::RpcError, seen: u64) {
+        if !matches!(error, tarpc::client::RpcError::Shutdown) {
+            return;
+        }
+        let _dialing = self.dialing.lock().await;
+        if self.client().1 != seen {
+            return;
+        }
+        match dial_controller(&self.addr).await {
+            Ok(client) => {
+                *self.client.lock().unwrap() = (client, seen + 1);
+                tracing::info!(controller = %self.addr, "dialed the controller again");
+            }
+            Err(e) => tracing::debug!(error = %format!("{e:#}"), "the controller is not back yet"),
+        }
+    }
+}
+
+impl ControlLink for Controller {
+    async fn register_worker(&self, info: WorkerInfo) -> Result<WorkerId> {
+        let (client, seen) = self.client();
+        match client
+            .register_worker(tarpc::context::current(), info)
+            .await
+        {
+            Ok(id) => Ok(id),
+            Err(e) => {
+                self.heal(&e, seen).await;
+                Err(e).context("register_worker rpc")
+            }
+        }
+    }
+
+    async fn heartbeat(&self, id: NodeId) -> Result<Ack> {
+        let (client, seen) = self.client();
+        match client.heartbeat(tarpc::context::current(), id).await {
+            Ok(ack) => Ok(ack),
+            Err(e) => {
+                self.heal(&e, seen).await;
+                Err(e).context("heartbeat rpc")
+            }
+        }
+    }
+
+    async fn report_worker(&self, id: WorkerId, status: WorkerStatus) -> Result<()> {
+        let (client, seen) = self.client();
+        match client
+            .report_worker(tarpc::context::current(), id, status)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.heal(&e, seen).await;
+                Err(e).context("report_worker rpc")
+            }
+        }
+    }
+
+    fn neighbors_watch(&self, id: WorkerId) -> watch::Receiver<Neighbors> {
+        let (tx, rx) = watch::channel(Neighbors {
+            epoch: 0,
+            peers: Vec::new(),
+            gateways: Vec::new(),
+        });
+        let control = self.clone();
+        tokio::spawn(async move {
+            let mut since = 0u64;
+            loop {
+                let (client, seen) = control.client();
+                let mut ctx = tarpc::context::current();
+                ctx.deadline = Instant::now() + WATCH_DEADLINE;
+                match client.watch_worker(ctx, id, since).await {
+                    Ok(neighbors) => {
+                        since = neighbors.epoch;
+                        if tx.send(neighbors).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(worker = %id, error = %e, "controller watch_worker transport failed");
+                        control.heal(&e, seen).await;
+                        if control.client().1 != seen {
+                            // A new controller counts its epochs afresh.
+                            since = 0;
+                        }
+                        tokio::time::sleep(WATCH_RETRY_BACKOFF).await;
+                    }
+                }
+            }
+        });
+        rx
+    }
+}
+
 async fn watch_neighbors_loop(
     client: ControlClient,
     worker_id: WorkerId,
@@ -132,7 +254,7 @@ pub async fn dial_controller(addr: &str) -> Result<ControlClient> {
     }
 }
 
-fn report_band(status: &WorkerStatus) -> (u8, bool, u32, u32) {
+fn report_band(status: &WorkerStatus) -> (u8, bool, u32, u32, bool) {
     let bucket = status.kv_pressure_bucket;
     let band = if bucket >= 240 {
         u8::MAX
@@ -148,29 +270,62 @@ fn report_band(status: &WorkerStatus) -> (u8, bool, u32, u32) {
         status.inflight == 0,
         status.running,
         status.waiting.div_ceil(4),
+        status.draining,
     )
+}
+
+static DRAINING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This worker takes no new turns from now on, and says so in its next
+/// report.
+pub fn set_draining() {
+    DRAINING.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub fn draining() -> bool {
+    DRAINING.load(std::sync::atomic::Ordering::Acquire)
 }
 
 pub fn spawn_control_tasks<C: ControlLink>(
     ctrl: C,
     worker_id: WorkerId,
+    info: WorkerInfo,
     mut gateways: GatewayLinkManager,
     partners: Option<std::sync::Arc<tokio::sync::Mutex<PartnerLinkManager>>>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let heartbeat_ctrl = ctrl.clone();
     let heartbeat_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+        let again = WorkerInfo {
+            prior: Some(worker_id),
+            ..info
+        };
         loop {
             ticker.tick().await;
             match heartbeat_ctrl.heartbeat(NodeId::Worker(worker_id)).await {
                 Ok(Ack::Ok) => {}
-                Ok(Ack::ReRegister) => {
-                    tracing::error!(
+                // The controller does not know this worker (it restarted, or
+                // timed it out): register again as the same worker. Only if
+                // the id is not granted back must the worker start over, as
+                // its links and turns are under it.
+                Ok(Ack::ReRegister) => match heartbeat_ctrl.register_worker(again.clone()).await {
+                    Ok(id) if id == worker_id => {
+                        tracing::info!(worker = %worker_id, "registered with the controller again");
+                    }
+                    Ok(id) => {
+                        tracing::error!(
+                            worker = %worker_id,
+                            granted = %id,
+                            "the controller gave this worker another id; restarting worker"
+                        );
+                        restart_after_lost_registration("worker");
+                    }
+                    Err(e) => tracing::warn!(
                         worker = %worker_id,
-                        "controller lost our registration; restarting worker"
-                    );
-                    restart_after_lost_registration("worker");
-                }
+                        error = %format!("{e:#}"),
+                        "registering again failed; retrying next tick"
+                    ),
+                },
                 Err(e) => {
                     tracing::warn!(
                         worker = %worker_id,
@@ -199,6 +354,7 @@ pub fn spawn_control_tasks<C: ControlLink>(
                 waiting: waiting.min(u32::MAX as usize) as u32,
                 capacity_tokens,
                 used_tokens,
+                draining: draining(),
             };
             let due = match &last {
                 None => true,
@@ -211,8 +367,9 @@ pub fn spawn_control_tasks<C: ControlLink>(
             }
             last = Some((status, Instant::now()));
             if runtime::planner::trace_enabled() {
+                let (free, idle, held, total) = runtime::store::kv_census();
                 println!(
-                    "[report] kv_bucket={} inflight={} queue=[{}]",
+                    "[report] kv_bucket={} pages free={free} idle={idle} held={held} of {total} inflight={} queue=[{}]",
                     status.kv_pressure_bucket,
                     status.inflight,
                     runtime::planner::planner()
@@ -255,7 +412,8 @@ pub fn spawn_control_tasks<C: ControlLink>(
                         break;
                     }
                     _ = tokio::time::sleep(LINK_HEAL_INTERVAL) => {
-                        if !gateways.reap_dead().is_empty() {
+                        let reaped = !gateways.reap_dead().is_empty();
+                        if reaped || gateways.missing(&last.gateways) {
                             break;
                         }
                     }

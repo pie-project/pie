@@ -1,0 +1,7 @@
+# Keeps every run some worker caches in every pool too, so it outlives the
+# worker: a level-triggered replication table, re-enacted until each pool
+# holds each run.
+plane = "cluster"
+subscribe = ["copied", "dropped", "worker-removed"]
+grants = ["replication"]
+uses = ["state.replicate"]

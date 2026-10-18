@@ -48,6 +48,7 @@ pub struct WorkerRegistry {
 struct RegistryInner {
     clients: RwLock<HashMap<WorkerId, WorkerControlClient>>,
     connected_tx: watch::Sender<Arc<HashSet<WorkerId>>>,
+    directory: crate::directory::Directory,
 }
 
 impl WorkerRegistry {
@@ -57,8 +58,14 @@ impl WorkerRegistry {
             inner: Arc::new(RegistryInner {
                 clients: RwLock::new(HashMap::new()),
                 connected_tx,
+                directory: crate::directory::Directory::default(),
             }),
         }
+    }
+
+    /// Which connected worker holds which sealed page.
+    pub fn directory(&self) -> &crate::directory::Directory {
+        &self.inner.directory
     }
 
     pub fn connected_watch(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>> {
@@ -105,6 +112,7 @@ impl WorkerRegistry {
     }
 
     fn remove(&self, id: WorkerId) {
+        self.inner.directory.forget(id);
         let mut clients = self.inner.clients.write().unwrap();
         clients.remove(&id);
         Self::publish(&self.inner.connected_tx, &clients);
@@ -219,7 +227,8 @@ impl GatewayInbound for InboundServer {
         req_id: ReqId,
         chunk: Tokens,
     ) -> Control {
-        self.sessions.feed(req_id, chunk).await
+        let from = *self.conn.worker_id.lock().unwrap();
+        self.sessions.feed_from(req_id, chunk, from).await
     }
 
     async fn counted(self, _: tarpc::context::Context, req_id: ReqId, prompt: u64, generated: u64) {
@@ -237,5 +246,56 @@ impl GatewayInbound for InboundServer {
 
     async fn redirect(self, _: tarpc::context::Context, req_id: ReqId) {
         self.sessions.redirect(req_id);
+    }
+
+    async fn state(
+        self,
+        _: tarpc::context::Context,
+        worker_id: WorkerId,
+        report: worker_api::StateReport,
+    ) {
+        let quiet = !report.full
+            && report.added.is_empty()
+            && report.removed.is_empty()
+            && report.runs_added.is_empty()
+            && report.runs_removed.is_empty();
+        // Workers report each second whether or not anything changed.
+        if !quiet {
+            tracing::debug!(
+                worker = %worker_id,
+                added = report.added.len(),
+                removed = report.removed.len(),
+                runs = report.runs_added.len(),
+                full = report.full,
+                "state report"
+            );
+        }
+        let directory = self.registry.directory();
+        directory.report(
+            worker_id,
+            report.peer,
+            report.added,
+            report.removed,
+            report.full,
+        );
+        directory.report_runs(
+            worker_id,
+            report.runs_added,
+            report.runs_removed,
+            report.full,
+            report.pool,
+        );
+        if let Some(published) = report.published {
+            directory.report_published(worker_id, published);
+        }
+    }
+
+    async fn locate(
+        self,
+        _: tarpc::context::Context,
+        worker_id: WorkerId,
+        keys: Vec<[u8; 32]>,
+    ) -> Vec<(WorkerId, String, u32)> {
+        self.registry.directory().holders(worker_id, &keys)
     }
 }

@@ -1,17 +1,20 @@
 package plex:policy@1.0.0;
 
-/// Runs at the cluster's front door: pie's gateway.
-world router {
+/// Where programs and their state live, across the cluster: pie's gateway,
+/// beside the state directory. Mostly space.
+world cluster {
     import reads;
     import writes;
-    import router-writes;
+    import cluster-writes;
+    import state-writes;
     export policy;
 }
 
-/// Runs inside each worker: pie's runtime.
-world engine {
+/// When a worker's passes run, and where its state sits within it: pie's
+/// runtime, one per worker. Mostly time.
+world worker {
     import reads;
     import writes;
-    import engine-writes;
+    import worker-writes;
     export policy;
 }

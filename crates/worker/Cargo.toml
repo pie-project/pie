@@ -23,6 +23,9 @@ net = [
     "dep:tarpc",
     "dep:tokio-tungstenite",
     "dep:worker-api",
+    "dep:transport",
+    "transport/tcp",
+    "dep:engine-cpu",
     "tokio/full",
 ]
 # `pie serve` in one process: the controller and the gateway beside this worker.
@@ -49,6 +52,8 @@ engine = { path = "../engine" }
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 transport = { path = "../transport", optional = true }
 ids = { path = "../ids" }
+state = { path = "../state" }
+engine-cpu = { path = "../engine-cpu", optional = true }
 client-api = { package = "pie-client-api", path = "../client-api" }
 anyhow = "1.0"
 controller = { path = "../controller", optional = true }

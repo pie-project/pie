@@ -1,6 +1,6 @@
 # Priority at the gateway: launches leave its queue by their `priority`,
-# and pass it on as `router/priority` for the engine's `priority` policy.
-plane = "router"
+# and pass it on as `cluster/priority` for the worker's `priority` policy.
+plane = "cluster"
 subscribe = ["arrived", "prop-changed"]
 grants = ["schedule", "placement"]
 gate-ms = 20

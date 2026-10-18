@@ -273,8 +273,14 @@ impl Shell {
         let page_tokens = u64::from(self.pools.paging().page_size.max(1));
         let seated = u64::from(rows) * row
             + u64::from(seats) * u64::from(context).div_ceil(page_tokens) * page;
-        let asked = stated.map_or(whole.max(seated), |bytes| bytes / ranks);
-        let budget = asked.min(crate::weights::available_memory() / ranks);
+        // Unstated, the default takes at most half of what the host leaves
+        // free: workers sharing a host each seat theirs as they boot, and
+        // the first must not take the room the next one needs.
+        let free = crate::weights::available_memory() / ranks;
+        let budget = match stated {
+            Some(bytes) => (bytes / ranks).min(free),
+            None => whole.max(seated).min(free / 2),
+        };
         let (rows, pages, window_pages) =
             crate::store::host_pool(budget, rows, row, pages, page, window_pages, window_page);
         self.pools.seat_host(pages, window_pages, rows, row)?;
@@ -312,6 +318,23 @@ impl Shell {
     pub fn spill_kv(&mut self, to_disk: bool, device: &[u32], disk: &[u32]) -> Result<()> {
         self.pools
             .spill_kv(self.device.stream(), to_disk, device, disk)
+    }
+
+    #[must_use]
+    pub fn host_kv_layout(&self, ranks: u32) -> Option<state::PageLayout> {
+        self.pools.host_kv_layout(ranks)
+    }
+
+    /// Once every copy on the stream has landed.
+    pub fn read_host_kv(&mut self, slots: &[u32]) -> Result<Vec<u8>> {
+        self.device.synchronize()?;
+        self.pools.read_host_kv(slots)
+    }
+
+    /// Behind every copy on the stream, so none still reads the slots.
+    pub fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()> {
+        self.device.synchronize()?;
+        self.pools.write_host_kv(slots, bytes)
     }
 
     pub fn swap_kv(

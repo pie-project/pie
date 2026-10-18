@@ -75,7 +75,7 @@ const TAIL: &str = r#"
 # frame_size               = 2     # guest contract: the submit depth is
 # frame_dispatch_depth     = 2     # derived from it, not a key of its own
 # max_concurrent_processes = 64    # omit: from the engine's max_forward_requests
-# policy                   = "noop"  # a PLEX engine policy: built-in name or .wasm path
+# policy                   = "noop"  # a PLEX worker policy: built-in name or .wasm path
 
 [sandbox]
 # The box an inferlet runs in: its walls, and its size.

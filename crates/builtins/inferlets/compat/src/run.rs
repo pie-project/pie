@@ -106,11 +106,14 @@ impl Output {
 
 /// Run `req`, handing every event to `sink` as it happens.
 pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, String> {
-    let prompt = prompt::build(req)?;
+    let mut prompt = prompt::build(req)?;
     // The worker's policy sees the prompt while this process still waits.
     let prompt_tokens = prompt.tokens.len() as u32;
     inferlet::session::set_tokens(prompt_tokens, 0);
-    let mut generated = 0u32;
+    // A turn that moved here continues after what the client was sent.
+    let resumed = crate::resume::get().map(|r| r.tokens).unwrap_or_default();
+    prompt.tokens.extend_from_slice(&resumed);
+    let mut generated = resumed.len() as u32;
     let matcher = constraint(req)?;
     let stop_tokens = chat::stop_tokens();
     let mut demux = Demux::new(&chat::cue_thinking(prompt::thinks(req)));
@@ -121,8 +124,16 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
         stop_hit: None,
     };
     let mut error: Option<String> = None;
+    // What the client was sent already passes through the decoders and the
+    // stop hold-back unseen, so they stand where they stood.
+    for &token in &resumed {
+        if let Ok(events) = demux.feed(token) {
+            let _ = out.deliver(events, &mut |_| {});
+        }
+    }
 
     let mut on_token = |token: u32| -> ControlFlow<()> {
+        crate::resume::note(token);
         generated += 1;
         if generated == 1 || generated.is_multiple_of(REPORT_EVERY) {
             inferlet::session::set_tokens(prompt_tokens, generated);
@@ -145,7 +156,7 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
     let (sampled, cached_tokens) = generate(
         &prompt,
         req.sampling,
-        req.max_tokens,
+        req.max_tokens.saturating_sub(resumed.len()),
         matcher.as_ref(),
         &mut on_token,
     )
@@ -170,12 +181,15 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
         finish = Finish::ToolCalls;
     }
 
+    // A resumed turn's counts are the turn's, not this launch's: what the
+    // client was sent before the move is completion, not prompt.
+    let resumed = resumed.len();
     Ok(Outcome {
         finish,
         stop_sequence: out.stop_hit.and_then(|i| req.stop.get(i).cloned()),
-        prompt_tokens: prompt.tokens.len(),
-        cached_tokens,
-        completion_tokens: sampled,
+        prompt_tokens: prompt.tokens.len() - resumed,
+        cached_tokens: cached_tokens.min(prompt.tokens.len() - resumed),
+        completion_tokens: sampled + resumed,
         content: out.content,
         reasoning: demux.reasoning_text,
         tool_calls: demux.tool_calls,

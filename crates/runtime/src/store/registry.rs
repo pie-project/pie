@@ -99,8 +99,8 @@ pub fn register_model_with_swap(
                 num_disk_pages.get(d).copied().unwrap_or(0),
                 rand::random::<[u8; 32]>(),
             );
-            if let Some(seed) = crate::model::kv_fingerprint() {
-                kv.set_domain(&seed);
+            if let Some(identity) = crate::model::identity() {
+                kv.set_domain(identity.domain());
             }
             let pool = state.get(d).copied().unwrap_or_default();
             // KV alone resumes a model only when it has no recurrent state.

@@ -1817,7 +1817,17 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "state",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "engine-cpu"
+version = "0.5.4"
+dependencies = [
+ "tokio",
+ "tracing",
+ "transport",
 ]
 
 [[package]]
@@ -1840,6 +1850,7 @@ dependencies = [
  "pie-poem-ir",
  "pie-profile",
  "serde_json",
+ "state",
  "tempfile",
  "tokenizer",
  "toml",
@@ -5173,6 +5184,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "state",
  "tempfile",
  "thiserror 2.0.21",
  "tokenizer",
@@ -5951,6 +5963,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "state"
+version = "0.5.4"
+dependencies = [
+ "blake3",
+ "serde",
+]
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6688,11 +6708,15 @@ name = "transport"
 version = "0.5.4"
 dependencies = [
  "bindgen",
+ "bytes",
  "engine",
  "ids",
  "pie-dtype",
  "serde",
+ "socket2",
  "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -8190,6 +8214,7 @@ dependencies = [
  "controller",
  "controller-api",
  "engine",
+ "engine-cpu",
  "futures",
  "gateway",
  "ids",
@@ -8204,6 +8229,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "state",
  "tarpc",
  "tempfile",
  "tokenizer",
@@ -8226,6 +8252,7 @@ dependencies = [
  "ids",
  "pie-client-api",
  "serde",
+ "state",
  "tarpc",
  "thiserror 2.0.21",
  "tokio",

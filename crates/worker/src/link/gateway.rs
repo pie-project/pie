@@ -26,11 +26,13 @@ const TURN_QUEUE_DEPTH: usize = 64;
 
 pub struct GatewayLink {
     serve_task: tokio::task::JoinHandle<()>,
+    state_task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for GatewayLink {
     fn drop(&mut self) {
         self.serve_task.abort();
+        self.state_task.abort();
     }
 }
 
@@ -72,6 +74,7 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
         .with_context(|| format!("registering worker with gateway at {addr}"))?;
     tracing::info!(%worker_id, gateway = %addr, "worker registered with gateway (dial-in)");
 
+    let state_task = tokio::spawn(crate::link::peer::report_state(gateway.clone(), worker_id));
     let server = WorkerControlServer {
         worker_id,
         gateway,
@@ -85,7 +88,10 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
             }),
     );
 
-    Ok(GatewayLink { serve_task })
+    Ok(GatewayLink {
+        serve_task,
+        state_task,
+    })
 }
 
 pub struct GatewayLinkManager {
@@ -126,18 +132,15 @@ impl GatewayLinkManager {
             .chain(roster.iter().map(|g| canonical_addr(&g.addr)))
             .collect();
 
-        let stale: Vec<String> = self
-            .links
-            .keys()
-            .filter(|addr| !desired.contains(*addr))
-            .cloned()
-            .collect();
-        for addr in stale {
-            self.links.remove(&addr);
-            tracing::info!(
+        // A live link to a gateway the roster leaves out is kept: the roster
+        // may be a restarted controller's, which has not heard from that
+        // gateway yet. A gateway that goes closes its links, and they are
+        // reaped then.
+        for addr in self.links.keys().filter(|addr| !desired.contains(*addr)) {
+            tracing::debug!(
                 worker = %self.worker_id,
                 gateway = %addr,
-                "dropped gateway link (left roster)"
+                "a linked gateway is not on the roster; keeping the link while it lives"
             );
         }
 
@@ -160,11 +163,21 @@ impl GatewayLinkManager {
         }
     }
 
+    /// Whether a gateway this worker should be linked to has no link: one
+    /// whose dial failed, as a restarted gateway's can before it listens.
+    pub fn missing(&self, roster: &[GatewayEndpoint]) -> bool {
+        self.pinned
+            .iter()
+            .cloned()
+            .chain(roster.iter().map(|g| canonical_addr(&g.addr)))
+            .any(|addr| !self.links.contains_key(&addr))
+    }
+
     pub fn reap_dead(&mut self) -> Vec<String> {
         let dead: Vec<String> = self
             .links
             .iter()
-            .filter(|(_, link)| link.serve_task.is_finished())
+            .filter(|(_, link)| link.serve_task.is_finished() || link.state_task.is_finished())
             .map(|(addr, _)| addr.clone())
             .collect();
         for addr in &dead {
@@ -213,6 +226,10 @@ struct SessionHandle {
 
 impl WorkerControl for WorkerControlServer {
     async fn dispatch(self, _: tarpc::context::Context, req: Request) -> Accepted {
+        // Draining, it takes no new turn; the gateway tries the next worker.
+        if super::control::draining() {
+            return Accepted::Reject;
+        }
         match self.admit(req).await {
             Ok(()) => Accepted::Ok {
                 worker: self.worker_id,
@@ -239,6 +256,15 @@ impl WorkerControl for WorkerControlServer {
                 }
             },
         }
+    }
+
+    async fn replicate(
+        self,
+        _: tarpc::context::Context,
+        _keys: Vec<[u8; 32]>,
+        _from: String,
+    ) -> Result<u32, String> {
+        Err("a serving worker takes another's pages as its passes need them".into())
     }
 
     async fn cancel(self, _: tarpc::context::Context, req_id: ReqId) {
@@ -437,8 +463,8 @@ async fn session_driver(
         }
 
         let mut message = req.message;
-        if let ClientMessage::LaunchProcess { router_props, .. } = &mut message {
-            *router_props = req.router_props;
+        if let ClientMessage::LaunchProcess { cluster_props, .. } = &mut message {
+            *cluster_props = req.cluster_props;
         }
         let fed = feed_turn(client_id, req_id, message);
 

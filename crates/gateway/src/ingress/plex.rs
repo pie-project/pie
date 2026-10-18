@@ -1,5 +1,5 @@
 //! Session props and `close` between a session's processes (PLEX 1.0 §9), to
-//! the router and every worker's engine policy.
+//! the cluster policy and every worker's worker policy.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -50,9 +50,9 @@ fn check(session: &str, changes: &Props) -> Result<(), String> {
     client_api::props::from_client(&mut changes.clone())?;
     if let Some(name) = changes
         .keys()
-        .find(|n| n.starts_with(client_api::props::ROUTER_PREFIX))
+        .find(|n| n.starts_with(client_api::props::CLUSTER_PREFIX))
     {
-        return Err(format!("`{name}` is the router's to set"));
+        return Err(format!("`{name}` is the cluster policy's to set"));
     }
     Ok(())
 }

@@ -12,6 +12,8 @@ members = [
     "crates/grammar",
     "crates/waker",
     "crates/ids",
+    "crates/state",
+    "crates/engine-cpu",
     "crates/dtype",
     "crates/profile",
     "crates/profile-macros",
@@ -73,6 +75,8 @@ default-members = [
     "crates/grammar",
     "crates/waker",
     "crates/ids",
+    "crates/state",
+    "crates/engine-cpu",
     "crates/dtype",
     "crates/profile",
     "crates/profile-macros",
@@ -139,6 +143,10 @@ path = "src/bin/pie-gateway.rs"
 [[bin]]
 name = "pie-worker"
 path = "src/bin/pie-worker.rs"
+
+[[bin]]
+name = "pie-pool"
+path = "src/bin/pie-pool.rs"
 
 [features]
 default = []

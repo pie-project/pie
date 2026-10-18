@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use controller_api::{
-    GatewayEndpoint, Health, NeighborPeer, Neighbors, Role, RoutableWorker, RoutingTable,
+    GatewayEndpoint, NeighborPeer, Neighbors, Role, RoutableWorker, RoutingTable,
 };
 use ids::WorkerId;
 
@@ -98,7 +98,7 @@ pub fn reassign(cluster: &Cluster) -> (Topology, RoutingTable) {
             addr: w.addr.clone(),
             role: w.role,
             model: w.model.clone(),
-            health: Health::Healthy,
+            health: w.health,
             coarse_load: w.load,
         })
         .collect();

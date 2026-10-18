@@ -65,6 +65,7 @@ pub fn register(
         Some(compiled) => compiled?,
         None => Tokenizer::from_file(&tokenizer_path)?,
     };
+    let identity = identity_of(&deployment, metadata, &tokenizer_path)?;
     let tokenizer = Arc::new(tokenizer);
     let contract = tokenizer::contract::Contract {
         markers: deployment.markers(),
@@ -107,11 +108,44 @@ pub fn register(
         num_layers: deployment.model.layers,
         diffusion,
         generative,
+        identity,
     });
     MODEL.set(model).map_err(|_| {
         anyhow!("a model is already registered; the runtime serves exactly one model")
     })?;
     Ok(())
+}
+
+/// What the model is, apart from how this worker serves it. `weights` is the
+/// package's model id until artifacts carry a digest of their source weights.
+fn identity_of(
+    deployment: &crate::catalog::Deployment,
+    metadata: &ModelMetadata,
+    tokenizer_path: &Path,
+) -> Result<state::ModelIdentity> {
+    let mut hasher = blake3::Hasher::new();
+    match &metadata.tokenizer {
+        Some(objects) => {
+            let mut objects: Vec<&(String, Vec<u8>)> = objects.iter().collect();
+            objects.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, bytes) in objects {
+                hasher.update(&(name.len() as u64).to_le_bytes());
+                hasher.update(name.as_bytes());
+                hasher.update(&(bytes.len() as u64).to_le_bytes());
+                hasher.update(bytes);
+            }
+        }
+        None => {
+            let bytes = std::fs::read(tokenizer_path)
+                .map_err(|e| anyhow!("read the tokenizer at {}: {e}", tokenizer_path.display()))?;
+            hasher.update(&bytes);
+        }
+    }
+    Ok(state::ModelIdentity {
+        model: deployment.model.id.clone(),
+        weights: deployment.model.id.clone(),
+        tokenizer: hasher.finalize().to_hex().to_string(),
+    })
 }
 
 /// The template a model's package states, as the template crate reads it.
@@ -271,10 +305,10 @@ pub fn model() -> &'static Arc<Model> {
     MODEL.get().expect("model accessed before registration")
 }
 
-/// So a key means the same KV across restarts and the workers serving it.
-pub fn kv_fingerprint() -> Option<Vec<u8>> {
-    let m = MODEL.get()?;
-    Some(format!("{}|{}|{}", m.deployment.name, m.kv_page_size, m.num_layers).into_bytes())
+/// So a key means the same state across restarts and every worker serving
+/// the model, whatever its engine, variant or page size.
+pub fn identity() -> Option<&'static state::ModelIdentity> {
+    MODEL.get().map(|m| &m.identity)
 }
 
 pub fn media_pad() -> Option<u32> {
@@ -304,6 +338,7 @@ pub struct Model {
     num_layers: u32,
     diffusion: Option<poem::generative::Diffusion>,
     generative: Option<poem::generative::Generative>,
+    identity: state::ModelIdentity,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -1,7 +1,7 @@
 //! Writing a PLEX serving policy for pie (`plex:policy@1.0.0`).
 //!
-//! Implement [`engine::Policy`] or [`router::Policy`] on a `Default` type and
-//! export it with [`engine!`] or [`router!`]; `policy.toml` beside `Cargo.toml`
+//! Implement [`worker::Policy`] or [`cluster::Policy`] on a `Default` type and
+//! export it with [`worker!`] or [`cluster!`]; `policy.toml` beside `Cargo.toml`
 //! is embedded as the manifest. A host restarts an instance that traps or
 //! overruns its deadline, without its state.
 
@@ -14,8 +14,8 @@ pub mod bindings {
             package plex:support;
 
             world support {
-                include plex:policy/engine@1.0.0;
-                include plex:policy/router@1.0.0;
+                include plex:policy/worker@1.0.0;
+                include plex:policy/cluster@1.0.0;
             }
         ",
         world: "plex:support/support",
@@ -29,8 +29,9 @@ pub use wit_bindgen;
 
 pub use bindings::plex::policy::reads::capability;
 pub use bindings::plex::policy::types::{
-    By, Change, Dispatch, Edge, Exit, Outcome, Placement, Retain, Subject, SubjectKind, Transition,
-    Value,
+    Accept, By, Change, Dispatch, Edge, Exit, Offload, OffloadEvent, OffloadMode, Outcome,
+    Placement, Replicate, Residency, Retain, Scale, Site, Subject, SubjectKind, Tier,
+    TransferClass, Transition, Value,
 };
 pub use bindings::plex::policy::writes::{set_alarm, terminate};
 
@@ -143,12 +144,13 @@ impl Value {
     }
 }
 
-/// The engine world: one instance inside each worker.
-pub mod engine {
-    use crate::{By, Change, Edge, Exit, Id};
+/// The worker world: one instance inside each worker. When a worker's passes
+/// run, and where its state sits within it.
+pub mod worker {
+    use crate::{By, Change, Edge, Exit, Id, OffloadEvent};
 
-    pub use crate::bindings::plex::policy::engine_writes::{
-        discard, install_retention, install_schedule,
+    pub use crate::bindings::plex::policy::worker_writes::{
+        discard, install_offload, install_retention, install_schedule, publish,
     };
 
     /// One handler per edge kind, then [`Policy::plan`]; every method defaults
@@ -160,6 +162,8 @@ pub mod engine {
         fn on_exited(&mut self, _exit: &Exit) {}
         fn on_retained(&mut self, _working_set: &Id) {}
         fn on_discarded(&mut self, _working_set: &Id, _by: By) {}
+        fn on_offloaded(&mut self, _offload: &OffloadEvent) {}
+        fn on_offload_failed(&mut self, _process: &Id) {}
         fn on_prop_changed(&mut self, _change: &Change) {}
         fn on_closed(&mut self, _session: &Id) {}
         fn on_timer(&mut self) {}
@@ -179,32 +183,55 @@ pub mod engine {
                 Edge::Exited(exit) => policy.on_exited(exit),
                 Edge::Retained(working_set) => policy.on_retained(working_set),
                 Edge::Discarded(t) => policy.on_discarded(&t.subject, t.by),
+                Edge::Offloaded(offload) => policy.on_offloaded(offload),
+                Edge::OffloadFailed(process) => policy.on_offload_failed(process),
                 Edge::PropChanged(change) => policy.on_prop_changed(change),
                 Edge::Closed(session) => policy.on_closed(session),
                 Edge::Timer => policy.on_timer(),
-                // Router edges: an engine host does not send them.
-                Edge::Dispatched(_) | Edge::WorkerRemoved(_) | Edge::WorkerDraining(_) => {}
+                // Cluster edges: a worker host does not send them.
+                Edge::Dispatched(_)
+                | Edge::WorkerRemoved(_)
+                | Edge::WorkerDraining(_)
+                | Edge::Migrated(_)
+                | Edge::MigrationFailed(_)
+                | Edge::Copied(_)
+                | Edge::Dropped(_)
+                | Edge::TierPressure(_)
+                | Edge::LinkChanged(_) => {}
             }
         }
         policy.plan(now_ms);
     }
 }
 
-/// The router world: one instance in the gateway.
-pub mod router {
-    use crate::{Change, Dispatch, Edge, Exit, Id};
+/// The cluster world: one instance in the gateway. Where programs and their
+/// state live.
+pub mod cluster {
+    use crate::{Change, Dispatch, Edge, Exit, Id, Residency};
 
-    pub use crate::bindings::plex::policy::router_writes::{install_placement, install_schedule};
+    pub use crate::bindings::plex::policy::cluster_writes::{
+        install_placement, install_scale, install_schedule,
+    };
+    pub use crate::bindings::plex::policy::state_writes::{
+        discard, install_acceptance, install_replication, install_retention,
+        install_transfer_shares,
+    };
 
     /// One handler per edge kind, then [`Policy::plan`].
     pub trait Policy: Default + 'static {
         fn on_arrived(&mut self, _process: &Id) {}
         fn on_dispatched(&mut self, _dispatch: &Dispatch) {}
+        fn on_migrated(&mut self, _dispatch: &Dispatch) {}
+        fn on_migration_failed(&mut self, _process: &Id) {}
         fn on_exited(&mut self, _exit: &Exit) {}
         fn on_prop_changed(&mut self, _change: &Change) {}
         fn on_closed(&mut self, _session: &Id) {}
         fn on_worker_removed(&mut self, _worker: &Id) {}
         fn on_worker_draining(&mut self, _worker: &Id) {}
+        fn on_copied(&mut self, _residency: &Residency) {}
+        fn on_dropped(&mut self, _residency: &Residency) {}
+        fn on_tier_pressure(&mut self, _worker: &Id) {}
+        fn on_link_changed(&mut self, _link: &Id) {}
         fn on_timer(&mut self) {}
 
         fn plan(&mut self, _now_ms: u64) {}
@@ -216,33 +243,44 @@ pub mod router {
             match edge {
                 Edge::Arrived(process) => policy.on_arrived(process),
                 Edge::Dispatched(dispatch) => policy.on_dispatched(dispatch),
+                Edge::Migrated(dispatch) => policy.on_migrated(dispatch),
+                Edge::MigrationFailed(process) => policy.on_migration_failed(process),
                 Edge::Exited(exit) => policy.on_exited(exit),
                 Edge::PropChanged(change) => policy.on_prop_changed(change),
                 Edge::Closed(session) => policy.on_closed(session),
                 Edge::WorkerRemoved(worker) => policy.on_worker_removed(worker),
                 Edge::WorkerDraining(worker) => policy.on_worker_draining(worker),
+                Edge::Copied(residency) => policy.on_copied(residency),
+                Edge::Dropped(residency) => policy.on_dropped(residency),
+                Edge::TierPressure(worker) => policy.on_tier_pressure(worker),
+                Edge::LinkChanged(link) => policy.on_link_changed(link),
                 Edge::Timer => policy.on_timer(),
-                // Engine edges: a router host does not send them.
-                Edge::Started(_) | Edge::Paused(_) | Edge::Retained(_) | Edge::Discarded(_) => {}
+                // Worker edges: a cluster host does not send them.
+                Edge::Started(_)
+                | Edge::Paused(_)
+                | Edge::Retained(_)
+                | Edge::Discarded(_)
+                | Edge::Offloaded(_)
+                | Edge::OffloadFailed(_) => {}
             }
         }
         policy.plan(now_ms);
     }
 }
 
-/// Exports `$policy`, an [`engine::Policy`], as an engine-world component.
+/// Exports `$policy`, a [`worker::Policy`], as a worker-world component.
 #[macro_export]
-macro_rules! engine {
+macro_rules! worker {
     ($policy:ty) => {
-        $crate::__policy!($policy, engine);
+        $crate::__policy!($policy, worker);
     };
 }
 
-/// Exports `$policy`, a [`router::Policy`], as a router-world component.
+/// Exports `$policy`, a [`cluster::Policy`], as a cluster-world component.
 #[macro_export]
-macro_rules! router {
+macro_rules! cluster {
     ($policy:ty) => {
-        $crate::__policy!($policy, router);
+        $crate::__policy!($policy, cluster);
     };
 }
 

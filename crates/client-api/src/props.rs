@@ -16,7 +16,9 @@ use serde_json::Value;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Props(pub BTreeMap<String, Value>);
 
-pub const ROUTER_PREFIX: &str = "router/";
+/// Props under this prefix are the cluster policy's, passed on with a
+/// placement; a client cannot set them.
+pub const CLUSTER_PREFIX: &str = "cluster/";
 
 pub const MAX_PROPS: usize = 64;
 pub const MAX_NAME_BYTES: usize = 128;
@@ -72,7 +74,7 @@ pub fn check_session(session: Option<&str>) -> Result<(), String> {
 }
 
 pub fn from_client(props: &mut Props) -> Result<(), String> {
-    props.retain(|name, value| !name.starts_with(ROUTER_PREFIX) && !value.is_null());
+    props.retain(|name, value| !name.starts_with(CLUSTER_PREFIX) && !value.is_null());
     if props.len() > MAX_PROPS {
         return Err(format!("{} props, limit {MAX_PROPS}", props.len()));
     }
@@ -264,7 +266,7 @@ mod tests {
     fn a_client_sets_any_name_but_the_routers_within_the_limits() {
         let mut given = props(json!({
             "priority": 3,
-            "router/priority": 9,
+            "cluster/priority": 9,
             "deadline": null,
             "tags": ["a", "b"],
         }));
@@ -333,7 +335,7 @@ mod tests {
             "tier": null,
             "keep": true,
             "new": [1],
-            "router/priority": 9,
+            "cluster/priority": 9,
         }));
         let (merged, mut changed) = merge(&current, changes).unwrap();
         assert_eq!(
@@ -383,7 +385,7 @@ mod tests {
             capture_outputs: true,
             props: Props::new(),
             session: Some("conv-1".into()),
-            router_props: Props::new(),
+            cluster_props: Props::new(),
         };
         for bytes in [
             rmp_serde::to_vec(&bare).unwrap(),

@@ -48,6 +48,118 @@ impl GatewayControl for ControlClient {
     }
 }
 
+/// A link to the controller that is dialed again when it goes, so a
+/// controller restarted on its address is found again: the routing watch
+/// starts over, and the next heartbeat hears it does not know this gateway,
+/// which registers again under its id.
+#[derive(Clone)]
+pub struct Controller {
+    addr: std::sync::Arc<str>,
+    client: std::sync::Arc<std::sync::Mutex<(ControlClient, u64)>>,
+    dialing: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Controller {
+    pub async fn connect(addr: &str) -> Result<Self> {
+        let client = connect_controller(addr).await?;
+        Ok(Self {
+            addr: addr.into(),
+            client: std::sync::Arc::new(std::sync::Mutex::new((client, 0))),
+            dialing: Default::default(),
+        })
+    }
+
+    /// The client, and which dial it came from.
+    fn client(&self) -> (ControlClient, u64) {
+        self.client.lock().unwrap().clone()
+    }
+
+    /// After `error` on the link from dial `seen`: if the link is gone,
+    /// dials again, unless another caller already has.
+    async fn heal(&self, error: &tarpc::client::RpcError, seen: u64) {
+        if !matches!(error, tarpc::client::RpcError::Shutdown) {
+            return;
+        }
+        let _dialing = self.dialing.lock().await;
+        if self.client().1 != seen {
+            return;
+        }
+        match connect_controller(&self.addr).await {
+            Ok(client) => {
+                *self.client.lock().unwrap() = (client, seen + 1);
+                tracing::info!(controller = %self.addr, "dialed the controller again");
+            }
+            Err(e) => tracing::debug!(error = %format!("{e:#}"), "the controller is not back yet"),
+        }
+    }
+}
+
+impl GatewayControl for Controller {
+    async fn register_gateway(&self, info: GatewayInfo) -> Result<GatewayId> {
+        let (client, seen) = self.client();
+        match client
+            .register_gateway(tarpc::context::current(), info)
+            .await
+        {
+            Ok(id) => Ok(id),
+            Err(e) => {
+                self.heal(&e, seen).await;
+                Err(e).context("register_gateway rpc")
+            }
+        }
+    }
+
+    async fn heartbeat(&self, id: NodeId) -> Result<Ack> {
+        let (client, seen) = self.client();
+        match client.heartbeat(tarpc::context::current(), id).await {
+            Ok(ack) => Ok(ack),
+            Err(e) => {
+                self.heal(&e, seen).await;
+                Err(e).context("heartbeat rpc")
+            }
+        }
+    }
+
+    fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
+        let (tx, rx) = watch::channel(RoutingTable {
+            epoch: 0,
+            workers: Vec::new(),
+        });
+        let control = self.clone();
+        tokio::spawn(async move {
+            let mut since: u64 = 0;
+            loop {
+                let (client, seen) = control.client();
+                let mut ctx = tarpc::context::current();
+                ctx.deadline = Instant::now() + WATCH_DEADLINE;
+                match client.watch_gateway(ctx, since).await {
+                    Ok(table) => {
+                        since = table.epoch;
+                        tracing::debug!(
+                            epoch = since,
+                            workers = table.workers.len(),
+                            "routing table updated"
+                        );
+                        if tx.send(table).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "watch_gateway error; retrying");
+                        control.heal(&e, seen).await;
+                        if control.client().1 != seen {
+                            // A new controller counts its epochs afresh.
+                            since = 0;
+                        }
+                        tokio::time::sleep(WATCH_RETRY_BACKOFF).await;
+                    }
+                }
+            }
+        });
+        rx
+    }
+}
+
 pub(crate) async fn heartbeat_loop<C: GatewayControl>(
     control: C,
     mut id: GatewayId,
@@ -60,7 +172,11 @@ pub(crate) async fn heartbeat_loop<C: GatewayControl>(
             Ok(Ack::Ok) => {}
             Ok(Ack::ReRegister) => {
                 tracing::warn!(%id, "controller lost our registration; re-registering");
-                match control.register_gateway(info.clone()).await {
+                let again = GatewayInfo {
+                    prior: Some(id),
+                    ..info.clone()
+                };
+                match control.register_gateway(again).await {
                     Ok(new_id) => {
                         id = new_id;
                         tracing::info!(%id, "gateway re-registered");
