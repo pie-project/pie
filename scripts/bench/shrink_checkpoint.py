@@ -2035,7 +2035,8 @@ def assign_rows(pairs: list[tuple[str, str]], src: dict[str, SrcTensor],
         t = src[src_name]
         ot = OutTensor(out_name, t)
         if router_rows is not None:
-            tail = out_name.split(plan.layer_prefix, 1)[-1]
+            # The source name: `--text-only` re-roots the output's.
+            tail = src_name.split(plan.layer_prefix, 1)[-1]
             tail = tail.split(".", 1)[-1] if "." in tail else tail
             if src_name.startswith("mtp."):
                 # A DSpark stage's router, after its `mtp.<stage>.`.
