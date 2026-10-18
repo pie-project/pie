@@ -314,22 +314,41 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
             if (lane == 0) shared_rows[n % 2] = w;
             __syncwarp();
             if (lane == 0) bar_arrive(&row_full[n % 2]);
-            for (int j = 0; j < w.nt; ++j, ++J) {
-                if (J >= kLists) bar_wait(&list_free[J % kLists], ((J / kLists) - 1) & 1);
-                u32* l = lists + (J % kLists) * kBK;
-                for (int c = static_cast<int>(lane); c < kBK; c += 32) {
-                    const int k = (w.j0 + j) * kBK + c;
-                    u32 e = kSlotMask;
-                    if (k < w.entries) {
-                        const int id = w.dense ? k : w.sel[k];
-                        if (id >= 0 && id <= w.last) {
-                            e = static_cast<u32>(row_in(w.pages, id, p.page)) | kValid;
-                        }
+            // Four tiles' ids a round, then their pool rows, every load of a
+            // round in flight at once: a tile's list costs a round's two
+            // latencies over four, not two of its own.
+            constexpr int kRound = 4;
+            for (int j0 = 0; j0 < w.nt; j0 += kRound) {
+                int id[kRound][kBK / 32];
+#pragma unroll
+                for (int b = 0; b < kRound; ++b) {
+#pragma unroll
+                    for (int c = 0; c < kBK / 32; ++c) {
+                        const int k = (w.j0 + j0 + b) * kBK + c * 32 + static_cast<int>(lane);
+                        id[b][c] = j0 + b < w.nt && k < w.entries ? (w.dense ? k : __ldg(w.sel + k)) : -1;
                     }
-                    l[c] = e;
                 }
-                __syncwarp();
-                if (lane == 0) bar_arrive(&list_full[J % kLists]);
+                u32 e[kRound][kBK / 32];
+#pragma unroll
+                for (int b = 0; b < kRound; ++b) {
+#pragma unroll
+                    for (int c = 0; c < kBK / 32; ++c) {
+                        e[b][c] = id[b][c] >= 0 && id[b][c] <= w.last
+                            ? static_cast<u32>(row_in(w.pages, id[b][c], p.page)) | kValid
+                            : kSlotMask;
+                    }
+                }
+#pragma unroll
+                for (int b = 0; b < kRound; ++b) {
+                    if (j0 + b >= w.nt) break;
+                    if (J >= kLists) bar_wait(&list_free[J % kLists], ((J / kLists) - 1) & 1);
+                    u32* l = lists + (J % kLists) * kBK;
+#pragma unroll
+                    for (int c = 0; c < kBK / 32; ++c) l[c * 32 + static_cast<int>(lane)] = e[b][c];
+                    __syncwarp();
+                    if (lane == 0) bar_arrive(&list_full[J % kLists]);
+                    ++J;
+                }
             }
         }
     } else if (warp == 4 || warp >= 6) {
