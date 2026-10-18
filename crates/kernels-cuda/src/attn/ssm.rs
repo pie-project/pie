@@ -1059,7 +1059,7 @@ fn gated_delta_chunked_fla(
     let scan_smem = scan_smem(k_dim);
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::attn::ssm_chunk_scan<64, false>").apply(
+        Fire::at(FILE, "::pie::attn::ssm_chunk_scan<64>").apply(
             Launch::grid(
                 [lanes * v_heads * (v_dim / SCAN_BV), 1, 1],
                 [2 * BLOCK, 1, 1],
@@ -1771,10 +1771,11 @@ struct KdaGates {
     floor: f32,
 }
 
-/// [`kda_chunked`] on the tensor cores: a block per (chunk, head) lands the
-/// chunk's decayed queries and fold keys, its update directions `w` and `u`
-/// and its decayed causal scores; then a block per (request, head, 64 value
-/// columns) walks the chunks with the state in f32. 128-wide heads.
+/// [`kda_chunked`] on the tensor cores in sixteen-token chunks: two warps a
+/// (chunk, head) land the chunk's decayed queries and fold keys, its decay,
+/// its update directions `w` and `u` and its decayed causal scores; then a
+/// block a (request, head, 64 value columns) walks the chunks with the state
+/// in f32. 128-wide heads.
 #[allow(clippy::too_many_arguments)]
 fn kda_chunked_mma(
     ctx: &Ctx,
@@ -1787,12 +1788,16 @@ fn kda_chunked_mma(
     lanes: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const CH: u32 = 64;
+    const CH: u32 = 16;
     const D: u32 = 128;
+    const TASKS: u32 = 2;
+    // `KDA16_TASK_SMEM` and `KDA16_SCAN_SMEM`.
     const LD: u32 = 136;
-    const LDC: u32 = 72;
-    const LDF: u32 = 132;
-    const BV: u32 = 64;
+    const LDT: u32 = 24;
+    const LDV: u32 = 72;
+    const TASK_SMEM: u32 = 3 * CH * LD * 2 + CH * (CH + 1) * FLOAT + CH * LDT * 2 + 3 * D * FLOAT;
+    const STAGE: u32 = 3 * CH * LD * 2 + CH * LDV * 2 + CH * LDT * 2 + D * FLOAT;
+    const SCAN_SMEM: u32 = 2 * STAGE + D * LDV * 2 + CH * LDV * 2;
     let heads = shape.heads;
     let slots = shape.n.div_ceil(CH) + lanes;
     let rows = u64::from(shape.n + CH) * u64::from(heads) * u64::from(D);
@@ -1812,13 +1817,12 @@ fn kda_chunked_mma(
         "attn.ssm_kda_chunk_gl",
         u64::from(slots) * u64::from(heads) * u64::from(D),
     )?;
-    // Four regions reused as the chunk goes on (`KDA_PREP_SMEM`), so two
-    // blocks share an SM.
-    let prep_smem = 3 * CH * LD * 2 + (CH + 32) * LD * 2 + CH * LDF * FLOAT + CH * FLOAT;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::attn::ssm_kda_chunk_prep")
-            .apply(Launch::grid([heads, slots, 1], [256, 1, 1]).smem(prep_smem)),
+        Fire::at(FILE, "::pie::attn::ssm_kda16_prep").apply(
+            Launch::grid([heads.div_ceil(TASKS), slots, 1], [TASKS * 2 * WARP, 1, 1])
+                .smem(TASKS * TASK_SMEM),
+        ),
         &[
             mixed.data.arg(),
             norm_eps.arg(),
@@ -1842,12 +1846,10 @@ fn kda_chunked_mma(
             ctx.stage(),
         ],
     )?;
-    let ldv = BV + 8;
-    let scan_smem = (3 * CH * LD + CH * ldv + CH * LDC + D * ldv + CH * ldv) * 2 + 2 * D * FLOAT;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::attn::ssm_chunk_scan<64, true>")
-            .apply(Launch::grid([lanes * heads * (D / BV), 1, 1], [256, 1, 1]).smem(scan_smem)),
+        Fire::at(FILE, "::pie::attn::ssm_kda16_scan")
+            .apply(Launch::grid([lanes * heads * (D / 64), 1, 1], [128, 1, 1]).smem(SCAN_SMEM)),
         &[
             ArgValue::Ptr(gl),
             ArgValue::Ptr(qg),
@@ -1865,7 +1867,6 @@ fn kda_chunked_mma(
             state.write_state_mask.arg(),
             y.arg(),
             stated(op, lanes)?.arg(),
-            stated(op, heads)?.arg(),
             stated(op, heads)?.arg(),
             ctx.stage(),
         ],
