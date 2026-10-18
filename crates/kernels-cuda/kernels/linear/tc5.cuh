@@ -283,10 +283,11 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     const int inter = epi.inter;
     constexpr u32 kM = 128 * kPair;
     constexpr u32 kQRows = kBN / kPair;
-    // A swapped NVFP4 launch of one P tile (a decode's down leg streaming
-    // its weight) reads 512 K a stage as two 128-byte boxes a tile, four
-    // 64-K MMAs a box.
-    constexpr u32 kBoxes = kKind == 3 && kSwap && kPT == 1 ? 2 : 1;
+    // A swapped block-scaled launch of one P tile (a decode streaming its
+    // weight) reads two 128-byte boxes a tile a stage (512 K NVFP4, 256 K
+    // mx), four MMAs a box: half the stages, and each weight row's two
+    // boxes adjacent in memory.
+    constexpr u32 kBoxes = kKind >= 2 && kSwap && kPT == 1 ? 2 : 1;
     constexpr u32 kStageK = tc5k::stage_k(kKind) * kBoxes;
     constexpr u32 kInstrK = tc5k::stage_k(kKind) / 4;
     constexpr u32 kInner = kKind == 0 ? 64 : 128;  // TMA box width, in the map's elements

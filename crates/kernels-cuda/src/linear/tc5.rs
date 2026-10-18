@@ -152,12 +152,12 @@ impl Kind {
         }
     }
 
-    /// The 128-byte TMA boxes a tile row takes a stage: a swapped NVFP4
-    /// launch of one P tile (a decode's down leg streaming its weight) two,
-    /// 512 K.
+    /// The 128-byte TMA boxes a tile row takes a stage: a swapped
+    /// block-scaled launch of one P tile (a decode streaming its weight)
+    /// two, 512 K NVFP4 or 256 K mx.
     const fn boxes(self, swap: bool, pt: u32) -> u32 {
         match self {
-            Self::Nvf4 if swap && pt == 1 => 2,
+            Self::Nvf4 | Self::Mx if swap && pt == 1 => 2,
             _ => 1,
         }
     }
