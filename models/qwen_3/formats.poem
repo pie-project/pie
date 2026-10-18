@@ -3,6 +3,7 @@
 # also states its rotation's sign diagonals in its metadata, which its
 # contract carries as constants.
 
+load("//lib/blockfp8/formats.poem", "fp8_bank", "fp8_proj", "fp8_read", "released_fp8")
 load("//lib/dflash/formats.poem", "bind_aux")
 
 # The Bonsai GGUF's rotation metadata.
@@ -76,33 +77,55 @@ def norm_of(layout):
         return lambda name: src(name).bias(-1.0)
     return lambda name: src(name)
 
+# A projection declared at the release's block FP8 reads its e4m3 codes and
+# `*.weight_scale_inv` factors as stored (`//lib/blockfp8`); any other, as
+# it always has.
+
+def read_proj(reads, w, name):
+    if fp8_proj(w):
+        fp8_read(reads, w, [name])
+    else:
+        reads.read(w, name)
+
+def read_joined(reads, w, names):
+    if fp8_proj(w):
+        fp8_read(reads, w, names)
+    else:
+        reads.read_concat(w, names)
+
 def read_attn(reads, a, n, norm):
-    reads.read(a.qg_proj, n("self_attn.q_proj.weight"))
-    reads.read(a.k_proj, n("self_attn.k_proj.weight"))
-    reads.read(a.v_proj, n("self_attn.v_proj.weight"))
-    reads.read(a.o_proj, n("self_attn.o_proj.weight"))
+    read_proj(reads, a.qg_proj, n("self_attn.q_proj.weight"))
+    read_proj(reads, a.k_proj, n("self_attn.k_proj.weight"))
+    read_proj(reads, a.v_proj, n("self_attn.v_proj.weight"))
+    read_proj(reads, a.o_proj, n("self_attn.o_proj.weight"))
     reads.read_expr(a.q_norm, norm(n("self_attn.q_norm.weight")))
     reads.read_expr(a.k_norm, norm(n("self_attn.k_norm.weight")))
 
 def read_gdn(reads, g, n):
-    reads.read_concat(g.in_qkvz, [n("linear_attn.in_proj_qkv.weight"), n("linear_attn.in_proj_z.weight")])
+    read_joined(reads, g.in_qkvz, [n("linear_attn.in_proj_qkv.weight"), n("linear_attn.in_proj_z.weight")])
     reads.read_concat(g.in_ba, [n("linear_attn.in_proj_b.weight"), n("linear_attn.in_proj_a.weight")])
     reads.read_expr(g.conv, squeezed(n("linear_attn.conv1d.weight")))
     reads.read(g.dt_bias, n("linear_attn.dt_bias"))
     reads.read(g.a_log, n("linear_attn.A_log"))
     reads.read(g.norm, n("linear_attn.norm.weight"))
-    reads.read(g.out_proj, n("linear_attn.out_proj.weight"))
+    read_proj(reads, g.out_proj, n("linear_attn.out_proj.weight"))
 
 def read_routed(reads, f, n, layout):
     reads.read(f.router, n("mlp.gate.weight"))
     if layout.mlx:
         reads.read_concat(f.gate_up, [n("mlp.switch_mlp.gate_proj.weight"), n("mlp.switch_mlp.up_proj.weight")])
         reads.read(f.down, n("mlp.switch_mlp.down_proj.weight"))
+    elif released_fp8(f.gate_up):
+        # The FP8 release stores each expert apart, its legs FP8 beside
+        # their block factors.
+        e = lambda i, s: n("mlp.experts.{}.{}.weight".format(i, s))
+        fp8_bank(reads, f.gate_up, [[e(i, "gate_proj"), e(i, "up_proj")] for i in range(f.experts)])
+        fp8_bank(reads, f.down, [[e(i, "down_proj")] for i in range(f.experts)])
     else:
         reads.read(f.gate_up, n("mlp.experts.gate_up_proj"))
         reads.read(f.down, n("mlp.experts.down_proj"))
-    reads.read_concat(f.shared_gate_up, [n("mlp.shared_expert.gate_proj.weight"), n("mlp.shared_expert.up_proj.weight")])
-    reads.read(f.shared_down, n("mlp.shared_expert.down_proj.weight"))
+    read_joined(reads, f.shared_gate_up, [n("mlp.shared_expert.gate_proj.weight"), n("mlp.shared_expert.up_proj.weight")])
+    read_proj(reads, f.shared_down, n("mlp.shared_expert.down_proj.weight"))
     reads.read(f.shared_gate, n("mlp.shared_expert_gate.weight"))
 
 CHANNELS = 3

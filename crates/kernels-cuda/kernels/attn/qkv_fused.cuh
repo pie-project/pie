@@ -451,14 +451,17 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     const int r = blockIdx.x;
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const int row = win != nullptr ? r + static_cast<int>(win[1]) : r;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     if (threadIdx.x == 0) {
-        // The packed row on its way into L2 under the rotation's setup.
+        // The packed row on its way into L2 under the rotation's setup (the
+        // bulk prefetch is sm_90's; below it the row is read as it comes).
         const int width = num_q_heads * qk_width + num_kv_heads * (qk_width + v_width);
         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(
                          packed + static_cast<long long>(row) * width),
                      "r"(static_cast<unsigned>(width) * 2u)
                      : "memory");
     }
+#endif
     const int pos = positions != nullptr ? positions[row] : 0;
     for (int dim_pair = threadIdx.x; dim_pair < span; dim_pair += blockDim.x) {
         const float freq = powf(theta, -static_cast<float>(dim_pair) / static_cast<float>(span));
