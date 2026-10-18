@@ -751,6 +751,102 @@ pub(crate) fn lay_out(
     lay_out_with(ctx, op, routes, experts, align, Some(distinct), &[])
 }
 
+/// The most routes and experts [`lay_out_quant_nvfp4`] takes in one launch.
+pub(crate) const FUSED_ROUTES: u32 = 1024;
+pub(crate) const FUSED_EXPERTS: u32 = 256;
+
+/// [`lay_out_with`] contiguous (each expert's rows `align` apart) and the
+/// NVFP4 quantize of `x`'s tokens to their routes' rows (`codes`, atoms in
+/// `atoms`) under `input_scales` in one launch, for a fire of at most
+/// [`FUSED_ROUTES`] routes over [`FUSED_EXPERTS`] experts; each leg's alpha
+/// laid as [`lay_out_with`] lays it. The layout's rows are
+/// [`contiguous_rows`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lay_out_quant_nvfp4(
+    ctx: &Ctx,
+    op: &'static str,
+    routes: Tensor,
+    experts: u32,
+    align: u32,
+    alphas: [(AlphaFrom, u64); 2],
+    x: Tensor,
+    input_scales: Tensor,
+    codes: u64,
+    atoms: u64,
+) -> Result<Layout, Error> {
+    let count = routes.rows * routes.width;
+    let k = x.width;
+    if count > FUSED_ROUTES
+        || experts > FUSED_EXPERTS
+        || !k.is_multiple_of(16)
+        || x.rows < routes.rows
+    {
+        return Err(refuse(
+            op,
+            "the fused layout takes 1024 routes over 256 experts, k a whole number of 16s",
+        ));
+    }
+    let e = experts as usize;
+    let i32s = |name, len: usize| -> Result<u64, Error> {
+        Ok(ctx.scratch_stream(op, name, len * 4)? as u64)
+    };
+    let counts = i32s(ROUTE_COUNTS, e)?;
+    let offsets = i32s(ROUTE_OFFSETS, e + 1)?;
+    let pos = i32s(ROUTE_POS, count as usize)?;
+    let int = |v: u32| stated(op, v).map(|v| v.arg());
+    let items = count * (k / 16);
+    let grid = items
+        .div_ceil(256)
+        .clamp(1, 4 * ctx.multiprocessors().unwrap_or(148));
+    let smem = (33 * experts + count) * 4;
+    let [(up, up_alpha), (down, down_alpha)] = alphas;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::route_lay_out_quant_nvfp4").apply(
+            Launch::grid([grid, 1, 1], [256, 1, 1])
+                .smem(smem)
+                .programmatic(ctx.tuning().pdl),
+        ),
+        &[
+            routes.arg(),
+            int(count)?,
+            int(routes.width)?,
+            ctx.stage(),
+            int(experts)?,
+            int(align)?,
+            ArgValue::Ptr(counts),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(pos),
+            ArgValue::Ptr(up.tensor_scales),
+            ArgValue::Ptr(up_alpha),
+            int(up.rows)?,
+            ArgValue::Ptr(down.tensor_scales),
+            ArgValue::Ptr(down.input_scales),
+            ArgValue::Ptr(down_alpha),
+            int(down.rows)?,
+            x.arg(),
+            input_scales.arg(),
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            int(k)?,
+        ],
+    )?;
+    let rows = contiguous_rows(count, experts, align);
+    Ok(Layout {
+        pos,
+        rows,
+        groups: tc5::Groups::Contiguous { offsets, rows },
+        m_max: 0,
+        counts,
+    })
+}
+
+/// The rows a contiguous layout of `count` routes over `experts` holds,
+/// each expert's start `align` apart.
+pub(crate) fn contiguous_rows(count: u32, experts: u32, align: u32) -> u32 {
+    (count + (align - 1) * experts.min(count)).next_multiple_of(align)
+}
+
 /// [`lay_out`], laying NVFP4's per-expert alpha too for each leg `alphas`
 /// names the sources and destination of (at most two): in the narrow
 /// fire's one launch, else apart. `distinct` `None`: contiguous however
@@ -791,7 +887,7 @@ pub(crate) fn lay_out_with(
             }
         } else {
             // Each expert's rows start a whole alignment apart.
-            let rows = (count + (align - 1) * experts.min(count)).next_multiple_of(align);
+            let rows = contiguous_rows(count, experts, align);
             Layout {
                 pos,
                 rows,

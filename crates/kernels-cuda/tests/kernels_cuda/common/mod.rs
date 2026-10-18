@@ -316,6 +316,7 @@ pub const SM100: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {
     mxfp4_cvt_ksplit_until: 6,
     mxfp4_a8_until: 48,
     moe_w4a4_fused_from: 1,
+    moe_w4a4_fused_layout: true,
     moe_w4a8_fused_from: 512,
     attn_res_fused_norm: true,
     mla_expanded_from: 256,

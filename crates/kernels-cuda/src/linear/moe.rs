@@ -1025,56 +1025,63 @@ fn experts_w4a4(
         let e = experts as usize;
         let up_alpha = ctx.scratch_stream(OP, UP_ALPHA, e * 4)? as u64;
         let down_alpha = ctx.scratch_stream(OP, DOWN_ALPHA, e * 4)? as u64;
-        let layout = act_quant::lay_out_with(
-            ctx,
-            OP,
-            routes,
-            experts,
-            // An expert's rows start on a 64-row half block: a decode's few
-            // rows an expert fill half the tiles a 128-row block would pad;
-            // contiguous, as the gate-up's NVFP4 epilogue lands its atoms.
-            tc5::GROUP_ALIGN,
-            None,
-            &[
-                (
-                    act_quant::AlphaFrom {
-                        input_scales: up_is.ptr,
-                        tensor_scales: up_ts.ptr,
-                        rows: 2 * inter,
-                    },
-                    up_alpha,
-                ),
-                (
-                    act_quant::AlphaFrom {
-                        input_scales: down_is.ptr,
-                        tensor_scales: down_ts.ptr,
-                        rows: n,
-                    },
-                    down_alpha,
-                ),
-            ],
-        )?;
-        let rows = layout.rows as usize;
+        let alphas = [
+            (
+                act_quant::AlphaFrom {
+                    input_scales: up_is.ptr,
+                    tensor_scales: up_ts.ptr,
+                    rows: 2 * inter,
+                },
+                up_alpha,
+            ),
+            (
+                act_quant::AlphaFrom {
+                    input_scales: down_is.ptr,
+                    tensor_scales: down_ts.ptr,
+                    rows: n,
+                },
+                down_alpha,
+            ),
+        ];
+        // An expert's rows start on a 64-row half block: a decode's few rows
+        // an expert fill half the tiles a 128-row block would pad; contiguous,
+        // as the gate-up's NVFP4 epilogue lands its atoms.
+        let align = tc5::GROUP_ALIGN;
+        // A narrow fire lays its routes out and quantizes their rows in one
+        // launch where the profile says (`kernel.moe.w4a4_fused_layout`).
+        let fused = ctx.tuning().moe_w4a4_fused_layout
+            && count <= act_quant::FUSED_ROUTES
+            && experts <= act_quant::FUSED_EXPERTS;
+        let rows = act_quant::contiguous_rows(count, experts, align) as usize;
         let xq = ctx.scratch_stream(OP, W4A4_X, rows * k as usize / 2)? as u64;
         let x_atom_bytes = tc5::atom_bytes(rows, k as usize, 16);
         let xs = act_quant::atoms_of(ctx, OP, W4A4_XS, x_atom_bytes)?;
-        act_quant::quantize(
-            ctx,
-            OP,
-            act_quant::Format::Nvfp4,
-            act_quant::Source {
-                x,
-                rows: count,
-                div: routes.width,
-                routes: Some(routes),
-                input_scales: Some(up_is),
-                pos: layout.pos,
-                m_max: 0,
-            },
-            xq,
-            xs,
-            x_atom_bytes,
-        )?;
+        let layout = if fused {
+            act_quant::lay_out_quant_nvfp4(
+                ctx, OP, routes, experts, align, alphas, x, up_is, xq, xs,
+            )?
+        } else {
+            let layout = act_quant::lay_out_with(ctx, OP, routes, experts, align, None, &alphas)?;
+            act_quant::quantize(
+                ctx,
+                OP,
+                act_quant::Format::Nvfp4,
+                act_quant::Source {
+                    x,
+                    rows: count,
+                    div: routes.width,
+                    routes: Some(routes),
+                    input_scales: Some(up_is),
+                    pos: layout.pos,
+                    m_max: 0,
+                },
+                xq,
+                xs,
+                x_atom_bytes,
+            )?;
+            layout
+        };
+        let rows = layout.rows as usize;
         let hq = ctx.scratch_stream(OP, W4A4_H, rows * inter as usize / 2)? as u64;
         let hs = ctx.scratch_stream(OP, W4A4_HS, tc5::atom_bytes(rows, inter as usize, 16))? as u64;
         let grouped_up = tc5::Grouped {

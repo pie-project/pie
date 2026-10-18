@@ -116,6 +116,12 @@ pub struct MoeW4a4FusedFrom(pub u32);
 #[decision(id = "kernel.attn.qkv_rows_from", constant(range(1..=65_536)), default = 64, tune = search)]
 pub struct AttnQkvRowsFrom(pub u32);
 
+/// Whether a narrow W4A4 routed MLP lays its routes out and quantizes their
+/// rows in one launch. Off but where a chip's profile turns it on (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.w4a4_fused_layout", flag, default = false, tune = search)]
+pub struct MoeW4a4FusedLayout;
+
 /// Whether a KDA prefill walks its chunks on the tensor cores (a chunk's
 /// update directions in parallel, then the state chunk by chunk) instead of
 /// a row at a time. Off but where a chip's profile turns it on (B200's): it
@@ -647,6 +653,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmFp8MmaGemvUntil>()
         .add::<AttnResFusedNorm>()
         .add::<SsmKdaChunked>()
+        .add::<MoeW4a4FusedLayout>()
         .add::<AttnQkvRowsFrom>()
         .add::<SsmKdaStepFused>()
         .add::<GemmSplitLaunchNs>()
@@ -761,6 +768,7 @@ tuning! {
     gemm_fp8_mma_gemv_until: u32 = 0, get GemmFp8MmaGemvUntil;
     attn_res_fused_norm: bool = false, on AttnResFusedNorm;
     ssm_kda_chunked: bool = false, on SsmKdaChunked;
+    moe_w4a4_fused_layout: bool = false, on MoeW4a4FusedLayout;
     qkv_rows_from: u32 = 64, get AttnQkvRowsFrom;
     ssm_kda_step_fused: bool = false, on SsmKdaStepFused;
     gemm_split_launch_ns: u32 = 0, get GemmSplitLaunchNs;

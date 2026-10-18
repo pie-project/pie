@@ -93,6 +93,36 @@ __device__ __forceinline__ float global_of(const float* __restrict__ input_scale
     return __fdiv_rn(1.f, input_scales[e]);
 }
 
+// A 16-wide bf16 block read to `v`; its largest magnitude.
+__device__ __forceinline__ float load_block16(const bf16* __restrict__ x, float (&v)[16]) {
+    uint4 raw[2];
+    raw[0] = reinterpret_cast<const uint4*>(x)[0];
+    raw[1] = reinterpret_cast<const uint4*>(x)[1];
+    const bf16* h = reinterpret_cast<const bf16*>(raw);
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        v[i] = bf16_to_f32(h[i]);
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+    return amax;
+}
+
+// A 16-wide block's e2m1 codes `w` under global `gs`; its scale's e4m3 code.
+__device__ __forceinline__ u8 nvfp4_block16(const float (&v)[16], float amax, float gs, uint2& w) {
+    const u8 sf_code = __nv_cvt_float_to_fp8(gs * (amax * rcp_approx_ftz(6.f)), __NV_SATFINITE, __NV_E4M3);
+    const float sf_value = e4m3_value(sf_code);
+    const float out_scale = sf_value != 0.f ? rcp_approx_ftz(sf_value * rcp_approx_ftz(gs)) : 0.f;
+    u32 c[2] = {0u, 0u};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const u32 byte = e2m1_code(v[2 * i] * out_scale) | (e2m1_code(v[2 * i + 1] * out_scale) << 4);
+        c[i / 4] |= byte << (8 * (i % 4));
+    }
+    w = make_uint2(c[0], c[1]);
+    return sf_code;
+}
+
 // One thread a 16-wide block. Under `kFan` (codes only) row `r` is a token
 // read once, its block's codes landed at each of its `div` routes' rows
 // (`pos[r * div + j]`) under that route's expert's global, as each route's
@@ -117,18 +147,8 @@ __global__ void act_quant_nvfp4(
     const int r = static_cast<int>(at / blocks);
     const int b = static_cast<int>(at % blocks);
     if constexpr (kFan) {
-        uint4 raw[2];
-        const uint4* src = reinterpret_cast<const uint4*>(x + static_cast<long long>(r) * k + b * 16);
-        raw[0] = src[0];
-        raw[1] = src[1];
-        const bf16* h = reinterpret_cast<const bf16*>(raw);
         float v[16];
-        float amax = 0.f;
-#pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            v[i] = bf16_to_f32(h[i]);
-            amax = fmaxf(amax, fabsf(v[i]));
-        }
+        const float amax = load_block16(x + static_cast<long long>(r) * k + b * 16, v);
         // The routes' globals are one (load lays the experts' largest), so
         // the block's codes are quantized once and land at each route.
         float last_gs = -1.f;
@@ -143,19 +163,7 @@ __global__ void act_quant_nvfp4(
             if (dropped) continue;
             if (gs != last_gs) {
                 last_gs = gs;
-                const float sf = gs * (amax * rcp_approx_ftz(6.f));
-                sf_code = __nv_cvt_float_to_fp8(sf, __NV_SATFINITE, __NV_E4M3);
-                const float sf_value = e4m3_value(sf_code);
-                const float out_scale =
-                    sf_value != 0.f ? rcp_approx_ftz(sf_value * rcp_approx_ftz(gs)) : 0.f;
-                u32 c[2] = {0u, 0u};
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    const u32 byte =
-                        e2m1_code(v[2 * i] * out_scale) | (e2m1_code(v[2 * i + 1] * out_scale) << 4);
-                    c[i / 4] |= byte << (8 * (i % 4));
-                }
-                w = make_uint2(c[0], c[1]);
+                sf_code = nvfp4_block16(v, amax, gs, w);
             }
             *reinterpret_cast<uint2*>(codes + static_cast<long long>(o) * (k / 2) + b * 8) = w;
             atoms[atom_offset(atom_row(o, m_max), b, blocks)] = sf_code;
@@ -637,6 +645,130 @@ __global__ void __launch_bounds__(kOffsetThreads) route_lay_out_small(
     for (int i = 0; i < kSmallPer; ++i) {
         const int r = tid + i * kOffsetThreads;
         if (r < count) pos[r] = rank[i] >= 0 ? start[routes[r]] + rank[i] : -1;
+    }
+}
+
+// `route_lay_out_small` and the NVFP4 quantize of a narrow W4A4 fire (at
+// most 1024 routes over 256 experts) in one launch: every block lays the
+// routes out alike -- a route's rank its 32-route chunk's matches ahead of it
+// past the chunks before -- so each lands the same rows; block 0 lands the
+// layout and the experts' alphas, and each block quantizes its share of the
+// routes' 16-wide blocks to their rows. Dynamic shared memory: `33 * experts`
+// ints for the counts and starts, `count` for the rows.
+__global__ void __launch_bounds__(256) route_lay_out_quant_nvfp4(
+    const i32* __restrict__ routes,
+    int count,
+    int top,
+    const u32* __restrict__ win,
+    int experts,
+    int align,
+    i32* __restrict__ counts,
+    i32* __restrict__ offsets,
+    i32* __restrict__ pos,
+    const float* __restrict__ tensor_scales,
+    float* __restrict__ alpha,
+    int alpha_rows,
+    const float* __restrict__ tensor_scales2,
+    const float* __restrict__ input_scales2,
+    float* __restrict__ alpha2,
+    int alpha_rows2,
+    const bf16* __restrict__ x,
+    const float* __restrict__ input_scales,
+    u8* __restrict__ codes,
+    u8* __restrict__ atoms,
+    int k)
+{
+    // A programmatic dependent (`kernel.pdl`) reads nothing until its
+    // producer is done; its consumer (the gate-up GEMM) may launch from here.
+    pdl_wait();
+    pdl_launch();
+    extern __shared__ int lay[];
+    int* cnt = lay;                     // [32 chunks][experts]
+    int* start = lay + 32 * experts;    // [experts]
+    int* row = start + experts;         // [count]
+    __shared__ int run_sum[8];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31, warp = tid >> 5;
+    const int chunks = (count + 31) / 32;
+    for (int i = tid; i < chunks * experts; i += 256) cnt[i] = 0;
+    __syncthreads();
+    int rank[4], ex[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int c = warp + 8 * i;
+        const int r = c * 32 + lane;
+        int e = -1;
+        if (r < count) {
+            e = routes[r];
+            if (e < 0 || e >= experts || !route_live(r, top, win)) e = -1;
+        }
+        const unsigned m = __match_any_sync(0xffffffffu, e);
+        rank[i] = __popc(m & ((1u << lane) - 1u));
+        ex[i] = e;
+        if (c < chunks && e >= 0 && rank[i] == 0) cnt[c * experts + e] = __popc(m);
+    }
+    __syncthreads();
+    // Each expert's chunks prefixed in place, its rows and start.
+    int rows_e = 0, tally = 0;
+    for (int e = tid; e < experts; e += 256) {
+        for (int c = 0; c < chunks; ++c) {
+            const int v = cnt[c * experts + e];
+            cnt[c * experts + e] = tally;
+            tally += v;
+        }
+        rows_e = (tally + align - 1) / align * align;
+    }
+    // The experts' rows scanned (an expert a thread, experts <= 256).
+    int incl = rows_e;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const int y = __shfl_up_sync(0xffffffffu, incl, off);
+        if (lane >= off) incl += y;
+    }
+    if (lane == 31) run_sum[warp] = incl;
+    __syncthreads();
+    int before = 0;
+    for (int w = 0; w < warp; ++w) before += run_sum[w];
+    if (tid < experts) {
+        start[tid] = before + incl - rows_e;
+        if (blockIdx.x == 0) {
+            offsets[tid] = start[tid];
+            counts[tid] = tally;
+            if (alpha != nullptr)
+                alpha[tid] = input_scales[tid] * tensor_scales[static_cast<long long>(tid) * alpha_rows];
+            if (alpha2 != nullptr)
+                alpha2[tid] = input_scales2[tid] * tensor_scales2[static_cast<long long>(tid) * alpha_rows2];
+        }
+    }
+    if (blockIdx.x == 0 && tid == 255) {
+        int total = 0;
+        for (int w = 0; w < 8; ++w) total += run_sum[w];
+        offsets[experts] = total;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int c = warp + 8 * i;
+        const int r = c * 32 + lane;
+        if (r < count) {
+            const int o = ex[i] >= 0 ? start[ex[i]] + cnt[c * experts + ex[i]] + rank[i] : -1;
+            row[r] = o;
+            if (blockIdx.x == 0) pos[r] = o;
+        }
+    }
+    __syncthreads();
+    // A thread a route's 16-wide block, under its expert's global.
+    const int blocks = k / 16;
+    for (long long at = static_cast<long long>(blockIdx.x) * 256 + tid; at < static_cast<long long>(count) * blocks;
+         at += static_cast<long long>(gridDim.x) * 256) {
+        const int r = static_cast<int>(at / blocks), b = static_cast<int>(at % blocks);
+        const int o = row[r];
+        if (o < 0) continue;
+        float v[16];
+        const float amax = load_block16(x + static_cast<long long>(r / top) * k + b * 16, v);
+        uint2 w;
+        atoms[atom_offset(o, b, blocks)] = nvfp4_block16(v, amax, __fdiv_rn(1.f, input_scales[routes[r]]), w);
+        *reinterpret_cast<uint2*>(codes + static_cast<long long>(o) * (k / 2) + b * 8) = w;
     }
 }
 
