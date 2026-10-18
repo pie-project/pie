@@ -443,6 +443,63 @@ def _rewrite_dsv41(cfg: dict, plan: Plan) -> None:
         tc["engram_layer_ids"] = kept("engram_layer_ids")
 
 
+_LAYER_REF = re.compile(r"layers\.(\d+)\.")
+
+
+def _remap_quant_lists(cfg: dict, plan: Plan) -> None:
+    """A quantization config's module lists (`ignored_layers`,
+    `modules_to_not_convert`, `exclude_modules`) name layers by source id:
+    renumbered to the cut's, a dropped layer's entries dropped. A draft
+    head's (`mtp`) entries pass as they are."""
+    for table in (cfg.get("quantization_config"), _text_cfg(cfg, plan).get("quantization_config")):
+        if not isinstance(table, dict):
+            continue
+        for key in ("ignored_layers", "modules_to_not_convert", "exclude_modules"):
+            names = table.get(key)
+            if not isinstance(names, list):
+                continue
+            out: list = []
+            for name in names:
+                m = _LAYER_REF.search(name) if isinstance(name, str) and "mtp" not in name else None
+                if m is None:
+                    out.append(name)
+                    continue
+                src = int(m.group(1))
+                out.extend(name[:m.start(1)] + str(dst) + name[m.end(1):]
+                           for dst, kept in enumerate(plan.src_layers) if kept == src)
+            table[key] = out
+
+
+def _rewrite_mimo(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    # Which layers are full attention (0) or windowed (1), and which carry
+    # experts: one entry a layer each.
+    for key in ("hybrid_layer_pattern", "moe_layer_freq"):
+        if isinstance(cfg.get(key), list):
+            cfg[key] = _slice_list(cfg[key], plan.src_layers)
+    _remap_quant_lists(cfg, plan)
+
+
+def _rewrite_hy4(cfg: dict, plan: Plan) -> None:
+    _rewrite_glm(cfg, plan)
+    # pie's `hy4-mini` keeps sixteen keys a ranking, so the ranking is read
+    # at the probe lengths a miniature is run at.
+    cfg["index_topk"] = 16
+
+
+def _rewrite_muse_spark(cfg: dict, plan: Plan) -> None:
+    _rewrite_muse_glimmer(cfg, plan)
+    tc = _text_cfg(cfg, plan)
+    if isinstance(tc.get("mlp_layer_types"), list):
+        tc["mlp_layer_types"] = _slice_list(tc["mlp_layer_types"], plan.src_layers)
+    _remap_quant_lists(cfg, plan)
+
+
+def _rewrite_glm5_next(cfg: dict, plan: Plan) -> None:
+    _rewrite_glm(cfg, plan)
+    _remap_quant_lists(cfg, plan)
+
+
 def _rewrite_kimi(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     tc = _text_cfg(cfg, plan)
@@ -1425,6 +1482,67 @@ FAMILIES: dict[str, dict[str, Any]] = {
         # covers both.
         default_layers="0-3",
         config_rewrite=_rewrite_gpt_oss,
+    ),
+    # MiMo-V2.6-Flash as released: fp8 projections at 128-square blocks
+    # (`o_proj` bf16), MXFP4 experts one plane each, the draft layers under
+    # `model.mtp.` (dropped). Layers 0-5: the dense layer, full attention at 0
+    # and 5, windowed between -- pie's `mimo26-flash-mini`.
+    "mimo_v2": dict(
+        layer_prefix="model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight", "mlp.gate.e_score_correction_bias"),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        default_layers="0-5",
+        config_rewrite=_rewrite_mimo,
+        # The towers are kept so the miniature loads unmodified as the
+        # release's architecture; pie's text row ignores them.
+        keep_res=(re.compile(r"^visual\."), re.compile(r"^audio_encoder\."),
+                  re.compile(r"^speech_embeddings\.")),
+    ),
+    # Hy4-preview: bf16, the bank stacked on dim 0 (`experts.gate_up_proj`,
+    # `experts.down_proj`). Layers 0-5: the dense layer, ranking indexers at
+    # 0, 1 and 5, reading ones between -- pie's `hy4-mini`.
+    "hy_v4": dict(
+        layer_prefix="model.layers.",
+        expert_re=None,
+        router_suffixes=("mlp.gate.weight", "mlp.gate.e_score_correction_bias",
+                         "mlp.experts.gate_up_proj", "mlp.experts.down_proj"),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+                      "model.hc_head.hc_head_base", "model.hc_head.hc_head_fn",
+                      "model.hc_head.hc_head_scale"),
+        default_layers="0-5",
+        config_rewrite=_rewrite_hy4,
+    ),
+    # Muse Spark Open's NVFP4 export: the bank stacked on dim 0 beside a
+    # scale a plane and an expert, layers 0 and 61 bf16. Layers 0-7: two
+    # whole periods, sliding and full -- pie's `muse-spark-open-mini-l8`.
+    "muse_spark": dict(
+        layer_prefix="model.language_model.layers.",
+        expert_re=None,
+        router_suffixes=tuple(
+            ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
+            + [f"mlp.experts.{p}{s}" for p in ("gate_up_proj", "down_proj")
+               for s in ("", "_input_scale", "_weight_scale", "_weight_scale_2")]),
+        globals_keep=("model.language_model.embed_tokens.weight",
+                      "model.language_model.norm.weight", "lm_head.weight"),
+        default_layers="0-7",
+        config_rewrite=_rewrite_muse_spark,
+        text_cfg_key="text_config",
+        keep_res=(re.compile(r"^model\.vision_"), re.compile(r"^model\.audio_tower\.")),
+    ),
+    # GLM-5.3-Flash as released (zai-org/GLM-5.3-Flash): fp8 at 128-square
+    # blocks beside `weight_scale_inv`, one plane an expert. Shares
+    # `glm5_next_mlx`'s prefix, so pass `--family glm5_next`.
+    "glm5_next": dict(
+        layer_prefix="model.language_model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight", "mlp.gate.e_score_correction_bias"),
+        globals_keep=("model.language_model.embed_tokens.weight",
+                      "model.language_model.norm.weight", "lm_head.weight"),
+        default_layers="0-7",
+        config_rewrite=_rewrite_glm5_next,
+        text_cfg_key="text_config",
+        keep_res=(re.compile(r"^model\.visual\."),),
     ),
 }
 
