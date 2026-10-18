@@ -694,7 +694,11 @@ mod sparse {
     /// 1024-byte alignment.
     const fn smem(rope: i32, e4: bool) -> u32 {
         let ring = if e4 {
-            if rope > 0 { 3 * (32768 + 16384) } else { 5 * 32768 }
+            if rope > 0 {
+                3 * (32768 + 16384)
+            } else {
+                5 * 32768
+            }
         } else {
             2 * (65536 + if rope > 0 { 16384 } else { 0 })
         };
