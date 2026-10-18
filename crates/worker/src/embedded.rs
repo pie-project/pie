@@ -93,7 +93,7 @@ impl Settings {
 
         config.model.engine.options = self.engine_options(kind, home);
         config.model.device_kv_budget = self.device_kv_budget;
-        config.model.device_memory_share = self.device_memory_share;
+        config.model.device_memory_share = Some(self.device_memory_share);
         if self.max_voxels.is_some() {
             config.model.max_voxels = self.max_voxels;
         }

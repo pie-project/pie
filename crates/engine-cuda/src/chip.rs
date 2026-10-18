@@ -855,14 +855,25 @@ mod tests {
         let (rtx, report) = resolve("NVIDIA GeForce RTX 4090", &facts(8, 9, 128), None);
         assert_eq!(report.used, profile::Source::Seeded("sm89.toml".into()));
         assert!(report.untuned());
+        assert_eq!(
+            Engine::of(&l40s),
+            Engine {
+                forward_tokens: 2048,
+                ..Engine::of(&registry().defaults())
+            },
+            "the L40S fires 2048 rows"
+        );
+        assert_eq!(Engine::of(&rtx), Engine::of(&registry().defaults()));
         for p in [&l40s, &rtx] {
-            assert_eq!(Engine::of(p), Engine::of(&registry().defaults()));
             assert_eq!(
                 kernels_cuda::tuning::Tuning::of(p),
                 kernels_cuda::tuning::Tuning::of(&registry().defaults()),
                 "what an Ada GPU ran before its family file"
             );
             for (spec, rungs, _) in p.entries() {
+                if spec.id == "engine.forward_tokens" && std::ptr::eq(p, &l40s) {
+                    continue;
+                }
                 assert_eq!(
                     rungs,
                     registry()

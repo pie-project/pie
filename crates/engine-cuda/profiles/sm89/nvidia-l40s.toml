@@ -3,6 +3,12 @@ api = 1
 [target]
 device = "NVIDIA L40S"
 
+# 2048-row fires: at 8192 a 14B's working set takes the kv an agent trace
+# needs (Qwen3-14B at 12288 context: 65K tokens of kv at 8192 rows, 74K at
+# 2048, where trace t1 on one card keeps 42 of 46 programs within their SLO).
+[engine]
+forward_tokens = 2048
+
 [provenance]
 measured = [
   "kernel.gemm.heuristics",
@@ -30,6 +36,7 @@ measured = [
   "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.prefill.ctas_per_sm",
   "engine.copies",
+  "engine.forward_tokens",
   "engine.graphs",
   "engine.lattice_steps",
   "engine.recording",

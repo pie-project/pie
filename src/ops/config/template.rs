@@ -61,7 +61,7 @@ model = "Qwen/Qwen3.5-0.8B"
 # Device memory, per device. The share is of the device's memory, less what
 # other processes hold when the engine starts; the kv pool fills what the
 # share leaves past the weights, unless its bytes are stated.
-# device_memory_share  = 0.90
+# device_memory_share  = 0.95     # cuda_native; 0.90 on other engines
 # device_kv_budget     = "20GiB"  # kv pages and state slots; refused if it does not fit
 # device_weight_budget = "18GiB"  # omit for uncapped
 "#;

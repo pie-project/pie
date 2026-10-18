@@ -515,9 +515,10 @@ pub struct ModelConfig {
     pub device_kv_budget: Option<ByteSize>,
     /// The share of the device's memory this load may take: weights, working
     /// set and kv pool. What other processes hold when the load begins comes
-    /// off it, as on a card another server shares.
-    #[serde(default = "default_device_memory_share")]
-    pub device_memory_share: f64,
+    /// off it, as on a card another server shares. Omit for the engine's
+    /// own ([`EngineKind::memory_share`]).
+    #[serde(default)]
+    pub device_memory_share: Option<f64>,
     /// How many pinned host bytes a preempted process's kv pages and
     /// recurrent-state slots may be suspended into (`"32GiB"`), shared by
     /// the tensor-parallel ranks: one rs row per device slot, then kv pages.
@@ -610,10 +611,6 @@ fn refuse_retired_keys(config: &toml::Table) -> Result<()> {
     Ok(())
 }
 
-fn default_device_memory_share() -> f64 {
-    engine::load::DEFAULT_DEVICE_MEMORY_SHARE
-}
-
 fn default_weight_dtype() -> String {
     "bfloat16".to_string()
 }
@@ -702,6 +699,14 @@ impl AdapterConfig {
 }
 
 impl ModelConfig {
+    /// The share of the device's memory this load may take: the stated one,
+    /// else the engine's.
+    #[must_use]
+    pub fn memory_share(&self) -> f64 {
+        self.device_memory_share
+            .unwrap_or_else(|| self.engine.kind.memory_share())
+    }
+
     /// The shared-adapter mount as the boot seam spells it: `Some(path)` when
     /// the operator stated one, `None` (the feature off) for the empty
     /// default.
@@ -725,7 +730,7 @@ impl ModelConfig {
             host_weight_budget: self.host_weight_budget.map(|b| b.as_bytes()),
             deferred_tier: self.deferred_tier,
             device_kv_budget: self.device_kv_budget.map(|b| b.as_bytes()),
-            device_memory_share: self.device_memory_share,
+            device_memory_share: self.memory_share(),
             host_kv_budget: self.host_kv_budget.map(|b| b.as_bytes()),
             kv_seats: None,
             disk_kv_budget: self.disk_kv_budget.map(|b| b.as_bytes()),
@@ -824,9 +829,9 @@ impl ModelConfig {
             );
         }
         ensure!(
-            self.device_memory_share.is_finite()
-                && self.device_memory_share > 0.0
-                && self.device_memory_share <= 1.0,
+            self.memory_share().is_finite()
+                && self.memory_share() > 0.0
+                && self.memory_share() <= 1.0,
             "model.device_memory_share must be finite and in (0.0, 1.0]"
         );
         ensure!(
@@ -1069,6 +1074,21 @@ pub enum EngineKind {
 }
 
 impl EngineKind {
+    /// The share of the device's memory a load takes when `[model]
+    /// device_memory_share` is not stated. A CUDA card is the server's own,
+    /// and the engine keeps a floor of its own below the share: at 0.95 a
+    /// 14B on an L40S holds the kv SGLang's default does (74K tokens, 42 of
+    /// 46 agent programs within their SLO, as SGLang; at 0.90, 59K and 16).
+    /// Memory a Metal, Vulkan or wgpu device shares with the desktop keeps
+    /// its tenth.
+    #[must_use]
+    pub fn memory_share(self) -> f64 {
+        match self {
+            EngineKind::CudaNative => 0.95,
+            _ => engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             EngineKind::CudaNative => "cuda_native",
