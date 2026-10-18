@@ -581,11 +581,40 @@ mod tests {
                         hc_mma: false,
                         index_tc5: false,
                         norm_emit: false,
+                        qkv_rows_from: defaults.qkv_rows_from,
                         ..tuning
                     },
                     defaults,
                     "{gpu}: only the Blackwell kernels differ"
                 );
+            } else if major == 9 {
+                assert_eq!(
+                    kernels_cuda::tuning::Tuning {
+                        pdl: false,
+                        ssm_gdn_fused_scan: false,
+                        ssm_gdn_out_bf16: false,
+                        ssm_conv_vec4: false,
+                        rows_vec: false,
+                        hc_tile: false,
+                        hc_mma: false,
+                        qg_prologue_until: 0,
+                        merge_warp: false,
+                        pool_mma: false,
+                        dsv4_decode_until: 0,
+                        gemm_bias_epilogue: false,
+                        gemm_rows_m: 0,
+                        attn_res_fused_norm: false,
+                        mxfp4_mma_from: defaults.mxfp4_mma_from,
+                        mxfp4_mma_until: defaults.mxfp4_mma_until,
+                        nvfp4_mma_from: defaults.nvfp4_mma_from,
+                        nvfp4_mma_until: defaults.nvfp4_mma_until,
+                        ..tuning
+                    },
+                    defaults,
+                    "{gpu}: Hopper takes the arch-generic arms alone"
+                );
+                assert!(tuning.ssm_gdn_fused_scan && tuning.pool_mma && tuning.pdl, "{gpu}");
+                assert_eq!((tuning.mxfp4_mma_from, tuning.mxfp4_mma_until), (28, 1024));
             } else {
                 assert_eq!(tuning, defaults, "{gpu}");
             }
@@ -707,9 +736,12 @@ mod tests {
     /// other family keeps the three wmma launches it ran before.
     #[cfg(not(feature = "rocm"))]
     #[test]
-    fn only_the_sm100_family_runs_the_two_launch_gated_delta_scan() {
-        for (name, major, minor, sms) in [("NVIDIA B200", 10, 0, 148), ("NVIDIA GB200", 10, 0, 152)]
-        {
+    fn only_hopper_and_the_sm100_family_run_the_two_launch_gated_delta_scan() {
+        for (name, major, minor, sms) in [
+            ("NVIDIA B200", 10, 0, 148),
+            ("NVIDIA GB200", 10, 0, 152),
+            ("NVIDIA H100 80GB HBM3", 9, 0, 132),
+        ] {
             let (p, _) = resolve(name, &facts(major, minor, sms), None);
             assert!(
                 kernels_cuda::tuning::Tuning::of(&p).ssm_gdn_fused_scan,
@@ -721,7 +753,6 @@ mod tests {
             ("NVIDIA GeForce RTX 3090", 8, 6, 82),
             ("NVIDIA Jetson AGX Orin", 8, 7, 16),
             ("NVIDIA L40S", 8, 9, 142),
-            ("NVIDIA H100 80GB HBM3", 9, 0, 132),
             ("NVIDIA B300", 10, 3, 148),
             ("NVIDIA Thor", 11, 0, 20),
             ("NVIDIA GeForce RTX 5090", 12, 0, 170),
@@ -772,12 +803,16 @@ mod tests {
         assert!(b200.pdl);
         assert_eq!(b200.gemm_tc5_split_tickets, 8);
         assert_eq!(b200.gemm_rows_m, 8);
+        // Hopper takes the register-dequant selects and none of tcgen05's.
+        let h100 = tuning(9, 0, 132);
+        assert!(!h100.moe_tc5 && !h100.mxfp4_cvt && h100.gemm_tc5_split_tickets == 0);
+        assert_eq!((h100.mxfp4_mma_from, h100.mxfp4_mma_until), (28, 1024));
+        assert_eq!((h100.nvfp4_mma_from, h100.nvfp4_mma_until), (32, 8192));
         for (major, minor) in [
             (8, 0),
             (8, 6),
             (8, 7),
             (8, 9),
-            (9, 0),
             (10, 3),
             (11, 0),
             (12, 0),
