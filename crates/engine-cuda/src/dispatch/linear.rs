@@ -1628,11 +1628,40 @@ impl Run<'_> {
         routes: ValueId,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        let (codes, ..) = self.planes(bank);
+        let (codes, scales, _, seat) = self.planes(bank);
         match codes.dtype {
             Dtype::Nvfp4 | Dtype::Mxfp4 | Dtype::U8 => {
                 let x = self.tensor(x);
                 self.select_quant(x, bank, routes, y)
+            }
+            // A block-FP8 release's experts, their factors laid as ue8m0
+            // exponents a weight row a 128 at load (`lay_tile_banks`).
+            Dtype::E4m3 => {
+                if !self.scales_in_atoms(bank) {
+                    return Err(unlaid(op));
+                }
+                if seat.streams() || crate::device::alloc::is_host_pointer(codes.ptr) {
+                    return Err(kernels_cuda::Error::Backend {
+                        op,
+                        detail: "a W8A16 select reads a resident bank, and this one is seated \
+                                 by a streaming tier"
+                            .to_string(),
+                    });
+                }
+                let x = self.tensor(x);
+                let routes = self.tensor(routes);
+                linear::moe::select_fp8_w8a16(
+                    self.ctx(),
+                    op,
+                    x,
+                    codes.ptr,
+                    scales.ptr,
+                    codes.rows,
+                    128,
+                    routes,
+                    &mut self.tensor(y),
+                    None,
+                )
             }
             stored => Err(kernels_cuda::Error::Backend {
                 op,

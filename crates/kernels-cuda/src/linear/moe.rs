@@ -2078,6 +2078,110 @@ fn select_mxfp4_mma(
     ctx.fire(op, fire, &args)
 }
 
+/// A routed select over a block-FP8 bank (`experts x n x k` e4m3 codes at
+/// `codes`, one ue8m0 exponent a weight row a `gran` columns in atoms at
+/// `atoms`) against bf16 activations (W8A16, `linear/moe_w8.cuh`), with the
+/// GLU in its epilogue where `glu` says: the select where there are no FP8
+/// tensor cores.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn select_fp8_w8a16(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    codes: u64,
+    atoms: u64,
+    experts: u32,
+    gran: u32,
+    routes: Tensor,
+    y: &mut Tensor,
+    glu: Option<crate::linear::tc5::Glu>,
+) -> Result<(), Error> {
+    use crate::linear::tc5::Glu;
+    const THREADS: u32 = 128;
+    const DEPTH: u32 = 2;
+    let fan = selected(op, x, routes, y)?;
+    if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
+        return Err(refuse(op, "a W8A16 select reads and lands bf16 rows"));
+    }
+    if !matches!(gran, 32 | 128) || !x.width.is_multiple_of(128) {
+        return Err(refuse(
+            op,
+            format!("a W8A16 select walks whole 128s of K in {gran}-wide blocks, not K {}", x.width),
+        ));
+    }
+    let (code, limit, alpha) = match glu {
+        None => (0, 0.0f32, 1.0f32),
+        Some(Glu::Swiglu) => (1, 0.0, 1.0),
+        Some(Glu::SwigluClamp { limit }) => (2, limit, 1.0),
+        Some(Glu::SwigluClampAlpha { limit, alpha }) => (3, limit, alpha),
+        Some(Glu::GegluTanh) => (4, 0.0, 1.0),
+        Some(Glu::Situ { beta, cap }) => (5, beta, cap),
+    };
+    let cols = if glu.is_some() { 64 } else { 128 };
+    let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
+    let experts = experts.clamp(1, EXPERT_CAP);
+    let per = fan.route_count.div_ceil(experts);
+    let nb: u32 = match per {
+        0..=4 => 1,
+        5..=12 => 2,
+        _ => 4,
+    };
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
+    let inter = stated(op, y.width)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
+        ctx,
+        op,
+        routes,
+        &fan,
+        experts,
+        8 * nb,
+        true,
+        if glu.is_some() || KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    let fire = Fire::at(
+        "linear/moe_w8.cuh",
+        symbol(&format!(
+            "::pie::linear::moe_select_fp8_mma<{nb}, {DEPTH}, {code}, {gran}>"
+        )),
+    )
+    .apply(Launch::grid(
+        [work_cap, y.width.div_ceil(cols), 1],
+        [THREADS, 1, 1],
+    ));
+    ctx.fire(
+        op,
+        fire,
+        &[
+            x.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+            inter.arg(),
+            limit.arg(),
+            alpha.arg(),
+        ],
+    )
+}
+
 /// Whether [`select_mxfp4_atoms`] takes a fire of `routes` over `x`'s
 /// width (asked before its activations are read back for it).
 #[cfg(feature = "cuda")]

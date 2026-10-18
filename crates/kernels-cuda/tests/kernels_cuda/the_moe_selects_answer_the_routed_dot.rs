@@ -349,3 +349,33 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         assert!(far < tol, "{what}: {far:.4} from the host's product");
     }
 }
+
+#[test]
+fn the_w8a16_selects_answer_the_routed_dot() {
+    use kernels_cuda::linear::moe::select_fp8_w8a16;
+    // (experts, tokens, top_k, n, k, by_token): a decode's few routes an
+    // expert, a slice of 16 and of 32, and the down select's routes as rows.
+    #[rustfmt::skip]
+    let cases = [(8, 1, 4, 256, 512, true), (8, 3, 2, 136, 1024, true), (4, 20, 2, 512, 256, true),
+        (16, 64, 8, 128, 512, false), (8, 7, 4, 384, 768, false)];
+    for (ex, tokens, top, n, k, by_token) in cases {
+        let what = format!("W8A16 select {ex}x{tokens}x{top} {n}x{k} by_token={by_token}");
+        let mut b = Bench::new(0x8e1 ^ (tokens * 13 + n + k) as u64);
+        let count = tokens * top;
+        let routes = tab(count, |r| ((r / top * 3 + r % top * 5) % ex) as i32);
+        let (rows_x, div) = pick(by_token, (tokens, top), (count, 1));
+        let (x, a) = b.bf16(rows_x * k);
+        let s = b.side(Elem::E4m3, Some(128), ex * n, k);
+        let atoms = &s.scales.as_ref().expect("scaled").0;
+        let (codes, atoms) = (b.up(&s.bytes), b.up(atoms));
+        let r = t(b.up(&routes), tokens, top, I32);
+        let mut y = b.out(count, n);
+        let ctx = b.ctx();
+        let x = t(x, rows_x, k, Bf16);
+        select_fp8_w8a16(&ctx, "test", x, codes, atoms, ex as u32, 128, r, &mut y, None)
+            .expect("the W8A16 select fires");
+        let w = |r: usize, c: usize, i: usize| f64::from(s.value(routes[r] as usize * n + c, k, i));
+        let want = dot([count, n, k], |r, i| a[r / div * k + i], w);
+        b.check(y.ptr, &want, TOL, &what);
+    }
+}
