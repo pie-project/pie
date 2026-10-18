@@ -23,6 +23,12 @@ pub enum WeightRow {
         biases: Option<Tensor>,
         seat: GroupSeat,
         repacked: bool,
+        /// The scales lie in the tcgen05 GEMM's atoms, laid there at load
+        /// for a low-precision product, not row-major.
+        atoms: bool,
+        /// An mxfp4 bank in the matrix core's lane order (ROCm:
+        /// `linear::moe::mxfp4_lanes`), which only routed selects read.
+        lanes: bool,
     },
 
     Streamed {
@@ -30,10 +36,20 @@ pub enum WeightRow {
         table: u64,
         counts: u64,
     },
+
+    /// A resident plane in the matrix core's order, which only the products
+    /// that read it so take (ROCm: an fp8b32 projection, `e4m3fn_shuffle`,
+    /// read by `act_quant::matmul_fp8b32_lanes`).
+    Ordered(Tensor),
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct WeightTable(pub Vec<Option<WeightRow>>);
+pub struct WeightTable(
+    pub Vec<Option<WeightRow>>,
+    /// A dense row requantized in place at load to fp8b128 (codes,
+    /// atom-laid exponents; `kernel.gemm.fp8_o_down`): its bf16 is gone.
+    pub std::collections::BTreeMap<usize, (Tensor, Tensor)>,
+);
 
 #[derive(Clone, Debug, Default)]
 pub struct SlotTable(pub Vec<Option<Tensor>>);
@@ -500,6 +516,19 @@ impl Standing {
     }
 }
 
+/// Rows quantized for the FP8 products, where they are held.
+#[cfg(feature = "rocm")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Fp8Rows {
+    pub value: u32,
+    pub stage: u64,
+    pub ctx: usize,
+    pub region: u32,
+    pub hold: usize,
+    pub codes: Tensor,
+    pub scales: Tensor,
+}
+
 pub struct Run<'c> {
     ctx: &'c Ctx,
 
@@ -537,6 +566,38 @@ pub struct Run<'c> {
     ceilings: Ceilings<'c>,
 
     stood: Cell<Option<(u32, u32, Standing)>>,
+
+    /// Rows this walk quantized for the FP8 products, by value, staged
+    /// window and context, with the region and hold they sit in: their codes
+    /// and scales, for the later products of the same rows.
+    #[cfg(feature = "rocm")]
+    pub(crate) fp8_rows: Vec<Fp8Rows>,
+    /// The holds each region has handed out this walk.
+    #[cfg(feature = "rocm")]
+    pub(crate) fp8_holds: Vec<(u32, usize)>,
+
+    /// The fp8 1x128 activations a producer last landed itself (its codes
+    /// beside its bf16 row), for the projection that reads that row next.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    held: Option<HeldAct>,
+
+    /// The routed GLU rows that land read back through e4m3 already
+    /// ([`Run::lands_read_back`]).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    read_back: Cell<Option<ValueId>>,
+}
+
+/// A producer's own fp8 1x128 copy of value `value` (at `ptr`, on the
+/// stream `stream`): its codes and atoms in `planes`, `rows x k`.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) struct HeldAct {
+    pub value: ValueId,
+    pub ptr: u64,
+    pub stream: usize,
+    pub rows: u32,
+    pub k: u32,
+    pub planes: [u64; 2],
 }
 
 impl<'c> Run<'c> {
@@ -573,7 +634,68 @@ impl<'c> Run<'c> {
             copy: CopyPlan::default(),
             ceilings: Ceilings::default(),
             stood: Cell::new(None),
+            #[cfg(feature = "rocm")]
+            fp8_rows: Vec::new(),
+            #[cfg(feature = "rocm")]
+            fp8_holds: Vec::new(),
+            held: None,
+            read_back: Cell::new(None),
         }
+    }
+
+    /// Whether `y`, a routed GLU's rows, lands as its e4m3 1x128 read-back: its one
+    /// reader, the routed down select, reads it back ([`Run::reading_back`]).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn lands_read_back(&self, y: ValueId) -> bool {
+        self.read_back.get() == Some(y)
+    }
+
+    /// `f` with `rows` landing as their read-back ([`Run::lands_read_back`]).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn reading_back<R>(&mut self, rows: ValueId, f: impl FnOnce(&mut Self) -> R) -> R {
+        let was = self.read_back.replace(Some(rows));
+        let r = f(self);
+        self.read_back.set(was);
+        r
+    }
+
+    /// Planes the latest producer of `y` lands its fp8 1x128 codes and atoms in
+    /// ([`kernels_cuda::linear::act_quant::held_planes`]): the next projection on
+    /// this stream reading `y` takes them instead of quantizing.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn hold_e4m3(&mut self, y: ValueId) -> Result<[u64; 2], kernels_cuda::Error> {
+        let t = self.tensor(y);
+        let ctx = self.ctx();
+        let planes =
+            kernels_cuda::linear::act_quant::held_planes(ctx, "linear.held_act", t.rows, t.width)?;
+        self.held = Some(HeldAct {
+            value: y,
+            ptr: t.ptr,
+            stream: ctx.stream().addr(),
+            rows: t.rows,
+            k: t.width,
+            planes,
+        });
+        Ok(planes)
+    }
+
+    /// Forgets the planes held for a producer that did not land them.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn drop_held(&mut self) {
+        self.held = None;
+    }
+
+    /// The planes [`Run::hold_e4m3`] gave `act`'s producer, when `act` (at
+    /// `t`) is the value they hold, on this stream.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn held_e4m3(&self, act: ValueId, t: &Tensor) -> Option<[u64; 2]> {
+        let held = self.held?;
+        (held.value == act
+            && held.ptr == t.ptr
+            && held.rows == t.rows
+            && held.k == t.width
+            && held.stream == self.ctx().stream().addr())
+        .then_some(held.planes)
     }
 
     #[must_use]
@@ -916,6 +1038,16 @@ impl<'c> Run<'c> {
 
     pub(crate) fn at_region(&self) -> u32 {
         self.place.region.get()
+    }
+
+    /// Whether this region's launches are being recorded into a body a
+    /// later fire replays, against the page tables that fire states.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn recorded(&self) -> bool {
+        matches!(
+            self.ceilings.admit(self.place.region.get()),
+            Some(Admit::Captured)
+        )
     }
 
     pub(crate) fn uncut(&self, id: ValueId) -> Tensor {
@@ -1308,7 +1440,7 @@ impl<'c> Run<'c> {
             Some(Def::Op(_) | Def::Merge(_)) => self.arena.0.get(at).copied().flatten().is_some(),
             Some(Def::Weight(w)) => matches!(
                 self.weights.0.get(*w as usize).copied().flatten(),
-                Some(WeightRow::Dense(_) | WeightRow::Streamed { .. })
+                Some(WeightRow::Dense(_) | WeightRow::Streamed { .. } | WeightRow::Ordered(_))
             ),
             _ => false,
         }
@@ -1479,9 +1611,11 @@ impl<'c> Run<'c> {
             Def::Weight(w) => {
                 let row = *w as usize;
                 match self.weights.0.get(row).copied().flatten() {
-                    Some(WeightRow::Dense(handle) | WeightRow::Streamed { slab: handle, .. }) => {
-                        handle
-                    }
+                    Some(
+                        WeightRow::Dense(handle)
+                        | WeightRow::Streamed { slab: handle, .. }
+                        | WeightRow::Ordered(handle),
+                    ) => handle,
                     Some(WeightRow::Planes { .. }) => panic!(
                         "value {at} is weight {row}, a split-plane bank; it resolves \
                          through `Run::planes`, never as one dense handle"
@@ -1550,9 +1684,21 @@ impl<'c> Run<'c> {
                 biases,
                 seat,
                 repacked: false,
+                atoms: false,
+                lanes: false,
             }) => Some((codes, scales, biases, seat)),
             _ => None,
         }
+    }
+
+    /// The fp8b128 codes and atom-laid exponents a grouped projection's bf16
+    /// plane was requantized to in place at load (`kernel.gemm.fp8_o_down`).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn fp8_grouped_plane(&self, id: ValueId) -> Option<(Tensor, Tensor)> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        self.weights.1.get(&(*w as usize)).copied()
     }
 
     pub(crate) fn maybe_tiled_planes(
@@ -1570,11 +1716,14 @@ impl<'c> Run<'c> {
                 biases: Some(biases),
                 seat,
                 repacked: true,
+                atoms: false,
+                lanes: _,
             }) => Some((codes, scales, biases, seat)),
             _ => None,
         }
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn maybe_stored(&self, id: ValueId) -> Option<Tensor> {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
@@ -1616,12 +1765,67 @@ impl<'c> Run<'c> {
                 biases,
                 seat,
                 repacked: _,
+                atoms: _,
+                lanes: _,
             }) => (codes, scales, biases, seat),
-            Some(WeightRow::Dense(_) | WeightRow::Streamed { .. }) => panic!(
-                "value {at} is weight {row}, bound as one dense handle, and this op reads \
+            Some(WeightRow::Dense(_) | WeightRow::Streamed { .. } | WeightRow::Ordered(_)) => {
+                panic!(
+                    "value {at} is weight {row}, bound as one dense handle, and this op reads \
                  a split-plane bank"
-            ),
+                )
+            }
             None => panic!("value {at} is weight {row}, which the shell has not bound"),
+        }
+    }
+
+    /// Whether weight `id`'s scales were laid into tcgen05 atoms at load.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn scales_in_atoms(&self, id: ValueId) -> bool {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return false;
+        };
+        matches!(
+            self.weights.0.get(*w as usize).copied().flatten(),
+            Some(WeightRow::Planes { atoms: true, .. })
+        )
+    }
+
+    /// Whether `id` is `linear.group_routes`' over `groups` (route g for
+    /// every row's group g).
+    #[cfg(feature = "rocm")]
+    pub(crate) fn group_routes_of(&self, id: ValueId, groups: u32) -> bool {
+        let Def::Op(at) = self.values[id.0 as usize].def else {
+            return false;
+        };
+        matches!(
+            self.nodes.get(at as usize).map(|node| &node.op),
+            Some(poem_ir::Operation::Linear(poem_ir::Linear::GroupRoutes { groups: g, routes }))
+                if *g == groups && *routes == id
+        )
+    }
+
+    /// Whether the split-plane bank `id` names landed in the matrix core's
+    /// lane order.
+    #[cfg(feature = "rocm")]
+    pub(crate) fn planes_in_lanes(&self, id: ValueId) -> bool {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return false;
+        };
+        matches!(
+            self.weights.0.get(*w as usize).copied().flatten(),
+            Some(WeightRow::Planes { lanes: true, .. })
+        )
+    }
+
+    /// The bank `id` names, if it landed in the matrix core's order.
+    #[cfg(feature = "rocm")]
+    pub(crate) fn ordered_bank(&self, id: ValueId) -> Option<Tensor> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        match self.weights.0.get(*w as usize).copied().flatten() {
+            Some(WeightRow::Ordered(handle)) => Some(self.cut(id, handle)),
+            _ => None,
         }
     }
 
@@ -1647,6 +1851,10 @@ impl<'c> Run<'c> {
             Some(WeightRow::Planes { .. }) => panic!(
                 "value {at} is weight {row}, a split-plane bank; a dense routed select \
                  does not read one"
+            ),
+            Some(WeightRow::Ordered(_)) => panic!(
+                "value {at} is weight {row}, a bank in the matrix core's order; only \
+                 `Run::ordered_bank`'s readers take it"
             ),
             None => panic!("value {at} is weight {row}, which the shell has not bound"),
         }
@@ -1700,6 +1908,23 @@ impl<'c> Run<'c> {
         }
     }
 
+    /// `id`'s pool with the whole fire's page tables, indexed by the fire's own
+    /// request ids (`request_of_token`); `None` where the region reads gathered seats.
+    pub(crate) fn pool_whole(&self, id: ValueId) -> Option<KvPool> {
+        if self.window().gathered.is_some() {
+            return None;
+        }
+        let pool = self.pool(id);
+        Some(match self.cache(id) {
+            CachePool::Kv { pool: whole, .. } => KvPool {
+                page_indptr: whole.page_indptr,
+                last_page_lens: whole.last_page_lens,
+                ..pool
+            },
+            CachePool::Recurrent(_) => pool,
+        })
+    }
+
     pub(crate) fn windowed(&self, handle: Tensor) -> Tensor {
         if !self.plane_base() {
             return handle;
@@ -1734,6 +1959,8 @@ impl<'c> Run<'c> {
         Some(RecurrentPool {
             write_state: false,
             commit_len: Tensor::ABSENT,
+            #[cfg(feature = "rocm")]
+            snapshots: kernels_cuda::Snapshots::NONE,
             ..cut
         })
     }
@@ -1762,6 +1989,11 @@ impl<'c> Run<'c> {
                     write_state_mask: lanes(pool.write_state_mask),
                     commit_len: lanes(pool.commit_len),
                     begin_at: lanes(pool.begin_at),
+                    #[cfg(feature = "rocm")]
+                    snapshots: kernels_cuda::Snapshots {
+                        indptr: lanes(pool.snapshots.indptr),
+                        ..pool.snapshots
+                    },
                     ..*pool
                 }
             }

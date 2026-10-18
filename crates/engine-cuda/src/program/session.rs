@@ -51,6 +51,9 @@ pub struct Session {
     poisoned: bool,
     fires: u64,
     commit: Pinned,
+    /// On ROCm, the pool the commit slot returns to.
+    #[cfg(feature = "rocm")]
+    commit_key: Option<crate::device::hip::held::pool::PoolKey>,
     pending: Option<Minted>,
     shadow: bool,
 }
@@ -86,6 +89,14 @@ impl Session {
         let rings = Rings::allocate(&shapes, endpoints)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
+        #[cfg(feature = "rocm")]
+        let commit_key = crate::device::hip::held::pool::commit_key(2 * size_of::<u32>());
+        #[cfg(feature = "rocm")]
+        let commit = match commit_key.and_then(crate::device::hip::held::pool::take) {
+            Some((commit, _, _)) => commit,
+            None => Pinned::mapped(2 * size_of::<u32>())?,
+        };
+        #[cfg(not(feature = "rocm"))]
         let commit = Pinned::mapped(2 * size_of::<u32>())?;
 
         let mut session = Session {
@@ -98,6 +109,8 @@ impl Session {
             poisoned: false,
             fires: 0,
             commit,
+            #[cfg(feature = "rocm")]
+            commit_key,
             pending: None,
             shadow,
         };
@@ -512,6 +525,38 @@ impl Session {
         })
     }
 
+    /// The shared rings this instance's stages put.
+    pub fn shared_puts<'p>(&'p self, plan: &'p ExecPlan) -> impl Iterator<Item = usize> + 'p {
+        (0..self.shapes.len()).filter_map(move |channel| {
+            if !plan.puts_channel(channel as u32) {
+                return None;
+            }
+            self.rings
+                .endpoint(channel)
+                .filter(|endpoint| endpoint.role() == HostRole::None)
+                .map(|endpoint| Arc::as_ptr(endpoint) as usize)
+        })
+    }
+
+    /// Shared rings whose cells the host reads to resolve descriptor ports under
+    /// `class` ([`Self::envelope`]); not the tokens' ring where the device copies
+    /// them ([`Self::token_device_source`]).
+    pub fn host_resolved_rings(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<usize> {
+        let tokens_on_device = self.token_device_source(plan, class).is_some();
+        plan.package
+            .ports
+            .iter()
+            .filter(|binding| !binding.is_const && engine::ports::resolves(class, binding.port))
+            .filter(|binding| !(binding.port == Port::EmbedTokens && tokens_on_device))
+            .filter_map(|binding| {
+                self.rings
+                    .endpoint(binding.channel as usize)
+                    .filter(|endpoint| endpoint.role() == HostRole::None)
+                    .map(|endpoint| Arc::as_ptr(endpoint) as usize)
+            })
+            .collect()
+    }
+
     fn mint(&mut self, plan: &ExecPlan, wave: &mut Wave) -> std::result::Result<Minted, String> {
         let before = self.cursors_now();
         let mut next = before.clone();
@@ -861,5 +906,16 @@ mod tests {
             text.contains("scratch") || text.contains("descriptors"),
             "and what would go wrong: {text}"
         );
+    }
+}
+
+/// On ROCm the commit slot goes back to the pool for the next session.
+#[cfg(feature = "rocm")]
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(key) = self.commit_key {
+            let commit = core::mem::replace(&mut self.commit, Pinned::empty());
+            crate::device::hip::held::pool::give(key, (commit, Pinned::empty(), None));
+        }
     }
 }

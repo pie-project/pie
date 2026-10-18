@@ -36,8 +36,14 @@ impl Run<'_> {
             },
 
             Layout::EmbedConcat {
+                scales: Some(_), ..
+            } => Err(kernels_wgpu::Error::Unsupported {
+                op: "layout.embed_concat(mxfp8)",
+            }),
+            Layout::EmbedConcat {
                 ids,
                 table,
+                scales: None,
                 vocab,
                 y,
             } => match self.banked(*table) {
@@ -129,6 +135,10 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
+            // DSpark's taps side by side are DeepSeek-V4.1's, served on CUDA.
+            Layout::ConcatCols { .. } | Layout::SplitQkvPadded { .. } => {
+                Err(kernels_wgpu::Error::Unsupported { op: op.name() })
+            }
             Layout::GridTaps {
                 positions,
                 grids,

@@ -336,6 +336,8 @@ pub struct EtaCaps {
     pub has_attn_page_mask: bool,
     pub has_lora: bool,
     pub adapter_attachments: bool,
+    /// [`::engine::Capabilities::rs_snapshots`], the least of the engines'.
+    pub rs_snapshots: u32,
 }
 
 impl std::fmt::Debug for Model {

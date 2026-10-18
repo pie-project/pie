@@ -193,6 +193,53 @@ impl Run<'_> {
                 *span,
                 &mut self.tensor(*y),
             ),
+            #[cfg(feature = "rocm")]
+            Fused::HcNormProject {
+                streams,
+                eps,
+                weight,
+                stream_count,
+                mixes,
+            } => elemwise::hc::norm_project(
+                self.ctx(),
+                self.tensor(*streams),
+                self.tensor(*weight),
+                *eps,
+                *stream_count,
+                &mut self.tensor(*mixes),
+            ),
+            Fused::NormRopeLast {
+                x,
+                weight,
+                head_dim,
+                eps,
+                positions,
+                rotary_dim,
+                theta,
+                interleaved,
+                inverse,
+                yarn,
+                y,
+                q_out: _,
+            } => elemwise::rope::norm_rope_last(
+                self.ctx(),
+                self.tensor(*x),
+                weight.map(|w| self.tensor(w)),
+                *head_dim,
+                *eps,
+                self.tensor(*positions),
+                *rotary_dim,
+                *theta,
+                *interleaved,
+                *inverse,
+                yarn.map(|y| elemwise::rope::Yarn {
+                    factor: y.factor,
+                    beta_fast: y.beta_fast,
+                    beta_slow: y.beta_slow,
+                    original_max_position: y.original_max_position,
+                }),
+                &mut self.tensor(*y),
+            ),
             Fused::NormModulate {
                 x,
                 norm,
@@ -291,7 +338,7 @@ impl Run<'_> {
         }
     }
 
-    fn elementwise(&self, op: &Elementwise) -> Result<(), kernels_cuda::Error> {
+    pub(super) fn elementwise(&self, op: &Elementwise) -> Result<(), kernels_cuda::Error> {
         match op {
             Elementwise::Rmsnorm { x, weight, eps, y } => elemwise::norm::rmsnorm(
                 self.ctx(),
@@ -347,6 +394,32 @@ impl Run<'_> {
                 *eps,
                 &mut self.tensor(*y),
             ),
+            Elementwise::NormGate {
+                x,
+                scale,
+                res,
+                gate,
+                eps,
+                temperature,
+                next,
+                y,
+            } => elemwise::norm::norm_gate(
+                self.ctx(),
+                self.tensor(*x),
+                scale.map(|s| self.tensor(s)),
+                res.map(|r| self.tensor(r)),
+                gate.map(|g| self.tensor(g)),
+                *eps,
+                *temperature,
+                self.plane_fan(self.tensor(*y).rows),
+                next.map(|n| elemwise::norm::Next {
+                    weight: self.tensor(n.weight),
+                    eps: n.eps,
+                    plus_one: n.plus_one,
+                    y: self.tensor(n.y),
+                }),
+                &mut self.tensor(*y),
+            ),
             Elementwise::LayernormNoScale { x, eps, y } => elemwise::layernorm::layernorm_no_scale(
                 self.ctx(),
                 self.tensor(*x),
@@ -396,7 +469,7 @@ impl Run<'_> {
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*gate),
-                self.tensor(*weight),
+                weight.map(|w| self.tensor(w)),
                 *head_dim,
                 *eps,
                 matches!(act, poem_ir::GateActivation::Sigmoid),
@@ -514,6 +587,9 @@ impl Run<'_> {
             } => (match form {
                 MropeForm::Interleaved => elemwise::rope_mrope::interleaved,
                 MropeForm::Blocked => elemwise::rope_mrope::blocked,
+                #[cfg(feature = "rocm")]
+                MropeForm::Split => elemwise::rope_mrope::split,
+                #[cfg(not(feature = "rocm"))]
                 MropeForm::Split => {
                     return Err(kernels_cuda::Error::Unsupported {
                         op: "elementwise.rope_mrope",
@@ -586,20 +662,29 @@ impl Run<'_> {
                 interleaved,
                 q_out: _,
                 k_out: _,
-            } => elemwise::rope::yarn(
-                self.ctx(),
-                &mut self.tensor(*q),
-                &mut self.tensor(*k),
-                self.tensor(*positions),
-                *head_dim,
-                *theta,
-                *factor,
-                *beta_fast,
-                *beta_slow,
-                *attention_factor,
-                *original_max_position,
-                *interleaved,
-            ),
+            } => {
+                use elemwise::rope;
+                let r = rope::YarnRope {
+                    head_dim: *head_dim,
+                    theta: *theta,
+                    yarn: rope::Yarn {
+                        factor: *factor,
+                        beta_fast: *beta_fast,
+                        beta_slow: *beta_slow,
+                        original_max_position: *original_max_position,
+                    },
+                    attention_factor: *attention_factor,
+                    interleaved: *interleaved,
+                };
+                let positions = self.tensor(*positions);
+                rope::yarn(
+                    self.ctx(),
+                    &mut self.tensor(*q),
+                    &mut self.tensor(*k),
+                    positions,
+                    r,
+                )
+            }
             Elementwise::GateSigmoidMul { x, gate, x_out: _ } => {
                 let fan = self.plane_fan(self.tensor(*x).rows);
                 elemwise::gate::sigmoid_mul(
@@ -822,6 +907,7 @@ impl Run<'_> {
                 gate_eps,
                 alpha,
                 sinkhorn,
+                comb,
                 x,
                 post_mix,
                 comb_mix,
@@ -835,6 +921,7 @@ impl Run<'_> {
                 *gate_eps,
                 *alpha,
                 *sinkhorn,
+                *comb,
                 &mut self.tensor(*x),
                 &mut self.tensor(*post_mix),
                 &mut self.tensor(*comb_mix),

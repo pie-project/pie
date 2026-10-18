@@ -1,3 +1,5 @@
+pub mod dsv4;
+
 pub mod dynconv;
 
 pub mod fa2;
@@ -7,6 +9,8 @@ pub mod fa2_abi;
 pub mod index;
 
 pub mod kv;
+
+pub mod markov;
 
 pub mod mla;
 
@@ -27,6 +31,14 @@ pub mod sched_prefill;
 pub mod selector;
 
 pub mod ssm;
+
+pub mod xqa;
+
+#[cfg(feature = "cuda")]
+pub mod dsv4_prefill;
+
+#[cfg(feature = "cuda")]
+pub mod tc5_fmha;
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -142,6 +154,29 @@ fn fa2_decode(
     lse: Option<&mut Tensor>,
     rel: Option<RelBias>,
 ) -> Result<(), Error> {
+    fa2_decode_with(
+        ctx, op, q, plan, pool, window, head_dim, sm_scale, o, lse, rel, None,
+    )
+    .map(|_| ())
+}
+
+/// [`fa2_decode`], handing the split's fold `sinks` to land in the same
+/// pass; `Ok(true)` where it did, `Ok(false)` where the caller owes them.
+#[allow(clippy::too_many_arguments)]
+fn fa2_decode_with(
+    ctx: &Ctx,
+    op: &'static str,
+    q: RaggedTensor,
+    plan: &DecodePlan,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: Option<&mut Tensor>,
+    rel: Option<RelBias>,
+    sinks: Option<Tensor>,
+) -> Result<bool, Error> {
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
@@ -178,7 +213,26 @@ fn fa2_decode(
         num_kv_heads: plan.shape.num_kv_heads,
         device: plan.device,
     };
+    let tensor_cores = xqa::takes(ctx, plan, pool, rel.is_some());
     match rel {
+        // A whole-window plan's block reads its request's window entire and
+        // lands the request's rows (sinks folded) itself: no partial, no fold.
+        None if tensor_cores && plan.info.whole => {
+            let direct = fa2_abi::DecodeParams {
+                o: split.o,
+                lse: split.lse,
+                partition_kv: false,
+                ..params
+            };
+            xqa::decode(ctx, op, plan, &direct, sinks)?;
+            return Ok(sinks.is_some());
+        }
+        None if tensor_cores => {
+            xqa::decode(ctx, op, plan, &params, sinks)?;
+            if !plan.info.split_kv {
+                return Ok(sinks.is_some());
+            }
+        }
         None => {
             let arm = fa2::decode_arm(plan.full_attention_variant(), window_left, NO_SOFT_CAP);
             fa2::decode(ctx, op, point(arm), &params)?;
@@ -204,9 +258,20 @@ fn fa2_decode(
         }
     }
     if plan.info.split_kv {
-        fa2::fold(ctx, op, &split)
+        fa2::fold(ctx, op, &sinked(split, sinks))
     } else {
-        Ok(())
+        Ok(false)
+    }
+}
+
+fn sinked(split: fa2_abi::Partials, sinks: Option<Tensor>) -> fa2_abi::Partials {
+    match sinks {
+        Some(sinks) => fa2_abi::Partials {
+            sinks: sinks.ptr,
+            sinks_f32: sinks.dtype == Dtype::F32,
+            ..split
+        },
+        None => split,
     }
 }
 
@@ -225,6 +290,30 @@ fn fa2_prefill(
     mask: Option<(Tensor, Tensor)>,
     rel: Option<RelBias>,
 ) -> Result<(), Error> {
+    fa2_prefill_with(
+        ctx, op, q, plan, pool, window, head_dim, sm_scale, o, lse, mask, rel, None,
+    )
+    .map(|_| ())
+}
+
+/// [`fa2_prefill`], handing the split's fold `sinks` as
+/// [`fa2_decode_with`] does.
+#[allow(clippy::too_many_arguments)]
+fn fa2_prefill_with(
+    ctx: &Ctx,
+    op: &'static str,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: Option<&mut Tensor>,
+    mask: Option<(Tensor, Tensor)>,
+    rel: Option<RelBias>,
+    sinks: Option<Tensor>,
+) -> Result<bool, Error> {
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
@@ -238,6 +327,33 @@ fn fa2_prefill(
     );
 
     lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
+    // The tcgen05 kernel lands the log-sum-exp too, and bf16 sinks in its
+    // epilogue (landed: no sink pass after).
+    #[cfg(feature = "cuda")]
+    {
+        let sunk = sinks.filter(|s| s.dtype == Dtype::Bf16);
+        if let Some(l) = &lse {
+            lse_plane(op, l, q.data.rows, plan.shape.num_q_heads);
+        }
+        if mask.is_none()
+            && rel.is_none()
+            && tc5_fmha::try_prefill(
+                ctx,
+                op,
+                q,
+                plan,
+                pool,
+                window_left,
+                head_dim,
+                sm_scale,
+                o,
+                lse.as_deref(),
+                sunk,
+            )?
+        {
+            return Ok(sunk.is_some());
+        }
+    }
     let mut bufs = pool_buffers(q.data.ptr, pool, plan.workspace, o.ptr);
     bufs.qo_indptr = q.indptr.ptr;
     if let Some(lse) = &lse {
@@ -292,9 +408,9 @@ fn fa2_prefill(
         }
     }
     if plan.info.split_kv {
-        fa2::fold(ctx, op, &split)
+        fa2::fold(ctx, op, &sinked(split, sinks))
     } else {
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -362,6 +478,81 @@ pub fn prefill(
     fa2_prefill(
         ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, None,
     )
+}
+
+/// [`decode_lse`], then the sinks over its output: in the split's fold
+/// where the profile's warp fold takes them, else by [`sink`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_lse_sink(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    plan: &DecodePlan,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: &mut Tensor,
+    sinks: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.lse_sink";
+    plan.accepts(OP, head_dim, window)?;
+    let landed = fa2_decode_with(
+        ctx,
+        OP,
+        q,
+        plan,
+        pool,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        Some(&mut *lse),
+        None,
+        Some(sinks),
+    )?;
+    if landed {
+        return Ok(());
+    }
+    sink(ctx, o, *lse, sinks, head_dim)
+}
+
+/// [`prefill_lse`], then the sinks, as [`decode_lse_sink`] lands them.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_lse_sink(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: &mut Tensor,
+    sinks: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.lse_sink";
+    plan.accepts(OP, head_dim, Some(kv_heads), window)?;
+    let landed = fa2_prefill_with(
+        ctx,
+        OP,
+        q,
+        plan,
+        pool,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        Some(&mut *lse),
+        None,
+        None,
+        Some(sinks),
+    )?;
+    if landed {
+        return Ok(());
+    }
+    sink(ctx, o, *lse, sinks, head_dim)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -576,6 +767,17 @@ pub fn sink(
 ) -> Result<(), Error> {
     const OP: &str = "attention.sink";
     let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    // The sinks are the scores' own element, or f32 as a checkpoint keeps them.
+    let s = match sink.dtype {
+        Dtype::F32 => "float",
+        held if held == o.dtype => t,
+        held => {
+            return Err(refuse(
+                OP,
+                format!("the sinks are {held:?} and the scores {:?}", o.dtype),
+            ));
+        }
+    };
     let heads = row_heads(OP, o.width, head_dim)?;
     lse_plane(OP, &lse, o.rows, heads);
     let rows = count(OP, "rows", o.rows)?;
@@ -583,7 +785,7 @@ pub fn sink(
         OP,
         Fire::at(
             "attn/attention.cuh",
-            symbol(&format!("::pie::attn::sink_rescale<{t}>")),
+            symbol(&format!("::pie::attn::sink_rescale<{t}, {s}>")),
         )
         .apply(per_head_elementwise(o.rows, heads, head_dim)),
         &[
@@ -668,14 +870,21 @@ pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
         )
     })?;
     nonzero(OP, "the element count", lanes)?;
+    // Eight elements a thread where the plane takes whole 16-byte runs: the
+    // same values, element for element.
+    let (entry, extent) = if lanes.is_multiple_of(8) && x.ptr % 16 == 0 {
+        ("logit_softcap_vec8", lanes / 8)
+    } else {
+        ("logit_softcap", lanes)
+    };
     ctx.fire(
         OP,
         Fire::at(
             "attn/attention.cuh",
-            symbol(&format!("::pie::attn::logit_softcap<{t}>")),
+            symbol(&format!("::pie::attn::{entry}<{t}>")),
         )
-        .apply(elementwise(lanes)),
-        &[x.arg(), cap.arg(), n.arg()],
+        .apply(elementwise(extent)),
+        &[x.arg(), cap.arg(), (extent as usize).arg()],
     )
 }
 
@@ -742,32 +951,18 @@ pub fn res_blend(
             ),
         ));
     }
-    let plane_bytes = u64::from(y.rows) * u64::from(y.width) * 2;
-    let stacked = blocks
-        .windows(2)
-        .all(|pair| pair[1].ptr == pair[0].ptr.wrapping_add(plane_bytes));
-    // The kernel walks `blocks + (j * rows + t) * hidden`. The planner does not
-    // place the closed blocks side by side (they are residual snapshots taken
-    // layers apart), so scattered ones are staged into one stacked scratch.
-    let first = if stacked {
-        blocks.first().map_or(prefix.ptr, |b| b.ptr)
-    } else {
-        let span = usize::try_from(plane_bytes)
-            .ok()
-            .and_then(|p| p.checked_mul(blocks.len()))
-            .ok_or_else(|| refuse(OP, "the stacked blocks do not fit a usize"))?;
-        let stack = ctx.scratch(OP, "elemwise.res_blend_blocks", span)? as usize as u64;
-        for (j, block) in blocks.iter().enumerate() {
-            stage_plane(
-                ctx,
-                OP,
-                stack + j as u64 * plane_bytes,
-                block.ptr,
-                plane_bytes,
-            )?;
-        }
-        stack
+    // Each closed block is read where it lies (they are residual snapshots
+    // taken layers apart), its address passed by value.
+    #[repr(C)]
+    struct ResBlocks {
+        at: [u64; MAX_BLOCKS],
+    }
+    let mut at = ResBlocks {
+        at: [0; MAX_BLOCKS],
     };
+    for (slot, block) in at.at.iter_mut().zip(blocks) {
+        *slot = block.ptr;
+    }
     ctx.fire(
         OP,
         Fire::at(
@@ -777,7 +972,7 @@ pub fn res_blend(
         .apply(Launch::per_row(y.rows, BLOCK)),
         &[
             prefix.arg(),
-            crate::jit::ArgValue::Ptr(first),
+            crate::jit::ArgValue::of(&at),
             weight.arg(),
             proj.arg(),
             y.arg(),
@@ -790,35 +985,97 @@ pub fn res_blend(
     )
 }
 
-/// One device-to-device plane copy on the context's stream.
-fn stage_plane(ctx: &Ctx, op: &'static str, dst: u64, src: u64, bytes: u64) -> Result<(), Error> {
-    #[cfg(feature = "cuda")]
+/// [`res_blend`] and the RMS norm of its row under `out_weight` in one pass
+/// (`res_blend_norm`, 512 threads a row or 256 for a prefill's many, the
+/// blended row held in registers): `y` the normed row. `Ok(false)` where the
+/// row is not whole 16-byte runs, wider than the registers hold, or a plane
+/// is unaligned.
+#[allow(clippy::too_many_arguments)]
+pub fn res_blend_norm(
+    ctx: &Ctx,
+    prefix: Tensor,
+    blocks: &[Tensor],
+    weight: Tensor,
+    eps: f32,
+    proj: Tensor,
+    out_weight: Tensor,
+    out_eps: f32,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "elementwise.res_blend_rmsnorm";
+    const MAX_BLOCKS: usize = 32;
+    let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let hidden = y.width;
+    // A prefill's many rows keep more of themselves resident at 256 threads a row.
+    let threads: u32 = if y.rows >= 1024 && hidden <= 256 * 8 * 4 {
+        256
+    } else {
+        512
+    };
+    let aligned = |p: u64| p % 16 == 0;
+    let row_bytes = u64::from(hidden) * 2;
+    if blocks.len() > MAX_BLOCKS
+        || hidden == 0
+        || !hidden.is_multiple_of(8)
+        || hidden > threads * 8 * 4
+        || !row_bytes.is_multiple_of(16)
+        || ![prefix.ptr, weight.ptr, proj.ptr, out_weight.ptr, y.ptr]
+            .into_iter()
+            .chain(blocks.iter().map(|b| b.ptr))
+            .all(aligned)
     {
-        use cudarc::runtime::sys as rt;
+        return Ok(false);
+    }
+    #[repr(C)]
+    struct ResBlocks {
+        at: [u64; MAX_BLOCKS],
+    }
+    let mut at = ResBlocks {
+        at: [0; MAX_BLOCKS],
+    };
+    for (slot, block) in at.at.iter_mut().zip(blocks) {
+        *slot = block.ptr;
+    }
+    ctx.fire(
+        OP,
+        Fire::at(
+            "elemwise/norm.cuh",
+            symbol(&format!("::pie::elemwise::res_blend_norm<{t}, {threads}>")),
+        )
+        .apply(Launch::per_row(y.rows, threads)),
+        &[
+            prefix.arg(),
+            crate::jit::ArgValue::of(&at),
+            weight.arg(),
+            proj.arg(),
+            out_weight.arg(),
+            y.arg(),
+            stated(OP, u32::try_from(blocks.len()).unwrap_or(u32::MAX))?.arg(),
+            stated(OP, hidden)?.arg(),
+            eps.arg(),
+            out_eps.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}
 
-        let code = unsafe {
-            rt::cudaMemcpyAsync(
-                dst as usize as *mut core::ffi::c_void,
-                src as usize as *const core::ffi::c_void,
-                usize::try_from(bytes).map_err(|_| refuse(op, "a plane wider than usize"))?,
-                rt::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
-                ctx.stream().cast(),
-            )
-        };
-        if code != rt::cudaError::cudaSuccess {
-            return Err(refuse(
-                op,
-                format!(
-                    "`cudaMemcpyAsync` answered {} stacking a block",
-                    code as i32
-                ),
-            ));
-        }
-        Ok(())
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (ctx, dst, src, bytes);
-        Err(crate::jit::runtimeless(op))
-    }
+/// A bf16 plane's tensor map, 128-byte swizzled, as the attention kernels'
+/// K, V and Q loads read them. A zero third extent makes the map 2D.
+#[cfg(feature = "cuda")]
+pub(crate) fn bf16_map(
+    ptr: u64,
+    dims: [u32; 3],
+    strides: [u64; 2],
+    boxes: [u32; 3],
+) -> Result<[u64; 16], Error> {
+    use cudarc::driver::sys as dr;
+    crate::linear::tc5::encode(crate::linear::tc5::Map {
+        ptr,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        dims,
+        strides,
+        boxes,
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    })
 }

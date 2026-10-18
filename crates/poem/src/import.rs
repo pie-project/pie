@@ -270,6 +270,8 @@ pub fn own_contract(
             [
                 crate::scales_name(&param.name),
                 crate::biases_name(&param.name),
+                crate::global_scales_name(&param.name),
+                crate::input_scales_name(&param.name),
             ]
         })
         .collect();
@@ -291,6 +293,8 @@ enum Kind {
 fn claim_kind(dtype: Dtype) -> Kind {
     match dtype {
         Dtype::Mxfp4
+        | Dtype::Nvfp4
+        | Dtype::E4m3tensor
         | Dtype::U4g64
         | Dtype::U8g64
         | Dtype::U4g32
@@ -305,9 +309,11 @@ fn claim_kind(dtype: Dtype) -> Kind {
 fn group_of(dtype: Dtype) -> u32 {
     match dtype {
         Dtype::Mxfp4 => 32,
+        Dtype::Nvfp4 => 16,
+        Dtype::E4m3tensor => 1,
         Dtype::U4g64 | Dtype::U8g64 | Dtype::U2g64 | Dtype::U4g64tiled => 64,
         Dtype::U4g32 | Dtype::U2g32 => 32,
-        Dtype::U2g128 => 128,
+        Dtype::U2g128 | Dtype::E4m3tile128 | Dtype::E4m3g128 => 128,
         other => panic!("`{other:?}` blocks no axis; only a packed bank has groups"),
     }
 }
@@ -339,6 +345,8 @@ struct Claim {
 fn claim(w: &Weight, tp: u32) -> Claim {
     let (encoding, scales) = match w.dtype {
         Dtype::Mxfp4
+        | Dtype::Nvfp4
+        | Dtype::E4m3tensor
         | Dtype::U4g64
         | Dtype::U8g64
         | Dtype::U4g32
@@ -373,9 +381,14 @@ fn claim(w: &Weight, tp: u32) -> Claim {
             "this dtype names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
         ),
-        Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 => panic!(
+        Dtype::E4m3row | Dtype::E4m3tile128 | Dtype::E4m3g128 => panic!(
             "a {:?} weight is served but no load contract declares one",
             w.dtype
+        ),
+        Dtype::Fp8b128 | Dtype::Fp8b32 | Dtype::Mxfp8 => panic!(
+            "`{}`: a block-fp8 weight is claimed plane by plane, its raw codes and \
+             exponents each their own",
+            w.name
         ),
     };
     Claim {
@@ -423,7 +436,7 @@ fn resolve(src: &ztensor::Source, claim: Claim) -> Result<Vec<TensorContract>, E
     });
     match (&stored, scales) {
         (Encoding::Quant(_), Some(pairing)) => {
-            tensors.extend(interned(&name, &shape, bands, pairing));
+            tensors.extend(interned(src, &name, &shape, bands, pairing)?);
         }
         (Encoding::Raw(_), Some(_)) => {}
         (Encoding::Quant(_), None) | (Encoding::Raw(_), None) => {}
@@ -715,6 +728,9 @@ fn planes(
     from: impl Into<String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let from = from.into();
+    if w.dtype.fp8_blocks().is_some() {
+        return fp8_block_planes(src, w, vec![from]);
+    }
     if stored_raw(src, &from)? {
         if placed_road_covers(w) {
             return placed_from_encode(w, |canon| Ok(vec![copy(src, canon, from)?]));
@@ -750,6 +766,7 @@ fn planes(
         | Dtype::U2g64
         | Dtype::U2g128 => affine_planes(src, w, vec![from]),
         Dtype::Mxfp4 => mx_planes(src, w, vec![from]),
+        Dtype::Nvfp4 => nv_planes(src, w, vec![from]),
         _ => Ok(vec![copy(src, w, from)?]),
     }
 }
@@ -760,6 +777,9 @@ fn planes_fused(
     parts: impl IntoIterator<Item = String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let parts: Vec<String> = parts.into_iter().collect();
+    if w.dtype.fp8_blocks().is_some() {
+        return fp8_block_planes(src, w, parts);
+    }
     if parts.iter().try_fold(true, |all, part| {
         Ok::<bool, Error>(all && stored_raw(src, part)?)
     })? {
@@ -799,6 +819,7 @@ fn planes_fused(
         | Dtype::U2g64
         | Dtype::U2g128 => affine_planes(src, w, parts),
         Dtype::Mxfp4 => mx_planes(src, w, parts),
+        Dtype::Nvfp4 => nv_planes(src, w, parts),
         _ => match fused(src, w, parts.clone()) {
             Ok(contract) => Ok(vec![contract]),
             Err(disagreement) => decoded_legs(src, w, &parts).unwrap_or(Err(disagreement)),
@@ -1417,6 +1438,231 @@ fn mx_planes(
     ])
 }
 
+/// An fp8b128 weight as DeepSeek releases it: raw e4m3 `{stem}.weight` beside
+/// `{stem}.scale` (one e8m0 exponent a 128x128 block), landed as stored; legs
+/// join along their rows, each a whole number of blocks.
+fn fp8_block_planes(
+    src: &ztensor::Source,
+    w: &Weight,
+    parts: Vec<String>,
+) -> Result<Vec<TensorContract>, Error> {
+    let illegible = |detail: String| Error::Illegible {
+        name: w.name.clone(),
+        detail,
+    };
+    let (br, bc) = w
+        .dtype
+        .fp8_blocks()
+        .expect("only a block-fp8 weight reads its exponent planes");
+    let (br, bc) = (i64::from(br), i64::from(bc));
+    if w.shape.len() != 2 {
+        return Err(illegible(format!(
+            "it is declared {:?}; a block-fp8 weight is one projection",
+            w.shape
+        )));
+    }
+    let axis = if parts.len() > 1 { pack_axis(w) } else { 0 };
+    if axis != 0 {
+        return Err(illegible(
+            "its legs join along the contracted axis, and its blocks are read whole".into(),
+        ));
+    }
+    let shape_of = |name: &str| -> Vec<i64> {
+        src.get(name)
+            .map(|tensor| tensor.shape().iter().map(|&n| n as i64).collect())
+            .unwrap_or_default()
+    };
+    let mut codes = Vec::new();
+    let mut scales = Vec::new();
+    let mut legs = Vec::new();
+    for (at, part) in parts.iter().enumerate() {
+        let stem = part.strip_suffix(".weight").ok_or_else(|| {
+            illegible(format!(
+                "`{part}` holds fp8 codes, whose exponents are named beside a `.weight`, \
+                 and it does not end in one"
+            ))
+        })?;
+        let held = shape_of(part);
+        let stored = stored_encoding(src, part)?;
+        let [rows, cols] = held[..] else {
+            return Err(illegible(format!(
+                "`{part}` is stored {held:?}, not a matrix"
+            )));
+        };
+        if stored != Encoding::Raw(DType::E4m3) || (at + 1 < parts.len() && rows % br != 0) {
+            return Err(illegible(format!(
+                "`{part}` is stored {stored:?} {held:?}; a block-fp8 leg is e4m3, a whole \
+                 number of {br}-row blocks but the last"
+            )));
+        }
+        let scale = format!("{stem}.scale");
+        let blocks = vec![(rows + br - 1) / br, (cols + bc - 1) / bc];
+        let stored = stored_encoding(src, &scale)?;
+        if stored != Encoding::Raw(DType::E8m0) || shape_of(&scale) != blocks {
+            return Err(illegible(format!(
+                "`{scale}` is stored {stored:?} {:?}; block-fp8 exponents are one e8m0 a \
+                 {br}x{bc} block, {blocks:?}",
+                shape_of(&scale)
+            )));
+        }
+        codes.push(Expr::src(part.clone()));
+        scales.push(Expr::src(scale));
+        legs.push(held);
+    }
+    holds_the_declared_rectangle(w, axis, &legs)?;
+    let [n, k] = extents(w)[..] else {
+        unreachable!("a two-dimensional weight has two extents")
+    };
+    Ok(vec![
+        TensorContract::new(
+            w.name.clone(),
+            joined(axis, codes),
+            vec![n, k],
+            encoding(Dtype::E4m3),
+        ),
+        TensorContract::new(
+            crate::scales_name(&w.name),
+            joined(axis, scales),
+            vec![(n + br - 1) / br, (k + bc - 1) / bc],
+            encoding(Dtype::E8m0),
+        ),
+    ])
+}
+
+/// An NVFP4 weight from modelopt's planes: `{stem}.weight` (two e2m1 codes a
+/// byte), `.weight_scale` (e4m3 per 16), `.weight_scale_2` (f32 tensor scale)
+/// and `.input_scale` (static activation scale). Legs joined along rows keep
+/// their own tensor scale (it lands per row) but read one activation, so the
+/// first leg's input scale is the weight's.
+fn nv_planes(
+    src: &ztensor::Source,
+    w: &Weight,
+    parts: Vec<String>,
+) -> Result<Vec<TensorContract>, Error> {
+    let illegible = |detail: String| Error::Illegible {
+        name: w.name.clone(),
+        detail,
+    };
+    if w.shape.len() != 2 {
+        return Err(illegible(format!(
+            "it is declared {:?}; an NVFP4 bank of more than one slab is read leg by \
+             leg in its format's own terms",
+            w.shape
+        )));
+    }
+    let axis = if parts.len() > 1 { pack_axis(w) } else { 0 };
+    if axis != 0 {
+        return Err(illegible(
+            "its legs join along the contracted axis, and a row holds one tensor scale".into(),
+        ));
+    }
+    let pairing = scaling(w);
+    let f32_raw = encoding(Dtype::F32);
+    let mut codes = Vec::new();
+    let mut scales = Vec::new();
+    let mut tensors = Vec::new();
+    let mut legs = Vec::new();
+    for part in &parts {
+        let stem = part.strip_suffix(".weight").ok_or_else(|| {
+            illegible(format!(
+                "`{part}` holds NVFP4 codes, whose scales are named beside a `.weight`, \
+                 and it does not end in one"
+            ))
+        })?;
+        let stored = stored_encoding(src, part)?;
+        let held: Vec<i64> = src
+            .get(part)
+            .map(|tensor| tensor.shape().iter().map(|&n| n as i64).collect())
+            .unwrap_or_default();
+        let [rows, bytes] = held[..] else {
+            return Err(illegible(format!(
+                "`{part}` is stored {held:?}; a leg of NVFP4 codes is [rows, cols / 2] bytes"
+            )));
+        };
+        if stored != Encoding::Raw(DType::U8) {
+            return Err(illegible(format!(
+                "`{part}` is stored {stored:?}, and NVFP4 codes are packed two to a u8"
+            )));
+        }
+        let unpacked = vec![rows, 2 * bytes];
+        let scale = format!("{stem}.weight_scale");
+        let stored = stored_encoding(src, &scale)?;
+        let counted = divided(&unpacked, pairing.channel_axis, pairing.group_size, &w.name);
+        let held: Vec<i64> = src
+            .get(&scale)
+            .map(|tensor| tensor.shape().iter().map(|&n| n as i64).collect())
+            .unwrap_or_default();
+        if stored != Encoding::Raw(DType::E4m3) || held != counted {
+            return Err(illegible(format!(
+                "`{scale}` is stored {stored:?} {held:?}, and NVFP4 scales are one e4m3 \
+                 per 16-code group, {counted:?}"
+            )));
+        }
+        let tensor = format!("{stem}.weight_scale_2");
+        one_f32(src, &tensor, &w.name)?;
+        let rows = usize::try_from(unpacked[0]).expect("a row count inside usize");
+        codes
+            .push(Expr::src(part.clone()).transmute(TensorType::new(unpacked.clone(), grouped(w))));
+        scales.push(Expr::src(scale));
+        let one = Expr::src(tensor).transmute(TensorType::new(vec![1], f32_raw.clone()));
+        tensors.push(if rows > 1 {
+            one.gather(0, vec![0; rows])
+        } else {
+            one
+        });
+        legs.push(unpacked);
+    }
+    holds_the_declared_rectangle(w, axis, &legs)?;
+    let first = parts[0].strip_suffix(".weight").unwrap_or(&parts[0]);
+    let input = format!("{first}.input_scale");
+    one_f32(src, &input, &w.name)?;
+    let counted = divided(
+        &extents(w),
+        pairing.channel_axis,
+        pairing.group_size,
+        &w.name,
+    );
+    let rows = extents(w)[..1].to_vec();
+    Ok(vec![
+        TensorContract::inferred(w.name.clone(), joined(axis, codes), grouped(w)),
+        TensorContract::new(
+            crate::scales_name(&w.name),
+            joined(axis, scales),
+            counted,
+            encoding(Dtype::E4m3),
+        )
+        .scaling(pairing),
+        TensorContract::new(
+            crate::global_scales_name(&w.name),
+            joined(axis, tensors),
+            rows,
+            f32_raw.clone(),
+        )
+        .offsetting(w.name.clone()),
+        TensorContract::new(
+            crate::input_scales_name(&w.name),
+            Expr::src(input),
+            Vec::new(),
+            f32_raw,
+        ),
+    ])
+}
+
+/// That `name` is one stored f32.
+fn one_f32(src: &ztensor::Source, name: &str, of: &str) -> Result<(), Error> {
+    let stored = stored_encoding(src, name)?;
+    let count: u64 = src
+        .get(name)
+        .map_or(0, |tensor| tensor.shape().iter().product());
+    if stored != Encoding::Raw(DType::F32) || count != 1 {
+        return Err(Error::Illegible {
+            name: of.to_string(),
+            detail: format!("`{name}` is stored {stored:?} ({count} values), and it is one f32"),
+        });
+    }
+    Ok(())
+}
+
 fn tiled_planes(
     src: &ztensor::Source,
     w: &Weight,
@@ -1601,14 +1847,33 @@ fn holds_the_declared_rectangle(w: &Weight, axis: u8, legs: &[Vec<i64>]) -> Resu
     Ok(())
 }
 
-fn interned(of: &str, shape: &[i64], bands: Option<Bands>, pairing: Scales) -> Vec<TensorContract> {
+fn interned(
+    src: &ztensor::Source,
+    of: &str,
+    shape: &[i64],
+    bands: Option<Bands>,
+    pairing: Scales,
+) -> Result<Vec<TensorContract>, Error> {
     seams_clear_the_blocked_axis(of, bands.as_ref(), pairing.channel_axis, pairing.group_size);
+    if pairing.form == ScaleForm::F32Tensor {
+        // One scale for the whole tensor, which every rank holds whole.
+        let name = crate::scales_name(of);
+        return Ok(vec![
+            TensorContract::new(
+                name.clone(),
+                Expr::src(name),
+                Vec::new(),
+                encoding(Dtype::F32),
+            )
+            .scaling(pairing),
+        ]);
+    }
     let declared = divided(shape, pairing.channel_axis, pairing.group_size, of);
     let plane = |name: String, dtype: Dtype, shape: Vec<i64>| {
         let expr = banded(&name, bands.as_ref());
         TensorContract::new(name, expr, shape, encoding(dtype))
     };
-    match pairing.form {
+    Ok(match pairing.form {
         ScaleForm::RawE8M0 => {
             vec![plane(crate::scales_name(of), Dtype::E8m0, declared).scaling(pairing)]
         }
@@ -1616,11 +1881,34 @@ fn interned(of: &str, shape: &[i64], bands: Option<Bands>, pairing: Scales) -> V
             plane(crate::scales_name(of), Dtype::Bf16, declared.clone()).scaling(pairing),
             plane(crate::biases_name(of), Dtype::Bf16, declared).offsetting(of),
         ],
+        ScaleForm::E4m3TensorScaled => {
+            // The tensor and input scales stop short of the contracted axis,
+            // so a cut there holds them whole; a cut before it bands them.
+            let lead = &shape[..shape.len() - 1];
+            let short = |name: String, shape: &[i64]| {
+                let expr = match &bands {
+                    Some((axis, _)) if (*axis as usize) < shape.len() => {
+                        banded(&name, bands.as_ref())
+                    }
+                    _ => Expr::src(name.clone()),
+                };
+                TensorContract::new(name, expr, shape.to_vec(), encoding(Dtype::F32))
+            };
+            let input = crate::input_scales_name(of);
+            if src.get(&input).is_none() {
+                return Err(Error::Missing(input));
+            }
+            vec![
+                plane(crate::scales_name(of), Dtype::E4m3, declared).scaling(pairing),
+                short(crate::global_scales_name(of), lead).offsetting(of),
+                short(input, &lead[..lead.len().saturating_sub(1)]),
+            ]
+        }
         other => panic!(
             "`{of}` pairs its codes with {other:?} scales, and no family here \
              declares a bank in those terms"
         ),
-    }
+    })
 }
 
 fn agreed(src: &ztensor::Source, name: &str, expr: &Expr) -> Result<Encoding, Error> {
@@ -1797,6 +2085,10 @@ fn seams_clear_the_blocked_axis(name: &str, bands: Option<&Bands>, channel: u32,
 pub fn scaling(w: &Weight) -> Scales {
     let form = match w.dtype {
         Dtype::Mxfp4 => ScaleForm::RawE8M0,
+        Dtype::Nvfp4 => ScaleForm::E4m3TensorScaled,
+        Dtype::E4m3tensor => ScaleForm::F32Tensor,
+        // A block-FP8 release's f32 factors, one a 128x128 block.
+        Dtype::E4m3tile128 | Dtype::E4m3g128 => ScaleForm::F32Factors,
         Dtype::U4g64
         | Dtype::U8g64
         | Dtype::U4g32
@@ -1938,9 +2230,27 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             "this dtype names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
         ),
-        Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 => panic!(
+        Dtype::Nvfp4 => Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::Nvfp4E2M1E4M3,
+            logical_dtype: DType::Bf16,
+            bits_per_element: 4,
+            group_size: 16,
+            channel_axis: None,
+        }),
+        Dtype::E4m3tensor => Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::Fp8E4M3Tensor,
+            logical_dtype: DType::Bf16,
+            bits_per_element: 8,
+            group_size: 1,
+            channel_axis: None,
+        }),
+        Dtype::E4m3row | Dtype::E4m3tile128 | Dtype::E4m3g128 => panic!(
             "a {:?} weight is served but no load contract declares one",
             dtype
+        ),
+        Dtype::Fp8b128 | Dtype::Fp8b32 | Dtype::Mxfp8 => panic!(
+            "a block-fp8 weight is encoded plane by plane, its raw codes and exponents \
+             each their own"
         ),
         // PTQ1_0 joins the self-contained block family: its `g128_t3_f16_n` term
         // resolves to `QuantScheme::Ptq1_0` (ternary, one inline fp16 scale).
@@ -2006,7 +2316,176 @@ mod tests {
         the_unplaced_sibling_of_that_row_still_reads_it();
         the_mlx_road_lands_the_placed_order_and_bands_its_rows();
         a_dense_row_is_untouched_by_the_guard();
+        modelopt_nvfp4_legs_land_their_codes_scales_and_a_tensor_scale_a_row();
+        deepseek_fp8_legs_land_their_codes_and_block_exponents_as_stored();
         a_gather_over_k_quants_computes_over_their_decoded_values();
+    }
+
+    fn deepseek_fp8_legs_land_their_codes_and_block_exponents_as_stored() {
+        use checkpoint::executor::Execution;
+        use checkpoint::executor::sink::MemorySink;
+        use checkpoint::plan::{StorageTarget, compile};
+
+        const LEG: u64 = 128;
+        const WIDTH: u64 = 256;
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let mut writer =
+            ztensor::Writer::create(dir.path().join("model.zt")).expect("the container opens");
+        for (leg, fill) in [("w1", 1u8), ("w3", 2)] {
+            writer
+                .add(
+                    format!("ffn.{leg}.scale"),
+                    vec![1, 2],
+                    ztensor::Leaf::E8M0,
+                    &[120 + fill, 124 + fill],
+                )
+                .expect("exponents land");
+            writer
+                .add(
+                    format!("ffn.{leg}.weight"),
+                    vec![LEG, WIDTH],
+                    ztensor::Leaf::E4M3,
+                    &vec![fill; (LEG * WIDTH) as usize],
+                )
+                .expect("codes land");
+        }
+        writer.finish().expect("the container closes");
+        let src = ztensor::Source::open(dir.path().join("model.zt")).expect("it reads back");
+
+        let w = Weight::sym("gate_up", [2 * LEG, WIDTH], Dtype::Fp8b128).packed([LEG, LEG]);
+        let parts = ["ffn.w1.weight", "ffn.w3.weight"].map(String::from);
+        let read = planes_fused(&src, &w, parts).expect("the legs read as one fp8b128 weight");
+        let names: Vec<&str> = read.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["gate_up", "gate_up.scales"]);
+        let contract = ModelContract {
+            alignment: ALIGNMENT,
+            tensors: read,
+            groups: Vec::new(),
+        };
+        let metadata = checkpoint::file::read::parse_metadata(dir.path()).expect("it parses");
+        let plan = compile(&metadata, &contract, StorageTarget::default()).expect("it compiles");
+        let mut sink = MemorySink::default();
+        Execution::new(&plan, dir.path())
+            .sink(&mut sink)
+            .run()
+            .expect("the plan executes");
+        let codes = &sink.tensors["gate_up"];
+        let half = (LEG * WIDTH) as usize;
+        assert_eq!(codes.len(), 2 * half);
+        assert!(codes[..half].iter().all(|b| *b == 1) && codes[half..].iter().all(|b| *b == 2));
+        assert_eq!(sink.tensors["gate_up.scales"], [121, 125, 122, 126]);
+
+        let short = Weight::sym("gate_up", [2 * LEG, 2 * WIDTH], Dtype::Fp8b128).packed([LEG, LEG]);
+        let parts = ["ffn.w1.weight", "ffn.w3.weight"].map(String::from);
+        assert!(
+            planes_fused(&src, &short, parts).is_err(),
+            "legs narrower than the declared weight are refused"
+        );
+    }
+
+    fn modelopt_nvfp4_legs_land_their_codes_scales_and_a_tensor_scale_a_row() {
+        use checkpoint::executor::Execution;
+        use checkpoint::executor::sink::MemorySink;
+        use checkpoint::plan::{StorageTarget, compile};
+
+        const LEG: u64 = 4;
+        const WIDTH: u64 = 64;
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let mut writer =
+            ztensor::Writer::create(dir.path().join("model.zt")).expect("the container opens");
+        let legs = [("gate", 0.5f32, 0.25f32, 1u8), ("up", 2.0, 0.75, 2)];
+        for (leg, tensor, input, fill) in legs {
+            let at = |plane: &str| format!("mlp.{leg}_proj.{plane}");
+            writer
+                .add(
+                    at("input_scale"),
+                    vec![],
+                    ztensor::Leaf::F32,
+                    &input.to_le_bytes(),
+                )
+                .expect("a scalar lands");
+            writer
+                .add(
+                    at("weight"),
+                    vec![LEG, WIDTH / 2],
+                    ztensor::Leaf::U8,
+                    &vec![fill; (LEG * WIDTH / 2) as usize],
+                )
+                .expect("codes land");
+            writer
+                .add(
+                    at("weight_scale"),
+                    vec![LEG, WIDTH / 16],
+                    ztensor::Leaf::E4M3,
+                    &vec![0x38 + fill; (LEG * WIDTH / 16) as usize],
+                )
+                .expect("scales land");
+            writer
+                .add(
+                    at("weight_scale_2"),
+                    vec![],
+                    ztensor::Leaf::F32,
+                    &tensor.to_le_bytes(),
+                )
+                .expect("a scalar lands");
+        }
+        writer.finish().expect("the container closes");
+        let src = ztensor::Source::open(dir.path().join("model.zt")).expect("it reads back");
+
+        let w = Weight::sym("proj", [2 * LEG, WIDTH], Dtype::Nvfp4).packed([LEG, LEG]);
+        let parts = ["mlp.gate_proj.weight", "mlp.up_proj.weight"].map(String::from);
+        let read = planes_fused(&src, &w, parts).expect("the legs read as one nvfp4 weight");
+        let names: Vec<&str> = read.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "proj",
+                "proj.scales",
+                "proj.global_scales",
+                "proj.input_scales"
+            ]
+        );
+        assert_eq!(
+            read[1].scales.as_ref().map(|s| s.form),
+            Some(ScaleForm::E4m3TensorScaled)
+        );
+        assert_eq!(read[2].zero_points.as_deref(), Some("proj"));
+
+        let contract = ModelContract {
+            alignment: ALIGNMENT,
+            tensors: read,
+            groups: Vec::new(),
+        };
+        let metadata = checkpoint::file::read::parse_metadata(dir.path()).expect("it parses");
+        let plan = compile(&metadata, &contract, StorageTarget::default()).expect("it compiles");
+        let attached = &plan.attachments[0];
+        assert_eq!(attached.scale_form, ScaleForm::E4m3TensorScaled);
+        assert!(
+            attached.zero_point_tensor.is_some(),
+            "the tensor scales ride as the codes' second companion"
+        );
+        let mut sink = MemorySink::default();
+        Execution::new(&plan, dir.path())
+            .sink(&mut sink)
+            .run()
+            .expect("the plan executes");
+        let f32s = |name: &str| -> Vec<f32> {
+            sink.tensors[name]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect()
+        };
+        let rows = |value: f32| vec![value; LEG as usize];
+        assert_eq!(f32s("proj.global_scales"), [rows(0.5), rows(2.0)].concat());
+        assert_eq!(f32s("proj.input_scales"), [0.25]);
+        let codes = &sink.tensors["proj"];
+        let half = (LEG * WIDTH / 2) as usize;
+        assert!(codes[..half].iter().all(|b| *b == 1) && codes[half..].iter().all(|b| *b == 2));
+        let scales = &sink.tensors["proj.scales"];
+        assert_eq!(scales.len(), (2 * LEG * WIDTH / 16) as usize);
+        assert_eq!((scales[0], scales[scales.len() - 1]), (0x39, 0x3a));
     }
 
     /// A container of K-quant blocks, `(name, [rows, cols], scheme)`.

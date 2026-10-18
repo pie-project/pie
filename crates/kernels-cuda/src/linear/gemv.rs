@@ -86,3 +86,116 @@ pub(crate) fn gemv_bf16(
         &values,
     )
 }
+
+/// `out[m][n] = act[m] . weight[n]` for a few rows (2..=8, a decode's) in
+/// one launch: the tactic `kernel.gemm.rows_m` lets the GEMM tuner try. A
+/// block's eight warps stream weight rows, as many warps a row as keep some
+/// 120 blocks busy (each a slice of K, summed in slice order). Under `pdl`
+/// it launches as the previous kernel's programmatic dependent, waiting on
+/// it in-kernel (sm_90 and later).
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_rows_bf16(
+    ctx: &Ctx,
+    weight: u64,
+    act: u64,
+    bias: u64,
+    out: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    pdl: bool,
+) -> Result<(), Error> {
+    const OP: &str = "linear.gemm_rows";
+    if !(1..=8).contains(&m) || n <= 0 || k <= 0 || k % 8 != 0 {
+        return Err(refuse(
+            OP,
+            format!("needs 1..=8 rows and k in whole eights, and was handed m={m}, k={k}"),
+        ));
+    }
+    if weight == 0 || act == 0 || out == 0 || !aligned16(weight) || !aligned16(act) {
+        return Err(refuse(
+            OP,
+            "the weight and the activation are 16-byte aligned, and nothing is null",
+        ));
+    }
+    let vectors = k / 8;
+    // Eight warps a row where K divides so: the most blocks and the fewest
+    // dependent loads a lane (best at every DeepSeek-V4-Flash shape measured).
+    let split = [8, 4, 2, 1]
+        .into_iter()
+        .find(|s| vectors % s == 0)
+        .unwrap_or(1);
+    let rows = 16 / split;
+    ctx.fire(
+        OP,
+        Fire::at(
+            "linear/gemv.cuh",
+            crate::jit::symbol(&format!(
+                "::pie::linear::gemm_rows_bf16_kernel<{m}, {split}>"
+            )),
+        )
+        .apply(
+            Launch::grid([n.unsigned_abs().div_ceil(rows as u32), 1, 1], [256, 1, 1])
+                .programmatic(pdl),
+        ),
+        &[
+            ArgValue::Ptr(weight),
+            ArgValue::Ptr(act),
+            if bias == 0 {
+                ArgValue::ABSENT
+            } else {
+                ArgValue::Ptr(bias)
+            },
+            ArgValue::Ptr(out),
+            ArgValue::I32(n),
+            ArgValue::I32(k),
+        ],
+    )
+}
+
+/// `out[m][n] = act[m] . weight[n]` for a product at most eight columns wide,
+/// a block a row: the tactic `kernel.gemm.narrow_n` lets the GEMM tuner try.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_narrow_bf16(
+    ctx: &Ctx,
+    weight: u64,
+    act: u64,
+    bias: u64,
+    out: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), Error> {
+    const OP: &str = "linear.gemm_narrow";
+    if m <= 0 || !(1..=8).contains(&n) || k <= 0 || k % 8 != 0 {
+        return Err(refuse(
+            OP,
+            format!("needs 1..=8 columns and k in whole eights, and was handed n={n}, k={k}"),
+        ));
+    }
+    if weight == 0 || act == 0 || out == 0 || !aligned16(weight) || !aligned16(act) {
+        return Err(refuse(
+            OP,
+            "the weight and the activation are 16-byte aligned, and nothing is null",
+        ));
+    }
+    ctx.fire(
+        OP,
+        Fire::at(
+            "linear/gemv.cuh",
+            crate::jit::symbol(&format!("::pie::linear::gemm_narrow_bf16_kernel<{n}>")),
+        )
+        .apply(Launch::grid([m.unsigned_abs(), 1, 1], [256, 1, 1])),
+        &[
+            ArgValue::Ptr(weight),
+            ArgValue::Ptr(act),
+            if bias == 0 {
+                ArgValue::ABSENT
+            } else {
+                ArgValue::Ptr(bias)
+            },
+            ArgValue::Ptr(out),
+            ArgValue::I32(k),
+        ],
+    )
+}

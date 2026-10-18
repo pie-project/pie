@@ -167,6 +167,7 @@ impl Drop for RsTxnsGuard {
         let stores = crate::store::registry::get(self.model, self.engine);
         {
             let mut store = stores.rs.lock().unwrap();
+            txn.abandon(&mut store);
             rs::settle(&mut store, Some(txn));
         }
         if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
@@ -332,6 +333,7 @@ fn host_ring_plan(
                     advance: crate::store::rs::RingAdvance {
                         positioned: true,
                         settled: lane.kv.held,
+                        reach: lane.kv.held,
                         fold: fold.of(row),
                         commit_end: end,
                         head: (rows > 0).then_some(end),
@@ -343,13 +345,14 @@ fn host_ring_plan(
 }
 
 /// A working set one lane writes from where its state ends, folding all it
-/// writes, buffers nothing.
+/// writes, buffers nothing; that lane lands its state as of `snapshots` too.
 fn host_rs_plan(
     stores: &crate::store::registry::Stores,
     ids: &[crate::store::rs::RsWorkingSetId],
     groups: &LaneGroups,
     req: &crate::engine::FireRequest,
     fold: &geometry::Fold,
+    snapshots: &[u32],
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
@@ -389,10 +392,15 @@ fn host_rs_plan(
                 let high = lanes.iter().map(|&lane| span(lane).1).max().unwrap_or(end);
                 Some(low..high)
             };
+        let snapshots = match (&writes, groups.len()) {
+            (None, 1) => snapshots.to_vec(),
+            _ => Vec::new(),
+        };
         plans.push(rs::GroupPlan {
             lanes: lanes.clone(),
             writes,
             fold,
+            snapshots,
         });
     }
     Ok(rs::RsPlan::Groups(plans))
@@ -422,6 +430,7 @@ fn device_rs_plan(
             lanes: group.clone(),
             writes: Some(frozen..reserved),
             fold: group_fold(fold, first, frozen, reserved),
+            snapshots: Vec::new(),
         });
     }
     Ok(rs::RsPlan::Groups(plans))
@@ -1363,15 +1372,37 @@ impl Drop for ReportTag {
     }
 }
 
-fn take_checkpoint(stores: &crate::store::registry::Stores, checkpoint: &TakeCheckpoint) {
+/// A snapshot no checkpoint takes is released.
+fn take_checkpoint(
+    stores: &crate::store::registry::Stores,
+    checkpoint: &TakeCheckpoint,
+    success: bool,
+) {
+    let release = || {
+        if checkpoint.snapshot {
+            stores.rs.lock().unwrap().release_working_set(checkpoint.rs);
+        }
+    };
+    if !success {
+        return release();
+    }
     let owner = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
         kv.owner_of(checkpoint.kv)
     });
-    let taken = stores
-        .rs
-        .lock()
-        .unwrap()
-        .checkpoint(checkpoint.rs, checkpoint.key, owner);
+    let taken = if checkpoint.snapshot {
+        stores
+            .rs
+            .lock()
+            .unwrap()
+            .keep(checkpoint.rs, checkpoint.key, owner);
+        Ok(true)
+    } else {
+        stores
+            .rs
+            .lock()
+            .unwrap()
+            .checkpoint(checkpoint.rs, checkpoint.key, owner)
+    };
     match taken {
         Ok(true) => {
             crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
@@ -1412,16 +1443,19 @@ fn reported_rows(
     Some((first, written.tokens.clone()))
 }
 
+/// `rs` is the pass's working set, forked once the fire settles, or with
+/// `snapshot` the hidden one the fire landed its state as of `pages` in.
 struct TakeCheckpoint {
     kv: crate::store::kv::page_table::WorkingSetId,
     rs: crate::store::rs::RsWorkingSetId,
+    snapshot: bool,
     pages: u64,
     key: crate::store::kv::hash::Hash256,
 }
 
 pub struct PendingFire {
     completion: crate::engine::WorkItemCompletion,
-    checkpoint: Option<TakeCheckpoint>,
+    checkpoints: Vec<TakeCheckpoint>,
     kv: Vec<FireWs>,
     device_geometry: bool,
     rstxn: RsTxnsGuard,
@@ -1552,14 +1586,20 @@ fn stamp_block_masks(req: &mut crate::engine::FireRequest) {
     }
 }
 
+/// `device_rows`, when given, are the rows each lane carries on the device:
+/// a pooled pass stages no host tokens, and its words still state its rows,
+/// so a single-token lane takes the decode branch.
 fn stamp_lane_words(
     req: &mut crate::engine::FireRequest,
     fire_wide_mask: bool,
     carries_media: bool,
+    device_rows: Option<&[u32]>,
 ) {
     let model = crate::model::model();
-    for lane in &mut req.lanes {
-        let rows = u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
+    for (at, lane) in req.lanes.iter_mut().enumerate() {
+        let rows = device_rows
+            .and_then(|rows| rows.get(at).copied())
+            .unwrap_or_else(|| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX));
         lane.word = model.word(
             rows,
             lane.mask.is_some() || fire_wide_mask,
@@ -1708,7 +1748,9 @@ fn stamp_lane_translation(
 /// The ring plan of a device-geometry fire: every row writes the pages
 /// the fire's write indexes name and reads through the working set's mapped
 /// pages. The device decides where its tokens land, so the ring keeps every
-/// page it writes and moves on at the next fire whose positions are known.
+/// page it writes and commits nothing; what it retires is behind the first
+/// page it writes, where every row lands past, so a decode loop that never
+/// states its positions still holds a window and not its whole sequence.
 fn device_ring_plan(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
@@ -1726,6 +1768,11 @@ fn device_ring_plan(
         .map(|&index| u32::try_from(index).unwrap_or(u32::MAX))
         .collect();
     let last = written.iter().copied().max();
+    let reach = written
+        .iter()
+        .copied()
+        .min()
+        .map_or(0, |first| first.saturating_mul(stores.kv_page_size));
     let extent = u32::try_from(mapped)
         .unwrap_or(u32::MAX)
         .max(last.map_or(0, |last| last.saturating_add(1)));
@@ -1738,6 +1785,7 @@ fn device_ring_plan(
                 advance: crate::store::rs::RingAdvance {
                     positioned: false,
                     settled: 0,
+                    reach,
                     fold: None,
                     commit_end: 0,
                     head: None,
@@ -2278,7 +2326,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
         }
         stamp_block_masks(&mut req);
-        stamp_lane_words(&mut req, fire_wide_mask, carries_media);
+        stamp_lane_words(&mut req, fire_wide_mask, carries_media, None);
         if !matched.is_empty() {
             let lane_rows: Vec<u32> = req
                 .lanes
@@ -2417,7 +2465,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // What was mapped in is skipped: the pass runs from there.
             let rows = u32::try_from(full.lanes[0].tokens.len()).unwrap_or(u32::MAX);
             full = rows_of_lanes(&full, &[Some((supplied, rows))], true, page_size);
-            stamp_lane_words(&mut full, false, false);
+            stamp_lane_words(&mut full, false, false, None);
             pass_slots = pass_slots.map(|slots| slots[supplied as usize..].to_vec());
             let total = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
                 kv.supplied_tokens(ws.id)
@@ -2446,8 +2494,15 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
             _ => Vec::new(),
         };
-        let forced: Vec<u32> = checkpoints.iter().map(|&row| (row - held) as u32).collect();
-        let mut frame = frame;
+        // An engine that lands a lane's state at rows inside a fire is cut only
+        // past as many as it lands at once.
+        let snapshots = crate::model::model().eta_caps().rs_snapshots as usize;
+        let forced: Vec<u32> = checkpoints
+            .iter()
+            .skip(snapshots)
+            .step_by(snapshots + 1)
+            .map(|&row| (row - held) as u32)
+            .collect();
         // Several lanes run in pieces only where none carries recurrent
         // state, which is bound lane by lane.
         let cuts = pass_pieces(
@@ -2509,6 +2564,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 why.join("; ")
             )));
         }
+        // The pieces in frames of their own, in the order they are cut, so
+        // the pieces of concurrent prompts seal together.
+        let piece_frames = {
+            let pipeline = ctx.resources().get(&this)?;
+            piece_frames(frame, cuts.len(), || pipeline.next_frame_seq())
+        };
         let mut settles = Vec::new();
         for (at, piece) in cuts.iter().enumerate() {
             let last = at + 1 == cuts.len();
@@ -2517,7 +2578,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             } else {
                 let mut rows = rows_of_lanes(&full, piece, last, page_size);
                 let media = !rows.media.is_empty();
-                stamp_lane_words(&mut rows, false, media);
+                stamp_lane_words(&mut rows, false, media, None);
                 rows
             };
             let spans: Vec<(std::ops::Range<u64>, std::ops::Range<u64>)> = groups
@@ -2525,17 +2586,28 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .map(|(_, lanes)| written_span_of(&req, lanes, page_size))
                 .collect();
             let (slots, _) = spans[0].clone();
-            let checkpoint = state
+            let at_row = |rs, row: u64, snapshot| {
+                let pages = row / u64::from(page_size.max(1));
+                TakeCheckpoint {
+                    kv: ws.id,
+                    rs,
+                    snapshot,
+                    pages,
+                    key: keys[pages as usize - 1],
+                }
+            };
+            let mut checkpoints_here: Vec<TakeCheckpoint> = state
                 .filter(|_| checkpoints.contains(&slots.end))
-                .map(|rs| {
-                    let pages = slots.end / u64::from(page_size.max(1));
-                    TakeCheckpoint {
-                        kv: ws.id,
-                        rs,
-                        pages,
-                        key: keys[pages as usize - 1],
-                    }
-                });
+                .map(|rs| at_row(rs, slots.end, false))
+                .into_iter()
+                .collect();
+            // The furthest the engine lands of those inside the fire.
+            let mut inside: Vec<u32> = checkpoints
+                .iter()
+                .filter(|&&row| slots.start < row && row < slots.end)
+                .map(|&row| (row - slots.start) as u32)
+                .collect();
+            inside.drain(..inside.len().saturating_sub(snapshots));
             let sets: Vec<(&KvWorkingSet, Written)> = group_sets
                 .iter()
                 .zip(&spans)
@@ -2545,7 +2617,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 if ring {
                     host_ring_plan(&req, page_size, &fold, &rs_ws_ids)
                 } else {
-                    host_rs_plan(&stores, &rs_ws_ids, &groups, &req, &fold)
+                    host_rs_plan(&stores, &rs_ws_ids, &groups, &req, &fold, &inside)
                 }
             };
             let reserved = reserve(
@@ -2655,6 +2727,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 return Ok(Err(refusal));
             }
             rs_prepared.apply_to(&mut req);
+            checkpoints_here.extend(
+                rs_prepared
+                    .snapshots
+                    .iter()
+                    .map(|snap| at_row(snap.snapshot, slots.start + u64::from(snap.row), true)),
+            );
             let rs_copy = rs_prepared.state_copy();
             let rstxns = RsTxnsGuard::new(model, engine, rs_prepared.txn);
             let completion = ctx
@@ -2681,7 +2759,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     copy_src,
                     copy_dst,
                     rs_copy,
-                    if last { frame.take() } else { None },
+                    piece_frames[at],
                     attention_stages,
                     adapted,
                 )
@@ -2708,7 +2786,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .unwrap()
                 .push_back(PendingOp::Fire(PendingFire {
                     completion,
-                    checkpoint,
+                    checkpoints: checkpoints_here,
                     kv: parts,
                     device_geometry: false,
                     rstxn: rstxns,
@@ -2730,6 +2808,38 @@ pub async fn submit_pass_stamped<C: FireContext>(
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
         crate::probe_fire_count!(submit_probe.submits);
         Ok(Ok(()))
+    }
+}
+
+/// The frame each of a pass's `pieces` fires carries, the pass's frame
+/// `frame`. A piece is submitted once the one before it has retired (it
+/// reads the KV and state that one writes), so a pass alone in its frame
+/// runs each piece as a frame of its own: the first takes `frame`'s sequence
+/// and each later one the next the pipeline hands out (`next_seq`). A lane's
+/// pieces queue in their order, one frame each, and the pieces of concurrent
+/// lanes seal together rather than one launch at a time. A pass sharing its
+/// frame keeps that frame for its last piece, its earlier pieces unframed.
+pub(crate) fn piece_frames(
+    frame: Option<crate::scheduler::FrameStamp>,
+    pieces: usize,
+    mut next_seq: impl FnMut() -> u64,
+) -> Vec<Option<crate::scheduler::FrameStamp>> {
+    match frame {
+        Some(stamp) if stamp.fires == 1 => (0..pieces)
+            .map(|at| {
+                Some(if at == 0 {
+                    stamp
+                } else {
+                    crate::scheduler::FrameStamp {
+                        seq: next_seq(),
+                        ..stamp
+                    }
+                })
+            })
+            .collect(),
+        frame => (0..pieces)
+            .map(|at| if at + 1 == pieces { frame } else { None })
+            .collect(),
     }
 }
 
@@ -3162,7 +3272,7 @@ fn settle_fold(
 async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
     let PendingFire {
         completion,
-        checkpoint,
+        checkpoints,
         kv,
         device_geometry: _,
         rstxn,
@@ -3236,8 +3346,8 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
         for (ws, fold) in folds {
             settle_fold(&stores, ws, fold, &reported, success);
         }
-        if let Some(checkpoint) = checkpoint.filter(|_| success) {
-            take_checkpoint(&stores, &checkpoint);
+        for checkpoint in &checkpoints {
+            take_checkpoint(&stores, checkpoint, success);
         }
     }
 
@@ -3340,12 +3450,9 @@ async fn fire_device_geometry<C: FireContext>(
         let pass = ctx.resources().get(&fwd)?;
         (pass.rs_ws.clone(), fold_of_pass(pass))
     };
-    let mut pass_lanes = pass_lanes(ctx, &fwd)?;
-    if !rs_reps.is_empty()
-        && let Err(error) = settle_device_folds(ctx, &fwd, &pipe_fires, &mut pass_lanes).await?
-    {
-        return Ok(Err(error));
-    }
+    // A recurrent state a device-counted fold left unsettled is read where
+    // the engine left it: the fire goes ahead of the settle.
+    let pass_lanes = pass_lanes(ctx, &fwd)?;
     let ws = pass_lanes.kv[0].clone();
     let groups = lane_groups(&pass_lanes.kv.iter().map(|ws| ws.id).collect::<Vec<_>>());
     let group_sets: Vec<KvWorkingSet> = groups
@@ -3586,7 +3693,19 @@ async fn fire_device_geometry<C: FireContext>(
             lane.captures_scores = captures;
         }
     }
-    stamp_lane_words(&mut req, fire_wide_mask, false);
+    // A drafted block whose layout the device carries (a block drafter's
+    // loop on the device): its lanes are the block's, as on the host path.
+    if ctx.resources().get(&fwd)?.block_draft {
+        for lane in &mut req.lanes {
+            lane.block_draft = true;
+        }
+        stamp_block_masks(&mut req);
+    }
+    // A split narrow enough to stage no host rows still knows each lane's
+    // rows; its words carry them.
+    let device_rows: Option<Vec<u32>> =
+        (!wide).then(|| split.windows(2).map(|lane| lane[1] - lane[0]).collect());
+    stamp_lane_words(&mut req, fire_wide_mask, false, device_rows.as_deref());
     if let Err(refusal) = seat_lane_slots(&mut req, &stores, &groups).await {
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));
@@ -3600,6 +3719,7 @@ async fn fire_device_geometry<C: FireContext>(
         geometry = ?req.geometry,
         lanes = req.lanes.len(),
         qo_indptr = ?resolved_qo_indptr,
+        reads_mtp_logits = req.lanes.first().is_some_and(|lane| lane.drafts),
         "fire geometry resolved on device path"
     );
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
@@ -3689,7 +3809,7 @@ async fn fire_device_geometry<C: FireContext>(
         .unwrap()
         .push_back(PendingOp::Fire(PendingFire {
             completion,
-            checkpoint: None,
+            checkpoints: Vec::new(),
             kv: parts,
             device_geometry: true,
             rstxn: rstxns,
@@ -3784,7 +3904,7 @@ pub(crate) mod lifecycle_tests {
             .expect("test FIFO")
             .push_back(PendingOp::Fire(PendingFire {
                 completion: completion.clone(),
-                checkpoint: None,
+                checkpoints: Vec::new(),
                 kv: vec![FireWs {
                     ws: id,
                     kvtxn: Some(txn),

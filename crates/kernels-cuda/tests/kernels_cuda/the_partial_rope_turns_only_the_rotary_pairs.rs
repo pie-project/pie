@@ -76,23 +76,16 @@ fn check(head_dim: usize, q_heads: usize, kv_heads: usize, rotary_dim: usize, sp
 
 #[test]
 fn the_partial_rope_turns_only_the_rotary_pairs_every_case() {
-    a_full_rotary_head_turns_end_to_end();
-    a_partial_rotary_head_leaves_the_tail_where_it_was();
-    a_proportional_head_pairs_across_the_whole_head();
-}
-
-fn a_full_rotary_head_turns_end_to_end() {
-    check(128, 4, 2, 128, 64);
-}
-
-fn a_partial_rotary_head_leaves_the_tail_where_it_was() {
-    // the shape Qwen3 A3B actually asks for: head_dim 256, rotary_dim 64.
-    check(256, 16, 2, 64, 32);
-    check(128, 8, 1, 64, 32);
-}
-
-fn a_proportional_head_pairs_across_the_whole_head() {
-    // Gemma 4 31B's global layers: head_dim 512, a quarter of it turning,
-    // each pair half a head apart.
-    check(512, 4, 1, 128, 256);
+    // (head_dim, q_heads, kv_heads, rotary_dim, span): a full rotary head;
+    // partial ones (Qwen3 A3B's 64 of 256) leaving the tail where it was;
+    // Gemma 4's global layers, a quarter of 512 turning, each pair half a
+    // head apart.
+    for (head_dim, q_heads, kv_heads, rotary_dim, span) in [
+        (128, 4, 2, 128, 64),
+        (256, 16, 2, 64, 32),
+        (128, 8, 1, 64, 32),
+        (512, 4, 1, 128, 256),
+    ] {
+        check(head_dim, q_heads, kv_heads, rotary_dim, span);
+    }
 }

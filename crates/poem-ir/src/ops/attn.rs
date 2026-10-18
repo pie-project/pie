@@ -139,6 +139,10 @@ pub enum Attention {
         sm_scale: f32,
         o: ValueId,
         lse: ValueId,
+        /// Each row's least window position (i32 a row, from
+        /// `attention.replay_floor`): the window reads no key below it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        floor: Option<ValueId>,
     },
     DecodeSelected {
         q: ValueId,
@@ -149,6 +153,10 @@ pub enum Attention {
         head_dim: u32,
         sm_scale: f32,
         ratio: u32,
+        /// The selection holds one run of blocks per kv head, each head's
+        /// queries reading its own; else one run every head shares.
+        #[serde(default)]
+        per_head: bool,
         o: ValueId,
     },
     PrefillSelected {
@@ -161,6 +169,8 @@ pub enum Attention {
         kv_heads: u32,
         sm_scale: f32,
         ratio: u32,
+        #[serde(default)]
+        per_head: bool,
         o: ValueId,
     },
     Sink {
@@ -265,20 +275,30 @@ pub enum Attention {
         plan: ValueId,
         q_pe: ValueId,
         cache: ValueId,
+        /// The tokens a query reads back through, itself included; none
+        /// reads every row.
+        #[serde(default)]
+        window: Option<u32>,
         heads: u32,
         kv_lora_rank: u32,
         sm_scale: f32,
         o: ValueId,
+        lse: Option<ValueId>,
     },
     MlaPrefill {
         q: ValueId,
         plan: ValueId,
         q_pe: ValueId,
         cache: ValueId,
+        /// The tokens a query reads back through, itself included; none
+        /// reads every row.
+        #[serde(default)]
+        window: Option<u32>,
         heads: u32,
         kv_lora_rank: u32,
         sm_scale: f32,
         o: ValueId,
+        lse: Option<ValueId>,
     },
     MlaDecodeSelected {
         q: ValueId,
@@ -290,6 +310,7 @@ pub enum Attention {
         kv_lora_rank: u32,
         sm_scale: f32,
         o: ValueId,
+        lse: Option<ValueId>,
     },
     MlaPrefillSelected {
         q: ValueId,
@@ -301,6 +322,7 @@ pub enum Attention {
         kv_lora_rank: u32,
         sm_scale: f32,
         o: ValueId,
+        lse: Option<ValueId>,
     },
 
     SsmCausalConv1d {
@@ -434,6 +456,8 @@ pub enum Attention {
         head_dim: u32,
         top_k: u32,
         ratio: u32,
+        #[serde(default)]
+        score: IndexScore,
         selection: ValueId,
     },
     IndexKvAppend {
@@ -544,6 +568,73 @@ pub enum Attention {
         map: Option<ValueId>,
         ngram_ids: ValueId,
     },
+    /// Bounded replay's floor, a lane's least position whose window keys a
+    /// replaying layer holds: with `mark` the rows are ones it skips and the
+    /// lane's state moves past them; without, each row reads its lane's floor
+    /// (0 if it never skipped). `floor` is i32 a row.
+    ReplayFloor {
+        positions: ValueId,
+        state: ValueId,
+        mark: bool,
+        floor: ValueId,
+    },
+    /// Each row's lane's last key position in `cache` (i32 a row): its kv
+    /// extent less one, whatever row of the lane it is.
+    KvEnds {
+        request_of_token: ValueId,
+        cache: ValueId,
+        ends: ValueId,
+    },
+    /// DeepSeek's window attention with its sinks, each row reading the
+    /// `window` positions that end at `positions` (not necessarily its own:
+    /// a drafted block's rows each read the whole block), its output's tail
+    /// not turned back.
+    WindowSink {
+        q: ValueId,
+        positions: ValueId,
+        request_of_token: ValueId,
+        cache: ValueId,
+        sink: ValueId,
+        window: u32,
+        head_dim: u32,
+        sm_scale: f32,
+        o: ValueId,
+    },
+    /// DSpark's Markov head over a drafted block's readouts: the one at depth
+    /// `i` (its position past `ends - block + 1`, `ends` its lane's last key)
+    /// adds the bias `head . embed[t]` of the token `t` picked at depth `i - 1`
+    /// (at depth 0, its own in `tokens`) and picks the argmax. `tokens`,
+    /// `positions` and `ends` are i32 a readout; `biased` the biased logits.
+    MarkovWalk {
+        logits: ValueId,
+        tokens: ValueId,
+        positions: ValueId,
+        ends: ValueId,
+        embed: ValueId,
+        head: ValueId,
+        /// The most readouts a lane's run holds (the drafted block's rows).
+        block: u32,
+        biased: ValueId,
+        /// Each readout's pick (i32), its biased row's argmax.
+        picks: ValueId,
+    },
+}
+
+/// How `attention.index_topk` scores a block of keys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IndexScore {
+    /// `Σ_h relu(q_h·k)·w_h` against the one pooled key that stands for each
+    /// closed block; one selection every head shares.
+    #[default]
+    Pooled,
+    /// `max_s q_h·k_s` over the keys of each block the row sees, per head: a
+    /// run of `top_k` blocks for each head, ascending, the row's own block
+    /// always in it, and every visible block when they fit.
+    BlockMax,
+    /// `Pooled`'s ranking, its `top_k` closed blocks expanded to their raw
+    /// tokens (`ratio` a block), then the row's own open block's: `top_k *
+    /// ratio + ratio - 1` token indices a row, unused -1 (GLM-5.3-Flash).
+    PooledTokens,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -613,7 +704,16 @@ impl Operands for Attention {
                 }
             }
             Self::DecodeLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
-            Self::PrefillLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
+            Self::PrefillLse {
+                q,
+                plan,
+                cache,
+                floor,
+                ..
+            } => {
+                sink.extend([*q, *plan, *cache]);
+                sink.extend(*floor);
+            }
             Self::DecodeSelected {
                 q,
                 plan,
@@ -921,6 +1021,31 @@ impl Operands for Attention {
                 sink.extend([*ids, *state]);
                 sink.extend(*map);
             }
+            Self::ReplayFloor {
+                positions, state, ..
+            } => sink.extend([*positions, *state]),
+            Self::KvEnds {
+                request_of_token,
+                cache,
+                ..
+            } => sink.extend([*request_of_token, *cache]),
+            Self::WindowSink {
+                q,
+                positions,
+                request_of_token,
+                cache,
+                sink: sinks,
+                ..
+            } => sink.extend([*q, *positions, *request_of_token, *cache, *sinks]),
+            Self::MarkovWalk {
+                logits,
+                tokens,
+                positions,
+                ends,
+                embed,
+                head,
+                ..
+            } => sink.extend([*logits, *tokens, *positions, *ends, *embed, *head]),
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -950,10 +1075,22 @@ impl Operands for Attention {
             Self::MlaAbsorbQ { q_latent, .. } => sink.push(*q_latent),
             Self::MlaAbsorbOut { o, .. } => sink.push(*o),
             Self::MlaKvAppend { .. } => {}
-            Self::MlaDecode { o, .. } => sink.push(*o),
-            Self::MlaPrefill { o, .. } => sink.push(*o),
-            Self::MlaDecodeSelected { o, .. } => sink.push(*o),
-            Self::MlaPrefillSelected { o, .. } => sink.push(*o),
+            Self::MlaDecode { o, lse, .. } => {
+                sink.push(*o);
+                sink.extend(*lse);
+            }
+            Self::MlaPrefill { o, lse, .. } => {
+                sink.push(*o);
+                sink.extend(*lse);
+            }
+            Self::MlaDecodeSelected { o, lse, .. } => {
+                sink.push(*o);
+                sink.extend(*lse);
+            }
+            Self::MlaPrefillSelected { o, lse, .. } => {
+                sink.push(*o);
+                sink.extend(*lse);
+            }
             Self::SsmCausalConv1d { y, .. } => sink.push(*y),
             Self::ShortConv { y, .. } => sink.push(*y),
             Self::ShortConvChunked { y, .. } => sink.push(*y),
@@ -993,6 +1130,10 @@ impl Operands for Attention {
             Self::PoolLseSelected { o, lse, .. } => sink.extend([*o, *lse]),
             Self::PleNgramIds { ngram_ids, .. } => sink.push(*ngram_ids),
             Self::PleNgramIdsChunked { ngram_ids, .. } => sink.push(*ngram_ids),
+            Self::ReplayFloor { floor, .. } => sink.push(*floor),
+            Self::KvEnds { ends, .. } => sink.push(*ends),
+            Self::WindowSink { o, .. } => sink.push(*o),
+            Self::MarkovWalk { biased, picks, .. } => sink.extend([*biased, *picks]),
         }
     }
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
@@ -1051,6 +1192,8 @@ impl Operands for Attention {
             Self::PoolLseSelected { .. } => {}
             Self::PleNgramIds { .. } => {}
             Self::PleNgramIdsChunked { .. } => {}
+            Self::ReplayFloor { .. } => {}
+            Self::KvEnds { .. } | Self::WindowSink { .. } | Self::MarkovWalk { .. } => {}
         }
     }
     fn name(&self) -> &'static str {
@@ -1110,6 +1253,10 @@ impl Operands for Attention {
             Self::PoolLseSelected { .. } => "attention.pool_lse_selected",
             Self::PleNgramIds { .. } => "attention.ple_ngram_ids",
             Self::PleNgramIdsChunked { .. } => "attention.ple_ngram_ids_chunked",
+            Self::ReplayFloor { .. } => "attention.replay_floor",
+            Self::KvEnds { .. } => "attention.kv_ends",
+            Self::WindowSink { .. } => "attention.window_sink",
+            Self::MarkovWalk { .. } => "attention.markov_walk",
         }
     }
 }

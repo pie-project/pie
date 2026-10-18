@@ -210,6 +210,10 @@ pub struct Lane {
     /// it binds one; otherwise the state rides the seat.
     #[serde(default)]
     pub rs_slot: Option<u32>,
+    /// Rows, ascending inside the lane, whose recurrent state the fire lands
+    /// in slots of their own as it runs.
+    #[serde(default)]
+    pub rs_snapshots: Vec<RsSnapshot>,
     #[serde(default)]
     pub channels: Vec<Ticket>,
     pub readout: Readout,
@@ -343,6 +347,35 @@ impl Lane {
         if !matches!(self.rs, RsVerb::Fold) && !serves.rs_verbs {
             return Err(Error::unsupported("engine", RS_VERBS_WITHOUT_DEVICE_HALF));
         }
+        if !self.rs_snapshots.is_empty() {
+            if self.rs_snapshots.len() > serves.rs_snapshots as usize {
+                return Err(Error::Invalid(format!(
+                    "lane in slot {} snapshots its recurrent state at {} rows, past the {} \
+                     this engine lands in one fire",
+                    self.slot,
+                    self.rs_snapshots.len(),
+                    serves.rs_snapshots
+                )));
+            }
+            let ascending = self
+                .rs_snapshots
+                .iter()
+                .try_fold(0, |at, snap| (at < snap.row).then_some(snap.row))
+                .is_some_and(|last| last < self.rows());
+            if !ascending || !matches!(self.rs, RsVerb::Fold) || self.rs_slot.is_none() {
+                return Err(Error::Invalid(format!(
+                    "lane in slot {} snapshots its recurrent state at rows {:?} of its {}: a \
+                     snapshot is an interior row, ascending, of a lane that folds every row \
+                     into a state slot of its own",
+                    self.slot,
+                    self.rs_snapshots
+                        .iter()
+                        .map(|snap| snap.row)
+                        .collect::<Vec<_>>(),
+                    self.rows()
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -361,6 +394,7 @@ pub struct Serves {
     pub rs_verbs: bool,
     pub bidirectional: bool,
     pub adapter_attachments: bool,
+    pub rs_snapshots: u32,
 }
 
 impl Serves {
@@ -369,6 +403,7 @@ impl Serves {
         rs_verbs: false,
         bidirectional: false,
         adapter_attachments: false,
+        rs_snapshots: 0,
     };
 
     #[must_use]
@@ -378,6 +413,7 @@ impl Serves {
             rs_verbs: caps.rs_verbs,
             bidirectional: caps.bidirectional_attention,
             adapter_attachments: caps.adapter_attachments,
+            rs_snapshots: caps.rs_snapshots,
         }
     }
 }
@@ -415,6 +451,13 @@ impl SelfCondInput {
     pub fn weights(&self) -> impl Iterator<Item = f32> + '_ {
         self.weight_bits.iter().map(|&bits| f32::from_bits(bits))
     }
+}
+
+/// The state after the lane's first `row` rows, landed in state slot `slot`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RsSnapshot {
+    pub row: u32,
+    pub slot: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

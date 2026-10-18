@@ -30,7 +30,12 @@ impl Shell {
                 admits.as_ref()
                     == record::widen(
                         &self.compiled,
-                        &windows.admits_axes(totals, &self.shifted, &self.lane_shifted)
+                        &windows.admits_axes(
+                            totals,
+                            &self.shifted,
+                            &self.lane_shifted,
+                            self.staging()
+                        )
                     ),
                 "the admissibility table for {key} is not what this key derived \
                  before, so `Windows::admits` has grown an input the key does \
@@ -40,7 +45,7 @@ impl Shell {
         }
         let admits: std::sync::Arc<[crate::window::Admit]> = record::widen(
             &self.compiled,
-            &windows.admits_axes(totals, &self.shifted, &self.lane_shifted),
+            &windows.admits_axes(totals, &self.shifted, &self.lane_shifted, self.staging()),
         )
         .into();
         if self.segments.len() > record::MAX_BODIES * 4 {

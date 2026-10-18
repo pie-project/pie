@@ -85,16 +85,8 @@ fn check(head_dim: usize, q_heads: usize, kv_heads: usize, rotary_dim: usize, se
 
 #[test]
 fn the_interleaved_mrope_turns_the_rotary_prefix_as_its_own_head_every_case() {
-    a_full_rotary_head_turns_end_to_end();
-    a_partial_rotary_head_turns_its_prefix_and_leaves_the_tail();
-}
-
-fn a_full_rotary_head_turns_end_to_end() {
-    // Qwen3-VL: head_dim 128, every pair rotated, sections [24, 20, 20].
+    // Qwen3-VL: head_dim 128, every pair turned, sections [24, 20, 20].
     check(128, 4, 2, 128, [24, 20, 20]);
-}
-
-fn a_partial_rotary_head_turns_its_prefix_and_leaves_the_tail() {
-    // Qwen3.5: head_dim 256, rotary_dim 64, sections [11, 11, 10].
+    // Qwen3.5: head_dim 256, rotary_dim 64 (the tail left), [11, 11, 10].
     check(256, 8, 2, 64, [11, 11, 10]);
 }

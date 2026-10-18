@@ -10,6 +10,7 @@ repository = "https://github.com/pie-project/pie"
 [features]
 default = ["cuda"]
 cuda = ["worker/cuda"]
+rocm = ["worker/rocm"]
 metal = ["worker/metal"]
 vulkan = ["worker/vulkan"]
 wgpu = ["worker/wgpu"]

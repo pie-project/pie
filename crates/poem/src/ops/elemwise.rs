@@ -144,7 +144,7 @@ pub fn clamp(x: &Value, lo: f32, hi: f32) -> Value {
 pub fn rmsnorm_gated(
     x: &Value,
     gate: &Value,
-    weight: &Weight,
+    weight: Option<&Weight>,
     head_dim: u32,
     eps: f32,
     act: GateActivation,
@@ -155,7 +155,7 @@ pub fn rmsnorm_gated(
         Elementwise::RmsnormGated {
             x: x.id(),
             gate: gate.id(),
-            weight: r.weight(weight),
+            weight: weight.map(|w| r.weight(w)),
             head_dim,
             eps,
             act,
@@ -564,11 +564,12 @@ pub fn hc_project(normed: &Value, dynamic: &Weight, stream_count: u32) -> Value 
     let count = u64::from(stream_count);
     let mix_hc = 2 * count + count * count;
     assert!(
-        dynamic.dim(0) == mix_hc || dynamic.dim(0) == count,
-        "`{}` lands {} rows; a {stream_count}-stream mix row is {mix_hc} wide and a trunk \
-         collapse row is {count}",
+        dynamic.dim(0) == mix_hc || dynamic.dim(0) == 2 * count || dynamic.dim(0) == count,
+        "`{}` lands {} rows; a {stream_count}-stream mix row is {mix_hc} wide ({} without \
+         its combine), and a trunk collapse row is {count}",
         dynamic.name,
         dynamic.dim(0),
+        2 * count,
     );
     let mixes = r.fresh(tensor(normed.rows(), dynamic.dim(0), Dtype::F32));
     r.push(
@@ -593,6 +594,57 @@ pub fn hc_gates(
     alpha: f32,
     sinkhorn: u32,
 ) -> (Value, Value, Value) {
+    gates(
+        normed,
+        streams,
+        scale,
+        base,
+        stream_count,
+        gate_eps,
+        alpha,
+        sinkhorn,
+        true,
+    )
+}
+
+/// `hc_gates` in the independent form: the mix row is the pre and post logits
+/// alone, the post gate carries `gate_eps` as the pre gate does, and the
+/// combine landed is the identity, so a fold adds each stream to itself.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_gates_independent(
+    mixes: &Value,
+    streams: &Value,
+    scale: &Weight,
+    base: &Weight,
+    stream_count: u32,
+    gate_eps: f32,
+    alpha: f32,
+) -> (Value, Value, Value) {
+    gates(
+        mixes,
+        streams,
+        scale,
+        base,
+        stream_count,
+        gate_eps,
+        alpha,
+        0,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gates(
+    normed: &Value,
+    streams: &Value,
+    scale: &Weight,
+    base: &Weight,
+    stream_count: u32,
+    gate_eps: f32,
+    alpha: f32,
+    sinkhorn: u32,
+    comb: bool,
+) -> (Value, Value, Value) {
     let r = normed.rec();
     let count = u64::from(stream_count);
     let x = r.fresh(tensor(
@@ -612,6 +664,7 @@ pub fn hc_gates(
             gate_eps,
             alpha,
             sinkhorn,
+            comb,
             x: x.id(),
             post_mix: post_mix.id(),
             comb_mix: comb_mix.id(),
@@ -1001,6 +1054,54 @@ pub fn hadamard_signed(x: &Value, block: u32, signs: &Weight) -> Value {
         &[x],
     );
     x_out
+}
+
+/// Muse Spark's post-norm and residual gate (`elementwise.norm_gate`):
+/// `x` times `scale` (rounded), RMS-normed unscaled, and with `res` and its
+/// `gate` the residual's gated sum; else the norm alone.
+/// With `next` (`weight, eps, plus_one`), also the norm the next sublayer
+/// reads over the output, landed in the same pass.
+pub fn norm_gate(
+    x: &Value,
+    scale: Option<&Weight>,
+    res: Option<(&Value, &Weight)>,
+    eps: f32,
+    temperature: f32,
+    next: Option<(&Weight, f32, bool)>,
+) -> (Value, Option<Value>) {
+    let r = x.rec();
+    let y = r.fresh(x.ty().clone());
+    let z = next.map(|_| r.fresh(x.ty().clone()));
+    let mut ins = vec![x];
+    if let Some((stream, _)) = res {
+        assert_eq!(
+            stream.ty(),
+            x.ty(),
+            "the residual and the normed row share a type"
+        );
+        ins.push(stream);
+    }
+    r.push(
+        Elementwise::NormGate {
+            x: x.id(),
+            scale: scale.map(|s| r.weight(s)),
+            res: res.map(|(stream, _)| stream.id()),
+            gate: res.map(|(_, gate)| r.weight(gate)),
+            eps,
+            temperature,
+            next: next
+                .zip(z.as_ref())
+                .map(|((w, eps, plus_one), z)| poem_ir::NormNext {
+                    weight: r.weight(w),
+                    eps,
+                    plus_one,
+                    y: z.id(),
+                }),
+            y: y.id(),
+        },
+        &ins,
+    );
+    (y, z)
 }
 
 pub fn mul(x: &Value, y: &Value) -> Value {

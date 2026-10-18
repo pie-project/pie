@@ -1,0 +1,89 @@
+# modelopt's exports as stored: a routed bank of NVFP4 experts, and a
+# projection kept e4m3 under one tensor scale.
+
+E4M3 = raw(dtype.e4m3)
+
+F32 = raw(dtype.f32)
+
+BF16 = raw(dtype.bf16)
+
+def nvfp4_bank(reads, w, experts):
+    """A routed bank of modelopt NVFP4 experts, `experts` each expert's leg
+    stems: `.weight` (e2m1 pairs), `.weight_scale` (e4m3 per 16), and scalars
+    `.weight_scale_2` (tensor scale, landed once a row) and `.input_scale`.
+    Legs stack into `[experts, rows, cols]`; an expert's legs read one
+    activation, so its first leg's input scale is the expert's."""
+    if w.dtype != dtype.nvfp4:
+        fail("`{}`: this checkpoint's experts are NVFP4, and this deployment reads them as {}; import the deployment that keeps them NVFP4".format(w.name, w.dtype))
+    count, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    legs = len(experts[0])
+    per_leg = rows // legs
+    if len(experts) != count or per_leg * legs != rows:
+        fail("`{}` is {} and the checkpoint holds {} experts of {} legs".format(w.name, w.shape, len(experts), legs))
+    codes = []
+    scales = []
+    tensors = []
+    inputs = []
+    for stems in experts:
+        for stem in stems:
+            codes.append(src(stem + ".weight").transmute([1, per_leg, cols], grouped(w)))
+            scales.append(src(stem + ".weight_scale").transmute([1, per_leg, cols // 16], E4M3))
+            tensors.append(src(stem + ".weight_scale_2").transmute([1, 1], F32).gather(1, [0] * per_leg))
+        inputs.append(src(stems[0] + ".input_scale").transmute([1], F32))
+    counted = scales_shape(w)
+
+    # One leg an expert stacks to the bank's own rectangle; two read it as
+    # their `[2 * experts, rows / 2, ...]` stack.
+    whole = lambda expr, shape, encoding: expr if legs == 1 else expr.transmute(shape, encoding)
+    reads.extend([
+        tensor(w.name, whole(concat(0, codes), w.shape, grouped(w)), grouped(w)),
+        tensor(scales_name(w.name), whole(concat(0, scales), counted, E4M3), E4M3, shape = counted, scaling = w),
+        tensor(global_scales_name(w.name), whole(concat(0, tensors), [count, rows], F32), F32, shape = [count, rows], tensor_scaling = w),
+        tensor(input_scales_name(w.name), concat(0, inputs), F32, shape = [count]),
+    ])
+
+def fp8_tensor_leg(reads, name):
+    """The modelopt FP8 projection `name` as bf16: its e4m3 codes widened to
+    f32, scaled by the f32 `{stem}.weight_scale` it is stored under, and
+    rounded once to bf16. Its `{stem}.input_scale` is not read: the
+    projection runs on bf16 activations."""
+    stem = name[:-len(".weight")]
+    scale = stem + ".weight_scale"
+    if stored(name) != E4M3 or not has(scale) or stored(scale) != F32:
+        fail("`{}` is read as modelopt FP8, e4m3 codes under one `{}`, and is stored {}".format(name, scale, stored(name)))
+    factor = name + ".factor"
+    wide = name + ".f32"
+    scaled = name + ".scaled"
+    reads.extend([
+        tensor(factor, src(scale).transmute([1, 1], F32), F32, shape = [1, 1], internal = True),
+        tensor(wide, src(name).cast(F32), F32, internal = True),
+        tensor(scaled, out(wide).scale_by(out(factor)), F32, internal = True),
+        tensor(name + ".bf16", out(scaled).cast(BF16), BF16, internal = True),
+    ])
+    return out(name + ".bf16")
+
+
+def nvfp4_stacked_bank(reads, w, stem, legs = None):
+    """A routed bank of modelopt NVFP4 experts stored stacked: `{stem}` e2m1
+    pairs `[experts, rows, cols / 2]`, `_weight_scale` (e4m3 per 16), and
+    `_weight_scale_2` / `_input_scale` (`[experts]`, or `[experts, legs]`
+    where gate and up stack). Tensor scales land once a row; an expert's
+    legs read one activation, so its first leg's input scale is the expert's."""
+    if w.dtype not in [dtype.nvfp4, dtype.nvfp4a4]:
+        fail("`{}`: this checkpoint's experts are NVFP4, and this deployment reads them as {}; import the deployment that keeps them NVFP4".format(w.name, w.dtype))
+    count, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    legs = legs if legs != None else 1
+    per_leg = rows // legs
+    counted = scales_shape(w)
+    picks = []
+    for leg in range(legs):
+        picks.extend([leg] * per_leg)
+    # One leg a bank stores its scalars `[experts]`; two, `[experts, legs]`.
+    per_expert = lambda name: src(name) if legs == 1 else src(name).slice(1, 0, 1).transmute([count], F32)
+    per_row = lambda name: (src(name).transmute([count, 1], F32) if legs == 1 else src(name)).gather(1, picks)
+    reads.extend([
+        tensor(w.name, src(stem).transmute(w.shape, grouped(w)), grouped(w)),
+        tensor(scales_name(w.name), src(stem + "_weight_scale"), E4M3, shape = counted, scaling = w),
+        tensor(global_scales_name(w.name), per_row(stem + "_weight_scale_2"), F32, shape = [count, rows], tensor_scaling = w),
+        tensor(input_scales_name(w.name), per_expert(stem + "_input_scale"), F32, shape = [count]),
+    ])

@@ -46,9 +46,11 @@ def forward(m, inputs):
         write_offset = inputs.write_offset(at.kv)
 
         x = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
-        q = ops.elemwise.add_bias(at.q_bias, ops.linear.matmul(x, at.q_proj))
-        k = ops.elemwise.add_bias(at.k_bias, ops.linear.matmul(x, at.k_proj))
-        v = ops.elemwise.add_bias(at.v_bias, ops.linear.matmul(x, at.v_proj))
+        q, k, v = ops.layout.split_qkv(
+            ops.elemwise.add_bias(at.qkv_bias, ops.linear.matmul(x, at.qkv)),
+            m.q_heads * d,
+            m.kv_heads * d,
+        )
         seam.at(seam.ATTN_QV, [q, v])
 
         rope = m.rope

@@ -21,6 +21,10 @@ struct Rule {
     shapes: Vec<Shape>,
     when: fn(&Match) -> bool,
     replace: fn(&Match) -> Fused,
+    /// Whether a seam no shell reads (a marker such as `attn.qv`, not one of
+    /// `EXPORT_SEAMS`) may hold a value this rule folds away. Every rule
+    /// keeps every seam's values but the ones that say otherwise.
+    through_markers: bool,
 }
 
 impl Rule {
@@ -37,7 +41,15 @@ impl Rule {
             shapes,
             when: |_| true,
             replace,
+            through_markers: false,
         }
+    }
+
+    /// A marker seam (one no shell reads) does not keep this rule from
+    /// folding the value it marks.
+    fn through_markers(mut self) -> Rule {
+        self.through_markers = true;
+        self
     }
 
     fn when(mut self, when: fn(&Match) -> bool) -> Rule {
@@ -89,6 +101,13 @@ impl Match<'_> {
         match self.attr(name) {
             Some(crate::tree::Tree::F32(bits)) => f32::from_bits(*bits),
             other => panic!("`{name}` binds {other:?}, not an f32"),
+        }
+    }
+
+    fn get_f32(&self, name: &str) -> Option<f32> {
+        match self.attr(name)? {
+            crate::tree::Tree::F32(bits) => Some(f32::from_bits(*bits)),
+            _ => None,
         }
     }
 

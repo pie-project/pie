@@ -15,6 +15,27 @@ pub struct Request<'a> {
     pub head_dim: u32,
     pub enable_cuda_graph: bool,
     pub chunk_floor_128: bool,
+    /// The sliding window's `window_left`: a request's tiles cover only the
+    /// keys its one query row sees, the last `window_left + 1`.
+    pub window_left: Option<u32>,
+    /// One work item a request, its whole window one chunk: the tensor-core
+    /// decode lands each request's rows itself (the partial planes and the
+    /// fold stay laid out for a decode that cannot).
+    pub whole: bool,
+}
+
+/// Each request's pages a decode walks: all of them, or under a sliding
+/// window as many as its last `window_left + 1` keys fill, counted from the
+/// window's start, where the kernel's tiles count from.
+fn walked(op: &'static str, req: &Request<'_>) -> Result<Vec<u32>, Error> {
+    let pages = spans(op, "kv_indptr", req.kv_indptr, req.live.requests as usize)?;
+    Ok(match req.window_left {
+        Some(left) if req.page_size > 0 => {
+            let seen = (left + 1).div_ceil(req.page_size);
+            pages.iter().map(|&p| p.min(seen)).collect()
+        }
+        _ => pages,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +51,7 @@ pub fn estimate(
     req: &Request<'_>,
     max_grid_size: u32,
 ) -> Result<WorkEstimate, Error> {
-    let pages = spans(op, "kv_indptr", req.kv_indptr, req.live.requests as usize)?;
+    let pages = walked(op, req)?;
     if req.gqa_group_size == 0 {
         return Err(refuse(op, "the GQA group this schedule states is zero"));
     }
@@ -42,6 +63,14 @@ pub fn estimate(
         return Err(refuse(op, "the pool's page size is zero"));
     }
 
+    if req.whole {
+        return Ok(WorkEstimate {
+            split_kv: true,
+            kv_chunk_size_in_pages: pages.iter().copied().max().unwrap_or(0).max(1),
+            new_batch_size: req.live.requests,
+            gdy,
+        });
+    }
     if u64::from(req.batch_size) * u64::from(gdy) >= u64::from(max_grid_size) {
         return Ok(WorkEstimate {
             split_kv: req.enable_cuda_graph,
@@ -84,6 +113,7 @@ pub fn estimate(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
     pub split_kv: bool,
+    pub whole: bool,
     pub enable_cuda_graph: bool,
     pub kv_chunk_size_in_pages: u32,
     pub new_batch_size: u32,
@@ -99,7 +129,7 @@ pub fn schedule(
     max_grid_size: u32,
 ) -> Result<Schedule, Error> {
     let est = estimate(op, req, max_grid_size)?;
-    let pages = spans(op, "kv_indptr", req.kv_indptr, req.live.requests as usize)?;
+    let pages = walked(op, req)?;
 
     let mut request_indices = Vec::new();
     let mut kv_tile_indices = Vec::new();
@@ -114,7 +144,11 @@ pub fn schedule(
     }
     let o_indptr = narrow_all(op, "batch_decode_o_indptr", &o_indptr)?;
 
-    let padded_batch_size = if req.enable_cuda_graph {
+    // A whole plan's work items are its requests: a recorded one pads to the
+    // batch it was recorded for, not to the grid a split would fill.
+    let padded_batch_size = if req.enable_cuda_graph && req.whole {
+        req.batch_size as usize
+    } else if req.enable_cuda_graph {
         ((max_grid_size / est.gdy) as usize).max(req.batch_size as usize)
     } else {
         est.new_batch_size as usize
@@ -131,6 +165,7 @@ pub fn schedule(
 
     Ok(Schedule {
         split_kv: est.split_kv,
+        whole: req.whole,
         enable_cuda_graph: req.enable_cuda_graph,
         kv_chunk_size_in_pages: est.kv_chunk_size_in_pages,
         new_batch_size: est.new_batch_size,
@@ -159,6 +194,7 @@ fn layout(
     let mut info = DecodePlanInfo {
         enable_cuda_graph: sched.enable_cuda_graph,
         split_kv: sched.split_kv,
+        whole: sched.whole,
         padded_batch_size: padded as i64,
         ..DecodePlanInfo::default()
     };
@@ -309,6 +345,7 @@ pub fn static_nonsplit(
     )?;
     let sched = Schedule {
         split_kv: false,
+        whole: false,
         enable_cuda_graph,
         kv_chunk_size_in_pages: 1,
         new_batch_size: live.requests,

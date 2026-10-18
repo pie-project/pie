@@ -127,7 +127,10 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
         if generated == 1 || generated.is_multiple_of(REPORT_EVERY) {
             inferlet::session::set_tokens(prompt_tokens, generated);
         }
-        if !req.ignore_eos && stop_tokens.contains(&token) {
+        if stop_tokens.contains(&token) {
+            if req.ignore_eos || generated as usize <= req.min_tokens {
+                return ControlFlow::Continue(());
+            }
             out.finish = Some(Finish::Stop);
             return ControlFlow::Break(());
         }

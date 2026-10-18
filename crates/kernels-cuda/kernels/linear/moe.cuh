@@ -19,8 +19,6 @@ namespace wmma = ::nvcuda::wmma;
 
 [[maybe_unused]] constexpr int kMoeVecWidth = 8;
 
-constexpr int kMaxTopK = 16;
-
 constexpr int kGemvWarps = 4;
 
 using f32 = float;
@@ -490,134 +488,108 @@ __global__ void moe_topk_sigmoid_sink(
     }
 }
 
-template <class T>
-__global__ void moe_topk_sigmoid(
-    const T* __restrict__ logits,
-    i32* __restrict__ topk_idx,
-    float* __restrict__ topk_w,
-    const float* __restrict__ correction_bias,
-    int E,
-    int K,
-    bool renormalize,
-    float routed_scaling_factor,
-    const u32* __restrict__ win)
-{
-    const int n = blockIdx.x;
-
-    if (win != nullptr && n >= static_cast<int>(win[0])) return;
-
-    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
-    const int tid = threadIdx.x;
-    const T* row = logits + static_cast<long long>(plane_row) * E;
-    __shared__ float scores[kRouterMaxExperts];
-    __shared__ float orig_scores[kRouterMaxExperts];
-
-    for (int e = tid; e < E; e += blockDim.x) {
-        const float x = Elem<T>::to_f32(row[e]);
-        const float s = 1.f / (1.f + expf(-x));
-        orig_scores[e] = s;
-        scores[e] = correction_bias != nullptr ? s + correction_bias[e] : s;
-    }
-    __syncthreads();
-
-    __shared__ bool taken[kRouterMaxExperts];
-    for (int e = tid; e < E; e += blockDim.x) taken[e] = false;
-    __syncthreads();
-
-    if (tid == 0) {
-        i32* idx = topk_idx + static_cast<long long>(plane_row) * K;
-        float* w = topk_w + static_cast<long long>(plane_row) * K;
-        float sum = 0.f;
-        const int picks = K < E ? K : E;
-        for (int k = 0; k < picks; ++k) {
-            int best_i = -1;
-            float best_v = -flt_max();
-            for (int e = 0; e < E; ++e) {
-                if (taken[e]) continue;
-                const float v = scores[e];
-
-                if (best_i < 0 || v > best_v) {
-                    best_v = v;
-                    best_i = e;
-                }
-            }
-            idx[k] = best_i;
-            w[k] = orig_scores[best_i];
-            sum += orig_scores[best_i];
-            taken[best_i] = true;
-        }
-
-        for (int k = picks; k < K; ++k) {
-            idx[k] = 0;
-            w[k] = 0.f;
-        }
-        const float scale = renormalize && sum > 0.f
-            ? routed_scaling_factor / sum
-            : routed_scaling_factor;
-        for (int k = 0; k < K; ++k) w[k] *= scale;
-    }
-}
-
 __device__ __forceinline__ float sqrt_softplus(float x) {
 
     const float sp = x > 20.f ? x : log1pf(expf(x));
     return sqrtf(fmaxf(sp, 0.f));
 }
 
-template <class T>
-__global__ void moe_topk_sqrt_softplus(
+// The ranked routers, a warp a row: the sigmoid (`kSoftplus` false) or
+// DeepSeek-V4's sqrt-softplus of each logit, `K` picks by the biased score
+// (the largest, the lowest expert on a tie), weighted by the unbiased one,
+// renormalized and scaled. Lane `l` holds experts `l + 32 m` as
+// order-preserving keys, `kPer` of them; a pick is two warp reductions. A
+// score below -FLT_MAX never wins. Picks past the experts land expert 0 at
+// weight 0 (sigmoid) or -1 (sqrt-softplus).
+constexpr int kRankedRows = 4;
+
+template <class T, bool kSoftplus, int kPer>
+__global__ void __launch_bounds__(32 * kRankedRows) moe_topk_ranked(
     const T* __restrict__ logits,
     i32* __restrict__ topk_idx,
     float* __restrict__ topk_w,
     const float* __restrict__ correction_bias,
+    int rows,
     int E,
     int K,
     bool renormalize,
     float routed_scaling_factor,
     const u32* __restrict__ win)
 {
-    const int n = blockIdx.x;
-
+    const int n = static_cast<int>(blockIdx.x) * kRankedRows + static_cast<int>(threadIdx.x >> 5);
+    if (n >= rows) return;
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
-    const int tid = threadIdx.x;
+    const int tid = static_cast<int>(threadIdx.x & 31);
     const T* row = logits + static_cast<long long>(plane_row) * E;
-    __shared__ float scores[kRouterMaxExperts];
-    __shared__ float orig_scores[kRouterMaxExperts];
 
-    for (int e = tid; e < E; e += blockDim.x) {
-        const float x = Elem<T>::to_f32(row[e]);
-        const float s = sqrt_softplus(x);
-        orig_scores[e] = s;
-        scores[e] = correction_bias != nullptr ? s + correction_bias[e] : s;
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-        i32* idx = topk_idx + static_cast<long long>(plane_row) * K;
-        float* w = topk_w + static_cast<long long>(plane_row) * K;
-        float sum = 0.f;
-        for (int k = 0; k < K; ++k) {
-            int best_i = -1;
-            float best_v = -flt_max();
-            for (int e = 0; e < E; ++e) {
-                const float v = scores[e];
-                if (v > best_v) {
-                    best_v = v;
-                    best_i = e;
-                }
+    float orig[kPer];
+    unsigned key[kPer];
+#pragma unroll
+    for (int m = 0; m < kPer; ++m) {
+        const int e = tid + 32 * m;
+        key[m] = 0u;
+        orig[m] = 0.f;
+        if (e < E) {
+            const float x = Elem<T>::to_f32(row[e]);
+            const float sc = kSoftplus ? sqrt_softplus(x) : 1.f / (1.f + expf(-x));
+            orig[m] = sc;
+            const float v = correction_bias != nullptr ? sc + correction_bias[e] : sc;
+            if (v > -flt_max()) {
+                const unsigned u = __float_as_uint(v);
+                key[m] = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
             }
-            idx[k] = best_i;
-            w[k] = orig_scores[best_i];
-            sum += orig_scores[best_i];
-            scores[best_i] = -flt_max();
         }
-        const float scale = renormalize && sum > 0.f
-            ? routed_scaling_factor / sum
-            : routed_scaling_factor;
-        for (int k = 0; k < K; ++k) w[k] *= scale;
     }
+    i32* idx = topk_idx + static_cast<long long>(plane_row) * K;
+    float* w = topk_w + static_cast<long long>(plane_row) * K;
+    int my_e = -1;
+    float my_w = 0.f;
+    float sum = 0.f;
+    for (int k = 0; k < K; ++k) {
+        unsigned mine = 0u;
+        int at = 0x7fffffff;
+        float o_at = 0.f;
+#pragma unroll
+        for (int m = 0; m < kPer; ++m) {
+            if (key[m] > mine) {
+                mine = key[m];
+                at = tid + 32 * m;
+                o_at = orig[m];
+            }
+        }
+        const unsigned top = __reduce_max_sync(0xffffffffu, mine);
+        const int i = top == 0u ? -1
+                                : static_cast<int>(__reduce_min_sync(
+                                      0xffffffffu, mine == top ? static_cast<unsigned>(at) : 0x7fffffffu));
+#pragma unroll
+        for (int m = 0; m < kPer; ++m) {
+            if (tid + 32 * m == i) key[m] = 0u;
+        }
+        if (i >= 0) {
+            const float o = __shfl_sync(0xffffffffu, o_at, i & 31);
+            sum += o;
+            if (tid == (k & 31)) {
+                my_e = i;
+                my_w = o;
+            }
+        } else if (tid == (k & 31)) {
+            my_e = kSoftplus ? -1 : 0;
+            my_w = 0.f;
+        }
+        // More than 32 picks: the lane's first round lands before its
+        // second is kept.
+        if ((k & 31) == 31 || k == K - 1) {
+            const int base = k & ~31;
+            if (tid <= (k & 31)) {
+                idx[base + tid] = my_e;
+                if (!kSoftplus || my_e >= 0) w[base + tid] = my_w;
+            }
+        }
+    }
+    __syncwarp();
+    const float scale = renormalize && sum > 0.f ? routed_scaling_factor / sum : routed_scaling_factor;
+    for (int k = tid; k < K; k += 32) w[k] *= scale;
 }
 
 template <class T>
@@ -836,7 +808,11 @@ __device__ __forceinline__ void moe_note_expert(
     }
 }
 
-template <class T, bool ActByToken, int kWarps, int kUnroll>
+// `y[route] = x[route or its token] . W[routes[route]]^T`, a warp `kRows`
+// weight rows: a lane's activations are read once and meet every row, and
+// the rows' loads issue together. A route run past grid.y's 65535 rows
+// continues on grid.z.
+template <class T, bool ActByToken, int kRows>
 __device__ __forceinline__ void moe_matmul_select_gemv_body(
     const i32* __restrict__ topk_idx,
     const T* __restrict__ act,
@@ -845,94 +821,71 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
     int top_k, int K, int N, long long expert_stride,
     const T* const* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits,
-    const u32* __restrict__ win)
+    const u32* __restrict__ win,
+    int route_count)
 {
-    const int route = blockIdx.y;
-
+    const int route = static_cast<int>(blockIdx.y + blockIdx.z * gridDim.y);
+    if (route >= route_count) return;
     if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
     const int plane_route = win != nullptr
         ? route + static_cast<int>(win[1]) * top_k
         : route;
-    const int row = blockIdx.x * kWarps + threadIdx.y;
-    if (row >= N) return;
+    const int row0 = (static_cast<int>(blockIdx.x) * kGemvWarps + static_cast<int>(threadIdx.y)) * kRows;
+    if (row0 >= N) return;
     const int lane = threadIdx.x;
 
     const int expert = topk_idx[plane_route];
-
     if (expert < 0) {
         if (lane == 0) {
-            out[(long long)plane_route * N + row] = Elem<T>::from_f32(0.f);
+#pragma unroll
+            for (int r = 0; r < kRows; ++r)
+                if (row0 + r < N) out[(long long)plane_route * N + row0 + r] = Elem<T>::from_f32(0.f);
         }
         return;
     }
-
     if (blockIdx.x == 0 && threadIdx.y == 0 && lane == 0) {
         moe_note_expert(expert_hits, expert);
     }
-    const T* w = moe_expert_base(weight_base, expert_table, expert, expert_stride)
-        + (long long)row * K;
+    const T* w = moe_expert_base(weight_base, expert_table, expert, expert_stride);
+    const float4* w4[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r)
+        w4[r] = reinterpret_cast<const float4*>(w + (long long)min(row0 + r, N - 1) * K);
+    const float4* x4 = reinterpret_cast<const float4*>(
+        act + (long long)(ActByToken ? plane_route / top_k : plane_route) * K);
 
-    const T* x =
-        act + (long long)(ActByToken ? plane_route / top_k : plane_route) * K;
-
-    float acc = 0.f;
+    float acc[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
     const int vec = K / kMoeVecWidth;
-    const float4* w4 = reinterpret_cast<const float4*>(w);
-    const float4* x4 = reinterpret_cast<const float4*>(x);
-    int i = lane;
-    for (; i + 32 * (kUnroll - 1) < vec; i += 32 * kUnroll) {
-        float4 wv[kUnroll];
-        float4 xv[kUnroll];
-        #pragma unroll
-        for (int u = 0; u < kUnroll; ++u) {
-            wv[u] = w4[i + 32 * u];
-            xv[u] = x4[i + 32 * u];
-        }
-        #pragma unroll
-        for (int u = 0; u < kUnroll; ++u) {
-            const T* wb = reinterpret_cast<const T*>(&wv[u]);
-            const T* xb = reinterpret_cast<const T*>(&xv[u]);
-            #pragma unroll
+    for (int i = lane; i < vec; i += 32) {
+        float4 wv[kRows];
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) wv[r] = w4[r][i];
+        const float4 xv = x4[i];
+        const T* xb = reinterpret_cast<const T*>(&xv);
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const T* wb = reinterpret_cast<const T*>(&wv[r]);
+#pragma unroll
             for (int j = 0; j < kMoeVecWidth; ++j) {
-                acc += Elem<T>::to_f32(wb[j]) * Elem<T>::to_f32(xb[j]);
+                acc[r] += Elem<T>::to_f32(wb[j]) * Elem<T>::to_f32(xb[j]);
             }
         }
     }
-    for (; i < vec; i += 32) {
-        float4 wv = w4[i];
-        float4 xv = x4[i];
-        const T* wb = reinterpret_cast<const T*>(&wv);
-        const T* xb = reinterpret_cast<const T*>(&xv);
-        #pragma unroll
-        for (int j = 0; j < kMoeVecWidth; ++j) {
-            acc += Elem<T>::to_f32(wb[j]) * Elem<T>::to_f32(xb[j]);
-        }
-    }
-    #pragma unroll
+#pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, off);
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) acc[r] += __shfl_down_sync(0xffffffffu, acc[r], off);
     }
     if (lane == 0) {
-        out[(long long)plane_route * N + row] = Elem<T>::from_f32(acc);
+#pragma unroll
+        for (int r = 0; r < kRows; ++r)
+            if (row0 + r < N) out[(long long)plane_route * N + row0 + r] = Elem<T>::from_f32(acc[r]);
     }
 }
 
-template <class T, bool ActByToken, int kWarps, int kUnroll = 1>
-__global__ void moe_matmul_select_gemv(
-    const i32* __restrict__ topk_idx,
-    const T* __restrict__ act,
-    const T* __restrict__ weight_base,
-    T* __restrict__ out,
-    int top_k, int K, int N, long long expert_stride,
-    const T* const* __restrict__ expert_table,
-    unsigned int* __restrict__ expert_hits)
-{
-    moe_matmul_select_gemv_body<T, ActByToken, kWarps, kUnroll>(
-        topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
-        expert_table, expert_hits, nullptr);
-}
-
-template <class T>
+template <class T, int kRows>
 __global__ void moe_matmul_select_gemv_by_token(
     const i32* __restrict__ topk_idx,
     const T* __restrict__ act,
@@ -941,14 +894,15 @@ __global__ void moe_matmul_select_gemv_by_token(
     int top_k, int K, int N, long long expert_stride,
     const T* const* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits,
+    int route_count,
     const u32* __restrict__ win)
 {
-    moe_matmul_select_gemv_body<T, true, kGemvWarps, 1>(
+    moe_matmul_select_gemv_body<T, true, kRows>(
         topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
-        expert_table, expert_hits, win);
+        expert_table, expert_hits, win, route_count);
 }
 
-template <class T>
+template <class T, int kRows>
 __global__ void moe_matmul_select_gemv_by_route(
     const i32* __restrict__ topk_idx,
     const T* __restrict__ act,
@@ -957,11 +911,12 @@ __global__ void moe_matmul_select_gemv_by_route(
     int top_k, int K, int N, long long expert_stride,
     const T* const* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits,
+    int route_count,
     const u32* __restrict__ win)
 {
-    moe_matmul_select_gemv_body<T, false, kGemvWarps, 1>(
+    moe_matmul_select_gemv_body<T, false, kRows>(
         topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
-        expert_table, expert_hits, win);
+        expert_table, expert_hits, win, route_count);
 }
 
 template <class T>
@@ -1302,8 +1257,7 @@ __global__ void moe_weighted_sum_batched(
     if (h >= hidden) return;
     float acc = 0.f;
     #pragma unroll
-    for (int k = 0; k < kMaxTopK; ++k) {
-        if (k >= batch) break;
+    for (int k = 0; k < batch; ++k) {
         const float v = Elem<T>::to_f32(src[(long long)k * hidden + h]);
         acc += weights[k] * v;
     }
@@ -1329,13 +1283,75 @@ __global__ void moe_weighted_sum(
     const long long base = static_cast<long long>(plane_row) * top_k;
     float acc = 0.f;
     #pragma unroll
-    for (int k = 0; k < kMaxTopK; ++k) {
-        if (k >= top_k) break;
+    for (int k = 0; k < top_k; ++k) {
         const long long r = base + k;
         const float v = Elem<T>::to_f32(src[r * hidden + h]);
         acc += weights[r] * v;
     }
     out[static_cast<long long>(plane_row) * hidden + h] = Elem<T>::from_f32(acc);
+}
+
+// `moe_weighted_sum` eight columns a thread, 16 bytes at a time: the same
+// sum, in the same order, for every element.
+template <class T>
+__global__ void moe_weighted_sum_vec8(
+    T* __restrict__ out,
+    const T* __restrict__ src,
+    const float* __restrict__ weights,
+    int top_k, int hidden,
+    const u32* __restrict__ win)
+{
+    const int n = blockIdx.x;
+
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int h0 = (blockIdx.y * blockDim.x + threadIdx.x) * 8;
+    if (h0 >= hidden) return;
+
+    const long long base = static_cast<long long>(plane_row) * top_k;
+    float acc[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] = 0.f;
+    for (int k = 0; k < top_k; ++k) {
+        const long long r = base + k;
+        const uint4 w = *reinterpret_cast<const uint4*>(src + r * hidden + h0);
+        const T* v8 = reinterpret_cast<const T*>(&w);
+        const float wr = weights[r];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] += wr * Elem<T>::to_f32(v8[i]);
+    }
+    uint4 o;
+    T* o8 = reinterpret_cast<T*>(&o);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) o8[i] = Elem<T>::from_f32(acc[i]);
+    *reinterpret_cast<uint4*>(out + static_cast<long long>(plane_row) * hidden + h0) = o;
+}
+
+// Each token's weighted routed rows plus its shared row, summed in f32.
+template <class T>
+__global__ void moe_sum_add(
+    T* __restrict__ out,
+    const T* __restrict__ src,
+    const T* __restrict__ shared,
+    int top_k, int hidden,
+    const u32* __restrict__ win)
+{
+    const int n = blockIdx.x;
+
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int h = blockIdx.y * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+
+    const long long base = static_cast<long long>(plane_row) * top_k;
+    float acc = 0.f;
+    for (int k = 0; k < top_k; ++k) {
+        acc += Elem<T>::to_f32(src[(base + k) * hidden + h]);
+    }
+    const long long at = static_cast<long long>(plane_row) * hidden + h;
+    out[at] = Elem<T>::from_f32(acc + Elem<T>::to_f32(shared[at]));
 }
 
 template <class T>
@@ -1384,8 +1400,7 @@ __global__ void moe_weighted_sum_add(
     const long long base = static_cast<long long>(n) * top_k;
     float acc = 0.f;
     #pragma unroll
-    for (int k = 0; k < kMaxTopK; ++k) {
-        if (k >= top_k) break;
+    for (int k = 0; k < top_k; ++k) {
         const long long r = base + k;
         const float v = Elem<T>::to_f32(src[r * hidden + h]);
         acc += weights[r] * v;
@@ -1475,8 +1490,7 @@ __global__ void moe_weighted_sum_aligned(
     const long long base = static_cast<long long>(n) * top_k;
     float acc = 0.f;
 #pragma unroll
-    for (int k = 0; k < kMaxTopK; ++k) {
-        if (k >= top_k) break;
+    for (int k = 0; k < top_k; ++k) {
         const long long route = base + k;
         const int row = route_to_aligned_row[route];
         const float v = Elem<T>::to_f32(

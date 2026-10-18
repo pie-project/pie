@@ -43,6 +43,7 @@ members = [
     "crates/chat-template",
     "crates/media",
     "crates/kernels-cuda",
+    "crates/kernels-rocm",
     "crates/kernels-metal",
     "crates/engine-cuda",
     "crates/engine-metal",
@@ -88,6 +89,7 @@ default-members = [
     "crates/ztensor",
     "crates/ztensor-compat",
     "crates/kernels-cuda",
+    "crates/kernels-rocm",
     "crates/kernels-metal",
     "crates/kernels-vulkan",
     "crates/engine-vulkan",
@@ -140,7 +142,10 @@ path = "src/bin/pie-worker.rs"
 
 [features]
 default = []
-cuda = ["worker/cuda"]
+cuda = ["engine-cuda", "worker/cuda"]
+rocm = ["engine-cuda", "worker/rocm"]
+# engine-cuda is built in, under `cuda` or `rocm`.
+engine-cuda = []
 metal = ["worker/metal"]
 vulkan = ["worker/vulkan"]
 wgpu = ["worker/wgpu"]

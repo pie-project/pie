@@ -1,7 +1,11 @@
-use kernels_cuda::attn::{self, fa2, index, mla, plan, pool, selected};
+#[cfg(not(feature = "rocm"))]
+use kernels_cuda::attn::fa2;
+#[cfg(feature = "rocm")]
+use kernels_cuda::attn::paged;
+use kernels_cuda::attn::{self, index, mla, plan, pool, selected};
 use kernels_cuda::attn_dense;
 use poem_exec::{DispatchAttention, KernelError};
-use poem_ir::{Attention, StructKind};
+use poem_ir::{Attention, IndexScore, StructKind};
 
 use crate::run::{Run, StructSlot};
 use kernels_cuda::RaggedTensor;
@@ -15,7 +19,7 @@ impl DispatchAttention for Run<'_> {
 
 impl Run<'_> {
     #[allow(clippy::too_many_arguments)]
-    fn capture_scores(
+    pub(super) fn capture_scores(
         &mut self,
         q: poem_ir::ValueId,
         plan: poem_ir::ValueId,
@@ -54,7 +58,7 @@ impl Run<'_> {
         )
     }
 
-    fn attention(&mut self, op: &Attention) -> Result<(), kernels_cuda::Error> {
+    pub(super) fn attention(&mut self, op: &Attention) -> Result<(), kernels_cuda::Error> {
         match op {
             Attention::PlanDecode {
                 kv_indptr,
@@ -70,12 +74,16 @@ impl Run<'_> {
                 let built = {
                     let fire = self.bindings();
                     let seat = self.planning(*kv_indptr, *plan);
+                    #[cfg(not(feature = "rocm"))]
                     let max_grid = fa2::decode_max_grid_size(
                         seat.shape.head_dim,
                         seat.shape.num_q_heads,
                         seat.shape.num_kv_heads,
                         &fire.device,
                     );
+                    #[cfg(feature = "rocm")]
+                    let max_grid =
+                        paged::decode_max_grid_size(seat.shape.num_kv_heads, fire.device.num_sm);
                     plan::plan_decode(
                         seat.kv_indptr,
                         seat.kv_len,
@@ -201,6 +209,7 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 ratio,
+                per_head,
                 o,
             } => selected::attention_decode_selected(
                 self.ctx(),
@@ -211,11 +220,12 @@ impl Run<'_> {
                 *head_dim,
                 *sm_scale,
                 *ratio,
+                *per_head,
                 &mut self.tensor(*o),
             ),
             Attention::PrefillSelected {
                 q,
-                plan: _,
+                plan,
                 selection,
                 cache,
                 window,
@@ -223,19 +233,47 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 ratio,
+                per_head,
                 o,
-            } => selected::attention_prefill_selected(
-                self.ctx(),
-                self.ragged_q(*q),
-                self.tensor(*selection),
-                &self.pool_absolute(*cache),
-                *window,
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                *ratio,
-                &mut self.tensor(*o),
-            ),
+            } => {
+                #[cfg(not(feature = "rocm"))]
+                let _ = plan;
+                // On ROCm the rows' causal plan walks them a tile at a time,
+                // the selection masking each row's keys; the per-row walk
+                // takes what the tiled one does not cover.
+                #[cfg(feature = "rocm")]
+                if let StructSlot::Prefill(planned) = self.slot(*plan)
+                    && attn::prefill_selected_tiled(
+                        self.ctx(),
+                        self.ragged_q(*q),
+                        planned,
+                        self.tensor(*selection),
+                        &self.pool_absolute(*cache),
+                        *window,
+                        *head_dim,
+                        *kv_heads,
+                        *sm_scale,
+                        *ratio,
+                        *per_head,
+                        &mut self.tensor(*o),
+                    )?
+                {
+                    return Ok(());
+                }
+                selected::attention_prefill_selected(
+                    self.ctx(),
+                    self.ragged_q(*q),
+                    self.tensor(*selection),
+                    &self.pool_absolute(*cache),
+                    *window,
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    *ratio,
+                    *per_head,
+                    &mut self.tensor(*o),
+                )
+            }
             Attention::DecodeRel {
                 q,
                 plan,
@@ -408,7 +446,26 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 lse,
+                floor,
             } => {
+                // A floor stays 0 unless the profile turns bounded replay on;
+                // then only the fused kernels read it.
+                if floor.is_some() && self.ctx().tuning().dsv4_replay {
+                    return Err(kernels_cuda::Error::Backend {
+                        op: "attention.prefill_lse",
+                        detail: "the window is held above a replay floor, which only the fused \
+                                 `attention.pool_attention` reads"
+                            .to_string(),
+                    });
+                }
+                if attn::dsv4::ds_rows(&self.pool(*cache)) {
+                    return Err(kernels_cuda::Error::Backend {
+                        op: "attention.prefill_lse",
+                        detail: "the cache holds DeepSeek's quantized rows, which only the fused \
+                                 `attention.pool_attention` and `attention.lse_sink` read"
+                            .to_string(),
+                    });
+                }
                 attn::prefill_lse(
                     self.ctx(),
                     self.ragged_q(*q),
@@ -480,13 +537,27 @@ impl Run<'_> {
                 cache,
                 write_page,
                 write_offset,
-            } => attn::kv_append_shared(
-                self.ctx(),
-                self.ragged_lanes(*plane),
-                &self.pool(*cache),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
-            ),
+            } => {
+                let pool = self.pool(*cache);
+                if attn::dsv4::ds_rows(&pool) {
+                    // DeepSeek's quantized rows, quantized on the way in.
+                    attn::dsv4::append(
+                        self.ctx(),
+                        self.ragged_lanes(*plane).data,
+                        &pool,
+                        self.tensor(*write_page),
+                        self.tensor(*write_offset),
+                    )
+                } else {
+                    attn::kv_append_shared(
+                        self.ctx(),
+                        self.ragged_lanes(*plane),
+                        &pool,
+                        self.tensor(*write_page),
+                        self.tensor(*write_offset),
+                    )
+                }
+            }
             Attention::MlaPlan {
                 kv_indptr,
                 kv_indices: _,
@@ -636,10 +707,12 @@ impl Run<'_> {
                 plan,
                 q_pe,
                 cache,
+                window,
                 heads,
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse,
             } => mla::attention_decode(
                 self.ctx(),
                 self.ragged(*q),
@@ -649,17 +722,21 @@ impl Run<'_> {
                 *heads,
                 *kv_lora_rank,
                 *sm_scale,
+                *window,
                 &mut self.tensor(*o),
+                lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
             Attention::MlaPrefill {
                 q,
                 plan,
                 q_pe,
                 cache,
+                window,
                 heads,
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse,
             } => mla::attention_prefill(
                 self.ctx(),
                 self.ragged(*q),
@@ -669,7 +746,9 @@ impl Run<'_> {
                 *heads,
                 *kv_lora_rank,
                 *sm_scale,
+                *window,
                 &mut self.tensor(*o),
+                lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
             Attention::MlaDecodeSelected {
                 q,
@@ -681,6 +760,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse,
             } => mla::attention_decode_selected(
                 self.ctx(),
                 self.ragged_lanes(*q),
@@ -692,6 +772,7 @@ impl Run<'_> {
                 *kv_lora_rank,
                 *sm_scale,
                 &mut self.tensor(*o),
+                lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
             Attention::MlaPrefillSelected {
                 q,
@@ -703,6 +784,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
+                lse,
             } => mla::attention_prefill_selected(
                 self.ctx(),
                 self.ragged_lanes(*q),
@@ -714,6 +796,7 @@ impl Run<'_> {
                 *kv_lora_rank,
                 *sm_scale,
                 &mut self.tensor(*o),
+                lse.map(|lse| self.tensor(lse)).as_mut(),
             ),
             Attention::SsmCausalConv1d {
                 x,
@@ -848,6 +931,98 @@ impl Run<'_> {
                 *heads_per_ngram,
                 map.map(|id| self.tensor(id)),
                 &mut self.tensor(*ngram_ids),
+            ),
+            Attention::ReplayFloor {
+                positions,
+                state,
+                mark,
+                floor,
+            } => kernels_cuda::attn_replay::floor(
+                self.ctx(),
+                self.ragged_lanes(*positions),
+                &self.recurrent_absolute(*state),
+                *mark,
+                &mut self.tensor(*floor),
+            ),
+            Attention::KvEnds {
+                request_of_token,
+                cache,
+                ends,
+            } => {
+                // Each row's request against the whole fire's tables, as
+                // the window that reads these ends does.
+                let pool = self
+                    .pool_whole(*cache)
+                    .ok_or_else(|| kernels_cuda::Error::Backend {
+                        op: "attention.kv_ends",
+                        detail: "a cache over gathered seats".to_string(),
+                    })?;
+                kernels_cuda::attn_replay::kv_ends(
+                    self.ctx(),
+                    self.tensor(*request_of_token),
+                    &pool,
+                    &mut self.tensor(*ends),
+                )
+            }
+            Attention::WindowSink {
+                q,
+                positions,
+                request_of_token,
+                cache,
+                sink,
+                window,
+                head_dim,
+                sm_scale,
+                o,
+            } => {
+                const OP: &str = "attention.window_sink";
+                // Each row reads its request's pages against the whole
+                // fire's tables, as DeepSeek's fused decode does.
+                let pool = self
+                    .pool_whole(*cache)
+                    .ok_or_else(|| kernels_cuda::Error::Backend {
+                        op: OP,
+                        detail: "a window over gathered seats".to_string(),
+                    })?;
+                let q = self.tensor(*q);
+                kernels_cuda::attn::dsv4::decode(
+                    self.ctx(),
+                    q,
+                    self.tensor(*positions),
+                    self.tensor(*request_of_token),
+                    None,
+                    &pool,
+                    *window,
+                    None,
+                    self.tensor(*sink),
+                    q.width / (*head_dim).max(1),
+                    *head_dim,
+                    *sm_scale,
+                    None,
+                    &mut self.tensor(*o),
+                )
+            }
+            Attention::MarkovWalk {
+                logits,
+                tokens,
+                positions,
+                ends,
+                embed,
+                head,
+                block,
+                biased,
+                picks,
+            } => kernels_cuda::attn::markov::walk(
+                self.ctx(),
+                self.tensor(*logits),
+                self.tensor(*tokens),
+                self.tensor(*positions),
+                self.tensor(*ends),
+                self.tensor(*embed),
+                self.tensor(*head),
+                *block,
+                &mut self.tensor(*biased),
+                &mut self.tensor(*picks),
             ),
             Attention::PleNgramIdsChunked {
                 ids,
@@ -1157,6 +1332,7 @@ impl Run<'_> {
                 head_dim,
                 top_k,
                 ratio,
+                score: IndexScore::Pooled,
                 selection,
             } => index::topk(
                 self.ctx(),
@@ -1169,6 +1345,54 @@ impl Run<'_> {
                 *ratio,
                 &mut self.tensor(*selection),
             ),
+            Attention::IndexTopk {
+                q,
+                weights,
+                keys,
+                heads,
+                head_dim,
+                top_k,
+                ratio,
+                score: IndexScore::PooledTokens,
+                selection,
+            } => index::topk_tokens(
+                self.ctx(),
+                self.ragged_lanes(*q),
+                weights.map(|w| self.tensor(w)),
+                &self.pool(*keys),
+                *heads,
+                *head_dim,
+                *top_k,
+                *ratio,
+                &mut self.tensor(*selection),
+            ),
+            Attention::IndexTopk {
+                q,
+                weights,
+                keys,
+                heads,
+                head_dim,
+                top_k,
+                ratio,
+                score: IndexScore::BlockMax,
+                selection,
+            } => {
+                if weights.is_some() {
+                    return Err(kernels_cuda::Error::Unsupported {
+                        op: "attention.index_topk",
+                    });
+                }
+                index::topk_block_max(
+                    self.ctx(),
+                    self.ragged_lanes(*q),
+                    &self.pool(*keys),
+                    *heads,
+                    *head_dim,
+                    *top_k,
+                    *ratio,
+                    &mut self.tensor(*selection),
+                )
+            }
             Attention::IndexKvAppend {
                 k,
                 keys,
@@ -1282,15 +1506,37 @@ impl Run<'_> {
                 pool: into,
                 write_page,
                 write_offset,
-            } => pool::kv_append(
-                self.ctx(),
-                self.tensor(*entries),
-                self.tensor(*boundary_pos),
-                self.tensor(*boundary_req),
-                &self.pool(*into),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
-            ),
+            } => {
+                let into = self.pool(*into);
+                if attn::dsv4::ds_rows(&into) {
+                    attn::dsv4::store_entries(
+                        self.ctx(),
+                        self.tensor(*entries),
+                        self.tensor(*boundary_pos),
+                        self.tensor(*boundary_req),
+                        &into,
+                    )
+                } else if attn::index::fp4_keys(&into) {
+                    // DeepSeek-V4.1's FP4 index keys, quantized on the way in.
+                    attn::index::store_fp4(
+                        self.ctx(),
+                        self.tensor(*entries),
+                        self.tensor(*boundary_pos),
+                        self.tensor(*boundary_req),
+                        &into,
+                    )
+                } else {
+                    pool::kv_append(
+                        self.ctx(),
+                        self.tensor(*entries),
+                        self.tensor(*boundary_pos),
+                        self.tensor(*boundary_req),
+                        &into,
+                        self.tensor(*write_page),
+                        self.tensor(*write_offset),
+                    )
+                }
+            }
             Attention::PoolLse {
                 q,
                 positions,
@@ -1315,9 +1561,34 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 &mut self.tensor(*lse),
             ),
-            Attention::PoolLseSelected { .. } => Err(kernels_cuda::Error::Unsupported {
-                op: "attention.pool_lse_selected",
-            }),
+            Attention::PoolLseSelected {
+                q,
+                positions,
+                request_of_token,
+                selection,
+                entries,
+                ratio,
+                top_k,
+                heads,
+                head_dim,
+                sm_scale,
+                o,
+                lse,
+            } => pool::attention_lse_selected(
+                self.ctx(),
+                self.tensor(*q),
+                self.tensor(*positions),
+                self.tensor(*request_of_token),
+                self.tensor(*selection),
+                &self.pool(*entries),
+                *ratio,
+                *top_k,
+                *heads,
+                *head_dim,
+                *sm_scale,
+                &mut self.tensor(*o),
+                &mut self.tensor(*lse),
+            ),
             Attention::Ragged {
                 q,
                 k,
@@ -1454,6 +1725,27 @@ impl Run<'_> {
         k: u32,
     ) -> Result<kernels_cuda::Tensor, kernels_cuda::Error> {
         match self.maybe_planes(w) {
+            #[cfg(not(feature = "rocm"))]
+            Some((codes, ..)) if codes.dtype == poem_ir::Dtype::E4m3tensor => {
+                Err(kernels_cuda::Error::Backend {
+                    op,
+                    detail: "a per-tensor e4m3 plane is read by the n-gram gather alone"
+                        .to_string(),
+                })
+            }
+            #[cfg(not(feature = "rocm"))]
+            Some((codes, scales, biases, seat)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
+                kernels_cuda::linear::nvfp4::decoded_plane(
+                    self.ctx(),
+                    op,
+                    codes,
+                    scales,
+                    super::linear::tensor_scales(op, biases)?,
+                    n,
+                    k,
+                    seat,
+                )
+            }
             Some((codes, scales, biases, seat)) => kernels_cuda::linear::quant::decoded_plane(
                 self.ctx(),
                 op,

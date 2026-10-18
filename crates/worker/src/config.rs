@@ -741,7 +741,16 @@ impl ModelConfig {
         let precision = self
             .precision
             .as_deref()
-            .map(|words| words.split('+').map(|w| dtype(w, "precision")).collect())
+            .map(|words| {
+                words
+                    .split('+')
+                    .map(|w| {
+                        poem::star::precision_of(w.trim()).ok_or_else(|| {
+                            anyhow::anyhow!("model.precision = {w:?} names no dtype")
+                        })
+                    })
+                    .collect()
+            })
             .transpose()?;
         let kv = self.kv.as_deref().map(|w| dtype(w, "kv")).transpose()?;
         let off = self

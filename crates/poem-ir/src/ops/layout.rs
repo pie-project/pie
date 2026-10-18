@@ -32,6 +32,18 @@ pub enum Layout {
         q: ValueId,
         gate: ValueId,
     },
+    /// A packed row of `heads[0]` query heads and `heads[1]` key and value
+    /// heads, queries and keys `widths[0]` wide and values `widths[1]`, cut
+    /// into q, k and v of `head_dim`-wide heads, each zero past its width.
+    SplitQkvPadded {
+        packed: ValueId,
+        heads: [u32; 2],
+        widths: [u32; 2],
+        head_dim: u32,
+        q: ValueId,
+        k: ValueId,
+        v: ValueId,
+    },
     SplitRows {
         x: ValueId,
         width: u32,
@@ -74,6 +86,9 @@ pub enum Layout {
     EmbedConcat {
         ids: ValueId,
         table: ValueId,
+        /// An MXFP8 table's ue8m0 exponents, one a 32 of each row.
+        #[serde(default)]
+        scales: Option<ValueId>,
         vocab: u32,
         y: ValueId,
     },
@@ -120,6 +135,11 @@ pub enum Layout {
         ids: ValueId,
         weights: ValueId,
     },
+    /// `xs` side by side, a row each's columns after the one before's.
+    ConcatCols {
+        xs: Vec<ValueId>,
+        y: ValueId,
+    },
 }
 
 /// How a patch row's columns are laid out: channel-major over the pixels,
@@ -165,6 +185,7 @@ impl Operands for Layout {
             }
             Self::SplitQkv { packed, .. } => sink.push(*packed),
             Self::SplitQGate { packed, .. } => sink.push(*packed),
+            Self::SplitQkvPadded { packed, .. } => sink.push(*packed),
             Self::SplitRows { x, .. } => sink.push(*x),
             Self::GatherRows { x, rows, .. } => sink.extend([*x, *rows]),
             Self::Select { table, .. } => sink.push(*table),
@@ -172,7 +193,12 @@ impl Operands for Layout {
             Self::PoolRows { x, .. } => sink.push(*x),
             Self::MergeRows { x, .. } => sink.push(*x),
             Self::ScatterLiveRows { src, routes, y, .. } => sink.extend([*src, *routes, *y]),
-            Self::EmbedConcat { ids, table, .. } => sink.extend([*ids, *table]),
+            Self::EmbedConcat {
+                ids, table, scales, ..
+            } => {
+                sink.extend([*ids, *table]);
+                sink.extend(*scales);
+            }
             Self::Argmax { xs, .. } => sink.extend(xs.iter().copied()),
             Self::TopK { x, .. } => sink.push(*x),
             Self::PackRows { x, perm, .. } => sink.extend([*x, *perm]),
@@ -184,6 +210,7 @@ impl Operands for Layout {
                 segments,
                 ..
             } => sink.extend([*positions, *grids, *segments]),
+            Self::ConcatCols { xs, .. } => sink.extend(xs.iter().copied()),
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -192,6 +219,7 @@ impl Operands for Layout {
             Self::EmbedWeighted { y, .. } => sink.push(*y),
             Self::SplitQkv { q, k, v, .. } => sink.extend([*q, *k, *v]),
             Self::SplitQGate { q, gate, .. } => sink.extend([*q, *gate]),
+            Self::SplitQkvPadded { q, k, v, .. } => sink.extend([*q, *k, *v]),
             Self::SplitRows { left, right, .. } => sink.extend([*left, *right]),
             Self::GatherRows { y, .. } => sink.push(*y),
             Self::Select { y, .. } => sink.push(*y),
@@ -208,6 +236,7 @@ impl Operands for Layout {
             Self::UnpackRows { y, .. } => sink.push(*y),
             Self::Pixels { y, .. } => sink.push(*y),
             Self::GridTaps { ids, weights, .. } => sink.extend([*ids, *weights]),
+            Self::ConcatCols { y, .. } => sink.push(*y),
         }
     }
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
@@ -216,6 +245,7 @@ impl Operands for Layout {
             | Self::EmbedWeighted { .. }
             | Self::SplitQkv { .. }
             | Self::SplitQGate { .. }
+            | Self::SplitQkvPadded { .. }
             | Self::SplitRows { .. }
             | Self::GatherRows { .. }
             | Self::Select { .. }
@@ -227,7 +257,8 @@ impl Operands for Layout {
             | Self::PackRows { .. }
             | Self::UnpackRows { .. }
             | Self::Pixels { .. }
-            | Self::GridTaps { .. } => {}
+            | Self::GridTaps { .. }
+            | Self::ConcatCols { .. } => {}
             Self::ScatterRows { y_out, y, .. } | Self::ScatterLiveRows { y_out, y, .. } => {
                 sink.push((*y_out, *y))
             }
@@ -239,6 +270,7 @@ impl Operands for Layout {
             Self::EmbedWeighted { .. } => "layout.embed_weighted",
             Self::SplitQkv { .. } => "layout.split_qkv",
             Self::SplitQGate { .. } => "layout.split_q_gate",
+            Self::SplitQkvPadded { .. } => "layout.split_qkv_padded",
             Self::SplitRows { .. } => "layout.split_rows",
             Self::GatherRows { .. } => "layout.gather_rows",
             Self::Select { .. } => "layout.select",
@@ -253,6 +285,7 @@ impl Operands for Layout {
             Self::UnpackRows { .. } => "layout.unpack_rows",
             Self::Pixels { .. } => "layout.pixels",
             Self::GridTaps { .. } => "layout.grid_taps",
+            Self::ConcatCols { .. } => "layout.concat_cols",
         }
     }
 }

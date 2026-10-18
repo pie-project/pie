@@ -62,7 +62,7 @@ pub struct Tuned {
 /// The check models among the artifacts stamped for `backend`: those
 /// `req.check` names, or the smallest.
 #[cfg(any(
-    feature = "cuda",
+    feature = "engine-cuda",
     feature = "vulkan",
     all(feature = "metal", target_vendor = "apple")
 ))]
@@ -100,7 +100,7 @@ fn pick_models(
 /// The `.zt` artifacts under `store` stamped for `backend`, as (path,
 /// deployment), smallest file first.
 #[cfg(any(
-    feature = "cuda",
+    feature = "engine-cuda",
     feature = "vulkan",
     all(feature = "metal", target_vendor = "apple")
 ))]
@@ -134,7 +134,7 @@ fn artifacts(store: &Path, backend: &str) -> Vec<(std::path::PathBuf, String)> {
 /// A backend's tune output as [`Tuned`]: each backend has its own type, with
 /// the same field names.
 #[cfg(any(
-    feature = "cuda",
+    feature = "engine-cuda",
     feature = "vulkan",
     all(feature = "metal", target_vendor = "apple")
 ))]
@@ -176,7 +176,7 @@ tune_grid!(tune_vulkan, engine_vulkan, "vulkan");
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 tune_grid!(tune_metal, engine_metal, "metal");
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "engine-cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     let models = pick_models("cuda", req)?;
     let out = engine_cuda::tune::run(Some(req.profiles), &models, say)?;
@@ -189,7 +189,7 @@ fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, 
 pub fn backends() -> Vec<Backend> {
     #[allow(unused_mut)]
     let mut out = Vec::new();
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "engine-cuda")]
     out.push(Backend {
         name: "cuda",
         registry: engine_cuda::chip::registry,

@@ -1,10 +1,14 @@
 #![cfg(feature = "cuda")]
 
+//! The gated delta step, on each of its arms, answers the recurrence: its
+//! output and the state it folds, leaves or folds where a predicate says.
+
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::ssm;
 use kernels_cuda::tensor::{RecurrentPool, Tensor};
 
+#[derive(Clone, Copy)]
 struct Geometry {
     k_heads: u32,
     v_heads: u32,
@@ -30,11 +34,6 @@ enum Boundary {
 /// Elements past each slot's state bank; eight keeps the fused arm's
 /// vector stride, anything else sends a 128-wide head to the staged arm.
 const PAD: usize = 8;
-
-#[allow(clippy::too_many_lines)]
-fn check(geo: Geometry, window: Option<Window>) {
-    check_at(geo, window, Boundary::Folded, PAD);
-}
 
 #[allow(clippy::too_many_lines)]
 fn check_at(geo: Geometry, window: Option<Window>, boundary: Boundary, pad: usize) {
@@ -174,112 +173,38 @@ fn check_at(geo: Geometry, window: Option<Window>, boundary: Boundary, pad: usiz
     }
 }
 
+const fn geo(k_heads: u32, v_heads: u32, k_dim: u32, v_dim: u32) -> Geometry {
+    Geometry {
+        k_heads,
+        v_heads,
+        k_dim,
+        v_dim,
+    }
+}
+
 #[test]
 fn the_fused_gdn_step_answers_what_the_recurrence_says_every_case() {
-    the_fused_step_answers_at_a_128_wide_head_with_a_gqa_fan();
-    the_fused_step_retires_a_buckets_padded_rows_and_reads_the_planes_where_the_window_says();
-    the_fused_step_answers_at_a_64_wide_head();
-    the_fused_step_answers_at_an_uneven_head();
-    every_step_arm_leaves_the_state_when_the_fire_buffers_its_rows();
-    every_step_arm_folds_the_lanes_the_predicate_names();
-}
-
-/// A speculative window buffers its rows unfolded: each arm answers what the
-/// recurrence says and leaves the state where it found it. The fused arm at
-/// a vector stride, the staged arm at a 128-wide head off it, and the
-/// per-value arm at a head the fused tile does not fit.
-fn every_step_arm_leaves_the_state_when_the_fire_buffers_its_rows() {
-    for (geo, pad) in step_arms() {
+    // The fused arm at a 128-wide head with a GQA fan, and at an uneven one.
+    check_at(geo(2, 4, 128, 128), None, Boundary::Folded, PAD);
+    check_at(geo(2, 2, 96, 48), None, Boundary::Folded, PAD);
+    // A bucket's padded rows retired, the planes read where the window says.
+    let window = Window {
+        bucket: 3,
+        live: 2,
+        base: 1,
+    };
+    check_at(geo(2, 2, 128, 128), Some(window), Boundary::Folded, PAD);
+    // A speculative window's rows buffered unfolded (the state left where
+    // it was), and folded on the lanes a predicate names, on each arm: the
+    // fused one at a vector stride, the staged one at a 128-wide head off
+    // it, the per-value one at a head the fused tile does not fit.
+    let arms = [
+        (geo(2, 4, 128, 128), PAD),
+        (geo(1, 2, 128, 128), 4),
+        (geo(1, 2, 40, 40), PAD),
+    ];
+    for (geo, pad) in arms {
         check_at(geo, None, Boundary::Buffered, pad);
-    }
-}
-
-fn every_step_arm_folds_the_lanes_the_predicate_names() {
-    for (geo, pad) in step_arms() {
         check_at(geo, None, Boundary::Predicated([1, 0, 1]), pad);
     }
-}
-
-fn step_arms() -> [(Geometry, usize); 3] {
-    [
-        (
-            Geometry {
-                k_heads: 2,
-                v_heads: 4,
-                k_dim: 128,
-                v_dim: 128,
-            },
-            PAD,
-        ),
-        (
-            Geometry {
-                k_heads: 1,
-                v_heads: 2,
-                k_dim: 128,
-                v_dim: 128,
-            },
-            4,
-        ),
-        (
-            Geometry {
-                k_heads: 1,
-                v_heads: 2,
-                k_dim: 40,
-                v_dim: 40,
-            },
-            PAD,
-        ),
-    ]
-}
-
-fn the_fused_step_answers_at_a_128_wide_head_with_a_gqa_fan() {
-    check(
-        Geometry {
-            k_heads: 2,
-            v_heads: 4,
-            k_dim: 128,
-            v_dim: 128,
-        },
-        None,
-    );
-}
-
-fn the_fused_step_retires_a_buckets_padded_rows_and_reads_the_planes_where_the_window_says() {
-    check(
-        Geometry {
-            k_heads: 2,
-            v_heads: 2,
-            k_dim: 128,
-            v_dim: 128,
-        },
-        Some(Window {
-            bucket: 3,
-            live: 2,
-            base: 1,
-        }),
-    );
-}
-
-fn the_fused_step_answers_at_a_64_wide_head() {
-    check(
-        Geometry {
-            k_heads: 1,
-            v_heads: 1,
-            k_dim: 64,
-            v_dim: 64,
-        },
-        None,
-    );
-}
-
-fn the_fused_step_answers_at_an_uneven_head() {
-    check(
-        Geometry {
-            k_heads: 2,
-            v_heads: 2,
-            k_dim: 96,
-            v_dim: 48,
-        },
-        None,
-    );
 }

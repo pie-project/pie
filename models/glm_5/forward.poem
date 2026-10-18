@@ -1,8 +1,23 @@
-# The forward of GLM-5: latent attention over the keys the indexer picks,
-# then a dense or routed SwiGLU MLP.
+# The forward of GLM-5: latent attention over the keys the indexer picks
+# (or, on a layer with none, the keys the last indexer picked), then a dense
+# or routed SwiGLU MLP; and the MTP head drafting from the trunk's last
+# hidden rows.
 
-def cache(c, space, a):
+# An e4m3 kv deployment keeps the latent rows as vLLM's standard fp8 rows: the
+# 512 latent and 64 rotated dims e4m3 under one scale of 1, 576 bytes a
+# position in a u8 plane. The index keys stay at bf16.
+FP8_ROW = 576
+
+def fp8_rows(m):
+    return m.kv == dtype.e4m3
+
+def cache(c, space, a, fp8 = False):
     """`a`'s latent rows in the kv `space`."""
+    if fp8:
+        if a.kv_lora_rank != 512 or a.qk_rope_head_dim != 64:
+            fail("fp8 latent rows hold 512 latent and 64 rotated dims, and this attention's are {} and {}".format(a.kv_lora_rank, a.qk_rope_head_dim))
+        c.kv(space, a.kv, [FP8_ROW], a.qk_rope_head_dim)
+        return
     c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
 
 def plans(inputs, heads, kv_lora_rank):
@@ -15,8 +30,9 @@ def plans(inputs, heads, kv_lora_rank):
     )
 
 def attention(x, inputs, plan, a, positions = None, select = None):
-    """Latent attention of the rows `x`. `select(q_a)`, if given, picks the
-    keys each query reads; `positions` default to the rows' own."""
+    """Latent attention of the rows `x`, and the selection it read through.
+    `select(q_a)`, if given, picks the keys each query reads; `positions`
+    default to the rows' own."""
     pages = inputs.kv(a.kv)
     if positions == None:
         positions = inputs.positions()
@@ -31,7 +47,10 @@ def attention(x, inputs, plan, a, positions = None, select = None):
 
     selection = select(q_a) if select != None else None
 
-    if a.theta != None:
+    if a.theta != None and a.interleaved:
+        kv_c, k_pe = ops.attn.mla_latents(kv_a, a.kv_a_norm, a.kv_a_norm_eps, a.kv_lora_rank)
+        k_pe = ops.elemwise.rope_partial_last(k_pe, positions, a.qk_rope_head_dim, a.qk_rope_head_dim, a.theta, True)
+    elif a.theta != None:
         kv_c, k_pe = ops.attn.mla_latents_rope(
             kv_a,
             positions,
@@ -46,9 +65,11 @@ def attention(x, inputs, plan, a, positions = None, select = None):
     ops.attn.mla_kv_append(kv_c, k_pe, pages, write_page, write_offset)
 
     q_nope, q_pe = ops.attn.mla_split_q_b(q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim)
-    if a.theta != None:
+    if a.theta != None and a.interleaved:
+        q_pe = ops.elemwise.rope_partial_last(q_pe, positions, a.qk_rope_head_dim, a.qk_rope_head_dim, a.theta, True)
+    elif a.theta != None:
         q_pe = ops.elemwise.rope_partial_q(q_pe, positions, a.qk_rope_head_dim, a.qk_rope_head_dim, a.theta)
-    return attend(x, q_nope, q_pe, pages, plan, a, selection)
+    return attend(x, q_nope, q_pe, pages, plan, a, selection), selection
 
 def attend(x, q_nope, q_pe, pages, plan, a, selection = None):
     """The split queries `q_nope`/`q_pe` of the rows `x` scored against the
@@ -80,57 +101,115 @@ def arm(decode, q, plan, q_pe, selection, pages, a):
     score = ops.attn.mla_decode_selected if decode else ops.attn.mla_prefill_selected
     return score(q, plan, q_pe, selection, pages, a.heads, a.kv_lora_rank, a.sm_scale)
 
+def whole(inputs, heads, kv_lora_rank):
+    """A plan that reads every row of `inputs` through the prefill arm."""
+    return struct(decode = None, prefill = ops.attn.mla_plan(inputs, heads, kv_lora_rank))
+
 def caches(m, c):
-    kv = c.kv_space(m.kv)
-    index = c.kv_space(m.kv)
-    for w in m.layers:
-        a = w.attn
-        cache(c, kv, a)
-        c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
+    fp8 = fp8_rows(m)
+    kv = c.kv_space(dtype.u8 if fp8 else m.kv)
+    index = c.kv_space(dtype.bf16 if fp8 else m.kv)
+    attns = [w.attn for w in m.layers]
+    if m.mtp != None:
+        attns.append(m.mtp.attn)
+    for a in attns:
+        cache(c, kv, a, fp8)
+        if a.indexer != None:
+            c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
 
 def forward(m, inputs):
     plan = plans(inputs, m.heads, m.kv_lora_rank)
+    positions = inputs.positions()
     y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
 
-    def block(l, w, y):
+    def block(l, w, carried):
+        y, selection = carried
         x = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
-        o = attention(x, inputs, plan, w.attn, select = lambda q_a: index_select(x, q_a, inputs, w.attn.indexer))
+        a = w.attn
+        if a.indexer != None:
+            keys = index_keys(x, inputs, positions, a.indexer)
+            select = lambda q_a: index_select(x, q_a, keys, positions, a.indexer)
+        elif selection == None:
+            fail("layer {} reads the selection of an indexer no layer before it runs".format(l))
+        else:
+            ranked = selection
+            select = lambda q_a: ranked
+        o, selection = attention(x, inputs, plan, a, positions = positions, select = select)
         adapted = fact.has(fact.Adapter)
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
         y = ops.elemwise.residual_add(o, y)
 
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, w.mlp_norm_eps)
-        return ops.elemwise.residual_add(mlp(x, w.mlp), y)
+        return ops.elemwise.residual_add(mlp(x, w.mlp), y), selection
 
-    y = inputs.fold_layers(m.layers, y, block)
+    y, _ = inputs.fold_layers(m.layers, (y, None), block)
+    y = ops.layout.gather_rows(y, inputs.readout_rows())
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
-    return ops.linear.lm_head(x, m.head)
+    logits = ops.linear.lm_head(x, m.head)
+    if m.mtp != None:
+        draft(m, inputs, y, positions, logits)
+    return logits
+
+def draft(m, inputs, y, positions, logits):
+    """The MTP head's drafted token, from the trunk's last hidden rows `y`
+    and the token its logits pick."""
+    mtp = m.mtp
+    drafted = inputs.on(fact.drafts())
+    plan = whole(drafted, m.heads, m.kv_lora_rank)
+    hidden = y.on(fact.drafts())
+    positions = positions.on(fact.drafts())
+    token = ops.layout.argmax([logits.on(fact.drafts())])
+
+    e = ops.layout.embed(token, m.embed, m.vocab)
+    e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
+    h = ops.elemwise.rmsnorm(hidden, mtp.hnorm, mtp.norm_eps)
+    fused = ops.elemwise.residual_add(
+        ops.linear.matmul(e, mtp.e_proj),
+        ops.linear.matmul(h, mtp.h_proj),
+    )
+    x = ops.elemwise.rmsnorm(fused, mtp.attn_norm, mtp.norm_eps)
+    keys = index_keys(x, drafted, positions, mtp.attn.indexer)
+    select = lambda q_a: index_select(x, q_a, keys, positions, mtp.attn.indexer)
+    o, _ = attention(x, drafted, plan, mtp.attn, positions = positions, select = select)
+    r = ops.elemwise.residual_add(o, fused)
+    x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.norm_eps)
+    r = ops.elemwise.residual_add(mlp(x, mtp.mlp), r)
+    proposal = ops.linear.lm_head(ops.elemwise.rmsnorm(r, mtp.norm, mtp.norm_eps), m.head)
+    seam.at(seam.MTP, [proposal])
+    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([proposal])])
 
 def mlp(x, f):
     if not f.routed:
         return ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, f.gate_up), f.inter), f.down)
-    routes, weights = ops.linear.moe_topk_sigmoid(
-        ops.linear.matmul(x, f.router),
-        f.experts,
-        f.top_k,
-        f.norm_weights,
-        f.scaling,
-    )
+    logits = ops.linear.matmul(x, f.router)
+    if f.bias != None:
+        routes, weights = ops.linear.moe_topk_sigmoid_biased(
+            logits,
+            f.bias,
+            f.experts,
+            f.top_k,
+            f.norm_weights,
+            f.scaling,
+        )
+    else:
+        routes, weights = ops.linear.moe_topk_sigmoid(logits, f.experts, f.top_k, f.norm_weights, f.scaling)
+
+    def select(act, bank):
+        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
+            return ops.linear.moe_matmul_select(act, bank, routes, f.top_k)
+        return ops.linear.moe_matmul_select_quant(act, bank, routes, f.top_k)
+
     act = ops.linear.mlp_swiglu(ops.linear.matmul(x, f.shared.gate_up), f.shared.inter)
     shared = ops.linear.matmul(act, f.shared.down)
-    packed = ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k)
-    act = ops.linear.mlp_swiglu(packed, f.inter)
-    routed = ops.linear.moe_weighted_sum(
-        ops.linear.moe_matmul_select(act, f.down, routes, f.top_k),
-        weights,
-    )
+    act = ops.linear.mlp_swiglu(select(x, f.gate_up), f.inter)
+    routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
     return ops.elemwise.residual_add(shared, routed)
 
-def index_select(x, q_a, inputs, ix):
+def index_keys(x, inputs, positions, ix):
+    """The indexer's keys of the rows `x` landed in its cache, ahead of the
+    query path so they run beside it."""
     keys = inputs.kv(ix.keys)
-    positions = inputs.positions()
     write_page = inputs.write_page(ix.keys)
     write_offset = inputs.write_offset(ix.keys)
     k = ops.attn.index_layernorm_rope(
@@ -143,6 +222,9 @@ def index_select(x, q_a, inputs, ix):
         ix.theta,
     )
     ops.attn.index_kv_append(k, keys, write_page, write_offset)
+    return keys
+
+def index_select(x, q_a, keys, positions, ix):
     q = ops.attn.index_rope(
         ops.linear.matmul(q_a, ix.q_proj),
         positions,
@@ -151,5 +233,5 @@ def index_select(x, q_a, inputs, ix):
         ix.rope_dim,
         ix.theta,
     )
-    weights = ops.linear.matmul(q_a, ix.weights_proj)
+    weights = ops.linear.matmul(q_a if ix.weights_from == "q_a" else x, ix.weights_proj)
     return ops.attn.index_topk(q, weights, keys, ix.heads, ix.head_dim, ix.top_k, 1)

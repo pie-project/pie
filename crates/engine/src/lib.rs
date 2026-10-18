@@ -33,8 +33,8 @@ pub use engine::{CompletionSink, Engine, KvWrites, StepDone, StepOutcome};
 pub use error::{Error, Result};
 pub use fire::{
     Attachment, Boundary, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket,
-    KvDelta, Lane, LaneReadout, LayerScores, Mask, Masking, MediaEncode, Readout, RsReset, RsVerb,
-    Serves, Step,
+    KvDelta, Lane, LaneReadout, LayerScores, Mask, Masking, MediaEncode, Readout, RsReset,
+    RsSnapshot, RsVerb, Serves, Step,
 };
 pub use load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
 pub use program::{

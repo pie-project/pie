@@ -538,6 +538,10 @@ fn facts(builder: &mut GlobalsBuilder) {
         Ok(PredicateValue(fact::bidirectional()))
     }
 
+    fn encode() -> anyhow::Result<PredicateValue> {
+        Ok(PredicateValue(fact::encode()))
+    }
+
     /// The rows of the stream `name` (text, image, video, audio, context,
     /// reference).
     fn stream(#[starlark(require = pos)] name: &str) -> anyhow::Result<PredicateValue> {

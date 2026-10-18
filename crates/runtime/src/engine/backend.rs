@@ -35,7 +35,7 @@ impl EngineSpec {
 
 pub mod open {
     #[cfg(any(
-        feature = "cuda",
+        feature = "engine-cuda",
         feature = "vulkan",
         feature = "wgpu",
         feature = "xla",
@@ -43,14 +43,14 @@ pub mod open {
     ))]
     use super::{EngineBox, Result};
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "engine-cuda")]
     pub fn cuda(boot: engine_cuda::DeviceBoot) -> Result<EngineBox> {
         engine_cuda::open(boot, crate::engine::load::contract_for)
             .map(|engine| Box::new(engine) as EngineBox)
             .map_err(::anyhow::Error::msg)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "engine-cuda")]
     pub fn cuda_group(mut boots: Vec<engine_cuda::DeviceBoot>) -> Result<(EngineBox, usize)> {
         match boots.len() {
             0 => Err(super::anyhow!("a cuda group requires at least one rank")),
@@ -108,16 +108,16 @@ pub mod open {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "engine-cuda")]
 pub use engine_cuda::comm::Transport;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "engine-cuda")]
 pub use engine_cuda::{DeviceBoot, Diagnostics, Graphs, Knobs, Recording, World, ordinal_of};
 
 mod remote;
 
 pub use remote::{RemoteDisconnectHandle, RemoteEngine};
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "engine-cuda")]
 #[must_use]
 pub fn envelopes_resolved() -> u64 {
     engine_cuda::Shell::envelopes_resolved()

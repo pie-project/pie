@@ -1,0 +1,69 @@
+# How a MiniMax-M3 checkpoint is laid out: the language model under
+# `language_model.`, each routed expert its own `w1`/`w3`/`w2` planes, the
+# vision tower beside it unread.
+
+def lifted(w):
+    """`w`'s shape, its cut axis left for the stack to fill."""
+    dims = list(w.shape)
+    dims[w.cut_axis] = -1
+    return dims
+
+def expert_bank(reads, w, names):
+    """The planes `names`, stacked on the leading axis, read as the bank `w`."""
+    read = logical(stored(names[0]))
+    reads.read_expr(w, concat(0, [src(n) for n in names]).transmute(lifted(w), raw(read)))
+
+def at(l, leaf):
+    return "language_model.model.layers.{}.{}".format(l, leaf)
+
+def formats(m):
+    return [format(
+        "huggingface",
+        recognizes = lambda c: has("language_model.model.embed_tokens.weight"),
+        read = lambda reads: read(m, reads),
+    )]
+
+def read(m, reads):
+    reads.read(m.embed, "language_model.model.embed_tokens.weight")
+    reads.read(m.final_norm, "language_model.model.norm.weight")
+    reads.read(m.head, "language_model.lm_head.weight")
+    for l, w in enumerate(m.layers):
+        n = lambda leaf: at(l, leaf)
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
+        a = w.attn
+        for p, name in [
+            (a.q_proj, "q_proj"),
+            (a.k_proj, "k_proj"),
+            (a.v_proj, "v_proj"),
+            (a.o_proj, "o_proj"),
+            (a.q_norm, "q_norm"),
+            (a.k_norm, "k_norm"),
+        ]:
+            reads.read(p, n("self_attn.{}.weight".format(name)))
+        ix = w.indexer
+        if ix != None:
+            for p, name in [
+                (ix.q_proj, "index_q_proj"),
+                (ix.k_proj, "index_k_proj"),
+                (ix.q_norm, "index_q_norm"),
+                (ix.k_norm, "index_k_norm"),
+            ]:
+                reads.read(p, n("self_attn.{}.weight".format(name)))
+        if w.dense != None:
+            read_mlp(reads, w.dense, lambda leaf: n("mlp." + leaf))
+            continue
+        f = w.mlp
+        moe = lambda leaf: n("block_sparse_moe." + leaf)
+        reads.read(f.router, moe("gate.weight"))
+        reads.read(f.bias, moe("e_score_correction_bias"))
+        gate_up = []
+        for e in range(f.experts):
+            gate_up += [moe("experts.{}.w1.weight".format(e)), moe("experts.{}.w3.weight".format(e))]
+        expert_bank(reads, f.gate_up, gate_up)
+        expert_bank(reads, f.down, [moe("experts.{}.w2.weight".format(e)) for e in range(f.experts)])
+        read_mlp(reads, f.shared, lambda leaf: moe("shared_experts." + leaf))
+
+def read_mlp(reads, f, n):
+    reads.read_concat(f.gate_up, [n("gate_proj.weight"), n("up_proj.weight")])
+    reads.read(f.down, n("down_proj.weight"))

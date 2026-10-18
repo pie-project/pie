@@ -49,6 +49,8 @@ pub struct RsPreparedWrite {
     pub(crate) buffers: Vec<RsBufferTarget>,
     pub(crate) allocated: Vec<RsSlotId>,
     pub(crate) seq: u64,
+    /// Rows the fire lands the state as of, each in a slot of its own.
+    pub(crate) snapshots: Vec<(u32, RsSlotId)>,
 }
 
 impl RsPreparedWrite {
@@ -85,14 +87,29 @@ pub struct RsPendingFold {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RsPublished {
     seqs: Vec<u64>,
+    snapshots: Vec<RsSnapshot>,
+}
+
+/// A working set's state as of `row` of the fire, held by `snapshot`, a
+/// hidden working set no process holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RsSnapshot {
+    pub ws: RsWorkingSetId,
+    pub row: u32,
+    pub slot: RsSlotId,
+    pub snapshot: RsWorkingSetId,
 }
 
 impl RsPublished {
-    pub(super) fn new(seqs: Vec<u64>) -> Self {
-        Self { seqs }
+    pub(super) fn new(seqs: Vec<u64>, snapshots: Vec<RsSnapshot>) -> Self {
+        Self { seqs, snapshots }
     }
 
     pub fn seqs(&self) -> &[u64] {
         &self.seqs
+    }
+
+    pub fn snapshots(&self) -> &[RsSnapshot] {
+        &self.snapshots
     }
 }

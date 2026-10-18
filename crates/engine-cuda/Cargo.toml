@@ -17,7 +17,8 @@ toml = "1.1"
 libc = "0.2"
 serde_json = "1"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
-kernels-cuda = { path = "../kernels-cuda" }
+kernels-cuda = { path = "../kernels-cuda", optional = true }
+kernels-rocm = { path = "../kernels-rocm", optional = true }
 
 engine = { path = "../engine" }
 
@@ -43,11 +44,20 @@ cudarc = { version = "0.19.8", optional = true, default-features = false, featur
 ] }
 
 [features]
-default = ["probe"]
+# Without a device runtime the engine builds over kernels-cuda, as a
+# runtimeless build.
+default = ["probe", "dep:kernels-cuda"]
 
 probe = []
 
-cuda = ["dep:cudarc", "kernels-cuda/cuda", "cudarc/cuda-13000"]
+cuda = ["device", "dep:cudarc", "dep:kernels-cuda", "kernels-cuda/cuda", "cudarc/cuda-13000"]
+
+# The same engine on AMD GPUs over HIP: kernels-rocm's kernels, hiprtc and
+# the HIP runtime in place of kernels-cuda, NVRTC and the CUDA runtime.
+rocm = ["device", "dep:kernels-rocm", "kernels-rocm/rocm"]
+
+# A device runtime, either one; enable `cuda` or `rocm`.
+device = []
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }

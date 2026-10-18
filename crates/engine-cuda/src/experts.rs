@@ -154,9 +154,9 @@ pub fn count_promoted(window_ms: u64) {
 
 #[must_use]
 pub fn pageable_access() -> bool {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         let mut ordinal = 0i32;
         // SAFETY: `ordinal` is a live out-parameter.
@@ -174,7 +174,7 @@ pub fn pageable_access() -> bool {
         };
         status == rt::cudaError::cudaSuccess && value != 0
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         false
     }
@@ -191,6 +191,9 @@ pub struct Plan {
     device_bytes: u64,
     host_bytes: u64,
     spill_bytes: u64,
+    /// Host bytes of the planes `host_declared` moved: fixed mapped
+    /// addresses, read in place, so a recorded body may hold them.
+    declared_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -468,7 +471,45 @@ impl Plan {
             device_bytes,
             host_bytes,
             spill_bytes,
+            declared_bytes: 0,
         })
+    }
+
+    /// Moves every plane the trace declares `ParamPlacement::Host` that this
+    /// plan still seats on the device to the pinned host tier (served through
+    /// its mapped device address), and returns the device bytes it freed.
+    pub fn host_declared(&mut self, trace: &Trace) -> Result<u64> {
+        let bytes = crate::weights::plane_bytes(trace)?;
+        let mut freed = 0u64;
+        for (at, param) in trace.params.iter().enumerate() {
+            if param.placement != poem_ir::ParamPlacement::Host
+                || param.source != ParamSource::Checkpoint
+                || self.streamed_whole(at)
+                || self.resident_of.contains_key(&at)
+            {
+                continue;
+            }
+            let reserved = bytes[at].next_multiple_of(crate::weights::ALIGN);
+            self.groups.push(GroupPlan {
+                param: at,
+                name: param.name.clone(),
+                planes: vec![GroupPlane {
+                    param: at,
+                    bytes: bytes[at],
+                    reserved,
+                }],
+                experts: 0,
+                routed: false,
+                bytes: reserved,
+                held: Held::Pinned,
+            });
+            self.pinned_of.insert(at);
+            self.device_bytes = self.device_bytes.saturating_sub(reserved);
+            self.host_bytes += reserved;
+            self.declared_bytes += reserved;
+            freed += reserved;
+        }
+        Ok(freed)
     }
 
     #[must_use]
@@ -531,6 +572,14 @@ impl Plan {
         self.host_walk().0
     }
 
+    /// Whether the host tier holds anything besides the planes the trace
+    /// declared `host`: experts seated per fire or planes the budget spilled,
+    /// whose addresses a recorded body cannot hold.
+    #[must_use]
+    pub fn hosts_beyond_declared(&self) -> bool {
+        self.host_image() > self.declared_bytes
+    }
+
     #[must_use]
     pub fn host_image(&self) -> u64 {
         self.host_walk().1
@@ -587,14 +636,28 @@ fn routed(
     let mut banks: Vec<BankPlan> = Vec::new();
     let mut groups: Vec<GroupPlan> = Vec::new();
     let mut arity: Option<u32> = None;
-    for node in &trace.nodes {
-        let Operation::Linear(op) = &node.op else {
-            continue;
-        };
+    // On ROCm a fused routed MLP's selects read their banks as they would
+    // apart.
+    #[cfg(feature = "rocm")]
+    let selects = trace.nodes.iter().flat_map(|node| match &node.op {
+        Operation::Linear(op) => vec![op],
+        Operation::Fused(poem_ir::Fused::MoeExperts { select, down, .. }) => {
+            vec![&**select, &**down]
+        }
+        Operation::Fused(poem_ir::Fused::MoeSelectGlu { select, .. }) => vec![&**select],
+        _ => Vec::new(),
+    });
+    #[cfg(not(feature = "rocm"))]
+    let selects = trace.nodes.iter().filter_map(|node| match &node.op {
+        Operation::Linear(op) => Some(op),
+        _ => None,
+    });
+    for op in selects {
         let (bank, dense) = match op {
             Linear::MoeMatmulSelect { bank, .. } => (*bank, true),
             Linear::MoeMatmulSelectBias { bank, .. }
-            | Linear::MoeMatmulSelectQuant { bank, .. } => (*bank, false),
+            | Linear::MoeMatmulSelectQuant { bank, .. }
+            | Linear::MoeMatmulSelectActQuant { bank, .. } => (*bank, false),
             _ => continue,
         };
         let at = weight_of(trace, bank)?;
@@ -1893,6 +1956,54 @@ mod tests {
     fn experts_every_case() {
         a_packed_bank_the_plan_pairs_no_scales_with_is_refused_by_name();
         a_budget_under_the_planes_that_cannot_move_is_refused_by_name();
+        a_host_declared_table_leaves_the_device_and_nothing_else_does();
+    }
+
+    fn a_host_declared_table_leaves_the_device_and_nothing_else_does() {
+        let trace = poem_compiler::catalog::deployment("qwen38-flash-next-mini-bf16-kv-bf16")
+            .expect("the catalog ships the deployment")
+            .trace(Platform::Cuda);
+        let at = |name: &str| {
+            trace
+                .params
+                .iter()
+                .position(|param| param.name == name)
+                .unwrap_or_else(|| panic!("the trace declares `{name}`"))
+        };
+        let table = at("ple.table");
+        let mut plan = Plan::of(&trace, &Attachments::new(), Budgets::uncapped()).expect("plans");
+        let full = plan.device_demand();
+        let freed = plan.host_declared(&trace).expect("the table moves");
+        let bytes = crate::weights::plane_bytes(&trace).expect("sized")[table]
+            .next_multiple_of(crate::weights::ALIGN);
+        assert_eq!(freed, bytes, "the codes of the table and nothing else move");
+        assert!(plan.pinned(table));
+        assert_eq!(
+            (0..trace.params.len())
+                .filter(|&p| plan.streamed_whole(p))
+                .count(),
+            1,
+            "only the table leaves the device"
+        );
+        assert_eq!(plan.device_demand(), full - bytes);
+        assert_eq!(plan.host_demand(), bytes);
+        assert!(
+            !plan.hosts_beyond_declared(),
+            "a declared plane alone leaves a recorded body free to hold it"
+        );
+        assert_eq!(
+            plan.host_declared(&trace).expect("again"),
+            0,
+            "a second call moves nothing"
+        );
+
+        let trace = gpt_oss();
+        let mut plan = Plan::of(&trace, &scales_of(&trace), Budgets::uncapped()).expect("plans");
+        assert_eq!(plan.host_declared(&trace).expect("nothing to move"), 0);
+        assert!(
+            !plan.streams(),
+            "a trace that declares no host plane plans as before"
+        );
     }
 
     fn a_packed_bank_the_plan_pairs_no_scales_with_is_refused_by_name() {

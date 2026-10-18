@@ -72,7 +72,7 @@ fn a_plain_row_states_no_drafter() {
                 row.model.id == id
                     && row.deploy.drafter.is_none()
                     && row.deploy.parts.is_empty()
-                    && weights.is_none_or(|w| row.deploy.weights.contains(&w))
+                    && weights.is_none_or(|w| row.deploy.weights.contains(&w.into()))
             })
             .unwrap_or_else(|| panic!("this build ships no plain `{id}` row"));
         assert_eq!(row.trace(Platform::Metal).drafter, None, "{}", row.name);

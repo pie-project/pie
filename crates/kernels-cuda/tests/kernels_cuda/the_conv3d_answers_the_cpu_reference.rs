@@ -98,16 +98,6 @@ fn check(case: &Case, path: ConvPath) {
     );
 
     let scale = (taps * c_in) as f32;
-    let worst = got
-        .iter()
-        .zip(&want)
-        .map(|(&g, &w)| (from_bf16(g) - w).abs())
-        .fold(0f32, f32::max);
-    let peak = want.iter().fold(0f32, |m, v| m.max(v.abs()));
-    eprintln!(
-        "{name} on {path:?}: worst |diff| {worst} at peak |want| {peak} over {} outputs",
-        want.len()
-    );
     for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
         let g = from_bf16(g);
         assert!(
@@ -232,23 +222,17 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// Every case on the direct kernel, and those whose channels fill the 8-wide
+/// vector on the tensor-core one.
 #[test]
 fn the_conv3d_answers_the_cpu_reference_every_case() {
-    the_direct_kernel_answers_the_reference();
-    the_tensor_core_kernel_answers_the_reference();
-    the_tensor_core_kernel_refuses_a_channel_count_it_cannot_vectorise();
-}
-
-fn the_direct_kernel_answers_the_reference() {
     for case in cases() {
         check(&case, ConvPath::Direct);
+        if case.c_in % 8 == 0 {
+            check(&case, ConvPath::TensorCore);
+        }
     }
-}
-
-fn the_tensor_core_kernel_answers_the_reference() {
-    for case in cases().iter().filter(|c| c.c_in % 8 == 0) {
-        check(case, ConvPath::TensorCore);
-    }
+    the_tensor_core_kernel_refuses_a_channel_count_it_cannot_vectorise();
 }
 
 fn the_tensor_core_kernel_refuses_a_channel_count_it_cannot_vectorise() {

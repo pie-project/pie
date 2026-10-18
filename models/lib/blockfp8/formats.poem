@@ -1,0 +1,78 @@
+# A release's FP8 projections and expert banks as stored: e4m3 codes beside
+# `*.weight_scale_inv` f32 factors a 128-square block (DeepSeek's and GLM's
+# layout), or modelopt's e4m3 codes under one `.weight_scale`, read byte for
+# byte into the `e4m3tile128` encodings.
+
+def fp8_proj(w):
+    """Whether the projection `w` keeps the release's own FP8."""
+    return w != None and w.dtype in [dtype.e4m3tile128, dtype.e4m3tile128a8]
+
+def fp8_read(reads, w, names):
+    """The projection `w` as the release stores it: its legs' e4m3 codes
+    joined along the rows, and their `*.weight_scale_inv` f32 block factors
+    joined likewise, byte for byte."""
+    rows, cols = w.shape[0], w.shape[1]
+    codes = [src(name) for name in names]
+    factors = []
+    for name in names:
+        factor = name[:-len(".weight")] + ".weight_scale_inv"
+        if modelopt_fp8(name):
+            # modelopt's one scale a projection, every 128-square block's
+            # factor: the codes are read as they are.
+            leg_rows = shape(name)[0]
+            if leg_rows % 128 != 0 or cols % 128 != 0:
+                fail("`{}`: `{}` is {} and its one scale lands as 128-square block factors only on whole blocks".format(w.name, name, shape(name)))
+            one = src(name[:-len(".weight")] + ".weight_scale").transmute([1, 1], raw(dtype.f32))
+            factors.append(one.gather(1, [0] * (cols // 128)).gather(0, [0] * (leg_rows // 128)))
+            continue
+        if not has(factor):
+            fail("`{}`: `{}` holds FP8 codes whose block factors are stored beside it as `{}`, and the checkpoint holds none".format(w.name, name, factor))
+        factors.append(src(factor))
+    counted = [(rows + 127) // 128, (cols + 127) // 128]
+    reads.extend([
+        tensor(w.name, codes[0] if len(codes) == 1 else concat(0, codes), encoding(dtype.e4m3)),
+        tensor(scales_name(w.name), factors[0] if len(factors) == 1 else concat(0, factors), encoding(dtype.f32), shape = counted),
+    ])
+
+def modelopt_fp8(name):
+    """Whether `name` is stored as modelopt's FP8: e4m3 codes under one
+    `.weight_scale`, not the release's 128-square block factors."""
+    stem = name[:-len(".weight")]
+    return stored(name) == raw(dtype.e4m3) and has(stem + ".weight_scale") and not has(name + "_scale_inv")
+
+def released_fp8(w):
+    """Whether the bank `w` keeps the release's own FP8: e4m3 codes under
+    one f32 factor a 128x128 block."""
+    return w.dtype in [dtype.e4m3tile128, dtype.e4m3tile128a8]
+
+def fp8_bank(reads, w, legs):
+    """A routed bank as the release stores it, byte for byte: each expert's
+    legs (`legs[e]`) e4m3 codes and `*.weight_scale_inv` block factors,
+    stacked on the leading axis as the bank's `[experts, ...]` rectangle."""
+    experts, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    per = rows // len(legs[0])
+    codes = []
+    factors = []
+    for names in legs:
+        for name in names:
+            factor = name[:-len(".weight")] + ".weight_scale_inv"
+            if not has(factor):
+                fail("`{}`: `{}` holds FP8 codes whose block factors are stored beside it as `{}`, and the checkpoint holds none".format(w.name, name, factor))
+            codes.append(src(name).transmute([1, per, cols], encoding(dtype.e4m3)))
+            factors.append(src(factor).transmute([1, per // 128, cols // 128], encoding(dtype.f32)))
+    counted = [experts, rows // 128, cols // 128]
+    codes = concat(0, codes)
+    factors = concat(0, factors)
+    # Two legs an expert (gate, up) stack to `[2E, inter, cols]`, which is
+    # the declared `[E, 2*inter, cols]` rectangle byte for byte.
+    if len(legs[0]) > 1:
+        codes = codes.transmute(list(w.shape), encoding(dtype.e4m3))
+        factors = factors.transmute(counted, encoding(dtype.f32))
+    reads.extend([
+        tensor(w.name, codes, encoding(dtype.e4m3)),
+        tensor(scales_name(w.name), factors, encoding(dtype.f32), shape = counted),
+    ])
+
+# A cast inside a join or a cut has no block factors to read, so an FP8
+# tensor that is joined or cut is first dequantized whole into a bf16 tensor
+# of its own, and the join or the cut reads that.

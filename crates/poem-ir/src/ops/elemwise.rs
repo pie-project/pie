@@ -11,6 +11,16 @@ pub struct Yarn {
     pub original_max_position: u32,
 }
 
+/// The norm a [`Elementwise::NormGate`] also lands over its output: `y =
+/// rmsnorm(out) * weight` (`1 + weight` where `plus_one`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NormNext {
+    pub weight: ValueId,
+    pub eps: f32,
+    pub plus_one: bool,
+    pub y: ValueId,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Elementwise {
     Rmsnorm {
@@ -45,6 +55,21 @@ pub enum Elementwise {
         eps: f32,
         y: ValueId,
     },
+    /// Muse Spark's post-norm and residual gate: `u = x * scale` rounded
+    /// (`x` where no scale), `n = rmsnorm(u)` unscaled and rounded, and with
+    /// a residual `y = alpha * res + beta * n`, `beta = sigmoid(w)` and
+    /// `alpha = sqrt(max(sigmoid(-w) * (1 + beta), 1e-3))` of the gate's
+    /// `w = gate / temperature` a column (f32); else `y = n`.
+    NormGate {
+        x: ValueId,
+        scale: Option<ValueId>,
+        res: Option<ValueId>,
+        gate: Option<ValueId>,
+        eps: f32,
+        temperature: f32,
+        next: Option<NormNext>,
+        y: ValueId,
+    },
     LayernormNoScale {
         x: ValueId,
         eps: f32,
@@ -76,10 +101,11 @@ pub enum Elementwise {
         hi: ValueId,
         x_out: ValueId,
     },
+    /// `act(gate) * rmsnorm(x) * weight` (no weight: scaleless) per head.
     RmsnormGated {
         x: ValueId,
         gate: ValueId,
-        weight: ValueId,
+        weight: Option<ValueId>,
         head_dim: u32,
         eps: f32,
         act: GateActivation,
@@ -241,6 +267,7 @@ pub enum Elementwise {
         gate_eps: f32,
         alpha: f32,
         sinkhorn: u32,
+        comb: bool,
         x: ValueId,
         post_mix: ValueId,
         comb_mix: ValueId,
@@ -401,6 +428,20 @@ impl Operands for Elementwise {
             Self::RmsnormPerHeadPlusOne { x, weight, .. } => sink.extend([*x, *weight]),
             Self::RmsnormGroupedPlusOne { x, weight, .. } => sink.extend([*x, *weight]),
             Self::RmsnormNoScale { x, .. } => sink.push(*x),
+            Self::NormGate {
+                x,
+                scale,
+                res,
+                gate,
+                next,
+                ..
+            } => {
+                sink.push(*x);
+                sink.extend(*scale);
+                sink.extend(*res);
+                sink.extend(*gate);
+                sink.extend(next.map(|n| n.weight));
+            }
             Self::LayernormNoScale { x, .. } => sink.push(*x),
             Self::Layernorm {
                 x, weight, bias, ..
@@ -409,7 +450,10 @@ impl Operands for Elementwise {
             Self::ClampLearned { x, lo, hi, .. } => sink.extend([*x, *lo, *hi]),
             Self::RmsnormGated {
                 x, gate, weight, ..
-            } => sink.extend([*x, *gate, *weight]),
+            } => {
+                sink.extend([*x, *gate]);
+                sink.extend(*weight);
+            }
             Self::RmsnormGatedBy {
                 x, gate, weight, ..
             } => sink.extend([*x, *gate, *weight]),
@@ -524,6 +568,9 @@ impl Operands for Elementwise {
             Self::RmsnormPerHeadPlusOne { y, .. } => sink.push(*y),
             Self::RmsnormGroupedPlusOne { y, .. } => sink.push(*y),
             Self::RmsnormNoScale { y, .. } => sink.push(*y),
+            Self::NormGate { y, next, .. } => {
+                sink.extend(std::iter::once(*y).chain(next.map(|n| n.y)))
+            }
             Self::LayernormNoScale { y, .. } => sink.push(*y),
             Self::Layernorm { y, .. } => sink.push(*y),
             Self::Clamp { x_out, .. } => sink.push(*x_out),
@@ -580,6 +627,7 @@ impl Operands for Elementwise {
             Self::RmsnormPerHeadPlusOne { .. } => {}
             Self::RmsnormGroupedPlusOne { .. } => {}
             Self::RmsnormNoScale { .. } => {}
+            Self::NormGate { .. } => {}
             Self::LayernormNoScale { .. } => {}
             Self::Layernorm { .. } => {}
             Self::Clamp { x_out, x, .. } => sink.push((*x_out, *x)),
@@ -645,6 +693,7 @@ impl Operands for Elementwise {
             Self::RmsnormPerHeadPlusOne { .. } => "elementwise.rmsnorm_per_head_plus_one",
             Self::RmsnormGroupedPlusOne { .. } => "elementwise.rmsnorm_grouped_plus_one",
             Self::RmsnormNoScale { .. } => "elementwise.rmsnorm_no_scale",
+            Self::NormGate { .. } => "elementwise.norm_gate",
             Self::LayernormNoScale { .. } => "elementwise.layernorm_no_scale",
             Self::Layernorm { .. } => "elementwise.layernorm",
             Self::Clamp { .. } => "elementwise.clamp",

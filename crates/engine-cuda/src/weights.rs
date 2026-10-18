@@ -1,5 +1,7 @@
-#[cfg(feature = "cuda")]
+#[cfg(feature = "device")]
 pub mod arena;
+#[cfg(feature = "rocm")]
+mod hip;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -122,13 +124,13 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
             let (rows, width) = rectangle(&param.shape);
             Ok(match param.dtype {
                 Dtype::Mxfp4 => rows.saturating_mul(width),
-                Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled => {
+                Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled | Dtype::Nvfp4 => {
                     rows.saturating_mul(width).div_ceil(2)
                 }
                 Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => {
                     rows.saturating_mul(width).div_ceil(4)
                 }
-                Dtype::U8g64 => rows.saturating_mul(width),
+                Dtype::U8g64 | Dtype::E4m3tensor => rows.saturating_mul(width),
                 Dtype::U2g16k | Dtype::I3g16k | Dtype::U4g32k | Dtype::U5g32k | Dtype::I6g16k => {
                     rows.saturating_mul(width)
                 }
@@ -170,14 +172,18 @@ pub fn prospect(
         .enumerate()
         .map(|(at, param)| (param.name.as_str(), at))
         .collect();
-    let planes = attachments(&landing, &index)?;
+    let planes = attachments(&landing, trace, &index)?;
     let ranking = crate::experts::Ranking::of(trace, &planes)?;
     Ok(Prospect { ranking, planes })
 }
 
-fn attachments(landing: &LoadPlan, index: &BTreeMap<&str, usize>) -> Result<Attachments> {
+fn attachments(
+    landing: &LoadPlan,
+    trace: &Trace,
+    index: &BTreeMap<&str, usize>,
+) -> Result<Attachments> {
     let mut planes = Attachments::new();
-    for (name, pairing) in pairings(landing, index)? {
+    for (name, pairing) in pairings(landing, trace, index)? {
         let Some(&at) = index.get(name) else {
             continue;
         };
@@ -628,8 +634,13 @@ struct Pairing {
 
 fn pairings<'a>(
     landing: &'a LoadPlan,
+    trace: &'a Trace,
     index: &BTreeMap<&str, usize>,
 ) -> Result<BTreeMap<&'a str, Pairing>> {
+    #[cfg(feature = "rocm")]
+    hip::refuse_k_quants(trace)?;
+    #[cfg(not(feature = "rocm"))]
+    let _ = trace;
     let named: BTreeMap<u32, &str> = landing
         .tensors
         .iter()
@@ -664,14 +675,30 @@ fn pairings<'a>(
                 "is an affine bank whose zero points this plan does not publish as a \
                  param of their own",
             )?),
-            ScaleForm::F32Factors => {
+            // A block-FP8 bank's f32 factors, one a 128x128 block (CUDA
+            // requantizes them to ue8m0 atoms at load, `lay_tile_banks`).
+            ScaleForm::F32Factors => None,
+            #[cfg(feature = "rocm")]
+            ScaleForm::E4m3TensorScaled | ScaleForm::F32Tensor => {
                 return Err(Fault::Param {
                     name: (*name).to_string(),
-                    why: "carries a scale form no point this shell stamps reads: the \
-                          cuda plane's split-plane banks are mxfp4 codes under raw \
-                          e8m0 exponents and MLX affine codes under bf16 factor pairs",
+                    why: "is an NVFP4 plane (e4m3 scales under f32 tensor scales) or a \
+                          per-tensor e4m3 table, which rocm has no products for; serve a \
+                          bf16, u4g64 or mxfp4 deployment of this model",
                 });
             }
+            #[cfg(not(feature = "rocm"))]
+            ScaleForm::F32Tensor => None,
+            #[cfg(not(feature = "rocm"))]
+            ScaleForm::E4m3TensorScaled => Some(row(
+                attachment.zero_point_tensor.ok_or_else(|| Fault::Param {
+                    name: (*name).to_string(),
+                    why: "is an NVFP4 bank whose attachment names no tensor scales; its \
+                          e4m3 scales are half of each weight",
+                })?,
+                "is an NVFP4 bank whose tensor scales this plan does not publish as a \
+                 param of their own",
+            )?),
         };
         out.insert(
             *name,
@@ -684,6 +711,39 @@ fn pairings<'a>(
                 biases,
             },
         );
+    }
+    // A block-FP8 bank stored as released: raw e4m3 codes beside raw f32
+    // block factors (`<name>.scales`), paired by name, the factors read at
+    // load (`lay_tile_banks`).
+    let decls: BTreeMap<&str, &checkpoint::types::TensorDecl> = landing
+        .tensors
+        .iter()
+        .map(|decl| (decl.name.as_str(), decl))
+        .collect();
+    for decl in &landing.tensors {
+        let raw = |dtype| checkpoint::types::Encoding::Raw(dtype);
+        if decl.encoding != raw(checkpoint::types::DType::E4m3)
+            || decl.shape.len() < 3
+            || out.contains_key(decl.name.as_str())
+            || !index.contains_key(decl.name.as_str())
+        {
+            continue;
+        }
+        let factors = poem::scales_name(&decl.name);
+        let (Some(beside), Some(&scales)) =
+            (decls.get(factors.as_str()), index.get(factors.as_str()))
+        else {
+            continue;
+        };
+        if beside.encoding == raw(checkpoint::types::DType::F32) {
+            out.insert(
+                decl.name.as_str(),
+                Pairing {
+                    scales,
+                    biases: None,
+                },
+            );
+        }
     }
     Ok(out)
 }
@@ -816,7 +876,7 @@ impl Weights {
             arm_refill(tier);
         }
 
-        let pairings = pairings(&landing, &index)?;
+        let pairings = pairings(&landing, trace, &index)?;
 
         let mut table = Vec::with_capacity(places.len());
         let mut decoded: Vec<Buffer> = Vec::new();
@@ -864,6 +924,8 @@ impl Weights {
                 }
                 Some(pairing) => WeightRow::Planes {
                     repacked: place.dtype == Dtype::U4g64tiled,
+                    atoms: false,
+                    lanes: false,
                     codes: packed(experts.as_ref(), &store, &places, at)?,
                     scales: packed(experts.as_ref(), &store, &places, pairing.scales)?,
                     biases: match pairing.biases {
@@ -897,6 +959,22 @@ impl Weights {
             };
             table.push(Some(row));
         }
+        #[cfg(feature = "cuda")]
+        lay_atoms(trace, &mut table, stream)?;
+        #[cfg(feature = "cuda")]
+        share_input_scales(trace, &table, stream)?;
+        #[cfg(feature = "cuda")]
+        lay_block_atoms(trace, &mut table, &mut decoded, stream)?;
+        #[cfg(feature = "rocm")]
+        {
+            let tier = experts.as_ref();
+            hip::canonical_fp8(trace, &index, &places, &store, tier, stream)?;
+            hip::group_row_factors(trace, &index, &mut table, stream)?;
+            hip::order_mxfp4_banks(trace, &places, &store, tier, &pairings, &mut table, stream)?;
+            hip::order_fp8b32_planes(trace, &places, &store, tier, &mut table, stream)?;
+        }
+        #[cfg(feature = "cuda")]
+        lay_tile_banks(trace, &mut table, &mut decoded, stream)?;
         if let Some(tier) = experts.as_mut() {
             let slabs: Vec<u64> = tier
                 .plan()
@@ -915,13 +993,120 @@ impl Weights {
         }
         Ok(Weights {
             store,
-            table: WeightTable(table),
+            table: WeightTable(table, BTreeMap::new()),
             banks: banks(trace, &places),
             experts,
             from_cache,
             rotor: None,
             decoded,
         })
+    }
+
+    /// `kernel.gemm.fp8_o_down`: each grouped bf16 projection whose routes send
+    /// group g to plane g (DeepSeek-V4's `wo_a`), read by it alone, requantized in
+    /// place to fp8b128 (e4m3 codes, block exponents in tcgen05 atoms), exactly the
+    /// checkpoint's values. Returns the planes it requantized.
+    #[cfg(feature = "cuda")]
+    pub fn requantize_grouped(
+        &mut self,
+        trace: &Trace,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<u32> {
+        use poem_ir::{Def, Linear, Operands, Operation};
+        let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
+            Some(Def::Weight(at)) => Some(*at as usize),
+            _ => None,
+        };
+        let readers = |id: poem_ir::ValueId| {
+            let mut ins = Vec::new();
+            trace
+                .nodes
+                .iter()
+                .filter(|node| {
+                    ins.clear();
+                    node.op.inputs(&mut ins);
+                    ins.contains(&id)
+                })
+                .count()
+        };
+        // SAFETY: `stream` is the load's stream, live for the load.
+        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        let mut done = 0;
+        for node in &trace.nodes {
+            let Operation::Linear(Linear::MatmulGrouped {
+                w, routes, groups, ..
+            }) = &node.op
+            else {
+                continue;
+            };
+            let trivial = matches!(
+                trace.values.get(routes.0 as usize).map(|v| &v.def),
+                Some(Def::Op(at)) if matches!(
+                    &trace.nodes[*at as usize].op,
+                    Operation::Linear(Linear::GroupRoutes { groups: g, .. }) if g == groups
+                )
+            );
+            let Some(at) = weight(*w) else { continue };
+            let Some(Some(WeightRow::Dense(plane))) = self.table.0.get(at).copied() else {
+                continue;
+            };
+            if self.table.1.contains_key(&at) {
+                continue;
+            }
+            let (rows, k) = (plane.rows as usize, plane.width as usize);
+            let n = rows / (*groups).max(1) as usize;
+            if !trivial
+                || plane.dtype != Dtype::Bf16
+                || readers(*w) != 1
+                || !rows.is_multiple_of(128)
+                || !k.is_multiple_of(512)
+                || !n.is_multiple_of(32)
+            {
+                continue;
+            }
+            let atom_bytes = kernels_cuda::linear::tc5::atom_bytes(rows, k, 128);
+            let staged = Buffer::zeroed(rows * k + atom_bytes)?;
+            kernels_cuda::linear::moe::quantize_fp8b128(
+                &ctx,
+                plane,
+                staged.ptr(),
+                staged.ptr() + (rows * k) as u64,
+            )?;
+            // The codes and atoms into the bf16's own slot, half of it.
+            // SAFETY: both spans are live device memory of these lengths (the
+            // slot `rows * k * 2` bytes), on the load's stream.
+            unsafe {
+                crate::device::ctx::check(
+                    "cudaMemcpyAsync",
+                    cudarc::runtime::sys::cudaMemcpyAsync(
+                        plane.ptr as usize as *mut core::ffi::c_void,
+                        staged.ptr() as usize as *const core::ffi::c_void,
+                        rows * k + atom_bytes,
+                        cudarc::runtime::sys::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                        stream.cast(),
+                    ),
+                )?;
+                crate::device::ctx::check(
+                    "cudaStreamSynchronize",
+                    cudarc::runtime::sys::cudaStreamSynchronize(stream.cast()),
+                )?;
+            }
+            drop(staged);
+            self.table.1.insert(
+                at,
+                (
+                    Tensor::new(plane.ptr, plane.rows, plane.width, Dtype::Fp8b128),
+                    Tensor::new(
+                        plane.ptr + (rows * k) as u64,
+                        plane.rows,
+                        plane.width / 128,
+                        Dtype::U8,
+                    ),
+                ),
+            );
+            done += 1;
+        }
+        Ok(done)
     }
 
     pub fn rotate(
@@ -999,7 +1184,7 @@ impl Weights {
     pub fn hosts_experts(&self) -> bool {
         self.experts
             .as_ref()
-            .is_some_and(|tier| tier.plan().host_image() > 0)
+            .is_some_and(|tier| tier.plan().hosts_beyond_declared())
     }
 
     #[must_use]
@@ -1146,9 +1331,9 @@ fn packed(
     let place = places[param];
     let width = match place.dtype {
         Dtype::Mxfp4 => place.width,
-        Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled => place.width.div_ceil(2),
+        Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled | Dtype::Nvfp4 => place.width.div_ceil(2),
         Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => place.width.div_ceil(4),
-        Dtype::U8g64 => place.width,
+        Dtype::U8g64 | Dtype::E4m3tensor => place.width,
         other => poem_compiler::arena::elem_bytes(other)
             .and_then(|element| u32::try_from(element).ok())
             .map(|element| place.width.saturating_mul(element))
@@ -1157,11 +1342,17 @@ fn packed(
                 why: "is a packed plane in a storage element that has no element size",
             })?,
     };
+    // NVFP4 and per-tensor e4m3 codes keep their dtype, which is how a
+    // reader tells their scales from an affine bank's factor pair.
+    let marked = match place.dtype {
+        Dtype::Nvfp4 | Dtype::E4m3tensor => place.dtype,
+        _ => Dtype::U8,
+    };
     Ok(Tensor::new(
         address(tier, store, place.offset, param)?,
         place.rows,
         width,
-        Dtype::U8,
+        marked,
     ))
 }
 
@@ -1333,4 +1524,372 @@ mod tests {
             100
         );
     }
+}
+
+/// The banks a low-precision product reads, and the K a scale of each covers:
+/// their scales are read only by that product, which takes them in atoms.
+#[cfg(feature = "cuda")]
+fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
+    use poem_ir::{Def, Fused, Linear, Operation};
+    let lowp = |op: &Linear| match op {
+        Linear::MatmulActQuant { w, .. } | Linear::MoeMatmulSelectActQuant { bank: w, .. } => {
+            Some(*w)
+        }
+        _ => None,
+    };
+    let mut banks = BTreeMap::new();
+    for node in &trace.nodes {
+        // A fused routed MLP's selects read their banks as they would apart.
+        let ws: Vec<_> = match &node.op {
+            Operation::Linear(op) => lowp(op).into_iter().collect(),
+            Operation::Fused(Fused::MoeExperts { select, down, .. }) => {
+                [lowp(select), lowp(down)].into_iter().flatten().collect()
+            }
+            Operation::Fused(Fused::MoeSelectGlu { select, .. }) => {
+                lowp(select).into_iter().collect()
+            }
+            _ => continue,
+        };
+        for w in ws {
+            let Some(Def::Weight(at)) = trace.values.get(w.0 as usize).map(|v| &v.def) else {
+                continue;
+            };
+            let at = *at as usize;
+            let gran = match trace.params[at].dtype {
+                Dtype::Nvfp4 => 16,
+                Dtype::Mxfp4 => 32,
+                Dtype::E4m3 | Dtype::E4m3tile128 => 128,
+                _ => continue,
+            };
+            banks.insert(at, gran);
+        }
+    }
+    banks
+}
+
+/// Each NVFP4 activation-quantizing bank's input scales set to their largest,
+/// in place, once: its activations quantize under one global, as vLLM's
+/// ModelOpt NVFP4 MoE takes the experts' largest input scale (each
+/// expert's product scale reading the same). A token's routes then quantize
+/// alike.
+#[cfg(feature = "cuda")]
+fn share_input_scales(
+    trace: &Trace,
+    table: &[Option<WeightRow>],
+    stream: *mut core::ffi::c_void,
+) -> Result<()> {
+    use poem_ir::{ActQuant, Def, Fused, Linear, Operation};
+    let scales_of = |op: &Linear| match op {
+        Linear::MoeMatmulSelectActQuant {
+            quant: ActQuant::Nvfp4,
+            input_scales: Some(s),
+            ..
+        } => Some(*s),
+        _ => None,
+    };
+    let mut planes = std::collections::BTreeSet::new();
+    for node in &trace.nodes {
+        let ss: Vec<_> = match &node.op {
+            Operation::Linear(op) => scales_of(op).into_iter().collect(),
+            Operation::Fused(Fused::MoeExperts { select, down, .. }) => {
+                [scales_of(select), scales_of(down)]
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            }
+            Operation::Fused(Fused::MoeSelectGlu { select, .. }) => {
+                scales_of(select).into_iter().collect()
+            }
+            _ => continue,
+        };
+        for v in ss {
+            if let Some(Def::Weight(at)) = trace.values.get(v.0 as usize).map(|v| &v.def) {
+                planes.insert(*at as usize);
+            }
+        }
+    }
+    for at in planes {
+        let Some(Some(WeightRow::Dense(t))) = table.get(at) else {
+            continue;
+        };
+        let n = (u64::from(t.rows) * u64::from(t.width)) as usize;
+        if t.dtype != Dtype::F32 || n < 2 {
+            continue;
+        }
+        let mut host = vec![0f32; n];
+        crate::device::ctx::sync(stream)?;
+        crate::device::copy_any(stream, host.as_mut_ptr() as u64, t.ptr, n * 4)?;
+        crate::device::ctx::sync(stream)?;
+        let max = host.iter().copied().fold(0f32, f32::max);
+        host.fill(max);
+        crate::device::copy_any(stream, t.ptr, host.as_ptr() as u64, n * 4)?;
+        crate::device::ctx::sync(stream)?;
+    }
+    Ok(())
+}
+
+/// Each low-precision bank's scales laid into the tcgen05 GEMM's atoms in place,
+/// once, where the bank is resident and tiles whole atoms. Any other keeps its
+/// row-major scales, and its product refuses it.
+#[cfg(feature = "cuda")]
+fn lay_atoms(
+    trace: &Trace,
+    table: &mut [Option<WeightRow>],
+    stream: *mut core::ffi::c_void,
+) -> Result<()> {
+    let banks = act_quant_banks(trace);
+    // A deployment that quantizes its activations runs on the tcgen05 GEMMs
+    // alone: refused at load where they are not, not at its first fire.
+    if !banks.is_empty() && !kernels_cuda::linear::tc5::supported() {
+        return Err(Fault::Unsupported(
+            "this deployment quantizes its activations, which runs on the tcgen05 GEMMs \
+             (sm_100a, sm_101a, sm_103a or sm_110a, NVRTC 12.9 or newer) that this device or \
+             NVRTC lacks; serve the deployment that reads bf16 activations instead"
+                .to_string(),
+        ));
+    }
+    let mut temp: Option<Buffer> = None;
+    for (at, gran) in banks {
+        let Some(Some(WeightRow::Planes {
+            scales,
+            seat,
+            atoms,
+            ..
+        })) = table.get_mut(at)
+        else {
+            continue;
+        };
+        // An MXFP4 plane is `[.., rows, blocks, 16]` bytes, an NVFP4 one its
+        // logical `[.., rows, k]`.
+        if matches!(trace.params[at].dtype, Dtype::E4m3 | Dtype::E4m3tile128) {
+            continue;
+        }
+        let shape = &trace.params[at].shape;
+        let (rows, cols): (u64, u64) = match trace.params[at].dtype {
+            Dtype::Mxfp4 if shape.len() >= 2 => (
+                shape[..shape.len() - 2].iter().product(),
+                shape[shape.len() - 2],
+            ),
+            _ => {
+                let (&k, lead) = shape.split_last().unwrap_or((&0, &[]));
+                (lead.iter().product(), k / u64::from(gran))
+            }
+        };
+        if rows == 0 || cols == 0 {
+            continue;
+        }
+        if seat.streams()
+            || crate::device::alloc::is_host_pointer(scales.ptr)
+            || !rows.is_multiple_of(128)
+            || !cols.is_multiple_of(4)
+        {
+            continue;
+        }
+        let bytes = usize::try_from(rows * cols).unwrap_or(usize::MAX);
+        if temp.as_ref().is_none_or(|t| t.bytes() < bytes) {
+            if temp.is_some() {
+                crate::device::ctx::sync(stream)?;
+            }
+            temp = Some(Buffer::zeroed(bytes)?);
+        }
+        let held = temp.as_ref().map_or(0, Buffer::ptr);
+        // SAFETY: `stream` is the load's stream, live for the load.
+        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        kernels_cuda::linear::act_quant::scales_to_atoms(
+            &ctx,
+            "linear.act_quant",
+            scales.ptr,
+            held,
+            u32::try_from(rows).unwrap_or(u32::MAX),
+            u32::try_from(cols).unwrap_or(u32::MAX),
+            1,
+        )?;
+        crate::device::copy_any(stream, scales.ptr, held, bytes)?;
+        *atoms = true;
+    }
+    if temp.is_some() {
+        crate::device::ctx::sync(stream)?;
+    }
+    Ok(())
+}
+
+/// Each released 128x128-block FP8 expert bank's f32 factors requantized in place
+/// to ue8m0 exponents (as vLLM's DeepGEMM path on Blackwell), spread into tcgen05
+/// atoms a weight row an atom row, in a buffer bound in the factors' place.
+#[cfg(feature = "cuda")]
+fn lay_tile_banks(
+    trace: &Trace,
+    table: &mut [Option<WeightRow>],
+    held: &mut Vec<Buffer>,
+    stream: *mut core::ffi::c_void,
+) -> Result<()> {
+    for (at, _) in act_quant_banks(trace) {
+        if !matches!(trace.params[at].dtype, Dtype::E4m3 | Dtype::E4m3tile128) {
+            continue;
+        }
+        let Some(Some(WeightRow::Planes {
+            codes,
+            scales,
+            seat,
+            atoms,
+            ..
+        })) = table.get_mut(at)
+        else {
+            continue;
+        };
+        let shape = &trace.params[at].shape;
+        let (&k, lead) = shape.split_last().unwrap_or((&0, &[]));
+        let rows: u64 = lead.iter().product();
+        if rows == 0 || k == 0 || !rows.is_multiple_of(128) || !k.is_multiple_of(512) {
+            continue;
+        }
+        // The factors plane is bound as bytes; its param states it f32.
+        if *atoms
+            || seat.streams()
+            || crate::device::alloc::is_host_pointer(codes.ptr)
+            || crate::device::alloc::is_host_pointer(scales.ptr)
+        {
+            continue;
+        }
+        let (blocks_r, blocks_k) = (rows / 128, k / 128);
+        let exps = Buffer::zeroed(usize::try_from(blocks_r * blocks_k).unwrap_or(usize::MAX))?;
+        let bytes = kernels_cuda::linear::tc5::atom_bytes(rows as usize, k as usize, 128);
+        let laid = Buffer::zeroed(bytes)?;
+        let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        // SAFETY: `stream` is the load's stream, live for the load.
+        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        kernels_cuda::linear::act_quant::fp8_tile_requant(
+            &ctx,
+            "linear.act_quant",
+            codes.ptr,
+            scales.ptr,
+            exps.ptr(),
+            to32(rows),
+            to32(k),
+            128,
+        )?;
+        kernels_cuda::linear::act_quant::scales_to_atoms(
+            &ctx,
+            "linear.act_quant",
+            exps.ptr(),
+            laid.ptr(),
+            to32(rows),
+            to32(blocks_k),
+            128,
+        )?;
+        *scales = Tensor::new(laid.ptr(), to32(rows), to32(blocks_k), Dtype::U8);
+        *codes = Tensor::new(codes.ptr, codes.rows, codes.width, Dtype::E4m3);
+        *atoms = true;
+        crate::device::ctx::sync(stream)?;
+        held.push(laid);
+    }
+    Ok(())
+}
+
+/// The block an `[n, k]` projection's scale plane `shape` scales, its K
+/// and the rows a scale covers: one a 128x128 block, a 32x32 block, or (f32
+/// factors, `e4m3g128`) a 128 along each row.
+#[cfg(feature = "cuda")]
+fn fp8_block_of(n: u64, k: u64, shape: &[u64], factors: bool) -> Option<(u64, u64)> {
+    [128, 32]
+        .into_iter()
+        .find(|&b| shape == [n.div_ceil(b), k.div_ceil(b)])
+        .map(|b| (b, b))
+        .or((factors && shape == [n, k.div_ceil(128)]).then_some((128, 1)))
+}
+
+/// Each block-FP8 projection's block exponents spread into tcgen05 atoms, a row a
+/// weight row, in their own buffer bound in the plane's place as raw `u8` scales.
+#[cfg(feature = "cuda")]
+fn lay_block_atoms(
+    trace: &Trace,
+    table: &mut [Option<WeightRow>],
+    held: &mut Vec<Buffer>,
+    stream: *mut core::ffi::c_void,
+) -> Result<()> {
+    use poem_ir::{Def, Linear, Operation};
+    let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
+        Some(Def::Weight(at)) => Some(*at as usize),
+        _ => None,
+    };
+    for node in &trace.nodes {
+        let Operation::Linear(Linear::MatmulActQuant {
+            w,
+            scales: Some(scales),
+            ..
+        }) = &node.op
+        else {
+            continue;
+        };
+        let (Some(codes), Some(at)) = (weight(*w), weight(*scales)) else {
+            continue;
+        };
+        let Some(Some(WeightRow::Dense(plane))) = table.get(at).copied() else {
+            continue;
+        };
+        if plane.dtype == Dtype::U8 {
+            continue;
+        }
+        let [n, k] = trace.params[codes].shape[..] else {
+            continue;
+        };
+        // The block the exponents scale: 128x128 (V4's fp8b128) or 32x32
+        // (V4.1's fp8b32), read off the exponent plane's own shape.
+        let factors = trace.params[at].dtype == Dtype::F32;
+        let Some((block, per)) = fp8_block_of(n, k, &trace.params[at].shape, factors) else {
+            continue;
+        };
+        let (rows, cols) = (n, k.div_ceil(block));
+        let bytes =
+            kernels_cuda::linear::tc5::atom_bytes(rows as usize, k as usize, block as usize);
+        let atoms = Buffer::zeroed(bytes)?;
+        // SAFETY: `stream` is the load's stream, live for the load.
+        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        // A block-FP8 release's f32 factors (not DeepSeek's e8m0
+        // exponents): requantized to their ue8m0 ceilings first, the codes
+        // re-rounded under them, as vLLM's DeepGEMM path does on Blackwell.
+        let mut exps: Option<Buffer> = None;
+        if factors {
+            let Some(Some(WeightRow::Dense(c))) = table.get(codes).copied() else {
+                continue;
+            };
+            if block != 128 {
+                continue;
+            }
+            let held_exps =
+                Buffer::zeroed(usize::try_from(rows.div_ceil(per) * cols).unwrap_or(usize::MAX))?;
+            kernels_cuda::linear::act_quant::fp8_tile_requant(
+                &ctx,
+                "linear.act_quant",
+                c.ptr,
+                plane.ptr,
+                held_exps.ptr(),
+                u32::try_from(rows).unwrap_or(u32::MAX),
+                u32::try_from(k).unwrap_or(u32::MAX),
+                u32::try_from(per).unwrap_or(u32::MAX),
+            )?;
+            exps = Some(held_exps);
+        }
+        kernels_cuda::linear::act_quant::scales_to_atoms(
+            &ctx,
+            "linear.act_quant",
+            exps.as_ref().map_or(plane.ptr, Buffer::ptr),
+            atoms.ptr(),
+            u32::try_from(rows).unwrap_or(u32::MAX),
+            u32::try_from(cols).unwrap_or(u32::MAX),
+            u32::try_from(per).unwrap_or(u32::MAX),
+        )?;
+        table[at] = Some(WeightRow::Dense(Tensor::new(
+            atoms.ptr(),
+            u32::try_from(rows).unwrap_or(u32::MAX),
+            u32::try_from(cols).unwrap_or(u32::MAX),
+            Dtype::U8,
+        )));
+        held.push(atoms);
+        if exps.is_some() {
+            // The exponents' buffer frees here: their launches done first.
+            crate::device::ctx::sync(stream)?;
+        }
+    }
+    Ok(())
 }

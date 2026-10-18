@@ -32,7 +32,14 @@ use super::{Golden, Graphs, Prepared, Readback, Shell};
 #[derive(Debug)]
 pub(super) struct GuestBatch {
     launched: Vec<(usize, u64)>,
-    seq: u64,
+    pub(super) seq: u64,
+}
+
+impl GuestBatch {
+    /// The instances whose epilogues this batch launched.
+    pub(super) fn instances(&self) -> impl Iterator<Item = u64> + '_ {
+        self.launched.iter().map(|&(_, instance)| instance)
+    }
 }
 
 fn seating(lanes: &[super::Seated<'_>]) -> String {
@@ -296,9 +303,9 @@ impl FireCtx<'_> {
         let rows = p.composition.rows();
         let lane_count = p.composition.lane_count();
 
-        let handles =
-            self.inputs
-                .commit(self.device.stream(), slot, &p.lengths, &p.token_injects)?;
+        let handles = self
+            .inputs
+            .commit(self.device, slot, &p.lengths, &p.token_injects)?;
         p.windows.bind(handles.windows);
         p.windows.bind_live(handles.live_rows);
         p.windows.bind_qo_absolute(handles.qo_absolute);
@@ -464,8 +471,18 @@ impl FireCtx<'_> {
         } else {
             u64::from(p.composition.patch_rows())
         };
+        // A fire that runs the side streams carves the arena laid out for
+        // them (`CompiledModel::arena_forked`); the rest the one in order.
+        let forks = !self.device.side_ctx().is_empty() && {
+            let until = self.compiled.streams.forked_until;
+            until == 0 || p.composition.bucket() <= until
+        };
+        let map = match &self.compiled.arena_forked {
+            Some(forked) if forks => forked,
+            _ => &self.compiled.arena,
+        };
         let slots = self.arena.slots(
-            &self.compiled.arena,
+            map,
             poem_compiler::FireRows {
                 tokens: carve_rows,
                 lanes: carve_lanes,
@@ -514,21 +531,25 @@ impl FireCtx<'_> {
         } else {
             kernels_cuda::Tensor::ABSENT
         };
-        let caches = self.pools.table(
-            &self
-                .inputs
-                .seats(&handles, p.pages, rows, lane_count)
-                .rs(
-                    p.rs.write_state,
-                    if p.rs.predicated {
-                        self.predicate.mask(lane_count)
-                    } else {
-                        kernels_cuda::Tensor::ABSENT
-                    },
-                    commit_len,
-                )
-                .splitting(commit_len),
-        )?;
+        let seats = self
+            .inputs
+            .seats(&handles, p.pages, rows, lane_count)
+            .rs(
+                p.rs.write_state,
+                if p.rs.predicated {
+                    self.predicate.mask(lane_count)
+                } else {
+                    kernels_cuda::Tensor::ABSENT
+                },
+                commit_len,
+            )
+            .splitting(commit_len);
+        #[cfg(feature = "rocm")]
+        let seats = seats.snapshotting(
+            self.predicate
+                .snapshots(self.device.stream(), &p.rs.snapshots)?,
+        );
+        let caches = self.pools.table(&seats)?;
         let paging = self.pools.paging();
         Ok(Staged {
             lane_count,
@@ -753,7 +774,12 @@ impl FireCtx<'_> {
                     compiled: self.compiled,
                     descriptor: &p.descriptor,
                     stream: self.device.stream(),
-                    lanes: forked,
+                    // Side streams for the fires narrow enough to leave the
+                    // card room for them (`compiler.dag_streams_until`).
+                    lanes: forked.filter(|_| {
+                        let until = self.compiled.streams.forked_until;
+                        until == 0 || p.composition.bucket() <= until
+                    }),
                     conditionals,
                     decoding: self.decoding,
                     tiers: self.tiers,

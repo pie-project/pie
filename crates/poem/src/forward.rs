@@ -391,6 +391,14 @@ impl Input {
         self.geometry(self.kv_space(), GeomKind::RowValid)
     }
 
+    /// Whether the backend reads a router's hint of the experts the next
+    /// layer will take (to stream their weights ahead). CUDA holds every
+    /// expert resident and reads none, so a forward computes none for it.
+    #[must_use]
+    pub fn route_hints(&self) -> bool {
+        self.rec.platform() != Platform::Cuda
+    }
+
     #[must_use]
     pub fn request_of_token(&self) -> Value {
         self.geometry(TOKEN_SPACE, GeomKind::RequestOfToken)

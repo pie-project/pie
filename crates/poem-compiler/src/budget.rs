@@ -179,6 +179,18 @@ pub struct DeviceProfile {
 
     pub fork_floor_us: f32,
 
+    /// Whether a join's independent branches are laid side by side
+    /// (`branch::split`) for the dependency schedule.
+    pub branches: bool,
+
+    /// Whether every launchable region is scheduled onto the streams by its
+    /// dependencies (`stream::fork_dag`), a region an op.
+    pub dag_streams: bool,
+
+    /// The widest fire, in rows, that runs the dependency schedule on the
+    /// side streams (0: every fire).
+    pub dag_streams_until: u32,
+
     pub family_us: FamilyCosts,
 
     pub exclusive: Vec<String>,
@@ -207,17 +219,39 @@ impl FamilyCosts {
             poem_ir::Operation::Layout(_) => self.layout,
             poem_ir::Operation::Collective(_) => self.collective,
             poem_ir::Operation::Fused(op) => match op {
+                poem_ir::Fused::LseSink { .. }
+                | poem_ir::Fused::PoolAttention { .. }
+                | poem_ir::Fused::PoolCompress { .. }
+                | poem_ir::Fused::MlaPrefillExpanded { .. }
+                | poem_ir::Fused::IndexTopkRope { .. } => self.attention,
                 poem_ir::Fused::MatmulGeglu { .. }
+                | poem_ir::Fused::MatmulSwiglu { .. }
                 | poem_ir::Fused::MlpSwiglu { .. }
                 | poem_ir::Fused::LmHeadSoftcap { .. }
-                | poem_ir::Fused::MatmulBias { .. } => self.linear,
+                | poem_ir::Fused::MatmulBias { .. }
+                | poem_ir::Fused::MatmulSplitRows { .. }
+                | poem_ir::Fused::MoeSelectGlu { .. }
+                | poem_ir::Fused::MoeExperts { .. } => self.linear,
                 poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom,
+                poem_ir::Fused::GdnStep { .. } => self.attention,
+                poem_ir::Fused::QGateNormRopeAppend { .. } => self.attention,
                 poem_ir::Fused::ResidualAddRmsnorm { .. }
                 | poem_ir::Fused::RmsnormResidualAdd { .. }
                 | poem_ir::Fused::EmbedScaleAdd { .. }
                 | poem_ir::Fused::EmbedScaleAddSelect { .. }
                 | poem_ir::Fused::RmsnormRopePartialQ { .. }
+                | poem_ir::Fused::HcNormProject { .. }
+                | poem_ir::Fused::NormRopeLast { .. }
+                | poem_ir::Fused::NormRopeLastAppend { .. }
+                | poem_ir::Fused::NormRopePair { .. }
+                | poem_ir::Fused::RopeYarnAppend { .. }
+                | poem_ir::Fused::SplitRopeYarnAppend { .. }
+                | poem_ir::Fused::QgQknormRopeAppend { .. }
                 | poem_ir::Fused::NormModulate { .. }
+                | poem_ir::Fused::HcPrenormProject { .. }
+                | poem_ir::Fused::HcGatesNorm { .. }
+                | poem_ir::Fused::ResBlendRmsnorm { .. }
+                | poem_ir::Fused::HcPre { .. }
                 | poem_ir::Fused::GatedResidualNormModulate { .. } => self.elementwise,
             },
             poem_ir::Operation::Spatial(_) => self.spatial,
@@ -249,6 +283,9 @@ impl Default for DeviceProfile {
             fat_region_us: 250.0,
             side_streams: 2,
             fork_floor_us: 20.0,
+            branches: false,
+            dag_streams: false,
+            dag_streams_until: 0,
             family_us: FamilyCosts::default(),
             exclusive: Vec::new(),
             grouped: Vec::new(),

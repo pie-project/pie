@@ -30,6 +30,11 @@ pub struct ChannelState {
     pub host_reads: Vec<Span>,
     pub desc_takes: Vec<Span>,
     pub desc_reads: Vec<Span>,
+    /// A queue between passes: another pass consumes it (its port or its
+    /// stage), so a pass that only puts it is no terminal output; and a
+    /// peeking consumer takes each value itself, so a put appends, never
+    /// draining the last.
+    pub queued: bool,
 }
 
 impl ChannelState {
@@ -246,7 +251,10 @@ pub(crate) fn record_channel_put(ch: &ChannelRef, value: u32, span: Span) {
         let (drain, elem) = {
             let st = ch.borrow();
             let peeked_port = !st.desc_reads.is_empty() && st.desc_takes.is_empty();
-            (peeked_port && st.prog_takes.is_empty(), st.elem_ty())
+            (
+                peeked_port && st.prog_takes.is_empty() && !st.queued,
+                st.elem_ty(),
+            )
         };
         if drain {
             ch.borrow_mut().prog_takes.push((stage, span));

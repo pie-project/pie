@@ -12,6 +12,38 @@ pub fn matmul(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), E
     act_x_wt(ctx, "linear.matmul", act, w, None, y)
 }
 
+/// `act . w^T` over bf16 operands landing f32 (a router's logits).
+pub fn matmul_f32(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "linear.matmul_f32";
+    dtype_dispatch!(OP, act.dtype, { Bf16 => () });
+    dtype_dispatch!(OP, w.dtype, { Bf16 => () });
+    dtype_dispatch!(OP, y.dtype, { F32 => () });
+    let n = count(OP, "the columns this projection lands", y.width)?;
+    let k = count(OP, "the contraction this projection walks", act.width)?;
+    if w.rows != y.width || w.width != act.width {
+        return Err(crate::jit::refuse(
+            OP,
+            format!(
+                "the weight is {} x {} and this projection contracts {k} into {n}",
+                w.rows, w.width
+            ),
+        ));
+    }
+    if y.rows == 0 {
+        return Ok(());
+    }
+    let m = ctx.opaque_rows(stated(OP, y.rows)?);
+    #[cfg(feature = "cuda")]
+    {
+        dense::act_x_wt_f32(ctx, OP, act.ptr, w.ptr, y.ptr, m, n, k)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = m;
+        Err(crate::jit::runtimeless(OP))
+    }
+}
+
 pub fn matmul_bias(
     ctx: &Ctx,
     act: Tensor,

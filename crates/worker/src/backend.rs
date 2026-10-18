@@ -5,12 +5,12 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "engine-cuda")]
 use runtime::engine::backend::{DeviceBoot, Diagnostics, Knobs, Transport, World, ordinal_of};
 
 use crate::backend::flavor::Flavor;
 use crate::config;
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "engine-cuda", test))]
 use crate::config::CudaNativeEngineOptions;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 use crate::config::MetalEngineOptions;
@@ -23,7 +23,7 @@ use crate::config::XlaEngineOptions;
 
 #[derive(Clone)]
 pub enum EngineOptions {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "engine-cuda")]
     CudaNative(CudaNativeEngineOptions),
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     Metal(MetalEngineOptions),
@@ -38,7 +38,7 @@ pub enum EngineOptions {
 impl EngineOptions {
     pub fn flavor(&self) -> Flavor {
         match self {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "engine-cuda")]
             EngineOptions::CudaNative(_) => Flavor::Cuda,
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
             EngineOptions::Metal(_) => Flavor::Metal,
@@ -49,7 +49,7 @@ impl EngineOptions {
             #[cfg(feature = "xla")]
             EngineOptions::Xla(_) => Flavor::Xla,
             #[cfg(not(any(
-                feature = "cuda",
+                feature = "engine-cuda",
                 feature = "vulkan",
                 feature = "wgpu",
                 feature = "xla",
@@ -84,7 +84,7 @@ fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "engine-cuda", test))]
 fn cuda_budgets(
     opts: &CudaNativeEngineOptions,
     adapter_seats: u32,
@@ -99,12 +99,16 @@ fn cuda_budgets(
         .max(page_size);
     engine::Budgets {
         max_lanes: opts.max_forward_requests.unwrap_or(256).max(1),
-        max_tokens: opts.max_forward_tokens.unwrap_or(8192).max(1),
+        // Unstated, 0: the engine takes its chip's `engine.forward_tokens`,
+        // 8192 where the profile says nothing.
+        max_tokens: opts.max_forward_tokens.map_or(0, |tokens| tokens.max(1)),
         buckets: Vec::new(),
         max_adapters: adapter_seats,
         page_size,
         max_context,
-        slots: opts.max_state_slots.unwrap_or(256).max(1),
+        // Unstated, 0: the engine sizes the slab from its chip's profile
+        // (`engine.state_slots_per_lane`), 256 where the profile says nothing.
+        slots: opts.max_state_slots.map_or(0, |slots| slots.max(1)),
         max_patches: patch_ceilings.0,
         max_images: patch_ceilings.1,
         max_voxels: voxel_ceilings.0,
@@ -112,7 +116,7 @@ fn cuda_budgets(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "engine-cuda")]
 fn device_boot(
     opts: &CudaNativeEngineOptions,
     home: &Path,
@@ -143,7 +147,7 @@ fn device_boot(
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "engine-cuda")]
 fn dump_device_boot(home: &Path, boot: &DeviceBoot, group_id: usize, rank: Option<usize>) {
     let dir = home.join("logs");
     let name = match rank {
@@ -245,7 +249,7 @@ fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
     ))
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "engine-cuda")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_engine_backend_group(
     rank_options: &[EngineOptions],
@@ -326,7 +330,7 @@ pub(crate) fn create_engine_backend_group(
 }
 
 #[cfg_attr(
-    not(feature = "cuda"),
+    not(feature = "engine-cuda"),
     allow(
         unused_variables,
         unreachable_code,
@@ -360,14 +364,14 @@ pub(crate) fn create_engine_backend(
         poem_ir::Platform,
     ) = match options {
         #[cfg(not(any(
-            feature = "cuda",
+            feature = "engine-cuda",
             feature = "vulkan",
             feature = "wgpu",
             feature = "xla",
             all(feature = "metal", target_vendor = "apple")
         )))]
         _ => unreachable!("`EngineOptions` has no variants in this build"),
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "engine-cuda")]
         EngineOptions::CudaNative(opts) => {
             let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
             if opts.verbose {
@@ -558,7 +562,7 @@ pub(crate) fn create_engine_backend(
         }
     };
     #[cfg_attr(
-        not(feature = "cuda"),
+        not(feature = "engine-cuda"),
         allow(
             unreachable_code,
             reason = "`EngineOptions` has no variants in this build"
@@ -621,7 +625,10 @@ mod tests {
         let budgets = cuda_budgets(&opts, 0, (None, None), (None, None));
         assert_eq!(budgets.page_size, 16);
         assert_eq!(budgets.max_context, 4096);
-        assert_eq!(budgets.slots, 256);
+        assert_eq!(
+            budgets.slots, 0,
+            "unstated, the engine's chip sizes the slab"
+        );
 
         opts.max_state_slots = Some(4);
         assert_eq!(cuda_budgets(&opts, 0, (None, None), (None, None)).slots, 4);
@@ -692,7 +699,7 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
 }
 
 #[cfg_attr(
-    not(feature = "cuda"),
+    not(feature = "engine-cuda"),
     allow(
         unused_variables,
         unreachable_code,
@@ -702,7 +709,7 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
 )]
 pub(crate) fn build_options(m: &config::ModelConfig, flavor: Flavor) -> Result<EngineOptions> {
     match flavor {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "engine-cuda")]
         Flavor::Cuda => {
             let mut c: CudaNativeEngineOptions = m
                 .engine

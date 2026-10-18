@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "device")]
 
 use crate::common_two_axis::{
     C_IN, C_OUT, Lcg, Rig, Weights, assert_close, attach, bf, conv_reference, frame,

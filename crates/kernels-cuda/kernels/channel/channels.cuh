@@ -341,4 +341,26 @@ __global__ void mask_from_commit(
     }
 }
 
+
+struct WordRun {
+    const u32* src;
+    u32 dst_word;
+    u32 words;
+};
+
+static_assert(sizeof(WordRun) == 16, "WordRun: the Rust `channel::WordRun` mirrors this layout");
+
+__global__ void gather_words(
+    const WordRun* __restrict__ runs,
+    u32* __restrict__ dst,
+    u32 run_count)
+{
+    const u32 run = blockIdx.x;
+    if (run >= run_count) return;
+    const WordRun r = runs[run];
+    for (u32 word = threadIdx.x; word < r.words; word += blockDim.x) {
+        dst[r.dst_word + word] = r.src[word];
+    }
+}
+
 }

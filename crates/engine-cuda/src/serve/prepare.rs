@@ -111,8 +111,23 @@ impl FrameShell for Shell {
                 }
             });
 
+        // A device-carried descriptor is read off its ring on the host, so owed
+        // epilogues writing a ring this fire resolves settle first; one feeding only
+        // device copies (a draft into the next verify) leaves the fire free.
+        let resolves_owed = |owed: &super::GuestBatch| {
+            let puts: std::collections::HashSet<usize> = owed
+                .instances()
+                .flat_map(|instance| self.programs.shared_puts(instance))
+                .collect();
+            attachments.iter().any(|attached| {
+                self.programs
+                    .host_resolved_rings(attached.instance)
+                    .iter()
+                    .any(|ring| puts.contains(ring))
+            })
+        };
         if !can_runahead
-            && self.owed.is_some()
+            && self.owed.as_ref().is_some_and(resolves_owed)
             && attachments.iter().any(|attached| {
                 self.programs
                     .geometry_of(attached.instance)
@@ -739,6 +754,10 @@ impl FrameShell for Shell {
         let mut rs_folded: Vec<Option<u32>> = vec![None; lanes.len()];
         let mut rs_lens: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut rs_order: Vec<u32> = vec![0; lanes.len()];
+        let mut snapshots = crate::store::rs::SnapTable {
+            indptr: vec![0],
+            ..Default::default()
+        };
         let mut adapter_routes: Vec<i32> = Vec::new();
         let any_adapter = lanes.iter().any(|seated| seated.adapter.is_some());
         if any_adapter {
@@ -838,6 +857,23 @@ impl FrameShell for Shell {
                 bidirectional: seated.bidirectional,
             });
             slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
+            if !seated.rs_snapshots.is_empty() && row.rows as usize != lane.tokens.len() {
+                return Err(Fault::program(
+                    "serve::rs",
+                    format!(
+                        "lane {} snapshots its recurrent state at rows of its own and runs \
+                         {} of its {} rows in this fire",
+                        row.source,
+                        row.rows,
+                        lane.tokens.len()
+                    ),
+                ));
+            }
+            for snap in seated.rs_snapshots {
+                snapshots.rows.push(narrow(u64::from(snap.row)));
+                snapshots.slots.push(narrow(u64::from(snap.slot)));
+            }
+            snapshots.indptr.push(narrow(snapshots.rows.len() as u64));
             let fire_lane = rs_moves.len();
             rs_order[row.source as usize] = fire_lane as u32;
             let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold.as_deref());
@@ -853,6 +889,16 @@ impl FrameShell for Shell {
                     folded,
                     fold,
                 } => {
+                    // A device-counted fold not yet settled left the state
+                    // past the runtime's length.
+                    let slot = seated.rs_slot.unwrap_or(lane.slot);
+                    let folded = &match self.rs_ahead.get(&slot) {
+                        Some(&at) if at > *folded && seated.rs_reset != RsReset::Fresh => at,
+                        _ => {
+                            self.rs_ahead.remove(&slot);
+                            *folded
+                        }
+                    };
                     let stated = match &ports {
                         Some(ports) => ports.slots(row.rows as usize)?,
                         None => None,
@@ -881,6 +927,9 @@ impl FrameShell for Shell {
                         .saturating_add(stated_fold(*fold, cell, port)?)
                         .min(first + row.rows);
                     rs_folded[source] = Some(to - folded);
+                    if *fold == FoldLen::Device {
+                        self.rs_ahead.insert(slot, to);
+                    }
                     let below: u32 = reads
                         .iter()
                         .map(|span| span.end.min(to).saturating_sub(span.start))
@@ -1165,12 +1214,7 @@ impl FrameShell for Shell {
                 }
             }
         }
-        self.pools.commit_frame(demand, &kv_ranges)?;
-        super::btrace::mark("commit_frame");
-
-        let indptr_host = kv::indptr(&seats)?;
         let paging = self.pools.paging();
-        let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
         let window_tables = if self.pools.has_windowed() {
             seats
                 .iter()
@@ -1188,6 +1232,19 @@ impl FrameShell for Shell {
         } else {
             Vec::new()
         };
+        // The windowed pages this fire's tables name, backed as they are
+        // first used.
+        let window_pages: Vec<u64> = window_tables
+            .iter()
+            .zip(&kv_less_seats)
+            .filter(|(_, kv_less)| !**kv_less)
+            .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
+            .collect();
+        self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;
+        super::btrace::mark("commit_frame");
+
+        let indptr_host = kv::indptr(&seats)?;
+        let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
         let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
         let mut geometries = (0..self.spaces)
             .map(|space| {
@@ -1350,7 +1407,7 @@ impl FrameShell for Shell {
         // recorded under is what it replays under.
         let key = key.with_islands(&record::widen(
             &self.compiled,
-            &windows.admits_axes(totals, &self.shifted, &self.lane_shifted),
+            &windows.admits_axes(totals, &self.shifted, &self.lane_shifted, self.staging()),
         ));
         let ladder = key.classes.clone();
         let patch_ladder = key.patch.as_ref().map(|axis| axis.classes.clone());
@@ -1363,6 +1420,7 @@ impl FrameShell for Shell {
         super::btrace::mark("segmentation");
         let bodied = records_bodies
             && !rs_moves.iter().any(|verb| !matches!(verb, RsMove::None))
+            && snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize
             && Self::keyable_units(&self.compiled)
             && world
             && !self.cache.body_refused(&key)
@@ -1591,6 +1649,8 @@ impl FrameShell for Shell {
                 order: rs_order,
                 reads: rs_reads,
                 rows_ext: rs_rows_ext,
+                #[cfg(feature = "rocm")]
+                snapshots,
             },
         })
     }

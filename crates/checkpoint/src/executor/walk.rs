@@ -11,12 +11,13 @@ use std::collections::HashSet;
 use super::iq_grid;
 use super::{Progress, Residency};
 use crate::codec::cast::{cast_elements, decode_values, encode_values};
+use crate::codec::e8m0::exp2_e8m0;
 use crate::codec::fp8::{decode_fp8_e4m3_elements, f32_to_fp8_e4m3};
 use crate::codec::int4::decode_int4b8_elements;
 use crate::codec::mlx::decode_mlx_affine_codes;
 use crate::codec::mlx::mlx_affine_group_params_bits;
 use crate::codec::mxfp4::{decode_mxfp4_elements, encode_mxfp4_group};
-use crate::codec::rows::{EncodeOperand, encode_rows};
+use crate::codec::rows::{EncodeOperand, encode_rows, fp8_block_grid};
 use crate::consume::SourceLedger;
 use crate::error::Error;
 use crate::executor::arena::{ArenaBacking, ArenaSpan, TileMapOp};
@@ -948,6 +949,7 @@ impl Walk<'_, '_> {
                 inputs.first().copied(),
                 outputs.first().copied(),
                 &input,
+                &transform,
             )?,
             TileMapKind::Scale => {
                 self.scale_bytes(source, inputs, outputs.first().copied(), &input, &transform)?
@@ -1315,7 +1317,9 @@ impl Walk<'_, '_> {
                 output.ok_or_else(|| invalid("per-block Scale requires an output buffer"))?;
             let elements = match transform.from {
                 None => decode_values(bytes, payload()?)?,
-                Some(QuantScheme::Mxfp4E2M1E8M0) => decode_mxfp4_elements(bytes),
+                Some(QuantScheme::Mxfp4E2M1E8M0 | QuantScheme::Nvfp4E2M1E4M3) => {
+                    decode_mxfp4_elements(bytes)
+                }
                 Some(QuantScheme::Int4B8) => decode_int4b8_elements(bytes),
                 Some(QuantScheme::Fp8E4M3) => decode_fp8_e4m3_elements(bytes),
                 Some(QuantScheme::MlxAffineU4) => {
@@ -1408,7 +1412,22 @@ impl Walk<'_, '_> {
         } else {
             return Err(invalid("host Encode requires a source or input buffer"));
         };
-        let values = decode_values(bytes, operand_dtype)?;
+        // a block-scaled FP8 source is read out through its factors, as the
+        // other encodes read it
+        let values = match (operand_dtype, inputs.first(), source) {
+            (DType::E4m3, None, Some(source)) => {
+                let (r, c) = (checked_usize_i64(rows)?, checked_usize_i64(cols)?);
+                let operand = self.fp8_block_operand(source, transform, bytes, r, c)?;
+                let mut row = vec![0.0f32; c];
+                let mut values = Vec::with_capacity(r * c);
+                for at in 0..r {
+                    operand.row_bf16(at, c, &mut row);
+                    values.extend(row.iter().map(|&v| f64::from(v)));
+                }
+                values
+            }
+            _ => decode_values(bytes, operand_dtype)?,
+        };
         if values.len() as i64 != rows * cols {
             return Err(invalid(format!(
                 "Encode was handed {} elements for the {shape:?} it must quantize",
@@ -1525,6 +1544,7 @@ impl Walk<'_, '_> {
         input: Option<BufferId>,
         output: Option<BufferId>,
         bytes: &[u8],
+        transform: &TransformSpec,
     ) -> Result<Vec<u8>, Error> {
         let output = output.ok_or_else(|| invalid("host Cast requires an output buffer"))?;
         let from = if let Some(input) = input {
@@ -1538,7 +1558,72 @@ impl Walk<'_, '_> {
         if from == to {
             return Ok(bytes.to_vec());
         }
+        if from == DType::E4m3
+            && let Some(source) = source
+            && transform.metadata_source.is_some()
+        {
+            return self.fp8_block_cast(source, transform, output, bytes, to);
+        }
+        // An e4m3 plane with no block factors beside it is widened code for
+        // code; a scale stored once for the whole plane (modelopt's per-tensor
+        // FP8) is the contract's own per-block Scale over the result.
+        if from == DType::E4m3 && matches!(to, DType::Bf16 | DType::F16 | DType::F32) {
+            return encode_values(&decode_fp8_e4m3_elements(bytes), to);
+        }
         cast_elements(bytes, from, to)
+    }
+
+    /// A block-scaled FP8 source read at a wider float: each code times its
+    /// block's factor, rounded to bf16 as an encode of it reads it.
+    fn fp8_block_cast(
+        &self,
+        source: &SourceExtent,
+        transform: &TransformSpec,
+        output: BufferId,
+        bytes: &[u8],
+        to: DType,
+    ) -> Result<Vec<u8>, Error> {
+        let shape = self.buffer_shape(output)?.to_vec();
+        let Some((rows, cols)) = crate::types::rectangle(&shape) else {
+            return Err(invalid(format!(
+                "host Cast of a block-scaled FP8 source reads a [rows, cols] rectangle, \
+                 and {shape:?} is none"
+            )));
+        };
+        let (rows, cols) = (checked_usize_i64(rows)?, checked_usize_i64(cols)?);
+        if bytes.len() != rows * cols {
+            return Err(invalid(format!(
+                "host Cast read {} bytes for a [{rows}, {cols}] FP8 plane",
+                bytes.len()
+            )));
+        }
+        let width = match to {
+            DType::Bf16 | DType::F16 => 2,
+            DType::F32 => 4,
+            other => {
+                return Err(invalid(format!(
+                    "host Cast widens block-scaled FP8 to a float, not {other:?}"
+                )));
+            }
+        };
+        let operand = self.fp8_block_operand(source, transform, bytes, rows, cols)?;
+        let mut out = vec![0u8; rows * cols * width];
+        let mut buf = vec![0.0f32; cols];
+        for (row, dst) in out.chunks_exact_mut(cols * width).enumerate() {
+            operand.row_bf16(row, cols, &mut buf);
+            for (value, le) in buf.iter().zip(dst.chunks_exact_mut(width)) {
+                match to {
+                    DType::Bf16 => {
+                        le.copy_from_slice(&bf16::from_f32(*value).to_bits().to_le_bytes())
+                    }
+                    DType::F16 => {
+                        le.copy_from_slice(&half::f16::from_f32(*value).to_bits().to_le_bytes());
+                    }
+                    _ => le.copy_from_slice(&value.to_le_bytes()),
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn decode_bytes(
@@ -1798,41 +1883,44 @@ impl Walk<'_, '_> {
                 weight.shape, scale.shape
             )));
         };
-        if !matches!(scale.encoding, Encoding::Raw(DType::F32)) {
-            return Err(invalid(format!(
-                "FP8 Encode scale '{}' must be F32",
-                scale.name
-            )));
-        }
+        // f32 factors, or e8m0 exponents (a factor of 2^(e - 127) each)
+        let factor_bytes = match scale.encoding {
+            Encoding::Raw(DType::F32) => 4,
+            Encoding::Raw(DType::E8m0) => 1,
+            _ => {
+                return Err(invalid(format!(
+                    "FP8 Encode scale '{}' must be F32 factors or E8M0 exponents",
+                    scale.name
+                )));
+            }
+        };
         let (true_rows, true_cols) = (checked_usize_i64(true_rows)?, checked_usize_i64(true_cols)?);
         let (scale_rows, scale_cols) = (
             checked_usize_i64(scale_rows)?,
             checked_usize_i64(scale_cols)?,
         );
-        let group_rows = true_rows.checked_div(scale_rows).unwrap_or(0);
-        let group_cols = true_cols.checked_div(scale_cols).unwrap_or(0);
-        if group_rows == 0 || group_rows != group_cols {
+        let chunks = usize::try_from(transform.fp8_chunks).unwrap_or(usize::MAX);
+        let grid = fp8_block_grid([true_rows, true_cols], [scale_rows, scale_cols], chunks)
+            .map_err(|why| invalid(format!("FP8 source '{}' {why}", weight.name)))?;
+
+        // A view's offset into the codes is carried in its file offset, its
+        // stride's base, or both; one code is one byte.
+        let base = source
+            .file_offset
+            .checked_sub(weight.file_offset)
+            .and_then(|into| into.checked_add(source.stride.base_offset))
+            .ok_or_else(|| invalid(format!("FP8 shard of '{}' starts before it", weight.name)))?;
+        let base = checked_usize(base)?;
+        let (first_row, first_col) = (base / true_cols, base % true_cols);
+        if first_row + rows > true_rows || first_col + cols > true_cols {
             return Err(invalid(format!(
-                "FP8 Encode source '{}' has unsupported scale shape \
-                 [{scale_rows}, {scale_cols}] for weight [{true_rows}, {true_cols}]",
+                "FP8 shard [{rows}, {cols}] at offset {base} reaches past the \
+                 [{true_rows}, {true_cols}] codes of '{}'",
                 weight.name
             )));
         }
-        let group = group_rows;
 
-        let base = checked_usize(source.stride.base_offset)?;
-        let scale_row_offset = (base / true_cols) / group;
-        let scale_col_offset = (base % true_cols) / group;
-        if scale_row_offset + rows.div_ceil(group) > scale_rows + 1
-            || scale_col_offset + cols.div_ceil(group) > scale_cols + 1
-        {
-            return Err(invalid(format!(
-                "FP8 Encode shard [{rows}, {cols}] at offset {base} reaches past \
-                 the [{scale_rows}, {scale_cols}] factors of '{}'",
-                scale.name
-            )));
-        }
-
+        let width: u32 = factor_bytes;
         let factor_bytes = self.read_extent(&SourceExtent {
             file_id: scale.file_id,
             tensor_id: scale.id,
@@ -1840,39 +1928,41 @@ impl Walk<'_, '_> {
             span_bytes: scale.span_bytes,
             stride: Extent {
                 base_offset: 0,
-                element_bytes: 4,
+                element_bytes: width,
                 dims: vec![crate::extent::Dim {
                     count: (scale_rows * scale_cols) as i64,
-                    src_stride: 4,
-                    dst_stride: 4,
+                    src_stride: i64::from(width),
+                    dst_stride: i64::from(width),
                 }],
             },
-            dtype: DType::F32,
+            dtype: if width == 4 { DType::F32 } else { DType::E8m0 },
         })?;
-        let factors: Vec<f32> = factor_bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|le| f32::from_le_bytes(*le))
-            .collect();
-        let last_index = (scale_row_offset + (rows.saturating_sub(1)) / group) * scale_cols
-            + scale_col_offset
-            + (cols.saturating_sub(1)) / group;
-        if rows > 0 && cols > 0 && last_index >= factors.len() {
+        let factors: Vec<f32> = if width == 4 {
+            factor_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|le| f32::from_le_bytes(*le))
+                .collect()
+        } else {
+            factor_bytes.iter().map(|&e| exp2_e8m0(e)).collect()
+        };
+        if factors.len() != scale_rows * scale_cols {
             return Err(invalid(format!(
-                "FP8 Encode factors for '{}' end at {} but the shard reads {}",
+                "FP8 factors '{}' hold {} values, not [{scale_rows}, {scale_cols}]",
                 scale.name,
-                factors.len(),
-                last_index
+                factors.len()
             )));
         }
         Ok(EncodeOperand::BlockScaledFp8 {
             bytes,
             factors,
             scale_cols,
-            group,
-            scale_row_offset,
-            scale_col_offset,
+            group: grid.group,
+            chunk_rows: grid.chunk_rows,
+            chunk_blocks: grid.chunk_blocks,
+            first_row,
+            first_col,
         })
     }
 

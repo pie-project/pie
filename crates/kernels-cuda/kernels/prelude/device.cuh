@@ -270,4 +270,31 @@ __device__ __forceinline__ void warp_argmax(float& v, int& idx) {
     idx = __shfl_sync(0xffffffffu, idx, 0);
 }
 
+// Programmatic dependent launch (`kernel.pdl`). A kernel launched as the
+// stream's previous kernel's dependent calls `pdl_wait` before it reads or
+// writes anything that kernel may still touch: it returns once that grid
+// has finished and flushed. `pdl_launch` lets this kernel's own dependents
+// launch (they wait likewise). Without the launch attribute both return at
+// once, and before sm_90 they are nothing.
+__device__ __forceinline__ void pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void pdl_launch() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+// 16 bytes streamed past L1 (read once: weights, codes).
+__device__ __forceinline__ uint4 ld_stream(const void* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+}
+
 }

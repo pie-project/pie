@@ -11,6 +11,7 @@ mod wan_2_dims;
 mod z_image_dims;
 
 mod a_banded_head_gathers_the_logits_it_holds_a_band_of;
+mod a_dag_schedule_orders_every_wait_after_its_close;
 mod a_fused_kernel_replaces_what_its_pattern_matches;
 mod a_kv_head_is_held_by_a_group_of_ranks;
 mod a_ptq1_0_trunk_traces_and_places;
@@ -42,6 +43,7 @@ mod the_mini_dit_row_bakes;
 mod the_mini_dit_tap_exports_an_intermediate;
 mod the_minimax_h3_import_reads_the_fl2va_index;
 mod the_minimax_h3_rows_bake;
+mod the_muse_spark_rows_bake;
 mod the_qwen4_text_reads_the_full_two_bit_flash;
 mod the_qwen_3_gguf_reads_gdn_heads_in_block_order;
 mod the_second_row_axis_costs_the_first_nothing;

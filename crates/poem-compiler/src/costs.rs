@@ -35,11 +35,49 @@ micros! {
 #[decision(id = "compiler.side_streams", constant(range(0..=8)), default = 2, tune = engine)]
 pub struct SideStreams(pub u32);
 
+/// Whether a join's independent branches (a MoE's shared and routed experts,
+/// an attention's q, kv and index chains) are forked onto side streams. Off
+/// unless a chip's profile turns it on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "compiler.branches", flag, default = false, tune = engine)]
+pub struct Branches;
+
+/// Whether every launchable region (one an op) is scheduled onto the streams
+/// by its dependencies (`stream::fork_dag`), not only a join's disjoint
+/// branches. Off unless a chip's profile turns it on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "compiler.dag_streams", flag, default = false, tune = engine)]
+pub struct DagStreams;
+
+/// The widest fire, in rows, that runs `compiler.dag_streams`' schedule on
+/// the side streams; wider fires walk every region on the main stream
+/// (each launch fills the card alone). 0: every fire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "compiler.dag_streams_until", constant(range(0..=1_000_000)), default = 0, tune = engine)]
+pub struct DagStreamsUntil(pub u32);
+
 /// Register the cost decisions, with this backend's own side-stream default.
+/// Whether a backend's graphs have a conditional node for `If` / `Switch`
+/// regions to lower onto.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conditionals {
+    Native,
+    /// None (HIP graphs): a conditional is priced past any launch it could
+    /// skip, so every region lowers to `AlwaysLaunch`.
+    Absent,
+}
+
 pub fn register(registry: &mut Registry, side_streams: u32) {
+    register_for(registry, side_streams, Conditionals::Native);
+}
+
+pub fn register_for(registry: &mut Registry, side_streams: u32, conditionals: Conditionals) {
+    registry.add::<LaunchUs>();
+    match conditionals {
+        Conditionals::Native => registry.add::<CondFixedUs>(),
+        Conditionals::Absent => registry.add_defaulting::<CondFixedUs>("1000000"),
+    };
     registry
-        .add::<LaunchUs>()
-        .add::<CondFixedUs>()
         .add::<CondPerArmUs>()
         .add::<FatRegionUs>()
         .add::<ForkFloorUs>()
@@ -50,6 +88,9 @@ pub fn register(registry: &mut Registry, side_streams: u32) {
         .add::<CollectiveUs>()
         .add::<CustomUs>()
         .add::<SpatialUs>()
+        .add::<Branches>()
+        .add::<DagStreams>()
+        .add::<DagStreamsUntil>()
         .add_defaulting::<SideStreams>(&side_streams.to_string());
 }
 
@@ -68,6 +109,10 @@ impl DeviceProfile {
             fat_region_us: us(profile.get::<FatRegionUs>().0),
             side_streams: profile.get::<SideStreams>().0,
             fork_floor_us: us(profile.get::<ForkFloorUs>().0),
+            branches: profile.on::<Branches>(&profile::Anywhere),
+            dag_streams: profile.on::<DagStreams>(&profile::Anywhere),
+            dag_streams_until: profile.get::<DagStreamsUntil>().0,
+
             family_us: FamilyCosts {
                 attention: us(profile.get::<AttentionUs>().0),
                 linear: us(profile.get::<LinearUs>().0),

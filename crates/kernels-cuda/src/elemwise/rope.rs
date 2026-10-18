@@ -3,8 +3,10 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
-use crate::tensor::Tensor;
+use crate::jit::{
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+};
+use crate::tensor::{KvPool, Tensor};
 
 const FILE: &str = "elemwise/rope.cuh";
 
@@ -250,6 +252,34 @@ pub struct Yarn {
     pub original_max_position: u32,
 }
 
+/// A YaRN rotation: `head_dim`-wide heads at `theta`, the frequencies ramped
+/// by `yarn`, cos and sin scaled by `attention_factor`, pairs interleaved or
+/// split halves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct YarnRope {
+    pub head_dim: u32,
+    pub theta: f32,
+    pub yarn: Yarn,
+    pub attention_factor: f32,
+    pub interleaved: bool,
+}
+
+impl YarnRope {
+    /// The dims the ramp runs between, over the span the checkpoint states.
+    fn ramp(&self, op: &'static str) -> Result<(f32, f32), Error> {
+        let span = "the position span this checkpoint's YaRN block states";
+        let max_position = stated(op, nonzero(op, span, self.yarn.original_max_position)?)?;
+        let y = self.yarn;
+        Ok(ramp_bounds(
+            stated(op, self.head_dim)?,
+            self.theta,
+            y.beta_fast,
+            y.beta_slow,
+            max_position,
+        ))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn partial_last(
     ctx: &Ctx,
@@ -293,6 +323,72 @@ pub fn partial_last(
         ));
     }
     let num_q_heads = q_heads(OP, q.width, head_dim)?;
+    // A row's heads over blocks of eight (DeepSeek-V4: 64 heads, a 64-wide
+    // tail), the angles worked out once a block rather than once a head and
+    // pair: the same values land.
+    let half = rotary_dim / 2;
+    // Four pairs a thread over 16- or 8-byte runs, a block as many heads as
+    // fill it, the angles the spread form's.
+    if ctx.tuning().rows_vec
+        && half > 0
+        && half <= ROTATE_BLOCK
+        && rotary_dim.is_multiple_of(8)
+        && head_dim.is_multiple_of(8)
+        && aligned16(q.ptr)
+    {
+        let heads_per_block = (ROTATE_BLOCK / (half / 4)).max(1);
+        return ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::elemwise::rope_partial_last_vec").apply(
+                Launch::grid(
+                    [q.rows, num_q_heads.div_ceil(heads_per_block), 1],
+                    [ROTATE_BLOCK, 1, 1],
+                )
+                .smem(half * 8),
+            ),
+            &[
+                q.arg(),
+                positions.arg(),
+                stated(OP, num_q_heads)?.arg(),
+                stated(OP, head_dim)?.arg(),
+                stated(OP, rotary_dim)?.arg(),
+                theta.arg(),
+                inverse.arg(),
+                interleaved.arg(),
+                factor.arg(),
+                low_dim.arg(),
+                high_dim.arg(),
+                stated(OP, heads_per_block)?.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
+    if half > 0 && half <= ROTATE_BLOCK {
+        const HEADS: u32 = 8;
+        let heads = num_q_heads;
+        return ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::elemwise::rope_partial_last_spread").apply(
+                Launch::grid([q.rows, heads.div_ceil(HEADS), 1], [ROTATE_BLOCK, 1, 1])
+                    .smem(half * 8),
+            ),
+            &[
+                q.arg(),
+                positions.arg(),
+                stated(OP, num_q_heads)?.arg(),
+                stated(OP, head_dim)?.arg(),
+                stated(OP, rotary_dim)?.arg(),
+                theta.arg(),
+                inverse.arg(),
+                interleaved.arg(),
+                factor.arg(),
+                low_dim.arg(),
+                high_dim.arg(),
+                stated(OP, HEADS)?.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::elemwise::rope_partial_last")
@@ -316,47 +412,420 @@ pub fn partial_last(
     )
 }
 
+/// A head's RMS norm (times `weight` where given; else scale-free) into `y`,
+/// then the rotation of its last `rotary_dim` dims there
+/// (`partial_last`). Under `kernel.elemwise.rows_vec`, where the head is
+/// 128, 256 or 512 wide, the rotation interleaved and its tail (at most 128
+/// wide) whole lane runs, both in one pass a warp a head; otherwise the two
+/// launches the unfused ops fire, unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn norm_rope_last(
+    ctx: &Ctx,
+    x: Tensor,
+    weight: Option<Tensor>,
+    head_dim: u32,
+    eps: f32,
+    positions: Tensor,
+    rotary_dim: u32,
+    theta: f32,
+    interleaved: bool,
+    inverse: bool,
+    yarn: Option<Yarn>,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.norm_rope_last";
+    let tail = Tail {
+        head_dim,
+        eps,
+        rotary_dim,
+        theta,
+        interleaved,
+        inverse,
+        yarn,
+    };
+    if one_pass(ctx, OP, x, weight, positions, tail, y, None)? {
+        return Ok(());
+    }
+    match weight {
+        Some(w) => crate::elemwise::norm::rmsnorm(ctx, x, w, eps, y)?,
+        None => crate::elemwise::norm::rmsnorm_no_scale(ctx, x, head_dim, eps, y)?,
+    }
+    partial_last(
+        ctx,
+        y,
+        positions,
+        rotary_dim,
+        head_dim,
+        theta,
+        interleaved,
+        inverse,
+        yarn,
+    )
+}
+
+/// Where a normed, rotated row is written as well: DeepSeek's fp8 pool and
+/// each row's page and offset.
+pub struct Append<'a> {
+    pub pool: &'a KvPool,
+    pub write_page: Tensor,
+    pub write_offset: Tensor,
+}
+
+/// `norm_rope_last` of a row one 512-wide head (scaled), the rotated row
+/// also written into DeepSeek's fp8 pool at its page and offset, in the one
+/// pass: whether it landed (under `kernel.elemwise.rows_vec`, an fp8 pool
+/// given). Nothing is fired where it did not.
+#[allow(clippy::too_many_arguments)]
+pub fn norm_rope_last_append(
+    ctx: &Ctx,
+    x: Tensor,
+    weight: Tensor,
+    head_dim: u32,
+    eps: f32,
+    positions: Tensor,
+    rotary_dim: u32,
+    theta: f32,
+    interleaved: bool,
+    inverse: bool,
+    yarn: Option<Yarn>,
+    y: &mut Tensor,
+    append: Option<Append<'_>>,
+) -> Result<bool, Error> {
+    const OP: &str = "elementwise.norm_rope_last_append";
+    let Some(append) = append else {
+        return Ok(false);
+    };
+    if head_dim != 512 || y.width != head_dim || !crate::attn::dsv4::fp8_ds(append.pool) {
+        return Ok(false);
+    }
+    let tail = Tail {
+        head_dim,
+        eps,
+        rotary_dim,
+        theta,
+        interleaved,
+        inverse,
+        yarn,
+    };
+    one_pass(ctx, OP, x, Some(weight), positions, tail, y, Some(append))
+}
+
+#[derive(Clone, Copy)]
+struct Tail {
+    head_dim: u32,
+    eps: f32,
+    rotary_dim: u32,
+    theta: f32,
+    interleaved: bool,
+    inverse: bool,
+    yarn: Option<Yarn>,
+}
+
+/// The one pass, where its shape and the profile allow: whether it fired.
+#[allow(clippy::too_many_arguments)]
+fn one_pass(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    weight: Option<Tensor>,
+    positions: Tensor,
+    t: Tail,
+    y: &mut Tensor,
+    append: Option<Append<'_>>,
+) -> Result<bool, Error> {
+    dtype_dispatch!(op, x.dtype, { Bf16 => () });
+    positions_stream(op, positions, &x);
+    let head_dim = t.head_dim;
+    let rotary_dim = t.rotary_dim;
+    let per = head_dim / 32;
+    let fits = ctx.tuning().rows_vec
+        && t.interleaved
+        && matches!(head_dim, 128 | 256 | 512)
+        && rotary_dim > 0
+        && rotary_dim <= head_dim.min(128)
+        && rotary_dim.is_multiple_of(per.min(8))
+        && y.width.is_multiple_of(head_dim)
+        && weight.is_none_or(|w| w.dtype == Dtype::Bf16 && aligned16(w.ptr))
+        && [x.ptr, y.ptr].iter().all(|&at| aligned16(at));
+    if !fits {
+        return Ok(false);
+    }
+    let (factor, low_dim, high_dim) = match t.yarn {
+        Some(yn) => {
+            let max_position = nonzero(
+                op,
+                "the position span this layer's YaRN ramp states",
+                yn.original_max_position,
+            )?;
+            let (low, high) = ramp_bounds(
+                stated(op, rotary_dim)?,
+                t.theta,
+                yn.beta_fast,
+                yn.beta_slow,
+                stated(op, max_position)?,
+            );
+            (yn.factor, low, high)
+        }
+        None => (UNSCALED, 0.0, 0.0),
+    };
+    let heads = y.width / head_dim;
+    let units = y.rows.checked_mul(heads).ok_or_else(|| {
+        refuse(
+            op,
+            format!("{} rows of {heads} heads overflow a grid", y.rows),
+        )
+    })?;
+    if units == 0 {
+        return Ok(true);
+    }
+    let weighted = weight.is_some();
+    let appends = append.is_some();
+    let (pages, write_page, write_offset, row_valid, page_size) = match &append {
+        Some(a) => (
+            a.pool.keys.arg(),
+            a.write_page.arg(),
+            a.write_offset.arg(),
+            a.pool.row_valid.arg(),
+            a.pool.page_size.arg(),
+        ),
+        None => (
+            Tensor::ABSENT.arg(),
+            Tensor::ABSENT.arg(),
+            Tensor::ABSENT.arg(),
+            Tensor::ABSENT.arg(),
+            0_i32.arg(),
+        ),
+    };
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::norm_rope_last<{per}, {weighted}, {appends}>"
+            )),
+        )
+        .apply(Launch::grid(
+            [strided_blocks(ctx, units), 1, 1],
+            [256, 1, 1],
+        )),
+        &[
+            x.arg(),
+            weight.unwrap_or(Tensor::ABSENT).arg(),
+            y.arg(),
+            positions.arg(),
+            stated(op, units)?.arg(),
+            stated(op, heads)?.arg(),
+            t.eps.arg(),
+            stated(op, rotary_dim)?.arg(),
+            t.theta.arg(),
+            t.inverse.arg(),
+            factor.arg(),
+            low_dim.arg(),
+            high_dim.arg(),
+            pages,
+            write_page,
+            write_offset,
+            row_valid,
+            page_size,
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}
+
 pub fn yarn(
     ctx: &Ctx,
     q: &mut Tensor,
     k: &mut Tensor,
     positions: Tensor,
-    head_dim: u32,
-    theta: f32,
-    factor: f32,
-    beta_fast: f32,
-    beta_slow: f32,
-    attention_factor: f32,
-    original_max_position: u32,
-    interleaved: bool,
+    r: YarnRope,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_yarn";
-    dtype_dispatch!(OP, q.dtype, { Bf16 => () });
-    debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
-    positions_stream(OP, positions, q);
-    let max_position = stated(
-        OP,
-        nonzero(
-            OP,
-            "the position span this checkpoint's YaRN block states",
-            original_max_position,
-        )?,
-    )?;
-    let num_q_heads = q_heads(OP, q.width, head_dim)?;
-    let num_kv_heads = heads(OP, k.width, head_dim)?;
-    let (low_dim, high_dim) = ramp_bounds(
-        stated(OP, head_dim)?,
+    yarn_fire(ctx, "elementwise.rope_yarn", q, k, positions, r, None)
+}
+
+/// Where a YaRN rotation also lands the rotated keys and the values in a
+/// paged cache, at each row's explicit page and offset.
+#[derive(Clone, Copy)]
+pub struct YarnAppend<'a> {
+    pub v: Tensor,
+    pub pool: &'a KvPool,
+    pub write_page: Tensor,
+    pub write_offset: Tensor,
+}
+
+impl YarnAppend<'_> {
+    /// Whether the fused write lands what `kv_append` would: a bf16 NHD
+    /// pool with no quantised planes and no envelopes to keep.
+    #[must_use]
+    pub fn fits(&self) -> bool {
+        self.pool.layout == 0
+            && !self.pool.has_envelopes
+            && self.pool.keys.dtype == Dtype::Bf16
+            && self.pool.values.dtype == Dtype::Bf16
+            && self.pool.key_scales.is_absent()
+            && self.pool.value_scales.is_absent()
+            && self.v.dtype == Dtype::Bf16
+    }
+}
+
+/// [`yarn`], landing the rotated keys and the values in `append`'s cache in
+/// the same launch. The caller checks [`YarnAppend::fits`] first.
+pub fn yarn_append(
+    ctx: &Ctx,
+    q: &mut Tensor,
+    k: &mut Tensor,
+    positions: Tensor,
+    r: YarnRope,
+    append: YarnAppend<'_>,
+) -> Result<(), Error> {
+    yarn_fire(
+        ctx,
+        "elementwise.rope_yarn_append",
+        q,
+        k,
+        positions,
+        r,
+        Some(append),
+    )
+}
+
+/// [`yarn_append`] reading q, k and v straight out of `packed` (`[rows, q |
+/// k | v]`, `q_width` and `kv_width` wide): the rotated q lands in `q_out`,
+/// the rotated k and its v in `append`'s cache, the same bits as
+/// `split_qkv`, [`yarn_append`] would land. `append.v` is not read. The
+/// caller checks [`YarnAppend::fits`] first.
+pub fn yarn_split_append(
+    ctx: &Ctx,
+    packed: Tensor,
+    kv_width: u32,
+    q_out: &mut Tensor,
+    positions: Tensor,
+    r: YarnRope,
+    append: YarnAppend<'_>,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.split_rope_yarn_append";
+    let YarnRope {
+        head_dim,
         theta,
-        beta_fast,
-        beta_slow,
-        max_position,
-    );
+        yarn,
+        attention_factor,
+        interleaved,
+    } = r;
+    dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
+    if !append.fits() {
+        return Err(refuse(
+            OP,
+            "the fused YaRN write lands a bf16 NHD cache without envelopes only",
+        ));
+    }
+    positions_stream(OP, positions, q_out);
+    let num_q_heads = q_heads(OP, q_out.width, head_dim)?;
+    let num_kv_heads = heads(OP, kv_width, head_dim)?;
+    if packed.width != q_out.width + 2 * kv_width || packed.rows != q_out.rows {
+        return Err(refuse(
+            OP,
+            format!(
+                "a [{} x {}] packed row is not q {} wide and k and v {} wide each over {} rows",
+                packed.rows, packed.width, q_out.width, kv_width, q_out.rows
+            ),
+        ));
+    }
+    let (low_dim, high_dim) = r.ramp(OP)?;
     let half = head_dim / 2;
     let pairs = cache_pairs(half);
     let per_block = heads_per_block(half);
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::elemwise::rope_yarn").apply(rotate_launch(
+        Fire::at(FILE, "::pie::elemwise::rope_yarn_split_append").apply(rotate_launch(
+            q_out.rows,
+            num_q_heads + num_kv_heads,
+            per_block,
+            pairs * 8,
+        )),
+        &[
+            packed.arg(),
+            q_out.arg(),
+            positions.arg(),
+            stated(OP, num_q_heads)?.arg(),
+            stated(OP, num_kv_heads)?.arg(),
+            stated(OP, head_dim)?.arg(),
+            theta.arg(),
+            yarn.factor.arg(),
+            low_dim.arg(),
+            high_dim.arg(),
+            attention_factor.arg(),
+            interleaved.arg(),
+            stated(OP, per_block)?.arg(),
+            stated(OP, pairs)?.arg(),
+            append.pool.keys.arg(),
+            append.pool.values.arg(),
+            append.write_page.arg(),
+            append.write_offset.arg(),
+            append.pool.row_valid.arg(),
+            append.pool.page_size.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+fn yarn_fire(
+    ctx: &Ctx,
+    op: &'static str,
+    q: &mut Tensor,
+    k: &mut Tensor,
+    positions: Tensor,
+    r: YarnRope,
+    append: Option<YarnAppend<'_>>,
+) -> Result<(), Error> {
+    let YarnRope {
+        head_dim,
+        theta,
+        yarn,
+        attention_factor,
+        interleaved,
+    } = r;
+    dtype_dispatch!(op, q.dtype, { Bf16 => () });
+    debug_assert_eq!(k.dtype, q.dtype, "`{op}` rotates q and k in one element");
+    positions_stream(op, positions, q);
+    let num_q_heads = q_heads(op, q.width, head_dim)?;
+    let num_kv_heads = heads(op, k.width, head_dim)?;
+    let (low_dim, high_dim) = r.ramp(op)?;
+    let half = head_dim / 2;
+    let pairs = cache_pairs(half);
+    let per_block = heads_per_block(half);
+    let (entry, v, k_pages, v_pages, w_page, w_off, row_valid, page_size) = match append {
+        Some(a) => {
+            if !a.fits() {
+                return Err(refuse(
+                    op,
+                    "the fused YaRN write lands a bf16 NHD cache without envelopes only",
+                ));
+            }
+            (
+                "::pie::elemwise::rope_yarn<::pie::true_type::value>",
+                a.v.arg(),
+                a.pool.keys.arg(),
+                a.pool.values.arg(),
+                a.write_page.arg(),
+                a.write_offset.arg(),
+                a.pool.row_valid.arg(),
+                a.pool.page_size,
+            )
+        }
+        None => (
+            "::pie::elemwise::rope_yarn<::pie::false_type::value>",
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            0,
+        ),
+    };
+    ctx.fire(
+        op,
+        Fire::at(FILE, entry).apply(rotate_launch(
             q.rows,
             num_q_heads + num_kv_heads,
             per_block,
@@ -366,17 +835,24 @@ pub fn yarn(
             q.arg(),
             k.arg(),
             positions.arg(),
-            stated(OP, num_q_heads)?.arg(),
-            stated(OP, num_kv_heads)?.arg(),
-            stated(OP, head_dim)?.arg(),
+            stated(op, num_q_heads)?.arg(),
+            stated(op, num_kv_heads)?.arg(),
+            stated(op, head_dim)?.arg(),
             theta.arg(),
-            factor.arg(),
+            yarn.factor.arg(),
             low_dim.arg(),
             high_dim.arg(),
             attention_factor.arg(),
             interleaved.arg(),
-            stated(OP, per_block)?.arg(),
-            stated(OP, pairs)?.arg(),
+            stated(op, per_block)?.arg(),
+            stated(op, pairs)?.arg(),
+            v,
+            k_pages,
+            v_pages,
+            w_page,
+            w_off,
+            row_valid,
+            page_size.arg(),
             ctx.stage(),
         ],
     )
@@ -414,4 +890,240 @@ fn rope_partial(
             ctx.stage(),
         ],
     )
+}
+
+/// Qwen3.5's attention prologue in one launch: the q heads cut from their
+/// `[q | gate]` rows (`qg`) and the k heads, each normed per head with its
+/// plus-one weight and turned by `rope_partial`'s pairs, the gate copied to
+/// `gate`, and the turned k with its v landed in `append`'s cache. The
+/// caller checks [`YarnAppend::fits`] first.
+#[allow(clippy::too_many_arguments)]
+pub fn qg_qknorm_rope_append(
+    ctx: &Ctx,
+    qg: Tensor,
+    k: Tensor,
+    q_norm: Tensor,
+    k_norm: Tensor,
+    positions: Tensor,
+    head_dim: u32,
+    rotary_dim: u32,
+    span: u32,
+    theta: f32,
+    q_eps: f32,
+    k_eps: f32,
+    q_out: &mut Tensor,
+    gate: &mut Tensor,
+    append: YarnAppend<'_>,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.qg_qknorm_rope_append";
+    dtype_dispatch!(OP, qg.dtype, { Bf16 => () });
+    positions_stream(OP, positions, q_out);
+    if !append.fits()
+        || !(head_dim == 128 || head_dim == 256)
+        || !span.is_multiple_of(head_dim / 32)
+        || !rotary_dim.is_multiple_of(2)
+        || span < rotary_dim / 2
+        || span + rotary_dim / 2 > head_dim
+        || !q_out.width.is_multiple_of(head_dim)
+        || !k.width.is_multiple_of(head_dim)
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "wants whole 128- or 256-wide heads, an even rotary prefix whose pairs sit \
+                 within them and a bf16 NHD cache; was handed head_dim={head_dim}, \
+                 rotary_dim={rotary_dim}, span={span}"
+            ),
+        ));
+    }
+    let hq = q_out.width / head_dim;
+    let hk = k.width / head_dim;
+    if q_out.rows == 0 {
+        return Ok(());
+    }
+    let units = q_out
+        .rows
+        .checked_mul(hq + hk)
+        .ok_or_else(|| refuse(OP, "the (row, head) units overflow a grid"))?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::qg_qknorm_rope_append<{}>",
+                head_dim / 32
+            )),
+        )
+        .apply(Launch::grid([units.div_ceil(8), 1, 1], [256, 1, 1])),
+        &[
+            qg.arg(),
+            k.arg(),
+            append.v.arg(),
+            q_norm.arg(),
+            k_norm.arg(),
+            positions.arg(),
+            q_out.arg(),
+            gate.arg(),
+            append.pool.keys.arg(),
+            append.pool.values.arg(),
+            append.write_page.arg(),
+            append.write_offset.arg(),
+            append.pool.row_valid.arg(),
+            append.pool.page_size.arg(),
+            stated(OP, hq)?.arg(),
+            stated(OP, hk)?.arg(),
+            stated(OP, units)?.arg(),
+            stated(OP, rotary_dim)?.arg(),
+            stated(OP, span)?.arg(),
+            theta.arg(),
+            q_eps.arg(),
+            k_eps.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// One side of [`norm_rope_pair`]: the rows, the head width and the norm's
+/// epsilon, where the normed and rotated rows land.
+pub struct Side<'a> {
+    pub x: Tensor,
+    pub head_dim: u32,
+    pub eps: f32,
+    pub y: &'a mut Tensor,
+}
+
+/// DeepSeek-V4's q (scale-free per head) and its kv plane (scaled, one
+/// 512-wide head) normed and rotated (forward, interleaved) in one launch
+/// (`norm_rope_pair`), the plane also written into DeepSeek's fp8 pool where
+/// `append` names one: whether it fired (under `kernel.elemwise.rows_vec`,
+/// for the shapes it is built for). Nothing is fired where it did not.
+#[allow(clippy::too_many_arguments)]
+pub fn norm_rope_pair(
+    ctx: &Ctx,
+    q: Side<'_>,
+    kv: Side<'_>,
+    kv_weight: Tensor,
+    positions: Tensor,
+    rotary_dim: u32,
+    theta: f32,
+    yarn: Option<Yarn>,
+    append: Option<Append<'_>>,
+) -> Result<bool, Error> {
+    const OP: &str = "elementwise.norm_rope_pair";
+    let qper = q.head_dim / 32;
+    let fits = ctx.tuning().rows_vec
+        && q.x.dtype == Dtype::Bf16
+        && kv.x.dtype == Dtype::Bf16
+        && kv_weight.dtype == Dtype::Bf16
+        && matches!(q.head_dim, 128 | 256 | 512)
+        && kv.head_dim == 512
+        && kv.y.width == 512
+        && rotary_dim > 0
+        && rotary_dim <= 128.min(q.head_dim)
+        && rotary_dim.is_multiple_of(qper.min(8))
+        && q.y.width.is_multiple_of(q.head_dim)
+        && q.y.rows == kv.y.rows
+        && append
+            .as_ref()
+            .is_none_or(|a| crate::attn::dsv4::fp8_ds(a.pool))
+        && [q.x.ptr, q.y.ptr, kv.x.ptr, kv.y.ptr, kv_weight.ptr]
+            .iter()
+            .all(|&at| aligned16(at));
+    if !fits {
+        return Ok(false);
+    }
+    positions_stream(OP, positions, &q.x);
+    let (factor, low_dim, high_dim) = match yarn {
+        Some(yn) => {
+            let max_position = nonzero(
+                OP,
+                "the position span this layer's YaRN ramp states",
+                yn.original_max_position,
+            )?;
+            let (low, high) = ramp_bounds(
+                stated(OP, rotary_dim)?,
+                theta,
+                yn.beta_fast,
+                yn.beta_slow,
+                stated(OP, max_position)?,
+            );
+            (yn.factor, low, high)
+        }
+        None => (UNSCALED, 0.0, 0.0),
+    };
+    let q_heads = q.y.width / q.head_dim;
+    let q_units = q.y.rows.checked_mul(q_heads).ok_or_else(|| {
+        refuse(
+            OP,
+            format!("{} rows of {q_heads} heads overflow a grid", q.y.rows),
+        )
+    })?;
+    let kv_units = kv.y.rows;
+    let units = q_units + kv_units;
+    if units == 0 {
+        return Ok(true);
+    }
+    let appends = append.is_some();
+    let (pages, write_page, write_offset, row_valid, page_size) = match &append {
+        Some(a) => (
+            a.pool.keys.arg(),
+            a.write_page.arg(),
+            a.write_offset.arg(),
+            a.pool.row_valid.arg(),
+            a.pool.page_size.arg(),
+        ),
+        None => (
+            Tensor::ABSENT.arg(),
+            Tensor::ABSENT.arg(),
+            Tensor::ABSENT.arg(),
+            Tensor::ABSENT.arg(),
+            0_i32.arg(),
+        ),
+    };
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::norm_rope_pair<{qper}, {appends}>"
+            )),
+        )
+        .apply(Launch::grid(
+            [strided_blocks(ctx, units), 1, 1],
+            [256, 1, 1],
+        )),
+        &[
+            q.x.arg(),
+            q.y.arg(),
+            stated(OP, q_units)?.arg(),
+            stated(OP, q_heads)?.arg(),
+            q.eps.arg(),
+            kv.x.arg(),
+            kv_weight.arg(),
+            kv.y.arg(),
+            stated(OP, kv_units)?.arg(),
+            kv.eps.arg(),
+            positions.arg(),
+            stated(OP, rotary_dim)?.arg(),
+            theta.arg(),
+            factor.arg(),
+            low_dim.arg(),
+            high_dim.arg(),
+            pages,
+            write_page,
+            write_offset,
+            row_valid,
+            page_size,
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}
+
+/// Blocks of eight warps for `units` warp-units, at most eight blocks a
+/// multiprocessor (a full one's threads): the kernels stride over the rest,
+/// working the tail's frequencies once a block rather than once a unit-eight.
+fn strided_blocks(ctx: &Ctx, units: u32) -> u32 {
+    let resident = ctx.multiprocessors().unwrap_or(148).saturating_mul(8);
+    units.div_ceil(8).min(resident).max(1)
 }

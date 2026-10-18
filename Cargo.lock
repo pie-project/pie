@@ -1830,6 +1830,7 @@ dependencies = [
  "eta-compiler",
  "eta-exec",
  "kernels-cuda",
+ "kernels-rocm",
  "libc",
  "memmap2",
  "pie-eta-ir",
@@ -3085,6 +3086,7 @@ dependencies = [
  "pie-dtype",
  "pie-profile",
  "tracing",
+ "ztensor-compat",
 ]
 
 [[package]]
@@ -3097,6 +3099,17 @@ dependencies = [
  "objc2-metal",
  "pie-dtype",
  "pie-profile",
+]
+
+[[package]]
+name = "kernels-rocm"
+version = "0.5.4"
+dependencies = [
+ "libloading 0.9.0",
+ "miniz_oxide 0.8.9",
+ "pie-dtype",
+ "pie-profile",
+ "tracing",
 ]
 
 [[package]]

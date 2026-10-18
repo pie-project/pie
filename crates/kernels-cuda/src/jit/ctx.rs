@@ -10,6 +10,13 @@ pub struct Launch {
     pub block: [u32; 3],
     pub smem: u32,
     pub cooperative: bool,
+    /// CTAs a cluster along x; 1 launches none.
+    pub cluster: u32,
+    /// Programmatic dependent launch: this kernel may start while the one
+    /// before it on the stream finishes, and waits on it in-kernel
+    /// (`griddepcontrol.wait`) before it reads anything that one wrote. Set
+    /// only on a kernel that waits so (sm_90 and later).
+    pub pdl: bool,
 }
 
 impl Launch {
@@ -21,6 +28,8 @@ impl Launch {
             block: [block, 1, 1],
             smem: 0,
             cooperative: false,
+            cluster: 1,
+            pdl: false,
         }
     }
 
@@ -31,6 +40,8 @@ impl Launch {
             block: [block, 1, 1],
             smem: 0,
             cooperative: false,
+            cluster: 1,
+            pdl: false,
         }
     }
 
@@ -41,6 +52,8 @@ impl Launch {
             block,
             smem: 0,
             cooperative: false,
+            cluster: 1,
+            pdl: false,
         }
     }
 
@@ -53,6 +66,22 @@ impl Launch {
     #[must_use]
     pub const fn cooperative(mut self) -> Self {
         self.cooperative = true;
+        self
+    }
+
+    /// Launches `ctas` consecutive CTAs along x as one cluster; the grid's
+    /// x must be a multiple of it.
+    #[must_use]
+    pub const fn cluster(mut self, ctas: u32) -> Self {
+        self.cluster = ctas;
+        self
+    }
+
+    /// Launches as a programmatic dependent of the stream's previous kernel
+    /// where `on`; see [`Launch::pdl`].
+    #[must_use]
+    pub const fn programmatic(mut self, on: bool) -> Self {
+        self.pdl = on;
         self
     }
 
@@ -339,6 +368,33 @@ impl Ctx {
         }
     }
 
+    /// [`Ctx::scratch_stream`], zeroed when fresh: for counts a kernel
+    /// leaves at zero between launches.
+    pub fn scratch_stream_zeroed(
+        &self,
+        op: &'static str,
+        name: &'static str,
+        bytes: usize,
+    ) -> Result<*mut c_void, Error> {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::take_zeroed(
+                self.slabs.0,
+                self.stream,
+                self.owner,
+                name,
+                NO_REGION,
+                bytes,
+            )
+            .map_err(|fault| fault.at(op))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (name, bytes);
+            Err(crate::jit::runtimeless(op))
+        }
+    }
+
     pub fn scratch_shared(
         &self,
         op: &'static str,
@@ -423,6 +479,34 @@ impl Ctx {
         }
     }
 
+    /// The dynamic shared memory one block may opt into on this device.
+    #[allow(clippy::unused_self)]
+    #[must_use]
+    pub fn smem_per_block_optin(&self) -> Option<u32> {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::max_shared_memory_per_block_optin()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    /// The shared memory one SM holds across its resident blocks.
+    #[allow(clippy::unused_self)]
+    #[must_use]
+    pub fn smem_per_sm(&self) -> Option<u32> {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::max_shared_memory_per_sm()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
     pub fn fire(&self, op: &'static str, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         let Some(root) = crate::jit::Root::of(fire.file) else {
             return Err(refuse(
@@ -489,11 +573,33 @@ impl Ctx {
     }
 }
 
+/// Whether a device instantiation that will not fire (it does not compile,
+/// or its module does not load) panics rather than falling back: on under
+/// `PIE_STRICT_KERNELS=1` or [`strict_kernels`], as the test harnesses run.
+/// Off, the fallback serves (another chip's toolchain may lack what one
+/// unit asks) and the fault is said once.
+#[must_use]
+pub fn kernels_strict() -> bool {
+    STRICT.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("PIE_STRICT_KERNELS").is_some_and(|v| v == "1")
+}
+
+/// Turns [`kernels_strict`] on for this process.
+pub fn strict_kernels() {
+    STRICT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(feature = "cuda")]
 fn said(root: &str, instantiation: &str, why: crate::jit::Fault) -> crate::jit::Fault {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
+    assert!(
+        !kernels_strict(),
+        "strict kernels: `{root}` {instantiation} will not fire: {why}"
+    );
     static SAID: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let said = SAID.get_or_init(|| Mutex::new(HashSet::new()));
     if let Ok(mut said) = said.lock()

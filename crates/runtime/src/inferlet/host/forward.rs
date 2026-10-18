@@ -1597,6 +1597,21 @@ impl ProcessCtx {
                             );
                             None
                         }
+                        // A program the decode envelope covers runs ahead: its
+                        // pages and write slots are the host's, so the next fire
+                        // is staged while this one runs. Device geometry reads
+                        // every descriptor port back from the device before it
+                        // stages, so it is only the pass for programs the
+                        // envelope declines.
+                        Some(_)
+                            if envelope_runs_ahead(
+                                &prog.bound.container,
+                                taint,
+                                device_port_mask,
+                            ) =>
+                        {
+                            None
+                        }
                         Some(qo_indptr) => {
                             tracing::info!(
                                 "device-carried decode ({} lane(s), {} row(s)) re-publishes \
@@ -2080,6 +2095,21 @@ impl pie::inferlet::forward_diffusion::HostForwardPass for ProcessCtx {
             Mode::Denoise => CanvasMode::Denoise,
         };
         self.core_canvas(this, mode).await
+    }
+}
+
+/// Whether the decode envelope classifies `container` and the engine reads
+/// every port that envelope requires from the device.
+fn envelope_runs_ahead(
+    container: &eta_ir::container::TraceContainer,
+    taint: &eta_compiler::eval::pareval::GeometryTaint,
+    device_port_mask: PortMask,
+) -> bool {
+    let mut why = String::new();
+    match crate::pipeline::fire::geometry::classify_decode_envelope_why(container, taint, &mut why)
+    {
+        Ok(Some(required)) => device_port_mask.covers(required),
+        Ok(None) | Err(_) => false,
     }
 }
 

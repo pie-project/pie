@@ -1,0 +1,134 @@
+# The weights of MiniMax-M3's language model: GQA with plus-one q/k norms and
+# a partial NeoX rope; three dense layers, then layers reading only the blocks
+# their indexer picks per kv head, with routed experts and one shared. Every
+# MLP is a clamped SwiGLU-OAI.
+
+def dims(layers = 60, experts = 128):
+    return struct(
+        hidden = 6144,
+        layers = layers,
+        dense_layers = 3,
+        q_heads = 64,
+        kv_heads = 4,
+        head_dim = 128,
+        rotary_dim = 64,
+        theta = 5000000.0,
+        dense_inter = 12288,
+        experts = experts,
+        top_k = 4,
+        inter = 3072,
+        shared_inter = 3072,
+        routed_scaling = 2.0,
+        swiglu_limit = 7.0,
+        swiglu_alpha = 1.702,
+        indexer = struct(heads = 4, head_dim = 128, block = 128, top_k = 16),
+        vocab = 200064,
+        norm_eps = 1e-6,
+    )
+
+DIMS = {
+    "minimax-m3": dims(),
+    "minimax-m3-mini": dims(layers = 6, experts = 8),
+}
+
+def mix_of(w):
+    """Where each kind of weight lands at deployment weights `w`: whole at
+    bf16; at u4g64 the routed experts at four bits and the rest of the
+    projections at eight."""
+    if w == dtype.u4g64:
+        return struct(embed = dtype.u8g64, head = dtype.u8g64, proj = dtype.u8g64, experts = dtype.u4g64)
+    return struct(embed = w, head = w, proj = w, experts = w)
+
+def attention(n, d, proj, dense, kv):
+    """The attention named by `n`, its projections at `proj`, caching in `kv`."""
+    hd = d.head_dim
+    return struct(
+        rotary_dim = d.rotary_dim,
+        theta = d.theta,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        q_proj = weight(n("q_proj"), [d.q_heads * hd, d.hidden], proj).columns(),
+        k_proj = weight(n("k_proj"), [d.kv_heads * hd, d.hidden], proj).columns(heads = d.kv_heads),
+        v_proj = weight(n("v_proj"), [d.kv_heads * hd, d.hidden], proj).columns(heads = d.kv_heads),
+        o_proj = weight(n("o_proj"), [d.hidden, d.q_heads * hd], proj).rows(),
+        q_norm = weight(n("q_norm"), [hd], dense),
+        k_norm = weight(n("k_norm"), [hd], dense),
+        norm_eps = d.norm_eps,
+        kv = kv,
+    )
+
+def indexer(n, d, dense, keys):
+    """The block indexer named by `n`: `heads` queries, one per kv head, and
+    one key a token, cached in `keys`."""
+    ix = d.indexer
+    return struct(
+        heads = ix.heads,
+        head_dim = ix.head_dim,
+        block = ix.block,
+        top_k = ix.top_k,
+        norm_eps = d.norm_eps,
+        q_proj = weight(n("index_q_proj"), [ix.heads * ix.head_dim, d.hidden], dense),
+        k_proj = weight(n("index_k_proj"), [ix.head_dim, d.hidden], dense),
+        q_norm = weight(n("index_q_norm"), [ix.head_dim], dense),
+        k_norm = weight(n("index_k_norm"), [ix.head_dim], dense),
+        keys = keys,
+    )
+
+def mlp(n, d, inter, proj, prefix = ""):
+    """A clamped SwiGLU-OAI MLP `inter` wide, its gate and up packed."""
+    return struct(
+        gate_up = weight(n(prefix + "gate_up"), [2 * inter, d.hidden], proj).packed([inter, inter]),
+        down = weight(n(prefix + "down"), [d.hidden, inter], proj).rows(),
+        inter = inter,
+        limit = d.swiglu_limit,
+        alpha = d.swiglu_alpha,
+    )
+
+def routed(n, d, mix, dense):
+    """`d.top_k` of `d.experts` experts, sigmoid-routed with a correction
+    bias, beside the one shared expert."""
+    return struct(
+        router = weight(n("router"), [d.experts, d.hidden], dense),
+        bias = weight(n("router_bias"), [d.experts], dtype.f32),
+        gate_up = weight(n("experts_gate_up"), [d.experts, 2 * d.inter, d.hidden], mix.experts).bank([d.inter, d.inter]),
+        down = weight(n("experts_down"), [d.experts, d.hidden, d.inter], mix.experts).rows(),
+        shared = mlp(n, d, d.shared_inter, mix.proj, prefix = "shared_"),
+        experts = d.experts,
+        top_k = d.top_k,
+        inter = d.inter,
+        routed_scaling = d.routed_scaling,
+        limit = d.swiglu_limit,
+        alpha = d.swiglu_alpha,
+    )
+
+def layout(id, deploy):
+    if len(deploy.weights) != 1 or deploy.weights[0] not in [dtype.bf16, dtype.u4g64] or deploy.parts or deploy.drafter != None:
+        fail("{} does not ship {}".format(id, deploy))
+    d = DIMS[id]
+    mix = mix_of(deploy.weights[0])
+    dense = compute(mix.proj)
+
+    def layer(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        sparse = l >= d.dense_layers
+        return struct(
+            attn_norm = weight(n("attn_norm"), [d.hidden], dense),
+            attn = attention(n, d, mix.proj, dense, "kv.{}".format(l)),
+            indexer = indexer(n, d, dense, "index.{}".format(l)) if sparse else None,
+            mlp_norm = weight(n("mlp_norm"), [d.hidden], dense),
+            mlp = routed(n, d, mix, dense) if sparse else None,
+            dense = None if sparse else mlp(n, d, d.dense_inter, mix.proj),
+        )
+
+    return struct(
+        hidden = d.hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        kv_heads = d.kv_heads,
+        head_dim = d.head_dim,
+        norm_eps = d.norm_eps,
+        kv = deploy.kv,
+        embed = weight("embed", [d.vocab, d.hidden], mix.embed),
+        head = weight("lm_head", [d.vocab, d.hidden], mix.head),
+        final_norm = weight("final_norm", [d.hidden], dense),
+        layers = [layer(l) for l in range(d.layers)],
+    )

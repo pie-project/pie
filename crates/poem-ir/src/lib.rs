@@ -15,15 +15,16 @@ pub use fact::{Builtin, Fact, Facts};
 pub use guard::Guard;
 pub use operands::Operands;
 pub use ops::{
-    Attention, Collective, Elementwise, Fused, GateActivation, GridRule, Layout, Linear,
-    ModulateForm, MropeForm, NormKind, Operation, PixelOrder, RaggedMask, RopeForm, Spatial,
-    TapKind, TimePad, VoxelSegment,
+    ActQuant, Attention, Collective, Elementwise, Fused, GateActivation, GridRule, IndexScore,
+    Layout, Linear, ModulateForm, MropeForm, NormKind, NormNext, Operation, PixelOrder, RaggedMask,
+    RopeForm, Spatial, TapKind, TimePad, VoxelSegment,
 };
 pub use request::{Request, Stream};
 pub use trace::{
-    BlockDrafter, CacheRow, Node, Param, ParamLayout, ParamSource, Platform, Seam, Shard, Trace,
+    BlockDrafter, CacheRow, Node, Param, ParamLayout, ParamPlacement, ParamSource, Platform, Seam,
+    Shard, Trace,
 };
 pub use value::{
-    BIASES, Def, Dim, Dtype, GeomKind, PerAxis, RowAxis, RuntimeInput, SCALES, Selection,
-    StructKind, TILED_BAND, TILED_STEP, Ty, ValueDecl, ValueId,
+    BIASES, Def, Dim, Dtype, GLOBAL_SCALES, GeomKind, INPUT_SCALES, PerAxis, RowAxis, RuntimeInput,
+    SCALES, Selection, StructKind, TILED_BAND, TILED_STEP, Ty, ValueDecl, ValueId,
 };

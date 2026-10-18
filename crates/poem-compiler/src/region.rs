@@ -5,7 +5,17 @@ use crate::error::Error;
 use crate::unit::node_axis;
 use poem_ir::ClassTable;
 
+#[cfg(test)]
 pub(crate) fn coalesce(trace: &Trace, classes: &ClassTable) -> Result<Vec<Region>, Error> {
+    coalesce_breaking(trace, classes, &std::collections::BTreeSet::new())
+}
+
+/// [`coalesce`], a region also starting at each node of `breaks`.
+pub(crate) fn coalesce_breaking(
+    trace: &Trace,
+    classes: &ClassTable,
+    breaks: &std::collections::BTreeSet<u32>,
+) -> Result<Vec<Region>, Error> {
     let mut regions: Vec<Region> = Vec::new();
     let mut outs: Vec<ValueId> = Vec::new();
     let mut open_axis: Option<RowAxis> = None;
@@ -19,7 +29,7 @@ pub(crate) fn coalesce(trace: &Trace, classes: &ClassTable) -> Result<Vec<Region
         let mask = classes.node_mask[j as usize].clone();
 
         let joins = axis.is_none() || open_axis.is_none() || open_axis == axis;
-        let joins = joins && !(j > 0 && break_after.contains(&(j - 1)));
+        let joins = joins && !(j > 0 && break_after.contains(&(j - 1))) && !breaks.contains(&j);
         match regions.last_mut() {
             Some(open) if open.phase == phase && open.mask == mask && joins => {
                 open.nodes.end = j + 1;

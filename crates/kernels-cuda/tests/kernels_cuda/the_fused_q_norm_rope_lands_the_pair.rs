@@ -1,5 +1,9 @@
 #![cfg(feature = "cuda")]
 
+//! q's RMS norm and its (partial) rotation in one pass answer the host:
+//! every element normed and scaled, the first `rotary_dim / 2` pairs
+//! turned, each `span` apart, on the staged window's rows alone.
+
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::elemwise::rope;
@@ -64,10 +68,8 @@ fn check(
             let xr = &x[at..at + head_dim];
             let ms: f32 = xr.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
             let inv = 1.0 / (ms + eps).sqrt();
-            // every element of the head is normed and scaled; only the first
-            // rotary_dim / 2 pairs rotate, each `span` apart at theta^(-dp / span):
-            // span = rotary_dim / 2 the way HF and llama.cpp pair a partial
-            // rotary, head_dim / 2 for a proportional one.
+            // `span`: rotary_dim / 2 for HF's partial rotary, head_dim / 2
+            // for a proportional one.
             let mut want: Vec<f32> = (0..head_dim).map(|i| xr[i] * inv * w[i]).collect();
             for dp in 0..rotary_dim / 2 {
                 let (a, b) = (want[dp], want[dp + span]);
@@ -90,22 +92,10 @@ fn check(
 
 #[test]
 fn the_fused_q_norm_rope_lands_the_pair_every_case() {
-    a_full_rotary_head_lands_the_pair();
-    a_partial_rotary_head_lands_the_pair_and_leaves_the_rest_normed();
-    a_proportional_head_pairs_across_the_whole_head();
-}
-
-fn a_full_rotary_head_lands_the_pair() {
+    // A full rotary head; a partial one on a window, the rest left normed;
+    // Gemma 4 31B's proportional head (a quarter turning, each pair half a
+    // head apart).
     check(256, 4, 256, 128, None);
-}
-
-fn a_partial_rotary_head_lands_the_pair_and_leaves_the_rest_normed() {
-    check(256, 8, 128, 64, None);
     check(128, 2, 64, 32, Some((6, 4, 1)));
-}
-
-fn a_proportional_head_pairs_across_the_whole_head() {
-    // Gemma 4 31B's global layers: head_dim 512, a quarter of it turning,
-    // each pair half a head apart.
     check(512, 4, 128, 256, None);
 }

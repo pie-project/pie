@@ -484,7 +484,10 @@ async fn main(input: Input) -> Result<Output> {
     // The first block row whose pick is a proposal: 1 when the anchor row
     // proposes nothing (DFlash), 0 when it proposes the next token (DSpark).
     let from = advertised.map_or(1, |d| d.proposals_from) as usize;
-    let pinned = (input.verify_rows != 0).then(|| input.verify_rows.clamp(2, block));
+    // The widest verify a block feeds: the anchor and every proposal (a
+    // head whose anchor row proposes, DSpark's, proposes a whole block).
+    let widest = block + 1 - from.min(1) as u32;
+    let pinned = (input.verify_rows != 0).then(|| input.verify_rows.clamp(2, widest));
     // The template `text-completion-bench` applies, so the two read the same prefill.
     let mut prompt: Vec<u32> = match &input.prompt_tokens {
         Some(tokens) => tokens.clone(),
@@ -624,7 +627,7 @@ async fn main(input: Input) -> Result<Output> {
         } else {
             gate.drafts().then(|| {
                 if gate.closed {
-                    pinned.unwrap_or(Gate::RUNGS[0]).min(block)
+                    pinned.unwrap_or(Gate::RUNGS[0]).min(widest)
                 } else {
                     pinned.unwrap_or_else(|| gate.width(block))
                 }

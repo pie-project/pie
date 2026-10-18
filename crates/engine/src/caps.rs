@@ -78,6 +78,18 @@ pub struct PoolFacts {
     pub host_buffer_pages: u32,
     #[serde(default)]
     pub disk_kv_pages: u32,
+    /// The engine would rather post one frame a lane than seat fewer lanes
+    /// than it batches when its state slots are short: the runtime then
+    /// dispatches one frame deep, so a lane holds one slot. False keeps the
+    /// configured depth whatever the slots seat.
+    #[serde(default)]
+    pub one_frame_when_short: bool,
+    /// The engine would rather a lane already decoding claim its next pages
+    /// before a prompt waiting to be seated does, and a prompt wait for a
+    /// lane to finish rather than suspend one. False keeps the runtime's
+    /// order of arrival, a waiting prompt older than a lane preempting it.
+    #[serde(default)]
+    pub seated_first: bool,
 }
 
 impl PoolFacts {
@@ -110,6 +122,12 @@ pub struct Capabilities {
 
     #[serde(default)]
     pub rs_verbs: bool,
+
+    /// The rows inside one lane whose recurrent state a fire lands in slots
+    /// of their own as it runs (`Lane::rs_snapshots`); 0 where it lands only
+    /// the state after the lane's last row, so a pass is cut at each.
+    #[serde(default)]
+    pub rs_snapshots: u32,
 
     #[serde(default)]
     pub bidirectional_attention: bool,

@@ -18,6 +18,21 @@ impl Shell {
         &self.compiled
     }
 
+    /// The regions whose attention stages at a prefill's width, and the
+    /// width (`crate::window::Staging`).
+    pub(crate) fn staging(&self) -> crate::window::Staging<'_> {
+        crate::window::Staging {
+            regions: &self.staging,
+            from: self.device.ctx().tuning().dsv4_prefill_from,
+        }
+    }
+
+    /// The kernel decisions this load runs under.
+    #[must_use]
+    pub fn tuning(&self) -> kernels_cuda::tuning::Tuning {
+        self.device.ctx().tuning()
+    }
+
     #[must_use]
     pub fn budget(&self) -> &Budget {
         &self.budget

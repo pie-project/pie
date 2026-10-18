@@ -235,7 +235,7 @@ fn import_vae(src: &ztensor::Source) -> checkpoint::contract::ModelContract {
 
 fn flagship() -> poem::star::Deploy {
     poem::star::Deploy {
-        weights: vec![Dtype::Bf16],
+        weights: vec![Dtype::Bf16.into()],
         kv: Dtype::Bf16,
         tp: 1,
         parts: vec![],

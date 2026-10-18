@@ -877,6 +877,12 @@ pub fn sink(
 ) -> Result<(), Error> {
     const OP: &str = "attention.sink";
     let entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "attn_sink_rescale_bfloat16" });
+    if sink.dtype != o.dtype {
+        return Err(Error::DtypeUnsupported {
+            op: OP,
+            dtype: sink.dtype,
+        });
+    }
     debug_assert_eq!(
         lse.dtype,
         Dtype::F32,

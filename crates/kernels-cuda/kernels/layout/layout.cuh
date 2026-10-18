@@ -205,6 +205,31 @@ __global__ void split_q_gate(
     }
 }
 
+// `split_q_gate` 16 bytes a lane: a thread moves one eight-element run of
+// q and the matching run of the gate; `runs` is `head_dim / 8`.
+template <class T>
+__global__ void split_q_gate_vec8(
+    const T* __restrict__ packed,
+    T* __restrict__ q_out,
+    T* __restrict__ gate_out,
+    long long total, int num_heads, int runs,
+    const u32* __restrict__ win)
+{
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const long long unit = i / runs;
+    const int c = static_cast<int>(i - unit * runs);
+    if (win != nullptr && unit / num_heads >= static_cast<long long>(win[0])) return;
+    const long long u = win != nullptr
+        ? unit + static_cast<long long>(win[1]) * num_heads
+        : unit;
+    const long long head_dim = static_cast<long long>(runs) * 8;
+    const T* row = packed + u * 2 * head_dim + c * 8;
+    *reinterpret_cast<uint4*>(q_out + u * head_dim + c * 8) = *reinterpret_cast<const uint4*>(row);
+    *reinterpret_cast<uint4*>(gate_out + u * head_dim + c * 8) =
+        *reinterpret_cast<const uint4*>(row + head_dim);
+}
+
 template <class T>
 __global__ void concat_rows(
     const T* __restrict__ left,
@@ -366,6 +391,79 @@ __global__ void split_qkv(
     for (int j = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x); j < kv_dim;
          j += static_cast<int>(blockDim.x * gridDim.y)) {
         v_out[static_cast<long long>(row) * kv_dim + j] = src_row[q_dim + kv_dim + j];
+    }
+}
+
+// split_qkv eight columns a thread: q_dim and kv_dim are multiples of 8 and
+// every plane 16-byte aligned, so each run is one 16-byte load and store.
+template <class T>
+__global__ void split_qkv_vec8(
+    const T* __restrict__ src,
+    T* __restrict__ q_out,
+    T* __restrict__ k_out,
+    T* __restrict__ v_out,
+    i32 q_dim, i32 kv_dim,
+    const u32* __restrict__ win)
+{
+    static_assert(sizeof(T) == 2, "eight columns are one 16-byte run");
+    const int n = static_cast<int>(blockIdx.x);
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const int q8 = q_dim / 8;
+    const int kv8 = kv_dim / 8;
+    const uint4* src_row =
+        reinterpret_cast<const uint4*>(src) + static_cast<long long>(row) * (q8 + 2 * kv8);
+    uint4* q_row = reinterpret_cast<uint4*>(q_out) + static_cast<long long>(row) * q8;
+    uint4* k_row = reinterpret_cast<uint4*>(k_out) + static_cast<long long>(row) * kv8;
+    uint4* v_row = reinterpret_cast<uint4*>(v_out) + static_cast<long long>(row) * kv8;
+    const int step = static_cast<int>(blockDim.x * gridDim.y);
+    const int first = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x);
+    for (int j = first; j < q8; j += step) q_row[j] = src_row[j];
+    for (int j = first; j < kv8; j += step) k_row[j] = src_row[q8 + j];
+    for (int j = first; j < kv8; j += step) v_row[j] = src_row[q8 + kv8 + j];
+}
+
+// `split_qkv_vec8` from heads narrower than the cut's: q and k heads `qk`
+// columns wide in the packed row, v heads `vw`, each landing `d` wide and
+// zero past its width (all whole 16-byte runs).
+__global__ void split_qkv_padded_vec8(
+    const bf16* __restrict__ src,
+    bf16* __restrict__ q_out,
+    bf16* __restrict__ k_out,
+    bf16* __restrict__ v_out,
+    i32 q_heads, i32 kv_heads, i32 qk, i32 vw, i32 d,
+    const u32* __restrict__ win)
+{
+    const int n = static_cast<int>(blockIdx.x);
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int d8 = d / 8;
+    const int stride8 = (q_heads * qk + kv_heads * (qk + vw)) / 8;
+    const uint4* src_row = reinterpret_cast<const uint4*>(src) + static_cast<long long>(row) * stride8;
+    const int out8 = (q_heads + 2 * kv_heads) * d8;
+    const int step = static_cast<int>(blockDim.x * gridDim.y);
+    for (int j = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x); j < out8; j += step) {
+        int h = j / d8;
+        const int c = j - h * d8;
+        uint4* dst;
+        int base8, width;
+        if (h < q_heads) {
+            dst = reinterpret_cast<uint4*>(q_out) + static_cast<long long>(row) * q_heads * d8;
+            base8 = h * qk / 8;
+            width = qk;
+        } else if (h < q_heads + kv_heads) {
+            h -= q_heads;
+            dst = reinterpret_cast<uint4*>(k_out) + static_cast<long long>(row) * kv_heads * d8;
+            base8 = (q_heads * qk + h * qk) / 8;
+            width = qk;
+        } else {
+            h -= q_heads + kv_heads;
+            dst = reinterpret_cast<uint4*>(v_out) + static_cast<long long>(row) * kv_heads * d8;
+            base8 = (q_heads * qk + kv_heads * qk + h * vw) / 8;
+            width = vw;
+        }
+        dst[h * d8 + c] = c * 8 < width ? src_row[base8 + c] : make_uint4(0, 0, 0, 0);
     }
 }
 

@@ -333,12 +333,12 @@ struct ChatMLToolDecoder {
     inside: bool,
 }
 
-/// The first `</tool_call>` that is not inside a JSON string. Measured on the
-/// 27B: an argument string held the closer verbatim, and a search blind to
+/// The first `closer` that is not inside a JSON string. Measured on the 27B:
+/// an argument string held `</tool_call>` verbatim, and a search blind to
 /// string context cut the call in half and dropped both halves.
-fn closer_outside_string(text: &str) -> Option<usize> {
+pub(crate) fn closer_outside_string(text: &str, closer: &str) -> Option<usize> {
     let bytes = text.as_bytes();
-    let closer = TOOL_CALL_CLOSE.as_bytes();
+    let closer = closer.as_bytes();
     let mut at = 0;
     let mut in_string = false;
     while at < bytes.len() {
@@ -361,7 +361,7 @@ impl ToolDecoder for ChatMLToolDecoder {
         let mut events = Vec::new();
         loop {
             if self.inside {
-                let Some(at) = closer_outside_string(&self.accumulated) else {
+                let Some(at) = closer_outside_string(&self.accumulated, TOOL_CALL_CLOSE) else {
                     return events;
                 };
                 let call = self.accumulated[..at].trim().to_string();

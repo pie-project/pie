@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "device")]
 
 use engine_cuda::device::{Buffer, Context};
 use kernels_cuda::{Ctx, Tensor, collective};

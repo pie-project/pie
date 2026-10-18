@@ -146,9 +146,27 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
         row.trace(poem::Platform::Cuda),
         &poem_compiler::fuse::flags::kernels(chip),
     );
+    #[cfg(not(feature = "rocm"))]
+    let trace = {
+        let tuning = kernels_cuda::tuning::Tuning::of(chip);
+        crate::narrow::gdn_out_bf16(
+            crate::grouped_decode::rewrite_with(
+                trace,
+                tuning.decode_grouped_prefill_from,
+                tuning.decode_grouped_prefill_lse,
+                kernels_cuda::attn::xqa::Gate::of(tuning),
+            ),
+            tuning.ssm_gdn_out_bf16,
+        )
+    };
     let slots = *LANES.iter().max().expect("lanes") as u32;
     let mut budget = poem_compiler::Budget::new(slots, CONTEXT);
-    budget.buckets = crate::api::lattice(Vec::new(), budget.max_tokens, engine.lattice_steps);
+    budget.buckets = crate::api::lattice(
+        Vec::new(),
+        budget.max_tokens,
+        engine.lattice_steps,
+        engine.prefill_lattice_from,
+    );
     let mut budgets = poem_compiler::Budgets::of(budget);
     if let Some(ladder) = patches(&trace, slots) {
         budgets = budgets.with_patches(ladder);
@@ -335,10 +353,22 @@ pub fn run(
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "rocm"))]
+    const GPU: (&str, u32, u32, u32, &str) = ("NVIDIA L40S", 8, 9, 142, "fuse.matmul_bias");
+    #[cfg(feature = "rocm")]
+    const GPU: (&str, u32, u32, u32, &str) = (
+        "AMD Instinct MI300X",
+        9,
+        4,
+        304,
+        "fuse.residual_add_rmsnorm",
+    );
+
     #[test]
     fn every_search_candidate_reads_against_the_registry() {
-        let facts = crate::chip::facts(8, 9, 142);
-        let (base, _) = crate::chip::resolve("NVIDIA L40S", &facts, None);
+        let (gpu, major, minor, sms, fused) = GPU;
+        let facts = crate::chip::facts(major, minor, sms);
+        let (base, _) = crate::chip::resolve(gpu, &facts, None);
         let registry = crate::chip::registry();
         let knobs = search::knobs(&base, SEARCH_SKIPS, "");
         let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
@@ -346,7 +376,7 @@ mod tests {
             "kernel.moe.grouped",
             "engine.graphs",
             "engine.recording",
-            "fuse.matmul_bias",
+            fused,
         ] {
             assert!(ids.contains(&want), "{want} not searched: {ids:?}");
         }
@@ -356,7 +386,7 @@ mod tests {
                 search::assemble(
                     registry,
                     &base,
-                    "NVIDIA L40S",
+                    gpu,
                     &facts,
                     &search::render_overrides(&entries),
                     &[],

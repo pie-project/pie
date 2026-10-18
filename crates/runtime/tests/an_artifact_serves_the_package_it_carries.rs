@@ -112,7 +112,7 @@ fn a_package_under_models_serves_its_artifact() {
     );
 
     let precision = Overrides {
-        precision: Some(vec![poem::Dtype::U4g64]),
+        precision: Some(vec![poem::Dtype::U4g64.into()]),
         ..Overrides::default()
     };
     let why = packaged(&path, &precision, poem::Platform::Cuda).unwrap_err();

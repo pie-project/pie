@@ -415,7 +415,8 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::SsmKdaStep { .. }
             | Attention::SsmKdaChunked { .. }
             | Attention::PleNgramIds { .. }
-            | Attention::PleNgramIdsChunked { .. } => true,
+            | Attention::PleNgramIdsChunked { .. }
+            | Attention::ReplayFloor { .. } => true,
             Attention::PlanDecode { .. }
             | Attention::PlanPrefill { .. }
             | Attention::Decode { .. }
@@ -446,6 +447,9 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::SsmGdnPrep { .. }
             | Attention::BlockDynConv { .. }
             | Attention::SelectorWalk { .. }
+            | Attention::KvEnds { .. }
+            | Attention::WindowSink { .. }
+            | Attention::MarkovWalk { .. }
             | Attention::IndexLayernormRope { .. }
             | Attention::IndexRope { .. }
             | Attention::IndexTopk { .. }
@@ -456,7 +460,16 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::PoolLse { .. }
             | Attention::PoolLseSelected { .. } => false,
         },
-        Operation::Fused(op) => matches!(op, Fused::QkvFusedQknormRopeVnormWrite { .. }),
+        Operation::Fused(op) => matches!(
+            op,
+            Fused::QkvFusedQknormRopeVnormWrite { .. }
+                | Fused::RopeYarnAppend { .. }
+                | Fused::NormRopeLastAppend { .. }
+                | Fused::PoolCompress { .. }
+                | Fused::NormRopePair { .. }
+                | Fused::SplitRopeYarnAppend { .. }
+                | Fused::QgQknormRopeAppend { .. }
+        ),
         Operation::Spatial(op) => match op {
             Spatial::Conv3d { cache, .. } => cache.is_some(),
             Spatial::CacheStore { .. } => true,

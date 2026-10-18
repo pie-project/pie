@@ -44,6 +44,7 @@ fn tests_every_case() {
     a_suspend_parks_private_slots_on_host_and_restore_brings_them_back();
     a_window_is_a_ring_of_pages_anchored_at_its_commit();
     a_checkpoint_resumes_a_fresh_working_set();
+    a_snapshot_resumes_at_its_row();
 }
 
 // A windowed model's state is a ring: a fire takes the pages it writes,
@@ -66,6 +67,7 @@ fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
     let advance = |fold, end| RingAdvance {
         positioned: true,
         settled: 0,
+        reach: 0,
         fold,
         commit_end: end,
         head: Some(end),
@@ -138,6 +140,7 @@ fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
     let device = |settled, end| RingAdvance {
         positioned: true,
         settled,
+        reach: settled,
         fold: None,
         commit_end: end,
         head: Some(end),
@@ -154,6 +157,7 @@ fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
     let lease = RingAdvance {
         positioned: false,
         settled: 0,
+        reach: 32,
         fold: None,
         commit_end: 0,
         head: None,
@@ -165,6 +169,23 @@ fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
         [0],
         "a device-geometry fire keeps the page its lease names"
     );
+
+    let decode = RingAdvance {
+        reach: 144,
+        ..lease
+    };
+    fire(&mut s, ws, &[9], decode);
+    assert_eq!(
+        s.ring_positions(ws),
+        Ok(Some((128, 144))),
+        "a device-geometry fire commits nothing"
+    );
+    assert_eq!(
+        s.ring_translation(ws, [6, 7]).unwrap()[0],
+        0,
+        "and retires what lies wholly behind the window of the first token it writes"
+    );
+    assert_ne!(s.ring_translation(ws, [7]).unwrap(), [0]);
 }
 
 fn a_suspend_parks_private_slots_on_host_and_restore_brings_them_back() {
@@ -472,4 +493,38 @@ fn a_checkpoint_resumes_a_fresh_working_set() {
     s.release_working_set(ws);
     assert_eq!(s.available().slots, free, "the checkpoint holds the slot");
     assert!(!s.has_checkpoint(&[8u8; 32]));
+}
+
+fn a_snapshot_resumes_at_its_row() {
+    let mut s = store();
+    let free = s.available().slots;
+    let ws = s.create_working_set(geom());
+    let mut prepared = s
+        .prepare_group(ws, true, false, Some(10), None, None)
+        .unwrap();
+    s.prepare_snapshots(&mut prepared, &[4], None).unwrap();
+    let published = s.publish_prepared(prepared).unwrap();
+    let [snap] = published.snapshots() else {
+        panic!("one snapshot a row")
+    };
+    assert_eq!((snap.ws, snap.row), (ws, 4));
+    s.settle(published.clone());
+    s.keep(snap.snapshot, [3; 32], None);
+    assert!(s.has_checkpoint(&[3; 32]));
+
+    let resumed = s.create_working_set(geom());
+    assert!(s.adopt_checkpoint(resumed, &[3; 32]).unwrap());
+    assert_eq!(s.folded_slot(resumed).unwrap(), Some(snap.slot));
+    assert_eq!(s.frozen(resumed), Ok(4), "the state as of its row");
+    assert_eq!(s.frozen(ws), Ok(10));
+
+    for id in [ws, resumed] {
+        s.release_working_set(id);
+    }
+    s.retire_idle();
+    assert_eq!(
+        s.available().slots,
+        free - 1,
+        "the checkpoint holds its slot"
+    );
 }

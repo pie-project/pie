@@ -81,6 +81,9 @@ pub struct Shell {
     media: poem_ir::ClassSet,
     shifted: Vec<bool>,
     lane_shifted: Vec<bool>,
+    /// `exports::regions_staging`: which regions launch eagerly at a
+    /// prefill's width.
+    staging: Vec<bool>,
     schedule_readers: Vec<Option<u32>>,
     adapter_fact: Option<u32>,
     adapters: crate::blob::Adapters,
@@ -90,6 +93,10 @@ pub struct Shell {
     scores: Option<crate::scores::Scores>,
     graphs: Graphs,
     copies: bool,
+    /// `engine.one_frame_when_short`.
+    one_frame_when_short: bool,
+    /// `engine.seated_first`.
+    seated_first: bool,
     pad: bool,
     bodies: bool,
     bodies_mem: usize,
@@ -108,6 +115,9 @@ pub struct Shell {
     airborne: crate::settle::Airborne,
     owed: Option<GuestBatch>,
     guest_landed: crate::device::graph::Event,
+    /// Where a device-counted fold left each recurrent slot, ahead of the
+    /// runtime's settled length until that fold settles.
+    rs_ahead: std::collections::HashMap<u32, u32>,
 }
 
 #[derive(Debug)]
@@ -124,8 +134,26 @@ pub(crate) struct KvReport {
 
 impl Shell {
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
+        match self.rs_ahead.get(&src).copied() {
+            Some(at) => self.rs_ahead.insert(dst, at),
+            None => self.rs_ahead.remove(&dst),
+        };
         self.pools.copy_slot(self.device.stream(), src, dst)?;
         self.device.synchronize()
+    }
+
+    /// Whether this load would post one frame a lane rather than seat fewer
+    /// lanes than it batches (`engine.one_frame_when_short`).
+    #[must_use]
+    pub fn one_frame_when_short(&self) -> bool {
+        self.one_frame_when_short
+    }
+
+    /// Whether this load asks the planner to serve a decoding lane's pages
+    /// before a prompt waiting to be seated (`engine.seated_first`).
+    #[must_use]
+    pub fn seated_first(&self) -> bool {
+        self.seated_first
     }
 
     /// Host rs rows: a state slot and a buffer page each, parked apart.
@@ -415,6 +443,21 @@ impl Shell {
         self.reap_guests_at("shell.reap_guests")
     }
 
+    /// Settles the guest batch a step left owed once that step has landed:
+    /// its channels' cells reach their readers then, and not at the next
+    /// fire's enqueue, which a reader waiting on them may be what holds back.
+    pub fn reap_landed_guests(&mut self) -> Result<()> {
+        let Some(batch) = self.owed.as_ref() else {
+            return Ok(());
+        };
+        // The batch's own event is recorded behind its programs, so it says
+        // the batch has landed even before the step's settle is counted.
+        if self.airborne.settled_past(batch.seq) || self.guest_landed.done()? {
+            self.reap_guests_at("shell.reap_landed_guests")?;
+        }
+        Ok(())
+    }
+
     pub fn reap_guests_at(&mut self, site: &'static str) -> Result<()> {
         reap_guest_fires(
             &mut self.programs,
@@ -460,6 +503,40 @@ impl Shell {
     }
 
     pub fn fire(&mut self, lanes: &[Lane<'_>]) -> Result<Vec<Vec<f32>>> {
+        // A causal encoder-decoder's long prompts: their leading rows
+        // through the encoder alone first (`crate::replay`).
+        if let Some(replay) = crate::replay::Replay::of(self) {
+            let window = replay.window as usize;
+            let cut = |lane: &Lane<'_>| lane.tokens.len() > window && lane.word & replay.bit == 0;
+            let heads: Vec<Seated<'_>> = lanes
+                .iter()
+                .filter(|lane| cut(lane))
+                .map(|lane| {
+                    Seated::of(Lane {
+                        word: lane.word | replay.bit,
+                        tokens: &lane.tokens[..lane.tokens.len() - window],
+                        ..*lane
+                    })
+                })
+                .collect();
+            if !heads.is_empty() {
+                self.fire_media(&heads, &[], &[], &mut Vec::new())?;
+                let tails: Vec<Seated<'_>> = lanes
+                    .iter()
+                    .map(|lane| {
+                        Seated::of(if cut(lane) {
+                            Lane {
+                                tokens: &lane.tokens[lane.tokens.len() - window..],
+                                ..*lane
+                            }
+                        } else {
+                            *lane
+                        })
+                    })
+                    .collect();
+                return self.fire_media(&tails, &[], &[], &mut Vec::new());
+            }
+        }
         let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
         self.fire_media(&seated, &[], &[], &mut Vec::new())
     }
@@ -509,6 +586,29 @@ impl Shell {
         Ok(std::mem::take(&mut settled.logits))
     }
 
+    /// [`Shell::fire_media`] over text lanes alone, each lane's logits the
+    /// rows `want` names of it (its last where it names none).
+    pub fn fire_rows(
+        &mut self,
+        lanes: &[Seated<'_>],
+        want: &[engine::fire::Readout],
+    ) -> Result<Vec<Vec<f32>>> {
+        let prepared = FrameShell::prepare(
+            self,
+            StepView {
+                lanes,
+                attachments: &[],
+                media: &[],
+                voxels: &[],
+            },
+            None,
+        )?;
+        let enqueued = FrameShell::enqueue(self, prepared)?;
+        let mut settled = FrameShell::settle(self, enqueued)?;
+        Shell::read_out_rows(self, &mut settled, want)?;
+        Ok(std::mem::take(&mut settled.logits))
+    }
+
     pub fn drain(&mut self) -> Result<()> {
         self.device.synchronize()
     }
@@ -524,6 +624,13 @@ impl Shell {
     #[must_use]
     pub fn armed(&self) -> Option<&Armed> {
         self.armed.as_ref()
+    }
+
+    /// The decoded-weight tile each stream was warmed with, main stream
+    /// first: a plane past its stream's tile takes the fused-dequant arm.
+    #[must_use]
+    pub fn decoded_tiles(&self) -> &[u64] {
+        &self.decoded_tiles
     }
 }
 
@@ -554,6 +661,8 @@ struct RsFire<'a> {
     buffered: bool,
     reads: Vec<Vec<std::ops::Range<u32>>>,
     rows_ext: u32,
+    #[cfg(feature = "rocm")]
+    snapshots: crate::store::rs::SnapTable,
 }
 
 #[derive(Debug, Clone, Copy)]

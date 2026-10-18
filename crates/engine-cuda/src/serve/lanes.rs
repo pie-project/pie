@@ -1,4 +1,6 @@
-use engine::fire::{AttnClasses, Boundary, Masking, PortFeed, RsReset, RsVerb, SelfCondInput};
+use engine::fire::{
+    AttnClasses, Boundary, Masking, PortFeed, RsReset, RsSnapshot, RsVerb, SelfCondInput,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Lane<'a> {
@@ -28,6 +30,7 @@ pub struct Seated<'a> {
     pub rs: RsVerb,
     pub rs_reset: RsReset,
     pub rs_slot: Option<u32>,
+    pub rs_snapshots: &'a [RsSnapshot],
     pub readout: Option<&'a [u32]>,
     pub stream: u8,
     pub group: Option<u32>,
@@ -58,6 +61,7 @@ impl<'a> Seated<'a> {
             rs: RsVerb::Fold,
             rs_reset: RsReset::Inferred,
             rs_slot: None,
+            rs_snapshots: &[],
             readout: None,
             stream: 0,
             group: None,

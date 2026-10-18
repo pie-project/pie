@@ -189,6 +189,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dspark-speculative-bench"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "entropy-adaptive-temperature"
 version = "0.1.0"
 dependencies = [

@@ -22,12 +22,16 @@ fn masked_arms(trace: &Trace) -> usize {
 
 #[test]
 fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
-    const DECLARE: [&str; 9] = [
+    const DECLARE: [&str; 13] = [
         "gemma4-",
         "diffusiongemma-",
         "gptoss-",
         "hunyuanimage3-",
+        "mimo26-",
+        "minimax-m3-",
         "muse-glimmer-",
+        "muse-spark-",
+        "ornith15-",
         "qwen3-",
         "qwen35-",
         "qwen36-",

@@ -485,7 +485,10 @@ mod tests {
             ..Overrides::default()
         };
         let plain_precision = Overrides {
-            precision: Some(vec![poem_ir::Dtype::U8g64, poem_ir::Dtype::U2g64]),
+            precision: Some(vec![
+                poem_ir::Dtype::U8g64.into(),
+                poem_ir::Dtype::U2g64.into(),
+            ]),
             ..Overrides::default()
         };
         let want = |overrides| Want {

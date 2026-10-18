@@ -47,6 +47,7 @@ cache-keys = [
     { file = "../../../crates/**/*.cpp" },
     { file = "../../../crates/**/*.cu" },
     { file = "../../../crates/**/*.cuh" },
+    { file = "../../../crates/**/*.hip" },
     { file = "../../../crates/**/*.hpp" },
     { file = "../../../crates/**/*.h" },
     { file = "../../../crates/**/*.metal" },

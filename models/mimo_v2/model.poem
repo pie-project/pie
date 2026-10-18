@@ -1,0 +1,151 @@
+# The weights of MiMo-V2.6: GQA, full on a few layers and windowed (128,
+# with sinks) on the rest, keys 192 wide and values 128; a dense first layer
+# then routed experts behind a biased sigmoid router (banks at the
+# deployment's second dtype).
+#
+# The kernels read heads 64/128/256/512 wide, so heads are zero-padded to 256;
+# the output projection reads each head's first 128. The scale stays the
+# 192-wide head's.
+
+load("//lib/adapters/model.poem", "banks")
+
+PADDED = 256
+
+def dims(hidden, layers, full, dense, q_heads, full_kv_heads, window_kv_heads, experts, norm_eps, value_scale, shards):
+    """`full` lists the full-attention layers and `dense` the dense ones;
+    `shards` is the count the checkpoint's fused qkv is stored cut into."""
+    return struct(
+        hidden = hidden,
+        layers = layers,
+        full = full,
+        dense = dense,
+        q_heads = q_heads,
+        full_kv_heads = full_kv_heads,
+        window_kv_heads = window_kv_heads,
+        qk_head_dim = 192,
+        v_head_dim = 128,
+        rotary_dim = 64,
+        full_theta = 10000000.0,
+        window_theta = 10000.0,
+        window = 128,
+        value_scale = value_scale,
+        experts = experts,
+        top_k = 8,
+        inter = 2048,
+        dense_inter = 16384,
+        vocab = 152576,
+        norm_eps = norm_eps,
+        shards = shards,
+    )
+
+def flash(layers = 48, full = [0, 5, 11, 17, 23, 29, 35, 41, 47], experts = 256):
+    return dims(4096, layers, full, [0], 64, 4, 8, experts, 1e-6, 0.707, 4)
+
+def pro(layers = 70, full = [0, 7, 15, 23, 31, 39, 47, 55, 62, 69], experts = 384):
+    return dims(6144, layers, full, [0], 128, 8, 8, experts, 1e-5, 0.612, 8)
+
+DIMS = {
+    "mimo26-flash": flash(),
+    "mimo26-flash-mini": flash(layers = 6, full = [0, 5], experts = 8),
+    # the release's first six layers at full width, every expert kept
+    "mimo26-flash-l6": flash(layers = 6, full = [0, 5]),
+    "mimo26-pro": pro(),
+    # layers 0, 1, 2 and 7 of the release
+    "mimo26-pro-mini": pro(layers = 4, full = [0, 3], experts = 8),
+}
+
+WINDOWED = 0
+FULL = 1
+
+def layout(id, deploy):
+    if len(deploy.weights) != 2:
+        fail("{} stores its weights and its experts at a dtype each, not {}".format(id, deploy.weights))
+    if deploy.drafter != None:
+        fail("{} drafts with nothing, not {}".format(id, deploy.drafter))
+    d = DIMS[id]
+    if PADDED != 2 * d.v_head_dim:
+        fail("the output projection reads a padded head's first half, its values")
+    weights, experts = deploy.weights
+    dense = compute(weights)
+    # The release's FP8 qkv kept as stored, its heads 192 (values 128) wide:
+    # the attention prologue lays them 256 wide.
+    unpadded = weights == dtype.e4m3g128a8
+    hidden = d.hidden
+    q_w = d.q_heads * PADDED
+
+    def layer(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        norm = lambda s: weight(n(s), [hidden], dense)
+        reading = FULL if l in d.full else WINDOWED
+        kv_heads = d.full_kv_heads if reading == FULL else d.window_kv_heads
+        kv_w = kv_heads * PADDED
+        q_qk = d.q_heads * d.qk_head_dim
+        kv_kv = kv_heads * (d.qk_head_dim + d.v_head_dim)
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        if l in d.dense:
+            di = d.dense_inter
+            mlp = struct(
+                routed = False,
+                inter = di,
+                gate_up = weight(n("gate_up"), [2 * di, hidden], weights).packed([di, di]),
+                down = weight(n("down"), [hidden, di], weights).rows(),
+            )
+        else:
+            iw = d.inter
+            mlp = struct(
+                routed = True,
+                experts = d.experts,
+                top_k = d.top_k,
+                inter = iw,
+                router = weight(n("router"), [d.experts, hidden], dense),
+                bias = weight(n("router_bias"), [d.experts], dtype.f32),
+                gate_up = weight(n("experts_gate_up"), [d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
+                down = weight(n("experts_down"), [d.experts, hidden, iw], experts).rows(),
+            )
+        return struct(
+            attn = struct(
+                reading = reading,
+                kv_heads = kv_heads,
+                theta = d.full_theta if reading == FULL else d.window_theta,
+                qkv = weight(n("qkv"), [q_qk + kv_kv, hidden], weights).packed(
+                    [q_qk, kv_heads * d.qk_head_dim, kv_heads * d.v_head_dim],
+                    heads = [d.q_heads, kv_heads, kv_heads],
+                ) if unpadded else weight(n("qkv"), [q_w + 2 * kv_w, hidden], weights).packed(
+                    [q_w, kv_w, kv_w],
+                    heads = [d.q_heads, kv_heads, kv_heads],
+                ),
+                o_proj = weight(n("o_proj"), [hidden, d.q_heads * d.v_head_dim], dense).rows(),
+                sinks = weight(n("attn_sinks"), [d.q_heads], dense).columns() if reading == WINDOWED else None,
+                kv = "kv.{}".format(l),
+            ),
+            attn_norm = norm("attn_norm"),
+            attn_norm_eps = d.norm_eps,
+            mlp_norm = norm("mlp_norm"),
+            mlp_norm_eps = d.norm_eps,
+            mlp = mlp,
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        full_kv_heads = d.full_kv_heads,
+        unpadded = unpadded,
+        window_kv_heads = d.window_kv_heads,
+        head_dim = PADDED,
+        qk_head_dim = d.qk_head_dim,
+        v_head_dim = d.v_head_dim,
+        rotary_dim = d.rotary_dim,
+        window = d.window,
+        value_scale = d.value_scale,
+        sm_scale = f32(1.0 / f32(sqrt(d.qk_head_dim))),
+        shards = d.shards,
+        kv = deploy.kv,
+        embed = weight("embed", [d.vocab, hidden], dense),
+        head = weight("lm_head", [d.vocab, hidden], dense).packed([d.vocab]),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight("final_norm", [hidden], dense),
+        final_norm_eps = d.norm_eps,
+    )

@@ -11,6 +11,7 @@ pub fn embed_concat(ids: &Value, table: &Weight, vocab: u32) -> Value {
         Layout::EmbedConcat {
             ids: ids.id(),
             table: r.weight(table),
+            scales: (table.dtype == Dtype::Mxfp8).then(|| r.weight_plane(table, poem_ir::SCALES)),
             vocab,
             y: y.id(),
         },
@@ -69,6 +70,39 @@ pub fn split_qkv(packed: &Value, q_width: u32, kv_width: u32) -> (Value, Value, 
     (q, k, v)
 }
 
+/// `packed`'s `heads` (query, key-value) heads, queries and keys
+/// `widths[0]` wide and values `widths[1]`, as q, k and v of `head_dim`-wide
+/// heads zero past their widths.
+pub fn split_qkv_padded(
+    packed: &Value,
+    heads: [u32; 2],
+    widths: [u32; 2],
+    head_dim: u32,
+) -> (Value, Value, Value) {
+    let r = packed.rec();
+    // (Saturating: a pattern's holes stand for any count.)
+    let (q_width, kv_width) = (
+        heads[0].saturating_mul(head_dim),
+        heads[1].saturating_mul(head_dim),
+    );
+    let q = r.fresh(tensor(packed.rows(), q_width, packed.dtype()));
+    let k = r.fresh(tensor(packed.rows(), kv_width, packed.dtype()));
+    let v = r.fresh(tensor(packed.rows(), kv_width, packed.dtype()));
+    r.push(
+        Layout::SplitQkvPadded {
+            packed: packed.id(),
+            heads,
+            widths,
+            head_dim,
+            q: q.id(),
+            k: k.id(),
+            v: v.id(),
+        },
+        &[packed],
+    );
+    (q, k, v)
+}
+
 pub fn split_q_gate(packed: &Value, head_dim: u32) -> (Value, Value) {
     let r = packed.rec();
     let head_dim64 = u64::from(head_dim);
@@ -89,8 +123,14 @@ pub fn split_q_gate(packed: &Value, head_dim: u32) -> (Value, Value) {
 
 pub fn split_rows(x: &Value, width: u32) -> (Value, Value) {
     let r = x.rec();
+    let rest = x.width().checked_sub(u64::from(width)).unwrap_or_else(|| {
+        panic!(
+            "split_rows at {width} of a {}-wide row: the split is past the row",
+            x.width()
+        )
+    });
     let left = r.fresh(tensor(x.rows(), width, x.dtype()));
-    let right = r.fresh(tensor(x.rows(), x.width() - u64::from(width), x.dtype()));
+    let right = r.fresh(tensor(x.rows(), rest, x.dtype()));
     r.push(
         Layout::SplitRows {
             x: x.id(),
@@ -178,6 +218,22 @@ pub fn argmax(xs: &[&Value]) -> Value {
     let y = r.fresh(tensor(first.rows(), xs.len() as u64, Dtype::I32));
     r.push(
         Layout::Argmax {
+            xs: xs.iter().map(|x| x.id()).collect(),
+            y: y.id(),
+        },
+        xs,
+    );
+    y
+}
+
+/// `xs` side by side: a row's columns of each, in order.
+pub fn concat_cols(xs: &[&Value]) -> Value {
+    let first = xs.first().expect("a concat of at least one value");
+    let r = first.rec();
+    let width: u64 = xs.iter().map(|x| x.width()).sum();
+    let y = r.fresh(tensor(first.rows(), width, first.dtype()));
+    r.push(
+        Layout::ConcatCols {
             xs: xs.iter().map(|x| x.id()).collect(),
             y: y.id(),
         },

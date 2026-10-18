@@ -461,6 +461,7 @@ struct PendingControl {
     tracked_completion: Option<ControlCompletion>,
     operation: &'static str,
     holds_launches: bool,
+    prelaunch: bool,
 }
 
 #[derive(Default)]
@@ -488,9 +489,23 @@ impl InFlightControls {
     fn admits(&self, item: &QueuedItem) -> bool {
         if BatchScheduler::standalone_copy(item) || BatchScheduler::lifecycle_control(item) {
             !self.holds_launches()
+        } else if let QueuedItem::PreLaunchCopy {
+            pipeline_id: Some(pipeline),
+            ..
+        } = item
+        {
+            // Other pipelines' pre-launch copies touch other state: they post
+            // together, so the launches behind them ride one wave.
+            self.settling
+                .iter()
+                .all(|control| control.prelaunch && control.pipeline_id != Some(*pipeline))
         } else {
             self.is_empty()
         }
+    }
+
+    fn copies_only(&self) -> bool {
+        self.settling.iter().all(|control| control.prelaunch)
     }
 
     fn holds_launches(&self) -> bool {
@@ -512,7 +527,10 @@ impl InFlightControls {
 struct QueueScan {
     queued_ids: frame::QueuedFireIds,
     blocked_lanes: HashSet<ProcessId>,
-    untracked: Option<u64>,
+    /// The unframed fires that ride together: each pipeline's first, none
+    /// behind its copy.
+    untracked: Vec<u64>,
+    riding: HashSet<Option<ProcessId>>,
     drain_eligible: Vec<u64>,
 }
 
@@ -520,7 +538,8 @@ impl QueueScan {
     fn clear(&mut self) {
         self.queued_ids.clear();
         self.blocked_lanes.clear();
-        self.untracked = None;
+        self.untracked.clear();
+        self.riding.clear();
         self.drain_eligible.clear();
     }
 }
@@ -1751,7 +1770,7 @@ impl BatchScheduler {
                 QueuedItem::Launch(_) => {
                     if Self::rotate_launch_for_wave_work(
                         pending,
-                        in_flight_control.is_empty(),
+                        in_flight_control.copies_only(),
                         !slot_blocks_lifecycle,
                     ) {
                         progress = true;
@@ -1895,6 +1914,7 @@ impl BatchScheduler {
                     tracked_completion: None,
                     operation: plan.label(),
                     holds_launches,
+                    prelaunch: true,
                 });
             }
             QueuedItem::CopyTracked { completion, .. } => {
@@ -1906,6 +1926,7 @@ impl BatchScheduler {
                     tracked_completion: Some(completion.clone()),
                     operation: "tracked KV copy",
                     holds_launches,
+                    prelaunch: false,
                 });
             }
             _ => {}
@@ -1936,8 +1957,10 @@ impl BatchScheduler {
                         .is_some_and(|pipeline| scan.blocked_lanes.contains(&pipeline));
                     if launch.framed {
                         scan.queued_ids.push(launch.fire_id);
-                    } else if scan.untracked.is_none() && !behind_copy {
-                        scan.untracked = Some(launch.fire_id);
+                    } else if !behind_copy && scan.riding.insert(launch.pipeline_id) {
+                        // Pieces of different prompts' passes (cut at their
+                        // checkpoints) share a fire rather than taking one each.
+                        scan.untracked.push(launch.fire_id);
                     }
                 }
                 QueuedItem::PreLaunchCopy {
@@ -2026,15 +2049,16 @@ impl BatchScheduler {
                     break;
                 }
                 vec![scan.drain_eligible.clone()]
-            } else if let Some(untracked) = scan.untracked {
+            } else if !scan.untracked.is_empty() {
                 rider_batch = true;
                 if wave_trace() {
                     wave_trace_emit(format!(
-                        "[wave-trace] t={}us rider fire={untracked}",
-                        wave_trace_us()
+                        "[wave-trace] t={}us rider fires={:?}",
+                        wave_trace_us(),
+                        scan.untracked
                     ));
                 }
-                vec![vec![untracked]]
+                vec![scan.untracked.clone()]
             } else {
                 match frame_policy.plan_dispatch(
                     &scan.queued_ids,
@@ -2619,13 +2643,13 @@ mod tests {
         BatchScheduler::queue_attempt(&mut pending, request);
         let mut cache = ScanCache::default();
         let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
-        assert_eq!(scan.untracked, None, "behind its copy");
+        assert!(scan.untracked.is_empty(), "behind its copy");
         // The copy is dispatched: the launch rides.
         let copy = pending.pop_front();
         assert!(matches!(copy, Some(QueuedItem::PreLaunchCopy { .. })));
         let mut cache = ScanCache::default();
         let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
-        assert_eq!(scan.untracked, Some(9));
+        assert_eq!(scan.untracked, [9]);
     }
 
     fn a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight() {

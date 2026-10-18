@@ -626,13 +626,19 @@ impl Windows {
                 poem_ir::PerAxis::new([rows, 0, 0]),
                 shifted,
                 lane_shifted,
+                Staging::NONE,
             ) == Admit::Captured
         })
     }
 
     #[must_use]
     pub fn admits(&self, rows: u32, shifted: &[bool], lane_shifted: &[bool]) -> Vec<Admit> {
-        self.admits_axes(poem_ir::PerAxis::new([rows, 0, 0]), shifted, lane_shifted)
+        self.admits_axes(
+            poem_ir::PerAxis::new([rows, 0, 0]),
+            shifted,
+            lane_shifted,
+            Staging::NONE,
+        )
     }
 
     #[must_use]
@@ -641,9 +647,10 @@ impl Windows {
         totals: poem_ir::PerAxis<u32>,
         shifted: &[bool],
         lane_shifted: &[bool],
+        staging: Staging<'_>,
     ) -> Vec<Admit> {
         (0..self.of_region.len() as u32)
-            .map(|region| self.admit_axes(region, totals, shifted, lane_shifted))
+            .map(|region| self.admit_axes(region, totals, shifted, lane_shifted, staging))
             .collect()
     }
 
@@ -662,8 +669,21 @@ impl Windows {
         totals: poem_ir::PerAxis<u32>,
         shifted: &[bool],
         lane_shifted: &[bool],
+        staging: Staging<'_>,
     ) -> Admit {
         if self.axis_of(region) == poem_ir::RowAxis::Voxels {
+            return Admit::Island;
+        }
+        // A staging attention at a prefill's width launches eagerly: what it
+        // stages is sized by this fire's page tables (`regions_staging`).
+        if staging.from > 0
+            && staging
+                .regions
+                .get(region as usize)
+                .copied()
+                .unwrap_or(false)
+            && (0..self.runs(region)).any(|run| self.at(region, run).span().rows >= staging.from)
+        {
             return Admit::Island;
         }
         let moves = shifted.get(region as usize).copied().unwrap_or(false);
@@ -693,6 +713,22 @@ impl Windows {
         });
         if held { Admit::Captured } else { Admit::Island }
     }
+}
+
+/// The regions whose DeepSeek attention stages its quantized rows
+/// (`exports::regions_staging`), and the rows from which it does
+/// (`kernel.sdpa.dsv4_prefill_from`; 0: none does).
+#[derive(Debug, Clone, Copy)]
+pub struct Staging<'a> {
+    pub regions: &'a [bool],
+    pub from: u32,
+}
+
+impl Staging<'_> {
+    pub const NONE: Staging<'static> = Staging {
+        regions: &[],
+        from: 0,
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1079,7 +1115,13 @@ impl Sink for Cursor<'_> {
     fn region_begin(&mut self, region: &Region) {
         self.place.region.set(self.at);
         self.place.run.set(0);
-        self.place.lane.set(region.stream);
+        // The lane keys a region's shared scratch: a fire walked without lanes runs
+        // every region on the main stream, so they take the main lane's scratch.
+        self.place.lane.set(if self.lanes.is_some() {
+            region.stream
+        } else {
+            0
+        });
         if let Some(pump) = self.pump
             && self.fault.is_none()
             && let Err(fault) = pump.rotor.at(self.at, pump.compute)
@@ -1093,7 +1135,9 @@ impl Sink for Cursor<'_> {
         if let Some(lanes) = self.lanes {
             lanes.at.set(region.stream);
         } else if let Some(cond) = self.cond {
-            cond.at.set(region.stream);
+            // No lanes (a serial walk, or a fire wider than the side streams
+            // run for): every region on the main stream, its waits moot.
+            cond.at.set(0);
         }
     }
     fn region_end(&mut self, _region: &Region) {}

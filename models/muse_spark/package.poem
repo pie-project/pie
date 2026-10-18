@@ -1,0 +1,31 @@
+# Muse Spark Open and its eight- and four-layer, sixteen-expert miniatures.
+# Ships bf16, modelopt NVFP4 and AMD Quark MXFP4 experts (first and last
+# layers' kept bf16), NVFP4 served against bf16 activations or, as vLLM
+# does, NVFP4 ones.
+
+ATEM = template("atem")
+TOKENIZER = tokenizer(markers = [["<|eot|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"]])
+
+MODELS = [
+    model("muse-spark-open", template = ATEM, tokenizer = TOKENIZER, arch = "muse_spark", layers = 62, vocab = 202048),
+    model("muse-spark-open-mini-l8", mini = True, template = ATEM, tokenizer = TOKENIZER, arch = "muse_spark", layers = 8, vocab = 202048),
+    model("muse-spark-open-mini-l4", mini = True, template = ATEM, tokenizer = TOKENIZER, arch = "muse_spark", layers = 4, vocab = 202048),
+]
+
+NVFP4 = [dtype.bf16, dtype.nvfp4]
+
+NVFP4_A4 = [dtype.bf16, dtype.nvfp4a4]
+
+MXFP4 = [dtype.bf16, dtype.mxfp4]
+
+# An NVFP4 checkpoint identifies as NVFP4 activations, as vLLM serves it.
+DEPLOYMENTS = [
+    deployment("muse-spark-open", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("muse-spark-open", weights = NVFP4_A4, kv = dtype.bf16),
+    deployment("muse-spark-open-mini-l8", weights = NVFP4_A4, kv = dtype.bf16),
+    deployment("muse-spark-open", weights = NVFP4, kv = dtype.bf16),
+    deployment("muse-spark-open-mini-l8", weights = NVFP4, kv = dtype.bf16),
+    deployment("muse-spark-open", weights = MXFP4, kv = dtype.bf16),
+    deployment("muse-spark-open-mini-l4", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("muse-spark-open-mini-l4", weights = MXFP4, kv = dtype.bf16),
+]

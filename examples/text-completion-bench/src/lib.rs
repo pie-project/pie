@@ -222,11 +222,9 @@ async fn run_one(
 
     let prompt_i32: Vec<i32> = prompt_vec.iter().map(|&t| t as i32).collect();
 
-    // Recurrent state is kept at 1, 2, 4, ... pages: a shared prefix resumes at least halfway in.
-    let page_size = kv_page_size();
-    let checkpoints: Vec<u32> = std::iter::successors(Some(page_size), |&b| b.checked_mul(2))
-        .take_while(|&b| b < n)
-        .collect();
+    // Recurrent state is kept where the prompt (one message) ends, as the
+    // compat routes keep it where messages end.
+    let checkpoints = [n];
 
     let toks_p = Channel::from(&prompt_i32[..]).named("toks_p");
     let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");

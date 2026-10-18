@@ -640,6 +640,12 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             } => &[(In(3), I32), (In(4), I32), (In(5), F32)],
             Attention::Ragged { .. } => &[(In(3), I32), (In(4), I32)],
             Attention::DecodeLse { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)],
+            Attention::PrefillLse { floor: Some(_), .. } => &[
+                (In(1), PREFILL_PLAN),
+                (In(2), CACHE),
+                (In(3), I32),
+                (Out(1), F32),
+            ],
             Attention::PrefillLse { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)],
             Attention::DecodeSelected { .. } => {
                 &[(In(1), DECODE_PLAN), (In(2), I32), (In(3), CACHE)]
@@ -661,9 +667,20 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Attention::MlaAbsorbOut { .. } => &[],
             Attention::MlaLatentsRope { .. } => &[(In(1), I32)],
             Attention::MlaKvAppend { .. } => &[(In(2), CACHE), (In(3), I32), (In(4), I32)],
+            Attention::MlaDecode { lse: Some(_), .. }
+            | Attention::MlaPrefill { lse: Some(_), .. } => {
+                &[(In(1), MLA_PLAN), (In(3), CACHE), (Out(1), F32)]
+            }
             Attention::MlaDecode { .. } | Attention::MlaPrefill { .. } => {
                 &[(In(1), MLA_PLAN), (In(3), CACHE)]
             }
+            Attention::MlaDecodeSelected { lse: Some(_), .. }
+            | Attention::MlaPrefillSelected { lse: Some(_), .. } => &[
+                (In(1), MLA_PLAN),
+                (In(3), I32),
+                (In(4), CACHE),
+                (Out(1), F32),
+            ],
             Attention::MlaDecodeSelected { .. } | Attention::MlaPrefillSelected { .. } => {
                 &[(In(1), MLA_PLAN), (In(3), I32), (In(4), CACHE)]
             }
@@ -716,6 +733,12 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::PleNgramIds { .. } | Attention::PleNgramIdsChunked { .. } => {
                 &[(In(0), I32), (In(1), CACHE), (Out(0), I32)]
             }
+            Attention::ReplayFloor { .. } => &[(In(0), I32), (In(1), CACHE), (Out(0), I32)],
+            Attention::KvEnds { .. } => &[(In(0), I32), (In(1), CACHE), (Out(0), I32)],
+            Attention::WindowSink { .. } => &[(In(1), I32), (In(2), I32), (In(3), CACHE)],
+            Attention::MarkovWalk { .. } => {
+                &[(In(1), I32), (In(2), I32), (In(3), I32), (Out(1), I32)]
+            }
         },
         Operation::Linear(op) => match op {
             Linear::MoeTopkSoftmax { .. }
@@ -731,15 +754,28 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Linear::MoeMatmulSelect { .. } => &[(In(2), I32)],
             Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],
             Linear::MoeMatmulSelectQuant { .. } => &[(In(2), I32)],
+            Linear::MoeMatmulSelectActQuant {
+                input_scales: Some(_),
+                ..
+            } => &[(In(2), I32), (In(3), F32)],
+            Linear::MoeMatmulSelectActQuant { .. } => &[(In(2), I32)],
+            Linear::MatmulActQuant {
+                input_scales: Some(_),
+                ..
+            } => &[(In(2), F32)],
             Linear::MoeWeightedSum { .. } => &[(In(1), F32)],
+            Linear::MlpSwigluClampSplitRouted { .. } => &[(In(2), F32)],
+            Linear::MlpSwigluClampRouted { .. } => &[(In(1), F32)],
             Linear::MoeBiasSum { .. } => &[(In(2), I32), (In(3), F32)],
             Linear::LoraCorrect { .. } => &[(In(3), I32)],
             Linear::Matmul { .. }
+            | Linear::MatmulActQuant { .. }
             | Linear::LmHead { .. }
             | Linear::MlpSwiglu { .. }
             | Linear::MlpSwigluClamp { .. }
             | Linear::MlpSwigluClampAlpha { .. }
             | Linear::MlpSwigluClampSplit { .. }
+            | Linear::MoeSumAdd { .. }
             | Linear::MlpGegluTanh { .. }
             | Linear::MlpGeluTanh { .. }
             | Linear::MlpGegluTanhPacked { .. }
@@ -774,6 +810,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::RmsnormPlusOne { .. }
             | Elementwise::RmsnormPerHeadPlusOne { .. }
             | Elementwise::RmsnormNoScale { .. }
+            | Elementwise::NormGate { .. }
             | Elementwise::LayernormNoScale { .. }
             | Elementwise::Layernorm { .. }
             | Elementwise::Clamp { .. }
@@ -814,6 +851,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Layout::EmbedWeighted { .. } => &[(In(0), I32), (In(1), F32)],
             Layout::ScatterRows { .. } | Layout::ScatterLiveRows { .. } => &[(In(1), I32)],
             Layout::SplitQkv { .. }
+            | Layout::SplitQkvPadded { .. }
             | Layout::SplitQGate { .. }
             | Layout::SplitRows { .. }
             | Layout::Select { .. }
@@ -823,6 +861,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Layout::TopK { .. } => &[(Out(0), F32), (Out(1), I32)],
             Layout::PackRows { .. } | Layout::UnpackRows { .. } => &[(In(1), I32)],
             Layout::Pixels { .. } => &[(In(0), U8)],
+            Layout::ConcatCols { .. } => &[],
             Layout::GridTaps { .. } => &[
                 (In(0), I32),
                 (In(1), I32),
@@ -841,10 +880,134 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 ..
             } => &[(In(4), I32)],
             Fused::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
+            Fused::HcNormProject { .. } => &[(In(1), F32), (Out(0), F32)],
+            Fused::QGateNormRopeAppend { .. } => {
+                &[(In(4), I32), (In(6), CACHE), (In(7), I32), (In(8), I32)]
+            }
+            Fused::GdnStep { .. } => {
+                &[(In(2), CACHE), (In(6), CACHE), (Out(3), F32), (Out(4), F32)]
+            }
+            Fused::NormRopeLast { .. } => &[(In(1), I32)],
+            Fused::IndexTopkRope { .. } => &[(In(1), I32), (In(2), CACHE), (Out(1), I32)],
+            // q's rows and positions, then the plane's rows, weight,
+            // positions, cache and write tables.
+            Fused::NormRopePair { .. } => &[
+                (In(1), I32),
+                (In(4), I32),
+                (In(5), CACHE),
+                (In(6), I32),
+                (In(7), I32),
+            ],
+            Fused::PoolCompress { .. } => &[
+                (In(0), I32),
+                (In(1), I32),
+                (In(2), CACHE),
+                (In(4), I32),
+                (In(5), CACHE),
+                (In(6), I32),
+                (In(7), I32),
+            ],
+            Fused::NormRopeLastAppend { .. } => {
+                &[(In(2), I32), (In(3), CACHE), (In(4), I32), (In(5), I32)]
+            }
             Fused::EmbedScaleAdd { .. } | Fused::EmbedScaleAddSelect { .. } => &[(In(0), I32)],
             Fused::QkvFusedQknormRopeVnormWrite { .. } => {
-                &[(In(1), I32), (In(4), CACHE), (In(5), I32), (In(6), I32)]
+                &[(In(1), CACHE), (In(2), I32), (In(3), I32)]
             }
+            Fused::RopeYarnAppend { .. } => {
+                &[(In(3), I32), (In(4), CACHE), (In(5), I32), (In(6), I32)]
+            }
+            Fused::SplitRopeYarnAppend { .. } => {
+                &[(In(1), I32), (In(2), CACHE), (In(3), I32), (In(4), I32)]
+            }
+            Fused::QgQknormRopeAppend { .. } => {
+                &[(In(3), I32), (In(6), CACHE), (In(7), I32), (In(8), I32)]
+            }
+            // The window's plan and cache (inputs 1, 2), the pool's from input
+            // 4 (5 under a floored window, whose floor is input 3), and the
+            // three f32 log-sum-exp planes (outputs 1, 3, 5).
+            Fused::PoolAttention { window, pool, .. }
+                if matches!(**window, Attention::PrefillLse { floor: Some(_), .. }) =>
+            {
+                match **pool {
+                    Attention::PoolLseSelected { .. } => &[
+                        (In(1), PREFILL_PLAN),
+                        (In(2), CACHE),
+                        (In(3), I32),
+                        (In(5), I32),
+                        (In(6), I32),
+                        (In(7), I32),
+                        (In(8), CACHE),
+                        (Out(1), F32),
+                        (Out(3), F32),
+                        (Out(5), F32),
+                    ],
+                    _ => &[
+                        (In(1), PREFILL_PLAN),
+                        (In(2), CACHE),
+                        (In(3), I32),
+                        (In(5), I32),
+                        (In(6), I32),
+                        (In(7), CACHE),
+                        (Out(1), F32),
+                        (Out(3), F32),
+                        (Out(5), F32),
+                    ],
+                }
+            }
+            Fused::PoolAttention { pool, .. } => match **pool {
+                Attention::PoolLseSelected { .. } => &[
+                    (In(1), PREFILL_PLAN),
+                    (In(2), CACHE),
+                    (In(4), I32),
+                    (In(5), I32),
+                    (In(6), I32),
+                    (In(7), CACHE),
+                    (Out(1), F32),
+                    (Out(3), F32),
+                    (Out(5), F32),
+                ],
+                _ => &[
+                    (In(1), PREFILL_PLAN),
+                    (In(2), CACHE),
+                    (In(4), I32),
+                    (In(5), I32),
+                    (In(6), CACHE),
+                    (Out(1), F32),
+                    (Out(3), F32),
+                    (Out(5), F32),
+                ],
+            },
+            // The plane, then the normed rows and the mixes.
+            Fused::HcPrenormProject { .. } => &[(In(1), F32), (Out(0), F32), (Out(1), F32)],
+            // The gates' mixes, then their post and combine mixes.
+            Fused::HcGatesNorm { .. } => &[(In(0), F32), (Out(1), F32), (Out(2), F32)],
+            Fused::ResBlendRmsnorm { .. } => &[],
+            // The plane, then the normed streams, the mixes and the post and
+            // combine mixes.
+            Fused::HcPre { .. } => &[
+                (In(1), F32),
+                (Out(0), F32),
+                (Out(1), F32),
+                (Out(3), F32),
+                (Out(4), F32),
+            ],
+            // `kv_b` (input 1), the plan, then the cache: after the rope
+            // half where the rows come apart.
+            Fused::MlaPrefillExpanded { split: Some(_), .. } => {
+                &[(In(2), MLA_PLAN), (In(3), CACHE)]
+            }
+            Fused::MlaPrefillExpanded { split: None, .. } => &[(In(2), MLA_PLAN), (In(4), CACHE)],
+            // The attention's own, and the sink's f32 log-sum-exp is its.
+            Fused::LseSink { attn, .. } => match **attn {
+                Attention::DecodeLse { .. } => {
+                    &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)]
+                }
+                Attention::PrefillLse { .. } => {
+                    &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)]
+                }
+                _ => &[],
+            },
             Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::NormModulate {
@@ -854,9 +1017,25 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 lane_of_row: None, ..
             }
             | Fused::MatmulGeglu { .. }
+            | Fused::MatmulSwiglu { .. }
             | Fused::MlpSwiglu { .. }
             | Fused::LmHeadSoftcap { .. }
-            | Fused::MatmulBias { .. } => &[],
+            | Fused::MatmulBias { .. }
+            | Fused::MatmulSplitRows { .. } => &[],
+            // The select's own: its routes are i32.
+            Fused::MoeSelectGlu { select, .. } => match select.as_ref() {
+                Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],
+                _ => &[(In(2), I32)],
+            },
+            // The select's routes, then the sum's weights.
+            Fused::MoeExperts { select, .. } => match select.as_ref() {
+                Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32), (In(4), F32)],
+                Linear::MoeMatmulSelectActQuant {
+                    input_scales: Some(_),
+                    ..
+                } => &[(In(2), I32), (In(3), F32), (In(4), F32)],
+                _ => &[(In(2), I32), (In(3), F32)],
+            },
         },
         Operation::Collective(_) => &[],
         Operation::Spatial(op) => match op {

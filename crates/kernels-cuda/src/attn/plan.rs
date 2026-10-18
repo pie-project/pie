@@ -254,6 +254,8 @@ pub struct Toggles {
     pub prefill_ctas_per_sm: u32,
 
     pub static_max_requests: u32,
+
+    pub xqa: crate::attn::xqa::Gate,
 }
 
 impl Toggles {
@@ -265,6 +267,7 @@ impl Toggles {
             chunk_floor_128: tuning.decode_chunk_floor_128,
             prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
             static_max_requests: tuning.decode_static_max_requests,
+            xqa: crate::attn::xqa::Gate::of(tuning),
         }
     }
 }
@@ -333,6 +336,31 @@ pub fn plan_decode(
     some_requests(OP, &shape)?;
     let window_left = window_left(OP, window)?;
 
+    // The tensor-core decode's block holds a whole stamp of key tiles; its
+    // split fills the SMs once, not the FA2 kernel's occupancy.
+    let max_grid_size = match crate::attn::xqa::Stamp::of(shape.head_dim) {
+        Some(stamp)
+            if toggles
+                .xqa
+                .takes(shape.head_dim, shape.group_size(), shape.num_requests) =>
+        {
+            stamp.grid(device)
+        }
+        _ => max_grid_size,
+    };
+    // A cluster folds through distributed shared memory, sm_90 on; it fills
+    // the SMs once with the stamp's blocks.
+    let ranks = match crate::attn::xqa::Stamp::of(shape.head_dim) {
+        Some(stamp) if device.cc_major >= 9 => toggles.xqa.ranks(
+            shape.head_dim,
+            shape.group_size(),
+            shape.num_requests,
+            shape.num_kv_heads,
+            window_left,
+            stamp.grid(device),
+        ),
+        _ => 0,
+    };
     let windowed_split = toggles.window_split && window_left >= 0;
     let built = if !windowed_split
         && sched_decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles)
@@ -356,6 +384,11 @@ pub fn plan_decode(
             head_dim: shape.head_dim,
             enable_cuda_graph,
             chunk_floor_128: toggles.chunk_floor_128,
+            window_left: u32::try_from(window_left).ok(),
+            whole: ranks > 0
+                || toggles
+                    .xqa
+                    .whole(shape.head_dim, shape.group_size(), window_left),
         };
         sched_decode::plan(
             OP,
@@ -366,8 +399,12 @@ pub fn plan_decode(
         )?
     };
 
+    let mut info = built.info;
+    if info.whole {
+        info.ranks = ranks;
+    }
     Ok(DecodePlan {
-        info: built.info,
+        info,
         int_upload: built.int_upload,
         int_bytes: built.int_bytes,
         float_bytes: built.float_bytes,
@@ -558,6 +595,12 @@ pub struct DecodePlanInfo {
     pub kv_chunk_size_ptr_offset: Option<u32>,
     pub enable_cuda_graph: bool,
     pub split_kv: bool,
+    /// Each request one work item over its whole window, which the
+    /// tensor-core decode lands unsplit (`xqa::Gate::whole`).
+    pub whole: bool,
+    /// The blocks a cluster reads each (request, kv head) of a whole plan
+    /// with, folding their slices itself (`xqa::Gate::ranks`); 0 for none.
+    pub ranks: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -575,6 +618,9 @@ pub struct PrefillPlanInfo {
     pub v_offset: Option<u32>,
     pub s_offset: Option<u32>,
     pub block_valid_mask_offset: Option<u32>,
+    /// The fire's live lanes, `[first lane, requests]`, as two i32s: a
+    /// captured launch reads them at replay.
+    pub live_lanes_offset: Option<u32>,
     pub enable_cuda_graph: bool,
     pub split_kv: bool,
 }

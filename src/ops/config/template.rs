@@ -4,7 +4,7 @@ use worker::backend::flavor;
 pub fn default_config_content() -> Result<String> {
     let flavor = flavor::default_flavor();
     let engine_block: Option<&str> = match flavor {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "engine-cuda")]
         Some(flavor::Flavor::Cuda) => Some(CUDA_ENGINE_BLOCK),
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         Some(flavor::Flavor::Metal) => Some(METAL_ENGINE_BLOCK),
@@ -101,7 +101,7 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 # max_outstanding_per_partner = 4
 "#;
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "engine-cuda", test))]
 const CUDA_ENGINE_BLOCK: &str = r#"
 [engine]
 # Which keys are valid here depends on `type`: the common ones below, plus
@@ -112,7 +112,8 @@ device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
 # kv_page_size    = 32      # omit: the engine derives one
-# max_state_slots = 256     # recurrent-state seats (hybrid models); omit for 256
+# max_state_slots = 256     # recurrent-state seats (hybrid models); omit for 256,
+#                           # or what the chip profile states (B200: two a lane)
 # max_model_len   = 4096    # the most tokens one sequence may hold; omit for
 #                           # 4096. State it at what you serve: a decode body
 #                           # for n lanes is armed only when the pool holds
@@ -231,7 +232,7 @@ mod tests {
 
     fn it_names_the_engine_this_binary_actually_has() {
         let expected: Option<&str> = match flavor::default_flavor() {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "engine-cuda")]
             Some(flavor::Flavor::Cuda) => Some("cuda_native"),
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
             Some(flavor::Flavor::Metal) => Some("metal"),

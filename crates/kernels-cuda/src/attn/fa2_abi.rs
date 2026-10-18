@@ -287,6 +287,11 @@ pub struct Partials {
     pub seq_len: DevicePtr,
     pub num_heads: u32,
     pub head_dim: u32,
+    /// Each head's sink, which the warp fold scales the output by; 0 for
+    /// none.
+    pub sinks: DevicePtr,
+    /// Whether the sinks are f32 (else the output's bf16).
+    pub sinks_f32: bool,
 }
 
 pub(crate) const fn resolve(base: DevicePtr, off: Option<u32>) -> DevicePtr {
