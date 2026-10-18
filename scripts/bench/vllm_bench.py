@@ -553,8 +553,9 @@ def run_streaming(args: argparse.Namespace):
         start = time.perf_counter()
         pacer.start()
 
-        async def offer(i: int) -> RequestResult:
-            await pacer.wait(i)
+        async def offer(i: int, paced: bool = True) -> RequestResult:
+            if paced:
+                await pacer.wait(i)
             return await stream_one(
                 f"req-{i}",
                 prompts[args.warmup + i],
@@ -564,9 +565,19 @@ def run_streaming(args: argparse.Namespace):
             )
 
         try:
-            results = list(
-                await asyncio.gather(*(offer(i) for i in range(n)))
-            )
+            if args.concurrency == 1 and not args.arrival_rate:
+                # One stream at a time, each sent when the last returns, as
+                # sglang_bench.py's latency mode streams. All at t=0 with
+                # max_num_seqs=1 queues them in the engine, and each queued
+                # request's TTFT then counts the whole of every request ahead
+                # of it: a single-stream TTFT is the request's own prefill.
+                # Unpaced: nothing is scheduled, so no arrival lag is recorded
+                # for requests that simply wait their turn here.
+                results = [await offer(i, paced=False) for i in range(n)]
+            else:
+                results = list(
+                    await asyncio.gather(*(offer(i) for i in range(n)))
+                )
         finally:
             if profiler_task is None:
                 cuda_profiler_stop(args.cuda_profiler_capture)
