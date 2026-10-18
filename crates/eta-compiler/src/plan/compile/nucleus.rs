@@ -32,8 +32,46 @@ pub(crate) fn recognize_library_dataflows(
         claimed.extend(candidate.nodes.iter().copied());
         matches.push(candidate);
     }
+    // A top-p or top-k cut outside a sampler chain, over f32 rows a
+    // vocabulary wide: the lane cut (its row on several blocks).
+    for node in (0..stage.ops.len() as u32).map(NodeIndex) {
+        if claimed.contains(&node) {
+            continue;
+        }
+        let Some(Op::PivotThreshold { input, predicate }) = stage.ops.get(node.index()) else {
+            continue;
+        };
+        let threshold = match *predicate {
+            Predicate::CummassLe(value) | Predicate::RankLe(value) => value,
+            Predicate::ProbGe(_) => continue,
+        };
+        let Some(input_type) = stage.value_types.get(*input as usize) else {
+            continue;
+        };
+        let wide = matches!(
+            input_type.dims.last(),
+            Some(Dimension::Static(width)) if *width >= LANE_CUT_WIDTH
+        );
+        if input_type.dtype != Dtype::F32 || !wide || !(1..=2).contains(&input_type.rank()) {
+            continue;
+        }
+        let Some(output) = index.base(node) else {
+            continue;
+        };
+        claimed.insert(node);
+        matches.push(LibraryMatch {
+            library: LibraryOp::LaneCut,
+            nodes: vec![node],
+            inputs: vec![*input, threshold],
+            outputs: vec![output],
+        });
+    }
     matches
 }
+
+/// The narrowest row a lane cut takes: below it one block walks the row as
+/// fast as a lane's blocks meet.
+const LANE_CUT_WIDTH: u32 = 1024;
 
 fn match_nucleus_dataflow(
     stage: &NormalizedStage,
@@ -170,6 +208,8 @@ struct Chain {
     top_p: ValueId,
     rng_state: ValueId,
     rng_shape: Shape,
+    /// The cut is top-k (`RankLe`), not top-p (`CummassLe`).
+    rank: bool,
 }
 
 impl Chain {
@@ -254,12 +294,17 @@ fn match_chain(
     let pivot_node = index.producer(keep)?;
     let Op::PivotThreshold {
         input: probabilities,
-        predicate: Predicate::CummassLe(top_p),
+        predicate,
     } = stage.ops.get(pivot_node.index())?
     else {
         return None;
     };
-    let (probabilities, top_p) = (*probabilities, *top_p);
+    let (top_p, rank) = match *predicate {
+        Predicate::CummassLe(top_p) => (top_p, false),
+        Predicate::RankLe(k) => (k, true),
+        Predicate::ProbGe(_) => return None,
+    };
+    let probabilities = *probabilities;
 
     let softmax = match_softmax(stage, probabilities, logits, index)?;
     if softmax.shape != rng_shape {
@@ -285,6 +330,7 @@ fn match_chain(
         top_p,
         rng_state,
         rng_shape,
+        rank,
     })
 }
 
@@ -405,7 +451,12 @@ fn chain_types_agree(
         }
     }
     let top_p_type = value_type(chain.top_p)?;
-    if top_p_type.dtype != Dtype::F32
+    let threshold_ok = if chain.rank {
+        matches!(top_p_type.dtype, Dtype::I32 | Dtype::U32)
+    } else {
+        top_p_type.dtype == Dtype::F32
+    };
+    if !threshold_ok
         || (!top_p_type.is_scalar()
             && !symbolic_dims_match_expected(
                 &top_p_type.dims,
@@ -475,7 +526,11 @@ fn match_nucleus_add_order(
     chain_types_agree(stage, &chain, inputs.scaled)?;
 
     Some(LibraryMatch {
-        library: LibraryOp::NucleusSample,
+        library: if chain.rank {
+            LibraryOp::RankSample
+        } else {
+            LibraryOp::NucleusSample
+        },
         nodes,
         inputs: inputs.values,
         outputs: vec![chain.token],

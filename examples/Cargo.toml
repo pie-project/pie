@@ -25,6 +25,7 @@ members = [
     "trackb-snapkv",
     "repetition-penalty",
     "dflash-speculative-bench",
+    "dspark-speculative-bench",
     "dry-repetition-penalty",
     "frames-probe",
     "gumbel-watermark",

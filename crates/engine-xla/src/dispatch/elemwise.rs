@@ -76,6 +76,10 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
+            // Muse Spark's post-norm gate is served on CUDA.
+            Elementwise::NormGate { .. } => Err(kernels_xla::Error::Unsupported {
+                op: "elementwise.norm_gate",
+            }),
             Elementwise::RmsnormNoScale {
                 x,
                 head_dim,
@@ -319,10 +323,14 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
+            // A scaleless gated norm runs on CUDA alone (Muse Spark's).
+            Elementwise::RmsnormGated { weight: None, .. } => {
+                Err(kernels_xla::Error::Unsupported { op: op.name() })
+            }
             Elementwise::RmsnormGated {
                 x,
                 gate,
-                weight,
+                weight: Some(weight),
                 head_dim,
                 eps,
                 act,
@@ -607,6 +615,10 @@ impl Run<'_> {
                 *stream_count,
                 self.tensor(*mixes),
             ),
+            // The independent form (no combine) is landed on CUDA alone.
+            Elementwise::HcGates { comb: false, .. } => {
+                Err(kernels_xla::Error::Unsupported { op: op.name() })
+            }
             Elementwise::HcGates {
                 normed,
                 streams,
@@ -616,6 +628,7 @@ impl Run<'_> {
                 gate_eps,
                 alpha,
                 sinkhorn,
+                comb: true,
                 x,
                 post_mix,
                 comb_mix,

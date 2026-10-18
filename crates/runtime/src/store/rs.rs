@@ -13,7 +13,8 @@ use crate::store::genmap::{GenKey, GenMap};
 use crate::store::kv::hash::Hash256;
 use crate::store::pool::{Pool, PoolId};
 use write::{
-    RsBufferTarget, RsPendingFold, RsPendingFolds, RsPreparedWrite, RsPublished, RsStateTarget,
+    RsBufferTarget, RsPendingFold, RsPendingFolds, RsPreparedWrite, RsPublished, RsSnapshot,
+    RsStateTarget,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,12 +63,15 @@ struct RingState {
 /// device-decided length (no `fold`) the host commits nothing, but every
 /// token before `settled`, the first the fire writes, is part of the
 /// sequence it continues, so the ring catches up to it. `positioned` says
-/// the host knows the fire's positions: only then do pages retire, through
-/// the sequence order of its kv page indexes.
+/// the host knows the fire's positions: the pages behind the committed
+/// position's window retire, through the sequence order of its kv page
+/// indexes. A device-positioned fire retires behind `reach`, the first token
+/// it may write, as no row's window reaches back past it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RingAdvance {
     pub(crate) positioned: bool,
     pub(crate) settled: u32,
+    pub(crate) reach: u32,
     pub(crate) fold: Option<u32>,
     pub(crate) commit_end: u32,
     pub(crate) head: Option<u32>,
@@ -276,6 +280,11 @@ impl RsStore {
             inflight: BTreeMap::new(),
             checkpoints: HashMap::new(),
         }
+    }
+
+    /// The state is a window ring of kv pages, drawn from the buffer pages.
+    pub fn is_ring(&self) -> bool {
+        self.ring.is_some()
     }
 
     pub fn retire_idle(&mut self) {
@@ -520,6 +529,12 @@ impl RsStore {
             return Ok(false);
         }
         let snapshot = self.fork(ws)?;
+        self.keep(snapshot, key, owner);
+        Ok(true)
+    }
+
+    /// Keeps `snapshot`, a hidden working set no process holds, as `key`.
+    pub fn keep(&mut self, snapshot: RsWorkingSetId, key: Hash256, owner: Option<ProcessId>) {
         let kept = RsCheckpoint {
             snapshot,
             owner,
@@ -528,7 +543,6 @@ impl RsStore {
         if let Some(old) = self.checkpoints.insert(key, kept) {
             self.release_working_set(old.snapshot);
         }
-        Ok(true)
     }
 
     pub fn has_checkpoint(&self, key: &Hash256) -> bool {
@@ -679,8 +693,13 @@ impl RsStore {
             let tail = advance.commit_end.saturating_sub(ring.committed);
             ring.committed = ring.committed.saturating_add(fold.min(tail));
         }
-        let first = ring.committed.saturating_sub(geom.tokens) / geom.page_size.max(1);
-        if !advance.positioned || first <= ring.retired {
+        let reach = if advance.positioned {
+            ring.committed
+        } else {
+            advance.reach
+        };
+        let first = reach.saturating_sub(geom.tokens) / geom.page_size.max(1);
+        if first <= ring.retired {
             return;
         }
         let behind =
@@ -874,7 +893,51 @@ impl RsStore {
             buffers,
             allocated,
             seq: self.seq,
+            snapshots: Vec::new(),
         })
+    }
+
+    /// A fresh slot for each of `rows`, where the fire `prepared` lands its
+    /// working set's state as of that row; each becomes a hidden working set
+    /// on publish ([`RsPublished::snapshots`]).
+    pub fn prepare_snapshots(
+        &mut self,
+        prepared: &mut RsPreparedWrite,
+        rows: &[u32],
+        reserved: Option<&mut RsGrant>,
+    ) -> Result<(), RsError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let need = RsUnits {
+            slots: rows.len() as u32,
+            pages: 0,
+        };
+        let slots: Vec<RsSlotId> = match reserved {
+            Some(granted) if granted.slots.len() >= rows.len() => {
+                granted.slots.drain(..rows.len()).collect()
+            }
+            Some(granted) => {
+                return Err(RsError::GrantMismatch {
+                    required: need,
+                    granted: granted.units(),
+                });
+            }
+            None => {
+                self.alloc(need)
+                    .ok_or(RsError::OutOfSlots {
+                        requested: need,
+                        available: self.available(),
+                    })?
+                    .0
+            }
+        };
+        if let Some(touch) = self.inflight.get_mut(&prepared.seq) {
+            touch.writes.extend(&slots);
+        }
+        prepared.allocated.extend(&slots);
+        prepared.snapshots = rows.iter().copied().zip(slots).collect();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -908,10 +971,11 @@ impl RsStore {
             .map(RsPreparedWrite::seq)
             .collect::<Vec<_>>();
         let mut folds = RsPendingFolds::default();
+        let mut snapshots = Vec::new();
         for write in prepared {
-            self.publish_prevalidated(write, &mut folds);
+            self.publish_prevalidated(write, &mut folds, &mut snapshots);
         }
-        Ok((RsPublished::new(seqs), folds))
+        Ok((RsPublished::new(seqs, snapshots), folds))
     }
 
     pub fn commit_folds(&mut self, folds: RsPendingFolds) {
@@ -920,8 +984,34 @@ impl RsStore {
         }
     }
 
-    fn publish_prevalidated(&mut self, prepared: RsPreparedWrite, folds: &mut RsPendingFolds) {
+    fn publish_prevalidated(
+        &mut self,
+        prepared: RsPreparedWrite,
+        folds: &mut RsPendingFolds,
+        snapshots: &mut Vec<RsSnapshot>,
+    ) {
         let ws = prepared.ws;
+        let (geom, frozen) = {
+            let entry = self.entry(ws).expect("batch prevalidated");
+            (entry.geom, entry.frozen)
+        };
+        for &(row, slot) in &prepared.snapshots {
+            self.refs.insert(slot, 1);
+            let snapshot = self.working_sets.insert(RsEntry {
+                geom,
+                folded: Some(slot),
+                buffer: Vec::new(),
+                base: frozen + row,
+                frozen: frozen + row,
+                ring: None,
+            });
+            snapshots.push(RsSnapshot {
+                ws,
+                row,
+                slot,
+                snapshot,
+            });
+        }
         if let Some(state) = &prepared.state {
             let old = self.entry(ws).expect("batch prevalidated").folded;
             if old != Some(state.slot) {

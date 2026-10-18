@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "device")]
 
 use crate::common_dit::{
     HEAD_DIM, Lcg, NAME, Rig, SM_SCALE, THETA, WIDTH, Weights, assert_close, attach, bf, condition,

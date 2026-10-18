@@ -12,19 +12,19 @@ fn scheduler_reconfigure_every_case() {
 fn the_knobs_are_no_longer_write_once() {
     assert_eq!(configured_frame_size(), 2, "default k");
     assert_eq!(configured_dispatch_depth(), 2, "default horizon");
-    assert_eq!(configured_submit_depth(), 3, "default window");
-    assert_eq!(channel_capacity(), 7, "3 frames x k=2, plus the margin");
+    assert_eq!(configured_submit_depth(), 5, "default window");
+    assert_eq!(channel_capacity(), 11, "5 frames x k=2, plus the margin");
 
     reconfigure(4, 3).expect("idle runtime accepts new knobs");
     assert_eq!(configured_frame_size(), 4);
     assert_eq!(configured_dispatch_depth(), 3);
-    assert_eq!(configured_submit_depth(), 4);
-    assert_eq!(channel_capacity(), 17);
+    assert_eq!(configured_submit_depth(), 6);
+    assert_eq!(channel_capacity(), 25);
 
     reconfigure(1, 6).expect("second round");
     assert_eq!(configured_frame_size(), 1);
     assert_eq!(configured_dispatch_depth(), 6);
-    assert_eq!(configured_submit_depth(), 7);
+    assert_eq!(configured_submit_depth(), 9);
 }
 
 fn a_refusal_names_what_is_still_running() {

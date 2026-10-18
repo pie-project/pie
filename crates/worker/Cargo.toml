@@ -27,7 +27,10 @@ net = [
 ]
 # `pie serve` in one process: the controller and the gateway beside this worker.
 standalone = ["net", "dep:controller", "dep:gateway", "dep:rustls"]
-cuda = ["runtime/cuda"]
+cuda = ["engine-cuda", "runtime/cuda"]
+rocm = ["engine-cuda", "runtime/rocm"]
+# engine-cuda is built in, under `cuda` or `rocm`.
+engine-cuda = []
 metal = ["runtime/metal"]
 vulkan = ["runtime/vulkan"]
 wgpu = ["runtime/wgpu"]

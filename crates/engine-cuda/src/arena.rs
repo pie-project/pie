@@ -60,9 +60,9 @@ impl Arena {
                 have: self.committed,
             });
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
             // SAFETY: `at..at + len` lies inside the committed prefix.
             unsafe {
                 crate::device::ctx::check(
@@ -76,7 +76,7 @@ impl Arena {
                 )
             }
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             let _ = into;
             Err(Fault::Runtimeless)

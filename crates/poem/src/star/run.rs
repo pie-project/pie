@@ -6,7 +6,7 @@ use std::cell::RefCell;
 
 use checkpoint::contract::ModelContract;
 
-use crate::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Trace, Value};
+use crate::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Precision, Trace, Value};
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
 use starlark::values::ValueLike;
@@ -15,7 +15,7 @@ use starlark::values::{Heap, Value as Star};
 
 use crate::star::forward::{SpecHandle, TRAIL, Trail, ValueHandle, held, hold_input};
 use crate::star::package::Package;
-use crate::star::values::DtypeValue;
+use crate::star::values::{DtypeValue, alloc_precision};
 
 /// How a deployment reads a still: cut into `patch` × `patch` patches in
 /// `block` × `block` blocks, its tokens placed by mrope or in sequence,
@@ -64,7 +64,7 @@ impl ImageSpec {
 /// A deployment as a package's layout reads it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Deploy {
-    pub weights: Vec<Dtype>,
+    pub weights: Vec<Precision>,
     pub kv: Dtype,
     pub tp: u32,
     pub parts: Vec<String>,
@@ -73,7 +73,11 @@ pub struct Deploy {
 
 impl Deploy {
     fn alloc<'v>(&self, heap: Heap<'v>) -> Star<'v> {
-        let weights: Vec<DtypeValue> = self.weights.iter().copied().map(DtypeValue).collect();
+        let weights: Vec<Star<'v>> = self
+            .weights
+            .iter()
+            .map(|stated| alloc_precision(heap, *stated))
+            .collect();
         heap.alloc(AllocStruct([
             ("weights", heap.alloc(weights)),
             ("kv", heap.alloc(DtypeValue(self.kv))),

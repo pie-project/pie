@@ -1,13 +1,17 @@
 # The weights of GLM-5: three dense layers, then routed experts with a shared
-# one; each layer's attention latent (MLA) with an indexer of its own.
+# one; each layer's attention latent (MLA) with an indexer of its own, or,
+# on GLM-5.3, the selection of the last layer that ranked; and GLM-5.3's
+# optional MTP draft head.
 
 load("//lib/adapters/model.poem", "banks")
 
-def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False, **extra):
+def attention(n, d, hidden, weights, norms, eps, kv, theta = None, interleaved = False, gated = False, latent = None, **extra):
     """The latent attention named by `n`, its projections in `weights` and
     its norms in `norms`, caching under `kv`. Its rope part is rotated at
-    `theta`, or left as it is with none; `gated` adds a sigmoid gate on its
-    output. `extra` rides along (an indexer, say)."""
+    `theta` (its pairs adjacent under `interleaved`), or left as it is with
+    none; `gated` adds a sigmoid gate on its output. `latent` is the dtype
+    of `kv_b_proj`, which the absorbs read as it is (`weights` by default).
+    `extra` rides along (an indexer, say)."""
     qk_head_dim = d.qk_nope_head_dim + d.qk_rope_head_dim
     v_width = d.heads * d.v_head_dim
     return struct(
@@ -17,6 +21,7 @@ def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False
         qk_rope_head_dim = d.qk_rope_head_dim,
         v_head_dim = d.v_head_dim,
         theta = theta,
+        interleaved = interleaved,
         sm_scale = f32(1.0 / f32(sqrt(qk_head_dim))),
         q_a_proj = weight(n("q_a_proj"), [d.q_lora_rank, hidden], weights),
         q_a_norm = weight(n("q_a_norm"), [d.q_lora_rank], norms),
@@ -28,7 +33,7 @@ def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False
         kv_b_proj = weight(
             n("kv_b_proj"),
             [d.heads * (d.qk_nope_head_dim + d.v_head_dim), d.kv_lora_rank],
-            weights,
+            latent if latent != None else weights,
         ).columns(),
         gate = weight(n("o_gate"), [v_width, hidden], weights).columns() if gated else None,
         o_proj = weight(n("o_proj"), [hidden, v_width], weights).rows(),
@@ -36,94 +41,186 @@ def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False
         **extra
     )
 
-GLM5 = struct(
-    hidden = 4096,
-    layers = 46,
-    dense_layers = 3,
-    heads = 96,
-    q_lora_rank = 1536,
-    kv_lora_rank = 512,
-    qk_nope_head_dim = 128,
-    qk_rope_head_dim = 64,
-    v_head_dim = 128,
-    theta = 10000.0,
-    index_heads = 64,
-    index_head_dim = 128,
-    index_top_k = 2048,
-    dense_inter = 10944,
-    experts = 128,
-    top_k = 8,
-    moe_inter = 1408,
-    shared_inter = 1408,
-    norm_weights = True,
-    scaling = 2.5,
-    vocab = 151552,
-    norm_eps = 1e-5,
-)
+def glm5():
+    return struct(
+        hidden = 4096,
+        layers = 46,
+        dense_layers = 3,
+        heads = 96,
+        q_lora_rank = 1536,
+        kv_lora_rank = 512,
+        qk_nope_head_dim = 128,
+        qk_rope_head_dim = 64,
+        v_head_dim = 128,
+        theta = 10000.0,
+        interleaved = False,
+        index_heads = 64,
+        index_head_dim = 128,
+        index_top_k = 2048,
+        # Every layer ranks; its head weights read the query latent.
+        index_freq = 1,
+        index_offset = 0,
+        index_weights_from = "q_a",
+        index_norm_eps = 1e-5,
+        dense_inter = 10944,
+        experts = 128,
+        top_k = 8,
+        moe_inter = 1408,
+        shared_inter = 1408,
+        router_bias = False,
+        norm_weights = True,
+        scaling = 2.5,
+        vocab = 151552,
+        norm_eps = 1e-5,
+    )
+
+def glm53(layers = 78, experts = 256):
+    return struct(
+        hidden = 6144,
+        layers = layers,
+        dense_layers = 3,
+        heads = 64,
+        q_lora_rank = 2048,
+        kv_lora_rank = 512,
+        qk_nope_head_dim = 192,
+        qk_rope_head_dim = 64,
+        v_head_dim = 256,
+        theta = 8000000.0,
+        interleaved = True,
+        index_heads = 32,
+        index_head_dim = 128,
+        index_top_k = 2048,
+        # Layers 0, 1, 2 rank, then every fourth from 6; the layers between
+        # read the selection of the last that ranked.
+        index_freq = 4,
+        index_offset = 3,
+        index_weights_from = "hidden",
+        index_norm_eps = 1e-6,
+        dense_inter = 12288,
+        experts = experts,
+        top_k = min(8, experts),
+        moe_inter = 2048,
+        shared_inter = 2048,
+        router_bias = True,
+        norm_weights = True,
+        scaling = 2.5,
+        vocab = 154880,
+        norm_eps = 1e-5,
+    )
+
+DIMS = {
+    "glm5-a12b": glm5(),
+    "glm53": glm53(),
+    # The first seven layers at full width with the first eight routed
+    # experts: three dense layers that rank, three that share, one that ranks.
+    "glm53-mini": glm53(layers = 7, experts = 8),
+}
+
+def ranks(d, l):
+    """Whether layer `l` runs an indexer of its own."""
+    return max(l - d.index_offset + 1, 0) % d.index_freq == 0
 
 def layout(id, deploy):
-    if len(deploy.weights) != 1:
-        fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
-    d = GLM5
-    w = deploy.weights[0]
+    d = DIMS[id]
+    mtp = deploy.drafter == "mtp"
+    ws = deploy.weights
+    if mtp and len(ws) == 3:
+        w, experts, draft = ws
+    elif not mtp and len(ws) == 2:
+        w, experts = ws
+        draft = None
+    elif not mtp and len(ws) == 1:
+        w, experts, draft = ws[0], ws[0], None
+    elif not mtp and len(ws) == 3:
+        # The dense layers' MLP at a dtype of its own (modelopt's FP8 one).
+        w, experts, dense_mlp = ws
+        draft = None
+    else:
+        fail("{} stores its weights at one dtype, or its weights and experts at a dtype each (and its dense layers' MLP at a third), and its draft experts at a third with the draft head; not {}".format(id, ws))
+    if not (not mtp and len(ws) == 3):
+        dense_mlp = None
+    # The release's FP8 as released: projections at 128x128-block FP8 against
+    # e4m3 activations; norms, tables, router, indexer and the latent's
+    # up-projection (the absorbs read it as bf16) at bf16, as vLLM reads them.
+    proj = w
+    if w == dtype.e4m3tile128a8:
+        w = dtype.bf16
+    dense = compute(w)
     hidden = d.hidden
     index_width = d.index_heads * d.index_head_dim
+    index_in = d.q_lora_rank if d.index_weights_from == "q_a" else hidden
+
+    def indexer(n, keys):
+        return struct(
+            heads = d.index_heads,
+            head_dim = d.index_head_dim,
+            top_k = d.index_top_k,
+            rope_dim = d.qk_rope_head_dim,
+            theta = d.theta,
+            weights_from = d.index_weights_from,
+            q_proj = weight(n("index_q_proj"), [index_width, d.q_lora_rank], proj),
+            k_proj = weight(n("index_k_proj"), [d.index_head_dim, hidden], proj),
+            weights_proj = weight(n("index_weights"), [d.index_heads, index_in], w),
+            k_norm = weight(n("index_k_norm"), [d.index_head_dim], w),
+            k_norm_eps = d.index_norm_eps,
+            k_norm_bias = weight(n("index_k_norm_bias"), [d.index_head_dim], w),
+            keys = keys,
+        )
+
+    def mla_at(prefix, kv, keys):
+        n = lambda s: "{}.{}".format(prefix, s)
+        return attention(
+            n,
+            d,
+            hidden,
+            weights = proj,
+            norms = w,
+            latent = w,
+            eps = d.norm_eps,
+            kv = kv,
+            theta = d.theta,
+            interleaved = d.interleaved,
+            indexer = indexer(n, keys) if keys != None else None,
+        )
+
+    def routed_at(prefix, banks_dtype):
+        n = lambda s: "{}.{}".format(prefix, s)
+        iw = d.moe_inter
+        sw = d.shared_inter
+        return struct(
+            routed = True,
+            router = weight(n("router"), [d.experts, hidden], w),
+            bias = weight(n("router_bias"), [d.experts], dtype.f32) if d.router_bias else None,
+            gate_up = weight(n("experts_gate_up"), [d.experts, 2 * iw, hidden], banks_dtype).bank([iw, iw]),
+            down = weight(n("experts_down"), [d.experts, hidden, iw], banks_dtype).rows(),
+            shared = struct(
+                gate_up = weight(n("shared_gate_up"), [2 * sw, hidden], proj).packed([sw, sw]),
+                down = weight(n("shared_down"), [hidden, sw], proj).rows(),
+                inter = sw,
+            ),
+            experts = d.experts,
+            top_k = d.top_k,
+            inter = iw,
+            norm_weights = d.norm_weights,
+            scaling = d.scaling,
+        )
 
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, width: weight(n(s), [width], w)
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, compute(w))
-        attn = attention(
-            n,
-            d,
-            hidden,
-            weights = w,
-            norms = w,
-            eps = d.norm_eps,
-            kv = "kv.{}".format(l),
-            theta = d.theta,
-            indexer = struct(
-                heads = d.index_heads,
-                head_dim = d.index_head_dim,
-                top_k = d.index_top_k,
-                rope_dim = d.qk_rope_head_dim,
-                theta = d.theta,
-                q_proj = weight(n("index_q_proj"), [index_width, d.q_lora_rank], w),
-                k_proj = weight(n("index_k_proj"), [d.index_head_dim, hidden], w),
-                weights_proj = weight(n("index_weights"), [d.index_heads, d.q_lora_rank], w),
-                k_norm = norm("index_k_norm", d.index_head_dim),
-                k_norm_eps = d.norm_eps,
-                k_norm_bias = weight(n("index_k_norm_bias"), [d.index_head_dim], w),
-                keys = "index.{}".format(l),
-            ),
-        )
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        keys = "index.{}".format(l) if ranks(d, l) else None
+        attn = mla_at("layer.{}".format(l), "kv.{}".format(l), keys)
         if l < d.dense_layers:
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight(n("gate_up"), [2 * iw, hidden], w).packed([iw, iw]),
-                down = weight(n("down"), [hidden, iw], w).rows(),
+                gate_up = weight(n("gate_up"), [2 * iw, hidden], dense_mlp or proj).packed([iw, iw]),
+                down = weight(n("down"), [hidden, iw], dense_mlp or proj).rows(),
                 inter = iw,
             )
         else:
-            iw = d.moe_inter
-            sw = d.shared_inter
-            mlp = struct(
-                routed = True,
-                router = weight(n("router"), [d.experts, hidden], w),
-                gate_up = weight(n("experts_gate_up"), [d.experts, 2 * iw, hidden], w).bank([iw, iw]),
-                down = weight(n("experts_down"), [d.experts, hidden, iw], w).rows(),
-                shared = struct(
-                    gate_up = weight(n("shared_gate_up"), [2 * sw, hidden], w).packed([sw, sw]),
-                    down = weight(n("shared_down"), [hidden, sw], w).rows(),
-                    inter = sw,
-                ),
-                experts = d.experts,
-                top_k = d.top_k,
-                inter = iw,
-                norm_weights = d.norm_weights,
-                scaling = d.scaling,
-            )
+            mlp = routed_at("layer.{}".format(l), experts)
         return struct(
             attn = attn,
             attn_norm = norm("attn_norm", hidden),
@@ -133,6 +230,21 @@ def layout(id, deploy):
             mlp = mlp,
             lora_a = lora_a,
             lora_b = lora_b,
+        )
+
+    head = None
+    if draft != None:
+        head = struct(
+            enorm = weight("mtp.enorm", [hidden], w),
+            hnorm = weight("mtp.hnorm", [hidden], w),
+            e_proj = weight("mtp.e_proj", [hidden, hidden], w),
+            h_proj = weight("mtp.h_proj", [hidden, hidden], w),
+            attn_norm = weight("mtp.attn_norm", [hidden], w),
+            attn = mla_at("mtp", "kv.mtp", "index.mtp"),
+            mlp_norm = weight("mtp.mlp_norm", [hidden], w),
+            mlp = routed_at("mtp", draft),
+            norm = weight("mtp.norm", [hidden], w),
+            norm_eps = d.norm_eps,
         )
 
     return struct(
@@ -146,4 +258,5 @@ def layout(id, deploy):
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight("final_norm", [hidden], w),
         final_norm_eps = d.norm_eps,
+        mtp = head,
     )

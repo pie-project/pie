@@ -281,6 +281,56 @@ pub fn embed_scale_add_select(
     )
 }
 
+/// `packed`'s `heads` (query, key-value) heads, queries and keys
+/// `widths[0]` wide and values `widths[1]`, cut into `q`, `k` and `v` heads
+/// `head_dim` wide, zero past their widths.
+pub fn split_qkv_padded(
+    ctx: &Ctx,
+    packed: Tensor,
+    heads: [u32; 2],
+    widths: [u32; 2],
+    head_dim: u32,
+    q: &mut Tensor,
+    k: &mut Tensor,
+    v: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "layout.split_qkv_padded";
+    dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
+    let runs = [widths[0], widths[1], head_dim]
+        .iter()
+        .all(|w| w.is_multiple_of(8))
+        && widths.iter().all(|&w| w <= head_dim)
+        && [packed.ptr, q.ptr, k.ptr, v.ptr]
+            .iter()
+            .all(|p| p % 16 == 0);
+    if !runs {
+        return Err(refuse(
+            OP,
+            format!("{widths:?}-wide heads into {head_dim} are not whole 16-byte runs"),
+        ));
+    }
+    let out8 = (heads[0] + 2 * heads[1]) * head_dim / 8;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::layout::split_qkv_padded_vec8").apply(Launch::grid(
+            [q.rows, out8.div_ceil(BLOCK), 1],
+            [BLOCK, 1, 1],
+        )),
+        &[
+            packed.arg(),
+            q.arg(),
+            k.arg(),
+            v.arg(),
+            stated(OP, heads[0])?.arg(),
+            stated(OP, heads[1])?.arg(),
+            stated(OP, widths[0])?.arg(),
+            stated(OP, widths[1])?.arg(),
+            stated(OP, head_dim)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 pub fn split_qkv(
     ctx: &Ctx,
     packed: Tensor,
@@ -302,10 +352,25 @@ pub fn split_qkv(
     if q_dim <= 0 && kv_dim <= 0 {
         return Err(refuse(OP, "both halves of this cut are zero-wide"));
     }
-    let width = q.width.max(k.width);
+    // Eight columns a thread where both cuts and every plane take whole
+    // 16-byte runs: a copy, so the same bits land either way.
+    let vec8 = q.width.is_multiple_of(8)
+        && k.width.is_multiple_of(8)
+        && [packed.ptr, q.ptr, k.ptr, v.ptr]
+            .iter()
+            .all(|p| p % 16 == 0);
+    let (entry, width) = if vec8 {
+        ("split_qkv_vec8", q.width.max(k.width) / 8)
+    } else {
+        ("split_qkv", q.width.max(k.width))
+    };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::layout::split_qkv<::pie::bf16>").apply(Launch::grid(
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::layout::{entry}<::pie::bf16>")),
+        )
+        .apply(Launch::grid(
             [q.rows, width.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
@@ -341,6 +406,31 @@ pub fn split_q_gate(
         ));
     }
     let heads = q.width / head_dim;
+    if ctx.tuning().rows_vec
+        && head_dim.is_multiple_of(8)
+        && [packed.ptr, q.ptr, gate.ptr]
+            .iter()
+            .all(|&at| aligned16(at))
+    {
+        let runs = head_dim / 8;
+        let total = u64::from(q.rows) * u64::from(heads) * u64::from(runs);
+        let blocks = u32::try_from(total.div_ceil(256))
+            .map_err(|_| refuse(OP, format!("{total} runs overflow a grid")))?;
+        return ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::layout::split_q_gate_vec8<::pie::bf16>")
+                .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
+            &[
+                packed.arg(),
+                q.arg(),
+                gate.arg(),
+                (total as i64).arg(),
+                stated(OP, heads)?.arg(),
+                stated(OP, runs)?.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     let block = if head_dim < 128 { 64 } else { 128 };
     ctx.fire(
         OP,

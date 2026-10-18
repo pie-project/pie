@@ -56,6 +56,7 @@ fn compile_through(
 ) -> Result<LoadPlan> {
     let (metadata, contract) = constant::mounted(metadata, contract)?;
     let (metadata, contract) = (metadata.as_ref(), contract.as_ref());
+    let contract = &crate::contract::rewrite::cast_block_scaled_fp8_legs_apart(contract, metadata)?;
     let rewritten =
         crate::contract::rewrite::coalesce_direct_row_shards(contract, metadata, &target)?;
     let mut plan = build::build(metadata, &rewritten, target.clone())?;
@@ -243,6 +244,11 @@ pub struct TransformSpec {
     pub repack: Option<RepackSpec>,
     pub scratch_bytes: u64,
     pub metadata_source: Option<TensorId>,
+    /// The shards a block-scaled FP8 source's rows are stored cut into, each
+    /// under a factor grid of its own (0: one grid, or the one cut its
+    /// factors account for).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub fp8_chunks: u32,
     pub scale_factor_bits: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub bias_bits: u32,

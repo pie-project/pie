@@ -34,26 +34,55 @@ fn every_fused_trace_keeps_its_order() {
     assert!(broken.is_empty(), "{}", broken.join("\n"));
 }
 
-/// Gemma 4's attention prologue is a pattern the compiler folds, on every
-/// layer whose q, k and v share one projection.
+/// A catalog model's pattern folds on every layer it appears in: the kernel
+/// replaces each `unfused` op one for one.
 #[test]
-fn gemma_4_writes_its_kv_through_the_fused_kernel() {
-    let deployment = poem_compiler::catalog::deployment("gemma4-31b-bf16-kv-bf16")
-        .expect("the catalog states gemma4-31b");
-    let trace = deployment.trace(Platform::Cuda);
+fn catalog_models_fold_their_patterns_on_every_layer() {
     let count = |t: &poem_ir::Trace, op: &str| {
         t.nodes
             .iter()
             .filter(|node| poem_ir::Operands::name(&node.op) == op)
             .count()
     };
-    let layers = count(&trace, "layout.split_qkv");
-    let fused =
-        poem_compiler::fuse::fuse(trace, &["custom_cuda.qkv_fused_qknorm_rope_vnorm_write"]);
-    assert!(layers > 0);
-    assert_eq!(count(&fused, "layout.split_qkv"), 0);
-    assert_eq!(
-        count(&fused, "custom_cuda.qkv_fused_qknorm_rope_vnorm_write"),
-        layers
-    );
+    for (deployment, unfused, kernels, landed) in [
+        (
+            "gemma4-31b-bf16-kv-bf16",
+            "layout.split_qkv",
+            &["custom_cuda.qkv_fused_qknorm_rope_vnorm_write"][..],
+            "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
+        ),
+        (
+            "gptoss-120b-bf16-mxfp4-kv-bf16",
+            "layout.split_qkv",
+            &[
+                "elementwise.split_rope_yarn_append",
+                "elementwise.rope_yarn_append",
+            ][..],
+            "elementwise.split_rope_yarn_append",
+        ),
+        (
+            "kimik3-l4-bf16-mxfp4a8-kv-bf16",
+            "attention.mla_prefill",
+            &["attention.mla_prefill_expanded"][..],
+            "attention.mla_prefill_expanded",
+        ),
+        (
+            "kimik3-l4-bf16-mxfp4a8-kv-bf16",
+            "elementwise.res_blend",
+            &["elementwise.res_blend_rmsnorm"][..],
+            "elementwise.res_blend_rmsnorm",
+        ),
+    ] {
+        let trace = poem_compiler::catalog::deployment(deployment)
+            .unwrap_or_else(|| panic!("the catalog states {deployment}"))
+            .trace(Platform::Cuda);
+        let layers = count(&trace, unfused);
+        let fused = poem_compiler::fuse::fuse(trace, kernels);
+        assert!(layers > 0, "{deployment}: {unfused}");
+        assert_eq!(
+            (count(&fused, unfused), count(&fused, landed)),
+            (0, layers),
+            "{deployment}: {landed}"
+        );
+    }
 }

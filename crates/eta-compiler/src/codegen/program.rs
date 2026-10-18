@@ -64,15 +64,17 @@ impl EmittedKernel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Backend {
     Cuda,
+    Hip,
     Metal,
 }
 
 impl Backend {
-    pub const ALL: &'static [Backend] = &[Backend::Cuda, Backend::Metal];
+    pub const ALL: &'static [Backend] = &[Backend::Cuda, Backend::Hip, Backend::Metal];
 
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "cuda" => Some(Backend::Cuda),
+            "hip" => Some(Backend::Hip),
             "metal" => Some(Backend::Metal),
             _ => None,
         }
@@ -81,6 +83,7 @@ impl Backend {
     pub fn name(self) -> &'static str {
         match self {
             Backend::Cuda => "cuda",
+            Backend::Hip => "hip",
             Backend::Metal => "metal",
         }
     }
@@ -88,6 +91,7 @@ impl Backend {
     pub fn emitter_version(self) -> u32 {
         match self {
             Backend::Cuda => crate::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION as u32,
+            Backend::Hip => crate::codegen::hip::HIP_GENERATED_EMITTER_VERSION as u32,
             Backend::Metal => crate::codegen::metal::METAL_M1_EMITTER_VERSION as u32,
         }
     }
@@ -102,7 +106,22 @@ pub fn emit_program(
     match backend {
         Backend::Cuda => {
             for (stage_index, stage) in stages.iter().enumerate() {
-                emit_cuda_stage(stage, stage_index, &mut kernels);
+                emit_simt_stage(
+                    crate::codegen::cuda::DIALECT,
+                    stage,
+                    stage_index,
+                    &mut kernels,
+                );
+            }
+        }
+        Backend::Hip => {
+            for (stage_index, stage) in stages.iter().enumerate() {
+                emit_simt_stage(
+                    crate::codegen::hip::DIALECT,
+                    stage,
+                    stage_index,
+                    &mut kernels,
+                );
             }
         }
         Backend::Metal => {
@@ -119,11 +138,16 @@ fn signature(stage: &CompiledStage) -> String {
     format!("{:016x}", stage.signature.hash)
 }
 
-fn emit_cuda_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<EmittedKernel>) {
+fn emit_simt_stage(
+    dialect: crate::codegen::simt::Dialect,
+    stage: &CompiledStage,
+    stage_index: usize,
+    out: &mut Vec<EmittedKernel>,
+) {
     let signature = signature(stage);
     for (region_index, region) in stage.fused.regions.iter().enumerate() {
         let entry = format!("ptir_fused_{signature}_r{region_index}");
-        let emitted = crate::codegen::cuda::emit_region(&entry, stage, region);
+        let emitted = crate::codegen::simt::emit_region(dialect, &entry, stage, region);
         out.push(EmittedKernel::new(
             KernelKind::Fused,
             stage_index,
@@ -291,7 +315,12 @@ fn grouped_library(stage: &CompiledStage, region: &Region) -> Option<LibraryOp> 
             let op = stage.normalized.ops.get(node)?;
             (crate::codegen::op_view::OpView::of(op).tag == tags::TOP_K).then_some(LibraryOp::TopK)
         }
-        LibraryOp::Sort | LibraryOp::Scan | LibraryOp::MatMul | LibraryOp::SecondParty => None,
+        LibraryOp::Sort
+        | LibraryOp::Scan
+        | LibraryOp::MatMul
+        | LibraryOp::SecondParty
+        | LibraryOp::RankSample
+        | LibraryOp::LaneCut => None,
     }
 }
 
@@ -306,7 +335,8 @@ mod tests {
         while let Some(backend) = next {
             out.push(backend);
             next = match backend {
-                Backend::Cuda => Some(Backend::Metal),
+                Backend::Cuda => Some(Backend::Hip),
+                Backend::Hip => Some(Backend::Metal),
                 Backend::Metal => None,
             };
         }

@@ -22,6 +22,16 @@ use super::{Boot, FireCost, Golden, Graphs, Shell};
 /// prefill chunk a frame, which serves, and under it the halving stops.
 const TOKENS_FLOOR: u32 = 1024;
 
+/// Where the kernels' compiled code lands under the cache directory.
+#[cfg(not(feature = "rocm"))]
+const CODE_DIR: &str = kernels_cuda::disk::CUBINS;
+#[cfg(feature = "rocm")]
+const CODE_DIR: &str = kernels_cuda::disk::CODE_OBJECTS;
+
+/// The recurrent-state slots a load holds when neither the config nor the
+/// chip's profile states them.
+const DEFAULT_STATE_SLOTS: u32 = 256;
+
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     super::diag::publish(&boot.knobs.diagnostics);
     // SAFETY: the boot's communicator is held by the engine for the life of
@@ -44,6 +54,42 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
+    if boot.budget.max_tokens == 0 {
+        boot.budget.max_tokens = match engine.forward_tokens {
+            0 => crate::api::DEFAULT_FORWARD_TOKENS,
+            tokens => tokens,
+        };
+        if let Some(fit) = walk_fire_fit(&boot.trace, engine.walk_fire_rows, device.device().num_sm)
+            && fit < boot.budget.max_tokens
+        {
+            eprintln!(
+                "engine-cuda: fires of {fit} rows where {} were asked: the chunked gated delta \
+                 walk's blocks fit one wave (engine.walk_fire_rows)",
+                boot.budget.max_tokens
+            );
+            boot.budget.max_tokens = fit;
+        }
+    }
+    if engine.host_planes {
+        let freed = boot.residency.host_declared(&boot.trace)?;
+        if freed > 0 {
+            // The deferred fill republishes routed seats only; a dense row
+            // read through the artifact's mapping would stay there, so the
+            // host image is built at boot.
+            boot.deferred_tier = false;
+            eprintln!(
+                "engine-cuda: {:.1} GiB of planes the package declares `host` serve from \
+                 pinned host memory (engine.host_planes)",
+                freed as f64 / f64::from(1u32 << 30)
+            );
+        }
+    }
+    if boot.slots == 0 {
+        boot.slots = match engine.state_slots_per_lane {
+            0 => DEFAULT_STATE_SLOTS,
+            per_lane => per_lane.saturating_mul(boot.budget.max_lanes).max(1),
+        };
+    }
 
     kernels_cuda::disk::install(boot.cache_dir);
 
@@ -52,6 +98,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         stated_buckets.clone(),
         boot.budget.max_tokens,
         engine.lattice_steps,
+        engine.prefill_lattice_from,
     );
 
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
@@ -61,6 +108,22 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         kernels.retain(|kernel| crate::UNCHAINED.contains(kernel));
     }
     boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), &kernels);
+    #[cfg(not(feature = "rocm"))]
+    {
+        let tuning = kernels_cuda::tuning::Tuning::of(&chip);
+        boot.trace = crate::grouped_decode::rewrite_with(
+            boot.trace.clone(),
+            tuning.decode_grouped_prefill_from,
+            tuning.decode_grouped_prefill_lse,
+            kernels_cuda::attn::xqa::Gate::of(tuning),
+        );
+        boot.trace = crate::narrow::gdn_out_bf16(boot.trace.clone(), tuning.ssm_gdn_out_bf16);
+    }
+    // A join's independent branches side by side, where the profile forks
+    // them onto side streams (`compiler.branches`).
+    if profile.branches {
+        boot.trace = poem_compiler::branch::split(boot.trace.clone());
+    }
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
@@ -104,7 +167,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         if !stated_buckets.is_empty() {
             buckets.push(tokens);
         }
-        budget.buckets = crate::api::lattice(buckets, tokens, engine.lattice_steps);
+        budget.buckets = crate::api::lattice(
+            buckets,
+            tokens,
+            engine.lattice_steps,
+            engine.prefill_lattice_from,
+        );
         budget
     };
     let asked_tokens = boot.budget.max_tokens;
@@ -268,7 +336,12 @@ fn refit(
             .filter(|bucket| *bucket < tokens)
             .collect();
         buckets.push(tokens);
-        budget.buckets = crate::api::lattice(buckets, tokens, engine.lattice_steps);
+        budget.buckets = crate::api::lattice(
+            buckets,
+            tokens,
+            engine.lattice_steps,
+            engine.prefill_lattice_from,
+        );
         budget
     };
     let budgets_at = |budget: &Budget| Budgets {
@@ -483,6 +556,12 @@ impl Shell {
             decode_dense,
             boot.deferred_tier,
         )?;
+        // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
+        // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).
+        #[cfg(feature = "cuda")]
+        if device.ctx().tuning().fp8_o_down && kernels_cuda::linear::tc5::supported() {
+            weights.requantize_grouped(&boot.trace, device.stream())?;
+        }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after weights resident",
@@ -591,6 +670,7 @@ impl Shell {
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
+        let staging = crate::exports::regions_staging(&boot.trace, &compiled);
         let schedule_readers = regions_launching_schedules(&boot.trace, &compiled);
         crate::voxels::relabel_conv_weights(&device, &boot.trace, weights.table())?;
         weights.rotate(&boot.trace, &compiled)?;
@@ -628,8 +708,17 @@ impl Shell {
         // Committed whole: a fire reading out past one row a lane (a verify
         // reads every row) would otherwise grow it outside the fit.
         let mut arena = Arena::reserve(&compiled.arena, &pools)?;
-        arena.ensure(&mut pools, compiled.arena.bytes)?;
-        let predicate = crate::store::rs::Predicate::reserve(boot.budget.max_lanes)?;
+        // The fires that run the side streams carve their own arena
+        // (`CompiledModel::arena_forked`): the larger of the two is held.
+        let forked_bytes = compiled
+            .arena_forked
+            .as_ref()
+            .map_or(0, |forked| forked.bytes);
+        arena.ensure(&mut pools, compiled.arena.bytes.max(forked_bytes))?;
+        let predicate = crate::store::rs::Predicate::reserve(
+            boot.budget.max_lanes,
+            crate::store::rs::snapshots(&boot.trace) > 0,
+        )?;
         let spaces = boot
             .trace
             .caches
@@ -791,6 +880,7 @@ impl Shell {
             media,
             shifted,
             lane_shifted,
+            staging,
             schedule_readers,
             adapters: crate::blob::Adapters::new(adapter_seats),
             scores,
@@ -799,6 +889,8 @@ impl Shell {
             exports,
             graphs: engine.graphs,
             copies: engine.copies,
+            one_frame_when_short: engine.one_frame_when_short,
+            seated_first: engine.seated_first,
             pad: engine.recording.pad(),
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),
@@ -815,14 +907,14 @@ impl Shell {
                 cache
             },
             programs: ProgramPlane::new(crate::program::compile::Disk::rooted(
-                boot.cache_dir
-                    .map(|dir| dir.join(kernels_cuda::disk::CUBINS)),
+                boot.cache_dir.map(|dir| dir.join(CODE_DIR)),
             )),
             settlement: crate::settle::Settlement::open(boot.runahead.staging_depth())?,
             taps: Vec::new(),
             airborne,
             owed: None,
             guest_landed: crate::device::graph::Event::new()?,
+            rs_ahead: std::collections::HashMap::new(),
         };
         if shell.weights.rotating() && shell.graphs.records() {
             eprintln!(
@@ -904,6 +996,19 @@ impl Shell {
             })?;
             decoded = decoded.saturating_add(tile);
         }
+        // The tickets the fused launches draw, taken on every stream now:
+        // the bodies armed at load capture before any eager fire.
+        #[cfg(feature = "rocm")]
+        for ctx in core::iter::once(shell.device.ctx())
+            .chain(shell.device.side_ctx())
+            .chain(shell.device.conditional_ctx())
+        {
+            ctx.warm_tickets().map_err(|why| {
+                Fault::Residency(format!(
+                    "the fused launches' tickets would not allocate ({why})"
+                ))
+            })?;
+        }
         let held_for_fires = programs;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
@@ -945,9 +1050,22 @@ impl Shell {
             0
         };
         let resident = footprint(&shell);
-        let fitted = shell
-            .pools
-            .fit_the_card(bodies, held_for_fires, &resident)?;
+        // On ROCm, arming the tall buckets grows the kernels' scratch slabs
+        // (top-k scores, chunked-recurrence planes, attention partials) after
+        // this fit, by about the activation arena again at a 16K-token
+        // budget; held for them here, the cache rows leave the bodies the
+        // room they were allowed (GLM's mini armed 11 of 49 compositions
+        // without it, its prefill buckets walking eagerly).
+        let scratch_growth = if cfg!(feature = "rocm") && shell.records_bodies() {
+            shell.arena.bytes()
+        } else {
+            0
+        };
+        let fitted = shell.pools.fit_the_card(
+            bodies,
+            held_for_fires.saturating_add(scratch_growth),
+            &resident,
+        )?;
         if fitted.bodies < bodies {
             eprintln!(
                 "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
@@ -1095,6 +1213,7 @@ fn decoded_weight_planes(
                     row,
                     crate::run::WeightRow::Planes {
                         repacked: false,
+                        lanes: false,
                         ..
                     }
                 )
@@ -1138,7 +1257,32 @@ fn decoded_weight_planes(
                 continue;
             };
             let at_tokens = match &node.op {
-                poem_ir::Operation::Linear(_) => {
+                // A low-precision product decodes no bf16 tile.
+                #[cfg(not(feature = "rocm"))]
+                poem_ir::Operation::Linear(
+                    poem_ir::Linear::MatmulActQuant { .. }
+                    | poem_ir::Linear::MoeMatmulSelectActQuant { .. },
+                ) => continue,
+                #[cfg(not(feature = "rocm"))]
+                poem_ir::Operation::Fused(
+                    poem_ir::Fused::MoeSelectGlu { select, .. }
+                    | poem_ir::Fused::MoeExperts { select, .. },
+                ) if matches!(**select, poem_ir::Linear::MoeMatmulSelectActQuant { .. }) => {
+                    continue;
+                }
+                // A fused projection runs its matmul when no fused kernel
+                // takes it, and decodes the same plane that matmul would.
+                poem_ir::Operation::Linear(_)
+                | poem_ir::Operation::Fused(
+                    poem_ir::Fused::MatmulSwiglu { .. }
+                    | poem_ir::Fused::MatmulGeglu { .. }
+                    | poem_ir::Fused::MlpSwiglu { .. }
+                    | poem_ir::Fused::MatmulBias { .. }
+                    | poem_ir::Fused::MatmulSplitRows { .. }
+                    | poem_ir::Fused::LmHeadSoftcap { .. }
+                    | poem_ir::Fused::MoeSelectGlu { .. }
+                    | poem_ir::Fused::MoeExperts { .. },
+                ) => {
                     outputs.clear();
                     node.op.outputs(&mut outputs);
                     outputs.iter().any(|id| token_rows(*id))
@@ -1154,6 +1298,29 @@ fn decoded_weight_planes(
                     if at_tokens {
                         slot.at_tokens = slot.at_tokens.max(bytes);
                     }
+                }
+            }
+            // On ROCm an fp8b128 projection is one dense e4m3 plane, decoded
+            // to bf16 for a prefill's GEMM like a split-plane one.
+            #[cfg(feature = "rocm")]
+            if let poem_ir::Operation::Linear(poem_ir::Linear::MatmulActQuant {
+                w,
+                scales: Some(_),
+                ..
+            }) = &node.op
+                && let Some(poem_ir::Ty::Tensor { shape, .. }) =
+                    trace.values.get(w.0 as usize).map(|decl| &decl.ty)
+            {
+                let bytes = shape
+                    .iter()
+                    .map(|dim| match dim {
+                        poem_ir::Dim::Const(n) => *n,
+                        _ => 1,
+                    })
+                    .fold(2u64, u64::saturating_mul);
+                slot.widest = slot.widest.max(bytes);
+                if at_tokens {
+                    slot.at_tokens = slot.at_tokens.max(bytes);
                 }
             }
         }
@@ -1212,4 +1379,25 @@ pub(super) struct Baked {
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
     pub(super) profile: DeviceProfile,
+}
+
+/// The widest fire whose lanes of `rows` prompt rows put no more (lane,
+/// value head) blocks of the trace's widest chunked gated delta walk than the
+/// card has SMs; `None` where `rows` is 0 or the trace has no such walk.
+fn walk_fire_fit(trace: &poem_ir::Trace, rows: u32, sms: u32) -> Option<u32> {
+    if rows == 0 {
+        return None;
+    }
+    let heads = trace
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            poem_ir::Operation::Attention(poem_ir::Attention::SsmGatedDeltaChunked {
+                v_heads,
+                ..
+            }) => Some(*v_heads),
+            _ => None,
+        })
+        .max()?;
+    Some((sms / heads.max(1)).max(1) * rows)
 }

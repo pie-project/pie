@@ -15,8 +15,9 @@ fn the_voxel_reshapes_land_the_reference_ordering_every_case() {
     pixel_shuffle_lands_torchs_ordering_on_the_hand_computed_example();
     pixel_unshuffle_inverts_pixel_shuffle_and_both_match_the_reference();
     patchify_and_unpatchify_round_trip_over_the_token_box();
-    upsample_nearest_repeats_every_frame();
-    upsample_nearest_keeps_the_first_frame_single();
+    // Nearest upsampling repeats every frame, or keeps the first single.
+    upsample(false);
+    upsample(true);
     avg_down_answers_the_avgdown3d_reference();
     avg_down_pads_a_short_chunks_time_axis_in_front();
 }
@@ -160,14 +161,6 @@ fn upsample(keep_first: bool) {
     assert_eq!(got, want, "keep_first {keep_first}");
 }
 
-fn upsample_nearest_repeats_every_frame() {
-    upsample(false);
-}
-
-fn upsample_nearest_keeps_the_first_frame_single() {
-    upsample(true);
-}
-
 fn avg_down_case(boxes: &[Box3], c: usize, r: [u32; 3], group: u32) {
     let (grid, rows) = table(boxes);
     let ru = r.map(|v| v as usize);
@@ -201,9 +194,7 @@ fn avg_down_case(boxes: &[Box3], c: usize, r: [u32; 3], group: u32) {
         .into_iter()
         .map(from_bf16)
         .collect();
-    let mut worst = 0f32;
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-        worst = worst.max((g - w).abs());
         assert!(
             (g - w).abs() <= 4e-3 + 8e-3 * w.abs(),
             "{r:?} group {group}: row {} channel {}: got {g}, want {w}",
@@ -211,17 +202,20 @@ fn avg_down_case(boxes: &[Box3], c: usize, r: [u32; 3], group: u32) {
             i % c_out
         );
     }
-    eprintln!("avg_down {r:?} group {group}: {rows} -> {rows_out} rows, max |err| {worst:.5}");
 }
 
 fn avg_down_answers_the_avgdown3d_reference() {
     const EVEN: [Box3; 2] = [Box3::new(4, 4, 6), Box3::new(2, 2, 4)];
     const ODD: [Box3; 2] = [Box3::new(1, 4, 6), Box3::new(3, 2, 4)];
-    avg_down_case(&EVEN, 5, [1, 2, 2], 4);
-    avg_down_case(&EVEN, 5, [2, 2, 2], 4);
-    avg_down_case(&ODD, 5, [2, 2, 2], 4);
-    avg_down_case(&ODD, 3, [2, 2, 2], 8);
-    avg_down_case(&ODD, 3, [1, 1, 1], 1);
+    for (boxes, c, r, group) in [
+        (&EVEN, 5, [1, 2, 2], 4),
+        (&EVEN, 5, [2, 2, 2], 4),
+        (&ODD, 5, [2, 2, 2], 4),
+        (&ODD, 3, [2, 2, 2], 8),
+        (&ODD, 3, [1, 1, 1], 1),
+    ] {
+        avg_down_case(boxes, c, r, group);
+    }
 }
 
 fn avg_down_pads_a_short_chunks_time_axis_in_front() {

@@ -19,6 +19,19 @@ impl Run<'_> {
                 vocab,
                 y,
             } => match self.maybe_planes(*table) {
+                Some((codes, ..))
+                    if matches!(
+                        codes.dtype,
+                        poem_ir::Dtype::Nvfp4 | poem_ir::Dtype::E4m3tensor
+                    ) =>
+                {
+                    Err(kernels_cuda::Error::Backend {
+                        op: "layout.embed",
+                        detail: "an nvfp4 table has no cuda gather; its rows are read as \
+                                 bf16 or affine codes"
+                            .to_string(),
+                    })
+                }
                 Some((codes, scales, biases, seat)) => {
                     kernels_cuda::layout_embed_concat::embed_mlx_affine(
                         self.ctx(),
@@ -48,9 +61,44 @@ impl Run<'_> {
             Layout::EmbedConcat {
                 ids,
                 table,
+                scales: Some(scales),
+                vocab,
+                y,
+            } => kernels_cuda::layout_embed_e4m3::embed_concat_mxfp8(
+                self.ctx(),
+                self.tensor(*ids),
+                self.tensor(*table),
+                self.tensor(*scales),
+                *vocab,
+                &mut self.tensor(*y),
+            ),
+            Layout::EmbedConcat {
+                ids,
+                table,
+                scales: None,
                 vocab,
                 y,
             } => match self.maybe_planes(*table) {
+                #[cfg(not(feature = "rocm"))]
+                Some((codes, ..)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
+                    Err(kernels_cuda::Error::Backend {
+                        op: "layout.embed_concat",
+                        detail: "an nvfp4 table has no cuda gather; its rows are read as \
+                                 bf16 or affine codes"
+                            .to_string(),
+                    })
+                }
+                #[cfg(not(feature = "rocm"))]
+                Some((codes, scales, _, _)) if codes.dtype == poem_ir::Dtype::E4m3tensor => {
+                    kernels_cuda::layout_embed_e4m3::embed_concat_e4m3(
+                        self.ctx(),
+                        self.tensor(*ids),
+                        codes,
+                        scales,
+                        *vocab,
+                        &mut self.tensor(*y),
+                    )
+                }
                 Some((codes, scales, biases, seat)) => {
                     kernels_cuda::layout_embed_concat::embed_concat_mlxu4(
                         self.ctx(),
@@ -83,6 +131,24 @@ impl Run<'_> {
                 self.tensor(*packed),
                 *q_width,
                 *kv_width,
+                &mut self.tensor(*q),
+                &mut self.tensor(*k),
+                &mut self.tensor(*v),
+            ),
+            Layout::SplitQkvPadded {
+                packed,
+                heads,
+                widths,
+                head_dim,
+                q,
+                k,
+                v,
+            } => layout::split_qkv_padded(
+                self.ctx(),
+                self.tensor(*packed),
+                *heads,
+                *widths,
+                *head_dim,
                 &mut self.tensor(*q),
                 &mut self.tensor(*k),
                 &mut self.tensor(*v),
@@ -155,6 +221,10 @@ impl Run<'_> {
                 *temporal,
                 &mut self.tensor(*y),
             ),
+            Layout::ConcatCols { xs, y } => {
+                let xs: Vec<_> = xs.iter().map(|x| self.tensor(*x)).collect();
+                kernels_cuda::layout_concat_cols::concat_cols(self.ctx(), &xs, &mut self.tensor(*y))
+            }
             Layout::GridTaps {
                 positions,
                 grids,

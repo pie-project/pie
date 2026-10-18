@@ -2,7 +2,7 @@
 
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
-use kernels_cuda::elemwise::{activation, binary};
+use kernels_cuda::elemwise::{activation, binary, norm};
 use kernels_cuda::tensor::Tensor;
 
 const ROWS: usize = 9;
@@ -48,10 +48,15 @@ fn the_bare_ops_answer_the_reference() {
     activation::silu(&ctx, rect(x_at), &mut rect(out[2])).expect("fires");
     activation::gelu_tanh(&ctx, rect(x_at), &mut rect(out[3])).expect("fires");
     activation::tanh(&ctx, rect(x_at), &mut rect(out[4])).expect("fires");
+    // The residual add into the stream it reads, eight lanes a thread.
+    let acc = gpu.up(&y_raw);
+    norm::residual_add(&ctx, rect(x_at), &mut rect(acc)).expect("fires");
     gpu.sync();
 
     let got: Vec<Vec<u16>> = out.iter().map(|&at| gpu.down(at, N)).collect();
+    let summed: Vec<u16> = gpu.down(acc, N);
     for at in 0..N {
+        close(from_bf16(summed[at]), x[at] + y[at], "residual_add", at);
         close(from_bf16(got[0][at]), x[at] + y[at], "add", at);
         close(from_bf16(got[1][at]), x[at] * y[at], "mul", at);
         close(from_bf16(got[2][at]), silu(x[at]), "silu", at);

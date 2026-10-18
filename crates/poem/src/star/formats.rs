@@ -243,12 +243,17 @@ fn expr_methods(builder: &mut MethodsBuilder) {
         ))))
     }
 
-    /// The values re-encoded as `encoding`.
+    /// The values re-encoded as `encoding`; a block-scaled FP8 source states
+    /// the `chunks` its rows are stored cut into, each under factors of its
+    /// own.
     fn cast(
         this: &ExprValue,
         #[starlark(require = pos)] encoding: &EncodingValue,
+        #[starlark(require = named, default = 0)] chunks: u32,
     ) -> anyhow::Result<ExprValue> {
-        Ok(ExprValue(this.0.clone().cast(encoding.0.clone())))
+        Ok(ExprValue(
+            this.0.clone().cast_chunked(encoding.0.clone(), chunks),
+        ))
     }
 
     /// The values times `factor`.
@@ -259,6 +264,15 @@ fn expr_methods(builder: &mut MethodsBuilder) {
         Ok(ExprValue(this.0.clone().scale(factor.0 as f32)))
     }
 
+    /// The values times `by`, a tensor of factors each blocking an equal
+    /// part of every axis (one factor of shape `[1, 1]` scales the whole).
+    fn scale_by<'v>(
+        this: &ExprValue,
+        #[starlark(require = pos)] by: Value<'v>,
+    ) -> anyhow::Result<ExprValue> {
+        Ok(ExprValue(this.0.clone().scale_per_block(expr_of(by)?)))
+    }
+
     /// The values plus `by`.
     fn bias(
         this: &ExprValue,
@@ -267,14 +281,32 @@ fn expr_methods(builder: &mut MethodsBuilder) {
         Ok(ExprValue(this.0.clone().bias(by.0 as f32)))
     }
 
-    /// The values put through `op`: "neg_ln" (`ln(-x)`), "sqrt" or "rsqrt".
+    /// The values at least `floor`.
+    fn at_least(
+        this: &ExprValue,
+        #[starlark(require = pos)] floor: UnpackFloat,
+    ) -> anyhow::Result<ExprValue> {
+        use checkpoint::contract::UnaryOp;
+        Ok(ExprValue(
+            this.0
+                .clone()
+                .unary(UnaryOp::AtLeast((floor.0 as f32).to_bits())),
+        ))
+    }
+
+    /// The values put through `op`: "neg_ln" (`ln(-x)`), "sqrt", "rsqrt" or
+    /// "sigmoid".
     fn unary(this: &ExprValue, #[starlark(require = pos)] op: &str) -> anyhow::Result<ExprValue> {
         use checkpoint::contract::UnaryOp;
         let op = match op {
             "neg_ln" => UnaryOp::NegLn,
             "sqrt" => UnaryOp::Sqrt,
             "rsqrt" => UnaryOp::Rsqrt,
-            other => anyhow::bail!("a unary op is neg_ln, sqrt or rsqrt, not {other:?}"),
+            "sigmoid" => UnaryOp::Sigmoid,
+            "square" => UnaryOp::Square,
+            other => {
+                anyhow::bail!("a unary op is neg_ln, sqrt, rsqrt, sigmoid or square, not {other:?}")
+            }
         };
         Ok(ExprValue(this.0.clone().unary(op)))
     }
@@ -636,14 +668,16 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
 
     /// The tensor `name` of a contract, which `expr` computes, of `encoding`
     /// and `shape` (inferred from `expr` if not given); `scaling` names the
-    /// quantized weight it holds the scales of, `internal` keeps it from the
-    /// artifact.
+    /// quantized weight it holds the scales of, `tensor_scaling` the NVFP4
+    /// weight it holds the per-row tensor scales of, `internal` keeps it
+    /// from the artifact.
     fn tensor<'v>(
         #[starlark(require = pos)] name: String,
         #[starlark(require = pos)] expr: Value<'v>,
         #[starlark(require = pos)] encoding: &EncodingValue,
         #[starlark(require = named, default = NoneOr::None)] shape: NoneOr<UnpackList<i64>>,
         #[starlark(require = named, default = NoneOr::None)] scaling: NoneOr<Value<'v>>,
+        #[starlark(require = named, default = NoneOr::None)] tensor_scaling: NoneOr<Value<'v>>,
         #[starlark(require = named, default = false)] internal: bool,
     ) -> anyhow::Result<TensorValue> {
         let expr = expr_of(expr)?;
@@ -656,6 +690,9 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
             t = t.scaling(crate::star::forward::dsl("scaling", || {
                 crate::import::scaling(&w)
             })?);
+        }
+        if let Some(w) = tensor_scaling.into_option() {
+            t = t.offsetting(weight(w)?.name);
         }
         if internal {
             t = t.internal();
@@ -692,6 +729,18 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
     /// The name the biases of the weight `name` are held under.
     fn biases_name(#[starlark(require = pos)] name: &str) -> anyhow::Result<String> {
         Ok(crate::biases_name(name))
+    }
+
+    /// The name the per-row tensor scales of the NVFP4 weight `name` are
+    /// held under.
+    fn global_scales_name(#[starlark(require = pos)] name: &str) -> anyhow::Result<String> {
+        Ok(crate::global_scales_name(name))
+    }
+
+    /// The name the activation scales of the NVFP4 weight `name` are held
+    /// under.
+    fn input_scales_name(#[starlark(require = pos)] name: &str) -> anyhow::Result<String> {
+        Ok(crate::input_scales_name(name))
     }
 
     /// How a weight of `dtype` is stored.

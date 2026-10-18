@@ -133,6 +133,12 @@ pub struct EngineConfig {
     pub backend_kind: String,
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
+    /// The engine asks for one frame a lane when its slots seat fewer lanes
+    /// than it batches (`PoolFacts::one_frame_when_short`).
+    pub one_frame_when_short: bool,
+    /// The engine asks the planner to serve a decoding lane's pages before a
+    /// prompt waiting to be seated (`PoolFacts::seated_first`).
+    pub seated_first: bool,
     pub rs_cache_slot_bytes: u64,
     pub rs_host_slots: usize,
     pub rs_buffer_pages: u32,
@@ -151,6 +157,8 @@ pub struct EngineConfig {
     /// The engine takes an attachment for an adapter alone
     /// ([`::engine::fire::Boundary::Adapter`]): an adapted pass can be cut.
     pub adapter_attachments: bool,
+    /// The rows inside a lane whose recurrent state one fire lands.
+    pub rs_snapshots: u32,
     pub device_geometry_port_mask: eta_ir::registry::PortMask,
     pub limits: crate::engine::SchedulerLimits,
     /// The facts the engine's trace branches on.
@@ -258,6 +266,32 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .map(|d| d.rs_cache_slots)
         .filter(|&slots| slots > 0)
         .min();
+    // Each posted frame buffers what it leaves unfolded: where every engine asks
+    // and the slots seat fewer lanes than they batch at the configured depth, post
+    // one frame a lane.
+    let lanes = engine_configs
+        .iter()
+        .map(|d| d.limits.max_forward_requests)
+        .min()
+        .unwrap_or(0);
+    let depth = crate::scheduler::configured_dispatch_depth().max(1);
+    if let Some(slots) = rs_seat_cap
+        && depth > 1
+        && slots / depth < lanes
+        && engine_configs
+            .iter()
+            .all(|d| d.rs_cache_slots == 0 || d.one_frame_when_short)
+    {
+        tracing::info!(
+            lanes,
+            state_slots = slots,
+            seated_at_depth = slots / depth,
+            seated_at_one = slots.min(lanes),
+            "admission: the state slots seat fewer lanes than the engine batches; posting one \
+             frame a lane, as the engine's profile asks"
+        );
+        crate::scheduler::set_dispatch_depth(1);
+    }
     let admission_cap = config
         .max_concurrent_processes
         .or_else(|| {
@@ -316,6 +350,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         has_attn_score: all(|d| d.has_attn_score),
         has_attn_page_mask: all(|d| d.has_attn_page_mask),
         adapter_attachments: all(|d| d.adapter_attachments),
+        rs_snapshots: engine_configs
+            .iter()
+            .map(|d| d.rs_snapshots)
+            .min()
+            .unwrap_or(0),
     };
     let facts = engine_configs
         .first()
@@ -362,6 +401,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let kv_swap_capable = engine_configs
         .first()
         .is_some_and(|d| d.cpu_pages > 0 || d.disk_pages > 0);
+    let seated_first = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seated_first);
     if let Some(d) = engine_configs.first() {
         if kv_swap_capable {
             tracing::info!(
@@ -409,7 +449,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         0,
         crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
             crate::planner::RegistryPool::new(arena_model_idx, 0, kv_swap_capable),
-        )),
+        ))
+        .seated_first(seated_first),
     );
     // After the gates and the planner it orders exist.
     #[cfg(not(target_arch = "wasm32"))]

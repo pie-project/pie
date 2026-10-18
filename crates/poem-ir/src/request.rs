@@ -55,6 +55,7 @@ pub struct Request {
     media: bool,
     block_draft: bool,
     denoise: bool,
+    encode: bool,
     stream: Stream,
     reading: Option<Name>,
 }
@@ -68,17 +69,22 @@ impl Request {
     pub const SCORES: &'static str = "scores";
     /// The flag an inferlet sets on rows that attend both ways.
     pub const BIDIRECTIONAL: &'static str = "bidirectional";
+    /// The flag a backend sets on the rows of a prompt a causal
+    /// encoder-decoder's decoder skips (bounded replay): only its encoder
+    /// reads them.
+    pub const ENCODE: &'static str = "encode";
     /// The choice of the stream a lane's rows join.
     pub const STREAM: &'static str = "stream";
     /// The choice of the reading a pass runs.
     pub const READING: &'static str = "reading";
 
     /// The custom flags a request carries.
-    pub const FLAGS: [&'static str; 4] = [
+    pub const FLAGS: [&'static str; 5] = [
         Self::DRAFTS,
         Self::BLOCK_DRAFT,
         Self::SCORES,
         Self::BIDIRECTIONAL,
+        Self::ENCODE,
     ];
     /// The custom choices a request carries.
     pub const CHOICES: [&'static str; 2] = [Self::STREAM, Self::READING];
@@ -94,6 +100,7 @@ impl Request {
             media: false,
             block_draft: false,
             denoise: false,
+            encode: false,
             stream: Stream::Text,
             reading: None,
         }
@@ -114,6 +121,12 @@ impl Request {
     #[must_use]
     pub fn denoising(mut self, denoise: bool) -> Request {
         self.denoise = denoise;
+        self
+    }
+
+    #[must_use]
+    pub fn encoding(mut self, encode: bool) -> Request {
+        self.encode = encode;
         self
     }
 
@@ -205,6 +218,7 @@ impl Request {
             Self::BLOCK_DRAFT => self.block_draft,
             Self::SCORES => self.captures_scores,
             Self::BIDIRECTIONAL => self.denoise,
+            Self::ENCODE => self.encode,
             _ => panic!("`{name}` is no flag a request carries"),
         }
     }

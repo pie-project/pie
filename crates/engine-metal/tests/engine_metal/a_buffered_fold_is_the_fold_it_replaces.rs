@@ -31,7 +31,7 @@ fn package() -> &'static poem::star::Package {
 
 fn deploy() -> poem::star::Deploy {
     poem::star::Deploy {
-        weights: vec![Dtype::Bf16],
+        weights: vec![Dtype::Bf16.into()],
         kv: Dtype::Bf16,
         tp: 1,
         parts: vec![],

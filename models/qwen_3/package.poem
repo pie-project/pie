@@ -1,8 +1,7 @@
-# Qwen 3.5 / 3.6 / 3.8: gated-delta (GDN) layers with a gated attention one
-# every few, dense or routed MLPs, a vision tower, and the drafters each
-# pairs with (MTP, EAGLE, DFlash, DFlash2, DSpark). The Ternary-Bonsai 27B and
-# the test geometries are models of it too, listed nowhere: a test traces
-# and imports them by id.
+# Qwen 3.5 / 3.6 / 3.8, Qwen3.8 Max and Ornith-1.5: GDN layers with gated
+# attention every few, dense or routed MLPs, a vision tower, and their
+# drafters. Ternary-Bonsai 27B and the test geometries are unlisted models of
+# it that tests trace and import by id.
 
 load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
 
@@ -31,6 +30,10 @@ MODELS = [
     qwen("qwen35-a3b", layers = 40),
     qwen("qwen35-d9b", drafters = ["dflash"], layers = 32),
     qwen("qwen36-35b-a3b", drafters = ["mtp", "dflash", "dflash2"], layers = 40),
+    qwen("ornith15-397b", template = CHATML_INTERLEAVED, parts = ["vision"], layers = 60),
+    qwen("ornith15-397b-mini", mini = True, template = CHATML_INTERLEAVED, layers = 5),
+    qwen("qwen38-max", template = CHATML_INTERLEAVED, tokenizer = TOKENIZER_38, layers = 92),
+    qwen("qwen38-max-mini", mini = True, template = CHATML_INTERLEAVED, tokenizer = TOKENIZER_38, layers = 5),
     qwen("qwen35-tiny", mini = True, layers = 4),
     qwen("qwen36-35b-a3b-mini", mini = True, layers = 5),
     qwen("qwen36-35b-a3b-mini64", mini = True, layers = 5),
@@ -65,13 +68,24 @@ DEPLOYMENTS = [
     deployment("qwen36-35b-a3b", weights = U4, kv = BF),
     deployment("qwen36-35b-a3b-mini", weights = U4, kv = BF),
     deployment("qwen36-35b-a3b-mini64", weights = U4, kv = BF),
+    deployment("ornith15-397b", weights = U4, kv = BF),
+    deployment("ornith15-397b", weights = U4, kv = BF, parts = ["vision"]),
+    deployment("ornith15-397b", weights = BF, kv = BF),
+    deployment("ornith15-397b-mini", weights = BF, kv = BF),
+    deployment("ornith15-397b-mini", weights = U4, kv = BF),
+    deployment("qwen38-max", weights = U4, kv = BF),
+    deployment("qwen38-max", weights = BF, kv = BF),
+    deployment("qwen38-max-mini", weights = BF, kv = BF),
+    deployment("qwen38-max-mini", weights = U4, kv = BF),
     deployment("qwen36-27b", weights = BF, kv = BF, drafter = "mtp"),
     deployment("qwen38-27b", weights = BF, kv = BF, drafter = "mtp"),
     deployment("qwen38-27b", weights = U4, kv = BF, drafter = "dflash2"),
     deployment("qwen38-27b", weights = U4, kv = BF, drafter = "dspark"),
     deployment("qwen38-27b", weights = U4, kv = BF, drafter = "mtp"),
     deployment("qwen38-27b", weights = U4, kv = BF),
+    deployment("qwen38-27b", weights = BF, kv = BF),
     deployment("qwen35-a3b", weights = BF, kv = BF),
+    deployment("qwen36-35b-a3b", weights = BF, kv = BF),
     deployment("qwen35-d3b", weights = BF, kv = BF),
     deployment("qwen35-d0.8b", weights = BF, kv = BF, drafter = "eagle"),
     deployment("qwen35-d0.8b", weights = BF, kv = BF),

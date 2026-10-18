@@ -166,13 +166,6 @@ pub struct PrefillPoint {
     pub device: Device,
 }
 
-pub(crate) fn block<P>(params: &P) -> ArgValue {
-    ArgValue::Bytes {
-        ptr: core::ptr::from_ref(params).cast::<u8>(),
-        len: core::mem::size_of::<P>(),
-    }
-}
-
 pub(crate) fn decode<P>(
     ctx: &Ctx,
     op: &'static str,
@@ -190,7 +183,7 @@ pub(crate) fn decode<P>(
             )
             .smem(geometry.smem_bytes),
         ),
-        &[block(params)],
+        &[ArgValue::of(params)],
     )
 }
 
@@ -211,7 +204,7 @@ pub(crate) fn prefill<P>(
             )
             .smem(geometry.smem_bytes),
         ),
-        &[block(params)],
+        &[ArgValue::of(params)],
     )
 }
 
@@ -242,7 +235,7 @@ pub(crate) fn prefill_ragged<P>(
             )
             .smem(geometry.smem_bytes),
         ),
-        &[block(params)],
+        &[ArgValue::of(params)],
     )
 }
 
@@ -384,7 +377,47 @@ fn merge_blocks_per_sm(_instantiation: &'static str, _smem: u32) -> u32 {
     1
 }
 
-pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), Error> {
+/// The split's partials folded a warp a (row, head), straight from global
+/// memory: a decode's rows hold two or three partials each, which the
+/// staged persistent merge spends most of its time synchronizing over.
+fn fold_warp(ctx: &Ctx, op: &'static str, split: &Partials, num_sms: u32) -> Result<(), Error> {
+    let sink = if split.sinks_f32 {
+        "float"
+    } else {
+        "::pie::bf16"
+    };
+    const WARPS: u32 = 8;
+    let pairs = split.max_seq_len.saturating_mul(split.num_heads);
+    let blocks = pairs.div_ceil(WARPS).clamp(1, num_sms.saturating_mul(8));
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::attn::merge_partials_warp<{}, {sink}>",
+                split.head_dim
+            )),
+        )
+        .apply(Launch::grid([blocks, 1, 1], [32 * WARPS, 1, 1])),
+        &[
+            ArgValue::Ptr(split.tmp_v),
+            ArgValue::Ptr(split.tmp_s),
+            ArgValue::Ptr(split.indptr),
+            ArgValue::Ptr(split.o),
+            ArgValue::Ptr(split.lse),
+            split.max_seq_len.arg(),
+            ArgValue::Ptr(split.seq_len),
+            split.num_heads.arg(),
+            ArgValue::Ptr(split.sinks),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// Folds the split's partials; `Ok(true)` where the fold also scaled the
+/// output by the split's sinks (the warp fold, where the profile takes it),
+/// `Ok(false)` where the caller still owes them.
+pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<bool, Error> {
     let head_dim = split.head_dim;
     let (_, bdx, bdy) = merge_geometry(head_dim).ok_or_else(|| no_merge_row(op))?;
     let smem = merge_smem_bytes(head_dim).ok_or_else(|| no_merge_row(op))?;
@@ -401,6 +434,19 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), 
     }
 
     let num_sms = ctx.multiprocessors().unwrap_or(1).max(1);
+    // A wide batch's rows hold a few partials each and fold a warp a row; a
+    // narrow one's rows hold many, which the staged merge pipelines.
+    // With sinks the warp fold takes every batch: it lands them in the same
+    // pass, which outweighs the staged merge's edge on a narrow batch.
+    let pairs = split.max_seq_len.saturating_mul(split.num_heads);
+    if ctx.tuning().merge_warp
+        && head_dim.is_multiple_of(64)
+        && (pairs >= num_sms * 8 || split.sinks != 0)
+    {
+        return fold_warp(ctx, op, split, num_sms).map(|()| split.sinks != 0);
+    }
+    let unsinked = Partials { sinks: 0, ..*split };
+    let split = &unsinked;
     let blocks = grid_blocks(
         merge_blocks_per_sm(instantiation, smem),
         split.max_seq_len,
@@ -423,6 +469,7 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), 
             ctx.stage(),
         ],
     )
+    .map(|()| false)
 }
 
 #[cfg(feature = "cuda")]

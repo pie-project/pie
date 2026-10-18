@@ -50,10 +50,10 @@ impl Kind {
 fn capture_info(
     stream: *mut c_void,
 ) -> Result<(
-    cudarc::driver::sys::CUgraph,
-    Vec<cudarc::driver::sys::CUgraphNode>,
+    crate::device::dr::CUgraph,
+    Vec<crate::device::dr::CUgraphNode>,
 )> {
-    use cudarc::driver::sys as dr;
+    use crate::device::dr;
 
     let mut status = dr::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
     let mut id: u64 = 0;
@@ -98,8 +98,8 @@ fn capture_info(
 }
 
 #[cfg(feature = "cuda")]
-fn said(call: &'static str, code: cudarc::driver::sys::CUresult) -> Result<()> {
-    if code == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+fn said(call: &'static str, code: crate::device::dr::CUresult) -> Result<()> {
+    if code == crate::device::dr::CUresult::CUDA_SUCCESS {
         Ok(())
     } else {
         Err(Fault::Device {
@@ -109,10 +109,31 @@ fn said(call: &'static str, code: cudarc::driver::sys::CUresult) -> Result<()> {
     }
 }
 
+/// HIP graphs have no conditional node. The ROCm engine registers
+/// conditionals as priced past any launch they could skip
+/// (`chip::registry`), so the compiler lowers every region to
+/// `AlwaysLaunch`; a profile that prices them back in reaches these, which
+/// refuse.
+#[cfg(feature = "rocm")]
+fn absent(what: &str) -> Fault {
+    Fault::Unbound {
+        what: format!(
+            "{what}: HIP graphs have no conditional node, so a region lowered to `If` or \
+             `Switch` has nowhere to go on ROCm; leave `compiler.cond_fixed_us` at this \
+             engine's default so every region lowers to `AlwaysLaunch`"
+        ),
+    }
+}
+
 pub fn handle(stream: *mut c_void, kind: Kind) -> Result<u64> {
+    #[cfg(feature = "rocm")]
+    {
+        let _ = (stream, kind);
+        Err(absent("a conditional handle"))
+    }
     #[cfg(feature = "cuda")]
     {
-        use cudarc::driver::sys as dr;
+        use crate::device::dr;
 
         let (graph, _) = capture_info(stream)?;
         let mut ctx: dr::CUcontext = core::ptr::null_mut();
@@ -134,7 +155,7 @@ pub fn handle(stream: *mut c_void, kind: Kind) -> Result<u64> {
         })?;
         Ok(handle)
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = (stream, kind);
         Err(Fault::Runtimeless)
@@ -142,9 +163,14 @@ pub fn handle(stream: *mut c_void, kind: Kind) -> Result<u64> {
 }
 
 pub fn open(stream: *mut c_void, handle: u64, kind: Kind) -> Result<Conditional> {
+    #[cfg(feature = "rocm")]
+    {
+        let _ = (stream, handle, kind);
+        Err(absent("a conditional node"))
+    }
     #[cfg(feature = "cuda")]
     {
-        use cudarc::driver::sys as dr;
+        use crate::device::dr;
 
         let (graph, frontier) = capture_info(stream)?;
         let mut ctx: dr::CUcontext = core::ptr::null_mut();
@@ -216,7 +242,7 @@ pub fn open(stream: *mut c_void, handle: u64, kind: Kind) -> Result<Conditional>
             arms: kind.size(),
         })
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = (stream, handle, kind);
         Err(Fault::Runtimeless)
@@ -224,9 +250,14 @@ pub fn open(stream: *mut c_void, handle: u64, kind: Kind) -> Result<Conditional>
 }
 
 pub fn begin_body(stream: *mut c_void, body: *mut c_void) -> Result<()> {
+    #[cfg(feature = "rocm")]
+    {
+        let _ = (stream, body);
+        Err(absent("a conditional body"))
+    }
     #[cfg(feature = "cuda")]
     {
-        use cudarc::driver::sys as dr;
+        use crate::device::dr;
 
         // SAFETY: `body` is the node's child graph, `stream` is the shell's
         // conditional-body stream, and no capture is active on it.
@@ -241,7 +272,7 @@ pub fn begin_body(stream: *mut c_void, body: *mut c_void) -> Result<()> {
             )
         })
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = (stream, body);
         Err(Fault::Runtimeless)
@@ -249,9 +280,14 @@ pub fn begin_body(stream: *mut c_void, body: *mut c_void) -> Result<()> {
 }
 
 pub fn end_body(stream: *mut c_void) -> Result<()> {
+    #[cfg(feature = "rocm")]
+    {
+        let _ = stream;
+        Err(absent("a conditional body"))
+    }
     #[cfg(feature = "cuda")]
     {
-        use cudarc::driver::sys as dr;
+        use crate::device::dr;
 
         let mut out: dr::CUgraph = core::ptr::null_mut();
         // SAFETY: a live out-parameter, on the stream `begin_body` opened.
@@ -259,7 +295,7 @@ pub fn end_body(stream: *mut c_void) -> Result<()> {
             dr::cuStreamEndCapture(stream.cast(), &raw mut out)
         })
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = stream;
         Err(Fault::Runtimeless)

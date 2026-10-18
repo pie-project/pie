@@ -714,6 +714,11 @@ pub fn elem_bytes(dtype: Dtype) -> Option<u64> {
         | Dtype::I6g16k
         | Dtype::E4m3row
         | Dtype::E4m3tile128
+        | Dtype::E4m3g128
+        | Dtype::E4m3tensor
+        | Dtype::Fp8b128
+        | Dtype::Fp8b32
+        | Dtype::Mxfp8
         | Dtype::Ptq1_0
         // C2b packed KV codec: a block-quantized format with an inline scale
         // plane, so it has no per-element byte size — callers that must size a

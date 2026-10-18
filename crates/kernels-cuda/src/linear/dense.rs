@@ -23,7 +23,7 @@ use cudarc::runtime::sys::{
     cudaStreamSynchronize,
 };
 
-use super::gemv::gemv_bf16;
+use super::gemv::{gemm_narrow_bf16, gemm_rows_bf16, gemv_bf16};
 use crate::jit::device::capture_status;
 use crate::jit::{Ctx, refuse};
 
@@ -61,6 +61,11 @@ enum Tactic {
     Gemv,
     GemmEx,
     Lt(usize),
+    /// `gemm_narrow_bf16`: a block a row, at most eight columns.
+    Narrow,
+    /// `gemm_rows_bf16`: a few rows in one launch, warps streaming the
+    /// weight's rows.
+    Rows,
 }
 
 impl Tactic {
@@ -69,6 +74,8 @@ impl Tactic {
             Self::GemmEx => (0, 0),
             Self::Lt(algo) => (1, i32::try_from(algo).unwrap_or(0)),
             Self::Gemv => (2, 0),
+            Self::Narrow => (3, 0),
+            Self::Rows => (4, 0),
         }
     }
 
@@ -77,6 +84,8 @@ impl Tactic {
             0 => Some(Self::GemmEx),
             1 => usize::try_from(algo).ok().map(Self::Lt),
             2 => Some(Self::Gemv),
+            3 => Some(Self::Narrow),
+            4 => Some(Self::Rows),
             _ => None,
         }
     }
@@ -113,6 +122,10 @@ pub(crate) fn act_x_wt(
         device.configure(
             (tuning.gemm_workspace_mb as usize) << 20,
             tuning.gemm_heuristics as usize,
+            tuning.gemm_narrow_n,
+            tuning.gemm_split_launch_ns,
+            tuning.gemm_rows_m,
+            tuning.gemm_split_launch_from,
         );
         let plan = device.plan_for(call);
         let tactic = capturing
@@ -128,6 +141,19 @@ pub(crate) fn act_x_wt(
     unsafe {
         cublasSetWorkspace_v2(handle, ws, ws_bytes);
     }
+    // A cuBLASLt tactic lands the bias from its epilogue where the profile
+    // says (`kernel.gemm.bias_epilogue`); one it refuses runs bare and the
+    // bias is added after.
+    if let (Some(Tactic::Lt(index)), true, Some(plan)) = (
+        tactic,
+        bias != 0 && tuning.gemm_bias_epilogue,
+        plan.as_deref(),
+    ) && let Some(heuristic) = plan.heuristics.get(index)
+        && !lt_handle.is_null()
+        && run_lt_bias(lt_handle, plan, &heuristic.algo, stream, call, ws, ws_bytes)
+    {
+        return Ok(true);
+    }
     if let Some(tactic) = tactic
         && run_tactic(
             handle,
@@ -138,9 +164,10 @@ pub(crate) fn act_x_wt(
             call,
             ws,
             ws_bytes,
+            tuning.pdl,
         )
     {
-        return Ok(tactic == Tactic::Gemv && bias != 0);
+        return Ok(matches!(tactic, Tactic::Gemv | Tactic::Rows) && bias != 0);
     }
     clear_error();
 
@@ -192,6 +219,7 @@ fn run_tactic(
     call: Call,
     ws: *mut c_void,
     ws_bytes: usize,
+    pdl: bool,
 ) -> bool {
     match tactic {
         Tactic::Gemv => {
@@ -207,6 +235,29 @@ fn run_tactic(
                 )
                 .is_ok()
         }
+        Tactic::Rows => gemm_rows_bf16(
+            &unsafe { Ctx::on(stream) },
+            call.w,
+            call.act,
+            call.bias,
+            call.y,
+            call.m,
+            call.n,
+            call.k,
+            pdl,
+        )
+        .is_ok(),
+        Tactic::Narrow => gemm_narrow_bf16(
+            &unsafe { Ctx::on(stream) },
+            call.w,
+            call.act,
+            call.bias,
+            call.y,
+            call.m,
+            call.n,
+            call.k,
+        )
+        .is_ok(),
         Tactic::GemmEx => {
             gemm_ex(
                 handle,
@@ -251,6 +302,55 @@ fn gemm_ex(handle: cublasHandle_t, call: Call, algo: cublasGemmAlgo_t) -> cublas
             cublasComputeType_t::CUBLAS_COMPUTE_32F,
             algo,
         )
+    }
+}
+
+/// `y = act . w^T` over bf16 operands landing f32, one cuBLAS call.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn act_x_wt_f32(
+    ctx: &Ctx,
+    op: &'static str,
+    act: u64,
+    w: u64,
+    y: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), Error> {
+    let handle: cublasHandle_t = ctx.cublas(op)?.cast::<cublasContext>();
+    let (alpha, beta) = (1.0f32, 0.0f32);
+    // SAFETY: `handle` is this context's live cuBLAS handle; the operands are
+    // device rows of the stated extents.
+    let status = unsafe {
+        cublasGemmEx(
+            handle,
+            cublasOperation_t::CUBLAS_OP_T,
+            cublasOperation_t::CUBLAS_OP_N,
+            n,
+            m,
+            k,
+            std::ptr::from_ref(&alpha).cast(),
+            dev(w),
+            cudaDataType::CUDA_R_16BF,
+            k,
+            dev(act),
+            cudaDataType::CUDA_R_16BF,
+            k,
+            std::ptr::from_ref(&beta).cast(),
+            dev_mut(y),
+            cudaDataType::CUDA_R_32F,
+            n,
+            cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        )
+    };
+    if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(crate::jit::refuse(
+            op,
+            format!("cuBLAS answered {status:?}"),
+        ))
     }
 }
 
@@ -313,6 +413,7 @@ fn build_lt_plan(
     m: i32,
     n: i32,
     k: i32,
+    in_place: bool,
 ) -> Option<LtPlan> {
     struct Pref(lt::cublasLtMatmulPreference_t);
     impl Drop for Pref {
@@ -434,9 +535,21 @@ fn build_lt_plan(
         if asked != ok || supports == 0 {
             continue;
         }
-        for split in [2i32, 4, 8] {
+        // Where a split's launch is charged, also each split reduced in
+        // place: one launch, its partials serialized through the output.
+        let schemes: &[lt::cublasLtReductionScheme_t] = if in_place {
+            &[
+                lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE,
+                lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_INPLACE,
+            ]
+        } else {
+            &[lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE]
+        };
+        for (split, &scheme) in [2i32, 4, 8]
+            .into_iter()
+            .flat_map(|split| schemes.iter().map(move |scheme| (split, scheme)))
+        {
             let mut algo = heuristic.algo;
-            let scheme = lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
             let set_split = unsafe {
                 lt::cublasLtMatmulAlgoConfigSetAttribute(
                     &raw mut algo,
@@ -516,9 +629,117 @@ fn run_lt(
     status == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
 }
 
+/// [`run_lt`] with the bias (bf16, one a column of `y`) added in the
+/// epilogue, through a descriptor of its own for the call. False where the
+/// algorithm refuses the epilogue.
+fn run_lt_bias(
+    lt_handle: lt::cublasLtHandle_t,
+    plan: &LtPlan,
+    algo: &lt::cublasLtMatmulAlgo_t,
+    stream: *mut c_void,
+    call: Call,
+    ws: *mut c_void,
+    ws_bytes: usize,
+) -> bool {
+    struct Desc(lt::cublasLtMatmulDesc_t);
+    impl Drop for Desc {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                let _ = unsafe { lt::cublasLtMatmulDescDestroy(self.0) };
+            }
+        }
+    }
+    let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
+    let mut desc = Desc(std::ptr::null_mut());
+    if unsafe {
+        lt::cublasLtMatmulDescCreate(
+            &raw mut desc.0,
+            lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            lt::cudaDataType::CUDA_R_32F,
+        )
+    } != ok
+    {
+        return false;
+    }
+    let set = |attribute: lt::cublasLtMatmulDescAttributes_t,
+               value: *const c_void,
+               bytes: usize| unsafe {
+        lt::cublasLtMatmulDescSetAttribute(desc.0, attribute, value, bytes) == ok
+    };
+    let (ta, tb) = (
+        cublasOperation_t::CUBLAS_OP_T,
+        cublasOperation_t::CUBLAS_OP_N,
+    );
+    let epilogue = lt::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS;
+    let bias_ptr = dev(call.bias);
+    let bias_type = lt::cudaDataType::CUDA_R_16BF;
+    let size = std::mem::size_of::<cublasOperation_t>();
+    if !(set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+        std::ptr::from_ref(&ta).cast(),
+        size,
+    ) && set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+        std::ptr::from_ref(&tb).cast(),
+        size,
+    ) && set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
+        std::ptr::from_ref(&epilogue).cast(),
+        std::mem::size_of::<lt::cublasLtEpilogue_t>(),
+    ) && set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+        std::ptr::from_ref(&bias_ptr).cast(),
+        std::mem::size_of::<*const c_void>(),
+    ) && set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+        std::ptr::from_ref(&bias_type).cast(),
+        std::mem::size_of::<lt::cudaDataType>(),
+    )) {
+        return false;
+    }
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    let status = unsafe {
+        lt::cublasLtMatmul(
+            lt_handle,
+            desc.0,
+            std::ptr::from_ref(&alpha).cast(),
+            dev(call.w),
+            plan.a_desc,
+            dev(call.act),
+            plan.b_desc,
+            std::ptr::from_ref(&beta).cast(),
+            dev(call.y),
+            plan.c_desc,
+            dev_mut(call.y),
+            plan.c_desc,
+            std::ptr::from_ref(algo),
+            ws,
+            ws_bytes,
+            stream.cast(),
+        )
+    };
+    if status != ok {
+        clear_error();
+        return false;
+    }
+    true
+}
+
 struct Device {
     lt: LtCtx,
     heuristics: usize,
+    /// `kernel.gemm.narrow_n`: products this many columns or fewer may time
+    /// the narrow kernel.
+    narrow_n: u32,
+    /// `kernel.gemm.split_launch_ns`: what a K-splitting algorithm's own
+    /// reduce launch costs a captured step past its timing, or 0.
+    split_ns: u32,
+    /// `kernel.gemm.split_launch_from`: the fewest rows charged `split_ns`.
+    split_from: u32,
+    /// `kernel.gemm.rows_m`: products of 2 to this many rows may time the
+    /// few-rows kernel.
+    rows_m: u32,
     plans: HashMap<(i32, i32, i32), Arc<LtPlan>>,
     chosen: HashMap<u64, Tactic>,
     disk: DiskCache,
@@ -538,6 +759,10 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
                     workspace_bytes: 8 * 1024 * 1024,
                 },
                 heuristics: 8,
+                narrow_n: 0,
+                split_ns: 0,
+                split_from: 0,
+                rows_m: 0,
                 plans: HashMap::new(),
                 chosen: HashMap::new(),
                 disk: DiskCache::new(),
@@ -554,12 +779,39 @@ impl Device {
     /// Lay a load's GEMM settings on this device (`kernel.gemm.workspace_mb`,
     /// `kernel.gemm.heuristics`): plans and tactics chosen under other
     /// settings are dropped, since an algorithm may need more workspace.
-    fn configure(&mut self, workspace_bytes: usize, heuristics: usize) {
-        if self.lt.workspace_bytes != workspace_bytes || self.heuristics != heuristics {
+    fn configure(
+        &mut self,
+        workspace_bytes: usize,
+        heuristics: usize,
+        narrow_n: u32,
+        split_ns: u32,
+        rows_m: u32,
+        split_from: u32,
+    ) {
+        if self.lt.workspace_bytes != workspace_bytes
+            || self.heuristics != heuristics
+            || self.narrow_n != narrow_n
+            || self.split_ns != split_ns
+            || self.rows_m != rows_m
+            || self.split_from != split_from
+        {
+            self.split_from = split_from;
             self.lt.workspace_bytes = workspace_bytes;
             self.heuristics = heuristics;
+            self.narrow_n = narrow_n;
+            self.split_ns = split_ns;
+            self.rows_m = rows_m;
             self.plans.clear();
             self.chosen.clear();
+        }
+    }
+
+    /// What a split algorithm's reduce launch is charged at `m` rows.
+    fn charge(&self, m: i32) -> u32 {
+        if i64::from(m) >= i64::from(self.split_from) {
+            self.split_ns
+        } else {
+            0
         }
     }
 
@@ -578,6 +830,7 @@ impl Device {
             m,
             n,
             k,
+            self.charge(m) > 0,
         )?);
         self.plans.insert((m, n, k), Arc::clone(&plan));
         Some(plan)
@@ -591,7 +844,23 @@ impl Device {
         call: Call,
         capturing: cudaStreamCaptureStatus,
     ) -> Option<Tactic> {
-        let key = shape_key(call, self.lt.workspace_bytes, self.heuristics);
+        // A product below `split_from` rows keys, plans and times as with
+        // no charge, so its tactic is what it was before one.
+        let charge = self.charge(call.m);
+        let key = shape_key(
+            call,
+            self.lt.workspace_bytes,
+            self.heuristics,
+            self.narrow_n,
+            charge,
+        );
+        // A shape the few-rows kernel may serve keys apart from the one it
+        // may not.
+        let key = if rows_tried(call, self.rows_m) {
+            key ^ 0x726f_7773_0000_0000 ^ u64::from(self.rows_m)
+        } else {
+            key
+        };
         if let Some(tactic) = self.chosen.get(&key) {
             return Some(*tactic);
         }
@@ -612,7 +881,16 @@ impl Device {
         if (call.m as usize) * (call.n as usize) * 2 > 256 * 1024 * 1024 {
             return None;
         }
-        let tactic = tune(handle, stream, &self.lt, plan, call);
+        let tactic = tune(
+            handle,
+            stream,
+            &self.lt,
+            plan,
+            call,
+            self.narrow_n,
+            charge,
+            self.rows_m,
+        );
         self.disk.store(key, tactic.encode());
         self.chosen.insert(key, tactic);
         tracing::info!(
@@ -626,14 +904,43 @@ impl Device {
     }
 }
 
-fn shape_key(call: Call, workspace_bytes: usize, heuristics: usize) -> u64 {
+/// Whether the tuner times the few-rows kernel for `call`
+/// (`kernel.gemm.rows_m`).
+fn rows_tried(call: Call, rows_m: u32) -> bool {
+    call.m >= 2 && call.m <= rows_m.min(8) as i32 && call.k % 8 == 0
+}
+
+fn shape_key(
+    call: Call,
+    workspace_bytes: usize,
+    heuristics: usize,
+    narrow_n: u32,
+    split_ns: u32,
+) -> u64 {
     let mut bytes = [0u8; 28];
     bytes[..4].copy_from_slice(&call.m.to_le_bytes());
     bytes[4..8].copy_from_slice(&call.n.to_le_bytes());
     bytes[8..12].copy_from_slice(&call.k.to_le_bytes());
     bytes[12..20].copy_from_slice(&(workspace_bytes as u64).to_le_bytes());
     bytes[20..].copy_from_slice(&(heuristics as u64).to_le_bytes());
-    crate::source::fnv1a64(&bytes)
+    // A shape the narrow kernel may serve keys apart from the one it may
+    // not, and one timed with a split's launch charged from one timed
+    // without; every other key is what it was.
+    let narrow = narrow_n > 0 && call.n <= narrow_n as i32;
+    let whole = split_ns > 0;
+    if !narrow && !whole {
+        return crate::source::fnv1a64(&bytes);
+    }
+    let mut wider = [0u8; 36];
+    wider[..28].copy_from_slice(&bytes);
+    if narrow {
+        wider[28..32].copy_from_slice(&narrow_n.to_le_bytes());
+    }
+    if !whole {
+        return crate::source::fnv1a64(&wider[..32]);
+    }
+    wider[32..].copy_from_slice(&split_ns.to_le_bytes());
+    crate::source::fnv1a64(&wider)
 }
 
 fn tune(
@@ -642,6 +949,9 @@ fn tune(
     lt: &LtCtx,
     plan: Option<&LtPlan>,
     call: Call,
+    narrow_n: u32,
+    split_ns: u32,
+    rows_m: u32,
 ) -> Tactic {
     let mut candidates = Vec::new();
     if call.m == 1 {
@@ -651,6 +961,13 @@ fn tune(
         candidates.extend((0..plan.heuristics.len()).map(Tactic::Lt));
     }
     candidates.push(Tactic::GemmEx);
+    // Last, so a tie keeps cuBLAS.
+    if call.n <= narrow_n as i32 && call.k % 8 == 0 {
+        candidates.push(Tactic::Narrow);
+    }
+    if rows_tried(call, rows_m) {
+        candidates.push(Tactic::Rows);
+    }
 
     let mut arena = TuneArena::empty();
     if !arena.init(handle, caller_stream, lt.workspace_bytes, call) {
@@ -672,6 +989,16 @@ fn tune(
             us = ms * 1000.0,
             "dense gemm bench"
         );
+        // A captured step pays a split's reduce its own launch, which a
+        // lone timing hides (`kernel.gemm.split_launch_ns`); `cublasGemmEx`
+        // picks its own algorithm, a split one as likely, so it is charged
+        // too.
+        let two = match candidate {
+            Tactic::Lt(i) => plan.is_some_and(|p| !one_launch(&p.heuristics[i].algo)),
+            Tactic::GemmEx => true,
+            Tactic::Gemv | Tactic::Narrow | Tactic::Rows => false,
+        };
+        let ms = if two { ms + split_ns as f32 * 1e-6 } else { ms };
         timings.push((candidate, ms));
     }
     let fastest = timings
@@ -683,6 +1010,50 @@ fn tune(
         }
     }
     candidates[0]
+}
+
+/// Whether an algorithm runs in one launch: it does not split K, or
+/// reduces its splits in place.
+fn one_launch(algo: &lt::cublasLtMatmulAlgo_t) -> bool {
+    if splits_of(algo) == 1 {
+        return true;
+    }
+    let mut scheme: u32 = 0;
+    let mut written: usize = 0;
+    let asked = unsafe {
+        lt::cublasLtMatmulAlgoConfigGetAttribute(
+            std::ptr::from_ref(algo),
+            lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+            std::ptr::from_mut(&mut scheme).cast(),
+            std::mem::size_of::<u32>(),
+            &raw mut written,
+        )
+    };
+    if asked != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        clear_error();
+        return false;
+    }
+    scheme == lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_INPLACE as u32
+}
+
+/// An algorithm's K splits (1 when it does not split K).
+fn splits_of(algo: &lt::cublasLtMatmulAlgo_t) -> i32 {
+    let mut splits: i32 = 1;
+    let mut written: usize = 0;
+    let asked = unsafe {
+        lt::cublasLtMatmulAlgoConfigGetAttribute(
+            std::ptr::from_ref(algo),
+            lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+            std::ptr::from_mut(&mut splits).cast(),
+            std::mem::size_of::<i32>(),
+            &raw mut written,
+        )
+    };
+    if asked != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        clear_error();
+        return 1;
+    }
+    splits.max(1)
 }
 
 struct TuneArena {
@@ -823,6 +1194,7 @@ impl TuneArena {
                 bench,
                 self.workspace,
                 self.workspace_bytes,
+                false,
             )
         };
         let stream = self.stream.cast();

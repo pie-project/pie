@@ -195,7 +195,7 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
             repack_spec(&ty, *layout, to)?;
             Ok(to.clone())
         }
-        Expr::Cast { src, to } => {
+        Expr::Cast { src, to, .. } => {
             let ty = infer(src, scope)?;
             infer_cast(&ty, to)
         }

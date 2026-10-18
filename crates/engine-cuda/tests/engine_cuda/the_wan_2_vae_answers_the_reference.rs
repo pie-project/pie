@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "device")]
 
 use std::path::Path;
 use std::time::Instant;

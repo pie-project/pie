@@ -34,9 +34,9 @@ pub struct Id(pub [u8; 128]);
 
 impl Id {
     pub fn new(transport: Transport) -> Result<Id> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::nccl::sys as nccl;
+            use crate::device::nccl;
             transport_defaults(transport);
             let mut id = nccl::ncclUniqueId { internal: [0; 128] };
             // SAFETY: a live out-parameter of the exact type NCCL writes.
@@ -44,7 +44,7 @@ impl Id {
             answered("ncclGetUniqueId", code)?;
             Ok(Id(id.internal.map(|byte| byte as u8)))
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             let _ = transport;
             Err(Fault::Runtimeless)
@@ -67,9 +67,9 @@ unsafe impl Sync for Comm {}
 
 impl Comm {
     pub fn open(id: &Id, rank: u32, size: u32) -> Result<Comm> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::nccl::sys as nccl;
+            use crate::device::nccl;
             let unique = nccl::ncclUniqueId {
                 internal: id.0.map(|byte| byte as core::ffi::c_char),
             };
@@ -92,7 +92,7 @@ impl Comm {
                 peers: None,
             })
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             let _ = (id, rank, size);
             Err(Fault::Runtimeless)
@@ -105,9 +105,9 @@ impl Comm {
     }
 
     pub fn abort(&self) {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::nccl::sys as nccl;
+            use crate::device::nccl;
             if self.raw.is_null() {
                 return;
             }
@@ -161,7 +161,7 @@ impl PartialEq for Comm {
 
 /// Bytes of each rank's peer stage; a longer message goes in stage-sized
 /// chunks.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "device")]
 const STAGE_BYTES: u64 = 16 << 20;
 
 /// Maps every rank's stage into every other rank when each pair of devices
@@ -173,7 +173,7 @@ const STAGE_BYTES: u64 = 16 << 20;
 /// `None` otherwise, and the collectives stay on NCCL.
 #[must_use]
 pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peers>> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
         match wire_peers(ordinals) {
             Ok(peers) => {
@@ -186,16 +186,16 @@ pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peer
             }
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = ordinals;
         None
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "device")]
 fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::Peers>>> {
-    use cudarc::runtime::sys as rt;
+    use crate::device::rt;
 
     use crate::device::ctx::check;
 
@@ -210,13 +210,13 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
         let mut vmm = 0;
         // SAFETY: a live out-parameter; a driver device is its ordinal.
         let asked = unsafe {
-            cudarc::driver::sys::cuDeviceGetAttribute(
+            crate::device::dr::cuDeviceGetAttribute(
                 &raw mut vmm,
-                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
+                crate::device::dr::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
                 a,
             )
         };
-        if asked != cudarc::driver::sys::CUresult::CUDA_SUCCESS || vmm == 0 {
+        if asked != crate::device::dr::CUresult::CUDA_SUCCESS || vmm == 0 {
             return Err(off(format!("cuda:{a} does not map memory for peers")));
         }
         for &b in ordinals.iter().filter(|&&b| b != a) {
@@ -351,7 +351,7 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
 /// one: left on, NCCL tries it even with P2P off, and in a container
 /// without the multicast capability every communicator fails to open
 /// (#500).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "device")]
 fn transport_defaults(transport: Transport) {
     let set: &[(&str, &str)] = match transport {
         Transport::Shm => &[("NCCL_P2P_DISABLE", "1"), ("NCCL_NVLS_ENABLE", "0")],
@@ -365,9 +365,9 @@ fn transport_defaults(transport: Transport) {
     }
 }
 
-#[cfg(feature = "cuda")]
-fn answered(call: &'static str, code: cudarc::nccl::sys::ncclResult_t) -> Result<()> {
-    if code == cudarc::nccl::sys::ncclResult_t::ncclSuccess {
+#[cfg(feature = "device")]
+fn answered(call: &'static str, code: crate::device::nccl::ncclResult_t) -> Result<()> {
+    if code == crate::device::nccl::ncclResult_t::ncclSuccess {
         Ok(())
     } else {
         Err(Fault::Device {

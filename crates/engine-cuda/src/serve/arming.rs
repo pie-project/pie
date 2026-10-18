@@ -535,6 +535,7 @@ impl Shell {
                 rs: RsVerb::Fold,
                 rs_reset: RsReset::Inferred,
                 rs_slot: None,
+                rs_snapshots: &[],
                 stream: lane.stream,
                 group: None,
                 peer: None,

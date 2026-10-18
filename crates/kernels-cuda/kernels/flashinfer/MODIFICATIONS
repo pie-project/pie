@@ -186,6 +186,25 @@ is the same assumption on the output side -- `win` is the `(count, start)`
 seat every other kernel in this tree already takes, spelled here for the one
 launch of the fa2 family that touches the fire's own planes.
 
+THE FOURTH EDIT IS AN ADDITION TOO, IN TWO FILES, AND BOTH PARTS CARRY
+MARKERS.  Step 3 takes out:
+
+    attention/decode.cuh                  the `decode_skips_window` trait after
+                                          `DEFINE_HAS_MEMBER(...)`, and in the
+                                          batch decode device function the
+                                          `window_start` it derives: the
+                                          request's walk and its kv tiles
+                                          count from `kv_len - window_left - 1`
+                                          rather than from zero.
+    attention/variants.cuh                `skips_decode_window` in
+                                          `DefaultAttention`, true for a
+                                          sliding window without a custom mask.
+
+A decode row's sliding window masked every key behind it and upstream still
+loaded them; gpt-oss's 128-wide window over a 640-key request read five
+times the keys it used. A variant without the member (PIE's score capture
+sets it false: it lands every key's score) walks every key as upstream does.
+
 THE COLUMNS MOVED WITH THEM.  The three rows above were re-derived from the
 files; `added` was raised by each file's net line delta, which for these edits
 includes two continuation lines that are a REWRAP of an upstream line rather

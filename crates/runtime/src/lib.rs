@@ -1,4 +1,4 @@
-#[cfg(feature = "cuda")]
+#[cfg(feature = "engine-cuda")]
 extern crate engine_cuda as _;
 
 #[cfg(target_arch = "wasm32")]

@@ -1,6 +1,11 @@
-# How a GLM-5.3-Flash checkpoint is laid out: mlx's names; or an artifact
-# already imported, its draft head and vision tower overlaid under `aux.`
-# (`pie model import --aux`), the trunk read as the artifact holds it.
+# How a GLM-5.3-Flash checkpoint is laid out: mlx's names and quantization;
+# the release's own (transformers' names, FP8 in 128-square blocks beside
+# `*_scale_inv`); or an imported artifact with its draft head and vision
+# tower overlaid under `aux.` (`pie model import --aux`).
+
+load("//lib/blockfp8/formats.poem", "fp8_bank", "fp8_proj", "fp8_read")
+
+BF = raw(dtype.bf16)
 
 def product(xs):
     out = 1
@@ -69,8 +74,22 @@ def formats(m):
             recognizes = lambda c: overlaid(m),
             read = lambda reads: own_with_aux(m, reads),
         ),
-        format("mlx", recognizes = lambda c: not overlaid(m), read = lambda reads: land(m, reads, False, "")),
+        format(
+            "huggingface",
+            recognizes = lambda c: not overlaid(m) and released(),
+            read = lambda reads: land(m, reads, False, "", hf = True),
+        ),
+        format(
+            "mlx",
+            recognizes = lambda c: not overlaid(m) and not released(),
+            read = lambda reads: land(m, reads, False, ""),
+        ),
     ]
+
+def released():
+    """Whether the checkpoint is the release's: its projections FP8 beside
+    their block factors, not mlx's codes beside `.scales`."""
+    return has("model.language_model.layers.0.mlp.gate_proj.weight_scale_inv")
 
 def overlaid(m):
     return (m.mtp != None and has("aux." + HEAD + "enorm.weight")) or (
@@ -88,20 +107,66 @@ def own_with_aux(m, reads):
 def read(reads, own, w, name):
     if own:
         reads.read_own(w)
+    elif fp8_proj(w):
+        fp8_read(reads, w, [name])
     else:
         reads.read(w, name)
 
-def read_concat(reads, own, w, names):
+def read_concat(reads, own, w, names, hf = False):
     if own:
         reads.read_own(w)
+    elif hf and fp8_proj(w):
+        fp8_read(reads, w, names)
+    elif hf:
+        joined(reads, w, names)
     else:
         reads.read_concat(w, names)
 
-def read_stack(reads, own, w, rows):
+def read_stack(reads, own, w, rows, hf = False):
     if own:
         reads.read_own(w)
+    elif hf and fp8_proj(w):
+        fp8_bank(reads, w, rows)
+    elif hf:
+        stacked(reads, w, rows)
     else:
         reads.read_stack(w, rows)
+
+# A cast inside a join or a cut has no block factors to read, so an FP8
+# tensor that is joined or stacked is first dequantized whole into a bf16
+# tensor of its own, and the join reads that.
+
+def leg(reads, name):
+    """The tensor `name` as bf16: as stored, or, stored FP8, dequantized by
+    its block factors."""
+    if stored(name) == BF:
+        return src(name)
+    reads.push(tensor(name + ".bf16", src(name).cast(BF), BF, internal = True))
+    return out(name + ".bf16")
+
+def landed(reads, w, value):
+    """`w` from the bf16 `value`, encoded to its own dtype."""
+    if w.dtype == dtype.bf16:
+        reads.push(tensor(w.name, value, BF))
+    else:
+        reads.push(tensor(w.name, value.cast(grouped(w)), grouped(w)))
+
+def joined(reads, w, names):
+    """`w` from the tensors `names`, joined along its first axis."""
+    if all([stored(name) == BF for name in names]) and w.dtype == dtype.bf16:
+        reads.read_concat(w, names)
+    else:
+        landed(reads, w, concat(0, [leg(reads, name) for name in names]))
+
+def stacked(reads, w, rows):
+    """A bank `w`, an expert a row of `rows` (each the names its rows join
+    from), stacked along its first axis."""
+    each = product(w.shape) // w.shape[0]
+    def one(names):
+        legs = [leg(reads, name) for name in names]
+        return (concat(0, legs) if len(legs) > 1 else legs[0]).transmute([1, each], BF)
+
+    landed(reads, w, concat(0, [one(names) for names in rows]).transmute(w.shape, BF))
 
 def read_expr(reads, own, w, expr):
     if own:
@@ -109,7 +174,7 @@ def read_expr(reads, own, w, expr):
     else:
         reads.read_expr(w, expr())
 
-def land(m, reads, own, new):
+def land(m, reads, own, new, hf = False):
     read(reads, own, m.embed, "model.language_model.embed_tokens.weight")
     read(reads, own, m.final_norm, "model.language_model.norm.weight")
     read(reads, own, m.head, "lm_head.weight")
@@ -126,11 +191,11 @@ def land(m, reads, own, new):
         if w.mixer_kind == "mla":
             mla(reads, own, n, w.mixer)
         else:
-            kda(reads, own, n, w.mixer)
+            kda(reads, own, n, w.mixer, hf)
         if w.mlp.routed:
-            moe(reads, own, n, w.mlp)
+            moe(reads, own, n, w.mlp, hf)
         else:
-            read_concat(reads, own, w.mlp.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+            read_concat(reads, own, w.mlp.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")], hf)
             read(reads, own, w.mlp.down, n("mlp.down_proj.weight"))
 
     held = lambda name: own and has(name)
@@ -188,18 +253,18 @@ def tower(reads, own, v, t):
     read_concat(reads, own, mg.gate_up, [v("merger.gate_proj.weight"), v("merger.up_proj.weight")])
     read(reads, own, mg.down, v("merger.down_proj.weight"))
 
-def moe(reads, own, n, f):
+def moe(reads, own, n, f, hf = False):
     read(reads, own, f.router, n("mlp.gate.weight"))
     read(reads, own, f.bias, n("mlp.gate.e_score_correction_bias"))
     read_stack(reads, own, f.gate_up, [
         [n("mlp.experts.{}.gate_proj.weight".format(e)), n("mlp.experts.{}.up_proj.weight".format(e))]
         for e in range(f.experts)
-    ])
-    read_stack(reads, own, f.down, [[n("mlp.experts.{}.down_proj.weight".format(e))] for e in range(f.experts)])
+    ], hf)
+    read_stack(reads, own, f.down, [[n("mlp.experts.{}.down_proj.weight".format(e))] for e in range(f.experts)], hf)
     read_concat(reads, own, f.shared.gate_up, [
         n("mlp.shared_experts.gate_proj.weight"),
         n("mlp.shared_experts.up_proj.weight"),
-    ])
+    ], hf)
     read(reads, own, f.shared.down, n("mlp.shared_experts.down_proj.weight"))
 
 def mla(reads, own, n, a):
@@ -214,8 +279,8 @@ def mla(reads, own, n, a):
     read(reads, own, ix.kpool_ape, n("self_attn.indexer.index_kpool_compress_ape"))
     read(reads, own, ix.kpool_gate, n("self_attn.indexer.index_kpool_compress_gate"))
 
-def kda(reads, own, n, k):
-    read_concat(reads, own, k.qkv, kda_qkv(n))
+def kda(reads, own, n, k, hf = False):
+    read_concat(reads, own, k.qkv, kda_qkv(n), hf)
     read_expr(reads, own, k.conv, lambda: kda_conv(k, n))
     read(reads, own, k.f_a, n("self_attn.f_a_proj.weight"))
     read(reads, own, k.f_b, n("self_attn.f_b_proj.weight"))

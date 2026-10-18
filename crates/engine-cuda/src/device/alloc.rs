@@ -6,9 +6,32 @@ pub struct Buffer {
     bytes: usize,
 }
 
-#[cfg(feature = "cuda")]
-fn out_of_room(fault: Fault, bytes: usize) -> Fault {
-    use cudarc::runtime::sys as rt;
+/// `bytes` of device memory for a [`Buffer`], freed exactly once in its
+/// `Drop`; on ROCm, one an earlier drop kept when its last reader landed.
+#[cfg(feature = "device")]
+fn alloc(bytes: usize) -> Result<*mut core::ffi::c_void> {
+    #[cfg(feature = "rocm")]
+    {
+        crate::device::hip::held::recycle::alloc(bytes).map(|ptr| ptr as *mut core::ffi::c_void)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        use crate::device::rt;
+
+        let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: `base` is a live local the call fills.
+        let allocated = unsafe {
+            crate::device::ctx::check("cudaMalloc", rt::cudaMalloc(&raw mut base, bytes))
+        };
+        allocated
+            .map(|()| base)
+            .map_err(|fault| out_of_room(fault, bytes))
+    }
+}
+
+#[cfg(feature = "device")]
+pub(crate) fn out_of_room(fault: Fault, bytes: usize) -> Fault {
+    use crate::device::rt;
 
     let shortfall = matches!(
         fault,
@@ -34,18 +57,11 @@ impl Buffer {
         if bytes == 0 {
             return Ok(Buffer { ptr: 0, bytes: 0 });
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
-            let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
-            // SAFETY: `base` is a live local; the allocation is this buffer's, freed exactly once in `Drop`.
-            let allocated = unsafe {
-                crate::device::ctx::check("cudaMalloc", rt::cudaMalloc(&raw mut base, bytes))
-            };
-            if let Err(fault) = allocated {
-                return Err(out_of_room(fault, bytes));
-            }
+            let base = alloc(bytes)?;
             // SAFETY: `base` is the allocation just made, of `bytes` bytes.
             unsafe {
                 crate::device::ctx::check("cudaMemset", rt::cudaMemset(base, 0, bytes))?;
@@ -55,7 +71,7 @@ impl Buffer {
                 bytes,
             })
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             Err(Fault::Runtimeless)
         }
@@ -65,18 +81,11 @@ impl Buffer {
         if bytes == 0 {
             return Ok(Buffer { ptr: 0, bytes: 0 });
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
-            let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
-            // SAFETY: `base` is a live local; the allocation is this buffer's, freed exactly once in `Drop`.
-            let allocated = unsafe {
-                crate::device::ctx::check("cudaMalloc", rt::cudaMalloc(&raw mut base, bytes))
-            };
-            if let Err(fault) = allocated {
-                return Err(out_of_room(fault, bytes));
-            }
+            let base = alloc(bytes)?;
             // SAFETY: `base` is the allocation just made, of `bytes` bytes, and
             // `stream` is the one every later read of it is ordered on.
             unsafe {
@@ -90,7 +99,7 @@ impl Buffer {
                 bytes,
             })
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             let _ = stream;
             Err(Fault::Runtimeless)
@@ -123,9 +132,9 @@ impl Buffer {
         if bytes.is_empty() {
             return Ok(());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             // SAFETY: the span was just checked against this allocation, and `bytes` is a live host slice for the duration of a synchronous copy.
             unsafe {
@@ -140,7 +149,7 @@ impl Buffer {
                 )
             }
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             Err(Fault::Runtimeless)
         }
@@ -151,9 +160,9 @@ impl Buffer {
         if len == 0 {
             return Ok(());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             // SAFETY: the span was just checked against this allocation.
             unsafe {
@@ -163,7 +172,7 @@ impl Buffer {
                 )
             }
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             Err(Fault::Runtimeless)
         }
@@ -179,10 +188,18 @@ impl Buffer {
         if bytes.is_empty() {
             return Ok(());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
+            #[cfg(not(feature = "rocm"))]
+            if bounce(stream, self.ptr + offset, bytes)? {
+                return Ok(());
+            }
+            #[cfg(feature = "rocm")]
+            if crate::device::hip::held::staged_through_ring(self.ptr + offset, bytes, stream)? {
+                return Ok(());
+            }
             // SAFETY: the span is checked; `bytes` outlives the enqueue, and the caller synchronizes the stream before it is dropped — every caller in this crate stages inside one `fire`.
             unsafe {
                 crate::device::ctx::check(
@@ -197,7 +214,7 @@ impl Buffer {
                 )
             }
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             let _ = stream;
             Err(Fault::Runtimeless)
@@ -216,9 +233,9 @@ impl Buffer {
         for &(offset, _, len) in spans {
             self.span(offset, len)?;
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
             use std::sync::atomic::{AtomicBool, Ordering};
 
             static REFUSED: AtomicBool = AtomicBool::new(false);
@@ -280,7 +297,7 @@ impl Buffer {
             }
             Ok(())
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             let _ = stream;
             Err(Fault::Runtimeless)
@@ -302,9 +319,9 @@ impl Buffer {
         if len == 0 {
             return Ok(());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             // SAFETY: the destination span is checked; the source is the caller's promise above.
             unsafe {
@@ -320,7 +337,7 @@ impl Buffer {
                 )
             }
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             let _ = (stream, src);
             Err(Fault::Runtimeless)
@@ -337,9 +354,9 @@ impl Buffer {
         if len == 0 {
             return Ok(());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             // SAFETY: the span was just checked against this allocation, and the caller keeps it alive past the enqueue.
             unsafe {
@@ -354,7 +371,7 @@ impl Buffer {
                 )
             }
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             let _ = stream;
             Err(Fault::Runtimeless)
@@ -365,9 +382,9 @@ impl Buffer {
         if self.bytes == 0 {
             return Ok(());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             // SAFETY: the span is this allocation's own, and the caller synchronizes the stream before the buffer is dropped.
             unsafe {
@@ -382,7 +399,7 @@ impl Buffer {
                 )
             }
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             let _ = stream;
             Err(Fault::Runtimeless)
@@ -394,9 +411,9 @@ impl Buffer {
         if into.is_empty() {
             return Ok(());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             // SAFETY: the span is checked and `into` is a live host slice.
             unsafe {
@@ -411,7 +428,7 @@ impl Buffer {
                 )
             }
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             Err(Fault::Runtimeless)
         }
@@ -436,8 +453,12 @@ impl Drop for Buffer {
         if self.ptr != 0 {
             // SAFETY: the pointer came from this buffer's own `cudaMalloc` and is freed exactly once.
             unsafe {
-                let _ = cudarc::runtime::sys::cudaFree(self.ptr as *mut core::ffi::c_void);
+                let _ = crate::device::rt::cudaFree(self.ptr as *mut core::ffi::c_void);
             }
+        }
+        #[cfg(feature = "rocm")]
+        if self.ptr != 0 {
+            crate::device::hip::held::recycle::release(self.ptr, self.bytes);
         }
     }
 }
@@ -453,7 +474,7 @@ pub struct Pinned {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
     Allocated,
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
     Registered,
 }
 
@@ -463,6 +484,17 @@ unsafe impl Send for Pinned {}
 unsafe impl Sync for Pinned {}
 
 impl Pinned {
+    /// An empty span, holding nothing to free.
+    #[must_use]
+    pub const fn empty() -> Pinned {
+        Pinned {
+            host: core::ptr::null_mut(),
+            device: 0,
+            bytes: 0,
+            origin: Origin::Allocated,
+        }
+    }
+
     pub fn mapped(bytes: usize) -> Result<Pinned> {
         Pinned::alloc(bytes, true)
     }
@@ -488,9 +520,9 @@ impl Pinned {
                 origin: Origin::Allocated,
             });
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             let mut host: *mut core::ffi::c_void = core::ptr::null_mut();
             // SAFETY: `host` is a live local; the allocation is this structure's, freed exactly once in `Drop`.
@@ -522,7 +554,7 @@ impl Pinned {
                 origin: Origin::Allocated,
             })
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             let _ = (bytes, zeroed);
             Err(Fault::Runtimeless)
@@ -585,22 +617,22 @@ impl Drop for Pinned {
             return;
         }
         match self.origin {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "device")]
             Origin::Allocated => {
                 // SAFETY: the pointer came from this structure's own `cudaHostAlloc` and is freed exactly once.
                 unsafe {
-                    let _ = cudarc::runtime::sys::cudaFreeHost(self.host.cast());
+                    let _ = crate::device::rt::cudaFreeHost(self.host.cast());
                 }
             }
             Origin::Registered => {
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "device")]
                 // SAFETY: the span is the one this structure registered.
                 unsafe {
-                    let _ = cudarc::runtime::sys::cudaHostUnregister(self.host.cast());
+                    let _ = crate::device::rt::cudaHostUnregister(self.host.cast());
                 }
                 unmap_anon(self.host, self.bytes);
             }
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "device"))]
             Origin::Allocated => {}
         }
     }
@@ -691,9 +723,9 @@ impl Pinning {
     }
 
     pub fn lock(self) -> Result<Pinned> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
-            use cudarc::runtime::sys as rt;
+            use crate::device::rt;
 
             if self.bytes == 0 {
                 return Pinned::mapped(0);
@@ -731,7 +763,7 @@ impl Pinning {
                 origin: Origin::Registered,
             })
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             Err(Fault::Runtimeless)
         }
@@ -748,9 +780,9 @@ pub fn write_raw(at: u64, bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         // SAFETY: `at` is an address the caller resolved against an allocation it owns, and `bytes` is a live host slice for the duration of a synchronous copy.
         unsafe {
@@ -765,20 +797,94 @@ pub fn write_raw(at: u64, bytes: &[u8]) -> Result<()> {
             )
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = at;
         Err(Fault::Runtimeless)
     }
 }
 
+/// The least copy that goes through pinned memory: a larger pageable copy waits
+/// for every launch already queued on its stream, stalling the host.
+#[cfg(feature = "cuda")]
+const BOUNCED: usize = 32 << 10;
+
+/// Pinned buffers a thread cycles its bounced copies through. A buffer is
+/// written again only once the copy that last read it has run, so the ring
+/// holds the host back only when the device is that many copies behind.
+#[cfg(feature = "cuda")]
+const BOUNCES: usize = 8;
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct Bounces {
+    ring: Vec<(Pinned, crate::device::graph::Event)>,
+    next: usize,
+}
+
+#[cfg(feature = "cuda")]
+thread_local! {
+    static BOUNCES_HELD: core::cell::RefCell<Bounces> = core::cell::RefCell::default();
+}
+
+/// Copies `bytes` to `dst` on `stream` through this thread's pinned ring
+/// when it is `BOUNCED` or longer; false when it is shorter and the caller
+/// copies it as it is.
+#[cfg(feature = "cuda")]
+fn bounce(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<bool> {
+    use crate::device::rt;
+
+    if bytes.len() < BOUNCED {
+        return Ok(false);
+    }
+    BOUNCES_HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        let at = held.next;
+        held.next = (at + 1) % BOUNCES;
+        if held.ring.len() <= at {
+            let pinned = Pinned::mapped_uninit(bytes.len().next_power_of_two())?;
+            held.ring
+                .push((pinned, crate::device::graph::Event::new()?));
+        } else {
+            held.ring[at].1.settle()?;
+            if held.ring[at].0.bytes() < bytes.len() {
+                held.ring[at].0 = Pinned::mapped_uninit(bytes.len().next_power_of_two())?;
+            }
+        }
+        let (pinned, read) = &held.ring[at];
+        pinned.write(0, bytes);
+        // SAFETY: the source is this ring's pinned buffer, written again only
+        // after `read` reports this copy run; the destination is the caller's
+        // checked span.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaMemcpyAsync",
+                rt::cudaMemcpyAsync(
+                    dst as *mut core::ffi::c_void,
+                    pinned.host().cast_const().cast(),
+                    bytes.len(),
+                    rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    stream.cast(),
+                ),
+            )?;
+        }
+        read.record(stream)?;
+        Ok(true)
+    })
+}
+
 pub fn stage_raw(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
+
+        #[cfg(not(feature = "rocm"))]
+        if bounce(stream, dst, bytes)? {
+            return Ok(());
+        }
 
         // SAFETY: `bytes` is a live host slice for the call; the destination span is the caller's own scratch.
         unsafe {
@@ -794,7 +900,7 @@ pub fn stage_raw(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Resu
             )
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = (stream, dst);
         Err(Fault::Runtimeless)
@@ -805,9 +911,9 @@ pub fn copy_d2d(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize
     if bytes == 0 {
         return Ok(());
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         // SAFETY: both addresses are resolutions the caller made against allocations this shell owns for the load's lifetime, and the copy is enqueued on the same stream as the launches around it.
         unsafe {
@@ -823,7 +929,7 @@ pub fn copy_d2d(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize
             )
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = (stream, dst, src);
         Err(Fault::Runtimeless)
@@ -834,9 +940,9 @@ pub fn copy_any(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize
     if bytes == 0 {
         return Ok(());
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         // SAFETY: both addresses are resolutions the caller made against allocations this shell owns for the load's lifetime, and the copy is enqueued on a stream the caller keeps ordered around it.
         unsafe {
@@ -852,7 +958,7 @@ pub fn copy_any(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize
             )
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = (stream, dst, src);
         Err(Fault::Runtimeless)
@@ -863,9 +969,9 @@ pub fn zero_span(at: u64, len: usize) -> Result<()> {
     if len == 0 {
         return Ok(());
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         // SAFETY: the address is a span the caller resolved against an allocation this shell owns.
         unsafe {
@@ -875,7 +981,7 @@ pub fn zero_span(at: u64, len: usize) -> Result<()> {
             )
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = at;
         Err(Fault::Runtimeless)
@@ -886,9 +992,9 @@ pub fn zero_span_on(stream: *mut core::ffi::c_void, at: u64, len: usize) -> Resu
     if len == 0 {
         return Ok(());
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         // SAFETY: as `zero_span`, and the caller keeps the span alive past the enqueue.
         unsafe {
@@ -898,7 +1004,7 @@ pub fn zero_span_on(stream: *mut core::ffi::c_void, at: u64, len: usize) -> Resu
             )
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = (stream, at);
         Err(Fault::Runtimeless)
@@ -909,9 +1015,9 @@ pub fn copy_d2h(at: u64, into: &mut [u8]) -> Result<()> {
     if into.is_empty() {
         return Ok(());
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         // SAFETY: the address is a checked span and `into` is a live host slice of exactly the length copied.
         unsafe {
@@ -926,7 +1032,7 @@ pub fn copy_d2h(at: u64, into: &mut [u8]) -> Result<()> {
             )
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = at;
         Err(Fault::Runtimeless)
@@ -935,16 +1041,16 @@ pub fn copy_d2h(at: u64, into: &mut [u8]) -> Result<()> {
 
 #[must_use]
 pub fn free_bytes() -> Option<u64> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         let (mut free, mut total) = (0usize, 0usize);
         // SAFETY: two live locals; the call only writes them.
         let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
         (asked == rt::cudaError::cudaSuccess).then_some(free as u64)
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         None
     }
@@ -952,16 +1058,16 @@ pub fn free_bytes() -> Option<u64> {
 
 #[must_use]
 pub fn is_host_pointer(at: u64) -> bool {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
         // SAFETY: a zeroed attribute record the call fills; the query reads nothing else.
         let mut attrs: rt::cudaPointerAttributes = unsafe { core::mem::zeroed() };
         let asked =
             unsafe { rt::cudaPointerGetAttributes(&raw mut attrs, at as *const core::ffi::c_void) };
         asked == rt::cudaError::cudaSuccess && attrs.type_ == rt::cudaMemoryType::cudaMemoryTypeHost
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = at;
         false
@@ -970,16 +1076,16 @@ pub fn is_host_pointer(at: u64) -> bool {
 
 #[must_use]
 pub fn is_capturing(stream: *mut core::ffi::c_void) -> bool {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
         let mut status = rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
         // SAFETY: a live stream handle and a local the query writes.
         let asked = unsafe { rt::cudaStreamIsCapturing(stream.cast(), &raw mut status) };
         asked == rt::cudaError::cudaSuccess
             && status != rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = stream;
         false
@@ -988,15 +1094,15 @@ pub fn is_capturing(stream: *mut core::ffi::c_void) -> bool {
 
 #[must_use]
 pub fn raw_alloc(bytes: usize) -> Option<u64> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
         let mut fresh: *mut core::ffi::c_void = core::ptr::null_mut();
         // SAFETY: a local the call fills.
         let code = unsafe { rt::cudaMalloc(&raw mut fresh, bytes) };
         (code == rt::cudaError::cudaSuccess && !fresh.is_null()).then_some(fresh as u64)
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = bytes;
         None
@@ -1004,13 +1110,13 @@ pub fn raw_alloc(bytes: usize) -> Option<u64> {
 }
 
 pub fn raw_free(at: u64) {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
         // SAFETY: an address `raw_alloc` returned and nobody else freed.
         let _ = unsafe { rt::cudaFree(at as *mut core::ffi::c_void) };
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = at;
     }

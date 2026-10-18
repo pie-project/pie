@@ -11,7 +11,8 @@
 //! (`text`/`json_object`/`json_schema`), `stream` and
 //! `stream_options.include_usage`, `temperature`, `top_p`, `top_k`,
 //! `max_tokens`/`max_completion_tokens`, `ignore_eos`, `stop`, `seed`,
-//! `presence_penalty`, `frequency_penalty`, `repetition_penalty`,
+//! `presence_penalty`, `frequency_penalty`, `repetition_penalty`, vLLM's
+//! `min_tokens`,
 //! `reasoning_effort: "none"` and `chat_template_kwargs.enable_thinking` to
 //! switch thinking off or on.
 //!
@@ -42,6 +43,7 @@ struct Body {
     top_k: Option<u32>,
     max_tokens: Option<usize>,
     max_completion_tokens: Option<usize>,
+    min_tokens: usize,
     ignore_eos: bool,
     stop: Option<Value>,
     seed: Option<i64>,
@@ -320,8 +322,9 @@ fn parse(body: Value) -> Result<(Request, bool), ApiError> {
         }
         req.max_tokens = max;
     }
-    req.stop = stop_sequences(body.stop)?;
+    req.min_tokens = body.min_tokens;
     req.ignore_eos = body.ignore_eos;
+    req.stop = stop_sequences(body.stop)?;
     req.thinking = match body.reasoning_effort.as_deref() {
         Some("none") => Thinking::Disabled,
         Some(_) => Thinking::Enabled,
@@ -387,9 +390,15 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
     };
     let stream = req.stream;
 
-    if stream {
-        emit::send(&ids.chunk(json!({"role": "assistant", "content": ""}), None));
-    }
+    // The role rides on the first delta, as the open servers send it: an
+    // empty role chunk ahead of the prefill would read as the first token.
+    let mut role = Some("assistant");
+    let mut delta = |mut v: Value| {
+        if let Some(r) = role.take() {
+            v["role"] = json!(r);
+        }
+        v
+    };
     let mut calls = 0usize;
     let outcome = compat::run(&req, |event| {
         if !stream {
@@ -397,14 +406,17 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         }
         match event {
             Event::Reasoning(text) => {
-                emit::send(&ids.chunk(json!({"reasoning_content": text}), None));
+                emit::send(&ids.chunk(delta(json!({"reasoning_content": text})), None));
             }
             Event::ReasoningEnd => {}
             Event::Text(text) => {
-                emit::send(&ids.chunk(json!({"content": text}), None));
+                emit::send(&ids.chunk(delta(json!({"content": text})), None));
             }
             Event::ToolCall(call) => {
-                emit::send(&ids.chunk(json!({"tool_calls": [tool_call_json(calls, &call)]}), None));
+                emit::send(&ids.chunk(
+                    delta(json!({"tool_calls": [tool_call_json(calls, &call)]})),
+                    None,
+                ));
                 calls += 1;
             }
         }
@@ -412,7 +424,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
     .await?;
 
     if stream {
-        emit::send(&ids.chunk(json!({}), Some(finish_reason(outcome.finish))));
+        emit::send(&ids.chunk(delta(json!({})), Some(finish_reason(outcome.finish))));
         if include_usage {
             emit::send(&json!({
                 "id": ids.id,

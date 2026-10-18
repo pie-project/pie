@@ -653,6 +653,36 @@ impl Plane {
         bound.session.settle_launched()
     }
 
+    /// The shared rings instance `id`'s stages put.
+    #[must_use]
+    pub fn shared_puts(&self, id: u64) -> Vec<usize> {
+        let Some(bound) = self.instances.get(&id) else {
+            return Vec::new();
+        };
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return Vec::new();
+        };
+        bound.session.shared_puts(&program.plan).collect()
+    }
+
+    /// The shared rings the host reads to resolve instance `id`'s
+    /// descriptor ports (none for a host-geometry instance).
+    #[must_use]
+    pub fn host_resolved_rings(&self, id: u64) -> Vec<usize> {
+        let Some(bound) = self.instances.get(&id) else {
+            return Vec::new();
+        };
+        if bound.geometry == GeometryClass::Host {
+            return Vec::new();
+        }
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return Vec::new();
+        };
+        bound
+            .session
+            .host_resolved_rings(&program.plan, bound.geometry)
+    }
+
     pub fn shared_rings(&self, id: u64) -> Vec<usize> {
         self.instances
             .get(&id)

@@ -153,7 +153,7 @@ impl Settings {
 fn native_kind() -> EngineKind {
     if cfg!(all(feature = "metal", target_vendor = "apple")) {
         EngineKind::Metal
-    } else if cfg!(feature = "cuda") {
+    } else if cfg!(feature = "engine-cuda") {
         EngineKind::CudaNative
     } else if cfg!(feature = "vulkan") {
         EngineKind::Vulkan

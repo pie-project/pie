@@ -59,9 +59,20 @@ pub fn swiglu(
     const OP: &str = "linear.mlp_swiglu";
     let t = dtype_dispatch!(OP, packed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
+    // Eight columns a thread where the halves and both planes take whole
+    // 16-byte runs: the same values, element for element.
+    let (entry, launch) =
+        if intermediate.is_multiple_of(8) && packed.ptr % 16 == 0 && y.ptr % 16 == 0 {
+            (
+                "mlp_swiglu_vec8",
+                elementwise_rows(OP, y.rows, y.width / 8)?,
+            )
+        } else {
+            ("mlp_swiglu", launch)
+        };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::mlp_swiglu<{t}>"))).apply(launch),
+        Fire::at(FILE, symbol(&format!("::pie::linear::{entry}<{t}>"))).apply(launch),
         &[
             packed.arg(),
             y.arg(),
@@ -132,24 +143,184 @@ pub fn swiglu_clamp_alpha(
     )
 }
 
-pub fn swiglu_clamp_split(
-    _ctx: &Ctx,
+/// The clamped SwiGLU over a gate and an up plane held apart (`up`), or
+/// over packed rows; with `weights`, each routed row times its route's f32
+/// weight before it rounds.
+#[allow(clippy::too_many_arguments)]
+fn swiglu_clamp_lanes(
+    ctx: &Ctx,
+    op: &'static str,
     gate: Tensor,
-    _up: Tensor,
-    _limit: f32,
-    _y: &mut Tensor,
+    up: Option<Tensor>,
+    weights: Option<Tensor>,
+    fan: u32,
+    limit: f32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let t = dtype_dispatch!(op, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    if let Some(w) = weights {
+        debug_assert_eq!(w.dtype, dtype::Dtype::F32, "`{op}` reads f32 route weights");
+        if u64::from(w.rows) * u64::from(w.width) != u64::from(y.rows) {
+            return Err(refuse(
+                op,
+                format!(
+                    "{} x {} route weights for {} routed rows",
+                    w.rows, w.width, y.rows
+                ),
+            ));
+        }
+    }
+    let n = y.elements();
+    let lanes = u32::try_from(n).map_err(|_| {
+        refuse(
+            op,
+            format!("{n} elements do not fit a 32-bit launch extent"),
+        )
+    })?;
+    nonzero(op, "the activation's element count", lanes)?;
+    let (packed, routed) = (up.is_none(), weights.is_some());
+    let absent = crate::jit::ArgValue::ABSENT;
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::linear::mlp_swiglu_clamp_lanes<{t}, {packed}, {routed}>"
+            )),
+        )
+        .apply(Launch::flat(lanes, BLOCK)),
+        &[
+            gate.arg(),
+            up.map_or(absent, |u| u.arg()),
+            weights.map_or(absent, |w| w.arg()),
+            y.arg(),
+            stated(op, lanes)?.arg(),
+            stated(op, y.width)?.arg(),
+            limit.arg(),
+            stated(op, fan)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+pub fn swiglu_clamp_split(
+    ctx: &Ctx,
+    gate: Tensor,
+    up: Tensor,
+    fan: u32,
+    limit: f32,
+    y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.mlp_swiglu_clamp_split";
-    Err(refuse(
+    debug_assert_eq!(
+        (gate.rows, gate.width),
+        (up.rows, up.width),
+        "`{OP}`'s gate and up planes are one rectangle"
+    );
+    swiglu_clamp_lanes(ctx, OP, gate, Some(up), None, fan, limit, y)
+}
+
+/// [`swiglu_clamp_split`] of routed rows, each times its route's f32
+/// weight before it rounds.
+pub fn swiglu_clamp_split_routed(
+    ctx: &Ctx,
+    gate: Tensor,
+    up: Tensor,
+    weights: Tensor,
+    fan: u32,
+    limit: f32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mlp_swiglu_clamp_split_routed";
+    debug_assert_eq!(
+        (gate.rows, gate.width),
+        (up.rows, up.width),
+        "`{OP}`'s gate and up planes are one rectangle"
+    );
+    swiglu_clamp_lanes(ctx, OP, gate, Some(up), Some(weights), fan, limit, y)
+}
+
+/// Whether [`swiglu_clamp_routed_e4m3`] lands rows `y` (at a valid launch):
+/// bf16, whole 128-column blocks.
+#[must_use]
+pub fn routed_e4m3_spans(y: &Tensor) -> bool {
+    y.dtype == dtype::Dtype::Bf16 && y.width.is_multiple_of(128)
+}
+
+/// [`swiglu_clamp_routed`] landing its bf16 rows read back through e4m3 a
+/// 128 columns (`act_quant`'s E4M3 at `gran` 128, read back): what a W4A8
+/// select would read back from the plain rows, and what it reads back from
+/// these again. `Ok(false)` where it does not apply (not bf16, or rows not
+/// whole 128-column blocks); the caller lands the plain rows then.
+#[allow(clippy::too_many_arguments)]
+pub fn swiglu_clamp_routed_e4m3(
+    ctx: &Ctx,
+    packed: Tensor,
+    intermediate: u32,
+    weights: Tensor,
+    fan: u32,
+    limit: f32,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.mlp_swiglu_clamp_routed";
+    if !routed_e4m3_spans(y)
+        || packed.dtype != dtype::Dtype::Bf16
+        || weights.dtype != dtype::Dtype::F32
+        || packed.width != 2 * intermediate
+        || y.width != intermediate
+        || packed.rows != y.rows
+        || u64::from(weights.rows) * u64::from(weights.width) != u64::from(y.rows)
+    {
+        return Ok(false);
+    }
+    let lanes = u32::try_from(y.elements() / 8)
+        .map_err(|_| refuse(OP, "the rows' eights do not fit a 32-bit launch extent"))?;
+    if lanes == 0 {
+        return Ok(true);
+    }
+    ctx.fire(
         OP,
-        format!(
-            "the unfused swiglu-clamp pair is the 2-bit MLX expert path's combine, and \
-             `{FILE}` instantiates no `swiglu_clamp_split` unit — this plane serves the \
-             packed `linear.mlp_swiglu_clamp` row (halves of {} at {:?}) and no MLX \
-             affine bank",
-            gate.width, gate.dtype,
-        ),
-    ))
+        Fire::at(
+            "linear/act_quant.cuh",
+            "::pie::linear::mlp_swiglu_clamp_routed_e4m3",
+        )
+        .apply(Launch::flat(lanes, BLOCK)),
+        &[
+            packed.arg(),
+            weights.arg(),
+            y.arg(),
+            stated(OP, lanes)?.arg(),
+            stated(OP, y.width)?.arg(),
+            limit.arg(),
+            stated(OP, fan)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}
+
+/// [`swiglu_clamp_split_routed`] over packed rows: each row's
+/// `intermediate` gate columns, then its up columns.
+pub fn swiglu_clamp_routed(
+    ctx: &Ctx,
+    packed: Tensor,
+    intermediate: u32,
+    weights: Tensor,
+    fan: u32,
+    limit: f32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mlp_swiglu_clamp_routed";
+    if packed.width != 2 * intermediate || y.width != intermediate || packed.rows != y.rows {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} x {} packed rows are not {} rows of {intermediate} gate and up columns into {} x {}",
+                packed.rows, packed.width, y.rows, y.rows, y.width
+            ),
+        ));
+    }
+    swiglu_clamp_lanes(ctx, OP, packed, None, Some(weights), fan, limit, y)
 }
 
 pub fn geglu_tanh(
@@ -225,13 +396,20 @@ pub fn geglu_tanh_packed(
     const OP: &str = "linear.mlp_geglu_tanh_packed";
     let t = dtype_dispatch!(OP, packed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
+    // Eight columns a thread where the halves and both planes take whole
+    // 16-byte runs: the same values, element for element.
+    let (entry, launch) =
+        if intermediate.is_multiple_of(8) && packed.ptr % 16 == 0 && y.ptr % 16 == 0 {
+            (
+                "mlp_geglu_tanh_packed_vec8",
+                elementwise_rows(OP, y.rows, y.width / 8)?,
+            )
+        } else {
+            ("mlp_geglu_tanh_packed", launch)
+        };
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!("::pie::linear::mlp_geglu_tanh_packed<{t}>")),
-        )
-        .apply(launch),
+        Fire::at(FILE, symbol(&format!("::pie::linear::{entry}<{t}>"))).apply(launch),
         &[
             packed.arg(),
             y.arg(),

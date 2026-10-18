@@ -1,4 +1,4 @@
-use eta_compiler::codegen::cuda::fused::emit_fused_region;
+use eta_compiler::codegen::cuda::emit_fused_region;
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
@@ -277,7 +277,7 @@ fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
         let name = format!("k{index}");
         if eta_compiler::codegen::cuda::order::is_order_region(stage, region) {
             order.push_str(
-                &eta_compiler::codegen::cuda::order::emit_order_region(&name, stage, region)
+                &eta_compiler::codegen::cuda::emit_order_region(&name, stage, region)
                     .expect("order emits"),
             );
         } else if region.row_value.is_some() {

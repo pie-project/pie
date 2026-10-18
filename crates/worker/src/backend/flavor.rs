@@ -2,7 +2,7 @@ use crate::config::EngineKind;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum Flavor {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "engine-cuda")]
     Cuda,
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     Metal,
@@ -17,7 +17,7 @@ pub enum Flavor {
 impl Flavor {
     pub fn as_str(self) -> &'static str {
         match self {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "engine-cuda")]
             Flavor::Cuda => "cuda",
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
             Flavor::Metal => "metal",
@@ -33,11 +33,11 @@ impl Flavor {
     pub fn from_kind(kind: EngineKind) -> Result<Self, String> {
         match kind {
             EngineKind::CudaNative => {
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "engine-cuda")]
                 {
                     Ok(Flavor::Cuda)
                 }
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "engine-cuda"))]
                 {
                     Err(missing_feature_msg("cuda_native", "cuda"))
                 }
@@ -102,7 +102,7 @@ fn non_apple_msg() -> String {
 }
 
 #[cfg(not(all(
-    feature = "cuda",
+    feature = "engine-cuda",
     feature = "metal",
     feature = "vulkan",
     feature = "wgpu",
@@ -125,7 +125,7 @@ fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
 pub fn compiled_summary() -> String {
     #[cfg_attr(
         not(any(
-            feature = "cuda",
+            feature = "engine-cuda",
             feature = "vulkan",
             feature = "wgpu",
             feature = "xla",
@@ -134,7 +134,7 @@ pub fn compiled_summary() -> String {
         allow(unused_mut, reason = "the pushes below are feature-gated")
     )]
     let mut out: Vec<&'static str> = Vec::new();
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "engine-cuda")]
     out.push("cuda");
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     out.push("metal");
@@ -149,7 +149,7 @@ pub fn compiled_summary() -> String {
 
 pub fn compiled_embedded() -> [(&'static str, bool); 5] {
     [
-        ("cuda_native", cfg!(feature = "cuda")),
+        ("cuda_native", cfg!(feature = "engine-cuda")),
         (
             "metal",
             cfg!(all(feature = "metal", target_vendor = "apple")),
@@ -162,7 +162,7 @@ pub fn compiled_embedded() -> [(&'static str, bool); 5] {
 
 pub fn default_flavor() -> Option<Flavor> {
     match runtime::engine::load::this_box()? {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "engine-cuda")]
         runtime::engine::load::Platform::Cuda => Some(Flavor::Cuda),
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         runtime::engine::load::Platform::Metal => Some(Flavor::Metal),

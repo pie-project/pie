@@ -8,14 +8,23 @@ pub struct StreamPlan {
     pub pairs: Vec<(u32, u32)>,
     pub events: u32,
     pub streams: u32,
+    /// The widest fire, in rows, a backend runs the side streams for; wider
+    /// ones walk every region on the main stream. 0: every fire.
+    pub forked_until: u32,
 }
 
-pub(crate) fn fork(trace: &Trace, regions: &mut [Region], profile: &DeviceProfile) -> StreamPlan {
+/// The regions forked onto side streams.
+pub(crate) fn fork_with(
+    trace: &Trace,
+    regions: &mut [Region],
+    profile: &DeviceProfile,
+) -> StreamPlan {
     if profile.side_streams == 0 || regions.len() < 3 {
         return StreamPlan {
             pairs: Vec::new(),
             events: 0,
             streams: 1,
+            forked_until: 0,
         };
     }
 
@@ -30,6 +39,7 @@ pub(crate) fn fork(trace: &Trace, regions: &mut [Region], profile: &DeviceProfil
         pairs: Vec::new(),
         events: 0,
         streams: 1,
+        forked_until: 0,
     };
     let mut at = 0usize;
     while at < regions.len() {
@@ -46,6 +56,185 @@ pub(crate) fn fork(trace: &Trace, regions: &mut [Region], profile: &DeviceProfil
     forks.pairs.sort_unstable();
     forks.pairs.dedup();
     forks
+}
+
+/// Every region list-scheduled by its dependencies and priced cost onto the
+/// main and `side_streams` side streams: a launchable region starts on the
+/// lane it can start soonest (the main one on ties, so scratch stays the main
+/// stream's), waiting on the last region it follows on each other lane; an
+/// unforkable region (and the last) runs on the main lane after every lane.
+///
+/// With `fixed` (each node's lane), a forkable region takes its first
+/// node's lane rather than choosing one.
+pub(crate) fn fork_dag(
+    trace: &Trace,
+    regions: &mut [Region],
+    profile: &DeviceProfile,
+    fixed: Option<&[u32]>,
+) -> StreamPlan {
+    let n = regions.len();
+    let mut plan = StreamPlan {
+        pairs: Vec::new(),
+        events: 0,
+        streams: 1,
+        forked_until: 0,
+    };
+    if profile.side_streams == 0 || n < 3 {
+        return plan;
+    }
+    plan.forked_until = profile.dag_streams_until;
+    let lanes = 1 + profile.side_streams as usize;
+    let touches = Touches::of(trace, regions, profile);
+    let ordered = closure(regions, &touches);
+    let costs: Vec<f32> = regions
+        .iter()
+        .map(|region| crate::lowering::region_us(trace, region, profile).max(0.5))
+        .collect();
+    let eligible: Vec<bool> = regions
+        .iter()
+        .enumerate()
+        .map(|(at, region)| forkable(region) && !touches.barrier[at])
+        .collect();
+
+    let mut finish = vec![0f32; n];
+    let mut free = vec![0f32; lanes];
+    let mut lane_of = vec![0usize; n];
+    let mut last: Vec<Option<usize>> = vec![None; lanes];
+    // `synced[l][t]`: the latest region of lane `t` lane `l` has waited past.
+    let mut synced: Vec<Vec<Option<usize>>> = vec![vec![None; lanes]; lanes];
+    // Each wait's source region, for the order below.
+    let mut sources: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for r in 0..n {
+        let mut ready = 0f32;
+        let mut need: Vec<Option<usize>> = vec![None; lanes];
+        for a in 0..r {
+            if !ordered.path(a, r) {
+                continue;
+            }
+            ready = ready.max(finish[a]);
+            let l = lane_of[a];
+            need[l] = Some(need[l].map_or(a, |held| held.max(a)));
+        }
+        let barrier = !eligible[r] || r + 1 == n;
+        let lane = if barrier {
+            0
+        } else if let Some(fixed) = fixed {
+            fixed
+                .get(regions[r].nodes.start as usize)
+                .map_or(0, |&l| (l as usize).min(lanes - 1))
+        } else {
+            let start = |l: usize| ready.max(free[l]);
+            (0..lanes)
+                .min_by(|&x, &y| start(x).total_cmp(&start(y)).then_with(|| x.cmp(&y)))
+                .unwrap_or(0)
+        };
+        if barrier {
+            for (t, held) in last.iter().enumerate() {
+                if let Some(a) = *held {
+                    need[t] = Some(need[t].map_or(a, |b| b.max(a)));
+                }
+            }
+        }
+        // A side lane's first region follows the main lane's last at least:
+        // its stream joins the fire there.
+        if lane != 0
+            && last[lane].is_none()
+            && (0..lanes).all(|t| t == lane || need[t].is_none())
+            && let Some(a) = last[0]
+        {
+            need[0] = Some(a);
+        }
+        for t in 0..lanes {
+            if t == lane {
+                continue;
+            }
+            let Some(a) = need[t] else { continue };
+            if synced[lane][t].is_some_and(|held| held >= a) {
+                continue;
+            }
+            let event = match regions[a].close {
+                Some(event) => event,
+                None => {
+                    let event = EventId(plan.events);
+                    plan.events += 1;
+                    regions[a].close = Some(event);
+                    event
+                }
+            };
+            regions[r].wait.push(event);
+            sources[r].push(a);
+            synced[lane][t] = Some(a);
+        }
+        let start = ready.max(free[lane]);
+        finish[r] = start + costs[r];
+        free[lane] = finish[r];
+        lane_of[r] = lane;
+        regions[r].stream = lane as u32;
+        last[lane] = Some(r);
+        plan.streams = plan.streams.max(lane as u32 + 1);
+    }
+
+    // Side by side: regions on different lanes neither orders (lane order
+    // and waits, transitively).
+    let words = n.div_ceil(64);
+    let mut before: Vec<Vec<u64>> = vec![vec![0u64; words]; n];
+    let mut prev: Vec<Option<usize>> = vec![None; lanes];
+    for r in 0..n {
+        let mut set = vec![0u64; words];
+        let add = |set: &mut Vec<u64>, a: usize, before: &Vec<Vec<u64>>| {
+            set[a / 64] |= 1 << (a % 64);
+            for (word, other) in set.iter_mut().zip(&before[a]) {
+                *word |= *other;
+            }
+        };
+        if let Some(p) = prev[lane_of[r]] {
+            add(&mut set, p, &before);
+        }
+        for &a in &sources[r] {
+            add(&mut set, a, &before);
+        }
+        before[r] = set;
+        prev[lane_of[r]] = Some(r);
+        for a in 0..r {
+            if lane_of[a] != lane_of[r] && before[r][a / 64] & (1 << (a % 64)) == 0 {
+                plan.pairs.push((a as u32, r as u32));
+            }
+        }
+    }
+    plan
+}
+
+/// Each node's lane as [`fork_dag`] schedules `regions` (a region an op).
+pub(crate) fn dag_lanes(
+    trace: &Trace,
+    regions: &mut [Region],
+    profile: &DeviceProfile,
+) -> (Vec<u32>, std::collections::BTreeSet<u32>) {
+    fork_dag(trace, regions, profile, None);
+    let mut lanes = vec![0u32; trace.nodes.len()];
+    // Where a coarser region must still break: where the lane changes,
+    // before a node that waits on another lane (a region waits at its start)
+    // and after one another lane waits on (a region closes at its end).
+    let mut breaks = std::collections::BTreeSet::new();
+    for region in regions.iter() {
+        for node in region.nodes.clone() {
+            if let Some(lane) = lanes.get_mut(node as usize) {
+                *lane = region.stream;
+            }
+        }
+        if !region.wait.is_empty() {
+            breaks.insert(region.nodes.start);
+        }
+        if region.close.is_some() {
+            breaks.insert(region.nodes.end);
+        }
+    }
+    for j in 1..lanes.len() {
+        if lanes[j] != lanes[j - 1] {
+            breaks.insert(j as u32);
+        }
+    }
+    (lanes, breaks)
 }
 
 fn seat(
@@ -117,7 +306,12 @@ fn group_at(regions: &[Region], ordered: &Ordered, at: usize) -> Option<core::op
 }
 
 fn forkable(region: &Region) -> bool {
-    region.launches() && region.lowering == Lowering::AlwaysLaunch
+    region.launches()
+        && region.lowering == Lowering::AlwaysLaunch
+        && region.stream == 0
+        && region.wait.is_empty()
+        && region.open.is_none()
+        && region.close.is_none()
 }
 
 fn candidates(regions: &[Region], ordered: &Ordered, a: usize, b: usize) -> bool {

@@ -240,3 +240,4 @@ tests/browser/languages/
 tests/browser/tools/package*.json
 crates/kernels-wgpu/tools/wgsl/
 scripts/bench/browser/results/*.raw
+.rocprofv3/

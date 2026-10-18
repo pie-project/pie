@@ -22,6 +22,10 @@ pub struct Reader {
 
 #[must_use]
 pub fn reads(op: &Operation) -> Option<Reader> {
+    // A sinked attention reads its cache as the attention inside it does.
+    if let Operation::Fused(poem_ir::Fused::LseSink { attn, .. }) = op {
+        return reads(&Operation::Attention((**attn).clone()));
+    }
     let Operation::Attention(op) = op else {
         return None;
     };

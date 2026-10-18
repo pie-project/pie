@@ -153,6 +153,8 @@ fn build_model(
                 backend_kind,
                 rs_cache_required: g.caps.pools.state_slots != 0,
                 rs_cache_slots: g.caps.pools.state_slots as usize,
+                one_frame_when_short: g.caps.pools.one_frame_when_short,
+                seated_first: g.caps.pools.seated_first,
                 rs_cache_slot_bytes: g.caps.pools.state_slot_bytes,
                 rs_host_slots: g.caps.pools.host_state_slots as usize,
                 rs_buffer_pages: g.caps.pools.buffer_pages,
@@ -169,6 +171,7 @@ fn build_model(
                 has_attn_score: g.caps.profile.has_attn_score,
                 has_lora: g.caps.profile.has_lora,
                 adapter_attachments: g.caps.adapter_attachments,
+                rs_snapshots: g.caps.rs_snapshots,
                 device_geometry_port_mask: g.caps.ports,
                 facts: g.caps.facts.clone(),
                 limits: runtime::engine::SchedulerLimits {

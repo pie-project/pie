@@ -173,7 +173,8 @@ impl<'a> Builder<'a> {
                     && !has_desc_use
                     && !has_host_put
                     && !st.seeded
-                    && st.seed.is_none();
+                    && st.seed.is_none()
+                    && !st.queued;
                 let seeded_latest_value_writer =
                     st.seeded && (has_desc_use || !st.prog_reads.is_empty()) && !has_prog_put;
                 let host_role = if (has_host_put || seeded_latest_value_writer) && !has_prog_put {

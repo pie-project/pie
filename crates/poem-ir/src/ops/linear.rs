@@ -3,11 +3,56 @@ use serde::{Deserialize, Serialize};
 use crate::operands::Operands;
 use crate::value::ValueId;
 
+/// The precision a product quantizes its bf16 activations to before reading
+/// a weight's codes: a property of the weight's deployment (`nvfp4a4`,
+/// `mxfp4a8`); activations stay bf16 between products.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ActQuant {
+    /// NVFP4: e2m1 under an e4m3 scale a 16, the scales under the static
+    /// global `1 / input_scale` the weight's `.input_scales` plane holds (one
+    /// an expert, or one for a projection).
+    Nvfp4,
+    /// e4m3 under a scale a `gran` (1x128 blocks, or 32). The engine picks
+    /// the scale's form: ue8m0 (`2^ceil(log2(amax / 448))`, DeepSeek's) or
+    /// f32 (`amax / 448`, transformers' and vLLM's against f32 weight
+    /// factors), whichever its matrix cores take.
+    E4m3 { gran: u32 },
+}
+
+impl ActQuant {
+    /// The K one scale covers.
+    #[must_use]
+    pub const fn gran(self) -> u32 {
+        match self {
+            Self::Nvfp4 => 16,
+            Self::E4m3 { gran } => gran,
+        }
+    }
+
+    /// Whether the scales sit under a static global the weight states.
+    #[must_use]
+    pub const fn global(self) -> bool {
+        matches!(self, Self::Nvfp4)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Linear {
     Matmul {
         act: ValueId,
         w: ValueId,
+        y: ValueId,
+    },
+    /// `act` quantized as `quant` states (under `input_scales`, the weight's
+    /// static global, when the format has one), then multiplied by `w`'s
+    /// codes at that precision; `scales` the weight's block scales when they
+    /// are a plane of their own beside raw codes (`fp8b128`).
+    MatmulActQuant {
+        act: ValueId,
+        w: ValueId,
+        quant: ActQuant,
+        input_scales: Option<ValueId>,
+        scales: Option<ValueId>,
         y: ValueId,
     },
     LmHead {
@@ -36,6 +81,27 @@ pub enum Linear {
     MlpSwigluClampSplit {
         gate: ValueId,
         up: ValueId,
+        limit: f32,
+        y: ValueId,
+    },
+    /// [`Linear::MlpSwigluClampSplit`] of routed rows, each row times its
+    /// route's weight before it rounds: DeepSeek's expert scales its
+    /// activations before its down leg quantizes them.
+    MlpSwigluClampSplitRouted {
+        gate: ValueId,
+        up: ValueId,
+        weights: ValueId,
+        limit: f32,
+        y: ValueId,
+    },
+    /// [`Linear::MlpSwigluClamp`] of routed rows (each row's `intermediate`
+    /// gate columns, then as many up columns), each row times its route's
+    /// f32 weight before it rounds: the packed form of
+    /// [`Linear::MlpSwigluClampSplitRouted`].
+    MlpSwigluClampRouted {
+        packed: ValueId,
+        intermediate: u32,
+        weights: ValueId,
         limit: f32,
         y: ValueId,
     },
@@ -166,9 +232,27 @@ pub enum Linear {
         routes: ValueId,
         y: ValueId,
     },
+    /// [`Linear::MoeMatmulSelectQuant`] whose activations are quantized as
+    /// `quant` states first, each route's under its expert's `input_scales`
+    /// when the format has a static global.
+    MoeMatmulSelectActQuant {
+        x: ValueId,
+        bank: ValueId,
+        routes: ValueId,
+        quant: ActQuant,
+        input_scales: Option<ValueId>,
+        y: ValueId,
+    },
     MoeWeightedSum {
         routed: ValueId,
         weights: ValueId,
+        y: ValueId,
+    },
+    /// Each token's routed rows (already weighted) summed in f32, plus its
+    /// `shared` row, rounded once.
+    MoeSumAdd {
+        routed: ValueId,
+        shared: ValueId,
         y: ValueId,
     },
     MoeBiasSum {
@@ -198,11 +282,28 @@ impl Operands for Linear {
     fn inputs(&self, sink: &mut Vec<ValueId>) {
         match self {
             Self::Matmul { act, w, .. } => sink.extend([*act, *w]),
+            Self::MatmulActQuant {
+                act,
+                w,
+                input_scales,
+                scales,
+                ..
+            } => {
+                sink.extend([*act, *w]);
+                sink.extend(*input_scales);
+                sink.extend(*scales);
+            }
             Self::LmHead { act, w, .. } => sink.extend([*act, *w]),
             Self::MlpSwiglu { packed, .. } => sink.push(*packed),
             Self::MlpSwigluClamp { packed, .. } => sink.push(*packed),
             Self::MlpSwigluClampAlpha { packed, .. } => sink.push(*packed),
             Self::MlpSwigluClampSplit { gate, up, .. } => sink.extend([*gate, *up]),
+            Self::MlpSwigluClampSplitRouted {
+                gate, up, weights, ..
+            } => sink.extend([*gate, *up, *weights]),
+            Self::MlpSwigluClampRouted {
+                packed, weights, ..
+            } => sink.extend([*packed, *weights]),
             Self::MlpGegluTanh { gate, up, .. } => sink.extend([*gate, *up]),
             Self::MlpGeluTanh { x, .. } => sink.push(*x),
             Self::MlpGegluTanhPacked { packed, .. } => sink.push(*packed),
@@ -257,9 +358,20 @@ impl Operands for Linear {
             Self::MoeMatmulSelectQuant {
                 x, bank, routes, ..
             } => sink.extend([*x, *bank, *routes]),
+            Self::MoeMatmulSelectActQuant {
+                x,
+                bank,
+                routes,
+                input_scales,
+                ..
+            } => {
+                sink.extend([*x, *bank, *routes]);
+                sink.extend(*input_scales);
+            }
             Self::MoeWeightedSum {
                 routed, weights, ..
             } => sink.extend([*routed, *weights]),
+            Self::MoeSumAdd { routed, shared, .. } => sink.extend([*routed, *shared]),
             Self::MoeBiasSum {
                 x,
                 bias,
@@ -292,11 +404,14 @@ impl Operands for Linear {
     fn outputs(&self, sink: &mut Vec<ValueId>) {
         match self {
             Self::Matmul { y, .. } => sink.push(*y),
+            Self::MatmulActQuant { y, .. } => sink.push(*y),
             Self::LmHead { y, .. } => sink.push(*y),
             Self::MlpSwiglu { y, .. } => sink.push(*y),
             Self::MlpSwigluClamp { y, .. } => sink.push(*y),
             Self::MlpSwigluClampAlpha { y, .. } => sink.push(*y),
             Self::MlpSwigluClampSplit { y, .. } => sink.push(*y),
+            Self::MlpSwigluClampSplitRouted { y, .. } => sink.push(*y),
+            Self::MlpSwigluClampRouted { y, .. } => sink.push(*y),
             Self::MlpGegluTanh { y, .. } => sink.push(*y),
             Self::MlpGeluTanh { y, .. } => sink.push(*y),
             Self::MlpGegluTanhPacked { y, .. } => sink.push(*y),
@@ -328,7 +443,9 @@ impl Operands for Linear {
             Self::MoeMatmulSelect { y, .. } => sink.push(*y),
             Self::MoeMatmulSelectBias { y, .. } => sink.push(*y),
             Self::MoeMatmulSelectQuant { y, .. } => sink.push(*y),
+            Self::MoeMatmulSelectActQuant { y, .. } => sink.push(*y),
             Self::MoeWeightedSum { y, .. } => sink.push(*y),
+            Self::MoeSumAdd { y, .. } => sink.push(*y),
             Self::MoeBiasSum { y, .. } => sink.push(*y),
             Self::MoeSigmoidGateAdd { y, .. } => sink.push(*y),
             Self::LoraCorrect { y_out, .. } => sink.push(*y_out),
@@ -338,11 +455,14 @@ impl Operands for Linear {
         match self {
             Self::LoraCorrect { y, y_out, .. } => sink.push((*y_out, *y)),
             Self::Matmul { .. }
+            | Self::MatmulActQuant { .. }
             | Self::LmHead { .. }
             | Self::MlpSwiglu { .. }
             | Self::MlpSwigluClamp { .. }
             | Self::MlpSwigluClampAlpha { .. }
             | Self::MlpSwigluClampSplit { .. }
+            | Self::MlpSwigluClampSplitRouted { .. }
+            | Self::MlpSwigluClampRouted { .. }
             | Self::MlpGegluTanh { .. }
             | Self::MlpGeluTanh { .. }
             | Self::MlpGegluTanhPacked { .. }
@@ -360,7 +480,9 @@ impl Operands for Linear {
             | Self::MoeMatmulSelect { .. }
             | Self::MoeMatmulSelectBias { .. }
             | Self::MoeMatmulSelectQuant { .. }
+            | Self::MoeMatmulSelectActQuant { .. }
             | Self::MoeWeightedSum { .. }
+            | Self::MoeSumAdd { .. }
             | Self::MoeBiasSum { .. }
             | Self::MoeSigmoidGateAdd { .. } => {}
         }
@@ -368,11 +490,14 @@ impl Operands for Linear {
     fn name(&self) -> &'static str {
         match self {
             Self::Matmul { .. } => "linear.matmul",
+            Self::MatmulActQuant { .. } => "linear.matmul_act_quant",
             Self::LmHead { .. } => "linear.lm_head",
             Self::MlpSwiglu { .. } => "linear.mlp_swiglu",
             Self::MlpSwigluClamp { .. } => "linear.mlp_swiglu_clamp",
             Self::MlpSwigluClampAlpha { .. } => "linear.mlp_swiglu_clamp_alpha",
             Self::MlpSwigluClampSplit { .. } => "linear.mlp_swiglu_clamp_split",
+            Self::MlpSwigluClampSplitRouted { .. } => "linear.mlp_swiglu_clamp_split_routed",
+            Self::MlpSwigluClampRouted { .. } => "linear.mlp_swiglu_clamp_routed",
             Self::MlpGegluTanh { .. } => "linear.mlp_geglu_tanh",
             Self::MlpGeluTanh { .. } => "linear.mlp_gelu_tanh",
             Self::MlpGegluTanhPacked { .. } => "linear.mlp_geglu_tanh_packed",
@@ -390,7 +515,9 @@ impl Operands for Linear {
             Self::MoeMatmulSelect { .. } => "linear.moe_matmul_select",
             Self::MoeMatmulSelectBias { .. } => "linear.moe_matmul_select_bias",
             Self::MoeMatmulSelectQuant { .. } => "linear.moe_matmul_select_quant",
+            Self::MoeMatmulSelectActQuant { .. } => "linear.moe_matmul_select_act_quant",
             Self::MoeWeightedSum { .. } => "linear.moe_weighted_sum",
+            Self::MoeSumAdd { .. } => "linear.moe_sum_add",
             Self::MoeBiasSum { .. } => "linear.moe_bias_sum",
             Self::MoeSigmoidGateAdd { .. } => "linear.moe_sigmoid_gate_add",
             Self::LoraCorrect { .. } => "linear.lora_correct",

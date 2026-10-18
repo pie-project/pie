@@ -100,6 +100,18 @@ impl Mismatch {
     }
 }
 
+/// A deployment's name without its `-kv-{kv}` segment.
+fn without_kv(name: &str) -> String {
+    match name.find("-kv-") {
+        Some(at) => {
+            let rest = &name[at + "-kv-".len()..];
+            let tail = rest.find('-').map_or("", |end| &rest[end..]);
+            format!("{}{tail}", &name[..at])
+        }
+        None => name.to_string(),
+    }
+}
+
 impl fmt::Display for Mismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -200,7 +212,13 @@ impl Stamp {
     pub fn check(&self, deployment: &Stamp) -> Result<(), Mismatch> {
         for field in Field::identity() {
             let (artifact, wanted) = (self.say(*field), deployment.say(*field));
-            if artifact != wanted {
+            // The kv a deployment caches at is the config's to choose: no
+            // plane of the artifact depends on it.
+            let same = match field {
+                Field::Deployment => without_kv(&artifact) == without_kv(&wanted),
+                _ => artifact == wanted,
+            };
+            if !same {
                 return Err(Mismatch {
                     field: *field,
                     artifact,

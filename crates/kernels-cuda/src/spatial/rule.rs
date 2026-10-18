@@ -114,13 +114,6 @@ pub fn derive_grid(
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::spatial::grid_rule").apply(Launch::grid([1, 1, 1], [32, 1, 1])),
-        &[
-            grid.arg(),
-            o_grid.arg(),
-            ArgValue::Bytes {
-                ptr: std::ptr::from_ref(&geom).cast(),
-                len: size_of::<Geom>(),
-            },
-        ],
+        &[grid.arg(), o_grid.arg(), ArgValue::of(&geom)],
     )
 }

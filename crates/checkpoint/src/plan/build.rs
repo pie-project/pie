@@ -21,7 +21,9 @@ use crate::types::{
     TensorDecl, TensorId, encoding_dense_element_bytes, encoding_nbytes,
 };
 
-const MAX_RUNS: usize = 1 << 20;
+/// The runs a copy list may hold: an NVFP4 bank's row tensor scales are one
+/// run a row (Qwen 3.8 Flash Next's 512-expert down bank is 1.3M of them).
+const MAX_RUNS: usize = 1 << 22;
 
 pub fn build(
     metadata: &Metadata,
@@ -287,13 +289,13 @@ impl Builder<'_> {
                     self.transform_with(payload, &decl, TileMapKind::Unary, Vec::new(), spec)?;
                 (value, decl)
             }
-            Expr::Cast { src, to } => {
+            Expr::Cast { src, to, chunks } => {
                 let operand = TensorDecl {
                     encoding: self.resolver.infer(src, &contract.name)?.encoding,
                     ..decl
                 };
                 let (value, _) = self.operand_bytes(src, &operand)?;
-                self.convert(value, operand, to)?
+                self.convert(value, operand, to, *chunks)?
             }
             Expr::Const { .. } => {
                 return Err(Error::Internal(
@@ -551,6 +553,7 @@ impl Builder<'_> {
         value: Value,
         decl: TensorDecl,
         to: &Encoding,
+        chunks: u32,
     ) -> Result<(Value, TensorDecl)> {
         let out = TensorDecl {
             encoding: to.clone(),
@@ -563,6 +566,7 @@ impl Builder<'_> {
                 TileMapKind::Cast,
                 TransformSpec {
                     to: Some(dtype_to_quant_marker(dtype)),
+                    fp8_chunks: chunks,
                     ..TransformSpec::default()
                 },
             )?,
@@ -585,7 +589,7 @@ impl Builder<'_> {
             }
             (Encoding::Raw(_), Encoding::Quant(target)) => {
                 let metadata = self.quant_metadata_outputs(&out)?;
-                self.encode(value, &out, target.scheme, &metadata)?
+                self.encode(value, &out, target.scheme, &metadata, chunks)?
             }
             (Encoding::Quant(_), Encoding::Quant(_)) => {
                 return Err(Error::Internal(
@@ -699,6 +703,7 @@ impl Builder<'_> {
         decl: &TensorDecl,
         scheme: QuantScheme,
         metadata: &[TensorDecl],
+        chunks: u32,
     ) -> Result<Value> {
         if metadata.is_empty() {
             return self.transform(
@@ -707,6 +712,7 @@ impl Builder<'_> {
                 TileMapKind::Encode,
                 TransformSpec {
                     to: Some(scheme),
+                    fp8_chunks: chunks,
                     ..TransformSpec::default()
                 },
             );
@@ -723,6 +729,7 @@ impl Builder<'_> {
         let transform = self.with_block_scale_source(
             TransformSpec {
                 to: Some(scheme),
+                fp8_chunks: chunks,
                 ..TransformSpec::default()
             },
             source.as_ref(),
@@ -997,12 +1004,7 @@ impl Builder<'_> {
     ) -> TransformSpec {
         transform.metadata_source = source.and_then(|source| {
             let raw = self.sources.tensor(source.tensor_id)?;
-            if !matches!(raw.encoding, Encoding::Raw(DType::E4m3)) {
-                return None;
-            }
-            self.sources
-                .by_name(&format!("{}_scale_inv", raw.name))
-                .map(|scale| scale.id)
+            self.sources.fp8_block_scale(raw).map(|scale| scale.id)
         });
         transform
     }
@@ -1259,7 +1261,7 @@ impl ScaleLayout {
                     zero_point_suffix: None,
                     naming: MetaNaming::Extend,
                     shape: crate::types::grouped_shape(lead, cols / 32),
-                    encoding: Encoding::Raw(DType::U8),
+                    encoding: Encoding::Raw(DType::E8m0),
                     granularity: QuantGranularity::PerGroup,
                     group_size: 32,
                     channel_axis: axis(lead.len()),

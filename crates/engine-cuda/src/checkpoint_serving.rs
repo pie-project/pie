@@ -396,6 +396,7 @@ mod tests {
                     dtype: poem_ir::Dtype::U8,
                     source: poem_ir::ParamSource::default(),
                     layout: poem_ir::ParamLayout::default(),
+                    placement: poem_ir::ParamPlacement::default(),
                 })
                 .collect(),
             caches: Vec::new(),

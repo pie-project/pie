@@ -270,10 +270,7 @@ pub fn conv3d_on(
             cache.map_or(ArgValue::ABSENT, |c| c.arg()),
             o.arg(),
             o_grid.arg(),
-            ArgValue::Bytes {
-                ptr: std::ptr::from_ref(&geom).cast(),
-                len: size_of::<Geom>(),
-            },
+            ArgValue::of(&geom),
         ],
     )
 }

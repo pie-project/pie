@@ -1,9 +1,18 @@
-use crate::store::rs::write::{RsPreparedWrite, RsPublished};
+use crate::store::rs::write::{RsPreparedWrite, RsPublished, RsSnapshot};
 use crate::store::rs::{RsGrant, RsSlotId, RsStore, RsUnits, RsWorkingSetId};
 
 #[derive(Debug)]
 pub struct RsTxn {
     published: RsPublished,
+}
+
+impl RsTxn {
+    /// The snapshots the fire was to land, which no checkpoint will take.
+    pub fn abandon(&self, store: &mut RsStore) {
+        for snap in self.published.snapshots() {
+            store.release_working_set(snap.snapshot);
+        }
+    }
 }
 
 pub fn validate_count(
@@ -49,6 +58,9 @@ pub struct GroupPlan {
     /// so nothing is buffered.
     pub writes: Option<std::ops::Range<u32>>,
     pub fold: GroupFold,
+    /// Rows of its one lane the fire lands the state as of, each in a slot
+    /// of its own (`Lane::rs_snapshots`).
+    pub snapshots: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +132,7 @@ pub fn demand(
                         .group_demand(ws, write_state, fresh, writes)
                         .map_err(|e| e.to_string())?,
                 );
+                total.slots += group.snapshots.len() as u32;
             }
         }
     }
@@ -140,6 +153,7 @@ pub struct PreparedRs {
     /// `(src, dst)` before the fire runs.
     pub window: Vec<Vec<u32>>,
     pub window_copies: Vec<(u32, u32)>,
+    pub snapshots: Vec<RsSnapshot>,
     pub txn: Option<RsTxn>,
 }
 
@@ -179,6 +193,16 @@ impl PreparedRs {
             if let Some(window) = self.window.get(row) {
                 lane.kv.window.clone_from(window);
             }
+        }
+        if let [lane] = request.lanes.as_mut_slice() {
+            lane.rs_snapshots = self
+                .snapshots
+                .iter()
+                .map(|snap| engine::fire::RsSnapshot {
+                    row: snap.row,
+                    slot: snap.slot.0,
+                })
+                .collect();
         }
         if let Some(lane) = request.lanes.first_mut()
             && !self.window_copies.is_empty()
@@ -310,9 +334,16 @@ pub fn prepare_many(
         let write = group
             .write(store, ws)
             .and_then(|(write_state, fresh, fold, writes)| {
-                store
+                let mut write = store
                     .prepare_group(ws, write_state, fresh, fold, writes, granted.as_deref_mut())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                if let Err(error) =
+                    store.prepare_snapshots(&mut write, &group.snapshots, granted.as_deref_mut())
+                {
+                    store.cancel_prepared(write);
+                    return Err(error.to_string());
+                }
+                Ok(write)
             });
         let write = match write {
             Ok(write) => write,
@@ -393,6 +424,7 @@ pub fn prepare_many(
     }
     note_reads(store, &published, &out);
     store.commit_folds(folds);
+    out.snapshots = published.snapshots().to_vec();
     out.txn = Some(RsTxn { published });
     Ok(out)
 }
@@ -403,6 +435,7 @@ pub fn prepare(store: &mut RsStore, ws: RsWorkingSetId, rows: u32) -> Result<Pre
         lanes: vec![0],
         writes: None,
         fold: GroupFold::Host(rows),
+        snapshots: Vec::new(),
     }]);
     prepare_many(store, &[ws], &plan, None)
 }
@@ -440,6 +473,7 @@ mod tests {
             lanes,
             writes: Some(writes),
             fold,
+            snapshots: Vec::new(),
         }])
     }
 

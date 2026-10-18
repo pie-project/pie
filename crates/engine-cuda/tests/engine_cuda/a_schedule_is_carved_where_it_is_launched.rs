@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "device")]
 
 use crate::common_dit::{Lcg, NAME, Rig, WIDTH, Weights, attach, bf, frame, lane};
 use engine::Engine;

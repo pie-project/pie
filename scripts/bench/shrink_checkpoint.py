@@ -294,6 +294,9 @@ class Plan:
     attn_res_block_size: int | None = None
     # drop the vision tower and flatten `text_cfg_key` to the top level
     text_only: bool = False
+    # DeepSeek-V4.1: keep the DSpark draft head (`mtp.{0,1,2}.*`), its
+    # experts carved as the trunk's, its target layers the last kept ones
+    dspark: bool = False
     # Router planes whose expert axis carries `sink` extra rows AFTER the
     # routed bank -- Inkling's `gate.weight` is `[256 routed + 2 shared,
     # hidden]`. The carve keeps the routed prefix and those trailing rows,
@@ -372,11 +375,15 @@ def _rewrite_dsv41(cfg: dict, plan: Plan) -> None:
     candidate source layers), the Engram modules and the DSpark head are all
     stated by layer id, so every list is re-indexed onto the kept layers and
     a kept layer that would read a dropped source is refused."""
+    stages = _text_cfg(cfg, plan).get("num_nextn_predict_layers") or 0
     _rewrite_common(cfg, plan)
     tc = _text_cfg(cfg, plan)
     remap = {src: i for i, src in enumerate(plan.src_layers)}
     if isinstance(tc.get("compress_ratios"), list):
-        tc["compress_ratios"] = _slice_list(tc["compress_ratios"], plan.src_layers)
+        # The DSpark stages' own ratios trail the trunk's, kept with them.
+        full = tc["compress_ratios"]
+        tail = full[len(full) - stages:] if plan.dspark and stages else []
+        tc["compress_ratios"] = _slice_list(full, plan.src_layers) + tail
     ratios = tc.get("compress_ratios") or []
 
     def kept(key: str) -> list[int]:
@@ -400,12 +407,28 @@ def _rewrite_dsv41(cfg: dict, plan: Plan) -> None:
     cand = tc.get("candidate_source_layer_id")
     if isinstance(cand, int):
         tc["candidate_source_layer_id"] = remap.get(cand, -1)
-    # DSpark is a separate bring-up: no draft stages, no target layers.
-    tc["num_nextn_predict_layers"] = 0
-    if "dspark_block_size" in tc:
-        tc["dspark_block_size"] = 0
-    if "dspark_target_layer_ids" in tc:
-        tc["dspark_target_layer_ids"] = []
+    targets = tc.get("dspark_target_layer_ids") or []
+    if plan.dspark and targets:
+        # The release taps its last decoder layers (37-39); the miniature's
+        # head taps its own last ones, as many: a fixture of the head's
+        # wiring and shapes, not of its trained acceptance.
+        n = len(targets)
+        if n > len(plan.src_layers):
+            raise SystemExit(f"deepseek_v41: DSpark taps {n} layers and {len(plan.src_layers)} are kept")
+        tc["dspark_target_layer_ids"] = list(range(len(plan.src_layers) - n, len(plan.src_layers)))
+        tc["num_nextn_predict_layers"] = stages
+        if plan.experts is not None and isinstance(tc.get("dspark_n_routed_experts"), int):
+            tc["dspark_n_routed_experts"] = min(tc["dspark_n_routed_experts"], plan.experts)
+            if isinstance(tc.get("dspark_num_experts_per_tok"), int):
+                tc["dspark_num_experts_per_tok"] = min(tc["dspark_num_experts_per_tok"],
+                                                       tc["dspark_n_routed_experts"])
+    else:
+        # Without `--dspark`: no draft stages, no target layers.
+        tc["num_nextn_predict_layers"] = 0
+        if "dspark_block_size" in tc:
+            tc["dspark_block_size"] = 0
+        if "dspark_target_layer_ids" in tc:
+            tc["dspark_target_layer_ids"] = []
     carve = plan.engram_carve
     if carve is not None:
         tc["engram_layer_ids"] = [remap[s] for s in carve.kept_src_layers]
@@ -1532,6 +1555,16 @@ def build_out_tensors(index: dict[str, str], plan: Plan,
                 if m and int(m.group(1)) >= plan.parts:
                     continue
             pairs.append((out_pfx + suffix, name))
+    if plan.dspark:
+        # The DSpark head's stages, their experts carved as a layer's.
+        for name in sorted(index):
+            if not name.startswith("mtp."):
+                continue
+            if plan.experts is not None and plan.expert_re is not None:
+                m = plan.expert_re.search(name)
+                if m and int(m.group(1)) >= plan.experts:
+                    continue
+            pairs.append((name, name))
     return pairs
 
 
@@ -1570,6 +1603,12 @@ def main() -> int:
                     help="DeepSeek-V4.1: re-carve each Engram hash table to this "
                          "bucket base (the release hashes at 16,000,000; a "
                          "miniature at 20,000 keeps ~480k of 384M rows per table)")
+    ap.add_argument("--dspark", action="store_true",
+                    help="DeepSeek-V4.1: keep the DSpark draft head (mtp.*), tapping the last kept layers")
+    ap.add_argument("--keep-fp8", action="store_true",
+                    help="DeepSeek-V4/V4.1: keep the fp8 planes as released, beside "
+                         "their `.scale` e8m0 exponents (the release format), rather "
+                         "than reading them out to bf16")
     ap.add_argument("--cache", default=None,
                     help="raw tensor cache dir (default: <out>/.srccache)")
     ap.add_argument("--keep-cache", action="store_true")
@@ -1607,6 +1646,7 @@ def main() -> int:
         text_cfg_key=fam.get("text_cfg_key"),
         attn_res_block_size=args.attn_res_block_size,
         text_only=args.text_only,
+        dspark=args.dspark,
         part_re=fam.get("part_re"),
         parts=parts or None,
         sink_suffixes=fam.get("sink_suffixes", ()),
@@ -1655,7 +1695,8 @@ def main() -> int:
     outs = assign_rows(pairs, src, plan)
     checks = apply_ple_carve(outs, src, plan)
     src_names = apply_engram_carve(outs, src, plan, weight_map, src_names)
-    outs = mark_fp8_readout(outs, plan)
+    if not args.keep_fp8:
+        outs = mark_fp8_readout(outs, plan)
     raw_total = sum(src[n].nbytes for n in src_names)
     total = sum(src[n].keep_bytes for n in src_names)
     if total < raw_total:
@@ -1996,6 +2037,9 @@ def assign_rows(pairs: list[tuple[str, str]], src: dict[str, SrcTensor],
         if router_rows is not None:
             tail = out_name.split(plan.layer_prefix, 1)[-1]
             tail = tail.split(".", 1)[-1] if "." in tail else tail
+            if src_name.startswith("mtp."):
+                # A DSpark stage's router, after its `mtp.<stage>.`.
+                tail = src_name.split(".", 2)[-1]
             if tail in plan.router_suffixes and t.shape and t.shape[0] > router_rows:
                 ot.rows = router_rows
             if tail in plan.sink_suffixes and t.shape and t.shape[0] > router_rows + plan.sink_rows:

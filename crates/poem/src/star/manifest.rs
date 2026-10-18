@@ -15,9 +15,9 @@ use starlark::values::none::NoneOr;
 use starlark::values::{NoSerialize, StarlarkValue, UnpackValue, Value};
 use starlark_derive::{starlark_module, starlark_value};
 
-use crate::Dtype;
 use crate::star::run::Deploy;
-use crate::star::values::{DtypeValue, word};
+use crate::star::values::{DtypeValue, precision, precision_word, word};
+use crate::{Dtype, Precision};
 
 /// A template: a format the runtime ships, with the settings it reads.
 #[derive(Clone, Debug, Default, PartialEq, Eq, ProvidesStaticType, NoSerialize, Allocative)]
@@ -287,9 +287,9 @@ impl Model {
             name.push('-');
             name.push_str(drafter);
         }
-        for dtype in &deploy.weights {
+        for stated in &deploy.weights {
             name.push('-');
-            name.push_str(&word(*dtype));
+            name.push_str(&precision_word(*stated));
         }
         name.push_str("-kv-");
         name.push_str(&word(deploy.kv));
@@ -321,7 +321,7 @@ impl Model {
             if word == "kv" {
                 break;
             }
-            weights.push(dtype_of(word)?);
+            weights.push(precision_of(word)?);
         }
         let kv = dtype_of(words.next()?)?;
         let tp = match words.next() {
@@ -344,6 +344,17 @@ impl Model {
 #[must_use]
 pub fn dtype_of(spelled: &str) -> Option<Dtype> {
     Dtype::ALL.iter().copied().find(|d| word(*d) == spelled)
+}
+
+/// The precision `spelled` names: a dtype, or a dtype whose products quantize
+/// their activations (`nvfp4a4`).
+#[must_use]
+pub fn precision_of(spelled: &str) -> Option<Precision> {
+    dtype_of(spelled).map(Precision::of).or_else(|| {
+        Precision::ACTED
+            .into_iter()
+            .find(|p| precision_word(*p) == spelled)
+    })
 }
 
 #[starlark_module]
@@ -440,7 +451,8 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
     }
 
     /// A deployment of the model `model`: its weights at `weights` (one
-    /// dtype, or a mixed recipe's banks in order), its kv at `kv`, with the
+    /// dtype, or a mixed recipe's banks in order, each a dtype or a precision
+    /// that quantizes its products' activations), its kv at `kv`, with the
     /// parts and the drafter it serves.
     fn deployment<'v>(
         #[starlark(require = pos)] model: String,
@@ -449,16 +461,15 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = UnpackList::default())] parts: UnpackList<String>,
         #[starlark(require = named, default = NoneOr::None)] drafter: NoneOr<String>,
     ) -> anyhow::Result<Listed> {
-        let weights = match weights.downcast_ref::<DtypeValue>() {
-            Some(one) => vec![one.0],
-            None => UnpackList::<Value<'v>>::unpack_value_err(weights)
+        let weights = match precision(weights) {
+            Ok(one) => vec![one],
+            Err(_) => UnpackList::<Value<'v>>::unpack_value_err(weights)
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .items
                 .into_iter()
                 .map(|w| {
-                    w.downcast_ref::<DtypeValue>()
-                        .map(|d| d.0)
-                        .ok_or_else(|| anyhow::anyhow!("weights are dtypes, not {}", w.get_type()))
+                    precision(w)
+                        .map_err(|_| anyhow::anyhow!("weights are dtypes, not {}", w.get_type()))
                 })
                 .collect::<anyhow::Result<_>>()?,
         };

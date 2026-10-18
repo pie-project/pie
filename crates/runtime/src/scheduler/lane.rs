@@ -426,6 +426,9 @@ impl Lane {
                         .cloned()
                         .unwrap_or_default();
                     if let Some(engine) = engine.as_mut() {
+                        if let Err(error) = engine.publish_landed() {
+                            tracing::error!(frame, step, %error, "publishing a landed step");
+                        }
                         for instance in instances {
                             if let Err(error) = channels.pump_out(engine.as_mut(), instance) {
                                 tracing::error!(frame, step, %error, "channel take after landing");

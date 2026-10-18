@@ -62,25 +62,100 @@ def boundaries(positions, row_valid, ratio, split = True):
     ppos, preq, prope = ops.attn.pool_boundary_prefill(positions.on(~one), row_valid, ratio)
     return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])
 
+# An e4m3 kv deployment keeps the window's plane and the compressed rows as
+# DeepSeek's fp8 rows (FlashMLA's fp8_ds_mla): 448 e4m3 codes and the 64
+# rotated dims in bf16 a position, with seven ue8m0 exponents (one a 64
+# codes) in each page's footer, 584 bytes a position in a u8 plane. The
+# index keys stay at bf16.
+DS_ROW = 584
+
+# An nvfp4 kv deployment keeps V4.1's caches as its reference quantizes
+# them: the window's plane as MXFP8 rows (all 512 dims e4m3 under one ue8m0
+# a 32, 528 bytes a position), the compressed rows as NVFP4 ones (e2m1 under
+# one e4m3 a 16, 288 bytes) and the index keys as FP4 ones (e2m1 under one
+# ue8m0 a 32, 68 bytes), its index queries read at FP4 against them.
+MX8_ROW = 528
+NV4_ROW = 288
+FP4_KEY_ROW = 68
+
+# The ratios whose pools pack their entries a row each: every page size a
+# deployment serves at is a multiple of them.
+COMPACT_RATIOS = [2, 4]
+
+def fp8_rows(m):
+    return m.kv == dtype.e4m3
+
+def fp4_rows(m):
+    return m.kv == dtype.nvfp4
+
 def caches(m, c):
-    kv = c.kv_space(m.kv)
+    fp8 = fp8_rows(m)
+    fp4 = fp4_rows(m)
+    rows = dtype.u8 if fp8 or fp4 else m.kv
+    keys = dtype.u8 if fp4 else dtype.bf16 if fp8 else m.kv
+
+    def row(at):
+        if fp8:
+            return [DS_ROW]
+        if fp4:
+            return [MX8_ROW]
+        return [at.kv_down.shape[0]]
+
+    # A pool compressing `ratio` positions into an entry keeps its entries
+    # compact, a row each: each position holds `1 / ratio` of a row (a page
+    # of positions `page / ratio` entries), where the ratio divides a page.
+    # A coarser pool (V4's 128) keeps a row a position, at each group's last.
+    def packed(width, ratio):
+        if ratio in COMPACT_RATIOS and width % ratio == 0:
+            return [width // ratio]
+        return [width]
+
+    # The window's plane is read only through its window: a windowed space,
+    # so a sequence keeps just its last `m.window` positions of it.
+    kv = c.kv_space(rows, m.window)
     for w in m.layers:
         at = w.attn
-        c.kv(kv, at.kv, [at.kv_down.shape[0]], m.head_dim, heads = at.kv_down.cut_axis != None)
+        c.kv(kv, at.kv, row(at), m.head_dim, heads = at.kv_down.cut_axis != None)
+        ratio = at.pool.ratio if at.pool != None else 1
         if at.pool != None and at.pool.owner:
-            pool = c.kv_space(m.kv)
-            c.kv(pool, at.pool.entries, [m.head_dim], m.head_dim)
+            pool = c.kv_space(rows)
+            entry = DS_ROW if fp8 else NV4_ROW if fp4 else m.head_dim
+            c.kv(pool, at.pool.entries, packed(entry, ratio), m.head_dim)
         if at.indexer != None and at.indexer.owns_keys:
-            index = c.kv_space(m.kv)
-            c.kv(index, at.indexer.keys, [at.indexer.head_dim], at.indexer.head_dim)
+            index = c.kv_space(keys)
+            key = FP4_KEY_ROW if fp4 else at.indexer.head_dim
+            c.kv(index, at.indexer.keys, packed(key, ratio), at.indexer.head_dim)
         if w.engram != None:
             c.state(w.engram.ids_state, [w.engram.ngram - 1], dtype.i32)
+    if m.decoder != None:
+        c.state(REPLAY, [1], dtype.i32)
     if m.mtp != None:
         at = m.mtp.block.attn
-        c.kv(kv, at.kv, [at.kv_down.shape[0]], m.head_dim, heads = at.kv_down.cut_axis != None)
+        c.kv(kv, at.kv, row(at), m.head_dim, heads = at.kv_down.cut_axis != None)
+    if m.dspark != None:
+        # A DSpark stage's window: the last `m.window` committed positions
+        # and the drafted block above them.
+        ds = m.dspark
+        space = c.kv_space(rows, m.window + ds.block)
+        for st in ds.stages:
+            at = st.attn
+            c.kv(space, at.kv, row(at), m.head_dim, heads = at.kv_down.cut_axis != None)
 
 # The dtype the forward computes in on every deployment.
 ACT = dtype.bf16
+
+# A causal encoder-decoder's bounded replay (V4.1): a long prompt's leading
+# rows may run through the encoder alone (`fact.encode()` lanes), the decoder
+# replaying its last window; its windows read no keys below a lane's floor.
+REPLAY = "replay"
+
+def replay_floor(inputs, positions):
+    """Each row's replay floor: an encoder-only lane's rows set it past
+    themselves, every other row reads its own."""
+    state = inputs.state(REPLAY)
+    skipped = fact.encode()
+    ops.attn.replay_floor(positions.on(skipped), state, True)
+    return ops.attn.replay_floor(positions.on(~skipped), state, False)
 
 # What a layer leaves the next: the last sublayer's input mix (under
 # Single-Pass mHC the next sublayer reads its input through it) and the
@@ -97,22 +172,42 @@ def kv_heads(m):
 
 def forward(m, inputs):
     hy = m.hyper
+    ds = m.dspark
+    # A DSpark deployment's drafted blocks run its stages alone: the trunk
+    # runs every other lane, its plans and tokens theirs.
+    trunk = inputs.on(~fact.block_draft()) if ds != None else inputs
     positions = inputs.positions()
     kvh = kv_heads(m)
-    plan = ops.attn.plan_prefill(inputs, m.heads, kvh, m.head_dim, m.window)
+    plan = ops.attn.plan_prefill(trunk, m.heads, kvh, m.head_dim, m.window)
     ids = inputs.tokens()
+    if ds != None:
+        ids = ids.on(~fact.block_draft())
     streams = ops.elemwise.hc_expand(ops.layout.embed(ids, m.embed, m.vocab), hy.streams)
     adapters = inputs.adapter_routes()
-    rows = struct(inputs = inputs, plan = plan, positions = positions, ids = ids, adapters = adapters, kv_heads = kvh)
+    floor = None
+    replay_plan = None
+    if m.decoder != None:
+        floor = replay_floor(inputs, positions.on(~fact.block_draft()) if ds != None else positions)
+        # The decoder's rows are its own classes': a plan of their own.
+        replayed = trunk.on(~fact.encode())
+        replay_plan = ops.attn.plan_prefill(replayed, m.heads, kvh, m.head_dim, m.window)
+    rows = struct(inputs = inputs, plan = plan, positions = positions, ids = ids, adapters = adapters,
+                  kv_heads = kvh, floor = floor, replay_plan = replay_plan)
 
     def block(l, w, carried):
-        streams, trail = carried
+        streams, trail, taps = carried
         if w.engram != None:
             streams = engram(streams, ids, inputs, m, w.engram)
+        if ds != None and l in ds.targets:
+            # DSpark reads its target layers' inputs, the streams averaged.
+            taps = taps + [summed(streams, m.hidden, hy.streams) * f32(1.0 / hy.streams)]
         following = m.layers[l + 1] if l + 1 < len(m.layers) else None
-        return layer(m, rows, w, streams, trail, following = following)
+        decoding = m.decoder != None and l >= m.decoder
+        streams, trail = layer(m, rows, w, streams, trail, following = following,
+                               narrow = m.decoder != None and l == m.decoder, replays = decoding)
+        return streams, trail, taps
 
-    streams, trail = inputs.fold_layers(m.layers, (streams, NO_TRAIL), block)
+    streams, trail, taps = inputs.fold_layers(m.layers, (streams, NO_TRAIL, []), block)
 
     if m.hc_head != None:
         y = collapse(streams, m.hc_head, hy)
@@ -121,11 +216,81 @@ def forward(m, inputs):
     else:
         y = summed(streams, m.hidden, hy.streams)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
+    ends = None
+    if ds != None:
+        dspark_keys(m, rows, taps)
+        # Each row's lane's last key: a drafted block's rows read the window
+        # that ends at the block's last, however its rows are laid out.
+        ends = ops.attn.kv_ends(inputs.request_of_token(), inputs.kv(ds.stages[0].attn.kv))
+        x = merge([dspark_block(m, inputs, rows, ends), x])
     x = ops.layout.gather_rows(x, inputs.readout_rows())
     logits = ops.linear.lm_head(x, m.head if m.head != None else m.embed)
     if m.mtp != None:
         draft(m, rows, streams, logits)
+    if ds != None:
+        logits = dspark_readout(m, inputs, logits, ends)
     return logits
+
+def dspark_keys(m, rows, taps):
+    """Each DSpark stage's window keys at the trunk's rows: its key
+    projection of the target layers' inputs, side by side, projected and
+    normed (`main_x`)."""
+    ds = m.dspark
+    hy = m.hyper
+    inputs = rows.inputs
+    main = ops.linear.matmul(ops.layout.concat_cols(taps), ds.main_proj)
+    main = ops.elemwise.rmsnorm(main, ds.main_norm, hy.norm_eps)
+    for st in ds.stages:
+        at = st.attn
+        plane = ops.linear.matmul(main, at.kv_down)
+        plane = ops.elemwise.rmsnorm(plane, at.kv_norm, at.kv_norm_eps)
+        plane = rope(plane, rows.positions, at.rope_dim, m.head_dim, at.theta, at.yarn)
+        ops.attn.kv_append_shared(plane, inputs.kv(at.kv), inputs.write_page(at.kv), inputs.write_offset(at.kv))
+
+def dspark_block(m, whole, rows, ends):
+    """A drafted block's rows (its anchor, then noise tokens) through the
+    DSpark stages: each row reads its stage's window and the whole block."""
+    ds = m.dspark
+    hy = m.hyper
+    drafted = whole.on(fact.block_draft())
+    ids = drafted.tokens()
+    streams = ops.elemwise.hc_expand(ops.layout.embed(ids, m.embed, m.vocab), hy.streams)
+    block_rows = struct(
+        inputs = drafted,
+        plan = None,
+        positions = drafted.positions(),
+        ids = ids,
+        adapters = rows.adapters,
+        kv_heads = rows.kv_heads,
+        floor = None,
+        replay_plan = None,
+        ends = ends.on(fact.block_draft()),
+    )
+    trail = NO_TRAIL
+    for st in ds.stages:
+        streams, trail = layer(m, block_rows, st, streams, trail)
+    y = premix(streams, trail.mix, m)
+    return ops.elemwise.rmsnorm(y, ds.norm, hy.norm_eps)
+
+def dspark_readout(m, inputs, logits, ends):
+    """States the DSpark head on the trace and plants its proposals: a
+    drafted block's logits through the Markov head, each row biased by the
+    token the row before it picked, and those picks."""
+    ds = m.dspark
+    drafting = fact.block_draft()
+    block_drafter(
+        logits,
+        rows = ds.block,
+        mask_token = ds.noise,
+        bidirectional = False,
+        proposals_from = 0,
+    )
+    read = lambda x: ops.layout.gather_rows(x, inputs.readout_rows()).on(drafting)
+    biased, picks = ops.attn.markov_walk(logits.on(drafting), read(inputs.tokens()), read(inputs.positions()),
+                                         read(ends), ds.markov_embed, ds.markov_head, ds.block)
+    seam.at(seam.MTP, [biased])
+    seam.at(seam.MTP_DRAFTS, [picks])
+    return merge([biased, logits.on(~drafting)])
 
 def draft(m, rows, streams, logits):
     """The MTP head's drafted token, from the trunk's last streams and the
@@ -154,6 +319,8 @@ def draft(m, rows, streams, logits):
         ids = token,
         adapters = rows.adapters,
         kv_heads = rows.kv_heads,
+        floor = None,
+        replay_plan = None,
     )
     out, _ = layer(m, draft_rows, mtp.block, fused, NO_TRAIL)
     y = ops.elemwise.rmsnorm(collapse(out, mtp.hc_head, hy), mtp.norm, mtp.norm_eps)
@@ -171,9 +338,12 @@ def rope(x, pos, rope_dim, head_dim, theta, scaling, inverse = False):
         )
     return ops.elemwise.rope_partial_last_yarn(x, pos, rope_dim, head_dim, theta, True, inverse, scaling)
 
-def layer(m, rows, w, streams, trail, following = None):
+def layer(m, rows, w, streams, trail, following = None, narrow = False, replays = False):
     """The layer `w` over `rows`, given the `trail` earlier layers left it:
-    the streams it leaves and its own trail."""
+    the streams it leaves and its own trail. With `narrow` (a causal
+    encoder-decoder's first decoder layer) its pool and index keys are
+    written for every row and the rest runs on the rows the decoder
+    replays; with `replays` its window reads nothing below `rows.floor`."""
     hy = m.hyper
     inputs = rows.inputs
     pos = rows.positions
@@ -185,11 +355,33 @@ def layer(m, rows, w, streams, trail, following = None):
     x, post_mix, comb_mix, mix = sublayer_input(streams, w.attn_mix, m, trail.mix)
     if w.attn_norm != None:
         x = ops.elemwise.rmsnorm(x, w.attn_norm, hy.norm_eps)
+    floor = rows.floor if replays else None
+    plan = rows.replay_plan if replays else rows.plan
+
+    if narrow:
+        p = at.pool
+        if p == None or not p.owner:
+            fail("a decoder's first layer writes the pool its layers read")
+        bpos, breq, brope = boundaries(pos, inputs.row_valid(), p.ratio)
+        pool_sources(m, inputs, at, x, pages, write_page, write_offset, bpos, breq, brope)
+        # Every later op of the decoder reads x or what it leads to: the
+        # rows of encoder-only lanes go no further.
+        x = x.on(~fact.encode())
+        if m.dspark != None:
+            # The streams are the trunk's lanes', not every lane's: they
+            # narrow with the rows explicitly.
+            replayed = ~fact.encode()
+            streams = streams.on(replayed)
+            post_mix = post_mix.on(replayed)
+            comb_mix = comb_mix.on(replayed)
+            if mix != None:
+                mix = struct(mixes = mix.mixes.on(replayed), scale = mix.scale, base = mix.base)
 
     q_a = ops.linear.matmul(x, at.q_down)
     q_a = ops.elemwise.rmsnorm(q_a, at.q_norm, at.q_norm_eps)
     q = ops.linear.matmul(q_a, at.q_up)
-    q = ops.elemwise.rmsnorm_no_scale(q, m.head_dim, at.q_norm_eps)
+    if at.q_head_norm:
+        q = ops.elemwise.rmsnorm_no_scale(q, m.head_dim, at.q_norm_eps)
     q = rope(q, pos, at.rope_dim, m.head_dim, at.theta, at.yarn)
     seam.at(seam.ATTN_Q, [q])
 
@@ -198,27 +390,20 @@ def layer(m, rows, w, streams, trail, following = None):
     plane = rope(plane, pos, at.rope_dim, m.head_dim, at.theta, at.yarn)
     ops.attn.kv_append_shared(plane, pages, write_page, write_offset)
 
-    o, lse = ops.attn.prefill_lse(q, rows.plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale)
-
     selection = trail.selection
     p = at.pool
     if p != None:
         entries = inputs.kv(p.entries)
         row_valid = inputs.row_valid()
         request_of_token = inputs.request_of_token()
-        bpos, breq, brope = boundaries(pos, row_valid, p.ratio)
+        # Each layer finds its own pool's boundaries (cheaper than holding
+        # them across layers). A CSA2 layer reading its source's pool closes none.
+        own_index = at.selection == "own" and at.indexer.compressor != None
+        if not narrow and (p.owner or own_index):
+            bpos, breq, brope = boundaries(pos, row_valid, p.ratio)
 
-        if p.owner:
-            latent = compress(m, x, p, pages, write_page, write_offset, bpos, breq)
-            ix = at.indexer
-            if ix != None and ix.wk != None:
-                # CSA2: the index keys are a projection of the compressed
-                # latent, taken before its rotation.
-                k = ops.elemwise.rmsnorm(ops.linear.matmul(latent, ix.wk), ix.k_norm, hy.norm_eps)
-                k = rope(k, brope, ix.rope_dim, ix.head_dim, ix.theta, ix.yarn)
-                ops.attn.pool_kv_append(k, bpos, breq, inputs.kv(ix.keys), inputs.write_page(ix.keys), inputs.write_offset(ix.keys))
-            pooled = rope(latent, brope, at.rope_dim, m.head_dim, at.theta, at.yarn)
-            ops.attn.pool_kv_append(pooled, bpos, breq, entries, inputs.write_page(p.entries), inputs.write_offset(p.entries))
+        if p.owner and not narrow:
+            pool_sources(m, inputs, at, x, pages, write_page, write_offset, bpos, breq, brope)
 
         if at.selection == "own":
             ix = at.indexer
@@ -230,14 +415,27 @@ def layer(m, rows, w, streams, trail, following = None):
             selection = struct(picked = picked, top_k = ix.top_k)
         elif at.selection == "shared" and selection == None:
             fail("a CSA2 Reuse Mode layer follows a layer that ranked")
+        # The window's attention runs beside the pool's, where a backend
+        # may land the two, their merge and the sinks as one.
+        o, lse = ops.attn.prefill_lse(q, plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale, floor)
         if at.selection != "none":
             po, plse = ops.attn.pool_lse_selected(q, pos, request_of_token, selection.picked, entries,
                                                   p.ratio, selection.top_k, m.heads, m.head_dim, at.sm_scale)
         else:
             po, plse = ops.attn.pool_lse(q, pos, request_of_token, entries, p.ratio, m.heads, m.head_dim, at.sm_scale)
         o, lse = ops.attn.merge_lse(o, lse, po, plse, m.heads, m.head_dim)
+    elif at.window_sink != None:
+        # A DSpark stage: every row of a block reads the window that ends
+        # at the block's last, the whole block bidirectionally, its sinks in.
+        o = ops.attn.window_sink(q, rows.ends, inputs.request_of_token(), pages, at.sink, at.window_sink,
+                                 m.head_dim, at.sm_scale)
+    else:
+        if floor != None:
+            fail("a replaying layer pools")
+        o, lse = ops.attn.prefill_lse(q, plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale)
 
-    o = ops.attn.sink(o, lse, at.sink, m.head_dim)
+    if at.window_sink == None:
+        o = ops.attn.sink(o, lse, at.sink, m.head_dim)
     o = rope(o, pos, at.rope_dim, m.head_dim, at.theta, at.yarn, inverse = True)
     seam.at(seam.ATTN_OUT, [o])
 
@@ -249,14 +447,37 @@ def layer(m, rows, w, streams, trail, following = None):
     o = ops.linear.matmul(o, at.o_up)
     adapted = fact.has(fact.Adapter)
     o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, rows.adapters, o.on(adapted))
+    if replays:
+        # The correction lands on every row it is read for: a replaying
+        # layer's, the decoder's (a DSpark deployment's trunk's).
+        if m.dspark != None:
+            o = o.on(~fact.block_draft())
+        o = o.on(~fact.encode())
     streams = ops.elemwise.hc_fold(o, streams, post_mix, comb_mix)
 
     x, post_mix, comb_mix, mix = sublayer_input(streams, w.mlp_mix, m, mix)
     if w.mlp_norm != None:
         x = ops.elemwise.rmsnorm(x, w.mlp_norm, hy.norm_eps)
-    f = mlp(x, rows.ids, w.mlp, streams, following, hy)
+    # The next layer's predicted experts, where the backend streams them.
+    f = mlp(x, rows.ids, w.mlp, streams, following if inputs.route_hints() else None, hy)
     streams = ops.elemwise.hc_fold(f, streams, post_mix, comb_mix)
     return streams, struct(mix = mix, selection = selection)
+
+def pool_sources(m, inputs, at, x, pages, write_page, write_offset, bpos, breq, brope):
+    """A pool owner's entries (and, under CSA2, its index keys) from `x`,
+    appended at the boundaries `bpos`."""
+    hy = m.hyper
+    p = at.pool
+    latent = compress(m, x, p, pages, write_page, write_offset, bpos, breq)
+    ix = at.indexer
+    if ix != None and ix.wk != None:
+        # CSA2: the index keys are a projection of the compressed
+        # latent, taken before its rotation.
+        k = ops.elemwise.rmsnorm(ops.linear.matmul(latent, ix.wk), ix.k_norm, hy.norm_eps)
+        k = rope(k, brope, ix.rope_dim, ix.head_dim, ix.theta, ix.yarn)
+        ops.attn.pool_kv_append(k, bpos, breq, inputs.kv(ix.keys), inputs.write_page(ix.keys), inputs.write_offset(ix.keys))
+    pooled = rope(latent, brope, at.rope_dim, m.head_dim, at.theta, at.yarn)
+    ops.attn.pool_kv_append(pooled, bpos, breq, inputs.kv(p.entries), inputs.write_page(p.entries), inputs.write_offset(p.entries))
 
 def compress(m, x, p, pages, write_page, write_offset, bpos, breq):
     c = p.compressor
@@ -353,6 +574,18 @@ def mlp(x, ids, f, streams, following, hy):
             return ops.linear.moe_matmul_select(act, bank, routes, f.top_k)
         return ops.linear.moe_matmul_select_quant(act, bank, routes, f.top_k)
 
+    if f.down.precision != f.down.dtype and f.gate_up.fused != None:
+        # The same over one packed gate-up bank: each expert's gate rows,
+        # then its up rows.
+        act = ops.linear.mlp_swiglu_clamp_routed(
+            select(x, f.gate_up.fused), f.inter, weights, f.limit)
+        return ops.linear.moe_sum_add(select(act, f.down), shared)
+    if f.down.precision != f.down.dtype and f.gate_up.fused == None:
+        # DeepSeek's expert weighs its activations before its down leg
+        # quantizes them, and sums its routes and the shared expert in f32.
+        act = ops.linear.mlp_swiglu_clamp_split_routed(
+            select(x, f.gate_up.gate), select(x, f.gate_up.up), weights, f.limit)
+        return ops.linear.moe_sum_add(select(act, f.down), shared)
     if f.gate_up.fused != None:
         act = ops.linear.mlp_swiglu_clamp(select(x, f.gate_up.fused), f.inter, f.limit)
     else:

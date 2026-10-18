@@ -57,21 +57,12 @@ fn check(boxes: &[Box3], c: usize, groups: usize, silu: bool) {
     }
 }
 
+/// Two lanes of different boxes norm separately, with and without the
+/// fused SiLU after the affine; a wide lane folds across its moment splits.
 #[test]
 fn the_group_norm_answers_the_cpu_reference_every_case() {
-    two_lanes_of_different_boxes_norm_separately();
-    the_fused_silu_follows_the_affine();
-    a_wide_lane_is_folded_across_its_moment_splits();
-}
-
-fn two_lanes_of_different_boxes_norm_separately() {
-    check(&[Box3::new(2, 4, 5), Box3::new(3, 3, 4)], 16, 4, false);
-}
-
-fn the_fused_silu_follows_the_affine() {
-    check(&[Box3::new(2, 4, 5), Box3::new(3, 3, 4)], 24, 8, true);
-}
-
-fn a_wide_lane_is_folded_across_its_moment_splits() {
+    let two = [Box3::new(2, 4, 5), Box3::new(3, 3, 4)];
+    check(&two, 16, 4, false);
+    check(&two, 24, 8, true);
     check(&[Box3::new(5, 40, 48), Box3::new(1, 8, 8)], 32, 8, true);
 }

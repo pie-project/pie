@@ -123,6 +123,7 @@ pub fn decode_selected(
     head_dim: u32,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
 ) -> Value {
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
@@ -136,6 +137,7 @@ pub fn decode_selected(
             head_dim,
             sm_scale,
             ratio,
+            per_head,
             o: o.id(),
         },
         &[q, plan, selection],
@@ -154,6 +156,7 @@ pub fn prefill_selected(
     kv_heads: u32,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
 ) -> Value {
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
@@ -168,6 +171,7 @@ pub fn prefill_selected(
             kv_heads,
             sm_scale,
             ratio,
+            per_head,
             o: o.id(),
         },
         &[q, plan, selection],
@@ -345,6 +349,7 @@ pub fn decode_lse(
     (o, lse)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prefill_lse(
     q: &Value,
     plan: &Value,
@@ -353,6 +358,7 @@ pub fn prefill_lse(
     head_dim: u32,
     kv_heads: u32,
     sm_scale: f32,
+    floor: Option<&Value>,
 ) -> (Value, Value) {
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
@@ -372,10 +378,32 @@ pub fn prefill_lse(
             sm_scale,
             o: o.id(),
             lse: lse.id(),
+            floor: floor.map(Value::id),
         },
-        &[q, plan],
+        &match floor {
+            Some(floor) => vec![q, plan, floor],
+            None => vec![q, plan],
+        },
     );
     (o, lse)
+}
+
+/// Bounded replay's floor (`attention.replay_floor`): with `mark` the rows
+/// of `positions` are ones a replaying layer skips, and their lane's state
+/// takes the position past them; without, each row's floor from its lane's.
+pub fn replay_floor(positions: &Value, state: ValueId, mark: bool) -> Value {
+    let r = positions.rec();
+    let floor = r.fresh(positions.ty().clone());
+    r.push(
+        Attention::ReplayFloor {
+            positions: positions.id(),
+            state,
+            mark,
+            floor: floor.id(),
+        },
+        &[positions],
+    );
+    floor
 }
 
 pub fn sink(o: &Value, lse: &Value, sink: &Weight, head_dim: u32) -> Value {
@@ -576,6 +604,86 @@ pub fn block_dyn_conv(
         &[x, coeff],
     );
     y
+}
+
+/// Each row's lane's last key position in `pages` (`attention.kv_ends`).
+pub fn kv_ends(request_of_token: &Value, pages: ValueId) -> Value {
+    let r = request_of_token.rec();
+    let ends = r.fresh(tensor(request_of_token.rows(), 1u64, Dtype::I32));
+    r.push(
+        Attention::KvEnds {
+            request_of_token: request_of_token.id(),
+            cache: pages,
+            ends: ends.id(),
+        },
+        &[request_of_token],
+    );
+    ends
+}
+
+/// DeepSeek's window attention with its sinks, each row reading the
+/// `window` positions that end at its `positions` (`attention.window_sink`).
+#[allow(clippy::too_many_arguments)]
+pub fn window_sink(
+    q: &Value,
+    positions: &Value,
+    request_of_token: &Value,
+    pages: ValueId,
+    sink: &Weight,
+    window: u32,
+    head_dim: u32,
+    sm_scale: f32,
+) -> Value {
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    r.push(
+        Attention::WindowSink {
+            q: q.id(),
+            positions: positions.id(),
+            request_of_token: request_of_token.id(),
+            cache: pages,
+            sink: r.weight(sink),
+            window,
+            head_dim,
+            sm_scale,
+            o: o.id(),
+        },
+        &[q, positions, request_of_token],
+    );
+    o
+}
+
+/// DSpark's Markov head over a drafted block's readouts
+/// (`attention.markov_walk`): the logits as biased, each row by the token
+/// the row before it picked, and each row's pick (i32).
+#[allow(clippy::too_many_arguments)]
+pub fn markov_walk(
+    logits: &Value,
+    tokens: &Value,
+    positions: &Value,
+    ends: &Value,
+    embed: &Weight,
+    head: &Weight,
+    block: u32,
+) -> (Value, Value) {
+    let r = logits.rec();
+    let biased = r.fresh(logits.ty().clone());
+    let picks = r.fresh(tensor(logits.rows(), 1u64, Dtype::I32));
+    r.push(
+        Attention::MarkovWalk {
+            logits: logits.id(),
+            tokens: tokens.id(),
+            positions: positions.id(),
+            ends: ends.id(),
+            embed: r.weight(embed),
+            head: r.weight(head),
+            block,
+            biased: biased.id(),
+            picks: picks.id(),
+        },
+        &[logits, tokens, positions, ends],
+    );
+    (biased, picks)
 }
 
 pub fn selector_walk(
@@ -833,12 +941,24 @@ pub fn mla_plan(inputs: &Input, heads: u32, kv_lora_rank: u32) -> Value {
     plan
 }
 
+/// The rope part of a `kv_a` row past its `kv_lora_rank` latent.
+fn rope_width(kv_a: &Value, kv_lora_rank: u32) -> u64 {
+    kv_a.width()
+        .checked_sub(u64::from(kv_lora_rank))
+        .unwrap_or_else(|| {
+            panic!(
+                "a {}-wide kv_a row holds no {kv_lora_rank}-wide latent",
+                kv_a.width()
+            )
+        })
+}
+
 pub fn mla_latents(kv_a: &Value, norm: &Weight, eps: f32, kv_lora_rank: u32) -> (Value, Value) {
     let r = kv_a.rec();
     let kv_c = r.fresh(tensor(kv_a.rows(), kv_lora_rank, kv_a.dtype()));
     let k_pe = r.fresh(tensor(
         kv_a.rows(),
-        kv_a.width() - u64::from(kv_lora_rank),
+        rope_width(kv_a, kv_lora_rank),
         kv_a.dtype(),
     ));
     r.push(
@@ -868,7 +988,7 @@ pub fn mla_latents_rope(
     let kv_c = r.fresh(tensor(kv_a.rows(), kv_lora_rank, kv_a.dtype()));
     let k_pe = r.fresh(tensor(
         kv_a.rows(),
-        kv_a.width() - u64::from(kv_lora_rank),
+        rope_width(kv_a, kv_lora_rank),
         kv_a.dtype(),
     ));
     r.push(
@@ -987,6 +1107,84 @@ pub fn mla_kv_append(
     );
 }
 
+/// The scores of a latent attention, and with `with_lse` the base-2
+/// log-sum-exp of each row's heads beside them.
+#[allow(clippy::too_many_arguments)]
+fn mla_scored(
+    q: &Value,
+    plan: &Value,
+    q_pe: &Value,
+    selection: Option<&Value>,
+    pages: ValueId,
+    heads: u32,
+    kv_lora_rank: u32,
+    sm_scale: f32,
+    decode: bool,
+    with_lse: bool,
+    window: Option<u32>,
+) -> (Value, Option<Value>) {
+    let r = q.rec();
+    let width = u64::from(heads) * u64::from(kv_lora_rank);
+    let o = r.fresh(tensor(q.rows(), width, q.dtype()));
+    let lse = with_lse.then(|| r.fresh(tensor(q.rows(), heads, Dtype::F32)));
+    let (q_id, plan_id, q_pe_id, o_id) = (q.id(), plan.id(), q_pe.id(), o.id());
+    let lse_id = lse.as_ref().map(Value::id);
+    let op = match (selection, decode) {
+        (None, true) => Attention::MlaDecode {
+            q: q_id,
+            plan: plan_id,
+            q_pe: q_pe_id,
+            cache: pages,
+            window,
+            heads,
+            kv_lora_rank,
+            sm_scale,
+            o: o_id,
+            lse: lse_id,
+        },
+        (None, false) => Attention::MlaPrefill {
+            q: q_id,
+            plan: plan_id,
+            q_pe: q_pe_id,
+            cache: pages,
+            window,
+            heads,
+            kv_lora_rank,
+            sm_scale,
+            o: o_id,
+            lse: lse_id,
+        },
+        (Some(selection), true) => Attention::MlaDecodeSelected {
+            q: q_id,
+            plan: plan_id,
+            q_pe: q_pe_id,
+            selection: selection.id(),
+            cache: pages,
+            heads,
+            kv_lora_rank,
+            sm_scale,
+            o: o_id,
+            lse: lse_id,
+        },
+        (Some(selection), false) => Attention::MlaPrefillSelected {
+            q: q_id,
+            plan: plan_id,
+            q_pe: q_pe_id,
+            selection: selection.id(),
+            cache: pages,
+            heads,
+            kv_lora_rank,
+            sm_scale,
+            o: o_id,
+            lse: lse_id,
+        },
+    };
+    let mut deps = vec![q, plan, q_pe];
+    deps.extend(selection);
+    r.push(op, &deps);
+    (o, lse)
+}
+
 pub fn mla_decode(
     q: &Value,
     plan: &Value,
@@ -995,24 +1193,22 @@ pub fn mla_decode(
     heads: u32,
     kv_lora_rank: u32,
     sm_scale: f32,
+    window: Option<u32>,
 ) -> Value {
-    let r = q.rec();
-    let width = u64::from(heads) * u64::from(kv_lora_rank);
-    let o = r.fresh(tensor(q.rows(), width, q.dtype()));
-    r.push(
-        Attention::MlaDecode {
-            q: q.id(),
-            plan: plan.id(),
-            q_pe: q_pe.id(),
-            cache: pages,
-            heads,
-            kv_lora_rank,
-            sm_scale,
-            o: o.id(),
-        },
-        &[q, plan, q_pe],
-    );
-    o
+    mla_scored(
+        q,
+        plan,
+        q_pe,
+        None,
+        pages,
+        heads,
+        kv_lora_rank,
+        sm_scale,
+        true,
+        false,
+        window,
+    )
+    .0
 }
 
 pub fn mla_prefill(
@@ -1023,26 +1219,25 @@ pub fn mla_prefill(
     heads: u32,
     kv_lora_rank: u32,
     sm_scale: f32,
+    window: Option<u32>,
 ) -> Value {
-    let r = q.rec();
-    let width = u64::from(heads) * u64::from(kv_lora_rank);
-    let o = r.fresh(tensor(q.rows(), width, q.dtype()));
-    r.push(
-        Attention::MlaPrefill {
-            q: q.id(),
-            plan: plan.id(),
-            q_pe: q_pe.id(),
-            cache: pages,
-            heads,
-            kv_lora_rank,
-            sm_scale,
-            o: o.id(),
-        },
-        &[q, plan, q_pe],
-    );
-    o
+    mla_scored(
+        q,
+        plan,
+        q_pe,
+        None,
+        pages,
+        heads,
+        kv_lora_rank,
+        sm_scale,
+        false,
+        false,
+        window,
+    )
+    .0
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn mla_decode_selected(
     q: &Value,
     plan: &Value,
@@ -1053,26 +1248,23 @@ pub fn mla_decode_selected(
     kv_lora_rank: u32,
     sm_scale: f32,
 ) -> Value {
-    let r = q.rec();
-    let width = u64::from(heads) * u64::from(kv_lora_rank);
-    let o = r.fresh(tensor(q.rows(), width, q.dtype()));
-    r.push(
-        Attention::MlaDecodeSelected {
-            q: q.id(),
-            plan: plan.id(),
-            q_pe: q_pe.id(),
-            selection: selection.id(),
-            cache: pages,
-            heads,
-            kv_lora_rank,
-            sm_scale,
-            o: o.id(),
-        },
-        &[q, plan, q_pe, selection],
-    );
-    o
+    mla_scored(
+        q,
+        plan,
+        q_pe,
+        Some(selection),
+        pages,
+        heads,
+        kv_lora_rank,
+        sm_scale,
+        true,
+        false,
+        None,
+    )
+    .0
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn mla_prefill_selected(
     q: &Value,
     plan: &Value,
@@ -1083,24 +1275,136 @@ pub fn mla_prefill_selected(
     kv_lora_rank: u32,
     sm_scale: f32,
 ) -> Value {
-    let r = q.rec();
-    let width = u64::from(heads) * u64::from(kv_lora_rank);
-    let o = r.fresh(tensor(q.rows(), width, q.dtype()));
-    r.push(
-        Attention::MlaPrefillSelected {
-            q: q.id(),
-            plan: plan.id(),
-            q_pe: q_pe.id(),
-            selection: selection.id(),
-            cache: pages,
-            heads,
-            kv_lora_rank,
-            sm_scale,
-            o: o.id(),
-        },
-        &[q, plan, q_pe, selection],
-    );
-    o
+    mla_scored(
+        q,
+        plan,
+        q_pe,
+        Some(selection),
+        pages,
+        heads,
+        kv_lora_rank,
+        sm_scale,
+        false,
+        false,
+        None,
+    )
+    .0
+}
+
+/// `mla_decode` with each row's per-head log-sum-exp beside its scores, for a
+/// sink to rescale them by.
+pub fn mla_decode_lse(
+    q: &Value,
+    plan: &Value,
+    q_pe: &Value,
+    pages: ValueId,
+    heads: u32,
+    kv_lora_rank: u32,
+    sm_scale: f32,
+    window: Option<u32>,
+) -> (Value, Value) {
+    lse_of(mla_scored(
+        q,
+        plan,
+        q_pe,
+        None,
+        pages,
+        heads,
+        kv_lora_rank,
+        sm_scale,
+        true,
+        true,
+        window,
+    ))
+}
+
+/// `mla_prefill` with each row's per-head log-sum-exp beside its scores.
+pub fn mla_prefill_lse(
+    q: &Value,
+    plan: &Value,
+    q_pe: &Value,
+    pages: ValueId,
+    heads: u32,
+    kv_lora_rank: u32,
+    sm_scale: f32,
+    window: Option<u32>,
+) -> (Value, Value) {
+    lse_of(mla_scored(
+        q,
+        plan,
+        q_pe,
+        None,
+        pages,
+        heads,
+        kv_lora_rank,
+        sm_scale,
+        false,
+        true,
+        window,
+    ))
+}
+
+/// `mla_decode_selected` with each row's per-head log-sum-exp beside its
+/// scores.
+#[allow(clippy::too_many_arguments)]
+pub fn mla_decode_selected_lse(
+    q: &Value,
+    plan: &Value,
+    q_pe: &Value,
+    selection: &Value,
+    pages: ValueId,
+    heads: u32,
+    kv_lora_rank: u32,
+    sm_scale: f32,
+) -> (Value, Value) {
+    lse_of(mla_scored(
+        q,
+        plan,
+        q_pe,
+        Some(selection),
+        pages,
+        heads,
+        kv_lora_rank,
+        sm_scale,
+        true,
+        true,
+        None,
+    ))
+}
+
+/// `mla_prefill_selected` with each row's per-head log-sum-exp beside its
+/// scores.
+#[allow(clippy::too_many_arguments)]
+pub fn mla_prefill_selected_lse(
+    q: &Value,
+    plan: &Value,
+    q_pe: &Value,
+    selection: &Value,
+    pages: ValueId,
+    heads: u32,
+    kv_lora_rank: u32,
+    sm_scale: f32,
+) -> (Value, Value) {
+    lse_of(mla_scored(
+        q,
+        plan,
+        q_pe,
+        Some(selection),
+        pages,
+        heads,
+        kv_lora_rank,
+        sm_scale,
+        false,
+        true,
+        None,
+    ))
+}
+
+fn lse_of((o, lse): (Value, Option<Value>)) -> (Value, Value) {
+    (
+        o,
+        lse.expect("a scoring asked for its log-sum-exp lands one"),
+    )
 }
 
 pub fn index_layernorm_rope(
@@ -1164,9 +1468,16 @@ pub fn index_topk(
     head_dim: u32,
     top_k: u32,
     ratio: u32,
+    score: IndexScore,
 ) -> Value {
     let r = q.rec();
-    let selection = r.fresh(tensor(q.rows(), top_k, Dtype::I32));
+    // A block-max ranking selects for each head on its own.
+    let width = match score {
+        IndexScore::Pooled => top_k,
+        IndexScore::BlockMax => heads * top_k,
+        IndexScore::PooledTokens => top_k * ratio.max(1) + ratio.max(1) - 1,
+    };
+    let selection = r.fresh(tensor(q.rows(), width, Dtype::I32));
     let mut deps = vec![q];
     deps.extend(weights);
     r.push(
@@ -1178,6 +1489,7 @@ pub fn index_topk(
             head_dim,
             top_k,
             ratio,
+            score,
             selection: selection.id(),
         },
         &deps,

@@ -15,6 +15,11 @@ Any other `.poem` file is a helper the stages may `load()`; `lib/` holds
 the helpers every package may load, as `//lib/…`.
 
 A deployment is named `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-tp{n}]`.
+Each of its weights is a dtype or a precision: a stored dtype whose products
+quantize their activations, spelled with what they quantize to (`nvfp4a4`,
+NVFP4 codes against NVFP4 activations; `mxfp4a8`, MXFP4 codes against e4m3
+in 1x128 blocks). A weight declared at a precision stores its dtype's planes
+and its products run on CUDA's tcgen05 GEMMs, refused where there are none.
 
 ## What a model says of its tokens
 
@@ -22,10 +27,10 @@ A model is spoken through a template and a tokenizer, both stated as data in
 `package.poem`, so no Rust names a model:
 
 - `template(format, …)` picks a format the runtime ships (`chatml`, `harmony`,
-  `gemma`, `deepseek`, `glm`, `kimi`, `kimi3`, `inkling`, `atem`, `lines`,
-  `raw`) and sets what the format leaves open: ChatML its `thinking`,
+  `gemma`, `deepseek`, `dots`, `glm`, `kimi`, `kimi3`, `inkling`, `atem`, `mimo`, `minimax`,
+  `hy`, `lines`, `raw`) and sets what the format leaves open: ChatML its `thinking`,
   `preserve_thinking`, `tools`, `generation_suffix` and `stop`; `lines` its
-  `stop`, `bos` and `eos`; `raw` its `stop`. A setting the format does not
+  `stop`, `bos` and `eos`; `raw` its `stop`; `hy` its `thinking`. A setting the format does not
   read is refused.
 - `tokenizer(markers, pinned, parts)` states what the model asks of the
   tokenizer an artifact carries: `markers`, groups of tokens the vocabulary

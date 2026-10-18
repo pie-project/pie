@@ -97,6 +97,50 @@ fn rms_row(
     )?;
     let launch = rows_per_head(op, y.rows, y.width, per_head_dim)?;
     let heads = stated(op, per_head_split(y.width, per_head_dim))?;
+    let width = if per_head_dim == 0 {
+        y.width
+    } else {
+        per_head_dim
+    };
+    if ctx.tuning().rows_vec
+        && (width == 128 || width == 256)
+        && [x.ptr, weight.ptr, y.ptr].iter().all(|&at| aligned16(at))
+    {
+        let units = y
+            .rows
+            .checked_mul(per_head_split(y.width, per_head_dim))
+            .ok_or_else(|| {
+                refuse(
+                    op,
+                    format!(
+                        "{} rows of {} heads overflow a grid",
+                        y.rows,
+                        y.width / width
+                    ),
+                )
+            })?;
+        let plus_one = template == OFFSET_BANK;
+        return ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_in_warp<{t}, {}, {plus_one}>",
+                    width / 32
+                )),
+            )
+            .apply(Launch::grid([units.div_ceil(8), 1, 1], [BLOCK, 1, 1])),
+            &[
+                x.arg(),
+                weight.arg(),
+                y.arg(),
+                stated(op, units)?.arg(),
+                eps.arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         op,
         Fire::at(
@@ -196,6 +240,89 @@ pub fn rmsnorm_per_head_plus_one(
     )
 }
 
+/// The norm [`norm_gate`] lands beside its output: `y = rmsnorm(out) *
+/// weight` (`1 + weight` where `plus_one`).
+#[derive(Clone, Copy)]
+pub struct Next {
+    pub weight: Tensor,
+    pub eps: f32,
+    pub plus_one: bool,
+    pub y: Tensor,
+}
+
+/// Muse Spark's post-norm and residual gate (`elementwise.norm_gate`): a
+/// row's `x` times `scale` (rounded), RMS-normed unscaled (rounded), and with
+/// `res` and its f32 `gate` the residual's gated sum; with `next`, the next
+/// sublayer's input norm over it in the same pass.
+#[allow(clippy::too_many_arguments)]
+pub fn norm_gate(
+    ctx: &Ctx,
+    x: Tensor,
+    scale: Option<Tensor>,
+    res: Option<Tensor>,
+    gate: Option<Tensor>,
+    eps: f32,
+    temperature: f32,
+    fan: u32,
+    next: Option<Next>,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.norm_gate";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    if res.is_some() != gate.is_some() || gate.is_some_and(|g| g.dtype != Dtype::F32) {
+        return Err(refuse(OP, "a residual comes with its f32 gate"));
+    }
+    let rows = nonzero(OP, "rows", y.rows)?;
+    let absent = |t: Option<Tensor>| t.map_or(crate::jit::ArgValue::ABSENT, |t| t.arg());
+    // A 16-byte run a thread, the row in the block's registers.
+    let threads = y.width / 8;
+    let planes = [
+        Some(x),
+        scale,
+        res,
+        gate,
+        Some(*y),
+        next.map(|n| n.weight),
+        next.map(|n| n.y),
+    ];
+    if !y.width.is_multiple_of(8)
+        || !threads.is_power_of_two()
+        || !(32..=1024).contains(&threads)
+        || !planes.into_iter().flatten().all(|t| aligned16(t.ptr))
+    {
+        return Err(refuse(
+            OP,
+            "a row of 256 to 8192 elements, a power of two, 16-byte aligned",
+        ));
+    }
+    let tail = next.is_some();
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::norm_gate<{t}, {threads}, {tail}>"
+            )),
+        )
+        .apply(Launch::per_row(rows, threads)),
+        &[
+            x.arg(),
+            absent(scale),
+            absent(res),
+            absent(gate),
+            y.arg(),
+            eps.arg(),
+            temperature.arg(),
+            stated(OP, fan)?.arg(),
+            absent(next.map(|n| n.weight)),
+            next.map_or(0.0, |n| n.eps).arg(),
+            i32::from(next.is_some_and(|n| n.plus_one)).arg(),
+            absent(next.map(|n| n.y)),
+            ctx.stage(),
+        ],
+    )
+}
+
 pub fn rmsnorm_no_scale(
     ctx: &Ctx,
     x: Tensor,
@@ -215,6 +342,74 @@ pub fn rmsnorm_no_scale(
     )?;
     let launch = rows_per_head(OP, y.rows, y.width, head_dim)?;
     let heads = stated(OP, per_head_split(y.width, head_dim))?;
+    // A warp a head over 16-byte runs, where the head is whole 256-element
+    // runs (DeepSeek-V4's 512-wide q heads); 8 or 16 lanes a 64- or 128-wide
+    // one (Muse Spark's).
+    let lanes = (hidden / 8).min(32);
+    if ctx.tuning().rows_vec
+        && hidden % (8 * lanes) == 0
+        && matches!(lanes, 8 | 16 | 32)
+        && (1..=4).contains(&(hidden / (8 * lanes)))
+        && [x.ptr, y.ptr].iter().all(|&at| aligned16(at))
+    {
+        let units = y
+            .rows
+            .checked_mul(per_head_split(y.width, head_dim))
+            .ok_or_else(|| refuse(OP, format!("{} rows of heads overflow a grid", y.rows)))?;
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_no_scale_vec<{t}, {}, {lanes}>",
+                    hidden / (8 * lanes)
+                )),
+            )
+            .apply(Launch::grid(
+                [units.div_ceil(256 / lanes.unsigned_abs()), 1, 1],
+                [BLOCK, 1, 1],
+            )),
+            &[
+                x.arg(),
+                y.arg(),
+                stated(OP, units)?.arg(),
+                eps.arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
+    // A warp a head, the block form's sums in its order, where the head is
+    // whole 256-element runs.
+    if ctx.tuning().hc_tile
+        && hidden % 256 == 0
+        && (1..=4).contains(&(hidden / 256))
+        && [x.ptr, y.ptr].iter().all(|&at| aligned16(at))
+    {
+        let units = y
+            .rows
+            .checked_mul(per_head_split(y.width, head_dim))
+            .ok_or_else(|| refuse(OP, format!("{} rows of heads overflow a grid", y.rows)))?;
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_no_scale_warp<{t}, {}>",
+                    hidden / 256
+                )),
+            )
+            .apply(Launch::grid([units.div_ceil(8), 1, 1], [BLOCK, 1, 1])),
+            &[
+                x.arg(),
+                y.arg(),
+                stated(OP, units)?.arg(),
+                eps.arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(
@@ -238,15 +433,28 @@ pub fn rmsnorm_gated(
     ctx: &Ctx,
     x: Tensor,
     gate: Tensor,
-    weight: Tensor,
+    weight: Option<Tensor>,
     head_dim: u32,
     eps: f32,
     sigmoid_gate: bool,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rmsnorm_gated";
-    debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
-    debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
+    debug_assert!(
+        matches!(x.dtype, Dtype::F32 | Dtype::Bf16),
+        "`{OP}` norms an f32 accumulator, or one landed in bf16"
+    );
+    let xin = if x.dtype == Dtype::Bf16 {
+        "::pie::bf16"
+    } else {
+        "float"
+    };
+    debug_assert!(
+        weight.is_none_or(|w| w.dtype == Dtype::F32),
+        "`{OP}` scales by an f32 weight"
+    );
+    let w_ptr = weight.map_or(0, |w| w.ptr);
+    let w_arg = weight.map_or(crate::jit::ArgValue::ABSENT, |w| w.arg());
     let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let hidden = stated(
         OP,
@@ -258,17 +466,69 @@ pub fn rmsnorm_gated(
     )?;
     let launch = rows_per_head(OP, y.rows, y.width, head_dim)?;
     let heads = stated(OP, per_head_split(y.width, head_dim))?;
+    let width = if head_dim == 0 { y.width } else { head_dim };
+    let aligned = [x.ptr, gate.ptr, w_ptr, y.ptr]
+        .iter()
+        .all(|&at| aligned16(at));
+    // 32 lanes a 128- or 256-wide head (four or eight values a lane); 8 a
+    // 64-wide one (eight a lane).
+    let (per, lanes) = match width {
+        64 => (8, 8),
+        128 | 256 => (width / 32, 32),
+        _ => (0, 0),
+    };
+    if aligned && lanes != 0 {
+        let units = y
+            .rows
+            .checked_mul(per_head_split(y.width, head_dim))
+            .ok_or_else(|| {
+                refuse(
+                    OP,
+                    format!(
+                        "{} rows of {} heads overflow a grid",
+                        y.rows,
+                        y.width / width
+                    ),
+                )
+            })?;
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_gated_in_warp<{xin}, {t}, {per}, {lanes}>"
+                )),
+            )
+            .apply(Launch::grid(
+                [units.div_ceil(256 / lanes), 1, 1],
+                [BLOCK, 1, 1],
+            )),
+            &[
+                x.arg(),
+                gate.arg(),
+                w_arg,
+                y.arg(),
+                stated(OP, units)?.arg(),
+                eps.arg(),
+                i32::from(sigmoid_gate).arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::elemwise::rmsnorm_gated_f32_in<{t}, 256>")),
+            symbol(&format!(
+                "::pie::elemwise::rmsnorm_gated_in<{xin}, {t}, 256>"
+            )),
         )
         .apply(launch),
         &[
             x.arg(),
             gate.arg(),
-            weight.arg(),
+            w_arg,
             y.arg(),
             hidden.arg(),
             eps.arg(),
@@ -338,40 +598,38 @@ pub fn rmsnorm_gated_by(
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rmsnorm_gated_by";
 
-    const KDA_BLOCK_MIN: u32 = WARP;
-
-    const KDA_BLOCK_MAX: u32 = 128;
-
     debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
     debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
     let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     nonzero(OP, "the stated head count", heads)?;
     nonzero(OP, "rows", y.rows)?;
-    if x.width == 0 || !x.width.is_multiple_of(heads) {
+    let d = x.width / heads;
+    if x.width == 0 || !x.width.is_multiple_of(heads) || !d.is_multiple_of(WARP) || d > 8 * WARP {
         return Err(refuse(
             OP,
             format!(
-                "the {}-wide normed row does not divide by the stated head count {heads}",
+                "the {}-wide normed row is not {heads} heads of a whole number of 32 up to 256",
                 x.width
             ),
         ));
     }
-    let d = x.width / heads;
+    let pairs = y
+        .rows
+        .checked_mul(heads)
+        .ok_or_else(|| refuse(OP, "the rows' heads do not count"))?;
     ctx.fire(
         OP,
         Fire::at(
             "elemwise/norm.cuh",
             symbol(&format!("::pie::elemwise::rmsnorm_gated_by<{t}>")),
         )
-        .apply(Launch::grid(
-            [y.rows, heads, 1],
-            [d.clamp(KDA_BLOCK_MIN, KDA_BLOCK_MAX), 1, 1],
-        )),
+        .apply(Launch::grid([pairs.div_ceil(8), 1, 1], [256, 1, 1])),
         &[
             x.arg(),
             gate.arg(),
             weight.arg(),
             y.arg(),
+            stated(OP, y.rows)?.arg(),
             stated(OP, heads)?.arg(),
             stated(OP, d)?.arg(),
             eps.arg(),
@@ -384,6 +642,21 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.residual_add";
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, n) = elementwise(OP, *y)?;
+    // Rows of whole 16-byte groups add eight lanes a thread.
+    if y.dtype == Dtype::Bf16 && y.width.is_multiple_of(8) && (y.ptr | x.ptr) % 16 == 0 {
+        let lanes = u32::try_from(n / 8).unwrap_or(u32::MAX);
+        return ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::elemwise::residual_add_vec8").apply(Launch::flat(lanes, BLOCK)),
+            &[
+                y.arg(),
+                x.arg(),
+                (n / 8).arg(),
+                stated(OP, y.width / 8)?.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&format!("::pie::elemwise::residual_add<{t}>"))).apply(launch),
@@ -420,7 +693,13 @@ pub fn residual_add_rmsnorm(
         && [x.ptr, y.ptr, weight.ptr, out.ptr]
             .iter()
             .all(|&at| aligned16(at));
-    let (entrypoint, block) = if vectors {
+    let per = (y.width / VEC_WIDTH).div_ceil(BLOCK);
+    let (entrypoint, block) = if vectors && ctx.tuning().rows_vec && (1..=4).contains(&per) {
+        (
+            format!("::pie::elemwise::residual_add_rmsnorm_reg<{per}, {plus}>"),
+            BLOCK,
+        )
+    } else if vectors {
         let block = (y.width / VEC_WIDTH).clamp(WARP, BLOCK).next_power_of_two();
         (
             format!("::pie::elemwise::residual_add_rmsnorm_vec8<{block}, {plus}>"),
@@ -671,4 +950,23 @@ pub fn res_blend(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     crate::attn::res_blend(ctx, prefix, blocks, weight, eps, proj, y)
+}
+
+/// [`res_blend`] with the RMS norm of the blended row in one pass; see
+/// [`crate::attn::res_blend_norm`].
+#[allow(clippy::too_many_arguments)]
+pub fn res_blend_norm(
+    ctx: &Ctx,
+    prefix: Tensor,
+    blocks: &[Tensor],
+    weight: Tensor,
+    eps: f32,
+    proj: Tensor,
+    out_weight: Tensor,
+    out_eps: f32,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    crate::attn::res_blend_norm(
+        ctx, prefix, blocks, weight, eps, proj, out_weight, out_eps, y,
+    )
 }

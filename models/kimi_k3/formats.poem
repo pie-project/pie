@@ -1,5 +1,6 @@
 # How a Kimi-K3 checkpoint is laid out: transformers' names under
-# `language_model.`, or llama.cpp's GGUF names.
+# `language_model.`, or under `model.` as a text-only cut flattens them, or
+# llama.cpp's GGUF names.
 
 def product(xs):
     out = 1
@@ -51,18 +52,38 @@ def named(a, at):
 
 GGUF_EMBED = "token_embd.weight"
 
-def formats(m):
+LAYOUTS = [
+    struct(
+        name = "huggingface",
+        trunk = "language_model.model.",
+        head = "language_model.lm_head.weight",
+        config = "text_config.",
+    ),
+    struct(name = "huggingface_text", trunk = "model.", head = "lm_head.weight", config = ""),
+]
+
+def configured(m, at):
+    """The shape a configuration states of this model, its text model's keys
+    under `at`: AttnRes's block stride is a model's own, never a reading's."""
     return [
-        format(
-            "huggingface",
-            recognizes = lambda c: not has(GGUF_EMBED),
-            read = lambda reads: huggingface(m, reads),
-        ),
-        format("gguf", recognizes = lambda c: has(GGUF_EMBED), read = lambda reads: gguf(m, reads)),
+        config(at + "hidden_size", m.hidden),
+        config(at + "num_hidden_layers", len(m.layers), or_deeper = True),
+        config(at + "attn_res_block_size", m.res_block),
     ]
 
-def at(l, leaf):
-    return "language_model.model.layers.{}.{}".format(l, leaf)
+def safetensors_format(m, layout):
+    """`layout`'s format, recognized by its embedding."""
+    return format(
+        layout.name,
+        recognizes = lambda c: has(layout.trunk + "embed_tokens.weight"),
+        read = lambda reads: huggingface(m, reads, layout),
+        states = configured(m, layout.config),
+    )
+
+def formats(m):
+    return [safetensors_format(m, layout) for layout in LAYOUTS] + [
+        format("gguf", recognizes = lambda c: has(GGUF_EMBED), read = lambda reads: gguf(m, reads)),
+    ]
 
 def blk(l, leaf):
     return "blk.{}.{}".format(l, leaf)
@@ -73,12 +94,13 @@ def lifted(w):
     dims[w.cut_axis] = -1
     return dims
 
-def huggingface(m, reads):
-    reads.read(m.embed, "language_model.model.embed_tokens.weight")
-    reads.read(m.final_norm, "language_model.model.norm.weight")
-    reads.read(m.head, "language_model.lm_head.weight")
+def huggingface(m, reads, layout):
+    trunk = layout.trunk
+    reads.read(m.embed, trunk + "embed_tokens.weight")
+    reads.read(m.final_norm, trunk + "norm.weight")
+    reads.read(m.head, layout.head)
     for l, w in enumerate(m.layers):
-        n = lambda leaf: at(l, leaf)
+        n = lambda leaf: "{}layers.{}.{}".format(trunk, l, leaf)
         reads.read(w.mixer_norm, n("input_layernorm.weight"))
         reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
         if w.res_blend != None:
@@ -128,8 +150,8 @@ def huggingface(m, reads):
         reads.read(s.down, n(stem + ".down_proj.weight"))
     r = m.output_res
     if r != None:
-        reads.read(r.norm, "language_model.model.output_attn_res_norm.weight")
-        reads.read(r.proj, "language_model.model.output_attn_res_proj.weight")
+        reads.read(r.norm, trunk + "output_attn_res_norm.weight")
+        reads.read(r.proj, trunk + "output_attn_res_proj.weight")
 
 def kda(reads, n, k):
     reads.read_concat(k.qkv, kda_qkv(n))

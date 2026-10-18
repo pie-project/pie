@@ -46,7 +46,7 @@ fn no_such_deployment(name: &str) -> String {
 pub struct Overrides {
     /// The precision the config expects; a checkpoint stored at another is
     /// refused rather than re-quantized.
-    pub precision: Option<Vec<poem_ir::Dtype>>,
+    pub precision: Option<Vec<poem::Precision>>,
     pub kv: Option<poem_ir::Dtype>,
     pub off: Vec<String>,
     /// `Some(None)` serves without the checkpoint's drafter.
@@ -214,16 +214,20 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<String> {
 
 #[must_use]
 pub fn this_box() -> Option<Platform> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "engine-cuda")]
     {
         return Some(Platform::Cuda);
     }
-    #[cfg(all(not(feature = "cuda"), feature = "metal", target_vendor = "apple"))]
+    #[cfg(all(
+        not(feature = "engine-cuda"),
+        feature = "metal",
+        target_vendor = "apple"
+    ))]
     {
         return Some(Platform::Metal);
     }
     #[cfg(all(
-        not(feature = "cuda"),
+        not(feature = "engine-cuda"),
         not(all(feature = "metal", target_vendor = "apple")),
         feature = "vulkan"
     ))]
@@ -231,7 +235,7 @@ pub fn this_box() -> Option<Platform> {
         return Some(Platform::Vulkan);
     }
     #[cfg(all(
-        not(feature = "cuda"),
+        not(feature = "engine-cuda"),
         not(all(feature = "metal", target_vendor = "apple")),
         not(feature = "vulkan"),
         feature = "wgpu"
@@ -240,7 +244,7 @@ pub fn this_box() -> Option<Platform> {
         return Some(Platform::Wgpu);
     }
     #[cfg(all(
-        not(feature = "cuda"),
+        not(feature = "engine-cuda"),
         not(all(feature = "metal", target_vendor = "apple")),
         not(feature = "vulkan"),
         not(feature = "wgpu"),
@@ -445,7 +449,7 @@ pub fn request(
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "engine-cuda")]
 #[must_use]
 pub fn sequence(trace: &Trace) -> Option<Vec<String>> {
     let at: std::collections::BTreeMap<&str, usize> = trace
@@ -478,7 +482,7 @@ pub fn sequence(trace: &Trace) -> Option<Vec<String>> {
     )
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "engine-cuda"))]
 #[must_use]
 pub fn sequence(_trace: &Trace) -> Option<Vec<String>> {
     None

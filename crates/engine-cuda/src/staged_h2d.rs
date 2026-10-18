@@ -15,7 +15,7 @@ pub struct Transfer {
     pub len: u64,
 }
 
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 struct Cargo(Vec<Transfer>);
 
 // SAFETY: read-only list of addresses for the scope's lifetime.
@@ -25,11 +25,11 @@ unsafe impl Send for Cargo {}
 
 #[derive(Debug)]
 struct Lane {
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
     stream: *mut c_void,
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
     pinned: [Pinned; 2],
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
     done: [Event; 2],
 }
 
@@ -41,15 +41,15 @@ unsafe impl Send for Lane {}
 #[derive(Debug)]
 pub struct Lanes {
     lanes: Vec<Lane>,
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
     buf_bytes: usize,
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
     device: i32,
 }
 
 impl Lanes {
     pub fn open(lanes: usize, buf_bytes: usize) -> Result<Lanes> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
             let buf_bytes = buf_bytes.max(1);
             let device = current_device()?;
@@ -67,7 +67,7 @@ impl Lanes {
                 device,
             })
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             let _ = (lanes, buf_bytes);
             Err(Fault::Runtimeless)
@@ -84,7 +84,7 @@ impl Lanes {
     }
 
     pub fn pump(&mut self, copies: &[Transfer]) -> Result<()> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         {
             if copies.is_empty() {
                 return Ok(());
@@ -136,7 +136,7 @@ impl Lanes {
             outcomes.into_iter().collect::<Result<Vec<()>>>()?;
             Ok(())
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "device"))]
         {
             let _ = copies;
             Err(Fault::Runtimeless)
@@ -144,9 +144,9 @@ impl Lanes {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "device")]
 fn run_lane(device: i32, lane: &mut Lane, run: &[Transfer]) -> Result<()> {
-    use cudarc::runtime::sys as rt;
+    use crate::device::rt;
 
     if run.is_empty() {
         return Ok(());
@@ -188,9 +188,9 @@ fn run_lane(device: i32, lane: &mut Lane, run: &[Transfer]) -> Result<()> {
     streamed.and(drained)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "device")]
 fn current_device() -> Result<i32> {
-    use cudarc::runtime::sys as rt;
+    use crate::device::rt;
 
     let mut ordinal: i32 = 0;
     // SAFETY: a live local out-parameter.
@@ -198,9 +198,9 @@ fn current_device() -> Result<i32> {
     Ok(ordinal)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "device")]
 fn new_stream() -> Result<*mut c_void> {
-    use cudarc::runtime::sys as rt;
+    use crate::device::rt;
 
     let mut stream: rt::cudaStream_t = core::ptr::null_mut();
     // SAFETY: a live local out-parameter; the stream is this pool's and is
@@ -213,13 +213,13 @@ fn new_stream() -> Result<*mut c_void> {
 
 impl Drop for Lanes {
     fn drop(&mut self) {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         for lane in &self.lanes {
             if !lane.stream.is_null() {
                 // SAFETY: handle from this module's own cudaStreamCreate,
                 // destroyed exactly once; every pump drained before returning.
                 unsafe {
-                    let _ = cudarc::runtime::sys::cudaStreamDestroy(lane.stream.cast());
+                    let _ = crate::device::rt::cudaStreamDestroy(lane.stream.cast());
                 }
             }
         }
@@ -232,7 +232,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     fn a_runtimeless_build_opens_no_lanes() {
         assert!(matches!(Lanes::standard(), Err(Fault::Runtimeless)));
     }

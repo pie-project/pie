@@ -494,6 +494,7 @@ impl Engine for Wgpu {
             media_encode: false,
             device_channel_commit: true,
             rs_verbs: shell.serves_rs_verbs(),
+            rs_snapshots: 0,
             bidirectional_attention: false,
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),

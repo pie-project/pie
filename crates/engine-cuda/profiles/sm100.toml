@@ -4,6 +4,102 @@ api = 1
 tier    = "sm_100"
 assumes = { cc = 100 }
 
+# Each line's measured win is in the commit that set it.
 [kernel]
 gemv.bf16 = "narrow"
-mla.path  = "naive"
+# A latent prefill from 256 rows runs expanded, as vLLM's MLA prefill does.
+mla.expanded_from = 256
+# Block-FP8 projections: a GEMV up to 4 rows, mma.sync up to 8.
+gemm.fp8_gemv_until = 4
+gemm.fp8_mma_gemv_until = 8
+# DeepSeek-V4's attention: pool on mma.sync, prefill from 512 rows and
+# decode up to 64 in one launch, V4.1's bounded replay, its FP4 pass from 32.
+sdpa.pool_mma = true
+sdpa.dsv4_prefill_from = 512
+sdpa.dsv4_replay = true
+sdpa.dsv4_fp4_pass_from = 32
+sdpa.dsv4_decode_until = 64
+# GLM-5.3's DSA on tcgen05; a row under its selection size read dense.
+sdpa.mla_sparse = true
+sdpa.mla_dense_short = true
+# A prefill's pooled index scored on tcgen05 and ranked by radix select.
+sdpa.index_tc5 = true
+sdpa.index_radix = true
+# The hyper-connection pre-mix norm emits the next fp8 GEMM's operand.
+elemwise.norm_emit = true
+# Routed bf16 selects on the tcgen05 grouped GEMM.
+moe.tc5           = true
+# Gated delta: the fused scan, one tcgen05 prefill launch, bf16 output.
+ssm.gdn_fused_scan = true
+ssm.gdn_tc5 = true
+ssm.gdn_out_bf16 = true
+ssm.conv_vec4 = true
+# Row kernels 16 bytes a lane; hyper-connection kernels tiled and on mma.sync.
+elemwise.rows_vec = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+# Qwen3.5's attention prologue in one launch up to 64 rows.
+elemwise.qg_prologue_until = 64
+# A wide decode's split partials fold a warp a row.
+sdpa.merge_warp = true
+
+# MXFP4 selects: register-dequant mma.sync from 28 to 1024 routes, e2m1
+# converts, W4A8 up to 48 routes from one, K split over two CTAs up to 6.
+moe.mxfp4_mma_from  = 28
+moe.mxfp4_mma_until = 1024
+moe.mxfp4_cvt = true
+moe.mxfp4_a8_until = 48
+moe.mxfp4_a8_from = 1
+moe.mxfp4_cvt_ksplit_until = 6
+# DeepSeek-V4's wo_a on its requantized fp8 plane: mma.sync, then the
+# grouped tcgen05 GEMM up to 512 rows.
+gemm.fp8_o_down = true
+gemm.fp8_grouped_tc5_until = 512
+# AttnRes's blend and its row's norm in one pass.
+attn_res.fused_norm = true
+# The tcgen05 prefill FMHA; Gemma 4's sliding layers on its 128-key tiles.
+sdpa.prefill.tc5 = true
+sdpa.prefill.wide_sliding = true
+# Decode rows of a group of four or wider through the prefill kernel,
+# sinks too.
+sdpa.decode.grouped_prefill_from = 4
+sdpa.decode.grouped_prefill_lse = true
+# Tensor-core decode (attn/xqa.cuh): 64-wide heads from 16 requests, short
+# windows whole, unwindowed rows over a cluster of eight.
+sdpa.decode.xqa = true
+sdpa.decode.xqa_from_64 = 16
+sdpa.decode.xqa_whole_window = 128
+sdpa.decode.xqa_cluster = 8
+# A dense bias from the cuBLASLt epilogue.
+gemm.bias_epilogue = true
+# Routed MLPs kept by expert with the GLU in the gate-up epilogue: W4A4
+# always, W4A8 from 512 tokens.
+moe.w4a4_fused_from = 1
+moe.w4a8_fused_from = 512
+# The fused qkv write a warp a head below 256 rows.
+attn.qkv_rows_from = 256
+# KDA: chunked prefill on the tensor cores, a fused decode step.
+ssm.kda_chunked = true
+ssm.kda_step_fused = true
+# W4A16 NVFP4 selects on the register-dequant MMA from 32 to 8192 routes.
+moe.nvfp4_mma_from = 32
+moe.nvfp4_mma_until = 8192
+# Tactic timing charges a split's reduce launch 2 us, at every row count.
+gemm.split_launch_ns = 2000
+# Dense tcgen05 GEMMs raster 16 tiles a band.
+gemm.tc5_raster = 16
+
+# Split-K of 8 rows or fewer folded in the last split, and launches as
+# programmatic dependents.
+gemm.tc5_split_tickets = 8
+pdl = true
+
+# Bf16 products of 2 to 8 rows may time the few-rows kernel.
+gemm.rows_m = 8
+
+[compiler]
+# A join's independent chains, and up to 256 rows every region, on side
+# streams, as vLLM runs DeepSeek-V4's.
+branches = true
+dag_streams = true
+dag_streams_until = 256

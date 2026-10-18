@@ -372,9 +372,9 @@ pub fn weight_tier_bytes(trace: &Trace, stated: u64, extra_resident: u64) -> Res
 
 /// The device's free and total bytes, as the driver reports them now.
 pub fn device_memory() -> Result<(u64, u64)> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         let (mut free, mut total) = (0usize, 0usize);
         // SAFETY: two live locals; the call only writes them.
@@ -382,7 +382,7 @@ pub fn device_memory() -> Result<(u64, u64)> {
         crate::device::ctx::check("cudaMemGetInfo", asked)?;
         Ok((free as u64, total as u64))
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         Err(Fault::Runtimeless)
     }
@@ -424,6 +424,8 @@ pub struct Seats {
     pub write_state_mask: Tensor,
     pub commit_len: Tensor,
     pub begin_at: Tensor,
+    #[cfg(feature = "rocm")]
+    pub snapshots: kernels_cuda::Snapshots,
 }
 
 impl Seats {
@@ -438,6 +440,13 @@ impl Seats {
     #[must_use]
     pub fn splitting(mut self, boundary: Tensor) -> Seats {
         self.begin_at = boundary;
+        self
+    }
+
+    #[cfg(feature = "rocm")]
+    #[must_use]
+    pub fn snapshotting(mut self, snapshots: kernels_cuda::Snapshots) -> Seats {
+        self.snapshots = snapshots;
         self
     }
 }
@@ -458,10 +467,11 @@ pub struct Pools {
     committed_kv_pages: u32,
     committed_state_slots: u32,
     backed_pages: Vec<u64>,
-    /// The window pages the windowed rows are backed through, 0 before the
-    /// first fire: the load's second fit can widen the window after arming
-    /// backed it.
-    windowed_backed: u64,
+    /// The windowed pages backed so far, a bit each: the windowed rows and
+    /// the compressor slabs their pages key are backed a page at a time, as
+    /// the fires' windowed tables (and the windowed moves) first touch it.
+    backed_windowed: Vec<u64>,
+    windowed_backed: bool,
     buffered: (u64, u64),
     host: Option<HostKv>,
     disk: Option<DiskKv>,
@@ -543,7 +553,19 @@ impl Pools {
                     let restated = facts.row(index);
                     if let Some(seat) = restated.filter(|seat| seat.kv_heads != 0) {
                         let heads = u64::from(seat.kv_heads) * u64::from(seat.head_dim);
-                        if heads != keys_width || heads != values_width {
+                        // DeepSeek's quantized rows hold a 512-wide head in
+                        // a u8 plane of their format's width.
+                        let ds_row = *dtype == Dtype::U8
+                            && heads == 512
+                            && [
+                                kernels_cuda::attn::dsv4::Rows::Ds,
+                                kernels_cuda::attn::dsv4::Rows::Mx8,
+                                kernels_cuda::attn::dsv4::Rows::Nv4,
+                            ]
+                            .iter()
+                            .any(|r| keys_width == u64::from(r.bytes()))
+                            && values_width == keys_width;
+                        if !ds_row && (heads != keys_width || heads != values_width) {
                             return Err(Fault::Unbound {
                                 what: format!(
                                     "cache `{name}`, which declares the planes {planes:?} while \
@@ -593,16 +615,28 @@ impl Pools {
         }
         let mut pooled = Vec::new();
         for (space, width) in pooled_spaces(trace) {
-            let cells = paging.pages() * u64::from(paging.page_size);
-            let bytes = cells * width * u64::from(elem_size(POOL_STATE));
+            // A slab keyed by a windowed row's pages (`space` is the cache row
+            // its gather reads) is as long as its windowed pool.
+            let windowed = paging.window.is_some()
+                && matches!(
+                    shapes.get(space as usize),
+                    Some(Shape::Kv { windowed: true, .. })
+                );
+            let row = PoolRow {
+                space,
+                width,
+                windowed,
+                planes: Vec::new(),
+            };
+            let bytes = row.watermark_bytes(
+                narrow_pages(paging.pages()),
+                narrow_pages(paging.window_pages()),
+                paging.page_size,
+            );
             let planes = (0..2)
                 .map(|_| Arena::reserve(&pool, bytes, "bytes of a compressor state slab"))
                 .collect::<Result<Vec<Arena>>>()?;
-            pooled.push(PoolRow {
-                space,
-                width,
-                planes,
-            });
+            pooled.push(PoolRow { planes, ..row });
         }
         Ok(Pools {
             pool,
@@ -617,7 +651,8 @@ impl Pools {
             committed_kv_pages: 0,
             committed_state_slots: 0,
             backed_pages: Vec::new(),
-            windowed_backed: 0,
+            backed_windowed: Vec::new(),
+            windowed_backed: false,
             buffered: (0, 1),
             host: None,
             disk: None,
@@ -648,10 +683,15 @@ impl Pools {
 
     #[must_use]
     pub fn pool_slabs(&self) -> Vec<(u32, PoolSlabs)> {
-        let cells = self.paging.pages() * u64::from(self.paging.page_size);
         self.pooled
             .iter()
             .map(|row| {
+                let pages = if row.windowed {
+                    self.paging.window_pages()
+                } else {
+                    self.paging.pages()
+                };
+                let cells = pages * u64::from(self.paging.page_size);
                 let plane = |at: usize| {
                     Tensor::new(
                         row.planes.get(at).map_or(0, elastic::Arena::base),
@@ -728,7 +768,7 @@ impl Pools {
             .pooled
             .iter()
             .map(|row| {
-                let bytes = row.watermark_bytes(pages, page_size);
+                let bytes = row.watermark_bytes(pages, windowed, page_size);
                 row.planes
                     .iter()
                     .map(|arena| mapped(bytes, arena))
@@ -779,7 +819,7 @@ impl Pools {
             }
         }
         for row in &mut self.pooled {
-            let bytes = row.watermark_bytes(narrow, page_size);
+            let bytes = row.watermark_bytes(narrow, windowed, page_size);
             for arena in &mut row.planes {
                 fresh(arena)?;
                 *arena = Arena::reserve(&self.pool, bytes, "bytes of a compressor state slab")?;
@@ -788,7 +828,8 @@ impl Pools {
         self.ceiling = pages;
         self.paging.pages = pages;
         self.paging.slots = slots;
-        self.windowed_backed = 0;
+        self.windowed_backed = false;
+        self.backed_windowed.clear();
         Ok(())
     }
 
@@ -926,6 +967,11 @@ impl Pools {
             )));
         }
         self.paging.pages = fit;
+        // A flat arena allocates its whole range on its first commit, so its
+        // range is the fitted one, not the one the asked count reserved.
+        if !elastic::mapped_on_demand() && self.committed_bytes() == 0 {
+            self.reshape(fit, self.paging.slots)?;
+        }
         // The runtime admits frames against this watermark, so the pool is
         // pledged it beside what its other arenas hold now: a frame inside
         // it is a frame the fit already sized the card for, and what a fire
@@ -1014,30 +1060,106 @@ impl Pools {
             .any(|shape| matches!(shape, Shape::Kv { windowed: true, .. }))
     }
 
-    /// Notes the windowed rows backed through the window the pool spans now,
-    /// and zeroes their page 0 the first time: every page behind a window
-    /// reads it, and a masked column still multiplies its value, so it must
-    /// hold no NaN.
-    fn note_windowed(&mut self) -> Result<()> {
-        let fresh = self.windowed_backed == 0;
-        self.windowed_backed = self.paging.window_pages();
-        if !fresh || !self.has_windowed() {
+    /// Zeroes page 0 of the windowed rows once they are backed: every page
+    /// behind a window reads it, and a masked column still multiplies its
+    /// value, so it must hold no NaN.
+    fn zero_null_page(&mut self) -> Result<()> {
+        if self.windowed_backed || !self.has_windowed() {
             return Ok(());
         }
-        let page_size = self.paging.page_size;
-        for (planes, shape) in self.rows.iter().zip(&self.shapes) {
+        for (arena, bytes) in self.windowed_planes() {
+            crate::device::zero_span(arena.span(0, bytes)?, usize::try_from(bytes).unwrap_or(0))?;
+        }
+        self.windowed_backed = true;
+        Ok(())
+    }
+
+    /// Backs the not-yet-backed windowed pages `pages` (and the null page behind a
+    /// window) in the windowed rows and compressor slabs: the pool grows on first
+    /// use, costing only the windows the seated sequences hold.
+    pub fn ensure_windowed(&mut self, pages: impl IntoIterator<Item = u64>) -> Result<()> {
+        if !self.has_windowed() {
+            return Ok(());
+        }
+        let capacity = self.paging.window_pages();
+        let mut fresh: Vec<u64> = core::iter::once(0)
+            .chain(pages)
+            .filter(|&page| {
+                !self
+                    .backed_windowed
+                    .get((page / 64) as usize)
+                    .is_some_and(|word| word & (1u64 << (page % 64)) != 0)
+            })
+            .collect();
+        fresh.sort_unstable();
+        fresh.dedup();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        if let Some(&page) = fresh.iter().find(|&&page| page >= capacity) {
+            return Err(Fault::Ceiling {
+                what: "windowed kv pages",
+                need: page + 1,
+                have: capacity,
+            });
+        }
+        // Runs of consecutive pages, a range each.
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for &page in &fresh {
+            match runs.last_mut() {
+                Some((first, count)) if *first + *count == page => *count += 1,
+                _ => runs.push((page, 1)),
+            }
+        }
+        let page_size = u64::from(self.paging.page_size);
+        let Pools {
+            pool,
+            rows,
+            shapes,
+            pooled,
+            ..
+        } = self;
+        let mut targets = Vec::new();
+        let ranges = |page_bytes: u64| {
+            elastic::Want::Ranges(
+                runs.iter()
+                    .map(|&(first, count)| (first * page_bytes, count * page_bytes))
+                    .collect(),
+            )
+        };
+        for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
             if !matches!(shape, Shape::Kv { windowed: true, .. }) {
                 continue;
             }
-            for (at, arena) in planes.iter().enumerate() {
-                let bytes = watermark_bytes(shape, at, 0, 1, 0, page_size);
-                crate::device::zero_span(
-                    arena.span(0, bytes)?,
-                    usize::try_from(bytes).unwrap_or(0),
-                )?;
+            for (at, arena) in planes.iter_mut().enumerate() {
+                let page_bytes = watermark_bytes(shape, at, 0, 1, 0, self.paging.page_size);
+                targets.push(elastic::Target {
+                    arena,
+                    want: ranges(page_bytes),
+                });
             }
         }
-        Ok(())
+        for row in pooled.iter_mut().filter(|row| row.windowed) {
+            let page_bytes = page_size * row.width * u64::from(elem_size(POOL_STATE));
+            for arena in row.planes.iter_mut() {
+                targets.push(elastic::Target {
+                    arena,
+                    want: ranges(page_bytes),
+                });
+            }
+        }
+        match elastic::commit_atomically(pool, &mut targets)? {
+            Commit::Committed => {}
+            refusal => return Err(refuse(&self.pool, refusal)),
+        }
+        for &page in &fresh {
+            let (word, bit) = ((page / 64) as usize, page % 64);
+            if self.backed_windowed.len() <= word {
+                self.backed_windowed.resize(word + 1, 0);
+            }
+            self.backed_windowed[word] |= 1u64 << bit;
+        }
+        self.zero_null_page()
     }
 
     #[must_use]
@@ -1114,6 +1236,8 @@ impl Pools {
                     commit_len: seats.commit_len,
                     begin_at: seats.begin_at,
                     fused_decay: false,
+                    #[cfg(feature = "rocm")]
+                    snapshots: seats.snapshots,
                     slab: Tensor::new(
                         planes.first().map_or(0, elastic::Arena::base),
                         self.paging.slots,
@@ -1220,6 +1344,11 @@ impl Pools {
             highest = highest.max(u64::from(span.src_page.max(span.dst_page)) + 1);
         }
         self.ensure_kv(u32::try_from(highest).unwrap_or(u32::MAX))?;
+        self.ensure_windowed(
+            windowed
+                .iter()
+                .flat_map(|span| [u64::from(span.src_page), u64::from(span.dst_page)]),
+        )?;
         for (planes, shape) in self.rows.iter().zip(&self.shapes) {
             let Shape::Kv {
                 windowed: in_window,
@@ -1265,11 +1394,29 @@ impl Pools {
     /// indexed by the same pages. Windowed rows name their own pages.
     fn paged_planes(&self) -> Vec<(&Arena, u64)> {
         let mut planes = self.kv_planes(false);
+        planes.extend(self.pooled_planes(false));
+        planes
+    }
+
+    /// The compressor slabs keyed by a windowed space's pages (or not), and
+    /// the bytes a page holds in each.
+    fn pooled_planes(&self, windowed: bool) -> Vec<(&Arena, u64)> {
         let page_size = u64::from(self.paging.page_size);
-        for row in &self.pooled {
-            let bytes = page_size * row.width * u64::from(elem_size(POOL_STATE));
-            planes.extend(row.planes.iter().map(|arena| (arena, bytes)));
-        }
+        self.pooled
+            .iter()
+            .filter(|row| row.windowed == windowed)
+            .flat_map(|row| {
+                let bytes = page_size * row.width * u64::from(elem_size(POOL_STATE));
+                row.planes.iter().map(move |arena| (arena, bytes))
+            })
+            .collect()
+    }
+
+    /// The windowed planes a windowed page spans: the windowed kv rows' and
+    /// the compressor slabs their pages key.
+    fn windowed_planes(&self) -> Vec<(&Arena, u64)> {
+        let mut planes = self.kv_planes(true);
+        planes.extend(self.pooled_planes(true));
         planes
     }
 
@@ -1303,7 +1450,7 @@ impl Pools {
     /// The bytes one windowed kv page holds over every windowed plane.
     #[must_use]
     pub fn window_page_bytes(&self) -> u64 {
-        self.kv_planes(true).iter().map(|&(_, bytes)| bytes).sum()
+        self.windowed_planes().iter().map(|&(_, bytes)| bytes).sum()
     }
 
     /// The bytes one kv page holds over every paged plane.
@@ -1505,13 +1652,14 @@ impl Pools {
         }
         let highest = device.iter().map(|&page| page + 1).max().unwrap_or(0);
         self.ensure_kv(highest)?;
+        self.ensure_windowed(windowed.iter().map(|&(page, _)| u64::from(page)))?;
         let Some(buffer) = self.host.as_ref().map(|host| host.buffer.host() as u64) else {
             return Ok(());
         };
         let mut base = 0u64;
         let spaces = [
             (self.paged_planes(), &paged[..], have[0]),
-            (self.kv_planes(true), windowed, have[1]),
+            (self.windowed_planes(), windowed, have[1]),
         ];
         for (planes, pairs, have) in spaces {
             let mut runs: Vec<(u32, u32, u32)> = Vec::new();
@@ -1613,23 +1761,20 @@ impl Pools {
         &mut self,
         demand: engine::frame::Demand,
         kv_ranges: &[(u64, u64)],
+        window_pages: &[u64],
     ) -> Result<()> {
-        if demand.kv_pages <= self.committed_kv_pages
+        if !(demand.kv_pages <= self.committed_kv_pages
             && demand.state_slots <= self.committed_state_slots
-            && (self.windowed_backed >= self.paging.window_pages() || !self.has_windowed())
             && kv_ranges
                 .iter()
-                .all(|&(first, count)| self.pages_backed(first, count))
+                .all(|&(first, count)| self.pages_backed(first, count)))
         {
-            return Ok(());
-        }
-        match self.commit_ranges(demand.kv_pages, demand.state_slots, Some(kv_ranges))? {
-            Commit::Committed => {
-                self.note_backed(kv_ranges);
-                self.note_windowed()
+            match self.commit_ranges(demand.kv_pages, demand.state_slots, Some(kv_ranges))? {
+                Commit::Committed => self.note_backed(kv_ranges),
+                refusal => return Err(refuse(&self.pool, refusal)),
             }
-            refusal => Err(refuse(&self.pool, refusal)),
         }
+        self.ensure_windowed(window_pages.iter().copied())
     }
 
     fn pages_backed(&self, first: u64, count: u64) -> bool {
@@ -1673,11 +1818,9 @@ impl Pools {
         for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
             for (at, arena) in planes.iter_mut().enumerate() {
                 let want = match (shape, kv_ranges) {
-                    // The windowed pool is what a window per sequence
-                    // takes, so it is backed whole on the first fire.
-                    (Shape::Kv { windowed: true, .. }, _) => {
-                        elastic::Want::Prefix(watermark_bytes(shape, at, 0, windowed, 0, page_size))
-                    }
+                    // The windowed pool backs its pages as they are first
+                    // used (`ensure_windowed`).
+                    (Shape::Kv { windowed: true, .. }, _) => continue,
                     (Shape::Kv { .. }, Some(ranges)) => {
                         let page_bytes = watermark_bytes(shape, at, 1, 0, 0, page_size);
                         elastic::Want::Ranges(
@@ -1699,8 +1842,8 @@ impl Pools {
                 targets.push(elastic::Target { arena, want });
             }
         }
-        for row in pooled.iter_mut() {
-            let bytes = row.watermark_bytes(kv_pages, page_size);
+        for row in pooled.iter_mut().filter(|row| !row.windowed) {
+            let bytes = row.watermark_bytes(kv_pages, windowed, page_size);
             for arena in row.planes.iter_mut() {
                 targets.push(elastic::Target {
                     arena,
@@ -1733,7 +1876,7 @@ impl Pools {
             }
         }
         for row in pooled.iter_mut() {
-            let bytes = row.watermark_bytes(kv_pages, page_size);
+            let bytes = row.watermark_bytes(kv_pages, windowed, page_size);
             for arena in row.planes.iter_mut() {
                 arena.release_tail(pool, bytes);
             }
@@ -1750,12 +1893,19 @@ const POOL_STATE: Dtype = Dtype::Bf16;
 struct PoolRow {
     space: u32,
     width: u64,
+    /// Keyed by a windowed space's pages: as long as its windowed pool.
+    windowed: bool,
     planes: Vec<Arena>,
 }
 
 impl PoolRow {
-    fn watermark_bytes(&self, kv_pages: u32, page_size: u32) -> u64 {
-        u64::from(kv_pages) * u64::from(page_size) * self.width * u64::from(elem_size(POOL_STATE))
+    fn watermark_bytes(&self, kv_pages: u32, window_pages: u32, page_size: u32) -> u64 {
+        let pages = if self.windowed {
+            window_pages
+        } else {
+            kv_pages
+        };
+        u64::from(pages) * u64::from(page_size) * self.width * u64::from(elem_size(POOL_STATE))
     }
 }
 
@@ -1766,12 +1916,18 @@ const fn compressor_coff(ratio: u32) -> u64 {
 fn pooled_spaces(trace: &Trace) -> Vec<(u32, u64)> {
     let mut spaces: Vec<(u32, u64)> = Vec::new();
     for node in &trace.nodes {
-        let Operation::Attention(Attention::PoolGather {
+        // A gather, or one the compressor's fused op holds.
+        let gather = match &node.op {
+            Operation::Attention(a) => a,
+            Operation::Fused(poem_ir::Fused::PoolCompress { gather, .. }) => &**gather,
+            _ => continue,
+        };
+        let Attention::PoolGather {
             pages,
             head_dim,
             ratio,
             ..
-        }) = &node.op
+        } = gather
         else {
             continue;
         };

@@ -63,6 +63,12 @@ impl Recorder {
         }
     }
 
+    /// The platform this trace is recorded for.
+    #[must_use]
+    pub fn platform(&self) -> Platform {
+        self.inner.borrow().platform
+    }
+
     pub fn fresh(&self, ty: Ty) -> Value {
         let mut p = self.inner.borrow_mut();
         p.values.push(ValueDecl {
@@ -114,6 +120,30 @@ impl Recorder {
         });
     }
 
+    /// The plane `suffix` of `w` (its `.input_scales`, say) as a weight
+    /// value of its own, for an op that reads it beside the codes.
+    pub fn weight_plane(&self, w: &Weight, suffix: &str) -> ValueId {
+        self.weight(w);
+        let mut p = self.inner.borrow_mut();
+        let name = format!("{}{suffix}", w.name);
+        let at = p
+            .params
+            .iter()
+            .position(|q| q.name == name)
+            .unwrap_or_else(|| panic!("`{}` stores no `{name}` plane", w.name));
+        let def = Def::Weight(at as u32);
+        if let Some(seen) = p.values.iter().position(|v| v.def == def) {
+            return ValueId(seen as u32);
+        }
+        let param = &p.params[at];
+        let ty = Ty::Tensor {
+            shape: param.shape.iter().copied().map(Dim::Const).collect(),
+            dtype: param.dtype,
+        };
+        p.values.push(ValueDecl { def, ty });
+        ValueId((p.values.len() - 1) as u32)
+    }
+
     pub fn weight(&self, w: &Weight) -> ValueId {
         let mut p = self.inner.borrow_mut();
         let w = &w.placed(p.platform);
@@ -129,6 +159,10 @@ impl Recorder {
                 plane.dtype,
                 w.source,
                 w.layout,
+                match plane.suffix {
+                    "" => w.placement,
+                    _ => poem_ir::ParamPlacement::Device,
+                },
             );
             first.get_or_insert(index);
         }
@@ -317,6 +351,7 @@ fn intern(
     dtype: Dtype,
     source: ParamSource,
     layout: ParamLayout,
+    placement: poem_ir::ParamPlacement,
 ) -> u32 {
     if let Some(i) = p.params.iter().position(|q| q.name == name) {
         let seen = &p.params[i];
@@ -333,6 +368,10 @@ fn intern(
             seen.layout == layout,
             "`{name}` is declared twice with two device layouts"
         );
+        assert!(
+            seen.placement == placement,
+            "`{name}` is declared twice with two placements"
+        );
         return i as u32;
     }
     p.params.push(Param {
@@ -342,6 +381,7 @@ fn intern(
         dtype,
         source,
         layout,
+        placement,
     });
     (p.params.len() - 1) as u32
 }
@@ -631,13 +671,22 @@ fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard 
     };
     let at = *axis as usize;
     let whole = logical[at];
-    let stored = *plane.get(at).unwrap_or_else(|| {
-        panic!("`{name}` stores {plane:?} and its cut names axis {at} of {logical:?}")
-    });
-    assert_eq!(
-        logical[..at],
-        plane[..at],
-        "`{name}`: the axes before its cut are not stored verbatim",
+    // A plane that stops short of the cut axis (an nvfp4 bank's per-row
+    // and per-expert scales under a cut of its contracted axis) is held
+    // whole by every rank.
+    let Some(&stored) = plane.get(at) else {
+        return Shard::Replicated;
+    };
+    // An axis before the cut is stored verbatim, or (a block-fp8
+    // projection's block exponents) one a 128- or 32-wide block.
+    assert!(
+        logical[..at]
+            .iter()
+            .zip(&plane[..at])
+            .all(|(l, p)| p == l || *p == l.div_ceil(128) || *p == l.div_ceil(32)),
+        "`{name}`: the axes before its cut, {:?}, are stored {:?}",
+        &logical[..at],
+        &plane[..at],
     );
     assert!(
         stored > 0 && whole.is_multiple_of(stored),

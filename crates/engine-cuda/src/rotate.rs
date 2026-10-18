@@ -410,23 +410,23 @@ impl Rotor {
 
 impl Drop for Rotor {
     fn drop(&mut self) {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         if !self.copy.is_null() {
             // SAFETY: handle is this module's own `cudaStreamCreate`,
             // destroyed exactly once. Stream destroy is async w.r.t. its
             // work; buffers below are freed after it either way.
             unsafe {
-                let _ = cudarc::runtime::sys::cudaStreamSynchronize(self.copy.cast());
-                let _ = cudarc::runtime::sys::cudaStreamDestroy(self.copy.cast());
+                let _ = crate::device::rt::cudaStreamSynchronize(self.copy.cast());
+                let _ = crate::device::rt::cudaStreamDestroy(self.copy.cast());
             }
         }
     }
 }
 
 fn copy_stream() -> Result<*mut c_void> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         let mut stream: rt::cudaStream_t = core::ptr::null_mut();
         // SAFETY: live local out-parameter; stream is this rotor's,
@@ -439,16 +439,16 @@ fn copy_stream() -> Result<*mut c_void> {
         }
         Ok(stream.cast())
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         Err(Fault::Runtimeless)
     }
 }
 
 fn copy_in(stream: *mut c_void, dst: u64, src: *const u8, bytes: u64) -> Result<()> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
-        use cudarc::runtime::sys as rt;
+        use crate::device::rt;
 
         // SAFETY: `dst` is a slot this rotor allocated at least `bytes`
         // long; `src` is page-locked host memory the tier holds for the
@@ -466,7 +466,7 @@ fn copy_in(stream: *mut c_void, dst: u64, src: *const u8, bytes: u64) -> Result<
             )
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         let _ = (stream, dst, src, bytes);
         Err(Fault::Runtimeless)
@@ -526,7 +526,7 @@ mod tests {
         assert!(matches!(why, Decline::Arena { cap: 1, .. }), "{why}");
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     fn rotation() -> (poem_ir::Trace, Rotation) {
         let (trace, compiled, plan) = rig();
         let schedule = Schedule::of(&trace);
@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     fn a_runtimeless_build_opens_no_rotor() {
         let (_, rotation) = rotation();
         let source = vec![core::ptr::null(); rotation.tenants().len()];

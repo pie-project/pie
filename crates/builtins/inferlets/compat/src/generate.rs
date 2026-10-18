@@ -82,12 +82,68 @@ impl Sampling {
     }
 }
 
+/// The sampler's knob values as scalars. Which knobs exist is the program's
+/// shape; their values ride in channels, so requests that differ only in
+/// value share one program and fly as one batch.
+struct Knobs {
+    /// A program constant: a channel-fed divisor costs the fused sampler
+    /// ~20% of a decode step, more than mixed temperatures cost by splitting.
+    temperature: Option<f32>,
+    top_p: Option<Tensor>,
+    top_k: Option<Tensor>,
+    repetition: Option<Tensor>,
+    frequency: Option<Tensor>,
+    presence: Option<Tensor>,
+}
+
+/// The channels a pass's knobs are seeded in.
+struct KnobChannels {
+    temperature: Option<f32>,
+    top_p: Option<Channel>,
+    top_k: Option<Channel>,
+    repetition: Option<Channel>,
+    frequency: Option<Channel>,
+    presence: Option<Channel>,
+}
+
+impl KnobChannels {
+    fn new(s: &Sampling, tag: &str) -> Self {
+        let f = |on: bool, v: f32, name: &str| {
+            on.then(|| Channel::from([v]).named(&format!("{name}{tag}")))
+        };
+        let sampled = s.temperature > 0.0;
+        let penalized = s.penalized();
+        Self {
+            temperature: sampled.then(|| s.temperature.max(1e-4)),
+            top_p: f(sampled && s.top_p < 1.0, s.top_p, "top_p"),
+            top_k: (sampled && s.top_k > 0)
+                .then(|| Channel::from([s.top_k]).named(&format!("top_k{tag}"))),
+            repetition: f(penalized && s.repetition_penalty != 1.0, s.repetition_penalty, "rep_pen"),
+            frequency: f(penalized && s.frequency_penalty != 0.0, s.frequency_penalty, "freq_pen"),
+            presence: f(penalized && s.presence_penalty != 0.0, s.presence_penalty, "pres_pen"),
+        }
+    }
+
+    /// Read without consuming: the seeded values stay for every fire.
+    fn read(&self) -> Knobs {
+        let t = |c: &Option<Channel>| c.as_ref().map(|c| reshape(c.read(), []));
+        Knobs {
+            temperature: self.temperature,
+            top_p: t(&self.top_p),
+            top_k: t(&self.top_k),
+            repetition: t(&self.repetition),
+            frequency: t(&self.frequency),
+            presence: t(&self.presence),
+        }
+    }
+}
+
 /// The sampled token as a rank-0 i32, and the next output-token histogram.
 /// `histogram` is `(counts, present)`: how often each token was generated,
 /// and whether it was in the prompt.
 fn sample(
     vocab: u32,
-    s: Sampling,
+    k: &Knobs,
     r: &Tensor,
     histogram: Option<(&Tensor, &Tensor)>,
     mask: Option<&Tensor>,
@@ -98,45 +154,46 @@ fn sample(
         let seen_out = gt(counts, &zero);
         let seen_prompt = gt(present, broadcast(0.5f32, [vocab]));
         let seen = or(&seen_out, &seen_prompt);
-        if s.repetition_penalty != 1.0 {
-            let rp = broadcast(s.repetition_penalty, [vocab]);
+        if let Some(rep) = &k.repetition {
+            let rp = broadcast(rep, [vocab]);
             let positive = gt(&logits, &zero);
             let repenalized = select(&positive, &logits / &rp, &logits * &rp);
             logits = select(&seen, &repenalized, &logits);
         }
-        if s.frequency_penalty != 0.0 {
-            logits = &logits - broadcast(s.frequency_penalty, [vocab]) * counts;
+        if let Some(freq) = &k.frequency {
+            logits = &logits - broadcast(freq, [vocab]) * counts;
         }
-        if s.presence_penalty != 0.0 {
-            logits = &logits - broadcast(s.presence_penalty, [vocab]) * cast(&seen_out, dtype::f32);
+        if let Some(pres) = &k.presence {
+            logits = &logits - broadcast(pres, [vocab]) * cast(&seen_out, dtype::f32);
         }
     }
     if let Some(mask) = mask {
         logits = mask_apply(&logits, mask);
     }
-    let token = if s.temperature <= 0.0 {
-        reduce_argmax(&logits)
-    } else {
-        let scaled = &logits / s.temperature.max(1e-4);
-        let mut keep: Option<Tensor> = None;
-        if s.top_k > 0 || s.top_p < 1.0 {
-            let probs = softmax(&scaled);
-            if s.top_k > 0 {
-                keep = Some(pivot_threshold(&probs, rank_le(s.top_k)));
+    let token = match k.temperature {
+        None => reduce_argmax(&logits),
+        Some(temperature) => {
+            let scaled = &logits / temperature;
+            let mut keep: Option<Tensor> = None;
+            if k.top_k.is_some() || k.top_p.is_some() {
+                let probs = softmax(&scaled);
+                if let Some(top_k) = &k.top_k {
+                    keep = Some(pivot_threshold(&probs, rank_le(top_k)));
+                }
+                if let Some(top_p) = &k.top_p {
+                    let nucleus = pivot_threshold(&probs, cummass_le(top_p));
+                    keep = Some(match keep {
+                        Some(k) => and(&k, &nucleus),
+                        None => nucleus,
+                    });
+                }
             }
-            if s.top_p < 1.0 {
-                let nucleus = pivot_threshold(&probs, cummass_le(s.top_p));
-                keep = Some(match keep {
-                    Some(k) => and(&k, &nucleus),
-                    None => nucleus,
-                });
-            }
+            let truncated = match keep {
+                Some(keep) => mask_apply(&scaled, keep),
+                None => scaled,
+            };
+            gumbel_max(&truncated, r)
         }
-        let truncated = match keep {
-            Some(keep) => mask_apply(&scaled, keep),
-            None => scaled,
-        };
-        gumbel_max(&truncated, r)
     };
     let next = histogram.map(|(counts, _)| scatter_add(counts, &token, 1.0f32));
     (token, next)
@@ -243,6 +300,7 @@ pub async fn generate(
         });
         let mask = matcher.map(|_| Channel::new([vocab], dtype::bool).named("mask_p"));
         let g0_ch = Channel::new([1], dtype::i32).named("g0");
+        let knobs = KnobChannels::new(&sampling, "_p");
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &embed_indptr)?;
@@ -262,7 +320,7 @@ pub async fn generate(
             let m = mask.map(|m| m.take());
             let (token, _) = sample(
                 vocab,
-                sampling,
+                &knobs.read(),
                 &r,
                 taken.as_ref().map(|(c, p)| (c, p)),
                 m.as_ref(),
@@ -308,6 +366,7 @@ pub async fn generate(
         .capacity(channel_capacity() as u32)
         .named("out");
     let rng = Channel::from([sampling.seed ^ 0x9e37, 1u32]).named("rng");
+    let knobs = KnobChannels::new(&sampling, "");
     let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
     let hist = penalized.then(|| {
         let mut counts0 = vec![0.0f32; vocab as usize];
@@ -336,10 +395,11 @@ pub async fn generate(
         let r = rng.take();
         let taken = hist.map(|(c, p)| (c.take(), p.take()));
         let m = mask.map(|m| m.take());
+        let k = knobs.read();
 
         let (token, counts_next) = sample(
             vocab,
-            sampling,
+            &k,
             &r,
             taken.as_ref().map(|(c, p)| (c, p)),
             m.as_ref(),

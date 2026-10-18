@@ -132,7 +132,10 @@ engine-metal = { path = "../engine-metal", optional = true }
 
 [features]
 default = []
-cuda = ["dep:engine-cuda", "engine-cuda/cuda", "media/nvenc"]
+cuda = ["engine-cuda", "engine-cuda/cuda", "media/nvenc"]
+rocm = ["engine-cuda", "engine-cuda/rocm"]
+# engine-cuda is built in, under `cuda` or `rocm`.
+engine-cuda = ["dep:engine-cuda"]
 metal = ["dep:engine-metal"]
 vulkan = ["dep:engine-vulkan", "engine-vulkan/vulkan"]
 wgpu = ["dep:engine-wgpu", "engine-wgpu/wgpu", "dep:wgpu"]

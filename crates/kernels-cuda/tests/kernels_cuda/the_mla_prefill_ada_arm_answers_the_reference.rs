@@ -194,7 +194,9 @@ fn prefill(gpu: &mut Gpu, case: &Case, raw: &Raw, device: &Device) -> Vec<u16> {
         HEADS as u32,
         RANK as u32,
         case.sm_scale,
+        None,
         &mut o,
+        None,
     )
     .expect("attention.mla_prefill enqueues");
     gpu.sync();

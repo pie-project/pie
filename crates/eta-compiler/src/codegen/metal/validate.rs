@@ -141,6 +141,14 @@ pub fn library_region_valid(stage: &CompiledStage, region: &Region) -> bool {
     if library_op_byte(region) == LibraryOp::NucleusSample as u8 {
         return nucleus_library_region_valid(stage, region);
     }
+    // A top-k sampler is the nucleus chain with a rank cut: Metal runs its
+    // thirteen nodes as a generated region.
+    if library_op_byte(region) == LibraryOp::LaneCut as u8 {
+        return region.nodes.len() == 1 && region.outputs.len() == 1 && region.sinks.is_empty();
+    }
+    if library_op_byte(region) == LibraryOp::RankSample as u8 {
+        return region.nodes.len() == 13 && region.outputs.len() == 1 && region.sinks.is_empty();
+    }
     let ops = &stage.normalized.ops;
     if region.nodes.len() != 1 || region.nodes[0].index() >= ops.len() {
         return false;

@@ -3,19 +3,12 @@
 use core::ffi::c_void;
 
 use crate::common::Gpu;
+use crate::common::host::cuda_ok as check;
 use kernels_cuda::Ctx;
 use kernels_cuda::cudarc::runtime::sys as rt;
 
 const DECODED_WEIGHT: &str = "linear.quant.decoded_weight";
 const TILE: u64 = 4 << 20;
-
-fn check(code: rt::cudaError, call: &str) {
-    assert_eq!(
-        code,
-        rt::cudaError::cudaSuccess,
-        "`{call}` answered {code:?}"
-    );
-}
 
 /// A conditional body is captured on a stream of its own and replayed in
 /// the main stream's order. The decoded-weight tile a load warms on the
@@ -40,6 +33,7 @@ fn a_body_captured_on_its_own_stream_takes_its_owners_tile() {
     let own = unsafe { Ctx::on(body).with_slabs(main.slabs()) };
     let in_order = unsafe { Ctx::on(body).with_slabs(main.slabs()) }.in_order_of(main.stream());
 
+    let alone = crate::common::capturing();
     unsafe {
         check(
             rt::cudaStreamBeginCapture(
@@ -60,6 +54,7 @@ fn a_body_captured_on_its_own_stream_takes_its_owners_tile() {
         check(rt::cudaGraphDestroy(graph), "cudaGraphDestroy");
         check(rt::cudaStreamDestroy(body.cast()), "cudaStreamDestroy");
     }
+    drop(alone);
 
     assert_eq!(
         shared.expect("a body in the main stream's order takes the main tile"),

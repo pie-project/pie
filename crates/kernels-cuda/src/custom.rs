@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::{KvPool, Tensor};
 
 const FILE: &str = "attn/qkv_fused.cuh";
@@ -10,9 +10,10 @@ const FILE: &str = "attn/qkv_fused.cuh";
 pub fn qkv_fused_qknorm_rope_vnorm_write(
     ctx: &Ctx,
     packed: Tensor,
-    positions: Tensor,
-    q_norm_weight: Tensor,
-    k_norm_weight: Tensor,
+    positions: Option<Tensor>,
+    q_norm_weight: Option<Tensor>,
+    k_norm_weight: Option<Tensor>,
+    v_norm: bool,
     eps: f32,
     pool: &KvPool,
     write_page: Tensor,
@@ -21,6 +22,10 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     head_dim: u32,
     theta: f32,
     rotary_dim: u32,
+    span: u32,
+    qk_norm: bool,
+    v_scale: f32,
+    widths: [u32; 2],
     q: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "custom_cuda.qkv_fused_qknorm_rope_vnorm_write";
@@ -31,9 +36,15 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
 
     const DECODE_BLOCK: u32 = 128;
 
+    const ROW_BLOCK: u32 = 256;
+
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
-    debug_assert_eq!(positions.dtype, Dtype::I32, "`{OP}` reads i32 positions");
-    if rotary_dim == 0 || rotary_dim > head_dim || !rotary_dim.is_multiple_of(2) {
+    debug_assert!(
+        positions.is_none_or(|p| p.dtype == Dtype::I32),
+        "`{OP}` reads i32 positions"
+    );
+    // A rotated width of 0 turns nothing.
+    if rotary_dim > head_dim || !rotary_dim.is_multiple_of(2) {
         return Err(refuse(
             OP,
             format!(
@@ -42,11 +53,41 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         ));
     }
     let rotary = stated(OP, rotary_dim)?;
+    // Pairs `span` apart: a lane run's whole entries, a power of two of them.
+    let lane_run = head_dim / 32;
+    if span == 0
+        || 2 * span > head_dim
+        || !span.is_multiple_of(lane_run.max(1))
+        || !(span / lane_run.max(1)).is_power_of_two()
+    {
+        return Err(refuse(
+            OP,
+            format!("pairs {span} apart do not turn in a {head_dim}-wide head's lane runs"),
+        ));
+    }
+    // Packed heads at their own widths: each a lane run's whole entries.
+    if widths
+        .iter()
+        .any(|&w| w > head_dim || !w.is_multiple_of(lane_run.max(1)))
+    {
+        return Err(refuse(
+            OP,
+            format!("{widths:?}-wide packed heads do not land in {head_dim}-wide lane runs"),
+        ));
+    }
+    // A 64- or 128-wide head moves 8 entries a lane where its pairs and
+    // widths fall in whole words (Muse's 64: 432 -> 260 us a 16384-row fire).
+    let word = matches!(head_dim, 64 | 128)
+        && span.is_multiple_of(8)
+        && (span / 8).is_power_of_two()
+        && widths.iter().all(|w| w.is_multiple_of(8));
+    let tail = (stated(OP, span)?, qk_norm, v_scale);
+    let (qk_width, v_width) = (stated(OP, widths[0])?, stated(OP, widths[1])?);
     let head_dim = count(OP, "the head width this fused write states", head_dim)?;
     let kv_heads = count(OP, "the kv head count this fused write states", kv_heads)?;
 
     let width = stated(OP, packed.width)?;
-    let num_q_heads = (width - 2 * kv_heads * head_dim) / head_dim;
+    let num_q_heads = (width - kv_heads * (qk_width + v_width)) / qk_width;
     if num_q_heads <= 0 {
         return Err(refuse(
             OP,
@@ -64,6 +105,52 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     let hnd_layout = pool.layout != 0;
     let rope_table = ArgValue::ABSENT;
     let window = ctx.stage();
+
+    // A prefill's rows go a block a row: the row's rotation is computed once
+    // for every head rather than once a head, and each head moves in whole
+    // 16-byte words. A decode's few rows keep the warp a head.
+    let by_row = matches!(head_dim, 64 | 128 | 256 | 512).then(|| {
+        let e = if word { 8 } else { head_dim / 32 };
+        format!("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32({head_dim}), ::pie::i32({e})>")
+    });
+    if let Some(instantiation) = by_row.filter(|_| packed.rows >= ctx.tuning().qkv_rows_from) {
+        return ctx.fire(
+            OP,
+            Fire::at(FILE, symbol(&instantiation)).apply(Launch::grid(
+                [packed.rows, 1, 1],
+                [if word { 64 } else { ROW_BLOCK }, 1, 1],
+            )),
+            &[
+                packed.arg(),
+                q.arg(),
+                pool.keys.arg(),
+                pool.values.arg(),
+                q_norm_weight.map_or(ArgValue::ABSENT, |t| t.arg()),
+                k_norm_weight.map_or(ArgValue::ABSENT, |t| t.arg()),
+                positions.map_or(ArgValue::ABSENT, |t| t.arg()),
+                pool.page_indices.arg(),
+                pool.page_indptr.arg(),
+                pool.last_page_lens.arg(),
+                write_page.arg(),
+                write_offset.arg(),
+                pool.row_valid.arg(),
+                window,
+                num_q_heads.arg(),
+                kv_heads.arg(),
+                pool.page_size.arg(),
+                hnd_layout.arg(),
+                theta.arg(),
+                eps.arg(),
+                v_norm.arg(),
+                rotary.arg(),
+                tail.0.arg(),
+                tail.1.arg(),
+                tail.2.arg(),
+                qk_width.arg(),
+                v_width.arg(),
+            ],
+        );
+    }
 
     let warped = match head_dim {
         64 => Some(
@@ -90,9 +177,9 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
                 q.arg(),
                 pool.keys.arg(),
                 pool.values.arg(),
-                q_norm_weight.arg(),
-                k_norm_weight.arg(),
-                positions.arg(),
+                q_norm_weight.map_or(ArgValue::ABSENT, |t| t.arg()),
+                k_norm_weight.map_or(ArgValue::ABSENT, |t| t.arg()),
+                positions.map_or(ArgValue::ABSENT, |t| t.arg()),
                 rope_table,
                 pool.page_indices.arg(),
                 pool.page_indptr.arg(),
@@ -108,9 +195,26 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
                 hnd_layout.arg(),
                 theta.arg(),
                 eps.arg(),
+                v_norm.arg(),
                 rotary.arg(),
+                tail.0.arg(),
+                tail.1.arg(),
+                tail.2.arg(),
+                qk_width.arg(),
+                v_width.arg(),
             ],
         );
+    }
+    // The block-a-head kernel turns Gemma's pairs under norms alone.
+    if 2 * span != head_dim.unsigned_abs()
+        || !qk_norm
+        || v_scale != 1.0
+        || widths != [head_dim.unsigned_abs(); 2]
+    {
+        return Err(refuse(
+            OP,
+            format!("a {head_dim}-wide head turns only half-head pairs under its norms"),
+        ));
     }
     ctx.fire(
         OP,
@@ -124,9 +228,9 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
             q.arg(),
             pool.keys.arg(),
             pool.values.arg(),
-            q_norm_weight.arg(),
-            k_norm_weight.arg(),
-            positions.arg(),
+            q_norm_weight.map_or(ArgValue::ABSENT, |t| t.arg()),
+            k_norm_weight.map_or(ArgValue::ABSENT, |t| t.arg()),
+            positions.map_or(ArgValue::ABSENT, |t| t.arg()),
             rope_table,
             pool.page_indices.arg(),
             pool.page_indptr.arg(),
@@ -142,6 +246,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
             hnd_layout.arg(),
             theta.arg(),
             eps.arg(),
+            v_norm.arg(),
             rotary.arg(),
         ],
     )

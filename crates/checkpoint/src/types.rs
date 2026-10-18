@@ -80,11 +80,18 @@ pub enum QuantScheme {
     /// per block, one inline fp16 scale, no separate scales/biases plane. Served
     /// natively (decode-in-dot) rather than decoded-then-re-encoded.
     Ptq1_0,
+    /// NVFP4 as modelopt stores it: e2m1 codes under one e4m3 scale per 16,
+    /// those under the f32 tensor scale of their row (`.global_scales`).
+    Nvfp4E2M1E4M3,
+    /// e4m3 codes under one f32 scale for the whole tensor (modelopt's
+    /// per-tensor FP8).
+    Fp8E4M3Tensor,
 }
 
 impl QuantScheme {
     pub fn default_bits(self) -> u8 {
         match self {
+            Self::Fp8E4M3Tensor => 8,
             Self::AwqInt4
             | Self::GptqInt4
             | Self::Mxfp4E2M1E8M0
@@ -95,6 +102,7 @@ impl QuantScheme {
             | Self::GgufIq4Nl
             | Self::GgufIq4Xs
             | Self::GgufMxfp4
+            | Self::Nvfp4E2M1E4M3
             | Self::Int4B8 => 4,
             Self::GgufQ2K | Self::GgufIq2Xxs | Self::GgufIq2Xs | Self::GgufIq2S => 2,
             // Ternary is ~1.6 bpw; the block rounds it to 2 for the bits field.
@@ -134,7 +142,7 @@ impl QuantScheme {
             | Self::GgufIq4Nl
             | Self::GgufIq4Xs
             | Self::GgufMxfp4 => 32,
-            Self::GgufQ2K | Self::GgufQ3K | Self::GgufQ6K => 16,
+            Self::GgufQ2K | Self::GgufQ3K | Self::GgufQ6K | Self::Nvfp4E2M1E4M3 => 16,
             Self::Ptq1_0 => 128,
             Self::GgufIq2Xxs
             | Self::GgufIq2Xs
@@ -142,6 +150,7 @@ impl QuantScheme {
             | Self::GgufIq3Xxs
             | Self::GgufIq3S => 32,
             Self::Fp8E4M3
+            | Self::Fp8E4M3Tensor
             | Self::Fp8E5M2
             | Self::Int8Symmetric
             | Self::Int8Asymmetric
@@ -345,4 +354,10 @@ pub enum ScaleForm {
     RawE8M0,
     F32Factors,
     Bf16AffineFactors,
+    /// One e4m3 scale per group under its row's f32 tensor scale; the
+    /// attachment's second companion (`zero_point_tensor`) is the plane of
+    /// tensor scales, one per row.
+    E4m3TensorScaled,
+    /// One f32 scale for the whole tensor, a scalar plane.
+    F32Tensor,
 }

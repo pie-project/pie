@@ -64,6 +64,7 @@ pub struct Cuda {
     sink: Option<engine::CompletionSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
     adapters: BTreeMap<InstanceId, crate::Binding>,
+    replay: Option<crate::replay::Replay>,
 }
 
 impl Cuda {
@@ -81,6 +82,7 @@ impl Cuda {
             sink: None,
             pending: None,
             adapters: BTreeMap::new(),
+            replay: None,
         }
     }
 
@@ -245,36 +247,69 @@ fn extents(stated: &BindExtents) -> eta_exec::Extents {
     }
 }
 
+/// The backend the host emits fused regions for: the HIP dialect (wave64)
+/// on ROCm.
+#[cfg(not(feature = "rocm"))]
+pub const CODEGEN: &str = "cuda";
+#[cfg(feature = "rocm")]
+pub const CODEGEN: &str = "hip";
+
 /// Powers of two from the floor up to `max_tokens`, with `steps - 1` more
-/// between each pair.
+/// between each pair; from `fine_from` rows (0 never), at least
+/// `PREFILL_LATTICE_STEPS` a doubling. A prefill's GEMMs run its bucket's
+/// rows, so a 2K prompt padded to 4096 costs a second prompt, while buckets
+/// this tall are few.
 #[must_use]
-pub(crate) fn default_lattice(max_tokens: u32, steps: u32) -> Vec<u32> {
+pub(crate) fn default_lattice(max_tokens: u32, steps: u32, fine_from: u32) -> Vec<u32> {
     let steps = steps.max(1);
     let mut lattice: Vec<u32> = Vec::new();
-    for i in 0u32.. {
-        let point = (f64::from(LATTICE_FLOOR) * 2f64.powf(f64::from(i) / f64::from(steps))).ceil();
+    let push = |point: f64, lattice: &mut Vec<u32>| -> bool {
         if point >= f64::from(max_tokens) {
-            break;
+            return false;
         }
         let point = point as u32;
         if lattice.last() != Some(&point) {
             lattice.push(point);
+        }
+        true
+    };
+    for i in 0u32.. {
+        let point = (f64::from(LATTICE_FLOOR) * 2f64.powf(f64::from(i) / f64::from(steps))).ceil();
+        if fine_from > 0 && point >= f64::from(fine_from) {
+            break;
+        }
+        if !push(point, &mut lattice) {
+            lattice.push(max_tokens);
+            return lattice;
+        }
+    }
+    let fine = steps.max(PREFILL_LATTICE_STEPS);
+    for i in 0u32.. {
+        let point = (f64::from(fine_from) * 2f64.powf(f64::from(i) / f64::from(fine))).ceil();
+        if !push(point, &mut lattice) {
+            break;
         }
     }
     lattice.push(max_tokens);
     lattice
 }
 
+const PREFILL_LATTICE_STEPS: u32 = 4;
+
 pub(crate) const LATTICE_FLOOR: u32 = 1;
 
 #[must_use]
-pub(crate) fn lattice(stated: Vec<u32>, max_tokens: u32, steps: u32) -> Vec<u32> {
+pub(crate) fn lattice(stated: Vec<u32>, max_tokens: u32, steps: u32, fine_from: u32) -> Vec<u32> {
     if stated.is_empty() {
-        default_lattice(max_tokens, steps)
+        default_lattice(max_tokens, steps, fine_from)
     } else {
         stated
     }
 }
+
+/// The rows a fire takes when neither `max_forward_tokens` nor the chip's
+/// profile states them.
+pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
 
 fn bake_budgets(budgets: &LoadBudgets) -> Budget {
     Budget {
@@ -298,7 +333,13 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
 
     let max_patches = budgets
         .max_patches
-        .unwrap_or_else(|| budgets.max_tokens.min(DERIVED_PATCH_CEILING))
+        .unwrap_or_else(|| {
+            let tokens = match budgets.max_tokens {
+                0 => DEFAULT_FORWARD_TOKENS,
+                tokens => tokens,
+            };
+            tokens.min(DERIVED_PATCH_CEILING)
+        })
         .max(PATCH_LATTICE_FLOOR);
     let mut buckets = Vec::new();
     let mut rung = PATCH_LATTICE_FLOOR;
@@ -540,7 +581,7 @@ impl Engine for Cuda {
                 native_mxfp4_moe: false,
                 storage_alignment: 256,
                 storage_max_tile_bytes: u64::MAX,
-                codegen_backend: Some("cuda".to_string()),
+                codegen_backend: Some(CODEGEN.to_string()),
             },
             pools: PoolFacts {
                 kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
@@ -565,6 +606,8 @@ impl Engine for Cuda {
                 host_state_slots: shell.host_state_slots(),
                 host_buffer_pages: shell.host_buffer_pages(),
                 disk_kv_pages,
+                one_frame_when_short: shell.one_frame_when_short(),
+                seated_first: shell.seated_first(),
             },
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
@@ -592,11 +635,17 @@ impl Engine for Cuda {
             media_encode: false,
             device_channel_commit: true,
             rs_verbs: true,
+            rs_snapshots: if state_rows {
+                crate::store::rs::snapshots(shell.trace())
+            } else {
+                0
+            },
             bidirectional_attention: true,
             adapter_attachments: true,
             facts: shell.trace().facts.clone(),
         };
 
+        self.replay = crate::replay::Replay::of(&shell);
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -649,7 +698,19 @@ impl Engine for Cuda {
                 frame: id,
                 step: index as u32,
             };
-            let (ticket, step_settled) = match self.fire_step(step, at) {
+            // A causal encoder-decoder's long prompts: their leading rows
+            // through the encoder alone first, unannounced, then the step
+            // with each such prompt's last window (`crate::replay`).
+            let split = self.replay.and_then(|replay| replay.split(step));
+            if let Some((head, _)) = &split
+                && let Err(error) = self.fire_step(head, at, false)
+            {
+                self.pending = None;
+                let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
+                return Err(attributed(error, airborne));
+            }
+            let step = split.as_ref().map_or(step, |(_, tail)| tail);
+            let (ticket, step_settled) = match self.fire_step(step, at, true) {
                 Ok(both) => both,
                 Err(error) => {
                     self.pending = None;
@@ -701,6 +762,13 @@ impl Engine for Cuda {
         }
         self.pending = Some((ticket.id, settled));
         Ok(())
+    }
+
+    fn publish_landed(&mut self) -> EngineResult<()> {
+        match self.shell.as_mut() {
+            Some(shell) => shell.reap_landed_guests().map_err(fault),
+            None => Ok(()),
+        }
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
@@ -926,18 +994,24 @@ impl Engine for Cuda {
 }
 
 impl Cuda {
+    /// `submission` fired; its completion told the sink where `announce`.
     fn fire_step(
         &mut self,
         submission: &Step,
         at: engine::StepDone,
+        announce: bool,
     ) -> EngineResult<(FireTicket, PendingStep)> {
         let id = self.next_fire;
         self.next_fire = self.next_fire.wrapping_add(1);
 
-        let done = self.sink.as_ref().map(|sink| crate::serve::Done {
-            at,
-            sink: std::sync::Arc::clone(sink),
-        });
+        let done = self
+            .sink
+            .as_ref()
+            .filter(|_| announce)
+            .map(|sink| crate::serve::Done {
+                at,
+                sink: std::sync::Arc::clone(sink),
+            });
         let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
         if !self.adapters.is_empty() {
             for attachment in &submission.attachments {
@@ -994,6 +1068,7 @@ impl Cuda {
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
                     rs_slot: lane.rs_slot,
+                    rs_snapshots: &lane.rs_snapshots,
                     readout: match &lane.readout {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,

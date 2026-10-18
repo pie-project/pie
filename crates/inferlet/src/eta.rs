@@ -137,6 +137,16 @@ impl Channel {
         self
     }
 
+    /// A queue between passes: another pass consumes it, so the pass that
+    /// puts it does not read it as its output for the host; a pass that
+    /// peeks it as a port (`kv_len`, `pages`, `page_indptr`) takes each value
+    /// in its own epilogue, and another pass's put appends to the ring
+    /// rather than replacing the value a peek reads. Set before use.
+    pub fn queued(self) -> Channel {
+        let _ = self.dsl().queued();
+        self
+    }
+
     pub fn from(v: impl IntoConst) -> Channel {
         let data: ConstData = v.into_const();
         let ch = Channel::build(data.shape, data.dtype, true);

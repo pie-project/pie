@@ -30,12 +30,14 @@ def gate(streams, mix, hy):
     )
 
 def summed(streams, hidden, count):
-    """The `count` streams, each `hidden` wide, added into one row."""
+    """The mean of the `count` streams, each `hidden` wide: the unweighted
+    collapse the head reads (a sum would read the final norm's epsilon a
+    `count` squared smaller)."""
     y, rest = ops.layout.split_rows(streams, hidden)
     for _ in range(1, count - 1):
         stream, rest = ops.layout.split_rows(rest, hidden)
         y = ops.elemwise.residual_add(stream, y)
-    return ops.elemwise.residual_add(rest, y)
+    return ops.elemwise.residual_add(rest, y) * f32(1.0 / count)
 
 def predict_route(streams, hy, mix, norm, norm_eps, router, bias, experts):
     """The experts a following MLP's router is predicted to take: the
@@ -92,8 +94,13 @@ def kda(x, inputs, k):
     o = ops.elemwise.rmsnorm_gated_by(core, g, k.o_norm, k.heads, k.o_norm_eps)
     return ops.linear.matmul(o, k.o_proj)
 
-def cache(c, space, a):
-    """`a`'s latent rows in the kv `space`."""
+def cache(c, space, a, fp8):
+    """`a`'s latent rows in the kv `space`: an e4m3 kv deployment's as vLLM's
+    standard fp8 rows (the latent and rotated dims' e4m3 codes under one
+    scale of 1 in a u8 plane)."""
+    if fp8:
+        c.kv(space, a.kv, [a.kv_lora_rank + a.qk_rope_head_dim], a.qk_rope_head_dim)
+        return
     c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
 
 def plans(inputs, heads, kv_lora_rank):
@@ -187,19 +194,21 @@ def boundaries(positions, row_valid, ratio, split = True):
     return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])
 
 def caches(m, c):
-    kv = c.kv_space(m.kv)
+    fp8 = m.kv == dtype.e4m3
+    kv = c.kv_space(dtype.u8 if fp8 else m.kv)
+    keys = dtype.bf16 if fp8 else m.kv
     for w in m.layers:
         a = w.mixer
         if w.mixer_kind == "mla":
-            index = c.kv_space(m.kv)
-            cache(c, kv, a)
+            index = c.kv_space(keys)
+            cache(c, kv, a, fp8)
             c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
         else:
             kda_caches(c, a)
     if m.mtp != None:
         a = m.mtp.attn
-        index = c.kv_space(m.kv)
-        cache(c, kv, a)
+        index = c.kv_space(keys)
+        cache(c, kv, a, fp8)
         c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
 
 def forward(m, inputs):
@@ -228,7 +237,8 @@ def forward(m, inputs):
         x, post_mix, comb_mix = gate(streams, w.mlp_mix, hy)
         x = ops.elemwise.rmsnorm(x, w.mlp_norm, w.mlp_norm_eps)
         following = m.layers[l + 1] if l + 1 < len(m.layers) else None
-        hint = predict_next(streams, following, hy)
+        # The next layer's predicted experts, where the backend streams them.
+        hint = predict_next(streams, following, hy) if inputs.route_hints() else None
         f = mlp(x, w.mlp, hint)
         return ops.elemwise.hc_fold(f, streams, post_mix, comb_mix)
 
@@ -290,8 +300,9 @@ def mlp(x, f, hint):
             ops.linear.mlp_swiglu_clamp(ops.linear.matmul(x, f.gate_up), f.inter, f.limit),
             f.down,
         )
+    # The release routes at f32: its logits are never rounded to bf16.
     routes, weights = ops.linear.moe_topk_sigmoid_biased_hinted(
-        ops.linear.matmul(x, f.router),
+        ops.linear.matmul_f32(x, f.router),
         f.bias,
         f.experts,
         f.top_k,
@@ -299,12 +310,9 @@ def mlp(x, f, hint):
         f.scaling,
         hint,
     )
-    packed = ops.linear.moe_matmul_select_quant(x, f.gate_up, routes, f.top_k)
+    packed = select(x, f.gate_up, routes, f.top_k)
     act = ops.linear.mlp_swiglu_clamp(packed, f.inter, f.limit)
-    routed = ops.linear.moe_weighted_sum(
-        ops.linear.moe_matmul_select_quant(act, f.down, routes, f.top_k),
-        weights,
-    )
+    routed = ops.linear.moe_weighted_sum(select(act, f.down, routes, f.top_k), weights)
     s = f.shared
     act = ops.linear.mlp_swiglu_clamp(ops.linear.matmul(x, s.gate_up), s.inter, f.limit)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
@@ -347,7 +355,18 @@ def index_select(x, q_a, inputs, positions, act, ix, split):
         ix.theta,
     )
     weights = ops.linear.matmul(x, ix.weights_proj)
-    return ops.attn.index_topk(q, weights, keys, ix.heads, ix.head_dim, ix.top_k, ix.kpool)
+    # The budget is the release's in tokens: its blocks are read back as the
+    # tokens each stands for, with the row's own open block.
+    return ops.attn.index_topk(
+        q,
+        weights,
+        keys,
+        ix.heads,
+        ix.head_dim,
+        ix.top_k // ix.kpool,
+        ix.kpool,
+        "pooled_tokens",
+    )
 
 def tower(inputs, t):
     d = t.head_dim
@@ -387,3 +406,10 @@ def tower(inputs, t):
     h = ops.linear.matmul(g, mg.gate_up)
     a = ops.linear.mlp_swiglu_clamp(h, t.merger_inter, t.limit)
     return ops.linear.matmul(a, mg.down)
+
+def select(x, bank, routes, top_k):
+    """A routed bank's select: a bf16 bank's plain, a quantized one's
+    through its codes and factors."""
+    if bank.dtype == dtype.bf16:
+        return ops.linear.moe_matmul_select(x, bank, routes, top_k)
+    return ops.linear.moe_matmul_select_quant(x, bank, routes, top_k)

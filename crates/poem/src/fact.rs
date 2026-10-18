@@ -82,6 +82,12 @@ pub fn bidirectional() -> Predicate {
     flag(Request::BIDIRECTIONAL)
 }
 
+/// The rows of a prompt only a causal encoder-decoder's encoder reads.
+#[must_use]
+pub fn encode() -> Predicate {
+    flag(Request::ENCODE)
+}
+
 /// The rows of the stream `stream`.
 #[must_use]
 pub fn stream(stream: Stream) -> Predicate {

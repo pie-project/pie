@@ -1,0 +1,213 @@
+# The forward of Hy4-preview: sublayers gated out of and folded back into
+# four hyper-connected streams; latent attention over the keys the last
+# ranking layer picked, sink-rescaled and gated; and the MTP draft head.
+
+def gate(streams, mix, hy):
+    """The sublayer input `mix` reads out of `streams`, and the post and
+    (identity) combine mixes its output is folded back with."""
+    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
+    return ops.elemwise.hc_gates_independent(
+        ops.elemwise.hc_project(normed, mix.dynamic, hy.streams),
+        streams,
+        mix.scale,
+        mix.base,
+        hy.streams,
+        hy.gate_eps,
+        hy.alpha,
+    )
+
+def collapse(streams, head, hy):
+    """The streams collapsed into one row through the mix `head`."""
+    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
+    mixed = ops.elemwise.hc_project(normed, head.dynamic, hy.streams)
+    return ops.elemwise.hc_collapse(mixed, streams, head.scale, head.base, hy.streams, hy.gate_eps)
+
+def cache(c, space, a):
+    """`a`'s latent rows in the kv `space`."""
+    c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
+
+def plans(inputs, heads, kv_lora_rank):
+    """The decode and prefill arms' plans over `inputs`."""
+    one = fact.single_token()
+    decode, prefill = inputs.on(one), inputs.on(~one)
+    return struct(
+        decode = ops.attn.mla_plan(decode, heads, kv_lora_rank),
+        prefill = ops.attn.mla_plan(prefill, heads, kv_lora_rank),
+    )
+
+def whole(inputs, heads, kv_lora_rank):
+    """A plan that reads every row of `inputs` through the prefill arm."""
+    return struct(decode = None, prefill = ops.attn.mla_plan(inputs, heads, kv_lora_rank))
+
+def attention(x, inputs, plan, positions, a, selection):
+    """Latent attention of the rows `x` over the keys `a`'s indexer ranks,
+    or with none the `selection` the last ranking layer left: the attention
+    and the selection it read."""
+    pages = inputs.kv(a.kv)
+    write_page = inputs.write_page(a.kv)
+    write_offset = inputs.write_offset(a.kv)
+
+    q_a = ops.linear.matmul(x, a.q_a_proj)
+    q_a = ops.elemwise.rmsnorm(q_a, a.q_a_norm, a.q_a_norm_eps)
+    q_b = ops.linear.matmul(q_a, a.q_b_proj)
+    kv_a = ops.linear.matmul(x, a.kv_a_proj)
+    seam.at(seam.ATTN_QV, [q_b, kv_a])
+
+    if a.indexer != None:
+        selection = index_select(x, q_a, inputs, positions, a.indexer)
+    elif selection == None:
+        fail("a layer reading the last ranking follows no layer that ranked")
+
+    kv_c, k_pe = ops.attn.mla_latents_rope(
+        kv_a,
+        positions,
+        a.kv_a_norm,
+        a.kv_a_norm_eps,
+        a.kv_lora_rank,
+        a.qk_rope_head_dim,
+        a.theta,
+    )
+    ops.attn.mla_kv_append(kv_c, k_pe, pages, write_page, write_offset)
+
+    q_nope, q_pe = ops.attn.mla_split_q_b(q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim)
+    q_pe = ops.elemwise.rope_partial_q(q_pe, positions, a.qk_rope_head_dim, a.qk_rope_head_dim, a.theta)
+    q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    seam.at(seam.ATTN_Q, [q])
+
+    if plan.decode == None:
+        scored, lse = arm(False, q, plan.prefill, q_pe, selection, pages, a)
+    else:
+        one = fact.single_token()
+        scored_d, lse_d = arm(True, q.on(one), plan.decode, q_pe.on(one), selection.on(one), pages, a)
+        scored_p, lse_p = arm(False, q.on(~one), plan.prefill, q_pe.on(~one), selection.on(~one), pages, a)
+        scored, lse = merge([scored_d, scored_p]), merge([lse_d, lse_p])
+    scored = ops.attn.sink(scored, lse, a.sink, a.kv_lora_rank)
+
+    o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
+    seam.at(seam.ATTN_OUT, [o])
+    return ops.linear.matmul(o, a.o_proj), selection
+
+def arm(decode, q, plan, q_pe, selection, pages, a):
+    score = ops.attn.mla_decode_selected_lse if decode else ops.attn.mla_prefill_selected_lse
+    return score(q, plan, q_pe, selection, pages, a.heads, a.kv_lora_rank, a.sm_scale)
+
+def index_select(x, q_a, inputs, positions, ix):
+    """The keys each row reads: the indexer's keys appended, its queries
+    scored against every cached key, the top `ix.top_k` kept. The checkpoint
+    turns the last `rope_dim` of each head; the reader moves them first."""
+    keys = inputs.kv(ix.keys)
+    k = ops.attn.index_layernorm_rope(
+        ops.linear.matmul(x, ix.wk),
+        positions,
+        ix.k_norm,
+        ix.k_norm_eps,
+        ix.k_norm_bias,
+        ix.rope_dim,
+        ix.theta,
+    )
+    ops.attn.index_kv_append(k, keys, inputs.write_page(ix.keys), inputs.write_offset(ix.keys))
+    q = ops.attn.index_rope(
+        ops.linear.matmul(q_a, ix.wq_b),
+        positions,
+        ix.heads,
+        ix.head_dim,
+        ix.rope_dim,
+        ix.theta,
+    )
+    weights = ops.linear.matmul(x, ix.weights_proj)
+    return ops.attn.index_topk(q, weights, keys, ix.heads, ix.head_dim, ix.top_k, 1)
+
+def mlp(x, f):
+    if not f.routed:
+        return ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, f.gate_up), f.inter), f.down)
+    routes, weights = ops.linear.moe_topk_sigmoid_biased(
+        ops.linear.matmul(x, f.router),
+        f.bias,
+        f.experts,
+        f.top_k,
+        f.renorm,
+        f.scaling,
+    )
+
+    def select(act, bank):
+        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
+            return ops.linear.moe_matmul_select(act, bank, routes, f.top_k)
+        return ops.linear.moe_matmul_select_quant(act, bank, routes, f.top_k)
+
+    act = ops.linear.mlp_swiglu_clamp(select(x, f.gate_up), f.inter, f.limit)
+    routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
+    s = f.shared
+    act = ops.linear.mlp_swiglu(ops.linear.matmul(x, s.gate_up), s.inter)
+    return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    index = c.kv_space(m.kv)
+    for w in m.layers:
+        cache(c, kv, w.attn)
+        if w.attn.indexer != None:
+            c.kv(index, w.attn.indexer.keys, [w.attn.indexer.head_dim], w.attn.indexer.head_dim)
+    if m.mtp != None:
+        a = m.mtp.attn
+        cache(c, kv, a)
+        c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
+
+def forward(m, inputs):
+    hy = m.hyper
+    plan = plans(inputs, m.heads, m.kv_lora_rank)
+    positions = inputs.positions()
+    streams = ops.elemwise.hc_expand(ops.layout.embed(inputs.tokens(), m.embed, m.vocab), hy.streams)
+    routes = inputs.adapter_routes()
+
+    def block(l, w, carried):
+        streams, selection = carried
+        x, post_mix, comb_mix = gate(streams, w.attn_mix, hy)
+        x = ops.elemwise.rmsnorm(x, w.attn_norm, w.attn_norm_eps)
+        o, selection = attention(x, inputs, plan, positions, w.attn, selection)
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        streams = ops.elemwise.hc_fold(o, streams, post_mix, comb_mix)
+
+        x, post_mix, comb_mix = gate(streams, w.mlp_mix, hy)
+        x = ops.elemwise.rmsnorm(x, w.mlp_norm, w.mlp_norm_eps)
+        streams = ops.elemwise.hc_fold(mlp(x, w.mlp), streams, post_mix, comb_mix)
+        return streams, selection
+
+    streams, _ = inputs.fold_layers(m.layers, (streams, None), block)
+
+    y = collapse(streams, m.hc_head, hy)
+    y = ops.layout.gather_rows(y, inputs.readout_rows())
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
+    logits = ops.linear.lm_head(x, m.head)
+
+    if m.mtp != None:
+        draft(m, inputs, x, positions, logits)
+    return logits
+
+def draft(m, inputs, hidden, positions, logits):
+    """The MTP head's drafted token, from the trunk's last normed rows
+    `hidden` and the token its logits pick: one plain residual layer, no
+    streams."""
+    mtp = m.mtp
+    drafted = inputs.on(fact.drafts())
+    plan = whole(drafted, m.heads, m.kv_lora_rank)
+    hidden = hidden.on(fact.drafts())
+    positions = positions.on(fact.drafts())
+    token = ops.layout.argmax([logits.on(fact.drafts())])
+
+    e = ops.layout.embed(token, m.embed, m.vocab)
+    e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
+    h = ops.elemwise.rmsnorm(hidden, mtp.hnorm, mtp.norm_eps)
+    fused = ops.elemwise.residual_add(
+        ops.linear.matmul(e, mtp.e_proj),
+        ops.linear.matmul(h, mtp.h_proj),
+    )
+    x = ops.elemwise.rmsnorm(fused, mtp.attn_norm, mtp.norm_eps)
+    o, _ = attention(x, drafted, plan, positions, mtp.attn, None)
+    r = ops.elemwise.residual_add(o, fused)
+    x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.norm_eps)
+    r = ops.elemwise.residual_add(mlp(x, mtp.mlp), r)
+    proposal = ops.linear.lm_head(ops.elemwise.rmsnorm(r, mtp.norm, mtp.norm_eps), m.head)
+    seam.at(seam.MTP, [proposal])
+    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([proposal])])

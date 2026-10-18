@@ -1,0 +1,23 @@
+# MiniMax-M3, its language model, and a six-layer, eight-expert miniature
+# of it: three dense layers and three sparse.
+
+MINIMAX = template("minimax")
+TOKENIZER = tokenizer(markers = [["[e~[", "]~b]", "]~!b[", "]<]minimax[>[", "<mm:think>", "</mm:think>"]])
+
+def m3(id, **kwargs):
+    return model(id, template = MINIMAX, tokenizer = TOKENIZER, arch = "minimax_m3_vl", vocab = 200064, **kwargs)
+
+MODELS = [
+    m3("minimax-m3", layers = 60),
+    m3("minimax-m3-mini", mini = True, layers = 6),
+]
+
+BF = dtype.bf16
+U4 = dtype.u4g64
+
+DEPLOYMENTS = [
+    deployment("minimax-m3", weights = U4, kv = BF),
+    deployment("minimax-m3", weights = BF, kv = BF),
+    deployment("minimax-m3-mini", weights = BF, kv = BF),
+    deployment("minimax-m3-mini", weights = U4, kv = BF),
+]

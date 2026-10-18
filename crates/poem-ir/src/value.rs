@@ -6,7 +6,7 @@ use crate::guard::Guard;
 pub struct ValueId(pub u32);
 
 pub use dtype::Dtype;
-pub use dtype::{BIASES, SCALES, TILED_BAND, TILED_STEP};
+pub use dtype::{BIASES, GLOBAL_SCALES, INPUT_SCALES, SCALES, TILED_BAND, TILED_STEP};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Dim {

@@ -167,6 +167,43 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
         let mut layers = 0u32;
         let mut decode_layers = 0u32;
         for (at, node) in trace.nodes.iter().enumerate() {
+            // The fused decode step reads the planes its primitives would:
+            // the conv's rows (the split it lands) and the gate prep's
+            // `[b | a]`.
+            if let Operation::Fused(poem_ir::Fused::GdnStep { qkv, ba, .. }) = &node.op {
+                let page = u64::from(paging);
+                let mut here = 0u64;
+                for (what, id) in [
+                    ("the conv's rows", *qkv),
+                    ("the gate prep's `[b | a]`", *ba),
+                ] {
+                    let width = width_of(trace, id).ok_or_else(|| unsized_plane(what, id))?;
+                    planes.insert(
+                        id.0,
+                        Plane {
+                            layer: decode_layers,
+                            at: page * here,
+                            width,
+                        },
+                    );
+                    here += width;
+                }
+                match per_token {
+                    None => per_token = Some(here),
+                    Some(first) if first == here => {}
+                    Some(first) => {
+                        return Err(Fault::Unbound {
+                            what: format!(
+                                "recurrent layer {decode_layers} buffers {here} elements a token \
+                                 where layer 0 buffers {first} — this pool cuts one page-slot \
+                                 stride for every layer"
+                            ),
+                        });
+                    }
+                }
+                decode_layers += 1;
+                continue;
+            }
             let (reads, chunked) = match &node.op {
                 Operation::Attention(Attention::SsmGatedDeltaChunked { qkv, gates, .. }) => (
                     Reads::GatedDelta {
@@ -439,6 +476,59 @@ fn width_of(trace: &Trace, id: ValueId) -> Option<u64> {
     }
 }
 
+/// The snapshot rows one lane lands in a fire (`Lane::rs_snapshots`), and
+/// the chunks every fire's scans keep for them, so a body recorded with none
+/// replays with up to this many.
+pub const SNAPSHOTS: u32 = 16;
+
+/// The snapshots this engine lands in a lane: [`SNAPSHOTS`] where every op
+/// that reads a state slot is a recurrent scan or window whose chunked arm
+/// lands them (a single-token arm never meets one), else none.
+#[must_use]
+pub fn snapshots(trace: &Trace) -> u32 {
+    if !cfg!(feature = "rocm") {
+        return 0;
+    }
+    let state = |id: &ValueId| {
+        matches!(
+            trace.values.get(id.0 as usize).map(|value| &value.def),
+            Some(poem_ir::Def::Cache(row))
+                if matches!(trace.caches.get(*row as usize), Some(poem_ir::CacheRow::State { .. }))
+        )
+    };
+    let mut reads = Vec::new();
+    let lands = trace.nodes.iter().all(|node| {
+        reads.clear();
+        node.op.inputs(&mut reads);
+        !reads.iter().any(state)
+            || matches!(
+                node.op,
+                Operation::Attention(
+                    Attention::SsmCausalConv1d { .. }
+                        | Attention::SsmCausalConv1dChunked { .. }
+                        | Attention::ShortConv { .. }
+                        | Attention::ShortConvChunked { .. }
+                        | Attention::SsmGatedDelta { .. }
+                        | Attention::SsmGatedDeltaChunked { .. }
+                        | Attention::SsmKdaStep { .. }
+                        | Attention::SsmKdaChunked { .. }
+                        | Attention::PleNgramIds { .. }
+                        | Attention::PleNgramIdsChunked { .. }
+                ) | Operation::Fused(poem_ir::Fused::GdnStep { .. })
+            )
+    });
+    if lands { SNAPSHOTS } else { 0 }
+}
+
+/// A fire's snapshots in fire-lane order: lane `l`'s are entries
+/// `indptr[l]..indptr[l + 1]` of `rows` and `slots`.
+#[derive(Debug, Default, Clone)]
+pub struct SnapTable {
+    pub indptr: Vec<i32>,
+    pub rows: Vec<i32>,
+    pub slots: Vec<i32>,
+}
+
 #[derive(Debug)]
 pub struct Predicate {
     region: Buffer,
@@ -448,11 +538,17 @@ pub struct Predicate {
     at_indptr: u64,
     at_mask: u64,
     at_len: u64,
+    #[cfg(feature = "rocm")]
+    at_snap: Option<[u64; 3]>,
+    /// The lane bounds the last fire left nonzero, which the next fire that
+    /// takes no snapshot zeroes; a run of fires taking none stages nothing.
+    #[cfg(feature = "rocm")]
+    snap_dirty: usize,
     lanes: u32,
 }
 
 impl Predicate {
-    pub fn reserve(max_lanes: u32) -> Result<Predicate> {
+    pub fn reserve(max_lanes: u32, snapshots: bool) -> Result<Predicate> {
         let lanes = u64::from(max_lanes);
         let mut at = 0u64;
         let mut take = |bytes: u64| {
@@ -466,6 +562,13 @@ impl Predicate {
         let at_indptr = take((lanes + 1) * 4);
         let at_mask = take(lanes);
         let at_len = take(lanes * 4);
+        #[cfg(feature = "rocm")]
+        let at_snap = snapshots.then(|| {
+            let entries = lanes * u64::from(SNAPSHOTS);
+            [take((lanes + 1) * 4), take(entries * 4), take(entries * 4)]
+        });
+        #[cfg(not(feature = "rocm"))]
+        let _ = snapshots;
         let mut region = Buffer::zeroed(usize::try_from(at).unwrap_or(usize::MAX))?;
         region.write(at_one, &1u32.to_le_bytes())?;
         let identity: Vec<u8> = (0..=max_lanes)
@@ -480,6 +583,10 @@ impl Predicate {
             at_indptr,
             at_mask,
             at_len,
+            #[cfg(feature = "rocm")]
+            at_snap,
+            #[cfg(feature = "rocm")]
+            snap_dirty: 0,
             lanes: max_lanes,
         })
     }
@@ -533,6 +640,51 @@ impl Predicate {
     #[must_use]
     pub fn commit_len(&self, lanes: u32) -> kernels_cuda::Tensor {
         kernels_cuda::Tensor::new(self.region.ptr() + self.at_len, lanes, 1, Dtype::I32)
+    }
+
+    /// The fire's snapshot table, staged on every fire of an engine that
+    /// lands them (its lanes' bounds, zero where none takes one), so every
+    /// launch reads it where a body recorded it.
+    #[cfg(feature = "rocm")]
+    pub fn snapshots(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        table: &SnapTable,
+    ) -> Result<kernels_cuda::Snapshots> {
+        let Some(at_snap) = self.at_snap else {
+            return Ok(kernels_cuda::Snapshots::NONE);
+        };
+        let entries = u64::from(self.lanes) * u64::from(SNAPSHOTS);
+        if table.rows.len() as u64 > entries {
+            return Err(Fault::Ceiling {
+                what: "rs snapshots",
+                need: table.rows.len() as u64,
+                have: entries,
+            });
+        }
+        if !table.rows.is_empty() {
+            for (at, values) in at_snap
+                .into_iter()
+                .zip([&table.indptr, &table.rows, &table.slots])
+            {
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                self.region.stage(stream, at, &bytes)?;
+            }
+            self.snap_dirty = table.indptr.len();
+        } else if self.snap_dirty > 0 {
+            self.region
+                .stage(stream, at_snap[0], &vec![0u8; self.snap_dirty * 4])?;
+            self.snap_dirty = 0;
+        }
+        let planes =
+            at_snap.map(|at| kernels_cuda::Tensor::new(self.region.ptr() + at, 1, 1, Dtype::I32));
+        let [indptr, rows, slots] = planes;
+        Ok(kernels_cuda::Snapshots {
+            indptr,
+            rows,
+            slots,
+            count: SNAPSHOTS.max(table.rows.len() as u32),
+        })
     }
 
     pub fn read_mask(&self, lanes: u32) -> Result<Vec<u8>> {

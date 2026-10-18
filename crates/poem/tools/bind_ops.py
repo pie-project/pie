@@ -51,7 +51,11 @@ PARAMS = {
     "impl Into<u64>": ("u64", "{}"),
     # An op that records outside any value takes the rows whose trace it is.
     "&Recorder": ("Input", "{}.recorder()"),
+    # A ranking a package may leave out: the indexer's own.
+    "IndexScore": ("Option<IndexScore>", "{}.unwrap_or_default()"),
 }
+# Parameters a package may leave out, by name, and what they then pass.
+DEFAULTED = {"per_head": ("bool", "false")}
 RESULTS = {"Value", "(Value, Value)", "(Value, Value, Value)", "()", "RaggedMask", "ValueId"}
 
 # The `Input` methods this does not bind: `on` and `partition` are bound by
@@ -103,8 +107,18 @@ def entry(module, name, params, call, receiver):
     """The table row binding `call`, a template whose `{passes}` the row's
     unpacked parameters fill, but for a receiver the call names itself."""
     names = ", ".join(f'"{p}"' for p, _ in params)
-    takes = "".join(f"            let {p}: {PARAMS[t][0]} = a.next()?;\n" for p, t in params)
-    passes = ", ".join(PARAMS[t][1].format(p) for p, t in params[int(receiver):])
+    def unpacked(p, t):
+        if p in DEFAULTED and DEFAULTED[p][0] == t:
+            return f"Option<{t}>"
+        return PARAMS[t][0]
+
+    def passed(p, t):
+        if p in DEFAULTED and DEFAULTED[p][0] == t:
+            return f"{p}.unwrap_or({DEFAULTED[p][1]})"
+        return PARAMS[t][1].format(p)
+
+    takes = "".join(f"            let {p}: {unpacked(p, t)} = a.next()?;\n" for p, t in params)
+    passes = ", ".join(passed(p, t) for p, t in params[int(receiver):])
     return (
         "    Op {\n"
         f'        module: "{module}",\n'

@@ -1,8 +1,8 @@
 # How a DeepSeek-V4 checkpoint is laid out. V4.1-Flash: its per-expert
-# release layout, or MLX's stacked one. V4-Flash and the base: an artifact
-# with an `--aux` overlay, the flash mlx spelling, transformers' deepseek-v3
-# one, or GGUF's; the flash spellings share their names, so a reading is what
-# tells them apart.
+# release layout, or MLX's stacked one. V4-Flash, V4-Pro and the base: the
+# release layout (dense planes bf16, or fp8 beside `.scale` exponents), an
+# `--aux` artifact, mlx, transformers' deepseek-v3 or GGUF names; the flash
+# spellings share names, so a reading tells them apart.
 
 AFFINE = [dtype.u4g64, dtype.u8g64, dtype.u4g32, dtype.u2g32, dtype.u2g64, dtype.u2g128]
 
@@ -21,6 +21,11 @@ def formats(m):
             ),
         ]
     return [
+        format(
+            "a DeepSeek-V4 checkpoint",
+            recognizes = lambda checkpoint: has("embed.weight"),
+            read = lambda reads: release(m, reads),
+        ),
         format("an artifact with an `--aux` overlay", read = lambda reads: own_with_aux(m, reads)),
         format("flash mlx", read = lambda reads: flash_mlx(m, reads)),
         format("huggingface", read = lambda reads: huggingface(m, reads)),
@@ -155,6 +160,98 @@ def own_with_aux(m, reads):
             reads.read_own(r.weight)
 
 # ---------------------------------------------------------------------------
+# The V4 release layout: `layers.` at the top, one plane per expert, the
+# routed legs MXFP4 codes beside their `.scale` exponents.
+# ---------------------------------------------------------------------------
+
+def compressor_reads(reads, c, at):
+    reads.read(c.wkv, at + ".wkv.weight")
+    if c.wgate != None:
+        reads.read(c.wgate, at + ".wgate.weight")
+    if c.ape != None:
+        reads.read(c.ape, at + ".ape")
+    reads.read(c.norm, at + ".norm.weight")
+
+def release(m, reads):
+    reads.read(m.embed, "embed.weight")
+    if m.head != None:
+        reads.read(m.head, "head.weight")
+    reads.read(m.final_norm, "norm.weight")
+    if m.hc_head != None:
+        head_reads(reads, m.hc_head, "")
+    for l, w in enumerate(m.layers):
+        release_layer(reads, w, "layers.{}.".format(l))
+    if m.mtp != None:
+        mtp = m.mtp
+        if not has("mtp.0.e_proj.weight"):
+            fail("this deployment declares a draft head, and the checkpoint holds no `mtp.0.`")
+        reads.read(mtp.enorm, "mtp.0.enorm.weight")
+        reads.read(mtp.hnorm, "mtp.0.hnorm.weight")
+        reads.read(mtp.e_proj, "mtp.0.e_proj.weight")
+        # one projection the hyper-connection streams share, read once a stream
+        reads.read_expr(mtp.h_proj, concat(0, [src("mtp.0.h_proj.weight")] * m.hyper.streams))
+        release_layer(reads, mtp.block, "mtp.0.")
+        head_reads(reads, mtp.hc_head, "mtp.0.")
+        reads.read(mtp.norm, "mtp.0.norm.weight")
+
+def head_reads(reads, h, at):
+    reads.read(h.base, at + "hc_head_base")
+    reads.read(h.dynamic, at + "hc_head_fn")
+    reads.read(h.scale, at + "hc_head_scale")
+
+def release_layer(reads, w, at):
+    """One block under `at` (`layers.N.`, or the draft head's `mtp.0.`): dense
+    planes at whatever the file stores (bf16, or fp8 beside `.scale` e8m0
+    exponents), the routed legs one plane per expert."""
+    n = lambda s: at + s
+    for mix, tag in [(w.attn_mix, "attn"), (w.mlp_mix, "ffn")]:
+        reads.read(mix.scale, n("hc_{}_scale".format(tag)))
+        reads.read(mix.base, n("hc_{}_base".format(tag)))
+        if mix.dynamic != None:
+            reads.read(mix.dynamic, n("hc_{}_fn".format(tag)))
+    if w.attn_norm != None:
+        reads.read(w.attn_norm, n("attn_norm.weight"))
+    if w.mlp_norm != None:
+        reads.read(w.mlp_norm, n("ffn_norm.weight"))
+    a = w.attn
+    reads.read(a.q_down, n("attn.wq_a.weight"))
+    reads.read(a.q_norm, n("attn.q_norm.weight"))
+    reads.read(a.q_up, n("attn.wq_b.weight"))
+    reads.read(a.kv_down, n("attn.wkv.weight"))
+    reads.read(a.kv_norm, n("attn.kv_norm.weight"))
+    reads.read(a.o_down, n("attn.wo_a.weight"))
+    reads.read(a.o_up, n("attn.wo_b.weight"))
+    reads.read(a.sink, n("attn.attn_sink"))
+    if a.pool != None and a.pool.compressor != None:
+        compressor_reads(reads, a.pool.compressor, n("attn.compressor"))
+    ix = a.indexer
+    if ix != None:
+        reads.read(ix.wq_b, n("attn.indexer.wq_b.weight"))
+        reads.read(ix.weights_proj, n("attn.indexer.weights_proj.weight"))
+        if ix.compressor != None:
+            compressor_reads(reads, ix.compressor, n("attn.indexer.compressor"))
+    f = w.mlp
+    if f.kind != "moe_flash":
+        fail("the release layout holds DeepSeekMoE blocks only")
+    reads.read(f.router, n("ffn.gate.weight"))
+    if f.gate.kind == "hash":
+        reads.read(f.gate.tid2eid, n("ffn.gate.tid2eid"))
+    else:
+        reads.read(f.gate.bias, n("ffn.gate.bias"))
+    expert = lambda e, leg: n("ffn.experts.{}.{}.weight".format(e, leg))
+    if f.gate_up.fused != None:
+        # Each expert's gate rows, then its up rows: one bank a fused
+        # gate-up select reads, its GLU over the packed rows.
+        read_bank_packed(reads, f.gate_up.fused,
+            [[expert(e, "w1"), expert(e, "w3")] for e in range(f.experts)])
+    else:
+        read_bank(reads, f.gate_up.gate, [expert(e, "w1") for e in range(f.experts)])
+        read_bank(reads, f.gate_up.up, [expert(e, "w3") for e in range(f.experts)])
+    read_bank(reads, f.down, [expert(e, "w2") for e in range(f.experts)])
+    reads.read_concat(f.shared_gate_up, [n("ffn.shared_experts.w1.weight"), n("ffn.shared_experts.w3.weight")])
+    reads.read(f.shared_down, n("ffn.shared_experts.w2.weight"))
+
+# ---------------------------------------------------------------------------
 # V4.1-Flash.
 # ---------------------------------------------------------------------------
 
@@ -162,6 +259,27 @@ def v41_mlx(m, reads):
     if not has("model.layers.0.ffn.switch_mlp.gate_proj.weight"):
         fail("no stacked MLX V4.1 expert bank in model.layers")
     v41(m, reads, True)
+
+def read_bank_packed(reads, w, pairs):
+    """A routed MXFP4 bank `[experts, 2 * rows, cols]` whose expert `e` is
+    the planes `pairs[e]` stacked by rows (its gate rows, then its up rows),
+    codes and e8m0 exponents alike."""
+    rows, cols = w.shape[1] // 2, w.shape[2]
+    if w.dtype != dtype.mxfp4:
+        fail("`{}`: a packed gate-up bank is read from MXFP4 halves only".format(w.name))
+    codes = []
+    scales = []
+    for pair in pairs:
+        stems = [part[:-len(".weight")] if part.endswith(".weight") else part for part in pair]
+        for part, stem in zip(pair, stems):
+            if not has(stem + ".scale"):
+                fail("`{}`: `{}` is read as MXFP4 codes, whose exponents are stored beside it as `{}`, and the checkpoint holds none".format(w.name, part, stem + ".scale"))
+        codes.append(concat(1, [src(part).transmute([1, rows, cols], encoding(dtype.mxfp4)) for part in pair]))
+        scales.append(concat(1, [src(stem + ".scale").transmute([1, rows, cols // 32], encoding(dtype.e8m0)) for stem in stems]))
+    reads.extend([
+        tensor(w.name, concat(0, codes), encoding(dtype.mxfp4)),
+        tensor(scales_name(w.name), concat(0, scales), encoding(dtype.e8m0), shape = scales_shape(w), scaling = w),
+    ])
 
 def read_bank(reads, w, parts):
     """A routed bank `[experts, rows, cols]` from one plane per expert, at
@@ -199,75 +317,93 @@ def v41(m, reads, mlx):
         reads.read(m.token_map, "engram.token_map")
 
     for l, w in enumerate(m.layers):
-        n = lambda s: ("model.layers.{}.{}" if mlx else "layers.{}.{}").format(l, s)
-        at = w.attn
-        for mix, tag in [(w.attn_mix, "attn"), (w.mlp_mix, "ffn")]:
-            name = lambda plane: n("{}_hc.{}".format(tag, plane)) if mlx else n("hc_{}_{}".format(tag, plane))
-            reads.read(mix.scale, name("scale"))
-            reads.read(mix.base, name("base"))
-            if mix.dynamic != None:
-                reads.read(mix.dynamic, name("fn"))
-        if w.attn_norm != None:
-            reads.read(w.attn_norm, n("attn_norm.weight"))
-        if w.mlp_norm != None:
-            reads.read(w.mlp_norm, n("ffn_norm.weight"))
+        v41_block(reads, w, lambda s: ("model.layers.{}.{}" if mlx else "layers.{}.{}").format(l, s), mlx)
 
-        reads.read(at.q_down, n("attn.wq_a.weight"))
-        reads.read(at.q_norm, n("attn.q_norm.weight"))
-        reads.read(at.q_up, n("attn.wq_b.weight"))
-        reads.read(at.kv_down, n("attn.wkv.weight"))
-        reads.read(at.kv_norm, n("attn.kv_norm.weight"))
-        reads.read(at.o_down, n("attn.wo_a.weight"))
-        reads.read(at.o_up, n("attn.wo_b.weight"))
-        reads.read(at.sink, n("attn.attn_sink"))
-
-        if at.pool != None and at.pool.compressor != None:
-            c = at.pool.compressor
-            reads.read(c.wkv, n("attn.compressor.wkv.weight"))
-            if c.wgate != None:
-                reads.read(c.wgate, n("attn.compressor.wgate.weight"))
-            reads.read(c.norm, n("attn.compressor.norm.weight"))
-        ix = at.indexer
-        if ix != None:
-            reads.read(ix.wq_b, n("attn.indexer.wq_b.weight"))
-            reads.read(ix.weights_proj, n("attn.indexer.weights_proj.weight"))
-            if ix.wk != None:
-                reads.read(ix.wk, n("attn.indexer.wk.weight"))
-                reads.read(ix.k_norm, n("attn.indexer.k_norm.weight"))
-
-        f = w.mlp
-        if f.kind != "moe_flash":
-            fail("every V4.1 layer is a DeepSeekMoE block")
-        reads.read(f.router, n("ffn.gate.weight"))
-        if f.gate.kind != "bias":
-            fail("V4.1 routes by bias-corrected scores on every layer")
-        reads.read(f.gate.bias, n("ffn.gate.e_score_correction_bias" if mlx else "ffn.gate.bias"))
-        expert = lambda e, leg: n("ffn.experts.{}.{}.weight".format(e, leg))
-        if f.gate_up.fused != None:
-            fail("V4.1 keeps its routed gate and up legs apart")
+    ds = m.dspark
+    if ds != None:
         if mlx:
-            reads.read(f.gate_up.gate, n("ffn.switch_mlp.gate_proj.weight"))
-            reads.read(f.gate_up.up, n("ffn.switch_mlp.up_proj.weight"))
-        else:
-            read_bank(reads, f.gate_up.gate, [expert(e, "w1") for e in range(f.experts)])
-            read_bank(reads, f.gate_up.up, [expert(e, "w3") for e in range(f.experts)])
-        if mlx:
-            reads.read(f.down, n("ffn.switch_mlp.down_proj.weight"))
-        else:
-            read_bank(reads, f.down, [expert(e, "w2") for e in range(f.experts)])
-        reads.read_concat(f.shared_gate_up, [
-            n("ffn.shared_experts.gate_proj.weight" if mlx else "ffn.shared_experts.w1.weight"),
-            n("ffn.shared_experts.up_proj.weight" if mlx else "ffn.shared_experts.w3.weight"),
-        ])
-        reads.read(f.shared_down, n("ffn.shared_experts.down_proj.weight" if mlx else "ffn.shared_experts.w2.weight"))
+            fail("the DSpark head is read from DeepSeek's release only")
+        if not has("mtp.0.main_proj.weight"):
+            fail("this deployment declares a DSpark head, and the checkpoint holds no `mtp.0.main_proj`")
+        reads.read(ds.main_proj, "mtp.0.main_proj.weight")
+        reads.read(ds.main_norm, "mtp.0.main_norm.weight")
+        for s, w in enumerate(ds.stages):
+            v41_block(reads, w, lambda name: "mtp.{}.{}".format(s, name), False)
+        last = len(ds.stages) - 1
+        reads.read(ds.norm, "mtp.{}.norm.weight".format(last))
+        reads.read(ds.markov_embed, "mtp.{}.markov_head.embed.weight".format(last))
+        reads.read(ds.markov_head, "mtp.{}.markov_head.head.weight".format(last))
 
-        if w.engram != None:
-            e = w.engram
-            reads.read(e.table, n("engram.embed.weight"))
-            reads.read(e.wkv, n("engram.wkv.weight"))
-            # The gate's normalisations carry `weight + 1`.
-            reads.read_over(e.q_weight, n("engram.q_weight"), lambda x: x.bias(-1.0))
-            reads.read_over(e.k_weight, n("engram.k_weight"), lambda x: x.bias(-1.0))
+def v41_block(reads, w, n, mlx):
+    """A V4.1 block whose tensors `n` names: a layer's, or a DSpark stage's."""
+    at = w.attn
+    for mix, tag in [(w.attn_mix, "attn"), (w.mlp_mix, "ffn")]:
+        name = lambda plane: n("{}_hc.{}".format(tag, plane)) if mlx else n("hc_{}_{}".format(tag, plane))
+        reads.read(mix.scale, name("scale"))
+        reads.read(mix.base, name("base"))
+        if mix.dynamic != None:
+            reads.read(mix.dynamic, name("fn"))
+    if w.attn_norm != None:
+        reads.read(w.attn_norm, n("attn_norm.weight"))
+    if w.mlp_norm != None:
+        reads.read(w.mlp_norm, n("ffn_norm.weight"))
+
+    reads.read(at.q_down, n("attn.wq_a.weight"))
+    reads.read(at.q_norm, n("attn.q_norm.weight"))
+    reads.read(at.q_up, n("attn.wq_b.weight"))
+    reads.read(at.kv_down, n("attn.wkv.weight"))
+    reads.read(at.kv_norm, n("attn.kv_norm.weight"))
+    reads.read(at.o_down, n("attn.wo_a.weight"))
+    reads.read(at.o_up, n("attn.wo_b.weight"))
+    reads.read(at.sink, n("attn.attn_sink"))
+
+    if at.pool != None and at.pool.compressor != None:
+        c = at.pool.compressor
+        reads.read(c.wkv, n("attn.compressor.wkv.weight"))
+        if c.wgate != None:
+            reads.read(c.wgate, n("attn.compressor.wgate.weight"))
+        reads.read(c.norm, n("attn.compressor.norm.weight"))
+    ix = at.indexer
+    if ix != None:
+        reads.read(ix.wq_b, n("attn.indexer.wq_b.weight"))
+        reads.read(ix.weights_proj, n("attn.indexer.weights_proj.weight"))
+        if ix.wk != None:
+            reads.read(ix.wk, n("attn.indexer.wk.weight"))
+            reads.read(ix.k_norm, n("attn.indexer.k_norm.weight"))
+
+    f = w.mlp
+    if f.kind != "moe_flash":
+        fail("every V4.1 layer is a DeepSeekMoE block")
+    reads.read(f.router, n("ffn.gate.weight"))
+    if f.gate.kind != "bias":
+        fail("V4.1 routes by bias-corrected scores on every layer")
+    reads.read(f.gate.bias, n("ffn.gate.e_score_correction_bias" if mlx else "ffn.gate.bias"))
+    expert = lambda e, leg: n("ffn.experts.{}.{}.weight".format(e, leg))
+    if f.gate_up.fused != None:
+        fail("V4.1 keeps its routed gate and up legs apart")
+    if mlx:
+        reads.read(f.gate_up.gate, n("ffn.switch_mlp.gate_proj.weight"))
+        reads.read(f.gate_up.up, n("ffn.switch_mlp.up_proj.weight"))
+    else:
+        read_bank(reads, f.gate_up.gate, [expert(e, "w1") for e in range(f.experts)])
+        read_bank(reads, f.gate_up.up, [expert(e, "w3") for e in range(f.experts)])
+    if mlx:
+        reads.read(f.down, n("ffn.switch_mlp.down_proj.weight"))
+    else:
+        read_bank(reads, f.down, [expert(e, "w2") for e in range(f.experts)])
+    reads.read_concat(f.shared_gate_up, [
+        n("ffn.shared_experts.gate_proj.weight" if mlx else "ffn.shared_experts.w1.weight"),
+        n("ffn.shared_experts.up_proj.weight" if mlx else "ffn.shared_experts.w3.weight"),
+    ])
+    reads.read(f.shared_down, n("ffn.shared_experts.down_proj.weight" if mlx else "ffn.shared_experts.w2.weight"))
+
+    if w.engram != None:
+        e = w.engram
+        reads.read(e.table, n("engram.embed.weight"))
+        reads.read(e.wkv, n("engram.wkv.weight"))
+        # The gate's normalisations carry `weight + 1`.
+        reads.read_over(e.q_weight, n("engram.q_weight"), lambda x: x.bias(-1.0))
+        reads.read_over(e.k_weight, n("engram.k_weight"), lambda x: x.bias(-1.0))
 
 # ---------------------------------------------------------------------------
 # transformers' deepseek-v3 spelling, and GGUF's.

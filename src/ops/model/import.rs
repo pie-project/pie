@@ -901,12 +901,25 @@ fn split_contract<'a>(
         .iter()
         .flat_map(|tensor| tensor.expr.outputs())
         .collect();
+    // A weight whose zero points decode keeps its scales in the decode too,
+    // so the decode's contract pairs the two.
+    let offset: BTreeSet<&str> = contract
+        .tensors
+        .iter()
+        .filter(|tensor| !matches!(tensor.expr, Expr::Src(_)))
+        .filter_map(|tensor| tensor.zero_points.as_deref())
+        .collect();
     let mut copies = Vec::new();
     let mut decode = Vec::new();
     for tensor in &contract.tensors {
+        let paired = tensor
+            .scales
+            .as_ref()
+            .is_some_and(|scales| offset.contains(scales.of.as_str()));
         let leg = match &tensor.expr {
             Expr::Src(leg)
                 if tensor.visibility.is_public()
+                    && !paired
                     && !produced_for.contains(tensor.name.as_str()) =>
             {
                 leg.as_str()
@@ -1531,6 +1544,7 @@ fn decodes_a_packed_plane(expr: &Expr, checkpoint: &Metadata, contract: &ModelCo
             Expr::Cast {
                 src,
                 to: Encoding::Raw(_),
+                ..
             } => src,
             Expr::Scale {
                 src,

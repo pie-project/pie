@@ -1,15 +1,19 @@
 # DeepSeek-V4: V4.1-Flash (CSA2, Single-Pass mHC, Engram) and its
 # eight-layer miniature; V4-Flash (with its MTP head or not) and its
-# miniature; and the small V4 base.
+# miniature; V4-Pro and its five-layer, sixteen-expert miniature; and the
+# small V4 base.
 
 R1 = template("deepseek")
 TOKENIZER = tokenizer(markers = [["<｜end▁of▁sentence｜>", "<|EOT|>"]])
 
 MODELS = [
-    model("dsv41-flash", template = R1, tokenizer = TOKENIZER, arch = "deepseek_v4", layers = 40, vocab = 129280),
-    model("dsv41-flash-mini", mini = True, template = R1, tokenizer = TOKENIZER, arch = "deepseek_v4", layers = 8, vocab = 129280),
+    model("dsv41-flash", template = R1, tokenizer = TOKENIZER, drafters = ["dspark"], arch = "deepseek_v4", layers = 40, vocab = 129280),
+    model("dsv41-flash-trunc8", mini = True, template = R1, tokenizer = TOKENIZER, arch = "deepseek_v4", layers = 8, vocab = 129280),
+    model("dsv41-flash-mini", mini = True, template = R1, tokenizer = TOKENIZER, drafters = ["dspark"], arch = "deepseek_v4", layers = 8, vocab = 129280),
     model("dsv4-flash", template = R1, tokenizer = TOKENIZER, drafters = ["mtp"], arch = "deepseek_v4", layers = 43, vocab = 129280),
     model("dsv4-flash-mini", mini = True, template = R1, tokenizer = TOKENIZER, drafters = ["mtp"], arch = "deepseek_v4", layers = 5, vocab = 129280),
+    model("dsv4-pro", template = R1, tokenizer = TOKENIZER, arch = "deepseek_v4", layers = 61, vocab = 129280),
+    model("dsv4-pro-mini", mini = True, template = R1, tokenizer = TOKENIZER, arch = "deepseek_v4", layers = 5, vocab = 129280),
     model("dsv4-base", mini = True, template = R1, tokenizer = TOKENIZER, arch = "deepseek_v4", layers = 6, vocab = 129280),
 ]
 
@@ -18,16 +22,38 @@ U4 = dtype.u4g64
 U2 = dtype.u2g64
 FP4 = dtype.mxfp4
 
+# DeepSeek's reference precision: its fp8 projections and fp4 experts each
+# read e4m3 activations in 1x128 blocks (W8A8 and W4A8).
+W8A8 = [dtype.fp8b128a8, dtype.mxfp4a8]
+
+# V4.1's release as DeepSeek serves it: MXFP8 projections (32x32 blocks)
+# and MXFP4 experts, each against e4m3 activations in 1x32 blocks.
+MX8 = [dtype.fp8b32a8g32, dtype.mxfp4a8g32]
+
 DEPLOYMENTS = [
     deployment("dsv41-flash", weights = U4, kv = BF),
     deployment("dsv41-flash", weights = [BF, FP4], kv = BF),
     deployment("dsv41-flash-mini", weights = [BF, FP4], kv = BF),
+    deployment("dsv41-flash", weights = MX8, kv = BF),
+    deployment("dsv41-flash-mini", weights = MX8, kv = BF),
+    deployment("dsv41-flash-trunc8", weights = MX8, kv = BF),
+    deployment("dsv41-flash", weights = MX8, kv = dtype.nvfp4),
+    deployment("dsv41-flash-mini", weights = MX8, kv = dtype.nvfp4),
+    # DSpark, DeepSeek's draft head, beside the release's own serving format.
+    deployment("dsv41-flash", weights = MX8, kv = dtype.nvfp4, drafter = "dspark"),
+    deployment("dsv41-flash-mini", weights = MX8, kv = dtype.nvfp4, drafter = "dspark"),
+    deployment("dsv4-flash", weights = [BF, FP4], kv = BF, drafter = "mtp"),
+    deployment("dsv4-flash", weights = [BF, FP4], kv = BF),
+    deployment("dsv4-flash", weights = W8A8, kv = BF),
     deployment("dsv4-flash", weights = [U4, U2, FP4], kv = BF, drafter = "mtp"),
     deployment("dsv4-flash-mini", weights = [U4, U2, FP4], kv = BF, drafter = "mtp"),
     deployment("dsv4-flash", weights = [U4, U2], kv = BF),
     deployment("dsv4-flash-mini", weights = [U4, U2], kv = BF),
     deployment("dsv4-flash-mini", weights = BF, kv = BF),
     deployment("dsv4-flash-mini", weights = [BF, FP4], kv = BF),
+    deployment("dsv4-flash-mini", weights = W8A8, kv = BF),
+    deployment("dsv4-pro", weights = [BF, FP4], kv = BF),
+    deployment("dsv4-pro-mini", weights = [BF, FP4], kv = BF),
     deployment("dsv4-base", weights = BF, kv = BF),
     deployment("dsv4-flash", weights = BF, kv = BF),
 ]

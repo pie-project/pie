@@ -1,14 +1,17 @@
 //! What a layout may use: weights, dtypes and the arithmetic their shapes
 //! are written in.
 
-use crate::{Dtype, Weight};
+use crate::{Dtype, Precision, Weight};
 use starlark::environment::GlobalsBuilder;
+use starlark::values::Value;
 use starlark::values::float::UnpackFloat;
 use starlark::values::list::UnpackList;
 use starlark::values::none::NoneOr;
 use starlark_derive::starlark_module;
 
-use crate::star::values::{DtypeValue, WeightValue, word};
+use crate::star::values::{
+    DtypeValue, PrecisionValue, WeightValue, precision, precision_word, word,
+};
 
 thread_local! {
     static ENV: std::cell::RefCell<Vec<(String, Option<String>)>> =
@@ -30,23 +33,29 @@ pub fn with_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
 
 #[starlark_module]
 pub(crate) fn layout(builder: &mut GlobalsBuilder) {
-    /// A weight named `name`, of `shape`, stored as `dtype`.
-    fn weight(
+    /// A weight named `name`, of `shape`, stored as `dtype` (a dtype, or a
+    /// precision whose products quantize their activations).
+    fn weight<'v>(
         #[starlark(require = pos)] name: String,
         #[starlark(require = pos)] shape: UnpackList<u64>,
-        #[starlark(require = pos)] dtype: &DtypeValue,
+        #[starlark(require = pos)] dtype: Value<'v>,
     ) -> anyhow::Result<WeightValue> {
-        Ok(WeightValue(Weight::sym(name, shape.items, dtype.0)))
+        Ok(WeightValue(Weight::at(
+            name,
+            shape.items,
+            precision(dtype)?,
+        )))
     }
 
     /// The dtype a bank stored as `dtype` computes in.
-    fn compute(#[starlark(require = pos)] dtype: &DtypeValue) -> anyhow::Result<DtypeValue> {
-        crate::compute_dtype(dtype.0)
+    fn compute<'v>(#[starlark(require = pos)] dtype: Value<'v>) -> anyhow::Result<DtypeValue> {
+        let stated = precision(dtype)?;
+        crate::compute_dtype(stated.dtype)
             .map(DtypeValue)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "`{}` is no representation a bank is stored in",
-                    word(dtype.0)
+                    precision_word(stated)
                 )
             })
     }
@@ -149,6 +158,9 @@ pub(crate) fn dtypes(builder: &mut GlobalsBuilder) {
     builder.namespace("dtype", |ns| {
         for dtype in Dtype::ALL {
             ns.set(&word(dtype), DtypeValue(dtype));
+        }
+        for acted in Precision::ACTED {
+            ns.set(&precision_word(acted), PrecisionValue(acted));
         }
     });
 }

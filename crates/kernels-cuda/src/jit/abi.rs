@@ -16,6 +16,15 @@ pub enum ArgValue {
 impl ArgValue {
     pub const ABSENT: Self = Self::Ptr(0);
 
+    /// `v`'s bytes, passed by value (a params struct, a tensor map).
+    #[must_use]
+    pub fn of<T>(v: &T) -> Self {
+        Self::Bytes {
+            ptr: core::ptr::from_ref(v).cast(),
+            len: core::mem::size_of::<T>(),
+        }
+    }
+
     #[must_use]
     pub const fn kind(self) -> &'static str {
         match self {
