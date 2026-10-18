@@ -27,7 +27,6 @@ fn read(warp: bool, xqa: bool, whole: u32, cluster: u32) -> Tuning {
 type Lanes = Option<Option<(u32, u32)>>;
 
 /// `[q heads, kv heads, head dim]` over requests of `(new, cached)` rows.
-#[allow(clippy::too_many_lines)]
 fn check(
     heads: [usize; 3],
     reqs: &[(usize, usize)],
@@ -35,6 +34,21 @@ fn check(
     flags: [bool; 2],
     lanes: Lanes,
     tuning: Tuning,
+) {
+    check_live(heads, reqs, window, flags, lanes, tuning, [0, 0]);
+}
+
+/// [`check`] with heads zero-padded past `live` (a key's and a value's
+/// widths; `[0, 0]` none), the pool saying so.
+#[allow(clippy::too_many_lines)]
+fn check_live(
+    heads: [usize; 3],
+    reqs: &[(usize, usize)],
+    window: Option<u32>,
+    flags: [bool; 2],
+    lanes: Lanes,
+    tuning: Tuning,
+    live: [usize; 2],
 ) {
     let ([qh, kvh, d], [graph, sinked], n) = (heads, flags, reqs.len());
     let (width, qw, scale) = (kvh * d, qh * d, (d as f32).sqrt().recip());
@@ -55,9 +69,19 @@ fn check(
     }
     let (rows, cells) = (qo[n] as usize, next * PAGE);
     let mut lcg = Lcg::seeded(0x5eed + d as u64);
-    let (k_raw, k) = lcg.row(cells * width);
-    let (v_raw, v) = lcg.row(cells * width);
-    let (q_raw, q) = lcg.row(rows * qw);
+    let (mut k_raw, mut k) = lcg.row(cells * width);
+    let (mut v_raw, mut v) = lcg.row(cells * width);
+    let (mut q_raw, mut q) = lcg.row(rows * qw);
+    let [lk, lv] = live.map(|w| if w == 0 { d } else { w });
+    for (raw, x, w) in [
+        (&mut k_raw, &mut k, lk),
+        (&mut v_raw, &mut v, lv),
+        (&mut q_raw, &mut q, lk),
+    ] {
+        for i in (0..x.len()).filter(|i| i % d >= w) {
+            (raw[i], x[i]) = (0, 0.0);
+        }
+    }
     let sinks: Vec<f32> = (0..qh).map(|h| 0.5 * (h % 7) as f32 - 1.0).collect();
     let sunk = sinked.then_some(&sinks[..]);
     let (want_o, want_lse) = attend([&q, &k, &v], [qh, kvh, d, d], scale, sunk, |row, _| {
@@ -77,6 +101,7 @@ fn check(
         values,
         last_page_lens,
         head_stride: d as i64,
+        live: live.map(|w| w as u32),
         ..kvp
     };
     let data = ten(gpu.up(&q_raw), rows, qw, Bf16);
@@ -165,6 +190,12 @@ fn check(
     );
     want_o[..ra * qw].fill(from_bf16(0x7f7f));
     want_o[rb * qw..].fill(from_bf16(0x7f7f));
+    // A padded head's values past their width are never written.
+    want_o
+        .iter_mut()
+        .enumerate()
+        .filter(|(i, _)| i % d as usize >= lv)
+        .for_each(|(_, o)| *o = from_bf16(0x7f7f));
     landed(&gpu, o_at, &want_o, 2e-2, 1.0, &what);
     let got_lse: Vec<f32> = gpu.down(lse_at, rows * qh as usize);
     let span = ra * qh as usize..rb * qh as usize;
@@ -205,4 +236,9 @@ fn the_paged_attention_answers_the_reference() {
     for (heads, reqs, window, flags, lanes, tuning) in cases {
         check(heads, reqs, window, flags, lanes, tuning);
     }
+    // MiMo's heads, 192-wide keys and 128-wide values padded to 256: the
+    // tcgen05 prefill reads the widths alone, whole and over a window.
+    let tc5 = tuned(|t| (t.prefill_tc5, t.prefill_wide_sliding) = (true, true));
+    check_live([64, 8, 256], long, None, own, pre, tc5, [192, 128]);
+    check_live([64, 8, 256], long, w128, sunk, pre, tc5, [192, 128]);
 }

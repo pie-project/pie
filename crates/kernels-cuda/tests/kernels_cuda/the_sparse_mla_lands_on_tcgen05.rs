@@ -272,6 +272,7 @@ fn score(
         block_size: 0,
         max_pages_per_request: 10,
         pages_in_batch: PAGE_INDICES.len() as i32,
+        live: [0, 0],
     };
     let q = RaggedTensor {
         data: Tensor::new(
@@ -485,6 +486,7 @@ fn decode_rows(reqs: usize, tc: bool, iters: u32) -> (Vec<u16>, f64) {
         block_size: 0,
         max_pages_per_request: *pages_per.iter().max().unwrap() as i32,
         pages_in_batch: total as i32,
+        live: [0, 0],
     };
     let q_at = gpu.up(&q_raw);
     let qpe_at = gpu.up(&qpe_raw);
@@ -661,6 +663,7 @@ fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> 
         block_size: 0,
         max_pages_per_request: pages_per as i32,
         pages_in_batch: total as i32,
+        live: [0, 0],
     };
     let q_at = gpu.up(&q_raw);
     let qpe_at = gpu.up(&qpe_raw);

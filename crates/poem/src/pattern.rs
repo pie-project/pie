@@ -124,6 +124,7 @@ impl Pattern {
             space: 0,
             window: None,
             head_dim: 0,
+            live: None,
             shard: poem_ir::Shard::Replicated,
         });
         let id = self.rec.cache(&row);

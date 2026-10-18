@@ -52,6 +52,7 @@ fn pool(keys: Tensor, values: Tensor, gpu: &mut Gpu) -> KvPool {
         block_size: 0,
         max_pages_per_request: 2,
         pages_in_batch: PAGES.len() as i32,
+        live: [0, 0],
     }
 }
 

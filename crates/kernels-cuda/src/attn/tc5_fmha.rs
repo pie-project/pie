@@ -37,6 +37,7 @@ struct Params {
     window_left: i32,
     lse: u64,
     sinks: u64,
+    head: i32,
 }
 
 /// The key tile and ring depth a head width runs at: three stages of K and
@@ -53,8 +54,8 @@ fn tiling(head_dim: u32, sliding_wide: bool) -> (u32, u32) {
 }
 
 /// `pie::attn::fmha::smem_bytes`.
-const fn smem_bytes(d: u32, bkv: u32, stages: u32) -> u32 {
-    2 * stages * (d / 64) * bkv * 128 + 1024 + 1024
+const fn smem_bytes(d: u32, dv: u32, bkv: u32, stages: u32) -> u32 {
+    stages * (d / 64 + dv / 64) * bkv * 128 + 1024 + 1024
 }
 
 /// `tc5_fmha_prefill_wide`'s shape: 128-key tiles; Q whole in shared
@@ -132,11 +133,19 @@ pub(crate) fn try_prefill(
     // and no short window has them on the IO path below (Muse's 4 x 4096
     // fire: sliding 1967 -> 1751 us, causal 2279 -> 2183).
     let sms = ctx.multiprocessors().unwrap_or(148);
+    // Heads zero-padded past their widths (MiMo's 192-wide keys and
+    // 128-wide values in 256) read those alone, at the padded stride.
+    let [lk, lv] = pool.live;
+    let live =
+        planes_take(lk, lv) && lk <= head_dim && lv <= head_dim && pool.live != [head_dim; 2];
+    let (dqk, dv) = if live { (lk, lv) } else { (head_dim, head_dim) };
     let pair = head_dim == 64
         && !(0..256).contains(&window_left)
         && (rows * group).div_ceil(256) * shape.num_kv_heads >= 4 * sms;
     let (bkv, stages) = if pair {
         (64, 4)
+    } else if live {
+        planes_tiling(dqk, dv)
     } else {
         tiling(head_dim, sliding_wide)
     };
@@ -168,10 +177,10 @@ pub(crate) fn try_prefill(
     let cells = pool.keys.rows;
     // A box a 16-token page slice, and one a whole tile for a tile whose
     // pages lie in a run.
-    let map = |ptr: u64, rows: u32| {
+    let map = |ptr: u64, d: u32, rows: u32| {
         crate::attn::bf16_map(
             ptr,
-            [head_dim, kv_heads, cells],
+            [d, kv_heads, cells],
             [
                 u64::from(head_dim) * 2,
                 u64::try_from(pool.seq_stride).unwrap_or(0) * 2,
@@ -179,11 +188,15 @@ pub(crate) fn try_prefill(
             [64, 1, rows],
         )
     };
-    let map_k = map(pool.keys.ptr, 16)?;
-    let map_v = map(pool.values.ptr, 16)?;
-    let map_k_run = map(pool.keys.ptr, bkv)?;
-    let map_v_run = map(pool.values.ptr, bkv)?;
-    let wide = wide_of(head_dim, sliding_wide);
+    let map_k = map(pool.keys.ptr, dqk, 16)?;
+    let map_v = map(pool.values.ptr, dv, 16)?;
+    let map_k_run = map(pool.keys.ptr, dqk, bkv)?;
+    let map_v_run = map(pool.values.ptr, dv, bkv)?;
+    let wide = if live {
+        None
+    } else {
+        wide_of(head_dim, sliding_wide)
+    };
     let int = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
     let params = Params {
         q: q.data.ptr,
@@ -205,6 +218,7 @@ pub(crate) fn try_prefill(
         window_left,
         lse: lse.map_or(0, |t| t.ptr),
         sinks: sinks.map_or(0, |t| t.ptr),
+        head: if live { int(head_dim) } else { 0 },
     };
     // Every request's tiles, rounded up a tile each.
     let bound = (rows * group).div_ceil(if pair { 256 } else { 128 }) + requests;
@@ -232,12 +246,12 @@ pub(crate) fn try_prefill(
             Fire::at(
                 FILE,
                 symbol(&format!(
-                    "::pie::attn::fmha::tc5_fmha_prefill<{head_dim}, {bkv}, {stages}, {head_dim}, {io}, {pair}>"
+                    "::pie::attn::fmha::tc5_fmha_prefill<{dqk}, {bkv}, {stages}, {dv}, {io}, {pair}>"
                 )),
             )
             .apply(
                 Launch::grid(grid, [threads, 1, 1])
-                    .smem(smem_bytes(head_dim, bkv, stages)),
+                    .smem(smem_bytes(dqk, dv, bkv, stages)),
             ),
             &tail,
         )?;
@@ -389,11 +403,11 @@ pub fn prefill_planes(ctx: &Ctx, op: &'static str, at: &Planes) -> Result<(), Er
         window_left: -1,
         lse: 0,
         sinks: 0,
+        head: 0,
     };
     let bound = at.rows.div_ceil(128) + at.requests;
     let (dqk, dv) = (at.dqk, at.dv);
-    // `pie::attn::fmha::smem_bytes(dqk, bkv, stages, dv)`.
-    let smem = stages * (dqk / 64 + dv / 64) * bkv * 128 + 1024 + 1024;
+    let smem = smem_bytes(dqk, dv, bkv, stages);
     ctx.fire(
         op,
         Fire::at(

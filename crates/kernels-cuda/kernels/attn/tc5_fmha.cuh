@@ -63,6 +63,9 @@ struct Params {
     // each q head's bf16 sink the row is scaled down by.
     float* lse;
     const u16* sinks;
+    // A head's stride in Q and O where wider than D and DV (heads padded
+    // past the widths read); 0 where they are the widths.
+    int head;
 };
 
 __host__ __device__ constexpr u32 smem_bytes(int d, int bkv, int stages, int dv = 0) {
@@ -346,7 +349,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
         const bool live = prow < x.qo_len * p.group;
         const u16* src =
             p.q + static_cast<long long>(x.qo_start + (live ? prow / p.group : 0)) * p.q_stride +
-            static_cast<long long>(h * p.group + prow % p.group) * D;
+            static_cast<long long>(h * p.group + prow % p.group) * (p.head > 0 ? p.head : D);
         // Every load in flight at once, 32 bytes each, then the stores.
         u32 qv[D / 2];
 #pragma unroll
@@ -380,7 +383,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
         const bool live = prow < w.qo_len * p.group;
         const long long o_row = w.qo_start + (live ? prow / p.group : 0);
         const int qh = h * p.group + prow % p.group;
-        u16* dst = p.o + o_row * p.o_stride + static_cast<long long>(qh) * DV;
+        u16* dst = p.o + o_row * p.o_stride + static_cast<long long>(qh) * (p.head > 0 ? p.head : DV);
 #pragma unroll 1
         for (u32 c = 0; c < DV; c += 32) {
             u32 v[32];

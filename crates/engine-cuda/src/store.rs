@@ -398,6 +398,7 @@ enum Shape {
         values_width: u64,
         values_plane: usize,
         head_stride: u64,
+        live: Option<[u32; 2]>,
     },
     State {
         stride: u64,
@@ -519,6 +520,7 @@ impl Pools {
                     dtype,
                     space,
                     window,
+                    live,
                     ..
                 } => {
                     let element = elem_bytes(name, *dtype)?;
@@ -593,6 +595,7 @@ impl Pools {
                         values_width,
                         values_plane,
                         head_stride: restated.map_or(keys_width, |seat| u64::from(seat.head_dim)),
+                        live: *live,
                     });
                 }
                 CacheRow::State {
@@ -1179,6 +1182,7 @@ impl Pools {
                     values_width,
                     values_plane,
                     head_stride,
+                    live,
                 } => {
                     let seat = seats
                         .spaces
@@ -1227,6 +1231,7 @@ impl Pools {
                             block_size: 0,
                             max_pages_per_request: narrow(u64::from(self.paging.pages_per_slot)),
                             pages_in_batch: narrow(u64::from(seats.pages)),
+                            live: live.unwrap_or([0, 0]),
                         },
                     }
                 }
