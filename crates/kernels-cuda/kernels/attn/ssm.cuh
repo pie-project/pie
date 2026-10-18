@@ -4078,13 +4078,14 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
         const float2 a = gdn_unpack(v.x), b = gdn_unpack(v.y);
         x[0] = a.x; x[1] = a.y; x[2] = b.x; x[3] = b.y;
     };
-    uint2 graw[R], kraw[R], qraw[R];
+    uint2 graw[R], kraw[R], qraw[R], vraw[R];
     #pragma unroll
     for (int ii = 0; ii < R; ++ii) {
         const int i = i0 + ii;
         graw[ii] = raw(raw_g + (row_at(i) * H + h) * D + c, i < L);
         kraw[ii] = raw(mixed + row_at(i) * 3 * width + width + h * D + c, i < L);
         qraw[ii] = raw(mixed + row_at(i) * 3 * width + h * D + c, i < L);
+        vraw[ii] = raw(mixed + row_at(i) * 3 * width + 2 * width + h * D + c, i < L);
     }
     const float beta = l < L ? sigmoidf(__bfloat162float(raw_beta[row_at(l) * H + h])) : 0.f;
 
@@ -4185,12 +4186,6 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
             store4(kg_out + (static_cast<long long>(ta + i) * H + h) * D + c, k[0] * el[0],
                    k[1] * el[1], k[2] * el[2], k[3] * el[3]);
         }
-    }
-    uint2 vraw[R];
-    #pragma unroll
-    for (int ii = 0; ii < R; ++ii) {
-        const int i = i0 + ii;
-        vraw[ii] = raw(mixed + row_at(i) * 3 * width + 2 * width + h * D + c, i < L);
     }
     const float q_scale = rsqrtf(static_cast<float>(D));
     #pragma unroll
