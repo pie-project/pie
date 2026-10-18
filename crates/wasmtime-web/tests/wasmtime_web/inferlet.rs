@@ -8,7 +8,7 @@ use wasmtime::component::{Component, Linker, ResourceType};
 
 fn guest_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/target/wasm32-wasip2/release/text_completion.wasm")
+        .join("../../examples/target/wasm32-wasip3/release/text_completion.wasm")
 }
 
 fn stub_pie_world(
@@ -53,7 +53,7 @@ fn text_completion_links_and_instantiates() {
     let path = guest_path();
     let Ok(bytes) = std::fs::read(&path) else {
         eprintln!(
-            "skipping: {} not built (cd examples && cargo build -p text-completion --release --target wasm32-wasip2)",
+            "skipping: {} not built (cd examples && cargo build -p text-completion --release --target wasm32-wasip3)",
             path.display()
         );
         return;

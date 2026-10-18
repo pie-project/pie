@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use super::CAPABILITIES;
-use super::wit::Level;
 
 pub const SECTION: &str = "plex.manifest";
 
@@ -15,13 +14,11 @@ const EDGES: &[&str] = &[
     "arrived",
     "started",
     "paused",
-    "resumed",
     "exited",
     "retained",
     "discarded",
     "prop-changed",
     "closed",
-    "diverged",
     "timer",
 ];
 
@@ -43,8 +40,6 @@ pub struct Manifest {
     pub deadline_ms: u64,
     /// Router only: present here is an error.
     pub gate_ms: Option<u64>,
-    /// Router only: present here is an error.
-    pub gate_fail: Option<String>,
     /// For discovery; never enforced.
     #[serde(default)]
     pub props: BTreeMap<String, PropDoc>,
@@ -88,7 +83,7 @@ pub enum ManifestError {
 }
 
 impl Manifest {
-    pub fn of(component: &[u8], capability: &dyn Fn(&str) -> Level) -> Result<Self, ManifestError> {
+    pub fn of(component: &[u8], capability: &dyn Fn(&str) -> bool) -> Result<Self, ManifestError> {
         let text = section(component).ok_or(ManifestError::Missing)?;
         let text = std::str::from_utf8(text).map_err(|_| ManifestError::NotText)?;
         let manifest: Manifest = toml::from_str(text)?;
@@ -96,15 +91,12 @@ impl Manifest {
         Ok(manifest)
     }
 
-    fn check(&self, capability: &dyn Fn(&str) -> Level) -> Result<(), ManifestError> {
+    fn check(&self, capability: &dyn Fn(&str) -> bool) -> Result<(), ManifestError> {
         if self.plane != "engine" {
             return Err(ManifestError::WrongPlane(self.plane.clone()));
         }
         if self.gate_ms.is_some() {
             return Err(ManifestError::RouterOnly("gate-ms"));
-        }
-        if self.gate_fail.is_some() {
-            return Err(ManifestError::RouterOnly("gate-fail"));
         }
         if let Some(edge) = self.subscribe.iter().find(|e| !EDGES.contains(&e.as_str())) {
             return Err(ManifestError::UnknownEdge(edge.clone()));
@@ -117,11 +109,7 @@ impl Manifest {
                 return Err(ManifestError::UnknownCapability(name.clone()));
             }
         }
-        if let Some(name) = self
-            .requires
-            .iter()
-            .find(|name| capability(name) == Level::Absent)
-        {
+        if let Some(name) = self.requires.iter().find(|name| !capability(name)) {
             return Err(ManifestError::Unmet(name.clone()));
         }
         if !(1..=MAX_DEADLINE_MS).contains(&self.deadline_ms) {
@@ -157,13 +145,7 @@ mod tests {
 
     fn parse(text: &str) -> Result<Manifest, ManifestError> {
         let manifest: Manifest = toml::from_str(text)?;
-        manifest.check(&|name| {
-            if name == "retention.tier" {
-                Level::Absent
-            } else {
-                Level::Native
-            }
-        })?;
+        manifest.check(&|name| name != "retention.tier")?;
         Ok(manifest)
     }
 

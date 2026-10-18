@@ -5,4 +5,3 @@ subscribe = ["arrived", "dispatched", "exited", "worker-removed"]
 grants = ["placement"]
 # Long enough for the call that places a new arrival to answer.
 gate-ms = 20
-gate-fail = "open"

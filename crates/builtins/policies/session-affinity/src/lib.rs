@@ -51,12 +51,11 @@ impl router::Policy for SessionAffinity {
                 Some(Placement {
                     process: p,
                     worker: Some(worker.clone()),
-                    prefill: None,
                     props: Vec::new(),
                 })
             })
             .collect();
-        let _ = router::install_placement(&placements);
+        router::install_placement(&placements);
     }
 }
 

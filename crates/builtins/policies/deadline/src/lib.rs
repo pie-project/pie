@@ -18,7 +18,7 @@ impl engine::Policy for Deadline {
                 Some((p, i64::MAX - due.max(0)))
             })
             .collect();
-        let _ = engine::install_schedule(&entries, None);
+        engine::install_schedule(&entries, None);
     }
 }
 

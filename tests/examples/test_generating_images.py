@@ -122,7 +122,7 @@ def build_guest() -> None:
     if os.environ.get("PIE_INFERLETS_NO_BUILD"):
         return
     subprocess.run(
-        ["cargo", "build", "-p", NAME, "--release", "--target", "wasm32-wasip2"],
+        ["cargo", "build", "-p", NAME, "--release", "--target", "wasm32-wasip3"],
         cwd=INFERLETS_DIR,
         check=True,
     )

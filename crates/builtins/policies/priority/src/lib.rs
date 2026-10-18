@@ -19,7 +19,7 @@ impl engine::Policy for Priority {
             })
             .collect();
         // Only an ungranted write is refused, and the manifest grants it.
-        let _ = engine::install_schedule(&entries, None);
+        engine::install_schedule(&entries, None);
     }
 }
 

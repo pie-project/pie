@@ -4,7 +4,6 @@ plane = "router"
 subscribe = ["arrived", "prop-changed"]
 grants = ["schedule", "placement"]
 gate-ms = 20
-gate-fail = "open"
 
 [props.priority]
 type = "int"

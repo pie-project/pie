@@ -59,7 +59,7 @@ model with recurrent layers. The returned JSON includes the exact generated toke
 ## Run
 
 ```bash
-cargo build --release --target wasm32-wasip2
+cargo build --release --target wasm32-wasip3
 python tests/examples/run_all.py --engine cuda_native --model <model-path>
 ```
 

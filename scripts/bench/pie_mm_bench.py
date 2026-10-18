@@ -51,11 +51,11 @@ WASM_NAME = "image_qa_bench.wasm"
 
 def bench_inferlet_wasm(inferlet_dir: str) -> Path:
     d = Path(inferlet_dir).expanduser().resolve()
-    wasm = d / "target" / "wasm32-wasip2" / "release" / WASM_NAME
+    wasm = d / "target" / "wasm32-wasip3" / "release" / WASM_NAME
     if not wasm.exists():
         raise FileNotFoundError(
             f"missing {wasm}; build with: cd {d} && "
-            "cargo build --target wasm32-wasip2 --release"
+            "cargo build --target wasm32-wasip3 --release"
         )
     return wasm
 

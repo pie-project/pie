@@ -6,7 +6,7 @@ interface types {
     /// Host-issued, opaque, compared byte-for-byte.
     type id = string;
 
-    /// Larger runs earlier and is kept longer. An unnamed subject is 0.
+    /// Larger runs earlier and is kept longer. Anything unnamed is 0.
     type key = s64;
 
     enum subject-kind { session, process, working-set, worker }
@@ -25,35 +25,7 @@ interface types {
         int(s64),
         float(f64),
         text(string),
-        /// Attrs that list subjects.
-        ids(list<id>),
         json(string),
-    }
-
-    variant lookup {
-        value(value),
-        absent,
-        unknown-subject,
-        unknown-name,
-    }
-
-    /// How far a host honours a capability.
-    enum level { native, degraded, absent }
-
-    enum refusal {
-        /// The manifest does not grant this write.
-        not-granted,
-        /// A table names the same subject twice (a retention table: the same
-        /// working-set with the same `upto`).
-        duplicate-subject,
-        too-large,
-        /// The subject is not in a state the verb applies to, such as
-        /// `discard` of a working-set whose owner still runs.
-        wrong-state,
-        /// A verb names a subject the host does not know. Tables skip
-        /// unknown ids instead: they are level-triggered and the next
-        /// call resyncs.
-        unknown-subject,
     }
 
     enum outcome { completed, failed, cancelled }
@@ -64,7 +36,6 @@ interface types {
     record exit {
         process: id,
         outcome: outcome,
-        by: by,
     }
 
     /// `subject`'s props named in `names` changed.
@@ -73,17 +44,12 @@ interface types {
         names: list<string>,
     }
 
-    record divergence {
-        subject: subject,
-        reason: string,
-    }
-
     record dispatch {
         process: id,
         worker: id,
     }
 
-    /// A paused process, or a discarded working-set, and who did it.
+    /// A discarded working-set, and who discarded it.
     record transition {
         subject: id,
         by: by,
@@ -96,20 +62,17 @@ interface types {
         prop-changed(change),
         /// A session, closed by the client.
         closed(id),
-        diverged(divergence),
         /// The alarm set by `set-alarm` is due.
         timer,
 
         // Router plane.
         dispatched(dispatch),
-        worker-added(id),
         worker-removed(id),
         worker-draining(id),
 
         // Engine plane.
         started(id),
-        paused(transition),
-        resumed(id),
+        paused(id),
         /// A working-set whose owner exited while its KV stays cached.
         retained(id),
         discarded(transition),
@@ -127,8 +90,6 @@ interface types {
         process: id,
         /// None leaves the worker to the router's default choice.
         worker: option<id>,
-        /// A P/D split: the prefill worker.
-        prefill: option<id>,
         /// Passed on with the process; the engine sees each as prop
         /// `router/<name>`.
         props: list<tuple<string, value>>,

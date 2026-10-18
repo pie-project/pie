@@ -26,7 +26,7 @@ for (const entry of list) {
   let output = "";
   try {
     const file = entry.inferlet.replace(/-/g, "_");
-    const program = await client.installProgram(`${root}examples/target/wasm32-wasip2/release/${file}.wasm`, null, true);
+    const program = await client.installProgram(`${root}examples/target/wasm32-wasip3/release/${file}.wasm`, null, true);
     const proc = await client.launchProcess(program, entry.input);
     const streamed = [];
     let returned = null;

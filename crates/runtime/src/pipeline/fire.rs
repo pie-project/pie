@@ -1367,11 +1367,6 @@ fn take_checkpoint(stores: &crate::store::registry::Stores, checkpoint: &TakeChe
     let owner = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
         kv.owner_of(checkpoint.kv)
     });
-    // Not where the policy keeps nothing.
-    let at = (checkpoint.pages * u64::from(stores.kv_page_size)).saturating_sub(1);
-    if owner.is_some_and(|owner| crate::policy::retention::below_floor_at(owner, at)) {
-        return;
-    }
     let taken = stores
         .rs
         .lock()

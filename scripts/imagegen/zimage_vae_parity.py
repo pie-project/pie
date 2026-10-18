@@ -126,15 +126,15 @@ def wasm() -> str:
     workspace = os.path.dirname(os.path.normpath(INFERLET))
     if not os.environ.get("PIE_INFERLETS_NO_BUILD"):
         done = subprocess.run(
-            ["cargo", "build", "-p", "zimage-vae-parity", "--target", "wasm32-wasip2"],
+            ["cargo", "build", "-p", "zimage-vae-parity", "--target", "wasm32-wasip3"],
             cwd=workspace, capture_output=True, text=True,
         )
         if done.returncode != 0:
             sys.stderr.write(done.stderr)
-            raise SystemExit("building zimage-vae-parity for wasm32-wasip2 failed")
+            raise SystemExit("building zimage-vae-parity for wasm32-wasip3 failed")
     candidates = [
-        os.path.join(workspace, "target/wasm32-wasip2/release", "zimage_vae_parity.wasm"),
-        os.path.join(workspace, "target/wasm32-wasip2/debug", "zimage_vae_parity.wasm"),
+        os.path.join(workspace, "target/wasm32-wasip3/release", "zimage_vae_parity.wasm"),
+        os.path.join(workspace, "target/wasm32-wasip3/debug", "zimage_vae_parity.wasm"),
     ]
     present = [path for path in candidates if os.path.exists(path)]
     if not present:

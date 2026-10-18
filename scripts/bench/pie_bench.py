@@ -104,7 +104,7 @@ def bench_inferlet_wasm(inferlet_dir: str | None) -> Path:
     # text-completion-bench's (cargo folds dashes to underscores). Without this
     # the harness can bench exactly ONE inferlet, which is why the
     # `eta::run_ahead` change had no way to be measured.
-    rel = Path("target") / "wasm32-wasip2" / "release" / f"{pkg['name'].replace('-', '_')}.wasm"
+    rel = Path("target") / "wasm32-wasip3" / "release" / f"{pkg['name'].replace('-', '_')}.wasm"
     candidates = [inferlet_dir / rel]
     for parent in inferlet_dir.parents:
         candidates.append(parent / rel)
@@ -116,7 +116,7 @@ def bench_inferlet_wasm(inferlet_dir: str | None) -> Path:
     if not wasm.exists():
         raise FileNotFoundError(
             f"missing {wasm}; build with: cd {inferlet_dir} && "
-            "cargo build --target wasm32-wasip2 --release"
+            "cargo build --target wasm32-wasip3 --release"
         )
     # The wasm is a build OUTPUT with no staleness guard of its own (the engine
     # guard below covers only crates and packages/python/server sources), so
@@ -128,7 +128,7 @@ def bench_inferlet_wasm(inferlet_dir: str | None) -> Path:
     if newest_src and wasm.stat().st_mtime_ns < newest_src:
         raise RuntimeError(
             f"{wasm} is older than {inferlet_dir}/src; rebuild with: "
-            f"cd {inferlet_dir} && cargo build --target wasm32-wasip2 --release"
+            f"cd {inferlet_dir} && cargo build --target wasm32-wasip3 --release"
         )
     return wasm
 

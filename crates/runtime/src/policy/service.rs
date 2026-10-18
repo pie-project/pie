@@ -11,11 +11,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use client_api::Props;
 use client_api::props::{PROMPT_BLOCK_BYTES, PromptIndex, TOKENS_PER_BYTE};
 
-use super::program::{Commit, Fault, LoadError, Plane, Program, Retention, Table};
+use super::program::{self, Commit, Fault, LoadError, Plane, Program, Retention, Table};
 use super::retention;
 use super::schedule;
 use super::tokens;
-use super::wit::{self, Edge, Level, Lookup, Refusal, Subject, SubjectKind, Value};
+use super::wit::{self, Edge, Subject, SubjectKind, Value};
 use super::{By, Event, Outcome};
 use crate::inferlet::process::{self, ProcessId};
 use crate::store::kv::CachedWorkingSet;
@@ -28,17 +28,16 @@ static EVENTS: OnceLock<Sender<Event>> = OnceLock::new();
 
 /// A worker has at most one.
 pub fn start(name: &str, component: &[u8]) -> Result<(), LoadError> {
-    let program = Program::load(name, component, &capability)?;
     let (tx, rx) = channel();
+    program::spawn(name, component, capability, "pie-policy", move |program| {
+        run(program, rx)
+    })?;
+    // A second one's thread ends with its channel.
     if EVENTS.set(tx).is_err() {
         return Err(LoadError::Instantiate(
             "this worker already runs an engine policy".into(),
         ));
     }
-    std::thread::Builder::new()
-        .name("pie-policy".into())
-        .spawn(move || run(program, rx))
-        .map_err(|e| LoadError::Instantiate(format!("spawning its thread: {e}")))?;
     tracing::info!(policy = name, "engine policy started");
     Ok(())
 }
@@ -49,19 +48,15 @@ pub(super) fn report(event: Event) {
     }
 }
 
-fn capability(name: &str) -> Level {
-    // Pausing evicts to the host or disk tier, which a worker may not have.
-    let can_pause = crate::planner::planner().is_some_and(|p| p.can_pause());
+fn capability(name: &str) -> bool {
     match name {
-        "schedule.admit" | "schedule.preempt" | "schedule.resume" => Level::Native,
-        "schedule.floor" if can_pause => Level::Native,
-        // Held at the gates, but what already runs keeps running.
-        "schedule.floor" => Level::Degraded,
-        // Cached KV yields to live work.
-        "retention.order" => Level::Native,
-        // Idle cache goes to the host in key order; below the floor it is dropped.
-        "retention.tier" if can_pause => Level::Native,
-        _ => Level::Absent,
+        // Pausing evicts to the host or disk tier: without one, preemption
+        // and the floor hold pending work only.
+        "schedule.admit" | "schedule.preempt" | "schedule.resume" | "schedule.floor"
+        | "retention.order" => true,
+        // Idle cache goes to the host in key order.
+        "retention.tier" => crate::planner::planner().is_some_and(|p| p.can_pause()),
+        _ => false,
     }
 }
 
@@ -195,7 +190,7 @@ fn by_owner(table: Retention) -> retention::Table {
             Some((ProcessId::from_str(&id).ok()?, steps))
         })
         .collect();
-    retention::Table::new(steps, table.floor)
+    retention::Table::new(steps)
 }
 
 fn enact(registry: &mut Registry, commit: Commit) {
@@ -323,7 +318,6 @@ struct Proc {
     waited_ms: u64,
     restarts: u64,
     cached_tokens: Option<u64>,
-    diverged: Option<&'static str>,
     tenant: String,
     /// Scoped by tenant.
     session: Option<String>,
@@ -438,7 +432,6 @@ impl Registry {
                         waited_ms: 0,
                         restarts: 0,
                         cached_tokens: None,
-                        diverged: None,
                         session: arrival
                             .session
                             .map(|session| format!("{}/{session}", arrival.tenant)),
@@ -470,34 +463,16 @@ impl Registry {
             Event::Started(pid) => self
                 .set(pid, State::Running)
                 .map(|id| Edge::Started(id.to_string())),
-            Event::Paused(pid, by) => self.set(pid, State::Paused).map(|id| {
-                Edge::Paused(wit::Transition {
-                    subject: id.to_string(),
-                    by: wit_by(by),
-                })
-            }),
-            Event::Resumed(pid) => self
-                .set(pid, State::Running)
-                .map(|id| Edge::Resumed(id.to_string())),
-            Event::Diverged(pid, reason) => {
-                let id = schedule::plex_id(pid);
-                self.procs.get_mut(&id).and_then(|proc| {
-                    let was = std::mem::replace(&mut proc.diverged, reason);
-                    (reason.is_some() && was != reason).then(|| {
-                        Edge::Diverged(wit::Divergence {
-                            subject: Subject::Process(id.to_string()),
-                            reason: reason.unwrap_or_default().to_string(),
-                        })
-                    })
-                })
+            Event::Paused(pid) => self
+                .set(pid, State::Paused)
+                .map(|id| Edge::Paused(id.to_string())),
+            Event::Resumed(pid) => {
+                self.set(pid, State::Running);
+                None
             }
-            Event::Exited(pid, outcome, by) => {
+            Event::Exited(pid, outcome) => {
                 let id = schedule::plex_id(pid);
-                let by = if self.terminated.remove(&id) {
-                    By::Policy
-                } else {
-                    by
-                };
+                self.terminated.remove(&id);
                 let Some(mut proc) = self.procs.remove(&id) else {
                     return Vec::new();
                 };
@@ -515,14 +490,12 @@ impl Registry {
                         Outcome::Failed => wit::Outcome::Failed,
                         Outcome::Cancelled => wit::Outcome::Cancelled,
                     },
-                    by: wit_by(by),
                 });
                 if !(self.cache.owns)(id) {
                     self.prompts.remove(&id);
                     return vec![exited];
                 }
                 // What it left in the cache outlives it.
-                retention::remember_exit(id);
                 self.retained.insert(
                     id,
                     Retained {
@@ -586,7 +559,6 @@ impl Registry {
                 }
                 // A live process's working-set ends with the process.
                 self.retained.remove(&owner).map(|_| {
-                    retention::forget(owner);
                     Edge::Discarded(wit::Transition {
                         subject: owner.to_string(),
                         by: wit_by(by),
@@ -624,7 +596,6 @@ impl Registry {
                 .collect(),
             sessions: self.sessions.clone(),
             held: self.held.clone(),
-            schedule: schedule::current(),
             cache: self.cache,
             cached: OnceCell::new(),
         }
@@ -645,7 +616,6 @@ struct Snapshot {
     retained: HashMap<String, Retained>,
     sessions: HashMap<String, Props>,
     held: Arc<PromptIndex>,
-    schedule: Option<Arc<schedule::Table>>,
     cache: Cache,
     /// Read once, when the call first asks.
     cached: OnceCell<(HashMap<String, CachedWorkingSet>, u32)>,
@@ -686,8 +656,8 @@ impl Snapshot {
     }
 }
 
-fn text(value: Option<&String>) -> Lookup {
-    value.map_or(Lookup::Absent, |v| Lookup::Value(Value::Text(v.clone())))
+fn text(value: Option<&String>) -> Option<Value> {
+    value.map(|v| Value::Text(v.clone()))
 }
 
 impl Plane for Snapshot {
@@ -716,31 +686,29 @@ impl Plane for Snapshot {
         }
     }
 
-    fn attr(&self, of: &Subject, name: &str) -> Lookup {
+    fn attr(&self, of: &Subject, name: &str) -> Option<Value> {
         match of {
             Subject::Process(id) => {
                 let (proc, live) = match (self.procs.get(id), self.exited.get(id)) {
                     (Some(proc), _) => (proc, true),
                     (None, Some(proc)) => (proc, false),
-                    (None, None) => return Lookup::UnknownSubject,
+                    (None, None) => return None,
                 };
                 let counts = || ProcessId::from_str(id).ok().and_then(tokens::get);
-                let int = |n: Option<u64>| {
-                    n.map_or(Lookup::Absent, |n| Lookup::Value(Value::Int(n as i64)))
-                };
+                let int = |n: Option<u64>| n.map(|n| Value::Int(n as i64));
                 match name {
-                    "state" if live => Lookup::Value(Value::Text(proc.state.name().into())),
-                    "state" => Lookup::Absent,
+                    "state" if live => Some(Value::Text(proc.state.name().into())),
+                    "state" => None,
                     "prompt-tokens" => int(counts().map(|c| c.prompt)),
                     "generated-tokens" => int(counts().map(|c| c.generated)),
-                    "arrival-ms" => Lookup::Value(Value::Int(proc.arrival_ms as i64)),
+                    "arrival-ms" => Some(Value::Int(proc.arrival_ms as i64)),
                     "service-ms" => int(Some(proc.times(now_ms(), live).0)),
                     "waited-ms" => int(Some(proc.times(now_ms(), live).1)),
                     "first-token-ms" => int(ProcessId::from_str(id)
                         .ok()
                         .and_then(tokens::first_token_ms)),
-                    "worker" => Lookup::Value(Value::Text(WORKER.into())),
-                    "restarts" => Lookup::Value(Value::Int(proc.restarts as i64)),
+                    "worker" => Some(Value::Text(WORKER.into())),
+                    "restarts" => Some(Value::Int(proc.restarts as i64)),
                     // What the runtime mapped in once it has run; before,
                     // what the cache holds of its prompt text.
                     "cached-tokens" => int(proc.cached_tokens.or_else(|| {
@@ -748,25 +716,9 @@ impl Plane for Snapshot {
                             .as_ref()
                             .map(|prompt| self.held.held_tokens(prompt))
                     })),
-                    "tenant" => Lookup::Value(Value::Text(proc.tenant.clone())),
-                    "session" => proc
-                        .session
-                        .clone()
-                        .map_or(Lookup::Absent, |s| Lookup::Value(Value::Text(s))),
-                    "status" => {
-                        let pid = ProcessId::from_str(id).ok();
-                        let schedule = self.schedule.as_ref();
-                        let named = pid.is_some_and(|pid| schedule.is_some_and(|s| s.names(pid)));
-                        // A divergence lasts while the floor still holds it.
-                        let held = pid.is_some_and(|pid| schedule.is_some_and(|s| s.held(pid)));
-                        let status = match proc.diverged {
-                            Some(reason) if held => format!("diverged/{reason}"),
-                            _ if named => "applied".to_string(),
-                            _ => "default".to_string(),
-                        };
-                        Lookup::Value(Value::Text(status))
-                    }
-                    _ => Lookup::UnknownName,
+                    "tenant" => Some(Value::Text(proc.tenant.clone())),
+                    "session" => proc.session.clone().map(Value::Text),
+                    _ => None,
                 }
             }
             Subject::Session(id) => {
@@ -777,58 +729,39 @@ impl Plane for Snapshot {
                         .split_once('/')
                         .map_or(id.as_str(), |(t, _)| t)
                         .to_string(),
-                    None => return Lookup::UnknownSubject,
+                    None => return None,
                 };
                 match name {
-                    "tenant" => Lookup::Value(Value::Text(tenant)),
-                    "processes" => Lookup::Value(Value::Ids(
-                        procs.iter().map(|(pid, _)| (*pid).clone()).collect(),
-                    )),
-                    _ => Lookup::UnknownName,
+                    "tenant" => Some(Value::Text(tenant)),
+                    _ => None,
                 }
             }
             Subject::WorkingSet(id) => {
                 let (sets, page_size) = self.cached();
-                let Some(set) = sets.get(id) else {
-                    return Lookup::UnknownSubject;
-                };
+                let set = sets.get(id)?;
                 let (tenant, session) = self.whose(id);
                 match name {
                     // Its owner while the owner runs; a retained one has none.
-                    "owner" if self.procs.contains_key(id) => {
-                        Lookup::Value(Value::Text(id.clone()))
-                    }
-                    "owner" => Lookup::Absent,
+                    "owner" if self.procs.contains_key(id) => Some(Value::Text(id.clone())),
+                    "owner" => None,
                     "tenant" => text(tenant),
                     "session" => text(session),
-                    "tokens" => {
-                        Lookup::Value(Value::Int((set.pages * u64::from(*page_size)) as i64))
-                    }
+                    "tokens" => Some(Value::Int((set.pages * u64::from(*page_size)) as i64)),
                     "last-use-ms" => {
                         let ago = set.last_use.elapsed().as_millis() as u64;
-                        Lookup::Value(Value::Int(now_ms().saturating_sub(ago) as i64))
+                        Some(Value::Int(now_ms().saturating_sub(ago) as i64))
                     }
-                    "status" => {
-                        let status = if retention::names(set.owner) {
-                            "applied"
-                        } else {
-                            "default"
-                        };
-                        Lookup::Value(Value::Text(status.into()))
-                    }
-                    _ => Lookup::UnknownName,
+                    _ => None,
                 }
             }
             Subject::Worker(id) if id == WORKER => match name {
-                "running" => Lookup::Value(Value::Int(self.count(State::Running))),
-                "waiting" => Lookup::Value(Value::Int(self.count(State::Pending))),
-                "paused" => Lookup::Value(Value::Int(self.count(State::Paused))),
-                "step-ms" => crate::scheduler::last_batch_us().map_or(Lookup::Absent, |us| {
-                    Lookup::Value(Value::Int(us.div_ceil(1000) as i64))
-                }),
-                "batch-size" => {
-                    Lookup::Value(Value::Int(crate::scheduler::last_batch_size() as i64))
+                "running" => Some(Value::Int(self.count(State::Running))),
+                "waiting" => Some(Value::Int(self.count(State::Pending))),
+                "paused" => Some(Value::Int(self.count(State::Paused))),
+                "step-ms" => {
+                    crate::scheduler::last_batch_us().map(|us| Value::Int(us.div_ceil(1000) as i64))
                 }
+                "batch-size" => Some(Value::Int(crate::scheduler::last_batch_size() as i64)),
                 // Pages cached for later processes are reclaimable, so
                 // they do not count as used, as in vLLM and SGLang.
                 "capacity-tokens" | "used-tokens" => {
@@ -840,7 +773,7 @@ impl Plane for Snapshot {
                         let cached: u64 = sets.values().map(|set| set.pages).sum();
                         capacity.saturating_sub(available).saturating_sub(cached)
                     };
-                    Lookup::Value(Value::Int((pages * u64::from(*page_size)) as i64))
+                    Some(Value::Int((pages * u64::from(*page_size)) as i64))
                 }
                 // Where a pause or a preemption puts kv: pie cannot compute
                 // it again, so this is what a pause costs.
@@ -852,57 +785,39 @@ impl Plane for Snapshot {
                     } else {
                         capacity.saturating_sub(available)
                     };
-                    Lookup::Value(Value::Int((pages * u64::from(*page_size)) as i64))
+                    Some(Value::Int((pages * u64::from(*page_size)) as i64))
                 }
-                _ => Lookup::UnknownName,
+                _ => None,
             },
-            _ => Lookup::UnknownSubject,
+            _ => None,
         }
     }
 
-    fn prop(&self, of: &Subject, name: &str) -> Lookup {
+    fn prop(&self, of: &Subject, name: &str) -> Option<Value> {
         match of {
-            Subject::Process(id) => match self.procs.get(id).or_else(|| self.exited.get(id)) {
-                Some(proc) => proc
-                    .props
-                    .get(name)
-                    .map_or(Lookup::Absent, |value| Lookup::Value(value.clone())),
-                None => Lookup::UnknownSubject,
-            },
-            Subject::Session(id) => match self.sessions.get(id) {
-                Some(props) => props
-                    .get(name)
-                    .and_then(|v| prop_value((name.to_string(), v.clone())))
-                    .map_or(Lookup::Absent, |(_, value)| Lookup::Value(value)),
-                None if !self.session(id).is_empty() => Lookup::Absent,
-                None => Lookup::UnknownSubject,
-            },
-            Subject::WorkingSet(id) if self.cached().0.contains_key(id) => Lookup::Absent,
-            _ => Lookup::UnknownSubject,
+            Subject::Process(id) => {
+                let proc = self.procs.get(id).or_else(|| self.exited.get(id))?;
+                proc.props.get(name).cloned()
+            }
+            Subject::Session(id) => {
+                let value = self.sessions.get(id)?.get(name)?;
+                prop_value((name.to_string(), value.clone())).map(|(_, value)| value)
+            }
+            _ => None,
         }
     }
 
-    fn capability(&self, name: &str) -> Level {
+    fn capability(&self, name: &str) -> bool {
         capability(name)
     }
 
-    fn terminable(&self, process: &str) -> Result<(), Refusal> {
-        if self.procs.contains_key(process) {
-            Ok(())
-        } else {
-            Err(Refusal::UnknownSubject)
-        }
+    fn terminable(&self, process: &str) -> bool {
+        self.procs.contains_key(process)
     }
 
-    fn discardable(&self, working_set: &str) -> Result<(), Refusal> {
-        if !self.cached().0.contains_key(working_set) {
-            Err(Refusal::UnknownSubject)
-        } else if self.procs.contains_key(working_set) {
-            // Live: terminate its owner instead.
-            Err(Refusal::WrongState)
-        } else {
-            Ok(())
-        }
+    fn discardable(&self, working_set: &str) -> bool {
+        // A live one ends with its owner: terminate that instead.
+        self.cached().0.contains_key(working_set) && !self.procs.contains_key(working_set)
     }
 }
 
@@ -938,28 +853,8 @@ mod tests {
         pid
     }
 
-    fn show(lookup: Lookup) -> String {
+    fn show(lookup: Option<Value>) -> String {
         format!("{lookup:?}")
-    }
-
-    #[test]
-    fn a_pause_no_tier_takes_is_told_once_until_it_happens() {
-        let mut registry = Registry::new(NO_CACHE);
-        let pid = arrive(&mut registry, "t", None);
-        let diverge =
-            |registry: &mut Registry| registry.apply(Event::Diverged(pid, Some("no-swap-room")));
-        let edges = diverge(&mut registry);
-        assert!(
-            matches!(&edges[..], [Edge::Diverged(d)] if d.reason == "no-swap-room"),
-            "{edges:?}"
-        );
-        assert!(diverge(&mut registry).is_empty(), "told once");
-        assert!(registry.apply(Event::Diverged(pid, None)).is_empty());
-        assert_eq!(
-            diverge(&mut registry).len(),
-            1,
-            "told again once it was enacted"
-        );
     }
 
     #[test]
@@ -979,7 +874,7 @@ mod tests {
             |registry: &Registry, name| format!("{:?}", registry.snapshot().prop(&process, name));
         assert_eq!(
             read(&registry, "priority"),
-            format!("{:?}", Lookup::Value(Value::Int(1)))
+            format!("{:?}", Some(Value::Int(1)))
         );
 
         let changed = registry.apply(Event::PropsChanged(
@@ -994,9 +889,9 @@ mod tests {
         assert_eq!(change.names, ["priority"]);
         assert_eq!(
             read(&registry, "priority"),
-            format!("{:?}", Lookup::Value(Value::Int(7)))
+            format!("{:?}", Some(Value::Int(7)))
         );
-        assert_eq!(read(&registry, "tier"), format!("{:?}", Lookup::Absent));
+        assert_eq!(read(&registry, "tier"), format!("{:?}", None::<Value>));
 
         // A process the policy never heard of has no props to change.
         let stranger = Event::PropsChanged(
@@ -1008,43 +903,28 @@ mod tests {
     }
 
     #[test]
-    fn a_session_is_scoped_by_its_tenant_and_lists_its_processes() {
+    fn a_session_is_scoped_by_its_tenant() {
         let mut registry = Registry::new(NO_CACHE);
         let a1 = arrive(&mut registry, "a", Some("chat")).to_string();
-        let a2 = arrive(&mut registry, "a", Some("chat")).to_string();
+        arrive(&mut registry, "a", Some("chat"));
         let b1 = arrive(&mut registry, "b", Some("chat")).to_string();
         let lone = arrive(&mut registry, "a", None).to_string();
         let plane = registry.snapshot();
 
         assert_eq!(plane.candidates(SubjectKind::Session), ["a/chat", "b/chat"]);
-        let mut a = vec![a1.clone(), a2];
-        a.sort();
         let chat = Subject::Session("a/chat".into());
         assert_eq!(
-            show(plane.attr(&chat, "processes")),
-            show(Lookup::Value(Value::Ids(a)))
-        );
-        assert_eq!(
             show(plane.attr(&chat, "tenant")),
-            show(Lookup::Value(Value::Text("a".into())))
+            show(Some(Value::Text("a".into())))
         );
-        assert_eq!(show(plane.prop(&chat, "anything")), show(Lookup::Absent));
+        assert_eq!(show(plane.prop(&chat, "anything")), show(None));
         let gone = Subject::Session("c/chat".into());
-        assert_eq!(
-            show(plane.attr(&gone, "tenant")),
-            show(Lookup::UnknownSubject)
-        );
+        assert_eq!(show(plane.attr(&gone, "tenant")), show(None));
 
         let of = |id: &String, name| show(plane.attr(&Subject::Process(id.clone()), name));
-        assert_eq!(
-            of(&a1, "session"),
-            show(Lookup::Value(Value::Text("a/chat".into())))
-        );
-        assert_eq!(
-            of(&b1, "tenant"),
-            show(Lookup::Value(Value::Text("b".into())))
-        );
-        assert_eq!(of(&lone, "session"), show(Lookup::Absent));
+        assert_eq!(of(&a1, "session"), show(Some(Value::Text("a/chat".into()))));
+        assert_eq!(of(&b1, "tenant"), show(Some(Value::Text("b".into()))));
+        assert_eq!(of(&lone, "session"), show(None));
     }
 
     static CACHED: std::sync::Mutex<Vec<(ProcessId, u64)>> = std::sync::Mutex::new(Vec::new());
@@ -1088,14 +968,11 @@ mod tests {
         let plane = registry.snapshot();
         assert_eq!(plane.candidates(SubjectKind::Session), [session()]);
         let read = |plane: &Snapshot, name| show(plane.prop(&Subject::Session(session()), name));
-        assert_eq!(
-            read(&plane, "tool-eta-ms"),
-            show(Lookup::Value(Value::Int(5000)))
-        );
-        assert_eq!(read(&plane, "other"), show(Lookup::Absent));
+        assert_eq!(read(&plane, "tool-eta-ms"), show(Some(Value::Int(5000))));
+        assert_eq!(read(&plane, "other"), show(None));
         assert_eq!(
             show(plane.attr(&Subject::Session(session()), "tenant")),
-            show(Lookup::Value(Value::Text("t".into())))
+            show(Some(Value::Text("t".into())))
         );
 
         let same = registry.apply(Event::SessionProps(
@@ -1108,10 +985,7 @@ mod tests {
 
         let edges = registry.apply(Event::SessionClosed(session()));
         assert!(matches!(&edges[..], [Edge::Closed(s)] if *s == session()));
-        assert_eq!(
-            read(&registry.snapshot(), "tool-eta-ms"),
-            show(Lookup::UnknownSubject)
-        );
+        assert_eq!(read(&registry.snapshot(), "tool-eta-ms"), show(None));
     }
 
     #[test]
@@ -1125,8 +999,8 @@ mod tests {
                     .attr(&Subject::Process(id.to_string()), name),
             )
         };
-        let int = |n| show(Lookup::Value(Value::Int(n)));
-        assert_eq!(of(&registry, "prompt-tokens"), show(Lookup::Absent));
+        let int = |n| show(Some(Value::Int(n)));
+        assert_eq!(of(&registry, "prompt-tokens"), show(None));
         tokens::set(
             id,
             tokens::Counts {
@@ -1138,24 +1012,18 @@ mod tests {
         assert_eq!(of(&registry, "generated-tokens"), int(7));
 
         tokens::exit(id);
-        registry.apply(Event::Exited(id, Outcome::Completed, By::Host));
+        registry.apply(Event::Exited(id, Outcome::Completed));
         assert_eq!(of(&registry, "generated-tokens"), int(7));
-        assert_eq!(
-            of(&registry, "tenant"),
-            show(Lookup::Value(Value::Text("t".into())))
-        );
-        assert_eq!(of(&registry, "state"), show(Lookup::Absent), "not live");
+        assert_eq!(of(&registry, "tenant"), show(Some(Value::Text("t".into()))));
+        assert_eq!(of(&registry, "state"), show(None), "not live");
         let plane = registry.snapshot();
         assert!(plane.candidates(SubjectKind::Process).is_empty());
-        assert_eq!(
-            plane.terminable(&id.to_string()),
-            Err(Refusal::UnknownSubject)
-        );
+        assert!(!plane.terminable(&id.to_string()));
 
         registry.exited.clear();
         assert_eq!(
             of(&registry, "tenant"),
-            show(Lookup::UnknownSubject),
+            show(None),
             "the next call does not"
         );
     }
@@ -1183,7 +1051,7 @@ mod tests {
                     .attr(&Subject::Process(id.to_string()), "cached-tokens"),
             )
         };
-        let tokens = |n: i64| show(Lookup::Value(Value::Int(n)));
+        let tokens = |n: i64| show(Some(Value::Int(n)));
         let first = with_prompt(&mut registry, &text);
         let second = with_prompt(&mut registry, &format!("{text}and more"));
         assert_eq!(cached(&registry, second), tokens(0), "nothing held yet");
@@ -1202,7 +1070,7 @@ mod tests {
         let bare = arrive(&mut registry, "t", None);
         assert_eq!(
             cached(&registry, bare),
-            show(Lookup::Absent),
+            show(None),
             "no prompt, no estimate"
         );
     }
@@ -1226,17 +1094,17 @@ mod tests {
         };
         assert_eq!(
             of(&registry, gone),
-            show(Lookup::Value(Value::Int(32))),
+            show(Some(Value::Int(32))),
             "its longest hit"
         );
-        assert_eq!(of(&registry, live), show(Lookup::Absent), "it never looked");
+        assert_eq!(of(&registry, live), show(None), "it never looked");
 
-        let edges = registry.apply(Event::Exited(gone, Outcome::Completed, By::Host));
+        let edges = registry.apply(Event::Exited(gone, Outcome::Completed));
         assert!(
             matches!(&edges[..], [Edge::Exited(_), Edge::Retained(ws)] if *ws == gone.to_string()),
             "{edges:?}"
         );
-        let edges = registry.apply(Event::Exited(uncached, Outcome::Completed, By::Host));
+        let edges = registry.apply(Event::Exited(uncached, Outcome::Completed));
         assert!(
             matches!(&edges[..], [Edge::Exited(_)]),
             "nothing of it outlives it"
@@ -1247,45 +1115,23 @@ mod tests {
         ids.sort();
         assert_eq!(plane.candidates(SubjectKind::WorkingSet), ids);
         let ws = |id: ProcessId, name| show(plane.attr(&Subject::WorkingSet(id.to_string()), name));
-        assert_eq!(ws(gone, "owner"), show(Lookup::Absent));
-        assert_eq!(
-            ws(live, "owner"),
-            show(Lookup::Value(Value::Text(live.to_string())))
-        );
+        assert_eq!(ws(gone, "owner"), show(None));
+        assert_eq!(ws(live, "owner"), show(Some(Value::Text(live.to_string()))));
         assert_eq!(
             ws(gone, "session"),
-            show(Lookup::Value(Value::Text("t/chat".into())))
+            show(Some(Value::Text("t/chat".into())))
         );
-        assert_eq!(ws(gone, "tokens"), show(Lookup::Value(Value::Int(64))));
+        assert_eq!(ws(gone, "tokens"), show(Some(Value::Int(64))));
         let worker = |name| show(plane.attr(&Subject::Worker(WORKER.to_string()), name));
-        assert_eq!(
-            worker("capacity-tokens"),
-            show(Lookup::Value(Value::Int(1600)))
-        );
+        assert_eq!(worker("capacity-tokens"), show(Some(Value::Int(1600))));
         // 60 of 100 pages are taken, 6 of them by what is cached.
-        assert_eq!(worker("used-tokens"), show(Lookup::Value(Value::Int(864))));
+        assert_eq!(worker("used-tokens"), show(Some(Value::Int(864))));
         // 100 of 400 pages below the device hold suspended kv.
-        assert_eq!(
-            worker("swap-capacity-tokens"),
-            show(Lookup::Value(Value::Int(6400)))
-        );
-        assert_eq!(
-            worker("swap-used-tokens"),
-            show(Lookup::Value(Value::Int(1600)))
-        );
-        assert_eq!(
-            ws(gone, "status"),
-            show(Lookup::Value(Value::Text("default".into())))
-        );
-        assert_eq!(plane.discardable(&gone.to_string()), Ok(()));
-        assert_eq!(
-            plane.discardable(&live.to_string()),
-            Err(Refusal::WrongState)
-        );
-        assert_eq!(
-            plane.discardable(&uncached.to_string()),
-            Err(Refusal::UnknownSubject)
-        );
+        assert_eq!(worker("swap-capacity-tokens"), show(Some(Value::Int(6400))));
+        assert_eq!(worker("swap-used-tokens"), show(Some(Value::Int(1600))));
+        assert!(plane.discardable(&gone.to_string()));
+        assert!(!plane.discardable(&live.to_string()), "live");
+        assert!(!plane.discardable(&uncached.to_string()), "not cached");
 
         let edges = registry.apply(Event::CacheEmptied(live, By::Client));
         assert!(edges.is_empty(), "a live working-set ends with its owner");

@@ -483,6 +483,7 @@ impl RsStore {
         freed
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn discard_cache(&mut self, owner: ProcessId) -> usize {
         let keys: Vec<Hash256> = self
             .checkpoints

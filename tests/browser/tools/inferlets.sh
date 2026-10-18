@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
-(cd examples && cargo build -q --release --target wasm32-wasip2)
+(cd examples && cargo build -q --release --target wasm32-wasip3)
 mkdir -p tests/browser/inferlets
 for name in $(python3 -c 'import json; print(" ".join(sorted({e["inferlet"] for e in json.load(open("tests/browser/matrix.json"))})))'); do
   case "$name" in
     *-js) cp "examples/$name/index.js" "tests/browser/inferlets/${name//-/_}.js" ;;
     *-py) cp "examples/$name/main.py" "tests/browser/inferlets/${name//-/_}.py" ;;
-    *) cp "examples/target/wasm32-wasip2/release/${name//-/_}.wasm" tests/browser/inferlets/ ;;
+    *) cp "examples/target/wasm32-wasip3/release/${name//-/_}.wasm" tests/browser/inferlets/ ;;
   esac
 done
 # The script twins run under their language component, which

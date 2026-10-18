@@ -26,8 +26,8 @@ python3 scripts/tiny_qwen35.py "$work/snapshot" "${tok[@]}"
 echo "== pie with the $engine engine"
 cargo build --release -p pie --features "$engine"
 pie=./target/release/pie
-echo "== inferlets (wasm32-wasip2)"
-(cd examples && cargo build -q --release --target wasm32-wasip2 -p text-completion -p naive-baseline -p sort-probe)
+echo "== inferlets (wasm32-wasip3)"
+(cd examples && cargo build -q --release --target wasm32-wasip3 -p text-completion -p naive-baseline -p sort-probe)
 
 echo "== import"
 "$pie" model import "$work/snapshot" --deployment qwen35-tiny-u4g64-kv-bf16 --keep-source

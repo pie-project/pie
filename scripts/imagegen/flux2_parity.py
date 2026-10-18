@@ -116,15 +116,15 @@ def wasm(inferlet: str) -> str:
     workspace = os.path.dirname(os.path.normpath(inferlet))
     if not os.environ.get("PIE_INFERLETS_NO_BUILD"):
         done = subprocess.run(
-            ["cargo", "build", "-p", name, "--target", "wasm32-wasip2"],
+            ["cargo", "build", "-p", name, "--target", "wasm32-wasip3"],
             cwd=workspace, capture_output=True, text=True,
         )
         if done.returncode != 0:
             sys.stderr.write(done.stderr)
-            raise SystemExit(f"building {name} for wasm32-wasip2 failed")
+            raise SystemExit(f"building {name} for wasm32-wasip3 failed")
     candidates = [
-        os.path.join(workspace, "target/wasm32-wasip2/release", f"{stem}.wasm"),
-        os.path.join(workspace, "target/wasm32-wasip2/debug", f"{stem}.wasm"),
+        os.path.join(workspace, "target/wasm32-wasip3/release", f"{stem}.wasm"),
+        os.path.join(workspace, "target/wasm32-wasip3/debug", f"{stem}.wasm"),
     ]
     present = [path for path in candidates if os.path.exists(path)]
     if not present:

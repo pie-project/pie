@@ -15,18 +15,14 @@ use ids::{ReqId, WorkerId};
 use tokio::sync::{Notify, mpsc, watch};
 use worker_api::Request;
 
-use super::GateFail;
-use super::program::{Commit, Fault, LoadError, Plane, Program, Table};
-use super::wit::{self, By, Edge, Level, Lookup, Outcome, Refusal, Subject, SubjectKind, Value};
+use super::program::{self, Commit, Fault, LoadError, Plane, Program, Table};
+use super::wit::{self, Edge, Outcome, Subject, SubjectKind, Value};
 use crate::admission::{AdmissionDecision, RejectReason};
 use crate::route::RoutingHandle;
 use crate::session::AdmitReject;
 
-fn capability(name: &str) -> Level {
-    match name {
-        "router.hold" => Level::Native,
-        _ => Level::Absent,
-    }
+fn capability(name: &str) -> bool {
+    name == "router.hold"
 }
 
 #[derive(Default)]
@@ -46,11 +42,9 @@ struct Shared {
 }
 
 pub struct Router {
-    name: String,
     events: Sender<Event>,
     shared: Arc<Shared>,
     gate: Duration,
-    gate_fail: GateFail,
     next_seq: AtomicU64,
     dead: Arc<AtomicBool>,
 }
@@ -75,7 +69,6 @@ enum Event {
     Exited {
         id: String,
         outcome: Outcome,
-        by: By,
     },
     Workers(BTreeSet<String>),
     SessionProps {
@@ -94,9 +87,6 @@ impl Router {
         routing: watch::Receiver<RoutingTable>,
         mut connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
     ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<ReqId>), LoadError> {
-        let program = Program::load(name, component, &capability)?;
-        let manifest = program.manifest();
-        let (gate, gate_fail) = (Duration::from_millis(manifest.gate_ms), manifest.gate_fail);
         let (cancels, cancelled) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             tables: RwLock::default(),
@@ -108,13 +98,11 @@ impl Router {
         });
         let (events, rx) = channel();
         let dead = Arc::new(AtomicBool::new(false));
-        std::thread::Builder::new()
-            .name("pie-router-policy".into())
-            .spawn({
-                let (shared, dead) = (shared.clone(), dead.clone());
-                move || run(program, rx, shared, routing, dead)
-            })
-            .map_err(|e| LoadError::Instantiate(format!("spawning its thread: {e}")))?;
+        let manifest = program::spawn(name, component, capability, "pie-router-policy", {
+            let (shared, dead) = (shared.clone(), dead.clone());
+            move |program| run(program, rx, shared, routing, dead)
+        })?;
+        let gate = Duration::from_millis(manifest.gate_ms);
 
         let workers = events.clone();
         tokio::spawn(async move {
@@ -133,11 +121,9 @@ impl Router {
         tracing::info!(policy = name, "router policy started");
         Ok((
             Arc::new(Self {
-                name: name.to_string(),
                 events,
                 shared,
                 gate,
-                gate_fail,
                 next_seq: AtomicU64::new(0),
                 dead,
             }),
@@ -173,15 +159,10 @@ impl Router {
             };
             self.pass(&mut waiting, req, routing).await
         };
-        if let Err(refusal) = &admitted {
-            let by = match refusal {
-                AdmitReject::Refused(_) => By::Policy,
-                AdmitReject::Full(_) => By::Host,
-            };
+        if admitted.is_err() {
             self.send(Event::Exited {
                 id,
                 outcome: Outcome::Cancelled,
-                by,
             });
         }
         admitted
@@ -195,17 +176,9 @@ impl Router {
     ) -> Result<(), AdmitReject> {
         let (id, seq) = (waiting.id, waiting.seq);
         if !self.gate.is_zero() && !self.dead.load(Ordering::Acquire) {
+            // Unanswered, the launch goes by the router's default.
             let mut heard = self.shared.heard.subscribe();
-            let answered = tokio::time::timeout(self.gate, heard.wait_for(|&h| h >= seq))
-                .await
-                .is_ok();
-            if !answered && self.gate_fail == GateFail::Closed {
-                return waiting.leave(Err(AdmitReject::Full(format!(
-                    "the router policy `{}` did not answer within its {} ms gate",
-                    self.name,
-                    self.gate.as_millis()
-                ))));
-            }
+            let _ = tokio::time::timeout(self.gate, heard.wait_for(|&h| h >= seq)).await;
         }
 
         {
@@ -301,11 +274,10 @@ impl Router {
         self.send(Event::SessionClosed { id });
     }
 
-    pub fn exited(&self, req: &Request, outcome: Outcome, by: By) {
+    pub fn exited(&self, req: &Request, outcome: Outcome) {
         self.send(Event::Exited {
             id: req.req_id.0.to_string(),
             outcome,
-            by,
         });
     }
 }
@@ -340,7 +312,6 @@ impl Drop for Waiting<'_> {
         self.router.send(Event::Exited {
             id: self.id.to_string(),
             outcome: Outcome::Cancelled,
-            by: By::Client,
         });
     }
 }
@@ -384,8 +355,7 @@ fn run(
 
         if !edges.is_empty() {
             tracing::debug!(policy = program.name(), ?edges, "router policy edges");
-            let schedule = shared.tables.read().unwrap().schedule.clone();
-            let plane = registry.snapshot(schedule, &routing.borrow());
+            let plane = registry.snapshot(&routing.borrow());
             match program.react(Box::new(plane), edges, now) {
                 Ok(commit) => {
                     tracing::debug!(
@@ -535,18 +505,13 @@ impl Registry {
                     proc.counted = Some((prompt, generated));
                 }
             }
-            Event::Exited { id, outcome, by } => {
-                let by = if self.terminated.remove(&id) {
-                    By::Policy
-                } else {
-                    by
-                };
+            Event::Exited { id, outcome } => {
+                self.terminated.remove(&id);
                 if let Some(proc) = self.procs.remove(&id) {
                     self.exited.insert(id.clone(), proc);
                     edges.push(Edge::Exited(wit::Exit {
                         process: id,
                         outcome,
-                        by,
                     }));
                 }
             }
@@ -574,9 +539,6 @@ impl Registry {
                 edges.push(Edge::Closed(id));
             }
             Event::Workers(now) => {
-                for added in now.difference(&self.workers) {
-                    edges.push(Edge::WorkerAdded(added.clone()));
-                }
                 for removed in self.workers.difference(&now) {
                     edges.push(Edge::WorkerRemoved(removed.clone()));
                     self.held.remove(removed);
@@ -586,7 +548,7 @@ impl Registry {
         }
     }
 
-    fn snapshot(&self, schedule: Option<Table>, routing: &RoutingTable) -> Snapshot {
+    fn snapshot(&self, routing: &RoutingTable) -> Snapshot {
         Snapshot {
             procs: self.procs.clone(),
             exited: self.exited.clone(),
@@ -598,7 +560,6 @@ impl Registry {
                 .filter(|w| self.workers.contains(&w.id.0.to_string()))
                 .map(|w| (w.id.0.to_string(), w.clone()))
                 .collect(),
-            schedule,
         }
     }
 }
@@ -625,7 +586,6 @@ fn json(value: &Value) -> Option<serde_json::Value> {
         Value::Int(i) => Json::from(*i),
         Value::Float(f) => serde_json::Number::from_f64(*f).map(Json::Number)?,
         Value::Text(s) => Json::String(s.clone()),
-        Value::Ids(ids) => Json::from(ids.clone()),
         Value::Json(text) => serde_json::from_str(text).ok()?,
     })
 }
@@ -636,11 +596,10 @@ struct Snapshot {
     sessions: HashMap<String, Props>,
     held: HashMap<String, Arc<PromptIndex>>,
     workers: BTreeMap<String, RoutableWorker>,
-    schedule: Option<Table>,
 }
 
-fn text(value: impl Into<String>) -> Lookup {
-    Lookup::Value(Value::Text(value.into()))
+fn text(value: impl Into<String>) -> Option<Value> {
+    Some(Value::Text(value.into()))
 }
 
 impl Plane for Snapshot {
@@ -661,19 +620,17 @@ impl Plane for Snapshot {
         }
     }
 
-    fn attr(&self, of: &Subject, name: &str) -> Lookup {
+    fn attr(&self, of: &Subject, name: &str) -> Option<Value> {
         match of {
             Subject::Process(id) => {
                 let (proc, live) = match (self.procs.get(id), self.exited.get(id)) {
                     (Some(proc), _) => (proc, true),
                     (None, Some(proc)) => (proc, false),
-                    (None, None) => return Lookup::UnknownSubject,
+                    (None, None) => return None,
                 };
-                let int = |n: Option<u64>| {
-                    n.map_or(Lookup::Absent, |n| Lookup::Value(Value::Int(n as i64)))
-                };
+                let int = |n: Option<u64>| n.map(|n| Value::Int(n as i64));
                 match name {
-                    "state" if !live => Lookup::Absent,
+                    "state" if !live => None,
                     "state" if proc.worker.is_some() => text("running"),
                     "state" => text("pending"),
                     // An exited process has told the router its counts; before
@@ -685,34 +642,26 @@ impl Plane for Snapshot {
                         })
                     })),
                     "max-tokens" => match proc.props.get(client_api::props::MAX_TOKENS) {
-                        Some(Value::Int(n)) if *n >= 0 => Lookup::Value(Value::Int(*n)),
-                        _ => Lookup::Absent,
+                        Some(Value::Int(n)) if *n >= 0 => Some(Value::Int(*n)),
+                        _ => None,
                     },
                     "generated-tokens" => int(proc.counted.map(|(_, generated)| generated)),
-                    "arrival-ms" => Lookup::Value(Value::Int(proc.arrival_ms as i64)),
+                    "arrival-ms" => Some(Value::Int(proc.arrival_ms as i64)),
                     "tenant" => text(proc.tenant.clone()),
-                    "session" => proc.session.clone().map_or(Lookup::Absent, text),
-                    "worker" => proc.worker.clone().map_or(Lookup::Absent, text),
-                    "status" => {
-                        let named = self
-                            .schedule
-                            .as_ref()
-                            .is_some_and(|s| s.keys.contains_key(id));
-                        text(if named { "applied" } else { "default" })
-                    }
-                    _ => match (name.strip_prefix("cached-tokens/"), &proc.prompt) {
+                    "session" => proc.session.clone().and_then(text),
+                    "worker" => proc.worker.clone().and_then(text),
+                    _ => {
                         // What the worker holds of its prompt, estimated
                         // from its text: there are no tokens here.
-                        (Some(worker), Some(prompt)) if self.workers.contains_key(worker) => {
-                            let held = self
-                                .held
-                                .get(worker)
-                                .map_or(0, |held| held.held_tokens(prompt));
-                            Lookup::Value(Value::Int(held as i64))
-                        }
-                        (Some(_), _) => Lookup::Absent,
-                        (None, _) => Lookup::UnknownName,
-                    },
+                        let worker = name.strip_prefix("cached-tokens/")?;
+                        let prompt = proc.prompt.as_ref()?;
+                        self.workers.get(worker)?;
+                        let held = self
+                            .held
+                            .get(worker)
+                            .map_or(0, |held| held.held_tokens(prompt));
+                        Some(Value::Int(held as i64))
+                    }
                 }
             }
             Subject::Session(id) => {
@@ -727,20 +676,15 @@ impl Plane for Snapshot {
                         .split_once('/')
                         .map_or(id.as_str(), |(t, _)| t)
                         .to_string(),
-                    None => return Lookup::UnknownSubject,
+                    None => return None,
                 };
                 match name {
                     "tenant" => text(tenant),
-                    "processes" => {
-                        Lookup::Value(Value::Ids(procs.map(|(id, _)| id.clone()).collect()))
-                    }
-                    _ => Lookup::UnknownName,
+                    _ => None,
                 }
             }
             Subject::Worker(id) => {
-                let Some(worker) = self.workers.get(id) else {
-                    return Lookup::UnknownSubject;
-                };
+                let worker = self.workers.get(id)?;
                 match name {
                     "role" => text(match worker.role {
                         Role::Prefill => "prefill",
@@ -748,67 +692,50 @@ impl Plane for Snapshot {
                         Role::Encode => "encode",
                     }),
                     "model" => text(worker.model.clone()),
-                    "draining" => Lookup::Value(Value::Boolean(worker.health != Health::Healthy)),
+                    "draining" => Some(Value::Boolean(worker.health != Health::Healthy)),
                     "pie/kv-pressure" => {
-                        Lookup::Value(Value::Int(i64::from(worker.coarse_load.kv_pressure_bucket)))
+                        Some(Value::Int(i64::from(worker.coarse_load.kv_pressure_bucket)))
                     }
-                    "pie/inflight" => {
-                        Lookup::Value(Value::Int(i64::from(worker.coarse_load.inflight)))
-                    }
+                    "pie/inflight" => Some(Value::Int(i64::from(worker.coarse_load.inflight))),
                     // As of the worker's last report to the controller.
-                    "running" => Lookup::Value(Value::Int(i64::from(worker.coarse_load.running))),
-                    "waiting" => Lookup::Value(Value::Int(i64::from(worker.coarse_load.waiting))),
+                    "running" => Some(Value::Int(i64::from(worker.coarse_load.running))),
+                    "waiting" => Some(Value::Int(i64::from(worker.coarse_load.waiting))),
                     "capacity-tokens" | "used-tokens"
                         if worker.coarse_load.capacity_tokens == 0 =>
                     {
-                        Lookup::Absent
+                        None
                     }
                     "capacity-tokens" => {
-                        Lookup::Value(Value::Int(worker.coarse_load.capacity_tokens as i64))
+                        Some(Value::Int(worker.coarse_load.capacity_tokens as i64))
                     }
-                    "used-tokens" => {
-                        Lookup::Value(Value::Int(worker.coarse_load.used_tokens as i64))
-                    }
-                    _ => Lookup::UnknownName,
+                    "used-tokens" => Some(Value::Int(worker.coarse_load.used_tokens as i64)),
+                    _ => None,
                 }
             }
-            Subject::WorkingSet(_) => Lookup::UnknownSubject,
+            Subject::WorkingSet(_) => None,
         }
     }
 
-    fn prop(&self, of: &Subject, name: &str) -> Lookup {
+    fn prop(&self, of: &Subject, name: &str) -> Option<Value> {
         match of {
-            Subject::Process(id) => match self.procs.get(id).or_else(|| self.exited.get(id)) {
-                Some(proc) => proc
-                    .props
-                    .get(name)
-                    .map_or(Lookup::Absent, |value| Lookup::Value(value.clone())),
-                None => Lookup::UnknownSubject,
-            },
-            Subject::Session(id) => match self.sessions.get(id) {
-                Some(props) => props
-                    .get(name)
-                    .and_then(|v| prop_value((name.to_string(), v.clone())))
-                    .map_or(Lookup::Absent, |(_, value)| Lookup::Value(value)),
-                None if self.procs.values().any(|p| p.session.as_ref() == Some(id)) => {
-                    Lookup::Absent
-                }
-                None => Lookup::UnknownSubject,
-            },
-            _ => Lookup::UnknownSubject,
+            Subject::Process(id) => {
+                let proc = self.procs.get(id).or_else(|| self.exited.get(id))?;
+                proc.props.get(name).cloned()
+            }
+            Subject::Session(id) => {
+                let value = self.sessions.get(id)?.get(name)?;
+                prop_value((name.to_string(), value.clone())).map(|(_, value)| value)
+            }
+            _ => None,
         }
     }
 
-    fn capability(&self, name: &str) -> Level {
+    fn capability(&self, name: &str) -> bool {
         capability(name)
     }
 
-    fn terminable(&self, process: &str) -> Result<(), Refusal> {
-        if self.procs.contains_key(process) {
-            Ok(())
-        } else {
-            Err(Refusal::UnknownSubject)
-        }
+    fn terminable(&self, process: &str) -> bool {
+        self.procs.contains_key(process)
     }
 }
 
@@ -889,22 +816,21 @@ mod tests {
             Event::Exited {
                 id: "1".into(),
                 outcome: Outcome::Completed,
-                by: By::Host,
             },
             Event::Workers(BTreeSet::from(["1".to_string()])),
         ] {
             registry.apply(event, &mut edges);
         }
-        let plane = registry.snapshot(None, &table(0));
+        let plane = registry.snapshot(&table(0));
         let of = |id: &str, name| format!("{:?}", plane.attr(&Subject::Process(id.into()), name));
-        let int = |n| format!("{:?}", Lookup::Value(Value::Int(n)));
+        let int = |n| format!("{:?}", Some(Value::Int(n)));
         assert_eq!(of("1", "generated-tokens"), int(30));
         assert_eq!(of("1", "prompt-tokens"), int(120));
         assert_eq!(of("1", "worker"), format!("{:?}", text("7")));
-        assert_eq!(of("1", "state"), format!("{:?}", Lookup::Absent));
+        assert_eq!(of("1", "state"), "None");
         assert_eq!(
             of("2", "prompt-tokens"),
-            format!("{:?}", Lookup::Absent),
+            "None",
             "the router never sees a live process's counts"
         );
         assert_eq!(plane.candidates(SubjectKind::Process), ["2"]);
@@ -915,11 +841,12 @@ mod tests {
         assert_eq!(worker("used-tokens"), int(250));
 
         registry.exited.clear();
-        let plane = registry.snapshot(None, &table(0));
-        assert!(matches!(
-            plane.attr(&Subject::Process("1".into()), "worker"),
-            Lookup::UnknownSubject
-        ));
+        let plane = registry.snapshot(&table(0));
+        assert!(
+            plane
+                .attr(&Subject::Process("1".into()), "worker")
+                .is_none()
+        );
     }
 
     #[test]
@@ -941,16 +868,10 @@ mod tests {
             },
             &mut edges,
         );
-        let plane = registry.snapshot(None, &table(0));
+        let plane = registry.snapshot(&table(0));
         let of = |name| format!("{:?}", plane.attr(&Subject::Process("1".into()), name));
-        assert_eq!(
-            of("prompt-tokens"),
-            format!("{:?}", Lookup::Value(Value::Int(160)))
-        );
-        assert_eq!(
-            of("max-tokens"),
-            format!("{:?}", Lookup::Value(Value::Int(64)))
-        );
+        assert_eq!(of("prompt-tokens"), format!("{:?}", Some(Value::Int(160))));
+        assert_eq!(of("max-tokens"), format!("{:?}", Some(Value::Int(64))));
     }
 
     #[test]
@@ -981,27 +902,16 @@ mod tests {
         ] {
             registry.apply(event, &mut edges);
         }
-        let plane = registry.snapshot(None, &table(0));
+        let plane = registry.snapshot(&table(0));
         let of = |id: &str, name| format!("{:?}", plane.attr(&Subject::Process(id.into()), name));
         // 1000 bytes: fifteen whole 64-byte blocks, at a guessed 16 tokens each.
         assert_eq!(
             of("2", "cached-tokens/1"),
-            format!("{:?}", Lookup::Value(Value::Int(240)))
+            format!("{:?}", Some(Value::Int(240)))
         );
-        assert_eq!(
-            of("2", "cached-tokens/9"),
-            format!("{:?}", Lookup::Absent),
-            "no such worker"
-        );
-        assert_eq!(
-            of("3", "cached-tokens/1"),
-            format!("{:?}", Lookup::Absent),
-            "no prompt"
-        );
-        assert_eq!(
-            of("2", "cached-tokens"),
-            format!("{:?}", Lookup::UnknownName)
-        );
+        assert_eq!(of("2", "cached-tokens/9"), "None", "no such worker");
+        assert_eq!(of("3", "cached-tokens/1"), "None", "no prompt");
+        assert_eq!(of("2", "cached-tokens"), "None");
     }
 
     #[test]
@@ -1018,11 +928,11 @@ mod tests {
             &mut edges,
         );
         assert!(matches!(&edges[..], [Edge::PropChanged(c)] if c.names == ["tool-eta-ms"]));
-        let plane = registry.snapshot(None, &table(0));
+        let plane = registry.snapshot(&table(0));
         assert_eq!(plane.candidates(SubjectKind::Session), ["default/s"]);
         assert!(matches!(
             plane.prop(&Subject::Session("default/s".into()), "tool-eta-ms"),
-            Lookup::Value(Value::Int(900))
+            Some(Value::Int(900))
         ));
         edges.clear();
         registry.apply(
@@ -1032,11 +942,12 @@ mod tests {
             &mut edges,
         );
         assert!(matches!(&edges[..], [Edge::Closed(s)] if s == "default/s"));
-        let plane = registry.snapshot(None, &table(0));
-        assert!(matches!(
-            plane.prop(&Subject::Session("default/s".into()), "tool-eta-ms"),
-            Lookup::UnknownSubject
-        ));
+        let plane = registry.snapshot(&table(0));
+        assert!(
+            plane
+                .prop(&Subject::Session("default/s".into()), "tool-eta-ms")
+                .is_none()
+        );
     }
 
     struct Rig {

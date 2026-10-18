@@ -1,7 +1,10 @@
+mod cli;
 mod clocks;
 mod filesystem;
 mod http;
+mod random;
 
+pub use cli::{TerminalInput, TerminalOutput};
 pub use filesystem::Descriptor;
 pub use http::{Fields, Request, RequestOptions, Response};
 
@@ -16,6 +19,17 @@ pub mod bindings {
                 package wasi-web:p3;
 
                 world imports {
+                    import wasi:cli/environment@0.3.0;
+                    import wasi:cli/exit@0.3.0;
+                    import wasi:cli/stdin@0.3.0;
+                    import wasi:cli/stdout@0.3.0;
+                    import wasi:cli/stderr@0.3.0;
+                    import wasi:cli/terminal-stdin@0.3.0;
+                    import wasi:cli/terminal-stdout@0.3.0;
+                    import wasi:cli/terminal-stderr@0.3.0;
+                    import wasi:random/random@0.3.0;
+                    import wasi:random/insecure@0.3.0;
+                    import wasi:random/insecure-seed@0.3.0;
                     import wasi:clocks/monotonic-clock@0.3.0;
                     import wasi:filesystem/types@0.3.0;
                     import wasi:filesystem/preopens@0.3.0;
@@ -25,6 +39,9 @@ pub mod bindings {
             path: "../inferlet/wit",
             world: "wasi-web:p3/imports",
             imports: {
+                "wasi:cli/stdin": store | trappable,
+                "wasi:cli/stdout": store | trappable,
+                "wasi:cli/stderr": store | trappable,
                 "wasi:http/client.send": store | trappable,
                 "wasi:http/types.[drop]request": store | trappable,
                 "wasi:http/types.[drop]response": store | trappable,
@@ -40,6 +57,8 @@ pub mod bindings {
             },
             require_store_data_send: true,
             with: {
+                "wasi:cli/terminal-input.terminal-input": crate::wasi::p3::TerminalInput,
+                "wasi:cli/terminal-output.terminal-output": crate::wasi::p3::TerminalOutput,
                 "wasi:filesystem/types.descriptor": crate::wasi::p3::Descriptor,
                 "wasi:http/types.fields": crate::wasi::p3::Fields,
                 "wasi:http/types.request": crate::wasi::p3::Request,
@@ -57,13 +76,7 @@ pub fn add_to_linker<T: WasiWebView + 'static>(linker: &mut Linker<T>) -> wasmti
     clocks::types::add_to_linker::<T, WasiWeb>(linker, T::wasi_web)?;
     clocks::monotonic_clock::add_to_linker::<T, WasiWeb>(linker, T::wasi_web)?;
     clocks::system_clock::add_to_linker::<T, WasiWeb>(linker, T::wasi_web)?;
-
-    // wasmtime never semver-matches pre-releases: the rc interface needs its exact name.
-    linker
-        .root()
-        .instance("wasi:random/insecure-seed@0.3.0-rc-2026-03-15")?
-        .func_wrap("get-insecure-seed", |mut store, (): ()| {
-            Ok((store.data_mut().wasi_web().ctx.insecure_seed,))
-        })?;
+    cli::add_to_linker(linker)?;
+    random::add_to_linker(linker)?;
     Ok(())
 }

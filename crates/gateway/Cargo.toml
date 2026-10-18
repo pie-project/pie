@@ -46,8 +46,10 @@ wasmtime = { version = "49.0.2", default-features = false, features = [
     "anyhow",
     "cranelift",
     "component-model",
+    "component-model-async",
+    "async",
 ] }
-wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p2"] }
+wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p3"] }
 
 [dev-dependencies]
 builtins = { path = "../builtins", features = ["test-policies"] }

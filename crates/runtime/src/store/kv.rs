@@ -139,6 +139,7 @@ struct KeptEntry {
 
 #[derive(Debug, Clone, Copy)]
 pub struct CachedWorkingSet {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub owner: ProcessId,
     pub entries: usize,
     pub pages: u64,
@@ -387,10 +388,12 @@ impl KvStore {
         sets.into_values().collect()
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn owns_cache(&self, owner: ProcessId) -> bool {
         self.owners.contains_key(&owner)
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn discard_cache(&mut self, owner: ProcessId, by: By) -> usize {
         let keys: Vec<u64> = self
             .cache
@@ -511,8 +514,6 @@ impl KvStore {
             .collect()
     }
 
-    /// A group keyed below the retention floor is not kept below the device:
-    /// reclaim drops it.
     pub fn prepare_demote(
         &mut self,
         room: usize,
@@ -523,11 +524,7 @@ impl KvStore {
             return Ok(None);
         }
         self.split_at_steps(&keys);
-        let floor = keys.floor();
         for (key, ids) in self.reclaim_order(&keys) {
-            if floor.is_some_and(|floor| key < floor) {
-                continue;
-            }
             // What a higher key also covers stays with it.
             let above: Vec<NodeId> = self
                 .cache

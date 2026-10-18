@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use super::CAPABILITIES;
-use super::wit::Level;
 
 pub const SECTION: &str = "plex.manifest";
 
@@ -18,23 +17,13 @@ const EDGES: &[&str] = &[
     "exited",
     "prop-changed",
     "closed",
-    "diverged",
     "timer",
     "dispatched",
-    "worker-added",
     "worker-removed",
     "worker-draining",
 ];
 
 const GRANTS: &[&str] = &["schedule", "placement", "terminate"];
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum GateFail {
-    #[default]
-    Open,
-    Closed,
-}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -50,11 +39,9 @@ pub struct Manifest {
     pub uses: Vec<String>,
     #[serde(default = "default_deadline_ms")]
     pub deadline_ms: u64,
-    /// 0 never waits.
+    /// 0 never waits; past it the router dispatches by its default.
     #[serde(default)]
     pub gate_ms: u64,
-    #[serde(default)]
-    pub gate_fail: GateFail,
     /// For discovery; never enforced.
     #[serde(default)]
     pub props: BTreeMap<String, PropDoc>,
@@ -98,7 +85,7 @@ pub enum ManifestError {
 }
 
 impl Manifest {
-    pub fn of(component: &[u8], capability: &dyn Fn(&str) -> Level) -> Result<Self, ManifestError> {
+    pub fn of(component: &[u8], capability: &dyn Fn(&str) -> bool) -> Result<Self, ManifestError> {
         let text = section(component).ok_or(ManifestError::Missing)?;
         let text = std::str::from_utf8(text).map_err(|_| ManifestError::NotText)?;
         let manifest: Manifest = toml::from_str(text)?;
@@ -106,7 +93,7 @@ impl Manifest {
         Ok(manifest)
     }
 
-    fn check(&self, capability: &dyn Fn(&str) -> Level) -> Result<(), ManifestError> {
+    fn check(&self, capability: &dyn Fn(&str) -> bool) -> Result<(), ManifestError> {
         if self.plane != "router" {
             return Err(ManifestError::WrongPlane(self.plane.clone()));
         }
@@ -121,11 +108,7 @@ impl Manifest {
                 return Err(ManifestError::UnknownCapability(name.clone()));
             }
         }
-        if let Some(name) = self
-            .requires
-            .iter()
-            .find(|name| capability(name) == Level::Absent)
-        {
+        if let Some(name) = self.requires.iter().find(|name| !capability(name)) {
             return Err(ManifestError::Unmet(name.clone()));
         }
         if !(1..=MAX_DEADLINE_MS).contains(&self.deadline_ms) {
@@ -164,13 +147,7 @@ mod tests {
 
     fn parse(text: &str) -> Result<Manifest, ManifestError> {
         let manifest: Manifest = toml::from_str(text)?;
-        manifest.check(&|name| {
-            if name == "placement.pd" {
-                Level::Absent
-            } else {
-                Level::Native
-            }
-        })?;
+        manifest.check(&|name| name != "router.hold")?;
         Ok(manifest)
     }
 
@@ -179,7 +156,6 @@ mod tests {
         let manifest = parse(r#"plane = "router""#).unwrap();
         assert_eq!(manifest.deadline_ms, DEFAULT_DEADLINE_MS);
         assert_eq!(manifest.gate_ms, 0, "no gate unless asked");
-        assert_eq!(manifest.gate_fail, GateFail::Open);
         assert!(manifest.subscribes("timer"));
         assert!(!manifest.subscribes("arrived"));
     }
@@ -200,10 +176,10 @@ mod tests {
                 "plane = \"router\"\nuses = [\"schedule.admit\"]",
                 "UnknownCapability",
             ),
-            ("plane = \"router\"\nrequires = [\"placement.pd\"]", "Unmet"),
+            ("plane = \"router\"\nrequires = [\"router.hold\"]", "Unmet"),
             ("plane = \"router\"\ndeadline-ms = 0", "Deadline"),
             ("plane = \"router\"\ngate-ms = 5000", "Gate"),
-            ("plane = \"router\"\ngate-fail = \"ajar\"", "Parse"),
+            ("plane = \"router\"\ngate-fail = \"open\"", "Parse"),
         ];
         for (text, want) in cases {
             let got = format!("{:?}", parse(text).unwrap_err());

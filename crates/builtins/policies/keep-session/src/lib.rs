@@ -100,14 +100,14 @@ impl engine::Policy for KeepSession {
             .iter()
             .partition(|(_, kept)| kept.due_ms.is_some_and(|due| due <= now_ms));
         for (ws, _) in &due {
-            let _ = engine::discard(ws);
+            engine::discard(ws);
         }
         let entries: Vec<_> = kept
             .iter()
             .map(|(ws, _)| Retain::all((*ws).clone(), KEEP))
             .collect();
         let next = kept.iter().filter_map(|(_, k)| k.due_ms).min();
-        let _ = engine::install_retention(&entries, None);
+        engine::install_retention(&entries);
         if let Some(next) = next {
             set_alarm(next);
         }

@@ -95,16 +95,6 @@ fn tests_every_case() {
 #[derive(Clone, Default)]
 struct Steps {
     entries: Vec<(ProcessId, Option<u64>, i64)>,
-    floor: Option<i64>,
-}
-
-impl Steps {
-    fn floor(floor: i64) -> Self {
-        Self {
-            floor: Some(floor),
-            ..Self::default()
-        }
-    }
 }
 
 impl Keys for Steps {
@@ -123,10 +113,6 @@ impl Keys for Steps {
             .filter(|(of, _, _)| *of == owner)
             .filter_map(|&(_, upto, _)| upto)
             .collect()
-    }
-
-    fn floor(&self) -> Option<i64> {
-        self.floor
     }
 }
 
@@ -996,10 +982,6 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     let mut store = KvStore::new_with_swap(8, 8, 0, h(31));
     let owner = ProcessId::from_u128(21);
     let tokens = kept_and_gone(&mut store, 12, 3, owner);
-    assert!(
-        store.prepare_demote(8, Steps::floor(1)).unwrap().is_none(),
-        "below the floor: dropped, not kept"
-    );
     let txn = store
         .prepare_demote(8, |_| 0)
         .unwrap()
@@ -1075,7 +1057,6 @@ fn a_tail_past_its_step_goes_before_another_head() {
     // both below it.
     let keys = Steps {
         entries: vec![(a, None, -1), (a, Some(40), 0), (b, None, -1)],
-        floor: None,
     };
     assert_eq!(
         store.reclaim_cache(store.current_epoch(), keys.clone()),
@@ -1100,28 +1081,21 @@ fn a_demote_leaves_what_a_higher_key_covers() {
     let a = ProcessId::from_u128(43);
     let tokens = prompt(17, 4);
     sealed_and_gone(&mut store, &tokens, a);
-    // KVFlow: the fixed prompt (two pages) kept, the suffix below the floor.
+    // KVFlow: the fixed prompt (two pages) above the suffix.
     let keys = Steps {
         entries: vec![(a, None, -1), (a, Some(32), 10)],
-        floor: Some(0),
     };
     let txn = store
         .prepare_demote(8, keys.clone())
         .unwrap()
-        .expect("the head goes to the host");
+        .expect("the tail goes to the host");
     assert_eq!(
         txn.page_count(),
         2,
-        "only the head: the tail is below the floor"
+        "only the tail: the head's key is higher"
     );
     store.commit_suspend(txn).unwrap();
-    store.retire_idle();
-    assert_eq!(
-        store.reclaim_cache(store.current_epoch(), keys.clone()),
-        2,
-        "the tail"
-    );
-    assert_eq!(store.available_pages(), 8);
+    assert_eq!(on_device(&mut store, &tokens), 2, "the head stays");
 }
 
 fn an_answer_goes_before_an_older_prompt() {
