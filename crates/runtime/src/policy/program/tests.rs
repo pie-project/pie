@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::policy::wit::{By, Exit, Outcome};
+use crate::policy::wit::{Exit, Outcome};
 
 #[derive(Default, Clone)]
 struct Fake {
@@ -44,46 +44,41 @@ impl Plane for Fake {
         }
     }
 
-    fn attr(&self, of: &Subject, name: &str) -> Lookup {
+    fn attr(&self, of: &Subject, name: &str) -> Option<Value> {
         let of = spelled(of);
         self.attrs
             .iter()
             .find(|(subject, n, _)| *subject == of && n == name)
-            .map_or(Lookup::UnknownName, |(_, _, value)| {
-                Lookup::Value(value.clone())
-            })
+            .map(|(_, _, value)| value.clone())
     }
 
-    fn prop(&self, of: &Subject, name: &str) -> Lookup {
+    fn prop(&self, of: &Subject, name: &str) -> Option<Value> {
         let Subject::Process(id) = of else {
-            return Lookup::UnknownSubject;
+            return None;
         };
-        let Some((_, props)) = self.processes.iter().find(|(p, _)| p == id) else {
-            return Lookup::UnknownSubject;
-        };
-        match props.iter().find(|(n, _)| n == name) {
-            Some((_, value)) => Lookup::Value(value.clone()),
-            None => Lookup::Absent,
-        }
+        let (_, props) = self.processes.iter().find(|(p, _)| p == id)?;
+        props
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, value)| value.clone())
     }
 
-    fn capability(&self, _name: &str) -> Level {
-        Level::Native
+    fn capability(&self, _name: &str) -> bool {
+        true
     }
 
-    fn terminable(&self, _process: &str) -> Result<(), Refusal> {
-        Ok(())
+    fn terminable(&self, _process: &str) -> bool {
+        true
     }
 
-    fn discardable(&self, _working_set: &str) -> Result<(), Refusal> {
-        Ok(())
+    fn discardable(&self, _working_set: &str) -> bool {
+        true
     }
 }
 
 fn load(name: &str) -> Program {
     let builtin = builtins::policy(name).unwrap_or_else(|| panic!("no built-in policy {name}"));
-    Program::load(name, builtin.component, &|_| Level::Native)
-        .unwrap_or_else(|e| panic!("{name}: {e}"))
+    Program::load(name, builtin.component, &|_| true).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
 fn arrived(process: &str) -> Vec<Edge> {
@@ -94,9 +89,7 @@ fn arrived(process: &str) -> Vec<Edge> {
 fn every_built_in_policy_loads_and_imports_no_router_writes() {
     for builtin in builtins::policies() {
         // A router policy is the gateway's to load.
-        if let Err(ManifestError::WrongPlane(_)) =
-            Manifest::of(builtin.component, &|_| Level::Native)
-        {
+        if let Err(ManifestError::WrongPlane(_)) = Manifest::of(builtin.component, &|_| true) {
             continue;
         }
         let program = load(builtin.name);
@@ -190,7 +183,6 @@ fn keep_session_keeps_a_session_s_latest_turn_until_it_is_due() {
             Edge::Exited(Exit {
                 process: id.into(),
                 outcome: Outcome::Completed,
-                by: By::Host,
             }),
             Edge::Retained(id.into()),
         ]
@@ -264,10 +256,6 @@ fn a_trap_discards_the_call_and_the_program_runs_again() {
             .react(Box::new(Fake::default()), arrived("a"), 0)
             .unwrap_err();
         assert!(matches!(fault, Fault::Trap(_)), "{fault}");
-        assert!(
-            program.store.data().scratch.is_empty(),
-            "the trapped call's put did not commit"
-        );
     }
 }
 
@@ -290,29 +278,4 @@ fn an_overrun_is_cut_off_at_the_deadline() {
             started.elapsed()
         );
     }
-}
-
-#[test]
-fn scratch_commits_and_outlives_a_restart() {
-    let mut program = load("test-scratch");
-    let plane = Fake::default().with("a", &[]).with("b", &[]);
-    for call in 1..=3 {
-        let commit = program
-            .react(Box::new(plane.clone()), arrived("a"), 100)
-            .unwrap();
-        let schedule = commit.schedule.expect("test-scratch installs a schedule");
-        assert_eq!((schedule.key("a"), schedule.key("b")), (call, call));
-    }
-    assert_eq!(program.alarm(), Some(1100));
-
-    program.restart().unwrap();
-    let commit = program
-        .react(Box::new(plane.clone()), vec![Edge::Timer], 200)
-        .unwrap();
-    assert_eq!(
-        commit.schedule.unwrap().key("a"),
-        4,
-        "the count survived the restart"
-    );
-    assert_eq!(program.alarm(), Some(1200), "the timer re-armed it");
 }

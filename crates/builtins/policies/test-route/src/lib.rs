@@ -23,20 +23,19 @@ impl router::Policy for Route {
                 worker: prop(&Subject::Process(p.clone()), "worker")
                     .text()
                     .map(str::to_string),
-                prefill: None,
                 props: vec![("from".to_string(), Value::Text(p.clone()))],
             })
             .collect();
-        let _ = router::install_schedule(&keys, Some(1));
-        let _ = router::install_placement(&placements);
+        router::install_schedule(&keys, Some(1));
+        router::install_placement(&placements);
         for p in &processes {
             let process = Subject::Process(p.clone());
             if let Some(reason) = prop(&process, "refuse").text() {
-                let _ = terminate(p, reason);
+                terminate(p, reason);
             }
             let running = attr(&process, "state").text() == Some("running");
             if running && prop(&process, "stop").boolean() == Some(true) {
-                let _ = terminate(p, "stopped");
+                terminate(p, "stopped");
             }
         }
     }

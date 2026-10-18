@@ -71,59 +71,45 @@ impl Linker {
         }
     }
 
-    fn build_base_linker(
-        engine: &Engine,
-        policy: &InstancePolicy,
-    ) -> Result<WasmLinker<ProcessCtx>> {
+    /// WASI 0.3 and pie's own interfaces: what every inferlet imports.
+    fn build_base_linker(engine: &Engine) -> Result<WasmLinker<ProcessCtx>> {
         let mut linker = WasmLinker::<ProcessCtx>::new(engine);
-        #[cfg(target_arch = "wasm32")]
-        let _ = policy;
-
-        #[cfg(target_arch = "wasm32")]
-        wasmtime_wasi::add_to_linker(&mut linker).expect("Failed to link WASI");
-
+        wasmtime_wasi::p3::add_to_linker(&mut linker).expect("Failed to link WASI");
         #[cfg(not(target_arch = "wasm32"))]
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("Failed to link WASI");
-        #[cfg(not(target_arch = "wasm32"))]
-        wasmtime_wasi::p3::add_to_linker(&mut linker).expect("Failed to link WASI p3");
-        #[cfg(not(target_arch = "wasm32"))]
-        wasmtime_wasi_http::p3::add_to_linker(&mut linker).expect("Failed to link WASI HTTP p3");
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let mut root = linker.root();
-            let mut random = root
-                .instance("wasi:random/insecure-seed@0.3.0-rc-2026-03-15")
-                .expect("Failed to add wasi:random insecure-seed rc shim");
-            random
-                .func_wrap_async("get-insecure-seed", |_store, (): ()| {
-                    Box::new(
-                        async move { Ok(((0x9e37_79b9_7f4a_7c15u64, 0xbf58_476d_1ce4_e5b9u64),)) },
-                    )
-                })
-                .expect("Failed to shim get-insecure-seed");
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        if policy.network.allow {
-            wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
-                .expect("Failed to link WASI HTTP");
-        }
-
+        wasmtime_wasi_http::p3::add_to_linker(&mut linker).expect("Failed to link WASI HTTP");
         host::add_to_linker(&mut linker)?;
-
         Ok(linker)
     }
 
     async fn base_linker(
         engine: &Engine,
-        policy: &InstancePolicy,
         cache: &BaseLinkerCache,
     ) -> Result<Arc<WasmLinker<ProcessCtx>>> {
         let linker = cache
-            .get_or_try_init(|| async { Self::build_base_linker(engine, policy).map(Arc::new) })
+            .get_or_try_init(|| async { Self::build_base_linker(engine).map(Arc::new) })
             .await?;
         Ok(Arc::clone(linker))
+    }
+
+    /// componentize-js 0.23 and componentize-py 0.25 still import WASI 0.2
+    /// (cli, io and random; JavaScript also clocks, filesystem and http): a
+    /// language component gets it beside 0.3. Delete with them.
+    fn with_wasi_0_2(
+        linker: &WasmLinker<ProcessCtx>,
+        policy: &InstancePolicy,
+    ) -> Result<WasmLinker<ProcessCtx>> {
+        let mut linker = linker.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        #[cfg(target_arch = "wasm32")]
+        wasmtime_wasi::p2::add_to_linker(&mut linker)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if policy.network.allow {
+            wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = policy;
+        Ok(linker)
     }
 
     fn instance_pre_cell(
@@ -169,19 +155,20 @@ impl Linker {
 
         let generation = main.generation;
         let component = main.component;
+        let language = main.script.is_some();
 
         let process_ctx =
             ProcessCtx::new(process_id, username, output, &policy, main.script).await?;
         let mut store = Store::new(&engine, process_ctx);
         store.limiter(|ctx| ctx.limits());
 
-        let base_linker = Self::base_linker(&engine, &policy, &base_linker_cache).await?;
+        let base_linker = Self::base_linker(&engine, &base_linker_cache).await?;
 
         let (cell, _cache_hit) =
             Self::instance_pre_cell(&instance_pre_cache, program_name, generation);
         let pre = cell
             .get_or_try_init(|| async {
-                Self::linker_for(&engine, &base_linker, &component)?
+                Self::linker_for(&engine, &base_linker, &component, language, &policy)?
                     .instantiate_pre(&component)
                     .map_err(|error| anyhow!("Instantiation pre-link error: {error}"))
             })
@@ -198,8 +185,14 @@ impl Linker {
         _engine: &Engine,
         linker: &'a WasmLinker<ProcessCtx>,
         _component: &Component,
+        language: bool,
+        policy: &InstancePolicy,
     ) -> Result<std::borrow::Cow<'a, WasmLinker<ProcessCtx>>> {
-        Ok(std::borrow::Cow::Borrowed(linker))
+        Ok(if language {
+            std::borrow::Cow::Owned(Self::with_wasi_0_2(linker, policy)?)
+        } else {
+            std::borrow::Cow::Borrowed(linker)
+        })
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -207,8 +200,14 @@ impl Linker {
         engine: &Engine,
         linker: &'a WasmLinker<ProcessCtx>,
         component: &Component,
+        language: bool,
+        policy: &InstancePolicy,
     ) -> Result<std::borrow::Cow<'a, WasmLinker<ProcessCtx>>> {
-        let mut linker = linker.clone();
+        let mut linker = if language {
+            Self::with_wasi_0_2(linker, policy)?
+        } else {
+            linker.clone()
+        };
         wasmtime_wasi::stub_unhosted(&mut linker, engine, component)?;
         Ok(std::borrow::Cow::Owned(linker))
     }

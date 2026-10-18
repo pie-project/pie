@@ -10,7 +10,7 @@ Build the guest once, then run it by name. `pie run` finds a bare name in the
 `examples` of the checkout the command runs in, so no `--path`:
 
 ```bash
-cargo build -p text-to-image --release --target wasm32-wasip2   # from examples
+cargo build -p text-to-image --release --target wasm32-wasip3   # from examples
 pie --config ~/.pie/config.<yours>.toml run text-to-image -o ./out -- \
     --prompt "a red bicycle leaning on a blue wall" \
     --width 1024 --height 1024 --steps 4 --seed 0 --out image

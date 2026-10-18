@@ -1,0 +1,6 @@
+[toolchain]
+# Inferlets and policies are WASI 0.3 components: `wasm32-wasip3` is
+# nightly's. The host, at the repository root, stays on stable.
+channel = "nightly-2026-10-18"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-wasip3"]

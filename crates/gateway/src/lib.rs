@@ -191,7 +191,7 @@ impl TurnRouter for RouteBackend {
         }
     }
 
-    fn ended(&self, req: &Request, outcome: Outcome, by: By) {
+    fn ended(&self, req: &Request, outcome: Outcome, _by: By) {
         {
             let mut located = self.located.lock().unwrap();
             if let Some(process) = located.launches.remove(&req.req_id) {
@@ -199,7 +199,7 @@ impl TurnRouter for RouteBackend {
             }
         }
         if let Some(router) = self.router_for(req) {
-            router.exited(req, outcome, by);
+            router.exited(req, outcome);
         }
     }
 }

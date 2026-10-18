@@ -1,8 +1,8 @@
 //!
 //! The inferlets are a separate cargo workspace (they target wasm), so this
-//! runs cargo for it, into that workspace's own target directory. The
-//! `wasm32-wasip2` target comes with the toolchain `rust-toolchain.toml`
-//! pins; without it the build fails here with the command to add it.
+//! runs cargo for it, into that workspace's own target directory, on the
+//! toolchain that workspace's `rust-toolchain.toml` pins (nightly, for
+//! `wasm32-wasip3`); without it the build fails here with how to add it.
 //!
 //! `PIE_BUILTINS=skip` embeds nothing — for a host that cannot build wasm
 //! at all. A pie built that way answers 404 on every compat route and
@@ -77,7 +77,7 @@ fn main() {
             build(workspace, &target_dir, set);
             for builtin in set {
                 let wasm = target_dir
-                    .join("wasm32-wasip2/release")
+                    .join("wasm32-wasip3/release")
                     .join(format!("{}.wasm", builtin.name.replace('-', "_")));
                 let staged = staged_dir.join(format!("{}.wasm", builtin.name));
                 fs::copy(&wasm, &staged)
@@ -142,20 +142,26 @@ fn string_value(line: &str, key: &str) -> Option<String> {
 }
 
 fn build(workspace: &Path, target_dir: &Path, builtins: &[Builtin]) {
-    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let mut command = Command::new(cargo);
+    // rustup's `cargo`, so the workspace's own rust-toolchain.toml (nightly,
+    // for wasm32-wasip3) applies, not the host build's toolchain.
+    let mut command = Command::new("cargo");
+    command.current_dir(workspace);
     command
         .arg("build")
         .arg("--manifest-path")
         .arg(workspace.join("Cargo.toml"))
         .arg("--release")
         .arg("--target")
-        .arg("wasm32-wasip2");
+        .arg("wasm32-wasip3");
     for builtin in builtins {
         command.arg("-p").arg(&builtin.name);
     }
-    // The outer build's flags are for the host; the built-ins are wasm.
+    // The outer build's toolchain and flags are for the host; the built-ins
+    // are wasm.
     for var in [
+        "RUSTUP_TOOLCHAIN",
+        "RUSTC",
+        "RUSTDOC",
         "CARGO_ENCODED_RUSTFLAGS",
         "CARGO_BUILD_RUSTFLAGS",
         "RUSTFLAGS",
@@ -171,14 +177,15 @@ fn build(workspace: &Path, target_dir: &Path, builtins: &[Builtin]) {
         .unwrap_or_else(|e| panic!("running cargo for {}: {e}", workspace.display()));
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let hint =
-            if stderr.contains("wasm32-wasip2") && stderr.contains("target may not be installed") {
-                "\n\nthe wasm32-wasip2 target is missing: `rustup target add wasm32-wasip2` adds it"
-            } else {
-                ""
-            };
+        let hint = if stderr.contains("wasm32-wasip3")
+            && stderr.contains("target may not be installed")
+        {
+            "\n\nthe wasm32-wasip3 target is missing: `rustup toolchain install` in the workspace adds it"
+        } else {
+            ""
+        };
         panic!(
-            "building the built-ins in {} for wasm32-wasip2 failed:\n{stderr}{hint}\n\n\
+            "building the built-ins in {} for wasm32-wasip3 failed:\n{stderr}{hint}\n\n\
              PIE_BUILTINS=skip builds a pie with no built-in inferlets (every compat route then answers 404)",
             workspace.display()
         );

@@ -8,7 +8,7 @@ struct Spin;
 
 impl engine::Policy for Spin {
     fn plan(&mut self, _now_ms: u64) {
-        let _ = engine::install_schedule(&[("spun".to_string(), 1)], None);
+        engine::install_schedule(&[("spun".to_string(), 1)], None);
         let mut n: u64 = 0;
         loop {
             n = std::hint::black_box(n.wrapping_add(1));

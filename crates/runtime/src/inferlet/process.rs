@@ -860,7 +860,7 @@ impl Process {
             // Before the client hears of the exit, so whoever it tells
             // can read the process's last counts.
             crate::policy::tokens::exit(self.client_pid);
-            crate::policy::report(crate::policy::Event::Exited(self.client_pid, outcome, by));
+            crate::policy::report(crate::policy::Event::Exited(self.client_pid, outcome));
             if let Some(tx) = self.result_tx.lock().unwrap().take() {
                 let _ = tx.send(result.clone());
             }

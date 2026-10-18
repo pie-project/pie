@@ -1,8 +1,13 @@
-//! A call is a transaction: one that traps or overruns stages nothing, and the
-//! instance restarts with its scratch intact.
+//! A call is a transaction: one that traps or overruns stages nothing, and a
+//! fresh instance takes the next call.
+//!
+//! A policy is a WASI 0.3 component, and WASI 0.3 is async: a program runs
+//! its calls to completion on the thread that loaded it, which runs no other
+//! async runtime (`spawn` gives it one).
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::future::Future;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -16,11 +21,12 @@ pub(crate) mod bindings {
     wasmtime::component::bindgen!({
         path: "../policy/wit",
         world: "router",
+        exports: { default: async },
     });
 }
 
 use bindings::plex::policy::{reads, router_writes, types, writes};
-use types::{Edge, Level, Lookup, Placement, Refusal, Subject, SubjectKind, Value};
+use types::{Edge, Placement, Subject, SubjectKind, Value};
 
 const TICK: Duration = Duration::from_millis(1);
 const MEMORY_BYTES: usize = 64 << 20;
@@ -29,10 +35,24 @@ const MAX_ENTRIES: usize = 1 << 16;
 pub trait Plane: Send {
     /// Stable for the life of the call.
     fn candidates(&self, kind: SubjectKind) -> Vec<String>;
-    fn attr(&self, of: &Subject, name: &str) -> Lookup;
-    fn prop(&self, of: &Subject, name: &str) -> Lookup;
-    fn capability(&self, name: &str) -> Level;
-    fn terminable(&self, process: &str) -> Result<(), Refusal>;
+    fn attr(&self, of: &Subject, name: &str) -> Option<Value>;
+    fn prop(&self, of: &Subject, name: &str) -> Option<Value>;
+    fn capability(&self, name: &str) -> bool;
+    /// Whether `terminate` applies to `process` now.
+    fn terminable(&self, process: &str) -> bool;
+}
+
+/// Why a write was not taken. The program is not told; the host logs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Refusal {
+    #[error("the manifest does not grant it")]
+    NotGranted,
+    #[error("a table names the same subject twice")]
+    DuplicateSubject,
+    #[error("a table is too large")]
+    TooLarge,
+    #[error("its subject is not in a state it applies to")]
+    WrongState,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -105,7 +125,7 @@ impl Program {
     pub fn load(
         name: &str,
         component: &[u8],
-        capability: &dyn Fn(&str) -> Level,
+        capability: &dyn Fn(&str) -> bool,
     ) -> Result<Self, LoadError> {
         let manifest = Manifest::of(component, capability)?;
         let engine = engine();
@@ -113,9 +133,9 @@ impl Program {
             Component::new(engine, component).map_err(|e| LoadError::Compile(format!("{e:#}")))?;
 
         let mut linker = Linker::new(engine);
-        // Policies target wasm32-wasip2 and so import WASI; the context is
-        // empty.
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+        // Policies target wasm32-wasip3 and so import WASI 0.3; the context
+        // is empty.
+        wasmtime_wasi::p3::add_to_linker(&mut linker)
             .map_err(|e| LoadError::Instantiate(format!("{e:#}")))?;
         bindings::Router::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(|e| LoadError::Instantiate(format!("{e:#}")))?;
@@ -124,8 +144,7 @@ impl Program {
             .and_then(bindings::RouterPre::new)
             .map_err(|e| LoadError::Instantiate(format!("{e:#}")))?;
 
-        let (store, instance) =
-            start(&pre, &manifest, HashMap::new()).map_err(LoadError::Instantiate)?;
+        let (store, instance) = start(&pre, name, &manifest).map_err(LoadError::Instantiate)?;
         Ok(Self {
             name: name.to_string(),
             manifest,
@@ -169,10 +188,11 @@ impl Program {
         self.store.data_mut().call = Some(Call::new(plane));
         self.store
             .set_epoch_deadline(ticks(self.manifest.deadline_ms));
-        let result = self
-            .instance
-            .plex_policy_policy()
-            .call_react(&mut self.store, &edges, now_ms);
+        let result = block_on(self.instance.plex_policy_policy().call_react(
+            &mut self.store,
+            &edges,
+            now_ms,
+        ));
         let call = self
             .store
             .data_mut()
@@ -197,17 +217,6 @@ impl Program {
     }
 
     fn commit(&mut self, staged: Staged) -> Commit {
-        let scratch = &mut self.store.data_mut().scratch;
-        for (name, val) in staged.puts {
-            match val {
-                Some(val) => {
-                    scratch.insert(name, val);
-                }
-                None => {
-                    scratch.remove(&name);
-                }
-            }
-        }
         if let Some(at_ms) = staged.alarm {
             self.alarm = Some(at_ms);
         }
@@ -219,8 +228,8 @@ impl Program {
     }
 
     fn restart(&mut self) -> Result<(), Fault> {
-        let scratch = std::mem::take(&mut self.store.data_mut().scratch);
-        let (store, instance) = start(&self.pre, &self.manifest, scratch).map_err(Fault::Dead)?;
+        let (store, instance) =
+            start(&self.pre, &self.name, &self.manifest).map_err(Fault::Dead)?;
         self.store = store;
         self.instance = instance;
         Ok(())
@@ -229,15 +238,56 @@ impl Program {
 
 fn start(
     pre: &bindings::RouterPre<HostState>,
+    name: &str,
     manifest: &Manifest,
-    scratch: HashMap<String, Value>,
 ) -> Result<(Store<HostState>, bindings::Router), String> {
-    let mut store = Store::new(pre.engine(), HostState::new(manifest, scratch));
+    let mut store = Store::new(pre.engine(), HostState::new(name, manifest));
     store.limiter(|state| &mut state.limits);
     // A component's initializers are guest code, bounded like any call.
     store.set_epoch_deadline(ticks(manifest.deadline_ms));
-    let instance = pre.instantiate(&mut store).map_err(|e| format!("{e:#}"))?;
+    let instance = block_on(pre.instantiate_async(&mut store)).map_err(|e| format!("{e:#}"))?;
     Ok((store, instance))
+}
+
+/// Loads a program on a thread of its own named `thread`, which then runs
+/// `serve` with it; the manifest, or why it did not load, comes back here.
+pub fn spawn(
+    name: &str,
+    component: &[u8],
+    capability: fn(&str) -> bool,
+    thread: &str,
+    serve: impl FnOnce(Program) + Send + 'static,
+) -> Result<Manifest, LoadError> {
+    let (name, component) = (name.to_string(), component.to_vec());
+    let (loaded, outcome) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name(thread.into())
+        .spawn(
+            move || match Program::load(&name, &component, &capability) {
+                Ok(program) => {
+                    let _ = loaded.send(Ok(program.manifest().clone()));
+                    serve(program);
+                }
+                Err(error) => {
+                    let _ = loaded.send(Err(error));
+                }
+            },
+        )
+        .map_err(|e| LoadError::Instantiate(format!("spawning its thread: {e}")))?;
+    outcome
+        .recv()
+        .map_err(|_| LoadError::Instantiate("its thread ended before it loaded".into()))?
+}
+
+/// Runs a call to completion on this thread, on a runtime of its own.
+fn block_on<F: Future>(future: F) -> F::Output {
+    thread_local! {
+        static RUNTIME: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a policy thread's runtime");
+    }
+    RUNTIME.with(|runtime| runtime.block_on(future))
 }
 
 fn ticks(deadline_ms: u64) -> u64 {
@@ -252,6 +302,7 @@ pub(super) fn engine() -> &'static wasmtime::Engine {
     ENGINE.get_or_init(|| {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
+        config.wasm_component_model_async(true);
         config.epoch_interruption(true);
         // Relaxed SIMD may lower differently per CPU, so two workers could
         // disagree about a policy's arithmetic.
@@ -277,15 +328,12 @@ fn edge_name(edge: &Edge) -> &'static str {
         Edge::Exited(_) => "exited",
         Edge::PropChanged(_) => "prop-changed",
         Edge::Closed(_) => "closed",
-        Edge::Diverged(_) => "diverged",
         Edge::Timer => "timer",
         Edge::Dispatched(_) => "dispatched",
-        Edge::WorkerAdded(_) => "worker-added",
         Edge::WorkerRemoved(_) => "worker-removed",
         Edge::WorkerDraining(_) => "worker-draining",
         Edge::Started(_) => "started",
         Edge::Paused(_) => "paused",
-        Edge::Resumed(_) => "resumed",
         Edge::Retained(_) => "retained",
         Edge::Discarded(_) => "discarded",
     }
@@ -298,17 +346,18 @@ struct Grants {
 }
 
 struct HostState {
+    name: String,
     wasi: WasiCtx,
     table: ResourceTable,
     limits: StoreLimits,
     grants: Grants,
-    scratch: HashMap<String, Value>,
     call: Option<Call>,
 }
 
 impl HostState {
-    fn new(manifest: &Manifest, scratch: HashMap<String, Value>) -> Self {
+    fn new(name: &str, manifest: &Manifest) -> Self {
         Self {
+            name: name.to_string(),
             wasi: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
             limits: StoreLimitsBuilder::new().memory_size(MEMORY_BYTES).build(),
@@ -317,7 +366,6 @@ impl HostState {
                 placement: manifest.grants("placement"),
                 terminate: manifest.grants("terminate"),
             },
-            scratch,
             call: None,
         }
     }
@@ -326,6 +374,13 @@ impl HostState {
     /// write nothing.
     fn call(&mut self) -> Result<&mut Call, Refusal> {
         self.call.as_mut().ok_or(Refusal::WrongState)
+    }
+
+    /// Stages a write, or logs why it was not taken.
+    fn write(&mut self, verb: &str, write: impl FnOnce(&mut Self) -> Result<(), Refusal>) {
+        if let Err(why) = write(self) {
+            tracing::warn!(policy = %self.name, verb, %why, "router policy write refused");
+        }
     }
 }
 
@@ -340,8 +395,6 @@ impl WasiView for HostState {
 
 struct Call {
     plane: Box<dyn Plane>,
-    /// Each kind's ids, read once per call so pages agree.
-    candidates: [Option<Vec<String>>; 4],
     staged: Staged,
 }
 
@@ -349,7 +402,6 @@ impl Call {
     fn new(plane: Box<dyn Plane>) -> Self {
         Self {
             plane,
-            candidates: Default::default(),
             staged: Staged::default(),
         }
     }
@@ -360,113 +412,75 @@ struct Staged {
     schedule: Option<Table>,
     placement: Option<HashMap<String, Placement>>,
     terminate: Vec<(String, String)>,
-    puts: Vec<(String, Option<Value>)>,
     alarm: Option<u64>,
 }
 
 impl types::Host for HostState {}
 
 impl reads::Host for HostState {
-    fn candidates(&mut self, kind: SubjectKind, cursor: u32, n: u32) -> Vec<String> {
-        let Ok(Call {
-            plane, candidates, ..
-        }) = self.call()
-        else {
-            return Vec::new();
-        };
-        let slot = match kind {
-            SubjectKind::Session => 0,
-            SubjectKind::Process => 1,
-            SubjectKind::WorkingSet => 2,
-            SubjectKind::Worker => 3,
-        };
-        candidates[slot]
-            .get_or_insert_with(|| plane.candidates(kind))
-            .iter()
-            .skip(cursor as usize)
-            .take(n as usize)
-            .cloned()
-            .collect()
+    fn candidates(&mut self, kind: SubjectKind) -> Vec<String> {
+        self.call()
+            .map(|call| call.plane.candidates(kind))
+            .unwrap_or_default()
     }
 
-    fn attr(&mut self, of: Subject, name: String) -> Lookup {
-        match self.call() {
-            Ok(call) => call.plane.attr(&of, &name),
-            Err(_) => Lookup::Absent,
-        }
+    fn attr(&mut self, of: Subject, name: String) -> Option<Value> {
+        self.call().ok()?.plane.attr(&of, &name)
     }
 
-    fn prop(&mut self, of: Subject, name: String) -> Lookup {
-        match self.call() {
-            Ok(call) => call.plane.prop(&of, &name),
-            Err(_) => Lookup::Absent,
-        }
+    fn prop(&mut self, of: Subject, name: String) -> Option<Value> {
+        self.call().ok()?.plane.prop(&of, &name)
     }
 
-    fn capability(&mut self, name: String) -> Level {
-        match self.call() {
-            Ok(call) => call.plane.capability(&name),
-            Err(_) => Level::Absent,
-        }
-    }
-
-    fn get(&mut self, name: String) -> Option<Value> {
-        // A call reads its own writes; they commit only when it returns.
-        if let Some(call) = self.call.as_ref()
-            && let Some((_, val)) = call.staged.puts.iter().rev().find(|(n, _)| *n == name)
-        {
-            return val.clone();
-        }
-        self.scratch.get(&name).cloned()
+    fn capability(&mut self, name: String) -> bool {
+        self.call().is_ok_and(|call| call.plane.capability(&name))
     }
 }
 
 impl writes::Host for HostState {
-    fn put(&mut self, name: String, val: Option<Value>) {
-        if let Ok(call) = self.call() {
-            call.staged.puts.push((name, val));
-        }
-    }
-
     fn set_alarm(&mut self, at_ms: u64) {
         if let Ok(call) = self.call() {
             call.staged.alarm = Some(at_ms);
         }
     }
 
-    fn terminate(&mut self, process: String, reason: String) -> Result<(), Refusal> {
-        if !self.grants.terminate {
-            return Err(Refusal::NotGranted);
-        }
-        let call = self.call()?;
-        call.plane.terminable(&process)?;
-        call.staged.terminate.push((process, reason));
-        Ok(())
+    fn terminate(&mut self, process: String, reason: String) {
+        self.write("terminate", |state| {
+            if !state.grants.terminate {
+                return Err(Refusal::NotGranted);
+            }
+            let call = state.call()?;
+            if !call.plane.terminable(&process) {
+                return Err(Refusal::WrongState);
+            }
+            call.staged.terminate.push((process, reason));
+            Ok(())
+        });
     }
 }
 
 impl router_writes::Host for HostState {
-    fn install_schedule(
-        &mut self,
-        entries: Vec<(String, i64)>,
-        floor: Option<i64>,
-    ) -> Result<(), Refusal> {
-        if !self.grants.schedule {
-            return Err(Refusal::NotGranted);
-        }
-        let keys = by_subject(entries)?;
-        self.call()?.staged.schedule = Some(Table { keys, floor });
-        Ok(())
+    fn install_schedule(&mut self, entries: Vec<(String, i64)>, floor: Option<i64>) {
+        self.write("install-schedule", |state| {
+            if !state.grants.schedule {
+                return Err(Refusal::NotGranted);
+            }
+            let keys = by_subject(entries)?;
+            state.call()?.staged.schedule = Some(Table { keys, floor });
+            Ok(())
+        });
     }
 
-    fn install_placement(&mut self, entries: Vec<Placement>) -> Result<(), Refusal> {
-        if !self.grants.placement {
-            return Err(Refusal::NotGranted);
-        }
-        let entries = entries.into_iter().map(|p| (p.process.clone(), p));
-        let table = by_subject(entries.collect())?;
-        self.call()?.staged.placement = Some(table);
-        Ok(())
+    fn install_placement(&mut self, entries: Vec<Placement>) {
+        self.write("install-placement", |state| {
+            if !state.grants.placement {
+                return Err(Refusal::NotGranted);
+            }
+            let entries = entries.into_iter().map(|p| (p.process.clone(), p));
+            let table = by_subject(entries.collect())?;
+            state.call()?.staged.placement = Some(table);
+            Ok(())
+        });
     }
 }
 

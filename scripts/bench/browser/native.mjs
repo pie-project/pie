@@ -16,8 +16,8 @@ const root = new URL("../../..", import.meta.url).pathname;
 
 const client = new PieClient(uri);
 await client.connect();
-const program = await client.installProgram(`${root}examples/target/wasm32-wasip2/release/text_completion.wasm`, null, true);
-const carried = await client.installProgram(`${root}examples/target/wasm32-wasip2/release/naive_baseline.wasm`, null, true);
+const program = await client.installProgram(`${root}examples/target/wasm32-wasip3/release/text_completion.wasm`, null, true);
+const carried = await client.installProgram(`${root}examples/target/wasm32-wasip3/release/naive_baseline.wasm`, null, true);
 const opts = {
   carried,
   makeClient: () => new PieClient(uri),

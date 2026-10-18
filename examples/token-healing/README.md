@@ -60,7 +60,7 @@ itself is a one-time cost on the first step only, not a per-token one.
 ## Run
 
 ```bash
-cargo build --release --target wasm32-wasip2
+cargo build --release --target wasm32-wasip3
 python tests/examples/run_all.py --engine cuda_native --model <model-path>
 ```
 

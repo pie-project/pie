@@ -1,15 +1,13 @@
-//! Stages a table and a scratch write, then traps: the host must discard
-//! both.
+//! Stages a table, then traps: the host must discard it.
 
-use policy::{Value, engine, put};
+use policy::engine;
 
 #[derive(Default)]
 struct Trap;
 
 impl engine::Policy for Trap {
     fn plan(&mut self, _now_ms: u64) {
-        let _ = engine::install_schedule(&[("trapped".to_string(), 1)], None);
-        put("trapped", Some(&Value::Boolean(true)));
+        engine::install_schedule(&[("trapped".to_string(), 1)], None);
         panic!("trapping on purpose");
     }
 }

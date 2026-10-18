@@ -89,11 +89,11 @@ NO_LATENT = (
 def build_guest() -> Path:
     if not os.environ.get("PIE_INFERLETS_NO_BUILD"):
         subprocess.run(
-            ["cargo", "build", "-p", NAME, "--release", "--target", "wasm32-wasip2"],
+            ["cargo", "build", "-p", NAME, "--release", "--target", "wasm32-wasip3"],
             cwd=INFERLETS_DIR,
             check=True,
         )
-    wasm = (INFERLETS_DIR / "target" / "wasm32-wasip2" / "release"
+    wasm = (INFERLETS_DIR / "target" / "wasm32-wasip3" / "release"
             / f"{NAME.replace('-', '_')}.wasm")
     if not wasm.exists():
         raise FileNotFoundError(f"no guest at {wasm}; build it or unset PIE_INFERLETS_NO_BUILD")

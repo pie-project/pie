@@ -56,7 +56,7 @@ impl engine::Policy for Fair {
                 (p.clone(), -(served.min(i64::MAX as u64) as i64))
             })
             .collect();
-        let _ = engine::install_schedule(&entries, None);
+        engine::install_schedule(&entries, None);
         if processes.iter().any(|(_, _, running)| *running) {
             set_alarm(now_ms + TICK_MS);
         }

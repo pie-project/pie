@@ -39,10 +39,10 @@ pub(crate) fn table<T: WasiWebView>(t: &mut T) -> &mut ResourceTable {
     t.wasi_web().table
 }
 
+/// WASI 0.3. A component still on 0.2 (a language component) adds
+/// `p2::add_to_linker`.
 pub fn add_to_linker<T: WasiWebView + 'static>(linker: &mut Linker<T>) -> wasmtime::Result<()> {
-    p2::add_to_linker(linker)?;
-    p3::add_to_linker(linker)?;
-    Ok(())
+    p3::add_to_linker(linker)
 }
 
 const HOSTED: &[&str] = &[

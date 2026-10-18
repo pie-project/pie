@@ -33,6 +33,11 @@ runs:
       shell: bash
       run: rustup toolchain install
 
+    # The wasm workspaces (built-ins, examples) pin nightly with
+    # `wasm32-wasip3`; every host build compiles the built-ins on it.
+    - shell: bash
+      run: cd crates/builtins/policies && rustup toolchain install
+
     - if: runner.os == 'macOS'
       shell: bash
       run: brew install cmake ninja libomp

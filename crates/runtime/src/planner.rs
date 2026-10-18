@@ -412,8 +412,6 @@ const HOST_RESERVE_DIVISOR: u32 = 8;
 /// It suspends no process of its own.
 const SWEEP: ProcessId = ProcessId::nil();
 
-const NO_SWAP_ROOM: &str = "no-swap-room";
-
 #[derive(Debug, Clone)]
 pub struct PlannerDiagnostics {
     pub device_pages_free: u32,
@@ -1327,10 +1325,7 @@ impl ResidencyPlanner {
         };
         let (picks, unhostable) =
             self.quote_and_pick(held, everything, self.swap_room(), model, engine);
-        // No tier takes them: they keep running, and the schedule hears so.
-        for pid in &unhostable {
-            crate::policy::report(crate::policy::Event::Diverged(*pid, Some(NO_SWAP_ROOM)));
-        }
+        // No tier takes them: they keep running.
         ptrace!(
             "pause_held picks={} unhostable={} room={:?}",
             picks.len(),
@@ -2630,33 +2625,24 @@ impl ResidencyPlanner {
     }
 
     fn report_evicted(self: &Arc<Self>, pid: ProcessId, freed: u32, rs_freed: RsUnits) {
-        let by = self.with_inner(|inner| {
+        self.with_inner(|inner| {
             inner.settle_eviction(pid);
             let Some(proc) = inner.procs.get_mut(&pid) else {
-                return crate::policy::By::Host;
+                return;
             };
             debug_assert_eq!(proc.state, Residency::Evicting);
             proc.state = Residency::Evicted;
-            let by = if proc.held {
-                crate::policy::By::Policy
-            } else {
-                crate::policy::By::Host
-            };
             let demand = Demand {
                 kv_pages: freed,
                 rs: rs_freed,
             };
             if proc.idle || proc.held {
                 proc.parked = Some(demand);
-                return by;
+                return;
             }
             inner.enqueue(pid, WaitKind::Restore { demand });
-            by
         });
-        if by == crate::policy::By::Policy {
-            crate::policy::report(crate::policy::Event::Diverged(pid, None));
-        }
-        crate::policy::report(crate::policy::Event::Paused(pid, by));
+        crate::policy::report(crate::policy::Event::Paused(pid));
         self.stats.evictions.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(target: "pie::kv", kv_pages = freed, "paused");
         self.vacate_held_seats();
@@ -2674,9 +2660,6 @@ impl ResidencyPlanner {
 
     fn eviction_failed_host_swap_full(self: &Arc<Self>, pid: ProcessId) {
         self.record_host_swap_exhaustion();
-        if self.with_inner(|inner| inner.procs.get(&pid).is_some_and(|p| p.held)) {
-            crate::policy::report(crate::policy::Event::Diverged(pid, Some(NO_SWAP_ROOM)));
-        }
         self.eviction_failed_inner(pid, true, false);
     }
 

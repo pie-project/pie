@@ -8,7 +8,7 @@ D11, D12).
 ## Run it
 
 ```bash
-cargo build -p text-to-video --release --target wasm32-wasip2   # from examples
+cargo build -p text-to-video --release --target wasm32-wasip3   # from examples
 pie --config ~/.pie/config.<yours>.toml run text-to-video -o ./out -- \
     --prompt "a red bicycle leaning on a blue wall" \
     --width 832 --height 480 --frames 17 --steps 20 --seed 0 --out clip

@@ -20,12 +20,11 @@ impl router::Policy for RouterPriority {
             .map(|(p, priority)| Placement {
                 process: p.clone(),
                 worker: None,
-                prefill: None,
                 props: vec![("priority".to_string(), Value::Int(*priority))],
             })
             .collect();
-        let _ = router::install_schedule(&ranked, None);
-        let _ = router::install_placement(&placements);
+        router::install_schedule(&ranked, None);
+        router::install_placement(&placements);
     }
 }
 

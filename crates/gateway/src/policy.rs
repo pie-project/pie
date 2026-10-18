@@ -6,7 +6,7 @@ mod manifest;
 mod program;
 mod service;
 
-pub use manifest::{GateFail, Manifest, ManifestError};
+pub use manifest::{Manifest, ManifestError};
 pub use program::{Commit, Fault, LoadError, Plane, Program, Table};
 pub use service::Router;
 
@@ -14,4 +14,4 @@ pub mod wit {
     pub use super::program::bindings::plex::policy::types::*;
 }
 
-pub const CAPABILITIES: &[&str] = &["router.hold", "placement.pd", "placement.migrate"];
+pub const CAPABILITIES: &[&str] = &["router.hold"];

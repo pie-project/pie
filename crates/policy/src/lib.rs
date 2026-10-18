@@ -2,8 +2,8 @@
 //!
 //! Implement [`engine::Policy`] or [`router::Policy`] on a `Default` type and
 //! export it with [`engine!`] or [`router!`]; `policy.toml` beside `Cargo.toml`
-//! is embedded as the manifest. A host restarts an instance that traps, so
-//! state that must outlive one belongs in scratch ([`get`] / [`put`]).
+//! is embedded as the manifest. A host restarts an instance that traps or
+//! overruns its deadline, without its state.
 
 /// One binding for both worlds: a component imports only what its code calls.
 #[doc(hidden)]
@@ -27,26 +27,27 @@ pub mod bindings {
 
 pub use wit_bindgen;
 
-pub use bindings::plex::policy::reads::{attr, capability, get, prop};
+pub use bindings::plex::policy::reads::capability;
 pub use bindings::plex::policy::types::{
-    By, Change, Dispatch, Divergence, Edge, Exit, Level, Lookup, Outcome, Placement, Refusal,
-    Retain, Subject, SubjectKind, Transition, Value,
+    By, Change, Dispatch, Edge, Exit, Outcome, Placement, Retain, Subject, SubjectKind, Transition,
+    Value,
 };
-pub use bindings::plex::policy::writes::{put, set_alarm, terminate};
+pub use bindings::plex::policy::writes::{set_alarm, terminate};
 
 pub type Id = String;
 
 pub fn candidates(kind: SubjectKind) -> Vec<Id> {
-    const PAGE: u32 = 256;
-    let mut all = Vec::new();
-    loop {
-        let page = bindings::plex::policy::reads::candidates(kind, all.len() as u32, PAGE);
-        let short = page.len() < PAGE as usize;
-        all.extend(page);
-        if short {
-            return all;
-        }
-    }
+    bindings::plex::policy::reads::candidates(kind)
+}
+
+/// A host-measured value of `of`, if it has one.
+pub fn attr(of: &Subject, name: &str) -> Lookup {
+    Lookup(bindings::plex::policy::reads::attr(of, name))
+}
+
+/// A value supplied from outside the host, if any.
+pub fn prop(of: &Subject, name: &str) -> Lookup {
+    Lookup(bindings::plex::policy::reads::prop(of, name))
 }
 
 impl Retain {
@@ -68,54 +69,37 @@ impl Retain {
     }
 }
 
+/// What a read found, read as the type the caller expects.
+#[derive(Debug, Clone)]
+pub struct Lookup(pub Option<Value>);
+
 impl Lookup {
     pub fn value(self) -> Option<Value> {
-        match self {
-            Lookup::Value(value) => Some(value),
-            _ => None,
-        }
+        self.0
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.0.is_some()
     }
 
     pub fn int(&self) -> Option<i64> {
-        match self {
-            Lookup::Value(value) => value.int(),
-            _ => None,
-        }
+        self.0.as_ref()?.int()
     }
 
     pub fn float(&self) -> Option<f64> {
-        match self {
-            Lookup::Value(value) => value.float(),
-            _ => None,
-        }
+        self.0.as_ref()?.float()
     }
 
     pub fn boolean(&self) -> Option<bool> {
-        match self {
-            Lookup::Value(value) => value.boolean(),
-            _ => None,
-        }
+        self.0.as_ref()?.boolean()
     }
 
     pub fn text(&self) -> Option<&str> {
-        match self {
-            Lookup::Value(value) => value.text(),
-            _ => None,
-        }
-    }
-
-    pub fn ids(&self) -> Option<&[Id]> {
-        match self {
-            Lookup::Value(value) => value.ids(),
-            _ => None,
-        }
+        self.0.as_ref()?.text()
     }
 
     pub fn json(&self) -> Option<&str> {
-        match self {
-            Lookup::Value(value) => value.json(),
-            _ => None,
-        }
+        self.0.as_ref()?.json()
     }
 }
 
@@ -150,13 +134,6 @@ impl Value {
         }
     }
 
-    pub fn ids(&self) -> Option<&[Id]> {
-        match self {
-            Value::Ids(v) => Some(v),
-            _ => None,
-        }
-    }
-
     /// A prop that was a JSON array or object, as its JSON text.
     pub fn json(&self) -> Option<&str> {
         match self {
@@ -168,7 +145,7 @@ impl Value {
 
 /// The engine world: one instance inside each worker.
 pub mod engine {
-    use crate::{By, Change, Divergence, Edge, Exit, Id};
+    use crate::{By, Change, Edge, Exit, Id};
 
     pub use crate::bindings::plex::policy::engine_writes::{
         discard, install_retention, install_schedule,
@@ -179,14 +156,12 @@ pub mod engine {
     pub trait Policy: Default + 'static {
         fn on_arrived(&mut self, _process: &Id) {}
         fn on_started(&mut self, _process: &Id) {}
-        fn on_paused(&mut self, _process: &Id, _by: By) {}
-        fn on_resumed(&mut self, _process: &Id) {}
+        fn on_paused(&mut self, _process: &Id) {}
         fn on_exited(&mut self, _exit: &Exit) {}
         fn on_retained(&mut self, _working_set: &Id) {}
         fn on_discarded(&mut self, _working_set: &Id, _by: By) {}
         fn on_prop_changed(&mut self, _change: &Change) {}
         fn on_closed(&mut self, _session: &Id) {}
-        fn on_diverged(&mut self, _divergence: &Divergence) {}
         fn on_timer(&mut self) {}
 
         /// Once per `react`, after every edge: where a policy installs its
@@ -200,20 +175,15 @@ pub mod engine {
             match edge {
                 Edge::Arrived(process) => policy.on_arrived(process),
                 Edge::Started(process) => policy.on_started(process),
-                Edge::Paused(t) => policy.on_paused(&t.subject, t.by),
-                Edge::Resumed(process) => policy.on_resumed(process),
+                Edge::Paused(process) => policy.on_paused(process),
                 Edge::Exited(exit) => policy.on_exited(exit),
                 Edge::Retained(working_set) => policy.on_retained(working_set),
                 Edge::Discarded(t) => policy.on_discarded(&t.subject, t.by),
                 Edge::PropChanged(change) => policy.on_prop_changed(change),
                 Edge::Closed(session) => policy.on_closed(session),
-                Edge::Diverged(divergence) => policy.on_diverged(divergence),
                 Edge::Timer => policy.on_timer(),
                 // Router edges: an engine host does not send them.
-                Edge::Dispatched(_)
-                | Edge::WorkerAdded(_)
-                | Edge::WorkerRemoved(_)
-                | Edge::WorkerDraining(_) => {}
+                Edge::Dispatched(_) | Edge::WorkerRemoved(_) | Edge::WorkerDraining(_) => {}
             }
         }
         policy.plan(now_ms);
@@ -222,7 +192,7 @@ pub mod engine {
 
 /// The router world: one instance in the gateway.
 pub mod router {
-    use crate::{Change, Dispatch, Divergence, Edge, Exit, Id};
+    use crate::{Change, Dispatch, Edge, Exit, Id};
 
     pub use crate::bindings::plex::policy::router_writes::{install_placement, install_schedule};
 
@@ -233,10 +203,8 @@ pub mod router {
         fn on_exited(&mut self, _exit: &Exit) {}
         fn on_prop_changed(&mut self, _change: &Change) {}
         fn on_closed(&mut self, _session: &Id) {}
-        fn on_worker_added(&mut self, _worker: &Id) {}
         fn on_worker_removed(&mut self, _worker: &Id) {}
         fn on_worker_draining(&mut self, _worker: &Id) {}
-        fn on_diverged(&mut self, _divergence: &Divergence) {}
         fn on_timer(&mut self) {}
 
         fn plan(&mut self, _now_ms: u64) {}
@@ -251,17 +219,11 @@ pub mod router {
                 Edge::Exited(exit) => policy.on_exited(exit),
                 Edge::PropChanged(change) => policy.on_prop_changed(change),
                 Edge::Closed(session) => policy.on_closed(session),
-                Edge::WorkerAdded(worker) => policy.on_worker_added(worker),
                 Edge::WorkerRemoved(worker) => policy.on_worker_removed(worker),
                 Edge::WorkerDraining(worker) => policy.on_worker_draining(worker),
-                Edge::Diverged(divergence) => policy.on_diverged(divergence),
                 Edge::Timer => policy.on_timer(),
                 // Engine edges: a router host does not send them.
-                Edge::Started(_)
-                | Edge::Paused(_)
-                | Edge::Resumed(_)
-                | Edge::Retained(_)
-                | Edge::Discarded(_) => {}
+                Edge::Started(_) | Edge::Paused(_) | Edge::Retained(_) | Edge::Discarded(_) => {}
             }
         }
         policy.plan(now_ms);
@@ -298,17 +260,18 @@ macro_rules! __policy {
 
         struct __PlexPolicy;
 
-        ::std::thread_local! {
-            static __PLEX_STATE: ::std::cell::RefCell<::std::option::Option<$policy>> =
-                const { ::std::cell::RefCell::new(::std::option::Option::None) };
-        }
+        // Not a thread-local: under WASI 0.3 each call is a task of its own,
+        // and a task's thread-locals start afresh.
+        static __PLEX_STATE: ::std::sync::Mutex<::std::option::Option<$policy>> =
+            ::std::sync::Mutex::new(::std::option::Option::None);
 
         impl $crate::bindings::exports::plex::policy::policy::Guest for __PlexPolicy {
             fn react(edges: ::std::vec::Vec<$crate::Edge>, now_ms: u64) {
-                __PLEX_STATE.with_borrow_mut(|state| {
-                    let policy = state.get_or_insert_with(::std::default::Default::default);
-                    $crate::$world::react(policy, edges, now_ms);
-                });
+                let mut state = __PLEX_STATE
+                    .lock()
+                    .unwrap_or_else(::std::sync::PoisonError::into_inner);
+                let policy = state.get_or_insert_with(::std::default::Default::default);
+                $crate::$world::react(policy, edges, now_ms);
             }
         }
 

@@ -35,43 +35,39 @@ impl Plane for Fake {
         }
     }
 
-    fn attr(&self, of: &Subject, name: &str) -> Lookup {
+    fn attr(&self, of: &Subject, name: &str) -> Option<Value> {
         let Subject::Process(id) = of else {
-            return Lookup::UnknownSubject;
+            return None;
         };
         self.attrs
             .iter()
             .find(|(p, n, _)| p == id && n == name)
-            .map_or(Lookup::UnknownName, |(_, _, value)| {
-                Lookup::Value(value.clone())
-            })
+            .map(|(_, _, value)| value.clone())
     }
 
-    fn prop(&self, of: &Subject, name: &str) -> Lookup {
+    fn prop(&self, of: &Subject, name: &str) -> Option<Value> {
         let Subject::Process(id) = of else {
-            return Lookup::UnknownSubject;
+            return None;
         };
-        let Some((_, props)) = self.processes.iter().find(|(p, _)| p == id) else {
-            return Lookup::UnknownSubject;
-        };
-        match props.iter().find(|(n, _)| n == name) {
-            Some((_, value)) => Lookup::Value(value.clone()),
-            None => Lookup::Absent,
-        }
+        let (_, props) = self.processes.iter().find(|(p, _)| p == id)?;
+        props
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, value)| value.clone())
     }
 
-    fn capability(&self, _name: &str) -> Level {
-        Level::Native
+    fn capability(&self, _name: &str) -> bool {
+        true
     }
 
-    fn terminable(&self, _process: &str) -> Result<(), Refusal> {
-        Ok(())
+    fn terminable(&self, _process: &str) -> bool {
+        true
     }
 }
 
 fn load(name: &str) -> Result<Program, LoadError> {
     let builtin = builtins::policy(name).unwrap_or_else(|| panic!("no built-in policy {name}"));
-    Program::load(name, builtin.component, &|_| Level::Native)
+    Program::load(name, builtin.component, &|_| true)
 }
 
 #[test]
@@ -131,7 +127,7 @@ fn test_route_orders_holds_and_places_by_its_clients_props() {
 fn an_unsubscribed_edge_does_not_run_the_program() {
     let mut program = load("test-route").unwrap();
     let plane = Fake::default().with("a", &[]);
-    let edges = vec![Edge::WorkerAdded("1".into())];
+    let edges = vec![Edge::WorkerDraining("1".into())];
     let commit = program.react(Box::new(plane), edges, 0).unwrap();
     assert!(commit.schedule.is_none() && commit.placement.is_none());
 }

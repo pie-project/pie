@@ -1096,12 +1096,12 @@ def text_to_image(args) -> int:
     workspace = os.path.dirname(inferlet)
     if not os.environ.get("PIE_INFERLETS_NO_BUILD"):
         done = subprocess.run(["cargo", "build", "-p", "text-to-image", "--release",
-                               "--target", "wasm32-wasip2"],
+                               "--target", "wasm32-wasip3"],
                               cwd=workspace, capture_output=True, text=True)
         if done.returncode != 0:
             sys.stderr.write(done.stderr)
             return 1
-    candidates = [os.path.join(workspace, "target/wasm32-wasip2", flavour, "text_to_image.wasm")
+    candidates = [os.path.join(workspace, "target/wasm32-wasip3", flavour, "text_to_image.wasm")
                   for flavour in ("release", "debug")]
     present = [p for p in candidates if os.path.exists(p)]
     if not present:
@@ -1205,12 +1205,12 @@ def text_to_video(args) -> int:
     workspace = os.path.dirname(inferlet)
     if not os.environ.get("PIE_INFERLETS_NO_BUILD"):
         done = subprocess.run(["cargo", "build", "-p", "text-to-video", "--release",
-                               "--target", "wasm32-wasip2"],
+                               "--target", "wasm32-wasip3"],
                               cwd=workspace, capture_output=True, text=True)
         if done.returncode != 0:
             sys.stderr.write(done.stderr)
             return 1
-    candidates = [os.path.join(workspace, "target/wasm32-wasip2", flavour, "text_to_video.wasm")
+    candidates = [os.path.join(workspace, "target/wasm32-wasip3", flavour, "text_to_video.wasm")
                   for flavour in ("release", "debug")]
     present = [p for p in candidates if os.path.exists(p)]
     if not present:

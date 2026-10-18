@@ -206,7 +206,7 @@ def _build_guests():
         print("Guests: not built (PIE_INFERLETS_NO_BUILD)")
         return
     result = subprocess.run(
-        ["cargo", "build", "--workspace", "--target", "wasm32-wasip2"],
+        ["cargo", "build", "--workspace", "--target", "wasm32-wasip3"],
         cwd=INFERLETS_DIR,
         capture_output=True,
         text=True,
@@ -244,10 +244,10 @@ def find_artifact(name: str) -> Path:
         if (inferlet_dir / script).exists():
             return inferlet_dir / script
     candidates = [
-        INFERLETS_DIR / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
-        INFERLETS_DIR / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
-        inferlet_dir / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
-        inferlet_dir / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
+        INFERLETS_DIR / "target" / "wasm32-wasip3" / "release" / f"{wasm_name}.wasm",
+        INFERLETS_DIR / "target" / "wasm32-wasip3" / "debug" / f"{wasm_name}.wasm",
+        inferlet_dir / "target" / "wasm32-wasip3" / "release" / f"{wasm_name}.wasm",
+        inferlet_dir / "target" / "wasm32-wasip3" / "debug" / f"{wasm_name}.wasm",
         inferlet_dir / "target" / f"{wasm_name}.wasm",
     ]
     present = [p for p in candidates if p.exists()]

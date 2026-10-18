@@ -104,7 +104,7 @@ fn stdout_clock_random_and_timer_reach_the_host() {
     let engine = common::engine();
     let component = Component::new(&engine, GUEST).expect("guest component");
     let mut linker = Linker::<common::State>::new(&engine);
-    wasmtime_web::add_to_linker(&mut linker).expect("add_to_linker");
+    wasmtime_web::p2::add_to_linker(&mut linker).expect("add_to_linker");
 
     let (state, stdout, _stderr) = common::state();
     let mut store = Store::new(&engine, state);

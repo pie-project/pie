@@ -85,7 +85,7 @@ pub struct Curated {
 impl Curated {
     pub fn build_hint(&self) -> String {
         format!(
-            "cd {} && cargo build -p {} --release --target wasm32-wasip2",
+            "cd {} && cargo build -p {} --release --target wasm32-wasip3",
             crate::ui::short_path(&self.root),
             self.name
         )
@@ -137,7 +137,7 @@ pub fn curated_in(roots: &[PathBuf], name: &str) -> Option<Curated> {
         }
         let built = std::env::var_os("CARGO_TARGET_DIR")
             .map_or_else(|| root.join("target"), PathBuf::from)
-            .join("wasm32-wasip2");
+            .join("wasm32-wasip3");
         let wasm = ["release", "debug"]
             .iter()
             .map(|profile| built.join(profile).join(&artifact))
@@ -484,7 +484,7 @@ mod tests {
         )
         .unwrap();
         if let Some(profile) = profile {
-            let built = dir.join("target").join("wasm32-wasip2").join(profile);
+            let built = dir.join("target").join("wasm32-wasip3").join(profile);
             std::fs::create_dir_all(&built).unwrap();
             std::fs::write(
                 built.join(format!("{}.wasm", name.replace('-', "_"))),
@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(
             found.wasm.unwrap(),
             dir.path()
-                .join("target/wasm32-wasip2/release/text_to_image.wasm")
+                .join("target/wasm32-wasip3/release/text_to_image.wasm")
         );
     }
 

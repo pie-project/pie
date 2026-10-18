@@ -40,8 +40,6 @@ pub const CAPABILITIES: &[&str] = &[
     "schedule.floor",
     "retention.order",
     "retention.tier",
-    "retention.promote",
-    "retention.outrank-live",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,12 +73,9 @@ pub(crate) enum Event {
     Kept(ProcessId, u64),
     CacheEmptied(ProcessId, By),
     Started(ProcessId),
-    Paused(ProcessId, By),
+    Paused(ProcessId),
     Resumed(ProcessId),
-    Exited(ProcessId, Outcome, By),
-    /// `Some` reason while the engine cannot enact the schedule for it, `None`
-    /// once it does.
-    Diverged(ProcessId, Option<&'static str>),
+    Exited(ProcessId, Outcome),
     /// The session id is `<tenant>/<session>`.
     SessionProps(String, Props),
     SessionClosed(String),

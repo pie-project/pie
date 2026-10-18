@@ -44,10 +44,10 @@ def _resolve(name: str) -> Path:
     wasm_name = name.replace("-", "_")
     inferlet_dir = INFERLETS_DIR / name
     candidates = [
-        INFERLETS_DIR / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
-        INFERLETS_DIR / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
-        inferlet_dir / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
-        inferlet_dir / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
+        INFERLETS_DIR / "target" / "wasm32-wasip3" / "release" / f"{wasm_name}.wasm",
+        INFERLETS_DIR / "target" / "wasm32-wasip3" / "debug" / f"{wasm_name}.wasm",
+        inferlet_dir / "target" / "wasm32-wasip3" / "release" / f"{wasm_name}.wasm",
+        inferlet_dir / "target" / "wasm32-wasip3" / "debug" / f"{wasm_name}.wasm",
         inferlet_dir / "target" / f"{wasm_name}.wasm",
     ]
     present = [p for p in candidates if p.exists()]
