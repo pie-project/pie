@@ -453,7 +453,7 @@ impl Client {
             capture_outputs,
             props,
             session,
-            router_props: Props::new(),
+            cluster_props: Props::new(),
         };
         let (ok, result) = self.send_msg_and_wait(msg).await?;
 

@@ -215,7 +215,7 @@ async fn relay(
                 .get(SESSION_HEADER)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string),
-            router_props: Props::new(),
+            cluster_props: Props::new(),
         },
         blobs: Vec::new(),
         priority: Priority::Normal,

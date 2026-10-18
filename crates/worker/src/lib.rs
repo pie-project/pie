@@ -28,4 +28,6 @@ pub use controller_api::Role;
 #[cfg(feature = "net")]
 pub use link::control::ControlLink;
 #[cfg(feature = "net")]
+pub use link::pool::run as run_pool;
+#[cfg(feature = "net")]
 pub use serve::{WorkerHandle, run, run_with};

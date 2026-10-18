@@ -13,7 +13,7 @@ use anyhow::{Result, anyhow};
 
 use super::stats::SchedulerStats;
 
-use super::worker::{BindRespond, PreLaunchCopy, QueuedItem};
+use super::worker::{BindRespond, HostKvOp, PreLaunchCopy, QueuedItem};
 
 pub(super) type LaunchResult = std::result::Result<SubmissionCompletion, String>;
 
@@ -132,7 +132,11 @@ fn fail_request(request: LaneRequest, why: &str) {
                 }
                 _ => {}
             }
-            let _ = reply.send(Lane::commit_on_failure(&item, why));
+            let commit = Lane::commit_on_failure(&item, why);
+            if let QueuedItem::HostKv { response, .. } = *item {
+                let _ = response.send(Err(anyhow!("{why}")));
+            }
+            let _ = reply.send(commit);
         }
         LaneRequest::Shutdown { .. } | LaneRequest::Landed { .. } => {}
     }
@@ -473,7 +477,9 @@ impl Lane {
                     result: Err(why.to_string()),
                 }
             }
-            QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. } => LaneCommit::None,
+            QueuedItem::CloseInstance { .. }
+            | QueuedItem::CloseChannels { .. }
+            | QueuedItem::HostKv { .. } => LaneCommit::None,
         }
     }
 
@@ -774,6 +780,24 @@ impl Lane {
                         LaneCommit::refused(message)
                     }
                 }
+            }
+            QueuedItem::HostKv { op, response } => {
+                let result = backend(engine).and_then(|engine| match op {
+                    HostKvOp::Write(slots, bytes) => engine
+                        .write_host_kv(&slots, &bytes)
+                        .map(|()| Vec::new())
+                        .map_err(Into::into),
+                    HostKvOp::CopyRead(copy, slots) => engine
+                        .copy_kv(&copy)
+                        .and_then(|()| engine.read_host_kv(&slots))
+                        .map_err(Into::into),
+                    HostKvOp::Layout => Ok(engine
+                        .host_kv_layout()
+                        .and_then(|layout| serde_json::to_vec(&layout).ok())
+                        .unwrap_or_default()),
+                });
+                let _ = response.send(result);
+                LaneCommit::None
             }
             QueuedItem::CloseInstance { id, .. } => {
                 match backend(engine)

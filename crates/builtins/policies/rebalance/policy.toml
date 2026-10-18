@@ -1,0 +1,13 @@
+# Keeps running turns even across the serving workers, as Llumnix does by
+# migrating them: when one worker runs at least two more than another, the
+# youngest of its turns moves to the idlest, one a call and each turn at
+# most once. A launch with a `worker` prop starts there.
+plane = "cluster"
+subscribe = ["arrived", "dispatched", "exited", "migrated", "migration-failed", "worker-removed"]
+grants = ["placement"]
+uses = ["placement.migrate"]
+gate-ms = 20
+
+[props.worker]
+type = "int"
+doc = "Where it starts."

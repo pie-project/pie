@@ -178,8 +178,8 @@ impl KvStore {
         }
     }
 
-    pub fn set_domain(&mut self, seed: &[u8]) {
-        self.domain = hash::cache_domain(seed);
+    pub fn set_domain(&mut self, domain: Hash256) {
+        self.domain = domain;
     }
 
     /// `Some(None)` at slot 0; `None` when that slot is opaque and no hash
@@ -612,6 +612,118 @@ impl KvStore {
                 Err(error)
             }
         }
+    }
+
+    /// Each cache entry's pages by key, from token 0: the runs this worker
+    /// can give whole.
+    pub fn cached_runs(&self) -> Vec<Vec<Hash256>> {
+        self.cache
+            .values()
+            .filter_map(|entry| {
+                let mut keys = self.table.path_keys(entry.path.terminal)?;
+                keys.truncate(entry.path.pages as usize);
+                (!keys.is_empty()).then_some(keys)
+            })
+            .collect()
+    }
+
+    /// Every sealed page's key here, on any tier.
+    pub fn sealed_keys(&self) -> std::collections::HashSet<Hash256> {
+        self.table.sealed_keys()
+    }
+
+    /// Host slots to land pages in that come from another worker; given
+    /// back with [`Self::free_host_slots`] unless an import takes them.
+    /// The tokens written to `ws`, as far as every write since is known.
+    pub fn logged(&self, ws: WorkingSetId) -> Result<&[u32], KvStoreError> {
+        Ok(self.table.logged(ws)?)
+    }
+
+    pub fn alloc_host_slots(&mut self, n: usize) -> Option<Vec<HostKvSlotId>> {
+        self.host_pool.try_alloc_n(n)
+    }
+
+    pub fn free_host_slots(&mut self, slots: Vec<HostKvSlotId>) {
+        self.host_pool.release_reserved(slots);
+    }
+
+    /// Pages another worker sealed, kept here as one cache entry in the host
+    /// tier: `slots` already hold their bytes. A pass whose rows they cover
+    /// promotes them as it would pages this worker demoted. They extend the
+    /// sealed pages `prefix` names, which must be found here whole; an empty
+    /// `prefix` starts at token 0.
+    pub fn import_cached(
+        &mut self,
+        prefix: &[Hash256],
+        token_hashes: Vec<Vec<Option<Hash256>>>,
+        page_hashes: Vec<Hash256>,
+        slots: Vec<HostKvSlotId>,
+    ) -> bool {
+        debug_assert_eq!(token_hashes.len(), slots.len());
+        debug_assert_eq!(page_hashes.len(), slots.len());
+        let pages = slots.len() as u64;
+        if pages == 0 {
+            return true;
+        }
+        let after = if prefix.is_empty() {
+            None
+        } else {
+            let run = self.table.sealed_run(prefix, false);
+            if run.len() != prefix.len() {
+                self.host_pool.release_reserved(slots);
+                return false;
+            }
+            run.last().copied()
+        };
+        let node = self.table.insert_cached(
+            after,
+            slots.into_iter().map(KvPageBacking::Swapped).collect(),
+            token_hashes,
+            page_hashes,
+        );
+        self.table.lease_cache_root(node);
+        // An entry's pages are its path's, from token 0: the prefix it was
+        // grafted below as well as its own.
+        let pages = self.table.path_len(node);
+        self.kept += 1;
+        tracing::debug!(target: "pie::kv", pages, "imported");
+        self.cache.insert(
+            self.kept,
+            KeptEntry {
+                path: KeptPath {
+                    terminal: node,
+                    pages,
+                },
+                owner: None,
+                last_use: Instant::now(),
+                decoded: false,
+            },
+        );
+        true
+    }
+
+    /// A run of sealed pages, held so it is neither moved nor reclaimed while
+    /// its bytes are read out, with each page's device id; `None` unless all
+    /// of it is on the device.
+    pub fn pin_resident(
+        &mut self,
+        run: &[TriePageLocation],
+    ) -> Option<(ReaderPin, Vec<PhysicalKvPageId>)> {
+        let last = run.last()?;
+        let mut ids = Vec::with_capacity(run.len());
+        for location in run {
+            match self.table.backing_at(location).ok()? {
+                KvPageBacking::Resident(id) => ids.push(id),
+                _ => return None,
+            }
+        }
+        self.table.pin(last.node);
+        Some((
+            ReaderPin {
+                nodes: vec![last.node],
+            },
+            ids,
+        ))
     }
 
     pub fn release_reader(&mut self, pin: ReaderPin) {

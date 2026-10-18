@@ -13,10 +13,12 @@ pub enum Command {
         role: Role,
         model: String,
         addr: String,
+        prior: Option<WorkerId>,
         reply: oneshot::Sender<WorkerId>,
     },
     RegisterGateway {
         addr: String,
+        prior: Option<GatewayId>,
         reply: oneshot::Sender<GatewayId>,
     },
     Heartbeat {
@@ -74,12 +76,13 @@ impl Actor {
                     role,
                     model,
                     addr,
+                    prior,
                     reply,
                 } => {
-                    let _ = reply.send(self.register_worker(role, model, addr));
+                    let _ = reply.send(self.register_worker(role, model, addr, prior));
                 }
-                Command::RegisterGateway { addr, reply } => {
-                    let _ = reply.send(self.register_gateway(addr));
+                Command::RegisterGateway { addr, prior, reply } => {
+                    let _ = reply.send(self.register_gateway(addr, prior));
                 }
                 Command::Heartbeat { node, reply } => {
                     let ack = if self.cluster.touch(node, Instant::now()) {
@@ -95,18 +98,24 @@ impl Actor {
         }
     }
 
-    fn register_worker(&mut self, role: Role, model: String, addr: String) -> WorkerId {
+    fn register_worker(
+        &mut self,
+        role: Role,
+        model: String,
+        addr: String,
+        prior: Option<WorkerId>,
+    ) -> WorkerId {
         let id = self
             .cluster
-            .insert_worker(role, model, addr, Instant::now());
+            .insert_worker_as(prior, role, model, addr, Instant::now());
         self.cluster.worker_epoch += 1;
         self.cluster.gateway_epoch += 1;
         self.replan_and_publish();
         id
     }
 
-    fn register_gateway(&mut self, addr: String) -> GatewayId {
-        let id = self.cluster.insert_gateway(addr, Instant::now());
+    fn register_gateway(&mut self, addr: String, prior: Option<GatewayId>) -> GatewayId {
+        let id = self.cluster.insert_gateway_as(prior, addr, Instant::now());
         self.cluster.worker_epoch += 1;
         self.publish_worker_view();
         id
@@ -123,10 +132,16 @@ impl Actor {
         let (workers_removed, gateways_removed) = self
             .cluster
             .evict_expired(Instant::now(), self.config.heartbeat_timeout);
+        let regraded = self
+            .cluster
+            .grade(Instant::now(), self.config.heartbeat_timeout / 2);
         if workers_removed > 0 {
             self.cluster.worker_epoch += 1;
             self.cluster.gateway_epoch += 1;
             self.replan_and_publish();
+        } else if regraded {
+            self.cluster.gateway_epoch += 1;
+            let _ = self.gateway_tx.send(routing_only(&self.cluster));
         } else if gateways_removed > 0 {
             self.cluster.worker_epoch += 1;
             self.publish_worker_view();

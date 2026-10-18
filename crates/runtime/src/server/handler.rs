@@ -469,7 +469,7 @@ impl Session {
         capture_outputs: bool,
         mut props: client_api::Props,
         session: Option<String>,
-        router_props: client_api::Props,
+        cluster_props: client_api::Props,
     ) {
         // A worker also takes clients that did not come through a gateway.
         if let Err(why) = client_api::props::from_client(&mut props)
@@ -479,12 +479,13 @@ impl Session {
                 .await;
             return;
         }
-        // The gateway's router policy speaks for itself, under its prefix.
-        props.extend(
-            router_props.into_iter().map(|(name, value)| {
-                (format!("{}{name}", client_api::props::ROUTER_PREFIX), value)
-            }),
-        );
+        // The gateway's cluster policy speaks for itself, under its prefix.
+        props.extend(cluster_props.into_iter().map(|(name, value)| {
+            (
+                format!("{}{name}", client_api::props::CLUSTER_PREFIX),
+                value,
+            )
+        }));
         // A bare `name` is its newest installed version: how the gateway's
         // fixed routes reach the built-in inferlets.
         let program_name = if inferlet.contains('@') {

@@ -89,6 +89,83 @@ fn tests_every_case() {
     a_tail_past_its_step_goes_before_another_head();
     a_demote_leaves_what_a_higher_key_covers();
     an_answer_goes_before_an_older_prompt();
+    pages_another_worker_sealed_are_found_in_the_host_tier();
+}
+
+/// Pages that came from another worker, whose keys this worker computes from
+/// the same tokens under the same domain, are found where a pass looks, below
+/// the device, and come back when their entry is dropped.
+fn pages_another_worker_sealed_are_found_in_the_host_tier() {
+    use super::hash::{chain_slots, page_hash};
+    let domain = h(7);
+    let mut store = KvStore::new_with_swap(8, 4, 0, domain);
+    store.set_page_size(4);
+    let tokens: Vec<u32> = (100..112).collect();
+    let slots = chain_slots(&domain, None, 0, &tokens);
+    let token_hashes: Vec<Vec<Option<Hash256>>> = slots
+        .chunks(4)
+        .map(|page| page.iter().map(|h| Some(*h)).collect())
+        .collect();
+    let keys: Vec<Hash256> = token_hashes.iter().map(|page| page_hash(page)).collect();
+
+    let host = store.alloc_host_slots(3).expect("three host slots");
+    assert!(store.alloc_host_slots(2).is_none(), "one slot is left");
+    assert!(store.import_cached(&[], token_hashes, keys.clone(), host));
+
+    let run = store.cached_run_any_tier(&keys);
+    assert_eq!(run.len(), 3, "the whole run is found");
+    assert_eq!(store.below_device(&run), 3, "all of it in the host tier");
+    assert!(
+        store.cached_run(&keys).is_empty(),
+        "none of it on the device"
+    );
+    // A node is found by its first page: a run that starts past it, as no
+    // pass's does, finds nothing.
+    assert!(store.cached_run_any_tier(&keys[1..]).is_empty());
+
+    // More pages extend the first import, grafted below its last page.
+    let mut store = KvStore::new_with_swap(8, 4, 0, domain);
+    store.set_page_size(4);
+    let tokens: Vec<u32> = (100..116).collect();
+    let slots = chain_slots(&domain, None, 0, &tokens);
+    let token_hashes: Vec<Vec<Option<Hash256>>> = slots
+        .chunks(4)
+        .map(|page| page.iter().map(|h| Some(*h)).collect())
+        .collect();
+    let keys: Vec<Hash256> = token_hashes.iter().map(|page| page_hash(page)).collect();
+    let head = store.alloc_host_slots(2).unwrap();
+    assert!(store.import_cached(&[], token_hashes[..2].to_vec(), keys[..2].to_vec(), head));
+    let lost = store.alloc_host_slots(1).unwrap();
+    assert!(
+        !store.import_cached(
+            &keys[2..3],
+            token_hashes[3..].to_vec(),
+            keys[3..].to_vec(),
+            lost
+        ),
+        "a prefix not held here refuses the import"
+    );
+    let tail = store
+        .alloc_host_slots(2)
+        .expect("the refused import gave its slot back");
+    assert!(store.import_cached(
+        &keys[..2],
+        token_hashes[2..].to_vec(),
+        keys[2..].to_vec(),
+        tail
+    ));
+    assert_eq!(
+        store.cached_run_any_tier(&keys).len(),
+        4,
+        "one run across both"
+    );
+    let mut runs = store.cached_runs();
+    runs.sort_by_key(Vec::len);
+    assert_eq!(
+        runs,
+        vec![keys[..2].to_vec(), keys.clone()],
+        "each entry from token 0"
+    );
 }
 
 /// Retention entries as `(owner, upto, key)`; a position no entry covers is 0.

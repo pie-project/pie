@@ -55,7 +55,7 @@ pub enum ClientMessage {
         session: Option<String>,
         /// Set by the worker, never on the wire.
         #[serde(skip)]
-        router_props: Props,
+        cluster_props: Props,
     },
 
     #[serde(rename = "attach_process")]

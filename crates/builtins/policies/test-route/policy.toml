@@ -1,4 +1,4 @@
-plane = "router"
+plane = "cluster"
 subscribe = ["arrived", "dispatched", "exited"]
 grants = ["schedule", "placement", "terminate"]
 gate-ms = 50

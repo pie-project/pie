@@ -1,6 +1,7 @@
 pub mod admission;
 pub mod blob;
 pub mod controller;
+pub mod directory;
 pub mod ingress;
 pub mod policy;
 pub mod route;
@@ -79,18 +80,18 @@ pub struct GatewayState {
     pub routing: RoutingHandle,
     pub workers: WorkerRegistry,
     pub blobs: Arc<dyn BlobStore>,
-    pub router: Option<Arc<policy::Router>>,
+    pub router: Option<Arc<policy::Cluster>>,
 }
 
 struct RouteBackend {
     routing: RoutingHandle,
     workers: WorkerRegistry,
     located: Mutex<Located>,
-    router: Option<Arc<policy::Router>>,
+    router: Option<Arc<policy::Cluster>>,
 }
 
 impl RouteBackend {
-    fn router_for(&self, req: &Request) -> Option<&policy::Router> {
+    fn router_for(&self, req: &Request) -> Option<&policy::Cluster> {
         let launch = matches!(req.message, client_api::ClientMessage::LaunchProcess { .. });
         self.router.as_deref().filter(|_| launch)
     }
@@ -136,9 +137,9 @@ impl TurnRouter for RouteBackend {
         let placed: Request;
         let (req, preferred) = match router {
             Some(router) => {
-                let (preferred, router_props) = router.placement(req);
+                let (preferred, cluster_props) = router.placement(req);
                 placed = Request {
-                    router_props,
+                    cluster_props,
                     ..req.clone()
                 };
                 (&placed, preferred)
@@ -188,6 +189,12 @@ impl TurnRouter for RouteBackend {
     fn counted(&self, req: &Request, prompt: u64, generated: u64) {
         if let Some(router) = self.router_for(req) {
             router.counted(req, prompt, generated);
+        }
+    }
+
+    fn moved(&self, req: &Request, worker: Option<WorkerId>, why: &str) {
+        if let Some(router) = self.router_for(req) {
+            router.moved(req, worker, why);
         }
     }
 
@@ -265,10 +272,21 @@ pub struct GatewayHandle {
     worker_task: tokio::task::JoinHandle<()>,
 }
 
+/// How long a shutting-down gateway lets open client streams run on.
+pub const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl GatewayHandle {
-    pub async fn shutdown(self) {
+    /// Stops taking connections and lets open streams finish, for up to
+    /// [`SHUTDOWN_GRACE`]: a stream that does not end in that time is cut.
+    pub async fn shutdown(mut self) {
         self.shutdown.notify_one();
-        let _ = self.serve_task.await;
+        if tokio::time::timeout(SHUTDOWN_GRACE, &mut self.serve_task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("client streams still open after the shutdown grace; cutting them");
+            self.serve_task.abort();
+        }
         self.worker_task.abort();
         let _ = self.worker_task.await;
     }
@@ -282,29 +300,41 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
     let router = match &config.policy {
         Some(spec) => {
             let component = builtins::policy_component(spec)?;
-            let (router, cancelled) = policy::Router::start(
+            let (router, cancelled, moves) = policy::Cluster::start(
                 spec,
                 &component,
                 routing.table_watch(),
                 workers.connected_watch(),
+                workers.clone(),
             )
-            .with_context(|| format!("load the router policy `{spec}`"))?;
-            Some((router, cancelled))
+            .with_context(|| format!("load the cluster policy `{spec}`"))?;
+            Some((router, cancelled, moves))
         }
         None => None,
     };
-    let policy_router = router.as_ref().map(|(router, _)| router.clone());
+    let policy_router = router.as_ref().map(|(router, _, _)| router.clone());
     let sessions = Sessions::new(Arc::new(RouteBackend {
         routing: routing.clone(),
         workers: workers.clone(),
         located: Mutex::default(),
         router: policy_router.clone(),
     }));
-    if let Some((_, mut cancelled)) = router {
-        let sessions = sessions.clone();
+    if let Some((_, mut cancelled, mut moves)) = router {
+        let cancelling = sessions.clone();
         tokio::spawn(async move {
             while let Some(req) = cancelled.recv().await {
-                sessions.terminate(req).await;
+                cancelling.terminate(req).await;
+            }
+        });
+        let moving = sessions.clone();
+        tokio::spawn(async move {
+            while let Some((req, target)) = moves.recv().await {
+                let moving = moving.clone();
+                tokio::spawn(async move {
+                    if !moving.migrate(req, target).await {
+                        tracing::debug!(%req, %target, "a turn did not move: ended, or already moving");
+                    }
+                });
             }
         });
     }
@@ -326,6 +356,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
 
     let info = GatewayInfo {
         addr: worker_addr.to_string(),
+        prior: None,
     };
     let gateway_id = control
         .register_gateway(info.clone())
@@ -356,7 +387,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
 }
 
 pub async fn run(config: Config) -> Result<GatewayHandle> {
-    let control = controller::connect_controller(&config.controller).await?;
+    let control = controller::Controller::connect(&config.controller).await?;
     run_with(config, control).await
 }
 

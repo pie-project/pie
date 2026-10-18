@@ -600,12 +600,12 @@ impl DecodeGeometry {
                 format!("fa2 decode head_dim {head_dim} needs bdx > 32 (decode.cuh:765)"),
             ));
         }
-        if !matches!(group_size, 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16) {
+        if !matches!(group_size, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 12 | 16) {
             return Err(refuse(
                 op,
                 format!(
                     "fa2 decode GQA group {group_size} is outside the stamped lattice \
-                     (1, 2, 3, 4, 6, 8, 12, 16)"
+                     (1, 2, 3, 4, 5, 6, 8, 12, 16)"
                 ),
             ));
         }

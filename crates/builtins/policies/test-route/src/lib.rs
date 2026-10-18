@@ -1,12 +1,12 @@
 //! Orders, holds, places and ends launches by their props, so a test can see
-//! the router enact each table and verb.
+//! the cluster host enact each table and verb.
 
-use policy::{Placement, Subject, SubjectKind, Value, attr, candidates, prop, router, terminate};
+use policy::{Placement, Subject, SubjectKind, Value, attr, candidates, cluster, prop, terminate};
 
 #[derive(Default)]
 struct Route;
 
-impl router::Policy for Route {
+impl cluster::Policy for Route {
     fn plan(&mut self, _now_ms: u64) {
         let processes = candidates(SubjectKind::Process);
         let keys: Vec<_> = processes
@@ -23,11 +23,12 @@ impl router::Policy for Route {
                 worker: prop(&Subject::Process(p.clone()), "worker")
                     .text()
                     .map(str::to_string),
+                executors: Vec::new(),
                 props: vec![("from".to_string(), Value::Text(p.clone()))],
             })
             .collect();
-        router::install_schedule(&keys, Some(1));
-        router::install_placement(&placements);
+        cluster::install_schedule(&keys, Some(1));
+        cluster::install_placement(&placements);
         for p in &processes {
             let process = Subject::Process(p.clone());
             if let Some(reason) = prop(&process, "refuse").text() {
@@ -41,4 +42,4 @@ impl router::Policy for Route {
     }
 }
 
-policy::router!(Route);
+policy::cluster!(Route);

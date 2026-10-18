@@ -1,6 +1,6 @@
 # Keeps a session's KV for its next turn: a process given `keep-ms` leaves
 # its cached working-set above every other until that long after it exits.
-plane = "engine"
+plane = "worker"
 subscribe = ["arrived", "prop-changed", "exited", "retained", "discarded"]
 grants = ["retention", "discard"]
 

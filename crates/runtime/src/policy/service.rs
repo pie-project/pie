@@ -1,4 +1,4 @@
-//! The engine policy on its own thread, with its own record of processes built
+//! The worker policy on its own thread, with its own record of processes built
 //! from the same events as its edges.
 
 use std::cell::OnceCell;
@@ -35,10 +35,10 @@ pub fn start(name: &str, component: &[u8]) -> Result<(), LoadError> {
     // A second one's thread ends with its channel.
     if EVENTS.set(tx).is_err() {
         return Err(LoadError::Instantiate(
-            "this worker already runs an engine policy".into(),
+            "this worker already runs a worker policy".into(),
         ));
     }
-    tracing::info!(policy = name, "engine policy started");
+    tracing::info!(policy = name, "worker policy started");
     Ok(())
 }
 
@@ -56,6 +56,12 @@ fn capability(name: &str) -> bool {
         | "retention.order" => true,
         // Idle cache goes to the host in key order.
         "retention.tier" => crate::planner::planner().is_some_and(|p| p.can_pause()),
+        // Passes go to a peer while one is linked; `cost` reads only the
+        // rule's threshold.
+        "offload.remote" => crate::offload::prefill::has_peer(),
+        // The worker's own values reach the cluster plane with its state
+        // report; a process's do not yet.
+        "publish" => true,
         _ => false,
     }
 }
@@ -91,7 +97,7 @@ impl Activity {
             keyed = self.keyed,
             terminated = self.terminated,
             discards = self.discards,
-            "engine policy activity"
+            "worker policy activity"
         );
     }
 }
@@ -131,7 +137,7 @@ fn run(mut program: Program, events: Receiver<Event>) {
             continue;
         }
 
-        tracing::debug!(policy = program.name(), ?edges, "engine policy edges");
+        tracing::debug!(policy = program.name(), ?edges, "worker policy edges");
         let started = Instant::now();
         let result = program.react(Box::new(registry.snapshot()), edges, now);
         activity.calls += 1;
@@ -150,19 +156,19 @@ fn run(mut program: Program, events: Receiver<Event>) {
                     schedule = commit.schedule.as_ref().map(|t| t.keys.len()),
                     floor = commit.schedule.as_ref().and_then(|t| t.floor),
                     retention = commit.retention.as_ref().map(|t| t.steps.len()),
-                    "engine policy call"
+                    "worker policy call"
                 );
                 enact(&mut registry, commit);
             }
             Err(Fault::Dead(error)) => {
-                tracing::error!(policy = program.name(), %error, "engine policy is dead; its tables are withdrawn");
+                tracing::error!(policy = program.name(), %error, "worker policy is dead; its tables are withdrawn");
                 schedule::install(None);
                 retention::install(None);
                 return;
             }
             Err(fault) => {
                 activity.discarded += 1;
-                tracing::warn!(policy = program.name(), %fault, "engine policy call discarded");
+                tracing::warn!(policy = program.name(), %fault, "worker policy call discarded");
             }
         }
         activity.log(program.name(), now);
@@ -193,9 +199,31 @@ fn by_owner(table: Retention) -> retention::Table {
     retention::Table::new(steps)
 }
 
+fn by_rule(offload: wit::Offload) -> super::offload::Rule {
+    super::offload::Rule {
+        mode: match offload.mode {
+            wit::OffloadMode::Never => super::offload::Mode::Never,
+            wit::OffloadMode::Cost => super::offload::Mode::Cost,
+            wit::OffloadMode::Always => super::offload::Mode::Always,
+        },
+        min_tokens: offload.min_tokens,
+        executors: offload.executors,
+    }
+}
+
 fn enact(registry: &mut Registry, commit: Commit) {
     if let Some(table) = commit.schedule {
         schedule::install(Some(by_process(table)));
+    }
+    if let Some(table) = commit.offload {
+        super::offload::install(Some(super::offload::Table {
+            entries: table
+                .entries
+                .into_iter()
+                .filter_map(|(id, rule)| Some((ProcessId::from_str(&id).ok()?, by_rule(rule))))
+                .collect(),
+            default: table.default.map(by_rule),
+        }));
     }
     if let Some(table) = commit.retention {
         retention::install(Some(by_owner(table)));
@@ -210,6 +238,14 @@ fn enact(registry: &mut Registry, commit: Commit) {
         if let Ok(owner) = ProcessId::from_str(&id) {
             (registry.cache.discard)(owner);
         }
+    }
+    for (of, name, value) in commit.publish {
+        let of = match of {
+            Subject::Worker(_) => "worker".to_string(),
+            Subject::Process(id) => format!("process:{id}"),
+            _ => continue,
+        };
+        super::publish(of, name, value.and_then(|v| wit_json(&v)));
     }
 }
 
@@ -351,6 +387,17 @@ impl Proc {
     }
 }
 
+fn wit_json(value: &Value) -> Option<serde_json::Value> {
+    use serde_json::Value as Json;
+    Some(match value {
+        Value::Boolean(b) => Json::Bool(*b),
+        Value::Int(i) => Json::from(*i),
+        Value::Float(f) => serde_json::Number::from_f64(*f).map(Json::Number)?,
+        Value::Text(s) => Json::String(s.clone()),
+        Value::Json(text) => serde_json::from_str(text).ok()?,
+    })
+}
+
 fn prop_value((name, value): (String, serde_json::Value)) -> Option<(String, Value)> {
     use serde_json::Value as Json;
     let value = match value {
@@ -414,7 +461,7 @@ impl Registry {
                 tracing::debug!(
                     process = %id,
                     props = ?arrival.props.keys().collect::<Vec<_>>(),
-                    "engine policy: a process arrived"
+                    "worker policy: a process arrived"
                 );
                 let now = now_ms();
                 let prompt: Option<Arc<[u64]>> = client_api::props::prompt_of(arrival.props.iter())
@@ -454,7 +501,7 @@ impl Registry {
             }
             Event::Cached(pid, tokens) => {
                 let id = schedule::plex_id(pid);
-                tracing::debug!(process = %id, tokens, "engine policy: cached tokens looked up");
+                tracing::debug!(process = %id, tokens, "worker policy: cached tokens looked up");
                 if let Some(proc) = self.procs.get_mut(&id) {
                     proc.cached_tokens = Some(proc.cached_tokens.unwrap_or(0).max(tokens));
                 }
@@ -470,6 +517,23 @@ impl Registry {
                 self.set(pid, State::Running);
                 None
             }
+            Event::Offloaded(pid, worker, tokens) => {
+                let id = schedule::plex_id(pid);
+                self.procs.contains_key(&id).then(|| {
+                    Edge::Offloaded(wit::OffloadEvent {
+                        process: id.to_string(),
+                        worker,
+                        tokens,
+                    })
+                })
+            }
+            Event::OffloadFailed(pid, reason) => {
+                let id = schedule::plex_id(pid);
+                tracing::debug!(process = %id, %reason, "worker policy: a pass meant for a peer ran here");
+                self.procs
+                    .contains_key(&id)
+                    .then(|| Edge::OffloadFailed(id.to_string()))
+            }
             Event::Exited(pid, outcome) => {
                 let id = schedule::plex_id(pid);
                 self.terminated.remove(&id);
@@ -480,7 +544,7 @@ impl Registry {
                 tracing::debug!(
                     process = %id,
                     counts = ?tokens::get(id),
-                    "engine policy: a process exited"
+                    "worker policy: a process exited"
                 );
                 self.exited.insert(id, proc.clone());
                 let exited = Edge::Exited(wit::Exit {
@@ -510,7 +574,7 @@ impl Registry {
                 let (merged, names) = match client_api::props::merge(&current, changes) {
                     Ok(merged) => merged,
                     Err(why) => {
-                        tracing::warn!(%session, %why, "engine policy: session props refused");
+                        tracing::warn!(%session, %why, "worker policy: session props refused");
                         (current, Vec::new())
                     }
                 };
@@ -678,6 +742,8 @@ impl Plane for Snapshot {
                 sessions.into_iter().cloned().collect()
             }
             SubjectKind::Worker => vec![WORKER.to_string()],
+            // Cluster subjects: the worker plane sees none.
+            SubjectKind::Group | SubjectKind::Link => Vec::new(),
             SubjectKind::WorkingSet => {
                 let mut ids: Vec<String> = self.cached().0.keys().cloned().collect();
                 ids.sort_unstable();

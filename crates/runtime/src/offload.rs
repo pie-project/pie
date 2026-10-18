@@ -5,6 +5,9 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 use anyhow::{Result, anyhow};
 
+pub mod directory;
+pub mod prefill;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PartnerRole {
     Prefill,
@@ -326,4 +329,9 @@ pub(crate) async fn try_encode(request: &mut crate::engine::FireRequest) -> bool
         tracing::warn!(%error, "encode offload declined");
     }
     false
+}
+
+/// Below this many uncached tokens a pass is not worth sending away.
+pub(crate) fn prefill_min_suffix_tokens() -> usize {
+    SETTINGS.read().unwrap().prefill_min_suffix_tokens
 }

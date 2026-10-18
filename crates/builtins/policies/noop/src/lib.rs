@@ -3,6 +3,6 @@
 #[derive(Default)]
 struct Noop;
 
-impl policy::engine::Policy for Noop {}
+impl policy::worker::Policy for Noop {}
 
-policy::engine!(Noop);
+policy::worker!(Noop);

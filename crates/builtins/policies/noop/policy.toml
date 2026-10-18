@@ -1,5 +1,5 @@
-# Installs nothing, so the engine keeps its default order: the baseline arm
+# Installs nothing, so the worker keeps its default order: the baseline arm
 # every other policy is compared against.
-plane = "engine"
+plane = "worker"
 subscribe = []
 grants = []

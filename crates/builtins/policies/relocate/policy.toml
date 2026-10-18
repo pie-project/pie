@@ -1,0 +1,20 @@
+# Places a launch on the worker its `worker` prop names, then, once it has
+# run `move-after-ms`, moves it to `move-to`: a running turn changes worker
+# and its stream goes on. For benchmarks and tests of migration.
+plane = "cluster"
+subscribe = ["arrived", "dispatched", "exited", "migrated"]
+grants = ["placement"]
+uses = ["placement.migrate"]
+gate-ms = 20
+
+[props.worker]
+type = "int"
+doc = "Where it starts."
+
+[props.move-to]
+type = "int"
+doc = "Where it moves."
+
+[props.move-after-ms]
+type = "int"
+doc = "How long after it arrives it moves."

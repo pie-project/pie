@@ -385,7 +385,7 @@ impl Session {
                 capture_outputs,
                 props,
                 session,
-                router_props,
+                cluster_props,
             } => {
                 self.handle_launch_process(
                     corr_id,
@@ -394,7 +394,7 @@ impl Session {
                     capture_outputs,
                     props,
                     session,
-                    router_props,
+                    cluster_props,
                 )
                 .await
             }

@@ -1,0 +1,12 @@
+# Sends a launch to the worker its `worker` prop names; one without goes by
+# the gateway's default. For benchmarks and debugging, and as the least a
+# placement policy is.
+plane = "cluster"
+subscribe = ["arrived"]
+grants = ["placement"]
+# Long enough for the call that places a new arrival to answer.
+gate-ms = 20
+
+[props.worker]
+type = "int"
+doc = "The worker to send it to, by number."

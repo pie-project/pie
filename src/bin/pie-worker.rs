@@ -46,6 +46,11 @@ async fn main() -> anyhow::Result<ExitCode> {
 
     let handle = worker::run(cfg, &pie::paths::pie_home()).await?;
     Ok(ctx
-        .run_until_signal(async move { handle.shutdown().await })
+        .run_until_signal(async move {
+            // A signal drains first: no new turns, and the cluster policy may
+            // move what runs here; then the worker leaves.
+            handle.drain(std::time::Duration::from_secs(60)).await;
+            handle.shutdown().await
+        })
         .await)
 }

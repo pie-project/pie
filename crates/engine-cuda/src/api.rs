@@ -955,9 +955,42 @@ impl Engine for Cuda {
             .map_err(fault)
     }
 
+    fn host_kv_layout(&self) -> Option<state::PageLayout> {
+        self.shell.as_ref()?.host_kv_layout(1)
+    }
+
+    fn read_host_kv(&mut self, slots: &[u32]) -> EngineResult<Vec<u8>> {
+        self.loaded_mut()?.read_host_kv(slots).map_err(fault)
+    }
+
+    fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
+        self.loaded_mut()?
+            .write_host_kv(slots, bytes)
+            .map_err(fault)
+    }
+
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
+        // A tensor-parallel group names its device by its first rank's
+        // ordinal; to each rank, a move between "the device" and a host or
+        // disk tier is a move out of or into its own.
+        let tier = |domain| matches!(domain, MemoryDomain::HostPinned | MemoryDomain::LocalDisk);
+        let own = |domain| match (domain, device) {
+            (MemoryDomain::CudaDevice(_), Some(device)) => device,
+            _ => domain,
+        };
+        let copy = &match (copy.src, copy.dst) {
+            (src, dst) if tier(dst) && !tier(src) => KvCopy {
+                src: own(src),
+                ..copy.clone()
+            },
+            (src, dst) if tier(src) && !tier(dst) => KvCopy {
+                dst: own(dst),
+                ..copy.clone()
+            },
+            _ => copy.clone(),
+        };
         if let Some((tier, out, pages, slots)) = device.and_then(|device| copy.tier_move(device)) {
             // The windowed pairs are stated in the copy's direction; the pool
             // takes them as (device, host).

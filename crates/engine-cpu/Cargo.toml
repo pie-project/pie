@@ -1,0 +1,19 @@
+[package]
+name = "engine-cpu"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The CPU engine: host memory for state no device holds. Today a pool of sealed pages, kept by key for any model and served over the bulk link, for workers that load no model."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[dependencies]
+transport = { path = "../transport", features = ["tcp"] }
+tokio = { version = "1.53", features = ["sync", "rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["sync", "rt", "macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

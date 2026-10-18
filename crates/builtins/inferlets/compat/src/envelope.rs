@@ -24,6 +24,8 @@ pub struct Envelope {
     /// Unix seconds at the gateway, or 0 when the program was not launched
     /// through it.
     pub time: u64,
+    /// Set when the turn moved here from another worker.
+    pub resume: Option<crate::resume::Resume>,
 }
 
 impl Envelope {
@@ -39,6 +41,7 @@ impl Envelope {
                 query: BTreeMap::new(),
                 body: Value::Object(object),
                 time: 0,
+                resume: None,
             });
         };
         let path = object
@@ -62,11 +65,14 @@ impl Envelope {
             })
             .unwrap_or_default();
         let time = object.get("time").and_then(Value::as_u64).unwrap_or(0);
+        let resume = object.get("resume").and_then(crate::resume::Resume::parse);
+        crate::resume::set(resume.clone());
         Ok(Self {
             path,
             query,
             body,
             time,
+            resume,
         })
     }
 }

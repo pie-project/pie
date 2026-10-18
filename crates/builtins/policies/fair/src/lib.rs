@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use policy::{Id, Subject, SubjectKind, attr, candidates, engine, set_alarm};
+use policy::{Id, Subject, SubjectKind, attr, candidates, set_alarm, worker};
 
 const TICK_MS: u64 = 250;
 
@@ -14,7 +14,7 @@ struct Fair {
     last_ms: Option<u64>,
 }
 
-impl engine::Policy for Fair {
+impl worker::Policy for Fair {
     fn plan(&mut self, now_ms: u64) {
         let processes: Vec<(Id, String, bool)> = candidates(SubjectKind::Process)
             .into_iter()
@@ -56,11 +56,11 @@ impl engine::Policy for Fair {
                 (p.clone(), -(served.min(i64::MAX as u64) as i64))
             })
             .collect();
-        engine::install_schedule(&entries, None);
+        worker::install_schedule(&entries, None);
         if processes.iter().any(|(_, _, running)| *running) {
             set_alarm(now_ms + TICK_MS);
         }
     }
 }
 
-policy::engine!(Fair);
+policy::worker!(Fair);

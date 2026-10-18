@@ -1,5 +1,5 @@
 # Fair share across tenants, after VTC: the tenant that has had the least
 # service runs first. Service is counted as time spent running.
-plane = "engine"
+plane = "worker"
 subscribe = ["arrived", "started", "paused", "exited"]
 grants = ["schedule"]

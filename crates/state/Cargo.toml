@@ -1,0 +1,15 @@
+[package]
+name = "state"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "What a pie cluster's state is: model identity, numerics class, content keys over the cluster block, sealed groups, state formats, and the events that say where copies are. Pure types; depends on no runtime and no engine."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+blake3 = "1.8"
+
+[lints]
+workspace = true

@@ -54,7 +54,7 @@ impl std::fmt::Display for SessionError {
             SessionError::NoWorker => f.write_str("no worker available"),
             SessionError::Draining => f.write_str("gateway draining"),
             SessionError::Launch(r) => write!(f, "launch refused: {r}"),
-            SessionError::Refused(r) => write!(f, "refused by the router policy: {r}"),
+            SessionError::Refused(r) => write!(f, "refused by the cluster policy: {r}"),
         }
     }
 }
@@ -101,6 +101,9 @@ pub trait TurnRouter: Send + Sync + 'static {
     fn counted(&self, _req: &Request, _prompt: u64, _generated: u64) {}
 
     fn ended(&self, _req: &Request, _outcome: Outcome, _by: By) {}
+
+    /// A running turn moved to `worker`, or (`None`) could not.
+    fn moved(&self, _req: &Request, _worker: Option<WorkerId>, _why: &str) {}
 }
 
 struct TurnState {
@@ -111,6 +114,14 @@ struct TurnState {
     sink: mpsc::Sender<Tokens>,
     open: Arc<AtomicBool>,
     outcome: Option<Outcome>,
+    /// The tokens the client has been sent, as the frames named them, and
+    /// the response id they went out under: what a move resumes from.
+    resume: Vec<u32>,
+    resume_id: Option<String>,
+    /// Moved: the worker it left, whose late frames are dropped, and the
+    /// new launch's answer, which the client does not see again.
+    left: Option<WorkerId>,
+    relaunched: bool,
 }
 
 struct Inner {
@@ -121,6 +132,59 @@ struct Inner {
     draining: AtomicBool,
     live: AtomicUsize,
     pipe_cap: usize,
+}
+
+/// Takes a frame's `plex` word (the tokens it covers and the response id)
+/// off it, keeping it on the turn.
+fn take_plex(turn: &mut TurnState, message: &mut ServerMessage) {
+    let ServerMessage::ProcessEvent { value, .. } = message else {
+        return;
+    };
+    if !value.contains("\"plex\"") {
+        return;
+    }
+    let Ok(serde_json::Value::Object(mut frame)) = serde_json::from_str(value) else {
+        return;
+    };
+    let Some(plex) = frame.remove("plex") else {
+        return;
+    };
+    if let Some(tokens) = plex.get("tokens").and_then(|t| t.as_array()) {
+        turn.resume
+            .extend(tokens.iter().filter_map(|t| t.as_u64()).map(|t| t as u32));
+    }
+    if let Some(id) = plex.get("id").and_then(|i| i.as_str()) {
+        turn.resume_id = Some(id.to_string());
+    }
+    *value = serde_json::Value::Object(frame).to_string();
+}
+
+/// Readies a turn to be launched again away from `old`: its launch carries
+/// what the client was sent, which the program continues after, and `old`'s
+/// late frames and the new launch's answer are kept from the client.
+fn relaunch(turn: &mut TurnState, old: WorkerId) {
+    if let (Some(id), ClientMessage::LaunchProcess { input, .. }) =
+        (&turn.resume_id, &mut turn.request.message)
+        && let Ok(serde_json::Value::Object(mut envelope)) =
+            serde_json::from_str::<serde_json::Value>(input)
+    {
+        envelope.insert(
+            "resume".into(),
+            serde_json::json!({"id": id, "tokens": turn.resume}),
+        );
+        *input = serde_json::Value::Object(envelope).to_string();
+    }
+    turn.worker = None;
+    turn.left = Some(old);
+    turn.relaunched = true;
+}
+
+fn is_launch_answer(turn: &TurnState, message: &ServerMessage) -> bool {
+    matches!(
+        (&turn.request.message, message),
+        (ClientMessage::LaunchProcess { corr_id, .. }, ServerMessage::Response { corr_id: answered, .. })
+            if corr_id == answered
+    )
 }
 
 impl Inner {
@@ -144,7 +208,7 @@ impl Inner {
             priority: input.priority,
             blobs: input.blobs,
             message: input.message,
-            router_props: Default::default(),
+            cluster_props: Default::default(),
         };
 
         if let Err(refusal) = self.router.admit(&request).await {
@@ -181,6 +245,10 @@ impl Inner {
                     sink: tx,
                     open: open.clone(),
                     outcome: None,
+                    resume: Vec::new(),
+                    resume_id: None,
+                    left: None,
+                    relaunched: false,
                 },
             );
         }
@@ -313,6 +381,18 @@ impl Sessions {
     }
 
     pub async fn feed(&self, req_id: ReqId, chunk: Tokens) -> worker_api::Control {
+        self.feed_from(req_id, chunk, None).await
+    }
+
+    /// A chunk from worker `from`: one from a worker the turn has left is
+    /// dropped, and the frames' word on what they cover (`plex`) is taken
+    /// off and kept for a move.
+    pub async fn feed_from(
+        &self,
+        req_id: ReqId,
+        mut chunk: Tokens,
+        from: Option<WorkerId>,
+    ) -> worker_api::Control {
         use worker_api::Control;
 
         let sink = {
@@ -320,8 +400,17 @@ impl Sessions {
             let Some(turn) = turns.get_mut(&req_id) else {
                 return Control::Abort;
             };
-            if let Tokens::Chunk(message) = &chunk {
+            if from.is_some() && turn.left.is_some() && from == turn.left {
+                return Control::Abort;
+            }
+            if let Tokens::Chunk(message) = &mut chunk {
+                take_plex(turn, message);
+                let relaunch = turn.relaunched && is_launch_answer(turn, message);
                 self.note(turn, req_id, message);
+                if relaunch {
+                    turn.relaunched = false;
+                    return Control::Continue;
+                }
             }
             turn.sink.clone()
         };
@@ -374,6 +463,43 @@ impl Sessions {
                 turn.outcome = Some(Outcome::Failed);
             }
             _ => {}
+        }
+    }
+
+    /// Moves a running turn to `target`: ends it where it runs, and launches
+    /// it again with what the client was sent, which the program continues
+    /// after under the same response id. The client's stream does not break.
+    /// The placement table already names `target`, so the dispatch goes
+    /// there.
+    pub async fn migrate(&self, req_id: ReqId, target: WorkerId) -> bool {
+        let entry = {
+            let mut turns = self.inner.turns.lock().unwrap();
+            let Some(turn) = turns.get_mut(&req_id) else {
+                return false;
+            };
+            let Some(old) = turn.worker else {
+                return false;
+            };
+            if old == target || turn.outcome.is_some() {
+                return false;
+            }
+            relaunch(turn, old);
+            (old, turn.request.clone(), turn.affinity, turn.open.clone())
+        };
+        let (old, request, affinity, open) = entry;
+        tracing::info!(req = %req_id, from = %old, to = %target, "moving a turn");
+        self.inner.router.cancel(old, req_id).await;
+        match self.inner.dispatch(req_id, &request, affinity, &open).await {
+            Ok(worker) => {
+                self.inner.router.moved(&request, Some(worker), "");
+                true
+            }
+            Err(_) => {
+                self.inner
+                    .router
+                    .moved(&request, None, "no worker took the moved turn");
+                false
+            }
         }
     }
 
@@ -510,19 +636,40 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                     .collect()
             };
 
-            for (req_id, emitted, request, affinity, open) in affected {
-                if emitted {
-                    inner.end(req_id, Outcome::Failed, By::Host);
-                    continue;
-                }
-                {
+            // A turn that has said nothing is launched again as it came; one
+            // whose frames named what they covered goes on after it, as a
+            // moved turn does; any other has said what cannot be unsaid.
+            for (req_id, _, _, affinity, open) in affected {
+                let (request, resumed) = {
                     let mut turns = inner.turns.lock().unwrap();
-                    match turns.get_mut(&req_id) {
-                        Some(turn) => turn.worker = None,
-                        None => continue,
+                    let Some(turn) = turns.get_mut(&req_id) else {
+                        continue;
+                    };
+                    let Some(old) = turn.worker else {
+                        continue;
+                    };
+                    let resumed = turn.emitted;
+                    if !turn.emitted {
+                        turn.worker = None;
+                    } else if turn.resume_id.is_some() && turn.outcome.is_none() {
+                        relaunch(turn, old);
+                        tracing::info!(req = %req_id, from = %old, "resuming a turn its worker dropped");
+                    } else {
+                        drop(turns);
+                        inner.end(req_id, Outcome::Failed, By::Host);
+                        continue;
                     }
+                    (turn.request.clone(), resumed)
+                };
+                match inner.dispatch(req_id, &request, affinity, &open).await {
+                    Ok(worker) if resumed => inner.router.moved(&request, Some(worker), ""),
+                    Err(_) if resumed => {
+                        inner
+                            .router
+                            .moved(&request, None, "no worker took the dropped turn")
+                    }
+                    _ => {}
                 }
-                let _ = inner.dispatch(req_id, &request, affinity, &open).await;
             }
         }
     });
@@ -546,6 +693,8 @@ mod tests {
         endings: Mutex<Vec<(ReqId, Outcome, By)>>,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
+        messages: Mutex<Vec<ClientMessage>>,
+        moves: Mutex<Vec<(ReqId, Option<WorkerId>)>>,
         _connected_tx: watch::Sender<Arc<HashSet<WorkerId>>>,
         connected_rx: watch::Receiver<Arc<HashSet<WorkerId>>>,
     }
@@ -566,6 +715,8 @@ mod tests {
                 endings: Mutex::new(Vec::new()),
                 entered: tokio::sync::Notify::new(),
                 release: tokio::sync::Notify::new(),
+                messages: Mutex::new(Vec::new()),
+                moves: Mutex::new(Vec::new()),
                 _connected_tx: tx,
                 connected_rx: rx,
             })
@@ -587,6 +738,7 @@ mod tests {
             affinity: Option<u64>,
         ) -> Result<WorkerId, DispatchFail> {
             self.dispatched.lock().unwrap().push(req.req_id);
+            self.messages.lock().unwrap().push(req.message.clone());
             self.affinities.lock().unwrap().push(affinity);
             if self.held.load(Ordering::Acquire) {
                 self.entered.notify_one();
@@ -615,6 +767,9 @@ mod tests {
         fn ended(&self, req: &Request, outcome: Outcome, by: By) {
             self.endings.lock().unwrap().push((req.req_id, outcome, by));
         }
+        fn moved(&self, req: &Request, worker: Option<WorkerId>, _why: &str) {
+            self.moves.lock().unwrap().push((req.req_id, worker));
+        }
     }
 
     fn launch() -> TurnInput {
@@ -626,7 +781,7 @@ mod tests {
                 capture_outputs: true,
                 props: Default::default(),
                 session: None,
-                router_props: Default::default(),
+                cluster_props: Default::default(),
             },
             blobs: Vec::new(),
             priority: Priority::Normal,
@@ -774,6 +929,101 @@ mod tests {
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_turn_its_worker_dropped_goes_on_after_what_the_client_was_sent() {
+        let router = MockRouter::new(Some(WorkerId(7)));
+        let sessions = Sessions::new(router.clone());
+        let mut turn = launch();
+        if let ClientMessage::LaunchProcess { input, .. } = &mut turn.message {
+            *input = r#"{"prompt":"hi"}"#.into();
+        }
+        let (_h, mut rx) = sessions
+            .create(ident(), turn, Affinity::Sticky)
+            .await
+            .unwrap();
+        let req = router.dispatched.lock().unwrap()[0];
+        let answer = || {
+            Tokens::Chunk(ServerMessage::Response {
+                corr_id: 4,
+                ok: true,
+                result: "p".into(),
+            })
+        };
+        let frame = |value: &str| {
+            Tokens::Chunk(ServerMessage::ProcessEvent {
+                process_id: "p".into(),
+                event: "message".into(),
+                value: value.into(),
+            })
+        };
+        sessions.feed_from(req, answer(), Some(WorkerId(7))).await;
+        sessions
+            .feed_from(
+                req,
+                frame(r#"{"text":"ab","plex":{"tokens":[1,2],"id":"cmpl-1"}}"#),
+                Some(WorkerId(7)),
+            )
+            .await;
+        rx.recv().await;
+        let Some(Tokens::Chunk(ServerMessage::ProcessEvent { value, .. })) = rx.recv().await else {
+            panic!("the frame");
+        };
+        assert_eq!(value, r#"{"text":"ab"}"#, "the client never sees `plex`");
+
+        // Worker 7 goes; 8 is all there is.
+        *router.dispatch_worker.lock().unwrap() = Some(WorkerId(8));
+        router
+            ._connected_tx
+            .send_replace(Arc::new([WorkerId(8)].into_iter().collect()));
+        settle().await;
+        assert_eq!(router.dispatched.lock().unwrap().len(), 2);
+        let relaunch = router.messages.lock().unwrap()[1].clone();
+        let ClientMessage::LaunchProcess { input, .. } = &relaunch else {
+            panic!("a launch");
+        };
+        let envelope: serde_json::Value = serde_json::from_str(input).unwrap();
+        assert_eq!(
+            envelope["resume"],
+            serde_json::json!({"id": "cmpl-1", "tokens": [1, 2]})
+        );
+        assert_eq!(*router.moves.lock().unwrap(), [(req, Some(WorkerId(8)))]);
+        assert!(
+            router.endings.lock().unwrap().is_empty(),
+            "the turn goes on"
+        );
+
+        // The new launch's answer is not heard again; its frames are.
+        sessions.feed_from(req, answer(), Some(WorkerId(8))).await;
+        sessions
+            .feed_from(req, frame(r#"{"text":"c"}"#), Some(WorkerId(8)))
+            .await;
+        let Some(Tokens::Chunk(ServerMessage::ProcessEvent { value, .. })) = rx.recv().await else {
+            panic!("the next frame");
+        };
+        assert_eq!(value, r#"{"text":"c"}"#);
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_said_what_it_cannot_resume_from_fails_with_its_worker() {
+        let router = MockRouter::new(Some(WorkerId(7)));
+        let sessions = Sessions::new(router.clone());
+        let (_h, _rx) = sessions
+            .create(ident(), launch(), Affinity::Sticky)
+            .await
+            .unwrap();
+        let req = router.dispatched.lock().unwrap()[0];
+        sessions
+            .feed_from(req, event("message"), Some(WorkerId(7)))
+            .await;
+        router._connected_tx.send_replace(Arc::new(HashSet::new()));
+        settle().await;
+        assert_eq!(
+            *router.endings.lock().unwrap(),
+            [(req, Outcome::Failed, By::Host)]
+        );
+        assert_eq!(router.dispatched.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

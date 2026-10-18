@@ -523,6 +523,48 @@ impl Engine for Group {
         self.lead(move |rank| rank.copy_state(&copy))
     }
 
+    fn host_kv_layout(&self) -> Option<state::PageLayout> {
+        let ranks = u32::try_from(self.ranks.len()).ok()?;
+        let rank = self.ranks.first()?.try_lock().ok()?;
+        let one = rank.host_kv_layout()?;
+        Some(state::PageLayout {
+            ranks,
+            page_tokens: one.page_tokens,
+            planes: one
+                .planes
+                .into_iter()
+                .map(|plane| state::Plane {
+                    heads: plane.heads * ranks,
+                    ..plane
+                })
+                .collect(),
+        })
+    }
+
+    /// Rank after rank: each holds its own heads of every slot.
+    fn read_host_kv(&mut self, slots: &[u32]) -> EngineResult<Vec<u8>> {
+        let mut out = Vec::new();
+        for rank in 0..self.ranks.len() {
+            out.extend(self.on(rank, |shell| shell.read_host_kv(slots))?);
+        }
+        Ok(out)
+    }
+
+    fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
+        let ranks = self.ranks.len();
+        if ranks == 0 || !bytes.len().is_multiple_of(ranks) {
+            return Err(Error::Device(format!(
+                "{} bytes of host kv do not split across {ranks} ranks",
+                bytes.len()
+            )));
+        }
+        let share = bytes.len() / ranks;
+        for (rank, bytes) in bytes.chunks(share).enumerate() {
+            self.on(rank, |shell| shell.write_host_kv(slots, bytes))?;
+        }
+        Ok(())
+    }
+
     fn encode(&mut self, plan: &mut MediaEncode) -> EngineResult<()> {
         self.on(0, |rank| rank.encode(plan))
     }

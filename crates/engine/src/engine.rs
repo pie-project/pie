@@ -138,6 +138,29 @@ pub trait Engine: Send + Sync {
         Err(self.unsupported("encode"))
     }
 
+    /// How [`Engine::read_host_kv`] lays out pages, when another engine of
+    /// another layout should be able to take them; `None` when this one
+    /// cannot say.
+    fn host_kv_layout(&self) -> Option<state::PageLayout> {
+        None
+    }
+
+    /// The bytes of host kv slots `slots`, one slot after another, laid out
+    /// as this engine lays a slot out, once every copy into them has landed.
+    /// What one worker's slots hold, another worker of the same layout takes
+    /// with [`Engine::write_host_kv`].
+    fn read_host_kv(&mut self, slots: &[u32]) -> Result<Vec<u8>> {
+        let _ = slots;
+        Err(self.unsupported("read_host_kv"))
+    }
+
+    /// Writes `bytes`, laid out as [`Engine::read_host_kv`] returns them, into
+    /// host kv slots `slots`.
+    fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()> {
+        let _ = (slots, bytes);
+        Err(self.unsupported("write_host_kv"))
+    }
+
     fn disconnect(&self, message: &str) {
         let _ = message;
     }

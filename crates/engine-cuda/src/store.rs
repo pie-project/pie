@@ -1687,6 +1687,137 @@ impl Pools {
         Ok(())
     }
 
+    /// How a host kv slot lays out its pages, rank by rank: each paged plane
+    /// `[token][head][dim]`, a row's keys then its values. `None` with the
+    /// compressor planes some models page beside their kv.
+    #[must_use]
+    pub fn host_kv_layout(&self, ranks: u32) -> Option<state::PageLayout> {
+        if !self.pooled.is_empty() {
+            return None;
+        }
+        let mut planes = Vec::new();
+        for shape in &self.shapes {
+            let Shape::Kv {
+                windowed: false,
+                dtype,
+                keys_width,
+                values_width,
+                head_stride,
+                ..
+            } = *shape
+            else {
+                continue;
+            };
+            for width in [keys_width, values_width] {
+                if head_stride == 0 || width % head_stride != 0 {
+                    return None;
+                }
+                planes.push(state::Plane {
+                    heads: u32::try_from(width / head_stride).ok()? * ranks,
+                    head_dim: u32::try_from(head_stride).ok()?,
+                    elem_bytes: elem_size(dtype),
+                });
+            }
+        }
+        Some(state::PageLayout {
+            ranks,
+            page_tokens: self.paging.page_size,
+            planes,
+        })
+    }
+
+    /// Bytes one host kv slot holds across the paged planes.
+    #[must_use]
+    pub fn host_kv_slot_bytes(&self) -> u64 {
+        self.paged_planes().iter().map(|&(_, bytes)| bytes).sum()
+    }
+
+    /// Where each paged plane keeps host slot `slot`, and the bytes it holds
+    /// there: the planes keep their host pages side by side.
+    fn host_kv_spans(&self, slot: u32) -> Result<Vec<(usize, usize)>> {
+        let have = self.host_pages();
+        if slot >= have {
+            return Err(Fault::Ceiling {
+                what: "host kv pages",
+                need: u64::from(slot) + 1,
+                have: u64::from(have),
+            });
+        }
+        let mut base = 0u64;
+        let mut spans = Vec::new();
+        for (_, page_bytes) in self.paged_planes() {
+            let at = base + u64::from(slot) * page_bytes;
+            spans.push((
+                usize::try_from(at).unwrap_or(usize::MAX),
+                usize::try_from(page_bytes).unwrap_or(0),
+            ));
+            base += u64::from(have) * page_bytes;
+        }
+        Ok(spans)
+    }
+
+    /// Host kv slots `slots`, one after another, each its planes in order.
+    /// The caller has synchronized every copy into them.
+    pub fn read_host_kv(&self, slots: &[u32]) -> Result<Vec<u8>> {
+        let Some(host) = self.host.as_ref() else {
+            return Err(Fault::Ceiling {
+                what: "host kv pages",
+                need: 1,
+                have: 0,
+            });
+        };
+        let slot_bytes = usize::try_from(self.host_kv_slot_bytes()).unwrap_or(0);
+        let mut out = Vec::with_capacity(slots.len() * slot_bytes);
+        for &slot in slots {
+            for (at, len) in self.host_kv_spans(slot)? {
+                let span = host
+                    .buffer
+                    .view(at as u64, len as u64)
+                    .ok_or(Fault::Ceiling {
+                        what: "bytes of the host kv buffer",
+                        need: (at + len) as u64,
+                        have: host.buffer.bytes() as u64,
+                    })?;
+                out.extend_from_slice(span);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Writes `bytes`, as [`Self::read_host_kv`] lays them out, into host kv
+    /// slots `slots`.
+    pub fn write_host_kv(&self, slots: &[u32], bytes: &[u8]) -> Result<()> {
+        let slot_bytes = usize::try_from(self.host_kv_slot_bytes()).unwrap_or(0);
+        if bytes.len() != slots.len() * slot_bytes {
+            return Err(Fault::Ceiling {
+                what: "bytes of host kv slots",
+                need: (slots.len() * slot_bytes) as u64,
+                have: bytes.len() as u64,
+            });
+        }
+        let Some(host) = self.host.as_ref() else {
+            return Err(Fault::Ceiling {
+                what: "host kv pages",
+                need: 1,
+                have: 0,
+            });
+        };
+        let mut from = 0;
+        for &slot in slots {
+            for (at, len) in self.host_kv_spans(slot)? {
+                if !host.buffer.write(at, &bytes[from..from + len]) {
+                    return Err(Fault::Ceiling {
+                        what: "bytes into the host kv buffer",
+                        need: (at + len) as u64,
+                        have: host.buffer.bytes() as u64,
+                    });
+                }
+                from += len;
+            }
+        }
+        Ok(())
+    }
+
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
         if !slab_row(self.has_state(), self.paging.slots, slot)? {
             return Ok(Vec::new());

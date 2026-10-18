@@ -1,6 +1,6 @@
 # Earliest deadline first: a process given `deadline-ms` is due that long
 # after it arrives, and the soonest due runs first.
-plane = "engine"
+plane = "worker"
 subscribe = ["arrived", "prop-changed"]
 grants = ["schedule"]
 

@@ -113,6 +113,26 @@ pub fn kv_tokens() -> (u64, u64) {
     (capacity, used)
 }
 
+/// Device kv pages of model 0's first engine, by what holds them: free,
+/// idle cache a reclaim would free now, the rest (working sets and pages
+/// pinned by readers or moves), and the total. For the contention trace.
+pub fn kv_census() -> (usize, usize, usize, usize) {
+    let Some(stores) = registry::try_get(0, 0) else {
+        return (0, 0, 0, 0);
+    };
+    registry::with_kv_lock(&stores.kv, "other", |kv| {
+        let total = kv.capacity_pages() as usize;
+        let free = kv.available_pages();
+        let idle = kv.reclaimable_cache_pages() as usize;
+        (
+            free,
+            idle,
+            total.saturating_sub(free).saturating_sub(idle),
+            total,
+        )
+    })
+}
+
 pub fn kv_pressure_bucket() -> u8 {
     if let Some(planner) = crate::planner::planner() {
         return planner.kv_pressure_bucket();

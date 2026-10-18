@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
+state = { path = "../state" }
 
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir", features = ["serde"] }
 

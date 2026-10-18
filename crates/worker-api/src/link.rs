@@ -68,15 +68,17 @@ where
         drop(server_sink);
         drop(client_sink);
         match res {
-            Ok(()) => {}
+            Ok(()) => tracing::debug!("the link's peer closed it"),
             Err(ChannelOrIoError::Channel(e)) => {
                 tracing::debug!("mux half closed, tearing the link down: {e}");
             }
-            Err(ChannelOrIoError::Io(e)) => {
-                tracing::warn!("inbound mux error: {e}");
-                abort_handle.abort();
-            }
+            Err(ChannelOrIoError::Io(e)) => tracing::warn!("inbound mux error: {e}"),
         }
+        // However the inbound side ends, the outbound goes too: it holds the
+        // channels' other halves, and until they drop neither the server nor
+        // the client here sees the link gone (a client kept anywhere, as a
+        // registry keeps one, would keep a dead link looking alive).
+        abort_handle.abort();
     });
 
     let outbound = Abortable::new(

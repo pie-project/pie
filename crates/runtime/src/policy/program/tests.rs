@@ -15,6 +15,8 @@ fn spelled(of: &Subject) -> String {
         Subject::Process(id) => format!("process:{id}"),
         Subject::WorkingSet(id) => format!("working-set:{id}"),
         Subject::Worker(id) => format!("worker:{id}"),
+        Subject::Group(id) => format!("group:{id}"),
+        Subject::Link(id) => format!("link:{id}"),
     }
 }
 
@@ -86,9 +88,9 @@ fn arrived(process: &str) -> Vec<Edge> {
 }
 
 #[test]
-fn every_built_in_policy_loads_and_imports_no_router_writes() {
+fn every_built_in_policy_loads_and_imports_no_cluster_writes() {
     for builtin in builtins::policies() {
-        // A router policy is the gateway's to load.
+        // A cluster policy is the gateway's to load.
         if let Err(ManifestError::WrongPlane(_)) = Manifest::of(builtin.component, &|_| true) {
             continue;
         }
@@ -100,7 +102,9 @@ fn every_built_in_policy_loads_and_imports_no_router_writes() {
             .map(|(name, _)| name.to_string())
             .collect();
         assert!(
-            !imports.iter().any(|name| name.contains("router-writes")),
+            !imports
+                .iter()
+                .any(|name| name.contains("cluster-writes") || name.contains("state-writes")),
             "{}: {imports:?}",
             program.name()
         );
@@ -215,7 +219,7 @@ fn keep_session_keeps_a_session_s_latest_turn_until_it_is_due() {
 }
 
 #[test]
-fn priority_keys_what_the_router_ranked_else_what_the_client_did() {
+fn priority_keys_what_the_cluster_ranked_else_what_the_client_did() {
     let mut program = load("priority");
     let plane = Fake::default()
         .with("a", &[("priority", Value::Int(5))])
@@ -225,7 +229,7 @@ fn priority_keys_what_the_router_ranked_else_what_the_client_did() {
             "d",
             &[
                 ("priority", Value::Int(9)),
-                ("router/priority", Value::Int(1)),
+                ("cluster/priority", Value::Int(1)),
             ],
         );
     let commit = program.react(Box::new(plane), arrived("a"), 0).unwrap();
@@ -233,7 +237,7 @@ fn priority_keys_what_the_router_ranked_else_what_the_client_did() {
     assert_eq!(schedule.key("a"), 5);
     assert_eq!(schedule.key("b"), 0);
     assert_eq!(schedule.key("c"), -3);
-    assert_eq!(schedule.key("d"), 1, "the router's rank wins");
+    assert_eq!(schedule.key("d"), 1, "the cluster's rank wins");
     assert_eq!(schedule.keys.len(), 3, "only ranked processes are named");
     assert_eq!(schedule.floor, None);
 }

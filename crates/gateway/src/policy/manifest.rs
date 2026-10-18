@@ -21,9 +21,25 @@ const EDGES: &[&str] = &[
     "dispatched",
     "worker-removed",
     "worker-draining",
+    "migrated",
+    "migration-failed",
+    "copied",
+    "dropped",
+    "tier-pressure",
+    "link-changed",
 ];
 
-const GRANTS: &[&str] = &["schedule", "placement", "terminate"];
+const GRANTS: &[&str] = &[
+    "schedule",
+    "placement",
+    "scale",
+    "terminate",
+    "replication",
+    "retention",
+    "transfer-shares",
+    "acceptance",
+    "discard",
+];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -39,7 +55,7 @@ pub struct Manifest {
     pub uses: Vec<String>,
     #[serde(default = "default_deadline_ms")]
     pub deadline_ms: u64,
-    /// 0 never waits; past it the router dispatches by its default.
+    /// 0 never waits; past it the gateway dispatches by its default.
     #[serde(default)]
     pub gate_ms: u64,
     /// For discovery; never enforced.
@@ -62,19 +78,19 @@ fn default_deadline_ms() -> u64 {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
-    #[error("the component has no `{SECTION}` section: was it exported with `policy::router!`?")]
+    #[error("the component has no `{SECTION}` section: was it exported with `policy::cluster!`?")]
     Missing,
     #[error("`{SECTION}` is not UTF-8")]
     NotText,
     #[error("`{SECTION}` does not parse: {0}")]
     Parse(#[from] toml::de::Error),
-    #[error("plane is `{0}`, and this host runs router policies")]
+    #[error("plane is `{0}`, and this host runs cluster policies")]
     WrongPlane(String),
-    #[error("a router host has no edge `{0}`")]
+    #[error("a cluster host has no edge `{0}`")]
     UnknownEdge(String),
     #[error("no write is granted by `{0}`")]
     UnknownGrant(String),
-    #[error("a router host has no capability `{0}`")]
+    #[error("a cluster host has no capability `{0}`")]
     UnknownCapability(String),
     #[error("the program requires `{0}`, which this gateway does not have")]
     Unmet(String),
@@ -94,7 +110,7 @@ impl Manifest {
     }
 
     fn check(&self, capability: &dyn Fn(&str) -> bool) -> Result<(), ManifestError> {
-        if self.plane != "router" {
+        if self.plane != "cluster" {
             return Err(ManifestError::WrongPlane(self.plane.clone()));
         }
         if let Some(edge) = self.subscribe.iter().find(|e| !EDGES.contains(&e.as_str())) {
@@ -147,13 +163,13 @@ mod tests {
 
     fn parse(text: &str) -> Result<Manifest, ManifestError> {
         let manifest: Manifest = toml::from_str(text)?;
-        manifest.check(&|name| name != "router.hold")?;
+        manifest.check(&|name| name != "cluster.hold")?;
         Ok(manifest)
     }
 
     #[test]
-    fn a_minimal_router_manifest_takes_the_defaults() {
-        let manifest = parse(r#"plane = "router""#).unwrap();
+    fn a_minimal_cluster_manifest_takes_the_defaults() {
+        let manifest = parse(r#"plane = "cluster""#).unwrap();
         assert_eq!(manifest.deadline_ms, DEFAULT_DEADLINE_MS);
         assert_eq!(manifest.gate_ms, 0, "no gate unless asked");
         assert!(manifest.subscribes("timer"));
@@ -161,25 +177,28 @@ mod tests {
     }
 
     #[test]
-    fn what_a_router_host_cannot_honour_is_refused() {
+    fn what_a_cluster_host_cannot_honour_is_refused() {
         let cases = [
-            (r#"plane = "engine""#, "WrongPlane"),
+            (r#"plane = "worker""#, "WrongPlane"),
             (
-                "plane = \"router\"\nsubscribe = [\"started\"]",
+                "plane = \"cluster\"\nsubscribe = [\"started\"]",
                 "UnknownEdge",
             ),
             (
-                "plane = \"router\"\ngrants = [\"retention\"]",
+                "plane = \"cluster\"\ngrants = [\"offload\"]",
                 "UnknownGrant",
             ),
             (
-                "plane = \"router\"\nuses = [\"schedule.admit\"]",
+                "plane = \"cluster\"\nuses = [\"schedule.admit\"]",
                 "UnknownCapability",
             ),
-            ("plane = \"router\"\nrequires = [\"router.hold\"]", "Unmet"),
-            ("plane = \"router\"\ndeadline-ms = 0", "Deadline"),
-            ("plane = \"router\"\ngate-ms = 5000", "Gate"),
-            ("plane = \"router\"\ngate-fail = \"open\"", "Parse"),
+            (
+                "plane = \"cluster\"\nrequires = [\"cluster.hold\"]",
+                "Unmet",
+            ),
+            ("plane = \"cluster\"\ndeadline-ms = 0", "Deadline"),
+            ("plane = \"cluster\"\ngate-ms = 5000", "Gate"),
+            ("plane = \"cluster\"\ngate-fail = \"open\"", "Parse"),
         ];
         for (text, want) in cases {
             let got = format!("{:?}", parse(text).unwrap_err());

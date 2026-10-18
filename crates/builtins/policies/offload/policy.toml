@@ -1,0 +1,15 @@
+# Sends a long pass's prefill to a peer worker: every pass with at least
+# 1024 uncached tokens by default; a process's `offload` prop says
+# otherwise.
+plane = "worker"
+subscribe = ["arrived", "prop-changed", "exited"]
+grants = ["offload"]
+uses = ["offload.remote"]
+
+[props.offload]
+type = "text"
+doc = "`never`, `always` or `cost` (the default): where this process's passes run."
+
+[props.offload-min-tokens]
+type = "int"
+doc = "Fewer uncached tokens than this stay home. Default 1024, or 0 with `always`."

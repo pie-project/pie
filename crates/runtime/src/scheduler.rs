@@ -115,6 +115,54 @@ pub(crate) fn scheduler_handle(engine_id: usize) -> Result<SchedulerHandle> {
         .ok_or_else(|| anyhow!("engine {engine_id} has no scheduler"))
 }
 
+/// Device pages `device` copied into host slots `slots`, and those slots'
+/// bytes.
+pub(crate) async fn read_device_kv(
+    engine_id: usize,
+    device: Vec<u32>,
+    slots: Vec<u32>,
+) -> Result<Vec<u8>> {
+    let copy = ::engine::KvCopy {
+        src: device_domain(engine_id),
+        dst: ::engine::MemoryDomain::HostPinned,
+        src_page_ids: device,
+        dst_page_ids: slots.clone(),
+        moves: Vec::new(),
+        windowed: Vec::new(),
+    };
+    scheduler_handle(engine_id)?
+        .host_kv(worker::HostKvOp::CopyRead(copy, slots))
+        .await
+}
+
+pub(crate) async fn write_host_kv(engine_id: usize, slots: Vec<u32>, bytes: Vec<u8>) -> Result<()> {
+    scheduler_handle(engine_id)?
+        .host_kv(worker::HostKvOp::Write(slots, bytes))
+        .await
+        .map(drop)
+}
+
+/// The engine's host-tier layout, once asked.
+pub(crate) async fn host_kv_layout(engine_id: usize) -> Option<state::PageLayout> {
+    static LAYOUTS: std::sync::Mutex<Vec<Option<Option<state::PageLayout>>>> =
+        std::sync::Mutex::new(Vec::new());
+    if let Some(Some(known)) = LAYOUTS.lock().unwrap().get(engine_id) {
+        return known.clone();
+    }
+    let bytes = scheduler_handle(engine_id)
+        .ok()?
+        .host_kv(worker::HostKvOp::Layout)
+        .await
+        .ok()?;
+    let layout: Option<state::PageLayout> = serde_json::from_slice(&bytes).ok();
+    let mut layouts = LAYOUTS.lock().unwrap();
+    if layouts.len() <= engine_id {
+        layouts.resize(engine_id + 1, None);
+    }
+    layouts[engine_id] = Some(layout.clone());
+    layout
+}
+
 pub async fn debug_dump(engine_id: usize) -> Result<String> {
     scheduler_handle(engine_id)?.debug_dump().await
 }

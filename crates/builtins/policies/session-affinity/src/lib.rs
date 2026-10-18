@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use policy::{Dispatch, Exit, Id, Placement, Subject, SubjectKind, attr, candidates, router};
+use policy::{Dispatch, Exit, Id, Placement, Subject, SubjectKind, attr, candidates, cluster};
 
 const IDLE_MS: u64 = 60 * 60 * 1000;
 
@@ -14,7 +14,7 @@ struct SessionAffinity {
     dispatched: Vec<(String, Id)>,
 }
 
-impl router::Policy for SessionAffinity {
+impl cluster::Policy for SessionAffinity {
     fn on_arrived(&mut self, process: &Id) {
         if let Some(session) = attr(&Subject::Process(process.clone()), "session").text() {
             self.processes.insert(process.clone(), session.to_string());
@@ -51,12 +51,13 @@ impl router::Policy for SessionAffinity {
                 Some(Placement {
                     process: p,
                     worker: Some(worker.clone()),
+                    executors: Vec::new(),
                     props: Vec::new(),
                 })
             })
             .collect();
-        router::install_placement(&placements);
+        cluster::install_placement(&placements);
     }
 }
 
-policy::router!(SessionAffinity);
+policy::cluster!(SessionAffinity);

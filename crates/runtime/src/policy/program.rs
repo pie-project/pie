@@ -20,13 +20,13 @@ use super::manifest::{Manifest, ManifestError};
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
         path: "../policy/wit",
-        world: "engine",
+        world: "worker",
         exports: { default: async },
     });
 }
 
-use bindings::plex::policy::{engine_writes, reads, types, writes};
-use types::{Edge, Retain, Subject, SubjectKind, Value};
+use bindings::plex::policy::{reads, types, worker_writes, writes};
+use types::{Edge, Offload, Retain, Subject, SubjectKind, Value};
 
 const TICK: Duration = Duration::from_millis(1);
 const MEMORY_BYTES: usize = 64 << 20;
@@ -130,6 +130,14 @@ impl Retention {
     }
 }
 
+/// Where each process's passes may run: `default` for every process no entry
+/// names.
+#[derive(Debug, Clone, Default)]
+pub struct Offloads {
+    pub entries: HashMap<String, Offload>,
+    pub default: Option<Offload>,
+}
+
 /// `None`: not installed by this call; the one before it still stands.
 #[derive(Debug, Default)]
 pub struct Commit {
@@ -137,6 +145,9 @@ pub struct Commit {
     pub retention: Option<Retention>,
     pub terminate: Vec<(String, String)>,
     pub discard: Vec<String>,
+    pub offload: Option<Offloads>,
+    /// `(subject, name, value)`, in call order; `None` withdraws.
+    pub publish: Vec<(Subject, String, Option<Value>)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -163,9 +174,9 @@ pub enum LoadError {
 pub struct Program {
     name: String,
     manifest: Manifest,
-    pre: bindings::EnginePre<HostState>,
+    pre: bindings::WorkerPre<HostState>,
     store: Store<HostState>,
-    instance: bindings::Engine,
+    instance: bindings::Worker,
     alarm: Option<u64>,
 }
 
@@ -185,11 +196,11 @@ impl Program {
         // is empty.
         wasmtime_wasi::p3::add_to_linker(&mut linker)
             .map_err(|e| LoadError::Instantiate(format!("{e:#}")))?;
-        bindings::Engine::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+        bindings::Worker::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(|e| LoadError::Instantiate(format!("{e:#}")))?;
         let pre = linker
             .instantiate_pre(&component)
-            .and_then(bindings::EnginePre::new)
+            .and_then(bindings::WorkerPre::new)
             .map_err(|e| LoadError::Instantiate(format!("{e:#}")))?;
 
         let (store, instance) = start(&pre, name, &manifest).map_err(LoadError::Instantiate)?;
@@ -273,6 +284,8 @@ impl Program {
             retention: staged.retention,
             terminate: staged.terminate,
             discard: staged.discard,
+            offload: staged.offload,
+            publish: staged.publish,
         }
     }
 
@@ -286,10 +299,10 @@ impl Program {
 }
 
 fn start(
-    pre: &bindings::EnginePre<HostState>,
+    pre: &bindings::WorkerPre<HostState>,
     name: &str,
     manifest: &Manifest,
-) -> Result<(Store<HostState>, bindings::Engine), String> {
+) -> Result<(Store<HostState>, bindings::Worker), String> {
     let mut store = Store::new(pre.engine(), HostState::new(name, manifest));
     store.limiter(|state| &mut state.limits);
     // A component's initializers are guest code, bounded like any call.
@@ -385,6 +398,14 @@ fn edge_name(edge: &Edge) -> &'static str {
         Edge::Paused(_) => "paused",
         Edge::Retained(_) => "retained",
         Edge::Discarded(_) => "discarded",
+        Edge::Migrated(_) => "migrated",
+        Edge::MigrationFailed(_) => "migration-failed",
+        Edge::Copied(_) => "copied",
+        Edge::Dropped(_) => "dropped",
+        Edge::TierPressure(_) => "tier-pressure",
+        Edge::LinkChanged(_) => "link-changed",
+        Edge::Offloaded(_) => "offloaded",
+        Edge::OffloadFailed(_) => "offload-failed",
     }
 }
 
@@ -393,6 +414,8 @@ struct Grants {
     retention: bool,
     terminate: bool,
     discard: bool,
+    offload: bool,
+    publish: bool,
 }
 
 struct HostState {
@@ -416,6 +439,8 @@ impl HostState {
                 retention: manifest.grants("retention"),
                 terminate: manifest.grants("terminate"),
                 discard: manifest.grants("discard"),
+                offload: manifest.grants("offload"),
+                publish: manifest.grants("publish"),
             },
             call: None,
         }
@@ -430,7 +455,7 @@ impl HostState {
     /// Stages a write, or logs why it was not taken.
     fn write(&mut self, verb: &str, write: impl FnOnce(&mut Self) -> Result<(), Refusal>) {
         if let Err(why) = write(self) {
-            tracing::warn!(policy = %self.name, verb, %why, "engine policy write refused");
+            tracing::warn!(policy = %self.name, verb, %why, "worker policy write refused");
         }
     }
 }
@@ -464,6 +489,8 @@ struct Staged {
     retention: Option<Retention>,
     terminate: Vec<(String, String)>,
     discard: Vec<String>,
+    offload: Option<Offloads>,
+    publish: Vec<(Subject, String, Option<Value>)>,
     alarm: Option<u64>,
 }
 
@@ -511,7 +538,7 @@ impl writes::Host for HostState {
     }
 }
 
-impl engine_writes::Host for HostState {
+impl worker_writes::Host for HostState {
     fn install_schedule(&mut self, entries: Vec<(String, i64)>, floor: Option<i64>) {
         self.write("install-schedule", |state| {
             if !state.grants.schedule {
@@ -544,6 +571,49 @@ impl engine_writes::Host for HostState {
                 return Err(Refusal::WrongState);
             }
             call.staged.discard.push(working_set);
+            Ok(())
+        });
+    }
+
+    fn install_offload(&mut self, entries: Vec<(String, Offload)>, default: Option<Offload>) {
+        self.write("install-offload", |state| {
+            if !state.grants.offload {
+                return Err(Refusal::NotGranted);
+            }
+            if entries.len() > MAX_ENTRIES {
+                return Err(Refusal::TooLarge);
+            }
+            let mut table = HashMap::with_capacity(entries.len());
+            for (process, offload) in entries {
+                match table.entry(process) {
+                    Entry::Occupied(_) => return Err(Refusal::DuplicateSubject),
+                    Entry::Vacant(slot) => {
+                        slot.insert(offload);
+                    }
+                }
+            }
+            state.call()?.staged.offload = Some(Offloads {
+                entries: table,
+                default,
+            });
+            Ok(())
+        });
+    }
+
+    fn publish(&mut self, of: Subject, name: String, val: Option<Value>) {
+        self.write("publish", |state| {
+            if !state.grants.publish {
+                return Err(Refusal::NotGranted);
+            }
+            // This worker, or a process on it.
+            if !matches!(of, Subject::Worker(_) | Subject::Process(_)) {
+                return Err(Refusal::WrongState);
+            }
+            let call = state.call()?;
+            if call.staged.publish.len() >= MAX_ENTRIES {
+                return Err(Refusal::TooLarge);
+            }
+            call.staged.publish.push((of, name, val));
             Ok(())
         });
     }

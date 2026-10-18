@@ -20,13 +20,15 @@ use super::manifest::{Manifest, ManifestError};
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
         path: "../policy/wit",
-        world: "router",
+        world: "cluster",
         exports: { default: async },
     });
 }
 
-use bindings::plex::policy::{reads, router_writes, types, writes};
-use types::{Edge, Placement, Subject, SubjectKind, Value};
+use bindings::plex::policy::{cluster_writes, reads, state_writes, types, writes};
+use types::{
+    Accept, Edge, Placement, Replicate, Scale, Subject, SubjectKind, TransferClass, Value,
+};
 
 const TICK: Duration = Duration::from_millis(1);
 const MEMORY_BYTES: usize = 64 << 20;
@@ -83,12 +85,25 @@ fn by_subject<T>(entries: Vec<(String, T)>) -> Result<HashMap<String, T>, Refusa
     Ok(table)
 }
 
+/// The state tables a call installed. Each is enacted only as far as its
+/// capability (`state.*`) says, and a policy reads `capability` to know.
+#[derive(Debug, Default)]
+pub struct StateCommit {
+    pub replication: Option<Vec<Replicate>>,
+    pub retention: Option<Table>,
+    pub transfer_shares: Option<Vec<(TransferClass, u32)>>,
+    pub acceptance: Option<Vec<Accept>>,
+    pub discard: Vec<String>,
+}
+
 /// `None`: not installed by this call; the one before it still stands.
 #[derive(Debug, Default)]
 pub struct Commit {
     pub schedule: Option<Table>,
     pub placement: Option<HashMap<String, Placement>>,
+    pub scale: Option<Vec<Scale>>,
     pub terminate: Vec<(String, String)>,
+    pub state: StateCommit,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -115,9 +130,9 @@ pub enum LoadError {
 pub struct Program {
     name: String,
     manifest: Manifest,
-    pre: bindings::RouterPre<HostState>,
+    pre: bindings::ClusterPre<HostState>,
     store: Store<HostState>,
-    instance: bindings::Router,
+    instance: bindings::Cluster,
     alarm: Option<u64>,
 }
 
@@ -137,11 +152,11 @@ impl Program {
         // is empty.
         wasmtime_wasi::p3::add_to_linker(&mut linker)
             .map_err(|e| LoadError::Instantiate(format!("{e:#}")))?;
-        bindings::Router::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+        bindings::Cluster::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(|e| LoadError::Instantiate(format!("{e:#}")))?;
         let pre = linker
             .instantiate_pre(&component)
-            .and_then(bindings::RouterPre::new)
+            .and_then(bindings::ClusterPre::new)
             .map_err(|e| LoadError::Instantiate(format!("{e:#}")))?;
 
         let (store, instance) = start(&pre, name, &manifest).map_err(LoadError::Instantiate)?;
@@ -223,7 +238,9 @@ impl Program {
         Commit {
             schedule: staged.schedule,
             placement: staged.placement,
+            scale: staged.scale,
             terminate: staged.terminate,
+            state: staged.state,
         }
     }
 
@@ -237,10 +254,10 @@ impl Program {
 }
 
 fn start(
-    pre: &bindings::RouterPre<HostState>,
+    pre: &bindings::ClusterPre<HostState>,
     name: &str,
     manifest: &Manifest,
-) -> Result<(Store<HostState>, bindings::Router), String> {
+) -> Result<(Store<HostState>, bindings::Cluster), String> {
     let mut store = Store::new(pre.engine(), HostState::new(name, manifest));
     store.limiter(|state| &mut state.limits);
     // A component's initializers are guest code, bounded like any call.
@@ -295,7 +312,7 @@ fn ticks(deadline_ms: u64) -> u64 {
     deadline_ms.div_ceil(TICK.as_millis() as u64) + 1
 }
 
-/// The router's own engine, apart from any the process hosts inferlets on:
+/// The cluster plane's own engine, apart from any the process hosts inferlets on:
 /// epoch interruption there would put a deadline on every inferlet store.
 pub(super) fn engine() -> &'static wasmtime::Engine {
     static ENGINE: OnceLock<wasmtime::Engine> = OnceLock::new();
@@ -310,7 +327,7 @@ pub(super) fn engine() -> &'static wasmtime::Engine {
         let engine = wasmtime::Engine::new(&config).expect("the policy engine's configuration");
         let ticker = engine.clone();
         std::thread::Builder::new()
-            .name("pie-router-epoch".into())
+            .name("pie-cluster-epoch".into())
             .spawn(move || {
                 loop {
                     std::thread::sleep(TICK);
@@ -332,17 +349,31 @@ fn edge_name(edge: &Edge) -> &'static str {
         Edge::Dispatched(_) => "dispatched",
         Edge::WorkerRemoved(_) => "worker-removed",
         Edge::WorkerDraining(_) => "worker-draining",
+        Edge::Migrated(_) => "migrated",
+        Edge::MigrationFailed(_) => "migration-failed",
+        Edge::Copied(_) => "copied",
+        Edge::Dropped(_) => "dropped",
+        Edge::TierPressure(_) => "tier-pressure",
+        Edge::LinkChanged(_) => "link-changed",
         Edge::Started(_) => "started",
         Edge::Paused(_) => "paused",
         Edge::Retained(_) => "retained",
         Edge::Discarded(_) => "discarded",
+        Edge::Offloaded(_) => "offloaded",
+        Edge::OffloadFailed(_) => "offload-failed",
     }
 }
 
 struct Grants {
     schedule: bool,
     placement: bool,
+    scale: bool,
     terminate: bool,
+    replication: bool,
+    retention: bool,
+    transfer_shares: bool,
+    acceptance: bool,
+    discard: bool,
 }
 
 struct HostState {
@@ -364,7 +395,13 @@ impl HostState {
             grants: Grants {
                 schedule: manifest.grants("schedule"),
                 placement: manifest.grants("placement"),
+                scale: manifest.grants("scale"),
                 terminate: manifest.grants("terminate"),
+                replication: manifest.grants("replication"),
+                retention: manifest.grants("retention"),
+                transfer_shares: manifest.grants("transfer-shares"),
+                acceptance: manifest.grants("acceptance"),
+                discard: manifest.grants("discard"),
             },
             call: None,
         }
@@ -379,7 +416,7 @@ impl HostState {
     /// Stages a write, or logs why it was not taken.
     fn write(&mut self, verb: &str, write: impl FnOnce(&mut Self) -> Result<(), Refusal>) {
         if let Err(why) = write(self) {
-            tracing::warn!(policy = %self.name, verb, %why, "router policy write refused");
+            tracing::warn!(policy = %self.name, verb, %why, "cluster policy write refused");
         }
     }
 }
@@ -411,7 +448,9 @@ impl Call {
 struct Staged {
     schedule: Option<Table>,
     placement: Option<HashMap<String, Placement>>,
+    scale: Option<Vec<Scale>>,
     terminate: Vec<(String, String)>,
+    state: StateCommit,
     alarm: Option<u64>,
 }
 
@@ -459,7 +498,7 @@ impl writes::Host for HostState {
     }
 }
 
-impl router_writes::Host for HostState {
+impl cluster_writes::Host for HostState {
     fn install_schedule(&mut self, entries: Vec<(String, i64)>, floor: Option<i64>) {
         self.write("install-schedule", |state| {
             if !state.grants.schedule {
@@ -479,6 +518,90 @@ impl router_writes::Host for HostState {
             let entries = entries.into_iter().map(|p| (p.process.clone(), p));
             let table = by_subject(entries.collect())?;
             state.call()?.staged.placement = Some(table);
+            Ok(())
+        });
+    }
+
+    fn install_scale(&mut self, entries: Vec<Scale>) {
+        self.write("install-scale", |state| {
+            if !state.grants.scale {
+                return Err(Refusal::NotGranted);
+            }
+            if entries.len() > MAX_ENTRIES {
+                return Err(Refusal::TooLarge);
+            }
+            let shapes = entries.iter().map(|s| (s.model.clone(), s.engine.clone()));
+            if shapes.collect::<std::collections::HashSet<_>>().len() != entries.len() {
+                return Err(Refusal::DuplicateSubject);
+            }
+            state.call()?.staged.scale = Some(entries);
+            Ok(())
+        });
+    }
+}
+
+impl state_writes::Host for HostState {
+    fn install_replication(&mut self, entries: Vec<Replicate>) {
+        self.write("install-replication", |state| {
+            if !state.grants.replication {
+                return Err(Refusal::NotGranted);
+            }
+            if entries.len() > MAX_ENTRIES {
+                return Err(Refusal::TooLarge);
+            }
+            let groups = entries.iter().map(|r| (r.group.clone(), r.upto));
+            if groups.collect::<std::collections::HashSet<_>>().len() != entries.len() {
+                return Err(Refusal::DuplicateSubject);
+            }
+            state.call()?.staged.state.replication = Some(entries);
+            Ok(())
+        });
+    }
+
+    fn install_retention(&mut self, entries: Vec<(String, i64)>) {
+        self.write("install-retention", |state| {
+            if !state.grants.retention {
+                return Err(Refusal::NotGranted);
+            }
+            let keys = by_subject(entries)?;
+            state.call()?.staged.state.retention = Some(Table { keys, floor: None });
+            Ok(())
+        });
+    }
+
+    fn install_transfer_shares(&mut self, entries: Vec<(TransferClass, u32)>) {
+        self.write("install-transfer-shares", |state| {
+            if !state.grants.transfer_shares {
+                return Err(Refusal::NotGranted);
+            }
+            let classes = entries.iter().map(|(class, _)| *class as u8);
+            if classes.collect::<std::collections::HashSet<_>>().len() != entries.len() {
+                return Err(Refusal::DuplicateSubject);
+            }
+            state.call()?.staged.state.transfer_shares = Some(entries);
+            Ok(())
+        });
+    }
+
+    fn install_acceptance(&mut self, entries: Vec<Accept>) {
+        self.write("install-acceptance", |state| {
+            if !state.grants.acceptance {
+                return Err(Refusal::NotGranted);
+            }
+            if entries.len() > MAX_ENTRIES {
+                return Err(Refusal::TooLarge);
+            }
+            state.call()?.staged.state.acceptance = Some(entries);
+            Ok(())
+        });
+    }
+
+    fn discard(&mut self, group: String) {
+        self.write("discard", |state| {
+            if !state.grants.discard {
+                return Err(Refusal::NotGranted);
+            }
+            state.call()?.staged.state.discard.push(group);
             Ok(())
         });
     }

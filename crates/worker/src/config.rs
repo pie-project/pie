@@ -176,6 +176,18 @@ pub struct OffloadConfig {
     /// shipped build hosts NIXL, so `nixl` refuses the boot.
     #[serde(default)]
     pub transfer: OffloadTransfer,
+    /// Where this worker serves other workers' passes (`host:port`); omit to
+    /// serve none.
+    #[serde(default)]
+    pub listen: Option<String>,
+    /// Workers to prefill this worker's passes on, by their `listen`
+    /// address. The first that serves this model in this class is taken.
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// Pool workers (`pie-pool`) to send every run this worker keeps to, by
+    /// their bulk address.
+    #[serde(default)]
+    pub pools: Vec<String>,
 }
 
 impl Default for OffloadConfig {
@@ -185,6 +197,9 @@ impl Default for OffloadConfig {
             prefill_min_suffix_tokens: 0,
             max_outstanding_per_partner: default_offload_max_outstanding(),
             transfer: OffloadTransfer::Auto,
+            listen: None,
+            peers: Vec::new(),
+            pools: Vec::new(),
         }
     }
 }
@@ -272,8 +287,8 @@ pub struct ServerConfig {
     /// Largest blob a client may upload in one request.
     #[serde(default = "default_max_upload")]
     pub max_upload: ByteSize,
-    /// A built-in policy's name or a component path; omit to run none. The
-    /// engine's own is `[runtime] policy`.
+    /// The cluster-plane PLEX policy: a built-in policy's name or a component
+    /// path; omit to run none. The worker plane's is `[runtime] policy`.
     #[serde(default)]
     pub policy: Option<String>,
 }
@@ -506,8 +521,10 @@ pub struct ModelConfig {
     /// How many pinned host bytes a preempted process's kv pages and
     /// recurrent-state slots may be suspended into (`"32GiB"`), shared by
     /// the tensor-parallel ranks: one rs row per device slot, then kv pages.
-    /// Omit for every seat at full context, and at least one device pool;
-    /// either is capped by the host memory the load leaves free. pie cannot
+    /// Omit for every seat at full context, and at least one device pool,
+    /// up to half the host memory the load leaves free (so workers sharing
+    /// a host each find room); a stated budget is capped by all of it. The
+    /// container's cgroup limit (v1 or v2) counts as the host's. pie cannot
     /// compute kv again, so this is where memory contention goes: it cannot
     /// be turned off.
     #[serde(default)]
@@ -870,8 +887,8 @@ pub struct RuntimeConfig {
     /// engine's `max_forward_requests`, which is what fills a batch.
     #[serde(default)]
     pub max_concurrent_processes: Option<usize>,
-    /// A built-in policy's name (`noop`, `priority`) or a component path; omit
-    /// to run none.
+    /// The worker-plane PLEX policy: a built-in policy's name (`noop`,
+    /// `priority`) or a component path; omit to run none.
     #[serde(default)]
     pub policy: Option<String>,
 }

@@ -1,12 +1,12 @@
 //! Earliest deadline first, `deadline-ms` after arrival; processes without one
 //! run after those with one.
 
-use policy::{Subject, SubjectKind, attr, candidates, engine, prop};
+use policy::{Subject, SubjectKind, attr, candidates, prop, worker};
 
 #[derive(Default)]
 struct Deadline;
 
-impl engine::Policy for Deadline {
+impl worker::Policy for Deadline {
     fn plan(&mut self, _now_ms: u64) {
         let entries: Vec<_> = candidates(SubjectKind::Process)
             .into_iter()
@@ -18,8 +18,8 @@ impl engine::Policy for Deadline {
                 Some((p, i64::MAX - due.max(0)))
             })
             .collect();
-        engine::install_schedule(&entries, None);
+        worker::install_schedule(&entries, None);
     }
 }
 
-policy::engine!(Deadline);
+policy::worker!(Deadline);

@@ -391,8 +391,9 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
     let stream = req.stream;
 
     // The role rides on the first delta, as the open servers send it: an
-    // empty role chunk ahead of the prefill would read as the first token.
-    let mut role = Some("assistant");
+    // empty role chunk ahead of the prefill would read as the first token. A
+    // turn resumed here after a move sent it before the move.
+    let mut role = (!compat::resume::resuming()).then_some("assistant");
     let mut delta = |mut v: Value| {
         if let Some(r) = role.take() {
             v["role"] = json!(r);

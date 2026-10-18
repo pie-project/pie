@@ -1,0 +1,7 @@
+# Moves every turn running on a draining worker to the least loaded worker
+# that is not, so a worker leaves without ending what it runs. Launches
+# otherwise go by the gateway's default.
+plane = "cluster"
+subscribe = ["worker-draining", "dispatched", "exited", "worker-removed"]
+grants = ["placement"]
+uses = ["placement.migrate"]

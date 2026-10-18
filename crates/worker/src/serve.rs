@@ -12,7 +12,7 @@ use crate::embedded::{Embedded, Engine, Summary};
 use crate::link::client;
 use crate::link::control::{self, ControlLink};
 use crate::link::executor::ExecutorServer;
-use crate::link::{gateway, partner, topology};
+use crate::link::{gateway, partner, peer, topology};
 
 pub use crate::link::topology::{Coordinator, TopologyMode, connect};
 
@@ -56,7 +56,7 @@ pub struct RuntimeHandle {
 enum ClusterControl {
     None,
     Distributed {
-        _client: ControlClient,
+        _client: control::Controller,
         worker_id: WorkerId,
     },
     Embedded {
@@ -137,6 +137,25 @@ impl WorkerHandle {
             WorkerKind::Decode(engine) => Some(&engine.summary),
             WorkerKind::Executor(_) => None,
         }
+    }
+
+    /// Takes no new turns, and waits up to `within` for what runs here to
+    /// end or be moved elsewhere by the cluster policy.
+    pub async fn drain(&self, within: std::time::Duration) {
+        crate::link::control::set_draining();
+        let deadline = std::time::Instant::now() + within;
+        tracing::info!("draining: no new turns; waiting for running ones");
+        while !runtime::inferlet::process::list().is_empty() {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    left = runtime::inferlet::process::list().len(),
+                    "drained as far as the deadline allows"
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        tracing::info!("drained");
     }
 
     pub async fn shutdown(self) {
@@ -244,6 +263,7 @@ async fn boot_executor(
             role,
             model: loaded.model,
             addr: server.endpoint().to_string(),
+            prior: None,
         },
     )
     .await
@@ -343,7 +363,39 @@ async fn boot_decode(
     let model = std::mem::take(&mut loaded.model);
     let booted = loaded.start().await?;
     let partner = build_partner_bootstrap(user_cfg, metadata, booted.runtime.model_idx);
+    start_peers(user_cfg).await?;
     Ok((model, booted, partner))
+}
+
+/// Serves other workers' passes, and dials the peers this worker's passes
+/// may be prefilled on, retrying until one takes them.
+async fn start_peers(user_cfg: &config::Config) -> Result<()> {
+    let engine = format!("{:?}", user_cfg.model.engine.kind).to_lowercase();
+    let hello = peer::hello(WorkerId(0), &engine);
+    if let Some(listen) = &user_cfg.offload.listen {
+        peer::serve(listen, hello.clone()).await?;
+        peer::set_listen(peer::bulk_addr(listen)?);
+    }
+    peer::clients();
+    if !user_cfg.offload.pools.is_empty() {
+        tokio::spawn(peer::push_to_pools(user_cfg.offload.pools.clone()));
+    }
+    let peers = user_cfg.offload.peers.clone();
+    let listen = peer::listen();
+    if !peers.is_empty() {
+        tokio::spawn(async move {
+            loop {
+                for addr in &peers {
+                    match peer::dial(addr, &hello, listen.clone()).await {
+                        Ok(()) => return,
+                        Err(error) => tracing::debug!(peer = %addr, %error, "peer not taken"),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    }
+    Ok(())
 }
 
 fn build_partner_bootstrap(
@@ -412,7 +464,7 @@ async fn assemble_control_and_edge(
             controller,
             gateways,
         } => {
-            let client = control::dial_controller(&controller)
+            let client = control::Controller::dial(&controller)
                 .await
                 .with_context(|| format!("dialing controller at {controller}"))?;
             let (edge, control_tasks, worker_id, partners) = assemble_distributed(
@@ -463,8 +515,13 @@ async fn assemble_distributed<C: ControlLink>(
     WorkerId,
     Option<std::sync::Arc<tokio::sync::Mutex<partner::PartnerLinkManager>>>,
 )> {
-    let info = WorkerInfo { role, model, addr };
-    let worker_id = ControlLink::register_worker(&control, info)
+    let info = WorkerInfo {
+        role,
+        model,
+        addr,
+        prior: None,
+    };
+    let worker_id = ControlLink::register_worker(&control, info.clone())
         .await
         .context("registering worker with controller")?;
 
@@ -478,7 +535,8 @@ async fn assemble_distributed<C: ControlLink>(
         .map(|config| partner::PartnerLinkManager::new(worker_id, config))
         .transpose()?
         .map(|manager| std::sync::Arc::new(tokio::sync::Mutex::new(manager)));
-    let control_tasks = control::spawn_control_tasks(control, worker_id, manager, partners.clone());
+    let control_tasks =
+        control::spawn_control_tasks(control, worker_id, info, manager, partners.clone());
 
     Ok((
         EdgeServer::GatewayLinks(dialed),

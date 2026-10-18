@@ -471,11 +471,26 @@ impl Scratch {
 
 pub(crate) fn available_memory() -> u64 {
     let read = |path: &str| std::fs::read_to_string(path).ok();
+    // cgroup v2 names the limit `memory.max`; a v1 hierarchy (many docker
+    // hosts still) names it `memory.limit_in_bytes`, its usage
+    // `memory.usage_in_bytes`, and keeps its own counters under `memory/`.
+    let (max, current, stat) = match read("/sys/fs/cgroup/memory.max") {
+        Some(max) => (
+            Some(max),
+            read("/sys/fs/cgroup/memory.current"),
+            read("/sys/fs/cgroup/memory.stat"),
+        ),
+        None => (
+            read("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+            read("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+            read("/sys/fs/cgroup/memory/memory.stat"),
+        ),
+    };
     headroom(
         read("/proc/meminfo").as_deref(),
-        read("/sys/fs/cgroup/memory.max").as_deref(),
-        read("/sys/fs/cgroup/memory.current").as_deref(),
-        read("/sys/fs/cgroup/memory.stat").as_deref(),
+        max.as_deref(),
+        current.as_deref(),
+        stat.as_deref(),
     )
 }
 
@@ -1522,6 +1537,34 @@ mod tests {
                 Some("inactive_file 500\n")
             ),
             100
+        );
+    }
+
+    #[test]
+    fn a_v1_cgroup_limit_caps_the_headroom_below_the_hosts() {
+        // A docker container on a v1 hierarchy: 1.3 TB free on the host,
+        // 377 GB the container may hold, 1.4 GB of it used. `memory.stat`
+        // there also carries `total_*` lines, which are not the group's own.
+        let meminfo = "MemAvailable:   1383000000 kB\n";
+        let stat = "cache 0\ninactive_file 0\nactive_file 0\ntotal_inactive_file 99\n";
+        assert_eq!(
+            headroom(
+                Some(meminfo),
+                Some("376999997440\n"),
+                Some("1476259840\n"),
+                Some(stat)
+            ),
+            376_999_997_440 - 1_476_259_840
+        );
+        // v1 says "unlimited" with a number near 2^63: the host decides.
+        assert_eq!(
+            headroom(
+                Some(meminfo),
+                Some("9223372036854771712\n"),
+                Some("1476259840\n"),
+                Some(stat)
+            ),
+            1_383_000_000 * 1024
         );
     }
 }
