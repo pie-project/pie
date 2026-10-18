@@ -4158,7 +4158,9 @@ __global__ void __launch_bounds__(256, 2) ssm_kda_chunk_prep(
     // `1 / sqrt(D)`: a warp a row.
     {
         const float q_scale = rsqrtf(static_cast<float>(D));
-        for (int i = warp; i < GDN_CH; i += THREADS / 32) {
+        #pragma unroll
+        for (int k = 0; k < GDN_CH / (THREADS / 32); ++k) {
+            const int i = warp + k * (THREADS / 32);
             #pragma unroll
             for (int which = 0; which < 2; ++which) {
                 bf16* rowp = (which == 0 ? Qb : Kb) + i * GDN_LD;
@@ -4198,6 +4200,7 @@ __global__ void __launch_bounds__(256, 2) ssm_kda_chunk_prep(
 
     // The decayed queries, the fold's keys, the keys `w` reads, the decay.
     const float* glast = Gf + (GDN_CH - 1) * KDA_LDF;
+    #pragma unroll 4
     for (int e = tid; e < GDN_CH * (D / 4); e += THREADS) {
         const int i = e / (D / 4);
         const int c = (e % (D / 4)) * 4;
@@ -4227,11 +4230,15 @@ __global__ void __launch_bounds__(256, 2) ssm_kda_chunk_prep(
     const int g = l >> 2;
     const int t = l & 3;
     bf16* pd = p_out + (static_cast<long long>(s) * H + h) * GDN_CH * GDN_CH;
+    #pragma unroll
     for (int bi = 0; bi < GDN_CH / 16; ++bi) {
         const int r0 = bi * 16;
         const int cols = r0 + 16;
         __syncthreads();
         const float* gr = Gf + r0 * KDA_LDF;
+        // (Unrolled: each thread's pairs independent, their loads and
+        // exponentials side by side.)
+        #pragma unroll 4
         for (int e = tid; e < cols * (D / 2); e += THREADS) {
             const int i = e / (D / 2);
             const int c = (e % (D / 2)) * 2;
@@ -4240,6 +4247,7 @@ __global__ void __launch_bounds__(256, 2) ssm_kda_chunk_prep(
                 gdn_pack(k.x * __expf(gr[c] - Gf[i * KDA_LDF + c]),
                          k.y * __expf(gr[c + 1] - Gf[i * KDA_LDF + c + 1]));
         }
+        #pragma unroll
         for (int e = tid; e < 16 * (D / 2); e += THREADS) {
             const int i = e / (D / 2);
             const int c = (e % (D / 2)) * 2;
