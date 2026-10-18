@@ -688,7 +688,12 @@ mod tests {
                 "{route}: {name} is not built in"
             );
         }
+        // The runtime launches `prefill` itself, for a pass a peer offloads.
+        let internal = ["prefill"];
         for builtin in builtins::all() {
+            if internal.contains(&builtin.name) {
+                continue;
+            }
             assert!(
                 routes.iter().any(|(_, name)| *name == builtin.name),
                 "{} is built in but no route serves it",
