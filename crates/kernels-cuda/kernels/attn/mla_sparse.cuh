@@ -22,11 +22,11 @@
 // The e4m3 instance (`kE4`) reads vLLM's standard fp8 rows (512 latent codes
 // and the rotated dims' 64 or none, one per-tensor scale of 1) and
 // runs both products on e4m3: Q quantized as it lands in TMEM (lanes 0-63 a
-// head's first 256 latent codes, lanes 64-127 its last, and each half's 32
-// rotated codes), a tile's 64 keys as four 128-code atoms (atoms a and a + 2
-// side by side, so lanes 0-63 meet the first half), the rotated dims twice
-// (rows 0-63 the first 32, rows 64-127 the last 32, each at byte 64 of its
-// row), P in e4m3.
+// head's first 256 latent codes and its 64 rotated codes, lanes 64-127 its
+// last 256 and zeros), a tile's 64 keys as four 128-code atoms (atoms a and
+// a + 2 side by side, so lanes 0-63 meet the first half), the rotated dims
+// once (each row's last 128 bytes, the codes at byte 64: lanes 64-127 read
+// the next 64 rows, finite, against zeros), P in e4m3.
 //
 // Warps 0-3 run the softmax and store O (and the base-2 log-sum-exp where
 // asked); warp 11 lists a tile's keys; warps 4 and 6-10 issue its gathers;
@@ -111,8 +111,8 @@ template <int kRope, bool kE4>
 struct Layout {
     // As many slots as shared memory holds: a gather's latency spans the
     // ring, the products of the slots ahead running under it.
-    static constexpr int kSlots = kE4 ? (kRope > 0 ? 3 : 5) : 2;
-    static constexpr u32 kSlot = kE4 ? kE4Latent + (kRope > 0 ? 2 * kAtom : 0u) : kTile + (kRope > 0 ? kRopeBytes : 0u);
+    static constexpr int kSlots = kE4 ? (kRope > 0 ? 4 : 5) : 2;
+    static constexpr u32 kSlot = kE4 ? kE4Latent + (kRope > 0 ? kAtom : 0u) : kTile + (kRope > 0 ? kRopeBytes : 0u);
     static constexpr u32 kOffRing = 0;
     static constexpr u32 kOffP = kOffRing + kSlots * kSlot;
     static constexpr u32 kOffX = kOffP + 2 * kPBytes;
@@ -216,6 +216,14 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
     if (warp == 5) {
         tmem_alloc(tmem_slot, kCols);
         tmem_relinquish();
+    }
+    if constexpr (kE4 && kRope > 0) {
+        // The rotated product's rows 64-127 read past each tile's (the next
+        // slot's, or P): finite from the start.
+        for (u32 i = threadIdx.x; i < L::kOffX / 16; i += blockDim.x) {
+            reinterpret_cast<uint4*>(smem)[i] = make_uint4(0, 0, 0, 0);
+        }
+        fence_async_shared();
     }
     tc_fence_before();
     __syncthreads();
@@ -359,7 +367,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
         // The latent: 16 groups of four keys by its atoms (8 bf16, 4 e4m3);
         // the rotated dims: 16 groups twice.
         constexpr int kLatentOps = kE4 ? 16 * 4 : 16 * 8;
-        constexpr int kOps = kLatentOps + (kRope > 0 ? 16 * 2 : 0);
+        constexpr int kOps = kLatentOps + (kRope > 0 ? (kE4 ? 16 : 16 * 2) : 0);
         int J = 0;
         int n = 0;
         for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
@@ -403,11 +411,10 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
                     } else {
                         const int copy = (op - kLatentOps) / 16;
                         if constexpr (kE4) {
-                            // A row's bytes from 448 + 32 copy: its rotated
-                            // codes 32 copy .. at byte 64 (past the row,
-                            // zeros).
-                            unsigned char* at = dst + kE4Latent + copy * kAtom + g * 4 * 128;
-                            gather4(at, &full[slot], &map_ckv, 448 + 32 * copy, rr[0], rr[1], rr[2], rr[3]);
+                            // A row's last 128 bytes: its rotated codes at
+                            // byte 64.
+                            unsigned char* at = dst + kE4Latent + g * 4 * 128;
+                            gather4(at, &full[slot], &map_ckv, 448, rr[0], rr[1], rr[2], rr[3]);
                         } else {
                             unsigned char* at = dst + kTile + copy * kAtom + g * 4 * 128;
                             gather4(at, &full[slot], &map_kpe, 0, rr[0], rr[1], rr[2], rr[3]);
@@ -472,7 +479,14 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
                                      sdesc_sw128(tile + (s / 4) * 2 * kAtom) + 2 * (s % 4), idesc_s, s > 0);
                     }
                     if constexpr (kRope > 0) {
-                        mma_ws_ts_f8(tmem + kColS8, tmem + kColQr8, sdesc_sw128(tile + kE4Latent) + 4, idesc_s, true);
+                        // The rotated dot whole in lanes 0-63 (Q's rotated
+                        // codes there, zeros in 64-127, whose rows past the
+                        // tile's are the next one's finite codes).
+#pragma unroll
+                        for (int s = 0; s < 2; ++s) {
+                            mma_ws_ts_f8(tmem + kColS8, tmem + kColQr8 + s * 8,
+                                         sdesc_sw128(tile + kE4Latent) + 4 + 2 * s, idesc_s, true);
+                        }
                     }
                     tc_commit(s_full);
                 } else if (lane == 0) {
@@ -506,24 +520,25 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
                 p.q + static_cast<long long>(qrow) * p.q_stride + head * kD + half * 256);
             if constexpr (kE4) {
                 // e4m3 codes a word of four: this half's 256 latent dims in
-                // two loads of 32 columns, its 32 rotated dims in eight.
-                // Every load in flight before any converts.
+                // two loads of 32 columns, the first half's every rotated
+                // dim in sixteen (the second's zeros). Every load in flight
+                // before any converts.
                 const uint4* pe = reinterpret_cast<const uint4*>(
-                    p.q_pe + static_cast<long long>(qrow) * p.qpe_stride + head * kRope + half * 32);
+                    p.q_pe + static_cast<long long>(qrow) * p.qpe_stride + head * kRope);
                 constexpr int kC = kRope > 0 ? 3 : 2;
-                uint4 x[kRope > 0 ? 36 : 32];
+                uint4 x[kRope > 0 ? 40 : 32];
 #pragma unroll
                 for (int g = 0; g < 32; ++g) x[g] = src[g];
                 if constexpr (kRope > 0) {
 #pragma unroll
-                    for (int g = 0; g < 4; ++g) x[32 + g] = pe[g];
+                    for (int g = 0; g < 8; ++g) x[32 + g] = half == 0 ? pe[g] : make_uint4(0, 0, 0, 0);
                 }
 #pragma unroll
                 for (int c = 0; c < kC; ++c) {
                     u32 v[32];
 #pragma unroll
                     for (int g = 0; g < 16; ++g) {
-                        const bool in = c < 2 || g < 4;
+                        const bool in = c < 2 || g < 8;
                         v[2 * g] = in ? bf16x4_e4m3(x[c * 16 + g].x, x[c * 16 + g].y) : 0u;
                         v[2 * g + 1] = in ? bf16x4_e4m3(x[c * 16 + g].z, x[c * 16 + g].w) : 0u;
                     }
