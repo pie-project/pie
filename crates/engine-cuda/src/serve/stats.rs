@@ -133,15 +133,22 @@ impl Shell {
             .map_or(0, crate::scores::Scores::planes)
     }
 
+    /// The lanes of one fire that may capture scores (0: no slab).
+    #[must_use]
+    pub fn score_seats(&self) -> u32 {
+        self.scores.as_ref().map_or(0, crate::scores::Scores::seats)
+    }
+
     #[must_use]
     pub fn score_heads(&self) -> u32 {
         self.scores.as_ref().map_or(0, crate::scores::Scores::heads)
     }
 
-    pub fn observed(&self, lane: u32) -> crate::error::Result<Option<Vec<f32>>> {
+    /// The scores the `seat`th capturing lane of the last fire was given.
+    pub fn observed(&self, seat: u32) -> crate::error::Result<Option<Vec<f32>>> {
         self.scores
             .as_ref()
-            .map(|scores| scores.read_lane(lane))
+            .map(|scores| scores.read_seat(seat))
             .transpose()
     }
 

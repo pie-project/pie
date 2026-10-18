@@ -584,6 +584,7 @@ impl Engine for Metal {
                 prefill_rows: shell
                     .neural_engine()
                     .map_or(0, crate::ane::Ane::prefill_rows),
+                max_score_lanes: 0,
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
                     &budgets,
                 )))

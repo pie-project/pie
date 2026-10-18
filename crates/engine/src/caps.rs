@@ -39,6 +39,10 @@ pub struct FireLimits {
     /// 0: as many as `max_tokens`.
     #[serde(default)]
     pub max_readouts: u32,
+    /// The lanes of one fire that may capture attention scores (0: every
+    /// lane).
+    #[serde(default)]
+    pub max_score_lanes: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

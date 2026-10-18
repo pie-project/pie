@@ -603,7 +603,11 @@ fn fire_fp8_dense(
     let (n, k) = (codes.rows, codes.width);
     let stages = k / FP8_BLOCK;
     // SB 0: the rows a factor covers, by the factors' own shape.
-    let fr = if sb == 0 { factor_rows(n, factors.rows).unwrap_or(FP8_BLOCK) } else { FP8_BLOCK };
+    let fr = if sb == 0 {
+        factor_rows(n, factors.rows).unwrap_or(FP8_BLOCK)
+    } else {
+        FP8_BLOCK
+    };
     if act.rows > 64 {
         return fire_fp8_tiles(ctx, op, act, act_scales, codes, factors, y, sb, fr);
     }

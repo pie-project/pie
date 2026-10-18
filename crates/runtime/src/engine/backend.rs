@@ -17,6 +17,9 @@ pub struct SchedulerLimits {
     pub prefill_rows: usize,
     /// 0: up to `max_forward_tokens`.
     pub max_readouts: usize,
+    /// The lanes of one fire that may capture attention scores (0: every
+    /// lane).
+    pub max_score_lanes: usize,
 }
 
 #[derive(Debug, Clone)]

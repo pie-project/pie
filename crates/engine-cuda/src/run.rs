@@ -2305,7 +2305,7 @@ impl<'c> Run<'c> {
     }
 }
 
-fn skip(handle: Tensor, skip: u32, keep: u32) -> Tensor {
+pub(crate) fn skip(handle: Tensor, skip: u32, keep: u32) -> Tensor {
     if skip == 0 && keep >= handle.rows {
         return handle;
     }

@@ -9,6 +9,12 @@ pub(crate) const KV_MAX: u32 = eta_ir::registry::ATTN_SCORE_KV_MAX;
 
 pub(crate) const OBSERVE: u32 = eta_ir::registry::ATTN_SCORE_OBSERVE;
 
+/// The lanes of one fire that capture scores at most. The slab seats them,
+/// not every lane a fire may hold: a block is `planes * KV_MAX` f32 (1600
+/// planes, 13 MB, on a 14B model), so a seat per lane took 3.2 GB of 256
+/// lanes from the kv pages for a capture few programs ask for.
+pub(crate) const SEATS: u32 = 16;
+
 /// Where a load's score planes sit inside a lane's block. A program declares
 /// `layers * heads` planes, layer-major and head-minor, over the WHOLE model's
 /// query heads: the number it reads off the deployment, not off a rank. A
@@ -56,14 +62,14 @@ impl Layout {
     }
 }
 
-/// What the score planes take at `lanes`: every lane's block of planes,
-/// each `KV_MAX` wide in f32.
+/// What the score planes take at `lanes`: a block of planes per seat, each
+/// `KV_MAX` wide in f32.
 #[must_use]
 pub(crate) fn bytes_for(exports: &[ValueId], heads: u32, lanes: u32, world: World) -> u64 {
     if exports.is_empty() || heads == 0 {
         return 0;
     }
-    u64::from(lanes)
+    u64::from(lanes.min(SEATS))
         .saturating_mul(u64::from(Layout::of(exports, heads, world).planes))
         .saturating_mul(u64::from(KV_MAX))
         .saturating_mul(4)
@@ -73,7 +79,7 @@ pub(crate) fn bytes_for(exports: &[ValueId], heads: u32, lanes: u32, world: Worl
 pub(crate) struct Scores {
     store: Buffer,
     layout: Layout,
-    lanes: u32,
+    seats: u32,
     world: World,
 }
 
@@ -92,7 +98,7 @@ impl Scores {
         Ok(Some(Scores {
             store: Buffer::zeroed(usize::try_from(bytes).unwrap_or(usize::MAX))?,
             layout,
-            lanes,
+            seats: lanes.min(SEATS),
             world,
         }))
     }
@@ -106,7 +112,7 @@ impl Scores {
     pub(crate) fn slab(&self) -> Tensor {
         Tensor::new(
             self.store.ptr(),
-            self.lanes.saturating_mul(self.layout.planes),
+            self.seats.saturating_mul(self.layout.planes),
             KV_MAX,
             poem_ir::Dtype::F32,
         )
@@ -123,37 +129,37 @@ impl Scores {
     }
 
     #[must_use]
-    pub(crate) fn lanes(&self) -> u32 {
-        self.lanes
+    pub(crate) fn seats(&self) -> u32 {
+        self.seats
     }
 
     #[must_use]
-    pub(crate) fn lane_base(&self, lane: u32) -> u64 {
+    pub(crate) fn seat_base(&self, seat: u32) -> u64 {
         self.store.ptr()
-            + u64::from(lane)
+            + u64::from(seat)
                 .saturating_mul(u64::from(self.layout.planes))
                 .saturating_mul(u64::from(KV_MAX))
                 .saturating_mul(4)
     }
 
-    /// Fills a lane's block with every rank's band. Each exported layer's
+    /// Fills a seat's block with every rank's band. Each exported layer's
     /// block is one in-place all-gather: this rank's band already sits at
     /// `rank * band` inside it, which is exactly where NCCL's in-place gather
     /// expects the send buffer. Every rank of the group issues the same
     /// gathers for the same lanes, since every rank fires the same frame.
-    pub(crate) fn gather(&self, ctx: &kernels_cuda::jit::Ctx, lane: u32) -> Result<()> {
+    pub(crate) fn gather(&self, ctx: &kernels_cuda::jit::Ctx, seat: u32) -> Result<()> {
         if self.world.size <= 1 {
             return Ok(());
         }
-        if lane >= self.lanes {
+        if seat >= self.seats {
             return Err(crate::error::Fault::Ceiling {
-                what: "fire lanes the score slab seats",
-                need: u64::from(lane) + 1,
-                have: u64::from(self.lanes),
+                what: "lanes of a fire the score slab seats",
+                need: u64::from(seat) + 1,
+                have: u64::from(self.seats),
             });
         }
         let row = u64::from(KV_MAX) * 4;
-        let base = self.lane_base(lane);
+        let base = self.seat_base(seat);
         let band = self.layout.band;
         kernels_cuda::collective::grouped("attention.score_gather", || {
             for (_, mine) in &self.layout.planes_of {
@@ -177,17 +183,17 @@ impl Scores {
         Ok(())
     }
 
-    pub(crate) fn read_lane(&self, lane: u32) -> crate::error::Result<Vec<f32>> {
-        if lane >= self.lanes {
+    pub(crate) fn read_seat(&self, seat: u32) -> crate::error::Result<Vec<f32>> {
+        if seat >= self.seats {
             return Err(crate::error::Fault::Ceiling {
-                what: "fire lanes the score slab seats",
-                need: u64::from(lane) + 1,
-                have: u64::from(self.lanes),
+                what: "lanes of a fire the score slab seats",
+                need: u64::from(seat) + 1,
+                have: u64::from(self.seats),
             });
         }
         let floats = self.layout.planes as usize * KV_MAX as usize;
         let mut raw = vec![0u8; floats * 4];
-        let at = u64::from(lane)
+        let at = u64::from(seat)
             .saturating_mul(u64::from(self.layout.planes))
             .saturating_mul(u64::from(KV_MAX))
             .saturating_mul(4);
@@ -200,15 +206,40 @@ impl Scores {
             .collect())
     }
 
-    #[must_use]
-    pub(crate) fn seat(&self) -> ScoreSeat {
-        ScoreSeat {
+    /// A fire's capturing lanes seated in lane order; refused when more
+    /// capture than the slab seats.
+    pub(crate) fn seat(&self, captures: impl IntoIterator<Item = bool>) -> Result<ScoreSeat> {
+        let seats = seats_of(captures);
+        let taken = seats.iter().flatten().count() as u64;
+        if taken > u64::from(self.seats) {
+            return Err(crate::error::Fault::Ceiling {
+                what: "lanes of a fire the score slab seats",
+                need: taken,
+                have: u64::from(self.seats),
+            });
+        }
+        Ok(ScoreSeat {
             slab: self.slab(),
             plane_stride: self.layout.planes,
             observe: OBSERVE,
             planes_of: self.layout.planes_of.clone(),
-        }
+            seats,
+        })
     }
+}
+
+/// Each capturing lane's seat, in lane order; `None` for a lane that does not.
+pub(crate) fn seats_of(captures: impl IntoIterator<Item = bool>) -> Vec<Option<u32>> {
+    let mut next = 0u32;
+    captures
+        .into_iter()
+        .map(|captures| {
+            captures.then(|| {
+                next += 1;
+                next - 1
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +248,8 @@ pub struct ScoreSeat {
     pub plane_stride: u32,
     pub observe: u32,
     pub planes_of: Vec<(ValueId, u32)>,
+    /// The fire's lanes, each to its block of the slab if it captures.
+    pub seats: Vec<Option<u32>>,
 }
 
 impl ScoreSeat {
@@ -231,6 +264,15 @@ impl ScoreSeat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capturing_lane_takes_the_next_seat_and_the_rest_take_none() {
+        assert_eq!(
+            seats_of([false, true, false, true, true]),
+            [None, Some(0), None, Some(1), Some(2)]
+        );
+        assert!(seats_of([false; 3]).iter().all(Option::is_none));
+    }
 
     const SCORES_SEAM: &str = poem_compiler::EXPORT_SEAMS[2];
 

@@ -24,6 +24,7 @@ pub(crate) struct RequestCapacityUsage {
     pub(crate) forward_requests: usize,
     pub(crate) forward_tokens: usize,
     pub(crate) page_refs: usize,
+    pub(crate) score_lanes: usize,
 }
 
 pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapacityUsage {
@@ -34,7 +35,18 @@ pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> Re
         forward_requests,
         forward_tokens: req.request.tokens(),
         page_refs: req.request.pages().count(),
+        score_lanes: req
+            .request
+            .lanes
+            .iter()
+            .filter(|lane| lane.captures_scores)
+            .count(),
     }
+}
+
+/// Whether `score_lanes` capturing lanes fit one fire (0: no ceiling).
+fn scores_fit(score_lanes: usize, limits: SchedulerLimits) -> bool {
+    limits.max_score_lanes == 0 || score_lanes <= limits.max_score_lanes
 }
 
 pub(crate) struct AdmissionLimits {
@@ -67,6 +79,13 @@ impl AdmissionLimits {
                 usage.page_refs, self.limits.max_page_refs
             ));
         }
+        if !scores_fit(usage.score_lanes, self.limits) {
+            return Some(format!(
+                "forward request has {} lanes capturing attention scores, exceeding engine \
+                 limit {}",
+                usage.score_lanes, self.limits.max_score_lanes
+            ));
+        }
         None
     }
 }
@@ -78,6 +97,7 @@ pub(crate) struct StepGroup {
     forward_requests: usize,
     forward_tokens: usize,
     page_refs: usize,
+    score_lanes: usize,
 }
 
 impl StepGroup {
@@ -103,6 +123,7 @@ impl StepGroup {
         self.forward_requests.saturating_add(usage.forward_requests) <= limits.max_forward_requests
             && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
             && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
+            && scores_fit(self.score_lanes.saturating_add(usage.score_lanes), limits)
     }
 
     pub(crate) fn push(
@@ -119,6 +140,7 @@ impl StepGroup {
         self.forward_requests = self.forward_requests.saturating_add(usage.forward_requests);
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
+        self.score_lanes = self.score_lanes.saturating_add(usage.score_lanes);
         self.forward_requests >= limits.max_forward_requests
             || self.forward_tokens >= limits.max_forward_tokens
             || self.page_refs >= limits.max_page_refs
@@ -337,6 +359,7 @@ mod tests {
             max_context: 0,
             prefill_rows: 0,
             max_readouts: 0,
+            max_score_lanes: 0,
         }
     }
 
@@ -350,6 +373,42 @@ mod tests {
         a_device_geometry_member_seriates_into_the_suffix();
         a_frames_cells_are_one_per_member_and_never_shared();
         a_device_resolved_lane_counts_against_the_token_cap();
+        capturing_lanes_past_the_score_seats_take_another_step();
+    }
+
+    fn capturing_lanes_past_the_score_seats_take_another_step() {
+        let capturing = |token, page| {
+            let mut request = decode(token, page);
+            request.lanes[0].captures_scores = true;
+            request
+        };
+        let limits = SchedulerLimits {
+            max_score_lanes: 2,
+            ..limits()
+        };
+        let (frame, _) = build_frame_submission(
+            vec![vec![
+                pending(capturing(11, 3), 1),
+                pending(decode(12, 4), 2),
+                pending(capturing(13, 5), 3),
+                pending(capturing(14, 6), 4),
+            ]],
+            limits,
+            16,
+            &SchedulerStats::default(),
+        );
+        let seated: Vec<(usize, usize)> = frame
+            .steps
+            .iter()
+            .map(|step| {
+                let lanes = &step.submission.lanes;
+                (
+                    lanes.len(),
+                    lanes.iter().filter(|l| l.captures_scores).count(),
+                )
+            })
+            .collect();
+        assert_eq!(seated, [(3, 2), (1, 1)]);
     }
 
     fn every_member_owns_a_span_of_the_steps_lanes() {

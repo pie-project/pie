@@ -40,22 +40,42 @@ impl Run<'_> {
         let mut slab = seat.slab;
         let mut q_rows = self.ragged(q);
         q_rows.data = self.windowed(q_rows.data);
-        kernels_cuda::attn_score::capture(
-            self.ctx(),
-            q_rows,
-            self.prefill_plan(plan),
-            &self.pool(cache),
-            window,
-            head_dim,
-            kv_heads,
-            sm_scale,
-            seat.observe,
-            lane_offset,
-            seat.plane_stride,
-            plane,
-            crate::scores::KV_MAX,
-            &mut slab,
-        )
+        let pool = self.pool(cache);
+        let requests = q_rows.indptr.rows.saturating_sub(1);
+        // The slab seats capturing lanes, not every lane: each is captured on
+        // its own, its tables cut to its one request and its block named by
+        // its seat.
+        for request in 0..requests {
+            let Some(Some(at)) = seat.seats.get((lane_offset + request) as usize) else {
+                continue;
+            };
+            let one = RaggedTensor {
+                data: q_rows.data,
+                indptr: crate::run::skip(q_rows.indptr, request, 2),
+            };
+            let pool = kernels_cuda::KvPool {
+                page_indptr: crate::run::skip(pool.page_indptr, request, 2),
+                last_page_lens: crate::run::skip(pool.last_page_lens, request, 1),
+                ..pool
+            };
+            kernels_cuda::attn_score::capture(
+                self.ctx(),
+                one,
+                self.prefill_plan(plan),
+                &pool,
+                window,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                seat.observe,
+                *at,
+                seat.plane_stride,
+                plane,
+                crate::scores::KV_MAX,
+                &mut slab,
+            )?;
+        }
+        Ok(())
     }
 
     pub(super) fn attention(&mut self, op: &Attention) -> Result<(), kernels_cuda::Error> {

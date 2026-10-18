@@ -659,7 +659,8 @@ impl FireCtx<'_> {
             scores: self
                 .scores
                 .filter(|_| p.lanes.iter().any(|seated| seated.captures_scores))
-                .map(Scores::seat),
+                .map(|slab| slab.seat(p.lanes.iter().map(|seated| seated.captures_scores)))
+                .transpose()?,
             device: self.device.device(),
             toggles: self.device.toggles(),
             capture: self.graphs.shaped(),
@@ -1025,11 +1026,10 @@ impl FireCtx<'_> {
         // the epilogue reads the model's planes, so the bands are gathered
         // first (every rank fires the same frame, so every rank gathers the
         // same lanes)
+        let seats = crate::scores::seats_of(p.lanes.iter().map(|seated| seated.captures_scores));
         if let Some(slab) = self.scores {
-            for (lane, seated) in p.lanes.iter().enumerate() {
-                if seated.captures_scores {
-                    slab.gather(self.device.ctx(), lane as u32)?;
-                }
+            for seat in seats.iter().flatten() {
+                slab.gather(self.device.ctx(), *seat)?;
             }
         }
         let mut epilogues = AirborneFires::default();
@@ -1203,16 +1203,13 @@ impl FireCtx<'_> {
                     0,
                 )?;
             }
-            if let Some(slab) = self.scores.filter(|_| {
-                p.lanes
-                    .get(attached.lane as usize)
-                    .is_some_and(|seated| seated.captures_scores)
-            }) {
-                if attached.lane >= slab.lanes() {
+            if let (Some(slab), Some(Some(seat))) = (self.scores, seats.get(attached.lane as usize))
+            {
+                if *seat >= slab.seats() {
                     return Err(Fault::Ceiling {
-                        what: "fire lanes the score slab seats",
-                        need: u64::from(attached.lane) + 1,
-                        have: u64::from(slab.lanes()),
+                        what: "lanes of a fire the score slab seats",
+                        need: u64::from(*seat) + 1,
+                        have: u64::from(slab.seats()),
                     });
                 }
                 let declared = self.programs.declared_score_planes(attached.instance);
@@ -1228,7 +1225,7 @@ impl FireCtx<'_> {
                 self.programs.bind_intrinsic(
                     attached.instance,
                     eta_ir::op::IntrinsicId::AttnScore,
-                    slab.lane_base(attached.lane),
+                    slab.seat_base(*seat),
                     crate::program::launch::INTRINSIC_STORAGE_F32,
                     crate::scores::KV_MAX,
                     crate::scores::KV_MAX,

@@ -25,7 +25,9 @@ impl Peers {
     /// No peer kernels on ROCm: the handshake refuses, and NCCL carries the
     /// group's messages.
     pub fn answer(&self, _ctx: &Ctx, _status: u64) -> Result<(), Error> {
-        Err(Error::Unsupported { op: "collective.peers_answer" })
+        Err(Error::Unsupported {
+            op: "collective.peers_answer",
+        })
     }
 }
 
