@@ -1302,7 +1302,8 @@ fn decoded_weight_planes(
             }
             // On ROCm an fp8b128 projection is one dense e4m3 plane, decoded
             // to bf16 for a prefill's GEMM like a split-plane one; on CUDA
-            // without tcgen05 so is its W8A16 product past a decode's rows.
+            // without tcgen05 so is its W8A16 product past
+            // `w8a16::GEMM_UNTIL` rows.
             #[cfg(any(feature = "rocm", feature = "cuda"))]
             if (cfg!(feature = "rocm") || !kernels_cuda::linear::tc5::supported())
                 && let poem_ir::Operation::Linear(poem_ir::Linear::MatmulActQuant {

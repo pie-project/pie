@@ -31,9 +31,11 @@ __device__ __forceinline__ unsigned factor2(unsigned e) {
     return f | (f << 16);
 }
 
+// `linear/w8a16.cuh`'s widening: `sel` 0x9180 codes 0 and 1, 0xB3A2 2 and 3.
 __device__ __forceinline__ unsigned widen2(unsigned w, unsigned sel, unsigned f2) {
-    const unsigned p = __byte_perm(w, 0u, sel);
-    return w4mma::mul2((p & 0x80008000u) | ((p >> 4) & 0x07F007F0u), f2);
+    unsigned p;
+    asm("prmt.b32 %0, %1, 0, %2;" : "=r"(p) : "r"(w), "r"(sel));
+    return w4mma::mul2((p << 4) & 0x87F087F0u, f2);
 }
 
 template <int kTiles, int kNb>
@@ -56,10 +58,10 @@ __device__ __forceinline__ void compute(const Chunk<kTiles, kNb>& cc, float (&ac
         for (int t = 0; t < kTiles; ++t) {
             const unsigned lo = word(cc.w[t][0], q);
             const unsigned hi = word(cc.w[t][1], q);
-            a[t][0] = widen2(lo, 0x1404u, cc.f[t][0]);
-            a[t][1] = widen2(hi, 0x1404u, cc.f[t][1]);
-            a[t][2] = widen2(lo, 0x3424u, cc.f[t][0]);
-            a[t][3] = widen2(hi, 0x3424u, cc.f[t][1]);
+            a[t][0] = widen2(lo, 0x9180u, cc.f[t][0]);
+            a[t][1] = widen2(hi, 0x9180u, cc.f[t][1]);
+            a[t][2] = widen2(lo, 0xB3A2u, cc.f[t][0]);
+            a[t][3] = widen2(hi, 0xB3A2u, cc.f[t][1]);
         }
 #pragma unroll
         for (int b = 0; b < kNb; ++b) {

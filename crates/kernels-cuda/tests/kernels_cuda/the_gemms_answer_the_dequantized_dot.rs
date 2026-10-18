@@ -300,7 +300,7 @@ fn the_w8a16_projections_answer_the_dot() {
     #[rustfmt::skip]
     let cases = [(128, 1, 384, 1024), (128, 5, 200, 640), (128, 16, 512, 2048), (128, 23, 256, 768),
         (128, 64, 136, 512), (128, 100, 256, 1024), (32, 1, 256, 1024), (32, 37, 200, 512),
-        (32, 130, 200, 1024)];
+        (32, 130, 200, 1024), (128, 256, 384, 1024), (128, 300, 136, 512), (32, 1024, 256, 2048), (128, 777, 520, 640)];
     for (gran, m, n, k) in cases {
         let mut b = Bench::new(0xa16 ^ (m * n + k) as u64);
         let (x, xv) = b.bf16(m * k);
@@ -313,5 +313,57 @@ fn the_w8a16_projections_answer_the_dot() {
         assert!(took, "{m}x{n}x{k} in {gran}s is a shape it reads");
         let want = dot([m, n, k], |r, i| xv[r * k + i], |_, c, i| f64::from(s.value(c, k, i)));
         b.check(y.ptr, &want, TOL, &format!("W8A16 in {gran}s, {m}x{n}x{k}"));
+    }
+}
+
+/// `cargo test ... -- --ignored the_w8a16_times`: the W8A16 product's time at
+/// a deployment's shapes, against cuBLAS on the plane widened to bf16.
+#[test]
+#[ignore = "a timing, not a check"]
+fn the_w8a16_times() {
+    use kernels_cuda::linear::{gemm, w8a16};
+    let shapes: Vec<(usize, usize, usize)> = std::env::var("W8A16_SHAPES")
+        .ok()
+        .map(|v| {
+            v.split(';')
+                .map(|s| {
+                    let d: Vec<usize> = s.split('x').map(|d| d.parse().expect("a dim")).collect();
+                    (d[0], d[1], d[2])
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| vec![(1, 13568, 4096), (32, 13568, 4096), (128, 13568, 4096), (256, 13568, 4096), (4096, 13568, 4096)]);
+    for (m, n, k) in shapes {
+        let mut b = Bench::new(7);
+        let (x, _) = b.bf16(m * k);
+        let s = b.side(Elem::E4m3, Some(128), n, k);
+        let atoms = &s.scales.as_ref().expect("scaled").0;
+        let (codes, atoms) = (b.up(&s.bytes), b.up(atoms));
+        let (mut y, ctx) = (b.out(m, n), b.ctx());
+        let wide = b.zeros(n * k * 2);
+        let act = t(x, m, k, Bf16);
+        let time = |f: &mut dyn FnMut()| {
+            f();
+            b.sync();
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                f();
+            }
+            b.sync();
+            start.elapsed().as_secs_f64() / 20.0 * 1e6
+        };
+        let ours = time(&mut || {
+            w8a16::matmul(&ctx, "time", act, codes, atoms, 128, &mut y).expect("fires");
+        });
+        w8a16::widen(&ctx, "time", codes, atoms, 128, n as u32, k as u32, wide).expect("widens");
+        let cublas = time(&mut || {
+            gemm::act_x_wt(&ctx, "time", act, t(wide, n, k, Bf16), None, &mut y).expect("fires");
+        });
+        let tf = |us: f64| 2.0 * (m * n * k) as f64 / us / 1e6;
+        eprintln!(
+            "W8A16 {m}x{n}x{k}: {ours:.1} us ({:.0} TF/s), cuBLAS bf16 {cublas:.1} us ({:.0} TF/s)",
+            tf(ours),
+            tf(cublas)
+        );
     }
 }

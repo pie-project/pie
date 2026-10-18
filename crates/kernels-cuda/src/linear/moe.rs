@@ -1936,6 +1936,10 @@ pub(crate) fn mxfp4_mma_worth(
         && x.width.is_multiple_of(32)
 }
 
+/// The most routes an expert averages that the register-held mxfp4
+/// select takes; past it, the shared-memory-staged one.
+const STAGED_FROM: u32 = 32;
+
 /// The routed mxfp4 select on mma.sync, each expert's rows dequantized in
 /// registers (`linear/moe_w4.cuh`); with `glu`, `y` is the GLU of the bank's
 /// gate rows and the up rows after them, half the bank's width.
@@ -1981,7 +1985,12 @@ fn select_mxfp4_mma(
     // An expert's slice is 8, 16 or 32 routes: as few 8-route blocks as the
     // average expert fills.
     let per = fan.route_count.div_ceil(experts);
+    // Past `STAGED_FROM` routes an expert, its activations staged in shared
+    // memory a CTA of 64 routes (`moe_select_mxfp4_mma_staged`), so a wide
+    // fire streams each expert's codes once a 64.
+    let staged = !cvt && per > STAGED_FROM;
     let nb: u32 = match per {
+        _ if staged => 8,
         0..=4 => 1,
         5..=12 => 2,
         _ => 4,
@@ -2039,6 +2048,16 @@ fn select_mxfp4_mma(
                 .smem(nb * win * 4096)
                 .cluster(ksplit),
         )
+    } else if staged {
+        const STAGES: u32 = 3;
+        let nv = tensor_scales.is_some();
+        Fire::at(
+            "linear/moe_w4.cuh",
+            symbol(&format!(
+                "::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {STAGES}, {code}, {nv}>"
+            )),
+        )
+        .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(STAGES * 8 * nb * 16 * 16))
     } else {
         Fire::at(
             "linear/moe_w4.cuh",

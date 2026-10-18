@@ -25,7 +25,7 @@
 // column steps of K, each group staging its own activation tiles through a
 // cp.async ring and folding into the others through shared memory at the
 // end. `16 * kMT` activation rows a block (the live ones read, the rest
-// zero-filled).
+// zero-filled), a grid row a tile of them.
 
 #include "prelude/device.cuh"
 #include "prelude/mma.cuh"
@@ -84,11 +84,17 @@ __device__ __forceinline__ unsigned factor2(unsigned e) {
     return f | (f << 16);
 }
 
-// Two of a word's codes (`sel` picks which into each half's high byte) as a
-// bf16x2, scaled by `f2`.
+// Two of a word's codes as a bf16x2, scaled by `f2`: `sel` lays each code
+// in a half's low byte with its sign replicated through the high one
+// (0x9180 codes 0 and 1, 0xB3A2 codes 2 and 3), so a shift of four puts the
+// sign at bit 15 (the copies above the code fall to the mask), the exponent
+// and mantissa at bf16's places.
 __device__ __forceinline__ unsigned widen2(unsigned w, unsigned sel, unsigned f2) {
-    const unsigned p = __byte_perm(w, 0u, sel);
-    const unsigned r = (p & 0x80008000u) | ((p >> 4) & 0x07F007F0u);
+    unsigned p;
+    // PTX's prmt replicates a byte's sign where its selector nibble's msb is
+    // set (`__byte_perm` reads three bits of it).
+    asm("prmt.b32 %0, %1, 0, %2;" : "=r"(p) : "r"(w), "r"(sel));
+    const unsigned r = (p << 4) & 0x87F087F0u;
     __nv_bfloat162 a, b;
     a.x.raw = static_cast<unsigned short>(r & 0xffffu);
     a.y.raw = static_cast<unsigned short>(r >> 16);
@@ -134,7 +140,12 @@ __global__ void __launch_bounds__(kWarpsN * kWarpsK * 32) fp8_w8a16_mma(
 
     int rows = m;
     if (win != nullptr) rows = min(rows, static_cast<int>(win[0]));
-    if (rows <= 0) return;
+    // A tile of `kBM` rows a grid row: the rows past it a later tile's.
+    const int m0 = static_cast<int>(blockIdx.y) * kBM;
+    if (rows <= m0) return;
+    rows -= m0;
+    x += static_cast<long long>(m0) * x_stride;
+    y += static_cast<long long>(m0) * y_stride;
 
     extern __shared__ __align__(16) unsigned char w8a16_smem[];
     bf16* ring = reinterpret_cast<bf16*>(w8a16_smem) + wk * kStages * kStageElems;
@@ -186,46 +197,50 @@ __global__ void __launch_bounds__(kWarpsN * kWarpsK * 32) fp8_w8a16_mma(
 #pragma unroll
     for (int s = 0; s < kStages - 1; ++s) issue(s);
 
-    uint4 bcur[kNSub], bnext[kNSub];
-    unsigned fcur[kNSub], fnext[kNSub];
-    fetch(0, bcur, fcur);
+    // The codes and exponents `kDepth` steps ahead, a ring of registers a
+    // step refilled as it is spent.
+    constexpr int kDepth = 3;
+    uint4 bring[kDepth][kNSub];
+    unsigned fring[kDepth][kNSub];
+#pragma unroll
+    for (int d = 0; d < kDepth; ++d) fetch(d, bring[d], fring[d]);
 
-    for (int it = 0; it < iters; ++it) {
-        fetch(it + 1, bnext, fnext);
-        cp_wait<kStages - 2>();
-        group_sync(1 + wk, kGroupThreads);
-        const bf16* tile = ring + (it % kStages) * kStageElems;
+    for (int it0 = 0; it0 < iters; it0 += kDepth) {
 #pragma unroll
-        for (int mt = 0; mt < kMT; ++mt) {
-            const int ra = mt * 16 + g;
-            const int rb = ra + 8;
-            const uint4 a_lo = *reinterpret_cast<const uint4*>(tile + ra * 64 + (((2 * t) ^ (ra & 7)) * 8));
-            const uint4 a_hi = *reinterpret_cast<const uint4*>(tile + ra * 64 + (((2 * t + 1) ^ (ra & 7)) * 8));
-            const uint4 b_lo = *reinterpret_cast<const uint4*>(tile + rb * 64 + (((2 * t) ^ (rb & 7)) * 8));
-            const uint4 b_hi = *reinterpret_cast<const uint4*>(tile + rb * 64 + (((2 * t + 1) ^ (rb & 7)) * 8));
+        for (int d = 0; d < kDepth; ++d) {
+            const int it = it0 + d;
+            if (it >= iters) break;
+            cp_wait<kStages - 2>();
+            group_sync(1 + wk, kGroupThreads);
+            const bf16* tile = ring + (it % kStages) * kStageElems;
 #pragma unroll
-            for (int c = 0; c < 4; ++c) {
-                const uint4& ar = c < 2 ? a_lo : a_hi;
-                const uint4& br = c < 2 ? b_lo : b_hi;
-                const unsigned a[4] = {
-                    (c & 1) ? ar.z : ar.x,
-                    (c & 1) ? br.z : br.x,
-                    (c & 1) ? ar.w : ar.y,
-                    (c & 1) ? br.w : br.y,
-                };
+            for (int mt = 0; mt < kMT; ++mt) {
+                const int ra = mt * 16 + g;
+                const int rb = ra + 8;
+                const uint4 a_lo = *reinterpret_cast<const uint4*>(tile + ra * 64 + (((2 * t) ^ (ra & 7)) * 8));
+                const uint4 a_hi = *reinterpret_cast<const uint4*>(tile + ra * 64 + (((2 * t + 1) ^ (ra & 7)) * 8));
+                const uint4 b_lo = *reinterpret_cast<const uint4*>(tile + rb * 64 + (((2 * t) ^ (rb & 7)) * 8));
+                const uint4 b_hi = *reinterpret_cast<const uint4*>(tile + rb * 64 + (((2 * t + 1) ^ (rb & 7)) * 8));
 #pragma unroll
-                for (int j = 0; j < kNSub; ++j) {
-                    const unsigned w = word_of(bcur[j], c);
-                    const unsigned bf[2] = {widen2(w, 0x1404u, fcur[j]), widen2(w, 0x3424u, fcur[j])};
-                    nvcuda::wmma::detail::mma_m16n8k16(acc[mt][j], a, bf, acc[mt][j]);
+                for (int c = 0; c < 4; ++c) {
+                    const uint4& ar = c < 2 ? a_lo : a_hi;
+                    const uint4& br = c < 2 ? b_lo : b_hi;
+                    const unsigned a[4] = {
+                        (c & 1) ? ar.z : ar.x,
+                        (c & 1) ? br.z : br.x,
+                        (c & 1) ? ar.w : ar.y,
+                        (c & 1) ? br.w : br.y,
+                    };
+#pragma unroll
+                    for (int j = 0; j < kNSub; ++j) {
+                        const unsigned w = word_of(bring[d][j], c);
+                        const unsigned bf[2] = {widen2(w, 0x9180u, fring[d][j]), widen2(w, 0xB3A2u, fring[d][j])};
+                        nvcuda::wmma::detail::mma_m16n8k16(acc[mt][j], a, bf, acc[mt][j]);
+                    }
                 }
             }
-        }
-        issue(it + kStages - 1);
-#pragma unroll
-        for (int j = 0; j < kNSub; ++j) {
-            bcur[j] = bnext[j];
-            fcur[j] = fnext[j];
+            issue(it + kStages - 1);
+            fetch(it + kDepth, bring[d], fring[d]);
         }
     }
     cp_wait<0>();
@@ -279,6 +294,191 @@ __global__ void __launch_bounds__(kWarpsN * kWarpsK * 32) fp8_w8a16_mma(
     }
 }
 
+// The same product at a wide fire's rows as a tiled GEMM: a CTA `kBM`
+// activation rows by 128 weight rows, its eight warps 2 x 4 over the tile
+// (a warp `kBM / 2` rows by 32 columns), both operands staged through a
+// `kStages` cp.async ring 64 columns of K at a time -- the activations as
+// `fp8_w8a16_mma` lays them, the codes a weight row's 64 bytes a stage row
+// (a quarter-warp's 16-byte reads land on 32 banks unswizzled) -- and each
+// warp widening its columns' codes from shared memory as it reads them.
+template <int kBM, int kStages, int kGran>
+__global__ void __launch_bounds__(256) fp8_w8a16_gemm(
+    const bf16* __restrict__ x,
+    int x_stride,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ atoms,
+    bf16* __restrict__ y,
+    int y_stride,
+    int m,
+    int n,
+    int k,
+    const u32* __restrict__ win)
+{
+    using namespace w8a16;
+    static_assert(kGran == 32 || kGran == 128, "a block is 32 or 128 columns of K");
+    static_assert(kBM == 64 || kBM == 128, "a CTA is 64 or 128 rows");
+    constexpr int kBN = 128;
+    constexpr int kMT = kBM / 32;  // m16 tiles a warp
+    constexpr int kNSub = 4;        // n8 tiles a warp
+    constexpr int kABytes = kBM * 128;
+    constexpr int kStageBytes = kABytes + kBN * 64;
+    constexpr int kACopies = kBM * 8 / 256;
+    constexpr int kBCopies = kBN * 4 / 256;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int wm = warp >> 2;
+    const int wn = warp & 3;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+
+    int rows = m;
+    if (win != nullptr) rows = min(rows, static_cast<int>(win[0]));
+    const int m0 = static_cast<int>(blockIdx.y) * kBM;
+    if (rows <= m0) return;
+    rows -= m0;
+    x += static_cast<long long>(m0) * x_stride;
+    y += static_cast<long long>(m0) * y_stride;
+    const int n0 = static_cast<int>(blockIdx.x) * kBN;
+    const int steps = k >> 6;
+    const int kblocks = k / kGran;
+
+    // The stages, then the CTA's block exponents (`kBN` rows of `kblocks`),
+    // laid once.
+    extern __shared__ __align__(16) unsigned char w8a16_gemm_smem[];
+    u8* exps = w8a16_gemm_smem + kStages * kStageBytes;
+    for (int i = tid; i < kBN * kblocks; i += 256) {
+        const int r = i / kblocks;
+        exps[i] = atoms[atom_offset(min(n0 + r, n - 1), i - r * kblocks, kblocks)];
+    }
+    const unsigned smem0 = smem_addr(w8a16_gemm_smem);
+
+    // Each thread's copies a stage: their sources (advanced 64 columns a
+    // step) and destinations within a stage.
+    const bf16* a_src[kACopies];
+    unsigned a_dst[kACopies];
+    int a_bytes[kACopies];
+#pragma unroll
+    for (int j = 0; j < kACopies; ++j) {
+        const int i = tid + 256 * j;
+        const int r = i >> 3;
+        const int c = i & 7;
+        a_src[j] = x + static_cast<long long>(min(r, rows - 1)) * x_stride + c * 8;
+        a_dst[j] = (r * 64 + ((c ^ (r & 7)) * 8)) * 2;
+        a_bytes[j] = r < rows ? 16 : 0;
+    }
+    const u8* b_src[kBCopies];
+    unsigned b_dst[kBCopies];
+#pragma unroll
+    for (int j = 0; j < kBCopies; ++j) {
+        const int i = tid + 256 * j;
+        const int r = i >> 2;
+        const int c = i & 3;
+        b_src[j] = codes + static_cast<long long>(min(n0 + r, n - 1)) * k + c * 16;
+        b_dst[j] = kABytes + r * 64 + c * 16;
+    }
+    int issued = 0;
+    auto issue = [&]() {
+        if (issued < steps) {
+            const unsigned base = smem0 + (issued % kStages) * kStageBytes;
+            const long long ka = static_cast<long long>(issued) * 64;
+#pragma unroll
+            for (int j = 0; j < kACopies; ++j) cp_async16(base + a_dst[j], a_src[j] + ka, a_bytes[j]);
+#pragma unroll
+            for (int j = 0; j < kBCopies; ++j) cp_async16(base + b_dst[j], b_src[j] + ka, 16);
+        }
+        ++issued;
+        cp_commit();
+    };
+
+    // A lane's shared-memory reads a stage, as byte offsets in it.
+    unsigned a_at[kMT][4];
+#pragma unroll
+    for (int mt = 0; mt < kMT; ++mt) {
+        const int ra = wm * (kBM / 2) + mt * 16 + g;
+        const int rb = ra + 8;
+        a_at[mt][0] = (ra * 64 + (((2 * t) ^ (ra & 7)) * 8)) * 2;
+        a_at[mt][1] = (ra * 64 + (((2 * t + 1) ^ (ra & 7)) * 8)) * 2;
+        a_at[mt][2] = (rb * 64 + (((2 * t) ^ (rb & 7)) * 8)) * 2;
+        a_at[mt][3] = (rb * 64 + (((2 * t + 1) ^ (rb & 7)) * 8)) * 2;
+    }
+    const unsigned b_at = kABytes + (wn * 32 + g) * 64 + t * 16;
+    const u8* my_exps = exps + (wn * 32 + g) * kblocks;
+
+    float acc[kMT][kNSub][4];
+#pragma unroll
+    for (int i = 0; i < kMT; ++i)
+#pragma unroll
+        for (int j = 0; j < kNSub; ++j)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) acc[i][j][q] = 0.f;
+
+#pragma unroll
+    for (int s = 0; s < kStages - 1; ++s) issue();
+    __syncthreads();  // the exponents laid
+
+    int slot = 0;
+    for (int step = 0; step < steps; ++step) {
+        cp_wait<kStages - 2>();
+        __syncthreads();
+        const unsigned char* stage = w8a16_gemm_smem + slot * kStageBytes;
+        const int kb = kGran == 128 ? (step >> 1) : ((step * 64 + 16 * t) >> 5);
+        unsigned f[kNSub];
+        uint4 bw[kNSub];
+#pragma unroll
+        for (int j = 0; j < kNSub; ++j) {
+            f[j] = factor2(my_exps[8 * j * kblocks + kb]);
+            bw[j] = *reinterpret_cast<const uint4*>(stage + b_at + j * 8 * 64);
+        }
+#pragma unroll
+        for (int mt = 0; mt < kMT; ++mt) {
+            const uint4 a_lo = *reinterpret_cast<const uint4*>(stage + a_at[mt][0]);
+            const uint4 a_hi = *reinterpret_cast<const uint4*>(stage + a_at[mt][1]);
+            const uint4 b_lo = *reinterpret_cast<const uint4*>(stage + a_at[mt][2]);
+            const uint4 b_hi = *reinterpret_cast<const uint4*>(stage + a_at[mt][3]);
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const uint4& ar = c < 2 ? a_lo : a_hi;
+                const uint4& br = c < 2 ? b_lo : b_hi;
+                const unsigned a[4] = {
+                    (c & 1) ? ar.z : ar.x,
+                    (c & 1) ? br.z : br.x,
+                    (c & 1) ? ar.w : ar.y,
+                    (c & 1) ? br.w : br.y,
+                };
+#pragma unroll
+                for (int j = 0; j < kNSub; ++j) {
+                    const unsigned w = word_of(bw[j], c);
+                    const unsigned bf[2] = {widen2(w, 0x9180u, f[j]), widen2(w, 0xB3A2u, f[j])};
+                    nvcuda::wmma::detail::mma_m16n8k16(acc[mt][j], a, bf, acc[mt][j]);
+                }
+            }
+        }
+        issue();
+        slot = slot + 1 == kStages ? 0 : slot + 1;
+    }
+    cp_wait<0>();
+
+#pragma unroll
+    for (int mt = 0; mt < kMT; ++mt)
+#pragma unroll
+        for (int j = 0; j < kNSub; ++j) {
+            const int col = n0 + wn * 32 + 8 * j + 2 * t;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int r = wm * (kBM / 2) + mt * 16 + g + 8 * h;
+                if (r >= rows) continue;
+                bf16* out = y + static_cast<long long>(r) * y_stride + col;
+                if (col + 1 < n) {
+                    *reinterpret_cast<unsigned*>(out) = pack_bf16x2(acc[mt][j][2 * h], acc[mt][j][2 * h + 1]);
+                } else if (col < n) {
+                    out[0] = f32_to_bf16(acc[mt][j][2 * h]);
+                }
+            }
+        }
+}
+
 // The same plane widened whole to bf16 (`out`, `[n, k]`), for a wide fire's
 // cuBLAS GEMM: a thread sixteen codes.
 template <int kGran>
@@ -298,14 +498,14 @@ __global__ void __launch_bounds__(256) fp8_atoms_to_bf16(
     const uint4 v = *reinterpret_cast<const uint4*>(codes + static_cast<long long>(row) * k + c0);
     const unsigned f2 = factor2(atoms[atom_offset(row, c0 / kGran, k / kGran)]);
     uint4 lo, hi;
-    lo.x = widen2(v.x, 0x1404u, f2);
-    lo.y = widen2(v.x, 0x3424u, f2);
-    lo.z = widen2(v.y, 0x1404u, f2);
-    lo.w = widen2(v.y, 0x3424u, f2);
-    hi.x = widen2(v.z, 0x1404u, f2);
-    hi.y = widen2(v.z, 0x3424u, f2);
-    hi.z = widen2(v.w, 0x1404u, f2);
-    hi.w = widen2(v.w, 0x3424u, f2);
+    lo.x = widen2(v.x, 0x9180u, f2);
+    lo.y = widen2(v.x, 0xB3A2u, f2);
+    lo.z = widen2(v.y, 0x9180u, f2);
+    lo.w = widen2(v.y, 0xB3A2u, f2);
+    hi.x = widen2(v.z, 0x9180u, f2);
+    hi.y = widen2(v.z, 0xB3A2u, f2);
+    hi.z = widen2(v.w, 0x9180u, f2);
+    hi.w = widen2(v.w, 0xB3A2u, f2);
     uint4* dst = reinterpret_cast<uint4*>(out + static_cast<long long>(row) * k + c0);
     dst[0] = lo;
     dst[1] = hi;

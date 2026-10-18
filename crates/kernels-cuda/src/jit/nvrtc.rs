@@ -380,6 +380,39 @@ mod tests {
         .map_err(|why| why.to_string())
     }
 
+    /// `PIE_CUBIN_DUMP="<unit>|<symbol>[;<symbol>...]|<out>" cargo test ...
+    /// -- --ignored a_unit_dumps_its_cubin`: one unit's instantiations
+    /// lowered for `PIE_CUBIN_ARCH` (sm_80 by default) and written out, for
+    /// `cuobjdump -sass`.
+    #[test]
+    #[ignore = "a developer's dump, not a check"]
+    fn a_unit_dumps_its_cubin() {
+        let Ok(spec) = std::env::var("PIE_CUBIN_DUMP") else {
+            return;
+        };
+        let mut parts = spec.splitn(3, '|');
+        let (file, symbols, out) = (
+            parts.next().expect("a unit"),
+            parts.next().expect("its symbols"),
+            parts.next().expect("an output path"),
+        );
+        let arch = std::env::var("PIE_CUBIN_ARCH").unwrap_or_else(|_| "sm_80".to_owned());
+        let file: &'static str = Box::leak(file.to_owned().into_boxed_str());
+        let root = Root::of(file).expect("a carried unit");
+        let wanted: Vec<String> = symbols.split(';').map(str::to_owned).collect();
+        let built = compile_text(&Job {
+            name: root.name,
+            source: root.text.to_owned(),
+            arch: &arch,
+            options: root.options,
+            headers: root.header_set(),
+            floor: Toolchain::ANY,
+            wanted: &wanted,
+        })
+        .expect("the unit lowers");
+        std::fs::write(out, &built.cubin).expect("the cubin lands");
+    }
+
     fn nvrtc_is_here() -> bool {
         let present = unsafe { nvrtc::is_culib_present() };
         if !present {

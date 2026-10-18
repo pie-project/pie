@@ -213,6 +213,13 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Mx, mma, [8, 12, 4, 384, 2880], t, None, 0),
         (K::Mx, mma, [8, 100, 4, 384, 2880], f, None, 0),
         (K::MxBias, mma, [8, 16, 4, 192, 2880], t, alpha, 8),
+        // Past 32 routes an expert, the shared-memory-staged kernel: by
+        // token and by route, its GLU under scales past f16's range, a live
+        // window, NVFP4 and its GLU.
+        (K::MxBias, mma, [8, 96, 4, 256, 2880], t, None, 0),
+        (K::Mx, mma, [4, 200, 2, 384, 1024], f, None, 0),
+        (K::MxBias, mma, [8, 80, 4, 192, 2880], t, alpha, 2),
+        (K::Mx, mma, [8, 120, 4, 256, 512], t, None, 1),
         (K::Mx, cvt, [8, 1, 4, 200, 2880], t, None, 0),
         (K::MxBias, cvt, [8, 40, 4, 576, 2880], t, None, 0),
         (K::MxBias, cvt, [8, 3, 4, 576, 2880], f, None, 2),
@@ -226,6 +233,8 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Nv, TC5, [16, 48, 10, 128, 640], t, None, 0),
         (K::Nv, nv_mma, [16, 2, 10, 256, 640], f, None, 0),
         (K::Nv, nv_mma, [16, 48, 10, 320, 2560], t, sw, 0),
+        (K::Nv, nv_mma, [16, 160, 10, 256, 640], t, None, 0),
+        (K::Nv, nv_mma, [16, 120, 10, 320, 2560], t, sw, 0),
     ];
     if supported() {
         // The atom-laid select on the e2m1 converts, keeping its order; the
@@ -240,6 +249,8 @@ fn the_routed_selects_answer_the_routed_dot() {
                 (kind, d, [8, 70, 3, 256, 512], f, None, 0), (kind, d, [8, 5, 3, 256, 512], f, None, 1)]);
         }
     }
+    // The tcgen05 arms are Blackwell's; elsewhere their cases have no arm.
+    cases.retain(|case| supported() || !(case.1 == TC5 || case.1 == SM100));
     cases.into_iter().for_each(routed);
 }
 

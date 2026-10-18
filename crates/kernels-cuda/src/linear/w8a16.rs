@@ -1,7 +1,7 @@
 //! Block-FP8 projections against bf16 activations (W8A16) where no FP8 tensor
-//! core is (`linear/w8a16.cuh`): a decode's rows on mma.sync with the codes
-//! widened in registers, a wider fire's against the plane widened to bf16
-//! through cuBLAS.
+//! core is (`linear/w8a16.cuh`), the codes widened in registers on mma.sync:
+//! a decode's few rows GEMV-shaped, a wider fire's as a tiled GEMM; a
+//! prefill's against the plane widened whole to bf16 (`widen`) on cuBLAS.
 
 use dtype::Dtype;
 
@@ -10,11 +10,17 @@ use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated, symbol};
 use crate::linear::gemm;
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/w8a16.cuh";
 const DECODED_WEIGHT: &str = "linear.quant.decoded_weight";
 
-/// The most rows the mma.sync kernel takes; wider fires widen the plane.
-pub const MMA_UNTIL: u32 = 64;
+const FILE: &str = "linear/w8a16.cuh";
+
+/// The most rows the GEMV-shaped mma.sync kernel takes (K split across
+/// warps, the codes streamed once); wider fires take the tiled GEMM.
+pub const MMA_UNTIL: u32 = 32;
+
+/// The most rows the tiled GEMM takes; a prefill's wider fires widen the
+/// plane once for cuBLAS, which leads there.
+pub const GEMM_UNTIL: u32 = 256;
 
 /// One CTA shape of the mma.sync kernel: `16 * mt` rows, `8 * n_sub *
 /// warps_n` columns, `warps_k` groups over K.
@@ -79,7 +85,42 @@ pub fn matmul(
     if m == 0 {
         return Ok(true);
     }
-    if m <= MMA_UNTIL {
+    if m > GEMM_UNTIL {
+        // A prefill's rows against the plane widened once, on cuBLAS.
+        let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
+        let tile = ctx.scratch_stream(op, DECODED_WEIGHT, bytes)? as usize as u64;
+        widen(ctx, op, codes, atoms, gran, n, k, tile)?;
+        gemm::act_x_wt(ctx, op, act, Tensor::new(tile, n, k, Dtype::Bf16), None, y)?;
+        return Ok(true);
+    }
+    if m > MMA_UNTIL {
+        // The tiled GEMM: 64-row CTAs while that keeps the grid wide, 128 past it.
+        let (bm, stages) = if m <= 128 { (64u32, 4u32) } else { (128, 3) };
+        // The stages, and the CTA's block exponents laid beside them.
+        let smem = stages * (bm * 64 * 2 + 128 * 64) + 128 * (k / gran);
+        ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!("::pie::linear::fp8_w8a16_gemm<{bm}, {stages}, {gran}>")),
+            )
+            .apply(Launch::grid([n.div_ceil(128), m.div_ceil(bm), 1], [256, 1, 1]).smem(smem)),
+            &[
+                act.arg(),
+                stated(op, k)?.arg(),
+                ArgValue::Ptr(codes),
+                ArgValue::Ptr(atoms),
+                y.arg(),
+                stated(op, n)?.arg(),
+                stated(op, m)?.arg(),
+                stated(op, n)?.arg(),
+                stated(op, k)?.arg(),
+                ctx.stage(),
+            ],
+        )?;
+        return Ok(true);
+    }
+    {
         let s = Shape::for_rows(m);
         ctx.fire(
             op,
@@ -92,7 +133,7 @@ pub fn matmul(
             )
             .apply(
                 Launch::grid(
-                    [n.div_ceil(s.columns()), 1, 1],
+                    [n.div_ceil(s.columns()), m.div_ceil(16 * s.mt), 1],
                     [32 * s.warps_n * s.warps_k, 1, 1],
                 )
                 .smem(s.smem()),
@@ -110,12 +151,7 @@ pub fn matmul(
                 ctx.stage(),
             ],
         )?;
-        return Ok(true);
     }
-    let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
-    let tile = ctx.scratch_stream(op, DECODED_WEIGHT, bytes)? as usize as u64;
-    widen(ctx, op, codes, atoms, gran, n, k, tile)?;
-    gemm::act_x_wt(ctx, op, act, Tensor::new(tile, n, k, Dtype::Bf16), None, y)?;
     Ok(true)
 }
 
