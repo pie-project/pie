@@ -390,3 +390,45 @@ fn the_w8a16_selects_answer_the_routed_dot() {
         b.check(y.ptr, &want, TOL, &what);
     }
 }
+
+/// `cargo test ... -- --ignored the_mxfp4_selects_time`: the register-
+/// dequant mxfp4 select's time at a decode's and a batch's routes, against
+/// the bank's bytes at the card's rate.
+#[test]
+#[ignore = "a timing, not a check"]
+fn the_mxfp4_selects_time() {
+    let mma = Tuning { mxfp4_mma_until: 65_536, mxfp4_mma_from: 1, ..Tuning::DEFAULT };
+    let arms = [("mma", mma), ("default", Tuning::DEFAULT)];
+    // (experts, tokens, top_k, n, k)
+    for ((ex, tokens, top, n, k), (arm, tuning)) in [(8, 1, 8, 4096, 4096), (8, 1, 8, 4096, 2048), (8, 4, 8, 4096, 4096), (8, 16, 8, 4096, 4096), (8, 128, 8, 4096, 4096), (256, 1, 8, 4096, 7168)]
+        .into_iter()
+        .flat_map(|case| arms.into_iter().map(move |arm| (case, arm)))
+    {
+        let mut b = Bench::new(9);
+        let count = tokens * top;
+        let routes = tab(count, |r| ((r / top * 3 + r % top * 5) % ex) as i32);
+        let (x, _) = b.bf16(tokens * k);
+        let s = b.side(Elem::E2m1, Some(32), ex * n, k);
+        let (c, sc) = (b.up(&s.bytes), b.up(&s.codes));
+        let (codes, scales) = (t(c, ex, n * k / 2, U8), t(sc, ex, n * k / 32, U8));
+        let r = t(b.up(&routes), tokens, top, I32);
+        let mut y = b.out(count, n);
+        let ctx = b.ctx().with_tuning(tuning);
+        let x = t(x, tokens, k, Bf16);
+        let mut fire = || {
+            moe::matmul_select_quant(&ctx, x, codes, scales, None, r, &mut y, GroupSeat::RESIDENT)
+                .expect("fires");
+        };
+        fire();
+        b.sync();
+        let start = std::time::Instant::now();
+        for _ in 0..50 {
+            fire();
+        }
+        b.sync();
+        let us = start.elapsed().as_secs_f64() / 50.0 * 1e6;
+        let live = ex.min(count);
+        let bytes = (live * n * k / 2 + live * n * k / 32) as f64;
+        eprintln!("mxfp4 select {arm} {ex}x{tokens}x{top} {n}x{k}: {us:.1} us, {:.0} GB/s of the routed bank", bytes / us / 1e3);
+    }
+}

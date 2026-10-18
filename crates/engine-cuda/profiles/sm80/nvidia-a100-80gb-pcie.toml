@@ -1,0 +1,32 @@
+api = 1
+
+[target]
+device = "NVIDIA A100 80GB PCIe"
+
+# Each line's measured win is in the commit that set it.
+# MXFP4 selects of 16 routes or more on the register-dequant MMA (fewer stay
+# on the per-route kernel, which streams a decode's bank faster); Qwen3.5's
+# gated delta on the fused scan; DeepSeek-V4.1's bounded replay, as B200's.
+[kernel]
+moe.mxfp4_mma_from = 16
+moe.mxfp4_mma_until = 65536
+sdpa.dsv4_replay = true
+ssm = ["gdn_fused_scan", "conv_vec4", "gdn_out_bf16"]
+
+# A prefill's fire on four buckets a doubling from 256 rows (its GEMMs run
+# its bucket's rows), and a bucket between powers of two below.
+[engine]
+prefill_lattice_from = 256
+lattice_steps = 2
+
+[provenance]
+source = "end to end on MiMo-V2.6-Flash and Qwen3.6-27B miniatures and checkpoints, by hand"
+measured = [
+  "kernel.moe.mxfp4_mma_from",
+  "kernel.moe.mxfp4_mma_until",
+  "kernel.ssm.gdn_fused_scan",
+  "kernel.ssm.conv_vec4",
+  "kernel.ssm.gdn_out_bf16",
+  "engine.prefill_lattice_from",
+  "engine.lattice_steps",
+]

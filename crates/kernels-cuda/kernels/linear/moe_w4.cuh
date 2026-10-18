@@ -326,8 +326,12 @@ __global__ void moe_route_order_scan(
 
 // `kNv`: an NVFP4 bank (an e4m3 scale a 16 codes, `tscale` an f32 tensor
 // scale a weight row) in place of mxfp4's e8m0 a 32.
-template <int kNb, int kDepth, int kGlu, bool kNv = false>
-__global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
+// `kKSplit`: K split across that many groups of the CTA's four warps, each
+// walking every `kKSplit`-th chunk, their sums folded through shared memory
+// before the first group lands them: a decode's few CTAs keep the card's
+// memory busy with more warps, each a share of K.
+template <int kNb, int kDepth, int kGlu, bool kNv = false, int kKSplit = 1>
+__global__ void __launch_bounds__(128 * kKSplit) moe_select_mxfp4_mma(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
     const i32* __restrict__ offsets,
@@ -358,7 +362,8 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
     const int count = min(offsets[expert + 1] - begin, kSlice);
     if (count <= 0) return;
 
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int warp = (static_cast<int>(threadIdx.x) >> 5) & 3;
+    const int part = static_cast<int>(threadIdx.x) >> 7;
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int g = lane >> 2;
     const int c = lane & 3;
@@ -366,7 +371,9 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
     // A tile's first row: the next 16 rows, or a GLU's up rows `inter` on.
     const int span = kGlu != 0 ? inter : n;
     auto tile_row = [&](int t) { return kGlu != 0 ? row_base + t * inter : row_base + 16 * t; };
-    if (row_base >= span) return;
+    // With K split, a warp past the bank's rows still meets the fold.
+    if (kKSplit == 1 && row_base >= span) return;
+    const bool rows_live = row_base < span;
 
     const int groups = k >> 5;
     const int chunks = (groups + 3) >> 2;
@@ -426,15 +433,18 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
 
+    // This group's chunks: part, part + kKSplit, ...
+    const int mine = rows_live && part < chunks ? (chunks - part + kKSplit - 1) / kKSplit : 0;
+    auto chunk_of = [&](int i) { return part + i * kKSplit; };
     Chunk ring[kDepth];
 #pragma unroll
     for (int d = 0; d < kDepth; ++d)
-        if (d < chunks) load(d, ring[d]);
-    for (int ch0 = 0; ch0 < chunks; ch0 += kDepth) {
+        if (d < mine) load(chunk_of(d), ring[d]);
+    for (int i0 = 0; i0 < mine; i0 += kDepth) {
 #pragma unroll
         for (int d = 0; d < kDepth; ++d) {
-            const int ch = ch0 + d;
-            if (ch < chunks) {
+            const int i = i0 + d;
+            if (i < mine) {
                 bool wide = false;
 #pragma unroll
                 for (int t = 0; t < kTiles; ++t)
@@ -446,9 +456,32 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
                 } else {
                     w4mma::compute<false, false>(ring[d], acc);
                 }
-                if (ch + kDepth < chunks) load(ch + kDepth, ring[d]);
+                if (i + kDepth < mine) load(chunk_of(i + kDepth), ring[d]);
             }
         }
+    }
+    if constexpr (kKSplit > 1) {
+        // The later groups' sums folded into the first's, a lane its own.
+        constexpr int kAcc = kTiles * kNb * 4;
+        __shared__ float fold[kKSplit - 1][4][kAcc][32];
+        if (part > 0) {
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int b = 0; b < kNb; ++b)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) fold[part - 1][warp][(t * kNb + b) * 4 + e][lane] = acc[t][b][e];
+        }
+        __syncthreads();
+        if (part > 0 || !rows_live) return;
+#pragma unroll
+        for (int p = 0; p < kKSplit - 1; ++p)
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int b = 0; b < kNb; ++b)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) acc[t][b][e] += fold[p][warp][(t * kNb + b) * 4 + e][lane];
     }
 
     const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;

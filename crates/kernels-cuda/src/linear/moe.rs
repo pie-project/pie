@@ -1940,6 +1940,14 @@ pub(crate) fn mxfp4_mma_worth(
 /// select takes; past it, the shared-memory-staged one.
 const STAGED_FROM: u32 = 32;
 
+/// The 128-code chunks a warp of the register-held mxfp4 select keeps in
+/// flight: a decode's few routes stream the bank at the card's rate only
+/// with more than one.
+const MMA_DEPTH: u32 = 1;
+
+/// The deepest K split the register-held mxfp4 select's CTA takes.
+const MMA_KSPLIT_MAX: u32 = 4;
+
 /// The routed mxfp4 select on mma.sync, each expert's rows dequantized in
 /// registers (`linear/moe_w4.cuh`); with `glu`, `y` is the GLU of the bank's
 /// gate rows and the up rows after them, half the bank's width.
@@ -2059,16 +2067,26 @@ fn select_mxfp4_mma(
         )
         .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(STAGES * 8 * nb * 16 * 16))
     } else {
+        let depth = MMA_DEPTH;
+        // A fire of few CTAs (a decode's routes) splits K across groups of
+        // the CTA's warps, so the card's memory has warps enough to stream
+        // the bank: as many as bring it to four CTAs' worth an SM.
+        let sms = ctx.multiprocessors().unwrap_or(108);
+        let ctas = (grid[0] * grid[1]).max(1);
+        let ksplit = if nb == 1 {
+            (4 * sms).div_ceil(ctas).next_power_of_two().clamp(1, MMA_KSPLIT_MAX)
+        } else {
+            1
+        };
+        let nv = tensor_scales.is_some();
         Fire::at(
             "linear/moe_w4.cuh",
-            symbol(&match tensor_scales {
-                // NVFP4: an e4m3 scale a 16 codes, a tensor scale a row.
-                Some(_) => format!("::pie::linear::moe_select_mxfp4_mma<{nb}, 1, {code}, true>"),
-                None => format!("::pie::linear::moe_select_mxfp4_mma<{nb}, 1, {code}>"),
-            }),
+            // NVFP4 (`nv`): an e4m3 scale a 16 codes, a tensor scale a row.
+            symbol(&format!(
+                "::pie::linear::moe_select_mxfp4_mma<{nb}, {depth}, {code}, {nv}, {ksplit}>"
+            )),
         )
-        // One chunk in flight a warp: five CTAs an SM.
-        .apply(Launch::grid(grid, [THREADS, 1, 1]))
+        .apply(Launch::grid(grid, [THREADS * ksplit, 1, 1]))
     };
     let mut args = vec![
         x.arg(),
