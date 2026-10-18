@@ -917,8 +917,19 @@ impl Pools {
                 self.declared_reshaped(pages, slots)
             });
             if fine > fit {
-                self.reshape(fine, slots)?;
-                fit = fine;
+                // What the bodies are held now they mostly give back once
+                // armed, and the fit is struck again then with none held: the
+                // planes reach what the room holds without them, so that fit
+                // can take it. Only `fine` of it is the pool's yet.
+                let reach = match self.budget {
+                    Some(_) => fine,
+                    None => pages_within(self.ceiling, live.saturating_sub(programs), |pages| {
+                        self.declared_reshaped(pages, slots)
+                    })
+                    .max(fine),
+                };
+                self.reshape(reach, slots)?;
+                fit = pages_within(self.ceiling, limit, |pages| self.declared_at(pages));
             }
         }
         // A hybrid declares a recurrent slab for every state slot, whatever
