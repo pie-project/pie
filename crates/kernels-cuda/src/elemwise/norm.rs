@@ -649,13 +649,20 @@ pub fn rmsnorm_gated_by(
         .rows
         .checked_mul(heads)
         .ok_or_else(|| refuse(OP, "the rows' heads do not count"))?;
+    // A warp's (row, head) pairs.
+    let per_warp: u32 = if ctx.tuning().rows_vec { 2 } else { 1 };
     ctx.fire(
         OP,
         Fire::at(
             "elemwise/norm.cuh",
-            symbol(&format!("::pie::elemwise::rmsnorm_gated_by<{t}>")),
+            symbol(&format!(
+                "::pie::elemwise::rmsnorm_gated_by<{t}, {per_warp}>"
+            )),
         )
-        .apply(Launch::grid([pairs.div_ceil(8), 1, 1], [256, 1, 1])),
+        .apply(Launch::grid(
+            [pairs.div_ceil(8 * per_warp), 1, 1],
+            [256, 1, 1],
+        )),
         &[
             x.arg(),
             gate.arg(),

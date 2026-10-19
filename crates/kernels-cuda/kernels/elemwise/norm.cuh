@@ -1588,9 +1588,10 @@ __global__ void __launch_bounds__(kTh) res_blend_norm(
         prefix, blocks, norm_weight, proj_weight, out, B, H, eps, out_weight, out_eps, win);
 }
 
-// A warp a (row, head): its `D` (32 to 256) dims a lane `D / 32` of them,
-// held across the norm.
-template <class ElemT>
+// A warp `kP` (row, head) pairs: a pair's `D` (32 to 256) dims a lane
+// `D / 32` of them, held across the norm. At 128 dims a warp's pairs load
+// at once.
+template <class ElemT, int kP>
 __global__ void __launch_bounds__(256) rmsnorm_gated_by(
     const float* __restrict__ o,
     const ElemT* __restrict__ g,
@@ -1599,50 +1600,71 @@ __global__ void __launch_bounds__(256) rmsnorm_gated_by(
     int rows, int H, int D, float eps,
     const u32* __restrict__ win)
 {
-    const long long pair = static_cast<long long>(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    const long long first = (static_cast<long long>(blockIdx.x) * 8 + (threadIdx.x >> 5)) * kP;
     const int lane = threadIdx.x & 31;
-    const int t = static_cast<int>(pair / H);
-    const int h = static_cast<int>(pair % H);
     const int live = win != nullptr ? min(static_cast<int>(win[0]), rows) : rows;
-    if (t >= live) return;
-    const int row = win != nullptr ? t + static_cast<int>(win[1]) : t;
-    const long long base = ((long long)row * H + h) * D;
+    const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
+    auto base_of = [&](long long pair, bool& in) {
+        const int t = static_cast<int>(pair / H);
+        in = t < live;
+        return (static_cast<long long>(t + row0) * H + pair % H) * D;
+    };
+    auto sigmoid = [](float x) { return 1.f / (1.f + __expf(-x)); };
     const int per = D / 32;
-    float x[8];
-    float acc = 0.f;
     if (per == 4) {
-        const float4 v = reinterpret_cast<const float4*>(o + base)[lane];
-        x[0] = v.x; x[1] = v.y; x[2] = v.z; x[3] = v.w;
-    } else {
+        float4 v[kP];
+        uint2 gw[kP];
+        long long base[kP];
+        bool in[kP];
+        #pragma unroll
+        for (int p = 0; p < kP; ++p) {
+            base[p] = base_of(first + p, in[p]);
+            if (in[p]) {
+                v[p] = reinterpret_cast<const float4*>(o + base[p])[lane];
+                gw[p] = reinterpret_cast<const uint2*>(g + base[p])[lane];
+            }
+        }
+        const float4 wv = reinterpret_cast<const float4*>(weight)[lane];
+        const float w4[4] = {wv.x, wv.y, wv.z, wv.w};
+        #pragma unroll
+        for (int p = 0; p < kP; ++p) {
+            if (!in[p]) continue;
+            const float x[4] = {v[p].x, v[p].y, v[p].z, v[p].w};
+            float acc = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+            const float scale = rsqrtf(acc / static_cast<float>(D) + eps);
+            const ElemT* g4 = reinterpret_cast<const ElemT*>(&gw[p]);
+            uint2 ow;
+            ElemT* o4 = reinterpret_cast<ElemT*>(&ow);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                o4[i] = Elem<ElemT>::from_f32(x[i] * scale * w4[i] * sigmoid(Elem<ElemT>::to_f32(g4[i])));
+            reinterpret_cast<uint2*>(out + base[p])[lane] = ow;
+        }
+        return;
+    }
+    for (int p = 0; p < kP; ++p) {
+        bool in;
+        const long long base = base_of(first + p, in);
+        if (!in) return;
+        float x[8];
+        float acc = 0.f;
 #pragma unroll
         for (int i = 0; i < 8; ++i)
             if (i < per) x[i] = o[base + lane * per + i];
-    }
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
-        if (i < per) acc += x[i] * x[i];
+        for (int i = 0; i < 8; ++i)
+            if (i < per) acc += x[i] * x[i];
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
-    const float scale = rsqrtf(acc / static_cast<float>(D) + eps);
-    if (per == 4) {
-        const uint2 gw = reinterpret_cast<const uint2*>(g + base)[lane];
-        const float4 wv = reinterpret_cast<const float4*>(weight)[lane];
-        const ElemT* g4 = reinterpret_cast<const ElemT*>(&gw);
-        const float w4[4] = {wv.x, wv.y, wv.z, wv.w};
-        uint2 ow;
-        ElemT* o4 = reinterpret_cast<ElemT*>(&ow);
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+        const float scale = rsqrtf(acc / static_cast<float>(D) + eps);
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
-            o4[i] = Elem<ElemT>::from_f32(x[i] * scale * w4[i] * (1.f / (1.f + __expf(-Elem<ElemT>::to_f32(g4[i])))));
-        reinterpret_cast<uint2*>(out + base)[lane] = ow;
-        return;
-    }
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        if (i < per) {
-            const int d = lane * per + i;
-            const float gate = Elem<ElemT>::to_f32(g[base + d]);
-            out[base + d] = Elem<ElemT>::from_f32(x[i] * scale * weight[d] * (1.f / (1.f + __expf(-gate))));
+        for (int i = 0; i < 8; ++i) {
+            if (i < per) {
+                const int d = lane * per + i;
+                out[base + d] = Elem<ElemT>::from_f32(x[i] * scale * weight[d] * sigmoid(Elem<ElemT>::to_f32(g[base + d])));
+            }
         }
     }
 }
