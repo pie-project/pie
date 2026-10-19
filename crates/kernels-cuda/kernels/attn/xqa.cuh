@@ -441,45 +441,75 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
     __syncthreads();
 
     const bool empty = partition_kv && chunk_start >= kv_len;
-    for (int e = tid; e < static_cast<int>(group) * HEAD_DIM; e += 32 * WARPS) {
-        const int h = e / HEAD_DIM;
-        const int d = e % HEAD_DIM;
+    // A head's maximum, sum and each warp's factor once, not a cell at a
+    // time (a warp with no keys factors nothing in).
+    __shared__ float head_m[8], head_l[8], head_f[8][WARPS];
+    if (tid < static_cast<int>(group)) {
+        const int h = tid;
         float m = -1e30f;
 #pragma unroll
         for (int w = 0; w < WARPS; ++w) {
             const float* sw = fold + w * (8 * HEAD_DIM + 16);
             if (sw[8 + h] > 0.f) m = fmaxf(m, sw[h]);
         }
-        float l = 0.f, acc = 0.f;
+        float l = 0.f;
 #pragma unroll
         for (int w = 0; w < WARPS; ++w) {
             const float* sw = fold + w * (8 * HEAD_DIM + 16);
             const float lw = sw[8 + h];
-            if (lw > 0.f) {
-                const float f = exp2f(sw[h] - m);
-                l += lw * f;
-                acc += sw[16 + h * HEAD_DIM + d] * f;
+            const float f = lw > 0.f ? exp2f(sw[h] - m) : 0.f;
+            if (lw > 0.f) l += lw * f;
+            head_f[h][w] = f;
+        }
+        head_m[h] = m;
+        head_l[h] = l;
+    }
+    __syncthreads();
+    // A partial lands at its work item; an unsplit row where its query row
+    // sits (a whole-window plan's requests are the fire's lanes).
+    const long long row_of = partition_kv ? bx : q_indptr[batch];
+    // Four columns a thread at a time.
+    for (int e = tid; e < static_cast<int>(group) * HEAD_DIM / 4; e += 32 * WARPS) {
+        const int h = e / (HEAD_DIM / 4);
+        const int d = e % (HEAD_DIM / 4) * 4;
+        const float m = head_m[h], l = head_l[h];
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) {
+            const float* sw = fold + w * (8 * HEAD_DIM + 16);
+            if (sw[8 + h] > 0.f) {
+                const float4 ow = *reinterpret_cast<const float4*>(sw + 16 + h * HEAD_DIM + d);
+                const float f = head_f[h][w];
+                acc[0] += ow.x * f;
+                acc[1] += ow.y * f;
+                acc[2] += ow.z * f;
+                acc[3] += ow.w * f;
             }
         }
         const int qo_head = kv_head * static_cast<int>(group) + h;
-        // A partial lands at its work item; an unsplit row where its query
-        // row sits (a whole-window plan's requests are the fire's lanes).
-        const long long row =
-            static_cast<long long>(partition_kv ? bx : q_indptr[batch]) * num_qo_heads + qo_head;
-        float out = (l > 0.f && !empty) ? acc / l : 0.f;
-        const float lse_v = (l > 0.f && !empty) ? m + log2f(l) : kEmpty;
+        const long long row = row_of * num_qo_heads + qo_head;
+        const bool live = l > 0.f && !empty;
+        float out[4];
+#pragma unroll
+        for (int x = 0; x < 4; ++x) out[x] = live ? acc[x] / l : 0.f;
+        const float lse_v = live ? m + log2f(l) : kEmpty;
         if (slices > 1) {
             // A slice's state waits in shared memory for the cluster's fold.
             float* mine_out = reinterpret_cast<float*>(smem_raw + Sh::SMEM_BYTES);
-            mine_out[h * HEAD_DIM + d] = out;
+            *reinterpret_cast<float4*>(mine_out + h * HEAD_DIM + d) = make_float4(out[0], out[1], out[2], out[3]);
             if (d == 0) mine_out[8 * HEAD_DIM + h] = lse_v;
             continue;
         }
         if (!partition_kv && sinks != nullptr) {
             const float sink = static_cast<float>(sinks[qo_head]);
-            out *= 1.0f / (1.0f + __expf(-(lse_v * kLn2 - sink)));
+            const float sc = 1.0f / (1.0f + __expf(-(lse_v * kLn2 - sink)));
+#pragma unroll
+            for (int x = 0; x < 4; ++x) out[x] *= sc;
         }
-        o[row * HEAD_DIM + d] = bf16(out);
+        uint2 packed;
+        packed.x = pack(out[0], out[1]);
+        packed.y = pack(out[2], out[3]);
+        *reinterpret_cast<uint2*>(o + row * HEAD_DIM + d) = packed;
         if (lse != nullptr && d == 0) lse[row] = lse_v;
     }
     if (slices == 1) return;
@@ -493,15 +523,28 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
          e += slices * 32 * WARPS) {
         const int h = e / HEAD_DIM;
         const int d = e % HEAD_DIM;
+        // Every slice's state out at once (eight ranks at most).
+        float lr[8], orr[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            if (r < slices) {
+                lr[r] = ld_cluster(states + 8 * HEAD_DIM + h, static_cast<unsigned>(r));
+                orr[r] = ld_cluster(states + h * HEAD_DIM + d, static_cast<unsigned>(r));
+            }
+        }
         float m = -1e30f;
-        for (int r = 0; r < slices; ++r) {
-            m = fmaxf(m, ld_cluster(states + 8 * HEAD_DIM + h, static_cast<unsigned>(r)));
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            if (r < slices) m = fmaxf(m, lr[r]);
         }
         float l = 0.f, acc = 0.f;
-        for (int r = 0; r < slices; ++r) {
-            const float w = exp2f(ld_cluster(states + 8 * HEAD_DIM + h, static_cast<unsigned>(r)) - m);
-            l += w;
-            acc += w * ld_cluster(states + h * HEAD_DIM + d, static_cast<unsigned>(r));
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            if (r < slices) {
+                const float w = exp2f(lr[r] - m);
+                l += w;
+                acc += w * orr[r];
+            }
         }
         float out = l > 0.f ? acc / l : 0.f;
         const float lse_v = l > 0.f ? m + log2f(l) : kEmpty;
