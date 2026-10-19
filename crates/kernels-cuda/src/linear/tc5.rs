@@ -635,8 +635,9 @@ pub enum Groups {
     /// `y`, `rows x n`). `offsets` is a device `i32[experts + 1]`, every
     /// entry a multiple of [`GROUP_ALIGN`]; the pad rows between experts
     /// are computed and land, unread. Rows past `offsets[experts]` are not
-    /// touched.
-    Contiguous { offsets: u64, rows: u32 },
+    /// touched. `cap` is the most rows an expert holds, where the layout
+    /// knows it (a decode's distinct routes: its tokens), else 0.
+    Contiguous { offsets: u64, rows: u32, cap: u32 },
     /// The decode layout: expert e's rows at `[e * m_max, e * m_max +
     /// counts[e])` of an `experts * m_max`-row activation and of `y`.
     /// `counts` is a device `i32[experts]`, each at most `m_max <= 256`.
@@ -802,7 +803,7 @@ pub fn grouped_gemm_epi_with(
     let bank = g.experts * n_per;
     let q_step = if glu { 128 } else { plan.bn };
     let job = match g.groups {
-        Groups::Contiguous { offsets, rows } => {
+        Groups::Contiguous { offsets, rows, cap } => {
             let swap = plan.swap;
             if swap && !matches!(kind, Kind::Mixed(_) | Kind::Mx | Kind::Nvf4) {
                 return Err(refuse(
@@ -812,8 +813,9 @@ pub fn grouped_gemm_epi_with(
             }
             // A 32-row Q tile at an odd quarter of its rows' 128-row scale
             // atom (an expert's second) faults the block-scaled MMA, as an
-            // A-side one does.
-            if swap && act.scales.is_some() && plan.bn < 64 {
+            // A-side one does: one an expert (its rows `cap` or fewer) starts
+            // at an even one.
+            if swap && act.scales.is_some() && plan.bn < 64 && (cap == 0 || cap > plan.bn) {
                 return Err(refuse(
                     OP,
                     "a swapped contiguous group of scaled rows takes Q tiles of 64 rows or more",

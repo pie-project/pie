@@ -835,7 +835,12 @@ pub(crate) fn lay_out_quant_nvfp4(
     Ok(Layout {
         pos,
         rows,
-        groups: tc5::Groups::Contiguous { offsets, rows },
+        // A router names an expert once a token.
+        groups: tc5::Groups::Contiguous {
+            offsets,
+            rows,
+            cap: routes.rows,
+        },
         m_max: 0,
         counts,
     })
@@ -891,7 +896,11 @@ pub(crate) fn lay_out_with(
             Layout {
                 pos,
                 rows,
-                groups: tc5::Groups::Contiguous { offsets, rows },
+                groups: tc5::Groups::Contiguous {
+                    offsets,
+                    rows,
+                    cap: if distinct == Some(true) { tokens } else { 0 },
+                },
                 m_max,
                 counts,
             }

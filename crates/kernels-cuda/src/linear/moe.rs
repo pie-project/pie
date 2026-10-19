@@ -1093,10 +1093,12 @@ fn experts_w4a4(
         // a weight row, its epilogue over the expert's rows alone (unswapped,
         // a thread a row, the whole 128-row block's).
         let sms = ctx.multiprocessors().unwrap_or(148);
+        // A Q tile of 32 rows where every expert's fit one (the fused
+        // layout states its rows the fire's tokens at most), else 64.
         let swapped = tc5::Plan {
             swap: true,
             pair: false,
-            bn: 64,
+            bn: if fused && routes.rows <= 32 { 32 } else { 64 },
             stages: 0,
             splits: 1,
         };
