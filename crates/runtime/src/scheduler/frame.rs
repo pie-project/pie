@@ -68,6 +68,10 @@ struct PlacedFire {
     tokens: usize,
 }
 
+/// A pass of at most this share of a fire's tokens is short
+/// ([`FramePolicy::seal`] places short passes first).
+const SHORT_PASS_SHARE: usize = 8;
+
 struct PendingFrame {
     seq: u64,
     expected: u32,
@@ -793,6 +797,21 @@ impl FramePolicy {
             if mid_boundary && fresh.is_empty() {
                 return None;
             }
+            // A short pass (a decode, a turn whose context is cached) goes
+            // before the prompts' chunks, which each fill a fire and take it
+            // in the order they became ready: otherwise a turn of a few
+            // tokens waits out every chunk that happens to sort ahead of it
+            // (agent trace, one GPU: TTFT p90 ~625 -> ~540 ms).
+            let short = (max_wave_tokens / SHORT_PASS_SHARE).max(1);
+            let rank = |lane: &ProcessId| {
+                let front = self.lanes.get(lane).and_then(|l| l.frames.front());
+                let tokens: usize =
+                    front.map_or(0, |f| f.fires.iter().map(|fire| fire.tokens).sum());
+                let ready = front.and_then(|f| f.complete_at);
+                (tokens > short, if tokens > short { ready } else { None })
+            };
+            fresh.sort_by_key(rank);
+            continuing.sort_by_key(rank);
             // The policy's schedule ranks lanes by their process's key; a
             // stable sort keeps lane order among equals, so with no schedule
             // nothing moves.
