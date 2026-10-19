@@ -875,8 +875,8 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
     float* xbuf = reinterpret_cast<float*>(smem + L::kOffX);
     u32* lists = reinterpret_cast<u32*>(smem + L::kOffList);
     u64* full = reinterpret_cast<u64*>(smem + L::kOffBar);
-    u64* empty = full + kSlots;
-    u64* s_full = empty + kSlots;
+    u64* empty = full + 2 * kSlots;
+    u64* s_full = empty + 2 * kSlots;
     u64* s_free = s_full + 1;
     u64* p_full = s_free + 1;
     u64* pv_done = p_full + 2;
@@ -895,9 +895,11 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
     if (threadIdx.x == 0) {
         bar_init(s_full, 1);
         bar_init(s_free, 128);
-        for (int s = 0; s < 2; ++s) {
+        for (int s = 0; s < 2 * kSlots; ++s) {
             bar_init(&full[s], kGatherThreads);
             bar_init(&empty[s], 1);
+        }
+        for (int s = 0; s < 2; ++s) {
             bar_init(&p_full[s], 128);
             bar_init(&pv_done[s], 1);
             bar_init(&row_full[s], 1);
@@ -1046,23 +1048,30 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
                 for (int m = 0; m < 8; ++m) cells[m] = l[16 * m + g];
                 __syncwarp();
                 if (lane == 0) bar_arrive(&list_free[J % kLists]);
-                bar_wait(&empty[slot], ((J / kSlots) & 1) ^ 1);
                 const u32 dst = sbase + L::kOffRing + slot * L::kSlot;
+                // Each half of the latent (atoms 2h, 2h + 1) once its half of
+                // the slot is free, the rotated codes with the second: the
+                // products start on the first while the second lands.
 #pragma unroll
-                for (int m = 0; m < 8; ++m) {
-                    const int k = 16 * m + g;
-                    const u32 cell = cells[m] & kSlotMask;
-                    const bool on = cell != kSlotMask;
-                    const unsigned char* src = p.kv + static_cast<long long>(on ? cell : 0) * p.kv_width;
-                    const u32 sw = static_cast<u32>(k * 128 + ((c ^ (k % 8)) * 16));
+                for (int h = 0; h < 2; ++h) {
+                    bar_wait(&empty[2 * slot + h], ((J / kSlots) & 1) ^ 1);
 #pragma unroll
-                    for (int a = 0; a < 4; ++a) {
-                        cp_async16(dst + a * e4::kAtom + sw, src + a * 128 + c * 16, on);
+                    for (int m = 0; m < 8; ++m) {
+                        const int k = 16 * m + g;
+                        const u32 cell = cells[m] & kSlotMask;
+                        const bool on = cell != kSlotMask;
+                        const unsigned char* src = p.kv + static_cast<long long>(on ? cell : 0) * p.kv_width;
+                        const u32 sw = static_cast<u32>(k * 128 + ((c ^ (k % 8)) * 16));
+#pragma unroll
+                        for (int a = 2 * h; a < 2 * h + 2; ++a) {
+                            cp_async16(dst + a * e4::kAtom + sw, src + a * 128 + c * 16, on);
+                        }
+                        if (kRope > 0 && h == 1) cp_async16(dst + e4::kLatent + sw, src + 448 + c * 16, on);
                     }
-                    if constexpr (kRope > 0) cp_async16(dst + e4::kLatent + sw, src + 448 + c * 16, on);
+                    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(
+                                     smem_addr(&full[2 * slot + h]))
+                                 : "memory");
                 }
-                asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(smem_addr(&full[slot]))
-                             : "memory");
             }
         }
     } else if (warp == 4) {
@@ -1085,8 +1094,8 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
                                   sdesc_sw128_mn(tile + 2 * v * e4::kAtom + s2 * 4096, e4::kAtom), idesc_o,
                                   i > first || s2 > 0);
                     }
+                    tc_commit(&empty[2 * (i % kSlots) + v]);
                 }
-                tc_commit(&empty[i % kSlots]);
                 tc_commit(&pv_done[i & 1]);
             }
             __syncwarp();
@@ -1122,18 +1131,24 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
             for (int j = 0; j < w.nt; ++j, ++J) {
                 const int slot = J % kSlots;
                 if (J >= 1) bar_wait(s_free, (J - 1) & 1);
-                bar_wait(&full[slot], (J / kSlots) & 1);
-                fence_async_shared();
-                tc_fence_after();
-                __syncwarp();
-                if (elect_one()) {
-                    const u32 tile = sbase + L::kOffRing + slot * L::kSlot;
-                    const u32 d = tmem + e4::kColS;
+                const u32 tile = sbase + L::kOffRing + slot * L::kSlot;
+                const u32 d = tmem + e4::kColS;
 #pragma unroll
-                    for (int s = 0; s < 16; ++s) {
-                        mma_ws_ts_f8(d, tmem + e4::kColQ + s * 8,
-                                     sdesc_sw128(tile + (s / 4) * e4::kAtom) + 2 * (s % 4), idesc_s, s > 0);
+                for (int h = 0; h < 2; ++h) {
+                    bar_wait(&full[2 * slot + h], (J / kSlots) & 1);
+                    fence_async_shared();
+                    tc_fence_after();
+                    __syncwarp();
+                    if (elect_one()) {
+#pragma unroll
+                        for (int s = 8 * h; s < 8 * h + 8; ++s) {
+                            mma_ws_ts_f8(d, tmem + e4::kColQ + s * 8,
+                                         sdesc_sw128(tile + (s / 4) * e4::kAtom) + 2 * (s % 4), idesc_s, s > 0);
+                        }
                     }
+                    __syncwarp();
+                }
+                if (elect_one()) {
                     if constexpr (kRope > 0) {
                         // The rotated codes at byte 64 of the fifth atom.
 #pragma unroll
