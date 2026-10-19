@@ -527,11 +527,26 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
                     p.q_pe + static_cast<long long>(qrow) * p.qpe_stride + head * kRope);
                 constexpr int kC = kRope > 0 ? 3 : 2;
                 uint4 x[kRope > 0 ? 40 : 32];
+                // 32 bytes a load: a thread's 512 contiguous bytes are a
+                // warp's 32 rows, so each load's lines are as many as its
+                // lanes, and half the loads halve the wavefronts.
+                auto ld32b = [](const uint4* at, uint4& a, uint4& b) {
+                    asm volatile("ld.global.nc.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                 : "=r"(a.x), "=r"(a.y), "=r"(a.z), "=r"(a.w), "=r"(b.x), "=r"(b.y), "=r"(b.z),
+                                   "=r"(b.w)
+                                 : "l"(at));
+                };
 #pragma unroll
-                for (int g = 0; g < 32; ++g) x[g] = src[g];
+                for (int g = 0; g < 32; g += 2) ld32b(src + g, x[g], x[g + 1]);
                 if constexpr (kRope > 0) {
 #pragma unroll
-                    for (int g = 0; g < 8; ++g) x[32 + g] = half == 0 ? pe[g] : make_uint4(0, 0, 0, 0);
+                    for (int g = 0; g < 8; g += 2) {
+                        if (half == 0) {
+                            ld32b(pe + g, x[32 + g], x[33 + g]);
+                        } else {
+                            x[32 + g] = x[33 + g] = make_uint4(0, 0, 0, 0);
+                        }
+                    }
                 }
 #pragma unroll
                 for (int c = 0; c < kC; ++c) {
