@@ -2210,8 +2210,10 @@ pub fn select_fp8_w8a16(
     let nb: u32 = match per {
         0..=4 => 1,
         5..=12 => 2,
-        _ => 4,
+        _ if fan.route_count < FP8_GEMM_FROM => 4,
+        _ => 8,
     };
+    let tiled = nb == 8;
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
     let inter = stated(op, y.width)?;
@@ -2245,16 +2247,32 @@ pub fn select_fp8_w8a16(
     } else {
         1
     };
-    let fire = Fire::at(
-        "linear/moe_w8.cuh",
-        symbol(&format!(
-            "::pie::linear::moe_select_fp8_mma<{nb}, {DEPTH}, {code}, {gran}, {tiles}, {ksplit}>"
-        )),
-    )
-    .apply(Launch::grid(
-        [work_cap, wide(cols), 1],
-        [THREADS * ksplit, 1, 1],
-    ));
+    let fire = if tiled {
+        // Three stages of 64 routes' activations and 128 rows' codes, 64 of
+        // K, and the widened tile: two CTAs an SM.
+        const STAGES: u32 = 3;
+        const WN: u32 = 2;
+        let cols = if glu.is_some() { 64 } else { 128 };
+        Fire::at(
+            "linear/moe_w8.cuh",
+            symbol(&format!("::pie::linear::moe_select_fp8_gemm<{STAGES}, {code}, {gran}, {WN}>")),
+        )
+        .apply(
+            Launch::grid([work_cap, wide(cols), 1], [64 * WN, 1, 1])
+                .smem(STAGES * (64 * 128 + 128 * 64) + 128 * 128),
+        )
+    } else {
+        Fire::at(
+            "linear/moe_w8.cuh",
+            symbol(&format!(
+                "::pie::linear::moe_select_fp8_mma<{nb}, {DEPTH}, {code}, {gran}, {tiles}, {ksplit}>"
+            )),
+        )
+        .apply(Launch::grid(
+            [work_cap, wide(cols), 1],
+            [THREADS * ksplit, 1, 1],
+        ))
+    };
     ctx.fire(
         op,
         fire,
@@ -2276,6 +2294,12 @@ pub fn select_fp8_w8a16(
         ],
     )
 }
+
+/// From this many routes a fire (a prefill's), a W8A16 select is the tiled
+/// GEMM that widens a stage's codes once a 64 routes
+/// (`moe_select_fp8_gemm`); fewer, the register-held kernel streams the
+/// bank as fast.
+const FP8_GEMM_FROM: u32 = 8192;
 
 /// The most routes an expert averages that a bf16 bank's select takes on
 /// the register-held mma.sync kernel; past it, the grouped GEMM (which a
