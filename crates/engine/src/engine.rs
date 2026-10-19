@@ -37,6 +37,13 @@ pub struct KvWrites {
 
 pub type CompletionSink = std::sync::Arc<dyn Fn(StepDone, StepOutcome) + Send + Sync>;
 
+/// Writes host kv slots from any thread, laid out as [`Engine::read_host_kv`]
+/// returns them. The slots are the caller's own, read by no copy until it
+/// has written them.
+pub trait HostKvWriter: Send + Sync {
+    fn write(&self, slots: &[u32], bytes: &[u8]) -> Result<()>;
+}
+
 pub trait Engine: Send + Sync {
     fn kind(&self) -> &'static str;
 
@@ -159,6 +166,12 @@ pub trait Engine: Send + Sync {
     fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()> {
         let _ = (slots, bytes);
         Err(self.unsupported("write_host_kv"))
+    }
+
+    /// [`Engine::write_host_kv`] without the engine's thread: pages another
+    /// worker sends land while a frame holds it. `None`: they wait for it.
+    fn host_kv_writer(&self) -> Option<std::sync::Arc<dyn HostKvWriter>> {
+        None
     }
 
     fn disconnect(&self, message: &str) {

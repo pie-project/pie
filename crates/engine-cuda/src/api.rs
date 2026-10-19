@@ -964,6 +964,11 @@ impl Engine for Cuda {
         self.loaded_mut()?.read_host_kv(slots).map_err(fault)
     }
 
+    fn host_kv_writer(&self) -> Option<std::sync::Arc<dyn engine::HostKvWriter>> {
+        let writer = self.shell.as_ref()?.host_kv_writer()?;
+        Some(std::sync::Arc::new(writer))
+    }
+
     fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
         self.loaded_mut()?
             .write_host_kv(slots, bytes)

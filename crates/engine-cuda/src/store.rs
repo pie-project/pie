@@ -491,11 +491,57 @@ struct DiskKv {
 /// moves in one copy; the host rs rows follow them.
 #[derive(Debug)]
 struct HostKv {
-    buffer: crate::device::Pinned,
+    buffer: std::sync::Arc<crate::device::Pinned>,
     pages: u32,
     window_pages: u32,
     rows: u32,
     row_bytes: u64,
+}
+
+/// The host kv slots, written from outside the engine's thread.
+#[derive(Debug)]
+pub struct HostKvWriter {
+    buffer: std::sync::Arc<crate::device::Pinned>,
+    pages: u32,
+    plane_bytes: Vec<u64>,
+}
+
+impl engine::HostKvWriter for HostKvWriter {
+    fn write(&self, slots: &[u32], bytes: &[u8]) -> engine::Result<()> {
+        let slot_bytes: u64 = self.plane_bytes.iter().sum();
+        if bytes.len() as u64 != slots.len() as u64 * slot_bytes {
+            return Err(engine::Error::Invalid(format!(
+                "{} bytes for {} host kv slots of {slot_bytes}",
+                bytes.len(),
+                slots.len()
+            )));
+        }
+        let mut from = 0usize;
+        for &slot in slots {
+            if slot >= self.pages {
+                return Err(engine::Error::Invalid(format!(
+                    "host kv slot {slot} of {}",
+                    self.pages
+                )));
+            }
+            let mut base = 0u64;
+            for &page_bytes in &self.plane_bytes {
+                let at = base + u64::from(slot) * page_bytes;
+                let len = usize::try_from(page_bytes).unwrap_or(0);
+                if !self.buffer.write(
+                    usize::try_from(at).unwrap_or(usize::MAX),
+                    &bytes[from..from + len],
+                ) {
+                    return Err(engine::Error::Invalid(format!(
+                        "host kv slot {slot} lies past the host buffer"
+                    )));
+                }
+                from += len;
+                base += u64::from(self.pages) * page_bytes;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Pools {
@@ -1487,7 +1533,7 @@ impl Pools {
             .then(|| {
                 crate::device::Pinned::mapped_uninit(usize::try_from(bytes).unwrap_or(usize::MAX))
                     .map(|buffer| HostKv {
-                        buffer,
+                        buffer: std::sync::Arc::new(buffer),
                         pages,
                         window_pages,
                         rows,
@@ -1793,6 +1839,23 @@ impl Pools {
             }
         }
         Ok(out)
+    }
+
+    /// Writes into the host kv slots from any thread, as
+    /// [`Self::write_host_kv`] does: the buffer and where each plane keeps a
+    /// slot are fixed once the host tier is seated.
+    #[must_use]
+    pub fn host_kv_writer(&self) -> Option<HostKvWriter> {
+        let host = self.host.as_ref()?;
+        Some(HostKvWriter {
+            buffer: std::sync::Arc::clone(&host.buffer),
+            pages: host.pages,
+            plane_bytes: self
+                .paged_planes()
+                .iter()
+                .map(|&(_, bytes)| bytes)
+                .collect(),
+        })
     }
 
     /// Writes `bytes`, as [`Self::read_host_kv`] lays them out, into host kv

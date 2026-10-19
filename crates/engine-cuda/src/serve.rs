@@ -332,6 +332,11 @@ impl Shell {
     }
 
     /// Behind every copy on the stream, so none still reads the slots.
+    #[must_use]
+    pub fn host_kv_writer(&self) -> Option<crate::store::HostKvWriter> {
+        self.pools.host_kv_writer()
+    }
+
     pub fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()> {
         self.device.synchronize()?;
         self.pools.write_host_kv(slots, bytes)

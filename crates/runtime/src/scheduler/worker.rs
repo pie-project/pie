@@ -1012,6 +1012,10 @@ impl BatchScheduler {
         frame_size: usize,
     ) {
         let engine = crate::engine::take_engine_backend(engine_id).ok();
+        super::set_host_kv_writer(
+            engine_id,
+            engine.as_ref().and_then(|engine| engine.host_kv_writer()),
+        );
         let mut lane = Lane::spawn(engine_id, engine, Arc::clone(&stats));
         let mut replies = LaneReplies::default();
         let mut instances = HashMap::new();

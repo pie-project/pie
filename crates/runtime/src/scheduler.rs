@@ -135,7 +135,35 @@ pub(crate) async fn read_device_kv(
         .await
 }
 
+/// Each engine's host kv writer, where it has one that needs no lane.
+static HOST_KV_WRITERS: std::sync::RwLock<Vec<Option<Arc<dyn ::engine::HostKvWriter>>>> =
+    std::sync::RwLock::new(Vec::new());
+
+pub(crate) fn set_host_kv_writer(
+    engine_id: usize,
+    writer: Option<Arc<dyn ::engine::HostKvWriter>>,
+) {
+    let mut writers = HOST_KV_WRITERS.write().unwrap();
+    if writers.len() <= engine_id {
+        writers.resize(engine_id + 1, None);
+    }
+    writers[engine_id] = writer;
+}
+
+/// Writes host kv slots: straight into the engine's host tier where it can
+/// be written from here, else on the engine's lane, after the frame it runs.
 pub(crate) async fn write_host_kv(engine_id: usize, slots: Vec<u32>, bytes: Vec<u8>) -> Result<()> {
+    let writer = HOST_KV_WRITERS
+        .read()
+        .unwrap()
+        .get(engine_id)
+        .cloned()
+        .flatten();
+    if let Some(writer) = writer {
+        return crate::rt::spawn_blocking(move || writer.write(&slots, &bytes))
+            .await?
+            .map_err(anyhow::Error::from);
+    }
     scheduler_handle(engine_id)?
         .host_kv(worker::HostKvOp::Write(slots, bytes))
         .await
