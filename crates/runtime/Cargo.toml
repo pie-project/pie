@@ -14,6 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 engine = { path = "../engine" }
+pie-trace = { path = "../trace" }
 state = { path = "../state" }
 profile = { package = "pie-profile", path = "../profile" }
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }

@@ -28,6 +28,9 @@ impl pie::inferlet::tools::Host for ProcessCtx {
     }
 
     async fn answer(&mut self, name: String, value: String) -> Result<Vec<u32>> {
+        // The agent waited on this tool since its last device work; the trace
+        // keeps the tool's name, never its value.
+        pie_trace::tool(self.id().as_u128(), &name);
         Ok(crate::model::model().instruct().answer(&name, &value))
     }
 

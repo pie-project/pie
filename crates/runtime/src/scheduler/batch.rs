@@ -179,6 +179,56 @@ pub(crate) fn build_batch_request(
               8 bytes instead of 1408. Unboxing would trade one allocation per request \
               for a 1408-byte memcpy on every shuffle and every Vec regrow"
 )]
+/// Each agent's rows in one step, for the agent trace: what its lanes carry
+/// (a lane the device resolves still carries a placeholder per row), the KV
+/// it already held, and the pages the lanes name.
+fn trace_parts(group: &[Box<PendingRequest>]) -> Vec<pie_trace::Part> {
+    let mut parts: Vec<(pie_trace::Part, HashSet<u32>)> = Vec::new();
+    for req in group {
+        let Some(agent) = req.process_id.or(req.pipeline_id) else {
+            continue;
+        };
+        let agent = agent.as_u128();
+        let index = match parts.iter().position(|(p, _)| p.agent == agent) {
+            Some(index) => index,
+            None => {
+                parts.push((
+                    pie_trace::Part {
+                        agent,
+                        ..pie_trace::Part::default()
+                    },
+                    HashSet::new(),
+                ));
+                parts.len() - 1
+            }
+        };
+        let (part, pages) = &mut parts[index];
+        for lane in &req.request.lanes {
+            let rows = u32::try_from(lane.tokens.len().max(1)).unwrap_or(u32::MAX);
+            if rows > 1 {
+                part.prefill += rows;
+                part.cached += lane.kv.held;
+            } else {
+                part.decode += 1;
+            }
+            pages.extend(lane.kv.pages.iter().copied());
+        }
+        if req.trace_submitted_us > 0 {
+            part.queued_since = Some(
+                part.queued_since
+                    .map_or(req.trace_submitted_us, |t| t.min(req.trace_submitted_us)),
+            );
+        }
+    }
+    parts
+        .into_iter()
+        .map(|(mut part, pages)| {
+            part.pages = u32::try_from(pages.len()).unwrap_or(u32::MAX);
+            part
+        })
+        .collect()
+}
+
 pub(crate) fn build_frame_submission(
     waves: Vec<Vec<Box<PendingRequest>>>,
     limits: SchedulerLimits,
@@ -283,7 +333,13 @@ pub(crate) fn build_frame_submission(
             let lane = build.member_lane_indptr[member];
             attachments.push(::engine::Attachment { lane, instance, at });
         }
+        let trace_step = if pie_trace::enabled() {
+            pie_trace::step_posted(trace_parts(&group))
+        } else {
+            0
+        };
         steps.push(StepFire {
+            trace_step,
             submission: ::engine::Step {
                 lanes,
                 attachments,
@@ -319,6 +375,7 @@ mod tests {
             prelaunch_copy: None,
             prelaunch_state_copy: None,
             frame: None,
+            trace_submitted_us: 0,
         })
     }
 

@@ -699,6 +699,9 @@ impl Process {
         result_tx: SharedResultTx,
         arrival: Arrival,
     ) {
+        if pie_trace::enabled() {
+            pie_trace::agent_start(process_id.as_u128(), &program.to_string());
+        }
         // A process arrives, as a policy sees it, before it waits: every gate
         // below orders by its key.
         let props = arrival.props.clone();
@@ -780,6 +783,7 @@ impl Process {
             wasm_run_us,
         );
 
+        pie_trace::agent_end(process_id.as_u128());
         if let Err(ref err) = result {
             tracing::info!("Process {process_id} failed: {err}");
         }

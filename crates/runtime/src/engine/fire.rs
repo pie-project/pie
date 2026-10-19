@@ -82,6 +82,8 @@ pub struct StepFire {
     pub terminal_cells: Vec<CellPtr>,
     pub instances: Vec<u64>,
     pub logical_fire_ids: Vec<u64>,
+    /// The agent trace's id for this step; 0 while no trace is on.
+    pub trace_step: u64,
 }
 
 #[derive(Default)]

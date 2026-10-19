@@ -130,6 +130,9 @@ pub(crate) struct PendingRequest {
     pub(crate) frame: Option<FrameStamp>,
     pub(crate) hook_program: bool,
     pub(crate) lora_program: bool,
+    /// When it was submitted, on the agent trace's clock; 0 while no trace
+    /// is on.
+    pub(crate) trace_submitted_us: u64,
 }
 
 impl PendingRequest {
@@ -165,6 +168,7 @@ impl PendingRequest {
             frame,
             hook_program,
             lora_program,
+            trace_submitted_us: pie_trace::now_us(),
         }
     }
 
@@ -464,6 +468,9 @@ struct PendingLaunchBatch {
     )]
     requests: Vec<Box<PendingRequest>>,
     started: Instant,
+    /// The agent trace's ids for the frame's steps; empty while no trace is
+    /// on.
+    trace_steps: Vec<u64>,
     batch_size: u64,
     total_tokens: usize,
 }
@@ -2253,6 +2260,15 @@ impl BatchScheduler {
         }
         let (submission, requests) =
             batch::build_frame_submission(survivors, limits, page_size, stats);
+        let trace_steps: Vec<u64> = if pie_trace::enabled() {
+            submission
+                .steps
+                .iter()
+                .map(|step| step.trace_step)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let batch_size = requests.len() as u64;
         let total_tokens = requests
             .iter()
@@ -2270,6 +2286,7 @@ impl BatchScheduler {
             started: Instant::now(),
             batch_size,
             total_tokens,
+            trace_steps,
         });
         (true, true)
     }
@@ -2321,6 +2338,7 @@ impl BatchScheduler {
             let result = result.expect("accepted batch carries a settled result");
             match result {
                 Ok(()) => {
+                    pie_trace::step_retired(&retired.trace_steps);
                     for request in &retired.requests {
                         request.completion.mark_native_retired();
                     }
@@ -2670,6 +2688,7 @@ mod tests {
             prelaunch_copy: None,
             prelaunch_state_copy: Some(StateCopy::default()),
             frame: None,
+            trace_submitted_us: 0,
         };
         let mut pending = PendingQueue::default();
         BatchScheduler::queue_attempt(&mut pending, request);
@@ -2705,6 +2724,7 @@ mod tests {
                         terminal_cells: Vec::new(),
                         instances: vec![0],
                         logical_fire_ids: vec![token],
+                        trace_step: 0,
                     }],
                 },
                 false,
@@ -2781,6 +2801,7 @@ mod tests {
                     terminal_cells: Vec::new(),
                     instances: vec![0],
                     logical_fire_ids: vec![42],
+                    trace_step: 0,
                 }],
             },
             false,

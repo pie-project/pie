@@ -554,6 +554,10 @@ impl Lane {
             }
             Err(error) => return Err(format!("{error}")),
         };
+        if pie_trace::enabled() {
+            let steps: Vec<u64> = frame.steps.iter().map(|step| step.trace_step).collect();
+            pie_trace::frame_submitted(ticket.id, &steps);
+        }
 
         let asynchronous = engine.settles_asynchronously();
         if asynchronous {

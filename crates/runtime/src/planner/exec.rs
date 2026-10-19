@@ -398,6 +398,7 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         stores.rs.lock().unwrap().commit_suspend(txn)
     });
     fence.keep_raised();
+    pie_trace::evict(pid.as_u128(), u32::try_from(freed).unwrap_or(u32::MAX));
     planner.report_evicted(pid, freed as u32, rs_freed);
 }
 
