@@ -613,9 +613,10 @@ __device__ __forceinline__ void norm_gate_out(
 // A gate's alpha and beta from its channel's `g`.
 __device__ __forceinline__ void norm_gate_ab(float g, float temperature, float& alpha, float& beta)
 {
-    const float w = g / temperature;
-    beta = 1.f / (1.f + __expf(-w));
-    alpha = sqrtf(fmaxf((1.f / (1.f + __expf(w))) * (1.f + beta), 1e-3f));
+    const float w = __fdividef(g, temperature);
+    beta = __fdividef(1.f, 1.f + __expf(-w));
+    const float a2 = fmaxf(__fdividef(1.f, 1.f + __expf(w)) * (1.f + beta), 1e-3f);
+    alpha = a2 * rsqrtf(a2);
 }
 
 // `u = x * scale` rounded to T (`x` with no scale).
