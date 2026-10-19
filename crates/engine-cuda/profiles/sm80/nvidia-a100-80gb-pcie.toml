@@ -7,7 +7,7 @@ device = "NVIDIA A100 80GB PCIe"
 # cuBLAS over the fused skinny GEMM, the narrow bf16 GEMV, row kernels 16
 # bytes a lane, a split attention's partials folded a warp a row;
 # a block-FP8 projection's two rows or fewer on the GEMV over bf16 rows;
-# MXFP4 selects of 16 routes or more on the register-dequant MMA (fewer stay
+# MXFP4 selects of 17 routes or more on the register-dequant MMA (fewer stay
 # on the per-route kernel, which streams a decode's bank faster); Qwen3.5's
 # gated delta on the fused scan; DeepSeek-V4.1's bounded replay, as B200's.
 [kernel]
@@ -17,7 +17,7 @@ gemv.bf16 = "narrow"
 gemm.narrow_n = 8
 elemwise.rows_vec = true
 sdpa.merge_warp = true
-moe.mxfp4_mma_from = 16
+moe.mxfp4_mma_from = 17
 moe.mxfp4_mma_until = 16777216
 sdpa.dsv4_replay = true
 ssm = ["gdn_fused_scan", "conv_vec4", "gdn_out_bf16", "kda_chunked", "kda_step_fused"]
