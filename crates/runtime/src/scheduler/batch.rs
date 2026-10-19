@@ -291,6 +291,7 @@ pub(crate) fn build_frame_submission(
                 voxels: build.voxels,
             },
             terminal_cells: build.terminal_cells,
+            members: build.instance_ids,
             instances,
             logical_fire_ids: build.logical_fire_ids,
         });
