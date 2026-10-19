@@ -4016,6 +4016,21 @@ __device__ __forceinline__ float kda_tanh(float x) {
     asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
 }
+// Two products an instruction where the card pairs them (sm_100 on), the
+// same rounding as apart.
+__device__ __forceinline__ float2 kda_mul2(float2 a, float2 b) {
+#if __CUDA_ARCH__ >= 1000
+    unsigned long long x, y, r;
+    asm("mov.b64 %0, {%1, %2};" : "=l"(x) : "f"(a.x), "f"(a.y));
+    asm("mov.b64 %0, {%1, %2};" : "=l"(y) : "f"(b.x), "f"(b.y));
+    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(r) : "l"(x), "l"(y));
+    float2 o;
+    asm("mov.b64 {%0, %1}, %2;" : "=f"(o.x), "=f"(o.y) : "l"(r));
+    return o;
+#else
+    return make_float2(a.x * b.x, a.y * b.y);
+#endif
+}
 constexpr int KDA16_TASKS = 2;
 // A (chunk, head)'s shared memory: three bf16 chunk tiles (the scaled keys,
 // their column twins, the scaled queries), `A` in f32, and the two warps'
@@ -4195,16 +4210,24 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
         unpack4(qr, i, q);
         float ke[4], kd[4], kz[4], kl[4], qe[4], qd[4];
         #pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            const float kk = k[u] * kinv[ii];
-            const float up = kk * kda_ex2(-G[ii][u]);
-            const float e = kda_ex2(G[ii][u]);
-            ke[u] = kk * e;
-            kd[u] = ke[u] * einv_0[u];
-            kz[u] = up * e_0[u];
-            kl[u] = up * e_l[u];
-            qe[u] = q[u] * qinv[ii] * e;
-            qd[u] = qe[u] * einv_0[u];
+        for (int u = 0; u < 4; u += 2) {
+            const float2 kk = kda_mul2(make_float2(k[u], k[u + 1]), make_float2(kinv[ii], kinv[ii]));
+            const float2 up =
+                kda_mul2(kk, make_float2(kda_ex2(-G[ii][u]), kda_ex2(-G[ii][u + 1])));
+            const float2 e = make_float2(kda_ex2(G[ii][u]), kda_ex2(G[ii][u + 1]));
+            const float2 ke2 = kda_mul2(kk, e);
+            const float2 kd2 = kda_mul2(ke2, make_float2(einv_0[u], einv_0[u + 1]));
+            const float2 kz2 = kda_mul2(up, make_float2(e_0[u], e_0[u + 1]));
+            const float2 kl2 = kda_mul2(up, make_float2(e_l[u], e_l[u + 1]));
+            const float2 qe2 =
+                kda_mul2(kda_mul2(make_float2(q[u], q[u + 1]), make_float2(qinv[ii], qinv[ii])), e);
+            const float2 qd2 = kda_mul2(qe2, make_float2(einv_0[u], einv_0[u + 1]));
+            ke[u] = ke2.x; ke[u + 1] = ke2.y;
+            kd[u] = kd2.x; kd[u + 1] = kd2.y;
+            kz[u] = kz2.x; kz[u + 1] = kz2.y;
+            kl[u] = kl2.x; kl[u + 1] = kl2.y;
+            qe[u] = qe2.x; qe[u + 1] = qe2.y;
+            qd[u] = qd2.x; qd[u + 1] = qd2.y;
         }
         store4(kr + i * GDN_LD + c, kd[0], kd[1], kd[2], kd[3]);
         store4(kc + i * GDN_LD + c, kz[0], kz[1], kz[2], kz[3]);
