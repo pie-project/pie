@@ -748,8 +748,9 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     } else if (warp == 6) {
         // The scale copier: each K step's scales into slot (step % kSfSlots) once
         // the MMAs kSfSlots steps back have read it. Shared memory holds
-        // [row block][atom]; TMEM takes [atom][row block].
-        if (kScaled && lane == 0 && leader) {
+        // [row block][atom]; TMEM takes [atom][row block]. The warp runs the
+        // loop together and one lane issues, as in the MMA warp.
+        if (kScaled && leader) {
             u32 s = 0, phase = 0, step = 0;
             for (int t = first_tile; t < tiles; t += tile_step) {
                 Unit x;
@@ -766,29 +767,32 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     }
                     bar_wait(&full[s], phase);
                     tc_fence_after();
-                    const u32 sf_tp = tmem + kStride + kAccN + slot * kSfCols;
-                    const u32 sf_tq = sf_tp + 4 * kAtomsP * kPT * kRowAtomsP;
-                    const u32 sf_p = smem_addr(smem + kOffSfP + s * kSfP);
-                    const u32 sf_q = smem_addr(smem + kOffSfQ + s * kSfQ);
-                    // P's scales as Q's: [row block][atom] in, [atom][row block]
-                    // out, each P tile's after the last's.
-                    for (u32 h = 0; h < kPT; ++h) {
-                        for (u32 r = 0; r < kRowAtomsP; ++r) {
-                            for (u32 a = 0; a < kAtomsP; ++a) {
-                                const u32 base = h * kAtomsP * kRowAtomsP;
-                                tc_cp_sf_atom<kPair>(
-                                    sf_tp + 4 * (base + a * kRowAtomsP + r),
-                                    sdesc_sf(sf_p + (base + r * kAtomsP + a) * 512));
+                    __syncwarp();
+                    if (elect_one()) {
+                        const u32 sf_tp = tmem + kStride + kAccN + slot * kSfCols;
+                        const u32 sf_tq = sf_tp + 4 * kAtomsP * kPT * kRowAtomsP;
+                        const u32 sf_p = smem_addr(smem + kOffSfP + s * kSfP);
+                        const u32 sf_q = smem_addr(smem + kOffSfQ + s * kSfQ);
+                        // P's scales as Q's: [row block][atom] in, [atom][row block]
+                        // out, each P tile's after the last's.
+                        for (u32 h = 0; h < kPT; ++h) {
+                            for (u32 r = 0; r < kRowAtomsP; ++r) {
+                                for (u32 a = 0; a < kAtomsP; ++a) {
+                                    const u32 base = h * kAtomsP * kRowAtomsP;
+                                    tc_cp_sf_atom<kPair>(
+                                        sf_tp + 4 * (base + a * kRowAtomsP + r),
+                                        sdesc_sf(sf_p + (base + r * kAtomsP + a) * 512));
+                                }
                             }
                         }
-                    }
-                    for (u32 r = 0; r < kRowAtomsQ; ++r) {
-                        for (u32 a = 0; a < kAtomsQ; ++a) {
-                            tc_cp_sf_atom<kPair>(sf_tq + 4 * (a * kRowAtomsQ + r),
-                                                 sdesc_sf(sf_q + (r * kAtomsQ + a) * 512));
+                        for (u32 r = 0; r < kRowAtomsQ; ++r) {
+                            for (u32 a = 0; a < kAtomsQ; ++a) {
+                                tc_cp_sf_atom<kPair>(sf_tq + 4 * (a * kRowAtomsQ + r),
+                                                     sdesc_sf(sf_q + (r * kAtomsQ + a) * 512));
+                            }
                         }
+                        tc_commit<kPair>(&sf_ready[slot]);
                     }
-                    tc_commit<kPair>(&sf_ready[slot]);
                     if (++s == kStages) {
                         s = 0;
                         phase ^= 1;
@@ -797,7 +801,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             }
         }
     } else if (warp == 5) {
-        if (lane == 0 && leader) {
+        // The MMA warp: all of it walks the steps, the elected lane issues.
+        if (leader) {
             u32 s = 0, phase = 0, step = 0;
             int it = 0;
             for (int t = first_tile; t < tiles; t += tile_step) {
@@ -828,61 +833,67 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         bar_wait(&tover[prev % 2], (prev / 2) & 1);
                         tc_fence_after();
                     }
-                    const u64 desc_q = sdesc_sw128(tile_q);
-                    // MMA j reads box j / 4 of each tile.
-                    constexpr u64 kBoxDescP = kBoxP >> 4, kBoxDescQ = kBoxQ >> 4;
-                    // A W4A16 A side's slot: this step's, in TMEM.
-                    const u32 a_slot = tmem + kStride + kAccN + s * kPT * 32;
+                    __syncwarp();
+                    if (elect_one()) {
+                        const u64 desc_q = sdesc_sw128(tile_q);
+                        // MMA j reads box j / 4 of each tile.
+                        constexpr u64 kBoxDescP = kBoxP >> 4, kBoxDescQ = kBoxQ >> 4;
+                        // A W4A16 A side's slot: this step's, in TMEM.
+                        const u32 a_slot = tmem + kStride + kAccN + s * kPT * 32;
 #pragma unroll
-                    for (u32 h = 0; h < kPT; ++h) {
-                    const u64 desc_p = sdesc_sw128(tile_p + h * kTileP);
-                    const u32 d = d0 + h * kBN;
-                    const u32 sf_tp = sf_tp0 + 4 * h * kAtomsP * kRowAtomsP;
+                        for (u32 h = 0; h < kPT; ++h) {
+                        const u64 desc_p = sdesc_sw128(tile_p + h * kTileP);
+                        const u32 d = d0 + h * kBN;
+                        const u32 sf_tp = sf_tp0 + 4 * h * kAtomsP * kRowAtomsP;
 #pragma unroll
-                    for (u32 j = 0; j < 4 * kBoxes; ++j) {
-                        const u64 a = desc_p + (j / 4) * kBoxDescP + 2 * (j % 4);
-                        const u64 b = desc_q + (j / 4) * kBoxDescQ + 2 * (j % 4);
-                        const bool accumulate = kb > kb0 || j > 0;
-                        if constexpr (kMixP) {
-                            mma_f16_ts(d, a_slot + h * 32 + j * 8, b,
-                                       idesc_dense(kF16Bf16, kF16Bf16, kM, kBN), accumulate);
-                        } else if constexpr (kKind == 0) {
-                            mma_f16<kPair>(d, a, b, idesc_dense(kF16Bf16, kF16Bf16, kM, kBN),
-                                           accumulate);
-                        } else if constexpr (kKind == 1) {
-                            mma_f8f6f4<kPair>(d, a, b, idesc_dense(kFmtP, kFmtQ, kM, kBN),
-                                              accumulate);
-                        } else {
-                            const u32 k0 = static_cast<u32>(kb) * kStageK + j * kInstrK;
-                            const u32 cp = k0 / kGranP;
-                            const u32 cq = k0 / kGranQ;
-                            const u32 col_p =
-                                sf_tp +
-                                4 * kRowAtomsP *
-                                    (cp / 4 - static_cast<u32>(kb) * kStageK / kGranP / 4) +
-                                x.pquarter;
-                            const u32 col_q =
-                                sf_tq +
-                                4 * kRowAtomsQ *
-                                    (cq / 4 - static_cast<u32>(kb) * kStageK / kGranQ / 4) +
-                                quarter_q;
-                            const u32 desc = idesc_with_ids(
-                                idesc_scaled(kFmtP, kFmtQ, kM, kBN, kKind == 2), cp % 4, cq % 4);
-                            if constexpr (kKind == 2) {
-                                mma_mxf8f6f4<kPair>(d, a, b, desc, accumulate, col_p, col_q);
+                        for (u32 j = 0; j < 4 * kBoxes; ++j) {
+                            const u64 a = desc_p + (j / 4) * kBoxDescP + 2 * (j % 4);
+                            const u64 b = desc_q + (j / 4) * kBoxDescQ + 2 * (j % 4);
+                            const bool accumulate = kb > kb0 || j > 0;
+                            if constexpr (kMixP) {
+                                mma_f16_ts(d, a_slot + h * 32 + j * 8, b,
+                                           idesc_dense(kF16Bf16, kF16Bf16, kM, kBN), accumulate);
+                            } else if constexpr (kKind == 0) {
+                                mma_f16<kPair>(d, a, b, idesc_dense(kF16Bf16, kF16Bf16, kM, kBN),
+                                               accumulate);
+                            } else if constexpr (kKind == 1) {
+                                mma_f8f6f4<kPair>(d, a, b, idesc_dense(kFmtP, kFmtQ, kM, kBN),
+                                                  accumulate);
                             } else {
-                                mma_nvf4<kPair>(d, a, b, desc, accumulate, col_p, col_q);
+                                const u32 k0 = static_cast<u32>(kb) * kStageK + j * kInstrK;
+                                const u32 cp = k0 / kGranP;
+                                const u32 cq = k0 / kGranQ;
+                                const u32 col_p =
+                                    sf_tp +
+                                    4 * kRowAtomsP *
+                                        (cp / 4 - static_cast<u32>(kb) * kStageK / kGranP / 4) +
+                                    x.pquarter;
+                                const u32 col_q =
+                                    sf_tq +
+                                    4 * kRowAtomsQ *
+                                        (cq / 4 - static_cast<u32>(kb) * kStageK / kGranQ / 4) +
+                                    quarter_q;
+                                const u32 desc = idesc_with_ids(
+                                    idesc_scaled(kFmtP, kFmtQ, kM, kBN, kKind == 2), cp % 4, cq % 4);
+                                if constexpr (kKind == 2) {
+                                    mma_mxf8f6f4<kPair>(d, a, b, desc, accumulate, col_p, col_q);
+                                } else {
+                                    mma_nvf4<kPair>(d, a, b, desc, accumulate, col_p, col_q);
+                                }
                             }
                         }
+                        }
+                        commit(&empty[s]);
                     }
-                    }
-                    commit(&empty[s]);
                     if (++s == kStages) {
                         s = 0;
                         phase ^= 1;
                     }
                 }
-                commit(&tfull[acc]);
+                __syncwarp();
+                if (elect_one()) {
+                    commit(&tfull[acc]);
+                }
                 ++it;
             }
             // Both CTAs' epilogues have read the last accumulator, so every

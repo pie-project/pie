@@ -248,6 +248,18 @@ __device__ __forceinline__ void tc_fence_after() {
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 }
 
+// Whole-warp, converged: true in one lane (the lowest). A warp that runs an
+// issue loop together and issues tcgen05 ops from the elected lane keeps
+// their operands in uniform registers; one lane alone moves each operand
+// over first, about 50 cycles an op.
+__device__ __forceinline__ bool elect_one() {
+    u32 one;
+    asm volatile(
+        "{\n\t.reg .pred p;\n\telect.sync _|p, 0xffffffff;\n\tselp.u32 %0, 1, 0, p;\n\t}"
+        : "=r"(one));
+    return one != 0;
+}
+
 // Arrives once on `bar` when every tcgen05 op this thread issued before it
 // (mma, cp) has completed. Implies fence::before_thread_sync.
 template <int G = 1>
