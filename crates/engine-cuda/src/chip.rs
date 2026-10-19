@@ -639,6 +639,7 @@ mod tests {
                 walk_fire_rows: 0,
                 host_planes: false,
                 prefill_lattice_from: 0,
+                kv_eager: false,
             }
         );
         assert_eq!(
