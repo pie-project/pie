@@ -1419,6 +1419,7 @@ impl FrameShell for Shell {
         };
         super::btrace::mark("segmentation");
         let bodied = records_bodies
+            && (self.walk_from == 0 || composition.rows() < self.walk_from)
             && !rs_moves.iter().any(|verb| !matches!(verb, RsMove::None))
             && snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize
             && Self::keyable_units(&self.compiled)

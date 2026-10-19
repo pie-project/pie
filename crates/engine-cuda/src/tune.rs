@@ -165,7 +165,6 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
         Vec::new(),
         budget.max_tokens,
         engine.lattice_steps,
-        engine.prefill_lattice_from,
     );
     let mut budgets = poem_compiler::Budgets::of(budget);
     if let Some(ladder) = patches(&trace, slots) {

@@ -10,20 +10,24 @@ assumes = { cc = 94 }
 #
 # hipBLASLt's grouped GEMM keeps the rows by expert from the gate-up to the
 # fold from `lt_mlp_from` routes an expert, both contractions at least
-# `lt_deep_k` (it loses over Qwen3.8-Flash-Next's 640-deep down projection).
-# Below that, the native legs keep expert order from `ordered_from` routes an
-# expert. Tiles: MT256x192x64 over the deep contractions, MT128x288x32 below.
+# `lt_deep_k` (it loses over Qwen3.8-Flash-Next's 640-deep down projection,
+# and is no faster than the native legs over Qwen3.6's 512-deep one). Below
+# that, the native legs keep expert order from `ordered_from` routes an
+# expert, the swiglu in the gate-up's epilogue (Qwen3.6, 4K tokens: -13%).
+# Tiles: MT256x192x64 over the deep contractions, MT128x288x32 below.
 [kernel]
 moe.lt_grouped = true
 moe.lt_mlp_from = 128
 moe.lt_tile_deep = 256_192_064
 moe.lt_tile_shallow = 128_288_032
 moe.lt_deep_k = 2048
-moe.ordered_from = 256
+moe.ordered_from = 128
 
 # A fire of 10240 rows where `max_forward_tokens` is unstated: 8192 left the
 # first prompts' decodes waiting out a second prefill fire, 12K and up made
-# queued prompts wait. Past 2048 rows, four buckets a doubling.
+# queued prompts wait. From 2048 rows a fire walks at its own rows: there a
+# body saves nothing and a bucket's padding (up to half the fire) costs its
+# share of every GEMM.
 [engine]
 forward_tokens = 10240
-prefill_lattice_from = 2048
+walk_from = 2048

@@ -111,12 +111,13 @@ pub struct WalkFireRows(pub u32);
 #[decision(id = "engine.host_planes", flag, default = false, tune = engine)]
 pub struct HostPlanes;
 
-/// Rows from which the default bucket lattice takes four buckets a doubling
-/// whatever `engine.lattice_steps` says (a prefill's GEMMs run its bucket's
-/// rows); 0 never.
+/// Rows from which a fire walks eagerly at its own rows (to a multiple of
+/// 64) rather than replaying its bucket's body: there the body saves
+/// nothing and the bucket's padding rows cost their whole share of the
+/// GEMMs. 0 never.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.prefill_lattice_from", constant(range(0..=65536)), default = 0, tune = engine)]
-pub struct PrefillLatticeFrom(pub u32);
+#[decision(id = "engine.walk_from", constant(range(0..=65536)), default = 0, tune = engine)]
+pub struct WalkFrom(pub u32);
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
@@ -133,7 +134,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<ForwardTokens>()
         .add::<WalkFireRows>()
         .add::<HostPlanes>()
-        .add::<PrefillLatticeFrom>();
+        .add::<WalkFrom>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     #[cfg(not(feature = "rocm"))]
     poem_compiler::costs::register(&mut r, 2);
@@ -217,7 +218,7 @@ pub struct Engine {
     pub forward_tokens: u32,
     pub walk_fire_rows: u32,
     pub host_planes: bool,
-    pub prefill_lattice_from: u32,
+    pub walk_from: u32,
 }
 
 impl Engine {
@@ -246,7 +247,7 @@ impl Engine {
             forward_tokens: profile.get::<ForwardTokens>().0,
             walk_fire_rows: profile.get::<WalkFireRows>().0,
             host_planes: profile.on::<HostPlanes>(&Anywhere),
-            prefill_lattice_from: profile.get::<PrefillLatticeFrom>().0,
+            walk_from: profile.get::<WalkFrom>().0,
         }
     }
 }
@@ -626,7 +627,7 @@ mod tests {
                 forward_tokens: 0,
                 walk_fire_rows: 0,
                 host_planes: false,
-                prefill_lattice_from: 0,
+                walk_from: 0,
             }
         );
         assert_eq!(
@@ -897,7 +898,7 @@ mod hip {
                 Engine::of(&profile),
                 Engine {
                     forward_tokens: 10240,
-                    prefill_lattice_from: 2048,
+                    walk_from: 2048,
                     ..Engine::of(&registry().defaults())
                 }
             );
@@ -908,7 +909,7 @@ mod hip {
             want.moe_lt_tile_deep = 256_192_064;
             want.moe_lt_tile_shallow = 128_288_032;
             want.moe_lt_deep_k = 2048;
-            want.moe_ordered_from = 256;
+            want.moe_ordered_from = 128;
             assert_eq!(kernels_cuda::tuning::Tuning::of(&profile), want, "{gpu}");
         }
     }
