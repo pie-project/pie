@@ -206,6 +206,7 @@ const fn atoms_k(kind: Kind, gran: u32) -> u32 {
 
 /// The dynamic shared memory the kernel lays out, mirrored from it, plus
 /// the 1024 bytes it may spend aligning the ring.
+#[allow(clippy::too_many_arguments)]
 const fn smem_bytes(
     kind: Kind,
     gran_p: u32,
@@ -317,6 +318,7 @@ impl Plan {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn staged(
         mut self,
         kind: Kind,
@@ -1193,6 +1195,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
 }
 
 /// A pass over a grouped GEMM's routed rows of `rows`, a block a row.
+#[allow(clippy::too_many_arguments)]
 fn fire_routed(
     ctx: &Ctx,
     entry: &'static str,

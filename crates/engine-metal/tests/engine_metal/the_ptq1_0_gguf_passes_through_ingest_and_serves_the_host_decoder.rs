@@ -40,8 +40,7 @@ use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 use checkpoint::types::{BackendKind, Encoding, QuantScheme, TensorDecl, Visibility};
 
 use poem::import::Builder;
-use poem::{Dtype, ParamSource, Platform, Shard, Weight};
-use poem_ir::ParamLayout;
+use poem::{Dtype, Platform, Weight};
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
@@ -204,14 +203,7 @@ fn convert(source_dir: &Path, metadata: &checkpoint::file::Metadata, out: &Path)
 }
 
 fn ptq1_0_weight(t: &RealTensor) -> Weight {
-    Weight {
-        name: t.name.to_string(),
-        shape: vec![t.rows as u64, t.k as u64],
-        dtype: Dtype::Ptq1_0,
-        shard: Shard::Replicated,
-        source: ParamSource::Checkpoint,
-        layout: ParamLayout::Natural,
-    }
+    Weight::sym(t.name, [t.rows as u64, t.k as u64], Dtype::Ptq1_0)
 }
 
 /// The fixture blocks are the fork's own oracle: the host decoder reproduces the

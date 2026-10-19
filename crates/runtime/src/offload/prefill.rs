@@ -635,9 +635,12 @@ async fn read_chunk(
     Ok(bytes)
 }
 
+/// The built-in program [`serve`] runs; no HTTP route serves it.
+pub const PROGRAM: &str = "prefill";
+
 async fn run_prefill(tokens: &[u32]) -> Result<()> {
     use crate::inferlet::program;
-    let name = program::newest("prefill")
+    let name = program::newest(PROGRAM)
         .await
         .ok_or_else(|| anyhow!("the built-in `prefill` program is not installed"))?;
     program::install(&name).await?;

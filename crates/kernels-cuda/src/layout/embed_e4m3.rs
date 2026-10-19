@@ -96,7 +96,7 @@ pub fn embed_concat_e4m3(
     }
     // Sixteen codes a thread where every row is whole 16-byte runs of an
     // aligned table: the same widening in a sixteenth of the requests.
-    let (entry, per) = if width.is_multiple_of(16) && codes.ptr % 16 == 0 {
+    let (entry, per) = if width.is_multiple_of(16) && codes.ptr.is_multiple_of(16) {
         ("embed_concat_e4m3_vec16<T, false>", width / 16)
     } else {
         ("embed_concat_e4m3<T>", width)
@@ -127,7 +127,7 @@ pub fn embed_concat_mxfp8(
 ) -> Result<(), Error> {
     const OP: &str = "layout.embed_concat";
     let (heads, width) = head_width(OP, ids, y)?;
-    if !width.is_multiple_of(32) || codes.ptr % 16 != 0 {
+    if !width.is_multiple_of(32) || !codes.ptr.is_multiple_of(16) {
         return Err(refuse(
             OP,
             format!("an MXFP8 row is whole 32-wide blocks on 16-byte runs, not {width} wide"),

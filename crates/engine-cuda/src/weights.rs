@@ -1482,93 +1482,6 @@ impl TensorSink for Landing<'_> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use poem::Platform;
-
-    use super::*;
-
-    #[test]
-    fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {
-        let trace = poem_compiler::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16")
-            .expect("the catalog ships the deployment")
-            .trace(Platform::Cuda);
-        let places = places(&trace, &crate::experts::Plan::default())
-            .expect("every param of a bf16 deployment has an element size");
-
-        assert_eq!(places.len(), trace.params.len());
-        let mut end = 0u64;
-        for (place, param) in places.iter().zip(&trace.params) {
-            assert!(
-                place.offset >= end,
-                "`{}` overlaps its predecessor",
-                param.name
-            );
-            assert_eq!(place.offset % ALIGN, 0, "`{}` is misaligned", param.name);
-            assert!(place.bytes > 0, "`{}` reserves nothing", param.name);
-            end = place.offset + place.reserved;
-        }
-
-        assert_eq!(places[0].offset, 0);
-        assert_eq!(places[0].rows, 248_320);
-        assert_eq!(places[0].width, 1024);
-        assert_eq!(places[0].bytes, 248_320 * 1024 * 2);
-    }
-
-    #[test]
-    fn the_headroom_nets_the_cgroups_page_cache_out_of_its_usage() {
-        let meminfo = "MemAvailable:   743437580 kB\n";
-        let stat = "anon 758157312\ninactive_file 23216467968\nactive_file 66810552320\n";
-        let pod = headroom(
-            Some(meminfo),
-            Some("93999996928\n"),
-            Some("93473275904\n"),
-            Some(stat),
-        );
-        assert_eq!(
-            pod,
-            93_999_996_928 - (93_473_275_904 - 23_216_467_968 - 66_810_552_320)
-        );
-        assert_eq!(
-            headroom(
-                None,
-                Some("100\n"),
-                Some("100\n"),
-                Some("inactive_file 500\n")
-            ),
-            100
-        );
-    }
-
-    #[test]
-    fn a_v1_cgroup_limit_caps_the_headroom_below_the_hosts() {
-        // A docker container on a v1 hierarchy: 1.3 TB free on the host,
-        // 377 GB the container may hold, 1.4 GB of it used. `memory.stat`
-        // there also carries `total_*` lines, which are not the group's own.
-        let meminfo = "MemAvailable:   1383000000 kB\n";
-        let stat = "cache 0\ninactive_file 0\nactive_file 0\ntotal_inactive_file 99\n";
-        assert_eq!(
-            headroom(
-                Some(meminfo),
-                Some("376999997440\n"),
-                Some("1476259840\n"),
-                Some(stat)
-            ),
-            376_999_997_440 - 1_476_259_840
-        );
-        // v1 says "unlimited" with a number near 2^63: the host decides.
-        assert_eq!(
-            headroom(
-                Some(meminfo),
-                Some("9223372036854771712\n"),
-                Some("1476259840\n"),
-                Some(stat)
-            ),
-            1_383_000_000 * 1024
-        );
-    }
-}
-
 /// The banks a low-precision product reads, and the K a scale of each covers:
 /// their scales are read only by that product, which takes them in atoms.
 #[cfg(feature = "cuda")]
@@ -1935,4 +1848,91 @@ fn lay_block_atoms(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use poem::Platform;
+
+    use super::*;
+
+    #[test]
+    fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {
+        let trace = poem_compiler::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16")
+            .expect("the catalog ships the deployment")
+            .trace(Platform::Cuda);
+        let places = places(&trace, &crate::experts::Plan::default())
+            .expect("every param of a bf16 deployment has an element size");
+
+        assert_eq!(places.len(), trace.params.len());
+        let mut end = 0u64;
+        for (place, param) in places.iter().zip(&trace.params) {
+            assert!(
+                place.offset >= end,
+                "`{}` overlaps its predecessor",
+                param.name
+            );
+            assert_eq!(place.offset % ALIGN, 0, "`{}` is misaligned", param.name);
+            assert!(place.bytes > 0, "`{}` reserves nothing", param.name);
+            end = place.offset + place.reserved;
+        }
+
+        assert_eq!(places[0].offset, 0);
+        assert_eq!(places[0].rows, 248_320);
+        assert_eq!(places[0].width, 1024);
+        assert_eq!(places[0].bytes, 248_320 * 1024 * 2);
+    }
+
+    #[test]
+    fn the_headroom_nets_the_cgroups_page_cache_out_of_its_usage() {
+        let meminfo = "MemAvailable:   743437580 kB\n";
+        let stat = "anon 758157312\ninactive_file 23216467968\nactive_file 66810552320\n";
+        let pod = headroom(
+            Some(meminfo),
+            Some("93999996928\n"),
+            Some("93473275904\n"),
+            Some(stat),
+        );
+        assert_eq!(
+            pod,
+            93_999_996_928 - (93_473_275_904 - 23_216_467_968 - 66_810_552_320)
+        );
+        assert_eq!(
+            headroom(
+                None,
+                Some("100\n"),
+                Some("100\n"),
+                Some("inactive_file 500\n")
+            ),
+            100
+        );
+    }
+
+    #[test]
+    fn a_v1_cgroup_limit_caps_the_headroom_below_the_hosts() {
+        // A docker container on a v1 hierarchy: 1.3 TB free on the host,
+        // 377 GB the container may hold, 1.4 GB of it used. `memory.stat`
+        // there also carries `total_*` lines, which are not the group's own.
+        let meminfo = "MemAvailable:   1383000000 kB\n";
+        let stat = "cache 0\ninactive_file 0\nactive_file 0\ntotal_inactive_file 99\n";
+        assert_eq!(
+            headroom(
+                Some(meminfo),
+                Some("376999997440\n"),
+                Some("1476259840\n"),
+                Some(stat)
+            ),
+            376_999_997_440 - 1_476_259_840
+        );
+        // v1 says "unlimited" with a number near 2^63: the host decides.
+        assert_eq!(
+            headroom(
+                Some(meminfo),
+                Some("9223372036854771712\n"),
+                Some("1476259840\n"),
+                Some(stat)
+            ),
+            1_383_000_000 * 1024
+        );
+    }
 }

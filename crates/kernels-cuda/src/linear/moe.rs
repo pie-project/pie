@@ -2523,7 +2523,8 @@ pub fn weighted_sum(
     );
     // Eight columns a thread where the rows and both planes take whole
     // 16-byte runs: the same sums, element for element.
-    let vec8 = y.width.is_multiple_of(8) && routed.ptr % 16 == 0 && y.ptr % 16 == 0;
+    let vec8 =
+        y.width.is_multiple_of(8) && routed.ptr.is_multiple_of(16) && y.ptr.is_multiple_of(16);
     let (entry, threads) = if vec8 {
         ("moe_weighted_sum_vec8", y.width / 8)
     } else {

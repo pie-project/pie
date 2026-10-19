@@ -14,7 +14,7 @@ const BLOCK: u32 = 256;
 pub fn concat_cols(ctx: &Ctx, xs: &[Tensor], y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "layout.concat_cols";
     let elem = y.dtype.bits();
-    if elem % 8 != 0 {
+    if !elem.is_multiple_of(8) {
         return Err(refuse(OP, "an element of whole bytes"));
     }
     let elem = elem / 8;
@@ -26,11 +26,11 @@ pub fn concat_cols(ctx: &Ctx, xs: &[Tensor], y: &mut Tensor) -> Result<(), Error
             return Err(refuse(OP, "the inputs share the output's element and rows"));
         }
         let width = u64::from(x.width) * elem;
-        let wide = width % 16 == 0
-            && stride % 16 == 0
-            && at % 16 == 0
+        let wide = width.is_multiple_of(16)
+            && stride.is_multiple_of(16)
+            && at.is_multiple_of(16)
             && x.ptr % 16 == 0
-            && y.ptr % 16 == 0;
+            && y.ptr.is_multiple_of(16);
         let per = if wide { width / 16 } else { width };
         let threads = u32::try_from(u64::from(y.rows) * per)
             .map_err(|_| refuse(OP, "the rows pass a 32-bit launch"))?;

@@ -381,7 +381,7 @@ pub fn prefill_selected_tiled(
         return Ok(false);
     }
     let q_heads = q.data.width / head_dim;
-    if q_heads % kv_heads != 0 {
+    if !q_heads.is_multiple_of(kv_heads) {
         return Ok(false);
     }
     let group = q_heads / kv_heads;
@@ -397,7 +397,7 @@ pub fn prefill_selected_tiled(
     lanes_carry(OP, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
     // Per head, the row holds one run of blocks for each kv head.
     let runs = if per_head { kv_heads } else { 1 };
-    if selection.width == 0 || selection.width % runs != 0 {
+    if selection.width == 0 || !selection.width.is_multiple_of(runs) {
         return Ok(false);
     }
     let sel = paged::PrefillSel {
