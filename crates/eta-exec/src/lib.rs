@@ -64,7 +64,10 @@ pub use status::{
     Fault, FaultClass, Outcome as StatusOutcome, STATUS_BYTES, Site, State, Status, describe_fault,
     report as report_status,
 };
-pub use step::{Interpreted, PassInputs, StageRunner, StepOutcome, step, step_with};
+pub use step::{
+    BatchRunner, Interpreted, Lane, PassInputs, StageRunner, StepOutcome, step, step_many,
+    step_with,
+};
 pub use value::{Value, concrete_dtype, encode_wire, value_matches, wire_cell_bytes};
 
 pub(crate) fn shape_numel(dims: &[u32]) -> u64 {
