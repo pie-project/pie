@@ -2371,14 +2371,16 @@ pub fn select_bf16_mma(
     };
     let cols = if glu.is_some() { 64 } else { 64 * tiles };
     let fire = if tiled {
-        // Four stages of 64 routes' and 128 rows' 64 of K: two CTAs an SM.
-        const STAGES: u32 = 4;
+        // Three stages of 64 routes' and 128 rows' 64 of K, four warps a
+        // CTA each 32 routes by 64 rows: two CTAs an SM.
+        const STAGES: u32 = 3;
+        const WN: u32 = 2;
         let cols = if glu.is_some() { 64 } else { 128 };
         Fire::at(
             "linear/moe_w8.cuh",
-            symbol(&format!("::pie::linear::moe_select_bf16_gemm<{STAGES}, {code}>")),
+            symbol(&format!("::pie::linear::moe_select_bf16_gemm<{STAGES}, {code}, {WN}>")),
         )
-        .apply(Launch::grid([work_cap, wide(cols), 1], [256, 1, 1]).smem(STAGES * (64 + 128) * 128))
+        .apply(Launch::grid([work_cap, wide(cols), 1], [64 * WN, 1, 1]).smem(STAGES * (64 + 128) * 128))
     } else {
         Fire::at(
             "linear/moe_w8.cuh",
