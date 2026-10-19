@@ -103,44 +103,45 @@ __device__ __forceinline__ RowInfo row_info(const Params& p, int t, int R) {
     return ri;
 }
 
-// A pass: rows `t[0]` and, where `two`, `t[1]` (local rows) of request
-// `ri[0].req`, scored over `nkeys` blocks (the larger of theirs). Rows that
-// see no more than `top_k` blocks are left to the ranking; a pass with no
-// row to score is skipped. Every role walks the same passes.
+// A pass: rows `t[0..count)` (local rows) of request `ri[0].req`, scored
+// over `nkeys` blocks (the largest of theirs). Rows that see no more than
+// `top_k` blocks are left to the ranking; a pass with no row to score is
+// skipped. Every role walks the same passes.
+template <int RP>
 struct Pass {
-    int t[2];
-    bool two;
-    bool score[2];
-    RowInfo ri[2];
+    int t[RP];
+    int count;
+    bool score[RP];
+    RowInfo ri[RP];
     int nkeys;
 };
 
-// The pair `pair`'s passes (one or two), in order: `n` of them into `out`.
-__device__ __forceinline__ int passes_of(const Params& p, int pair, int live, int R, Pass (&out)[2]) {
-    const int t0 = 2 * pair;
-    const int t1 = t0 + 1;
-    RowInfo a = row_info(p, t0, R);
-    const bool has1 = t1 < live;
-    RowInfo b = has1 ? row_info(p, t1, R) : a;
+// Group `group`'s passes (its RP rows split where their request changes),
+// in order: `n` of them into `out`.
+template <int RP>
+__device__ __forceinline__ int passes_of(const Params& p, int group, int live, int R, Pass<RP> (&out)[RP]) {
     int n = 0;
-    auto make = [&](int ta, const RowInfo& ia, bool two, int tb, const RowInfo& ib) {
-        Pass ps;
-        ps.t[0] = ta;
-        ps.t[1] = tb;
-        ps.two = two;
-        ps.ri[0] = ia;
-        ps.ri[1] = ib;
-        ps.score[0] = ia.nkeys > p.top_k;
-        ps.score[1] = two && ib.nkeys > p.top_k;
-        ps.nkeys = max(ps.score[0] ? ia.nkeys : 0, ps.score[1] ? ib.nkeys : 0);
-        if (ps.nkeys > 0) out[n++] = ps;
+    Pass<RP> cur;
+    cur.count = 0;
+    cur.nkeys = 0;
+    auto close = [&]() {
+        if (cur.count > 0 && cur.nkeys > 0) out[n++] = cur;
+        cur.count = 0;
+        cur.nkeys = 0;
     };
-    if (has1 && a.req == b.req) {
-        make(t0, a, true, t1, b);
-    } else {
-        make(t0, a, false, t0, a);
-        if (has1) make(t1, b, false, t1, b);
+#pragma unroll
+    for (int i = 0; i < RP; ++i) {
+        const int t = RP * group + i;
+        if (t >= live) break;
+        const RowInfo ri = row_info(p, t, R);
+        if (cur.count > 0 && cur.ri[0].req != ri.req) close();
+        const int c = cur.count++;
+        cur.t[c] = t;
+        cur.ri[c] = ri;
+        cur.score[c] = ri.nkeys > p.top_k;
+        cur.nkeys = max(cur.nkeys, cur.score[c] ? ri.nkeys : 0);
     }
+    close();
     return n;
 }
 
@@ -160,6 +161,8 @@ __device__ __forceinline__ float reduce_scatter32(float (&v)[32], int lane) {
     return v[0];
 }
 
+// H heads a row: 128 / H rows a pass, a row's heads H lanes.
+template <int H>
 __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant__ tc5::TmaMap map,
                                                            const __grid_constant__ tc5::TmaMap map8,
                                                            const Params p) {
@@ -168,7 +171,8 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
     const int base_row = p.win != nullptr ? static_cast<int>(p.win[1]) : 0;
     const int R = (p.win != nullptr && static_cast<int>(p.win[2]) < p.requests) ? static_cast<int>(p.win[2])
                                                                                : p.requests;
-    const int pairs = (live + 1) / 2;
+    constexpr int RP = 128 / H;
+    const int groups = (live + RP - 1) / RP;
 
     extern __shared__ unsigned char smem_raw[];
     const u32 raw = smem_addr(smem_raw);
@@ -214,11 +218,11 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
     if (warp == 8) {
         // The tiles' loads: a page's `per` entries a box, two atoms.
         int J = 0;
-        for (int pair = static_cast<int>(blockIdx.x); pair < pairs; pair += static_cast<int>(gridDim.x)) {
-            Pass ps[2];
-            const int np = passes_of(p, pair, live, R, ps);
+        for (int group = static_cast<int>(blockIdx.x); group < groups; group += static_cast<int>(gridDim.x)) {
+            Pass<RP> ps[RP];
+            const int np = passes_of(p, group, live, R, ps);
             for (int k = 0; k < np; ++k) {
-                const Pass& s = ps[k];
+                const Pass<RP>& s = ps[k];
                 const int tiles = (s.nkeys + kBN - 1) / kBN;
                 for (int jt = 0; jt < tiles; ++jt, ++J) {
                     const int slot = J % kSlots;
@@ -264,11 +268,11 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
     } else if (warp == 9) {
         const u32 idesc = idesc_dense(kF16Bf16, kF16Bf16, 128, kBN);
         int J = 0, P = 0;
-        for (int pair = static_cast<int>(blockIdx.x); pair < pairs; pair += static_cast<int>(gridDim.x)) {
-            Pass ps[2];
-            const int np = passes_of(p, pair, live, R, ps);
+        for (int group = static_cast<int>(blockIdx.x); group < groups; group += static_cast<int>(gridDim.x)) {
+            Pass<RP> ps[RP];
+            const int np = passes_of(p, group, live, R, ps);
             for (int k = 0; k < np; ++k, ++P) {
-                const Pass& s = ps[k];
+                const Pass<RP>& s = ps[k];
                 const int qb = P & 1;
                 bar_wait(&q_full[qb], (P >> 1) & 1);
                 tc_fence_after();
@@ -279,7 +283,8 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
                     if (J >= kSBufs) bar_wait(&s_free[sb], ((J / kSBufs) - 1) & 1);
                     bar_wait(&k_full[slot], (J / kSlots) & 1);
                     tc_fence_after();
-                    if (lane == 0) {
+                    __syncwarp();
+                    if (elect_one()) {
                         const u32 qa = sbase + kOffQ + qb * kTile;
                         const u32 ka = sbase + kOffK + slot * kTile;
 #pragma unroll
@@ -295,8 +300,8 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
                     }
                     __syncwarp();
                 }
-                if (lane == 0) tc_commit(&q_empty[qb]);
                 __syncwarp();
+                if (elect_one()) tc_commit(&q_empty[qb]);
             }
         }
     } else if (warp >= 10) {
@@ -305,7 +310,7 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
         // turned as `index_topk_paged_mma` turns it; and the head weights.
         const int qt = static_cast<int>(threadIdx.x) - 320;
         __shared__ float turn_f[kD / 2];
-        __shared__ float turn_c[2][32], turn_s[2][32];
+        __shared__ float turn_c[RP][32], turn_s[RP][32];
         if (p.turn_dim > 0) {
             for (int pair = qt; pair < p.turn_dim / 2; pair += 64) {
                 float freq = powf(p.turn_theta, -2.f * static_cast<float>(pair) / static_cast<float>(p.turn_dim));
@@ -317,17 +322,17 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
         }
         asm volatile("bar.sync 1, 64;" ::: "memory");
         int P = 0;
-        for (int pair = static_cast<int>(blockIdx.x); pair < pairs; pair += static_cast<int>(gridDim.x)) {
-            Pass ps[2];
-            const int np = passes_of(p, pair, live, R, ps);
+        for (int group = static_cast<int>(blockIdx.x); group < groups; group += static_cast<int>(gridDim.x)) {
+            Pass<RP> ps[RP];
+            const int np = passes_of(p, group, live, R, ps);
             for (int k = 0; k < np; ++k, ++P) {
-                const Pass& s = ps[k];
+                const Pass<RP>& s = ps[k];
                 const int qb = P & 1;
                 // The pass's angles, a (row, pair) a thread.
-                if (p.turn_dim > 0) {
-                    const int rr = qt / 32;
-                    const int pr = qt % 32;
-                    if (pr < p.turn_dim / 2 && (rr == 0 || s.two)) {
+                for (int u = qt; p.turn_dim > 0 && u < RP * 32; u += 64) {
+                    const int rr = u / 32;
+                    const int pr = u % 32;
+                    if (pr < p.turn_dim / 2 && rr < s.count) {
                         const float pos = static_cast<float>(p.turn_pos[base_row + s.t[rr]]);
                         __sincosf(pos * turn_f[pr], &turn_s[rr][pr], &turn_c[rr][pr]);
                     }
@@ -343,10 +348,10 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
                         const int i = b0 + u8 * 64;
                         const int l = i / 16;
                         const int c = i % 16;
-                        const int rr = l / 64;
-                        const int h = l % 64;
+                        const int rr = l / H;
+                        const int h = l % H;
                         v[u8] = make_int4(0, 0, 0, 0);
-                        if ((rr == 0 || s.two) && h < p.heads) {
+                        if (rr < s.count && h < p.heads) {
                             const int t_row = base_row + s.t[rr];
                             v[u8] = *reinterpret_cast<const int4*>(
                                 p.q + (static_cast<long long>(t_row) * p.heads + h) * kD + c * 8);
@@ -355,9 +360,9 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
 #pragma unroll
                     for (int u8 = 0; u8 < 8; ++u8) {
                         const int i = b0 + u8 * 64;
-                        const int l = i / 16;        // lane: row l / 64, head l % 64
+                        const int l = i / 16;        // lane: row l / H, head l % H
                         const int c = i % 16;        // run of 8 dims
-                        const int rr = l / 64;
+                        const int rr = l / H;
                         if (p.turn_dim > 0 && c * 8 >= kD - p.turn_dim) {
                             unsigned short* e = reinterpret_cast<unsigned short*>(&v[u8]);
 #pragma unroll
@@ -378,10 +383,10 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
                     }
                 }
                 for (int l = qt; l < 128; l += 64) {
-                    const int rr = l / 64;
-                    const int h = l % 64;
+                    const int rr = l / H;
+                    const int h = l % H;
                     float wv = 0.f;
-                    if ((rr == 0 || s.two) && h < p.heads) {
+                    if (rr < s.count && h < p.heads) {
                         const int t_row = base_row + s.t[rr];
                         wv = p.w != nullptr
                                  ? __uint_as_float(static_cast<u32>(p.w[static_cast<long long>(t_row) * p.heads + h]) << 16)
@@ -399,22 +404,22 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
         // of a group is TMEM lane l.
         const int l = static_cast<int>(threadIdx.x) % 128;
         const int wg = static_cast<int>(warp) / 4;
-        const int rr = l / 64;
+        const int rr = l / H;
         const u32 lane_base = ((warp % 4) * 32) << 16;
         const int bar_id = 2 + 2 * wg + rr;
         int J = 0, P = 0;
-        for (int pair = static_cast<int>(blockIdx.x); pair < pairs; pair += static_cast<int>(gridDim.x)) {
-            Pass ps[2];
-            const int np = passes_of(p, pair, live, R, ps);
+        for (int group = static_cast<int>(blockIdx.x); group < groups; group += static_cast<int>(gridDim.x)) {
+            Pass<RP> ps[RP];
+            const int np = passes_of(p, group, live, R, ps);
             for (int k = 0; k < np; ++k, ++P) {
-                const Pass& s = ps[k];
+                const Pass<RP>& s = ps[k];
                 const int qb = P & 1;
                 bar_wait(&q_full[qb], (P >> 1) & 1);
                 const float wv = wsm[qb * 128 + l];
-                const bool mine = rr == 0 || s.two;
-                const int nk = s.ri[rr].nkeys;
+                const bool mine = rr < s.count;
                 const bool write = mine && s.score[rr];
-                float* frow = p.scores + static_cast<long long>(s.t[rr]) * p.score_stride;
+                const int nk = write ? s.ri[rr].nkeys : 0;
+                float* frow = p.scores + static_cast<long long>(mine ? s.t[rr] : 0) * p.score_stride;
                 const int tiles = (s.nkeys + kBN - 1) / kBN;
                 for (int jt = 0; jt < tiles; ++jt, ++J) {
                     const int sb = J % kSBufs;
@@ -429,10 +434,18 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
                         float v[32];
 #pragma unroll
                         for (int i = 0; i < 32; ++i) v[i] = fmaxf(__uint_as_float(raw32[i]), 0.f) * wv;
-                        red[warp * 128 + c * 32 + lane] = reduce_scatter32(v, static_cast<int>(lane));
+                        const float sum = reduce_scatter32(v, static_cast<int>(lane));
+                        if constexpr (H == 32) {
+                            // A warp holds the row's heads whole.
+                            const int j = jt * kBN + c * 32 + static_cast<int>(lane);
+                            if (j < nk) frow[j] = sum;
+                        } else {
+                            red[warp * 128 + c * 32 + lane] = sum;
+                        }
                     }
                     tc_fence_before();
                     bar_arrive(&s_free[sb]);
+                    if constexpr (H == 32) continue;
                     // The row's two warps (heads 0-31, 32-63) meet.
                     asm volatile("bar.sync %0, 64;" ::"r"(bar_id) : "memory");
                     if (write && (warp & 1) == 0) {

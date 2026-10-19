@@ -925,12 +925,18 @@ fn ranked_tc5(
         sub: if compact { 0 } else { ratio - 1 },
     };
     let bytes = ArgValue::of(&params);
-    let pairs = selection.rows.div_ceil(2);
+    // A pass's 128 lanes hold two rows of 64 heads, or four of 32.
+    let h = if heads <= 32 { 32 } else { 64 };
+    let groups = selection.rows.div_ceil(128 / h);
     ctx.fire(
         OP,
-        Fire::at(TC5_FILE, "::pie::attn::index_tc5::index_logits_tc5").apply(
+        Fire::at(
+            TC5_FILE,
+            symbol(&format!("::pie::attn::index_tc5::index_logits_tc5<{h}>")),
+        )
+        .apply(
             Launch::grid(
-                [pairs.min(ctx.multiprocessors().unwrap_or(148)), 1, 1],
+                [groups.min(ctx.multiprocessors().unwrap_or(148)), 1, 1],
                 [384, 1, 1],
             )
             .smem(TC5_SMEM),
