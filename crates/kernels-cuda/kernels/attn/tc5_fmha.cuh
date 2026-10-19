@@ -695,7 +695,8 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                 const float alpha = grow ? ex2(m_used - m_new) : 1.f;
                 const float base = m_new == neg_inf() ? 0.f : m_new;
                 // Two f32 lanes an instruction (the scale's FMA, the sums); an
-                // eighth of the exponentials on the FMA pipe beside the rest's.
+                // eighth of the exponentials on the FMA pipe beside the rest's
+                // (a pair's 64-wide heads, a quarter).
                 u64 s2[4] = {0, 0, 0, 0};
                 const u64 sc2 = f32x2(p.scale_log2, p.scale_log2);
                 const u64 nb2 = f32x2(-base, -base);
@@ -704,7 +705,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                 for (int c = 0; c < kBKV; c += 2) {
                     float x0, x1;
                     f32x2_split(fma_f32x2(f32x2(s[c], s[c + 1]), sc2, nb2), x0, x1);
-                    const bool fma_pipe = (c & 15) == 14;
+                    const bool fma_pipe = PAIR ? (c & 7) == 6 : (c & 15) == 14;
                     const float e0 = fma_pipe ? ex2_fma(x0) : ex2(x0);
                     const float e1 = fma_pipe ? ex2_fma(x1) : ex2(x1);
                     s2[(c >> 1) & 3] = add_f32x2(s2[(c >> 1) & 3], f32x2(e0, e1));
