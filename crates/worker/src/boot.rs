@@ -260,6 +260,21 @@ fn load(
         max_lanes: caps.limits.max_lanes,
         max_tokens: caps.limits.max_tokens,
     };
+    if pie_trace::enabled() {
+        let page_bytes = kv_page_bytes(&metadata.config, summary.kv_page_size, &summary.deployment)
+            .or_else(|| {
+                (summary.kv_pages > 0).then(|| group.facts.pool_bytes / u64::from(summary.kv_pages))
+            });
+        pie_trace::set_meta(|meta| {
+            // The model as the config names it (`Qwen/Qwen3.5-0.8B`), not
+            // the artifact's file name.
+            meta.model = Some(user_cfg.model.model.clone());
+            meta.scheme = pie_trace::scheme_of(&summary.deployment);
+            meta.weights_bytes = Some(summary.weight_bytes);
+            meta.kv_pages_total = Some(u64::from(summary.kv_pages));
+            meta.kv_page_bytes = page_bytes.filter(|&b| b > 0);
+        });
+    }
     let config = translate::build(user_cfg, home, builtins, engines, metadata)
         .context("translating to bootstrap::Config")?;
     Ok(Loaded {
@@ -315,6 +330,38 @@ fn load_without_engine(
         },
         config,
     })
+}
+
+/// The bytes one KV page holds across the model's attention layers, from its
+/// config: `page_size` tokens of keys and values per KV head.
+fn kv_page_bytes(config: &[u8], page_size: u32, deployment: &str) -> Option<u64> {
+    let config: serde_json::Value = serde_json::from_slice(config).ok()?;
+    let text = config.get("text_config").unwrap_or(&config);
+    let field = |key: &str| text.get(key).and_then(serde_json::Value::as_u64);
+    let layers = match text
+        .get("layer_types")
+        .and_then(serde_json::Value::as_array)
+    {
+        Some(types) => types
+            .iter()
+            .filter(|t| {
+                t.as_str()
+                    .is_some_and(|t| t.contains("attention") && !t.contains("linear"))
+            })
+            .count() as u64,
+        None => field("num_hidden_layers")?,
+    };
+    let heads = field("num_key_value_heads").or_else(|| field("num_attention_heads"))?;
+    let head_dim = field("head_dim")
+        .or_else(|| Some(field("hidden_size")? / field("num_attention_heads")?.max(1)))?;
+    let element = if deployment.contains("kv-fp8") || deployment.contains("kv-u8") {
+        1
+    } else if deployment.contains("kv-f32") {
+        4
+    } else {
+        2
+    };
+    Some(u64::from(page_size) * layers * 2 * heads * head_dim * element)
 }
 
 fn artifact_name(path: &Path) -> String {
