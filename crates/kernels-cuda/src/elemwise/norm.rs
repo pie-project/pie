@@ -212,6 +212,50 @@ pub fn rmsnorm(
     )
 }
 
+/// Two RMS norms of `x` under their own weights in one pass over the row
+/// (`rmsnorm_pair_vec8`): bf16 rows a whole number of eights wide, at most
+/// four 16-byte runs a thread.
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm_pair(
+    ctx: &Ctx,
+    x: Tensor,
+    w0: Tensor,
+    eps0: f32,
+    out0: &mut Tensor,
+    w1: Tensor,
+    eps1: f32,
+    out1: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.rmsnorm_pair";
+    let rows = nonzero(OP, "rows", x.rows)?;
+    let hidden = stated(OP, nonzero(OP, "the normed width", x.width)?)?;
+    let per = (x.width / 8).div_ceil(BLOCK);
+    if x.dtype != Dtype::Bf16
+        || !x.width.is_multiple_of(8)
+        || per > 4
+        || ![x.ptr, w0.ptr, w1.ptr, out0.ptr, out1.ptr].iter().all(|&at| aligned16(at))
+    {
+        return Err(refuse(OP, "a bf16 row a whole number of eights wide, at most 8192, 16-byte aligned"));
+    }
+    let per = per.next_power_of_two();
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::elemwise::rmsnorm_pair_vec8<{BLOCK}, {per}>")))
+            .apply(Launch::per_row(rows, BLOCK)),
+        &[
+            x.arg(),
+            w0.arg(),
+            w1.arg(),
+            out0.arg(),
+            out1.arg(),
+            hidden.arg(),
+            eps0.arg(),
+            eps1.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 pub fn rmsnorm_per_head(
     ctx: &Ctx,
     x: Tensor,
@@ -701,10 +745,12 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn residual_add_rmsnorm(
     ctx: &Ctx,
     x: Tensor,
     y: &mut Tensor,
+    scale: Option<Tensor>,
     weight: Tensor,
     plus_one: bool,
     eps: f32,
@@ -750,6 +796,7 @@ pub fn residual_add_rmsnorm(
             y.arg(),
             weight.arg(),
             out.arg(),
+            scale.map_or(crate::jit::ArgValue::ABSENT, |s| s.arg()),
             hidden.arg(),
             eps.arg(),
             ctx.stage(),

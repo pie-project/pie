@@ -236,6 +236,7 @@ impl FamilyCosts {
                 poem_ir::Fused::GdnStep { .. } => self.attention,
                 poem_ir::Fused::QGateNormRopeAppend { .. } => self.attention,
                 poem_ir::Fused::ResidualAddRmsnorm { .. }
+                | poem_ir::Fused::RmsnormPair { .. }
                 | poem_ir::Fused::RmsnormResidualAdd { .. }
                 | poem_ir::Fused::EmbedScaleAdd { .. }
                 | poem_ir::Fused::EmbedScaleAddSelect { .. }

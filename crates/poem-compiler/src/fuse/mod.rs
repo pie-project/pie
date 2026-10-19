@@ -25,6 +25,10 @@ struct Rule {
     /// `EXPORT_SEAMS`) may hold a value this rule folds away. Every rule
     /// keeps every seam's values but the ones that say otherwise.
     through_markers: bool,
+    /// Whether the fused op lands where the first matched op was, not the
+    /// last: for matches whose later ops' outputs are read in between (two
+    /// norms of one row, the first's reader ahead of the second).
+    land_first: bool,
 }
 
 impl Rule {
@@ -42,6 +46,7 @@ impl Rule {
             when: |_| true,
             replace,
             through_markers: false,
+            land_first: false,
         }
     }
 
@@ -49,6 +54,11 @@ impl Rule {
     /// folding the value it marks.
     fn through_markers(mut self) -> Rule {
         self.through_markers = true;
+        self
+    }
+
+    fn land_first(mut self) -> Rule {
+        self.land_first = true;
         self
     }
 

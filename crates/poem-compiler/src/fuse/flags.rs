@@ -41,6 +41,8 @@ flags! {
     EmbedScaleAddSelect = "fuse.embed_scale_add_select" => "elementwise.embed_scale_add_select",
     EmbedScaleAdd = "fuse.embed_scale_add" => "elementwise.embed_scale_add",
     ResidualAddRmsnorm = "fuse.residual_add_rmsnorm" => "elementwise.residual_add_rmsnorm",
+    ResidualAddScaleRmsnorm = "fuse.residual_add_scale_rmsnorm" => "elementwise.residual_add_scale_rmsnorm",
+    RmsnormPair = "fuse.rmsnorm_pair" => "elementwise.rmsnorm_pair",
     MlpSwiglu = "fuse.mlp_swiglu" => "linear.mlp_swiglu",
     MatmulGeglu = "fuse.matmul_geglu" => "linear.matmul_geglu",
     MoeExperts = "fuse.moe_experts" => "linear.moe_experts",

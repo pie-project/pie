@@ -28,10 +28,24 @@ pub enum Fused {
         x: ValueId,
         y: ValueId,
         y_out: ValueId,
+        /// A one-element scale the sum takes before the norm reads it (the
+        /// stream lands scaled).
+        #[serde(default)]
+        scale: Option<ValueId>,
         weight: ValueId,
         plus_one: bool,
         eps: f32,
         out: ValueId,
+    },
+    /// Two RMS norms of one row, each under its own weight.
+    RmsnormPair {
+        x: ValueId,
+        w0: ValueId,
+        eps0: f32,
+        out0: ValueId,
+        w1: ValueId,
+        eps1: f32,
+        out1: ValueId,
     },
     RmsnormResidualAdd {
         x: ValueId,
@@ -474,7 +488,15 @@ pub enum Fused {
 impl Operands for Fused {
     fn inputs(&self, sink: &mut Vec<ValueId>) {
         match self {
-            Self::ResidualAddRmsnorm { x, y, weight, .. } => sink.extend([*x, *y, *weight]),
+            Self::RmsnormPair { x, w0, w1, .. } => sink.extend([*x, *w0, *w1]),
+            Self::ResidualAddRmsnorm {
+                x, y, weight, scale, ..
+            } => {
+                sink.extend([*x, *y, *weight]);
+                if let Some(s) = scale {
+                    sink.push(*s);
+                }
+            }
             Self::RmsnormResidualAdd {
                 x,
                 weight,
@@ -839,6 +861,7 @@ impl Operands for Fused {
     fn outputs(&self, sink: &mut Vec<ValueId>) {
         match self {
             Self::ResidualAddRmsnorm { y_out, out, .. } => sink.extend([*y_out, *out]),
+            Self::RmsnormPair { out0, out1, .. } => sink.extend([*out0, *out1]),
             Self::RmsnormResidualAdd {
                 t,
                 y_out,
@@ -1021,6 +1044,7 @@ impl Operands for Fused {
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
         match self {
             Self::ResidualAddRmsnorm { y_out, y, .. } => sink.push((*y_out, *y)),
+            Self::RmsnormPair { .. } => {}
             Self::RmsnormResidualAdd { y_out, y, .. } => sink.push((*y_out, *y)),
             Self::EmbedScaleAdd { y_out, y, .. } => sink.push((*y_out, *y)),
             Self::EmbedScaleAddSelect { .. } => {}
@@ -1104,7 +1128,9 @@ impl Operands for Fused {
     // the family that kernel ships in.
     fn name(&self) -> &'static str {
         match self {
-            Self::ResidualAddRmsnorm { .. } => "elementwise.residual_add_rmsnorm",
+            Self::ResidualAddRmsnorm { scale: None, .. } => "elementwise.residual_add_rmsnorm",
+            Self::RmsnormPair { .. } => "elementwise.rmsnorm_pair",
+            Self::ResidualAddRmsnorm { scale: Some(_), .. } => "elementwise.residual_add_scale_rmsnorm",
             Self::RmsnormResidualAdd { .. } => "elementwise.rmsnorm_residual_add",
             Self::EmbedScaleAdd { .. } => "elementwise.embed_scale_add",
             Self::EmbedScaleAddSelect { .. } => "elementwise.embed_scale_add_select",

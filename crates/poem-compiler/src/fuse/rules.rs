@@ -35,6 +35,8 @@ pub(super) fn all() -> Vec<Rule> {
         embed_scale_add_select(),
         embed_scale_add(),
         residual_add_rmsnorm(),
+        residual_add_scale_rmsnorm(),
+        rmsnorm_pair(),
         mlp_swiglu(),
         matmul_geglu(),
         moe_experts(),
@@ -896,12 +898,65 @@ fn residual_add_rmsnorm() -> Rule {
             x: m.value("x"),
             y: m.value("y"),
             y_out: m.value("y_out"),
+            scale: None,
             weight: m.value("weight"),
             plus_one: plus_one(m.op("out")),
             eps: m.f32("eps"),
             out: m.value("out"),
         },
     )
+}
+
+/// A residual add whose sum a one-element scale takes before the norm reads
+/// it (Gemma 4's layer scalar ahead of the next layer's norm).
+fn residual_add_scale_rmsnorm() -> Rule {
+    let chain = |norm: Norm| {
+        template(move |p| {
+            let sum = elemwise::residual_add(&p.rows("x", W), &p.rows("y", W));
+            p.name("sum", &sum);
+            let y_out = elemwise::scale(&p.weight("s", [1]), &sum);
+            p.export("y_out", &y_out);
+            let out = norm.apply(p, &y_out, "weight", "eps");
+            p.export("out", &out);
+        })
+    };
+    Rule::new(
+        "elementwise.residual_add_scale_rmsnorm",
+        Norm::BOTH.map(chain),
+        |m| Fused::ResidualAddRmsnorm {
+            x: m.value("x"),
+            y: m.value("y"),
+            y_out: m.value("y_out"),
+            scale: Some(m.value("s")),
+            weight: m.value("weight"),
+            plus_one: plus_one(m.op("out")),
+            eps: m.f32("eps"),
+            out: m.value("out"),
+        },
+    )
+}
+
+/// Two plain RMS norms of one row under their own weights (Gemma 4's router
+/// norm and its expert path's).
+fn rmsnorm_pair() -> Rule {
+    let pattern = template(|p| {
+        let x = p.rows("x", W);
+        let out0 = elemwise::rmsnorm(&x, &p.weight("w0", [W]), p.f32("eps0"));
+        p.export("out0", &out0);
+        let out1 = elemwise::rmsnorm(&x, &p.weight("w1", [W]), p.f32("eps1"));
+        p.export("out1", &out1);
+    });
+    Rule::new("elementwise.rmsnorm_pair", [pattern], |m| Fused::RmsnormPair {
+        x: m.value("x"),
+        w0: m.value("w0"),
+        eps0: m.f32("eps0"),
+        out0: m.value("out0"),
+        w1: m.value("w1"),
+        eps1: m.f32("eps1"),
+        out1: m.value("out1"),
+    })
+    .when(|m| m.width("x").is_some_and(|w| w % 8 == 0 && w <= 8192))
+    .land_first()
 }
 
 /// A dense MLP whole: the packed gate-up projection, swiglu, and the down

@@ -17,6 +17,7 @@ impl Run<'_> {
                 x,
                 y,
                 y_out: _,
+                scale: None,
                 weight,
                 plus_one,
                 eps,

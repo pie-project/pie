@@ -41,6 +41,7 @@ impl DispatchFused for Run<'_> {
                 Err(kernels_cuda::Error::Unsupported { op: op.name() })
             }
             Fused::ResidualAddRmsnorm { .. }
+            | Fused::RmsnormPair { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::EmbedScaleAdd { .. }
             | Fused::EmbedScaleAddSelect { .. }

@@ -1009,6 +1009,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 _ => &[],
             },
             Fused::ResidualAddRmsnorm { .. }
+            | Fused::RmsnormPair { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::NormModulate {
                 lane_of_row: None, ..

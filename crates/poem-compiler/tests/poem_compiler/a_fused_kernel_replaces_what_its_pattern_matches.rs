@@ -1023,3 +1023,45 @@ fn a_gated_delta_step_whose_conv_is_read_elsewhere_stays_apart() {
         ]
     );
 }
+
+/// Gemma 4's layer end: the stream's sum, its one-element layer scalar, the
+/// next layer's attention norm.
+#[test]
+fn a_scaled_residual_add_folds_into_the_next_norm() {
+    let t = trace(|p| {
+        let y = elemwise::residual_add(&p.rows("x", 2816), &p.rows("y", 2816));
+        let y = elemwise::scale(&p.weight("s", [1]), &y);
+        elemwise::rmsnorm(&y, &p.weight("w1", [2816]), 1e-6);
+    });
+    let fused = fuse(t, &["elementwise.residual_add_scale_rmsnorm"]);
+    assert_eq!(ops(&fused), ["elementwise.residual_add_scale_rmsnorm"]);
+}
+
+/// Gemma 4's router norm and its expert path's norm read one row; another
+/// op between them and the row's other readers stay.
+#[test]
+fn two_norms_of_one_row_fold_into_a_pair() {
+    let t = trace(|p| {
+        let x = p.rows("x", 2816);
+        let r = elemwise::rmsnorm(&x, &p.weight("w0", [2816]), 1e-6);
+        linear::matmul(&r, &p.weight("router", [128, 2816]));
+        let e = elemwise::rmsnorm(&x, &p.weight("w1", [2816]), 1e-6);
+        elemwise::silu(&e);
+        elemwise::silu(&x);
+    });
+    let fused = fuse(t, &["elementwise.rmsnorm_pair"]);
+    assert_eq!(
+        ops(&fused),
+        ["elementwise.rmsnorm_pair", "linear.matmul", "elementwise.silu", "elementwise.silu"]
+    );
+}
+
+#[test]
+fn two_bare_norms_of_one_row_fold() {
+    let t = trace(|p| {
+        let x = p.rows("x", 2816);
+        elemwise::rmsnorm(&x, &p.weight("w0", [2816]), 1e-6);
+        elemwise::rmsnorm(&x, &p.weight("w1", [2816]), 1e-6);
+    });
+    assert_eq!(ops(&fuse(t, &["elementwise.rmsnorm_pair"])), ["elementwise.rmsnorm_pair"]);
+}

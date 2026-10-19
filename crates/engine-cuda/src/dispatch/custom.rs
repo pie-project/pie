@@ -34,6 +34,7 @@ impl DispatchFused for Run<'_> {
             | Fused::MoeSelectGlu { .. }
             | Fused::MoeExperts { .. } => self.fused_linear(op),
             Fused::ResidualAddRmsnorm { .. }
+            | Fused::RmsnormPair { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::EmbedScaleAdd { .. }
             | Fused::EmbedScaleAddSelect { .. }

@@ -192,7 +192,7 @@ pub(super) fn apply(mut trace: Trace, rule: &Rule) -> Trace {
                     rule.kernel,
                     "a rule forms the kernel it is listed under"
                 );
-                trace = rewrite(trace, &binding, fused);
+                trace = rewrite(trace, &binding, fused, rule.land_first);
                 uses = Uses::of(&trace);
             }
             None => at += 1,
@@ -211,7 +211,7 @@ fn matched(trace: &Trace, uses: &Uses, rule: &Rule, shape: &Shape, at: usize) ->
     let mut found = None;
     extend(trace, uses, shape, 0, at, start, &mut |binding| {
         let ok = escapes_nothing(uses, shape, binding, rule.through_markers)
-            && keeps_order(trace, binding)
+            && if rule.land_first { keeps_order_first(trace, binding) } else { keeps_order(trace, binding) }
             && (rule.when)(&Match {
                 trace,
                 shape,
@@ -389,9 +389,40 @@ fn keeps_order(trace: &Trace, b: &Binding) -> bool {
     })
 }
 
-fn rewrite(mut trace: Trace, b: &Binding, fused: poem_ir::Fused) -> Trace {
+/// [`keeps_order`] for a fused op landing where the first matched op was:
+/// every op between must write nothing the matched ops read (a value, or
+/// through an alias), so the later ones may move ahead of it.
+fn keeps_order_first(trace: &Trace, b: &Binding) -> bool {
     let matched: BTreeSet<usize> = b.nodes.iter().flatten().copied().collect();
-    let last = *matched.last().expect("a match holds at least one op");
+    let (Some(&first), Some(&last)) = (matched.first(), matched.last()) else {
+        return false;
+    };
+    let mut read = BTreeSet::new();
+    let mut ids = Vec::new();
+    for &m in &matched {
+        ids.clear();
+        trace.nodes[m].op.inputs(&mut ids);
+        read.extend(ids.iter().copied());
+    }
+    let mut aliases = Vec::new();
+    (first + 1..last).filter(|i| !matched.contains(i)).all(|i| {
+        let op = &trace.nodes[i].op;
+        ids.clear();
+        op.outputs(&mut ids);
+        aliases.clear();
+        op.aliases(&mut aliases);
+        ids.iter().all(|v| !read.contains(v))
+            && aliases.iter().all(|(_, into)| !read.contains(into))
+    })
+}
+
+fn rewrite(mut trace: Trace, b: &Binding, fused: poem_ir::Fused, land_first: bool) -> Trace {
+    let matched: BTreeSet<usize> = b.nodes.iter().flatten().copied().collect();
+    let last = if land_first {
+        *matched.first().expect("a match holds at least one op")
+    } else {
+        *matched.last().expect("a match holds at least one op")
+    };
     let guard = trace.nodes[last].guard.clone();
     let layer = matched.iter().rev().find_map(|&m| trace.nodes[m].layer);
     let mut landed = Vec::with_capacity(trace.nodes.len());
