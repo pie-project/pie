@@ -452,6 +452,10 @@ fn the_recorder_is_inert_until_started_then_writes_the_file() {
     gpu_span(Some((7, 1)), 3_000, 3_500);
     gpu_span(None, 1_000, 2_000);
     gpu_span(None, 5_000, 6_000);
+    // A frame's span can land before its submit returns.
+    let s3 = step_posted(vec![part(A, 0, 1, 2)]);
+    gpu_span(Some((8, 0)), 7_000, 7_400);
+    frame_submitted(8, &[s3]);
     step_retired(&[s1, s2]);
     memory(1 << 30);
     memory(2 << 30);
@@ -460,11 +464,12 @@ fn the_recorder_is_inert_until_started_then_writes_the_file() {
     let written = finish().unwrap().unwrap();
     assert!(!enabled());
     assert_eq!(written.agents, 1);
-    assert_eq!(written.steps, 2);
+    assert_eq!(written.steps, 3);
 
     let json: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let gpu = spans(&json, 2, 2);
-    assert_eq!(gpu.len(), 2);
+    assert_eq!(gpu.len(), 3);
+    assert_eq!(gpu[2]["args"]["step"], 3);
     assert_eq!(gpu[0]["args"]["step"], 1);
     assert_eq!(gpu[0]["ts"], 1_000);
     assert_eq!(gpu[1]["args"]["step"], 2);
@@ -476,6 +481,16 @@ fn the_recorder_is_inert_until_started_then_writes_the_file() {
             .any(|e| e["args"]["name"] == "agent-1 (agent-loop)")
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn schemes_from_deployment_names() {
+    assert_eq!(
+        scheme_of("qwen35-d0-8b-u4g64-kv-bf16").as_deref(),
+        Some("affine_u4_g64")
+    );
+    assert_eq!(scheme_of("qwen35-d0-8b-bf16-kv-bf16").as_deref(), Some("bf16"));
+    assert_eq!(scheme_of("plain"), None);
 }
 
 #[test]

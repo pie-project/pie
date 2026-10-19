@@ -138,6 +138,9 @@ struct State {
     frames: HashMap<(u64, u32), u64>,
     /// Steps submitted to the engine and not yet given a device span.
     awaiting_gpu: BTreeSet<u64>,
+    /// Device spans that landed before the engine's submit returned the
+    /// frame they belong to.
+    early_gpu: HashMap<(u64, u32), (u64, u64)>,
     last_memory_us: Option<u64>,
 }
 
@@ -178,6 +181,7 @@ pub fn start(path: impl Into<PathBuf>, mut meta: Meta) {
         next_step: 1,
         frames: HashMap::new(),
         awaiting_gpu: BTreeSet::new(),
+        early_gpu: HashMap::new(),
         last_memory_us: None,
     });
     ENABLED.store(true, Ordering::Relaxed);
@@ -223,6 +227,9 @@ fn push(f: impl FnOnce(u64) -> Record) {
 }
 
 pub fn agent_start(agent: AgentKey, program: &str) {
+    if !enabled() {
+        return;
+    }
     // A program name, not anything the program said.
     let program = program.split('@').next().unwrap_or(program).to_string();
     push(|t| Record::AgentStart { t, agent, program });
@@ -258,8 +265,12 @@ pub fn frame_submitted(frame: u64, steps: &[u64]) {
             if step == 0 {
                 continue;
             }
-            let index = u32::try_from(index).unwrap_or(u32::MAX);
-            s.frames.insert((frame, index), step);
+            let key = (frame, u32::try_from(index).unwrap_or(u32::MAX));
+            if let Some((start, end)) = s.early_gpu.remove(&key) {
+                s.log.push(Record::Gpu { step, start, end });
+                continue;
+            }
+            s.frames.insert(key, step);
             s.awaiting_gpu.insert(step);
         }
     });
@@ -303,19 +314,22 @@ pub fn gpu_span(at: Option<(u64, u32)>, start: u64, end: u64) {
 }
 
 fn gpu_span_locked(s: &mut State, at: Option<(u64, u32)>, start: u64, end: u64) {
-    let step = match at.and_then(|key| s.frames.remove(&key)) {
-        Some(step) => Some(step),
+    let end = end.max(start);
+    let step = match at {
+        Some(key) => match s.frames.remove(&key) {
+            Some(step) => Some(step),
+            None => {
+                s.early_gpu.insert(key, (start, end));
+                return;
+            }
+        },
         None => s.awaiting_gpu.iter().next().copied(),
     };
     let Some(step) = step else {
         return;
     };
     s.awaiting_gpu.remove(&step);
-    s.log.push(Record::Gpu {
-        step,
-        start,
-        end: end.max(start),
-    });
+    s.log.push(Record::Gpu { step, start, end });
 }
 
 /// Device memory allocated now; kept at most once per [`WINDOW_US`].
@@ -351,6 +365,9 @@ pub fn memory_due() -> bool {
 
 /// The agent fed the result of tool `name` back.
 pub fn tool(agent: AgentKey, name: &str) {
+    if !enabled() {
+        return;
+    }
     let name = name.to_string();
     push(|t| Record::Tool { t, agent, name });
 }
@@ -429,6 +446,32 @@ pub fn apple_bandwidth_gbs(name: &str, gpu_cores: Option<u32>) -> Option<f64> {
         _ => return None,
     };
     Some(gbs)
+}
+
+/// The weight scheme a deployment name states: `u4g64` is 4-bit affine in
+/// groups of 64 (`affine_u4_g64`); otherwise its first dtype word.
+#[must_use]
+pub fn scheme_of(deployment: &str) -> Option<String> {
+    let words: Vec<&str> = deployment.split(['-', '.', '_']).collect();
+    for word in &words {
+        if let Some(rest) = word.strip_prefix('u')
+            && let Some((bits, group)) = rest.split_once('g')
+            && !bits.is_empty()
+            && !group.is_empty()
+            && bits.chars().all(|c| c.is_ascii_digit())
+            && group.chars().all(|c| c.is_ascii_digit())
+        {
+            return Some(format!("affine_u{bits}_g{group}"));
+        }
+    }
+    let mut prev = "";
+    for word in words {
+        if prev != "kv" && matches!(word, "bf16" | "f16" | "fp16" | "f32" | "fp8" | "mxfp4" | "nvfp4") {
+            return Some(word.to_string());
+        }
+        prev = word;
+    }
+    None
 }
 
 /// `2026-10-18T12:00:00Z` for `at`.
