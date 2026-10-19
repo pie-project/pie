@@ -782,6 +782,7 @@ mod tests {
                 Operation::Attention(Attention::SsmCausalConv1dChunked {
                     x: ValueId(0),
                     weight: ValueId(1),
+                    bias: None,
                     state: ValueId(2),
                     conv_width: 4,
                     dilation: 1,

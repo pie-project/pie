@@ -183,8 +183,10 @@ __global__ void __launch_bounds__(256) rmsnorm_in_warp(
     *reinterpret_cast<Run*>(y + at) = *reinterpret_cast<const Run*>(out);
 }
 
-template <class T, int BLOCK = 256>
-__global__ void rmsnorm_grouped_plus_one(
+// Each `group`-wide run of a row RMS-normed and scaled by its own weights,
+// plus one under `PLUS_ONE`.
+template <class T, int BLOCK, bool PLUS_ONE>
+__global__ void rmsnorm_grouped(
     const T* __restrict__ x,
     const T* __restrict__ weight,
     T* __restrict__ y,
@@ -217,7 +219,7 @@ __global__ void rmsnorm_grouped_plus_one(
 
     for (int i = tid; i < group; i += BLOCK) {
         const float xv = Elem<T>::to_f32(xr[i]);
-        const float wv = Elem<T>::to_f32(wr[i]) + 1.f;
+        const float wv = Elem<T>::to_f32(wr[i]) + (PLUS_ONE ? 1.f : 0.f);
         yr[i] = Elem<T>::from_f32(xv * inv_rms * wv);
     }
 }

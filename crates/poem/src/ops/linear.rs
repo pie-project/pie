@@ -221,6 +221,19 @@ pub fn mlp_gelu_tanh(x: &Value) -> Value {
     y
 }
 
+pub fn mlp_relu2(x: &Value) -> Value {
+    let r = x.rec();
+    let y = r.fresh(x.ty().clone());
+    r.push(
+        Linear::MlpRelu2 {
+            x: x.id(),
+            y: y.id(),
+        },
+        &[x],
+    );
+    y
+}
+
 pub fn mlp_geglu_tanh_packed(packed: &Value, intermediate: u32) -> Value {
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));

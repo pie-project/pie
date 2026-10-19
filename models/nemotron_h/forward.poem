@@ -1,0 +1,107 @@
+# The forward of Nemotron-3 Super: pre-norm layers, each one mixer added to
+# the residual: a Mamba-2 scan, a NoPE GQA attention, or a latent MoE whose
+# relu2 experts read the residual squeezed to the latent width beside a relu2
+# shared expert reading it whole.
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    plane = m.kv_heads * m.head_dim
+    for w in m.layers:
+        if w.attn != None:
+            c.kv(kv, w.attn.kv, [plane, plane], m.head_dim, heads = True)
+        elif w.mamba != None:
+            c.state(w.mamba.conv_state, [m.conv_kernel, m.conv_dim], dtype.bf16, split = 1)
+            c.state(w.mamba.ssm_state, [m.mamba_heads, m.mamba_head_dim, m.state_dim], dtype.f32, split = 0)
+
+def forward(m, inputs):
+    ([input_m, input_s, input_d], input_p) = inputs.partition([fact.has(fact.Mask), fact.scores(), fact.single_token()])
+    plans = struct(
+        m = ops.attn.plan_prefill(input_m, m.heads, m.kv_heads, m.head_dim, None),
+        d = ops.attn.plan_decode(input_d, m.heads, m.kv_heads, m.head_dim, None),
+        p = ops.attn.plan_prefill(input_p, m.heads, m.kv_heads, m.head_dim, None),
+        s = ops.attn.plan_prefill(input_s, m.heads, m.kv_heads, m.head_dim, None),
+    )
+    mask = inputs.mask()
+    y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+
+    def block(l, w, y):
+        x = ops.elemwise.rmsnorm(y, w.norm, m.eps)
+        if w.mamba != None:
+            o = mamba(x, inputs, m, w.mamba)
+        elif w.attn != None:
+            o = attention(x, inputs, m, plans, mask, w.attn)
+        else:
+            o = moe(x, m, w.moe)
+        return ops.elemwise.residual_add(o, y)
+
+    y = inputs.fold_layers(m.layers, y, block)
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
+    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    return ops.linear.lm_head(x, m.head)
+
+def mamba(x, inputs, m, k):
+    conv_state = inputs.state(k.conv_state)
+    ssm_state = inputs.state(k.ssm_state)
+    z, rest = ops.layout.split_rows(ops.linear.matmul(x, k.in_proj), m.inner)
+    xbc, dt = ops.layout.split_rows(rest, m.conv_dim)
+    seam.at(seam.RECURRENT, [xbc])
+
+    def scan(xbc, chunked):
+        rows = (lambda v: v.on(~fact.single_token())) if chunked else (lambda v: v.on(fact.single_token()))
+        conv = ops.attn.ssm_causal_conv1d_chunked if chunked else ops.attn.ssm_causal_conv1d
+        return ops.attn.ssm_mamba2(
+            conv(xbc, k.conv, conv_state, m.conv_kernel, k.conv_bias),
+            rows(dt),
+            rows(z),
+            k.a_log,
+            k.dt_bias,
+            k.d,
+            k.norm,
+            m.eps,
+            ssm_state,
+            m.mamba_heads,
+            m.groups,
+            m.state_dim,
+            chunked,
+        )
+
+    o = switch(xbc, [(fact.single_token(), lambda xbc: scan(xbc, False))], otherwise = lambda xbc: scan(xbc, True))
+    return ops.linear.matmul(o, k.out_proj)
+
+def attention(x, inputs, m, plans, mask, a):
+    pages = inputs.kv(a.kv)
+    d = m.head_dim
+    q = ops.linear.matmul(x, a.q)
+    k = ops.linear.matmul(x, a.k)
+    v = ops.linear.matmul(x, a.v)
+    seam.at(seam.ATTN_QV, [q, v])
+    ops.attn.kv_append(k, v, pages, inputs.write_page(a.kv), inputs.write_offset(a.kv))
+    seam.at(seam.ATTN_Q, [q])
+
+    def scored(q):
+        o, lse = ops.attn.prefill_lse(q, plans.s, pages, None, d, m.kv_heads, m.sm_scale)
+        seam.at(seam.SCORES, [lse])
+        return o
+
+    o = switch(q, [
+        (fact.has(fact.Mask), lambda q: ops.attn.masked(q, plans.m, mask, pages, None, d, m.kv_heads, True, m.sm_scale)),
+        (fact.scores(), scored),
+        (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, m.sm_scale)),
+    ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, m.sm_scale))
+    seam.at(seam.ATTN_OUT, [o])
+    return ops.linear.matmul(o, a.o)
+
+def moe(x, m, f):
+    routes, weights = ops.linear.moe_topk_sigmoid_biased(
+        ops.linear.matmul_f32(x, f.router),
+        f.bias,
+        m.experts,
+        m.top_k,
+        True,
+        m.scaling,
+    )
+    z = ops.linear.matmul(x, f.down_latent)
+    hidden = ops.linear.mlp_relu2(ops.linear.moe_matmul_select_quant(z, f.up, routes, m.top_k))
+    routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select_quant(hidden, f.down, routes, m.top_k), weights)
+    shared = ops.linear.matmul(ops.linear.mlp_relu2(ops.linear.matmul(x, f.shared_up)), f.shared_down)
+    return ops.elemwise.residual_add(ops.linear.matmul(routed, f.up_latent), shared)

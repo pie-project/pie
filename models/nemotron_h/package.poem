@@ -1,0 +1,21 @@
+# Nemotron-3 Super (`nemotron_h`): Mamba-2 mixers, a few NoPE attention
+# layers and latent MoE layers of relu2 experts; and its nine-layer
+# miniature (four of each mixer kind but one attention). Served as modelopt
+# exports it and vLLM serves it: routed experts NVFP4 against NVFP4
+# activations, the projections the export keeps FP8 at FP8, the rest bf16.
+
+STOP = ["<|im_end|>"]
+CHATML = template("chatml", thinking = True, tools = True, generation_suffix = "<think>\n", stop = STOP)
+TOKENIZER = tokenizer(markers = [STOP])
+
+MODELS = [
+    model("nemotron3-super", template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 88, vocab = 131072),
+    model("nemotron3-super-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 9, vocab = 131072),
+]
+
+RELEASE = [dtype.bf16, dtype.nvfp4a4, dtype.e4m3tile128a8]
+
+DEPLOYMENTS = [
+    deployment("nemotron3-super", weights = RELEASE, kv = dtype.bf16),
+    deployment("nemotron3-super-mini", weights = RELEASE, kv = dtype.bf16),
+]

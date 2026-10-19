@@ -1800,6 +1800,7 @@ fn ssm_gdn_step() -> Rule {
         let conv = attn::ssm_causal_conv1d_dilated(
             &qkv,
             &p.weight("conv_weight", [W, W]),
+            None,
             conv_state,
             p.u32("conv_width"),
             p.u32("dilation"),
