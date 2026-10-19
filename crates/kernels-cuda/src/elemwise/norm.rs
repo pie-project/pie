@@ -296,31 +296,39 @@ pub fn norm_gate(
         ));
     }
     let tail = next.is_some();
-    ctx.fire(
-        OP,
-        Fire::at(
-            FILE,
-            symbol(&format!(
-                "::pie::elemwise::norm_gate<{t}, {threads}, {tail}>"
-            )),
+    // A long fire's block walks sixteen rows; a short one's keeps a row.
+    const WALK: u32 = 16;
+    let walk = rows >= 8192;
+    let (entry, launch) = if walk {
+        (
+            format!("::pie::elemwise::norm_gate_rows<{t}, {threads}, {tail}, {WALK}>"),
+            Launch::per_row(rows.div_ceil(WALK), threads),
         )
-        .apply(Launch::per_row(rows, threads)),
-        &[
-            x.arg(),
-            absent(scale),
-            absent(res),
-            absent(gate),
-            y.arg(),
-            eps.arg(),
-            temperature.arg(),
-            stated(OP, fan)?.arg(),
-            absent(next.map(|n| n.weight)),
-            next.map_or(0.0, |n| n.eps).arg(),
-            i32::from(next.is_some_and(|n| n.plus_one)).arg(),
-            absent(next.map(|n| n.y)),
-            ctx.stage(),
-        ],
-    )
+    } else {
+        (
+            format!("::pie::elemwise::norm_gate<{t}, {threads}, {tail}>"),
+            Launch::per_row(rows, threads),
+        )
+    };
+    let mut args = vec![
+        x.arg(),
+        absent(scale),
+        absent(res),
+        absent(gate),
+        y.arg(),
+        eps.arg(),
+        temperature.arg(),
+        stated(OP, fan)?.arg(),
+        absent(next.map(|n| n.weight)),
+        next.map_or(0.0, |n| n.eps).arg(),
+        i32::from(next.is_some_and(|n| n.plus_one)).arg(),
+        absent(next.map(|n| n.y)),
+    ];
+    if walk {
+        args.push(stated(OP, rows)?.arg());
+    }
+    args.push(ctx.stage());
+    ctx.fire(OP, Fire::at(FILE, symbol(&entry)).apply(launch), &args)
 }
 
 pub fn rmsnorm_no_scale(
