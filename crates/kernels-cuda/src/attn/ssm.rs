@@ -1321,7 +1321,7 @@ pub fn gated_delta_chunked(
         return ctx.fire(
             OP,
             Fire::at(FILE, "::pie::attn::ssm_gdn_narrow_rows")
-                .apply(Launch::grid([rows, 1, 1], [128, 1, 1])),
+                .apply(Launch::grid([rows, y.width.div_ceil(4 * 128), 1], [128, 1, 1])),
             &[wide.arg(), y.arg(), width.arg(), ctx.stage()],
         );
     }

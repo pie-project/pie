@@ -3217,8 +3217,9 @@ __global__ void ssm_kda_chunked_batched(
 constexpr int GDN_CH = 64;
 
 // A gated delta walk's f32 rows narrowed to bf16 where its trace asked for
-// a bf16 output and the walk could not land one itself: one block a row,
-// the staged window's rows only.
+// a bf16 output and the walk could not land one itself: a block a row and
+// span of `blockDim.x` runs of four (a few rows' fire is otherwise a few
+// blocks walking a long row), the staged window's rows only.
 __global__ void ssm_gdn_narrow_rows(
     const float* __restrict__ src, __nv_bfloat16* __restrict__ dst, int width,
     const u32* __restrict__ win)
@@ -3226,8 +3227,23 @@ __global__ void ssm_gdn_narrow_rows(
     const int r = blockIdx.x;
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
-    for (int c = threadIdx.x; c < width; c += blockDim.x) {
-        dst[row * width + c] = __float2bfloat16(src[row * width + c]);
+    const float* s = src + row * width;
+    __nv_bfloat16* d = dst + row * width;
+    const int span = 4 * static_cast<int>(blockDim.x);
+    const int c0 = static_cast<int>(blockIdx.y) * span;
+    if ((width & 3) == 0) {
+        const int c = c0 + 4 * static_cast<int>(threadIdx.x);
+        if (c < width) {
+            const float4 v = *reinterpret_cast<const float4*>(s + c);
+            __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y);
+            __nv_bfloat162 hi = __floats2bfloat162_rn(v.z, v.w);
+            *reinterpret_cast<__nv_bfloat162*>(d + c) = lo;
+            *reinterpret_cast<__nv_bfloat162*>(d + c + 2) = hi;
+        }
+        return;
+    }
+    for (int c = c0 + static_cast<int>(threadIdx.x); c < min(width, c0 + span); c += blockDim.x) {
+        d[c] = __float2bfloat16(s[c]);
     }
 }
 
