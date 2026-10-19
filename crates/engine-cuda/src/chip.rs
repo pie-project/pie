@@ -608,6 +608,8 @@ mod tests {
                         mxfp4_mma_until: defaults.mxfp4_mma_until,
                         nvfp4_mma_from: defaults.nvfp4_mma_from,
                         nvfp4_mma_until: defaults.nvfp4_mma_until,
+                        bf16_mma_from: defaults.bf16_mma_from,
+                        bf16_mma_until: defaults.bf16_mma_until,
                         ..tuning
                     },
                     defaults,
@@ -615,6 +617,7 @@ mod tests {
                 );
                 assert!(tuning.ssm_gdn_fused_scan && tuning.pool_mma && tuning.pdl, "{gpu}");
                 assert_eq!((tuning.mxfp4_mma_from, tuning.mxfp4_mma_until), (28, 1024));
+                assert_eq!((tuning.bf16_mma_from, tuning.bf16_mma_until), (16, 65536));
             } else {
                 assert_eq!(tuning, defaults, "{gpu}");
             }
