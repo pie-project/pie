@@ -475,6 +475,9 @@ pub struct Pools {
     buffered: (u64, u64),
     host: Option<HostKv>,
     disk: Option<DiskKv>,
+    /// The kv planes were handed to another worker to read
+    /// ([`Pools::export_kv`]): committed whole, and never trimmed since.
+    kv_exported: bool,
 }
 
 /// The slot file kv is suspended into below host memory, and the pinned
@@ -496,6 +499,18 @@ struct HostKv {
     window_pages: u32,
     rows: u32,
     row_bytes: u64,
+}
+
+/// What [`Pools::export_kv`] hands out: the planes' regions and the shape
+/// their pages have.
+#[derive(Debug, Clone)]
+pub struct ExportedKv {
+    pub regions: Vec<engine::KvRegion>,
+    pub layers: u32,
+    pub heads: u32,
+    pub head_dim: u32,
+    pub dtype: Dtype,
+    pub page_size: u32,
 }
 
 impl Pools {
@@ -656,6 +671,7 @@ impl Pools {
             buffered: (0, 1),
             host: None,
             disk: None,
+            kv_exported: false,
         })
     }
 
@@ -1447,6 +1463,70 @@ impl Pools {
         planes
     }
 
+    /// The kv planes as another worker reads them: every declared page
+    /// committed now and kept so (trim spares them), one region per paged
+    /// plane, a page `p` at `base + p * page_stride`. A windowed space is
+    /// refused: its pages are backed one at a time as fires first touch them.
+    pub fn export_kv(&mut self, ordinal: u32) -> Result<ExportedKv> {
+        if !self.windowed_planes().is_empty() {
+            return Err(Fault::Residency(
+                "a windowed kv space is backed a page at a time as fires first touch it, \
+                 so it cannot be handed whole to another worker"
+                    .to_string(),
+            ));
+        }
+        let pages = u32::try_from(self.paging.pages()).unwrap_or(u32::MAX);
+        self.ensure_kv(pages)?;
+        self.kv_exported = true;
+        let mut regions = Vec::new();
+        for (arena, page_bytes) in self.paged_planes() {
+            let len = u64::from(pages) * page_bytes;
+            regions.push(engine::KvRegion {
+                base: arena.span(0, len)?,
+                len,
+                page_stride: page_bytes,
+                domain: engine::MemoryDomain::CudaDevice(ordinal),
+            });
+        }
+        let (layers, heads, head_dim, dtype) = self
+            .shapes
+            .iter()
+            .find_map(|shape| match *shape {
+                Shape::Kv {
+                    windowed: false,
+                    dtype,
+                    keys_width,
+                    head_stride,
+                    ..
+                } => Some((dtype, keys_width, head_stride)),
+                _ => None,
+            })
+            .map_or(
+                (0, 0, 0, Dtype::Bf16),
+                |(dtype, keys_width, head_stride)| {
+                    let layers = self
+                        .shapes
+                        .iter()
+                        .filter(|shape| matches!(shape, Shape::Kv { .. }))
+                        .count();
+                    (
+                        u32::try_from(layers).unwrap_or(u32::MAX),
+                        u32::try_from(keys_width / head_stride.max(1)).unwrap_or(u32::MAX),
+                        u32::try_from(head_stride).unwrap_or(u32::MAX),
+                        dtype,
+                    )
+                },
+            );
+        Ok(ExportedKv {
+            regions,
+            layers,
+            heads,
+            head_dim,
+            dtype,
+            page_size: self.paging.page_size,
+        })
+    }
+
     /// The bytes one windowed kv page holds over every windowed plane.
     #[must_use]
     pub fn window_page_bytes(&self) -> u64 {
@@ -2236,10 +2316,13 @@ impl engine::frame::Supply for Pools {
         if !self.trim_is_worth_the_unmap(hint) {
             return;
         }
-        self.release_to(
-            hint.kv_pages.min(self.committed_kv_pages),
-            hint.state_slots.min(self.committed_state_slots),
-        );
+        // Exported planes stay as another worker registered them.
+        let kv_pages = if self.kv_exported {
+            self.committed_kv_pages
+        } else {
+            hint.kv_pages.min(self.committed_kv_pages)
+        };
+        self.release_to(kv_pages, hint.state_slots.min(self.committed_state_slots));
     }
 }
 

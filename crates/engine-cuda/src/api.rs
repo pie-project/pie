@@ -471,6 +471,10 @@ impl Engine for Cuda {
         self.caps.as_ref().map(|caps| &caps.device)
     }
 
+    fn export_kv_handle(&self) -> Option<engine::KvHandle> {
+        self.caps.as_ref()?.kv_handle.clone()
+    }
+
     fn bind_thread(&mut self) -> EngineResult<()> {
         match self.shell.as_ref() {
             Some(shell) => shell.bind_thread().map_err(fault),
@@ -549,6 +553,11 @@ impl Engine for Cuda {
                 self.boot.world.size,
             )
             .map_err(fault)?;
+        let kv_handle = if residency.kv_export {
+            Some(shell.export_kv(self.boot.world).map_err(fault)?)
+        } else {
+            None
+        };
         let disk_kv_pages = shell
             .seat_disk_kv(
                 residency.disk_kv_budget,
@@ -631,7 +640,7 @@ impl Engine for Cuda {
                 host_to_device: host_kv_pages > 0,
                 host_to_host: false,
             },
-            kv_handle: None,
+            kv_handle,
             media_encode: false,
             device_channel_commit: true,
             rs_verbs: true,

@@ -247,6 +247,40 @@ impl Shell {
     /// within the host memory the load left. Unstated, it holds `seats`
     /// sequences at `context` tokens, and at least one device pool's worth
     /// of each.
+    /// The kv planes, for another worker to read in place
+    /// ([`crate::store::Pools::export_kv`]). One rank's planes hold a band of
+    /// each layer's heads, so a tensor-parallel load is refused until a
+    /// handle carries every rank's.
+    pub fn export_kv(&mut self, world: crate::World) -> Result<engine::KvHandle> {
+        if world.size > 1 {
+            return Err(Fault::Residency(
+                "a tensor-parallel load's kv is split across its ranks, and a handle names \
+                 one rank's planes"
+                    .to_string(),
+            ));
+        }
+        let ordinal = u32::try_from(self.ordinal()).unwrap_or(0);
+        let exported = self.pools.export_kv(ordinal)?;
+        let layout = engine::KvLayout {
+            num_layers: exported.layers,
+            num_kv_heads: exported.heads,
+            head_dim: exported.head_dim,
+            page_size: exported.page_size,
+            dtype: exported.dtype,
+            kind: engine::KvLayoutKind::KvSeparate,
+            storage_format: format!("cuda {} {:?}", self.trace().name, exported.dtype),
+            region_page_bytes: exported
+                .regions
+                .iter()
+                .map(|region| region.page_stride)
+                .collect(),
+        };
+        Ok(engine::KvHandle {
+            regions: exported.regions,
+            layout,
+        })
+    }
+
     pub fn seat_host_kv(
         &mut self,
         stated: Option<u64>,

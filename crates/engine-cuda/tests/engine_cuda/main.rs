@@ -61,6 +61,7 @@ mod a_two_reading_plan_reads_each_lane_back_from_its_own_seam;
 mod a_windowed_row_reads_what_the_full_row_reads;
 mod an_adapter_is_not_a_lanes_scratch;
 mod an_epilogue_agrees_with_the_host_interpreter;
+mod an_exported_kv_stays_mapped;
 mod every_armed_body_answers_its_eager_walk;
 mod every_catalog_deployment_dispatches;
 mod every_diagnostic_is_a_word_the_boot_states;

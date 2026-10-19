@@ -730,6 +730,7 @@ impl ModelConfig {
             kv_seats: None,
             disk_kv_budget: self.disk_kv_budget.map(|b| b.as_bytes()),
             disk_kv_dir: self.disk_kv_path.clone(),
+            kv_export: false,
         }
     }
 
