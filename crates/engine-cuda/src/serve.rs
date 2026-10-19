@@ -314,6 +314,10 @@ impl Shell {
     /// within the host memory the load left. Unstated, it holds `seats`
     /// sequences at `context` tokens, and at least one device pool's worth
     /// of each.
+    /// Device pools' worth of host kv the unstated default seats at most
+    /// ([`Self::seat_host_kv`]).
+    pub const HOST_POOLS: u64 = 4;
+
     pub fn seat_host_kv(
         &mut self,
         stated: Option<u64>,
@@ -342,11 +346,18 @@ impl Shell {
             + u64::from(seats) * u64::from(context).div_ceil(page_tokens) * page;
         // Unstated, the default takes at most half of what the host leaves
         // free: workers sharing a host each seat theirs as they boot, and
-        // the first must not take the room the next one needs.
+        // the first must not take the room the next one needs. And at most
+        // [`Self::HOST_POOLS`] device pools: pinned pages cost the driver ~0.2 s a GiB
+        // to give back when this process dies, holding every other process
+        // on the host meanwhile (128 GiB pinned: ~25 s), and an agent trace
+        // that suspends whole programs for long tool waits peaked at 1.7
+        // pools; the disk tier takes what is past it.
         let free = crate::weights::available_memory() / ranks;
         let budget = match stated {
             Some(bytes) => (bytes / ranks).min(free),
-            None => whole.max(seated).min(free / 2),
+            None => whole
+                .max(seated.min(whole.saturating_mul(Self::HOST_POOLS)))
+                .min(free / 2),
         };
         let (rows, pages, window_pages) =
             crate::store::host_pool(budget, rows, row, pages, page, window_pages, window_page);
