@@ -2076,16 +2076,14 @@ fn select_mxfp4_mma(
     let cols = if glu.is_some() { 64 } else { 128 };
     let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
     let experts = codes.rows.clamp(1, EXPERT_CAP);
-    // An expert's slice is 8, 16, 32 or (on the bf16 path) 64 routes: as
-    // few 8-route blocks as the average expert fills, each slice's codes
-    // read and dequantized once for all of its routes.
+    // An expert's slice is 8, 16 or 32 routes: as few 8-route blocks as the
+    // average expert fills, each slice's codes read and dequantized once for
+    // all of its routes. (64-route slices measured slower here — mimom.)
     let per = fan.route_count.div_ceil(experts);
     let nb: u32 = match per {
         0..=4 => 1,
         5..=12 => 2,
-        13..=40 => 4,
-        _ if cvt => 4,
-        _ => 8,
+        _ => 4,
     };
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
