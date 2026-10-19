@@ -2280,14 +2280,18 @@ fn select_mxfp4_mma(
     let cols = if glu.is_some() { 64 } else { 128 };
     let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
     let experts = codes.rows.clamp(1, EXPERT_CAP);
-    // An expert's slice is 8, 16 or 32 routes: as few 8-route blocks as the
-    // average expert fills.
+    // An expert's slice is 8, 16, 32 or 64 routes: as few 8-route blocks as
+    // the average expert fills. The 32- and 64-route slices stage their
+    // activations in shared memory, the CTA's warps sharing them (bf16 kernel).
     let per = fan.route_count.div_ceil(experts);
     let nb: u32 = match per {
         0..=4 => 1,
         5..=12 => 2,
-        _ => 4,
+        13..=40 => 4,
+        _ if cvt => 4,
+        _ => 8,
     };
+    let smem_x = !cvt && nb >= 4;
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
     let inter = stated(op, y.width)?;
@@ -2344,14 +2348,15 @@ fn select_mxfp4_mma(
     } else {
         Fire::at(
             "linear/moe_w4.cuh",
-            symbol(&match tensor_scales {
-                // NVFP4: an e4m3 scale a 16 codes, a tensor scale a row.
-                Some(_) => format!("::pie::linear::moe_select_mxfp4_mma<{nb}, 1, {code}, true>"),
-                None => format!("::pie::linear::moe_select_mxfp4_mma<{nb}, 1, {code}>"),
-            }),
+            // NVFP4: an e4m3 scale a 16 codes, a tensor scale a row.
+            symbol(&format!(
+                "::pie::linear::moe_select_mxfp4_mma<{nb}, 1, {code}, {}, {smem_x}>",
+                tensor_scales.is_some()
+            )),
         )
-        // One chunk in flight a warp: five CTAs an SM.
-        .apply(Launch::grid(grid, [THREADS, 1, 1]))
+        // One chunk in flight a warp: five CTAs an SM. Staged activations: two
+        // chunks of the slice's rows, 288 bytes each (`kXRow`).
+        .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(if smem_x { 2 * 8 * nb * 288 } else { 0 }))
     };
     let mut args = vec![
         x.arg(),

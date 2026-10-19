@@ -62,6 +62,12 @@ __device__ __forceinline__ unsigned ld_scale(const u8* p) {
 
 using ::pie::glu_fn::glu;
 
+// 16 bytes global to shared, past L1 (a slice's activations, staged once).
+__device__ __forceinline__ void cp_cg16(void* dst, const void* src) {
+    const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(at), "l"(src));
+}
+
 __device__ __forceinline__ uint4 ld_act(const void* p) {
     uint4 v;
     asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n"
@@ -96,8 +102,11 @@ struct Chunk {
 // two factors.
 // NVFP4 (`kNv`): a lane's 32 codes are two 16-code blocks, words 0-1 and
 // 2-3, the two e4m3 scales in the low and high byte of its scale word.
-template <bool wide, bool kNv, int kTiles, int kNb>
-__device__ __forceinline__ void compute(const Chunk<kTiles, kNb>& cc, float (&acc)[kTiles][kNb][4]) {
+// `xf(b, w)`: the lane's word `w` of its routes' activations in 8-route
+// block `b` (its registers', or shared memory's).
+template <bool wide, bool kNv, int kTiles, int kNb, class XF>
+__device__ __forceinline__ void compute(const Chunk<kTiles, kNb>& cc, float (&acc)[kTiles][kNb][4],
+                                        XF xf) {
     unsigned s1[kTiles][2], s2[kTiles][2], nv[kTiles][2][2];
 #pragma unroll
     for (int t = 0; t < kTiles; ++t)
@@ -131,7 +140,7 @@ __device__ __forceinline__ void compute(const Chunk<kTiles, kNb>& cc, float (&ac
             unsigned b0[kNb], b1[kNb];
 #pragma unroll
             for (int b = 0; b < kNb; ++b) {
-                const uint4 x = cc.x[b][w];
+                const uint4 x = xf(b, w);
                 const unsigned lo = jj == 0 ? x.y : x.x;
                 const unsigned hi = jj == 0 ? x.w : x.z;
                 b0[b] = __byte_perm(lo, hi, 0x7632);
@@ -480,8 +489,11 @@ __global__ void moe_route_order_scan(
 }
 
 // `kNv`: an NVFP4 bank (an e4m3 scale a 16 codes, `tscale` an f32 tensor
-// scale a weight row) in place of mxfp4's e8m0 a 32.
-template <int kNb, int kDepth, int kGlu, bool kNv = false>
+// scale a weight row) in place of mxfp4's e8m0 a 32. `kSmemX`: the slice's
+// activations staged a chunk at a time into shared memory (`kSlice` rows
+// of `kXRow` bytes, twice), shared by the CTA's warps, rather than each lane
+// loading its own: the wide slices', whose loads would outweigh the codes.
+template <int kNb, int kDepth, int kGlu, bool kNv = false, bool kSmemX = false>
 __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
@@ -521,7 +533,9 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
     // A tile's first row: the next 16 rows, or a GLU's up rows `inter` on.
     const int span = kGlu != 0 ? inter : n;
     auto tile_row = [&](int t) { return kGlu != 0 ? row_base + t * inter : row_base + 16 * t; };
-    if (row_base >= span) return;
+    // A warp past the bank: done, but where it joins the CTA's staging and
+    // barriers (its rows clamped in, its sums landing nowhere).
+    if (!kSmemX && row_base >= span) return;
 
     const int groups = k >> 5;
     const int chunks = (groups + 3) >> 2;
@@ -564,14 +578,38 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
                     cc.s[t][h] = live ? w4mma::ld_scale(srow[t][h] + ch * 4) : 127u;
                 }
             }
+        if constexpr (!kSmemX) {
 #pragma unroll
-        for (int b = 0; b < kNb; ++b)
+            for (int b = 0; b < kNb; ++b)
 #pragma unroll
-            for (int q = 0; q < 4; ++q)
-                cc.x[b][q] = live && xrow[b] != nullptr
-                    ? w4mma::ld_act(xrow[b] + ch * 128 + q * 8)
-                    : make_uint4(0, 0, 0, 0);
+                for (int q = 0; q < 4; ++q)
+                    cc.x[b][q] = live && xrow[b] != nullptr
+                        ? w4mma::ld_act(xrow[b] + ch * 128 + q * 8)
+                        : make_uint4(0, 0, 0, 0);
+        }
     };
+
+    // The staged chunk: a route's 128 activations a row, its four 32-code
+    // groups at 64 bytes apart and the upper two 16 further (a lane's
+    // quarter-warp reads land on distinct banks), rows 288 bytes apart.
+    constexpr int kXRow = 288;
+    extern __shared__ uint4 w4x_smem[];
+    u8* xbuf = reinterpret_cast<u8*>(w4x_smem);
+    auto stage = [&](int ch, int buf) {
+        u8* dst0 = xbuf + buf * kSlice * kXRow;
+        for (int i = static_cast<int>(threadIdx.x); i < kSlice * 16; i += 128) {
+            const int tok = i >> 4, j = i & 15;
+            u8* dst = dst0 + tok * kXRow + (j >> 2) * 64 + (j >> 3) * 16 + (j & 3) * 16;
+            const int kk = ch * 128 + j * 8;
+            if (tok < count && kk < k) {
+                const long long r = order[begin + tok] / act_div;
+                w4mma::cp_cg16(dst, act + r * k + kk);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+    const int x_lane = g * kXRow + c * 64 + (c >> 1) * 16;
 
     float acc[kTiles][kNb][4];
 #pragma unroll
@@ -582,6 +620,10 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
             for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
 
     Chunk ring[kDepth];
+    if constexpr (kSmemX) {
+        stage(0, 0);
+        __pipeline_commit();
+    }
 #pragma unroll
     for (int d = 0; d < kDepth; ++d)
         if (d < chunks) load(d, ring[d]);
@@ -590,18 +632,35 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
         for (int d = 0; d < kDepth; ++d) {
             const int ch = ch0 + d;
             if (ch < chunks) {
+                const u8* xs = xbuf + (ch & 1) * kSlice * kXRow + x_lane;
+                if constexpr (kSmemX) {
+                    // The next chunk's rows stream in under this one's math.
+                    if (ch + 1 < chunks) stage(ch + 1, (ch + 1) & 1);
+                    __pipeline_commit();
+                    __pipeline_wait_prior(1);
+                    __syncthreads();
+                }
+                auto xf = [&](int b, int w) {
+                    if constexpr (kSmemX) {
+                        return *reinterpret_cast<const uint4*>(xs + 8 * b * kXRow + w * 16);
+                    } else {
+                        return ring[d].x[b][w];
+                    }
+                };
                 bool wide = false;
 #pragma unroll
                 for (int t = 0; t < kTiles; ++t)
                     wide |= ring[d].s[t][0] > 128u || ring[d].s[t][1] > 128u;
                 if constexpr (kNv) {
-                    w4mma::compute<false, true>(ring[d], acc);
+                    w4mma::compute<false, true>(ring[d], acc, xf);
                 } else if (__any_sync(0xffffffffu, wide)) {
-                    w4mma::compute<true, false>(ring[d], acc);
+                    w4mma::compute<true, false>(ring[d], acc, xf);
                 } else {
-                    w4mma::compute<false, false>(ring[d], acc);
+                    w4mma::compute<false, false>(ring[d], acc, xf);
                 }
                 if (ch + kDepth < chunks) load(ch + kDepth, ring[d]);
+                // The buffer just read is the one the next chunk stages over.
+                if constexpr (kSmemX) __syncthreads();
             }
         }
     }
