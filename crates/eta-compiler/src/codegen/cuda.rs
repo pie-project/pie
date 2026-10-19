@@ -11,7 +11,14 @@ use crate::codegen::error::EmitError;
 use crate::plan::{CompiledStage, Region};
 use alloc::string::String;
 
-pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 51;
+pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 52;
+
+/// The line a region carries where it holds the exact cut's state, which on
+/// CUDA sits in [`CUT_STATE_BYTES`] of the launch's dynamic shared memory
+/// (NVRTC's static shared memory stops at 48 KB).
+pub const CUT_STATE_MARK: &str = "// m1: the exact cut's state\n";
+/// The chunk header's `M1_CUT_STATE_BYTES`.
+pub const CUT_STATE_BYTES: u32 = 34_816;
 
 /// How a lane's blocks meet on a CUDA device: L2-coherent words behind the
 /// device-scope fences.
@@ -30,6 +37,7 @@ const CUDA_LANE: &str = "
 pub const DIALECT: Dialect = Dialect {
     chunk: include_str!("../../runtime/cuda/ptir_m1_chunk.cuh"),
     lane: CUDA_LANE,
+    cut_mark: CUT_STATE_MARK,
 };
 
 pub fn emit_region(
@@ -70,4 +78,13 @@ pub fn emit_singleton_region(entry_name: &str, op_tag: u8) -> Result<String, Emi
 
 pub fn singleton_runtime_source() -> String {
     simt::runtime_source(DIALECT)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_chunk_header_gives_the_cut_state_what_the_launcher_does() {
+        let line = alloc::format!("#define M1_CUT_STATE_BYTES {}u", super::CUT_STATE_BYTES);
+        assert!(super::DIALECT.chunk.contains(&line), "{line}");
+    }
 }

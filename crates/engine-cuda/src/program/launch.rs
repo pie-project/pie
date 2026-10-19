@@ -1514,7 +1514,7 @@ pub fn launch(
                 block,
                 1,
                 1,
-                0,
+                module.dynamic_shared(),
                 stream.cast(),
                 args.slots.as_mut_ptr(),
                 std::ptr::null_mut(),

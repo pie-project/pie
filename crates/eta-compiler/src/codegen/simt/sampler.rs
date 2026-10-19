@@ -169,6 +169,7 @@ pub fn emit_sampler_region(
   g.counted = false;
 ",
     );
+    source.push_str(dialect.cut_mark);
     if cut_only {
         let _ = write!(
             source,
