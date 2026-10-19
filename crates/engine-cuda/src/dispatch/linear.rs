@@ -1399,8 +1399,28 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.moe_matmul_select_act_quant";
-        lowp(OP)?;
         let (codes, scales, biases, seat) = self.planes(bank);
+        // A 128x128-block FP8 bank off tcgen05: the mma.sync fp8 select (W8A8).
+        if !linear::tc5::supported()
+            && codes.dtype == Dtype::E4m3
+            && quant == (ActQuant::E4m3 { gran: 128 })
+            && !seat.streams()
+            && self.scales_in_atoms(bank)
+            && !crate::device::alloc::is_host_pointer(codes.ptr)
+        {
+            let (x, routes) = (self.tensor(x), self.tensor(routes));
+            let mut out = self.tensor(y);
+            return linear::moe::select_fp8_mma(
+                self.ctx(),
+                x,
+                codes.ptr,
+                scales.ptr,
+                codes.rows,
+                routes,
+                &mut out,
+            );
+        }
+        lowp(OP)?;
         per_tensor_e4m3_is_a_table(OP, codes)?;
         if seat.streams() || crate::device::alloc::is_host_pointer(codes.ptr) {
             return Err(kernels_cuda::Error::Backend {
@@ -1545,10 +1565,10 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.matmul_act_quant";
-        lowp(OP)?;
         if let Some(block_scales) = block_scales {
             return self.fp8_block_matmul(act, w, quant, block_scales, y);
         }
+        lowp(OP)?;
         let (codes, scales, _, seat) = self.planes(w);
         if seat.streams() {
             return Err(kernels_cuda::Error::Backend {
@@ -1677,6 +1697,16 @@ impl Run<'_> {
             if act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)? {
                 return Ok(());
             }
+            // Off tcgen05, the rest on the mma.sync fp8 kernel.
+            if !linear::tc5::supported() && linear::moe::fp8_mma_takes(act, n) {
+                return linear::moe::matmul_fp8_mma(
+                    self.ctx(),
+                    act,
+                    codes.ptr,
+                    atoms.ptr,
+                    &mut out,
+                );
+            }
             // Its producer landed the codes itself: no quantize launch.
             if let Some(planes) = self.held_e4m3(act_id, &act) {
                 return act_quant::matmul_held(
@@ -1690,6 +1720,7 @@ impl Run<'_> {
                 );
             }
         }
+        lowp(OP)?;
         act_quant::matmul(
             self.ctx(),
             OP,

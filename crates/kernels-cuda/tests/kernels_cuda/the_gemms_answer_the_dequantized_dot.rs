@@ -182,18 +182,23 @@ fn the_quantized_dense_projections_answer_the_dequantized_dot() {
 
 #[test]
 fn the_fp8_block_projections_answer_the_dot() {
-    use kernels_cuda::linear::moe::{dense_fp8_shape, matmul_grouped_fp8, matmul_grouped_fp8_with};
+    use kernels_cuda::linear::moe::{dense_fp8_shape, matmul_fp8_mma, matmul_grouped_fp8};
+    use kernels_cuda::linear::moe::{matmul_grouped_fp8_with, select_fp8_mma};
     use kernels_cuda::linear::moe_route::group_routes;
     // (arm, rows, groups, n, k): 0, the mma.sync kernel in each CTA shape
     // the dense pick lands; 1, its grouped projection; 2, a row's groups as
     // its routes on the grouped tcgen05 GEMM; 3, the GEMV over bf16 rows (K
-    // split across warps, then rows padded to four).
+    // split across warps, then rows padded to four); 4, the mma.sync fp8
+    // matmul past the decode widths (narrow planes K split, wide ones
+    // whole); 5, a row's groups as its routes on the mma.sync fp8 select.
     #[rustfmt::skip]
     let cases = [(0, 2, 1, 4096, 2048), (0, 4, 1, 8192, 1024), (0, 4, 1, 32768, 1024),
         (0, 8, 1, 1024, 4096), (1, 3, 8, 256, 1024), (2, 37, 4, 256, 1024), (3, 1, 1, 640, 6144),
-        (3, 3, 1, 1024, 1536)];
+        (3, 3, 1, 1024, 1536), (4, 5, 1, 384, 512), (4, 13, 1, 256, 1024), (4, 30, 1, 128, 2048),
+        (4, 130, 1, 640, 1536), (4, 40, 1, 16384, 512), (4, 130, 1, 32768, 512),
+        (5, 37, 4, 256, 1024), (5, 9, 8, 128, 512)];
     for (arm, rows, groups, n, k) in cases {
-        if !supported() && arm >= 2 {
+        if !supported() && arm == 2 {
             continue;
         }
         let mut b = Bench::new(0xf8 + rows as u64);
@@ -225,7 +230,14 @@ fn the_fp8_block_projections_answer_the_dot() {
                 let bank = act_quant::Bank { codes, atoms, experts, n: n32, k: k32, elem, gran, alpha_e: 0, alpha_from };
                 act_quant::select(&ctx, "test", fmt, xr, routes, None, bank, &mut yr)
             }
-            _ => act_quant::fp8_block_gemv(&ctx, xt, codes, atoms, &mut y).map(|took| assert!(took)),
+            3 => act_quant::fp8_block_gemv(&ctx, xt, codes, atoms, &mut y).map(|took| assert!(took)),
+            4 => matmul_fp8_mma(&ctx, xt, codes, atoms, &mut y),
+            _ => {
+                let mut routes = t(b.zeros(rg * 4), rows, groups, I32);
+                group_routes(&ctx, groups as u32, &mut routes).expect("the routes lay");
+                let (xr, mut yr) = (t(x, rg, k, Bf16), t(y.ptr, rg, n, Bf16));
+                select_fp8_mma(&ctx, xr, codes, atoms, groups as u32, routes, &mut yr)
+            }
         }
         .expect("the fp8 projection fires");
         // The quantizing arms read e4m3 rows, the GEMV the bf16 ones.
