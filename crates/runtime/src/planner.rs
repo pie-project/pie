@@ -2618,6 +2618,12 @@ impl ResidencyPlanner {
         if !self.is_wedged() {
             return;
         }
+        // Idle cache on its way to the host is neither dropped nor swept
+        // while it moves, and frees its device pages when it lands (which
+        // pokes the planner): the pool is not starved, it is waiting.
+        if self.demoting.load(Ordering::Acquire) || self.sweeping.load(Ordering::Acquire) {
+            return;
+        }
         if self.salvage_free_pages() {
             self.poke();
             return;
