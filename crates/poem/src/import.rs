@@ -429,7 +429,7 @@ fn resolve(src: &ztensor::Source, claim: Claim) -> Result<Vec<TensorContract>, E
     });
     match (&stored, scales) {
         (Encoding::Quant(_), Some(pairing)) => {
-            tensors.extend(interned(&name, &shape, bands, pairing));
+            tensors.extend(interned(src, &name, &shape, bands, pairing));
         }
         (Encoding::Raw(_), Some(_)) => {}
         (Encoding::Quant(_), None) | (Encoding::Raw(_), None) => {}
@@ -1607,7 +1607,7 @@ fn holds_the_declared_rectangle(w: &Weight, axis: u8, legs: &[Vec<i64>]) -> Resu
     Ok(())
 }
 
-fn interned(of: &str, shape: &[i64], bands: Option<Bands>, pairing: Scales) -> Vec<TensorContract> {
+fn interned(src: &ztensor::Source, of: &str, shape: &[i64], bands: Option<Bands>, pairing: Scales) -> Vec<TensorContract> {
     seams_clear_the_blocked_axis(of, bands.as_ref(), pairing.channel_axis, pairing.group_size);
     let declared = divided(shape, pairing.channel_axis, pairing.group_size, of);
     // A scale plane is stored beside its codes, a block of them each.
