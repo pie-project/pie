@@ -20,7 +20,7 @@ pub const MMA_UNTIL: u32 = 32;
 
 /// The most rows the tiled GEMM takes; a prefill's wider fires widen the
 /// plane once for cuBLAS, which leads there.
-pub const GEMM_UNTIL: u32 = 256;
+pub const GEMM_UNTIL: u32 = 64;
 
 /// One CTA shape of the mma.sync kernel: `16 * mt` rows, `8 * n_sub *
 /// warps_n` columns, `warps_k` groups over K.
