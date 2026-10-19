@@ -869,8 +869,10 @@ mod sparse {
         };
         if fp8 && splits == 1 {
             // A prefill's rows on 128-key tiles and whole scores.
-            let slot = 65536 + if s.rope > 0 { 16384 } else { 0 };
-            let smem = 2 * slot + 5 * 8192 + 2 * 8192 + 4 * 128 * 4 + 1024 + 2048 + 1024;
+            // Five 32 KB halves, the rope atom and Q's staging's third atom
+            // with rotated dims, Q's two atoms, two P buffers.
+            let rope = if s.rope > 0 { 2 * 8192 + 8192 } else { 0 };
+            let smem = 5 * 32768 + rope + 2 * 8192 + 2 * 8192 + 4 * 128 * 4 + 1024 + 2048 + 1024;
             return ctx.fire(
                 op,
                 Fire::at(

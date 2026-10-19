@@ -800,12 +800,14 @@ __global__ __launch_bounds__(128) void mla_sparse_fold(
 // one scale of 1), a block a row at a time, persistent, after FA4's sparse
 // MLA (flash_attn/cute/flash_fwd_mla_1cta_sm100.py):
 //
-//   - Q (64 heads by 576 codes) is quantized into shared memory a row ahead
-//     and copied into TMEM at its row's start, each head at lanes m and
+//   - Q (64 heads by 576 codes) is quantized into shared memory in two
+//     passes (its first 256 latent codes and their rotated half, then the
+//     rest) and copied into TMEM at its row's start, each head at lanes m and
 //     m + 64, as a weight-stationary MMA reads its A operand.
-//   - A tile is 128 keys: their 512 latent codes (four 16 KB atoms) and their
-//     rows' last 128 bytes (the rotated codes at byte 64), gathered by
-//     cp.async, two tiles a ring.
+//   - A tile is 128 keys: their 512 latent codes as two 32 KB halves (two
+//     16 KB atoms each), gathered by cp.async into a ring of five halves, and
+//     their 64 rotated codes, into one atom's left or right half by the
+//     tile's parity.
 //   - S = Q K^T is one M = 64, N = 128 chain over the 576 codes: lanes 0-63
 //     hold keys 0-63 of every head, lanes 64-127 keys 64-127 (64 columns).
 //   - The softmax's thread t (head t % 64, keys [64 (t / 64), + 64)) meets
@@ -819,10 +821,9 @@ namespace e4 {
 
 constexpr int kBK = 128;
 constexpr u32 kAtom = kBK * 128;        // 128 keys by 128 codes
-constexpr u32 kLatent = 4 * kAtom;      // 64 KB
-constexpr int kSlots = 2;
+constexpr u32 kHalf = 2 * kAtom;        // 256 latent codes of a tile
+constexpr int kStages = 5;
 constexpr u32 kQAtom = 64 * 128;        // 64 heads by 128 codes
-constexpr u32 kQBytes = 5 * kQAtom;
 constexpr u32 kPBytes = 64 * 128;
 constexpr int kLists = 4;
 constexpr u32 kColS = 0;                // S, 64 columns
@@ -831,9 +832,11 @@ constexpr u32 kColO = 256;
 
 template <int kRope>
 struct Layout {
-    static constexpr u32 kSlot = kLatent + (kRope > 0 ? kAtom : 0u);
     static constexpr u32 kOffRing = 0;
-    static constexpr u32 kOffQ = kOffRing + kSlots * kSlot;
+    static constexpr u32 kOffRope = kOffRing + kStages * kHalf;
+    static constexpr u32 kOffQ = kOffRope + (kRope > 0 ? kAtom : 0u);
+    // A pass's 256 latent codes, and (with rotated dims) their rotated codes.
+    static constexpr u32 kQBytes = (kRope > 0 ? 3 : 2) * kQAtom;
     static constexpr u32 kOffP = kOffQ + kQBytes;
     static constexpr u32 kOffList = kOffP + 2 * kPBytes;
     static constexpr u32 kOffX = kOffList + kLists * kBK * 4;
@@ -862,7 +865,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
     using namespace tc5;
     using L = e4::Layout<kRope>;
     constexpr int kBK = e4::kBK;
-    constexpr int kSlots = e4::kSlots;
+    constexpr int kStages = e4::kStages;
     constexpr int kLists = e4::kLists;
     const int live = p.live != nullptr ? static_cast<int>(p.live[0]) : p.rows;
     const int base = p.live != nullptr ? static_cast<int>(p.live[1]) : 0;
@@ -875,8 +878,8 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
     float* xbuf = reinterpret_cast<float*>(smem + L::kOffX);
     u32* lists = reinterpret_cast<u32*>(smem + L::kOffList);
     u64* full = reinterpret_cast<u64*>(smem + L::kOffBar);
-    u64* empty = full + 2 * kSlots;
-    u64* s_full = empty + 2 * kSlots;
+    u64* empty = full + kStages;
+    u64* s_full = empty + kStages;
     u64* s_free = s_full + 1;
     u64* p_full = s_free + 1;
     u64* pv_done = p_full + 2;
@@ -895,7 +898,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
     if (threadIdx.x == 0) {
         bar_init(s_full, 1);
         bar_init(s_free, 128);
-        for (int s = 0; s < 2 * kSlots; ++s) {
+        for (int s = 0; s < kStages; ++s) {
             bar_init(&full[s], kGatherThreads);
             bar_init(&empty[s], 1);
         }
@@ -969,41 +972,47 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
             }
         }
     } else if (warp == 6 || warp == 7) {
-        // Q's loader: each row's Q as soon as the last row's products have
-        // read it, while the softmax finishes that row; a thread two
-        // (head, half) units.
+        // Q's loader: a row's Q in two passes through one staging, each as
+        // soon as the products have taken the last; a thread a head. A pass
+        // is the head's latent dims [256 half, + 256) as e4m3 codes in the
+        // first two atoms and its rotated dims [32 half, + 32) at byte
+        // 64 + 32 half of the third, loaded before its staging is free.
         const int u = static_cast<int>(threadIdx.x) - 192;
-        // Q's row as e4m3 codes in its atoms (head `head`, latent dims
-        // [256 half, + 256) and rotated dims [32 half, + 32) at byte 64 of
-        // the fifth).
-        auto load_q = [&](int qrow, int head, int half) {
+        unsigned char* qrow_at = smem + L::kOffQ + u * 128;
+        uint4 x[32], pe[4];
+        auto fetch_q = [&](int qrow, int half) {
             const uint4* src = reinterpret_cast<const uint4*>(
-                p.q + static_cast<long long>(qrow) * p.q_stride + head * kD + half * 256);
-            unsigned char* qrow_at = smem + L::kOffQ + head * 128;
-            uint4 x[32];
+                p.q + static_cast<long long>(qrow) * p.q_stride + u * kD + half * 256);
 #pragma unroll
             for (int i = 0; i < 32; ++i) x[i] = src[i];
+            if constexpr (kRope > 0) {
+                const uint4* src_pe = reinterpret_cast<const uint4*>(
+                    p.q_pe + static_cast<long long>(qrow) * p.qpe_stride + u * kRope + half * 32);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) pe[i] = src_pe[i];
+            }
+        };
+        auto put_q = [&](int half) {
 #pragma unroll
             for (int c = 0; c < 16; ++c) {
                 const uint4 a = x[2 * c], b = x[2 * c + 1];
-                const int atom = half * 2 + c / 8;
                 const int ch = c % 8;
-                *reinterpret_cast<uint4*>(qrow_at + atom * e4::kQAtom + ((ch ^ (head % 8)) * 16)) =
+                *reinterpret_cast<uint4*>(qrow_at + (c / 8) * e4::kQAtom + ((ch ^ (u % 8)) * 16)) =
                     make_uint4(bf16x4_e4m3(a.x, a.y), bf16x4_e4m3(a.z, a.w), bf16x4_e4m3(b.x, b.y),
                                bf16x4_e4m3(b.z, b.w));
             }
             if constexpr (kRope > 0) {
-                const uint4* pe = reinterpret_cast<const uint4*>(
-                    p.q_pe + static_cast<long long>(qrow) * p.qpe_stride + head * kRope + half * 32);
 #pragma unroll
                 for (int c = 0; c < 2; ++c) {
                     const uint4 a = pe[2 * c], b = pe[2 * c + 1];
                     const int ch = 4 + half * 2 + c;
-                    *reinterpret_cast<uint4*>(qrow_at + 4 * e4::kQAtom + ((ch ^ (head % 8)) * 16)) =
+                    *reinterpret_cast<uint4*>(qrow_at + 2 * e4::kQAtom + ((ch ^ (u % 8)) * 16)) =
                         make_uint4(bf16x4_e4m3(a.x, a.y), bf16x4_e4m3(a.z, a.w), bf16x4_e4m3(b.x, b.y),
                                    bf16x4_e4m3(b.z, b.w));
                 }
             }
+            fence_async_shared();
+            bar_arrive(q_ready);
         };
         int n = 0;
         for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
@@ -1021,18 +1030,21 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
                                  : "memory");
                 }
             }
-            if (n > 0) bar_wait(q_free, (n - 1) & 1);
-            load_q(w.row, u, 0);
-            load_q(w.row, u, 1);
-            fence_async_shared();
-            bar_arrive(q_ready);
+#pragma unroll 1
+            for (int half = 0; half < 2; ++half) {
+                fetch_q(w.row, half);
+                const int e = 2 * n + half;
+                if (e > 0) bar_wait(q_free, (e - 1) & 1);
+                put_q(half);
+            }
         }
     } else if (warp >= 8) {
         // The gathers, 128 threads by cp.async: eight threads a row's 128-byte
         // block (16 bytes each), a warp four rows an instruction; rows
-        // [16 m + t / 8] for m < 8. A key a row's 512 latent codes into the
-        // four atoms and its last 128 bytes (the rotated codes at byte 64)
-        // into the fifth; a dropped key lands zeros.
+        // [16 m + t / 8] for m < 8. A key a row's 512 latent codes into its
+        // tile's two halves of the ring and its rotated codes (the row's last
+        // 64 bytes) into the rope atom's half of the tile's parity; a dropped
+        // key lands zeros.
         const int t = static_cast<int>(threadIdx.x) - 256;
         const int c = t % 8;
         const int g = t / 8;
@@ -1040,7 +1052,6 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
         for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
             const Row w = take_row(n);
             for (int j = 0; j < w.nt; ++j, ++J) {
-                const int slot = J % kSlots;
                 const u32* l = lists + (J % kLists) * kBK;
                 bar_wait(&list_full[J % kLists], (J / kLists) & 1);
                 u32 cells[8];
@@ -1048,13 +1059,15 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
                 for (int m = 0; m < 8; ++m) cells[m] = l[16 * m + g];
                 __syncwarp();
                 if (lane == 0) bar_arrive(&list_free[J % kLists]);
-                const u32 dst = sbase + L::kOffRing + slot * L::kSlot;
-                // Each half of the latent (atoms 2h, 2h + 1) once its half of
-                // the slot is free, the rotated codes with the second: the
-                // products start on the first while the second lands.
+                // Each half of the latent once its stage is free, the rotated
+                // codes with the second (the stage two tiles back freed them
+                // too): the products start on the first while the second
+                // lands.
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    bar_wait(&empty[2 * slot + h], ((J / kSlots) & 1) ^ 1);
+                    const int q = 2 * J + h;
+                    const u32 dst = sbase + L::kOffRing + (q % kStages) * e4::kHalf;
+                    bar_wait(&empty[q % kStages], ((q / kStages) & 1) ^ 1);
 #pragma unroll
                     for (int m = 0; m < 8; ++m) {
                         const int k = 16 * m + g;
@@ -1063,15 +1076,19 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
                         const unsigned char* src = p.kv + static_cast<long long>(on ? cell : 0) * p.kv_width;
                         const u32 sw = static_cast<u32>(k * 128 + ((c ^ (k % 8)) * 16));
 #pragma unroll
-                        for (int a = 2 * h; a < 2 * h + 2; ++a) {
-                            cp_async16(dst + a * e4::kAtom + sw, src + a * 128 + c * 16, on);
+                        for (int a = 0; a < 2; ++a) {
+                            cp_async16(dst + a * e4::kAtom + sw, src + (2 * h + a) * 128 + c * 16, on);
                         }
                         // The rotated codes alone (the row's last 64 bytes, at
-                        // byte 64 of the fifth atom's row).
-                        if (kRope > 0 && h == 1 && c >= 4) cp_async16(dst + e4::kLatent + sw, src + 448 + c * 16, on);
+                        // byte 64 (J & 1) of the rope atom's row).
+                        if (kRope > 0 && h == 1 && c >= 4) {
+                            const int ch = c - 4 + 4 * (J & 1);
+                            cp_async16(sbase + L::kOffRope + static_cast<u32>(k * 128 + ((ch ^ (k % 8)) * 16)),
+                                       src + 448 + c * 16, on);
+                        }
                     }
                     asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(
-                                     smem_addr(&full[2 * slot + h]))
+                                     smem_addr(&full[q % kStages]))
                                  : "memory");
                 }
             }
@@ -1082,7 +1099,6 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
         const u32 qa = sbase + L::kOffQ;
         // O += P V for tile i: per 256 dims (atoms 2v and 2v + 1), 32 keys a step.
         auto pv = [&](int i, int first) {
-            const u32 tile = sbase + L::kOffRing + (i % kSlots) * L::kSlot;
             const u32 pa = sbase + L::kOffP + (i & 1) * e4::kPBytes;
             bar_wait(&p_full[i & 1], (i >> 1) & 1);
             tc_fence_after();
@@ -1090,13 +1106,14 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
             if (elect_one()) {
 #pragma unroll
                 for (int v = 0; v < 2; ++v) {
+                    const int q = 2 * i + v;
+                    const u32 half = sbase + L::kOffRing + (q % kStages) * e4::kHalf;
 #pragma unroll
                     for (int s2 = 0; s2 < kBK / 32; ++s2) {
                         mma_ws_f8(tmem + e4::kColO + v * 128, sdesc_sw128(pa) + 2 * s2,
-                                  sdesc_sw128_mn(tile + 2 * v * e4::kAtom + s2 * 4096, e4::kAtom), idesc_o,
-                                  i > first || s2 > 0);
+                                  sdesc_sw128_mn(half + s2 * 4096, e4::kAtom), idesc_o, i > first || s2 > 0);
                     }
-                    tc_commit(&empty[2 * (i % kSlots) + v]);
+                    tc_commit(&empty[q % kStages]);
                 }
                 tc_commit(&pv_done[i & 1]);
             }
@@ -1106,38 +1123,43 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
         for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
             const Row w = take_row(n);
             // The row's Q from its staging into TMEM (in the pipe's order, after
-            // the last row's products); the staging is then free.
-            bar_wait(q_ready, n & 1);
-            tc_fence_after();
-            __syncwarp();
-            if (elect_one()) {
+            // the last row's products), a pass at a time; the staging is then
+            // free. The second pass lands under the first tile's first half.
+            auto take_q = [&](int half) {
+                bar_wait(q_ready, half);
+                tc_fence_after();
+                __syncwarp();
+                if (elect_one()) {
 #pragma unroll
-                for (int a = 0; a < 4; ++a) {
+                    for (int a = 0; a < 2; ++a) {
 #pragma unroll
-                    for (int k = 0; k < 8; ++k) {
-                        tc_cp_q(tmem + e4::kColQ + (a * 8 + k) * 4, sdesc_sw128(qa + a * e4::kQAtom) + k);
+                        for (int k = 0; k < 8; ++k) {
+                            tc_cp_q(tmem + e4::kColQ + ((2 * half + a) * 8 + k) * 4, sdesc_sw128(qa + a * e4::kQAtom) + k);
+                        }
                     }
-                }
-                if constexpr (kRope > 0) {
+                    if constexpr (kRope > 0) {
 #pragma unroll
-                    for (int k = 4; k < 8; ++k) {
-                        tc_cp_q(tmem + e4::kColQ + 128 + (k - 4) * 4, sdesc_sw128(qa + 4 * e4::kQAtom) + k);
+                        for (int k = 4 + 2 * half; k < 6 + 2 * half; ++k) {
+                            tc_cp_q(tmem + e4::kColQ + 128 + (k - 4) * 4, sdesc_sw128(qa + 2 * e4::kQAtom) + k);
+                        }
                     }
+                    tc_commit(q_free);
                 }
-                tc_commit(q_free);
-            }
-            __syncwarp();
+                __syncwarp();
+            };
+            take_q(0);
             if (n > 0) bar_wait(o_free, (n - 1) & 1);
             tc_fence_after();
             const int first = J;
             for (int j = 0; j < w.nt; ++j, ++J) {
-                const int slot = J % kSlots;
                 if (J >= 1) bar_wait(s_free, (J - 1) & 1);
-                const u32 tile = sbase + L::kOffRing + slot * L::kSlot;
                 const u32 d = tmem + e4::kColS;
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    bar_wait(&full[2 * slot + h], (J / kSlots) & 1);
+                    const int q = 2 * J + h;
+                    const u32 half = sbase + L::kOffRing + (q % kStages) * e4::kHalf;
+                    if (j == 0 && h == 1) take_q(1);
+                    bar_wait(&full[q % kStages], (q / kStages) & 1);
                     fence_async_shared();
                     tc_fence_after();
                     __syncwarp();
@@ -1145,18 +1167,18 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
 #pragma unroll
                         for (int s = 8 * h; s < 8 * h + 8; ++s) {
                             mma_ws_ts_f8(d, tmem + e4::kColQ + s * 8,
-                                         sdesc_sw128(tile + (s / 4) * e4::kAtom) + 2 * (s % 4), idesc_s, s > 0);
+                                         sdesc_sw128(half + ((s / 4) % 2) * e4::kAtom) + 2 * (s % 4), idesc_s, s > 0);
                         }
                     }
                     __syncwarp();
                 }
                 if (elect_one()) {
                     if constexpr (kRope > 0) {
-                        // The rotated codes at byte 64 of the fifth atom.
+                        // The rotated codes at byte 64 (J & 1) of the rope atom.
 #pragma unroll
                         for (int s = 0; s < 2; ++s) {
                             mma_ws_ts_f8(d, tmem + e4::kColQ + 128 + s * 8,
-                                         sdesc_sw128(tile + e4::kLatent) + 4 + 2 * s, idesc_s, true);
+                                         sdesc_sw128(sbase + L::kOffRope) + 4 * (J & 1) + 2 * s, idesc_s, true);
                         }
                     }
                     tc_commit(s_full);
@@ -1164,6 +1186,7 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
                 __syncwarp();
                 if (j > 0) pv(J - 1, first);
             }
+            if (w.nt == 0) take_q(1);
             pv(J - 1, first);
         }
     } else if (warp < 4) {
