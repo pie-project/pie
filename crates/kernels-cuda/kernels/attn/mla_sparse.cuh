@@ -1066,7 +1066,9 @@ __global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
                         for (int a = 2 * h; a < 2 * h + 2; ++a) {
                             cp_async16(dst + a * e4::kAtom + sw, src + a * 128 + c * 16, on);
                         }
-                        if (kRope > 0 && h == 1) cp_async16(dst + e4::kLatent + sw, src + 448 + c * 16, on);
+                        // The rotated codes alone (the row's last 64 bytes, at
+                        // byte 64 of the fifth atom's row).
+                        if (kRope > 0 && h == 1 && c >= 4) cp_async16(dst + e4::kLatent + sw, src + 448 + c * 16, on);
                     }
                     asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(
                                      smem_addr(&full[2 * slot + h]))
