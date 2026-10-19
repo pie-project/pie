@@ -151,6 +151,12 @@ impl Gate {
         }
         let pairs = requests.saturating_mul(kv_heads).max(1);
         let mut ranks = self.cluster.min(8);
+        // Past 64 blocks, eight slices a row fold slower than four (B200:
+        // Muse Spark's 16 pairs at a decode of one, gpt-oss's 32 and 64 at four
+        // and eight).
+        while ranks > 4 && pairs.saturating_mul(ranks) > 64 {
+            ranks /= 2;
+        }
         while ranks > 1 && pairs.saturating_mul(ranks) > grid {
             ranks /= 2;
         }
@@ -283,7 +289,7 @@ mod tests {
         // most eight; a 64-wide one under a long window too (Muse Spark's
         // 2048); a whole-read window, Gemma's 256-wide sliding row, or any
         // where it is off, none.
-        assert_eq!(gate.ranks(64, 8, 8, 8, -1, 740), 8);
+        assert_eq!(gate.ranks(64, 8, 8, 8, -1, 740), 4);
         assert_eq!(gate.ranks(64, 8, 16, 8, -1, 740), 4);
         assert_eq!(gate.ranks(64, 8, 64, 8, -1, 740), 1);
         assert_eq!(gate.ranks(64, 8, 8, 8, 127, 740), 0);
