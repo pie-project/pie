@@ -248,7 +248,7 @@ def draft(m, inputs, x, logits, head):
         chain.append(proposal)
     seam.at(seam.MTP_DRAFTS, [ops.layout.argmax(chain)])
 
-MTP_DEPTH = 3
+MTP_DEPTH = 4
 
 def rotate(q, k, inputs, m, a, shift = 0):
     vision = m.tower != None
