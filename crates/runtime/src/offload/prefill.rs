@@ -535,7 +535,29 @@ fn keyed_pages(stores: &Stores, tokens: &[u32]) -> (Vec<Vec<Option<Hash256>>>, V
 /// run fills completely. Pages before `from_page` this worker holds nowhere
 /// are first fetched from `home`, which holds them, so only the rest is
 /// computed.
+/// Peers' passes prefilled at once here, and the most that wait behind them:
+/// unbounded, a burst of passes held each other's kv until reads took
+/// seconds, where a home turned away computes the pass itself.
+const SERVING: usize = 2;
+const WAITING: usize = 2;
+
+static ADMITTED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(SERVING);
+static QUEUED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub async fn serve(tokens: Vec<u32>, from_page: u32, home: Option<String>) -> Result<RemotePages> {
+    use std::sync::atomic::Ordering;
+    let _permit = match ADMITTED.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            if QUEUED.fetch_add(1, Ordering::AcqRel) >= WAITING {
+                QUEUED.fetch_sub(1, Ordering::AcqRel);
+                bail!("busy: {SERVING} passes run here and {WAITING} wait");
+            }
+            let permit = ADMITTED.acquire().await;
+            QUEUED.fetch_sub(1, Ordering::AcqRel);
+            permit?
+        }
+    };
     let stores = crate::store::registry::try_get(0, 0)
         .ok_or_else(|| anyhow!("no engine serves a model here"))?;
     let engine = 0usize;
