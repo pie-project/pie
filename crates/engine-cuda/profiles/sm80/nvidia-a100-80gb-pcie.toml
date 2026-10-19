@@ -18,7 +18,6 @@ gemm.narrow_n = 8
 gemm.fp8_shadow = true
 elemwise.rows_vec = true
 sdpa.merge_warp = true
-sdpa.mla_selected_mma = true
 sdpa.decode.grouped_prefill_from = 8
 sdpa.decode.grouped_prefill_lse = true
 sdpa.decode.grouped_prefill_window = true
@@ -43,7 +42,6 @@ measured = [
   "kernel.gemm.fp8_shadow",
   "kernel.elemwise.rows_vec",
   "kernel.sdpa.merge_warp",
-  "kernel.sdpa.mla_selected_mma",
   "kernel.sdpa.decode.grouped_prefill_from",
   "kernel.sdpa.decode.grouped_prefill_lse",
   "kernel.sdpa.decode.grouped_prefill_window",

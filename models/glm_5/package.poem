@@ -20,6 +20,7 @@ BF = dtype.bf16
 U4 = dtype.u4g64
 F8 = dtype.e4m3tile128a8
 NV4 = dtype.nvfp4a4
+NV4W = dtype.nvfp4
 
 DEPLOYMENTS = [
     deployment("glm5-a12b", weights = BF, kv = BF),
@@ -43,4 +44,8 @@ DEPLOYMENTS = [
     # projection as every 128-square block's factor), as vLLM serves it.
     deployment("glm53", weights = [BF, NV4, F8], kv = BF),
     deployment("glm53-mini", weights = [BF, NV4, F8], kv = BF),
+    # The export's NVFP4 experts against bf16 activations, where no GEMM
+    # quantizes them (Hopper), as vLLM's Marlin serves them there.
+    deployment("glm53", weights = [BF, NV4W], kv = BF),
+    deployment("glm53-mini", weights = [BF, NV4W], kv = BF),
 ]

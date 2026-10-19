@@ -14,6 +14,8 @@
 // e2m1 code there becomes a bf16 by two masks and a shift. The activations
 // are permuted to match, two byte-perms a register.
 
+#include <cuda_pipeline.h>
+
 #include "prelude/device.cuh"
 #include "prelude/glu.cuh"
 
@@ -240,6 +242,130 @@ __device__ __forceinline__ void w4_land(const float (&acc)[kTiles][kNb][4], Fact
 }
 
 }  // namespace w4mma
+
+// A routed bf16 select at decode widths: the bf16 analog of
+// `moe_select_mxfp4_mma`, without its GLU. Each expert's weight rows and the
+// routes' rows are staged a K-tile at a time into shared memory with
+// `cp.async`, read to the mma fragments by `ldmatrix`, and met on mma.sync.
+// The routing (order/offsets/work) and the epilogue (`w4mma::w4_land`) are
+// shared with the mxfp4 kernel; the fragments are the ones `attn/mla.cuh`
+// loads, so the output fragment is the layout `w4_land` reads.
+namespace bf16mma {
+__device__ __forceinline__ void ld_a(unsigned (&a)[4], const bf16* base, int ld, int lane) {
+    const bf16* r = base + static_cast<long long>(lane & 15) * ld + ((lane & 16) ? 8 : 0);
+    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(r));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(addr));
+}
+__device__ __forceinline__ void ld_b(unsigned (&b)[2], const bf16* base, int ld, int lane) {
+    const bf16* q = base + static_cast<long long>(lane & 7) * ld + ((lane & 8) ? 8 : 0);
+    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(q));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                 : "=r"(b[0]), "=r"(b[1]) : "r"(addr));
+}
+}  // namespace bf16mma
+
+template <int kNb>
+__global__ void __launch_bounds__(128) moe_select_bf16_mma(
+    const bf16* __restrict__ act,
+    const i32* __restrict__ order,
+    const i32* __restrict__ offsets,
+    const i32* __restrict__ work,
+    const bf16* __restrict__ weight,
+    const bf16* __restrict__ bias,
+    bf16* __restrict__ out,
+    int act_div, int n, int k, int num_experts)
+{
+    constexpr int kTiles = 2;
+    constexpr int kRowsWarp = kTiles * 16;
+    constexpr int kRowsCta = 4 * kRowsWarp;   // 128 weight rows a CTA
+    constexpr int kSlice = 8 * kNb;           // routes a slice (B of the GEMM)
+    constexpr int kBK = 16;                   // K staged a step (one mma k)
+    constexpr int kPad = kBK + 8;             // smem row stride (ldmatrix)
+
+    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
+    const int item = work[blockIdx.x];
+    const int expert = item >> 16;
+    const int slice = item & 0xFFFF;
+    const int begin = offsets[expert] + slice * kSlice;
+    const int count = min(offsets[expert + 1] - begin, kSlice);
+    if (count <= 0) return;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int g = lane >> 2;
+    const int c = lane & 3;
+    // The CTA's 128 rows and this warp's 32 of them. A warp whose rows run
+    // past the bank still joins the cooperative load and the barriers;
+    // `w4_land` drops its out-of-range rows.
+    const int cta_row0 = static_cast<int>(blockIdx.y) * kRowsCta;
+    const int row_base = cta_row0 + warp * kRowsWarp;
+
+    const bf16* w_e = weight + static_cast<long long>(expert) * n * k;
+    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+
+    extern __shared__ bf16 smem[];
+    bf16* sW = smem;                          // [kRowsCta][kPad]
+    bf16* sX = sW + kRowsCta * kPad;          // [kSlice][kPad]
+
+    float acc[kTiles][kNb][4];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int b = 0; b < kNb; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
+
+    for (int k0 = 0; k0 < k; k0 += kBK) {
+        // Stage this K-tile: 128 weight rows and `count` route rows, 8 bf16
+        // (16 B) a cp.async. Rows past the bank or routes past the slice are
+        // zeroed so the mma reads defined smem (their outputs are not stored).
+        for (int i = tid; i < kRowsCta * (kBK / 8); i += 128) {
+            const int row = i / (kBK / 8);
+            const int ch = (i % (kBK / 8)) * 8;
+            bf16* dst = sW + row * kPad + ch;
+            if (cta_row0 + row < n) {
+                __pipeline_memcpy_async(
+                    dst, w_e + static_cast<long long>(cta_row0 + row) * k + k0 + ch, 16);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        for (int i = tid; i < kSlice * (kBK / 8); i += 128) {
+            const int tok = i / (kBK / 8);
+            const int ch = (i % (kBK / 8)) * 8;
+            bf16* dst = sX + tok * kPad + ch;
+            if (tok < count) {
+                const long long r = static_cast<long long>(order[begin + tok] / act_div);
+                __pipeline_memcpy_async(dst, act + r * k + k0 + ch, 16);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
+        unsigned bk[kNb][2];
+#pragma unroll
+        for (int b = 0; b < kNb; ++b) bf16mma::ld_b(bk[b], sX + 8 * b * kPad, kPad, lane);
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t) {
+            unsigned a[4];
+            bf16mma::ld_a(a, sW + (warp * kRowsWarp + 16 * t) * kPad, kPad, lane);
+#pragma unroll
+            for (int b = 0; b < kNb; ++b) {
+                w4mma::mma(acc[t][b], a[0], a[1], a[2], a[3], bk[b][0], bk[b][1]);
+            }
+        }
+        __syncthreads();
+    }
+
+    auto factor = [&](int) { return 1.f; };
+    w4mma::w4_land<0, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, n, row_base,
+                                   g, c, 0.f, 1.f);
+}
 
 /// `y[route] = x[route / act_div] . W[expert]^T (+ bias[expert])` for the
 /// routes `order` lists by expert, `work` naming (expert, slice of

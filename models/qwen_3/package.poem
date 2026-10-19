@@ -46,6 +46,7 @@ MODELS = [
     fixture("qwen3-micro-text-hd128-rotated"),
     fixture("qwen3-micro-text-hd256"),
     fixture("qwen3-micro-text-hd256-rotated"),
+    fixture("qwen35-pico"),
 ]
 
 U4 = dtype.u4g64

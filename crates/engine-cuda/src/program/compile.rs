@@ -300,7 +300,8 @@ pub struct Module {
     #[cfg(feature = "device")]
     function: crate::device::dr::CUfunction,
     block_threads: u32,
-    dynamic_smem: u32,
+    /// The dynamic shared memory each launch hands it.
+    dynamic_shared: u32,
     entry_name: String,
 }
 
@@ -313,7 +314,9 @@ unsafe impl Send for Module {}
 unsafe impl Sync for Module {}
 
 impl Module {
-    pub fn load(cubin: &[u8], entry_name: &str) -> Result<Module> {
+    /// `dynamic_shared` bytes of dynamic shared memory each launch hands
+    /// the entry, its allowance raised to them here.
+    pub fn load(cubin: &[u8], entry_name: &str, dynamic_shared: u32) -> Result<Module> {
         if cubin.is_empty() {
             return Err(Fault::program("cuModuleLoadData", "the cubin is empty"));
         }
@@ -353,27 +356,44 @@ impl Module {
                     code: code as i32,
                 });
             }
-            let dynamic_smem = match dynamic_smem(module, function) {
-                Ok(bytes) => bytes,
-                Err(fault) => {
-                    // SAFETY: `module` is loaded and no function of it is in flight.
+            // ROCm keeps the cut's state static and never asks for any.
+            #[cfg(not(feature = "rocm"))]
+            if dynamic_shared > 0 {
+                // SAFETY: `function` was just resolved out of the loaded module.
+                let code = unsafe {
+                    dr::cuFuncSetAttribute(
+                        function,
+                        dr::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        i32::try_from(dynamic_shared).unwrap_or(i32::MAX),
+                    )
+                };
+                if code != dr::CUresult::CUDA_SUCCESS {
+                    // SAFETY: as above, no function of it is in flight.
                     unsafe { dr::cuModuleUnload(module) };
-                    return Err(fault);
+                    return Err(Fault::Device {
+                        call: "cuFuncSetAttribute",
+                        code: code as i32,
+                    });
                 }
-            };
+            }
             Ok(Module {
                 module,
                 function,
                 block_threads: launch_width(function),
-                dynamic_smem,
+                dynamic_shared,
                 entry_name: entry_name.to_string(),
             })
         }
         #[cfg(not(feature = "device"))]
         {
-            let _ = entry_name;
+            let _ = (entry_name, dynamic_shared);
             Err(Fault::Runtimeless)
         }
+    }
+
+    #[must_use]
+    pub const fn dynamic_shared(&self) -> u32 {
+        self.dynamic_shared
     }
 
     #[cfg(feature = "device")]
@@ -391,63 +411,6 @@ impl Module {
     pub fn entry_name(&self) -> &str {
         &self.entry_name
     }
-
-    /// The dynamic shared memory a launch gives the kernel: what its
-    /// `m1_dynamic_smem` export asks (a sampler's cut state), else none.
-    #[must_use]
-    pub const fn dynamic_smem(&self) -> u32 {
-        self.dynamic_smem
-    }
-}
-
-/// The bytes `module`'s `m1_dynamic_smem` export asks, with `function`
-/// opted into them; 0 for a module without the export.
-#[cfg(feature = "device")]
-fn dynamic_smem(
-    module: crate::device::dr::CUmodule,
-    function: crate::device::dr::CUfunction,
-) -> Result<u32> {
-    use crate::device::dr;
-
-    let mut at: dr::CUdeviceptr = 0;
-    let mut size = 0usize;
-    // SAFETY: `module` is loaded; the name is a NUL-terminated literal and
-    // the out-parameters are live.
-    let code = unsafe {
-        dr::cuModuleGetGlobal_v2(
-            &raw mut at,
-            &raw mut size,
-            module,
-            c"m1_dynamic_smem".as_ptr(),
-        )
-    };
-    if code != dr::CUresult::CUDA_SUCCESS || size != 4 {
-        return Ok(0);
-    }
-    let mut bytes = 0u32;
-    // SAFETY: `at` is the export's 4 device bytes and `bytes` 4 host ones.
-    let code = unsafe { dr::cuMemcpyDtoH_v2((&raw mut bytes).cast(), at, 4) };
-    if code != dr::CUresult::CUDA_SUCCESS {
-        return Err(Fault::Device {
-            call: "cuMemcpyDtoH",
-            code: code as i32,
-        });
-    }
-    // SAFETY: `function` belongs to `module`, which is loaded.
-    let code = unsafe {
-        dr::cuFuncSetAttribute(
-            function,
-            dr::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            bytes as i32,
-        )
-    };
-    if code != dr::CUresult::CUDA_SUCCESS {
-        return Err(Fault::Device {
-            call: "cuFuncSetAttribute",
-            code: code as i32,
-        });
-    }
-    Ok(bytes)
 }
 
 impl Drop for Module {
@@ -889,8 +852,17 @@ impl Cache {
         architecture: &str,
     ) -> std::result::Result<Arc<Module>, Failure> {
         let key = disk_key(identity, source);
+        // CUDA keeps the exact cut's state in dynamic shared memory; HIP's
+        // text keeps it static.
+        let dynamic = if !cfg!(feature = "rocm")
+            && source.contains(eta_compiler::codegen::cuda::CUT_STATE_MARK)
+        {
+            eta_compiler::codegen::cuda::CUT_STATE_BYTES
+        } else {
+            0
+        };
         if let Some(cubin) = self.disk.load(&key, region_index, entry) {
-            match Module::load(&cubin, entry) {
+            match Module::load(&cubin, entry, dynamic) {
                 Ok(module) => {
                     self.stats.persistent_hits += 1;
                     return Ok(Arc::new(module));
@@ -901,7 +873,7 @@ impl Cache {
 
         let cubin = compile(source, architecture)?;
         self.stats.compilations += 1;
-        let module = Module::load(&cubin, entry).map_err(|error| Failure::Retryable {
+        let module = Module::load(&cubin, entry, dynamic).map_err(|error| Failure::Retryable {
             reason: format!("loading `{entry}`: {error}"),
         })?;
         self.disk.store(&key, region_index, entry, &cubin);

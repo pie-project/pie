@@ -124,6 +124,15 @@ fn lanes_carry(
     ))
 }
 
+/// The width of the pool's pages as the FA2 kernels read them.
+fn kv_width(pool: &KvPool) -> fa2::KvWidth {
+    if kv::native_e4m3(pool) {
+        fa2::KvWidth::E4M3
+    } else {
+        fa2::KvWidth::BF16
+    }
+}
+
 fn pool_buffers(q_ptr: u64, pool: &KvPool, plan_ws: plan::Workspace, o_ptr: u64) -> Buffers {
     Buffers {
         q: q_ptr,
@@ -209,6 +218,7 @@ fn fa2_decode_with(
         head_dim: plan.shape.head_dim,
         group_size: plan.shape.group_size(),
         arm,
+        kv: kv_width(pool),
         padded_batch_size: params.padded_batch_size,
         num_kv_heads: plan.shape.num_kv_heads,
         device: plan.device,
@@ -224,11 +234,11 @@ fn fa2_decode_with(
                 partition_kv: false,
                 ..params
             };
-            xqa::decode(ctx, op, plan, &direct, sinks)?;
+            xqa::decode(ctx, op, plan, &direct, sinks, kv::native_e4m3(pool))?;
             return Ok(sinks.is_some());
         }
         None if tensor_cores => {
-            xqa::decode(ctx, op, plan, &params, sinks)?;
+            xqa::decode(ctx, op, plan, &params, sinks, kv::native_e4m3(pool))?;
             if !plan.info.split_kv {
                 return Ok(sinks.is_some());
             }
@@ -369,6 +379,7 @@ fn fa2_prefill_with(
         head_dim: plan.shape.head_dim,
         cta_tile_q: plan.cta_tile_q(),
         arm,
+        kv: kv_width(pool),
         padded_batch_size: params.padded_batch_size,
         num_kv_heads: plan.shape.num_kv_heads,
         device: plan.device,

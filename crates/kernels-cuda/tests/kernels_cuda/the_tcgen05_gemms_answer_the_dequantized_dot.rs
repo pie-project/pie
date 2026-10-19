@@ -94,7 +94,7 @@ fn run((a, w, lay, [n, k], f, rs, plan, tun): Case) {
     #[rustfmt::skip]
     let groups = match lay {
         Lay::D(_) => None,
-        Lay::C(_) => Some(Groups::Contiguous { offsets: b.up(&offs), rows: rows as u32 }),
+        Lay::C(_) => Some(Groups::Contiguous { offsets: b.up(&offs), rows: rows as u32, cap: 0 }),
         Lay::M(..) => Some(Groups::Masked { counts: b.up(&counts), m_max: mm as u32 }),
     };
     let wrows = n << u8::from(f.is_some());

@@ -103,6 +103,9 @@ struct Epi {
     // zero between launches, or null for the finalize's launch: the last of
     // a tile's splits to land sums the slabs and rounds y itself.
     unsigned* tickets;
+    // Swapped: the weights, their scales and the group were landed before
+    // the launch this one depends on (a routed down leg after its gate-up).
+    int weights_ahead;
 };
 
 namespace tc5k {
@@ -266,8 +269,10 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                        (kGroup == 1 || kPair == 1)),
                   "contiguous groups run unswapped (a W4A16 or NVFP4 one swapped too), masked "
                   "swapped on lone CTAs");
-    static_assert(kGlu == 0 || kSwap || kBN == 256, "an unswapped GLU tile is gate 128 | up 128");
-    static_assert(kGlu == 0 || !kSwap || kBN <= 128, "a swapped GLU tile holds two accumulators");
+    // A GLU reads gate and up rows; relu2 (6) the one value it activates.
+    constexpr bool kFused = kGlu != 0 && kGlu != 6;
+    static_assert(!kFused || kSwap || kBN == 256, "an unswapped GLU tile is gate 128 | up 128");
+    static_assert(!kFused || !kSwap || kBN <= 128, "a swapped GLU tile holds two accumulators");
     static_assert(kMix == 0 || (kKind == 0 && kPair == 1), "W4A16 runs kind::f16 on lone CTAs");
     static_assert(kMix == 0 || !kSwap || kStages % 2 == 0,
                   "a swapped W4A16 weight's transform groups own alternate slots");
@@ -276,17 +281,17 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     // A GLU tile reads the weight's gate rows and the matching up rows `inter`
     // further on, side by side: unswapped as the two halves of the Q tile,
     // swapped as two P tiles into two accumulators.
-    constexpr bool kFused = kGlu != 0;
     constexpr u32 kPT = kFused && kSwap ? 2 : 1;
     constexpr u32 kAccN = kBN * kPT;
     constexpr u32 kQStep = kFused && !kSwap ? 128 : kBN;  // output columns a Q tile
     const int inter = epi.inter;
     constexpr u32 kM = 128 * kPair;
     constexpr u32 kQRows = kBN / kPair;
-    // A swapped NVFP4 launch of one P tile (a decode's down leg streaming
-    // its weight) reads 512 K a stage as two 128-byte boxes a tile, four
-    // 64-K MMAs a box.
-    constexpr u32 kBoxes = kKind == 3 && kSwap && kPT == 1 ? 2 : 1;
+    // A swapped block-scaled launch of one P tile (a decode streaming its
+    // weight) reads two 128-byte boxes a tile a stage (512 K NVFP4, 256 K
+    // mx), four MMAs a box: half the stages, and each weight row's two
+    // boxes adjacent in memory.
+    constexpr u32 kBoxes = kKind >= 2 && kSwap && kPT == 1 ? 2 : 1;
     constexpr u32 kStageK = tc5k::stage_k(kKind) * kBoxes;
     constexpr u32 kInstrK = tc5k::stage_k(kKind) / 4;
     constexpr u32 kInner = kKind == 0 ? 64 : 128;  // TMA box width, in the map's elements
@@ -322,9 +327,13 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     constexpr u32 kTx = kPair * ((kMixP ? kRawBytes : kTxP * kPT) + (kMixQ ? kRawBytes : kTxQ) +
                                  kSfP + kSfQ);
     constexpr u32 kSfCols = 4 * kAtomsP * kPT * kRowAtomsP + 4 * kAtomsQ * kRowAtomsQ;
-    // Scales go to TMEM from their own warp, up to four K steps ahead in their
-    // own slots, so neither the MMA thread nor the copier waits on the other.
-    constexpr u32 kSfSlots = kStages < 4 / kBoxes ? kStages : 4 / kBoxes;
+    // Unswapped, the MMA thread copies each step's scales to TMEM itself,
+    // into one slot: its tensor pipe runs them in order with the MMAs on
+    // either side, so they wait on no barrier and leave TMEM to the
+    // accumulators. Swapped, they go from their own warp, up to four K steps
+    // ahead in their own slots.
+    constexpr bool kSelfSf = kScaled && !kSwap;
+    constexpr u32 kSfSlots = kSelfSf ? 1 : kStages < 4 / kBoxes ? kStages : 4 / kBoxes;
     // A swapped W4A16 weight lands in TMEM instead: an A slot a ring stage of
     // each P tile's 64 K, past the accumulators.
     constexpr u32 kASlots = kStages;
@@ -414,8 +423,13 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         tmem_relinquish<kPair>();
     }
     // As a programmatic dependent (`kernel.pdl`) the set-up above overlapped
-    // the producer's tail; wait for it before touching memory.
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+    // the producer's tail; wait for it before touching memory. With the
+    // weights ahead the group is read first, the weight loader never waits,
+    // and every other role waits below.
+    const bool ahead = kSwap && epi.weights_ahead != 0;
+    if (!ahead) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
     // A masked launch counts each expert's tiles up front, so units map onto
     // the busy experts alone. An expert's output columns: its bank rows, or a
     // GLU's gate rows.
@@ -481,6 +495,9 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     // Every CTA is resident and holds its TMEM, so the dependent may launch
     // now (not earlier: its CTA could take an SM's TMEM first).
     asm volatile("griddepcontrol.launch_dependents;");
+    if (ahead && !(warp == 4 && lane == 0)) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
 
     // Tiles along P and Q (of one expert, when grouped), and the experts.
     // Contiguous P tiles stop at the routed rows.
@@ -543,10 +560,16 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 pt = r / q_tiles;
                 qt = r - pt * q_tiles;
             } else if constexpr (kGroup == 1) {
-                // An expert's row tiles walk fastest, sharing its weight tile.
+                // Bands of an expert's row tiles walk its weight tiles together,
+                // so a wave shares both operands (as a dense launch's).
                 const int m_tiles = (routes[e + 1] - routes[e] + static_cast<int>(kM) - 1) / static_cast<int>(kM);
-                qt = r / m_tiles;
-                pt = r - qt * m_tiles;
+                const int kRaster = epi.raster;
+                const int band = r / (kRaster * num_q);
+                const int first = band * kRaster;
+                const int size = min(m_tiles - first, kRaster);
+                const int rr = r - band * kRaster * num_q;
+                pt = first + rr % size;
+                qt = rr / size;
             } else {
                 const int q_tiles = (min(routes[e], m_max) + kBN - 1) / kBN;
                 pt = r / q_tiles;
@@ -698,7 +721,9 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                             load2(tile_p + h * kTileP, &map_p, p0 + static_cast<int>(h) * inter, kBoxP);
                         }
                     }
-                    if constexpr (kMixQ && kFused) {
+                    if (ahead) {
+                        // The activations: lane 1's.
+                    } else if constexpr (kMixQ && kFused) {
                         load_raw(raw_s, &map_q, x.q_row);
                         load_raw(raw_s + 128 * 32, &map_q, x.q_row + inter);
                     } else if constexpr (kMixQ) {
@@ -721,7 +746,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                                   x.p_block + static_cast<int>(rank) +
                                       static_cast<int>(h) * inter / 128);
                         }
-                        if constexpr (kFused && !kSwap) {
+                        if (ahead) {
+                        } else if constexpr (kFused && !kSwap) {
                             for (int h = 0; h < 2; ++h) {
                                 load3(sf_q + h * kAtomsQ * 512, &map_sfq, atom_q,
                                       (x.q_row + h * inter) / 128);
@@ -736,12 +762,44 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     }
                 }
             }
+        } else if (lane == 1 && ahead) {
+            // The weights ahead, the activation rows and their scales load
+            // here once the producer kernel is done (waited above), each into
+            // its stage once free, under the stage's one expect_tx (lane 0's):
+            // so the weight loader runs a ring ahead and they never queue
+            // behind it. Swapped launches are lone CTAs.
+            u32 s = 0, phase = 0;
+            for (int t = first_tile; t < tiles; t += tile_step) {
+                Unit x;
+                if (!unit_of(t, x)) {
+                    continue;
+                }
+                for (int kb = x.kb0; kb < x.kb1; ++kb) {
+                    bar_wait(&empty[s], phase ^ 1);
+#pragma unroll
+                    for (u32 b = 0; b < kBoxes; ++b) {
+                        tma_load_2d(smem + kOffQ + s * kTileQ + b * kBoxQ, &full[s], &map_q,
+                                    (kb * static_cast<int>(kBoxes) + static_cast<int>(b)) *
+                                        static_cast<int>(kInner),
+                                    x.q_row);
+                    }
+                    if constexpr (kScaled) {
+                        tma_load_3d(smem + kOffSfQ + s * kSfQ, &full[s], &map_sfq, 0,
+                                    static_cast<int>(kb * kStageK / kGranQ / 4), x.q_block);
+                    }
+                    if (++s == kStages) {
+                        s = 0;
+                        phase ^= 1;
+                    }
+                }
+            }
         }
     } else if (warp == 6) {
-        // The scale copier: each K step's scales into slot (step % kSfSlots) once
+        // The swapped scale copier: each K step's scales into slot (step % kSfSlots) once
         // the MMAs kSfSlots steps back have read it. Shared memory holds
-        // [row block][atom]; TMEM takes [atom][row block].
-        if (kScaled && lane == 0 && leader) {
+        // [row block][atom]; TMEM takes [atom][row block]. The warp runs the
+        // loop together and one lane issues, as in the MMA warp.
+        if (kScaled && !kSelfSf && leader) {
             u32 s = 0, phase = 0, step = 0;
             for (int t = first_tile; t < tiles; t += tile_step) {
                 Unit x;
@@ -758,29 +816,32 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     }
                     bar_wait(&full[s], phase);
                     tc_fence_after();
-                    const u32 sf_tp = tmem + kStride + kAccN + slot * kSfCols;
-                    const u32 sf_tq = sf_tp + 4 * kAtomsP * kPT * kRowAtomsP;
-                    const u32 sf_p = smem_addr(smem + kOffSfP + s * kSfP);
-                    const u32 sf_q = smem_addr(smem + kOffSfQ + s * kSfQ);
-                    // P's scales as Q's: [row block][atom] in, [atom][row block]
-                    // out, each P tile's after the last's.
-                    for (u32 h = 0; h < kPT; ++h) {
-                        for (u32 r = 0; r < kRowAtomsP; ++r) {
-                            for (u32 a = 0; a < kAtomsP; ++a) {
-                                const u32 base = h * kAtomsP * kRowAtomsP;
-                                tc_cp_sf_atom<kPair>(
-                                    sf_tp + 4 * (base + a * kRowAtomsP + r),
-                                    sdesc_sf(sf_p + (base + r * kAtomsP + a) * 512));
+                    __syncwarp();
+                    if (elect_one()) {
+                        const u32 sf_tp = tmem + kStride + kAccN + slot * kSfCols;
+                        const u32 sf_tq = sf_tp + 4 * kAtomsP * kPT * kRowAtomsP;
+                        const u32 sf_p = smem_addr(smem + kOffSfP + s * kSfP);
+                        const u32 sf_q = smem_addr(smem + kOffSfQ + s * kSfQ);
+                        // P's scales as Q's: [row block][atom] in, [atom][row block]
+                        // out, each P tile's after the last's.
+                        for (u32 h = 0; h < kPT; ++h) {
+                            for (u32 r = 0; r < kRowAtomsP; ++r) {
+                                for (u32 a = 0; a < kAtomsP; ++a) {
+                                    const u32 base = h * kAtomsP * kRowAtomsP;
+                                    tc_cp_sf_atom<kPair>(
+                                        sf_tp + 4 * (base + a * kRowAtomsP + r),
+                                        sdesc_sf(sf_p + (base + r * kAtomsP + a) * 512));
+                                }
                             }
                         }
-                    }
-                    for (u32 r = 0; r < kRowAtomsQ; ++r) {
-                        for (u32 a = 0; a < kAtomsQ; ++a) {
-                            tc_cp_sf_atom<kPair>(sf_tq + 4 * (a * kRowAtomsQ + r),
-                                                 sdesc_sf(sf_q + (r * kAtomsQ + a) * 512));
+                        for (u32 r = 0; r < kRowAtomsQ; ++r) {
+                            for (u32 a = 0; a < kAtomsQ; ++a) {
+                                tc_cp_sf_atom<kPair>(sf_tq + 4 * (a * kRowAtomsQ + r),
+                                                     sdesc_sf(sf_q + (r * kAtomsQ + a) * 512));
+                            }
                         }
+                        tc_commit<kPair>(&sf_ready[slot]);
                     }
-                    tc_commit<kPair>(&sf_ready[slot]);
                     if (++s == kStages) {
                         s = 0;
                         phase ^= 1;
@@ -789,7 +850,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             }
         }
     } else if (warp == 5) {
-        if (lane == 0 && leader) {
+        // The MMA warp: all of it walks the steps, the elected lane issues.
+        if (leader) {
             u32 s = 0, phase = 0, step = 0;
             int it = 0;
             for (int t = first_tile; t < tiles; t += tile_step) {
@@ -807,7 +869,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     // A W4A16 stage is ready once its weight tile is written.
                     bar_wait(kMixed ? &xfull[s] : &full[s], phase);
                     const u32 slot = step % kSfSlots;
-                    if constexpr (kScaled) {
+                    if constexpr (kScaled && !kSelfSf) {
                         bar_wait(&sf_ready[slot], (step / kSfSlots) & 1);
                     }
                     tc_fence_after();
@@ -820,61 +882,89 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         bar_wait(&tover[prev % 2], (prev / 2) & 1);
                         tc_fence_after();
                     }
-                    const u64 desc_q = sdesc_sw128(tile_q);
-                    // MMA j reads box j / 4 of each tile.
-                    constexpr u64 kBoxDescP = kBoxP >> 4, kBoxDescQ = kBoxQ >> 4;
-                    // A W4A16 A side's slot: this step's, in TMEM.
-                    const u32 a_slot = tmem + kStride + kAccN + s * kPT * 32;
-#pragma unroll
-                    for (u32 h = 0; h < kPT; ++h) {
-                    const u64 desc_p = sdesc_sw128(tile_p + h * kTileP);
-                    const u32 d = d0 + h * kBN;
-                    const u32 sf_tp = sf_tp0 + 4 * h * kAtomsP * kRowAtomsP;
-#pragma unroll
-                    for (u32 j = 0; j < 4 * kBoxes; ++j) {
-                        const u64 a = desc_p + (j / 4) * kBoxDescP + 2 * (j % 4);
-                        const u64 b = desc_q + (j / 4) * kBoxDescQ + 2 * (j % 4);
-                        const bool accumulate = kb > kb0 || j > 0;
-                        if constexpr (kMixP) {
-                            mma_f16_ts(d, a_slot + h * 32 + j * 8, b,
-                                       idesc_dense(kF16Bf16, kF16Bf16, kM, kBN), accumulate);
-                        } else if constexpr (kKind == 0) {
-                            mma_f16<kPair>(d, a, b, idesc_dense(kF16Bf16, kF16Bf16, kM, kBN),
-                                           accumulate);
-                        } else if constexpr (kKind == 1) {
-                            mma_f8f6f4<kPair>(d, a, b, idesc_dense(kFmtP, kFmtQ, kM, kBN),
-                                              accumulate);
-                        } else {
-                            const u32 k0 = static_cast<u32>(kb) * kStageK + j * kInstrK;
-                            const u32 cp = k0 / kGranP;
-                            const u32 cq = k0 / kGranQ;
-                            const u32 col_p =
-                                sf_tp +
-                                4 * kRowAtomsP *
-                                    (cp / 4 - static_cast<u32>(kb) * kStageK / kGranP / 4) +
-                                x.pquarter;
-                            const u32 col_q =
-                                sf_tq +
-                                4 * kRowAtomsQ *
-                                    (cq / 4 - static_cast<u32>(kb) * kStageK / kGranQ / 4) +
-                                quarter_q;
-                            const u32 desc = idesc_with_ids(
-                                idesc_scaled(kFmtP, kFmtQ, kM, kBN, kKind == 2), cp % 4, cq % 4);
-                            if constexpr (kKind == 2) {
-                                mma_mxf8f6f4<kPair>(d, a, b, desc, accumulate, col_p, col_q);
-                            } else {
-                                mma_nvf4<kPair>(d, a, b, desc, accumulate, col_p, col_q);
+                    __syncwarp();
+                    if (elect_one()) {
+                        if constexpr (kSelfSf) {
+                            // P's scales as Q's: [row block][atom] in, [atom][row
+                            // block] out, each P tile's after the last's.
+                            const u32 sf_p = smem_addr(smem + kOffSfP + s * kSfP);
+                            const u32 sf_q = smem_addr(smem + kOffSfQ + s * kSfQ);
+                            for (u32 h = 0; h < kPT; ++h) {
+                                for (u32 r = 0; r < kRowAtomsP; ++r) {
+                                    for (u32 a = 0; a < kAtomsP; ++a) {
+                                        const u32 base = h * kAtomsP * kRowAtomsP;
+                                        tc_cp_sf_atom<kPair>(
+                                            sf_tp0 + 4 * (base + a * kRowAtomsP + r),
+                                            sdesc_sf(sf_p + (base + r * kAtomsP + a) * 512));
+                                    }
+                                }
+                            }
+                            for (u32 r = 0; r < kRowAtomsQ; ++r) {
+                                for (u32 a = 0; a < kAtomsQ; ++a) {
+                                    tc_cp_sf_atom<kPair>(sf_tq + 4 * (a * kRowAtomsQ + r),
+                                                         sdesc_sf(sf_q + (r * kAtomsQ + a) * 512));
+                                }
                             }
                         }
+                        const u64 desc_q = sdesc_sw128(tile_q);
+                        // MMA j reads box j / 4 of each tile.
+                        constexpr u64 kBoxDescP = kBoxP >> 4, kBoxDescQ = kBoxQ >> 4;
+                        // A W4A16 A side's slot: this step's, in TMEM.
+                        const u32 a_slot = tmem + kStride + kAccN + s * kPT * 32;
+#pragma unroll
+                        for (u32 h = 0; h < kPT; ++h) {
+                        const u64 desc_p = sdesc_sw128(tile_p + h * kTileP);
+                        const u32 d = d0 + h * kBN;
+                        const u32 sf_tp = sf_tp0 + 4 * h * kAtomsP * kRowAtomsP;
+#pragma unroll
+                        for (u32 j = 0; j < 4 * kBoxes; ++j) {
+                            const u64 a = desc_p + (j / 4) * kBoxDescP + 2 * (j % 4);
+                            const u64 b = desc_q + (j / 4) * kBoxDescQ + 2 * (j % 4);
+                            const bool accumulate = kb > kb0 || j > 0;
+                            if constexpr (kMixP) {
+                                mma_f16_ts(d, a_slot + h * 32 + j * 8, b,
+                                           idesc_dense(kF16Bf16, kF16Bf16, kM, kBN), accumulate);
+                            } else if constexpr (kKind == 0) {
+                                mma_f16<kPair>(d, a, b, idesc_dense(kF16Bf16, kF16Bf16, kM, kBN),
+                                               accumulate);
+                            } else if constexpr (kKind == 1) {
+                                mma_f8f6f4<kPair>(d, a, b, idesc_dense(kFmtP, kFmtQ, kM, kBN),
+                                                  accumulate);
+                            } else {
+                                const u32 k0 = static_cast<u32>(kb) * kStageK + j * kInstrK;
+                                const u32 cp = k0 / kGranP;
+                                const u32 cq = k0 / kGranQ;
+                                const u32 col_p =
+                                    sf_tp +
+                                    4 * kRowAtomsP *
+                                        (cp / 4 - static_cast<u32>(kb) * kStageK / kGranP / 4) +
+                                    x.pquarter;
+                                const u32 col_q =
+                                    sf_tq +
+                                    4 * kRowAtomsQ *
+                                        (cq / 4 - static_cast<u32>(kb) * kStageK / kGranQ / 4) +
+                                    quarter_q;
+                                const u32 desc = idesc_with_ids(
+                                    idesc_scaled(kFmtP, kFmtQ, kM, kBN, kKind == 2), cp % 4, cq % 4);
+                                if constexpr (kKind == 2) {
+                                    mma_mxf8f6f4<kPair>(d, a, b, desc, accumulate, col_p, col_q);
+                                } else {
+                                    mma_nvf4<kPair>(d, a, b, desc, accumulate, col_p, col_q);
+                                }
+                            }
+                        }
+                        }
+                        commit(&empty[s]);
                     }
-                    }
-                    commit(&empty[s]);
                     if (++s == kStages) {
                         s = 0;
                         phase ^= 1;
                     }
                 }
-                commit(&tfull[acc]);
+                __syncwarp();
+                if (elect_one()) {
+                    commit(&tfull[acc]);
+                }
                 ++it;
             }
             // Both CTAs' epilogues have read the last accumulator, so every
@@ -1186,6 +1276,21 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 }
                 return tc5k::glu<kGlu>(g, u, epi.limit, epi.galpha);
             };
+            // An ungated activation (relu2) of a value, or the value itself;
+            // landing an NVFP4 operand under each expert's global, it takes the
+            // value rounded to bf16, as apart.
+            auto act = [&](float g) -> float {
+                if constexpr (kGlu == 0) {
+                    return g;
+                } else {
+                    if constexpr (kOut == 2) {
+                        if (epi.in_scale != nullptr) {
+                            g = bf16_to_f32(f32_to_bf16(g));
+                        }
+                    }
+                    return tc5k::glu<kGlu>(g, 0.f, 0.f, 0.f);
+                }
+            };
             auto finish = [&](u32 c0, const Cols& f, const u32 (&v)[32], const u32 (&u)[32],
                               float (&h)[32]) {
                 if (plain) {
@@ -1195,7 +1300,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                             h[j] = glu_of(__uint_as_float(v[j]) * alpha + 0.f,
                                           __uint_as_float(u[j]) * alpha + 0.f);
                         } else {
-                            h[j] = __uint_as_float(v[j]) * alpha + 0.f;
+                            h[j] = act(__uint_as_float(v[j]) * alpha + 0.f);
                         }
                     }
                     return;
@@ -1212,8 +1317,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 } else {
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
-                        h[j] = __uint_as_float(v[j]) * alpha * ws_col(f, j, false) +
-                               bias_col(f, j, false);
+                        h[j] = act(__uint_as_float(v[j]) * alpha * ws_col(f, j, false) +
+                                   bias_col(f, j, false));
                     }
                 }
 #pragma unroll

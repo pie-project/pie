@@ -508,6 +508,10 @@ impl Run<'_> {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
+            Linear::MlpRelu2 { x, y } => {
+                let fan = self.plane_fan(self.tensor(*y).rows);
+                linear::mlp::relu2(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
+            }
             Linear::MlpGegluTanhPacked {
                 packed,
                 intermediate,
@@ -1254,6 +1258,7 @@ impl Run<'_> {
                     cap: up_cap.unwrap_or(0.0),
                 },
             ),
+            Linear::MlpRelu2 { x, y } => (x, y, self.tensor(y).width, Glu::Relu2),
             _ => return Ok(false),
         };
         let Linear::MoeWeightedSum {

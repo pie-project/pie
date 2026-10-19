@@ -3,3 +3,42 @@ api = 1
 [target]
 tier    = "sm_90"
 assumes = { cc = 90 }
+
+# The sm_100 tier's arch-generic arms (mma.sync, clusters, PDL), measured on
+# an H100 80GB HBM3: DeepSeek-V4-Flash's miniature +25% at one request and
+# +67% at 64, Qwen3.6-27B +3% at one request and +6% at 64.
+[kernel]
+pdl = true
+# Gated delta: the two-launch chunked scan and a bf16 output.
+ssm.gdn_fused_scan = true
+ssm.gdn_out_bf16 = true
+ssm.conv_vec4 = true
+# KDA's prefill chunked on the tensor cores (GLM-5.3-Flash, Kimi-K3).
+ssm.kda_chunked = true
+# Row kernels 16 bytes a lane; hyper-connection kernels tiled and on mma.sync.
+elemwise.rows_vec = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+# Qwen3.5's attention prologue in one launch up to 64 rows.
+elemwise.qg_prologue_until = 64
+# A wide decode's split partials fold a warp a row.
+sdpa.merge_warp = true
+# DeepSeek-V4's attention: pool on mma.sync, decode up to 64 in one launch.
+sdpa.pool_mma = true
+sdpa.dsv4_decode_until = 64
+# A dense bias from the cuBLASLt epilogue.
+gemm.bias_epilogue = true
+# Bf16 products of 2 to 8 rows may time the few-rows kernel.
+gemm.rows_m = 8
+# AttnRes's blend and its row's norm in one pass.
+attn_res.fused_norm = true
+# MXFP4 selects on the register-dequant mma.sync from 28 to 1024 routes,
+# W4A16 NVFP4 ones from 32 to 8192.
+moe.mxfp4_mma_from = 28
+moe.mxfp4_mma_until = 1024
+moe.nvfp4_mma_from = 32
+moe.nvfp4_mma_until = 8192
+# Bf16 routed experts (Hy4, GLM-5.3-Flash served bf16): the graph-safe grouped
+# mma.sync kernel from 16 routes, where the per-route GEMV re-reads each expert.
+moe.bf16_mma_from = 16
+moe.bf16_mma_until = 65536

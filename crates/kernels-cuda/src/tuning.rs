@@ -116,6 +116,12 @@ pub struct MoeW4a4FusedFrom(pub u32);
 #[decision(id = "kernel.attn.qkv_rows_from", constant(range(1..=65_536)), default = 64, tune = search)]
 pub struct AttnQkvRowsFrom(pub u32);
 
+/// Whether a narrow W4A4 routed MLP lays its routes out and quantizes their
+/// rows in one launch. Off but where a chip's profile turns it on (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.w4a4_fused_layout", flag, default = false, tune = search)]
+pub struct MoeW4a4FusedLayout;
+
 /// Whether a KDA prefill walks its chunks on the tensor cores (a chunk's
 /// update directions in parallel, then the state chunk by chunk) instead of
 /// a row at a time. Off but where a chip's profile turns it on (B200's): it
@@ -193,6 +199,19 @@ pub struct GemmBiasEpilogue;
 #[decision(id = "kernel.moe.mxfp4_mma_from", constant(range(1..=65_536)), default = 64, tune = search)]
 pub struct MoeMxfp4MmaFrom(pub u32);
 
+/// The fewest routes a routed bf16 select runs on the graph-safe grouped
+/// mma.sync kernel with (`moe_select_bf16_mma`), rather than the per-route
+/// GEMV. Bf16 experts have no tcgen05 or cuBLAS grouped path under a
+/// captured graph, so this is their only fast route. 0 never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.bf16_mma_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeBf16MmaFrom(pub u32);
+
+/// The most routes the bf16 grouped mma.sync kernel takes (0 never).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.bf16_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeBf16MmaUntil(pub u32);
+
 /// Whether the register-dequant mxfp4 select turns its codes into f16 with
 /// the e2m1 converts of the arch-specific Blackwells (`linear/moe_w4_cvt.cuh`)
 /// rather than bf16 by integer ops. Off but where a chip's profile says.
@@ -263,13 +282,6 @@ pub struct Dsv4DecodeUntil(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.selected_mma", flag, default = false, tune = search)]
 pub struct SdpaSelectedMma;
-
-/// Whether a sparse MLA's selected rows (GLM-5.x's DSA) run on the mma.sync
-/// MLA kernel, its keys gathered through the selection, rather than the
-/// scalar walk a warp a key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.mla_selected_mma", flag, default = false, tune = search)]
-pub struct SdpaMlaSelectedMma;
 
 /// Whether a compressed-pool attention (`attention.pool_lse`, and its
 /// selected form) runs on the tensor cores, a block a row's 16 heads, rather
@@ -655,6 +667,8 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
+        .add::<MoeBf16MmaFrom>()
+        .add::<MoeBf16MmaUntil>()
         .add::<MoeMxfp4Cvt>()
         .add::<MoeMxfp4CvtKsplitUntil>()
         .add::<GemmFp8ODown>()
@@ -669,6 +683,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmFp8MmaGemvUntil>()
         .add::<AttnResFusedNorm>()
         .add::<SsmKdaChunked>()
+        .add::<MoeW4a4FusedLayout>()
         .add::<AttnQkvRowsFrom>()
         .add::<SsmKdaStepFused>()
         .add::<GemmSplitLaunchNs>()
@@ -689,7 +704,6 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeXqaWholeWindow>()
         .add::<DecodeXqaCluster>()
         .add::<SdpaSelectedMma>()
-        .add::<SdpaMlaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<SdpaIndexTc5>()
         .add::<ElemwiseNormEmit>()
@@ -772,6 +786,8 @@ tuning! {
     merge_warp: bool = false, on SdpaMergeWarp;
     mxfp4_mma_until: u32 = 0, get MoeMxfp4MmaUntil;
     mxfp4_mma_from: u32 = 64, get MoeMxfp4MmaFrom;
+    bf16_mma_from: u32 = 0, get MoeBf16MmaFrom;
+    bf16_mma_until: u32 = 0, get MoeBf16MmaUntil;
     mxfp4_cvt: bool = false, on MoeMxfp4Cvt;
     mxfp4_cvt_ksplit_until: u32 = 0, get MoeMxfp4CvtKsplitUntil;
     fp8_o_down: bool = false, on GemmFp8ODown;
@@ -786,6 +802,7 @@ tuning! {
     gemm_fp8_mma_gemv_until: u32 = 0, get GemmFp8MmaGemvUntil;
     attn_res_fused_norm: bool = false, on AttnResFusedNorm;
     ssm_kda_chunked: bool = false, on SsmKdaChunked;
+    moe_w4a4_fused_layout: bool = false, on MoeW4a4FusedLayout;
     qkv_rows_from: u32 = 64, get AttnQkvRowsFrom;
     ssm_kda_step_fused: bool = false, on SsmKdaStepFused;
     gemm_split_launch_ns: u32 = 0, get GemmSplitLaunchNs;
@@ -806,7 +823,6 @@ tuning! {
     decode_xqa_whole_window: u32 = 0, get DecodeXqaWholeWindow;
     decode_xqa_cluster: u32 = 0, get DecodeXqaCluster;
     selected_mma: bool = false, on SdpaSelectedMma;
-    mla_selected_mma: bool = false, on SdpaMlaSelectedMma;
     index_mma: bool = false, on SdpaIndexMma;
     index_tc5: bool = false, on SdpaIndexTc5;
     norm_emit: bool = false, on ElemwiseNormEmit;

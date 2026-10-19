@@ -522,6 +522,8 @@ def build_config(args: argparse.Namespace):
             device_weight_budget=getattr(args, "device_weight_budget", None),
             host_weight_budget=getattr(args, "host_weight_budget", None),
             device_kv_budget=getattr(args, "device_kv_budget", None),
+            precision=getattr(args, "precision", None),
+            kv=getattr(args, "kv", None),
             device_memory_share=args.gpu_mem_util,
             engine=EngineConfig(
                 type=args.engine,
@@ -1500,6 +1502,10 @@ def build_parser() -> argparse.ArgumentParser:
             help="DEAD for cuda_native: never reaches engine_options, so it "
                  "silently does nothing. Use --device-kv-budget to cap KV.",
         )
+        sp.add_argument("--precision", default=None,
+                        help="[model] precision, e.g. bf16+nvfp4a4")
+        sp.add_argument("--kv", default=None,
+                        help="[model] kv, e.g. e4m3 (DeepSeek-V4's fp8 rows)")
         sp.add_argument(
             "--device-kv-budget",
             default=None,

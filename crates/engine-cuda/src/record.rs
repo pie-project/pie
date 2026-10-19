@@ -926,7 +926,8 @@ impl Bodies {
 
         // The warm fires walk the streams the capture will: a side stream's
         // regions take their own slabs (`scratch_stream` scopes by stream),
-        // which a capture cannot grow.
+        // which a capture cannot grow. Nothing is capturing, so no region
+        // opens a conditional node.
         walk_capture(at, run, place, Streams::Warm)?;
 
         if self.sealed_decline() {
@@ -1259,12 +1260,9 @@ impl BodyMap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Streams {
     Serial,
-    Forked,
-    /// A warm fire's walk: the side streams a capture forks onto (so each
-    /// takes the slabs its regions will), launched eagerly, so its
-    /// conditional regions walk as an eager fire's do rather than open
-    /// nodes in a capture there is none of.
+    /// The capture's side streams, eagerly: no conditional node is opened.
     Warm,
+    Forked,
 }
 
 impl<'a> Fire<'a> {

@@ -11,6 +11,10 @@ const BODY: &str = include_str!("../../../runtime/cuda/ptir_m1_runtime_body.cuh"
 pub struct Dialect {
     pub chunk: &'static str,
     pub lane: &'static str,
+    /// The line a region carries where it holds the exact cut's state, so
+    /// the launcher sizes its dynamic shared memory; empty where the dialect
+    /// keeps that state static.
+    pub cut_mark: &'static str,
 }
 
 fn rng_preamble() -> String {

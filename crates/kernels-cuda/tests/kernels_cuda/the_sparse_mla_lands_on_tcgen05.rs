@@ -206,21 +206,6 @@ fn score(
     decode: bool,
     pooled: bool,
 ) -> ((Vec<u16>, Vec<f32>), Case) {
-    let tuning = Tuning {
-        mla_naive: true,
-        mla_sparse: tc,
-        ..Tuning::DEFAULT
-    };
-    score_on(rope, tuning, window, decode, pooled)
-}
-
-fn score_on(
-    rope: usize,
-    tuning: Tuning,
-    window: Option<(u32, u32)>,
-    decode: bool,
-    pooled: bool,
-) -> ((Vec<u16>, Vec<f32>), Case) {
     let mut rng = Lcg::seeded(0x6c73_6533 + rope as u64);
     let tokens: usize = Q_LENS.iter().sum();
     let slots = PAGE_INDICES.len() * PAGE;
@@ -246,7 +231,11 @@ fn score_on(
     let mut gpu = Gpu::open();
     let device = Device::probe(&gpu.ctx()).expect("the device answers its attributes");
     let plan = plan(&mut gpu, &case, &device);
-    let ctx = gpu.ctx().with_tuning(tuning);
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        mla_naive: true,
+        mla_sparse: tc,
+        ..Tuning::DEFAULT
+    });
     if let Some((live, base)) = window {
         let win_at = gpu.up(&[live, base, Q_LENS.len() as u32, 0u32]);
         ctx.arm_stage(win_at);
@@ -283,6 +272,7 @@ fn score_on(
         block_size: 0,
         max_pages_per_request: 10,
         pages_in_batch: PAGE_INDICES.len() as i32,
+        live: [0, 0],
     };
     let q = RaggedTensor {
         data: Tensor::new(
@@ -496,6 +486,7 @@ fn decode_rows(reqs: usize, tc: bool, iters: u32) -> (Vec<u16>, f64) {
         block_size: 0,
         max_pages_per_request: *pages_per.iter().max().unwrap() as i32,
         pages_in_batch: total as i32,
+        live: [0, 0],
     };
     let q_at = gpu.up(&q_raw);
     let qpe_at = gpu.up(&qpe_raw);
@@ -672,6 +663,7 @@ fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> 
         block_size: 0,
         max_pages_per_request: pages_per as i32,
         pages_in_batch: total as i32,
+        live: [0, 0],
     };
     let q_at = gpu.up(&q_raw);
     let qpe_at = gpu.up(&qpe_raw);
@@ -711,9 +703,14 @@ fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> 
 /// values in bf16: within a few percent of the output's norm.
 #[test]
 fn glm_fp8_rows_score_in_e4m3() {
-    for (kv, rope) in [(300, 64), (1000, 64), (1000, 0)] {
-        let want = decode_short(4, kv, rope, false, false);
-        let got = decode_short(4, kv, rope, true, false);
+    // Fp8 latent rows need the tcgen05 sparse pass (Blackwell).
+    if !kernels_cuda::linear::tc5::supported() {
+        return;
+    }
+    // Four rows split over the multiprocessors; 160 a block each on 128-key tiles.
+    for (rows, kv, rope) in [(4, 300, 64), (4, 1000, 64), (4, 1000, 0), (160, 1000, 64)] {
+        let want = decode_short(rows, kv, rope, false, false);
+        let got = decode_short(rows, kv, rope, true, false);
         let (mut err, mut norm) = (0f64, 0f64);
         for (&g, &w) in got.iter().zip(&want) {
             let (g, w) = (f64::from(from_bf16(g)), f64::from(from_bf16(w)));
@@ -721,12 +718,19 @@ fn glm_fp8_rows_score_in_e4m3() {
             norm += w * w;
         }
         let rel = (err / norm).sqrt();
-        assert!(rel < 0.05, "{kv} keys, rope {rope}: relative error {rel}");
+        assert!(
+            rel < 0.05,
+            "{rows} rows of {kv} keys, rope {rope}: relative error {rel}"
+        );
     }
 }
 
 #[test]
 fn glm_reads_a_short_selection_dense() {
+    // Fp8 latent rows need the tcgen05 sparse pass (Blackwell).
+    if !kernels_cuda::linear::tc5::supported() {
+        return;
+    }
     let want = decode_short(4, 300, 64, true, false);
     let got = decode_short(4, 300, 64, true, true);
     for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
@@ -738,59 +742,5 @@ fn glm_reads_a_short_selection_dense() {
             (i / RANK) % HEADS,
             i % RANK
         );
-    }
-}
-
-/// The selected rows on the mma.sync MLA kernel (`kernel.sdpa.mla_selected_mma`,
-/// any sm_80 on): against the host reference, and on a pooled index's
-/// selection (holes, repeats, ids past the row) against the warp-a-key form.
-#[test]
-fn the_sparse_mla_lands_on_mma() {
-    let mma = Tuning {
-        mla_naive: true,
-        mla_selected_mma: true,
-        ..Tuning::DEFAULT
-    };
-    for (rope, decode, pooled) in [64, 0].into_iter().flat_map(|r| {
-        [
-            (r, false, false),
-            (r, true, false),
-            (r, false, true),
-            (r, true, true),
-        ]
-    }) {
-        let (got, case) = score_on(rope, mma, None, decode, pooled);
-        let (again, _) = score_on(rope, mma, None, decode, pooled);
-        assert!(
-            got.0 == again.0,
-            "decode {decode} pooled {pooled}: two passes land apart"
-        );
-        let want = if pooled {
-            let (naive, _) = score(rope, false, None, decode, pooled);
-            (
-                naive.0.iter().map(|&b| from_bf16(b)).collect::<Vec<f32>>(),
-                naive.1,
-            )
-        } else {
-            case.reference()
-        };
-        for (i, &g) in got.0.iter().enumerate() {
-            let (g, w) = (from_bf16(g), want.0[i]);
-            assert!(
-                close(g, w),
-                "decode {decode} pooled {pooled}: row {} head {} dim {} scored {g} against {w}",
-                i / (HEADS * RANK),
-                (i / RANK) % HEADS,
-                i % RANK
-            );
-        }
-        for (i, (&g, &w)) in got.1.iter().zip(&want.1).enumerate() {
-            assert!(
-                (g == w) || (g - w).abs() <= 1.0e-2 * w.abs().max(1.0),
-                "decode {decode} pooled {pooled}: row {} head {} landed log-sum-exp {g} against {w}",
-                i / HEADS,
-                i % HEADS
-            );
-        }
     }
 }

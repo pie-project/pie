@@ -328,6 +328,8 @@ pub enum Attention {
     SsmCausalConv1d {
         x: ValueId,
         weight: ValueId,
+        /// A bias a channel, added before the activation (Mamba-2's).
+        bias: Option<ValueId>,
         state: ValueId,
         conv_width: u32,
         dilation: u32,
@@ -350,6 +352,7 @@ pub enum Attention {
     SsmCausalConv1dChunked {
         x: ValueId,
         weight: ValueId,
+        bias: Option<ValueId>,
         state: ValueId,
         conv_width: u32,
         dilation: u32,
@@ -426,6 +429,28 @@ pub enum Attention {
         head_dim: u32,
         norm_eps: f32,
         gate_floor: f32,
+        y: ValueId,
+    },
+    /// Mamba-2's selective scan over the convolved rows `xbc` (`x`, then
+    /// `groups` of `B`, then of `C`, each `state_dim` wide): per head, `dt =
+    /// softplus(dt + dt_bias)`, `S = exp(-exp(a_log) dt) S + dt x B^T`, and
+    /// `(C S + d x) * silu(z)`, RMS-normed a group of heads and scaled by
+    /// `norm`, landed bf16. `chunked` walks a prompt's rows; else each row is
+    /// a request's one step.
+    SsmMamba2 {
+        xbc: ValueId,
+        dt: ValueId,
+        z: ValueId,
+        a_log: ValueId,
+        dt_bias: ValueId,
+        d: ValueId,
+        norm: ValueId,
+        eps: f32,
+        state: ValueId,
+        heads: u32,
+        groups: u32,
+        state_dim: u32,
+        chunked: bool,
         y: ValueId,
     },
 
@@ -842,8 +867,15 @@ impl Operands for Attention {
                 sink.extend([*q, *plan, *q_pe, *selection, *cache]);
             }
             Self::SsmCausalConv1d {
-                x, weight, state, ..
-            } => sink.extend([*x, *weight, *state]),
+                x,
+                weight,
+                bias,
+                state,
+                ..
+            } => {
+                sink.extend([*x, *weight, *state]);
+                sink.extend(*bias);
+            }
             Self::ShortConv {
                 x, weight, state, ..
             } => sink.extend([*x, *weight, *state]),
@@ -851,9 +883,14 @@ impl Operands for Attention {
                 x, weight, state, ..
             } => sink.extend([*x, *weight, *state]),
             Self::SsmCausalConv1dChunked {
-                x, weight, state, ..
+                x,
+                weight,
+                bias,
+                state,
+                ..
             } => {
                 sink.extend([*x, *weight, *state]);
+                sink.extend(*bias);
             }
             Self::BlockDynConv { x, coeff, base, .. } => sink.extend([*x, *coeff, *base]),
             Self::SelectorWalk {
@@ -911,6 +948,19 @@ impl Operands for Attention {
                 ..
             } => {
                 sink.extend([*mixed, *f, *b, *dt_bias, *a_log, *state]);
+            }
+            Self::SsmMamba2 {
+                xbc,
+                dt,
+                z,
+                a_log,
+                dt_bias,
+                d,
+                norm,
+                state,
+                ..
+            } => {
+                sink.extend([*xbc, *dt, *z, *a_log, *dt_bias, *d, *norm, *state]);
             }
             Self::IndexLayernormRope {
                 k,
@@ -1102,6 +1152,7 @@ impl Operands for Attention {
             Self::SsmGatedDeltaChunked { y, .. } => sink.push(*y),
             Self::SsmKdaStep { y, .. } => sink.push(*y),
             Self::SsmKdaChunked { y, .. } => sink.push(*y),
+            Self::SsmMamba2 { y, .. } => sink.push(*y),
             Self::IndexLayernormRope { k_out, .. } => sink.push(*k_out),
             Self::IndexRope { q_out, .. } => sink.push(*q_out),
             Self::IndexTopk { selection, .. } => sink.push(*selection),
@@ -1178,6 +1229,7 @@ impl Operands for Attention {
             Self::SsmGatedDeltaChunked { .. } => {}
             Self::SsmKdaStep { .. } => {}
             Self::SsmKdaChunked { .. } => {}
+            Self::SsmMamba2 { .. } => {}
             Self::IndexLayernormRope { k_out, k, .. } => sink.push((*k_out, *k)),
             Self::IndexRope { q_out, q, .. } => sink.push((*q_out, *q)),
             Self::IndexTopk { .. } => {}
@@ -1239,6 +1291,8 @@ impl Operands for Attention {
             Self::SsmGatedDeltaChunked { .. } => "attention.ssm_gated_delta_chunked",
             Self::SsmKdaStep { .. } => "attention.ssm_kda_step",
             Self::SsmKdaChunked { .. } => "attention.ssm_kda_chunked",
+            Self::SsmMamba2 { chunked: false, .. } => "attention.ssm_mamba2_step",
+            Self::SsmMamba2 { chunked: true, .. } => "attention.ssm_mamba2_chunked",
             Self::IndexLayernormRope { .. } => "attention.index_layernorm_rope",
             Self::IndexRope { .. } => "attention.index_rope",
             Self::IndexTopk { .. } => "attention.index_topk",
