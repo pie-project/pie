@@ -3995,19 +3995,16 @@ __global__ void __launch_bounds__(256) ssm_chunk_scan(
 // `l` the key channels `4l..4l+3`. They form the gates, their running sum
 // `G` down the chunk, the unit-length rows (the queries scaled by
 // `1 / sqrt(D)`), and land
-//   q_g = q exp(G),  k_g = k exp(G_L - G),  exp(G_L),
-//   A = tril(beta_i k_i . k_j exp(G_i - G_j), -1),  T = (I + A)^-1,
-//   w = T diag(beta) (k exp(G)),  u = T diag(beta) v,
+//   q_g = q exp(G),  k_g = k exp(G_L - G),  k_e = k exp(G),  exp(G_L),
+//   A = tril(beta_i k_i . k_j exp(G_i - G_j), -1),  T diag(beta) = (I + A)^-1 diag(beta),
 //   P = tril(q_i . k_j exp(G_i - G_j)).
 constexpr int KDA_CH = 16;
 constexpr int KDA16_TASKS = 2;
 // A (chunk, head)'s shared memory: three bf16 chunk tiles (the scaled keys,
-// their column twins, the scaled queries; then `k exp(G)` and the values
-// over the first and third), `A` in f32, `T diag(beta)` in bf16, and the
-// two warps' running sums.
+// their column twins, the scaled queries), `A` in f32, and the two warps'
+// running sums.
 constexpr int KDA16_LDT = 24;
-constexpr int KDA16_TASK_SMEM = 3 * KDA_CH * GDN_LD * 2 + KDA_CH * (KDA_CH + 1) * 4 +
-                                KDA_CH * KDA16_LDT * 2 + 3 * 128 * 4;
+constexpr int KDA16_TASK_SMEM = 3 * KDA_CH * GDN_LD * 2 + KDA_CH * (KDA_CH + 1) * 4 + 3 * 128 * 4;
 
 __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
     const bf16* __restrict__ mixed,
@@ -4023,8 +4020,8 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
     const int* __restrict__ begin_at,
     bf16* __restrict__ qg_out,
     bf16* __restrict__ kg_out,
-    bf16* __restrict__ w_out,
-    bf16* __restrict__ u_out,
+    bf16* __restrict__ ke_out,
+    bf16* __restrict__ tb_out,
     bf16* __restrict__ p_out,
     float* __restrict__ gl_out,
     int lanes, int H,
@@ -4060,10 +4057,7 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
     bf16* kc = kr + KDA_CH * GDN_LD;
     bf16* qr = kc + KDA_CH * GDN_LD;
     float* As = reinterpret_cast<float*>(qr + KDA_CH * GDN_LD);
-    bf16* t1 = reinterpret_cast<bf16*>(As + KDA_CH * (KDA_CH + 1));
-    float* xch = reinterpret_cast<float*>(t1 + KDA_CH * KDA16_LDT);
-    bf16* kgs = kr;
-    bf16* vs = qr;
+    float* xch = As + KDA_CH * (KDA_CH + 1);
 
     auto store4 = [&](bf16* at, float a, float b, float cc, float d) {
         *reinterpret_cast<uint2*>(at) = make_uint2(gdn_pack(a, b), gdn_pack(cc, d));
@@ -4078,14 +4072,13 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
         const float2 a = gdn_unpack(v.x), b = gdn_unpack(v.y);
         x[0] = a.x; x[1] = a.y; x[2] = b.x; x[3] = b.y;
     };
-    uint2 graw[R], kraw[R], qraw[R], vraw[R];
+    uint2 graw[R], kraw[R], qraw[R];
     #pragma unroll
     for (int ii = 0; ii < R; ++ii) {
         const int i = i0 + ii;
         graw[ii] = raw(raw_g + (row_at(i) * H + h) * D + c, i < L);
         kraw[ii] = raw(mixed + row_at(i) * 3 * width + width + h * D + c, i < L);
         qraw[ii] = raw(mixed + row_at(i) * 3 * width + h * D + c, i < L);
-        vraw[ii] = raw(mixed + row_at(i) * 3 * width + 2 * width + h * D + c, i < L);
     }
     const float beta = l < L ? sigmoidf(__bfloat162float(raw_beta[row_at(l) * H + h])) : 0.f;
 
@@ -4163,18 +4156,17 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
     auto inv_len = [&](const float (&x)[4], float scale) {
         return rsqrtf(warp_sum(x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3]) + eps) * scale;
     };
-    // The keys: their split-scaled twins for `A` and `P`, the fold's keys.
-    float kinv[R];
+    // The keys: their split-scaled twins for `A` and `P`, the scan's keys.
     #pragma unroll
     for (int ii = 0; ii < R; ++ii) {
         const int i = i0 + ii;
         float k[4];
         unpack4(kraw[ii], k);
-        kinv[ii] = inv_len(k, 1.f);
+        const float kinv = inv_len(k, 1.f);
         float e0[4], e1[4], el[4];
         #pragma unroll
         for (int u = 0; u < 4; ++u) {
-            k[u] *= kinv[ii];
+            k[u] *= kinv;
             const float einv = __fdividef(1.f, E[ii][u]);
             e0[u] = E[ii][u] * einv_0[u];
             e1[u] = e_0[u] * einv;
@@ -4183,8 +4175,9 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
         store4(kr + i * GDN_LD + c, k[0] * e0[0], k[1] * e0[1], k[2] * e0[2], k[3] * e0[3]);
         store4(kc + i * GDN_LD + c, k[0] * e1[0], k[1] * e1[1], k[2] * e1[2], k[3] * e1[3]);
         if (i < L) {
-            store4(kg_out + (static_cast<long long>(ta + i) * H + h) * D + c, k[0] * el[0],
-                   k[1] * el[1], k[2] * el[2], k[3] * el[3]);
+            const long long at = (static_cast<long long>(ta + i) * H + h) * D + c;
+            store4(kg_out + at, k[0] * el[0], k[1] * el[1], k[2] * el[2], k[3] * el[3]);
+            store4(ke_out + at, k[0] * E[ii][0], k[1] * E[ii][1], k[2] * E[ii][2], k[3] * E[ii][3]);
         }
     }
     const float q_scale = rsqrtf(static_cast<float>(D));
@@ -4242,8 +4235,7 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
     pair();
 
     // `T = (I + A)^-1` by forward substitution, a column a lane of the first
-    // warp, then `T diag(beta)` in bf16; `k exp(G)` and the values over the
-    // tiles `A` and `P` are done with.
+    // warp, out as `T diag(beta)` in bf16.
     if (hw == 0) {
         float tcol[KDA_CH];
         #pragma unroll
@@ -4254,58 +4246,10 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
             tcol[rr] = rr == l ? 1.f : (rr < l ? 0.f : -sum);
         }
         if (l < KDA_CH) {
+            bf16* td = tb_out + (static_cast<long long>(s) * H + h) * KDA_CH * KDA_CH;
             #pragma unroll
-            for (int rr = 0; rr < KDA_CH; ++rr) t1[rr * KDA16_LDT + l] = bf16(tcol[rr] * beta);
+            for (int rr = 0; rr < KDA_CH; ++rr) td[rr * KDA_CH + l] = bf16(tcol[rr] * beta);
         }
-    }
-    #pragma unroll
-    for (int ii = 0; ii < R; ++ii) {
-        const int i = i0 + ii;
-        float k[4], v[4];
-        unpack4(kraw[ii], k);
-        unpack4(vraw[ii], v);
-        store4(kgs + i * GDN_LD + c, k[0] * kinv[ii] * E[ii][0], k[1] * kinv[ii] * E[ii][1],
-               k[2] * kinv[ii] * E[ii][2], k[3] * kinv[ii] * E[ii][3]);
-        store4(vs + i * GDN_LD + c, v[0], v[1], v[2], v[3]);
-    }
-    pair();
-
-    // `w = (T diag(beta)) (k exp(G))` and `u = (T diag(beta)) v`, a warp
-    // half the columns.
-    unsigned ta4[4];
-    gdn_ldsm(ta4, gdn_at_a(t1, KDA16_LDT, 0, 0, l));
-    #pragma unroll
-    for (int pass = 0; pass < 2; ++pass) {
-        const bf16* rhs = pass == 0 ? kgs : vs;
-        bf16* dst = pass == 0 ? w_out : u_out;
-        #pragma unroll
-        for (int q = 0; q < D / 32; ++q) {
-            const int np = hw * (D / 32) + q;
-            unsigned b[4];
-            gdn_ldsm_t(b, gdn_at_b(rhs, GDN_LD, 0, np * 16, l));
-            float o[2][4] = {};
-            gdn_mma(o[0], ta4, b[0], b[1]);
-            gdn_mma(o[1], ta4, b[2], b[3]);
-            #pragma unroll
-            for (int half = 0; half < 2; ++half) {
-                bf16* at = kc + (g + 8 * half) * GDN_LD + np * 16 + 2 * t;
-                *reinterpret_cast<unsigned*>(at) = gdn_pack(o[0][2 * half], o[0][2 * half + 1]);
-                *reinterpret_cast<unsigned*>(at + 8) = gdn_pack(o[1][2 * half], o[1][2 * half + 1]);
-            }
-        }
-        // Out through the spent key tile, 16 bytes a store.
-        pair();
-        #pragma unroll
-        for (int q = 0; q < KDA_CH * (D / 8) / 64; ++q) {
-            const int e = q * 64 + hw * 32 + l;
-            const int i = e / (D / 8);
-            const int cc = (e % (D / 8)) * 8;
-            if (i < L) {
-                *reinterpret_cast<uint4*>(dst + (static_cast<long long>(ta + i) * H + h) * D + cc) =
-                    *reinterpret_cast<const uint4*>(kc + i * GDN_LD + cc);
-            }
-        }
-        pair();
     }
 }
 
@@ -4313,21 +4257,23 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
 // the request's chunks; a warp carries sixteen value columns of the state
 // over all its key rows, held transposed, `[values][keys]`, in f32
 // fragments. Transposed, the state is its own A operand for the chunk's
-// `v_new^T = u^T - S^T w^T` and `out^T = S^T q_g^T + v_new^T P^T`, and
+// `v_new^T = (v^T - S^T k_e^T) (T diag(beta))^T` and
+// `out^T = S^T q_g^T + v_new^T P^T`, and
 // `v_new^T` is the A operand of the fold `S^T = S^T diag(exp(G_L)) +
 // v_new^T k_g`, so a warp never waits on another. The operands stream in
 // two chunks ahead.
 constexpr int KDA16_BV = 64;
 constexpr int KDA16_LDV = KDA16_BV + 8;
 constexpr int KDA16_STAGE =
-    3 * KDA_CH * GDN_LD * 2 + KDA_CH * KDA16_LDV * 2 + KDA_CH * KDA16_LDT * 2 + 128 * 4;
+    3 * KDA_CH * GDN_LD * 2 + KDA_CH * KDA16_LDV * 2 + 2 * KDA_CH * KDA16_LDT * 2 + 128 * 4;
 
 __global__ void __launch_bounds__(128) ssm_kda16_scan(
     const float* __restrict__ decay,
+    const bf16* __restrict__ mixed,
     const bf16* __restrict__ qg,
     const bf16* __restrict__ kg,
-    const bf16* __restrict__ w,
-    const bf16* __restrict__ u,
+    const bf16* __restrict__ ke,
+    const bf16* __restrict__ tb,
     const bf16* __restrict__ pm,
     float* __restrict__ state_base,
     const int* __restrict__ slot_ids,
@@ -4346,14 +4292,15 @@ __global__ void __launch_bounds__(128) ssm_kda16_scan(
     constexpr int BV = KDA16_BV;
     constexpr int LDV = KDA16_LDV;
     extern __shared__ __align__(16) unsigned char kda16_smem[];
-    auto stage = [&](int b, bf16*& sq, bf16*& sw, bf16*& sk, bf16*& su, bf16*& sp, float*& sg) {
+    auto stage = [&](int b, bf16*& sq, bf16*& sw, bf16*& sk, bf16*& su, bf16*& sp, bf16*& st, float*& sg) {
         unsigned char* at = kda16_smem + b * KDA16_STAGE;
         sq = reinterpret_cast<bf16*>(at);
         sw = sq + KDA_CH * GDN_LD;
         sk = sw + KDA_CH * GDN_LD;
         su = sk + KDA_CH * GDN_LD;
         sp = su + KDA_CH * LDV;
-        sg = reinterpret_cast<float*>(sp + KDA_CH * KDA16_LDT);
+        st = sp + KDA_CH * KDA16_LDT;
+        sg = reinterpret_cast<float*>(st + KDA_CH * KDA16_LDT);
     };
 
     const int nvt = V / BV;
@@ -4393,9 +4340,9 @@ __global__ void __launch_bounds__(128) ssm_kda16_scan(
     const int nchunks = (lane.T + KDA_CH - 1) / KDA_CH;
     auto load = [&](int jc) {
         if (jc < nchunks) {
-            bf16 *sq, *sw, *sk, *su, *sp;
+            bf16 *sq, *sw, *sk, *su, *sp, *st;
             float* sg;
-            stage(jc % 3, sq, sw, sk, su, sp, sg);
+            stage(jc % 3, sq, sw, sk, su, sp, st, sg);
             const int ta = lane.t0 + jc * KDA_CH;
             const int L = min(KDA_CH, lane.t0 + lane.T - ta);
             #pragma unroll
@@ -4405,7 +4352,7 @@ __global__ void __launch_bounds__(128) ssm_kda16_scan(
                 const bool in = i < L;
                 const long long row = (static_cast<long long>(ta + (in ? i : 0)) * H + h) * BK + c;
                 gdn_cp16(sq + i * GDN_LD + c, qg + row, in);
-                gdn_cp16(sw + i * GDN_LD + c, w + row, in);
+                gdn_cp16(sw + i * GDN_LD + c, ke + row, in);
                 gdn_cp16(sk + i * GDN_LD + c, kg + row, in);
             }
             {
@@ -4413,13 +4360,16 @@ __global__ void __launch_bounds__(128) ssm_kda16_scan(
                 const int c = (tid % (BV / 8)) * 8;
                 const bool in = i < L;
                 gdn_cp16(su + i * LDV + c,
-                         u + (static_cast<long long>(ta + (in ? i : 0)) * H + h) * V + vt * BV + c, in);
+                         mixed + static_cast<long long>(ta + (in ? i : 0) + row0) * 3 * H * V + 2 * H * V + h * V +
+                             vt * BV + c,
+                         in);
             }
-            if (tid < KDA_CH * KDA_CH / 8) {
-                const int i = tid / 2;
+            if (tid < KDA_CH * KDA_CH / 4) {
+                const int i = (tid / 2) % KDA_CH;
                 const int c = (tid % 2) * 8;
-                gdn_cp16(sp + i * KDA16_LDT + c,
-                         pm + (static_cast<long long>(base + jc) * H + h) * KDA_CH * KDA_CH + i * KDA_CH + c, true);
+                const long long at = (static_cast<long long>(base + jc) * H + h) * KDA_CH * KDA_CH + i * KDA_CH + c;
+                if (tid < KDA_CH * KDA_CH / 8) gdn_cp16(sp + i * KDA16_LDT + c, pm + at, true);
+                else gdn_cp16(st + i * KDA16_LDT + c, tb + at, true);
             }
             if (tid < BK / 4) {
                 gdn_cp16(sg + tid * 4, decay + (static_cast<long long>(base + jc) * H + h) * BK + tid * 4, true);
@@ -4440,13 +4390,13 @@ __global__ void __launch_bounds__(128) ssm_kda16_scan(
         asm volatile("cp.async.wait_group 1;\n" ::: "memory");
         __syncthreads();
         load(jc + 2);
-        bf16 *sq, *sw, *sk, *su, *sp;
+        bf16 *sq, *sw, *sk, *su, *sp, *st;
         float* sg;
-        stage(jc % 3, sq, sw, sk, su, sp, sg);
+        stage(jc % 3, sq, sw, sk, su, sp, st, sg);
         const int ta = lane.t0 + jc * KDA_CH;
         const int L = min(KDA_CH, lane.t0 + lane.T - ta);
 
-        // `S^T q_g^T` and `S^T w^T`, two eight-token tiles each.
+        // `S^T q_g^T` and `S^T k_e^T`, two eight-token tiles each.
         float oh[2][4] = {};
         float wh[2][4] = {};
         #pragma unroll
@@ -4464,17 +4414,28 @@ __global__ void __launch_bounds__(128) ssm_kda16_scan(
             gdn_mma(wh[1], a, bw[2], bw[3]);
         }
 
-        // `v_new^T = u^T - S^T w^T`, in A-operand order.
+        // `v_new^T = (v^T - S^T k_e^T) (T diag(beta))^T`, in A-operand order.
         unsigned vn[4];
         {
-            unsigned ut[4];
-            gdn_ldsm_t(ut, at_tok(su, LDV, cw));
+            unsigned x[4], bt[4];
+            gdn_ldsm_t(x, at_tok(su, LDV, cw));
             #pragma unroll
             for (int nt = 0; nt < 2; ++nt) {
                 #pragma unroll
                 for (int half = 0; half < 2; ++half) {
-                    const float2 uu = gdn_unpack(ut[2 * nt + half]);
-                    vn[2 * nt + half] = gdn_pack(uu.x - wh[nt][2 * half], uu.y - wh[nt][2 * half + 1]);
+                    const float2 vv = gdn_unpack(x[2 * nt + half]);
+                    x[2 * nt + half] = gdn_pack(vv.x - wh[nt][2 * half], vv.y - wh[nt][2 * half + 1]);
+                }
+            }
+            float o[2][4] = {};
+            gdn_ldsm(bt, at_tok(st, KDA16_LDT, 0));
+            gdn_mma(o[0], x, bt[0], bt[1]);
+            gdn_mma(o[1], x, bt[2], bt[3]);
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                #pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    vn[2 * nt + half] = gdn_pack(o[nt][2 * half], o[nt][2 * half + 1]);
                 }
             }
         }
