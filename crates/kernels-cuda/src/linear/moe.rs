@@ -2282,6 +2282,13 @@ pub fn select_fp8_w8a16(
 /// captured fire never takes: it sizes its blocks on the host).
 const BF16_MMA_UNTIL: u32 = u32::MAX;
 
+/// From this many routes a fire (with K in whole 64s), a bf16 select is the
+/// tiled GEMM (`moe_select_bf16_gemm`), a CTA 64 of an expert's routes: a
+/// batch's routes crowd onto a few hot experts as often as not, and its
+/// tiles stream a hot expert's rows once a 64 routes, near the card's rate
+/// with the routes spread.
+const BF16_GEMM_FROM: u32 = 256;
+
 /// A routed select over a bf16 bank (`experts x n x k` at `bank`) on mma.sync
 /// (`linear/moe_w8.cuh`'s `moe_select_bf16_mma`), each expert's rows
 /// streamed once a slice of its routes, with the GLU in its epilogue where
@@ -2327,8 +2334,10 @@ pub fn select_bf16_mma(
     let nb: u32 = match per {
         0..=4 => 1,
         5..=12 => 2,
-        _ => 4,
+        _ if fan.route_count < BF16_GEMM_FROM || !x.width.is_multiple_of(64) => 4,
+        _ => 8,
     };
+    let tiled = nb == 8;
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
     let inter = stated(op, y.width)?;
@@ -2361,16 +2370,27 @@ pub fn select_bf16_mma(
         1
     };
     let cols = if glu.is_some() { 64 } else { 64 * tiles };
-    let fire = Fire::at(
-        "linear/moe_w8.cuh",
-        symbol(&format!(
-            "::pie::linear::moe_select_bf16_mma<{nb}, {DEPTH}, {code}, {tiles}, {ksplit}>"
-        )),
-    )
-    .apply(Launch::grid(
-        [work_cap, wide(cols), 1],
-        [THREADS * ksplit, 1, 1],
-    ));
+    let fire = if tiled {
+        // Four stages of 64 routes' and 128 rows' 64 of K: two CTAs an SM.
+        const STAGES: u32 = 4;
+        let cols = if glu.is_some() { 64 } else { 128 };
+        Fire::at(
+            "linear/moe_w8.cuh",
+            symbol(&format!("::pie::linear::moe_select_bf16_gemm<{STAGES}, {code}>")),
+        )
+        .apply(Launch::grid([work_cap, wide(cols), 1], [256, 1, 1]).smem(STAGES * (64 + 128) * 128))
+    } else {
+        Fire::at(
+            "linear/moe_w8.cuh",
+            symbol(&format!(
+                "::pie::linear::moe_select_bf16_mma<{nb}, {DEPTH}, {code}, {tiles}, {ksplit}>"
+            )),
+        )
+        .apply(Launch::grid(
+            [work_cap, wide(cols), 1],
+            [THREADS * ksplit, 1, 1],
+        ))
+    };
     ctx.fire(
         op,
         fire,
