@@ -472,7 +472,7 @@ pub fn matmul_select(
             && x.dtype == Dtype::Bf16
             && bank.dtype == Dtype::Bf16
             && !experts.streams()
-            && x.width.is_multiple_of(16)
+            && x.width.is_multiple_of(64)
             && y.width.is_multiple_of(8)
             && bank.rows >= 1
             && u64::from(bank.width) == u64::from(x.width) * u64::from(y.width)
@@ -540,8 +540,9 @@ fn select_bf16_mma(
         },
     )?;
     let grid = [work_cap, y.width.div_ceil(COLS), 1];
-    // smem = (128 weight rows + 8*nb route rows) x (kBK 16 + 8 pad) bf16.
-    let smem = (128 + 8 * nb) * (16 + 8) * 2;
+    // Three stages of 128 weight rows and 8 nb route rows, each a K step of
+    // 64 bf16 padded by 8 (`kBf16MmaStages`, `kBf16MmaBK`).
+    let smem = 3 * (128 + 8 * nb) * (64 + 8) * 2;
     ctx.fire(
         op,
         Fire::at(

@@ -219,6 +219,10 @@ __device__ __forceinline__ void w4_land(const float (&acc)[kTiles][kNb][4], Fact
 // The routing (order/offsets/work) and the epilogue (`w4mma::w4_land`) are
 // shared with the mxfp4 kernel; the fragments are the ones `attn/mla.cuh`
 // loads, so the output fragment is the layout `w4_land` reads.
+// The bf16 select's K step and its pipeline's stages (`moe_select_bf16_mma`).
+constexpr int kBf16MmaBK = 64;
+constexpr int kBf16MmaStages = 3;
+
 namespace bf16mma {
 __device__ __forceinline__ void ld_a(unsigned (&a)[4], const bf16* base, int ld, int lane) {
     const bf16* r = base + static_cast<long long>(lane & 15) * ld + ((lane & 16) ? 8 : 0);
@@ -249,8 +253,11 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
     constexpr int kRowsWarp = kTiles * 16;
     constexpr int kRowsCta = 4 * kRowsWarp;   // 128 weight rows a CTA
     constexpr int kSlice = 8 * kNb;           // routes a slice (B of the GEMM)
-    constexpr int kBK = 16;                   // K staged a step (one mma k)
+    constexpr int kBK = kBf16MmaBK;           // K staged a step (four mma k)
     constexpr int kPad = kBK + 8;             // smem row stride (ldmatrix)
+    constexpr int kStages = kBf16MmaStages;
+    constexpr int kChunks = kBK / 8;          // 16-byte chunks a row a step
+    constexpr int kStage = (kRowsCta + kSlice) * kPad;
 
     if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
     const int item = work[blockIdx.x];
@@ -274,9 +281,40 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
     const bf16* w_e = weight + static_cast<long long>(expert) * n * k;
     const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
 
+    // `kStages` stages, each 128 weight rows then the slice's route rows.
     extern __shared__ bf16 smem[];
-    bf16* sW = smem;                          // [kRowsCta][kPad]
-    bf16* sX = sW + kRowsCta * kPad;          // [kSlice][kPad]
+
+    // Stage `st` takes K-step `step`: 16 bytes a cp.async. Rows past the
+    // bank or routes past the slice are zeroed so the mma reads defined
+    // smem (their outputs are not stored).
+    auto load = [&](int step, int st) {
+        bf16* sW = smem + st * kStage;
+        bf16* sX = sW + kRowsCta * kPad;
+        const int k0 = step * kBK;
+#pragma unroll
+        for (int i = tid; i < kRowsCta * kChunks; i += 128) {
+            const int row = i / kChunks;
+            const int ch = (i % kChunks) * 8;
+            bf16* dst = sW + row * kPad + ch;
+            if (cta_row0 + row < n) {
+                __pipeline_memcpy_async(
+                    dst, w_e + static_cast<long long>(cta_row0 + row) * k + k0 + ch, 16);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        for (int i = tid; i < kSlice * kChunks; i += 128) {
+            const int tok = i / kChunks;
+            const int ch = (i % kChunks) * 8;
+            bf16* dst = sX + tok * kPad + ch;
+            if (tok < count) {
+                const long long r = static_cast<long long>(order[begin + tok] / act_div);
+                __pipeline_memcpy_async(dst, act + r * k + k0 + ch, 16);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
 
     float acc[kTiles][kNb][4];
 #pragma unroll
@@ -286,49 +324,39 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
 
-    for (int k0 = 0; k0 < k; k0 += kBK) {
-        // Stage this K-tile: 128 weight rows and `count` route rows, 8 bf16
-        // (16 B) a cp.async. Rows past the bank or routes past the slice are
-        // zeroed so the mma reads defined smem (their outputs are not stored).
-        for (int i = tid; i < kRowsCta * (kBK / 8); i += 128) {
-            const int row = i / (kBK / 8);
-            const int ch = (i % (kBK / 8)) * 8;
-            bf16* dst = sW + row * kPad + ch;
-            if (cta_row0 + row < n) {
-                __pipeline_memcpy_async(
-                    dst, w_e + static_cast<long long>(cta_row0 + row) * k + k0 + ch, 16);
-            } else {
-                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
-            }
-        }
-        for (int i = tid; i < kSlice * (kBK / 8); i += 128) {
-            const int tok = i / (kBK / 8);
-            const int ch = (i % (kBK / 8)) * 8;
-            bf16* dst = sX + tok * kPad + ch;
-            if (tok < count) {
-                const long long r = static_cast<long long>(order[begin + tok] / act_div);
-                __pipeline_memcpy_async(dst, act + r * k + k0 + ch, 16);
-            } else {
-                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
-            }
-        }
+    // Every step commits a group (empty past the end), so the wait for
+    // step `s` is always the same count behind.
+    const int steps = k / kBK;
+#pragma unroll
+    for (int s = 0; s < kStages - 1; ++s) {
+        if (s < steps) load(s, s);
         __pipeline_commit();
-        __pipeline_wait_prior(0);
+    }
+    for (int s = 0; s < steps; ++s) {
+        __pipeline_wait_prior(kStages - 2);
         __syncthreads();
+        // The stage refilled here was read at step s - 1, behind the barrier.
+        const int next = s + kStages - 1;
+        if (next < steps) load(next, next % kStages);
+        __pipeline_commit();
 
-        unsigned bk[kNb][2];
+        const bf16* sW = smem + (s % kStages) * kStage;
+        const bf16* sX = sW + kRowsCta * kPad;
 #pragma unroll
-        for (int b = 0; b < kNb; ++b) bf16mma::ld_b(bk[b], sX + 8 * b * kPad, kPad, lane);
+        for (int kk = 0; kk < kBK; kk += 16) {
+            unsigned bk[kNb][2];
 #pragma unroll
-        for (int t = 0; t < kTiles; ++t) {
-            unsigned a[4];
-            bf16mma::ld_a(a, sW + (warp * kRowsWarp + 16 * t) * kPad, kPad, lane);
+            for (int b = 0; b < kNb; ++b) bf16mma::ld_b(bk[b], sX + 8 * b * kPad + kk, kPad, lane);
 #pragma unroll
-            for (int b = 0; b < kNb; ++b) {
-                w4mma::mma(acc[t][b], a[0], a[1], a[2], a[3], bk[b][0], bk[b][1]);
+            for (int t = 0; t < kTiles; ++t) {
+                unsigned a[4];
+                bf16mma::ld_a(a, sW + (warp * kRowsWarp + 16 * t) * kPad + kk, kPad, lane);
+#pragma unroll
+                for (int b = 0; b < kNb; ++b) {
+                    w4mma::mma(acc[t][b], a[0], a[1], a[2], a[3], bk[b][0], bk[b][1]);
+                }
             }
         }
-        __syncthreads();
     }
 
     auto factor = [&](int) { return 1.f; };
