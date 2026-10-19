@@ -2032,6 +2032,7 @@ fn select_mxfp4_mma(
     // fire streams each expert's codes once a 64.
     let staged = !cvt && per > STAGED_FROM;
     let (staged_nb, staged_tiles) = (8, 2);
+    let staged_warps: u32 = 4;
     let nb: u32 = match per {
         _ if staged => staged_nb,
         0..=4 => 1,
@@ -2041,9 +2042,9 @@ fn select_mxfp4_mma(
     // A CTA lands 128 rows (64 a staged one-tile warp's), or 64 GLU columns
     // (their gate and up rows).
     let cols = if glu.is_some() {
-        64
+        if staged { 16 * staged_warps } else { 64 }
     } else if staged {
-        64 * staged_tiles
+        16 * staged_tiles * staged_warps
     } else {
         128
     };
@@ -2104,13 +2105,14 @@ fn select_mxfp4_mma(
         const STAGES: u32 = 3;
         let nv = tensor_scales.is_some();
         let tiles = staged_tiles;
+        let warps = staged_warps;
         Fire::at(
             "linear/moe_w4.cuh",
             symbol(&format!(
-                "::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {STAGES}, {code}, {nv}, {tiles}>"
+                "::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {STAGES}, {code}, {nv}, {tiles}, {warps}>"
             )),
         )
-        .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(STAGES * 8 * nb * 16 * 16))
+        .apply(Launch::grid(grid, [32 * warps, 1, 1]).smem(STAGES * 8 * nb * 16 * 16))
     } else {
         let depth = MMA_DEPTH;
         // A fire of few CTAs (a decode's routes) splits K across groups of

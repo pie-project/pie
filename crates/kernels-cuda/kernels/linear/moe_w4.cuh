@@ -593,8 +593,9 @@ __device__ __forceinline__ void compute_staged(const uint4 (&cw)[kTiles][2], con
 /// wide fire streams each expert's codes once a 64 routes, not a 32.
 // `kTiles` m16 tiles of weight rows a warp: 1 holds a slice of 128 routes
 // (`kNb` 16) in the registers 2 holds 64 in.
-template <int kNb, int kStages, int kGlu, bool kNv = false, int kTiles = 2>
-__global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
+// `kWarps` warps a CTA (4 or 8) share the staged routes.
+template <int kNb, int kStages, int kGlu, bool kNv = false, int kTiles = 2, int kWarps = 4>
+__global__ void __launch_bounds__(32 * kWarps) moe_select_mxfp4_mma_staged(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
     const i32* __restrict__ offsets,
@@ -614,9 +615,14 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
 {
     static_assert(kGlu == 0 || kTiles == 2, "a GLU warp is a gate tile and its up tile");
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
-    constexpr int kRowsCta = 4 * kRowsWarp;
+    constexpr int kRowsCta = kWarps * kRowsWarp;
     constexpr int kSlice = 8 * kNb;
     constexpr int kStageRuns = kSlice * 16;
+    // A staging pass is `kThreads / 16` route rows, a thread a run of each.
+    constexpr int kThreads = 32 * kWarps;
+    constexpr int kRowStep = kThreads / 16;
+    constexpr int kPasses = kSlice / kRowStep;
+    static_assert(kPasses * kRowStep == kSlice, "the slice stages in whole passes");
 
     if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
     const int item = work[blockIdx.x];
@@ -657,10 +663,10 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
 
     // The runs this thread stages a chunk: rows tid / 16 + 8 j, run tid % 16.
     const int run = tid & 15;
-    const bf16* src[kNb];
+    const bf16* src[kPasses];
 #pragma unroll
-    for (int j = 0; j < kNb; ++j) {
-        const int tok = (tid >> 4) + 8 * j;
+    for (int j = 0; j < kPasses; ++j) {
+        const int tok = (tid >> 4) + kRowStep * j;
         src[j] = tok < count ? act + static_cast<long long>(order[begin + tok] / act_div) * k + run * 8
                              : nullptr;
     }
@@ -670,8 +676,8 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
             uint4* dst = staged_x + (ch % kStages) * kStageRuns;
             const int col = ch * 128 + run * 8;
 #pragma unroll
-            for (int j = 0; j < kNb; ++j) {
-                const int row = (tid >> 4) + 8 * j;
+            for (int j = 0; j < kPasses; ++j) {
+                const int row = (tid >> 4) + kRowStep * j;
                 const bool live = src[j] != nullptr && col < k;
                 const unsigned saddr = static_cast<unsigned>(__cvta_generic_to_shared(dst + w4mma::x_slot(row, run)));
                 asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(saddr),
@@ -717,7 +723,7 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
         {
             uint4* xs_w = staged_x + (ch % kStages) * kStageRuns;
 #pragma unroll
-            for (int j = 0; j < kNb; ++j) w4mma::lay_staged(xs_w + w4mma::x_slot((tid >> 4) + 8 * j, run));
+            for (int j = 0; j < kPasses; ++j) w4mma::lay_staged(xs_w + w4mma::x_slot((tid >> 4) + kRowStep * j, run));
         }
         __syncthreads();
         if (rows_live) {
