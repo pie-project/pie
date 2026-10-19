@@ -6,8 +6,13 @@ device = "NVIDIA L40S"
 # 2048-row fires: at 8192 a 14B's working set takes the kv an agent trace
 # needs (Qwen3-14B at 12288 context: 65K tokens of kv at 8192 rows, 74K at
 # 2048, where trace t1 on one card keeps 42 of 46 programs within their SLO).
+#
+# Four row buckets a doubling from 512: on powers of two a 1106-row prompt ran
+# the 2048 bucket's GEMMs (300 ms to its first token, SGLang 195; now 203).
+# From 128 the bodies took 3% of the kv.
 [engine]
 forward_tokens = 2048
+prefill_lattice_from = 512
 
 [provenance]
 measured = [
@@ -39,6 +44,7 @@ measured = [
   "engine.forward_tokens",
   "engine.graphs",
   "engine.lattice_steps",
+  "engine.prefill_lattice_from",
   "engine.recording",
   "engine.working_set_percent",
   "fuse.embed_scale_add",

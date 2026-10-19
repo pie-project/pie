@@ -859,9 +859,10 @@ mod tests {
             Engine::of(&l40s),
             Engine {
                 forward_tokens: 2048,
+                prefill_lattice_from: 512,
                 ..Engine::of(&registry().defaults())
             },
-            "the L40S fires 2048 rows"
+            "the L40S fires 2048 rows, its buckets four a doubling from 512"
         );
         assert_eq!(Engine::of(&rtx), Engine::of(&registry().defaults()));
         for p in [&l40s, &rtx] {
@@ -871,7 +872,11 @@ mod tests {
                 "what an Ada GPU ran before its family file"
             );
             for (spec, rungs, _) in p.entries() {
-                if spec.id == "engine.forward_tokens" && std::ptr::eq(p, &l40s) {
+                if matches!(
+                    spec.id,
+                    "engine.forward_tokens" | "engine.prefill_lattice_from"
+                ) && std::ptr::eq(p, &l40s)
+                {
                     continue;
                 }
                 assert_eq!(
