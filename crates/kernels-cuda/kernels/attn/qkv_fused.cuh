@@ -696,6 +696,85 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
             }
         }
     }
+    // Otherwise over 16-byte words, each lane's rotation (its cos, its
+    // signed sin, the pair `span` away a shuffle off) and both weights' runs
+    // held across the heads.
+    if constexpr (STAGE && ELEMS_PER_THREAD == 8 && is_same<KV, bf16>::value) {
+        if (!walked) {
+            walked = true;
+            const int run = part * ELEMS_PER_THREAD;
+            float cs[8], sn[8], wq[8], wk[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int dim = run + k;
+                const int in_two = dim & (2 * span - 1);
+                const int dim_pair = in_two & (span - 1);
+                const bool turns = dim < 2 * span;
+                cs[k] = turns ? rotation[dim_pair] : 1.f;
+                sn[k] = turns ? (in_two < span ? -rotation[HALF + dim_pair] : rotation[HALF + dim_pair]) : 0.f;
+                wq[k] = wk[k] = 1.f;
+            }
+            if (q_weight != nullptr && run < qk_width) load_bf16_run<8>(q_weight + run, wq);
+            if (k_weight != nullptr && run < qk_width) load_bf16_run<8>(k_weight + run, wk);
+            for (int head0 = warp_id * G; head0 < total_qk_heads; head0 += warps_per_block * G) {
+                const int head_idx = head0 + sub;
+                const bool is_q = head_idx < num_q_heads;
+                const bool on = head_idx < total_qk_heads && (is_q || kv_valid);
+                const int local_head = is_q ? head_idx : (head_idx - num_q_heads);
+                float x[8], y[8];
+#pragma unroll
+                for (int k = 0; k < 8; ++k) x[k] = y[k] = 0.f;
+                if (on && run < qk_width) {
+                    load_bf16_run<8>(src_row + (is_q ? 0 : q_src) + local_head * qk_width + run, x);
+                }
+                if (on && !is_q && run < v_width) {
+                    load_bf16_run<8>(src_row + q_src + num_kv_heads * qk_width + local_head * v_width + run, y);
+                }
+                float sum = 0.f, v_sum = 0.f;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    sum += x[k] * x[k];
+                    v_sum += y[k] * y[k];
+                }
+#pragma unroll
+                for (int offset = L / 2; offset > 0; offset >>= 1) {
+                    sum += __shfl_xor_sync(FULL_MASK, sum, offset, L);
+                    v_sum += __shfl_xor_sync(FULL_MASK, v_sum, offset, L);
+                }
+                if (qk_norm) {
+                    const float inv_rms = rsqrtf(sum / static_cast<float>(HEAD_DIM) + eps);
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) x[k] *= inv_rms * (is_q ? wq[k] : wk[k]);
+                }
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const float pair = __shfl_xor_sync(FULL_MASK, x[k], pair_offset, L);
+                    x[k] = x[k] * cs[k] + pair * sn[k];
+                }
+                if (!on) continue;
+                HeadDst<KV> dst;
+                HeadDst<KV> v_dst;
+                if (is_q) {
+                    dst.q = q_out + (static_cast<long long>(row) * num_q_heads + local_head) * HEAD_DIM;
+                } else {
+                    const long long page_row = hnd_layout
+                        ? ((static_cast<long long>(actual_page) * num_kv_heads + local_head) * page_size +
+                           offset_in_page) * HEAD_DIM
+                        : ((static_cast<long long>(actual_page) * page_size) + offset_in_page) * kv_dim +
+                              local_head * HEAD_DIM;
+                    dst.kv = k_pages + page_row;
+                    v_dst.kv = v_pages + page_row;
+                }
+                dst.template run<8>(run, x);
+                if (!is_q) {
+                    const float inv_v = (v_norm ? rsqrtf(v_sum / static_cast<float>(HEAD_DIM) + eps) : 1.f) * v_scale;
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) y[k] *= inv_v;
+                    v_dst.template run<8>(run, y);
+                }
+            }
+        }
+    }
     for (int head0 = walked ? total_qk_heads : warp_id * G; head0 < total_qk_heads; head0 += warps_per_block * G) {
         // A part of the warp a head: every lane joins the shuffles, a lane
         // past the heads (or on an invalid row's kv) loading and storing nothing.
