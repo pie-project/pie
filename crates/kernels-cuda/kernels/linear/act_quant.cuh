@@ -649,7 +649,7 @@ __global__ void __launch_bounds__(kOffsetThreads) route_lay_out_small(
 }
 
 // `route_lay_out_small` and the NVFP4 quantize of a narrow W4A4 fire (at
-// most 1024 routes over 256 experts) in one launch: every block lays the
+// most 1024 routes over 512 experts) in one launch: every block lays the
 // routes out alike -- a route's rank its 32-route chunk's matches ahead of it
 // past the chunks before -- so each lands the same rows; block 0 lands the
 // layout and the experts' alphas, and each block quantizes its share of the
@@ -708,18 +708,26 @@ __global__ void __launch_bounds__(256) route_lay_out_quant_nvfp4(
         if (c < chunks && e >= 0 && rank[i] == 0) cnt[c * experts + e] = __popc(m);
     }
     __syncthreads();
-    // Each expert's chunks prefixed in place, its rows and start.
-    int rows_e = 0, tally = 0;
-    for (int e = tid; e < experts; e += 256) {
+    // Each expert's chunks prefixed in place, its rows (two experts a
+    // thread, experts <= 512).
+    constexpr int kPer = 2;
+    int rows_e[kPer], tally[kPer], sum = 0;
+#pragma unroll
+    for (int p = 0; p < kPer; ++p) {
+        const int e = tid * kPer + p;
+        tally[p] = 0;
+        rows_e[p] = 0;
+        if (e >= experts) continue;
         for (int c = 0; c < chunks; ++c) {
             const int v = cnt[c * experts + e];
-            cnt[c * experts + e] = tally;
-            tally += v;
+            cnt[c * experts + e] = tally[p];
+            tally[p] += v;
         }
-        rows_e = (tally + align - 1) / align * align;
+        rows_e[p] = (tally[p] + align - 1) / align * align;
+        sum += rows_e[p];
     }
-    // The experts' rows scanned (an expert a thread, experts <= 256).
-    int incl = rows_e;
+    // The experts' rows scanned.
+    int incl = sum;
 #pragma unroll
     for (int off = 1; off < 32; off <<= 1) {
         const int y = __shfl_up_sync(0xffffffffu, incl, off);
@@ -729,16 +737,21 @@ __global__ void __launch_bounds__(256) route_lay_out_quant_nvfp4(
     __syncthreads();
     int before = 0;
     for (int w = 0; w < warp; ++w) before += run_sum[w];
-    if (tid < experts) {
-        start[tid] = before + incl - rows_e;
+    int at_e = before + incl - sum;
+#pragma unroll
+    for (int p = 0; p < kPer; ++p) {
+        const int e = tid * kPer + p;
+        if (e >= experts) continue;
+        start[e] = at_e;
         if (blockIdx.x == 0) {
-            offsets[tid] = start[tid];
-            counts[tid] = tally;
+            offsets[e] = at_e;
+            counts[e] = tally[p];
             if (alpha != nullptr)
-                alpha[tid] = input_scales[tid] * tensor_scales[static_cast<long long>(tid) * alpha_rows];
+                alpha[e] = input_scales[e] * tensor_scales[static_cast<long long>(e) * alpha_rows];
             if (alpha2 != nullptr)
-                alpha2[tid] = input_scales2[tid] * tensor_scales2[static_cast<long long>(tid) * alpha_rows2];
+                alpha2[e] = input_scales2[e] * tensor_scales2[static_cast<long long>(e) * alpha_rows2];
         }
+        at_e += rows_e[p];
     }
     if (blockIdx.x == 0 && tid == 255) {
         int total = 0;
@@ -911,30 +924,45 @@ __global__ void route_weighted_gather_vec8(
     if (scale != nullptr) sv = *reinterpret_cast<const uint4*>(scale + h0);
     const bf16* s8 = reinterpret_cast<const bf16*>(&sv);
     const long long base = static_cast<long long>(plane) * top;
-    for (int j = 0; j < top; ++j) {
-        const int o = pos[base + j];
-        if (o < 0) continue;
-        const uint4 w = *reinterpret_cast<const uint4*>(grouped + static_cast<long long>(o) * n + h0);
-        const bf16* v8 = reinterpret_cast<const bf16*>(&w);
-        float u[8];
+    // Eight routes' rows (and weights) in flight at once, summed in route
+    // order: a row's latency paid once a batch, not once a route.
+    constexpr int kAhead = 8;
+    for (int j0 = 0; j0 < top; j0 += kAhead) {
+        int at[kAhead];
+        uint4 rows[kAhead];
+        float wts[kAhead];
 #pragma unroll
-        for (int i = 0; i < 8; ++i) u[i] = bf16_to_f32(v8[i]);
-        if (scale != nullptr) {
-            float ss = 0.f;
+        for (int a = 0; a < kAhead; ++a) at[a] = j0 + a < top ? pos[base + j0 + a] : -1;
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                u[i] = bf16_to_f32(f32_to_bf16(u[i] * bf16_to_f32(s8[i])));
-                ss = fmaf(u[i], u[i], ss);
-            }
-            const float inv = rsqrtf(route_row_sum(ss, part) / static_cast<float>(n) + eps);
-#pragma unroll
-            for (int i = 0; i < 8; ++i) u[i] = bf16_to_f32(f32_to_bf16(u[i] * inv));
+        for (int a = 0; a < kAhead; ++a) {
+            rows[a] = at[a] >= 0 ? *reinterpret_cast<const uint4*>(grouped + static_cast<long long>(at[a]) * n + h0)
+                                 : uint4{};
+            // No weights: the routes already carry theirs (DeepSeek's, before
+            // the down leg), and moe_sum_add sums them as they are.
+            wts[a] = weights != nullptr && at[a] >= 0 ? weights[base + j0 + a] : 1.f;
         }
-        // No weights: the routes already carry theirs (DeepSeek's, before
-        // the down leg), and moe_sum_add sums them as they are.
-        const float wr = weights != nullptr ? weights[base + j] : 1.f;
 #pragma unroll
-        for (int i = 0; i < 8; ++i) acc[i] += wr * u[i];
+        for (int a = 0; a < kAhead; ++a) {
+            if (at[a] < 0) continue;
+            const bf16* v8 = reinterpret_cast<const bf16*>(&rows[a]);
+            float u[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) u[i] = bf16_to_f32(v8[i]);
+            if (scale != nullptr) {
+                float ss = 0.f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    u[i] = bf16_to_f32(f32_to_bf16(u[i] * bf16_to_f32(s8[i])));
+                    ss = fmaf(u[i], u[i], ss);
+                }
+                const float inv = rsqrtf(route_row_sum(ss, part) / static_cast<float>(n) + eps);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) u[i] = bf16_to_f32(f32_to_bf16(u[i] * inv));
+            }
+            const float wr = wts[a];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[i] += wr * u[i];
+        }
     }
     // Qwen's shared expert under its sigmoid gate, as moe_sigmoid_gate_add
     // adds it; with no gate, the shared row added as it is (moe_sum_add).

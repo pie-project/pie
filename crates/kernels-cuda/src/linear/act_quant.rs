@@ -753,7 +753,7 @@ pub(crate) fn lay_out(
 
 /// The most routes and experts [`lay_out_quant_nvfp4`] takes in one launch.
 pub(crate) const FUSED_ROUTES: u32 = 1024;
-pub(crate) const FUSED_EXPERTS: u32 = 256;
+pub(crate) const FUSED_EXPERTS: u32 = 512;
 
 /// [`lay_out_with`] contiguous (each expert's rows `align` apart) and the
 /// NVFP4 quantize of `x`'s tokens to their routes' rows (`codes`, atoms in
@@ -783,7 +783,7 @@ pub(crate) fn lay_out_quant_nvfp4(
     {
         return Err(refuse(
             op,
-            "the fused layout takes 1024 routes over 256 experts, k a whole number of 16s",
+            "the fused layout takes 1024 routes over 512 experts, k a whole number of 16s",
         ));
     }
     let e = experts as usize;
