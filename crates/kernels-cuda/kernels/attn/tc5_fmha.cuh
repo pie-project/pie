@@ -259,23 +259,40 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
     // from each one's last (the longest causal ones first), a rank's every
     // request and head in turn (past 16 KV heads, a head at a time, its keys
     // kept in L2 while the blocks share them), dealt to the blocks back and
-    // forth so their sums even out.
+    // forth so their sums even out. Up to 32 requests with rows a warp holds
+    // them a lane each, so a captured fire's empty lanes cost no rounds.
     const int first = kOwn ? 0 : static_cast<int>(blockIdx.x * gridDim.y + blockIdx.y);
     const int step = kOwn ? 1 : static_cast<int>(gridDim.x * gridDim.y);
     int h = 0;
     int ranks = 0;
+    // The live requests (rows past 0), the n-th at lane n: its lane, first
+    // row, rows and tiles.
+    int nlive = 0, my_r = 0, my_qs = 0, my_ql = 0, my_tiles = 0;
     if constexpr (kOwn) {
         const int lane = static_cast<int>(threadIdx.x & 31);
         for (int base = 0; base < p.live[1]; base += 32) {
             const int r = p.live[0] + base + lane;
-            const int ql = base + lane < p.live[1] ? p.qo_indptr[r + 1] - p.qo_indptr[r] : 0;
-            ranks = max(ranks, (ql * p.group + kRows - 1) / kRows);
+            const bool in = base + lane < p.live[1];
+            const int qs = in ? p.qo_indptr[r] : 0;
+            const int ql = in ? p.qo_indptr[r + 1] - qs : 0;
+            const int tiles = (ql * p.group + kRows - 1) / kRows;
+            ranks = max(ranks, tiles);
+            const unsigned on = __ballot_sync(0xffffffffu, tiles > 0);
+            const int at = nlive + __popc(on & ((1u << lane) - 1u));
+            if (tiles > 0 && at < 32) {
+                my_r = r;
+                my_qs = qs;
+                my_ql = ql;
+                my_tiles = tiles;
+            }
+            nlive += __popc(on);
         }
         ranks = __reduce_max_sync(0xffffffffu, ranks);
     }
     auto next_work = [&](int& i, Work& x) {
         if constexpr (kOwn) {
-            const int lanes = p.live[1];
+            const bool held = nlive <= 32;
+            const int lanes = held ? nlive : p.live[1];
             const int nb = static_cast<int>(gridDim.x);
             const int b = static_cast<int>(blockIdx.x);
             for (;; ++i) {
@@ -284,10 +301,18 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                 const bool by_head = p.kv_heads > 16;
                 h = by_head ? item / (ranks * lanes) : item % p.kv_heads;
                 const int q = by_head ? item % (ranks * lanes) : item / p.kv_heads;
-                const int r = p.live[0] + q % lanes;
-                const int qs = p.qo_indptr[r];
-                const int ql = p.qo_indptr[r + 1] - qs;
-                const int tiles = (ql * p.group + kRows - 1) / kRows;
+                int r, qs, ql, tiles;
+                if (held) {
+                    r = __shfl_sync(0xffffffffu, my_r, q % lanes);
+                    qs = __shfl_sync(0xffffffffu, my_qs, q % lanes);
+                    ql = __shfl_sync(0xffffffffu, my_ql, q % lanes);
+                    tiles = __shfl_sync(0xffffffffu, my_tiles, q % lanes);
+                } else {
+                    r = p.live[0] + q % lanes;
+                    qs = p.qo_indptr[r];
+                    ql = p.qo_indptr[r + 1] - qs;
+                    tiles = (ql * p.group + kRows - 1) / kRows;
+                }
                 if (q / lanes >= tiles) continue;
                 x.r = r;
                 x.row0 = (tiles - 1 - q / lanes) * kRows;
