@@ -159,6 +159,8 @@ vulkan = ["worker/vulkan"]
 wgpu = ["worker/wgpu"]
 xla = ["worker/xla"]
 profile-fire = ["worker/profile-fire"]
+# Reads peers' kv in place over NIXL (needs NIXL_PREFIX at build).
+nixl = ["worker/nixl"]
 
 [dependencies]
 dirs = "7.0"

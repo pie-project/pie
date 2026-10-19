@@ -172,8 +172,7 @@ pub struct OffloadConfig {
     /// Transfers in flight to any one partner before the next waits.
     #[serde(default = "default_offload_max_outstanding")]
     pub max_outstanding_per_partner: u32,
-    /// How KV pages cross between workers — see [`OffloadTransfer`]. No
-    /// shipped build hosts NIXL, so `nixl` refuses the boot.
+    /// How KV pages cross between workers — see [`OffloadTransfer`].
     #[serde(default)]
     pub transfer: OffloadTransfer,
     /// Where this worker serves other workers' passes (`host:port`); omit to
@@ -220,9 +219,10 @@ fn default_offload_max_outstanding() -> u32 {
 
 /// How KV pages cross between workers.
 ///
-/// No shipped build hosts `Nixl`: it parses but fails the boot at
-/// `link::partner::PartnerLinkManager::new` with a missing-feature error.
-/// `Auto` takes NIXL where available, which today is nowhere.
+/// `Nixl` and `Auto` read a peer's kv in place, device to device, where the
+/// build has the `nixl` feature (built against `NIXL_PREFIX`) and both
+/// workers export kv of one layout; otherwise, and with `Inline`, the pages'
+/// bytes ride the bulk link. A build without the feature refuses `Nixl`.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OffloadTransfer {

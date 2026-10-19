@@ -47,6 +47,7 @@ pub fn hello(worker: WorkerId, engine: &str) -> Hello {
             ranks: 1,
         }),
         identity,
+        kv: super::kv::access(),
     }
 }
 
@@ -170,10 +171,14 @@ impl Peer for PeerServer {
             .ok_or("this worker has no kv store")?;
         let started = Instant::now();
         let bulk = listen().ok_or("this worker serves no bulk link")?;
-        let pages =
-            runtime::offload::prefill::serve(request.tokens, request.from_page, request.home)
-                .await
-                .map_err(|e| format!("{e:#}"))?;
+        let pages = runtime::offload::prefill::serve(
+            request.tokens,
+            request.from_page,
+            request.home,
+            request.in_place,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))?;
         tracing::info!(
             target: "pie::offload",
             pages = pages.count,
@@ -186,7 +191,16 @@ impl Peer for PeerServer {
             class,
             format,
             bulk,
+            held: pages.held.map(|held| worker_api::peer::HeldPages {
+                lease: held.lease,
+                pages: held.pages,
+            }),
         })
+    }
+
+    async fn release(self, _: tarpc::context::Context, lease: u64) -> Result<(), String> {
+        runtime::offload::prefill::release(lease);
+        Ok(())
     }
 }
 
@@ -233,13 +247,38 @@ struct Dialed {
     client: PeerClient,
     /// This worker's bulk-bytes address, for the peer to fetch prefixes from.
     home: Option<String>,
+    /// The key this worker reads the peer's kv in place by, if it can.
+    kv: Option<u64>,
 }
 
 impl runtime::offload::prefill::PrefillPeer for Dialed {
+    fn reads_in_place(&self) -> bool {
+        self.kv.is_some()
+    }
+
+    fn read(&self, remote: Vec<u32>, local: Vec<u32>) -> BoxFuture<'static, Result<()>> {
+        match self.kv {
+            Some(peer) => super::kv::read(peer, remote, local),
+            None => Box::pin(async { bail!("this peer's kv is not read in place") }),
+        }
+    }
+
+    fn release(&self, lease: u64) -> BoxFuture<'static, Result<()>> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .release(tarpc::context::current(), lease)
+                .await
+                .context("the peer link")?
+                .map_err(|why| anyhow::anyhow!("the peer refused the release: {why}"))
+        })
+    }
+
     fn prefill(
         &self,
         tokens: Vec<u32>,
         from_page: u32,
+        in_place: bool,
     ) -> BoxFuture<'static, Result<runtime::offload::prefill::RemotePages>> {
         let client = self.client.clone();
         let home = self.home.clone();
@@ -254,6 +293,7 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
                         tokens,
                         from_page,
                         home,
+                        in_place,
                     },
                 )
                 .await
@@ -265,6 +305,10 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
                 page_tokens: pages.format.page_tokens,
                 count: pages.count as usize,
                 addr: pages.bulk,
+                held: pages.held.map(|held| runtime::offload::prefill::Held {
+                    lease: held.lease,
+                    pages: held.pages,
+                }),
             })
         })
     }
@@ -292,11 +336,25 @@ pub async fn dial(addr: &str, ours: &Hello, listen: Option<String>) -> Result<()
     if page(&theirs) != page(ours) {
         bail!("the peer at {addr} pages its kv differently");
     }
+    // Its kv is read in place where both have an agent and one layout.
+    let kv = match &theirs.kv {
+        Some(access) => super::kv::connect(access).unwrap_or_else(|error| {
+            tracing::warn!(peer = %addr, %error, "the peer's kv is not readable in place");
+            None
+        }),
+        None => None,
+    };
     runtime::offload::prefill::set_peer(Some(Arc::new(Dialed {
         client,
         home: listen,
+        kv,
     })));
-    tracing::info!(peer = %addr, worker = %theirs.worker, "prefilling passes on a peer");
+    tracing::info!(
+        peer = %addr,
+        worker = %theirs.worker,
+        in_place = kv.is_some(),
+        "prefilling passes on a peer"
+    );
     Ok(())
 }
 

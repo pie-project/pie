@@ -3,6 +3,7 @@ pub mod client;
 pub mod control;
 pub mod executor;
 pub mod gateway;
+pub mod kv;
 pub mod partner;
 pub mod peer;
 pub mod pool;

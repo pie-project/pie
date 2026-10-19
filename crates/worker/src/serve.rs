@@ -12,7 +12,7 @@ use crate::embedded::{Embedded, Engine, Summary};
 use crate::link::client;
 use crate::link::control::{self, ControlLink};
 use crate::link::executor::ExecutorServer;
-use crate::link::{gateway, partner, peer, topology};
+use crate::link::{gateway, kv, partner, peer, topology};
 
 pub use crate::link::topology::{Coordinator, TopologyMode, connect};
 
@@ -371,6 +371,14 @@ async fn boot_decode(
 /// may be prefilled on, retrying until one takes them.
 async fn start_peers(user_cfg: &config::Config) -> Result<()> {
     let engine = format!("{:?}", user_cfg.model.engine.kind).to_lowercase();
+    // Its kv agent first: the hello says whether peers can read it in place.
+    if let Some(handle) = runtime::offload::home_kv_handle() {
+        let name = match &user_cfg.offload.listen {
+            Some(listen) => peer::bulk_addr(listen)?,
+            None => format!("pie-worker-{}", std::process::id()),
+        };
+        kv::open(&name, handle)?;
+    }
     let hello = peer::hello(WorkerId(0), &engine);
     if let Some(listen) = &user_cfg.offload.listen {
         peer::serve(listen, hello.clone()).await?;
@@ -415,6 +423,9 @@ fn build_partner_bootstrap(
             0
         },
     );
+    if let Some(kv_handle) = &metadata.kv_handle {
+        runtime::offload::set_home_kv_handle(kv_handle.clone());
+    }
     if !user_cfg.offload.enabled {
         return None;
     }
@@ -424,7 +435,6 @@ fn build_partner_bootstrap(
         );
         return None;
     };
-    runtime::offload::set_home_kv_handle(kv_handle.clone());
     Some(partner::PartnerBootstrap {
         full_identity: metadata.full_identity,
         encode_identity: metadata.encode_identity,

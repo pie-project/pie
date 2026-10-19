@@ -51,11 +51,46 @@ pub struct RemotePages {
     pub page_tokens: u32,
     pub count: usize,
     pub addr: String,
+    /// The pages held on the executor's device for the asker to read in
+    /// place, when it asked to and they were there to hold.
+    pub held: Option<Held>,
+}
+
+/// An executor's pages held for one read: their device page ids, in run
+/// order, until the asker releases the lease.
+#[derive(Debug, Clone)]
+pub struct Held {
+    pub lease: u64,
+    pub pages: Vec<u32>,
 }
 
 /// The worker a pass is offloaded to: the link layer's.
 pub trait PrefillPeer: Send + Sync {
-    fn prefill(&self, tokens: Vec<u32>, from_page: u32) -> BoxFuture<'static, Result<RemotePages>>;
+    /// Prefills on the peer; with `in_place` the pages are held there for
+    /// [`PrefillPeer::read`].
+    fn prefill(
+        &self,
+        tokens: Vec<u32>,
+        from_page: u32,
+        in_place: bool,
+    ) -> BoxFuture<'static, Result<RemotePages>>;
+
+    /// Whether this worker can read the peer's kv in place.
+    fn reads_in_place(&self) -> bool {
+        false
+    }
+
+    /// Reads the peer's device pages `remote` into this worker's `local`.
+    fn read(&self, remote: Vec<u32>, local: Vec<u32>) -> BoxFuture<'static, Result<()>> {
+        let _ = (remote, local);
+        Box::pin(async { Err(anyhow!("this peer's kv is not read in place")) })
+    }
+
+    /// Lets the peer give the pages of a lease back.
+    fn release(&self, lease: u64) -> BoxFuture<'static, Result<()>> {
+        let _ = lease;
+        Box::pin(async { Ok(()) })
+    }
 }
 
 static PEER: RwLock<Option<Arc<dyn PrefillPeer>>> = RwLock::new(None);
@@ -144,7 +179,7 @@ pub(crate) async fn before_pass(
         return;
     };
     let started = std::time::Instant::now();
-    match take(stores, engine, peer, pass).await {
+    match take(pid, stores, engine, peer, pass).await {
         Ok(pages) => {
             tracing::info!(
                 target: "pie::offload",
@@ -299,6 +334,7 @@ async fn fetch_held(
 }
 
 async fn take(
+    pid: crate::inferlet::process::ProcessId,
     stores: &Stores,
     engine: usize,
     peer: Arc<dyn PrefillPeer>,
@@ -306,7 +342,11 @@ async fn take(
 ) -> Result<usize> {
     let t0 = std::time::Instant::now();
     let pages = peer
-        .prefill(pass.tokens.clone(), u32::try_from(pass.have)?)
+        .prefill(
+            pass.tokens.clone(),
+            u32::try_from(pass.have)?,
+            peer.reads_in_place(),
+        )
         .await?;
     let t_rpc = t0.elapsed();
     let page = u64::from(stores.kv_page_size);
@@ -323,8 +363,23 @@ async fn take(
     if pages.count != want {
         bail!("the peer prefilled {} pages of {want}", pages.count);
     }
-    let remote = super::directory::remote().ok_or_else(|| anyhow!("no bulk link here"))?;
     let have = pass.at(pass.have);
+    if let Some(held) = pages.held {
+        let lease = held.lease;
+        let read = read_in_place(pid, stores, &*peer, &pass, have, held).await;
+        if let Err(error) = peer.release(lease).await {
+            tracing::warn!(target: "pie::offload", %error, lease, "a peer's lease was not released");
+        }
+        read?;
+        tracing::debug!(
+            target: "pie::offload",
+            rpc_ms = t_rpc.as_millis() as u64,
+            read_ms = (t0.elapsed() - t_rpc).as_millis() as u64,
+            "read a peer's pages in place"
+        );
+        return Ok(want);
+    }
+    let remote = super::directory::remote().ok_or_else(|| anyhow!("no bulk link here"))?;
     let bytes = remote
         .fetch(pages.addr.clone(), pass.keys.clone(), have as u32)
         .await?;
@@ -348,6 +403,58 @@ async fn take(
         "took a peer's pages"
     );
     Ok(n)
+}
+
+/// Reads a peer's held pages straight into device pages this worker
+/// reserves for `pid` through the planner, and files them as one cache
+/// entry, device-resident, as [`land`] files host slots.
+async fn read_in_place(
+    pid: crate::inferlet::process::ProcessId,
+    stores: &Stores,
+    peer: &dyn PrefillPeer,
+    pass: &Pass,
+    have: usize,
+    held: Held,
+) -> Result<()> {
+    let n = held.pages.len();
+    let planner = crate::planner::planner().ok_or_else(|| anyhow!("no kv planner here"))?;
+    let demand = crate::planner::Demand {
+        kv_pages: u32::try_from(n)?,
+        ..crate::planner::Demand::default()
+    };
+    let crate::planner::Acquired::Granted(mut grant) = planner
+        .acquire(pid, pid, demand)
+        .await
+        .map_err(|error| anyhow!("reserving pages to read a peer's into: {error}"))?
+    else {
+        bail!("the planner asked the pass to yield before its pages were read");
+    };
+    let local: Vec<_> = grant.lend_kv().drain(..n).collect();
+    drop(grant);
+    if let Err(error) = peer
+        .read(held.pages, local.iter().map(|page| page.0).collect())
+        .await
+    {
+        with_kv_lock(&stores.kv, "offload-read", |kv| {
+            kv.release_device_reservation(local)
+        });
+        return Err(error);
+    }
+    let filed = with_kv_lock(&stores.kv, "offload-read", |kv| {
+        kv.import_cached_at(
+            &pass.keys[..have],
+            pass.token_hashes[have..].to_vec(),
+            pass.keys[have..].to_vec(),
+            local
+                .into_iter()
+                .map(crate::store::kv::page_table::KvPageBacking::Resident)
+                .collect(),
+        )
+    });
+    if !filed {
+        bail!("the prefix the pages extend went while they were read");
+    }
+    Ok(())
 }
 
 /// Lands pages another worker sealed in this worker's host tier, as one
@@ -439,7 +546,80 @@ fn keyed_pages(stores: &Stores, tokens: &[u32]) -> (Vec<Vec<Option<Hash256>>>, V
 /// run fills completely. Pages before `from_page` this worker holds nowhere
 /// are first fetched from `home`, which holds them, so only the rest is
 /// computed.
-pub async fn serve(tokens: Vec<u32>, from_page: u32, home: Option<String>) -> Result<RemotePages> {
+/// How long an executor holds pages for an asker that never releases them
+/// (it died, or its link did).
+const LEASE_TTL: Duration = Duration::from_secs(60);
+
+struct Lease {
+    kv: Arc<parking_lot::Mutex<crate::store::kv::KvStore>>,
+    pin: crate::store::kv::ReaderPin,
+    since: std::time::Instant,
+}
+
+/// Pages this executor holds for askers to read in place, by lease.
+static LEASES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, Lease>>> =
+    std::sync::LazyLock::new(Default::default);
+
+static NEXT_LEASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Gives back the pages lease `lease` held; a lease already gone is no fault.
+pub fn release(lease: u64) {
+    let held = LEASES.lock().unwrap().remove(&lease);
+    if let Some(held) = held {
+        held.kv.lock().release_reader(held.pin);
+    }
+}
+
+/// Gives back what askers held past [`LEASE_TTL`].
+fn expire_leases() {
+    let stale: Vec<Lease> = {
+        let mut leases = LEASES.lock().unwrap();
+        let old: Vec<u64> = leases
+            .iter()
+            .filter(|(_, lease)| lease.since.elapsed() >= LEASE_TTL)
+            .map(|(&id, _)| id)
+            .collect();
+        old.into_iter()
+            .filter_map(|id| leases.remove(&id))
+            .collect()
+    };
+    for lease in stale {
+        tracing::warn!(target: "pie::offload", "an asker never released its pages; given back");
+        lease.kv.lock().release_reader(lease.pin);
+    }
+}
+
+/// Holds `keys[from..]`, device-resident, for an asker to read in place;
+/// `None` when some of them are not on the device.
+fn hold(stores: &Stores, keys: &[Hash256], from: usize) -> Option<Held> {
+    let (pin, pages) = with_kv_lock(&stores.kv, "offload-hold", |kv| {
+        let run = kv.cached_run_any_tier(keys);
+        (run.len() == keys.len() && from < run.len())
+            .then(|| kv.pin_resident(&run[from..]))
+            .flatten()
+    })?;
+    let lease = NEXT_LEASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    LEASES.lock().unwrap().insert(
+        lease,
+        Lease {
+            kv: stores.kv.clone(),
+            pin,
+            since: std::time::Instant::now(),
+        },
+    );
+    Some(Held {
+        lease,
+        pages: pages.into_iter().map(|page| page.0).collect(),
+    })
+}
+
+pub async fn serve(
+    tokens: Vec<u32>,
+    from_page: u32,
+    home: Option<String>,
+    in_place: bool,
+) -> Result<RemotePages> {
+    expire_leases();
     let stores = crate::store::registry::try_get(0, 0)
         .ok_or_else(|| anyhow!("no engine serves a model here"))?;
     let engine = 0usize;
@@ -453,6 +633,7 @@ pub async fn serve(tokens: Vec<u32>, from_page: u32, home: Option<String>) -> Re
             page_tokens: stores.kv_page_size,
             count: 0,
             addr: String::new(),
+            held: None,
         });
     }
     let t0 = std::time::Instant::now();
@@ -524,6 +705,9 @@ pub async fn serve(tokens: Vec<u32>, from_page: u32, home: Option<String>) -> Re
         page_tokens: stores.kv_page_size,
         count: (pages - from) as usize,
         addr: String::new(),
+        held: in_place
+            .then(|| hold(&stores, &keys, from as usize))
+            .flatten(),
     })
 }
 
