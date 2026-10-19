@@ -164,19 +164,38 @@ __global__ void act_quant_nvfp4(
         float v[16];
         const float amax = load_block16(x + static_cast<long long>(r) * k + b * 16, v);
         // The routes' globals are one (load lays the experts' largest), so
-        // the block's codes are quantized once and land at each route.
-        // A route's global divides once a scale, its block quantized once a
-        // global.
+        // the block's codes are quantized once a global (its divide once a
+        // scale) and land at each route. Where a warp holds whole rows (and
+        // a row's routes fit it), lane j reads route j's row and scale once
+        // for the warp.
+        const int lane = threadIdx.x & 31;
+        const bool shared_routes = blocks % 32 == 0 && div <= 32;
+        int my_o = -1;
+        float my_scale = 0.f;
+        if (shared_routes && lane < div) {
+            my_o = pos[r * div + lane];
+            const int e = routes != nullptr ? routes[r * div + lane] : 0;
+            if (e < 0) my_o = -1;
+            if (my_o >= 0) my_scale = input_scales[e];
+        }
         float last_scale = -1.f;
         uint2 w = make_uint2(0u, 0u);
         u8 sf_code = 0;
         for (int j = 0; j < div; ++j) {
-            const int route = r * div + j;
-            const int o = pos[route];
-            if (o < 0) continue;
-            const int e = routes != nullptr ? routes[route] : 0;
-            if (e < 0) continue;
-            const float scale = input_scales[e];
+            int o;
+            float scale;
+            if (shared_routes) {
+                o = __shfl_sync(0xffffffffu, my_o, j);
+                scale = __shfl_sync(0xffffffffu, my_scale, j);
+                if (o < 0) continue;
+            } else {
+                const int route = r * div + j;
+                o = pos[route];
+                if (o < 0) continue;
+                const int e = routes != nullptr ? routes[route] : 0;
+                if (e < 0) continue;
+                scale = input_scales[e];
+            }
             if (scale != last_scale) {
                 last_scale = scale;
                 sf_code = nvfp4_block16(v, amax, __fdiv_rn(1.f, scale), w);
