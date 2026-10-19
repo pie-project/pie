@@ -20,7 +20,7 @@ sdpa.merge_warp = true
 moe.mxfp4_mma_from = 16
 moe.mxfp4_mma_until = 16777216
 sdpa.dsv4_replay = true
-ssm = ["gdn_fused_scan", "conv_vec4", "gdn_out_bf16"]
+ssm = ["gdn_fused_scan", "conv_vec4", "gdn_out_bf16", "kda_chunked", "kda_step_fused"]
 
 # A prefill's fire on four buckets a doubling from 256 rows (its GEMMs run
 # its bucket's rows), and a bucket between powers of two below.
@@ -42,6 +42,8 @@ measured = [
   "kernel.ssm.gdn_fused_scan",
   "kernel.ssm.conv_vec4",
   "kernel.ssm.gdn_out_bf16",
+  "kernel.ssm.kda_chunked",
+  "kernel.ssm.kda_step_fused",
   "engine.prefill_lattice_from",
   "engine.lattice_steps",
 ]
