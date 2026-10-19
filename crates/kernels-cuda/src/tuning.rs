@@ -186,6 +186,19 @@ pub struct GemmBiasEpilogue;
 #[decision(id = "kernel.moe.mxfp4_mma_from", constant(range(1..=65_536)), default = 64, tune = search)]
 pub struct MoeMxfp4MmaFrom(pub u32);
 
+/// The fewest routes a routed bf16 select runs on the graph-safe grouped
+/// mma.sync kernel with (`moe_select_bf16_mma`), rather than the per-route
+/// GEMV. Bf16 experts have no tcgen05 or cuBLAS grouped path under a
+/// captured graph, so this is their only fast route. 0 never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.bf16_mma_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeBf16MmaFrom(pub u32);
+
+/// The most routes the bf16 grouped mma.sync kernel takes (0 never).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.bf16_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeBf16MmaUntil(pub u32);
+
 /// Whether the register-dequant mxfp4 select turns its codes into f16 with
 /// the e2m1 converts of the arch-specific Blackwells (`linear/moe_w4_cvt.cuh`)
 /// rather than bf16 by integer ops. Off but where a chip's profile says.
@@ -634,6 +647,8 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
+        .add::<MoeBf16MmaFrom>()
+        .add::<MoeBf16MmaUntil>()
         .add::<MoeMxfp4Cvt>()
         .add::<MoeMxfp4CvtKsplitUntil>()
         .add::<GemmFp8ODown>()
@@ -748,6 +763,8 @@ tuning! {
     merge_warp: bool = false, on SdpaMergeWarp;
     mxfp4_mma_until: u32 = 0, get MoeMxfp4MmaUntil;
     mxfp4_mma_from: u32 = 64, get MoeMxfp4MmaFrom;
+    bf16_mma_from: u32 = 0, get MoeBf16MmaFrom;
+    bf16_mma_until: u32 = 0, get MoeBf16MmaUntil;
     mxfp4_cvt: bool = false, on MoeMxfp4Cvt;
     mxfp4_cvt_ksplit_until: u32 = 0, get MoeMxfp4CvtKsplitUntil;
     fp8_o_down: bool = false, on GemmFp8ODown;

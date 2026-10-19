@@ -210,6 +210,108 @@ __device__ __forceinline__ void w4_land(const float (&acc)[kTiles][kNb][4], Fact
 
 }  // namespace w4mma
 
+// A routed bf16 select at decode widths: the bf16 analog of
+// `moe_select_mxfp4_mma`. Each expert's weight rows stream once into
+// registers and meet the expert's few routes on mma.sync, no shared-memory
+// round trip. The routing (order/offsets/work) and the epilogue
+// (`w4mma::w4_land`) are shared with the mxfp4 kernel. For
+// `mma.m16n8k16.row.col` both operands load the same way: lane (g=lane>>2,
+// c=lane&3) owns K-pair c of row/token g and g+8, one `(&uint4.x)[c]`.
+template <int kNb, int kGlu>
+__global__ void __launch_bounds__(128) moe_select_bf16_mma(
+    const bf16* __restrict__ act,
+    const i32* __restrict__ order,
+    const i32* __restrict__ offsets,
+    const i32* __restrict__ work,
+    const bf16* __restrict__ weight,
+    const bf16* __restrict__ bias,
+    bf16* __restrict__ out,
+    int act_div, int n, int k, int num_experts, int inter,
+    float limit, float galpha)
+{
+    constexpr int kTiles = 2;
+    constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
+    constexpr int kRowsCta = 4 * kRowsWarp;
+    constexpr int kSlice = 8 * kNb;
+
+    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
+    const int item = work[blockIdx.x];
+    const int expert = item >> 16;
+    const int slice = item & 0xFFFF;
+    const int begin = offsets[expert] + slice * kSlice;
+    const int count = min(offsets[expert + 1] - begin, kSlice);
+    if (count <= 0) return;
+
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int g = lane >> 2;
+    const int c = lane & 3;
+    const int row_base = static_cast<int>(blockIdx.y) * kRowsCta + warp * kRowsWarp;
+    const int span = kGlu != 0 ? inter : n;
+    auto tile_row = [&](int t) { return kGlu != 0 ? row_base + t * inter : row_base + 16 * t; };
+    if (row_base >= span) return;
+
+    const bf16* w_e = weight + static_cast<long long>(expert) * n * k;
+    const bf16* wrow[kTiles][2];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int r = min(tile_row(t) + 8 * h + g, n - 1);
+            wrow[t][h] = w_e + static_cast<long long>(r) * k;
+        }
+    const bf16* xrow[kNb];
+#pragma unroll
+    for (int b = 0; b < kNb; ++b) {
+        const int tok = 8 * b + g;
+        xrow[b] = tok < count ? act + static_cast<long long>(order[begin + tok] / act_div) * k
+                              : nullptr;
+    }
+
+    float acc[kTiles][kNb][4];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int b = 0; b < kNb; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
+
+    for (int k0 = 0; k0 < k; k0 += 16) {
+        unsigned b0[kNb], b1[kNb];
+#pragma unroll
+        for (int b = 0; b < kNb; ++b) {
+            if (xrow[b] != nullptr) {
+                const uint4 lo = w4mma::ld_act(xrow[b] + k0);
+                const uint4 hi = w4mma::ld_act(xrow[b] + k0 + 8);
+                b0[b] = (&lo.x)[c];
+                b1[b] = (&hi.x)[c];
+            } else {
+                b0[b] = 0u;
+                b1[b] = 0u;
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t) {
+            const uint4 wl0 = w4mma::ld_act(wrow[t][0] + k0);
+            const uint4 wh0 = w4mma::ld_act(wrow[t][0] + k0 + 8);
+            const uint4 wl1 = w4mma::ld_act(wrow[t][1] + k0);
+            const uint4 wh1 = w4mma::ld_act(wrow[t][1] + k0 + 8);
+            const unsigned a0 = (&wl0.x)[c];
+            const unsigned a1 = (&wl1.x)[c];
+            const unsigned a2 = (&wh0.x)[c];
+            const unsigned a3 = (&wh1.x)[c];
+#pragma unroll
+            for (int b = 0; b < kNb; ++b) w4mma::mma(acc[t][b], a0, a1, a2, a3, b0[b], b1[b]);
+        }
+    }
+
+    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    auto factor = [&](int) { return 1.f; };
+    w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, inter,
+                                      row_base, g, c, limit, galpha);
+}
+
+
 /// `y[route] = x[route / act_div] . W[expert]^T (+ bias[expert])` for the
 /// routes `order` lists by expert, `work` naming (expert, slice of
 /// `slice_routes` routes) per CTA (from `moe_route_order`). A CTA covers 128

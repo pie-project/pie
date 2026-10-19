@@ -182,9 +182,15 @@ fn the_routed_selects_answer_the_routed_dot() {
     #[rustfmt::skip]
     let mma = Tuning { mxfp4_mma_until: 65_536, mxfp4_mma_from: 1, ..d };
     #[rustfmt::skip]
+    let bf16mma = Tuning { moe_grouped: false, bf16_mma_from: 1, bf16_mma_until: 65_536, ..d };
+    #[rustfmt::skip]
     let cvt = Tuning { mxfp4_cvt: true, mxfp4_a8_until: 65_536, mxfp4_cvt_ksplit_until: 6, ..mma };
     #[rustfmt::skip]
-    let nv_mma = Tuning { nvfp4_mma_until: 65_536, mxfp4_cvt: true, ..TC5 };
+    let nv_mma = if supported() {
+        Tuning { nvfp4_mma_until: 65_536, mxfp4_cvt: true, ..TC5 }
+    } else {
+        Tuning { nvfp4_mma_until: 65_536, ..d }
+    };
     let (sw, f, t) = (Some(Glu::Swiglu), false, true);
     #[rustfmt::skip]
     let alpha = Some(Glu::SwigluClampAlpha { limit: 1e4, alpha: 1.702 });
@@ -197,12 +203,17 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Bf16, d, [8, 48, 2, 96, 64], f, None, 0),
         (K::Bf16, TC5, [16, 70, 4, 192, 256], t, None, 0),
         (K::Bf16, TC5, [16, 48, 4, 128, 256], t, sw, 0),
+        // bf16 on the graph-safe grouped mma kernel: nb 8/4/1, by token and route.
+        (K::Bf16, bf16mma, [8, 64, 8, 128, 256], t, None, 0),
+        (K::Bf16, bf16mma, [8, 64, 8, 128, 256], f, None, 0),
+        (K::Bf16, bf16mma, [16, 40, 8, 256, 128], f, None, 0),
+        (K::Bf16, bf16mma, [8, 12, 4, 96, 512], t, None, 0),
         // Affine u4: per route, grouped, tcgen05.
         (K::Affine, d, [16, 1, 8, 1408, 2816], t, None, 0),
         (K::Affine, d, [16, 3, 8, 704, 704], f, None, 0),
         (K::Affine, TC5, [16, 40, 8, 256, 704], f, None, 0),
         // MXFP4: per route, grouped WMMA and fp32, tcgen05; the register-
-        // dequant kernel at one, two and four 8-route blocks, its GLU
+        // dequant kernel at one, two, four and eight 8-route blocks, its GLU
         // keeping the order for the select after; the e2m1 converts (a K
         // split at one token, scales and rows past f16's range); B200's.
         (K::Mx, d, [8, 3, 4, 96, 2240], t, None, 0),
@@ -213,6 +224,7 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Mx, mma, [8, 12, 4, 384, 2880], t, None, 0),
         (K::Mx, mma, [8, 100, 4, 384, 2880], f, None, 0),
         (K::MxBias, mma, [8, 16, 4, 192, 2880], t, alpha, 8),
+        (K::MxBias, mma, [8, 100, 4, 192, 2880], t, alpha, 0),
         (K::Mx, cvt, [8, 1, 4, 200, 2880], t, None, 0),
         (K::MxBias, cvt, [8, 40, 4, 576, 2880], t, None, 0),
         (K::MxBias, cvt, [8, 3, 4, 576, 2880], f, None, 2),
@@ -226,7 +238,10 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Nv, TC5, [16, 48, 10, 128, 640], t, None, 0),
         (K::Nv, nv_mma, [16, 2, 10, 256, 640], f, None, 0),
         (K::Nv, nv_mma, [16, 48, 10, 320, 2560], t, sw, 0),
+        (K::Nv, nv_mma, [8, 64, 8, 256, 640], t, sw, 0),
     ];
+    // Off tcgen05 (Hopper) the arms its tunings name do not take the fire.
+    cases.retain(|case| supported() || !(case.1.moe_tc5 || case.1.mxfp4_cvt));
     if supported() {
         // The atom-laid select on the e2m1 converts, keeping its order; the
         // quantizing selects masked (a few routes) and contiguous, by token

@@ -464,8 +464,104 @@ pub fn matmul_select(
         if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
             return select_grouped(ctx, OP, x, bank, routes, y, count);
         }
+        // Bf16 experts under a captured graph have no grouped path (tcgen05 is
+        // Blackwell's, cuBLAS is not graph-capturable); the per-route GEMV
+        // re-reads each expert once a route. The grouped mma.sync kernel reads
+        // it once a slice.
+        if bf16_mma_spans(ctx, fan.route_count)
+            && x.dtype == Dtype::Bf16
+            && bank.dtype == Dtype::Bf16
+            && !experts.streams()
+            && x.width % 16 == 0
+            && y.width % 8 == 0
+            && bank.rows >= 1
+            && u64::from(bank.width) == u64::from(x.width) * u64::from(y.width)
+        {
+            return select_bf16_mma(ctx, OP, x, bank, routes, y, &fan, bank.rows);
+        }
     }
     select_gemv(ctx, OP, x, bank, routes, y, experts)
+}
+
+/// Whether the graph-safe bf16 grouped mma.sync kernel takes a fire of
+/// `routes` routes: `kernel.moe.bf16_mma_from ..= kernel.moe.bf16_mma_until`.
+#[cfg(feature = "cuda")]
+fn bf16_mma_spans(ctx: &Ctx, routes: u32) -> bool {
+    let t = ctx.tuning();
+    t.bf16_mma_until > 0 && t.bf16_mma_from <= routes && routes <= t.bf16_mma_until
+}
+
+/// `y[route] = x[route or its token] . W[routes[route]]^T` on the grouped
+/// bf16 mma.sync kernel: routes laid out by expert on-device (graph-safe),
+/// each expert's weight rows read once a slice.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn select_bf16_mma(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    fan: &Selected,
+    experts: u32,
+) -> Result<(), Error> {
+    const THREADS: u32 = 128;
+    const COLS: u32 = 128;
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let k = stated(op, x.width)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let per = fan.route_count.div_ceil(experts.max(1));
+    let nb: u32 = match per {
+        0..=8 => 1,
+        9..=16 => 2,
+        17..=40 => 4,
+        _ => 8,
+    };
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
+        ctx,
+        op,
+        routes,
+        fan,
+        experts,
+        8 * nb,
+        true,
+        if KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    let grid = [work_cap, y.width.div_ceil(COLS), 1];
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/moe_w4.cuh",
+            symbol(&format!("::pie::linear::moe_select_bf16_mma<{nb}, 0>")),
+        )
+        .apply(Launch::grid(grid, [THREADS, 1, 1])),
+        &[
+            x.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            bank.arg(),
+            ArgValue::ABSENT,
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+            n.arg(),
+            0.0f32.arg(),
+            1.0f32.arg(),
+        ],
+    )
 }
 
 /// Says, once a process, that a select the tcgen05 GEMM was to take fell
@@ -1978,13 +2074,16 @@ fn select_mxfp4_mma(
     let cols = if glu.is_some() { 64 } else { 128 };
     let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
     let experts = codes.rows.clamp(1, EXPERT_CAP);
-    // An expert's slice is 8, 16 or 32 routes: as few 8-route blocks as the
-    // average expert fills.
+    // An expert's slice is 8, 16, 32 or (on the bf16 path) 64 routes: as
+    // few 8-route blocks as the average expert fills, each slice's codes
+    // read and dequantized once for all of its routes.
     let per = fan.route_count.div_ceil(experts);
     let nb: u32 = match per {
         0..=4 => 1,
         5..=12 => 2,
-        _ => 4,
+        13..=40 => 4,
+        _ if cvt => 4,
+        _ => 8,
     };
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;

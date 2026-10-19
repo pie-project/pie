@@ -36,3 +36,7 @@ moe.mxfp4_mma_from = 28
 moe.mxfp4_mma_until = 1024
 moe.nvfp4_mma_from = 32
 moe.nvfp4_mma_until = 8192
+# Bf16 routed experts (Hy4, GLM-5.3-Flash served bf16): the graph-safe grouped
+# mma.sync kernel from 16 routes, where the per-route GEMV re-reads each expert.
+moe.bf16_mma_from = 16
+moe.bf16_mma_until = 65536
