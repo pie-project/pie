@@ -484,9 +484,11 @@ pub struct ModelConfig {
     /// How many pinned host bytes a preempted process's kv pages and
     /// recurrent-state slots may be suspended into (`"32GiB"`), shared by
     /// the tensor-parallel ranks: one rs row per device slot, then kv pages.
-    /// Omit for every seat at full context, and at least one device pool,
-    /// up to half the host memory the load leaves free (so workers sharing
-    /// a host each find room); a stated budget is capped by all of it. The
+    /// Omit for every seat at full context, at least one device pool and at
+    /// most four (cuda), up to half the host memory the load leaves free (so
+    /// workers sharing a host each find room); a stated budget is capped by
+    /// all of it. Pinned memory is slow to give back: a worker that dies
+    /// holds its host's other GPU processes ~0.2 s a GiB of it. The
     /// container's cgroup limit (v1 or v2) counts as the host's. pie cannot
     /// compute kv again, so this is where memory contention goes: it cannot
     /// be turned off.
