@@ -42,7 +42,7 @@ pub fn build_without_engine(
         tokenizer_path: artifact.to_path_buf(),
         metadata,
         engines: Vec::new(),
-        scheduler: scheduler(&user.runtime),
+        scheduler: scheduler(&user.runtime, user.model.engine.kind),
     };
     runtime_config(user, home, builtins, model)
 }
@@ -108,11 +108,14 @@ fn runtime_config(
     })
 }
 
-fn scheduler(runtime: &config::RuntimeConfig) -> runtime::bootstrap::SchedulerConfig {
+fn scheduler(
+    runtime: &config::RuntimeConfig,
+    engine: config::EngineKind,
+) -> runtime::bootstrap::SchedulerConfig {
     runtime::bootstrap::SchedulerConfig {
         submit_deadline_us: runtime.submit_deadline.as_micros(),
         silence_timeout_secs: runtime.silence_timeout.as_secs(),
-        frame_size: runtime.frame_size,
+        frame_size: runtime.frame_size(engine),
         frame_dispatch_depth: runtime.frame_dispatch_depth,
     }
 }
@@ -195,6 +198,6 @@ fn build_model(
         tokenizer_path,
         metadata,
         engines,
-        scheduler: scheduler(runtime),
+        scheduler: scheduler(runtime, m.engine.kind),
     })
 }

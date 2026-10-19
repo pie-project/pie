@@ -72,7 +72,7 @@ const TAIL: &str = r#"
 # carries the reasoning.
 # submit_deadline          = "50ms"
 # silence_timeout          = "30s"
-# frame_size               = 2     # guest contract: the submit depth is
+# frame_size               = 1     # guest contract (omit: cuda_native 1, others 2); the submit depth is
 # frame_dispatch_depth     = 2     # derived from it, not a key of its own
 # max_concurrent_processes = 64    # omit: from the engine's max_forward_requests
 # policy                   = "noop"  # a PLEX worker policy: built-in name or .wasm path

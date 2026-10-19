@@ -103,7 +103,7 @@ impl Settings {
         config.server.worker_threads = 2;
         config.server.verbose = self.verbose;
         config.server.max_upload = ByteSize::from_mib(256);
-        config.runtime.frame_size = self.frame_size;
+        config.runtime.frame_size = Some(self.frame_size);
         config.runtime.frame_dispatch_depth = self.frame_dispatch_depth;
         config.runtime.max_concurrent_processes = self.max_concurrent_processes;
         let sandbox = &mut config.sandbox;

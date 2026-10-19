@@ -346,7 +346,7 @@ pub async fn run(global: &crate::args::GlobalArgs, args: TuneArgs) -> Result<cra
 
     let (controller, gateway, worker) = worker::standalone::derive_standalone(&content)?;
     let baseline = Knobs {
-        frame_size: worker.runtime.frame_size as usize,
+        frame_size: worker.runtime.frame_size(worker.model.engine.kind) as usize,
         dispatch_depth: worker.runtime.frame_dispatch_depth as usize,
     };
     let (plan, skipped) = plan(baseline, args.budget);

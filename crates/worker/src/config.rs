@@ -881,8 +881,9 @@ pub struct RuntimeConfig {
     /// Waves per frame (*k*): how many token steps the wait-all quorum admits
     /// before it runs. A deployment constant, fixed at runtime start like the
     /// KV page size. Bounded above by the CUDA engine — see [`Self::validate`].
-    #[serde(default = "default_frame_size")]
-    pub frame_size: u32,
+    /// Omit for the engine's own ([`EngineKind::frame_size`]).
+    #[serde(default)]
+    pub frame_size: Option<u32>,
     /// Frames the runtime keeps posted to the engine but not yet retired: the
     /// dispatch loop's enqueue horizon, keeping the GPU from idling between
     /// frames. Bounded jointly with `frame_size` — see [`Self::validate`].
@@ -903,7 +904,7 @@ impl Default for RuntimeConfig {
         Self {
             submit_deadline: default_submit_deadline(),
             silence_timeout: default_silence_timeout(),
-            frame_size: default_frame_size(),
+            frame_size: None,
             frame_dispatch_depth: default_frame_dispatch_depth(),
             max_concurrent_processes: None,
             policy: None,
@@ -912,6 +913,12 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Waves per frame: the stated count, else the engine's.
+    #[must_use]
+    pub fn frame_size(&self, engine: EngineKind) -> u32 {
+        self.frame_size.unwrap_or_else(|| engine.frame_size())
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             self.submit_deadline.as_micros() > 0,
@@ -926,19 +933,20 @@ impl RuntimeConfig {
             "runtime.silence_timeout must not be shorter than submit_deadline: \
              a kill that lands before the leash would fail guests the leash exists to spare"
         );
-        ensure!(self.frame_size >= 1, "runtime.frame_size must be >= 1");
+        let frame_size = self.frame_size.unwrap_or(1);
+        ensure!(frame_size >= 1, "runtime.frame_size must be >= 1");
         ensure!(
             self.frame_dispatch_depth >= 1,
             "runtime.frame_dispatch_depth must be >= 1"
         );
         ensure!(
-            self.frame_size <= u32::from(Runahead::STEPS_MAX),
+            frame_size <= u32::from(Runahead::STEPS_MAX),
             "runtime.frame_size must be at most {} (got {}): it is `k` in the engine's \
              staging formula `frames_in_flight * k + 1`, and the frame scheduler was \
              built and measured around that bound \
              (`engine::runahead::Runahead::STEPS_MAX`)",
             Runahead::STEPS_MAX,
-            self.frame_size
+            frame_size
         );
         ensure!(
             self.frame_dispatch_depth <= u32::from(Runahead::MAX_FRAMES),
@@ -963,10 +971,6 @@ fn default_submit_deadline() -> Duration {
 
 fn default_silence_timeout() -> Duration {
     Duration::from_secs(30)
-}
-
-fn default_frame_size() -> u32 {
-    2
 }
 
 fn default_frame_dispatch_depth() -> u32 {
@@ -1086,6 +1090,18 @@ impl EngineKind {
         match self {
             EngineKind::CudaNative => 0.95,
             _ => engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        }
+    }
+
+    /// Waves per frame when `[runtime] frame_size` is not stated. A prompt
+    /// joins at a frame's edge, so CUDA runs one: on an agent trace (14B,
+    /// L40S) its TTFT p50 falls from ~470 to ~340 ms for 1-4% of decode
+    /// throughput. The other engines keep two.
+    #[must_use]
+    pub fn frame_size(self) -> u32 {
+        match self {
+            EngineKind::CudaNative => 1,
+            _ => 2,
         }
     }
 
