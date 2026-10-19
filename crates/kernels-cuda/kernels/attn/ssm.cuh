@@ -4273,12 +4273,41 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
 // `v_new^T = (v^T - S^T k_e^T) (T diag(beta))^T` and
 // `out^T = S^T q_g^T + v_new^T P^T`, and
 // `v_new^T` is the A operand of the fold `S^T = S^T diag(exp(G_L)) +
-// v_new^T k_g`, so a warp never waits on another. The operands stream in
-// two chunks ahead.
+// v_new^T k_g`, so a warp waits on the others only to refill a stage. The
+// operands stream in two chunks ahead, each stage with a barrier its loads
+// complete and one its four warps release.
 constexpr int KDA16_BV = 64;
 constexpr int KDA16_LDV = KDA16_BV + 8;
 constexpr int KDA16_STAGE =
     3 * KDA_CH * GDN_LD * 2 + KDA_CH * KDA16_LDV * 2 + 2 * KDA_CH * KDA16_LDT * 2 + 128 * 4;
+
+__device__ __forceinline__ void kda_bar_init(unsigned long long* bar, unsigned count) {
+    asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(static_cast<unsigned>(__cvta_generic_to_shared(bar))),
+                 "r"(count));
+}
+__device__ __forceinline__ void kda_bar_arrive(unsigned long long* bar) {
+    asm volatile("mbarrier.arrive.shared.b64 _, [%0];" ::"r"(static_cast<unsigned>(__cvta_generic_to_shared(bar)))
+                 : "memory");
+}
+// One arrival once this thread's `cp.async`s land.
+__device__ __forceinline__ void kda_bar_arrive_cp(unsigned long long* bar) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" ::"r"(
+                     static_cast<unsigned>(__cvta_generic_to_shared(bar)))
+                 : "memory");
+}
+__device__ __forceinline__ void kda_bar_wait(unsigned long long* bar, unsigned parity) {
+    const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(bar));
+    unsigned done = 0;
+    while (!done) {
+        asm volatile(
+            "{\n\t.reg .pred p;\n\t"
+            "mbarrier.test_wait.parity.shared.b64 p, [%1], %2;\n\t"
+            "selp.u32 %0, 1, 0, p;\n\t}"
+            : "=r"(done)
+            : "r"(at), "r"(parity)
+            : "memory");
+    }
+}
 
 __global__ void __launch_bounds__(128) ssm_kda16_scan(
     const float* __restrict__ decay,
@@ -4350,9 +4379,20 @@ __global__ void __launch_bounds__(128) ssm_kda16_scan(
         }
     }
 
+    // Per stage: its loads landed (each thread's arrival), its warps are
+    // done with it (each warp's).
+    unsigned long long* full = reinterpret_cast<unsigned long long*>(kda16_smem + 3 * KDA16_STAGE);
+    unsigned long long* empty = full + 3;
+    if (tid < 3) {
+        kda_bar_init(full + tid, 128);
+        kda_bar_init(empty + tid, 4);
+    }
+    __syncthreads();
+
     const int nchunks = (lane.T + KDA_CH - 1) / KDA_CH;
     auto load = [&](int jc) {
         if (jc < nchunks) {
+            if (jc >= 3) kda_bar_wait(empty + jc % 3, (jc / 3 - 1) & 1);
             bf16 *sq, *sw, *sk, *su, *sp, *st;
             float* sg;
             stage(jc % 3, sq, sw, sk, su, sp, st, sg);
@@ -4387,8 +4427,8 @@ __global__ void __launch_bounds__(128) ssm_kda16_scan(
             if (tid < BK / 4) {
                 gdn_cp16(sg + tid * 4, decay + (static_cast<long long>(base + jc) * H + h) * BK + tid * 4, true);
             }
+            kda_bar_arrive_cp(full + jc % 3);
         }
-        gdn_cp_commit();
     };
     // Lane `l`'s row address for an x4 `ldmatrix` over a `[token][k]` tile:
     // as is, the B operand of two eight-token tiles; transposed, a `[k][token]`
@@ -4400,9 +4440,7 @@ __global__ void __launch_bounds__(128) ssm_kda16_scan(
     load(0);
     load(1);
     for (int jc = 0; jc < nchunks; ++jc) {
-        asm volatile("cp.async.wait_group 1;\n" ::: "memory");
-        __syncthreads();
-        load(jc + 2);
+        kda_bar_wait(full + jc % 3, (jc / 3) & 1);
         bf16 *sq, *sw, *sk, *su, *sp, *st;
         float* sg;
         stage(jc % 3, sq, sw, sk, su, sp, st, sg);
@@ -4485,8 +4523,10 @@ __global__ void __launch_bounds__(128) ssm_kda16_scan(
                 gdn_mma(hacc[2 * np + j], vn, b[2 * j], b[2 * j + 1]);
             }
         }
+        __syncwarp();
+        if (l == 0) kda_bar_arrive(empty + jc % 3);
+        load(jc + 2);
     }
-    gdn_cp_wait_all();
 
     if (write_state && row_persists(write_state_mask, lane.rl)) {
         #pragma unroll

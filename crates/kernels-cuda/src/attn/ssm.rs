@@ -1802,7 +1802,7 @@ fn kda_chunked_mma(
     const CH: u32 = 16;
     const D: u32 = 128;
     const TASKS: u32 = 2;
-    // `KDA16_TASK_SMEM` and the scan's three `KDA16_STAGE`s.
+    // `KDA16_TASK_SMEM`, and the scan's three `KDA16_STAGE`s and their barriers.
     const LD: u32 = 136;
     const LDT: u32 = 24;
     const LDV: u32 = 72;
@@ -1855,7 +1855,7 @@ fn kda_chunked_mma(
     ctx.fire(
         op,
         Fire::at(FILE, "::pie::attn::ssm_kda16_scan")
-            .apply(Launch::grid([lanes * heads * (D / 64), 1, 1], [128, 1, 1]).smem(3 * STAGE)),
+            .apply(Launch::grid([lanes * heads * (D / 64), 1, 1], [128, 1, 1]).smem(3 * STAGE + 64)),
         &[
             ArgValue::Ptr(gl),
             mixed.data.arg(),
