@@ -637,6 +637,8 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     const std::uint32_t* __restrict__ kv_last_page_lens,
     __nv_bfloat16* __restrict__ o,
     float* __restrict__ lse,
+    __nv_bfloat16* __restrict__ part_o,
+    float* __restrict__ part_lse,
     const std::int32_t* __restrict__ selection, int top_k, int dense,
     int R, int H, int page_size, float sm_scale, bool causal,
     const u32* __restrict__ win)
@@ -710,6 +712,13 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
         __syncthreads();
     }
     const int steps = srow != nullptr ? s_entries : j_end;
+    // Split-K (`gridDim.z` > 1, a decode's few rows): this block reads its
+    // share of the row's key tiles, its normalized output and base-2
+    // log-sum-exp landing in `part_o`/`part_lse` for `mla_mma_fold`.
+    const int splits = static_cast<int>(gridDim.z);
+    const int per = ((steps + kBK - 1) / kBK + splits - 1) / splits * kBK;
+    const int j_lo = min(steps, static_cast<int>(blockIdx.z) * per);
+    const int j_hi = min(steps, j_lo + per);
 
     constexpr int kChunksPerRow = kD / 8;
     for (int c = tid; c < kBM * kChunksPerRow; c += kThreads) {
@@ -738,8 +747,8 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
         for (int rr = tid; rr < kBK; rr += kThreads) {
             const int n = j0 + rr;
             int j = n;
-            if (srow != nullptr) j = n < steps ? srow[n] : -1;
-            const bool ok = n < steps && j >= 0 && j < j_end;
+            if (srow != nullptr) j = n < j_hi ? srow[n] : -1;
+            const bool ok = n < j_hi && j >= 0 && j < j_end;
             s_ok[stage * kBK + rr] = ok;
             s_slot[rr] =
                 ok
@@ -772,16 +781,16 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
 
     #pragma unroll
     for (int s = 0; s < kStages - 1; ++s) {
-        const int j0 = s * kBK;
-        if (j0 < steps) issue_tile(j0, s);
+        const int j0 = j_lo + s * kBK;
+        if (j0 < j_hi) issue_tile(j0, s);
     }
 
     int stage = 0;
-    for (int j0 = 0; j0 < steps; j0 += kBK, stage = (stage + 1) % kStages) {
+    for (int j0 = j_lo; j0 < j_hi; j0 += kBK, stage = (stage + 1) % kStages) {
 
         __syncthreads();
         const int prefetch_j0 = j0 + (kStages - 1) * kBK;
-        if (prefetch_j0 < steps) {
+        if (prefetch_j0 < j_hi) {
             issue_tile(prefetch_j0, (stage + kStages - 1) % kStages);
         } else {
             __pipeline_commit();
@@ -891,16 +900,21 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     }
 
     __syncthreads();
-    if (lse != nullptr && tid < kBM) {
+    const bool split = splits > 1;
+    float* lse_at = split ? part_lse : lse;
+    __nv_bfloat16* o_at = split ? part_o : o;
+    const long long unit =
+        split ? static_cast<long long>(t_row) * splits + blockIdx.z : static_cast<long long>(t_row);
+    if (lse_at != nullptr && tid < kBM) {
         const float l = sL[tid];
-        lse[static_cast<long long>(t_row) * H + h0 + tid] =
+        lse_at[unit * H + h0 + tid] =
             (l > 0.f) ? (sM[tid] + logf(l)) * 1.4426950408889634f : -CUDART_INF_F;
     }
     const float l0 = sL[g], l1 = sL[g + 8];
     const float i0 = (l0 > 0.f) ? (1.f / l0) : 0.f;
     const float i1 = (l1 > 0.f) ? (1.f / l1) : 0.f;
-    __nv_bfloat16* o0 = o + (static_cast<long long>(t_row) * H + h0 + g) * kCkv;
-    __nv_bfloat16* o1 = o + (static_cast<long long>(t_row) * H + h0 + g + 8) * kCkv;
+    __nv_bfloat16* o0 = o_at + (unit * H + h0 + g) * kCkv;
+    __nv_bfloat16* o1 = o_at + (unit * H + h0 + g + 8) * kCkv;
     #pragma unroll
     for (int n = 0; n < kNTiles; ++n) {
         const int d = dbase + n * 8 + p;
@@ -908,6 +922,47 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
         o0[d + 1] = __float2bfloat16(oacc[n][1] * i0);
         o1[d] = __float2bfloat16(oacc[n][2] * i1);
         o1[d + 1] = __float2bfloat16(oacc[n][3] * i1);
+    }
+}
+
+// `mla_mma_paged_kernel`'s split units of each row folded: a block a (row,
+// head), the units' outputs weighted by 2^(lse - max) over their sum (at
+// most 32 units, a lane each), the row's output and base-2 log-sum-exp (where
+// asked) landed.
+__global__ __launch_bounds__(128) void mla_mma_fold(
+    const __nv_bfloat16* __restrict__ part_o, const float* __restrict__ part_lse,
+    __nv_bfloat16* __restrict__ o, float* __restrict__ lse, int splits, int H,
+    const u32* __restrict__ win)
+{
+    const int t = static_cast<int>(blockIdx.x);
+    if (win != nullptr && t >= static_cast<int>(win[0])) return;
+    const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
+    const int h = static_cast<int>(blockIdx.y);
+    const long long unit0 = static_cast<long long>(t_row) * splits;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const float mine = lane < splits ? part_lse[(unit0 + lane) * H + h] : -CUDART_INF_F;
+    float top = mine;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, m));
+    const float e = mine > -CUDART_INF_F ? exp2f(mine - top) : 0.f;
+    float sum = e;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, m);
+    const float share = sum > 0.f ? e / sum : 0.f;
+    const int d = static_cast<int>(threadIdx.x) * 4;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int s = 0; s < splits; ++s) {
+        const float w = __shfl_sync(0xffffffffu, share, s);
+        if (w == 0.f) continue;
+        const __nv_bfloat16* src = part_o + ((unit0 + s) * H + h) * kCkv + d;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) acc[i] = fmaf(w, __bfloat162float(src[i]), acc[i]);
+    }
+    __nv_bfloat16* dst = o + (static_cast<long long>(t_row) * H + h) * kCkv + d;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) dst[i] = __float2bfloat16(acc[i]);
+    if (lse != nullptr && threadIdx.x == 0) {
+        lse[static_cast<long long>(t_row) * H + h] = sum > 0.f ? top + __log2f(sum) : -CUDART_INF_F;
     }
 }
 
