@@ -272,7 +272,8 @@ pub struct Plan {
 impl Plan {
     /// Rows of 64 or fewer put the weight on the 128-row side. Otherwise a CTA
     /// pair runs 256 x 256 tiles, unless lone 128 x 128 tiles fill the `sms`
-    /// sooner. Either splits K when its tiles leave SMs idle ([`Plan::splits_for`]).
+    /// sooner, or a short K's lone 128 x 256. Either splits K when its tiles
+    /// leave SMs idle ([`Plan::splits_for`]).
     #[must_use]
     pub fn choose(m: u32, n: u32, k: u32, sms: u32) -> Self {
         if m <= 64 {
@@ -295,9 +296,13 @@ impl Plan {
             f64::from(waves) * area * f64::from(steps.div_ceil(splits)) / rate * penalty
         };
         let pair = time(256, 2, 1.8) <= time(128, 1, 1.0);
+        // Over 1024 K or less the epilogue outruns the products: lone CTAs'
+        // 128 x 256 tiles drain twice the stores at once (GLM's kv_b,
+        // 16384 x 28672 x 512: 446 -> 348 us).
+        let lone = pair && k <= 1024;
         Self {
             swap: false,
-            pair,
+            pair: pair && !lone,
             bn: if pair { 256 } else { 128 },
             stages: 0,
             splits: 0,
