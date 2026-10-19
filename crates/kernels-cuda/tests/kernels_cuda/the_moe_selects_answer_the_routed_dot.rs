@@ -294,6 +294,8 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         (4, 64, [512, 256, 64, 10], sw, None, None, 0.3),
         (4, 8, [512, 256, 16, 8], sw, None, None, 0.3),
         (4, 300, [256, 128, 16, 4], sw, Some(false), None, 0.3),
+        (4, 64, [512, 256, 64, 10], Glu::Relu2, None, None, 0.3),
+        (4, 8, [512, 256, 16, 8], Glu::Relu2, None, None, 0.3),
         (8, 64, [512, 256, 64, 10], Glu::Situ { beta: 4.0, cap: 25.0 }, None, None, 0.25),
         (8, 300, [256, 128, 16, 4], clamp, Some(false), None, 0.25),
         (8, 64, [512, 256, 64, 6], clamp, Some(true), None, 0.25),
@@ -310,7 +312,9 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         // (Muse Spark's).
         let ((scale, scv), normed) = (b.bf16(hidden), tokens < 64 || a == 0);
         let norm = normed.then(|| (t(scale, 1, hidden, Bf16), 1e-6));
-        let (up, uw) = mlp_bank(&mut b, a, [ex, 2 * inter, hidden]);
+        // relu2's up rows alone, a GLU's gate rows then its up rows.
+        let up_rows = pick(g == Glu::Relu2, inter, 2 * inter);
+        let (up, uw) = mlp_bank(&mut b, a, [ex, up_rows, hidden]);
         let (down, dw) = mlp_bank(&mut b, a, [ex, hidden, inter]);
         let (x, it) = (t(x, tokens, hidden, Bf16), inter as u32);
         let mut y = b.out(tokens, hidden);
@@ -336,7 +340,7 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
             _ => moe::experts(&ctx, m, &mut y, RES, RES, gate.map(|_| (st, gt)), norm),
         };
         assert!(took.expect("fires"), "{what}: the grouped GEMM takes it");
-        let upv = |e: usize, o: usize, i: usize| f64::from(uw[(e * 2 * inter + o) * hidden + i]);
+        let upv = |e: usize, o: usize, i: usize| f64::from(uw[(e * up_rows + o) * hidden + i]);
         let downv = |e: usize, o: usize, c: usize| f64::from(dw[(e * hidden + o) * inter + c]);
         let shared = gate.map(|f| (&sv[..], (!f).then_some(&gv[..])));
         let first = gate == Some(true);

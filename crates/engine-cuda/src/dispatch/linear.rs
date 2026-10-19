@@ -1258,6 +1258,7 @@ impl Run<'_> {
                     cap: up_cap.unwrap_or(0.0),
                 },
             ),
+            Linear::MlpRelu2 { x, y } => (x, y, self.tensor(y).width, Glu::Relu2),
             _ => return Ok(false),
         };
         let Linear::MoeWeightedSum {

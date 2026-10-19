@@ -998,11 +998,11 @@ fn experts_w4a4(
     let count = tokens * routes.width;
     let experts = up_codes.rows;
     let (k, n) = (x.width, y.width);
-    // Only SwiGLU's epilogue lands what the four apart would.
+    // Only SwiGLU's and relu2's epilogues land what the four apart would.
     if count == 0
         || norm.is_some_and(|(s, _)| s.dtype != Dtype::Bf16 || s.rows * s.width != y.width)
         || tokens < ctx.tuning().moe_w4a4_fused_from
-        || !matches!(glu, tc5::Glu::Swiglu)
+        || !matches!(glu, tc5::Glu::Swiglu | tc5::Glu::Relu2)
         || !ctx.tuning().moe_tc5
         || !tc5::supported()
         || x.dtype != Dtype::Bf16
@@ -1030,7 +1030,11 @@ fn experts_w4a4(
                 act_quant::AlphaFrom {
                     input_scales: up_is.ptr,
                     tensor_scales: up_ts.ptr,
-                    rows: 2 * inter,
+                    rows: if glu == tc5::Glu::Relu2 {
+                        inter
+                    } else {
+                        2 * inter
+                    },
                 },
                 up_alpha,
             ),
@@ -1982,6 +1986,12 @@ fn select_mxfp4_mma(
         Some(Glu::SwigluClampAlpha { limit, alpha }) => (3, limit, alpha),
         Some(Glu::GegluTanh) => (4, 0.0, 1.0),
         Some(Glu::Situ { beta, cap }) => (5, beta, cap),
+        Some(Glu::Relu2) => {
+            return Err(refuse(
+                op,
+                "the register-dequant select lands GLUs, not relu2",
+            ));
+        }
     };
     // A CTA lands 128 rows, or 64 GLU columns (their gate and up rows).
     let cols = if glu.is_some() { 64 } else { 128 };

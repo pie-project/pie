@@ -266,8 +266,10 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                        (kGroup == 1 || kPair == 1)),
                   "contiguous groups run unswapped (a W4A16 or NVFP4 one swapped too), masked "
                   "swapped on lone CTAs");
-    static_assert(kGlu == 0 || kSwap || kBN == 256, "an unswapped GLU tile is gate 128 | up 128");
-    static_assert(kGlu == 0 || !kSwap || kBN <= 128, "a swapped GLU tile holds two accumulators");
+    // A GLU reads gate and up rows; relu2 (6) the one value it activates.
+    constexpr bool kFused = kGlu != 0 && kGlu != 6;
+    static_assert(!kFused || kSwap || kBN == 256, "an unswapped GLU tile is gate 128 | up 128");
+    static_assert(!kFused || !kSwap || kBN <= 128, "a swapped GLU tile holds two accumulators");
     static_assert(kMix == 0 || (kKind == 0 && kPair == 1), "W4A16 runs kind::f16 on lone CTAs");
     static_assert(kMix == 0 || !kSwap || kStages % 2 == 0,
                   "a swapped W4A16 weight's transform groups own alternate slots");
@@ -276,7 +278,6 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     // A GLU tile reads the weight's gate rows and the matching up rows `inter`
     // further on, side by side: unswapped as the two halves of the Q tile,
     // swapped as two P tiles into two accumulators.
-    constexpr bool kFused = kGlu != 0;
     constexpr u32 kPT = kFused && kSwap ? 2 : 1;
     constexpr u32 kAccN = kBN * kPT;
     constexpr u32 kQStep = kFused && !kSwap ? 128 : kBN;  // output columns a Q tile
@@ -1193,6 +1194,21 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 }
                 return tc5k::glu<kGlu>(g, u, epi.limit, epi.galpha);
             };
+            // An ungated activation (relu2) of a value, or the value itself;
+            // landing an NVFP4 operand under each expert's global, it takes the
+            // value rounded to bf16, as apart.
+            auto act = [&](float g) -> float {
+                if constexpr (kGlu == 0) {
+                    return g;
+                } else {
+                    if constexpr (kOut == 2) {
+                        if (epi.in_scale != nullptr) {
+                            g = bf16_to_f32(f32_to_bf16(g));
+                        }
+                    }
+                    return tc5k::glu<kGlu>(g, 0.f, 0.f, 0.f);
+                }
+            };
             auto finish = [&](u32 c0, const Cols& f, const u32 (&v)[32], const u32 (&u)[32],
                               float (&h)[32]) {
                 if (plain) {
@@ -1202,7 +1218,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                             h[j] = glu_of(__uint_as_float(v[j]) * alpha + 0.f,
                                           __uint_as_float(u[j]) * alpha + 0.f);
                         } else {
-                            h[j] = __uint_as_float(v[j]) * alpha + 0.f;
+                            h[j] = act(__uint_as_float(v[j]) * alpha + 0.f);
                         }
                     }
                     return;
@@ -1219,8 +1235,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 } else {
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
-                        h[j] = __uint_as_float(v[j]) * alpha * ws_col(f, j, false) +
-                               bias_col(f, j, false);
+                        h[j] = act(__uint_as_float(v[j]) * alpha * ws_col(f, j, false) +
+                                   bias_col(f, j, false));
                     }
                 }
 #pragma unroll

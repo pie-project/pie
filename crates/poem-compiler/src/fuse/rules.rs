@@ -929,8 +929,9 @@ fn mlp_swiglu() -> Rule {
 }
 
 /// A routed MLP: a gate-up select and its GLU (each `moe_select_glu` form,
-/// or SiTU), the down select of the GLU on the same routes (each row normed
-/// under a scale where `normed`, Muse Spark's), and the weighted sum.
+/// or SiTU; or an up select and its relu2), the down select of the GLU on the
+/// same routes (each row normed under a scale where `normed`, Muse Spark's),
+/// and the weighted sum.
 fn moe_experts() -> Rule {
     let mut alternatives = Vec::new();
     // Each leg's select: over a dense bank, a biased one, a quantized one,
@@ -940,7 +941,7 @@ fn moe_experts() -> Rule {
         .flat_map(|s| (0..3).map(move |d| (s, d)))
         .chain([(3, 3), (4, 4)]);
     for (select, down) in legs {
-        for glu in 0..5 {
+        for glu in 0..6 {
             for (gated, normed) in [(true, false), (false, false), (false, true)] {
                 alternatives.push(template(move |p| {
                     let x = p.rows("x", W);
@@ -987,19 +988,23 @@ fn moe_experts() -> Rule {
                     };
                     let packed = select_of(&x, "bank", "bias", select);
                     p.name("packed", &packed);
-                    let intermediate = p.u32("intermediate");
                     let hidden = match glu {
-                        0 => linear::mlp_swiglu(&packed, intermediate),
-                        1 => linear::mlp_swiglu_clamp(&packed, intermediate, p.f32("limit")),
-                        3 => linear::mlp_geglu_tanh_packed(&packed, intermediate),
+                        0 => linear::mlp_swiglu(&packed, p.u32("intermediate")),
+                        1 => {
+                            linear::mlp_swiglu_clamp(&packed, p.u32("intermediate"), p.f32("limit"))
+                        }
+                        3 => linear::mlp_geglu_tanh_packed(&packed, p.u32("intermediate")),
                         4 => {
                             // Kimi-K3's SiTU, its up cap whatever it holds.
                             p.free("up_cap");
-                            linear::mlp_situ(&packed, intermediate, p.f32("beta"), None)
+                            linear::mlp_situ(&packed, p.u32("intermediate"), p.f32("beta"), None)
                         }
+                        // Nemotron-H's ungated experts: the select's rows
+                        // are the up rows alone.
+                        5 => linear::mlp_relu2(&packed),
                         _ => linear::mlp_swiglu_clamp_alpha(
                             &packed,
-                            intermediate,
+                            p.u32("intermediate"),
                             p.f32("limit"),
                             p.f32("alpha"),
                         ),

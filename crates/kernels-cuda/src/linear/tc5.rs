@@ -402,6 +402,8 @@ pub enum Glu {
     /// under a cap (`cap > 0`), `u` else (`mlp_situ`; its tanh the fast
     /// one).
     Situ { beta: f32, cap: f32 },
+    /// `relu(g)^2`, of the weight's rows alone: no up rows (`mlp_relu2`).
+    Relu2,
 }
 
 /// Where the epilogue lands its `rows x n` result.
@@ -478,7 +480,13 @@ impl Epilogue {
             Some(Glu::SwigluClampAlpha { .. }) => 3,
             Some(Glu::GegluTanh) => 4,
             Some(Glu::Situ { .. }) => 5,
+            Some(Glu::Relu2) => 6,
         }
+    }
+
+    /// Whether the epilogue's activation reads gate and up rows.
+    const fn gated(&self) -> bool {
+        matches!(self.glu, Some(g) if !matches!(g, Glu::Relu2))
     }
 
     const fn out_code(&self) -> u32 {
@@ -499,13 +507,11 @@ impl Epilogue {
             }
             return Ok(plan);
         }
-        if plan.swap {
-            if plan.bn > 128 {
-                // Two accumulators of 128 fill a stage's TMEM: wider rows take
-                // more Q tiles.
-                plan.bn = 128;
-            }
-        } else {
+        if self.gated() && plan.swap {
+            // Two accumulators of 128 fill a stage's TMEM: wider rows take
+            // more Q tiles.
+            plan.bn = plan.bn.min(128);
+        } else if self.gated() {
             plan.bn = 256;
         }
         plan.splits = 1;
@@ -590,7 +596,7 @@ pub fn gemm_epi_with(
     }
     let plan = unpaired_if_mixed(act, w, epi.fit(swapped_if_mixed(act, w, plan, m >= 256))?);
     let kind = admit(act, w, n, k, plan)?;
-    let glu = epi.glu.is_some();
+    let glu = epi.gated();
     if glu && !n.is_multiple_of(128) && !glu_any_rows(act, w, epi) {
         return Err(refuse(
             OP,
@@ -776,7 +782,7 @@ pub fn grouped_gemm_epi_with(
             Groups::Masked { .. } => plan,
         })?,
     );
-    let glu = epi.glu.is_some();
+    let glu = epi.gated();
     if glu && !n.is_multiple_of(128) && !glu_any_rows(act, w, epi) {
         return Err(refuse(
             OP,
@@ -1008,7 +1014,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
         epi,
         ..
     } = job;
-    let glu = epi.glu.is_some();
+    let glu = epi.gated();
     // A GLU swapped reads two weight tiles a stage; unswapped, its Q tile
     // comes in two 128-row halves.
     let pt = if glu && job.plan.swap { 2 } else { 1 };
