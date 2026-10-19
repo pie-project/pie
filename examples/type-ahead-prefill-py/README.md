@@ -1,7 +1,7 @@
 # type-ahead-prefill-py
 
 Prefill the prompt while the user is still typing it. The client sends the
-draft after every keystroke; the inferlet prefills each finished word, so when
+draft each time a word is finished; the inferlet prefills it, so when
 Enter is pressed only the last word, the end of the turn and the cue are left
 to compute before the first token.
 

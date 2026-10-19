@@ -4,7 +4,8 @@
     python examples/type-ahead-prefill-py/client.py            # type, Enter sends
     python examples/type-ahead-prefill-py/client.py --compare  # scripted typing vs. pasting it all at once
 
-Every keystroke sends the whole draft to the inferlet; the dim counter on the
+Each finished word sends the draft up to its space to the inferlet, and a
+backspace into a finished word sends the shorter draft; the dim counter on the
 right is how many prompt tokens are already in the KV cache.
 """
 
@@ -18,6 +19,11 @@ import tty
 from pathlib import Path
 
 from pie_client import Event, PieClient
+
+def words(draft: str) -> str:
+    """The draft up to and including its last space: the part the inferlet prefills."""
+    return draft[: draft.rfind(" ") + 1]
+
 
 SOURCE = Path(__file__).with_name("main.py")
 NAME, VERSION = "type-ahead-prefill", "0.1.0"
@@ -56,8 +62,11 @@ async def answer(process, echo: bool) -> dict:
 async def scripted(client: PieClient, text: str, cps: float, type_ahead: bool, max_tokens: int) -> dict:
     process = await start(client, max_tokens)
     if type_ahead:
+        sent = ""
         for i in range(1, len(text) + 1):
-            await process.signal(json.dumps({"draft": text[:i]}))
+            if words(text[:i]) != sent:
+                sent = words(text[:i])
+                await process.signal(json.dumps({"draft": sent}))
             await asyncio.sleep(1 / cps)
     await process.signal(json.dumps({"send": text}))
     return await answer(process, echo=False)
@@ -75,7 +84,7 @@ async def compare(client: PieClient, args) -> None:
 
 async def interactive(client: PieClient, max_tokens: int) -> None:
     process = await start(client, max_tokens)
-    draft, prefilled = "", 0
+    draft, sent, prefilled = "", "", 0
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     loop = asyncio.get_running_loop()
@@ -115,7 +124,9 @@ async def interactive(client: PieClient, max_tokens: int) -> None:
             else:
                 continue
             show()
-            await process.signal(json.dumps({"draft": draft}))
+            if words(draft) != sent:  # a space finished a word, or a backspace went into one
+                sent = words(draft)
+                await process.signal(json.dumps({"draft": sent}))
     finally:
         loop.remove_reader(fd)
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
