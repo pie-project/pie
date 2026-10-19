@@ -759,7 +759,7 @@ fn fused_fits(shape: &Delta, state: &RecurrentPool, qkv: Tensor, y: &Tensor) -> 
 /// the warps are persistent, so the grid is at most what the SMs seat at
 /// once.
 const FUSED_WARPS: u32 = 4;
-const FUSED_BLOCKS_PER_SM: u32 = 3;
+const FUSED_BLOCKS_PER_SM: u32 = 4;
 /// The bytes one warp's stage of the fused step streams: its state tile, the
 /// q and k rows, its value slice and the two gates.
 const FUSED_STAGE: u32 = 4096 + 512 + 32 + 32;
