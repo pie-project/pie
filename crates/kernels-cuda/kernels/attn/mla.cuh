@@ -563,8 +563,8 @@ constexpr int kStages = PIE_MLA_MMA_STAGES;
 static_assert(kStages >= 1, "kStages must be at least 1");
 constexpr int kThreads = kWarps * 32;
 constexpr int kCkv = 512;
-// `kKpe`/`kD`/`kLdD` are the rope width and depend on the kernel's `KPE`
-// template parameter (64 for a rotated part, 0 for NoPE latents).
+// `kKpe`/`kD`/`kLdD` live in the kernel: they follow its `KPE` template
+// parameter (the rope width, 64 for a rotated part, 0 for NoPE latents).
 constexpr int kLdP = kBK + 8;
 constexpr int kDimsPerWarp = kCkv / kWarps;
 constexpr int kNTiles = kDimsPerWarp / 8;
@@ -641,7 +641,7 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     int R, int H, int page_size, float sm_scale, bool causal,
     const u32* __restrict__ win)
 {
-    // `KPE` the rope width: 64 with a rotated part, 0 for NoPE latents
+    // `KPE` is the rope width: 64 with a rotated part, 0 for NoPE latents
     // (GLM-5.3-Flash's DSA). The `d < kCkv` loads already skip the pe part
     // when it is absent; q_pe/kpe_pages are then unread.
     constexpr int kKpe = KPE;

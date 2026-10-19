@@ -616,7 +616,10 @@ mod tests {
                     defaults,
                     "{gpu}: Hopper takes the arch-generic arms alone"
                 );
-                assert!(tuning.ssm_gdn_fused_scan && tuning.pool_mma && tuning.pdl, "{gpu}");
+                assert!(
+                    tuning.ssm_gdn_fused_scan && tuning.pool_mma && tuning.pdl,
+                    "{gpu}"
+                );
                 assert_eq!((tuning.mxfp4_mma_from, tuning.mxfp4_mma_until), (28, 1024));
                 assert_eq!((tuning.bf16_mma_from, tuning.bf16_mma_until), (16, 65536));
             } else {
@@ -736,8 +739,8 @@ mod tests {
         assert_eq!(Engine::of(&family).lattice_steps, 1);
     }
 
-    /// The two-launch gated delta scan is an sm_100 family decision; every
-    /// other family keeps the three wmma launches it ran before.
+    /// The two-launch gated delta scan is a Hopper and sm_100 family decision;
+    /// every other family keeps the three wmma launches it ran before.
     #[cfg(not(feature = "rocm"))]
     #[test]
     fn only_hopper_and_the_sm100_family_run_the_two_launch_gated_delta_scan() {

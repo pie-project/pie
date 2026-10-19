@@ -700,8 +700,9 @@ fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> 
 /// values in bf16: within a few percent of the output's norm.
 #[test]
 fn glm_fp8_rows_score_in_e4m3() {
+    // Fp8 latent rows need the tcgen05 sparse pass (Blackwell).
     if !kernels_cuda::linear::tc5::supported() {
-        return;  // fp8 latent rows need the tcgen05 sparse pass (Blackwell)
+        return;
     }
     for (kv, rope) in [(300, 64), (1000, 64), (1000, 0)] {
         let want = decode_short(4, kv, rope, false, false);
@@ -719,8 +720,9 @@ fn glm_fp8_rows_score_in_e4m3() {
 
 #[test]
 fn glm_reads_a_short_selection_dense() {
+    // Fp8 latent rows need the tcgen05 sparse pass (Blackwell).
     if !kernels_cuda::linear::tc5::supported() {
-        return;  // fp8 latent rows need the tcgen05 sparse pass (Blackwell)
+        return;
     }
     let want = decode_short(4, 300, 64, true, false);
     let got = decode_short(4, 300, 64, true, true);

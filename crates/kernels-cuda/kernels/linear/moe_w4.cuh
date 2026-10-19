@@ -213,12 +213,12 @@ __device__ __forceinline__ void w4_land(const float (&acc)[kTiles][kNb][4], Fact
 }  // namespace w4mma
 
 // A routed bf16 select at decode widths: the bf16 analog of
-// `moe_select_mxfp4_mma`. Each expert's weight rows and the routes' rows are
-// staged a K-tile at a time into shared memory with `cp.async`, read to the
-// mma fragments by `ldmatrix`, and met on mma.sync. The routing
-// (order/offsets/work) and the epilogue (`w4mma::w4_land`) are shared with
-// the mxfp4 kernel; the `ld_a`/`ld_b_k`/mma triple is the one `attn/mla.cuh`
-// uses, so the output fragment is the layout `w4_land` reads.
+// `moe_select_mxfp4_mma`, without its GLU. Each expert's weight rows and the
+// routes' rows are staged a K-tile at a time into shared memory with
+// `cp.async`, read to the mma fragments by `ldmatrix`, and met on mma.sync.
+// The routing (order/offsets/work) and the epilogue (`w4mma::w4_land`) are
+// shared with the mxfp4 kernel; the fragments are the ones `attn/mla.cuh`
+// loads, so the output fragment is the layout `w4_land` reads.
 namespace bf16mma {
 __device__ __forceinline__ void ld_a(unsigned (&a)[4], const bf16* base, int ld, int lane) {
     const bf16* r = base + static_cast<long long>(lane & 15) * ld + ((lane & 16) ? 8 : 0);
@@ -234,7 +234,7 @@ __device__ __forceinline__ void ld_b(unsigned (&b)[2], const bf16* base, int ld,
 }
 }  // namespace bf16mma
 
-template <int kNb, int kGlu>
+template <int kNb>
 __global__ void __launch_bounds__(128) moe_select_bf16_mma(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
@@ -243,16 +243,14 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
     const bf16* __restrict__ weight,
     const bf16* __restrict__ bias,
     bf16* __restrict__ out,
-    int act_div, int n, int k, int num_experts, int inter,
-    float limit, float galpha)
+    int act_div, int n, int k, int num_experts)
 {
     constexpr int kTiles = 2;
-    constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
+    constexpr int kRowsWarp = kTiles * 16;
     constexpr int kRowsCta = 4 * kRowsWarp;   // 128 weight rows a CTA
     constexpr int kSlice = 8 * kNb;           // routes a slice (B of the GEMM)
     constexpr int kBK = 16;                   // K staged a step (one mma k)
-    constexpr int kWPad = kBK + 8;            // smem row stride (ldmatrix)
-    constexpr int kBN = kSlice;
+    constexpr int kPad = kBK + 8;             // smem row stride (ldmatrix)
 
     if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
     const int item = work[blockIdx.x];
@@ -267,22 +265,18 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
     const int lane = tid & 31;
     const int g = lane >> 2;
     const int c = lane & 3;
-    // The CTA's 128 rows and this warp's 32 of them. With `kGlu` a warp's two
-    // 16-row tiles are gate rows and their up rows, `inter` apart.
+    // The CTA's 128 rows and this warp's 32 of them. A warp whose rows run
+    // past the bank still joins the cooperative load and the barriers;
+    // `w4_land` drops its out-of-range rows.
     const int cta_row0 = static_cast<int>(blockIdx.y) * kRowsCta;
-    const int span = kGlu != 0 ? inter : n;
-    const int row_base = kGlu != 0 ? cta_row0 / kTiles + warp * kRowsWarp
-                                   : cta_row0 + warp * kRowsWarp;
-    // A partial-tile warp (its rows past the bank) must still join the
-    // cooperative load and the barrier; `w4_land` drops its out-of-range
-    // rows, so no early return here.
+    const int row_base = cta_row0 + warp * kRowsWarp;
 
     const bf16* w_e = weight + static_cast<long long>(expert) * n * k;
     const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
 
     extern __shared__ bf16 smem[];
-    bf16* sW = smem;                          // [kRowsCta][kWPad]
-    bf16* sX = sW + kRowsCta * kWPad;         // [kBN][kWPad]
+    bf16* sW = smem;                          // [kRowsCta][kPad]
+    bf16* sX = sW + kRowsCta * kPad;          // [kSlice][kPad]
 
     float acc[kTiles][kNb][4];
 #pragma unroll
@@ -296,23 +290,21 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
         // Stage this K-tile: 128 weight rows and `count` route rows, 8 bf16
         // (16 B) a cp.async. Rows past the bank or routes past the slice are
         // zeroed so the mma reads defined smem (their outputs are not stored).
-#pragma unroll
         for (int i = tid; i < kRowsCta * (kBK / 8); i += 128) {
-            const int wr = i / (kBK / 8);
+            const int row = i / (kBK / 8);
             const int ch = (i % (kBK / 8)) * 8;
-            const int grow = (kGlu != 0) ? (cta_row0 / kTiles + (wr / 16) * inter + wr % 16)
-                                         : (cta_row0 + wr);
-            bf16* dst = sW + wr * kWPad + ch;
-            if (grow < span) {
-                __pipeline_memcpy_async(dst, w_e + static_cast<long long>(grow) * k + k0 + ch, 16);
+            bf16* dst = sW + row * kPad + ch;
+            if (cta_row0 + row < n) {
+                __pipeline_memcpy_async(
+                    dst, w_e + static_cast<long long>(cta_row0 + row) * k + k0 + ch, 16);
             } else {
                 *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
             }
         }
-        for (int i = tid; i < kBN * (kBK / 8); i += 128) {
+        for (int i = tid; i < kSlice * (kBK / 8); i += 128) {
             const int tok = i / (kBK / 8);
             const int ch = (i % (kBK / 8)) * 8;
-            bf16* dst = sX + tok * kWPad + ch;
+            bf16* dst = sX + tok * kPad + ch;
             if (tok < count) {
                 const long long r = static_cast<long long>(order[begin + tok] / act_div);
                 __pipeline_memcpy_async(dst, act + r * k + k0 + ch, 16);
@@ -326,22 +318,23 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
 
         unsigned bk[kNb][2];
 #pragma unroll
-        for (int b = 0; b < kNb; ++b) bf16mma::ld_b(bk[b], sX + 8 * b * kWPad, kWPad, lane);
+        for (int b = 0; b < kNb; ++b) bf16mma::ld_b(bk[b], sX + 8 * b * kPad, kPad, lane);
 #pragma unroll
         for (int t = 0; t < kTiles; ++t) {
             unsigned a[4];
-            bf16mma::ld_a(a, sW + (warp * kRowsWarp + 16 * t) * kWPad, kWPad, lane);
+            bf16mma::ld_a(a, sW + (warp * kRowsWarp + 16 * t) * kPad, kPad, lane);
 #pragma unroll
-            for (int b = 0; b < kNb; ++b) w4mma::mma(acc[t][b], a[0], a[1], a[2], a[3], bk[b][0], bk[b][1]);
+            for (int b = 0; b < kNb; ++b) {
+                w4mma::mma(acc[t][b], a[0], a[1], a[2], a[3], bk[b][0], bk[b][1]);
+            }
         }
         __syncthreads();
     }
 
     auto factor = [&](int) { return 1.f; };
-    w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, inter,
-                                      row_base, g, c, limit, galpha);
+    w4mma::w4_land<0, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, n, row_base,
+                                   g, c, 0.f, 1.f);
 }
-
 
 /// `y[route] = x[route / act_div] . W[expert]^T (+ bias[expert])` for the
 /// routes `order` lists by expert, `work` naming (expert, slice of

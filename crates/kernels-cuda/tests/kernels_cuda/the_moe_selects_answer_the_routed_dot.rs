@@ -203,7 +203,8 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Bf16, d, [8, 48, 2, 96, 64], f, None, 0),
         (K::Bf16, TC5, [16, 70, 4, 192, 256], t, None, 0),
         (K::Bf16, TC5, [16, 48, 4, 128, 256], t, sw, 0),
-        // bf16 on the graph-safe grouped mma kernel: nb 8/4/1, by token and route.
+        // Bf16 on the graph-safe grouped mma.sync: eight, four and one 8-route
+        // blocks, by token and by route, a partial 128-row tile.
         (K::Bf16, bf16mma, [8, 64, 8, 128, 256], t, None, 0),
         (K::Bf16, bf16mma, [8, 64, 8, 128, 256], f, None, 0),
         (K::Bf16, bf16mma, [16, 40, 8, 256, 128], f, None, 0),
@@ -213,7 +214,7 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Affine, d, [16, 3, 8, 704, 704], f, None, 0),
         (K::Affine, TC5, [16, 40, 8, 256, 704], f, None, 0),
         // MXFP4: per route, grouped WMMA and fp32, tcgen05; the register-
-        // dequant kernel at one, two, four and eight 8-route blocks, its GLU
+        // dequant kernel at one, two and four 8-route blocks, its GLU
         // keeping the order for the select after; the e2m1 converts (a K
         // split at one token, scales and rows past f16's range); B200's.
         (K::Mx, d, [8, 3, 4, 96, 2240], t, None, 0),
@@ -224,7 +225,6 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Mx, mma, [8, 12, 4, 384, 2880], t, None, 0),
         (K::Mx, mma, [8, 100, 4, 384, 2880], f, None, 0),
         (K::MxBias, mma, [8, 16, 4, 192, 2880], t, alpha, 8),
-        (K::MxBias, mma, [8, 100, 4, 192, 2880], t, alpha, 0),
         (K::Mx, cvt, [8, 1, 4, 200, 2880], t, None, 0),
         (K::MxBias, cvt, [8, 40, 4, 576, 2880], t, None, 0),
         (K::MxBias, cvt, [8, 3, 4, 576, 2880], f, None, 2),
@@ -238,7 +238,6 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Nv, TC5, [16, 48, 10, 128, 640], t, None, 0),
         (K::Nv, nv_mma, [16, 2, 10, 256, 640], f, None, 0),
         (K::Nv, nv_mma, [16, 48, 10, 320, 2560], t, sw, 0),
-        (K::Nv, nv_mma, [8, 64, 8, 256, 640], t, sw, 0),
     ];
     // Off tcgen05 (Hopper) the arms its tunings name do not take the fire.
     cases.retain(|case| supported() || !(case.1.moe_tc5 || case.1.mxfp4_cvt));

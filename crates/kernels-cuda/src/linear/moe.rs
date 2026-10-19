@@ -472,8 +472,8 @@ pub fn matmul_select(
             && x.dtype == Dtype::Bf16
             && bank.dtype == Dtype::Bf16
             && !experts.streams()
-            && x.width % 16 == 0
-            && y.width % 8 == 0
+            && x.width.is_multiple_of(16)
+            && y.width.is_multiple_of(8)
             && bank.rows >= 1
             && u64::from(bank.width) == u64::from(x.width) * u64::from(y.width)
         {
@@ -511,6 +511,8 @@ fn select_bf16_mma(
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
     let k = stated(op, x.width)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
+    // An expert's slice is 8, 16, 32 or 64 routes, by how many the average
+    // expert holds: each slice reads its weight rows once for all of them.
     let per = fan.route_count.div_ceil(experts.max(1));
     let nb: u32 = match per {
         0..=8 => 1,
@@ -544,7 +546,7 @@ fn select_bf16_mma(
         op,
         Fire::at(
             "linear/moe_w4.cuh",
-            symbol(&format!("::pie::linear::moe_select_bf16_mma<{nb}, 0>")),
+            symbol(&format!("::pie::linear::moe_select_bf16_mma<{nb}>")),
         )
         .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(smem)),
         &[
@@ -559,9 +561,6 @@ fn select_bf16_mma(
             n.arg(),
             k.arg(),
             stated(op, experts)?.arg(),
-            n.arg(),
-            0.0f32.arg(),
-            1.0f32.arg(),
         ],
     )
 }
@@ -2077,8 +2076,7 @@ fn select_mxfp4_mma(
     let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
     let experts = codes.rows.clamp(1, EXPERT_CAP);
     // An expert's slice is 8, 16 or 32 routes: as few 8-route blocks as the
-    // average expert fills, each slice's codes read and dequantized once for
-    // all of its routes. (64-route slices measured slower here — mimom.)
+    // average expert fills.
     let per = fan.route_count.div_ceil(experts);
     let nb: u32 = match per {
         0..=4 => 1,
