@@ -5,6 +5,16 @@ pub mod elastic;
 pub mod graph;
 #[cfg(feature = "rocm")]
 pub mod hip;
+#[cfg(all(feature = "device", not(feature = "rocm")))]
+pub mod recycle;
+#[cfg(all(feature = "device", not(feature = "rocm")))]
+pub mod slab;
+
+/// Endpoint memory kept for the next channel of its shape.
+#[cfg(feature = "rocm")]
+pub use hip::held::pool;
+#[cfg(all(feature = "device", not(feature = "rocm")))]
+pub use recycle as pool;
 
 /// The runtime, driver, NCCL and cuBLAS bindings the engine calls: CUDA's,
 /// or on ROCm HIP's, RCCL's and rocBLAS's under the same names.

@@ -264,14 +264,14 @@ impl Rings {
                 .and_then(|endpoint| endpoint.device_cells());
             cells.push(match shared {
                 Some(_) => Buffer::zeroed(0)?,
-                None => Buffer::zeroed(bytes * shape.ring() as usize)?,
+                None => Buffer::slab_zeroed(bytes * shape.ring() as usize)?,
             });
         }
 
         let slots = shapes.len();
         let words = slots * size_of::<u32>();
         let full_at = 3 * words;
-        let mut registry = Buffer::zeroed(full_at + slots * MAX_RING as usize)?;
+        let mut registry = Buffer::slab_zeroed(full_at + slots * MAX_RING as usize)?;
         let cap1: Vec<u8> = shapes
             .iter()
             .flat_map(|shape| {

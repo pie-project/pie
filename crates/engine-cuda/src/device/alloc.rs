@@ -4,6 +4,8 @@ use crate::error::{Fault, Result};
 pub struct Buffer {
     ptr: u64,
     bytes: usize,
+    /// A span of a slab (`device::slab`) rather than its own `cudaMalloc`.
+    slab: bool,
 }
 
 /// `bytes` of device memory for a [`Buffer`], freed exactly once in its
@@ -55,7 +57,7 @@ pub(crate) fn out_of_room(fault: Fault, bytes: usize) -> Fault {
 impl Buffer {
     pub fn zeroed(bytes: usize) -> Result<Buffer> {
         if bytes == 0 {
-            return Ok(Buffer { ptr: 0, bytes: 0 });
+            return Ok(Buffer { ptr: 0, bytes: 0, slab: false });
         }
         #[cfg(feature = "device")]
         {
@@ -69,6 +71,7 @@ impl Buffer {
             Ok(Buffer {
                 ptr: base as u64,
                 bytes,
+                slab: false,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -79,7 +82,7 @@ impl Buffer {
 
     pub fn zeroed_on(stream: *mut core::ffi::c_void, bytes: usize) -> Result<Buffer> {
         if bytes == 0 {
-            return Ok(Buffer { ptr: 0, bytes: 0 });
+            return Ok(Buffer { ptr: 0, bytes: 0, slab: false });
         }
         #[cfg(feature = "device")]
         {
@@ -97,6 +100,7 @@ impl Buffer {
             Ok(Buffer {
                 ptr: base as u64,
                 bytes,
+                slab: false,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -104,6 +108,24 @@ impl Buffer {
             let _ = stream;
             Err(Fault::Runtimeless)
         }
+    }
+
+    /// `zeroed` for a session's small, compute-stream-read memory: a span
+    /// of a slab (`device::slab`) when one serves the size, its memset on
+    /// the compute stream.
+    pub fn slab_zeroed(bytes: usize) -> Result<Buffer> {
+        #[cfg(all(feature = "device", not(feature = "rocm")))]
+        if let Some(class) = crate::device::slab::class(bytes)
+            && crate::device::slab::serves()
+        {
+            let ptr = crate::device::slab::device(class)?;
+            return Ok(Buffer {
+                ptr,
+                bytes,
+                slab: true,
+            });
+        }
+        Buffer::zeroed(bytes)
     }
 
     #[must_use]
@@ -449,6 +471,14 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
+        #[cfg(all(feature = "cuda", not(feature = "rocm")))]
+        if self.ptr != 0
+            && self.slab
+            && let Some(class) = crate::device::slab::class(self.bytes)
+        {
+            crate::device::slab::release_device(class, self.ptr);
+            return;
+        }
         #[cfg(feature = "cuda")]
         if self.ptr != 0 {
             // SAFETY: the pointer came from this buffer's own `cudaMalloc` and is freed exactly once.
@@ -474,6 +504,9 @@ pub struct Pinned {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
     Allocated,
+    /// A span of a slab (`device::slab`).
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    Slab,
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     Registered,
 }
@@ -501,6 +534,24 @@ impl Pinned {
 
     pub fn mapped_uninit(bytes: usize) -> Result<Pinned> {
         Pinned::alloc(bytes, false)
+    }
+
+    /// `mapped` for a session's small, compute-stream-read memory: a span
+    /// of a slab (`device::slab`) when one serves the size.
+    pub fn slab_mapped(bytes: usize) -> Result<Pinned> {
+        #[cfg(all(feature = "device", not(feature = "rocm")))]
+        if let Some(class) = crate::device::slab::class(bytes)
+            && crate::device::slab::serves()
+        {
+            let (host, device) = crate::device::slab::host(class, true)?;
+            return Ok(Pinned {
+                host,
+                device,
+                bytes,
+                origin: Origin::Slab,
+            });
+        }
+        Pinned::mapped(bytes)
     }
 
     pub fn zero(&self) {
@@ -617,6 +668,14 @@ impl Drop for Pinned {
             return;
         }
         match self.origin {
+            #[cfg(all(feature = "device", not(feature = "rocm")))]
+            Origin::Slab => {
+                if let Some(class) = crate::device::slab::class(self.bytes) {
+                    crate::device::slab::release_host(class, self.host, self.device);
+                }
+            }
+            #[cfg(any(not(feature = "device"), feature = "rocm"))]
+            Origin::Slab => {}
             #[cfg(feature = "device")]
             Origin::Allocated => {
                 // SAFETY: the pointer came from this structure's own `cudaHostAlloc` and is freed exactly once.
