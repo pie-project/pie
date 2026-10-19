@@ -503,6 +503,19 @@ __device__ __forceinline__ int x_slot(int row, int q) {
     return row * 16 + (q ^ (((q >> 3) & 1) << 1) ^ (row & 1));
 }
 
+// A staged run of eight activations relaid in place as the B words the
+// register-dequant mma reads them in (the byte perms `compute` does a warp
+// a run, done once a CTA): the first k-step's (b0, b1), then the second's.
+__device__ __forceinline__ void lay_staged(uint4* at) {
+    const uint4 v = *at;
+    uint4 o;
+    o.x = __byte_perm(v.y, v.w, 0x7632);
+    o.y = __byte_perm(v.y, v.w, 0x5410);
+    o.z = __byte_perm(v.x, v.z, 0x7632);
+    o.w = __byte_perm(v.x, v.z, 0x5410);
+    *at = o;
+}
+
 // `compute` with the routes' activations read from the stage (`xs`, the
 // chunk's runs) rather than held a chunk in registers.
 template <bool wide, bool kNv, int kTiles, int kNb>
@@ -537,6 +550,8 @@ __device__ __forceinline__ void compute_staged(const uint4 (&cw)[kTiles][2], con
 #pragma unroll
                 for (int h = 0; h < 2; ++h) s1[t][h] = nv[t][h][w >> 1];
         }
+        // The run already laid as the mma's B words (`lay_staged`): its two
+        // k-steps' (b0, b1) pairs.
         uint4 xv[kNb];
 #pragma unroll
         for (int b = 0; b < kNb; ++b) xv[b] = xs[x_slot(8 * b + g, 4 * c + w)];
@@ -545,10 +560,8 @@ __device__ __forceinline__ void compute_staged(const uint4 (&cw)[kTiles][2], con
             unsigned b0[kNb], b1[kNb];
 #pragma unroll
             for (int b = 0; b < kNb; ++b) {
-                const unsigned lo = jj == 0 ? xv[b].y : xv[b].x;
-                const unsigned hi = jj == 0 ? xv[b].w : xv[b].z;
-                b0[b] = __byte_perm(lo, hi, 0x7632);
-                b1[b] = __byte_perm(lo, hi, 0x5410);
+                b0[b] = jj == 0 ? xv[b].x : xv[b].z;
+                b1[b] = jj == 0 ? xv[b].y : xv[b].w;
             }
             const int p0 = 2 * jj;
 #pragma unroll
@@ -699,6 +712,13 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
     for (int ch = 0; ch < chunks; ++ch) {
         load_w(ch + 1, nw, ns);
         asm volatile("cp.async.wait_group %0;\n" ::"n"(kStages - 2));
+        // This thread's own runs of the chunk (visible to it past the wait)
+        // relaid as B words before the barrier shares them.
+        {
+            uint4* xs_w = staged_x + (ch % kStages) * kStageRuns;
+#pragma unroll
+            for (int j = 0; j < kNb; ++j) w4mma::lay_staged(xs_w + w4mma::x_slot((tid >> 4) + 8 * j, run));
+        }
         __syncthreads();
         if (rows_live) {
             const uint4* xs = staged_x + (ch % kStages) * kStageRuns;

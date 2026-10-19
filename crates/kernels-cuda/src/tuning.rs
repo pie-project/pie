@@ -38,7 +38,7 @@ pub struct MoeTc5From(pub u32);
 /// register-dequant MMA kernel with; 0 (never) but where a chip's profile
 /// says (B200's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.mxfp4_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
+#[decision(id = "kernel.moe.mxfp4_mma_until", constant(range(0..=16_777_216)), default = 0, tune = search)]
 pub struct MoeMxfp4MmaUntil(pub u32);
 
 /// The routes a routed NVFP4 select of bf16 activations (W4A16) runs on the

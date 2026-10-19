@@ -570,6 +570,13 @@ def _rewrite_muse_glimmer(cfg: dict, plan: Plan) -> None:
             tc[key] = _slice_list(tc[key], plan.src_layers)
 
 
+def _rewrite_muse_spark(cfg: dict, plan: Plan) -> None:
+    _rewrite_muse_glimmer(cfg, plan)
+    tc = _text_cfg(cfg, plan)
+    if isinstance(tc.get("mlp_layer_types"), list):
+        tc["mlp_layer_types"] = _slice_list(tc["mlp_layer_types"], plan.src_layers)
+
+
 def _rewrite_inkling(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     tc = _text_cfg(cfg, plan)
@@ -1396,6 +1403,33 @@ FAMILIES: dict[str, dict[str, Any]] = {
         config_rewrite=_rewrite_kimi_k3,
         text_cfg_key="text_config",
         keep_res=(re.compile(r"^vision_tower\."), re.compile(r"^mm_projector\.")),
+    ),
+    "muse_spark": dict(
+        layer_prefix="model.language_model.layers.",
+        # The routed bank stacked on dim 0, its NVFP4 planes (block scales,
+        # each expert's global and input scale) with it.
+        expert_re=None,
+        router_suffixes=(
+            "mlp.gate.weight",
+            "mlp.gate.e_score_correction_bias",
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.gate_up_proj_weight_scale",
+            "mlp.experts.gate_up_proj_weight_scale_2",
+            "mlp.experts.gate_up_proj_input_scale",
+            "mlp.experts.down_proj",
+            "mlp.experts.down_proj_weight_scale",
+            "mlp.experts.down_proj_weight_scale_2",
+            "mlp.experts.down_proj_input_scale",
+        ),
+        globals_keep=("model.language_model.embed_tokens.weight",
+                      "model.language_model.norm.weight",
+                      "lm_head.weight"),
+        # `muse-spark-open-mini-l8`: the first eight layers, the first (bf16
+        # experts) and two full-attention periods.
+        default_layers="0-7",
+        config_rewrite=_rewrite_muse_spark,
+        text_cfg_key="text_config",
+        keep_res=(re.compile(r"^model\.(vision|audio|multi_modal)"),),
     ),
     "muse_glimmer": dict(
         layer_prefix="model.language_model.layers.",
