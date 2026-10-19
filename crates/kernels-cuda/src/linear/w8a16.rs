@@ -85,7 +85,11 @@ pub fn matmul(
     if m == 0 {
         return Ok(true);
     }
-    if m > GEMM_UNTIL {
+    // A small plane at a batch's rows tiles too few CTAs to fill the card:
+    // widened (a few microseconds at its size) for cuBLAS, which splits K.
+    let sms = ctx.multiprocessors().unwrap_or(108);
+    let few = m > MMA_UNTIL && n.div_ceil(128) * m.div_ceil(64) < 2 * sms;
+    if m > GEMM_UNTIL || few {
         // A prefill's rows against the plane widened once, on cuBLAS.
         let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
         let tile = ctx.scratch_stream(op, DECODED_WEIGHT, bytes)? as usize as u64;

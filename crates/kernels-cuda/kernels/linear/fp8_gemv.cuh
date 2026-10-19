@@ -16,15 +16,35 @@ namespace fp8gemv {
 
 using ::pie::ld_stream;
 
+// The power of two a code's f32 falls short of its value by: none where the
+// e4m3 convert is (sm_89), 2^-8 where the codes are laid into f16 by integer
+// ops (an e4m3 exponent field in f16's, bias 15 for 7), the block's exponent
+// taking it back.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+constexpr unsigned kCodeBias = 8;
+#else
+constexpr unsigned kCodeBias = 0;
+#endif
+
 // Four e4m3 codes of a word as f32: two codes an f16 pair a convert.
 __device__ __forceinline__ void codes4(unsigned w, float (&out)[4]) {
     unsigned lo, hi;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+    // A code's sign replicated through its half's high byte, then shifted
+    // to f16's places: sign at 15, exponent field low four bits, mantissa
+    // the top three; an e4m3 subnormal an f16 subnormal, exact.
+    asm("prmt.b32 %0, %1, 0, 0x9180;" : "=r"(lo) : "r"(w));
+    asm("prmt.b32 %0, %1, 0, 0xB3A2;" : "=r"(hi) : "r"(w));
+    lo = (lo << 7) & 0xBF80BF80u;
+    hi = (hi << 7) & 0xBF80BF80u;
+#else
     asm("{ .reg .b16 a, b;\n"
         "mov.b32 {a, b}, %2;\n"
         "cvt.rn.f16x2.e4m3x2 %0, a;\n"
         "cvt.rn.f16x2.e4m3x2 %1, b; }\n"
         : "=r"(lo), "=r"(hi)
         : "r"(w));
+#endif
     float f0, f1, f2, f3;
     asm("{ .reg .f16 l, u;\n mov.b32 {l, u}, %2;\n cvt.f32.f16 %0, l;\n cvt.f32.f16 %1, u; }\n"
         : "=f"(f0), "=f"(f1) : "r"(lo));
@@ -77,7 +97,7 @@ __global__ void __launch_bounds__(kWarps * 32) fp8_block_gemv(
         for (int i = 0; i < kRows; ++i) {
             const int row = min(row0 + i, n - 1);
             w[i] = ld_stream(codes + static_cast<long long>(row) * k + c0);
-            s[i] = __uint_as_float(static_cast<unsigned>(atoms[atom_offset(row, c0 / 128, blocks)]) << 23);
+            s[i] = __uint_as_float((static_cast<unsigned>(atoms[atom_offset(row, c0 / 128, blocks)]) + kCodeBias) << 23);
         }
         // The activations' sixteen columns of each row, read through L1
         // (every warp of the block reads the same).

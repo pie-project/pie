@@ -82,8 +82,9 @@ __device__ __forceinline__ void compute(const Chunk<kTiles, kNb>& cc, float (&ac
 /// (`moe_route_order`), as `moe_select_mxfp4_mma` lands them; with `kGlu`
 /// the bank's `n` rows are `inter` gate rows and as many up rows and `out`
 /// the GLU.
-template <int kNb, int kDepth, int kGlu, int kGran>
-__global__ void __launch_bounds__(128) moe_select_fp8_mma(
+// `kTiles` and `kKSplit` as `moe_select_bf16_mma` takes them.
+template <int kNb, int kDepth, int kGlu, int kGran, int kTiles = 2, int kKSplit = 1>
+__global__ void __launch_bounds__(128 * kKSplit) moe_select_fp8_mma(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
     const i32* __restrict__ offsets,
@@ -100,7 +101,7 @@ __global__ void __launch_bounds__(128) moe_select_fp8_mma(
     float galpha)
 {
     static_assert(kGran == 32 || kGran == 128, "a block is 32 or 128 columns of K");
-    constexpr int kTiles = 2;
+    static_assert(kGlu == 0 || kTiles == 2, "a GLU warp is a gate tile and its up tile");
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
     constexpr int kRowsCta = 4 * kRowsWarp;
     constexpr int kSlice = 8 * kNb;
@@ -113,14 +114,16 @@ __global__ void __launch_bounds__(128) moe_select_fp8_mma(
     const int count = min(offsets[expert + 1] - begin, kSlice);
     if (count <= 0) return;
 
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int warp = (static_cast<int>(threadIdx.x) >> 5) & 3;
+    const int part = static_cast<int>(threadIdx.x) >> 7;
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int g = lane >> 2;
     const int c = lane & 3;
     const int row_base = static_cast<int>(blockIdx.y) * kRowsCta + warp * kRowsWarp;
     const int span = kGlu != 0 ? inter : n;
     auto tile_row = [&](int t) { return kGlu != 0 ? row_base + t * inter : row_base + 16 * t; };
-    if (row_base >= span) return;
+    if (kKSplit == 1 && row_base >= span) return;
+    const bool rows_live = row_base < span;
 
     const int chunks = k >> 6;
     const int kblocks = k / kGran;
@@ -171,19 +174,42 @@ __global__ void __launch_bounds__(128) moe_select_fp8_mma(
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
 
+    const int mine = rows_live && part < chunks ? (chunks - part + kKSplit - 1) / kKSplit : 0;
     Chunk ring[kDepth];
 #pragma unroll
     for (int d = 0; d < kDepth; ++d)
-        if (d < chunks) load(d, ring[d]);
-    for (int ch0 = 0; ch0 < chunks; ch0 += kDepth) {
+        if (d < mine) load(part + d * kKSplit, ring[d]);
+    for (int i0 = 0; i0 < mine; i0 += kDepth) {
 #pragma unroll
         for (int d = 0; d < kDepth; ++d) {
-            const int ch = ch0 + d;
-            if (ch < chunks) {
+            const int i = i0 + d;
+            if (i < mine) {
                 w8mma::compute(ring[d], acc);
-                if (ch + kDepth < chunks) load(ch + kDepth, ring[d]);
+                if (i + kDepth < mine) load(part + (i + kDepth) * kKSplit, ring[d]);
             }
         }
+    }
+    if constexpr (kKSplit > 1) {
+        constexpr int kAcc = kTiles * kNb * 4;
+        __shared__ float fold[kKSplit - 1][4][kAcc][32];
+        if (part > 0) {
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int b = 0; b < kNb; ++b)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) fold[part - 1][warp][(t * kNb + b) * 4 + e][lane] = acc[t][b][e];
+        }
+        __syncthreads();
+        if (part > 0 || !rows_live) return;
+#pragma unroll
+        for (int p = 0; p < kKSplit - 1; ++p)
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int b = 0; b < kNb; ++b)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) acc[t][b][e] += fold[p][warp][(t * kNb + b) * 4 + e][lane];
     }
 
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, [](int) { return 1.f; }, nullptr, order, begin, count,

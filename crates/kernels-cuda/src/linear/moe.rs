@@ -2164,7 +2164,8 @@ pub fn select_fp8_w8a16(
         Some(Glu::GegluTanh) => (4, 0.0, 1.0),
         Some(Glu::Situ { beta, cap }) => (5, beta, cap),
     };
-    let cols = if glu.is_some() { 64 } else { 128 };
+    let sms = ctx.multiprocessors().unwrap_or(108);
+    let wide = |cols: u32| y.width.div_ceil(cols);
     let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
     let experts = experts.clamp(1, EXPERT_CAP);
     let per = fan.route_count.div_ceil(experts);
@@ -2196,15 +2197,25 @@ pub fn select_fp8_w8a16(
             Share::Take
         },
     )?;
+    // A decode's few CTAs: half the rows a warp, then K split, as the bf16
+    // select takes them.
+    let tiles: u32 = if glu.is_none() && work_cap * wide(128) < 2 * sms { 1 } else { 2 };
+    let cols = if glu.is_some() { 64 } else { 64 * tiles };
+    let ctas = (work_cap * wide(cols)).max(1);
+    let ksplit = if nb == 1 {
+        (4 * sms).div_ceil(ctas).next_power_of_two().clamp(1, 4)
+    } else {
+        1
+    };
     let fire = Fire::at(
         "linear/moe_w8.cuh",
         symbol(&format!(
-            "::pie::linear::moe_select_fp8_mma<{nb}, {DEPTH}, {code}, {gran}>"
+            "::pie::linear::moe_select_fp8_mma<{nb}, {DEPTH}, {code}, {gran}, {tiles}, {ksplit}>"
         )),
     )
     .apply(Launch::grid(
-        [work_cap, y.width.div_ceil(cols), 1],
-        [THREADS, 1, 1],
+        [work_cap, wide(cols), 1],
+        [THREADS * ksplit, 1, 1],
     ));
     ctx.fire(
         op,

@@ -1697,6 +1697,11 @@ impl Run<'_> {
         let mut out = self.tensor(y);
         let k = act.width;
         let block = if atoms.width == 0 { 0 } else { k.div_ceil(atoms.width) };
+        // A decode's few rows over 128-wide blocks as the GEMV over bf16 rows
+        // (`kernel.gemm.fp8_gemv_until`), as the tcgen05 path takes them.
+        if block == 128 && act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)? {
+            return Ok(());
+        }
         if linear::w8a16::matmul(self.ctx(), op, act, codes.ptr, atoms.ptr, block, &mut out)? {
             return Ok(());
         }

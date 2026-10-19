@@ -192,8 +192,12 @@ fn the_fp8_block_projections_answer_the_dot() {
     let cases = [(0, 2, 1, 4096, 2048), (0, 4, 1, 8192, 1024), (0, 4, 1, 32768, 1024),
         (0, 8, 1, 1024, 4096), (1, 3, 8, 256, 1024), (2, 37, 4, 256, 1024), (3, 1, 1, 640, 6144),
         (3, 3, 1, 1024, 1536)];
+    // The mma.sync fp8 kernels (arms 0 and 1) are sm_89's: an Ada's e4m3 MMA.
+    let fp8_mma = kernels_cuda::jit::cache::arch()
+        .and_then(|a| a.trim_start_matches("sm_").trim_end_matches(char::is_alphabetic).parse::<u32>().ok())
+        .is_some_and(|cc| cc >= 89);
     for (arm, rows, groups, n, k) in cases {
-        if !supported() && arm >= 2 {
+        if (!supported() && arm == 2) || (!fp8_mma && arm <= 1) {
             continue;
         }
         let mut b = Bench::new(0xf8 + rows as u64);
@@ -332,7 +336,7 @@ fn the_w8a16_times() {
                 })
                 .collect()
         })
-        .unwrap_or_else(|| vec![(1, 13568, 4096), (32, 13568, 4096), (128, 13568, 4096), (256, 13568, 4096), (4096, 13568, 4096)]);
+        .unwrap_or_else(|| vec![(1, 13568, 4096), (1, 2048, 2048), (1, 4096, 2048), (1, 2048, 4096), (4, 2048, 2048), (32, 13568, 4096), (128, 13568, 4096), (256, 13568, 4096), (4096, 13568, 4096)]);
     for (m, n, k) in shapes {
         let mut b = Bench::new(7);
         let (x, _) = b.bf16(m * k);
@@ -355,6 +359,13 @@ fn the_w8a16_times() {
         let ours = time(&mut || {
             w8a16::matmul(&ctx, "time", act, codes, atoms, 128, &mut y).expect("fires");
         });
+        if m <= 4 && k % 512 == 0 {
+            let g = b.ctx().with_tuning(GEMV);
+            let gemv = time(&mut || {
+                assert!(act_quant::fp8_block_gemv(&g, act, codes, atoms, &mut y).expect("fires"));
+            });
+            eprintln!("  fp8 GEMV {m}x{n}x{k}: {gemv:.1} us ({:.0} GB/s)", (n * k) as f64 / gemv / 1e3);
+        }
         w8a16::widen(&ctx, "time", codes, atoms, 128, n as u32, k as u32, wide).expect("widens");
         let cublas = time(&mut || {
             gemm::act_x_wt(&ctx, "time", act, t(wide, n, k, Bf16), None, &mut y).expect("fires");
