@@ -58,13 +58,25 @@ impl Stamp {
     /// The dynamic shared memory a block holds (`Shape::SMEM_BYTES`).
     #[must_use]
     pub const fn smem(self) -> u32 {
+        self.smem_over(false)
+    }
+
+    /// [`Stamp::smem`] over an e4m3 pool's pages, staged raw before they
+    /// widen.
+    #[must_use]
+    pub const fn smem_over(self, e4m3: bool) -> u32 {
         let head_dim = self.head_dim;
         let ld = head_dim + 8;
         let tile = 16 * self.mt;
         let staged = self.warps * self.stages * 2 * tile * ld * 2;
         let fold = self.warps * (8 * head_dim + 16) * 4;
         let region = if staged > fold { staged } else { fold };
-        region + (8 * ld + self.warps * tile * 8) * 2
+        let raw = if e4m3 {
+            self.warps * self.stages * 2 * tile * head_dim
+        } else {
+            0
+        };
+        region + (8 * ld + self.warps * tile * 8) * 2 + raw
     }
 }
 
@@ -155,23 +167,25 @@ pub fn takes(ctx: &Ctx, plan: &DecodePlan, pool: &KvPool, rel: bool) -> bool {
         && !rel
         && plan.shape.num_kv_heads * group == plan.shape.num_q_heads
         && !plan.shape.hnd_layout
-        && pool.keys.dtype == Dtype::Bf16
-        && pool.values.dtype == Dtype::Bf16
+        && (pool.keys.dtype == Dtype::Bf16 && pool.values.dtype == Dtype::Bf16
+            || crate::attn::kv::native_e4m3(pool))
         && Stamp::of(head_dim).is_some_and(|stamp| {
             ctx.smem_per_block_optin()
-                .is_some_and(|cap| cap >= stamp.smem())
+                .is_some_and(|cap| cap >= stamp.smem_over(crate::attn::kv::native_e4m3(pool)))
         })
 }
 
 /// Fires the tensor-core decode over `params` (the FA2 decode's, its output
 /// already the split's partial plane where the plan splits). With `sinks`
-/// and no split, the sinks scale the output in the same pass.
+/// and no split, the sinks scale the output in the same pass. `e4m3` reads
+/// the pages as an e4m3 pool's.
 pub fn decode(
     ctx: &Ctx,
     op: &'static str,
     plan: &DecodePlan,
     params: &DecodeParams,
     sinks: Option<Tensor>,
+    e4m3: bool,
 ) -> Result<(), Error> {
     let head_dim = plan.shape.head_dim;
     let stamp = Stamp::of(head_dim).ok_or_else(|| {
@@ -190,19 +204,19 @@ pub fn decode(
         [plan.shape.num_kv_heads * ranks, params.padded_batch_size, 1],
         [32 * stamp.warps, 1, 1],
     );
+    let smem = stamp.smem_over(e4m3);
     let launch = if ranks > 1 {
-        launch
-            .cluster(ranks)
-            .smem(stamp.smem() + (8 * head_dim + 8) * 4)
+        launch.cluster(ranks).smem(smem + (8 * head_dim + 8) * 4)
     } else {
-        launch.smem(stamp.smem())
+        launch.smem(smem)
     };
+    let pages = if e4m3 { ", ::pie::u8" } else { "" };
     ctx.fire(
         op,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::attn::xqa::decode<{head_dim}, {}, {}, {}, {sink_ty}>",
+                "::pie::attn::xqa::decode<{head_dim}, {}, {}, {}, {sink_ty}{pages}>",
                 stamp.mt, stamp.warps, stamp.stages
             )),
         )

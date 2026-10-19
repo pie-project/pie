@@ -45,13 +45,34 @@ fn instantiated(op: &'static str, head_dim: u32) -> Result<(), Error> {
     ))
 }
 
+/// An e4m3 pool's plain arms read it as it is; the others read bf16 pages.
+fn e4m3_arm(op: &'static str, kv: KvWidth, plain: bool) -> Result<bool, Error> {
+    match (kv == KvWidth::E4M3, plain) {
+        (false, _) => Ok(false),
+        (true, true) => Ok(true),
+        (true, false) => Err(refuse(
+            op,
+            "an e4m3 pool is read by the plain arms alone; this arm reads bf16 pages",
+        )),
+    }
+}
+
 fn decode_symbol(
     op: &'static str,
     g: &DecodeGeometry,
     arm: DecodeArm,
+    kv: KvWidth,
 ) -> Result<&'static str, Error> {
     instantiated(op, g.head_dim)?;
+    let plain = matches!(
+        arm,
+        DecodeArm::Full | DecodeArm::Softcap | DecodeArm::Window
+    );
+    let e4m3 = e4m3_arm(op, kv, plain)?;
     let (variant, params) = match arm {
+        DecodeArm::Full if e4m3 => ("VariantFull", "DecodeParams8"),
+        DecodeArm::Softcap if e4m3 => ("VariantWindowSoftcap", "DecodeParams8"),
+        DecodeArm::Window if e4m3 => ("VariantWindow", "DecodeParams8"),
         DecodeArm::Full => ("VariantFull", "DecodeParams"),
         DecodeArm::Softcap => ("VariantWindowSoftcap", "DecodeParams"),
         DecodeArm::Window => ("VariantWindow", "DecodeParams"),
@@ -78,8 +99,19 @@ fn prefill_symbol(
     op: &'static str,
     g: &PrefillGeometry,
     arm: PrefillArm,
+    kv: KvWidth,
 ) -> Result<&'static str, Error> {
     instantiated(op, g.head_dim)?;
+    let plain = matches!(
+        arm,
+        PrefillArm::CausalFullSoftcap
+            | PrefillArm::NoneFullSoftcap
+            | PrefillArm::CausalFull
+            | PrefillArm::NoneFull
+            | PrefillArm::CausalSoftcap
+            | PrefillArm::CausalWindow
+    );
+    let e4m3 = e4m3_arm(op, kv, plain)?;
     let (mask, variant, params) = match arm {
         PrefillArm::CausalFullSoftcap => ("kCausal", "VariantFullSoftcap", "PrefillParams"),
         PrefillArm::NoneFullSoftcap => ("kNone", "VariantFullSoftcap", "PrefillParams"),
@@ -94,11 +126,19 @@ fn prefill_symbol(
         PrefillArm::CausalRelBiasFull => ("kCausal", "VariantRelBiasFull", "PrefillRelParams"),
         PrefillArm::CausalRelBiasWindow => ("kCausal", "VariantRelBiasWindow", "PrefillRelParams"),
     };
+    let (params, pages) = if e4m3 {
+        (
+            "PrefillParams8",
+            ", ::pie::attn::fa2::PrefillParams8, __nv_fp8_e4m3",
+        )
+    } else {
+        (params, "")
+    };
     Ok(symbol(&format!(
         "::flashinfer::BatchPrefillWithPagedKVCacheKernel<\
          ::pie::attn::fa2::PagedTraits<::flashinfer::MaskMode::{mask}, \
          {q}, {mmaq}, {kv}, {dqk}, {dvo}, {wq}, {wkv}, \
-         ::pie::attn::fa2::{variant}>, ::pie::attn::fa2::{params}>",
+         ::pie::attn::fa2::{variant}{pages}>, ::pie::attn::fa2::{params}>",
         q = g.cta_tile_q,
         mmaq = g.num_mma_q,
         kv = g.num_mma_kv,
@@ -151,6 +191,7 @@ pub struct DecodePoint {
     pub head_dim: u32,
     pub group_size: u32,
     pub arm: DecodeArm,
+    pub kv: KvWidth,
     pub padded_batch_size: u32,
     pub num_kv_heads: u32,
     pub device: Device,
@@ -161,6 +202,7 @@ pub struct PrefillPoint {
     pub head_dim: u32,
     pub cta_tile_q: u32,
     pub arm: PrefillArm,
+    pub kv: KvWidth,
     pub padded_batch_size: u32,
     pub num_kv_heads: u32,
     pub device: Device,
@@ -172,11 +214,11 @@ pub(crate) fn decode<P>(
     at: DecodePoint,
     params: &P,
 ) -> Result<(), Error> {
-    let geometry = DecodeGeometry::derive(op, at.head_dim, at.group_size, KvWidth::BF16)?;
+    let geometry = DecodeGeometry::derive(op, at.head_dim, at.group_size, at.kv)?;
 
     ctx.fire(
         op,
-        Fire::at(FILE, decode_symbol(op, &geometry, at.arm)?).apply(
+        Fire::at(FILE, decode_symbol(op, &geometry, at.arm, at.kv)?).apply(
             Launch::grid(
                 DecodeGeometry::grid(at.padded_batch_size, at.num_kv_heads),
                 geometry.block(),
@@ -193,11 +235,10 @@ pub(crate) fn prefill<P>(
     at: PrefillPoint,
     params: &P,
 ) -> Result<(), Error> {
-    let geometry =
-        PrefillGeometry::derive(op, at.head_dim, at.cta_tile_q, KvWidth::BF16, &at.device)?;
+    let geometry = PrefillGeometry::derive(op, at.head_dim, at.cta_tile_q, at.kv, &at.device)?;
     ctx.fire(
         op,
-        Fire::at(FILE, prefill_symbol(op, &geometry, at.arm)?).apply(
+        Fire::at(FILE, prefill_symbol(op, &geometry, at.arm, at.kv)?).apply(
             Launch::grid(
                 PrefillGeometry::grid(at.padded_batch_size, at.num_kv_heads),
                 geometry.block(),
@@ -495,7 +536,7 @@ fn decode_blocks_per_sm_uncached(head_dim: u32, group_size: u32) -> Option<u32> 
 
     const OP: &str = "attention.plan_decode";
     let geometry = DecodeGeometry::derive(OP, head_dim, group_size, KvWidth::BF16).ok()?;
-    let entrypoint = decode_symbol(OP, &geometry, DecodeArm::Full).ok()?;
+    let entrypoint = decode_symbol(OP, &geometry, DecodeArm::Full, KvWidth::BF16).ok()?;
     let root = crate::jit::Root::of(FILE)?;
     let resolved = crate::jit::cache::resolve(&root, entrypoint).ok()?;
 
@@ -560,6 +601,8 @@ pub struct KvWidth(pub u32);
 
 impl KvWidth {
     pub const BF16: Self = Self(2);
+
+    pub const E4M3: Self = Self(1);
 
     pub const POINTER: u32 = 8;
 }
@@ -908,7 +951,14 @@ impl PrefillGeometry {
 
         off = align16(off) + 1;
         off = align16(off) + 1;
-        off = align16(off) + q_width;
+        // An e4m3 tile's bf16 repack (`USE_KV_REPACK`).
+        let repack = kv.0 == 1 && head_dim != 64 && head_dim <= 256 && cta_tile_q > 16;
+        off = align16(off)
+            + if repack {
+                cta_tile_kv * head_dim * q_width
+            } else {
+                q_width
+            };
         off = align16(off)
             + if vo_split {
                 cta_tile_q * cta_tile_kv * q_width

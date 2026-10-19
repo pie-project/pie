@@ -15,7 +15,10 @@ MODELS = [
 
 RELEASE = [dtype.bf16, dtype.nvfp4a4, dtype.e4m3tile128a8]
 
+# Keys and values cached e4m3, as vLLM serves the export (its scales are
+# one); the miniature also bf16.
 DEPLOYMENTS = [
-    deployment("nemotron3-super", weights = RELEASE, kv = dtype.bf16),
+    deployment("nemotron3-super", weights = RELEASE, kv = dtype.e4m3),
+    deployment("nemotron3-super-mini", weights = RELEASE, kv = dtype.e4m3),
     deployment("nemotron3-super-mini", weights = RELEASE, kv = dtype.bf16),
 ]

@@ -111,7 +111,7 @@ __device__ __forceinline__ unsigned pack(float lo, float hi) {
     return bits;
 }
 
-template <int HEAD_DIM, int MT, int WARPS, int STAGES>
+template <int HEAD_DIM, int MT, int WARPS, int STAGES, bool FP8 = false>
 struct Shape {
     // A 16-byte pad a row puts the eight rows one `ldmatrix` reads in eight
     // bank groups.
@@ -127,14 +127,18 @@ struct Shape {
     // The warps' states, folded through the staged region once it drains.
     static constexpr int FOLD_BYTES = WARPS * (8 * HEAD_DIM + 16) * 4;
     static constexpr int REGION = STAGED_BYTES > FOLD_BYTES ? STAGED_BYTES : FOLD_BYTES;
-    static constexpr int SMEM_BYTES = REGION + (Q_ELEMS + WARPS * P_ELEMS) * 2;
+    // An e4m3 pool's K and V land raw first, a stage a warp, and widen to
+    // the bf16 tiles the products read.
+    static constexpr int RAW_OFF = REGION + (Q_ELEMS + WARPS * P_ELEMS) * 2;
+    static constexpr int RAW_STAGE = 2 * TILE * HEAD_DIM;
+    static constexpr int SMEM_BYTES = RAW_OFF + (FP8 ? WARPS * STAGES * RAW_STAGE : 0);
 };
 
-template <int HEAD_DIM, int MT, int WARPS, int STAGES, class S>
+template <int HEAD_DIM, int MT, int WARPS, int STAGES, class S, class KV = bf16>
 __global__ void __launch_bounds__(32 * WARPS) decode(
     const bf16* __restrict__ q,
-    const bf16* __restrict__ k_data,
-    const bf16* __restrict__ v_data,
+    const KV* __restrict__ k_data,
+    const KV* __restrict__ v_data,
     const i32* __restrict__ page_indices,
     const i32* __restrict__ page_indptr,
     const i32* __restrict__ last_page_len,
@@ -158,7 +162,9 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
     const S* __restrict__ sinks,
     u32 ranks)
 {
-    using Sh = Shape<HEAD_DIM, MT, WARPS, STAGES>;
+    constexpr bool FP8 = sizeof(KV) == 1;
+    using Sh = Shape<HEAD_DIM, MT, WARPS, STAGES, FP8>;
+    constexpr int CHUNKS8 = HEAD_DIM / 16;  // 16-byte pieces an e4m3 row
     constexpr int LD = Sh::LD;
     constexpr int TILE = Sh::TILE;
     constexpr int DT = HEAD_DIM / 16;
@@ -220,6 +226,9 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
     const long long head_off = static_cast<long long>(kv_head) * stride_h;
     // Stage the warp's j-th tile (the chunk's tile warp + j * WARPS): lane
     // r < TILE finds row r's cell once, and the copies read it off a shuffle.
+    auto raw_of = [&](int stage) {
+        return smem_raw + Sh::RAW_OFF + (warp * STAGES + stage) * Sh::RAW_STAGE;
+    };
     auto load = [&](int j, int stage) {
         const int tile = warp + j * WARPS;
         bf16* ks = mine + stage * Sh::STAGE_ELEMS;
@@ -235,6 +244,21 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
                        static_cast<long long>(entry) * stride_n + head_off;
             }
         }
+        if constexpr (FP8) {
+            unsigned char* rk = raw_of(stage);
+            unsigned char* rv = rk + TILE * HEAD_DIM;
+#pragma unroll
+            for (int e = lane; e < TILE * CHUNKS8; e += 32) {
+                const int r = e / CHUNKS8;
+                const int c = e % CHUNKS8;
+                long long at = __shfl_sync(0xffffffffu, cell, r & 31);
+                const bool live = at >= 0;
+                at = live ? at + c * 16 : 0;
+                cp16(rk + r * HEAD_DIM + c * 16, k_data + at, live);
+                cp16(rv + r * HEAD_DIM + c * 16, v_data + at, live);
+            }
+            return;
+        }
 #pragma unroll
         for (int e = lane; e < TILE * CHUNKS; e += 32) {
             const int r = e / CHUNKS;
@@ -244,6 +268,29 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
             at = live ? at + c * 8 : 0;
             cp16(ks + r * LD + c * 8, k_data + at, live);
             cp16(vs + r * LD + c * 8, v_data + at, live);
+        }
+    };
+    // An e4m3 stage's raw rows widened into its bf16 tiles (exact).
+    auto widen = [&](int stage) {
+        const unsigned char* rk = raw_of(stage);
+        bf16* ks = mine + stage * Sh::STAGE_ELEMS;
+#pragma unroll
+        for (int e = lane; e < 2 * TILE * CHUNKS8; e += 32) {
+            const int half = e / (TILE * CHUNKS8);
+            const int r = (e / CHUNKS8) % TILE;
+            const int c = e % CHUNKS8;
+            const uint4 w = *reinterpret_cast<const uint4*>(rk + half * TILE * HEAD_DIM + r * HEAD_DIM + c * 16);
+            const unsigned words[4] = {w.x, w.y, w.z, w.w};
+            unsigned out[8];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const unsigned x = words[u];
+                out[2 * u] = pack(e4m3_to_f32(x & 0xff), e4m3_to_f32((x >> 8) & 0xff));
+                out[2 * u + 1] = pack(e4m3_to_f32((x >> 16) & 0xff), e4m3_to_f32(x >> 24));
+            }
+            uint4* dst = reinterpret_cast<uint4*>(ks + half * Sh::TILE_ELEMS + r * LD + c * 16);
+            dst[0] = make_uint4(out[0], out[1], out[2], out[3]);
+            dst[1] = make_uint4(out[4], out[5], out[6], out[7]);
         }
     };
 
@@ -272,6 +319,10 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
         cp_commit();
         cp_wait<STAGES - 1>();
         __syncwarp();
+        if constexpr (FP8) {
+            widen(stage);
+            __syncwarp();
+        }
         const bf16* ks = mine + stage * Sh::STAGE_ELEMS;
         const bf16* vs = ks + Sh::TILE_ELEMS;
         const int base = chunk_start + (warp + j * WARPS) * TILE;

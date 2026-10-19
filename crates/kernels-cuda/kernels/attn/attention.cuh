@@ -124,6 +124,12 @@ using VariantCustomSoftcap = ::flashinfer::DefaultAttention<true, true, true, fa
 using DecodeParams = ::flashinfer::BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 using PrefillParams = ::flashinfer::BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 
+// An e4m3 pool's (vLLM's `fp8` KV, a unit scale): its pages read as they
+// are, the queries bf16.
+using DTypeKV8 = __nv_fp8_e4m3;
+using DecodeParams8 = ::flashinfer::BatchDecodeParams<DTypeQ, DTypeKV8, DTypeO, IdType>;
+using PrefillParams8 = ::flashinfer::BatchPrefillPagedParams<DTypeQ, DTypeKV8, DTypeO, IdType>;
+
 using CaptureWindow = PieScoreCapture<VariantWindow>;
 using CaptureFull = PieScoreCapture<VariantFull>;
 using CapturePrefill = PieScoreCaptureWindow<VariantFull>;
@@ -196,10 +202,10 @@ using PrefillRelParams = RelBiasParams<PrefillParams>;
 template <::flashinfer::MaskMode MASK, std::uint32_t CTA_TILE_Q, std::uint32_t NUM_MMA_Q,
           std::uint32_t NUM_MMA_KV, std::uint32_t NUM_MMA_D_QK, std::uint32_t NUM_MMA_D_VO,
           std::uint32_t NUM_WARPS_Q, std::uint32_t NUM_WARPS_KV, class Variant,
-          class Params = PrefillParams>
+          class Params = PrefillParams, class KV = DTypeKV>
 using PagedTraits =
     ::flashinfer::KernelTraits<MASK, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
-                              NUM_WARPS_Q, NUM_WARPS_KV, POS_ENC, DTypeQ, DTypeKV, DTypeO, float,
+                              NUM_WARPS_Q, NUM_WARPS_KV, POS_ENC, DTypeQ, KV, DTypeO, float,
                               IdType, Variant>;
 
 template <class KTraits>

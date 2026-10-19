@@ -155,7 +155,7 @@ pub(crate) fn try_prefill(
         && supported()
         && matches!(head_dim, 64 | 128 | 256 | 512)
         && requests > 0
-        && kv::native_bf16(pool)
+        && (kv::native_bf16(pool) || kv::native_e4m3(pool))
         && pool.layout == NHD
         && page >= 16
         && page.is_multiple_of(16)
@@ -172,6 +172,28 @@ pub(crate) fn try_prefill(
     };
     if !fits {
         return Ok(false);
+    }
+    // An e4m3 pool's pages the fire reads widen to a bf16 shadow first (a
+    // prefill reads each page many times over; the widening once), past a
+    // cap FA2 reads them as they are.
+    if kv::native_e4m3(pool) {
+        const SHADOW_CAP: usize = 1 << 30;
+        return match kv::widen_e4m3(ctx, op, pool, SHADOW_CAP)? {
+            Some(shadow) => try_prefill(
+                ctx,
+                op,
+                q,
+                plan,
+                &shadow,
+                window_left,
+                head_dim,
+                sm_scale,
+                o,
+                lse,
+                sinks,
+            ),
+            None => Ok(false),
+        };
     }
     let kv_heads = shape.num_kv_heads;
     let cells = pool.keys.rows;

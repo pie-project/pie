@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_fp8.h>
+
 #include "prelude/device.cuh"
 
 namespace pie::custom {
@@ -9,12 +11,45 @@ __device__ __forceinline__ float norm_weight(const bf16* __restrict__ w, int i) 
     return w != nullptr ? bf16_to_f32(w[i]) : 1.f;
 }
 
-template <int BLOCK, bool USE_ROPE_TABLE>
+template <int E>
+__device__ __forceinline__ void store_bf16_run(bf16* __restrict__ at, const float (&in)[E]);
+
+// A head's landing row: the query output, or a key or value page row as the
+// pool holds it (bf16, or e4m3 under a unit scale).
+template <class KV>
+struct HeadDst {
+    bf16* q = nullptr;
+    KV* kv = nullptr;
+
+    __device__ __forceinline__ void put(int i, float x) const {
+        if (q != nullptr) {
+            q[i] = f32_to_bf16(x);
+        } else if constexpr (is_same<KV, bf16>::value) {
+            kv[i] = f32_to_bf16(x);
+        } else {
+            kv[i] = KV(x);
+        }
+    }
+
+    template <int E>
+    __device__ __forceinline__ void run(int at, const float (&in)[E]) const {
+        if (q != nullptr) {
+            store_bf16_run<E>(q + at, in);
+        } else if constexpr (is_same<KV, bf16>::value) {
+            store_bf16_run<E>(kv + at, in);
+        } else {
+#pragma unroll
+            for (int i = 0; i < E; ++i) kv[at + i] = KV(in[i]);
+        }
+    }
+};
+
+template <int BLOCK, bool USE_ROPE_TABLE, class KV = bf16>
 __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
     const bf16* __restrict__ packed,
     bf16* __restrict__ q_out,
-    bf16* __restrict__ k_pages,
-    bf16* __restrict__ v_pages,
+    KV* __restrict__ k_pages,
+    KV* __restrict__ v_pages,
     const bf16* __restrict__ q_weight,
     const bf16* __restrict__ k_weight,
     const i32* __restrict__ positions,
@@ -81,10 +116,10 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
         __syncthreads();
     }
 
-    bf16* dst = nullptr;
-    bf16* v_dst = nullptr;
+    HeadDst<KV> dst;
+    HeadDst<KV> v_dst;
     if (is_q) {
-        dst = q_out + (static_cast<long long>(row) * num_q_heads + local_head) *
+        dst.q = q_out + (static_cast<long long>(row) * num_q_heads + local_head) *
                       head_dim;
     } else {
         int actual_page;
@@ -108,21 +143,21 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
             const long long page_row =
                 ((static_cast<long long>(actual_page) * num_kv_heads +
                   local_head) * page_size + offset_in_page) * head_dim;
-            dst = k_pages + page_row;
-            v_dst = v_pages + page_row;
+            dst.kv = k_pages + page_row;
+            v_dst.kv = v_pages + page_row;
         } else {
             const long long page_row =
                 ((static_cast<long long>(actual_page) * page_size) +
                  offset_in_page) * kv_dim;
-            dst = k_pages + page_row + local_head * head_dim;
-            v_dst = v_pages + page_row + local_head * head_dim;
+            dst.kv = k_pages + page_row + local_head * head_dim;
+            v_dst.kv = v_pages + page_row + local_head * head_dim;
         }
     }
 
     if (!is_q) {
         const float inv_v = v_norm ? rsqrtf(buf_v[0] / static_cast<float>(head_dim) + eps) : 1.f;
         for (int i = threadIdx.x; i < head_dim; i += BLOCK) {
-            v_dst[i] = f32_to_bf16(bf16_to_f32(v_src[i]) * inv_v);
+            v_dst.put(i, bf16_to_f32(v_src[i]) * inv_v);
         }
     }
 
@@ -157,17 +192,17 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
             cos_v = 1.f;
             sin_v = 0.f;
         }
-        dst[dim_pair] = f32_to_bf16(a * cos_v - b * sin_v);
-        dst[dim_pair + half] = f32_to_bf16(b * cos_v + a * sin_v);
+        dst.put(dim_pair, a * cos_v - b * sin_v);
+        dst.put(dim_pair + half, b * cos_v + a * sin_v);
     }
 }
 
-template <int HEAD_DIM, bool USE_ROPE_TABLE>
+template <int HEAD_DIM, bool USE_ROPE_TABLE, class KV = bf16>
 __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     const bf16* __restrict__ packed,
     bf16* __restrict__ q_out,
-    bf16* __restrict__ k_pages,
-    bf16* __restrict__ v_pages,
+    KV* __restrict__ k_pages,
+    KV* __restrict__ v_pages,
     const bf16* __restrict__ q_weight,
     const bf16* __restrict__ k_weight,
     const i32* __restrict__ positions,
@@ -292,10 +327,10 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
         vals[i] = vals[i] * cos_v + signed_pair * sin_v;
     }
 
-    bf16* dst = nullptr;
-    bf16* v_dst = nullptr;
+    HeadDst<KV> dst;
+    HeadDst<KV> v_dst;
     if (is_q) {
-        dst = q_out + (static_cast<long long>(row) * num_q_heads + local_head) *
+        dst.q = q_out + (static_cast<long long>(row) * num_q_heads + local_head) *
                       HEAD_DIM;
     } else {
         int actual_page;
@@ -319,28 +354,28 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
             const long long page_row =
                 ((static_cast<long long>(actual_page) * num_kv_heads +
                   local_head) * page_size + offset_in_page) * HEAD_DIM;
-            dst = k_pages + page_row;
-            v_dst = v_pages + page_row;
+            dst.kv = k_pages + page_row;
+            v_dst.kv = v_pages + page_row;
         } else {
             const long long page_row =
                 ((static_cast<long long>(actual_page) * page_size) +
                  offset_in_page) * kv_dim;
-            dst = k_pages + page_row + local_head * HEAD_DIM;
-            v_dst = v_pages + page_row + local_head * HEAD_DIM;
+            dst.kv = k_pages + page_row + local_head * HEAD_DIM;
+            v_dst.kv = v_pages + page_row + local_head * HEAD_DIM;
         }
     }
 
 #pragma unroll
     for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
         const int dim = lane * ELEMS_PER_THREAD + i;
-        dst[dim] = f32_to_bf16(vals[i]);
+        dst.put(dim, vals[i]);
     }
     if (!is_q) {
         const float inv_v = v_norm ? rsqrtf(v_sum / static_cast<float>(HEAD_DIM) + eps) : 1.f;
 #pragma unroll
         for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
             const int dim = lane * ELEMS_PER_THREAD + i;
-            v_dst[dim] = f32_to_bf16(v_vals[i] * inv_v * v_scale);
+            v_dst.put(dim, v_vals[i] * inv_v * v_scale);
         }
     }
 }
@@ -408,12 +443,12 @@ __device__ __forceinline__ void store_bf16_run(bf16* __restrict__ at, const floa
 // whole 16-byte words. With E = 8 entries a lane (a 64- or 128-wide head's
 // word) a head takes part of the warp and the warp several heads at once,
 // its sums adding in another order than the warp kernel's.
-template <int HEAD_DIM, int E = HEAD_DIM / 32>
+template <int HEAD_DIM, int E = HEAD_DIM / 32, class KV = bf16>
 __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     const bf16* __restrict__ packed,
     bf16* __restrict__ q_out,
-    bf16* __restrict__ k_pages,
-    bf16* __restrict__ v_pages,
+    KV* __restrict__ k_pages,
+    KV* __restrict__ v_pages,
     const bf16* __restrict__ q_weight,
     const bf16* __restrict__ k_weight,
     const i32* __restrict__ positions,
@@ -572,31 +607,31 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
         }
 
         if (!on) continue;
-        bf16* dst;
-        bf16* v_dst = nullptr;
+        HeadDst<KV> dst;
+        HeadDst<KV> v_dst;
         if (is_q) {
-            dst = q_out + (static_cast<long long>(row) * num_q_heads + local_head) * HEAD_DIM;
+            dst.q = q_out + (static_cast<long long>(row) * num_q_heads + local_head) * HEAD_DIM;
         } else if (hnd_layout) {
             const long long page_row =
                 ((static_cast<long long>(actual_page) * num_kv_heads +
                   local_head) * page_size + offset_in_page) * HEAD_DIM;
-            dst = k_pages + page_row;
-            v_dst = v_pages + page_row;
+            dst.kv = k_pages + page_row;
+            v_dst.kv = v_pages + page_row;
         } else {
             const long long page_row =
                 ((static_cast<long long>(actual_page) * page_size) +
                  offset_in_page) * kv_dim;
-            dst = k_pages + page_row + local_head * HEAD_DIM;
-            v_dst = v_pages + page_row + local_head * HEAD_DIM;
+            dst.kv = k_pages + page_row + local_head * HEAD_DIM;
+            v_dst.kv = v_pages + page_row + local_head * HEAD_DIM;
         }
-        store_bf16_run<ELEMS_PER_THREAD>(dst + run, vals);
+        dst.template run<ELEMS_PER_THREAD>(run, vals);
         if (!is_q) {
             const float inv_v = v_norm ? rsqrtf(v_sum / static_cast<float>(HEAD_DIM) + eps) : 1.f;
 #pragma unroll
             for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
                 v_vals[i] = v_vals[i] * inv_v * v_scale;
             }
-            store_bf16_run<ELEMS_PER_THREAD>(v_dst + run, v_vals);
+            v_dst.template run<ELEMS_PER_THREAD>(run, v_vals);
         }
     }
 }

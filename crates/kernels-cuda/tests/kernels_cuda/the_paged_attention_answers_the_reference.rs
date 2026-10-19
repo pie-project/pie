@@ -4,8 +4,10 @@
 //! `prefill_lse` and their sinked forms) against the host softmax, one case a route.
 
 use crate::common::attn_ref::{attend, col, landed, near, pool, ten, tuned};
+use crate::common::host::to_e4m3;
+use crate::common::tc5::e4m3;
 use crate::common::{Gpu, Lcg, from_bf16, host::upload_to};
-use dtype::Dtype::{Bf16, F32, I32};
+use dtype::Dtype::{Bf16, E4m3, F32, I32};
 use kernels_cuda::attn::plan::{self, Device, Live, Shape, Toggles, Workspace};
 use kernels_cuda::attn::{self, fa2::decode_max_grid_size as grid_of};
 use kernels_cuda::tensor::{KvPool, RaggedTensor};
@@ -35,12 +37,12 @@ fn check(
     lanes: Lanes,
     tuning: Tuning,
 ) {
-    check_live(heads, reqs, window, flags, lanes, tuning, [0, 0]);
+    check_live(heads, reqs, window, flags, lanes, tuning, [0, 0], false);
 }
 
 /// [`check`] with heads zero-padded past `live` (a key's and a value's
-/// widths; `[0, 0]` none), the pool saying so.
-#[allow(clippy::too_many_lines)]
+/// widths; `[0, 0]` none), the pool saying so; its pages e4m3 where `fp8`.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn check_live(
     heads: [usize; 3],
     reqs: &[(usize, usize)],
@@ -49,6 +51,7 @@ fn check_live(
     lanes: Lanes,
     tuning: Tuning,
     live: [usize; 2],
+    fp8: bool,
 ) {
     let ([qh, kvh, d], [graph, sinked], n) = (heads, flags, reqs.len());
     let (width, qw, scale) = (kvh * d, qh * d, (d as f32).sqrt().recip());
@@ -82,6 +85,17 @@ fn check_live(
             (raw[i], x[i]) = (0, 0.0);
         }
     }
+    // An e4m3 pool's pages hold each value's nearest code.
+    let codes = |x: &mut Vec<f32>| -> Vec<u8> {
+        let c: Vec<u8> = x.iter().map(|&v| to_e4m3(v)).collect();
+        x.iter_mut().zip(&c).for_each(|(v, &c)| *v = e4m3(c));
+        c
+    };
+    let (k8, v8) = if fp8 {
+        (codes(&mut k), codes(&mut v))
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let sinks: Vec<f32> = (0..qh).map(|h| 0.5 * (h % 7) as f32 - 1.0).collect();
     let sunk = sinked.then_some(&sinks[..]);
     let (want_o, want_lse) = attend([&q, &k, &v], [qh, kvh, d, d], scale, sunk, |row, _| {
@@ -94,8 +108,18 @@ fn check_live(
     let flat: Vec<i32> = pages.iter().flatten().map(|&p| p as i32).collect();
     let ids = col(&mut gpu, &flat, I32);
     let indptr = col(&mut gpu, &kv_indptr, I32);
-    let kvp = pool(ten(gpu.up(&k_raw), cells, width, Bf16), ids, indptr, PAGE);
-    let values = ten(gpu.up(&v_raw), cells, width, Bf16);
+    let (keys, values) = if fp8 {
+        (
+            ten(gpu.up(&k8), cells, width, E4m3),
+            ten(gpu.up(&v8), cells, width, E4m3),
+        )
+    } else {
+        (
+            ten(gpu.up(&k_raw), cells, width, Bf16),
+            ten(gpu.up(&v_raw), cells, width, Bf16),
+        )
+    };
+    let kvp = pool(keys, ids, indptr, PAGE);
     let last_page_lens = col(&mut gpu, &last, I32);
     let kvp = KvPool {
         values,
@@ -239,6 +263,65 @@ fn the_paged_attention_answers_the_reference() {
     // MiMo's heads, 192-wide keys and 128-wide values padded to 256: the
     // tcgen05 prefill reads the widths alone, whole and over a window.
     let tc5 = tuned(|t| (t.prefill_tc5, t.prefill_wide_sliding) = (true, true));
-    check_live([64, 8, 256], long, None, own, pre, tc5, [192, 128]);
-    check_live([64, 8, 256], long, w128, sunk, pre, tc5, [192, 128]);
+    check_live([64, 8, 256], long, None, own, pre, tc5, [192, 128], false);
+    check_live([64, 8, 256], long, w128, sunk, pre, tc5, [192, 128], false);
+    // An e4m3 pool (vLLM's fp8 KV): FA2's decode and prefill read it as it is,
+    // the tensor-core decode widening it (whole, split, and over a cluster).
+    let nolive = [0, 0];
+    check_live(
+        [32, 2, 128],
+        dec,
+        None,
+        own,
+        all,
+        read(false, false, 0, 0),
+        nolive,
+        true,
+    );
+    check_live(
+        [64, 8, 64],
+        dec,
+        w128,
+        sunk,
+        all,
+        read(true, true, 256, 0),
+        nolive,
+        true,
+    );
+    check_live(
+        [64, 8, 64],
+        dec,
+        None,
+        both,
+        all,
+        read(false, true, 0, 0),
+        nolive,
+        true,
+    );
+    check_live(
+        [32, 16, 256],
+        dec,
+        None,
+        sunk,
+        all,
+        read(false, true, 0, 8),
+        nolive,
+        true,
+    );
+    check_live([32, 2, 128], chunks, None, own, pre, fa2, nolive, true);
+    check_live([8, 2, 128], chunks, w100, sunk, pre, fa2, nolive, true);
+    // The tcgen05 prefill over the pages widened to a bf16 shadow.
+    let tc5_only = tuned(|t| t.prefill_tc5 = true);
+    check_live([32, 4, 128], chunks, None, rec, pre, tc5_only, nolive, true);
+    check_live(
+        [128, 16, 64],
+        long,
+        Some(300),
+        sunk,
+        pre,
+        tc5_only,
+        nolive,
+        true,
+    );
+    check_live([64, 8, 256], long, w100, sunk, pre, tc5, nolive, true);
 }

@@ -103,6 +103,17 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     let rows = count(OP, "rows", packed.rows)?;
 
     let hnd_layout = pool.layout != 0;
+    // The pages it writes: bf16, or e4m3 under a unit scale.
+    let pages = if crate::attn::kv::native_e4m3(pool) {
+        ", __nv_fp8_e4m3"
+    } else if crate::attn::kv::native_bf16(pool) {
+        ""
+    } else {
+        return Err(refuse(
+            OP,
+            "the fused write lands bf16 or e4m3 pages, not a scaled scheme's",
+        ));
+    };
     let rope_table = ArgValue::ABSENT;
     let window = ctx.stage();
 
@@ -111,7 +122,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     // 16-byte words. A decode's few rows keep the warp a head.
     let by_row = matches!(head_dim, 64 | 128 | 256 | 512).then(|| {
         let e = if word { 8 } else { head_dim / 32 };
-        format!("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32({head_dim}), ::pie::i32({e})>")
+        format!("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32({head_dim}), ::pie::i32({e}){pages}>")
     });
     if let Some(instantiation) = by_row.filter(|_| packed.rows >= ctx.tuning().qkv_rows_from) {
         return ctx.fire(
@@ -152,23 +163,14 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         );
     }
 
-    let warped = match head_dim {
-        64 => Some(
-            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(64), false>",
-        ),
-        128 => Some(
-            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(128), false>",
-        ),
-        256 => Some(
-            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(256), false>",
-        ),
-        _ => None,
-    };
+    let warped = matches!(head_dim, 64 | 128 | 256).then(|| {
+        format!("::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32({head_dim}), false{pages}>")
+    });
     if let Some(instantiation) = warped {
         let units = packed.rows.saturating_mul(heads);
         return ctx.fire(
             OP,
-            Fire::at(FILE, instantiation).apply(Launch::grid(
+            Fire::at(FILE, symbol(&instantiation)).apply(Launch::grid(
                 [units.div_ceil(WARPS_PER_BLOCK), 1, 1],
                 [WARP_BLOCK, 1, 1],
             )),
@@ -220,7 +222,9 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         OP,
         Fire::at(
             FILE,
-            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv<::pie::i32(128), false>",
+            symbol(&format!(
+                "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv<::pie::i32(128), false{pages}>"
+            )),
         )
         .apply(Launch::grid([packed.rows, heads, 1], [DECODE_BLOCK, 1, 1])),
         &[
