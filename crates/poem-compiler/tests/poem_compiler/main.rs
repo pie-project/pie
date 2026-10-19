@@ -19,6 +19,7 @@ mod a_ragged_attention_over_two_arms_bakes_into_one_region;
 mod a_relative_bias_table_bakes_as_a_plan_constant;
 mod a_routed_bank_is_the_rectangle_the_grouped_leg_reads;
 mod a_u4_trunk_projection_decodes_on_the_tiled_arm;
+mod a_width_the_ranks_cannot_split_lands_padded_with_zeros;
 mod every_catalog_row_bakes;
 mod every_deployment_resolves_its_request_classes;
 mod every_deployment_ships_whole;
