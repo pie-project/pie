@@ -466,9 +466,9 @@ pub fn matmul_select(
     select_gemv(ctx, OP, x, bank, routes, y, experts)
 }
 
-/// A grouped projection (`linear.matmul_grouped`): row r's group g, x[r·groups
-/// + g] (k wide), through the bank's expert routes[r][g] (n x k) into y[r·groups
-/// + g]. `identity` states the routes are `group_routes`' (route g for group
+/// A grouped projection (`linear.matmul_grouped`): row r's group g,
+/// `x[r·groups + g]` (k wide), through the bank's expert `routes[r][g]` (n x k)
+/// into `y[r·groups + g]`. `identity` states the routes are `group_routes`' (route g for group
 /// g, every row), so the fire is `groups` dense matmuls over strided planes:
 /// past the batch legs' reach (an expert there sees a route a row, too many
 /// for them, and too few experts for the grouped leg to fill the card) one

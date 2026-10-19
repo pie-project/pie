@@ -23,7 +23,10 @@ pub fn matmul_f32(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(
     if w.rows != y.width || w.width != act.width {
         return Err(crate::jit::refuse(
             OP,
-            format!("the weight is {} x {} and this projection contracts {k} into {n}", w.rows, w.width),
+            format!(
+                "the weight is {} x {} and this projection contracts {k} into {n}",
+                w.rows, w.width
+            ),
         ));
     }
     if y.rows == 0 {

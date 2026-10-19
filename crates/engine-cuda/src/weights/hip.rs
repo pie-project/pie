@@ -143,14 +143,20 @@ pub(super) fn group_row_factors(
         crate::device::copy_any(stream, host.as_mut_ptr() as u64, t.ptr, host.len() * 4)?;
         crate::device::ctx::sync(stream)?;
         let groups: Vec<&[f32]> = host.chunks(GROUP * cols).collect();
-        if groups.iter().any(|g| g.chunks(cols).any(|row| row != &g[..cols])) {
+        if groups
+            .iter()
+            .any(|g| g.chunks(cols).any(|row| row != &g[..cols]))
+        {
             return Err(Fault::Param {
                 name: param.name.clone(),
                 why: "is an e4m3g128 projection whose per-row factors differ within a 64-row \
                       group; rocm's FP8 kernels read one factor a 64-row group at the finest",
             });
         }
-        let folded: Vec<f32> = groups.iter().flat_map(|g| g[..cols].iter().copied()).collect();
+        let folded: Vec<f32> = groups
+            .iter()
+            .flat_map(|g| g[..cols].iter().copied())
+            .collect();
         crate::device::copy_any(stream, t.ptr, folded.as_ptr() as u64, folded.len() * 4)?;
         crate::device::ctx::sync(stream)?;
         table[at] = Some(WeightRow::Dense(kernels_cuda::Tensor::new(

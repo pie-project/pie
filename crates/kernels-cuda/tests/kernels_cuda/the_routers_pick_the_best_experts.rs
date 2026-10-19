@@ -17,7 +17,7 @@ fn the_ranked_routers_pick_the_best_experts() {
         let (mut b, scaling) = (Bench::new(1), 1.5f32);
         // Evenly spaced logits, a few planted ties.
         let even = |i: usize| -4.0 + 0.03 * ((i % ex * 97 + i / ex * 31) % ex) as f32;
-        let tie = |i: usize| i / ex % 3 == 0 && i % ex % 50 == 7;
+        let tie = |i: usize| (i / ex).is_multiple_of(3) && i % ex % 50 == 7;
         let logits = tab(rows * ex, |i| to_bf16(pick(tie(i), 2.5, even(i))));
         let bias = tab(ex, |e| pick(e % 5 == 0, 0.0f32, -0.001));
         let (l, bt) = (t(b.up(&logits), rows, ex, Bf16), t(b.up(&bias), 1, ex, F32));

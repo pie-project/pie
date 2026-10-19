@@ -690,8 +690,9 @@ mod tests {
         }
         for builtin in builtins::all() {
             assert!(
-                routes.iter().any(|(_, name)| *name == builtin.name),
-                "{} is built in but no route serves it",
+                routes.iter().any(|(_, name)| *name == builtin.name)
+                    || builtin.name == runtime::offload::prefill::PROGRAM,
+                "{} is built in but neither a route nor the runtime runs it",
                 builtin.name
             );
         }

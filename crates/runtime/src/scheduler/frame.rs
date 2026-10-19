@@ -1386,8 +1386,8 @@ mod tests {
             .collect();
         for piece in 0..2 {
             let mut ids = Vec::new();
-            for (at, &lane) in lanes.iter().enumerate() {
-                let frame = frames[at][piece].expect("every piece is framed");
+            for (at, (&lane, framed)) in lanes.iter().zip(&frames).enumerate() {
+                let frame = framed[piece].expect("every piece is framed");
                 let id = 100 + 2 * at as u64 + piece as u64;
                 policy.on_fire_enqueued(frame, Some(lane), id, 128, 1, None);
                 ids.push(id);

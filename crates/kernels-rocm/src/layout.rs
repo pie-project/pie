@@ -342,7 +342,9 @@ pub fn split_qkv_padded(
         .iter()
         .all(|w| w.is_multiple_of(8))
         && widths.iter().all(|&w| w <= head_dim)
-        && [packed.ptr, q.ptr, k.ptr, v.ptr].iter().all(|p| p % 16 == 0);
+        && [packed.ptr, q.ptr, k.ptr, v.ptr]
+            .iter()
+            .all(|p| p % 16 == 0);
     if !runs {
         return Err(refuse(
             OP,

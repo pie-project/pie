@@ -135,7 +135,7 @@ fn fp8b128_planes(
             ),
         ));
     };
-    if n == 0 || k == 0 || !k.is_multiple_of(16) || codes.ptr % 16 != 0 {
+    if n == 0 || k == 0 || !k.is_multiple_of(16) || !codes.ptr.is_multiple_of(16) {
         return Err(refuse(
             op,
             format!("a [{n}, {k}] e4m3 plane is not whole 16-byte runs a row"),
@@ -603,7 +603,11 @@ fn fire_fp8_dense(
     let (n, k) = (codes.rows, codes.width);
     let stages = k / FP8_BLOCK;
     // SB 0: the rows a factor covers, by the factors' own shape.
-    let fr = if sb == 0 { factor_rows(n, factors.rows).unwrap_or(FP8_BLOCK) } else { FP8_BLOCK };
+    let fr = if sb == 0 {
+        factor_rows(n, factors.rows).unwrap_or(FP8_BLOCK)
+    } else {
+        FP8_BLOCK
+    };
     if act.rows > 64 {
         return fire_fp8_tiles(ctx, op, act, act_scales, codes, factors, y, sb, fr);
     }

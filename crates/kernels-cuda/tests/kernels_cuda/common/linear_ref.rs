@@ -120,7 +120,8 @@ pub fn dot(
     out
 }
 
-/// Every `got` within `tol` of its want.
+/// Every `got` within `tol` of its want; a NaN is off.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 pub fn check(got: &[f64], want: &[Want], tol: f64, what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: lengths");
     let off = |(g, (w, s)): (&f64, &Want)| !((g - w).abs() <= tol * (w.abs() + s) + 1e-6);

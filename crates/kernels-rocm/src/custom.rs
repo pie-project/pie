@@ -63,14 +63,22 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         && 2 * span <= head_dim
         && span.is_multiple_of(lane_run)
         && (span / lane_run).is_power_of_two()
-        && widths.iter().all(|&w| w <= head_dim && w.is_multiple_of(lane_run));
+        && widths
+            .iter()
+            .all(|&w| w <= head_dim && w.is_multiple_of(lane_run));
     if !classic && !warp_shaped {
         return Err(refuse(
             OP,
-            format!("pairs {span} apart over {widths:?}-wide heads do not turn in a {head_dim}-wide head's lane runs"),
+            format!(
+                "pairs {span} apart over {widths:?}-wide heads do not turn in a {head_dim}-wide head's lane runs"
+            ),
         ));
     }
-    let (span, qk_width, v_width) = (stated(OP, span)?, stated(OP, widths[0])?, stated(OP, widths[1])?);
+    let (span, qk_width, v_width) = (
+        stated(OP, span)?,
+        stated(OP, widths[0])?,
+        stated(OP, widths[1])?,
+    );
     let head_dim = count(OP, "the head width this fused write states", head_dim)?;
     let kv_heads = count(OP, "the kv head count this fused write states", kv_heads)?;
 
@@ -110,16 +118,11 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         _ => None,
     };
     // A lane moves its run of a head as one access, up to 16 bytes.
-    let aligned = [
-        packed.ptr,
-        q.ptr,
-        pool.keys.ptr,
-        pool.values.ptr,
-    ]
-    .into_iter()
-    .chain(q_norm_weight.map(|w| w.ptr))
-    .chain(k_norm_weight.map(|w| w.ptr))
-    .all(|at| at.is_multiple_of(16));
+    let aligned = [packed.ptr, q.ptr, pool.keys.ptr, pool.values.ptr]
+        .into_iter()
+        .chain(q_norm_weight.map(|w| w.ptr))
+        .chain(k_norm_weight.map(|w| w.ptr))
+        .all(|at| at.is_multiple_of(16));
     if let Some(instantiation) = warped.filter(|_| aligned) {
         let warps = if packed.rows >= PREFILL_ROWS {
             [12u32, 8, 6]
