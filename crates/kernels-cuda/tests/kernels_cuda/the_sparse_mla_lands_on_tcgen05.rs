@@ -206,6 +206,21 @@ fn score(
     decode: bool,
     pooled: bool,
 ) -> ((Vec<u16>, Vec<f32>), Case) {
+    let tuning = Tuning {
+        mla_naive: true,
+        mla_sparse: tc,
+        ..Tuning::DEFAULT
+    };
+    score_on(rope, tuning, window, decode, pooled)
+}
+
+fn score_on(
+    rope: usize,
+    tuning: Tuning,
+    window: Option<(u32, u32)>,
+    decode: bool,
+    pooled: bool,
+) -> ((Vec<u16>, Vec<f32>), Case) {
     let mut rng = Lcg::seeded(0x6c73_6533 + rope as u64);
     let tokens: usize = Q_LENS.iter().sum();
     let slots = PAGE_INDICES.len() * PAGE;
@@ -231,11 +246,7 @@ fn score(
     let mut gpu = Gpu::open();
     let device = Device::probe(&gpu.ctx()).expect("the device answers its attributes");
     let plan = plan(&mut gpu, &case, &device);
-    let ctx = gpu.ctx().with_tuning(Tuning {
-        mla_naive: true,
-        mla_sparse: tc,
-        ..Tuning::DEFAULT
-    });
+    let ctx = gpu.ctx().with_tuning(tuning);
     if let Some((live, base)) = window {
         let win_at = gpu.up(&[live, base, Q_LENS.len() as u32, 0u32]);
         ctx.arm_stage(win_at);
@@ -727,5 +738,46 @@ fn glm_reads_a_short_selection_dense() {
             (i / RANK) % HEADS,
             i % RANK
         );
+    }
+}
+
+/// The selected rows on the mma.sync MLA kernel (`kernel.sdpa.mla_selected_mma`,
+/// any sm_80 on): against the host reference, and on a pooled index's
+/// selection (holes, repeats, ids past the row) against the warp-a-key form.
+#[test]
+fn the_sparse_mla_lands_on_mma() {
+    let mma = Tuning {
+        mla_naive: true,
+        mla_selected_mma: true,
+        ..Tuning::DEFAULT
+    };
+    for (decode, pooled) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (got, case) = score_on(64, mma, None, decode, pooled);
+        let (again, _) = score_on(64, mma, None, decode, pooled);
+        assert!(got.0 == again.0, "decode {decode} pooled {pooled}: two passes land apart");
+        let want = if pooled {
+            let (naive, _) = score(64, false, None, decode, pooled);
+            (naive.0.iter().map(|&b| from_bf16(b)).collect::<Vec<f32>>(), naive.1)
+        } else {
+            case.reference()
+        };
+        for (i, &g) in got.0.iter().enumerate() {
+            let (g, w) = (from_bf16(g), want.0[i]);
+            assert!(
+                close(g, w),
+                "decode {decode} pooled {pooled}: row {} head {} dim {} scored {g} against {w}",
+                i / (HEADS * RANK),
+                (i / RANK) % HEADS,
+                i % RANK
+            );
+        }
+        for (i, (&g, &w)) in got.1.iter().zip(&want.1).enumerate() {
+            assert!(
+                (g == w) || (g - w).abs() <= 1.0e-2 * w.abs().max(1.0),
+                "decode {decode} pooled {pooled}: row {} head {} landed log-sum-exp {g} against {w}",
+                i / HEADS,
+                i % HEADS
+            );
+        }
     }
 }

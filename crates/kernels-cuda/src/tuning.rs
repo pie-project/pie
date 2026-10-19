@@ -264,6 +264,13 @@ pub struct Dsv4DecodeUntil(pub u32);
 #[decision(id = "kernel.sdpa.selected_mma", flag, default = false, tune = search)]
 pub struct SdpaSelectedMma;
 
+/// Whether a sparse MLA's selected rows (GLM-5.x's DSA) run on the mma.sync
+/// MLA kernel, its keys gathered through the selection, rather than the
+/// scalar walk a warp a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.mla_selected_mma", flag, default = false, tune = search)]
+pub struct SdpaMlaSelectedMma;
+
 /// Whether a compressed-pool attention (`attention.pool_lse`, and its
 /// selected form) runs on the tensor cores, a block a row's 16 heads, rather
 /// than the scalar walk a block a row and head. Off reads the pool the
@@ -682,6 +689,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeXqaWholeWindow>()
         .add::<DecodeXqaCluster>()
         .add::<SdpaSelectedMma>()
+        .add::<SdpaMlaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<SdpaIndexTc5>()
         .add::<ElemwiseNormEmit>()
@@ -798,6 +806,7 @@ tuning! {
     decode_xqa_whole_window: u32 = 0, get DecodeXqaWholeWindow;
     decode_xqa_cluster: u32 = 0, get DecodeXqaCluster;
     selected_mma: bool = false, on SdpaSelectedMma;
+    mla_selected_mma: bool = false, on SdpaMlaSelectedMma;
     index_mma: bool = false, on SdpaIndexMma;
     index_tc5: bool = false, on SdpaIndexTc5;
     norm_emit: bool = false, on ElemwiseNormEmit;

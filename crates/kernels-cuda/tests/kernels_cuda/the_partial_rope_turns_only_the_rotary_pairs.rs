@@ -46,6 +46,7 @@ fn check(head_dim: usize, q_heads: usize, kv_heads: usize, rotary_dim: usize, sp
         head_dim as u32,
         theta,
         span as u32,
+        0,
     )
     .expect("the partial rope fires");
     gpu.sync();

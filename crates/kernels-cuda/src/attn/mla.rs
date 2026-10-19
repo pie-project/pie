@@ -535,7 +535,7 @@ pub(crate) mod naive {
         }
         let selected = ptrs.selection != 0;
 
-        if !selected
+        if (!selected || ctx.tuning().mla_selected_mma)
             && shape.window == 0
             && mma_supported(shape.kv_lora_rank, shape.rope_dim, shape.num_heads)
         {
@@ -572,6 +572,8 @@ pub(crate) mod naive {
                     shape.page_size.arg(),
                     shape.sm_scale.arg(),
                     shape.causal.arg(),
+                    ArgValue::Ptr(ptrs.selection),
+                    shape.top_k.arg(),
                     ctx.stage(),
                 ],
             );

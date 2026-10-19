@@ -638,6 +638,7 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     __nv_bfloat16* __restrict__ o,
     float* __restrict__ lse,
     int R, int H, int page_size, float sm_scale, bool causal,
+    const std::int32_t* __restrict__ selection, int top_k,
     const u32* __restrict__ win)
 {
     extern __shared__ __align__(16) char smem_raw[];
@@ -684,6 +685,23 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
         (num_pages - 1) * page_size + static_cast<int>(kv_last_page_lens[r]);
     const int abs_q = kv_len - new_tokens + (t - qo_lo);
     const int j_end = causal ? (abs_q + 1) : kv_len;
+    // A selected row (a sparse MLA's top-k) reads the keys its selection
+    // names, through its last live entry (holes and repeats as they lie).
+    const std::int32_t* srow =
+        selection != nullptr ? selection + static_cast<long long>(t_row) * top_k : nullptr;
+    __shared__ int s_last;
+    if (srow != nullptr) {
+        if (tid == 0) s_last = 0;
+        __syncthreads();
+        int last = 0;
+        for (int n = tid; n < top_k; n += kThreads) {
+            const int j = srow[n];
+            if (j >= 0 && j < j_end) last = n + 1;
+        }
+        atomicMax(&s_last, last);
+        __syncthreads();
+    }
+    const int n_end = srow != nullptr ? s_last : j_end;
 
     constexpr int kChunksPerRow = kD / 8;
     for (int c = tid; c < kBM * kChunksPerRow; c += kThreads) {
@@ -706,16 +724,25 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     const int dbase = warp * kDimsPerWarp;
 
     __shared__ long long s_slot[kBK];
+    // A key's place in each stage: live or not (a selection's -1, a key past
+    // the row's end).
+    __shared__ bool s_live[kStages][kBK];
     auto issue_tile = [&](int j0, int stage) {
         for (int rr = tid; rr < kBK; rr += kThreads) {
-            const int j = j0 + rr;
+            const int n = j0 + rr;
+            int j = n < n_end ? n : -1;
+            if (srow != nullptr && j >= 0) {
+                j = srow[n];
+                if (j >= j_end) j = -1;
+            }
             s_slot[rr] =
-                (j < j_end)
+                (j >= 0)
                     ? (static_cast<long long>(
                            kv_page_indices[pages_first + j / page_size]) *
                            page_size +
                        (j % page_size))
                     : -1;
+            s_live[stage][rr] = j >= 0;
         }
         __syncthreads();
         __nv_bfloat16* dst_base = sKbuf + stage * (kBK * kLdD);
@@ -741,15 +768,15 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     #pragma unroll
     for (int s = 0; s < kStages - 1; ++s) {
         const int j0 = s * kBK;
-        if (j0 < j_end) issue_tile(j0, s);
+        if (j0 < n_end) issue_tile(j0, s);
     }
 
     int stage = 0;
-    for (int j0 = 0; j0 < j_end; j0 += kBK, stage = (stage + 1) % kStages) {
+    for (int j0 = 0; j0 < n_end; j0 += kBK, stage = (stage + 1) % kStages) {
 
         __syncthreads();
         const int prefetch_j0 = j0 + (kStages - 1) * kBK;
-        if (prefetch_j0 < j_end) {
+        if (prefetch_j0 < n_end) {
             issue_tile(prefetch_j0, (stage + kStages - 1) % kStages);
         } else {
             __pipeline_commit();
@@ -801,9 +828,8 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
             #pragma unroll
             for (int i = 0; i < kColsPerSub; ++i) {
                 const int jj = sub * kColsPerSub + i;
-                const int j = j0 + jj;
                 float s = -CUDART_INF_F;
-                if (j < j_end) {
+                if (j0 + jj < n_end && s_live[stage][jj]) {
                     s = sS[row * kBK + jj] * sm_scale;
                 }
                 v[i] = s;
