@@ -402,6 +402,8 @@ fn an_fp8_bank_on_the_matrix_core_folds_each_route() {
         (96, 4, 256, 768),
         (40, 6, 192, 256),
         (200, 4, 320, 512),
+        (300, 6, 336, 384),
+        (600, 8, 512, 1024),
     ] {
         let (nb, kb) = (n.div_ceil(128), k / 128);
         let (codes, factors) =

@@ -806,8 +806,9 @@ impl Engine for Cuda {
             ))
         })?;
         let capacity = registration.capacity.max(1);
+        let stream = self.loaded_mut()?.stream();
         let endpoint = Arc::new(
-            crate::program::Endpoint::open(registration.host_role, cell_bytes, capacity)
+            crate::program::Endpoint::open(registration.host_role, cell_bytes, capacity, stream)
                 .map_err(fault)?,
         );
         let mirror = (!device_only).then(|| HostMirror {
@@ -896,8 +897,9 @@ impl Engine for Cuda {
         channel: u32,
         cell: &[u8],
     ) -> EngineResult<bool> {
+        let stream = self.loaded_mut()?.stream();
         self.instance(instance)?
-            .publish(channel, cell)
+            .publish(channel, cell, stream)
             .map_err(fault)
     }
 

@@ -107,6 +107,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     if !boot.knobs.diagnostics.fuse_chains {
         kernels.retain(|kernel| crate::UNCHAINED.contains(kernel));
     }
+    #[cfg(feature = "rocm")]
+    {
+        boot.trace = crate::split_arm::split_into_arms(boot.trace.clone());
+    }
     boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), &kernels);
     #[cfg(not(feature = "rocm"))]
     {
@@ -912,8 +916,8 @@ impl Shell {
             settlement: crate::settle::Settlement::open(boot.runahead.staging_depth())?,
             taps: Vec::new(),
             airborne,
-            owed: None,
-            guest_landed: crate::device::graph::Event::new()?,
+            owed: super::Owed::new(),
+            spare_events: Vec::new(),
             rs_ahead: std::collections::HashMap::new(),
         };
         if shell.weights.rotating() && shell.graphs.records() {

@@ -29,7 +29,14 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    pub fn open(role: HostRole, wire_bytes: u32, capacity: u32) -> Result<Endpoint> {
+    /// Opens an endpoint, its device cells zeroed on `stream` ahead of the fires
+    /// that read them.
+    pub fn open(
+        role: HostRole,
+        wire_bytes: u32,
+        capacity: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<Endpoint> {
         let cap1 = capacity.checked_add(1).ok_or_else(|| {
             Fault::program(
                 "program::endpoint",
@@ -64,7 +71,7 @@ impl Endpoint {
                 Pinned::mapped(WORDS * size_of::<u64>())?,
                 Pinned::mapped(cells.max(1))?,
                 match role {
-                    HostRole::None => Some(Buffer::zeroed(cells.max(1))?),
+                    HostRole::None => Some(Buffer::zeroed_on(stream, cells.max(1))?),
                     _ => None,
                 },
             ),

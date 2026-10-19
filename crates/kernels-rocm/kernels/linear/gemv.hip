@@ -108,11 +108,22 @@ __device__ __forceinline__ float skinny_reduce(skinny_cd d) {
 // The skinny kernel's epilogue. SWIGLU and GEGLU read a packed [gate | up]
 // bank of 2N rows, output column n being act(g)·u of rows n and N + n, each
 // rounded to bf16 first as the unfused projection would store them;
-// SOFTCAP lands cap·tanh(v / cap) of the rounded product.
+// SOFTCAP lands cap·tanh(v / cap) of the rounded product; F32 the product
+// unrounded into an f32 `out`.
 constexpr int kSkinnyStore = 0;
 constexpr int kSkinnySwiglu = 1;
 constexpr int kSkinnyGeglu = 2;
 constexpr int kSkinnySoftcap = 3;
+constexpr int kSkinnyF32 = 4;  // the f32 product as it is (`out` an f32 plane)
+
+template <int EPI>
+__device__ __forceinline__ void skinny_put(bf16* out, long long at, float v) {
+    if constexpr (EPI == kSkinnyF32) {
+        reinterpret_cast<float*>(out)[at] = v;
+    } else {
+        out[at] = from_f32<bf16>(v);
+    }
+}
 
 template <int ROWS, int YT, int UNRL, int EPI = kSkinnyStore, bool ACT_G = false>
 __global__ __launch_bounds__(1024) void skinny_bf16(const bf16* __restrict__ weight, const bf16* __restrict__ act,
@@ -192,7 +203,7 @@ __global__ __launch_bounds__(1024) void skinny_bf16(const bf16* __restrict__ wei
                 } else if constexpr (EPI == kSkinnySoftcap) {
                     v = cap * tanhf(to_f32(from_f32<bf16>(v)) * (1.f / cap));
                 }
-                if (l == kWave - 1 && n0 + y < N) out[static_cast<long long>(r) * N + n0 + y] = from_f32<bf16>(v);
+                if (l == kWave - 1 && n0 + y < N) skinny_put<EPI>(out, static_cast<long long>(r) * N + n0 + y, v);
             }
     }
 }
@@ -355,7 +366,7 @@ __global__ __launch_bounds__(1024) void skinny4_bf16(const bf16* __restrict__ we
                         } else if constexpr (EPI == kSkinnySoftcap) {
                             v = cap * tanhf(to_f32(from_f32<bf16>(v)) * (1.f / cap));
                         }
-                        if (n < N) out[static_cast<long long>(row) * N + n] = from_f32<bf16>(v);
+                        if (n < N) skinny_put<EPI>(out, static_cast<long long>(row) * N + n, v);
                     }
             }
         }

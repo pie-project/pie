@@ -39,6 +39,7 @@ pub const WORKSPACE: usize = 32 << 20;
 /// that for each group g of a row: `y[m, g·n..][n] = x[m, g·k..][k] ·
 /// w[g][n, k]ᵀ`, x a [m, groups·k] and y a [m, groups·n] plane, w the
 /// groups' [n, k] blocks one after another (one strided-batched launch).
+/// `f32_out` lands y at f32 rather than bf16.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Shape {
     pub m: u32,
@@ -46,6 +47,7 @@ pub struct Shape {
     pub k: u32,
     pub bias: bool,
     pub groups: u32,
+    pub f32_out: bool,
 }
 
 struct Plan {
@@ -130,7 +132,13 @@ impl Plan {
             )?;
             answered(
                 "hipblasLtMatrixLayoutCreate",
-                (lt.hipblasLtMatrixLayoutCreate)(&raw mut d, sys::LT_R_16BF, n, m, (g * n) as i64),
+                (lt.hipblasLtMatrixLayoutCreate)(
+                    &raw mut d,
+                    if s.f32_out { sys::LT_R_32F } else { sys::LT_R_16BF },
+                    n,
+                    m,
+                    (g * n) as i64,
+                ),
             )?;
             if g > 1 {
                 // A group's weight block follows the last; its activation and

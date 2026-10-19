@@ -234,9 +234,12 @@ pub struct Rings {
 }
 
 impl Rings {
+    /// The rings of `shapes`, their registry staged on `stream` ahead of
+    /// any fire that reads it.
     pub fn allocate(
         shapes: &[ChannelShape],
         endpoints: Vec<Option<Arc<Endpoint>>>,
+        stream: *mut core::ffi::c_void,
     ) -> Result<Rings> {
         if endpoints.len() != shapes.len() {
             return Err(Fault::program(
@@ -264,14 +267,14 @@ impl Rings {
                 .and_then(|endpoint| endpoint.device_cells());
             cells.push(match shared {
                 Some(_) => Buffer::zeroed(0)?,
-                None => Buffer::zeroed(bytes * shape.ring() as usize)?,
+                None => Buffer::zeroed_on(stream, bytes * shape.ring() as usize)?,
             });
         }
 
         let slots = shapes.len();
         let words = slots * size_of::<u32>();
         let full_at = 3 * words;
-        let mut registry = Buffer::zeroed(full_at + slots * MAX_RING as usize)?;
+        let mut registry = Buffer::zeroed_on(stream, full_at + slots * MAX_RING as usize)?;
         let cap1: Vec<u8> = shapes
             .iter()
             .flat_map(|shape| {
@@ -280,7 +283,7 @@ impl Rings {
                     .to_le_bytes()
             })
             .collect();
-        registry.write(2 * words as u64, &cap1)?;
+        registry.stage(stream, 2 * words as u64, &cap1)?;
         let device = kernels_cuda::channel::Rings::new(
             registry.at(full_at as u64)?,
             registry.ptr(),
@@ -308,7 +311,11 @@ impl Rings {
         self.endpoints.get(channel).and_then(Option::as_ref)
     }
 
-    pub fn seed_registry(&mut self, cursors: &[Cursor]) -> Result<()> {
+    pub fn seed_registry(
+        &mut self,
+        cursors: &[Cursor],
+        stream: *mut core::ffi::c_void,
+    ) -> Result<()> {
         let slots = self.shapes.len();
         let words = slots * size_of::<u32>();
         let mut head = Vec::with_capacity(words);
@@ -332,9 +339,9 @@ impl Rings {
                 }
             }
         }
-        self.registry.write(0, &head)?;
-        self.registry.write(words as u64, &tail)?;
-        self.registry.write((3 * words) as u64, &full)?;
+        self.registry.stage(stream, 0, &head)?;
+        self.registry.stage(stream, words as u64, &tail)?;
+        self.registry.stage(stream, (3 * words) as u64, &full)?;
         Ok(())
     }
 
@@ -389,7 +396,13 @@ impl Rings {
             .and_then(|endpoint| endpoint.device_cells())
     }
 
-    pub fn write_cell(&mut self, channel: usize, sequence: u64, native: &[u8]) -> Result<()> {
+    pub fn write_cell(
+        &mut self,
+        channel: usize,
+        sequence: u64,
+        native: &[u8],
+        stream: *mut core::ffi::c_void,
+    ) -> Result<()> {
         let shape = self.shape_of(channel)?;
         if native.len() != shape.cell_bytes() {
             return Err(Fault::program(
@@ -403,7 +416,7 @@ impl Rings {
         }
         if let Some(base) = self.shared_slab(channel) {
             let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
-            crate::device::write_raw(base + at, native)?;
+            crate::device::stage_raw(stream, base + at, native)?;
             if let Some(endpoint) = self.endpoint(channel)
                 && !endpoint.write_cell(sequence, native)
             {
@@ -434,7 +447,7 @@ impl Rings {
             return Ok(());
         }
         let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
-        self.cells[channel].write(at, native)
+        self.cells[channel].stage(stream, at, native)
     }
 
     pub fn read_cell(&self, channel: usize, sequence: u64) -> Result<Vec<u8>> {
@@ -912,10 +925,11 @@ impl Prepared {
             result_base += u32::from(op.result_count);
         }
 
-        let mut params = Buffer::zeroed(
+        let mut params = Buffer::zeroed_on(
+            stream,
             (records.len() * size_of::<CudaOpParams>()).max(size_of::<CudaOpParams>()),
         )?;
-        params.write(0, &records_bytes(&records))?;
+        params.stage(stream, 0, &records_bytes(&records))?;
 
         let offset_bytes: Vec<u8> = scratch_layout
             .values
@@ -923,8 +937,8 @@ impl Prepared {
             .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
             .flat_map(u32::to_le_bytes)
             .collect();
-        let mut offsets = Buffer::zeroed(offset_bytes.len().max(size_of::<u32>()))?;
-        offsets.write(0, &offset_bytes)?;
+        let mut offsets = Buffer::zeroed_on(stream, offset_bytes.len().max(size_of::<u32>()))?;
+        offsets.stage(stream, 0, &offset_bytes)?;
 
         let mut prepared = Prepared {
             retired: Vec::new(),

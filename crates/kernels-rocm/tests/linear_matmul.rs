@@ -215,3 +215,27 @@ fn the_batch_engine_projection() {
         assert_eq!(diff, 0, "batch {m}x{i}x{k}: {diff} cells differ");
     }
 }
+
+#[test]
+fn the_f32_projection_lands_unrounded() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    for (m, n, k) in [(1u32, 32u32, 4096u32), (200, 288, 6144)] {
+        let a: Vec<f32> = values((m * k) as usize, 31, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let w: Vec<f32> = values((n * k) as usize, 32, 0.05)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let at = gpu.tensor(&a, m, k, Dtype::Bf16);
+        let wt = gpu.tensor(&w, n, k, Dtype::Bf16);
+        let mut y = gpu.zeros(m, n, Dtype::F32);
+        gemm::matmul_f32(&ctx, at, wt, &mut y).unwrap();
+        let want = reference(&a, &w, None, m as usize, n as usize, k as usize);
+        for (i, (h, w)) in gpu.read(&y).iter().zip(&want).enumerate() {
+            assert!((h - w).abs() <= 1e-4 * w.abs().max(1.0), "matmul_f32 {m}x{n}x{k}[{i}] = {h}, want {w}");
+        }
+    }
+}
