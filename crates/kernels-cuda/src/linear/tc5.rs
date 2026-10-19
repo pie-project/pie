@@ -459,6 +459,11 @@ pub struct Epilogue {
     /// select's rows, the GLU's and the next select's quantizer would hold
     /// them apart.
     pub input_scales: u64,
+    /// Swapped: the weight, its scales, the group's offsets and live rows
+    /// were all landed before the launch this one depends on (a routed
+    /// down leg after its gate-up), so under PDL the first ring of weight
+    /// tiles loads before the wait and only the activations wait.
+    pub weights_ahead: bool,
 }
 
 impl Epilogue {
@@ -470,6 +475,7 @@ impl Epilogue {
         weight_scale: 0,
         live_rows: 0,
         input_scales: 0,
+        weights_ahead: false,
     };
 
     const fn glu_code(&self) -> u32 {
@@ -549,6 +555,7 @@ impl Epilogue {
             wscale: self.weight_scale,
             live: self.live_rows,
             in_scale: self.input_scales,
+            weights_ahead: i32::from(self.weights_ahead),
             raster: 8,
             slab: 0,
             tickets: 0,
@@ -577,6 +584,7 @@ struct EpiArgs {
     raster: i32,
     slab: i64,
     tickets: u64,
+    weights_ahead: i32,
 }
 
 /// `y = epilogue(alpha * act . w^T)` for `[m, n, k]`, `n` the output's columns, under a stated plan.

@@ -1153,6 +1153,7 @@ fn experts_w4a4(
             1.0,
             tc5::Epilogue {
                 live_rows: layout.live_rows(),
+                weights_ahead: true,
                 ..tc5::Epilogue::STORE
             },
             down_plan,

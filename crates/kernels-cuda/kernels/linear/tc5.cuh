@@ -103,6 +103,9 @@ struct Epi {
     // zero between launches, or null for the finalize's launch: the last of
     // a tile's splits to land sums the slabs and rounds y itself.
     unsigned* tickets;
+    // Swapped: the weights, their scales and the group were landed before
+    // the launch this one depends on (a routed down leg after its gate-up).
+    int weights_ahead;
 };
 
 namespace tc5k {
@@ -420,8 +423,13 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         tmem_relinquish<kPair>();
     }
     // As a programmatic dependent (`kernel.pdl`) the set-up above overlapped
-    // the producer's tail; wait for it before touching memory.
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+    // the producer's tail; wait for it before touching memory. With the
+    // weights ahead the group is read first, the weight loader never waits,
+    // and every other role waits below.
+    const bool ahead = kSwap && epi.weights_ahead != 0;
+    if (!ahead) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
     // A masked launch counts each expert's tiles up front, so units map onto
     // the busy experts alone. An expert's output columns: its bank rows, or a
     // GLU's gate rows.
@@ -487,6 +495,9 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     // Every CTA is resident and holds its TMEM, so the dependent may launch
     // now (not earlier: its CTA could take an SM's TMEM first).
     asm volatile("griddepcontrol.launch_dependents;");
+    if (ahead && !(warp == 4 && lane == 0)) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
 
     // Tiles along P and Q (of one expert, when grouped), and the experts.
     // Contiguous P tiles stop at the routed rows.
@@ -710,7 +721,9 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                             load2(tile_p + h * kTileP, &map_p, p0 + static_cast<int>(h) * inter, kBoxP);
                         }
                     }
-                    if constexpr (kMixQ && kFused) {
+                    if (ahead) {
+                        // The activations: lane 1's.
+                    } else if constexpr (kMixQ && kFused) {
                         load_raw(raw_s, &map_q, x.q_row);
                         load_raw(raw_s + 128 * 32, &map_q, x.q_row + inter);
                     } else if constexpr (kMixQ) {
@@ -733,7 +746,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                                   x.p_block + static_cast<int>(rank) +
                                       static_cast<int>(h) * inter / 128);
                         }
-                        if constexpr (kFused && !kSwap) {
+                        if (ahead) {
+                        } else if constexpr (kFused && !kSwap) {
                             for (int h = 0; h < 2; ++h) {
                                 load3(sf_q + h * kAtomsQ * 512, &map_sfq, atom_q,
                                       (x.q_row + h * inter) / 128);
@@ -741,6 +755,37 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         } else {
                             load3(sf_q, &map_sfq, atom_q, x.q_block);
                         }
+                    }
+                    if (++s == kStages) {
+                        s = 0;
+                        phase ^= 1;
+                    }
+                }
+            }
+        } else if (lane == 1 && ahead) {
+            // The weights ahead, the activation rows and their scales load
+            // here once the producer kernel is done (waited above), each into
+            // its stage once free, under the stage's one expect_tx (lane 0's):
+            // so the weight loader runs a ring ahead and they never queue
+            // behind it. Swapped launches are lone CTAs.
+            u32 s = 0, phase = 0;
+            for (int t = first_tile; t < tiles; t += tile_step) {
+                Unit x;
+                if (!unit_of(t, x)) {
+                    continue;
+                }
+                for (int kb = x.kb0; kb < x.kb1; ++kb) {
+                    bar_wait(&empty[s], phase ^ 1);
+#pragma unroll
+                    for (u32 b = 0; b < kBoxes; ++b) {
+                        tma_load_2d(smem + kOffQ + s * kTileQ + b * kBoxQ, &full[s], &map_q,
+                                    (kb * static_cast<int>(kBoxes) + static_cast<int>(b)) *
+                                        static_cast<int>(kInner),
+                                    x.q_row);
+                    }
+                    if constexpr (kScaled) {
+                        tma_load_3d(smem + kOffSfQ + s * kSfQ, &full[s], &map_sfq, 0,
+                                    static_cast<int>(kb * kStageK / kGranQ / 4), x.q_block);
                     }
                     if (++s == kStages) {
                         s = 0;
