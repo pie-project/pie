@@ -1728,6 +1728,7 @@ impl Shell {
                 media: &[],
                 clips: &[],
                 done: None,
+                at: None,
             },
             None,
         )?;
@@ -2504,6 +2505,7 @@ impl Shell {
             media,
             clips,
             done,
+            at,
         } = step;
 
         while self.inflight.len() >= self.arms.depth() {
@@ -3682,6 +3684,7 @@ impl Shell {
             merge_lands,
             attachments,
             done,
+            at,
             arm,
             composition,
             readout_first,
@@ -4083,6 +4086,7 @@ impl Shell {
             media: &[],
             clips: &[],
             done: None,
+            at: None,
         })?;
         let walked = self.walk_once(&p, mode)?;
         let taped = walked.tape;
@@ -4226,6 +4230,8 @@ pub struct StepView<'a> {
     pub media: &'a [Media<'a>],
     pub clips: &'a [Clips<'a>],
     pub done: Option<Done>,
+    /// The step this is, for the agent trace; `None` outside a frame.
+    pub at: Option<engine::StepDone>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4242,6 +4248,7 @@ pub struct Prepared<'a> {
     merge_lands: Vec<MergeLand>,
     attachments: &'a [Attached],
     done: Option<Done>,
+    at: Option<engine::StepDone>,
     arm: usize,
     composition: Composition,
     readout_first: Vec<u32>,
@@ -4514,21 +4521,25 @@ impl engine::frame::Shell for Shell {
         let seq = self.airborne.enter();
         let counts = self.airborne.clone();
         let done = prepared.done.take();
+        let traced = prepared.at.map(|at| (at.frame, at.step));
         let verdict = self.ane.as_ref().and_then(crate::ane::Ane::verdict);
-        let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
-            counts.leave();
-            let refused = refused.or_else(|| verdict.as_ref().and_then(|verdict| verdict()));
-            if let Some(done) = done.as_ref() {
-                let outcome = match &refused {
-                    None => engine::StepOutcome::Committed,
-                    Some(why) => engine::StepOutcome::Faulted(format!(
-                        "metal command buffer for frame {} step {}: {why}",
-                        done.at.frame, done.at.step
-                    )),
-                };
-                (done.sink)(done.at, outcome);
-            }
-        })));
+        let pending = frame.commit_async_traced(
+            traced,
+            Some(Box::new(move |refused: Option<String>| {
+                counts.leave();
+                let refused = refused.or_else(|| verdict.as_ref().and_then(|verdict| verdict()));
+                if let Some(done) = done.as_ref() {
+                    let outcome = match &refused {
+                        None => engine::StepOutcome::Committed,
+                        Some(why) => engine::StepOutcome::Faulted(format!(
+                            "metal command buffer for frame {} step {}: {why}",
+                            done.at.frame, done.at.step
+                        )),
+                    };
+                    (done.sink)(done.at, outcome);
+                }
+            })),
+        );
         let pending = match pending {
             Ok(pending) => pending,
             Err(fault) => {

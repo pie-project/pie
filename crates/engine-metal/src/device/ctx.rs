@@ -163,6 +163,18 @@ impl Context {
             });
             let working_set = device.recommendedMaxWorkingSetSize();
             let max_buffer = device.maxBufferLength() as u64;
+            if pie_trace::enabled() {
+                let gpu_cores = cores.map(|(n, _)| n);
+                let memory = Self::physical_memory();
+                pie_trace::set_meta(|meta| {
+                    meta.device = Some("metal".to_string());
+                    meta.hardware.bandwidth_gbs = pie_trace::apple_bandwidth_gbs(&name, gpu_cores);
+                    meta.hardware.name = Some(name.clone());
+                    meta.hardware.memory_gb =
+                        (memory > 0).then(|| (memory as f64 / f64::from(1u32 << 30)).round());
+                });
+                pie_trace::memory(device.currentAllocatedSize() as u64);
+            }
             Ok(Context {
                 device,
                 queue,
@@ -731,14 +743,35 @@ impl Frame {
         }
     }
 
-    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     pub fn commit_async(
+        self,
+        on_done: Option<Box<dyn Fn(Option<String>) + Send + 'static>>,
+    ) -> Result<Pending> {
+        self.commit_async_traced(None, on_done)
+    }
+
+    /// [`Frame::commit_async`] for step `traced` (`(frame, step)`) of the
+    /// engine's frames: while an agent trace is on, the completion reports
+    /// the buffers' device start and end, and samples the device's
+    /// allocated memory.
+    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
+    pub fn commit_async_traced(
         mut self,
+        traced: Option<(u64, u32)>,
         on_done: Option<Box<dyn Fn(Option<String>) + Send + 'static>>,
     ) -> Result<Pending> {
         #[cfg(target_vendor = "apple")]
         {
             let flushed = std::mem::take(self.flushed.get_mut());
+            let on_done = match (on_done, pie_trace::enabled()) {
+                (on_done, false) => on_done,
+                (on_done, true) => Some(Box::new(move |refused: Option<String>| {
+                    if let Some(on_done) = on_done.as_ref() {
+                        on_done(refused);
+                    }
+                })
+                    as Box<dyn Fn(Option<String>) + Send + 'static>),
+            };
             if let Some(on_done) = on_done {
                 let heads = Flushed(flushed.clone());
                 let handler = block2::RcBlock::new(
@@ -754,6 +787,9 @@ impl Frame {
                             .iter()
                             .find_map(|head| head.error())
                             .or_else(|| buffer.error());
+                        if pie_trace::enabled() {
+                            trace_completed(&heads, buffer, traced);
+                        }
                         on_done(refused.map(|error| error.localizedDescription().to_string()));
                     },
                 );
@@ -783,6 +819,30 @@ impl Drop for Frame {
     fn drop(&mut self) {
         #[cfg(target_vendor = "apple")]
         self.end_pass();
+    }
+}
+
+/// A retired step's device span and the device's allocated memory, to the
+/// agent trace. The device stamps `GPUStartTime`/`GPUEndTime` on the host's
+/// uptime clock, which `systemUptime` reads.
+#[cfg(target_vendor = "apple")]
+fn trace_completed(
+    heads: &Flushed,
+    buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    traced: Option<(u64, u32)>,
+) {
+    let start = heads
+        .0
+        .first()
+        .map_or_else(|| buffer.GPUStartTime(), |head| head.GPUStartTime());
+    let end = buffer.GPUEndTime();
+    // A copy outside a step is not a step's span.
+    if traced.is_some() {
+        let now = objc2_foundation::NSProcessInfo::processInfo().systemUptime();
+        pie_trace::gpu_span_host(traced, start, end, now);
+    }
+    if pie_trace::memory_due() {
+        pie_trace::memory(buffer.device().currentAllocatedSize() as u64);
     }
 }
 

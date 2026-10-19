@@ -17,6 +17,7 @@ poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 kernels-metal = { path = "../kernels-metal" }
 
 engine = { path = "../engine" }
+pie-trace = { path = "../trace" }
 
 poem-exec = { package = "pie-poem-exec", path = "../poem-exec" }
 
@@ -41,6 +42,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSError",
     "NSRange",
     "NSProcessInfo",
+    "NSDate",
 ] }
 objc2-metal = { version = "0.3", default-features = false, features = [
     "std",

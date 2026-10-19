@@ -1094,6 +1094,7 @@ impl Metal {
                     media: &media,
                     clips: &clips,
                     done,
+                    at: Some(at),
                 },
                 None,
             )
