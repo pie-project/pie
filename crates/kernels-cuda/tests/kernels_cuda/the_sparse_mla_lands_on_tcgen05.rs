@@ -272,6 +272,7 @@ fn score(
         block_size: 0,
         max_pages_per_request: 10,
         pages_in_batch: PAGE_INDICES.len() as i32,
+        live: [0, 0],
     };
     let q = RaggedTensor {
         data: Tensor::new(
@@ -485,6 +486,7 @@ fn decode_rows(reqs: usize, tc: bool, iters: u32) -> (Vec<u16>, f64) {
         block_size: 0,
         max_pages_per_request: *pages_per.iter().max().unwrap() as i32,
         pages_in_batch: total as i32,
+        live: [0, 0],
     };
     let q_at = gpu.up(&q_raw);
     let qpe_at = gpu.up(&qpe_raw);
@@ -661,6 +663,7 @@ fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> 
         block_size: 0,
         max_pages_per_request: pages_per as i32,
         pages_in_batch: total as i32,
+        live: [0, 0],
     };
     let q_at = gpu.up(&q_raw);
     let qpe_at = gpu.up(&qpe_raw);
@@ -704,9 +707,10 @@ fn glm_fp8_rows_score_in_e4m3() {
     if !kernels_cuda::linear::tc5::supported() {
         return;
     }
-    for (kv, rope) in [(300, 64), (1000, 64), (1000, 0)] {
-        let want = decode_short(4, kv, rope, false, false);
-        let got = decode_short(4, kv, rope, true, false);
+    // Four rows split over the multiprocessors; 160 a block each on 128-key tiles.
+    for (rows, kv, rope) in [(4, 300, 64), (4, 1000, 64), (4, 1000, 0), (160, 1000, 64)] {
+        let want = decode_short(rows, kv, rope, false, false);
+        let got = decode_short(rows, kv, rope, true, false);
         let (mut err, mut norm) = (0f64, 0f64);
         for (&g, &w) in got.iter().zip(&want) {
             let (g, w) = (f64::from(from_bf16(g)), f64::from(from_bf16(w)));
@@ -714,7 +718,10 @@ fn glm_fp8_rows_score_in_e4m3() {
             norm += w * w;
         }
         let rel = (err / norm).sqrt();
-        assert!(rel < 0.05, "{kv} keys, rope {rope}: relative error {rel}");
+        assert!(
+            rel < 0.05,
+            "{rows} rows of {kv} keys, rope {rope}: relative error {rel}"
+        );
     }
 }
 

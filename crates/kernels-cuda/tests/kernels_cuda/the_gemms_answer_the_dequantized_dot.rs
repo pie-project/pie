@@ -24,10 +24,11 @@ fn dense(x: &[f64], w: &[f64], [m, n, k]: [usize; 3], bias: Option<&[f64]>) -> V
 fn the_few_rows_and_narrow_gemms_land_the_dot() {
     use kernels_cuda::linear::{gemm_narrow_bf16, gemm_rows_bf16};
     // (few rows, m, n, k, bias): the rows kernel at each K split (8, 4, 2,
-    // 1 warps a row), the narrow one at column counts of its template.
+    // 1 warps a row) and over a cluster (a router's few columns), the narrow
+    // one at column counts of its template.
     #[rustfmt::skip]
     let cases = [(true, 8, 512, 4096, false), (true, 5, 300, 96, true), (true, 2, 64, 48, true),
-        (true, 3, 7, 1032, false), (false, 64, 4, 10240, false), (false, 7, 1, 264, true)];
+        (true, 3, 7, 1032, false), (true, 8, 16, 8192, true), (false, 64, 4, 10240, false), (false, 7, 1, 264, true)];
     for (rows, m, n, k, bias) in cases {
         let mut b = Bench::new((m * 31 + n * 7 + k) as u64);
         let ((x, xv), (w, wv), (bias_at, bv)) = (b.bf16(m * k), b.bf16(n * k), b.bf16(n));

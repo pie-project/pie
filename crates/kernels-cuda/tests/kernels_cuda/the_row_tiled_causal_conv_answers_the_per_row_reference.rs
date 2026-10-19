@@ -59,6 +59,7 @@ fn check(channels: usize, vec4: bool) {
             indptr: Tensor::new(indptr_at, lens.len() as u32 + 1, 1, Dtype::I32),
         },
         Tensor::new(w_at, channels as u32, k, Dtype::Bf16),
+        None,
         &pool,
         k,
         1,

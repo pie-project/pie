@@ -156,6 +156,7 @@ pub fn glu(f: Glu, g: f64, u: f64) -> f64 {
             let u = if c > 0.0 { c * (u / c).tanh() } else { u };
             b * (g / b).tanh() / (1.0 + (-g).exp()) * u
         }
+        Glu::Relu2 => g.max(0.0).powi(2),
     }
 }
 
@@ -268,7 +269,8 @@ pub fn mlp(
         let (t, e, wt) = (r / top, e as usize, f64::from(weights[r]));
         let row = |o: usize| sum(hidden, |i| x[t * hidden + i] * up(e, o, i));
         let h = tab(inter, |c| {
-            let v = glu(f, row(c), row(inter + c)) * if first { wt } else { 1.0 };
+            let u = if f == Glu::Relu2 { 0.0 } else { row(inter + c) };
+            let v = glu(f, row(c), u) * if first { wt } else { 1.0 };
             f64::from(from_bf16(to_bf16(v as f32)))
         });
         let mut v = tab(hidden, |o| sum(inter, |c| h[c] * down(e, o, c)));

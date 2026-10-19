@@ -336,7 +336,9 @@ fn spec_methods(builder: &mut MethodsBuilder) {
     }
 
     /// The kv row `name` in `space`, its planes of `planes` and heads of
-    /// `head_dim`; `heads` cuts it between ranks by head.
+    /// `head_dim`; `heads` cuts it between ranks by head; `live`, a key
+    /// head's and a value head's widths, where heads are zero-padded past
+    /// them.
     fn kv(
         #[starlark(this)] _this: &SpecHandle,
         #[starlark(require = pos)] space: u32,
@@ -344,10 +346,19 @@ fn spec_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = pos)] planes: UnpackList<u64>,
         #[starlark(require = pos)] head_dim: u32,
         #[starlark(require = named, default = false)] heads: bool,
+        #[starlark(require = named)] live: Option<UnpackList<u32>>,
     ) -> anyhow::Result<NoneType> {
+        let live = match live.map(|l| l.items).as_deref() {
+            None => None,
+            Some(&[key, value]) => Some((key, value)),
+            Some(other) => anyhow::bail!("`live` is a key and a value width, not {other:?}"),
+        };
         with(|t| {
             let spec = t.spec.get_or_insert_with(HybridSpec::new);
-            let row = spec.kv(crate::KvSpace(space), name, planes.items, head_dim);
+            let mut row = spec.kv(crate::KvSpace(space), name, planes.items, head_dim);
+            if let Some((key, value)) = live {
+                row.live(key, value);
+            }
             if heads {
                 row.heads();
             }

@@ -52,6 +52,7 @@ fn conv_update(write_state: bool, mask: Option<[u8; 3]>, channels: usize) {
         &gpu.ctx(),
         Tensor::new(x_at, rows, channels as u32, Dtype::Bf16),
         Tensor::new(w_at, channels as u32, k, Dtype::Bf16),
+        None,
         &pool,
         k,
         1,

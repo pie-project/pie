@@ -233,6 +233,7 @@ impl Run<'_> {
                 conv_width,
                 dilation,
                 y,
+                ..
             } => attn::ssm::causal_conv1d(
                 self.ctx(),
                 self.tensor(*x),
@@ -249,6 +250,7 @@ impl Run<'_> {
                 conv_width,
                 dilation,
                 y,
+                ..
             } => attn::ssm::causal_conv1d_chunked(
                 self.ctx(),
                 self.ragged(*x),

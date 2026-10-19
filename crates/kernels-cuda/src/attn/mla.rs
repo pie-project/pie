@@ -695,15 +695,21 @@ mod sparse {
         part_lse: u64,
         splits: i32,
         dense: i32,
+        kv: u64,
+        kv_width: i32,
     }
 
     /// `pie::attn::mlas::Layout<kRope, kE4>::kSmem`: the ring (two slots of
-    /// 64 keys' bf16 latent and rotated dims twice, or three of their e4m3
-    /// codes), P twice, the score exchange, six key lists, barriers, and the
+    /// 64 keys' bf16 latent and rotated dims twice, or four of their e4m3
+    /// codes, five without rotated dims), P twice, the score exchange, six key lists, barriers, and the
     /// 1024-byte alignment.
     const fn smem(rope: i32, e4: bool) -> u32 {
         let ring = if e4 {
-            3 * (32768 + if rope > 0 { 16384 } else { 0 })
+            if rope > 0 {
+                4 * (32768 + 8192)
+            } else {
+                5 * 32768
+            }
         } else {
             2 * (65536 + if rope > 0 { 16384 } else { 0 })
         };
@@ -867,7 +873,25 @@ mod sparse {
             part_lse,
             splits: int(splits),
             dense: i32::from(ctx.tuning().mla_dense_short),
+            kv: pool.keys.ptr,
+            kv_width: int(pool.keys.width),
         };
+        if fp8 && splits == 1 {
+            // A prefill's rows on 128-key tiles and whole scores.
+            // Five 32 KB halves, the rope atom and Q's staging's third atom
+            // with rotated dims, Q's two atoms, two P buffers.
+            let rope = if s.rope > 0 { 2 * 8192 + 8192 } else { 0 };
+            let smem = 5 * 32768 + rope + 2 * 8192 + 2 * 8192 + 4 * 128 * 4 + 1024 + 2048 + 1024;
+            return ctx.fire(
+                op,
+                Fire::at(
+                    FILE,
+                    symbol(&format!("::pie::attn::mlas::mla_sparse_e4<{}>", s.rope)),
+                )
+                .apply(Launch::grid([rows.min(sms), 1, 1], [384, 1, 1]).smem(smem)),
+                &[ArgValue::of(&params)],
+            );
+        }
         ctx.fire(
             op,
             Fire::at(

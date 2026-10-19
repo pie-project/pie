@@ -1,4 +1,11 @@
 
+// NVRTC's static shared memory stops at 48 KB, which the exact cut's state
+// passes beside a region's other shared arrays: on CUDA it sits in the
+// launch's dynamic shared memory, this many bytes of it
+// (`eta_compiler::codegen::cuda::CUT_STATE_BYTES`, the launcher's).
+#define M1_CUT_DYNAMIC 1
+#define M1_CUT_STATE_BYTES 34816u
+
 // The 32-lane chunk the reductions' numeric contract is written over (a
 // width-32 tree; see `canonical_reduce`), as CUDA's warp holds it.
 template <class T>

@@ -205,6 +205,15 @@ __device__ __forceinline__ bf16x2 ldg<bf16x2>(const bf16x2* p) {
     return out;
 }
 
+// An e4m3 code's value (its finite codes; exact in bf16).
+__device__ __forceinline__ float e4m3_to_f32(unsigned b) {
+    const unsigned e = (b >> 3) & 0xf;
+    const unsigned m = b & 7;
+    const float v = e != 0 ? __uint_as_float(((e + 120) << 23) | (m << 20))
+                           : static_cast<float>(m) * 0.001953125f;
+    return (b & 0x80) != 0 ? -v : v;
+}
+
 __device__ __forceinline__ float bf16x2_lo(bf16x2 v) { return bf16_to_f32(v.x); }
 __device__ __forceinline__ float bf16x2_hi(bf16x2 v) { return bf16_to_f32(v.y); }
 

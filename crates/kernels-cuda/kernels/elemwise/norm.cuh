@@ -131,6 +131,45 @@ __global__ void rmsnorm_plus_one(
         x, weight, y, hidden, x_row_stride, y_row_stride, eps, heads, win);
 }
 
+// `rmsnorm` (`rmsnorm_plus_one` under PLUS_ONE) of a whole row of `256 *
+// PER`, landing its bits: each thread's values (its elements `t`, `t + 256`,
+// ...) and their weights loaded at once and held, the squares summed in the
+// same order, not read twice in a loop each.
+template <class T, int PER, bool PLUS_ONE>
+__global__ void __launch_bounds__(256) rmsnorm_held(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    T* __restrict__ y,
+    float eps,
+    const u32* __restrict__ win)
+{
+    constexpr int BLOCK = 256;
+    constexpr int hidden = BLOCK * PER;
+    const int row = blockIdx.x;
+    if (win != nullptr && row >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
+    const int tid = threadIdx.x;
+    const T* xr = x + static_cast<long long>(plane_row) * hidden;
+    T* yr = y + static_cast<long long>(plane_row) * hidden;
+    float v[PER], w[PER];
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        v[k] = Elem<T>::to_f32(xr[tid + k * BLOCK]);
+        w[k] = Elem<T>::to_f32(weight[tid + k * BLOCK]);
+    }
+    float local = 0.f;
+#pragma unroll
+    for (int k = 0; k < PER; ++k) local += v[k] * v[k];
+    __shared__ float buf[BLOCK];
+    const float inv_rms = rsqrtf(block_reduce_sum_fast<BLOCK>(local, buf) / static_cast<float>(hidden) + eps);
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        float wv = w[k];
+        if constexpr (PLUS_ONE) wv += 1.f;
+        yr[tid + k * BLOCK] = Elem<T>::from_f32(v[k] * inv_rms * wv);
+    }
+}
+
 template <int PER> struct LaneRun { using type = uint4; };
 template <> struct LaneRun<4> { using type = uint2; };
 
@@ -183,8 +222,10 @@ __global__ void __launch_bounds__(256) rmsnorm_in_warp(
     *reinterpret_cast<Run*>(y + at) = *reinterpret_cast<const Run*>(out);
 }
 
-template <class T, int BLOCK = 256>
-__global__ void rmsnorm_grouped_plus_one(
+// Each `group`-wide run of a row RMS-normed and scaled by its own weights,
+// plus one under `PLUS_ONE`.
+template <class T, int BLOCK, bool PLUS_ONE>
+__global__ void rmsnorm_grouped(
     const T* __restrict__ x,
     const T* __restrict__ weight,
     T* __restrict__ y,
@@ -217,7 +258,7 @@ __global__ void rmsnorm_grouped_plus_one(
 
     for (int i = tid; i < group; i += BLOCK) {
         const float xv = Elem<T>::to_f32(xr[i]);
-        const float wv = Elem<T>::to_f32(wr[i]) + 1.f;
+        const float wv = Elem<T>::to_f32(wr[i]) + (PLUS_ONE ? 1.f : 0.f);
         yr[i] = Elem<T>::from_f32(xv * inv_rms * wv);
     }
 }
@@ -510,6 +551,90 @@ __global__ void rmsnorm_no_scale(
     }
 }
 
+// A norm_gate row's tail, `u` its (scaled) values and `rv` its residual's:
+// the norm, the gated sum (`gate_of(e, alpha, beta)` a channel's gate), `y`,
+// and under NEXT the next norm into `z`.
+template <class T, int BLOCK, bool NEXT, class Gate>
+__device__ __forceinline__ void norm_gate_out(
+    const float (&u)[8],
+    const T (&rv)[8],
+    bool gated,
+    Gate gate_of,
+    long long base,
+    int at,
+    T* __restrict__ y,
+    float eps,
+    const T* __restrict__ next_w,
+    float next_eps,
+    int plus_one,
+    T* __restrict__ z,
+    float* buf)
+{
+    constexpr int hidden = 8 * BLOCK;
+    float local = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) local = fmaf(u[e], u[e], local);
+    const float inv_rms = rsqrtf(block_reduce_sum_fast<BLOCK>(local, buf) / static_cast<float>(hidden) + eps);
+    T out[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        if (!gated) {
+            out[e] = Elem<T>::from_f32(u[e] * inv_rms);
+        } else {
+            const float n = Elem<T>::to_f32(Elem<T>::from_f32(u[e] * inv_rms));
+            float alpha, beta;
+            gate_of(e, alpha, beta);
+            out[e] = Elem<T>::from_f32(alpha * Elem<T>::to_f32(rv[e]) + beta * n);
+        }
+    }
+    *reinterpret_cast<uint4*>(y + base) = *reinterpret_cast<const uint4*>(out);
+    if constexpr (NEXT) {
+        T wt[8];
+        *reinterpret_cast<uint4*>(wt) = *reinterpret_cast<const uint4*>(next_w + at);
+        float sq = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const float o = Elem<T>::to_f32(out[e]);
+            sq += o * o;
+        }
+        __syncthreads();
+        const float inv = rsqrtf(block_reduce_sum_fast<BLOCK>(sq, buf) / static_cast<float>(hidden) + next_eps);
+        T zn[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            float wv = Elem<T>::to_f32(wt[e]);
+            if (plus_one) wv += 1.f;
+            zn[e] = Elem<T>::from_f32(Elem<T>::to_f32(out[e]) * inv * wv);
+        }
+        *reinterpret_cast<uint4*>(z + base) = *reinterpret_cast<const uint4*>(zn);
+    }
+}
+
+// A gate's alpha and beta from its channel's `g`.
+__device__ __forceinline__ void norm_gate_ab(float g, float temperature, float& alpha, float& beta)
+{
+    const float w = __fdividef(g, temperature);
+    beta = __fdividef(1.f, 1.f + __expf(-w));
+    const float a2 = fmaxf(__fdividef(1.f, 1.f + __expf(w)) * (1.f + beta), 1e-3f);
+    alpha = a2 * rsqrtf(a2);
+}
+
+// `u = x * scale` rounded to T (`x` with no scale).
+template <class T>
+__device__ __forceinline__ void norm_gate_in(const T (&v)[8], const T* __restrict__ scale, int at, float (&u)[8])
+{
+    if (scale != nullptr) {
+        T s[8];
+        *reinterpret_cast<uint4*>(s) = *reinterpret_cast<const uint4*>(scale + at);
+#pragma unroll
+        for (int e = 0; e < 8; ++e)
+            u[e] = Elem<T>::to_f32(Elem<T>::from_f32(Elem<T>::to_f32(v[e]) * Elem<T>::to_f32(s[e])));
+    } else {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) u[e] = Elem<T>::to_f32(v[e]);
+    }
+}
+
 // Muse Spark's post-norm and residual gate, a block a row of `8 * BLOCK`, a
 // 16-byte run a thread held in registers: `u = x * scale` rounded to T (`x`
 // with no scale), `n = u / rms(u)` rounded to T, and with a residual `y =
@@ -543,16 +668,7 @@ __global__ void __launch_bounds__(BLOCK) norm_gate(
     T v[8];
     *reinterpret_cast<uint4*>(v) = *reinterpret_cast<const uint4*>(x + base);
     float u[8];
-    if (scale != nullptr) {
-        T s[8];
-        *reinterpret_cast<uint4*>(s) = *reinterpret_cast<const uint4*>(scale + at);
-#pragma unroll
-        for (int e = 0; e < 8; ++e)
-            u[e] = Elem<T>::to_f32(Elem<T>::from_f32(Elem<T>::to_f32(v[e]) * Elem<T>::to_f32(s[e])));
-    } else {
-#pragma unroll
-        for (int e = 0; e < 8; ++e) u[e] = Elem<T>::to_f32(v[e]);
-    }
+    norm_gate_in(v, scale, at, u);
     T rv[8];
     float g[8];
     if (res != nullptr) {
@@ -560,44 +676,66 @@ __global__ void __launch_bounds__(BLOCK) norm_gate(
         *reinterpret_cast<float4*>(g) = *reinterpret_cast<const float4*>(gate + at);
         *reinterpret_cast<float4*>(g + 4) = *reinterpret_cast<const float4*>(gate + at + 4);
     }
-    float local = 0.f;
-#pragma unroll
-    for (int e = 0; e < 8; ++e) local = fmaf(u[e], u[e], local);
     __shared__ float buf[BLOCK];
-    const float inv_rms = rsqrtf(block_reduce_sum_fast<BLOCK>(local, buf) / static_cast<float>(hidden) + eps);
-    T out[8];
+    norm_gate_out<T, BLOCK, NEXT>(
+        u, rv, res != nullptr, [&](int e, float& a, float& b) { norm_gate_ab(g[e], temperature, a, b); },
+        base, at, y, eps, next_w, next_eps, plus_one, z, buf);
+}
+
+// norm_gate over a long fire, a block ROWS rows in turn: its channels' gate
+// math taken once, and each row's loads out while the last is normed.
+template <class T, int BLOCK, bool NEXT, int ROWS>
+__global__ void __launch_bounds__(BLOCK) norm_gate_rows(
+    const T* __restrict__ x,
+    const T* __restrict__ scale,
+    const T* __restrict__ res,
+    const float* __restrict__ gate,
+    T* __restrict__ y,
+    float eps,
+    float temperature,
+    int fan,
+    const T* __restrict__ next_w,
+    float next_eps,
+    int plus_one,
+    T* __restrict__ z,
+    int rows,
+    const u32* __restrict__ win)
+{
+    constexpr int hidden = 8 * BLOCK;
+    const int first = blockIdx.x * ROWS;
+    const int end = win != nullptr ? min(rows, static_cast<int>(win[0]) * fan) : rows;
+    const int last = min(first + ROWS, end);
+    const long long shift = win != nullptr ? static_cast<long long>(win[1]) * fan : 0;
+    const int at = threadIdx.x * 8;
+    float alpha[8], beta[8];
+    if (res != nullptr) {
+        float g[8];
+        *reinterpret_cast<float4*>(g) = *reinterpret_cast<const float4*>(gate + at);
+        *reinterpret_cast<float4*>(g + 4) = *reinterpret_cast<const float4*>(gate + at + 4);
 #pragma unroll
-    for (int e = 0; e < 8; ++e) {
-        if (res == nullptr) {
-            out[e] = Elem<T>::from_f32(u[e] * inv_rms);
-        } else {
-            const float n = Elem<T>::to_f32(Elem<T>::from_f32(u[e] * inv_rms));
-            const float w = g[e] / temperature;
-            const float beta = 1.f / (1.f + __expf(-w));
-            const float alpha = sqrtf(fmaxf((1.f / (1.f + __expf(w))) * (1.f + beta), 1e-3f));
-            out[e] = Elem<T>::from_f32(alpha * Elem<T>::to_f32(rv[e]) + beta * n);
-        }
+        for (int e = 0; e < 8; ++e) norm_gate_ab(g[e], temperature, alpha[e], beta[e]);
     }
-    *reinterpret_cast<uint4*>(y + base) = *reinterpret_cast<const uint4*>(out);
-    if constexpr (NEXT) {
-        T wt[8];
-        *reinterpret_cast<uint4*>(wt) = *reinterpret_cast<const uint4*>(next_w + at);
-        float sq = 0.f;
-#pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            const float o = Elem<T>::to_f32(out[e]);
-            sq += o * o;
+    __shared__ float buf[BLOCK];
+    uint4 xn{}, rn{};
+    if (first < last) {
+        xn = *reinterpret_cast<const uint4*>(x + (first + shift) * hidden + at);
+        if (res != nullptr) rn = *reinterpret_cast<const uint4*>(res + (first + shift) * hidden + at);
+    }
+    for (int row = first; row < last; ++row) {
+        const long long base = (row + shift) * hidden + at;
+        T v[8], rv[8];
+        *reinterpret_cast<uint4*>(v) = xn;
+        *reinterpret_cast<uint4*>(rv) = rn;
+        if (row + 1 < last) {
+            xn = *reinterpret_cast<const uint4*>(x + base + hidden);
+            if (res != nullptr) rn = *reinterpret_cast<const uint4*>(res + base + hidden);
         }
-        __syncthreads();
-        const float inv = rsqrtf(block_reduce_sum_fast<BLOCK>(sq, buf) / static_cast<float>(hidden) + next_eps);
-        T zn[8];
-#pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            float wv = Elem<T>::to_f32(wt[e]);
-            if (plus_one) wv += 1.f;
-            zn[e] = Elem<T>::from_f32(Elem<T>::to_f32(out[e]) * inv * wv);
-        }
-        *reinterpret_cast<uint4*>(z + base) = *reinterpret_cast<const uint4*>(zn);
+        float u[8];
+        norm_gate_in(v, scale, at, u);
+        if (row > first) __syncthreads();
+        norm_gate_out<T, BLOCK, NEXT>(
+            u, rv, res != nullptr, [&](int e, float& a, float& b) { a = alpha[e], b = beta[e]; },
+            base, at, y, eps, next_w, next_eps, plus_one, z, buf);
     }
 }
 
@@ -851,9 +989,8 @@ __global__ void __launch_bounds__(256) rmsnorm_gated_in_warp(
     #pragma unroll
     for (int u = 0; u < PER; ++u) {
         const float g = Elem<T>::to_f32(gv[u]);
-        const float sg = sigmoid_gate
-            ? 1.f / (1.f + __expf(-g))
-            : g / (1.f + __expf(-g));
+        // The gate on the fast division (vLLM's Triton gate's).
+        const float sg = __fdividef(sigmoid_gate ? 1.f : g, 1.f + __expf(-g));
         out[u] = Elem<T>::from_f32(wv[u] * (xv[u] * inv_rms) * sg);
     }
     if constexpr (PER == 4) {
@@ -1490,9 +1627,10 @@ __global__ void __launch_bounds__(kTh) res_blend_norm(
         prefix, blocks, norm_weight, proj_weight, out, B, H, eps, out_weight, out_eps, win);
 }
 
-// A warp a (row, head): its `D` (32 to 256) dims a lane `D / 32` of them,
-// held across the norm.
-template <class ElemT>
+// A warp `kP` (row, head) pairs: a pair's `D` (32 to 256) dims a lane
+// `D / 32` of them, held across the norm. At 128 dims a warp's pairs load
+// at once.
+template <class ElemT, int kP>
 __global__ void __launch_bounds__(256) rmsnorm_gated_by(
     const float* __restrict__ o,
     const ElemT* __restrict__ g,
@@ -1501,50 +1639,71 @@ __global__ void __launch_bounds__(256) rmsnorm_gated_by(
     int rows, int H, int D, float eps,
     const u32* __restrict__ win)
 {
-    const long long pair = static_cast<long long>(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    const long long first = (static_cast<long long>(blockIdx.x) * 8 + (threadIdx.x >> 5)) * kP;
     const int lane = threadIdx.x & 31;
-    const int t = static_cast<int>(pair / H);
-    const int h = static_cast<int>(pair % H);
     const int live = win != nullptr ? min(static_cast<int>(win[0]), rows) : rows;
-    if (t >= live) return;
-    const int row = win != nullptr ? t + static_cast<int>(win[1]) : t;
-    const long long base = ((long long)row * H + h) * D;
+    const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
+    auto base_of = [&](long long pair, bool& in) {
+        const int t = static_cast<int>(pair / H);
+        in = t < live;
+        return (static_cast<long long>(t + row0) * H + pair % H) * D;
+    };
+    auto sigmoid = [](float x) { return 1.f / (1.f + __expf(-x)); };
     const int per = D / 32;
-    float x[8];
-    float acc = 0.f;
     if (per == 4) {
-        const float4 v = reinterpret_cast<const float4*>(o + base)[lane];
-        x[0] = v.x; x[1] = v.y; x[2] = v.z; x[3] = v.w;
-    } else {
+        float4 v[kP];
+        uint2 gw[kP];
+        long long base[kP];
+        bool in[kP];
+        #pragma unroll
+        for (int p = 0; p < kP; ++p) {
+            base[p] = base_of(first + p, in[p]);
+            if (in[p]) {
+                v[p] = reinterpret_cast<const float4*>(o + base[p])[lane];
+                gw[p] = reinterpret_cast<const uint2*>(g + base[p])[lane];
+            }
+        }
+        const float4 wv = reinterpret_cast<const float4*>(weight)[lane];
+        const float w4[4] = {wv.x, wv.y, wv.z, wv.w};
+        #pragma unroll
+        for (int p = 0; p < kP; ++p) {
+            if (!in[p]) continue;
+            const float x[4] = {v[p].x, v[p].y, v[p].z, v[p].w};
+            float acc = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+            const float scale = rsqrtf(acc / static_cast<float>(D) + eps);
+            const ElemT* g4 = reinterpret_cast<const ElemT*>(&gw[p]);
+            uint2 ow;
+            ElemT* o4 = reinterpret_cast<ElemT*>(&ow);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                o4[i] = Elem<ElemT>::from_f32(x[i] * scale * w4[i] * sigmoid(Elem<ElemT>::to_f32(g4[i])));
+            reinterpret_cast<uint2*>(out + base[p])[lane] = ow;
+        }
+        return;
+    }
+    for (int p = 0; p < kP; ++p) {
+        bool in;
+        const long long base = base_of(first + p, in);
+        if (!in) return;
+        float x[8];
+        float acc = 0.f;
 #pragma unroll
         for (int i = 0; i < 8; ++i)
             if (i < per) x[i] = o[base + lane * per + i];
-    }
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
-        if (i < per) acc += x[i] * x[i];
+        for (int i = 0; i < 8; ++i)
+            if (i < per) acc += x[i] * x[i];
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
-    const float scale = rsqrtf(acc / static_cast<float>(D) + eps);
-    if (per == 4) {
-        const uint2 gw = reinterpret_cast<const uint2*>(g + base)[lane];
-        const float4 wv = reinterpret_cast<const float4*>(weight)[lane];
-        const ElemT* g4 = reinterpret_cast<const ElemT*>(&gw);
-        const float w4[4] = {wv.x, wv.y, wv.z, wv.w};
-        uint2 ow;
-        ElemT* o4 = reinterpret_cast<ElemT*>(&ow);
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+        const float scale = rsqrtf(acc / static_cast<float>(D) + eps);
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
-            o4[i] = Elem<ElemT>::from_f32(x[i] * scale * w4[i] * (1.f / (1.f + __expf(-Elem<ElemT>::to_f32(g4[i])))));
-        reinterpret_cast<uint2*>(out + base)[lane] = ow;
-        return;
-    }
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        if (i < per) {
-            const int d = lane * per + i;
-            const float gate = Elem<ElemT>::to_f32(g[base + d]);
-            out[base + d] = Elem<ElemT>::from_f32(x[i] * scale * weight[d] * (1.f / (1.f + __expf(-gate))));
+        for (int i = 0; i < 8; ++i) {
+            if (i < per) {
+                const int d = lane * per + i;
+                out[base + d] = Elem<ElemT>::from_f32(x[i] * scale * weight[d] * sigmoid(Elem<ElemT>::to_f32(g[base + d])));
+            }
         }
     }
 }

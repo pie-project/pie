@@ -2,7 +2,8 @@
 
 // The GLUs pie's MLPs use (1 swiglu, 2 clamped, 3 clamped with alpha, 4
 // GeGLU's tanh form, 5 SiTU), as the tcgen05 epilogue and the
-// register-dequant MoE kernels spell them. Fast exp and divide: a precise
+// register-dequant MoE kernels spell them; and 6, relu2, an activation of
+// the gate's value alone, no up rows read. Fast exp and divide: a precise
 // division would pace a fused epilogue (an overflowing exp divides to 0,
 // its limit).
 
@@ -12,6 +13,9 @@ template <int kGlu>
 __device__ __forceinline__ float glu(float g, float u, float limit, float galpha) {
     if constexpr (kGlu == 1) {
         return __fdividef(g, 1.f + __expf(-g)) * u;
+    } else if constexpr (kGlu == 6) {
+        g = fmaxf(g, 0.f);
+        return g * g;
     } else if constexpr (kGlu == 4) {
         // GeGLU, gelu's tanh form: 0.5 g (1 + tanh(sqrt(2 / pi) (g + 0.044715 g^3))) u.
         float t;

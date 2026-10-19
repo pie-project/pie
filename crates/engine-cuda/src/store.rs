@@ -10,7 +10,7 @@ use crate::error::{Fault, Result};
 use crate::run::{CachePool, CacheTable, PoolSlabs};
 use crate::settle::Airborne;
 use crate::store::kv::{Facts, Paging};
-pub use engine::fit::{least_state_slots, pages_within, state_slots_within};
+pub use engine::fit::{balanced_state_slots, least_state_slots, pages_within, state_slots_within};
 
 impl From<poem_exec::store::Fault> for Fault {
     fn from(fault: poem_exec::store::Fault) -> Fault {
@@ -398,6 +398,7 @@ enum Shape {
         values_width: u64,
         values_plane: usize,
         head_stride: u64,
+        live: Option<[u32; 2]>,
     },
     State {
         stride: u64,
@@ -519,6 +520,7 @@ impl Pools {
                     dtype,
                     space,
                     window,
+                    live,
                     ..
                 } => {
                     let element = elem_bytes(name, *dtype)?;
@@ -593,6 +595,7 @@ impl Pools {
                         values_width,
                         values_plane,
                         head_stride: restated.map_or(keys_width, |seat| u64::from(seat.head_dim)),
+                        live: *live,
                     });
                 }
                 CacheRow::State {
@@ -922,14 +925,23 @@ impl Pools {
             }
         }
         // A hybrid declares a recurrent slab for every state slot, whatever
-        // the pool seats, and on a short card that slab alone can be the
-        // refusal. The slots are then cut to what leaves the kv pages their
-        // half of the room past one sequence, in the whole seats the
-        // runtime admits lanes by.
-        if fit < one_slot && fresh && self.has_state() && self.budget.is_none() {
+        // the pool seats: a heavy slab can take the room its lanes' pages
+        // needed, and on a short card the slab alone can be the refusal.
+        // Where the pages that fit seat fewer sequences at the declared
+        // context than there are slots, the slots are cut to where the two
+        // seat alike, never under what leaves the pages their half of the
+        // room past one sequence.
+        let one = one_slot.max(1);
+        let seats = u64::from(self.paging.slots);
+        if fit / one < seats && fresh && self.has_state() && self.budget.is_none() {
             let one_sequence = self.declared_reshaped(one_slot, 0);
-            let slots = state_slots_within(self.paging.slots, room, one_sequence, |slots| {
+            let floor = state_slots_within(self.paging.slots, room, one_sequence, |slots| {
                 self.declared_reshaped(0, slots)
+            });
+            let slots = balanced_state_slots(self.paging.slots, floor, one_slot, |slots| {
+                pages_within(self.ceiling, room, |pages| {
+                    self.declared_reshaped(pages, slots)
+                })
             });
             let pages = pages_within(self.ceiling, room, |pages| {
                 self.declared_reshaped(pages, slots)
@@ -1179,6 +1191,7 @@ impl Pools {
                     values_width,
                     values_plane,
                     head_stride,
+                    live,
                 } => {
                     let seat = seats
                         .spaces
@@ -1227,6 +1240,7 @@ impl Pools {
                             block_size: 0,
                             max_pages_per_request: narrow(u64::from(self.paging.pages_per_slot)),
                             pages_in_batch: narrow(u64::from(seats.pages)),
+                            live: live.unwrap_or([0, 0]),
                         },
                     }
                 }

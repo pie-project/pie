@@ -23,7 +23,7 @@ use cudarc::runtime::sys::{
     cudaStreamSynchronize,
 };
 
-use super::gemv::{gemm_narrow_bf16, gemm_rows_bf16, gemv_bf16};
+use super::gemv::{gemm_narrow_bf16, gemm_rows_bf16, gemv_bf16, rows_cluster};
 use crate::jit::device::capture_status;
 use crate::jit::{Ctx, refuse};
 
@@ -855,9 +855,10 @@ impl Device {
             charge,
         );
         // A shape the few-rows kernel may serve keys apart from the one it
-        // may not.
+        // may not, and one it serves over a cluster apart again.
         let key = if rows_tried(call, self.rows_m) {
-            key ^ 0x726f_7773_0000_0000 ^ u64::from(self.rows_m)
+            let cluster = rows_cluster(call.n, call.k);
+            key ^ 0x726f_7773_0000_0000 ^ u64::from(self.rows_m) ^ (u64::from(cluster > 1) << 8)
         } else {
             key
         };

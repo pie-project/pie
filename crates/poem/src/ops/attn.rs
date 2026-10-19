@@ -490,13 +490,20 @@ pub fn kv_append_shared(plane: &Value, pages: ValueId, write_page: &Value, write
     );
 }
 
-pub fn ssm_causal_conv1d(x: &Value, weight: &Weight, state: ValueId, conv_width: u32) -> Value {
-    ssm_causal_conv1d_dilated(x, weight, state, conv_width, 1)
+pub fn ssm_causal_conv1d(
+    x: &Value,
+    weight: &Weight,
+    bias: Option<&Weight>,
+    state: ValueId,
+    conv_width: u32,
+) -> Value {
+    ssm_causal_conv1d_dilated(x, weight, bias, state, conv_width, 1)
 }
 
 pub fn ssm_causal_conv1d_dilated(
     x: &Value,
     weight: &Weight,
+    bias: Option<&Weight>,
     state: ValueId,
     conv_width: u32,
     dilation: u32,
@@ -507,6 +514,7 @@ pub fn ssm_causal_conv1d_dilated(
         Attention::SsmCausalConv1d {
             x: x.id(),
             weight: r.weight(weight),
+            bias: bias.map(|b| r.weight(b)),
             state,
             conv_width,
             dilation,
@@ -520,15 +528,17 @@ pub fn ssm_causal_conv1d_dilated(
 pub fn ssm_causal_conv1d_chunked(
     x: &Value,
     weight: &Weight,
+    bias: Option<&Weight>,
     state: ValueId,
     conv_width: u32,
 ) -> Value {
-    ssm_causal_conv1d_chunked_dilated(x, weight, state, conv_width, 1)
+    ssm_causal_conv1d_chunked_dilated(x, weight, bias, state, conv_width, 1)
 }
 
 pub fn ssm_causal_conv1d_chunked_dilated(
     x: &Value,
     weight: &Weight,
+    bias: Option<&Weight>,
     state: ValueId,
     conv_width: u32,
     dilation: u32,
@@ -539,6 +549,7 @@ pub fn ssm_causal_conv1d_chunked_dilated(
         Attention::SsmCausalConv1dChunked {
             x: x.id(),
             weight: r.weight(weight),
+            bias: bias.map(|b| r.weight(b)),
             state,
             conv_width,
             dilation,
@@ -881,6 +892,49 @@ pub fn ssm_kda_step(
             y: y.id(),
         },
         &[mixed, f, b],
+    );
+    y
+}
+
+/// Mamba-2's scan over the convolved `xbc` rows, gated by `silu(z)` and
+/// RMS-normed a group; bf16 rows `z` wide. `chunked` walks prompts, else one
+/// step a request.
+#[allow(clippy::too_many_arguments)]
+pub fn ssm_mamba2(
+    xbc: &Value,
+    dt: &Value,
+    z: &Value,
+    a_log: &Weight,
+    dt_bias: &Weight,
+    d: &Weight,
+    norm: &Weight,
+    eps: f32,
+    state: ValueId,
+    heads: u32,
+    groups: u32,
+    state_dim: u32,
+    chunked: bool,
+) -> Value {
+    let r = xbc.rec();
+    let y = r.fresh(tensor(xbc.rows(), z.width(), Dtype::Bf16));
+    r.push(
+        Attention::SsmMamba2 {
+            xbc: xbc.id(),
+            dt: dt.id(),
+            z: z.id(),
+            a_log: r.weight(a_log),
+            dt_bias: r.weight(dt_bias),
+            d: r.weight(d),
+            norm: r.weight(norm),
+            eps,
+            state,
+            heads,
+            groups,
+            state_dim,
+            chunked,
+            y: y.id(),
+        },
+        &[xbc, dt, z],
     );
     y
 }

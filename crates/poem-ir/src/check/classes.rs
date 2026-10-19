@@ -414,6 +414,7 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::SsmGatedDeltaChunked { .. }
             | Attention::SsmKdaStep { .. }
             | Attention::SsmKdaChunked { .. }
+            | Attention::SsmMamba2 { .. }
             | Attention::PleNgramIds { .. }
             | Attention::PleNgramIdsChunked { .. }
             | Attention::ReplayFloor { .. } => true,
@@ -463,6 +464,7 @@ fn writes_cache(op: &Operation) -> bool {
         Operation::Fused(op) => matches!(
             op,
             Fused::QkvFusedQknormRopeVnormWrite { .. }
+                | Fused::SplitQkvFused { .. }
                 | Fused::RopeYarnAppend { .. }
                 | Fused::NormRopeLastAppend { .. }
                 | Fused::PoolCompress { .. }

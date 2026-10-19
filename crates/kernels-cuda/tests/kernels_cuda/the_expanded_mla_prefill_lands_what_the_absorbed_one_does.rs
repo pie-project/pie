@@ -111,6 +111,7 @@ fn the_expanded_mla_prefill_lands_what_the_absorbed_one_does() {
         block_size: 0,
         max_pages_per_request: 10,
         pages_in_batch: PAGE_INDICES.len() as i32,
+        live: [0, 0],
     };
 
     // Absorbed: split, absorb the queries, score the latents, absorb out.

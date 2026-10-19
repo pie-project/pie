@@ -56,6 +56,7 @@ impl Run<'_> {
 
     fn attention(&mut self, op: &Attention) -> Result<(), kernels_metal::Error> {
         match op {
+            Attention::SsmMamba2 { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Attention::PlanDecode {
                 kv_indptr: _,
                 kv_indices: _,
@@ -723,6 +724,7 @@ impl Run<'_> {
                 conv_width,
                 dilation,
                 y,
+                ..
             }
             | Attention::SsmCausalConv1dChunked {
                 x,
@@ -731,6 +733,7 @@ impl Run<'_> {
                 conv_width,
                 dilation,
                 y,
+                ..
             } if self.rs_seat().is_some() => {
                 const OP: &str = "attention.ssm_causal_conv1d_committed";
                 let seat = self.rs_seat().expect("guarded");
@@ -876,6 +879,7 @@ impl Run<'_> {
                 conv_width,
                 dilation,
                 y,
+                ..
             } => attn::ssm::causal_conv1d(
                 self.ctx(),
                 self.tensor(*x),
@@ -892,6 +896,7 @@ impl Run<'_> {
                 conv_width,
                 dilation,
                 y,
+                ..
             } => attn::ssm::causal_conv1d_chunked(
                 self.ctx(),
                 self.ragged(*x),

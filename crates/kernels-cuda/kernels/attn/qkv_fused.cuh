@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_fp8.h>
+
 #include "prelude/device.cuh"
 
 namespace pie::custom {
@@ -9,12 +11,45 @@ __device__ __forceinline__ float norm_weight(const bf16* __restrict__ w, int i) 
     return w != nullptr ? bf16_to_f32(w[i]) : 1.f;
 }
 
-template <int BLOCK, bool USE_ROPE_TABLE>
+template <int E>
+__device__ __forceinline__ void store_bf16_run(bf16* __restrict__ at, const float (&in)[E]);
+
+// A head's landing row: the query output, or a key or value page row as the
+// pool holds it (bf16, or e4m3 under a unit scale).
+template <class KV>
+struct HeadDst {
+    bf16* q = nullptr;
+    KV* kv = nullptr;
+
+    __device__ __forceinline__ void put(int i, float x) const {
+        if (q != nullptr) {
+            q[i] = f32_to_bf16(x);
+        } else if constexpr (is_same<KV, bf16>::value) {
+            kv[i] = f32_to_bf16(x);
+        } else {
+            kv[i] = KV(x);
+        }
+    }
+
+    template <int E>
+    __device__ __forceinline__ void run(int at, const float (&in)[E]) const {
+        if (q != nullptr) {
+            store_bf16_run<E>(q + at, in);
+        } else if constexpr (is_same<KV, bf16>::value) {
+            store_bf16_run<E>(kv + at, in);
+        } else {
+#pragma unroll
+            for (int i = 0; i < E; ++i) kv[at + i] = KV(in[i]);
+        }
+    }
+};
+
+template <int BLOCK, bool USE_ROPE_TABLE, class KV = bf16>
 __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
     const bf16* __restrict__ packed,
     bf16* __restrict__ q_out,
-    bf16* __restrict__ k_pages,
-    bf16* __restrict__ v_pages,
+    KV* __restrict__ k_pages,
+    KV* __restrict__ v_pages,
     const bf16* __restrict__ q_weight,
     const bf16* __restrict__ k_weight,
     const i32* __restrict__ positions,
@@ -81,10 +116,10 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
         __syncthreads();
     }
 
-    bf16* dst = nullptr;
-    bf16* v_dst = nullptr;
+    HeadDst<KV> dst;
+    HeadDst<KV> v_dst;
     if (is_q) {
-        dst = q_out + (static_cast<long long>(row) * num_q_heads + local_head) *
+        dst.q = q_out + (static_cast<long long>(row) * num_q_heads + local_head) *
                       head_dim;
     } else {
         int actual_page;
@@ -108,21 +143,21 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
             const long long page_row =
                 ((static_cast<long long>(actual_page) * num_kv_heads +
                   local_head) * page_size + offset_in_page) * head_dim;
-            dst = k_pages + page_row;
-            v_dst = v_pages + page_row;
+            dst.kv = k_pages + page_row;
+            v_dst.kv = v_pages + page_row;
         } else {
             const long long page_row =
                 ((static_cast<long long>(actual_page) * page_size) +
                  offset_in_page) * kv_dim;
-            dst = k_pages + page_row + local_head * head_dim;
-            v_dst = v_pages + page_row + local_head * head_dim;
+            dst.kv = k_pages + page_row + local_head * head_dim;
+            v_dst.kv = v_pages + page_row + local_head * head_dim;
         }
     }
 
     if (!is_q) {
         const float inv_v = v_norm ? rsqrtf(buf_v[0] / static_cast<float>(head_dim) + eps) : 1.f;
         for (int i = threadIdx.x; i < head_dim; i += BLOCK) {
-            v_dst[i] = f32_to_bf16(bf16_to_f32(v_src[i]) * inv_v);
+            v_dst.put(i, bf16_to_f32(v_src[i]) * inv_v);
         }
     }
 
@@ -157,17 +192,17 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
             cos_v = 1.f;
             sin_v = 0.f;
         }
-        dst[dim_pair] = f32_to_bf16(a * cos_v - b * sin_v);
-        dst[dim_pair + half] = f32_to_bf16(b * cos_v + a * sin_v);
+        dst.put(dim_pair, a * cos_v - b * sin_v);
+        dst.put(dim_pair + half, b * cos_v + a * sin_v);
     }
 }
 
-template <int HEAD_DIM, bool USE_ROPE_TABLE>
+template <int HEAD_DIM, bool USE_ROPE_TABLE, class KV = bf16>
 __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     const bf16* __restrict__ packed,
     bf16* __restrict__ q_out,
-    bf16* __restrict__ k_pages,
-    bf16* __restrict__ v_pages,
+    KV* __restrict__ k_pages,
+    KV* __restrict__ v_pages,
     const bf16* __restrict__ q_weight,
     const bf16* __restrict__ k_weight,
     const i32* __restrict__ positions,
@@ -192,11 +227,16 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     bool qk_norm,
     float v_scale,
     int qk_width,
-    int v_width)
+    int v_width,
+    int rest_width,
+    bf16* __restrict__ rest)
 {
     constexpr unsigned FULL_MASK = 0xffffffffu;
     constexpr int ELEMS_PER_THREAD = HEAD_DIM / 32;
     static_assert(HEAD_DIM % 64 == 0);
+    // The decode attention after it (`kernel.pdl`) reads its plan meanwhile
+    // and waits for these rows.
+    pdl_launch();
 
     const int warp_id = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -218,9 +258,20 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     // The packed row's heads at their own widths (`qk_width`, `v_width`),
     // each landing HEAD_DIM wide, zero past its width.
     const int kv_dim = num_kv_heads * HEAD_DIM;
-    const int packed_stride = num_q_heads * qk_width + num_kv_heads * (qk_width + v_width);
+    const int qkv_width = num_q_heads * qk_width + num_kv_heads * (qk_width + v_width);
+    const int packed_stride = qkv_width + rest_width;
     const bf16* src_row =
         packed + static_cast<long long>(row) * packed_stride;
+    // The row's columns past its qkv (`rest`, a whole number of 16-byte
+    // words), a q head's share each.
+    if (is_q && rest_width > 0) {
+        const int per = ((rest_width + num_q_heads - 1) / num_q_heads + 7) / 8 * 8;
+        const int end = min((local_head + 1) * per, rest_width);
+        for (int c = local_head * per + lane * 8; c < end; c += 256) {
+            *reinterpret_cast<uint4*>(rest + static_cast<long long>(row) * rest_width + c) =
+                *reinterpret_cast<const uint4*>(src_row + qkv_width + c);
+        }
+    }
     const bf16* src = is_q
         ? src_row + local_head * qk_width
         : src_row + num_q_heads * qk_width + local_head * qk_width;
@@ -292,10 +343,10 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
         vals[i] = vals[i] * cos_v + signed_pair * sin_v;
     }
 
-    bf16* dst = nullptr;
-    bf16* v_dst = nullptr;
+    HeadDst<KV> dst;
+    HeadDst<KV> v_dst;
     if (is_q) {
-        dst = q_out + (static_cast<long long>(row) * num_q_heads + local_head) *
+        dst.q = q_out + (static_cast<long long>(row) * num_q_heads + local_head) *
                       HEAD_DIM;
     } else {
         int actual_page;
@@ -319,28 +370,28 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
             const long long page_row =
                 ((static_cast<long long>(actual_page) * num_kv_heads +
                   local_head) * page_size + offset_in_page) * HEAD_DIM;
-            dst = k_pages + page_row;
-            v_dst = v_pages + page_row;
+            dst.kv = k_pages + page_row;
+            v_dst.kv = v_pages + page_row;
         } else {
             const long long page_row =
                 ((static_cast<long long>(actual_page) * page_size) +
                  offset_in_page) * kv_dim;
-            dst = k_pages + page_row + local_head * HEAD_DIM;
-            v_dst = v_pages + page_row + local_head * HEAD_DIM;
+            dst.kv = k_pages + page_row + local_head * HEAD_DIM;
+            v_dst.kv = v_pages + page_row + local_head * HEAD_DIM;
         }
     }
 
 #pragma unroll
     for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
         const int dim = lane * ELEMS_PER_THREAD + i;
-        dst[dim] = f32_to_bf16(vals[i]);
+        dst.put(dim, vals[i]);
     }
     if (!is_q) {
         const float inv_v = v_norm ? rsqrtf(v_sum / static_cast<float>(HEAD_DIM) + eps) : 1.f;
 #pragma unroll
         for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
             const int dim = lane * ELEMS_PER_THREAD + i;
-            v_dst[dim] = f32_to_bf16(v_vals[i] * inv_v * v_scale);
+            v_dst.put(dim, v_vals[i] * inv_v * v_scale);
         }
     }
 }
@@ -407,13 +458,16 @@ __device__ __forceinline__ void store_bf16_run(bf16* __restrict__ at, const floa
 // into shared memory rather than once a head, and each head's run moves in
 // whole 16-byte words. With E = 8 entries a lane (a 64- or 128-wide head's
 // word) a head takes part of the warp and the warp several heads at once,
-// its sums adding in another order than the warp kernel's.
-template <int HEAD_DIM, int E = HEAD_DIM / 32>
+// its sums adding in another order than the warp kernel's. With STAGE
+// (sm_90 on) the whole packed row lands in shared memory by one bulk copy
+// and the rest leaves by another, so a head's loads wait no round trip
+// each.
+template <int HEAD_DIM, int E = HEAD_DIM / 32, class KV = bf16, bool STAGE = false>
 __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     const bf16* __restrict__ packed,
     bf16* __restrict__ q_out,
-    bf16* __restrict__ k_pages,
-    bf16* __restrict__ v_pages,
+    KV* __restrict__ k_pages,
+    KV* __restrict__ v_pages,
     const bf16* __restrict__ q_weight,
     const bf16* __restrict__ k_weight,
     const i32* __restrict__ positions,
@@ -436,7 +490,9 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     bool qk_norm,
     float v_scale,
     int qk_width,
-    int v_width)
+    int v_width,
+    int rest_width,
+    bf16* __restrict__ rest)
 {
     constexpr unsigned FULL_MASK = 0xffffffffu;
     constexpr int ELEMS_PER_THREAD = E;
@@ -451,9 +507,27 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     const int r = blockIdx.x;
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const int row = win != nullptr ? r + static_cast<int>(win[1]) : r;
-    if (threadIdx.x == 0) {
+    extern __shared__ __align__(16) unsigned char qkv_stage[];
+    const int row_bytes =
+        (num_q_heads * qk_width + num_kv_heads * (qk_width + v_width) + rest_width) * 2;
+    unsigned long long* staged = reinterpret_cast<unsigned long long*>(qkv_stage + row_bytes);
+    const unsigned staged_at = static_cast<unsigned>(__cvta_generic_to_shared(staged));
+    const unsigned stage_at = static_cast<unsigned>(__cvta_generic_to_shared(qkv_stage));
+    if (STAGE && threadIdx.x == 0) {
+#if __CUDA_ARCH__ >= 900
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(staged_at));
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(staged_at), "r"(row_bytes)
+                     : "memory");
+        asm volatile(
+            "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                stage_at),
+            "l"(packed + static_cast<long long>(row) * (row_bytes / 2)), "r"(row_bytes), "r"(staged_at)
+            : "memory");
+#endif
+    } else if (threadIdx.x == 0) {
         // The packed row on its way into L2 under the rotation's setup.
-        const int width = num_q_heads * qk_width + num_kv_heads * (qk_width + v_width);
+        const int width = num_q_heads * qk_width + num_kv_heads * (qk_width + v_width) + rest_width;
         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(
                          packed + static_cast<long long>(row) * width),
                      "r"(static_cast<unsigned>(width) * 2u)
@@ -481,8 +555,38 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     // The packed row's heads at their own widths, landing HEAD_DIM wide.
     const int kv_dim = num_kv_heads * HEAD_DIM;
     const int q_src = num_q_heads * qk_width;
-    const int packed_stride = q_src + num_kv_heads * (qk_width + v_width);
-    const bf16* src_row = packed + static_cast<long long>(row) * packed_stride;
+    const int qkv_width = q_src + num_kv_heads * (qk_width + v_width);
+    const int packed_stride = qkv_width + rest_width;
+    const bf16* src_row = STAGE ? reinterpret_cast<const bf16*>(qkv_stage)
+                                : packed + static_cast<long long>(row) * packed_stride;
+    if constexpr (STAGE) {
+#if __CUDA_ARCH__ >= 900
+        unsigned done = 0;
+        while (!done) {
+            asm volatile(
+                "{\n\t.reg .pred p;\n\t"
+                "mbarrier.try_wait.parity.shared::cta.b64 p, [%1], 0;\n\t"
+                "selp.u32 %0, 1, 0, p;\n\t}"
+                : "=r"(done)
+                : "r"(staged_at)
+                : "memory");
+        }
+        if (threadIdx.x == 0 && rest_width > 0) {
+            asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(
+                             rest + static_cast<long long>(row) * rest_width),
+                         "r"(stage_at + qkv_width * 2), "r"(rest_width * 2)
+                         : "memory");
+            asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+        }
+#endif
+    } else {
+        // The row's columns past its qkv (`rest`, a whole number of 16-byte
+        // words).
+        for (int c = threadIdx.x * 8; c < rest_width; c += blockDim.x * 8) {
+            *reinterpret_cast<uint4*>(rest + static_cast<long long>(row) * rest_width + c) =
+                *reinterpret_cast<const uint4*>(src_row + qkv_width + c);
+        }
+    }
     const bool kv_valid = row_valid == nullptr || row_valid[row] != 0;
 
     int actual_page = 0;
@@ -508,7 +612,170 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     const int pair_offset = span / ELEMS_PER_THREAD;
     const int sub = lane / L;
     const int part = lane % L;
-    for (int head0 = warp_id * G; head0 < total_qk_heads; head0 += warps_per_block * G) {
+    // A whole-width rotation (pairs half a head apart) over 16-byte words: a
+    // lane takes four dims of each half instead, its pairs its own, the
+    // rotation's eight values and both weights' held across the heads.
+    bool walked = false;
+    if constexpr (STAGE && ELEMS_PER_THREAD == 8 && is_same<KV, bf16>::value) {
+        if (2 * span == HEAD_DIM && rotary_dim == HEAD_DIM && qk_width == HEAD_DIM && v_width == HEAD_DIM) {
+            walked = true;
+            const int lo = part * 4;
+            auto ld8 = [&](const bf16* at, float (&o)[8]) {
+                const uint2 x = *reinterpret_cast<const uint2*>(at + lo);
+                const uint2 y = *reinterpret_cast<const uint2*>(at + HALF + lo);
+                const unsigned int w4[4] = {x.x, x.y, y.x, y.y};
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    o[2 * k] = __uint_as_float(w4[k] << 16);
+                    o[2 * k + 1] = __uint_as_float(w4[k] & 0xffff0000u);
+                }
+            };
+            auto st8 = [&](bf16* at, const float (&o)[8]) {
+                *reinterpret_cast<uint2*>(at + lo) = make_uint2(pack_bf16x2(o[0], o[1]), pack_bf16x2(o[2], o[3]));
+                *reinterpret_cast<uint2*>(at + HALF + lo) =
+                    make_uint2(pack_bf16x2(o[4], o[5]), pack_bf16x2(o[6], o[7]));
+            };
+            float cs[4], sn[4], wq[8], wk[8];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                cs[k] = rotation[lo + k];
+                sn[k] = rotation[HALF + lo + k];
+            }
+#pragma unroll
+            for (int k = 0; k < 8; ++k) wq[k] = wk[k] = 1.f;
+            if (q_weight != nullptr) ld8(q_weight, wq);
+            if (k_weight != nullptr) ld8(k_weight, wk);
+            for (int head0 = warp_id * G; head0 < total_qk_heads; head0 += warps_per_block * G) {
+                const int head_idx = head0 + sub;
+                const bool is_q = head_idx < num_q_heads;
+                const bool on = head_idx < total_qk_heads && (is_q || kv_valid);
+                const int local_head = is_q ? head_idx : (head_idx - num_q_heads);
+                float x[8], y[8];
+#pragma unroll
+                for (int k = 0; k < 8; ++k) x[k] = y[k] = 0.f;
+                if (on) ld8(src_row + (is_q ? 0 : q_src) + local_head * HEAD_DIM, x);
+                if (on && !is_q) ld8(src_row + q_src + num_kv_heads * HEAD_DIM + local_head * HEAD_DIM, y);
+                float sum = 0.f, v_sum = 0.f;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    sum += x[k] * x[k];
+                    v_sum += y[k] * y[k];
+                }
+#pragma unroll
+                for (int offset = L / 2; offset > 0; offset >>= 1) {
+                    sum += __shfl_xor_sync(FULL_MASK, sum, offset, L);
+                    v_sum += __shfl_xor_sync(FULL_MASK, v_sum, offset, L);
+                }
+                if (!on) continue;
+                if (qk_norm) {
+                    const float inv_rms = rsqrtf(sum / static_cast<float>(HEAD_DIM) + eps);
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) x[k] *= inv_rms * (is_q ? wq[k] : wk[k]);
+                }
+                // x[k] dim lo + k's (first half), x[4 + k] its pair's.
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const float u = x[k], v = x[4 + k];
+                    x[k] = u * cs[k] - v * sn[k];
+                    x[4 + k] = v * cs[k] + u * sn[k];
+                }
+                if (is_q) {
+                    st8(q_out + (static_cast<long long>(row) * num_q_heads + local_head) * HEAD_DIM, x);
+                    continue;
+                }
+                const long long page_row = hnd_layout
+                    ? ((static_cast<long long>(actual_page) * num_kv_heads + local_head) * page_size +
+                       offset_in_page) * HEAD_DIM
+                    : ((static_cast<long long>(actual_page) * page_size) + offset_in_page) * kv_dim +
+                          local_head * HEAD_DIM;
+                st8(k_pages + page_row, x);
+                const float inv_v = (v_norm ? rsqrtf(v_sum / static_cast<float>(HEAD_DIM) + eps) : 1.f) * v_scale;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) y[k] *= inv_v;
+                st8(v_pages + page_row, y);
+            }
+        }
+    }
+    // Otherwise over 16-byte words, each lane's rotation (its cos, its
+    // signed sin, the pair `span` away a shuffle off) and both weights' runs
+    // held across the heads.
+    if constexpr (STAGE && ELEMS_PER_THREAD == 8 && is_same<KV, bf16>::value) {
+        if (!walked) {
+            walked = true;
+            const int run = part * ELEMS_PER_THREAD;
+            float cs[8], sn[8], wq[8], wk[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int dim = run + k;
+                const int in_two = dim & (2 * span - 1);
+                const int dim_pair = in_two & (span - 1);
+                const bool turns = dim < 2 * span;
+                cs[k] = turns ? rotation[dim_pair] : 1.f;
+                sn[k] = turns ? (in_two < span ? -rotation[HALF + dim_pair] : rotation[HALF + dim_pair]) : 0.f;
+                wq[k] = wk[k] = 1.f;
+            }
+            if (q_weight != nullptr && run < qk_width) load_bf16_run<8>(q_weight + run, wq);
+            if (k_weight != nullptr && run < qk_width) load_bf16_run<8>(k_weight + run, wk);
+            for (int head0 = warp_id * G; head0 < total_qk_heads; head0 += warps_per_block * G) {
+                const int head_idx = head0 + sub;
+                const bool is_q = head_idx < num_q_heads;
+                const bool on = head_idx < total_qk_heads && (is_q || kv_valid);
+                const int local_head = is_q ? head_idx : (head_idx - num_q_heads);
+                float x[8], y[8];
+#pragma unroll
+                for (int k = 0; k < 8; ++k) x[k] = y[k] = 0.f;
+                if (on && run < qk_width) {
+                    load_bf16_run<8>(src_row + (is_q ? 0 : q_src) + local_head * qk_width + run, x);
+                }
+                if (on && !is_q && run < v_width) {
+                    load_bf16_run<8>(src_row + q_src + num_kv_heads * qk_width + local_head * v_width + run, y);
+                }
+                float sum = 0.f, v_sum = 0.f;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    sum += x[k] * x[k];
+                    v_sum += y[k] * y[k];
+                }
+#pragma unroll
+                for (int offset = L / 2; offset > 0; offset >>= 1) {
+                    sum += __shfl_xor_sync(FULL_MASK, sum, offset, L);
+                    v_sum += __shfl_xor_sync(FULL_MASK, v_sum, offset, L);
+                }
+                if (qk_norm) {
+                    const float inv_rms = rsqrtf(sum / static_cast<float>(HEAD_DIM) + eps);
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) x[k] *= inv_rms * (is_q ? wq[k] : wk[k]);
+                }
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const float pair = __shfl_xor_sync(FULL_MASK, x[k], pair_offset, L);
+                    x[k] = x[k] * cs[k] + pair * sn[k];
+                }
+                if (!on) continue;
+                HeadDst<KV> dst;
+                HeadDst<KV> v_dst;
+                if (is_q) {
+                    dst.q = q_out + (static_cast<long long>(row) * num_q_heads + local_head) * HEAD_DIM;
+                } else {
+                    const long long page_row = hnd_layout
+                        ? ((static_cast<long long>(actual_page) * num_kv_heads + local_head) * page_size +
+                           offset_in_page) * HEAD_DIM
+                        : ((static_cast<long long>(actual_page) * page_size) + offset_in_page) * kv_dim +
+                              local_head * HEAD_DIM;
+                    dst.kv = k_pages + page_row;
+                    v_dst.kv = v_pages + page_row;
+                }
+                dst.template run<8>(run, x);
+                if (!is_q) {
+                    const float inv_v = (v_norm ? rsqrtf(v_sum / static_cast<float>(HEAD_DIM) + eps) : 1.f) * v_scale;
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) y[k] *= inv_v;
+                    v_dst.template run<8>(run, y);
+                }
+            }
+        }
+    }
+    for (int head0 = walked ? total_qk_heads : warp_id * G; head0 < total_qk_heads; head0 += warps_per_block * G) {
         // A part of the warp a head: every lane joins the shuffles, a lane
         // past the heads (or on an invalid row's kv) loading and storing nothing.
         const int head_idx = head0 + sub;
@@ -572,32 +839,37 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
         }
 
         if (!on) continue;
-        bf16* dst;
-        bf16* v_dst = nullptr;
+        HeadDst<KV> dst;
+        HeadDst<KV> v_dst;
         if (is_q) {
-            dst = q_out + (static_cast<long long>(row) * num_q_heads + local_head) * HEAD_DIM;
+            dst.q = q_out + (static_cast<long long>(row) * num_q_heads + local_head) * HEAD_DIM;
         } else if (hnd_layout) {
             const long long page_row =
                 ((static_cast<long long>(actual_page) * num_kv_heads +
                   local_head) * page_size + offset_in_page) * HEAD_DIM;
-            dst = k_pages + page_row;
-            v_dst = v_pages + page_row;
+            dst.kv = k_pages + page_row;
+            v_dst.kv = v_pages + page_row;
         } else {
             const long long page_row =
                 ((static_cast<long long>(actual_page) * page_size) +
                  offset_in_page) * kv_dim;
-            dst = k_pages + page_row + local_head * HEAD_DIM;
-            v_dst = v_pages + page_row + local_head * HEAD_DIM;
+            dst.kv = k_pages + page_row + local_head * HEAD_DIM;
+            v_dst.kv = v_pages + page_row + local_head * HEAD_DIM;
         }
-        store_bf16_run<ELEMS_PER_THREAD>(dst + run, vals);
+        dst.template run<ELEMS_PER_THREAD>(run, vals);
         if (!is_q) {
             const float inv_v = v_norm ? rsqrtf(v_sum / static_cast<float>(HEAD_DIM) + eps) : 1.f;
 #pragma unroll
             for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
                 v_vals[i] = v_vals[i] * inv_v * v_scale;
             }
-            store_bf16_run<ELEMS_PER_THREAD>(v_dst + run, v_vals);
+            v_dst.template run<ELEMS_PER_THREAD>(run, v_vals);
         }
+    }
+    if constexpr (STAGE) {
+#if __CUDA_ARCH__ >= 900
+        if (threadIdx.x == 0 && rest_width > 0) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+#endif
     }
 }
 

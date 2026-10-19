@@ -75,6 +75,8 @@ gemm.bias_epilogue = true
 # Routed MLPs kept by expert with the GLU in the gate-up epilogue: W4A4
 # always, W4A8 from 512 tokens.
 moe.w4a4_fused_from = 1
+# A narrow W4A4 fire lays its routes out and quantizes them in one launch.
+moe.w4a4_fused_layout = true
 moe.w4a8_fused_from = 512
 # The fused qkv write a warp a head below 256 rows.
 attn.qkv_rows_from = 256

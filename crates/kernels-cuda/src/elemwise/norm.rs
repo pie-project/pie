@@ -141,6 +141,22 @@ fn rms_row(
             ],
         );
     }
+    // A whole row of 2048 to 8192 held in registers, read once.
+    if per_head_dim == 0 && matches!(width, 2048 | 4096 | 8192) {
+        let plus_one = template == OFFSET_BANK;
+        return ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_held<{t}, {}, {plus_one}>",
+                    width / 256
+                )),
+            )
+            .apply(launch),
+            &[x.arg(), weight.arg(), y.arg(), eps.arg(), ctx.stage()],
+        );
+    }
     ctx.fire(
         op,
         Fire::at(
@@ -296,31 +312,39 @@ pub fn norm_gate(
         ));
     }
     let tail = next.is_some();
-    ctx.fire(
-        OP,
-        Fire::at(
-            FILE,
-            symbol(&format!(
-                "::pie::elemwise::norm_gate<{t}, {threads}, {tail}>"
-            )),
+    // A long fire's block walks sixteen rows; a short one's keeps a row.
+    const WALK: u32 = 16;
+    let walk = rows >= 8192;
+    let (entry, launch) = if walk {
+        (
+            format!("::pie::elemwise::norm_gate_rows<{t}, {threads}, {tail}, {WALK}>"),
+            Launch::per_row(rows.div_ceil(WALK), threads),
         )
-        .apply(Launch::per_row(rows, threads)),
-        &[
-            x.arg(),
-            absent(scale),
-            absent(res),
-            absent(gate),
-            y.arg(),
-            eps.arg(),
-            temperature.arg(),
-            stated(OP, fan)?.arg(),
-            absent(next.map(|n| n.weight)),
-            next.map_or(0.0, |n| n.eps).arg(),
-            i32::from(next.is_some_and(|n| n.plus_one)).arg(),
-            absent(next.map(|n| n.y)),
-            ctx.stage(),
-        ],
-    )
+    } else {
+        (
+            format!("::pie::elemwise::norm_gate<{t}, {threads}, {tail}>"),
+            Launch::per_row(rows, threads),
+        )
+    };
+    let mut args = vec![
+        x.arg(),
+        absent(scale),
+        absent(res),
+        absent(gate),
+        y.arg(),
+        eps.arg(),
+        temperature.arg(),
+        stated(OP, fan)?.arg(),
+        absent(next.map(|n| n.weight)),
+        next.map_or(0.0, |n| n.eps).arg(),
+        i32::from(next.is_some_and(|n| n.plus_one)).arg(),
+        absent(next.map(|n| n.y)),
+    ];
+    if walk {
+        args.push(stated(OP, rows)?.arg());
+    }
+    args.push(ctx.stage());
+    ctx.fire(OP, Fire::at(FILE, symbol(&entry)).apply(launch), &args)
 }
 
 pub fn rmsnorm_no_scale(
@@ -547,12 +571,36 @@ pub fn rmsnorm_grouped_plus_one(
     eps: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_grouped_plus_one";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let group = nonzero(OP, "the group width", group)?;
+    rmsnorm_grouped(
+        ctx,
+        "elementwise.rmsnorm_grouped_plus_one",
+        x,
+        weight,
+        group,
+        eps,
+        true,
+        y,
+    )
+}
+
+/// Each `group`-wide run of `x`'s rows RMS-normed into `y` and scaled by
+/// its own `weight`s (`1 + weight` under `plus_one`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rmsnorm_grouped(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    weight: Tensor,
+    group: u32,
+    eps: f32,
+    plus_one: bool,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let group = nonzero(op, "the group width", group)?;
     if y.width == 0 || !y.width.is_multiple_of(group) {
         return Err(refuse(
-            OP,
+            op,
             format!(
                 "the {}-wide row is not a whole number of {group}-wide groups",
                 y.width
@@ -565,13 +613,13 @@ pub fn rmsnorm_grouped_plus_one(
         "the weight spans the row's full width"
     );
     let groups = y.width / group;
-    let launch = rows_per_head(OP, y.rows, y.width, group)?;
+    let launch = rows_per_head(op, y.rows, y.width, group)?;
     ctx.fire(
-        OP,
+        op,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::elemwise::rmsnorm_grouped_plus_one<{t}, 256>"
+                "::pie::elemwise::rmsnorm_grouped<{t}, 256, {plus_one}>"
             )),
         )
         .apply(launch),
@@ -579,8 +627,8 @@ pub fn rmsnorm_grouped_plus_one(
             x.arg(),
             weight.arg(),
             y.arg(),
-            stated(OP, group)?.arg(),
-            stated(OP, groups)?.arg(),
+            stated(op, group)?.arg(),
+            stated(op, groups)?.arg(),
             eps.arg(),
             ctx.stage(),
         ],
@@ -617,13 +665,20 @@ pub fn rmsnorm_gated_by(
         .rows
         .checked_mul(heads)
         .ok_or_else(|| refuse(OP, "the rows' heads do not count"))?;
+    // A warp's (row, head) pairs.
+    let per_warp: u32 = if ctx.tuning().rows_vec { 2 } else { 1 };
     ctx.fire(
         OP,
         Fire::at(
             "elemwise/norm.cuh",
-            symbol(&format!("::pie::elemwise::rmsnorm_gated_by<{t}>")),
+            symbol(&format!(
+                "::pie::elemwise::rmsnorm_gated_by<{t}, {per_warp}>"
+            )),
         )
-        .apply(Launch::grid([pairs.div_ceil(8), 1, 1], [256, 1, 1])),
+        .apply(Launch::grid(
+            [pairs.div_ceil(8 * per_warp), 1, 1],
+            [256, 1, 1],
+        )),
         &[
             x.arg(),
             gate.arg(),

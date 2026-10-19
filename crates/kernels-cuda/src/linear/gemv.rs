@@ -87,6 +87,28 @@ pub(crate) fn gemv_bf16(
     )
 }
 
+/// The warps a row of the few-rows kernel splits K over: eight where K
+/// divides so, the most blocks and the fewest dependent loads a lane.
+fn rows_split(k: i32) -> i32 {
+    [8, 4, 2, 1]
+        .into_iter()
+        .find(|s| (k / 8) % s == 0)
+        .unwrap_or(1)
+}
+
+/// The blocks a cluster of the few-rows kernel splits a row's K over besides:
+/// four for a product of a few columns (a router's), whose few blocks alone
+/// keep too few loads in flight; else 1.
+pub(crate) fn rows_cluster(n: i32, k: i32) -> u32 {
+    let split = rows_split(k);
+    let blocks = n.unsigned_abs().div_ceil(16 / split as u32);
+    if blocks <= 32 && (k / 8) % (split * 4) == 0 {
+        4
+    } else {
+        1
+    }
+}
+
 /// `out[m][n] = act[m] . weight[n]` for a few rows (2..=8, a decode's) in
 /// one launch: the tactic `kernel.gemm.rows_m` lets the GEMM tuner try. A
 /// block's eight warps stream weight rows, as many warps a row as keep some
@@ -118,25 +140,22 @@ pub fn gemm_rows_bf16(
             "the weight and the activation are 16-byte aligned, and nothing is null",
         ));
     }
-    let vectors = k / 8;
-    // Eight warps a row where K divides so: the most blocks and the fewest
-    // dependent loads a lane (best at every DeepSeek-V4-Flash shape measured).
-    let split = [8, 4, 2, 1]
-        .into_iter()
-        .find(|s| vectors % s == 0)
-        .unwrap_or(1);
+    let split = rows_split(k);
     let rows = 16 / split;
+    let blocks = n.unsigned_abs().div_ceil(rows as u32);
+    let cl = rows_cluster(n, k);
     ctx.fire(
         OP,
         Fire::at(
             "linear/gemv.cuh",
             crate::jit::symbol(&format!(
-                "::pie::linear::gemm_rows_bf16_kernel<{m}, {split}>"
+                "::pie::linear::gemm_rows_bf16_kernel<{m}, {split}, {cl}>"
             )),
         )
         .apply(
-            Launch::grid([n.unsigned_abs().div_ceil(rows as u32), 1, 1], [256, 1, 1])
-                .programmatic(pdl),
+            Launch::grid([blocks * cl, 1, 1], [256, 1, 1])
+                .programmatic(pdl)
+                .cluster(cl),
         ),
         &[
             ArgValue::Ptr(weight),

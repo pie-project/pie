@@ -177,6 +177,7 @@ fn prefill(gpu: &mut Gpu, case: &Case, raw: &Raw, device: &Device) -> Vec<u16> {
         block_size: 0,
         max_pages_per_request: 5,
         pages_in_batch: PAGE_INDICES.len() as i32,
+        live: [0, 0],
     };
     let q = RaggedTensor {
         data: Tensor::new(raw.q_nope, tokens, (HEADS * RANK) as u32, Dtype::Bf16),

@@ -969,6 +969,7 @@ fn gdn_step(p: &Pattern, read_conv: bool) -> poem::Value {
     let conv = attn::ssm_causal_conv1d(
         &qkv,
         &p.weight("conv", [4 * 128, 4]),
+        None,
         p.cache("conv_state"),
         4,
     );

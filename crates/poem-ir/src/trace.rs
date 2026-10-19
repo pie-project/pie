@@ -135,6 +135,10 @@ pub enum CacheRow {
         /// readable (they deserialize to 0, which reproduces the old anchor).
         #[serde(default)]
         head_dim: u32,
+        /// Where heads are zero-padded to `head_dim`: the widths a key head
+        /// and a value head carry, the rest zeros an engine may skip.
+        #[serde(default)]
+        live: Option<[u32; 2]>,
         /// `Cut { axis: 0, .. }` when every plane holds heads the ranks
         /// split between them.
         #[serde(default)]
