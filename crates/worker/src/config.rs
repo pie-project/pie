@@ -281,7 +281,8 @@ pub struct ServerConfig {
     /// Independent of `--log-level`, which sets the tracing filter.
     #[serde(default)]
     pub verbose: bool,
-    /// Tokio worker threads. Derived from the visible CPUs, capped at 64.
+    /// Tokio worker threads. Derived from the visible CPUs: half of them,
+    /// capped at 64.
     #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
     /// Largest blob a client may upload in one request.
@@ -326,9 +327,14 @@ fn default_port() -> u16 {
 fn default_true() -> bool {
     true
 }
+// Half the CPUs leave the rest to the engine's own threads (its serve loop,
+// the tokenizer and lane pools); a box whose quota the workers alone fill
+// (24 of an H100 node's) settles a decode fleet into lockstep, its guests
+// trailing every frame: 7.5k tok/s against 18.7k at 12 on DeepSeek-V4's
+// miniature, 64 lanes.
 fn default_worker_threads() -> usize {
     std::thread::available_parallelism()
-        .map(|n| n.get().min(64))
+        .map(|n| (n.get() / 2).clamp(1, 64))
         .unwrap_or(4)
 }
 fn default_max_upload() -> ByteSize {
