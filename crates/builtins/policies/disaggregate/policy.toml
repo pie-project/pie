@@ -1,0 +1,13 @@
+# Disaggregates prefill from decode by worker role: a launch goes to the
+# least loaded decode worker, and its long prefills to the prefill workers,
+# least loaded first (their worker's offload rule says which passes go).
+# A launch with a `worker` prop starts there.
+plane = "cluster"
+subscribe = ["arrived", "dispatched", "exited", "worker-removed"]
+grants = ["placement"]
+uses = ["placement.executors"]
+gate-ms = 20
+
+[props.worker]
+type = "int"
+doc = "Where it starts."

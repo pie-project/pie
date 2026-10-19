@@ -273,6 +273,18 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
 /// Dials `addr` and, if it can take this worker's passes, makes it the
 /// runtime's prefill peer.
 pub async fn dial(addr: &str, ours: &Hello, listen: Option<String>) -> Result<()> {
+    let (client, theirs) = greet(addr, ours).await?;
+    runtime::offload::prefill::set_peer(Some(Arc::new(Dialed {
+        client,
+        home: listen,
+    })));
+    tracing::info!(peer = %addr, worker = %theirs.worker, "prefilling passes on a peer");
+    Ok(())
+}
+
+/// The peer link to `addr`, once its worker said it can take this worker's
+/// passes: one model, one class, one page format.
+async fn greet(addr: &str, ours: &Hello) -> Result<(PeerClient, Hello)> {
     let client = connect(addr).await?;
     let theirs = client
         .hello(tarpc::context::current(), ours.clone())
@@ -292,12 +304,43 @@ pub async fn dial(addr: &str, ours: &Hello, listen: Option<String>) -> Result<()
     if page(&theirs) != page(ours) {
         bail!("the peer at {addr} pages its kv differently");
     }
-    runtime::offload::prefill::set_peer(Some(Arc::new(Dialed {
-        client,
-        home: listen,
-    })));
-    tracing::info!(peer = %addr, worker = %theirs.worker, "prefilling passes on a peer");
-    Ok(())
+    Ok((client, theirs))
+}
+
+/// The peer link listens one port below the bulk link.
+fn peer_of_bulk(bulk: &str) -> Result<String> {
+    let addr: std::net::SocketAddr = bulk
+        .parse()
+        .with_context(|| format!("`{bulk}` is not an address and port"))?;
+    let port = addr
+        .port()
+        .checked_sub(1)
+        .with_context(|| format!("`{bulk}` has no port below it"))?;
+    Ok(std::net::SocketAddr::new(addr.ip(), port).to_string())
+}
+
+/// Dials the executors a policy names, by their bulk addresses.
+pub struct Dialer {
+    pub hello: Hello,
+}
+
+impl runtime::offload::prefill::PrefillDialer for Dialer {
+    fn dial(
+        &self,
+        bulk: String,
+    ) -> BoxFuture<'static, Result<Arc<dyn runtime::offload::prefill::PrefillPeer>>> {
+        let hello = self.hello.clone();
+        Box::pin(async move {
+            let addr = peer_of_bulk(&bulk)?;
+            let (client, theirs) = greet(&addr, &hello).await?;
+            tracing::info!(executor = %addr, worker = %theirs.worker, "an executor the policy named takes passes");
+            let peer: Arc<dyn runtime::offload::prefill::PrefillPeer> = Arc::new(Dialed {
+                client,
+                home: listen(),
+            });
+            Ok(peer)
+        })
+    }
 }
 
 /// The gateway's directory, asked by this worker.

@@ -21,13 +21,18 @@ use crate::admission::{AdmissionDecision, RejectReason};
 use crate::route::RoutingHandle;
 use crate::session::AdmitReject;
 
+/// The prop a placement's executors reach the worker in, as `cluster/executors`.
+const EXECUTORS_PROP: &str = "executors";
+
 fn capability(name: &str) -> bool {
     // Runs replicate to pools, and a GPU worker takes them as a pass needs
     // them; a running turn of a built-in API moves by ending where it runs
-    // and resuming where it goes, after what its client was sent.
+    // and resuming where it goes, after what its client was sent; a
+    // process's passes go to the executors named, as their worker's offload
+    // rule lets them.
     matches!(
         name,
-        "cluster.hold" | "state.replicate" | "placement.migrate"
+        "cluster.hold" | "state.replicate" | "placement.migrate" | "placement.executors"
     )
 }
 
@@ -65,6 +70,7 @@ pub struct Cluster {
     gate: Duration,
     next_seq: AtomicU64,
     dead: Arc<AtomicBool>,
+    fleet: crate::worker::WorkerRegistry,
 }
 
 enum Event {
@@ -161,6 +167,7 @@ impl Cluster {
             }
         });
         let ticks = events.clone();
+        let placing = fleet.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(STATE_TICK).await;
@@ -189,6 +196,7 @@ impl Cluster {
                 gate,
                 next_seq: AtomicU64::new(0),
                 dead,
+                fleet: placing,
             }),
             cancelled,
             moves,
@@ -307,11 +315,25 @@ impl Cluster {
             .as_deref()
             .and_then(|w| w.parse().ok())
             .map(WorkerId);
-        let props = placement
+        let mut props: Props = placement
             .props
             .iter()
             .filter_map(|(name, value)| Some((name.clone(), json(value)?)))
             .collect();
+        // The worker reaches an executor at its bulk link, as the directory
+        // knows it; one it does not know is left out.
+        let directory = self.fleet.directory();
+        let executors: Vec<String> = placement
+            .executors
+            .iter()
+            .filter_map(|id| directory.peer(WorkerId(id.parse().ok()?)))
+            .collect();
+        if !executors.is_empty() {
+            props.insert(
+                EXECUTORS_PROP.to_string(),
+                serde_json::Value::String(executors.join(" ")),
+            );
+        }
         (worker, props)
     }
 

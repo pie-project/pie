@@ -25,6 +25,7 @@ in a compat body, or as `LaunchProcess.props`) and the session it names.
 | `relocate` | cluster | places a launch by `worker`, then moves it to `move-to` once it has run `move-after-ms`; its stream goes on | `worker`, `move-to`, `move-after-ms` |
 | `drain-migrate` | cluster | moves every turn running on a draining worker to the least loaded one that is not, so a worker leaves without ending what it runs | |
 | `rebalance` | cluster | keeps running turns even across serving workers by moving the youngest from the busiest to the idlest (after Llumnix); a `worker` prop names where a launch starts | `worker` |
+| `disaggregate` | cluster | sends a launch to the least loaded decode worker, and its long prefills to the prefill workers (`[cluster] role = "prefill"`), least loaded first; which passes go is the worker's offload rule | `worker` |
 | `pin` | cluster | sends a launch to the worker its `worker` prop names | `worker` |
 | `cluster-priority` | cluster | launches leave the gateway's queue by priority, and pass it on as `cluster/priority` | `priority` |
 

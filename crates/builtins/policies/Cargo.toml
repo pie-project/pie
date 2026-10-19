@@ -15,6 +15,7 @@ members = [
     "cluster-priority",
     "pin",
     "rebalance",
+    "disaggregate",
     "drain-migrate",
     "relocate",
     "pool-replicate",

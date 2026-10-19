@@ -702,6 +702,7 @@ impl Process {
         // A process arrives, as a policy sees it, before it waits: every gate
         // below orders by its key.
         let props = arrival.props.clone();
+        crate::offload::prefill::arrived(process_id, &props);
         crate::policy::report(crate::policy::Event::Arrived(process_id, arrival));
         // Held ahead of every admission permit: a preempted process coming
         // back must not queue behind permits the held-back processes own.
@@ -860,6 +861,7 @@ impl Process {
             // Before the client hears of the exit, so whoever it tells
             // can read the process's last counts.
             crate::policy::tokens::exit(self.client_pid);
+            crate::offload::prefill::exited(self.client_pid);
             crate::policy::report(crate::policy::Event::Exited(self.client_pid, outcome));
             if let Some(tx) = self.result_tx.lock().unwrap().take() {
                 let _ = tx.send(result.clone());

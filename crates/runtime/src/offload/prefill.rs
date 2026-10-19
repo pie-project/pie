@@ -69,7 +69,103 @@ fn peer() -> Option<Arc<dyn PrefillPeer>> {
 }
 
 pub fn has_peer() -> bool {
-    PEER.read().unwrap().is_some()
+    PEER.read().unwrap().is_some() || DIALER.read().unwrap().is_some()
+}
+
+/// Reaches the worker whose bulk link is at an address, and answers whether
+/// it can take this worker's passes: the link layer's.
+pub trait PrefillDialer: Send + Sync {
+    fn dial(&self, bulk: String) -> BoxFuture<'static, Result<Arc<dyn PrefillPeer>>>;
+}
+
+static DIALER: RwLock<Option<Arc<dyn PrefillDialer>>> = RwLock::new(None);
+
+/// Executors dialed so far, by bulk address.
+static DIALED: std::sync::LazyLock<
+    tokio::sync::Mutex<std::collections::HashMap<String, Arc<dyn PrefillPeer>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+pub fn set_dialer(dialer: Option<Arc<dyn PrefillDialer>>) {
+    *DIALER.write().unwrap() = dialer;
+}
+
+/// The prop the cluster plane names a process's executors in (as
+/// `placement.executors`): their bulk addresses, best first, space apart.
+pub const EXECUTORS_PROP: &str = "cluster/executors";
+
+/// Each process's executors, as its launch named them.
+static EXECUTORS: std::sync::LazyLock<
+    RwLock<std::collections::HashMap<crate::inferlet::process::ProcessId, Vec<String>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Notes the executors a process's launch named, if any.
+pub fn arrived(pid: crate::inferlet::process::ProcessId, props: &client_api::Props) {
+    let Some(named) = props.get(EXECUTORS_PROP).and_then(|value| value.as_str()) else {
+        return;
+    };
+    let executors: Vec<String> = named.split_whitespace().map(str::to_string).collect();
+    if !executors.is_empty() {
+        EXECUTORS.write().unwrap().insert(pid, executors);
+    }
+}
+
+pub fn exited(pid: crate::inferlet::process::ProcessId) {
+    EXECUTORS.write().unwrap().remove(&pid);
+}
+
+/// Where `pid`'s pass goes: the first executor the worker plane's rule names,
+/// else the cluster plane's, that can take it; else the configured peer.
+async fn executor(pid: crate::inferlet::process::ProcessId) -> Option<Arc<dyn PrefillPeer>> {
+    let ruled = crate::policy::offload::rule(pid)
+        .flatten()
+        .map(|rule| rule.executors)
+        .unwrap_or_default();
+    let named = if ruled.is_empty() {
+        EXECUTORS
+            .read()
+            .unwrap()
+            .get(&pid)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        ruled
+    };
+    let dialer = DIALER.read().unwrap().clone();
+    if let Some(dialer) = dialer {
+        for bulk in named {
+            if crate::offload::prefill::is_home(&bulk) {
+                continue;
+            }
+            let mut dialed = DIALED.lock().await;
+            if let Some(peer) = dialed.get(&bulk) {
+                return Some(peer.clone());
+            }
+            match dialer.dial(bulk.clone()).await {
+                Ok(peer) => {
+                    dialed.insert(bulk, peer.clone());
+                    return Some(peer);
+                }
+                Err(error) => tracing::debug!(
+                    target: "pie::offload",
+                    executor = %bulk,
+                    %error,
+                    "an executor the policy named cannot take this worker's passes"
+                ),
+            }
+        }
+    }
+    peer()
+}
+
+static HOME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// This worker's own bulk address: an executor list that names it skips it.
+pub fn set_home(bulk: String) {
+    let _ = HOME.set(bulk);
+}
+
+fn is_home(bulk: &str) -> bool {
+    HOME.get().is_some_and(|home| home == bulk)
 }
 
 /// Tokens per kv page on this worker's engine, once one serves a model.
@@ -140,7 +236,7 @@ pub(crate) async fn before_pass(
     if pass.have >= pass.limit || (pass.limit - pass.have) * u64::from(page) < min_tokens {
         return;
     }
-    let Some(peer) = peer() else {
+    let Some(peer) = executor(pid).await else {
         return;
     };
     let started = std::time::Instant::now();

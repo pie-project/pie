@@ -190,7 +190,9 @@ pub async fn run(cfg: config::Config, home: &Path) -> Result<WorkerHandle> {
     };
     let control_addr = topology::addr_from_host_port(&cfg.server.host, cfg.server.port);
     let coordinator = topology::connect(&mode, control_addr)?;
-    if matches!(coordinator.role(), Some(Role::Prefill | Role::Encode)) {
+    // A prefill worker serves a runtime like any other: its passes are the
+    // ones peers send it (`offload`), and the gateway routes no launch to it.
+    if matches!(coordinator.role(), Some(Role::Encode)) {
         let executor = boot_executor(&cfg, home, &coordinator).await?;
         Ok(WorkerHandle {
             inner: WorkerKind::Executor(executor),
@@ -375,7 +377,11 @@ async fn start_peers(user_cfg: &config::Config) -> Result<()> {
     if let Some(listen) = &user_cfg.offload.listen {
         peer::serve(listen, hello.clone()).await?;
         peer::set_listen(peer::bulk_addr(listen)?);
+        runtime::offload::prefill::set_home(peer::bulk_addr(listen)?);
     }
+    runtime::offload::prefill::set_dialer(Some(std::sync::Arc::new(peer::Dialer {
+        hello: hello.clone(),
+    })));
     peer::clients();
     if !user_cfg.offload.pools.is_empty() {
         tokio::spawn(peer::push_to_pools(user_cfg.offload.pools.clone()));
