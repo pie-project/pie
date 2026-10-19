@@ -441,14 +441,10 @@ pub enum Fused {
         sum: Box<Linear>,
         gate_add: Option<Box<Linear>>,
     },
-    /// `qkv` (a `QkvFusedQknormRopeVnormWrite`) on the first `width` columns
-    /// of its `packed` rows, the rest of each row landing in `rest`: a row
-    /// split (Muse Spark's qkv|gate) read in place.
-    SplitQkvFused {
-        width: u32,
-        rest: ValueId,
-        qkv: Box<Fused>,
-    },
+    /// `qkv` (a `QkvFusedQknormRopeVnormWrite`) on the first columns of its
+    /// `packed` rows, the rest of each row (`rest`'s width) landing in
+    /// `rest`: a row split (Muse Spark's qkv|gate) read in place.
+    SplitQkvFused { rest: ValueId, qkv: Box<Fused> },
     /// A packed qkv row split, q and k normed per head (under weights, or
     /// none) where `qk_norm`, v normed without a scale where `v_norm` and
     /// scaled by `v_scale`, the first `rotary_dim / 2` pairs `span` apart of

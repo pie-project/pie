@@ -151,9 +151,7 @@ impl Gate {
         }
         let pairs = requests.saturating_mul(kv_heads).max(1);
         let mut ranks = self.cluster.min(8);
-        // Past 64 blocks, eight slices a row fold slower than four (B200:
-        // Muse Spark's 16 pairs at a decode of one, gpt-oss's 32 and 64 at four
-        // and eight).
+        // Past 64 blocks, eight slices a row fold slower than four.
         while ranks > 4 && pairs.saturating_mul(ranks) > 64 {
             ranks /= 2;
         }

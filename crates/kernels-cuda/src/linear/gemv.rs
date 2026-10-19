@@ -88,8 +88,7 @@ pub(crate) fn gemv_bf16(
 }
 
 /// The warps a row of the few-rows kernel splits K over: eight where K
-/// divides so, the most blocks and the fewest dependent loads a lane (best at
-/// every DeepSeek-V4-Flash shape measured).
+/// divides so, the most blocks and the fewest dependent loads a lane.
 fn rows_split(k: i32) -> i32 {
     [8, 4, 2, 1]
         .into_iter()

@@ -662,11 +662,7 @@ fn qkv_qknorm_rope_vnorm_write() -> Rule {
 /// read in place, not copied out first.
 fn split_qkv_fused() -> Rule {
     Rule::new("custom_cuda.split_qkv_fused", qkv_patterns(true), |m| {
-        let Operation::Layout(Layout::SplitRows { width, .. }) = m.op("rest") else {
-            panic!("`rest` comes from a row split");
-        };
         Fused::SplitQkvFused {
-            width: *width,
             rest: m.value("rest"),
             qkv: Box::new(qkv_fused(m, m.value("full"))),
         }

@@ -925,12 +925,12 @@ impl Pools {
             }
         }
         // A hybrid declares a recurrent slab for every state slot, whatever
-        // the pool seats: a heavy slab (Nemotron-H's 163 MB a slot) can take
-        // the room its lanes' pages needed, and on a short card the slab
-        // alone can be the refusal. Where the pages that fit seat fewer
-        // sequences at the declared context than there are slots, the slots
-        // are cut to where the two seat alike, never under what leaves the
-        // pages their half of the room past one sequence.
+        // the pool seats: a heavy slab can take the room its lanes' pages
+        // needed, and on a short card the slab alone can be the refusal.
+        // Where the pages that fit seat fewer sequences at the declared
+        // context than there are slots, the slots are cut to where the two
+        // seat alike, never under what leaves the pages their half of the
+        // room past one sequence.
         let one = one_slot.max(1);
         let seats = u64::from(self.paging.slots);
         if fit / one < seats && fresh && self.has_state() && self.budget.is_none() {
