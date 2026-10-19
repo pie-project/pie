@@ -751,12 +751,15 @@ fn the_sparse_mla_lands_on_mma() {
         mla_selected_mma: true,
         ..Tuning::DEFAULT
     };
-    for (decode, pooled) in [(false, false), (true, false), (false, true), (true, true)] {
-        let (got, case) = score_on(64, mma, None, decode, pooled);
-        let (again, _) = score_on(64, mma, None, decode, pooled);
+    for (rope, decode, pooled) in [64, 0]
+        .into_iter()
+        .flat_map(|r| [(r, false, false), (r, true, false), (r, false, true), (r, true, true)])
+    {
+        let (got, case) = score_on(rope, mma, None, decode, pooled);
+        let (again, _) = score_on(rope, mma, None, decode, pooled);
         assert!(got.0 == again.0, "decode {decode} pooled {pooled}: two passes land apart");
         let want = if pooled {
-            let (naive, _) = score(64, false, None, decode, pooled);
+            let (naive, _) = score(rope, false, None, decode, pooled);
             (naive.0.iter().map(|&b| from_bf16(b)).collect::<Vec<f32>>(), naive.1)
         } else {
             case.reference()

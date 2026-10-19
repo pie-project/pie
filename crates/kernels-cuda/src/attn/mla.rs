@@ -468,6 +468,13 @@ pub(crate) mod naive {
 
     pub const MMA_SMEM_BYTES: u32 = 100_032;
 
+    /// [`MMA_SMEM_BYTES`] at a rotated part `rope` wide (64 or none).
+    #[must_use]
+    pub const fn mma_smem_bytes(rope: i32) -> u32 {
+        // The query and key tiles' rows narrow by what the part drops.
+        MMA_SMEM_BYTES - (64 - rope) as u32 * (16 + 64) * 2
+    }
+
     #[must_use]
     pub const fn naive_smem_bytes(kv_lora_rank: i32) -> u32 {
         let per = NAIVE_WARPS as i64 * kv_lora_rank as i64 + 2 * NAIVE_WARPS as i64;
@@ -477,7 +484,7 @@ pub(crate) mod naive {
 
     #[must_use]
     pub const fn mma_supported(kv_lora_rank: i32, rope_dim: i32, num_heads: i32) -> bool {
-        kv_lora_rank == 512 && rope_dim == 64 && num_heads % MMA_BM == 0
+        kv_lora_rank == 512 && matches!(rope_dim, 0 | 64) && num_heads % MMA_BM == 0
     }
 
     #[must_use]
@@ -548,12 +555,16 @@ pub(crate) mod naive {
                 ],
                 [MMA_THREADS, 1, 1],
             )
-            .smem(MMA_SMEM_BYTES);
+            .smem(mma_smem_bytes(shape.rope_dim));
             return ctx.fire(
                 op,
                 Fire::at(
                     "attn/mla.cuh",
-                    "::pie::attn::mla_naive::mma_detail::mla_mma_paged_kernel",
+                    if shape.rope_dim == 0 {
+                        "::pie::attn::mla_naive::mma_detail::mla_mma_paged_kernel<0>"
+                    } else {
+                        "::pie::attn::mla_naive::mma_detail::mla_mma_paged_kernel<64>"
+                    },
                 )
                 .apply(launch),
                 &[

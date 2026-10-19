@@ -626,6 +626,8 @@ __device__ __forceinline__ void ld_b_v(std::uint32_t (&b)[2], const __nv_bfloat1
         : "r"(addr));
 }
 
+// `KPE`: the rotated part's width, 64 or none (GLM-5.3-Flash).
+template <int KPE>
 __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_kernel(
     const __nv_bfloat16* __restrict__ q_nope,
     const __nv_bfloat16* __restrict__ q_pe,
@@ -641,6 +643,9 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     const std::int32_t* __restrict__ selection, int top_k,
     const u32* __restrict__ win)
 {
+    constexpr int kKpe = KPE;
+    constexpr int kD = kCkv + kKpe;
+    constexpr int kLdD = kD + 8;
     extern __shared__ __align__(16) char smem_raw[];
     __nv_bfloat16* sQ = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     __nv_bfloat16* sKbuf = sQ + kBM * kLdD;
