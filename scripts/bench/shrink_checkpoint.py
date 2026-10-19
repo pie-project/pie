@@ -1498,6 +1498,8 @@ FAMILIES: dict[str, dict[str, Any]] = {
         # release's architecture; pie's text row ignores them.
         keep_res=(re.compile(r"^visual\."), re.compile(r"^audio_encoder\."),
                   re.compile(r"^speech_embeddings\.")),
+        # SGLang's MiMo-V2 reads its audio tokenizer's config at load.
+        aux_dirs=("audio_tokenizer/",),
     ),
     # Hy4-preview: bf16, the bank stacked on dim 0 (`experts.gate_up_proj`,
     # `experts.down_proj`). Layers 0-5: the dense layer, ranking indexers at
@@ -1895,7 +1897,7 @@ def main() -> int:
         print(f"      {key}: {n} per-tensor overrides carried onto the "
               f"renumbered names")
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
-    copy_aux_files(args.repo, args.revision, out_dir)
+    copy_aux_files(args.repo, args.revision, out_dir, fam.get("aux_dirs", ()))
     write_index(out_dir, shard_files)
     if plan.family == "deepseek_v41":
         write_engram_token_map(out_dir)
@@ -2301,9 +2303,16 @@ AUX_MAX = 64 * 1024**2
 AUX_SKIP_SUFFIX = (".safetensors", ".bin", ".pt", ".pth", ".gguf", ".h5", ".msgpack")
 
 
-def copy_aux_files(repo: str, revision: str, out_dir: Path) -> None:
+def copy_aux_files(repo: str, revision: str, out_dir: Path,
+                   dirs: tuple[str, ...] = ()) -> None:
+    """The repo's top-level side files, and every file under `dirs` whole
+    (a sub-model the release loads beside the trunk, weights included)."""
     for sib in list_repo_files(repo, revision):
         name = sib.get("rfilename", "")
+        if name and name.startswith(dirs):
+            (out_dir / name).parent.mkdir(parents=True, exist_ok=True)
+            (out_dir / name).write_bytes(fetch_bytes(repo, revision, name))
+            continue
         if not name or "/" in name:
             continue
         if name.endswith(AUX_SKIP_SUFFIX) or name == "model.safetensors.index.json":
