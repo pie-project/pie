@@ -724,29 +724,63 @@ async fn export(
     };
     let slots: Vec<u32> = staging.iter().map(|slot| slot.0).collect();
     let layout = crate::scheduler::host_kv_layout(engine).await;
-    // One read: a round trip through the engine's lane per chunk costs more
-    // than the chunks save. The link and the asker's landing go by chunks.
+    // The first chunk is read before answering (its size is the page's); the
+    // rest are read while the link carries the one before.
     let t0 = std::time::Instant::now();
-    let read = read_chunk(engine, &device, &slots).await;
-    with_kv_lock(&stores.kv, "offload-export", |kv| {
-        kv.free_host_slots(staging)
-    });
-    release(stores, pin);
-    let bytes = read?;
-    tracing::debug!(
-        target: "pie::offload",
-        pages = n,
-        ms = t0.elapsed().as_millis() as u64,
-        "read pages out"
-    );
-    let page_bytes = bytes.len() / n;
+    let first = n.min(CHUNK_PAGES);
+    let bytes = match read_chunk(engine, &device[..first], &slots[..first]).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            with_kv_lock(&stores.kv, "offload-export", |kv| {
+                kv.free_host_slots(staging)
+            });
+            release(stores, pin);
+            return Err(error);
+        }
+    };
+    let page_bytes = bytes.len() / first;
     let (tx, chunks) = tokio::sync::mpsc::channel(2);
+    let stores = stores.clone();
     tokio::spawn(async move {
-        for chunk in bytes.chunks(CHUNK_PAGES * page_bytes) {
-            if tx.send(Ok(chunk.to_vec())).await.is_err() {
-                return;
+        let mut next = Some(bytes);
+        let mut at = first;
+        while let Some(bytes) = next.take() {
+            let read = (at < n).then(|| {
+                let to = n.min(at + CHUNK_PAGES);
+                let chunk = (device[at..to].to_vec(), slots[at..to].to_vec());
+                at = to;
+                chunk
+            });
+            let sent = async { tx.send(Ok(bytes)).await.is_ok() };
+            let (sent, read) = match read {
+                Some((device, slots)) => {
+                    let (sent, read) = tokio::join!(sent, read_chunk(engine, &device, &slots));
+                    (sent, Some(read))
+                }
+                None => (sent.await, None),
+            };
+            if !sent {
+                break;
+            }
+            match read {
+                Some(Ok(bytes)) => next = Some(bytes),
+                Some(Err(error)) => {
+                    let _ = tx.send(Err(format!("{error:#}"))).await;
+                    break;
+                }
+                None => {}
             }
         }
+        with_kv_lock(&stores.kv, "offload-export", |kv| {
+            kv.free_host_slots(staging)
+        });
+        with_kv_lock(&stores.kv, "offload-export", |kv| kv.release_reader(pin));
+        tracing::debug!(
+            target: "pie::offload",
+            pages = n,
+            ms = t0.elapsed().as_millis() as u64,
+            "read pages out"
+        );
     });
     Ok(PageStream {
         count: n,
