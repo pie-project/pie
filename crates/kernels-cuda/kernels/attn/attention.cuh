@@ -721,6 +721,50 @@ __global__ void attn_prefill_score_fold(
 }
 
 
+// Each row's q over that row's own one extra key and value (the key's kv
+// head shared by `heads / kv_heads` q heads): `o` the value spread to the q
+// heads and `lse` the score times `scale_log2` (the softmax scale in base 2),
+// to merge with an attention over the cache. A block a row and q head.
+template <class T>
+__global__ void local_lse_one(
+    const T* __restrict__ q,
+    const T* __restrict__ k,
+    const T* __restrict__ v,
+    T* __restrict__ o,
+    float* __restrict__ lse,
+    int heads,
+    int kv_heads,
+    int head_dim,
+    float scale_log2,
+    const u32* __restrict__ win)
+{
+    const int n = blockIdx.x;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const long long row = win != nullptr ? n + static_cast<long long>(win[1]) : n;
+    const int h = blockIdx.y;
+    const int g = h / (heads / kv_heads);
+    const T* qr = q + (row * heads + h) * head_dim;
+    const T* kr = k + (row * kv_heads + g) * head_dim;
+    const T* vr = v + (row * kv_heads + g) * head_dim;
+    T* orow = o + (row * heads + h) * head_dim;
+    float acc = 0.f;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        acc += Elem<T>::to_f32(qr[d]) * Elem<T>::to_f32(kr[d]);
+        orow[d] = vr[d];
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    __shared__ float part[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) part[warp] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.f;
+        for (int w = 0; w < static_cast<int>((blockDim.x + 31) >> 5); ++w) sum += part[w];
+        lse[row * heads + h] = sum * scale_log2;
+    }
+}
+
 template <class T>
 __global__ void merge_lse_combine(
     const T* __restrict__ o1,

@@ -422,6 +422,39 @@ pub fn sink(o: &Value, lse: &Value, sink: &Weight, head_dim: u32) -> Value {
     o_out
 }
 
+/// Each row's q over that row's own extra key and value
+/// (`attention.local_lse`): the value spread to the q heads and the scaled
+/// score in base 2, to `merge_lse` with an attention over the cache.
+#[allow(clippy::too_many_arguments)]
+pub fn local_lse(
+    q: &Value,
+    k: &Value,
+    v: &Value,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    sm_scale: f32,
+) -> (Value, Value) {
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    let lse = r.fresh(tensor(q.rows(), u64::from(heads), Dtype::F32));
+    r.push(
+        Attention::LocalLse {
+            q: q.id(),
+            k: k.id(),
+            v: v.id(),
+            heads,
+            kv_heads,
+            head_dim,
+            sm_scale,
+            o: o.id(),
+            lse: lse.id(),
+        },
+        &[q, k, v],
+    );
+    (o, lse)
+}
+
 pub fn merge_lse(
     o1: &Value,
     lse1: &Value,

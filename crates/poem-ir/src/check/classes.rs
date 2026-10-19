@@ -433,6 +433,7 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::PrefillSelected { .. }
             | Attention::Sink { .. }
             | Attention::MergeLse { .. }
+            | Attention::LocalLse { .. }
             | Attention::LogitSoftcap { .. }
             | Attention::MlaPlan { .. }
             | Attention::MlaLatents { .. }

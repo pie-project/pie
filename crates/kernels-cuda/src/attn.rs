@@ -800,6 +800,63 @@ pub fn sink(
     )
 }
 
+/// Each row's q over that row's own extra key and value: `o` the value
+/// spread to the q heads, `lse` the scaled score in base 2.
+#[allow(clippy::too_many_arguments)]
+pub fn local_lse(
+    ctx: &Ctx,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.local_lse";
+    let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    if kv_heads == 0 || heads % kv_heads != 0 {
+        return Err(refuse(
+            OP,
+            format!("{heads} q heads do not group over {kv_heads} kv heads"),
+        ));
+    }
+    if q.width != heads * head_dim || k.width != kv_heads * head_dim || v.width != k.width {
+        return Err(refuse(
+            OP,
+            format!(
+                "q {} k {} v {} wide for {heads} heads over {kv_heads} kv heads of {head_dim}",
+                q.width, k.width, v.width
+            ),
+        ));
+    }
+    lse_plane(OP, lse, o.rows, heads);
+    let threads = head_dim.next_multiple_of(32).clamp(32, 256);
+    let heads_i = count(OP, "the head count", heads)?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            "attn/attention.cuh",
+            symbol(&format!("::pie::attn::local_lse_one<{t}>")),
+        )
+        .apply(Launch::grid([o.rows, heads, 1], [threads, 1, 1])),
+        &[
+            q.arg(),
+            k.arg(),
+            v.arg(),
+            o.arg(),
+            lse.arg(),
+            heads_i.arg(),
+            count(OP, "the kv head count", kv_heads)?.arg(),
+            count(OP, "the head width", head_dim)?.arg(),
+            (sm_scale * core::f32::consts::LOG2_E).arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn merge_lse(
     ctx: &Ctx,

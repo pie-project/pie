@@ -7,9 +7,12 @@
 
 load("//lib/dflash/forward.poem", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches")
 
-def draft_attn(x, inputs, plan, a, head_dim, kv_heads, rope, append = True):
+def draft_attn(x, inputs, plan, a, head_dim, kv_heads, rope, append = True, local = None, q_heads = 0):
     """A draft head's gated attention over `plan`, rotating q and k by
-    `rope(q, k)`; `append` caches this step's k and v."""
+    `rope(q, k)`; `append` caches this step's k and v. With `local` (the
+    rotated k and v of the steps before it), the step also attends over those
+    and its own, each row's as extra keys merged past the cache. Returns the
+    output and this step's rotated k and v."""
     d = head_dim
     pages = inputs.kv(a.kv)
     write_page = inputs.write_page(a.kv)
@@ -22,8 +25,14 @@ def draft_attn(x, inputs, plan, a, head_dim, kv_heads, rope, append = True):
     q, k = rope(q, k)
     if append:
         ops.attn.kv_append(k, v, pages, write_page, write_offset)
-    o = ops.attn.prefill(q, plan, pages, None, d, kv_heads, a.sm_scale)
-    return ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(o, gate), a.o_proj)
+    if local == None:
+        o = ops.attn.prefill(q, plan, pages, None, d, kv_heads, a.sm_scale)
+    else:
+        o, lse = ops.attn.prefill_lse(q, plan, pages, None, d, kv_heads, a.sm_scale)
+        for lk, lv in local + [(k, v)]:
+            lo, ll = ops.attn.local_lse(q, lk, lv, q_heads, kv_heads, d, a.sm_scale)
+            o, lse = ops.attn.merge_lse(o, lse, lo, ll, q_heads, d)
+    return ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(o, gate), a.o_proj), k, v
 
 def moe(x, f):
     """The routed MLP: `f.top_k` of `f.experts`, plus the gated shared expert."""
@@ -208,6 +217,7 @@ def draft(m, inputs, x, logits, head):
     token = ops.layout.argmax([logits.on(fact.drafts())])
     a = mtp.attn
     chain = []
+    local = []
     for step in range(MTP_DEPTH):
         e = ops.layout.embed(token, m.embed, m.vocab)
         h = hidden
@@ -219,7 +229,10 @@ def draft(m, inputs, x, logits, head):
 
         nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mixer_norm, mtp.mixer_norm_eps)
         # Step j's token sits j past the row's: it turns there.
-        o = draft_attn(nx, inputs, plan, a, m.head_dim, m.kv_heads, lambda q, k: rotate(q, k, inputs, m, a, step), append = step == 0)
+        # Steps past the first see the chain's own keys beside the cache's.
+        o, sk, sv = draft_attn(nx, inputs, plan, a, m.head_dim, m.kv_heads, lambda q, k: rotate(q, k, inputs, m, a, step), append = step == 0, local = local if step > 0 else None, q_heads = m.q_heads)
+        if step > 0:
+            local = local + [(sk, sv)]
         dy = ops.elemwise.residual_add(o, dy)
 
         nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mlp_norm, mtp.mlp_norm_eps)

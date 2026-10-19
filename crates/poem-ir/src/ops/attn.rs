@@ -180,6 +180,21 @@ pub enum Attention {
         head_dim: u32,
         o_out: ValueId,
     },
+    /// Each row's q over that row's own extra key and value (one key, its
+    /// kv head shared by `heads / kv_heads` q heads): `o` the value spread
+    /// to the q heads, `lse` the scaled score in base 2, to `MergeLse` with
+    /// an attention over the cache.
+    LocalLse {
+        q: ValueId,
+        k: ValueId,
+        v: ValueId,
+        heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        sm_scale: f32,
+        o: ValueId,
+        lse: ValueId,
+    },
     MergeLse {
         o1: ValueId,
         lse1: ValueId,
@@ -755,6 +770,7 @@ impl Operands for Attention {
             Self::MergeLse {
                 o1, lse1, o2, lse2, ..
             } => sink.extend([*o1, *lse1, *o2, *lse2]),
+            Self::LocalLse { q, k, v, .. } => sink.extend([*q, *k, *v]),
             Self::LogitSoftcap { x, .. } => sink.push(*x),
             Self::KvAppend {
                 k,
@@ -1065,6 +1081,7 @@ impl Operands for Attention {
             Self::PrefillRel { o, .. } => sink.push(*o),
             Self::Sink { o_out, .. } => sink.push(*o_out),
             Self::MergeLse { o, lse, .. } => sink.extend([*o, *lse]),
+            Self::LocalLse { o, lse, .. } => sink.extend([*o, *lse]),
             Self::LogitSoftcap { x_out, .. } => sink.push(*x_out),
             Self::KvAppend { .. } => {}
             Self::KvAppendShared { .. } => {}
@@ -1153,6 +1170,7 @@ impl Operands for Attention {
             Self::PrefillRel { .. } => {}
             Self::Sink { o_out, o, .. } => sink.push((*o_out, *o)),
             Self::MergeLse { .. } => {}
+            Self::LocalLse { .. } => {}
             Self::LogitSoftcap { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::KvAppend { .. } => {}
             Self::KvAppendShared { .. } => {}
@@ -1214,6 +1232,7 @@ impl Operands for Attention {
             Self::PrefillRel { .. } => "attention.prefill_rel",
             Self::Sink { .. } => "attention.sink",
             Self::MergeLse { .. } => "attention.merge_lse",
+            Self::LocalLse { .. } => "attention.local_lse",
             Self::LogitSoftcap { .. } => "attention.logit_softcap",
             Self::KvAppend { .. } => "attention.kv_append",
             Self::KvAppendShared { .. } => "attention.kv_append_shared",

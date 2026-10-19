@@ -515,6 +515,28 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 &mut self.tensor(*lse),
             ),
+            Attention::LocalLse {
+                q,
+                k,
+                v,
+                heads,
+                kv_heads,
+                head_dim,
+                sm_scale,
+                o,
+                lse,
+            } => attn::local_lse(
+                self.ctx(),
+                self.tensor(*q),
+                self.tensor(*k),
+                self.tensor(*v),
+                *heads,
+                *kv_heads,
+                *head_dim,
+                *sm_scale,
+                &mut self.tensor(*o),
+                &mut self.tensor(*lse),
+            ),
             Attention::LogitSoftcap { x, cap, x_out: _ } => {
                 attn::logit_softcap(self.ctx(), &mut self.tensor(*x), *cap)
             }

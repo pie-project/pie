@@ -3,6 +3,8 @@
 //!
 //! Every op and `Input` method a package can spell the arguments and
 //! result of. Not bound:
+//! `elemwise::rope_partial_shifted`
+//! `elemwise::rope_mrope_shifted`
 //! `spatial::grid`
 
 use crate::ops;
@@ -423,6 +425,26 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("attn.merge_lse", || {
                     ops::attn::merge_lse(&o1, &lse1, &o2, &lse2, heads, head_dim)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "local_lse",
+        params: &["q", "k", "v", "heads", "kv_heads", "head_dim", "sm_scale"],
+        call: |a, heap| {
+            let q: Value = a.next()?;
+            let k: Value = a.next()?;
+            let v: Value = a.next()?;
+            let heads: u32 = a.next()?;
+            let kv_heads: u32 = a.next()?;
+            let head_dim: u32 = a.next()?;
+            let sm_scale: f32 = a.next()?;
+            result(
+                heap,
+                dsl("attn.local_lse", || {
+                    ops::attn::local_lse(&q, &k, &v, heads, kv_heads, head_dim, sm_scale)
                 })?,
             )
         },

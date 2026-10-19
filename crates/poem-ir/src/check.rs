@@ -657,6 +657,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::PrefillRel { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (In(3), F32)],
             Attention::Sink { .. } => &[(In(1), F32)],
             Attention::MergeLse { .. } => &[(In(1), F32), (In(3), F32), (Out(1), F32)],
+            Attention::LocalLse { .. } => &[(Out(1), F32)],
             Attention::LogitSoftcap { .. } => &[],
             Attention::KvAppend { .. } => &[(In(2), CACHE), (In(3), I32), (In(4), I32)],
             Attention::KvAppendShared { .. } => &[(In(1), CACHE), (In(2), I32), (In(3), I32)],

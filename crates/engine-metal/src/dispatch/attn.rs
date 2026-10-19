@@ -367,6 +367,7 @@ impl Run<'_> {
                 self.tensor(*sink),
                 *head_dim,
             ),
+            Attention::LocalLse { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Attention::MergeLse {
                 o1,
                 lse1,

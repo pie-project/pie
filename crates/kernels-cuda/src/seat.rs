@@ -54,6 +54,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("attention.kv_append", Reads::Rows),
     entry("attention.kv_append_shared", Reads::Rows),
     entry("attention.merge_lse", Reads::Rows),
+    entry("attention.local_lse", Reads::Rows),
     entry("attention.mla_decode_selected", Reads::Rows),
     entry("attention.mla_latents", Reads::Rows),
     entry("attention.mla_latents_rope", Reads::Rows),
