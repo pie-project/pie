@@ -114,7 +114,7 @@ impl FrameShell for Shell {
         // A device-carried descriptor is read off its ring on the host, so owed
         // epilogues writing a ring this fire resolves settle first; one feeding only
         // device copies (a draft into the next verify) leaves the fire free.
-        let resolves_owed = |owed: &super::GuestBatch| {
+        let resolves_owed = |owed: &super::Owed| {
             let puts: std::collections::HashSet<usize> = owed
                 .instances()
                 .flat_map(|instance| self.programs.shared_puts(instance))
@@ -127,7 +127,7 @@ impl FrameShell for Shell {
             })
         };
         if !can_runahead
-            && self.owed.as_ref().is_some_and(resolves_owed)
+            && resolves_owed(&self.owed)
             && attachments.iter().any(|attached| {
                 self.programs
                     .geometry_of(attached.instance)

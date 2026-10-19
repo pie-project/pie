@@ -912,8 +912,7 @@ impl Shell {
             settlement: crate::settle::Settlement::open(boot.runahead.staging_depth())?,
             taps: Vec::new(),
             airborne,
-            owed: None,
-            guest_landed: crate::device::graph::Event::new()?,
+            owed: super::Owed::default(),
             rs_ahead: std::collections::HashMap::new(),
         };
         if shell.weights.rotating() && shell.graphs.records() {

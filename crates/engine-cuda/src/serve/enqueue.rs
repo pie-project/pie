@@ -33,12 +33,141 @@ use super::{Golden, Graphs, Prepared, Readback, Shell};
 pub(super) struct GuestBatch {
     launched: Vec<(usize, u64)>,
     pub(super) seq: u64,
+    landed: Event,
 }
 
 impl GuestBatch {
     /// The instances whose epilogues this batch launched.
     pub(super) fn instances(&self) -> impl Iterator<Item = u64> + '_ {
         self.launched.iter().map(|&(_, instance)| instance)
+    }
+}
+
+/// The epilogue batches launched and not yet settled, oldest first. A step's
+/// epilogues no longer wait for the step before to land: an instance carries
+/// up to [`crate::program::AIRBORNE`] fires, each predicted past the last.
+#[derive(Debug, Default)]
+pub(super) struct Owed {
+    batches: std::collections::VecDeque<GuestBatch>,
+    spare: Vec<Event>,
+    /// Instances closed while fires of theirs were airborne: their rings and
+    /// launch tables are what those fires read, so they go once settled.
+    closing: Vec<u64>,
+}
+
+impl Owed {
+    pub(super) fn instances(&self) -> impl Iterator<Item = u64> + '_ {
+        self.batches.iter().flat_map(GuestBatch::instances)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
+    /// Closes instance `id` now, or once its airborne fires settle.
+    pub(super) fn close(&mut self, programs: &mut ProgramPlane, id: u64) -> Result<()> {
+        if programs
+            .instance(id)
+            .is_some_and(crate::program::Session::airborne)
+        {
+            self.closing.push(id);
+            return Ok(());
+        }
+        programs.close_instance(id)
+    }
+
+    fn close_settled(&mut self, programs: &mut ProgramPlane) -> Result<()> {
+        let mut first: Option<crate::error::Fault> = None;
+        let mut index = 0;
+        while index < self.closing.len() {
+            let id = self.closing[index];
+            if programs
+                .instance(id)
+                .is_some_and(crate::program::Session::airborne)
+            {
+                index += 1;
+                continue;
+            }
+            self.closing.swap_remove(index);
+            if let Err(fault) = programs.close_instance(id) {
+                first.get_or_insert(fault);
+            }
+        }
+        match first {
+            Some(fault) => Err(fault),
+            None => Ok(()),
+        }
+    }
+
+    fn event(&mut self) -> Result<Event> {
+        match self.spare.pop() {
+            Some(event) => Ok(event),
+            None => Event::new(),
+        }
+    }
+
+    fn landed(&self, batch: &GuestBatch, airborne: &Airborne) -> Result<bool> {
+        Ok(airborne.settled_past(batch.seq) || batch.landed.done()?)
+    }
+
+    /// Settles the batches that have landed, oldest first, and stops at the
+    /// first that has not.
+    pub(super) fn reap_landed(
+        &mut self,
+        programs: &mut ProgramPlane,
+        airborne: &Airborne,
+    ) -> Result<()> {
+        while let Some(batch) = self.batches.front() {
+            if !self.landed(batch, airborne)? {
+                return Ok(());
+            }
+            self.reap_front(programs, airborne, "owed.reap_landed")?;
+        }
+        Ok(())
+    }
+
+    fn reap_front(
+        &mut self,
+        programs: &mut ProgramPlane,
+        airborne: &Airborne,
+        site: &'static str,
+    ) -> Result<()> {
+        let Some(batch) = self.batches.pop_front() else {
+            return Ok(());
+        };
+        if !airborne.settled_past(batch.seq) {
+            let traced = super::diag::on().reap_trace;
+            let started = traced.then(std::time::Instant::now);
+            batch.landed.settle()?;
+            super::btrace::mark("landed");
+            if let Some(started) = started {
+                eprintln!(
+                    "[reap-trace] {site}: waited {} us for batch seq {}",
+                    started.elapsed().as_micros(),
+                    batch.seq
+                );
+            }
+        }
+        super::btrace::mark("waited");
+        let mut first: Option<crate::error::Fault> = None;
+        for (_, instance) in &batch.launched {
+            let outcome = programs
+                .settle_launched(*instance)
+                .and_then(|fired| committed_or(fired, *instance, "epilogue"));
+            if let Err(fault) = outcome {
+                first.get_or_insert(fault);
+            }
+        }
+        self.spare.push(batch.landed);
+        if !self.closing.is_empty()
+            && let Err(fault) = self.close_settled(programs)
+        {
+            first.get_or_insert(fault);
+        }
+        match first {
+            Some(fault) => Err(fault),
+            None => Ok(()),
+        }
     }
 }
 
@@ -158,7 +287,6 @@ impl Shell {
             readout_rows: &mut self.readout_rows,
             budget: &self.budget,
             owed: &mut self.owed,
-            guest_landed: &self.guest_landed,
             airborne: &self.airborne,
             scores: self.scores.as_ref(),
             shifted: &self.shifted,
@@ -205,8 +333,7 @@ struct FireCtx<'a> {
     predicate: &'a mut Predicate,
     readout_rows: &'a mut Buffer,
     budget: &'a Budget,
-    owed: &'a mut Option<GuestBatch>,
-    guest_landed: &'a Event,
+    owed: &'a mut Owed,
     airborne: &'a Airborne,
     scores: Option<&'a Scores>,
     shifted: &'a [bool],
@@ -235,13 +362,7 @@ impl FireCtx<'_> {
         let mut verdicts: Vec<(usize, Fired)> = Vec::new();
         let mut prologues = AirborneFires::default();
         if p.attachments.iter().any(|a| a.at == Boundary::Prologue) {
-            reap_guest_fires(
-                self.programs,
-                self.owed,
-                self.airborne,
-                self.guest_landed,
-                "enqueue.prologue",
-            )?;
+            reap_guest_fires(self.programs, self.owed, self.airborne, "enqueue.prologue")?;
         }
         for (at, attached) in p.attachments.iter().enumerate() {
             if attached.at != Boundary::Prologue {
@@ -1014,13 +1135,16 @@ impl FireCtx<'_> {
             }
             None => None,
         };
-        reap_guest_fires(
-            self.programs,
-            self.owed,
-            self.airborne,
-            self.guest_landed,
-            "enqueue.epilogue",
-        )?;
+        // The step before's epilogues settle here only when one of this
+        // step's instances cannot have another fire minted past theirs.
+        self.owed.reap_landed(self.programs, self.airborne)?;
+        if p.attachments
+            .iter()
+            .filter(|a| a.at == Boundary::Epilogue)
+            .any(|a| !self.programs.may_mint_airborne(a.instance))
+        {
+            reap_guest_fires(self.programs, self.owed, self.airborne, "enqueue.epilogue")?;
+        }
         super::btrace::mark("epi_reap");
         // a tensor-parallel rank captured only its band of each layer's heads;
         // the epilogue reads the model's planes, so the bands are gathered
@@ -1244,13 +1368,11 @@ impl FireCtx<'_> {
 
         super::btrace::mark("epi_bind");
         let mut settled: Vec<(usize, Fired)> = Vec::new();
-        *self.owed = epilogues.defer(
-            self.device,
-            self.programs,
-            self.guest_landed,
-            self.seq,
-            &mut settled,
-        )?;
+        let landed = self.owed.event()?;
+        match epilogues.defer(self.device, self.programs, landed, self.seq, &mut settled)? {
+            Ok(batch) => self.owed.batches.push_back(batch),
+            Err(landed) => self.owed.spare.push(landed),
+        }
         super::btrace::mark("epi_fly");
         for (lane, fired) in settled {
             let attached = p
@@ -1357,62 +1479,44 @@ impl AirborneFires {
         Ok(())
     }
 
+    /// Flies the staged fires and hands back their batch, or the event
+    /// unused when nothing was launched.
     fn defer(
         &mut self,
         device: &Context,
         programs: &mut ProgramPlane,
-        landed: &crate::device::graph::Event,
+        landed: Event,
         seq: u64,
         into: &mut Vec<(usize, Fired)>,
-    ) -> Result<Option<GuestBatch>> {
+    ) -> Result<std::result::Result<GuestBatch, Event>> {
         self.fly(device, programs)?;
         into.append(&mut self.settled);
         if self.launched.is_empty() {
             self.rings.clear();
-            return Ok(None);
+            return Ok(Err(landed));
         }
         landed.record(device.stream())?;
         let batch = GuestBatch {
             launched: core::mem::take(&mut self.launched),
             seq,
+            landed,
         };
         self.rings.clear();
         self.flown = false;
-        Ok(Some(batch))
+        Ok(Ok(batch))
     }
 }
 
+/// Settles every owed batch, oldest first, waiting for each to land.
 pub(super) fn reap_guest_fires(
     programs: &mut ProgramPlane,
-    owed: &mut Option<GuestBatch>,
-    airborne: &crate::settle::Airborne,
-    landed: &crate::device::graph::Event,
+    owed: &mut Owed,
+    airborne: &Airborne,
     site: &'static str,
 ) -> Result<()> {
-    let Some(batch) = owed.take() else {
-        return Ok(());
-    };
-    if !airborne.settled_past(batch.seq) {
-        let traced = super::diag::on().reap_trace;
-        let started = traced.then(std::time::Instant::now);
-        landed.settle()?;
-        super::btrace::mark("landed");
-        if let Some(started) = started {
-            eprintln!(
-                "[reap-trace] {site}: waited {} us for batch seq {}",
-                started.elapsed().as_micros(),
-                batch.seq
-            );
-        }
-    }
-    super::btrace::mark("waited");
     let mut first: Option<crate::error::Fault> = None;
-    for (lane, instance) in batch.launched {
-        let outcome = programs
-            .settle_launched(instance)
-            .and_then(|fired| committed_or(fired, instance, "epilogue"));
-        if let Err(fault) = outcome {
-            let _ = lane;
+    while !owed.is_empty() {
+        if let Err(fault) = owed.reap_front(programs, airborne, site) {
             first.get_or_insert(fault);
         }
     }

@@ -39,7 +39,7 @@ use crate::store::kv::{self, Seat};
 use crate::store::rs::Buffers;
 use crate::weights::{AdapterPlane, Weights};
 use crate::window::Windows;
-use enqueue::{GuestBatch, reap_guest_fires};
+use enqueue::{Owed, reap_guest_fires};
 use segments::Segmented;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -113,8 +113,7 @@ pub struct Shell {
     settlement: crate::settle::Settlement,
     taps: Vec<Option<crate::device::Pinned>>,
     airborne: crate::settle::Airborne,
-    owed: Option<GuestBatch>,
-    guest_landed: crate::device::graph::Event,
+    owed: Owed,
     /// Where a device-counted fold left each recurrent slot, ahead of the
     /// runtime's settled length until that fold settles.
     rs_ahead: std::collections::HashMap<u32, u32>,
@@ -475,25 +474,13 @@ impl Shell {
     /// its channels' cells reach their readers then, and not at the next
     /// fire's enqueue, which a reader waiting on them may be what holds back.
     pub fn reap_landed_guests(&mut self) -> Result<()> {
-        let Some(batch) = self.owed.as_ref() else {
-            return Ok(());
-        };
-        // The batch's own event is recorded behind its programs, so it says
+        // A batch's own event is recorded behind its programs, so it says
         // the batch has landed even before the step's settle is counted.
-        if self.airborne.settled_past(batch.seq) || self.guest_landed.done()? {
-            self.reap_guests_at("shell.reap_landed_guests")?;
-        }
-        Ok(())
+        self.owed.reap_landed(&mut self.programs, &self.airborne)
     }
 
     pub fn reap_guests_at(&mut self, site: &'static str) -> Result<()> {
-        reap_guest_fires(
-            &mut self.programs,
-            &mut self.owed,
-            &self.airborne,
-            &self.guest_landed,
-            site,
-        )
+        reap_guest_fires(&mut self.programs, &mut self.owed, &self.airborne, site)
     }
 
     pub fn program_instance(&mut self, instance_id: u64) -> Result<Option<&mut ProgramSession>> {
@@ -507,8 +494,7 @@ impl Shell {
     }
 
     pub fn close_program_instance(&mut self, instance_id: u64) -> Result<()> {
-        self.reap_guests_at("shell.close_program_instance")?;
-        self.programs.close_instance(instance_id)
+        self.owed.close(&mut self.programs, instance_id)
     }
 
     pub fn fire_program(&mut self, instance_id: u64) -> Result<Fired> {

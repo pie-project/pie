@@ -646,6 +646,19 @@ impl Plane {
         self.wave.clear();
     }
 
+    /// Whether instance `id` may have another fire minted while its earlier
+    /// ones are airborne ([`Session::may_mint_airborne`]).
+    #[must_use]
+    pub fn may_mint_airborne(&self, id: u64) -> bool {
+        let Some(bound) = self.instances.get(&id) else {
+            return false;
+        };
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return false;
+        };
+        bound.session.may_mint_airborne(&program.plan)
+    }
+
     pub fn settle_launched(&mut self, id: u64) -> Result<Fired> {
         let bound = self
             .instances
