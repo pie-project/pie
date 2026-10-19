@@ -1,5 +1,7 @@
 use crate::error::{Error, OrOverflow};
-use crate::types::{Axis, DType, Encoding, RepackLayout, RepackSpec, TILED_BAND, TILED_STEP};
+use crate::types::{
+    Axis, DType, Encoding, QuantScheme, RepackLayout, RepackSpec, TILED_BAND, TILED_STEP,
+};
 
 use super::compile;
 use super::{
@@ -627,15 +629,20 @@ fn infer_fill(value: u32, ty: &TensorType) -> Result<TensorType, Error> {
             ty.shape
         )));
     }
-    let Encoding::Raw(dtype) = &ty.encoding else {
-        return Err(Error::Contract(format!(
-            "Fill into {:?} is not a constant: a quantized code word means \
-             nothing without the block scale beside it, and which code reads as \
-             zero is scheme-specific",
-            ty.encoding
-        )));
+    let dtype = match &ty.encoding {
+        Encoding::Raw(dtype) => *dtype,
+        // An MXFP4 code of zero bytes is zero under any block scale.
+        Encoding::Quant(spec) if spec.scheme == QuantScheme::Mxfp4E2M1E8M0 => DType::U8,
+        Encoding::Quant(_) => {
+            return Err(Error::Contract(format!(
+                "Fill into {:?} is not a constant: a quantized code word means \
+                 nothing without the block scale beside it, and which code reads as \
+                 zero is scheme-specific",
+                ty.encoding
+            )));
+        }
     };
-    if value != 0.0_f32.to_bits() || *dtype == DType::E8m0 {
+    if value != 0.0_f32.to_bits() || dtype == DType::E8m0 {
         return Err(Error::Contract(format!(
             "Fill of {} as {dtype:?} is not a run of zero bytes, which is all \
              the zeroing can write",

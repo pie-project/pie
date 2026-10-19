@@ -50,6 +50,20 @@ DFLASH_20B = dflash_head(
 WINDOWED = 0
 FULL = 1
 
+# An expert's width is cut in MXFP4 blocks of 32, and padded to whole tiles
+# of 128 the fused expert kernels take when it does not split in blocks.
+BLOCK = 32
+TILE = 128
+
+def inter(iw, tp):
+    """An expert's width as `tp` ranks hold it: the checkpoint's, or zero-padded
+    when its blocks do not split `tp` ways; a zero gate and up row yields a zero
+    SwiGLU, and a zero down column adds nothing."""
+    if (iw // BLOCK) % tp == 0:
+        return iw
+    tile = tp * TILE
+    return (iw + tile - 1) // tile * tile
+
 def layout(id, deploy):
     if len(deploy.weights) != 2:
         fail("{} stores its weights and its experts at a dtype each, not {}".format(id, deploy.weights))
@@ -63,7 +77,7 @@ def layout(id, deploy):
     hd = d.head_dim
     q_w = d.q_heads * hd
     kv_w = d.kv_heads * hd
-    iw = d.inter
+    iw = inter(d.inter, deploy.tp)
 
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
