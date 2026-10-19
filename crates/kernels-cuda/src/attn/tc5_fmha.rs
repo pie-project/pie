@@ -259,11 +259,11 @@ pub(crate) fn try_prefill(
         // fire 685 -> 531 us, GPT-OSS's 475 -> 447). A long window's (Muse's
         // 2048) are the softmax's: its registers go further without.
         let io = (0..256).contains(&window_left) && bound * kv_heads >= 4 * sms;
-        // A pair's block walks items too, an SM a block.
+        // Either way a block walks items, an SM a block.
         let (grid, threads) = match (io, pair) {
             (true, _) => ([sms, 1, 1], 320),
             (false, true) => ([sms.min(bound * kv_heads), 1, 1], 320),
-            (false, false) => ([bound, kv_heads, 1], 192),
+            (false, false) => ([sms.min(bound * kv_heads), 1, 1], 192),
         };
         ctx.fire(
             op,
@@ -430,6 +430,7 @@ pub fn prefill_planes(ctx: &Ctx, op: &'static str, at: &Planes) -> Result<(), Er
         head: 0,
     };
     let bound = at.rows.div_ceil(128) + at.requests;
+    let sms = ctx.multiprocessors().unwrap_or(148);
     let (dqk, dv) = (at.dqk, at.dv);
     let smem = smem_bytes(dqk, dv, bkv, stages);
     ctx.fire(
@@ -440,7 +441,8 @@ pub fn prefill_planes(ctx: &Ctx, op: &'static str, at: &Planes) -> Result<(), Er
                 "::pie::attn::fmha::tc5_fmha_prefill<{dqk}, {bkv}, {stages}, {dv}>"
             )),
         )
-        .apply(Launch::grid([bound.max(1), at.heads, 1], [192, 1, 1]).smem(smem)),
+        // A block walks items, an SM a block.
+        .apply(Launch::grid([sms.min(bound * at.heads).max(1), 1, 1], [192, 1, 1]).smem(smem)),
         &[
             ArgValue::of(&map_k),
             ArgValue::of(&map_v),

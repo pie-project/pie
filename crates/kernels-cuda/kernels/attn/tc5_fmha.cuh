@@ -214,9 +214,9 @@ __device__ __forceinline__ bool work_of(const Params& p, int bound, int block, W
 //
 // With PAIR a block's item is two tiles of 128 rows that read one K and V
 // stream, each its own softmax warpgroup (warps 0-3, 6-9), S buffers, O
-// and Q: every key tile loads once for 256 rows. A pair's block walks
-// several items (the host's grid an SM a block), each warpgroup taking its
-// tile's Q in and O out.
+// and Q: every key tile loads once for 256 rows. Without IO a block walks
+// several items (the host's grid an SM a block), each softmax warpgroup
+// taking its tile's Q in and O out.
 template <int D, int BKV, int ST, int DV = D, bool IO = false, bool PAIR = false>
 __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
     const __grid_constant__ tc5::TmaMap map_k, const __grid_constant__ tc5::TmaMap map_v,
@@ -247,23 +247,24 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
     static_assert(kColQ + kT * D / 2 <= kCols, "S twice, O and Q fit TMEM");
     static_assert(!(IO && PAIR), "a pair's warpgroups move their own Q and O");
     constexpr int kRows = 128 * kT;
-    constexpr bool kWalk = IO || PAIR;
+    // Without IO the softmax warps move each item's Q and O themselves.
+    constexpr bool kOwn = !IO;
     (void)kKA;
 
     // A block's items: a tile of a KV head's rows, numbered tile-major from
     // (x, y), the grid's size apart; `next_work` steps `i` past empty ones.
-    // With IO or PAIR a block walks several (the host's grid an SM a
-    // block), the K and V ring, the S buffers and the P V products counting
-    // across them.
-    // A pair's `i` is instead its block's round: the requests' tiles ranked
+    // A block walks several (the host's grid an SM a block), the K and V
+    // ring, the S buffers and the P V products counting across them.
+    // Without IO `i` is instead the block's round: the requests' tiles ranked
     // from each one's last (the longest causal ones first), a rank's every
-    // request and head in turn, dealt to the blocks back and forth so their
-    // sums even out.
-    const int first = PAIR ? 0 : static_cast<int>(blockIdx.x * gridDim.y + blockIdx.y);
-    const int step = PAIR ? 1 : static_cast<int>(gridDim.x * gridDim.y);
+    // request and head in turn (past 16 KV heads, a head at a time, its keys
+    // kept in L2 while the blocks share them), dealt to the blocks back and
+    // forth so their sums even out.
+    const int first = kOwn ? 0 : static_cast<int>(blockIdx.x * gridDim.y + blockIdx.y);
+    const int step = kOwn ? 1 : static_cast<int>(gridDim.x * gridDim.y);
     int h = 0;
     int ranks = 0;
-    if constexpr (PAIR) {
+    if constexpr (kOwn) {
         const int lane = static_cast<int>(threadIdx.x & 31);
         for (int base = 0; base < p.live[1]; base += 32) {
             const int r = p.live[0] + base + lane;
@@ -273,15 +274,16 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
         ranks = __reduce_max_sync(0xffffffffu, ranks);
     }
     auto next_work = [&](int& i, Work& x) {
-        if constexpr (PAIR) {
+        if constexpr (kOwn) {
             const int lanes = p.live[1];
             const int nb = static_cast<int>(gridDim.x);
             const int b = static_cast<int>(blockIdx.x);
             for (;; ++i) {
                 const int item = i * nb + ((i & 1) ? nb - 1 - b : b);
                 if (item >= ranks * lanes * p.kv_heads) return false;
-                h = item % p.kv_heads;
-                const int q = item / p.kv_heads;
+                const bool by_head = p.kv_heads > 16;
+                h = by_head ? item / (ranks * lanes) : item % p.kv_heads;
+                const int q = by_head ? item % (ranks * lanes) : item / p.kv_heads;
                 const int r = p.live[0] + q % lanes;
                 const int qs = p.qo_indptr[r];
                 const int ql = p.qo_indptr[r + 1] - qs;
@@ -298,8 +300,8 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
             }
         }
         for (; i < bound * p.kv_heads; i += step) {
-            h = kWalk ? i % p.kv_heads : static_cast<int>(blockIdx.y);
-            const int t = kWalk ? i / p.kv_heads : static_cast<int>(blockIdx.x);
+            h = i % p.kv_heads;
+            const int t = i / p.kv_heads;
             if (work_of(p, bound, t, x, kRows)) return true;
         }
         return false;
@@ -558,16 +560,16 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
             for (u32 x = 0; x < kT; ++x) bar_wait(&q_ready[x], tile & 1);
             // The last tile's O out before this one's first product lands.
             if (nt == 0) {
-                if (kWalk && tile > 0) bar_wait(o_free, (tile - 1) & 1);
+                if (tile > 0) bar_wait(o_free, (tile - 1) & 1);
                 __syncwarp();
-                if (kWalk && elect_one()) tc_commit(q_free);
+                if (elect_one()) tc_commit(q_free);
                 ++tile;
                 return;
             }
             auto pv = [&](int i) {
                 const int gi = g + i;
                 const u32 st = gi % ST;
-                if (kWalk && i == 0 && tile > 0) bar_wait(o_free, (tile - 1) & 1);
+                if (i == 0 && tile > 0) bar_wait(o_free, (tile - 1) & 1);
                 bar_wait(&v_full[st], (gi / ST) & 1);
                 if (i == nt - 1) bar_wait(v_fixed, keyed & 1);
                 const u32 vb = sbase + kOffV + st * kTileV;
@@ -613,7 +615,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                         tc_commit(&s_full[sb]);
                         if (x == kT - 1) {
                             tc_commit(&k_empty[st]);
-                            if (kWalk && j == nt - 1) tc_commit(q_free);
+                            if (j == nt - 1) tc_commit(q_free);
                         }
                     }
                 }
@@ -624,15 +626,10 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
             ++keyed;
             ++tile;
         };
-        // With IO the whole warp finds each tile, its lanes scanning the
-        // requests. (A loop of one tile issues slower: 47 -> 51 us.)
-        if (kWalk) {
-            Work w = w0;
-            for (int t = t0, more = 1; more; t += step, more = next_work(t, w)) {
-                issue(w);
-            }
-        } else {
-            issue(w0);
+        // The whole warp finds each tile, its lanes scanning the requests.
+        Work w = w0;
+        for (int t = t0, more = 1; more; t += step, more = next_work(t, w)) {
+            issue(w);
         }
     } else if (warp < 4 || (PAIR && warp >= 6)) {
         // The softmax warpgroup (with PAIR, tile xt's).
@@ -641,8 +638,8 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
         for (int t = t0, more = 1; more; t += step, more = next_work(t, w)) {
             int jb = 0;
             const int nt = tiles_of(w, jb);
-            // With PAIR each item's Q went in under the last one's end.
-            if (!IO && (!PAIR || tile == 0)) load_q(w);
+            // Each item's Q after the first went in under the last one's end.
+            if (kOwn && tile == 0) load_q(w);
             const int wh = h;
             const int prow = w.row0 + irow;
             const bool live = prow < w.qo_len * p.group;
@@ -770,7 +767,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                 tc_fence_before();
                 bar_arrive(&p_full[st]);
             }
-            if (PAIR) {
+            if (kOwn) {
                 // The next item's Q, once this one's last S has read this Q,
                 // under this one's last products.
                 Work wn;
@@ -799,7 +796,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
             }
             tc_fence_before();
             if (IO) bar_arrive(o_ready);
-            if (PAIR) bar_arrive(o_free);
+            if (kOwn) bar_arrive(o_free);
             ++tile;
             g += nt;
         }
