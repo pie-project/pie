@@ -17,7 +17,7 @@ in a compat body, or as `LaunchProcess.props`) and the session it names.
 | `priority` | worker | larger priority runs first and is preempted last | `cluster/priority`, else `priority` |
 | `fair` | worker | the tenant that has had the least service runs first (after VTC); service is time spent running | the tenant |
 | `deadline` | worker | earliest deadline first; one without a deadline runs after every one with | `deadline-ms`, from arrival |
-| `offload` | worker | sends a pass's prefill to a peer worker: from 1024 uncached tokens, or as the process's `offload` prop says | `offload`, `offload-min-tokens` |
+| `offload` | worker | sends a pass's prefill to a peer worker: from 1024 uncached tokens while the worker is busy (8 lanes a fire), or as the process's `offload` prop says | `offload`, `offload-min-tokens` |
 | `keep-session` | worker | keeps a completed process's cached KV above the rest for `keep-ms`, for its session's next turn, then discards it | `keep-ms`, the session |
 | `cache-aware` | cluster | sends a launch to the worker holding the most of its prompt (as the gateway routed it) if that is at least 0.3 of it, else to the least loaded; load wins when one worker runs 8 more turns than another and 1.5 times as many (after SGLang's router) | `worker` |
 | `session-affinity` | cluster | sends a session's processes where its last one went | the session |
