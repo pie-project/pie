@@ -772,17 +772,29 @@ __global__ __launch_bounds__(128) void mla_sparse_fold(
     const u16* base_o = part_o + (static_cast<long long>(row) * splits * 64 + head) * kD;
     for (int d = static_cast<int>(threadIdx.x) * 4; d < kD; d += 128 * 4) {
         float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-#pragma unroll 8
-        for (int s2 = 0; s2 < splits; ++s2) {
-            const float wgt = __shfl_sync(0xffffffffu, share, s2);
-            if (wgt == 0.f) continue;
-            const uint2 b = *reinterpret_cast<const uint2*>(base_o + static_cast<long long>(s2) * 64 * kD + d);
-            const float4 v = make_float4(__uint_as_float(b.x << 16), __uint_as_float(b.x & 0xffff0000u),
-                                         __uint_as_float(b.y << 16), __uint_as_float(b.y & 0xffff0000u));
-            acc.x = fmaf(wgt, v.x, acc.x);
-            acc.y = fmaf(wgt, v.y, acc.y);
-            acc.z = fmaf(wgt, v.z, acc.z);
-            acc.w = fmaf(wgt, v.w, acc.w);
+        // Sixteen splits' loads in flight at once, then their sums in order
+        // (a split of no weight read nothing: its part may be unwritten).
+        for (int s0 = 0; s0 < splits; s0 += 16) {
+            float wgt[16];
+            uint2 b[16];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                wgt[i] = __shfl_sync(0xffffffffu, share, (s0 + i) & 31);
+                if (s0 + i >= splits) wgt[i] = 0.f;
+                b[i] = wgt[i] != 0.f
+                    ? *reinterpret_cast<const uint2*>(base_o + static_cast<long long>(s0 + i) * 64 * kD + d)
+                    : make_uint2(0u, 0u);
+            }
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                if (wgt[i] == 0.f) continue;
+                const float4 v = make_float4(__uint_as_float(b[i].x << 16), __uint_as_float(b[i].x & 0xffff0000u),
+                                             __uint_as_float(b[i].y << 16), __uint_as_float(b[i].y & 0xffff0000u));
+                acc.x = fmaf(wgt[i], v.x, acc.x);
+                acc.y = fmaf(wgt[i], v.y, acc.y);
+                acc.z = fmaf(wgt[i], v.z, acc.z);
+                acc.w = fmaf(wgt[i], v.w, acc.w);
+            }
         }
         uint2 packed;
         packed.x = pack_bf16(acc.x, acc.y);
