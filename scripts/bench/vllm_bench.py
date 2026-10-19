@@ -140,6 +140,8 @@ def run(args: argparse.Namespace):
         llm_kwargs["kernel_config"] = {"moe_backend": args.moe_backend}
     if args.enforce_eager:
         llm_kwargs["enforce_eager"] = True
+    if getattr(args, "language_model_only", False):
+        llm_kwargs["language_model_only"] = True
     if os.environ.get("VLLM_DISABLE_CUSTOM_AR"):
         # This box's GPU-to-GPU P2P DMA is broken; vLLM's custom all-reduce
         # uses it and returns zeros, so tp>1 needs the NCCL fallback.
@@ -373,6 +375,8 @@ def run_streaming(args: argparse.Namespace):
     engine_kwargs = {}
     if args.enforce_eager:
         engine_kwargs["enforce_eager"] = True
+    if getattr(args, "language_model_only", False):
+        engine_kwargs["language_model_only"] = True
     if getattr(args, "num_gpu_blocks_override", 0):
         engine_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
     if getattr(args, "block_size", 0):
@@ -641,6 +645,11 @@ def main() -> None:
                  "headline baseline should report.",
         )
         sp.add_argument("--enforce-eager", action="store_true")
+        sp.add_argument(
+            "--language-model-only", action="store_true",
+            help="Build the text tower alone: a miniature carved without its "
+                 "vision tower loads, and a multimodal row skips its encoder "
+                 "budget.")
         sp.add_argument(
             "--no-chunked-prefill", action="store_true",
             help="disable vLLM's chunked prefill. Prefill then does not share "

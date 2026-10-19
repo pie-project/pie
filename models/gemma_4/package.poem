@@ -39,6 +39,7 @@ DEPLOYMENTS = [
     deployment("gemma4-e4b", weights = BF, kv = BF, drafter = "eagle"),
     deployment("gemma4-e4b", weights = BF, kv = BF),
     deployment("gemma4-31b", weights = BF, kv = BF),
+    deployment("gemma4-26b-a4b", weights = BF, kv = BF),
     deployment("gemma4-e4b-mini-l1", weights = BF, kv = BF),
     deployment("gemma4-e4b-mini-l6", weights = BF, kv = BF),
     deployment("gemma4-e4b-mini-l24", weights = BF, kv = BF),
