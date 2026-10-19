@@ -301,6 +301,7 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         (8, 300, [256, 128, 16, 4], clamp, Some(false), None, 0.25),
         (8, 64, [512, 256, 64, 6], clamp, Some(true), None, 0.25),
         (16, 160, [512, 256, 16, 4], sw, None, None, 0.1),
+        (16, 8, [512, 256, 8, 8], sw, None, None, 0.1),
     ];
     for (a, tokens, [hidden, inter, ex, top], g, gate, window, tol) in cases {
         let what = format!("{a} {tokens}x{top} over {ex}, gate {gate:?}, window {window:?}");
@@ -310,8 +311,8 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         let ((x, xv), (sh, sv)) = (b.bf16(tokens * hidden), b.bf16(tokens * hidden));
         let (gates, gv) = b.bf16(tokens);
         // The bf16 and narrow W4A4 fires norm their routes under a scale
-        // (Muse Spark's).
-        let ((scale, scv), normed) = (b.bf16(hidden), tokens < 64 || a == 0);
+        // (Muse Spark's); a block-FP8 pair never does.
+        let ((scale, scv), normed) = (b.bf16(hidden), (tokens < 64 && a != 16) || a == 0);
         let norm = normed.then(|| (t(scale, 1, hidden, Bf16), 1e-6));
         // relu2's up rows alone, a GLU's gate rows then its up rows.
         let up_rows = pick(g == Glu::Relu2, inter, 2 * inter);

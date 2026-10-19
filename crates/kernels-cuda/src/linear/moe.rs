@@ -1195,7 +1195,10 @@ pub fn experts_weighted_first(
 
 /// [`experts`] on two W4A8 banks (or two block-FP8 ones) (MXFP4 codes against e4m3 activations in
 /// 1x128 blocks): the GLU lands as the down GEMM's e4m3 operand. Under
-/// `kernel.moe.w4a8_fused_from` tokens, or masked, the four run apart.
+/// `kernel.moe.w4a8_fused_from` tokens, or masked, the four run apart; but
+/// a block-FP8 pair's masked fire (a decode's) runs fused on the masked
+/// layout, laid out once: the gate-up lands bf16 and one pass takes its
+/// SwiGLU into the down GEMM's e4m3 operand.
 #[cfg(feature = "cuda")]
 fn experts_w4a8_as(ctx: &Ctx, m: RoutedMlp, y: &mut Tensor, sum: W4a8Sum) -> Result<bool, Error> {
     let RoutedMlp {
@@ -1265,8 +1268,11 @@ fn experts_w4a8_as(ctx: &Ctx, m: RoutedMlp, y: &mut Tensor, sum: W4a8Sum) -> Res
         glu,
         tc5::Glu::Swiglu | tc5::Glu::SwigluClamp { .. } | tc5::Glu::Situ { .. }
     );
-    if count <= act_quant::MASKED_FIRE
-        || tokens < ctx.tuning().moe_w4a8_fused_from
+    let masked = w_gran == 128
+        && count <= act_quant::MASKED_FIRE
+        && glu == tc5::Glu::Swiglu
+        && matches!(sum, W4a8Sum::Weighted(_));
+    if (count <= act_quant::MASKED_FIRE || tokens < ctx.tuning().moe_w4a8_fused_from) && !masked
         || !glu_taken
         || !ctx.tuning().moe_tc5
         || !tc5::supported()
@@ -1284,11 +1290,32 @@ fn experts_w4a8_as(ctx: &Ctx, m: RoutedMlp, y: &mut Tensor, sum: W4a8Sum) -> Res
         return Ok(false);
     }
     let mut run = || -> Result<(), Error> {
-        let layout = act_quant::lay_out(ctx, OP, routes, experts, act_quant::BLOCK_ROWS, false)?;
+        let layout = if masked {
+            act_quant::lay_out_with(
+                ctx,
+                OP,
+                routes,
+                experts,
+                act_quant::BLOCK_ROWS,
+                Some(false),
+                &[],
+            )?
+        } else {
+            act_quant::lay_out(ctx, OP, routes, experts, act_quant::BLOCK_ROWS, false)?
+        };
         let rows = layout.rows as usize;
+        let m_max = layout.m_max as usize;
+        // A masked layout's scale atoms: each expert's whole 128-row blocks.
+        let atoms_for = |cols: u32| {
+            if m_max > 0 {
+                tc5::masked_atom_bytes(experts as usize, m_max, cols as usize, GRAN as usize)
+            } else {
+                tc5::atom_bytes(rows, cols as usize, GRAN as usize)
+            }
+        };
         let fmt = act_quant::Format::E4m3 { gran: GRAN };
         let xq = ctx.scratch_stream(OP, W4A8_X, rows * k as usize)? as u64;
-        let x_atom_bytes = tc5::atom_bytes(rows, k as usize, GRAN as usize);
+        let x_atom_bytes = atoms_for(k);
         let xs = act_quant::atoms_of(ctx, OP, W4A8_XS, x_atom_bytes)?;
         act_quant::quantize(
             ctx,
@@ -1301,18 +1328,19 @@ fn experts_w4a8_as(ctx: &Ctx, m: RoutedMlp, y: &mut Tensor, sum: W4a8Sum) -> Res
                 routes: None,
                 input_scales: None,
                 pos: layout.pos,
-                m_max: 0,
+                m_max: layout.m_max,
             },
             xq,
             xs,
             x_atom_bytes,
         )?;
         let hq = ctx.scratch_stream(OP, W4A8_H, rows * inter as usize)? as u64;
-        let hs = ctx.scratch_stream(
-            OP,
-            W4A8_HS,
-            tc5::atom_bytes(rows, inter as usize, GRAN as usize),
-        )? as u64;
+        // A masked layout's padding rows keep their atoms: a zeroed slab.
+        let hs = if masked {
+            act_quant::atoms_of(ctx, OP, W4A8_HS, atoms_for(inter))?
+        } else {
+            ctx.scratch_stream(OP, W4A8_HS, atoms_for(inter))? as u64
+        };
         // DeepSeek's weights scale the GLU's rows, each at its grouped row.
         let row_scale = match sum {
             W4a8Sum::Weighted(_) => 0,
@@ -1327,40 +1355,57 @@ fn experts_w4a8_as(ctx: &Ctx, m: RoutedMlp, y: &mut Tensor, sum: W4a8Sum) -> Res
             groups: layout.groups,
             alpha_e: 0,
         };
-        // A few rows an expert run the gate-up swapped (bank on P, rows on 64-row
-        // Q tiles): the same products at a quarter the MMA work.
-        let sms = ctx.multiprocessors().unwrap_or(148);
-        let up_plan = if count <= SWAPPED_W4A8_UP_ROUTES * experts {
-            tc5::Plan {
-                swap: true,
-                pair: false,
-                bn: 64,
-                stages: 0,
-                splits: 1,
-            }
+        if masked {
+            const W4A8_U: &str = "linear.moe_tc5_u";
+            let us = ctx.scratch_stream(OP, W4A8_U, rows * 2 * inter as usize * 2)? as u64;
+            tc5::grouped_gemm_epi(
+                ctx,
+                tc5::Operand::scaled(xq, tc5::Elem::E4m3, xs, GRAN),
+                tc5::Operand::scaled(up_codes.ptr, w_elem, up_atoms.ptr, w_gran),
+                us,
+                grouped,
+                [2 * inter, k],
+                1.0,
+                tc5::Epilogue::STORE,
+                count,
+            )?;
+            act_quant::swiglu_quant(ctx, OP, us, layout.rows, inter, layout.m_max, hq, hs)?;
         } else {
-            tc5::Plan::grouped(&grouped, inter, k, count, sms)
-        };
-        tc5::grouped_gemm_epi_with(
-            ctx,
-            tc5::Operand::scaled(xq, tc5::Elem::E4m3, xs, GRAN),
-            tc5::Operand::scaled(up_codes.ptr, w_elem, up_atoms.ptr, w_gran),
-            hq,
-            grouped,
-            [inter, k],
-            1.0,
-            tc5::Epilogue {
-                glu: Some(glu),
-                out: tc5::Out::Fp8Block {
-                    data: hq,
-                    scales: hs,
+            // A few rows an expert run the gate-up swapped (bank on P, rows on 64-row
+            // Q tiles): the same products at a quarter the MMA work.
+            let sms = ctx.multiprocessors().unwrap_or(148);
+            let up_plan = if count <= SWAPPED_W4A8_UP_ROUTES * experts {
+                tc5::Plan {
+                    swap: true,
+                    pair: false,
+                    bn: 64,
+                    stages: 0,
+                    splits: 1,
+                }
+            } else {
+                tc5::Plan::grouped(&grouped, inter, k, count, sms)
+            };
+            tc5::grouped_gemm_epi_with(
+                ctx,
+                tc5::Operand::scaled(xq, tc5::Elem::E4m3, xs, GRAN),
+                tc5::Operand::scaled(up_codes.ptr, w_elem, up_atoms.ptr, w_gran),
+                hq,
+                grouped,
+                [inter, k],
+                1.0,
+                tc5::Epilogue {
+                    glu: Some(glu),
+                    out: tc5::Out::Fp8Block {
+                        data: hq,
+                        scales: hs,
+                    },
+                    row_scale,
+                    live_rows: layout.live_rows(),
+                    ..tc5::Epilogue::STORE
                 },
-                row_scale,
-                live_rows: layout.live_rows(),
-                ..tc5::Epilogue::STORE
-            },
-            up_plan,
-        )?;
+                up_plan,
+            )?;
+        }
         let ys = ctx.scratch_stream(OP, W4A8_Y, rows * n as usize * 2)? as u64;
         tc5::grouped_gemm_epi(
             ctx,

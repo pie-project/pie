@@ -439,6 +439,45 @@ __global__ void act_quant_e4m3_v8(
     }
 }
 
+// A gate-up's bf16 rows (`[rows][gate inter | up inter]`) through SwiGLU
+// (rounded to bf16, as a GLU landing them would) into e4m3 codes in 1x128
+// blocks at the same rows, eight a lane, `m_max` a masked layout's.
+__global__ void swiglu_quant_e4m3_v8(
+    const bf16* __restrict__ h, int rows, int inter, int m_max, u8* __restrict__ codes,
+    u8* __restrict__ atoms)
+{
+    pdl_wait();
+    pdl_launch();
+    using Block = E4m3Block<128>;
+    const int blocks = inter / 128;
+    const long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const long long slot = at / Block::kLanes;
+    const int lane = static_cast<int>(threadIdx.x % 32);
+    const bool live = slot < static_cast<long long>(rows) * blocks;
+    const long long sl = live ? slot : 0;
+    const int r = static_cast<int>(sl / blocks);
+    const int b = static_cast<int>(sl % blocks);
+    const bf16* g8 = h + static_cast<long long>(r) * 2 * inter + b * 128 + (lane % Block::kLanes) * 8;
+    const uint4 gw = *reinterpret_cast<const uint4*>(g8);
+    const uint4 uw = *reinterpret_cast<const uint4*>(g8 + inter);
+    const unsigned gs[4] = {gw.x, gw.y, gw.z, gw.w};
+    const unsigned us[4] = {uw.x, uw.y, uw.z, uw.w};
+    float y[8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const float g = __uint_as_float(j ? gs[i] & 0xFFFF0000u : gs[i] << 16);
+            const float u = __uint_as_float(j ? us[i] & 0xFFFF0000u : us[i] << 16);
+            y[2 * i + j] = g / (1.f + __expf(-g)) * u;
+        }
+    }
+    Block q;
+    q.hold(y);
+    if (!live) return;
+    q.store(codes, atoms, r, b, inter, m_max, lane);
+}
+
 // A 128x128-block FP8 plane under f32 block factors (DeepSeek-V3's and
 // GLM-5.3's release: `w = code * factor`) requantized in place to ue8m0
 // exponents, as vLLM's DeepGEMM path does on Blackwell: each block's factor

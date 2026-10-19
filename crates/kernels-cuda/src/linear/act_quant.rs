@@ -255,6 +255,46 @@ pub fn quantize(
     launch(ctx, op, fmt, 0, src, codes, atoms, 0)
 }
 
+/// A gate-up's bf16 rows (`[rows][gate inter | up inter]`) through SwiGLU
+/// into e4m3 codes in 1x128 blocks and their atoms (`m_max` a masked
+/// layout's), the GLU's values rounded to bf16 first as apart: `act_quant`'s
+/// eight a lane over the GLU's output.
+#[allow(clippy::too_many_arguments)]
+pub fn swiglu_quant(
+    ctx: &Ctx,
+    op: &'static str,
+    h: u64,
+    rows: u32,
+    inter: u32,
+    m_max: u32,
+    codes: u64,
+    atoms: u64,
+) -> Result<(), Error> {
+    if !inter.is_multiple_of(128) || !h.is_multiple_of(16) || !codes.is_multiple_of(8) {
+        return Err(refuse(
+            op,
+            format!("a {inter}-wide GLU lands whole 128-wide e4m3 blocks"),
+        ));
+    }
+    let lanes = u64::from(rows) * u64::from(inter / 8);
+    let threads = u32::try_from(lanes.next_multiple_of(32))
+        .map_err(|_| refuse(op, format!("{lanes} lanes overflow a launch")))?;
+    let int = |v: u32| stated(op, v).map(|v| v.arg());
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::swiglu_quant_e4m3_v8")
+            .apply(Launch::flat(threads, BLOCK).programmatic(ctx.tuning().pdl)),
+        &[
+            ArgValue::Ptr(h),
+            int(rows)?,
+            int(inter)?,
+            int(m_max)?,
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+        ],
+    )
+}
+
 /// A stream's slab named `name` (one name a format) of `bytes` activation
 /// atoms, zeroed when fresh, for [`quantize`]: no clear a launch.
 pub(crate) fn atoms_of(
