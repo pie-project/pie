@@ -298,24 +298,43 @@ __global__ __launch_bounds__(64) void moe_topk_sigmoid_sink(const T* __restrict_
 
 // y[n][h] = Σ_k weights[n][k] · routed[n·top_k + k][h], in rank order;
 // given `shared`, rounded and then shared[n][h]·sigmoid(gate[n·gate_stride])
-// added, as `moe_sigmoid_gate_add` would.
-template <class T>
+// added, as `moe_sigmoid_gate_add` would. VEC elements a thread (8: hidden
+// a multiple of 8, the rows 16-byte aligned).
+template <class T, int VEC>
 __global__ void moe_weighted_sum(T* __restrict__ out, const T* __restrict__ src, const float* __restrict__ weights,
                                  int top_k, int hidden, const T* __restrict__ shared, const T* __restrict__ gate,
                                  int gate_stride, const u32* __restrict__ win) {
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long n = window.plane(blockIdx.x);
-    const int h = blockIdx.y * blockDim.x + threadIdx.x;
+    const int h = (blockIdx.y * blockDim.x + threadIdx.x) * VEC;
     if (h >= hidden) return;
     const long long base = n * top_k;
-    float acc = 0.f;
-    for (int k = 0; k < top_k; ++k) acc += weights[base + k] * to_f32(src[(base + k) * hidden + h]);
-    if (shared != nullptr) {
-        const float s = 1.f / (1.f + __expf(-to_f32(gate[n * gate_stride])));
-        acc = to_f32(from_f32<T>(acc)) + to_f32(shared[n * hidden + h]) * s;
+    float acc[VEC] = {};
+    for (int k = 0; k < top_k; ++k) {
+        const float w = weights[base + k];
+        const T* row = src + (base + k) * hidden + h;
+        if constexpr (VEC == 8) {
+            const Pack8<T> v = *reinterpret_cast<const Pack8<T>*>(row);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) acc[j] += w * to_f32(v.v[j]);
+        } else {
+            acc[0] += w * to_f32(row[0]);
+        }
     }
-    out[n * hidden + h] = from_f32<T>(acc);
+    const float s = shared != nullptr ? 1.f / (1.f + __expf(-to_f32(gate[n * gate_stride]))) : 0.f;
+    T o[VEC];
+#pragma unroll
+    for (int j = 0; j < VEC; ++j) {
+        float a = acc[j];
+        if (shared != nullptr) a = to_f32(from_f32<T>(a)) + to_f32(shared[n * hidden + h + j]) * s;
+        o[j] = from_f32<T>(a);
+    }
+    if constexpr (VEC == 8) {
+        *reinterpret_cast<Pack8<T>*>(out + n * hidden + h) = *reinterpret_cast<const Pack8<T>*>(o);
+    } else {
+        out[n * hidden + h] = o[0];
+    }
 }
 
 // y[n][h] = Σ_k src[n·top_k + k][h] + shared[n][h], the routed rows already
@@ -691,11 +710,11 @@ __global__ __launch_bounds__(kGroupWaves<MT>* kWave) void moe_matmul_select_grou
 // The grouped dense leg at a prefill's routes: NBW 16-row weight blocks a
 // wave over WAVES waves (16·NBW·WAVES weight rows a block), so each
 // activation piece a wave reads from LDS feeds NBW times the products.
-template <class T, int MT, int NBW, int WAVES, int SORTED = 0>
+template <class T, int MT, int NBW, int WAVES, int SORTED = 0, int GLU = 0>
 __global__ __launch_bounds__(WAVES* kWave) void moe_matmul_select_grouped_tall(
     const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const T* __restrict__ bank, T* __restrict__ out, int act_div, int n, int k,
-    int num_experts) {
+    int num_experts, float limit) {
     const int blocks = gridDim.x * gridDim.y;
     const int b = blockIdx.x + gridDim.x * blockIdx.y;
     const int x = b % kDenseXcds, q = blocks / kDenseXcds, r = blocks % kDenseXcds;
@@ -703,8 +722,8 @@ __global__ __launch_bounds__(WAVES* kWave) void moe_matmul_select_grouped_tall(
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item, at % gridDim.x)) return;
     const T* w = bank + static_cast<long long>(item.expert) * n * k;
-    grouped_tile<GroupDense<T>, T, MT, NBW, WAVES, SORTED>(act, order, item.begin, item.count, {w}, nullptr, out,
-                                                           act_div, n, k, at / gridDim.x);
+    grouped_tile<GroupDense<T>, T, MT, NBW, WAVES, SORTED, GLU>(act, order, item.begin, item.count, {w}, nullptr,
+                                                                out, act_div, n, k, at / gridDim.x, limit);
 }
 
 // The batch dense leg (decode batches): one work item of up to MT routes a
