@@ -150,6 +150,8 @@ async def main() -> None:
         await client.authenticate("type-ahead")
         if args.compare:
             await compare(client, args)
+        elif not sys.stdin.isatty():
+            sys.exit("typing needs a terminal: run this in Terminal, or pass --compare")
         else:
             await interactive(client, args.max_tokens)
 
