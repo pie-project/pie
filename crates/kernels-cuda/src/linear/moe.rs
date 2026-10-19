@@ -461,6 +461,15 @@ pub fn matmul_select(
                 Err(why) => tc5_fell_back(OP, &why),
             }
         }
+        // Where there are no tcgen05 GEMMs, a decode's routes on mma.sync,
+        // each expert's rows streamed once a slice rather than once a route.
+        if !crate::linear::tc5::supported()
+            && bank.dtype == Dtype::Bf16
+            && !experts.streams()
+            && select_bf16_mma(ctx, OP, x, bank.ptr, bank.rows, routes, y, None)?
+        {
+            return Ok(());
+        }
         if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
             return select_grouped(ctx, OP, x, bank, routes, y, count);
         }
@@ -2217,6 +2226,121 @@ pub fn select_fp8_w8a16(
             alpha.arg(),
         ],
     )
+}
+
+/// The most routes an expert averages that a bf16 bank's select takes on
+/// the register-held mma.sync kernel; past it, the grouped GEMM (which a
+/// captured fire never takes: it sizes its blocks on the host).
+const BF16_MMA_UNTIL: u32 = u32::MAX;
+
+/// A routed select over a bf16 bank (`experts x n x k` at `bank`) on mma.sync
+/// (`linear/moe_w8.cuh`'s `moe_select_bf16_mma`), each expert's rows
+/// streamed once a slice of its routes, with the GLU in its epilogue where
+/// `glu` says. `Ok(false)` for a fire it does not take.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn select_bf16_mma(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: u64,
+    experts: u32,
+    routes: Tensor,
+    y: &mut Tensor,
+    glu: Option<crate::linear::tc5::Glu>,
+) -> Result<bool, Error> {
+    use crate::linear::tc5::Glu;
+    const THREADS: u32 = 128;
+    const DEPTH: u32 = 2;
+    let fan = selected(op, x, routes, y)?;
+    if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 || !x.width.is_multiple_of(32) || bank % 16 != 0
+    {
+        return Ok(false);
+    }
+    let experts = experts.clamp(1, EXPERT_CAP);
+    let per = fan.route_count.div_ceil(experts);
+    if per > BF16_MMA_UNTIL {
+        return Ok(false);
+    }
+    let (code, limit, alpha) = match glu {
+        None => (0, 0.0f32, 1.0f32),
+        Some(Glu::Swiglu) => (1, 0.0, 1.0),
+        Some(Glu::SwigluClamp { limit }) => (2, limit, 1.0),
+        Some(Glu::SwigluClampAlpha { limit, alpha }) => (3, limit, alpha),
+        Some(Glu::GegluTanh) => (4, 0.0, 1.0),
+        Some(Glu::Situ { beta, cap }) => (5, beta, cap),
+    };
+    // A decode's few CTAs: half the rows a warp (twice the CTAs), then K
+    // split across groups of a CTA's warps, toward four CTAs' warps an SM.
+    let sms = ctx.multiprocessors().unwrap_or(108);
+    let wide = |cols: u32| y.width.div_ceil(cols);
+    let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
+    let nb: u32 = match per {
+        0..=4 => 1,
+        5..=12 => 2,
+        _ => 4,
+    };
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
+    let inter = stated(op, y.width)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
+        ctx,
+        op,
+        routes,
+        &fan,
+        experts,
+        8 * nb,
+        true,
+        if glu.is_some() || KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    let tiles: u32 = if glu.is_none() && work_cap * wide(128) < 2 * sms { 1 } else { 2 };
+    let cols = if glu.is_some() { 64 } else { 64 * tiles };
+    let ctas = (work_cap * wide(cols)).max(1);
+    let ksplit = if nb == 1 {
+        (4 * sms).div_ceil(ctas).next_power_of_two().clamp(1, 4)
+    } else {
+        1
+    };
+    let fire = Fire::at(
+        "linear/moe_w8.cuh",
+        symbol(&format!(
+            "::pie::linear::moe_select_bf16_mma<{nb}, {DEPTH}, {code}, {tiles}, {ksplit}>"
+        )),
+    )
+    .apply(Launch::grid(
+        [work_cap, wide(cols), 1],
+        [THREADS * ksplit, 1, 1],
+    ));
+    ctx.fire(
+        op,
+        fire,
+        &[
+            x.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            ArgValue::Ptr(bank),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+            inter.arg(),
+            limit.arg(),
+            alpha.arg(),
+        ],
+    )?;
+    Ok(true)
 }
 
 /// Whether [`select_mxfp4_atoms`] takes a fire of `routes` over `x`'s

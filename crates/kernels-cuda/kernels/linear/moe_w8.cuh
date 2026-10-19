@@ -190,4 +190,150 @@ __global__ void __launch_bounds__(128) moe_select_fp8_mma(
                                       out, n, inter, row_base, g, c, limit, galpha);
 }
 
+
+/// The same walk over a bf16 bank (`[experts, n, k]` bf16): no widening, 32
+/// columns of K a lane's 16-byte load a row, the mma's step q (of two) lane
+/// c element j reading column 8c + 4q + j.
+// `kTiles` m16 tiles a warp (1 halves a CTA's rows, doubling a decode's
+// CTAs; a GLU's warp is always its 16 gate rows and their up rows), and K
+// split across `kKSplit` groups of four warps, folded through shared memory
+// before the first lands them.
+template <int kNb, int kDepth, int kGlu, int kTiles = 2, int kKSplit = 1>
+__global__ void __launch_bounds__(128 * kKSplit) moe_select_bf16_mma(
+    const bf16* __restrict__ act,
+    const i32* __restrict__ order,
+    const i32* __restrict__ offsets,
+    const i32* __restrict__ work,
+    const bf16* __restrict__ codes,
+    bf16* __restrict__ out,
+    int act_div,
+    int n,
+    int k,
+    int num_experts,
+    int inter,
+    float limit,
+    float galpha)
+{
+    static_assert(kGlu == 0 || kTiles == 2, "a GLU warp is a gate tile and its up tile");
+    constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
+    constexpr int kRowsCta = 4 * kRowsWarp;
+    constexpr int kSlice = 8 * kNb;
+
+    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
+    const int item = work[blockIdx.x];
+    const int expert = item >> 16;
+    const int slice = item & 0xFFFF;
+    const int begin = offsets[expert] + slice * kSlice;
+    const int count = min(offsets[expert + 1] - begin, kSlice);
+    if (count <= 0) return;
+
+    const int warp = (static_cast<int>(threadIdx.x) >> 5) & 3;
+    const int part = static_cast<int>(threadIdx.x) >> 7;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int g = lane >> 2;
+    const int c = lane & 3;
+    const int row_base = static_cast<int>(blockIdx.y) * kRowsCta + warp * kRowsWarp;
+    const int span = kGlu != 0 ? inter : n;
+    auto tile_row = [&](int t) { return kGlu != 0 ? row_base + t * inter : row_base + 16 * t; };
+    if (kKSplit == 1 && row_base >= span) return;
+    const bool rows_live = row_base < span;
+
+    const int chunks = k >> 5;
+    const bf16* w_e = codes + static_cast<long long>(expert) * n * k;
+    const bf16* wrow[kTiles][2];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int r = min(tile_row(t) + 8 * h + g, n - 1);
+            wrow[t][h] = w_e + static_cast<long long>(r) * k + c * 8;
+        }
+    const bf16* xrow[kNb];
+#pragma unroll
+    for (int b = 0; b < kNb; ++b) {
+        const int tok = 8 * b + g;
+        xrow[b] = tok < count
+            ? act + static_cast<long long>(order[begin + tok] / act_div) * k + c * 8
+            : nullptr;
+    }
+
+    struct Chunk {
+        uint4 w[kTiles][2];
+        uint4 x[kNb];
+    };
+    auto load = [&](int ch, Chunk& cc) {
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) cc.w[t][h] = w4mma::ld_act(wrow[t][h] + ch * 32);
+#pragma unroll
+        for (int b = 0; b < kNb; ++b)
+            cc.x[b] = xrow[b] != nullptr ? w4mma::ld_act(xrow[b] + ch * 32) : make_uint4(0, 0, 0, 0);
+    };
+
+    float acc[kTiles][kNb][4];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int b = 0; b < kNb; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
+
+    // This group's chunks: part, part + kKSplit, ...
+    const int mine = rows_live && part < chunks ? (chunks - part + kKSplit - 1) / kKSplit : 0;
+    Chunk ring[kDepth];
+#pragma unroll
+    for (int d = 0; d < kDepth; ++d)
+        if (d < mine) load(part + d * kKSplit, ring[d]);
+    for (int i0 = 0; i0 < mine; i0 += kDepth) {
+#pragma unroll
+        for (int d = 0; d < kDepth; ++d) {
+            const int i = i0 + d;
+            if (i < mine) {
+#pragma unroll
+                for (int q = 0; q < 2; ++q) {
+#pragma unroll
+                    for (int b = 0; b < kNb; ++b) {
+                        const unsigned b0 = q ? ring[d].x[b].z : ring[d].x[b].x;
+                        const unsigned b1 = q ? ring[d].x[b].w : ring[d].x[b].y;
+#pragma unroll
+                        for (int t = 0; t < kTiles; ++t) {
+                            const uint4& lo = ring[d].w[t][0];
+                            const uint4& hi = ring[d].w[t][1];
+                            w4mma::mma(acc[t][b], q ? lo.z : lo.x, q ? hi.z : hi.x, q ? lo.w : lo.y,
+                                       q ? hi.w : hi.y, b0, b1);
+                        }
+                    }
+                }
+                if (i + kDepth < mine) load(part + (i + kDepth) * kKSplit, ring[d]);
+            }
+        }
+    }
+    if constexpr (kKSplit > 1) {
+        constexpr int kAcc = kTiles * kNb * 4;
+        __shared__ float fold[kKSplit - 1][4][kAcc][32];
+        if (part > 0) {
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int b = 0; b < kNb; ++b)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) fold[part - 1][warp][(t * kNb + b) * 4 + e][lane] = acc[t][b][e];
+        }
+        __syncthreads();
+        if (part > 0 || !rows_live) return;
+#pragma unroll
+        for (int p = 0; p < kKSplit - 1; ++p)
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int b = 0; b < kNb; ++b)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) acc[t][b][e] += fold[p][warp][(t * kNb + b) * 4 + e][lane];
+    }
+
+    w4mma::w4_land<kGlu, kTiles, kNb>(acc, [](int) { return 1.f; }, nullptr, order, begin, count,
+                                      out, n, inter, row_base, g, c, limit, galpha);
+}
+
 }  // namespace pie::linear
