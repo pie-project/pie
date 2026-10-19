@@ -870,34 +870,63 @@ __global__ void route_gather_vec8(
     *dst = *reinterpret_cast<const uint4*>(grouped + static_cast<long long>(o) * n + c);
 }
 
-// The block's sum of `v`, as norm_gate's block folds it (warps, then the
-// warps' sums in the first); `part` is reusable on return.
-__device__ __forceinline__ float route_row_sum(float v, float* part)
+// A word's two bf16 as f32, and two f32 rounded into one word (`lo` low).
+__device__ __forceinline__ float bf16x2_lo(u32 w) { return __uint_as_float(w << 16); }
+__device__ __forceinline__ float bf16x2_hi(u32 w) { return __uint_as_float(w & 0xffff0000u); }
+__device__ __forceinline__ u32 bf16x2_round(float lo, float hi)
+{
+    u32 w;
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(w) : "f"(hi), "f"(lo));
+    return w;
+}
+
+// Two bf16 products rounded once (an fma adding -0, which keeps a zero's
+// sign).
+__device__ __forceinline__ u32 bf16x2_mul(u32 a, u32 b)
+{
+    u32 w;
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(w) : "r"(a), "r"(b), "r"(0x80008000u));
+    return w;
+}
+
+// The block's sum of each of `v`'s K values, as norm_gate's block folds one
+// (warps, then the warps' sums in the first), all K at once; `part` holds
+// 33 * K and is reusable on return.
+template <int K>
+__device__ __forceinline__ void route_row_sums(float (&v)[K], float* part)
 {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
-    if (lane == 0) part[warp] = v;
-    __syncthreads();
-    if (warp == 0) {
-        float w = lane < static_cast<int>(blockDim.x >> 5) ? part[lane] : 0.f;
+    for (int k = 0; k < K; ++k) {
 #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) w += __shfl_xor_sync(0xffffffffu, w, off);
-        if (lane == 0) part[32] = w;
+        for (int off = 16; off > 0; off >>= 1) v[k] += __shfl_xor_sync(0xffffffffu, v[k], off);
+        if (lane == 0) part[warp * K + k] = v[k];
     }
     __syncthreads();
-    const float total = part[32];
+    if (warp == 0) {
+#pragma unroll
+        for (int k = 0; k < K; ++k) {
+            float w = lane < static_cast<int>(blockDim.x >> 5) ? part[lane * K + k] : 0.f;
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) w += __shfl_xor_sync(0xffffffffu, w, off);
+            if (lane == 0) part[32 * K + k] = w;
+        }
+    }
     __syncthreads();
-    return total;
+#pragma unroll
+    for (int k = 0; k < K; ++k) v[k] = part[32 * K + k];
+    __syncthreads();
 }
 
 // `moe_weighted_sum_vec8` of the grouped product read where it lies: token
 // t's eight columns from `grouped[pos[t * top + j]]`, weighted, summed in f32
 // in `j` order; a dropped route adds nothing. A token past the live window
-// (`win`, in tokens) is untouched. With a `scale`, a block holds the row
-// (`n / 8` threads) and each route is first normed as norm_gate norms it:
-// `u = x * scale` rounded, `u / rms(u)` rounded.
-__global__ void route_weighted_gather_vec8(
+// (`win`, in tokens) is untouched. Normed, a block holds the row (`n / 8`
+// threads) and each route is first normed as norm_gate norms it under
+// `scale`: `u = x * scale` rounded, `u / rms(u)` rounded (a row of at most
+// 4096).
+template <bool kNorm>
+__global__ void __launch_bounds__(kNorm ? 512 : 1024, kNorm ? 4 : 1) route_weighted_gather_vec8(
     const bf16* __restrict__ grouped,
     const i32* __restrict__ pos,
     const float* __restrict__ weights,
@@ -919,14 +948,15 @@ __global__ void route_weighted_gather_vec8(
     float acc[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) acc[i] = 0.f;
-    __shared__ float part[33];
-    uint4 sv = {};
-    if (scale != nullptr) sv = *reinterpret_cast<const uint4*>(scale + h0);
-    const bf16* s8 = reinterpret_cast<const bf16*>(&sv);
-    const long long base = static_cast<long long>(plane) * top;
     // Eight routes' rows (and weights) in flight at once, summed in route
-    // order: a row's latency paid once a batch, not once a route.
-    constexpr int kAhead = 8;
+    // order: a row's latency paid once a batch, not once a route. Normed,
+    // two, their norms' block sums taken together: a row's block then fits
+    // four to a multiprocessor, which hides more latency than a deeper batch.
+    constexpr int kAhead = kNorm ? 2 : 8;
+    __shared__ float part[kNorm ? 33 * kAhead : 1];
+    uint4 sv = {};
+    if constexpr (kNorm) sv = *reinterpret_cast<const uint4*>(scale + h0);
+    const long long base = static_cast<long long>(plane) * top;
     for (int j0 = 0; j0 < top; j0 += kAhead) {
         int at[kAhead];
         uint4 rows[kAhead];
@@ -941,27 +971,43 @@ __global__ void route_weighted_gather_vec8(
             // the down leg), and moe_sum_add sums them as they are.
             wts[a] = weights != nullptr && at[a] >= 0 ? weights[base + j0 + a] : 1.f;
         }
+        if constexpr (kNorm) {
+            // Two values a word: `x * scale` rounded is one bf16 product
+            // (the f32 one is exact), and `u / rms(u)` rounds in pairs.
+            float inv[kAhead];
 #pragma unroll
-        for (int a = 0; a < kAhead; ++a) {
-            if (at[a] < 0) continue;
-            const bf16* v8 = reinterpret_cast<const bf16*>(&rows[a]);
-            float u[8];
+            for (int a = 0; a < kAhead; ++a) {
+                u32* r = reinterpret_cast<u32*>(&rows[a]);
+                const u32* sc = reinterpret_cast<const u32*>(&sv);
+                inv[a] = 0.f;
 #pragma unroll
-            for (int i = 0; i < 8; ++i) u[i] = bf16_to_f32(v8[i]);
-            if (scale != nullptr) {
-                float ss = 0.f;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    u[i] = bf16_to_f32(f32_to_bf16(u[i] * bf16_to_f32(s8[i])));
-                    ss = fmaf(u[i], u[i], ss);
+                for (int w = 0; w < 4; ++w) {
+                    r[w] = bf16x2_mul(r[w], sc[w]);
+                    inv[a] = fmaf(bf16x2_lo(r[w]), bf16x2_lo(r[w]), inv[a]);
+                    inv[a] = fmaf(bf16x2_hi(r[w]), bf16x2_hi(r[w]), inv[a]);
                 }
-                const float inv = rsqrtf(route_row_sum(ss, part) / static_cast<float>(n) + eps);
-#pragma unroll
-                for (int i = 0; i < 8; ++i) u[i] = bf16_to_f32(f32_to_bf16(u[i] * inv));
             }
-            const float wr = wts[a];
+            route_row_sums(inv, part);
 #pragma unroll
-            for (int i = 0; i < 8; ++i) acc[i] += wr * u[i];
+            for (int a = 0; a < kAhead; ++a) {
+                if (at[a] < 0) continue;
+                const float v = rsqrtf(inv[a] / static_cast<float>(n) + eps), wr = wts[a];
+                const u32* r = reinterpret_cast<const u32*>(&rows[a]);
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    const u32 o = bf16x2_round(bf16x2_lo(r[w]) * v, bf16x2_hi(r[w]) * v);
+                    acc[2 * w] += wr * bf16x2_lo(o);
+                    acc[2 * w + 1] += wr * bf16x2_hi(o);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int a = 0; a < kAhead; ++a) {
+                if (at[a] < 0) continue;
+                const bf16* v8 = reinterpret_cast<const bf16*>(&rows[a]);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[i] += wts[a] * bf16_to_f32(v8[i]);
+            }
         }
     }
     // Qwen's shared expert under its sigmoid gate, as moe_sigmoid_gate_add

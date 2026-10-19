@@ -1060,7 +1060,7 @@ pub(crate) fn weighted_gather(
         || !y.ptr.is_multiple_of(16)
         || !scale.is_multiple_of(16)
         || (scale != 0 && !(n / 8).is_multiple_of(32))
-        || (scale != 0 && n / 8 > 1024)
+        || (scale != 0 && n / 8 > 512)
     {
         return Err(refuse(
             op,
@@ -1076,8 +1076,14 @@ pub(crate) fn weighted_gather(
     };
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_weighted_gather_vec8")
-            .apply(Launch::grid([tokens, blocks, 1], [block, 1, 1])),
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::linear::route_weighted_gather_vec8<{}>",
+                scale != 0
+            )),
+        )
+        .apply(Launch::grid([tokens, blocks, 1], [block, 1, 1])),
         &[
             ArgValue::Ptr(grouped),
             ArgValue::Ptr(pos),
@@ -1122,7 +1128,7 @@ pub(crate) fn sum_gather(
     let int = |v: u32| stated(op, v).map(|v| v.arg());
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_weighted_gather_vec8").apply(Launch::grid(
+        Fire::at(FILE, "::pie::linear::route_weighted_gather_vec8<false>").apply(Launch::grid(
             [tokens, (n / 8).div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
