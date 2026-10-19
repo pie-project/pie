@@ -84,6 +84,7 @@ impl Gpu {
                 pdl: true,
                 gemm_tc5_split_tickets: 65_536,
                 gemm_rows_m: 8,
+                ssm_kda_chunked: true,
                 ..tuning
             })
         } else {

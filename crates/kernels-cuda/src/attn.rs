@@ -883,7 +883,7 @@ pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
     nonzero(OP, "the element count", lanes)?;
     // Eight elements a thread where the plane takes whole 16-byte runs: the
     // same values, element for element.
-    let (entry, extent) = if lanes.is_multiple_of(8) && x.ptr % 16 == 0 {
+    let (entry, extent) = if lanes.is_multiple_of(8) && x.ptr.is_multiple_of(16) {
         ("logit_softcap_vec8", lanes / 8)
     } else {
         ("logit_softcap", lanes)
@@ -1023,7 +1023,7 @@ pub fn res_blend_norm(
     } else {
         512
     };
-    let aligned = |p: u64| p % 16 == 0;
+    let aligned = |p: u64| p.is_multiple_of(16);
     let row_bytes = u64::from(hidden) * 2;
     if blocks.len() > MAX_BLOCKS
         || hidden == 0

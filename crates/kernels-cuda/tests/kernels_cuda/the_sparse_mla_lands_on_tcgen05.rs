@@ -703,6 +703,10 @@ fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> 
 /// values in bf16: within a few percent of the output's norm.
 #[test]
 fn glm_fp8_rows_score_in_e4m3() {
+    // Fp8 latent rows need the tcgen05 sparse pass (Blackwell).
+    if !kernels_cuda::linear::tc5::supported() {
+        return;
+    }
     // Four rows split over the multiprocessors; 160 a block each on 128-key tiles.
     for (rows, kv, rope) in [(4, 300, 64), (4, 1000, 64), (4, 1000, 0), (160, 1000, 64)] {
         let want = decode_short(rows, kv, rope, false, false);
@@ -723,6 +727,10 @@ fn glm_fp8_rows_score_in_e4m3() {
 
 #[test]
 fn glm_reads_a_short_selection_dense() {
+    // Fp8 latent rows need the tcgen05 sparse pass (Blackwell).
+    if !kernels_cuda::linear::tc5::supported() {
+        return;
+    }
     let want = decode_short(4, 300, 64, true, false);
     let got = decode_short(4, 300, 64, true, true);
     for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {

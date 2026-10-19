@@ -464,8 +464,105 @@ pub fn matmul_select(
         if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
             return select_grouped(ctx, OP, x, bank, routes, y, count);
         }
+        // Bf16 experts under a captured graph have no grouped path (tcgen05 is
+        // Blackwell's, cuBLAS is not graph-capturable); the per-route GEMV
+        // re-reads each expert once a route. The grouped mma.sync kernel reads
+        // it once a slice.
+        if bf16_mma_spans(ctx, fan.route_count)
+            && x.dtype == Dtype::Bf16
+            && bank.dtype == Dtype::Bf16
+            && !experts.streams()
+            && x.width.is_multiple_of(16)
+            && y.width.is_multiple_of(8)
+            && bank.rows >= 1
+            && u64::from(bank.width) == u64::from(x.width) * u64::from(y.width)
+        {
+            return select_bf16_mma(ctx, OP, x, bank, routes, y, &fan, bank.rows);
+        }
     }
     select_gemv(ctx, OP, x, bank, routes, y, experts)
+}
+
+/// Whether the graph-safe bf16 grouped mma.sync kernel takes a fire of
+/// `routes` routes: `kernel.moe.bf16_mma_from ..= kernel.moe.bf16_mma_until`.
+#[cfg(feature = "cuda")]
+fn bf16_mma_spans(ctx: &Ctx, routes: u32) -> bool {
+    let t = ctx.tuning();
+    t.bf16_mma_until > 0 && t.bf16_mma_from <= routes && routes <= t.bf16_mma_until
+}
+
+/// `y[route] = x[route or its token] . W[routes[route]]^T` on the grouped
+/// bf16 mma.sync kernel: routes laid out by expert on-device (graph-safe),
+/// each expert's weight rows read once a slice.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn select_bf16_mma(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    fan: &Selected,
+    experts: u32,
+) -> Result<(), Error> {
+    const THREADS: u32 = 128;
+    const COLS: u32 = 128;
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let k = stated(op, x.width)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    // An expert's slice is 8, 16, 32 or 64 routes, by how many the average
+    // expert holds: each slice reads its weight rows once for all of them.
+    let per = fan.route_count.div_ceil(experts.max(1));
+    let nb: u32 = match per {
+        0..=8 => 1,
+        9..=16 => 2,
+        17..=40 => 4,
+        _ => 8,
+    };
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
+        ctx,
+        op,
+        routes,
+        fan,
+        experts,
+        8 * nb,
+        true,
+        if KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    let grid = [work_cap, y.width.div_ceil(COLS), 1];
+    // smem = (128 weight rows + 8*nb route rows) x (kBK 16 + 8 pad) bf16.
+    let smem = (128 + 8 * nb) * (16 + 8) * 2;
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/moe_w4.cuh",
+            symbol(&format!("::pie::linear::moe_select_bf16_mma<{nb}>")),
+        )
+        .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(smem)),
+        &[
+            x.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            bank.arg(),
+            ArgValue::ABSENT,
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+        ],
+    )
 }
 
 /// Says, once a process, that a select the tcgen05 GEMM was to take fell
@@ -2588,7 +2685,8 @@ pub fn weighted_sum(
     );
     // Eight columns a thread where the rows and both planes take whole
     // 16-byte runs: the same sums, element for element.
-    let vec8 = y.width.is_multiple_of(8) && routed.ptr % 16 == 0 && y.ptr % 16 == 0;
+    let vec8 =
+        y.width.is_multiple_of(8) && routed.ptr.is_multiple_of(16) && y.ptr.is_multiple_of(16);
     let (entry, threads) = if vec8 {
         ("moe_weighted_sum_vec8", y.width / 8)
     } else {

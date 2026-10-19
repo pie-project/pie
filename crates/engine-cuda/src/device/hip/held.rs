@@ -241,6 +241,10 @@ pub mod pool {
     }
 }
 
+/// The largest pageable copy HIP stages itself without waiting for the
+/// stream.
+const HIP_STAGED_BYTES: usize = 4 << 10;
+
 /// The largest copy [`Buffer::stage`] bounces through the pinned ring.
 const RING_SLOT_BYTES: usize = 1 << 20;
 
@@ -273,7 +277,7 @@ pub(crate) fn staged_through_ring(
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    if bytes.len() > RING_SLOT_BYTES {
+    if bytes.len() <= HIP_STAGED_BYTES || bytes.len() > RING_SLOT_BYTES {
         return Ok(false);
     }
     let mut capturing: core::ffi::c_int = 0;
@@ -299,29 +303,23 @@ pub(crate) fn staged_through_ring(
     let ring = match rings.entry(device) {
         std::collections::hash_map::Entry::Occupied(held) => held.into_mut(),
         std::collections::hash_map::Entry::Vacant(free) => {
-            let mut slots = Vec::with_capacity(RING_SLOTS);
-            for _ in 0..RING_SLOTS {
-                let pinned = Pinned::mapped_uninit(RING_SLOT_BYTES)?;
-                let mut event: rt::Event = core::ptr::null_mut();
-                // SAFETY: writes the event.
-                unsafe {
-                    check(
-                        "hipEventCreateWithFlags",
-                        rt::hipEventCreateWithFlags(&raw mut event, rt::hipEventDisableTiming),
-                    )?;
-                }
-                slots.push((pinned, event, false));
-            }
+            let slots = (0..RING_SLOTS)
+                .map(|_| ring_slot())
+                .collect::<Result<_>>()?;
             free.insert(StageRing { slots, next: 0 })
         }
     };
     let at = ring.next;
-    ring.next = (ring.next + 1) % RING_SLOTS;
-    let (pinned, event, used) = &mut ring.slots[at];
-    // SAFETY: the event is this slot's; waiting on it is what frees the slot.
-    if *used {
-        unsafe { check("hipEventSynchronize", rt::hipEventSynchronize(*event))? };
+    // A slot whose copy is still queued behind airborne work is not waited
+    // out: a fresh one goes in ahead of it, so the ring holds as many slots
+    // as copies are in flight and the oldest stays next.
+    let (_, event, used) = &ring.slots[at];
+    // SAFETY: queries the slot's own event.
+    if *used && unsafe { rt::hipEventQuery(*event) } != 0 {
+        ring.slots.insert(at, ring_slot()?);
     }
+    ring.next = (at + 1) % ring.slots.len();
+    let (pinned, event, used) = &mut ring.slots[at];
     // SAFETY: the slot holds RING_SLOT_BYTES ≥ bytes.len(), and the copy that
     // last read it has landed; the new copy reads it until the event records.
     unsafe {
@@ -340,6 +338,21 @@ pub(crate) fn staged_through_ring(
     }
     *used = true;
     Ok(true)
+}
+
+/// A pinned stage slot and the event its copy records.
+fn ring_slot() -> Result<(Pinned, kernels_cuda::hip::rt::Event, bool)> {
+    use kernels_cuda::hip::rt;
+    let pinned = Pinned::mapped_uninit(RING_SLOT_BYTES)?;
+    let mut event: rt::Event = core::ptr::null_mut();
+    // SAFETY: writes the event.
+    unsafe {
+        check(
+            "hipEventCreateWithFlags",
+            rt::hipEventCreateWithFlags(&raw mut event, rt::hipEventDisableTiming),
+        )?;
+    }
+    Ok((pinned, event, false))
 }
 
 /// Device memory a dropped [`Buffer`] leaves, kept for the next of its size.

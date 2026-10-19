@@ -61,15 +61,17 @@ pub fn swiglu(
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
     // Eight columns a thread where the halves and both planes take whole
     // 16-byte runs: the same values, element for element.
-    let (entry, launch) =
-        if intermediate.is_multiple_of(8) && packed.ptr % 16 == 0 && y.ptr % 16 == 0 {
-            (
-                "mlp_swiglu_vec8",
-                elementwise_rows(OP, y.rows, y.width / 8)?,
-            )
-        } else {
-            ("mlp_swiglu", launch)
-        };
+    let (entry, launch) = if intermediate.is_multiple_of(8)
+        && packed.ptr.is_multiple_of(16)
+        && y.ptr.is_multiple_of(16)
+    {
+        (
+            "mlp_swiglu_vec8",
+            elementwise_rows(OP, y.rows, y.width / 8)?,
+        )
+    } else {
+        ("mlp_swiglu", launch)
+    };
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&format!("::pie::linear::{entry}<{t}>"))).apply(launch),
@@ -415,15 +417,17 @@ pub fn geglu_tanh_packed(
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
     // Eight columns a thread where the halves and both planes take whole
     // 16-byte runs: the same values, element for element.
-    let (entry, launch) =
-        if intermediate.is_multiple_of(8) && packed.ptr % 16 == 0 && y.ptr % 16 == 0 {
-            (
-                "mlp_geglu_tanh_packed_vec8",
-                elementwise_rows(OP, y.rows, y.width / 8)?,
-            )
-        } else {
-            ("mlp_geglu_tanh_packed", launch)
-        };
+    let (entry, launch) = if intermediate.is_multiple_of(8)
+        && packed.ptr.is_multiple_of(16)
+        && y.ptr.is_multiple_of(16)
+    {
+        (
+            "mlp_geglu_tanh_packed_vec8",
+            elementwise_rows(OP, y.rows, y.width / 8)?,
+        )
+    } else {
+        ("mlp_geglu_tanh_packed", launch)
+    };
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&format!("::pie::linear::{entry}<{t}>"))).apply(launch),

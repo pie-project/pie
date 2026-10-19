@@ -261,7 +261,7 @@ fn check_config(path: &Path, origin: crate::args::Origin) -> Checks {
     out
 }
 
-const KNOWN_ENGINES: &str = "cuda, metal, vulkan, wgpu, xla";
+const KNOWN_ENGINES: &str = "cuda, metal, vulkan, wgpu, xla, cerebras";
 
 fn absent_because(name: &str) -> String {
     match name {
@@ -273,6 +273,7 @@ fn absent_because(name: &str) -> String {
         "vulkan" => "not compiled — build with `--features vulkan`".to_string(),
         "wgpu" => "not compiled — build with `--features wgpu`".to_string(),
         "xla" => "not compiled — build with `--features xla`".to_string(),
+        "cerebras" => "not compiled — build with `--features cerebras`".to_string(),
         other => format!("unknown engine type `{other}`; this build knows: {KNOWN_ENGINES}"),
     }
 }
@@ -690,8 +691,9 @@ mod tests {
         }
         for builtin in builtins::all() {
             assert!(
-                routes.iter().any(|(_, name)| *name == builtin.name),
-                "{} is built in but no route serves it",
+                routes.iter().any(|(_, name)| *name == builtin.name)
+                    || builtin.name == runtime::offload::prefill::PROGRAM,
+                "{} is built in but neither a route nor the runtime runs it",
                 builtin.name
             );
         }

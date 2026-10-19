@@ -274,7 +274,7 @@ fn the_pool_attention_answers_the_reference() {
         for (r, &p) in positions.iter().enumerate() {
             let visible = (p as usize + 1) / ratio;
             let early = |i: usize| (r == 3 || r == 5) && i >= top_k / 2;
-            let past = |i: usize| (r + i) % 9 == 0;
+            let past = |i: usize| (r + i).is_multiple_of(9);
             let wrap = visible.max(1) + 3;
             let id = |i: usize| [(i * 37 + r * 11) % wrap, visible + i % 7][usize::from(past(i))];
             sel.extend((0..top_k).map(|i| if early(i) { -1 } else { id(i) as i32 }));

@@ -522,7 +522,7 @@ pub fn topk_block_max(
             "a block-max ranking keeps at least one block of at least one key",
         ));
     }
-    if keys.keys.ptr % 16 != 0 {
+    if !keys.keys.ptr.is_multiple_of(16) {
         return Err(refuse(OP, "the key pool is not 16-byte aligned"));
     }
     pool_pitch(OP, keys, head_dim)?;

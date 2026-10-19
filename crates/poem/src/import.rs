@@ -426,7 +426,13 @@ fn resolve(src: &ztensor::Source, claim: Claim) -> Result<Vec<TensorContract>, E
         scales,
     } = claim;
     let stored = stored_encoding(src, &name)?;
-    let read = banded(&name, bands.as_ref());
+    let read = padded(
+        &name,
+        bands.as_ref(),
+        &shape,
+        stored_shape(src, &name).as_deref(),
+        &stored,
+    );
     let expr = ladder(&name, read, &stored, &encoding)?;
     tensors.push(match &encoding {
         Encoding::Raw(_) => {
@@ -1869,8 +1875,21 @@ fn interned(
         ]);
     }
     let declared = divided(shape, pairing.channel_axis, pairing.group_size, of);
+    // A scale plane is stored beside its codes, a block of them each.
+    let stored = stored_shape(src, of).filter(|codes| {
+        codes
+            .get(pairing.channel_axis as usize)
+            .is_some_and(|extent| extent % i64::from(pairing.group_size) == 0)
+    });
+    let stored = stored.map(|codes| divided(&codes, pairing.channel_axis, pairing.group_size, of));
     let plane = |name: String, dtype: Dtype, shape: Vec<i64>| {
-        let expr = banded(&name, bands.as_ref());
+        let expr = padded(
+            &name,
+            bands.as_ref(),
+            &shape,
+            stored.as_deref(),
+            &encoding(dtype),
+        );
         TensorContract::new(name, expr, shape, encoding(dtype))
     };
     Ok(match pairing.form {
@@ -2022,6 +2041,83 @@ fn banded(name: &str, bands: Option<&Bands>) -> Expr {
             Expr::concat(at, legs)
         }
     }
+}
+
+/// [`banded`], each segment zero-padded at its end when the file stores
+/// `name` (as `stored`, encoded `held`) narrower along the cut than the plan
+/// holds it `whole`: a width whose blocks the ranks cannot split, which the
+/// model pads with rows and columns that contract to nothing, read out of an
+/// artifact imported whole.
+fn padded(
+    name: &str,
+    bands: Option<&Bands>,
+    whole: &[i64],
+    stored: Option<&[i64]>,
+    held: &Encoding,
+) -> Expr {
+    let read = banded(name, bands);
+    let (Some((axis, extents)), Some(stored)) = (bands, stored) else {
+        return read;
+    };
+    let at = *axis as usize;
+    let narrower = stored.len() == whole.len()
+        && at < whole.len()
+        && stored[at] < whole[at]
+        && (0..whole.len()).all(|i| i == at || stored[i] == whole[i]);
+    if !narrower {
+        return read;
+    }
+    let legs = extents.len() as i64;
+    let short = whole[at] - stored[at];
+    let pad = short / legs;
+    // A cut of one segment is the whole axis, in the units this plane counts
+    // it in; the seams of many clear any blocked axis.
+    let seg = |extent: i64| if legs == 1 { whole[at] } else { extent };
+    // Each segment padded alike, by less than it stores; any other shortfall
+    // is a plane this plan does not read, for the load to refuse.
+    if short % legs != 0 || extents.iter().any(|(extent, _)| seg(*extent) <= 2 * pad) {
+        return read;
+    }
+    let mut zeros = whole.to_vec();
+    zeros[at] = pad;
+    // A zero MXFP4 code is zero under any scale, and the scales beside it
+    // are zeroed as bytes.
+    let zeros = match held {
+        Encoding::Raw(DType::E8m0) => Expr::fill(
+            0.0,
+            TensorType::new(zeros.clone(), Encoding::Raw(DType::U8)),
+        )
+        .transmute(TensorType::new(zeros, held.clone())),
+        held => Expr::fill(0.0, TensorType::new(zeros, held.clone())),
+    };
+    let cut = as_axis(*axis, name);
+    let mut start = 0;
+    let mut parts = Vec::with_capacity(extents.len());
+    for (extent, replicas) in extents {
+        let kept = seg(*extent) - pad;
+        let leg = match legs {
+            1 => Expr::src(name),
+            _ => Expr::src(name).slice(cut, start, kept),
+        };
+        start += kept;
+        parts.push(Expr::concat(cut, vec![leg, zeros.clone()]).shard_among(cut, *replicas));
+    }
+    match legs {
+        1 => parts.remove(0),
+        _ => Expr::concat(cut, parts),
+    }
+}
+
+/// The shape the file stores `name` in, if it holds it.
+fn stored_shape(src: &ztensor::Source, name: &str) -> Option<Vec<i64>> {
+    let tensor = src.get(name)?;
+    Some(
+        tensor
+            .shape()
+            .iter()
+            .map(|extent| i64::try_from(*extent).expect("an extent no i64 holds"))
+            .collect(),
+    )
 }
 
 pub fn extents(w: &Weight) -> Vec<i64> {

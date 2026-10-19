@@ -477,7 +477,8 @@ pub(crate) mod naive {
 
     #[must_use]
     pub const fn mma_supported(kv_lora_rank: i32, rope_dim: i32, num_heads: i32) -> bool {
-        kv_lora_rank == 512 && rope_dim == 64 && num_heads % MMA_BM == 0
+        // A 64-wide rotated part, or none (NoPE: GLM-5.3-Flash's DSA latents).
+        kv_lora_rank == 512 && (rope_dim == 64 || rope_dim == 0) && num_heads % MMA_BM == 0
     }
 
     #[must_use]
@@ -535,8 +536,10 @@ pub(crate) mod naive {
         }
         let selected = ptrs.selection != 0;
 
-        if !selected
-            && shape.window == 0
+        // A selection reads on the tensor cores as a dense window does: a
+        // tile is the selection's positions rather than the window's.
+        if shape.window == 0
+            && (!selected || shape.top_k > 0)
             && mma_supported(shape.kv_lora_rank, shape.rope_dim, shape.num_heads)
         {
             #[allow(clippy::cast_sign_loss)]
@@ -553,7 +556,10 @@ pub(crate) mod naive {
                 op,
                 Fire::at(
                     "attn/mla.cuh",
-                    "::pie::attn::mla_naive::mma_detail::mla_mma_paged_kernel",
+                    crate::jit::symbol(&format!(
+                        "::pie::attn::mla_naive::mma_detail::mla_mma_paged_kernel<{}>",
+                        shape.rope_dim
+                    )),
                 )
                 .apply(launch),
                 &[
@@ -567,6 +573,9 @@ pub(crate) mod naive {
                     ArgValue::Ptr(ptrs.kv_last_page_lens),
                     ArgValue::Ptr(ptrs.o),
                     ArgValue::Ptr(ptrs.lse),
+                    ArgValue::Ptr(ptrs.selection),
+                    shape.top_k.arg(),
+                    i32::from(ctx.tuning().mla_dense_short).arg(),
                     shape.num_requests.arg(),
                     shape.num_heads.arg(),
                     shape.page_size.arg(),

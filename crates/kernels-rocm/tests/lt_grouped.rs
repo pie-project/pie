@@ -170,3 +170,42 @@ fn the_sorted_routed_mlp_answers_the_steps() {
         );
     }
 }
+
+#[test]
+fn the_decode_routed_mlp_answers_the_steps() {
+    let Some(gpu) = Gpu::open() else { return };
+    let dt = Dtype::Bf16;
+    let hidden = 1024usize;
+    let ctx = gpu.ctx().with_tuning(tuning(0, 0, None));
+    for tokens in [1usize, 32] {
+        let m = mlp(&gpu, dt, tokens, 8, 32, hidden, 512, 3);
+        let rows = tokens as u32;
+        let shared = gpu.tensor(&values(tokens * hidden, 5, 1.0), rows, hidden as u32, dt);
+        let gate = gpu.tensor(&values(tokens * 2, 6, 1.0), rows, 2, dt);
+        let mut routed = m.y;
+        moe::mlp_swiglu(&ctx, &m.p, &mut routed).unwrap();
+        let mut want = gpu.zeros(rows, hidden as u32, dt);
+        moe::sigmoid_gate_add(&ctx, routed, shared, gate, &mut want).unwrap();
+        for gated in [false, true] {
+            let mut y = gpu.zeros(rows, hidden as u32, dt);
+            let out = gpu.zeros(rows, hidden as u32, dt);
+            let fold = gated.then_some(moe::SharedGate {
+                shared,
+                gate,
+                y: out,
+            });
+            assert!(moe::decode_mlp(&ctx, &m.p, fold, &mut y).unwrap());
+            let (have, want) = if gated {
+                (gpu.read(&out), gpu.read(&want))
+            } else {
+                (gpu.read(&y), gpu.read(&routed))
+            };
+            for (j, (&h, &w)) in have.iter().zip(&want).enumerate() {
+                assert!(
+                    (h - w).abs() <= w.abs() / 64.0 + 0.01,
+                    "{tokens} tokens, gated {gated}: y[{j}] = {h}, steps {w}"
+                );
+            }
+        }
+    }
+}

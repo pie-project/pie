@@ -11,6 +11,7 @@ pub enum Platform {
     Wgpu,
     Vulkan,
     Xla,
+    Cerebras,
 }
 
 impl Platform {
@@ -22,6 +23,7 @@ impl Platform {
             Platform::Wgpu => "wgpu",
             Platform::Vulkan => "vulkan",
             Platform::Xla => "xla",
+            Platform::Cerebras => "cerebras",
         }
     }
 

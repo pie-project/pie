@@ -84,13 +84,21 @@ fn a_deployment_is_checked_against_its_model() {
     )
     .expect("dsv4-flash splits eight ways");
 
+    for id in ["gptoss-20b", "gptoss-120b"] {
+        check(
+            id,
+            deploy(&[Dtype::Bf16, Dtype::Mxfp4], 4, &[], None),
+            Platform::Cuda,
+        )
+        .unwrap_or_else(|why| panic!("{id} pads its expert width to split four ways: {why}"));
+    }
     assert!(
         check(
             "gptoss-20b",
-            deploy(&[Dtype::Bf16, Dtype::Mxfp4], 4, &[], None),
+            deploy(&[Dtype::Bf16, Dtype::Mxfp4], 3, &[], None),
             Platform::Cuda
         )
         .is_err(),
-        "gpt-oss-20b's expert width does not split four ways"
+        "gpt-oss-20b's kv heads do not split three ways"
     );
 }

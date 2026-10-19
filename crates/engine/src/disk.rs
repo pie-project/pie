@@ -107,8 +107,21 @@ impl SlotFile {
 pub fn free_space(dir: &Path) -> u64 {
     dir.ancestors()
         .find(|path| path.exists())
-        .and_then(|at| rustix::fs::statvfs(at).ok())
-        .map_or(0, |stat| stat.f_bavail.saturating_mul(stat.f_frsize))
+        .and_then(available_bytes)
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn available_bytes(at: &Path) -> Option<u64> {
+    let stat = rustix::fs::statvfs(at).ok()?;
+    Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+/// Windows states free space only through an unsafe call this crate
+/// forbids.
+#[cfg(not(unix))]
+fn available_bytes(_at: &Path) -> Option<u64> {
+    None
 }
 
 #[must_use]

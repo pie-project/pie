@@ -97,6 +97,19 @@ pub(crate) fn skinny_bf16(
     skinny(ctx, weight, act, out, m, n, k, SkinnyEpilogue::Store)
 }
 
+/// [`skinny_bf16`] landing the f32 products (a router's logits).
+pub(crate) fn skinny_f32(
+    ctx: &Ctx,
+    weight: u64,
+    act: u64,
+    out: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), Error> {
+    skinny(ctx, weight, act, out, m, n, k, SkinnyEpilogue::F32)
+}
+
 /// [`skinny_bf16`] over a packed `[gate | up]` bank of 2n rows, landing
 /// `silu(gate)·up` (n columns): the decode MLP's first half in one fire.
 pub(crate) fn skinny_swiglu_bf16(
@@ -112,14 +125,15 @@ pub(crate) fn skinny_swiglu_bf16(
 }
 
 /// What the skinny kernel lands of each product: it as is, the gated
-/// activation of a packed `[gate | up]` bank of 2n rows (`n` columns), or
-/// `cap · tanh(v / cap)`.
+/// activation of a packed `[gate | up]` bank of 2n rows (`n` columns),
+/// `cap · tanh(v / cap)`, or the f32 product unrounded into an f32 plane.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum SkinnyEpilogue {
     Store,
     Swiglu,
     Geglu,
     Softcap(f32),
+    F32,
 }
 
 impl SkinnyEpilogue {
@@ -129,6 +143,7 @@ impl SkinnyEpilogue {
             Self::Swiglu => 1,
             Self::Geglu => 2,
             Self::Softcap(_) => 3,
+            Self::F32 => 4,
         }
     }
 }

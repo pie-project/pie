@@ -776,34 +776,6 @@ impl Drop for Pinning {
     }
 }
 
-pub fn write_raw(at: u64, bytes: &[u8]) -> Result<()> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    #[cfg(feature = "device")]
-    {
-        use crate::device::rt;
-
-        // SAFETY: `at` is an address the caller resolved against an allocation it owns, and `bytes` is a live host slice for the duration of a synchronous copy.
-        unsafe {
-            crate::device::ctx::check(
-                "cudaMemcpy",
-                rt::cudaMemcpy(
-                    at as *mut core::ffi::c_void,
-                    bytes.as_ptr().cast(),
-                    bytes.len(),
-                    rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
-                ),
-            )
-        }
-    }
-    #[cfg(not(feature = "device"))]
-    {
-        let _ = at;
-        Err(Fault::Runtimeless)
-    }
-}
-
 /// The least copy that goes through pinned memory: a larger pageable copy waits
 /// for every launch already queued on its stream, stalling the host.
 #[cfg(feature = "cuda")]
@@ -883,6 +855,10 @@ pub fn stage_raw(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Resu
 
         #[cfg(not(feature = "rocm"))]
         if bounce(stream, dst, bytes)? {
+            return Ok(());
+        }
+        #[cfg(feature = "rocm")]
+        if crate::device::hip::held::staged_through_ring(dst, bytes, stream)? {
             return Ok(());
         }
 

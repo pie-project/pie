@@ -570,6 +570,7 @@ pub(crate) fn write_mla_fp8_rows(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_mla_to_pages(
     ctx: &Ctx,
     op: &'static str,

@@ -198,7 +198,9 @@ fn launch(
             }
             // Eight elements a lane where the planes align to it (a 16-byte
             // load, an 8-byte store), else one a lane: the same bytes.
-            let v8 = src.x.ptr % 16 == 0 && codes % 8 == 0 && values % 16 == 0;
+            let v8 = src.x.ptr.is_multiple_of(16)
+                && codes.is_multiple_of(8)
+                && values.is_multiple_of(16);
             let lanes = if v8 { u64::from(gran / 8) } else { 32 };
             let wide = if v8 { "_v8" } else { "" };
             // The eight-a-lane kernels wait on their producer in-kernel.
@@ -353,8 +355,8 @@ pub fn fp8_block_gemv(
         || k == 0
         || !k.is_multiple_of(512)
         || n == 0
-        || codes % 16 != 0
-        || act.ptr % 16 != 0
+        || !codes.is_multiple_of(16)
+        || !act.ptr.is_multiple_of(16)
     {
         return Ok(false);
     }
@@ -400,6 +402,7 @@ pub fn fp8_block_gemv(
 /// factors' shape): each factor rounded up to its power of two, each code
 /// re-rounded under it, as vLLM's DeepGEMM path requantizes a block-FP8
 /// release on Blackwell.
+#[allow(clippy::too_many_arguments)]
 pub fn fp8_tile_requant(
     ctx: &Ctx,
     op: &'static str,
@@ -1051,7 +1054,7 @@ pub(crate) fn gather_back(
     let (count, n) = (y.rows, y.width);
     // Whole 16-byte runs where the rows and both buffers allow them: the same
     // values, a quarter of the threads.
-    let vec8 = n.is_multiple_of(8) && grouped % 16 == 0 && y.ptr % 16 == 0;
+    let vec8 = n.is_multiple_of(8) && grouped.is_multiple_of(16) && y.ptr.is_multiple_of(16);
     let (entry, per) = if vec8 {
         ("::pie::linear::route_gather_vec8", 8)
     } else {
@@ -1080,6 +1083,7 @@ pub(crate) fn gather_back(
 /// grouped product gathered back, read where it lies. Under a gate, plus
 /// `shared[t] * sigmoid(gate[t])`, rounded once. Tokens past the live window
 /// are untouched.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn weighted_gather(
     ctx: &Ctx,
     op: &'static str,

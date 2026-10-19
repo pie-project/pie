@@ -11,7 +11,7 @@ use crate::hip::{lt, sys};
 use crate::jit::{Ctx, refuse};
 
 use super::dense_batch::dense_batch_bf16;
-use super::gemv::{gemv_bf16, skinny_bf16, skinny_swiglu_bf16};
+use super::gemv::{gemv_bf16, skinny_bf16, skinny_f32, skinny_swiglu_bf16};
 
 /// Up to eight rows the skinny kernels always take a small weight.
 const SKINNY_SMALL: i32 = 8;
@@ -91,6 +91,7 @@ pub(crate) fn act_x_wt(
         k: k.unsigned_abs(),
         bias: false,
         groups: 1,
+        f32_out: false,
     };
     let workspace = ctx.scratch_shared(op, "linear.lt_workspace", lt::WORKSPACE)? as u64;
     // SAFETY: the three planes are device ranges the caller sized at [m, k],
@@ -123,7 +124,9 @@ pub(crate) fn act_x_wt(
     Ok(false)
 }
 
-/// `y = act · wᵀ` over bf16 operands landing f32, one rocBLAS call.
+/// `y = act · wᵀ` over bf16 operands landing f32: the skinny kernel for a
+/// decode's few rows, hipBLASLt above them, rocBLAS where hipBLASLt offers
+/// nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn act_x_wt_f32(
     ctx: &Ctx,
@@ -135,6 +138,24 @@ pub(crate) fn act_x_wt_f32(
     n: i32,
     k: i32,
 ) -> Result<(), Error> {
+    if route(ctx, m, n, k) == Route::Skinny && skinny_f32(ctx, w, act, y, m, n, k).is_ok() {
+        return Ok(());
+    }
+    let shape = lt::Shape {
+        m: m.unsigned_abs(),
+        n: n.unsigned_abs(),
+        k: k.unsigned_abs(),
+        bias: false,
+        groups: 1,
+        f32_out: true,
+    };
+    let workspace = ctx.scratch_shared(op, "linear.lt_workspace", lt::WORKSPACE)? as u64;
+    // SAFETY: the three planes are device ranges the caller sized at [m, k],
+    // [n, k] and [m, n] (f32); the workspace is this stream's.
+    let landed = unsafe { lt::matmul(shape, act, w, 0, y, workspace, ctx.stream()) };
+    if landed.map_err(|why| refuse(op, format!("{why} at M={m} N={n} K={k}")))? {
+        return Ok(());
+    }
     let handle = ctx.blas(op)?;
     // SAFETY: the context's handle is live; the three planes are device
     // ranges the caller sized at [n, k], [m, k] and [m, n].

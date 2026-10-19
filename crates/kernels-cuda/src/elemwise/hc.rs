@@ -83,7 +83,8 @@ pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Resu
     // Eight elements a thread, 1024 threads a row, where the row is whole
     // 16-byte runs: a 16384-wide stream row is two loads a thread, not 64
     // serial ones (DeepSeek-V4-Flash decode8: 28 us a call).
-    let vec8 = y.width.is_multiple_of(8) && streams.ptr % 16 == 0 && y.ptr % 16 == 0;
+    let vec8 =
+        y.width.is_multiple_of(8) && streams.ptr.is_multiple_of(16) && y.ptr.is_multiple_of(16);
     let (entry, block) = if vec8 {
         (
             "::pie::elemwise::hc_rmsnorm_f32_vec8<::pie::bf16, 1024>",
@@ -166,8 +167,8 @@ pub fn project(
         && fan.is_multiple_of(TILE_K)
         && rows >= TILE_FROM
         && mix_hc <= TILE_COLS
-        && normed.ptr % 16 == 0
-        && hc_fn.ptr % 16 == 0
+        && normed.ptr.is_multiple_of(16)
+        && hc_fn.ptr.is_multiple_of(16)
     {
         return project_sliced(ctx, OP, normed, hc_fn, mixes, rows, fan, mix_hc, true);
     }

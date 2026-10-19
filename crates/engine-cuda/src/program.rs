@@ -172,6 +172,9 @@ pub struct Plane {
     wave: Wave,
     shadow: bool,
     flight: u32,
+    /// Instances closed while a fire of theirs was airborne: each closes
+    /// when its last one settles, the device done reading its rings.
+    closing: std::collections::BTreeSet<u64>,
 }
 
 impl Default for Plane {
@@ -194,6 +197,7 @@ impl Plane {
             wave: Wave::default(),
             shadow: false,
             flight: u32::MAX,
+            closing: std::collections::BTreeSet::new(),
         }
     }
 
@@ -276,7 +280,7 @@ impl Plane {
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         program.batch(extents, 1, stream)?;
         let program = &*program;
-        let endpoints = endpoints_for(&program.plan, adopted)?;
+        let endpoints = endpoints_for(&program.plan, adopted, stream)?;
         let held = endpoints.clone();
         let session = match Session::bind(
             &program.compiled,
@@ -285,6 +289,7 @@ impl Plane {
             extents,
             endpoints,
             self.shadow,
+            stream,
         ) {
             Ok(session) => session,
             Err(why) => {
@@ -650,7 +655,11 @@ impl Plane {
             .instances
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
-        bound.session.settle_launched()
+        let fired = bound.session.settle_launched();
+        if !bound.session.airborne() && self.closing.remove(&id) {
+            self.close_now(id)?;
+        }
+        fired
     }
 
     /// The shared rings instance `id`'s stages put.
@@ -690,7 +699,20 @@ impl Plane {
             .unwrap_or_default()
     }
 
+    /// Closes instance `id`, once its airborne fires settle if it has any.
     pub fn close_instance(&mut self, id: u64) -> Result<()> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        if bound.session.airborne() {
+            self.closing.insert(id);
+            return Ok(());
+        }
+        self.close_now(id)
+    }
+
+    fn close_now(&mut self, id: u64) -> Result<()> {
         let bound = self
             .instances
             .remove(&id)
@@ -745,9 +767,10 @@ struct Bound {
 fn endpoints_for(
     plan: &ExecPlan,
     adopted: &[Option<std::sync::Arc<Endpoint>>],
+    stream: *mut core::ffi::c_void,
 ) -> Result<Vec<Option<std::sync::Arc<Endpoint>>>> {
     let mut seated: Vec<std::sync::Arc<Endpoint>> = Vec::new();
-    match gather_endpoints(plan, adopted, &mut seated) {
+    match gather_endpoints(plan, adopted, &mut seated, stream) {
         Ok(endpoints) => Ok(endpoints),
         Err(why) => {
             for endpoint in &seated {
@@ -762,6 +785,7 @@ fn gather_endpoints(
     plan: &ExecPlan,
     adopted: &[Option<std::sync::Arc<Endpoint>>],
     seated: &mut Vec<std::sync::Arc<Endpoint>>,
+    stream: *mut core::ffi::c_void,
 ) -> Result<Vec<Option<std::sync::Arc<Endpoint>>>> {
     use eta_ir::container::HostRole;
 
@@ -826,6 +850,7 @@ fn gather_endpoints(
                 declared.host_role,
                 wire_bytes,
                 capacity,
+                stream,
             )?))),
         }
     }

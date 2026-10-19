@@ -127,7 +127,7 @@ impl FrameShell for Shell {
             })
         };
         if !can_runahead
-            && self.owed.as_ref().is_some_and(resolves_owed)
+            && self.owed.iter().any(resolves_owed)
             && attachments.iter().any(|attached| {
                 self.programs
                     .geometry_of(attached.instance)

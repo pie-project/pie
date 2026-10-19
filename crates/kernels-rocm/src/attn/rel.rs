@@ -30,7 +30,7 @@ pub fn walk(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    if head_dim == 0 || head_dim % 8 != 0 || head_dim > MAX_DIM {
+    if head_dim == 0 || !head_dim.is_multiple_of(8) || head_dim > MAX_DIM {
         return Err(refuse(
             op,
             format!(
@@ -39,7 +39,11 @@ pub fn walk(
         ));
     }
     let heads = q.data.width / head_dim;
-    if heads == 0 || q.data.width != heads * head_dim || kv_heads == 0 || heads % kv_heads != 0 {
+    if heads == 0
+        || q.data.width != heads * head_dim
+        || kv_heads == 0
+        || !heads.is_multiple_of(kv_heads)
+    {
         return Err(refuse(
             op,
             format!(

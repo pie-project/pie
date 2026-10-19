@@ -50,17 +50,26 @@ pub struct Session {
     bound: u64,
     poisoned: bool,
     fires: u64,
-    commit: Pinned,
-    /// On ROCm, the pool the commit slot returns to.
+    /// A commit slot (two words the device writes) for each fire airborne
+    /// at once, reused as they settle.
+    commits: Vec<Pinned>,
+    /// On ROCm, the pool the commit slots return to.
     #[cfg(feature = "rocm")]
     commit_key: Option<crate::device::hip::held::pool::PoolKey>,
-    pending: Option<Minted>,
+    /// The fires minted and not yet settled, oldest first: each mints
+    /// against the cursors the ones ahead of it predicted.
+    pending: std::collections::VecDeque<Minted>,
+    /// A fire ahead of the airborne ones declined, so they were minted
+    /// against cursors that did not happen and decline in turn.
+    cascading: bool,
     shadow: bool,
 }
 
 #[derive(Debug)]
 struct Minted {
+    slot: usize,
     before: Vec<Cursor>,
+    next: Vec<Cursor>,
     tickets: Vec<Ticket>,
     shared_head: Vec<u32>,
     shared_tail: Vec<u32>,
@@ -74,6 +83,7 @@ impl Session {
         extents: Extents,
         endpoints: Vec<Option<Arc<Endpoint>>>,
         shadow: bool,
+        stream: *mut core::ffi::c_void,
     ) -> Result<Session> {
         stages_and_plans_agree(compiled)?;
         if plan.package.channels.is_empty() {
@@ -86,18 +96,11 @@ impl Session {
 
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
-        let rings = Rings::allocate(&shapes, endpoints)?;
+        let rings = Rings::allocate(&shapes, endpoints, stream)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
         #[cfg(feature = "rocm")]
         let commit_key = crate::device::hip::held::pool::commit_key(2 * size_of::<u32>());
-        #[cfg(feature = "rocm")]
-        let commit = match commit_key.and_then(crate::device::hip::held::pool::take) {
-            Some((commit, _, _)) => commit,
-            None => Pinned::mapped(2 * size_of::<u32>())?,
-        };
-        #[cfg(not(feature = "rocm"))]
-        let commit = Pinned::mapped(2 * size_of::<u32>())?;
 
         let mut session = Session {
             rings,
@@ -108,10 +111,11 @@ impl Session {
             bound: 0,
             poisoned: false,
             fires: 0,
-            commit,
+            commits: Vec::new(),
             #[cfg(feature = "rocm")]
             commit_key,
-            pending: None,
+            pending: std::collections::VecDeque::new(),
+            cascading: false,
             shadow,
         };
         for (channel, wire) in seeds {
@@ -133,7 +137,7 @@ impl Session {
             {
                 continue;
             }
-            if !session.publish(*channel, wire)? {
+            if !session.publish(*channel, wire, stream)? {
                 return Err(Fault::program(
                     "program::session",
                     format!(
@@ -144,7 +148,7 @@ impl Session {
             }
         }
         let seeded = session.cursors_now();
-        session.rings.seed_registry(&seeded)?;
+        session.rings.seed_registry(&seeded, stream)?;
         Ok(session)
     }
 
@@ -220,9 +224,32 @@ impl Session {
         }
     }
 
+    /// The commit word of the fire minted last.
     #[must_use]
     pub fn commit_word(&self) -> u64 {
-        self.commit.device()
+        self.pending
+            .back()
+            .map_or(0, |minted| self.commits[minted.slot].device())
+    }
+
+    /// A commit slot no airborne fire holds, a new one when every slot is.
+    fn free_commit(&mut self) -> Result<usize> {
+        let held = |slot: usize| self.pending.iter().any(|minted| minted.slot == slot);
+        if let Some(slot) = (0..self.commits.len()).find(|&slot| !held(slot)) {
+            return Ok(slot);
+        }
+        #[cfg(feature = "rocm")]
+        let commit = match self
+            .commit_key
+            .and_then(crate::device::hip::held::pool::take)
+        {
+            Some((commit, _, _)) => commit,
+            None => Pinned::mapped(2 * size_of::<u32>())?,
+        };
+        #[cfg(not(feature = "rocm"))]
+        let commit = Pinned::mapped(2 * size_of::<u32>())?;
+        self.commits.push(commit);
+        Ok(self.commits.len() - 1)
     }
 
     #[must_use]
@@ -241,14 +268,22 @@ impl Session {
             .map_or(0, |cursor| cursor.tail.saturating_sub(cursor.head))
     }
 
-    pub fn publish(&mut self, channel: u32, wire: &[u8]) -> Result<bool> {
+    /// Publishes `wire` into `channel`, its cell staged on `stream` ahead of
+    /// the fire that reads it.
+    pub fn publish(
+        &mut self,
+        channel: u32,
+        wire: &[u8],
+        stream: *mut core::ffi::c_void,
+    ) -> Result<bool> {
         let shape = self.shape_of(channel)?;
         if self.depth(channel) >= u64::from(shape.capacity) {
             return Ok(false);
         }
         let native = wire_to_native(shape.dtype, shape.numel, wire)?;
         let tail = self.cursor(channel).map_or(0, |cursor| cursor.tail);
-        self.rings.write_cell(channel as usize, tail, &native)?;
+        self.rings
+            .write_cell(channel as usize, tail, &native, stream)?;
         self.advance_tail(channel as usize);
         Ok(true)
     }
@@ -275,12 +310,23 @@ impl Session {
         }
     }
 
+    /// Takes the oldest cell a settled fire put; `None` while the next one is
+    /// a prediction of a fire still airborne.
     pub fn take(&mut self, channel: u32) -> Result<Option<Vec<u8>>> {
         if self.depth(channel) == 0 {
             return Ok(None);
         }
         let shape = self.shape_of(channel)?;
         let head = self.cursor(channel).map_or(0, |cursor| cursor.head);
+        let settled_tail = self.pending.front().map_or(u64::MAX, |minted| {
+            minted
+                .before
+                .get(channel as usize)
+                .map_or(0, |cursor| cursor.tail)
+        });
+        if head >= settled_tail {
+            return Ok(None);
+        }
         let native = self.rings.read_cell(channel as usize, head)?;
         self.advance_head(channel as usize);
         Ok(Some(native_to_wire(shape.dtype, shape.numel, &native)?))
@@ -362,15 +408,6 @@ impl Session {
         plan: &ExecPlan,
         wave: &mut Wave,
     ) -> Result<Launched> {
-        if self.pending.is_some() {
-            return Err(Fault::program(
-                "program::session",
-                "this instance already has a fire airborne: a second mint would predict \
-                 against cursors the first has not yet reconciled with the pinned words \
-                 `pull_validate` reads, and the device would refuse whichever of the two \
-                 it saw second",
-            ));
-        }
         if self.poisoned {
             return Ok(Launched::Refused(Fired::Faulted(
                 "instance is poisoned".to_string(),
@@ -470,7 +507,8 @@ impl Session {
             return Ok(Launched::Refused(Fired::Blocked(blocked)));
         }
 
-        let minted = match self.mint(plan, wave) {
+        let slot = self.free_commit()?;
+        let minted = match self.mint(plan, wave, slot) {
             Ok(minted) => minted,
             Err(why) => {
                 self.poisoned = true;
@@ -478,15 +516,15 @@ impl Session {
             }
         };
 
-        self.pending = Some(minted);
+        self.pending.push_back(minted);
         Ok(Launched::Airborne)
     }
 
     pub fn take_lane(&mut self, stages: &mut [Option<Prepared>]) -> Result<()> {
-        let Some(minted) = self.pending.as_ref() else {
+        let Some(minted) = self.pending.back() else {
             return Ok(());
         };
-        let commit = self.commit.device();
+        let commit = self.commits[minted.slot].device();
         for prepared in stages.iter_mut().flatten() {
             let lane = prepared.stage_lane(&self.rings, &minted.before, commit)?;
             for intrinsic in self.intrinsics.iter().flatten() {
@@ -504,16 +542,21 @@ impl Session {
         Ok(())
     }
 
+    /// Settles the oldest airborne fire.
     pub fn settle_launched(&mut self) -> Result<Fired> {
-        let Some(minted) = self.pending.take() else {
+        let Some(minted) = self.pending.pop_front() else {
             return Ok(Fired::Committed);
         };
-        self.settle(&minted)
+        let fired = self.settle(&minted);
+        if self.pending.is_empty() {
+            self.cascading = false;
+        }
+        fired
     }
 
     #[must_use]
-    pub const fn airborne(&self) -> bool {
-        self.pending.is_some()
+    pub fn airborne(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     pub fn shared_rings(&self) -> impl Iterator<Item = usize> + '_ {
@@ -557,7 +600,12 @@ impl Session {
             .collect()
     }
 
-    fn mint(&mut self, plan: &ExecPlan, wave: &mut Wave) -> std::result::Result<Minted, String> {
+    fn mint(
+        &mut self,
+        plan: &ExecPlan,
+        wave: &mut Wave,
+        slot: usize,
+    ) -> std::result::Result<Minted, String> {
         let before = self.cursors_now();
         let mut next = before.clone();
         let mut tickets: Vec<Ticket> = Vec::with_capacity(self.shapes.len());
@@ -687,7 +735,7 @@ impl Session {
         }
 
         let rings = self.rings.device();
-        let commit = self.commit.device();
+        let commit = self.commits[slot].device();
 
         let _lane = wave.stage(
             &tickets,
@@ -714,7 +762,7 @@ impl Session {
             },
         );
 
-        self.cursors = next;
+        self.cursors = next.clone();
         for slot in &shared_head {
             if let Some(endpoint) = self.rings.endpoint(*slot as usize) {
                 endpoint.predict_head();
@@ -726,7 +774,9 @@ impl Session {
             }
         }
         Ok(Minted {
+            slot,
             before,
+            next,
             tickets,
             shared_head,
             shared_tail,
@@ -734,7 +784,7 @@ impl Session {
     }
 
     fn settle(&mut self, minted: &Minted) -> Result<Fired> {
-        let word = self.commit.read(0, size_of::<u32>());
+        let word = self.commits[minted.slot].read(0, size_of::<u32>());
         let committed = u32::from_le_bytes([word[0], word[1], word[2], word[3]]) != 0;
         if committed {
             self.fires += 1;
@@ -751,7 +801,20 @@ impl Session {
             }
         }
 
-        self.cursors = minted.before.clone();
+        // Only this fire's own advance is undone: the fires minted after it
+        // keep theirs, and settle (declining) after it.
+        for ((cursor, before), next) in self
+            .cursors
+            .iter_mut()
+            .zip(&minted.before)
+            .zip(&minted.next)
+        {
+            cursor.head -= next.head - before.head;
+            cursor.tail -= next.tail - before.tail;
+        }
+        if core::mem::replace(&mut self.cascading, !self.pending.is_empty()) {
+            return Ok(Fired::Declined);
+        }
         if let Some(stale) = self.stale_ticket(&minted.tickets) {
             return Err(Fault::program(
                 "program::session",
@@ -914,8 +977,9 @@ mod tests {
 impl Drop for Session {
     fn drop(&mut self) {
         if let Some(key) = self.commit_key {
-            let commit = core::mem::replace(&mut self.commit, Pinned::empty());
-            crate::device::hip::held::pool::give(key, (commit, Pinned::empty(), None));
+            for commit in self.commits.drain(..) {
+                crate::device::hip::held::pool::give(key, (commit, Pinned::empty(), None));
+            }
         }
     }
 }

@@ -182,9 +182,15 @@ fn the_routed_selects_answer_the_routed_dot() {
     #[rustfmt::skip]
     let mma = Tuning { mxfp4_mma_until: 65_536, mxfp4_mma_from: 1, ..d };
     #[rustfmt::skip]
+    let bf16mma = Tuning { moe_grouped: false, bf16_mma_from: 1, bf16_mma_until: 65_536, ..d };
+    #[rustfmt::skip]
     let cvt = Tuning { mxfp4_cvt: true, mxfp4_a8_until: 65_536, mxfp4_cvt_ksplit_until: 6, ..mma };
     #[rustfmt::skip]
-    let nv_mma = Tuning { nvfp4_mma_until: 65_536, mxfp4_cvt: true, ..TC5 };
+    let nv_mma = if supported() {
+        Tuning { nvfp4_mma_until: 65_536, mxfp4_cvt: true, ..TC5 }
+    } else {
+        Tuning { nvfp4_mma_until: 65_536, ..d }
+    };
     let (sw, f, t) = (Some(Glu::Swiglu), false, true);
     #[rustfmt::skip]
     let alpha = Some(Glu::SwigluClampAlpha { limit: 1e4, alpha: 1.702 });
@@ -197,6 +203,12 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Bf16, d, [8, 48, 2, 96, 64], f, None, 0),
         (K::Bf16, TC5, [16, 70, 4, 192, 256], t, None, 0),
         (K::Bf16, TC5, [16, 48, 4, 128, 256], t, sw, 0),
+        // Bf16 on the graph-safe grouped mma.sync: eight, four and one 8-route
+        // blocks, by token and by route, a partial 128-row tile.
+        (K::Bf16, bf16mma, [8, 64, 8, 128, 256], t, None, 0),
+        (K::Bf16, bf16mma, [8, 64, 8, 128, 256], f, None, 0),
+        (K::Bf16, bf16mma, [16, 40, 8, 256, 128], f, None, 0),
+        (K::Bf16, bf16mma, [8, 12, 4, 96, 512], t, None, 0),
         // Affine u4: per route, grouped, tcgen05.
         (K::Affine, d, [16, 1, 8, 1408, 2816], t, None, 0),
         (K::Affine, d, [16, 3, 8, 704, 704], f, None, 0),
@@ -227,6 +239,8 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Nv, nv_mma, [16, 2, 10, 256, 640], f, None, 0),
         (K::Nv, nv_mma, [16, 48, 10, 320, 2560], t, sw, 0),
     ];
+    // Off tcgen05 (Hopper) the arms its tunings name do not take the fire.
+    cases.retain(|case| supported() || !(case.1.moe_tc5 || case.1.mxfp4_cvt));
     if supported() {
         // The atom-laid select on the e2m1 converts, keeping its order; the
         // quantizing selects masked (a few routes) and contiguous, by token

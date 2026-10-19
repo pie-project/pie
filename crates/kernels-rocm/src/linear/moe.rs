@@ -466,9 +466,9 @@ pub fn matmul_select(
     select_gemv(ctx, OP, x, bank, routes, y, experts)
 }
 
-/// A grouped projection (`linear.matmul_grouped`): row r's group g, x[r·groups
-/// + g] (k wide), through the bank's expert routes[r][g] (n x k) into y[r·groups
-/// + g]. `identity` states the routes are `group_routes`' (route g for group
+/// A grouped projection (`linear.matmul_grouped`): row r's group g,
+/// `x[r·groups + g]` (k wide), through the bank's expert `routes[r][g]` (n x k)
+/// into `y[r·groups + g]`. `identity` states the routes are `group_routes`' (route g for group
 /// g, every row), so the fire is `groups` dense matmuls over strided planes:
 /// past the batch legs' reach (an expert there sees a route a row, too many
 /// for them, and too few experts for the grouped leg to fill the card) one
@@ -549,6 +549,7 @@ fn grouped_lt(
         k,
         bias: false,
         groups,
+        f32_out: false,
     };
     let workspace = ctx.scratch_shared(op, "linear.lt_workspace", lt::WORKSPACE)? as u64;
     // SAFETY: x is [m, groups·k], y [m, groups·n] and w groups blocks of
@@ -902,7 +903,7 @@ fn route_order(
     // route has one.
     let work_cap = fan.route_count.div_ceil(group) + experts.min(fan.route_count);
     let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
-    let order = ctx.scratch(
+    let order = ctx.scratch_stream(
         op,
         ROUTE_ORDER,
         (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
@@ -1082,12 +1083,13 @@ mod ordered {
         let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
         let rows = fan.route_count as usize;
         let elem = 2usize;
-        let packed = ctx.scratch(
+        let packed = ctx.scratch_stream(
             op,
             "linear.moe_ordered_packed",
             rows * 2 * i as usize * elem,
         )? as usize as u64;
-        let h = ctx.scratch(op, "linear.moe_ordered_h", rows * i as usize * elem)? as usize as u64;
+        let h = ctx.scratch_stream(op, "linear.moe_ordered_h", rows * i as usize * elem)? as usize
+            as u64;
         let ordered = route_order(ctx, op, p.routes, fan, experts, group_routes(fan, experts))?;
         let act_div = if fan.by_token { fan.top_k } else { 1 };
         // Gate-up: the tokens' rows by route in, the products in expert order.
@@ -2142,7 +2144,7 @@ pub fn fp8_tiles(x: Tensor, codes: Tensor, scales: Tensor, y: &Tensor) -> bool {
 /// 1x128 block (`quantized_codes`), on the FP8 matrix core: at decode
 /// batches items of the least of 16, 32 and 64 routes holding what an expert
 /// averages; past 64 routes an expert the prefill tile, items of 128 against
-/// 128 weight rows. An expert past its item takes another.
+/// 256 weight rows. An expert past its item takes another.
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_select_fp8_mfma(
     ctx: &Ctx,
@@ -2204,7 +2206,11 @@ pub fn matmul_select_fp8_quantized(
     }
     let experts = codes.rows.max(1);
     let per = fan.route_count.div_ceil(experts);
-    let gemm = per > 64;
+    // The prefill tile walks whole 16-row strips and reads the activation at
+    // 32-bit offsets.
+    let gemm = per > 64
+        && y.width.is_multiple_of(16)
+        && u64::from(x.rows) * u64::from(x.width) <= u64::from(u32::MAX);
     let mt = if gemm {
         128
     } else {
@@ -2216,10 +2222,14 @@ pub fn matmul_select_fp8_quantized(
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     let mut args = vec![q.arg(), act_scales.arg()];
     let (entry, rows, threads) = if gemm {
+        // The dense prefill tile (128 routes x 256 weight rows, eight waves
+        // at two a SIMD), its rows gathered by route.
         (
-            "::pie::linear::moe_fp8_gemm8".to_string(),
-            128,
-            2 * GROUP_BLOCK,
+            "::pie::linear::moe_fp8_tiles<::pie::i32(3), ::pie::i32(8), ::pie::i32(1), ::pie::i32(2), \
+             ::pie::i32(8), ::pie::i32(2)>"
+                .to_string(),
+            256,
+            512,
         )
     } else {
         (
@@ -2503,6 +2513,220 @@ pub struct RoutedMlp {
     pub routed: Tensor,
 }
 
+/// A shared expert's gated add after the routed fold: `y = routed +
+/// shared · sigmoid(gate)`, `gate` one logit a row.
+#[derive(Clone, Copy, Debug)]
+pub struct SharedGate {
+    pub shared: Tensor,
+    pub gate: Tensor,
+    pub y: Tensor,
+}
+
+/// Rows a decode wave takes in [`decode_mlp`].
+const DECODE_RPW: u32 = 2;
+const DECODE_BLOCK: u32 = 256;
+
+/// A decode fire's routed MLP with the swiglu in the gate-up launch and the
+/// fold (and `shared`'s gated add, landing in its `y`) at the end, over
+/// resident 16-bit banks. One token takes two launches: fewer tokens than
+/// `kernel.moe.batch_from`, rows of whole 512s. A batch takes the batch legs
+/// over one route ordering where both legs would. Whether it ran.
+pub fn decode_mlp(
+    ctx: &Ctx,
+    p: &RoutedMlp,
+    shared: Option<SharedGate>,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.moe_decode_mlp";
+    let (x, i, hidden) = (p.x, p.intermediate, y.width);
+    let t = ctx.tuning();
+    let fan = selected(OP, x, p.routes, &p.packed)?;
+    let top_k = fan.top_k.unsigned_abs();
+    let (Some(count), Some(_)) = (
+        dense_experts(x, p.gate_up, &p.packed, p.gate_up_experts),
+        dense_experts(p.h, p.down, &p.routed, p.down_experts),
+    ) else {
+        return Ok(false);
+    };
+    let covered = fan.by_token
+        && t.moe_batch
+        && p.limit.is_none()
+        && p.packed.width == 2 * i
+        && shared.is_none_or(|s| {
+            s.shared.dtype == x.dtype
+                && s.gate.dtype == x.dtype
+                && s.shared.width == hidden
+                && s.y.width == hidden
+                && s.gate.width > 0
+        });
+    if !covered {
+        return Ok(false);
+    }
+    if x.rows >= t.moe_batch_from {
+        return batch_mlp(ctx, p, &fan, count, shared, y);
+    }
+    let fits = |k: u32, most: u32| k.is_multiple_of(512) && (1..=most).contains(&(k / 512));
+    if !fits(x.width, 8) || !fits(i, 4) || !(1..=16).contains(&top_k) {
+        return Ok(false);
+    }
+    let ty = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let rows_a_block = 4 * DECODE_RPW;
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::linear::moe_decode_glu<{ty}, {}, {DECODE_RPW}>",
+                x.width / 512
+            )),
+        )
+        .apply(Launch::grid(
+            [fan.route_count, i.div_ceil(rows_a_block), 1],
+            [DECODE_BLOCK, 1, 1],
+        )),
+        &[
+            p.routes.arg(),
+            x.arg(),
+            p.gate_up.arg(),
+            p.h.arg(),
+            fan.top_k.arg(),
+            stated(OP, i)?.arg(),
+            (2 * i64::from(i) * i64::from(x.width)).arg(),
+            ctx.stage(),
+        ],
+    )?;
+    let (out, shared_at, gate_at, gate_stride) = match shared {
+        Some(s) => (s.y, s.shared.ptr, s.gate.ptr, stated(OP, s.gate.width)?),
+        None => (*y, 0, 0, 0),
+    };
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::linear::moe_decode_down<{ty}, {}, {top_k}, {DECODE_RPW}>",
+                i / 512
+            )),
+        )
+        .apply(Launch::grid(
+            [x.rows, hidden.div_ceil(rows_a_block), 1],
+            [DECODE_BLOCK, 1, 1],
+        )),
+        &[
+            p.routes.arg(),
+            p.weights.arg(),
+            p.h.arg(),
+            p.down.arg(),
+            out.arg(),
+            ArgValue::Ptr(shared_at),
+            ArgValue::Ptr(gate_at),
+            gate_stride.arg(),
+            stated(OP, hidden)?.arg(),
+            (i64::from(hidden) * i64::from(i)).arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}
+
+/// [`decode_mlp`]'s batch: where `matmul_select` would take the batch leg
+/// for both matmuls, one route ordering for both, the swiglu in the gate-up
+/// leg's epilogue, and the fold with the gated add.
+fn batch_mlp(
+    ctx: &Ctx,
+    p: &RoutedMlp,
+    fan: &Selected,
+    count: u32,
+    shared: Option<SharedGate>,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.moe_decode_mlp";
+    let (x, i, hidden) = (p.x, p.intermediate, y.width);
+    let until = ctx.tuning().moe_dense_batch_until;
+    let down_fan = Selected {
+        by_token: false,
+        ..*fan
+    };
+    let tiled = x.dtype == Dtype::Bf16
+        && x.width.is_multiple_of(64)
+        && count <= ORDER_EXPERT_CAP
+        && (65..=until).contains(&fan.route_count.div_ceil(count));
+    let Some(mt) = batch_items(ctx, fan, count, 64, until) else {
+        return Ok(false);
+    };
+    if tiled
+        || !x.width.is_multiple_of(8)
+        || !i.is_multiple_of(8)
+        || wide_items(ctx, fan, count, x).is_some()
+        || wide_items(ctx, &down_fan, count, p.h).is_some()
+    {
+        return Ok(false);
+    }
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let ordered = route_order(ctx, OP, p.routes, fan, count, mt)?;
+    let order = [
+        ArgValue::Ptr(ordered.order),
+        ArgValue::Ptr(ordered.offsets),
+        ArgValue::Ptr(ordered.work),
+    ];
+    let experts = stated(OP, count)?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::linear::moe_matmul_select_dense_batch_swiglu<{t}, ::pie::i32({mt})>"
+            )),
+        )
+        .apply(Launch::grid(
+            [ordered.work_cap, i.div_ceil(64), 1],
+            [GROUP_BLOCK, 1, 1],
+        )),
+        &[
+            &[x.arg()],
+            &order[..],
+            &[
+                p.gate_up.arg(),
+                p.h.arg(),
+                fan.top_k.arg(),
+                stated(OP, i)?.arg(),
+                stated(OP, x.width)?.arg(),
+                experts.arg(),
+            ],
+        ]
+        .concat(),
+    )?;
+    let nbw = dense_nbw(mt);
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::linear::moe_matmul_select_dense_batch<{t}, ::pie::i32({mt}), ::pie::i32({nbw})>"
+            )),
+        )
+        .apply(Launch::grid(
+            [ordered.work_cap, hidden.div_ceil(64 * nbw), 1],
+            [GROUP_BLOCK, 1, 1],
+        )),
+        &[
+            &[p.h.arg()],
+            &order[..],
+            &[
+                p.down.arg(),
+                p.routed.arg(),
+                1i32.arg(),
+                stated(OP, hidden)?.arg(),
+                stated(OP, i)?.arg(),
+                experts.arg(),
+            ],
+        ]
+        .concat(),
+    )?;
+    weighted_fold(ctx, p.routed, p.weights, shared, y)?;
+    Ok(true)
+}
+
 /// The routed MLP: on the grouped GEMM with its routes in expert order
 /// throughout where that measured faster, else the four routed steps.
 pub fn mlp_swiglu(ctx: &Ctx, p: &RoutedMlp, y: &mut Tensor) -> Result<(), Error> {
@@ -2541,6 +2765,17 @@ pub fn weighted_sum(
     weights: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
+    weighted_fold(ctx, routed, weights, None, y)
+}
+
+/// [`weighted_sum`], and given `shared` its gated add, into `shared.y`.
+fn weighted_fold(
+    ctx: &Ctx,
+    routed: Tensor,
+    weights: Tensor,
+    shared: Option<SharedGate>,
+    y: &mut Tensor,
+) -> Result<(), Error> {
     const OP: &str = "linear.moe_weighted_sum";
     let t = dtype_dispatch!(OP, routed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");
@@ -2571,11 +2806,14 @@ pub fn weighted_sum(
         )
         .apply(elementwise_rows(OP, y.rows, y.width)?),
         &[
-            y.arg(),
+            shared.map_or(*y, |s| s.y).arg(),
             routed.arg(),
             weights.arg(),
             stated(OP, top_k)?.arg(),
             stated(OP, y.width)?.arg(),
+            ArgValue::Ptr(shared.map_or(0, |s| s.shared.ptr)),
+            ArgValue::Ptr(shared.map_or(0, |s| s.gate.ptr)),
+            stated(OP, shared.map_or(0, |s| s.gate.width))?.arg(),
             ctx.stage(),
         ],
     )

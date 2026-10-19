@@ -1167,10 +1167,10 @@ impl Run<'_> {
                 res: None,
                 gate: None,
                 eps,
-                temperature,
+                temperature: 1.0,
                 next: None,
                 y,
-            }) if temperature == 1.0 => Some((x, scale, eps, y)),
+            }) => Some((x, scale, eps, y)),
             Some(_) => return Ok(false),
         };
         // DeepSeek's form: the route weights scale the GLU's rows before the

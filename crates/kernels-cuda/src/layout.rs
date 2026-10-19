@@ -284,6 +284,7 @@ pub fn embed_scale_add_select(
 /// `packed`'s `heads` (query, key-value) heads, queries and keys
 /// `widths[0]` wide and values `widths[1]`, cut into `q`, `k` and `v` heads
 /// `head_dim` wide, zero past their widths.
+#[allow(clippy::too_many_arguments)]
 pub fn split_qkv_padded(
     ctx: &Ctx,
     packed: Tensor,

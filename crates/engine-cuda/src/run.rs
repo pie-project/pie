@@ -1723,7 +1723,7 @@ impl<'c> Run<'c> {
         }
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(not(feature = "rocm"))]
     pub(crate) fn maybe_stored(&self, id: ValueId) -> Option<Tensor> {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {

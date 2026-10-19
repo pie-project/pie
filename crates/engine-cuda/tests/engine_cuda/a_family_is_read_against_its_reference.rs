@@ -369,7 +369,7 @@ fn every_probe_is_dumped() {
         // Each lane's ids: a fixed LCG walk over the vocabulary's body.
         let prompts: Vec<Vec<u32>> = (0..lanes)
             .map(|lane| {
-                let mut state = 0x9e37_79b9_u64 ^ (lane as u64 + 1) * 0x2545_f491;
+                let mut state = 0x9e37_79b9_u64 ^ ((lane as u64 + 1) * 0x2545_f491);
                 (0..lane_prefix(lane) + batch_steps)
                     .map(|_| {
                         state = state

@@ -698,7 +698,7 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, n) = elementwise(OP, *y)?;
     // Rows of whole 16-byte groups add eight lanes a thread.
-    if y.dtype == Dtype::Bf16 && y.width.is_multiple_of(8) && (y.ptr | x.ptr) % 16 == 0 {
+    if y.dtype == Dtype::Bf16 && y.width.is_multiple_of(8) && (y.ptr | x.ptr).is_multiple_of(16) {
         let lanes = u32::try_from(n / 8).unwrap_or(u32::MAX);
         return ctx.fire(
             OP,
