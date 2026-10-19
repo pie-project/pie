@@ -535,8 +535,10 @@ pub(crate) mod naive {
         }
         let selected = ptrs.selection != 0;
 
-        if !selected
-            && shape.window == 0
+        // A selection reads on the tensor cores as a dense window does: a
+        // tile is the selection's positions rather than the window's.
+        if shape.window == 0
+            && (!selected || shape.top_k > 0)
             && mma_supported(shape.kv_lora_rank, shape.rope_dim, shape.num_heads)
         {
             #[allow(clippy::cast_sign_loss)]
@@ -567,6 +569,9 @@ pub(crate) mod naive {
                     ArgValue::Ptr(ptrs.kv_last_page_lens),
                     ArgValue::Ptr(ptrs.o),
                     ArgValue::Ptr(ptrs.lse),
+                    ArgValue::Ptr(ptrs.selection),
+                    shape.top_k.arg(),
+                    i32::from(ctx.tuning().mla_dense_short).arg(),
                     shape.num_requests.arg(),
                     shape.num_heads.arg(),
                     shape.page_size.arg(),
