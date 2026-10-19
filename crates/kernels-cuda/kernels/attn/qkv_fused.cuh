@@ -232,6 +232,9 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     constexpr unsigned FULL_MASK = 0xffffffffu;
     constexpr int ELEMS_PER_THREAD = HEAD_DIM / 32;
     static_assert(HEAD_DIM % 64 == 0);
+    // The decode attention after it (`kernel.pdl`) reads its plan meanwhile
+    // and waits for these rows.
+    pdl_launch();
 
     const int warp_id = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;

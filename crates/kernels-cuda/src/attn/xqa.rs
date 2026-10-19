@@ -203,7 +203,8 @@ pub fn decode(
     let launch = Launch::grid(
         [plan.shape.num_kv_heads * ranks, params.padded_batch_size, 1],
         [32 * stamp.warps, 1, 1],
-    );
+    )
+    .programmatic(ctx.tuning().pdl);
     let smem = stamp.smem_over(e4m3);
     let launch = if ranks > 1 {
         launch.cluster(ranks).smem(smem + (8 * head_dim + 8) * 4)

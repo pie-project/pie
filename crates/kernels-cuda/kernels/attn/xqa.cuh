@@ -207,6 +207,10 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
         chunk_end = min(chunk_start + per, kv_len);
     }
 
+    // The plan above was landed before the step's kernels; as a programmatic
+    // dependent (`kernel.pdl`) the query rows and the keys wait for the
+    // kernel before (the one landing this token's rows).
+    pdl_wait();
     // The group's query rows, zero past the group.
     const long long q_row = static_cast<long long>(q_indptr[batch]) * q_stride_n;
     for (int e = tid; e < 8 * CHUNKS; e += 32 * WARPS) {
