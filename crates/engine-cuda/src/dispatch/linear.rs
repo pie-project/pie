@@ -1695,6 +1695,14 @@ impl Run<'_> {
         }
         let act = self.tensor(act);
         let mut out = self.tensor(y);
+        // A batch's rows on the plane's bf16 copy (`kernel.gemm.fp8_shadow`).
+        #[cfg(feature = "cuda")]
+        if act.rows > linear::w8a16::MMA_UNTIL
+            && let Some(shadow) = self.fp8_shadow(w)
+        {
+            linear::gemm::act_x_wt(self.ctx(), op, act, shadow, None, &mut out)?;
+            return Ok(());
+        }
         let k = act.width;
         let block = if atoms.width == 0 { 0 } else { k.div_ceil(atoms.width) };
         // A decode's few rows over 128-wide blocks as the GEMV over bf16 rows

@@ -1008,7 +1008,7 @@ impl Weights {
         }
         Ok(Weights {
             store,
-            table: WeightTable(table, BTreeMap::new()),
+            table: WeightTable(table, BTreeMap::new(), BTreeMap::new()),
             banks: banks(trace, &places),
             experts,
             from_cache,
@@ -1120,6 +1120,73 @@ impl Weights {
                 ),
             );
             done += 1;
+        }
+        Ok(done)
+    }
+
+    /// `kernel.gemm.fp8_shadow`: each block-FP8 dense projection read at
+    /// bf16 activations keeps a bf16 copy, widened once here, that a
+    /// batch's rows read on cuBLAS. Returns the planes it widened.
+    #[cfg(feature = "cuda")]
+    pub fn shadow_fp8_dense(&mut self, trace: &Trace, stream: *mut core::ffi::c_void) -> Result<u32> {
+        use poem_ir::{Def, Linear, Operation};
+        let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
+            Some(Def::Weight(at)) => Some(*at as usize),
+            _ => None,
+        };
+        // SAFETY: `stream` is the load's stream, live for the load.
+        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        let mut done = 0;
+        for node in &trace.nodes {
+            let Operation::Linear(Linear::MatmulActQuant {
+                w,
+                scales: Some(scales),
+                ..
+            }) = &node.op
+            else {
+                continue;
+            };
+            let (Some(at), Some(s_at)) = (weight(*w), weight(*scales)) else {
+                continue;
+            };
+            if self.table.2.contains_key(&at) {
+                continue;
+            }
+            let (Some(Some(WeightRow::Dense(codes))), Some(Some(WeightRow::Dense(atoms)))) =
+                (self.table.0.get(at).copied(), self.table.0.get(s_at).copied())
+            else {
+                continue;
+            };
+            if atoms.dtype != Dtype::U8 || atoms.width == 0 {
+                continue;
+            }
+            let (n, k) = (codes.rows, codes.width);
+            let gran = k.div_ceil(atoms.width);
+            let buffer = Buffer::zeroed(n as usize * k as usize * 2)?;
+            if kernels_cuda::linear::w8a16::widen(
+                &ctx,
+                "linear.fp8_shadow",
+                codes.ptr,
+                atoms.ptr,
+                gran,
+                n,
+                k,
+                buffer.ptr(),
+            )
+            .is_err()
+            {
+                continue;
+            }
+            self.table.2.insert(at, Tensor::new(buffer.ptr(), n, k, Dtype::Bf16));
+            self.decoded.push(buffer);
+            done += 1;
+        }
+        // SAFETY: the load's stream.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaStreamSynchronize",
+                cudarc::runtime::sys::cudaStreamSynchronize(stream.cast()),
+            )?;
         }
         Ok(done)
     }

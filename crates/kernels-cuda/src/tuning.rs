@@ -159,6 +159,13 @@ pub struct MlaExpandedFrom(pub u32);
 #[decision(id = "kernel.gemm.fp8_gemv_until", constant(range(0..=64)), default = 0, tune = search)]
 pub struct GemmFp8GemvUntil(pub u32);
 
+/// Whether a block-FP8 dense projection read at bf16 activations (no
+/// tcgen05) keeps a bf16 copy widened once at load beside its codes: a
+/// batch's rows run cuBLAS on it, a decode's few the codes (half the bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.fp8_shadow", flag, default = false, tune = search)]
+pub struct GemmFp8Shadow;
+
 /// The most rows a dense fp8b128 projection runs on the mma.sync fp8
 /// kernel (`moe::dense_fp8_shape` says where it leads, in which CTA
 /// shape), its rows quantized in the same launch. 0: never.
@@ -651,6 +658,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeW4a8FusedFrom>()
         .add::<MlaExpandedFrom>()
         .add::<GemmFp8GemvUntil>()
+        .add::<GemmFp8Shadow>()
         .add::<GemmFp8MmaGemvUntil>()
         .add::<AttnResFusedNorm>()
         .add::<SsmKdaChunked>()
@@ -766,6 +774,7 @@ tuning! {
     moe_w4a8_fused_from: u32 = 65_536, get MoeW4a8FusedFrom;
     mla_expanded_from: u32 = 65_536, get MlaExpandedFrom;
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
+    gemm_fp8_shadow: bool = false, on GemmFp8Shadow;
     gemm_fp8_mma_gemv_until: u32 = 0, get GemmFp8MmaGemvUntil;
     attn_res_fused_norm: bool = false, on AttnResFusedNorm;
     ssm_kda_chunked: bool = false, on SsmKdaChunked;
