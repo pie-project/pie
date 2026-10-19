@@ -141,6 +141,22 @@ fn rms_row(
             ],
         );
     }
+    // A whole row of 2048 to 8192 held in registers, read once.
+    if per_head_dim == 0 && matches!(width, 2048 | 4096 | 8192) {
+        let plus_one = template == OFFSET_BANK;
+        return ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_held<{t}, {}, {plus_one}>",
+                    width / 256
+                )),
+            )
+            .apply(launch),
+            &[x.arg(), weight.arg(), y.arg(), eps.arg(), ctx.stage()],
+        );
+    }
     ctx.fire(
         op,
         Fire::at(

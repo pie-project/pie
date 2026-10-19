@@ -131,6 +131,45 @@ __global__ void rmsnorm_plus_one(
         x, weight, y, hidden, x_row_stride, y_row_stride, eps, heads, win);
 }
 
+// `rmsnorm` (`rmsnorm_plus_one` under PLUS_ONE) of a whole row of `256 *
+// PER`, landing its bits: each thread's values (its elements `t`, `t + 256`,
+// ...) and their weights loaded at once and held, the squares summed in the
+// same order, not read twice in a loop each.
+template <class T, int PER, bool PLUS_ONE>
+__global__ void __launch_bounds__(256) rmsnorm_held(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    T* __restrict__ y,
+    float eps,
+    const u32* __restrict__ win)
+{
+    constexpr int BLOCK = 256;
+    constexpr int hidden = BLOCK * PER;
+    const int row = blockIdx.x;
+    if (win != nullptr && row >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
+    const int tid = threadIdx.x;
+    const T* xr = x + static_cast<long long>(plane_row) * hidden;
+    T* yr = y + static_cast<long long>(plane_row) * hidden;
+    float v[PER], w[PER];
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        v[k] = Elem<T>::to_f32(xr[tid + k * BLOCK]);
+        w[k] = Elem<T>::to_f32(weight[tid + k * BLOCK]);
+    }
+    float local = 0.f;
+#pragma unroll
+    for (int k = 0; k < PER; ++k) local += v[k] * v[k];
+    __shared__ float buf[BLOCK];
+    const float inv_rms = rsqrtf(block_reduce_sum_fast<BLOCK>(local, buf) / static_cast<float>(hidden) + eps);
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        float wv = w[k];
+        if constexpr (PLUS_ONE) wv += 1.f;
+        yr[tid + k * BLOCK] = Elem<T>::from_f32(v[k] * inv_rms * wv);
+    }
+}
+
 template <int PER> struct LaneRun { using type = uint4; };
 template <> struct LaneRun<4> { using type = uint2; };
 
