@@ -310,6 +310,85 @@ __device__ __forceinline__ void moe_topk_softmax_warp_body(
     }
 }
 
+// A row's top `K` (at most 16) of its `num_experts` (at most 32 `kPerLane`)
+// logits and their softmax over those `K`, a warp a row: the full-softmax
+// arm's weights (the top `K` of the softmax, renormalized, are the softmax
+// of the top `K` logits) without its block reductions, under the fire's live
+// window, each weight times `per_expert_scale` where it is given.
+template <class T, int kPerLane>
+__global__ void __launch_bounds__(32) moe_topk_softmax_lane(
+    const T* __restrict__ logits,
+    i32* __restrict__ topk_idx,
+    float* __restrict__ topk_w,
+    int num_experts,
+    int K,
+    const u32* __restrict__ win,
+    const T* __restrict__ per_expert_scale)
+{
+    const int n = blockIdx.x;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int row_at = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int lane = static_cast<int>(threadIdx.x);
+    const T* row = logits + static_cast<long long>(row_at) * num_experts;
+    float val[kPerLane];
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+        const int e = lane + i * 32;
+        val[i] = e < num_experts ? Logit<T>::to_f32(row[e]) : -flt_max();
+    }
+    float best_w[16];
+    int best_e[16];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        if (k >= K) break;
+        float bv = -flt_max();
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+            const int e = lane + i * 32;
+            if (val[i] > bv) {
+                bv = val[i];
+                bi = e;
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kPerLane; ++i)
+            if (lane + i * 32 == bi) val[i] = -flt_max();
+        best_w[k] = bv;
+        best_e[k] = bi < num_experts ? bi : -1;
+    }
+    if (lane == 0) {
+        i32* out_idx = topk_idx + static_cast<long long>(row_at) * K;
+        float* out_w = topk_w + static_cast<long long>(row_at) * K;
+        float w_sum = 0.f;
+        const float row_max = best_w[0];
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            if (k >= K) break;
+            best_w[k] = best_e[k] >= 0 ? expf(best_w[k] - row_max) : 0.f;
+            w_sum += best_w[k];
+        }
+        const float inv_w = 1.f / w_sum;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            if (k >= K) break;
+            float w = best_w[k] * inv_w;
+            if (per_expert_scale != nullptr && best_e[k] >= 0) w *= Logit<T>::to_f32(per_expert_scale[best_e[k]]);
+            out_idx[k] = best_e[k];
+            out_w[k] = w;
+        }
+    }
+}
+
 template <class T>
 __global__ void moe_topk_softmax_warp_x1(
     const T* __restrict__ logits, i32* __restrict__ topk_idx,

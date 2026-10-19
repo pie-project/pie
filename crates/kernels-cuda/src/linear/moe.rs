@@ -87,6 +87,19 @@ fn router_extents_upto(
     Ok((stated(op, experts)?, stated(op, top_k)?))
 }
 
+/// A router of at most 512 experts and a top-k of at most 16 a warp a row
+/// (`moe_topk_softmax_lane`): `None` past them.
+fn topk_lane(t: &str, experts: u32, top_k: u32, rows: u32) -> Option<Fire> {
+    if experts == 0 || experts > 512 || top_k == 0 || top_k > 16 {
+        return None;
+    }
+    let per = experts.div_ceil(32).next_power_of_two();
+    Some(
+        Fire::at(FILE, symbol(&format!("::pie::linear::moe_topk_softmax_lane<{t}, {per}>")))
+            .apply(Launch::grid([rows.max(1), 1, 1], [32, 1, 1])),
+    )
+}
+
 pub fn topk_softmax(
     ctx: &Ctx,
     logits: Tensor,
@@ -99,6 +112,13 @@ pub fn topk_softmax(
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     ranked_planes(OP, logits, top_k, routes, weights);
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
+    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows) {
+        return ctx.fire(
+            OP,
+            fire,
+            &[logits.arg(), routes.arg(), weights.arg(), e.arg(), k.arg(), ctx.stage(), ArgValue::ABSENT],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(
@@ -142,6 +162,13 @@ pub fn topk_softmax_scaled(
     );
     ranked_planes(OP, logits, top_k, routes, weights);
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
+    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows) {
+        return ctx.fire(
+            OP,
+            fire,
+            &[logits.arg(), routes.arg(), weights.arg(), e.arg(), k.arg(), ctx.stage(), scale.arg()],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(
