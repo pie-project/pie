@@ -300,6 +300,7 @@ pub struct Module {
     #[cfg(feature = "device")]
     function: crate::device::dr::CUfunction,
     block_threads: u32,
+    dynamic_smem: u32,
     entry_name: String,
 }
 
@@ -352,10 +353,19 @@ impl Module {
                     code: code as i32,
                 });
             }
+            let dynamic_smem = match dynamic_smem(module, function) {
+                Ok(bytes) => bytes,
+                Err(fault) => {
+                    // SAFETY: `module` is loaded and no function of it is in flight.
+                    unsafe { dr::cuModuleUnload(module) };
+                    return Err(fault);
+                }
+            };
             Ok(Module {
                 module,
                 function,
                 block_threads: launch_width(function),
+                dynamic_smem,
                 entry_name: entry_name.to_string(),
             })
         }
@@ -381,6 +391,47 @@ impl Module {
     pub fn entry_name(&self) -> &str {
         &self.entry_name
     }
+
+    /// The dynamic shared memory a launch gives the kernel: what its
+    /// `m1_dynamic_smem` export asks (a sampler's cut state), else none.
+    #[must_use]
+    pub const fn dynamic_smem(&self) -> u32 {
+        self.dynamic_smem
+    }
+}
+
+/// The bytes `module`'s `m1_dynamic_smem` export asks, with `function`
+/// opted into them; 0 for a module without the export.
+#[cfg(feature = "device")]
+fn dynamic_smem(module: crate::device::dr::CUmodule, function: crate::device::dr::CUfunction) -> Result<u32> {
+    use crate::device::dr;
+
+    let mut at: dr::CUdeviceptr = 0;
+    let mut size = 0usize;
+    // SAFETY: `module` is loaded; the name is a NUL-terminated literal and
+    // the out-parameters are live.
+    let code = unsafe { dr::cuModuleGetGlobal_v2(&raw mut at, &raw mut size, module, c"m1_dynamic_smem".as_ptr()) };
+    if code != dr::CUresult::CUDA_SUCCESS || size != 4 {
+        return Ok(0);
+    }
+    let mut bytes = 0u32;
+    // SAFETY: `at` is the export's 4 device bytes and `bytes` 4 host ones.
+    let code = unsafe { dr::cuMemcpyDtoH_v2((&raw mut bytes).cast(), at, 4) };
+    if code != dr::CUresult::CUDA_SUCCESS {
+        return Err(Fault::Device { call: "cuMemcpyDtoH", code: code as i32 });
+    }
+    // SAFETY: `function` belongs to `module`, which is loaded.
+    let code = unsafe {
+        dr::cuFuncSetAttribute(
+            function,
+            dr::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            bytes as i32,
+        )
+    };
+    if code != dr::CUresult::CUDA_SUCCESS {
+        return Err(Fault::Device { call: "cuFuncSetAttribute", code: code as i32 });
+    }
+    Ok(bytes)
 }
 
 impl Drop for Module {

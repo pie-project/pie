@@ -116,11 +116,26 @@ __device__ __forceinline__ m1_u32 m1_fast_flags(const M1Fast& f, m1_u32 b) {
   return (f.flags[b >> 2] >> ((b & 3u) * 8u)) & 0xFFu;
 }
 
+// The block's fast-cut state and its cut's, together past the 48 KiB a
+// block holds statically: they live in the dynamic shared memory the
+// launcher opts the kernel into, `m1_dynamic_smem` bytes of it.
+#define M1_CUT_STATE_AT ((sizeof(M1Fast) + 15u) & ~(size_t)15u)
+extern "C" __device__ const m1_u32 m1_dynamic_smem =
+    (m1_u32)(M1_CUT_STATE_AT + sizeof(M1CutShared));
+
+__device__ __forceinline__ m1_u8* m1_dynamic_base() {
+  extern __shared__ __align__(16) m1_u8 m1_dynamic[];
+  return m1_dynamic;
+}
+
 // The block's fast-cut state (one, whoever fills it: the cut's own first
 // pass, or the sampler's probability pass).
 __device__ __forceinline__ M1Fast& m1_fast_state() {
-  __shared__ M1Fast f;
-  return f;
+  return *reinterpret_cast<M1Fast*>(m1_dynamic_base());
+}
+
+__device__ __forceinline__ M1CutShared& m1_cut_state() {
+  return *reinterpret_cast<M1CutShared*>(m1_dynamic_base() + M1_CUT_STATE_AT);
 }
 
 // The buckets over keys [least, most]: each 2^stretch keys wide.
@@ -1331,7 +1346,7 @@ __device__ void ptir_lane_sample(
     m1_u8* token,
     m1_u32 rows,
     m1_u32 len) {
-  __shared__ M1CutShared cut;
+  M1CutShared& cut = m1_cut_state();
   float* tree_work = cut.before;
   __shared__ M1Range block_range[32];
   __shared__ M1ArgmaxCandidate block_best[32];
@@ -1508,7 +1523,7 @@ __device__ void ptir_lane_cut(
     const m1_u8* threshold,
     const M1ValueDesc threshold_desc,
     m1_u8* output) {
-  __shared__ M1CutShared cut;
+  M1CutShared& cut = m1_cut_state();
   const m1_u32 len = input_desc.last;
   const m1_u32 rows = input_desc.rows;
   const m1_u32 dtype = input_desc.dtype;
