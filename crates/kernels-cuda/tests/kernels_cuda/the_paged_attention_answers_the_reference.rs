@@ -256,6 +256,7 @@ fn the_paged_attention_answers_the_reference() {
         ([32, 4, 128], chunks, None, rec, pre, tuned(|t| t.prefill_tc5 = true)),
         ([64, 8, 256], long, w100, sunk, pre, tuned(|t| (t.prefill_tc5, t.prefill_wide_sliding) = (true, true))),
         ([128, 16, 64], long, Some(300), sunk, pre, tuned(|t| t.prefill_tc5 = true)),
+        ([128, 16, 64], long, None, own, pre, tuned(|t| t.prefill_tc5 = true)),
     ];
     for (heads, reqs, window, flags, lanes, tuning) in cases {
         check(heads, reqs, window, flags, lanes, tuning);

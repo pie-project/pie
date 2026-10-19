@@ -259,9 +259,11 @@ pub(crate) fn try_prefill(
         // fire 685 -> 531 us, GPT-OSS's 475 -> 447). A long window's (Muse's
         // 2048) are the softmax's: its registers go further without.
         let io = (0..256).contains(&window_left) && bound * kv_heads >= 4 * sms;
-        let (grid, threads) = match io {
-            true => ([sms, 1, 1], 320),
-            false => ([bound, kv_heads, 1], if pair { 320 } else { 192 }),
+        // A pair's block walks items too, an SM a block.
+        let (grid, threads) = match (io, pair) {
+            (true, _) => ([sms, 1, 1], 320),
+            (false, true) => ([sms.min(bound * kv_heads), 1, 1], 320),
+            (false, false) => ([bound, kv_heads, 1], 192),
         };
         ctx.fire(
             op,
