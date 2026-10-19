@@ -525,16 +525,25 @@ __global__ void __launch_bounds__(32 * kRankedRows) moe_topk_ranked(
 
     float orig[kPer];
     unsigned key[kPer];
+    // Every logit and bias out before any is scored: a lane's loads paid
+    // once, not once an expert.
+    float raw[kPer], bias[kPer];
+#pragma unroll
+    for (int m = 0; m < kPer; ++m) {
+        const int e = tid + 32 * m;
+        raw[m] = e < E ? Elem<T>::to_f32(row[e]) : 0.f;
+        bias[m] = e < E && correction_bias != nullptr ? correction_bias[e] : 0.f;
+    }
 #pragma unroll
     for (int m = 0; m < kPer; ++m) {
         const int e = tid + 32 * m;
         key[m] = 0u;
         orig[m] = 0.f;
         if (e < E) {
-            const float x = Elem<T>::to_f32(row[e]);
+            const float x = raw[m];
             const float sc = kSoftplus ? sqrt_softplus(x) : 1.f / (1.f + expf(-x));
             orig[m] = sc;
-            const float v = correction_bias != nullptr ? sc + correction_bias[e] : sc;
+            const float v = correction_bias != nullptr ? sc + bias[m] : sc;
             if (v > -flt_max()) {
                 const unsigned u = __float_as_uint(v);
                 key[m] = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
