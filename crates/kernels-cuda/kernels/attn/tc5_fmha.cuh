@@ -508,7 +508,7 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
         const u32 idesc_s = idesc_dense(kF16Bf16, kF16Bf16, 128, kBKV);
         const u32 idesc_o = idesc_dense(kF16Bf16, kF16Bf16, 128, DV) | (1u << 16);
         int g = 0, tile = 0, keyed = 0;
-        // Lane 0 issues a tile's products.
+        // The whole warp walks a tile's products; the elected lane issues.
         auto issue = [&](const Work& w) {
             int jb = 0;
             const int nt = tiles_of(w, jb);
@@ -517,7 +517,8 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
             // The last tile's O out before this one's first product lands.
             if (nt == 0) {
                 if (IO && tile > 0) bar_wait(o_free, (tile - 1) & 1);
-                if (IO) tc_commit(q_free);
+                __syncwarp();
+                if (IO && elect_one()) tc_commit(q_free);
                 ++tile;
                 return;
             }
@@ -534,14 +535,18 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                     bar_wait(&p_full[sb], (gi >> 1) & 1);
                     tc_fence_after();
                     const u32 pa = tmem + kColS + sb * kBKV;
+                    __syncwarp();
+                    if (elect_one()) {
 #pragma unroll
-                    for (u32 s = 0; s < kBKV / 16; ++s) {
-                        const u64 b = sdesc_sw128_mn(vb + s * 2048, kAtomKV);
-                        mma_f16_ts(tmem + kColO + x * DV, pa + s * 8, b, idesc_o, i > 0 || s > 0);
+                        for (u32 s = 0; s < kBKV / 16; ++s) {
+                            const u64 b = sdesc_sw128_mn(vb + s * 2048, kAtomKV);
+                            mma_f16_ts(tmem + kColO + x * DV, pa + s * 8, b, idesc_o,
+                                       i > 0 || s > 0);
+                        }
+                        tc_commit(&pv_done[sb]);
+                        if (x == kT - 1) tc_commit(&v_empty[st]);
                     }
-                    tc_commit(&pv_done[sb]);
                 }
-                tc_commit(&v_empty[st]);
             };
             for (int j = 0; j < nt; ++j) {
                 const int gj = g + j;
@@ -555,16 +560,21 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
                     // product has read it. Only it can have landed yet.
                     if (gj >= 2) bar_wait(&pv_done[sb], ((gj - 2) >> 1) & 1);
                     tc_fence_after();
+                    __syncwarp();
+                    if (elect_one()) {
 #pragma unroll
-                    for (u32 s = 0; s < D / 16; ++s) {
-                        const u64 b = sdesc_sw128(kb + (s / 4) * kAtomKV) + 2 * (s % 4);
-                        mma_f16_ts(tmem + kColS + sb * kBKV, tmem + kColQ + x * (D / 2) + s * 8, b,
-                                   idesc_s, s > 0);
+                        for (u32 s = 0; s < D / 16; ++s) {
+                            const u64 b = sdesc_sw128(kb + (s / 4) * kAtomKV) + 2 * (s % 4);
+                            mma_f16_ts(tmem + kColS + sb * kBKV,
+                                       tmem + kColQ + x * (D / 2) + s * 8, b, idesc_s, s > 0);
+                        }
+                        tc_commit(&s_full[sb]);
+                        if (x == kT - 1) {
+                            tc_commit(&k_empty[st]);
+                            if (IO && j == nt - 1) tc_commit(q_free);
+                        }
                     }
-                    tc_commit(&s_full[sb]);
                 }
-                tc_commit(&k_empty[st]);
-                if (IO && j == nt - 1) tc_commit(q_free);
                 if (j > 0) pv(j - 1);
             }
             pv(nt - 1);
@@ -577,9 +587,9 @@ __global__ __launch_bounds__(IO || PAIR ? 320 : 192, 1) void tc5_fmha_prefill(
         if (IO) {
             Work w = w0;
             for (int t = t0, more = 1; more; t += step, more = next_work(t, w)) {
-                if (lane == 0) issue(w);
+                issue(w);
             }
-        } else if (lane == 0) {
+        } else {
             issue(w0);
         }
     } else if (warp < 4 || (PAIR && warp >= 6)) {
