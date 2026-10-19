@@ -94,6 +94,9 @@ struct LaneState {
     frames: VecDeque<PendingFrame>,
     group: Option<u32>,
     fired_this_boundary: bool,
+    /// Its last sealed frame carried a prompt: its next pass is built on the
+    /// host from what that prompt answers, so only decodes wait for it.
+    prompting: bool,
 }
 
 #[derive(Debug)]
@@ -234,6 +237,9 @@ pub(super) struct FramePolicy {
     pending_binds: BTreeMap<ProcessId, usize>,
     cohorts: BTreeMap<(ProcessId, u32), Cohort>,
     staged: BTreeSet<ProcessId>,
+    /// The seal under way takes prompts alone: the decodes wait out the
+    /// lanes coming off a prompt, which no prompt waits for.
+    prompts_only: bool,
     pending_slots: u64,
     joins_in_flight: BTreeSet<ProcessId>,
     admission_queue: VecDeque<ProcessId>,
@@ -283,6 +289,7 @@ impl FramePolicy {
             pending_binds: BTreeMap::new(),
             cohorts: BTreeMap::new(),
             staged: BTreeSet::new(),
+            prompts_only: false,
             pending_slots: 0,
             joins_in_flight: BTreeSet::new(),
             admission_queue: VecDeque::new(),
@@ -449,6 +456,7 @@ impl FramePolicy {
             frames: VecDeque::new(),
             group: None,
             fired_this_boundary: true,
+            prompting: false,
         });
         if lane.owner.is_none() {
             lane.owner = owner;
@@ -774,6 +782,12 @@ impl FramePolicy {
         let k = self.k;
         let max_wave_rows = self.max_wave_rows;
         let max_wave_tokens = self.max_wave_tokens;
+        // One frame of prompts on the card at a time: prompts arriving behind
+        // it bind together into the next, while decodes keep running ahead.
+        let prompt_in_flight = self
+            .in_flight_lanes
+            .iter()
+            .any(|lane| self.lanes.get(lane).is_some_and(|state| state.prompting));
         loop {
             let mut fresh: Vec<ProcessId> = Vec::new();
             let mut continuing: Vec<ProcessId> = Vec::new();
@@ -895,7 +909,22 @@ impl FramePolicy {
                 if short {
                     continue;
                 }
+                let prompt = unit_fires
+                    .iter()
+                    .flat_map(|(_, live)| live)
+                    .any(|fire| fire.tokens > fire.rows);
+                let grouped = self
+                    .lanes
+                    .get(&unit[0])
+                    .and_then(LaneState::group_key)
+                    .is_some();
+                if (self.prompts_only && (!prompt || grouped))
+                    || (prompt && !grouped && prompt_in_flight)
+                {
+                    continue;
+                }
                 for (lane_id, live) in unit_fires {
+                    let prompting = live.iter().any(|fire| fire.tokens > fire.rows);
                     for fire in &live {
                         wave_rows[fire.wave] += fire.rows;
                         wave_tokens[fire.wave] += fire.tokens;
@@ -915,6 +944,7 @@ impl FramePolicy {
                         }
                     }
                     lane.served = true;
+                    lane.prompting = prompting;
                     lane.frames.pop_front();
                 }
             }
@@ -946,7 +976,7 @@ impl FramePolicy {
                     self.executing_now
                 ));
             }
-            if !mid_boundary {
+            if !mid_boundary && !self.prompts_only {
                 self.open_boundary();
             }
             for member in &members {
@@ -1156,6 +1186,7 @@ ready_age_newest={}us",
             if !doomed.is_empty() {
                 return FramePlan::Terminate(doomed);
             }
+            let mut missing_decoders = 0usize;
             let mut missing = 0;
             let mut expired: Vec<ProcessId> = Vec::new();
             let leash = self.submit_deadline;
@@ -1210,6 +1241,7 @@ ready_age_newest={}us",
                 }
                 if blocking {
                     missing += 1;
+                    missing_decoders += usize::from(!lane.prompting);
                 }
             }
             if !expired.is_empty() {
@@ -1231,6 +1263,14 @@ ready_age_newest={}us",
                     self.lanes.values().filter(|lane| lane.awaited).count(),
                     self.lanes.len()
                 ));
+            }
+            if missing > 0 && missing_decoders == 0 {
+                self.prompts_only = true;
+                let sealed = self.seal();
+                self.prompts_only = false;
+                if let Some(FramePlan::Dispatch(_)) = sealed {
+                    continue;
+                }
             }
             if missing > 0 {
                 if executing {
@@ -1361,6 +1401,7 @@ mod tests {
         a_lane_parked_mid_frame_seals_what_it_submitted();
         truncated_frame_seals_with_submitted_fires_only();
         graceful_close_releases_the_wait();
+        no_prompt_waits_for_a_lane_off_a_prompt();
         consumed_release_leaves_no_phantom_hold_for_bystander();
         a_burst_of_cut_prefills_seals_its_pieces_frame_by_frame();
     }
@@ -1820,6 +1861,30 @@ mod tests {
         policy.on_lane_leave(a, None, false);
         let next = plan(&mut policy, &queued, Instant::now());
         assert_eq!(fires(&next), vec![92]);
+    }
+
+    fn no_prompt_waits_for_a_lane_off_a_prompt() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let (a, b, c) = (pid(), pid(), pid());
+        policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 90, 512, 1, None);
+        policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 91, 1, 1, None);
+        let queued: QueuedFireIds = [90, 91].into_iter().collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())).len(), 2);
+
+        policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 92, 1, 1, None);
+        policy.on_fire_enqueued(stamp(c, 0, 0, 1), Some(c), 93, 256, 1, None);
+        let queued: QueuedFireIds = [92, 93].into_iter().collect();
+        assert_eq!(
+            policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now()),
+            FramePlan::Park,
+            "c's prompt binds behind a's on the card, b's decode waits to batch with a's"
+        );
+        policy.on_frame_retired([a, b]);
+        assert_eq!(
+            fires(&plan(&mut policy, &queued, Instant::now())),
+            vec![93],
+            "c's prompt seals while a builds its next pass"
+        );
     }
 
     fn consumed_release_leaves_no_phantom_hold_for_bystander() {

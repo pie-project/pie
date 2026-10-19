@@ -32,6 +32,8 @@ pub mod run;
 pub mod scores;
 pub mod serve;
 pub mod settle;
+#[cfg(feature = "rocm")]
+pub mod split_arm;
 pub mod staged_h2d;
 pub mod store;
 pub mod tune;

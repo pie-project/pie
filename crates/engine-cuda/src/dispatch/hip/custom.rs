@@ -64,16 +64,18 @@ impl DispatchFused for Run<'_> {
 impl Run<'_> {
     /// A routed swiglu MLP over dense bf16 banks (selects through the plain
     /// banks, a swiglu or its clamp, the weighted sum) as one
+    /// `linear::moe::decode_mlp` (which may fold `gate_add` in too) or
     /// `linear::moe::mlp_swiglu`, which keeps the routes in expert order
-    /// across both matmuls where that measured faster. Whether it took the
-    /// legs; the caller runs them otherwise.
+    /// across both matmuls. `None` where it left
+    /// the legs to the caller, else whether it folded the gate add.
     fn moe_experts_ordered(
         &mut self,
         select: &poem_ir::Linear,
         glu: &poem_ir::Linear,
         down: &poem_ir::Linear,
         sum: &poem_ir::Linear,
-    ) -> Result<bool, kernels_cuda::Error> {
+        gate_add: Option<&poem_ir::Linear>,
+    ) -> Result<Option<bool>, kernels_cuda::Error> {
         use poem_ir::Linear;
         let (
             Linear::MoeMatmulSelect {
@@ -95,7 +97,7 @@ impl Run<'_> {
             },
         ) = (select, down, sum)
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let (intermediate, limit, glu_in, glu_out) = match glu {
             Linear::MlpSwiglu {
@@ -109,14 +111,14 @@ impl Run<'_> {
                 limit,
                 y,
             } => (*intermediate, Some(*limit), *packed, *y),
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
         if routes != down_routes || glu_in != *packed || glu_out != *h || summed != routed {
-            return Ok(false);
+            return Ok(None);
         }
         // Banks in the matrix core's order run as their legs.
         if self.ordered_bank(*gate_up).is_some() || self.ordered_bank(*down_bank).is_some() {
-            return Ok(false);
+            return Ok(None);
         }
         let (gate_up, gate_up_experts) = self.expert_bank(*gate_up);
         let (down, down_experts) = self.expert_bank(*down_bank);
@@ -135,8 +137,24 @@ impl Run<'_> {
             h: self.tensor(*h),
             routed: self.tensor(*routed),
         };
+        let shared = match gate_add {
+            Some(&Linear::MoeSigmoidGateAdd {
+                routed,
+                shared,
+                gate,
+                y: out,
+            }) if routed == *y => Some(kernels_cuda::linear::moe::SharedGate {
+                shared: self.tensor(shared),
+                gate: self.tensor(gate),
+                y: self.tensor(out),
+            }),
+            _ => None,
+        };
+        if kernels_cuda::linear::moe::decode_mlp(self.ctx(), &p, shared, &mut self.tensor(*y))? {
+            return Ok(Some(shared.is_some()));
+        }
         kernels_cuda::linear::moe::mlp_swiglu(self.ctx(), &p, &mut self.tensor(*y))?;
-        Ok(true)
+        Ok(Some(false))
     }
 
     /// A fused op as the primitives it replaced, each over the values the
@@ -207,11 +225,13 @@ impl Run<'_> {
                 sum,
                 gate_add,
             } => {
-                if norm.is_some()
-                    || !self
-                        .moe_experts_ordered(select, glu, down, sum)
+                let ran = if norm.is_some() {
+                    None
+                } else {
+                    self.moe_experts_ordered(select, glu, down, sum, gate_add.as_deref())
                         .map_err(crate::error::kernel)?
-                {
+                };
+                if ran.is_none() {
                     for leg in [select, glu, down] {
                         DispatchLinear::dispatch(self, leg)?;
                     }
@@ -221,8 +241,8 @@ impl Run<'_> {
                     DispatchLinear::dispatch(self, sum)?;
                 }
                 match gate_add {
-                    Some(gate_add) => DispatchLinear::dispatch(self, gate_add),
-                    None => Ok(()),
+                    Some(gate_add) if ran != Some(true) => DispatchLinear::dispatch(self, gate_add),
+                    _ => Ok(()),
                 }
             }
             Fused::LseSink {
