@@ -1657,6 +1657,7 @@ impl Pools {
             return Ok(());
         };
         let mut base = 0u64;
+        let mut spans: Vec<(u64, u64, usize)> = Vec::new();
         let spaces = [
             (self.paged_planes(), &paged[..], have[0]),
             (self.windowed_planes(), windowed, have[1]),
@@ -1679,12 +1680,12 @@ impl Pools {
                     } else {
                         (on_device, on_host)
                     };
-                    crate::device::copy_any(stream, dst, src, usize::try_from(bytes).unwrap_or(0))?;
+                    spans.push((dst, src, usize::try_from(bytes).unwrap_or(0)));
                 }
                 base += have * page_bytes;
             }
         }
-        Ok(())
+        crate::device::copy_batch(stream, to_host, &spans)
     }
 
     /// How a host kv slot lays out its pages, rank by rank: each paged plane

@@ -936,6 +936,80 @@ pub fn copy_d2d(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize
     }
 }
 
+/// Copies every `(dst, src, bytes)` span between the device and pinned host
+/// memory in one call: a tier move of fragmented pages is thousands of spans
+/// (a page a plane), and a call each kept the engine's thread ~4 us a span.
+pub fn copy_batch(
+    stream: *mut core::ffi::c_void,
+    to_host: bool,
+    spans: &[(u64, u64, usize)],
+) -> Result<()> {
+    let live: Vec<(u64, u64, usize)> = spans.iter().copied().filter(|s| s.2 > 0).collect();
+    #[cfg(all(feature = "cuda", not(feature = "rocm")))]
+    if live.len() > 1 {
+        use crate::device::rt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static REFUSED: AtomicBool = AtomicBool::new(false);
+        if !REFUSED.load(Ordering::Relaxed) {
+            let dsts: Vec<*mut core::ffi::c_void> =
+                live.iter().map(|s| s.0 as *mut core::ffi::c_void).collect();
+            let srcs: Vec<*const core::ffi::c_void> = live
+                .iter()
+                .map(|s| s.1 as *const core::ffi::c_void)
+                .collect();
+            let sizes: Vec<usize> = live.iter().map(|s| s.2).collect();
+            let mut device: i32 = 0;
+            // SAFETY: plain query.
+            let _ = unsafe { rt::cudaGetDevice(&raw mut device) };
+            let host = rt::cudaMemLocation {
+                type_: rt::cudaMemLocationType::cudaMemLocationTypeHost,
+                id: 0,
+            };
+            let on_device = rt::cudaMemLocation {
+                type_: rt::cudaMemLocationType::cudaMemLocationTypeDevice,
+                id: device,
+            };
+            let (src_hint, dst_hint) = if to_host {
+                (on_device, host)
+            } else {
+                (host, on_device)
+            };
+            let mut attrs = [rt::cudaMemcpyAttributes {
+                srcAccessOrder: rt::cudaMemcpySrcAccessOrder::cudaMemcpySrcAccessOrderStream,
+                srcLocHint: src_hint,
+                dstLocHint: dst_hint,
+                flags: 0,
+            }];
+            let mut attrs_at = [0usize];
+            // SAFETY: the spans are the caller's: device spans it resolved
+            // against its arenas, host spans inside its pinned tier.
+            let status = unsafe {
+                rt::cudaMemcpyBatchAsync(
+                    dsts.as_ptr(),
+                    srcs.as_ptr(),
+                    sizes.as_ptr(),
+                    live.len(),
+                    attrs.as_mut_ptr(),
+                    attrs_at.as_mut_ptr(),
+                    1,
+                    stream.cast(),
+                )
+            };
+            if status == rt::cudaError::cudaSuccess {
+                return Ok(());
+            }
+            // SAFETY: clearing the sticky error of the refused batch.
+            let _ = unsafe { rt::cudaGetLastError() };
+            REFUSED.store(true, Ordering::Relaxed);
+        }
+    }
+    let _ = to_host;
+    for (dst, src, bytes) in live {
+        copy_any(stream, dst, src, bytes)?;
+    }
+    Ok(())
+}
+
 pub fn copy_any(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize) -> Result<()> {
     if bytes == 0 {
         return Ok(());
