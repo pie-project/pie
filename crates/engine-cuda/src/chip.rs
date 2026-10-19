@@ -592,6 +592,7 @@ mod tests {
                     kernels_cuda::tuning::Tuning {
                         pdl: false,
                         ssm_gdn_fused_scan: false,
+                        ssm_kda_chunked: false,
                         ssm_gdn_out_bf16: false,
                         ssm_conv_vec4: false,
                         rows_vec: false,

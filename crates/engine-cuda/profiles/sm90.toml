@@ -11,6 +11,8 @@ assumes = { cc = 90 }
 pdl = true
 # Gated delta: the two-launch chunked scan and a bf16 output.
 ssm.gdn_fused_scan = true
+# KDA (gated-delta) prefill on the tensor cores (GLM-5.3-Flash, Kimi-K3).
+ssm.kda_chunked = true
 ssm.gdn_out_bf16 = true
 ssm.conv_vec4 = true
 # Row kernels 16 bytes a lane; hyper-connection kernels tiled and on mma.sync.
