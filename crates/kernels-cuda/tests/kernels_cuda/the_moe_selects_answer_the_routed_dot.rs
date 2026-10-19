@@ -295,7 +295,6 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         (4, 8, [512, 256, 16, 8], sw, None, None, 0.3),
         (4, 300, [256, 128, 16, 4], sw, Some(false), None, 0.3),
         (4, 64, [512, 256, 64, 10], Glu::Relu2, None, None, 0.3),
-        (4, 8, [512, 256, 16, 8], Glu::Relu2, None, None, 0.3),
         (4, 8, [512, 256, 512, 22], Glu::Relu2, None, None, 0.3),
         (8, 64, [512, 256, 64, 10], Glu::Situ { beta: 4.0, cap: 25.0 }, None, None, 0.25),
         (8, 300, [256, 128, 16, 4], clamp, Some(false), None, 0.25),

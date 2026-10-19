@@ -82,10 +82,6 @@ def bench_args(args: argparse.Namespace) -> argparse.Namespace:
         argv += ["--precision", args.precision]
     if getattr(args, "kv", None):
         argv += ["--kv", args.kv]
-    if getattr(args, "frame_dispatch_depth", None):
-        argv += ["--frame-dispatch-depth", str(args.frame_dispatch_depth)]
-    if getattr(args, "device_weight_budget", None):
-        argv += ["--device-weight-budget", args.device_weight_budget]
     return pie_bench.build_parser().parse_args(argv)
 
 
@@ -199,10 +195,6 @@ def main() -> None:
     ap.add_argument("--engine-option", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--precision", default=None, help="[model] precision, e.g. bf16+nvfp4a4")
     ap.add_argument("--kv", default=None, help="[model] kv, e.g. e4m3 (DeepSeek-V4's fp8 rows)")
-    ap.add_argument("--frame-dispatch-depth", type=int, default=None,
-                    help="[runtime] frame_dispatch_depth: frames a lane keeps posted (its state slots)")
-    ap.add_argument("--device-weight-budget", default=None,
-                    help="[model] device_weight_budget, e.g. 80GiB: what of the weights stays on the device")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -213,8 +205,7 @@ def main() -> None:
                             capture_output=True, text=True).stdout.strip()
     res.update(mode=args.mode, model=args.model, hf=args.hf, argv=shlex.join(sys.argv), pie_commit=commit,
                wall_s=time.time() - t0, peak_gpu_mem_mib=mem.peak,
-               contended=bool(mem.foreign), foreign_pids=sorted(mem.foreign), foreign_samples=mem.foreign_samples,
-               foreign_pids_at_load=sorted(mem.foreign_at_load))
+               contended=bool(mem.foreign), foreign_pids=sorted(mem.foreign))
     path = os.path.join(args.out, f"{args.mode}.json")
     with open(path, "w") as f:
         json.dump(res, f, indent=2)

@@ -460,8 +460,8 @@ __device__ __forceinline__ void store_bf16_run(bf16* __restrict__ at, const floa
 // word) a head takes part of the warp and the warp several heads at once,
 // its sums adding in another order than the warp kernel's. With STAGE
 // (sm_90 on) the whole packed row lands in shared memory by one bulk copy
-// and the rest leaves by another: a head's loads no longer wait a round
-// trip each.
+// and the rest leaves by another, so a head's loads wait no round trip
+// each.
 template <int HEAD_DIM, int E = HEAD_DIM / 32, class KV = bf16, bool STAGE = false>
 __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     const bf16* __restrict__ packed,

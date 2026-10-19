@@ -943,15 +943,9 @@ __global__ void route_gather_vec8(
     *dst = *reinterpret_cast<const uint4*>(grouped + static_cast<long long>(o) * n + c);
 }
 
-// A word's two bf16 as f32, and two f32 rounded into one word (`lo` low).
+// A word's two bf16 as f32 (`lo` low).
 __device__ __forceinline__ float bf16x2_lo(u32 w) { return __uint_as_float(w << 16); }
 __device__ __forceinline__ float bf16x2_hi(u32 w) { return __uint_as_float(w & 0xffff0000u); }
-__device__ __forceinline__ u32 bf16x2_round(float lo, float hi)
-{
-    u32 w;
-    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(w) : "f"(hi), "f"(lo));
-    return w;
-}
 
 // Two bf16 products rounded once (an fma adding -0, which keeps a zero's
 // sign).
@@ -1068,7 +1062,7 @@ __global__ void __launch_bounds__(kNorm ? 512 : 1024, kNorm ? 4 : 1) route_weigh
                 const u32* r = reinterpret_cast<const u32*>(&rows[a]);
 #pragma unroll
                 for (int w = 0; w < 4; ++w) {
-                    const u32 o = bf16x2_round(bf16x2_lo(r[w]) * v, bf16x2_hi(r[w]) * v);
+                    const u32 o = pack_bf16x2(bf16x2_lo(r[w]) * v, bf16x2_hi(r[w]) * v);
                     acc[2 * w] += wr * bf16x2_lo(o);
                     acc[2 * w + 1] += wr * bf16x2_hi(o);
                 }

@@ -596,9 +596,9 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
 
 
 # The fixed points every engine is held to (`pie_baseline.py`,
-# `profile_points.py`): one prefill batch, three decode
-# batches timed at 256 outputs and at 1 so a step is (t256 - t1) / 255, and
-# one serving burst offered all at once.
+# `profile_points.py`): one prefill batch, three decode batches timed at 256
+# outputs and at 1 so a step is (t256 - t1) / 255, and one serving burst
+# offered all at once.
 FIXED_PREFILL = dict(batch=32, input_len=4096, output_len=1)
 FIXED_DECODE_BATCHES = (1, 8, 64)
 FIXED_DECODE_INPUT, FIXED_DECODE_OUTPUT = 512, 256
@@ -658,12 +658,10 @@ def _descends_from(pid: int, root: int) -> bool:
 
 class MemSampler:
     """nvidia-smi memory.used and utilization every `period` seconds, into
-    `path`, with every compute process's pid:MiB, so a neighbour sharing the
-    device during a measurement shows. A compute process that does not
-    descend from this one is a neighbour: `foreign` collects the pids seen
-    once `measuring()` was called (a neighbour during the weight load slows
-    the load, not a measured point), `foreign_at_load` the ones before, and a
-    run with any `foreign` is contended."""
+    `path`, with every compute process's pid:MiB. A compute process that does
+    not descend from this one is a neighbour: `foreign` collects those seen
+    once `measuring()` was called (one during the weight load slows the load,
+    not a measured point), and a run with any is contended."""
 
     def __init__(self, path: str, period: float = 1.0) -> None:
         import threading
@@ -671,9 +669,6 @@ class MemSampler:
         self.path, self.period = path, period
         self.peak = 0
         self.foreign: set[int] = set()
-        self.foreign_at_load: set[int] = set()
-        # Samples, about a second each, a neighbour was seen while measuring.
-        self.foreign_samples = 0
         self._measuring = threading.Event()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -689,12 +684,8 @@ class MemSampler:
                         ["nvidia-smi", "--query-gpu=memory.used,utilization.gpu", "--format=csv,noheader,nounits"],
                         capture_output=True, text=True, timeout=10).stdout.split(",")[:2]
                     _, apps = _gpu_compute_apps()
-                    neighbours = {pid for pid in apps if not _descends_from(pid, me)}
                     if self._measuring.is_set():
-                        self.foreign |= neighbours
-                        self.foreign_samples += bool(neighbours)
-                    else:
-                        self.foreign_at_load |= neighbours
+                        self.foreign |= {pid for pid in apps if not _descends_from(pid, me)}
                     used = int(used)
                     self.peak = max(self.peak, used)
                     procs = " ".join(f"{pid}:{mib}" for pid, mib in apps.items())

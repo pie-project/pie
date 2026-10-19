@@ -297,8 +297,7 @@ impl Plan {
         };
         let pair = time(256, 2, 1.8) <= time(128, 1, 1.0);
         // Over 1024 K or less the epilogue outruns the products: lone CTAs'
-        // 128 x 256 tiles drain twice the stores at once (GLM's kv_b,
-        // 16384 x 28672 x 512: 446 -> 348 us).
+        // 128 x 256 tiles drain twice the stores at once.
         let lone = pair && k <= 1024;
         Self {
             swap: false,

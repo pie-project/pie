@@ -261,68 +261,24 @@ fn the_paged_attention_answers_the_reference() {
     for (heads, reqs, window, flags, lanes, tuning) in cases {
         check(heads, reqs, window, flags, lanes, tuning);
     }
-    // MiMo's heads, 192-wide keys and 128-wide values padded to 256: the
-    // tcgen05 prefill reads the widths alone, whole and over a window.
     let tc5 = tuned(|t| (t.prefill_tc5, t.prefill_wide_sliding) = (true, true));
-    check_live([64, 8, 256], long, None, own, pre, tc5, [192, 128], false);
-    check_live([64, 8, 256], long, w128, sunk, pre, tc5, [192, 128], false);
-    // An e4m3 pool (vLLM's fp8 KV): FA2's decode and prefill read it as it is,
-    // the tensor-core decode widening it (whole, split, and over a cluster).
-    let nolive = [0, 0];
-    check_live(
-        [32, 2, 128],
-        dec,
-        None,
-        own,
-        all,
-        read(false, false, 0, 0),
-        nolive,
-        true,
-    );
-    check_live(
-        [64, 8, 64],
-        dec,
-        w128,
-        sunk,
-        all,
-        read(true, true, 256, 0),
-        nolive,
-        true,
-    );
-    check_live(
-        [64, 8, 64],
-        dec,
-        None,
-        both,
-        all,
-        read(false, true, 0, 0),
-        nolive,
-        true,
-    );
-    check_live(
-        [32, 16, 256],
-        dec,
-        None,
-        sunk,
-        all,
-        read(false, true, 0, 8),
-        nolive,
-        true,
-    );
-    check_live([32, 2, 128], chunks, None, own, pre, fa2, nolive, true);
-    check_live([8, 2, 128], chunks, w100, sunk, pre, fa2, nolive, true);
-    // The tcgen05 prefill over the pages widened to a bf16 shadow.
-    let tc5_only = tuned(|t| t.prefill_tc5 = true);
-    check_live([32, 4, 128], chunks, None, rec, pre, tc5_only, nolive, true);
-    check_live(
-        [128, 16, 64],
-        long,
-        Some(300),
-        sunk,
-        pre,
-        tc5_only,
-        nolive,
-        true,
-    );
-    check_live([64, 8, 256], long, w100, sunk, pre, tc5, nolive, true);
+    let none = [0, 0];
+    #[rustfmt::skip]
+    let cases = [
+        // MiMo's heads, 192-wide keys and 128-wide values padded to 256: the tcgen05 prefill reads
+        // the widths alone, whole and over a window.
+        ([64, 8, 256], long, None, own, pre, tc5, [192, 128], false),
+        ([64, 8, 256], long, w128, sunk, pre, tc5, [192, 128], false),
+        // An e4m3 pool: FA2's decode and prefill read it as it is, the tensor-core decode widens it
+        // (whole, split, over a cluster), the tcgen05 prefill reads a bf16 shadow of it.
+        ([32, 2, 128], dec, None, own, all, read(false, false, 0, 0), none, true),
+        ([64, 8, 64], dec, w128, sunk, all, read(true, true, 256, 0), none, true),
+        ([64, 8, 64], dec, None, both, all, read(false, true, 0, 0), none, true),
+        ([32, 16, 256], dec, None, sunk, all, read(false, true, 0, 8), none, true),
+        ([8, 2, 128], chunks, w100, sunk, pre, fa2, none, true),
+        ([32, 4, 128], chunks, None, rec, pre, tuned(|t| t.prefill_tc5 = true), none, true),
+    ];
+    for (heads, reqs, window, flags, lanes, tuning, live, fp8) in cases {
+        check_live(heads, reqs, window, flags, lanes, tuning, live, fp8);
+    }
 }

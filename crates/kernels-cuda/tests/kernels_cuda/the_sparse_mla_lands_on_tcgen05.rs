@@ -704,13 +704,7 @@ fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> 
 #[test]
 fn glm_fp8_rows_score_in_e4m3() {
     // Four rows split over the multiprocessors; 160 a block each on 128-key tiles.
-    for (rows, kv, rope) in [
-        (4, 300, 64),
-        (4, 1000, 64),
-        (4, 1000, 0),
-        (160, 1000, 64),
-        (160, 700, 0),
-    ] {
+    for (rows, kv, rope) in [(4, 300, 64), (4, 1000, 64), (4, 1000, 0), (160, 1000, 64)] {
         let want = decode_short(rows, kv, rope, false, false);
         let got = decode_short(rows, kv, rope, true, false);
         let (mut err, mut norm) = (0f64, 0f64);

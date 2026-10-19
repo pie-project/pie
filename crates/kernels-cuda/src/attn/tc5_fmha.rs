@@ -146,7 +146,7 @@ pub(crate) fn try_prefill(
         (64, 4)
     } else if live && (0..256).contains(&window_left) {
         // A short window's keys reach a 64-key tile past its rows, not a
-        // 128-key one: less of each tile masked (MiMo's 128: 443 -> 323 us).
+        // 128-key one: less of each tile masked.
         (64, 3)
     } else if live {
         planes_tiling(dqk, dv)
