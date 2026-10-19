@@ -138,17 +138,31 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     // A prefill's rows go a block a row: the row's rotation is computed once
     // for every head rather than once a head, and each head moves in whole
     // 16-byte words. A decode's few rows keep the warp a head.
+    // Under `rows_vec` (B200) a word-wide row lands in shared memory whole,
+    // by one bulk copy.
+    let stage = word && ctx.tuning().rows_vec && packed.width * 2 + 16 <= 48 * 1024;
     let by_row = matches!(head_dim, 64 | 128 | 256 | 512).then(|| {
         let e = if word { 8 } else { head_dim / 32 };
-        format!("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32({head_dim}), ::pie::i32({e}){pages}>")
+        if stage {
+            let kv = if pages.is_empty() { "::pie::bf16" } else { "__nv_fp8_e4m3" };
+            format!("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32({head_dim}), ::pie::i32({e}), {kv}, true>")
+        } else {
+            format!("::pie::custom::qkv_qk_norm_rope_vnorm_write_kv_rows<::pie::i32({head_dim}), ::pie::i32({e}){pages}>")
+        }
     });
+    let smem = if stage { packed.width * 2 + 16 } else { 0 };
+    let block = if stage {
+        128
+    } else if word {
+        64
+    } else {
+        ROW_BLOCK
+    };
     if let Some(instantiation) = by_row.filter(|_| packed.rows >= ctx.tuning().qkv_rows_from) {
         return ctx.fire(
             OP,
-            Fire::at(FILE, symbol(&instantiation)).apply(Launch::grid(
-                [packed.rows, 1, 1],
-                [if word { 64 } else { ROW_BLOCK }, 1, 1],
-            )),
+            Fire::at(FILE, symbol(&instantiation))
+                .apply(Launch::grid([packed.rows, 1, 1], [block, 1, 1]).smem(smem)),
             &[
                 packed.arg(),
                 q.arg(),
