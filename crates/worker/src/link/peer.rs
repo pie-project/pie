@@ -19,6 +19,9 @@ use worker_api::dispatch_codec;
 use worker_api::peer::{Hello, PEER_MAX_FRAME_BYTES, Pages, Peer, PeerClient, Prefill};
 
 /// A prefill may run long; the link waits this long for it.
+/// How long a pass waits for the directory to say who holds its pages.
+const LOCATE_DEADLINE: Duration = Duration::from_millis(500);
+
 const PREFILL_DEADLINE: Duration = Duration::from_secs(300);
 
 /// What this worker says of itself. Its class is the engine and the
@@ -356,8 +359,11 @@ impl runtime::offload::directory::Directory for GatewayDirectory {
     ) -> BoxFuture<'static, Result<Vec<runtime::offload::directory::Holder>>> {
         let (gateway, worker) = (self.gateway.clone(), self.worker);
         Box::pin(async move {
+            // An optimization: past a moment the pass is computed here.
+            let mut ctx = tarpc::context::current();
+            ctx.deadline = Instant::now() + LOCATE_DEADLINE;
             let found = gateway
-                .locate(tarpc::context::current(), worker, keys)
+                .locate(ctx, worker, keys)
                 .await
                 .context("asking the gateway's directory")?;
             Ok(found

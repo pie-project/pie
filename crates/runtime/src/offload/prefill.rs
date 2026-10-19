@@ -98,8 +98,21 @@ static EXECUTORS: std::sync::LazyLock<
     RwLock<std::collections::HashMap<crate::inferlet::process::ProcessId, Vec<String>>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// The prop a pass this worker computes for a peer's process carries: its
+/// home chose where it runs, so it neither asks the directory nor goes on.
+const SERVING_PROP: &str = "pie/serving-peer";
+
+/// Processes computing a peer's pass.
+static SERVING_PEERS: std::sync::LazyLock<
+    RwLock<std::collections::HashSet<crate::inferlet::process::ProcessId>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// Notes the executors a process's launch named, if any.
 pub fn arrived(pid: crate::inferlet::process::ProcessId, props: &client_api::Props) {
+    if props.contains_key(SERVING_PROP) {
+        SERVING_PEERS.write().unwrap().insert(pid);
+        return;
+    }
     let Some(named) = props.get(EXECUTORS_PROP).and_then(|value| value.as_str()) else {
         return;
     };
@@ -111,6 +124,7 @@ pub fn arrived(pid: crate::inferlet::process::ProcessId, props: &client_api::Pro
 
 pub fn exited(pid: crate::inferlet::process::ProcessId) {
     EXECUTORS.write().unwrap().remove(&pid);
+    SERVING_PEERS.write().unwrap().remove(&pid);
 }
 
 /// Where `pid`'s pass goes: the first executor the worker plane's rule names,
@@ -204,6 +218,9 @@ pub(crate) async fn before_pass(
     rows: &[u32],
     slots: &[Hash256],
 ) {
+    if SERVING_PEERS.read().unwrap().contains(&pid) {
+        return;
+    }
     let Some(mut pass) = plan(stores, ws, held, rows, slots) else {
         return;
     };
@@ -229,11 +246,14 @@ pub(crate) async fn before_pass(
             ),
         }
     }
-    let Some(min_tokens) = min_tokens(pid) else {
+    let Some((min_tokens, costed)) = min_tokens(pid) else {
         return;
     };
     let page = stores.kv_page_size;
     if pass.have >= pass.limit || (pass.limit - pass.have) * u64::from(page) < min_tokens {
+        return;
+    }
+    if costed && crate::scheduler::last_batch_size() < BUSY_LANES {
         return;
     }
     let Some(peer) = executor(pid).await else {
@@ -268,22 +288,33 @@ pub(crate) async fn before_pass(
     }
 }
 
-/// The fewest uncached tokens worth a peer's prefill: the worker policy's
-/// rule, else the configuration's. Unstated, 2048: the pages come back
-/// inline. `None`: this process's passes stay home.
-fn min_tokens(pid: crate::inferlet::process::ProcessId) -> Option<u64> {
+/// The fewest lanes in this worker's last fire for which a costed pass goes
+/// to a peer. Below it the pass is cheaper here: on an idle 14B a ~3.3K-token
+/// prefill takes 650 ms at home and 1.2-1.5 s through a peer, the transfer
+/// added; past it the decodes it would stall are the cost (32 decodes: 2.1x
+/// the tokens a second with the prefills sent away).
+const BUSY_LANES: u64 = 8;
+
+/// The fewest uncached tokens worth a peer's prefill, and whether the pass
+/// goes only while this worker is busy: the worker policy's rule, else the
+/// configuration's (2048 unstated, costed). `None`: this process's passes
+/// stay home.
+fn min_tokens(pid: crate::inferlet::process::ProcessId) -> Option<(u64, bool)> {
     use crate::policy::offload::Mode;
     match crate::policy::offload::rule(pid) {
         Some(None) => None,
         Some(Some(rule)) => match rule.mode {
             Mode::Never => None,
-            Mode::Always => Some(u64::from(rule.min_tokens).max(1)),
-            Mode::Cost => Some(u64::from(rule.min_tokens)),
+            Mode::Always => Some((u64::from(rule.min_tokens).max(1), false)),
+            Mode::Cost => Some((u64::from(rule.min_tokens), true)),
         },
-        None => Some(match super::prefill_min_suffix_tokens() {
-            0 => 2048,
-            n => n as u64,
-        }),
+        None => Some((
+            match super::prefill_min_suffix_tokens() {
+                0 => 2048,
+                n => n as u64,
+            },
+            true,
+        )),
     }
 }
 
@@ -791,7 +822,12 @@ async fn run_prefill(tokens: &[u32]) -> Result<()> {
         None,
         false,
         Some(tx),
-        crate::policy::Arrival::default(),
+        crate::policy::Arrival {
+            props: [(SERVING_PROP.to_string(), serde_json::Value::Bool(true))]
+                .into_iter()
+                .collect(),
+            ..crate::policy::Arrival::default()
+        },
     )?;
     rx.await
         .map_err(|_| anyhow!("the prefill program went away"))?
