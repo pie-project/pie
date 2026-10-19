@@ -308,10 +308,12 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
         tmem_relinquish();
     }
     if constexpr (kE4 && kRope > 0) {
-        // The rotated product's rows 64-127 read past each tile's (the next
-        // slot's, or P): finite from the start.
-        for (u32 i = threadIdx.x; i < L::kOffX / 16; i += blockDim.x) {
-            reinterpret_cast<uint4*>(smem)[i] = make_uint4(0, 0, 0, 0);
+        // The rotated product's rows 64-127 read past each tile's, the
+        // atom after it (the next slot's first, or P's): finite from the
+        // start.
+        constexpr u32 kPast = kAtom / 16;
+        for (u32 i = threadIdx.x; i < kSlots * kPast; i += blockDim.x) {
+            reinterpret_cast<uint4*>(smem + (i / kPast + 1) * L::kSlot)[i % kPast] = make_uint4(0, 0, 0, 0);
         }
         fence_async_shared();
     }
