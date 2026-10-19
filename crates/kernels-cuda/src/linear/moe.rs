@@ -2022,8 +2022,6 @@ fn select_mxfp4_mma(
         Some(Glu::GegluTanh) => (4, 0.0, 1.0),
         Some(Glu::Situ { beta, cap }) => (5, beta, cap),
     };
-    // A CTA lands 128 rows, or 64 GLU columns (their gate and up rows).
-    let cols = if glu.is_some() { 64 } else { 128 };
     let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
     let experts = codes.rows.clamp(1, EXPERT_CAP);
     // An expert's slice is 8, 16 or 32 routes: as few 8-route blocks as the
@@ -2033,11 +2031,21 @@ fn select_mxfp4_mma(
     // memory a CTA of 64 routes (`moe_select_mxfp4_mma_staged`), so a wide
     // fire streams each expert's codes once a 64.
     let staged = !cvt && per > STAGED_FROM;
+    let (staged_nb, staged_tiles) = (8, 2);
     let nb: u32 = match per {
-        _ if staged => 8,
+        _ if staged => staged_nb,
         0..=4 => 1,
         5..=12 => 2,
         _ => 4,
+    };
+    // A CTA lands 128 rows (64 a staged one-tile warp's), or 64 GLU columns
+    // (their gate and up rows).
+    let cols = if glu.is_some() {
+        64
+    } else if staged {
+        64 * staged_tiles
+    } else {
+        128
     };
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
@@ -2095,10 +2103,11 @@ fn select_mxfp4_mma(
     } else if staged {
         const STAGES: u32 = 3;
         let nv = tensor_scales.is_some();
+        let tiles = staged_tiles;
         Fire::at(
             "linear/moe_w4.cuh",
             symbol(&format!(
-                "::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {STAGES}, {code}, {nv}>"
+                "::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {STAGES}, {code}, {nv}, {tiles}>"
             )),
         )
         .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(STAGES * 8 * nb * 16 * 16))

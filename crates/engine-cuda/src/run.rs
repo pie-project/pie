@@ -1152,7 +1152,10 @@ impl<'c> Run<'c> {
         let tokens = self
             .carve_rows()
             .unwrap_or_else(|| self.window().span().rows);
-        if tokens == 0 {
+        // A plane of fewer rows than the window's tokens is not packed by
+        // token (a head's rows gathered off the window, a draft's own): each
+        // row its own.
+        if tokens == 0 || plane_rows < tokens {
             return 1;
         }
         assert_eq!(

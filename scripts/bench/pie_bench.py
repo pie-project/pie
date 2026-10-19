@@ -75,6 +75,25 @@ def reconstruct_token_arrivals(
 
 PIE_BENCH_DEFAULT_DEVICE = "cuda:0"
 
+# A speculative inferlet's rounds over the measured requests, printed at exit.
+_SPEC_TALLY = {"rounds": 0, "drafted": 0, "accepted": 0, "tokens": 0}
+
+
+def _print_spec_tally() -> None:
+    t = _SPEC_TALLY
+    if t["rounds"]:
+        rate = t["accepted"] / t["drafted"] if t["drafted"] else 0.0
+        print(
+            f"spec rounds: {t['rounds']} drafted {t['drafted']} accepted {t['accepted']} "
+            f"(rate {rate:.3f}), tokens/round {t['tokens'] / t['rounds']:.2f}",
+            flush=True,
+        )
+
+
+import atexit
+
+atexit.register(_print_spec_tally)
+
 # Metal's engine takes these two unconditionally: its planner has no lattice
 # to collapse, so a value is always wanted. The CUDA engine documents the
 # opposite -- "Omit to let the memory planner choose ... A guess here is worse
@@ -900,6 +919,11 @@ async def run(args: argparse.Namespace):
                         # trackb-snapkv, ...) report the count as `count` and
                         # no ids, so the ids are checked only when they exist
                         output_tokens = int(_output_token_count(obj))
+                        # A speculative loop's rounds (dflash-speculative-bench).
+                        if "rounds" in obj and i >= args.warmup:
+                            for key in ("rounds", "drafted", "accepted"):
+                                _SPEC_TALLY[key] += int(obj.get(key) or 0)
+                            _SPEC_TALLY["tokens"] += output_tokens
                         token_ids = [int(token) for token in obj.get("token_ids") or []]
                         if "token_ids" in obj and len(token_ids) != output_tokens:
                             raise ValueError(

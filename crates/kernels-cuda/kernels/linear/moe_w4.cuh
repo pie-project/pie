@@ -578,7 +578,9 @@ __device__ __forceinline__ void compute_staged(const uint4 (&cw)[kTiles][2], con
 /// 64: the slice's activations staged a 128-code chunk at a time in shared
 /// memory through a `kStages` cp.async ring the CTA's warps share, so a
 /// wide fire streams each expert's codes once a 64 routes, not a 32.
-template <int kNb, int kStages, int kGlu, bool kNv = false>
+// `kTiles` m16 tiles of weight rows a warp: 1 holds a slice of 128 routes
+// (`kNb` 16) in the registers 2 holds 64 in.
+template <int kNb, int kStages, int kGlu, bool kNv = false, int kTiles = 2>
 __global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
@@ -597,7 +599,7 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
     float galpha,
     const float* __restrict__ tscale)
 {
-    constexpr int kTiles = 2;
+    static_assert(kGlu == 0 || kTiles == 2, "a GLU warp is a gate tile and its up tile");
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
     constexpr int kRowsCta = 4 * kRowsWarp;
     constexpr int kSlice = 8 * kNb;
