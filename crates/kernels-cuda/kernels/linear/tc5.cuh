@@ -324,9 +324,13 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     constexpr u32 kTx = kPair * ((kMixP ? kRawBytes : kTxP * kPT) + (kMixQ ? kRawBytes : kTxQ) +
                                  kSfP + kSfQ);
     constexpr u32 kSfCols = 4 * kAtomsP * kPT * kRowAtomsP + 4 * kAtomsQ * kRowAtomsQ;
-    // Scales go to TMEM from their own warp, up to four K steps ahead in their
-    // own slots, so neither the MMA thread nor the copier waits on the other.
-    constexpr u32 kSfSlots = kStages < 4 / kBoxes ? kStages : 4 / kBoxes;
+    // Unswapped, the MMA thread copies each step's scales to TMEM itself,
+    // into one slot: its tensor pipe runs them in order with the MMAs on
+    // either side, so they wait on no barrier and leave TMEM to the
+    // accumulators. Swapped, they go from their own warp, up to four K steps
+    // ahead in their own slots.
+    constexpr bool kSelfSf = kScaled && !kSwap;
+    constexpr u32 kSfSlots = kSelfSf ? 1 : kStages < 4 / kBoxes ? kStages : 4 / kBoxes;
     // A swapped W4A16 weight lands in TMEM instead: an A slot a ring stage of
     // each P tile's 64 K, past the accumulators.
     constexpr u32 kASlots = kStages;
@@ -746,11 +750,11 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
             }
         }
     } else if (warp == 6) {
-        // The scale copier: each K step's scales into slot (step % kSfSlots) once
+        // The swapped scale copier: each K step's scales into slot (step % kSfSlots) once
         // the MMAs kSfSlots steps back have read it. Shared memory holds
         // [row block][atom]; TMEM takes [atom][row block]. The warp runs the
         // loop together and one lane issues, as in the MMA warp.
-        if (kScaled && leader) {
+        if (kScaled && !kSelfSf && leader) {
             u32 s = 0, phase = 0, step = 0;
             for (int t = first_tile; t < tiles; t += tile_step) {
                 Unit x;
@@ -820,7 +824,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     // A W4A16 stage is ready once its weight tile is written.
                     bar_wait(kMixed ? &xfull[s] : &full[s], phase);
                     const u32 slot = step % kSfSlots;
-                    if constexpr (kScaled) {
+                    if constexpr (kScaled && !kSelfSf) {
                         bar_wait(&sf_ready[slot], (step / kSfSlots) & 1);
                     }
                     tc_fence_after();
@@ -835,6 +839,28 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     }
                     __syncwarp();
                     if (elect_one()) {
+                        if constexpr (kSelfSf) {
+                            // P's scales as Q's: [row block][atom] in, [atom][row
+                            // block] out, each P tile's after the last's.
+                            const u32 sf_p = smem_addr(smem + kOffSfP + s * kSfP);
+                            const u32 sf_q = smem_addr(smem + kOffSfQ + s * kSfQ);
+                            for (u32 h = 0; h < kPT; ++h) {
+                                for (u32 r = 0; r < kRowAtomsP; ++r) {
+                                    for (u32 a = 0; a < kAtomsP; ++a) {
+                                        const u32 base = h * kAtomsP * kRowAtomsP;
+                                        tc_cp_sf_atom<kPair>(
+                                            sf_tp0 + 4 * (base + a * kRowAtomsP + r),
+                                            sdesc_sf(sf_p + (base + r * kAtomsP + a) * 512));
+                                    }
+                                }
+                            }
+                            for (u32 r = 0; r < kRowAtomsQ; ++r) {
+                                for (u32 a = 0; a < kAtomsQ; ++a) {
+                                    tc_cp_sf_atom<kPair>(sf_tq + 4 * (a * kRowAtomsQ + r),
+                                                         sdesc_sf(sf_q + (r * kAtomsQ + a) * 512));
+                                }
+                            }
+                        }
                         const u64 desc_q = sdesc_sw128(tile_q);
                         // MMA j reads box j / 4 of each tile.
                         constexpr u64 kBoxDescP = kBoxP >> 4, kBoxDescQ = kBoxQ >> 4;
