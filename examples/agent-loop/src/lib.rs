@@ -24,7 +24,8 @@ struct Input {
     /// The fake tool's shortest and longest sleep.
     tool_min_ms: u64,
     tool_max_ms: u64,
-    /// Varies the tool's sleeps (and the sampling) between copies.
+    /// Varies the tool's sleeps and the sampling; mixed with the instance id,
+    /// so copies launched together differ.
     seed: u64,
     question: String,
     temperature: f32,
@@ -133,11 +134,17 @@ async fn main(input: Input) -> Result<String> {
     next.extend(chat::user(&input.question));
     next.extend(chat::cue_without_thinking());
 
+    let instance = inferlet::runtime::instance_id()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+    let base = mix(input.seed ^ instance);
     let span = input.tool_max_ms.saturating_sub(input.tool_min_ms) + 1;
     let mut generated = 0usize;
     let mut waited_ms = 0u64;
     for turn_index in 0..input.turns {
-        let seed = mix(input.seed.wrapping_mul(1_000).wrapping_add(turn_index as u64));
+        let seed = mix(base.wrapping_add(turn_index as u64));
         generated += turn(
             &ws,
             &next,
