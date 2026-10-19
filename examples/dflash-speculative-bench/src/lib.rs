@@ -516,6 +516,17 @@ async fn main(input: Input) -> Result<Output> {
 
     let pipe = Pipeline::new();
 
+    // `drafter = "mtp"`: a chain head (MTP) drafts in the verify fire itself
+    // -- each row's chain of `depth` -- and the next round proposes the chain
+    // at the row the trunk kept, so a round is one fire.
+    let chained = input.drafter == "mtp";
+    let depth = model::mtp_depth();
+    if chained && (depth == 0 || advertised.is_some()) {
+        return Err("`drafter = mtp` takes a chain head (mtp_depth > 0, no draft block)".into());
+    }
+    let chain_k = input.block.unwrap_or(depth).clamp(1, depth.max(1)) as usize;
+    let mut chain: Vec<i32> = Vec::new();
+
     let mut anchor: i32 = 0;
     for &(base, end) in &readout_spans(n, model::ReadoutKind::Logits) {
         let len = end - base;
@@ -528,14 +539,25 @@ async fn main(input: Input) -> Result<Output> {
         fwd.embed(&toks, &indptr)?;
         fwd.readout(&readout)?;
         fwd.state(&[&ws], StateGeometry::folding())?;
-        fwd.epilogue(move || {
-            next.put(&reshape(reduce_argmax(intrinsics::logits()), [1]));
-        });
+        let last = end == n;
+        let chain_p = Channel::new([depth.max(1)], dtype::i32).named("chain_p");
+        {
+            let chain_p = chain_p.clone();
+            fwd.epilogue(move || {
+                next.put(&reshape(reduce_argmax(intrinsics::logits()), [1]));
+                if chained && last {
+                    chain_p.put(&reshape(intrinsics::mtp_drafts(depth), [depth]));
+                }
+            });
+        }
         fwd.submit(&pipe).context("prefill submit")?;
         anchor = next
             .take_host::<Vec<i32>>()
             .await
             .context("prefill readback")?[0];
+        if chained && last {
+            chain = chain_p.take_host::<Vec<i32>>().await.context("prefill chain readback")?;
+        }
     }
 
     if input.report_timing {
@@ -595,6 +617,68 @@ async fn main(input: Input) -> Result<Output> {
             held += 1;
             generated.push(anchor as u32);
             emitted_ns.push(monotonic_now_ns());
+            continue;
+        }
+        if chained {
+            // ONE fire: verify `[anchor, chain[..k]]`, and every row's chain
+            // for the round after.
+            let k = chain.len().min(chain_k);
+            let verify = k as u32 + 1;
+            let mut fed = vec![anchor];
+            fed.extend_from_slice(&chain[..k]);
+            let toks = Channel::from(fed.as_slice()).named("toks_m");
+            let indptr = Channel::from([0u32, verify]).named("embed_indptr_m");
+            let slots = Channel::from_iter(held..held + verify).named("slots_m");
+            let readout = Channel::from_iter(0..verify).named("readout_m");
+            let fold_len = Channel::from([survivors]).named("fold_len_m");
+            let truth = Channel::new([verify], dtype::i32)
+                .capacity(channel_capacity() as u32)
+                .named("truth_m");
+            let chains = Channel::new([verify * depth], dtype::i32)
+                .capacity(channel_capacity() as u32)
+                .named("chains_m");
+            let fwd = ForwardPass::new();
+            fwd.embed(&toks, &indptr)?;
+            fwd.readout(&readout)?;
+            fwd.state(
+                &[&ws],
+                StateGeometry {
+                    slots: Some(&slots),
+                    fold: Fold::Count(&fold_len),
+                    ..StateGeometry::default()
+                },
+            )?;
+            {
+                let truth = truth.clone();
+                let chains = chains.clone();
+                fwd.epilogue(move || {
+                    truth.put(&reshape(reduce_argmax(intrinsics::logits()), [verify]));
+                    chains.put(&reshape(intrinsics::mtp_drafts(verify * depth), [verify * depth]));
+                });
+            }
+            let fired_at = monotonic_now_ns();
+            fwd.submit(&pipe).context("chain verify submit")?;
+            let truth = truth.take_host::<Vec<i32>>().await.context("chain truth readback")?;
+            let chains = chains.take_host::<Vec<i32>>().await.context("chain readback")?;
+            prices.verified(verify, monotonic_now_ns().saturating_sub(fired_at));
+            let kept = chain[..k].iter().zip(&truth).take_while(|(p, t)| p == t).count();
+            rounds += 1;
+            drafted += k;
+            accepted += kept;
+            widths.push(verify);
+            replayed += survivors as usize;
+            survivors = kept as u32 + 1;
+            let round_ns = monotonic_now_ns();
+            for tok in chain[..kept].iter() {
+                generated.push(*tok as u32);
+                emitted_ns.push(round_ns);
+            }
+            anchor = truth[kept];
+            generated.push(anchor as u32);
+            emitted_ns.push(round_ns);
+            held += kept as u32 + 1;
+            let d = depth as usize;
+            chain = chains[kept * d..kept * d + d].to_vec();
             continue;
         }
 

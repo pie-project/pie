@@ -195,30 +195,42 @@ def mlp(x, f, bonsai):
     return moe(x, f)
 
 def draft(m, inputs, x, logits, head):
+    """The MTP head chained `MTP_DEPTH` deep: each step embeds the token the
+    step before picked and reads that step's hidden; only the first caches
+    its k and v."""
     mtp = m.mtp
     plan = ops.attn.plan_prefill(inputs.on(fact.drafts()), m.q_heads, m.kv_heads, m.head_dim, None)
     hidden = x.on(fact.drafts())
-    chosen = ops.layout.argmax([logits.on(fact.drafts())])
-    e = ops.layout.embed(chosen, m.embed, m.vocab)
-    if mtp.pre_fc != None:
-        pre = mtp.pre_fc
-        e = ops.elemwise.rmsnorm_plus_one(e, pre.embedding, pre.eps)
-        hidden = ops.elemwise.rmsnorm_plus_one(hidden, pre.hidden, pre.eps)
-    dy = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.fc_embed), ops.linear.matmul(hidden, mtp.fc_hidden))
-
-    nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mixer_norm, mtp.mixer_norm_eps)
+    token = ops.layout.argmax([logits.on(fact.drafts())])
     a = mtp.attn
-    o = draft_attn(nx, inputs, plan, a, m.head_dim, m.kv_heads, lambda q, k: rotate(q, k, inputs, m, a))
-    dy = ops.elemwise.residual_add(o, dy)
+    chain = []
+    for step in range(MTP_DEPTH):
+        e = ops.layout.embed(token, m.embed, m.vocab)
+        h = hidden
+        if mtp.pre_fc != None:
+            pre = mtp.pre_fc
+            e = ops.elemwise.rmsnorm_plus_one(e, pre.embedding, pre.eps)
+            h = ops.elemwise.rmsnorm_plus_one(h, pre.hidden, pre.eps)
+        dy = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.fc_embed), ops.linear.matmul(h, mtp.fc_hidden))
 
-    nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mlp_norm, mtp.mlp_norm_eps)
-    f = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(nx, mtp.mlp.gate_up), mtp.mlp.inter), mtp.mlp.down)
-    dy = ops.elemwise.residual_add(f, dy)
+        nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mixer_norm, mtp.mixer_norm_eps)
+        o = draft_attn(nx, inputs, plan, a, m.head_dim, m.kv_heads, lambda q, k: rotate(q, k, inputs, m, a), append = step == 0)
+        dy = ops.elemwise.residual_add(o, dy)
 
-    read = ops.elemwise.rmsnorm_plus_one(dy, mtp.norm, mtp.norm_eps) if mtp.norm != None else dy
-    proposal = ops.linear.lm_head(read, head)
-    seam.at(seam.MTP, [proposal])
-    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([proposal])])
+        nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mlp_norm, mtp.mlp_norm_eps)
+        f = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(nx, mtp.mlp.gate_up), mtp.mlp.inter), mtp.mlp.down)
+        dy = ops.elemwise.residual_add(f, dy)
+
+        read = ops.elemwise.rmsnorm_plus_one(dy, mtp.norm, mtp.norm_eps) if mtp.norm != None else dy
+        proposal = ops.linear.lm_head(read, head)
+        if step == 0:
+            seam.at(seam.MTP, [proposal])
+        token = ops.layout.argmax([proposal])
+        hidden = read
+        chain.append(proposal)
+    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax(chain)])
+
+MTP_DEPTH = 3
 
 def rotate(q, k, inputs, m, a):
     vision = m.tower != None

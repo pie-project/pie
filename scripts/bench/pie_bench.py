@@ -919,6 +919,8 @@ async def run(args: argparse.Namespace):
                         # trackb-snapkv, ...) report the count as `count` and
                         # no ids, so the ids are checked only when they exist
                         output_tokens = int(_output_token_count(obj))
+                        if os.environ.get("PIE_BENCH_DUMP_REPLY") and i == args.warmup:
+                            print("[reply] " + json.dumps({k: v for k, v in obj.items() if k not in ("token_ids", "intertoken_us", "tokens")})[:3000], flush=True)
                         # A speculative loop's rounds (dflash-speculative-bench).
                         if "rounds" in obj and i >= args.warmup:
                             for key in ("rounds", "drafted", "accepted"):
