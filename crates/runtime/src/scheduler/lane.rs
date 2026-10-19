@@ -142,6 +142,16 @@ fn fail_request(request: LaneRequest, why: &str) {
     }
 }
 
+/// Where each engine step's landing goes: the lane's frame it belongs to, its
+/// step there, and the instances whose channels it fills.
+struct Landing {
+    frame: u64,
+    step: usize,
+    instances: Vec<u64>,
+}
+
+type Landings = HashMap<(::engine::FrameId, u32), Landing>;
+
 pub(super) struct Lane {
     launch_tx: crate::rt::channel::Sender<LaneRequest>,
     control_tx: crate::rt::channel::Sender<LaneRequest>,
@@ -312,7 +322,8 @@ impl Lane {
         stats: Arc<SchedulerStats>,
     ) {
         let mut channels = ChannelJoin::new();
-        let mut landed_instances: HashMap<::engine::FrameId, Vec<Vec<u64>>> = HashMap::new();
+        let mut landed_instances: Landings = HashMap::new();
+        let mut frames: u64 = 0;
         let broker = crate::engine::CompletionBroker::new();
         let settlements = crate::engine::completion::FrameSettlements::new();
         if let Some(engine) = engine.as_mut() {
@@ -388,6 +399,7 @@ impl Lane {
                                         &broker,
                                         &settlements,
                                         &mut landed_instances,
+                                        &mut frames,
                                     )
                                 })
                             }
@@ -424,29 +436,15 @@ impl Lane {
                     step,
                     outcome,
                 } => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let instances = landed_instances
-                        .get(&frame)
-                        .and_then(|steps| steps.get(step as usize))
-                        .cloned()
-                        .unwrap_or_default();
-                    if let Some(engine) = engine.as_mut() {
-                        if let Err(error) = engine.publish_landed() {
-                            tracing::error!(frame, step, %error, "publishing a landed step");
-                        }
-                        for instance in instances {
-                            if let Err(error) = channels.pump_out(engine.as_mut(), instance) {
-                                tracing::error!(frame, step, %error, "channel take after landing");
-                            }
-                        }
-                    }
-                    tracing::debug!(frame, step, "channels pumped out after landing");
-                    settlements.settled(frame, &outcome, &broker);
-                    if landed_instances
-                        .get(&frame)
-                        .is_some_and(|steps| step as usize + 1 >= steps.len())
-                    {
-                        landed_instances.remove(&frame);
-                    }
+                    Self::landed(
+                        engine.as_mut(),
+                        &channels,
+                        &mut landed_instances,
+                        &settlements,
+                        &broker,
+                        (frame, step),
+                        &outcome,
+                    );
                 }))
                 .is_err(),
             };
@@ -502,6 +500,34 @@ impl Lane {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// A landed step: its channels pumped out and what it settles published.
+    fn landed(
+        engine: Option<&mut EngineBox>,
+        channels: &ChannelJoin,
+        landings: &mut Landings,
+        settlements: &crate::engine::completion::FrameSettlements,
+        broker: &crate::engine::CompletionBroker,
+        (frame, step): (::engine::FrameId, u32),
+        outcome: &::engine::StepOutcome,
+    ) {
+        let landing = landings.remove(&(frame, step));
+        if let Some(engine) = engine {
+            if let Err(error) = engine.publish_landed() {
+                tracing::error!(frame, step, %error, "publishing a landed step");
+            }
+            for &instance in landing.iter().flat_map(|landing| &landing.instances) {
+                if let Err(error) = channels.pump_out(engine.as_mut(), instance) {
+                    tracing::error!(frame, step, %error, "channel take after landing");
+                }
+            }
+        }
+        tracing::debug!(frame, step, "channels pumped out after landing");
+        if let Some(landing) = landing {
+            settlements.settled(landing.frame, landing.step, outcome, broker);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn fire_frame(
         engine: &mut EngineBox,
         channels: &ChannelJoin,
@@ -510,7 +536,8 @@ impl Lane {
         stash: &mut Option<LaneRequest>,
         broker: &crate::engine::CompletionBroker,
         settlements: &std::sync::Arc<crate::engine::completion::FrameSettlements>,
-        landed: &mut HashMap<::engine::FrameId, Vec<Vec<u64>>>,
+        landings: &mut Landings,
+        frames: &mut u64,
     ) -> std::result::Result<SubmissionCompletion, String> {
         use crate::engine::completion;
 
@@ -525,77 +552,118 @@ impl Lane {
             *stash = Some(queued);
         }
 
-        let submitted = ::engine::FrameSubmission {
+        let submission = ::engine::FrameSubmission {
             steps: frame
                 .steps
                 .iter_mut()
                 .map(|step| std::mem::take(&mut step.submission))
                 .collect(),
         };
+        let submitted = &submission.steps;
 
-        for step in &submitted.steps {
+        for step in submitted {
             for attachment in &step.attachments {
                 if let Err(error) = channels.pump_in(engine.as_mut(), attachment.instance) {
                     return Err(format!("channel publish: {error}"));
                 }
             }
         }
-        tracing::debug!(
-            steps = submitted.steps.len(),
-            "submitting a frame to the engine"
-        );
-        let ticket = match engine.submit(&submitted) {
-            Ok(ticket) => ticket,
-            Err(error) if error.is_retryable() => {
-                return Err(format!(
+        tracing::debug!(steps = submitted.len(), "submitting a frame to the engine");
+        let refused = |error: ::engine::Error| {
+            if error.is_retryable() {
+                format!(
                     "frame admission answered a retryable refusal past static \
                      admission, which the frame contract forbids: {error}"
-                ));
+                )
+            } else {
+                format!("{error}")
             }
-            Err(error) => return Err(format!("{error}")),
         };
 
-        let asynchronous = engine.settles_asynchronously();
-        if asynchronous {
-            landed.insert(
-                ticket.id,
-                submitted
-                    .steps
-                    .iter()
-                    .map(|step| step.attachments.iter().map(|a| a.instance).collect())
-                    .collect(),
-            );
-        }
-        let mut wakes: Vec<u64> = Vec::new();
-        for step in &submitted.steps {
-            for attachment in &step.attachments {
-                let deferred = asynchronous.then_some(&mut wakes);
-                if let Err(error) =
-                    channels.pump_out_with(engine.as_mut(), attachment.instance, deferred)
-                {
-                    return Err(format!("channel take: {error}"));
+        if !engine.settles_asynchronously() {
+            engine.submit(&submission).map_err(refused)?;
+            for step in submitted {
+                for attachment in &step.attachments {
+                    if let Err(error) =
+                        channels.pump_out_with(engine.as_mut(), attachment.instance, None)
+                    {
+                        return Err(format!("channel take: {error}"));
+                    }
                 }
             }
-        }
-
-        if !asynchronous {
             for step in &frame.steps {
                 completion::settle(&step.terminal_cells, completion::TERMINAL_OUTCOME_SUCCESS);
             }
             return Ok(SubmissionCompletion::ready());
         }
 
-        let completion = broker.submission_completion(waker::FIRST_COMPLETION_EPOCH);
-        let cells: Vec<_> = frame.terminal_cells().collect();
-        settlements.expect(
-            ticket.id,
-            ticket.steps.len(),
-            cells,
-            wakes,
-            &completion,
-            broker,
-        );
-        Ok(completion)
+        // A fire, and the readers of an instance, settle as soon as the last
+        // step of this frame the instance is in lands: a prompt that fills
+        // the first step has its token before the decodes after it run.
+        let steps = submitted.len().max(1);
+        let mut last: HashMap<u64, usize> = HashMap::new();
+        for (at, (step, fire)) in submitted.iter().zip(&frame.steps).enumerate() {
+            for instance in step
+                .attachments
+                .iter()
+                .map(|attachment| attachment.instance)
+                .chain(fire.members.iter().copied())
+            {
+                last.insert(instance, at);
+            }
+        }
+        let mut parts: Vec<(Vec<completion::CellPtr>, Vec<u64>)> =
+            vec![(Vec::new(), Vec::new()); steps];
+        for (at, fire) in frame.steps.iter().enumerate() {
+            for (member, cell) in fire.terminal_cells.iter().enumerate() {
+                let part = fire
+                    .members
+                    .get(member)
+                    .and_then(|instance| last.get(instance))
+                    .copied()
+                    .unwrap_or(steps - 1)
+                    .max(at);
+                parts[part].0.push(*cell);
+            }
+        }
+        let key = *frames;
+        *frames = frames.wrapping_add(1);
+        let done = broker.submission_completion(waker::FIRST_COMPLETION_EPOCH);
+        settlements.book(key, parts, &done, broker);
+
+        let instances: Vec<Vec<u64>> = submitted
+            .iter()
+            .map(|step| step.attachments.iter().map(|a| a.instance).collect())
+            .collect();
+        let ticket = match engine.submit(&submission) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                settlements.forget(key);
+                return Err(refused(error));
+            }
+        };
+        for (at, instances) in instances.into_iter().enumerate() {
+            landings.insert(
+                (ticket.id, at as u32),
+                Landing {
+                    frame: key,
+                    step: at,
+                    instances: instances.clone(),
+                },
+            );
+            for instance in instances {
+                let mut wakes = Vec::new();
+                if let Err(error) =
+                    channels.pump_out_with(engine.as_mut(), instance, Some(&mut wakes))
+                {
+                    settlements.forget(key);
+                    return Err(format!("channel take: {error}"));
+                }
+                let part = last.get(&instance).copied().unwrap_or(steps - 1).max(at);
+                settlements.add_wakes(key, part, wakes);
+            }
+        }
+        Ok(done)
     }
 
     fn execute_control(

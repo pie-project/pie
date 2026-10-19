@@ -80,6 +80,8 @@ impl FireRequest {
 pub struct StepFire {
     pub submission: Step,
     pub terminal_cells: Vec<CellPtr>,
+    /// The instance each terminal cell's fire belongs to.
+    pub members: Vec<u64>,
     pub instances: Vec<u64>,
     pub logical_fire_ids: Vec<u64>,
 }
