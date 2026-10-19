@@ -14,6 +14,8 @@
 // e2m1 code there becomes a bf16 by two masks and a shift. The activations
 // are permuted to match, two byte-perms a register.
 
+#include <cuda_pipeline.h>
+
 #include "prelude/device.cuh"
 #include "prelude/glu.cuh"
 
@@ -211,12 +213,27 @@ __device__ __forceinline__ void w4_land(const float (&acc)[kTiles][kNb][4], Fact
 }  // namespace w4mma
 
 // A routed bf16 select at decode widths: the bf16 analog of
-// `moe_select_mxfp4_mma`. Each expert's weight rows stream once into
-// registers and meet the expert's few routes on mma.sync, no shared-memory
-// round trip. The routing (order/offsets/work) and the epilogue
-// (`w4mma::w4_land`) are shared with the mxfp4 kernel. For
-// `mma.m16n8k16.row.col` both operands load the same way: lane (g=lane>>2,
-// c=lane&3) owns K-pair c of row/token g and g+8, one `(&uint4.x)[c]`.
+// `moe_select_mxfp4_mma`. Each expert's weight rows and the routes' rows are
+// staged a K-tile at a time into shared memory with `cp.async`, read to the
+// mma fragments by `ldmatrix`, and met on mma.sync. The routing
+// (order/offsets/work) and the epilogue (`w4mma::w4_land`) are shared with
+// the mxfp4 kernel; the `ld_a`/`ld_b_k`/mma triple is the one `attn/mla.cuh`
+// uses, so the output fragment is the layout `w4_land` reads.
+namespace bf16mma {
+__device__ __forceinline__ void ld_a(unsigned (&a)[4], const bf16* base, int ld, int lane) {
+    const bf16* r = base + static_cast<long long>(lane & 15) * ld + ((lane & 16) ? 8 : 0);
+    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(r));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(addr));
+}
+__device__ __forceinline__ void ld_b(unsigned (&b)[2], const bf16* base, int ld, int lane) {
+    const bf16* q = base + static_cast<long long>(lane & 7) * ld + ((lane & 8) ? 8 : 0);
+    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(q));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                 : "=r"(b[0]), "=r"(b[1]) : "r"(addr));
+}
+}  // namespace bf16mma
+
 template <int kNb, int kGlu>
 __global__ void __launch_bounds__(128) moe_select_bf16_mma(
     const bf16* __restrict__ act,
@@ -231,8 +248,11 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
 {
     constexpr int kTiles = 2;
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
-    constexpr int kRowsCta = 4 * kRowsWarp;
-    constexpr int kSlice = 8 * kNb;
+    constexpr int kRowsCta = 4 * kRowsWarp;   // 128 weight rows a CTA
+    constexpr int kSlice = 8 * kNb;           // routes a slice (B of the GEMM)
+    constexpr int kBK = 16;                   // K staged a step (one mma k)
+    constexpr int kWPad = kBK + 8;            // smem row stride (ldmatrix)
+    constexpr int kBN = kSlice;
 
     if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
     const int item = work[blockIdx.x];
@@ -242,31 +262,27 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
     const int count = min(offsets[expert + 1] - begin, kSlice);
     if (count <= 0) return;
 
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
     const int g = lane >> 2;
     const int c = lane & 3;
-    const int row_base = static_cast<int>(blockIdx.y) * kRowsCta + warp * kRowsWarp;
+    // The CTA's 128 rows and this warp's 32 of them. With `kGlu` a warp's two
+    // 16-row tiles are gate rows and their up rows, `inter` apart.
+    const int cta_row0 = static_cast<int>(blockIdx.y) * kRowsCta;
     const int span = kGlu != 0 ? inter : n;
-    auto tile_row = [&](int t) { return kGlu != 0 ? row_base + t * inter : row_base + 16 * t; };
-    if (row_base >= span) return;
+    const int row_base = kGlu != 0 ? cta_row0 / kTiles + warp * kRowsWarp
+                                   : cta_row0 + warp * kRowsWarp;
+    // A partial-tile warp (its rows past the bank) must still join the
+    // cooperative load and the barrier; `w4_land` drops its out-of-range
+    // rows, so no early return here.
 
     const bf16* w_e = weight + static_cast<long long>(expert) * n * k;
-    const bf16* wrow[kTiles][2];
-#pragma unroll
-    for (int t = 0; t < kTiles; ++t)
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const int r = min(tile_row(t) + 8 * h + g, n - 1);
-            wrow[t][h] = w_e + static_cast<long long>(r) * k;
-        }
-    const bf16* xrow[kNb];
-#pragma unroll
-    for (int b = 0; b < kNb; ++b) {
-        const int tok = 8 * b + g;
-        xrow[b] = tok < count ? act + static_cast<long long>(order[begin + tok] / act_div) * k
-                              : nullptr;
-    }
+    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+
+    extern __shared__ bf16 smem[];
+    bf16* sW = smem;                          // [kRowsCta][kWPad]
+    bf16* sX = sW + kRowsCta * kWPad;         // [kBN][kWPad]
 
     float acc[kTiles][kNb][4];
 #pragma unroll
@@ -276,36 +292,51 @@ __global__ void __launch_bounds__(128) moe_select_bf16_mma(
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
 
-    for (int k0 = 0; k0 < k; k0 += 16) {
-        unsigned b0[kNb], b1[kNb];
+    for (int k0 = 0; k0 < k; k0 += kBK) {
+        // Stage this K-tile: 128 weight rows and `count` route rows, 8 bf16
+        // (16 B) a cp.async. Rows past the bank or routes past the slice are
+        // zeroed so the mma reads defined smem (their outputs are not stored).
 #pragma unroll
-        for (int b = 0; b < kNb; ++b) {
-            if (xrow[b] != nullptr) {
-                const uint4 lo = w4mma::ld_act(xrow[b] + k0);
-                const uint4 hi = w4mma::ld_act(xrow[b] + k0 + 8);
-                b0[b] = (&lo.x)[c];
-                b1[b] = (&hi.x)[c];
+        for (int i = tid; i < kRowsCta * (kBK / 8); i += 128) {
+            const int wr = i / (kBK / 8);
+            const int ch = (i % (kBK / 8)) * 8;
+            const int grow = (kGlu != 0) ? (cta_row0 / kTiles + (wr / 16) * inter + wr % 16)
+                                         : (cta_row0 + wr);
+            bf16* dst = sW + wr * kWPad + ch;
+            if (grow < span) {
+                __pipeline_memcpy_async(dst, w_e + static_cast<long long>(grow) * k + k0 + ch, 16);
             } else {
-                b0[b] = 0u;
-                b1[b] = 0u;
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
             }
         }
+        for (int i = tid; i < kBN * (kBK / 8); i += 128) {
+            const int tok = i / (kBK / 8);
+            const int ch = (i % (kBK / 8)) * 8;
+            bf16* dst = sX + tok * kWPad + ch;
+            if (tok < count) {
+                const long long r = static_cast<long long>(order[begin + tok] / act_div);
+                __pipeline_memcpy_async(dst, act + r * k + k0 + ch, 16);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
+        unsigned bk[kNb][2];
+#pragma unroll
+        for (int b = 0; b < kNb; ++b) bf16mma::ld_b(bk[b], sX + 8 * b * kWPad, kWPad, lane);
 #pragma unroll
         for (int t = 0; t < kTiles; ++t) {
-            const uint4 wl0 = w4mma::ld_act(wrow[t][0] + k0);
-            const uint4 wh0 = w4mma::ld_act(wrow[t][0] + k0 + 8);
-            const uint4 wl1 = w4mma::ld_act(wrow[t][1] + k0);
-            const uint4 wh1 = w4mma::ld_act(wrow[t][1] + k0 + 8);
-            const unsigned a0 = (&wl0.x)[c];
-            const unsigned a1 = (&wl1.x)[c];
-            const unsigned a2 = (&wh0.x)[c];
-            const unsigned a3 = (&wh1.x)[c];
+            unsigned a[4];
+            bf16mma::ld_a(a, sW + (warp * kRowsWarp + 16 * t) * kWPad, kWPad, lane);
 #pragma unroll
-            for (int b = 0; b < kNb; ++b) w4mma::mma(acc[t][b], a0, a1, a2, a3, b0[b], b1[b]);
+            for (int b = 0; b < kNb; ++b) w4mma::mma(acc[t][b], a[0], a[1], a[2], a[3], bk[b][0], bk[b][1]);
         }
+        __syncthreads();
     }
 
-    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
     auto factor = [&](int) { return 1.f; };
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, inter,
                                       row_base, g, c, limit, galpha);

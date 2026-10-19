@@ -538,13 +538,15 @@ fn select_bf16_mma(
         },
     )?;
     let grid = [work_cap, y.width.div_ceil(COLS), 1];
+    // smem = (128 weight rows + 8*nb route rows) x (kBK 16 + 8 pad) bf16.
+    let smem = (128 + 8 * nb) * (16 + 8) * 2;
     ctx.fire(
         op,
         Fire::at(
             "linear/moe_w4.cuh",
             symbol(&format!("::pie::linear::moe_select_bf16_mma<{nb}, 0>")),
         )
-        .apply(Launch::grid(grid, [THREADS, 1, 1])),
+        .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(smem)),
         &[
             x.arg(),
             ArgValue::Ptr(order),
