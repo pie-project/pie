@@ -17,14 +17,14 @@ use poem_ir::{Attention, Fused, Operands, Operation, StructKind, Trace, Ty, Valu
 /// that only plain decodes read planned and read as a prefill.
 #[must_use]
 pub fn rewrite(trace: Trace, from: u32) -> Trace {
-    rewrite_with(trace, from, false, Gate::default())
+    rewrite_with(trace, from, false, false, Gate::default())
 }
 
 /// [`rewrite`], and where `lse` holds, the plans without a window that
 /// log-sum-exp decodes read as well, but for those `xqa` reads across a
 /// cluster.
 #[must_use]
-pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, xqa: Gate) -> Trace {
+pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, xqa: Gate) -> Trace {
     if from == 0 {
         return trace;
     }
@@ -64,7 +64,7 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, xqa: Gate) -> Trace 
         match attention {
             Some(Attention::PlanDecode { .. } | Attention::Decode { .. }) => continue,
             Some(Attention::DecodeLse { plan, .. })
-                if lse && wide.get(plan).is_some_and(|(_, slides)| !slides) =>
+                if lse && wide.get(plan).is_some_and(|(_, slides)| !slides || lse_window) =>
             {
                 continue;
             }
@@ -205,9 +205,9 @@ mod tests {
             "gpt-oss decodes both kinds of layer"
         );
         let off = Gate::default();
-        assert_eq!(rewrite_with(trace.clone(), 4, false, off), trace);
-        assert_eq!(rewrite_with(trace.clone(), 0, true, off), trace);
-        let rewritten = rewrite_with(trace.clone(), 4, true, off);
+        assert_eq!(rewrite_with(trace.clone(), 4, false, false, off), trace);
+        assert_eq!(rewrite_with(trace.clone(), 0, true, false, off), trace);
+        let rewritten = rewrite_with(trace.clone(), 4, true, false, off);
         assert_eq!(census(&rewritten), (0, sliding, prefills + full));
         // Rows the tensor-core decode reads across a cluster stay decodes.
         let clustered = Gate {
@@ -215,7 +215,7 @@ mod tests {
             cluster: 8,
             ..off
         };
-        assert_eq!(rewrite_with(trace.clone(), 4, true, clustered), trace);
+        assert_eq!(rewrite_with(trace.clone(), 4, true, false, clustered), trace);
         poem_ir::check(&rewritten).expect("the rewritten trace types");
     }
 }

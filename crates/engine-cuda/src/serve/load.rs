@@ -115,6 +115,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             boot.trace.clone(),
             tuning.decode_grouped_prefill_from,
             tuning.decode_grouped_prefill_lse,
+            tuning.decode_grouped_prefill_window,
             kernels_cuda::attn::xqa::Gate::of(tuning),
         );
         boot.trace = crate::narrow::gdn_out_bf16(boot.trace.clone(), tuning.ssm_gdn_out_bf16);

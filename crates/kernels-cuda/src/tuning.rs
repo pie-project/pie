@@ -560,6 +560,13 @@ pub struct DecodeGroupedPrefillFrom(pub u32);
 #[decision(id = "kernel.sdpa.decode.grouped_prefill_lse", flag, default = false, tune = search)]
 pub struct DecodeGroupedPrefillLse;
 
+/// Whether those log-sum-exp rows take the prefill kernel under a sliding
+/// window too (MiMo's sink layers: a wide group the decode kernel walks on
+/// CUDA cores).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.grouped_prefill_window", flag, default = false, tune = search)]
+pub struct DecodeGroupedPrefillWindow;
+
 /// Whether a paged decode of a group of at most eight query heads reads its
 /// cache on tensor cores (`attn/xqa.cuh`, the group's rows one MMA tile)
 /// rather than the FA2 decode kernel.
@@ -661,6 +668,7 @@ pub fn register(registry: &mut Registry) {
         .add::<PrefillWideSliding>()
         .add::<DecodeGroupedPrefillFrom>()
         .add::<DecodeGroupedPrefillLse>()
+        .add::<DecodeGroupedPrefillWindow>()
         .add::<DecodeXqa>()
         .add::<DecodeXqaFrom64>()
         .add::<DecodeXqaWholeWindow>()
@@ -775,6 +783,7 @@ tuning! {
     prefill_wide_sliding: bool = false, on PrefillWideSliding;
     decode_grouped_prefill_from: u32 = 0, get DecodeGroupedPrefillFrom;
     decode_grouped_prefill_lse: bool = false, on DecodeGroupedPrefillLse;
+    decode_grouped_prefill_window: bool = false, on DecodeGroupedPrefillWindow;
     decode_xqa: bool = false, on DecodeXqa;
     decode_xqa_from_64: u32 = 0, get DecodeXqaFrom64;
     decode_xqa_whole_window: u32 = 0, get DecodeXqaWholeWindow;

@@ -17,6 +17,9 @@ gemv.bf16 = "narrow"
 gemm.narrow_n = 8
 elemwise.rows_vec = true
 sdpa.merge_warp = true
+sdpa.decode.grouped_prefill_from = 8
+sdpa.decode.grouped_prefill_lse = true
+sdpa.decode.grouped_prefill_window = true
 moe.mxfp4_mma_from = 17
 moe.mxfp4_mma_until = 16777216
 sdpa.dsv4_replay = true
@@ -40,6 +43,9 @@ measured = [
   "kernel.gemm.narrow_n",
   "kernel.elemwise.rows_vec",
   "kernel.sdpa.merge_warp",
+  "kernel.sdpa.decode.grouped_prefill_from",
+  "kernel.sdpa.decode.grouped_prefill_lse",
+  "kernel.sdpa.decode.grouped_prefill_window",
   "kernel.moe.mxfp4_mma_from",
   "kernel.moe.mxfp4_mma_until",
   "kernel.ssm.gdn_fused_scan",
