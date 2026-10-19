@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "agent-loop"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"

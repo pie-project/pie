@@ -92,6 +92,13 @@ pub mod grammar {
     pub use crate::pie::inferlet::grammar::*;
 }
 
+/// Tool calls: a toolset's prompt tokens, the decoder that finds calls in
+/// output, and [`tools::answer`], which formats a result to feed back (and
+/// which an agent trace reads as the end of the wait on that tool).
+pub mod tools {
+    pub use crate::pie::inferlet::tools::*;
+}
+
 pub mod media {
     pub use crate::pie::inferlet::forward::MediaSpan as Span;
     pub use crate::pie::inferlet::media::{Audio, Image, Video};
