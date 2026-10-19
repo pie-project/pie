@@ -1,11 +1,20 @@
 # A release's FP8 projections and expert banks as stored: e4m3 codes beside
-# `*.weight_scale_inv` f32 factors a 128-square block (DeepSeek's and GLM's
-# layout), or modelopt's e4m3 codes under one `.weight_scale`, read byte for
+# `*.weight_scale_inv` factors a 128-square block (DeepSeek's and GLM's
+# layout, f32; Qwen's, bf16), or modelopt's e4m3 codes under one `.weight_scale`, read byte for
 # byte into the `e4m3tile128` encodings.
 
 def fp8_proj(w):
     """Whether the projection `w` keeps the release's own FP8."""
     return w != None and w.dtype in [dtype.e4m3tile128, dtype.e4m3tile128a8]
+
+def block_factors(reads, name):
+    """The block factors `name`, read as f32: as stored, or, stored bf16 (as
+    Qwen's FP8 releases store them), widened exactly into an f32 tensor of
+    their own, which the join reads."""
+    if stored(name) == raw(dtype.f32):
+        return src(name)
+    reads.push(tensor(name + ".f32", src(name).cast(raw(dtype.f32)), raw(dtype.f32), internal = True))
+    return out(name + ".f32")
 
 def fp8_read(reads, w, names):
     """The projection `w` as the release stores it: its legs' e4m3 codes
@@ -27,7 +36,7 @@ def fp8_read(reads, w, names):
             continue
         if not has(factor):
             fail("`{}`: `{}` holds FP8 codes whose block factors are stored beside it as `{}`, and the checkpoint holds none".format(w.name, name, factor))
-        factors.append(src(factor))
+        factors.append(block_factors(reads, factor))
     counted = [(rows + 127) // 128, (cols + 127) // 128]
     reads.extend([
         tensor(w.name, codes[0] if len(codes) == 1 else concat(0, codes), encoding(dtype.e4m3)),
@@ -59,7 +68,7 @@ def fp8_bank(reads, w, legs):
             if not has(factor):
                 fail("`{}`: `{}` holds FP8 codes whose block factors are stored beside it as `{}`, and the checkpoint holds none".format(w.name, name, factor))
             codes.append(src(name).transmute([1, per, cols], encoding(dtype.e4m3)))
-            factors.append(src(factor).transmute([1, per // 128, cols // 128], encoding(dtype.f32)))
+            factors.append(block_factors(reads, factor).transmute([1, per // 128, cols // 128], encoding(dtype.f32)))
     counted = [experts, rows // 128, cols // 128]
     codes = concat(0, codes)
     factors = concat(0, factors)

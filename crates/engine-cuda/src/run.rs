@@ -49,6 +49,9 @@ pub struct WeightTable(
     /// A dense row requantized in place at load to fp8b128 (codes,
     /// atom-laid exponents; `kernel.gemm.fp8_o_down`): its bf16 is gone.
     pub std::collections::BTreeMap<usize, (Tensor, Tensor)>,
+    /// A block-FP8 dense row's bf16 copy widened at load beside its codes
+    /// (`kernel.gemm.fp8_shadow`), which a batch's rows read on cuBLAS.
+    pub std::collections::BTreeMap<usize, Tensor>,
 );
 
 #[derive(Clone, Debug, Default)]
@@ -1699,6 +1702,14 @@ impl<'c> Run<'c> {
             return None;
         };
         self.weights.1.get(&(*w as usize)).copied()
+    }
+
+    /// The bf16 copy a block-FP8 dense plane keeps (`kernel.gemm.fp8_shadow`).
+    pub(crate) fn fp8_shadow(&self, id: ValueId) -> Option<Tensor> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        self.weights.2.get(&(*w as usize)).copied()
     }
 
     pub(crate) fn maybe_tiled_planes(

@@ -192,8 +192,17 @@ fn the_fp8_block_projections_answer_the_dot() {
     let cases = [(0, 2, 1, 4096, 2048), (0, 4, 1, 8192, 1024), (0, 4, 1, 32768, 1024),
         (0, 8, 1, 1024, 4096), (1, 3, 8, 256, 1024), (2, 37, 4, 256, 1024), (3, 1, 1, 640, 6144),
         (3, 3, 1, 1024, 1536)];
+    // The mma.sync fp8 kernels (arms 0 and 1) are sm_89's: an Ada's e4m3 MMA.
+    let fp8_mma = kernels_cuda::jit::cache::arch()
+        .and_then(|a| {
+            a.trim_start_matches("sm_")
+                .trim_end_matches(char::is_alphabetic)
+                .parse::<u32>()
+                .ok()
+        })
+        .is_some_and(|cc| cc >= 89);
     for (arm, rows, groups, n, k) in cases {
-        if !supported() && arm >= 2 {
+        if (!supported() && arm == 2) || (!fp8_mma && arm <= 1) {
             continue;
         }
         let mut b = Bench::new(0xf8 + rows as u64);
@@ -291,3 +300,40 @@ fn the_quantizing_products_answer_the_read_back_dot() {
         assert!(same, "{what}: the held and dependent products");
     }
 }
+
+#[test]
+fn the_w8a16_projections_answer_the_dot() {
+    use kernels_cuda::linear::w8a16;
+    // (block, m, n, k): the mma.sync kernel at each CTA shape (16, 32 and 64
+    // rows, a part tile of each), and wider fires on the widened plane.
+    #[rustfmt::skip]
+    let cases = [(128, 1, 384, 1024), (128, 5, 200, 640), (128, 16, 512, 2048), (128, 23, 256, 768),
+        (128, 64, 136, 512), (128, 100, 256, 1024), (32, 1, 256, 1024), (32, 37, 200, 512),
+        (32, 130, 200, 1024), (128, 256, 384, 1024), (128, 300, 136, 512), (32, 1024, 256, 2048), (128, 777, 520, 640)];
+    for (gran, m, n, k) in cases {
+        let mut b = Bench::new(0xa16 ^ (m * n + k) as u64);
+        let (x, xv) = b.bf16(m * k);
+        let s = b.side(Elem::E4m3, Some(gran), n, k);
+        let atoms = &s.scales.as_ref().expect("scaled").0;
+        let (codes, atoms) = (b.up(&s.bytes), b.up(atoms));
+        let (mut y, ctx) = (b.out(m, n), b.ctx());
+        let took = w8a16::matmul(
+            &ctx,
+            "test",
+            t(x, m, k, Bf16),
+            codes,
+            atoms,
+            gran as u32,
+            &mut y,
+        )
+        .expect("the W8A16 product fires");
+        assert!(took, "{m}x{n}x{k} in {gran}s is a shape it reads");
+        let want = dot(
+            [m, n, k],
+            |r, i| xv[r * k + i],
+            |_, c, i| f64::from(s.value(c, k, i)),
+        );
+        b.check(y.ptr, &want, TOL, &format!("W8A16 in {gran}s, {m}x{n}x{k}"));
+    }
+}
+

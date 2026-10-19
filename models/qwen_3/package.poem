@@ -51,6 +51,7 @@ MODELS = [
 U4 = dtype.u4g64
 BF = dtype.bf16
 U8 = dtype.u8g64
+F8 = dtype.e4m3tile128a8
 
 DEPLOYMENTS = [
     deployment("qwen36-27b", weights = U4, kv = BF, drafter = "mtp"),
@@ -86,6 +87,9 @@ DEPLOYMENTS = [
     deployment("qwen38-27b", weights = BF, kv = BF),
     deployment("qwen35-a3b", weights = BF, kv = BF),
     deployment("qwen36-35b-a3b", weights = BF, kv = BF),
+    # Qwen3.6-35B-A3B-FP8 as released: its projections and experts as stored
+    # (128-square blocks, activations e4m3 in 1x128), the rest bf16.
+    deployment("qwen36-35b-a3b", weights = F8, kv = BF),
     deployment("qwen35-d3b", weights = BF, kv = BF),
     deployment("qwen35-d0.8b", weights = BF, kv = BF, drafter = "eagle"),
     deployment("qwen35-d0.8b", weights = BF, kv = BF),

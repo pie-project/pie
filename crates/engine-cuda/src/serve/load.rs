@@ -119,6 +119,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             boot.trace.clone(),
             tuning.decode_grouped_prefill_from,
             tuning.decode_grouped_prefill_lse,
+            tuning.decode_grouped_prefill_window,
             kernels_cuda::attn::xqa::Gate::of(tuning),
         );
         boot.trace = crate::narrow::gdn_out_bf16(boot.trace.clone(), tuning.ssm_gdn_out_bf16);
@@ -565,6 +566,11 @@ impl Shell {
         #[cfg(feature = "cuda")]
         if device.ctx().tuning().fp8_o_down && kernels_cuda::linear::tc5::supported() {
             weights.requantize_grouped(&boot.trace, device.stream())?;
+        }
+        // `kernel.gemm.fp8_shadow`: block-FP8 dense planes keep a bf16 copy.
+        #[cfg(feature = "cuda")]
+        if device.ctx().tuning().gemm_fp8_shadow && !kernels_cuda::linear::tc5::supported() {
+            weights.shadow_fp8_dense(&boot.trace, device.stream())?;
         }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
@@ -1305,13 +1311,16 @@ fn decoded_weight_planes(
                 }
             }
             // On ROCm an fp8b128 projection is one dense e4m3 plane, decoded
-            // to bf16 for a prefill's GEMM like a split-plane one.
-            #[cfg(feature = "rocm")]
-            if let poem_ir::Operation::Linear(poem_ir::Linear::MatmulActQuant {
-                w,
-                scales: Some(_),
-                ..
-            }) = &node.op
+            // to bf16 for a prefill's GEMM like a split-plane one; on CUDA
+            // without tcgen05 so is its W8A16 product past
+            // `w8a16::GEMM_UNTIL` rows.
+            #[cfg(any(feature = "rocm", feature = "cuda"))]
+            if (cfg!(feature = "rocm") || !kernels_cuda::linear::tc5::supported())
+                && let poem_ir::Operation::Linear(poem_ir::Linear::MatmulActQuant {
+                    w,
+                    scales: Some(_),
+                    ..
+                }) = &node.op
                 && let Some(poem_ir::Ty::Tensor { shape, .. }) =
                     trace.values.get(w.0 as usize).map(|decl| &decl.ty)
             {

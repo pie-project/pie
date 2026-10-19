@@ -1,0 +1,59 @@
+api = 1
+
+[target]
+device = "NVIDIA A100 80GB PCIe"
+
+# Each line's measured win is in the commit that set it.
+# cuBLAS over the fused skinny GEMM, the narrow bf16 GEMV, row kernels 16
+# bytes a lane, a split attention's partials folded a warp a row;
+# a block-FP8 projection's two rows or fewer on the GEMV over bf16 rows;
+# MXFP4 selects of 17 routes or more on the register-dequant MMA (fewer stay
+# on the per-route kernel, which streams a decode's bank faster); Qwen3.5's
+# gated delta on the fused scan; DeepSeek-V4.1's bounded replay, as B200's.
+[kernel]
+gemm.fp8_gemv_until = 2
+gemm.skinny_rows = 0
+gemv.bf16 = "narrow"
+gemm.narrow_n = 8
+gemm.fp8_shadow = true
+elemwise.rows_vec = true
+sdpa.merge_warp = true
+sdpa.mla_selected_mma = true
+sdpa.decode.grouped_prefill_from = 8
+sdpa.decode.grouped_prefill_lse = true
+sdpa.decode.grouped_prefill_window = true
+moe.mxfp4_mma_from = 17
+moe.mxfp4_mma_until = 16777216
+sdpa.dsv4_replay = true
+ssm = ["gdn_fused_scan", "conv_vec4", "gdn_out_bf16", "kda_chunked", "kda_step_fused"]
+
+# A prefill's fire on four buckets a doubling from 256 rows (its GEMMs run
+# its bucket's rows), and a bucket between powers of two below.
+[engine]
+prefill_lattice_from = 256
+lattice_steps = 2
+
+[provenance]
+source = "end to end on MiMo-V2.6-Flash and Qwen3.6-27B miniatures and checkpoints, by hand"
+measured = [
+  "kernel.gemm.fp8_gemv_until",
+  "kernel.gemm.skinny_rows",
+  "kernel.gemv.bf16",
+  "kernel.gemm.narrow_n",
+  "kernel.gemm.fp8_shadow",
+  "kernel.elemwise.rows_vec",
+  "kernel.sdpa.merge_warp",
+  "kernel.sdpa.mla_selected_mma",
+  "kernel.sdpa.decode.grouped_prefill_from",
+  "kernel.sdpa.decode.grouped_prefill_lse",
+  "kernel.sdpa.decode.grouped_prefill_window",
+  "kernel.moe.mxfp4_mma_from",
+  "kernel.moe.mxfp4_mma_until",
+  "kernel.ssm.gdn_fused_scan",
+  "kernel.ssm.conv_vec4",
+  "kernel.ssm.gdn_out_bf16",
+  "kernel.ssm.kda_chunked",
+  "kernel.ssm.kda_step_fused",
+  "engine.prefill_lattice_from",
+  "engine.lattice_steps",
+]

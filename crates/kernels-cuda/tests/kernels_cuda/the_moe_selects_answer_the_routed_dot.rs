@@ -213,6 +213,13 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Mx, mma, [8, 12, 4, 384, 2880], t, None, 0),
         (K::Mx, mma, [8, 100, 4, 384, 2880], f, None, 0),
         (K::MxBias, mma, [8, 16, 4, 192, 2880], t, alpha, 8),
+        // Past 32 routes an expert, the shared-memory-staged kernel: by
+        // token and by route, its GLU under scales past f16's range, a live
+        // window, NVFP4 and its GLU.
+        (K::MxBias, mma, [8, 96, 4, 256, 2880], t, None, 0),
+        (K::Mx, mma, [4, 200, 2, 384, 1024], f, None, 0),
+        (K::MxBias, mma, [8, 80, 4, 192, 2880], t, alpha, 2),
+        (K::Mx, mma, [8, 120, 4, 256, 512], t, None, 1),
         (K::Mx, cvt, [8, 1, 4, 200, 2880], t, None, 0),
         (K::MxBias, cvt, [8, 40, 4, 576, 2880], t, None, 0),
         (K::MxBias, cvt, [8, 3, 4, 576, 2880], f, None, 2),
@@ -226,6 +233,8 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Nv, TC5, [16, 48, 10, 128, 640], t, None, 0),
         (K::Nv, nv_mma, [16, 2, 10, 256, 640], f, None, 0),
         (K::Nv, nv_mma, [16, 48, 10, 320, 2560], t, sw, 0),
+        (K::Nv, nv_mma, [16, 160, 10, 256, 640], t, None, 0),
+        (K::Nv, nv_mma, [16, 120, 10, 320, 2560], t, sw, 0),
     ];
     if supported() {
         // The atom-laid select on the e2m1 converts, keeping its order; the
@@ -240,6 +249,8 @@ fn the_routed_selects_answer_the_routed_dot() {
                 (kind, d, [8, 70, 3, 256, 512], f, None, 0), (kind, d, [8, 5, 3, 256, 512], f, None, 1)]);
         }
     }
+    // The tcgen05 arms are Blackwell's; elsewhere their cases have no arm.
+    cases.retain(|case| supported() || !(case.1 == TC5 || case.1 == SM100));
     cases.into_iter().for_each(routed);
 }
 
@@ -349,3 +360,36 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         assert!(far < tol, "{what}: {far:.4} from the host's product");
     }
 }
+
+#[test]
+fn the_w8a16_selects_answer_the_routed_dot() {
+    use kernels_cuda::linear::moe::select_fp8_w8a16;
+    // (experts, tokens, top_k, n, k, by_token): a decode's few routes an
+    // expert, a slice of 16 and of 32, and the down select's routes as rows.
+    #[rustfmt::skip]
+    let cases = [(8, 1, 4, 256, 512, true), (8, 3, 2, 136, 1024, true), (4, 20, 2, 512, 256, true),
+        (16, 64, 8, 128, 512, false), (8, 7, 4, 384, 768, false)];
+    for (ex, tokens, top, n, k, by_token) in cases {
+        let what = format!("W8A16 select {ex}x{tokens}x{top} {n}x{k} by_token={by_token}");
+        let mut b = Bench::new(0x8e1 ^ (tokens * 13 + n + k) as u64);
+        let count = tokens * top;
+        let routes = tab(count, |r| ((r / top * 3 + r % top * 5) % ex) as i32);
+        let (rows_x, div) = pick(by_token, (tokens, top), (count, 1));
+        let (x, a) = b.bf16(rows_x * k);
+        let s = b.side(Elem::E4m3, Some(128), ex * n, k);
+        let atoms = &s.scales.as_ref().expect("scaled").0;
+        let (codes, atoms) = (b.up(&s.bytes), b.up(atoms));
+        let r = t(b.up(&routes), tokens, top, I32);
+        let mut y = b.out(count, n);
+        let ctx = b.ctx();
+        let x = t(x, rows_x, k, Bf16);
+        select_fp8_w8a16(
+            &ctx, "test", x, codes, atoms, ex as u32, 128, r, &mut y, None,
+        )
+        .expect("the W8A16 select fires");
+        let w = |r: usize, c: usize, i: usize| f64::from(s.value(routes[r] as usize * n + c, k, i));
+        let want = dot([count, n, k], |r, i| a[r / div * k + i], w);
+        b.check(y.ptr, &want, TOL, &what);
+    }
+}
+

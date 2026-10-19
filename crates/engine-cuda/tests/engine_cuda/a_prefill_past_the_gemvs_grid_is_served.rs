@@ -354,11 +354,29 @@ fn a_bank_past_the_cache_is_where_grouping_pays() {
 
     let (gemv, gemv_ms) = fire_at(&fixture, BOTH, Leg::Gemv).expect("the per-route GEMV fires");
     finite(&gemv[0], "gemv");
-    for leg in GROUPED {
+    for leg in GROUPED
+        .into_iter()
+        .filter(|leg| *leg != Leg::Tcgen05 || tcgen05())
+    {
         let (grouped, grouped_ms) = fire_at(&fixture, BOTH, leg).expect("the grouped leg fires");
         finite(&grouped[0], "grouped");
         pays(leg, &grouped, grouped_ms, &gemv, gemv_ms);
     }
+}
+
+/// Whether the device has tcgen05 (sm_100 and up).
+fn tcgen05() -> bool {
+    use engine_cuda::device::rt;
+    let mut major = 0;
+    // SAFETY: an attribute query of device 0 into a local.
+    unsafe {
+        rt::cudaDeviceGetAttribute(
+            &mut major,
+            rt::cudaDeviceAttr::cudaDevAttrComputeCapabilityMajor,
+            0,
+        );
+    }
+    major >= 10
 }
 
 /// A grouped leg reading the bank once a batch against the GEMV reading it
@@ -384,8 +402,11 @@ fn pays(leg: Leg, grouped: &[Vec<f32>], grouped_ms: f64, gemv: &[Vec<f32>], gemv
         mean <= 0.01 * spread,
         "the two legs answer differently in the MEAN: {mean} over a spread of {spread}"
     );
+    // Below tcgen05 the "GEMV" leg is the routed MMA select, which reads a
+    // bank once an expert too: there grouping need only keep pace.
+    let bound = if tcgen05() { gemv_ms } else { gemv_ms * 1.1 };
     assert!(
-        grouped_ms < gemv_ms,
+        grouped_ms < bound,
         "grouping a bank that does not fit in cache ({leg:?}) took {grouped_ms:.1} ms against the \
          per-route GEMV's {gemv_ms:.1} ms; this is the shape it exists for"
     );

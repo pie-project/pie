@@ -927,7 +927,7 @@ impl Bodies {
         // The warm fires walk the streams the capture will: a side stream's
         // regions take their own slabs (`scratch_stream` scopes by stream),
         // which a capture cannot grow.
-        walk_capture(at, run, place, Streams::Forked)?;
+        walk_capture(at, run, place, Streams::Warm)?;
 
         if self.sealed_decline() {
             let declines = self.recorder.bstats.sealed_declines;
@@ -1260,6 +1260,11 @@ impl BodyMap {
 enum Streams {
     Serial,
     Forked,
+    /// A warm fire's walk: the side streams a capture forks onto (so each
+    /// takes the slabs its regions will), launched eagerly, so its
+    /// conditional regions walk as an eager fire's do rather than open
+    /// nodes in a capture there is none of.
+    Warm,
 }
 
 impl<'a> Fire<'a> {
@@ -1312,7 +1317,9 @@ fn walk_capture_units(
 ) -> Result<()> {
     let serial_capture = crate::serve::diag::on().capture_serial;
     let mut cursor = match (streams, at.lanes) {
-        (Streams::Forked, Some(lanes)) if !serial_capture => Cursor::across(place, lanes),
+        (Streams::Forked | Streams::Warm, Some(lanes)) if !serial_capture => {
+            Cursor::across(place, lanes)
+        }
         _ => at.serial(place),
     };
     if streams == Streams::Forked {

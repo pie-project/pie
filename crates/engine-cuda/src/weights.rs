@@ -1008,7 +1008,7 @@ impl Weights {
         }
         Ok(Weights {
             store,
-            table: WeightTable(table, BTreeMap::new()),
+            table: WeightTable(table, BTreeMap::new(), BTreeMap::new()),
             banks: banks(trace, &places),
             experts,
             from_cache,
@@ -1103,7 +1103,7 @@ impl Weights {
                 )?;
                 crate::device::ctx::check(
                     "cudaStreamSynchronize",
-                    cudarc::runtime::sys::cudaStreamSynchronize(stream.cast()),
+                    crate::device::rt::cudaStreamSynchronize(stream.cast()),
                 )?;
             }
             drop(staged);
@@ -1120,6 +1120,82 @@ impl Weights {
                 ),
             );
             done += 1;
+        }
+        Ok(done)
+    }
+
+    /// `kernel.gemm.fp8_shadow`: each block-FP8 dense projection read at
+    /// bf16 activations keeps a bf16 copy, widened once here, that a
+    /// batch's rows read on cuBLAS. Returns the planes it widened.
+    #[cfg(feature = "cuda")]
+    pub fn shadow_fp8_dense(
+        &mut self,
+        trace: &Trace,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<u32> {
+        use poem_ir::{Def, Linear, Operation};
+        let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
+            Some(Def::Weight(at)) => Some(*at as usize),
+            _ => None,
+        };
+        // SAFETY: `stream` is the load's stream, live for the load.
+        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        let mut done = 0;
+        for node in &trace.nodes {
+            let Operation::Linear(Linear::MatmulActQuant {
+                w,
+                scales: Some(scales),
+                ..
+            }) = &node.op
+            else {
+                continue;
+            };
+            let (Some(at), Some(s_at)) = (weight(*w), weight(*scales)) else {
+                continue;
+            };
+            if self.table.2.contains_key(&at) {
+                continue;
+            }
+            let (Some(Some(WeightRow::Dense(codes))), Some(Some(WeightRow::Dense(atoms)))) = (
+                self.table.0.get(at).copied(),
+                self.table.0.get(s_at).copied(),
+            ) else {
+                continue;
+            };
+            if atoms.dtype != Dtype::U8 || atoms.width == 0 {
+                continue;
+            }
+            let (n, k) = (codes.rows, codes.width);
+            let gran = k.div_ceil(atoms.width);
+            let buffer = Buffer::zeroed_on(stream, n as usize * k as usize * 2)?;
+            // A plane the widen does not read (K not whole blocks) keeps no
+            // copy: its rows stay on the W8A16 kernels.
+            if kernels_cuda::linear::w8a16::widen(
+                &ctx,
+                "linear.fp8_shadow",
+                codes.ptr,
+                atoms.ptr,
+                gran,
+                n,
+                k,
+                buffer.ptr(),
+            )
+            .is_err()
+            {
+                continue;
+            }
+            self.table
+                .2
+                .insert(at, Tensor::new(buffer.ptr(), n, k, Dtype::Bf16));
+            self.decoded.push(buffer);
+            done += 1;
+        }
+        // SAFETY: the load's stream.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaStreamSynchronize",
+                cudarc::runtime::sys::cudaStreamSynchronize(stream.cast()),
+            )?;
         }
         Ok(done)
     }
@@ -1594,15 +1670,11 @@ fn lay_atoms(
     stream: *mut core::ffi::c_void,
 ) -> Result<()> {
     let banks = act_quant_banks(trace);
-    // A deployment that quantizes its activations runs on the tcgen05 GEMMs
-    // alone: refused at load where they are not, not at its first fire.
-    if !banks.is_empty() && !kernels_cuda::linear::tc5::supported() {
-        return Err(Fault::Unsupported(
-            "this deployment quantizes its activations, which runs on the tcgen05 GEMMs \
-             (sm_100a, sm_101a, sm_103a or sm_110a, NVRTC 12.9 or newer) that this device or \
-             NVRTC lacks; serve the deployment that reads bf16 activations instead"
-                .to_string(),
-        ));
+    // Where there are no tcgen05 GEMMs its products read bf16 activations
+    // (W4A16, W8A16), and its 4-bit banks keep their row-major scales for
+    // the selects that read them so.
+    if !kernels_cuda::linear::tc5::supported() {
+        return Ok(());
     }
     let mut temp: Option<Buffer> = None;
     for (at, gran) in banks {
