@@ -180,6 +180,10 @@ pub enum Elementwise {
         head_dim: u32,
         theta: f32,
         span: u32,
+        /// Steps past each row's position the rows turn as (a draft chain's
+        /// later steps).
+        #[serde(default)]
+        shift: i32,
         q_out: ValueId,
         k_out: ValueId,
     },
@@ -192,6 +196,9 @@ pub enum Elementwise {
         rotary_dim: u32,
         head_dim: u32,
         theta: f32,
+        /// Steps past each row's position the rows turn as, every axis.
+        #[serde(default)]
+        shift: i32,
         q_out: ValueId,
         k_out: ValueId,
     },

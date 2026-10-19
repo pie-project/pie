@@ -30,6 +30,7 @@ pub fn interleaved(
         rotary_dim,
         head_dim,
         theta,
+        0,
     )
 }
 
@@ -54,7 +55,31 @@ pub fn blocked(
         rotary_dim,
         head_dim,
         theta,
+        0,
     )
+}
+
+/// [`interleaved`] (`blocked` where `blocked`) turning each row `shift`
+/// positions past its own on every axis.
+#[allow(clippy::too_many_arguments)]
+pub fn shifted(
+    ctx: &Ctx,
+    blocked: bool,
+    q: &mut Tensor,
+    k: &mut Tensor,
+    positions: Tensor,
+    sections: [u32; AXES as usize],
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+    shift: i32,
+) -> Result<(), Error> {
+    let entry = if blocked {
+        "::pie::elemwise::rope_mrope_blocked<::pie::bf16>"
+    } else {
+        "::pie::elemwise::rope_mrope<::pie::bf16>"
+    };
+    fire(ctx, entry, q, k, positions, sections, rotary_dim, head_dim, theta, shift)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -68,6 +93,7 @@ fn fire(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    shift: i32,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_mrope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
@@ -140,6 +166,7 @@ fn fire(
             stated(OP, sections[0])?.arg(),
             stated(OP, sections[1])?.arg(),
             stated(OP, sections[2])?.arg(),
+            shift.arg(),
             ctx.stage(),
         ],
     )

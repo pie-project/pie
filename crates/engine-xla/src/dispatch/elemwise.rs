@@ -436,6 +436,9 @@ impl Run<'_> {
                 *theta,
                 *interleaved,
             ),
+            Elementwise::RopePartial { shift, .. } if *shift != 0 => {
+                Err(kernels_xla::Error::Unsupported { op: op.name() })
+            }
             Elementwise::RopePartial {
                 q,
                 k,
@@ -445,6 +448,7 @@ impl Run<'_> {
                 theta,
                 span,
                 q_out: _,
+                shift: _,
                 k_out: _,
             } => elemwise::rope::partial(
                 self.ctx(),
@@ -456,6 +460,9 @@ impl Run<'_> {
                 *theta,
                 *span,
             ),
+            Elementwise::RopeMrope { shift, .. } if *shift != 0 => {
+                Err(kernels_xla::Error::Unsupported { op: op.name() })
+            }
             Elementwise::RopeMrope {
                 q,
                 k,
@@ -465,6 +472,7 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 theta,
+                shift: _,
                 q_out: _,
                 k_out: _,
             } => elemwise::rope_mrope::interleaved(
@@ -487,6 +495,7 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 theta,
+                shift: _,
                 q_out: _,
                 k_out: _,
             } => elemwise::rope_mrope::split(
@@ -509,6 +518,7 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 theta,
+                shift: _,
                 q_out: _,
                 k_out: _,
             } => elemwise::rope_mrope::blocked(

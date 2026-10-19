@@ -941,6 +941,7 @@ impl Run<'_> {
             *head_dim,
             *theta,
             *span,
+            0,
         )?;
         kernels_cuda::attn::kv_append(
             self.ctx(),

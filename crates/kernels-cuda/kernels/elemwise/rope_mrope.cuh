@@ -18,6 +18,7 @@ __global__ void rope_mrope(
     int rotary_dim,
     float theta,
     int s0, int s1, int s2,
+    int shift,
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
@@ -31,9 +32,11 @@ __global__ void rope_mrope(
     // at theta^(-2i/rotary_dim), as `rope_partial` and upstream turn it.
     const int half = rotary_dim / 2;
 
-    const int pos_t = positions[3 * row + 0];
-    const int pos_h = positions[3 * row + 1];
-    const int pos_w = positions[3 * row + 2];
+    // `shift` steps past the row's own position on every axis (a draft
+    // chain's later steps, text rows whose axes agree).
+    const int pos_t = positions[3 * row + 0] + shift;
+    const int pos_h = positions[3 * row + 1] + shift;
+    const int pos_w = positions[3 * row + 2] + shift;
     (void)s0;
 
     for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
@@ -84,6 +87,7 @@ __global__ void rope_mrope_blocked(
     int rotary_dim,
     float theta,
     int s0, int s1, int s2,
+    int shift,
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
@@ -97,9 +101,9 @@ __global__ void rope_mrope_blocked(
     const int rope_angles = rotary_dim / 2;
     const int total = s0 + s1 + s2;
 
-    const int pos[3] = { positions[3 * row + 0],
-                         positions[3 * row + 1],
-                         positions[3 * row + 2] };
+    const int pos[3] = { positions[3 * row + 0] + shift,
+                         positions[3 * row + 1] + shift,
+                         positions[3 * row + 2] + shift };
 
     for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
         const int head_idx = t / half;

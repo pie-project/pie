@@ -581,6 +581,7 @@ impl Run<'_> {
                 head_dim,
                 theta,
                 span,
+                shift,
                 q_out: _,
                 k_out: _,
             } => elemwise::rope::partial(
@@ -592,6 +593,7 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
                 *span,
+                *shift,
             ),
             Elementwise::RopeMrope {
                 q,
@@ -602,6 +604,39 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 theta,
+                shift,
+                q_out: _,
+                k_out: _,
+            } if *shift != 0 => elemwise::rope_mrope::shifted(
+                self.ctx(),
+                match form {
+                    MropeForm::Interleaved => false,
+                    MropeForm::Blocked => true,
+                    MropeForm::Split => {
+                        return Err(kernels_cuda::Error::Unsupported {
+                            op: "elementwise.rope_mrope",
+                        });
+                    }
+                },
+                &mut self.tensor(*q),
+                &mut self.tensor(*k),
+                self.tensor(*positions),
+                *sections,
+                *rotary_dim,
+                *head_dim,
+                *theta,
+                *shift,
+            ),
+            Elementwise::RopeMrope {
+                q,
+                k,
+                positions,
+                sections,
+                form,
+                rotary_dim,
+                head_dim,
+                theta,
+                shift: _,
                 q_out: _,
                 k_out: _,
             } => (match form {

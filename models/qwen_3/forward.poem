@@ -48,9 +48,13 @@ def positions(inputs, vision):
     """The positions a trunk's attention rotates by: multimodal with a tower."""
     return inputs.mrope_positions() if vision else inputs.positions()
 
-def rope(q, k, positions, vision, rotary_dim, head_dim, theta):
+def rope(q, k, positions, vision, rotary_dim, head_dim, theta, shift = 0):
     if not vision:
+        if shift:
+            return ops.elemwise.rope_partial(q, k, positions, rotary_dim, head_dim, theta, shift = shift)
         return ops.elemwise.rope_partial(q, k, positions, rotary_dim, head_dim, theta)
+    if shift:
+        return ops.elemwise.rope_mrope(q, k, positions, MROPE_SECTIONS, "interleaved", rotary_dim, head_dim, theta, shift = shift)
     return ops.elemwise.rope_mrope(q, k, positions, MROPE_SECTIONS, "interleaved", rotary_dim, head_dim, theta)
 
 def tower(inputs, t):
@@ -214,7 +218,8 @@ def draft(m, inputs, x, logits, head):
         dy = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.fc_embed), ops.linear.matmul(h, mtp.fc_hidden))
 
         nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mixer_norm, mtp.mixer_norm_eps)
-        o = draft_attn(nx, inputs, plan, a, m.head_dim, m.kv_heads, lambda q, k: rotate(q, k, inputs, m, a), append = step == 0)
+        # Step j's token sits j past the row's: it turns there.
+        o = draft_attn(nx, inputs, plan, a, m.head_dim, m.kv_heads, lambda q, k: rotate(q, k, inputs, m, a, step), append = step == 0)
         dy = ops.elemwise.residual_add(o, dy)
 
         nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mlp_norm, mtp.mlp_norm_eps)
@@ -232,9 +237,9 @@ def draft(m, inputs, x, logits, head):
 
 MTP_DEPTH = 3
 
-def rotate(q, k, inputs, m, a):
+def rotate(q, k, inputs, m, a, shift = 0):
     vision = m.tower != None
-    return rope(q, k, positions(inputs, vision), vision, a.rotary_dim, m.head_dim, a.theta)
+    return rope(q, k, positions(inputs, vision), vision, a.rotary_dim, m.head_dim, a.theta, shift)
 
 def attn_mixer(x, inputs, m, plans, mask, a):
     pages = inputs.kv(a.kv)

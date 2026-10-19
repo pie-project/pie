@@ -351,6 +351,21 @@ pub fn rope_partial(
     theta: f32,
     span: Option<u32>,
 ) -> (Value, Value) {
+    rope_partial_shifted(q, k, positions, rotary_dim, head_dim, theta, span, 0)
+}
+
+/// [`rope_partial`] turning each row as `shift` positions past its own.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_partial_shifted(
+    q: &Value,
+    k: &Value,
+    positions: &Value,
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+    span: Option<u32>,
+    shift: i32,
+) -> (Value, Value) {
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
     let k_out = r.fresh(k.ty().clone());
@@ -363,6 +378,7 @@ pub fn rope_partial(
             head_dim,
             theta,
             span: span.unwrap_or(rotary_dim / 2),
+            shift,
             q_out: q_out.id(),
             k_out: k_out.id(),
         },
@@ -781,6 +797,22 @@ pub fn rope_mrope(
     head_dim: u32,
     theta: f32,
 ) -> (Value, Value) {
+    rope_mrope_shifted(q, k, positions, sections, form, rotary_dim, head_dim, theta, 0)
+}
+
+/// [`rope_mrope`] turning each row `shift` positions past its own.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_mrope_shifted(
+    q: &Value,
+    k: &Value,
+    positions: &Value,
+    sections: [u32; 3],
+    form: MropeForm,
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+    shift: i32,
+) -> (Value, Value) {
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
     let k_out = r.fresh(k.ty().clone());
@@ -794,6 +826,7 @@ pub fn rope_mrope(
             rotary_dim,
             head_dim,
             theta,
+            shift,
             q_out: q_out.id(),
             k_out: k_out.id(),
         },

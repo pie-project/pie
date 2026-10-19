@@ -2157,6 +2157,7 @@ pub(crate) static OPS: &[Op] = &[
             "head_dim",
             "theta",
             "span",
+            "shift",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -2166,11 +2167,12 @@ pub(crate) static OPS: &[Op] = &[
             let head_dim: u32 = a.next()?;
             let theta: f32 = a.next()?;
             let span: Option<u32> = a.next()?;
+            let shift: Option<u32> = a.next()?;
             result(
                 heap,
                 dsl("elemwise.rope_partial", || {
-                    ops::elemwise::rope_partial(
-                        &q, &k, &positions, rotary_dim, head_dim, theta, span,
+                    ops::elemwise::rope_partial_shifted(
+                        &q, &k, &positions, rotary_dim, head_dim, theta, span, shift.map_or(0, |s| s as i32),
                     )
                 })?,
             )
@@ -2580,6 +2582,7 @@ pub(crate) static OPS: &[Op] = &[
             "rotary_dim",
             "head_dim",
             "theta",
+            "shift",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -2590,11 +2593,13 @@ pub(crate) static OPS: &[Op] = &[
             let rotary_dim: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
             let theta: f32 = a.next()?;
+            let shift: Option<u32> = a.next()?;
             result(
                 heap,
                 dsl("elemwise.rope_mrope", || {
-                    ops::elemwise::rope_mrope(
+                    ops::elemwise::rope_mrope_shifted(
                         &q, &k, &positions, sections, form, rotary_dim, head_dim, theta,
+                        shift.map_or(0, |s| s as i32),
                     )
                 })?,
             )

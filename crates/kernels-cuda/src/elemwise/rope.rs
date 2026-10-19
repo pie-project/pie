@@ -161,13 +161,14 @@ pub fn partial(
     head_dim: u32,
     theta: f32,
     span: u32,
+    shift: i32,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     positions_stream(OP, positions, q);
     rope_partial(
-        ctx, OP, *q, *k, positions, rotary_dim, head_dim, theta, span,
+        ctx, OP, *q, *k, positions, rotary_dim, head_dim, theta, span, shift,
     )
 }
 
@@ -184,7 +185,7 @@ pub fn partial_q(
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     positions_stream(OP, positions, q);
     let k = Tensor::new(q.ptr, q.rows, 0, q.dtype);
-    rope_partial(ctx, OP, *q, k, positions, rotary_dim, head_dim, theta, span)
+    rope_partial(ctx, OP, *q, k, positions, rotary_dim, head_dim, theta, span, 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -869,6 +870,7 @@ fn rope_partial(
     head_dim: u32,
     theta: f32,
     span: u32,
+    shift: i32,
 ) -> Result<(), Error> {
     let num_q_heads = q_heads(op, q.width, head_dim)?;
     let num_kv_heads = heads(op, k.width, head_dim)?;
@@ -880,7 +882,7 @@ fn rope_partial(
             q.arg(),
             k.arg(),
             positions.arg(),
-            0_i32.arg(),
+            shift.arg(),
             stated(op, num_q_heads)?.arg(),
             stated(op, num_kv_heads)?.arg(),
             stated(op, head_dim)?.arg(),

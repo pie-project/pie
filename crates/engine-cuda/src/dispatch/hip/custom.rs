@@ -562,6 +562,7 @@ impl Run<'_> {
                 head_dim,
                 theta,
                 span,
+                shift: 0,
                 q_out,
                 k_out,
             },
