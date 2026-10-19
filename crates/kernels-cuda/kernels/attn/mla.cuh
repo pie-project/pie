@@ -563,9 +563,8 @@ constexpr int kStages = PIE_MLA_MMA_STAGES;
 static_assert(kStages >= 1, "kStages must be at least 1");
 constexpr int kThreads = kWarps * 32;
 constexpr int kCkv = 512;
-constexpr int kKpe = 64;
-constexpr int kD = kCkv + kKpe;
-constexpr int kLdD = kD + 8;
+// `kKpe`/`kD`/`kLdD` are the rope width and depend on the kernel's `KPE`
+// template parameter (64 for a rotated part, 0 for NoPE latents).
 constexpr int kLdP = kBK + 8;
 constexpr int kDimsPerWarp = kCkv / kWarps;
 constexpr int kNTiles = kDimsPerWarp / 8;
@@ -626,6 +625,7 @@ __device__ __forceinline__ void ld_b_v(std::uint32_t (&b)[2], const __nv_bfloat1
         : "r"(addr));
 }
 
+template <int KPE>
 __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_kernel(
     const __nv_bfloat16* __restrict__ q_nope,
     const __nv_bfloat16* __restrict__ q_pe,
@@ -641,6 +641,12 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     int R, int H, int page_size, float sm_scale, bool causal,
     const u32* __restrict__ win)
 {
+    // `KPE` the rope width: 64 with a rotated part, 0 for NoPE latents
+    // (GLM-5.3-Flash's DSA). The `d < kCkv` loads already skip the pe part
+    // when it is absent; q_pe/kpe_pages are then unread.
+    constexpr int kKpe = KPE;
+    constexpr int kD = kCkv + kKpe;
+    constexpr int kLdD = kD + 8;
     extern __shared__ __align__(16) char smem_raw[];
     __nv_bfloat16* sQ = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     __nv_bfloat16* sKbuf = sQ + kBM * kLdD;
