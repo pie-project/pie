@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    Serve,
+    Serve(ServeArgs),
 
     Run(ops::run::RunArgs),
 
@@ -63,6 +63,14 @@ enum Command {
     Tune(ops::tune::TuneArgs),
 
     Doctor,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServeArgs {
+    /// Record an agent trace while serving, written to this `.pie` file
+    /// when the server stops. `$PIE_TRACE` does the same.
+    #[arg(long, value_name = "FILE")]
+    trace: Option<std::path::PathBuf>,
 }
 
 #[cfg(unix)]
@@ -103,14 +111,14 @@ async fn main() -> ExitCode {
 async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
-    if let Command::Serve = cli.command {
-        return serve(cli.global, cli.diag.as_deref()).await;
+    if let Command::Serve(args) = cli.command {
+        return serve(cli.global, cli.diag.as_deref(), args).await;
     }
 
     pie::daemon::init_command(&cli.global);
 
     let answer = match cli.command {
-        Command::Serve => unreachable!("serve returns before the op dispatch"),
+        Command::Serve(_) => unreachable!("serve returns before the op dispatch"),
 
         Command::Model { cmd } => {
             let global = cli.global.clone();
@@ -142,7 +150,11 @@ async fn run() -> anyhow::Result<ExitCode> {
     Ok(code)
 }
 
-async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Result<ExitCode> {
+async fn serve(
+    global: pie::args::GlobalArgs,
+    diag: Option<&str>,
+    args: ServeArgs,
+) -> anyhow::Result<ExitCode> {
     let ctx = pie::daemon::init(
         pie::daemon::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
         global,
@@ -152,6 +164,7 @@ async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Res
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
     }
+    let tracing = pie::trace::begin(args.trace.as_deref());
     let handle =
         worker::standalone::run_standalone(controller, gateway, worker, &pie::paths::pie_home())
             .await?;
@@ -162,6 +175,11 @@ async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Res
     );
     println!("✓ Server ready at ws://{}", handle.listen_addr);
     Ok(ctx
-        .run_until_signal(async move { handle.shutdown().await })
+        .run_until_signal(async move {
+            if tracing {
+                pie::trace::end().await;
+            }
+            handle.shutdown().await
+        })
         .await)
 }

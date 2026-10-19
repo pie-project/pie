@@ -4,4 +4,5 @@ pub mod local;
 pub mod ops;
 pub mod paths;
 pub mod sweep;
+pub mod trace;
 pub mod ui;

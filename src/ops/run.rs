@@ -16,6 +16,16 @@ pub struct RunArgs {
     #[arg(long = "out", short = 'o', value_name = "DIR")]
     pub out: Option<PathBuf>,
 
+    /// Record an agent trace of the run (which agent's prefill, decode,
+    /// tool waits and KV pages hold the device, when) to this `.pie` file.
+    /// `$PIE_TRACE` does the same.
+    #[arg(long, value_name = "FILE")]
+    pub trace: Option<PathBuf>,
+
+    /// Launch this many copies of the program at once, each its own agent.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub parallel: usize,
+
     #[arg(last = true, allow_hyphen_values = true)]
     pub arguments: Vec<String>,
 }
@@ -275,6 +285,9 @@ pub async fn run(
     })?;
 
     let target = target(args.inferlet.as_deref(), args.path.as_deref())?;
+    if args.parallel == 0 {
+        bail!("--parallel takes at least 1");
+    }
 
     let (controller, gateway, mut worker) = worker::standalone::derive_standalone(&content)?;
     if let Some(words) = diag {
@@ -294,6 +307,7 @@ pub async fn run(
     }
     println!();
 
+    let tracing = crate::trace::begin(args.trace.as_deref());
     let pie =
         worker::standalone::run_standalone(controller, gateway, worker, &crate::paths::pie_home())
             .await
@@ -303,9 +317,13 @@ pub async fn run(
         &plan,
         &args.arguments,
         args.out.as_deref(),
+        args.parallel,
     )
     .await;
     fire_probes().await;
+    if tracing {
+        crate::trace::end().await;
+    }
     pie.shutdown().await;
     Ok(crate::ui::Answer::quiet().with_code(outcome?))
 }
@@ -355,6 +373,24 @@ async fn fire_probes() {
 #[cfg(not(feature = "profile-fire"))]
 async fn fire_probes() {}
 
+/// One of `--parallel`'s copies, to its end: its result on one line, under
+/// its number; its streamed output is not shown, since copies interleave.
+async fn follow_quietly(index: usize, mut process: client::client::Process) -> Result<bool> {
+    loop {
+        match process.recv().await.context("reading process output")? {
+            ProcessEvent::Return(value) => {
+                println!("[{index}] {}", value.trim());
+                return Ok(true);
+            }
+            ProcessEvent::Error(message) => {
+                eprintln!("[{index}] {message}");
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn write_received(
     dir: &Path,
     file: &client::client::ReceivedFile,
@@ -378,6 +414,7 @@ async fn drive(
     plan: &Plan,
     arguments: &[String],
     out_dir: Option<&Path>,
+    parallel: usize,
 ) -> Result<std::process::ExitCode> {
     let program = &plan.program;
     let client = Client::connect_with_identity(&format!("ws://{addr}/v1/ws"), "pie-run")
@@ -406,8 +443,37 @@ async fn drive(
         }
     }
 
+    let input = arguments_to_input(arguments);
+    if parallel > 1 {
+        let mut processes = Vec::with_capacity(parallel);
+        for _ in 0..parallel {
+            processes.push(
+                client
+                    .launch_process(program.to_string(), input.clone(), true)
+                    .await
+                    .with_context(|| format!("launching {program}"))?,
+            );
+        }
+        let waits: Vec<_> = processes
+            .into_iter()
+            .enumerate()
+            .map(|(index, process)| tokio::spawn(follow_quietly(index + 1, process)))
+            .collect();
+        let mut code = std::process::ExitCode::SUCCESS;
+        for wait in waits {
+            if !wait.await.context("waiting for a copy")?? {
+                code = std::process::ExitCode::FAILURE;
+            }
+        }
+        client
+            .close()
+            .await
+            .context("closing the client connection")?;
+        return Ok(code);
+    }
+
     let mut process = client
-        .launch_process(program.to_string(), arguments_to_input(arguments), true)
+        .launch_process(program.to_string(), input, true)
         .await
         .with_context(|| format!("launching {program}"))?;
 
