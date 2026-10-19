@@ -245,7 +245,7 @@ fn the_tensor_core_kda_lands_the_serial_walk() {
     let slots_at = gpu.up(&[2i32, 0, 1]);
     let commit_at = gpu.up(&[37i32, 9, 16]);
     let begin_at = gpu.up(&[0i32, 0, 5]);
-    let mut run = |chunked: bool| {
+    let mut run = |chunked: bool, floor: f32| {
         let slab_at = gpu.up(&seed);
         let y_at = gpu.zeros(n * wide * 4);
         let pool = RecurrentPool {
@@ -276,7 +276,7 @@ fn the_tensor_core_kda_lands_the_serial_walk() {
             H,
             D,
             1e-6,
-            0.0,
+            floor,
             &mut y,
         )
         .expect("the KDA scan fires");
@@ -285,8 +285,6 @@ fn the_tensor_core_kda_lands_the_serial_walk() {
         let slab: Vec<f32> = gpu.down(slab_at, lens.len() * stride);
         (y, slab)
     };
-    let (y_walk, slab_walk) = run(false);
-    let (y, slab) = run(true);
     let near = |got: &[f32], want: &[f32], what: &str| {
         let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
         let worst = got
@@ -295,6 +293,11 @@ fn the_tensor_core_kda_lands_the_serial_walk() {
             .fold(0f32, |m, (g, w)| m.max((g - w).abs()));
         assert!(worst <= 2e-2 * scale, "{what}: off by {worst} of {scale}");
     };
-    near(&y, &y_walk, "the rows");
-    near(&slab, &slab_walk, "the slots");
+    // Unbounded gates, and gates floored by a sigmoid.
+    for floor in [0.0, -5.0] {
+        let (y_walk, slab_walk) = run(false, floor);
+        let (y, slab) = run(true, floor);
+        near(&y, &y_walk, "the rows");
+        near(&slab, &slab_walk, "the slots");
+    }
 }
