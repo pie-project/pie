@@ -432,3 +432,37 @@ fn the_mxfp4_selects_time() {
         eprintln!("mxfp4 select {arm} {ex}x{tokens}x{top} {n}x{k}: {us:.1} us, {:.0} GB/s of the routed bank", bytes / us / 1e3);
     }
 }
+
+/// `cargo test ... -- --ignored the_bf16_selects_time`: the bf16 select at a
+/// decode's routes, against the routed experts' bytes at the card's rate.
+#[test]
+#[ignore = "a timing, not a check"]
+fn the_bf16_selects_time() {
+    // (experts, tokens, top_k, n, k): Gemma 4 26B-A4B's gate-up and down.
+    for (ex, tokens, top, n, k) in [(128, 1, 8, 1408, 2816), (128, 1, 8, 2816, 704), (128, 4, 8, 1408, 2816)] {
+        let mut b = Bench::new(11);
+        let count = tokens * top;
+        let routes = tab(count, |r| ((r / top * 3 + r % top * 5) % ex) as i32);
+        let (x, _) = b.bf16(tokens * k);
+        let (w, _) = b.bf16(ex * n * k);
+        let bank = t(w, ex, n * k, Bf16);
+        let r = t(b.up(&routes), tokens, top, I32);
+        let mut y = b.out(count, n);
+        let ctx = b.ctx();
+        let x = t(x, tokens, k, Bf16);
+        let mut fire = || {
+            moe::matmul_select(&ctx, x, bank, r, &mut y, ExpertTable::RESIDENT).expect("fires");
+        };
+        fire();
+        b.sync();
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            fire();
+        }
+        b.sync();
+        let us = start.elapsed().as_secs_f64() / 100.0 * 1e6;
+        let live = ex.min(count);
+        let bytes = (live * n * k * 2) as f64;
+        eprintln!("bf16 select {ex}x{tokens}x{top} {n}x{k}: {us:.1} us, {:.0} GB/s", bytes / us / 1e3);
+    }
+}

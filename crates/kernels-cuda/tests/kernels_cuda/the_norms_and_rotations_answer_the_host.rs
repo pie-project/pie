@@ -218,3 +218,32 @@ fn attn_res_blends_what_the_host_blends() {
         }
     }
 }
+
+#[test]
+fn the_wide_row_norm_answers_the_host() {
+    // A row in 16-byte runs a thread (one to four of them), its weight plain
+    // and plus one, at Gemma 4's 2816 and the widest it takes.
+    for (rows, width, plus_one) in [(3, 2816, false), (5, 2816, true), (2, 4096, false), (4, 8192, true), (7, 1032, false)] {
+        let mut lcg = Lcg::seeded(0x77 + width as u64);
+        let x_bits: Vec<u16> = (0..rows * width).map(|_| to_bf16(3.0 * lcg.unit())).collect();
+        let w_bits: Vec<u16> = (0..width).map(|_| to_bf16(lcg.unit())).collect();
+        let w = wide(&w_bits);
+        let w_eff: Vec<f32> = w.iter().map(|v| if plus_one { v + 1.0 } else { *v }).collect();
+        let want = rmsnorm(&wide(&x_bits), width, Some(&w_eff), 1e-6);
+        let mut gpu = Gpu::open();
+        let (x, wt, y_at) = (
+            ten(gpu.up(&x_bits), rows, width, Bf16),
+            ten(gpu.up(&w_bits), 1, width, Bf16),
+            gpu.zeros(rows * width * 2),
+        );
+        let vec = kernels_cuda::tuning::Tuning { rows_vec: true, ..kernels_cuda::tuning::Tuning::DEFAULT };
+        let ctx = gpu.ctx().with_tuning(vec);
+        let mut y = ten(y_at, rows, width, Bf16);
+        let fired = match plus_one {
+            true => norm::rmsnorm_plus_one(&ctx, x, wt, 1e-6, &mut y),
+            false => norm::rmsnorm(&ctx, x, wt, 1e-6, &mut y),
+        };
+        fired.expect("the norm fires");
+        landed(&gpu, y_at, &want, 3e-2, 1.0, &format!("width {width} plus_one {plus_one}"));
+    }
+}

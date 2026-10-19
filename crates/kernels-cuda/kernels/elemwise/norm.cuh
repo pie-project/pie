@@ -131,6 +131,65 @@ __global__ void rmsnorm_plus_one(
         x, weight, y, hidden, x_row_stride, y_row_stride, eps, heads, win);
 }
 
+// A wide row's RMS norm (its width a whole number of eights, at most
+// `256 * 8 * kRuns`) a block a row: each thread's 16-byte runs loaded at
+// once and held through the block's sum, so the row is read once.
+template <class T, int kRuns, bool WEIGHT_PLUS_ONE>
+__global__ void __launch_bounds__(256) rmsnorm_runs(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    T* __restrict__ y,
+    int hidden,
+    int x_row_stride,
+    int y_row_stride,
+    float eps,
+    const u32* __restrict__ win)
+{
+    const int row = blockIdx.x;
+    if (win != nullptr && row >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
+    const int tid = threadIdx.x;
+    const T* xr = x + static_cast<long long>(plane_row) * x_row_stride;
+    T* yr = y + static_cast<long long>(plane_row) * y_row_stride;
+    const int runs = hidden >> 3;
+    uint4 v[kRuns];
+#pragma unroll
+    for (int r = 0; r < kRuns; ++r) {
+        const int at = tid + r * 256;
+        v[r] = at < runs ? *reinterpret_cast<const uint4*>(xr + at * 8) : make_uint4(0, 0, 0, 0);
+    }
+    float local = 0.f;
+#pragma unroll
+    for (int r = 0; r < kRuns; ++r) {
+        const T* e = reinterpret_cast<const T*>(&v[r]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float f = Elem<T>::to_f32(e[j]);
+            local += f * f;
+        }
+    }
+    __shared__ float buf[256];
+    const float sum = block_reduce_sum_fast<256>(local, buf);
+    const float inv_rms = rsqrtf(sum / static_cast<float>(hidden) + eps);
+#pragma unroll
+    for (int r = 0; r < kRuns; ++r) {
+        const int at = tid + r * 256;
+        if (at >= runs) continue;
+        const uint4 wr = *reinterpret_cast<const uint4*>(weight + at * 8);
+        const T* e = reinterpret_cast<const T*>(&v[r]);
+        const T* wv = reinterpret_cast<const T*>(&wr);
+        uint4 o;
+        T* oe = reinterpret_cast<T*>(&o);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            float w = Elem<T>::to_f32(wv[j]);
+            if constexpr (WEIGHT_PLUS_ONE) w += 1.f;
+            oe[j] = Elem<T>::from_f32(Elem<T>::to_f32(e[j]) * inv_rms * w);
+        }
+        *reinterpret_cast<uint4*>(yr + at * 8) = o;
+    }
+}
+
 template <int PER> struct LaneRun { using type = uint4; };
 template <> struct LaneRun<4> { using type = uint2; };
 

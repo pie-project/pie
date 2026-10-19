@@ -2349,6 +2349,7 @@ pub fn select_bf16_mma(
     } else {
         1
     };
+    let cols = if glu.is_some() { 64 } else { 64 * tiles };
     let fire = Fire::at(
         "linear/moe_w8.cuh",
         symbol(&format!(
