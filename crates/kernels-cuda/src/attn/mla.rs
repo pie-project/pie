@@ -686,6 +686,8 @@ mod sparse {
         part_lse: u64,
         splits: i32,
         dense: i32,
+        kv: u64,
+        kv_width: i32,
     }
 
     /// `pie::attn::mlas::Layout<kRope, kE4>::kSmem`: the ring (two slots of
@@ -862,7 +864,23 @@ mod sparse {
             part_lse,
             splits: int(splits),
             dense: i32::from(ctx.tuning().mla_dense_short),
+            kv: pool.keys.ptr,
+            kv_width: int(pool.keys.width),
         };
+        if fp8 && splits == 1 {
+            // A prefill's rows on 128-key tiles and whole scores.
+            let slot = 65536 + if s.rope > 0 { 16384 } else { 0 };
+            let smem = 2 * slot + 5 * 8192 + 2 * 8192 + 4 * 128 * 4 + 1024 + 2048 + 1024;
+            return ctx.fire(
+                op,
+                Fire::at(
+                    FILE,
+                    symbol(&format!("::pie::attn::mlas::mla_sparse_e4<{}>", s.rope)),
+                )
+                .apply(Launch::grid([rows.min(sms), 1, 1], [384, 1, 1]).smem(smem)),
+                &[ArgValue::of(&params)],
+            );
+        }
         ctx.fire(
             op,
             Fire::at(

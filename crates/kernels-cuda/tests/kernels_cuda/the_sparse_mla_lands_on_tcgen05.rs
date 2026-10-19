@@ -703,9 +703,16 @@ fn decode_short(reqs: usize, kv: usize, rope: usize, fp8: bool, dense: bool) -> 
 /// values in bf16: within a few percent of the output's norm.
 #[test]
 fn glm_fp8_rows_score_in_e4m3() {
-    for (kv, rope) in [(300, 64), (1000, 64), (1000, 0)] {
-        let want = decode_short(4, kv, rope, false, false);
-        let got = decode_short(4, kv, rope, true, false);
+    // Four rows split over the multiprocessors; 160 a block each on 128-key tiles.
+    for (rows, kv, rope) in [
+        (4, 300, 64),
+        (4, 1000, 64),
+        (4, 1000, 0),
+        (160, 1000, 64),
+        (160, 700, 0),
+    ] {
+        let want = decode_short(rows, kv, rope, false, false);
+        let got = decode_short(rows, kv, rope, true, false);
         let (mut err, mut norm) = (0f64, 0f64);
         for (&g, &w) in got.iter().zip(&want) {
             let (g, w) = (f64::from(from_bf16(g)), f64::from(from_bf16(w)));
@@ -713,7 +720,10 @@ fn glm_fp8_rows_score_in_e4m3() {
             norm += w * w;
         }
         let rel = (err / norm).sqrt();
-        assert!(rel < 0.05, "{kv} keys, rope {rope}: relative error {rel}");
+        assert!(
+            rel < 0.05,
+            "{rows} rows of {kv} keys, rope {rope}: relative error {rel}"
+        );
     }
 }
 

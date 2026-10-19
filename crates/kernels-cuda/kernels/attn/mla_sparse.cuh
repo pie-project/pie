@@ -80,6 +80,10 @@ struct Params {
     // Rows that see no more keys than `top_k` read every key they see, in
     // order, their selection unread.
     int dense;
+    // The pool's fp8 rows (`kv_width` bytes a cell), which the 128-key pass
+    // gathers itself.
+    const unsigned char* kv;
+    int kv_width;
 };
 
 constexpr int kD = 512;
@@ -144,6 +148,92 @@ __device__ __forceinline__ void mma_ws_f8(u32 d, u64 a, u64 b, u32 idesc, bool a
 __device__ __forceinline__ u32 bf16x4_e4m3(u32 x, u32 y) {
     return dsv4s::e4m3x4(__uint_as_float(x << 16), __uint_as_float(x & 0xffff0000u),
                          __uint_as_float(y << 16), __uint_as_float(y & 0xffff0000u));
+}
+
+// Unit u (row u / splits, split u % splits) of the live ones: its request
+// (by the query rows' indptr), its position in that request's keys, the keys
+// it may see, and its selected ids up to the first negative one, dealt in
+// tiles of kBK keys. A whole warp finds it.
+struct Row {
+    int row, pos, last, entries, nt, j0, split, dense;
+    const int* sel;
+    const u32* pages;
+};
+
+template <int kBK>
+__device__ __forceinline__ Row row_of(const Params& p, int u, int splits, int base, int requests, u32 lane) {
+    Row w;
+    const int r = u / splits;
+    w.split = u % splits;
+    w.row = base + r;
+    // The first request whose rows end past r, 32 requests a round with
+    // their loads in flight (a search's halvings are as many dependent
+    // loads, each a cold read at the pass's start); then its bounds,
+    // read together.
+    int req = requests - 1;
+    for (int b = 0; b < requests; b += 32) {
+        const int i = b + static_cast<int>(lane);
+        const bool past = i < requests && r < static_cast<int>(__ldg(&p.qo_indptr[i + 1]));
+        const unsigned m = __ballot_sync(0xffffffffu, past);
+        if (m != 0u) {
+            req = b + __ffs(m) - 1;
+            break;
+        }
+    }
+    const int qo_lo = static_cast<int>(__ldg(&p.qo_indptr[req]));
+    const int qo_hi = static_cast<int>(__ldg(&p.qo_indptr[req + 1]));
+    const int pages_first = static_cast<int>(__ldg(&p.page_indptr[req]));
+    const int pages_end = static_cast<int>(__ldg(&p.page_indptr[req + 1]));
+    const int last_len = static_cast<int>(__ldg(&p.last_page_lens[req]));
+    const int fresh = qo_hi - qo_lo;
+    const int num_pages = pages_end - pages_first;
+    const int kv_len = (num_pages - 1) * p.page + last_len;
+    w.pos = kv_len - fresh + (r - qo_lo);
+    // The last key the row sees: its own (causal), or the request's.
+    w.last = p.causal ? w.pos : kv_len - 1;
+    w.pages = p.page_indices + pages_first;
+    w.sel = p.selection + static_cast<long long>(w.row) * p.top_k;
+    // The selection may hold -1 anywhere (a pooled index's dropped
+    // blocks): the stream runs to its last id, a -1 before it masked.
+    // Found from the end, 512 ids a round with their loads all in flight
+    // (a full selection's last id is in the first round).
+    // A row that sees no more keys than its selection holds reads them
+    // all, in order: its index ranked every one.
+    w.dense = p.dense != 0 && w.last + 1 <= p.top_k;
+    w.entries = w.dense ? max(w.last + 1, 0) : 0;
+    for (int end = p.top_k; !w.dense && end > 0 && w.entries == 0; end -= 16 * 32) {
+        const int n0 = end - 16 * 32;
+        int v[16];
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            const int n = n0 + u * 32 + static_cast<int>(lane);
+            v[u] = n >= 0 ? __ldg(w.sel + n) : -1;
+        }
+#pragma unroll
+        for (int u = 15; u >= 0; --u) {
+            const unsigned held = __ballot_sync(0xffffffffu, v[u] >= 0);
+            if (held != 0u && w.entries == 0) w.entries = n0 + u * 32 + 32 - __clz(held);
+        }
+    }
+    // A row always walks one tile: its O and its log-sum-exp land. A
+    // split walks its share of the row's tiles; one past them (a row of
+    // fewer tiles than splits) walks none and lands only its empty
+    // log-sum-exp, which the fold weighs at nothing.
+    const int tiles = max((w.entries + kBK - 1) / kBK, 1);
+    const int share = (tiles + splits - 1) / splits;
+    w.j0 = w.split * share;
+    w.nt = max(min(tiles, w.j0 + share) - w.j0, 0);
+    return w;
+}
+
+// Unit n of a block's walk (its nth), as its lists warp found it: two in
+// flight, each held until all its readers have taken it.
+__device__ __forceinline__ Row take_row(const Row* rows, u64* row_full, u64* row_free, int n, u32 lane) {
+    tc5::bar_wait(&row_full[n % 2], (n / 2) & 1);
+    const Row w = rows[n % 2];
+    __syncwarp();
+    if (lane == 0) tc5::bar_arrive(&row_free[n % 2]);
+    return w;
 }
 
 template <int kRope, bool kE4 = false>
@@ -233,94 +323,15 @@ __global__ __launch_bounds__(384, 1) void mla_sparse(
     // now: it waits for this grid before it reads.
     asm volatile("griddepcontrol.launch_dependents;");
 
-    // Row r of the live ones: its request (by the query rows' indptr), its
-    // position in that request's keys, the keys it may see, and its selected
-    // ids up to the first negative one.
-    struct Row {
-        int row, pos, last, entries, nt, j0, split, dense;
-        const int* sel;
-        const u32* pages;
-    };
-    auto row_at = [&](int u) {
-        Row w;
-        const int r = u / splits;
-        w.split = u % splits;
-        w.row = base + r;
-        // The first request whose rows end past r, 32 requests a round with
-        // their loads in flight (a search's halvings are as many dependent
-        // loads, each a cold read at the pass's start); then its bounds,
-        // read together.
-        int req = requests - 1;
-        for (int b = 0; b < requests; b += 32) {
-            const int i = b + static_cast<int>(lane);
-            const bool past = i < requests && r < static_cast<int>(__ldg(&p.qo_indptr[i + 1]));
-            const unsigned m = __ballot_sync(0xffffffffu, past);
-            if (m != 0u) {
-                req = b + __ffs(m) - 1;
-                break;
-            }
-        }
-        const int qo_lo = static_cast<int>(__ldg(&p.qo_indptr[req]));
-        const int qo_hi = static_cast<int>(__ldg(&p.qo_indptr[req + 1]));
-        const int pages_first = static_cast<int>(__ldg(&p.page_indptr[req]));
-        const int pages_end = static_cast<int>(__ldg(&p.page_indptr[req + 1]));
-        const int last_len = static_cast<int>(__ldg(&p.last_page_lens[req]));
-        const int fresh = qo_hi - qo_lo;
-        const int num_pages = pages_end - pages_first;
-        const int kv_len = (num_pages - 1) * p.page + last_len;
-        w.pos = kv_len - fresh + (r - qo_lo);
-        // The last key the row sees: its own (causal), or the request's.
-        w.last = p.causal ? w.pos : kv_len - 1;
-        w.pages = p.page_indices + pages_first;
-        w.sel = p.selection + static_cast<long long>(w.row) * p.top_k;
-        // The selection may hold -1 anywhere (a pooled index's dropped
-        // blocks): the stream runs to its last id, a -1 before it masked.
-        // Found from the end, 512 ids a round with their loads all in flight
-        // (a full selection's last id is in the first round).
-        // A row that sees no more keys than its selection holds reads them
-        // all, in order: its index ranked every one.
-        w.dense = p.dense != 0 && w.last + 1 <= p.top_k;
-        w.entries = w.dense ? max(w.last + 1, 0) : 0;
-        for (int end = p.top_k; !w.dense && end > 0 && w.entries == 0; end -= 16 * 32) {
-            const int n0 = end - 16 * 32;
-            int v[16];
-#pragma unroll
-            for (int u = 0; u < 16; ++u) {
-                const int n = n0 + u * 32 + static_cast<int>(lane);
-                v[u] = n >= 0 ? __ldg(w.sel + n) : -1;
-            }
-#pragma unroll
-            for (int u = 15; u >= 0; --u) {
-                const unsigned held = __ballot_sync(0xffffffffu, v[u] >= 0);
-                if (held != 0u && w.entries == 0) w.entries = n0 + u * 32 + 32 - __clz(held);
-            }
-        }
-        // A row always walks one tile: its O and its log-sum-exp land. A
-        // split walks its share of the row's tiles; one past them (a row of
-        // fewer tiles than splits) walks none and lands only its empty
-        // log-sum-exp, which the fold weighs at nothing.
-        const int tiles = max((w.entries + kBK - 1) / kBK, 1);
-        const int share = (tiles + splits - 1) / splits;
-        w.j0 = w.split * share;
-        w.nt = max(min(tiles, w.j0 + share) - w.j0, 0);
-        return w;
-    };
     Row* shared_rows = reinterpret_cast<Row*>(row_free + 2);
-    // Unit `n` of this block's walk (its `n`th), as the lists warp found it.
-    auto take_row = [&](int n) {
-        bar_wait(&row_full[n % 2], (n / 2) & 1);
-        const Row w = shared_rows[n % 2];
-        __syncwarp();
-        if (lane == 0) bar_arrive(&row_free[n % 2]);
-        return w;
-    };
+    auto take_row = [&](int n) { return mlas::take_row(shared_rows, row_full, row_free, n, lane); };
 
     if (warp == 11) {
         int J = 0;
         int n = 0;
         for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
             if (n >= 2) bar_wait(&row_free[n % 2], ((n / 2) - 1) & 1);
-            const Row w = row_at(r);
+            const Row w = row_of<kBK>(p, r, splits, base, requests, lane);
             if (lane == 0) shared_rows[n % 2] = w;
             __syncwarp();
             if (lane == 0) bar_arrive(&row_full[n % 2]);
@@ -780,6 +791,487 @@ __global__ __launch_bounds__(128) void mla_sparse_fold(
     }
     if (lse != nullptr && threadIdx.x == 0) {
         lse[static_cast<long long>(row) * 64 + head] = sum > 0.f ? top + __log2f(sum) : neg_inf();
+    }
+}
+
+// ---- The e4m3 prefill pass on 128-key tiles ----
+//
+// `mla_sparse<kRope, true>`'s rows on whole scores (vLLM's standard fp8 rows,
+// one scale of 1), a block a row at a time, persistent, after FA4's sparse
+// MLA (flash_attn/cute/flash_fwd_mla_1cta_sm100.py):
+//
+//   - Q (64 heads by 576 codes) is quantized into shared memory a row ahead
+//     and copied into TMEM at its row's start, each head at lanes m and
+//     m + 64, as a weight-stationary MMA reads its A operand.
+//   - A tile is 128 keys: their 512 latent codes (four 16 KB atoms) and their
+//     rows' last 128 bytes (the rotated codes at byte 64), gathered by
+//     cp.async, two tiles a ring.
+//   - S = Q K^T is one M = 64, N = 128 chain over the 576 codes: lanes 0-63
+//     hold keys 0-63 of every head, lanes 64-127 keys 64-127 (64 columns).
+//   - The softmax's thread t (head t % 64, keys [64 (t / 64), + 64)) meets
+//     its partner (t ^ 64) once a tile for the max; P lands in shared memory
+//     in e4m3 and O += P V runs as two N = 256 halves, issued after the next
+//     tile's S.
+//
+// Warps 0-3 run the softmax and store O; warp 4 owns TMEM and issues every
+// MMA; warp 5 lists a tile's keys; warps 6-7 load Q; warps 8-11 gather.
+namespace e4 {
+
+constexpr int kBK = 128;
+constexpr u32 kAtom = kBK * 128;        // 128 keys by 128 codes
+constexpr u32 kLatent = 4 * kAtom;      // 64 KB
+constexpr int kSlots = 2;
+constexpr u32 kQAtom = 64 * 128;        // 64 heads by 128 codes
+constexpr u32 kQBytes = 5 * kQAtom;
+constexpr u32 kPBytes = 64 * 128;
+constexpr int kLists = 4;
+constexpr u32 kColS = 0;                // S, 64 columns
+constexpr u32 kColQ = 64;               // Q's 576 codes (144 columns), rows m and m + 64
+constexpr u32 kColO = 256;
+
+template <int kRope>
+struct Layout {
+    static constexpr u32 kSlot = kLatent + (kRope > 0 ? kAtom : 0u);
+    static constexpr u32 kOffRing = 0;
+    static constexpr u32 kOffQ = kOffRing + kSlots * kSlot;
+    static constexpr u32 kOffP = kOffQ + kQBytes;
+    static constexpr u32 kOffList = kOffP + 2 * kPBytes;
+    static constexpr u32 kOffX = kOffList + kLists * kBK * 4;
+    static constexpr u32 kOffBar = kOffX + 2 * 128 * 4;
+    static constexpr u32 kSmem = kOffBar + 1024u + 1024u;
+};
+
+}  // namespace e4
+
+constexpr int kGatherThreads = 128;
+
+// 16 bytes from global memory into shared memory by cp.async, or zeros.
+__device__ __forceinline__ void cp_async16(u32 dst, const void* src, bool on) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(on ? 16 : 0)
+                 : "memory");
+}
+
+// 64 rows of 16 bytes (a K-major operand's column, `sdesc`) into 4 TMEM
+// columns at lanes m and m + 64.
+__device__ __forceinline__ void tc_cp_q(u32 taddr, u64 sdesc) {
+    asm volatile("tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [%0], %1;" ::"r"(taddr), "l"(sdesc));
+}
+
+template <int kRope>
+__global__ __launch_bounds__(384, 1) void mla_sparse_e4(const Params p) {
+    using namespace tc5;
+    using L = e4::Layout<kRope>;
+    constexpr int kBK = e4::kBK;
+    constexpr int kSlots = e4::kSlots;
+    constexpr int kLists = e4::kLists;
+    const int live = p.live != nullptr ? static_cast<int>(p.live[0]) : p.rows;
+    const int base = p.live != nullptr ? static_cast<int>(p.live[1]) : 0;
+    const int requests = p.live != nullptr ? min(p.requests, static_cast<int>(p.live[2])) : p.requests;
+
+    extern __shared__ unsigned char smem_raw[];
+    const u32 raw = smem_addr(smem_raw);
+    unsigned char* smem = smem_raw + (((raw + 1023u) & ~1023u) - raw);
+    const u32 sbase = smem_addr(smem);
+    float* xbuf = reinterpret_cast<float*>(smem + L::kOffX);
+    u32* lists = reinterpret_cast<u32*>(smem + L::kOffList);
+    u64* full = reinterpret_cast<u64*>(smem + L::kOffBar);
+    u64* empty = full + kSlots;
+    u64* s_full = empty + kSlots;
+    u64* s_free = s_full + 1;
+    u64* p_full = s_free + 1;
+    u64* pv_done = p_full + 2;
+    u64* q_ready = pv_done + 2;
+    u64* q_free = q_ready + 1;
+    u64* o_free = q_free + 1;
+    u64* list_full = o_free + 1;
+    u64* list_free = list_full + kLists;
+    u64* row_full = list_free + kLists;
+    u64* row_free = row_full + 2;
+    u32* tmem_slot = reinterpret_cast<u32*>(row_free + 2);
+
+    const u32 warp = threadIdx.x / 32;
+    const u32 lane = threadIdx.x % 32;
+
+    if (threadIdx.x == 0) {
+        bar_init(s_full, 1);
+        bar_init(s_free, 128);
+        for (int s = 0; s < 2; ++s) {
+            bar_init(&full[s], kGatherThreads);
+            bar_init(&empty[s], 1);
+            bar_init(&p_full[s], 128);
+            bar_init(&pv_done[s], 1);
+            bar_init(&row_full[s], 1);
+            bar_init(&row_free[s], 4 + 1 + 4 + 2);
+        }
+        bar_init(q_ready, 64);
+        bar_init(q_free, 1);
+        bar_init(o_free, 128);
+        for (int s = 0; s < kLists; ++s) {
+            bar_init(&list_full[s], 1);
+            bar_init(&list_free[s], 128 + 4);
+        }
+        bar_init_fence();
+    }
+    if (warp == 4) {
+        tmem_alloc(tmem_slot, kCols);
+        tmem_relinquish();
+    }
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    const u32 tmem = *tmem_slot;
+
+    Row* shared_rows = reinterpret_cast<Row*>(tmem_slot + 4);
+    auto take_row = [&](int n) { return mlas::take_row(shared_rows, row_full, row_free, n, lane); };
+
+    if (warp == 5) {
+        int J = 0, n = 0;
+        for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
+            if (n >= 2) bar_wait(&row_free[n % 2], ((n / 2) - 1) & 1);
+            const Row w = row_of<kBK>(p, r, 1, base, requests, lane);
+            if (lane == 0) shared_rows[n % 2] = w;
+            __syncwarp();
+            if (lane == 0) bar_arrive(&row_full[n % 2]);
+            constexpr int kRound = 2;
+            for (int j0 = 0; j0 < w.nt; j0 += kRound) {
+                int id[kRound][kBK / 32];
+#pragma unroll
+                for (int b = 0; b < kRound; ++b) {
+#pragma unroll
+                    for (int c = 0; c < kBK / 32; ++c) {
+                        const int k = (j0 + b) * kBK + c * 32 + static_cast<int>(lane);
+                        id[b][c] = j0 + b < w.nt && k < w.entries ? (w.dense ? k : __ldg(w.sel + k)) : -1;
+                    }
+                }
+                u32 e[kRound][kBK / 32];
+#pragma unroll
+                for (int b = 0; b < kRound; ++b) {
+#pragma unroll
+                    for (int c = 0; c < kBK / 32; ++c) {
+                        e[b][c] = id[b][c] >= 0 && id[b][c] <= w.last
+                            ? static_cast<u32>(row_in(w.pages, id[b][c], p.page)) | kValid
+                            : kSlotMask;
+                    }
+                }
+#pragma unroll
+                for (int b = 0; b < kRound; ++b) {
+                    if (j0 + b >= w.nt) break;
+                    if (J >= kLists) bar_wait(&list_free[J % kLists], ((J / kLists) - 1) & 1);
+                    u32* l = lists + (J % kLists) * kBK;
+#pragma unroll
+                    for (int c = 0; c < kBK / 32; ++c) l[c * 32 + static_cast<int>(lane)] = e[b][c];
+                    __syncwarp();
+                    if (lane == 0) bar_arrive(&list_full[J % kLists]);
+                    ++J;
+                }
+            }
+        }
+    } else if (warp == 6 || warp == 7) {
+        // Q's loader: each row's Q as soon as the last row's products have
+        // read it, while the softmax finishes that row; a thread two
+        // (head, half) units.
+        const int u = static_cast<int>(threadIdx.x) - 192;
+        // Q's row as e4m3 codes in its atoms (head `head`, latent dims
+        // [256 half, + 256) and rotated dims [32 half, + 32) at byte 64 of
+        // the fifth).
+        auto load_q = [&](int qrow, int head, int half) {
+            const uint4* src = reinterpret_cast<const uint4*>(
+                p.q + static_cast<long long>(qrow) * p.q_stride + head * kD + half * 256);
+            unsigned char* qrow_at = smem + L::kOffQ + head * 128;
+            uint4 x[32];
+#pragma unroll
+            for (int i = 0; i < 32; ++i) x[i] = src[i];
+#pragma unroll
+            for (int c = 0; c < 16; ++c) {
+                const uint4 a = x[2 * c], b = x[2 * c + 1];
+                const int atom = half * 2 + c / 8;
+                const int ch = c % 8;
+                *reinterpret_cast<uint4*>(qrow_at + atom * e4::kQAtom + ((ch ^ (head % 8)) * 16)) =
+                    make_uint4(bf16x4_e4m3(a.x, a.y), bf16x4_e4m3(a.z, a.w), bf16x4_e4m3(b.x, b.y),
+                               bf16x4_e4m3(b.z, b.w));
+            }
+            if constexpr (kRope > 0) {
+                const uint4* pe = reinterpret_cast<const uint4*>(
+                    p.q_pe + static_cast<long long>(qrow) * p.qpe_stride + head * kRope + half * 32);
+#pragma unroll
+                for (int c = 0; c < 2; ++c) {
+                    const uint4 a = pe[2 * c], b = pe[2 * c + 1];
+                    const int ch = 4 + half * 2 + c;
+                    *reinterpret_cast<uint4*>(qrow_at + 4 * e4::kQAtom + ((ch ^ (head % 8)) * 16)) =
+                        make_uint4(bf16x4_e4m3(a.x, a.y), bf16x4_e4m3(a.z, a.w), bf16x4_e4m3(b.x, b.y),
+                                   bf16x4_e4m3(b.z, b.w));
+                }
+            }
+        };
+        int n = 0;
+        for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
+            const Row w = take_row(n);
+            // The next row's queries toward L2 while this one waits its turn.
+            const int next = r + static_cast<int>(gridDim.x);
+            if (u == 0 && next < live) {
+                const long long nr = base + next;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p.q + nr * p.q_stride),
+                             "r"(64u * kD * 2u)
+                             : "memory");
+                if constexpr (kRope > 0) {
+                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p.q_pe + nr * p.qpe_stride),
+                                 "r"(64u * kRope * 2u)
+                                 : "memory");
+                }
+            }
+            if (n > 0) bar_wait(q_free, (n - 1) & 1);
+            load_q(w.row, u, 0);
+            load_q(w.row, u, 1);
+            fence_async_shared();
+            bar_arrive(q_ready);
+        }
+    } else if (warp >= 8) {
+        // The gathers, 128 threads by cp.async: eight threads a row's 128-byte
+        // block (16 bytes each), a warp four rows an instruction; rows
+        // [16 m + t / 8] for m < 8. A key a row's 512 latent codes into the
+        // four atoms and its last 128 bytes (the rotated codes at byte 64)
+        // into the fifth; a dropped key lands zeros.
+        const int t = static_cast<int>(threadIdx.x) - 256;
+        const int c = t % 8;
+        const int g = t / 8;
+        int J = 0, n = 0;
+        for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
+            const Row w = take_row(n);
+            for (int j = 0; j < w.nt; ++j, ++J) {
+                const int slot = J % kSlots;
+                const u32* l = lists + (J % kLists) * kBK;
+                bar_wait(&list_full[J % kLists], (J / kLists) & 1);
+                u32 cells[8];
+#pragma unroll
+                for (int m = 0; m < 8; ++m) cells[m] = l[16 * m + g];
+                __syncwarp();
+                if (lane == 0) bar_arrive(&list_free[J % kLists]);
+                bar_wait(&empty[slot], ((J / kSlots) & 1) ^ 1);
+                const u32 dst = sbase + L::kOffRing + slot * L::kSlot;
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    const int k = 16 * m + g;
+                    const u32 cell = cells[m] & kSlotMask;
+                    const bool on = cell != kSlotMask;
+                    const unsigned char* src = p.kv + static_cast<long long>(on ? cell : 0) * p.kv_width;
+                    const u32 sw = static_cast<u32>(k * 128 + ((c ^ (k % 8)) * 16));
+#pragma unroll
+                    for (int a = 0; a < 4; ++a) {
+                        cp_async16(dst + a * e4::kAtom + sw, src + a * 128 + c * 16, on);
+                    }
+                    if constexpr (kRope > 0) cp_async16(dst + e4::kLatent + sw, src + 448 + c * 16, on);
+                }
+                asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(smem_addr(&full[slot]))
+                             : "memory");
+            }
+        }
+    } else if (warp == 4) {
+        const u32 idesc_s = idesc_dense(kE4M3, kE4M3, 64, 128);
+        const u32 idesc_o = idesc_dense(kE4M3, kE4M3, 64, 256) | (1u << 16);
+        const u32 qa = sbase + L::kOffQ;
+        // O += P V for tile i: per 256 dims (atoms 2v and 2v + 1), 32 keys a step.
+        auto pv = [&](int i, int first) {
+            const u32 tile = sbase + L::kOffRing + (i % kSlots) * L::kSlot;
+            const u32 pa = sbase + L::kOffP + (i & 1) * e4::kPBytes;
+            bar_wait(&p_full[i & 1], (i >> 1) & 1);
+            tc_fence_after();
+            __syncwarp();
+            if (elect_one()) {
+#pragma unroll
+                for (int v = 0; v < 2; ++v) {
+#pragma unroll
+                    for (int s2 = 0; s2 < kBK / 32; ++s2) {
+                        mma_ws_f8(tmem + e4::kColO + v * 128, sdesc_sw128(pa) + 2 * s2,
+                                  sdesc_sw128_mn(tile + 2 * v * e4::kAtom + s2 * 4096, e4::kAtom), idesc_o,
+                                  i > first || s2 > 0);
+                    }
+                }
+                tc_commit(&empty[i % kSlots]);
+                tc_commit(&pv_done[i & 1]);
+            }
+            __syncwarp();
+        };
+        int J = 0, n = 0;
+        for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
+            const Row w = take_row(n);
+            // The row's Q from its staging into TMEM (in the pipe's order, after
+            // the last row's products); the staging is then free.
+            bar_wait(q_ready, n & 1);
+            tc_fence_after();
+            __syncwarp();
+            if (elect_one()) {
+#pragma unroll
+                for (int a = 0; a < 4; ++a) {
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        tc_cp_q(tmem + e4::kColQ + (a * 8 + k) * 4, sdesc_sw128(qa + a * e4::kQAtom) + k);
+                    }
+                }
+                if constexpr (kRope > 0) {
+#pragma unroll
+                    for (int k = 4; k < 8; ++k) {
+                        tc_cp_q(tmem + e4::kColQ + 128 + (k - 4) * 4, sdesc_sw128(qa + 4 * e4::kQAtom) + k);
+                    }
+                }
+                tc_commit(q_free);
+            }
+            __syncwarp();
+            if (n > 0) bar_wait(o_free, (n - 1) & 1);
+            tc_fence_after();
+            const int first = J;
+            for (int j = 0; j < w.nt; ++j, ++J) {
+                const int slot = J % kSlots;
+                if (J >= 1) bar_wait(s_free, (J - 1) & 1);
+                bar_wait(&full[slot], (J / kSlots) & 1);
+                fence_async_shared();
+                tc_fence_after();
+                __syncwarp();
+                if (elect_one()) {
+                    const u32 tile = sbase + L::kOffRing + slot * L::kSlot;
+                    const u32 d = tmem + e4::kColS;
+#pragma unroll
+                    for (int s = 0; s < 16; ++s) {
+                        mma_ws_ts_f8(d, tmem + e4::kColQ + s * 8,
+                                     sdesc_sw128(tile + (s / 4) * e4::kAtom) + 2 * (s % 4), idesc_s, s > 0);
+                    }
+                    if constexpr (kRope > 0) {
+                        // The rotated codes at byte 64 of the fifth atom.
+#pragma unroll
+                        for (int s = 0; s < 2; ++s) {
+                            mma_ws_ts_f8(d, tmem + e4::kColQ + 128 + s * 8,
+                                         sdesc_sw128(tile + e4::kLatent) + 4 + 2 * s, idesc_s, true);
+                        }
+                    }
+                    tc_commit(s_full);
+                }
+                __syncwarp();
+                if (j > 0) pv(J - 1, first);
+            }
+            pv(J - 1, first);
+        }
+    } else if (warp < 4) {
+        const int t = static_cast<int>(threadIdx.x);
+        const int head = t % 64;
+        const int half = t / 64;
+        const u32 lane_base = (warp * 32) << 16;
+        int J = 0, n = 0;
+        for (int r = static_cast<int>(blockIdx.x); r < live; r += static_cast<int>(gridDim.x), ++n) {
+            const Row w = take_row(n);
+            const int row = w.row;
+            float m_used = neg_inf();
+            float l = 0.f;
+            for (int j = 0; j < w.nt; ++j, ++J) {
+                const int sb = J & 1;
+                bar_wait(s_full, J & 1);
+                tc_fence_after();
+                u32 v[2][32];
+                tmem_ld32(tmem + lane_base + e4::kColS, v[0]);
+                tmem_ld32(tmem + lane_base + e4::kColS + 32, v[1]);
+                tmem_wait_ld();
+                tc_fence_before();
+                bar_arrive(s_free);
+                bar_wait(&list_full[J % kLists], (J / kLists) & 1);
+                const uint4* marks4 = reinterpret_cast<const uint4*>(lists + (J % kLists) * kBK + half * 64);
+                float s[64];
+                float mx = neg_inf();
+#pragma unroll
+                for (int w4 = 0; w4 < 16; ++w4) {
+                    const uint4 m = marks4[w4];
+                    const u32 mv[4] = {m.x, m.y, m.z, m.w};
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int k = 4 * w4 + i;
+                        const float sc = __uint_as_float(v[k / 32][k % 32]);
+                        s[k] = (mv[i] & kValid) ? sc * p.scale_log2 : neg_inf();
+                        mx = fmaxf(mx, s[k]);
+                    }
+                }
+                bar_arrive(&list_free[J % kLists]);
+                float* xm = xbuf + (J & 1) * 128;
+                xm[t] = mx;
+                pair_sync(warp);
+                mx = fmaxf(mx, xm[t ^ 64]);
+                const bool grow = mx > m_used + 8.f;
+                const float m_new = grow ? mx : m_used;
+                const float alpha = grow ? ex2(m_used - m_new) : 1.f;
+                const float bse = m_new == neg_inf() ? 0.f : m_new;
+                u32 pk[16];
+                float sum = 0.f;
+#pragma unroll
+                for (int i = 0; i < 64; i += 4) {
+                    const float e0 = ex2(s[i] - bse), e1 = ex2(s[i + 1] - bse);
+                    const float e2 = ex2(s[i + 2] - bse), e3 = ex2(s[i + 3] - bse);
+                    sum += (e0 + e1) + (e2 + e3);
+                    pk[i / 4] = dsv4s::e4m3x4(e0, e1, e2, e3);
+                }
+                l = l * alpha + sum;
+                m_used = m_new;
+                // P's buffer two tiles back is free once its product is in; O
+                // rescales once the last product is in.
+                if (J >= 2) bar_wait(&pv_done[sb], ((J >> 1) - 1) & 1);
+                if (j > 0 && __any_sync(0xffffffffu, grow)) {
+                    bar_wait(&pv_done[(J - 1) & 1], ((J - 1) >> 1) & 1);
+                    tc_fence_after();
+#pragma unroll 1
+                    for (u32 c = 0; c < 256; c += 32) {
+                        u32 o[32];
+                        tmem_ld32(tmem + lane_base + e4::kColO + c, o);
+                        tmem_wait_ld();
+#pragma unroll
+                        for (int i = 0; i < 32; ++i) o[i] = __float_as_uint(__uint_as_float(o[i]) * alpha);
+                        fmha::tmem_st32(tmem + lane_base + e4::kColO + c, o);
+                    }
+                    fmha::tmem_wait_st();
+                }
+                // P: head `head`'s keys [64 half, + 64) as four 16-byte
+                // words of its 128-byte row.
+                const u32 prow = sbase + L::kOffP + sb * e4::kPBytes + head * 128;
+#pragma unroll
+                for (int w4 = 0; w4 < 4; ++w4) {
+                    const int chunk = half * 4 + w4;
+                    asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};" ::"r"(prow + ((chunk ^ (head % 8)) * 16)),
+                                 "r"(pk[4 * w4]), "r"(pk[4 * w4 + 1]), "r"(pk[4 * w4 + 2]), "r"(pk[4 * w4 + 3])
+                                 : "memory");
+                }
+                fence_async_shared();
+                tc_fence_before();
+                bar_arrive(&p_full[sb]);
+            }
+            bar_wait(&pv_done[(J - 1) & 1], ((J - 1) >> 1) & 1);
+            tc_fence_after();
+            float* xl = xbuf + (J & 1) * 128;
+            xl[t] = l;
+            pair_sync(warp);
+            const float l_all = l + xl[t ^ 64];
+            const float scale = l_all > 0.f ? 1.f / l_all : 0.f;
+            if (p.lse != nullptr && half == 0) {
+                p.lse[static_cast<long long>(row) * 64 + head] = l_all > 0.f ? m_used + __log2f(l_all) : neg_inf();
+            }
+            u16* dst = p.o + static_cast<long long>(row) * p.o_stride + static_cast<long long>(head) * kD;
+#pragma unroll 1
+            for (u32 c = 0; c < 256; c += 32) {
+                u32 o[32];
+                tmem_ld32(tmem + lane_base + e4::kColO + c, o);
+                tmem_wait_ld();
+                const int d0 = static_cast<int>(c / 128) * 256 + half * 128 + static_cast<int>(c % 128);
+                u32 out[16];
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    out[i] = pack_bf16(__uint_as_float(o[2 * i]) * scale, __uint_as_float(o[2 * i + 1]) * scale);
+                }
+                uint4* o4 = reinterpret_cast<uint4*>(dst + d0);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) o4[i] = make_uint4(out[4 * i], out[4 * i + 1], out[4 * i + 2], out[4 * i + 3]);
+            }
+            tc_fence_before();
+            bar_arrive(o_free);
+        }
+    }
+    tc_fence_before();
+    __syncthreads();
+    if (warp == 4) {
+        tc_fence_after();
+        tmem_dealloc(tmem, kCols);
     }
 }
 
