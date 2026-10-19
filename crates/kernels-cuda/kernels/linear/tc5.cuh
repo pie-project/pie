@@ -544,10 +544,16 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                 pt = r / q_tiles;
                 qt = r - pt * q_tiles;
             } else if constexpr (kGroup == 1) {
-                // An expert's row tiles walk fastest, sharing its weight tile.
+                // Bands of an expert's row tiles walk its weight tiles together,
+                // so a wave shares both operands (as a dense launch's).
                 const int m_tiles = (routes[e + 1] - routes[e] + static_cast<int>(kM) - 1) / static_cast<int>(kM);
-                qt = r / m_tiles;
-                pt = r - qt * m_tiles;
+                const int kRaster = epi.raster;
+                const int band = r / (kRaster * num_q);
+                const int first = band * kRaster;
+                const int size = min(m_tiles - first, kRaster);
+                const int rr = r - band * kRaster * num_q;
+                pt = first + rr % size;
+                qt = rr / size;
             } else {
                 const int q_tiles = (min(routes[e], m_max) + kBN - 1) / kBN;
                 pt = r / q_tiles;
