@@ -59,6 +59,20 @@ __device__ __forceinline__ unsigned e2m1_code(float v) {
     return (v < 0.f ? 8u : 0u) | c;
 }
 
+// Two values' e2m1 codes in a byte, `lo` in the low nibble: one conversion
+// on a B200 (whose -0 keeps its sign bit, a zero all the same).
+__device__ __forceinline__ u32 e2m1_pair(float lo, float hi) {
+#if defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM103_ALL)
+    u32 byte;
+    asm("{\n\t.reg .b8 q;\n\tcvt.rn.satfinite.e2m1x2.f32 q, %1, %2;\n\tcvt.u32.u8 %0, q;\n\t}"
+        : "=r"(byte)
+        : "f"(hi), "f"(lo));
+    return byte;
+#else
+    return e2m1_code(lo) | (e2m1_code(hi) << 4);
+#endif
+}
+
 __device__ __forceinline__ float e4m3_value(u8 b) {
     __nv_fp8_e4m3 v;
     v.__x = b;
@@ -116,7 +130,7 @@ __device__ __forceinline__ u8 nvfp4_block16(const float (&v)[16], float amax, fl
     u32 c[2] = {0u, 0u};
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const u32 byte = e2m1_code(v[2 * i] * out_scale) | (e2m1_code(v[2 * i + 1] * out_scale) << 4);
+        const u32 byte = e2m1_pair(v[2 * i] * out_scale, v[2 * i + 1] * out_scale);
         c[i / 4] |= byte << (8 * (i % 4));
     }
     w = make_uint2(c[0], c[1]);
@@ -151,19 +165,21 @@ __global__ void act_quant_nvfp4(
         const float amax = load_block16(x + static_cast<long long>(r) * k + b * 16, v);
         // The routes' globals are one (load lays the experts' largest), so
         // the block's codes are quantized once and land at each route.
-        float last_gs = -1.f;
+        // A route's global divides once a scale, its block quantized once a
+        // global.
+        float last_scale = -1.f;
         uint2 w = make_uint2(0u, 0u);
         u8 sf_code = 0;
         for (int j = 0; j < div; ++j) {
             const int route = r * div + j;
             const int o = pos[route];
             if (o < 0) continue;
-            bool dropped = false;
-            const float gs = global_of(input_scales, routes, route, &dropped);
-            if (dropped) continue;
-            if (gs != last_gs) {
-                last_gs = gs;
-                sf_code = nvfp4_block16(v, amax, gs, w);
+            const int e = routes != nullptr ? routes[route] : 0;
+            if (e < 0) continue;
+            const float scale = input_scales[e];
+            if (scale != last_scale) {
+                last_scale = scale;
+                sf_code = nvfp4_block16(v, amax, __fdiv_rn(1.f, scale), w);
             }
             *reinterpret_cast<uint2*>(codes + static_cast<long long>(o) * (k / 2) + b * 8) = w;
             atoms[atom_offset(atom_row(o, m_max), b, blocks)] = sf_code;
@@ -193,8 +209,7 @@ __global__ void act_quant_nvfp4(
         u8* dst = codes + static_cast<long long>(o) * (k / 2) + b * 8;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            dst[i] = static_cast<u8>(e2m1_code(v[2 * i] * out_scale)
-                                     | (e2m1_code(v[2 * i + 1] * out_scale) << 4));
+            dst[i] = static_cast<u8>(e2m1_pair(v[2 * i] * out_scale, v[2 * i + 1] * out_scale));
         }
         atoms[atom_offset(atom_row(o, m_max), b, blocks)] = sf_code;
     } else {
