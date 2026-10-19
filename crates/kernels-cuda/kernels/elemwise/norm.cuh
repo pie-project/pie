@@ -989,9 +989,8 @@ __global__ void __launch_bounds__(256) rmsnorm_gated_in_warp(
     #pragma unroll
     for (int u = 0; u < PER; ++u) {
         const float g = Elem<T>::to_f32(gv[u]);
-        const float sg = sigmoid_gate
-            ? 1.f / (1.f + __expf(-g))
-            : g / (1.f + __expf(-g));
+        // The gate on the fast division (vLLM's Triton gate's).
+        const float sg = __fdividef(sigmoid_gate ? 1.f : g, 1.f + __expf(-g));
         out[u] = Elem<T>::from_f32(wv[u] * (xv[u] * inv_rms) * sg);
     }
     if constexpr (PER == 4) {
