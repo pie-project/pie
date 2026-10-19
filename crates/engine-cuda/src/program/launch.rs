@@ -967,11 +967,10 @@ impl Prepared {
         if lanes <= self.lanes {
             return Ok(());
         }
-        // The buffers the last growth outgrew were kept for the fires still
-        // reading them; freeing waits for the device, so it happens here,
-        // once per growth, rather than hoarding a generation per doubling
-        // until this batch is dropped.
-        self.retired.clear();
+        // The buffers a growth outgrows stay with this batch until it drops
+        // (at most its own size again, a doubling at a time): freeing one
+        // waits for the whole device, which at a burst's first fires would
+        // stall them; a growth that does not fit frees them first.
         let lanes = lanes
             .checked_next_power_of_two()
             .unwrap_or(lanes)
@@ -1052,6 +1051,7 @@ impl Prepared {
         // since a frame past static admission has no retry to answer.
         let scratch = match Buffer::zeroed_on(stream, scratch_bytes) {
             Err(Fault::OutOfMemory { .. }) => {
+                self.retired.clear();
                 self.scratch = Buffer::zeroed(0)?;
                 self.lanes = 0;
                 Buffer::zeroed_on(stream, scratch_bytes).map_err(|fault| match fault {
