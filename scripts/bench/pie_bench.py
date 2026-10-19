@@ -771,7 +771,7 @@ async def run(args: argparse.Namespace):
     prompt_token_ids: list[list[int]] | None = None
     if args.pretokenized_prompts:
         prompt_token_ids, _ = hf_chat_token_ids_and_counts(
-            args.model, args.system, prompts, getattr(args, "think", None)
+            args.hf_tokenizer or args.model, args.system, prompts, getattr(args, "think", None)
         )
     wasm = bench_inferlet_wasm(args.inferlet_dir)
 
@@ -1677,6 +1677,12 @@ def build_parser() -> argparse.ArgumentParser:
             default=False,
             help="Pre-render chat prompts to token IDs before timing and send raw tokens "
                  "to the benchmark inferlet.",
+        )
+        sp.add_argument(
+            "--hf-tokenizer",
+            default=None,
+            help="The HF model whose tokenizer and chat template --pretokenized-prompts "
+                 "renders with (default: --model), for a --model that is an artifact path.",
         )
         sp.add_argument(
             "--single-process-batch",
