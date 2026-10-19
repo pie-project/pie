@@ -383,6 +383,9 @@ async fn start_peers(user_cfg: &config::Config) -> Result<()> {
         hello: hello.clone(),
     })));
     peer::clients();
+    if user_cfg.cluster.role == Some(Role::Prefill) {
+        tokio::spawn(runtime::offload::prefill::warm());
+    }
     if !user_cfg.offload.pools.is_empty() {
         tokio::spawn(peer::push_to_pools(user_cfg.offload.pools.clone()));
     }

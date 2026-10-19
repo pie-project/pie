@@ -731,6 +731,29 @@ async fn read_chunk(
     Ok(bytes)
 }
 
+/// Prompt tokens [`warm`] prefills: past one fire, so a fire and a remainder
+/// are both compiled.
+const WARM_TOKENS: u32 = 3000;
+
+/// Runs the `prefill` program once, so the first pass a peer sends does not
+/// wait out its compiling (~45 s on a 14B).
+pub async fn warm() {
+    let started = std::time::Instant::now();
+    let tokens: Vec<u32> = (0..WARM_TOKENS).map(|at| 1000 + at % 1000).collect();
+    match run_prefill(&tokens).await {
+        Ok(()) => tracing::info!(
+            target: "pie::offload",
+            ms = started.elapsed().as_millis() as u64,
+            "warmed the prefill program for peers' passes"
+        ),
+        Err(error) => tracing::warn!(
+            target: "pie::offload",
+            %error,
+            "the prefill program could not be warmed; a peer's first pass compiles it"
+        ),
+    }
+}
+
 async fn run_prefill(tokens: &[u32]) -> Result<()> {
     use crate::inferlet::program;
     let name = program::newest("prefill")
