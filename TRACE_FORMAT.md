@@ -66,3 +66,33 @@ args `{ "step": 17 }`. Real GPU start/end from Metal (`MTLCommandBuffer.GPUStart
 
 - pid 1, agent tid: `start`, `end`.
 - pid 2, tid 1: `evict` args `{ "agent": 2, "pages": 32 }` when the scheduler evicts an agent's pages.
+
+## How pie fills it (v1 recorder notes)
+
+These pin down what the fields above mean as `pie` records them; none
+changes their shape.
+
+- Recording: `pie run --trace FILE` or `pie serve --trace FILE` (or
+  `$PIE_TRACE=FILE`). The recorder keeps counts in memory and writes the file
+  when the run ends or the server stops.
+- `meta` values pie cannot tell are `null` (e.g. `bandwidth_gbs` on a chip it
+  has no figure for). `memory_gb` and `allocated_gb` are GiB.
+- A `step` span runs from when the scheduler posts it (or the previous step
+  ends, whichever is later) to its GPU end; without GPU timestamps (non-Metal
+  engines) to when the host saw it settle. Steps never overlap; neither do
+  `gpu` spans.
+- An agent's `prefill`/`decode` spans are the steps that carried its rows: a
+  lane of one row is decode, a longer lane prefill. Consecutive steps of the
+  same kind less than 2 ms apart, with nothing else of the agent's between
+  them, are one span whose `tokens` add up. `cached_tokens` is the KV the
+  agent already held when its prefill ran (context it did not recompute).
+- `queued` is from when the agent submitted the work to when the step that
+  carried it started, shown only when at least 1 ms.
+- `tool` ends when the inferlet feeds a tool result back through
+  `tools.answer(name, …)` and starts at the end of its previous span; `tool`
+  is the name it answered.
+- `kv_pages`: an agent's count is the distinct pages its lanes named in its
+  latest step, 0 once it ends, less what an eviction took; `free` is
+  `kv_pages_total` minus the agents' sum.
+- `gpu_busy`/`gpu_share` are emitted at window starts (multiples of 10 ms)
+  only when a value changes, and end with a zero sample.
