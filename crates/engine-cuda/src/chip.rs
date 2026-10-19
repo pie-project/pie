@@ -118,6 +118,14 @@ pub struct HostPlanes;
 #[decision(id = "engine.prefill_lattice_from", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct PrefillLatticeFrom(pub u32);
 
+/// Whether a load commits its whole fitted cache (every kv page and state
+/// slot the fit seats) when it comes up, rather than mapping pages as frames
+/// first reach them: a decode then never waits on the driver mapping memory
+/// mid-run (a millisecond or more a 32 MiB unit while fires are in flight).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.kv_eager", flag, default = false, tune = engine)]
+pub struct KvEager;
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
     kernels_cuda::tuning::register(&mut r);
@@ -133,6 +141,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<ForwardTokens>()
         .add::<WalkFireRows>()
         .add::<HostPlanes>()
+        .add::<KvEager>()
         .add::<PrefillLatticeFrom>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     #[cfg(not(feature = "rocm"))]
@@ -219,6 +228,7 @@ pub struct Engine {
     pub walk_fire_rows: u32,
     pub host_planes: bool,
     pub prefill_lattice_from: u32,
+    pub kv_eager: bool,
 }
 
 impl Engine {
@@ -248,6 +258,7 @@ impl Engine {
             walk_fire_rows: profile.get::<WalkFireRows>().0,
             host_planes: profile.on::<HostPlanes>(&Anywhere),
             prefill_lattice_from: profile.get::<PrefillLatticeFrom>().0,
+            kv_eager: profile.on::<KvEager>(&Anywhere),
         }
     }
 }

@@ -1877,6 +1877,18 @@ impl Pools {
         }
     }
 
+    /// Commits every kv page and state slot the fit seats (`engine.kv_eager`).
+    pub fn commit_whole_fit(&mut self) -> Result<()> {
+        let pages = u32::try_from(self.paging.pages).unwrap_or(u32::MAX);
+        match self.commit_to(pages, self.paging.slots)? {
+            Commit::Committed => {}
+            refusal => return Err(refuse(&self.pool, refusal)),
+        }
+        // The windowed pool backs its pages on first use otherwise.
+        let windowed = self.paging.window_pages();
+        self.ensure_windowed(0..windowed)
+    }
+
     fn ensure_state(&mut self, slots: u32) -> Result<()> {
         match self.commit_to(0, slots)? {
             Commit::Committed => Ok(()),

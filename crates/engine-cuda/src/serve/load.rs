@@ -1102,6 +1102,9 @@ impl Shell {
         shell.arm_bodies()?;
         let resident = footprint(&shell);
         let fitted = shell.pools.fit_the_card(0, held_for_fires, &resident)?;
+        if engine.kv_eager {
+            shell.pools.commit_whole_fit()?;
+        }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \

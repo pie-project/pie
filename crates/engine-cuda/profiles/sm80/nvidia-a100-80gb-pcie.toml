@@ -23,8 +23,11 @@ sdpa.dsv4_replay = true
 ssm = ["gdn_fused_scan", "conv_vec4", "gdn_out_bf16", "kda_chunked", "kda_step_fused"]
 
 # A prefill's fire on four buckets a doubling from 256 rows (its GEMMs run
-# its bucket's rows), and a bucket between powers of two below.
+# its bucket's rows), and a bucket between powers of two below; the whole
+# fitted cache committed at load (a 256-way decode on Gemma 4 otherwise
+# waits ~0.5 s on the driver mapping pages mid-run).
 [engine]
+kv_eager = true
 prefill_lattice_from = 256
 lattice_steps = 2
 
@@ -46,4 +49,5 @@ measured = [
   "kernel.ssm.kda_step_fused",
   "engine.prefill_lattice_from",
   "engine.lattice_steps",
+  "engine.kv_eager",
 ]
