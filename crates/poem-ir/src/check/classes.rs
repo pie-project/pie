@@ -464,6 +464,7 @@ fn writes_cache(op: &Operation) -> bool {
         Operation::Fused(op) => matches!(
             op,
             Fused::QkvFusedQknormRopeVnormWrite { .. }
+                | Fused::SplitQkvFused { .. }
                 | Fused::RopeYarnAppend { .. }
                 | Fused::NormRopeLastAppend { .. }
                 | Fused::PoolCompress { .. }

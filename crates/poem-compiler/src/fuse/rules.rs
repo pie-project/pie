@@ -30,6 +30,7 @@ const W4A8: Precision = Precision {
 
 pub(super) fn all() -> Vec<Rule> {
     vec![
+        split_qkv_fused(),
         qkv_qknorm_rope_vnorm_write(),
         rmsnorm_residual_add(),
         embed_scale_add_select(),
@@ -647,11 +648,50 @@ fn plus_one(op: &Operation) -> bool {
 /// weights and v's a scaleless norm, rotated in part on a global layer;
 /// Muse Spark's are scaleless with v as it is, its global layers unturned.
 fn qkv_qknorm_rope_vnorm_write() -> Rule {
-    // (Gemma's form, the rotation: 0 none, 1 full, 2 partial; MiMo's form:
-    // no norms, v scaled, a partial rotation.)
+    Rule::new(
+        "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
+        qkv_patterns(false),
+        |m| qkv_fused(m, m.value("packed")),
+    )
+    .when(qkv_admits)
+    .through_markers()
+}
+
+/// The fused qkv write on the first columns of a row split, the rest of each
+/// row landing as the split's second half (Muse Spark's qkv|gate): the split
+/// read in place, not copied out first.
+fn split_qkv_fused() -> Rule {
+    Rule::new("custom_cuda.split_qkv_fused", qkv_patterns(true), |m| {
+        let Operation::Layout(Layout::SplitRows { width, .. }) = m.op("rest") else {
+            panic!("`rest` comes from a row split");
+        };
+        Fused::SplitQkvFused {
+            width: *width,
+            rest: m.value("rest"),
+            qkv: Box::new(qkv_fused(m, m.value("full"))),
+        }
+    })
+    .when(qkv_admits)
+    .through_markers()
+}
+
+/// The qkv write's forms (each read off a row split where `split`): Gemma's
+/// (the rotation: 0 none, 1 full, 2 partial), MiMo's (no norms, v scaled, a
+/// partial rotation).
+fn qkv_patterns(split: bool) -> Vec<Template> {
     let pattern = |gemma: bool, rope: u8| {
         template(move |p| {
-            let packed = p.rows("packed", 3 * W);
+            let packed = if split {
+                // Any cut matches: the replacement reads the trace's own.
+                let full = p.rows("full", 4 * W);
+                let (packed, rest) = layout::split_rows(&full, W as u32 / 2);
+                p.free("width");
+                p.name("packed", &packed);
+                p.export("rest", &rest);
+                packed
+            } else {
+                p.rows("packed", 3 * W)
+            };
             let positions = p.indices("positions");
             let d = p.u32("d");
             let (q, k, v) = if rope == 4 {
@@ -708,60 +748,59 @@ fn qkv_qknorm_rope_vnorm_write() -> Rule {
             p.export("q", &q);
         })
     };
-    Rule::new(
-        "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
-        [
-            pattern(true, 2),
-            pattern(true, 1),
-            pattern(false, 1),
-            pattern(false, 0),
-            pattern(false, 3),
-            pattern(false, 4),
-        ],
-        |m| {
-            let d = m.u32("d");
-            let rotated = m.get_f32("theta").is_some();
-            let normed = m.get_f32("eps").is_some();
-            Fused::QkvFusedQknormRopeVnormWrite {
-                packed: m.value("packed"),
-                positions: m.get("positions").filter(|_| rotated),
-                q_norm_weight: m.get("q_norm"),
-                k_norm_weight: m.get("k_norm"),
-                v_norm: m.get("q_norm").is_some(),
-                eps: m.get_f32("eps").unwrap_or(0.0),
-                cache: m.value("cache"),
-                write_page: m.value("write_page"),
-                write_offset: m.value("write_offset"),
-                kv_heads: m
-                    .get_u32("kv_heads")
-                    .unwrap_or_else(|| m.u32("kv_width") / d),
-                head_dim: d,
-                theta: m.get_f32("theta").unwrap_or(0.0),
-                rotary_dim: if rotated {
-                    m.get_u32("rotary").unwrap_or(d)
-                } else {
-                    0
-                },
-                span: if normed { d / 2 } else { m.u32("span") },
-                qk_norm: normed,
-                v_scale: m.get_f32("v_scale").unwrap_or(1.0),
-                widths: [m.get_u32("qk").unwrap_or(d), m.get_u32("vw").unwrap_or(d)],
-                q: m.value("q"),
-            }
+    vec![
+        pattern(true, 2),
+        pattern(true, 1),
+        pattern(false, 1),
+        pattern(false, 0),
+        pattern(false, 3),
+        pattern(false, 4),
+    ]
+}
+
+/// The fused qkv write a match states, its rows read off `packed`.
+fn qkv_fused(m: &Match, packed: poem_ir::ValueId) -> Fused {
+    let d = m.u32("d");
+    let rotated = m.get_f32("theta").is_some();
+    let normed = m.get_f32("eps").is_some();
+    Fused::QkvFusedQknormRopeVnormWrite {
+        packed,
+        positions: m.get("positions").filter(|_| rotated),
+        q_norm_weight: m.get("q_norm"),
+        k_norm_weight: m.get("k_norm"),
+        v_norm: m.get("q_norm").is_some(),
+        eps: m.get_f32("eps").unwrap_or(0.0),
+        cache: m.value("cache"),
+        write_page: m.value("write_page"),
+        write_offset: m.value("write_offset"),
+        kv_heads: m
+            .get_u32("kv_heads")
+            .unwrap_or_else(|| m.u32("kv_width") / d),
+        head_dim: d,
+        theta: m.get_f32("theta").unwrap_or(0.0),
+        rotary_dim: if rotated {
+            m.get_u32("rotary").unwrap_or(d)
+        } else {
+            0
         },
-    )
-    .when(|m| {
-        let d = m.u32("d");
-        let rotary = m.get_u32("rotary").unwrap_or(d);
-        m.dtype("packed") == Some(Dtype::Bf16)
-            && rotary <= d
-            && rotary % 2 == 0
-            && m.get_u32("span").is_none_or(|span| {
-                span == d / 2 || (m.get_f32("eps").is_none() && 2 * span <= d && span > 0)
-            })
-            && m.get_u32("kv_width").is_none_or(|w| w % d == 0)
-    })
-    .through_markers()
+        span: if normed { d / 2 } else { m.u32("span") },
+        qk_norm: normed,
+        v_scale: m.get_f32("v_scale").unwrap_or(1.0),
+        widths: [m.get_u32("qk").unwrap_or(d), m.get_u32("vw").unwrap_or(d)],
+        q: m.value("q"),
+    }
+}
+
+fn qkv_admits(m: &Match) -> bool {
+    let d = m.u32("d");
+    let rotary = m.get_u32("rotary").unwrap_or(d);
+    m.dtype("packed") == Some(Dtype::Bf16)
+        && rotary <= d
+        && rotary % 2 == 0
+        && m.get_u32("span").is_none_or(|span| {
+            span == d / 2 || (m.get_f32("eps").is_none() && 2 * span <= d && span > 0)
+        })
+        && m.get_u32("kv_width").is_none_or(|w| w % d == 0)
 }
 
 /// A row norm whose output joins the residual stream, optionally scaled and

@@ -6,6 +6,8 @@ use crate::tensor::{KvPool, Tensor};
 
 const FILE: &str = "attn/qkv_fused.cuh";
 
+/// The packed row's qkv write; with `rest`, the row's columns past its qkv
+/// planes (a row split's second half) land there.
 #[allow(clippy::too_many_arguments)]
 pub fn qkv_fused_qknorm_rope_vnorm_write(
     ctx: &Ctx,
@@ -26,6 +28,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     qk_norm: bool,
     v_scale: f32,
     widths: [u32; 2],
+    rest: Option<Tensor>,
     q: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "custom_cuda.qkv_fused_qknorm_rope_vnorm_write";
@@ -86,7 +89,22 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     let head_dim = count(OP, "the head width this fused write states", head_dim)?;
     let kv_heads = count(OP, "the kv head count this fused write states", kv_heads)?;
 
-    let width = stated(OP, packed.width)?;
+    // The rest: whole 16-byte words after a whole number of them.
+    let rest_width = rest.map_or(0, |r| r.width);
+    if rest.is_some_and(|r| {
+        r.rows != packed.rows
+            || r.dtype != Dtype::Bf16
+            || rest_width >= packed.width
+            || !rest_width.is_multiple_of(8)
+            || !packed.width.is_multiple_of(8)
+    }) {
+        return Err(refuse(
+            OP,
+            "the rest of a row lands as whole 16-byte words past whole ones",
+        ));
+    }
+    let rest_arg = rest.map_or(ArgValue::ABSENT, |r| r.arg());
+    let width = stated(OP, packed.width - rest_width)?;
     let num_q_heads = (width - kv_heads * (qk_width + v_width)) / qk_width;
     if num_q_heads <= 0 {
         return Err(refuse(
@@ -159,6 +177,8 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
                 tail.2.arg(),
                 qk_width.arg(),
                 v_width.arg(),
+                stated(OP, rest_width)?.arg(),
+                rest_arg,
             ],
         );
     }
@@ -204,11 +224,15 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
                 tail.2.arg(),
                 qk_width.arg(),
                 v_width.arg(),
+                stated(OP, rest_width)?.arg(),
+                rest_arg,
             ],
         );
     }
-    // The block-a-head kernel turns Gemma's pairs under norms alone.
-    if 2 * span != head_dim.unsigned_abs()
+    // The block-a-head kernel turns Gemma's pairs under norms alone, and
+    // reads a row of qkv alone.
+    if rest.is_some()
+        || 2 * span != head_dim.unsigned_abs()
         || !qk_norm
         || v_scale != 1.0
         || widths != [head_dim.unsigned_abs(); 2]

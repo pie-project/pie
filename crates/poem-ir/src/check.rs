@@ -913,7 +913,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 &[(In(2), I32), (In(3), CACHE), (In(4), I32), (In(5), I32)]
             }
             Fused::EmbedScaleAdd { .. } | Fused::EmbedScaleAddSelect { .. } => &[(In(0), I32)],
-            Fused::QkvFusedQknormRopeVnormWrite { .. } => {
+            Fused::QkvFusedQknormRopeVnormWrite { .. } | Fused::SplitQkvFused { .. } => {
                 &[(In(1), CACHE), (In(2), I32), (In(3), I32)]
             }
             Fused::RopeYarnAppend { .. } => {

@@ -227,7 +227,9 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     bool qk_norm,
     float v_scale,
     int qk_width,
-    int v_width)
+    int v_width,
+    int rest_width,
+    bf16* __restrict__ rest)
 {
     constexpr unsigned FULL_MASK = 0xffffffffu;
     constexpr int ELEMS_PER_THREAD = HEAD_DIM / 32;
@@ -256,9 +258,20 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     // The packed row's heads at their own widths (`qk_width`, `v_width`),
     // each landing HEAD_DIM wide, zero past its width.
     const int kv_dim = num_kv_heads * HEAD_DIM;
-    const int packed_stride = num_q_heads * qk_width + num_kv_heads * (qk_width + v_width);
+    const int qkv_width = num_q_heads * qk_width + num_kv_heads * (qk_width + v_width);
+    const int packed_stride = qkv_width + rest_width;
     const bf16* src_row =
         packed + static_cast<long long>(row) * packed_stride;
+    // The row's columns past its qkv (`rest`, a whole number of 16-byte
+    // words), a q head's share each.
+    if (is_q && rest_width > 0) {
+        const int per = ((rest_width + num_q_heads - 1) / num_q_heads + 7) / 8 * 8;
+        const int end = min((local_head + 1) * per, rest_width);
+        for (int c = local_head * per + lane * 8; c < end; c += 256) {
+            *reinterpret_cast<uint4*>(rest + static_cast<long long>(row) * rest_width + c) =
+                *reinterpret_cast<const uint4*>(src_row + qkv_width + c);
+        }
+    }
     const bf16* src = is_q
         ? src_row + local_head * qk_width
         : src_row + num_q_heads * qk_width + local_head * qk_width;
@@ -474,7 +487,9 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     bool qk_norm,
     float v_scale,
     int qk_width,
-    int v_width)
+    int v_width,
+    int rest_width,
+    bf16* __restrict__ rest)
 {
     constexpr unsigned FULL_MASK = 0xffffffffu;
     constexpr int ELEMS_PER_THREAD = E;
@@ -491,7 +506,7 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     const int row = win != nullptr ? r + static_cast<int>(win[1]) : r;
     if (threadIdx.x == 0) {
         // The packed row on its way into L2 under the rotation's setup.
-        const int width = num_q_heads * qk_width + num_kv_heads * (qk_width + v_width);
+        const int width = num_q_heads * qk_width + num_kv_heads * (qk_width + v_width) + rest_width;
         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(
                          packed + static_cast<long long>(row) * width),
                      "r"(static_cast<unsigned>(width) * 2u)
@@ -519,8 +534,15 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     // The packed row's heads at their own widths, landing HEAD_DIM wide.
     const int kv_dim = num_kv_heads * HEAD_DIM;
     const int q_src = num_q_heads * qk_width;
-    const int packed_stride = q_src + num_kv_heads * (qk_width + v_width);
+    const int qkv_width = q_src + num_kv_heads * (qk_width + v_width);
+    const int packed_stride = qkv_width + rest_width;
     const bf16* src_row = packed + static_cast<long long>(row) * packed_stride;
+    // The row's columns past its qkv (`rest`, a whole number of 16-byte
+    // words).
+    for (int c = threadIdx.x * 8; c < rest_width; c += blockDim.x * 8) {
+        *reinterpret_cast<uint4*>(rest + static_cast<long long>(row) * rest_width + c) =
+            *reinterpret_cast<const uint4*>(src_row + qkv_width + c);
+    }
     const bool kv_valid = row_valid == nullptr || row_valid[row] != 0;
 
     int actual_page = 0;

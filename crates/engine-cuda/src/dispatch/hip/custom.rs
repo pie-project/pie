@@ -37,7 +37,8 @@ impl DispatchFused for Run<'_> {
             | Fused::HcGatesNorm { .. }
             | Fused::HcPrenormProject { .. }
             | Fused::ResBlendRmsnorm { .. }
-            | Fused::QgQknormRopeAppend { .. } => {
+            | Fused::QgQknormRopeAppend { .. }
+            | Fused::SplitQkvFused { .. } => {
                 Err(kernels_cuda::Error::Unsupported { op: op.name() })
             }
             Fused::ResidualAddRmsnorm { .. }
