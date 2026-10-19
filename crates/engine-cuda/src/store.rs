@@ -1267,6 +1267,48 @@ impl Pools {
         self.zero_slot(Some(stream), slot)
     }
 
+    /// [`Self::clear_on`] for many slots, a run of consecutive slots one
+    /// zeroing a state plane (a prefill seats hundreds of lanes at once).
+    pub fn clear_many_on(&mut self, stream: *mut core::ffi::c_void, slots: &[u32]) -> Result<()> {
+        let mut sorted: Vec<u32> = slots.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for &slot in &sorted {
+            match runs.last_mut() {
+                Some((first, count)) if *first + *count == slot => *count += 1,
+                _ => runs.push((slot, 1)),
+            }
+        }
+        for (first, count) in runs {
+            if count == 1 {
+                self.zero_slot(Some(stream), first)?;
+                continue;
+            }
+            let last = first + count - 1;
+            if !slab_row(self.has_state(), self.paging.slots, last)? {
+                for slot in first..=last {
+                    self.zero_slot(Some(stream), slot)?;
+                }
+                continue;
+            }
+            self.ensure_state(last + 1)?;
+            for (planes, shape) in self.rows.iter().zip(&self.shapes) {
+                let Shape::State { stride, dtype } = *shape else {
+                    continue;
+                };
+                let Some(arena) = planes.first() else {
+                    continue;
+                };
+                let bytes = stride * u64::from(elem_size(dtype));
+                let len = bytes * u64::from(count);
+                let at = arena.span(u64::from(first) * bytes, len)?;
+                crate::device::zero_span_on(stream, at, usize::try_from(len).unwrap_or(0))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn copy_slot(&mut self, stream: *mut core::ffi::c_void, src: u32, dst: u32) -> Result<()> {
         for slot in [src, dst] {
             if !slab_row(self.has_state(), self.paging.slots, slot)? {

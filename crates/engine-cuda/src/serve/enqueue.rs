@@ -296,9 +296,8 @@ impl FireCtx<'_> {
     }
 
     fn stage(&mut self, p: &mut Prepared<'_>, slot: &SlotGuard) -> Result<Staged> {
-        for fresh in &p.fresh {
-            self.pools.clear_on(self.device.stream(), *fresh)?;
-        }
+        let fresh: Vec<u32> = p.fresh.iter().copied().collect();
+        self.pools.clear_many_on(self.device.stream(), &fresh)?;
 
         let rows = p.composition.rows();
         let lane_count = p.composition.lane_count();
