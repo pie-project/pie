@@ -4176,27 +4176,34 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) ssm_kda16_prep(
         return rsqrtf(warp_sum(x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3]) + eps) * scale;
     };
     // The keys and queries: their split-scaled twins for `A` and `P`, the
-    // scan's.
+    // scan's. Every row's lengths first, so their shuffles overlap.
     const float q_scale = rsqrtf(static_cast<float>(D));
+    float kinv[R], qinv[R];
+    #pragma unroll
+    for (int ii = 0; ii < R; ++ii) {
+        float k[4], q[4];
+        unpack4(kc, i0 + ii, k);
+        unpack4(qr, i0 + ii, q);
+        kinv[ii] = inv_len(k, 1.f);
+        qinv[ii] = inv_len(q, q_scale);
+    }
     #pragma unroll
     for (int ii = 0; ii < R; ++ii) {
         const int i = i0 + ii;
         float k[4], q[4];
         unpack4(kc, i, k);
         unpack4(qr, i, q);
-        const float kinv = inv_len(k, 1.f);
-        const float qinv = inv_len(q, q_scale);
         float ke[4], kd[4], kz[4], kl[4], qe[4], qd[4];
         #pragma unroll
         for (int u = 0; u < 4; ++u) {
-            const float kk = k[u] * kinv;
+            const float kk = k[u] * kinv[ii];
             const float up = kk * kda_ex2(-G[ii][u]);
             const float e = kda_ex2(G[ii][u]);
             ke[u] = kk * e;
             kd[u] = ke[u] * einv_0[u];
             kz[u] = up * e_0[u];
             kl[u] = up * e_l[u];
-            qe[u] = q[u] * qinv * e;
+            qe[u] = q[u] * qinv[ii] * e;
             qd[u] = qe[u] * einv_0[u];
         }
         store4(kr + i * GDN_LD + c, kd[0], kd[1], kd[2], kd[3]);
