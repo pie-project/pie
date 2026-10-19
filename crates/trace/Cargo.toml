@@ -1,0 +1,18 @@
+[package]
+name = "pie-trace"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Agent traces: an in-memory recorder of which GPU work, KV pages and waits belong to which inferlet, written at the end as a `.pie` file (Chrome/Perfetto JSON). Off unless started; counts and timings only, never text. Internal to pie."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_trace"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
+[lints]
+workspace = true

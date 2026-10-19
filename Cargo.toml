@@ -17,6 +17,7 @@ members = [
     "crates/dtype",
     "crates/profile",
     "crates/profile-macros",
+    "crates/trace",
 
     "crates/client-api",
     "crates/controller-api",
@@ -80,6 +81,7 @@ default-members = [
     "crates/dtype",
     "crates/profile",
     "crates/profile-macros",
+    "crates/trace",
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",
