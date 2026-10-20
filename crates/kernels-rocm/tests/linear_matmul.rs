@@ -235,7 +235,10 @@ fn the_f32_projection_lands_unrounded() {
         gemm::matmul_f32(&ctx, at, wt, &mut y).unwrap();
         let want = reference(&a, &w, None, m as usize, n as usize, k as usize);
         for (i, (h, w)) in gpu.read(&y).iter().zip(&want).enumerate() {
-            assert!((h - w).abs() <= 1e-4 * w.abs().max(1.0), "matmul_f32 {m}x{n}x{k}[{i}] = {h}, want {w}");
+            assert!(
+                (h - w).abs() <= 1e-4 * w.abs().max(1.0),
+                "matmul_f32 {m}x{n}x{k}[{i}] = {h}, want {w}"
+            );
         }
     }
 }

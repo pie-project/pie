@@ -73,6 +73,7 @@ pub fn max_touched_pages(total_tokens: i32, num_requests: i32, page_size: i32) -
 /// page list's order, as a pool of its own (its list `0..pages`), for a
 /// kernel that reads bf16 pages alone; `None` where the shadow would pass
 /// `cap` bytes.
+#[cfg(feature = "cuda")]
 pub(crate) fn widen_e4m3(
     ctx: &Ctx,
     op: &'static str,

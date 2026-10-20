@@ -992,9 +992,10 @@ __device__ __forceinline__ void route_row_sums(float (&v)[K], float* part)
 // (`win`, in tokens) is untouched. Normed, a block holds the row (`n / 8`
 // threads) and each route is first normed as norm_gate norms it under
 // `scale`: `u = x * scale` rounded, `u / rms(u)` rounded (a row of at most
-// 4096).
-template <bool kNorm>
-__global__ void __launch_bounds__(kNorm ? 512 : 1024, kNorm ? 4 : 1) route_weighted_gather_vec8(
+// 4096). `kAheadNorm` normed routes are in flight at once (each normed by its
+// own block sum, the same whatever the batch).
+template <bool kNorm, int kAheadNorm = 2>
+__global__ void __launch_bounds__(kNorm ? 512 : 1024, kNorm ? (kAheadNorm > 2 ? 1 : 4) : 1) route_weighted_gather_vec8(
     const bf16* __restrict__ grouped,
     const i32* __restrict__ pos,
     const float* __restrict__ weights,
@@ -1018,9 +1019,11 @@ __global__ void __launch_bounds__(kNorm ? 512 : 1024, kNorm ? 4 : 1) route_weigh
     for (int i = 0; i < 8; ++i) acc[i] = 0.f;
     // Eight routes' rows (and weights) in flight at once, summed in route
     // order: a row's latency paid once a batch, not once a route. Normed,
-    // two, their norms' block sums taken together: a row's block then fits
-    // four to a multiprocessor, which hides more latency than a deeper batch.
-    constexpr int kAhead = kNorm ? 2 : 8;
+    // `kAheadNorm`, their norms' block sums taken together: two lets a row's
+    // block fit four to a multiprocessor, which hides more latency than a
+    // deeper batch over a long fire; a decode's few rows' blocks leave the
+    // multiprocessors idle, and a deeper batch pays fewer rounds.
+    constexpr int kAhead = kNorm ? kAheadNorm : 8;
     __shared__ float part[kNorm ? 33 * kAhead : 1];
     uint4 sv = {};
     if constexpr (kNorm) sv = *reinterpret_cast<const uint4*>(scale + h0);

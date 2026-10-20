@@ -5,8 +5,8 @@ use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::exports::{
     Exports, Feeds, corrected_classes, decoding_of, landing_requests, masked_classes,
-    media_classes, plain_of, regions_lane_shifting, regions_launching_schedules, regions_shifting,
-    schedule_streams,
+    media_classes, plain_of, read_only_by_decoders, regions_lane_shifting,
+    regions_launching_schedules, regions_shifting, schedule_streams,
 };
 use crate::inputs::Inputs;
 use crate::program::Plane as ProgramPlane;
@@ -646,13 +646,16 @@ impl Shell {
             crate::device::ctx::sync(device.stream())?;
         }
 
-        let facts = kv::probe(&boot.trace)?;
+        let mut facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
         crate::window::no_grouped_window_is_also_a_prepare_window(&compiled)?;
         let masked = masked_classes(&boot.trace, &compiled);
         let corrected = corrected_classes(&boot.trace, &compiled);
         let landing = landing_requests(&boot.trace.facts, &compiled.classes);
         let decoding = decoding_of(&landing);
+        // A schedule only decoding classes read sees a row a lane: its
+        // partials are sized for the lanes, not the widest fire's rows.
+        facts.mark_rows_a_lane(&read_only_by_decoders(&boot.trace, &compiled, &decoding));
         let feeds = Feeds::of(&boot.trace, &compiled);
         // A wide body is captured from representative lanes and keyed by the
         // whole wide list, so only classes a synthetic lane can stand in for
@@ -715,16 +718,17 @@ impl Shell {
         if let Some(buffers) = &buffers {
             pools.seat_buffered(buffers.slot_bytes(), buffers.map_unit());
         }
-        // Committed whole: a fire reading out past one row a lane (a verify
-        // reads every row) would otherwise grow it outside the fit.
-        let mut arena = Arena::reserve(&compiled.arena, &pools)?;
         // The fires that run the side streams carve their own arena
-        // (`CompiledModel::arena_forked`): the larger of the two is held.
+        // (`CompiledModel::arena_forked`): the larger of the two is reserved
+        // and held. Committed whole: a fire reading out past one row a lane
+        // (a verify reads every row) would otherwise grow it outside the fit.
         let forked_bytes = compiled
             .arena_forked
             .as_ref()
             .map_or(0, |forked| forked.bytes);
-        arena.ensure(&mut pools, compiled.arena.bytes.max(forked_bytes))?;
+        let arena_bytes = compiled.arena.bytes.max(forked_bytes);
+        let mut arena = Arena::reserve(arena_bytes, &pools)?;
+        arena.ensure(&mut pools, arena_bytes)?;
         let predicate = crate::store::rs::Predicate::reserve(
             boot.budget.max_lanes,
             crate::store::rs::snapshots(&boot.trace) > 0,

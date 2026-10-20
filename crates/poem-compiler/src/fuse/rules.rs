@@ -792,7 +792,7 @@ fn qkv_admits(m: &Match) -> bool {
     let rotary = m.get_u32("rotary").unwrap_or(d);
     m.dtype("packed") == Some(Dtype::Bf16)
         && rotary <= d
-        && rotary % 2 == 0
+        && rotary.is_multiple_of(2)
         && m.get_u32("span").is_none_or(|span| {
             span == d / 2 || (m.get_f32("eps").is_none() && 2 * span <= d && span > 0)
         })

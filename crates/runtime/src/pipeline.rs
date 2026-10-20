@@ -5,9 +5,13 @@ pub mod instance;
 pub mod media;
 pub mod program;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fire::{PendingFireQueue, PendingFires, PipelineFailure};
+
+/// The pipelines open right now (`pipeline.live`).
+static LIVE: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Pipeline {
     pub fires: PendingFires,
@@ -20,6 +24,7 @@ impl Pipeline {
     pub fn new() -> Self {
         let fires = Arc::new(PendingFireQueue::new());
         let weak_fires = Arc::downgrade(&fires);
+        LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             fires,
             failure: Arc::new(Mutex::new(None)),
@@ -30,6 +35,11 @@ impl Pipeline {
             }),
             frame_seq: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    #[must_use]
+    pub fn live() -> usize {
+        LIVE.load(Ordering::Relaxed)
     }
 
     pub(crate) fn next_frame_seq(&self) -> u64 {
@@ -46,6 +56,7 @@ impl Default for Pipeline {
 
 impl Drop for Pipeline {
     fn drop(&mut self) {
+        LIVE.fetch_sub(1, Ordering::Relaxed);
         self.scope.close();
     }
 }

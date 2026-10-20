@@ -1190,6 +1190,12 @@ impl Pipeline {
     pub fn park(&self) {
         wit_forward::park(&self.wit);
     }
+
+    /// How many pipelines are open on the engine, this one included.
+    #[must_use]
+    pub fn live() -> u32 {
+        wit_pipeline::live()
+    }
 }
 
 impl Default for Pipeline {

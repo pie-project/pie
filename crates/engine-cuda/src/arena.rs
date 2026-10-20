@@ -15,9 +15,10 @@ pub struct Arena {
 }
 
 impl Arena {
-    pub fn reserve(map: &ArenaMap, pools: &Pools) -> Result<Arena> {
+    /// Reserves `bytes`, the most any arena map this load carves asks for.
+    pub fn reserve(bytes: u64, pools: &Pools) -> Result<Arena> {
         Ok(Arena {
-            store: pools.reserve_arena(map.bytes, "activation arena")?,
+            store: pools.reserve_arena(bytes, "activation arena")?,
             committed: 0,
         })
     }

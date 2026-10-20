@@ -21,6 +21,16 @@ interface tools {
     /// Provide a tool result (after a tool-call reply)
     answer: func(name: string, value: string) -> list<u32>;
 
+    /// Consecutive tool results (name, value), as the template writes them
+    /// together.
+    answers: func(results: list<tuple<string, string>>) -> list<u32>;
+
+    /// An earlier assistant turn: `message`, then the calls it made in the
+    /// template's call syntax. `current` marks a turn after the
+    /// conversation's last user query, which some templates replay with its
+    /// reasoning.
+    assistant-calls: func(message: string, calls: list<tool-call>, current: bool) -> list<u32>;
+
     /// Returns the grammar that constrains well-formed tool-call output for
     /// this model and toolset, or none if the model has no enforceable format.
     format: func(tools: list<string>) -> option<grammar>;

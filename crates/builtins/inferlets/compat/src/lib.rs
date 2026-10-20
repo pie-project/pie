@@ -35,7 +35,7 @@ pub use demux::Event;
 pub use envelope::Envelope;
 pub use error::ApiError;
 pub use generate::Sampling;
-pub use request::{Message, Request, ResponseFormat, Role, Thinking, ToolCall, ToolChoice};
+pub use request::{Effort, Message, Request, ResponseFormat, Role, Thinking, ToolCall, ToolChoice};
 pub use run::{Finish, Outcome, run};
 
 /// A short id unique to this process: the instance id's leading characters.

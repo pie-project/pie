@@ -1306,6 +1306,8 @@ pub fn gated_delta_chunked(
     let _ = z;
     dtype_dispatch!(OP, qkv.data.dtype, { Bf16 => () });
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
+    // A short fire (a verify, a fold) scans its rows in order instead.
+    let scan = y.rows <= ctx.tuning().ssm_gdn_scan_until;
     if y.dtype == Dtype::Bf16 {
         // Narrowed for its gated norm: the tcgen05 walk lands bf16 itself;
         // any other walk lands f32 in a plane, cast after.
@@ -1315,6 +1317,7 @@ pub fn gated_delta_chunked(
         if k_dim == 128
             && v_dim == 128
             && !SERIAL_SCAN.with(core::cell::Cell::get)
+            && !scan
             && gated_delta_chunked_tc5(ctx, OP, &shape, qkv, gates, state, y)?
         {
             return Ok(());
@@ -1341,7 +1344,8 @@ pub fn gated_delta_chunked(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;
-    let wide = k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get);
+    let wide =
+        k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get) && !scan;
     #[cfg(feature = "cuda")]
     if wide && gated_delta_chunked_tc5(ctx, OP, &shape, qkv, gates, state, y)? {
         return Ok(());
@@ -2132,16 +2136,16 @@ mod tests {
         assert!(scan_smem(128) > 101_376);
     }
 
-    /// Three blocks of the fused step where the SM holds them, as on a B200
-    /// (228 KiB) or an A100 (164 KiB); two on a 100 KiB SM; four where asked
-    /// and held.
+    /// Four blocks of the fused step where the SM holds them, as on a B200
+    /// (228 KiB) or an A100 (164 KiB); two on a 100 KiB SM; the profile's
+    /// fewer where it asks (A100's three).
     #[test]
     fn the_fused_step_seats_what_the_sm_holds() {
-        assert_eq!(fused_blocks_per_sm(Some(233_472), 3), 3);
-        assert_eq!(fused_blocks_per_sm(Some(167_936), 3), 3);
-        assert_eq!(fused_blocks_per_sm(Some(102_400), 3), 2);
-        assert_eq!(fused_blocks_per_sm(Some(16_384), 3), 1);
-        assert_eq!(fused_blocks_per_sm(None, 3), 3);
         assert_eq!(fused_blocks_per_sm(Some(233_472), 4), 4);
+        assert_eq!(fused_blocks_per_sm(Some(167_936), 4), 4);
+        assert_eq!(fused_blocks_per_sm(Some(102_400), 4), 2);
+        assert_eq!(fused_blocks_per_sm(Some(16_384), 4), 1);
+        assert_eq!(fused_blocks_per_sm(None, 4), 4);
+        assert_eq!(fused_blocks_per_sm(Some(167_936), 3), 3);
     }
 }

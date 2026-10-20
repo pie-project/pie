@@ -2174,14 +2174,17 @@ fn glu_code(
 
 /// The most routes an expert averages that the register-held mxfp4
 /// select takes; past it, the shared-memory-staged one.
+#[cfg(feature = "cuda")]
 const STAGED_FROM: u32 = 32;
 
 /// The 128-code chunks a warp of the register-held mxfp4 select keeps in
 /// flight: one, five CTAs an SM; a decode's few CTAs take more warps from
 /// the K split instead.
+#[cfg(feature = "cuda")]
 const MMA_DEPTH: u32 = 1;
 
 /// The deepest K split the register-held mxfp4 select's CTA takes.
+#[cfg(feature = "cuda")]
 const MMA_KSPLIT_MAX: u32 = 4;
 
 /// The routed mxfp4 select on mma.sync, each expert's rows dequantized in
@@ -2534,6 +2537,7 @@ pub fn select_fp8_w8a16(
 /// GEMM that widens a stage's codes once a 64 routes
 /// (`moe_select_fp8_gemm`); fewer, the register-held kernel streams the
 /// bank as fast.
+#[cfg(feature = "cuda")]
 const FP8_GEMM_FROM: u32 = 8192;
 
 /// From this many routes a fire (with K in whole 64s), a bf16 select is the
@@ -2541,6 +2545,7 @@ const FP8_GEMM_FROM: u32 = 8192;
 /// batch's routes crowd onto a few hot experts as often as not, and its
 /// tiles stream a hot expert's rows once a 64 routes, near the card's rate
 /// with the routes spread.
+#[cfg(feature = "cuda")]
 const BF16_GEMM_FROM: u32 = 256;
 
 /// A routed select over a bf16 bank (`experts x n x k` at `bank`) on mma.sync

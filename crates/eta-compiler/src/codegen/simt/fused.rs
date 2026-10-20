@@ -696,6 +696,7 @@ struct GumbelSlots {
     noise_desc: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_body(
     source: &mut String,
     stage: &CompiledStage,
