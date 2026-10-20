@@ -5,7 +5,7 @@ use kernels_cuda::attn::paged;
 use kernels_cuda::attn::{self, index, mla, plan, pool, selected};
 use kernels_cuda::attn_dense;
 use poem_exec::{DispatchAttention, KernelError};
-use poem_ir::{Attention, IndexScore, StructKind};
+use poem_ir::{Attention, IndexScore, Operation, StructKind};
 
 use crate::run::{Run, StructSlot};
 use kernels_cuda::RaggedTensor;
@@ -584,7 +584,21 @@ impl Run<'_> {
                         seat.workspace,
                     )?
                 };
-                built.stage(self.ctx())?;
+                // Only the dense FA2 arms read the plan off the card; a trunk
+                // whose MLA reads are all selected (the sparse or naive
+                // kernels) leaves its upload (some 600 KB a fire) unstaged.
+                let read = self.nodes().iter().any(|node| {
+                    matches!(
+                        &node.op,
+                        Operation::Attention(
+                            Attention::MlaDecode { plan: read, .. }
+                                | Attention::MlaPrefill { plan: read, .. }
+                        ) if read == plan
+                    )
+                });
+                if read {
+                    built.stage(self.ctx())?;
+                }
                 self.put(*plan, StructSlot::Mla(built));
                 Ok(())
             }
