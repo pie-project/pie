@@ -27,6 +27,15 @@ sdpa.index_mma = true
 sdpa.index_radix = true
 sdpa.pool_mma = true
 sdpa.selected_mma = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+elemwise.qg_prologue_until = 64
+elemwise.norm_emit = true
+sdpa.dsv4_decode_until = 64
+gemm.bias_epilogue = true
+gemm.rows_m = 8
+mla.expanded_from = 256
+attn_res.fused_norm = true
 moe.mxfp4_mma_from = 17
 moe.mxfp4_mma_until = 16777216
 moe.mxfp4_select_lean = true
@@ -47,9 +56,10 @@ prefill_lattice_from = 256
 lattice_steps = 2
 
 # Independent chains on side streams: decode latency +5-11% (Gemma 4, Qwen3.6-A3B,
-# DeepSeek-V4, GLM-5.3, Hy4), outputs unchanged.
+# DeepSeek-V4, GLM-5.3, Hy4), outputs unchanged; a join's branches on them too.
 [compiler]
 dag_streams = true
+branches = true
 
 [provenance]
 source = "end to end on MiMo-V2.6-Flash and Qwen3.6-27B miniatures and checkpoints, by hand"
@@ -84,4 +94,14 @@ measured = [
   "engine.prefill_lattice_from",
   "engine.lattice_steps",
   "compiler.dag_streams",
+  "kernel.elemwise.hc_tile",
+  "kernel.elemwise.hc_mma",
+  "kernel.elemwise.qg_prologue_until",
+  "kernel.elemwise.norm_emit",
+  "kernel.sdpa.dsv4_decode_until",
+  "kernel.gemm.bias_epilogue",
+  "kernel.gemm.rows_m",
+  "kernel.mla.expanded_from",
+  "kernel.attn_res.fused_norm",
+  "compiler.branches",
 ]
