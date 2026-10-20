@@ -420,14 +420,14 @@ def layout(id, deploy):
         )
     dflash = None
     if d.draft in blocks:
-        dflash = dflash_declare(d.dflash_head, "aux", hidden, d.vocab, d.norm_eps, w, dense)
+        dflash = dflash_declare(d.dflash_head, "aux", hidden, d.vocab, d.norm_eps, w, dense, blocks_w = proj)
 
     # Ternary-Bonsai's token embedding is gathered whole, which no ternary
     # kernel does: it is served decoded.
     embed = weight("embed", [d.vocab, hidden], dense if bonsai else table)
     head = None
     if not d.tied:
-        head = weight("lm_head", [d.vocab, hidden], table).columns()
+        head = weight("lm_head", [d.vocab, hidden], proj if table == w else table).columns()
     signs = None
     if bonsai:
         sign = lambda width: weight(sign_name(width), [1, width], dense)
