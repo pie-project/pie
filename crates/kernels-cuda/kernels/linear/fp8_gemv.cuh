@@ -67,7 +67,8 @@ __device__ __forceinline__ void codes4(unsigned w, float (&out)[4]) {
 
 }  // namespace fp8gemv
 
-template <int kWarps, int kRows, int kM>
+// `kGran` codes a block exponent along K: 128 (the 128x128 blocks) or 32.
+template <int kWarps, int kRows, int kM, int kGran = 128>
 __global__ void __launch_bounds__(kWarps * 32) fp8_block_gemv(
     const bf16* __restrict__ x,
     int x_stride,
@@ -92,7 +93,7 @@ __global__ void __launch_bounds__(kWarps * 32) fp8_block_gemv(
     const int group = warp / splits;
     const int part_k = warp % splits;
     const int row0 = (blockIdx.x * (kWarps / splits) + group) * kRows;
-    const int blocks = k / 128;
+    const int blocks = k / kGran;
     float acc[kRows][kM];
 #pragma unroll
     for (int i = 0; i < kRows; ++i) {
@@ -106,7 +107,7 @@ __global__ void __launch_bounds__(kWarps * 32) fp8_block_gemv(
         for (int i = 0; i < kRows; ++i) {
             const int row = min(row0 + i, n - 1);
             w[i] = ld_stream(codes + static_cast<long long>(row) * k + c0);
-            s[i] = __uint_as_float((static_cast<unsigned>(atoms[atom_offset(row, c0 / 128, blocks)]) + kCodeBias) << 23);
+            s[i] = __uint_as_float((static_cast<unsigned>(atoms[atom_offset(row, c0 / kGran, blocks)]) + kCodeBias) << 23);
         }
         // The activations' sixteen columns of each row, read through L1
         // (every warp of the block reads the same).

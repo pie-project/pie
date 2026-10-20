@@ -341,6 +341,7 @@ pub fn fp8_block_gemv(
     act: Tensor,
     codes: u64,
     atoms: u64,
+    gran: u32,
     y: &mut Tensor,
 ) -> Result<bool, Error> {
     const OP: &str = "linear.fp8_block_gemv";
@@ -352,6 +353,7 @@ pub fn fp8_block_gemv(
         || act.dtype != Dtype::Bf16
         || y.dtype != Dtype::Bf16
         || y.rows != m
+        || !matches!(gran, 32 | 128)
         || k == 0
         || !k.is_multiple_of(512)
         || n == 0
@@ -373,7 +375,12 @@ pub fn fp8_block_gemv(
         Fire::at(
             "linear/fp8_gemv.cuh",
             symbol(&format!(
-                "::pie::linear::fp8_block_gemv<{WARPS}, {ROWS}, {rows_pad}>"
+                "::pie::linear::fp8_block_gemv<{WARPS}, {ROWS}, {rows_pad}{}>",
+                if gran == 128 {
+                    String::new()
+                } else {
+                    format!(", {gran}")
+                }
             )),
         )
         .apply(Launch::grid(
