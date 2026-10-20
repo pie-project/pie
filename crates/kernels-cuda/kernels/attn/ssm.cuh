@@ -2769,7 +2769,9 @@ __global__ void ssm_kda_gate_beta_rows(
     const int width = H * D;
     const long long base = static_cast<long long>(t) * width;
     const long long src = static_cast<long long>(t_row) * width;
-    for (int e = threadIdx.x * 4; e < width; e += blockDim.x * 4) {
+    // `gridDim.y` blocks share the row's channels (a decode's few rows).
+    for (int e = (blockIdx.y * blockDim.x + threadIdx.x) * 4; e < width;
+         e += gridDim.y * blockDim.x * 4) {
         const float a = __expf(A_log[e / D]);
         float out[4];
         #pragma unroll
@@ -2786,10 +2788,49 @@ __global__ void ssm_kda_gate_beta_rows(
         }
         *reinterpret_cast<float4*>(gate_out + base + e) = make_float4(out[0], out[1], out[2], out[3]);
     }
-    for (int h = threadIdx.x; h < H; h += blockDim.x) {
+    for (int h = threadIdx.x; h < H && blockIdx.y == 0; h += blockDim.x) {
         beta_out[static_cast<long long>(t) * H + h] =
             sigmoidf(Elem<ElemT>::to_f32(raw_beta[static_cast<long long>(t_row) * H + h]));
     }
+}
+
+// `ssm_kda_qkv_prep` a warp a head: block (row, plane, z) takes heads
+// z * BLOCK / 32 .. +BLOCK / 32, each warp its head's sum of squares (folded
+// across its lanes) and the head's normalized values, no shared memory
+// between: a decode's row over the card rather than one block a plane.
+// `width` whole `head_dim`s.
+template <class ElemT, int BLOCK>
+__global__ void ssm_kda_qkv_prep_heads(
+    const ElemT* __restrict__ mixed,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    int width, int head_dim, float eps,
+    const u32* __restrict__ win)
+{
+    const int n = blockIdx.x;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int plane = blockIdx.y;
+    const int lane = threadIdx.x % 32;
+    const int h = blockIdx.z * (BLOCK / 32) + static_cast<int>(threadIdx.x) / 32;
+    if (h * head_dim >= width) return;
+    const ElemT* src = mixed + (long long)n_row * 3 * width + (long long)plane * width + h * head_dim;
+    float* dst = (plane == 0 ? q_out : (plane == 1 ? k_out : v_out)) + (long long)n * width + h * head_dim;
+    if (plane == 2) {
+        for (int d = lane; d < head_dim; d += 32) dst[d] = Elem<ElemT>::to_f32(src[d]);
+        return;
+    }
+    float acc = 0.f;
+    for (int d = lane; d < head_dim; d += 32) {
+        const float x = Elem<ElemT>::to_f32(src[d]);
+        acc += x * x;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    const float q_scale = (plane == 0) ? rsqrtf(static_cast<float>(head_dim)) : 1.f;
+    const float inv = rsqrtf(acc + eps);
+    for (int d = lane; d < head_dim; d += 32) dst[d] = Elem<ElemT>::to_f32(src[d]) * inv * q_scale;
 }
 
 template <class ElemT, int BLOCK>

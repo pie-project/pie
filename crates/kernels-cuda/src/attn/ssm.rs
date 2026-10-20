@@ -1625,8 +1625,25 @@ impl Kda {
 
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::ssm_kda_qkv_prep<::pie::bf16, 128>")
-                .apply(Launch::grid([self.n, PLANES, 1], [PREP_BLOCK, 1, 1])),
+            // A warp a head where the row is whole heads (a decode's row over
+            // the card), else a block a plane.
+            if self.head_dim > 0 && self.width.is_multiple_of(self.head_dim) {
+                Fire::at(
+                    FILE,
+                    "::pie::attn::ssm_kda_qkv_prep_heads<::pie::bf16, 128>",
+                )
+                .apply(Launch::grid(
+                    [
+                        self.n,
+                        PLANES,
+                        (self.width / self.head_dim).div_ceil(PREP_BLOCK / WARP),
+                    ],
+                    [PREP_BLOCK, 1, 1],
+                ))
+            } else {
+                Fire::at(FILE, "::pie::attn::ssm_kda_qkv_prep<::pie::bf16, 128>")
+                    .apply(Launch::grid([self.n, PLANES, 1], [PREP_BLOCK, 1, 1]))
+            },
             &[
                 mixed.arg(),
                 ArgValue::Ptr(staged.q_norm),
@@ -1640,8 +1657,10 @@ impl Kda {
         )?;
         // A row a block, four channels a thread.
         let gates = if self.head_dim.is_multiple_of(4) {
-            Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta_rows<::pie::bf16>")
-                .apply(Launch::grid([self.n, 1, 1], [256, 1, 1]))
+            Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta_rows<::pie::bf16>").apply(Launch::grid(
+                [self.n, self.width.div_ceil(1024), 1],
+                [256, 1, 1],
+            ))
         } else {
             Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta<::pie::bf16>").apply(Launch::grid(
                 [self.n, self.heads, 1],
