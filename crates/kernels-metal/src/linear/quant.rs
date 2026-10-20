@@ -56,6 +56,13 @@ pub fn qmm_group(bm: i32) -> [u32; 3] {
     [32, 2, if bm < 2 * FRAG_ROWS { 1 } else { 2 }]
 }
 
+/// The threadgroup of the MXFP4 and fp16 routed matmuls: `quant_qmm_t.metal`'s
+/// `routed_wm`, two simdgroups for a tile of at most 16 rows.
+#[must_use]
+pub fn routed_group(bm: i32) -> [u32; 3] {
+    [32, 2, if bm <= 2 * FRAG_ROWS { 1 } else { 2 }]
+}
+
 const FRAG_ROWS: i32 = 8;
 
 const QMV_GROUP: [u32; 3] = [32, 2, 1];
