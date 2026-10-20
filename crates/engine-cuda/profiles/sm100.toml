@@ -70,6 +70,10 @@ sdpa.decode.xqa = true
 sdpa.decode.xqa_from_64 = 16
 sdpa.decode.xqa_whole_window = 128
 sdpa.decode.xqa_cluster = 8
+# 64-wide heads three key tiles deep a warp, rows swizzled, four blocks an SM:
+# Muse Spark's bs64 decode attention 328 -> 288 us a step, gpt-oss-120b's
+# 7-8 us a step at bs1/8/64 (bs8 Muse even).
+sdpa.decode.xqa_deep_64 = true
 # A dense bias from the cuBLASLt epilogue.
 gemm.bias_epilogue = true
 # Routed MLPs kept by expert with the GLU in the gate-up epilogue: W4A4
