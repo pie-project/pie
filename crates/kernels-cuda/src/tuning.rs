@@ -131,6 +131,15 @@ pub struct MoeW4a4SwapBnNarrow(pub u32);
 #[decision(id = "kernel.moe.w4a4_down_splits", constant(range(1..=8)), default = 1, tune = search)]
 pub struct MoeW4a4DownSplits(pub u32);
 
+/// The fewest waves of units a swapped grouped tcgen05 GEMM (a decode's
+/// routed experts) spans before it deals them over the fewest CTAs that keep
+/// its waves, the same count each, rather than a CTA an SM with the last
+/// wave part full (a launch of two waves' short units hides their latency
+/// on the SMs it would retire). 0, never, but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.even_waves_from", constant(range(0..=64)), default = 0, tune = search)]
+pub struct MoeEvenWavesFrom(pub u32);
+
 /// The fewest rows the fused qkv norm, rotation and KV write takes a block a
 /// row (a warp a head below): 64 but where a chip's profile says (B200's,
 /// where 64 decode rows' blocks leave most SMs idle).
@@ -709,6 +718,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeW4a4SwappedRoutes>()
         .add::<MoeW4a4SwapBnNarrow>()
         .add::<MoeW4a4DownSplits>()
+        .add::<MoeEvenWavesFrom>()
         .add::<AttnQkvRowsFrom>()
         .add::<SsmKdaStepFused>()
         .add::<GemmSplitLaunchNs>()
@@ -831,6 +841,7 @@ tuning! {
     moe_w4a4_swapped_routes: u32 = 64, get MoeW4a4SwappedRoutes;
     moe_w4a4_swap_bn_narrow: u32 = 32, get MoeW4a4SwapBnNarrow;
     moe_w4a4_down_splits: u32 = 1, get MoeW4a4DownSplits;
+    moe_even_waves_from: u32 = 0, get MoeEvenWavesFrom;
     qkv_rows_from: u32 = 64, get AttnQkvRowsFrom;
     ssm_kda_step_fused: bool = false, on SsmKdaStepFused;
     gemm_split_launch_ns: u32 = 0, get GemmSplitLaunchNs;

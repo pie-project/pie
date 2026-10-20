@@ -106,6 +106,10 @@ struct Epi {
     // Swapped: the weights, their scales and the group were landed before
     // the launch this one depends on (a routed down leg after its gate-up).
     int weights_ahead;
+    // Grouped and swapped: from this many waves (0, never) the units dealt
+    // over the fewest CTAs that keep them, the same count each
+    // (`kernel.moe.even_waves_from`).
+    int even_waves;
 };
 
 namespace tc5k {
@@ -512,8 +516,22 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     // decode's few tiles would leave SMs idle, summed in f32 at `part`.
     const int kb_per = (num_kb + splits - 1) / splits;
     const int tiles = (kGroup != 0 ? starts[experts] : num_p * num_q) * splits;
-    const int first_tile = static_cast<int>(blockIdx.x) / kPair;
-    const int tile_step = static_cast<int>(gridDim.x) / kPair;
+    int first_tile = static_cast<int>(blockIdx.x) / kPair;
+    int tile_step = static_cast<int>(gridDim.x) / kPair;
+    // A decode's routed units, few and equal, would leave the last wave part
+    // full: from `even_waves` waves the fewest CTAs that keep the waves take
+    // the same count each, and the rest retire (their SMs free for what
+    // follows).
+    if (kGroup != 0 && kSwap && epi.even_waves > 0 && tiles > 0) {
+        const int waves = (tiles + tile_step - 1) / tile_step;
+        const int even = (tiles + waves - 1) / waves;
+        if (waves >= epi.even_waves && even < tile_step) {
+            tile_step = even;
+            if (first_tile >= even) {
+                first_tile = tiles;
+            }
+        }
+    }
 
     // Where a unit reads and lands. D's tile-local [i][j] lands at y[out_p
     // + i][out_q + j] unswapped, y[out_q + j][out_p + i] swapped, for i <

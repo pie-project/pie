@@ -565,6 +565,7 @@ impl Epilogue {
             raster: 8,
             slab: 0,
             tickets: 0,
+            even_waves: 0,
         }
     }
 }
@@ -591,6 +592,7 @@ struct EpiArgs {
     slab: i64,
     tickets: u64,
     weights_ahead: i32,
+    even_waves: i32,
 }
 
 /// `y = epilogue(alpha * act . w^T)` for `[m, n, k]`, `n` the output's columns, under a stated plan.
@@ -1092,6 +1094,13 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     };
     let epi_args = EpiArgs {
         raster: i32::try_from(ctx.tuning().gemm_tc5_raster.max(1)).unwrap_or(8),
+        // A swapped grouped launch's units, dealt evenly from as many waves
+        // as the profile says (`kernel.moe.even_waves_from`).
+        even_waves: if group.mode != 0 && plan.swap {
+            i32::try_from(ctx.tuning().moe_even_waves_from).unwrap_or(0)
+        } else {
+            0
+        },
         ..epi.args(n, job.pad, wsf, wzero)
     };
     let sms = ctx.multiprocessors().unwrap_or(148);

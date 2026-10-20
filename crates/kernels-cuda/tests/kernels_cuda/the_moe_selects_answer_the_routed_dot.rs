@@ -45,7 +45,8 @@ fn bank(codes: u64, atoms: u64, [e, n, k]: [usize; 3], alpha: Option<[u64; 3]>) 
 type Case = (K, Tuning, [usize; 5], bool, Option<Glu>, u8);
 
 fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
-    let what = format!("{kind:?} {ex}x{tokens}x{top} {by_token} {n}x{k} {f:?} {flags}");
+    let even = tuning.moe_even_waves_from > 0;
+    let what = format!("{kind:?} {ex}x{tokens}x{top} {by_token} {n}x{k} {f:?} {flags} even {even}");
     let mut b = Bench::new(0x5e1 ^ (tokens * 7 + n) as u64);
     let (count, quant) = (tokens * top, matches!(kind, K::A8 | K::A4));
     let mut routes = tab(count, |r| ((r / top * 3 + r % top * 5) % ex) as i32);
@@ -265,6 +266,25 @@ fn the_routed_selects_answer_the_routed_dot() {
     }
     // The tcgen05 arms are Blackwell's; elsewhere their cases have no arm.
     cases.retain(|case| supported() || !(case.1 == TC5 || case.1 == SM100));
+    // Each tcgen05 case again with a swapped launch's units dealt evenly.
+    let even = cases
+        .iter()
+        .filter(|case| case.1.moe_tc5)
+        .map(|&(k, t, s, by, f, fl)| {
+            (
+                k,
+                Tuning {
+                    moe_even_waves_from: 1,
+                    ..t
+                },
+                s,
+                by,
+                f,
+                fl,
+            )
+        });
+    let even: Vec<Case> = even.collect();
+    cases.extend(even);
     cases.into_iter().for_each(routed);
 }
 
@@ -352,14 +372,23 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         let first = gate == Some(true);
         #[rustfmt::skip]
         let want = mlp(&xv, (&routes, &weights), [hidden, inter, top], upv, downv, g, first, shared, normed.then_some(&scv[..]));
-        // A W4A4 fire's swapped down leg whole and split along K.
-        let splits: &[u32] = if a == 4 { &[1, 2, 4] } else { &[1] };
-        for &down_splits in splits {
-            let what = format!("{what}, down splits {down_splits}");
+        // Every fire with its swapped units dealt evenly and not, and a W4A4
+        // fire's swapped down leg split along K.
+        let arms: &[(u32, bool)] = if a == 4 {
+            &[(1, false), (2, false), (4, false), (1, true), (2, true)]
+        } else {
+            &[(1, false), (1, true)]
+        };
+        // Each split count's product dealt as before, which dealing its units
+        // evenly lands bit for bit.
+        let mut dealt: Vec<(u32, Vec<f64>)> = Vec::new();
+        for &(down_splits, even) in arms {
+            let what = format!("{what}, down splits {down_splits}, even waves {even}");
             let mut y = b.out(tokens, hidden);
             let base = pick(a < 4, TC5, W4A8);
             let ctx = b.ctx().with_tuning(Tuning {
                 moe_w4a4_down_splits: down_splits,
+                moe_even_waves_from: u32::from(even),
                 ..base
             });
             if let Some((live, first)) = window {
@@ -385,6 +414,19 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
             // Quantized rows answer to their codes' rounding on both legs.
             let far = distance(&got[span.clone()], &want[span]);
             assert!(far < tol, "{what}: {far:.4} from the host's product");
+            if even {
+                let (_, before) = dealt
+                    .iter()
+                    .find(|(s, _)| *s == down_splits)
+                    .expect("an uneven arm");
+                let same = got
+                    .iter()
+                    .zip(before)
+                    .all(|(g, b)| g.to_bits() == b.to_bits());
+                assert!(same, "{what}: not the bits the uneven deal lands");
+            } else {
+                dealt.push((down_splits, got));
+            }
         }
     }
 }
