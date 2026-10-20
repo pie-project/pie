@@ -1404,7 +1404,9 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.moe_matmul_select_act_quant";
-        lowp(OP)?;
+        if !linear::tc5::supported() {
+            return self.select_a16(OP, x, bank, routes, y);
+        }
         let (codes, scales, biases, seat) = self.planes(bank);
         per_tensor_e4m3_is_a_table(OP, codes)?;
         if seat.streams() || crate::device::alloc::is_host_pointer(codes.ptr) {
@@ -1550,7 +1552,9 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.matmul_act_quant";
-        lowp(OP)?;
+        if !linear::tc5::supported() {
+            return self.matmul_a16(OP, act, w, block_scales, y);
+        }
         if let Some(block_scales) = block_scales {
             return self.fp8_block_matmul(act, w, quant, block_scales, y);
         }
@@ -1613,6 +1617,117 @@ impl Run<'_> {
                 ),
             }),
         }
+    }
+
+    /// An activation-quantizing select where there are no tcgen05 GEMMs: the
+    /// bank against the rows as they are, bf16 (W4A16 for an MXFP4 or NVFP4
+    /// bank, W8A16 for a block-FP8 one).
+    #[cfg(feature = "cuda")]
+    fn select_a16(
+        &mut self,
+        op: &'static str,
+        x: ValueId,
+        bank: ValueId,
+        routes: ValueId,
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        let (codes, scales, _, seat) = self.planes(bank);
+        match codes.dtype {
+            Dtype::Nvfp4 | Dtype::Mxfp4 | Dtype::U8 => {
+                let x = self.tensor(x);
+                self.select_quant(x, bank, routes, y)
+            }
+            // A block-FP8 release's experts, their factors laid as ue8m0
+            // exponents a weight row a 128 at load (`lay_tile_banks`).
+            Dtype::E4m3 => {
+                if !self.scales_in_atoms(bank) {
+                    return Err(unlaid(op));
+                }
+                if seat.streams() || crate::device::alloc::is_host_pointer(codes.ptr) {
+                    return Err(kernels_cuda::Error::Backend {
+                        op,
+                        detail: "a W8A16 select reads a resident bank, and this one is seated \
+                                 by a streaming tier"
+                            .to_string(),
+                    });
+                }
+                let x = self.tensor(x);
+                let routes = self.tensor(routes);
+                linear::moe::select_fp8_w8a16(
+                    self.ctx(),
+                    op,
+                    x,
+                    codes.ptr,
+                    scales.ptr,
+                    codes.rows,
+                    128,
+                    routes,
+                    &mut self.tensor(y),
+                    None,
+                )
+            }
+            stored => Err(kernels_cuda::Error::Backend {
+                op,
+                detail: format!(
+                    "a {stored:?} bank's select against bf16 activations has no point where \
+                     there are no tcgen05 GEMMs"
+                ),
+            }),
+        }
+    }
+
+    /// An activation-quantizing projection where there are no tcgen05 GEMMs:
+    /// a block-FP8 plane against the rows as they are, bf16 (W8A16), its
+    /// codes widened in registers (`linear::w8a16`); a 4-bit one as its
+    /// bf16-activation product reads it.
+    #[cfg(feature = "cuda")]
+    fn matmul_a16(
+        &mut self,
+        op: &'static str,
+        act: ValueId,
+        w: ValueId,
+        block_scales: Option<ValueId>,
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        let Some(block_scales) = block_scales else {
+            return self.row_major_matmul(&act, &w, &y);
+        };
+        let codes = self.tensor(w);
+        let atoms = self.tensor(block_scales);
+        if atoms.dtype != Dtype::U8 {
+            return Err(unlaid(op));
+        }
+        let act = self.tensor(act);
+        let mut out = self.tensor(y);
+        // A batch's rows on the plane's bf16 copy (`kernel.gemm.fp8_shadow`).
+        if act.rows > linear::w8a16::MMA_UNTIL
+            && let Some(shadow) = self.fp8_shadow(w)
+        {
+            linear::gemm::act_x_wt(self.ctx(), op, act, shadow, None, &mut out)?;
+            return Ok(());
+        }
+        let k = act.width;
+        let block = if atoms.width == 0 {
+            0
+        } else {
+            k.div_ceil(atoms.width)
+        };
+        // A decode's few rows over 128-wide blocks as the GEMV over bf16 rows
+        // (`kernel.gemm.fp8_gemv_until`), as the tcgen05 path takes them.
+        if block == 128
+            && act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)?
+        {
+            return Ok(());
+        }
+        if linear::w8a16::matmul(self.ctx(), op, act, codes.ptr, atoms.ptr, block, &mut out)? {
+            return Ok(());
+        }
+        Err(kernels_cuda::Error::Backend {
+            op,
+            detail: format!(
+                "a block-fp8 projection of {block}-wide blocks over K {k} has no W8A16 point"
+            ),
+        })
     }
 
     /// A block-FP8 projection against e4m3 activations on one tcgen05 GEMM (W8A8):
@@ -1858,13 +1973,11 @@ pub(crate) fn tensor_scales(
     })
 }
 
-/// A low-precision product runs on the tcgen05 GEMMs or not at all: an
-/// A4/A8 deployment does not fall back to bf16 activations.
+/// A low-precision product runs on the tcgen05 GEMMs; on CUDA without them
+/// it reads bf16 activations (`select_a16`, `matmul_a16`), and a build with
+/// no CUDA has neither.
+#[cfg(not(feature = "cuda"))]
 fn lowp(op: &'static str) -> Result<(), kernels_cuda::Error> {
-    #[cfg(feature = "cuda")]
-    if linear::tc5::supported() {
-        return Ok(());
-    }
     Err(kernels_cuda::Error::Backend {
         op,
         detail: "a product that quantizes its activations runs on the tcgen05 GEMMs \

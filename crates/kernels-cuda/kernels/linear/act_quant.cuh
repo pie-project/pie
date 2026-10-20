@@ -336,9 +336,10 @@ struct E4m3Block {
         for (int i = 0; i < 4; ++i) {
             const float lo = fminf(fmaxf(v[2 * i] * inv, -448.f), 448.f);
             const float hi = fminf(fmaxf(v[2 * i + 1] * inv, -448.f), 448.f);
-            unsigned short pair;
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(pair) : "f"(hi), "f"(lo));
-            half[i] = pair;
+            // The shim's convert: the instruction from sm_89, its portable
+            // rounding below (sm_80 serves its W8A16 load through here).
+            half[i] = static_cast<unsigned short>(
+                __nv_cvt_float2_to_fp8x2(make_float2(lo, hi), __NV_SATFINITE, __NV_E4M3));
         }
         return static_cast<unsigned long long>(half[0] | (half[1] << 16)) |
                (static_cast<unsigned long long>(half[2] | (half[3] << 16)) << 32);

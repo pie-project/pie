@@ -102,6 +102,39 @@ fn rms_row(
     } else {
         per_head_dim
     };
+    // A whole row's norm (no heads) in 16-byte runs a thread, read once.
+    let runs = y.width.div_ceil(8 * BLOCK);
+    if ctx.tuning().rows_vec
+        && per_head_dim == 0
+        && y.width > 256
+        && y.width.is_multiple_of(8)
+        && runs <= 4
+        && x.width.is_multiple_of(8)
+        && [x.ptr, weight.ptr, y.ptr].iter().all(|&at| aligned16(at))
+    {
+        let plus_one = template == OFFSET_BANK;
+        let runs = runs.next_power_of_two();
+        return ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_runs<{t}, {runs}, {plus_one}>"
+                )),
+            )
+            .apply(Launch::grid([y.rows, 1, 1], [BLOCK, 1, 1])),
+            &[
+                x.arg(),
+                weight.arg(),
+                y.arg(),
+                hidden.arg(),
+                hidden.arg(),
+                hidden.arg(),
+                eps.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     if ctx.tuning().rows_vec
         && (width == 128 || width == 256)
         && [x.ptr, weight.ptr, y.ptr].iter().all(|&at| aligned16(at))

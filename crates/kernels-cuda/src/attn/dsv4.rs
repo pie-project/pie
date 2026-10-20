@@ -189,6 +189,11 @@ pub fn takes(heads: u32, head_dim: u32, window: &KvPool, pooled: Option<&Pooled<
 /// How many blocks split a row's keys: enough that the rows' four head
 /// groups fill the chip, a power of two up to [`MAX_RANKS`].
 fn ranks(ctx: &Ctx, rows: u32) -> u32 {
+    // Thread block clusters arrive with sm_90; below it the kernel folds
+    // nothing across ranks (`dsv4_decode.cuh`), so a block holds every key.
+    if crate::jit::device::compute_capability_major().is_some_and(|major| major < 9) {
+        return 1;
+    }
     let sms = ctx.multiprocessors().unwrap_or(148);
     let blocks = rows.saturating_mul(HEADS / GROUP);
     let mut r = 1;

@@ -176,6 +176,7 @@ seeded!("gfx94.toml");
 #[cfg(not(feature = "rocm"))]
 seeded!(
     "sm80.toml",
+    "sm80/nvidia-a100-80gb-pcie.toml",
     "sm86.toml",
     "sm87.toml",
     "sm89.toml",

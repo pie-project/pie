@@ -98,8 +98,12 @@ fn rows_split(k: i32) -> i32 {
 
 /// The blocks a cluster of the few-rows kernel splits a row's K over besides:
 /// four for a product of a few columns (a router's), whose few blocks alone
-/// keep too few loads in flight; else 1.
+/// keep too few loads in flight; else, or below sm_90 (no clusters), 1.
 pub(crate) fn rows_cluster(n: i32, k: i32) -> u32 {
+    // Thread block clusters arrive with sm_90.
+    if crate::jit::device::compute_capability_major().is_some_and(|major| major < 9) {
+        return 1;
+    }
     let split = rows_split(k);
     let blocks = n.unsigned_abs().div_ceil(16 / split as u32);
     if blocks <= 32 && (k / 8) % (split * 4) == 0 {

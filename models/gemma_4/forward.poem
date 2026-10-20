@@ -35,6 +35,13 @@ def plans(m, input, plan):
         plan(input, m.q_heads, m.glob.kv_heads, m.glob.head_dim, None),
     ]
 
+def select(x, bank, routes, top_k):
+    """A routed bank's select: a bf16 bank's plain, a quantized one's
+    through its codes and factors."""
+    if bank.dtype == dtype.bf16:
+        return ops.linear.moe_matmul_select(x, bank, routes, top_k)
+    return ops.linear.moe_matmul_select_quant(x, bank, routes, top_k)
+
 def forward(m, inputs):
     classes = [fact.has(fact.Mask), fact.scores(), fact.single_token()]
     dr = m.dflash
@@ -132,8 +139,8 @@ def forward(m, inputs):
                 x.top_k,
             )
             moe_in = ops.elemwise.rmsnorm(y, x.pre_ffw_norm_2, x.pre_ffw_norm_2_eps)
-            hidden = ops.linear.mlp_geglu_tanh_packed(ops.linear.moe_matmul_select_quant(moe_in, x.gate_up, experts, x.top_k), x.inter)
-            routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select_quant(hidden, x.down, experts, x.top_k), weights)
+            hidden = ops.linear.mlp_geglu_tanh_packed(select(moe_in, x.gate_up, experts, x.top_k), x.inter)
+            routed = ops.linear.moe_weighted_sum(select(hidden, x.down, experts, x.top_k), weights)
             h2 = ops.elemwise.rmsnorm(routed, x.post_ffw_norm_2, x.post_ffw_norm_2_eps)
             f = ops.elemwise.residual_add(h1, h2)
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, w.post_ffw_norm_eps), y)

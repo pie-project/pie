@@ -38,7 +38,7 @@ pub struct MoeTc5From(pub u32);
 /// register-dequant MMA kernel with; 0 (never) but where a chip's profile
 /// says (B200's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.mxfp4_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
+#[decision(id = "kernel.moe.mxfp4_mma_until", constant(range(0..=16_777_216)), default = 0, tune = search)]
 pub struct MoeMxfp4MmaUntil(pub u32);
 
 /// The routes a routed NVFP4 select of bf16 activations (W4A16) runs on the
@@ -164,6 +164,13 @@ pub struct MlaExpandedFrom(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.gemm.fp8_gemv_until", constant(range(0..=64)), default = 0, tune = search)]
 pub struct GemmFp8GemvUntil(pub u32);
+
+/// Whether a block-FP8 dense projection read at bf16 activations (no
+/// tcgen05) keeps a bf16 copy widened once at load beside its codes: a
+/// batch's rows run cuBLAS on it, a decode's few the codes (half the bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.fp8_shadow", flag, default = false, tune = search)]
+pub struct GemmFp8Shadow;
 
 /// The most rows a dense fp8b128 projection runs on the mma.sync fp8
 /// kernel (`moe::dense_fp8_shape` says where it leads, in which CTA
@@ -579,6 +586,13 @@ pub struct DecodeGroupedPrefillFrom(pub u32);
 #[decision(id = "kernel.sdpa.decode.grouped_prefill_lse", flag, default = false, tune = search)]
 pub struct DecodeGroupedPrefillLse;
 
+/// Whether those log-sum-exp rows take the prefill kernel under a sliding
+/// window too (MiMo's sink layers: a wide group the decode kernel walks on
+/// CUDA cores).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.grouped_prefill_window", flag, default = false, tune = search)]
+pub struct DecodeGroupedPrefillWindow;
+
 /// Whether a paged decode of a group of at most eight query heads reads its
 /// cache on tensor cores (`attn/xqa.cuh`, the group's rows one MMA tile)
 /// rather than the FA2 decode kernel.
@@ -665,6 +679,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeW4a8FusedFrom>()
         .add::<MlaExpandedFrom>()
         .add::<GemmFp8GemvUntil>()
+        .add::<GemmFp8Shadow>()
         .add::<GemmFp8MmaGemvUntil>()
         .add::<AttnResFusedNorm>()
         .add::<SsmKdaChunked>()
@@ -683,6 +698,7 @@ pub fn register(registry: &mut Registry) {
         .add::<PrefillWideSliding>()
         .add::<DecodeGroupedPrefillFrom>()
         .add::<DecodeGroupedPrefillLse>()
+        .add::<DecodeGroupedPrefillWindow>()
         .add::<DecodeXqa>()
         .add::<DecodeXqaFrom64>()
         .add::<DecodeXqaWholeWindow>()
@@ -782,6 +798,7 @@ tuning! {
     moe_w4a8_fused_from: u32 = 65_536, get MoeW4a8FusedFrom;
     mla_expanded_from: u32 = 65_536, get MlaExpandedFrom;
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
+    gemm_fp8_shadow: bool = false, on GemmFp8Shadow;
     gemm_fp8_mma_gemv_until: u32 = 0, get GemmFp8MmaGemvUntil;
     attn_res_fused_norm: bool = false, on AttnResFusedNorm;
     ssm_kda_chunked: bool = false, on SsmKdaChunked;
@@ -800,6 +817,7 @@ tuning! {
     prefill_wide_sliding: bool = false, on PrefillWideSliding;
     decode_grouped_prefill_from: u32 = 0, get DecodeGroupedPrefillFrom;
     decode_grouped_prefill_lse: bool = false, on DecodeGroupedPrefillLse;
+    decode_grouped_prefill_window: bool = false, on DecodeGroupedPrefillWindow;
     decode_xqa: bool = false, on DecodeXqa;
     decode_xqa_from_64: u32 = 0, get DecodeXqaFrom64;
     decode_xqa_whole_window: u32 = 0, get DecodeXqaWholeWindow;
