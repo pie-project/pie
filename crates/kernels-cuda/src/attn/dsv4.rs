@@ -206,8 +206,14 @@ fn ranks(ctx: &Ctx, rows: u32) -> u32 {
 fn smem(rows: Option<(Rows, Rows)>) -> u32 {
     let ld = HEAD_DIM + 8;
     let tile = KEYS * ld * 2;
-    // Tiles in flight: six of quantized rows (and the one they widen into),
-    // four of bf16. A raw key holds the wider format's data and scales.
+    // Tiles in flight: six of quantized rows (five below sm_90, as
+    // `dsv4_decode.cuh` lays them) and the one they widen into, four of
+    // bf16. A raw key holds the wider format's data and scales.
+    let stages = if crate::jit::device::compute_capability_major().is_some_and(|major| major < 9) {
+        5
+    } else {
+        6
+    };
     let ring = if let Some((w, p)) = rows {
         let split = |r: Rows| match r {
             Rows::Ds => (DS_DATA, DS_SCALES),
@@ -215,7 +221,7 @@ fn smem(rows: Option<(Rows, Rows)>) -> u32 {
             Rows::Nv4 => (256, 32),
         };
         let ((wd, ws), (pd, ps)) = (split(w), split(p));
-        6 * KEYS * (wd.max(pd) + ws.max(ps)) + tile
+        stages * KEYS * (wd.max(pd) + ws.max(ps)) + tile
     } else {
         4 * tile
     };
