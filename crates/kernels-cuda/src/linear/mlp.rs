@@ -102,7 +102,7 @@ pub fn swiglu_clamp(
             FILE,
             symbol(&format!("::pie::linear::mlp_swiglu_clamp<{t}>")),
         )
-        .apply(launch),
+        .apply(launch.programmatic(ctx.tuning().pdl)),
         &[
             packed.arg(),
             y.arg(),

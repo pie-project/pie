@@ -735,7 +735,8 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         let lanes = u32::try_from(n / 8).unwrap_or(u32::MAX);
         return ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::elemwise::residual_add_vec8").apply(Launch::flat(lanes, BLOCK)),
+            Fire::at(FILE, "::pie::elemwise::residual_add_vec8")
+                .apply(Launch::flat(lanes, BLOCK).programmatic(ctx.tuning().pdl)),
             &[
                 y.arg(),
                 x.arg(),

@@ -12,6 +12,10 @@ __global__ void gemv_bf16_kernel(
     bf16* __restrict__ out,
     int N, int K, float beta)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int row = blockIdx.x * kWarps + threadIdx.y;
     if (row >= N) return;
     const float4* w4 =
@@ -124,6 +128,10 @@ __global__ void gemv_splitk_bf16_kernel(
     bf16* __restrict__ out,
     int N, int K, float beta)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int row = blockIdx.x;
     if (row >= N) return;
     const int warp = threadIdx.y;

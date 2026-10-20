@@ -389,10 +389,13 @@ pub fn fp8_block_gemv_in(
                 "::pie::linear::fp8_block_gemv<{WARPS}, {ROWS}, {rows_pad}, {gran}>"
             )),
         )
-        .apply(Launch::grid(
-            [n.div_ceil(ROWS * (WARPS / splits)), 1, 1],
-            [WARPS * 32, 1, 1],
-        )),
+        .apply(
+            Launch::grid(
+                [n.div_ceil(ROWS * (WARPS / splits)), 1, 1],
+                [WARPS * 32, 1, 1],
+            )
+            .programmatic(ctx.tuning().pdl),
+        ),
         &[
             act.arg(),
             stated(OP, act.width)?.arg(),
