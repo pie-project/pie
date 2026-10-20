@@ -191,13 +191,15 @@ fn the_fp8_block_projections_answer_the_dot() {
     // its routes on the grouped tcgen05 GEMM; 3, the GEMV over bf16 rows (K
     // split across warps, then rows padded to four); 4, the W8A8 matmul
     // (narrow planes K split, wide ones whole); 5, a row's groups as its
-    // routes on the W8A8 select.
+    // routes on the W8A8 select; 6, cuBLASLt's block-scaled FP8 GEMM (rows
+    // padded to fours).
     #[rustfmt::skip]
     let cases = [(0, 2, 1, 4096, 2048), (0, 4, 1, 8192, 1024), (0, 4, 1, 32768, 1024),
         (0, 8, 1, 1024, 4096), (1, 3, 8, 256, 1024), (2, 37, 4, 256, 1024), (3, 1, 1, 640, 6144),
         (3, 3, 1, 1024, 1536), (4, 5, 1, 384, 512), (4, 13, 1, 256, 1024), (4, 30, 1, 128, 2048),
         (4, 130, 1, 640, 1536), (4, 40, 1, 16384, 512), (4, 130, 1, 32768, 512),
-        (5, 37, 4, 256, 1024), (5, 9, 8, 128, 512)];
+        (5, 37, 4, 256, 1024), (5, 9, 8, 128, 512), (6, 5, 1, 384, 512), (6, 64, 1, 640, 1536),
+        (6, 37, 1, 16384, 512), (6, 130, 1, 256, 2048)];
     // The mma.sync fp8 kernels (arms 0, 1, 4 and 5) are sm_89's: an Ada's e4m3 MMA.
     let fp8_mma = kernels_cuda::jit::cache::arch()
         .and_then(|a| {
@@ -208,7 +210,7 @@ fn the_fp8_block_projections_answer_the_dot() {
         })
         .is_some_and(|cc| cc >= 89);
     for (arm, rows, groups, n, k) in cases {
-        if (!supported() && arm == 2) || (!fp8_mma && matches!(arm, 0 | 1 | 4 | 5)) {
+        if (!supported() && arm == 2) || (!fp8_mma && matches!(arm, 0 | 1 | 4 | 5 | 6)) {
             continue;
         }
         let mut b = Bench::new(0xf8 + rows as u64);
@@ -242,6 +244,8 @@ fn the_fp8_block_projections_answer_the_dot() {
             }
             3 => act_quant::fp8_block_gemv(&ctx, xt, codes, atoms, &mut y).map(|took| assert!(took)),
             4 => matmul_fp8_w8a8(&ctx, xt, codes, atoms, &mut y),
+            6 => kernels_cuda::linear::lt_fp8::matmul(&ctx, "test", xt, codes, atoms, &mut y)
+                .map(|took| assert!(took, "cuBLASLt takes {rows}x{n}x{k}")),
             _ => {
                 let mut routes = t(b.zeros(rg * 4), rows, groups, I32);
                 group_routes(&ctx, groups as u32, &mut routes).expect("the routes lay");

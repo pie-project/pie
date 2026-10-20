@@ -261,4 +261,50 @@ __global__ void __launch_bounds__(256) fp8a8_fold(
     *reinterpret_cast<uint2*>(out + at) = packed;
 }
 
+/// Rows `[rows, k]` of bf16 as e4m3 in 1x128 blocks for cuBLASLt's
+/// block-scaled FP8 GEMM: `quantize_rows_e4m3b128`'s codes (rows past `rows`
+/// up to `mpad` zero), each block's factor an f32 at `scales[kb * mpad + r]`
+/// (cuBLASLt's `VEC128_32F` B scales). 16 lanes a block, `mpad k / 1024`
+/// blocks of 128 threads.
+__global__ void __launch_bounds__(128) quantize_rows_e4m3b128_lt(
+    const bf16* __restrict__ x, u8* __restrict__ codes, float* __restrict__ scales, int rows,
+    int mpad, int k)
+{
+    using Block = E4m3Block<128>;
+    const int blocks = k / 128;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int slot = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) / Block::kLanes);
+    // Every lane joins the block's shuffles; a slot past the rows reads row 0.
+    const bool live = slot < mpad * blocks;
+    const int sl = live ? slot : 0;
+    const int r = sl / blocks, kb = sl % blocks;
+    const long long at = static_cast<long long>(r) * k + kb * 128;
+    Block q;
+    q.load(x + (r < rows ? at : kb * 128), lane);
+    if (!live) return;
+    u8* dst = codes + at + (lane % Block::kLanes) * 8;
+    if (r < rows) {
+        *reinterpret_cast<unsigned long long*>(dst) = q.codes();
+        if (lane % Block::kLanes == 0) scales[kb * mpad + r] = gfp8::exp2_biased(q.e + 127);
+    } else {
+        *reinterpret_cast<unsigned long long*>(dst) = 0ull;
+        if (lane % Block::kLanes == 0) scales[kb * mpad + r] = 0.f;
+    }
+}
+
+/// A 128x128-block FP8 plane's exponents (in tcgen05's atoms, a weight row an
+/// atom row) as cuBLASLt's `BLK128x128_32F` A scales: an f32 a block at
+/// `out[nb * kbp + kb]`, `kbp` the K blocks rounded up to four (the padding
+/// zero). One thread a slot of `n / 128` x `kbp`.
+__global__ void __launch_bounds__(256) fp8b128_atoms_to_lt(
+    const u8* __restrict__ atoms, float* __restrict__ out, int n, int k)
+{
+    const int blocks = k / 128;
+    const int kbp = (blocks + 3) / 4 * 4;
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= (n / 128) * kbp) return;
+    const int nb = i / kbp, kb = i % kbp;
+    out[i] = kb < blocks ? gfp8::exp2_biased(atoms[atom_offset(nb * 128, kb, blocks)]) : 0.f;
+}
+
 }  // namespace pie::linear
