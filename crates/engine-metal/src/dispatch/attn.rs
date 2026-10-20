@@ -135,7 +135,11 @@ impl Run<'_> {
                 self.ctx(),
                 self.tuning(),
                 self.tensor(*q),
-                self.decode_plan(*plan),
+                &if self.reads_out(*q) {
+                    self.readout_plan(*plan)
+                } else {
+                    *self.decode_plan(*plan)
+                },
                 self.pool(*cache),
                 *window,
                 *head_dim,

@@ -4325,6 +4325,15 @@ pub(crate) static INPUTS: &[Op] = &[
     },
     Op {
         module: "inputs",
+        name: "readout_attention",
+        params: &["inputs"],
+        call: |a, heap| {
+            let inputs: Input = a.next()?;
+            Ok(heap.alloc(inputs.readout_attention()))
+        },
+    },
+    Op {
+        module: "inputs",
         name: "request_of_token",
         params: &["inputs"],
         call: |a, heap| {

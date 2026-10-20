@@ -63,6 +63,13 @@ pub struct CacheGeometry {
 pub struct FireTables {
     pub request_of_token: Tensor,
 
+    /// Each readout row's position, lane and mask flag (`inputs::Handles`).
+    pub readout_positions: Tensor,
+
+    pub readout_request_of_token: Tensor,
+
+    pub readout_mask_enabled: Tensor,
+
     pub mask: Tensor,
 
     pub mask_enabled: Tensor,
@@ -1076,6 +1083,39 @@ impl<'c> Run<'c> {
                 id.0
             ),
         }
+    }
+
+    /// The decode plan `id` as a query of readout rows reads it: each row
+    /// attends as the token it reads out, its position, lane and mask flag
+    /// those of that token, over this window's readouts.
+    pub(crate) fn readout_plan(&self, id: ValueId) -> DecodePlan {
+        let plan = *self.decode_plan(id);
+        let window = self.window();
+        assert!(
+            window.gathered.is_none(),
+            "a decode over readout rows runs in a window of whole lanes, and this one \
+             was gathered"
+        );
+        let (skip, keep) = readout_span(
+            &self.fire.readout_indptr,
+            window.span.lane_offset,
+            window.span.lanes,
+        );
+        let t = &self.fire.tables;
+        DecodePlan {
+            positions: self.slice(t.readout_positions, skip, keep),
+            request_of_token: self.slice(t.readout_request_of_token, skip, keep),
+            mask_enabled: self.slice(t.readout_mask_enabled, skip, keep),
+            ..plan
+        }
+    }
+
+    /// Whether `id`'s rows are the fire's readouts rather than its tokens.
+    pub(crate) fn reads_out(&self, id: ValueId) -> bool {
+        matches!(
+            &self.values[id.0 as usize].ty,
+            Ty::Tensor { shape, .. } if shape.first() == Some(&Dim::Readouts)
+        )
     }
 
     pub(crate) fn prefill_plan(&self, id: ValueId) -> &PrefillPlan {
