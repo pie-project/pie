@@ -3156,6 +3156,48 @@ __global__ void ssm_kda_step_batched(
     const int warp = threadIdx.x >> 5;
     const int warps = blockDim.x >> 5;
 
+    // A row in registers where it is whole 128-column runs (up to 512): a
+    // lane's float4 of each, the row read once and written once.
+    if (D % 128 == 0 && D <= 512) {
+        const int runs = D / 128;
+        for (int vi = v_lo + warp; vi < v_hi; vi += warps) {
+            float4* row = reinterpret_cast<float4*>(st + (long long)vi * D);
+            float4 sv[4];
+            float mem = 0.f;
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                if (c >= runs) break;
+                const int at = c * 32 + lane;
+                const float4 x = row[at];
+                const float4 gg = reinterpret_cast<const float4*>(sg)[at];
+                const float4 kk = reinterpret_cast<const float4*>(sk)[at];
+                sv[c] = make_float4(x.x * gg.x, x.y * gg.y, x.z * gg.z, x.w * gg.w);
+                mem += sv[c].x * kk.x + sv[c].y * kk.y + sv[c].z * kk.z + sv[c].w * kk.w;
+            }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) mem += __shfl_xor_sync(0xffffffffu, mem, off);
+            const float delta = (v_h[vi] - mem) * beta_h;
+            float acc = 0.f;
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                if (c >= runs) break;
+                const int at = c * 32 + lane;
+                const float4 kk = reinterpret_cast<const float4*>(sk)[at];
+                const float4 qq = reinterpret_cast<const float4*>(sq)[at];
+                float4 x = sv[c];
+                x.x += kk.x * delta;
+                x.y += kk.y * delta;
+                x.z += kk.z * delta;
+                x.w += kk.w * delta;
+                row[at] = x;
+                acc += x.x * qq.x + x.y * qq.y + x.z * qq.z + x.w * qq.w;
+            }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+            if (lane == 0) out_h[vi] = acc;
+        }
+        return;
+    }
     for (int vi = v_lo + warp; vi < v_hi; vi += warps) {
         float* row = st + (long long)vi * D;
         float mem = 0.f;
