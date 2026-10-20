@@ -23,6 +23,9 @@ elemwise.hc_mma = true
 elemwise.qg_prologue_until = 64
 # A wide decode's split partials fold a warp a row.
 sdpa.merge_warp = true
+# Selected (sparse) attention on the tensor cores, a kv head's query group a
+# walk: Qwen3.8-Flash-Next's miniature 11% less GPU time at 64.
+sdpa.selected_mma = true
 # DeepSeek-V4's attention: pool on mma.sync, decode up to 64 in one launch.
 sdpa.pool_mma = true
 sdpa.dsv4_decode_until = 64
