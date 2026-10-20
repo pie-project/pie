@@ -172,6 +172,8 @@ pub struct Run<'c> {
 
     /// A routed MLP whose rows stay sorted from gate-up to the fold.
     chain: std::cell::Cell<Option<Chain>>,
+    /// A matmul output whose bias the matmul already landed, so its add is done.
+    biased: std::cell::Cell<Option<ValueId>>,
 
     /// Per value, the nodes that read it, made on first ask.
     readers: std::cell::OnceCell<Vec<Vec<u32>>>,
@@ -233,6 +235,7 @@ impl<'c> Run<'c> {
             ane: None,
             tuning,
             chain: std::cell::Cell::new(None),
+            biased: std::cell::Cell::new(None),
             readers: std::cell::OnceCell::new(),
         }
     }
@@ -260,6 +263,30 @@ impl<'c> Run<'c> {
             Some(&[only]) => self.nodes.get(only as usize),
             _ => None,
         }
+    }
+
+    /// The bias the only reader of matmul output `y` adds to it in place, if one does.
+    pub(crate) fn bias_reader(&self, y: ValueId) -> Option<ValueId> {
+        use poem_ir::{Elementwise, Operation};
+        match self.sole_reader(y).map(|n| &n.op) {
+            Some(Operation::Elementwise(Elementwise::AddBias { bias, out, .. })) if *out == y => {
+                Some(*bias)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn bias_landed(&self, y: ValueId) {
+        self.biased.set(Some(y));
+    }
+
+    /// Whether the matmul that wrote `out` landed its bias too; asking settles it.
+    pub(crate) fn bias_taken(&self, out: ValueId) -> bool {
+        let taken = self.biased.get() == Some(out);
+        if taken {
+            self.biased.set(None);
+        }
+        taken
     }
 
     pub(crate) fn chain_clear(&self) {

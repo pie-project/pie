@@ -501,7 +501,41 @@ pub fn matmul_columns(
         Some(columns),
         scratch,
         capacity_rows,
+        None,
+        &mut false,
     )
+}
+
+/// [`matmul`] whose output then takes `bias` (one row, `y`'s width): true when the matmul
+/// landed it, false when the caller still adds it.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_bias(
+    ctx: &Ctx<'_>,
+    tuning: &Tuning,
+    act: Tensor,
+    w: Bank,
+    bias: Tensor,
+    y: Tensor,
+    scratch: Scratch<'_>,
+    capacity_rows: u32,
+) -> Result<bool, Error> {
+    let bias =
+        (bias.dtype == Dtype::Bf16 && bias.rows <= 1 && bias.width == y.width).then_some(bias);
+    let mut folded = false;
+    act_x_wt_over(
+        ctx,
+        tuning,
+        "linear.matmul",
+        act,
+        w,
+        y,
+        None,
+        scratch,
+        capacity_rows,
+        bias,
+        &mut folded,
+    )?;
+    Ok(folded)
 }
 
 pub fn lm_head(
@@ -536,7 +570,19 @@ pub fn act_x_wt(
     scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    act_x_wt_over(ctx, tuning, op, act, w, y, None, scratch, capacity_rows)
+    act_x_wt_over(
+        ctx,
+        tuning,
+        op,
+        act,
+        w,
+        y,
+        None,
+        scratch,
+        capacity_rows,
+        None,
+        &mut false,
+    )
 }
 
 /// `act x w^T` over `y`'s leading `columns` (every column when `None`), at
@@ -552,6 +598,8 @@ fn act_x_wt_over(
     columns: Option<u32>,
     scratch: Scratch<'_>,
     capacity_rows: u32,
+    bias: Option<Tensor>,
+    folded: &mut bool,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
     // PTQ1_0 is a single-plane inline-scale ternary bank: the fp16 scale lives
@@ -641,11 +689,6 @@ fn act_x_wt_over(
                         const FILE: &str = "linear/quant_qmm_mpp.metal";
                         let aux =
                             Tensor::new(staged.buf, padded, contraction / 64, dtype::Dtype::F32);
-                        ctx.fire(
-                            Fire::at(FILE, "qmm_mpp_input_sums")
-                                .apply(Grid::of([32 * (contraction / 64), padded, 1], [32, 4, 1])),
-                            &[act.arg(), aux.arg_mut(), k.arg(), bm.arg()],
-                        )?;
                         let crate::tuning::QmmMpp {
                             split_rows,
                             split_cols,
@@ -690,12 +733,28 @@ fn act_x_wt_over(
                             "ulong"
                         };
                         let groups_per_tg = simdgroups * if local { split } else { 1 };
+                        // The local split's parts share a threadgroup, so its sums
+                        // stay a pass of their own; every other point folds them.
+                        let sums = !local && std::env::var_os("PIE_QMM_SEPARATE_SUMS").is_none();
+                        if !sums {
+                            ctx.fire(
+                                Fire::at(FILE, "qmm_mpp_input_sums").apply(Grid::of(
+                                    [32 * (contraction / 64), padded, 1],
+                                    [32, 4, 1],
+                                )),
+                                &[act.arg(), aux.arg_mut(), k.arg(), bm.arg()],
+                            )?;
+                        }
+                        let bias = bias.filter(|_| split == 1 || local);
+                        let biased = bias.is_some();
                         let entry = symbol(&format!(
-                            "affine_qmm_mpp_{kind}_m{bm}_n{bn}_s{simdgroups}_k{split}_p{pipeline}_l{local}_g{}_{index}",
-                            linear_mode + 1
+                            "affine_qmm_mpp_{kind}_m{bm}_n{bn}_s{simdgroups}_k{split}_p{pipeline}_l{local}_g{}_{index}_f{}_b{}",
+                            linear_mode + 1,
+                            u8::from(sums),
+                            u8::from(biased),
                         ));
                         let stamp = symbol(&format!(
-                            "PIE_MPP_POINT(\"{entry}\",{bm},{bn},{simdgroups},{packed},false,{split},{pipeline},{local},{linear_mode},{index})"
+                            "PIE_MPP_POINT(\"{entry}\",{bm},{bn},{simdgroups},{packed},false,{split},{pipeline},{local},{linear_mode},{index},{sums},{biased})"
                         ));
                         ctx.fire(
                             Fire::at(FILE, entry).stamp(stamp).apply(Grid::of(
@@ -724,11 +783,16 @@ fn act_x_wt_over(
                                 },
                                 k.arg(),
                                 n.arg(),
-                                aux.arg(),
+                                if sums { ctx.absent()? } else { aux.arg() },
                                 (if local { rows } else { padded } as i32).arg(),
                                 ld.arg(),
+                                match bias {
+                                    Some(bias) => bias.arg(),
+                                    None => ctx.absent()?,
+                                },
                             ],
                         )?;
+                        *folded = biased;
                         if local {
                             return Ok(());
                         }

@@ -28,6 +28,7 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
     let handles = Handles::new();
     let pipelines = Pipelines::new();
     let mut checked = 0;
+    let mut folds = 0;
     let cases = [
         (64u32, 128u32),
         (192, 256),
@@ -172,22 +173,37 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
                     (rows <= cap * 8 && width == n)
                         .then(|| Tensor::new(ph, rows, width, Dtype::F32))
                 };
+                // Every other row count also lands a linear bias, in the matmul where it can.
+                let biased = m % 2 == 1 || m == 2048;
+                let linear_bias = |col: u32| ((col % 5) as f32 - 2.0) / 8.0;
+                let bias_b = upload(
+                    &(0..n)
+                        .flat_map(|col| bf16(linear_bias(col)))
+                        .collect::<Vec<_>>(),
+                );
+                let bias_t = Tensor::new(bind(&bias_b), 1, n, Dtype::Bf16);
                 let frame = device.frame().expect("frame");
                 let sink = Sink::new(&device, &frame, &pipelines, &handles);
-                quant::matmul(
-                    &sink,
-                    &tuning,
-                    Tensor::new(ha, m, k, Dtype::Bf16),
-                    bank,
-                    Tensor::new(ho, m, n, Dtype::Bf16),
-                    quant::Scratch {
-                        precast: &precast,
-                        partials: &partials,
-                    },
-                    cap,
-                )
-                .expect("prefill");
+                let out = Tensor::new(ho, m, n, Dtype::Bf16);
+                let scratch = quant::Scratch {
+                    precast: &precast,
+                    partials: &partials,
+                };
+                let act = Tensor::new(ha, m, k, Dtype::Bf16);
+                let folded = if biased {
+                    let folded =
+                        quant::matmul_bias(&sink, &tuning, act, bank, bias_t, out, scratch, cap)
+                            .expect("prefill");
+                    if !folded {
+                        kernels_metal::elemwise::norm::add_bias(&sink, bias_t, out).expect("bias");
+                    }
+                    folded
+                } else {
+                    quant::matmul(&sink, &tuning, act, bank, out, scratch, cap).expect("prefill");
+                    false
+                };
                 frame.commit().expect("commit");
+                folds += usize::from(folded);
                 let got = handles.read(ho, output_bytes + 64).expect("read");
                 let pp = handles.read(ph, partial_bytes + 64).expect("partial guard");
                 assert!(
@@ -212,8 +228,23 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
                             want += product;
                             absolute_sum += product.abs();
                         }
-                        let bits = (want as f32).to_bits();
-                        let rounded = ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16;
+                        let round = |v: f32| {
+                            let bits = v.to_bits();
+                            ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+                        };
+                        let rounded = if !biased {
+                            round(want as f32)
+                        } else if folded {
+                            want += f64::from(linear_bias(col));
+                            round(want as f32)
+                        } else {
+                            let landed = f32::from_bits(u32::from(round(want as f32)) << 16);
+                            want = f64::from(landed) + f64::from(linear_bias(col));
+                            round(want as f32)
+                        };
+                        if biased {
+                            absolute_sum += f64::from(linear_bias(col)).abs();
+                        }
                         let offset = ((row * n + col) * 2) as usize;
                         let actual = u16::from_le_bytes([got[offset], got[offset + 1]]);
                         let actual_f32 = f32::from_bits(u32::from(actual) << 16);
@@ -237,7 +268,8 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
             }
         }
     }
+    assert!(folds > 0, "some matmul lands its bias");
     eprintln!(
-        "checked {checked} prefill outputs against exact and random affine dots, including row tails and a fallback column width"
+        "checked {checked} prefill outputs ({folds} matmuls landing their bias) against exact and random affine dots, including row tails and a fallback column width"
     );
 }

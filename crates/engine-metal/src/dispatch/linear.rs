@@ -194,18 +194,37 @@ impl Run<'_> {
                     {
                         return self.matmul_split(ane, &plan, *act, *y);
                     }
-                    linear::quant::matmul(
-                        self.ctx(),
-                        self.tuning(),
-                        x,
-                        bank,
-                        self.tensor(*y),
-                        linear::quant::Scratch {
-                            precast: &|rows, contraction| self.precast(rows, contraction),
-                            partials: &|rows, width| self.partials(rows, width),
-                        },
-                        self.capacity(*act).min(self.capacity(*y)),
-                    )
+                    let scratch = linear::quant::Scratch {
+                        precast: &|rows, contraction| self.precast(rows, contraction),
+                        partials: &|rows, width| self.partials(rows, width),
+                    };
+                    let capacity = self.capacity(*act).min(self.capacity(*y));
+                    match self.bias_reader(*y) {
+                        Some(bias) => {
+                            if linear::quant::matmul_bias(
+                                self.ctx(),
+                                self.tuning(),
+                                x,
+                                bank,
+                                self.tensor(bias),
+                                self.tensor(*y),
+                                scratch,
+                                capacity,
+                            )? {
+                                self.bias_landed(*y);
+                            }
+                            Ok(())
+                        }
+                        None => linear::quant::matmul(
+                            self.ctx(),
+                            self.tuning(),
+                            x,
+                            bank,
+                            self.tensor(*y),
+                            scratch,
+                            capacity,
+                        ),
+                    }
                 }
                 None => linear::gemm::matmul(
                     self.ctx(),

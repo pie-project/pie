@@ -924,16 +924,20 @@ pub fn matmul_select_batched(
     } else if let Some((m, n, simdgroups)) = mpp {
         const FILE: &str = "linear/quant_qmm_mpp.metal";
         let k = stated(op, x.width)?;
-        ctx.fire(
-            Fire::at(FILE, "qmm_mpp_input_sums")
-                .apply(Grid::of([32 * (x.width / 64), padded, 1], [32, 4, 1])),
-            &[scratch.x.arg(), scratch.sums.arg_mut(), k.arg(), m.arg()],
-        )?;
+        let sums = std::env::var_os("PIE_QMM_SEPARATE_SUMS").is_none();
+        if !sums {
+            ctx.fire(
+                Fire::at(FILE, "qmm_mpp_input_sums")
+                    .apply(Grid::of([32 * (x.width / 64), padded, 1], [32, 4, 1])),
+                &[scratch.x.arg(), scratch.sums.arg_mut(), k.arg(), m.arg()],
+            )?;
+        }
         let entry = crate::linear::quant::symbol(&format!(
-            "affine_qmm_mpp_routed_m{m}_n{n}_s{simdgroups}_t{tile}"
+            "affine_qmm_mpp_routed_m{m}_n{n}_s{simdgroups}_t{tile}_f{}",
+            u8::from(sums)
         ));
         let stamp = crate::linear::quant::symbol(&format!(
-            "PIE_MPP_ROUTED_POINT(\"{entry}\",{m},{n},{simdgroups},{tile})"
+            "PIE_MPP_ROUTED_POINT(\"{entry}\",{m},{n},{simdgroups},{tile},{sums})"
         ));
         ctx.fire(
             Fire::at(FILE, entry).stamp(stamp).apply(Grid::of(
@@ -948,7 +952,11 @@ pub fn matmul_select_batched(
                 scratch.y.arg_mut(),
                 k.arg(),
                 stated(op, y.width)?.arg(),
-                scratch.sums.arg(),
+                if sums {
+                    ctx.absent()?
+                } else {
+                    scratch.sums.arg()
+                },
                 scratch.tile_expert.arg(),
             ],
         )?;

@@ -376,6 +376,7 @@ impl Run<'_> {
             Elementwise::ResidualAdd { x, y, y_out: _ } => {
                 elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
+            Elementwise::AddBias { out, .. } if self.bias_taken(*out) => Ok(()),
             Elementwise::AddBias {
                 bias,
                 out,

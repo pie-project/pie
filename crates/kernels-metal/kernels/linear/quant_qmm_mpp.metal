@@ -40,16 +40,51 @@ kernel void qmm_mpp_pack_bank(const device uint *codes [[buffer(0)]],
 
 #include "../common/mpp.metal"
 
+// The 64-wide group sums of `M` activation rows over groups [first, stop), into
+// `sums[(group - first) * M + row]`, by every thread of the threadgroup: eight lanes take a
+// group of a row, eight inputs each, and fold it with three shuffles.
+template <int M, int THREADS, class Index>
+__attribute__((always_inline)) void
+mpp_group_sums(const device bfloat *input, int width, uint first, uint stop,
+               threadgroup float *sums, uint thread_id) {
+  static_assert(THREADS % 32 == 0, "whole simdgroups fold the sums");
+  const uint items = (stop - first) * M * 8;
+  for (uint item = thread_id; item < items; item += THREADS) {
+    const uint pair = item / 8, lane = item % 8;
+    const uint row = pair % M, group = first + pair / M;
+    const device bfloat4 *at = reinterpret_cast<const device bfloat4 *>(
+        input + Index(row) * width + group * 64 + lane * 8);
+    const float4 a = float4(at[0]), b = float4(at[1]);
+    float sum = (a.x + a.y) + (a.z + a.w) + (b.x + b.y) + (b.z + b.w);
+    sum += simd_shuffle_xor(sum, ushort(1));
+    sum += simd_shuffle_xor(sum, ushort(2));
+    sum += simd_shuffle_xor(sum, ushort(4));
+    if (lane == 0)
+      sums[pair] = sum;
+  }
+}
+
+// The groups whose sums a threadgroup holds at once: 8 KB of them.
+template <int M> constexpr uint mpp_sum_chunk() { return (2048 / M) & ~1u; }
+
+// `SUMS` folds the activations' group sums here, where the zero points need them, rather
+// than reading them from a pass of their own; `BIAS` adds the linear's bias to the
+// landed row.
 template <int M, int N, int S, bool PACKED, bool RELAXED, int PARTS, bool PAIRED, bool LOCAL,
-          int ROW_GROUP, class Index>
+          int ROW_GROUP, class Index, bool SUMS, bool BIAS>
 [[kernel]] void
 affine_qmm_mpp(const device uchar *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
                const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
                device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
                constant int &columns [[buffer(6)]], const device float *sums [[buffer(7)]],
                constant int &rows [[buffer(8)]], constant int &stride [[buffer(9)]],
+               const device bfloat *bias [[buffer(10)]],
                uint3 position [[threadgroup_position_in_grid]],
                uint thread_id [[thread_index_in_threadgroup]]) {
+  static_assert(!SUMS || !LOCAL, "the local split's parts fold no sums of their own");
+  static_assert(!BIAS || PARTS == 1 || LOCAL, "a partial lands no bias");
+  constexpr uint CHUNK = mpp_sum_chunk<M>();
+  threadgroup float held[SUMS ? CHUNK * M : 1];
   uint row_tile = position.y, column_tile = position.x;
   if constexpr (ROW_GROUP == 0) {
     row_tile = position.x / (columns / N);
@@ -91,30 +126,45 @@ affine_qmm_mpp(const device uchar *weights [[buffer(0)]], const device bfloat *s
     auto rhs = weight_view(group).template slice<64, N>(0, 0);
     multiply.run(lhs, rhs, result);
   };
+  uint chunk = 0;
   auto accumulate = [&](uint group, const thread decltype(total) &result) {
     mpp_for_each(total, valid_mask, [&](ushort i) __attribute__((always_inline)) {
       auto at = total.get_multidimensional_index(i);
       Index parameter = PACKED ? (Index(column / 256) * groups_total + group) * 256 + column % 256 + at[0]
                                : Index(column + at[0]) * groups_total + group;
-      Index sum = Index(row_tile) * M * groups + group * M + at[1];
-      total[i] += result[i] * float(scales[parameter]) + sums[sum] * float(biases[parameter]);
+      float sum;
+      if constexpr (SUMS)
+        sum = held[(group - chunk) * M + at[1]];
+      else
+        sum = sums[Index(row_tile) * M * groups + group * M + at[1]];
+      total[i] += result[i] * float(scales[parameter]) + sum * float(biases[parameter]);
     });
   };
   uint group = part * (groups / PARTS);
   const uint end = (part + 1) * (groups / PARTS);
-  if constexpr (PAIRED) {
-    for (; group + 1 < end; group += 2) {
-      decltype(total) first, second;
-      dot(group, first);
-      dot(group + 1, second);
-      accumulate(group, first);
-      accumulate(group + 1, second);
+  for (chunk = group; chunk < end; chunk += SUMS ? CHUNK : end) {
+    const uint stop = SUMS ? min(chunk + CHUNK, end) : end;
+    if constexpr (SUMS) {
+      if (chunk != part * (groups / PARTS))
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      mpp_group_sums<M, S * 32, Index>(input + Index(row) * width, width, chunk, stop, held,
+                                       thread_id);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-  }
-  for (; group < end; ++group) {
-    decltype(total) result;
-    dot(group, result);
-    accumulate(group, result);
+    if constexpr (PAIRED) {
+      for (; group + 1 < stop; group += 2) {
+        decltype(total) first, second;
+        dot(group, first);
+        dot(group + 1, second);
+        accumulate(group, first);
+        accumulate(group + 1, second);
+      }
+    }
+    for (; group < stop; ++group) {
+      decltype(total) result;
+      dot(group, result);
+      accumulate(group, result);
+    }
   }
   if constexpr (LOCAL) {
     threadgroup float partials[PARTS * M * N];
@@ -127,6 +177,8 @@ affine_qmm_mpp(const device uchar *weights [[buffer(0)]], const device bfloat *s
       float sum = 0;
       for (uint p = 0; p < PARTS; ++p)
         sum += partials[p * M * N + i];
+      if constexpr (BIAS)
+        sum += float(bias[column + i % N]);
       if (row + i / N < uint(rows))
         output[Index(row + i / N) * columns + column + i % N] = bfloat(sum);
     }
@@ -138,24 +190,29 @@ affine_qmm_mpp(const device uchar *weights [[buffer(0)]], const device bfloat *s
   } else {
     auto converted =
         multiply.template get_destination_cooperative_tensor<decltype(a), decltype(b), bfloat>();
-    mpp_for_each(total, valid_mask,
-                 [&](ushort i) __attribute__((always_inline)) { converted[i] = bfloat(total[i]); });
+    mpp_for_each(total, valid_mask, [&](ushort i) __attribute__((always_inline)) {
+      float value = total[i];
+      if constexpr (BIAS)
+        value += float(bias[column + total.get_multidimensional_index(i)[0]]);
+      converted[i] = bfloat(value);
+    });
     auto destination = tensor(output + Index(row) * columns + column, dextents<int, 2>{columns, M},
                               array<int, 2>{1, columns});
     converted.store(destination.template slice<N, M>(0, 0));
   }
 }
 
-#define PIE_MPP_POINT(name, m, n, s, packed, relaxed, parts, paired, local, grid, index)           \
+#define PIE_MPP_POINT(name, m, n, s, packed, relaxed, parts, paired, local, grid, index, sums,     \
+                      bias)                                                                        \
   template [[host_name(name)]] [[kernel]] void                                                     \
-  affine_qmm_mpp<m, n, s, packed, relaxed, parts, paired, local, grid, index>(                     \
+  affine_qmm_mpp<m, n, s, packed, relaxed, parts, paired, local, grid, index, sums, bias>(         \
       const device uchar *, const device bfloat *, const device bfloat *, const device bfloat *,   \
       device bfloat *, constant int &, constant int &, const device float *, constant int &,       \
-      constant int &, uint3, uint);
+      constant int &, const device bfloat *, uint3, uint);
 
 // The routed twin of the in-place kernel: a row tile belongs to one expert, whose bank lies
 // `expert * columns` rows into the planes, and a tile no expert claimed is left unwritten.
-template <int M, int N, int S, int TILE>
+template <int M, int N, int S, int TILE, bool SUMS>
 [[kernel]] void
 affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
                       const device bfloat *scales [[buffer(1)]],
@@ -164,11 +221,14 @@ affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
                       device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
                       constant int &columns [[buffer(6)]], const device float *sums [[buffer(7)]],
                       const device int *tile_expert [[buffer(8)]],
-                      uint3 position [[threadgroup_position_in_grid]]) {
+                      uint3 position [[threadgroup_position_in_grid]],
+                      uint thread_id [[thread_index_in_threadgroup]]) {
   const uint column_tile = position.x, row_tile = position.y;
   const int expert = tile_expert[row_tile * M / TILE];
   if (expert < 0)
     return;
+  constexpr uint CHUNK = mpp_sum_chunk<M>();
+  threadgroup float held[SUMS ? CHUNK * M : 1];
   const int groups = width / 64;
   const uint row = row_tile * M;
   const ulong column = ulong(expert) * columns + column_tile * N;
@@ -187,17 +247,31 @@ affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
       multiply.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
   const ulong valid_mask = mpp_valid_mask(total);
   mpp_for_each(total, valid_mask, [&](ushort i) __attribute__((always_inline)) { total[i] = 0; });
-  for (uint group = 0; group < uint(groups); ++group) {
-    decltype(total) result;
-    auto lhs = activations.template slice<64, M>(group * 64, 0);
-    auto rhs = weight_view(group).template slice<64, N>(0, 0);
-    multiply.run(lhs, rhs, result);
-    mpp_for_each(total, valid_mask, [&](ushort i) __attribute__((always_inline)) {
-      auto at = total.get_multidimensional_index(i);
-      const ulong parameter = (column + at[0]) * groups + group;
-      const ulong sum = ulong(row_tile) * M * groups + group * M + at[1];
-      total[i] += result[i] * float(scales[parameter]) + sums[sum] * float(biases[parameter]);
-    });
+  for (uint chunk = 0; chunk < uint(groups); chunk += SUMS ? CHUNK : uint(groups)) {
+    const uint stop = SUMS ? min(chunk + CHUNK, uint(groups)) : uint(groups);
+    if constexpr (SUMS) {
+      if (chunk != 0)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      mpp_group_sums<M, S * 32, ulong>(input + ulong(row) * width, width, chunk, stop, held,
+                                       thread_id);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint group = chunk; group < stop; ++group) {
+      decltype(total) result;
+      auto lhs = activations.template slice<64, M>(group * 64, 0);
+      auto rhs = weight_view(group).template slice<64, N>(0, 0);
+      multiply.run(lhs, rhs, result);
+      mpp_for_each(total, valid_mask, [&](ushort i) __attribute__((always_inline)) {
+        auto at = total.get_multidimensional_index(i);
+        const ulong parameter = (column + at[0]) * groups + group;
+        float sum;
+        if constexpr (SUMS)
+          sum = held[(group - chunk) * M + at[1]];
+        else
+          sum = sums[ulong(row_tile) * M * groups + group * M + at[1]];
+        total[i] += result[i] * float(scales[parameter]) + sum * float(biases[parameter]);
+      });
+    }
   }
   auto converted =
       multiply.template get_destination_cooperative_tensor<decltype(a), decltype(b), bfloat>();
@@ -208,11 +282,11 @@ affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
   converted.store(destination.template slice<N, M>(0, 0));
 }
 
-#define PIE_MPP_ROUTED_POINT(name, m, n, s, tile)                                                  \
-  template [[host_name(name)]] [[kernel]] void affine_qmm_mpp_routed<m, n, s, tile>(               \
+#define PIE_MPP_ROUTED_POINT(name, m, n, s, tile, sums)                                            \
+  template [[host_name(name)]] [[kernel]] void affine_qmm_mpp_routed<m, n, s, tile, sums>(         \
       const device uchar *, const device bfloat *, const device bfloat *, const device bfloat *,   \
       device bfloat *, constant int &, constant int &, const device float *, const device int *,   \
-      uint3);
+      uint3, uint);
 
 // The routed MXFP4 matmul on the MPP matmul, as mlx-lm's `gather_qmm_rhs_nax` runs it: each
 // 64-wide slice of the expert's codes is decoded into threadgroup bfloat (an E2M1 value times
