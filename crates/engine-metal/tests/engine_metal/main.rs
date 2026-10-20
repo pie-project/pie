@@ -12,6 +12,7 @@ mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
 mod each_checked_in_profile_runs_its_familys_old_tuning;
 mod every_catalog_deployment_dispatches;
+mod mma_attention_matches_fp64;
 mod mpp_attention_over_a_bf16_pool_matches_fp64;
 mod the_block_drafter_loads_and_leaves_the_trunk_alone;
 mod the_block_drafters_proposals_are_measured;
@@ -46,7 +47,6 @@ mod the_split_mlp_matches_the_gpu_alone;
 mod the_staged_rows_match_affine_dots;
 mod the_tower_reads_pixels_as_the_host_cut_them;
 mod the_voxel_axis_answers_its_host_reference;
-mod wide_head_mma_attention_matches_fp64;
 
 /// The bytes a pool takes that holds `slots` sequences at `context`, the
 /// `device_kv_budget` a test states for its shell.
