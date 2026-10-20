@@ -540,10 +540,79 @@ pub fn matmul_select(
             && bank.rows >= 1
             && u64::from(bank.width) == u64::from(x.width) * u64::from(y.width)
         {
+            // On Hopper, wgmma over the same staging (sm_90a).
+            if hopper_wgmma() && y.width.is_multiple_of(128) {
+                return select_bf16_wgmma(ctx, OP, x, bank, routes, y, &fan, bank.rows);
+            }
             return select_bf16_mma(ctx, OP, x, bank, routes, y, &fan, bank.rows);
         }
     }
     select_gemv(ctx, OP, x, bank, routes, y, experts)
+}
+
+/// [`select_bf16_mma`] on Hopper's wgmma (`moe_select_bf16_wgmma`): an
+/// expert's slice 16 routes, or 32 past an average of 8.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn select_bf16_wgmma(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    fan: &Selected,
+    experts: u32,
+) -> Result<(), Error> {
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let slice: u32 = if fan.route_count.div_ceil(experts.max(1)) <= 8 {
+        16
+    } else {
+        32
+    };
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
+        ctx,
+        op,
+        routes,
+        fan,
+        experts,
+        slice,
+        true,
+        if KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    // `kWgStages` stages of 128 code rows and the slice's route rows, 64 bf16
+    // of K each, past the 1024-byte alignment.
+    let smem = 3 * (128 + slice) * 128 + 1024;
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/moe_wgmma.cuh",
+            symbol(&format!("::pie::linear::moe_select_bf16_wgmma<{slice}>")),
+        )
+        .apply(Launch::grid([work_cap, y.width / 128, 1], [128, 1, 1]).smem(smem)),
+        &[
+            x.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            bank.arg(),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            stated(op, x.width)?.arg(),
+            stated(op, experts)?.arg(),
+        ],
+    )
 }
 
 /// Whether the graph-safe bf16 grouped mma.sync kernel takes a fire of
