@@ -230,6 +230,18 @@ pub struct MlaAbsorbOutFrom(pub u32);
 #[decision(id = "kernel.mla.absorb_out_until", constant(range(0..=1_048_576)), default = 0, tune = search)]
 pub struct MlaAbsorbOutUntil(pub u32);
 
+/// The rows up to which a dense `e4m3tile128` projection takes the FP8
+/// decode tile (`dense_fp8_mfma`, at most 64), past them the prefill tiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.fp8.decode_until", constant(range(1..=64)), default = 64, tune = search)]
+pub struct Fp8DecodeUntil(pub u32);
+
+/// The rows up to which those prefill tiles are 64 x 128 (a wave a 16-row
+/// strip, three waves a SIMD) rather than 64 or 128 x 256; 0, never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.fp8.narrow_until", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct Fp8NarrowUntil(pub u32);
+
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
@@ -270,7 +282,9 @@ pub fn register(registry: &mut Registry) {
         .add::<DenseBatchWeightMaxMi>()
         .add::<MlaAbsorbQUntil>()
         .add::<MlaAbsorbOutFrom>()
-        .add::<MlaAbsorbOutUntil>();
+        .add::<MlaAbsorbOutUntil>()
+        .add::<Fp8DecodeUntil>()
+        .add::<Fp8NarrowUntil>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -315,6 +329,8 @@ pub struct Tuning {
     pub mla_absorb_q_until: u32,
     pub mla_absorb_out_from: u32,
     pub mla_absorb_out_until: u32,
+    pub fp8_decode_until: u32,
+    pub fp8_narrow_until: u32,
     /// DeepSeek's fused prefill pass and bounded replay, CUDA's decisions:
     /// never on ROCm.
     pub dsv4_prefill_from: u32,
@@ -363,6 +379,8 @@ impl Tuning {
         mla_absorb_q_until: 0,
         mla_absorb_out_from: 0,
         mla_absorb_out_until: 0,
+        fp8_decode_until: 64,
+        fp8_narrow_until: 0,
         dsv4_prefill_from: 0,
         dsv4_replay: false,
     };
@@ -409,6 +427,8 @@ impl Tuning {
             mla_absorb_q_until: profile.get::<MlaAbsorbQUntil>().0,
             mla_absorb_out_from: profile.get::<MlaAbsorbOutFrom>().0,
             mla_absorb_out_until: profile.get::<MlaAbsorbOutUntil>().0,
+            fp8_decode_until: profile.get::<Fp8DecodeUntil>().0,
+            fp8_narrow_until: profile.get::<Fp8NarrowUntil>().0,
             dsv4_prefill_from: 0,
             dsv4_replay: false,
         }

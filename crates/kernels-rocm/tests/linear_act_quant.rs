@@ -318,8 +318,19 @@ fn run_fp8_mfma(m: usize, n: usize, k: usize, edge_codes: bool) {
 
 /// `run_fp8_mfma` under factors a `tall` x 128 block (at 64: `e4m3g128` per-row factors folded at load).
 fn run_fp8_mfma_rows(m: usize, n: usize, k: usize, edge_codes: bool, tall: usize) {
+    run_fp8_mfma_tuned(m, n, k, edge_codes, tall, false);
+}
+
+/// `run_fp8_mfma_rows`, `narrow`: past 16 rows on the 64 x 128 prefill tile.
+fn run_fp8_mfma_tuned(m: usize, n: usize, k: usize, edge_codes: bool, tall: usize, narrow: bool) {
     let Some(gpu) = Gpu::open() else { return };
-    let ctx = gpu.ctx();
+    let mut ctx = gpu.ctx();
+    if narrow {
+        let mut tuning = ctx.tuning();
+        tuning.fp8_decode_until = 16;
+        tuning.fp8_narrow_until = u32::MAX;
+        ctx.set_tuning(tuning);
+    }
     let (nb, kb) = (n.div_ceil(tall), k / 128);
     let (mut codes, factors) = tile_planes(n * k, nb * kb, (m * 37 + n) as u32);
     if edge_codes {
@@ -378,6 +389,11 @@ fn an_fp8_projection_on_the_matrix_core_folds_each_block() {
     run_fp8_mfma(150, 320, 512, true);
     run_fp8_mfma(300, 320, 768, true);
     run_fp8_mfma(1100, 1040, 1536, false);
+    // The narrow tile: one tile of rows, then rows past several, whole
+    // tiles and sliced.
+    run_fp8_mfma_tuned(40, 384, 1024, true, 128, true);
+    run_fp8_mfma_tuned(300, 1040, 1536, false, 128, true);
+    run_fp8_mfma_tuned(150, 320, 768, true, 64, true);
 }
 
 #[test]

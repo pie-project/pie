@@ -31,6 +31,12 @@ mla.absorb_q_until = 2048
 mla.absorb_out_from = 33
 mla.absorb_out_until = 1536
 
+# A dense e4m3tile128 projection past 32 rows leaves the FP8 decode tile for
+# the prefill tiles, 64 x 128 up to 128 rows (GLM-5.3's shapes at 48-128
+# rows: 12-44% faster than the decode tile or the 256-wide tiles).
+fp8.decode_until = 32
+fp8.narrow_until = 128
+
 # A fire of 10240 rows where `max_forward_tokens` is unstated: 8192 left the
 # first prompts' decodes waiting out a second prefill fire, 12K and up made
 # queued prompts wait. Past 2048 rows, eight buckets a doubling: a prefill's

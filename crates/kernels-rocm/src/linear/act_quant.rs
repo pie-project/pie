@@ -586,8 +586,9 @@ pub fn matmul_fp8b32_lanes(
 /// `act_scales` against `codes` (in the matrix core's order) beside
 /// `factors`: SB 0 f32 scales a 1x128 block and factors a 128x128 one, SB 32
 /// ue8m0 exponents a 1x32 and a 32x32 block (the same bytes a 128-code
-/// stage). Up to 64 rows on the decode tile (`dense_fp8_mfma`), past them on
-/// the prefill tiles (`dense_fp8_tiles`).
+/// stage). Up to 64 rows (`kernel.fp8.decode_until` for `e4m3tile128`) on
+/// the decode tile (`dense_fp8_mfma`), past them on the prefill tiles
+/// (`dense_fp8_tiles`).
 #[allow(clippy::too_many_arguments)]
 fn fire_fp8_dense(
     ctx: &Ctx,
@@ -608,7 +609,12 @@ fn fire_fp8_dense(
     } else {
         FP8_BLOCK
     };
-    if act.rows > 64 {
+    let decode_until = if sb == 0 {
+        ctx.tuning().fp8_decode_until
+    } else {
+        64
+    };
+    if act.rows > decode_until {
         return fire_fp8_tiles(ctx, op, act, act_scales, codes, factors, y, sb, fr);
     }
     // The decode tile; K sliced while the tiles and items are short of two
@@ -696,8 +702,20 @@ impl PrefillTile {
 /// The prefill tile a product's shape takes (measured on MI300X): SB 32 64
 /// rows x 256 columns at four waves a SIMD (its every step's fold leaves the
 /// registers for no wider tile); SB 0 128 x 256 at two a SIMD, 64 x 256
-/// where those leave more than two fifths of a round of CUs idle.
+/// where those leave more than two fifths of a round of CUs idle; up to
+/// `kernel.fp8.narrow_until` rows 64 x 128 at three a SIMD, a wave a strip,
+/// so a short prefill's tiles fill the card.
 fn prefill_tile(ctx: &Ctx, sb: u32, rows: u32, n: u32) -> PrefillTile {
+    if sb == 0 && rows <= ctx.tuning().fp8_narrow_until {
+        return PrefillTile {
+            nb: 3,
+            wn: 8,
+            wm: 1,
+            ns: 1,
+            ms: 4,
+            occ: 3,
+        };
+    }
     if sb == 32 {
         return PrefillTile {
             nb: 2,
