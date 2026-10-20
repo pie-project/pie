@@ -744,6 +744,20 @@ constexpr int prefill_bc() {
     return D >= 512 ? 16 : D <= 64 ? 64 : 32;
 }
 
+// A prefill block's (work item, kv head): each XCD (block b runs on XCD b
+// mod 8) takes a run of the grid in (head, item) order, so the items it runs
+// at once are neighbouring query tiles of one head and find that head's keys
+// and values in its L2; causal items walk each head from its last (the
+// longest) down.
+__device__ __forceinline__ void prefill_item(bool causal, int& bx, int& kv_head) {
+    const int total = gridDim.x * gridDim.y, b = blockIdx.x + gridDim.x * blockIdx.y;
+    const int xcd = b % 8, q = total / 8, rem = total % 8;
+    const int at = xcd * q + min(xcd, rem) + b / 8;
+    kv_head = at / gridDim.x;
+    bx = at % gridDim.x;
+    if (causal) bx = gridDim.x - 1 - bx;
+}
+
 template <int D, bool HND, bool CAUSAL>
 __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     constexpr int BC = prefill_bc<D>();
@@ -755,8 +769,8 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     __shared__ alignas(16) bf16 ks[BC][KPAD];
     __shared__ alignas(16) bf16 vt[D][VPAD];
 
-    const int bx = blockIdx.x;
-    const int kv_head = blockIdx.y;
+    int bx, kv_head;
+    prefill_item(CAUSAL, bx, kv_head);
     if (p.block_valid != nullptr && p.block_valid[bx] == 0) return;
     const int G = p.num_qo_heads / p.num_kv_heads;
     const int req = p.request_indices[bx];
@@ -953,8 +967,8 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
 
     // Causal tiles grow with their position: the last of a request walks the
     // most keys, so the grid starts there and the short ones fill the tail.
-    const int bx = CAUSAL ? gridDim.x - 1 - blockIdx.x : blockIdx.x;
-    const int kv_head = blockIdx.y;
+    int bx, kv_head;
+    prefill_item(CAUSAL, bx, kv_head);
     if (p.block_valid != nullptr && p.block_valid[bx] == 0) return;
     const int G = p.num_qo_heads / p.num_kv_heads;
     const int req = p.request_indices[bx];
