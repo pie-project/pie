@@ -4422,7 +4422,9 @@ impl engine::frame::Shell for Shell {
         };
         fire_trace(|| "forward-encoded".to_string());
         let profile = crate::encode::kernel_profile();
-        if !profile.is_empty() {
+        if !profile.is_empty() && prepared.descriptor.rows < 256 {
+            crate::encode::reset_kernel_profile();
+        } else if !profile.is_empty() {
             let total: u64 = profile.iter().map(|(_, ns, _)| ns).sum();
             eprintln!(
                 "kernels: fire of {} row(s), {:.1} ms on the device:",
