@@ -144,15 +144,7 @@ __global__ void moe_matmul_select_nvfp4(
 #pragma unroll
                 for (int r = 0; r < kRows; ++r) {
                     if constexpr (kLean) {
-                        const unsigned wd = (&ww[u][r].x)[q];
-#pragma unroll
-                        for (int p = 0; p < 4; ++p) {
-                            // Codes 3 - p and 7 - p, 2^-126 times their value.
-                            const unsigned t = wd << (4 * p);
-                            const unsigned b2 = (t & 0x80008000u) | ((t >> 6) & 0x01C001C0u);
-                            part[q >> 1][r] = fmaf(__uint_as_float(b2 << 16), xv[3 - p], part[q >> 1][r]);
-                            part[q >> 1][r] = fmaf(__uint_as_float(b2 & 0xFFFF0000u), xv[7 - p], part[q >> 1][r]);
-                        }
+                        part[q >> 1][r] = e2m1x8_dot_lean((&ww[u][r].x)[q], xv, part[q >> 1][r]);
                     } else {
                         __half2 qd[4];
                         mxfp4_unpack8((&ww[u][r].x)[q], qd);

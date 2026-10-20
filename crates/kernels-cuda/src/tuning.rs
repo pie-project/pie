@@ -567,10 +567,9 @@ pub struct SsmGdnOutBf16;
 pub struct SsmGdnStepBlocks(pub u32);
 
 /// Whether the per-route MXFP4 and NVFP4 selects (a decode's few routes an
-/// expert, and NVFP4's dense product) run
-/// lean: two-warp blocks, one code block a row in flight a lane, the codes
-/// widened by integer ops, no converts. Off but where a chip's profile turns
-/// it on (A100's).
+/// expert, and NVFP4's dense product) run lean: two-warp blocks, one code
+/// block a row in flight a lane, the codes widened by integer ops, no
+/// converts. Off but where a chip's profile turns it on (A100's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.mxfp4_select_lean", flag, default = false, tune = search)]
 pub struct MoeMxfp4SelectLean;

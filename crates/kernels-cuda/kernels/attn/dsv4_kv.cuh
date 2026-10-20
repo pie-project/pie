@@ -125,26 +125,6 @@ __device__ __forceinline__ void ds_store_warp(const bf16* __restrict__ src, DsRo
     }
 }
 
-
-// Two e4m3 codes (the low byte first) as f32: sm_89's convert, or below it
-// each code laid into an f32 by integer ops (2^-120 times its value, an e4m3
-// subnormal an f32 one, exact) and taken back up.
-__device__ __forceinline__ void ds_e4m3x2(std::uint16_t pair, float& lo, float& hi) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
-    const std::uint32_t b0 = pair & 0xFFu, b1 = pair >> 8;
-    lo = __uint_as_float(((b0 & 0x80u) << 24) | ((b0 & 0x7Fu) << 20)) * 0x1p120f;
-    hi = __uint_as_float(((b1 & 0x80u) << 24) | ((b1 & 0x7Fu) << 20)) * 0x1p120f;
-#else
-    asm("{\n\t.reg .b32 h2;\n\t.reg .b16 l, h;\n\t"
-        "cvt.rn.f16x2.e4m3x2 h2, %2;\n\t"
-        "mov.b32 {l, h}, h2;\n\t"
-        "cvt.f32.f16 %0, l;\n\t"
-        "cvt.f32.f16 %1, h;\n\t}"
-        : "=f"(lo), "=f"(hi)
-        : "h"(pair));
-#endif
-}
-
 // 8 dims of a row from its data and scale bytes: `j` the first dim (a
 // multiple of 8).
 __device__ __forceinline__ uint4 ds_load8(const std::uint8_t* data, const std::uint8_t* scales, int j) {
@@ -157,7 +137,7 @@ __device__ __forceinline__ uint4 ds_load8(const std::uint8_t* data, const std::u
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         float lo, hi;
-        ds_e4m3x2(c2[i], lo, hi);
+        ::pie::e4m3_pair_f32(c2[i], lo, hi);
         const __nv_bfloat162 b = __floats2bfloat162_rn(lo * s, hi * s);
         o32[i] = *reinterpret_cast<const std::uint32_t*>(&b);
     }
@@ -315,7 +295,7 @@ __device__ __forceinline__ uint4 mx8_widen8(uint2 codes, float s) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         float lo, hi;
-        ds_e4m3x2(c2[i], lo, hi);
+        ::pie::e4m3_pair_f32(c2[i], lo, hi);
         const __nv_bfloat162 b = __floats2bfloat162_rn(lo * s, hi * s);
         o32[i] = *reinterpret_cast<const std::uint32_t*>(&b);
     }

@@ -638,6 +638,22 @@ __device__ __forceinline__ void moe_note_group(
     }
 }
 
+// Eight e2m1 codes of a word (code `i` its nibble `i`) dotted with `xv`
+// onto `acc`, the codes laid into bf16 by integer ops: each 2^-126 times its
+// value, exact, so `xv` comes 2^100 up and the caller's scale takes back the
+// 2^26 left. No f16 converts.
+__device__ __forceinline__ float e2m1x8_dot_lean(unsigned wd, const float (&xv)[8], float acc) {
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        // Codes 3 - p and 7 - p at bits 12..15 and 28..31.
+        const unsigned t = wd << (4 * p);
+        const unsigned b2 = (t & 0x80008000u) | ((t >> 6) & 0x01C001C0u);
+        acc = fmaf(__uint_as_float(b2 << 16), xv[3 - p], acc);
+        acc = fmaf(__uint_as_float(b2 & 0xFFFF0000u), xv[7 - p], acc);
+    }
+    return acc;
+}
+
 // With kLean (A100's profile) one 32-code block a row in flight a lane, the
 // codes laid into bf16 by integer ops (2^-126 times their value, exact) and
 // the activations taken 2^100 up so the products stay normal, the block
@@ -731,15 +747,7 @@ __global__ void moe_matmul_select_mxfp4(
 #pragma unroll
                 for (int r = 0; r < kRows; ++r) {
                     if constexpr (kLean) {
-                        const unsigned wd = (&ww[u][r].x)[q];
-#pragma unroll
-                        for (int p = 0; p < 4; ++p) {
-                            // Codes 3 - p and 7 - p at bits 12..15 and 28..31.
-                            const unsigned t = wd << (4 * p);
-                            const unsigned b2 = (t & 0x80008000u) | ((t >> 6) & 0x01C001C0u);
-                            part[r] = fmaf(__uint_as_float(b2 << 16), xv[3 - p], part[r]);
-                            part[r] = fmaf(__uint_as_float(b2 & 0xFFFF0000u), xv[7 - p], part[r]);
-                        }
+                        part[r] = e2m1x8_dot_lean((&ww[u][r].x)[q], xv, part[r]);
                     } else {
                         __half2 qd[4];
                         mxfp4_unpack8((&ww[u][r].x)[q], qd);

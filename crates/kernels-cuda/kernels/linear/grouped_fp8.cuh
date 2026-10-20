@@ -34,25 +34,8 @@ __device__ __forceinline__ void mma(float (&d)[4], unsigned a0, unsigned a1, uns
 
 /// Two e4m3 codes (the low byte the low half) as floats, exactly.
 __device__ __forceinline__ float2 e4m3x2_f32(unsigned short pair) {
-    float lo, hi;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
-    // Below sm_89's convert: each code laid into an f32 (2^-120 times its
-    // value, an e4m3 subnormal an f32 one) and taken back up.
-    const unsigned b0 = pair & 0xFFu, b1 = static_cast<unsigned>(pair) >> 8;
-    lo = __uint_as_float(((b0 & 0x80u) << 24) | ((b0 & 0x7Fu) << 20)) * 0x1p120f;
-    hi = __uint_as_float(((b1 & 0x80u) << 24) | ((b1 & 0x7Fu) << 20)) * 0x1p120f;
-#else
-    asm("{ .reg .b32 h; .reg .b16 l, u;\n"
-        "cvt.rn.f16x2.e4m3x2 h, %2;\n"
-        "mov.b32 {l, u}, h;\n"
-        "cvt.f32.f16 %0, l;\n"
-        "cvt.f32.f16 %1, u; }\n"
-        : "=f"(lo), "=f"(hi)
-        : "h"(pair));
-#endif
     float2 r;
-    r.x = lo;
-    r.y = hi;
+    ::pie::e4m3_pair_f32(pair, r.x, r.y);
     return r;
 }
 
