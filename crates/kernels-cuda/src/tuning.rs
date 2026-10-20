@@ -148,6 +148,16 @@ pub struct MoeEvenWavesFrom(pub u32);
 #[decision(id = "kernel.moe.routes_sized", flag, default = false, tune = search)]
 pub struct MoeRoutesSized;
 
+/// The most tokens a routed MLP's normed gather (Muse Spark's routes, each
+/// normed under its scale before the weighted sum) takes with eight routes in
+/// flight a round rather than two: a decode's few row blocks leave the
+/// multiprocessors idle, so a deeper batch pays fewer rounds of load and
+/// block sum (the same bits: each route's sum is its own, the routes added
+/// in order). 0, never, but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.gather_ahead_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeGatherAheadUntil(pub u32);
+
 /// The fewest rows the fused qkv norm, rotation and KV write takes a block a
 /// row (a warp a head below): 64 but where a chip's profile says (B200's,
 /// where 64 decode rows' blocks leave most SMs idle).
@@ -728,6 +738,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeW4a4DownSplits>()
         .add::<MoeEvenWavesFrom>()
         .add::<MoeRoutesSized>()
+        .add::<MoeGatherAheadUntil>()
         .add::<AttnQkvRowsFrom>()
         .add::<SsmKdaStepFused>()
         .add::<GemmSplitLaunchNs>()
@@ -852,6 +863,7 @@ tuning! {
     moe_w4a4_down_splits: u32 = 1, get MoeW4a4DownSplits;
     moe_even_waves_from: u32 = 0, get MoeEvenWavesFrom;
     moe_routes_sized: bool = false, on MoeRoutesSized;
+    moe_gather_ahead_until: u32 = 0, get MoeGatherAheadUntil;
     qkv_rows_from: u32 = 64, get AttnQkvRowsFrom;
     ssm_kda_step_fused: bool = false, on SsmKdaStepFused;
     gemm_split_launch_ns: u32 = 0, get GemmSplitLaunchNs;

@@ -373,8 +373,9 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         let first = gate == Some(true);
         #[rustfmt::skip]
         let want = mlp(&xv, (&routes, &weights), [hidden, inter, top], upv, downv, g, first, shared, normed.then_some(&scv[..]));
-        // Every fire with its swapped units dealt evenly and not, and a W4A4
-        // fire's swapped down leg split along K.
+        // Every fire with its swapped units dealt evenly and not (its routing
+        // sized and a normed gather's eight routes in flight with them), and a
+        // W4A4 fire's swapped down leg split along K.
         let arms: &[(u32, bool)] = if a == 4 {
             &[(1, false), (2, false), (4, false), (1, true), (2, true)]
         } else {
@@ -391,6 +392,7 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
                 moe_w4a4_down_splits: down_splits,
                 moe_even_waves_from: u32::from(even),
                 moe_routes_sized: even,
+                moe_gather_ahead_until: if even { 65_536 } else { 0 },
                 ..base
             });
             if let Some((live, first)) = window {
