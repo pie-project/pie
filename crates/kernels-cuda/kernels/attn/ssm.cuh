@@ -3091,6 +3091,77 @@ __global__ void ssm_kda_step_fused(
     }
 }
 
+// `ssm_kda_step_batched`'s value rows `v_lo..v_hi` of a head's `D = 128
+// kRuns` state in registers: a lane's float4 of each 128-column run, a
+// warp's `kPair` rows loaded together so their reads are in flight at
+// once, each row read once and written once.
+template <int kRuns, int kPair>
+__device__ __forceinline__ void kda_step_rows(float* st, const float* sq, const float* sk,
+                                              const float* sg, const float* v_h, float beta_h,
+                                              float* out_h, int v_lo, int v_hi, int lane,
+                                              int warp, int warps) {
+    constexpr int D = 128 * kRuns;
+    for (int v0 = v_lo + warp * kPair; v0 < v_hi; v0 += warps * kPair) {
+        float4 sv[kPair][kRuns];
+        float mem[kPair], acc[kPair];
+#pragma unroll
+        for (int p = 0; p < kPair; ++p) {
+            if (v0 + p < v_hi) {
+                const float4* row = reinterpret_cast<const float4*>(st + (long long)(v0 + p) * D);
+#pragma unroll
+                for (int c = 0; c < kRuns; ++c) sv[p][c] = row[c * 32 + lane];
+            }
+        }
+#pragma unroll
+        for (int p = 0; p < kPair; ++p) {
+            mem[p] = 0.f;
+#pragma unroll
+            for (int c = 0; c < kRuns; ++c) {
+                const int at = c * 32 + lane;
+                const float4 gg = reinterpret_cast<const float4*>(sg)[at];
+                const float4 kk = reinterpret_cast<const float4*>(sk)[at];
+                float4& x = sv[p][c];
+                x = make_float4(x.x * gg.x, x.y * gg.y, x.z * gg.z, x.w * gg.w);
+                mem[p] += x.x * kk.x + x.y * kk.y + x.z * kk.z + x.w * kk.w;
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+            for (int p = 0; p < kPair; ++p) mem[p] += __shfl_xor_sync(0xffffffffu, mem[p], off);
+        }
+#pragma unroll
+        for (int p = 0; p < kPair; ++p) {
+            acc[p] = 0.f;
+            if (v0 + p >= v_hi) continue;
+            const float delta = (v_h[v0 + p] - mem[p]) * beta_h;
+            float4* row = reinterpret_cast<float4*>(st + (long long)(v0 + p) * D);
+#pragma unroll
+            for (int c = 0; c < kRuns; ++c) {
+                const int at = c * 32 + lane;
+                const float4 kk = reinterpret_cast<const float4*>(sk)[at];
+                const float4 qq = reinterpret_cast<const float4*>(sq)[at];
+                float4 x = sv[p][c];
+                x.x += kk.x * delta;
+                x.y += kk.y * delta;
+                x.z += kk.z * delta;
+                x.w += kk.w * delta;
+                row[at] = x;
+                acc[p] += x.x * qq.x + x.y * qq.y + x.z * qq.z + x.w * qq.w;
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+            for (int p = 0; p < kPair; ++p) acc[p] += __shfl_xor_sync(0xffffffffu, acc[p], off);
+        }
+#pragma unroll
+        for (int p = 0; p < kPair; ++p) {
+            if (lane == p && v0 + p < v_hi) out_h[v0 + p] = acc[p];
+        }
+    }
+}
+
 __global__ void ssm_kda_step_batched(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
@@ -3156,45 +3227,13 @@ __global__ void ssm_kda_step_batched(
     const int warp = threadIdx.x >> 5;
     const int warps = blockDim.x >> 5;
 
-    // A row in registers where it is whole 128-column runs (up to 512): a
-    // lane's float4 of each, the row read once and written once.
-    if (D % 128 == 0 && D <= 512) {
-        const int runs = D / 128;
-        for (int vi = v_lo + warp; vi < v_hi; vi += warps) {
-            float4* row = reinterpret_cast<float4*>(st + (long long)vi * D);
-            float4 sv[4];
-            float mem = 0.f;
-#pragma unroll
-            for (int c = 0; c < 4; ++c) {
-                if (c >= runs) break;
-                const int at = c * 32 + lane;
-                const float4 x = row[at];
-                const float4 gg = reinterpret_cast<const float4*>(sg)[at];
-                const float4 kk = reinterpret_cast<const float4*>(sk)[at];
-                sv[c] = make_float4(x.x * gg.x, x.y * gg.y, x.z * gg.z, x.w * gg.w);
-                mem += sv[c].x * kk.x + sv[c].y * kk.y + sv[c].z * kk.z + sv[c].w * kk.w;
-            }
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) mem += __shfl_xor_sync(0xffffffffu, mem, off);
-            const float delta = (v_h[vi] - mem) * beta_h;
-            float acc = 0.f;
-#pragma unroll
-            for (int c = 0; c < 4; ++c) {
-                if (c >= runs) break;
-                const int at = c * 32 + lane;
-                const float4 kk = reinterpret_cast<const float4*>(sk)[at];
-                const float4 qq = reinterpret_cast<const float4*>(sq)[at];
-                float4 x = sv[c];
-                x.x += kk.x * delta;
-                x.y += kk.y * delta;
-                x.z += kk.z * delta;
-                x.w += kk.w * delta;
-                row[at] = x;
-                acc += x.x * qq.x + x.y * qq.y + x.z * qq.z + x.w * qq.w;
-            }
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
-            if (lane == 0) out_h[vi] = acc;
+    if (D == 128 || D == 256 || D == 512) {
+        if (D == 128) {
+            kda_step_rows<1, 8>(st, sq, sk, sg, v_h, beta_h, out_h, v_lo, v_hi, lane, warp, warps);
+        } else if (D == 256) {
+            kda_step_rows<2, 4>(st, sq, sk, sg, v_h, beta_h, out_h, v_lo, v_hi, lane, warp, warps);
+        } else {
+            kda_step_rows<4, 2>(st, sq, sk, sg, v_h, beta_h, out_h, v_lo, v_hi, lane, warp, warps);
         }
         return;
     }
