@@ -2375,6 +2375,7 @@ fn select_plan(
     y: &Tensor,
     glu: bool,
     gemm: bool,
+    fill: u32,
 ) -> Result<SelectPlan, Error> {
     let nb: u32 = match fan.route_count.div_ceil(experts) {
         0..=4 => 1,
@@ -2397,7 +2398,7 @@ fn select_plan(
         },
     )?;
     // A decode's few CTAs: half the rows a warp (twice the CTAs), then K
-    // split across groups of a CTA's warps, toward four CTAs' warps an SM.
+    // split across groups of a CTA's warps, toward `fill` CTAs' warps an SM.
     let sms = ctx.multiprocessors().unwrap_or(108);
     let tiles: u32 = if !glu && order.work_cap * y.width.div_ceil(128) < 2 * sms {
         1
@@ -2407,7 +2408,7 @@ fn select_plan(
     let cols = if glu { 64 } else { 64 * tiles };
     let ctas = (order.work_cap * y.width.div_ceil(cols)).max(1);
     let ksplit = if nb == 1 {
-        (4 * sms)
+        (fill * sms)
             .div_ceil(ctas)
             .next_power_of_two()
             .clamp(1, MMA_KSPLIT_MAX)
@@ -2479,6 +2480,7 @@ pub fn select_fp8_w8a16(
         y,
         glu.is_some(),
         fan.route_count >= FP8_GEMM_FROM,
+        4,
     )?;
     let fire = if tiled {
         // Three stages of 64 routes' activations and 128 rows' codes, 64 of
@@ -2595,6 +2597,9 @@ pub fn select_bf16_held(
         y,
         glu.is_some(),
         fan.route_count >= BF16_GEMM_FROM && x.width.is_multiple_of(64),
+        // bf16 codes stream twice an fp8 bank's bytes: deeper K splits keep
+        // more of them in flight (Hy4's decode +2%).
+        8,
     )?;
     let fire = if tiled {
         // Three stages of 64 routes' and 128 rows' 64 of K, four warps a
@@ -2765,7 +2770,10 @@ fn matmul_select_mxfp4(
     }
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
-    let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
+    // A lean select (`kernel.moe.mxfp4_select_lean`) runs blocks of two warps.
+    let lean = ctx.tuning().mxfp4_select_lean;
+    let block = if lean { 2 * WARP } else { DECODE_BLOCK };
+    let tile = (block / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
 
     let experts = codes.rows.clamp(1, EXPERT_CAP);
@@ -2818,12 +2826,13 @@ fn matmul_select_mxfp4(
         Fire::at(
             "linear/quant.cuh",
             symbol(&format!(
-                "::pie::linear::moe_matmul_select_mxfp4<{t}, ::pie::i32({ROWS_PER_WARP})>"
+                "::pie::linear::moe_matmul_select_mxfp4<{t}, ::pie::i32({ROWS_PER_WARP}){}>",
+                if lean { ", true" } else { "" }
             )),
         )
         .apply(Launch::grid(
             [fan.route_count, y.width.div_ceil(tile), 1],
-            [DECODE_BLOCK, 1, 1],
+            [block, 1, 1],
         )),
         &[
             x.arg(),
@@ -3483,6 +3492,32 @@ pub fn matmul_grouped_strided(
     }
     if y.rows == 0 {
         return Ok(());
+    }
+    // One row (a decode's) as one GEMV over every group's rows, where the
+    // profile says (`kernel.gemm.grouped_gemv`): batched cuBLAS spends its
+    // few CTAs on a plane a GEMV streams at full bandwidth.
+    if ctx.tuning().grouped_gemv
+        && y.rows == 1
+        && k.is_multiple_of(8)
+        && [x.ptr, w.ptr].iter().all(|p| p.is_multiple_of(16))
+    {
+        let rows = groups * n;
+        return ctx.fire(
+            OP,
+            Fire::at(
+                "linear/gemv.cuh",
+                "::pie::linear::gemv_bf16_grouped_kernel<::pie::i32(4)>",
+            )
+            .apply(Launch::grid([rows.div_ceil(4), 1, 1], [32, 4, 1])),
+            &[
+                w.arg(),
+                x.arg(),
+                y.arg(),
+                stated(OP, rows)?.arg(),
+                stated(OP, k)?.arg(),
+                stated(OP, n)?.arg(),
+            ],
+        );
     }
     let int =
         |v: u32| i32::try_from(v).map_err(|_| refuse(OP, "an extent past the int cuBLAS takes"));

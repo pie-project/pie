@@ -1712,10 +1712,10 @@ impl Run<'_> {
         } else {
             k.div_ceil(atoms.width)
         };
-        // A decode's few rows over 128-wide blocks as the GEMV over bf16 rows
-        // (`kernel.gemm.fp8_gemv_until`), as the tcgen05 path takes them.
-        if block == 128
-            && act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)?
+        // A decode's few rows over 128- or 32-wide blocks as the GEMV over bf16
+        // rows (`kernel.gemm.fp8_gemv_until`), as the tcgen05 path takes them.
+        if matches!(block, 32 | 128)
+            && act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, block, &mut out)?
         {
             return Ok(());
         }
@@ -1794,7 +1794,7 @@ impl Run<'_> {
             }
             // Else a GEMV over the activations as they are, where the profile says
             // (`kernel.gemm.fp8_gemv_until`): ahead of the tcgen05 GEMM even on held codes.
-            if act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)? {
+            if act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, 128, &mut out)? {
                 return Ok(());
             }
             // Its producer landed the codes itself: no quantize launch.

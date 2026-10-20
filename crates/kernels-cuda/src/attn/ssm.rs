@@ -766,23 +766,23 @@ fn fused_fits(shape: &Delta, state: &RecurrentPool, qkv: Tensor, y: &Tensor) -> 
             .all(|&at| aligned16(at))
 }
 
-/// Warps per block of the fused step, and the most blocks each SM holds:
-/// the warps are persistent, so the grid is at most what the SMs seat at
-/// once.
+/// Warps per block of the fused step: the warps are persistent, so the
+/// grid is at most what the SMs seat at once (`kernel.ssm.gdn_step_blocks`
+/// blocks an SM at most).
 const FUSED_WARPS: u32 = 4;
-const FUSED_BLOCKS_PER_SM: u32 = 4;
 /// The bytes one warp's stage of the fused step streams: its state tile, the
 /// q and k rows, its value slice and the two gates.
 const FUSED_STAGE: u32 = 4096 + 512 + 32 + 32;
 /// The fused step's shared memory a block, double-buffered.
 const FUSED_SMEM: u32 = FUSED_WARPS * 2 * FUSED_STAGE;
 
-/// The fused step's blocks one SM seats: four, or fewer where the SM's
+/// The fused step's blocks one SM seats: `most`, or fewer where the SM's
 /// shared memory (less the 1 KiB the runtime keeps a block) holds fewer.
-fn fused_blocks_per_sm(smem_per_sm: Option<u32>) -> u32 {
+fn fused_blocks_per_sm(smem_per_sm: Option<u32>, most: u32) -> u32 {
     const RESERVED: u32 = 1024;
-    smem_per_sm.map_or(FUSED_BLOCKS_PER_SM, |bytes| {
-        (bytes / (FUSED_SMEM + RESERVED)).clamp(1, FUSED_BLOCKS_PER_SM)
+    let most = most.max(1);
+    smem_per_sm.map_or(most, |bytes| {
+        (bytes / (FUSED_SMEM + RESERVED)).clamp(1, most)
     })
 }
 
@@ -810,7 +810,7 @@ impl Delta {
             })?;
         let blocks = tiles
             .div_ceil(FUSED_WARPS)
-            .min(sms * fused_blocks_per_sm(ctx.smem_per_sm()));
+            .min(sms * fused_blocks_per_sm(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks));
         ctx.fire(
             op,
             Fire::at(FILE, "::pie::attn::ssm_gdn_decode_step<4>")
@@ -2136,14 +2136,16 @@ mod tests {
         assert!(scan_smem(128) > 101_376);
     }
 
-    /// Three blocks of the fused step where the SM holds them, as on a B200
-    /// (228 KiB) or an A100 (164 KiB); two on a 100 KiB SM.
+    /// Four blocks of the fused step where the SM holds them, as on a B200
+    /// (228 KiB) or an A100 (164 KiB); two on a 100 KiB SM; the profile's
+    /// fewer where it asks (A100's three).
     #[test]
     fn the_fused_step_seats_what_the_sm_holds() {
-        assert_eq!(fused_blocks_per_sm(Some(233_472)), 4);
-        assert_eq!(fused_blocks_per_sm(Some(167_936)), 4);
-        assert_eq!(fused_blocks_per_sm(Some(102_400)), 2);
-        assert_eq!(fused_blocks_per_sm(Some(16_384)), 1);
-        assert_eq!(fused_blocks_per_sm(None), 4);
+        assert_eq!(fused_blocks_per_sm(Some(233_472), 4), 4);
+        assert_eq!(fused_blocks_per_sm(Some(167_936), 4), 4);
+        assert_eq!(fused_blocks_per_sm(Some(102_400), 4), 2);
+        assert_eq!(fused_blocks_per_sm(Some(16_384), 4), 1);
+        assert_eq!(fused_blocks_per_sm(None, 4), 4);
+        assert_eq!(fused_blocks_per_sm(Some(167_936), 3), 3);
     }
 }

@@ -363,8 +363,9 @@ using IdType = std::int32_t;
 // output and log-sum-exp. A row of no partials lands zeros and -inf, one
 // partial lands as it stands. `win` is the staged `(count, start)` seat.
 // With `sinks`, each head's output is scaled as `sink_rescale` scales it,
-// by 1 / (1 + exp(sink - lse)), from the f32 sum before it rounds.
-template <int HEAD_DIM, class S = float>
+// by 1 / (1 + exp(sink - lse)), from the f32 sum before it rounds. Rows lie
+// HEAD_DIM apart; LIVE of their columns are folded (the rest no one's).
+template <int HEAD_DIM, class S = float, int LIVE = HEAD_DIM>
 __global__ void __launch_bounds__(256) merge_partials_warp(
     const merge_lse::DTypeIn* __restrict__ v,
     const float* __restrict__ s,
@@ -377,8 +378,8 @@ __global__ void __launch_bounds__(256) merge_partials_warp(
     const S* __restrict__ sinks,
     const u32* __restrict__ win)
 {
-    static_assert(HEAD_DIM % 64 == 0, "two columns a lane at least");
-    constexpr int PER = HEAD_DIM / 32;
+    static_assert(LIVE % 64 == 0 && LIVE <= HEAD_DIM, "two columns a lane at least");
+    constexpr int PER = LIVE / 32;
     const u32 staged = seq_len_ptr != nullptr ? *seq_len_ptr : max_seq_len;
     const u32 rows = (win != nullptr && win[0] < staged) ? win[0] : staged;
     const u32 row_base = win != nullptr ? win[1] : 0;

@@ -147,6 +147,16 @@ fn the_strided_grouped_projection_answers_each_group() {
     let w = |r: usize, c: usize, i: usize| wv[((r % groups) * n + c) * k + i];
     let want = dot([rows * groups, n, k], |r, i| xv[r * k + i], w);
     b.check(y.ptr, &want, TOL, "strided");
+    // A decode's one row on the grouped GEMV (`kernel.gemm.grouped_gemv`).
+    let mut y1 = b.out(1, groups * n);
+    let ctx = b.ctx().with_tuning(Tuning {
+        grouped_gemv: true,
+        ..Tuning::DEFAULT
+    });
+    let xt1 = t(x, 1, groups * k, Bf16);
+    matmul_grouped_strided(&ctx, xt1, wt, &mut y1, groups as u32).expect("fires");
+    let want1 = dot([groups, n, k], |r, i| xv[r * k + i], w);
+    b.check(y1.ptr, &want1, TOL, "strided, one row");
 }
 
 #[test]
@@ -235,7 +245,7 @@ fn the_fp8_block_projections_answer_the_dot() {
                 let bank = act_quant::Bank { codes, atoms, experts, n: n32, k: k32, elem, gran, alpha_e: 0, alpha_from };
                 act_quant::select(&ctx, "test", fmt, xr, routes, None, bank, &mut yr)
             }
-            _ => act_quant::fp8_block_gemv(&ctx, xt, codes, atoms, &mut y).map(|took| assert!(took)),
+            _ => act_quant::fp8_block_gemv(&ctx, xt, codes, atoms, 128, &mut y).map(|took| assert!(took)),
         }
         .expect("the fp8 projection fires");
         // The quantizing arms read e4m3 rows, the GEMV the bf16 ones.
@@ -335,5 +345,34 @@ fn the_w8a16_projections_answer_the_dot() {
             |_, c, i| f64::from(s.value(c, k, i)),
         );
         b.check(y.ptr, &want, TOL, &format!("W8A16 in {gran}s, {m}x{n}x{k}"));
+    } // The GEMV over bf16 rows at a decode's few rows, in either block width.
+    for (gran, m, n, k) in [
+        (32, 1, 1280, 5120),
+        (32, 3, 512, 1024),
+        (128, 2, 640, 2048),
+        (32, 1, 4096, 1280),
+        (128, 2, 256, 640),
+    ] {
+        let mut b = Bench::new(0x6e3 ^ (m * n + k) as u64);
+        let (x, xv) = b.bf16(m * k);
+        let s = b.side(Elem::E4m3, Some(gran), n, k);
+        let atoms = &s.scales.as_ref().expect("scaled").0;
+        let (codes, atoms) = (b.up(&s.bytes), b.up(atoms));
+        let (mut y, ctx) = (b.out(m, n), b.ctx().with_tuning(GEMV));
+        let took =
+            act_quant::fp8_block_gemv(&ctx, t(x, m, k, Bf16), codes, atoms, gran as u32, &mut y)
+                .expect("the GEMV fires");
+        assert!(took, "{m}x{n}x{k} in {gran}s is a shape the GEMV reads");
+        let want = dot(
+            [m, n, k],
+            |r, i| xv[r * k + i],
+            |_, c, i| f64::from(s.value(c, k, i)),
+        );
+        b.check(
+            y.ptr,
+            &want,
+            TOL,
+            &format!("the GEMV in {gran}s, {m}x{n}x{k}"),
+        );
     }
 }

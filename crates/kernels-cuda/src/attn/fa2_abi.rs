@@ -292,6 +292,9 @@ pub struct Partials {
     pub sinks: DevicePtr,
     /// Whether the sinks are f32 (else the output's bf16).
     pub sinks_f32: bool,
+    /// The columns of each head the fold carries (a pool's live value
+    /// width, the product having written no more); 0 for the whole head.
+    pub live: u32,
 }
 
 pub(crate) const fn resolve(base: DevicePtr, off: Option<u32>) -> DevicePtr {
