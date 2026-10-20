@@ -8,13 +8,18 @@
 //!
 //! Request: `PIEB`, u32 version, u32 key count, the keys (32 bytes each),
 //! u32 first page. Answer: u8 status; 0 then u32 pages, u64 bytes per page,
-//! u32 length and the source's description of its layout (opaque here), and
-//! the bytes; 1 then u32 length and a UTF-8 reason. A source that fails
-//! mid-answer closes the stream short.
+//! u32 length and the source's description of its layout (opaque here), the
+//! slots (below), and the bytes; 1 then u32 length and a UTF-8 reason. A
+//! source that fails mid-answer closes the stream short.
 //!
 //! A put (to a pool) is `PIEP`, u32 version, u32 key count, the keys, u64
-//! bytes per page, u32 length and the layout, then the bytes; the answer is
-//! a status as above.
+//! bytes per page, u32 length and the layout, the slots, then the bytes;
+//! the answer is a status as above.
+//!
+//! Slots: u32 per page (0 when the source has none), then that many 32-byte
+//! hashes a page, page after page: each token's chained hash. A page's key
+//! names it, and a sequence goes on from the hash of its last token, so a
+//! worker that keeps a run it did not compute needs them.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -28,7 +33,7 @@ use tokio::sync::mpsc;
 const MAGIC: &[u8; 4] = b"PIEB";
 /// A put: pages to keep, by key.
 const PUT: &[u8; 4] = b"PIEP";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 /// More keys than one sequence could hold is not a request.
 const MAX_KEYS: u32 = 1 << 20;
 const SOCKET_BUFFER: usize = 16 << 20;
@@ -37,12 +42,14 @@ const RECV_CHUNK_BYTES: usize = 32 << 20;
 
 pub type Key = [u8; 32];
 
-/// Pages' bytes, back to back, and what the source says of their layout.
+/// Pages' bytes, back to back, what the source says of their layout, and
+/// their tokens' hashes, page after page (empty when it has none).
 #[derive(Debug, Clone, Default)]
 pub struct Pages {
     pub data: Vec<u8>,
     pub count: usize,
     pub meta: Vec<u8>,
+    pub slots: Vec<Key>,
 }
 
 impl Pages {
@@ -57,6 +64,8 @@ pub struct Stream {
     pub count: usize,
     pub page_bytes: usize,
     pub meta: Vec<u8>,
+    /// The pages' tokens' hashes, page after page (empty when none).
+    pub slots: Vec<Key>,
     pub chunks: mpsc::Receiver<Result<Vec<u8>, String>>,
 }
 
@@ -78,6 +87,7 @@ impl Stream {
             data,
             count: self.count,
             meta: self.meta,
+            slots: self.slots,
         })
     }
 
@@ -90,6 +100,7 @@ impl Stream {
             count: pages.count,
             page_bytes,
             meta: pages.meta,
+            slots: pages.slots,
             chunks,
         }
     }
@@ -108,6 +119,27 @@ pub trait Source: Send + Sync + 'static {
         let _ = (keys, pages);
         Box::pin(async { Err("this worker keeps no pages it is sent".to_string()) })
     }
+}
+
+/// The slots as the link carries them: per page, then the hashes.
+fn put_slots(out: &mut Vec<u8>, slots: &[Key], count: usize) {
+    let per_page = slots.len().checked_div(count).unwrap_or(0);
+    out.extend_from_slice(&(per_page as u32).to_le_bytes());
+    for slot in slots {
+        out.extend_from_slice(slot);
+    }
+}
+
+async fn read_slots(stream: &mut TcpStream, count: usize) -> std::io::Result<Vec<Key>> {
+    let per_page = stream.read_u32_le().await? as usize;
+    if per_page > 1 << 16 {
+        return Err(std::io::Error::other("too many slots a page"));
+    }
+    let mut slots = vec![[0u8; 32]; per_page * count];
+    for slot in &mut slots {
+        stream.read_exact(slot).await?;
+    }
+    Ok(slots)
 }
 
 fn tune(stream: &TcpStream) {
@@ -161,10 +193,21 @@ async fn answer(mut stream: TcpStream, source: &dyn Source) -> std::io::Result<(
             let page_bytes = stream.read_u64_le().await? as usize;
             let mut meta = vec![0u8; stream.read_u32_le().await? as usize];
             stream.read_exact(&mut meta).await?;
-            let mut data = vec![0u8; page_bytes * keys.len()];
-            stream.read_exact(&mut data).await?;
             let count = keys.len();
-            let taken = source.write(keys, Pages { data, count, meta }).await;
+            let slots = read_slots(&mut stream, count).await?;
+            let mut data = vec![0u8; page_bytes * count];
+            stream.read_exact(&mut data).await?;
+            let taken = source
+                .write(
+                    keys,
+                    Pages {
+                        data,
+                        count,
+                        meta,
+                        slots,
+                    },
+                )
+                .await;
             let mut status = Vec::new();
             match taken {
                 Ok(()) => status.push(0),
@@ -187,6 +230,7 @@ async fn answer(mut stream: TcpStream, source: &dyn Source) -> std::io::Result<(
                 head.extend_from_slice(&(answer.page_bytes as u64).to_le_bytes());
                 head.extend_from_slice(&(answer.meta.len() as u32).to_le_bytes());
                 head.extend_from_slice(&answer.meta);
+                put_slots(&mut head, &answer.slots, answer.count);
                 stream.write_all(&head).await?;
                 let mut sent = 0usize;
                 while let Some(chunk) = answer.chunks.recv().await {
@@ -236,6 +280,7 @@ pub async fn fetch_stream(addr: &str, keys: &[Key], from: u32) -> Result<Stream,
     let page_bytes = stream.read_u64_le().await.map_err(io)? as usize;
     let mut meta = vec![0u8; stream.read_u32_le().await.map_err(io)? as usize];
     stream.read_exact(&mut meta).await.map_err(io)?;
+    let slots = read_slots(&mut stream, count).await.map_err(io)?;
     let (tx, chunks) = mpsc::channel(4);
     let total = count * page_bytes;
     let chunk = RECV_CHUNK_BYTES
@@ -272,6 +317,7 @@ pub async fn fetch_stream(addr: &str, keys: &[Key], from: u32) -> Result<Stream,
         count,
         page_bytes,
         meta,
+        slots,
         chunks,
     })
 }
@@ -294,6 +340,7 @@ pub async fn put(addr: &str, keys: &[Key], pages: &Pages) -> Result<(), String> 
     head.extend_from_slice(&(pages.page_bytes() as u64).to_le_bytes());
     head.extend_from_slice(&(pages.meta.len() as u32).to_le_bytes());
     head.extend_from_slice(&pages.meta);
+    put_slots(&mut head, &pages.slots, pages.count);
     stream.write_all(&head).await.map_err(io)?;
     stream.write_all(&pages.data).await.map_err(io)?;
     if stream.read_u8().await.map_err(io)? == 0 {
@@ -324,6 +371,11 @@ mod tests {
                 }
                 let (tx, chunks) = mpsc::channel(2);
                 let count = keys.len() - from as usize;
+                // Two slots a page, each the page's key.
+                let slots = keys[from as usize..]
+                    .iter()
+                    .flat_map(|key| [*key, *key])
+                    .collect();
                 tokio::spawn(async move {
                     for key in &keys[from as usize..] {
                         let _ = tx.send(Ok(key.to_vec())).await;
@@ -333,6 +385,7 @@ mod tests {
                     count,
                     page_bytes: 32,
                     meta: b"echo".to_vec(),
+                    slots,
                     chunks,
                 })
             })
@@ -348,6 +401,7 @@ mod tests {
             data: vec![7u8; 64],
             count: 2,
             meta: Vec::new(),
+            slots: vec![[9u8; 32]; 4],
         };
         let refused = put(&addr, &[[1u8; 32], [2u8; 32]], &pages)
             .await
@@ -369,6 +423,7 @@ mod tests {
         assert_eq!(&pages.data[..32], &[2u8; 32]);
         assert_eq!(&pages.data[32..], &[3u8; 32]);
         assert_eq!(pages.meta, b"echo");
+        assert_eq!(pages.slots, [[2u8; 32], [2u8; 32], [3u8; 32], [3u8; 32]]);
         assert_eq!(fetch(&addr, &keys, 9).await.unwrap_err(), "past the run");
     }
 }
