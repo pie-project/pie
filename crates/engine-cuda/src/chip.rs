@@ -620,6 +620,7 @@ mod tests {
                         bf16_mma_until: defaults.bf16_mma_until,
                         selected_mma: defaults.selected_mma,
                         gemm_fp8_gemv_until: defaults.gemm_fp8_gemv_until,
+                        mla_dense_short: defaults.mla_dense_short,
                         ..tuning
                     },
                     defaults,

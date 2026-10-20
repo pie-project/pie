@@ -26,6 +26,9 @@ sdpa.merge_warp = true
 # Selected (sparse) attention on the tensor cores, a kv head's query group a
 # walk: Qwen3.8-Flash-Next's miniature 11% less GPU time at 64.
 sdpa.selected_mma = true
+# A selected MLA row that sees no more keys than its selection holds reads
+# them dense, in order (GLM-5.3-Flash's miniature +4% at 64).
+sdpa.mla_dense_short = true
 # DeepSeek-V4's attention: pool on mma.sync, decode up to 64 in one launch.
 sdpa.pool_mma = true
 sdpa.dsv4_decode_until = 64
