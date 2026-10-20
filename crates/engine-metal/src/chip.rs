@@ -400,7 +400,14 @@ mod tests {
                 profile::Source::Seeded("apple9/apple-m4-pro.toml".into())
             ]
         );
-        assert_eq!(report.measured, ["kernel.ane.mlp", "kernel.qmm_splitk"]);
+        assert_eq!(
+            report.measured,
+            [
+                "kernel.ane.mlp",
+                "kernel.moe.tile_rows",
+                "kernel.qmm_splitk"
+            ]
+        );
         assert!(!report.untuned());
         assert_eq!(*profile.get::<AneMlp>(), AneMlp::Share { percent: 74 });
         assert_eq!(*profile.get::<AneProjections>(), AneProjections::Gpu);

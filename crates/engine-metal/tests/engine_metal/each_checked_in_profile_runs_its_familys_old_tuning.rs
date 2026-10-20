@@ -36,6 +36,14 @@ fn old_tile(family: u32, pairs: u32, experts: u32) -> u32 {
     }
 }
 
+/// The M4 Pro's measured routed tile: 16 rows below 48 pairs an expert.
+fn m4_pro_tile(family: u32, pairs: u32, experts: u32) -> u32 {
+    match old_tile(family, pairs, experts) {
+        32 if pairs / experts < 48 => 16,
+        tile => tile,
+    }
+}
+
 /// The kernel the old cascade in `act_x_wt_over` ran a dense matmul on.
 fn old_qmm(family: u32, at: &QmmAt) -> Qmm {
     let (fp16_from, crossover_tg, mpp, ..) = old(family);
@@ -112,6 +120,7 @@ fn assert_old_tuning(
     fill_tg: u32,
     mlp: Option<AneMlp>,
     projections: Option<AneProjections>,
+    tile: fn(u32, u32, u32) -> u32,
 ) {
     let (profile, report) = chip::resolve(device, &chip::facts(family, cores, 10, true), None);
     assert_eq!(
@@ -159,7 +168,7 @@ fn assert_old_tuning(
         for pairs in [0, 1, 7, 8, 64, 255, 256, 2048, 4096, 8191, 8192, 65_536] {
             assert_eq!(
                 t.moe_tile_rows(pairs, experts),
-                old_tile(family, pairs, experts),
+                tile(family, pairs, experts),
                 "{device}: {pairs} pairs over {experts} experts"
             );
         }
@@ -224,12 +233,12 @@ fn assert_old_tuning(
 #[test]
 fn each_checked_in_profile_runs_its_familys_old_tuning() {
     for &(family, device, cores) in CHIPS {
-        assert_old_tuning(device, family, cores, 512, None, None);
+        assert_old_tuning(device, family, cores, 512, None, None, old_tile);
     }
 }
 
 #[test]
-fn the_m4_pro_runs_its_family_and_the_two_values_it_measured() {
+fn the_m4_pro_runs_its_family_and_the_three_values_it_measured() {
     assert_old_tuning(
         "Apple M4 Pro",
         9,
@@ -237,9 +246,17 @@ fn the_m4_pro_runs_its_family_and_the_two_values_it_measured() {
         896,
         Some(AneMlp::Share { percent: 74 }),
         Some(AneProjections::Gpu),
+        m4_pro_tile,
     );
     let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(9, Some(20), 10, true), None);
-    assert_eq!(report.measured, ["kernel.ane.mlp", "kernel.qmm_splitk"]);
+    assert_eq!(
+        report.measured,
+        [
+            "kernel.ane.mlp",
+            "kernel.moe.tile_rows",
+            "kernel.qmm_splitk"
+        ]
+    );
 }
 
 #[test]

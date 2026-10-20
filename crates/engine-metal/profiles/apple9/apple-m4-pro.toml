@@ -4,10 +4,13 @@ api = 1
 device = "Apple M4 Pro"
 
 [provenance]
-measured = ["kernel.qmm_splitk", "kernel.ane.mlp"]
+measured = ["kernel.qmm_splitk", "kernel.ane.mlp", "kernel.moe.tile_rows"]
 
 [kernel]
 qmm_splitk      = { use = "fill", fill_tg = 896, max = 8 }
 ane.mlp         = [{ when = "ane", use = "share", percent = 74 }, "gpu"]
 ane.projections = "gpu"
 ane.min_rows    = 512
+# a 512-token prompt over Gemma 4 26B-A4B routes about 33 rows an expert: a 32-row tile
+# runs most experts half empty, as MLX's 16-row gather tile does not
+moe.tile_rows   = [{ when = "per_expert < 2", value = 1 }, { when = "per_expert >= 48", value = 32 }, { value = 16 }]
