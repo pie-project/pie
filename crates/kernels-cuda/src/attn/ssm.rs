@@ -1306,6 +1306,8 @@ pub fn gated_delta_chunked(
     let _ = z;
     dtype_dispatch!(OP, qkv.data.dtype, { Bf16 => () });
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
+    // A short fire (a verify, a fold) scans its rows in order instead.
+    let scan = y.rows <= ctx.tuning().ssm_gdn_scan_until;
     if y.dtype == Dtype::Bf16 {
         // Narrowed for its gated norm: the tcgen05 walk lands bf16 itself;
         // any other walk lands f32 in a plane, cast after.
@@ -1315,6 +1317,7 @@ pub fn gated_delta_chunked(
         if k_dim == 128
             && v_dim == 128
             && !SERIAL_SCAN.with(core::cell::Cell::get)
+            && !scan
             && gated_delta_chunked_tc5(ctx, OP, &shape, qkv, gates, state, y)?
         {
             return Ok(());
@@ -1341,7 +1344,8 @@ pub fn gated_delta_chunked(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;
-    let wide = k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get);
+    let wide =
+        k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get) && !scan;
     #[cfg(feature = "cuda")]
     if wide && gated_delta_chunked_tc5(ctx, OP, &shape, qkv, gates, state, y)? {
         return Ok(());

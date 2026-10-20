@@ -427,6 +427,12 @@ pub enum MlaPath {
 #[decision(id = "kernel.qmm.gemm_from", constant(range(1..=4096)), default = 16, tune = search)]
 pub struct QmmGemmFrom(pub u32);
 
+/// The rows from which a tiled four-bit decode point multiplies on the
+/// tensor cores (`gemv_affine_tiled_mma`); below, on the CUDA cores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.qmm.gemv_mma_from", constant(range(1..=17)), default = 2, tune = search)]
+pub struct QmmGemvMmaFrom(pub u32);
+
 /// The fewest rows the tiled quantised GEMM takes its long tile (64 x 128,
 /// 2 stages) for; fewer take the short one (32 x 128, 4 stages).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -518,6 +524,14 @@ pub struct SsmGdnFusedScan;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.ssm.gdn_tc5", flag, default = false, tune = search)]
 pub struct SsmGdnTc5;
+
+/// The fire rows up to which a gated delta fire runs the sequential scan
+/// (`ssm_gated_delta_chunked_batched_fla`) over the chunked walk: a verify's
+/// or a fold's handful of rows barely fill a chunk, and the scan reads each
+/// lane's state once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_scan_until", constant(range(0..=4096)), default = 32, tune = search)]
+pub struct SsmGdnScanUntil(pub u32);
 
 /// Whether the row kernels a prefill streams run their bandwidth-shaped
 /// forms: a 128- or 256-wide RMS norm a warp a row (per head or whole), a
@@ -638,6 +652,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemvSplitkMaxN>()
         .add::<MlaPath>()
         .add::<QmmGemmFrom>()
+        .add::<QmmGemvMmaFrom>()
         .add::<QmmLongRows>()
         .add::<QmmSplitWarpsPerSm>()
         .add::<QmmSplitThinMax>()
@@ -659,6 +674,7 @@ pub fn register(registry: &mut Registry) {
         .add::<Dsv4DecodeUntil>()
         .add::<SsmGdnFusedScan>()
         .add::<SsmGdnTc5>()
+        .add::<SsmGdnScanUntil>()
         .add::<ElemwiseRowsVec>()
         .add::<ElemwiseHcTile>()
         .add::<ElemwiseHcMma>()
@@ -757,6 +773,7 @@ tuning! {
     /// `kernel.mla.path = naive`.
     mla_naive: bool = false, is MlaPath::Naive;
     qmm_gemm_from: u32 = 16, get QmmGemmFrom;
+    qmm_gemv_mma_from: u32 = 2, get QmmGemvMmaFrom;
     qmm_long_rows: u32 = 512, get QmmLongRows;
     qmm_split_warps_per_sm: u32 = 58, get QmmSplitWarpsPerSm;
     qmm_split_thin_max: u32 = 32, get QmmSplitThinMax;
@@ -778,6 +795,7 @@ tuning! {
     dsv4_decode_until: u32 = 0, get Dsv4DecodeUntil;
     ssm_gdn_fused_scan: bool = false, on SsmGdnFusedScan;
     ssm_gdn_tc5: bool = false, on SsmGdnTc5;
+    ssm_gdn_scan_until: u32 = 32, get SsmGdnScanUntil;
     rows_vec: bool = false, on ElemwiseRowsVec;
     hc_tile: bool = false, on ElemwiseHcTile;
     hc_mma: bool = false, on ElemwiseHcMma;

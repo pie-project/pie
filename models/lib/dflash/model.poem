@@ -47,10 +47,12 @@ def selector(rank, top_k):
 def markov(rank, top_k):
     return struct(kind = "markov", rank = rank, top_k = top_k)
 
-def declare(head, prefix, hidden, vocab, norm_eps, w, dense):
+def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
     """The drafter `head` describes, its weights under `prefix`, over a
     trunk of `hidden` and `vocab` whose norms take `norm_eps`, its banks
-    stored as `w` and its vectors as `dense`."""
+    stored as `w` (its blocks' projections as `blocks_w`, when given) and its
+    vectors as `dense`."""
+    bw = blocks_w if blocks_w != None else w
     n = lambda s: "{}.{}".format(prefix, s)
     dq, dkv, hd = head.q_heads, head.kv_heads, head.head_dim
     inter = head.inter
@@ -83,10 +85,10 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense):
                 rotary_dim = hd,
                 theta = head.theta,
                 sm_scale = f32(1.0 / f32(sqrt(hd))),
-                q_proj = weight(b("q_proj"), [dq * hd, hidden], w).columns(),
-                k_proj = weight(b("k_proj"), [dkv * hd, hidden], w).columns(heads = dkv),
-                v_proj = weight(b("v_proj"), [dkv * hd, hidden], w).columns(heads = dkv),
-                o_proj = weight(b("o_proj"), [hidden, dq * hd], w).rows(),
+                q_proj = weight(b("q_proj"), [dq * hd, hidden], bw).columns(),
+                k_proj = weight(b("k_proj"), [dkv * hd, hidden], bw).columns(heads = dkv),
+                v_proj = weight(b("v_proj"), [dkv * hd, hidden], bw).columns(heads = dkv),
+                o_proj = weight(b("o_proj"), [hidden, dq * hd], bw).rows(),
                 q_norm = weight(b("q_norm"), [hd], dense),
                 q_norm_eps = norm_eps,
                 k_norm = weight(b("k_norm"), [hd], dense),
@@ -100,8 +102,8 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense):
             mlp_norm = weight(b("mlp_norm"), [hidden], dense),
             mlp_norm_eps = norm_eps,
             mlp = struct(
-                gate_up = weight(b("gate_up"), [2 * inter, hidden], w).packed([inter, inter]),
-                down = weight(b("down"), [hidden, inter], w).rows(),
+                gate_up = weight(b("gate_up"), [2 * inter, hidden], bw).packed([inter, inter]),
+                down = weight(b("down"), [hidden, inter], bw).rows(),
                 inter = inter,
             ),
             window = window,
