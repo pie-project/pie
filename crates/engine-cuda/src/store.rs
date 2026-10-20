@@ -501,6 +501,22 @@ struct HostKv {
     row_bytes: u64,
 }
 
+/// `bytes` pinned on reserved huge pages, where the host's pool holds them.
+#[cfg(target_os = "linux")]
+fn huge_tier(bytes: usize) -> Option<crate::device::Pinned> {
+    let pinned = crate::device::Pinning::huge(bytes)?.lock().ok()?;
+    eprintln!(
+        "engine-cuda: the host kv tier ({} MiB) is pinned on reserved huge pages",
+        bytes >> 20
+    );
+    Some(pinned)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn huge_tier(_bytes: usize) -> Option<crate::device::Pinned> {
+    None
+}
+
 /// A group a tap reads a host slot's planes in: its layer, its planes (of
 /// the paged planes, in a slot's order), and their spans `(offset, bytes)`
 /// of a slot.
@@ -1559,7 +1575,12 @@ impl Pools {
     }
 
     /// Pins `pages` host kv pages, `window_pages` host windowed pages and
-    /// `rows` host rs rows of `row_bytes`, in that order.
+    /// `rows` host rs rows of `row_bytes`, in that order: on reserved huge
+    /// pages where the host keeps a pool that holds them. The tier is most
+    /// of what a worker pins, and when a process dies the driver unpins its
+    /// memory under a lock every process on the host waits on for any
+    /// allocation, about 0.17 s a GiB of 4 KiB pages and a fifth of that of
+    /// huge ones.
     pub fn seat_host(
         &mut self,
         pages: u32,
@@ -1573,7 +1594,9 @@ impl Pools {
             + u64::from(rows) * row_bytes;
         self.host = (bytes > 0)
             .then(|| {
-                crate::device::Pinned::mapped_uninit(usize::try_from(bytes).unwrap_or(usize::MAX))
+                let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+                huge_tier(bytes)
+                    .map_or_else(|| crate::device::Pinned::mapped_uninit(bytes), Ok)
                     .map(|buffer| HostKv {
                         buffer,
                         pages,

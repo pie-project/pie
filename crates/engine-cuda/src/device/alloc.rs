@@ -681,6 +681,34 @@ pub struct Pinning {
 unsafe impl Send for Pinning {}
 
 impl Pinning {
+    /// `bytes` (rounded up to whole 2 MiB pages) from the kernel's reserved
+    /// huge pages (`vm.nr_hugepages`), or `None` when the pool cannot hold
+    /// them: reserved pages are set aside whole, so this never compacts, and
+    /// their unpinning when the process dies holds the driver's lock a fifth
+    /// as long as 4 KiB pages'.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn huge(bytes: usize) -> Option<Pinning> {
+        const HUGE_PAGE: usize = 2 << 20;
+        let bytes = bytes.max(1).next_multiple_of(HUGE_PAGE);
+        // SAFETY: a fresh private anonymous mapping of a stated length from
+        // the huge page pool; no fd, no offset, owned by nobody else.
+        let at = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
+                -1,
+                0,
+            )
+        };
+        (at != libc::MAP_FAILED).then(|| Pinning {
+            host: at.cast(),
+            bytes,
+        })
+    }
+
     pub fn uninit(bytes: usize) -> Result<Pinning> {
         let Some(at) = map_anon(bytes) else {
             return Err(Fault::Device {
