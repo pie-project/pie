@@ -337,4 +337,3 @@ fn the_w8a16_projections_answer_the_dot() {
         b.check(y.ptr, &want, TOL, &format!("W8A16 in {gran}s, {m}x{n}x{k}"));
     }
 }
-

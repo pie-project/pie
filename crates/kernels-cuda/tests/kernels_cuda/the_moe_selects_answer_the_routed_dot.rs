@@ -411,4 +411,3 @@ fn the_w8a16_selects_answer_the_routed_dot() {
         b.check(y.ptr, &want, TOL, &what);
     }
 }
-
