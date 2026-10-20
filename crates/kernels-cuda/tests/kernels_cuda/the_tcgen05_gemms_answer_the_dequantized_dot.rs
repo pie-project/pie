@@ -273,6 +273,38 @@ fn the_tcgen05_gemm_answers_the_dequantized_dot_every_case() {
 }
 
 #[test]
+fn a_swapped_contiguous_group_of_scaled_rows_refuses_a_q_tile_past_64() {
+    if !supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
+    // An expert's rows start on a 64-row boundary; a wider Q tile reads
+    // the next 128-row scale atom unmapped (96 and 128 faulted on B200).
+    let b = Bench::new(0x64);
+    let nv = Operand::scaled(0, NV.0, 0, 16);
+    #[rustfmt::skip]
+    let g = Grouped { experts: 8, groups: Groups::Contiguous { offsets: 0, rows: 0, cap: 0 }, alpha_e: 0 };
+    let fire = |bn| {
+        grouped_gemm_epi_with(
+            &b.ctx(),
+            nv,
+            nv,
+            0,
+            g,
+            [256, 512],
+            1.0,
+            Epilogue::STORE,
+            p(true, false, bn, 1).expect("a plan"),
+        )
+    };
+    for bn in [96, 128, 256] {
+        assert!(fire(bn).is_err(), "a {bn}-row Q tile is admitted");
+    }
+    // 64 is admitted (no rows, so nothing launches).
+    fire(64).expect("a 64-row Q tile is admitted");
+}
+
+#[test]
 fn a_dependent_gemm_reads_what_its_producer_landed() {
     if !supported() {
         eprintln!("skipped: no tcgen05 on this device");

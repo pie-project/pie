@@ -841,6 +841,15 @@ pub fn grouped_gemm_epi_with(
                     "a swapped contiguous group of scaled rows takes Q tiles of 64 rows or more",
                 ));
             }
+            // A wider one at an expert's odd 64-row start reaches into the
+            // next 128-row scale atom its one mapped atom block does not
+            // hold (96 and 128 fault on B200).
+            if swap && act.scales.is_some() && plan.bn > GROUP_ALIGN {
+                return Err(refuse(
+                    OP,
+                    "a swapped contiguous group of scaled rows takes Q tiles of 64 rows or fewer",
+                ));
+            }
             if rows == 0 {
                 return Ok(());
             }

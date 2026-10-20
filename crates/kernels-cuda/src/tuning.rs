@@ -109,6 +109,21 @@ pub struct GemmSplitLaunchFrom(pub u32);
 #[decision(id = "kernel.moe.w4a4_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct MoeW4a4FusedFrom(pub u32);
 
+/// The most routes an expert on average a W4A4 routed MLP's legs run swapped
+/// with (a thread a weight row, the routes on the Q tile); past it they run
+/// grouped. 64 (GLM-5.3's experts, measured) but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.w4a4_swapped_routes", constant(range(0..=4096)), default = 64, tune = search)]
+pub struct MoeW4a4SwappedRoutes(pub u32);
+
+/// The Q tile of a swapped W4A4 leg whose fused layout states every expert's
+/// rows the fire's 32 tokens or fewer: 32 but where a chip's profile says.
+/// Any other swapped leg takes 64 (a scaled contiguous group's tile neither
+/// narrower nor wider).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.w4a4_swap_bn_narrow", constant(set(32, 64)), default = 32, tune = search)]
+pub struct MoeW4a4SwapBnNarrow(pub u32);
+
 /// The fewest rows the fused qkv norm, rotation and KV write takes a block a
 /// row (a warp a head below): 64 but where a chip's profile says (B200's,
 /// where 64 decode rows' blocks leave most SMs idle).
@@ -684,6 +699,8 @@ pub fn register(registry: &mut Registry) {
         .add::<AttnResFusedNorm>()
         .add::<SsmKdaChunked>()
         .add::<MoeW4a4FusedLayout>()
+        .add::<MoeW4a4SwappedRoutes>()
+        .add::<MoeW4a4SwapBnNarrow>()
         .add::<AttnQkvRowsFrom>()
         .add::<SsmKdaStepFused>()
         .add::<GemmSplitLaunchNs>()
@@ -803,6 +820,8 @@ tuning! {
     attn_res_fused_norm: bool = false, on AttnResFusedNorm;
     ssm_kda_chunked: bool = false, on SsmKdaChunked;
     moe_w4a4_fused_layout: bool = false, on MoeW4a4FusedLayout;
+    moe_w4a4_swapped_routes: u32 = 64, get MoeW4a4SwappedRoutes;
+    moe_w4a4_swap_bn_narrow: u32 = 32, get MoeW4a4SwapBnNarrow;
     qkv_rows_from: u32 = 64, get AttnQkvRowsFrom;
     ssm_kda_step_fused: bool = false, on SsmKdaStepFused;
     gemm_split_launch_ns: u32 = 0, get GemmSplitLaunchNs;
