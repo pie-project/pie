@@ -34,6 +34,9 @@ pub struct PageStream {
     /// The pages' tokens' hashes, page after page; empty when the source
     /// has none.
     pub slots: Vec<Hash256>,
+    /// The groups (spans of a page) the chunks are parts of, each chunk one
+    /// `transport::tcp::part`; empty: whole pages.
+    pub groups: Vec<Vec<(u64, u64)>>,
     pub chunks: tokio::sync::mpsc::Receiver<std::result::Result<Vec<u8>, String>>,
 }
 
@@ -517,6 +520,9 @@ async fn land(
     if n == 0 {
         return Ok(());
     }
+    if !stream.groups.is_empty() {
+        bail!("pages sent a part at a time are laid back out before they land");
+    }
     // Pages another layout holds (another split across ranks) are laid out
     // as this engine holds them, a chunk at a time.
     let to = crate::scheduler::host_kv_layout(engine).await;
@@ -837,6 +843,7 @@ async fn export(
         page_bytes,
         layout,
         slots: hashes,
+        groups: Vec::new(),
         chunks,
     })
 }

@@ -83,12 +83,14 @@ impl runtime::offload::directory::Remote for Clients {
         Box::pin(async move {
             let stream = transport::tcp::fetch_stream(&addr, &keys, from)
                 .await
+                .and_then(transport::tcp::Stream::paged)
                 .map_err(|why| anyhow::anyhow!("fetching pages: {why}"))?;
             Ok(runtime::offload::prefill::PageStream {
                 count: stream.count,
                 page_bytes: stream.page_bytes,
                 layout: serde_json::from_slice(&stream.meta).ok(),
                 slots: stream.slots,
+                groups: stream.groups,
                 chunks: stream.chunks,
             })
         })
@@ -118,6 +120,7 @@ impl transport::tcp::Source for Source {
                     .and_then(|layout| serde_json::to_vec(layout).ok())
                     .unwrap_or_default(),
                 slots: pages.slots,
+                groups: pages.groups,
                 chunks: pages.chunks,
             })
         })
@@ -510,6 +513,7 @@ async fn push(pool: &str, run: &[[u8; 32]], from: usize) -> Result<usize> {
         page_bytes: stream.page_bytes,
         meta,
         slots: stream.slots,
+        groups: stream.groups,
         chunks: stream.chunks,
     }
     .collect()
