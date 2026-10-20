@@ -475,9 +475,9 @@ pub struct Pools {
     buffered: (u64, u64),
     host: Option<HostKv>,
     disk: Option<DiskKv>,
-    /// The kv planes were handed to another worker to read
-    /// ([`Pools::export_kv`]): committed whole, and never trimmed since.
-    kv_exported: bool,
+    /// Every declared page and slot is backed ([`Pools::back_whole`]), and
+    /// never trimmed since.
+    whole: bool,
 }
 
 /// The slot file kv is suspended into below host memory, and the pinned
@@ -706,7 +706,7 @@ impl Pools {
             buffered: (0, 1),
             host: None,
             disk: None,
-            kv_exported: false,
+            whole: false,
         })
     }
 
@@ -1498,21 +1498,44 @@ impl Pools {
         planes
     }
 
-    /// The kv planes as another worker reads them: every declared page
-    /// committed now and kept so (trim spares them), one region per paged
-    /// plane, a page `p` at `base + p * page_stride`. A windowed space is
-    /// refused: its pages are backed one at a time as fires first touch them.
+    /// Backs every page and slot the pools declare, at load, and keeps them
+    /// so (trim spares them): backing a page as a fire first touches it takes
+    /// the driver's lock, which a dying process on the host holds for
+    /// seconds, and a worker taking a dead peer's turns needs new pages then
+    /// above all.
+    pub fn back_whole(&mut self) -> Result<()> {
+        let pages = u32::try_from(self.paging.pages()).unwrap_or(u32::MAX);
+        let slots = if self.has_state() {
+            self.paging.slots
+        } else {
+            0
+        };
+        match self.commit_to(pages, slots)? {
+            Commit::Committed => {}
+            refusal => return Err(refuse(&self.pool, refusal)),
+        }
+        self.note_backed(&[(0, u64::from(pages))]);
+        self.ensure_windowed(0..self.paging.window_pages())?;
+        self.whole = true;
+        Ok(())
+    }
+
+    /// The kv planes as another worker reads them: every declared page, one
+    /// region per paged plane, a page `p` at `base + p * page_stride`. A
+    /// windowed space is refused: its pages are named by its own ring, not by
+    /// the kv pages a peer reads.
     pub fn export_kv(&mut self, ordinal: u32) -> Result<ExportedKv> {
         if !self.windowed_planes().is_empty() {
             return Err(Fault::Residency(
-                "a windowed kv space is backed a page at a time as fires first touch it, \
-                 so it cannot be handed whole to another worker"
+                "a windowed kv space names its pages by its own ring, so it cannot be \
+                 handed to another worker by the kv pages it reads"
                     .to_string(),
             ));
         }
+        if !self.whole {
+            self.back_whole()?;
+        }
         let pages = u32::try_from(self.paging.pages()).unwrap_or(u32::MAX);
-        self.ensure_kv(pages)?;
-        self.kv_exported = true;
         let mut regions = Vec::new();
         for (arena, page_bytes) in self.paged_planes() {
             let len = u64::from(pages) * page_bytes;
@@ -2442,6 +2465,9 @@ impl engine::frame::Supply for Pools {
     }
 
     fn trim(&mut self, hint: engine::frame::Demand) {
+        if self.whole {
+            return;
+        }
         let idle = self
             .airborne
             .as_ref()
@@ -2457,13 +2483,10 @@ impl engine::frame::Supply for Pools {
         if !self.trim_is_worth_the_unmap(hint) {
             return;
         }
-        // Exported planes stay as another worker registered them.
-        let kv_pages = if self.kv_exported {
-            self.committed_kv_pages
-        } else {
-            hint.kv_pages.min(self.committed_kv_pages)
-        };
-        self.release_to(kv_pages, hint.state_slots.min(self.committed_state_slots));
+        self.release_to(
+            hint.kv_pages.min(self.committed_kv_pages),
+            hint.state_slots.min(self.committed_state_slots),
+        );
     }
 }
 

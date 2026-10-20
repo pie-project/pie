@@ -275,6 +275,11 @@ impl Shell {
     /// ([`crate::store::Pools::export_kv`]). One rank's planes hold a band of
     /// each layer's heads, so a tensor-parallel load is refused until a
     /// handle carries every rank's.
+    /// [`crate::store::Pools::back_whole`].
+    pub fn back_whole(&mut self) -> Result<()> {
+        self.pools.back_whole()
+    }
+
     pub fn export_kv(&mut self, world: crate::World) -> Result<engine::KvHandle> {
         if world.size > 1 {
             return Err(Fault::Residency(
