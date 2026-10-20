@@ -566,7 +566,8 @@ pub struct SsmGdnOutBf16;
 #[decision(id = "kernel.ssm.gdn_step_blocks", constant(set(1, 2, 3, 4)), default = 4, tune = search)]
 pub struct SsmGdnStepBlocks(pub u32);
 
-/// Whether the per-route MXFP4 select (a decode's few routes an expert) runs
+/// Whether the per-route MXFP4 and NVFP4 selects (a decode's few routes an
+/// expert, and NVFP4's dense product) run
 /// lean: two-warp blocks, one code block a row in flight a lane, the codes
 /// widened by integer ops, no converts. Off but where a chip's profile turns
 /// it on (A100's).

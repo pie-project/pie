@@ -249,6 +249,7 @@ fn the_routed_selects_answer_the_routed_dot() {
         // NVFP4: by route, grouped, tcgen05, the register-dequant kernel and
         // its GLU.
         (K::Nv, d, [16, 3, 10, 640, 2560], t, None, 0),
+        (K::Nv, lean, [16, 3, 10, 640, 2560], t, None, 0),
         (K::Nv, d, [16, 48, 10, 200, 640], f, None, 0),
         (K::Nv, TC5, [16, 48, 10, 128, 640], t, None, 0),
         (K::Nv, nv_mma, [16, 2, 10, 256, 640], f, None, 0),
