@@ -253,6 +253,12 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Nv, nv_mma, [16, 48, 10, 320, 2560], t, sw, 0),
         (K::Nv, nv_mma, [16, 160, 10, 256, 640], t, None, 0),
         (K::Nv, nv_mma, [16, 120, 10, 320, 2560], t, sw, 0),
+        // Hopper's wgmma select of a 64-route slice (K whole 128s): a
+        // partial tile, scales past f16's range under a GLU, and a fire
+        // filling the card (its two stages).
+        (K::Nv, nv_mma, [8, 64, 8, 200, 1024], f, None, 0),
+        (K::MxBias, mma, [8, 80, 4, 192, 2816], t, alpha, 2),
+        (K::Nv, nv_mma, [8, 64, 8, 6144, 512], t, None, 0),
     ];
     // Off tcgen05 (Hopper) the arms its tunings name do not take the fire.
     cases.retain(|case| supported() || !(case.1.moe_tc5 || case.1.mxfp4_cvt));
@@ -494,6 +500,63 @@ fn bf16_select_rate() {
         eprintln!(
             "bf16 select {n}x{k}: {us:.1} us a fire, {:.0} GB/s of the bank",
             (experts * n * k * 2) as f64 / us / 1e3
+        );
+    }
+}
+
+/// The NVFP4 W4A16 select's rate at GLM-5.3-mini's decode shapes (eight
+/// experts, each of a C64 step's tokens on all eight): the GLU gate-up and
+/// the down projection.
+#[test]
+#[ignore = "a rate, not an answer"]
+fn nvfp4_select_rate() {
+    let (experts, tokens, top) = (8usize, 64usize, 8usize);
+    for (n, k, glu) in [(2048usize, 6144usize, true), (6144, 2048, false)] {
+        let rows = if glu { 2 * n } else { n };
+        let mut b = Bench::new(9);
+        let (x, _) = b.bf16(tokens * k);
+        let codes = b.up(&tab(experts * rows * k / 2, |i| (i * 37 % 251) as u8));
+        let scales = b.up(&tab(experts * rows * k / 16, |i| 0x30 + (i % 7) as u8));
+        let ts = b.up(&tab(experts * rows, |_| 0.01f32));
+        let routes = b.up(&tab(tokens * top, |i| (i % top) as i32));
+        let (xt, rt) = (t(x, tokens, k, Bf16), t(routes, tokens, top, I32));
+        let mut y = b.out(tokens * top, n);
+        let tuning = Tuning {
+            nvfp4_mma_until: 65_536,
+            nvfp4_mma_from: 1,
+            ..b.ctx().tuning()
+        };
+        let ctx = b.ctx().with_tuning(tuning);
+        let (c, s) = (
+            t(codes, experts, rows * k / 2, Nvfp4),
+            t(scales, experts, rows * k / 16, U8),
+        );
+        let tt = t(ts, experts, rows * 4, U8);
+        let fire = |y: &mut _| {
+            if glu {
+                let bank = GluBank::Nvfp4 {
+                    codes: c,
+                    scales: s,
+                    tensor_scales: tt,
+                };
+                moe::select_glu(&ctx, xt, bank, rt, y, Glu::Swiglu, RES).map(|_| ())
+            } else {
+                nvfp4::matmul_select(&ctx, xt, c, s, tt, rt, y, SEAT)
+            }
+        };
+        fire(&mut y).expect("fires");
+        b.sync();
+        let reps = 50;
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            fire(&mut y).expect("fires");
+        }
+        b.sync();
+        let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+        let flops = 2.0 * (tokens * top * rows * k) as f64;
+        eprintln!(
+            "nvfp4 select {rows}x{k}: {us:.1} us a fire, {:.0} TFLOP/s",
+            flops / us / 1e6
         );
     }
 }
