@@ -11,6 +11,9 @@ const CONV_GROUP: u32 = 256;
 /// running a whole 555-row prompt left most of the GPU idle.
 const CONV_RUN_ROWS: u32 = 16;
 
+/// The widest conv the four-channel prompt conv holds (`PIE_CONV_X4_TAPS`).
+const CONV_X4_TAPS: u32 = 8;
+
 const SCAN_WIDTH: u32 = 128;
 
 const GDN_SCAN_FILE: &str = "attn/ssm_gdn_scan.metal";
@@ -392,10 +395,16 @@ pub fn causal_conv1d_chunked_landing(
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     // A lane holds at most every row, so this many runs cover the longest.
     let runs = x.data.rows.div_ceil(CONV_RUN_ROWS);
+    // Four channels a thread where they divide the row and the taps fit.
+    let (entry, threads) = if channels.is_multiple_of(4) && conv_width <= CONV_X4_TAPS {
+        ("causal_conv1d_chunked_x4_bfloat16", channels / 4)
+    } else {
+        (entry, channels)
+    };
     ctx.fire(
         Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(Grid::of(
-            [channels, lanes, runs],
-            [channels.min(CONV_GROUP), 1, 1],
+            [threads, lanes, runs],
+            [threads.min(CONV_GROUP), 1, 1],
         )),
         &[
             x.data.arg(),

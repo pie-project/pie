@@ -33,12 +33,17 @@ inline float gdn_packed_dot(
   return (p.x + p.y) + (p.z + p.w);
 }
 
+// Row `at`'s inputs to a scan: its query and key, each l2-normed over the
+// head, the query scaled, its value rows, its decay and its beta.
 template <typename T, int LANES, int VROWS, int PER>
-inline void gdn_scan_token(
+inline void gdn_scan_row(
     const device T* qkv,
     const device float* gates,
-    device float* y,
-    thread float (&st)[VROWS][PER],
+    thread float (&q)[PER],
+    thread float (&k)[PER],
+    thread float (&vals)[VROWS],
+    thread float& decay,
+    thread float& beta,
     int at,
     int lane,
     int dv_base,
@@ -54,10 +59,7 @@ inline void gdn_scan_token(
   const size_t row = size_t(at) * pitch;
   const size_t qbase = row + size_t(hk) * size_t(dk);
   const size_t kbase = qbase + keys;
-  const size_t vbase = row + 2 * keys + size_t(hv) * size_t(dv);
 
-  float q[PER];
-  float k[PER];
   float qs = 0.0f;
   float ks = 0.0f;
   if constexpr (LANES == 8 && PER == 16) {
@@ -75,6 +77,8 @@ inline void gdn_scan_token(
       k[4*i+2] = kv.z;
       k[4*i+3] = kv.w;
     }
+    qs = gdn_packed_dot(q, q);
+    ks = gdn_packed_dot(k, k);
   } else {
     for (int i = 0; i < PER; ++i) {
       const int d = PER * lane + i;
@@ -86,23 +90,28 @@ inline void gdn_scan_token(
       ks += kv * kv;
     }
   }
-  if constexpr (LANES == 8 && PER == 16) {
-    qs = gdn_packed_dot(q, q);
-    ks = gdn_packed_dot(k, k);
-  }
   const float qinv = metal::rsqrt(gdn_row_sum<LANES>(qs) + 1e-6f) * scale;
   const float kinv = metal::rsqrt(gdn_row_sum<LANES>(ks) + 1e-6f);
   for (int i = 0; i < PER; ++i) {
     q[i] *= qinv;
     k[i] *= kinv;
   }
-
+  const size_t vbase = row + 2 * keys + size_t(hv) * size_t(dv);
+  for (int v = 0; v < VROWS; ++v) {
+    vals[v] = float(qkv[vbase + size_t(dv_base + v)]);
+  }
   const size_t fused = size_t(at) * 2 * size_t(v_heads) + size_t(hv);
-  const float decay = metal::exp(gates[fused]);
-  const float beta = gates[fused + size_t(v_heads)];
-  const size_t out = (size_t(at) * size_t(v_heads) + size_t(hv)) * size_t(dv);
+  decay = metal::exp(gates[fused]);
+  beta = gates[fused + size_t(v_heads)];
+}
 
-  float kv_mem[VROWS];
+// Decay the state and take each value row's memory, not yet reduced.
+template <int LANES, int VROWS, int PER>
+inline void gdn_scan_memory(
+    thread float (&st)[VROWS][PER],
+    const thread float (&k)[PER],
+    float decay,
+    thread float (&mem)[VROWS]) {
   for (int v = 0; v < VROWS; ++v) {
     float acc = 0.0f;
     for (int i = 0; i < PER; ++i) {
@@ -110,20 +119,63 @@ inline void gdn_scan_token(
       acc += st[v][i] * k[i];
     }
     if constexpr (LANES == 8 && PER == 16) acc = gdn_packed_dot(st[v], k);
-    kv_mem[v] = gdn_row_sum<LANES>(acc);
+    mem[v] = acc;
   }
+}
+
+// Fold the row in and take each value row's readout, not yet reduced; `mem`
+// is reduced.
+template <int LANES, int VROWS, int PER>
+inline void gdn_scan_update(
+    thread float (&st)[VROWS][PER],
+    const thread float (&k)[PER],
+    const thread float (&q)[PER],
+    const thread float (&vals)[VROWS],
+    const thread float (&mem)[VROWS],
+    float beta,
+    thread float (&out)[VROWS]) {
   for (int v = 0; v < VROWS; ++v) {
-    const float delta =
-        (float(qkv[vbase + size_t(dv_base + v)]) - kv_mem[v]) * beta;
+    const float delta = (vals[v] - mem[v]) * beta;
     float sum = 0.0f;
     for (int i = 0; i < PER; ++i) {
       st[v][i] += k[i] * delta;
       sum += st[v][i] * q[i];
     }
     if constexpr (LANES == 8 && PER == 16) sum = gdn_packed_dot(st[v], q);
-    sum = gdn_row_sum<LANES>(sum);
+    out[v] = sum;
+  }
+}
+
+// One row of a scan, in the arithmetic every scan of a layout shares.
+template <typename T, int LANES, int VROWS, int PER>
+inline void gdn_scan_token(
+    const device T* qkv,
+    const device float* gates,
+    device float* y,
+    thread float (&st)[VROWS][PER],
+    int at,
+    int lane,
+    int dv_base,
+    int hv,
+    int hk,
+    int k_heads,
+    int v_heads,
+    int dk,
+    int dv) {
+  float q[PER], k[PER], vals[VROWS], mem[VROWS], out[VROWS];
+  float decay, beta;
+  gdn_scan_row<T, LANES, VROWS, PER>(qkv, gates, q, k, vals, decay, beta, at, lane,
+                                     dv_base, hv, hk, k_heads, v_heads, dk, dv);
+  gdn_scan_memory<LANES, VROWS, PER>(st, k, decay, mem);
+  for (int v = 0; v < VROWS; ++v) {
+    mem[v] = gdn_row_sum<LANES>(mem[v]);
+  }
+  gdn_scan_update<LANES, VROWS, PER>(st, k, q, vals, mem, beta, out);
+  const size_t row_out = (size_t(at) * size_t(v_heads) + size_t(hv)) * size_t(dv);
+  for (int v = 0; v < VROWS; ++v) {
+    out[v] = gdn_row_sum<LANES>(out[v]);
     if (lane == 0) {
-      y[out + size_t(dv_base + v)] = sum;
+      y[row_out + size_t(dv_base + v)] = out[v];
     }
   }
 }
@@ -193,9 +245,42 @@ template <typename T, int LANES, int VROWS, int PER>
       snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + n) * 2 * PIE_RS_SNAPSHOTS : nullptr;
   int snapped = 0;
   int snap_at = snap != nullptr ? begin + snap[0] : -1;
+  if constexpr (LANES != 32) {
+    // A lane of 16 keys or more has no registers to spare for the next row.
+    for (int t = begin; t < end; ++t) {
+      gdn_scan_token<T, LANES, VROWS, PER>(
+          qkv, gates, y, st, t, lane, dv_base, hv, hk, k_heads, v_heads, dk, dv);
+      if (t + 1 == snap_at) {
+        gdn_store<VROWS, PER>(
+            gdn_cells<VROWS, PER>(rstate, snap[PIE_RS_SNAPSHOTS + snapped], hv, v_heads, dv_base,
+                                  dk, dv),
+            st, lane, dk);
+        ++snapped;
+        snap_at = snapped < PIE_RS_SNAPSHOTS && snap[snapped] > 0 ? begin + snap[snapped] : -1;
+      }
+    }
+    gdn_store<VROWS, PER>(cells, st, lane, dk);
+    return;
+  }
+  // Row t's readout and row t + 1's memory both read the state as row t
+  // leaves it, so one pass takes both and their reductions overlap, each
+  // with the arithmetic `gdn_scan_token` gives it; row t + 1's inputs load
+  // while row t updates.
+  float q[PER], k[PER], vals[VROWS], mem[VROWS], out[VROWS];
+  float decay, beta;
+  gdn_scan_row<T, LANES, VROWS, PER>(qkv, gates, q, k, vals, decay, beta, begin, lane,
+                                     dv_base, hv, hk, k_heads, v_heads, dk, dv);
+  gdn_scan_memory<LANES, VROWS, PER>(st, k, decay, mem);
+  for (int v = 0; v < VROWS; ++v) {
+    mem[v] = gdn_row_sum<LANES>(mem[v]);
+  }
   for (int t = begin; t < end; ++t) {
-    gdn_scan_token<T, LANES, VROWS, PER>(
-        qkv, gates, y, st, t, lane, dv_base, hv, hk, k_heads, v_heads, dk, dv);
+    const bool more = t + 1 < end;
+    float nq[PER], nk[PER], nvals[VROWS], ndecay, nbeta;
+    gdn_scan_row<T, LANES, VROWS, PER>(qkv, gates, nq, nk, nvals, ndecay, nbeta,
+                                       more ? t + 1 : t, lane, dv_base, hv, hk, k_heads,
+                                       v_heads, dk, dv);
+    gdn_scan_update<LANES, VROWS, PER>(st, k, q, vals, mem, beta, out);
     if (t + 1 == snap_at) {
       gdn_store<VROWS, PER>(
           gdn_cells<VROWS, PER>(rstate, snap[PIE_RS_SNAPSHOTS + snapped], hv, v_heads, dv_base,
@@ -204,6 +289,28 @@ template <typename T, int LANES, int VROWS, int PER>
       ++snapped;
       snap_at = snapped < PIE_RS_SNAPSHOTS && snap[snapped] > 0 ? begin + snap[snapped] : -1;
     }
+    if (more) {
+      gdn_scan_memory<LANES, VROWS, PER>(st, nk, ndecay, mem);
+    }
+    const size_t row_out = (size_t(t) * size_t(v_heads) + size_t(hv)) * size_t(dv);
+    for (int v = 0; v < VROWS; ++v) {
+      if (more) {
+        mem[v] = gdn_row_sum<LANES>(mem[v]);
+      }
+      out[v] = gdn_row_sum<LANES>(out[v]);
+      if (lane == 0) {
+        y[row_out + size_t(dv_base + v)] = out[v];
+      }
+    }
+    for (int i = 0; i < PER; ++i) {
+      q[i] = nq[i];
+      k[i] = nk[i];
+    }
+    for (int v = 0; v < VROWS; ++v) {
+      vals[v] = nvals[v];
+    }
+    decay = ndecay;
+    beta = nbeta;
   }
   gdn_store<VROWS, PER>(cells, st, lane, dk);
 }
