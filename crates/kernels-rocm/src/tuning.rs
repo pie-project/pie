@@ -213,6 +213,23 @@ pub struct DenseBatchWeightMi(pub u32);
 #[decision(id = "kernel.dense.batch_weight_max_mi", constant(range(0..=65_536)), default = 192, tune = search)]
 pub struct DenseBatchWeightMaxMi(pub u32);
 
+/// The rows up to which MLA's query absorb (`q_nope · W_UK`, per head)
+/// takes the native kernel (`attn/mla.hip` `mla_absorb`) over rocBLAS's
+/// strided batch; 0, never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.mla.absorb_q_until", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct MlaAbsorbQUntil(pub u32);
+
+/// The rows from which, and up to which, MLA's value absorb (`latent ·
+/// W_UVᵀ`, per head) takes the native kernel; until 0, never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.mla.absorb_out_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct MlaAbsorbOutFrom(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.mla.absorb_out_until", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct MlaAbsorbOutUntil(pub u32);
+
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
@@ -250,7 +267,10 @@ pub fn register(registry: &mut Registry) {
         .add::<DenseBatchFrom>()
         .add::<DenseBatchUntil>()
         .add::<DenseBatchWeightMi>()
-        .add::<DenseBatchWeightMaxMi>();
+        .add::<DenseBatchWeightMaxMi>()
+        .add::<MlaAbsorbQUntil>()
+        .add::<MlaAbsorbOutFrom>()
+        .add::<MlaAbsorbOutUntil>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -292,6 +312,9 @@ pub struct Tuning {
     pub dense_batch_until: u32,
     pub dense_batch_weight_mi: u32,
     pub dense_batch_weight_max_mi: u32,
+    pub mla_absorb_q_until: u32,
+    pub mla_absorb_out_from: u32,
+    pub mla_absorb_out_until: u32,
     /// DeepSeek's fused prefill pass and bounded replay, CUDA's decisions:
     /// never on ROCm.
     pub dsv4_prefill_from: u32,
@@ -337,6 +360,9 @@ impl Tuning {
         dense_batch_until: 16,
         dense_batch_weight_mi: 128,
         dense_batch_weight_max_mi: 192,
+        mla_absorb_q_until: 0,
+        mla_absorb_out_from: 0,
+        mla_absorb_out_until: 0,
         dsv4_prefill_from: 0,
         dsv4_replay: false,
     };
@@ -380,6 +406,9 @@ impl Tuning {
             dense_batch_until: profile.get::<DenseBatchUntil>().0,
             dense_batch_weight_mi: profile.get::<DenseBatchWeightMi>().0,
             dense_batch_weight_max_mi: profile.get::<DenseBatchWeightMaxMi>().0,
+            mla_absorb_q_until: profile.get::<MlaAbsorbQUntil>().0,
+            mla_absorb_out_from: profile.get::<MlaAbsorbOutFrom>().0,
+            mla_absorb_out_until: profile.get::<MlaAbsorbOutUntil>().0,
             dsv4_prefill_from: 0,
             dsv4_replay: false,
         }

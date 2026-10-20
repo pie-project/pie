@@ -772,67 +772,78 @@ fn absorb_into_and_out_of_the_latent() {
     // rank wide. q_nope · W_k gives the latent query; latent · W_vᵀ the
     // head's output.
     let Some(gpu) = Gpu::open() else { return };
-    let ctx = gpu.ctx();
-    let (tokens, heads, nope, v, rank) = (3usize, 4usize, 192usize, 256usize, 512usize);
-    let kvb: Vec<f32> = values(heads * (nope + v) * rank, 31, 0.1)
-        .into_iter()
-        .map(round_bf16)
-        .collect();
-    let qn: Vec<f32> = values(tokens * heads * nope, 32, 1.0)
-        .into_iter()
-        .map(round_bf16)
-        .collect();
-    let lat: Vec<f32> = values(tokens * heads * rank, 33, 1.0)
-        .into_iter()
-        .map(round_bf16)
-        .collect();
-    let kv_b = gpu.tensor(&kvb, (heads * (nope + v)) as u32, rank as u32, Dtype::Bf16);
-    let mut q_latent = gpu.zeros(tokens as u32, (heads * rank) as u32, Dtype::Bf16);
-    mla::absorb_q(
-        &ctx,
-        gpu.tensor(&qn, tokens as u32, (heads * nope) as u32, Dtype::Bf16),
-        kv_b,
-        heads as u32,
-        rank as u32,
-        nope as u32,
-        v as u32,
-        &mut q_latent,
-    )
-    .unwrap();
-    let mut o = gpu.zeros(tokens as u32, (heads * v) as u32, Dtype::Bf16);
-    mla::absorb_out(
-        &ctx,
-        gpu.tensor(&lat, tokens as u32, (heads * rank) as u32, Dtype::Bf16),
-        kv_b,
-        heads as u32,
-        rank as u32,
-        v as u32,
-        nope as u32,
-        &mut o,
-    )
-    .unwrap();
-    let (gq, go) = (gpu.read(&q_latent), gpu.read(&o));
-    let w = |h: usize, row: usize, col: usize| f64::from(kvb[(h * (nope + v) + row) * rank + col]);
-    for t in 0..tokens {
-        for h in 0..heads {
-            let want: Vec<f32> = (0..rank)
-                .map(|i| {
-                    (0..nope)
-                        .map(|k| f64::from(qn[(t * heads + h) * nope + k]) * w(h, k, i))
-                        .sum::<f64>() as f32
-                })
-                .collect();
-            let at = (t * heads + h) * rank;
-            close_rows("absorb_q", &gq[at..at + rank], &want, 1e-2);
-            let want: Vec<f32> = (0..v)
-                .map(|j| {
-                    (0..rank)
-                        .map(|r| f64::from(lat[(t * heads + h) * rank + r]) * w(h, nope + j, r))
-                        .sum::<f64>() as f32
-                })
-                .collect();
-            let at = (t * heads + h) * v;
-            close_rows("absorb_out", &go[at..at + v], &want, 1e-2);
+    // rocBLAS's strided batch, then the native kernel over a decode's few
+    // rows and rows past one tile ending mid-tile.
+    for (native, tokens) in [(false, 3usize), (true, 3), (true, 130)] {
+        let mut ctx = gpu.ctx();
+        let mut tuning = ctx.tuning();
+        if native {
+            tuning.mla_absorb_q_until = u32::MAX;
+            tuning.mla_absorb_out_until = u32::MAX;
+        }
+        ctx.set_tuning(tuning);
+        let (heads, nope, v, rank) = (4usize, 192usize, 256usize, 512usize);
+        let kvb: Vec<f32> = values(heads * (nope + v) * rank, 31, 0.1)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let qn: Vec<f32> = values(tokens * heads * nope, 32, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let lat: Vec<f32> = values(tokens * heads * rank, 33, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let kv_b = gpu.tensor(&kvb, (heads * (nope + v)) as u32, rank as u32, Dtype::Bf16);
+        let mut q_latent = gpu.zeros(tokens as u32, (heads * rank) as u32, Dtype::Bf16);
+        mla::absorb_q(
+            &ctx,
+            gpu.tensor(&qn, tokens as u32, (heads * nope) as u32, Dtype::Bf16),
+            kv_b,
+            heads as u32,
+            rank as u32,
+            nope as u32,
+            v as u32,
+            &mut q_latent,
+        )
+        .unwrap();
+        let mut o = gpu.zeros(tokens as u32, (heads * v) as u32, Dtype::Bf16);
+        mla::absorb_out(
+            &ctx,
+            gpu.tensor(&lat, tokens as u32, (heads * rank) as u32, Dtype::Bf16),
+            kv_b,
+            heads as u32,
+            rank as u32,
+            v as u32,
+            nope as u32,
+            &mut o,
+        )
+        .unwrap();
+        let (gq, go) = (gpu.read(&q_latent), gpu.read(&o));
+        let w =
+            |h: usize, row: usize, col: usize| f64::from(kvb[(h * (nope + v) + row) * rank + col]);
+        for t in 0..tokens {
+            for h in 0..heads {
+                let want: Vec<f32> = (0..rank)
+                    .map(|i| {
+                        (0..nope)
+                            .map(|k| f64::from(qn[(t * heads + h) * nope + k]) * w(h, k, i))
+                            .sum::<f64>() as f32
+                    })
+                    .collect();
+                let at = (t * heads + h) * rank;
+                close_rows("absorb_q", &gq[at..at + rank], &want, 1e-2);
+                let want: Vec<f32> = (0..v)
+                    .map(|j| {
+                        (0..rank)
+                            .map(|r| f64::from(lat[(t * heads + h) * rank + r]) * w(h, nope + j, r))
+                            .sum::<f64>() as f32
+                    })
+                    .collect();
+                let at = (t * heads + h) * v;
+                close_rows("absorb_out", &go[at..at + v], &want, 1e-2);
+            }
         }
     }
 }

@@ -23,6 +23,14 @@ moe.lt_tile_shallow = 128_288_032
 moe.lt_deep_k = 2048
 moe.ordered_from = 128
 
+# MLA's per-head absorbs (DeepSeek, GLM-5.3, Kimi K3 heads: 64 x 192 / 512 x
+# 256) on the native kernel where rocBLAS's strided batch picks a slow
+# solution: the query's up to 2048 rows (1.4-3x), the value's 33-1536 (it
+# keeps rocBLAS's few-row and 2048-row solutions).
+mla.absorb_q_until = 2048
+mla.absorb_out_from = 33
+mla.absorb_out_until = 1536
+
 # A fire of 10240 rows where `max_forward_tokens` is unstated: 8192 left the
 # first prompts' decodes waiting out a second prefill fire, 12K and up made
 # queued prompts wait. Past 2048 rows, eight buckets a doubling: a prefill's

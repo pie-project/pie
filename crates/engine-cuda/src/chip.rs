@@ -901,8 +901,12 @@ mod hip {
                     ..Engine::of(&registry().defaults())
                 }
             );
-            // The defaults, but for the routed MLP's paths the family measured.
+            // The defaults, but for the routed MLP's and MLA absorbs' paths the
+            // family measured.
             let mut want = kernels_cuda::tuning::Tuning::of(&registry().defaults());
+            want.mla_absorb_q_until = 2048;
+            want.mla_absorb_out_from = 33;
+            want.mla_absorb_out_until = 1536;
             want.moe_lt_grouped = true;
             want.moe_lt_mlp_from = 128;
             want.moe_lt_tile_deep = 256_192_064;

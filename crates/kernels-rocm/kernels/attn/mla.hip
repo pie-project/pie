@@ -34,6 +34,120 @@ __global__ void mla_split_q_b(const T* __restrict__ q_b, T* __restrict__ q_nope,
     else q_pe[row * rope + (d - nope)] = v;
 }
 
+// The absorbs: y[t, h, :] = x[t, h, :] · W_h, every head's own K x N
+// matrix (`wstride` elements apart), KN: W_h row-major [K][N] (the up
+// projection's key half, read for the query), else [N][K] (its value half,
+// read back out of the latent). A block 64 of a head's N columns over
+// WT·16·MS tokens, its four waves WN along N by WT along the tokens; a stage
+// 64 of K, the weight through LDS as [n][k] (KN transposed on the way in),
+// each wave's tokens straight to its registers.
+template <bool KN, int WT, int MS>
+__global__ __launch_bounds__(256) void mla_absorb(const bf16* __restrict__ x, const bf16* __restrict__ w,
+                                                  bf16* __restrict__ y, int tokens, int n, int k, int ldx, int ldy,
+                                                  long long wstride, const u32* __restrict__ win) {
+    constexpr int NT = 64, KC = 64, PITCH = KC + 8, WL = NT * KC / 8 / 256, H2 = KC / 32;
+    constexpr int WN = 4 / WT, NB = 4 / WN, TT = WT * 16 * MS;
+    static_assert(WN * WT == 4, "four waves");
+    __shared__ __align__(16) bf16 wl[2][NT * PITCH];
+    const Window window{win};
+    const int live = window.w == nullptr ? tokens : min(tokens, static_cast<int>(win[0]));
+    const long long first = window.plane(0);
+    const int h = blockIdx.y, n0 = blockIdx.x * NT, t0 = blockIdx.z * TT;
+    if (t0 >= live) return;
+    const int tid = threadIdx.x, l = lane(), r16 = l % 16, g = l / 16, wave = tid / kWave;
+    const int wn = wave % WN, wt = wave / WN, tw = t0 + wt * 16 * MS;
+    const bf16* wh = w + h * wstride;
+    const int stages = k / KC;
+
+    // A thread's 16-byte pieces of a weight stage, piece p = tid + 256 i: KN
+    // row p / 8 of the stage, columns 8 (p % 8) ..; else row n = p / 8, k
+    // 8 (p % 8) ...
+    auto wload = [&](int s, Pack8<bf16> (&v)[WL]) {
+#pragma unroll
+        for (int i = 0; i < WL; ++i) {
+            const int p = tid + 256 * i, r = KN ? p / 8 : p / (KC / 8), c = KN ? 8 * (p % 8) : 8 * (p % (KC / 8));
+            if constexpr (KN)
+                v[i] = *reinterpret_cast<const Pack8<bf16>*>(wh + static_cast<long long>(s * KC + r) * n + n0 + c);
+            else
+                v[i] = *reinterpret_cast<const Pack8<bf16>*>(wh + static_cast<long long>(n0 + r) * k + s * KC + c);
+        }
+    };
+    auto wstore = [&](const Pack8<bf16> (&v)[WL], int b) {
+#pragma unroll
+        for (int i = 0; i < WL; ++i) {
+            const int p = tid + 256 * i, r = KN ? p / 8 : p / (KC / 8), c = KN ? 8 * (p % 8) : 8 * (p % (KC / 8));
+            if constexpr (KN) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) wl[b][(c + j) * PITCH + r] = v[i].v[j];
+            } else {
+                *reinterpret_cast<Pack8<bf16>*>(&wl[b][r * PITCH + c]) = v[i];
+            }
+        }
+    };
+    const bf16* xr[MS];
+#pragma unroll
+    for (int ms = 0; ms < MS; ++ms)
+        xr[ms] = x + (first + min(tw + 16 * ms + r16, live - 1)) * ldx + static_cast<long long>(h) * k + 8 * g;
+
+    mfma_cd acc[NB][MS];
+#pragma unroll
+    for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+        for (int ms = 0; ms < MS; ++ms) acc[nb][ms] = mfma_zero();
+    mfma_ab2 xb[MS][H2];
+    Pack8<bf16> wv[WL];
+    wload(0, wv);
+#pragma unroll
+    for (int ms = 0; ms < MS; ++ms)
+#pragma unroll
+        for (int h2 = 0; h2 < H2; ++h2) xb[ms][h2] = load8(xr[ms] + 32 * h2);
+    wstore(wv, 0);
+    lds_barrier();
+    for (int s = 0; s < stages; ++s) {
+        const int b = s & 1;
+        mfma_ab2 xn[MS][H2];
+        if (s + 1 < stages) {
+            wload(s + 1, wv);
+#pragma unroll
+            for (int ms = 0; ms < MS; ++ms)
+#pragma unroll
+                for (int h2 = 0; h2 < H2; ++h2) xn[ms][h2] = load8(xr[ms] + (s + 1) * KC + 32 * h2);
+        }
+#pragma unroll
+        for (int h2 = 0; h2 < H2; ++h2)
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb) {
+                const mfma_ab2 a = *reinterpret_cast<const mfma_ab2*>(
+                    &wl[b][(16 * (wn * NB + nb) + r16) * PITCH + 32 * h2 + 8 * g]);
+#pragma unroll
+                for (int ms = 0; ms < MS; ++ms) acc[nb][ms] = mfma16x2(a, xb[ms][h2], acc[nb][ms]);
+            }
+        if (s + 1 < stages) {
+            wstore(wv, b ^ 1);
+#pragma unroll
+            for (int ms = 0; ms < MS; ++ms)
+#pragma unroll
+                for (int h2 = 0; h2 < H2; ++h2) xb[ms][h2] = xn[ms][h2];
+        }
+        lds_barrier();
+    }
+    // D: column (token) l % 16, rows (n) 4g .. 4g + 3 of each 16.
+#pragma unroll
+    for (int ms = 0; ms < MS; ++ms) {
+        const int t = tw + 16 * ms + r16;
+        if (t >= live) continue;
+#pragma unroll
+        for (int nb = 0; nb < NB; ++nb) {
+            const int c = n0 + 16 * (wn * NB + nb) + 4 * g;
+            bf16 v[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) v[i] = from_f32<bf16>(acc[nb][ms][i]);
+            *reinterpret_cast<uint2*>(y + (first + t) * ldy + static_cast<long long>(h) * n + c) =
+                __builtin_bit_cast(uint2, v);
+        }
+    }
+}
+
 // kv_a's [latent | rope] row: the latent RMS-normed into kv_c, the rope
 // half copied into k_pe. One block per row.
 template <class T, int BLOCK>

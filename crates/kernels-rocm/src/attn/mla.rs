@@ -198,6 +198,20 @@ pub fn absorb_q(
 ) -> Result<(), Error> {
     const OP: &str = "attention.mla_absorb_q";
     dtype_dispatch!(OP, q_nope.dtype, { Bf16 => () });
+    if q_nope.rows <= ctx.tuning().mla_absorb_q_until {
+        return absorb_native(
+            ctx,
+            OP,
+            true,
+            q_nope,
+            kv_b.ptr,
+            heads,
+            nope_dim,
+            kv_lora_rank,
+            u64::from(nope_dim + v_head_dim) * u64::from(kv_lora_rank),
+            q_latent,
+        );
+    }
     let heads = count(OP, "the head count this absorb states", heads)?;
     let nope = stated(OP, nope_dim)?;
     let v_dim = stated(OP, v_head_dim)?;
@@ -247,6 +261,22 @@ pub fn absorb_out(
 ) -> Result<(), Error> {
     const OP: &str = "attention.mla_absorb_out";
     dtype_dispatch!(OP, latent.dtype, { Bf16 => () });
+    let t = ctx.tuning();
+    if (t.mla_absorb_out_from..=t.mla_absorb_out_until).contains(&latent.rows) {
+        return absorb_native(
+            ctx,
+            OP,
+            false,
+            latent,
+            kv_b.ptr
+                .wrapping_add(2 * u64::from(nope_dim) * u64::from(kv_lora_rank)),
+            heads,
+            kv_lora_rank,
+            v_head_dim,
+            u64::from(nope_dim + v_head_dim) * u64::from(kv_lora_rank),
+            o,
+        );
+    }
     let heads = count(OP, "the head count this absorb states", heads)?;
     let nope = stated(OP, nope_dim)?;
     let v_dim = stated(OP, v_head_dim)?;
@@ -327,6 +357,70 @@ unsafe fn absorb(
             heads,
         )
     }
+}
+
+/// `y[t, h] = x[t, h] · W_h` over `heads` matrices `wstride` elements
+/// apart, each `[k, n]` (`kn`) or `[n, k]`, on `attn/mla.hip`'s
+/// `mla_absorb`.
+#[allow(clippy::too_many_arguments)]
+fn absorb_native(
+    ctx: &Ctx,
+    op: &'static str,
+    kn: bool,
+    x: Tensor,
+    w: u64,
+    heads: u32,
+    k: u32,
+    n: u32,
+    wstride: u64,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let heads_i = count(op, "the head count this absorb states", heads)?;
+    if k % 64 != 0 || n % 64 != 0 || k == 0 || n == 0 {
+        return Err(refuse(
+            op,
+            format!("the absorb takes K and N multiples of 64, not {k} and {n}"),
+        ));
+    }
+    let tokens = x.rows;
+    if tokens == 0 {
+        return Ok(());
+    }
+    // Waves along the tokens and 16-row blocks a wave: a decode's few rows
+    // spread the four waves along N.
+    let (wt, ms) = match tokens {
+        0..=16 => (1, 1),
+        17..=32 => (1, 2),
+        33..=64 => (2, 2),
+        65..=512 => (4, 2),
+        _ => (4, 4),
+    };
+    let tt = wt * 16 * ms;
+    ctx.fire(
+        op,
+        Fire::at(
+            "attn/mla.hip",
+            crate::jit::symbol(&format!("::pie::attn::mla_absorb<{kn}, {wt}, {ms}>")),
+        )
+        .apply(Launch::grid(
+            [n / 64, heads, tokens.div_ceil(tt)],
+            [BLOCK, 1, 1],
+        )),
+        &[
+            x.arg(),
+            ArgValue::Ptr(w),
+            y.arg(),
+            stated(op, tokens)?.arg(),
+            stated(op, n)?.arg(),
+            stated(op, k)?.arg(),
+            (heads_i * stated(op, k)?).arg(),
+            (heads_i * stated(op, n)?).arg(),
+            i64::try_from(wstride)
+                .map_err(|_| refuse(op, "the head stride does not fit an i64"))?
+                .arg(),
+            ctx.stage(),
+        ],
+    )
 }
 
 pub fn kv_append(
