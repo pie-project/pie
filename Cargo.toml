@@ -157,7 +157,7 @@ default = []
 cuda = ["engine-cuda", "worker/cuda"]
 rocm = ["engine-cuda", "worker/rocm"]
 # engine-cuda is built in, under `cuda` or `rocm`.
-engine-cuda = []
+engine-cuda = ["worker/engine-cuda"]
 metal = ["worker/metal"]
 vulkan = ["worker/vulkan"]
 wgpu = ["worker/wgpu"]

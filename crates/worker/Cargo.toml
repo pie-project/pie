@@ -33,7 +33,7 @@ standalone = ["net", "dep:controller", "dep:gateway", "dep:rustls"]
 cuda = ["engine-cuda", "runtime/cuda"]
 rocm = ["engine-cuda", "runtime/rocm"]
 # engine-cuda is built in, under `cuda` or `rocm`.
-engine-cuda = []
+engine-cuda = ["runtime/engine-cuda"]
 metal = ["runtime/metal"]
 vulkan = ["runtime/vulkan"]
 wgpu = ["runtime/wgpu"]
