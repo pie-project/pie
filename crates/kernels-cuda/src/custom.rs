@@ -139,9 +139,11 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     // for every head rather than once a head, and each head moves in whole
     // 16-byte words. A decode's few rows keep the warp a head.
     // Under `rows_vec` (B200) a row of 16-byte words a lane (64-, 128- and
-    // 256-wide heads) lands in shared memory whole, by one bulk copy.
-    let stage =
-        (word || head_dim == 256) && ctx.tuning().rows_vec && packed.width * 2 + 16 <= 48 * 1024;
+    // 256-wide heads) lands in shared memory whole, by one bulk copy (sm_90's).
+    let stage = (word || head_dim == 256)
+        && ctx.tuning().rows_vec
+        && crate::jit::device::compute_capability_major().is_some_and(|major| major >= 9)
+        && packed.width * 2 + 16 <= 48 * 1024;
     let by_row = matches!(head_dim, 64 | 128 | 256 | 512).then(|| {
         let e = if word { 8 } else { head_dim / 32 };
         if stage {
