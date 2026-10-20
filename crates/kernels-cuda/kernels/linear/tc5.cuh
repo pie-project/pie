@@ -110,6 +110,9 @@ struct Epi {
     // over the fewest CTAs that keep them, the same count each
     // (`kernel.moe.even_waves_from`).
     int even_waves;
+    // The routing entries shared memory holds (a grouped launch's experts and
+    // one, at most 1028; `kernel.moe.routes_sized`), or 0 for 1028.
+    int route_cap;
 };
 
 namespace tc5k {
@@ -368,9 +371,12 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     constexpr u32 kOffBar = kOffOut + kOutBytes;
     // A grouped launch holds the routing (offsets or counts, and a swapped
     // contiguous launch's live rows) in shared memory, read once a unit.
+    // Its entries: the bank's experts and one where the launch says
+    // (`route_cap`), else the most a launch routes.
     constexpr bool kLives = kGroup == 1 && kSwap;
-    constexpr u32 kGroupInts = kGroup == 0 ? 0 : (kLives ? 3 : 2) * 1028;
-    constexpr u32 kBytes = kOffBar + (3 * kStages + 16) * 8 + 8 + kGroupInts * 4;
+    const u32 cap = epi.route_cap > 0 ? static_cast<u32>(epi.route_cap) : 1028u;
+    const u32 group_ints = kGroup == 0 ? 0u : (kLives ? 3u : 2u) * cap;
+    const u32 bytes = kOffBar + (3 * kStages + 16) * 8 + 8 + group_ints * 4;
 
     extern __shared__ unsigned char smem_raw[];
     const u32 raw = smem_addr(smem_raw);
@@ -385,8 +391,8 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     u64* sf_ready = tover + 2;
     u32* tmem_slot = reinterpret_cast<u32*>(sf_ready + 8);
     int* routes = reinterpret_cast<int*>(tmem_slot + 2);
-    int* starts = routes + 1028;
-    int* lives = starts + 1028;  // kLives only
+    int* starts = routes + cap;
+    int* lives = starts + cap;  // kLives only
 
     const u32 warp = threadIdx.x / 32;
     const u32 lane = threadIdx.x % 32;
@@ -396,7 +402,9 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     if (threadIdx.x == 0) {
         u32 have;
         asm volatile("mov.u32 %0, %%dynamic_smem_size;" : "=r"(have));
-        if (have < kBytes + 1024) {
+        // A launch's routing past its entries (more experts than it holds)
+        // would overrun them, as one short of its shared memory would.
+        if (have < bytes + 1024 || (kGroup != 0 && static_cast<u32>(experts) + 1 > cap)) {
             asm volatile("trap;");
         }
     }

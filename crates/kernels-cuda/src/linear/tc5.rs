@@ -216,6 +216,7 @@ const fn smem_bytes(
     p_blocks: u32,
     lives: bool,
     quant: bool,
+    routes: u32,
 ) -> u32 {
     let Plan {
         swap,
@@ -250,9 +251,10 @@ const fn smem_bytes(
             (true, false) => 1024,
             (false, _) => 4 * 2 * 2048,
         };
-    // The routing a grouped launch holds is reserved for every launch; a
+    // The routing a grouped launch holds, `routes` entries (its experts and
+    // one, or the most a launch routes), is reserved for every launch; a
     // swapped contiguous one holds each expert's live rows too.
-    let routing = MAX_ROUTES * if lives { 12 } else { 8 };
+    let routing = routes * if lives { 12 } else { 8 };
     bar + (3 * stages + 16) * 8 + 8 + routing + 1024
 }
 
@@ -332,6 +334,7 @@ impl Plan {
         p_blocks: u32,
         lives: bool,
         quant: bool,
+        routes: u32,
     ) -> Self {
         let mut stages = 8;
         while stages > 2
@@ -344,6 +347,7 @@ impl Plan {
                 p_blocks,
                 lives,
                 quant,
+                routes,
             ) > SMEM_CAP
         {
             stages -= 1;
@@ -566,6 +570,7 @@ impl Epilogue {
             slab: 0,
             tickets: 0,
             even_waves: 0,
+            route_cap: 0,
         }
     }
 }
@@ -593,6 +598,7 @@ struct EpiArgs {
     tickets: u64,
     weights_ahead: i32,
     even_waves: i32,
+    route_cap: i32,
 }
 
 /// `y = epilogue(alpha * act . w^T)` for `[m, n, k]`, `n` the output's columns, under a stated plan.
@@ -1055,10 +1061,27 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     };
     let lives = group.mode == 1 && job.plan.swap;
     let quant = job.plan.swap && matches!(epi.out, Out::Nvfp4 { .. });
+    // A grouped launch's routing for its bank's experts alone where the
+    // profile says (`kernel.moe.routes_sized`), the room going to the ring.
+    let routes = if group.mode != 0 && ctx.tuning().moe_routes_sized {
+        group.experts + 1
+    } else {
+        MAX_ROUTES
+    };
     let plan = job
         .plan
-        .staged(kind, gran(p), gran(q), pt, p_blocks, lives, quant);
-    let smem = smem_bytes(kind, gran(p), gran(q), plan, pt, p_blocks, lives, quant);
+        .staged(kind, gran(p), gran(q), pt, p_blocks, lives, quant, routes);
+    let smem = smem_bytes(
+        kind,
+        gran(p),
+        gran(q),
+        plan,
+        pt,
+        p_blocks,
+        lives,
+        quant,
+        routes,
+    );
     let ctas = if plan.pair { 2 } else { 1 };
     let [rows_p, rows_q] = job.rows;
 
@@ -1101,6 +1124,8 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
         } else {
             0
         },
+        // The routing entries its shared memory holds, as reserved above.
+        route_cap: i32::try_from(routes).unwrap_or(i32::MAX),
         ..epi.args(n, job.pad, wsf, wzero)
     };
     let sms = ctx.multiprocessors().unwrap_or(148);
@@ -1497,9 +1522,9 @@ mod tests {
                     stages: 0,
                     splits: 0,
                 }
-                .staged(kind, g, g, 1, 1, false, false);
+                .staged(kind, g, g, 1, 1, false, false, MAX_ROUTES);
                 assert!(plan.stages >= 3, "{kind:?} bn={bn}: {plan:?}");
-                assert!(smem_bytes(kind, g, g, plan, 1, 1, false, false) <= SMEM_CAP);
+                assert!(smem_bytes(kind, g, g, plan, 1, 1, false, false, MAX_ROUTES) <= SMEM_CAP);
             }
         }
     }

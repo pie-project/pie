@@ -140,6 +140,14 @@ pub struct MoeW4a4DownSplits(pub u32);
 #[decision(id = "kernel.moe.even_waves_from", constant(range(0..=64)), default = 0, tune = search)]
 pub struct MoeEvenWavesFrom(pub u32);
 
+/// Whether a grouped tcgen05 GEMM's shared memory holds its routing for the
+/// bank's experts alone rather than the most a launch routes (1028), the
+/// room going to the ring: Muse Spark's bs64 W4A4 down leg takes a fourth
+/// stage. Off but where a chip's profile turns it on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.routes_sized", flag, default = false, tune = search)]
+pub struct MoeRoutesSized;
+
 /// The fewest rows the fused qkv norm, rotation and KV write takes a block a
 /// row (a warp a head below): 64 but where a chip's profile says (B200's,
 /// where 64 decode rows' blocks leave most SMs idle).
@@ -719,6 +727,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeW4a4SwapBnNarrow>()
         .add::<MoeW4a4DownSplits>()
         .add::<MoeEvenWavesFrom>()
+        .add::<MoeRoutesSized>()
         .add::<AttnQkvRowsFrom>()
         .add::<SsmKdaStepFused>()
         .add::<GemmSplitLaunchNs>()
@@ -842,6 +851,7 @@ tuning! {
     moe_w4a4_swap_bn_narrow: u32 = 32, get MoeW4a4SwapBnNarrow;
     moe_w4a4_down_splits: u32 = 1, get MoeW4a4DownSplits;
     moe_even_waves_from: u32 = 0, get MoeEvenWavesFrom;
+    moe_routes_sized: bool = false, on MoeRoutesSized;
     qkv_rows_from: u32 = 64, get AttnQkvRowsFrom;
     ssm_kda_step_fused: bool = false, on SsmKdaStepFused;
     gemm_split_launch_ns: u32 = 0, get GemmSplitLaunchNs;

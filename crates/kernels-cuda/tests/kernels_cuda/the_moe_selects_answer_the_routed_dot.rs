@@ -275,6 +275,7 @@ fn the_routed_selects_answer_the_routed_dot() {
                 k,
                 Tuning {
                     moe_even_waves_from: 1,
+                    moe_routes_sized: true,
                     ..t
                 },
                 s,
@@ -389,6 +390,7 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
             let ctx = b.ctx().with_tuning(Tuning {
                 moe_w4a4_down_splits: down_splits,
                 moe_even_waves_from: u32::from(even),
+                moe_routes_sized: even,
                 ..base
             });
             if let Some((live, first)) = window {
