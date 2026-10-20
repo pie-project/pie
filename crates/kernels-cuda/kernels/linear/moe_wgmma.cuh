@@ -72,7 +72,7 @@ struct Mma<64> {
 
 // The ring's depth, and the bytes a stage holds before the 1024-byte
 // alignment the swizzle asks of its base.
-constexpr int kWgStages = 4;
+constexpr int kWgStages = 3;
 
 /// `y[route] = q(x[route / act_div]) . (W[expert] * 2^(s - 127))^T`, the rows
 /// quantized by `quantize_rows_e4m3b128` (`xq`, `xe`), the bank's exponents
