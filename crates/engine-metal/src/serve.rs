@@ -3680,6 +3680,9 @@ impl Shell {
             geometry,
             tables: FireTables {
                 request_of_token: bound.request_of_token,
+                readout_positions: bound.readout_positions,
+                readout_request_of_token: bound.readout_request_of_token,
+                readout_mask_enabled: bound.readout_mask_enabled,
                 mask: bound.mask,
                 mask_enabled: bound.mask_enabled,
                 mask_stride: bound.mask_stride,

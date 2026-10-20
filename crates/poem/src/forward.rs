@@ -409,6 +409,15 @@ impl Input {
         self.rec.platform() != Platform::Cuda
     }
 
+    /// Whether a decode attention takes readout rows for its queries, each
+    /// attending as the token it reads out. Metal seats each readout's
+    /// position and lane beside the tokens'; the other backends attend only
+    /// token rows, so a forward keeps every row for them.
+    #[must_use]
+    pub fn readout_attention(&self) -> bool {
+        self.rec.platform() == Platform::Metal
+    }
+
     #[must_use]
     pub fn request_of_token(&self) -> Value {
         self.geometry(TOKEN_SPACE, GeomKind::RequestOfToken)
