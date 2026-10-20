@@ -546,6 +546,7 @@ mod tests {
                         decode_grouped_prefill_from: 0,
                         gemm_bias_epilogue: false,
                         moe_w4a4_fused_from: 65_536,
+                        moe_w4a4_fused_layout: defaults.moe_w4a4_fused_layout,
                         moe_w4a8_fused_from: 65_536,
                         mla_expanded_from: 65_536,
                         gemm_fp8_gemv_until: 0,
