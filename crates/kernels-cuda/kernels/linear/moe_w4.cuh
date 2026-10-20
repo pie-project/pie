@@ -191,8 +191,9 @@ __device__ __forceinline__ void compute(const Chunk<kTiles, kNb>& cc, float (&ac
 
 // A warp's sums landed at their routes' rows: each row's bias (`b_e`, or
 // none) after its `factor`, the gate and up rows through the GLU into
-// `inter` columns where `kGlu`, else `n` columns as they are.
-template <int kGlu, int kTiles, int kNb, class Factor>
+// `inter` columns where `kGlu`, else `n` columns as they are; tile `t`'s
+// rows `kTileRows t` past the warp's.
+template <int kGlu, int kTiles, int kNb, int kTileRows = 16, class Factor>
 __device__ __forceinline__ void w4_land(const float (&acc)[kTiles][kNb][4], Factor factor,
                                         const bf16* b_e, const i32* __restrict__ order, int begin,
                                         int count, bf16* __restrict__ out, int n, int inter,
@@ -224,7 +225,7 @@ __device__ __forceinline__ void w4_land(const float (&acc)[kTiles][kNb][4], Fact
     for (int t = 0; t < kTiles; ++t)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const int row = row_base + 16 * t + 8 * h + g;
+            const int row = row_base + kTileRows * t + 8 * h + g;
             if (row >= n) continue;
             const float add = b_e != nullptr ? bf16_to_f32(b_e[row]) : 0.f;
             const float f = factor(row);

@@ -2654,6 +2654,23 @@ fn select_mxfp4_mma(
                 .smem(nb * win * 4096)
                 .cluster(ksplit),
         )
+    } else if staged && hopper_wgmma() && x.width.is_multiple_of(128) {
+        // Hopper: the staged slice on wgmma (`moe_select_fp4_wgmma`), the
+        // codes dequantized to its A registers, a warpgroup's 128 rows (64
+        // GLU columns) a CTA. Two stages where the fire's slices fill the
+        // card three CTAs an SM deep (their shared memory), else three.
+        let nv = tensor_scales.is_some();
+        let sms = ctx.multiprocessors().unwrap_or(132);
+        let ctas = fan.route_count.div_ceil(64) * grid[1];
+        let stages: u32 = if ctas >= 3 * sms - sms / 2 { 2 } else { 3 };
+        let smem = stages * (64 * 256 + 128 * (64 + 8)) + 128 * 32 + 1024;
+        Fire::at(
+            "linear/moe_wgmma.cuh",
+            symbol(&format!(
+                "::pie::linear::moe_select_fp4_wgmma<{code}, {nv}, 2, 1, {stages}>"
+            )),
+        )
+        .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(smem))
     } else if staged {
         const STAGES: u32 = 3;
         let nv = tensor_scales.is_some();

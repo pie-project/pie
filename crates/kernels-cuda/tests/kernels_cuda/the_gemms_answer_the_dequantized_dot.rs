@@ -361,11 +361,15 @@ fn the_w8a16_projections_answer_the_dot() {
         let (codes, atoms) = (b.up(&s.bytes), b.up(atoms));
         let mut y = b.out(m, n);
         let ctx = b.ctx().with_tuning(GEMV);
-        let took = act_quant::fp8_block_gemv_in(&ctx, t(x, m, k, Bf16), codes, atoms, gran as u32, &mut y)
-            .expect("the GEMV fires");
+        let took =
+            act_quant::fp8_block_gemv_in(&ctx, t(x, m, k, Bf16), codes, atoms, gran as u32, &mut y)
+                .expect("the GEMV fires");
         assert!(took, "{m}x{n}x{k} in {gran}s is a shape the GEMV reads");
-        let want = dot([m, n, k], |r, i| xv[r * k + i], |_, c, i| f64::from(s.value(c, k, i)));
+        let want = dot(
+            [m, n, k],
+            |r, i| xv[r * k + i],
+            |_, c, i| f64::from(s.value(c, k, i)),
+        );
         b.check(y.ptr, &want, TOL, &format!("GEMV in {gran}s, {m}x{n}x{k}"));
     }
 }
-

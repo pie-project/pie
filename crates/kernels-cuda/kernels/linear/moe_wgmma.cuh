@@ -12,6 +12,7 @@
 // m64, columns 8 j + 2 c (+ 1).
 
 #include "linear/grouped_fp8.cuh"
+#include "linear/moe_w4.cuh"
 
 namespace pie::linear {
 
@@ -342,6 +343,277 @@ __global__ void __launch_bounds__(128) moe_select_bf16_wgmma(
                 const long long route = order[begin + tok];
                 out[route * n + row] = f32_to_bf16(acc[t][4 * j + q]);
             }
+}
+
+namespace wgfp4 {
+
+// m64n64k16 with A, the warp's 16 rows, from registers: the a0..a3 of
+// mma.sync's m16n8k16, so the register dequant feeds it as it feeds mma.sync.
+__device__ __forceinline__ void mma(float (&d)[32], const unsigned (&a)[4],
+                                    unsigned long long b) {
+    asm volatile(
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,"
+        "%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, {%32,%33,%34,%35}, %36, 1, 1, 1, 0;\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+          "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]),
+          "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]),
+          "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]),
+          "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]),
+          "+f"(d[31])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(b));
+}
+
+// Holds `a`'s registers to here: an MMA in flight still reads them.
+__device__ __forceinline__ void hold(unsigned (&a)[4]) {
+    asm volatile("" : "+r"(a[0]), "+r"(a[1]), "+r"(a[2]), "+r"(a[3])::"memory");
+}
+
+}  // namespace wgfp4
+
+/// `moe_select_mxfp4_mma_staged` on Hopper's wgmma (sm_90a), for a slice of
+/// 64 routes an expert: a CTA, `kWg` warpgroups, each `kT` m64 tiles of the
+/// expert's rows (a GLU's gate and up tiles). Each 128-code K chunk's route
+/// rows (K-major, 128-byte swizzled, the MMAs' B) and the CTA's codes and
+/// scales stage through a `kStages` cp.async ring. A lane dequantizes the
+/// A fragment mma.sync's m16n8k16 would hold of its warp's 16 rows of each
+/// tile, k-step `s`'s codes `16 s + 2 c (+ 1)` and `+ 8` the bytes `8 s + c`
+/// and `8 s + 4 + c` of the row's chunk, and its warpgroup's m64n64k16 MMAs
+/// read them from registers. `k` whole 128s. Grid `[work_cap, rows / (64 kT
+/// kWg)]` (64 kWg GLU columns), `128 kWg` threads, `kStages (16384 + 72 R)`
+/// (each stage rounded up to a 1024) `+ 32 R + 1024` bytes of shared memory
+/// for the CTA's `R = 64 kT kWg` rows.
+namespace wgfp4 {
+
+// The byte of `w` that `sel` (`0x4440 | c`) picks: its two e2m1 codes as
+// `w4mma::e2m1_pair` lands them (the low code the pair's low bf16).
+__device__ __forceinline__ unsigned byte_codes(unsigned w, unsigned sel) {
+    const unsigned b = __byte_perm(w, 0u, sel);
+    return ((b * 0x01001000u) & 0x80008000u) | ((b * 0x00040040u) & 0x01C001C0u);
+}
+
+}  // namespace wgfp4
+
+template <int kGlu, bool kNv, int kT, int kWg, int kStages>
+__global__ void __launch_bounds__(128 * kWg, kWg == 1 && kT == 2 ? 3 : 1) moe_select_fp4_wgmma(
+    const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
+    const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
+    const bf16* __restrict__ bias, bf16* __restrict__ out, int act_div, int n, int k,
+    int num_experts, int inter, float limit, float galpha, const float* __restrict__ tscale) {
+    static_assert(kGlu == 0 || kT == 2, "a GLU's CTA is its gate tile and its up tile");
+    constexpr int kSlice = 64;
+    constexpr int kThreads = 128 * kWg;
+    // A stage: the routes' two K-major atoms (128 codes), then the CTA's
+    // rows' codes (64 bytes a row, its 16-byte runs swizzled by row pairs)
+    // and scales (8 bytes a row).
+    constexpr int kAtom = 64 * 128;
+    constexpr int kRows = 64 * kT * kWg;
+    constexpr int kB = 2 * kAtom;
+    // Whole 1024s, each stage's atoms on the swizzle's alignment.
+    constexpr int kStage = (kB + kRows * (64 + 8) + 1023) / 1024 * 1024;
+    // A thread's 16-byte route runs, code runs and scale runs a chunk.
+    constexpr int kRuns = 64 * 16 / kThreads;
+    constexpr int kSegs = kRows * 4 / kThreads;
+    constexpr int kSfs = (kRows + kThreads - 1) / kThreads;
+
+    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
+    const int item = work[blockIdx.x];
+    const int expert = item >> 16;
+    const int begin = offsets[expert] + (item & 0xFFFF) * kSlice;
+    const int count = min(offsets[expert + 1] - begin, kSlice);
+    if (count <= 0) return;
+
+    // The ring on the swizzle's 1024-byte alignment, kept a shared-memory
+    // pointer (an offset from the array, not a cast integer). Past it, a
+    // warp's 32 rows' NVFP4 scales a chunk as bf16 pairs.
+    extern __shared__ uint4 wgfp4_smem[];
+    const unsigned base = static_cast<unsigned>(__cvta_generic_to_shared(wgfp4_smem));
+    u8* ring = reinterpret_cast<u8*>(wgfp4_smem) + ((1024u - (base & 1023u)) & 1023u);
+    unsigned* conv = reinterpret_cast<unsigned*>(ring + kStages * kStage);
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = (tid >> 5) & 3, wg = tid >> 7, lane = tid & 31, g = lane >> 2, c = lane & 3;
+    // Warp w's 16 rows of each m64 tile of its warpgroup's.
+    constexpr int kWgRows = kGlu != 0 ? 64 : 64 * kT;
+    const int row_base = (static_cast<int>(blockIdx.y) * kWg + wg) * kWgRows + 16 * warp;
+    const int span = kGlu != 0 ? inter : n;
+    // A CTA row `r` (warpgroup, tile, row of the m64): its bank row.
+    auto bank_row = [&](int r) {
+        const int rw = r / (64 * kT), t = (r / 64) % kT, i = r % 64;
+        const int base = (static_cast<int>(blockIdx.y) * kWg + rw) * kWgRows + i;
+        return kGlu != 0 ? base + t * inter : base + 64 * t;
+    };
+
+    const int chunks = k >> 7;
+    const long long row_bytes = k >> 1;
+    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
+    const int sf_row = kNv ? k >> 4 : k >> 5;
+    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+
+    // This thread's route runs' rows (-1 past the slice), and its code and
+    // scale runs' bank rows, clamped into the bank (a row past it lands
+    // nowhere).
+    int src[kRuns], wr[kSegs], sr[kSfs];
+#pragma unroll
+    for (int j = 0; j < kRuns; ++j) {
+        const int row = (tid + kThreads * j) >> 4;
+        src[j] = row < count ? order[begin + row] / act_div : -1;
+    }
+#pragma unroll
+    for (int j = 0; j < kSegs; ++j) wr[j] = min(bank_row((tid + kThreads * j) >> 2), n - 1);
+#pragma unroll
+    for (int j = 0; j < kSfs; ++j) sr[j] = min(bank_row(min(tid + kThreads * j, kRows - 1)), n - 1);
+
+    auto cp = [](void* dst, const void* from, int live) {
+        const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(at), "l"(from), "r"(live));
+    };
+    auto stage = [&](int ch) {
+        if (ch < chunks) {
+            u8* st = ring + (ch % kStages) * kStage;
+#pragma unroll
+            for (int j = 0; j < kRuns; ++j) {
+                const int u = tid + kThreads * j, row = u >> 4, q = u & 15;
+                const bool live = src[j] >= 0;
+                const bf16* from = live ? act + static_cast<long long>(src[j]) * k + ch * 128 + q * 8 : act;
+                cp(st + (q >> 3) * kAtom + row * 128 + (((q & 7) ^ (row & 7)) << 4), from, live ? 16 : 0);
+            }
+#pragma unroll
+            for (int j = 0; j < kSegs; ++j) {
+                const int u = tid + kThreads * j, r = u >> 2, q = u & 3;
+                cp(st + kB + r * 64 + ((q ^ ((r >> 1) & 3)) << 4), w_e + wr[j] * row_bytes + ch * 64 + q * 16, 16);
+            }
+#pragma unroll
+            for (int j = 0; j < kSfs; ++j) {
+                const int r = tid + kThreads * j;
+                if (r >= kRows) break;
+                const u8* from = s_e + static_cast<long long>(sr[j]) * sf_row + ch * (kNv ? 8 : 4);
+                const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(st + kB + kRows * 64 + r * 8));
+                if constexpr (kNv) {
+                    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(at), "l"(from));
+                } else {
+                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(at), "l"(from));
+                }
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+
+    float acc[kT][8][4];
+#pragma unroll
+    for (int t = 0; t < kT; ++t)
+#pragma unroll
+        for (int b = 0; b < 8; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
+
+#pragma unroll
+    for (int s = 0; s < kStages - 1; ++s) stage(s);
+
+    for (int ch = 0; ch < chunks; ++ch) {
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(kStages - 2));
+        __syncthreads();
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        stage(ch + kStages - 1);
+
+        const u8* st = ring + (ch % kStages) * kStage;
+        // The lane's rows (h: g, g + 8) of each tile in the stage.
+        int rr[kT][2];
+#pragma unroll
+        for (int t = 0; t < kT; ++t)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) rr[t][h] = (wg * kT + t) * 64 + 16 * warp + 8 * h + g;
+        const u8* sfs = st + kB + kRows * 64;
+        // NVFP4: lane `l` converts its warp's row `l % 16` of tile `l / 16`'s
+        // eight block scales; MXFP4 reads its four a step.
+        unsigned* cw = conv + (wg * 4 + warp) * kT * 16 * 8;
+        uint2 sc[kT][2];
+        bool wide = false;
+        if constexpr (kNv) {
+            __syncwarp();
+#pragma unroll
+            for (int j = 0; j < (kT * 16 + 31) / 32; ++j) {
+                const int l = lane + 32 * j;
+                if (l < kT * 16) {
+                    const int r = (wg * kT + l / 16) * 64 + 16 * warp + l % 16;
+                    const uint2 v = *reinterpret_cast<const uint2*>(sfs + r * 8);
+                    unsigned o[8];
+#pragma unroll
+                    for (int q = 0; q < 8; ++q) {
+                        const unsigned e = w4mma::nvfp4_scale_bf16(((q < 4 ? v.x : v.y) >> (8 * (q & 3))) & 0xFFu);
+                        o[q] = e | (e << 16);
+                    }
+                    uint4* d = reinterpret_cast<uint4*>(cw + l * 8);
+                    d[0] = make_uint4(o[0], o[1], o[2], o[3]);
+                    d[1] = make_uint4(o[4], o[5], o[6], o[7]);
+                }
+            }
+            __syncwarp();
+        } else {
+#pragma unroll
+            for (int t = 0; t < kT; ++t)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    sc[t][h] = *reinterpret_cast<const uint2*>(sfs + rr[t][h] * 8);
+                    wide |= __vcmpgtu4(sc[t][h].x, 0x80808080u) != 0u;
+                }
+            wide = __any_sync(0xffffffffu, wide);
+        }
+        const unsigned sel = 0x4440u | static_cast<unsigned>(c);
+
+        unsigned a[2][kT][4];
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            unsigned (&as)[kT][4] = a[s & 1];
+#pragma unroll
+            for (int t = 0; t < kT; ++t) {
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int r = rr[t][h];
+                    const uint2 w = *reinterpret_cast<const uint2*>(
+                        st + kB + r * 64 + (((s >> 1) ^ ((r >> 1) & 3)) << 4) + (s & 1) * 8);
+                    // The step's scale, a bf16 pair: NVFP4's e4m3 a 16 codes
+                    // (block `s`, converted), MXFP4's e8m0 a 32 (block `s / 2`).
+                    unsigned x, x2 = 0u;
+                    if constexpr (kNv) {
+                        x = cw[(16 * t + 8 * h + g) * 8 + s];
+                    } else {
+                        const unsigned b = (sc[t][h].x >> (8 * (s >> 1))) & 0xFFu;
+                        x = !wide || b <= 128u ? (b + 126u) << 7 : 253u << 7;
+                        x2 = b <= 128u ? 0x3F80u : b << 7;
+                        x2 |= x2 << 16;
+                        x |= x << 16;
+                    }
+                    unsigned lo = w4mma::mul2(wgfp4::byte_codes(w.x, sel), x);
+                    unsigned hi = w4mma::mul2(wgfp4::byte_codes(w.y, sel), x);
+                    if (!kNv && wide) {
+                        lo = w4mma::mul2(lo, x2);
+                        hi = w4mma::mul2(hi, x2);
+                    }
+                    as[t][h] = lo;
+                    as[t][2 + h] = hi;
+                }
+            }
+            const unsigned long long db = wgfp8::desc(st + (s >> 2) * kAtom + (s & 3) * 32);
+            asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#pragma unroll
+            for (int t = 0; t < kT; ++t) wgfp4::mma(reinterpret_cast<float(&)[32]>(acc[t]), as[t], db);
+            asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+            // The step before's A registers are free once its MMAs land.
+            asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
+#pragma unroll
+            for (int t = 0; t < kT; ++t) wgfp4::hold(as[t]);
+        }
+        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+    }
+    asm volatile("cp.async.wait_group 0;\n" ::);
+
+    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    const float* t_e = kNv ? tscale + static_cast<long long>(expert) * n : nullptr;
+    auto factor = [&](int row) { return kNv ? t_e[row] * 256.f : 1.f; };
+    if (row_base >= span) return;
+    w4mma::w4_land<kGlu, kT, 8, 64>(acc, factor, b_e, order, begin, count, out, n, inter, row_base,
+                                    g, c, limit, galpha);
 }
 
 }  // namespace pie::linear
