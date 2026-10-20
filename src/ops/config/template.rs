@@ -92,13 +92,10 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 # [cluster]
 # Distributed serving only. A single-node config omits this section entirely.
 # controller = "tcp://10.0.0.1:9102"
-# role = "decode"
+# role = "decode"                # or "prefill": takes peers' passes, no client turns
 # gateways = ["tcp://10.0.0.2:8081"]
-# max_clients = 4
-# offload = true
-# transfer = "auto"
+# transfer = "auto"               # peers' kv read in place where the build has NIXL
 # prefill_min_suffix_tokens = 0
-# max_outstanding_per_partner = 4
 "#;
 
 #[cfg(any(feature = "engine-cuda", test))]

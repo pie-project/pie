@@ -2340,7 +2340,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .collect();
             req.media = crate::pipeline::media::lane_media(&matched, &lane_rows, &lane_base);
         }
-        crate::offload::try_encode(&mut req).await;
         let kv_clock = crate::scheduler::probe::ProbeClock::start();
         let groups = lane_groups(&pass_lanes.kv.iter().map(|ws| ws.id).collect::<Vec<_>>());
         let group_sets: Vec<KvWorkingSet> = groups

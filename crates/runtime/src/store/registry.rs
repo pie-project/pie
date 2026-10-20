@@ -140,21 +140,6 @@ pub fn kv_sharing() -> bool {
     *ON.get_or_init(|| std::env::var_os("PIE_KV_SHARE").is_none_or(|value| value != "0"))
 }
 
-pub fn unregister_engine(model_idx: usize, engine_idx: usize) -> anyhow::Result<()> {
-    let model = REGISTRY
-        .get(model_idx)
-        .ok_or_else(|| anyhow::anyhow!("store registry: unknown model {model_idx}"))?;
-    let mut stores = model.write().unwrap();
-    let slot = stores.get_mut(engine_idx).ok_or_else(|| {
-        anyhow::anyhow!("store registry: unknown engine {engine_idx} for model {model_idx}")
-    })?;
-    anyhow::ensure!(
-        slot.take().is_some(),
-        "store registry: engine {engine_idx} for model {model_idx} is already unregistered"
-    );
-    Ok(())
-}
-
 pub fn get(model_idx: usize, engine_idx: usize) -> Stores {
     try_get(model_idx, engine_idx).unwrap_or_else(|| {
         panic!("store registry: no stores for model {model_idx} engine {engine_idx}")
@@ -233,18 +218,7 @@ mod tests {
 
     #[test]
     fn registry_every_case() {
-        dynamic_store_slots_unregister_without_reusing_engine_ids();
         dynamic_store_slots_allow_global_engine_id_gaps();
-    }
-
-    fn dynamic_store_slots_unregister_without_reusing_engine_ids() {
-        let model = register_model(16, &[8], &[0]);
-        register_engine_with_swap(model, 1, 16, 4, 0, 0, 0).unwrap();
-        assert!(try_get(model, 1).is_some());
-        unregister_engine(model, 1).unwrap();
-        assert!(try_get(model, 1).is_none());
-        register_engine_with_swap(model, 2, 16, 4, 0, 0, 0).unwrap();
-        assert!(try_get(model, 2).is_some());
     }
 
     fn dynamic_store_slots_allow_global_engine_id_gaps() {

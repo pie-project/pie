@@ -19,7 +19,6 @@ mod server;
 #[cfg(not(target_arch = "wasm32"))]
 pub use server::Server;
 
-mod executor;
 #[cfg(feature = "net")]
 mod link;
 

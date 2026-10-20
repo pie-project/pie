@@ -58,7 +58,7 @@ pub struct StandaloneHandle {
 
 impl StandaloneHandle {
     pub fn summary(&self) -> &Summary {
-        self.worker.summary().expect("a standalone worker decodes")
+        self.worker.summary()
     }
 
     pub async fn shutdown(self) {

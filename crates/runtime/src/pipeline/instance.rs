@@ -312,7 +312,6 @@ impl BoundForwardPass {
         if std::mem::replace(&mut self.closed, true) {
             return;
         }
-        crate::offload::close_home_instance(self.bound_instance.instance_id);
         if let Err(error) = self.scheduler.close_instance(
             self.bound_instance.instance_id,
             self.bound_instance.pacing_wait_id,

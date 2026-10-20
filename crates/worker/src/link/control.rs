@@ -11,7 +11,6 @@ use tarpc::tokio_serde::formats::Bincode;
 use tokio::sync::watch;
 
 use super::gateway::GatewayLinkManager;
-use super::partner::PartnerLinkManager;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const REPORT_INTERVAL: Duration = Duration::from_secs(2);
@@ -291,7 +290,6 @@ pub fn spawn_control_tasks<C: ControlLink>(
     worker_id: WorkerId,
     info: WorkerInfo,
     mut gateways: GatewayLinkManager,
-    partners: Option<std::sync::Arc<tokio::sync::Mutex<PartnerLinkManager>>>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let heartbeat_ctrl = ctrl.clone();
     let heartbeat_task = tokio::spawn(async move {
@@ -399,9 +397,6 @@ pub fn spawn_control_tasks<C: ControlLink>(
                 "neighbor view updated"
             );
             gateways.reconcile(&last.gateways).await;
-            if let Some(partners) = partners.as_ref() {
-                partners.lock().await.reconcile(&last.peers).await;
-            }
             loop {
                 tokio::select! {
                     changed = rx.changed() => {
@@ -418,76 +413,6 @@ pub fn spawn_control_tasks<C: ControlLink>(
                         }
                     }
                 }
-            }
-        }
-    });
-
-    vec![heartbeat_task, report_task, watch_task]
-}
-
-pub fn spawn_executor_control_tasks<C: ControlLink>(
-    ctrl: C,
-    worker_id: WorkerId,
-    stats: std::sync::Arc<crate::link::executor::ExecutorStats>,
-    total_pages: u32,
-) -> Vec<tokio::task::JoinHandle<()>> {
-    let heartbeat_ctrl = ctrl.clone();
-    let heartbeat_task = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
-        loop {
-            ticker.tick().await;
-            match heartbeat_ctrl.heartbeat(NodeId::Worker(worker_id)).await {
-                Ok(Ack::Ok) => {}
-                Ok(Ack::ReRegister) => {
-                    tracing::error!(
-                        worker = %worker_id,
-                        "controller lost executor registration; restarting executor"
-                    );
-                    restart_after_lost_registration("executor");
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        worker = %worker_id,
-                        %error,
-                        "executor heartbeat transport failed"
-                    );
-                }
-            }
-        }
-    });
-
-    let report_ctrl = ctrl.clone();
-    let report_task = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(REPORT_INTERVAL);
-        loop {
-            ticker.tick().await;
-            let status = WorkerStatus {
-                kv_pressure_bucket: stats.kv_pressure_bucket(total_pages),
-                inflight: stats.inflight(),
-                ..WorkerStatus::default()
-            };
-            if let Err(error) = report_ctrl.report_worker(worker_id, status).await {
-                tracing::warn!(
-                    worker = %worker_id,
-                    %error,
-                    "executor report_worker transport failed"
-                );
-            }
-        }
-    });
-
-    let watch_task = tokio::spawn(async move {
-        let mut rx = ctrl.neighbors_watch(worker_id);
-        loop {
-            let neighbors = rx.borrow_and_update().clone();
-            tracing::debug!(
-                worker = %worker_id,
-                peers = neighbors.peers.len(),
-                epoch = neighbors.epoch,
-                "executor neighbor view updated"
-            );
-            if rx.changed().await.is_err() {
-                break;
             }
         }
     });
