@@ -621,6 +621,235 @@ fn select_bf16_mma(
     )
 }
 
+/// Whether this device has the FP8 MMA the W8A8 kernels run on (sm_89 on):
+/// where it has no tcgen05, a block-FP8 deployment's batches quantize their
+/// rows as the deployment says rather than read them bf16 (`w8a16`).
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn fp8_w8a8_capable() -> bool {
+    crate::jit::cache::arch()
+        .and_then(|a| {
+            a.trim_start_matches("sm_")
+                .trim_end_matches(char::is_alphabetic)
+                .parse::<u32>()
+                .ok()
+        })
+        .is_some_and(|cc| cc >= 89)
+}
+
+/// The fewest routes a block-FP8 select takes [`select_fp8_w8a8`] at, and
+/// the rows of a dense plane [`matmul_fp8_w8a8`] takes, between a decode's
+/// register-held W8A16 kernels and a prefill's widened cuBLAS GEMM.
+pub const FP8_W8A8_FROM: u32 = 64;
+pub const FP8_W8A8_DENSE: core::ops::RangeInclusive<u32> = 33..=256;
+
+/// `x`'s rows as e4m3 in 1x128 blocks (codes, a biased exponent a block) in
+/// stream scratch, for [`select_fp8_w8a8`] and [`matmul_fp8_w8a8`].
+#[cfg(feature = "cuda")]
+fn quantize_rows_e4m3b128(ctx: &Ctx, op: &'static str, x: Tensor) -> Result<(u64, u64), Error> {
+    let (rows, k) = (x.rows as usize, x.width as usize);
+    let codes = ctx.scratch_stream(op, "linear.fp8_w8a8_x", rows * k)? as u64;
+    let exps = ctx.scratch_stream(op, "linear.fp8_w8a8_xe", rows * (k / 128))? as u64;
+    let lanes = u32::try_from(rows * (k / 128) * 16).map_err(|_| refuse(op, "too many rows"))?;
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/moe_w8a8.cuh",
+            "::pie::linear::quantize_rows_e4m3b128",
+        )
+        .apply(Launch::grid([lanes.div_ceil(128), 1, 1], [128, 1, 1])),
+        &[
+            x.arg(),
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(exps),
+            stated(op, x.rows)?.arg(),
+            stated(op, x.width)?.arg(),
+        ],
+    )?;
+    Ok((codes, exps))
+}
+
+/// Whether the mma.sync fp8 kernels take a product of `x` against a
+/// 128x128-block FP8 plane `n` rows wide: bf16 rows, K in whole 512s (as the
+/// load lays the exponents), N in whole 128-row blocks.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn fp8_w8a8_takes(x: Tensor, n: u32) -> bool {
+    x.dtype == Dtype::Bf16 && x.width > 0 && x.width.is_multiple_of(512) && n.is_multiple_of(128)
+}
+
+/// `y[route] = q(x[route or its token]) . W[routes[route]]^T` for a
+/// 128x128-block FP8 bank (W8A8, `q` the rows' e4m3 1x128 quantization) on
+/// mma.sync, off tcgen05: the rows quantized once, routes laid out by expert
+/// on-device (graph-safe), each expert's codes read once a slice.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn select_fp8_w8a8(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: u64,
+    atoms: u64,
+    experts: u32,
+    routes: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_select_fp8_w8a8";
+    let fan = selected(OP, x, routes, y)?;
+    let n = stated(OP, nonzero(OP, "N, the bank's output width", y.width)?)?;
+    if !fp8_w8a8_takes(x, y.width) || experts == 0 {
+        return Err(refuse(
+            OP,
+            "the fp8 select takes bf16 rows, K in 512s and N in 128s",
+        ));
+    }
+    let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    // As the bf16 select: an expert's slice 8, 16, 32 or 64 routes.
+    let nb: u32 = match fan.route_count.div_ceil(experts) {
+        0..=8 => 1,
+        9..=16 => 2,
+        17..=40 => 4,
+        _ => 8,
+    };
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
+        ctx,
+        OP,
+        routes,
+        &fan,
+        experts,
+        8 * nb,
+        true,
+        if KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            "linear/moe_w8a8.cuh",
+            symbol(&format!("::pie::linear::moe_select_fp8a8_mma<{nb}, false>")),
+        )
+        .apply(
+            Launch::grid([work_cap, y.width.div_ceil(128), 1], [128, 1, 1]).smem(fp8_mma_smem(nb)),
+        ),
+        &[
+            ArgValue::Ptr(xq),
+            ArgValue::Ptr(xe),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            y.arg(),
+            ArgValue::ABSENT,
+            act_div.arg(),
+            n.arg(),
+            stated(OP, x.width)?.arg(),
+            stated(OP, experts)?.arg(),
+            stated(OP, x.rows)?.arg(),
+        ],
+    )
+}
+
+/// `y = q(x) . W^T` for one 128x128-block FP8 plane (W8A8) on mma.sync, off
+/// tcgen05: [`select_fp8_w8a8`]'s kernel over the rows in order.
+#[cfg(feature = "cuda")]
+pub fn matmul_fp8_w8a8(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: u64,
+    atoms: u64,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.matmul_fp8_w8a8";
+    if !fp8_w8a8_takes(x, y.width) || y.rows != x.rows || y.dtype != Dtype::Bf16 {
+        return Err(refuse(
+            OP,
+            "the fp8 matmul takes bf16 rows, K in 512s and N in 128s",
+        ));
+    }
+    if x.rows == 0 {
+        return Ok(());
+    }
+    let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
+    let nb: u32 = match x.rows {
+        0..=8 => 1,
+        9..=16 => 2,
+        17..=32 => 4,
+        _ => 8,
+    };
+    // K split where the plane's row blocks and the row slices leave the
+    // multiprocessors short of two CTAs each: every code still read once.
+    let sms = ctx.multiprocessors().unwrap_or(132);
+    let ctas = x.rows.div_ceil(8 * nb) * y.width.div_ceil(128);
+    let splits = (2 * sms / ctas.max(1)).clamp(1, 8).min(x.width / 128);
+    let count = x.rows as usize * y.width as usize;
+    let part = if splits > 1 {
+        ctx.scratch_stream(OP, "linear.fp8_w8a8_part", splits as usize * count * 4)? as u64
+    } else {
+        0
+    };
+    ctx.fire(
+        OP,
+        Fire::at(
+            "linear/moe_w8a8.cuh",
+            symbol(&format!("::pie::linear::moe_select_fp8a8_mma<{nb}, true>")),
+        )
+        .apply(
+            Launch::grid(
+                [x.rows.div_ceil(8 * nb), y.width.div_ceil(128), splits],
+                [128, 1, 1],
+            )
+            .smem(fp8_mma_smem(nb)),
+        ),
+        &[
+            ArgValue::Ptr(xq),
+            ArgValue::Ptr(xe),
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            y.arg(),
+            ArgValue::Ptr(part),
+            1i32.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, x.width)?.arg(),
+            1i32.arg(),
+            stated(OP, x.rows)?.arg(),
+        ],
+    )?;
+    if splits == 1 {
+        return Ok(());
+    }
+    let quads = u32::try_from(count / 4).map_err(|_| refuse(OP, "too many outputs"))?;
+    ctx.fire(
+        OP,
+        Fire::at("linear/moe_w8a8.cuh", "::pie::linear::fp8a8_fold")
+            .apply(Launch::grid([quads.div_ceil(256), 1, 1], [256, 1, 1])),
+        &[
+            ArgValue::Ptr(part),
+            y.arg(),
+            (count as i64).arg(),
+            stated(OP, splits)?.arg(),
+        ],
+    )
+}
+
+/// Three stages of 128 weight rows and 8 nb route rows, each a 128-code K
+/// step padded by 16 bytes (`kFp8a8Stages`).
+#[cfg(feature = "cuda")]
+const fn fp8_mma_smem(nb: u32) -> u32 {
+    3 * (128 + 8 * nb) * (128 + 16)
+}
+
 /// Says, once a process, that a select the tcgen05 GEMM was to take fell
 /// back to the GEMV, and why: a silent fallback reads as a slow kernel.
 #[cfg(feature = "cuda")]
