@@ -647,6 +647,15 @@ pub struct DecodeXqaWholeWindow(pub u32);
 #[decision(id = "kernel.sdpa.decode.xqa_cluster", constant(set(0, 1, 2, 4, 8)), default = 0, tune = search)]
 pub struct DecodeXqaCluster(pub u32);
 
+/// Whether a 64-wide tensor-core decode over a bf16 pool keeps three key
+/// tiles in flight a warp rather than two, its key rows swizzled rather than
+/// padded so four blocks still share an SM: a decode's two or three tiles a
+/// warp load at once, one memory latency rather than two. The same products,
+/// so the same bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.xqa_deep_64", flag, default = false, tune = search)]
+pub struct DecodeXqaDeep64;
+
 /// Whether a split attention's partial states fold a warp a (row, head)
 /// rather than through the staged persistent merge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -733,6 +742,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeXqaFrom64>()
         .add::<DecodeXqaWholeWindow>()
         .add::<DecodeXqaCluster>()
+        .add::<DecodeXqaDeep64>()
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<SdpaIndexTc5>()
@@ -855,6 +865,7 @@ tuning! {
     decode_xqa_from_64: u32 = 0, get DecodeXqaFrom64;
     decode_xqa_whole_window: u32 = 0, get DecodeXqaWholeWindow;
     decode_xqa_cluster: u32 = 0, get DecodeXqaCluster;
+    decode_xqa_deep_64: bool = false, on DecodeXqaDeep64;
     selected_mma: bool = false, on SdpaSelectedMma;
     index_mma: bool = false, on SdpaIndexMma;
     index_tc5: bool = false, on SdpaIndexTc5;

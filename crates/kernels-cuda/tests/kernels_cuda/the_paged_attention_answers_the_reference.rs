@@ -24,6 +24,16 @@ fn read(warp: bool, xqa: bool, whole: u32, cluster: u32) -> Tuning {
     })
 }
 
+/// `read` with a 64-wide decode's key tiles three deep (swizzled), and under
+/// PDL where `pdl`.
+fn deep(t: Tuning, pdl: bool) -> Tuning {
+    Tuning {
+        decode_xqa_deep_64: true,
+        pdl,
+        ..t
+    }
+}
+
 /// The decode over the lanes `(first, count)` of a fire (every lane where
 /// `Some(None)`), or the prefill where `None`.
 type Lanes = Option<Option<(u32, u32)>>;
@@ -247,6 +257,11 @@ fn the_paged_attention_answers_the_reference() {
         ([32, 16, 256], dec, None, sunk, all, read(false, true, 0, 8)),
         ([64, 8, 64], dec, w128, both, more, read(true, true, 256, 2)),
         ([32, 4, 512], dec, w200, rec, all, read(false, true, 0, 1)),
+        // The 64-wide decode three tiles deep: whole windows, a cluster, Muse Spark's heads, under PDL.
+        ([64, 8, 64], dec, w128, both, lanes, deep(read(false, true, 256, 0), false)),
+        ([64, 8, 64], dec, None, own, all, deep(read(true, true, 0, 8), true)),
+        ([128, 16, 64], dec, w200, both, all, deep(read(true, true, 128, 8), false)),
+        ([128, 16, 64], dec, None, rec, more, deep(read(false, true, 0, 4), true)),
         // FA2's prefill, one row a request and chunks over cached prefixes, sinked and not.
         ([64, 8, 64], dec, w200, both, pre, read(true, true, 0, 0)),
         ([32, 4, 512], chunks, None, own, pre, fa2),
@@ -274,6 +289,7 @@ fn the_paged_attention_answers_the_reference() {
         ([32, 2, 128], dec, None, own, all, read(false, false, 0, 0), none, true),
         ([64, 8, 64], dec, w128, sunk, all, read(true, true, 256, 0), none, true),
         ([64, 8, 64], dec, None, both, all, read(false, true, 0, 0), none, true),
+        ([64, 8, 64], dec, None, both, all, deep(read(false, true, 0, 4), false), none, true),
         ([32, 16, 256], dec, None, sunk, all, read(false, true, 0, 8), none, true),
         ([8, 2, 128], chunks, w100, sunk, pre, fa2, none, true),
         ([32, 4, 128], chunks, None, rec, pre, tuned(|t| t.prefill_tc5 = true), none, true),

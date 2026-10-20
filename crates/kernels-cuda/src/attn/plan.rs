@@ -338,7 +338,7 @@ pub fn plan_decode(
 
     // The tensor-core decode's block holds a whole stamp of key tiles; its
     // split fills the SMs once, not the FA2 kernel's occupancy.
-    let max_grid_size = match crate::attn::xqa::Stamp::of(shape.head_dim) {
+    let max_grid_size = match toggles.xqa.stamp(shape.head_dim, false) {
         Some(stamp)
             if toggles
                 .xqa
@@ -350,7 +350,7 @@ pub fn plan_decode(
     };
     // A cluster folds through distributed shared memory, sm_90 on; it fills
     // the SMs once with the stamp's blocks.
-    let ranks = match crate::attn::xqa::Stamp::of(shape.head_dim) {
+    let ranks = match toggles.xqa.stamp(shape.head_dim, false) {
         Some(stamp) if device.cc_major >= 9 => toggles.xqa.ranks(
             shape.head_dim,
             shape.group_size(),

@@ -111,13 +111,15 @@ __device__ __forceinline__ unsigned pack(float lo, float hi) {
     return bits;
 }
 
-template <int HEAD_DIM, int MT, int WARPS, int STAGES, bool FP8 = false>
+template <int HEAD_DIM, int MT, int WARPS, int STAGES, bool FP8 = false, bool SWZ = false>
 struct Shape {
     // A 16-byte pad a row puts the eight rows one `ldmatrix` reads in eight
-    // bank groups.
+    // bank groups; swizzled, a key row's 16-byte pieces trade places by its
+    // row instead (piece c at c ^ (row % 8)), unpadded.
     static constexpr int LD = HEAD_DIM + 8;
+    static constexpr int KV_LD = SWZ ? HEAD_DIM : LD;
     static constexpr int TILE = 16 * MT;
-    static constexpr int TILE_ELEMS = TILE * LD;
+    static constexpr int TILE_ELEMS = TILE * KV_LD;
     // K and V a stage, STAGES stages a warp; the query rows; P a warp.
     static constexpr int STAGE_ELEMS = 2 * TILE_ELEMS;
     static constexpr int WARP_ELEMS = STAGES * STAGE_ELEMS;
@@ -134,7 +136,7 @@ struct Shape {
     static constexpr int SMEM_BYTES = RAW_OFF + (FP8 ? WARPS * STAGES * RAW_STAGE : 0);
 };
 
-template <int HEAD_DIM, int MT, int WARPS, int STAGES, class S, class KV = bf16>
+template <int HEAD_DIM, int MT, int WARPS, int STAGES, class S, class KV = bf16, bool SWZ = false>
 __global__ void __launch_bounds__(32 * WARPS) decode(
     const bf16* __restrict__ q,
     const KV* __restrict__ k_data,
@@ -163,12 +165,16 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
     u32 ranks)
 {
     constexpr bool FP8 = sizeof(KV) == 1;
-    using Sh = Shape<HEAD_DIM, MT, WARPS, STAGES, FP8>;
+    static_assert(!(SWZ && FP8), "an e4m3 pool's tiles widen into padded rows");
+    using Sh = Shape<HEAD_DIM, MT, WARPS, STAGES, FP8, SWZ>;
     constexpr int CHUNKS8 = HEAD_DIM / 16;  // 16-byte pieces an e4m3 row
     constexpr int LD = Sh::LD;
     constexpr int TILE = Sh::TILE;
     constexpr int DT = HEAD_DIM / 16;
     constexpr int CHUNKS = HEAD_DIM / 8;  // 16-byte pieces a row
+    constexpr int KLD = Sh::KV_LD;
+    // Key row r's 16-byte piece c in a K or V tile.
+    auto kv_at = [](int r, int c) { return r * KLD + (SWZ ? (c ^ (r & 7)) : c) * 8; };
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     bf16* staged = reinterpret_cast<bf16*>(smem_raw);
@@ -270,8 +276,8 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
             long long at = __shfl_sync(0xffffffffu, cell, r & 31);
             const bool live = at >= 0;
             at = live ? at + c * 8 : 0;
-            cp16(ks + r * LD + c * 8, k_data + at, live);
-            cp16(vs + r * LD + c * 8, v_data + at, live);
+            cp16(ks + kv_at(r, c), k_data + at, live);
+            cp16(vs + kv_at(r, c), v_data + at, live);
         }
     };
     // An e4m3 stage's raw rows widened into its bf16 tiles (exact).
@@ -341,7 +347,7 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
 #pragma unroll
             for (int kc = 0; kc < DT; ++kc) {
                 unsigned a[4], b0, b1;
-                ldsm4(a, ks + (mt * 16 + (lane & 15)) * LD + kc * 16 + ((lane >> 4) << 3));
+                ldsm4(a, ks + kv_at(mt * 16 + (lane & 15), kc * 2 + (lane >> 4)));
                 ldsm2(b0, b1, qs + (lane & 7) * LD + kc * 16 + (((lane >> 3) & 1) << 3));
                 if (kc & 1) {
                     mma(s2, a, b0, b1);
@@ -404,8 +410,7 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
                 unsigned a[4];
                 // V^T as the A operand: V's rows are keys (k), its columns
                 // the value dims (m).
-                ldsm4_t(a, vs + (mt * 16 + (lane & 7) + ((lane >> 4) << 3)) * LD + d * 16 +
-                                (((lane >> 3) & 1) << 3));
+                ldsm4_t(a, vs + kv_at(mt * 16 + (lane & 7) + ((lane >> 4) << 3), d * 2 + ((lane >> 3) & 1)));
                 mma(o_acc[d], a, b0, b1);
             }
         }
