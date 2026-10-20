@@ -294,7 +294,7 @@ pub(crate) fn default_lattice(max_tokens: u32, steps: u32, fine_from: u32) -> Ve
     lattice
 }
 
-const PREFILL_LATTICE_STEPS: u32 = 4;
+const PREFILL_LATTICE_STEPS: u32 = 8;
 
 pub(crate) const LATTICE_FLOOR: u32 = 1;
 

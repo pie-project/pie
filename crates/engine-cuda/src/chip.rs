@@ -111,7 +111,7 @@ pub struct WalkFireRows(pub u32);
 #[decision(id = "engine.host_planes", flag, default = false, tune = engine)]
 pub struct HostPlanes;
 
-/// Rows from which the default bucket lattice takes four buckets a doubling
+/// Rows from which the default bucket lattice takes eight buckets a doubling
 /// whatever `engine.lattice_steps` says (a prefill's GEMMs run its bucket's
 /// rows); 0 never.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -908,7 +908,7 @@ mod hip {
             want.moe_lt_tile_deep = 256_192_064;
             want.moe_lt_tile_shallow = 128_288_032;
             want.moe_lt_deep_k = 2048;
-            want.moe_ordered_from = 256;
+            want.moe_ordered_from = 128;
             assert_eq!(kernels_cuda::tuning::Tuning::of(&profile), want, "{gpu}");
         }
     }
