@@ -590,16 +590,21 @@ fn select_bf16_wgmma(
             Share::Take
         },
     )?;
-    // `kWgStages` stages of 128 code rows and the slice's route rows, 64 bf16
-    // of K each, past the 1024-byte alignment.
-    let smem = 3 * (128 + slice) * 128 + 1024;
+    // A CTA 64 of the expert's rows, K 128 a stage where it divides (fewer
+    // barriers a row: 3.0 TB/s at Gemma 4 26B-A4B's gate-up, every expert
+    // routed), else 64: `kWgStages` stages of the rows and the slice's route
+    // rows, past the 1024-byte alignment.
+    let (tiles, atoms): (u32, u32) = (1, if x.width.is_multiple_of(128) { 2 } else { 1 });
+    let smem = 3 * atoms * (64 * tiles + slice) * 128 + 1024;
     ctx.fire(
         op,
         Fire::at(
             "linear/moe_wgmma.cuh",
-            symbol(&format!("::pie::linear::moe_select_bf16_wgmma<{slice}>")),
+            symbol(&format!(
+                "::pie::linear::moe_select_bf16_wgmma<{slice}, {tiles}, {atoms}>"
+            )),
         )
-        .apply(Launch::grid([work_cap, y.width / 128, 1], [128, 1, 1]).smem(smem)),
+        .apply(Launch::grid([work_cap, y.width / (64 * tiles), 1], [128, 1, 1]).smem(smem)),
         &[
             x.arg(),
             ArgValue::Ptr(order),

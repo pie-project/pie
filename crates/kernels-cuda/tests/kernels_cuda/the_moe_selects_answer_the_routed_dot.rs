@@ -214,6 +214,7 @@ fn the_routed_selects_answer_the_routed_dot() {
         // at its 16- and 32-route slices.
         (K::Bf16, bf16mma, [64, 16, 4, 256, 512], t, None, 0),
         (K::Bf16, bf16mma, [16, 40, 4, 128, 256], f, None, 0),
+        (K::Bf16, bf16mma, [32, 16, 4, 256, 192], t, None, 0),
         // Affine u4: per route, grouped, tcgen05.
         (K::Affine, d, [16, 1, 8, 1408, 2816], t, None, 0),
         (K::Affine, d, [16, 3, 8, 704, 704], f, None, 0),
@@ -458,5 +459,41 @@ fn the_w8a16_selects_answer_the_routed_dot() {
         let w = |r: usize, c: usize, i: usize| f64::from(s.value(routes[r] as usize * n + c, k, i));
         let want = dot([count, n, k], |r, i| a[r / div * k + i], w);
         b.check(y.ptr, &want, TOL, &what);
+    }
+}
+
+/// The bf16 select's rate at Gemma 4 26B-A4B's routed shapes (128 experts, 64
+/// tokens a top-8, routes spread): `cargo test ... -- --ignored bf16_select_rate`.
+#[test]
+#[ignore]
+fn bf16_select_rate() {
+    for (n, k) in [(1408usize, 2816usize), (2816, 704)] {
+        let (experts, tokens, top) = (128usize, 64usize, 8usize);
+        let mut b = Bench::new(7);
+        let (x, _) = b.bf16(tokens * k);
+        let bank = b.up(&tab(experts * n * k, |i| (0x3c00u16 ^ (i % 97) as u16)));
+        let routes = b.up(&tab(tokens * top, |i| {
+            ((i / top * 37 + (i % top) * 16) % experts) as i32
+        }));
+        let (xt, rt) = (t(x, tokens, k, Bf16), t(routes, tokens, top, I32));
+        let mut y = b.out(tokens * top, n);
+        #[rustfmt::skip]
+        let tuning = Tuning { moe_grouped: false, bf16_mma_from: 16, bf16_mma_until: 65_536, ..b.ctx().tuning() };
+        let ctx = b.ctx().with_tuning(tuning);
+        let fire =
+            |y: &mut _| moe::matmul_select(&ctx, xt, t(bank, experts, n * k, Bf16), rt, y, RES);
+        fire(&mut y).expect("fires");
+        b.sync();
+        let reps = 30;
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            fire(&mut y).expect("fires");
+        }
+        b.sync();
+        let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+        eprintln!(
+            "bf16 select {n}x{k}: {us:.1} us a fire, {:.0} GB/s of the bank",
+            (experts * n * k * 2) as f64 / us / 1e3
+        );
     }
 }

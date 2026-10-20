@@ -239,17 +239,22 @@ struct Mma<16> {
 }  // namespace wgbf16
 
 /// `y[route] = x[route / act_div] . W[expert]^T` for a bf16 bank on Hopper's
-/// wgmma: `moe_select_fp8a8_wgmma`'s ring and swizzle over bf16, a stage 64 of
-/// K (a 128-byte row), four m64nRk16 MMAs a stage into the sums, no block
-/// scales. `k` whole 64s, `n` whole 128s. Grid `[work_cap, n / 128]`, 128
-/// threads, `kWgStages (128 + kR) 128 + 1024` bytes of shared memory.
-template <int kR>
+/// wgmma: `moe_select_fp8a8_wgmma`'s ring and swizzle over bf16, a stage
+/// `kAtoms` 64-wide K atoms (128-byte rows), `kT` m64 tiles of the expert's
+/// rows a CTA, the MMAs summing straight into the accumulators (no block
+/// scales). `k` whole `64 kAtoms`s, `n` whole `64 kT`s. Grid `[work_cap, n /
+/// (64 kT)]`, 128 threads, `kWgStages kAtoms (64 kT + kR) 128 + 1024` bytes of
+/// shared memory.
+template <int kR, int kT = 2, int kAtoms = 1>
 __global__ void __launch_bounds__(128) moe_select_bf16_wgmma(
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const bf16* __restrict__ weight, bf16* __restrict__ out,
     int act_div, int n, int k, int num_experts) {
-    constexpr int kA = 128 * 128;
-    constexpr int kStage = kA + kR * 128;
+    // `kT` m64 tiles a CTA: 128 or 64 of the expert's rows.
+    constexpr int kRows = 64 * kT;
+    // `kAtoms` 64-wide K atoms a stage (64 or 128 of K).
+    constexpr int kA = kAtoms * kRows * 128;
+    constexpr int kStage = kA + kAtoms * kR * 128;
     constexpr int kF = kR / 2;
 
     if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
@@ -264,34 +269,34 @@ __global__ void __launch_bounds__(128) moe_select_bf16_wgmma(
         (reinterpret_cast<unsigned long long>(wgbf16_smem) + 1023) & ~1023ull);
     const int tid = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
-    const int row0 = static_cast<int>(blockIdx.y) * 128;
-    const int steps = k / 64;
+    const int row0 = static_cast<int>(blockIdx.y) * kRows;
+    const int steps = k / (64 * kAtoms);
     const bf16* w_e = weight + (static_cast<long long>(expert) * n + row0) * k;
 
     auto load = [&](int kb, int st) {
         u8* a = smem + st * kStage;
         u8* b = a + kA;
-        const int k0 = kb * 64;
-        for (int i = tid; i < 128 * 8; i += 128) {
-            const int r = i >> 3, ch = i & 7;
-            wgfp8::cp16(a + r * 128 + ((ch ^ (r & 7)) << 4),
-                        w_e + static_cast<long long>(r) * k + k0 + ch * 8);
+        const int k0 = kb * 64 * kAtoms;
+        for (int i = tid; i < kRows * 8 * kAtoms; i += 128) {
+            const int r = i / (8 * kAtoms), q = i % (8 * kAtoms), at = q >> 3, ch = q & 7;
+            wgfp8::cp16(a + at * kRows * 128 + r * 128 + ((ch ^ (r & 7)) << 4),
+                        w_e + static_cast<long long>(r) * k + k0 + q * 8);
         }
-        for (int i = tid; i < kR * 8; i += 128) {
-            const int r = i >> 3, ch = i & 7;
-            u8* dst = b + r * 128 + ((ch ^ (r & 7)) << 4);
+        for (int i = tid; i < kR * 8 * kAtoms; i += 128) {
+            const int r = i / (8 * kAtoms), q = i % (8 * kAtoms), at = q >> 3, ch = q & 7;
+            u8* dst = b + at * kR * 128 + r * 128 + ((ch ^ (r & 7)) << 4);
             if (r < count) {
                 const long long row = order[begin + r] / act_div;
-                wgfp8::cp16(dst, act + row * k + k0 + ch * 8);
+                wgfp8::cp16(dst, act + row * k + k0 + q * 8);
             } else {
                 *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
             }
         }
     };
 
-    float acc[2][kF];
+    float acc[kT][kF];
 #pragma unroll
-    for (int t = 0; t < 2; ++t)
+    for (int t = 0; t < kT; ++t)
 #pragma unroll
         for (int i = 0; i < kF; ++i) acc[t][i] = 0.f;
 
@@ -312,11 +317,12 @@ __global__ void __launch_bounds__(128) moe_select_bf16_wgmma(
         const u8* b = a + kA;
         asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 #pragma unroll
-        for (int kk = 0; kk < 4; ++kk) {
-            const unsigned long long db = wgfp8::desc(b + kk * 32);
+        for (int kk = 0; kk < 4 * kAtoms; ++kk) {
+            const int at = kk >> 2, off = (kk & 3) * 32;
+            const unsigned long long db = wgfp8::desc(b + at * kR * 128 + off);
 #pragma unroll
-            for (int t = 0; t < 2; ++t) {
-                wgbf16::Mma<kR>::run(acc[t], wgfp8::desc(a + t * 64 * 128 + kk * 32), db);
+            for (int t = 0; t < kT; ++t) {
+                wgbf16::Mma<kR>::run(acc[t], wgfp8::desc(a + at * kRows * 128 + t * 64 * 128 + off), db);
             }
         }
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
@@ -325,7 +331,7 @@ __global__ void __launch_bounds__(128) moe_select_bf16_wgmma(
     }
 
 #pragma unroll
-    for (int t = 0; t < 2; ++t)
+    for (int t = 0; t < kT; ++t)
 #pragma unroll
         for (int j = 0; j < kR / 8; ++j)
 #pragma unroll
