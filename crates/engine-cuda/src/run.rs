@@ -811,6 +811,23 @@ impl<'c> Run<'c> {
             .any(|reads| !reads.is_empty())
     }
 
+    /// Whether every lane of this window folds its rows whole: none of them
+    /// buffers, so a commit length the fire carries for another class's
+    /// lanes says nothing about these, and a one-token arm (which has no
+    /// seat for one) can run them.
+    fn rs_window_folds_whole(&self) -> bool {
+        let Some(seat) = self.rs.as_ref() else {
+            return false;
+        };
+        let lane0 = self.window().span().lane_offset as usize;
+        let lanes = self.qo_indptr_host().len().saturating_sub(1);
+        seat.lanes
+            .iter()
+            .skip(lane0)
+            .take(lanes)
+            .all(|lane| *lane == RsMove::None)
+    }
+
     fn rs_ext_layout(&self, seat: &RsSeat<'_>) -> (Vec<(u32, u32, u32)>, Vec<i32>) {
         let lane0 = self.window().span().lane_offset as usize;
         let bounds = self.qo_indptr_host();
@@ -1998,7 +2015,11 @@ impl<'c> Run<'c> {
                 RecurrentPool {
                     slot_ids: lanes(pool.slot_ids),
                     write_state_mask: lanes(pool.write_state_mask),
-                    commit_len: lanes(pool.commit_len),
+                    commit_len: if self.rs_window_folds_whole() {
+                        Tensor::ABSENT
+                    } else {
+                        lanes(pool.commit_len)
+                    },
                     begin_at: lanes(pool.begin_at),
                     #[cfg(feature = "rocm")]
                     snapshots: kernels_cuda::Snapshots {
