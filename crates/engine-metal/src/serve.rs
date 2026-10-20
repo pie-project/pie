@@ -172,6 +172,9 @@ pub struct Seated<'a> {
     pub rs: &'a engine::fire::RsVerb,
     pub rs_reset: engine::fire::RsReset,
     pub rs_slot: Option<u32>,
+    /// Rows inside the lane whose recurrent state also lands in a slot of
+    /// its own (`Lane::rs_snapshots`).
+    pub rs_snapshots: &'a [engine::fire::RsSnapshot],
     pub captures_scores: bool,
     pub translation: &'a [u32],
 }
@@ -198,6 +201,7 @@ impl<'a> Seated<'a> {
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
             rs_slot: None,
+            rs_snapshots: &[],
         }
     }
 
@@ -2783,6 +2787,10 @@ impl Shell {
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
         let mut rs_active = false;
+        // Per fire lane, the rows inside it whose state lands in a slot of its
+        // own and then those slots (`kernels_metal::attn::ssm::Snapshots`).
+        let mut rs_snaps: Vec<i32> = Vec::new();
+        let mut snap_slots = 0u32;
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut slot_of_row: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
@@ -2915,6 +2923,40 @@ impl Shell {
             }
             slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
             let at_lane = slot_ids.len() as i32 - 1;
+            {
+                const MAX: usize = kernels_metal::attn::ssm::RS_SNAPSHOTS as usize;
+                let snaps = seated.rs_snapshots;
+                if snaps.len() > MAX
+                    || (!snaps.is_empty() && row.rows as usize != lane.tokens.len())
+                    || snaps
+                        .iter()
+                        .any(|snap| snap.row == 0 || snap.row >= row.rows)
+                {
+                    return Err(Fault::program(
+                        "serve::rs",
+                        format!(
+                            "lane {source} snapshots its recurrent state at rows {:?} and runs \
+                             {} of its {} rows in this fire; a fire lands at most {MAX} \
+                             interior rows of a lane it runs whole",
+                            snaps.iter().map(|snap| snap.row).collect::<Vec<_>>(),
+                            row.rows,
+                            lane.tokens.len()
+                        ),
+                    ));
+                }
+                if !snaps.is_empty() && rs_snaps.is_empty() {
+                    rs_snaps.resize(at_lane as usize * 2 * MAX, 0);
+                }
+                if !rs_snaps.is_empty() {
+                    let mut entry = [0i32; 2 * MAX];
+                    for (at, snap) in snaps.iter().enumerate() {
+                        entry[at] = narrow(u64::from(snap.row));
+                        entry[MAX + at] = narrow(u64::from(snap.slot));
+                        snap_slots = snap_slots.max(snap.slot.saturating_add(1));
+                    }
+                    rs_snaps.extend(entry);
+                }
+            }
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
                 if self.rs_layout.is_none() {
                     return Err(Fault::program(
@@ -3051,7 +3093,8 @@ impl Shell {
                 .iter()
                 .map(|&row| (row as u32).saturating_add(1))
                 .max()
-                .unwrap_or(0),
+                .unwrap_or(0)
+                .max(snap_slots),
             workspace: 0,
         };
         Supply::commit(&mut self.pools, demand)?;
@@ -3529,6 +3572,7 @@ impl Shell {
                 slot_of_row: &slot_of_row,
                 rs_replay: rs_active.then_some(rs_replay.as_slice()),
                 rs_commit: rs_active.then_some(rs_commit.as_slice()),
+                rs_snaps: (!rs_snaps.is_empty()).then_some(rs_snaps.as_slice()),
                 request_of_token: &request_of_token,
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
                 spaces: &geometries,
@@ -3636,6 +3680,9 @@ impl Shell {
             geometry,
             tables: FireTables {
                 request_of_token: bound.request_of_token,
+                readout_positions: bound.readout_positions,
+                readout_request_of_token: bound.readout_request_of_token,
+                readout_mask_enabled: bound.readout_mask_enabled,
                 mask: bound.mask,
                 mask_enabled: bound.mask_enabled,
                 mask_stride: bound.mask_stride,
@@ -3646,6 +3693,7 @@ impl Shell {
                 }
                 _ => None,
             },
+            rs_snaps: bound.rs_snaps,
             rs: if rs_active {
                 let (Some(layout), Some(buffers), Some(scratch)) =
                     (&self.rs_layout, &self.rs_buffers, &self.rs_scratch)

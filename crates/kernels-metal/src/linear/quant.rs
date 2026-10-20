@@ -56,6 +56,13 @@ pub fn qmm_group(bm: i32) -> [u32; 3] {
     [32, 2, if bm < 2 * FRAG_ROWS { 1 } else { 2 }]
 }
 
+/// The threadgroup of the MXFP4 and fp16 routed matmuls: `quant_qmm_t.metal`'s
+/// `routed_wm`, two simdgroups for a tile of at most 16 rows.
+#[must_use]
+pub fn routed_group(bm: i32) -> [u32; 3] {
+    [32, 2, if bm <= 2 * FRAG_ROWS { 1 } else { 2 }]
+}
+
 const FRAG_ROWS: i32 = 8;
 
 const QMV_GROUP: [u32; 3] = [32, 2, 1];
@@ -284,14 +291,31 @@ pub fn mb_block(rows: i32, capacity: i32) -> Option<(i32, i32)> {
             .saturating_mul(rung);
         (padded <= capacity).then_some((rung, padded))
     };
+    // A prompt-sized batch takes the widest tile that pads it by at most a
+    // sixteenth: a few rows past a whole number of 64-row tiles would
+    // otherwise run a whole tile more.
+    let snug = |(rung, padded): (i32, i32)| {
+        (rows < PROMPT_ROWS || padded - rows <= rows / 16).then_some((rung, padded))
+    };
     BM_RUNGS
         .iter()
         .rev()
         .copied()
         .filter(|rung| rows >= *rung)
-        .find_map(fits)
+        .find_map(|rung| fits(rung).and_then(snug))
+        .or_else(|| {
+            BM_RUNGS
+                .iter()
+                .rev()
+                .copied()
+                .filter(|rung| rows >= *rung)
+                .find_map(fits)
+        })
         .or_else(|| fits(BM_RUNGS[0]))
 }
+
+/// The rows from which [`mb_block`] weighs a tile's padding.
+const PROMPT_ROWS: i32 = 256;
 
 /// The widest row tile up to `widen_to` that still fills, for a padded
 /// matmul now tiled at `bm`.
@@ -631,7 +655,7 @@ fn act_x_wt_over(
     for choice in tuning.qmm(&at) {
         match choice {
             Qmm::Mpp => {
-                let (bm, bn) = crate::tuning::mpp_tile(rows);
+                let (bm, bn) = crate::tuning::mpp_tile_for(rows, columns);
                 // A column cut lands part of a row, which the MPP kernel never does.
                 if columns == stride {
                     let padded = rows.div_ceil(bm) * bm;
@@ -1289,6 +1313,9 @@ mod tests {
         assert_eq!(widen_rung(16, 16, 32, fills), 16);
         assert_eq!(widen_rung(8, 8, 32, fills), 8);
         assert_eq!(widen_rung(8, 16, 32, |_| false), 8);
+        assert_eq!(mb_block(512, 1024), Some((64, 512)));
+        assert_eq!(mb_block(525, 1024), Some((32, 544)));
+        assert_eq!(mb_block(560, 1024), Some((64, 576)));
     }
 
     fn the_split_follows_the_tile_count() {

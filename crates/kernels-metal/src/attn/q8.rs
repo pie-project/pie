@@ -24,9 +24,9 @@ pub(super) fn mpp_fits(
     rows: SdpaMppRows,
 ) -> bool {
     causal
-        && !lse
+        && (!lse || dim == 64)
         && q.rows >= rows.from
-        && matches!(dim, 128 | 256)
+        && matches!(dim, 64 | 128 | 256)
         && pool.page_size == 32
         && pool.keys.dtype == Dtype::Bf16
         && pool.values.dtype == Dtype::Bf16
@@ -60,9 +60,9 @@ pub(super) fn attention(
     } = rows;
     let mpp = allow_mpp
         && causal
-        && lse.is_none()
+        && (lse.is_none() || (dim == 64 && !q8))
         && pool.page_size == 32
-        && matches!(dim, 128 | 256)
+        && (matches!(dim, 128 | 256) || (dim == 64 && !q8))
         && q.rows >= from;
     let paired = !mpp
         && dim == 256
@@ -79,6 +79,8 @@ pub(super) fn attention(
             (true, _, 128) if q8 => "q8_mpp_d128",
             (true, _, 256) if q8 && q.rows >= direct_from => "q8_visit_direct",
             (true, _, 256) if q8 => "q8_mpp_d256",
+            (true, false, 64) => "sdpa_mpp_d64",
+            (true, true, 64) => "sdpa_mpp_lse_d64",
             (true, _, 128) => "sdpa_mpp_d128",
             (true, _, 256) if q.rows >= direct_from => "sdpa_visit_direct",
             (true, _, 256) => "sdpa_mpp_d256",
@@ -118,6 +120,8 @@ pub(super) fn attention(
     if let Some(lse) = lse {
         super::lse_plane(op, lse, &shape);
         args.push(lse.arg_mut());
+    } else if mpp {
+        args.push(ctx.absent()?);
     }
     let threads = if mpp { 256 } else { 1024 };
     let grid = if mpp {

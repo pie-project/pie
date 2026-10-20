@@ -135,7 +135,11 @@ impl Run<'_> {
                 self.ctx(),
                 self.tuning(),
                 self.tensor(*q),
-                self.decode_plan(*plan),
+                &if self.reads_out(*q) {
+                    self.readout_plan(*plan)
+                } else {
+                    *self.decode_plan(*plan)
+                },
                 self.pool(*cache),
                 *window,
                 *head_dim,
@@ -739,7 +743,7 @@ impl Run<'_> {
                 let seat = self.rs_seat().expect("guarded");
                 let ext_x = self.rs_extend(OP, &seat, *x)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
-                attn::ssm::causal_conv1d_committed(
+                attn::ssm::causal_conv1d_committed_landing(
                     self.ctx(),
                     ext_x,
                     self.qo_indptr(),
@@ -749,6 +753,7 @@ impl Run<'_> {
                     *conv_width,
                     *dilation,
                     ext_y,
+                    self.rs_snapshots(),
                 )?;
                 self.rs_land(OP, &seat, ext_y, *y)
             }
@@ -798,7 +803,7 @@ impl Run<'_> {
                 let ext_qkv = self.rs_ext_of(OP, &seat, *qkv)?;
                 let ext_gates = self.rs_ext_of(OP, &seat, *gates)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
-                attn::ssm::gated_delta_committed(
+                attn::ssm::gated_delta_committed_landing(
                     self.ctx(),
                     self.tuning(),
                     ext_qkv,
@@ -812,6 +817,7 @@ impl Run<'_> {
                     *k_dim,
                     *v_dim,
                     ext_y,
+                    self.rs_snapshots(),
                 )?;
                 self.rs_land(OP, &seat, ext_y, *y)
             }
@@ -897,7 +903,7 @@ impl Run<'_> {
                 dilation,
                 y,
                 ..
-            } => attn::ssm::causal_conv1d_chunked(
+            } => attn::ssm::causal_conv1d_chunked_landing(
                 self.ctx(),
                 self.ragged(*x),
                 self.tensor(*weight),
@@ -905,6 +911,7 @@ impl Run<'_> {
                 *conv_width,
                 *dilation,
                 self.tensor(*y),
+                self.rs_snapshots(),
             ),
             Attention::DecodeRel { .. }
             | Attention::PrefillRel { .. }
@@ -1041,7 +1048,7 @@ impl Run<'_> {
                 k_dim,
                 v_dim,
                 y,
-            } => attn::ssm::gated_delta_chunked(
+            } => attn::ssm::gated_delta_chunked_landing(
                 self.ctx(),
                 self.tuning(),
                 self.ragged(*qkv),
@@ -1053,6 +1060,7 @@ impl Run<'_> {
                 *k_dim,
                 *v_dim,
                 self.tensor(*y),
+                self.rs_snapshots(),
             ),
             Attention::SsmKdaStep {
                 mixed,

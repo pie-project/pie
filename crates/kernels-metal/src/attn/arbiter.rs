@@ -13,6 +13,21 @@ const MMA_ENTRY: &str = "sdpa_paged_mma_bfloat16_d_64";
 
 const MMA_LSE_ENTRY: &str = "sdpa_paged_mma_lse_bfloat16_d_64";
 
+/// The wide heads' simdgroup-matrix kernels, a 128-wide slice of the head a
+/// simdgroup and four row groups: as many threads as the head is wide.
+const MMA_WIDE: [(u32, &str, &str); 2] = [
+    (
+        256,
+        "sdpa_paged_mma_wide_bfloat16_d_256",
+        "sdpa_paged_mma_wide_lse_bfloat16_d_256",
+    ),
+    (
+        512,
+        "sdpa_paged_mma_wide_bfloat16_d_512",
+        "sdpa_paged_mma_wide_lse_bfloat16_d_512",
+    ),
+];
+
 const MMA_FILE: &str = "attn/sdpa_paged_mma.metal";
 
 #[must_use]
@@ -22,8 +37,8 @@ pub fn should_tile(rows: u32, requests: u32, tuning: &Tuning) -> bool {
 
 #[must_use]
 pub fn should_mma(head_dim: u32, tuning: &Tuning) -> bool {
-    // The plain and the lse kernels are both stamped at one head width.
-    tuning.sdpa_mma() && head_dim == MMA_HEAD_DIM
+    // The plain and the lse kernels are stamped at 64, 256 and 512.
+    tuning.sdpa_mma() && (head_dim == MMA_HEAD_DIM || MMA_WIDE.iter().any(|w| w.0 == head_dim))
 }
 
 fn as_decode(plan: &PrefillPlan, mask: Tensor) -> DecodePlan {
@@ -51,11 +66,15 @@ fn mma(
     lse: Option<Tensor>,
 ) -> Result<(), Error> {
     let shape = Paged::of(op, q, pool, window, true, head_dim)?;
-    let lanes = shape.q_heads.checked_mul(MMA_THREADS).ok_or_else(|| {
+    let (threads, plain, with_lse) = match MMA_WIDE.iter().find(|w| w.0 == head_dim) {
+        Some(&(width, plain, with_lse)) => (width, plain, with_lse),
+        None => (MMA_THREADS, MMA_ENTRY, MMA_LSE_ENTRY),
+    };
+    let lanes = shape.q_heads.checked_mul(threads).ok_or_else(|| {
         refuse(
             op,
             format!(
-                "the grid will not launch: {} query heads, one {MMA_THREADS}-thread group each",
+                "the grid will not launch: {} query heads, one {threads}-thread group each",
                 shape.q_heads
             ),
         )
@@ -81,17 +100,17 @@ fn mma(
         stated(op, shape.rows)?.arg(),
     ];
     let entry = match lse {
-        None => MMA_ENTRY,
+        None => plain,
         Some(lse) => {
             lse_plane(op, lse, &shape);
             args.push(lse.arg_mut());
-            MMA_LSE_ENTRY
+            with_lse
         }
     };
     ctx.fire(
         Fire::at(MMA_FILE, entry).apply(Grid::of(
             [lanes, shape.rows.div_ceil(SDPA_TILE).max(1), 1],
-            [MMA_THREADS, 1, 1],
+            [threads, 1, 1],
         )),
         &args,
     )

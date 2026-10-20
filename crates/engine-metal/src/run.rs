@@ -63,6 +63,13 @@ pub struct CacheGeometry {
 pub struct FireTables {
     pub request_of_token: Tensor,
 
+    /// Each readout row's position, lane and mask flag (`inputs::Handles`).
+    pub readout_positions: Tensor,
+
+    pub readout_request_of_token: Tensor,
+
+    pub readout_mask_enabled: Tensor,
+
     pub mask: Tensor,
 
     pub mask_enabled: Tensor,
@@ -120,6 +127,10 @@ pub struct FireBindings {
     pub scores: Option<crate::scores::ScoreSeat>,
 
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
+
+    /// The fire's recurrent snapshot table, when a lane snapshots
+    /// (`kernels_metal::attn::ssm::Snapshots`).
+    pub rs_snaps: Option<Tensor>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -185,6 +196,10 @@ pub(crate) struct Chain {
     hidden: ValueId,
     routed: ValueId,
     padded: u32,
+    /// The row tile the down's MPP kernel reads its input sums at, when it takes it.
+    sums_tile: Option<u32>,
+    /// The activation landed the down's input sums at `sums_tile`.
+    sums: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,13 +278,14 @@ impl<'c> Run<'c> {
     }
 
     /// How a batched routed matmul of `x` over `routes` into `y` stands in a
-    /// sorted chain: a gate-up whose output only a swiglu reads, whose output
+    /// sorted chain: a gate-up whose output only a gated activation reads, whose output
     /// only a down over the same routes reads, whose output only a fold
     /// reads, starts one; that down continues it. Anything else runs as it
     /// always has.
     pub(crate) fn chain_select(
         &self,
         x: ValueId,
+        bank: ValueId,
         routes: ValueId,
         y: ValueId,
     ) -> kernels_metal::linear::moe::Sorted {
@@ -288,20 +304,29 @@ impl<'c> Run<'c> {
             return Sorted {
                 input: true,
                 output: true,
+                sums: chain.sums,
             };
         }
         self.chain.set(None);
-        let Some(Operation::Linear(Linear::MlpSwiglu {
-            packed, y: hidden, ..
-        })) = self.sole_reader(y).map(|n| &n.op)
-        else {
-            return Sorted::default();
+        let (packed, hidden) = match self.sole_reader(y).map(|n| &n.op) {
+            Some(Operation::Linear(
+                Linear::MlpSwiglu {
+                    packed, y: hidden, ..
+                }
+                | Linear::MlpSwigluClampAlpha {
+                    packed, y: hidden, ..
+                }
+                | Linear::MlpGegluTanhPacked {
+                    packed, y: hidden, ..
+                },
+            )) => (packed, hidden),
+            _ => return Sorted::default(),
         };
         let Some(Operation::Linear(Linear::MoeMatmulSelectQuant {
             x: down_x,
+            bank: down_bank,
             routes: down_routes,
             y: routed,
-            ..
         })) = self.sole_reader(*hidden).map(|n| &n.op)
         else {
             return Sorted::default();
@@ -314,12 +339,32 @@ impl<'c> Run<'c> {
         if *packed != y || down_x != hidden || *down_routes != routes || folded != routed {
             return Sorted::default();
         }
-        let pairs = self.tensor(y).rows;
-        let Some((padded, _)) =
-            kernels_metal::linear::moe::sorted_stack(pairs, self.experts(routes), self.tuning)
-        else {
+        let stack = |x, bank, y| {
+            kernels_metal::linear::moe::sorted_stack(
+                self.tensor(x),
+                self.planes(bank),
+                self.tensor(y),
+                self.experts(routes),
+                self.tuning,
+            )
+        };
+        // The down reads the gate-up's sorted rows, so both passes sort alike.
+        let Some((padded, tile)) = stack(x, bank, y) else {
             return Sorted::default();
         };
+        if stack(*hidden, *down_bank, *routed) != Some((padded, tile)) {
+            return Sorted::default();
+        }
+        let sums_tile = self.routed_scratch().and_then(|scratch| {
+            kernels_metal::linear::moe::mpp_sums_tile(
+                self.tensor(*hidden),
+                self.planes(*down_bank),
+                self.tensor(*routed),
+                self.experts(routes),
+                scratch.sums,
+                self.tuning,
+            )
+        });
         self.chain.set(Some(Chain {
             step: ChainStep::GateUp,
             routes,
@@ -327,10 +372,13 @@ impl<'c> Run<'c> {
             hidden: *hidden,
             routed: *routed,
             padded,
+            sums_tile,
+            sums: false,
         }));
         Sorted {
             input: false,
             output: true,
+            sums: false,
         }
     }
 
@@ -357,6 +405,20 @@ impl<'c> Run<'c> {
             Tensor::new(scratch.x.buf, chain.padded, inter, poem_ir::Dtype::Bf16),
             scratch.perm,
         ))
+    }
+
+    /// Where the chain's activation lands the down's input sums and at which
+    /// row tile, when the down's MPP kernel reads them; the down then skips its
+    /// sums pass. Only an activation that writes them asks.
+    pub(crate) fn chain_sums(&self) -> Option<(Tensor, u32)> {
+        let chain = self.chain.get()?;
+        if chain.step != ChainStep::Swiglu {
+            return None;
+        }
+        let tile = chain.sums_tile?;
+        let scratch = self.routed_scratch()?;
+        self.chain.set(Some(Chain { sums: true, ..chain }));
+        Some((scratch.sums, tile))
     }
 
     /// The sorted down rows, the route-to-row map and the fan-out, when
@@ -520,6 +582,17 @@ impl<'c> Run<'c> {
         self.fire.rs.clone()
     }
 
+    /// Where this window's prompt scans land the state as of rows inside a
+    /// lane, when a lane of the fire snapshots.
+    pub(crate) fn rs_snapshots(&self) -> Option<kernels_metal::attn::ssm::Snapshots> {
+        self.fire
+            .rs_snaps
+            .map(|table| kernels_metal::attn::ssm::Snapshots {
+                table,
+                lane0: self.window().span.lane_offset,
+            })
+    }
+
     pub(crate) fn ctx(&self) -> &'c Ctx<'c> {
         self.ctx
     }
@@ -528,7 +601,7 @@ impl<'c> Run<'c> {
         &self.fire
     }
 
-    fn slice(&self, handle: Tensor, skip: u32, keep: u32) -> Tensor {
+    pub(crate) fn slice(&self, handle: Tensor, skip: u32, keep: u32) -> Tensor {
         if skip == 0 && keep >= handle.rows {
             return handle;
         }
@@ -1010,6 +1083,39 @@ impl<'c> Run<'c> {
                 id.0
             ),
         }
+    }
+
+    /// The decode plan `id` as a query of readout rows reads it: each row
+    /// attends as the token it reads out, its position, lane and mask flag
+    /// those of that token, over this window's readouts.
+    pub(crate) fn readout_plan(&self, id: ValueId) -> DecodePlan {
+        let plan = *self.decode_plan(id);
+        let window = self.window();
+        assert!(
+            window.gathered.is_none(),
+            "a decode over readout rows runs in a window of whole lanes, and this one \
+             was gathered"
+        );
+        let (skip, keep) = readout_span(
+            &self.fire.readout_indptr,
+            window.span.lane_offset,
+            window.span.lanes,
+        );
+        let t = &self.fire.tables;
+        DecodePlan {
+            positions: self.slice(t.readout_positions, skip, keep),
+            request_of_token: self.slice(t.readout_request_of_token, skip, keep),
+            mask_enabled: self.slice(t.readout_mask_enabled, skip, keep),
+            ..plan
+        }
+    }
+
+    /// Whether `id`'s rows are the fire's readouts rather than its tokens.
+    pub(crate) fn reads_out(&self, id: ValueId) -> bool {
+        matches!(
+            &self.values[id.0 as usize].ty,
+            Ty::Tensor { shape, .. } if shape.first() == Some(&Dim::Readouts)
+        )
     }
 
     pub(crate) fn prefill_plan(&self, id: ValueId) -> &PrefillPlan {

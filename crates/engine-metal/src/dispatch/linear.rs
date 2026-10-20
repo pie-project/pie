@@ -23,10 +23,21 @@ impl Run<'_> {
                 y,
             } => match self
                 .ane()
-                .and_then(|ane| Some((ane, ane.plan(*gate_up, self.tensor(*act).rows)?)))
+                .and_then(|ane| {
+                    let head = ane.head_rows(self.tensor(*act).rows);
+                    Some((ane, ane.plan(*gate_up, head)?))
+                })
                 .filter(|(_, plan)| self.split_fits(plan, *act, *h, *y))
             {
-                Some((ane, plan)) => self.mlp_split(ane, &plan, *act, *packed, *h, *y),
+                Some((ane, plan)) => self.mlp_split(
+                    ane,
+                    &plan,
+                    *act,
+                    (*gate_up, *down, *intermediate),
+                    *packed,
+                    *h,
+                    *y,
+                ),
                 None => {
                     self.linear(&Linear::Matmul {
                         act: *act,
@@ -107,28 +118,90 @@ impl Run<'_> {
         ane.after_columns(self.ctx(), plan, out)
     }
 
+    /// The whole MLP on the GPU over the rows of `act` past the `head` the
+    /// Neural Engine shares, landed in the same planes' rows while the
+    /// Neural Engine runs the head.
+    #[allow(clippy::too_many_arguments)]
+    fn mlp_tail(
+        &self,
+        head: u32,
+        act: poem_ir::ValueId,
+        gate_up: poem_ir::ValueId,
+        down: poem_ir::ValueId,
+        intermediate: u32,
+        packed: poem_ir::ValueId,
+        h: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> Result<(), kernels_metal::Error> {
+        let (Some(gate_up), Some(down)) = (self.banked(gate_up), self.banked(down)) else {
+            return Err(kernels_metal::Error::Unsupported {
+                op: "fused.mlp_swiglu",
+            });
+        };
+        let tail = self.tensor(act).rows - head;
+        let at = |id: poem_ir::ValueId| self.slice(self.tensor(id), head, tail);
+        let room = |id: poem_ir::ValueId| self.capacity(id).saturating_sub(head);
+        let precast = |rows, contraction| self.precast(rows, contraction);
+        let partials = |rows, width| self.partials(rows, width);
+        let scratch = || linear::quant::Scratch {
+            precast: &precast,
+            partials: &partials,
+        };
+        let (x, gate, hidden, out) = (at(act), at(packed), at(h), at(y));
+        linear::quant::matmul(
+            self.ctx(),
+            self.tuning(),
+            x,
+            gate_up,
+            gate,
+            scratch(),
+            room(act).min(room(packed)),
+        )?;
+        linear::mlp::swiglu(self.ctx(), gate, intermediate, hidden)?;
+        linear::quant::matmul(
+            self.ctx(),
+            self.tuning(),
+            hidden,
+            down,
+            out,
+            scratch(),
+            room(h).min(room(y)),
+        )
+    }
+
     /// The GPU's share of a split MLP, between the hand-off and the join:
     /// gate and up over its leading `keep` channels, written compactly into
     /// the packed and staging planes, swiglu, and down over those channels
     /// into `y`, which the join then adds the Neural Engine's partial to.
+    /// Rows past the plan's run the whole MLP on the GPU meanwhile.
+    #[allow(clippy::too_many_arguments)]
     fn mlp_split(
         &self,
         ane: &crate::ane::Ane,
         plan: &crate::ane::Plan,
         act: poem_ir::ValueId,
+        (gate_up, down, intermediate): (poem_ir::ValueId, poem_ir::ValueId, u32),
         packed: poem_ir::ValueId,
         h: poem_ir::ValueId,
         y: poem_ir::ValueId,
     ) -> Result<(), kernels_metal::Error> {
         let keep = plan.split.keep;
-        let x = self.tensor(act);
-        let out = self.tensor(y);
+        let x = kernels_metal::Tensor {
+            rows: plan.rows,
+            ..self.tensor(act)
+        };
+        let out = kernels_metal::Tensor {
+            rows: plan.rows,
+            ..self.tensor(y)
+        };
         let gate = kernels_metal::Tensor {
             width: keep,
+            rows: plan.rows,
             ..self.tensor(packed)
         };
         let h_gpu = kernels_metal::Tensor {
             width: keep,
+            rows: plan.rows,
             ..self.tensor(h)
         };
         ane.before(self.ctx(), plan, x)?;
@@ -167,6 +240,9 @@ impl Run<'_> {
             scratch(),
             self.capacity(h).min(self.capacity(y)),
         )?;
+        if plan.rows < self.tensor(act).rows {
+            self.mlp_tail(plan.rows, act, gate_up, down, intermediate, packed, h, y)?;
+        }
         ane.after(self.ctx(), plan, out)
     }
 
@@ -274,14 +350,25 @@ impl Run<'_> {
                 limit,
                 alpha,
                 y,
-            } => linear::mlp::swiglu_clamp_alpha(
-                self.ctx(),
-                self.tensor(*packed),
-                *intermediate,
-                *limit,
-                *alpha,
-                self.tensor(*y),
-            ),
+            } => match self.chain_swiglu(*packed, *y) {
+                Some((sorted_packed, sorted_h, perm)) => linear::mlp::swiglu_clamp_alpha_sorted(
+                    self.ctx(),
+                    sorted_packed,
+                    *intermediate,
+                    *limit,
+                    *alpha,
+                    perm,
+                    sorted_h,
+                ),
+                None => linear::mlp::swiglu_clamp_alpha(
+                    self.ctx(),
+                    self.tensor(*packed),
+                    *intermediate,
+                    *limit,
+                    *alpha,
+                    self.tensor(*y),
+                ),
+            },
             Linear::MlpSwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
                 self.ctx(),
                 self.tensor(*gate),
@@ -311,12 +398,32 @@ impl Run<'_> {
                 packed,
                 intermediate,
                 y,
-            } => linear::mlp::geglu_tanh_packed(
-                self.ctx(),
-                self.tensor(*packed),
-                *intermediate,
-                self.tensor(*y),
-            ),
+            } => match self.chain_swiglu(*packed, *y) {
+                Some((sorted_packed, sorted_h, perm)) => match self.chain_sums() {
+                    Some((sums, tile)) => linear::mlp::geglu_tanh_sorted_sums(
+                        self.ctx(),
+                        sorted_packed,
+                        *intermediate,
+                        perm,
+                        sorted_h,
+                        sums,
+                        tile,
+                    ),
+                    None => linear::mlp::geglu_tanh_sorted(
+                        self.ctx(),
+                        sorted_packed,
+                        *intermediate,
+                        perm,
+                        sorted_h,
+                    ),
+                },
+                None => linear::mlp::geglu_tanh_packed(
+                    self.ctx(),
+                    self.tensor(*packed),
+                    *intermediate,
+                    self.tensor(*y),
+                ),
+            },
             Linear::MlpSitu {
                 packed,
                 intermediate,
@@ -490,8 +597,9 @@ impl Run<'_> {
                 y,
             } => {
                 const OP: &str = "linear.moe_matmul_select_bias";
-                if let Some(scratch) = self.routed_scratch()
-                    && linear::moe::matmul_select_batched(
+                if let Some(scratch) = self.routed_scratch() {
+                    let sorted = self.chain_select(*x, *bank, *routes, *y);
+                    if linear::moe::matmul_select_batched(
                         self.ctx(),
                         OP,
                         self.tensor(*x),
@@ -502,10 +610,15 @@ impl Run<'_> {
                         scratch,
                         self.tensor(*y),
                         self.tuning(),
-                        linear::moe::Sorted::default(),
-                    )?
-                {
-                    return Ok(());
+                        sorted,
+                    )? {
+                        return Ok(());
+                    }
+                    debug_assert!(
+                        !sorted.input && !sorted.output,
+                        "a chain starts only where the batched matmul runs"
+                    );
+                    self.chain_clear();
                 }
                 linear::moe::matmul_select_bias(
                     self.ctx(),
@@ -519,7 +632,7 @@ impl Run<'_> {
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
                 const OP: &str = "linear.moe_matmul_select_quant";
                 if let Some(scratch) = self.routed_scratch() {
-                    let sorted = self.chain_select(*x, *routes, *y);
+                    let sorted = self.chain_select(*x, *bank, *routes, *y);
                     if linear::moe::matmul_select_batched(
                         self.ctx(),
                         OP,

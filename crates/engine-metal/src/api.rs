@@ -604,7 +604,7 @@ impl Engine for Metal {
             media_encode: false,
             device_channel_commit: false,
             rs_verbs: shell.serves_rs_verbs(),
-            rs_snapshots: 0,
+            rs_snapshots: crate::rs::snapshots(shell.trace()),
             bidirectional_attention: true,
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
@@ -1079,6 +1079,7 @@ impl Metal {
                     rs: &lane.rs,
                     rs_reset: lane.rs_reset,
                     rs_slot: lane.rs_slot,
+                    rs_snapshots: &lane.rs_snapshots,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;
