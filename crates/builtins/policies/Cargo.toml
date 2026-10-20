@@ -18,6 +18,7 @@ members = [
     "drain-migrate",
     "relocate",
     "pool-replicate",
+    "replicate",
     "test-spin",
     "test-trap",
     "test-route",

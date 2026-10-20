@@ -22,6 +22,7 @@ in a compat body, or as `LaunchProcess.props`) and the session it names.
 | `cache-aware` | cluster | sends a launch to the worker holding the most of its prompt (as the gateway routed it) if that is at least 0.3 of it, else to the least loaded; load wins when one worker runs 8 more turns than another and 1.5 times as many (after SGLang's router) | `worker` |
 | `session-affinity` | cluster | sends a session's processes where its last one went | the session |
 | `pool-replicate` | cluster | keeps every run some worker caches in every pool too, so it outlives the worker | |
+| `replicate` | cluster | keeps every run some worker caches on two decode workers (the two a hash of the run picks), in their host tier, so losing a worker leaves its runs on another | |
 | `relocate` | cluster | places a launch by `worker`, then moves it to `move-to` once it has run `move-after-ms`; its stream goes on | `worker`, `move-to`, `move-after-ms` |
 | `drain-migrate` | cluster | moves every turn running on a draining worker to the least loaded one that is not, so a worker leaves without ending what it runs | |
 | `rebalance` | cluster | keeps running turns even across serving workers by moving the youngest from the busiest to the idlest (after Llumnix); a `worker` prop names where a launch starts | `worker` |
