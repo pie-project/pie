@@ -1287,6 +1287,10 @@ __global__ void residual_add(T* __restrict__ y, const T* __restrict__ x, usize n
 // Eight bf16 lanes a thread, rows of whole 16-byte groups (`width8` a row).
 __global__ void residual_add_vec8(bf16* __restrict__ y, const bf16* __restrict__ x, usize n8,
                                   int width8, const u32* __restrict__ win) {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n8) return;
     if (win != nullptr && i >= static_cast<usize>(win[0]) * static_cast<usize>(width8)) return;
