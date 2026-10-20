@@ -564,3 +564,53 @@ fn nvfp4_select_rate() {
         );
     }
 }
+
+/// The block-FP8 select's rate at GLM-5.3-Flash-mini's decode shapes (32
+/// experts, a C64 step's 64 tokens on eight each): the gate-up (by token)
+/// and the down projection (by route).
+#[test]
+#[ignore = "a rate, not an answer"]
+fn fp8_select_rate() {
+    use kernels_cuda::linear::moe::select_fp8_w8a8;
+    use kernels_cuda::linear::tc5::atom_bytes;
+    let (experts, tokens, top) = (32usize, 64usize, 8usize);
+    for (n, k, by_token) in [(4096usize, 4096usize, true), (4096, 2048, false)] {
+        let mut b = Bench::new(11);
+        let count = tokens * top;
+        // `PIE_ROUTES`: a file of `count` i32 expert ids (a skewed routing).
+        let routes: Vec<i32> = std::env::var("PIE_ROUTES").map_or_else(
+            |_| tab(count, |r| ((r / top * 3 + r % top * 5) % experts) as i32),
+            |p| {
+                let bytes = std::fs::read(p).expect("reads the routes");
+                bytes
+                    .chunks(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            },
+        );
+        let rows_x = if by_token { tokens } else { count };
+        let (x, _) = b.bf16(rows_x * k);
+        let codes = b.up(&tab(experts * n * k, |i| (i * 37 % 251) as u8 & 0xbf));
+        let atoms = b.up(&tab(atom_bytes(experts * n, k, 128), |i| {
+            120 + (i % 5) as u8
+        }));
+        let r = t(b.up(&routes), tokens, top, I32);
+        let mut y = b.out(count, n);
+        let ctx = b.ctx();
+        let x = t(x, rows_x, k, Bf16);
+        let fire = |y: &mut _| select_fp8_w8a8(&ctx, x, codes, atoms, experts as u32, r, y);
+        fire(&mut y).expect("fires");
+        b.sync();
+        let reps = 30;
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            fire(&mut y).expect("fires");
+        }
+        b.sync();
+        let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+        eprintln!(
+            "fp8 select {n}x{k} by_token={by_token}: {us:.1} us a fire, {:.0} GB/s of the bank",
+            (experts * n * k) as f64 / us / 1e3
+        );
+    }
+}
