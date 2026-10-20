@@ -1653,6 +1653,22 @@ impl Run<'_> {
                 }
                 let x = self.tensor(x);
                 let routes = self.tensor(routes);
+                // A batch's routes quantized as the deployment says, on the
+                // FP8 MMA where there is one (W8A8).
+                if linear::moe::fp8_w8a8_capable()
+                    && routes.rows * routes.width >= linear::moe::FP8_W8A8_FROM
+                    && linear::moe::fp8_w8a8_takes(x, self.tensor(y).width)
+                {
+                    return linear::moe::select_fp8_w8a8(
+                        self.ctx(),
+                        x,
+                        codes.ptr,
+                        scales.ptr,
+                        codes.rows,
+                        routes,
+                        &mut self.tensor(y),
+                    );
+                }
                 linear::moe::select_fp8_w8a16(
                     self.ctx(),
                     op,
@@ -1718,6 +1734,15 @@ impl Run<'_> {
             && act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)?
         {
             return Ok(());
+        }
+        // A batch's rows quantized as the deployment says, on the FP8 MMA
+        // where there is one (W8A8).
+        if block == 128
+            && linear::moe::FP8_W8A8_DENSE.contains(&act.rows)
+            && linear::moe::fp8_w8a8_capable()
+            && linear::moe::fp8_w8a8_takes(act, out.width)
+        {
+            return linear::moe::matmul_fp8_w8a8(self.ctx(), act, codes.ptr, atoms.ptr, &mut out);
         }
         if linear::w8a16::matmul(self.ctx(), op, act, codes.ptr, atoms.ptr, block, &mut out)? {
             return Ok(());
