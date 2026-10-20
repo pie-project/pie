@@ -22,6 +22,8 @@ sdpa.decode.grouped_prefill_from = 8
 sdpa.decode.grouped_prefill_lse = true
 sdpa.decode.grouped_prefill_window = true
 sdpa.fa2_live = true
+sdpa.index_mma = true
+sdpa.index_radix = true
 moe.mxfp4_mma_from = 17
 moe.mxfp4_mma_until = 16777216
 moe.mxfp4_select_lean = true
@@ -58,6 +60,8 @@ measured = [
   "kernel.sdpa.decode.grouped_prefill_lse",
   "kernel.sdpa.decode.grouped_prefill_window",
   "kernel.sdpa.fa2_live",
+  "kernel.sdpa.index_mma",
+  "kernel.sdpa.index_radix",
   "kernel.moe.mxfp4_mma_from",
   "kernel.moe.mxfp4_mma_until",
   "kernel.moe.mxfp4_select_lean",
