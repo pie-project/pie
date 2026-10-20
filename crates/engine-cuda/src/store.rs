@@ -920,8 +920,20 @@ impl Pools {
                 self.declared_reshaped(pages, slots)
             });
             if fine > fit {
-                self.reshape(fine, slots)?;
-                fit = fine;
+                // The planes are reserved for what the rows reach once the
+                // bodies' allowance comes back after arming (the second fit
+                // sizes the pages to the room then), not only for this
+                // pass's: reserved at this pass's pages, the later fit could
+                // never pass them.
+                let reach = match self.budget {
+                    Some(_) => fine,
+                    None => pages_within(self.ceiling, live.saturating_sub(programs), |pages| {
+                        self.declared_reshaped(pages, slots)
+                    })
+                    .max(fine),
+                };
+                self.reshape(reach, slots)?;
+                fit = pages_within(self.ceiling, limit, |pages| self.declared_at(pages));
             }
         }
         // A hybrid declares a recurrent slab for every state slot, whatever
