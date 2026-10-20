@@ -62,6 +62,8 @@ pub struct Context {
     ordinal: i32,
     stream: *mut c_void,
     notify: *mut c_void,
+    /// Where taps read pages out, behind the layers that wrote them.
+    tap: *mut c_void,
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     cublas: *mut c_void,
     ctx: Ctx,
@@ -121,8 +123,21 @@ impl Context {
                     });
                 }
 
+                let mut tap: rt::cudaStream_t = core::ptr::null_mut();
+                let status = rt::cudaStreamCreateWithFlags(&raw mut tap, 1);
+                if status != rt::cudaError::cudaSuccess {
+                    let _ = rt::cudaStreamDestroy(notify);
+                    blas::cublasDestroy_v2(handle);
+                    destroy_stream(ordinal, stream.cast());
+                    return Err(Fault::Device {
+                        call: "cudaStreamCreateWithFlags",
+                        code: status as i32,
+                    });
+                }
+
                 let stream: *mut c_void = stream.cast();
                 let notify: *mut c_void = notify.cast();
+                let tap: *mut c_void = tap.cast();
                 let cublas: *mut c_void = handle.cast();
                 let slabs = Slabs::open();
                 slabs.attach(stream);
@@ -168,6 +183,7 @@ impl Context {
                     ordinal,
                     stream,
                     notify,
+                    tap,
                     cublas,
                     ctx,
                     slabs,
@@ -208,33 +224,13 @@ impl Context {
         self.notify
     }
 
-    pub fn host_fn(&self, work: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
-        #[cfg(feature = "device")]
-        {
-            use crate::device::rt;
+    #[must_use]
+    pub fn tap_stream(&self) -> *mut c_void {
+        self.tap
+    }
 
-            let carried: *mut Box<dyn FnOnce() + Send + 'static> = Box::into_raw(Box::new(work));
-            // SAFETY: carried is a live leaked allocation, reclaimed exactly
-            // once — here on the failure path, or by the trampoline.
-            let code = unsafe {
-                rt::cudaLaunchHostFunc(self.notify.cast(), Some(host_fn_trampoline), carried.cast())
-            };
-            if code != rt::cudaError::cudaSuccess {
-                // SAFETY: the launch failed, so nothing else will ever see
-                // this pointer; reclaiming it here avoids a leak.
-                drop(unsafe { Box::from_raw(carried) });
-                return Err(Fault::Device {
-                    call: "cudaLaunchHostFunc",
-                    code: code as i32,
-                });
-            }
-            Ok(())
-        }
-        #[cfg(not(feature = "device"))]
-        {
-            let _ = work;
-            Err(Fault::Runtimeless)
-        }
+    pub fn host_fn(&self, work: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
+        host_fn_on(self.notify, work)
     }
 
     pub fn open_lanes(&mut self, side: u32, events: u32) -> Result<()> {
@@ -434,12 +430,45 @@ impl Drop for Context {
                 if !self.notify.is_null() {
                     let _ = crate::device::rt::cudaStreamDestroy(self.notify.cast());
                 }
+                if !self.tap.is_null() {
+                    let _ = crate::device::rt::cudaStreamDestroy(self.tap.cast());
+                }
             }
         }
     }
 }
 
 #[cfg(feature = "device")]
+/// `work` on the host once what `stream` has before it is done.
+pub fn host_fn_on(stream: *mut c_void, work: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
+    #[cfg(feature = "device")]
+    {
+        use crate::device::rt;
+
+        let carried: *mut Box<dyn FnOnce() + Send + 'static> = Box::into_raw(Box::new(work));
+        // SAFETY: carried is a live leaked allocation, reclaimed exactly
+        // once — here on the failure path, or by the trampoline.
+        let code = unsafe {
+            rt::cudaLaunchHostFunc(stream.cast(), Some(host_fn_trampoline), carried.cast())
+        };
+        if code != rt::cudaError::cudaSuccess {
+            // SAFETY: the launch failed, so nothing else will ever see
+            // this pointer; reclaiming it here avoids a leak.
+            drop(unsafe { Box::from_raw(carried) });
+            return Err(Fault::Device {
+                call: "cudaLaunchHostFunc",
+                code: code as i32,
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        let _ = (stream, work);
+        Err(Fault::Runtimeless)
+    }
+}
+
 extern "C" fn host_fn_trampoline(user: *mut c_void) {
     if user.is_null() {
         return;

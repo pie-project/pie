@@ -93,6 +93,57 @@ fn peer_lane(lanes: &[super::Seated<'_>], at: usize, want: u32) -> Result<usize>
 }
 
 impl Shell {
+    /// The taps the fire's lanes ask for, a group a layer, each with every
+    /// tapped lane's copies and landings.
+    fn tapping(
+        &mut self,
+        lanes: &[super::lanes::Seated<'_>],
+    ) -> Result<Option<crate::tap::Tapping>> {
+        let taps: Vec<&engine::fire::Tap> = lanes.iter().filter_map(|seated| seated.tap).collect();
+        if taps.is_empty() {
+            return Ok(None);
+        }
+        let (Some(plan), Some(sink)) = (self.kv_taps.as_ref(), self.tap_sink.clone()) else {
+            return Err(Fault::Unsupported(
+                "a lane asks for a tap, and this load reads no layer out as it goes".to_string(),
+            ));
+        };
+        if let Some(tap) = taps.iter().find(|tap| tap.pages.len() != tap.slots.len()) {
+            return Err(Fault::program(
+                "serve::tap",
+                format!(
+                    "a tap names {} pages and {} host slots",
+                    tap.pages.len(),
+                    tap.slots.len()
+                ),
+            ));
+        }
+        let mut groups = Vec::with_capacity(plan.len());
+        for (index, group) in plan.iter().enumerate() {
+            let mut copies = Vec::new();
+            let mut lands = Vec::with_capacity(taps.len());
+            for tap in &taps {
+                let spans = self
+                    .pools
+                    .tap_spans(&group.planes, &tap.pages, &tap.slots)?;
+                copies.extend(spans.copies);
+                lands.push((tap.tag, spans.lands));
+            }
+            groups.push(crate::tap::Group {
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                layer: group.layer,
+                copies,
+                lands,
+            });
+        }
+        Ok(Some(crate::tap::Tapping::new(
+            groups,
+            self.device.stream(),
+            self.device.tap_stream(),
+            sink,
+        )))
+    }
+
     pub(super) fn enqueue_on(
         &mut self,
         p: &mut Prepared<'_>,
@@ -134,7 +185,9 @@ impl Shell {
             .rs_scratch
             .as_ref()
             .map(|have| (have.ptr(), have.bytes() as u64));
+        let tapping = self.tapping(p.lanes)?;
         let mut fire = FireCtx {
+            tapping: tapping.as_ref(),
             device: &self.device,
             trace: &self.trace,
             compiled: &self.compiled,
@@ -183,6 +236,8 @@ impl Shell {
 }
 
 struct FireCtx<'a> {
+    /// The fire's taps, when a lane asks for one.
+    tapping: Option<&'a crate::tap::Tapping>,
     device: &'a Context,
     trace: &'a Trace,
     compiled: &'a CompiledModel,
@@ -739,7 +794,8 @@ impl FireCtx<'_> {
         )
         .across(&side_ctx, &stream)
         .ceilings(ceilings)
-        .decoded_tiles(self.decoded_tiles);
+        .decoded_tiles(self.decoded_tiles)
+        .tapping(self.tapping);
         if let Some(body) = self.device.conditional_ctx() {
             run = run.conditional(body, &stream);
         }
@@ -827,6 +883,12 @@ impl FireCtx<'_> {
             .map_err(Fault::from)
         };
         drop(run);
+        if let Some(tapping) = self.tapping {
+            match &walked {
+                Ok(()) => tapping.finish(),
+                Err(error) => tapping.fail(&error.to_string()),
+            }
+        }
         self.device.ctx().disarm();
         self.device.ctx().disarm_stage();
         self.device.ctx().disarm_region();

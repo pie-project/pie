@@ -62,6 +62,7 @@ pub struct Cuda {
     next_frame: FrameId,
     channels: BTreeMap<ChannelId, Arc<crate::program::Endpoint>>,
     sink: Option<engine::CompletionSink>,
+    tap_sink: Option<engine::TapSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
     adapters: BTreeMap<InstanceId, crate::Binding>,
     replay: Option<crate::replay::Replay>,
@@ -80,6 +81,7 @@ impl Cuda {
             next_frame: 1,
             channels: BTreeMap::new(),
             sink: None,
+            tap_sink: None,
             pending: None,
             adapters: BTreeMap::new(),
             replay: None,
@@ -655,6 +657,10 @@ impl Engine for Cuda {
         };
 
         self.replay = crate::replay::Replay::of(&shell);
+        let mut shell = shell;
+        if let Some(sink) = &self.tap_sink {
+            shell.on_tapped(sink.clone());
+        }
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -740,6 +746,19 @@ impl Engine for Cuda {
 
     fn on_complete(&mut self, sink: engine::CompletionSink) {
         self.sink = Some(sink);
+    }
+
+    /// One rank's planes hold a band of each layer's heads, so a
+    /// tensor-parallel load (a group, apart from this) taps nothing.
+    fn tap_groups(&self) -> Option<engine::TapGroups> {
+        self.shell.as_ref()?.tap_groups()
+    }
+
+    fn on_tapped(&mut self, sink: engine::TapSink) {
+        if let Some(shell) = self.shell.as_mut() {
+            shell.on_tapped(sink.clone());
+        }
+        self.tap_sink = Some(sink);
     }
 
     fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
@@ -1121,6 +1140,7 @@ impl Cuda {
                     ports: &lane.ports,
                     attn_classes: lane.attn_classes.as_ref(),
                     reports: lane.reports,
+                    tap: lane.tap.as_ref(),
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

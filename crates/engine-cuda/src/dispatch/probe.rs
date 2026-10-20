@@ -3,6 +3,7 @@ use crate::run::Run;
 impl poem_exec::DispatchProbe for Run<'_> {
     fn probe(&mut self, node: &poem_ir::Node) {
         use poem_ir::Operands;
+        self.walked(node);
         let tag = crate::record::PTR_TAG.load(std::sync::atomic::Ordering::Relaxed);
         if tag != 0 {
             let mut ins = Vec::new();

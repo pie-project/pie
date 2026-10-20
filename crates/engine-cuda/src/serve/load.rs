@@ -845,6 +845,7 @@ impl Shell {
         let adapter_seats = weights.adapter_seats();
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let compiled_towered = compiled.order_for(poem_ir::RowAxis::Patches).is_some();
+        let kv_taps = crate::tap::row_layers(&boot.trace).and_then(|rows| pools.tap_groups(&rows));
         let mut shell = Shell {
             device,
             accounting,
@@ -911,6 +912,8 @@ impl Shell {
             )),
             settlement: crate::settle::Settlement::open(boot.runahead.staging_depth())?,
             taps: Vec::new(),
+            kv_taps,
+            tap_sink: None,
             airborne,
             owed: None,
             guest_landed: crate::device::graph::Event::new()?,

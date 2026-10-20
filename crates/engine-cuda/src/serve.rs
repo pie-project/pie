@@ -112,6 +112,12 @@ pub struct Shell {
     programs: ProgramPlane,
     settlement: crate::settle::Settlement,
     taps: Vec<Option<crate::device::Pinned>>,
+    /// How a tapped lane's pages are read out, a layer's planes at a time:
+    /// each group's layer, planes, and spans of a host slot. `None`: this
+    /// load reads no layer out as it goes ([`crate::tap`]).
+    kv_taps: Option<Vec<crate::store::TapGroup>>,
+    /// Where taps tell what they read.
+    tap_sink: Option<engine::TapSink>,
     airborne: crate::settle::Airborne,
     owed: Option<GuestBatch>,
     guest_landed: crate::device::graph::Event,
@@ -133,6 +139,24 @@ pub(crate) struct KvReport {
 }
 
 impl Shell {
+    /// Whether a lane may ask this load for a tap: it reads its layers out
+    /// as they go, and someone is told what it read.
+    #[must_use]
+    pub fn taps_kv(&self) -> bool {
+        self.kv_taps.is_some() && self.tap_sink.is_some()
+    }
+
+    /// The groups a tap reads a host slot's planes in, as spans of it.
+    #[must_use]
+    pub fn tap_groups(&self) -> Option<engine::TapGroups> {
+        let groups = self.kv_taps.as_ref()?;
+        Some(groups.iter().map(|group| group.spans.clone()).collect())
+    }
+
+    pub fn on_tapped(&mut self, sink: engine::TapSink) {
+        self.tap_sink = Some(sink);
+    }
+
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
         match self.rs_ahead.get(&src).copied() {
             Some(at) => self.rs_ahead.insert(dst, at),

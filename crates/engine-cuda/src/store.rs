@@ -501,6 +501,25 @@ struct HostKv {
     row_bytes: u64,
 }
 
+/// A group a tap reads a host slot's planes in: its layer, its planes (of
+/// the paged planes, in a slot's order), and their spans `(offset, bytes)`
+/// of a slot.
+#[derive(Debug, Clone, Default)]
+pub struct TapGroup {
+    pub layer: u32,
+    pub planes: Vec<usize>,
+    pub spans: Vec<(u64, u64)>,
+}
+
+/// A tap's pages of a group: the copies `(dst, src, bytes)` out to the host
+/// tier, and where each page's planes land there, page after page,
+/// `(address, bytes)`.
+#[derive(Debug, Clone, Default)]
+pub struct TapSpans {
+    pub copies: Vec<(u64, u64, usize)>,
+    pub lands: Vec<(u64, usize)>,
+}
+
 /// What [`Pools::export_kv`] hands out: the planes' regions and the shape
 /// their pages have.
 #[derive(Debug, Clone)]
@@ -1835,6 +1854,104 @@ impl Pools {
             base += u64::from(have) * page_bytes;
         }
         Ok(spans)
+    }
+
+    /// The cache row of each paged plane, in a host slot's order.
+    fn paged_plane_rows(&self) -> Vec<usize> {
+        let mut rows = Vec::new();
+        for (row, (arenas, shape)) in self.rows.iter().zip(&self.shapes).enumerate() {
+            if matches!(
+                shape,
+                Shape::Kv {
+                    windowed: false,
+                    ..
+                }
+            ) {
+                rows.extend(std::iter::repeat_n(row, arenas.len()));
+            }
+        }
+        rows
+    }
+
+    /// How a tap reads a host slot's planes out: a group a layer, each the
+    /// planes of the kv rows `row_layer` puts in it, as `(planes, spans of a
+    /// slot)`, in the layers' order. `None` where a tap cannot read a layer
+    /// whole: windowed rows (named by their own pages), compressor slabs, or
+    /// a kv row no layer writes.
+    #[must_use]
+    pub fn tap_groups(&self, row_layer: &[Option<u32>]) -> Option<Vec<TapGroup>> {
+        let windowed = self
+            .shapes
+            .iter()
+            .any(|shape| matches!(shape, Shape::Kv { windowed: true, .. }));
+        if windowed || !self.pooled.is_empty() {
+            return None;
+        }
+        let mut groups: std::collections::BTreeMap<u32, TapGroup> =
+            std::collections::BTreeMap::new();
+        let mut offset = 0u64;
+        for (plane, (row, (_, bytes))) in self
+            .paged_plane_rows()
+            .into_iter()
+            .zip(self.paged_planes())
+            .enumerate()
+        {
+            let layer = (*row_layer.get(row)?)?;
+            let group = groups.entry(layer).or_insert_with(|| TapGroup {
+                layer,
+                ..TapGroup::default()
+            });
+            group.planes.push(plane);
+            group.spans.push((offset, bytes));
+            offset += bytes;
+        }
+        Some(groups.into_values().collect())
+    }
+
+    /// For planes `planes`, device pages `device[i]` to host slots
+    /// `host[i]`.
+    pub fn tap_spans(
+        &mut self,
+        planes: &[usize],
+        device: &[u32],
+        host: &[u32],
+    ) -> Result<TapSpans> {
+        let have = self.host_pages();
+        if let Some(&slot) = host.iter().find(|&&slot| slot >= have) {
+            return Err(Fault::Ceiling {
+                what: "host kv pages",
+                need: u64::from(slot) + 1,
+                have: u64::from(have),
+            });
+        }
+        self.ensure_kv(device.iter().map(|&page| page + 1).max().unwrap_or(0))?;
+        let Some(buffer) = self.host.as_ref().map(|host| host.buffer.host() as u64) else {
+            return Err(Fault::Ceiling {
+                what: "host kv pages",
+                need: 1,
+                have: 0,
+            });
+        };
+        let all = self.paged_planes();
+        let mut bases = Vec::with_capacity(all.len());
+        let mut base = 0u64;
+        for &(_, bytes) in &all {
+            bases.push(base);
+            base += u64::from(have) * bytes;
+        }
+        let mut copies = Vec::with_capacity(planes.len() * device.len());
+        let mut lands = Vec::with_capacity(planes.len() * device.len());
+        for (&d, &h) in device.iter().zip(host) {
+            for &plane in planes {
+                let (arena, bytes) = all[plane];
+                let on_host = buffer + bases[plane] + u64::from(h) * bytes;
+                let on_device = arena.span(u64::from(d) * bytes, bytes)?;
+                let len = usize::try_from(bytes).unwrap_or(0);
+                copies.push((on_host, on_device, len));
+                lands.push((on_host, len));
+            }
+        }
+        Ok(TapSpans { copies, lands })
     }
 
     /// Host kv slots `slots`, one after another, each its planes in order.

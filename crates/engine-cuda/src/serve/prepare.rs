@@ -48,6 +48,12 @@ impl FrameShell for Shell {
         } = step;
         let arming = self.arming;
         let copies = self.copies;
+        let tapped = lanes.iter().any(|seated| seated.tap.is_some());
+        if tapped && (arming || !self.taps_kv()) {
+            return Err(Fault::Unsupported(
+                "a lane asks for a tap, and this load reads no layer out as it goes".to_string(),
+            ));
+        }
 
         for (index, attached) in attachments.iter().enumerate() {
             if attached.lane as usize >= lanes.len() {
@@ -1418,7 +1424,10 @@ impl FrameShell for Shell {
             (Vec::new().into(), true)
         };
         super::btrace::mark("segmentation");
+        // A tapped fire is walked, so the walk can mark where each layer
+        // ends on the stream.
         let bodied = records_bodies
+            && !tapped
             && !rs_moves.iter().any(|verb| !matches!(verb, RsMove::None))
             && snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize
             && Self::keyable_units(&self.compiled)

@@ -542,6 +542,7 @@ impl Shell {
                 ports: &[],
                 attn_classes: None,
                 reports: 0,
+                tap: None,
             })
             .collect();
 

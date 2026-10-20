@@ -34,6 +34,7 @@ pub mod serve;
 pub mod settle;
 pub mod staged_h2d;
 pub mod store;
+pub mod tap;
 pub mod tune;
 pub mod voxels;
 pub mod weights;
