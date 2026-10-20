@@ -200,6 +200,9 @@ pub struct DecodePoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefillPoint {
     pub head_dim: u32,
+    /// The widths the kernel reads of each head, keys' and values' (the
+    /// pool's live widths, or the head's twice).
+    pub widths: [u32; 2],
     pub cta_tile_q: u32,
     pub arm: PrefillArm,
     pub kv: KvWidth,
@@ -235,7 +238,8 @@ pub(crate) fn prefill<P>(
     at: PrefillPoint,
     params: &P,
 ) -> Result<(), Error> {
-    let geometry = PrefillGeometry::derive(op, at.head_dim, at.cta_tile_q, at.kv, &at.device)?;
+    let geometry =
+        PrefillGeometry::derive(op, at.head_dim, at.widths, at.cta_tile_q, at.kv, &at.device)?;
     ctx.fire(
         op,
         Fire::at(FILE, prefill_symbol(op, &geometry, at.arm, at.kv)?).apply(
@@ -265,8 +269,14 @@ pub(crate) fn prefill_ragged<P>(
     at: RaggedPoint,
     params: &P,
 ) -> Result<(), Error> {
-    let geometry =
-        PrefillGeometry::derive(op, at.head_dim, at.cta_tile_q, KvWidth::BF16, &at.device)?;
+    let geometry = PrefillGeometry::derive(
+        op,
+        at.head_dim,
+        [at.head_dim; 2],
+        at.cta_tile_q,
+        KvWidth::BF16,
+        &at.device,
+    )?;
     ctx.fire(
         op,
         Fire::at(FILE, prefill_ragged_symbol(op, &geometry, at.arm)?).apply(
@@ -738,6 +748,7 @@ impl PrefillGeometry {
     pub fn derive(
         op: &'static str,
         head_dim: u32,
+        [dqk, dvo]: [u32; 2],
         cta_tile_q: u32,
         kv: KvWidth,
         dev: &Device,
@@ -764,21 +775,22 @@ impl PrefillGeometry {
             )
         };
 
-        let num_mma_d_qk = head_dim / 16;
-        let num_mma_d_vo = head_dim / 16;
+        let num_mma_d_qk = dqk / 16;
+        let num_mma_d_vo = dvo / 16;
 
-        let use_repack = kv.0 == 1 && head_dim != 64 && head_dim <= 256 && cta_tile_q > 16;
+        let use_repack = kv.0 == 1 && dvo != 64 && dvo <= 256 && cta_tile_q > 16;
         let kv_shared = num_mma_d_vo > 16
             && num_mma_d_vo.is_multiple_of(num_warps_kv_)
+            && dqk == dvo
             && (kv.0 == 2 || cta_tile_q > 16);
         let vo_split_dispatch = num_mma_d_vo > 16 && num_mma_d_vo.is_multiple_of(num_warps_kv_);
 
         let per_mma_kv = (if kv_shared {
-            head_dim * 16 * num_warps_kv_ * kv.0
+            dqk * 16 * num_warps_kv_ * kv.0
         } else {
-            (head_dim + head_dim) * 16 * num_warps_kv_ * kv.0
+            (dqk + dvo) * 16 * num_warps_kv_ * kv.0
         }) + (if use_repack {
-            head_dim * 16 * num_warps_kv_ * q_width
+            dqk.max(dvo) * 16 * num_warps_kv_ * q_width
         } else {
             0
         }) + (if vo_split_dispatch {
@@ -793,7 +805,7 @@ impl PrefillGeometry {
             0
         };
         let shared_rope_freq = 0;
-        let fixed_smem = cta_tile_q * head_dim * q_width + vo_split_fixed + shared_rope_freq;
+        let fixed_smem = cta_tile_q * dqk * q_width + vo_split_fixed + shared_rope_freq;
 
         let min_valid_mma_kv = if kv.0 == 1 && num_warps_q_ > 2 {
             num_warps_q_ / 2
@@ -852,7 +864,7 @@ impl PrefillGeometry {
         } else {
             num_mma_d_vo_tile
         };
-        let invalid = (if head_dim >= 512 {
+        let invalid = (if dqk >= 512 {
             cta_tile_q > 32
         } else {
             cta_tile_q == 32
@@ -870,7 +882,7 @@ impl PrefillGeometry {
         let smem_bytes = Self::shared_storage_paged(
             cta_tile_q,
             cta_tile_kv,
-            head_dim,
+            [dqk, dvo],
             num_warps_kv_,
             kv,
             q_width,
@@ -903,7 +915,7 @@ impl PrefillGeometry {
     pub const fn shared_storage_paged(
         cta_tile_q: u32,
         cta_tile_kv: u32,
-        head_dim: u32,
+        [dqk, dvo]: [u32; 2],
         num_warps_kv: u32,
         kv: KvWidth,
         q_width: u32,
@@ -912,25 +924,25 @@ impl PrefillGeometry {
             n.div_ceil(16) * 16
         }
 
-        let kv_share_shape = head_dim / 16 > 16 && (head_dim / 16).is_multiple_of(num_warps_kv);
+        let kv_share_shape = dvo / 16 > 16 && (dvo / 16).is_multiple_of(num_warps_kv);
         let vo_split = kv_share_shape;
-        let v_share_active = kv_share_shape && (kv.0 == 2 || cta_tile_q > 16);
+        let v_share_active = kv_share_shape && dqk == dvo && (kv.0 == 2 || cta_tile_q > 16);
 
         let mut a = 0;
-        a = align16(a) + cta_tile_q * head_dim * q_width;
-        a = align16(a) + cta_tile_kv * head_dim * kv.0;
+        a = align16(a) + cta_tile_q * dqk * q_width;
+        a = align16(a) + cta_tile_kv * dqk * kv.0;
         a = align16(a)
             + if v_share_active {
                 kv.0
             } else {
-                cta_tile_kv * head_dim * kv.0
+                cta_tile_kv * dvo * kv.0
             };
         let a = align16(a);
 
         let sync_o_elems = if num_warps_kv == 1 || vo_split {
             1
         } else {
-            num_warps_kv * cta_tile_q * if head_dim > 256 { 256 } else { head_dim }
+            num_warps_kv * cta_tile_q * if dvo > 256 { 256 } else { dvo }
         };
         let sync_md_elems = if num_warps_kv == 1 {
             1
@@ -942,7 +954,7 @@ impl PrefillGeometry {
         b = align16(b) + sync_md_elems * 8;
         let b = align16(b);
 
-        let c = align16(cta_tile_q * head_dim * q_width);
+        let c = align16(cta_tile_q * dvo * q_width);
 
         let mut off = if a > b { a } else { b };
         if c > off {
@@ -952,10 +964,10 @@ impl PrefillGeometry {
         off = align16(off) + 1;
         off = align16(off) + 1;
         // An e4m3 tile's bf16 repack (`USE_KV_REPACK`).
-        let repack = kv.0 == 1 && head_dim != 64 && head_dim <= 256 && cta_tile_q > 16;
+        let repack = kv.0 == 1 && dvo != 64 && dvo <= 256 && cta_tile_q > 16;
         off = align16(off)
             + if repack {
-                cta_tile_kv * head_dim * q_width
+                cta_tile_kv * if dqk > dvo { dqk } else { dvo } * q_width
             } else {
                 q_width
             };

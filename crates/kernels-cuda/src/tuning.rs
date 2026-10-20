@@ -593,6 +593,14 @@ pub struct DecodeGroupedPrefillLse;
 #[decision(id = "kernel.sdpa.decode.grouped_prefill_window", flag, default = false, tune = search)]
 pub struct DecodeGroupedPrefillWindow;
 
+/// Whether the FA2 prefill kernel (a decode's grouped rows too) reads a
+/// pool's live widths out of its wider heads (MiMo's 192-wide keys and
+/// 128-wide values stored 256 wide), not the padding. Off but where a chip's
+/// profile turns it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.fa2_live", flag, default = false, tune = search)]
+pub struct Fa2Live;
+
 /// Whether a paged decode of a group of at most eight query heads reads its
 /// cache on tensor cores (`attn/xqa.cuh`, the group's rows one MMA tile)
 /// rather than the FA2 decode kernel.
@@ -699,6 +707,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeGroupedPrefillFrom>()
         .add::<DecodeGroupedPrefillLse>()
         .add::<DecodeGroupedPrefillWindow>()
+        .add::<Fa2Live>()
         .add::<DecodeXqa>()
         .add::<DecodeXqaFrom64>()
         .add::<DecodeXqaWholeWindow>()
@@ -818,6 +827,7 @@ tuning! {
     decode_grouped_prefill_from: u32 = 0, get DecodeGroupedPrefillFrom;
     decode_grouped_prefill_lse: bool = false, on DecodeGroupedPrefillLse;
     decode_grouped_prefill_window: bool = false, on DecodeGroupedPrefillWindow;
+    fa2_live: bool = false, on Fa2Live;
     decode_xqa: bool = false, on DecodeXqa;
     decode_xqa_from_64: u32 = 0, get DecodeXqaFrom64;
     decode_xqa_whole_window: u32 = 0, get DecodeXqaWholeWindow;

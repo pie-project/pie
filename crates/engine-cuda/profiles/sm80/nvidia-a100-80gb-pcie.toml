@@ -21,6 +21,7 @@ sdpa.merge_warp = true
 sdpa.decode.grouped_prefill_from = 8
 sdpa.decode.grouped_prefill_lse = true
 sdpa.decode.grouped_prefill_window = true
+sdpa.fa2_live = true
 moe.mxfp4_mma_from = 17
 moe.mxfp4_mma_until = 16777216
 sdpa.dsv4_replay = true
@@ -45,6 +46,7 @@ measured = [
   "kernel.sdpa.decode.grouped_prefill_from",
   "kernel.sdpa.decode.grouped_prefill_lse",
   "kernel.sdpa.decode.grouped_prefill_window",
+  "kernel.sdpa.fa2_live",
   "kernel.moe.mxfp4_mma_from",
   "kernel.moe.mxfp4_mma_until",
   "kernel.ssm.gdn_fused_scan",
