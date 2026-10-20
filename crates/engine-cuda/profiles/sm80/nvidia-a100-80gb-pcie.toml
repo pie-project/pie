@@ -26,6 +26,7 @@ sdpa.fa2_live = true
 sdpa.index_mma = true
 sdpa.index_radix = true
 sdpa.pool_mma = true
+sdpa.selected_mma = true
 moe.mxfp4_mma_from = 17
 moe.mxfp4_mma_until = 16777216
 moe.mxfp4_select_lean = true
@@ -68,6 +69,7 @@ measured = [
   "kernel.sdpa.index_mma",
   "kernel.sdpa.index_radix",
   "kernel.sdpa.pool_mma",
+  "kernel.sdpa.selected_mma",
   "kernel.moe.mxfp4_mma_from",
   "kernel.moe.mxfp4_mma_until",
   "kernel.moe.mxfp4_select_lean",
