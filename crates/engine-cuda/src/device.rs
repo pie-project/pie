@@ -3,6 +3,7 @@ pub mod conditional;
 pub mod ctx;
 pub mod elastic;
 pub mod graph;
+pub mod held;
 #[cfg(feature = "rocm")]
 pub mod hip;
 

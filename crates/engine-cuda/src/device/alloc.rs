@@ -6,27 +6,12 @@ pub struct Buffer {
     bytes: usize,
 }
 
-/// `bytes` of device memory for a [`Buffer`], freed exactly once in its
-/// `Drop`; on ROCm, one an earlier drop kept when its last reader landed.
+/// `bytes` of device memory for a [`Buffer`], given back once in its `Drop`:
+/// one an earlier drop kept when its last reader landed, where there is one
+/// (`device::held::recycle`).
 #[cfg(feature = "device")]
 fn alloc(bytes: usize) -> Result<*mut core::ffi::c_void> {
-    #[cfg(feature = "rocm")]
-    {
-        crate::device::hip::held::recycle::alloc(bytes).map(|ptr| ptr as *mut core::ffi::c_void)
-    }
-    #[cfg(not(feature = "rocm"))]
-    {
-        use crate::device::rt;
-
-        let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
-        // SAFETY: `base` is a live local the call fills.
-        let allocated = unsafe {
-            crate::device::ctx::check("cudaMalloc", rt::cudaMalloc(&raw mut base, bytes))
-        };
-        allocated
-            .map(|()| base)
-            .map_err(|fault| out_of_room(fault, bytes))
-    }
+    crate::device::held::recycle::alloc(bytes).map(|ptr| ptr as *mut core::ffi::c_void)
 }
 
 #[cfg(feature = "device")]
@@ -449,16 +434,9 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "device")]
         if self.ptr != 0 {
-            // SAFETY: the pointer came from this buffer's own `cudaMalloc` and is freed exactly once.
-            unsafe {
-                let _ = crate::device::rt::cudaFree(self.ptr as *mut core::ffi::c_void);
-            }
-        }
-        #[cfg(feature = "rocm")]
-        if self.ptr != 0 {
-            crate::device::hip::held::recycle::release(self.ptr, self.bytes);
+            crate::device::held::recycle::release(self.ptr, self.bytes);
         }
     }
 }

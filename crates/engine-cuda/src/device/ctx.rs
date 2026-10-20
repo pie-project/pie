@@ -90,8 +90,7 @@ impl Context {
                 check("cudaSetDevice", rt::cudaSetDevice(ordinal))?;
                 let mut stream: rt::cudaStream_t = core::ptr::null_mut();
                 check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
-                #[cfg(feature = "rocm")]
-                crate::device::hip::held::pool::adopt_stream(ordinal, stream.cast());
+                crate::device::held::pool::adopt_stream(ordinal, stream.cast());
 
                 let mut handle: blas::cublasHandle_t = core::ptr::null_mut();
                 let status = blas::cublasCreate_v2(&raw mut handle);
@@ -567,25 +566,18 @@ pub fn sync(stream: *mut c_void) -> Result<()> {
     }
 }
 
-/// Destroys a context's compute stream; on ROCm, out of the reach of the
-/// memory held behind it first.
+/// Destroys a context's compute stream, out of the reach of the memory held
+/// behind it first.
 ///
 /// # Safety
 ///
 /// `stream` is a live stream nothing launches on again.
 #[cfg(feature = "device")]
 unsafe fn destroy_stream(ordinal: i32, stream: *mut c_void) {
-    #[cfg(feature = "rocm")]
-    crate::device::hip::held::pool::retire_stream(ordinal, stream, || {
+    crate::device::held::pool::retire_stream(ordinal, stream, || {
         // SAFETY: as the caller promises.
         let _ = unsafe { crate::device::rt::cudaStreamDestroy(stream.cast()) };
     });
-    #[cfg(not(feature = "rocm"))]
-    {
-        let _ = ordinal;
-        // SAFETY: as the caller promises.
-        let _ = unsafe { crate::device::rt::cudaStreamDestroy(stream.cast()) };
-    }
 }
 
 #[cfg(feature = "device")]
