@@ -306,13 +306,12 @@ __global__ void __launch_bounds__(128) moe_select_bf16_wgmma(
         if (s < steps) load(s, s);
         asm volatile("cp.async.commit_group;\n" ::);
     }
+    // A step's MMAs stay in flight past it: the stage after next loads where
+    // the step before read, once its MMAs land (the warpgroup's, one CTA).
     for (int kb = 0; kb < steps; ++kb) {
         asm volatile("cp.async.wait_group %0;\n" ::"n"(kWgStages - 2));
         __syncthreads();
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-        const int next = kb + kWgStages - 1;
-        if (next < steps) load(next, next % kWgStages);
-        asm volatile("cp.async.commit_group;\n" ::);
 
         const u8* a = smem + (kb % kWgStages) * kStage;
         const u8* b = a + kA;
@@ -327,9 +326,12 @@ __global__ void __launch_bounds__(128) moe_select_bf16_wgmma(
             }
         }
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
-        __syncthreads();
+        asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
+        const int next = kb + kWgStages - 1;
+        if (next < steps) load(next, next % kWgStages);
+        asm volatile("cp.async.commit_group;\n" ::);
     }
+    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 
 #pragma unroll
     for (int t = 0; t < kT; ++t)
