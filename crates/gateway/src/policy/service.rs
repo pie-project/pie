@@ -22,9 +22,9 @@ use crate::route::RoutingHandle;
 use crate::session::AdmitReject;
 
 fn capability(name: &str) -> bool {
-    // Runs replicate to pools, and a GPU worker takes them as a pass needs
-    // them; a running turn of a built-in API moves by ending where it runs
-    // and resuming where it goes, after what its client was sent.
+    // Runs replicate to pools and to serving workers' host tiers; a running
+    // turn of a built-in API moves by ending where it runs and resuming
+    // where it goes, after what its client was sent.
     matches!(
         name,
         "cluster.hold" | "state.replicate" | "placement.migrate"

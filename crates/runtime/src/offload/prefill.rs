@@ -31,6 +31,9 @@ pub struct PageStream {
     pub count: usize,
     pub page_bytes: usize,
     pub layout: Option<state::PageLayout>,
+    /// The pages' tokens' hashes, page after page; empty when the source
+    /// has none.
+    pub slots: Vec<Hash256>,
     pub chunks: tokio::sync::mpsc::Receiver<std::result::Result<Vec<u8>, String>>,
 }
 
@@ -457,6 +460,49 @@ async fn read_in_place(
     Ok(())
 }
 
+/// Keeps the run `keys` (named from token 0) that the worker at bulk
+/// address `from` holds, in this worker's host tier: what of it is not here
+/// already, as one cache entry, the way the cluster policy replicates state.
+/// The source must send the pages' tokens' hashes: a run kept without them
+/// names its pages, but nothing after it could seal on it.
+pub async fn replicate(keys: Vec<Hash256>, from: String) -> Result<usize> {
+    let stores = crate::store::registry::try_get(0, 0)
+        .ok_or_else(|| anyhow!("no engine serves a model here"))?;
+    let have = with_kv_lock(&stores.kv, "offload-replicate", |kv| {
+        kv.cached_run_any_tier(&keys).len()
+    });
+    let want = keys.len().saturating_sub(have);
+    if want == 0 {
+        return Ok(0);
+    }
+    let remote = super::directory::remote().ok_or_else(|| anyhow!("no bulk link here"))?;
+    let mut pages = remote
+        .fetch(from.clone(), keys.clone(), have as u32)
+        .await?;
+    if pages.count != want {
+        bail!("{from} answered {} pages of {want}", pages.count);
+    }
+    let page = stores.kv_page_size as usize;
+    let slots = std::mem::take(&mut pages.slots);
+    if slots.len() != want * page {
+        bail!("{from} sent the pages without their tokens' hashes");
+    }
+    let token_hashes = slots
+        .chunks(page)
+        .map(|hashes| hashes.iter().copied().map(Some).collect())
+        .collect();
+    land(
+        &stores,
+        0,
+        &keys[..have],
+        token_hashes,
+        keys[have..].to_vec(),
+        pages,
+    )
+    .await?;
+    Ok(want)
+}
+
 /// Lands pages another worker sealed in this worker's host tier, as one
 /// cache entry, writing each chunk as it comes.
 async fn land(
@@ -735,16 +781,19 @@ async fn export(
     for _ in 0..tries {
         held = with_kv_lock(&stores.kv, "offload-export", |kv| {
             let run = kv.cached_run_any_tier(keys);
-            (run.len() == keys.len() && from < run.len())
-                .then(|| kv.pin_resident(&run[from..]))
-                .flatten()
+            if run.len() != keys.len() || from >= run.len() {
+                return None;
+            }
+            let hashes = kv.run_slots(&run[from..]).unwrap_or_default();
+            kv.pin_resident(&run[from..])
+                .map(|(pin, device)| (pin, device, hashes))
         });
         if held.is_some() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let (pin, device) =
+    let (pin, device, hashes) =
         held.ok_or_else(|| anyhow!("those pages are not all cached on the device here"))?;
     let release = |stores: &Stores, pin| {
         with_kv_lock(&stores.kv, "offload-export", |kv| kv.release_reader(pin))
@@ -787,6 +836,7 @@ async fn export(
         count: n,
         page_bytes,
         layout,
+        slots: hashes,
         chunks,
     })
 }

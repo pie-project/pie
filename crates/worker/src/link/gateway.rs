@@ -261,10 +261,14 @@ impl WorkerControl for WorkerControlServer {
     async fn replicate(
         self,
         _: tarpc::context::Context,
-        _keys: Vec<[u8; 32]>,
-        _from: String,
+        keys: Vec<[u8; 32]>,
+        from: String,
     ) -> Result<u32, String> {
-        Err("a serving worker takes another's pages as its passes need them".into())
+        let pages = runtime::offload::prefill::replicate(keys, from.clone())
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        tracing::info!(target: "pie::offload", pages, %from, "kept a run another worker holds");
+        Ok(u32::try_from(pages).unwrap_or(u32::MAX))
     }
 
     async fn cancel(self, _: tarpc::context::Context, req_id: ReqId) {

@@ -88,6 +88,7 @@ impl runtime::offload::directory::Remote for Clients {
                 count: stream.count,
                 page_bytes: stream.page_bytes,
                 layout: serde_json::from_slice(&stream.meta).ok(),
+                slots: stream.slots,
                 chunks: stream.chunks,
             })
         })
@@ -116,6 +117,7 @@ impl transport::tcp::Source for Source {
                     .as_ref()
                     .and_then(|layout| serde_json::to_vec(layout).ok())
                     .unwrap_or_default(),
+                slots: pages.slots,
                 chunks: pages.chunks,
             })
         })
@@ -507,6 +509,7 @@ async fn push(pool: &str, run: &[[u8; 32]], from: usize) -> Result<usize> {
         count: stream.count,
         page_bytes: stream.page_bytes,
         meta,
+        slots: stream.slots,
         chunks: stream.chunks,
     }
     .collect()
