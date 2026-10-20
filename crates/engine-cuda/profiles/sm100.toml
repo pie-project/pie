@@ -83,6 +83,9 @@ moe.w4a4_fused_layout = true
 # room to the ring.
 moe.even_waves_from = 3
 moe.routes_sized = true
+# A decode's normed routed gather (Muse Spark's) with eight routes in flight a
+# round up to 128 tokens; past them its one block a multiprocessor costs waves.
+moe.gather_ahead_until = 128
 moe.w4a8_fused_from = 512
 # The fused qkv write a warp a head below 256 rows.
 attn.qkv_rows_from = 256
