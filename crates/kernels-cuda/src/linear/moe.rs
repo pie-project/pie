@@ -2281,8 +2281,9 @@ fn select_mxfp4_mma(
     let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
     let experts = codes.rows.clamp(1, EXPERT_CAP);
     // An expert's slice is 8, 16, 32 or 64 routes: as few 8-route blocks as
-    // the average expert fills. The 32- and 64-route slices stage their
-    // activations in shared memory, the CTA's warps sharing them (bf16 kernel).
+    // the average expert fills. The 64-route slices stage their activations
+    // in shared memory, the CTA's warps sharing them (bf16 kernel; at 32 the
+    // lanes' own loads measured faster, DeepSeek-V4-Flash).
     let per = fan.route_count.div_ceil(experts);
     let nb: u32 = match per {
         0..=4 => 1,
@@ -2291,7 +2292,7 @@ fn select_mxfp4_mma(
         _ if cvt => 4,
         _ => 8,
     };
-    let smem_x = !cvt && nb >= 4;
+    let smem_x = !cvt && nb == 8;
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
     let inter = stated(op, y.width)?;
