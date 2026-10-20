@@ -222,6 +222,85 @@ fn plan_for(
     Some((handle, plan))
 }
 
+/// A plane's block scales in cuBLASLt's `BLK128x128_32F` layout, converted
+/// once from its atoms and kept by the atoms' address: a block-FP8 plane
+/// (codes and atoms, two planes) is never a rotated tenant, so its atoms sit
+/// where the load put them. A miss converts on a thread of its own, on its own
+/// stream, so a capturing stream's graph never holds the conversion: every
+/// graph reads the one finished copy.
+fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<u64, Error> {
+    use cudarc::runtime::sys as rt;
+    static SCALES: OnceLock<Mutex<HashMap<(i32, u64, u32, u32), u64>>> = OnceLock::new();
+    let mut dev = 0i32;
+    // SAFETY: an out-pointer for the calling thread's device.
+    let _ = unsafe { cudaGetDevice(&raw mut dev) };
+    let key = (dev, atoms, n, k);
+    let mut held = SCALES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(&at) = held.get(&key) {
+        return Ok(at);
+    }
+    let kbp = (k / 128).div_ceil(4) * 4;
+    let bytes = (n / 128) as usize * kbp as usize * 4;
+    let made = std::thread::scope(|scope| {
+        scope
+            .spawn(|| -> Result<u64, Error> {
+                let fail = |what: &str, code: rt::cudaError_t| {
+                    refuse(
+                        op,
+                        format!("`{what}` answered {} converting the scales", code as i32),
+                    )
+                };
+                // SAFETY: the device the caller runs on, a fresh allocation
+                // and stream this thread owns, a launch it waits out.
+                unsafe {
+                    let code = rt::cudaSetDevice(dev);
+                    if code != rt::cudaError::cudaSuccess {
+                        return Err(fail("cudaSetDevice", code));
+                    }
+                    let mut at: *mut c_void = std::ptr::null_mut();
+                    let code = rt::cudaMalloc(&raw mut at, bytes.max(4));
+                    if code != rt::cudaError::cudaSuccess {
+                        return Err(fail("cudaMalloc", code));
+                    }
+                    let mut stream: rt::cudaStream_t = std::ptr::null_mut();
+                    let code =
+                        rt::cudaStreamCreateWithFlags(&raw mut stream, rt::cudaStreamNonBlocking);
+                    if code != rt::cudaError::cudaSuccess {
+                        return Err(fail("cudaStreamCreateWithFlags", code));
+                    }
+                    let ctx = Ctx::on(stream.cast());
+                    let fired = ctx.fire(
+                        op,
+                        Fire::at(FILE, "::pie::linear::fp8b128_atoms_to_lt").apply(Launch::grid(
+                            [((n / 128) * kbp).div_ceil(256), 1, 1],
+                            [256, 1, 1],
+                        )),
+                        &[
+                            ArgValue::Ptr(atoms),
+                            ArgValue::Ptr(at as u64),
+                            stated(op, n)?.arg(),
+                            stated(op, k)?.arg(),
+                        ],
+                    );
+                    let code = rt::cudaStreamSynchronize(stream);
+                    let _ = rt::cudaStreamDestroy(stream);
+                    fired?;
+                    if code != rt::cudaError::cudaSuccess {
+                        return Err(fail("cudaStreamSynchronize", code));
+                    }
+                    Ok(at as u64)
+                }
+            })
+            .join()
+            .unwrap_or_else(|_| Err(refuse(op, "the scales' conversion thread panicked")))
+    })?;
+    held.insert(key, made);
+    Ok(made)
+}
+
 /// `y = q(act) . (W 2^(s - 127))^T` for an `n x k` 128x128-block FP8 plane
 /// (`codes`, its exponents in tcgen05's atoms at `atoms`), `q` the rows'
 /// e4m3 1x128 quantization. `Ok(false)` for a shape cuBLASLt does not take.
@@ -249,13 +328,13 @@ pub fn matmul(
     let Some((handle, plan)) = plan_for(mpad, n, k, workspace) else {
         return Ok(false);
     };
-    let (blocks, kbp) = (k / 128, (k / 128).div_ceil(4) * 4);
+    let blocks = k / 128;
     let scratch = |name, bytes: u64| -> Result<u64, Error> {
         Ok(ctx.scratch_stream(op, name, usize::try_from(bytes).unwrap_or(usize::MAX))? as u64)
     };
     let xq = scratch("linear.lt_fp8_x", u64::from(mpad) * u64::from(k))?;
     let xs = scratch("linear.lt_fp8_xs", u64::from(blocks) * u64::from(mpad) * 4)?;
-    let ws_scales = scratch("linear.lt_fp8_ws", u64::from(n / 128) * u64::from(kbp) * 4)?;
+    let ws_scales = weight_scales(op, atoms, n, k)?;
     let d = if mpad == m {
         y.ptr
     } else {
@@ -274,19 +353,6 @@ pub fn matmul(
             ArgValue::Ptr(xs),
             stated(op, m)?.arg(),
             stated(op, mpad)?.arg(),
-            stated(op, k)?.arg(),
-        ],
-    )?;
-    ctx.fire(
-        op,
-        Fire::at(FILE, "::pie::linear::fp8b128_atoms_to_lt").apply(Launch::grid(
-            [((n / 128) * kbp).div_ceil(256), 1, 1],
-            [256, 1, 1],
-        )),
-        &[
-            ArgValue::Ptr(atoms),
-            ArgValue::Ptr(ws_scales),
-            stated(op, n)?.arg(),
             stated(op, k)?.arg(),
         ],
     )?;
