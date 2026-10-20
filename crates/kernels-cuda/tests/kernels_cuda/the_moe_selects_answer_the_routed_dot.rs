@@ -374,22 +374,15 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         #[rustfmt::skip]
         let want = mlp(&xv, (&routes, &weights), [hidden, inter, top], upv, downv, g, first, shared, normed.then_some(&scv[..]));
         // Every fire with its swapped units dealt evenly and not (its routing
-        // sized and a normed gather's eight routes in flight with them), and a
-        // W4A4 fire's swapped down leg split along K.
-        let arms: &[(u32, bool)] = if a == 4 {
-            &[(1, false), (2, false), (4, false), (1, true), (2, true)]
-        } else {
-            &[(1, false), (1, true)]
-        };
-        // Each split count's product dealt as before, which dealing its units
-        // evenly lands bit for bit.
-        let mut dealt: Vec<(u32, Vec<f64>)> = Vec::new();
-        for &(down_splits, even) in arms {
-            let what = format!("{what}, down splits {down_splits}, even waves {even}");
+        // sized and a normed gather's eight routes in flight with them).
+        // The product dealt as before, which dealing its units evenly lands
+        // bit for bit.
+        let mut dealt: Option<Vec<f64>> = None;
+        for even in [false, true] {
+            let what = format!("{what}, even waves {even}");
             let mut y = b.out(tokens, hidden);
             let base = pick(a < 4, TC5, W4A8);
             let ctx = b.ctx().with_tuning(Tuning {
-                moe_w4a4_down_splits: down_splits,
                 moe_even_waves_from: u32::from(even),
                 moe_routes_sized: even,
                 moe_gather_ahead_until: if even { 65_536 } else { 0 },
@@ -419,17 +412,14 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
             let far = distance(&got[span.clone()], &want[span]);
             assert!(far < tol, "{what}: {far:.4} from the host's product");
             if even {
-                let (_, before) = dealt
-                    .iter()
-                    .find(|(s, _)| *s == down_splits)
-                    .expect("an uneven arm");
+                let before = dealt.as_ref().expect("an uneven arm");
                 let same = got
                     .iter()
                     .zip(before)
                     .all(|(g, b)| g.to_bits() == b.to_bits());
                 assert!(same, "{what}: not the bits the uneven deal lands");
             } else {
-                dealt.push((down_splits, got));
+                dealt = Some(got);
             }
         }
     }

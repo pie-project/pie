@@ -792,14 +792,6 @@ mod tests {
         );
         assert_eq!((b200.nvfp4_mma_from, b200.nvfp4_mma_until), (32, 8192));
         assert_eq!(b200.moe_w4a4_fused_from, 1);
-        assert_eq!(
-            (
-                b200.moe_w4a4_swapped_routes,
-                b200.moe_w4a4_swap_bn_narrow,
-                b200.moe_w4a4_down_splits
-            ),
-            (64, 32, 1)
-        );
         assert_eq!((b200.moe_even_waves_from, b200.moe_routes_sized), (3, true));
         assert_eq!(b200.moe_gather_ahead_until, 128);
         assert_eq!(b200.moe_w4a8_fused_from, 512);

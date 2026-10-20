@@ -1089,6 +1089,11 @@ pub fn experts(
     Ok(run().is_ok())
 }
 
+/// The most routes an expert on average whose W4A4 legs run swapped
+/// (GLM-5.3's experts, measured).
+#[cfg(feature = "cuda")]
+const SWAPPED_UP_ROUTES: u32 = 64;
+
 /// A W4A8 routed MLP of this many routes an expert or fewer runs its
 /// gate-up swapped, in 64-row Q tiles (DeepSeek-V4-Flash, measured).
 #[cfg(feature = "cuda")]
@@ -1244,24 +1249,16 @@ fn experts_w4a4(
         // a weight row, its epilogue over the expert's rows alone (unswapped,
         // a thread a row, the whole 128-row block's).
         let sms = ctx.multiprocessors().unwrap_or(148);
-        // A narrow Q tile where every expert's rows fit one (the fused
-        // layout states its rows the fire's tokens at most;
-        // `kernel.moe.w4a4_swap_bn_narrow`), else 64.
-        let tuning = ctx.tuning();
+        // A Q tile of 32 rows where every expert's fit one (the fused
+        // layout states its rows the fire's tokens at most), else 64.
         let swapped = tc5::Plan {
             swap: true,
             pair: false,
-            bn: if fused && routes.rows <= 32 {
-                tuning.moe_w4a4_swap_bn_narrow
-            } else {
-                64
-            },
+            bn: if fused && routes.rows <= 32 { 32 } else { 64 },
             stages: 0,
             splits: 1,
         };
-        // Swapped up to `kernel.moe.w4a4_swapped_routes` routes an expert.
-        let swaps = count <= tuning.moe_w4a4_swapped_routes * experts;
-        let plan = if swaps {
+        let plan = if count <= SWAPPED_UP_ROUTES * experts {
             swapped
         } else {
             tc5::Plan::grouped(&grouped_up, inter, k, count, sms)
@@ -1293,14 +1290,8 @@ fn experts_w4a4(
             groups: layout.groups,
             alpha_e: down_alpha,
         };
-        // A swapped down leg splits K where the profile says
-        // (`kernel.moe.w4a4_down_splits`): a decode's live tiles fill the SMs
-        // a few waves deep, the last one part full.
-        let down_plan = if swaps {
-            tc5::Plan {
-                splits: tuning.moe_w4a4_down_splits,
-                ..swapped
-            }
+        let down_plan = if count <= SWAPPED_UP_ROUTES * experts {
+            swapped
         } else {
             tc5::Plan::grouped(&grouped_down, n, inter, count, sms)
         };
