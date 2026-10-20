@@ -37,6 +37,13 @@ mla.absorb_out_until = 1536
 fp8.decode_until = 32
 fp8.narrow_until = 128
 
+# An lm head over a body's readouts padded past 128 rows (a mixed fire's
+# ceiling, 7-9 of 256 live on GLM-5.3) multiplies only the live ones on
+# hipBLASLt's grouped kernels: 154880 x 6144 at 9 live 483 us against the
+# padded GEMM's 1018; up to 128 rows the dense GEMM stays (the grouped tiles
+# trail it by ~4% at full count).
+gemm.live_from = 129
+
 # A fire of 10240 rows where `max_forward_tokens` is unstated: 8192 left the
 # first prompts' decodes waiting out a second prefill fire, 12K and up made
 # queued prompts wait. Past 2048 rows, eight buckets a doubling: a prefill's

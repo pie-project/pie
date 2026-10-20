@@ -1002,12 +1002,13 @@ impl Run<'_> {
                     seat,
                 )
             }
-            None => linear::gemm::lm_head(
-                self.ctx(),
-                self.tensor(*act),
-                self.tensor(*w),
-                &mut self.tensor(*y),
-            ),
+            None => {
+                // Over a body's readouts, only the live ones (a staged word).
+                let act = self.tensor(*act);
+                let readouts = self.bindings().readout_rows;
+                let live = if act.rows == readouts.rows { self.bindings().readout_live } else { 0 };
+                linear::gemm::lm_head_live(self.ctx(), act, self.tensor(*w), live, &mut self.tensor(*y))
+            }
         }
     }
 }

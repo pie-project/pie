@@ -307,6 +307,9 @@ pub struct FireBindings {
 
     pub readout_rows: Tensor,
 
+    /// A device word: how many of `readout_rows` are live.
+    pub readout_live: u64,
+
     pub patches: Option<Tensor>,
     pub patch_segments: Option<Tensor>,
     pub patch_routes: Option<Tensor>,

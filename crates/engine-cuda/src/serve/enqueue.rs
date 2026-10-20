@@ -646,6 +646,7 @@ impl FireCtx<'_> {
             positions: handles.positions,
             adapter_routes: handles.adapter_routes,
             readout_rows: handles.readout_rows,
+            readout_live: handles.readout_live,
             patches: staged.patches.as_ref().map(|seats| seats.patches),
             patch_segments: staged.patches.as_ref().map(|seats| seats.segments),
             patch_routes: staged.patches.as_ref().map(|seats| seats.routes),

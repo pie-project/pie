@@ -192,6 +192,28 @@ pub struct MoeDenseBatchUntil(pub u32);
 #[decision(id = "kernel.moe.dense_wide_from", constant(range(0..=4096)), default = 26, tune = search)]
 pub struct MoeDenseWideFrom(pub u32);
 
+/// The padded rows from which an lm head over a body's readouts multiplies
+/// only the live ones (a device word): hipBLASLt's grouped kernels, M read
+/// on the device, one launch a range of live rows (0: never).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.live_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct GemmLiveFrom(pub u32);
+
+/// The grouped tiles (`MT0·10⁶ + MT1·10³ + depth`) of the live lm head's
+/// three launches; each takes the live rows up to its MT1 the one before
+/// did not (the last, the rest).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.live_tile_small", constant(range(0..=4_000_000_000)), default = 192_032_128, tune = search)]
+pub struct GemmLiveTileSmall(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.live_tile_mid", constant(range(0..=4_000_000_000)), default = 256_128_064, tune = search)]
+pub struct GemmLiveTileMid(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.live_tile_large", constant(range(0..=4_000_000_000)), default = 176_256_064, tune = search)]
+pub struct GemmLiveTileLarge(pub u32);
+
 /// The rows from which, and up to which, a bf16 projection (and the fused
 /// gate/up SwiGLU) takes the batch engine over hipBLASLt; until 0, never.
 /// On MI300X it wins by 1.2x only at a few rows over a wide bank (Qwen3.8's
@@ -284,7 +306,11 @@ pub fn register(registry: &mut Registry) {
         .add::<MlaAbsorbOutFrom>()
         .add::<MlaAbsorbOutUntil>()
         .add::<Fp8DecodeUntil>()
-        .add::<Fp8NarrowUntil>();
+        .add::<Fp8NarrowUntil>()
+        .add::<GemmLiveFrom>()
+        .add::<GemmLiveTileSmall>()
+        .add::<GemmLiveTileMid>()
+        .add::<GemmLiveTileLarge>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -331,6 +357,8 @@ pub struct Tuning {
     pub mla_absorb_out_until: u32,
     pub fp8_decode_until: u32,
     pub fp8_narrow_until: u32,
+    pub gemm_live_from: u32,
+    pub gemm_live_tiles: [u32; 3],
     /// DeepSeek's fused prefill pass and bounded replay, CUDA's decisions:
     /// never on ROCm.
     pub dsv4_prefill_from: u32,
@@ -381,6 +409,8 @@ impl Tuning {
         mla_absorb_out_until: 0,
         fp8_decode_until: 64,
         fp8_narrow_until: 0,
+        gemm_live_from: 0,
+        gemm_live_tiles: [192_032_128, 256_128_064, 176_256_064],
         dsv4_prefill_from: 0,
         dsv4_replay: false,
     };
@@ -429,6 +459,12 @@ impl Tuning {
             mla_absorb_out_until: profile.get::<MlaAbsorbOutUntil>().0,
             fp8_decode_until: profile.get::<Fp8DecodeUntil>().0,
             fp8_narrow_until: profile.get::<Fp8NarrowUntil>().0,
+            gemm_live_from: profile.get::<GemmLiveFrom>().0,
+            gemm_live_tiles: [
+                profile.get::<GemmLiveTileSmall>().0,
+                profile.get::<GemmLiveTileMid>().0,
+                profile.get::<GemmLiveTileLarge>().0,
+            ],
             dsv4_prefill_from: 0,
             dsv4_replay: false,
         }

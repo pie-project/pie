@@ -239,3 +239,31 @@ fn the_f32_projection_lands_unrounded() {
         }
     }
 }
+
+/// The lm head over a body's padded readouts multiplies only the live rows
+/// (a device word), whichever of its three launches takes the count, and
+/// leaves the padding's rows as they were.
+#[test]
+fn the_live_lm_head_multiplies_the_live_rows() {
+    let Some(gpu) = Gpu::open() else { return };
+    if kernels_rocm::hip::lt_grouped::library(Dtype::Bf16).is_err() {
+        return;
+    }
+    let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
+    t.gemm_live_from = 129;
+    let ctx = gpu.ctx().with_tuning(t);
+    let (m, n, k) = (192u32, 3000u32, 512u32);
+    let a: Vec<f32> = values((m * k) as usize, 31, 1.0).into_iter().map(round_bf16).collect();
+    let w: Vec<f32> = values((n * k) as usize, 32, 0.05).into_iter().map(round_bf16).collect();
+    let (at, wt) = (gpu.tensor(&a, m, k, Dtype::Bf16), gpu.tensor(&w, n, k, Dtype::Bf16));
+    let want = reference(&a, &w, None, m as usize, n as usize, k as usize);
+    for live in [7u32, 40, 150, 192] {
+        let count = gpu.upload(&[live], 1, 1, Dtype::I32);
+        let mut y = gpu.tensor(&vec![3.0; (m * n) as usize], m, n, Dtype::Bf16);
+        gemm::lm_head_live(&ctx, at, wt, count.ptr, &mut y).unwrap();
+        let got = gpu.read(&y);
+        let rows = (live * n) as usize;
+        close_bf16(&format!("live {live}"), &got[..rows], &want[..rows], 2.0);
+        assert!(got[rows..].iter().all(|&v| v == 3.0), "live {live}: a padding row was written");
+    }
+}

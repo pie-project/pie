@@ -833,44 +833,53 @@ __global__ __launch_bounds__(256) void moe_swiglu_ordered(const T* __restrict__ 
 // from moe_route_order. Each expert's `UserArguments` (49 words: m its
 // weight rows, n its routes, k; a/b/d its planes) is written here, an n = 0
 // sentinel after the last so a worst-case grid's spare groups end there.
+// One UserArguments record: d[c, n] = b[c, k] · a[n, k]ᵀ (c = 0 with n = 0
+// is the sentinel a worst-case grid's spare groups end at).
+template <class T>
+__device__ __forceinline__ void lt_record(u32* __restrict__ rec, u32 n, u32 c, u32 k, u64 d, u64 a, u64 b) {
+    u32 w[49];
+#pragma unroll
+    for (int i = 0; i < 49; ++i) w[i] = 0;
+    if (n != 0) {
+        w[0] = n;
+        w[1] = c;
+        w[2] = 1;
+        w[3] = k;
+        w[4] = static_cast<u32>(d);
+        w[5] = static_cast<u32>(d >> 32);
+        w[6] = static_cast<u32>(d);
+        w[7] = static_cast<u32>(d >> 32);
+        w[8] = static_cast<u32>(a);
+        w[9] = static_cast<u32>(a >> 32);
+        w[10] = static_cast<u32>(b);
+        w[11] = static_cast<u32>(b >> 32);
+        w[12] = n;
+        w[13] = n * c;
+        w[14] = n;
+        w[15] = n * c;
+        w[16] = k;
+        w[17] = n * k;
+        w[18] = k;
+        w[19] = k * c;
+        w[20] = 0x3f800000u;  // alpha = 1.0f; beta (word 24) stays 0
+    }
+#pragma unroll
+    for (int i = 0; i < 49; ++i) rec[i] = w[i];
+}
+
 template <class T>
 __device__ __forceinline__ void lt_write_args(const i32* __restrict__ offsets, u32* __restrict__ args, u64 bank,
                                               u64 staged_in, u64 staged_out, int n, int k, int num_experts) {
     for (int e = threadIdx.x; e <= num_experts; e += blockDim.x) {
-        u32 w[49];
-#pragma unroll
-        for (int i = 0; i < 49; ++i) w[i] = 0;
-        if (e < num_experts) {
-            const u32 off = static_cast<u32>(offsets[e]);
-            const u32 c = static_cast<u32>(offsets[e + 1]) - off;
-            const u64 d = staged_out + static_cast<u64>(off) * n * sizeof(T);
-            const u64 a = bank + static_cast<u64>(e) * n * k * sizeof(T);
-            const u64 b = staged_in + static_cast<u64>(off) * k * sizeof(T);
-            w[0] = n;
-            w[1] = c;
-            w[2] = 1;
-            w[3] = k;
-            w[4] = static_cast<u32>(d);
-            w[5] = static_cast<u32>(d >> 32);
-            w[6] = static_cast<u32>(d);
-            w[7] = static_cast<u32>(d >> 32);
-            w[8] = static_cast<u32>(a);
-            w[9] = static_cast<u32>(a >> 32);
-            w[10] = static_cast<u32>(b);
-            w[11] = static_cast<u32>(b >> 32);
-            w[12] = n;
-            w[13] = n * c;
-            w[14] = n;
-            w[15] = n * c;
-            w[16] = k;
-            w[17] = static_cast<u32>(n) * k;
-            w[18] = k;
-            w[19] = k * c;
-            w[20] = 0x3f800000u;  // alpha = 1.0f; beta (word 24) stays 0
-        }
         u32* rec = args + static_cast<long long>(e) * 49;
-#pragma unroll
-        for (int i = 0; i < 49; ++i) rec[i] = w[i];
+        if (e == num_experts) {
+            lt_record<T>(rec, 0, 0, 0, 0, 0, 0);
+            continue;
+        }
+        const u32 off = static_cast<u32>(offsets[e]);
+        const u32 c = static_cast<u32>(offsets[e + 1]) - off;
+        lt_record<T>(rec, n, c, k, staged_out + static_cast<u64>(off) * n * sizeof(T),
+                     bank + static_cast<u64>(e) * n * k * sizeof(T), staged_in + static_cast<u64>(off) * k * sizeof(T));
     }
 }
 
@@ -907,6 +916,22 @@ template <class T>
 __global__ __launch_bounds__(256) void moe_lt_args(const i32* __restrict__ offsets, u32* __restrict__ args, u64 bank,
                                                    u64 staged_in, u64 staged_out, int n, int k, int num_experts) {
     lt_write_args<T>(offsets, args, bank, staged_in, staged_out, n, k, num_experts);
+}
+
+// A projection over the live rows of a padded plane (an lm head over a
+// body's readouts): `live` names how many of `rows` are, and launch r of
+// three grouped GEMMs takes them when they number in (bounds[r], bounds[r +
+// 1]], the others none; a record and its sentinel a launch.
+template <class T>
+__global__ __launch_bounds__(64) void dense_lt_live_args(const u32* __restrict__ live, u32* __restrict__ args, u64 w,
+                                                         u64 act, u64 y, int n, int k, int rows, int b1, int b2) {
+    const int m = min(static_cast<int>(*live), rows);
+    const int bounds[4] = {0, b1, b2, rows};
+    for (int r = threadIdx.x; r < 6; r += blockDim.x) {
+        const int at = r / 2;
+        const u32 c = m > bounds[at] && m <= bounds[at + 1] ? static_cast<u32>(m) : 0u;
+        lt_record<T>(args + r * 49, r % 2 == 0 ? static_cast<u32>(n) : 0u, c, k, y, w, act);
+    }
 }
 
 // The sorted routed MLP's fold: y[n][h] = Σ_k weights[n][k] ·

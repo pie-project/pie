@@ -163,6 +163,8 @@ pub struct Handles {
     pub row_valid: Tensor,
     pub adapter_routes: Option<Tensor>,
     pub readout_rows: Tensor,
+    /// How many of `readout_rows` are live (the rest pad a body's ceiling).
+    pub readout_live: u64,
     pub mask: Option<Tensor>,
     pub mask_indptr: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
@@ -280,6 +282,7 @@ pub struct Fire<'a> {
     pub slot_ids: &'a [i32],
     pub adapter_routes: Option<&'a [i32]>,
     pub readout_rows: &'a [i32],
+    pub readout_live: u32,
     pub spaces: &'a [Geometry],
     pub mask: Option<&'a crate::mask::Staged>,
     pub live_rows: u32,
@@ -471,6 +474,7 @@ pub struct Inputs {
     slot_ids: u64,
     adapter_routes: u64,
     readout_rows: u64,
+    readout_live: u64,
     mask_bits: u64,
     mask_bytes: u64,
     mask_indptr: u64,
@@ -540,6 +544,7 @@ impl Inputs {
         let slot_ids = take(lanes * 4);
         let adapter_routes = take(rows * 4);
         let readout_rows = take(rows * 4);
+        let readout_live = take(4);
         let context = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
         let mask_bytes = if masked {
             (rows * context).div_ceil(8) + lanes
@@ -651,6 +656,7 @@ impl Inputs {
             slot_ids,
             adapter_routes,
             readout_rows,
+            readout_live,
             mask_bits,
             mask_bytes,
             mask_indptr,
@@ -898,6 +904,11 @@ impl Inputs {
             self.readout_rows,
             bytes_of(fire.readout_rows),
             "staged readout rows",
+        )?;
+        put(
+            self.readout_live,
+            &fire.readout_live.to_le_bytes(),
+            "staged live readouts",
         )?;
 
         let mask_bytes = match fire.mask {
@@ -1229,6 +1240,7 @@ impl Inputs {
         let at_class_table = self.class_table;
         let class_count = *class_count;
         let at_readouts = self.readout_rows;
+        let at_readout_live = self.readout_live;
         let places: Vec<SpaceAt> = self.spaces.clone();
         let at_lane_of_row = self.lane_of_row;
         let at_group_of_lane = self.group_of_lane;
@@ -1260,6 +1272,7 @@ impl Inputs {
         copy(at_row_valid, rows as usize)?;
         copy(at_lane_of_row, rows as usize * 4)?;
         copy(at_readouts, readouts as usize * 4)?;
+        copy(at_readout_live, 4)?;
         copy(at_slot_ids, space_lanes as usize * 4)?;
         if let Some(routes) = adapter_rows {
             copy(at_routes, *routes as usize * 4)?;
@@ -1324,6 +1337,7 @@ impl Inputs {
             slot_ids: i32s(base + at_slot_ids, space_lanes),
             adapter_routes: adapter_rows.map(|rows| i32s(base + at_routes, rows)),
             readout_rows: i32s(base + at_readouts, readouts),
+            readout_live: base + at_readout_live,
             row_valid: Tensor::new(base + at_row_valid, rows, 1, Dtype::U8),
             mask: mask_bytes.map(|bytes| Tensor::new(base + at_mask, bytes, 1, Dtype::U8)),
             mask_indptr: mask_bytes.map(|_| i32s(base + at_mask_indptr, lanes + 1)),
