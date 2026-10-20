@@ -284,14 +284,31 @@ pub fn mb_block(rows: i32, capacity: i32) -> Option<(i32, i32)> {
             .saturating_mul(rung);
         (padded <= capacity).then_some((rung, padded))
     };
+    // A prompt-sized batch takes the widest tile that pads it by at most a
+    // sixteenth: a few rows past a whole number of 64-row tiles would
+    // otherwise run a whole tile more.
+    let snug = |(rung, padded): (i32, i32)| {
+        (rows < PROMPT_ROWS || padded - rows <= rows / 16).then_some((rung, padded))
+    };
     BM_RUNGS
         .iter()
         .rev()
         .copied()
         .filter(|rung| rows >= *rung)
-        .find_map(fits)
+        .find_map(|rung| fits(rung).and_then(snug))
+        .or_else(|| {
+            BM_RUNGS
+                .iter()
+                .rev()
+                .copied()
+                .filter(|rung| rows >= *rung)
+                .find_map(fits)
+        })
         .or_else(|| fits(BM_RUNGS[0]))
 }
+
+/// The rows from which [`mb_block`] weighs a tile's padding.
+const PROMPT_ROWS: i32 = 256;
 
 /// The widest row tile up to `widen_to` that still fills, for a padded
 /// matmul now tiled at `bm`.
@@ -1289,6 +1306,9 @@ mod tests {
         assert_eq!(widen_rung(16, 16, 32, fills), 16);
         assert_eq!(widen_rung(8, 8, 32, fills), 8);
         assert_eq!(widen_rung(8, 16, 32, |_| false), 8);
+        assert_eq!(mb_block(512, 1024), Some((64, 512)));
+        assert_eq!(mb_block(525, 1024), Some((32, 544)));
+        assert_eq!(mb_block(560, 1024), Some((64, 576)));
     }
 
     fn the_split_follows_the_tile_count() {
