@@ -35,6 +35,13 @@ __device__ __forceinline__ void mma(float (&d)[4], unsigned a0, unsigned a1, uns
 /// Two e4m3 codes (the low byte the low half) as floats, exactly.
 __device__ __forceinline__ float2 e4m3x2_f32(unsigned short pair) {
     float lo, hi;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+    // Below sm_89's convert: each code laid into an f32 (2^-120 times its
+    // value, an e4m3 subnormal an f32 one) and taken back up.
+    const unsigned b0 = pair & 0xFFu, b1 = static_cast<unsigned>(pair) >> 8;
+    lo = __uint_as_float(((b0 & 0x80u) << 24) | ((b0 & 0x7Fu) << 20)) * 0x1p120f;
+    hi = __uint_as_float(((b1 & 0x80u) << 24) | ((b1 & 0x7Fu) << 20)) * 0x1p120f;
+#else
     asm("{ .reg .b32 h; .reg .b16 l, u;\n"
         "cvt.rn.f16x2.e4m3x2 h, %2;\n"
         "mov.b32 {l, u}, h;\n"
@@ -42,10 +49,40 @@ __device__ __forceinline__ float2 e4m3x2_f32(unsigned short pair) {
         "cvt.f32.f16 %1, u; }\n"
         : "=f"(lo), "=f"(hi)
         : "h"(pair));
+#endif
     float2 r;
     r.x = lo;
     r.y = hi;
     return r;
+}
+
+/// `v` as an e4m3 code, rounded to nearest even and saturated at 448 (as
+/// sm_89's `cvt.rn.satfinite` lands it; NaN lands the NaN code).
+__device__ __forceinline__ unsigned e4m3_of(float v) {
+    const unsigned sign = (__float_as_uint(v) >> 24) & 0x80u;
+    const float a = fabsf(v);
+    if (!(a == a)) return 0x7Fu;
+    if (a >= 448.f) return sign | 0x7Eu;
+    // Below 2^-6 the codes step 2^-9 apart: a subnormal code is the count
+    // (eight of them reaching the smallest normal, code 0x08).
+    if (a < 0x1p-6f) return sign | static_cast<unsigned>(__float2int_rn(a * 512.f));
+    // Else keep three mantissa bits, nearest even, a carry moving the exponent.
+    unsigned bits = __float_as_uint(a);
+    bits += 0x7FFFFu + ((bits >> 20) & 1u);
+    const unsigned e = (bits >> 23) - 120u;  // bias 127 to bias 7
+    const unsigned code = (e << 3) | ((bits >> 20) & 7u);
+    return sign | (code > 0x7Eu ? 0x7Eu : code);
+}
+
+/// Two floats as e4m3 codes, `lo`'s the low byte.
+__device__ __forceinline__ unsigned short e4m3x2_of(float hi, float lo) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+    return static_cast<unsigned short>(e4m3_of(lo) | (e4m3_of(hi) << 8));
+#else
+    unsigned short r;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(hi), "f"(lo));
+    return r;
+#endif
 }
 
 /// 2^(e - 127) for a biased exponent `e` in 1 .. 254.
@@ -272,9 +309,8 @@ __global__ void __launch_bounds__(256) quantize_fp8b128(const bf16* __restrict__
     unsigned packed[16];
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
-        unsigned short lo, hi;
-        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(v[4 * i + 1] * inv), "f"(v[4 * i] * inv));
-        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(v[4 * i + 3] * inv), "f"(v[4 * i + 2] * inv));
+        const unsigned short lo = gfp8::e4m3x2_of(v[4 * i + 1] * inv, v[4 * i] * inv);
+        const unsigned short hi = gfp8::e4m3x2_of(v[4 * i + 3] * inv, v[4 * i + 2] * inv);
         packed[i] = static_cast<unsigned>(lo) | (static_cast<unsigned>(hi) << 16);
     }
 #pragma unroll
