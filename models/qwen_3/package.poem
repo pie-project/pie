@@ -7,10 +7,10 @@ load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
 
 # Qwen 3.5, 3.6 and 3.8 templates end a thinking request's prompt inside an open `<think>`.
 THINKING_CUE = "<think>\n"
-CHATML = template("chatml", thinking = True, tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
+CHATML = template("chatml", thinking = True, tools = True, xml_tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
 CHATML_INTERLEAVED = template("chatml", thinking = True, preserve_thinking = True, tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
 # Qwen3.8's template opens a thinking request's system turn with its reasoning-effort instruction.
-CHATML_QWEN38 = template("chatml", thinking = True, preserve_thinking = True, reasoning_effort = True, tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
+CHATML_QWEN38 = template("chatml", thinking = True, preserve_thinking = True, reasoning_effort = True, tools = True, xml_tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP], parts = {"vision": [QWEN_VISION]})
 TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"vision": [QWEN_VISION]})
 

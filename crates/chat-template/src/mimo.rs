@@ -170,7 +170,7 @@ fn parameter_value(text: &str) -> serde_json::Value {
 
 /// `<function=NAME><parameter=K>V</parameter>…</function>` as the name and
 /// its arguments' JSON object.
-fn parse_call(span: &str) -> Option<(String, String)> {
+pub(crate) fn parse_call(span: &str) -> Option<(String, String)> {
     let rest = &span[span.find(FUNCTION_OPEN)? + FUNCTION_OPEN.len()..];
     let close = rest.find('>')?;
     let name = rest[..close].trim().to_string();

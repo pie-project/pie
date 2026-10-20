@@ -1,6 +1,6 @@
 pub use crate::pie::inferlet::chat::{
-    Decoder, Event, ReasoningEffort, assistant, cue, cue_without_thinking, first_user, prefix,
-    seal, stop_tokens, system, system_thinking, system_user, user,
+    Decoder, Event, ReasoningEffort, assistant, cue, cue_without_thinking, first_user, open,
+    prefix, seal, stop_tokens, system, system_thinking, system_user, user,
 };
 
 /// [`cue`], or [`cue_without_thinking`] when `think` is false.

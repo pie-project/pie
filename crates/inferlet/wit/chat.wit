@@ -36,6 +36,12 @@ interface chat {
     /// `system(message)` (or nothing) where the template has no instruction.
     system-thinking: func(message: option<string>, effort: reasoning-effort) -> list<u32>;
 
+    /// The system turn a conversation opens with, as the template writes it
+    /// from the request's system message, its tools, and the reasoning effort
+    /// of a request the model answers with thinking (`none` for one it
+    /// answers without).
+    open: func(system: option<string>, tools: list<string>, effort: option<reasoning-effort>) -> list<u32>;
+
     /// Cue the model to generate (fills generation header)
     cue: func() -> list<u32>;
 
