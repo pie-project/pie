@@ -29,6 +29,8 @@ sdpa.pool_mma = true
 moe.mxfp4_mma_from = 17
 moe.mxfp4_mma_until = 16777216
 moe.mxfp4_select_lean = true
+moe.nvfp4_mma_from = 17
+moe.nvfp4_mma_until = 65536
 sdpa.dsv4_replay = true
 ssm.gdn_fused_scan = true
 ssm.conv_vec4 = true
@@ -69,6 +71,8 @@ measured = [
   "kernel.moe.mxfp4_mma_from",
   "kernel.moe.mxfp4_mma_until",
   "kernel.moe.mxfp4_select_lean",
+  "kernel.moe.nvfp4_mma_from",
+  "kernel.moe.nvfp4_mma_until",
   "kernel.ssm.gdn_fused_scan",
   "kernel.ssm.gdn_step_blocks",
   "kernel.ssm.conv_vec4",
