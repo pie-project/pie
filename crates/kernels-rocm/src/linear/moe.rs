@@ -1035,7 +1035,8 @@ fn grouped_launch(
 ) -> Result<(), Error> {
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let k = stated(op, x.width)?;
-    let rows = nonzero(op, "N, the bank's output width", y.width)? * if glu.is_some() { 2 } else { 1 };
+    let rows =
+        nonzero(op, "N, the bank's output width", y.width)? * if glu.is_some() { 2 } else { 1 };
     let n = stated(op, rows)?;
     let tall = takes_tall(ordered, rows, x.width);
     debug_assert!(tall || glu.is_none(), "a GLU launch takes the tall block");
@@ -1102,8 +1103,8 @@ const fn takes_tall(ordered: &RouteOrder, rows: u32, k: u32) -> bool {
 #[cfg(feature = "rocm")]
 mod ordered {
     use super::{
-        FILE, SORT_ACT, SORT_OUT, Selected, dense_experts, takes_tall, group_routes, grouped_launch,
-        grouped_worth, route_order, select_grouped_launch, selected, weighted_sum,
+        FILE, SORT_ACT, SORT_OUT, Selected, dense_experts, group_routes, grouped_launch,
+        grouped_worth, route_order, select_grouped_launch, selected, takes_tall, weighted_sum,
     };
     use crate::error::Error;
     use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, stated, symbol};
@@ -2243,7 +2244,7 @@ pub fn matmul_select_fp8_mfma(
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
-    let (q, act_scales) = crate::linear::act_quant::quantized_codes(ctx, OP, x, 128)?;
+    let (q, act_scales) = crate::linear::act_quant::quantized_codes(ctx, OP, x, 128, false)?;
     matmul_select_fp8_quantized(ctx, x, q, act_scales, codes, scales, routes, y, seat)
 }
 

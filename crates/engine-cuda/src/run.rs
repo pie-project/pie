@@ -38,8 +38,9 @@ pub enum WeightRow {
     },
 
     /// A resident plane in the matrix core's order, which only the products
-    /// that read it so take (ROCm: an fp8b32 projection, `e4m3fn_shuffle`,
-    /// read by `act_quant::matmul_fp8b32_lanes`).
+    /// that read it so take (ROCm: an fp8b32 or fp8b128 projection,
+    /// `e4m3fn_shuffle`, read by `act_quant::matmul_fp8b32_lanes` or, beside
+    /// f32 factors, `act_quant::matmul_fp8_quantized`).
     Ordered(Tensor),
 }
 
@@ -524,6 +525,7 @@ impl Standing {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Fp8Rows {
     pub value: u32,
+    pub pow2: bool,
     pub stage: u64,
     pub ctx: usize,
     pub region: u32,

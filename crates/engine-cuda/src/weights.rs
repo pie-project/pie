@@ -986,7 +986,15 @@ impl Weights {
             hip::canonical_fp8(trace, &index, &places, &store, tier, stream)?;
             hip::group_row_factors(trace, &index, &mut table, stream)?;
             hip::order_mxfp4_banks(trace, &places, &store, tier, &pairings, &mut table, stream)?;
-            hip::order_fp8b32_planes(trace, &places, &store, tier, &mut table, stream)?;
+            hip::order_fp8b_planes(
+                trace,
+                &places,
+                &store,
+                tier,
+                &mut table,
+                &mut decoded,
+                stream,
+            )?;
         }
         #[cfg(feature = "cuda")]
         lay_tile_banks(trace, &mut table, &mut decoded, stream)?;

@@ -788,17 +788,16 @@ impl Run<'_> {
         &mut self,
         op: &'static str,
         act: ValueId,
+        pow2: bool,
     ) -> Result<(kernels_cuda::Tensor, kernels_cuda::Tensor), kernels_cuda::Error> {
         let stage = match self.ctx().stage() {
             kernels_cuda::jit::ArgValue::Ptr(p) => p,
             _ => 0,
         };
         let ctx = core::ptr::from_ref(self.ctx()) as usize;
-        if let Some(held) = self
-            .fp8_rows
-            .iter()
-            .find(|held| held.value == act.0 && held.stage == stage && held.ctx == ctx)
-        {
+        if let Some(held) = self.fp8_rows.iter().find(|held| {
+            held.value == act.0 && held.pow2 == pow2 && held.stage == stage && held.ctx == ctx
+        }) {
             return Ok((held.codes, held.scales));
         }
         let x = self.tensor(act);
@@ -813,7 +812,7 @@ impl Run<'_> {
                 0
             }
         } % linear::act_quant::FP8_HOLDS;
-        let (q, s) = linear::act_quant::quantized_codes_held(self.ctx(), op, x, hold)?;
+        let (q, s) = linear::act_quant::quantized_codes_held(self.ctx(), op, x, hold, pow2)?;
         // The hold's earlier rows are gone; past a decode batch nothing is
         // held (the stream's slab).
         self.fp8_rows
@@ -821,6 +820,7 @@ impl Run<'_> {
         if x.rows <= 64 {
             self.fp8_rows.push(crate::run::Fp8Rows {
                 value: act.0,
+                pow2,
                 stage,
                 ctx,
                 region,
@@ -841,7 +841,7 @@ impl Run<'_> {
         routes: ValueId,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        let (q, act_scales) = self.fp8_quantized("linear.moe_matmul_select_act_quant", x)?;
+        let (q, act_scales) = self.fp8_quantized("linear.moe_matmul_select_act_quant", x, false)?;
         let x = self.tensor(x);
         let (codes, scales, biases, seat) = self.planes(bank);
         let routes = self.tensor(routes);
@@ -889,6 +889,7 @@ impl Run<'_> {
         };
         let codes = self.tensor(w);
         let scales = self.tensor(scales);
+        let ordered = self.ordered_bank(w).is_some();
         // f32 factors: an e4m3tile projection (transformers' FP8 release),
         // against e4m3 activations under f32 scales on the FP8 matrix core.
         if scales.dtype == Dtype::F32 {
@@ -901,7 +902,10 @@ impl Run<'_> {
                     ),
                 });
             }
-            let (q, act_scales) = self.fp8_quantized(OP, act)?;
+            // An ordered plane's factors are an fp8b128 one's exponents
+            // (`weights::hip::order_fp8b_planes`): its rows quantize under
+            // DeepSeek's power-of-two scales.
+            let (q, act_scales) = self.fp8_quantized(OP, act, ordered)?;
             return linear::act_quant::matmul_fp8_quantized(
                 self.ctx(),
                 OP,
@@ -913,7 +917,7 @@ impl Run<'_> {
             );
         }
         // An fp8b32 plane in the FP8 matrix core's order.
-        if self.ordered_bank(w).is_some() {
+        if ordered {
             return linear::act_quant::matmul_fp8b32_lanes(
                 self.ctx(),
                 OP,
@@ -1006,8 +1010,18 @@ impl Run<'_> {
                 // Over a body's readouts, only the live ones (a staged word).
                 let act = self.tensor(*act);
                 let readouts = self.bindings().readout_rows;
-                let live = if act.rows == readouts.rows { self.bindings().readout_live } else { 0 };
-                linear::gemm::lm_head_live(self.ctx(), act, self.tensor(*w), live, &mut self.tensor(*y))
+                let live = if act.rows == readouts.rows {
+                    self.bindings().readout_live
+                } else {
+                    0
+                };
+                linear::gemm::lm_head_live(
+                    self.ctx(),
+                    act,
+                    self.tensor(*w),
+                    live,
+                    &mut self.tensor(*y),
+                )
             }
         }
     }
