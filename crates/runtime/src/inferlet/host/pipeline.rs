@@ -6,7 +6,11 @@ pub use crate::pipeline::Pipeline;
 
 use super::pie;
 
-impl pie::inferlet::pipeline::Host for ProcessCtx {}
+impl pie::inferlet::pipeline::Host for ProcessCtx {
+    async fn live(&mut self) -> anyhow::Result<u32> {
+        Ok(u32::try_from(Pipeline::live()).unwrap_or(u32::MAX))
+    }
+}
 
 impl pie::inferlet::pipeline::HostPipeline for ProcessCtx {
     async fn new(&mut self) -> anyhow::Result<Resource<Pipeline>> {
