@@ -594,17 +594,17 @@ fn select_bf16_wgmma(
     // barriers a row: 3.0 TB/s at Gemma 4 26B-A4B's gate-up, every expert
     // routed), else 64: `kWgStages` stages of the rows and the slice's route
     // rows, past the 1024-byte alignment.
-    let (tiles, atoms): (u32, u32) = (1, if x.width.is_multiple_of(128) { 2 } else { 1 });
-    let smem = 3 * atoms * (64 * tiles + slice) * 128 + 1024;
+    let atoms: u32 = if x.width.is_multiple_of(128) { 2 } else { 1 };
+    let smem = 3 * atoms * (64 + slice) * 128 + 1024;
     ctx.fire(
         op,
         Fire::at(
             "linear/moe_wgmma.cuh",
             symbol(&format!(
-                "::pie::linear::moe_select_bf16_wgmma<{slice}, {tiles}, {atoms}>"
+                "::pie::linear::moe_select_bf16_wgmma<{slice}, {atoms}>"
             )),
         )
-        .apply(Launch::grid([work_cap, y.width / (64 * tiles), 1], [128, 1, 1]).smem(smem)),
+        .apply(Launch::grid([work_cap, y.width / 64, 1], [128, 1, 1]).smem(smem)),
         &[
             x.arg(),
             ArgValue::Ptr(order),
@@ -2677,7 +2677,7 @@ fn select_mxfp4_mma(
         Fire::at(
             "linear/moe_wgmma.cuh",
             symbol(&format!(
-                "::pie::linear::moe_select_fp4_wgmma<{code}, {nv}, 2, 1, {stages}>"
+                "::pie::linear::moe_select_fp4_wgmma<{code}, {nv}, {stages}>"
             )),
         )
         .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(smem))

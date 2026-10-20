@@ -570,9 +570,6 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
                 ctx.stream().cast(),
             )
         };
-        if code == rt::cudaError::cudaSuccess {
-            pinned::sent(op, ctx.stream().cast())?;
-        }
         if code != rt::cudaError::cudaSuccess {
             return Err(refuse(
                 op,
@@ -582,7 +579,7 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
                 ),
             ));
         }
-        Ok(())
+        pinned::sent(op, ctx.stream().cast())
     }
     #[cfg(not(feature = "cuda"))]
     {

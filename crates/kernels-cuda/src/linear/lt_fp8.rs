@@ -230,10 +230,10 @@ fn plan_for(
 /// graph reads the one finished copy.
 fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<u64, Error> {
     use cudarc::runtime::sys as rt;
-    static SCALES: OnceLock<Mutex<HashMap<(i32, u64, u32, u32), u64>>> = OnceLock::new();
-    let mut dev = 0i32;
-    // SAFETY: an out-pointer for the calling thread's device.
-    let _ = unsafe { cudaGetDevice(&raw mut dev) };
+    /// The converted scales by device, atoms' address, `n` and `k`.
+    type Converted = Mutex<HashMap<(i32, u64, u32, u32), u64>>;
+    static SCALES: OnceLock<Converted> = OnceLock::new();
+    let dev = device();
     let key = (dev, atoms, n, k);
     let mut held = SCALES
         .get_or_init(|| Mutex::new(HashMap::new()))

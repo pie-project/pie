@@ -477,7 +477,7 @@ fn bf16_select_rate() {
         let (experts, tokens, top) = (128usize, 64usize, 8usize);
         let mut b = Bench::new(7);
         let (x, _) = b.bf16(tokens * k);
-        let bank = b.up(&tab(experts * n * k, |i| (0x3c00u16 ^ (i % 97) as u16)));
+        let bank = b.up(&tab(experts * n * k, |i| 0x3c00u16 ^ (i % 97) as u16));
         // `PIE_ROUTES`: a file of `tokens * top` i32 expert ids (a model's).
         let routes: Vec<i32> = std::env::var("PIE_ROUTES").map_or_else(
             |_| {

@@ -241,17 +241,17 @@ struct Mma<16> {
 
 /// `y[route] = x[route / act_div] . W[expert]^T` for a bf16 bank on Hopper's
 /// wgmma: `moe_select_fp8a8_wgmma`'s ring and swizzle over bf16, a stage
-/// `kAtoms` 64-wide K atoms (128-byte rows), `kT` m64 tiles of the expert's
-/// rows a CTA, the MMAs summing straight into the accumulators (no block
-/// scales). `k` whole `64 kAtoms`s, `n` whole `64 kT`s. Grid `[work_cap, n /
-/// (64 kT)]`, 128 threads, `kWgStages kAtoms (64 kT + kR) 128 + 1024` bytes of
-/// shared memory.
-template <int kR, int kT = 2, int kAtoms = 1>
+/// `kAtoms` 64-wide K atoms (128-byte rows), one m64 tile of the expert's
+/// rows a CTA (a decode's few routes stream more rows' CTAs at once), the
+/// MMAs summing straight into the accumulators (no block scales). `k` whole
+/// `64 kAtoms`s, `n` whole 64s. Grid `[work_cap, n / 64]`, 128 threads,
+/// `kWgStages kAtoms (64 + kR) 128 + 1024` bytes of shared memory.
+template <int kR, int kAtoms = 1>
 __global__ void __launch_bounds__(128) moe_select_bf16_wgmma(
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const bf16* __restrict__ weight, bf16* __restrict__ out,
     int act_div, int n, int k, int num_experts) {
-    // `kT` m64 tiles a CTA: 128 or 64 of the expert's rows.
+    constexpr int kT = 1;
     constexpr int kRows = 64 * kT;
     // `kAtoms` 64-wide K atoms a stage (64 or 128 of K).
     constexpr int kA = kAtoms * kRows * 128;
@@ -373,18 +373,6 @@ __device__ __forceinline__ void hold(unsigned (&a)[4]) {
 
 }  // namespace wgfp4
 
-/// `moe_select_mxfp4_mma_staged` on Hopper's wgmma (sm_90a), for a slice of
-/// 64 routes an expert: a CTA, `kWg` warpgroups, each `kT` m64 tiles of the
-/// expert's rows (a GLU's gate and up tiles). Each 128-code K chunk's route
-/// rows (K-major, 128-byte swizzled, the MMAs' B) and the CTA's codes and
-/// scales stage through a `kStages` cp.async ring. A lane dequantizes the
-/// A fragment mma.sync's m16n8k16 would hold of its warp's 16 rows of each
-/// tile, k-step `s`'s codes `16 s + 2 c (+ 1)` and `+ 8` the bytes `8 s + c`
-/// and `8 s + 4 + c` of the row's chunk, and its warpgroup's m64n64k16 MMAs
-/// read them from registers. `k` whole 128s. Grid `[work_cap, rows / (64 kT
-/// kWg)]` (64 kWg GLU columns), `128 kWg` threads, `kStages (16384 + 72 R)`
-/// (each stage rounded up to a 1024) `+ 32 R + 1024` bytes of shared memory
-/// for the CTA's `R = 64 kT kWg` rows.
 namespace wgfp4 {
 
 // The byte of `w` that `sel` (`0x4440 | c`) picks: its two e2m1 codes as
@@ -396,20 +384,32 @@ __device__ __forceinline__ unsigned byte_codes(unsigned w, unsigned sel) {
 
 }  // namespace wgfp4
 
-template <int kGlu, bool kNv, int kT, int kWg, int kStages>
-__global__ void __launch_bounds__(128 * kWg, kWg == 1 && kT == 2 ? 3 : 1) moe_select_fp4_wgmma(
+/// `moe_select_mxfp4_mma_staged` on Hopper's wgmma (sm_90a), for a slice of
+/// 64 routes an expert: a CTA, one warpgroup, two m64 tiles of the expert's
+/// rows (128 rows, or a GLU's 64 gate and 64 up rows). Each 128-code K
+/// chunk's route rows (K-major, 128-byte swizzled, the MMAs' B) and the CTA's
+/// codes and scales stage through a `kStages` cp.async ring. A lane
+/// dequantizes the A fragment mma.sync's m16n8k16 would hold of its warp's
+/// 16 rows of each tile, k-step `s`'s codes `16 s + 2 c (+ 1)` and `+ 8` the
+/// bytes `8 s + c` and `8 s + 4 + c` of the row's chunk, and the warpgroup's
+/// m64n64k16 MMAs read them from registers. `k` whole 128s. Grid
+/// `[work_cap, rows / 128]` (64 GLU columns), 128 threads, `kStages 25600 +
+/// 5120` bytes of shared memory past a 1024-byte alignment.
+
+template <int kGlu, bool kNv, int kStages>
+__global__ void __launch_bounds__(128, 3) moe_select_fp4_wgmma(
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const bf16* __restrict__ bias, bf16* __restrict__ out, int act_div, int n, int k,
     int num_experts, int inter, float limit, float galpha, const float* __restrict__ tscale) {
-    static_assert(kGlu == 0 || kT == 2, "a GLU's CTA is its gate tile and its up tile");
     constexpr int kSlice = 64;
-    constexpr int kThreads = 128 * kWg;
+    constexpr int kT = 2;
+    constexpr int kThreads = 128;
     // A stage: the routes' two K-major atoms (128 codes), then the CTA's
     // rows' codes (64 bytes a row, its 16-byte runs swizzled by row pairs)
     // and scales (8 bytes a row).
     constexpr int kAtom = 64 * 128;
-    constexpr int kRows = 64 * kT * kWg;
+    constexpr int kRows = 64 * kT;
     constexpr int kB = 2 * kAtom;
     // Whole 1024s, each stage's atoms on the swizzle's alignment.
     constexpr int kStage = (kB + kRows * (64 + 8) + 1023) / 1024 * 1024;
@@ -434,15 +434,14 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 1 && kT == 2 ? 3 : 1) moe_se
     unsigned* conv = reinterpret_cast<unsigned*>(ring + kStages * kStage);
 
     const int tid = static_cast<int>(threadIdx.x);
-    const int warp = (tid >> 5) & 3, wg = tid >> 7, lane = tid & 31, g = lane >> 2, c = lane & 3;
-    // Warp w's 16 rows of each m64 tile of its warpgroup's.
-    constexpr int kWgRows = kGlu != 0 ? 64 : 64 * kT;
-    const int row_base = (static_cast<int>(blockIdx.y) * kWg + wg) * kWgRows + 16 * warp;
+    const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
+    // Warp w's 16 rows of each m64 tile.
+    constexpr int kTileRows = kGlu != 0 ? 64 : 64 * kT;
+    const int row_base = static_cast<int>(blockIdx.y) * kTileRows + 16 * warp;
     const int span = kGlu != 0 ? inter : n;
-    // A CTA row `r` (warpgroup, tile, row of the m64): its bank row.
+    // A CTA row `r` (tile `r / 64`, row `r % 64` of it): its bank row.
     auto bank_row = [&](int r) {
-        const int rw = r / (64 * kT), t = (r / 64) % kT, i = r % 64;
-        const int base = (static_cast<int>(blockIdx.y) * kWg + rw) * kWgRows + i;
+        const int t = r / 64, base = static_cast<int>(blockIdx.y) * kTileRows + r % 64;
         return kGlu != 0 ? base + t * inter : base + 64 * t;
     };
 
@@ -524,11 +523,11 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 1 && kT == 2 ? 3 : 1) moe_se
 #pragma unroll
         for (int t = 0; t < kT; ++t)
 #pragma unroll
-            for (int h = 0; h < 2; ++h) rr[t][h] = (wg * kT + t) * 64 + 16 * warp + 8 * h + g;
+            for (int h = 0; h < 2; ++h) rr[t][h] = t * 64 + 16 * warp + 8 * h + g;
         const u8* sfs = st + kB + kRows * 64;
         // NVFP4: lane `l` converts its warp's row `l % 16` of tile `l / 16`'s
         // eight block scales; MXFP4 reads its four a step.
-        unsigned* cw = conv + (wg * 4 + warp) * kT * 16 * 8;
+        unsigned* cw = conv + warp * kT * 16 * 8;
         uint2 sc[kT][2];
         bool wide = false;
         if constexpr (kNv) {
@@ -537,7 +536,7 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 1 && kT == 2 ? 3 : 1) moe_se
             for (int j = 0; j < (kT * 16 + 31) / 32; ++j) {
                 const int l = lane + 32 * j;
                 if (l < kT * 16) {
-                    const int r = (wg * kT + l / 16) * 64 + 16 * warp + l % 16;
+                    const int r = (l / 16) * 64 + 16 * warp + l % 16;
                     const uint2 v = *reinterpret_cast<const uint2*>(sfs + r * 8);
                     unsigned o[8];
 #pragma unroll
