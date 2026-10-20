@@ -554,7 +554,7 @@ impl<'c> Run<'c> {
         &self.fire
     }
 
-    fn slice(&self, handle: Tensor, skip: u32, keep: u32) -> Tensor {
+    pub(crate) fn slice(&self, handle: Tensor, skip: u32, keep: u32) -> Tensor {
         if skip == 0 && keep >= handle.rows {
             return handle;
         }

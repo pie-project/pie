@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use kernels_metal::ane::ffn::{self, Ffn, MAX_ROWS, MIN_ROWS, Memory, Shape};
+use kernels_metal::ane::ffn::{self, Ffn, MAX_ROWS, MIN_ROWS, Memory, STEP, Shape};
 use kernels_metal::ane::{Element, Handoff, Surface, linear};
 use kernels_metal::linear::ane::{self as kernels, Projection, Set, Shared, Source, Target};
 use kernels_metal::{Bank, Ctx, Error, Tensor};
@@ -68,6 +68,10 @@ struct ProjectionSite {
 /// What a step's completion handler asks: whether any Neural Engine
 /// evaluation or join of the step failed.
 pub type Verdict = Box<dyn Fn() -> Option<String> + Send>;
+
+/// The most rows past a whole procedure the GPU runs rather than pad the
+/// Neural Engine's program to the next one.
+const GPU_TAIL: u32 = STEP / 4;
 
 pub struct Private {
     handoff: Handoff,
@@ -539,6 +543,20 @@ impl Private {
     #[must_use]
     pub fn column_splits(&self) -> u64 {
         self.column_splits.load(Ordering::Acquire)
+    }
+
+    /// The leading rows of a fire the Neural Engine takes an MLP's share of:
+    /// all of them, or, when a few rows past a whole procedure would pad it to
+    /// the next one, only the rows of that procedure, the GPU running the
+    /// rest in full.
+    #[must_use]
+    pub fn head_rows(&self, rows: u32) -> u32 {
+        let tail = rows % STEP;
+        if tail != 0 && tail <= GPU_TAIL && self.rows_fit(rows - tail) {
+            rows - tail
+        } else {
+            rows
+        }
     }
 
     fn rows_fit(&self, rows: u32) -> bool {
