@@ -507,9 +507,17 @@ pub fn matmul_select(
                 Err(why) => tc5_fell_back(OP, &why),
             }
         }
-        // Where there are no tcgen05 GEMMs, a decode's routes on mma.sync,
-        // each expert's rows streamed once a slice rather than once a route.
+        // Where there are no tcgen05 GEMMs, a batch whose experts fill their
+        // tiles (past 12 routes an expert, `BF16_GEMM_FROM` routes a fire) on
+        // the tiled mma.sync GEMM. Fewer routes an expert take the pipelined
+        // select or the per-route GEMV below, which measured ahead of the
+        // register-held kernel there (Gemma 4 26B-A4B's 128 experts at 64
+        // rows, 196 against 146 us a select; every decode measured).
+        let tiled = fan.route_count >= BF16_GEMM_FROM
+            && x.width.is_multiple_of(64)
+            && fan.route_count.div_ceil(bank.rows.max(1)) > 12;
         if !crate::linear::tc5::supported()
+            && tiled
             && bank.dtype == Dtype::Bf16
             && !experts.streams()
             && select_bf16_held(ctx, OP, x, bank.ptr, bank.rows, routes, y, None)?
