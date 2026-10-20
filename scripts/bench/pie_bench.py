@@ -524,6 +524,10 @@ def build_config(args: argparse.Namespace):
             device_kv_budget=getattr(args, "device_kv_budget", None),
             precision=getattr(args, "precision", None),
             kv=getattr(args, "kv", None),
+            # A run that never speculates serves without the drafter: a paired
+            # head otherwise taps the trunk and fills its own kv on every prompt row.
+            drafter=getattr(args, "drafter", None)
+            or ("none" if getattr(args, "system_speculation", None) is False else None),
             device_memory_share=args.gpu_mem_util,
             engine=EngineConfig(
                 type=args.engine,
@@ -1506,6 +1510,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="[model] precision, e.g. bf16+nvfp4a4")
         sp.add_argument("--kv", default=None,
                         help="[model] kv, e.g. e4m3 (DeepSeek-V4's fp8 rows)")
+        sp.add_argument("--drafter", default=None,
+                        help="[model] drafter, e.g. dflash2 or none. Omit to serve the "
+                             "checkpoint's, or none under --no-system-speculation")
         sp.add_argument(
             "--device-kv-budget",
             default=None,
