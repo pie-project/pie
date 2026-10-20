@@ -16,22 +16,27 @@ namespace pie::attn {
 
 // ---------------------------------------------------------------- feed --
 
-// q_b's per-head [nope | rope] rows split into the two planes.
-template <class T>
+// q_b's per-head [nope | rope] rows split into the two planes, V elements a
+// thread (V divides both widths).
+template <class T, int V>
 __global__ void mla_split_q_b(const T* __restrict__ q_b, T* __restrict__ q_nope, T* __restrict__ q_pe,
                               int total, int heads, int nope, int rope, const u32* __restrict__ win) {
+    struct alignas(sizeof(T) * V) P {
+        T v[V];
+    };
     const Window window{win};
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     const int per = nope + rope;
-    const int d = i % per;
-    const int h = (i / per) % heads;
-    const int n = i / (heads * per);
+    const long long e = static_cast<long long>(i) * V;
+    const int d = static_cast<int>(e % per);
+    const int h = static_cast<int>(e / per % heads);
+    const long long n = e / (static_cast<long long>(heads) * per);
     if (!window.live(n)) return;
     const long long row = window.plane(n) * heads + h;
-    const T v = q_b[row * per + d];
-    if (d < nope) q_nope[row * nope + d] = v;
-    else q_pe[row * rope + (d - nope)] = v;
+    const P v = *reinterpret_cast<const P*>(q_b + row * per + d);
+    if (d < nope) *reinterpret_cast<P*>(q_nope + row * nope + d) = v;
+    else *reinterpret_cast<P*>(q_pe + row * rope + (d - nope)) = v;
 }
 
 // The absorbs: y[t, h, :] = x[t, h, :] · W_h, every head's own K x N

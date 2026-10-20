@@ -304,6 +304,10 @@ fn topk_ranks_exactly_over_paged_keys() {
     // GLM-5.3's indexer: 32 heads of 128, weighted; decode and prefill rows,
     // short rows listing everything they see.
     run_topk(32, 128, 1, 64, &[1, 1, 5], &[40, 900, 3000], true);
+    // A prefill past the candidate lists: rows a block over shared keys.
+    run_topk(32, 128, 1, 256, &[260, 300], &[40, 700], true);
+    // Past a block's four key lanes: each walks its later key blocks.
+    run_topk(32, 128, 1, 128, &[520], &[1700], true);
 }
 
 #[test]
@@ -311,6 +315,7 @@ fn topk_over_a_compressed_key_pool() {
     // DeepSeek-V4 / GLM-5.3-Flash: keys pooled every 4 tokens.
     run_topk(32, 128, 4, 96, &[1, 3], &[2000, 777], true);
     run_topk(16, 64, 4, 8, &[2], &[150], false);
+    run_topk(64, 128, 4, 64, &[530], &[400], true);
 }
 
 #[test]

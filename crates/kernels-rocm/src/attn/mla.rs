@@ -158,7 +158,9 @@ pub fn split_q_b(
     let nope = stated(OP, nope_dim)?;
     let rope = stated(OP, rope_dim)?;
     let width = i64::from(heads) * (i64::from(nope) + i64::from(rope));
-    let total = i64::from(q_b.rows) * width;
+    // Eight elements a thread when both widths are whole eights.
+    let vec = if nope % 8 == 0 && rope % 8 == 0 { 8 } else { 1 };
+    let total = i64::from(q_b.rows) * width / vec;
     let total = i32::try_from(total).map_err(|_| {
         refuse(
             OP,
@@ -169,7 +171,7 @@ pub fn split_q_b(
         OP,
         Fire::at(
             "attn/mla.hip",
-            crate::jit::symbol(&format!("::pie::attn::mla_split_q_b<{t}>")),
+            crate::jit::symbol(&format!("::pie::attn::mla_split_q_b<{t}, {vec}>")),
         )
         .apply(Launch::flat(total.unsigned_abs(), BLOCK)),
         &[
