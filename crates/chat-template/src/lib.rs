@@ -12,6 +12,7 @@ pub mod glm;
 pub mod harmony;
 pub mod hy;
 pub mod inkling;
+pub mod json;
 pub mod kimi;
 pub mod kimi3;
 pub mod lines;
@@ -137,6 +138,51 @@ pub trait Instruct: Send + Sync {
 
     fn answer(&self, _name: &str, _value: &str) -> Vec<u32> {
         Vec::new()
+    }
+
+    /// The system turn a conversation opens with, as the template writes it
+    /// from the request's system message, its tools and, for a request the
+    /// model answers with thinking, its reasoning effort. The default is
+    /// [`Instruct::system_thinking`] (or [`Instruct::system`]), then
+    /// [`Instruct::equip`].
+    fn open(&self, system: Option<&str>, tools: &[String], effort: Option<Effort>) -> Vec<u32> {
+        let mut tokens = match effort {
+            Some(effort) => self.system_thinking(system, effort),
+            None => system.map(|msg| self.system(msg)).unwrap_or_default(),
+        };
+        if !tools.is_empty() {
+            tokens.extend(self.equip(tools));
+        }
+        tokens
+    }
+
+    /// An earlier assistant turn: `msg`, then the `calls` (name, arguments
+    /// JSON) it made in the template's call syntax. `current` is a turn after
+    /// the conversation's last user query, which some templates replay with
+    /// its reasoning. The default writes each call as a ChatML
+    /// `<tool_call>{"name": …, "arguments": …}</tool_call>`.
+    fn assistant_calls(&self, msg: &str, calls: &[(String, String)], _current: bool) -> Vec<u32> {
+        let mut body = msg.to_string();
+        for (name, arguments) in calls {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&format!(
+                "<tool_call>\n{{\"name\": {}, \"arguments\": {}}}\n</tool_call>",
+                json::tojson(&serde_json::Value::String(name.clone())),
+                json::retojson(arguments)
+            ));
+        }
+        self.assistant(&body)
+    }
+
+    /// Consecutive tool results (name, value), as the template writes them
+    /// together. The default is one [`Instruct::answer`] each.
+    fn answers(&self, results: &[(String, String)]) -> Vec<u32> {
+        results
+            .iter()
+            .flat_map(|(name, value)| self.answer(name, value))
+            .collect()
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder>;

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
 use crate::decode::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder, ThinkingDecoder};
+use crate::json::{retojson, tojson};
 use crate::{
     ChatDecoder, Effort, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar, special,
     specials,
@@ -17,6 +18,10 @@ pub struct ChatML {
     /// reasoning-effort instruction (Qwen3.8).
     pub reasoning_effort: bool,
     pub tools: bool,
+    /// The template describes tools and reads calls in Qwen3-Coder's XML
+    /// (`<function=NAME><parameter=K>V</parameter></function>`), as Qwen 3.5
+    /// and later write them; otherwise in Hermes JSON.
+    pub xml_tools: bool,
     pub generation_suffix: String,
     pub stop_tokens: Vec<String>,
 }
@@ -100,10 +105,56 @@ impl ChatMLInstruct {
     }
 
     fn turn(&self, prefix: &[u32], msg: &str) -> Vec<u32> {
+        self.verbatim(prefix, msg.trim())
+    }
+
+    fn verbatim(&self, prefix: &[u32], msg: &str) -> Vec<u32> {
         let mut tokens = prefix.to_vec();
-        tokens.extend(self.tokenizer.encode(msg.trim()));
+        tokens.extend(self.tokenizer.encode(msg));
         tokens.extend(&self.turn_suffix);
         tokens
+    }
+
+    /// The reasoning-effort instruction a request with `effort` opens with.
+    fn instruction(&self, effort: Option<Effort>) -> Option<&'static str> {
+        if !(self.config.thinking && self.config.reasoning_effort) {
+            return None;
+        }
+        match effort? {
+            Effort::Xhigh => Some(EFFORT_XHIGH),
+            Effort::Low => Some(EFFORT_LOW),
+            Effort::Medium => None,
+        }
+    }
+
+    /// The system turn without tools. Qwen3.8 writes no turn for an empty
+    /// system message; the templates before it write the empty turn.
+    fn plain_system(&self, msg: Option<&str>, effort: Option<Effort>) -> Vec<u32> {
+        let content = msg.map(str::trim);
+        let skip_empty = self.config.reasoning_effort;
+        match (self.instruction(effort), content) {
+            (Some(i), Some(c)) if !c.is_empty() => {
+                self.turn(&self.system_prefix, &format!("{i}\n\n{c}"))
+            }
+            (Some(i), _) => self.turn(&self.system_prefix, i),
+            (None, Some(c)) if !(skip_empty && c.is_empty()) => self.system(c),
+            (None, _) => Vec::new(),
+        }
+    }
+
+    /// An assistant turn's reasoning and answer, split where its thinking
+    /// block closes.
+    fn split_reasoning(msg: &str) -> (&str, &str) {
+        match msg.rfind(THINK_CLOSE) {
+            Some(at) => {
+                let head = &msg[..at];
+                let reasoning = head
+                    .rfind(THINK_OPEN)
+                    .map_or(head, |open| &head[open + THINK_OPEN.len()..]);
+                (reasoning.trim(), msg[at + THINK_CLOSE.len()..].trim())
+            }
+            None => ("", msg.trim()),
+        }
     }
 
     fn without_thinking(msg: &str) -> &str {
@@ -124,43 +175,56 @@ impl ChatMLInstruct {
         if !config.preserve_thinking {
             return Cow::Borrowed(Self::without_thinking(msg));
         }
-        let (reasoning, answer) = match msg.rfind(THINK_CLOSE) {
-            Some(at) => {
-                let head = &msg[..at];
-                let reasoning = head
-                    .rfind(THINK_OPEN)
-                    .map_or(head, |open| &head[open + THINK_OPEN.len()..]);
-                (reasoning.trim(), msg[at + THINK_CLOSE.len()..].trim())
-            }
-            None => ("", msg.trim()),
-        };
+        let (reasoning, answer) = Self::split_reasoning(msg);
         Cow::Owned(format!(
             "{THINK_OPEN}\n{reasoning}\n{THINK_CLOSE}\n\n{answer}"
         ))
     }
 
-    fn tool_system_prompt(tools: &[String]) -> String {
-        let mut prompt = String::from(
-            " # Tools\n\n\
-             You may call one or more functions to assist with the user query.\n\n\
-             You are provided with function signatures within <tools></tools> XML tags:\n\
-             <tools>",
-        );
+    /// The template's tool description, each tool written as `tojson`
+    /// writes it.
+    fn tools_block(&self, tools: &[String]) -> String {
+        let (head, tail) = if self.config.xml_tools {
+            (XML_TOOLS_HEAD, XML_TOOLS_TAIL)
+        } else {
+            (HERMES_TOOLS_HEAD, HERMES_TOOLS_TAIL)
+        };
+        let mut block = String::from(head);
         for tool in tools {
-            prompt.push('\n');
-            prompt.push_str(tool);
+            block.push('\n');
+            block.push_str(&retojson(tool));
         }
-        prompt.push_str(
-            "\n</tools>\n\n\
-             For each function call, return a json object with function name and arguments \
-             within <tool_call></tool_call> XML tags:\n\
-             <tool_call>\n\
-             {\"name\": <function-name>, \"arguments\": <args-json-object>}\n\
-             </tool_call>",
-        );
-        prompt
+        block.push_str(tail);
+        block
+    }
+
+    /// One call in the template's syntax.
+    fn call_text(&self, name: &str, arguments: &str) -> String {
+        if !self.config.xml_tools {
+            return format!(
+                "<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {arguments}}}\n</tool_call>"
+            );
+        }
+        let mut text = format!("<tool_call>\n<function={name}>\n");
+        if let Ok(serde_json::Value::Object(arguments)) = serde_json::from_str(arguments) {
+            for (key, value) in arguments {
+                let value = match value {
+                    serde_json::Value::String(s) => s,
+                    other => tojson(&other),
+                };
+                text.push_str(&format!("<parameter={key}>\n{value}\n</parameter>\n"));
+            }
+        }
+        text.push_str("</function>\n</tool_call>");
+        text
     }
 }
+
+const HERMES_TOOLS_HEAD: &str = "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>";
+const HERMES_TOOLS_TAIL: &str = "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
+/// Qwen 3.5–3.8's `chat_template.jinja`, word for word.
+const XML_TOOLS_HEAD: &str = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+const XML_TOOLS_TAIL: &str = "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
 
 pub fn tool_names(tools: &[String]) -> Option<String> {
     let mut names: Vec<String> = Vec::new();
@@ -213,19 +277,7 @@ impl Instruct for ChatMLInstruct {
     }
 
     fn system_thinking(&self, msg: Option<&str>, effort: Effort) -> Vec<u32> {
-        let instruction = match effort {
-            _ if !(self.config.thinking && self.config.reasoning_effort) => None,
-            Effort::Xhigh => Some(EFFORT_XHIGH),
-            Effort::Low => Some(EFFORT_LOW),
-            Effort::Medium => None,
-        };
-        let content = msg.map(str::trim).filter(|m| !m.is_empty());
-        match (instruction, content) {
-            (Some(i), Some(c)) => self.turn(&self.system_prefix, &format!("{i}\n\n{c}")),
-            (Some(i), None) => self.turn(&self.system_prefix, i),
-            (None, Some(c)) => self.system(c),
-            (None, None) => Vec::new(),
-        }
+        self.plain_system(msg, Some(effort))
     }
 
     fn user(&self, msg: &str) -> Vec<u32> {
@@ -252,22 +304,96 @@ impl Instruct for ChatMLInstruct {
     }
 
     fn equip(&self, tools: &[String]) -> Vec<u32> {
-        if !self.config.tools {
+        if !self.config.tools || tools.is_empty() {
             return Vec::new();
         }
-        self.system(&Self::tool_system_prompt(tools))
+        self.verbatim(&self.system_prefix, &self.tools_block(tools))
     }
 
-    fn answer(&self, _name: &str, value: &str) -> Vec<u32> {
-        if !self.config.tools {
+    fn answer(&self, name: &str, value: &str) -> Vec<u32> {
+        self.answers(&[(name.to_string(), value.to_string())])
+    }
+
+    /// The template writes consecutive results in one user turn.
+    fn answers(&self, results: &[(String, String)]) -> Vec<u32> {
+        if !self.config.tools || results.is_empty() {
             return Vec::new();
         }
         let mut tokens = self.user_prefix.clone();
-        tokens.extend(&self.tool_response_prefix);
-        tokens.extend(self.tokenizer.encode(value));
-        tokens.extend(&self.tool_response_suffix);
+        for (i, (_, value)) in results.iter().enumerate() {
+            if i > 0 {
+                tokens.extend(self.tokenizer.encode("\n"));
+            }
+            let value = if self.config.xml_tools {
+                value.trim()
+            } else {
+                value
+            };
+            tokens.extend(&self.tool_response_prefix);
+            tokens.extend(self.tokenizer.encode(value));
+            tokens.extend(&self.tool_response_suffix);
+        }
         tokens.extend(&self.turn_suffix);
         tokens
+    }
+
+    /// The template writes the tools into the system turn, around the
+    /// system message: after it (Hermes) or ahead of it, behind the
+    /// reasoning-effort instruction (Qwen 3.5 and later).
+    fn open(&self, system: Option<&str>, tools: &[String], effort: Option<Effort>) -> Vec<u32> {
+        if !self.config.tools || tools.is_empty() {
+            return self.plain_system(system, effort);
+        }
+        let block = self.tools_block(tools);
+        let text = if self.config.xml_tools {
+            let mut text = String::new();
+            if let Some(instruction) = self.instruction(effort) {
+                text.push_str(instruction);
+                text.push_str("\n\n");
+            }
+            text.push_str(&block);
+            if let Some(content) = system.map(str::trim).filter(|c| !c.is_empty()) {
+                text.push_str("\n\n");
+                text.push_str(content);
+            }
+            text
+        } else {
+            match system {
+                Some(content) => format!("{content}\n\n{block}"),
+                None => block,
+            }
+        };
+        self.verbatim(&self.system_prefix, &text)
+    }
+
+    /// Qwen 3.5 and later replay a turn's reasoning where thinking is
+    /// preserved or the turn follows the last user query; Hermes Qwen3 only
+    /// for the latter, and only when there is reasoning to replay.
+    fn assistant_calls(&self, msg: &str, calls: &[(String, String)], current: bool) -> Vec<u32> {
+        let (reasoning, answer) = Self::split_reasoning(msg);
+        let keep = self.config.thinking
+            && if self.config.xml_tools {
+                self.config.preserve_thinking || current
+            } else {
+                self.config.preserve_thinking || (current && !reasoning.is_empty())
+            };
+        let mut body = if keep {
+            format!("{THINK_OPEN}\n{reasoning}\n{THINK_CLOSE}\n\n{answer}")
+        } else if self.config.thinking {
+            answer.to_string()
+        } else {
+            msg.trim().to_string()
+        };
+        for (i, (name, arguments)) in calls.iter().enumerate() {
+            let gap = match (self.config.xml_tools, i, answer.is_empty()) {
+                (true, 0, false) => "\n\n",
+                (_, 0, true) => "",
+                _ => "\n",
+            };
+            body.push_str(gap);
+            body.push_str(&self.call_text(name, arguments));
+        }
+        self.verbatim(&self.assistant_prefix, &body)
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
@@ -308,6 +434,7 @@ impl Instruct for ChatMLInstruct {
             decoder: self.tokenizer.decoder(false),
             accumulated: String::new(),
             inside: false,
+            xml: self.config.xml_tools,
         })
     }
 
@@ -316,6 +443,17 @@ impl Instruct for ChatMLInstruct {
             return None;
         }
         let alternatives = tool_names(tools)?;
+        if self.config.xml_tools {
+            let source = format!(
+                r#"root ::= tool-call ("\n" tool-call)*
+tool-call ::= "<tool_call>\n<function=" tool-name ">\n" parameter* "</function>\n</tool_call>"
+parameter ::= "<parameter=" parameter-name ">\n" parameter-value "\n</parameter>\n"
+parameter-name ::= [A-Za-z0-9_.-]+
+parameter-value ::= ([^<] | "<" [^/])*
+tool-name ::= {alternatives}"#
+            );
+            return Some(ToolGrammar { source });
+        }
         let source = format!(
             r#"root ::= tool-call ("\n" tool-call)*
 tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
@@ -331,6 +469,7 @@ struct ChatMLToolDecoder {
     decoder: TokenizerDecoder,
     accumulated: String,
     inside: bool,
+    xml: bool,
 }
 
 /// The first `closer` that is not inside a JSON string. Measured on the 27B:
@@ -361,13 +500,23 @@ impl ToolDecoder for ChatMLToolDecoder {
         let mut events = Vec::new();
         loop {
             if self.inside {
-                let Some(at) = closer_outside_string(&self.accumulated, TOOL_CALL_CLOSE) else {
+                // An XML call's values are bare text, where a quote opens no string.
+                let close = if self.xml {
+                    self.accumulated.find(TOOL_CALL_CLOSE)
+                } else {
+                    closer_outside_string(&self.accumulated, TOOL_CALL_CLOSE)
+                };
+                let Some(at) = close else {
                     return events;
                 };
                 let call = self.accumulated[..at].trim().to_string();
                 self.accumulated = self.accumulated[at + TOOL_CALL_CLOSE.len()..].to_string();
                 self.inside = false;
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&call)
+                if self.xml {
+                    if let Some((name, arguments)) = crate::mimo::parse_call(&call) {
+                        events.push(ToolEvent::Call(name, arguments));
+                    }
+                } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&call)
                     && let Some(name) = parsed["name"].as_str()
                 {
                     events.push(ToolEvent::Call(
@@ -405,6 +554,7 @@ mod tests {
             preserve_thinking,
             reasoning_effort: false,
             tools: true,
+            xml_tools: false,
             generation_suffix: String::new(),
             stop_tokens: vec!["<|im_end|>".to_string()],
         }

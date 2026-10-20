@@ -31,6 +31,7 @@ fn the_new_templates_write_what_the_reference_renders_every_case() {
     qwen38_replays_every_earlier_answer_inside_its_thinking_block();
     qwen38_opens_a_thinking_request_with_its_reasoning_effort_instruction();
     qwen38_cues_a_thinking_answer_inside_an_open_think_block();
+    qwen38_writes_its_tools_calls_and_results_as_its_template_does();
     gemma_closes_an_empty_thought_channel_where_its_template_does();
     minimax_opens_with_the_system_and_developer_turns();
     hy_writes_the_reasoning_mode_the_turns_the_calls_and_the_cue();
@@ -236,6 +237,7 @@ fn chatml_trims_the_turn_and_closes_an_empty_thinking_block() {
             preserve_thinking: false,
             reasoning_effort: false,
             tools: true,
+            xml_tools: false,
             generation_suffix: String::new(),
             stop_tokens: vec!["<|im_end|>".to_string()],
         },
@@ -266,6 +268,7 @@ fn qwen38_opens_a_thinking_request_with_its_reasoning_effort_instruction() {
         preserve_thinking: true,
         reasoning_effort,
         tools: true,
+        xml_tools: false,
         generation_suffix: String::new(),
         stop_tokens: vec!["<|im_end|>".to_string()],
     };
@@ -335,6 +338,7 @@ fn qwen38_cues_a_thinking_answer_inside_an_open_think_block() {
             preserve_thinking: true,
             reasoning_effort: true,
             tools: true,
+            xml_tools: false,
             generation_suffix: "<think>\n".to_string(),
             stop_tokens: vec!["<|im_end|>".to_string()],
         },
@@ -391,6 +395,7 @@ fn qwen38_replays_every_earlier_answer_inside_its_thinking_block() {
             preserve_thinking: true,
             reasoning_effort: true,
             tools: true,
+            xml_tools: false,
             generation_suffix: String::new(),
             stop_tokens: vec!["<|im_end|>".to_string()],
         },
@@ -575,4 +580,63 @@ fn minimax_opens_with_the_system_and_developer_turns() {
         template.cue_without_thinking(),
         vec![200019, 1361, 10, 200060]
     );
+}
+
+/// Qwen3.8's template writes the tools into its one system turn (behind the
+/// reasoning-effort instruction, ahead of the system message, each tool as
+/// `tojson` writes it), replays calls in its XML, puts consecutive tool
+/// results in one user turn, and writes no turn for an empty system
+/// message. The references are its `chat_template.jinja` rendered over the
+/// same snapshot (`fixtures/qwen38_reference.json`), tokenized whole.
+fn qwen38_writes_its_tools_calls_and_results_as_its_template_does() {
+    let Some(tokenizer) = snapshot(
+        "mlx-community/Qwen3.8-27B-4bit",
+        "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+    ) else {
+        return;
+    };
+    let reference: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/qwen38_reference.json")).unwrap();
+    let expect = |case: &str| tokenizer.encode(reference[case].as_str().unwrap());
+    let qwen38 = chat_template::chatml::ChatMLInstruct::new(
+        tokenizer.clone(),
+        chat_template::chatml::ChatML {
+            thinking: true,
+            preserve_thinking: true,
+            reasoning_effort: true,
+            tools: true,
+            xml_tools: true,
+            generation_suffix: "<think>\n".to_string(),
+            stop_tokens: vec!["<|im_end|>".to_string()],
+        },
+    );
+    let tool = r#"{"type":"function","function":{"name":"get_weather","description":"Get the weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city"]}}}"#.to_string();
+    let tools = std::slice::from_ref(&tool);
+
+    let mut got = qwen38.open(Some("You are terse."), tools, Some(Effort::Xhigh));
+    got.extend(qwen38.user("Weather in Paris and Rome?"));
+    got.extend(qwen38.assistant_calls(
+        "<think>Need both.</think>",
+        &[
+            ("get_weather".into(), r#"{"city":"Paris"}"#.into()),
+            ("get_weather".into(), r#"{"city":"Rome","days":3}"#.into()),
+        ],
+        true,
+    ));
+    got.extend(qwen38.answers(&[
+        ("get_weather".into(), "Sunny".into()),
+        ("get_weather".into(), "Rain".into()),
+    ]));
+    got.extend(qwen38.cue());
+    assert_eq!(got, expect("tools"));
+
+    let mut got = qwen38.open(Some(""), &[], Some(Effort::Xhigh));
+    got.extend(qwen38.user("Hi"));
+    got.extend(qwen38.cue());
+    assert_eq!(got, expect("empty_system"));
+
+    let mut got = qwen38.open(None, tools, None);
+    got.extend(qwen38.user("Hi"));
+    got.extend(qwen38.cue_without_thinking());
+    assert_eq!(got, expect("tools_quiet"));
 }

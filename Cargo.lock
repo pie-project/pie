@@ -605,6 +605,7 @@ dependencies = [
 name = "chat-template"
 version = "0.5.4"
 dependencies = [
+ "serde",
  "serde_json",
  "tokenizer",
 ]
