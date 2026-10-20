@@ -33,6 +33,11 @@ ssm = ["gdn_fused_scan", "conv_vec4", "gdn_out_bf16", "kda_chunked", "kda_step_f
 prefill_lattice_from = 256
 lattice_steps = 2
 
+# Independent chains on side streams: decode latency +5-11% (Gemma 4, Qwen3.6-A3B,
+# DeepSeek-V4, GLM-5.3, Hy4), outputs unchanged.
+[compiler]
+dag_streams = true
+
 [provenance]
 source = "end to end on MiMo-V2.6-Flash and Qwen3.6-27B miniatures and checkpoints, by hand"
 measured = [
@@ -56,4 +61,5 @@ measured = [
   "kernel.ssm.kda_step_fused",
   "engine.prefill_lattice_from",
   "engine.lattice_steps",
+  "compiler.dag_streams",
 ]
