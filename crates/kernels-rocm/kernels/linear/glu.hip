@@ -57,6 +57,27 @@ __global__ void mlp_swiglu(const T* __restrict__ packed, T* __restrict__ y, i32 
     y[row * I + i] = from_f32<T>(g * sigmoid(g) * u);
 }
 
+// mlp_swiglu eight elements a thread, for an intermediate width of whole
+// eights and 16-byte aligned planes. Grid: (rows, ⌈I / (8 · block)⌉).
+template <class T>
+__global__ void mlp_swiglu_vec8(const T* __restrict__ packed, T* __restrict__ y, i32 I, i32 fan,
+                                const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x, fan)) return;
+    const i32 k = blockIdx.y * blockDim.x + threadIdx.x;
+    if (k >= I / 8) return;
+    const long long row = window.plane(blockIdx.x, fan);
+    const Pack8<T> g = reinterpret_cast<const Pack8<T>*>(packed + row * 2 * I)[k];
+    const Pack8<T> u = reinterpret_cast<const Pack8<T>*>(packed + row * 2 * I + I)[k];
+    Pack8<T> out;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const float gv = to_f32(g.v[e]);
+        out.v[e] = from_f32<T>(gv * sigmoid(gv) * to_f32(u.v[e]));
+    }
+    reinterpret_cast<Pack8<T>*>(y + row * I)[k] = out;
+}
+
 // 0.5·g·(1 + tanh(√(2/π)·(g + 0.044715·g³))), the tanh form of GELU.
 __device__ __forceinline__ float gelu_tanh(float g) {
     constexpr float kAlpha = 0.7978845608028654f;
