@@ -48,4 +48,7 @@ DEPLOYMENTS = [
     # quantizes them (Hopper), as vLLM's Marlin serves them there.
     deployment("glm53", weights = [BF, NV4W], kv = BF),
     deployment("glm53-mini", weights = [BF, NV4W], kv = BF),
+    # ... with the dense MLP the export's FP8, on mma.sync (Hopper).
+    deployment("glm53", weights = [BF, NV4W, F8], kv = BF),
+    deployment("glm53-mini", weights = [BF, NV4W, F8], kv = BF),
 ]
