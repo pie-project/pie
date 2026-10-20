@@ -248,22 +248,23 @@ pub fn decode(
         launch.smem(smem)
     };
     // The defaulted parameters spelled out up to the last one set.
-    let page_ty = if e4m3 { "::pie::u8" } else { "::pie::bf16" };
-    let pages = match (e4m3, stamp.swizzle) {
-        (false, false) => String::new(),
-        (true, false) => format!(", {page_ty}"),
-        (_, true) => format!(", {page_ty}, true"),
+    let pages = if e4m3 { ", ::pie::u8" } else { "" };
+    // The swizzled stamp (a bf16 pool's) has its own entry, its registers
+    // held to the four blocks its shared memory lets share an SM.
+    let entry = if stamp.swizzle {
+        format!(
+            "::pie::attn::xqa::decode_deep<{head_dim}, {}, {}, {}, 4, {sink_ty}>",
+            stamp.mt, stamp.warps, stamp.stages
+        )
+    } else {
+        format!(
+            "::pie::attn::xqa::decode<{head_dim}, {}, {}, {}, {sink_ty}{pages}>",
+            stamp.mt, stamp.warps, stamp.stages
+        )
     };
     ctx.fire(
         op,
-        Fire::at(
-            FILE,
-            symbol(&format!(
-                "::pie::attn::xqa::decode<{head_dim}, {}, {}, {}, {sink_ty}{pages}>",
-                stamp.mt, stamp.warps, stamp.stages
-            )),
-        )
-        .apply(launch),
+        Fire::at(FILE, symbol(&entry)).apply(launch),
         &[
             ArgValue::Ptr(params.q),
             ArgValue::Ptr(kv.k_data),

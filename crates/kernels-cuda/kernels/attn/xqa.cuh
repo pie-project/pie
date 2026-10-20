@@ -136,8 +136,8 @@ struct Shape {
     static constexpr int SMEM_BYTES = RAW_OFF + (FP8 ? WARPS * STAGES * RAW_STAGE : 0);
 };
 
-template <int HEAD_DIM, int MT, int WARPS, int STAGES, class S, class KV = bf16, bool SWZ = false>
-__global__ void __launch_bounds__(32 * WARPS) decode(
+template <int HEAD_DIM, int MT, int WARPS, int STAGES, class S, class KV, bool SWZ>
+__device__ __forceinline__ void decode_body(
     const bf16* __restrict__ q,
     const KV* __restrict__ k_data,
     const KV* __restrict__ v_data,
@@ -564,6 +564,76 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
     }
     // No block leaves while another may still read its shared memory.
     sync_cluster();
+}
+
+template <int HEAD_DIM, int MT, int WARPS, int STAGES, class S, class KV = bf16>
+__global__ void __launch_bounds__(32 * WARPS) decode(
+    const bf16* __restrict__ q,
+    const KV* __restrict__ k_data,
+    const KV* __restrict__ v_data,
+    const i32* __restrict__ page_indices,
+    const i32* __restrict__ page_indptr,
+    const i32* __restrict__ last_page_len,
+    u32 page_size,
+    u32 stride_page,
+    u32 stride_n,
+    u32 stride_h,
+    const i32* __restrict__ q_indptr,
+    u32 q_stride_n,
+    const i32* __restrict__ request_indices,
+    const i32* __restrict__ kv_tile_indices,
+    const i32* __restrict__ kv_chunk_size_ptr,
+    const bool* __restrict__ block_valid_mask,
+    bool partition_kv,
+    u32 num_qo_heads,
+    u32 group,
+    i32 window_left,
+    float sm_scale,
+    bf16* __restrict__ o,
+    float* __restrict__ lse,
+    const S* __restrict__ sinks,
+    u32 ranks)
+{
+    decode_body<HEAD_DIM, MT, WARPS, STAGES, S, KV, false>(
+        q, k_data, v_data, page_indices, page_indptr, last_page_len, page_size, stride_page, stride_n,
+        stride_h, q_indptr, q_stride_n, request_indices, kv_tile_indices, kv_chunk_size_ptr,
+        block_valid_mask, partition_kv, num_qo_heads, group, window_left, sm_scale, o, lse, sinks, ranks);
+}
+
+// The swizzled stamp over a bf16 pool, `MIN_CTAS` blocks an SM (as many as
+// its shared memory lets share one): its registers held to them.
+template <int HEAD_DIM, int MT, int WARPS, int STAGES, int MIN_CTAS, class S>
+__global__ void __launch_bounds__(32 * WARPS, MIN_CTAS) decode_deep(
+    const bf16* __restrict__ q,
+    const bf16* __restrict__ k_data,
+    const bf16* __restrict__ v_data,
+    const i32* __restrict__ page_indices,
+    const i32* __restrict__ page_indptr,
+    const i32* __restrict__ last_page_len,
+    u32 page_size,
+    u32 stride_page,
+    u32 stride_n,
+    u32 stride_h,
+    const i32* __restrict__ q_indptr,
+    u32 q_stride_n,
+    const i32* __restrict__ request_indices,
+    const i32* __restrict__ kv_tile_indices,
+    const i32* __restrict__ kv_chunk_size_ptr,
+    const bool* __restrict__ block_valid_mask,
+    bool partition_kv,
+    u32 num_qo_heads,
+    u32 group,
+    i32 window_left,
+    float sm_scale,
+    bf16* __restrict__ o,
+    float* __restrict__ lse,
+    const S* __restrict__ sinks,
+    u32 ranks)
+{
+    decode_body<HEAD_DIM, MT, WARPS, STAGES, S, bf16, true>(
+        q, k_data, v_data, page_indices, page_indptr, last_page_len, page_size, stride_page, stride_n,
+        stride_h, q_indptr, q_stride_n, request_indices, kv_tile_indices, kv_chunk_size_ptr,
+        block_valid_mask, partition_kv, num_qo_heads, group, window_left, sm_scale, o, lse, sinks, ranks);
 }
 
 }
