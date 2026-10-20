@@ -147,7 +147,7 @@ impl Root {
         let name = file.strip_suffix(".cuh")?;
         let (options, headers, floor) = configured_for(file);
         let (specific, floor) = specific_for(file).map_or((false, floor), |floor| (true, floor));
-        let tcgen05_twin = TCGEN05_TWIN.iter().any(|&unit| unit == file);
+        let tcgen05_twin = TCGEN05_TWIN.contains(&file);
         Some(Self {
             name,
             text,

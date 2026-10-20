@@ -108,12 +108,12 @@ fn the_mamba2_scan_and_step_answer_the_serial_recurrence() {
         }
     }
     let mut want_step = Vec::new();
-    for lane in 0..LENS.len() {
+    for (lane, &slot) in SLOT_OF.iter().enumerate().take(LENS.len()) {
         want_step.extend(reference(
             &rows,
             prompt + lane,
             &mut want_slab,
-            SLOT_OF[lane] as usize,
+            slot as usize,
         ));
     }
 

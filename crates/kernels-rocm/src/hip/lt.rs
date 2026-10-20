@@ -134,7 +134,11 @@ impl Plan {
                 "hipblasLtMatrixLayoutCreate",
                 (lt.hipblasLtMatrixLayoutCreate)(
                     &raw mut d,
-                    if s.f32_out { sys::LT_R_32F } else { sys::LT_R_16BF },
+                    if s.f32_out {
+                        sys::LT_R_32F
+                    } else {
+                        sys::LT_R_16BF
+                    },
                     n,
                     m,
                     (g * n) as i64,

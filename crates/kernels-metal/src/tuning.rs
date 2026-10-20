@@ -74,7 +74,7 @@ pub fn mpp_tile(rows: u32) -> (u32, u32) {
 #[must_use]
 pub fn mpp_tile_for(rows: u32, n: u32) -> (u32, u32) {
     let (bm, bn) = mpp_tile(rows);
-    if n % bn != 0 && n % 64 == 0 {
+    if !n.is_multiple_of(bn) && n.is_multiple_of(64) {
         (bm, 64)
     } else {
         (bm, bn)

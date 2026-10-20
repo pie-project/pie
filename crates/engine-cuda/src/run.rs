@@ -1722,6 +1722,7 @@ impl<'c> Run<'c> {
     }
 
     /// The bf16 copy a block-FP8 dense plane keeps (`kernel.gemm.fp8_shadow`).
+    #[cfg(feature = "cuda")]
     pub(crate) fn fp8_shadow(&self, id: ValueId) -> Option<Tensor> {
         let Def::Weight(w) = &self.values[id.0 as usize].def else {
             return None;
