@@ -6,7 +6,8 @@
 // as they are (bf16, not quantized: the W8A16 product of the same codes).
 // A warp `kRows` weight rows; a lane sixteen codes (one 16-byte load) of
 // each a pass, the warp's lanes 512 adjacent codes; `kM` activation rows
-// read through L1 beside them. `k` a whole number of 512s.
+// read through L1 beside them. `k` a whole number of 128s (lanes past it
+// on a last pass read nothing).
 
 #include "linear/act_quant.cuh"
 

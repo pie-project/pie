@@ -336,7 +336,13 @@ fn the_w8a16_projections_answer_the_dot() {
         );
         b.check(y.ptr, &want, TOL, &format!("W8A16 in {gran}s, {m}x{n}x{k}"));
     } // The GEMV over bf16 rows at a decode's few rows, in either block width.
-    for (gran, m, n, k) in [(32, 1, 1280, 5120), (32, 3, 512, 1024), (128, 2, 640, 2048)] {
+    for (gran, m, n, k) in [
+        (32, 1, 1280, 5120),
+        (32, 3, 512, 1024),
+        (128, 2, 640, 2048),
+        (32, 1, 4096, 1280),
+        (128, 2, 256, 640),
+    ] {
         let mut b = Bench::new(0x6e3 ^ (m * n + k) as u64);
         let (x, xv) = b.bf16(m * k);
         let s = b.side(Elem::E4m3, Some(gran), n, k);
