@@ -4,14 +4,26 @@ use crate::error::{Fault, Result};
 pub struct Buffer {
     ptr: u64,
     bytes: usize,
+    /// The device heap's class this is a cell of, and the device
+    /// (`device::held::heap`).
+    carved: Option<(usize, i32)>,
 }
 
-/// `bytes` of device memory for a [`Buffer`], given back once in its `Drop`:
-/// one an earlier drop kept when its last reader landed, where there is one
-/// (`device::held::recycle`).
+/// `bytes` of device memory for a [`Buffer`], given back once in its `Drop`,
+/// and the device heap's class when it is a cell of it: small spans are
+/// carved (`device::held::heap`), larger ones are one an earlier drop kept
+/// when its last reader landed, where there is one (`device::held::recycle`).
 #[cfg(feature = "device")]
-fn alloc(bytes: usize) -> Result<*mut core::ffi::c_void> {
-    crate::device::held::recycle::alloc(bytes).map(|ptr| ptr as *mut core::ffi::c_void)
+fn alloc(bytes: usize) -> Result<(*mut core::ffi::c_void, Option<(usize, i32)>)> {
+    use crate::device::held::heap::{self, Kind};
+    if let Some(class) = heap::class_of(Kind::Device, bytes) {
+        let cell = heap::take(Kind::Device, class)?;
+        return Ok((
+            cell.device as *mut core::ffi::c_void,
+            Some((class, cell.ordinal)),
+        ));
+    }
+    crate::device::held::recycle::alloc(bytes).map(|ptr| (ptr as *mut core::ffi::c_void, None))
 }
 
 #[cfg(feature = "device")]
@@ -40,13 +52,17 @@ pub(crate) fn out_of_room(fault: Fault, bytes: usize) -> Fault {
 impl Buffer {
     pub fn zeroed(bytes: usize) -> Result<Buffer> {
         if bytes == 0 {
-            return Ok(Buffer { ptr: 0, bytes: 0 });
+            return Ok(Buffer {
+                ptr: 0,
+                bytes: 0,
+                carved: None,
+            });
         }
         #[cfg(feature = "device")]
         {
             use crate::device::rt;
 
-            let base = alloc(bytes)?;
+            let (base, carved) = alloc(bytes)?;
             // SAFETY: `base` is the allocation just made, of `bytes` bytes.
             unsafe {
                 crate::device::ctx::check("cudaMemset", rt::cudaMemset(base, 0, bytes))?;
@@ -54,6 +70,7 @@ impl Buffer {
             Ok(Buffer {
                 ptr: base as u64,
                 bytes,
+                carved,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -64,13 +81,17 @@ impl Buffer {
 
     pub fn zeroed_on(stream: *mut core::ffi::c_void, bytes: usize) -> Result<Buffer> {
         if bytes == 0 {
-            return Ok(Buffer { ptr: 0, bytes: 0 });
+            return Ok(Buffer {
+                ptr: 0,
+                bytes: 0,
+                carved: None,
+            });
         }
         #[cfg(feature = "device")]
         {
             use crate::device::rt;
 
-            let base = alloc(bytes)?;
+            let (base, carved) = alloc(bytes)?;
             // SAFETY: `base` is the allocation just made, of `bytes` bytes, and
             // `stream` is the one every later read of it is ordered on.
             unsafe {
@@ -82,6 +103,7 @@ impl Buffer {
             Ok(Buffer {
                 ptr: base as u64,
                 bytes,
+                carved,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -436,7 +458,19 @@ impl Drop for Buffer {
     fn drop(&mut self) {
         #[cfg(feature = "device")]
         if self.ptr != 0 {
-            crate::device::held::recycle::release(self.ptr, self.bytes);
+            use crate::device::held::heap::{self, Cell, Kind};
+            match self.carved {
+                Some((class, ordinal)) => heap::give(
+                    Kind::Device,
+                    class,
+                    Cell {
+                        host: 0,
+                        device: self.ptr,
+                        ordinal,
+                    },
+                ),
+                None => crate::device::held::recycle::release(self.ptr, self.bytes),
+            }
         }
     }
 }
@@ -454,6 +488,9 @@ enum Origin {
     Allocated,
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     Registered,
+    /// A cell of the pinned heap, of this class (`device::held::heap`).
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    Carved(usize),
 }
 
 // SAFETY: concurrent-access soundness comes from the channel's SPSC discipline above this type (guest and engine each own one control word), not from anything here; moving the allocation is as sound as a `Box<[u8]>`.
@@ -497,6 +534,25 @@ impl Pinned {
                 bytes: 0,
                 origin: Origin::Allocated,
             });
+        }
+        // Small spans are carved from the pinned heap: pinning afresh takes
+        // the driver's lock, which another process's teardown may hold.
+        #[cfg(feature = "device")]
+        if let Some(class) =
+            crate::device::held::heap::class_of(crate::device::held::heap::Kind::Pinned, bytes)
+        {
+            let cell =
+                crate::device::held::heap::take(crate::device::held::heap::Kind::Pinned, class)?;
+            let pinned = Pinned {
+                host: cell.host as *mut u8,
+                device: cell.device,
+                bytes,
+                origin: Origin::Carved(class),
+            };
+            if zeroed {
+                pinned.zero();
+            }
+            return Ok(pinned);
         }
         #[cfg(feature = "device")]
         {
@@ -602,6 +658,18 @@ impl Drop for Pinned {
                     let _ = crate::device::rt::cudaFreeHost(self.host.cast());
                 }
             }
+            #[cfg(feature = "device")]
+            Origin::Carved(class) => crate::device::held::heap::give(
+                crate::device::held::heap::Kind::Pinned,
+                class,
+                crate::device::held::heap::Cell {
+                    host: self.host as usize,
+                    device: self.device,
+                    ordinal: -1,
+                },
+            ),
+            #[cfg(not(feature = "device"))]
+            Origin::Carved(_) => {}
             Origin::Registered => {
                 #[cfg(feature = "device")]
                 // SAFETY: the span is the one this structure registered.

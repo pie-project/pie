@@ -90,7 +90,10 @@ impl Context {
                 check("cudaSetDevice", rt::cudaSetDevice(ordinal))?;
                 let mut stream: rt::cudaStream_t = core::ptr::null_mut();
                 check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
-                crate::device::held::pool::adopt_stream(ordinal, stream.cast());
+                crate::device::held::adopt_stream(ordinal, stream.cast());
+                // The heaps' first chunks, while the load may wait.
+                crate::device::held::heap::reserve(crate::device::held::heap::Kind::Pinned)?;
+                crate::device::held::heap::reserve(crate::device::held::heap::Kind::Device)?;
 
                 let mut handle: blas::cublasHandle_t = core::ptr::null_mut();
                 let status = blas::cublasCreate_v2(&raw mut handle);
@@ -574,7 +577,7 @@ pub fn sync(stream: *mut c_void) -> Result<()> {
 /// `stream` is a live stream nothing launches on again.
 #[cfg(feature = "device")]
 unsafe fn destroy_stream(ordinal: i32, stream: *mut c_void) {
-    crate::device::held::pool::retire_stream(ordinal, stream, || {
+    crate::device::held::retire_stream(ordinal, stream, || {
         // SAFETY: as the caller promises.
         let _ = unsafe { crate::device::rt::cudaStreamDestroy(stream.cast()) };
     });
