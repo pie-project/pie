@@ -343,40 +343,49 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         let (up, uw) = mlp_bank(&mut b, a, [ex, up_rows, hidden]);
         let (down, dw) = mlp_bank(&mut b, a, [ex, hidden, inter]);
         let (x, it) = (t(x, tokens, hidden, Bf16), inter as u32);
-        let mut y = b.out(tokens, hidden);
         let r = t(b.up(&routes), tokens, top, I32);
         let wt = t(b.up(&weights), tokens, top, F32);
-        let ctx = b.ctx().with_tuning(pick(a < 4, TC5, W4A8));
-        if let Some((live, first)) = window {
-            ctx.arm_stage(b.up(&[live, first]));
-        }
         let (st, gt) = (t(sh, tokens, hidden, Bf16), t(gates, tokens, 1, Bf16));
-        let m = moe::RoutedMlp {
-            x,
-            up,
-            glu: g,
-            down,
-            routes: r,
-            weights: wt,
-            inter: it,
-        };
-        #[rustfmt::skip]
-        let took = match gate {
-            Some(true) => moe::experts_weighted_first(&ctx, m, st, &mut y),
-            _ => moe::experts(&ctx, m, &mut y, RES, RES, gate.map(|_| (st, gt)), norm),
-        };
-        assert!(took.expect("fires"), "{what}: the grouped GEMM takes it");
         let upv = |e: usize, o: usize, i: usize| f64::from(uw[(e * up_rows + o) * hidden + i]);
         let downv = |e: usize, o: usize, c: usize| f64::from(dw[(e * hidden + o) * inter + c]);
         let shared = gate.map(|f| (&sv[..], (!f).then_some(&gv[..])));
         let first = gate == Some(true);
         #[rustfmt::skip]
         let want = mlp(&xv, (&routes, &weights), [hidden, inter, top], upv, downv, g, first, shared, normed.then_some(&scv[..]));
-        let (lo, hi) = window.map_or((0, tokens), |(l, f)| (f as usize, (f + l) as usize));
-        let (got, span) = (b.read(y.ptr, tokens * hidden), lo * hidden..hi * hidden);
-        // Quantized rows answer to their codes' rounding on both legs.
-        let far = distance(&got[span.clone()], &want[span]);
-        assert!(far < tol, "{what}: {far:.4} from the host's product");
+        // A W4A4 fire's swapped down leg whole and split along K.
+        let splits: &[u32] = if a == 4 { &[1, 2, 4] } else { &[1] };
+        for &down_splits in splits {
+            let what = format!("{what}, down splits {down_splits}");
+            let mut y = b.out(tokens, hidden);
+            let base = pick(a < 4, TC5, W4A8);
+            let ctx = b.ctx().with_tuning(Tuning {
+                moe_w4a4_down_splits: down_splits,
+                ..base
+            });
+            if let Some((live, first)) = window {
+                ctx.arm_stage(b.up(&[live, first]));
+            }
+            let m = moe::RoutedMlp {
+                x,
+                up,
+                glu: g,
+                down,
+                routes: r,
+                weights: wt,
+                inter: it,
+            };
+            #[rustfmt::skip]
+            let took = match gate {
+                Some(true) => moe::experts_weighted_first(&ctx, m, st, &mut y),
+                _ => moe::experts(&ctx, m, &mut y, RES, RES, gate.map(|_| (st, gt)), norm),
+            };
+            assert!(took.expect("fires"), "{what}: the grouped GEMM takes it");
+            let (lo, hi) = window.map_or((0, tokens), |(l, f)| (f as usize, (f + l) as usize));
+            let (got, span) = (b.read(y.ptr, tokens * hidden), lo * hidden..hi * hidden);
+            // Quantized rows answer to their codes' rounding on both legs.
+            let far = distance(&got[span.clone()], &want[span]);
+            assert!(far < tol, "{what}: {far:.4} from the host's product");
+        }
     }
 }
 

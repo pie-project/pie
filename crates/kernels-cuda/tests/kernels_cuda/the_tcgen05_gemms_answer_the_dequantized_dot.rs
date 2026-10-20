@@ -258,6 +258,9 @@ fn the_tcgen05_gemm_answers_the_dequantized_dot_every_case() {
         (NV, NV, Lay::C(3), [640, 640], no, f, None, 0),
         (NV, NV, Lay::C(3), [640, 768], no, f, p(f, f, 128, 3), 2),
         (NV, NV, Lay::C(8), [256, 512], no, f, p(t, f, 64, 1), 0),
+        // A decode's swapped NVFP4 down leg split along K, repeated and replayed.
+        (NV, NV, Lay::C(8), [256, 4096], no, f, p(t, f, 64, 2), 4),
+        (NV, NV, Lay::C(8), [256, 4096], no, f, p(t, f, 64, 4), 4),
         (DS, W4, Lay::C(6), [512, 1024], no, f, p(f, t, 256, 0), 0),
         (BF, BF, Lay::M(6, 1), [384, 4104], no, f, None, 0),
         (NV, NV, Lay::M(12, 40), [256, 2048], no, f, p(t, f, 64, 4), 2),

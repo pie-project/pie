@@ -1293,8 +1293,14 @@ fn experts_w4a4(
             groups: layout.groups,
             alpha_e: down_alpha,
         };
+        // A swapped down leg splits K where the profile says
+        // (`kernel.moe.w4a4_down_splits`): a decode's live tiles fill the SMs
+        // a few waves deep, the last one part full.
         let down_plan = if swaps {
-            swapped
+            tc5::Plan {
+                splits: tuning.moe_w4a4_down_splits,
+                ..swapped
+            }
         } else {
             tc5::Plan::grouped(&grouped_down, n, inter, count, sms)
         };

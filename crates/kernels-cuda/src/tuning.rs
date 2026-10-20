@@ -124,6 +124,13 @@ pub struct MoeW4a4SwappedRoutes(pub u32);
 #[decision(id = "kernel.moe.w4a4_swap_bn_narrow", constant(set(32, 64)), default = 32, tune = search)]
 pub struct MoeW4a4SwapBnNarrow(pub u32);
 
+/// The K splits of a swapped W4A4 routed MLP's down leg (its gate-up keeps
+/// one past its GLU), summed in f32 and rounded by the routed finalize: 1
+/// but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.w4a4_down_splits", constant(range(1..=8)), default = 1, tune = search)]
+pub struct MoeW4a4DownSplits(pub u32);
+
 /// The fewest rows the fused qkv norm, rotation and KV write takes a block a
 /// row (a warp a head below): 64 but where a chip's profile says (B200's,
 /// where 64 decode rows' blocks leave most SMs idle).
@@ -701,6 +708,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeW4a4FusedLayout>()
         .add::<MoeW4a4SwappedRoutes>()
         .add::<MoeW4a4SwapBnNarrow>()
+        .add::<MoeW4a4DownSplits>()
         .add::<AttnQkvRowsFrom>()
         .add::<SsmKdaStepFused>()
         .add::<GemmSplitLaunchNs>()
@@ -822,6 +830,7 @@ tuning! {
     moe_w4a4_fused_layout: bool = false, on MoeW4a4FusedLayout;
     moe_w4a4_swapped_routes: u32 = 64, get MoeW4a4SwappedRoutes;
     moe_w4a4_swap_bn_narrow: u32 = 32, get MoeW4a4SwapBnNarrow;
+    moe_w4a4_down_splits: u32 = 1, get MoeW4a4DownSplits;
     qkv_rows_from: u32 = 64, get AttnQkvRowsFrom;
     ssm_kda_step_fused: bool = false, on SsmKdaStepFused;
     gemm_split_launch_ns: u32 = 0, get GemmSplitLaunchNs;
