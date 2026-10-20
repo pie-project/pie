@@ -449,6 +449,10 @@ __global__ void moe_route_order_scan(
     int num_experts,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     extern __shared__ i32 order_smem[];
     i32* counts = order_smem;
     i32* fill = counts + num_experts + 1;

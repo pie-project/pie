@@ -264,7 +264,8 @@ fn conv1d_update(
             Launch::grid(
                 [(channels / CONV_VEC).div_ceil(CONV_BLOCK), rows, 1],
                 [CONV_BLOCK, 1, 1],
-            ),
+            )
+            .programmatic(ctx.tuning().pdl),
         )
     } else {
         args.push(dil.arg());
@@ -1628,14 +1629,17 @@ impl Kda {
                     FILE,
                     "::pie::attn::ssm_kda_qkv_prep_heads<::pie::bf16, 128>",
                 )
-                .apply(Launch::grid(
-                    [
-                        self.n,
-                        PLANES,
-                        (self.width / self.head_dim).div_ceil(PREP_BLOCK / WARP),
-                    ],
-                    [PREP_BLOCK, 1, 1],
-                ))
+                .apply(
+                    Launch::grid(
+                        [
+                            self.n,
+                            PLANES,
+                            (self.width / self.head_dim).div_ceil(PREP_BLOCK / WARP),
+                        ],
+                        [PREP_BLOCK, 1, 1],
+                    )
+                    .programmatic(ctx.tuning().pdl),
+                )
             } else {
                 Fire::at(FILE, "::pie::attn::ssm_kda_qkv_prep<::pie::bf16, 128>")
                     .apply(Launch::grid([self.n, PLANES, 1], [PREP_BLOCK, 1, 1]))
@@ -1653,10 +1657,10 @@ impl Kda {
         )?;
         // A row a block, four channels a thread.
         let gates = if self.head_dim.is_multiple_of(4) {
-            Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta_rows<::pie::bf16>").apply(Launch::grid(
-                [self.n, self.width.div_ceil(1024), 1],
-                [256, 1, 1],
-            ))
+            Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta_rows<::pie::bf16>").apply(
+                Launch::grid([self.n, self.width.div_ceil(1024), 1], [256, 1, 1])
+                    .programmatic(ctx.tuning().pdl),
+            )
         } else {
             Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta<::pie::bf16>").apply(Launch::grid(
                 [self.n, self.heads, 1],
@@ -1779,7 +1783,8 @@ pub fn kda_step(
                 ],
                 [STEP_BLOCK, 1, 1],
             )
-            .smem(kda_shmem(shape.head_dim)),
+            .smem(kda_shmem(shape.head_dim))
+            .programmatic(ctx.tuning().pdl),
         ),
         &[
             ArgValue::Ptr(staged.q_norm),

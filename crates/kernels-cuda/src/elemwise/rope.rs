@@ -344,7 +344,8 @@ pub fn partial_last(
                     [q.rows, num_q_heads.div_ceil(heads_per_block), 1],
                     [ROTATE_BLOCK, 1, 1],
                 )
-                .smem(half * 8),
+                .smem(half * 8)
+                .programmatic(ctx.tuning().pdl),
             ),
             &[
                 q.arg(),

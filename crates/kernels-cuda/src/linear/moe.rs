@@ -237,10 +237,10 @@ fn ranked_router(
                 "::pie::linear::moe_topk_ranked<{t}, {softplus}, {per}>"
             )),
         )
-        .apply(Launch::grid(
-            [logits.rows.div_ceil(ROWS), 1, 1],
-            [WARP * ROWS, 1, 1],
-        )),
+        .apply(
+            Launch::grid([logits.rows.div_ceil(ROWS), 1, 1], [WARP * ROWS, 1, 1])
+                .programmatic(ctx.tuning().pdl),
+        ),
         &[
             logits.arg(),
             routes.arg(),
@@ -2403,7 +2403,11 @@ fn route_order_sliced(
         } else {
             Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
         }
-        .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
+        .apply(
+            Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1])
+                .smem(2 * (experts + 1) * 4)
+                .programmatic(ctx.tuning().pdl && scan),
+        ),
         &[
             routes.arg(),
             ArgValue::Ptr(order),
@@ -3484,7 +3488,7 @@ pub fn weighted_sum(
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&format!("::pie::linear::{entry}<{t}>")))
-            .apply(elementwise_rows(OP, y.rows, threads)?),
+            .apply(elementwise_rows(OP, y.rows, threads)?.programmatic(ctx.tuning().pdl && vec8)),
         &[
             y.arg(),
             routed.arg(),

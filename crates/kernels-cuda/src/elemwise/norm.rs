@@ -122,7 +122,7 @@ fn rms_row(
                     "::pie::elemwise::rmsnorm_runs<{t}, {runs}, {plus_one}>"
                 )),
             )
-            .apply(Launch::grid([y.rows, 1, 1], [BLOCK, 1, 1])),
+            .apply(Launch::grid([y.rows, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl)),
             &[
                 x.arg(),
                 weight.arg(),
@@ -708,10 +708,10 @@ pub fn rmsnorm_gated_by(
                 "::pie::elemwise::rmsnorm_gated_by<{t}, {per_warp}>"
             )),
         )
-        .apply(Launch::grid(
-            [pairs.div_ceil(8 * per_warp), 1, 1],
-            [256, 1, 1],
-        )),
+        .apply(
+            Launch::grid([pairs.div_ceil(8 * per_warp), 1, 1], [256, 1, 1])
+                .programmatic(ctx.tuning().pdl),
+        ),
         &[
             x.arg(),
             gate.arg(),
@@ -802,7 +802,11 @@ pub fn residual_add_rmsnorm(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entrypoint)).apply(Launch::per_row(rows, block)),
+        // The register kernel waits on its producer in-kernel (`kernel.pdl`).
+        Fire::at(FILE, symbol(&entrypoint)).apply(
+            Launch::per_row(rows, block)
+                .programmatic(ctx.tuning().pdl && entrypoint.contains("_reg<")),
+        ),
         &[
             x.arg(),
             y.arg(),

@@ -67,7 +67,7 @@ pub fn swiglu(
     {
         (
             "mlp_swiglu_vec8",
-            elementwise_rows(OP, y.rows, y.width / 8)?,
+            elementwise_rows(OP, y.rows, y.width / 8)?.programmatic(ctx.tuning().pdl),
         )
     } else {
         ("mlp_swiglu", launch)

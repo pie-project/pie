@@ -58,6 +58,10 @@ __global__ void mla_split_q_b_vec8(
     int rope,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= runs) return;
     const int per = (nope + rope) / 8;
@@ -88,6 +92,10 @@ __global__ void mla_latents(
     float eps,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int n = blockIdx.x;
 
     if (win != nullptr && n >= static_cast<int>(win[0])) return;

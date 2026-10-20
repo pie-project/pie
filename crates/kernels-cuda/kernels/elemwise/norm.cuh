@@ -145,6 +145,10 @@ __global__ void __launch_bounds__(256) rmsnorm_runs(
     float eps,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int row = blockIdx.x;
     if (win != nullptr && row >= static_cast<int>(win[0])) return;
     const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
@@ -505,6 +509,10 @@ __global__ void __launch_bounds__(256) residual_add_rmsnorm_reg(
     float eps,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     constexpr int BLOCK = 256;
     const int row = blockIdx.x;
     if (win != nullptr && row >= static_cast<int>(win[0])) return;
@@ -1702,6 +1710,10 @@ __global__ void __launch_bounds__(256) rmsnorm_gated_by(
     int rows, int H, int D, float eps,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const long long first = (static_cast<long long>(blockIdx.x) * 8 + (threadIdx.x >> 5)) * kP;
     const int lane = threadIdx.x & 31;
     const int live = win != nullptr ? min(static_cast<int>(win[0]), rows) : rows;
