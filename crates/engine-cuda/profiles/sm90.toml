@@ -45,3 +45,6 @@ moe.nvfp4_mma_until = 8192
 # mma.sync kernel from 16 routes, where the per-route GEMV re-reads each expert.
 moe.bf16_mma_from = 16
 moe.bf16_mma_until = 65536
+# A block-FP8 projection's decode rows (to 4) on the GEMV over bf16 rows,
+# ahead of the W8A16 mma.sync kernel (GLM-5.3-Flash's dense layers).
+gemm.fp8_gemv_until = 4
