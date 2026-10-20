@@ -1024,6 +1024,10 @@ __global__ void rope_partial_last_vec(
     int heads_per_block,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int n = blockIdx.x;
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;

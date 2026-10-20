@@ -756,6 +756,10 @@ __global__ void ssm_causal_conv1d_update_batched_vec8(
     const u8* __restrict__ write_state_mask,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     constexpr int VEC = 8;
     constexpr int K_MAX = 8;
     union Vec { uint4 raw; T e[VEC]; };
@@ -2762,6 +2766,10 @@ __global__ void ssm_kda_gate_beta_rows(
     float lower_bound,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int t = blockIdx.x;
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
@@ -2808,6 +2816,10 @@ __global__ void ssm_kda_qkv_prep_heads(
     int width, int head_dim, float eps,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int n = blockIdx.x;
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
     const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
@@ -3095,6 +3107,10 @@ __global__ void ssm_kda_step_batched(
     float* __restrict__ work,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int r = blockIdx.x;
 
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
