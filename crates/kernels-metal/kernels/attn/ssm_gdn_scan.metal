@@ -4,6 +4,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#ifndef PIE_RS_SNAPSHOTS
+#define PIE_RS_SNAPSHOTS 4
+#endif
+
 
 template <int LANES>
 inline float gdn_row_sum(float v) {
@@ -163,6 +167,8 @@ template <typename T, int LANES, int VROWS, int PER>
     const constant int& v_heads [[buffer(7)]],
     const constant int& k_dim   [[buffer(8)]],
     const constant int& v_dim   [[buffer(9)]],
+    const device int* snaps     [[buffer(10)]],
+    const constant int& snap_lane0 [[buffer(11)]],
     uint3 pos [[thread_position_in_grid]]) {
   const int lane = int(pos.x) % LANES;
   const int dv_base = int(pos.y) * VROWS;
@@ -182,9 +188,22 @@ template <typename T, int LANES, int VROWS, int PER>
       gdn_cells<VROWS, PER>(rstate, int(slots[begin]), hv, v_heads, dv_base, dk, dv);
   float st[VROWS][PER];
   gdn_load<VROWS, PER>(st, cells, lane, dk);
+  // The rows whose state lands in a slot of its own, ascending; 0 ends them.
+  const device int* snap =
+      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + n) * 2 * PIE_RS_SNAPSHOTS : nullptr;
+  int snapped = 0;
+  int snap_at = snap != nullptr ? begin + snap[0] : -1;
   for (int t = begin; t < end; ++t) {
     gdn_scan_token<T, LANES, VROWS, PER>(
         qkv, gates, y, st, t, lane, dv_base, hv, hk, k_heads, v_heads, dk, dv);
+    if (t + 1 == snap_at) {
+      gdn_store<VROWS, PER>(
+          gdn_cells<VROWS, PER>(rstate, snap[PIE_RS_SNAPSHOTS + snapped], hv, v_heads, dv_base,
+                                dk, dv),
+          st, lane, dk);
+      ++snapped;
+      snap_at = snapped < PIE_RS_SNAPSHOTS && snap[snapped] > 0 ? begin + snap[snapped] : -1;
+    }
   }
   gdn_store<VROWS, PER>(cells, st, lane, dk);
 }
@@ -195,7 +214,7 @@ template <typename T, int LANES, int VROWS, int PER>
       const device bfloat*, const device int*, const device float*,            \
       device float*, const device uint*, device float*,                        \
       const constant int&, const constant int&, const constant int&,           \
-      const constant int&, uint3);
+      const constant int&, const device int*, const constant int&, uint3);
 
 template <typename T, int LANES, int VROWS, int PER>
 [[kernel]] void gated_delta_scan_step(
@@ -249,6 +268,8 @@ template <typename T, int LANES, int VROWS, int PER>
     const constant int& v_heads [[buffer(10)]],
     const constant int& k_dim   [[buffer(11)]],
     const constant int& v_dim   [[buffer(12)]],
+    const device int* snaps     [[buffer(13)]],
+    const constant int& snap_lane0 [[buffer(14)]],
     uint3 pos [[thread_position_in_grid]]) {
   const int lane = int(pos.x) % LANES;
   const int dv_base = int(pos.y) * VROWS;
@@ -275,12 +296,26 @@ template <typename T, int LANES, int VROWS, int PER>
   device float* cells = gdn_cells<VROWS, PER>(rstate, slot, hv, v_heads, dv_base, dk, dv);
   float st[VROWS][PER];
   gdn_load<VROWS, PER>(st, cells, lane, dk);
+  // A lane that snapshots folds its own rows, none replayed: the state as of
+  // each of its snapshot rows lands in that row's slot.
+  const device int* snap =
+      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS : nullptr;
+  int snapped = 0;
+  int snap_at = snap != nullptr ? snap[0] : 0;
   for (int t = 0; t < span; ++t) {
     gdn_scan_token<T, LANES, VROWS, PER>(
         qkv, gates, y, st, begin + t, lane, dv_base, hv, hk, k_heads, v_heads, dk, dv);
 
     if (t + 1 == keep) {
       gdn_store<VROWS, PER>(cells, st, lane, dk);
+    }
+    if (t + 1 == snap_at) {
+      gdn_store<VROWS, PER>(
+          gdn_cells<VROWS, PER>(rstate, snap[PIE_RS_SNAPSHOTS + snapped], hv, v_heads, dv_base,
+                                dk, dv),
+          st, lane, dk);
+      ++snapped;
+      snap_at = snapped < PIE_RS_SNAPSHOTS ? snap[snapped] : 0;
     }
   }
 }
@@ -292,4 +327,4 @@ template <typename T, int LANES, int VROWS, int PER>
       const device int*, const device int*, const constant int&,               \
       const device float*, device float*, device float*,                       \
       const constant int&, const constant int&, const constant int&,           \
-      const constant int&, uint3);
+      const constant int&, const device int*, const constant int&, uint3);

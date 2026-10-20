@@ -1,6 +1,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#ifndef PIE_RS_SNAPSHOTS
+#define PIE_RS_SNAPSHOTS 4
+#endif
+
 
 inline float causal_conv1d_silu(float z) {
   return z / (1.0f + metal::exp(-z));
@@ -57,6 +61,8 @@ template <typename T>
     const constant int& conv_width [[buffer(8)]],
     const constant int& dilation   [[buffer(9)]],
     const constant int& run_rows   [[buffer(10)]],
+    const device int* snaps        [[buffer(11)]],
+    const constant int& snap_lane0 [[buffer(12)]],
     uint3 pos [[thread_position_in_grid]]) {
   // One thread a channel, a lane and a run of at least `run_rows` rows. Only
   // a run that starts before the history ends reads the carried state, and
@@ -103,6 +109,21 @@ template <typename T>
     return;
   }
 
+  // The state as of each snapshot row lands in a slot of its own, read
+  // before the lane's own slot takes its state past the last row.
+  if (snap_lane0 >= 0) {
+    const device int* snap = snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS;
+    for (int i = 0; i < PIE_RS_SNAPSHOTS && snap[i] > 0; ++i) {
+      const size_t into = size_t(snap[PIE_RS_SNAPSHOTS + i]) * size_t(hist) * chans;
+      for (int s = 0; s < hist; ++s) {
+        const int src = snap[i] - hist + s;
+        new_conv_state[into + size_t(s) * chans + col] = (src < 0)
+            ? conv_state[slab + size_t(hist + src) * chans + col]
+            : float(x[size_t(begin + src) * chans + col]);
+      }
+    }
+  }
+
   for (int s = 0; s < hist; ++s) {
     const int src = span - hist + s;
     new_conv_state[slab + size_t(s) * chans + col] = (src < 0)
@@ -125,7 +146,8 @@ template <typename T>
       const device itype*, const device int*, const device itype*,      \
       const device float*, device float*, const device uint*,           \
       device itype*, const constant int&, const constant int&,          \
-      const constant int&, const constant int&, uint3);
+      const constant int&, const constant int&, const device int*,      \
+      const constant int&, uint3);
 
 instantiate_causal_conv1d(bfloat16, bfloat)
 
@@ -146,6 +168,8 @@ template <typename T>
     const constant int& channels   [[buffer(10)]],
     const constant int& conv_width [[buffer(11)]],
     const constant int& dilation   [[buffer(12)]],
+    const device int* snaps        [[buffer(13)]],
+    const constant int& snap_lane0 [[buffer(14)]],
     uint2 pos [[thread_position_in_grid]]) {
   const int c = int(pos.x);
   const int r = int(pos.y);
@@ -184,6 +208,20 @@ template <typename T>
     y[size_t(begin + t) * chans + col] = T(causal_conv1d_silu(acc));
   }
 
+  // A lane that snapshots folds its own rows, none replayed.
+  if (snap_lane0 >= 0) {
+    const device int* snap = snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS;
+    for (int i = 0; i < PIE_RS_SNAPSHOTS && snap[i] > 0; ++i) {
+      const size_t into = size_t(snap[PIE_RS_SNAPSHOTS + i]) * size_t(hist) * chans;
+      for (int s = 0; s < hist; ++s) {
+        const int src = snap[i] - hist + s;
+        new_conv_state[into + size_t(s) * chans + col] = (src < 0)
+            ? conv_state[slab + size_t(hist + src) * chans + col]
+            : float(x[size_t(begin + src) * chans + col]);
+      }
+    }
+  }
+
   int keep = commit[lane0 + r];
   if (keep > span) {
     keep = span;
@@ -211,6 +249,7 @@ template <typename T>
       const device int*, const device int*, const constant int&,        \
       const device itype*, const device float*, device float*,          \
       device itype*, const constant int&, const constant int&,          \
-      const constant int&, uint2);
+      const constant int&, const device int*, const constant int&,      \
+      uint2);
 
 instantiate_causal_conv1d_committed(bfloat16, bfloat)

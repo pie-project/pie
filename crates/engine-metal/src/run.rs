@@ -120,6 +120,10 @@ pub struct FireBindings {
     pub scores: Option<crate::scores::ScoreSeat>,
 
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
+
+    /// The fire's recurrent snapshot table, when a lane snapshots
+    /// (`kernels_metal::attn::ssm::Snapshots`).
+    pub rs_snaps: Option<Tensor>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -518,6 +522,17 @@ impl<'c> Run<'c> {
 
     pub(crate) fn rs_seat(&self) -> Option<std::sync::Arc<crate::rs::Seat>> {
         self.fire.rs.clone()
+    }
+
+    /// Where this window's prompt scans land the state as of rows inside a
+    /// lane, when a lane of the fire snapshots.
+    pub(crate) fn rs_snapshots(&self) -> Option<kernels_metal::attn::ssm::Snapshots> {
+        self.fire
+            .rs_snaps
+            .map(|table| kernels_metal::attn::ssm::Snapshots {
+                table,
+                lane0: self.window().span.lane_offset,
+            })
     }
 
     pub(crate) fn ctx(&self) -> &'c Ctx<'c> {

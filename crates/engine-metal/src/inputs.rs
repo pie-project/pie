@@ -113,6 +113,7 @@ pub struct Handles {
     pub self_cond_weights: Option<Tensor>,
     pub rs_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
+    pub rs_snaps: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
     pub ports: Vec<Tensor>,
@@ -173,6 +174,7 @@ pub struct Fire<'a> {
     pub self_cond_weights: Option<&'a [f32]>,
     pub rs_replay: Option<&'a [i32]>,
     pub rs_commit: Option<&'a [i32]>,
+    pub rs_snaps: Option<&'a [i32]>,
     pub group_of_lane: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
 }
@@ -229,6 +231,7 @@ pub struct Inputs {
     self_cond: Option<(u64, u64, u64)>,
     rs_replay: u64,
     rs_commit: u64,
+    rs_snaps: u64,
 }
 
 /// The ints one fire's packed window boundaries can fill, at the ceiling.
@@ -379,6 +382,7 @@ impl Inputs {
         });
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
+        let rs_snaps = take(lanes * u64::from(SNAP_INTS) * 4);
         let total = at;
 
         let store = Buffer::zeroed(device, total)?;
@@ -408,6 +412,7 @@ impl Inputs {
             self_cond,
             rs_replay,
             rs_commit,
+            rs_snaps,
         })
     }
 
@@ -483,6 +488,16 @@ impl Inputs {
             }
             _ => false,
         };
+        if let Some(snaps) = fire.rs_snaps {
+            if snaps.len() != lanes as usize * SNAP_INTS as usize {
+                return Err(Fault::Ceiling {
+                    what: "recurrent snapshot tables, one row per lane",
+                    need: snaps.len() as u64,
+                    have: u64::from(lanes) * u64::from(SNAP_INTS),
+                });
+            }
+            self.store.write(self.rs_snaps, bytes_of(snaps))?;
+        }
 
         let adapter_routes = match fire.adapter_routes {
             None => None,
@@ -899,6 +914,15 @@ impl Inputs {
             } else {
                 None
             },
+            rs_snaps: match fire.rs_snaps {
+                Some(snaps) => Some(i32s(
+                    handles,
+                    &self.store,
+                    self.rs_snaps,
+                    snaps.len() as u32,
+                )?),
+                None => None,
+            },
         })
     }
 
@@ -930,6 +954,9 @@ impl Inputs {
         }
     }
 }
+
+/// The ints of one lane's row in the snapshot table: its rows, then its slots.
+const SNAP_INTS: u32 = 2 * kernels_metal::attn::ssm::RS_SNAPSHOTS;
 
 fn csr(into: &mut Vec<i32>, staged: &[i32], ceiling: u32) {
     into.clear();
