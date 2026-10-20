@@ -15,14 +15,10 @@
 
 use serde_json::{Value, json};
 
-/// A frame, naming for the gateway the tokens it covers since the frame
-/// before and the response's id, so the turn can move ([`crate::resume`]).
-fn frame(mut frame: Value) {
-    let tokens = crate::resume::take();
-    if !tokens.is_empty() {
-        frame["plex"] = json!({"tokens": tokens, "id": crate::short_id()});
-    }
-    inferlet::session::send(&frame.to_string());
+/// A frame, the tokens it covers going into the resume log with it, so the
+/// turn can move ([`crate::resume`]).
+fn frame(frame: Value) {
+    crate::resume::send(&frame.to_string());
 }
 
 /// A JSON frame with no event name.
