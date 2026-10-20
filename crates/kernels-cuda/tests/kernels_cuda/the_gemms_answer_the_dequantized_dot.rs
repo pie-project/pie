@@ -352,5 +352,20 @@ fn the_w8a16_projections_answer_the_dot() {
         );
         b.check(y.ptr, &want, TOL, &format!("W8A16 in {gran}s, {m}x{n}x{k}"));
     }
+    // The decode rows' GEMV over the same planes, in 32s and 128s.
+    for (gran, m, n, k) in [(32, 1, 256, 1024), (32, 3, 640, 2048), (128, 2, 384, 1024)] {
+        let mut b = Bench::new(0xa17 ^ (m * n + k) as u64);
+        let (x, xv) = b.bf16(m * k);
+        let s = b.side(Elem::E4m3, Some(gran), n, k);
+        let atoms = &s.scales.as_ref().expect("scaled").0;
+        let (codes, atoms) = (b.up(&s.bytes), b.up(atoms));
+        let mut y = b.out(m, n);
+        let ctx = b.ctx().with_tuning(GEMV);
+        let took = act_quant::fp8_block_gemv_in(&ctx, t(x, m, k, Bf16), codes, atoms, gran as u32, &mut y)
+            .expect("the GEMV fires");
+        assert!(took, "{m}x{n}x{k} in {gran}s is a shape the GEMV reads");
+        let want = dot([m, n, k], |r, i| xv[r * k + i], |_, c, i| f64::from(s.value(c, k, i)));
+        b.check(y.ptr, &want, TOL, &format!("GEMV in {gran}s, {m}x{n}x{k}"));
+    }
 }
 

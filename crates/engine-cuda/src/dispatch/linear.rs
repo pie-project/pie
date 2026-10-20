@@ -1728,10 +1728,10 @@ impl Run<'_> {
         } else {
             k.div_ceil(atoms.width)
         };
-        // A decode's few rows over 128-wide blocks as the GEMV over bf16 rows
-        // (`kernel.gemm.fp8_gemv_until`), as the tcgen05 path takes them.
-        if block == 128
-            && act_quant::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)?
+        // A decode's few rows over 128- or 32-wide blocks as the GEMV over bf16
+        // rows (`kernel.gemm.fp8_gemv_until`), as the tcgen05 path takes them.
+        if matches!(block, 32 | 128)
+            && act_quant::fp8_block_gemv_in(self.ctx(), act, codes.ptr, atoms.ptr, block, &mut out)?
         {
             return Ok(());
         }

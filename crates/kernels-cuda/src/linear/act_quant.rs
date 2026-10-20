@@ -343,6 +343,18 @@ pub fn fp8_block_gemv(
     atoms: u64,
     y: &mut Tensor,
 ) -> Result<bool, Error> {
+    fp8_block_gemv_in(ctx, act, codes, atoms, 128, y)
+}
+
+/// [`fp8_block_gemv`] over blocks of `gran` (128, or MXFP8's 32) columns.
+pub fn fp8_block_gemv_in(
+    ctx: &Ctx,
+    act: Tensor,
+    codes: u64,
+    atoms: u64,
+    gran: u32,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
     const OP: &str = "linear.fp8_block_gemv";
     const WARPS: u32 = 8;
     const ROWS: u32 = 4;
@@ -357,6 +369,7 @@ pub fn fp8_block_gemv(
         || n == 0
         || !codes.is_multiple_of(16)
         || !act.ptr.is_multiple_of(16)
+        || !matches!(gran, 32 | 128)
     {
         return Ok(false);
     }
@@ -373,7 +386,7 @@ pub fn fp8_block_gemv(
         Fire::at(
             "linear/fp8_gemv.cuh",
             symbol(&format!(
-                "::pie::linear::fp8_block_gemv<{WARPS}, {ROWS}, {rows_pad}>"
+                "::pie::linear::fp8_block_gemv<{WARPS}, {ROWS}, {rows_pad}, {gran}>"
             )),
         )
         .apply(Launch::grid(
