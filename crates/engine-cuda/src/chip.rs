@@ -612,6 +612,7 @@ mod tests {
                         nvfp4_mma_until: defaults.nvfp4_mma_until,
                         bf16_mma_from: defaults.bf16_mma_from,
                         bf16_mma_until: defaults.bf16_mma_until,
+                        selected_mma: defaults.selected_mma,
                         ..tuning
                     },
                     defaults,
