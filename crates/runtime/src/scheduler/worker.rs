@@ -292,6 +292,8 @@ pub(crate) enum HostKvOp {
     /// A copy of device pages into host slots, then a read of those slots:
     /// one item on the lane, with no completion to settle between.
     CopyRead(::engine::KvCopy, Vec<u32>),
+    /// The engine's tap groups (`Engine::tap_groups`), as JSON.
+    TapGroups,
 }
 
 type SchedTx = tokio::sync::mpsc::UnboundedSender<SchedulerItem>;

@@ -46,10 +46,23 @@ pub struct Prefill {
     /// The asker's bulk-bytes address: the executor fetches from it, by key,
     /// the pages before `from_page` it holds nowhere itself.
     pub home: Option<String>,
-    /// The asker reads the pages in place: hold them on the device, and say
-    /// where, until it releases them.
+    /// How the asker takes the pages.
     #[serde(default)]
-    pub in_place: bool,
+    pub delivery: Delivery,
+}
+
+/// How an asker takes a prefill's pages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Delivery {
+    /// Fetched by key over the bulk link once the prefill is done.
+    #[default]
+    Fetched,
+    /// Read in place: hold them on the device, and say where, until the
+    /// asker releases them.
+    InPlace,
+    /// Fetched by key at once, each layer of them sent as the executor
+    /// computes it, where its engine can; else as fetched.
+    Streamed,
 }
 
 /// The pages a prefill sealed, left in the executor's cache: `count` from

@@ -90,8 +90,7 @@ impl runtime::offload::directory::Remote for Clients {
                 page_bytes: stream.page_bytes,
                 layout: serde_json::from_slice(&stream.meta).ok(),
                 slots: stream.slots,
-                groups: stream.groups,
-                chunks: stream.chunks,
+                body: runtime::offload::prefill::Body::Pages(stream.chunks),
             })
         })
     }
@@ -111,19 +110,44 @@ impl transport::tcp::Source for Source {
             let pages = runtime::offload::prefill::fetch(keys, from)
                 .await
                 .map_err(|e| format!("{e:#}"))?;
-            Ok(transport::tcp::Stream {
-                count: pages.count,
-                page_bytes: pages.page_bytes,
-                meta: pages
-                    .layout
-                    .as_ref()
-                    .and_then(|layout| serde_json::to_vec(layout).ok())
-                    .unwrap_or_default(),
-                slots: pages.slots,
-                groups: pages.groups,
-                chunks: pages.chunks,
-            })
+            Ok(wire(pages))
         })
+    }
+}
+
+/// A runtime stream as the bulk link sends it: whole pages as they are, a
+/// streamed run's parts as `transport::tcp::part`s.
+fn wire(pages: runtime::offload::prefill::PageStream) -> transport::tcp::Stream {
+    use runtime::offload::prefill::Body;
+    let meta = pages
+        .layout
+        .as_ref()
+        .and_then(|layout| serde_json::to_vec(layout).ok())
+        .unwrap_or_default();
+    let (groups, chunks) = match pages.body {
+        Body::Pages(chunks) => (Vec::new(), chunks),
+        Body::Parts { groups, mut parts } => {
+            let (tx, chunks) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Some(part) = parts.recv().await {
+                    let chunk = part.map(|part| {
+                        transport::tcp::part(part.group, part.first, part.pages, &part.bytes)
+                    });
+                    if tx.send(chunk).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            (groups, chunks)
+        }
+    };
+    transport::tcp::Stream {
+        count: pages.count,
+        page_bytes: pages.page_bytes,
+        meta,
+        slots: pages.slots,
+        groups,
+        chunks,
     }
 }
 
@@ -180,7 +204,13 @@ impl Peer for PeerServer {
             request.tokens,
             request.from_page,
             request.home,
-            request.in_place,
+            match request.delivery {
+                worker_api::peer::Delivery::Fetched => runtime::offload::prefill::Delivery::Fetched,
+                worker_api::peer::Delivery::InPlace => runtime::offload::prefill::Delivery::InPlace,
+                worker_api::peer::Delivery::Streamed => {
+                    runtime::offload::prefill::Delivery::Streamed
+                }
+            },
         )
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -283,7 +313,7 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
         &self,
         tokens: Vec<u32>,
         from_page: u32,
-        in_place: bool,
+        delivery: runtime::offload::prefill::Delivery,
     ) -> BoxFuture<'static, Result<runtime::offload::prefill::RemotePages>> {
         let client = self.client.clone();
         let home = self.home.clone();
@@ -298,7 +328,17 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
                         tokens,
                         from_page,
                         home,
-                        in_place,
+                        delivery: match delivery {
+                            runtime::offload::prefill::Delivery::Fetched => {
+                                worker_api::peer::Delivery::Fetched
+                            }
+                            runtime::offload::prefill::Delivery::InPlace => {
+                                worker_api::peer::Delivery::InPlace
+                            }
+                            runtime::offload::prefill::Delivery::Streamed => {
+                                worker_api::peer::Delivery::Streamed
+                            }
+                        },
                     },
                 )
                 .await
@@ -503,22 +543,10 @@ pub async fn push_to_pools(pools: Vec<String>) {
 
 async fn push(pool: &str, run: &[[u8; 32]], from: usize) -> Result<usize> {
     let stream = runtime::offload::prefill::fetch(run.to_vec(), from as u32).await?;
-    let meta = stream
-        .layout
-        .as_ref()
-        .and_then(|layout| serde_json::to_vec(layout).ok())
-        .unwrap_or_default();
-    let pages = transport::tcp::Stream {
-        count: stream.count,
-        page_bytes: stream.page_bytes,
-        meta,
-        slots: stream.slots,
-        groups: stream.groups,
-        chunks: stream.chunks,
-    }
-    .collect()
-    .await
-    .map_err(|why| anyhow::anyhow!(why))?;
+    let pages = wire(stream)
+        .collect()
+        .await
+        .map_err(|why| anyhow::anyhow!(why))?;
     let count = pages.count;
     transport::tcp::put(pool, &run[from..], &pages)
         .await

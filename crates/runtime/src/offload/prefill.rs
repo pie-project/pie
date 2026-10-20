@@ -9,7 +9,9 @@
 //!
 //! Executor: [`serve`] prefills with the built-in `prefill` program, which
 //! leaves its pages sealed in this worker's cache; the home then fetches
-//! them by key over the bulk link ([`fetch`] answers it).
+//! them by key over the bulk link ([`fetch`] answers it). Streamed, the
+//! executor answers at once and the home's fetch takes each layer of the
+//! pages as the program's fires compute it (`super::stream`).
 //!
 //! Both workers hash under one model identity, so a page's key names the
 //! same prefix on both. Their engines must lay a page out alike: v1 moves a
@@ -24,9 +26,8 @@ use futures::future::BoxFuture;
 use crate::store::kv::hash::{self, Hash256};
 use crate::store::registry::{Stores, with_kv_lock};
 
-/// Pages' bytes as they come, in chunks of whole pages laid out as an
-/// engine lays out a host slot (each chunk a read of its own); `layout` says
-/// how, where the engine can.
+/// Pages' bytes as they come, laid out as an engine lays out a host slot;
+/// `layout` says how, where the engine can.
 pub struct PageStream {
     pub count: usize,
     pub page_bytes: usize,
@@ -34,10 +35,41 @@ pub struct PageStream {
     /// The pages' tokens' hashes, page after page; empty when the source
     /// has none.
     pub slots: Vec<Hash256>,
-    /// The groups (spans of a page) the chunks are parts of, each chunk one
-    /// `transport::tcp::part`; empty: whole pages.
-    pub groups: Vec<Vec<(u64, u64)>>,
-    pub chunks: tokio::sync::mpsc::Receiver<std::result::Result<Vec<u8>, String>>,
+    pub body: Body,
+}
+
+/// How a [`PageStream`]'s bytes come.
+pub enum Body {
+    /// In chunks of whole pages, each a read of its own.
+    Pages(tokio::sync::mpsc::Receiver<std::result::Result<Vec<u8>, String>>),
+    /// In parts, as the pages are computed: `groups` are the spans of a page
+    /// each part holds of its pages, and every (group, page) comes once.
+    Parts {
+        groups: Vec<Vec<(u64, u64)>>,
+        parts: tokio::sync::mpsc::UnboundedReceiver<std::result::Result<Part, String>>,
+    },
+}
+
+/// Group `group` of pages `first..first + pages` of a stream: each page's
+/// spans of the group, page after page.
+#[derive(Debug)]
+pub struct Part {
+    pub group: u32,
+    pub first: u32,
+    pub pages: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// How a peer's prefilled pages come back to the asker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Fetched by key once the prefill is done.
+    Fetched,
+    /// Held on the peer's device for the asker to read in place.
+    InPlace,
+    /// Sent a layer at a time as the peer computes them, where its engine
+    /// can; else as fetched.
+    Streamed,
 }
 
 /// Pages read out and sent at a time: the next is read while the link
@@ -72,13 +104,13 @@ pub struct Held {
 
 /// The worker a pass is offloaded to: the link layer's.
 pub trait PrefillPeer: Send + Sync {
-    /// Prefills on the peer; with `in_place` the pages are held there for
-    /// [`PrefillPeer::read`].
+    /// Prefills on the peer, its pages to come back as `delivery` says; held
+    /// in place, they are read by [`PrefillPeer::read`].
     fn prefill(
         &self,
         tokens: Vec<u32>,
         from_page: u32,
-        in_place: bool,
+        delivery: Delivery,
     ) -> BoxFuture<'static, Result<RemotePages>>;
 
     /// Whether this worker can read the peer's kv in place.
@@ -351,7 +383,11 @@ async fn take(
         .prefill(
             pass.tokens.clone(),
             u32::try_from(pass.have)?,
-            peer.reads_in_place(),
+            if peer.reads_in_place() {
+                Delivery::InPlace
+            } else {
+                Delivery::Streamed
+            },
         )
         .await?;
     let t_rpc = t0.elapsed();
@@ -514,15 +550,15 @@ async fn land(
     prefix: &[Hash256],
     token_hashes: Vec<Vec<Option<Hash256>>>,
     keys: Vec<Hash256>,
-    mut stream: PageStream,
+    stream: PageStream,
 ) -> Result<()> {
     let n = stream.count;
     if n == 0 {
         return Ok(());
     }
-    if !stream.groups.is_empty() {
+    let Body::Pages(mut chunks) = stream.body else {
         bail!("pages sent a part at a time are laid back out before they land");
-    }
+    };
     // Pages another layout holds (another split across ranks) are laid out
     // as this engine holds them, a chunk at a time.
     let to = crate::scheduler::host_kv_layout(engine).await;
@@ -536,7 +572,7 @@ async fn land(
     let ids: Vec<u32> = host.iter().map(|slot| slot.0).collect();
     let written = async {
         let mut at = 0usize;
-        while let Some(chunk) = stream.chunks.recv().await {
+        while let Some(chunk) = chunks.recv().await {
             let chunk = chunk.map_err(|why| anyhow!(why))?;
             let k = chunk.len().checked_div(stream.page_bytes).unwrap_or(0);
             if k == 0 || at + k > n || k * stream.page_bytes != chunk.len() {
@@ -669,7 +705,7 @@ pub async fn serve(
     tokens: Vec<u32>,
     from_page: u32,
     home: Option<String>,
-    in_place: bool,
+    delivery: Delivery,
 ) -> Result<RemotePages> {
     expire_leases();
     let stores = crate::store::registry::try_get(0, 0)
@@ -727,7 +763,33 @@ pub async fn serve(
         }
     }
     let t_fetch = t0.elapsed();
-    run_prefill(&tokens[..(pages * page) as usize]).await?;
+    let answer = RemotePages {
+        start: from * page,
+        page_tokens: stores.kv_page_size,
+        count: (pages - from) as usize,
+        addr: String::new(),
+        held: None,
+    };
+    let whole = tokens[..(pages * page) as usize].to_vec();
+    // Streamed, the asker fetches the run as it is computed: its fires'
+    // layers go out as they land.
+    if delivery == Delivery::Streamed
+        && let Some(run) = super::stream::expect(&keys, from as usize).await
+    {
+        tokio::spawn(async move {
+            let ran = run_prefill(&whole).await;
+            super::stream::done(run, ran);
+        });
+        tracing::debug!(
+            target: "pie::offload",
+            have,
+            fetched,
+            fetch_ms = t_fetch.as_millis() as u64,
+            "streaming a prefill"
+        );
+        return Ok(answer);
+    }
+    run_prefill(&whole).await?;
     let t_run = t0.elapsed();
     // The program has exited; its working set's pages are kept as it is
     // released, which may land just after.
@@ -753,19 +815,20 @@ pub async fn serve(
         "served a prefill"
     );
     Ok(RemotePages {
-        start: from * page,
-        page_tokens: stores.kv_page_size,
-        count: (pages - from) as usize,
-        addr: String::new(),
-        held: in_place
+        held: (delivery == Delivery::InPlace)
             .then(|| hold(&stores, &keys, from as usize))
             .flatten(),
+        ..answer
     })
 }
 
 /// The bytes of this worker's sealed pages `keys[from..]`, for a peer that
 /// asks by key. `keys` run from token 0: a run is found from its first page.
+/// A run a streamed prefill is computing here goes out as it is computed.
 pub async fn fetch(keys: Vec<Hash256>, from: u32) -> Result<PageStream> {
+    if let Some(stream) = super::stream::take(&keys, from as usize) {
+        return Ok(stream);
+    }
     let stores = crate::store::registry::try_get(0, 0)
         .ok_or_else(|| anyhow!("no engine serves a model here"))?;
     export(&stores, 0, &keys, from as usize, false).await
@@ -843,8 +906,7 @@ async fn export(
         page_bytes,
         layout,
         slots: hashes,
-        groups: Vec::new(),
-        chunks,
+        body: Body::Pages(chunks),
     })
 }
 

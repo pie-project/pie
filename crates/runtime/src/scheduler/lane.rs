@@ -319,6 +319,7 @@ impl Lane {
             if let Err(error) = engine.bind_thread() {
                 tracing::error!(engine_idx, %error, "engine lane could not bind its thread");
             }
+            engine.on_tapped(crate::offload::stream::sink());
             if engine.settles_asynchronously() {
                 engine.on_complete(std::sync::Arc::new(move |at: engine::StepDone, outcome| {
                     // What lanes wrote is kept before their step is published
@@ -791,6 +792,9 @@ impl Lane {
                         .copy_kv(&copy)
                         .and_then(|()| engine.read_host_kv(&slots))
                         .map_err(Into::into),
+                    HostKvOp::TapGroups => {
+                        Ok(serde_json::to_vec(&engine.tap_groups()).unwrap_or_default())
+                    }
                     HostKvOp::Layout => Ok(engine
                         .host_kv_layout()
                         .and_then(|layout| serde_json::to_vec(&layout).ok())

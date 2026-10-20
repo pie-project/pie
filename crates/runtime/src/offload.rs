@@ -1,11 +1,13 @@
 //! Other workers' part in this one's passes: a pass's prefill run on a peer
-//! (`prefill`), and pages another worker's cache holds (`directory`).
+//! (`prefill`, streamed as it is computed by `stream`), and pages another
+//! worker's cache holds (`directory`).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, RwLock};
 
 pub mod directory;
 pub mod prefill;
+pub mod stream;
 
 static PREFILL_MIN_SUFFIX_TOKENS: AtomicUsize = AtomicUsize::new(0);
 

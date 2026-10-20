@@ -2454,6 +2454,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 slots,
             )
             .await;
+            // A pass that computes a run a peer streams taps its fires.
+            crate::offload::stream::bind(pid, &stores, ws.id, u64::from(lane.kv.held), slots);
         }
         // Pages below the device come back up first; the run stays held
         // until it is mapped in just below.
@@ -2746,6 +2748,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             if let Err(refusal) = map_lane_pages(&mut req, &stores, &groups) {
                 return Ok(Err(refusal));
             }
+            crate::offload::stream::tap(pid, &stores, &mut req);
             rs_prepared.apply_to(&mut req);
             checkpoints_here.extend(
                 rs_prepared
