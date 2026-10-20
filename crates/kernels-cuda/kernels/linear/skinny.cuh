@@ -63,6 +63,10 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
     int k,
     float cap)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     constexpr bool kGeglu = kEpilogue == 2;
     constexpr int kThreads = kWarps * 32;
     constexpr int kSkinnyLd = skinny_ld<kBK>();
