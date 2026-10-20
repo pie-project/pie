@@ -37,3 +37,6 @@ pub mod act_quant;
 
 #[cfg(feature = "cuda")]
 pub mod w8a16;
+
+#[cfg(feature = "cuda")]
+pub mod lt_fp8;
