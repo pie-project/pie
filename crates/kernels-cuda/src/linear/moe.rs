@@ -3488,6 +3488,32 @@ pub fn matmul_grouped_strided(
     if y.rows == 0 {
         return Ok(());
     }
+    // One row (a decode's) as one GEMV over every group's rows, where the
+    // profile says (`kernel.gemm.grouped_gemv`): batched cuBLAS spends its
+    // few CTAs on a plane a GEMV streams at full bandwidth.
+    if ctx.tuning().grouped_gemv
+        && y.rows == 1
+        && k.is_multiple_of(8)
+        && [x.ptr, w.ptr].iter().all(|p| p.is_multiple_of(16))
+    {
+        let rows = groups * n;
+        return ctx.fire(
+            OP,
+            Fire::at(
+                "linear/gemv.cuh",
+                "::pie::linear::gemv_bf16_grouped_kernel<::pie::i32(4)>",
+            )
+            .apply(Launch::grid([rows.div_ceil(4), 1, 1], [32, 4, 1])),
+            &[
+                w.arg(),
+                x.arg(),
+                y.arg(),
+                stated(OP, rows)?.arg(),
+                stated(OP, k)?.arg(),
+                stated(OP, n)?.arg(),
+            ],
+        );
+    }
     let int =
         |v: u32| i32::try_from(v).map_err(|_| refuse(OP, "an extent past the int cuBLAS takes"));
     let handle = ctx.cublas(OP)?.cast::<cublasContext>();

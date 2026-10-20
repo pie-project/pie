@@ -147,6 +147,16 @@ fn the_strided_grouped_projection_answers_each_group() {
     let w = |r: usize, c: usize, i: usize| wv[((r % groups) * n + c) * k + i];
     let want = dot([rows * groups, n, k], |r, i| xv[r * k + i], w);
     b.check(y.ptr, &want, TOL, "strided");
+    // A decode's one row on the grouped GEMV (`kernel.gemm.grouped_gemv`).
+    let mut y1 = b.out(1, groups * n);
+    let ctx = b.ctx().with_tuning(Tuning {
+        grouped_gemv: true,
+        ..Tuning::DEFAULT
+    });
+    let xt1 = t(x, 1, groups * k, Bf16);
+    matmul_grouped_strided(&ctx, xt1, wt, &mut y1, groups as u32).expect("fires");
+    let want1 = dot([groups, n, k], |r, i| xv[r * k + i], w);
+    b.check(y1.ptr, &want1, TOL, "strided, one row");
 }
 
 #[test]

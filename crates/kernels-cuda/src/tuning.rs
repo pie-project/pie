@@ -575,6 +575,13 @@ pub struct SsmGdnStepBlocks(pub u32);
 #[decision(id = "kernel.moe.mxfp4_select_lean", flag, default = false, tune = search)]
 pub struct MoeMxfp4SelectLean;
 
+/// Whether a strided grouped bf16 projection at one row (DeepSeek-V4.1's
+/// grouped output LoRA at decode) is one GEMV over every group's rows rather
+/// than batched cuBLAS. Off but where a chip's profile turns it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.grouped_gemv", flag, default = false, tune = search)]
+pub struct GemmGroupedGemv;
+
 /// Whether a prefill the tcgen05 FMHA (`attn/tc5_fmha.cuh`, sm_100a) can
 /// serve runs on it; off, FA2 serves every prefill, as before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -690,6 +697,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmGdnOutBf16>()
         .add::<SsmGdnStepBlocks>()
         .add::<MoeMxfp4SelectLean>()
+        .add::<GemmGroupedGemv>()
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
@@ -812,6 +820,7 @@ tuning! {
     ssm_gdn_out_bf16: bool = false, on SsmGdnOutBf16;
     ssm_gdn_step_blocks: u32 = 4, get SsmGdnStepBlocks;
     mxfp4_select_lean: bool = false, on MoeMxfp4SelectLean;
+    grouped_gemv: bool = false, on GemmGroupedGemv;
     merge_warp: bool = false, on SdpaMergeWarp;
     mxfp4_mma_until: u32 = 0, get MoeMxfp4MmaUntil;
     mxfp4_mma_from: u32 = 64, get MoeMxfp4MmaFrom;
