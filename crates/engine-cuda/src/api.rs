@@ -255,31 +255,53 @@ pub const CODEGEN: &str = "cuda";
 pub const CODEGEN: &str = "hip";
 
 /// Powers of two from the floor up to `max_tokens`, with `steps - 1` more
-/// between each pair.
+/// between each pair; from `fine_from` rows (0 never), at least
+/// `PREFILL_LATTICE_STEPS` a doubling. A prefill's GEMMs run its bucket's
+/// rows, so a 2K prompt padded to 4096 costs a second prompt, while buckets
+/// this tall are few.
 #[must_use]
-pub(crate) fn default_lattice(max_tokens: u32, steps: u32) -> Vec<u32> {
+pub(crate) fn default_lattice(max_tokens: u32, steps: u32, fine_from: u32) -> Vec<u32> {
     let steps = steps.max(1);
     let mut lattice: Vec<u32> = Vec::new();
-    for i in 0u32.. {
-        let point = (f64::from(LATTICE_FLOOR) * 2f64.powf(f64::from(i) / f64::from(steps))).ceil();
+    let push = |point: f64, lattice: &mut Vec<u32>| -> bool {
         if point >= f64::from(max_tokens) {
-            break;
+            return false;
         }
         let point = point as u32;
         if lattice.last() != Some(&point) {
             lattice.push(point);
+        }
+        true
+    };
+    for i in 0u32.. {
+        let point = (f64::from(LATTICE_FLOOR) * 2f64.powf(f64::from(i) / f64::from(steps))).ceil();
+        if fine_from > 0 && point >= f64::from(fine_from) {
+            break;
+        }
+        if !push(point, &mut lattice) {
+            lattice.push(max_tokens);
+            return lattice;
+        }
+    }
+    let fine = steps.max(PREFILL_LATTICE_STEPS);
+    for i in 0u32.. {
+        let point = (f64::from(fine_from) * 2f64.powf(f64::from(i) / f64::from(fine))).ceil();
+        if !push(point, &mut lattice) {
+            break;
         }
     }
     lattice.push(max_tokens);
     lattice
 }
 
+const PREFILL_LATTICE_STEPS: u32 = 4;
+
 pub(crate) const LATTICE_FLOOR: u32 = 1;
 
 #[must_use]
-pub(crate) fn lattice(stated: Vec<u32>, max_tokens: u32, steps: u32) -> Vec<u32> {
+pub(crate) fn lattice(stated: Vec<u32>, max_tokens: u32, steps: u32, fine_from: u32) -> Vec<u32> {
     if stated.is_empty() {
-        default_lattice(max_tokens, steps)
+        default_lattice(max_tokens, steps, fine_from)
     } else {
         stated
     }

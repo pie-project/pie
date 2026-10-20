@@ -958,12 +958,6 @@ impl Shell {
             Kind::Wide => 3,
             Kind::Tower => 4,
         };
-        // Fires from `engine.walk_from` rows walk; the bucket that holds
-        // the rows just below it is the tallest a body serves.
-        if self.walk_from > 0 {
-            let tallest = self.budget.buckets.iter().copied().find(|b| *b >= self.walk_from);
-            targets.retain(|(bucket, _)| tallest.is_none_or(|top| *bucket <= top));
-        }
         targets
             .sort_by_key(|(bucket, target)| (Some(*bucket) != top, rank(target.kind()), *bucket));
         if targets.is_empty() {

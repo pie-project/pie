@@ -98,6 +98,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         stated_buckets.clone(),
         boot.budget.max_tokens,
         engine.lattice_steps,
+        engine.prefill_lattice_from,
     );
 
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
@@ -174,6 +175,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             buckets,
             tokens,
             engine.lattice_steps,
+            engine.prefill_lattice_from,
         );
         budget
     };
@@ -342,6 +344,7 @@ fn refit(
             buckets,
             tokens,
             engine.lattice_steps,
+            engine.prefill_lattice_from,
         );
         budget
     };
@@ -893,7 +896,6 @@ impl Shell {
             one_frame_when_short: engine.one_frame_when_short,
             seated_first: engine.seated_first,
             pad: engine.recording.pad(),
-            walk_from: engine.walk_from,
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),
             bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),

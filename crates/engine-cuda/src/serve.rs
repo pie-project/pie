@@ -98,8 +98,6 @@ pub struct Shell {
     /// `engine.seated_first`.
     seated_first: bool,
     pad: bool,
-    /// `engine.walk_from`.
-    walk_from: u32,
     bodies: bool,
     bodies_mem: usize,
     decoded_tiles: Vec<u64>,

@@ -150,7 +150,6 @@ impl Shell {
             facts: &self.facts,
             graphs: self.graphs,
             pad: self.pad,
-            walk_from: self.walk_from,
             arming: self.arming,
             golden_arm: self.golden_arm,
             cache: &mut self.cache,
@@ -188,9 +187,6 @@ impl Shell {
     }
 }
 
-/// The rows a walked fire's kernels pad to (`engine.walk_from`).
-const WALK_ROWS: u32 = 64;
-
 struct FireCtx<'a> {
     device: &'a Context,
     trace: &'a Trace,
@@ -202,7 +198,6 @@ struct FireCtx<'a> {
     facts: &'a kv::Facts,
     graphs: Graphs,
     pad: bool,
-    walk_from: u32,
     arming: bool,
     golden_arm: Golden,
     cache: &'a mut GraphCache,
@@ -708,15 +703,12 @@ impl FireCtx<'_> {
                 windows: &p.windows,
                 at: &stream,
             });
-        let rows = p.composition.rows();
         let armed = kernels_cuda::Pad {
-            rows,
-            bucket: if !self.pad {
-                rows
-            } else if self.walk_from > 0 && rows >= self.walk_from {
-                rows.next_multiple_of(WALK_ROWS).min(p.composition.bucket()).max(rows)
-            } else {
+            rows: p.composition.rows(),
+            bucket: if self.pad {
                 p.composition.bucket()
+            } else {
+                p.composition.rows()
             },
         };
         let armed_patches = kernels_cuda::Pad {
