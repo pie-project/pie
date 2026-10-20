@@ -110,6 +110,7 @@ const SPECIFIC: &[(&str, Toolchain)] = &[
     ("attn/mla_sparse.cuh", Toolchain::new(12, 9)),
     ("attn/gdn_tc5.cuh", Toolchain::new(12, 9)),
     ("linear/moe_w4_cvt.cuh", Toolchain::new(12, 9)),
+    ("linear/moe_wgmma.cuh", Toolchain::ANY),
 ];
 
 /// The units compiled for the arch-specific target on a tcgen05 chip and the

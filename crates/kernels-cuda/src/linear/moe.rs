@@ -637,6 +637,13 @@ pub fn fp8_w8a8_capable() -> bool {
         .is_some_and(|cc| cc >= 89)
 }
 
+/// Whether this device is Hopper (sm_90), whose arch-specific target has
+/// wgmma: the routed W8A8 select's tensor-core GEMM there.
+#[cfg(feature = "cuda")]
+fn hopper_wgmma() -> bool {
+    crate::jit::cache::arch() == Some("sm_90")
+}
+
 /// The fewest routes a block-FP8 select takes [`select_fp8_w8a8`] at, and
 /// the rows of a dense plane [`matmul_fp8_w8a8`] takes, between a decode's
 /// register-held W8A16 kernels and a prefill's widened cuBLAS GEMM.
@@ -704,8 +711,59 @@ pub fn select_fp8_w8a8(
     }
     let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let per = fan.route_count.div_ceil(experts);
+    // On Hopper, wgmma (sm_90a): an expert's slice 32 routes, or 64 past an
+    // average of 16, at about the card's rate either way, so a busy expert's
+    // routes rarely spill into a second read of its codes.
+    if hopper_wgmma() {
+        let slice: u32 = if per <= 16 { 32 } else { 64 };
+        let RouteOrder {
+            order,
+            offsets,
+            work,
+            work_cap,
+        } = route_order_sliced(
+            ctx,
+            OP,
+            routes,
+            &fan,
+            experts,
+            slice,
+            true,
+            if KEEP_NEXT.with(core::cell::Cell::get) {
+                Share::Keep
+            } else {
+                Share::Take
+            },
+        )?;
+        // `kWgStages` stages of 128 code rows and the slice's route rows, a
+        // 128-code K step each, past the 1024-byte alignment.
+        let smem = 4 * (128 + slice) * 128 + 1024;
+        return ctx.fire(
+            OP,
+            Fire::at(
+                "linear/moe_wgmma.cuh",
+                symbol(&format!("::pie::linear::moe_select_fp8a8_wgmma<{slice}>")),
+            )
+            .apply(Launch::grid([work_cap, y.width / 128, 1], [128, 1, 1]).smem(smem)),
+            &[
+                ArgValue::Ptr(xq),
+                ArgValue::Ptr(xe),
+                ArgValue::Ptr(order),
+                ArgValue::Ptr(offsets),
+                ArgValue::Ptr(work),
+                ArgValue::Ptr(codes),
+                ArgValue::Ptr(atoms),
+                y.arg(),
+                act_div.arg(),
+                n.arg(),
+                stated(OP, x.width)?.arg(),
+                stated(OP, experts)?.arg(),
+            ],
+        );
+    }
     // As the bf16 select: an expert's slice 8, 16, 32 or 64 routes.
-    let nb: u32 = match fan.route_count.div_ceil(experts) {
+    let nb: u32 = match per {
         0..=8 => 1,
         9..=16 => 2,
         17..=40 => 4,
