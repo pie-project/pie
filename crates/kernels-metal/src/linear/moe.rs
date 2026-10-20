@@ -919,6 +919,7 @@ pub fn matmul_select_batched(
                     None => ctx.absent()?,
                 },
                 scratch.tile_expert.arg(),
+                scratch.perm.arg(),
             ],
         )?;
     } else if let Some((m, n, simdgroups)) = mpp {
