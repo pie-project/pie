@@ -704,12 +704,10 @@ mod sparse {
     /// codes, five without rotated dims), P twice, the score exchange, six key lists, barriers, and the
     /// 1024-byte alignment.
     const fn smem(rope: i32, e4: bool) -> u32 {
+        // Four e4m3 slots with rotated dims (4 x (32768 + 8192)) and five
+        // without (5 x 32768) both come to 160 KiB.
         let ring = if e4 {
-            if rope > 0 {
-                4 * (32768 + 8192)
-            } else {
-                5 * 32768
-            }
+            5 * 32768
         } else {
             2 * (65536 + if rope > 0 { 16384 } else { 0 })
         };

@@ -109,6 +109,33 @@ pub struct GemmSplitLaunchFrom(pub u32);
 #[decision(id = "kernel.moe.w4a4_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct MoeW4a4FusedFrom(pub u32);
 
+/// The fewest waves of units a swapped grouped tcgen05 GEMM (a decode's
+/// routed experts) spans before it deals them over the fewest CTAs that keep
+/// its waves, the same count each, rather than a CTA an SM with the last
+/// wave part full (a launch of two waves' short units hides their latency
+/// on the SMs it would retire). 0, never, but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.even_waves_from", constant(range(0..=64)), default = 0, tune = search)]
+pub struct MoeEvenWavesFrom(pub u32);
+
+/// Whether a grouped tcgen05 GEMM's shared memory holds its routing for the
+/// bank's experts alone rather than the most a launch routes (1028), the
+/// room going to the ring: Muse Spark's bs64 W4A4 down leg takes a fourth
+/// stage. Off but where a chip's profile turns it on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.routes_sized", flag, default = false, tune = search)]
+pub struct MoeRoutesSized;
+
+/// The most tokens a routed MLP's normed gather (Muse Spark's routes, each
+/// normed under its scale before the weighted sum) takes with eight routes in
+/// flight a round rather than two: a decode's few row blocks leave the
+/// multiprocessors idle, so a deeper batch pays fewer rounds of load and
+/// block sum (the same bits: each route's sum is its own, the routes added
+/// in order). 0, never, but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.gather_ahead_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeGatherAheadUntil(pub u32);
+
 /// The fewest rows the fused qkv norm, rotation and KV write takes a block a
 /// row (a warp a head below): 64 but where a chip's profile says (B200's,
 /// where 64 decode rows' blocks leave most SMs idle).
@@ -634,6 +661,15 @@ pub struct DecodeXqaWholeWindow(pub u32);
 #[decision(id = "kernel.sdpa.decode.xqa_cluster", constant(set(0, 1, 2, 4, 8)), default = 0, tune = search)]
 pub struct DecodeXqaCluster(pub u32);
 
+/// Whether a 64-wide tensor-core decode over a bf16 pool keeps three key
+/// tiles in flight a warp rather than two, its key rows swizzled rather than
+/// padded so four blocks still share an SM: a decode's two or three tiles a
+/// warp load at once, one memory latency rather than two. The same products,
+/// so the same bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.xqa_deep_64", flag, default = false, tune = search)]
+pub struct DecodeXqaDeep64;
+
 /// Whether a split attention's partial states fold a warp a (row, head)
 /// rather than through the staged persistent merge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -700,6 +736,9 @@ pub fn register(registry: &mut Registry) {
         .add::<AttnResFusedNorm>()
         .add::<SsmKdaChunked>()
         .add::<MoeW4a4FusedLayout>()
+        .add::<MoeEvenWavesFrom>()
+        .add::<MoeRoutesSized>()
+        .add::<MoeGatherAheadUntil>()
         .add::<AttnQkvRowsFrom>()
         .add::<SsmKdaStepFused>()
         .add::<GemmSplitLaunchNs>()
@@ -719,6 +758,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeXqaFrom64>()
         .add::<DecodeXqaWholeWindow>()
         .add::<DecodeXqaCluster>()
+        .add::<DecodeXqaDeep64>()
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<SdpaIndexTc5>()
@@ -821,6 +861,9 @@ tuning! {
     attn_res_fused_norm: bool = false, on AttnResFusedNorm;
     ssm_kda_chunked: bool = false, on SsmKdaChunked;
     moe_w4a4_fused_layout: bool = false, on MoeW4a4FusedLayout;
+    moe_even_waves_from: u32 = 0, get MoeEvenWavesFrom;
+    moe_routes_sized: bool = false, on MoeRoutesSized;
+    moe_gather_ahead_until: u32 = 0, get MoeGatherAheadUntil;
     qkv_rows_from: u32 = 64, get AttnQkvRowsFrom;
     ssm_kda_step_fused: bool = false, on SsmKdaStepFused;
     gemm_split_launch_ns: u32 = 0, get GemmSplitLaunchNs;
@@ -840,6 +883,7 @@ tuning! {
     decode_xqa_from_64: u32 = 0, get DecodeXqaFrom64;
     decode_xqa_whole_window: u32 = 0, get DecodeXqaWholeWindow;
     decode_xqa_cluster: u32 = 0, get DecodeXqaCluster;
+    decode_xqa_deep_64: bool = false, on DecodeXqaDeep64;
     selected_mma: bool = false, on SdpaSelectedMma;
     index_mma: bool = false, on SdpaIndexMma;
     index_tc5: bool = false, on SdpaIndexTc5;

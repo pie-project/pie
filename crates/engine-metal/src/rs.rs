@@ -68,15 +68,15 @@ pub fn snapshots(trace: &Trace) -> u32 {
             return true;
         }
         any = true;
-        match &node.op {
+        matches!(
+            &node.op,
             Operation::Attention(
                 Attention::SsmCausalConv1d { .. }
-                | Attention::SsmCausalConv1dChunked { .. }
-                | Attention::SsmGatedDelta { .. }
-                | Attention::SsmGatedDeltaChunked { .. },
-            ) => true,
-            _ => false,
-        }
+                    | Attention::SsmCausalConv1dChunked { .. }
+                    | Attention::SsmGatedDelta { .. }
+                    | Attention::SsmGatedDeltaChunked { .. },
+            )
+        )
     });
     if lands && any {
         kernels_metal::attn::ssm::RS_SNAPSHOTS

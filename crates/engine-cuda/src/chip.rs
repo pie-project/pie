@@ -525,6 +525,7 @@ mod tests {
                     "{gpu}"
                 );
                 assert_eq!(tuning.decode_xqa_cluster, if b200 { 8 } else { 0 }, "{gpu}");
+                assert_eq!(tuning.decode_xqa_deep_64, b200, "{gpu}");
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
@@ -546,6 +547,10 @@ mod tests {
                         decode_grouped_prefill_from: 0,
                         gemm_bias_epilogue: false,
                         moe_w4a4_fused_from: 65_536,
+                        moe_w4a4_fused_layout: defaults.moe_w4a4_fused_layout,
+                        moe_even_waves_from: defaults.moe_even_waves_from,
+                        moe_routes_sized: defaults.moe_routes_sized,
+                        moe_gather_ahead_until: defaults.moe_gather_ahead_until,
                         moe_w4a8_fused_from: 65_536,
                         mla_expanded_from: 65_536,
                         gemm_fp8_gemv_until: 0,
@@ -565,6 +570,7 @@ mod tests {
                         decode_xqa_from_64: 0,
                         decode_xqa_whole_window: 0,
                         decode_xqa_cluster: 0,
+                        decode_xqa_deep_64: false,
                         pool_mma: false,
                         dsv4_prefill_from: 0,
                         index_radix: false,
@@ -788,6 +794,8 @@ mod tests {
         );
         assert_eq!((b200.nvfp4_mma_from, b200.nvfp4_mma_until), (32, 8192));
         assert_eq!(b200.moe_w4a4_fused_from, 1);
+        assert_eq!((b200.moe_even_waves_from, b200.moe_routes_sized), (3, true));
+        assert_eq!(b200.moe_gather_ahead_until, 128);
         assert_eq!(b200.moe_w4a8_fused_from, 512);
         assert_eq!(b200.mla_expanded_from, 256);
         assert_eq!(b200.gemm_fp8_gemv_until, 4);

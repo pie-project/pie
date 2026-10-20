@@ -70,6 +70,10 @@ sdpa.decode.xqa = true
 sdpa.decode.xqa_from_64 = 16
 sdpa.decode.xqa_whole_window = 128
 sdpa.decode.xqa_cluster = 8
+# 64-wide heads three key tiles deep a warp, rows swizzled, four blocks an SM:
+# Muse Spark's bs64 decode attention 328 -> 288 us a step, gpt-oss-120b's
+# 7-8 us a step at bs1/8/64 (bs8 Muse even).
+sdpa.decode.xqa_deep_64 = true
 # A dense bias from the cuBLASLt epilogue.
 gemm.bias_epilogue = true
 # Routed MLPs kept by expert with the GLU in the gate-up epilogue: W4A4
@@ -77,6 +81,15 @@ gemm.bias_epilogue = true
 moe.w4a4_fused_from = 1
 # A narrow W4A4 fire lays its routes out and quantizes them in one launch.
 moe.w4a4_fused_layout = true
+# A decode's routed units dealt evenly over the fewest CTAs that keep their
+# waves, from three waves (two waves' short units hide their latency on the
+# SMs it would retire); the routing held for the bank's experts alone, the
+# room to the ring.
+moe.even_waves_from = 3
+moe.routes_sized = true
+# A decode's normed routed gather (Muse Spark's) with eight routes in flight a
+# round up to 128 tokens; past them its one block a multiprocessor costs waves.
+moe.gather_ahead_until = 128
 moe.w4a8_fused_from = 512
 # The fused qkv write a warp a head below 256 rows.
 attn.qkv_rows_from = 256

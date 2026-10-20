@@ -417,7 +417,10 @@ impl<'c> Run<'c> {
         }
         let tile = chain.sums_tile?;
         let scratch = self.routed_scratch()?;
-        self.chain.set(Some(Chain { sums: true, ..chain }));
+        self.chain.set(Some(Chain {
+            sums: true,
+            ..chain
+        }));
         Some((scratch.sums, tile))
     }
 

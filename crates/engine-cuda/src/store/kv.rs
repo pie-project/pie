@@ -28,6 +28,10 @@ pub fn width_of(trace: &Trace, value: ValueId) -> Result<u64> {
 pub struct ScheduleFacts {
     pub kind: StructKind,
     pub reading: SpaceFacts,
+    /// Every fire that reads the plan carries one query row a lane (it is
+    /// read only for decoding classes, as a grouped decode through the
+    /// prefill kernel is): its rows are at most its lanes.
+    pub rows_a_lane: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -40,6 +44,16 @@ impl Facts {
     #[must_use]
     pub fn row(&self, at: usize) -> Option<SpaceFacts> {
         self.rows.get(at).copied().flatten()
+    }
+
+    /// Marks the plans `rows_a_lane` names (by value) as read only by fires
+    /// of one query row a lane.
+    pub fn mark_rows_a_lane(&mut self, rows_a_lane: &[bool]) {
+        for (seat, &one) in self.plans.iter_mut().zip(rows_a_lane) {
+            if let Some(seat) = seat {
+                seat.rows_a_lane = one;
+            }
+        }
     }
 }
 
@@ -110,6 +124,7 @@ pub fn probe(trace: &Trace) -> Result<Facts> {
         *seat = Some(ScheduleFacts {
             kind,
             reading: carve.reading,
+            rows_a_lane: false,
         });
     }
 

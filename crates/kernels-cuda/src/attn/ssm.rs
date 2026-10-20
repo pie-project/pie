@@ -777,7 +777,7 @@ const FUSED_STAGE: u32 = 4096 + 512 + 32 + 32;
 /// The fused step's shared memory a block, double-buffered.
 const FUSED_SMEM: u32 = FUSED_WARPS * 2 * FUSED_STAGE;
 
-/// The fused step's blocks one SM seats: three, or fewer where the SM's
+/// The fused step's blocks one SM seats: four, or fewer where the SM's
 /// shared memory (less the 1 KiB the runtime keeps a block) holds fewer.
 fn fused_blocks_per_sm(smem_per_sm: Option<u32>) -> u32 {
     const RESERVED: u32 = 1024;
@@ -2140,10 +2140,10 @@ mod tests {
     /// (228 KiB) or an A100 (164 KiB); two on a 100 KiB SM.
     #[test]
     fn the_fused_step_seats_what_the_sm_holds() {
-        assert_eq!(fused_blocks_per_sm(Some(233_472)), 3);
-        assert_eq!(fused_blocks_per_sm(Some(167_936)), 3);
+        assert_eq!(fused_blocks_per_sm(Some(233_472)), 4);
+        assert_eq!(fused_blocks_per_sm(Some(167_936)), 4);
         assert_eq!(fused_blocks_per_sm(Some(102_400)), 2);
         assert_eq!(fused_blocks_per_sm(Some(16_384)), 1);
-        assert_eq!(fused_blocks_per_sm(None), 3);
+        assert_eq!(fused_blocks_per_sm(None), 4);
     }
 }

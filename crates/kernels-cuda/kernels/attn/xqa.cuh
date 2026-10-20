@@ -111,13 +111,15 @@ __device__ __forceinline__ unsigned pack(float lo, float hi) {
     return bits;
 }
 
-template <int HEAD_DIM, int MT, int WARPS, int STAGES, bool FP8 = false>
+template <int HEAD_DIM, int MT, int WARPS, int STAGES, bool FP8 = false, bool SWZ = false>
 struct Shape {
     // A 16-byte pad a row puts the eight rows one `ldmatrix` reads in eight
-    // bank groups.
+    // bank groups; swizzled, a key row's 16-byte pieces trade places by its
+    // row instead (piece c at c ^ (row % 8)), unpadded.
     static constexpr int LD = HEAD_DIM + 8;
+    static constexpr int KV_LD = SWZ ? HEAD_DIM : LD;
     static constexpr int TILE = 16 * MT;
-    static constexpr int TILE_ELEMS = TILE * LD;
+    static constexpr int TILE_ELEMS = TILE * KV_LD;
     // K and V a stage, STAGES stages a warp; the query rows; P a warp.
     static constexpr int STAGE_ELEMS = 2 * TILE_ELEMS;
     static constexpr int WARP_ELEMS = STAGES * STAGE_ELEMS;
@@ -134,8 +136,8 @@ struct Shape {
     static constexpr int SMEM_BYTES = RAW_OFF + (FP8 ? WARPS * STAGES * RAW_STAGE : 0);
 };
 
-template <int HEAD_DIM, int MT, int WARPS, int STAGES, class S, class KV = bf16>
-__global__ void __launch_bounds__(32 * WARPS) decode(
+template <int HEAD_DIM, int MT, int WARPS, int STAGES, class S, class KV, bool SWZ>
+__device__ __forceinline__ void decode_body(
     const bf16* __restrict__ q,
     const KV* __restrict__ k_data,
     const KV* __restrict__ v_data,
@@ -163,12 +165,16 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
     u32 ranks)
 {
     constexpr bool FP8 = sizeof(KV) == 1;
-    using Sh = Shape<HEAD_DIM, MT, WARPS, STAGES, FP8>;
+    static_assert(!(SWZ && FP8), "an e4m3 pool's tiles widen into padded rows");
+    using Sh = Shape<HEAD_DIM, MT, WARPS, STAGES, FP8, SWZ>;
     constexpr int CHUNKS8 = HEAD_DIM / 16;  // 16-byte pieces an e4m3 row
     constexpr int LD = Sh::LD;
     constexpr int TILE = Sh::TILE;
     constexpr int DT = HEAD_DIM / 16;
     constexpr int CHUNKS = HEAD_DIM / 8;  // 16-byte pieces a row
+    constexpr int KLD = Sh::KV_LD;
+    // Key row r's 16-byte piece c in a K or V tile.
+    auto kv_at = [](int r, int c) { return r * KLD + (SWZ ? (c ^ (r & 7)) : c) * 8; };
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     bf16* staged = reinterpret_cast<bf16*>(smem_raw);
@@ -270,8 +276,8 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
             long long at = __shfl_sync(0xffffffffu, cell, r & 31);
             const bool live = at >= 0;
             at = live ? at + c * 8 : 0;
-            cp16(ks + r * LD + c * 8, k_data + at, live);
-            cp16(vs + r * LD + c * 8, v_data + at, live);
+            cp16(ks + kv_at(r, c), k_data + at, live);
+            cp16(vs + kv_at(r, c), v_data + at, live);
         }
     };
     // An e4m3 stage's raw rows widened into its bf16 tiles (exact).
@@ -341,7 +347,7 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
 #pragma unroll
             for (int kc = 0; kc < DT; ++kc) {
                 unsigned a[4], b0, b1;
-                ldsm4(a, ks + (mt * 16 + (lane & 15)) * LD + kc * 16 + ((lane >> 4) << 3));
+                ldsm4(a, ks + kv_at(mt * 16 + (lane & 15), kc * 2 + (lane >> 4)));
                 ldsm2(b0, b1, qs + (lane & 7) * LD + kc * 16 + (((lane >> 3) & 1) << 3));
                 if (kc & 1) {
                     mma(s2, a, b0, b1);
@@ -404,8 +410,7 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
                 unsigned a[4];
                 // V^T as the A operand: V's rows are keys (k), its columns
                 // the value dims (m).
-                ldsm4_t(a, vs + (mt * 16 + (lane & 7) + ((lane >> 4) << 3)) * LD + d * 16 +
-                                (((lane >> 3) & 1) << 3));
+                ldsm4_t(a, vs + kv_at(mt * 16 + (lane & 7) + ((lane >> 4) << 3), d * 2 + ((lane >> 3) & 1)));
                 mma(o_acc[d], a, b0, b1);
             }
         }
@@ -559,6 +564,76 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
     }
     // No block leaves while another may still read its shared memory.
     sync_cluster();
+}
+
+template <int HEAD_DIM, int MT, int WARPS, int STAGES, class S, class KV = bf16>
+__global__ void __launch_bounds__(32 * WARPS) decode(
+    const bf16* __restrict__ q,
+    const KV* __restrict__ k_data,
+    const KV* __restrict__ v_data,
+    const i32* __restrict__ page_indices,
+    const i32* __restrict__ page_indptr,
+    const i32* __restrict__ last_page_len,
+    u32 page_size,
+    u32 stride_page,
+    u32 stride_n,
+    u32 stride_h,
+    const i32* __restrict__ q_indptr,
+    u32 q_stride_n,
+    const i32* __restrict__ request_indices,
+    const i32* __restrict__ kv_tile_indices,
+    const i32* __restrict__ kv_chunk_size_ptr,
+    const bool* __restrict__ block_valid_mask,
+    bool partition_kv,
+    u32 num_qo_heads,
+    u32 group,
+    i32 window_left,
+    float sm_scale,
+    bf16* __restrict__ o,
+    float* __restrict__ lse,
+    const S* __restrict__ sinks,
+    u32 ranks)
+{
+    decode_body<HEAD_DIM, MT, WARPS, STAGES, S, KV, false>(
+        q, k_data, v_data, page_indices, page_indptr, last_page_len, page_size, stride_page, stride_n,
+        stride_h, q_indptr, q_stride_n, request_indices, kv_tile_indices, kv_chunk_size_ptr,
+        block_valid_mask, partition_kv, num_qo_heads, group, window_left, sm_scale, o, lse, sinks, ranks);
+}
+
+// The swizzled stamp over a bf16 pool, `MIN_CTAS` blocks an SM (as many as
+// its shared memory lets share one): its registers held to them.
+template <int HEAD_DIM, int MT, int WARPS, int STAGES, int MIN_CTAS, class S>
+__global__ void __launch_bounds__(32 * WARPS, MIN_CTAS) decode_deep(
+    const bf16* __restrict__ q,
+    const bf16* __restrict__ k_data,
+    const bf16* __restrict__ v_data,
+    const i32* __restrict__ page_indices,
+    const i32* __restrict__ page_indptr,
+    const i32* __restrict__ last_page_len,
+    u32 page_size,
+    u32 stride_page,
+    u32 stride_n,
+    u32 stride_h,
+    const i32* __restrict__ q_indptr,
+    u32 q_stride_n,
+    const i32* __restrict__ request_indices,
+    const i32* __restrict__ kv_tile_indices,
+    const i32* __restrict__ kv_chunk_size_ptr,
+    const bool* __restrict__ block_valid_mask,
+    bool partition_kv,
+    u32 num_qo_heads,
+    u32 group,
+    i32 window_left,
+    float sm_scale,
+    bf16* __restrict__ o,
+    float* __restrict__ lse,
+    const S* __restrict__ sinks,
+    u32 ranks)
+{
+    decode_body<HEAD_DIM, MT, WARPS, STAGES, S, bf16, true>(
+        q, k_data, v_data, page_indices, page_indptr, last_page_len, page_size, stride_page, stride_n,
+        stride_h, q_indptr, q_stride_n, request_indices, kv_tile_indices, kv_chunk_size_ptr,
+        block_valid_mask, partition_kv, num_qo_heads, group, window_left, sm_scale, o, lse, sinks, ranks);
 }
 
 }

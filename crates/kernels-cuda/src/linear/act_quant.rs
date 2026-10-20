@@ -1118,12 +1118,20 @@ pub(crate) fn weighted_gather(
     } else {
         ((n / 8).div_ceil(BLOCK), BLOCK)
     };
+    // A normed fire of `kernel.moe.gather_ahead_until` tokens or fewer has
+    // eight routes in flight a round (its blocks too few to fill the
+    // multiprocessors), else two.
+    let ahead = if tokens <= ctx.tuning().moe_gather_ahead_until {
+        8
+    } else {
+        2
+    };
     ctx.fire(
         op,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::linear::route_weighted_gather_vec8<{}>",
+                "::pie::linear::route_weighted_gather_vec8<{}, {ahead}>",
                 scale != 0
             )),
         )

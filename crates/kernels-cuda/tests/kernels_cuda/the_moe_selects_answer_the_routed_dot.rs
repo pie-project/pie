@@ -45,7 +45,8 @@ fn bank(codes: u64, atoms: u64, [e, n, k]: [usize; 3], alpha: Option<[u64; 3]>) 
 type Case = (K, Tuning, [usize; 5], bool, Option<Glu>, u8);
 
 fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
-    let what = format!("{kind:?} {ex}x{tokens}x{top} {by_token} {n}x{k} {f:?} {flags}");
+    let even = tuning.moe_even_waves_from > 0;
+    let what = format!("{kind:?} {ex}x{tokens}x{top} {by_token} {n}x{k} {f:?} {flags} even {even}");
     let mut b = Bench::new(0x5e1 ^ (tokens * 7 + n) as u64);
     let (count, quant) = (tokens * top, matches!(kind, K::A8 | K::A4));
     let mut routes = tab(count, |r| ((r / top * 3 + r % top * 5) % ex) as i32);
@@ -265,6 +266,26 @@ fn the_routed_selects_answer_the_routed_dot() {
     }
     // The tcgen05 arms are Blackwell's; elsewhere their cases have no arm.
     cases.retain(|case| supported() || !(case.1 == TC5 || case.1 == SM100));
+    // Each tcgen05 case again with a swapped launch's units dealt evenly.
+    let even = cases
+        .iter()
+        .filter(|case| case.1.moe_tc5)
+        .map(|&(k, t, s, by, f, fl)| {
+            (
+                k,
+                Tuning {
+                    moe_even_waves_from: 1,
+                    moe_routes_sized: true,
+                    ..t
+                },
+                s,
+                by,
+                f,
+                fl,
+            )
+        });
+    let even: Vec<Case> = even.collect();
+    cases.extend(even);
     cases.into_iter().for_each(routed);
 }
 
@@ -343,40 +364,64 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         let (up, uw) = mlp_bank(&mut b, a, [ex, up_rows, hidden]);
         let (down, dw) = mlp_bank(&mut b, a, [ex, hidden, inter]);
         let (x, it) = (t(x, tokens, hidden, Bf16), inter as u32);
-        let mut y = b.out(tokens, hidden);
         let r = t(b.up(&routes), tokens, top, I32);
         let wt = t(b.up(&weights), tokens, top, F32);
-        let ctx = b.ctx().with_tuning(pick(a < 4, TC5, W4A8));
-        if let Some((live, first)) = window {
-            ctx.arm_stage(b.up(&[live, first]));
-        }
         let (st, gt) = (t(sh, tokens, hidden, Bf16), t(gates, tokens, 1, Bf16));
-        let m = moe::RoutedMlp {
-            x,
-            up,
-            glu: g,
-            down,
-            routes: r,
-            weights: wt,
-            inter: it,
-        };
-        #[rustfmt::skip]
-        let took = match gate {
-            Some(true) => moe::experts_weighted_first(&ctx, m, st, &mut y),
-            _ => moe::experts(&ctx, m, &mut y, RES, RES, gate.map(|_| (st, gt)), norm),
-        };
-        assert!(took.expect("fires"), "{what}: the grouped GEMM takes it");
         let upv = |e: usize, o: usize, i: usize| f64::from(uw[(e * up_rows + o) * hidden + i]);
         let downv = |e: usize, o: usize, c: usize| f64::from(dw[(e * hidden + o) * inter + c]);
         let shared = gate.map(|f| (&sv[..], (!f).then_some(&gv[..])));
         let first = gate == Some(true);
         #[rustfmt::skip]
         let want = mlp(&xv, (&routes, &weights), [hidden, inter, top], upv, downv, g, first, shared, normed.then_some(&scv[..]));
-        let (lo, hi) = window.map_or((0, tokens), |(l, f)| (f as usize, (f + l) as usize));
-        let (got, span) = (b.read(y.ptr, tokens * hidden), lo * hidden..hi * hidden);
-        // Quantized rows answer to their codes' rounding on both legs.
-        let far = distance(&got[span.clone()], &want[span]);
-        assert!(far < tol, "{what}: {far:.4} from the host's product");
+        // Every fire with its swapped units dealt evenly and not (its routing
+        // sized and a normed gather's eight routes in flight with them).
+        // The product dealt as before, which dealing its units evenly lands
+        // bit for bit.
+        let mut dealt: Option<Vec<f64>> = None;
+        for even in [false, true] {
+            let what = format!("{what}, even waves {even}");
+            let mut y = b.out(tokens, hidden);
+            let base = pick(a < 4, TC5, W4A8);
+            let ctx = b.ctx().with_tuning(Tuning {
+                moe_even_waves_from: u32::from(even),
+                moe_routes_sized: even,
+                moe_gather_ahead_until: if even { 65_536 } else { 0 },
+                ..base
+            });
+            if let Some((live, first)) = window {
+                ctx.arm_stage(b.up(&[live, first]));
+            }
+            let m = moe::RoutedMlp {
+                x,
+                up,
+                glu: g,
+                down,
+                routes: r,
+                weights: wt,
+                inter: it,
+            };
+            #[rustfmt::skip]
+            let took = match gate {
+                Some(true) => moe::experts_weighted_first(&ctx, m, st, &mut y),
+                _ => moe::experts(&ctx, m, &mut y, RES, RES, gate.map(|_| (st, gt)), norm),
+            };
+            assert!(took.expect("fires"), "{what}: the grouped GEMM takes it");
+            let (lo, hi) = window.map_or((0, tokens), |(l, f)| (f as usize, (f + l) as usize));
+            let (got, span) = (b.read(y.ptr, tokens * hidden), lo * hidden..hi * hidden);
+            // Quantized rows answer to their codes' rounding on both legs.
+            let far = distance(&got[span.clone()], &want[span]);
+            assert!(far < tol, "{what}: {far:.4} from the host's product");
+            if even {
+                let before = dealt.as_ref().expect("an uneven arm");
+                let same = got
+                    .iter()
+                    .zip(before)
+                    .all(|(g, b)| g.to_bits() == b.to_bits());
+                assert!(same, "{what}: not the bits the uneven deal lands");
+            } else {
+                dealt = Some(got);
+            }
+        }
     }
 }
 
@@ -411,4 +456,3 @@ fn the_w8a16_selects_answer_the_routed_dot() {
         b.check(y.ptr, &want, TOL, &what);
     }
 }
-
