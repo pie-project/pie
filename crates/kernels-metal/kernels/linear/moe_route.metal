@@ -588,6 +588,46 @@ constant constexpr uint kMaxExperts = 1024;
 
 
 
+// `route_gather` that also lands each copied row's 64-wide group sums where the MPP routed
+// matmul reads them (`qmm_mpp_input_sums`' layout over `tile_rows`-row tiles), so the stack
+// is read once rather than again by a sums pass. A threadgroup takes one stack row; eight
+// lanes take a 64-wide group, eight inputs each. A padding row is left as it is, sums too.
+[[kernel]] void route_gather_sums(
+    const device bfloat* x     [[buffer(0)]],
+    device bfloat* out         [[buffer(1)]],
+    const device int* perm     [[buffer(2)]],
+    device float* sums         [[buffer(3)]],
+    const constant uint& experts_per_token [[buffer(4)]],
+    const constant uint& width             [[buffer(5)]],
+    const constant uint& tile_rows         [[buffer(6)]],
+    const constant uint& x_pitch           [[buffer(7)]],
+    uint2 tg                   [[threadgroup_position_in_grid]],
+    uint2 lid2                 [[thread_position_in_threadgroup]],
+    uint2 threads2             [[threads_per_threadgroup]]) {
+    const uint lid = lid2.x, threads = threads2.x;
+    const uint row = tg.y;
+    const int sel = perm[row];
+    if (sel < 0) return;
+    const uint k = experts_per_token < 1u ? 1u : experts_per_token;
+    const uint pitch = x_pitch != 0u ? x_pitch : width;
+    const device bfloat* src = x + ulong(uint(sel) / k) * pitch;
+    device bfloat* dst = out + ulong(row) * width;
+    const uint groups = width / 64u;
+    const ulong tile_base = ulong(row / tile_rows) * tile_rows * groups + row % tile_rows;
+    for (uint at = lid * 8u; at < width; at += threads * 8u) {
+        const bfloat4 a = *reinterpret_cast<const device bfloat4*>(src + at);
+        const bfloat4 b = *reinterpret_cast<const device bfloat4*>(src + at + 4u);
+        *reinterpret_cast<device bfloat4*>(dst + at) = a;
+        *reinterpret_cast<device bfloat4*>(dst + at + 4u) = b;
+        const float4 fa = float4(a), fb = float4(b);
+        float sum = (fa.x + fa.y) + (fa.z + fa.w) + (fb.x + fb.y) + (fb.z + fb.w);
+        sum += simd_shuffle_xor(sum, ushort(1));
+        sum += simd_shuffle_xor(sum, ushort(2));
+        sum += simd_shuffle_xor(sum, ushort(4));
+        if (lid % 8u == 0u) sums[tile_base + ulong(at / 64u) * tile_rows] = sum;
+    }
+}
+
 [[kernel]] void route_scatter(
     const device bfloat* sorted [[buffer(0)]],
     device bfloat* out         [[buffer(1)]],

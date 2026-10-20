@@ -116,6 +116,36 @@ pub fn geglu_tanh_sorted(
     )
 }
 
+/// [`geglu_tanh_sorted`] that also lands each row's 64-wide group sums in `sums` over
+/// `tile`-row tiles, as the MPP routed matmul that reads the rows next folds them.
+#[allow(clippy::too_many_arguments)]
+pub fn geglu_tanh_sorted_sums(
+    ctx: &Ctx<'_>,
+    packed: Tensor,
+    intermediate: u32,
+    perm: Tensor,
+    y: Tensor,
+    sums: Tensor,
+    tile: u32,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mlp_geglu_tanh_packed";
+    dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
+    let cut = halves(OP, packed, intermediate, y)?;
+    debug_assert!(intermediate.is_multiple_of(64), "whole 64-wide groups");
+    ctx.fire(
+        Fire::at("linear/mlp_packed.metal", "packed_geglu_tanh_sorted_sums")
+            .apply(Grid::of([256, y.rows, 1], [256, 1, 1])),
+        &[
+            cut.packed.arg(),
+            cut.y.arg_mut(),
+            cut.intermediate.arg(),
+            perm.arg(),
+            sums.arg_mut(),
+            tile.arg(),
+        ],
+    )
+}
+
 pub fn swiglu_clamp(
     ctx: &Ctx<'_>,
     packed: Tensor,
