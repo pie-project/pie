@@ -189,6 +189,10 @@ pub(crate) struct Chain {
     hidden: ValueId,
     routed: ValueId,
     padded: u32,
+    /// The row tile the down's MPP kernel reads its input sums at, when it takes it.
+    sums_tile: Option<u32>,
+    /// The activation landed the down's input sums at `sums_tile`.
+    sums: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +297,7 @@ impl<'c> Run<'c> {
             return Sorted {
                 input: true,
                 output: true,
+                sums: chain.sums,
             };
         }
         self.chain.set(None);
@@ -343,6 +348,16 @@ impl<'c> Run<'c> {
         if stack(*hidden, *down_bank, *routed) != Some((padded, tile)) {
             return Sorted::default();
         }
+        let sums_tile = self.routed_scratch().and_then(|scratch| {
+            kernels_metal::linear::moe::mpp_sums_tile(
+                self.tensor(*hidden),
+                self.planes(*down_bank),
+                self.tensor(*routed),
+                self.experts(routes),
+                scratch.sums,
+                self.tuning,
+            )
+        });
         self.chain.set(Some(Chain {
             step: ChainStep::GateUp,
             routes,
@@ -350,10 +365,13 @@ impl<'c> Run<'c> {
             hidden: *hidden,
             routed: *routed,
             padded,
+            sums_tile,
+            sums: false,
         }));
         Sorted {
             input: false,
             output: true,
+            sums: false,
         }
     }
 
@@ -380,6 +398,20 @@ impl<'c> Run<'c> {
             Tensor::new(scratch.x.buf, chain.padded, inter, poem_ir::Dtype::Bf16),
             scratch.perm,
         ))
+    }
+
+    /// Where the chain's activation lands the down's input sums and at which
+    /// row tile, when the down's MPP kernel reads them; the down then skips its
+    /// sums pass. Only an activation that writes them asks.
+    pub(crate) fn chain_sums(&self) -> Option<(Tensor, u32)> {
+        let chain = self.chain.get()?;
+        if chain.step != ChainStep::Swiglu {
+            return None;
+        }
+        let tile = chain.sums_tile?;
+        let scratch = self.routed_scratch()?;
+        self.chain.set(Some(Chain { sums: true, ..chain }));
+        Some((scratch.sums, tile))
     }
 
     /// The sorted down rows, the route-to-row map and the fan-out, when

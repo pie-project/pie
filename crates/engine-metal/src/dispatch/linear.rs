@@ -399,13 +399,24 @@ impl Run<'_> {
                 intermediate,
                 y,
             } => match self.chain_swiglu(*packed, *y) {
-                Some((sorted_packed, sorted_h, perm)) => linear::mlp::geglu_tanh_sorted(
-                    self.ctx(),
-                    sorted_packed,
-                    *intermediate,
-                    perm,
-                    sorted_h,
-                ),
+                Some((sorted_packed, sorted_h, perm)) => match self.chain_sums() {
+                    Some((sums, tile)) => linear::mlp::geglu_tanh_sorted_sums(
+                        self.ctx(),
+                        sorted_packed,
+                        *intermediate,
+                        perm,
+                        sorted_h,
+                        sums,
+                        tile,
+                    ),
+                    None => linear::mlp::geglu_tanh_sorted(
+                        self.ctx(),
+                        sorted_packed,
+                        *intermediate,
+                        perm,
+                        sorted_h,
+                    ),
+                },
                 None => linear::mlp::geglu_tanh_packed(
                     self.ctx(),
                     self.tensor(*packed),

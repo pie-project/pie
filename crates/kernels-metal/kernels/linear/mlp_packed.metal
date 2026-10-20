@@ -159,6 +159,46 @@ instantiate_packed_geglu_tanh(bfloat16, bfloat)
   out[row + i] = static_cast<bfloat>(gelu * u);
 }
 
+// packed_geglu_tanh_sorted, a threadgroup to a row and eight outputs to a lane, landing the
+// row's 64-wide group sums (of the bfloat outputs) as `qmm_mpp_input_sums` lays them over
+// `tile_rows`-row tiles, for the MPP routed matmul that reads the rows next.
+[[kernel]] void packed_geglu_tanh_sorted_sums(
+    const device bfloat* packed [[buffer(0)]],
+    device bfloat* out          [[buffer(1)]],
+    const constant uint& intermediate [[buffer(2)]],
+    const device int* perm      [[buffer(3)]],
+    device float* sums          [[buffer(4)]],
+    const constant uint& tile_rows    [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint2 lid2 [[thread_position_in_threadgroup]],
+    uint2 threads2 [[threads_per_threadgroup]]) {
+  const uint row = tg.y, lid = lid2.x, threads = threads2.x;
+  if (perm[row] < 0) return;
+  constexpr float k = 0.7978845608028654f;
+  const device bfloat* gate = packed + ulong(row) * intermediate * 2;
+  const device bfloat* up = gate + intermediate;
+  device bfloat* dst = out + ulong(row) * intermediate;
+  const uint groups = intermediate / 64u;
+  const ulong tile_base = ulong(row / tile_rows) * tile_rows * groups + row % tile_rows;
+  for (uint at = lid * 8u; at < intermediate; at += threads * 8u) {
+    float sum = 0.0f;
+    bfloat h[8];
+    for (uint j = 0; j < 8u; ++j) {
+      const float g = float(gate[at + j]);
+      const float u = float(up[at + j]);
+      const float inner = k * (g + 0.044715f * g * g * g);
+      h[j] = static_cast<bfloat>(0.5f * g * (1.0f + precise::tanh(inner)) * u);
+      sum += float(h[j]);
+    }
+    *reinterpret_cast<device bfloat4*>(dst + at) = bfloat4(h[0], h[1], h[2], h[3]);
+    *reinterpret_cast<device bfloat4*>(dst + at + 4u) = bfloat4(h[4], h[5], h[6], h[7]);
+    sum += simd_shuffle_xor(sum, ushort(1));
+    sum += simd_shuffle_xor(sum, ushort(2));
+    sum += simd_shuffle_xor(sum, ushort(4));
+    if (lid % 8u == 0u) sums[tile_base + ulong(at / 64u) * tile_rows] = sum;
+  }
+}
+
 template <typename T>
 [[kernel]] void packed_situ(
     const device T* packed [[buffer(0)]],

@@ -773,6 +773,39 @@ pub struct Sorted {
     pub input: bool,
     /// Leave the output's rows sorted in `scratch.y`; `y` is not written.
     pub output: bool,
+    /// `scratch.sums` already holds the sorted input's group sums at the MPP row tile
+    /// [`mpp_sums_tile`] names: the activation that wrote the rows landed them.
+    pub sums: bool,
+}
+
+/// The row tile whose 64-wide group sums the batched routed matmul of `x` over `bank` into
+/// `y` reads from `scratch.sums`, when it takes the MPP kernel: what a pass writing its
+/// input rows lands them at to spare the matmul its sums pass.
+#[must_use]
+pub fn mpp_sums_tile(
+    x: Tensor,
+    bank: Bank,
+    y: Tensor,
+    experts: u32,
+    sums: Tensor,
+    tuning: &crate::Tuning,
+) -> Option<u32> {
+    let mut tile = tile_rows(y.rows, experts, tuning);
+    if tile <= 1 || tile_cols(y.width).is_none() || !x.width.is_multiple_of(QMM_BK) {
+        return None;
+    }
+    let fp16 = tuning.fp16_gemm_format(bank.bits, bank.group);
+    if tile == MOE_TILE_ROWS[0] && !(fp16 && bank.affine() && bank.bits == 4 && bank.group == 64) {
+        tile = MOE_TILE_ROWS[1];
+    }
+    let tile = bank_tile(x, bank, y, tile, tuning);
+    let padded = stack_rows(y.rows, experts, tile);
+    let sums_fit = sums.dtype == Dtype::F32
+        && u64::from(sums.rows) * u64::from(sums.width)
+            >= u64::from(padded) * u64::from(x.width / 64);
+    mpp_point(x, bank, false, y, tile, tuning)
+        .filter(|_| sums_fit && x.width.is_multiple_of(64))
+        .map(|(m, _, _)| m)
 }
 
 /// The rows a batched routed matmul of `x` over `bank` into `y` sorts its routes into, and
@@ -870,11 +903,30 @@ pub fn matmul_select_batched(
         0u32.arg(),
     ];
     let lanes = router_lanes(op, experts)?;
+    // The MPP kernel's group sums ride the gather, which has the rows in hand.
+    let gathered_sums = !sorted.input && mpp.is_some() && x.width.is_multiple_of(64);
     if !sorted.input {
         ctx.fire(
             Fire::at(ROUTE_FILE, "route_sort").apply(Grid::of([lanes, 1, 1], [lanes, 1, 1])),
             &sort,
         )?;
+    }
+    if let (true, Some((m, _, _))) = (gathered_sums, mpp) {
+        ctx.fire(
+            Fire::at(ROUTE_FILE, "route_gather_sums")
+                .apply(Grid::of([256, padded, 1], [256, 1, 1])),
+            &[
+                x.arg(),
+                scratch.x.arg_mut(),
+                scratch.perm.arg(),
+                scratch.sums.arg_mut(),
+                gather_fan.arg(),
+                x.width.arg(),
+                m.arg(),
+                0u32.arg(),
+            ],
+        )?;
+    } else if !sorted.input {
         ctx.fire(
             Fire::at(ROUTE_FILE, "route_gather").apply(route_rows(op, x.width, padded)?),
             &[
@@ -925,11 +977,19 @@ pub fn matmul_select_batched(
     } else if let Some((m, n, simdgroups)) = mpp {
         const FILE: &str = "linear/quant_qmm_mpp.metal";
         let k = stated(op, x.width)?;
-        ctx.fire(
-            Fire::at(FILE, "qmm_mpp_input_sums")
-                .apply(Grid::of([32 * (x.width / 64), padded, 1], [32, 4, 1])),
-            &[scratch.x.arg(), scratch.sums.arg_mut(), k.arg(), m.arg()],
-        )?;
+        debug_assert!(
+            !sorted.sums
+                || (bias.is_none()
+                    && mpp_sums_tile(x, bank, y, experts, scratch.sums, tuning) == Some(m)),
+            "`{op}`'s input sums were landed at the tile its MPP kernel reads"
+        );
+        if !gathered_sums && !sorted.sums {
+            ctx.fire(
+                Fire::at(FILE, "qmm_mpp_input_sums")
+                    .apply(Grid::of([32 * (x.width / 64), padded, 1], [32, 4, 1])),
+                &[scratch.x.arg(), scratch.sums.arg_mut(), k.arg(), m.arg()],
+            )?;
+        }
         let entry = crate::linear::quant::symbol(&format!(
             "affine_qmm_mpp_routed_m{m}_n{n}_s{simdgroups}_t{tile}"
         ));
