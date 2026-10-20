@@ -267,7 +267,7 @@ impl<'c> Run<'c> {
     }
 
     /// How a batched routed matmul of `x` over `routes` into `y` stands in a
-    /// sorted chain: a gate-up whose output only a swiglu reads, whose output
+    /// sorted chain: a gate-up whose output only a gated activation reads, whose output
     /// only a down over the same routes reads, whose output only a fold
     /// reads, starts one; that down continues it. Anything else runs as it
     /// always has.
@@ -296,11 +296,19 @@ impl<'c> Run<'c> {
             };
         }
         self.chain.set(None);
-        let Some(Operation::Linear(Linear::MlpSwiglu {
-            packed, y: hidden, ..
-        })) = self.sole_reader(y).map(|n| &n.op)
-        else {
-            return Sorted::default();
+        let (packed, hidden) = match self.sole_reader(y).map(|n| &n.op) {
+            Some(Operation::Linear(
+                Linear::MlpSwiglu {
+                    packed, y: hidden, ..
+                }
+                | Linear::MlpSwigluClampAlpha {
+                    packed, y: hidden, ..
+                }
+                | Linear::MlpGegluTanhPacked {
+                    packed, y: hidden, ..
+                },
+            )) => (packed, hidden),
+            _ => return Sorted::default(),
         };
         let Some(Operation::Linear(Linear::MoeMatmulSelectQuant {
             x: down_x,

@@ -350,14 +350,25 @@ impl Run<'_> {
                 limit,
                 alpha,
                 y,
-            } => linear::mlp::swiglu_clamp_alpha(
-                self.ctx(),
-                self.tensor(*packed),
-                *intermediate,
-                *limit,
-                *alpha,
-                self.tensor(*y),
-            ),
+            } => match self.chain_swiglu(*packed, *y) {
+                Some((sorted_packed, sorted_h, perm)) => linear::mlp::swiglu_clamp_alpha_sorted(
+                    self.ctx(),
+                    sorted_packed,
+                    *intermediate,
+                    *limit,
+                    *alpha,
+                    perm,
+                    sorted_h,
+                ),
+                None => linear::mlp::swiglu_clamp_alpha(
+                    self.ctx(),
+                    self.tensor(*packed),
+                    *intermediate,
+                    *limit,
+                    *alpha,
+                    self.tensor(*y),
+                ),
+            },
             Linear::MlpSwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
                 self.ctx(),
                 self.tensor(*gate),
@@ -387,12 +398,21 @@ impl Run<'_> {
                 packed,
                 intermediate,
                 y,
-            } => linear::mlp::geglu_tanh_packed(
-                self.ctx(),
-                self.tensor(*packed),
-                *intermediate,
-                self.tensor(*y),
-            ),
+            } => match self.chain_swiglu(*packed, *y) {
+                Some((sorted_packed, sorted_h, perm)) => linear::mlp::geglu_tanh_sorted(
+                    self.ctx(),
+                    sorted_packed,
+                    *intermediate,
+                    perm,
+                    sorted_h,
+                ),
+                None => linear::mlp::geglu_tanh_packed(
+                    self.ctx(),
+                    self.tensor(*packed),
+                    *intermediate,
+                    self.tensor(*y),
+                ),
+            },
             Linear::MlpSitu {
                 packed,
                 intermediate,
@@ -566,8 +586,9 @@ impl Run<'_> {
                 y,
             } => {
                 const OP: &str = "linear.moe_matmul_select_bias";
-                if let Some(scratch) = self.routed_scratch()
-                    && linear::moe::matmul_select_batched(
+                if let Some(scratch) = self.routed_scratch() {
+                    let sorted = self.chain_select(*x, *bank, *routes, *y);
+                    if linear::moe::matmul_select_batched(
                         self.ctx(),
                         OP,
                         self.tensor(*x),
@@ -578,10 +599,15 @@ impl Run<'_> {
                         scratch,
                         self.tensor(*y),
                         self.tuning(),
-                        linear::moe::Sorted::default(),
-                    )?
-                {
-                    return Ok(());
+                        sorted,
+                    )? {
+                        return Ok(());
+                    }
+                    debug_assert!(
+                        !sorted.input && !sorted.output,
+                        "a chain starts only where the batched matmul runs"
+                    );
+                    self.chain_clear();
                 }
                 linear::moe::matmul_select_bias(
                     self.ctx(),

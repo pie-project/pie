@@ -94,6 +94,27 @@ template <typename T>
 
 instantiate_packed_gptoss_swiglu(bfloat16, bfloat)
 
+// packed_gptoss_swiglu over a routed stack's sorted rows, skipping its padding rows.
+[[kernel]] void packed_gptoss_swiglu_sorted(
+    const device bfloat* packed [[buffer(0)]],
+    device bfloat* out          [[buffer(1)]],
+    const constant uint& intermediate [[buffer(2)]],
+    const constant float& limit       [[buffer(3)]],
+    const constant float& alpha       [[buffer(4)]],
+    const device int* perm      [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  if (perm[gid.y] < 0) return;
+  const uint i = gid.x;
+  const size_t row = size_t(gid.y) * size_t(intermediate);
+  const size_t packed_row = row * 2;
+  float g = float(packed[packed_row + i]);
+  float u = float(packed[packed_row + intermediate + i]);
+  g = min(g, limit);
+  u = clamp(u, -limit, limit);
+  const float sig = 1.0f / (1.0f + fast::exp(-alpha * g));
+  out[row + i] = static_cast<bfloat>((g * sig) * (u + 1.0f));
+}
+
 template <typename T>
 [[kernel]] void packed_geglu_tanh(
     const device T* packed [[buffer(0)]],
@@ -118,6 +139,25 @@ template <typename T>
       const constant uint&, uint2);
 
 instantiate_packed_geglu_tanh(bfloat16, bfloat)
+
+// packed_geglu_tanh over a routed stack's sorted rows, skipping its padding rows.
+[[kernel]] void packed_geglu_tanh_sorted(
+    const device bfloat* packed [[buffer(0)]],
+    device bfloat* out          [[buffer(1)]],
+    const constant uint& intermediate [[buffer(2)]],
+    const device int* perm      [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  if (perm[gid.y] < 0) return;
+  constexpr float k = 0.7978845608028654f;
+  const uint i = gid.x;
+  const size_t row = size_t(gid.y) * size_t(intermediate);
+  const size_t packed_row = row * 2;
+  const float g = float(packed[packed_row + i]);
+  const float u = float(packed[packed_row + intermediate + i]);
+  const float inner = k * (g + 0.044715f * g * g * g);
+  const float gelu = 0.5f * g * (1.0f + precise::tanh(inner));
+  out[row + i] = static_cast<bfloat>(gelu * u);
+}
 
 template <typename T>
 [[kernel]] void packed_situ(
