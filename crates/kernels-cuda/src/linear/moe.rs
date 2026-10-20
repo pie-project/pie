@@ -89,7 +89,7 @@ fn router_extents_upto(
 
 /// A router of at most 512 experts and a top-k of at most 16 a warp a row
 /// (`moe_topk_softmax_lane`): `None` past them.
-fn topk_lane(t: &str, experts: u32, top_k: u32, rows: u32) -> Option<Fire> {
+fn topk_lane(t: &str, experts: u32, top_k: u32, rows: u32, pdl: bool) -> Option<Fire> {
     if experts == 0 || experts > 512 || top_k == 0 || top_k > 16 {
         return None;
     }
@@ -99,7 +99,7 @@ fn topk_lane(t: &str, experts: u32, top_k: u32, rows: u32) -> Option<Fire> {
             FILE,
             symbol(&format!("::pie::linear::moe_topk_softmax_lane<{t}, {per}>")),
         )
-        .apply(Launch::grid([rows.max(1), 1, 1], [32, 1, 1])),
+        .apply(Launch::grid([rows.max(1), 1, 1], [32, 1, 1]).programmatic(pdl)),
     )
 }
 
@@ -115,7 +115,7 @@ pub fn topk_softmax(
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     ranked_planes(OP, logits, top_k, routes, weights);
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
-    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows) {
+    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows, ctx.tuning().pdl) {
         return ctx.fire(
             OP,
             fire,
@@ -173,7 +173,7 @@ pub fn topk_softmax_scaled(
     );
     ranked_planes(OP, logits, top_k, routes, weights);
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
-    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows) {
+    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows, ctx.tuning().pdl) {
         return ctx.fire(
             OP,
             fire,
@@ -2253,10 +2253,13 @@ pub(crate) fn select_gemv(
     let entry = format!("::pie::linear::moe_matmul_select_gemv_{form}<{t}, {ROWS}>");
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&entry)).apply(Launch::grid(
-            [y.width.div_ceil(GEMV_WARPS * ROWS), grid_y, grid_z],
-            [WARP, GEMV_WARPS, 1],
-        )),
+        Fire::at(FILE, symbol(&entry)).apply(
+            Launch::grid(
+                [y.width.div_ceil(GEMV_WARPS * ROWS), grid_y, grid_z],
+                [WARP, GEMV_WARPS, 1],
+            )
+            .programmatic(ctx.tuning().pdl),
+        ),
         &[
             routes.arg(),
             x.arg(),

@@ -1163,6 +1163,10 @@ __global__ __launch_bounds__(BLOCK) void rmsnorm_residual_add_vec8(
     float eps1,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int row = blockIdx.x;
     if (win != nullptr && row >= static_cast<int>(win[0])) return;
     const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
@@ -1351,6 +1355,10 @@ __global__ void silu_scaled(T* __restrict__ x, float s, usize n,
 template <class T>
 __global__ void scale(T* __restrict__ x, const T* __restrict__ s, usize n,
                       int width, const u32* __restrict__ win) {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
 

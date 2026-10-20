@@ -912,7 +912,9 @@ pub fn rmsnorm_residual_add(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entrypoint)).apply(Launch::per_row(rows, block)),
+        // The vec8 form waits on its producer in-kernel (`kernel.pdl`).
+        Fire::at(FILE, symbol(&entrypoint))
+            .apply(Launch::per_row(rows, block).programmatic(ctx.tuning().pdl && vectors)),
         &[
             x.arg(),
             w0.arg(),
@@ -1022,7 +1024,8 @@ pub fn scale(ctx: &Ctx, s: Tensor, x: &mut Tensor) -> Result<(), Error> {
     let (launch, n) = elementwise(OP, *x)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::scale<{t}>"))).apply(launch),
+        Fire::at(FILE, symbol(&format!("::pie::elemwise::scale<{t}>")))
+            .apply(launch.programmatic(ctx.tuning().pdl)),
         &[
             x.arg(),
             s.arg(),

@@ -423,7 +423,7 @@ pub fn geglu_tanh_packed(
     {
         (
             "mlp_geglu_tanh_packed_vec8",
-            elementwise_rows(OP, y.rows, y.width / 8)?,
+            elementwise_rows(OP, y.rows, y.width / 8)?.programmatic(ctx.tuning().pdl),
         )
     } else {
         ("mlp_geglu_tanh_packed", launch)
