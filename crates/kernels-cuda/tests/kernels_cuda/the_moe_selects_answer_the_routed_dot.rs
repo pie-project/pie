@@ -466,7 +466,7 @@ fn bf16_select_rate() {
 #[ignore = "a rate, not an answer"]
 fn nvfp4_select_rate() {
     let (experts, tokens, top) = (8usize, 64usize, 8usize);
-    for (n, k, glu) in [(2048usize, 6144usize, true), (6144, 2048, false)] {
+    for (n, k, glu) in [(2048usize, 6144usize, true), (4096, 6144, false), (6144, 2048, false)] {
         let rows = if glu { 2 * n } else { n };
         let mut b = Bench::new(9);
         let (x, _) = b.bf16(tokens * k);
