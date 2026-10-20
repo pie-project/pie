@@ -1,12 +1,14 @@
 //! Sealed pages in host memory, by key, least recently used first to go;
-//! and, given a directory, on disk too, so a pool that restarts comes back
-//! with what it held. A page on disk is one file named by its key: `PIE2`,
-//! its layout's length and layout, its tokens' hashes' count and hashes,
-//! then its bytes, written whole before it is named. (A file without the
-//! mark holds the layout and the bytes alone, as pools wrote before.)
+//! and, given a [`Store`], kept there too, so a pool that restarts comes
+//! back with what it held. A page in a store is one blob: `PIE2`, its
+//! layout's length and layout, its tokens' hashes' count and hashes, then
+//! its bytes. (A blob without the mark holds the layout and the bytes
+//! alone, as pools wrote before.)
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+
+use crate::store::Store;
 
 use transport::tcp::{Answer, Key, Pages, Source, Stream, Taken};
 
@@ -18,7 +20,7 @@ struct Page {
     used: u64,
 }
 
-/// What a disk page begins with since pages carry their tokens' hashes.
+/// What a stored page begins with since pages carry their tokens' hashes.
 const MARK: &[u8; 4] = b"PIE2";
 
 #[derive(Default)]
@@ -49,92 +51,48 @@ impl Inner {
     }
 }
 
-/// Pages kept up to `capacity` bytes in memory, and every page sent on
-/// disk where there is a directory.
+/// Pages kept up to `capacity` bytes in memory, and every page sent in the
+/// store where there is one.
 #[derive(Clone)]
 pub struct Pool {
     inner: Arc<Mutex<Inner>>,
     capacity: usize,
-    disk: Option<Arc<Disk>>,
+    store: Option<Arc<dyn Store>>,
 }
 
-struct Disk {
-    dir: std::path::PathBuf,
-    keys: Mutex<std::collections::HashSet<Key>>,
-}
-
-fn hex(key: &Key) -> String {
-    key.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unhex(name: &str) -> Option<Key> {
-    if name.len() != 64 {
-        return None;
+fn encode(meta: &[u8], slots: &[Key], bytes: &[u8]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(12 + meta.len() + 32 * slots.len() + bytes.len());
+    blob.extend_from_slice(MARK);
+    blob.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+    blob.extend_from_slice(meta);
+    blob.extend_from_slice(&(slots.len() as u32).to_le_bytes());
+    for slot in slots {
+        blob.extend_from_slice(slot);
     }
-    let mut key = [0u8; 32];
-    for (i, byte) in key.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(name.get(2 * i..2 * i + 2)?, 16).ok()?;
-    }
-    Some(key)
+    blob.extend_from_slice(bytes);
+    blob
 }
 
-impl Disk {
-    fn open(dir: std::path::PathBuf) -> std::io::Result<Self> {
-        std::fs::create_dir_all(&dir)?;
-        let mut keys = std::collections::HashSet::new();
-        for entry in std::fs::read_dir(&dir)? {
-            let name = entry?.file_name();
-            if let Some(key) = name.to_str().and_then(unhex) {
-                keys.insert(key);
-            }
+/// The page's layout, tokens' hashes and bytes.
+fn decode(all: &[u8]) -> Option<(Vec<u8>, Vec<Key>, Vec<u8>)> {
+    let u32_at = |at: usize| -> Option<usize> {
+        Some(u32::from_le_bytes(all.get(at..at + 4)?.try_into().ok()?) as usize)
+    };
+    let marked = all.get(..4) == Some(MARK.as_slice());
+    let mut at = if marked { 4 } else { 0 };
+    let len = u32_at(at)?;
+    let meta = all.get(at + 4..at + 4 + len)?.to_vec();
+    at += 4 + len;
+    let mut slots = Vec::new();
+    if marked {
+        let count = u32_at(at)?;
+        at += 4;
+        for _ in 0..count {
+            slots.push(all.get(at..at + 32)?.try_into().ok()?);
+            at += 32;
         }
-        Ok(Self {
-            dir,
-            keys: Mutex::new(keys),
-        })
     }
-
-    fn write(&self, key: &Key, meta: &[u8], slots: &[Key], bytes: &[u8]) -> std::io::Result<()> {
-        use std::io::Write;
-        let name = hex(key);
-        let tmp = self.dir.join(format!(".{name}.tmp"));
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(MARK)?;
-        file.write_all(&(meta.len() as u32).to_le_bytes())?;
-        file.write_all(meta)?;
-        file.write_all(&(slots.len() as u32).to_le_bytes())?;
-        for slot in slots {
-            file.write_all(slot)?;
-        }
-        file.write_all(bytes)?;
-        file.sync_data()?;
-        std::fs::rename(&tmp, self.dir.join(name))?;
-        self.keys.lock().unwrap().insert(*key);
-        Ok(())
-    }
-
-    /// The page's layout, tokens' hashes and bytes.
-    fn read(&self, key: &Key) -> Option<(Vec<u8>, Vec<Key>, Vec<u8>)> {
-        let all = std::fs::read(self.dir.join(hex(key))).ok()?;
-        let u32_at = |at: usize| -> Option<usize> {
-            Some(u32::from_le_bytes(all.get(at..at + 4)?.try_into().ok()?) as usize)
-        };
-        let marked = all.get(..4) == Some(MARK.as_slice());
-        let mut at = if marked { 4 } else { 0 };
-        let len = u32_at(at)?;
-        let meta = all.get(at + 4..at + 4 + len)?.to_vec();
-        at += 4 + len;
-        let mut slots = Vec::new();
-        if marked {
-            let count = u32_at(at)?;
-            at += 4;
-            for _ in 0..count {
-                slots.push(all.get(at..at + 32)?.try_into().ok()?);
-                at += 32;
-            }
-        }
-        Some((meta, slots, all.get(at..)?.to_vec()))
-    }
+    Some((meta, slots, all.get(at..)?.to_vec()))
 }
 
 impl Pool {
@@ -142,23 +100,19 @@ impl Pool {
         Self {
             inner: Arc::default(),
             capacity,
-            disk: None,
+            store: None,
         }
     }
 
-    /// A pool that also keeps every page it is sent under `dir`, and holds
-    /// what the directory held when it opens.
-    pub fn with_dir(capacity: usize, dir: std::path::PathBuf) -> std::io::Result<Self> {
-        let disk = Disk::open(dir)?;
-        tracing::info!(
-            pages = disk.keys.lock().unwrap().len(),
-            "pool opened its directory"
-        );
-        Ok(Self {
+    /// A pool that also keeps every page it is sent in `store`, and holds
+    /// what the store held.
+    pub fn with_store(capacity: usize, store: Arc<dyn Store>) -> Self {
+        tracing::info!(pages = store.keys().len(), "pool opened its store");
+        Self {
             inner: Arc::default(),
             capacity,
-            disk: Some(Arc::new(disk)),
-        })
+            store: Some(store),
+        }
     }
 
     /// Keeps `pages`, one per key, letting the least recently used go to
@@ -173,23 +127,24 @@ impl Pool {
             return Err("the tokens' hashes do not split into the pages".into());
         }
         let slots_of = |at: usize| &pages.slots[at * per_page..(at + 1) * per_page];
-        // With a directory every page is kept on disk and memory caches
-        // what fits; without one, more than memory holds is refused.
-        if self.disk.is_none() && page_bytes * keys.len() > self.capacity {
+        // With a store every page is kept there and memory caches what
+        // fits; without one, more than memory holds is refused.
+        if self.store.is_none() && page_bytes * keys.len() > self.capacity {
             return Err(format!(
                 "{} bytes are more than this pool holds",
                 page_bytes * keys.len()
             ));
         }
-        if let Some(disk) = &self.disk {
-            for (at, (key, bytes)) in keys
+        if let Some(store) = &self.store {
+            let blobs: Vec<(Key, Vec<u8>)> = keys
                 .iter()
                 .zip(pages.data.chunks(page_bytes.max(1)))
                 .enumerate()
-            {
-                disk.write(key, &pages.meta, slots_of(at), bytes)
-                    .map_err(|e| format!("writing a page to the pool's directory: {e}"))?;
-            }
+                .map(|(at, (key, bytes))| (*key, encode(&pages.meta, slots_of(at), bytes)))
+                .collect();
+            store
+                .put(&blobs)
+                .map_err(|e| format!("keeping pages in the pool's store: {e}"))?;
         }
         let meta = Arc::new(pages.meta.clone());
         let mut inner = self.inner.lock().unwrap();
@@ -229,25 +184,44 @@ impl Pool {
 
     /// Pages `keys[from..]`, if all of them are here and laid out alike.
     pub fn get(&self, keys: &[Key], from: usize) -> Result<Pages, String> {
-        let mut inner = self.inner.lock().unwrap();
         let want = keys.get(from..).ok_or("past the run")?;
+        // What memory lacks is read from the store in one batch, outside
+        // the lock: a store may be across a network.
+        let missing: Vec<Key> = {
+            let inner = self.inner.lock().unwrap();
+            want.iter()
+                .filter(|key| !inner.pages.contains_key(*key))
+                .copied()
+                .collect()
+        };
+        let mut stored: HashMap<Key, Vec<u8>> = match (&self.store, missing.is_empty()) {
+            (Some(store), false) => missing
+                .iter()
+                .zip(store.get(&missing))
+                .filter_map(|(key, blob)| Some((*key, blob?)))
+                .collect(),
+            _ => HashMap::new(),
+        };
+        let mut inner = self.inner.lock().unwrap();
         let mut data = Vec::new();
         let mut meta: Option<Arc<Vec<u8>>> = None;
         // A run's hashes go out only if every page of it has them.
         let mut slots: Option<Vec<Key>> = Some(Vec::new());
         for (at, key) in want.iter().enumerate() {
-            let (page_meta, page_slots, bytes): (Arc<Vec<u8>>, Vec<Key>, Vec<u8>) =
-                match inner.pages.get(key) {
-                    Some(page) => (page.meta.clone(), page.slots.clone(), page.bytes.clone()),
-                    None => {
-                        let (meta, slots, bytes) = self
-                            .disk
-                            .as_ref()
-                            .and_then(|disk| disk.read(key))
-                            .ok_or_else(|| format!("page {} of the run is not here", from + at))?;
-                        (Arc::new(meta), slots, bytes)
-                    }
-                };
+            let (page_meta, page_slots, bytes): (Arc<Vec<u8>>, Vec<Key>, Vec<u8>) = match inner
+                .pages
+                .get(key)
+            {
+                Some(page) => (page.meta.clone(), page.slots.clone(), page.bytes.clone()),
+                None => {
+                    let (meta, slots, bytes) = stored
+                        .remove(key)
+                        .as_deref()
+                        .and_then(decode)
+                        .ok_or_else(|| format!("page {} of the run is not here", from + at))?;
+                    (Arc::new(meta), slots, bytes)
+                }
+            };
             match (&mut slots, page_slots.is_empty()) {
                 (Some(all), false) => all.extend(page_slots),
                 _ => slots = None,
@@ -272,13 +246,13 @@ impl Pool {
         })
     }
 
-    /// Every key held, in memory or on disk: what the pool reports to the
-    /// directory.
+    /// Every key held, in memory or in the store: what the pool reports to
+    /// the directory.
     pub fn keys(&self) -> Vec<Key> {
         let mut keys: std::collections::HashSet<Key> =
             self.inner.lock().unwrap().pages.keys().copied().collect();
-        if let Some(disk) = &self.disk {
-            keys.extend(disk.keys.lock().unwrap().iter().copied());
+        if let Some(store) = &self.store {
+            keys.extend(store.keys());
         }
         keys.into_iter().collect()
     }
@@ -288,7 +262,7 @@ impl Pool {
     }
 }
 
-/// Reads and writes may touch the disk: off the async threads.
+/// Reads and writes may touch the store: off the async threads.
 impl Source for Pool {
     fn read(&self, keys: Vec<Key>, from: u32) -> Answer {
         let pool = self.clone();
@@ -313,6 +287,7 @@ impl Source for Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Dir;
 
     /// `count` pages of 8 bytes of `n`, two tokens a page, page `p`'s hashed
     /// `n + p`.
@@ -354,13 +329,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let keys = [[1u8; 32], [2u8; 32]];
         {
-            let pool = Pool::with_dir(8, dir.clone()).unwrap();
+            let pool = Pool::with_store(8, Arc::new(Dir::open(dir.clone()).unwrap()));
             pool.put(&keys, pages(3, 2)).unwrap();
-            // Memory holds one page; the other is on disk alone.
+            // Memory holds one page; the other is in the store alone.
             assert_eq!(pool.bytes(), 8);
             assert_eq!(pool.get(&keys, 0).unwrap().data, vec![3u8; 16]);
         }
-        let reopened = Pool::with_dir(8, dir.clone()).unwrap();
+        let reopened = Pool::with_store(8, Arc::new(Dir::open(dir.clone()).unwrap()));
         let mut held = reopened.keys();
         held.sort();
         assert_eq!(held, keys.to_vec());
