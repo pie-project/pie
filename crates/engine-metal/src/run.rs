@@ -270,6 +270,7 @@ impl<'c> Run<'c> {
     pub(crate) fn chain_select(
         &self,
         x: ValueId,
+        bank: ValueId,
         routes: ValueId,
         y: ValueId,
     ) -> kernels_metal::linear::moe::Sorted {
@@ -299,9 +300,9 @@ impl<'c> Run<'c> {
         };
         let Some(Operation::Linear(Linear::MoeMatmulSelectQuant {
             x: down_x,
+            bank: down_bank,
             routes: down_routes,
             y: routed,
-            ..
         })) = self.sole_reader(*hidden).map(|n| &n.op)
         else {
             return Sorted::default();
@@ -314,12 +315,22 @@ impl<'c> Run<'c> {
         if *packed != y || down_x != hidden || *down_routes != routes || folded != routed {
             return Sorted::default();
         }
-        let pairs = self.tensor(y).rows;
-        let Some((padded, _)) =
-            kernels_metal::linear::moe::sorted_stack(pairs, self.experts(routes), self.tuning)
-        else {
+        let stack = |x, bank, y| {
+            kernels_metal::linear::moe::sorted_stack(
+                self.tensor(x),
+                self.planes(bank),
+                self.tensor(y),
+                self.experts(routes),
+                self.tuning,
+            )
+        };
+        // The down reads the gate-up's sorted rows, so both passes sort alike.
+        let Some((padded, tile)) = stack(x, bank, y) else {
             return Sorted::default();
         };
+        if stack(*hidden, *down_bank, *routed) != Some((padded, tile)) {
+            return Sorted::default();
+        }
         self.chain.set(Some(Chain {
             step: ChainStep::GateUp,
             routes,

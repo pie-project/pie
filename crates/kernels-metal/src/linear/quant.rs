@@ -631,7 +631,7 @@ fn act_x_wt_over(
     for choice in tuning.qmm(&at) {
         match choice {
             Qmm::Mpp => {
-                let (bm, bn) = crate::tuning::mpp_tile(rows);
+                let (bm, bn) = crate::tuning::mpp_tile_for(rows, columns);
                 // A column cut lands part of a row, which the MPP kernel never does.
                 if columns == stride {
                     let padded = rows.div_ceil(bm) * bm;

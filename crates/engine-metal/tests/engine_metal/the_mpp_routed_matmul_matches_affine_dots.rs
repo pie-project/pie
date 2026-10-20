@@ -36,6 +36,7 @@ fn every_routed_row_answers_its_experts_exact_affine_reference() {
 [kernel]
 moe.path = "mpp"
 moe.tile_rows = [
+  { when = "per_expert >= 64", value = 64 },
   { when = "per_expert >= 32", value = 32 },
   { when = "per_expert >= 1", value = 16 },
   { value = 8 },
@@ -44,10 +45,12 @@ moe.tile_rows = [
         false,
     );
     let mut checked = 0;
-    // (experts, tokens, fan-out, K, N): row tiles of 16, 32 and 8.
+    // (experts, tokens, fan-out, K, N): row tiles of 16, 64 (which an affine bank runs
+    // at 32), 32 and 8.
     let cases = [
         (6u32, 40u32, 2u32, 128u32, 128u32),
         (4, 200, 2, 256, 256),
+        (6, 120, 2, 128, 128),
         (16, 12, 1, 128, 64),
     ];
     for exact in [true, false] {

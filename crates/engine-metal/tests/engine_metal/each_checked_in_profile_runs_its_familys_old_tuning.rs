@@ -18,13 +18,16 @@ fn old(family: u32) -> (i64, u32, bool, bool, GdnScan) {
     }
 }
 
-/// The old routed tile choice.
-fn old_tile(pairs: u32, experts: u32) -> u32 {
+/// The old routed tile choice, but the 64-row tile an Apple10 GPU measured
+/// since.
+fn old_tile(family: u32, pairs: u32, experts: u32) -> u32 {
     if experts == 0 || pairs < experts * 2 {
         return 1;
     }
     let per = pairs / experts;
-    if per >= 32 {
+    if per >= 64 && family == 10 {
+        64
+    } else if per >= 32 {
         32
     } else if per >= 1 {
         16
@@ -156,7 +159,7 @@ fn assert_old_tuning(
         for pairs in [0, 1, 7, 8, 64, 255, 256, 2048, 4096, 8191, 8192, 65_536] {
             assert_eq!(
                 t.moe_tile_rows(pairs, experts),
-                old_tile(pairs, experts),
+                old_tile(family, pairs, experts),
                 "{device}: {pairs} pairs over {experts} experts"
             );
         }

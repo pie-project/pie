@@ -70,6 +70,17 @@ pub fn mpp_tile(rows: u32) -> (u32, u32) {
     (bm, if bm == 8 { 64 } else { 128 })
 }
 
+/// `mpp_tile`, with a 64-wide column tile where `n` holds no whole 128-wide one.
+#[must_use]
+pub fn mpp_tile_for(rows: u32, n: u32) -> (u32, u32) {
+    let (bm, bn) = mpp_tile(rows);
+    if n % bn != 0 && n % 64 == 0 {
+        (bm, 64)
+    } else {
+        (bm, bn)
+    }
+}
+
 /// Eighths of a wave of 32x64 output tiles over `cores` GPU cores: how full
 /// `rows` rows into `n` columns keep the device.
 #[must_use]
@@ -82,7 +93,10 @@ impl Qmm {
     fn fits_shape(&self, at: &QmmAt) -> bool {
         match self {
             Qmm::Mpp => {
-                let (_, bn) = mpp_tile(u32::try_from(at.rows).unwrap_or(u32::MAX));
+                let (_, bn) = mpp_tile_for(
+                    u32::try_from(at.rows).unwrap_or(u32::MAX),
+                    u32::try_from(at.n).unwrap_or(u32::MAX),
+                );
                 at.bits == 4 && at.group == 64 && at.rows >= 8 && at.n % i64::from(bn) == 0
             }
             Qmm::Staged => at.bits == 4 && at.group == 64 && at.rows <= 8 && at.n % 64 == 0,
@@ -198,7 +212,8 @@ pub enum MoePath {
 
 /// The row tile a routed matmul sorts its pairs into, by pairs per expert;
 /// 1 leaves the pairs unsorted. An 8-row tile is stamped only for fp16 4-bit
-/// 64-group banks; any other bank runs it at 16.
+/// 64-group banks; any other bank runs it at 16. A 64-row tile is taken only by
+/// the MXFP4 MPP kernel; any other bank runs it at 32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(
     id = "kernel.moe.tile_rows",

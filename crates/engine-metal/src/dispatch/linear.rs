@@ -519,7 +519,7 @@ impl Run<'_> {
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
                 const OP: &str = "linear.moe_matmul_select_quant";
                 if let Some(scratch) = self.routed_scratch() {
-                    let sorted = self.chain_select(*x, *routes, *y);
+                    let sorted = self.chain_select(*x, *bank, *routes, *y);
                     if linear::moe::matmul_select_batched(
                         self.ctx(),
                         OP,

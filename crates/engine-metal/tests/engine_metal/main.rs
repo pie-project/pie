@@ -29,6 +29,7 @@ mod the_kv_write_round_trips;
 mod the_miniature_drafts;
 mod the_mpp_prefill_matches_affine_dots;
 mod the_mpp_routed_matmul_matches_affine_dots;
+mod the_mpp_routed_mxfp4_matmul_matches_its_dots;
 mod the_packed_kv_decode_reads;
 mod the_packed_kv_page_migrates;
 mod the_packed_kv_tiled_reads;
