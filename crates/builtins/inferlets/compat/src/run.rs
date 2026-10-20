@@ -124,11 +124,12 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
         stop_hit: None,
     };
     let mut error: Option<String> = None;
-    // What the client was sent already passes through the decoders and the
-    // stop hold-back unseen, so they stand where they stood.
+    // What the client was sent already passes through the decoders, the
+    // stop hold-back and the adapter's stream, whose frames the client has
+    // (`crate::resume`), so they all stand where they stood.
     for &token in &resumed {
         if let Ok(events) = demux.feed(token) {
-            let _ = out.deliver(events, &mut |_| {});
+            let _ = out.deliver(events, &mut sink);
         }
     }
 
