@@ -2372,6 +2372,7 @@ fn select_plan(
     y: &Tensor,
     glu: bool,
     gemm: bool,
+    fill: u32,
 ) -> Result<SelectPlan, Error> {
     let nb: u32 = match fan.route_count.div_ceil(experts) {
         0..=4 => 1,
@@ -2394,7 +2395,7 @@ fn select_plan(
         },
     )?;
     // A decode's few CTAs: half the rows a warp (twice the CTAs), then K
-    // split across groups of a CTA's warps, toward four CTAs' warps an SM.
+    // split across groups of a CTA's warps, toward `fill` CTAs' warps an SM.
     let sms = ctx.multiprocessors().unwrap_or(108);
     let tiles: u32 = if !glu && order.work_cap * y.width.div_ceil(128) < 2 * sms {
         1
@@ -2404,7 +2405,7 @@ fn select_plan(
     let cols = if glu { 64 } else { 64 * tiles };
     let ctas = (order.work_cap * y.width.div_ceil(cols)).max(1);
     let ksplit = if nb == 1 {
-        (4 * sms)
+        (fill * sms)
             .div_ceil(ctas)
             .next_power_of_two()
             .clamp(1, MMA_KSPLIT_MAX)
@@ -2476,6 +2477,7 @@ pub fn select_fp8_w8a16(
         y,
         glu.is_some(),
         fan.route_count >= FP8_GEMM_FROM,
+        4,
     )?;
     let fire = if tiled {
         // Three stages of 64 routes' activations and 128 rows' codes, 64 of
@@ -2590,6 +2592,9 @@ pub fn select_bf16_held(
         y,
         glu.is_some(),
         fan.route_count >= BF16_GEMM_FROM && x.width.is_multiple_of(64),
+        // bf16 codes stream twice an fp8 bank's bytes: deeper K splits keep
+        // more of them in flight (Hy4's decode +2%).
+        8,
     )?;
     let fire = if tiled {
         // Three stages of 64 routes' and 128 rows' 64 of K, four warps a
