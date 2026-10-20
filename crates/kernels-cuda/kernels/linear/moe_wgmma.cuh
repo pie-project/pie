@@ -203,4 +203,139 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_wgmma(
             }
 }
 
+
+namespace wgbf16 {
+
+template <int R>
+struct Mma;
+
+template <>
+struct Mma<32> {
+    static __device__ __forceinline__ void run(float (&d)[16], unsigned long long a,
+                                               unsigned long long b) {
+        asm volatile(
+            "wgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, %16, %17, 1, 1, 1, 0, 0;\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+              "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]),
+              "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
+            : "l"(a), "l"(b));
+    }
+};
+
+template <>
+struct Mma<16> {
+    static __device__ __forceinline__ void run(float (&d)[8], unsigned long long a,
+                                               unsigned long long b) {
+        asm volatile(
+            "wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7}, %8, %9, 1, 1, 1, 0, 0;\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+              "+f"(d[7])
+            : "l"(a), "l"(b));
+    }
+};
+
+}  // namespace wgbf16
+
+/// `y[route] = x[route / act_div] . W[expert]^T` for a bf16 bank on Hopper's
+/// wgmma: `moe_select_fp8a8_wgmma`'s ring and swizzle over bf16, a stage 64 of
+/// K (a 128-byte row), four m64nRk16 MMAs a stage into the sums, no block
+/// scales. `k` whole 64s, `n` whole 128s. Grid `[work_cap, n / 128]`, 128
+/// threads, `kWgStages (128 + kR) 128 + 1024` bytes of shared memory.
+template <int kR>
+__global__ void __launch_bounds__(128) moe_select_bf16_wgmma(
+    const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
+    const i32* __restrict__ work, const bf16* __restrict__ weight, bf16* __restrict__ out,
+    int act_div, int n, int k, int num_experts) {
+    constexpr int kA = 128 * 128;
+    constexpr int kStage = kA + kR * 128;
+    constexpr int kF = kR / 2;
+
+    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
+    const int item = work[blockIdx.x];
+    const int expert = item >> 16;
+    const int begin = offsets[expert] + (item & 0xFFFF) * kR;
+    const int count = min(offsets[expert + 1] - begin, kR);
+    if (count <= 0) return;
+
+    extern __shared__ uint4 wgbf16_smem[];
+    u8* smem = reinterpret_cast<u8*>(
+        (reinterpret_cast<unsigned long long>(wgbf16_smem) + 1023) & ~1023ull);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
+    const int row0 = static_cast<int>(blockIdx.y) * 128;
+    const int steps = k / 64;
+    const bf16* w_e = weight + (static_cast<long long>(expert) * n + row0) * k;
+
+    auto load = [&](int kb, int st) {
+        u8* a = smem + st * kStage;
+        u8* b = a + kA;
+        const int k0 = kb * 64;
+        for (int i = tid; i < 128 * 8; i += 128) {
+            const int r = i >> 3, ch = i & 7;
+            wgfp8::cp16(a + r * 128 + ((ch ^ (r & 7)) << 4),
+                        w_e + static_cast<long long>(r) * k + k0 + ch * 8);
+        }
+        for (int i = tid; i < kR * 8; i += 128) {
+            const int r = i >> 3, ch = i & 7;
+            u8* dst = b + r * 128 + ((ch ^ (r & 7)) << 4);
+            if (r < count) {
+                const long long row = order[begin + r] / act_div;
+                wgfp8::cp16(dst, act + row * k + k0 + ch * 8);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+
+    float acc[2][kF];
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+        for (int i = 0; i < kF; ++i) acc[t][i] = 0.f;
+
+#pragma unroll
+    for (int s = 0; s < kWgStages - 1; ++s) {
+        if (s < steps) load(s, s);
+        asm volatile("cp.async.commit_group;\n" ::);
+    }
+    for (int kb = 0; kb < steps; ++kb) {
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(kWgStages - 2));
+        __syncthreads();
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        const int next = kb + kWgStages - 1;
+        if (next < steps) load(next, next % kWgStages);
+        asm volatile("cp.async.commit_group;\n" ::);
+
+        const u8* a = smem + (kb % kWgStages) * kStage;
+        const u8* b = a + kA;
+        asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            const unsigned long long db = wgfp8::desc(b + kk * 32);
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                wgbf16::Mma<kR>::run(acc[t], wgfp8::desc(a + t * 64 * 128 + kk * 32), db);
+            }
+        }
+        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+        for (int j = 0; j < kR / 8; ++j)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int tok = 8 * j + 2 * c + (q & 1);
+                if (tok >= count) continue;
+                const int row = row0 + t * 64 + 16 * warp + g + (q >= 2 ? 8 : 0);
+                const long long route = order[begin + tok];
+                out[route * n + row] = f32_to_bf16(acc[t][4 * j + q]);
+            }
+}
+
 }  // namespace pie::linear

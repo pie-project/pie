@@ -210,6 +210,10 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Bf16, bf16mma, [8, 64, 8, 128, 256], f, None, 0),
         (K::Bf16, bf16mma, [16, 40, 8, 256, 128], f, None, 0),
         (K::Bf16, bf16mma, [8, 12, 4, 96, 512], t, None, 0),
+        // Few routes an expert (not the tiled GEMM's): Hopper's wgmma select
+        // at its 16- and 32-route slices.
+        (K::Bf16, bf16mma, [64, 16, 4, 256, 512], t, None, 0),
+        (K::Bf16, bf16mma, [16, 40, 4, 128, 256], f, None, 0),
         // Affine u4: per route, grouped, tcgen05.
         (K::Affine, d, [16, 1, 8, 1408, 2816], t, None, 0),
         (K::Affine, d, [16, 3, 8, 704, 704], f, None, 0),
