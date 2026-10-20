@@ -1,4 +1,5 @@
 mod ffi;
+pub mod objects;
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};

@@ -9,6 +9,9 @@ How kv pages move between workers.
   `inline`) registers it with one NIXL agent; a peer of the same layout
   reads it device to device. UCX picks the path: CUDA IPC or shared memory
   on one host, RDMA across hosts.
+- `Objects` (`nixl`): named objects in a store a NIXL storage plugin fronts
+  (`OBJ` for S3 and what speaks it). A pool worker keeps its pages there
+  (`pie-pool --objects OBJ`), the cluster's external tier.
 
 ## Building with NIXL
 
@@ -45,3 +48,25 @@ On a host without NVLink, UCX keeps CUDA IPC reads off, and without RDMA
 devices (`/dev/infiniband`) or ptrace (for `cma`) it falls back to TCP
 emulation, slower than the `tcp` link: measure on the hardware it is meant
 for.
+
+### The `OBJ` plugin
+
+The wheel's `OBJ` plugin links NVIDIA's cuObject client and rdma-core, which
+it does not carry. Without them NIXL reports `OBJ` as unsupported. Their
+runtime libraries load without RDMA hardware; unpacked beside the rest:
+
+```sh
+apt-get download libcuobjclient-13-1 libibverbs1 librdmacm1t64 ibverbs-providers libnl-route-3-200
+for d in *.deb; do dpkg-deb -x $d x; done
+cp -a x/usr/local/cuda-*/targets/x86_64-linux/lib/libcuobjclient.so* $P/lib/
+mkdir -p $P/lib/rdma && cp -a x/usr/lib/x86_64-linux-gnu/lib{ibverbs,rdmacm,mlx5,nl-route-3}.so* $P/lib/rdma/
+```
+
+The cuObject client needs a cuFile newer than CUDA 13.0's: the
+`nvidia-cufile` wheel's `nvidia/cu13/lib/libcufile*.so*` go in `$P/lib/rdma`
+too. Run with `LD_LIBRARY_PATH=$P/lib:$P/lib/rdma`.
+
+`OBJ`'s params: `bucket`, `endpoint_override` (a URL), `scheme`, `region`,
+and `access_key`/`secret_key` unless the environment gives credentials. The
+object tests run when `PIE_TEST_S3` names an endpoint (any credentials, a
+bucket `pie`), such as `moto_server`'s.
