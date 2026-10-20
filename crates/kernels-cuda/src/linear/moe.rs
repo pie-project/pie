@@ -2760,7 +2760,10 @@ fn matmul_select_mxfp4(
     }
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
-    let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
+    // A lean select (`kernel.moe.mxfp4_select_lean`) runs blocks of two warps.
+    let lean = ctx.tuning().mxfp4_select_lean;
+    let block = if lean { 2 * WARP } else { DECODE_BLOCK };
+    let tile = (block / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
 
     let experts = codes.rows.clamp(1, EXPERT_CAP);
@@ -2813,12 +2816,13 @@ fn matmul_select_mxfp4(
         Fire::at(
             "linear/quant.cuh",
             symbol(&format!(
-                "::pie::linear::moe_matmul_select_mxfp4<{t}, ::pie::i32({ROWS_PER_WARP})>"
+                "::pie::linear::moe_matmul_select_mxfp4<{t}, ::pie::i32({ROWS_PER_WARP}){}>",
+                if lean { ", true" } else { "" }
             )),
         )
         .apply(Launch::grid(
             [fan.route_count, y.width.div_ceil(tile), 1],
-            [DECODE_BLOCK, 1, 1],
+            [block, 1, 1],
         )),
         &[
             x.arg(),

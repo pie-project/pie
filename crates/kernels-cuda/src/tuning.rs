@@ -566,6 +566,14 @@ pub struct SsmGdnOutBf16;
 #[decision(id = "kernel.ssm.gdn_step_blocks", constant(set(1, 2, 3, 4)), default = 4, tune = search)]
 pub struct SsmGdnStepBlocks(pub u32);
 
+/// Whether the per-route MXFP4 select (a decode's few routes an expert) runs
+/// lean: two-warp blocks, one code block a row in flight a lane, the codes
+/// widened by integer ops, no converts. Off but where a chip's profile turns
+/// it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_select_lean", flag, default = false, tune = search)]
+pub struct MoeMxfp4SelectLean;
+
 /// Whether a prefill the tcgen05 FMHA (`attn/tc5_fmha.cuh`, sm_100a) can
 /// serve runs on it; off, FA2 serves every prefill, as before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -680,6 +688,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmConvVec4>()
         .add::<SsmGdnOutBf16>()
         .add::<SsmGdnStepBlocks>()
+        .add::<MoeMxfp4SelectLean>()
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
@@ -801,6 +810,7 @@ tuning! {
     ssm_conv_vec4: bool = false, on SsmConvVec4;
     ssm_gdn_out_bf16: bool = false, on SsmGdnOutBf16;
     ssm_gdn_step_blocks: u32 = 4, get SsmGdnStepBlocks;
+    mxfp4_select_lean: bool = false, on MoeMxfp4SelectLean;
     merge_warp: bool = false, on SdpaMergeWarp;
     mxfp4_mma_until: u32 = 0, get MoeMxfp4MmaUntil;
     mxfp4_mma_from: u32 = 64, get MoeMxfp4MmaFrom;
