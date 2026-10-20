@@ -114,10 +114,10 @@ struct TurnState {
     sink: mpsc::Sender<Tokens>,
     open: Arc<AtomicBool>,
     outcome: Option<Outcome>,
-    /// The tokens the client has been sent, as the frames named them, and
-    /// the response id they went out under: what a move resumes from.
-    resume: Vec<u32>,
-    resume_id: Option<String>,
+    /// The program's resume log as of what the client has been sent: what
+    /// a move relaunches it with. None: it keeps none, and a turn that has
+    /// sent anything cannot be moved.
+    resume: Option<String>,
     /// Moved: the worker it left, whose late frames are dropped, and the
     /// new launch's answer, which the client does not see again.
     left: Option<WorkerId>,
@@ -134,45 +134,37 @@ struct Inner {
     pipe_cap: usize,
 }
 
-/// Takes a frame's `plex` word (the tokens it covers and the response id)
-/// off it, keeping it on the turn.
-fn take_plex(turn: &mut TurnState, message: &mut ServerMessage) {
-    let ServerMessage::ProcessEvent { value, .. } = message else {
-        return;
+/// A program's resume note ([`client_api::resume`]): kept on the turn, and
+/// what the client sees of it, the message it carries, put in its place.
+/// `false`: the note carries no message, so the client sees nothing.
+fn take_note(turn: &mut TurnState, message: &mut ServerMessage) -> bool {
+    let ServerMessage::ProcessEvent { event, value, .. } = message else {
+        return true;
     };
-    if !value.contains("\"plex\"") {
-        return;
+    if event != client_api::resume::EVENT {
+        return true;
     }
-    let Ok(serde_json::Value::Object(mut frame)) = serde_json::from_str(value) else {
-        return;
+    let Ok(note) = serde_json::from_str::<client_api::resume::Note>(value) else {
+        tracing::warn!("a resume note that does not parse is dropped");
+        return false;
     };
-    let Some(plex) = frame.remove("plex") else {
-        return;
-    };
-    if let Some(tokens) = plex.get("tokens").and_then(|t| t.as_array()) {
-        turn.resume
-            .extend(tokens.iter().filter_map(|t| t.as_u64()).map(|t| t as u32));
+    turn.resume = note.apply(turn.resume.take());
+    match note.message {
+        Some(sent) => {
+            *event = "message".to_string();
+            *value = sent;
+            true
+        }
+        None => false,
     }
-    if let Some(id) = plex.get("id").and_then(|i| i.as_str()) {
-        turn.resume_id = Some(id.to_string());
-    }
-    *value = serde_json::Value::Object(frame).to_string();
 }
 
 /// Readies a turn to be launched again away from `old`: its launch carries
 /// what the client was sent, which the program continues after, and `old`'s
 /// late frames and the new launch's answer are kept from the client.
 fn relaunch(turn: &mut TurnState, old: WorkerId) {
-    if let (Some(id), ClientMessage::LaunchProcess { input, .. }) =
-        (&turn.resume_id, &mut turn.request.message)
-        && let Ok(serde_json::Value::Object(mut envelope)) =
-            serde_json::from_str::<serde_json::Value>(input)
-    {
-        envelope.insert(
-            "resume".into(),
-            serde_json::json!({"id": id, "tokens": turn.resume}),
-        );
-        *input = serde_json::Value::Object(envelope).to_string();
+    if let ClientMessage::LaunchProcess { resume, .. } = &mut turn.request.message {
+        *resume = turn.resume.clone();
     }
     turn.worker = None;
     turn.left = Some(old);
@@ -245,8 +237,7 @@ impl Inner {
                     sink: tx,
                     open: open.clone(),
                     outcome: None,
-                    resume: Vec::new(),
-                    resume_id: None,
+                    resume: None,
                     left: None,
                     relaunched: false,
                 },
@@ -385,8 +376,8 @@ impl Sessions {
     }
 
     /// A chunk from worker `from`: one from a worker the turn has left is
-    /// dropped, and the frames' word on what they cover (`plex`) is taken
-    /// off and kept for a move.
+    /// dropped, and a program's resume note is kept on the turn for a move,
+    /// the client seeing only the message it carries.
     pub async fn feed_from(
         &self,
         req_id: ReqId,
@@ -404,7 +395,9 @@ impl Sessions {
                 return Control::Abort;
             }
             if let Tokens::Chunk(message) = &mut chunk {
-                take_plex(turn, message);
+                if !take_note(turn, message) {
+                    return Control::Continue;
+                }
                 let relaunch = turn.relaunched && is_launch_answer(turn, message);
                 self.note(turn, req_id, message);
                 if relaunch {
@@ -481,6 +474,11 @@ impl Sessions {
                 return false;
             };
             if old == target || turn.outcome.is_some() {
+                return false;
+            }
+            // Its program keeps no resume log: run again, it would send
+            // what the client already has.
+            if turn.emitted && turn.resume.is_none() {
                 return false;
             }
             relaunch(turn, old);
@@ -651,7 +649,7 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                     let resumed = turn.emitted;
                     if !turn.emitted {
                         turn.worker = None;
-                    } else if turn.resume_id.is_some() && turn.outcome.is_none() {
+                    } else if turn.resume.is_some() && turn.outcome.is_none() {
                         relaunch(turn, old);
                         tracing::info!(req = %req_id, from = %old, "resuming a turn its worker dropped");
                     } else {
@@ -781,6 +779,7 @@ mod tests {
                 capture_outputs: true,
                 props: Default::default(),
                 session: None,
+                resume: None,
                 cluster_props: Default::default(),
             },
             blobs: Vec::new(),
@@ -958,19 +957,45 @@ mod tests {
                 value: value.into(),
             })
         };
+        let note = |note: client_api::resume::Note| {
+            Tokens::Chunk(ServerMessage::ProcessEvent {
+                process_id: "p".into(),
+                event: client_api::resume::EVENT.into(),
+                value: serde_json::to_string(&note).unwrap(),
+            })
+        };
         sessions.feed_from(req, answer(), Some(WorkerId(7))).await;
         sessions
             .feed_from(
                 req,
-                frame(r#"{"text":"ab","plex":{"tokens":[1,2],"id":"cmpl-1"}}"#),
+                note(client_api::resume::Note {
+                    state: Some("cmpl-1\n".into()),
+                    ..Default::default()
+                }),
+                Some(WorkerId(7)),
+            )
+            .await;
+        sessions
+            .feed_from(
+                req,
+                note(client_api::resume::Note {
+                    more: "1 2 ".into(),
+                    message: Some(r#"{"text":"ab"}"#.into()),
+                    ..Default::default()
+                }),
                 Some(WorkerId(7)),
             )
             .await;
         rx.recv().await;
-        let Some(Tokens::Chunk(ServerMessage::ProcessEvent { value, .. })) = rx.recv().await else {
+        let Some(Tokens::Chunk(ServerMessage::ProcessEvent { event, value, .. })) = rx.recv().await
+        else {
             panic!("the frame");
         };
-        assert_eq!(value, r#"{"text":"ab"}"#, "the client never sees `plex`");
+        assert_eq!(
+            (event.as_str(), value.as_str()),
+            ("message", r#"{"text":"ab"}"#),
+            "the client sees what a note carries, and not a note carrying nothing"
+        );
 
         // Worker 7 goes; 8 is all there is.
         *router.dispatch_worker.lock().unwrap() = Some(WorkerId(8));
@@ -980,13 +1005,14 @@ mod tests {
         settle().await;
         assert_eq!(router.dispatched.lock().unwrap().len(), 2);
         let relaunch = router.messages.lock().unwrap()[1].clone();
-        let ClientMessage::LaunchProcess { input, .. } = &relaunch else {
+        let ClientMessage::LaunchProcess { input, resume, .. } = &relaunch else {
             panic!("a launch");
         };
-        let envelope: serde_json::Value = serde_json::from_str(input).unwrap();
+        assert_eq!(input, r#"{"prompt":"hi"}"#, "the program's own input");
         assert_eq!(
-            envelope["resume"],
-            serde_json::json!({"id": "cmpl-1", "tokens": [1, 2]})
+            resume.as_deref(),
+            Some("cmpl-1\n1 2 "),
+            "its log as the client had it"
         );
         assert_eq!(*router.moves.lock().unwrap(), [(req, Some(WorkerId(8)))]);
         assert!(
@@ -1022,6 +1048,25 @@ mod tests {
         assert_eq!(
             *router.endings.lock().unwrap(),
             [(req, Outcome::Failed, By::Host)]
+        );
+        assert_eq!(router.dispatched.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_sent_without_a_resume_log_is_not_moved() {
+        let router = MockRouter::new(Some(WorkerId(7)));
+        let sessions = Sessions::new(router.clone());
+        let (_h, _rx) = sessions
+            .create(ident(), launch(), Affinity::Sticky)
+            .await
+            .unwrap();
+        let req = router.dispatched.lock().unwrap()[0];
+        sessions
+            .feed_from(req, event("message"), Some(WorkerId(7)))
+            .await;
+        assert!(
+            !sessions.migrate(req, WorkerId(8)).await,
+            "run again, it would send what the client has"
         );
         assert_eq!(router.dispatched.lock().unwrap().len(), 1);
     }

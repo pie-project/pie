@@ -58,6 +58,19 @@ async fn stream_out(ctx: &mut ProcessCtx, bytes: Vec<u8>, name: String) -> Resul
     Ok(())
 }
 
+/// `event` to process `process_id`'s client, if it has one.
+async fn deliver(process_id: process::ProcessId, event: &ProcessEvent, what: &str) {
+    if let Ok(Some(client_id)) = process::get_client_id(process_id).await
+        && let Err(err) = server::send_event(client_id, process_id, event)
+    {
+        tracing::warn!(client_id, process_id = %process_id, error = %err, "{what} delivery failed");
+    }
+}
+
+fn resume_event(note: &client_api::resume::Note) -> ProcessEvent {
+    ProcessEvent::Resume(serde_json::to_string(note).expect("a note is plain JSON"))
+}
+
 impl pie::inferlet::session::Host for ProcessCtx {
     async fn set_props(&mut self, props: String) -> Result<Result<(), String>> {
         let changes: client_api::Props = match serde_json::from_str(&props) {
@@ -108,18 +121,31 @@ impl pie::inferlet::session::Host for ProcessCtx {
 
     async fn send(&mut self, message: String) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        let process_id = self.id();
-        if let Ok(Some(client_id)) = process::get_client_id(process_id).await
-            && let Err(err) =
-                server::send_event(client_id, process_id, &ProcessEvent::Message(message))
-        {
-            tracing::warn!(
-                client_id,
-                process_id = %process_id,
-                error = %err,
-                "session.send delivery failed"
-            );
-        }
+        deliver(self.id(), &ProcessEvent::Message(message), "session.send").await;
+        Ok(())
+    }
+
+    async fn resumed(&mut self) -> Result<Option<String>> {
+        Ok(ProcessCtx::resumed(self))
+    }
+
+    async fn set_resume(&mut self, state: String) -> Result<()> {
+        let note = client_api::resume::Note {
+            state: Some(state),
+            ..client_api::resume::Note::default()
+        };
+        deliver(self.id(), &resume_event(&note), "session.set-resume").await;
+        Ok(())
+    }
+
+    async fn send_with_resume(&mut self, message: String, more: String) -> Result<()> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let note = client_api::resume::Note {
+            more,
+            message: Some(message),
+            ..client_api::resume::Note::default()
+        };
+        deliver(self.id(), &resume_event(&note), "session.send-with-resume").await;
         Ok(())
     }
 

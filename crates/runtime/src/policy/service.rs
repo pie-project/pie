@@ -914,6 +914,7 @@ mod tests {
                 tenant: tenant.into(),
                 session: session.map(Into::into),
                 props: Default::default(),
+                resumed: None,
             },
         ));
         pid
@@ -933,6 +934,7 @@ mod tests {
             tenant: "t".into(),
             session: None,
             props: props(json!({"priority": 1})),
+            resumed: None,
         };
         let arrived = registry.apply(Event::Arrived(pid, arrival));
         assert!(matches!(arrived[..], [Edge::Arrived(ref p)] if *p == id));
@@ -1106,6 +1108,7 @@ mod tests {
                     tenant: "t".into(),
                     session: None,
                     props: props(json!({ "prompt": prompt })),
+                    resumed: None,
                 },
             ));
             schedule::plex_id(pid)

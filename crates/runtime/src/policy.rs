@@ -66,6 +66,8 @@ pub struct Arrival {
     pub tenant: String,
     pub session: Option<String>,
     pub props: Props,
+    /// The resume log a move relaunched it with (`session.resumed`).
+    pub resumed: Option<String>,
 }
 
 /// Each is a no-op when no policy is loaded.

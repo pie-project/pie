@@ -434,6 +434,7 @@ mod tests {
                 capture_outputs: false,
                 props: Default::default(),
                 session: None,
+                resume: None,
                 cluster_props: Default::default(),
             };
             assert!(matches!(h.admit(&request), AdmissionDecision::Reject(_)));
@@ -456,6 +457,7 @@ mod tests {
             capture_outputs: false,
             props: Default::default(),
             session: None,
+            resume: None,
             cluster_props: Default::default(),
         };
         let order = Arc::new(Mutex::new(Vec::new()));

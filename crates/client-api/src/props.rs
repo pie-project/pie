@@ -385,6 +385,7 @@ mod tests {
             capture_outputs: true,
             props: Props::new(),
             session: Some("conv-1".into()),
+            resume: None,
             cluster_props: Props::new(),
         };
         for bytes in [

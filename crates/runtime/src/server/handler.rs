@@ -469,6 +469,7 @@ impl Session {
         capture_outputs: bool,
         mut props: client_api::Props,
         session: Option<String>,
+        resume: Option<String>,
         cluster_props: client_api::Props,
     ) {
         // A worker also takes clients that did not come through a gateway.
@@ -543,6 +544,7 @@ impl Session {
                 tenant: self.tenant.clone(),
                 session,
                 props,
+                resumed: resume,
             },
         ) {
             Ok(process_id) => {

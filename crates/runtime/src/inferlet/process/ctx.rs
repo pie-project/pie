@@ -47,6 +47,8 @@ pub struct ProcessCtx {
     residency: Arc<Mutex<ProcessResidency>>,
     prewarm_permit: Option<OrderedPermit>,
     props: client_api::Props,
+    /// What a move relaunched this process with (`session.resumed`).
+    resumed: Option<String>,
     bind_admitted: bool,
     execution_seated: bool,
     execution_admitted: bool,
@@ -220,6 +222,7 @@ impl ProcessCtx {
             },
             prewarm_permit: None,
             props: client_api::Props::new(),
+            resumed: None,
             bind_admitted: false,
             execution_seated: false,
             execution_admitted: false,
@@ -262,6 +265,14 @@ impl ProcessCtx {
 
     pub(crate) fn set_props(&mut self, props: client_api::Props) {
         self.props = props;
+    }
+
+    pub(crate) fn set_resumed(&mut self, resumed: Option<String>) {
+        self.resumed = resumed;
+    }
+
+    pub(crate) fn resumed(&self) -> Option<String> {
+        self.resumed.clone()
     }
 
     pub(crate) fn release_prewarm_permit(&mut self) {

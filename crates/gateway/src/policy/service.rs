@@ -1102,6 +1102,7 @@ mod tests {
                 capture_outputs: true,
                 props: serde_json::from_value(props).unwrap(),
                 session: None,
+                resume: None,
                 cluster_props: Props::new(),
             },
             cluster_props: Props::new(),

@@ -76,4 +76,21 @@ interface session {
     /// `prompt` as soon as it is tokenized.
     set-tokens: func(prompt: u32, generated: u32);
 
+    /// What this process resumes from, when the cluster moved it here from
+    /// another worker: the resume log it kept there (`set-resume`,
+    /// `send-with-resume`). It runs again from its own input, and goes on
+    /// after what the log says it already did and sent.
+    resumed: func() -> option<string>;
+
+    /// Replaces this process's resume log. A process that keeps one can be
+    /// moved while it runs: it is ended where it runs and launched again
+    /// elsewhere, `resumed` returning the log as it was when it was moved.
+    /// One that keeps none is moved only before it has sent anything.
+    set-resume: func(state: string);
+
+    /// Sends `message` to the client and appends `more` to the resume log, as
+    /// one: a move resumes after both or neither, so what the log says was
+    /// sent is what the client has.
+    send-with-resume: func(message: string, more: string);
+
 }

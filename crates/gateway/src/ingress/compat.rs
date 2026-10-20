@@ -215,6 +215,7 @@ async fn relay(
                 .get(SESSION_HEADER)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string),
+            resume: None,
             cluster_props: Props::new(),
         },
         blobs: Vec::new(),
