@@ -7,6 +7,7 @@ gdn_staged(const device bfloat *qkv [[buffer(0)]], const device int *indptr [[bu
            const device uint *slots [[buffer(4)]], device float *y [[buffer(5)]],
            constant int &kh [[buffer(6)]], constant int &vh [[buffer(7)]],
            constant int &dk [[buffer(8)]], constant int &dv [[buffer(9)]],
+           const device int *snaps [[buffer(10)]], constant int &snap_lane0 [[buffer(11)]],
            uint3 tile [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   constexpr int D = 128, ROWS = 32;
   const int req = tile.z / vh, hv = tile.z % vh, hk = hv / (vh / kh);
@@ -19,6 +20,11 @@ gdn_staged(const device bfloat *qkv [[buffer(0)]], const device int *indptr [[bu
   device float *cells = gdn_cells<2, 16>(state, int(slots[begin]), hv, vh, value_base, dk, dv);
   float st[2][16];
   gdn_load<2, 16>(st, cells, packed_lane, dk);
+  // The rows whose state lands in a slot of its own, ascending; 0 ends them.
+  const device int *snap =
+      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + req) * 2 * PIE_RS_SNAPSHOTS : nullptr;
+  int snapped = 0;
+  int snap_at = snap != nullptr ? begin + snap[0] : -1;
   threadgroup float queries[BLOCK * D], key_data[BLOCK * D], values[BLOCK * ROWS],
       gate_data[BLOCK * 2];
   for (int start = begin; start < end; start += BLOCK) {
@@ -83,6 +89,13 @@ gdn_staged(const device bfloat *qkv [[buffer(0)]], const device int *indptr [[bu
             y[(size_t(start + b) * vh + hv) * dv + value_base + v] = out;
         }
       }
+      if (start + b + 1 == snap_at) {
+        gdn_store<2, 16>(
+            gdn_cells<2, 16>(state, snap[PIE_RS_SNAPSHOTS + snapped], hv, vh, value_base, dk, dv), st,
+            packed_lane, dk);
+        ++snapped;
+        snap_at = snapped < PIE_RS_SNAPSHOTS && snap[snapped] > 0 ? begin + snap[snapped] : -1;
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -92,4 +105,4 @@ gdn_staged(const device bfloat *qkv [[buffer(0)]], const device int *indptr [[bu
   template [[host_name(name)]] [[kernel]] void gdn_staged<block>(                                  \
       const device bfloat *, const device int *, const device float *, device float *,             \
       const device uint *, device float *, constant int &, constant int &, constant int &,         \
-      constant int &, uint3, uint);
+      constant int &, const device int *, constant int &, uint3, uint);

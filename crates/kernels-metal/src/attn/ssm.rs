@@ -321,6 +321,30 @@ pub fn causal_conv1d(
     )
 }
 
+/// The rows of one lane whose recurrent state a prompt's scans land in slots
+/// of their own as they pass them (`Lane::rs_snapshots`), at most.
+pub const RS_SNAPSHOTS: u32 = 4;
+
+/// Where a prompt's scans land the state as of rows inside it: per lane,
+/// [`RS_SNAPSHOTS`] rows into the lane (ascending, 0 ends them) and then as
+/// many slots; the scan's request `r` is lane `lane0 + r`.
+#[derive(Clone, Copy, Debug)]
+pub struct Snapshots {
+    pub table: Tensor,
+    pub lane0: u32,
+}
+
+fn snapshot_args(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    snapshots: Option<Snapshots>,
+) -> Result<[crate::encode::ArgValue; 2], Error> {
+    Ok(match snapshots {
+        Some(snapshots) => [snapshots.table.arg(), stated(op, snapshots.lane0)?.arg()],
+        None => [ctx.absent()?, (-1i32).arg()],
+    })
+}
+
 pub fn causal_conv1d_chunked(
     ctx: &Ctx<'_>,
     x: RaggedTensor,
@@ -329,6 +353,22 @@ pub fn causal_conv1d_chunked(
     conv_width: u32,
     dilation: u32,
     y: Tensor,
+) -> Result<(), Error> {
+    causal_conv1d_chunked_landing(ctx, x, weight, state, conv_width, dilation, y, None)
+}
+
+/// [`causal_conv1d_chunked`], landing the window as of each of `snapshots`'
+/// rows in its slot too.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_chunked_landing(
+    ctx: &Ctx<'_>,
+    x: RaggedTensor,
+    weight: Tensor,
+    state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    y: Tensor,
+    snapshots: Option<Snapshots>,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d_chunked";
     let entry = dtype_dispatch!(OP, x.data.dtype, { Bf16 => "causal_conv1d_chunked_bfloat16" });
@@ -349,6 +389,7 @@ pub fn causal_conv1d_chunked(
         "the state bank a dilated conv reads is `(width - 1) * dilation + 1` rows of channels"
     );
     let lanes = requests(OP, x)?;
+    let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     // A lane holds at most every row, so this many runs cover the longest.
     let runs = x.data.rows.div_ceil(CONV_RUN_ROWS);
     ctx.fire(
@@ -368,6 +409,8 @@ pub fn causal_conv1d_chunked(
             taps.arg(),
             stated(OP, dilation)?.arg(),
             stated(OP, CONV_RUN_ROWS)?.arg(),
+            snaps,
+            lane0,
         ],
     )
 }
@@ -489,6 +532,28 @@ pub fn gated_delta_chunked(
     v_dim: u32,
     y: Tensor,
 ) -> Result<(), Error> {
+    gated_delta_chunked_landing(
+        ctx, tuning, qkv, z, gates, state, k_heads, v_heads, k_dim, v_dim, y, None,
+    )
+}
+
+/// [`gated_delta_chunked`], landing the state as of each of `snapshots`'
+/// rows in its slot too.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_chunked_landing(
+    ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
+    qkv: RaggedTensor,
+    z: Tensor,
+    gates: Tensor,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: Tensor,
+    snapshots: Option<Snapshots>,
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_gated_delta_chunked";
     let _ = z;
     let entry = dtype_dispatch!(OP, qkv.data.dtype, { Bf16 => "gated_delta_chunked_bfloat16" });
@@ -496,6 +561,7 @@ pub fn gated_delta_chunked(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;
+    let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     let args = [
         qkv.data.arg(),
         qkv.indptr.arg(),
@@ -507,6 +573,8 @@ pub fn gated_delta_chunked(
         stated(OP, shape.v_heads)?.arg(),
         stated(OP, shape.k_dim)?.arg(),
         stated(OP, shape.v_dim)?.arg(),
+        snaps,
+        lane0,
     ];
     if let Some(grid) = gdn_staged_launch_at(&shape, lanes, qkv.data.rows, tuning.gdn_scan()) {
         return ctx.fire(
@@ -770,6 +838,26 @@ pub fn causal_conv1d_committed(
     dilation: u32,
     y: Tensor,
 ) -> Result<(), Error> {
+    causal_conv1d_committed_landing(
+        ctx, x, indptr, committed, weight, state, conv_width, dilation, y, None,
+    )
+}
+
+/// [`causal_conv1d_committed`], landing the window as of each of
+/// `snapshots`' rows in its slot too.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_committed_landing(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    indptr: Tensor,
+    committed: &Committed,
+    weight: Tensor,
+    state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    y: Tensor,
+    snapshots: Option<Snapshots>,
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d_committed";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "causal_conv1d_committed_bfloat16" });
     let channels = nonzero(OP, "the conv's channel count", x.width)?;
@@ -786,6 +874,7 @@ pub fn causal_conv1d_committed(
         ));
     }
     let lanes = committed_lanes(OP, indptr)?;
+    let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     ctx.fire(
         Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(conv_grid(channels, lanes)),
         &[
@@ -802,6 +891,8 @@ pub fn causal_conv1d_committed(
             stated(OP, x.width)?.arg(),
             taps.arg(),
             stated(OP, dilation)?.arg(),
+            snaps,
+            lane0,
         ],
     )
 }
@@ -822,6 +913,31 @@ pub fn gated_delta_committed(
     v_dim: u32,
     y: Tensor,
 ) -> Result<(), Error> {
+    gated_delta_committed_landing(
+        ctx, tuning, qkv, indptr, committed, gates, state, work, k_heads, v_heads, k_dim, v_dim, y,
+        None,
+    )
+}
+
+/// [`gated_delta_committed`], landing the state as of each of `snapshots`'
+/// rows in its slot too.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_committed_landing(
+    ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
+    qkv: Tensor,
+    indptr: Tensor,
+    committed: &Committed,
+    gates: Tensor,
+    state: &RecurrentPool,
+    work: Tensor,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: Tensor,
+    snapshots: Option<Snapshots>,
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_gated_delta_committed";
     let entry = dtype_dispatch!(OP, qkv.dtype, { Bf16 => "gated_delta_committed_bfloat16" });
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
@@ -834,6 +950,7 @@ pub fn gated_delta_committed(
         lanes_rows(tuning.gdn_scan()),
         gdn_scan_committed_point,
     ) {
+        let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
             &[
@@ -850,9 +967,12 @@ pub fn gated_delta_committed(
                 stated(OP, shape.v_heads)?.arg(),
                 stated(OP, shape.k_dim)?.arg(),
                 stated(OP, shape.v_dim)?.arg(),
+                snaps,
+                lane0,
             ],
         );
     }
+    let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     let splits = (shape.v_dim / 32).max(1);
     let grid = Grid::of(
         [SCAN_WIDTH, shape.v_heads, lanes.saturating_mul(splits)],
@@ -876,6 +996,8 @@ pub fn gated_delta_committed(
             stated(OP, shape.k_dim)?.arg(),
             stated(OP, shape.v_dim)?.arg(),
             stated(OP, splits)?.arg(),
+            snaps,
+            lane0,
         ],
     )
 }
