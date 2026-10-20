@@ -1031,20 +1031,27 @@ pub fn matmul_select_batched(
             args.push(ctx.absent()?);
         }
         args.push(scratch.tile_expert.arg());
+        let mut grid = crate::linear::quant::qmm_grid(
+            op,
+            stated(op, y.width)?,
+            stated(op, bn)?,
+            stated(op, padded)?,
+            stated(op, tile)?,
+            1,
+        )?;
+        // The stamped affine kernel is the steel tile's own; the MXFP4 and fp16 ones
+        // take the routed threadgroup.
+        let group = if point.stamp.is_empty() {
+            let group = crate::linear::quant::routed_group(stated(op, tile)?);
+            grid[2] = group[2];
+            group
+        } else {
+            crate::linear::quant::qmm_group(stated(op, tile)?)
+        };
         ctx.fire(
             Fire::at(QMM_FILE, point.entry)
                 .stamp(point.stamp)
-                .apply(Grid::of(
-                    crate::linear::quant::qmm_grid(
-                        op,
-                        stated(op, y.width)?,
-                        stated(op, bn)?,
-                        stated(op, padded)?,
-                        stated(op, tile)?,
-                        1,
-                    )?,
-                    crate::linear::quant::qmm_group(stated(op, tile)?),
-                )),
+                .apply(Grid::of(grid, group)),
             &args,
         )?;
     }
