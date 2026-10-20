@@ -164,14 +164,25 @@ pub(crate) fn act_x_wt(
             call,
             ws,
             ws_bytes,
-            tuning.pdl,
+            tuning,
         )
     {
         return Ok(matches!(tactic, Tactic::Gemv | Tactic::Rows) && bias != 0);
     }
     clear_error();
 
-    if m == 1 && gemv_bf16(&unsafe { Ctx::on(stream) }, w, act, bias, y, n, k).is_ok() {
+    if m == 1
+        && gemv_bf16(
+            &unsafe { Ctx::on(stream) }.with_tuning(tuning),
+            w,
+            act,
+            bias,
+            y,
+            n,
+            k,
+        )
+        .is_ok()
+    {
         return Ok(bias != 0);
     }
     if gemm_ex(
@@ -219,13 +230,16 @@ fn run_tactic(
     call: Call,
     ws: *mut c_void,
     ws_bytes: usize,
-    pdl: bool,
+    tuning: crate::tuning::Tuning,
 ) -> bool {
+    // The kernels' own launches read this dispatch's decisions (`kernel.pdl`,
+    // `kernel.gemv.bf16`), not a bare stream's defaults.
+    let pdl = tuning.pdl;
     match tactic {
         Tactic::Gemv => {
             call.m == 1
                 && gemv_bf16(
-                    &unsafe { Ctx::on(stream) },
+                    &unsafe { Ctx::on(stream) }.with_tuning(tuning),
                     call.w,
                     call.act,
                     call.bias,
@@ -236,7 +250,7 @@ fn run_tactic(
                 .is_ok()
         }
         Tactic::Rows => gemm_rows_bf16(
-            &unsafe { Ctx::on(stream) },
+            &unsafe { Ctx::on(stream) }.with_tuning(tuning),
             call.w,
             call.act,
             call.bias,
@@ -248,7 +262,7 @@ fn run_tactic(
         )
         .is_ok(),
         Tactic::Narrow => gemm_narrow_bf16(
-            &unsafe { Ctx::on(stream) },
+            &unsafe { Ctx::on(stream) }.with_tuning(tuning),
             call.w,
             call.act,
             call.bias,
@@ -1234,7 +1248,7 @@ impl TuneArena {
                 bench,
                 self.workspace,
                 self.workspace_bytes,
-                false,
+                crate::tuning::Tuning::DEFAULT,
             )
         };
         let stream = self.stream.cast();
