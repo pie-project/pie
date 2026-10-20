@@ -3111,9 +3111,18 @@ __global__ void ssm_kda_step_batched(
 
     const int slot = slot_ids[r];
     if (slot < 0) return;
-    float* st = kda_state_or_copy(
-        state_base + (long long)slot * slot_stride_elems + (long long)h * D * D,
-        work, rh, D, folds(write_state, write_state_mask, r));
+    // `gridDim.z` blocks share the head's value rows (a decode's few rows):
+    // this block's run of them, and only those copied where the row does not
+    // fold.
+    const int per = (D + static_cast<int>(gridDim.z) - 1) / static_cast<int>(gridDim.z);
+    const int v_lo = static_cast<int>(blockIdx.z) * per;
+    const int v_hi = min(D, v_lo + per);
+    float* st = state_base + (long long)slot * slot_stride_elems + (long long)h * D * D;
+    if (!folds(write_state, write_state_mask, r)) {
+        float* copy = work + rh * D * D;
+        for (int i = v_lo * D + threadIdx.x; i < v_hi * D; i += blockDim.x) copy[i] = st[i];
+        st = copy;
+    }
     float* out_h = out + ((long long)r_row * H + h) * D;
 
     extern __shared__ float smem[];
@@ -3131,7 +3140,7 @@ __global__ void ssm_kda_step_batched(
     const int warp = threadIdx.x >> 5;
     const int warps = blockDim.x >> 5;
 
-    for (int vi = warp; vi < D; vi += warps) {
+    for (int vi = v_lo + warp; vi < v_hi; vi += warps) {
         float* row = st + (long long)vi * D;
         float mem = 0.f;
         for (int ki = lane; ki < D; ki += 32) {
