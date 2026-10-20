@@ -264,6 +264,13 @@ pub struct Fp8DecodeUntil(pub u32);
 #[decision(id = "kernel.fp8.narrow_until", constant(range(0..=1_048_576)), default = 0, tune = search)]
 pub struct Fp8NarrowUntil(pub u32);
 
+/// The fewest 16-column state slices (requests x value heads x v_dim / 16)
+/// from which the gated-delta chunk scan walks 32-column slices, a chunk's
+/// W and k̂ᵀ read for twice the columns; 0, never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_wide_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct SsmGdnWideFrom(pub u32);
+
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
@@ -307,6 +314,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MlaAbsorbOutUntil>()
         .add::<Fp8DecodeUntil>()
         .add::<Fp8NarrowUntil>()
+        .add::<SsmGdnWideFrom>()
         .add::<GemmLiveFrom>()
         .add::<GemmLiveTileSmall>()
         .add::<GemmLiveTileMid>()
@@ -357,6 +365,7 @@ pub struct Tuning {
     pub mla_absorb_out_until: u32,
     pub fp8_decode_until: u32,
     pub fp8_narrow_until: u32,
+    pub ssm_gdn_wide_from: u32,
     pub gemm_live_from: u32,
     pub gemm_live_tiles: [u32; 3],
     /// DeepSeek's fused prefill pass and bounded replay, CUDA's decisions:
@@ -409,6 +418,7 @@ impl Tuning {
         mla_absorb_out_until: 0,
         fp8_decode_until: 64,
         fp8_narrow_until: 0,
+        ssm_gdn_wide_from: 0,
         gemm_live_from: 0,
         gemm_live_tiles: [192_032_128, 256_128_064, 176_256_064],
         dsv4_prefill_from: 0,
@@ -459,6 +469,7 @@ impl Tuning {
             mla_absorb_out_until: profile.get::<MlaAbsorbOutUntil>().0,
             fp8_decode_until: profile.get::<Fp8DecodeUntil>().0,
             fp8_narrow_until: profile.get::<Fp8NarrowUntil>().0,
+            ssm_gdn_wide_from: profile.get::<SsmGdnWideFrom>().0,
             gemm_live_from: profile.get::<GemmLiveFrom>().0,
             gemm_live_tiles: [
                 profile.get::<GemmLiveTileSmall>().0,

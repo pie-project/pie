@@ -44,6 +44,12 @@ fp8.narrow_until = 128
 # trail it by ~4% at full count).
 gemm.live_from = 129
 
+# The gated-delta chunk scan walks 32-column state slices from 512 slices
+# of 16 (two Qwen3.6 requests): the slices of a head read the same chunk
+# operands, and at 14K rows the 16-column walk is 1.4x the time (one
+# request keeps it: 64 vs 82 us).
+ssm.gdn_wide_from = 512
+
 # A fire of 10240 rows where `max_forward_tokens` is unstated: 8192 left the
 # first prompts' decodes waiting out a second prefill fire, 12K and up made
 # queued prompts wait. Past 2048 rows, eight buckets a doubling: a prefill's

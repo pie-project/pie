@@ -9,6 +9,7 @@ mod common;
 use common::{Gpu, STATE, round_bf16, values};
 use dtype::Dtype;
 use kernels_rocm::attn::ssm;
+use kernels_rocm::tuning::Tuning;
 use kernels_rocm::{RaggedTensor, RecurrentPool, Tensor};
 
 struct Case {
@@ -119,14 +120,28 @@ fn bind(gpu: &Gpu, case: &Case, inp: &Inputs) -> Bound {
     }
 }
 
-fn launch(gpu: &Gpu, case: &Case, b: &mut Bound, serial: bool) {
+/// How a fire walks: the serial scan, or the chunked passes at 16- or
+/// 32-column state slices.
+#[derive(Clone, Copy)]
+enum Walk {
+    Serial,
+    Chunked,
+    Wide,
+}
+
+fn launch(gpu: &Gpu, case: &Case, b: &mut Bound, walk: Walk) {
+    let serial = matches!(walk, Walk::Serial);
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        ssm_gdn_wide_from: u32::from(matches!(walk, Walk::Wide)),
+        ..Tuning::DEFAULT
+    });
     let run = if serial {
         ssm::gated_delta_chunked_serial
     } else {
         ssm::gated_delta_chunked
     };
     run(
-        &gpu.ctx(),
+        &ctx,
         b.qkv,
         Tensor::ABSENT,
         b.gates,
@@ -140,9 +155,9 @@ fn launch(gpu: &Gpu, case: &Case, b: &mut Bound, serial: bool) {
     .unwrap();
 }
 
-fn fire(gpu: &Gpu, case: &Case, inp: &Inputs, serial: bool) -> Fired {
+fn fire(gpu: &Gpu, case: &Case, inp: &Inputs, walk: Walk) -> Fired {
     let mut b = bind(gpu, case, inp);
-    launch(gpu, case, &mut b, serial);
+    launch(gpu, case, &mut b, walk);
     gpu.sync();
     Fired {
         y: b.y,
@@ -185,9 +200,10 @@ fn the_chunked_gated_delta_answers_the_serial_scan() {
     ];
     for (n, case) in cases.iter().enumerate() {
         let inp = case.inputs(40 + n as u64);
-        let serial = fire(&gpu, case, &inp, true);
-        let chunked = fire(&gpu, case, &inp, false);
-        let again = fire(&gpu, case, &inp, false);
+        let serial = fire(&gpu, case, &inp, Walk::Serial);
+        let chunked = fire(&gpu, case, &inp, Walk::Chunked);
+        let again = fire(&gpu, case, &inp, Walk::Chunked);
+        let wide = fire(&gpu, case, &inp, Walk::Wide);
         let (ys, yc, ya) = (
             gpu.read(&serial.y),
             gpu.read(&chunked.y),
@@ -201,6 +217,11 @@ fn the_chunked_gated_delta_answers_the_serial_scan() {
         assert!(
             yc.iter().zip(&ya).all(|(a, b)| a.to_bits() == b.to_bits()) && sc == sa,
             "case {n}: two chunked fires disagree"
+        );
+        assert!(
+            gpu.read(&wide.y).iter().zip(&yc).all(|(a, b)| a.to_bits() == b.to_bits())
+                && gpu.read(&wide.slab) == sc,
+            "case {n}: the 32-column slices disagree with the 16-column ones"
         );
         let (e, at) = worst(&yc, &ys);
         let width = (case.v_heads * D) as usize;
