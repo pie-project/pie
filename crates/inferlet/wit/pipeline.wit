@@ -20,4 +20,9 @@ interface pipeline {
         /// Resource drop has exactly these semantics.
         close: func();
     }
+
+    /// How many pipelines are open on the engine, this one included: a
+    /// program that trades compute for latency (speculation) reads whether
+    /// it is alone.
+    live: func() -> u32;
 }
