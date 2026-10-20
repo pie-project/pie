@@ -274,6 +274,37 @@ pub fn rmsnorm_gated(
     )?;
     let launch = rows_per_head(OP, y.rows, y.width, head_dim)?;
     let heads = stated(OP, per_head_split(y.width, head_dim))?;
+    // A head of 8 to 512 (a power of two) on its own lanes, eight elements
+    // a lane, where every plane allows 16-byte reads.
+    let lph = head_dim / 8;
+    let aligned = [x.ptr, gate.ptr, y.ptr, weight.map_or(0, |w| w.ptr)]
+        .iter()
+        .all(|p| p.is_multiple_of(16));
+    if head_dim.is_multiple_of(8) && lph.is_power_of_two() && lph <= WARP && aligned {
+        let total = u64::from(y.rows) * u64::from(y.width / head_dim);
+        let per = u64::from(BLOCK / lph);
+        let blocks = u32::try_from(total.div_ceil(per))
+            .map_err(|_| refuse(OP, format!("the grid will not launch: {total} head rows")))?;
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!("::pie::elemwise::rmsnorm_gated_f32_lanes<{t}, {lph}>")),
+            )
+            .apply(Launch::per_row(blocks, BLOCK)),
+            &[
+                x.arg(),
+                gate.arg(),
+                weight.map_or(ArgValue::ABSENT, |w| w.arg()),
+                y.arg(),
+                i64::try_from(total).unwrap_or(i64::MAX).arg(),
+                eps.arg(),
+                i32::from(sigmoid_gate).arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(
@@ -714,12 +745,29 @@ pub fn norm_gate(
     let rows = nonzero(OP, "rows", y.rows)?;
     let absent = |t: Option<&Tensor>| t.map_or(ArgValue::ABSENT, Tensor::arg);
     let tail = next.is_some();
+    // A row of whole eights in aligned planes moves in 16-byte packs, held
+    // in registers (up to eight a thread) through both norms.
+    let chunks = (y.width / VEC_WIDTH).div_ceil(BLOCK);
+    let aligned = [
+        Some(x),
+        scale,
+        res,
+        gate,
+        Some(*y),
+        next.as_ref().map(|n| n.weight),
+        next.as_ref().map(|n| n.y),
+    ]
+    .iter()
+    .flatten()
+    .all(|t| t.ptr.is_multiple_of(16));
+    let entry = if y.width.is_multiple_of(VEC_WIDTH) && chunks <= 8 && aligned {
+        format!("::pie::elemwise::norm_gate_vec8<{t}, {BLOCK}, {tail}, {chunks}>")
+    } else {
+        format!("::pie::elemwise::norm_gate<{t}, {BLOCK}, {tail}>")
+    };
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!("::pie::elemwise::norm_gate<{t}, {BLOCK}, {tail}>")),
-        )
+        Fire::at(FILE, symbol(&entry))
         .apply(Launch::per_row(rows, BLOCK)),
         &[
             x.arg(),

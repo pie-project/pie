@@ -200,6 +200,52 @@ __global__ __launch_bounds__(BLOCK) void rmsnorm_gated_f32_in(const float* __res
     }
 }
 
+// rmsnorm_gated_f32_in over heads of 8·LPH elements: LPH lanes a head row,
+// eight elements a lane, the sum of squares across them by shuffles; 256 /
+// LPH head rows a block, `total` (rows x heads) in all. Planes 16-byte
+// aligned.
+template <class T, int LPH>
+__global__ __launch_bounds__(256) void rmsnorm_gated_f32_lanes(const float* __restrict__ x,
+                                                               const T* __restrict__ gate,
+                                                               const float* __restrict__ w,
+                                                               T* __restrict__ y, long long total,
+                                                               float eps, int sigmoid_gate, int heads,
+                                                               const u32* __restrict__ win) {
+    constexpr int HD = 8 * LPH;
+    const long long hr = static_cast<long long>(blockIdx.x) * (256 / LPH) + threadIdx.x / LPH;
+    const Window window{win};
+    if (hr >= total || !window.live(hr, heads)) return;
+    const long long row = window.plane(hr, heads) * HD;
+    const int c = (threadIdx.x % LPH) * 8;
+    const float4 a = *reinterpret_cast<const float4*>(x + row + c);
+    const float4 b = *reinterpret_cast<const float4*>(x + row + c + 4);
+    const Pack8<T> g = *reinterpret_cast<const Pack8<T>*>(gate + row + c);
+    const float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+    float ws[8] = {1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f};
+    if (w != nullptr) {
+        const float4 wa = *reinterpret_cast<const float4*>(w + c);
+        const float4 wb = *reinterpret_cast<const float4*>(w + c + 4);
+        const float wv[8] = {wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w};
+#pragma unroll
+        for (int e = 0; e < 8; ++e) ws[e] = wv[e];
+    }
+    float local = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) local += v[e] * v[e];
+#pragma unroll
+    for (int off = LPH / 2; off > 0; off >>= 1) local += __shfl_xor(local, off, kWave);
+    const float inv = rsqrtf(local / static_cast<float>(HD) + eps);
+    Pack8<T> out;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const float gv = to_f32(g.v[e]);
+        const float sig = 1.f / (1.f + __expf(-gv));
+        const float gated = sigmoid_gate ? sig : gv * sig;
+        out.v[e] = from_f32<T>(ws[e] * (v[e] * inv) * gated);
+    }
+    *reinterpret_cast<Pack8<T>*>(y + row + c) = out;
+}
+
 // y += x over the first `n` elements of a `width`-wide plane: the live rows
 // (the window's, else all) are one contiguous run, swept by a grid sized to
 // the device rather than to the launch's padded extent, eight elements a
@@ -363,6 +409,83 @@ __global__ __launch_bounds__(BLOCK) void norm_gate(
         for (int i = threadIdx.x; i < n; i += BLOCK) {
             const float w = to_f32(next_w[i]) + (plus_one ? 1.f : 0.f);
             z[base + i] = from_f32<T>(to_f32(y[base + i]) * inv2 * w);
+        }
+    }
+}
+
+// norm_gate over a row of whole eights in 16-byte aligned planes: the row's
+// packs held in registers, CH a thread, through both norms.
+template <class T, int BLOCK, bool NEXT, int CH>
+__global__ __launch_bounds__(BLOCK) void norm_gate_vec8(
+    const T* __restrict__ x, const T* __restrict__ scale, const T* res,
+    const float* __restrict__ gate, T* y, int n, float eps, float temperature, int fan,
+    const T* __restrict__ next_w, float next_eps, int plus_one, T* __restrict__ z,
+    const u32* __restrict__ win) {
+    __shared__ float smem[BLOCK / kWave];
+    const Window window{win};
+    if (!window.live(blockIdx.x, fan)) return;
+    const long long base = window.plane(blockIdx.x, fan) * n;
+    const int packs = n / 8, tid = threadIdx.x;
+    float u[CH][8];
+    float local = 0.f;
+#pragma unroll
+    for (int c = 0; c < CH; ++c) {
+        const int k = min(tid + c * BLOCK, packs - 1);
+        const Pack8<T> xv = reinterpret_cast<const Pack8<T>*>(x + base)[k];
+        Pack8<T> sv;
+        if (scale != nullptr) sv = reinterpret_cast<const Pack8<T>*>(scale)[k];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const float v = to_f32(xv.v[e]);
+            u[c][e] = scale == nullptr ? v : to_f32(from_f32<T>(v * to_f32(sv.v[e])));
+            if (tid + c * BLOCK < packs) local = fmaf(u[c][e], u[c][e], local);
+        }
+    }
+    const float inv = rsqrtf(block_sum(local, smem) / static_cast<float>(n) + eps);
+    float sq = 0.f;
+    Pack8<T> outs[CH];
+#pragma unroll
+    for (int c = 0; c < CH; ++c) {
+        const int k = tid + c * BLOCK;
+        if (k >= packs) continue;
+        Pack8<T> rv;
+        float gv[8];
+        if (res != nullptr) {
+            rv = reinterpret_cast<const Pack8<T>*>(res + base)[k];
+            const float4 ga = reinterpret_cast<const float4*>(gate)[2 * k];
+            const float4 gb = reinterpret_cast<const float4*>(gate)[2 * k + 1];
+            const float g8[8] = {ga.x, ga.y, ga.z, ga.w, gb.x, gb.y, gb.z, gb.w};
+#pragma unroll
+            for (int e = 0; e < 8; ++e) gv[e] = g8[e];
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            float o = u[c][e] * inv;
+            if (res != nullptr) {
+                const float w = gv[e] / temperature;
+                const float beta = 1.f / (1.f + __expf(-w));
+                const float alpha = sqrtf(fmaxf((1.f / (1.f + __expf(w))) * (1.f + beta), 1e-3f));
+                o = alpha * to_f32(rv.v[e]) + beta * to_f32(from_f32<T>(o));
+            }
+            outs[c].v[e] = from_f32<T>(o);
+            sq += to_f32(outs[c].v[e]) * to_f32(outs[c].v[e]);
+        }
+        reinterpret_cast<Pack8<T>*>(y + base)[k] = outs[c];
+    }
+    if constexpr (NEXT) {
+        const float inv2 = rsqrtf(block_sum(sq, smem) / static_cast<float>(n) + next_eps);
+#pragma unroll
+        for (int c = 0; c < CH; ++c) {
+            const int k = tid + c * BLOCK;
+            if (k >= packs) continue;
+            const Pack8<T> wv = reinterpret_cast<const Pack8<T>*>(next_w)[k];
+            Pack8<T> q;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const float w = to_f32(wv.v[e]) + (plus_one ? 1.f : 0.f);
+                q.v[e] = from_f32<T>(to_f32(outs[c].v[e]) * inv2 * w);
+            }
+            reinterpret_cast<Pack8<T>*>(z + base)[k] = q;
         }
     }
 }
