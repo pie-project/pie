@@ -218,11 +218,54 @@ affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
 // 64-wide slice of the expert's codes is decoded into threadgroup bfloat (an E2M1 value times
 // its power-of-two block scale is exact in bfloat) and multiplied there, two slices in flight
 // so one barrier separates a slice's decode from its multiply.
-constant float kMppMxfp4Lut[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
-                                   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
-
 inline float mpp_mxfp4_scale(uchar code) {
   return code == 0xff ? NAN : metal::ldexp(1.0f, int(code) - 127);
+}
+
+// The multiply of a routed MXFP4 tile's first `R` rows: every thread decodes its run of each
+// slice into `staged`, and the matmul reads only the rows an expert holds.
+template <int R, int N, int S, int BK, int LD, bool BIAS, class Decode>
+inline void mxfp4_mpp_rows(const device bfloat *input, device bfloat *output, int width,
+                           int columns, const device bfloat *bias, ulong column, uint row,
+                           uint column_tile, threadgroup bfloat (&staged)[2][N * LD],
+                           thread Decode &decode) {
+  auto activations = tensor(const_cast<device bfloat *>(input) + ulong(row) * width,
+                            dextents<int, 2>{width, R}, array<int, 2>{1, width});
+  auto weight_view = [&](uint buffer) {
+    return tensor<threadgroup bfloat, dextents<int, 2>, tensor_inline>(
+        staged[buffer], dextents<int, 2>{BK, N}, array<int, 2>{1, LD});
+  };
+  constexpr auto descriptor = matmul2d_descriptor(
+      R, N, BK, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<descriptor, execution_simdgroups<S>> multiply;
+  auto a = activations.template slice<BK, R>(0, 0);
+  auto b = weight_view(0).template slice<BK, N>(0, 0);
+  auto total =
+      multiply.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+  const ulong valid_mask = mpp_valid_mask(total);
+  mpp_for_each(total, valid_mask, [&](ushort i) __attribute__((always_inline)) { total[i] = 0; });
+  uint buffer = 0;
+  auto codes = decode.load(0);
+  for (int k0 = 0; k0 < width; k0 += BK, buffer ^= 1) {
+    decode.store(codes, staged[buffer]);
+    if (k0 + BK < width)
+      codes = decode.load(k0 + BK);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    auto lhs = activations.template slice<BK, R>(k0, 0);
+    auto rhs = weight_view(buffer).template slice<BK, N>(0, 0);
+    multiply.run(lhs, rhs, total);
+  }
+  auto converted =
+      multiply.template get_destination_cooperative_tensor<decltype(a), decltype(b), bfloat>();
+  mpp_for_each(total, valid_mask, [&](ushort i) __attribute__((always_inline)) {
+    float value = total[i];
+    if constexpr (BIAS)
+      value += float(bias[column + total.get_multidimensional_index(i)[0]]);
+    converted[i] = bfloat(value);
+  });
+  auto destination = tensor(output + ulong(row) * columns + column_tile * N,
+                            dextents<int, 2>{columns, R}, array<int, 2>{1, columns});
+  converted.store(destination.template slice<N, R>(0, 0));
 }
 
 template <int M, int N, int S, int TILE, bool BIAS>
@@ -233,11 +276,11 @@ mxfp4_qmm_mpp_routed(const device uchar *codes [[buffer(0)]],
                      constant int &width [[buffer(4)]], constant int &columns [[buffer(5)]],
                      const device bfloat *bias [[buffer(6)]],
                      const device int *tile_expert [[buffer(7)]],
+                     const device int *perm [[buffer(8)]],
                      uint3 position [[threadgroup_position_in_grid]],
                      uint thread_id [[thread_index_in_threadgroup]]) {
   constexpr int BK = 64, LD = BK + 8, THREADS = 32 * S;
   constexpr int BYTES = N * BK / 2, PER_THREAD = BYTES / THREADS;
-  static_assert(PER_THREAD % 4 == 0, "a thread decodes whole words");
   const uint column_tile = position.x, row_tile = position.y;
   const int expert = tile_expert[row_tile * M / TILE];
   if (expert < 0)
@@ -252,58 +295,60 @@ mxfp4_qmm_mpp_routed(const device uchar *codes [[buffer(0)]],
   const uint n = first / (BK / 2), byte = first % (BK / 2);
   const device uchar *code_row = codes + (column + n) * (width / 2) + byte;
   const device uchar *exponent_row = exponents + (column + n) * blocks;
-  auto decode = [&](uint k0, threadgroup bfloat *into) {
-    const device uchar *from = code_row + k0 / 2;
-    threadgroup bfloat *to = into + n * LD + byte * 2;
+  // A run starts on a 16-byte boundary inside one 32-wide block, so it reads one exponent and
+  // one aligned word quad; an E2M1 code's low three bits placed at a half's bits 9..11 read
+  // as the code's value over 2^14, exactly (as mlx's `fp4_e2m1` decodes it).
+  static_assert(PER_THREAD == 16, "a thread decodes one aligned quad of words");
+  struct Slice {
+    uint4 words;
+    float scale;
+  };
+  struct Decoder {
+    const device uchar *code_row;
+    const device uchar *exponent_row;
+    uint offset;
+    Slice load(uint k0) const {
+      return {*reinterpret_cast<const device uint4 *>(code_row + k0 / 2),
+              mpp_mxfp4_scale(exponent_row[k0 / 32])};
+    }
+    void store(Slice slice, threadgroup bfloat *into) const {
+      threadgroup bfloat4 *to = reinterpret_cast<threadgroup bfloat4 *>(into + offset);
 #pragma unroll
-    for (int w = 0; w < PER_THREAD; w += 4) {
-      const float scale = mpp_mxfp4_scale(exponent_row[k0 / 32 + (byte + w) / 16]);
-      const uchar4 four = *reinterpret_cast<const device uchar4 *>(from + w);
+      for (int w = 0; w < 4; ++w) {
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        to[2 * (w + j)] = bfloat(scale * kMppMxfp4Lut[four[j] & 0xf]);
-        to[2 * (w + j) + 1] = bfloat(scale * kMppMxfp4Lut[four[j] >> 4]);
+        for (int h = 0; h < 2; ++h) {
+          const uint word = slice.words[w] >> (16 * h);
+          const uint low = ((word & 0x7u) << 9) | ((word & 0x8u) << 12) |
+                           ((word & 0x70u) << 21) | ((word & 0x80u) << 24);
+          const uint high = (((word >> 8) & 0x7u) << 9) | (((word >> 8) & 0x8u) << 12) |
+                            (((word >> 8) & 0x70u) << 21) | (((word >> 8) & 0x80u) << 24);
+          const float2 a = float2(as_type<half2>(low) * half(16384.0h)) * slice.scale;
+          const float2 b = float2(as_type<half2>(high) * half(16384.0h)) * slice.scale;
+          to[2 * w + h] = bfloat4(bfloat(a.x), bfloat(a.y), bfloat(b.x), bfloat(b.y));
+        }
       }
     }
-  };
-
-  auto activations = tensor(const_cast<device bfloat *>(input) + ulong(row) * width,
-                            dextents<int, 2>{width, M}, array<int, 2>{1, width});
-  auto weight_view = [&](uint buffer) {
-    return tensor<threadgroup bfloat, dextents<int, 2>, tensor_inline>(
-        staged[buffer], dextents<int, 2>{BK, N}, array<int, 2>{1, LD});
-  };
-  constexpr auto descriptor =
-      matmul2d_descriptor(M, N, BK, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<descriptor, execution_simdgroups<S>> multiply;
-  auto a = activations.template slice<BK, M>(0, 0);
-  auto b = weight_view(0).template slice<BK, N>(0, 0);
-  auto total =
-      multiply.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
-  const ulong valid_mask = mpp_valid_mask(total);
-  mpp_for_each(total, valid_mask, [&](ushort i) __attribute__((always_inline)) { total[i] = 0; });
-  uint buffer = 0;
-  for (int k0 = 0; k0 < width; k0 += BK, buffer ^= 1) {
-    decode(k0, staged[buffer]);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    auto lhs = activations.template slice<BK, M>(k0, 0);
-    auto rhs = weight_view(buffer).template slice<BK, N>(0, 0);
-    multiply.run(lhs, rhs, total);
+  } decode{code_row, exponent_row + byte / 16, n * LD + byte * 2};
+  // An expert's rows fill its tiles from the front, so a tile whose later rows no route
+  // claimed multiplies only its leading 16 or 32 rows.
+  if constexpr (M == 64) {
+    if (perm[row + 16] < 0) {
+      mxfp4_mpp_rows<16, N, S, BK, LD, BIAS>(input, output, width, columns, bias, column, row,
+                                             column_tile, staged, decode);
+      return;
+    }
+    if (perm[row + 32] < 0) {
+      mxfp4_mpp_rows<32, N, S, BK, LD, BIAS>(input, output, width, columns, bias, column, row,
+                                             column_tile, staged, decode);
+      return;
+    }
   }
-  auto converted =
-      multiply.template get_destination_cooperative_tensor<decltype(a), decltype(b), bfloat>();
-  mpp_for_each(total, valid_mask, [&](ushort i) __attribute__((always_inline)) {
-    float value = total[i];
-    if constexpr (BIAS)
-      value += float(bias[column + total.get_multidimensional_index(i)[0]]);
-    converted[i] = bfloat(value);
-  });
-  auto destination = tensor(output + ulong(row) * columns + column_tile * N,
-                            dextents<int, 2>{columns, M}, array<int, 2>{1, columns});
-  converted.store(destination.template slice<N, M>(0, 0));
+  mxfp4_mpp_rows<M, N, S, BK, LD, BIAS>(input, output, width, columns, bias, column, row,
+                                        column_tile, staged, decode);
 }
 
 #define PIE_MPP_MXFP4_POINT(name, m, n, s, tile, bias)                                             \
   template [[host_name(name)]] [[kernel]] void mxfp4_qmm_mpp_routed<m, n, s, tile, bias>(          \
       const device uchar *, const device uchar *, const device bfloat *, device bfloat *,          \
-      constant int &, constant int &, const device bfloat *, const device int *, uint3, uint);
+      constant int &, constant int &, const device bfloat *, const device int *, const device int *, \
+      uint3, uint);
