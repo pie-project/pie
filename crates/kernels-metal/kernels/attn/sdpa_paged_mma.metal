@@ -104,7 +104,6 @@ inline void sdpa_paged_mma_body(
   const int mask_word = live ? int(attention_mask_enabled[my_row]) : 0;
   const bool masked  = mask_word != 0;
   const bool wide    = mask_word == 2;
-  const int my_req   = live ? req_of_token[my_row] : -1;
 
   float Ov[DF * 2];
   for (int i = 0; i < DF * 2; i++) Ov[i] = 0.0f;
@@ -133,7 +132,10 @@ inline void sdpa_paged_mma_body(
       kp_hi = int(kv_page_indptr[r + 1] - uint(page_base)) * page_size - 1;
     }
 
-    const bool mine = live && my_req == r;
+    // Only this run's rows: a request's rows may come back in a later run of
+    // the tile, which reads its keys again.
+    const int local = my_row - row_lo;
+    const bool mine = live && local >= sub && local < sub_hi;
 
     for (int base = kp_lo; base <= kp_hi; base += KT) {
       const int cnt = min(KT, kp_hi + 1 - base);

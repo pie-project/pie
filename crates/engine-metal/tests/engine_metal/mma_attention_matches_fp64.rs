@@ -35,7 +35,7 @@ fn f32s(v: &[u8]) -> Vec<f32> {
 }
 
 #[test]
-fn wide_head_mma_attention_matches_fp64() {
+fn mma_attention_matches_fp64() {
     let Ok(dev) = Context::bind() else {
         return;
     };
@@ -43,8 +43,11 @@ fn wide_head_mma_attention_matches_fp64() {
     let pipes = Pipelines::new();
     let tuning = engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"tiled\"", false);
     // (head dim, rows, query heads, kv heads, requests, pages per request, first position)
+    // Interleaved owners bring a request's rows back in later runs of a tile.
     for (d, m, qh, kh, requests, np, base) in [
-        (256usize, 35usize, 6usize, 2usize, 3usize, 3usize, 65usize),
+        (64usize, 35usize, 8usize, 2usize, 3usize, 3usize, 65usize),
+        (64, 300, 4, 1, 2, 12, 0),
+        (256, 35, 6, 2, 3, 3, 65),
         (256, 64, 8, 4, 2, 4, 65),
         (256, 600, 2, 1, 3, 10, 65),
         (512, 35, 4, 2, 3, 3, 65),
