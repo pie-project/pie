@@ -30,6 +30,7 @@ mod the_kv_write_round_trips;
 mod the_miniature_drafts;
 mod the_mpp_prefill_matches_affine_dots;
 mod the_mpp_routed_matmul_matches_affine_dots;
+mod the_mpp_routed_mxfp4_matmul_matches_its_dots;
 mod the_packed_kv_decode_reads;
 mod the_packed_kv_page_migrates;
 mod the_packed_kv_tiled_reads;
@@ -45,6 +46,7 @@ mod the_split_mlp_matches_the_gpu_alone;
 mod the_staged_rows_match_affine_dots;
 mod the_tower_reads_pixels_as_the_host_cut_them;
 mod the_voxel_axis_answers_its_host_reference;
+mod wide_head_mma_attention_matches_fp64;
 
 /// The bytes a pool takes that holds `slots` sequences at `context`, the
 /// `device_kv_budget` a test states for its shell.

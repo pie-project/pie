@@ -42,6 +42,10 @@ pub fn sorted_rows(pairs: u32, experts: u32, tuning: &crate::Tuning) -> u32 {
     if tile <= 1 {
         return pairs;
     }
+    stack_rows(pairs, experts, tile)
+}
+
+fn stack_rows(pairs: u32, experts: u32, tile: u32) -> u32 {
     let touched = pairs.min(experts);
     let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
     bound.div_ceil(tile) * tile
@@ -696,6 +700,30 @@ fn mpp_point(
     fits.then_some((m, n, simdgroups))
 }
 
+/// The MPP point of a routed MXFP4 matmul, as `(row tile, column tile, simdgroups)`: the
+/// codes are decoded into threadgroup bfloat a 64-wide slice at a time, as mlx-lm's
+/// `gather_qmm_rhs_nax` does, so a row tile is the sorted tile, inside one expert's rows.
+fn mxfp4_mpp_point(
+    x: Tensor,
+    bank: Bank,
+    y: Tensor,
+    tile: u32,
+    tuning: &crate::Tuning,
+) -> Option<(u32, u32, u32)> {
+    // A bank lays an expert's codes out as `y.width` rows of `x.width` or as one row.
+    let whole =
+        bank.ld == x.width || u64::from(bank.ld) == u64::from(y.width) * u64::from(x.width) / 2;
+    let fits = tuning.moe_mpp()
+        && !bank.affine()
+        && bank.group == MXFP4_BLOCK
+        && bank.bits == 4
+        && whole
+        && tile >= 32
+        && x.width.is_multiple_of(64)
+        && y.width.is_multiple_of(64);
+    fits.then_some((tile, 64, 4))
+}
+
 fn batched_point(
     op: &'static str,
     bank: Bank,
@@ -747,12 +775,31 @@ pub struct Sorted {
     pub output: bool,
 }
 
-/// The rows a batched routed matmul sorts `pairs` routes into, and its tile,
-/// when it runs at all.
+/// The rows a batched routed matmul of `x` over `bank` into `y` sorts its routes into, and
+/// its tile, when it runs at all.
 #[must_use]
-pub fn sorted_stack(pairs: u32, experts: u32, tuning: &crate::Tuning) -> Option<(u32, u32)> {
-    let tile = tile_rows(pairs, experts, tuning);
-    (tile > 1).then(|| (sorted_rows(pairs, experts, tuning), tile))
+pub fn sorted_stack(
+    x: Tensor,
+    bank: Bank,
+    y: Tensor,
+    experts: u32,
+    tuning: &crate::Tuning,
+) -> Option<(u32, u32)> {
+    let tile = tile_rows(y.rows, experts, tuning);
+    (tile > 1).then(|| {
+        let tile = bank_tile(x, bank, y, tile, tuning);
+        (stack_rows(y.rows, experts, tile), tile)
+    })
+}
+
+/// A 64-row tile only where the MXFP4 MPP kernel multiplies it whole; any other kernel
+/// multiplies at most 32 rows at a time, and the wider tile would only pad more.
+fn bank_tile(x: Tensor, bank: Bank, y: Tensor, tile: u32, tuning: &crate::Tuning) -> u32 {
+    if tile == MOE_TILE_ROWS[3] && mxfp4_mpp_point(x, bank, y, tile, tuning).is_none() {
+        MOE_TILE_ROWS[2]
+    } else {
+        tile
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -787,17 +834,15 @@ pub fn matmul_select_batched(
     if tile == MOE_TILE_ROWS[0] && !(fp16 && bank.affine() && bank.bits == 4 && bank.group == 64) {
         tile = MOE_TILE_ROWS[1];
     }
-    let padded = {
-        let touched = pairs.min(experts);
-        let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
-        bound.div_ceil(tile) * tile
-    };
+    let tile = bank_tile(x, bank, y, tile, tuning);
+    let padded = stack_rows(pairs, experts, tile);
     let sums = scratch.sums;
     let sums_fit = sums.dtype == Dtype::F32
         && u64::from(sums.rows) * u64::from(sums.width)
             >= u64::from(padded) * u64::from(x.width / 64);
     let mpp = mpp_point(x, bank, bias.is_some(), y, tile, tuning).filter(|_| sums_fit);
-    let point = match mpp {
+    let mxfp4 = mxfp4_mpp_point(x, bank, y, tile, tuning);
+    let point = match mpp.or(mxfp4) {
         Some(_) => None,
         None => match batched_point(op, bank, bias.is_some(), tile, bn, fp16)? {
             Some(point) => Some(point),
@@ -847,7 +892,36 @@ pub fn matmul_select_batched(
         )?;
     }
 
-    if let Some((m, n, simdgroups)) = mpp {
+    if let Some((m, n, simdgroups)) = mxfp4 {
+        const FILE: &str = "linear/quant_qmm_mpp.metal";
+        let biased = bias.is_some();
+        let entry = crate::linear::quant::symbol(&format!(
+            "mxfp4_qmm_mpp_routed_m{m}_n{n}_s{simdgroups}_t{tile}_b{}",
+            u8::from(biased)
+        ));
+        let stamp = crate::linear::quant::symbol(&format!(
+            "PIE_MPP_MXFP4_POINT(\"{entry}\",{m},{n},{simdgroups},{tile},{biased})"
+        ));
+        ctx.fire(
+            Fire::at(FILE, entry).stamp(stamp).apply(Grid::of(
+                [32 * simdgroups * (y.width / n), padded / m, 1],
+                [32 * simdgroups, 1, 1],
+            )),
+            &[
+                bank.codes.arg(),
+                bank.scales.arg(),
+                scratch.x.arg(),
+                scratch.y.arg_mut(),
+                stated(op, x.width)?.arg(),
+                stated(op, y.width)?.arg(),
+                match bias {
+                    Some(bias) => bias.arg(),
+                    None => ctx.absent()?,
+                },
+                scratch.tile_expert.arg(),
+            ],
+        )?;
+    } else if let Some((m, n, simdgroups)) = mpp {
         const FILE: &str = "linear/quant_qmm_mpp.metal";
         let k = stated(op, x.width)?;
         ctx.fire(

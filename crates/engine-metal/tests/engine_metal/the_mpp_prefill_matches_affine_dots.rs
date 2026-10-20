@@ -33,12 +33,14 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
         (192, 256),
         (512, 384),
         (128, 160),
+        (256, 320),
         (512, 1024),
         (5120, 34816),
         (17408, 5120),
         (5120, 12288),
         (5120, 16384),
         (6144, 5120),
+        (2880, 2880),
     ];
     for exact in [true, false] {
         for &(k, n) in &cases {
@@ -141,7 +143,7 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
                 ld: k,
             };
             for m in [8u32, 17, 32, 65, 2048] {
-                if !exact && !(n % 128 == 0 && (m > 16 || n >= 1024)) {
+                if !exact && !(n % 64 == 0 && (m > 16 || n >= 1024)) {
                     continue;
                 }
                 if k > 512 && ![8, 2048].contains(&m) {
