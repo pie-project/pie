@@ -559,6 +559,13 @@ pub struct SsmConvVec4;
 #[decision(id = "kernel.ssm.gdn_out_bf16", flag, default = false, tune = search)]
 pub struct SsmGdnOutBf16;
 
+/// The most blocks an SM seats of the fused gated delta decode step: 4 but
+/// where a chip's profile says (A100's 3: its persistent warps stream the
+/// state 7% faster).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_step_blocks", constant(set(1, 2, 3, 4)), default = 4, tune = search)]
+pub struct SsmGdnStepBlocks(pub u32);
+
 /// Whether a prefill the tcgen05 FMHA (`attn/tc5_fmha.cuh`, sm_100a) can
 /// serve runs on it; off, FA2 serves every prefill, as before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -672,6 +679,7 @@ pub fn register(registry: &mut Registry) {
         .add::<ElemwiseHcMma>()
         .add::<SsmConvVec4>()
         .add::<SsmGdnOutBf16>()
+        .add::<SsmGdnStepBlocks>()
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
@@ -792,6 +800,7 @@ tuning! {
     hc_mma: bool = false, on ElemwiseHcMma;
     ssm_conv_vec4: bool = false, on SsmConvVec4;
     ssm_gdn_out_bf16: bool = false, on SsmGdnOutBf16;
+    ssm_gdn_step_blocks: u32 = 4, get SsmGdnStepBlocks;
     merge_warp: bool = false, on SdpaMergeWarp;
     mxfp4_mma_until: u32 = 0, get MoeMxfp4MmaUntil;
     mxfp4_mma_from: u32 = 64, get MoeMxfp4MmaFrom;

@@ -25,7 +25,12 @@ sdpa.fa2_live = true
 moe.mxfp4_mma_from = 17
 moe.mxfp4_mma_until = 16777216
 sdpa.dsv4_replay = true
-ssm = ["gdn_fused_scan", "conv_vec4", "gdn_out_bf16", "kda_chunked", "kda_step_fused"]
+ssm.gdn_fused_scan = true
+ssm.conv_vec4 = true
+ssm.gdn_out_bf16 = true
+ssm.kda_chunked = true
+ssm.kda_step_fused = true
+ssm.gdn_step_blocks = 3
 
 # A prefill's fire on four buckets a doubling from 256 rows (its GEMMs run
 # its bucket's rows), and a bucket between powers of two below.
@@ -55,6 +60,7 @@ measured = [
   "kernel.moe.mxfp4_mma_from",
   "kernel.moe.mxfp4_mma_until",
   "kernel.ssm.gdn_fused_scan",
+  "kernel.ssm.gdn_step_blocks",
   "kernel.ssm.conv_vec4",
   "kernel.ssm.gdn_out_bf16",
   "kernel.ssm.kda_chunked",
