@@ -440,12 +440,19 @@ fn fold_warp(ctx: &Ctx, op: &'static str, split: &Partials, num_sms: u32) -> Res
     const WARPS: u32 = 8;
     let pairs = split.max_seq_len.saturating_mul(split.num_heads);
     let blocks = pairs.div_ceil(WARPS).clamp(1, num_sms.saturating_mul(8));
+    // A narrower live width folds its columns alone.
+    let live = match split.live {
+        live if live != 0 && live < split.head_dim && live.is_multiple_of(64) => {
+            format!(", {live}")
+        }
+        _ => String::new(),
+    };
     ctx.fire(
         op,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::attn::merge_partials_warp<{}, {sink}>",
+                "::pie::attn::merge_partials_warp<{}, {sink}{live}>",
                 split.head_dim
             )),
         )

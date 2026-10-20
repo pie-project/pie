@@ -437,6 +437,10 @@ fn fa2_prefill_with(
         }
     }
     if plan.info.split_kv {
+        let split = fa2_abi::Partials {
+            live: if widths == [head; 2] { 0 } else { widths[1] },
+            ..split
+        };
         fa2::fold(ctx, op, &sinked(split, sinks))
     } else {
         Ok(false)
