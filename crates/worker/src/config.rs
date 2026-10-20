@@ -227,10 +227,11 @@ pub struct ServerConfig {
     /// Largest blob a client may upload in one request.
     #[serde(default = "default_max_upload")]
     pub max_upload: ByteSize,
-    /// The cluster-plane PLEX policy: a built-in policy's name or a component
-    /// path; omit to run none. The worker plane's is `[runtime] policy`.
+    /// The cluster-plane policies: each a built-in policy's name or a
+    /// component path, no two granted the same write; omit to run none. The
+    /// worker plane's is `[runtime] policy`.
     #[serde(default)]
-    pub policy: Option<String>,
+    pub policies: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -241,7 +242,7 @@ impl Default for ServerConfig {
             verbose: false,
             worker_threads: default_worker_threads(),
             max_upload: default_max_upload(),
-            policy: None,
+            policies: Vec::new(),
         }
     }
 }
@@ -538,6 +539,10 @@ const RETIRED: &[(&str, &str)] = &[
 /// Keys of the remote executor and partner links, which are gone: a worker
 /// of any role runs a runtime, and peers' passes ride the peer link.
 const RETIRED_KEYS: &[(&str, &str)] = &[
+    (
+        "server.policy",
+        "`[server] policies` lists the cluster policies, each granted its own writes",
+    ),
     (
         "executor.max_clients",
         "no worker leases kv to remote clients; a prefill worker runs a runtime",

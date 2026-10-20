@@ -125,6 +125,14 @@ pub enum LoadError {
     Compile(String),
     #[error("does not instantiate: {0}")]
     Instantiate(String),
+    #[error("`{0}` {1}")]
+    Of(String, Box<LoadError>),
+    #[error("`{first}` and `{second}` are both granted `{grant}`")]
+    Shared {
+        grant: String,
+        first: String,
+        second: String,
+    },
 }
 
 pub struct Program {
@@ -266,30 +274,52 @@ fn start(
     Ok((store, instance))
 }
 
-/// Loads a program on a thread of its own named `thread`, which then runs
-/// `serve` with it; the manifest, or why it did not load, comes back here.
+/// Loads programs on a thread of their own named `thread`, which then runs
+/// `serve` with them; their manifests, or why one did not load, come back
+/// here. No two may be granted the same write: each table has one author.
 pub fn spawn(
-    name: &str,
-    component: &[u8],
+    programs: Vec<(String, Vec<u8>)>,
     capability: fn(&str) -> bool,
     thread: &str,
-    serve: impl FnOnce(Program) + Send + 'static,
-) -> Result<Manifest, LoadError> {
-    let (name, component) = (name.to_string(), component.to_vec());
+    serve: impl FnOnce(Vec<Program>) + Send + 'static,
+) -> Result<Vec<Manifest>, LoadError> {
     let (loaded, outcome) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name(thread.into())
-        .spawn(
-            move || match Program::load(&name, &component, &capability) {
-                Ok(program) => {
-                    let _ = loaded.send(Ok(program.manifest().clone()));
-                    serve(program);
+        .spawn(move || {
+            let programs = programs
+                .iter()
+                .map(|(name, component)| {
+                    Program::load(name, component, &capability)
+                        .map_err(|error| LoadError::Of(name.clone(), Box::new(error)))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|programs| {
+                    let mut authors: HashMap<&str, &str> = HashMap::new();
+                    for program in &programs {
+                        for grant in &program.manifest.grants {
+                            if let Some(first) = authors.insert(grant, &program.name) {
+                                return Err(LoadError::Shared {
+                                    grant: grant.clone(),
+                                    first: first.to_string(),
+                                    second: program.name.clone(),
+                                });
+                            }
+                        }
+                    }
+                    Ok(programs)
+                });
+            match programs {
+                Ok(programs) => {
+                    let manifests = programs.iter().map(|p| p.manifest.clone()).collect();
+                    let _ = loaded.send(Ok(manifests));
+                    serve(programs);
                 }
                 Err(error) => {
                     let _ = loaded.send(Err(error));
                 }
-            },
-        )
+            }
+        })
         .map_err(|e| LoadError::Instantiate(format!("spawning its thread: {e}")))?;
     outcome
         .recv()

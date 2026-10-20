@@ -119,9 +119,11 @@ pub type Started = (
 );
 
 impl Cluster {
+    /// Starts the cluster policies `programs` names, (name, component), on
+    /// one thread: each call goes to every one, and each writes what its
+    /// manifest grants it, which no other may.
     pub fn start(
-        name: &str,
-        component: &[u8],
+        programs: Vec<(String, Vec<u8>)>,
         routing: watch::Receiver<RoutingTable>,
         mut connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
         fleet: crate::worker::WorkerRegistry,
@@ -139,12 +141,14 @@ impl Cluster {
         });
         let (events, rx) = channel();
         let dead = Arc::new(AtomicBool::new(false));
-        let manifest = program::spawn(name, component, capability, "pie-cluster-policy", {
+        let names: Vec<String> = programs.iter().map(|(name, _)| name.clone()).collect();
+        let manifests = program::spawn(programs, capability, "pie-cluster-policy", {
             let (shared, dead) = (shared.clone(), dead.clone());
             let (fleet, handle) = (fleet.clone(), tokio::runtime::Handle::current());
-            move |program| run(program, rx, shared, routing, dead, fleet, handle)
+            move |programs| run(programs, rx, shared, routing, dead, fleet, handle)
         })?;
-        let gate = Duration::from_millis(manifest.gate_ms);
+        // A launch waits for the slowest to hear it.
+        let gate = Duration::from_millis(manifests.iter().map(|m| m.gate_ms).max().unwrap_or(0));
 
         let workers = events.clone();
         tokio::spawn(async move {
@@ -181,7 +185,7 @@ impl Cluster {
                 }
             }
         });
-        tracing::info!(policy = name, "cluster policy started");
+        tracing::info!(policies = ?names, "cluster policies started");
         Ok((
             Arc::new(Self {
                 events,
@@ -390,7 +394,7 @@ impl Drop for Waiting<'_> {
 }
 
 fn run(
-    mut program: Program,
+    mut programs: Vec<Program>,
     events: Receiver<Event>,
     shared: Arc<Shared>,
     routing: watch::Receiver<RoutingTable>,
@@ -400,7 +404,7 @@ fn run(
 ) {
     let mut registry = Registry::default();
     loop {
-        let first = match program.alarm() {
+        let first = match programs.iter().filter_map(Program::alarm).min() {
             Some(at_ms) => {
                 let wait = at_ms.saturating_sub(now_ms());
                 match events.recv_timeout(Duration::from_millis(wait)) {
@@ -423,10 +427,6 @@ fn run(
             }
             registry.apply(event, &mut edges);
         }
-        let now = now_ms();
-        if program.alarm().is_some_and(|at_ms| at_ms <= now) {
-            edges.push(Edge::Timer);
-        }
         // A worker the controller now grades degraded is draining.
         let degraded: BTreeSet<String> = routing
             .borrow()
@@ -440,7 +440,16 @@ fn run(
         }
         registry.draining = degraded;
 
-        if !edges.is_empty() {
+        let now = now_ms();
+        let mut withdrawn = Vec::new();
+        for (at, program) in programs.iter_mut().enumerate() {
+            let mut edges = edges.clone();
+            if program.alarm().is_some_and(|at_ms| at_ms <= now) {
+                edges.push(Edge::Timer);
+            }
+            if edges.is_empty() {
+                continue;
+            }
             tracing::debug!(policy = program.name(), ?edges, "cluster policy edges");
             let plane = registry.snapshot(&routing.borrow());
             match program.react(Box::new(plane), edges, now) {
@@ -453,25 +462,31 @@ fn run(
                         "cluster policy call"
                     );
                     enact(&shared, &mut registry, commit);
-                    replicate(&mut registry, &fleet, &handle);
                 }
                 Err(Fault::Dead(error)) => {
                     tracing::error!(policy = program.name(), %error, "cluster policy is dead; its tables are withdrawn");
-                    dead.store(true, Ordering::Release);
-                    *shared.tables.write().unwrap() = Tables::default();
-                    shared.heard.send_replace(u64::MAX);
-                    shared.changed.notify_waiters();
-                    return;
+                    withdraw(&shared, &mut registry, program.manifest());
+                    withdrawn.push(at);
                 }
                 Err(fault) => {
                     tracing::warn!(policy = program.name(), %fault, "cluster policy call discarded");
                 }
             }
         }
+        for at in withdrawn.into_iter().rev() {
+            programs.remove(at);
+        }
+        if programs.is_empty() {
+            dead.store(true, Ordering::Release);
+            shared.heard.send_replace(u64::MAX);
+            shared.changed.notify_waiters();
+            return;
+        }
         // A replication table stands until replaced: what it asks for and
         // is not yet so is asked for again.
-        if registry.ticked {
+        if registry.ticked || registry.replaced {
             registry.ticked = false;
+            registry.replaced = false;
             replicate(&mut registry, &fleet, &handle);
         }
         // Whether or not a call ran, the gate has nothing more to wait for.
@@ -479,6 +494,23 @@ fn run(
             shared.heard.send_modify(|h| *h = (*h).max(seq));
         }
     }
+}
+
+/// A dead program's tables revert to empty; the others' stand.
+fn withdraw(shared: &Shared, registry: &mut Registry, manifest: &super::manifest::Manifest) {
+    {
+        let mut tables = shared.tables.write().unwrap();
+        if manifest.grants("schedule") {
+            tables.schedule = None;
+        }
+        if manifest.grants("placement") {
+            tables.placement.clear();
+        }
+    }
+    if manifest.grants("replication") {
+        registry.replication.clear();
+    }
+    shared.changed.notify_waiters();
 }
 
 /// Asks each site the replication table names, and that does not hold its
@@ -537,6 +569,7 @@ fn replicate(
 fn enact(shared: &Shared, registry: &mut Registry, commit: Commit) {
     if let Some(replication) = commit.state.replication {
         registry.replication = replication;
+        registry.replaced = true;
     }
     let mut changed = false;
     {
@@ -623,6 +656,8 @@ struct Registry {
     asked: HashMap<(String, String), std::time::Instant>,
     /// The directory was heard since the table was last enacted.
     ticked: bool,
+    /// The table was replaced since it was last enacted.
+    replaced: bool,
     /// What each worker's policy published about it, by name.
     published: HashMap<String, HashMap<String, serde_json::Value>>,
     /// Workers draining, as of the routing table last heard.
@@ -1241,14 +1276,28 @@ mod tests {
         _connected: watch::Sender<Arc<HashSet<WorkerId>>>,
     }
 
+    fn programs(names: &[&str]) -> Vec<(String, Vec<u8>)> {
+        names
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    builtins::policy(name).unwrap().component.to_vec(),
+                )
+            })
+            .collect()
+    }
+
     fn rig(kv: u8) -> Rig {
+        rig_of(kv, &["test-route"])
+    }
+
+    fn rig_of(kv: u8, names: &[&str]) -> Rig {
         let (table, table_rx) = watch::channel(table(kv));
         let (connected, connected_rx) = watch::channel(Arc::new(HashSet::from([WorkerId(1)])));
         let routing = RoutingHandle::new(table_rx.clone(), connected_rx.clone());
-        let component = builtins::policy("test-route").unwrap().component;
         let (router, cancelled, _moves) = Cluster::start(
-            "test-route",
-            component,
+            programs(names),
             table_rx,
             connected_rx,
             crate::worker::WorkerRegistry::new(),
@@ -1282,6 +1331,40 @@ mod tests {
         assert_eq!(props["from"], serde_json::json!("1"));
         assert_eq!(rig.router.placement(&free).0, None, "the router's default");
         waiting.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_policy_beside_another_places_what_it_places() {
+        let rig = rig_of(0, &["replicate", "test-route"]);
+        let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
+        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        assert_eq!(rig.router.placement(&placed).0, Some(WorkerId(1)));
+    }
+
+    #[tokio::test]
+    async fn two_policies_granted_the_same_write_do_not_load() {
+        let (_table, table_rx) = watch::channel(table(0));
+        let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::new()));
+        let started = Cluster::start(
+            programs(&["test-route", "cache-aware"]),
+            table_rx,
+            connected_rx,
+            crate::worker::WorkerRegistry::new(),
+        );
+        match started {
+            Err(LoadError::Shared {
+                grant,
+                first,
+                second,
+            }) => {
+                assert_eq!(
+                    (grant.as_str(), first.as_str(), second.as_str()),
+                    ("placement", "test-route", "cache-aware")
+                );
+            }
+            Err(other) => panic!("refused for sharing a write, got {other}"),
+            Ok(_) => panic!("refused for sharing a write, but it loaded"),
+        }
     }
 
     // One thread, so each records its release as it is released.

@@ -6,7 +6,9 @@ in the config:
 - the worker plane (when a worker's passes run, where its state sits) in
   `[runtime] policy`;
 - the cluster plane (where programs and their state live), in `pie serve`,
-  in `[server] policy`.
+  in `[server] policies`, a list: several run side by side so long as no
+  two are granted the same write (`cache-aware` places launches while
+  `replicate` keeps runs on two workers).
 
 A policy reads the props a client sends with a launch (as request headers,
 in a compat body, or as `LaunchProcess.props`) and the session it names.

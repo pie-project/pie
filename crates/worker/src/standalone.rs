@@ -128,6 +128,6 @@ pub fn derive_standalone(
     let worker = crate::Config::parse(combined).context("parsing config")?;
     let controller = controller::Config::parse("").context("controller defaults")?;
     let mut gateway = gateway::Config::parse("").context("gateway defaults")?;
-    gateway.policy = worker.server.policy.clone();
+    gateway.policies = worker.server.policies.clone();
     Ok((controller, gateway, worker))
 }

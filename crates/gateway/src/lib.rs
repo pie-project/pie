@@ -39,10 +39,11 @@ pub struct Config {
     pub worker_listen: SocketAddr,
     #[serde(default = "default_controller")]
     pub controller: String,
-    /// A built-in policy's name or a component path; none keeps the gateway's
-    /// own order.
+    /// The cluster policies: each a built-in policy's name or a component
+    /// path, no two granted the same write; none keeps the gateway's own
+    /// order.
     #[serde(default)]
-    pub policy: Option<String>,
+    pub policies: Vec<String>,
 }
 
 fn default_listen() -> SocketAddr {
@@ -61,7 +62,7 @@ impl Default for Config {
             listen: default_listen(),
             worker_listen: default_worker_listen(),
             controller: default_controller(),
-            policy: None,
+            policies: Vec::new(),
         }
     }
 }
@@ -297,20 +298,22 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
 
     let workers = WorkerRegistry::new();
     let routing = RoutingHandle::new(routing_rx, workers.connected_watch());
-    let router = match &config.policy {
-        Some(spec) => {
-            let component = builtins::policy_component(spec)?;
-            let (router, cancelled, moves) = policy::Cluster::start(
-                spec,
-                &component,
-                routing.table_watch(),
-                workers.connected_watch(),
-                workers.clone(),
-            )
-            .with_context(|| format!("load the cluster policy `{spec}`"))?;
-            Some((router, cancelled, moves))
-        }
-        None => None,
+    let router = if config.policies.is_empty() {
+        None
+    } else {
+        let programs = config
+            .policies
+            .iter()
+            .map(|spec| Ok((spec.clone(), builtins::policy_component(spec)?.into_owned())))
+            .collect::<Result<Vec<_>>>()?;
+        let (router, cancelled, moves) = policy::Cluster::start(
+            programs,
+            routing.table_watch(),
+            workers.connected_watch(),
+            workers.clone(),
+        )
+        .context("load the cluster policies")?;
+        Some((router, cancelled, moves))
     };
     let policy_router = router.as_ref().map(|(router, _, _)| router.clone());
     let sessions = Sessions::new(Arc::new(RouteBackend {
