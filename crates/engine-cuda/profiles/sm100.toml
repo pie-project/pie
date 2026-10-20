@@ -77,6 +77,12 @@ gemm.bias_epilogue = true
 moe.w4a4_fused_from = 1
 # A narrow W4A4 fire lays its routes out and quantizes them in one launch.
 moe.w4a4_fused_layout = true
+# A decode's routed units dealt evenly over the fewest CTAs that keep their
+# waves, from three waves (two waves' short units hide their latency on the
+# SMs it would retire); the routing held for the bank's experts alone, the
+# room to the ring.
+moe.even_waves_from = 3
+moe.routes_sized = true
 moe.w4a8_fused_from = 512
 # The fused qkv write a warp a head below 256 rows.
 attn.qkv_rows_from = 256

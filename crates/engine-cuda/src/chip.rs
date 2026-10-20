@@ -547,6 +547,8 @@ mod tests {
                         gemm_bias_epilogue: false,
                         moe_w4a4_fused_from: 65_536,
                         moe_w4a4_fused_layout: defaults.moe_w4a4_fused_layout,
+                        moe_even_waves_from: defaults.moe_even_waves_from,
+                        moe_routes_sized: defaults.moe_routes_sized,
                         moe_w4a8_fused_from: 65_536,
                         mla_expanded_from: 65_536,
                         gemm_fp8_gemv_until: 0,
@@ -797,6 +799,7 @@ mod tests {
             ),
             (64, 32, 1)
         );
+        assert_eq!((b200.moe_even_waves_from, b200.moe_routes_sized), (3, true));
         assert_eq!(b200.moe_w4a8_fused_from, 512);
         assert_eq!(b200.mla_expanded_from, 256);
         assert_eq!(b200.gemm_fp8_gemv_until, 4);
