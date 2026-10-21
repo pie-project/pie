@@ -24,6 +24,8 @@ pub(crate) struct RequestCapacityUsage {
     pub(crate) forward_requests: usize,
     pub(crate) forward_tokens: usize,
     pub(crate) page_refs: usize,
+    /// Its lanes that capture attention scores.
+    pub(crate) scoring_lanes: usize,
 }
 
 pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapacityUsage {
@@ -34,6 +36,21 @@ pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> Re
         forward_requests,
         forward_tokens: req.request.tokens(),
         page_refs: req.request.pages().count(),
+        scoring_lanes: req
+            .request
+            .lanes
+            .iter()
+            .filter(|lane| lane.captures_scores)
+            .count(),
+    }
+}
+
+/// The lanes of one fire that may capture attention scores.
+fn scoring_ceiling(limits: &SchedulerLimits) -> usize {
+    if limits.max_scoring_lanes == 0 {
+        limits.max_forward_requests
+    } else {
+        limits.max_scoring_lanes
     }
 }
 
@@ -67,6 +84,14 @@ impl AdmissionLimits {
                 usage.page_refs, self.limits.max_page_refs
             ));
         }
+        if usage.scoring_lanes > scoring_ceiling(&self.limits) {
+            return Some(format!(
+                "forward request has {} lanes capturing attention scores, exceeding engine \
+                 limit {}",
+                usage.scoring_lanes,
+                scoring_ceiling(&self.limits)
+            ));
+        }
         None
     }
 }
@@ -78,6 +103,7 @@ pub(crate) struct StepGroup {
     forward_requests: usize,
     forward_tokens: usize,
     page_refs: usize,
+    scoring_lanes: usize,
 }
 
 impl StepGroup {
@@ -103,6 +129,7 @@ impl StepGroup {
         self.forward_requests.saturating_add(usage.forward_requests) <= limits.max_forward_requests
             && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
             && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
+            && self.scoring_lanes.saturating_add(usage.scoring_lanes) <= scoring_ceiling(&limits)
     }
 
     pub(crate) fn push(
@@ -119,6 +146,7 @@ impl StepGroup {
         self.forward_requests = self.forward_requests.saturating_add(usage.forward_requests);
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
+        self.scoring_lanes = self.scoring_lanes.saturating_add(usage.scoring_lanes);
         self.forward_requests >= limits.max_forward_requests
             || self.forward_tokens >= limits.max_forward_tokens
             || self.page_refs >= limits.max_page_refs
@@ -337,6 +365,7 @@ mod tests {
             max_context: 0,
             prefill_rows: 0,
             max_readouts: 0,
+            max_scoring_lanes: 0,
         }
     }
 

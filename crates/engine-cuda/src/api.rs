@@ -634,6 +634,7 @@ impl Engine for Cuda {
                 prefill_rows: 0,
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
                     .unwrap_or(u32::MAX),
+                max_scoring_lanes: shell.scoring_lanes(),
             },
             profile,
             ports: PortMask::DEVICE_GEOMETRY

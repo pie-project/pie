@@ -651,6 +651,8 @@ fn score_capture_averages_the_observed_rows_mass() {
         Dtype::F32,
     );
     let scale = 1.0 / (d as f32).sqrt();
+    // Each lane seated at its own block.
+    let seat_of = gpu.column(&(0..(lane_offset + n) as i32).collect::<Vec<_>>());
     kernels_rocm::attn_score::capture(
         &ctx,
         q,
@@ -666,6 +668,7 @@ fn score_capture_averages_the_observed_rows_mass() {
         plane,
         kv_max,
         &mut scores,
+        &seat_of,
     )
     .unwrap();
     let got = gpu.read(&scores);

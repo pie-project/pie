@@ -55,6 +55,7 @@ impl Run<'_> {
             plane,
             crate::scores::KV_MAX,
             &mut slab,
+            &seat.seat_of,
         )
     }
 

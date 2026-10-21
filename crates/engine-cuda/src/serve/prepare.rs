@@ -764,6 +764,9 @@ impl FrameShell for Shell {
             indptr: vec![0],
             ..Default::default()
         };
+        let scoring = lanes.iter().any(|seated| seated.captures_scores);
+        let mut score_seats: Vec<i32> = Vec::new();
+        let mut score_seat_of: Vec<Option<u32>> = vec![None; lanes.len()];
         let mut adapter_routes: Vec<i32> = Vec::new();
         let any_adapter = lanes.iter().any(|seated| seated.adapter.is_some());
         if any_adapter {
@@ -863,6 +866,16 @@ impl FrameShell for Shell {
                 bidirectional: seated.bidirectional,
             });
             slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
+            if scoring {
+                // Capturing lanes take the slab's seats in the order the
+                // fire lays its lanes out.
+                let seat = seated.captures_scores.then(|| {
+                    let seat = score_seat_of.iter().flatten().count() as u32;
+                    score_seat_of[source] = Some(seat);
+                    seat
+                });
+                score_seats.push(seat.map_or(-1, |seat| seat as i32));
+            }
             if !seated.rs_snapshots.is_empty() && row.rows as usize != lane.tokens.len() {
                 return Err(Fault::program(
                     "serve::rs",
@@ -1503,6 +1516,15 @@ impl FrameShell for Shell {
         let geometries = geometries;
 
         super::btrace::mark("windows");
+        let capturing = score_seat_of.iter().flatten().count() as u64;
+        let seated_scores = self.scores.as_ref().map_or(0, crate::scores::Scores::seats);
+        if capturing > u64::from(seated_scores) {
+            return Err(Fault::Ceiling {
+                what: "capturing lanes the score slab seats",
+                need: capturing,
+                have: u64::from(seated_scores),
+            });
+        }
         let slot = self.inputs.claim()?;
         let packing_fires: Vec<crate::inputs::PackingFire<'_>> = packings
             .iter()
@@ -1532,6 +1554,7 @@ impl FrameShell for Shell {
                 lane_reach: lane_carve,
                 lane_of_row: &lane_of_row,
                 group_of_lane: &group_of_lane,
+                score_seats: &score_seats,
                 packings: &packing_fires,
                 class_table: class_table
                     .as_ref()
@@ -1608,6 +1631,7 @@ impl FrameShell for Shell {
             patch_ladder,
             towered: self.towered,
             lanes,
+            score_seat_of,
             attachments,
             composition,
             readout_rows,

@@ -45,6 +45,7 @@ pub fn capture(
     plane: u32,
     kv_max: u32,
     scores: &mut Tensor,
+    seat_of: &Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.score_capture";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
@@ -129,10 +130,9 @@ pub fn capture(
         "`{OP}` writes one plane per query head inside a lane's block of {plane_stride}"
     );
     debug_assert!(
-        u64::from(lane_offset + requests) * u64::from(plane_stride) <= u64::from(scores.rows),
-        "`{OP}` writes {requests} lanes of {plane_stride} planes from lane {lane_offset}, \
-         and the slab holds {} rows",
-        scores.rows
+        lane_offset + requests <= seat_of.rows,
+        "`{OP}` seats {requests} lanes from lane {lane_offset}, and the seat table holds {}",
+        seat_of.rows
     );
 
     let floats = head_width.saturating_add(2 * WAVES);
@@ -170,6 +170,7 @@ pub fn capture(
             pool.page_indptr.arg(),
             pool.last_page_lens.arg(),
             scores.arg(),
+            seat_of.arg(),
             page_size.arg(),
             stated(OP, num_q_heads)?.arg(),
             stated(OP, num_kv_heads)?.arg(),

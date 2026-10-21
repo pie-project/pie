@@ -785,6 +785,8 @@ pub(crate) struct MergeLand {
 
 pub struct Prepared<'a> {
     lanes: &'a [Seated<'a>],
+    /// Each lane's seat in the score slab, where it captures.
+    score_seat_of: Vec<Option<u32>>,
     attachments: &'a [Attached],
     composition: Composition,
     readout_rows: Vec<i32>,

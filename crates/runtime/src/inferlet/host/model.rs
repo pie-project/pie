@@ -247,6 +247,7 @@ mod tests {
     fn a_prefill_chunk_stops_at_the_rows_the_engine_prefers() {
         let limits = |max_forward_tokens, prefill_rows| crate::engine::SchedulerLimits {
             max_readouts: 0,
+            max_scoring_lanes: 0,
             max_forward_requests: 8,
             max_forward_tokens,
             max_page_refs: 64,
