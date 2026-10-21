@@ -250,14 +250,6 @@ impl<'c> Run<'c> {
 
     /// The single node that reads `value`, if exactly one does.
     pub(crate) fn sole_reader(&self, value: ValueId) -> Option<&'c Node> {
-        match self.readers(value) {
-            &[only] => self.nodes.get(only as usize),
-            _ => None,
-        }
-    }
-
-    /// The trace's nodes that read `value`, in order.
-    pub(crate) fn readers(&self, value: ValueId) -> &[u32] {
         use poem_ir::Operands as _;
         let readers = self.readers.get_or_init(|| {
             let mut readers = vec![Vec::new(); self.values.len()];
@@ -275,7 +267,10 @@ impl<'c> Run<'c> {
             }
             readers
         });
-        readers.get(value.0 as usize).map_or(&[], Vec::as_slice)
+        match readers.get(value.0 as usize).map(Vec::as_slice) {
+            Some(&[only]) => self.nodes.get(only as usize),
+            _ => None,
+        }
     }
 
     pub(crate) fn chain_clear(&self) {
