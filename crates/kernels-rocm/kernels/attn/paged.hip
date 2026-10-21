@@ -4,7 +4,9 @@
 // the host scheduler (attn/sched_*.rs) staged: a work item is a (request,
 // query tile, kv chunk); a split schedule writes f32 partials and their lse
 // for `merge_partials`. Scores are in the log2 domain (s = q·k·sm_scale·
-// log2 e), the lse convention every reader of the plane takes.
+// log2 e), the lse convention every reader of the plane takes. `FP8` reads
+// an e4m3 pool (attn/kv.hip's `Kv`): the host folds its unit into
+// `scale_log2`, the kernels into their output rows.
 
 #include "prelude/device.hip"
 #include "prelude/mfma.hip"
@@ -93,8 +95,9 @@ __device__ __forceinline__ long long kv_token(const Paged& p, int req, int t, in
 // tokens. Lane i of a wavefront scores token t0 + i for every query head of
 // the GQA group, the wavefront keeps an online softmax per head, and each
 // lane accumulates its D/kWave columns of the output.
-template <int D, int G, int WAVES, bool HND>
+template <int D, int G, int WAVES, bool HND, bool FP8>
 __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
+    using KV = Kv<FP8>;
     constexpr int kCols = D / kWave;
     static_assert(D % kWave == 0, "a decode head is a whole number of lanes wide");
     __shared__ float qs[G][D];
@@ -138,9 +141,9 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
 #pragma unroll
         for (int g = 0; g < G; ++g) s[g] = 0.f;
         if (live) {
-            const auto* kp = reinterpret_cast<const Pack8<bf16>*>(p.k + kv_token<HND, D>(p, req, t, kv_head, 0));
+            const long long kp = kv_token<HND, D>(p, req, t, kv_head, 0);
             for (int j8 = 0; j8 < D / 8; ++j8) {
-                const Pack8<bf16> kv8 = kp[j8];
+                const Pack8<bf16> kv8 = KV::wide(KV::raw(p.k, kp + 8 * j8));
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     const float kf = to_f32(kv8.v[e]);
@@ -162,10 +165,10 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
         }
         const int tiles = min(kWave, end - t0);
         for (int i = 0; i < tiles; ++i) {
-            const bf16* vp = p.v + kv_token<HND, D>(p, req, t0 + i, kv_head, ln * kCols);
+            const long long vp = kv_token<HND, D>(p, req, t0 + i, kv_head, ln * kCols);
             float vf[kCols];
 #pragma unroll
-            for (int c = 0; c < kCols; ++c) vf[c] = to_f32(vp[c]);
+            for (int c = 0; c < kCols; ++c) vf[c] = KV::one(p.v, vp + c);
 #pragma unroll
             for (int g = 0; g < G; ++g) {
                 const float pi = __shfl(pr[g], i, kWave);
@@ -204,7 +207,7 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
                 out += part_o[w][g][j] * f;
             }
         }
-        const float value = sum > 0.f ? out / sum : 0.f;
+        const float value = sum > 0.f ? out / sum * KV::unit : 0.f;
         const long long at = (row + kv_head * G + g) * D + j;
         if (p.partition) {
             static_cast<float*>(p.o)[at] = value;
@@ -231,8 +234,6 @@ __host__ __device__ constexpr int decode_fold_heads(int G, int D, int waves) {
 // accumulates 8 columns of P·V from 16-byte value reads; the wavefronts
 // fold through LDS at the end. Four wavefronts at 512-wide heads (eight
 // spill there); QL keeps Qᵀ in LDS for the registers.
-template <int D>
-constexpr int kDecodeMfmaWaves = D >= 512 ? 4 : 8;
 
 // With PVM the round's P·V runs on the matrix core too: the wavefront lays
 // its 16 value rows in LDS and takes Oᵀ (16 columns × 16 heads) += Vᵀ · Pᵀ a
@@ -241,10 +242,14 @@ constexpr int kDecodeMfmaWaves = D >= 512 ? 4 : 8;
 // accumulator quads for its head instead of G × 8 floats, and a round costs
 // D/16 MFMAs instead of G·D/8 FMAs a lane. The weights round to bf16 for the
 // product, as a prefill's do.
-template <int D, int G, bool HND, int WAVES = kDecodeMfmaWaves<D>, bool QL = false, bool PVM = false>
+template <int D, int G, bool HND, int WAVES, bool QL, bool PVM, bool FP8>
 __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
+    using KV = Kv<FP8>;
     constexpr int SUB = 16, KT = SUB / 16, KP = D / 32;
-    constexpr int LPK = D / 8;           // lanes a key's value row spans
+    // Elements a value read takes: sixteen e4m3 codes (16 bytes) where the
+    // values stage through LDS, else eight (a lane's accumulator columns).
+    constexpr int RE = PVM && FP8 ? 16 : 8;
+    constexpr int LPK = D / RE;          // lanes a key's value row spans
     constexpr int KPI = kWave / LPK;     // keys one value read covers
     constexpr int VR = SUB / KPI;        // value reads a round
     static_assert(G <= 16 && D % 32 == 0 && kWave % LPK == 0, "a group within one column tile");
@@ -297,13 +302,13 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
         if constexpr (QLDS) {
             if (wave == 0 && g < G) {
 #pragma unroll
-                for (int st = 0; st < KP; ++st) qs[st][quad][g] = load8(qrow + st * 32 + 8 * quad);
+                for (int st = 0; st < KP; ++st) qs[st][quad][g] = load8(qrow + KV::col(st, quad));
             }
             __syncthreads();
         } else {
 #pragma unroll
             for (int st = 0; st < KP; ++st) {
-                qf[st] = load8(qrow + st * 32 + 8 * quad);
+                qf[st] = load8(qrow + KV::col(st, quad));
                 if (g >= G) qf[st] = mfma_ab2{};
             }
         }
@@ -326,7 +331,7 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
     mfma_cd ot[PVM ? D / 16 : 1];
 #pragma unroll
     for (int mt = 0; mt < (PVM ? D / 16 : 1); ++mt) ot[mt] = mfma_zero();
-    const int col = 8 * (l % LPK), parity = l / LPK;
+    const int col = RE * (l % LPK), parity = l / LPK;
 
     const i32* pages = p.page_indices + p.page_indptr[req];
     const int ps_ = p.page_size;
@@ -346,30 +351,31 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
         // whole key row beside its value reads would not fit the registers.
         constexpr int KH = HALVES ? KP / 2 : KP;
         mfma_cd s[KT];
-        mfma_ab2 kr[KT][KH];
+        typename KV::Raw kr[KT][KH];
         auto read_keys = [&](int half) {
 #pragma unroll
             for (int kt = 0; kt < KT; ++kt) {
-                const bf16* row = p.k + at(min(t0 + kt * 16 + g, wend - 1), 0) + 8 * quad + half * KH * 32;
-#pragma unroll
-                for (int st = 0; st < KH; ++st) kr[kt][st] = load8(row + st * 32);
+                KV::keys(p.k, at(min(t0 + kt * 16 + g, wend - 1), 0), quad, half * KH, kr[kt]);
             }
         };
         auto score_keys = [&](int half) {
 #pragma unroll
             for (int kt = 0; kt < KT; ++kt)
 #pragma unroll
-                for (int st = 0; st < KH; ++st) s[kt] = mfma16x2(kr[kt][st], q_at(half * KH + st), s[kt]);
+                for (int st = 0; st < KH; ++st) s[kt] = mfma16x2(KV::ab2(kr[kt][st]), q_at(half * KH + st), s[kt]);
         };
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt) s[kt] = mfma_zero();
         read_keys(0);
         // The value reads ride ahead of the scores, except at 512-wide heads,
         // which read them in halves after the weights (registers again).
-        auto value_at = [&](int i) {
-            return *reinterpret_cast<const Pack8<bf16>*>(p.v + at(min(t0 + i * KPI + parity, wend - 1), col));
+        using VRaw = typename conditional<RE == 16, Pack8<bf16>, typename KV::Raw>::type;
+        auto value_at = [&](int i) -> VRaw {
+            const long long v = at(min(t0 + i * KPI + parity, wend - 1), col);
+            if constexpr (RE == 16) return *reinterpret_cast<const VRaw*>(reinterpret_cast<const u8*>(p.v) + v);
+            else return KV::raw(p.v, v);
         };
-        Pack8<bf16> vr[HALVES ? 1 : VR];
+        VRaw vr[HALVES ? 1 : VR];
         if constexpr (!HALVES) {
 #pragma unroll
             for (int i = 0; i < VR; ++i) vr[i] = value_at(i);
@@ -412,8 +418,16 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
             // The round's value rows into this wavefront's LDS rows.
             bf16* vs = vbuf + wave * SUB * VLD;
 #pragma unroll
-            for (int i = 0; i < VR; ++i)
-                *reinterpret_cast<Pack8<bf16>*>(vs + (i * KPI + parity) * VLD + col) = vr[i];
+            for (int i = 0; i < VR; ++i) {
+                bf16* row = vs + (i * KPI + parity) * VLD + col;
+                if constexpr (RE == 16) {
+                    const auto w = __builtin_bit_cast(mfma_ab2, vr[i]);
+                    *reinterpret_cast<mfma_ab2*>(row) = e4m3x8_bf16(__builtin_bit_cast(u64, w.lo));
+                    *reinterpret_cast<mfma_ab2*>(row + 8) = e4m3x8_bf16(__builtin_bit_cast(u64, w.hi));
+                } else {
+                    *reinterpret_cast<Pack8<bf16>*>(row) = KV::wide(vr[i]);
+                }
+            }
             __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
             __builtin_amdgcn_wave_barrier();
             __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
@@ -445,7 +459,8 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
 #pragma unroll
             for (int c = 0; c < 8; ++c) acc[h][c] *= a;
         }
-        auto weigh = [&](int i, const Pack8<bf16>& v) {
+        auto weigh = [&](int i, const auto& raw) {
+            const Pack8<bf16> v = KV::wide(raw);
             const int kl = i * KPI + parity;
             float pv[G];
 #pragma unroll
@@ -457,11 +472,12 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
                 for (int h = 0; h < G; ++h) acc[h][c] += pv[h] * vf;
             }
         };
-        if constexpr (HALVES) {
+        if constexpr (PVM) {
+        } else if constexpr (HALVES) {
             constexpr int VH = VR / 2;
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                Pack8<bf16> vh[VH];
+                VRaw vh[VH];
 #pragma unroll
                 for (int i = 0; i < VH; ++i) vh[i] = value_at(half * VH + i);
 #pragma unroll
@@ -529,7 +545,7 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
                     out += part_o(w, hl, j) * f;
                 }
             }
-            const float value = sum > 0.f ? out / sum : 0.f;
+            const float value = sum > 0.f ? out / sum * KV::unit : 0.f;
             const long long at = (row + kv_head * G + h) * D + j;
             if (p.partition) static_cast<float*>(p.o)[at] = value;
             else static_cast<bf16*>(p.o)[at] = from_f32<bf16>(value);
@@ -543,17 +559,15 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
 // quarters' MFMA scores summed through LDS, the same online softmax in each.
 // Nothing folds at the end, and a lane's G·4 accumulators leave room for a
 // few blocks a CU.
-template <int D, int G, bool HND>
+template <int D, int G, bool HND, bool FP8>
 __global__ __launch_bounds__(256) void paged_decode_cols(const Paged p) {
+    using KV = Kv<FP8>;
     constexpr int WAVES = 4, SUB = 16, DW = D / WAVES, KPW = DW / 32;
     constexpr int VC = 4;              // value columns a lane
     constexpr int LPV = DW / VC;       // lanes a key's value quarter spans
     constexpr int KPV = kWave / LPV;   // keys one value read covers
     constexpr int VR = SUB / KPV;      // value reads a round
     static_assert(G <= 16 && DW % 32 == 0 && kWave % LPV == 0, "a group within one column tile");
-    struct alignas(8) Pack4 {
-        bf16 v[4];
-    };
     // The quarters' partial scores, by round parity (a wavefront is at most
     // one round past the slowest: the barrier between).
     __shared__ float sp[2][WAVES][SUB][16];
@@ -582,9 +596,9 @@ __global__ __launch_bounds__(256) void paged_decode_cols(const Paged p) {
     mfma_ab2 qf[KPW];
     {
         const bf16* qrow = p.q + static_cast<long long>(p.q_indptr[req]) * p.q_stride_n +
-                           static_cast<long long>(kv_head * G + min(g, G - 1)) * p.q_stride_h + c0 + 8 * quad;
+                           static_cast<long long>(kv_head * G + min(g, G - 1)) * p.q_stride_h + c0;
 #pragma unroll
-        for (int st = 0; st < KPW; ++st) qf[st] = load8(qrow + st * 32);
+        for (int st = 0; st < KPW; ++st) qf[st] = load8(qrow + KV::col(st, quad));
     }
 
     float m = neg_inf(), lsum = 0.f;
@@ -609,19 +623,16 @@ __global__ __launch_bounds__(256) void paged_decode_cols(const Paged p) {
     for (int t0 = w0; t0 < wend; t0 += SUB) {
         // The round's key and value reads, all issued before any is used
         // (past the chunk they reread its last key, which weighs zero).
-        mfma_ab2 kr[KPW];
+        typename KV::Raw kr[KPW];
         {
-            const bf16* row = p.k + at(min(t0 + g, wend - 1), c0 + 8 * quad);
-#pragma unroll
-            for (int st = 0; st < KPW; ++st) kr[st] = load8(row + st * 32);
+            KV::keys(p.k, at(min(t0 + g, wend - 1), c0), quad, 0, kr);
         }
-        Pack4 vr[VR];
+        typename KV::Raw4 vr[VR];
 #pragma unroll
-        for (int i = 0; i < VR; ++i)
-            vr[i] = *reinterpret_cast<const Pack4*>(p.v + at(min(t0 + i * KPV + vpar, wend - 1), vcol));
+        for (int i = 0; i < VR; ++i) vr[i] = KV::raw4(p.v, at(min(t0 + i * KPV + vpar, wend - 1), vcol));
         mfma_cd s = mfma_zero();
 #pragma unroll
-        for (int st = 0; st < KPW; ++st) s = mfma16x2(kr[st], qf[st], s);
+        for (int st = 0; st < KPW; ++st) s = mfma16x2(KV::ab2(kr[st]), qf[st], s);
 #pragma unroll
         for (int t = 0; t < 4; ++t) sp[parity][wave][4 * quad + t][g] = s[t];
         __syncthreads();
@@ -668,7 +679,7 @@ __global__ __launch_bounds__(256) void paged_decode_cols(const Paged p) {
             for (int h = 0; h < G; ++h) pv[h] = pw[wave][kl][h];
 #pragma unroll
             for (int c = 0; c < VC; ++c) {
-                const float vf = to_f32(vr[i].v[c]);
+                const float vf = KV::f(vr[i], c);
 #pragma unroll
                 for (int h = 0; h < G; ++h) acc[h][c] += pv[h] * vf;
             }
@@ -702,13 +713,11 @@ __global__ __launch_bounds__(256) void paged_decode_cols(const Paged p) {
 #pragma unroll
         for (int h = 0; h < G; ++h) {
             const float big = fin_m[wave][h], sum_h = fin_l[wave][h];
-            const float inv = sum_h > 0.f ? 1.f / sum_h : 0.f;
+            const float inv = sum_h > 0.f ? KV::unit / sum_h : 0.f;
             const long long at = (row + kv_head * G + h) * D + vcol;
             if (!p.partition) {
-                Pack4 o;
-#pragma unroll
-                for (int c = 0; c < VC; ++c) o.v[c] = from_f32<bf16>(acc[h][c] * inv);
-                *reinterpret_cast<Pack4*>(static_cast<bf16*>(p.o) + at) = o;
+                *reinterpret_cast<mfma_ab*>(static_cast<bf16*>(p.o) + at) =
+                    pack4(acc[h][0] * inv, acc[h][1] * inv, acc[h][2] * inv, acc[h][3] * inv);
             } else {
                 *reinterpret_cast<float4*>(static_cast<float*>(p.o) + at) =
                     float4{acc[h][0] * inv, acc[h][1] * inv, acc[h][2] * inv, acc[h][3] * inv};
@@ -744,19 +753,35 @@ constexpr int prefill_bc() {
     return D >= 512 ? 16 : D <= 64 ? 64 : 32;
 }
 
-template <int D, bool HND, bool CAUSAL>
+// A prefill block's (work item, kv head): each XCD (block b runs on XCD b
+// mod 8) takes a run of the grid in (head, item) order, so the items it runs
+// at once are neighbouring query tiles of one head and find that head's keys
+// and values in its L2; causal items walk each head from its last (the
+// longest) down.
+__device__ __forceinline__ void prefill_item(bool causal, int& bx, int& kv_head) {
+    const int total = gridDim.x * gridDim.y, b = blockIdx.x + gridDim.x * blockIdx.y;
+    const int xcd = b % 8, q = total / 8, rem = total % 8;
+    const int at = xcd * q + min(xcd, rem) + b / 8;
+    kv_head = at / gridDim.x;
+    bx = at % gridDim.x;
+    if (causal) bx = gridDim.x - 1 - bx;
+}
+
+template <int D, bool HND, bool CAUSAL, bool FP8>
 __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
+    using KV = Kv<FP8>;
     constexpr int BC = prefill_bc<D>();
-    constexpr int KS = D / 16;   // k steps over the head for Sᵀ, d tiles for Oᵀ
+    constexpr int KS = D / 16;   // d tiles for Oᵀ
+    constexpr int KP = D / 32;   // paired k steps over the head for Sᵀ
     constexpr int KT = BC / 16;  // key tiles per kv tile
-    constexpr int KPAD = D + 16, VPAD = BC + 4;
+    constexpr int KPAD = D + 8, VPAD = BC + 4;
     constexpr int THREADS = 512, RD = BC * D / 8 / THREADS;  // 16-byte reads a thread a tile
     static_assert(RD * 8 * THREADS == BC * D && THREADS % BC == 0, "the tile splits evenly");
     __shared__ alignas(16) bf16 ks[BC][KPAD];
     __shared__ alignas(16) bf16 vt[D][VPAD];
 
-    const int bx = blockIdx.x;
-    const int kv_head = blockIdx.y;
+    int bx, kv_head;
+    prefill_item(CAUSAL, bx, kv_head);
     if (p.block_valid != nullptr && p.block_valid[bx] == 0) return;
     const int G = p.num_qo_heads / p.num_kv_heads;
     const int req = p.request_indices[bx];
@@ -787,13 +812,13 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     // Whether any of the wavefront's rows is a query (its first row is).
     const bool wave_live = (qo_tile * kPrefillTileQ + wave * 16) / G < qo_len;
 
-    // Qᵀ as B operands: column = this lane's query row, k = 4·quad + t.
-    mfma_ab qf[KS];
+    // Qᵀ as B operands, k paired 8·quad: column = this lane's query row.
+    mfma_ab2 qf[KP];
     {
-        const bf16* qrow = p.q + static_cast<long long>(q_first + token) * p.q_stride_n +
-                           static_cast<long long>(head) * p.q_stride_h;
+        const bf16* qrow = p.q + static_cast<long long>(q_first + min(token, qo_len - 1)) * p.q_stride_n +
+                           static_cast<long long>(head) * p.q_stride_h + 8 * quad;
 #pragma unroll
-        for (int s = 0; s < KS; ++s) qf[s] = row_live ? load4(qrow + s * 16 + 4 * quad) : mfma_ab{0, 0, 0, 0};
+        for (int s = 0; s < KP; ++s) qf[s] = load8(qrow + s * 32);
     }
 
     mfma_cd o[KS];
@@ -809,36 +834,62 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     // (key c % BC, columns 8·(c / BC)), a wavefront 16 keys of four columns.
     // Every read is issued (a key past the chunk reads the chunk's last,
     // and lands as zeros at the store), so no read waits on another.
-    Pack8<bf16> kr[RD], vr[RD];
+    // With an even RD a thread's V reads pair up: keys 2·(c % (BC/2)) and
+    // +1 of columns 8·(c / (BC/2)), landed in Vᵀ four bytes a write.
+    constexpr bool PAIRS = RD % 2 == 0;
+    typename KV::Raw kr[RD], vr[RD];
+    auto v_at = [&](int r, int& vkey, int& vj) {
+        if constexpr (PAIRS) {
+            const int c = threadIdx.x + (r / 2) * THREADS;
+            vkey = 2 * (c % (BC / 2)) + r % 2;
+            vj = (c / (BC / 2)) * 8;
+        } else {
+            const int c = threadIdx.x + r * THREADS;
+            vkey = c % BC;
+            vj = (c / BC) * 8;
+        }
+    };
     auto fetch = [&](int kv0) {
 #pragma unroll
         for (int r = 0; r < RD; ++r) {
             const int c = threadIdx.x + r * THREADS;
             const int kkey = kv0 + c / (D / 8), kj = (c % (D / 8)) * 8;
-            const int vkey = kv0 + c % BC, vj = (c / BC) * 8;
-            kr[r] = *reinterpret_cast<const Pack8<bf16>*>(
-                p.k + kv_token<HND, D>(p, req, min(kkey, chunk_end - 1), kv_head, kj));
-            vr[r] = *reinterpret_cast<const Pack8<bf16>*>(
-                p.v + kv_token<HND, D>(p, req, min(vkey, chunk_end - 1), kv_head, vj));
+            int vkey, vj;
+            v_at(r, vkey, vj);
+            kr[r] = KV::raw(p.k, kv_token<HND, D>(p, req, min(kkey, chunk_end - 1), kv_head, kj));
+            vr[r] = KV::raw(p.v, kv_token<HND, D>(p, req, min(kv0 + vkey, chunk_end - 1), kv_head, vj));
         }
     };
     auto stage = [&](int kv0) {
 #pragma unroll
         for (int r = 0; r < RD; ++r) {
             const int c = threadIdx.x + r * THREADS;
-            const Pack8<bf16> k8 = kv0 + c / (D / 8) < chunk_end ? kr[r] : Pack8<bf16>{};
-            const Pack8<bf16> v8 = kv0 + c % BC < chunk_end ? vr[r] : Pack8<bf16>{};
+            const Pack8<bf16> k8 = kv0 + c / (D / 8) < chunk_end ? KV::wide(kr[r]) : Pack8<bf16>{};
             *reinterpret_cast<Pack8<bf16>*>(&ks[c / (D / 8)][(c % (D / 8)) * 8]) = k8;
-            const int vkey = c % BC, vj = (c / BC) * 8;
+        }
 #pragma unroll
-            for (int e = 0; e < 8; ++e) vt[vj + e][vkey] = v8.v[e];
+        for (int r = 0; r < RD; r += PAIRS ? 2 : 1) {
+            int vkey, vj;
+            v_at(r, vkey, vj);
+            const Pack8<bf16> v0 = kv0 + vkey < chunk_end ? KV::wide(vr[r]) : Pack8<bf16>{};
+            if constexpr (PAIRS) {
+                const Pack8<bf16> v1 = kv0 + vkey + 1 < chunk_end ? KV::wide(vr[r + 1]) : Pack8<bf16>{};
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const bf16 pair[2] = {v0.v[e], v1.v[e]};
+                    *reinterpret_cast<u32*>(&vt[vj + e][vkey]) = *reinterpret_cast<const u32*>(pair);
+                }
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) vt[vj + e][vkey] = v0.v[e];
+            }
         }
     };
     if (chunk_start < chunk_end) fetch(chunk_start);
 
     for (int kv0 = chunk_start; kv0 < chunk_end; kv0 += BC) {
         stage(kv0);
-        __syncthreads();
+        lds_barrier();
         if (kv0 + BC < chunk_end) fetch(kv0 + BC);
         if (wave_live) {
             // Sᵀ: lane holds keys 4·quad + t of each 16-key tile, for its row;
@@ -847,14 +898,11 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
             mfma_cd s[KT];
 #pragma unroll
             for (int kt = 0; kt < KT; ++kt) {
-                mfma_cd s2 = mfma_cd{0.f, 0.f, 0.f, 0.f};
-                s[kt] = mfma_cd{0.f, 0.f, 0.f, 0.f};
+                mfma_cd c[2] = {mfma_zero(), mfma_zero()};
 #pragma unroll
-                for (int st = 0; st < KS; st += 2) {
-                    s[kt] = mfma16(load4(&ks[kt * 16 + ln % 16][st * 16 + 4 * quad]), qf[st], s[kt]);
-                    s2 = mfma16(load4(&ks[kt * 16 + ln % 16][(st + 1) * 16 + 4 * quad]), qf[st + 1], s2);
-                }
-                s[kt] += s2;
+                for (int st = 0; st < KP; ++st)
+                    c[st % 2] = mfma16x2(load8(&ks[kt * 16 + ln % 16][st * 32 + 8 * quad]), qf[st], c[st % 2]);
+                s[kt] = c[0] + c[1];
             }
             float tile_max = neg_inf();
 #pragma unroll
@@ -891,7 +939,7 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
                 for (int kt = 0; kt < KT; ++kt) o[dt] = mfma16(load4(&vt[dt * 16 + ln % 16][kt * 16 + 4 * quad]), pt[kt], o[dt]);
             }
         }
-        __syncthreads();
+        lds_barrier();
     }
 
     // Each lane summed only its own keys of the row; the row's four lanes
@@ -905,7 +953,7 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
         ? static_cast<long long>(p.o_indptr[req]) + static_cast<long long>(token) * num_chunks + kv_tile
         : static_cast<long long>(p.o_indptr[req]) + token;
     const long long base = (row * p.num_qo_heads + head) * D;
-    const float inv = l > 0.f ? 1.f / l : 0.f;
+    const float inv = l > 0.f ? KV::unit / l : 0.f;
 #pragma unroll
     for (int dt = 0; dt < KS; ++dt) {
         const int j = dt * 16 + 4 * quad;
@@ -937,8 +985,9 @@ constexpr int kSelTokens = 16;
 constexpr int kSelBlocks = 2048;
 constexpr int kSelWords = kSelBlocks / 32;
 
-template <int D, bool HND, bool CAUSAL, bool SEL>
+template <int D, bool HND, bool CAUSAL, bool SEL, bool FP8>
 __device__ __forceinline__ void paged_prefill_body(const Paged& p, const PrefillSel& sel) {
+    using KV = Kv<FP8>;
     constexpr int BC = 32, KT = BC / 16, KP = D / 32, DT = D / 16;
     constexpr int KPAD = D + 4, VPAD = BC + 4;
     constexpr int THREADS = 512, TABLE = 512;
@@ -953,8 +1002,8 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
 
     // Causal tiles grow with their position: the last of a request walks the
     // most keys, so the grid starts there and the short ones fill the tail.
-    const int bx = CAUSAL ? gridDim.x - 1 - blockIdx.x : blockIdx.x;
-    const int kv_head = blockIdx.y;
+    int bx, kv_head;
+    prefill_item(CAUSAL, bx, kv_head);
     if (p.block_valid != nullptr && p.block_valid[bx] == 0) return;
     const int G = p.num_qo_heads / p.num_kv_heads;
     const int req = p.request_indices[bx];
@@ -1026,7 +1075,7 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     const int k_key = tid / (D / 8 / KR), k_col = (tid % (D / 8 / KR)) * 8 * KR;
     const int v_pair = tid % (BC / 2), v_col = (tid / (BC / 2)) * 8;
     const bool v_live = v_col < D;
-    Pack8<bf16> kreg[KR], vreg[2];
+    typename KV::Raw kreg[KR], vreg[2];
     int page0 = 0, wend = 0;
     auto fetch = [&](int kv0) {
         auto at = [&](int t, int j) {
@@ -1035,27 +1084,27 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
         };
 #pragma unroll
         for (int r = 0; r < KR; ++r)
-            kreg[r] = *reinterpret_cast<const Pack8<bf16>*>(p.k + at(kv0 + k_key, k_col + 8 * r));
+            kreg[r] = KV::raw(p.k, at(kv0 + k_key, k_col + 8 * r));
         if (v_live) {
 #pragma unroll
-            for (int e = 0; e < 2; ++e) vreg[e] = *reinterpret_cast<const Pack8<bf16>*>(p.v + at(kv0 + 2 * v_pair + e, v_col));
+            for (int e = 0; e < 2; ++e) vreg[e] = KV::raw(p.v, at(kv0 + 2 * v_pair + e, v_col));
         }
     };
     auto stage = [&](int kv0) {
         // Keys past the chunk land as zeros, so no garbage meets a weight.
 #pragma unroll
         for (int r = 0; r < KR; ++r) {
-            Pack8<bf16> kv = kreg[r];
+            Pack8<bf16> kv = KV::wide(kreg[r]);
             if (kv0 + k_key >= wend) kv = Pack8<bf16>{};
             *reinterpret_cast<Pack8<bf16>*>(&ks[k_key * KPAD + k_col + 8 * r]) = kv;
         }
         if (v_live) {
+            Pack8<bf16> vw[2];
 #pragma unroll
-            for (int e = 0; e < 2; ++e)
-                if (kv0 + 2 * v_pair + e >= wend) vreg[e] = Pack8<bf16>{};
+            for (int e = 0; e < 2; ++e) vw[e] = kv0 + 2 * v_pair + e >= wend ? Pack8<bf16>{} : KV::wide(vreg[e]);
 #pragma unroll
             for (int c = 0; c < 8; ++c) {
-                const bf16 pair[2] = {vreg[0].v[c], vreg[1].v[c]};
+                const bf16 pair[2] = {vw[0].v[c], vw[1].v[c]};
                 *reinterpret_cast<u32*>(&vt[(v_col + c) * VPAD + 2 * v_pair]) = *reinterpret_cast<const u32*>(pair);
             }
         }
@@ -1134,7 +1183,7 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
         ? static_cast<long long>(p.o_indptr[req]) + static_cast<long long>(token) * num_chunks + kv_tile
         : static_cast<long long>(p.o_indptr[req]) + token;
     const long long base = (row * p.num_qo_heads + head) * D;
-    const float inv = l > 0.f ? 1.f / l : 0.f;
+    const float inv = l > 0.f ? KV::unit / l : 0.f;
 #pragma unroll
     for (int dt = 0; dt < DT; ++dt) {
         const int j = dt * 16 + 4 * quad;
@@ -1149,14 +1198,14 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     if (quad == 0 && p.lse != nullptr) p.lse[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
 }
 
-template <int D, bool HND, bool CAUSAL>
+template <int D, bool HND, bool CAUSAL, bool FP8>
 __global__ __launch_bounds__(512) void paged_prefill(const Paged p) {
-    paged_prefill_body<D, HND, CAUSAL, false>(p, PrefillSel{});
+    paged_prefill_body<D, HND, CAUSAL, false, FP8>(p, PrefillSel{});
 }
 
 template <int D, bool HND>
 __global__ __launch_bounds__(512) void paged_prefill_selected(const Paged p, const PrefillSel sel) {
-    paged_prefill_body<D, HND, true, true>(p, sel);
+    paged_prefill_body<D, HND, true, true, false>(p, sel);
 }
 
 // ----------------------------------------------------------------- merge --

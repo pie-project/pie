@@ -164,8 +164,20 @@ impl Shelf {
     /// is filed under its id, and no two device files of a family can apply
     /// to one device.
     pub fn check(&self, registry: &Registry, dir: &Path) -> Result<(), String> {
+        self.check_beside(registry, dir, &[])
+    }
+
+    /// [`Shelf::check`] over a directory another build of the same engine
+    /// shares: `beside` are the files it seeds, and this build leaves them out.
+    pub fn check_beside(
+        &self,
+        registry: &Registry,
+        dir: &Path,
+        beside: &[&str],
+    ) -> Result<(), String> {
         let mut on_disk = Vec::new();
         walk(dir, "", &mut on_disk)?;
+        on_disk.retain(|name| !beside.contains(&name.as_str()));
         on_disk.sort();
         let mut listed: Vec<String> = self.seeded.iter().map(|(n, _)| (*n).to_string()).collect();
         listed.sort();

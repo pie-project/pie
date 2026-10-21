@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::{KvPool, Tensor};
 
 const FILE: &str = "attn/qkv_fused.hip";
@@ -102,21 +102,29 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     let rope_table = ArgValue::ABSENT;
     let window = ctx.stage();
 
-    let warped = match head_dim {
-        64 => Some(
-            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(64), false>",
-        ),
-        128 => Some(
-            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(128), false>",
-        ),
-        256 => Some(
-            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(256), false>",
-        ),
-        512 => Some(
-            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(512), false>",
-        ),
-        _ => None,
+    // Eight elements a lane (a 16-byte run) where the pairs and widths fall
+    // in whole runs of eight, else a wavefront a head.
+    let run = if span.unsigned_abs().is_multiple_of(8)
+        && (span.unsigned_abs() / 8).is_power_of_two()
+        && [qk_width, v_width]
+            .iter()
+            .all(|w| w.unsigned_abs().is_multiple_of(8))
+    {
+        8
+    } else {
+        lane_run
     };
+    // The pages it writes: bf16, or e4m3 under a unit scale.
+    let fp8 = crate::attn::kv::native_e4m3(pool);
+    if !fp8 && !crate::attn::kv::native_bf16(pool) {
+        return Err(refuse(OP, "the fused write lands bf16 or e4m3 pages"));
+    }
+    let warped = matches!(head_dim, 64 | 128 | 256 | 512).then(|| {
+        format!(
+            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32({head_dim}), false, ::pie::i32({run}), {fp8}>"
+        )
+    });
+    let heads_a_wave = 64 / (head_dim.unsigned_abs() / run);
     // A lane moves its run of a head as one access, up to 16 bytes.
     let aligned = [packed.ptr, q.ptr, pool.keys.ptr, pool.values.ptr]
         .into_iter()
@@ -124,18 +132,19 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         .chain(k_norm_weight.map(|w| w.ptr))
         .all(|at| at.is_multiple_of(16));
     if let Some(instantiation) = warped.filter(|_| aligned) {
+        let slots = |w: u32| w * heads_a_wave;
         let warps = if packed.rows >= PREFILL_ROWS {
-            [12u32, 8, 6]
+            [12u32, 8, 6, 4, 3, 2, 1]
                 .into_iter()
-                .find(|w| heads.is_multiple_of(*w))
+                .find(|w| heads.is_multiple_of(slots(*w)))
                 .unwrap_or(SPREAD_WARPS)
         } else {
             SPREAD_WARPS
         };
         return ctx.fire(
             OP,
-            Fire::at(FILE, instantiation).apply(Launch::grid(
-                [packed.rows, heads.div_ceil(warps), 1],
+            Fire::at(FILE, symbol(&instantiation)).apply(Launch::grid(
+                [packed.rows, heads.div_ceil(slots(warps)), 1],
                 [64 * warps, 1, 1],
             )),
             &[
@@ -170,7 +179,16 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
             ],
         );
     }
-    // The block-a-head kernel turns half-head pairs under norms alone.
+    // The block-a-head kernel turns half-head pairs under norms alone, into
+    // bf16 pages.
+    if fp8 {
+        return Err(refuse(
+            OP,
+            format!(
+                "a {head_dim}-wide head's fused write into e4m3 pages wants 16-byte-aligned planes"
+            ),
+        ));
+    }
     if !classic {
         return Err(refuse(
             OP,

@@ -2554,6 +2554,12 @@ fn glu_code(
 #[cfg(feature = "cuda")]
 const STAGED_FROM: u32 = 32;
 
+/// The fewest routes an expert averages that Hopper's staged wgmma select
+/// takes from the register-held one (DeepSeek-V4-Flash's miniature at 24 a
+/// 64-row decode: 11% less time a fire).
+#[cfg(feature = "cuda")]
+const WGMMA_FROM: u32 = 13;
+
 /// The 128-code chunks a warp of the register-held mxfp4 select keeps in
 /// flight: one, five CTAs an SM; a decode's few CTAs take more warps from
 /// the K split instead.
@@ -2602,7 +2608,11 @@ fn select_mxfp4_mma(
     // Past `STAGED_FROM` routes an expert, its activations staged in shared
     // memory a CTA of 64 routes (`moe_select_mxfp4_mma_staged`), so a wide
     // fire streams each expert's codes once a 64.
-    let staged = !cvt && per > STAGED_FROM;
+    // Hopper's wgmma slice from `WGMMA_FROM`: the register-held kernel's
+    // 32-route block is ALU-bound past 16 routes.
+    let staged = !cvt
+        && (per > STAGED_FROM
+            || (hopper_wgmma() && per >= WGMMA_FROM && x.width.is_multiple_of(128)));
     let nb: u32 = match per {
         _ if staged => 8,
         0..=4 => 1,

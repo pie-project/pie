@@ -153,10 +153,12 @@ impl ConvOut {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn causal_conv1d(
     ctx: &Ctx,
     x: Tensor,
     weight: Tensor,
+    bias: Option<Tensor>,
     state: &RecurrentPool,
     conv_width: u32,
     dilation: u32,
@@ -168,6 +170,7 @@ pub fn causal_conv1d(
         OP,
         x,
         weight,
+        bias,
         state,
         conv_width,
         dilation,
@@ -190,6 +193,7 @@ pub fn short_conv(
         OP,
         x,
         weight,
+        None,
         state,
         conv_width,
         1,
@@ -204,6 +208,7 @@ fn conv1d_update(
     op: &'static str,
     x: Tensor,
     weight: Tensor,
+    bias: Option<Tensor>,
     state: &RecurrentPool,
     conv_width: u32,
     dilation: u32,
@@ -231,7 +236,7 @@ fn conv1d_update(
     let args = [
         x.arg(),
         weight.arg(),
-        ArgValue::ABSENT,
+        bias.map_or(ArgValue::ABSENT, |b| b.arg()),
         state.conv_slab.arg(),
         state.slot_ids.arg(),
         state.conv_stride.arg(),
@@ -247,10 +252,12 @@ fn conv1d_update(
     ctx.fire(op, Fire::at(FILE, entrypoint).apply(launch), &args)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn causal_conv1d_chunked(
     ctx: &Ctx,
     x: RaggedTensor,
     weight: Tensor,
+    bias: Option<Tensor>,
     state: &RecurrentPool,
     conv_width: u32,
     dilation: u32,
@@ -262,6 +269,7 @@ pub fn causal_conv1d_chunked(
         OP,
         x,
         weight,
+        bias,
         state,
         conv_width,
         dilation,
@@ -284,6 +292,7 @@ pub fn short_conv_chunked(
         OP,
         x,
         weight,
+        None,
         state,
         conv_width,
         1,
@@ -298,6 +307,7 @@ fn conv1d_chunked(
     op: &'static str,
     x: RaggedTensor,
     weight: Tensor,
+    bias: Option<Tensor>,
     state: &RecurrentPool,
     conv_width: u32,
     dilation: u32,
@@ -347,7 +357,7 @@ fn conv1d_chunked(
             &[
                 x.data.arg(),
                 weight.arg(),
-                ArgValue::ABSENT,
+                bias.map_or(ArgValue::ABSENT, |b| b.arg()),
                 y.arg(),
                 state.conv_slab.arg(),
                 state.slot_ids.arg(),
@@ -376,7 +386,7 @@ fn conv1d_chunked(
             &[
                 x.data.arg(),
                 weight.arg(),
-                ArgValue::ABSENT,
+                bias.map_or(ArgValue::ABSENT, |b| b.arg()),
                 y.arg(),
                 state.conv_slab.arg(),
                 state.slot_ids.arg(),
@@ -1085,10 +1095,21 @@ fn chunk_parallel(
         state.write_state_mask.arg(),
     ];
     common(&mut args)?;
+    let from = ctx.tuning().ssm_gdn_wide_from;
+    let slices = lanes * v_heads * (v_dim / CHUNK_SLICE);
+    let bvt = if from > 0 && slices >= from {
+        2 * CHUNK_SLICE
+    } else {
+        CHUNK_SLICE
+    };
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_h<128, 128>").apply(Launch::grid(
-            [lanes * v_heads * (v_dim / CHUNK_SLICE), 1, 1],
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::attn::ssm_gdn_chunk_h<128, 128, {bvt}>")),
+        )
+        .apply(Launch::grid(
+            [lanes * v_heads * (v_dim / bvt), 1, 1],
             [BLOCK, 1, 1],
         )),
         &args,
@@ -1550,4 +1571,161 @@ fn kda_chunk_parallel(
         )),
         &args,
     )
+}
+
+/// Mamba-2's per-head weights: `A_log`, `dt_bias` and `D` (f32 `[heads]`),
+/// and the gated group norm's bf16 `[heads * 64]` weight and epsilon.
+#[derive(Clone, Copy)]
+pub struct Mamba2 {
+    pub a_log: Tensor,
+    pub dt_bias: Tensor,
+    pub d: Tensor,
+    pub norm: Tensor,
+    pub eps: f32,
+    pub heads: u32,
+    pub groups: u32,
+}
+
+impl Mamba2 {
+    /// Refuses all but 64-wide heads over a 128-wide state, the width of
+    /// `xbc` (`x`, then each group's `B`, then its `C`) and `dt` against
+    /// the heads, and a group count that does not split them.
+    fn check(
+        &self,
+        op: &'static str,
+        xbc: Tensor,
+        dt: Tensor,
+        z: Tensor,
+        y: &Tensor,
+        state_dim: u32,
+    ) -> Result<(), Error> {
+        dtype_dispatch!(op, xbc.dtype, { Bf16 => () });
+        let inner = self.heads * 64;
+        if state_dim != 128
+            || self.groups == 0
+            || !self.heads.is_multiple_of(self.groups)
+            || xbc.width != inner + 2 * self.groups * state_dim
+            || dt.width != self.heads
+            || z.width != inner
+            || y.width != inner
+        {
+            return Err(refuse(
+                op,
+                format!(
+                    "Mamba-2 runs 64-wide heads over a 128-wide state in whole groups; this \
+                     fire states {} heads in {} groups of a {}-wide state, a {}-wide xbc, \
+                     {}-wide dt, a {}-wide z and a {}-wide output",
+                    self.heads, self.groups, state_dim, xbc.width, dt.width, z.width, y.width
+                ),
+            ));
+        }
+        for (what, t) in [("dt", dt.dtype), ("z", z.dtype), ("output", y.dtype)] {
+            if t != Dtype::Bf16 {
+                return Err(refuse(
+                    op,
+                    format!("Mamba-2 reads and lands bf16, and its {what} is {t:?}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The gated output's group norm, in place.
+    fn norm(&self, ctx: &Ctx, op: &'static str, y: &mut Tensor) -> Result<(), Error> {
+        let group = y.width / self.groups;
+        crate::elemwise::norm::rmsnorm_grouped(ctx, op, *y, self.norm, group, self.eps, false, y)
+    }
+}
+
+/// One Mamba-2 step a request over the convolved `xbc` rows: lands
+/// `(C S + D x) * silu(z)`, group-normed, in `y`.
+#[allow(clippy::too_many_arguments)]
+pub fn mamba2_step(
+    ctx: &Ctx,
+    xbc: Tensor,
+    dt: Tensor,
+    z: Tensor,
+    m: Mamba2,
+    state: &RecurrentPool,
+    state_dim: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.ssm_mamba2_step";
+    m.check(OP, xbc, dt, z, y, state_dim)?;
+    f32_state(OP, state)?;
+    seated(OP, state, "ssm_mamba2_step", true, false, false)?;
+    let rows = nonzero(OP, "rows", xbc.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::ssm_mamba2_step")
+            .apply(Launch::grid([rows, m.heads, 1], [BLOCK, 1, 1])),
+        &[
+            xbc.arg(),
+            dt.arg(),
+            z.arg(),
+            m.a_log.arg(),
+            m.dt_bias.arg(),
+            m.d.arg(),
+            state.slab.arg(),
+            state.slot_ids.arg(),
+            state.slot_stride_elems.arg(),
+            y.arg(),
+            stated(OP, m.heads)?.arg(),
+            stated(OP, m.groups)?.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    m.norm(ctx, OP, y)
+}
+
+/// A prompt's Mamba-2 walk, token by token: a block a (request, head) lands
+/// `(C S + D x) * silu(z)` for each row, then the group norm.
+#[allow(clippy::too_many_arguments)]
+pub fn mamba2_chunked(
+    ctx: &Ctx,
+    xbc: RaggedTensor,
+    dt: Tensor,
+    z: Tensor,
+    m: Mamba2,
+    state: &RecurrentPool,
+    state_dim: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.ssm_mamba2_chunked";
+    m.check(OP, xbc.data, dt, z, y, state_dim)?;
+    let lanes = requests(OP, xbc)?;
+    f32_state(OP, state)?;
+    seated(OP, state, "ssm_mamba2_scan", true, true, true)?;
+    let [snap, snap_rows, snap_slots] = state.snapshots.args();
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::ssm_mamba2_scan")
+            .apply(Launch::grid([lanes, m.heads, 1], [BLOCK, 1, 1])),
+        &[
+            xbc.data.arg(),
+            dt.arg(),
+            z.arg(),
+            m.a_log.arg(),
+            m.dt_bias.arg(),
+            m.d.arg(),
+            state.slab.arg(),
+            state.slot_ids.arg(),
+            xbc.indptr.arg(),
+            state.slot_stride_elems.arg(),
+            state.commit_len.arg(),
+            state.begin_at.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            snap,
+            snap_rows,
+            snap_slots,
+            y.arg(),
+            stated(OP, m.heads)?.arg(),
+            stated(OP, m.groups)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    m.norm(ctx, OP, y)
 }

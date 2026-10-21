@@ -457,6 +457,7 @@ impl Run<'_> {
             &poem_ir::Attention::SsmCausalConv1d {
                 x: qkv,
                 weight: conv_weight,
+                bias: None,
                 state: conv_state,
                 conv_width,
                 dilation,

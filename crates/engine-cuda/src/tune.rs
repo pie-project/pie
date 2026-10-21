@@ -167,6 +167,7 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
         budget.max_tokens,
         engine.lattice_steps,
         engine.prefill_lattice_from,
+        engine.prefill_lattice_steps,
     );
     let mut budgets = poem_compiler::Budgets::of(budget);
     if let Some(ladder) = patches(&trace, slots) {
@@ -218,7 +219,7 @@ impl Bench for Cuda<'_> {
             self.facts,
             &search::render_overrides(entries),
             &[],
-            &["cc"],
+            &[crate::chip::ARCH],
         )
     }
 
@@ -338,7 +339,7 @@ pub fn run(
         &facts,
         &tuned,
         &provenance,
-        &["cc"],
+        &[crate::chip::ARCH],
     )?;
     Ok(Outcome {
         device: name,
@@ -391,7 +392,7 @@ mod tests {
                     &facts,
                     &search::render_overrides(&entries),
                     &[],
-                    &["cc"],
+                    &[crate::chip::ARCH],
                 )
                 .unwrap_or_else(|e| panic!("{} = {label}: {e}", k.id));
             }

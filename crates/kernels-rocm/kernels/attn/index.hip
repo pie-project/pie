@@ -89,6 +89,8 @@ __global__ __launch_bounds__(256) void index_knorm_rope(bf16* __restrict__ k, co
 struct IndexRow {
     const i32* pages;
     int nkeys;
+    int req;
+    int kv_len;
 };
 
 __device__ __forceinline__ IndexRow index_row(const i32* qo_indptr, const i32* page_indices,
@@ -99,7 +101,7 @@ __device__ __forceinline__ IndexRow index_row(const i32* qo_indptr, const i32* p
     const int abs_q = kv_len - (qo_indptr[r + 1] - qo_indptr[r]) + (t - qo_indptr[r]);
     const int stride = ratio > 0 ? ratio : 1;
     const int total = abs_q + 1;
-    return {page_indices + page_indptr[r], min(total > 0 ? total / stride : 0, score_stride)};
+    return {page_indices + page_indptr[r], min(total > 0 ? total / stride : 0, score_stride), r, kv_len};
 }
 
 // ------------------------------------------------------------ scoring --
@@ -196,6 +198,151 @@ __global__ __launch_bounds__(256) void index_score_paged(
         const u64 holders = __ballot(mine == best);
         if (l == __builtin_ctzll(holders)) mine = neg_inf();
         if (l == 0) out[r] = best;
+    }
+}
+
+// A prefill's scoring: a block a TT token rows over key blocks kb ≡ x (mod
+// gridDim.x), 256 keys a block, until none of its rows reaches one; the keys held
+// in registers across the rows (wavefront w keys 64w.. as four 16-key B
+// tiles, reloaded where a row starts another request) and each row's heads
+// through LDS as A tiles, S = Q·Kᵀ: a lane holds heads 4g+i of key c, so a
+// key's head sum is four terms in registers and two shuffles. The rows'
+// requests and key counts land in LDS first, one thread a row; the next
+// row's queries and head weights load under the current row's products.
+template <int D, int NT, int TT>
+__global__ __launch_bounds__(256) void index_score_rows(
+    const bf16* __restrict__ q, const bf16* __restrict__ wts, const bf16* __restrict__ key_pages,
+    const i32* __restrict__ qo_indptr, const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
+    const i32* __restrict__ last_page_lens, float* __restrict__ scores, i32 rows, i32 requests, i32 heads,
+    i32 page_size, i32 score_stride, i32 ratio, i32 compact, const u32* __restrict__ win) {
+    static_assert(D % 32 == 0 && TT <= 256, "a key row is whole 32-wide k pairs; a thread a row");
+    constexpr int KP = D / 32, TILES = 4, H = 16 * NT, QE = H * D;  // a row's query elements
+    constexpr int QC = QE / 8 / 256;                                // 16-byte chunks a thread a row
+    static_assert(QC * 8 * 256 == QE, "a row's queries are whole chunks a thread");
+    constexpr int QP = D + 8;  // a head's LDS pitch
+    __shared__ __align__(16) bf16 ql[2][H * QP];
+    __shared__ float wl[2][H];
+    __shared__ int nkeys_of[TT], req_of[TT], pages_of[TT], kv_of[TT];
+    const Window window{win};
+    const int tid = threadIdx.x, w = tid / kWave, l = lane(), c = l % 16, g = l / 16;
+    const int t0 = static_cast<int>(blockIdx.y) * TT;
+    const int kps = compact ? page_size / ratio : page_size;
+    const int stride = ratio > 0 ? ratio : 1;
+    requests = window.lanes(requests);
+    if (tid < TT) {
+        const int t = t0 + tid;
+        int nk = 0;
+        if (t < rows && window.live(t)) {
+            const IndexRow row = index_row(qo_indptr, page_indices, page_indptr, last_page_lens, requests, page_size,
+                                           score_stride, ratio, t);
+            nk = row.nkeys;
+            req_of[tid] = row.req;
+            pages_of[tid] = static_cast<int>(row.pages - page_indices);
+            kv_of[tid] = row.kv_len;
+        }
+        nkeys_of[tid] = nk;
+    }
+    __shared__ int list[TT];
+    __shared__ int listed;
+    // Key block kb of every gridDim.x: done when none of the rows reaches it;
+    // else the rows that do, listed.
+    for (int kb = blockIdx.x;; kb += gridDim.x) {
+        const int first = 256 * kb, base = first + 64 * w;
+        if (!__syncthreads_or(tid < TT && nkeys_of[tid] > first)) return;
+        if (tid == 0) {
+            int n = 0;
+            for (int i = 0; i < TT; ++i)
+                if (nkeys_of[i] > first) list[n++] = i;
+            listed = n;
+        }
+        __syncthreads();
+        const int count = listed;
+
+        // A row's queries (heads past the stated ones repeat the last, under a
+        // zero weight) and weights, a thread's share in registers.
+        typedef u32 chunk __attribute__((ext_vector_type(4)));
+        struct Share {
+            chunk q[QC];
+            float w;
+        };
+        auto fetch = [&](Share& o, int p) {
+            const long long t_row = window.plane(t0 + list[p]);
+#pragma unroll
+            for (int j = 0; j < QC; ++j) {
+                const int e = 8 * (tid + 256 * j), h = min(e / D, heads - 1);
+                o.q[j] = *reinterpret_cast<const chunk*>(q + (t_row * heads + h) * D + e % D);
+            }
+            if (tid < H) o.w = tid < heads ? (wts != nullptr ? to_f32(wts[t_row * heads + tid]) : 1.f) : 0.f;
+        };
+        auto land = [&](const Share& o, int b) {
+#pragma unroll
+            for (int j = 0; j < QC; ++j) {
+                const int e = 8 * (tid + 256 * j), h = e / D;
+                *reinterpret_cast<chunk*>(&ql[b][h * QP + e % D]) = o.q[j];
+            }
+            if (tid < H) wl[b][tid] = o.w;
+        };
+
+        mfma_ab2 kr[TILES][KP];
+        int held = -1;
+        // Listed row p from LDS stage b; then the next row's share (in `next`)
+        // into the other stage and the one two past it into `next`.
+        auto step = [&](int p, int b, Share& next) {
+            const int i = list[p];
+            const int nkeys = nkeys_of[i];
+            if (req_of[i] != held) {
+                held = req_of[i];
+                const i32* pages = page_indices + pages_of[i];
+                const int nreq = min(kv_of[i] / stride, score_stride);
+#pragma unroll
+                for (int kt = 0; kt < TILES; ++kt) {
+                    const int j = min(base + 16 * kt + c, nreq - 1);
+                    const int cell = compact ? j : (j + 1) * ratio - 1;
+                    const long long slot = static_cast<long long>(pages[cell / kps]) * kps + cell % kps;
+#pragma unroll
+                    for (int st = 0; st < KP; ++st) kr[kt][st] = load8(key_pages + slot * D + 32 * st + 8 * g);
+                }
+            }
+            mfma_ab2 qf[NT][KP];
+            float hw[NT][4];
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+                for (int st = 0; st < KP; ++st) qf[nt][st] = load8(&ql[b][(16 * nt + c) * QP + 32 * st + 8 * g]);
+#pragma unroll
+                for (int e = 0; e < 4; ++e) hw[nt][e] = wl[b][16 * nt + 4 * g + e];
+            }
+            float* frow = scores + static_cast<long long>(t0 + i) * score_stride;
+#pragma unroll
+            for (int kt = 0; kt < TILES; ++kt) {
+                float v = 0.f;
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    mfma_cd sv = mfma_zero();
+#pragma unroll
+                    for (int st = 0; st < KP; ++st) sv = mfma16x2(qf[nt][st], kr[kt][st], sv);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) v += fmaxf(sv[e], 0.f) * hw[nt][e];
+                }
+                v += __shfl_xor(v, 16, kWave);
+                v += __shfl_xor(v, 32, kWave);
+                const int j = base + 16 * kt + c;
+                if (g == kt && j < nkeys) frow[j] = v;
+            }
+            if (p + 1 < count) land(next, b ^ 1);
+            if (p + 3 < count) fetch(next, p + 3);
+            __syncthreads();
+        };
+        Share sa, sb;
+        fetch(sa, 0);
+        land(sa, 0);
+        if (count > 1) fetch(sa, 1);
+        if (count > 2) fetch(sb, 2);
+        __syncthreads();
+        for (int p = 0; p < count; p += 2) {
+            step(p, 0, sa);
+            if (p + 1 < count) step(p + 1, 1, sb);
+        }
     }
 }
 
