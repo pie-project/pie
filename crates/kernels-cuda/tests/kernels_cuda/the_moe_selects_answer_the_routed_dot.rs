@@ -371,6 +371,9 @@ fn the_routed_mlp_kept_by_expert_answers_the_host() {
         // its atoms' last four-column group half filled.
         (16, 64, [2048, 768, 16, 8], sw, None, None, 0.1),
         (16, 8, [2048, 768, 16, 8], sw, None, None, 0.1),
+        // GLM-4.5-Air's: K 1408, eleven 128-blocks.
+        (16, 1, [4096, 1408, 16, 8], sw, None, None, 0.1),
+        (16, 64, [4096, 1408, 16, 8], sw, None, None, 0.1),
     ];
     for (a, tokens, [hidden, inter, ex, top], g, gate, window, tol) in cases {
         let what = format!("{a} {tokens}x{top} over {ex}, gate {gate:?}, window {window:?}");
