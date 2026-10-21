@@ -82,6 +82,10 @@ __global__ void __launch_bounds__(kWarps * 32) fp8_block_gemv(
     int k,
     int splits)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     using namespace fp8gemv;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;

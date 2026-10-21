@@ -66,8 +66,10 @@ pub(crate) fn gemv_bf16(
         };
         return ctx.fire(
             "linear.gemv",
-            Fire::at("linear/gemv.cuh", instantiation)
-                .apply(Launch::grid([n.unsigned_abs(), 1, 1], [32, warps, 1])),
+            Fire::at("linear/gemv.cuh", instantiation).apply(
+                Launch::grid([n.unsigned_abs(), 1, 1], [32, warps, 1])
+                    .programmatic(ctx.tuning().pdl),
+            ),
             &values,
         );
     }
@@ -79,10 +81,10 @@ pub(crate) fn gemv_bf16(
     };
     ctx.fire(
         "linear.gemv",
-        Fire::at("linear/gemv.cuh", instantiation).apply(Launch::grid(
-            [n.unsigned_abs().div_ceil(4), 1, 1],
-            [32, 4, 1],
-        )),
+        Fire::at("linear/gemv.cuh", instantiation).apply(
+            Launch::grid([n.unsigned_abs().div_ceil(4), 1, 1], [32, 4, 1])
+                .programmatic(ctx.tuning().pdl),
+        ),
         &values,
     )
 }

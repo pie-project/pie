@@ -207,10 +207,10 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         let units = packed.rows.saturating_mul(heads);
         return ctx.fire(
             OP,
-            Fire::at(FILE, symbol(&instantiation)).apply(Launch::grid(
-                [units.div_ceil(WARPS_PER_BLOCK), 1, 1],
-                [WARP_BLOCK, 1, 1],
-            )),
+            Fire::at(FILE, symbol(&instantiation)).apply(
+                Launch::grid([units.div_ceil(WARPS_PER_BLOCK), 1, 1], [WARP_BLOCK, 1, 1])
+                    .programmatic(ctx.tuning().pdl),
+            ),
             &[
                 packed.arg(),
                 q.arg(),

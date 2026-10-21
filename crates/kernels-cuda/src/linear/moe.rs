@@ -89,7 +89,7 @@ fn router_extents_upto(
 
 /// A router of at most 512 experts and a top-k of at most 16 a warp a row
 /// (`moe_topk_softmax_lane`): `None` past them.
-fn topk_lane(t: &str, experts: u32, top_k: u32, rows: u32) -> Option<Fire> {
+fn topk_lane(t: &str, experts: u32, top_k: u32, rows: u32, pdl: bool) -> Option<Fire> {
     if experts == 0 || experts > 512 || top_k == 0 || top_k > 16 {
         return None;
     }
@@ -99,7 +99,7 @@ fn topk_lane(t: &str, experts: u32, top_k: u32, rows: u32) -> Option<Fire> {
             FILE,
             symbol(&format!("::pie::linear::moe_topk_softmax_lane<{t}, {per}>")),
         )
-        .apply(Launch::grid([rows.max(1), 1, 1], [32, 1, 1])),
+        .apply(Launch::grid([rows.max(1), 1, 1], [32, 1, 1]).programmatic(pdl)),
     )
 }
 
@@ -115,7 +115,7 @@ pub fn topk_softmax(
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     ranked_planes(OP, logits, top_k, routes, weights);
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
-    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows) {
+    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows, ctx.tuning().pdl) {
         return ctx.fire(
             OP,
             fire,
@@ -173,7 +173,7 @@ pub fn topk_softmax_scaled(
     );
     ranked_planes(OP, logits, top_k, routes, weights);
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
-    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows) {
+    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows, ctx.tuning().pdl) {
         return ctx.fire(
             OP,
             fire,
@@ -237,10 +237,10 @@ fn ranked_router(
                 "::pie::linear::moe_topk_ranked<{t}, {softplus}, {per}>"
             )),
         )
-        .apply(Launch::grid(
-            [logits.rows.div_ceil(ROWS), 1, 1],
-            [WARP * ROWS, 1, 1],
-        )),
+        .apply(
+            Launch::grid([logits.rows.div_ceil(ROWS), 1, 1], [WARP * ROWS, 1, 1])
+                .programmatic(ctx.tuning().pdl),
+        ),
         &[
             logits.arg(),
             routes.arg(),
@@ -507,9 +507,17 @@ pub fn matmul_select(
                 Err(why) => tc5_fell_back(OP, &why),
             }
         }
-        // Where there are no tcgen05 GEMMs, a decode's routes on mma.sync,
-        // each expert's rows streamed once a slice rather than once a route.
+        // Where there are no tcgen05 GEMMs, a batch whose experts fill their
+        // tiles (past 12 routes an expert, `BF16_GEMM_FROM` routes a fire) on
+        // the tiled mma.sync GEMM. Fewer routes an expert take the pipelined
+        // select or the per-route GEMV below, which measured ahead of the
+        // register-held kernel there (Gemma 4 26B-A4B's 128 experts at 64
+        // rows, 196 against 146 us a select; every decode measured).
+        let tiled = fan.route_count >= BF16_GEMM_FROM
+            && x.width.is_multiple_of(64)
+            && fan.route_count.div_ceil(bank.rows.max(1)) > 12;
         if !crate::linear::tc5::supported()
+            && tiled
             && bank.dtype == Dtype::Bf16
             && !experts.streams()
             && select_bf16_held(ctx, OP, x, bank.ptr, bank.rows, routes, y, None)?
@@ -527,15 +535,89 @@ pub fn matmul_select(
             && x.dtype == Dtype::Bf16
             && bank.dtype == Dtype::Bf16
             && !experts.streams()
-            && x.width.is_multiple_of(16)
+            && x.width.is_multiple_of(64)
             && y.width.is_multiple_of(8)
             && bank.rows >= 1
             && u64::from(bank.width) == u64::from(x.width) * u64::from(y.width)
         {
+            // On Hopper, wgmma over the same staging (sm_90a).
+            if hopper_wgmma() && y.width.is_multiple_of(128) {
+                return select_bf16_wgmma(ctx, OP, x, bank, routes, y, &fan, bank.rows);
+            }
             return select_bf16_mma(ctx, OP, x, bank, routes, y, &fan, bank.rows);
         }
     }
     select_gemv(ctx, OP, x, bank, routes, y, experts)
+}
+
+/// [`select_bf16_mma`] on Hopper's wgmma (`moe_select_bf16_wgmma`): an
+/// expert's slice 16 routes, or 32 past an average of 8.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn select_bf16_wgmma(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    fan: &Selected,
+    experts: u32,
+) -> Result<(), Error> {
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let slice: u32 = if fan.route_count.div_ceil(experts.max(1)) <= 8 {
+        16
+    } else {
+        32
+    };
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
+        ctx,
+        op,
+        routes,
+        fan,
+        experts,
+        slice,
+        true,
+        if KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    // A CTA 64 of the expert's rows, K 128 a stage where it divides (fewer
+    // barriers a row: 3.0 TB/s at Gemma 4 26B-A4B's gate-up, every expert
+    // routed), else 64: `kWgStages` stages of the rows and the slice's route
+    // rows, past the 1024-byte alignment.
+    let atoms: u32 = if x.width.is_multiple_of(128) { 2 } else { 1 };
+    let smem = 3 * atoms * (64 + slice) * 128 + 1024;
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/moe_wgmma.cuh",
+            symbol(&format!(
+                "::pie::linear::moe_select_bf16_wgmma<{slice}, {atoms}>"
+            )),
+        )
+        .apply(Launch::grid([work_cap, y.width / 64, 1], [128, 1, 1]).smem(smem)),
+        &[
+            x.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            bank.arg(),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            stated(op, x.width)?.arg(),
+            stated(op, experts)?.arg(),
+        ],
+    )
 }
 
 /// Whether the graph-safe bf16 grouped mma.sync kernel takes a fire of
@@ -595,8 +677,9 @@ fn select_bf16_mma(
         },
     )?;
     let grid = [work_cap, y.width.div_ceil(COLS), 1];
-    // smem = (128 weight rows + 8*nb route rows) x (kBK 16 + 8 pad) bf16.
-    let smem = (128 + 8 * nb) * (16 + 8) * 2;
+    // Three stages of 128 weight rows and 8 nb route rows, each a K step of
+    // 64 bf16 padded by 8 (`kBf16MmaStages`, `kBf16MmaBK`).
+    let smem = 3 * (128 + 8 * nb) * (64 + 8) * 2;
     ctx.fire(
         op,
         Fire::at(
@@ -618,6 +701,293 @@ fn select_bf16_mma(
             stated(op, experts)?.arg(),
         ],
     )
+}
+
+/// Whether this device has the FP8 MMA the W8A8 kernels run on (sm_89 on):
+/// where it has no tcgen05, a block-FP8 deployment's batches quantize their
+/// rows as the deployment says rather than read them bf16 (`w8a16`).
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn fp8_w8a8_capable() -> bool {
+    crate::jit::cache::arch()
+        .and_then(|a| {
+            a.trim_start_matches("sm_")
+                .trim_end_matches(char::is_alphabetic)
+                .parse::<u32>()
+                .ok()
+        })
+        .is_some_and(|cc| cc >= 89)
+}
+
+/// Whether this device is Hopper (sm_90), whose arch-specific target has
+/// wgmma: the routed W8A8 select's tensor-core GEMM there.
+#[cfg(feature = "cuda")]
+fn hopper_wgmma() -> bool {
+    crate::jit::cache::arch() == Some("sm_90")
+}
+
+/// The fewest routes a block-FP8 select takes [`select_fp8_w8a8`] at, and
+/// the rows of a dense plane [`matmul_fp8_w8a8`] takes, between a decode's
+/// register-held W8A16 kernels and a prefill's widened cuBLAS GEMM.
+pub const FP8_W8A8_FROM: u32 = 64;
+pub const FP8_W8A8_DENSE: core::ops::RangeInclusive<u32> = 33..=256;
+
+/// `x`'s rows as e4m3 in 1x128 blocks (codes, a biased exponent a block) in
+/// stream scratch, for [`select_fp8_w8a8`] and [`matmul_fp8_w8a8`].
+#[cfg(feature = "cuda")]
+fn quantize_rows_e4m3b128(ctx: &Ctx, op: &'static str, x: Tensor) -> Result<(u64, u64), Error> {
+    let (rows, k) = (x.rows as usize, x.width as usize);
+    let codes = ctx.scratch_stream(op, "linear.fp8_w8a8_x", rows * k)? as u64;
+    let exps = ctx.scratch_stream(op, "linear.fp8_w8a8_xe", rows * (k / 128))? as u64;
+    let lanes = u32::try_from(rows * (k / 128) * 16).map_err(|_| refuse(op, "too many rows"))?;
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/moe_w8a8.cuh",
+            "::pie::linear::quantize_rows_e4m3b128",
+        )
+        .apply(Launch::grid([lanes.div_ceil(128), 1, 1], [128, 1, 1])),
+        &[
+            x.arg(),
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(exps),
+            stated(op, x.rows)?.arg(),
+            stated(op, x.width)?.arg(),
+        ],
+    )?;
+    Ok((codes, exps))
+}
+
+/// Whether the mma.sync fp8 kernels take a product of `x` against a
+/// 128x128-block FP8 plane `n` rows wide: bf16 rows, K in whole 512s (as the
+/// load lays the exponents), N in whole 128-row blocks.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn fp8_w8a8_takes(x: Tensor, n: u32) -> bool {
+    x.dtype == Dtype::Bf16 && x.width > 0 && x.width.is_multiple_of(512) && n.is_multiple_of(128)
+}
+
+/// `y[route] = q(x[route or its token]) . W[routes[route]]^T` for a
+/// 128x128-block FP8 bank (W8A8, `q` the rows' e4m3 1x128 quantization) on
+/// mma.sync, off tcgen05: the rows quantized once, routes laid out by expert
+/// on-device (graph-safe), each expert's codes read once a slice.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn select_fp8_w8a8(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: u64,
+    atoms: u64,
+    experts: u32,
+    routes: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_select_fp8_w8a8";
+    let fan = selected(OP, x, routes, y)?;
+    let n = stated(OP, nonzero(OP, "N, the bank's output width", y.width)?)?;
+    if !fp8_w8a8_takes(x, y.width) || experts == 0 {
+        return Err(refuse(
+            OP,
+            "the fp8 select takes bf16 rows, K in 512s and N in 128s",
+        ));
+    }
+    let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let per = fan.route_count.div_ceil(experts);
+    // On Hopper, wgmma (sm_90a): an expert's slice 32 routes, or 64 past an
+    // average of 16, at about the card's rate either way, so a busy expert's
+    // routes rarely spill into a second read of its codes.
+    if hopper_wgmma() {
+        let slice: u32 = if per <= 16 { 32 } else { 64 };
+        let RouteOrder {
+            order,
+            offsets,
+            work,
+            work_cap,
+        } = route_order_sliced(
+            ctx,
+            OP,
+            routes,
+            &fan,
+            experts,
+            slice,
+            true,
+            if KEEP_NEXT.with(core::cell::Cell::get) {
+                Share::Keep
+            } else {
+                Share::Take
+            },
+        )?;
+        // `kWgStages` stages of 128 code rows and the slice's route rows, a
+        // 128-code K step each, past the 1024-byte alignment.
+        let smem = 3 * (128 + slice) * 128 + 1024;
+        return ctx.fire(
+            OP,
+            Fire::at(
+                "linear/moe_wgmma.cuh",
+                symbol(&format!("::pie::linear::moe_select_fp8a8_wgmma<{slice}>")),
+            )
+            .apply(Launch::grid([work_cap, y.width / 128, 1], [128, 1, 1]).smem(smem)),
+            &[
+                ArgValue::Ptr(xq),
+                ArgValue::Ptr(xe),
+                ArgValue::Ptr(order),
+                ArgValue::Ptr(offsets),
+                ArgValue::Ptr(work),
+                ArgValue::Ptr(codes),
+                ArgValue::Ptr(atoms),
+                y.arg(),
+                act_div.arg(),
+                n.arg(),
+                stated(OP, x.width)?.arg(),
+                stated(OP, experts)?.arg(),
+            ],
+        );
+    }
+    // As the bf16 select: an expert's slice 8, 16, 32 or 64 routes.
+    let nb: u32 = match per {
+        0..=8 => 1,
+        9..=16 => 2,
+        17..=40 => 4,
+        _ => 8,
+    };
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
+        ctx,
+        OP,
+        routes,
+        &fan,
+        experts,
+        8 * nb,
+        true,
+        if KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            "linear/moe_w8a8.cuh",
+            symbol(&format!("::pie::linear::moe_select_fp8a8_mma<{nb}, false>")),
+        )
+        .apply(
+            Launch::grid([work_cap, y.width.div_ceil(128), 1], [128, 1, 1]).smem(fp8_mma_smem(nb)),
+        ),
+        &[
+            ArgValue::Ptr(xq),
+            ArgValue::Ptr(xe),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            y.arg(),
+            ArgValue::ABSENT,
+            act_div.arg(),
+            n.arg(),
+            stated(OP, x.width)?.arg(),
+            stated(OP, experts)?.arg(),
+            stated(OP, x.rows)?.arg(),
+        ],
+    )
+}
+
+/// `y = q(x) . W^T` for one 128x128-block FP8 plane (W8A8) on mma.sync, off
+/// tcgen05: [`select_fp8_w8a8`]'s kernel over the rows in order.
+#[cfg(feature = "cuda")]
+pub fn matmul_fp8_w8a8(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: u64,
+    atoms: u64,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.matmul_fp8_w8a8";
+    if !fp8_w8a8_takes(x, y.width) || y.rows != x.rows || y.dtype != Dtype::Bf16 {
+        return Err(refuse(
+            OP,
+            "the fp8 matmul takes bf16 rows, K in 512s and N in 128s",
+        ));
+    }
+    if x.rows == 0 {
+        return Ok(());
+    }
+    let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
+    let nb: u32 = match x.rows {
+        0..=8 => 1,
+        9..=16 => 2,
+        17..=32 => 4,
+        _ => 8,
+    };
+    // K split where the plane's row blocks and the row slices leave the
+    // multiprocessors short of two CTAs each: every code still read once.
+    let sms = ctx.multiprocessors().unwrap_or(132);
+    let ctas = x.rows.div_ceil(8 * nb) * y.width.div_ceil(128);
+    let splits = (2 * sms / ctas.max(1)).clamp(1, 8).min(x.width / 128);
+    let count = x.rows as usize * y.width as usize;
+    let part = if splits > 1 {
+        ctx.scratch_stream(OP, "linear.fp8_w8a8_part", splits as usize * count * 4)? as u64
+    } else {
+        0
+    };
+    ctx.fire(
+        OP,
+        Fire::at(
+            "linear/moe_w8a8.cuh",
+            symbol(&format!("::pie::linear::moe_select_fp8a8_mma<{nb}, true>")),
+        )
+        .apply(
+            Launch::grid(
+                [x.rows.div_ceil(8 * nb), y.width.div_ceil(128), splits],
+                [128, 1, 1],
+            )
+            .smem(fp8_mma_smem(nb)),
+        ),
+        &[
+            ArgValue::Ptr(xq),
+            ArgValue::Ptr(xe),
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            y.arg(),
+            ArgValue::Ptr(part),
+            1i32.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, x.width)?.arg(),
+            1i32.arg(),
+            stated(OP, x.rows)?.arg(),
+        ],
+    )?;
+    if splits == 1 {
+        return Ok(());
+    }
+    let quads = u32::try_from(count / 4).map_err(|_| refuse(OP, "too many outputs"))?;
+    ctx.fire(
+        OP,
+        Fire::at("linear/moe_w8a8.cuh", "::pie::linear::fp8a8_fold")
+            .apply(Launch::grid([quads.div_ceil(256), 1, 1], [256, 1, 1])),
+        &[
+            ArgValue::Ptr(part),
+            y.arg(),
+            (count as i64).arg(),
+            stated(OP, splits)?.arg(),
+        ],
+    )
+}
+
+/// Three stages of 128 weight rows and 8 nb route rows, each a 128-code K
+/// step padded by 16 bytes (`kFp8a8Stages`).
+#[cfg(feature = "cuda")]
+const fn fp8_mma_smem(nb: u32) -> u32 {
+    3 * (128 + 8 * nb) * (128 + 16)
 }
 
 /// Says, once a process, that a select the tcgen05 GEMM was to take fell
@@ -1883,10 +2253,13 @@ pub(crate) fn select_gemv(
     let entry = format!("::pie::linear::moe_matmul_select_gemv_{form}<{t}, {ROWS}>");
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&entry)).apply(Launch::grid(
-            [y.width.div_ceil(GEMV_WARPS * ROWS), grid_y, grid_z],
-            [WARP, GEMV_WARPS, 1],
-        )),
+        Fire::at(FILE, symbol(&entry)).apply(
+            Launch::grid(
+                [y.width.div_ceil(GEMV_WARPS * ROWS), grid_y, grid_z],
+                [WARP, GEMV_WARPS, 1],
+            )
+            .programmatic(ctx.tuning().pdl),
+        ),
         &[
             routes.arg(),
             x.arg(),
@@ -2033,7 +2406,11 @@ fn route_order_sliced(
         } else {
             Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
         }
-        .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
+        .apply(
+            Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1])
+                .smem(2 * (experts + 1) * 4)
+                .programmatic(ctx.tuning().pdl && scan),
+        ),
         &[
             routes.arg(),
             ArgValue::Ptr(order),
@@ -2287,6 +2664,23 @@ fn select_mxfp4_mma(
                 .smem(nb * win * 4096)
                 .cluster(ksplit),
         )
+    } else if staged && hopper_wgmma() && x.width.is_multiple_of(128) {
+        // Hopper: the staged slice on wgmma (`moe_select_fp4_wgmma`), the
+        // codes dequantized to its A registers, a warpgroup's 128 rows (64
+        // GLU columns) a CTA. Two stages where the fire's slices fill the
+        // card three CTAs an SM deep (their shared memory), else three.
+        let nv = tensor_scales.is_some();
+        let sms = ctx.multiprocessors().unwrap_or(132);
+        let ctas = fan.route_count.div_ceil(64) * grid[1];
+        let stages: u32 = if ctas >= 3 * sms - sms / 2 { 2 } else { 3 };
+        let smem = stages * (64 * 256 + 128 * (64 + 8)) + 128 * 32 + 1024;
+        Fire::at(
+            "linear/moe_wgmma.cuh",
+            symbol(&format!(
+                "::pie::linear::moe_select_fp4_wgmma<{code}, {nv}, {stages}>"
+            )),
+        )
+        .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(smem))
     } else if staged {
         const STAGES: u32 = 3;
         let nv = tensor_scales.is_some();
@@ -3111,7 +3505,7 @@ pub fn weighted_sum(
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&format!("::pie::linear::{entry}<{t}>")))
-            .apply(elementwise_rows(OP, y.rows, threads)?),
+            .apply(elementwise_rows(OP, y.rows, threads)?.programmatic(ctx.tuning().pdl && vec8)),
         &[
             y.arg(),
             routed.arg(),

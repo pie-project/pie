@@ -301,3 +301,89 @@ fn the_tensor_core_kda_lands_the_serial_walk() {
         near(&slab, &slab_walk, "the slots");
     }
 }
+
+/// A decode's step (a token a lane, its heads' value rows split over blocks)
+/// lands the serial walk's rows and slots, folding and not.
+#[test]
+fn the_kda_decode_step_lands_the_serial_walk() {
+    const H: u32 = 2;
+    const D: u32 = 128;
+    let wide = (H * D) as usize;
+    let stride = (H * D * D) as usize;
+    let n = 3usize;
+    let mut gpu = Gpu::open();
+    let mut lcg = Lcg::seeded(0x4d);
+    let mixed = gpu.up(&lcg.row(n * 3 * wide).0);
+    let f = gpu.up(&lcg.row(n * wide).0);
+    let b = gpu.up(&lcg.row(n * H as usize).0);
+    let dt_bias: Vec<f32> = (0..wide).map(|_| 0.1 * lcg.unit()).collect();
+    let a_log: Vec<f32> = (0..H).map(|_| -0.5 + 0.2 * lcg.unit()).collect();
+    let (dt_bias, a_log) = (gpu.up(&dt_bias), gpu.up(&a_log));
+    let seed: Vec<f32> = (0..n * stride).map(|_| 0.05 * lcg.unit()).collect();
+    let indptr_at = gpu.up(&[0i32, 1, 2, 3]);
+    let slots_at = gpu.up(&[2i32, 0, 1]);
+    let mut run = |step: bool, write_state: bool| {
+        let slab_at = gpu.up(&seed);
+        let y_at = gpu.zeros(n * wide * 4);
+        let pool = RecurrentPool {
+            slab: Tensor::new(slab_at, n as u32, stride as u32, Dtype::F32),
+            slot_ids: Tensor::new(slots_at, n as u32, 1, Dtype::I32),
+            slot_stride_elems: stride as i64,
+            conv_slab: Tensor::ABSENT,
+            conv_stride: 0,
+            write_state,
+            write_state_mask: Tensor::ABSENT,
+            commit_len: Tensor::ABSENT,
+            begin_at: Tensor::ABSENT,
+            fused_decay: false,
+        };
+        let mixed_t = Tensor::new(mixed, n as u32, 3 * wide as u32, Dtype::Bf16);
+        let (f_t, b_t) = (
+            Tensor::new(f, n as u32, wide as u32, Dtype::Bf16),
+            Tensor::new(b, n as u32, H, Dtype::Bf16),
+        );
+        let (dt_t, a_t) = (
+            Tensor::new(dt_bias, 1, wide as u32, Dtype::F32),
+            Tensor::new(a_log, 1, H, Dtype::F32),
+        );
+        let mut y = Tensor::new(y_at, n as u32, wide as u32, Dtype::F32);
+        let tuning = crate::common::attn_ref::tuned(|t| t.ssm_kda_chunked = false);
+        let ctx = gpu.ctx().with_tuning(tuning);
+        if step {
+            ssm::kda_step(
+                &ctx, mixed_t, f_t, b_t, dt_t, a_t, &pool, H, D, 1e-6, 0.0, &mut y,
+            )
+            .expect("the KDA step fires");
+        } else {
+            let data = RaggedTensor {
+                data: mixed_t,
+                indptr: Tensor::new(indptr_at, 4, 1, Dtype::I32),
+            };
+            ssm::kda_chunked(
+                &ctx, data, f_t, b_t, dt_t, a_t, &pool, H, D, 1e-6, 0.0, &mut y,
+            )
+            .expect("the KDA scan fires");
+        }
+        gpu.sync();
+        let y: Vec<f32> = gpu.down(y_at, n * wide);
+        let slab: Vec<f32> = gpu.down(slab_at, n * stride);
+        (y, slab)
+    };
+    let near = |got: &[f32], want: &[f32], what: &str| {
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = got
+            .iter()
+            .zip(want)
+            .fold(0f32, |m, (g, w)| m.max((g - w).abs()));
+        assert!(
+            worst <= 1e-4 * scale.max(1e-6),
+            "{what}: off by {worst} of {scale}"
+        );
+    };
+    for write_state in [true, false] {
+        let (y_walk, slab_walk) = run(false, write_state);
+        let (y, slab) = run(true, write_state);
+        near(&y, &y_walk, "the rows");
+        near(&slab, &slab_walk, "the slots");
+    }
+}

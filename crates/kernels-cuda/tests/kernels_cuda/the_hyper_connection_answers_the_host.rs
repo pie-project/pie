@@ -220,3 +220,60 @@ fn the_tensor_core_prenorm_projection_answers_the_host() {
     let got = gpu.down::<f32>(m_at, rows * MIX);
     near(&got, &want, 2e-3, 1.0, "the tensor-core prenorm projection");
 }
+
+/// `hc::pre` (the prenorm projection, then the gates and the norm) at a
+/// decode's rows over four 4096-wide streams: its launches' rate.
+#[test]
+#[ignore = "a rate, not an answer"]
+fn the_pre_rate() {
+    let fan = M * H;
+    let mut lcg = Lcg::seeded(0x5e7);
+    let mut gpu = Gpu::open();
+    for rows in [1usize, 8, 64] {
+        let (_, s_bits) = bf16s(&mut lcg, rows * fan, 1.0);
+        let w: Vec<f32> = (0..MIX * fan).map(|_| lcg.unit() * 0.01).collect();
+        let bias: Vec<f32> = (0..MIX).map(|_| lcg.unit()).collect();
+        let (_, nw) = bf16s(&mut lcg, H, 1.0);
+        let (s_at, w_at, b_at, nw_at) = (gpu.up(&s_bits), gpu.up(&w), gpu.up(&bias), gpu.up(&nw));
+        let sc_at = gpu.up(&[0.7f32, 1.3, 0.9]);
+        let (mix_at, y_at) = (gpu.zeros(rows * MIX * 4), gpu.zeros(rows * H * 2));
+        let (post_at, comb_at) = (gpu.zeros(rows * M * 4), gpu.zeros(rows * M * M * 4));
+        let ctx = gpu.ctx();
+        let fire = || {
+            let gate = hc::Gate {
+                scale: ten(sc_at, 1, 3, F32),
+                base: ten(b_at, 1, MIX, F32),
+                gate_eps: 1e-6,
+                alpha: 2.0,
+                sinkhorn: 20,
+            };
+            let fired = hc::pre(
+                &ctx,
+                ten(s_at, rows, fan, Bf16),
+                1e-6,
+                ten(w_at, MIX, fan, F32),
+                M as u32,
+                &mut ten(mix_at, rows, MIX, F32),
+                gate,
+                ten(nw_at, 1, H, Bf16),
+                1e-6,
+                None,
+                &mut ten(post_at, rows, M, F32),
+                &mut ten(comb_at, rows, M * M, F32),
+                &mut ten(y_at, rows, H, Bf16),
+            );
+            assert!(fired.expect("the pre fires"), "the pre takes these planes");
+        };
+        fire();
+        gpu.sync();
+        let start = std::time::Instant::now();
+        for _ in 0..200 {
+            fire();
+        }
+        gpu.sync();
+        eprintln!(
+            "hc pre rows {rows}: {:.1} us a call",
+            start.elapsed().as_secs_f64() * 1e6 / 200.0
+        );
+    }
+}

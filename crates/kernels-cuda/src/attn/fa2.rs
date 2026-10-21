@@ -226,7 +226,8 @@ pub(crate) fn decode<P>(
                 DecodeGeometry::grid(at.padded_batch_size, at.num_kv_heads),
                 geometry.block(),
             )
-            .smem(geometry.smem_bytes),
+            .smem(geometry.smem_bytes)
+            .programmatic(ctx.tuning().pdl),
         ),
         &[ArgValue::of(params)],
     )
@@ -514,7 +515,11 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<bool
 
     ctx.fire(
         op,
-        Fire::at(FILE, instantiation).apply(Launch::grid([blocks, 1, 1], [bdx, bdy, 1]).smem(smem)),
+        Fire::at(FILE, instantiation).apply(
+            Launch::grid([blocks, 1, 1], [bdx, bdy, 1])
+                .smem(smem)
+                .programmatic(ctx.tuning().pdl),
+        ),
         &[
             ArgValue::Ptr(split.tmp_v),
             ArgValue::Ptr(split.tmp_s),

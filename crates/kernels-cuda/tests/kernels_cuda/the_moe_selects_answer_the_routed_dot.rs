@@ -214,6 +214,11 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Bf16, bf16mma, [8, 64, 8, 128, 256], f, None, 0),
         (K::Bf16, bf16mma, [16, 40, 8, 256, 128], f, None, 0),
         (K::Bf16, bf16mma, [8, 12, 4, 96, 512], t, None, 0),
+        // Few routes an expert (not the tiled GEMM's): Hopper's wgmma select
+        // at its 16- and 32-route slices.
+        (K::Bf16, bf16mma, [64, 16, 4, 256, 512], t, None, 0),
+        (K::Bf16, bf16mma, [16, 40, 4, 128, 256], f, None, 0),
+        (K::Bf16, bf16mma, [32, 16, 4, 256, 192], t, None, 0),
         // Affine u4: per route, grouped, tcgen05.
         (K::Affine, d, [16, 1, 8, 1408, 2816], t, None, 0),
         (K::Affine, d, [16, 3, 8, 704, 704], f, None, 0),
@@ -257,6 +262,12 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Nv, nv_mma, [16, 48, 10, 320, 2560], t, sw, 0),
         (K::Nv, nv_mma, [16, 160, 10, 256, 640], t, None, 0),
         (K::Nv, nv_mma, [16, 120, 10, 320, 2560], t, sw, 0),
+        // Hopper's wgmma select of a 64-route slice (K whole 128s): a
+        // partial tile, scales past f16's range under a GLU, and a fire
+        // filling the card (its two stages).
+        (K::Nv, nv_mma, [8, 64, 8, 200, 1024], f, None, 0),
+        (K::MxBias, mma, [8, 80, 4, 192, 2816], t, alpha, 2),
+        (K::Nv, nv_mma, [8, 64, 8, 6144, 512], t, None, 0),
     ];
     // Off tcgen05 (Hopper) the arms its tunings name do not take the fire.
     cases.retain(|case| supported() || !(case.1.moe_tc5 || case.1.mxfp4_cvt));
@@ -463,5 +474,165 @@ fn the_w8a16_selects_answer_the_routed_dot() {
         let w = |r: usize, c: usize, i: usize| f64::from(s.value(routes[r] as usize * n + c, k, i));
         let want = dot([count, n, k], |r, i| a[r / div * k + i], w);
         b.check(y.ptr, &want, TOL, &what);
+    }
+}
+
+/// The bf16 select's rate at Gemma 4 26B-A4B's routed shapes (128 experts, 64
+/// tokens a top-8, routes spread): `cargo test ... -- --ignored bf16_select_rate`.
+#[test]
+#[ignore]
+fn bf16_select_rate() {
+    for (n, k) in [(1408usize, 2816usize), (2816, 704)] {
+        let (experts, tokens, top) = (128usize, 64usize, 8usize);
+        let mut b = Bench::new(7);
+        let (x, _) = b.bf16(tokens * k);
+        let bank = b.up(&tab(experts * n * k, |i| 0x3c00u16 ^ (i % 97) as u16));
+        // `PIE_ROUTES`: a file of `tokens * top` i32 expert ids (a model's).
+        let routes: Vec<i32> = std::env::var("PIE_ROUTES").map_or_else(
+            |_| {
+                tab(tokens * top, |i| {
+                    ((i / top * 37 + (i % top) * 16) % experts) as i32
+                })
+            },
+            |p| {
+                let bytes = std::fs::read(p).expect("reads the routes");
+                bytes
+                    .chunks(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            },
+        );
+        let routes = b.up(&routes);
+        let (xt, rt) = (t(x, tokens, k, Bf16), t(routes, tokens, top, I32));
+        let mut y = b.out(tokens * top, n);
+        #[rustfmt::skip]
+        let tuning = Tuning { moe_grouped: false, bf16_mma_from: 16, bf16_mma_until: 65_536, ..b.ctx().tuning() };
+        let ctx = b.ctx().with_tuning(tuning);
+        let fire =
+            |y: &mut _| moe::matmul_select(&ctx, xt, t(bank, experts, n * k, Bf16), rt, y, RES);
+        fire(&mut y).expect("fires");
+        b.sync();
+        let reps = 30;
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            fire(&mut y).expect("fires");
+        }
+        b.sync();
+        let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+        eprintln!(
+            "bf16 select {n}x{k}: {us:.1} us a fire, {:.0} GB/s of the bank",
+            (experts * n * k * 2) as f64 / us / 1e3
+        );
+    }
+}
+
+/// The NVFP4 W4A16 select's rate at GLM-5.3-mini's decode shapes (eight
+/// experts, each of a C64 step's tokens on all eight): the GLU gate-up and
+/// the down projection.
+#[test]
+#[ignore = "a rate, not an answer"]
+fn nvfp4_select_rate() {
+    let (experts, tokens, top) = (8usize, 64usize, 8usize);
+    for (n, k, glu) in [
+        (2048usize, 6144usize, true),
+        (4096, 6144, false),
+        (6144, 2048, false),
+    ] {
+        let rows = if glu { 2 * n } else { n };
+        let mut b = Bench::new(9);
+        let (x, _) = b.bf16(tokens * k);
+        let codes = b.up(&tab(experts * rows * k / 2, |i| (i * 37 % 251) as u8));
+        let scales = b.up(&tab(experts * rows * k / 16, |i| 0x30 + (i % 7) as u8));
+        let ts = b.up(&tab(experts * rows, |_| 0.01f32));
+        let routes = b.up(&tab(tokens * top, |i| (i % top) as i32));
+        let (xt, rt) = (t(x, tokens, k, Bf16), t(routes, tokens, top, I32));
+        let mut y = b.out(tokens * top, n);
+        let tuning = Tuning {
+            nvfp4_mma_until: 65_536,
+            nvfp4_mma_from: 1,
+            ..b.ctx().tuning()
+        };
+        let ctx = b.ctx().with_tuning(tuning);
+        let (c, s) = (
+            t(codes, experts, rows * k / 2, Nvfp4),
+            t(scales, experts, rows * k / 16, U8),
+        );
+        let tt = t(ts, experts, rows * 4, U8);
+        let fire = |y: &mut _| {
+            if glu {
+                let bank = GluBank::Nvfp4 {
+                    codes: c,
+                    scales: s,
+                    tensor_scales: tt,
+                };
+                moe::select_glu(&ctx, xt, bank, rt, y, Glu::Swiglu, RES).map(|_| ())
+            } else {
+                nvfp4::matmul_select(&ctx, xt, c, s, tt, rt, y, SEAT)
+            }
+        };
+        fire(&mut y).expect("fires");
+        b.sync();
+        let reps = 50;
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            fire(&mut y).expect("fires");
+        }
+        b.sync();
+        let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+        let flops = 2.0 * (tokens * top * rows * k) as f64;
+        eprintln!(
+            "nvfp4 select {rows}x{k}: {us:.1} us a fire, {:.0} TFLOP/s",
+            flops / us / 1e6
+        );
+    }
+}
+
+/// The block-FP8 select's rate at GLM-5.3-Flash-mini's decode shapes (32
+/// experts, a C64 step's 64 tokens on eight each): the gate-up (by token)
+/// and the down projection (by route).
+#[test]
+#[ignore = "a rate, not an answer"]
+fn fp8_select_rate() {
+    use kernels_cuda::linear::moe::select_fp8_w8a8;
+    use kernels_cuda::linear::tc5::atom_bytes;
+    let (experts, tokens, top) = (32usize, 64usize, 8usize);
+    for (n, k, by_token) in [(4096usize, 4096usize, true), (4096, 2048, false)] {
+        let mut b = Bench::new(11);
+        let count = tokens * top;
+        // `PIE_ROUTES`: a file of `count` i32 expert ids (a skewed routing).
+        let routes: Vec<i32> = std::env::var("PIE_ROUTES").map_or_else(
+            |_| tab(count, |r| ((r / top * 3 + r % top * 5) % experts) as i32),
+            |p| {
+                let bytes = std::fs::read(p).expect("reads the routes");
+                bytes
+                    .chunks(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            },
+        );
+        let rows_x = if by_token { tokens } else { count };
+        let (x, _) = b.bf16(rows_x * k);
+        let codes = b.up(&tab(experts * n * k, |i| (i * 37 % 251) as u8 & 0xbf));
+        let atoms = b.up(&tab(atom_bytes(experts * n, k, 128), |i| {
+            120 + (i % 5) as u8
+        }));
+        let r = t(b.up(&routes), tokens, top, I32);
+        let mut y = b.out(count, n);
+        let ctx = b.ctx();
+        let x = t(x, rows_x, k, Bf16);
+        let fire = |y: &mut _| select_fp8_w8a8(&ctx, x, codes, atoms, experts as u32, r, y);
+        fire(&mut y).expect("fires");
+        b.sync();
+        let reps = 30;
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            fire(&mut y).expect("fires");
+        }
+        b.sync();
+        let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+        eprintln!(
+            "fp8 select {n}x{k} by_token={by_token}: {us:.1} us a fire, {:.0} GB/s of the bank",
+            (experts * n * k) as f64 / us / 1e3
+        );
     }
 }

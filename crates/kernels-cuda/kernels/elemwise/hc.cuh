@@ -397,6 +397,10 @@ __global__ void __launch_bounds__(THREADS) hc_gates_norm(
     u8* __restrict__ atoms,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     constexpr int BLOCK = 256;
     constexpr int H = PER * BLOCK;
     static_assert(H % THREADS == 0, "whole columns a thread");
@@ -670,6 +674,10 @@ __global__ void __launch_bounds__(256) hc_fold_vec8(
     int H,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     static_assert(sizeof(T) == 2, "eight elements are one 16-byte run");
     if (M > MAX_HC_MULT) return;
     // 32-bit index arithmetic: the host keeps `N * H / 8` under 2^31.
@@ -1374,6 +1382,10 @@ __global__ void __launch_bounds__(BR * KG) hc_prenorm_project_tile(
     float eps,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     constexpr int SX = KT + 8;
     constexpr int SW = KT + 4;
     constexpr int NT = BR * KG;

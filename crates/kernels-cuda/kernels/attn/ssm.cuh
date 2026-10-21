@@ -756,6 +756,10 @@ __global__ void ssm_causal_conv1d_update_batched_vec8(
     const u8* __restrict__ write_state_mask,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     constexpr int VEC = 8;
     constexpr int K_MAX = 8;
     union Vec { uint4 raw; T e[VEC]; };
@@ -2762,6 +2766,10 @@ __global__ void ssm_kda_gate_beta_rows(
     float lower_bound,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int t = blockIdx.x;
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
@@ -2769,7 +2777,9 @@ __global__ void ssm_kda_gate_beta_rows(
     const int width = H * D;
     const long long base = static_cast<long long>(t) * width;
     const long long src = static_cast<long long>(t_row) * width;
-    for (int e = threadIdx.x * 4; e < width; e += blockDim.x * 4) {
+    // `gridDim.y` blocks share the row's channels (a decode's few rows).
+    for (int e = (blockIdx.y * blockDim.x + threadIdx.x) * 4; e < width;
+         e += gridDim.y * blockDim.x * 4) {
         const float a = __expf(A_log[e / D]);
         float out[4];
         #pragma unroll
@@ -2786,10 +2796,53 @@ __global__ void ssm_kda_gate_beta_rows(
         }
         *reinterpret_cast<float4*>(gate_out + base + e) = make_float4(out[0], out[1], out[2], out[3]);
     }
-    for (int h = threadIdx.x; h < H; h += blockDim.x) {
+    for (int h = threadIdx.x; h < H && blockIdx.y == 0; h += blockDim.x) {
         beta_out[static_cast<long long>(t) * H + h] =
             sigmoidf(Elem<ElemT>::to_f32(raw_beta[static_cast<long long>(t_row) * H + h]));
     }
+}
+
+// `ssm_kda_qkv_prep` a warp a head: block (row, plane, z) takes heads
+// z * BLOCK / 32 .. +BLOCK / 32, each warp its head's sum of squares (folded
+// across its lanes) and the head's normalized values, no shared memory
+// between: a decode's row over the card rather than one block a plane.
+// `width` whole `head_dim`s.
+template <class ElemT, int BLOCK>
+__global__ void ssm_kda_qkv_prep_heads(
+    const ElemT* __restrict__ mixed,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    int width, int head_dim, float eps,
+    const u32* __restrict__ win)
+{
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
+    const int n = blockIdx.x;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int plane = blockIdx.y;
+    const int lane = threadIdx.x % 32;
+    const int h = blockIdx.z * (BLOCK / 32) + static_cast<int>(threadIdx.x) / 32;
+    if (h * head_dim >= width) return;
+    const ElemT* src = mixed + (long long)n_row * 3 * width + (long long)plane * width + h * head_dim;
+    float* dst = (plane == 0 ? q_out : (plane == 1 ? k_out : v_out)) + (long long)n * width + h * head_dim;
+    if (plane == 2) {
+        for (int d = lane; d < head_dim; d += 32) dst[d] = Elem<ElemT>::to_f32(src[d]);
+        return;
+    }
+    float acc = 0.f;
+    for (int d = lane; d < head_dim; d += 32) {
+        const float x = Elem<ElemT>::to_f32(src[d]);
+        acc += x * x;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    const float q_scale = (plane == 0) ? rsqrtf(static_cast<float>(head_dim)) : 1.f;
+    const float inv = rsqrtf(acc + eps);
+    for (int d = lane; d < head_dim; d += 32) dst[d] = Elem<ElemT>::to_f32(src[d]) * inv * q_scale;
 }
 
 template <class ElemT, int BLOCK>
@@ -3038,6 +3091,77 @@ __global__ void ssm_kda_step_fused(
     }
 }
 
+// `ssm_kda_step_batched`'s value rows `v_lo..v_hi` of a head's `D = 128
+// kRuns` state in registers: a lane's float4 of each 128-column run, a
+// warp's `kPair` rows loaded together so their reads are in flight at
+// once, each row read once and written once.
+template <int kRuns, int kPair>
+__device__ __forceinline__ void kda_step_rows(float* st, const float* sq, const float* sk,
+                                              const float* sg, const float* v_h, float beta_h,
+                                              float* out_h, int v_lo, int v_hi, int lane,
+                                              int warp, int warps) {
+    constexpr int D = 128 * kRuns;
+    for (int v0 = v_lo + warp * kPair; v0 < v_hi; v0 += warps * kPair) {
+        float4 sv[kPair][kRuns];
+        float mem[kPair], acc[kPair];
+#pragma unroll
+        for (int p = 0; p < kPair; ++p) {
+            if (v0 + p < v_hi) {
+                const float4* row = reinterpret_cast<const float4*>(st + (long long)(v0 + p) * D);
+#pragma unroll
+                for (int c = 0; c < kRuns; ++c) sv[p][c] = row[c * 32 + lane];
+            }
+        }
+#pragma unroll
+        for (int p = 0; p < kPair; ++p) {
+            mem[p] = 0.f;
+#pragma unroll
+            for (int c = 0; c < kRuns; ++c) {
+                const int at = c * 32 + lane;
+                const float4 gg = reinterpret_cast<const float4*>(sg)[at];
+                const float4 kk = reinterpret_cast<const float4*>(sk)[at];
+                float4& x = sv[p][c];
+                x = make_float4(x.x * gg.x, x.y * gg.y, x.z * gg.z, x.w * gg.w);
+                mem[p] += x.x * kk.x + x.y * kk.y + x.z * kk.z + x.w * kk.w;
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+            for (int p = 0; p < kPair; ++p) mem[p] += __shfl_xor_sync(0xffffffffu, mem[p], off);
+        }
+#pragma unroll
+        for (int p = 0; p < kPair; ++p) {
+            acc[p] = 0.f;
+            if (v0 + p >= v_hi) continue;
+            const float delta = (v_h[v0 + p] - mem[p]) * beta_h;
+            float4* row = reinterpret_cast<float4*>(st + (long long)(v0 + p) * D);
+#pragma unroll
+            for (int c = 0; c < kRuns; ++c) {
+                const int at = c * 32 + lane;
+                const float4 kk = reinterpret_cast<const float4*>(sk)[at];
+                const float4 qq = reinterpret_cast<const float4*>(sq)[at];
+                float4 x = sv[p][c];
+                x.x += kk.x * delta;
+                x.y += kk.y * delta;
+                x.z += kk.z * delta;
+                x.w += kk.w * delta;
+                row[at] = x;
+                acc[p] += x.x * qq.x + x.y * qq.y + x.z * qq.z + x.w * qq.w;
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+            for (int p = 0; p < kPair; ++p) acc[p] += __shfl_xor_sync(0xffffffffu, acc[p], off);
+        }
+#pragma unroll
+        for (int p = 0; p < kPair; ++p) {
+            if (lane == p && v0 + p < v_hi) out_h[v0 + p] = acc[p];
+        }
+    }
+}
+
 __global__ void ssm_kda_step_batched(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
@@ -3054,6 +3178,10 @@ __global__ void ssm_kda_step_batched(
     float* __restrict__ work,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int r = blockIdx.x;
 
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
@@ -3070,9 +3198,18 @@ __global__ void ssm_kda_step_batched(
 
     const int slot = slot_ids[r];
     if (slot < 0) return;
-    float* st = kda_state_or_copy(
-        state_base + (long long)slot * slot_stride_elems + (long long)h * D * D,
-        work, rh, D, folds(write_state, write_state_mask, r));
+    // `gridDim.z` blocks share the head's value rows (a decode's few rows):
+    // this block's run of them, and only those copied where the row does not
+    // fold.
+    const int per = (D + static_cast<int>(gridDim.z) - 1) / static_cast<int>(gridDim.z);
+    const int v_lo = static_cast<int>(blockIdx.z) * per;
+    const int v_hi = min(D, v_lo + per);
+    float* st = state_base + (long long)slot * slot_stride_elems + (long long)h * D * D;
+    if (!folds(write_state, write_state_mask, r)) {
+        float* copy = work + rh * D * D;
+        for (int i = v_lo * D + threadIdx.x; i < v_hi * D; i += blockDim.x) copy[i] = st[i];
+        st = copy;
+    }
     float* out_h = out + ((long long)r_row * H + h) * D;
 
     extern __shared__ float smem[];
@@ -3090,7 +3227,17 @@ __global__ void ssm_kda_step_batched(
     const int warp = threadIdx.x >> 5;
     const int warps = blockDim.x >> 5;
 
-    for (int vi = warp; vi < D; vi += warps) {
+    if (D == 128 || D == 256 || D == 512) {
+        if (D == 128) {
+            kda_step_rows<1, 8>(st, sq, sk, sg, v_h, beta_h, out_h, v_lo, v_hi, lane, warp, warps);
+        } else if (D == 256) {
+            kda_step_rows<2, 4>(st, sq, sk, sg, v_h, beta_h, out_h, v_lo, v_hi, lane, warp, warps);
+        } else {
+            kda_step_rows<4, 2>(st, sq, sk, sg, v_h, beta_h, out_h, v_lo, v_hi, lane, warp, warps);
+        }
+        return;
+    }
+    for (int vi = v_lo + warp; vi < v_hi; vi += warps) {
         float* row = st + (long long)vi * D;
         float mem = 0.f;
         for (int ki = lane; ki < D; ki += 32) {

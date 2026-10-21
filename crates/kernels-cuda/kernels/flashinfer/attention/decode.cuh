@@ -531,6 +531,11 @@ template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t 
           typename Params>
 __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params) {
   extern __shared__ uint8_t smem[];
+  // pie: a programmatic dependent (`kernel.pdl`) reads nothing, its
+  // params' tables included, until its producer is done.
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
   BatchDecodeWithPagedKVCacheDevice<POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size,
                                     bdx, bdy, bdz, AttentionVariant>(params, smem);
 }
