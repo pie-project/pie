@@ -10,8 +10,8 @@ use crate::Instruct;
 use crate::chatml::{ChatML, ChatMLInstruct};
 
 pub const FORMATS: &[&str] = &[
-    "chatml", "harmony", "gemma", "deepseek", "dots", "glm", "kimi", "kimi3", "inkling", "atem",
-    "mimo", "minimax", "hy", "lines", "raw",
+    "chatml", "harmony", "gemma", "deepseek", "dots", "glm", "glm47", "glm45", "kimi", "kimi3",
+    "inkling", "atem", "mimo", "minimax", "hy", "llama", "lines", "raw",
 ];
 
 /// A format and its settings; a setting the format does not read is refused.
@@ -87,8 +87,8 @@ impl Spec {
             "gemma" | "hy" => &["thinking"],
             "lines" => &["stop", "bos", "eos"],
             "raw" => &["stop"],
-            "harmony" | "deepseek" | "dots" | "glm" | "kimi" | "kimi3" | "inkling" | "atem"
-            | "mimo" | "minimax" => &[],
+            "harmony" | "deepseek" | "dots" | "glm" | "glm47" | "glm45" | "kimi" | "kimi3"
+            | "inkling" | "atem" | "mimo" | "minimax" | "llama" => &[],
             other => {
                 return Err(format!(
                     "`{other}` names no template format; this build ships {}",
@@ -135,6 +135,14 @@ pub fn build(spec: &Spec, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>
         "deepseek" => Arc::new(crate::deepseek::DeepSeek::new(tokenizer)),
         "dots" => Arc::new(crate::dots::Dots::new(tokenizer)),
         "glm" => Arc::new(crate::glm::Glm::new(tokenizer)),
+        "glm47" => Arc::new(crate::glm::Glm::with_style(
+            tokenizer,
+            crate::glm::Style::Glm47,
+        )),
+        "glm45" => Arc::new(crate::glm::Glm::with_style(
+            tokenizer,
+            crate::glm::Style::Glm45,
+        )),
         "kimi" => Arc::new(crate::kimi::Kimi::new(tokenizer)),
         "kimi3" => Arc::new(crate::kimi3::Kimi3::new(tokenizer)),
         "inkling" => Arc::new(crate::inkling::Inkling::new(tokenizer)),
@@ -142,6 +150,7 @@ pub fn build(spec: &Spec, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>
         "mimo" => Arc::new(crate::mimo::Mimo::new(tokenizer)),
         "minimax" => Arc::new(crate::minimax::MiniMax::new(tokenizer)),
         "hy" => Arc::new(crate::hy::Hy::new(tokenizer, spec.thinking)),
+        "llama" => Arc::new(crate::llama::Llama::new(tokenizer)),
         "lines" => Arc::new(crate::lines::Lines::new(
             tokenizer,
             spec.bos.as_deref().unwrap_or_default(),

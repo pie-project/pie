@@ -37,6 +37,234 @@ fn the_new_templates_write_what_the_reference_renders_every_case() {
     hy_writes_the_reasoning_mode_the_turns_the_calls_and_the_cue();
     dots_opens_on_the_default_system_turn_and_answers_a_tool_in_a_user_turn();
     mimo_writes_its_turns_untrimmed_and_its_tools_a_turn_ahead();
+    llama_opens_on_its_dated_system_turn_and_writes_its_calls_as_json();
+    glm47_writes_its_turns_back_to_back_and_its_calls_in_xml();
+    glm45_writes_a_newline_after_each_marker();
+}
+
+const GLM_TOOL: &str = r#"{"type": "function", "function": {"name": "get_weather", "description": "Weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}"#;
+const GLM_CALL: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 2}}\n</tool_call>";
+
+/// GLM-4.7's template: no effort line, turns back to back, a past answer
+/// behind a bare `</think>`, calls in its XML, results in an observation.
+fn glm47_writes_its_turns_back_to_back_and_its_calls_in_xml() {
+    let Some(tokenizer) = snapshot(
+        "zai-org/GLM-4.7",
+        "602d01efcdd332c5238ca4bcede555defbe83eb7",
+    ) else {
+        return;
+    };
+    let template = chat_template::glm::Glm::with_style(tokenizer, chat_template::glm::Style::Glm47);
+    let question: Vec<u32> = vec![151336, 3838, 374, 220, 99419, 3039, 220, 99619, 30];
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.cue());
+    assert_eq!(
+        got,
+        [vec![151331, 151333], question.clone(), vec![151337, 151350]].concat()
+    );
+    assert_eq!(template.cue_without_thinking(), vec![151337, 151351]);
+
+    let mut got = template.system_user("You are terse.", MESSAGE);
+    got.extend(template.cue());
+    let want = [
+        vec![151331, 151333, 151335, 2610, 525, 50205, 13],
+        question.clone(),
+        vec![151337, 151350],
+    ]
+    .concat();
+    assert_eq!(got, want);
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.assistant("<think>17*23</think>391"));
+    got.extend(template.user("And 18 times 23?"));
+    got.extend(template.cue());
+    let want = [
+        vec![151331, 151333],
+        question,
+        vec![
+            151337, 151351, 101294, 16, 151336, 3036, 220, 99243, 3039, 220, 99619, 30, 151337,
+            151350,
+        ],
+    ]
+    .concat();
+    assert_eq!(got, want);
+
+    let mut got = template.equip(&[GLM_TOOL.to_string()]);
+    got.extend(template.user("Weather in Paris?"));
+    got.extend(template.assistant(GLM_CALL));
+    got.extend(template.answer("get_weather", "{\"temp\": 21}"));
+    got.extend(template.cue());
+    let want: Vec<u32> = vec![
+        151331, 151333, 151335, 198, 2, 13843, 271, 2610, 1231, 1618, 825, 476, 803, 5746, 311,
+        7789, 448, 279, 1196, 3239, 382, 2610, 525, 3897, 448, 729, 32479, 2878, 366, 15906, 1472,
+        15906, 29, 11868, 9488, 510, 27, 15906, 397, 4913, 1313, 788, 330, 1688, 497, 330, 1688,
+        788, 5212, 606, 788, 330, 455, 68852, 497, 330, 4684, 788, 330, 28876, 497, 330, 13777,
+        788, 5212, 1313, 788, 330, 1700, 497, 330, 13185, 788, 5212, 8923, 788, 5212, 1313, 788,
+        330, 917, 30849, 3417, 532, 522, 15906, 1339, 2461, 1817, 729, 1618, 11, 2550, 279, 729,
+        829, 323, 5977, 2878, 279, 2701, 11868, 3561, 510, 151352, 90, 1688, 11489, 92, 151356, 90,
+        858, 16159, 12, 16, 92, 151357, 151358, 90, 858, 19048, 12, 16, 92, 151359, 151356, 90,
+        858, 16159, 12, 17, 92, 151357, 151358, 90, 858, 19048, 12, 17, 92, 151359, 1112, 151353,
+        151336, 28876, 304, 12089, 30, 151337, 151351, 151352, 455, 68852, 151356, 8923, 151357,
+        151358, 59190, 151359, 151356, 13769, 151357, 151358, 17, 151359, 151353, 151338, 151354,
+        4913, 3888, 788, 220, 99146, 92, 151355, 151337, 151350,
+    ];
+    assert_eq!(got, want);
+}
+
+/// GLM-4.5 / 4.6's template: a newline after each marker, the cue left for
+/// the model to open its own thinking block, an empty block for a turn that
+/// does not think.
+fn glm45_writes_a_newline_after_each_marker() {
+    let Some(tokenizer) = snapshot(
+        "zai-org/GLM-4.5",
+        "cbb2c7cfb52fa128a9660cb1a7a78e017899e115",
+    ) else {
+        return;
+    };
+    let template = chat_template::glm::Glm::with_style(tokenizer, chat_template::glm::Style::Glm45);
+    let question: Vec<u32> = vec![151336, 198, 3838, 374, 220, 99419, 3039, 220, 99619, 30];
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.cue());
+    assert_eq!(
+        got,
+        [vec![151331, 151333], question.clone(), vec![151337]].concat()
+    );
+    assert_eq!(
+        template.cue_without_thinking(),
+        vec![151337, 198, 151350, 151351]
+    );
+
+    let mut got = template.system_user("You are terse.", MESSAGE);
+    got.extend(template.cue());
+    let want = [
+        vec![151331, 151333, 151335, 198, 2610, 525, 50205, 13],
+        question.clone(),
+        vec![151337],
+    ]
+    .concat();
+    assert_eq!(got, want);
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.assistant("391"));
+    got.extend(template.user("And 18 times 23?"));
+    got.extend(template.cue());
+    let want = [
+        vec![151331, 151333],
+        question,
+        vec![
+            151337, 198, 151350, 151351, 198, 101294, 16, 151336, 198, 3036, 220, 99243, 3039, 220,
+            99619, 30, 151337,
+        ],
+    ]
+    .concat();
+    assert_eq!(got, want);
+
+    let mut got = template.equip(&[GLM_TOOL.to_string()]);
+    got.extend(template.user("Weather in Paris?"));
+    got.extend(template.assistant(GLM_CALL));
+    got.extend(template.answer("get_weather", "{\"temp\": 21}"));
+    got.extend(template.cue());
+    let want: Vec<u32> = vec![
+        151331, 151333, 151335, 198, 2, 13843, 271, 2610, 1231, 1618, 825, 476, 803, 5746, 311,
+        7789, 448, 279, 1196, 3239, 382, 2610, 525, 3897, 448, 729, 32479, 2878, 366, 15906, 1472,
+        15906, 29, 11868, 9488, 510, 27, 15906, 397, 4913, 1313, 788, 330, 1688, 497, 330, 1688,
+        788, 5212, 606, 788, 330, 455, 68852, 497, 330, 4684, 788, 330, 28876, 497, 330, 13777,
+        788, 5212, 1313, 788, 330, 1700, 497, 330, 13185, 788, 5212, 8923, 788, 5212, 1313, 788,
+        330, 917, 30849, 3417, 532, 522, 15906, 1339, 2461, 1817, 729, 1618, 11, 2550, 279, 729,
+        829, 323, 5977, 2878, 279, 2701, 11868, 3561, 510, 151352, 90, 1688, 11489, 532, 151356,
+        90, 858, 16159, 12, 16, 92, 151357, 198, 151358, 90, 858, 19048, 12, 16, 92, 151359, 198,
+        151356, 90, 858, 16159, 12, 17, 92, 151357, 198, 151358, 90, 858, 19048, 12, 17, 92,
+        151359, 198, 9335, 151353, 151336, 198, 28876, 304, 12089, 30, 151337, 198, 151350, 151351,
+        198, 151352, 455, 68852, 198, 151356, 8923, 151357, 198, 151358, 59190, 151359, 198,
+        151356, 13769, 151357, 198, 151358, 17, 151359, 198, 151353, 151338, 198, 151354, 198,
+        4913, 3888, 788, 220, 99146, 532, 151355, 151337,
+    ];
+    assert_eq!(got, want);
+}
+
+/// Llama 3.1's template always opens on a system turn carrying its dates,
+/// lists the tools in that turn under `Environment: ipython` (with
+/// `tools_in_user_message: false`), writes a call as its JSON and hands the
+/// result back quoted in an `ipython` turn.
+fn llama_opens_on_its_dated_system_turn_and_writes_its_calls_as_json() {
+    let Some(tokenizer) = snapshot(
+        "unsloth/Llama-3.1-8B-Instruct",
+        "4699cc75b550f9c6f3173fb80f4703b62d946aa5",
+    ) else {
+        return;
+    };
+    let template = chat_template::llama::Llama::new(tokenizer);
+    let dates: Vec<u32> = vec![
+        38766, 1303, 33025, 2696, 25, 6790, 220, 2366, 18, 198, 15724, 2696, 25, 220, 1627, 10263,
+        220, 2366, 19, 271,
+    ];
+    let system = |body: &[u32]| {
+        [
+            vec![128000, 128006, 9125, 128007, 271],
+            dates.clone(),
+            body.to_vec(),
+            vec![128009],
+        ]
+        .concat()
+    };
+    let question: Vec<u32> = vec![
+        128006, 882, 128007, 271, 3923, 374, 220, 1114, 3115, 220, 1419, 30, 128009,
+    ];
+    let cue: Vec<u32> = vec![128006, 78191, 128007, 271];
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.cue());
+    assert_eq!(got, [system(&[]), question.clone(), cue.clone()].concat());
+
+    let mut got = template.system_user("You are terse.", MESSAGE);
+    got.extend(template.cue());
+    let terse = system(&[2675, 527, 51637, 13]);
+    assert_eq!(got, [terse, question.clone(), cue.clone()].concat());
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.assistant("391"));
+    got.extend(template.user("And 18 times 23?"));
+    got.extend(template.cue());
+    let want = [
+        system(&[]),
+        question,
+        cue.clone(),
+        vec![19631, 128009],
+        vec![
+            128006, 882, 128007, 271, 3112, 220, 972, 3115, 220, 1419, 30, 128009,
+        ],
+        cue.clone(),
+    ]
+    .concat();
+    assert_eq!(got, want);
+
+    let tool = r#"{"type": "function", "function": {"name": "get_weather", "description": "Weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}"#;
+    let mut got = template.equip(&[tool.to_string()]);
+    got.extend(template.user("Weather in Paris?"));
+    got.extend(template.assistant(
+        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
+    ));
+    got.extend(template.answer("get_weather", "{\"temp\": 21}"));
+    got.extend(template.cue());
+    let want: Vec<u32> = vec![
+        128000, 128006, 9125, 128007, 271, 13013, 25, 6125, 27993, 198, 38766, 1303, 33025, 2696,
+        25, 6790, 220, 2366, 18, 198, 15724, 2696, 25, 220, 1627, 10263, 220, 2366, 19, 271, 2675,
+        617, 2680, 311, 279, 2768, 5865, 13, 2057, 1650, 264, 734, 11, 4587, 6013, 449, 4823, 369,
+        264, 734, 1650, 8542, 3595, 304, 279, 3645, 5324, 609, 794, 734, 836, 11, 330, 14105, 794,
+        11240, 315, 5811, 836, 323, 1202, 907, 7966, 5519, 539, 1005, 7482, 382, 517, 262, 330,
+        1337, 794, 330, 1723, 761, 262, 330, 1723, 794, 341, 286, 330, 609, 794, 330, 456, 70464,
+        761, 286, 330, 4789, 794, 330, 30081, 761, 286, 330, 14105, 794, 341, 310, 330, 1337, 794,
+        330, 1735, 761, 310, 330, 13495, 794, 341, 394, 330, 9103, 794, 341, 504, 330, 1337, 794,
+        330, 928, 702, 394, 457, 310, 457, 286, 457, 262, 457, 633, 128009, 128006, 882, 128007,
+        271, 30081, 304, 12366, 30, 128009, 128006, 78191, 128007, 271, 5018, 609, 794, 330, 456,
+        70464, 498, 330, 14105, 794, 5324, 9103, 794, 330, 60704, 32075, 128009, 128006, 23799,
+        4690, 128007, 271, 14461, 2153, 3975, 11955, 220, 1691, 10064, 128009, 128006, 78191,
+        128007, 271,
+    ];
+    assert_eq!(got, want);
+    assert_eq!(template.seal(), vec![128009, 128008, 128001]);
 }
 
 /// Dots3's template opens a conversation with no system turn on its default

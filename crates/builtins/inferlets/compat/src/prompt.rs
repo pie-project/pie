@@ -52,7 +52,9 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
         // Turns after the last user query are the current tool loop, which
         // some templates replay with their reasoning.
         let last_query = messages.iter().rposition(|m| m.role == Role::User);
-        let mut seen_user = false;
+        // The opening (a system turn, the tools) already opened the
+        // conversation; `first_user` opens it only where nothing has.
+        let mut seen_user = !tokens.is_empty();
         let mut at = lead;
         while at < messages.len() {
             let m = &messages[at];

@@ -16,6 +16,7 @@ pub mod json;
 pub mod kimi;
 pub mod kimi3;
 pub mod lines;
+pub mod llama;
 pub mod mimo;
 pub mod minimax;
 pub mod raw;
