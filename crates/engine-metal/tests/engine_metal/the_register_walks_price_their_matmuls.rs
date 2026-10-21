@@ -180,7 +180,7 @@ fn the_register_walks_price_their_matmuls() {
         let mut line = format!("{what:15} K={k:5} N={n:6} x{layers:2} S={engine}");
         let mut reference: Option<Vec<Vec<u8>>> = None;
         for split in [engine, engine / 2, engine * 2] {
-            if split < 1 || split > 8 || (k / 256) < split as u32 {
+            if !(1..=8).contains(&split) || (k / 256) < split as u32 {
                 continue;
             }
             for &walk in &walks {

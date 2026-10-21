@@ -39,7 +39,17 @@ pub fn block_dyn_conv_table(
     table: Tensor,
     counters: u32,
 ) -> Result<(), Error> {
-    convolve(ctx, x, coeff, base, side, taps, group, y, Some((table, counters)))
+    convolve(
+        ctx,
+        x,
+        coeff,
+        base,
+        side,
+        taps,
+        group,
+        y,
+        Some((table, counters)),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -163,8 +173,7 @@ fn convolve(
         }
         // A thread per channel and row, so a lane's rows convolve side by side.
         None => ctx.fire(
-            Fire::at(FILE, entry)
-                .apply(Grid::of([channels, rows, 1], [channels.min(GROUP), 1, 1])),
+            Fire::at(FILE, entry).apply(Grid::of([channels, rows, 1], [channels.min(GROUP), 1, 1])),
             &args,
         ),
     }

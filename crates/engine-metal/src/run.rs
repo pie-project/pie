@@ -384,7 +384,12 @@ impl<'c> Run<'c> {
         else {
             return None;
         };
-        if !nodes.contains(&at) || !nodes.contains(&(at + 1)) || *d2 != head_dim || *e2 != eps || *x2 == y {
+        if !nodes.contains(&at)
+            || !nodes.contains(&(at + 1))
+            || *d2 != head_dim
+            || *e2 != eps
+            || *x2 == y
+        {
             return None;
         }
         let span = |v: ValueId| {

@@ -370,7 +370,7 @@ impl Run<'_> {
                 });
             match split_rows {
                 Some((width, left, right))
-                    if one_pass && halves.is_none() && members.len() + 1 <= 3 && i == 0 =>
+                    if one_pass && halves.is_none() && members.len() < 3 && i == 0 =>
                 {
                     let (l, r) = (self.tensor(left), self.tensor(right));
                     if l.width != width
@@ -432,7 +432,10 @@ impl Run<'_> {
             let Some(b) = span(self.tensor(v)) else {
                 return Ok(false);
             };
-            if spans[1..].iter().any(|a| Some(*a) != first_out && !apart(a, &b)) {
+            if spans[1..]
+                .iter()
+                .any(|a| Some(*a) != first_out && !apart(a, &b))
+            {
                 return Ok(false);
             }
         }

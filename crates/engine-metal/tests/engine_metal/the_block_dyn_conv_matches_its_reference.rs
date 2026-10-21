@@ -230,14 +230,30 @@ fn the_convolution_lays_the_table_its_projections_read() {
             indptr.push(indptr.last().unwrap() + *s as i32);
         }
         let coeff_width = 2 * TAPS * groups;
-        let x: Vec<f32> = (0..u64::from(rows * WIDE)).map(|at| bf16_round(unit(at ^ 0x77))).collect();
-        let coeff: Vec<f32> =
-            (0..u64::from(rows * coeff_width)).map(|at| bf16_round(0.25 * unit(at ^ 0x5151))).collect();
-        let base: Vec<f32> =
-            (0..u64::from(2 * TAPS * WIDE)).map(|at| bf16_round(0.5 + 0.1 * unit(at ^ 0xA1A1))).collect();
-        let (x_b, coeff_b, base_b) = (upload(&bf16_bytes(&x)), upload(&bf16_bytes(&coeff)), upload(&bf16_bytes(&base)));
-        let indptr_b = upload(&indptr.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<_>>());
-        let (plain_b, laid_b) = (upload(&vec![0x11; (rows * WIDE * 2) as usize]), upload(&vec![0x11; (rows * WIDE * 2) as usize]));
+        let x: Vec<f32> = (0..u64::from(rows * WIDE))
+            .map(|at| bf16_round(unit(at ^ 0x77)))
+            .collect();
+        let coeff: Vec<f32> = (0..u64::from(rows * coeff_width))
+            .map(|at| bf16_round(0.25 * unit(at ^ 0x5151)))
+            .collect();
+        let base: Vec<f32> = (0..u64::from(2 * TAPS * WIDE))
+            .map(|at| bf16_round(0.5 + 0.1 * unit(at ^ 0xA1A1)))
+            .collect();
+        let (x_b, coeff_b, base_b) = (
+            upload(&bf16_bytes(&x)),
+            upload(&bf16_bytes(&coeff)),
+            upload(&bf16_bytes(&base)),
+        );
+        let indptr_b = upload(
+            &indptr
+                .iter()
+                .flat_map(|i| i.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let (plain_b, laid_b) = (
+            upload(&vec![0x11; (rows * WIDE * 2) as usize]),
+            upload(&vec![0x11; (rows * WIDE * 2) as usize]),
+        );
         let table_rows = quant::register_table_rows(WIDE as i32, COUNTERS as i32);
         let own_b = upload(&vec![0xa5; (table_rows * WIDE * 2) as usize]);
         let laid_table_b = upload(&vec![0xa5; (table_rows * WIDE * 2) as usize]);
@@ -256,13 +272,20 @@ fn the_convolution_lays_the_table_its_projections_read() {
         for side in 0..2u32 {
             let frame = device.frame().expect("a frame");
             let sink = Sink::new(&device, &frame, &pipelines, &handles);
-            dynconv::block_dyn_conv(&sink, xt, ct, bt, side, TAPS, GROUP, plain).expect("the plain launch");
-            quant::register_table(&sink, plain, own, rows as i32, WIDE as i32, COUNTERS as i32).expect("the tile's table");
-            dynconv::block_dyn_conv_table(&sink, xt, ct, bt, side, TAPS, GROUP, laid, table, COUNTERS)
-                .expect("the table-laying launch");
+            dynconv::block_dyn_conv(&sink, xt, ct, bt, side, TAPS, GROUP, plain)
+                .expect("the plain launch");
+            quant::register_table(&sink, plain, own, rows as i32, WIDE as i32, COUNTERS as i32)
+                .expect("the tile's table");
+            dynconv::block_dyn_conv_table(
+                &sink, xt, ct, bt, side, TAPS, GROUP, laid, table, COUNTERS,
+            )
+            .expect("the table-laying launch");
             frame.commit().expect("the commit");
             let read = |b: &Buffer| handles.read(bind(b), b.bytes()).expect("read");
-            assert!(read(&plain_b) == read(&laid_b), "spans {spans:?} side {side}: the table-laying conv lands other rows");
+            assert!(
+                read(&plain_b) == read(&laid_b),
+                "spans {spans:?} side {side}: the table-laying conv lands other rows"
+            );
             let (mine, theirs) = (read(&laid_table_b), read(&own_b));
             let end = (17 * WIDE + 4 * COUNTERS) as usize;
             assert!(
