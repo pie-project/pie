@@ -34,7 +34,9 @@ fn diagnostics(doc: &toml::Table) -> Result<crate::diag::Diagnostics, String> {
         .and_then(toml::Value::as_table)
         .and_then(|metal| metal.get("diagnostics"))
     else {
-        let words = std::env::var("PIE_METAL_DIAGNOSTICS").unwrap_or_else(|_| "kernel-profile=2".to_string());
+        let Ok(words) = std::env::var("PIE_METAL_DIAGNOSTICS") else {
+            return Ok(crate::diag::Diagnostics::default());
+        };
         return words
             .parse::<crate::diag::Diagnostics>()
             .map_err(|error| format!("PIE_METAL_DIAGNOSTICS: {error}"));
