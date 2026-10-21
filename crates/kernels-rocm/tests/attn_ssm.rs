@@ -137,7 +137,7 @@ fn attn_ssm() {
     let xs: Vec<f32> = values(3 * c, 4, 2.0).into_iter().map(round_bf16).collect();
     let x = gpu.tensor(&xs, 3, c as u32, Dtype::Bf16);
     let mut y = gpu.zeros(3, c as u32, Dtype::Bf16);
-    ssm::causal_conv1d(&ctx, x, wt, &state, k as u32, 1, &mut y).unwrap();
+    ssm::causal_conv1d(&ctx, x, wt, None, &state, k as u32, 1, &mut y).unwrap();
     let got = gpu.read(&y);
     let got_state = gpu.read(&conv_slab);
     for (r, &slot) in slot_ids.iter().enumerate() {
@@ -184,7 +184,7 @@ fn attn_ssm() {
         indptr: gpu.column(&indptr),
     };
     let mut y = gpu.zeros(total as u32, c as u32, Dtype::Bf16);
-    ssm::causal_conv1d_chunked(&ctx, x, wt, &state, k as u32, 1, &mut y).unwrap();
+    ssm::causal_conv1d_chunked(&ctx, x, wt, None, &state, k as u32, 1, &mut y).unwrap();
     let got = gpu.read(&y);
     let got_state = gpu.read(&conv_slab);
     for (r, &slot) in slot_ids.iter().enumerate() {

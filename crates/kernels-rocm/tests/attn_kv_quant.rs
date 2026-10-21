@@ -151,6 +151,7 @@ fn quantized(gpu: &Gpu, c: &Case, pg: &Pages) -> Quantized {
             0
         },
         pages_in_batch: pg.indices.len() as i32,
+        live: [0, 0],
         ..KV
     };
     Quantized {

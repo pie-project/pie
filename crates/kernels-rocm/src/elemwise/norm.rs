@@ -334,12 +334,36 @@ pub fn rmsnorm_grouped_plus_one(
     eps: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_grouped_plus_one";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let group = nonzero(OP, "the group width", group)?;
+    rmsnorm_grouped(
+        ctx,
+        "elementwise.rmsnorm_grouped_plus_one",
+        x,
+        weight,
+        group,
+        eps,
+        true,
+        y,
+    )
+}
+
+/// Each `group`-wide run of `x`'s rows RMS-normed into `y` and scaled by
+/// its own `weight`s (`1 + weight` under `plus_one`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rmsnorm_grouped(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    weight: Tensor,
+    group: u32,
+    eps: f32,
+    plus_one: bool,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let group = nonzero(op, "the group width", group)?;
     if y.width == 0 || !y.width.is_multiple_of(group) {
         return Err(refuse(
-            OP,
+            op,
             format!(
                 "the {}-wide row is not a whole number of {group}-wide groups",
                 y.width
@@ -352,13 +376,13 @@ pub fn rmsnorm_grouped_plus_one(
         "the weight spans the row's full width"
     );
     let groups = y.width / group;
-    let launch = rows_per_head(OP, y.rows, y.width, group)?;
+    let launch = rows_per_head(op, y.rows, y.width, group)?;
     ctx.fire(
-        OP,
+        op,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::elemwise::rmsnorm_grouped_plus_one<{t}, 256>"
+                "::pie::elemwise::rmsnorm_grouped<{t}, 256, {plus_one}>"
             )),
         )
         .apply(launch),
@@ -366,8 +390,8 @@ pub fn rmsnorm_grouped_plus_one(
             x.arg(),
             weight.arg(),
             y.arg(),
-            stated(OP, group)?.arg(),
-            stated(OP, groups)?.arg(),
+            stated(op, group)?.arg(),
+            stated(op, groups)?.arg(),
             eps.arg(),
             ctx.stage(),
         ],

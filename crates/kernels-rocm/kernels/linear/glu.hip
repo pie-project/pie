@@ -105,15 +105,17 @@ __global__ void mlp_geglu_tanh(const T* __restrict__ gate, const T* __restrict__
     y[at] = from_f32<T>(gelu_tanh(to_f32(gate[at])) * to_f32(up[at]));
 }
 
-// y = gelu_tanh(x).
-template <class T>
-__global__ void mlp_gelu_tanh(const T* __restrict__ x, T* __restrict__ y, i32 n, i32 width, i32 fan,
-                              const u32* __restrict__ win) {
+// y = gelu_tanh(x), or relu(x)² under RELU2.
+template <class T, bool RELU2>
+__global__ void mlp_act(const T* __restrict__ x, T* __restrict__ y, i32 n, i32 width, i32 fan,
+                        const u32* __restrict__ win) {
     const i32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const long long at = flat_at(i, width, fan, win);
     if (at < 0) return;
-    y[at] = from_f32<T>(gelu_tanh(to_f32(x[at])));
+    const float v = to_f32(x[at]);
+    const float r = fmaxf(v, 0.f);
+    y[at] = from_f32<T>(RELU2 ? r * r : gelu_tanh(v));
 }
 
 // The packed launches below share mlp_swiglu's grid, (rows, ⌈I / block⌉):

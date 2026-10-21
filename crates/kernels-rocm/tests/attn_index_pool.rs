@@ -72,6 +72,7 @@ fn make_pool(gpu: &Gpu, rows: &[Vec<f32>], cells: &[usize], width: usize, ps: us
         head_stride: width as i64,
         max_pages_per_request: max_pages,
         pages_in_batch: indices.len() as i32,
+        live: [0, 0],
         ..KV
     };
     Pool {

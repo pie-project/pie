@@ -402,6 +402,10 @@ impl Run<'_> {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
+            Linear::MlpRelu2 { x, y } => {
+                let fan = self.plane_fan(self.tensor(*y).rows);
+                linear::mlp::relu2(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
+            }
             Linear::MlpGegluTanhPacked {
                 packed,
                 intermediate,

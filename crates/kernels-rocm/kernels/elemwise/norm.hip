@@ -327,20 +327,18 @@ __global__ void standardize(T* __restrict__ out, const T* __restrict__ bias,
         row[d] = from_f32<T>((to_f32(row[d]) - to_f32(bias[d])) * to_f32(scale[d]));
 }
 
-// y = rmsnorm(x) · (w + 1) over each `group`-wide slice of a row; the weight
-// spans the full row, one slice of it per group. A launch over
-// `rows * groups` blocks.
-template <class T, int BLOCK>
-__global__ __launch_bounds__(BLOCK) void rmsnorm_grouped_plus_one(const T* __restrict__ x,
-                                                                  const T* __restrict__ w,
-                                                                  T* __restrict__ y, int group,
-                                                                  int groups, float eps,
-                                                                  const u32* __restrict__ win) {
+// y = rmsnorm(x) · w (`w + 1` under PLUS_ONE) over each `group`-wide slice
+// of a row; the weight spans the full row, one slice of it per group. A
+// launch over `rows * groups` blocks.
+template <class T, int BLOCK, bool PLUS_ONE>
+__global__ __launch_bounds__(BLOCK) void rmsnorm_grouped(const T* __restrict__ x, const T* __restrict__ w,
+                                                         T* __restrict__ y, int group, int groups, float eps,
+                                                         const u32* __restrict__ win) {
     const Window window{win};
     if (!window.live(blockIdx.x, groups)) return;
     const long long at = window.plane(blockIdx.x, groups) * group;
     const T* wg = w + static_cast<long long>(blockIdx.x % groups) * group;
-    norm_row<T, BLOCK, true>(x + at, wg, y + at, group, eps);
+    norm_row<T, BLOCK, PLUS_ONE>(x + at, wg, y + at, group, eps);
 }
 
 // y = rmsnorm(o) · w · sigmoid(g) per `D`-wide head, o and w in f32: the

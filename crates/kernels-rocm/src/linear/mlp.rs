@@ -307,30 +307,44 @@ pub fn geglu_tanh(
 }
 
 pub fn gelu_tanh(ctx: &Ctx, x: Tensor, fan: u32, y: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "linear.mlp_gelu_tanh";
+    act(ctx, "linear.mlp_gelu_tanh", false, x, fan, y)
+}
+
+pub fn relu2(ctx: &Ctx, x: Tensor, fan: u32, y: &mut Tensor) -> Result<(), Error> {
+    act(ctx, "linear.mlp_relu2", true, x, fan, y)
+}
+
+fn act(
+    ctx: &Ctx,
+    op: &'static str,
+    relu2: bool,
+    x: Tensor,
+    fan: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
     let t = dtype_dispatch!(
-        OP,
+        op,
         x.dtype,
         { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" }
     );
     let n = y.elements();
     let lanes = u32::try_from(n).map_err(|_| {
         refuse(
-            OP,
+            op,
             format!("{n} elements do not fit a 32-bit launch extent"),
         )
     })?;
-    nonzero(OP, "the activation's element count", lanes)?;
+    nonzero(op, "the activation's element count", lanes)?;
     ctx.fire(
-        OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::mlp_gelu_tanh<{t}>")))
+        op,
+        Fire::at(FILE, symbol(&format!("::pie::linear::mlp_act<{t}, {relu2}>")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[
             x.arg(),
             y.arg(),
-            stated(OP, lanes)?.arg(),
-            stated(OP, y.width)?.arg(),
-            stated(OP, fan)?.arg(),
+            stated(op, lanes)?.arg(),
+            stated(op, y.width)?.arg(),
+            stated(op, fan)?.arg(),
             ctx.stage(),
         ],
     )

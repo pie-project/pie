@@ -113,6 +113,7 @@ fn cache(gpu: &Gpu, c: &Case, kv_lens: &[u32], seed: u64) -> Cache {
         layout: i32::from(c.hnd),
         max_pages_per_request: *pages_of.iter().max().unwrap() as i32,
         pages_in_batch: page_indices.len() as i32,
+        live: [0, 0],
         ..KV
     };
     Cache {

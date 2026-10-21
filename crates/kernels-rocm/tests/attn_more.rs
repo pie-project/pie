@@ -76,6 +76,7 @@ fn paged_cache(
         head_stride: d as i64,
         max_pages_per_request: *per.iter().max().unwrap() as i32,
         pages_in_batch: indices.len() as i32,
+        live: [0, 0],
         ..KV
     };
     Cache {

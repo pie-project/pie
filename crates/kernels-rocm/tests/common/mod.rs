@@ -213,6 +213,7 @@ pub const KV: KvPool = KvPool {
     block_size: 0,
     max_pages_per_request: 0,
     pages_in_batch: 0,
+    live: [0, 0],
 };
 
 /// A recurrent pool writing every lane's state, nothing else seated.

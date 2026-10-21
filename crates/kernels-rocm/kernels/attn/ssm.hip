@@ -2441,4 +2441,122 @@ __global__ __launch_bounds__(256) void ssm_kda_chunk_ho(
         *reinterpret_cast<f32x4*>(state + key(q)) = f32x4{hf[q][0], hf[q][1], hf[q][2], hf[q][3]};
 }
 
+// ------------------------------------------------------------- Mamba-2 --
+
+// Mamba-2: a head's state S[p][n] (64 head dims by a 128-wide state) in f32
+// at slab + slot·stride + h·64·128, its operands off one convolved `xbc` row
+// (`x`, then each group's `B`, then its `C`), its decay exp(−exp(A_log)·dt)
+// one scalar a step. A token stores S = S·decay + dt·x·Bᵀ and lands
+// (S·C + D·x)·silu(z), the group norm after it. A block of four wavefronts
+// holds the state in registers: a half-wavefront a state row, lane c its
+// columns 4c..4c+3, eight rows a lane.
+constexpr int M2_P = 64, M2_N = 128, M2_Q = M2_P / 8;
+
+__device__ __forceinline__ float m2_dt(float raw, float bias) {
+    const float x = raw + bias;
+    return x > 20.f ? x : log1pf(__expf(x));
+}
+
+// The state row of the lane's q-th run, and the run's index among the head's.
+__device__ __forceinline__ int m2_row(int q) {
+    return static_cast<int>(threadIdx.x / kWave) * (2 * M2_Q) + 2 * q + (lane() >> 5);
+}
+__device__ __forceinline__ int m2_run(int q) { return m2_row(q) * (M2_N / 4) + (lane() & 31); }
+
+// One token through the lane's runs: `at` its xbc row, `zr` and `yr` its z
+// and output rows.
+__device__ __forceinline__ void m2_token(f32x4 (&s)[M2_Q], const bf16* at, const bf16* zr, bf16* yr, float step,
+                                         float decay, float skip, int h, int inner, int g, int G) {
+    const int c = 4 * (lane() & 31);
+    const bf16* bp = at + inner + g * M2_N + c;
+    const bf16* cp = at + inner + (G + g) * M2_N + c;
+    const f32x4 b = {to_f32(bp[0]), to_f32(bp[1]), to_f32(bp[2]), to_f32(bp[3])};
+    const f32x4 cc = {to_f32(cp[0]), to_f32(cp[1]), to_f32(cp[2]), to_f32(cp[3])};
+    float x[M2_Q];
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) x[q] = to_f32(at[h * M2_P + m2_row(q)]);
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) {
+        s[q] = s[q] * decay + (step * x[q]) * b;
+        float acc = s[q].x * cc.x + s[q].y * cc.y + s[q].z * cc.z + s[q].w * cc.w;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, kWave);
+        if ((lane() & 31) == 0) {
+            const int o = h * M2_P + m2_row(q);
+            yr[o] = from_f32<bf16>((acc + skip * x[q]) * silu(to_f32(zr[o])));
+        }
+    }
+}
+
+// Decode: grid (rows, H), a block a (row, head).
+__global__ __launch_bounds__(256) void ssm_mamba2_step(
+    const bf16* __restrict__ xbc, const bf16* __restrict__ dt, const bf16* __restrict__ z,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, const float* __restrict__ D,
+    float* __restrict__ state_base, const i32* __restrict__ slot_ids, long long slot_stride, bf16* __restrict__ y,
+    int H, int G, bool write_state, const u8* __restrict__ mask, const u32* __restrict__ win) {
+    const int r = blockIdx.x, h = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int slot = slot_ids[rl];
+    if (slot < 0) return;
+    const int inner = H * M2_P;
+    f32x4* st = reinterpret_cast<f32x4*>(state_base + static_cast<long long>(slot) * slot_stride +
+                                         static_cast<long long>(h) * M2_P * M2_N);
+    f32x4 s[M2_Q];
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) s[q] = st[m2_run(q)];
+    const float step = m2_dt(to_f32(dt[row * H + h]), dt_bias[h]);
+    m2_token(s, xbc + row * (inner + 2 * G * M2_N), z + row * inner, y + row * inner, step,
+             __expf(-__expf(a_log[h]) * step), D[h], h, inner, h / (H / G), G);
+    if (!folds(write_state, mask, rl)) return;
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
+}
+
+// Prefill, token by token: grid (lanes, H), the head's state in registers
+// across the walk.
+__global__ __launch_bounds__(256) void ssm_mamba2_scan(
+    const bf16* __restrict__ xbc, const bf16* __restrict__ dt, const bf16* __restrict__ z,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, const float* __restrict__ D,
+    float* __restrict__ state_base, const i32* __restrict__ slot_ids, const u32* __restrict__ indptr,
+    long long slot_stride, const int* __restrict__ commit_len, const int* __restrict__ begin_at, bool write_state,
+    const u8* __restrict__ mask, const int* __restrict__ snap, const int* __restrict__ snap_rows,
+    const i32* __restrict__ snap_slots, bf16* __restrict__ y, int H, int G, const u32* __restrict__ win) {
+    const int r = blockIdx.x, h = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[2])) return;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
+    const Span sp = span_of(indptr, r, rl, commit_len, begin_at);
+    if (sp.n <= 0) return;
+    const int slot = slot_ids[rl];
+    if (slot < 0) return;
+    const long long head = static_cast<long long>(h) * M2_P * M2_N;
+    f32x4* st = reinterpret_cast<f32x4*>(state_base + static_cast<long long>(slot) * slot_stride + head);
+    f32x4 s[M2_Q];
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) s[q] = st[m2_run(q)];
+    const int inner = H * M2_P, g = h / (H / G);
+    const long long width = inner + 2 * G * M2_N;
+    const float neg_a = -__expf(a_log[h]), bias = dt_bias[h], skip = D[h];
+    const bool fold = folds(write_state, mask, rl);
+    Snaps sn = snaps_of(snap, rl);
+    for (int t = 0; t < sp.n; ++t) {
+        const long long row = sp.t0 + t + row0;
+        const float step = m2_dt(to_f32(dt[row * H + h]), bias);
+        m2_token(s, xbc + row * width, z + row * inner, y + row * inner, step, __expf(neg_a * step), skip, h, inner,
+                 g, G);
+        if (sn.e0 < sn.e1 && snap_rows[sn.e0] == t + 1) {
+            f32x4* at = reinterpret_cast<f32x4*>(state_base + static_cast<long long>(snap_slots[sn.e0]) * slot_stride + head);
+            if (fold)
+#pragma unroll
+                for (int q = 0; q < M2_Q; ++q) at[m2_run(q)] = s[q];
+            ++sn.e0;
+        }
+    }
+    if (!fold) return;
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
+}
+
 }  // namespace pie::attn
