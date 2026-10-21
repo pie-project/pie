@@ -4,6 +4,8 @@
 # against e4m3 activations) and as modelopt exports it in NVFP4 (against bf16
 # activations). Qwen 3.5 and later, with gated-delta layers, are `qwen_3`;
 # Qwen 3's mixtures of experts are `qwen3_moe`.
+# A u4g64 row also reads an AWQ or GPTQ int4 export (Qwen/Qwen3-8B-AWQ), its
+# codes moved as they are.
 
 load("//lib/spoken.poem", "QWEN_STOP")
 
@@ -24,6 +26,8 @@ F8 = dtype.e4m3tile128a8
 
 DEPLOYMENTS = [
     deployment("qwen3-0.6b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-8b", weights = dtype.u4g64, kv = dtype.bf16),
     deployment("qwen3-14b", weights = dtype.bf16, kv = dtype.bf16),
     # Keys and values e4m3 under a unit scale (vLLM's `fp8` KV).
     deployment("qwen3-0.6b", weights = dtype.bf16, kv = dtype.e4m3),
@@ -35,7 +39,6 @@ DEPLOYMENTS = [
     deployment("qwen3-0.6b", weights = dtype.e4m3g128a8, kv = dtype.bf16),
     deployment("qwen3-14b", weights = dtype.e4m3g128a8, kv = dtype.e4m3),
     deployment("qwen3-14b", weights = dtype.e4m3g128a8, kv = dtype.bf16),
-    deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-8b", weights = F8, kv = dtype.bf16),
     deployment("qwen3-8b", weights = F8, kv = dtype.e4m3),
     deployment("qwen3-8b", weights = dtype.nvfp4, kv = dtype.e4m3),
@@ -46,4 +49,5 @@ DEPLOYMENTS = [
     deployment("qwen3-32b", weights = dtype.u4g64, kv = dtype.bf16),
     deployment("qwen3-8b", weights = dtype.e4m3g128a8, kv = dtype.e4m3),
     deployment("qwen3-32b", weights = dtype.e4m3g128a8, kv = dtype.e4m3),
+    deployment("qwen3-14b", weights = dtype.u4g64, kv = dtype.bf16),
 ]

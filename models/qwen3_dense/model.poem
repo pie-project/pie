@@ -1,7 +1,9 @@
 # The weights of Qwen 3 (dense): per layer an RMS norm, q, k, v and o
 # projections with per-head q and k norms, an RMS norm and a SwiGLU MLP; the
 # token embedding, which the 0.6B also reads out through (tied), a final norm.
-# Each layer also has the LoRA banks the host registers.
+# Each layer also has the LoRA banks the host registers. A deployment's dtype
+# is its projections'; the embedding and head stay at its compute dtype, as
+# an AWQ or GPTQ export keeps them.
 
 load("//lib/adapters/model.poem", "banks")
 load("//lib/rope.poem", "yarn")
@@ -76,8 +78,8 @@ def layout(id, deploy):
         rope = yarn(deploy, 32768),
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
-        embed = weight("embed", [d.vocab, hidden], w),
-        head = None if d.tied else weight("lm_head", [d.vocab, hidden], w).columns(),
+        embed = weight("embed", [d.vocab, hidden], dense),
+        head = None if d.tied else weight("lm_head", [d.vocab, hidden], dense).columns(),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight("final_norm", [hidden], dense),
     )
