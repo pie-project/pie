@@ -82,9 +82,15 @@ fn plan_floats(
         .map(|seat| {
             seat.map(|seat| {
                 match seat.kind {
+                    // A prefill plan only decoders read (a grouped decode on
+                    // the prefill kernel) sees a row a lane at most.
                     StructKind::AttnPrefillPlan => prefill_float_bytes(
                         &seat.reading,
-                        budget.buckets.last().copied().unwrap_or(budget.max_tokens),
+                        if seat.rows_a_lane {
+                            crate::window::lane_capacity(budget.max_lanes)
+                        } else {
+                            budget.buckets.last().copied().unwrap_or(budget.max_tokens)
+                        },
                         budget.max_lanes,
                         device,
                         toggles,

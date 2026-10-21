@@ -68,6 +68,84 @@ pub fn swiglu_sorted(
     )
 }
 
+/// [`swiglu_clamp_alpha`] over a routed stack's sorted rows, padding rows left as they are.
+pub fn swiglu_clamp_alpha_sorted(
+    ctx: &Ctx<'_>,
+    packed: Tensor,
+    intermediate: u32,
+    limit: f32,
+    alpha: f32,
+    perm: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mlp_swiglu_clamp_alpha";
+    dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
+    let cut = halves(OP, packed, intermediate, y)?;
+    ctx.fire(
+        Fire::at("linear/mlp_packed.metal", "packed_gptoss_swiglu_sorted").apply(cut.grid),
+        &[
+            cut.packed.arg(),
+            cut.y.arg_mut(),
+            cut.intermediate.arg(),
+            limit.arg(),
+            alpha.arg(),
+            perm.arg(),
+        ],
+    )
+}
+
+/// [`geglu_tanh_packed`] over a routed stack's sorted rows, padding rows left as they are.
+pub fn geglu_tanh_sorted(
+    ctx: &Ctx<'_>,
+    packed: Tensor,
+    intermediate: u32,
+    perm: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mlp_geglu_tanh_packed";
+    dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
+    let cut = halves(OP, packed, intermediate, y)?;
+    ctx.fire(
+        Fire::at("linear/mlp_packed.metal", "packed_geglu_tanh_sorted").apply(cut.grid),
+        &[
+            cut.packed.arg(),
+            cut.y.arg_mut(),
+            cut.intermediate.arg(),
+            perm.arg(),
+        ],
+    )
+}
+
+/// [`geglu_tanh_sorted`] that also lands each row's 64-wide group sums in `sums` over
+/// `tile`-row tiles, as the MPP routed matmul that reads the rows next folds them.
+#[allow(clippy::too_many_arguments)]
+pub fn geglu_tanh_sorted_sums(
+    ctx: &Ctx<'_>,
+    packed: Tensor,
+    intermediate: u32,
+    perm: Tensor,
+    y: Tensor,
+    sums: Tensor,
+    tile: u32,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mlp_geglu_tanh_packed";
+    dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
+    let cut = halves(OP, packed, intermediate, y)?;
+    debug_assert!(intermediate.is_multiple_of(64), "whole 64-wide groups");
+    ctx.fire(
+        Fire::at("linear/mlp_packed.metal", "packed_geglu_tanh_sorted_sums")
+            .apply(Grid::of([256, y.rows, 1], [256, 1, 1])),
+        &[
+            cut.packed.arg(),
+            cut.y.arg_mut(),
+            cut.intermediate.arg(),
+            perm.arg(),
+            sums.arg_mut(),
+            tile.arg(),
+        ],
+    )
+}
+
 pub fn swiglu_clamp(
     ctx: &Ctx<'_>,
     packed: Tensor,

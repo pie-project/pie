@@ -149,12 +149,14 @@ __global__ void kv_append_at_positions(
     }
 }
 
-template <bool HND_LAYOUT>
+// A row's key and value landed at its explicit page and offset, as bf16 or,
+// into an e4m3 pool, rounded to e4m3 (saturating, under a unit scale).
+template <bool HND_LAYOUT, class KV = bf16>
 __global__ void kv_append_explicit(
     const bf16* __restrict__ k_curr,
     const bf16* __restrict__ v_curr,
-    bf16* __restrict__ k_pages,
-    bf16* __restrict__ v_pages,
+    KV* __restrict__ k_pages,
+    KV* __restrict__ v_pages,
     const u32* __restrict__ w_page,
     const u32* __restrict__ w_off,
     const u8* __restrict__ row_valid,
@@ -188,8 +190,48 @@ __global__ void kv_append_explicit(
             dst = ((static_cast<long long>(actual_page) * page_size) +
                    offset_in_page) * row + i;
         }
-        k_pages[dst] = k_curr[src + i];
-        v_pages[dst] = v_curr[src + i];
+        if constexpr (is_same<KV, bf16>::value) {
+            k_pages[dst] = k_curr[src + i];
+            v_pages[dst] = v_curr[src + i];
+        } else {
+            k_pages[dst] = KV(bf16_to_f32(k_curr[src + i]));
+            v_pages[dst] = KV(bf16_to_f32(v_curr[src + i]));
+        }
+    }
+}
+
+// The pages a fire reads of an e4m3 pool, widened to bf16 in its page
+// list's order (the list's i-th page at the shadow's page i), and the
+// shadow's own list: 16 codes a thread.
+__global__ void widen_e4m3_pages(
+    const uint4* __restrict__ k_pages,
+    const uint4* __restrict__ v_pages,
+    uint4* __restrict__ k_out,
+    uint4* __restrict__ v_out,
+    const u32* __restrict__ page_indices,
+    i32* __restrict__ shadow_indices,
+    long long n,
+    int page_chunks)
+{
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long long active = i / page_chunks;
+    const int local = static_cast<int>(i % page_chunks);
+    if (local == 0) shadow_indices[active] = static_cast<i32>(active);
+    const long long src = static_cast<long long>(page_indices[active]) * page_chunks + local;
+    const uint4 kv[2] = {k_pages[src], v_pages[src]};
+    uint4* out[2] = {k_out, v_out};
+#pragma unroll
+    for (int x = 0; x < 2; ++x) {
+        const unsigned w[4] = {kv[x].x, kv[x].y, kv[x].z, kv[x].w};
+        unsigned b[8];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            b[2 * u] = pack_bf16x2(e4m3_to_f32(w[u] & 0xff), e4m3_to_f32((w[u] >> 8) & 0xff));
+            b[2 * u + 1] = pack_bf16x2(e4m3_to_f32((w[u] >> 16) & 0xff), e4m3_to_f32(w[u] >> 24));
+        }
+        out[x][2 * i] = make_uint4(b[0], b[1], b[2], b[3]);
+        out[x][2 * i + 1] = make_uint4(b[4], b[5], b[6], b[7]);
     }
 }
 

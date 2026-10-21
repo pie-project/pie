@@ -14,6 +14,8 @@
 // e2m1 code there becomes a bf16 by two masks and a shift. The activations
 // are permuted to match, two byte-perms a register.
 
+#include <cuda_pipeline.h>
+
 #include "prelude/device.cuh"
 #include "prelude/glu.cuh"
 
@@ -58,6 +60,37 @@ __device__ __forceinline__ unsigned ld_scale(const u8* p) {
 }
 
 using ::pie::glu_fn::glu;
+
+// A K-split CTA's later groups' sums (`part` past 0) folded through shared
+// memory into its first group's, a lane its own: false for the threads that
+// land nothing past it (the later groups, a warp past the bank's rows).
+template <int kKSplit, int kTiles, int kNb>
+__device__ __forceinline__ bool fold_ksplit(float (&acc)[kTiles][kNb][4], int part, int warp,
+                                            int lane, bool rows_live) {
+    if constexpr (kKSplit > 1) {
+        constexpr int kAcc = kTiles * kNb * 4;
+        __shared__ float fold[kKSplit - 1][4][kAcc][32];
+        if (part > 0) {
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int b = 0; b < kNb; ++b)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) fold[part - 1][warp][(t * kNb + b) * 4 + e][lane] = acc[t][b][e];
+        }
+        __syncthreads();
+        if (part > 0 || !rows_live) return false;
+#pragma unroll
+        for (int p = 0; p < kKSplit - 1; ++p)
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int b = 0; b < kNb; ++b)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) acc[t][b][e] += fold[p][warp][(t * kNb + b) * 4 + e][lane];
+    }
+    return true;
+}
 
 __device__ __forceinline__ uint4 ld_act(const void* p) {
     uint4 v;
@@ -158,8 +191,9 @@ __device__ __forceinline__ void compute(const Chunk<kTiles, kNb>& cc, float (&ac
 
 // A warp's sums landed at their routes' rows: each row's bias (`b_e`, or
 // none) after its `factor`, the gate and up rows through the GLU into
-// `inter` columns where `kGlu`, else `n` columns as they are.
-template <int kGlu, int kTiles, int kNb, class Factor>
+// `inter` columns where `kGlu`, else `n` columns as they are; tile `t`'s
+// rows `kTileRows t` past the warp's.
+template <int kGlu, int kTiles, int kNb, int kTileRows = 16, class Factor>
 __device__ __forceinline__ void w4_land(const float (&acc)[kTiles][kNb][4], Factor factor,
                                         const bf16* b_e, const i32* __restrict__ order, int begin,
                                         int count, bf16* __restrict__ out, int n, int inter,
@@ -191,7 +225,7 @@ __device__ __forceinline__ void w4_land(const float (&acc)[kTiles][kNb][4], Fact
     for (int t = 0; t < kTiles; ++t)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const int row = row_base + 16 * t + 8 * h + g;
+            const int row = row_base + kTileRows * t + 8 * h + g;
             if (row >= n) continue;
             const float add = b_e != nullptr ? bf16_to_f32(b_e[row]) : 0.f;
             const float f = factor(row);
@@ -209,6 +243,158 @@ __device__ __forceinline__ void w4_land(const float (&acc)[kTiles][kNb][4], Fact
 }
 
 }  // namespace w4mma
+
+// A routed bf16 select at decode widths: the bf16 analog of
+// `moe_select_mxfp4_mma`, without its GLU. Each expert's weight rows and the
+// routes' rows are staged a K-tile at a time into shared memory with
+// `cp.async`, read to the mma fragments by `ldmatrix`, and met on mma.sync.
+// The routing (order/offsets/work) and the epilogue (`w4mma::w4_land`) are
+// shared with the mxfp4 kernel; the fragments are the ones `attn/mla.cuh`
+// loads, so the output fragment is the layout `w4_land` reads.
+// The bf16 select's K step and its pipeline's stages (`moe_select_bf16_mma`).
+constexpr int kBf16MmaBK = 64;
+constexpr int kBf16MmaStages = 3;
+
+namespace bf16mma {
+__device__ __forceinline__ void ld_a(unsigned (&a)[4], const bf16* base, int ld, int lane) {
+    const bf16* r = base + static_cast<long long>(lane & 15) * ld + ((lane & 16) ? 8 : 0);
+    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(r));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(addr));
+}
+__device__ __forceinline__ void ld_b(unsigned (&b)[2], const bf16* base, int ld, int lane) {
+    const bf16* q = base + static_cast<long long>(lane & 7) * ld + ((lane & 8) ? 8 : 0);
+    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(q));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                 : "=r"(b[0]), "=r"(b[1]) : "r"(addr));
+}
+}  // namespace bf16mma
+
+template <int kNb>
+__global__ void __launch_bounds__(128) moe_select_bf16_mma(
+    const bf16* __restrict__ act,
+    const i32* __restrict__ order,
+    const i32* __restrict__ offsets,
+    const i32* __restrict__ work,
+    const bf16* __restrict__ weight,
+    const bf16* __restrict__ bias,
+    bf16* __restrict__ out,
+    int act_div, int n, int k, int num_experts)
+{
+    constexpr int kTiles = 2;
+    constexpr int kRowsWarp = kTiles * 16;
+    constexpr int kRowsCta = 4 * kRowsWarp;   // 128 weight rows a CTA
+    constexpr int kSlice = 8 * kNb;           // routes a slice (B of the GEMM)
+    constexpr int kBK = kBf16MmaBK;           // K staged a step (four mma k)
+    constexpr int kPad = kBK + 8;             // smem row stride (ldmatrix)
+    constexpr int kStages = kBf16MmaStages;
+    constexpr int kChunks = kBK / 8;          // 16-byte chunks a row a step
+    constexpr int kStage = (kRowsCta + kSlice) * kPad;
+
+    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
+    const int item = work[blockIdx.x];
+    const int expert = item >> 16;
+    const int slice = item & 0xFFFF;
+    const int begin = offsets[expert] + slice * kSlice;
+    const int count = min(offsets[expert + 1] - begin, kSlice);
+    if (count <= 0) return;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int g = lane >> 2;
+    const int c = lane & 3;
+    // The CTA's 128 rows and this warp's 32 of them. A warp whose rows run
+    // past the bank still joins the cooperative load and the barriers;
+    // `w4_land` drops its out-of-range rows.
+    const int cta_row0 = static_cast<int>(blockIdx.y) * kRowsCta;
+    const int row_base = cta_row0 + warp * kRowsWarp;
+
+    const bf16* w_e = weight + static_cast<long long>(expert) * n * k;
+    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+
+    // `kStages` stages, each 128 weight rows then the slice's route rows.
+    extern __shared__ bf16 smem[];
+
+    // Stage `st` takes K-step `step`: 16 bytes a cp.async. Rows past the
+    // bank or routes past the slice are zeroed so the mma reads defined
+    // smem (their outputs are not stored).
+    auto load = [&](int step, int st) {
+        bf16* sW = smem + st * kStage;
+        bf16* sX = sW + kRowsCta * kPad;
+        const int k0 = step * kBK;
+#pragma unroll
+        for (int i = tid; i < kRowsCta * kChunks; i += 128) {
+            const int row = i / kChunks;
+            const int ch = (i % kChunks) * 8;
+            bf16* dst = sW + row * kPad + ch;
+            if (cta_row0 + row < n) {
+                __pipeline_memcpy_async(
+                    dst, w_e + static_cast<long long>(cta_row0 + row) * k + k0 + ch, 16);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        for (int i = tid; i < kSlice * kChunks; i += 128) {
+            const int tok = i / kChunks;
+            const int ch = (i % kChunks) * 8;
+            bf16* dst = sX + tok * kPad + ch;
+            if (tok < count) {
+                const long long r = static_cast<long long>(order[begin + tok] / act_div);
+                __pipeline_memcpy_async(dst, act + r * k + k0 + ch, 16);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+
+    float acc[kTiles][kNb][4];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int b = 0; b < kNb; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
+
+    // Every step commits a group (empty past the end), so the wait for
+    // step `s` is always the same count behind.
+    const int steps = k / kBK;
+#pragma unroll
+    for (int s = 0; s < kStages - 1; ++s) {
+        if (s < steps) load(s, s);
+        __pipeline_commit();
+    }
+    for (int s = 0; s < steps; ++s) {
+        __pipeline_wait_prior(kStages - 2);
+        __syncthreads();
+        // The stage refilled here was read at step s - 1, behind the barrier.
+        const int next = s + kStages - 1;
+        if (next < steps) load(next, next % kStages);
+        __pipeline_commit();
+
+        const bf16* sW = smem + (s % kStages) * kStage;
+        const bf16* sX = sW + kRowsCta * kPad;
+#pragma unroll
+        for (int kk = 0; kk < kBK; kk += 16) {
+            unsigned bk[kNb][2];
+#pragma unroll
+            for (int b = 0; b < kNb; ++b) bf16mma::ld_b(bk[b], sX + 8 * b * kPad + kk, kPad, lane);
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t) {
+                unsigned a[4];
+                bf16mma::ld_a(a, sW + (warp * kRowsWarp + 16 * t) * kPad + kk, kPad, lane);
+#pragma unroll
+                for (int b = 0; b < kNb; ++b) {
+                    w4mma::mma(acc[t][b], a[0], a[1], a[2], a[3], bk[b][0], bk[b][1]);
+                }
+            }
+        }
+    }
+
+    auto factor = [&](int) { return 1.f; };
+    w4mma::w4_land<0, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, n, row_base,
+                                   g, c, 0.f, 1.f);
+}
 
 /// `y[route] = x[route / act_div] . W[expert]^T (+ bias[expert])` for the
 /// routes `order` lists by expert, `work` naming (expert, slice of
@@ -263,6 +449,10 @@ __global__ void moe_route_order_scan(
     int num_experts,
     const u32* __restrict__ win)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     extern __shared__ i32 order_smem[];
     i32* counts = order_smem;
     i32* fill = counts + num_experts + 1;
@@ -326,8 +516,12 @@ __global__ void moe_route_order_scan(
 
 // `kNv`: an NVFP4 bank (an e4m3 scale a 16 codes, `tscale` an f32 tensor
 // scale a weight row) in place of mxfp4's e8m0 a 32.
-template <int kNb, int kDepth, int kGlu, bool kNv = false>
-__global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
+// `kKSplit`: K split across that many groups of the CTA's four warps, each
+// walking every `kKSplit`-th chunk, their sums folded through shared memory
+// before the first group lands them: a decode's few CTAs keep the card's
+// memory busy with more warps, each a share of K.
+template <int kNb, int kDepth, int kGlu, bool kNv = false, int kKSplit = 1>
+__global__ void __launch_bounds__(128 * kKSplit) moe_select_mxfp4_mma(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
     const i32* __restrict__ offsets,
@@ -358,7 +552,8 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
     const int count = min(offsets[expert + 1] - begin, kSlice);
     if (count <= 0) return;
 
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int warp = (static_cast<int>(threadIdx.x) >> 5) & 3;
+    const int part = static_cast<int>(threadIdx.x) >> 7;
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int g = lane >> 2;
     const int c = lane & 3;
@@ -366,7 +561,9 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
     // A tile's first row: the next 16 rows, or a GLU's up rows `inter` on.
     const int span = kGlu != 0 ? inter : n;
     auto tile_row = [&](int t) { return kGlu != 0 ? row_base + t * inter : row_base + 16 * t; };
-    if (row_base >= span) return;
+    // With K split, a warp past the bank's rows still meets the fold.
+    if (kKSplit == 1 && row_base >= span) return;
+    const bool rows_live = row_base < span;
 
     const int groups = k >> 5;
     const int chunks = (groups + 3) >> 2;
@@ -426,15 +623,18 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
 
+    // This group's chunks: part, part + kKSplit, ...
+    const int mine = rows_live && part < chunks ? (chunks - part + kKSplit - 1) / kKSplit : 0;
+    auto chunk_of = [&](int i) { return part + i * kKSplit; };
     Chunk ring[kDepth];
 #pragma unroll
     for (int d = 0; d < kDepth; ++d)
-        if (d < chunks) load(d, ring[d]);
-    for (int ch0 = 0; ch0 < chunks; ch0 += kDepth) {
+        if (d < mine) load(chunk_of(d), ring[d]);
+    for (int i0 = 0; i0 < mine; i0 += kDepth) {
 #pragma unroll
         for (int d = 0; d < kDepth; ++d) {
-            const int ch = ch0 + d;
-            if (ch < chunks) {
+            const int i = i0 + d;
+            if (i < mine) {
                 bool wide = false;
 #pragma unroll
                 for (int t = 0; t < kTiles; ++t)
@@ -446,13 +646,279 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
                 } else {
                     w4mma::compute<false, false>(ring[d], acc);
                 }
-                if (ch + kDepth < chunks) load(ch + kDepth, ring[d]);
+                if (i + kDepth < mine) load(chunk_of(i + kDepth), ring[d]);
             }
         }
     }
+    if (!w4mma::fold_ksplit<kKSplit>(acc, part, warp, lane, rows_live)) return;
 
     const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
     // NVFP4: a weight row's tensor scale, and the 2^8 the scales held back.
+    const float* t_e = kNv ? tscale + static_cast<long long>(expert) * n : nullptr;
+    auto factor = [&](int row) { return kNv ? t_e[row] * 256.f : 1.f; };
+    w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, inter,
+                                      row_base, g, c, limit, galpha);
+}
+
+namespace w4mma {
+
+// A staged activation chunk's 16-byte run `q` (0..15, codes 8q..8q+7 of
+// the chunk's 128) of route row `row`, where the stage keeps it: a lane's
+// four runs (4c..4c+3), and its quarter-warp's two rows, on eight bank
+// quads.
+__device__ __forceinline__ int x_slot(int row, int q) {
+    return row * 16 + (q ^ (((q >> 3) & 1) << 1) ^ (row & 1));
+}
+
+// A staged run of eight activations relaid in place as the B words the
+// register-dequant mma reads them in (the byte perms `compute` does a warp
+// a run, done once a CTA): the first k-step's (b0, b1), then the second's.
+__device__ __forceinline__ void lay_staged(uint4* at) {
+    const uint4 v = *at;
+    uint4 o;
+    o.x = __byte_perm(v.y, v.w, 0x7632);
+    o.y = __byte_perm(v.y, v.w, 0x5410);
+    o.z = __byte_perm(v.x, v.z, 0x7632);
+    o.w = __byte_perm(v.x, v.z, 0x5410);
+    *at = o;
+}
+
+// `compute` with the routes' activations read from the stage (`xs`, the
+// chunk's runs) rather than held a chunk in registers.
+template <bool wide, bool kNv, int kTiles, int kNb>
+__device__ __forceinline__ void compute_staged(const uint4 (&cw)[kTiles][2], const unsigned (&cs)[kTiles][2],
+                                               const uint4* __restrict__ xs, int g, int c,
+                                               float (&acc)[kTiles][kNb][4]) {
+    unsigned s1[kTiles][2], s2[kTiles][2], nv[kTiles][2][2];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const unsigned s = cs[t][h];
+            if constexpr (kNv) {
+#pragma unroll
+                for (int q = 0; q < 2; ++q) {
+                    const unsigned v = nvfp4_scale_bf16((s >> (8 * q)) & 0xFFu);
+                    nv[t][h][q] = v | (v << 16);
+                }
+                s1[t][h] = s2[t][h] = 0u;
+            } else {
+                const unsigned a = !wide || s <= 128u ? (s + 126u) << 7 : 253u << 7;
+                const unsigned b = s <= 128u ? 0x3F80u : s << 7;
+                s1[t][h] = a | (a << 16);
+                s2[t][h] = b | (b << 16);
+            }
+        }
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        if constexpr (kNv) {
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) s1[t][h] = nv[t][h][w >> 1];
+        }
+        // The run already laid as the mma's B words (`lay_staged`): its two
+        // k-steps' (b0, b1) pairs.
+        uint4 xv[kNb];
+#pragma unroll
+        for (int b = 0; b < kNb; ++b) xv[b] = xs[x_slot(8 * b + g, 4 * c + w)];
+#pragma unroll
+        for (int jj = 0; jj < 2; ++jj) {
+            unsigned b0[kNb], b1[kNb];
+#pragma unroll
+            for (int b = 0; b < kNb; ++b) {
+                b0[b] = jj == 0 ? xv[b].x : xv[b].z;
+                b1[b] = jj == 0 ? xv[b].y : xv[b].w;
+            }
+            const int p0 = 2 * jj;
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t) {
+                const unsigned w0 = (&cw[t][0].x)[w];
+                const unsigned w1 = (&cw[t][1].x)[w];
+                unsigned a0 = mul2(e2m1_pair(w0 << (4 * p0)), s1[t][0]);
+                unsigned a1 = mul2(e2m1_pair(w1 << (4 * p0)), s1[t][1]);
+                unsigned a2 = mul2(e2m1_pair(w0 << (4 * p0 + 4)), s1[t][0]);
+                unsigned a3 = mul2(e2m1_pair(w1 << (4 * p0 + 4)), s1[t][1]);
+                if constexpr (wide) {
+                    a0 = mul2(a0, s2[t][0]);
+                    a1 = mul2(a1, s2[t][1]);
+                    a2 = mul2(a2, s2[t][0]);
+                    a3 = mul2(a3, s2[t][1]);
+                }
+#pragma unroll
+                for (int b = 0; b < kNb; ++b) mma(acc[t][b], a0, a1, a2, a3, b0[b], b1[b]);
+            }
+        }
+    }
+}
+
+}  // namespace w4mma
+
+/// `moe_select_mxfp4_mma` for a slice of `8 kNb` routes an expert, up to
+/// 64: the slice's activations staged a 128-code chunk at a time in shared
+/// memory through a `kStages` cp.async ring the CTA's warps share, so a
+/// wide fire streams each expert's codes once a 64 routes, not a 32.
+template <int kNb, int kStages, int kGlu, bool kNv = false>
+__global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
+    const bf16* __restrict__ act,
+    const i32* __restrict__ order,
+    const i32* __restrict__ offsets,
+    const i32* __restrict__ work,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const bf16* __restrict__ bias,
+    bf16* __restrict__ out,
+    int act_div,
+    int n,
+    int k,
+    int num_experts,
+    int inter,
+    float limit,
+    float galpha,
+    const float* __restrict__ tscale)
+{
+    // Four warps a CTA, each two m16 tiles of weight rows (a GLU's gate tile
+    // and its up tile).
+    constexpr int kTiles = 2;
+    constexpr int kWarps = 4;
+    constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
+    constexpr int kRowsCta = kWarps * kRowsWarp;
+    constexpr int kSlice = 8 * kNb;
+    constexpr int kStageRuns = kSlice * 16;
+    // A staging pass is `kThreads / 16` route rows, a thread a run of each.
+    constexpr int kThreads = 32 * kWarps;
+    constexpr int kRowStep = kThreads / 16;
+    constexpr int kPasses = kSlice / kRowStep;
+    static_assert(kPasses * kRowStep == kSlice, "the slice stages in whole passes");
+
+    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
+    const int item = work[blockIdx.x];
+    const int expert = item >> 16;
+    const int slice = item & 0xFFFF;
+    const int begin = offsets[expert] + slice * kSlice;
+    const int count = min(offsets[expert + 1] - begin, kSlice);
+    if (count <= 0) return;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int g = lane >> 2;
+    const int c = lane & 3;
+    const int row_base = static_cast<int>(blockIdx.y) * kRowsCta + warp * kRowsWarp;
+    const int span = kGlu != 0 ? inter : n;
+    auto tile_row = [&](int t) { return kGlu != 0 ? row_base + t * inter : row_base + 16 * t; };
+    // A warp past the bank's rows still stages its share of the routes.
+    const bool rows_live = row_base < span;
+
+    const int groups = k >> 5;
+    const int chunks = (groups + 3) >> 2;
+    const long long row_bytes = k >> 1;
+    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
+    const int sf_row = kNv ? 2 * groups : groups;
+    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+
+    const u8* wrow[kTiles][2];
+    const u8* srow[kTiles][2];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int r = min(max(tile_row(t), 0) + 8 * h + g, n - 1);
+            wrow[t][h] = w_e + r * row_bytes + c * 16;
+            srow[t][h] = s_e + static_cast<long long>(r) * sf_row + (kNv ? 2 * c : c);
+        }
+
+    // The runs this thread stages a chunk: rows tid / 16 + 8 j, run tid % 16.
+    const int run = tid & 15;
+    const bf16* src[kPasses];
+#pragma unroll
+    for (int j = 0; j < kPasses; ++j) {
+        const int tok = (tid >> 4) + kRowStep * j;
+        src[j] = tok < count ? act + static_cast<long long>(order[begin + tok] / act_div) * k + run * 8
+                             : nullptr;
+    }
+    extern __shared__ __align__(16) uint4 staged_x[];
+    auto stage = [&](int ch) {
+        if (ch < chunks) {
+            uint4* dst = staged_x + (ch % kStages) * kStageRuns;
+            const int col = ch * 128 + run * 8;
+#pragma unroll
+            for (int j = 0; j < kPasses; ++j) {
+                const int row = (tid >> 4) + kRowStep * j;
+                const bool live = src[j] != nullptr && col < k;
+                const unsigned saddr = static_cast<unsigned>(__cvta_generic_to_shared(dst + w4mma::x_slot(row, run)));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(saddr),
+                             "l"(live ? src[j] + ch * 128 : act), "r"(live ? 16 : 0));
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    auto load_w = [&](int ch, uint4 (&cw)[kTiles][2], unsigned (&cs)[kTiles][2]) {
+        const bool live = rows_live && ch < chunks && ch * 4 + c < groups;
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                cw[t][h] = live ? w4mma::ld_stream(wrow[t][h] + ch * 64) : make_uint4(0, 0, 0, 0);
+                if constexpr (kNv) {
+                    cs[t][h] = live ? w4mma::ld_scale2(srow[t][h] + ch * 8) : 0u;
+                } else {
+                    cs[t][h] = live ? w4mma::ld_scale(srow[t][h] + ch * 4) : 127u;
+                }
+            }
+    };
+
+    float acc[kTiles][kNb][4];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int b = 0; b < kNb; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
+
+#pragma unroll
+    for (int s = 0; s < kStages - 1; ++s) stage(s);
+    uint4 cw[kTiles][2], nw[kTiles][2];
+    unsigned cs[kTiles][2], ns[kTiles][2];
+    load_w(0, cw, cs);
+
+    for (int ch = 0; ch < chunks; ++ch) {
+        load_w(ch + 1, nw, ns);
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(kStages - 2));
+        // This thread's own runs of the chunk (visible to it past the wait)
+        // relaid as B words before the barrier shares them.
+        {
+            uint4* xs_w = staged_x + (ch % kStages) * kStageRuns;
+#pragma unroll
+            for (int j = 0; j < kPasses; ++j) w4mma::lay_staged(xs_w + w4mma::x_slot((tid >> 4) + kRowStep * j, run));
+        }
+        __syncthreads();
+        if (rows_live) {
+            const uint4* xs = staged_x + (ch % kStages) * kStageRuns;
+            bool wide = false;
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t) wide |= cs[t][0] > 128u || cs[t][1] > 128u;
+            if constexpr (kNv) {
+                w4mma::compute_staged<false, true>(cw, cs, xs, g, c, acc);
+            } else if (__any_sync(0xffffffffu, wide)) {
+                w4mma::compute_staged<true, false>(cw, cs, xs, g, c, acc);
+            } else {
+                w4mma::compute_staged<false, false>(cw, cs, xs, g, c, acc);
+            }
+        }
+        stage(ch + kStages - 1);
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                cw[t][h] = nw[t][h];
+                cs[t][h] = ns[t][h];
+            }
+    }
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    if (!rows_live) return;
+
+    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
     const float* t_e = kNv ? tscale + static_cast<long long>(expert) * n : nullptr;
     auto factor = [&](int row) { return kNv ? t_e[row] * 256.f : 1.f; };
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, inter,

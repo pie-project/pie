@@ -5,7 +5,7 @@ use kernels_cuda::attn::paged;
 use kernels_cuda::attn::{self, index, mla, plan, pool, selected};
 use kernels_cuda::attn_dense;
 use poem_exec::{DispatchAttention, KernelError};
-use poem_ir::{Attention, IndexScore, StructKind};
+use poem_ir::{Attention, IndexScore, Operation, StructKind};
 
 use crate::run::{Run, StructSlot};
 use kernels_cuda::RaggedTensor;
@@ -584,7 +584,21 @@ impl Run<'_> {
                         seat.workspace,
                     )?
                 };
-                built.stage(self.ctx())?;
+                // Only the dense FA2 arms read the plan off the card; a trunk
+                // whose MLA reads are all selected (the sparse or naive
+                // kernels) leaves its upload (some 600 KB a fire) unstaged.
+                let read = self.nodes().iter().any(|node| {
+                    matches!(
+                        &node.op,
+                        Operation::Attention(
+                            Attention::MlaDecode { plan: read, .. }
+                                | Attention::MlaPrefill { plan: read, .. }
+                        ) if read == plan
+                    )
+                });
+                if read {
+                    built.stage(self.ctx())?;
+                }
                 self.put(*plan, StructSlot::Mla(built));
                 Ok(())
             }
@@ -801,6 +815,7 @@ impl Run<'_> {
             Attention::SsmCausalConv1d {
                 x,
                 weight,
+                bias,
                 state,
                 conv_width,
                 dilation,
@@ -811,6 +826,7 @@ impl Run<'_> {
                         "attention.ssm_causal_conv1d",
                         *x,
                         *weight,
+                        *bias,
                         *state,
                         *conv_width,
                         *dilation,
@@ -822,6 +838,7 @@ impl Run<'_> {
                     self.ctx(),
                     self.tensor(*x),
                     self.tensor(*weight),
+                    bias.map(|b| self.tensor(b)),
                     &self.recurrent_absolute(*state),
                     *conv_width,
                     *dilation,
@@ -872,6 +889,7 @@ impl Run<'_> {
             Attention::SsmCausalConv1dChunked {
                 x,
                 weight,
+                bias,
                 state,
                 conv_width,
                 dilation,
@@ -882,6 +900,7 @@ impl Run<'_> {
                         "attention.ssm_causal_conv1d_chunked",
                         *x,
                         *weight,
+                        *bias,
                         *state,
                         *conv_width,
                         *dilation,
@@ -894,6 +913,7 @@ impl Run<'_> {
                     self.ctx(),
                     self.ragged_lanes(*x),
                     self.tensor(*weight),
+                    bias.map(|b| self.tensor(b)),
                     &self.recurrent_absolute(*state),
                     *conv_width,
                     *dilation,
@@ -904,6 +924,7 @@ impl Run<'_> {
                     self.ctx(),
                     self.ragged_lanes(*x),
                     self.tensor(*weight),
+                    bias.map(|b| self.tensor(b)),
                     &tail,
                     *conv_width,
                     *dilation,
@@ -1223,6 +1244,71 @@ impl Run<'_> {
                     *head_dim,
                     *norm_eps,
                     *gate_floor,
+                    &mut self.tensor(*y),
+                )
+            }
+            Attention::SsmMamba2 {
+                xbc,
+                dt,
+                z,
+                a_log,
+                dt_bias,
+                d,
+                norm,
+                eps,
+                state,
+                heads,
+                groups,
+                state_dim,
+                chunked,
+                y,
+            } => {
+                const OP: &str = "attention.ssm_mamba2";
+                if self.rs_extended() {
+                    return Err(kernels_cuda::Error::Unsupported { op: OP });
+                }
+                let m = attn::ssm::Mamba2 {
+                    a_log: self.tensor(*a_log),
+                    dt_bias: self.tensor(*dt_bias),
+                    d: self.tensor(*d),
+                    norm: self.tensor(*norm),
+                    eps: *eps,
+                    heads: *heads,
+                    groups: *groups,
+                };
+                let (dt, z) = (self.tensor(*dt), self.tensor(*z));
+                if !chunked {
+                    return attn::ssm::mamba2_step(
+                        self.ctx(),
+                        self.tensor(*xbc),
+                        dt,
+                        z,
+                        m,
+                        &self.recurrent(*state),
+                        *state_dim,
+                        &mut self.tensor(*y),
+                    );
+                }
+                let tail = self.recurrent_tail_absolute(*state);
+                attn::ssm::mamba2_chunked(
+                    self.ctx(),
+                    self.ragged_lanes(*xbc),
+                    dt,
+                    z,
+                    m,
+                    &self.recurrent_absolute(*state),
+                    *state_dim,
+                    &mut self.tensor(*y),
+                )?;
+                let Some(tail) = tail else { return Ok(()) };
+                attn::ssm::mamba2_chunked(
+                    self.ctx(),
+                    self.ragged_lanes(*xbc),
+                    dt,
+                    z,
+                    m,
+                    &tail,
+                    *state_dim,
                     &mut self.tensor(*y),
                 )
             }
@@ -1770,11 +1856,13 @@ impl Run<'_> {
         op: &'static str,
         x: ValueId,
         weight: ValueId,
+        bias: Option<ValueId>,
         state: ValueId,
         conv_width: u32,
         dilation: u32,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
+        let bias = bias.map(|b| self.tensor(b));
         let x_ext = self.rs_extend(op, x, true)?;
         let csr = self.rs_ext_csr(op)?;
         let mut y_ext = self.rs_out(op, y)?;
@@ -1786,6 +1874,7 @@ impl Run<'_> {
                 indptr: csr,
             },
             self.tensor(weight),
+            bias,
             &self.recurrent_absolute(state),
             conv_width,
             dilation,
@@ -1799,6 +1888,7 @@ impl Run<'_> {
                     indptr: csr,
                 },
                 self.tensor(weight),
+                bias,
                 &tail,
                 conv_width,
                 dilation,

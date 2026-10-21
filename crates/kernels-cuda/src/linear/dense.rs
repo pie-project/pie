@@ -23,7 +23,7 @@ use cudarc::runtime::sys::{
     cudaStreamSynchronize,
 };
 
-use super::gemv::{gemm_narrow_bf16, gemm_rows_bf16, gemv_bf16};
+use super::gemv::{gemm_narrow_bf16, gemm_rows_bf16, gemv_bf16, rows_cluster};
 use crate::jit::device::capture_status;
 use crate::jit::{Ctx, refuse};
 
@@ -164,14 +164,25 @@ pub(crate) fn act_x_wt(
             call,
             ws,
             ws_bytes,
-            tuning.pdl,
+            tuning,
         )
     {
         return Ok(matches!(tactic, Tactic::Gemv | Tactic::Rows) && bias != 0);
     }
     clear_error();
 
-    if m == 1 && gemv_bf16(&unsafe { Ctx::on(stream) }, w, act, bias, y, n, k).is_ok() {
+    if m == 1
+        && gemv_bf16(
+            &unsafe { Ctx::on(stream) }.with_tuning(tuning),
+            w,
+            act,
+            bias,
+            y,
+            n,
+            k,
+        )
+        .is_ok()
+    {
         return Ok(bias != 0);
     }
     if gemm_ex(
@@ -219,13 +230,16 @@ fn run_tactic(
     call: Call,
     ws: *mut c_void,
     ws_bytes: usize,
-    pdl: bool,
+    tuning: crate::tuning::Tuning,
 ) -> bool {
+    // The kernels' own launches read this dispatch's decisions (`kernel.pdl`,
+    // `kernel.gemv.bf16`), not a bare stream's defaults.
+    let pdl = tuning.pdl;
     match tactic {
         Tactic::Gemv => {
             call.m == 1
                 && gemv_bf16(
-                    &unsafe { Ctx::on(stream) },
+                    &unsafe { Ctx::on(stream) }.with_tuning(tuning),
                     call.w,
                     call.act,
                     call.bias,
@@ -236,7 +250,7 @@ fn run_tactic(
                 .is_ok()
         }
         Tactic::Rows => gemm_rows_bf16(
-            &unsafe { Ctx::on(stream) },
+            &unsafe { Ctx::on(stream) }.with_tuning(tuning),
             call.w,
             call.act,
             call.bias,
@@ -248,7 +262,7 @@ fn run_tactic(
         )
         .is_ok(),
         Tactic::Narrow => gemm_narrow_bf16(
-            &unsafe { Ctx::on(stream) },
+            &unsafe { Ctx::on(stream) }.with_tuning(tuning),
             call.w,
             call.act,
             call.bias,
@@ -855,9 +869,10 @@ impl Device {
             charge,
         );
         // A shape the few-rows kernel may serve keys apart from the one it
-        // may not.
+        // may not, and one it serves over a cluster apart again.
         let key = if rows_tried(call, self.rows_m) {
-            key ^ 0x726f_7773_0000_0000 ^ u64::from(self.rows_m)
+            let cluster = rows_cluster(call.n, call.k);
+            key ^ 0x726f_7773_0000_0000 ^ u64::from(self.rows_m) ^ (u64::from(cluster > 1) << 8)
         } else {
             key
         };
@@ -990,51 +1005,61 @@ fn tune(
             "dense gemm bench"
         );
         // A captured step pays a split's reduce its own launch, which a
-        // lone timing hides (`kernel.gemm.split_launch_ns`); `cublasGemmEx`
-        // picks its own algorithm, a split one as likely, so it is charged
-        // too.
+        // lone timing hides (`kernel.gemm.split_launch_ns`); under the
+        // in-place scheme too, a `splitKreduce_kernel` follows the split
+        // (B200, cuBLAS 13). `cublasGemmEx` picks its own algorithm, a split
+        // one as likely, so it is charged too.
         let two = match candidate {
-            Tactic::Lt(i) => plan.is_some_and(|p| !one_launch(&p.heuristics[i].algo)),
+            Tactic::Lt(i) => plan.is_some_and(|p| splits_of(&p.heuristics[i].algo) > 1),
             Tactic::GemmEx => true,
             Tactic::Gemv | Tactic::Narrow | Tactic::Rows => false,
         };
-        let ms = if two { ms + split_ns as f32 * 1e-6 } else { ms };
-        timings.push((candidate, ms));
+        let charge = if two { split_ns as f32 * 1e-6 } else { 0.0 };
+        timings.push((candidate, ms + charge, charge));
     }
     let fastest = timings
         .iter()
-        .fold(f32::INFINITY, |best, &(_, ms)| best.min(ms));
-    for &(candidate, ms) in &timings {
-        if ms <= fastest / 0.98 {
-            return candidate;
+        .fold(f32::INFINITY, |best, &(_, ms, _)| best.min(ms));
+    // One pass leaves a plateau of near-equal tactics ordered by noise: the
+    // first few within reach of the fastest are timed again in turns (a
+    // drift in the device's speed falling on each alike), and of those whose
+    // medians tie the earliest (cuBLAS's own ranking) is kept.
+    let mut finals: Vec<(Tactic, f32, Vec<f32>)> = timings
+        .iter()
+        .filter(|&&(_, ms, _)| ms <= fastest * FINAL_REACH)
+        .take(FINALISTS)
+        .map(|&(candidate, ms, charge)| (candidate, charge, vec![ms]))
+        .collect();
+    if finals.len() > 1 {
+        for _ in 0..FINAL_ROUNDS {
+            for (candidate, charge, samples) in &mut finals {
+                if let Some(ms) = arena.time(*candidate, lt.handle, plan, call) {
+                    samples.push(ms + *charge);
+                }
+            }
         }
     }
-    candidates[0]
+    let medians: Vec<(Tactic, f32)> = finals
+        .into_iter()
+        .map(|(candidate, _, mut samples)| {
+            samples.sort_by(f32::total_cmp);
+            (candidate, samples[samples.len() / 2])
+        })
+        .collect();
+    let best = medians.iter().fold(f32::INFINITY, |b, &(_, ms)| b.min(ms));
+    medians
+        .iter()
+        .find(|&&(_, ms)| ms <= best * FINAL_TIE)
+        .map_or(candidates[0], |&(candidate, _)| candidate)
 }
 
-/// Whether an algorithm runs in one launch: it does not split K, or
-/// reduces its splits in place.
-fn one_launch(algo: &lt::cublasLtMatmulAlgo_t) -> bool {
-    if splits_of(algo) == 1 {
-        return true;
-    }
-    let mut scheme: u32 = 0;
-    let mut written: usize = 0;
-    let asked = unsafe {
-        lt::cublasLtMatmulAlgoConfigGetAttribute(
-            std::ptr::from_ref(algo),
-            lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
-            std::ptr::from_mut(&mut scheme).cast(),
-            std::mem::size_of::<u32>(),
-            &raw mut written,
-        )
-    };
-    if asked != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-        clear_error();
-        return false;
-    }
-    scheme == lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_INPLACE as u32
-}
+/// A tactic within this factor of the fastest's first timing is a finalist,
+/// the first this many such, each timed this many times more; finalists'
+/// medians within the last factor of the best tie.
+const FINAL_REACH: f32 = 1.05;
+const FINALISTS: usize = 8;
+const FINAL_ROUNDS: usize = 4;
+const FINAL_TIE: f32 = 1.02;
 
 /// An algorithm's K splits (1 when it does not split K).
 fn splits_of(algo: &lt::cublasLtMatmulAlgo_t) -> i32 {
@@ -1068,6 +1093,8 @@ struct TuneArena {
     workspace_bytes: usize,
     flush: *mut c_void,
     flush_bytes: usize,
+    /// The evictions' span alone, timed once.
+    alone: std::cell::Cell<Option<f32>>,
 }
 
 impl Drop for TuneArena {
@@ -1116,6 +1143,7 @@ impl TuneArena {
             workspace_bytes: 0,
             flush: std::ptr::null_mut(),
             flush_bytes: 0,
+            alone: std::cell::Cell::new(None),
         }
     }
 
@@ -1160,6 +1188,8 @@ impl TuneArena {
         self.handle = caller;
         let filled = unsafe {
             cudaMemsetAsync(self.act, 0x3C, act_bytes, self.stream.cast()) == cudaError::cudaSuccess
+                // Once outside a capture, its kernel loaded here.
+                && self.evict()
                 && cudaMemsetAsync(self.y, 0x3C, y_bytes, self.stream.cast())
                     == cudaError::cudaSuccess
                 && cudaStreamSynchronize(self.stream.cast()) == cudaError::cudaSuccess
@@ -1169,6 +1199,30 @@ impl TuneArena {
             return false;
         }
         true
+    }
+
+    /// Reads the flush slab through a cuBLAS product of one row (its rows,
+    /// each dot landing past them), so the timed product starts on an L2 of
+    /// clean lines another kernel's weights left, as in a step: a memset
+    /// leaves it dirty, every eviction a write-back the product pays.
+    fn evict(&self) -> bool {
+        const K: usize = 8192;
+        let rows = self.flush_bytes / (2 * K + 2);
+        let at = self.flush.addr() as u64;
+        let call = Call {
+            act: at,
+            w: at,
+            bias: 0,
+            y: at + (rows * 2 * K) as u64,
+            m: 1,
+            n: rows as i32,
+            k: K as i32,
+        };
+        gemm_ex(
+            self.handle,
+            call,
+            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        ) == cublasStatus_t::CUBLAS_STATUS_SUCCESS
     }
 
     fn time(
@@ -1194,7 +1248,7 @@ impl TuneArena {
                 bench,
                 self.workspace,
                 self.workspace_bytes,
-                false,
+                crate::tuning::Tuning::DEFAULT,
             )
         };
         let stream = self.stream.cast();
@@ -1207,7 +1261,25 @@ impl TuneArena {
             clear_error();
             return None;
         }
+        // The product's share of a run of evicted products, past the
+        // evictions alone: the device's timer steps some 2 us, coarser than
+        // the tactics' gaps, so one product a span reads as a tie.
+        let alone = match self.alone.get() {
+            Some(alone) => alone,
+            None => {
+                let alone = self.span(&|| true)?;
+                self.alone.set(Some(alone));
+                alone
+            }
+        };
+        let with = self.span(&fire)?;
+        Some((with - alone).max(0.0) / REPS as f32)
+    }
 
+    /// The least of a few timings (ms) of `REPS` evictions, each followed by
+    /// `body`, captured as one graph.
+    fn span(&self, body: &dyn Fn() -> bool) -> Option<f32> {
+        let stream = self.stream.cast();
         let mut graph: cudaGraph_t = std::ptr::null_mut();
         let mut exec: cudaGraphExec_t = std::ptr::null_mut();
         let captured = unsafe {
@@ -1215,11 +1287,9 @@ impl TuneArena {
                 stream,
                 cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal,
             ) == cudaError::cudaSuccess
-                && cudaMemsetAsync(self.flush, 0, self.flush_bytes, stream)
-                    == cudaError::cudaSuccess
                 && cudaEventRecordWithFlags(self.start, stream, cudaEventRecordExternal)
                     == cudaError::cudaSuccess
-                && fire()
+                && (0..REPS).all(|_| self.evict() && body())
                 && cudaEventRecordWithFlags(self.stop, stream, cudaEventRecordExternal)
                     == cudaError::cudaSuccess
         };
@@ -1240,9 +1310,8 @@ impl TuneArena {
             clear_error();
             return None;
         }
-
         let mut best: Option<f32> = None;
-        for round in 0..10 {
+        for round in 0..ROUNDS {
             if unsafe { cudaGraphLaunch(exec, stream) } != cudaError::cudaSuccess
                 || unsafe { cudaEventSynchronize(self.stop) } != cudaError::cudaSuccess
             {
@@ -1251,7 +1320,7 @@ impl TuneArena {
                 clear_error();
                 return None;
             }
-            if round < 3 {
+            if round == 0 {
                 continue;
             }
             let mut ms = 0.0f32;
@@ -1271,6 +1340,10 @@ impl TuneArena {
         best
     }
 }
+
+/// Evicted products a timed span, and the spans timed (the first a warm-up).
+const REPS: usize = 4;
+const ROUNDS: usize = 3;
 
 fn flush_bytes() -> usize {
     const FALLBACK: usize = 64 << 20;
@@ -1383,7 +1456,7 @@ fn signature() -> String {
         .to_string_lossy()
         .into_owned();
     format!(
-        "# pie-dense-gemm v6 sm{}{} cublas={version} dev={name}",
+        "# pie-dense-gemm v7 sm{}{} cublas={version} dev={name}",
         prop.major, prop.minor
     )
 }

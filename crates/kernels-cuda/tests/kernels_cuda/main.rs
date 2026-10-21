@@ -25,6 +25,7 @@ mod the_hyper_connection_answers_the_host;
 mod the_indexers_select_their_best_blocks;
 mod the_inkling_points_answer_their_host_reference;
 mod the_interleaved_mrope_turns_the_rotary_prefix_as_its_own_head;
+mod the_mamba2_scan_and_step_answer_the_serial_recurrence;
 mod the_mla_append_lands_each_request_in_its_own_pages;
 mod the_mla_prefill_ada_arm_answers_the_reference;
 mod the_mla_scores_land_their_log_sum_exp;
@@ -45,6 +46,7 @@ mod the_spatial_attention_answers_the_cpu_reference;
 mod the_spatial_attention_segments_by_frame;
 mod the_tcgen05_epilogues_land_quantized_rows;
 mod the_tcgen05_gemms_answer_the_dequantized_dot;
+mod the_tiled_decode_point_lands_alike_on_the_tensor_cores;
 mod the_voxel_reshapes_land_the_reference_ordering;
 mod the_word_gather_lands_each_run_where_its_table_says;
 

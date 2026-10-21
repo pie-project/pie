@@ -55,6 +55,7 @@ impl HybridSpec {
             space: space.0,
             window,
             head_dim,
+            live: None,
             shard: Shard::Replicated,
         });
         DeclaredCache(self.rows.last_mut().expect("a row was just pushed"))
@@ -80,6 +81,15 @@ impl HybridSpec {
 pub struct DeclaredCache<'a>(&'a mut CacheRow);
 
 impl DeclaredCache<'_> {
+    /// The kv row's heads are zero-padded past `key` and `value` values.
+    pub fn live(&mut self, key: u32, value: u32) -> &mut Self {
+        let CacheRow::Kv { live, .. } = &mut *self.0 else {
+            panic!("only a kv row holds heads");
+        };
+        *live = Some([key, value]);
+        self
+    }
+
     /// The kv row's planes hold heads, which the ranks split between them.
     pub fn heads(self) {
         let CacheRow::Kv { planes, shard, .. } = self.0 else {
@@ -397,6 +407,15 @@ impl Input {
     #[must_use]
     pub fn route_hints(&self) -> bool {
         self.rec.platform() != Platform::Cuda
+    }
+
+    /// Whether a decode attention takes readout rows for its queries, each
+    /// attending as the token it reads out. Metal seats each readout's
+    /// position and lane beside the tokens'; the other backends attend only
+    /// token rows, so a forward keeps every row for them.
+    #[must_use]
+    pub fn readout_attention(&self) -> bool {
+        self.rec.platform() == Platform::Metal
     }
 
     #[must_use]

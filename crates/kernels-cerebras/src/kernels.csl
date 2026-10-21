@@ -1,0 +1,1884 @@
+// The kernel library: every op as one function over pointers and runtime
+// sizes, so a program's phases are calls and its code size does not grow
+// with the number of ops in a fire. Sections are split on `// @@ name` and
+// included by name from Rust (`crate::library`).
+
+// @@ k_prelude
+var k_dummy_f32: [1]f32;
+var k_dummy_u32: [1]u32;
+const k_base_f32 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> k_dummy_f32[i] });
+const k_base_u32 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> k_dummy_u32[i] });
+
+// Rounds n f32 values at p to bf16 (nearest even) in place.
+fn k_round_bf16(p: [*]f32, n: i32) void {
+  var i: i32 = 0;
+  while (i < n) : (i += 1) {
+    var u: u32 = @bitcast(u32, p[i]);
+    u = u + 0x7FFF + ((u >> 16) & 1);
+    u = u & 0xFFFF0000;
+    p[i] = @bitcast(f32, u);
+  }
+}
+
+// Copies n f32 values from src[soff..] to dst[doff..].
+fn k_copy(dst: [*]f32, doff: i32, src: [*]f32, soff: i32, n: i32) void {
+  var d = @set_dsd_base_addr(k_base_f32, dst);
+  d = @set_dsd_length(d, @bitcast(u16, @as(i16, n)));
+  d = @increment_dsd_offset(d, @as(i16, doff), f32);
+  var s = @set_dsd_base_addr(k_base_f32, src);
+  s = @set_dsd_length(s, @bitcast(u16, @as(i16, n)));
+  s = @increment_dsd_offset(s, @as(i16, soff), f32);
+  @fmovs(d, s);
+}
+
+// Copies n u32 words from src[soff..] to dst[doff..].
+fn k_copy_u32(dst: [*]u32, doff: i32, src: [*]u32, soff: i32, n: i32) void {
+  var d = @set_dsd_base_addr(k_base_u32, dst);
+  d = @set_dsd_length(d, @bitcast(u16, @as(i16, n)));
+  d = @increment_dsd_offset(d, @as(i16, doff), u32);
+  var s = @set_dsd_base_addr(k_base_u32, src);
+  s = @set_dsd_length(s, @bitcast(u16, @as(i16, n)));
+  s = @increment_dsd_offset(s, @as(i16, soff), u32);
+  @mov32(d, s);
+}
+
+// dot(a[aoff..aoff+n], b[boff..boff+n]): per chunk of up to 256, the
+// products by one vector multiply into scratch, then a halving tree of
+// vector adds down to one word. (A reduction into a scalar,
+// `@fadds(&s, s, dsd)`, folds its start value when the compiler knows it
+// and then keeps only the last element, SDK 2.10; the tree never does.)
+const K_DOT_CHUNK: i32 = 256;
+var k_dot_tmp = @zeros([256]f32);
+fn k_dot(a: [*]f32, aoff: i32, b: [*]f32, boff: i32, n: i32) f32 {
+  var s: f32 = 0.0;
+  var at: i32 = 0;
+  while (at < n) : (at += K_DOT_CHUNK) {
+    var len: i32 = n - at;
+    if (len > K_DOT_CHUNK) { len = K_DOT_CHUNK; }
+    var p: i32 = 1;
+    while (p < len) : (p *= 2) {}
+    var da = @set_dsd_base_addr(k_base_f32, a);
+    da = @set_dsd_length(da, @bitcast(u16, @as(i16, len)));
+    da = @increment_dsd_offset(da, @as(i16, aoff + at), f32);
+    var db = @set_dsd_base_addr(k_base_f32, b);
+    db = @set_dsd_length(db, @bitcast(u16, @as(i16, len)));
+    db = @increment_dsd_offset(db, @as(i16, boff + at), f32);
+    var dt = @set_dsd_base_addr(k_base_f32, @ptrcast([*]f32, &k_dot_tmp));
+    dt = @set_dsd_length(dt, @bitcast(u16, @as(i16, len)));
+    @fmuls(dt, da, db);
+    if (p > len) {
+      var dz = @set_dsd_base_addr(k_base_f32, @ptrcast([*]f32, &k_dot_tmp));
+      dz = @set_dsd_length(dz, @bitcast(u16, @as(i16, p - len)));
+      dz = @increment_dsd_offset(dz, @as(i16, len), f32);
+      @fmuls(dz, dz, 0.0);
+    }
+    var h: i32 = p / 2;
+    while (h >= 1) : (h /= 2) {
+      var lo = @set_dsd_base_addr(k_base_f32, @ptrcast([*]f32, &k_dot_tmp));
+      lo = @set_dsd_length(lo, @bitcast(u16, @as(i16, h)));
+      var hi = @set_dsd_base_addr(k_base_f32, @ptrcast([*]f32, &k_dot_tmp));
+      hi = @set_dsd_length(hi, @bitcast(u16, @as(i16, h)));
+      hi = @increment_dsd_offset(hi, @as(i16, h), f32);
+      @fadds(lo, lo, hi);
+    }
+    s = s + k_dot_tmp[0];
+  }
+  return s;
+}
+
+// @@ k_residual_add
+// y[i] += x[i] for i < n.
+fn k_residual_add(x: [*]f32, y: [*]f32, n: i32) void {
+  var dx = @set_dsd_base_addr(k_base_f32, x);
+  dx = @set_dsd_length(dx, @bitcast(u16, @as(i16, n)));
+  var dy = @set_dsd_base_addr(k_base_f32, y);
+  dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, n)));
+  @fadds(dy, dy, dx);
+}
+
+// @@ k_rmsnorm
+// Every width-wide run r of x: y = x * rsqrt(mean(x^2) + eps) * (w or 1 + w).
+fn k_rmsnorm(x: [*]f32, w: [*]f32, y: [*]f32, runs: i32, width: i32, eps: f32, plus_one: bool) void {
+  var dw = @set_dsd_base_addr(k_base_f32, w);
+  dw = @set_dsd_length(dw, @bitcast(u16, @as(i16, width)));
+  var r: i32 = 0;
+  while (r < runs) : (r += 1) {
+    var base: i32 = r * width;
+    var ss: f32 = k_dot(x, base, x, base, width);
+    var inv: f32 = 1.0 / math.sqrt_f32(ss / @as(f32, width) + eps);
+    var dx = @set_dsd_base_addr(k_base_f32, x);
+    dx = @set_dsd_length(dx, @bitcast(u16, @as(i16, width)));
+    dx = @increment_dsd_offset(dx, @as(i16, base), f32);
+    var dy = @set_dsd_base_addr(k_base_f32, y);
+    dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, width)));
+    dy = @increment_dsd_offset(dy, @as(i16, base), f32);
+    @fmuls(dy, dx, inv);
+    if (plus_one) {
+      // y = y * w + y
+      var i: i32 = 0;
+      while (i < width) : (i += 1) {
+        y[base + i] = y[base + i] * (w[i] + 1.0);
+      }
+    } else {
+      @fmuls(dy, dy, dw);
+    }
+  }
+}
+
+// @@ k_rowsq
+// ss[r] = sum of squares of row r of x (rows of width).
+fn k_rowsq(x: [*]f32, ss: [*]f32, rows: i32, width: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    ss[r] = k_dot(x, r * width, x, r * width, width);
+  }
+}
+
+// @@ k_rmsnorm_scaled
+// y = x * rsqrt(mean of squares + eps) * w over rows of a column block:
+// the sums of squares of each row's `parts` blocks sit in ss[r * parts ..].
+fn k_rmsnorm_scaled(x: [*]f32, w: [*]f32, ss: [*]f32, y: [*]f32, rows: i32, width: i32, parts: i32, full: i32, eps: f32, plus_one: bool) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var total: f32 = 0.0;
+    var c: i32 = 0;
+    while (c < parts) : (c += 1) { total = total + ss[r * parts + c]; }
+    var inv: f32 = 1.0 / math.sqrt_f32(total / @as(f32, full) + eps);
+    var base: i32 = r * width;
+    var i: i32 = 0;
+    while (i < width) : (i += 1) {
+      var g: f32 = w[i];
+      if (plus_one) { g = g + 1.0; }
+      y[base + i] = x[base + i] * inv * g;
+    }
+  }
+}
+
+// @@ k_rmsnorm_gated
+fn k_sig_gate(v: f32, z: f32) f32 {
+  return v / (1.0 + math.exp_f32(-z));
+}
+fn k_silu_gate(v: f32, z: f32) f32 {
+  return v * z / (1.0 + math.exp_f32(-z));
+}
+// Every width-wide run: y = x * rsqrt(mean(x^2) + eps) * w * gate(z).
+fn k_rmsnorm_gated(x: [*]f32, z: [*]f32, w: [*]f32, y: [*]f32, runs: i32, width: i32, eps: f32, sigmoid: bool) void {
+  var dw = @set_dsd_base_addr(k_base_f32, w);
+  dw = @set_dsd_length(dw, @bitcast(u16, @as(i16, width)));
+  var r: i32 = 0;
+  while (r < runs) : (r += 1) {
+    var base: i32 = r * width;
+    var ss: f32 = k_dot(x, base, x, base, width);
+    var inv: f32 = 1.0 / math.sqrt_f32(ss / @as(f32, width) + eps);
+    var dx = @set_dsd_base_addr(k_base_f32, x);
+    dx = @set_dsd_length(dx, @bitcast(u16, @as(i16, width)));
+    dx = @increment_dsd_offset(dx, @as(i16, base), f32);
+    var dz = @set_dsd_base_addr(k_base_f32, z);
+    dz = @set_dsd_length(dz, @bitcast(u16, @as(i16, width)));
+    dz = @increment_dsd_offset(dz, @as(i16, base), f32);
+    var dy = @set_dsd_base_addr(k_base_f32, y);
+    dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, width)));
+    dy = @increment_dsd_offset(dy, @as(i16, base), f32);
+    @fmuls(dy, dx, inv);
+    @fmuls(dy, dy, dw);
+    if (sigmoid) {
+      @map(k_sig_gate, dy, dz, dy);
+    } else {
+      @map(k_silu_gate, dy, dz, dy);
+    }
+  }
+}
+
+// @@ k_matmul
+// y[m, n] = sum_k a[m, k] * w[n, k]; a is [m, k], w is [n, k], y is [m, n].
+fn k_matmul(a: [*]f32, w: [*]f32, y: [*]f32, m: i32, k: i32, n: i32) void {
+  var i: i32 = 0;
+  while (i < m) : (i += 1) {
+    var j: i32 = 0;
+    while (j < n) : (j += 1) {
+      y[i * n + j] = k_dot(a, i * k, w, j * k, k);
+    }
+  }
+}
+
+// @@ k_swiglu
+fn k_silu_mul(g: f32, u: f32) f32 {
+  return g / (1.0 + math.exp_f32(-g)) * u;
+}
+// y = silu(g) * u where packed rows are [g | u], each inter wide.
+fn k_swiglu(pk: [*]f32, y: [*]f32, rows: i32, inter: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var dg = @set_dsd_base_addr(k_base_f32, pk);
+    dg = @set_dsd_length(dg, @bitcast(u16, @as(i16, inter)));
+    dg = @increment_dsd_offset(dg, @as(i16, r * 2 * inter), f32);
+    var du = @set_dsd_base_addr(k_base_f32, pk);
+    du = @set_dsd_length(du, @bitcast(u16, @as(i16, inter)));
+    du = @increment_dsd_offset(du, @as(i16, r * 2 * inter + inter), f32);
+    var dy = @set_dsd_base_addr(k_base_f32, y);
+    dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, inter)));
+    dy = @increment_dsd_offset(dy, @as(i16, r * inter), f32);
+    @map(k_silu_mul, dg, du, dy);
+  }
+}
+
+// @@ k_rope
+// NeoX rotation of the first 2*half lanes of every head of v, in place.
+fn k_rope(v: [*]f32, pos: [*]i32, inv_freq: [*]f32, rows: i32, width: i32, head_dim: i32, half: i32) void {
+  var heads: i32 = width / head_dim;
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var p: f32 = @as(f32, pos[r]);
+    var h: i32 = 0;
+    while (h < heads) : (h += 1) {
+      var base: i32 = r * width + h * head_dim;
+      var i: i32 = 0;
+      while (i < half) : (i += 1) {
+        var ang: f32 = p * inv_freq[i];
+        var c: f32 = math.cos_f32(ang);
+        var s: f32 = math.sin_f32(ang);
+        var lo: i32 = base + i;
+        var hi: i32 = lo + half;
+        var x1: f32 = v[lo];
+        var x2: f32 = v[hi];
+        v[lo] = x1 * c - x2 * s;
+        v[hi] = x1 * s + x2 * c;
+      }
+    }
+  }
+}
+
+// @@ k_sigmoid_mul
+fn k_sig_mul(x: f32, g: f32) f32 {
+  return x / (1.0 + math.exp_f32(-g));
+}
+// x[i] *= sigmoid(g[i]) for i < n.
+fn k_sigmoid_mul(x: [*]f32, g: [*]f32, n: i32) void {
+  var dx = @set_dsd_base_addr(k_base_f32, x);
+  dx = @set_dsd_length(dx, @bitcast(u16, @as(i16, n)));
+  var dg = @set_dsd_base_addr(k_base_f32, g);
+  dg = @set_dsd_length(dg, @bitcast(u16, @as(i16, n)));
+  @map(k_sig_mul, dx, dg, dx);
+}
+
+// @@ k_gather_rows
+// tight[i] = wide[clamp(index[i], 0, last)].
+fn k_gather_rows(wide: [*]f32, index: [*]i32, tight: [*]f32, rows: i32, width: i32, last: i32) void {
+  var i: i32 = 0;
+  while (i < rows) : (i += 1) {
+    var idx: i32 = index[i];
+    if (idx < 0) { idx = 0; } else if (idx > last) { idx = last; }
+    k_copy(tight, i * width, wide, idx * width, width);
+  }
+}
+
+// @@ k_scatter_live_rows
+// y[routes[i]] = src[i] for routes inside [0, yrows).
+fn k_scatter_live_rows(src: [*]f32, routes: [*]i32, y: [*]f32, rows: i32, width: i32, yrows: i32) void {
+  var i: i32 = 0;
+  while (i < rows) : (i += 1) {
+    var route: i32 = routes[i];
+    if (route >= 0 and route < yrows) {
+      k_copy(y, route * width, src, i * width, width);
+    }
+  }
+}
+
+// @@ k_kv_append
+// Rows [r0, r1) of k (and v) land in pool row page[i] * ps + off[i]; out of range drops.
+fn k_kv_append(k: [*]f32, v: [*]f32, keys: [*]f32, values: [*]f32, page: [*]i32, off: [*]i32, r0: i32, r1: i32, w: i32, ps: i32, pages: i32, shared: bool) void {
+  var i: i32 = r0;
+  while (i < r1) : (i += 1) {
+    var pg: i32 = page[i];
+    var o: i32 = off[i];
+    if (pg >= 0 and pg < pages and o >= 0 and o < ps) {
+      var slot: i32 = pg * ps + o;
+      k_copy(keys, slot * w, k, i * w, w);
+      if (!shared) {
+        k_copy(values, slot * w, v, i * w, w);
+      }
+    }
+  }
+}
+
+// @@ k_attend
+// Paged attention over rows [r0, r1) of q: see kernels-cerebras attn::paged.
+fn k_attend(q: [*]f32, keys: [*]f32, values: [*]f32, idx: [*]i32, ptr: [*]i32, pos: [*]i32, req: [*]i32, en: [*]u32, mask: [*]u32, o: [*]f32, lse: [*]f32, acc: [*]f32, mrow: [*]u32,
+            sel: [*]i32, sblk: [*]u32, top_k: i32, ratio: i32,
+            r0: i32, r1: i32, kp0: i32, kh0: i32, kh1: i32, pr0: i32, pr1: i32, group: i32, d: i32, ps: i32, span: i32, mask_w: i32, mask_width: i32, scale: f32, window: i32, causal: bool, lanes: i32, has_lse: bool) void {
+  // A block selection (ratio > 0): row r reads the keys of the `ratio`-wide
+  // blocks its sel[r, 0..top_k) names among the closed blocks
+  // [0, (qpos + 1) / ratio), and every key of the open block after them.
+  var nblk_max: i32 = 0;
+  if (ratio > 0) { nblk_max = span / ratio + 1; }
+  // Of each page this PE holds rows [pr0, pr1) (row groups): its local
+  // pages are (pr1 - pr0) rows tall and it attends just those positions.
+  var psl: i32 = pr1 - pr0;
+  // This PE's pages hold the lane's keys from position kp0 on (page groups)
+  // and kv heads [kh0, kh1) of them (head groups): its key rows are
+  // (kh1 - kh0) * d wide, and its q, o and lse rows hold just the query
+  // heads of those kv heads.
+  var kwl: i32 = (kh1 - kh0) * d;
+  var h0: i32 = kh0 * group;
+  var h1: i32 = kh1 * group;
+  var lw: i32 = h1 - h0;
+  var dacc = @set_dsd_base_addr(k_base_f32, acc);
+  dacc = @set_dsd_length(dacc, @bitcast(u16, @as(i16, d)));
+  var r: i32 = r0;
+  while (r < r1) : (r += 1) {
+    var lane: i32 = req[r];
+    if (lane < 0) { lane = 0; } else if (lane >= lanes) { lane = lanes - 1; }
+    var qpos: i32 = pos[r];
+    var first_page: i32 = ptr[lane];
+    var count: i32 = ptr[lane + 1] - first_page;
+    var cap: i32 = kp0 + count * ps;
+    if (cap > span) { cap = span; }
+    var flag: u32 = en[r];
+    var hi: i32 = cap;
+    var wide: bool = !causal or flag == 2;
+    if (!wide) { hi = qpos + 1; if (hi > cap) { hi = cap; } }
+    var lo: i32 = 0;
+    if (window > 0 and qpos >= window) { lo = qpos - window + 1; }
+    if (lo < kp0) { lo = kp0; }
+    if (hi < lo) { hi = lo; }
+    if (flag != 0 and mask_w > 0) {
+      k_copy_u32(mrow, 0, mask, r * mask_width, mask_w);
+    }
+    var nblocks: i32 = 0;
+    if (ratio > 0) {
+      if (qpos + 1 > 0) { nblocks = (qpos + 1) / ratio; }
+      if (nblocks > nblk_max) { nblocks = nblk_max; }
+      var bi: i32 = 0;
+      while (bi < nblocks) : (bi += 1) { sblk[bi] = 0; }
+      var si: i32 = 0;
+      while (si < top_k) : (si += 1) {
+        var sb: i32 = sel[r * top_k + si];
+        if (sb >= 0 and sb < nblocks) { sblk[sb] = 1; }
+      }
+    }
+    var h: i32 = h0;
+    while (h < h1) : (h += 1) {
+      var kh: i32 = h / group;
+      var head: i32 = r * lw + (h - h0);
+      var qoff: i32 = head * d;
+      var m: f32 = 0.0;
+      var l: f32 = 0.0;
+      var any: bool = false;
+      var kp: i32 = 0;
+      while (kp < hi) : (kp += 1) {
+        if (kp < lo) { continue; }
+        if (flag != 0) {
+          if (kp >= mask_w) { continue; }
+          if (mrow[kp] == 0) { continue; }
+        }
+        if (ratio > 0) {
+          var blk: i32 = kp / ratio;
+          if (blk < nblocks and sblk[blk] == 0) { continue; }
+        }
+        var prow: i32 = (kp - kp0) % ps;
+        if (prow < pr0 or prow >= pr1) { continue; }
+        var page: i32 = idx[first_page + (kp - kp0) / ps];
+        if (page < 0) { continue; }
+        var slot: i32 = page * psl + (prow - pr0);
+        var koff: i32 = slot * kwl + (kh - kh0) * d;
+        var s: f32 = k_dot(q, qoff, keys, koff, d) * scale;
+        var dv = @set_dsd_base_addr(k_base_f32, values);
+        dv = @set_dsd_length(dv, @bitcast(u16, @as(i16, d)));
+        dv = @increment_dsd_offset(dv, @as(i16, koff), f32);
+        if (!any) {
+          any = true;
+          m = s;
+          l = 1.0;
+          @fmovs(dacc, dv);
+        } else if (s > m) {
+          var alpha: f32 = math.exp_f32(m - s);
+          l = l * alpha + 1.0;
+          @fmuls(dacc, dacc, alpha);
+          @fadds(dacc, dacc, dv);
+          m = s;
+        } else {
+          var p: f32 = math.exp_f32(s - m);
+          l = l + p;
+          @fmacs(dacc, dacc, dv, p);
+        }
+      }
+      var dout = @set_dsd_base_addr(k_base_f32, o);
+      dout = @set_dsd_length(dout, @bitcast(u16, @as(i16, d)));
+      dout = @increment_dsd_offset(dout, @as(i16, qoff), f32);
+      if (any) {
+        @fmuls(dout, dacc, 1.0 / l);
+        if (has_lse) { lse[head] = (m + math.log_f32(l)) * 1.4426950408889634; }
+      } else {
+        var i: i32 = 0;
+        while (i < d) : (i += 1) { o[qoff + i] = 0.0; }
+        if (has_lse) { lse[head] = @bitcast(f32, @as(u32, 0xFF800000)); }
+      }
+    }
+  }
+}
+
+// @@ k_conv1d
+fn k_silu(z: f32) f32 {
+  return z / (1.0 + math.exp_f32(-z));
+}
+// The causal conv over lanes [l0, l1) and channels [ch0, ch1): per lane,
+// y = silu(conv(win ++ x rows)), then the window rolls to the last hist
+// rows. per_row: one row per lane, slot slots[l]; else lanes from indptr
+// with slot slots[indptr[l]]. The bank holds, per local slot, hist rows of
+// the block's channels (stride = hist * (ch1 - ch0)); x, y, w are global.
+fn k_conv1d(x: [*]f32, w: [*]f32, bank: [*]f32, slots: [*]i32, indptr: [*]i32, y: [*]f32, win: [*]f32,
+            l0: i32, l1: i32, ch0: i32, ch1: i32, per_row: bool, c: i32, hist: i32, width: i32, dil: i32, slots_rows: i32, sharded: bool) void {
+  var cb: i32 = ch1 - ch0;
+  var stride: i32 = hist * cb;
+  // x and y rows are `c` wide and w has `c` rows, or just this PE's `cb`
+  // channels when sharded.
+  var xw: i32 = c;
+  var xoff: i32 = 0;
+  if (sharded) { xw = cb; xoff = ch0; }
+  var l: i32 = l0;
+  while (l < l1) : (l += 1) {
+    var start: i32 = l;
+    var n: i32 = 1;
+    var slot: i32 = 0;
+    if (per_row) {
+      slot = slots[l];
+    } else {
+      start = indptr[l];
+      n = indptr[l + 1] - start;
+      if (n > 0) { slot = slots[start]; }
+    }
+    if (n > 0 and slot >= 0 and slot < slots_rows) {
+      k_copy(win, 0, bank, slot * stride, stride);
+      var t: i32 = 0;
+      while (t < n) : (t += 1) {
+        var ch: i32 = ch0;
+        while (ch < ch1) : (ch += 1) {
+          var acc: f32 = 0.0;
+          var tap: i32 = 0;
+          while (tap < width) : (tap += 1) {
+            var src: i32 = t - (width - 1 - tap) * dil;
+            var val: f32 = 0.0;
+            if (src < 0) { val = win[(hist + src) * cb + (ch - ch0)]; } else { val = x[(start + src) * xw + (ch - xoff)]; }
+            acc = acc + val * w[(ch - xoff) * width + tap];
+          }
+          y[(start + t) * xw + (ch - xoff)] = k_silu(acc);
+        }
+      }
+      var s: i32 = 0;
+      while (s < hist) : (s += 1) {
+        var src: i32 = n - hist + s;
+        var ch: i32 = ch0;
+        while (ch < ch1) : (ch += 1) {
+          var val: f32 = 0.0;
+          if (src < 0) { val = win[(hist + src) * cb + (ch - ch0)]; } else { val = x[(start + src) * xw + (ch - xoff)]; }
+          win[s * cb + (ch - ch0)] = val;
+        }
+      }
+      k_copy(bank, slot * stride, win, 0, stride);
+    }
+  }
+}
+
+// @@ k_gdn_prep
+fn k_softplus(z: f32) f32 {
+  if (z > 20.0) { return z; }
+  return math.log_f32(1.0 + math.exp_f32(z));
+}
+// [b | a] -> [g_log | beta]: g = -exp(a_log) * softplus(a + dt_bias), beta = sigmoid(b).
+fn k_gdn_prep(ba: [*]f32, dt: [*]f32, alog: [*]f32, gates: [*]f32, rows: i32, hv: i32) void {
+  var t: i32 = 0;
+  while (t < rows) : (t += 1) {
+    var row: i32 = t * 2 * hv;
+    var h: i32 = 0;
+    while (h < hv) : (h += 1) {
+      var bv: f32 = ba[row + h];
+      var av: f32 = ba[row + hv + h];
+      gates[row + h] = -math.exp_f32(alog[h]) * k_softplus(av + dt[h]);
+      gates[row + hv + h] = 1.0 / (1.0 + math.exp_f32(-bv));
+    }
+  }
+}
+
+// @@ k_delta
+// The gated delta rule over lanes [l0, l1), value heads [h0, h1) and state
+// rows [c0, c1) (see kernels-cerebras attn::ssm). The bank holds, per local
+// slot, the block's rows: (h - h0) * (c1 - c0) + (c - c0) rows of dk.
+fn k_delta(qkv: [*]f32, gates: [*]f32, slots: [*]i32, indptr: [*]i32, bank: [*]f32, y: [*]f32, qn: [*]f32, kn: [*]f32,
+           l0: i32, l1: i32, h0: i32, h1: i32, c0: i32, c1: i32, per_row: bool, hk: i32, hv: i32, dk: i32, dv: i32, width: i32, slots_rows: i32, inv_sqrt_dk: f32, sharded: bool) void {
+  var group: i32 = hv / hk;
+  var cb: i32 = c1 - c0;
+  var stride: i32 = (h1 - h0) * cb * dk;
+  // Whole rows, or (sharded) rows of just this PE's heads: q and k of the k
+  // heads [kh0, kh1), then v cells [h0, h1) x [c0, c1); y likewise.
+  var kh0: i32 = 0;
+  var nq: i32 = hk * dk;
+  var rw: i32 = width;
+  var vb0: i32 = 2 * hk * dk;
+  var vh: i32 = dv;
+  var yw: i32 = hv * dv;
+  var hb: i32 = 0;
+  var cs: i32 = 0;
+  if (sharded) {
+    kh0 = h0 / group;
+    var kh1: i32 = (h1 + group - 1) / group;
+    nq = (kh1 - kh0) * dk;
+    rw = 2 * nq + (h1 - h0) * cb;
+    vb0 = 2 * nq;
+    vh = cb;
+    yw = (h1 - h0) * cb;
+    hb = h0;
+    cs = c0;
+  }
+  var dqn = @set_dsd_base_addr(k_base_f32, qn);
+  dqn = @set_dsd_length(dqn, @bitcast(u16, @as(i16, dk)));
+  var dkn = @set_dsd_base_addr(k_base_f32, kn);
+  dkn = @set_dsd_length(dkn, @bitcast(u16, @as(i16, dk)));
+  var l: i32 = l0;
+  while (l < l1) : (l += 1) {
+    var start: i32 = l;
+    var n: i32 = 1;
+    var slot: i32 = 0;
+    if (per_row) {
+      slot = slots[l];
+    } else {
+      start = indptr[l];
+      n = indptr[l + 1] - start;
+      if (n > 0) { slot = slots[start]; }
+    }
+    if (n > 0 and slot >= 0 and slot < slots_rows) {
+      var sbase: i32 = slot * stride;
+      var i: i32 = 0;
+      while (i < n) : (i += 1) {
+        var t: i32 = start + i;
+        var row: i32 = t * rw;
+        var grow: i32 = t * 2 * hv;
+        var h: i32 = h0;
+        while (h < h1) : (h += 1) {
+          var kh: i32 = h / group;
+          var qoff: i32 = row + (kh - kh0) * dk;
+          var koff: i32 = row + nq + (kh - kh0) * dk;
+          var dq = @set_dsd_base_addr(k_base_f32, qkv);
+          dq = @set_dsd_length(dq, @bitcast(u16, @as(i16, dk)));
+          dq = @increment_dsd_offset(dq, @as(i16, qoff), f32);
+          var dkr = @set_dsd_base_addr(k_base_f32, qkv);
+          dkr = @set_dsd_length(dkr, @bitcast(u16, @as(i16, dk)));
+          dkr = @increment_dsd_offset(dkr, @as(i16, koff), f32);
+          var qq: f32 = k_dot(qkv, qoff, qkv, qoff, dk);
+          @fmuls(dqn, dq, inv_sqrt_dk / math.sqrt_f32(qq + 1e-6));
+          var kk: f32 = k_dot(qkv, koff, qkv, koff, dk);
+          @fmuls(dkn, dkr, 1.0 / math.sqrt_f32(kk + 1e-6));
+          var a: f32 = math.exp_f32(gates[grow + h]);
+          var beta: f32 = gates[grow + hv + h];
+          var vbase: i32 = row + vb0 + (h - hb) * vh - cs;
+          var hbase: i32 = sbase + (h - h0) * cb * dk;
+          var ybase: i32 = t * yw + (h - hb) * vh - cs;
+          var c: i32 = c0;
+          while (c < c1) : (c += 1) {
+            var soff: i32 = hbase + (c - c0) * dk;
+            var ds = @set_dsd_base_addr(k_base_f32, bank);
+            ds = @set_dsd_length(ds, @bitcast(u16, @as(i16, dk)));
+            ds = @increment_dsd_offset(ds, @as(i16, soff), f32);
+            @fmuls(ds, ds, a);
+            var mem: f32 = k_dot(bank, soff, kn, 0, dk);
+            var delta: f32 = (qkv[vbase + c] - mem) * beta;
+            @fmacs(ds, ds, dkn, delta);
+            y[ybase + c] = k_dot(bank, soff, qn, 0, dk);
+          }
+        }
+      }
+    }
+  }
+}
+
+// @@ k_lora
+// y[r] += B[a] (A[a] x[r]) for rows [r0, r1) and a = routes[r] inside [0, adapters).
+fn k_lora(x: [*]f32, a: [*]f32, b: [*]f32, routes: [*]i32, y: [*]f32, waist: [*]f32,
+          r0: i32, r1: i32, o0: i32, o1: i32, k0: i32, k1: i32, xr0: i32, in_w: i32, out_w: i32, rank: i32, adapters: i32, aw: i32, bw: i32, sharded: bool) void {
+  // Whole banks and y rows, or (sharded) this PE's outputs [o0, o1) and
+  // ranks [k0, k1): its down bank rows are [rl][in_w], its up bank rows
+  // [ol][rl], its y rows ol wide, and y gets this PE's partial over its
+  // ranks (the host adds the rank groups up). x holds rows from xr0 on.
+  var rl: i32 = k1 - k0;
+  var ol: i32 = o1 - o0;
+  var awl: i32 = aw;
+  var bwl: i32 = bw;
+  var yw: i32 = out_w;
+  var os: i32 = 0;
+  if (sharded) { awl = rl * in_w; bwl = ol * rl; yw = ol; os = o0; }
+  var r: i32 = r0;
+  while (r < r1) : (r += 1) {
+    var ad: i32 = routes[r];
+    if (ad >= 0 and ad < adapters) {
+      var k: i32 = 0;
+      while (k < rl) : (k += 1) {
+        waist[k] = k_dot(a, ad * awl + k * in_w, x, (r - xr0) * in_w, in_w);
+      }
+      var o: i32 = o0;
+      while (o < o1) : (o += 1) {
+        y[r * yw + (o - os)] = y[r * yw + (o - os)] + k_dot(b, ad * bwl + (o - os) * rl, waist, 0, rl);
+      }
+    }
+  }
+}
+
+// @@ k_lora_down
+// waist[r][k - k0] = dot(A[routes[r]][k][i0..i1], x[r][i0..i1]) for the PE's
+// rows [r0, r1), ranks [k0, k1) and input slice [c0, c1): its down bank
+// slots are [k1 - k0][c1 - c0], its x rows (c1 - c0) wide, its waist rows
+// (k1 - k0) wide (a partial over input slices).
+fn k_lora_down(x: [*]f32, a: [*]f32, routes: [*]i32, waist: [*]f32,
+               r0: i32, r1: i32, k0: i32, k1: i32, c0: i32, c1: i32, adapters: i32) void {
+  var rl: i32 = k1 - k0;
+  var il: i32 = c1 - c0;
+  var r: i32 = r0;
+  while (r < r1) : (r += 1) {
+    var ad: i32 = routes[r];
+    if (ad >= 0 and ad < adapters) {
+      var k: i32 = 0;
+      while (k < rl) : (k += 1) {
+        waist[r * rl + k] = k_dot(a, ad * rl * il + k * il, x, r * il, il);
+      }
+    }
+  }
+}
+
+// @@ k_lora_up
+// y[r][o - o0] += dot(B[routes[r]][o][k0..k1], waist[r][k0..k1]) for the
+// PE's rows [r0, r1), outputs [o0, o1) and ranks [k0, k1): its up bank
+// slots are [o1 - o0][k1 - k0], its waist rows (k1 - k0) wide, its y rows
+// (o1 - o0) wide (a partial over rank groups).
+fn k_lora_up(waist: [*]f32, b: [*]f32, routes: [*]i32, y: [*]f32,
+             r0: i32, r1: i32, o0: i32, o1: i32, k0: i32, k1: i32, adapters: i32) void {
+  var rl: i32 = k1 - k0;
+  var ol: i32 = o1 - o0;
+  var r: i32 = r0;
+  while (r < r1) : (r += 1) {
+    var ad: i32 = routes[r];
+    if (ad >= 0 and ad < adapters) {
+      var o: i32 = 0;
+      while (o < ol) : (o += 1) {
+        y[r * ol + o] = y[r * ol + o] + k_dot(b, ad * ol * rl + o * rl, waist, r * rl, rl);
+      }
+    }
+  }
+}
+
+// @@ k_moe_select
+// y[l][o - o0] = dot(bank[routes[l]][o][c0..c1], x[l / xdiv][c0..c1]) for
+// the PE's lanes (routed pairs) [l0, l1), outputs [o0, o1) and depth
+// [c0, c1); a negative route leaves the row. Whole: x rows k wide, bank
+// experts [n][k], y rows n wide. Sharded: x rows (c1 - c0) wide, bank
+// slots [o1 - o0][c1 - c0], y rows (o1 - o0) wide (a partial over depth).
+fn k_moe_select(x: [*]f32, bank: [*]f32, routes: [*]i32, y: [*]f32,
+                l0: i32, l1: i32, o0: i32, o1: i32, c0: i32, c1: i32, xdiv: i32, n: i32, k: i32, experts: i32, sharded: bool) void {
+  var kl: i32 = c1 - c0;
+  var ol: i32 = o1 - o0;
+  var xw: i32 = k;
+  var yw: i32 = n;
+  var bw: i32 = n * k;
+  var brow: i32 = k;
+  var os: i32 = 0;
+  var cs: i32 = 0;
+  if (sharded) { xw = kl; yw = ol; bw = ol * kl; brow = kl; os = o0; cs = c0; }
+  var l: i32 = l0;
+  while (l < l1) : (l += 1) {
+    var e: i32 = routes[l];
+    if (e >= 0 and e < experts) {
+      var xrow: i32 = (l / xdiv) * xw;
+      var o: i32 = o0;
+      while (o < o1) : (o += 1) {
+        y[l * yw + (o - os)] = k_dot(bank, e * bw + (o - os) * brow, x, xrow, kl);
+      }
+    }
+  }
+}
+
+// @@ k_moe_weighted_sum
+// y[t][j] = sum over s of weights[t][s] * routed[t * top_k + s][j].
+fn k_moe_weighted_sum(routed: [*]f32, weights: [*]f32, y: [*]f32, rows: i32, top_k: i32, width: i32) void {
+  var t: i32 = 0;
+  while (t < rows) : (t += 1) {
+    var dy = @set_dsd_base_addr(k_base_f32, y);
+    dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, width)));
+    dy = @increment_dsd_offset(dy, @as(i16, t * width), f32);
+    @fmuls(dy, dy, 0.0);
+    var s: i32 = 0;
+    while (s < top_k) : (s += 1) {
+      var dr = @set_dsd_base_addr(k_base_f32, routed);
+      dr = @set_dsd_length(dr, @bitcast(u16, @as(i16, width)));
+      dr = @increment_dsd_offset(dr, @as(i16, (t * top_k + s) * width), f32);
+      @fmacs(dy, dy, dr, weights[t * top_k + s]);
+    }
+  }
+}
+
+// @@ k_moe_gate_add
+// y = routed + sigmoid(gate[row]) * shared.
+fn k_moe_gate_add(routed: [*]f32, shared: [*]f32, gate: [*]f32, y: [*]f32, rows: i32, width: i32) void {
+  var t: i32 = 0;
+  while (t < rows) : (t += 1) {
+    var g: f32 = 1.0 / (1.0 + math.exp_f32(-gate[t]));
+    var dy = @set_dsd_base_addr(k_base_f32, y);
+    dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, width)));
+    dy = @increment_dsd_offset(dy, @as(i16, t * width), f32);
+    var dr = @set_dsd_base_addr(k_base_f32, routed);
+    dr = @set_dsd_length(dr, @bitcast(u16, @as(i16, width)));
+    dr = @increment_dsd_offset(dr, @as(i16, t * width), f32);
+    var ds = @set_dsd_base_addr(k_base_f32, shared);
+    ds = @set_dsd_length(ds, @bitcast(u16, @as(i16, width)));
+    ds = @increment_dsd_offset(ds, @as(i16, t * width), f32);
+    @fmovs(dy, dr);
+    @fmacs(dy, dy, ds, g);
+  }
+}
+
+// @@ k_rope_table
+// Rotates each head of v (rows of width) by a table of pairs: lanes lo[i]
+// and hi[i] turn by angle pos[row * 3 + axis[i]] * freq[i].
+fn k_rope_table(v: [*]f32, pos: [*]i32, lo: [*]i32, hi: [*]i32, axis: [*]i32, freq: [*]f32, n: i32, rows: i32, width: i32, head_dim: i32) void {
+  var heads: i32 = width / head_dim;
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var h: i32 = 0;
+    while (h < heads) : (h += 1) {
+      var base: i32 = r * width + h * head_dim;
+      var i: i32 = 0;
+      while (i < n) : (i += 1) {
+        var p: f32 = @as(f32, pos[r * 3 + axis[i]]);
+        var ang: f32 = p * freq[i];
+        var c: f32 = math.cos_f32(ang);
+        var s: f32 = math.sin_f32(ang);
+        var a: i32 = base + lo[i];
+        var b: i32 = base + hi[i];
+        var x1: f32 = v[a];
+        var x2: f32 = v[b];
+        v[a] = x1 * c - x2 * s;
+        v[b] = x1 * s + x2 * c;
+      }
+    }
+  }
+}
+
+// @@ k_add_bias
+// y[r][c] += bias[c] over rows of width.
+fn k_add_bias(y: [*]f32, bias: [*]f32, rows: i32, width: i32) void {
+  var db = @set_dsd_base_addr(k_base_f32, bias);
+  db = @set_dsd_length(db, @bitcast(u16, @as(i16, width)));
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var dy = @set_dsd_base_addr(k_base_f32, y);
+    dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, width)));
+    dy = @increment_dsd_offset(dy, @as(i16, r * width), f32);
+    @fadds(dy, dy, db);
+  }
+}
+
+// @@ k_layernorm
+// y = (x - mean) / sqrt(var + eps) * w + b per row.
+fn k_layernorm(x: [*]f32, w: [*]f32, b: [*]f32, y: [*]f32, rows: i32, width: i32, eps: f32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var base: i32 = r * width;
+    var sum: f32 = 0.0;
+    var i: i32 = 0;
+    while (i < width) : (i += 1) { sum = sum + x[base + i]; }
+    var mean: f32 = sum / @as(f32, width);
+    var ss: f32 = 0.0;
+    i = 0;
+    while (i < width) : (i += 1) {
+      var d: f32 = x[base + i] - mean;
+      ss = ss + d * d;
+    }
+    var inv: f32 = 1.0 / math.sqrt_f32(ss / @as(f32, width) + eps);
+    i = 0;
+    while (i < width) : (i += 1) {
+      y[base + i] = (x[base + i] - mean) * inv * w[i] + b[i];
+    }
+  }
+}
+
+// @@ k_rowstats
+// st[r * 2] = sum of row r of x, st[r * 2 + 1] = its sum of squares.
+fn k_rowstats(x: [*]f32, st: [*]f32, rows: i32, width: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var base: i32 = r * width;
+    var sum: f32 = 0.0;
+    var i: i32 = 0;
+    while (i < width) : (i += 1) { sum = sum + x[base + i]; }
+    st[r * 2] = sum;
+    st[r * 2 + 1] = k_dot(x, base, x, base, width);
+  }
+}
+
+// @@ k_layernorm_scaled
+// y = (x - mean) / sqrt(var + eps) * w + b over rows of a column block:
+// row r's block sums sit in st[r * 2 * parts ..][0..parts] and its sums of
+// squares in the parts after, over `full` columns.
+fn k_layernorm_scaled(x: [*]f32, w: [*]f32, b: [*]f32, st: [*]f32, y: [*]f32, rows: i32, width: i32, parts: i32, full: i32, eps: f32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var sum: f32 = 0.0;
+    var ss: f32 = 0.0;
+    var c: i32 = 0;
+    while (c < parts) : (c += 1) {
+      sum = sum + st[r * 2 * parts + c];
+      ss = ss + st[r * 2 * parts + parts + c];
+    }
+    var mean: f32 = sum / @as(f32, full);
+    var variance: f32 = ss / @as(f32, full) - mean * mean;
+    if (variance < 0.0) { variance = 0.0; }
+    var inv: f32 = 1.0 / math.sqrt_f32(variance + eps);
+    var base: i32 = r * width;
+    var i: i32 = 0;
+    while (i < width) : (i += 1) {
+      y[base + i] = (x[base + i] - mean) * inv * w[i] + b[i];
+    }
+  }
+}
+
+// @@ k_gelu_tanh
+fn k_gelu_tanh_one(x: f32) f32 {
+  var u: f32 = 0.7978845608 * (x + 0.044715 * x * x * x);
+  var e: f32 = math.exp_f32(2.0 * u);
+  var t: f32 = (e - 1.0) / (e + 1.0);
+  return 0.5 * x * (1.0 + t);
+}
+// y = gelu_tanh(x) over n elements.
+fn k_gelu_tanh(x: [*]f32, y: [*]f32, n: i32) void {
+  var dx = @set_dsd_base_addr(k_base_f32, x);
+  dx = @set_dsd_length(dx, @bitcast(u16, @as(i16, n)));
+  var dy = @set_dsd_base_addr(k_base_f32, y);
+  dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, n)));
+  @map(k_gelu_tanh_one, dx, dy);
+}
+
+// @@ k_attend_dense
+// Bidirectional attention within segments: for each lane (segment) l in
+// [l0, l1) with rows [indptr[l], indptr[l + 1]), each query row r of the
+// window (rows [r0, r1) of the window, which starts at global row w0) and
+// each query head of kv heads [kh0, kh1) attends the segment's keys within
+// [a0, a1). Whole: q/o rows are all heads, k/v rows all heads and all key
+// rows. Sharded: q/o/lse rows hold just the kv heads' query heads, k/v
+// rows hold key rows [a0, a1) and heads [kh0, kh1); the lse (base 2) of
+// each row and head is written for the host to merge key groups.
+fn k_attend_dense(q: [*]f32, k: [*]f32, v: [*]f32, o: [*]f32, lse: [*]f32, indptr: [*]i32, acc: [*]f32,
+                  l0: i32, l1: i32, a0: i32, a1: i32, kh0: i32, kh1: i32, r0: i32, r1: i32, w0: i32, group: i32, d: i32, scale: f32, sharded: bool) void {
+  var kwl: i32 = (kh1 - kh0) * d;
+  var h0: i32 = kh0 * group;
+  var h1: i32 = kh1 * group;
+  var lw: i32 = h1 - h0;
+  var qw: i32 = lw * d;
+  var dacc = @set_dsd_base_addr(k_base_f32, acc);
+  dacc = @set_dsd_length(dacc, @bitcast(u16, @as(i16, d)));
+  var l: i32 = l0;
+  while (l < l1) : (l += 1) {
+    var s0: i32 = indptr[l];
+    var s1: i32 = indptr[l + 1];
+    // Query rows of this segment inside the window, window-relative.
+    var qlo: i32 = s0 - w0;
+    if (qlo < r0) { qlo = r0; }
+    var qhi: i32 = s1 - w0;
+    if (qhi > r1) { qhi = r1; }
+    // Key rows of this segment this PE holds.
+    var klo: i32 = s0;
+    if (klo < a0) { klo = a0; }
+    var khi: i32 = s1;
+    if (khi > a1) { khi = a1; }
+    var r: i32 = qlo;
+    while (r < qhi) : (r += 1) {
+      var h: i32 = h0;
+      while (h < h1) : (h += 1) {
+        var kh: i32 = h / group;
+        var qoff: i32 = r * qw + (h - h0) * d;
+        var m: f32 = 0.0;
+        var lsum: f32 = 0.0;
+        var any: bool = false;
+        var kr: i32 = klo;
+        while (kr < khi) : (kr += 1) {
+          var koff: i32 = (kr - a0) * kwl + (kh - kh0) * d;
+          var s: f32 = k_dot(q, qoff, k, koff, d) * scale;
+          var dv = @set_dsd_base_addr(k_base_f32, v);
+          dv = @set_dsd_length(dv, @bitcast(u16, @as(i16, d)));
+          dv = @increment_dsd_offset(dv, @as(i16, koff), f32);
+          if (!any) {
+            any = true;
+            m = s;
+            lsum = 1.0;
+            @fmovs(dacc, dv);
+          } else if (s > m) {
+            var alpha: f32 = math.exp_f32(m - s);
+            lsum = lsum * alpha + 1.0;
+            @fmuls(dacc, dacc, alpha);
+            @fadds(dacc, dacc, dv);
+            m = s;
+          } else {
+            var p: f32 = math.exp_f32(s - m);
+            lsum = lsum + p;
+            @fmacs(dacc, dacc, dv, p);
+          }
+        }
+        var dout = @set_dsd_base_addr(k_base_f32, o);
+        dout = @set_dsd_length(dout, @bitcast(u16, @as(i16, d)));
+        dout = @increment_dsd_offset(dout, @as(i16, qoff), f32);
+        if (any) {
+          @fmuls(dout, dacc, 1.0 / lsum);
+          if (sharded) { lse[r * lw + (h - h0)] = (m + math.log_f32(lsum)) * 1.4426950408889634; }
+        } else {
+          var i: i32 = 0;
+          while (i < d) : (i += 1) { o[qoff + i] = 0.0; }
+          if (sharded) { lse[r * lw + (h - h0)] = @bitcast(f32, @as(u32, 0xFF800000)); }
+        }
+      }
+    }
+  }
+}
+
+// @@ k_silu_scaled
+fn k_silu_s(z: f32) f32 {
+  return z / (1.0 + math.exp_f32(-z));
+}
+// x = silu(s * x) over n elements, in place.
+fn k_silu_scaled(x: [*]f32, n: i32, s: f32) void {
+  var dx = @set_dsd_base_addr(k_base_f32, x);
+  dx = @set_dsd_length(dx, @bitcast(u16, @as(i16, n)));
+  @fmuls(dx, dx, s);
+  @map(k_silu_s, dx, dx);
+}
+
+// @@ k_rmsnorm_banked
+// Every group-wide run of each width-wide row scaled by rsqrt(mean of
+// squares + eps), then by the gain of its column of the row: w or 1 + w.
+fn k_rmsnorm_banked(x: [*]f32, w: [*]f32, y: [*]f32, rows: i32, width: i32, group: i32, eps: f32, plus_one: bool) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var c: i32 = 0;
+    while (c < width) : (c += group) {
+      var base: i32 = r * width + c;
+      var ss: f32 = k_dot(x, base, x, base, group);
+      var inv: f32 = 1.0 / math.sqrt_f32(ss / @as(f32, group) + eps);
+      var i: i32 = 0;
+      while (i < group) : (i += 1) {
+        var g: f32 = w[c + i];
+        if (plus_one) { g = g + 1.0; }
+        y[base + i] = x[base + i] * inv * g;
+      }
+    }
+  }
+}
+
+// @@ k_hc_expand
+// y[r, s * h + i] = x[r, i] for each of m streams.
+fn k_hc_expand(x: [*]f32, y: [*]f32, rows: i32, h: i32, m: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < m) : (s += 1) {
+      k_copy(y, (r * m + s) * h, x, r * h, h);
+    }
+  }
+}
+
+// @@ k_hc_mix
+// y[r, i] = (1 / m) * sum_s v[r, s, i] * sigmoid(g[r, s, i]).
+fn k_hc_mix(g: [*]f32, v: [*]f32, y: [*]f32, rows: i32, h: i32, m: i32) void {
+  var inv_m: f32 = 1.0 / @as(f32, m);
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var i: i32 = 0;
+    while (i < h) : (i += 1) {
+      var acc: f32 = 0.0;
+      var s: i32 = 0;
+      while (s < m) : (s += 1) {
+        var at: i32 = (r * m + s) * h + i;
+        acc = acc + v[at] / (1.0 + math.exp_f32(-g[at]));
+      }
+      y[r * h + i] = acc * inv_m;
+    }
+  }
+}
+
+// @@ k_hc_inject
+// hy[r, s, i] += 2 * sigmoid(g[r, s] / m) * o[r, i].
+fn k_hc_inject(o: [*]f32, g: [*]f32, hy: [*]f32, rows: i32, h: i32, m: i32) void {
+  var inv_m: f32 = 1.0 / @as(f32, m);
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < m) : (s += 1) {
+      var gate: f32 = 2.0 / (1.0 + math.exp_f32(-g[r * m + s] * inv_m));
+      var base: i32 = (r * m + s) * h;
+      var i: i32 = 0;
+      while (i < h) : (i += 1) {
+        hy[base + i] = hy[base + i] + gate * o[r * h + i];
+      }
+    }
+  }
+}
+
+// @@ k_ple_gate
+// Per row r and stream s: d = key[r, s, :] . query[r, s, :] / sqrt(h),
+// gate = sigmoid(sign(d) * sqrt(max(|d|, 1e-6))) (d = 0 gates by 0.5),
+// y[r, s, i] = gate * value[r, i].
+fn k_ple_gate(key: [*]f32, query: [*]f32, value: [*]f32, y: [*]f32, rows: i32, h: i32, m: i32) void {
+  var inv_sqrt_h: f32 = 1.0 / math.sqrt_f32(@as(f32, h));
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < m) : (s += 1) {
+      var base: i32 = (r * m + s) * h;
+      var d: f32 = k_dot(key, base, query, base, h) * inv_sqrt_h;
+      var a: f32 = d;
+      if (a < 0.0) { a = -a; }
+      if (a < 0.000001) { a = 0.000001; }
+      var mag: f32 = math.sqrt_f32(a);
+      var damped: f32 = 0.0;
+      if (d > 0.0) { damped = mag; } else if (d < 0.0) { damped = -mag; }
+      var gate: f32 = 1.0 / (1.0 + math.exp_f32(-damped));
+      var i: i32 = 0;
+      while (i < h) : (i += 1) {
+        y[base + i] = gate * value[r * h + i];
+      }
+    }
+  }
+}
+
+// @@ k_block_dyn_conv
+// A stateless causal depthwise conv whose taps move per row: for lane l in
+// [0, lanes) with rows [indptr[l], indptr[l + 1]), row t at position j of
+// its lane is y[t, ch] = sum_{k <= j} (base[side * taps + k, ch] +
+// coeff[t, (side * taps + k) * gl + ch / group]) * x[t - k, ch] over this
+// PE's cb channels (gl = cb / group groups); the rows before the lane's
+// first read nothing.
+fn k_block_dyn_conv(x: [*]f32, coeff: [*]f32, base: [*]f32, indptr: [*]i32, y: [*]f32,
+                    lanes: i32, cb: i32, taps: i32, group: i32, side: i32) void {
+  var gl: i32 = cb / group;
+  var cw: i32 = 2 * taps * gl;
+  var l: i32 = 0;
+  while (l < lanes) : (l += 1) {
+    var b: i32 = indptr[l];
+    var e: i32 = indptr[l + 1];
+    var t: i32 = b;
+    while (t < e) : (t += 1) {
+      var j: i32 = t - b;
+      var ch: i32 = 0;
+      while (ch < cb) : (ch += 1) {
+        var g: i32 = ch / group;
+        var acc: f32 = 0.0;
+        var k: i32 = 0;
+        while (k < taps and k <= j) : (k += 1) {
+          var at: i32 = side * taps + k;
+          var coef: f32 = base[at * cb + ch] + coeff[t * cw + at * gl + g];
+          acc = acc + coef * x[(t - k) * cb + ch];
+        }
+        y[t * cb + ch] = acc;
+      }
+    }
+  }
+}
+
+// @@ k_ple_dot
+// pd[r, s] = key[r, s, :] . query[r, s, :] over this PE's h columns.
+fn k_ple_dot(key: [*]f32, query: [*]f32, pd: [*]f32, rows: i32, h: i32, m: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < m) : (s += 1) {
+      var base: i32 = (r * m + s) * h;
+      pd[r * m + s] = k_dot(key, base, query, base, h);
+    }
+  }
+}
+
+// @@ k_ple_gate_scaled
+// The gate of k_ple_gate from the `parts` column blocks' partial dots in
+// pd[r, s, parts] (full = the whole stream's width), scaling this PE's h
+// columns of the value: y[r, s, i] = gate * value[r, i].
+fn k_ple_gate_scaled(value: [*]f32, pd: [*]f32, y: [*]f32, rows: i32, h: i32, m: i32, parts: i32, full: i32) void {
+  var inv_sqrt_h: f32 = 1.0 / math.sqrt_f32(@as(f32, full));
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < m) : (s += 1) {
+      var d: f32 = 0.0;
+      var c: i32 = 0;
+      while (c < parts) : (c += 1) { d = d + pd[(r * m + s) * parts + c]; }
+      d = d * inv_sqrt_h;
+      var a: f32 = d;
+      if (a < 0.0) { a = -a; }
+      if (a < 0.000001) { a = 0.000001; }
+      var mag: f32 = math.sqrt_f32(a);
+      var damped: f32 = 0.0;
+      if (d > 0.0) { damped = mag; } else if (d < 0.0) { damped = -mag; }
+      var gate: f32 = 1.0 / (1.0 + math.exp_f32(-damped));
+      var base: i32 = (r * m + s) * h;
+      var i: i32 = 0;
+      while (i < h) : (i += 1) {
+        y[base + i] = gate * value[r * h + i];
+      }
+    }
+  }
+}
+
+// @@ k_argmax_part
+// The greatest value of each row of x (NaN never wins) and its index, as a
+// pair out[2r] (the value), out[2r + 1] (the index as i32 bits; -1 when
+// every lane is NaN).
+fn k_argmax_part(x: [*]f32, out: [*]f32, rows: i32, width: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var best: f32 = 0.0; var bi: i32 = -1;
+    var i: i32 = 0;
+    while (i < width) : (i += 1) {
+      var v: f32 = x[r * width + i];
+      if (math.isNaN_f32(v)) { continue; }
+      if (bi < 0 or v > best) { best = v; bi = i; }
+    }
+    out[2 * r] = best;
+    out[2 * r + 1] = @bitcast(f32, bi);
+  }
+}
+
+// @@ k_topk_softmax
+// routes[t][s], weights[t][s] for s < top_k: the top_k largest of the first
+// `experts` lanes of row t (ties to the lowest index, NaN never picked) and
+// the softmax over them; picks past the row's lanes hold -1 and 0.
+fn k_topk_softmax(logits: [*]f32, routes: [*]i32, weights: [*]f32, rows: i32, width: i32, experts: i32, top_k: i32) void {
+  var t: i32 = 0;
+  while (t < rows) : (t += 1) {
+    var n: i32 = experts;
+    if (n > width) { n = width; }
+    var picked: i32 = 0;
+    var s: i32 = 0;
+    while (s < top_k) : (s += 1) {
+      var bi: i32 = -1; var bv: f32 = 0.0;
+      var i: i32 = 0;
+      while (i < n) : (i += 1) {
+        var v: f32 = logits[t * width + i];
+        if (math.isNaN_f32(v)) { continue; }
+        var taken: bool = false;
+        var q: i32 = 0;
+        while (q < picked) : (q += 1) { if (routes[t * top_k + q] == i) { taken = true; } }
+        if (taken) { continue; }
+        if (bi < 0 or v > bv) { bi = i; bv = v; }
+      }
+      if (bi < 0) { break; }
+      routes[t * top_k + s] = bi;
+      weights[t * top_k + s] = bv;
+      picked += 1;
+    }
+    var m: f32 = 0.0;
+    var q: i32 = 0;
+    while (q < picked) : (q += 1) { if (q == 0 or weights[t * top_k + q] > m) { m = weights[t * top_k + q]; } }
+    var z: f32 = 0.0;
+    q = 0;
+    while (q < picked) : (q += 1) { var e: f32 = math.exp_f32(weights[t * top_k + q] - m); weights[t * top_k + q] = e; z = z + e; }
+    q = 0;
+    while (q < picked) : (q += 1) { weights[t * top_k + q] = weights[t * top_k + q] / z; }
+    q = picked;
+    while (q < top_k) : (q += 1) { routes[t * top_k + q] = -1; weights[t * top_k + q] = 0.0; }
+  }
+}
+
+// @@ k_lse_merge
+// total[j] = log2 Σ_p 2^all[p * n + j] over g parts (base 2; all -inf stays
+// -inf): the merged log-sum-exp of g PEs' per-cell partials.
+fn k_lse_merge(all: [*]f32, total: [*]f32, g: i32, n: i32) void {
+  var j: i32 = 0;
+  while (j < n) : (j += 1) {
+    var m: f32 = all[j];
+    var p: i32 = 1;
+    while (p < g) : (p += 1) {
+      if (all[p * n + j] > m) { m = all[p * n + j]; }
+    }
+    if (@bitcast(u32, m) == 0xFF800000) {
+      total[j] = m;
+    } else {
+      var s: f32 = 0.0;
+      p = 0;
+      while (p < g) : (p += 1) {
+        s = s + math.exp_f32((all[p * n + j] - m) * 0.6931471805599453);
+      }
+      total[j] = m + math.log_f32(s) * 1.4426950408889634;
+    }
+  }
+}
+
+// @@ k_lse_scale
+// o[c * d + i] *= 2^(lse[c] - total[c]) for n cells of d (0 when the total
+// is -inf): a PE's normalised partial reweighted for the merged sum.
+fn k_lse_scale(o: [*]f32, lse: [*]f32, total: [*]f32, n: i32, d: i32) void {
+  var c: i32 = 0;
+  while (c < n) : (c += 1) {
+    var f: f32 = 0.0;
+    if (@bitcast(u32, total[c]) != 0xFF800000) {
+      f = math.exp_f32((lse[c] - total[c]) * 0.6931471805599453);
+    }
+    var i: i32 = 0;
+    while (i < d) : (i += 1) { o[c * d + i] = o[c * d + i] * f; }
+  }
+}
+
+// @@ k_argmax_merge
+// y[r * y_width + column] = the index of the greatest value among the cg
+// column blocks' pairs all[c * 2 * rows + 2r] (value), [.. + 1] (local
+// index as i32 bits, -1 when the block had no lane): the block's base
+// c * block plus the local index, the lowest block on ties, 0 when none.
+fn k_argmax_merge(all: [*]f32, y: [*]i32, cg: i32, rows: i32, block: i32, column: i32, y_width: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var best: f32 = 0.0; var bi: i32 = -1;
+    var c: i32 = 0;
+    while (c < cg) : (c += 1) {
+      var v: f32 = all[c * 2 * rows + 2 * r];
+      var li: i32 = @bitcast(i32, all[c * 2 * rows + 2 * r + 1]);
+      if (li >= 0 and !math.isNaN_f32(v)) {
+        if (bi < 0 or v > best) { best = v; bi = c * block + li; }
+      }
+    }
+    if (bi < 0) { bi = 0; }
+    y[r * y_width + column] = bi;
+  }
+}
+
+// @@ k_topk
+// The k largest of each row of x, largest first: values[r][s], indices[r][s]
+// (ties to the lower column, NaN never picked); a slot no value fills holds
+// value 0 at column 0.
+fn k_topk(x: [*]f32, values: [*]f32, indices: [*]i32, rows: i32, width: i32, k: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < k) : (s += 1) { values[r * k + s] = 0.0; indices[r * k + s] = 0; }
+    s = 0;
+    while (s < k) : (s += 1) {
+      var best: f32 = 0.0; var bi: i32 = -1;
+      var i: i32 = 0;
+      while (i < width) : (i += 1) {
+        var v: f32 = x[r * width + i];
+        if (math.isNaN_f32(v)) { continue; }
+        var taken: bool = false;
+        var j: i32 = 0;
+        while (j < s) : (j += 1) { if (indices[r * k + j] == i) { taken = true; } }
+        if (taken) { continue; }
+        if (bi < 0 or v > best) { best = v; bi = i; }
+      }
+      if (bi < 0) { break; }
+      values[r * k + s] = best;
+      indices[r * k + s] = bi;
+    }
+  }
+}
+
+// @@ k_group_routes
+// routes[r][g] = g: the identity routing of `groups` slices a row.
+fn k_group_routes(routes: [*]i32, rows: i32, groups: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var g: i32 = 0;
+    while (g < groups) : (g += 1) { routes[r * groups + g] = g; }
+  }
+}
+
+// @@ k_boundary
+// Marks the rows whose position closes a `ratio` block: bpos the position
+// (or -1), brope the block's first position (or 0), breq the row's request.
+fn k_boundary(positions: [*]i32, request_of_token: [*]i32, row_valid: [*]i32,
+              bpos: [*]i32, breq: [*]i32, brope: [*]i32, rows: i32, ratio: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var pos: i32 = positions[r];
+    var p1: i32 = pos + 1;
+    var closes: bool = false;
+    if (p1 >= 0) { closes = (p1 - (p1 / ratio) * ratio) == 0; }
+    var is_b: bool = closes and row_valid[r] != 0;
+    breq[r] = request_of_token[r];
+    if (is_b) {
+      bpos[r] = pos;
+      brope[r] = (pos / ratio) * ratio;
+    } else {
+      bpos[r] = -1;
+      brope[r] = 0;
+    }
+  }
+}
+
+// @@ k_ple_ngram
+// v mod m over u64 by long division (the hash primes need no u64 divide).
+fn k_umod64(v: u64, m: u64) u64 {
+  var x: u64 = v;
+  var r: u64 = 0;
+  var i: i32 = 0;
+  while (i < 64) : (i += 1) {
+    r = (r << 1) | (x >> 63);
+    x = x << 1;
+    if (r >= m) { r = r - m; }
+  }
+  return r;
+}
+// Each lane's rows [b, e) (lane l's bounds indptr[l], indptr[l + 1], or row
+// l alone when per_row) hash [id(t), the span ids before it] (the lane's
+// kept window in slab[slots[b]] before row b; after an eos only eos) with
+// mults into mixed, head (p, i) landing mixed mod primes[(p - 1) hpn + i]
+// + offsets[...] in out[t][...]; then the window moves on by the lane's
+// ids (as id + 1).
+fn k_ple_ngram(ids: [*]i32, indptr: [*]i32, lanes: i32, per_row: bool, slots: [*]i32, slab: [*]i32, slab_rows: i32,
+               out: [*]i32, rows: i32, eos: i32, mults: [*]u64, primes: [*]u64, offsets: [*]u64,
+               span: i32, heads: i32, hpn: i32, window: [*]i32, past: [*]i32) void {
+  var l: i32 = 0;
+  while (l < lanes) : (l += 1) {
+    var b: i32 = l;
+    var e: i32 = l + 1;
+    if (!per_row) { b = indptr[l]; e = indptr[l + 1]; }
+    if (b < 0) { b = 0; }
+    if (e < b) { e = b; }
+    if (b > rows) { b = rows; }
+    if (e > rows) { e = rows; }
+    var n: i32 = e - b;
+    var slot: i32 = -1;
+    if (b < rows) { slot = slots[b]; }
+    var kept: bool = slot >= 0 and slot < slab_rows;
+    var s: i32 = 0;
+    while (s < span) : (s += 1) {
+      past[s] = 0;
+      if (kept) { past[s] = slab[slot * span + s]; }
+    }
+    var j: i32 = 0;
+    while (j < n) : (j += 1) {
+      var t: i32 = b + j;
+      window[0] = ids[t];
+      var crossed: bool = false;
+      var p: i32 = 1;
+      while (p <= span) : (p += 1) {
+        var src: i32 = j - p;
+        var w: i32 = eos;
+        if (src >= 0) {
+          w = ids[t - p];
+        } else {
+          var cell: i32 = past[span + src];
+          if (cell == 0) { w = eos; } else { w = cell - 1; }
+        }
+        if (crossed) { w = eos; }
+        if (w == eos) { crossed = true; }
+        window[p] = w;
+      }
+      var mixed: u64 = 0;
+      p = 0;
+      while (p <= span) : (p += 1) {
+        mixed = mixed ^ (@bitcast(u64, @as(i64, window[p])) * mults[p]);
+        if (p >= 1) {
+          var lo: i32 = (p - 1) * hpn;
+          var i: i32 = 0;
+          while (i < hpn) : (i += 1) {
+            var r: u64 = k_umod64(mixed, primes[lo + i]) + offsets[lo + i];
+            out[t * heads + lo + i] = @bitcast(i32, @as(u32, r & 0xFFFFFFFF));
+          }
+        }
+      }
+    }
+    if (n > 0 and kept) {
+      s = 0;
+      while (s < span) : (s += 1) {
+        var src: i32 = n - span + s;
+        if (src >= 0) { window[s] = ids[b + src] + 1; } else { window[s] = past[src + span]; }
+      }
+      s = 0;
+      while (s < span) : (s += 1) { slab[slot * span + s] = window[s]; }
+    }
+  }
+}
+
+// @@ k_index_cell
+// The pool cell of request `req`'s position `pos` through its page table
+// (indptr[req] the first page entry, pages of ps rows), or -1 when the
+// tables do not reach it or the cell is past `cells`.
+fn k_index_cell(indices: [*]i32, indptr: [*]i32, nidx: i32, nptr: i32, req: i32, pos: i32, ps: i32, cells: i32) i32 {
+  var p: i32 = pos;
+  if (p < 0) { p = 0; }
+  if (req < 0 or req >= nptr) { return -1; }
+  var at: i32 = indptr[req] + p / ps;
+  if (at < 0 or at >= nidx) { return -1; }
+  var cell: i32 = indices[at] * ps + (p - (p / ps) * ps);
+  if (cell < 0 or cell >= cells) { return -1; }
+  return cell;
+}
+
+// @@ k_index_page_write
+// Lands row r of src in pool row write_page[r] * ps + write_offset[r]; a
+// page or offset out of range drops the row.
+fn k_index_page_write(src: [*]f32, table: [*]f32, write_page: [*]i32, write_offset: [*]i32,
+                      rows: i32, width: i32, ps: i32, table_rows: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var page: i32 = write_page[r];
+    var off: i32 = write_offset[r];
+    if (page >= 0 and off >= 0 and off < ps) {
+      var cell: i32 = page * ps + off;
+      if (cell < table_rows) { k_copy(table, cell * width, src, r * width, width); }
+    }
+  }
+}
+
+// @@ k_index_pool_write
+// Files boundary row r's entry at its request's cell for its position; a
+// row closing no block (bpos < 0) writes nothing.
+fn k_index_pool_write(entries: [*]f32, bpos: [*]i32, breq: [*]i32, table: [*]f32, indices: [*]i32, indptr: [*]i32,
+                      nidx: i32, nptr: i32, rows: i32, width: i32, ps: i32, cells: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var bp: i32 = bpos[r];
+    if (bp >= 0) {
+      var cell: i32 = k_index_cell(indices, indptr, nidx, nptr, breq[r], bp, ps, cells);
+      if (cell >= 0) { k_copy(table, cell * width, entries, r * width, width); }
+    }
+  }
+}
+
+// @@ k_index_block_mean
+// Each boundary row's mean of the ratio cached keys ending at its position
+// (positions before 0 add nothing, the divisor stays ratio); 0 for a row
+// closing no block.
+fn k_index_block_mean(bpos: [*]i32, breq: [*]i32, table: [*]f32, indices: [*]i32, indptr: [*]i32, nidx: i32, nptr: i32,
+                      entries: [*]f32, rows: i32, hd: i32, ratio: i32, ps: i32, cells: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var j: i32 = 0;
+    while (j < hd) : (j += 1) { entries[r * hd + j] = 0.0; }
+    var bp: i32 = bpos[r];
+    if (bp >= 0) {
+      var i: i32 = 0;
+      while (i < ratio) : (i += 1) {
+        var pos: i32 = bp + i - (ratio - 1);
+        if (pos >= 0) {
+          var cell: i32 = k_index_cell(indices, indptr, nidx, nptr, breq[r], pos, ps, cells);
+          if (cell >= 0) {
+            j = 0;
+            while (j < hd) : (j += 1) { entries[r * hd + j] = entries[r * hd + j] + table[cell * hd + j]; }
+          }
+        }
+      }
+      var inv: f32 = 1.0 / @as(f32, ratio);
+      j = 0;
+      while (j < hd) : (j += 1) { entries[r * hd + j] = entries[r * hd + j] * inv; }
+    }
+  }
+}
+
+// @@ k_index_topk
+// Per query row: scores sum_h max(q_h . k_j, 0) * w_h against the cached keys
+// j < (pos + 1) / ratio (key j at position (j + 1) * ratio - 1, at most nk),
+// then the top_k keys: every key when there are no more than top_k, else,
+// in key order, those at or above a threshold bisected 40 times between the
+// row's min and max; unfilled slots are -1.
+fn k_index_topk(q: [*]f32, weights: [*]f32, has_w: bool, table: [*]f32, indices: [*]i32, indptr: [*]i32, nidx: i32, nptr: i32,
+                positions: [*]i32, request_of_token: [*]i32, selection: [*]i32, scores: [*]f32,
+                rows: i32, h: i32, d: i32, k: i32, ratio: i32, ps: i32, nk: i32, cells: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < k) : (s += 1) { selection[r * k + s] = -1; }
+    var p1: i32 = positions[r] + 1;
+    var nkeys: i32 = 0;
+    if (p1 > 0) { nkeys = p1 / ratio; }
+    if (nkeys > nk) { nkeys = nk; }
+    var req: i32 = request_of_token[r];
+    var j: i32 = 0;
+    while (j < nkeys) : (j += 1) {
+      var kpos: i32 = (j + 1) * ratio - 1;
+      var cell: i32 = k_index_cell(indices, indptr, nidx, nptr, req, kpos, ps, cells);
+      var sc: f32 = 0.0;
+      var hh: i32 = 0;
+      while (hh < h) : (hh += 1) {
+        var dot: f32 = 0.0;
+        if (cell >= 0) { dot = k_dot(q, (r * h + hh) * d, table, cell * d, d); }
+        if (dot < 0.0) { dot = 0.0; }
+        var w: f32 = 1.0;
+        if (has_w) { w = weights[r * h + hh]; }
+        sc = sc + dot * w;
+      }
+      scores[j] = sc;
+    }
+    if (nkeys <= k) {
+      j = 0;
+      while (j < nkeys) : (j += 1) { selection[r * k + j] = j; }
+    } else {
+      var lo: f32 = scores[0];
+      var hi: f32 = scores[0];
+      j = 1;
+      while (j < nkeys) : (j += 1) {
+        if (scores[j] < lo) { lo = scores[j]; }
+        if (scores[j] > hi) { hi = scores[j]; }
+      }
+      var it: i32 = 0;
+      while (it < 40) : (it += 1) {
+        var mid: f32 = (lo + hi) * 0.5;
+        var cnt: i32 = 0;
+        j = 0;
+        while (j < nkeys) : (j += 1) { if (scores[j] >= mid) { cnt += 1; } }
+        if (cnt > k) { lo = mid; } else { hi = mid; }
+      }
+      var slot: i32 = 0;
+      j = 0;
+      while (j < nkeys and slot < k) : (j += 1) {
+        if (scores[j] >= hi) { selection[r * k + slot] = j; slot += 1; }
+      }
+    }
+  }
+}
+
+// @@ k_split_rows
+// left[r] = x[r][..cut], right[r] = x[r][cut..].
+fn k_split_rows(x: [*]f32, left: [*]f32, right: [*]f32, rows: i32, width: i32, cut: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    k_copy(left, r * cut, x, r * width, cut);
+    k_copy(right, r * (width - cut), x, r * width + cut, width - cut);
+  }
+}
+
+// @@ k_split_q_gate
+// Per row and head, packed = [q_h | gate_h] (hd each) cut into q and gate.
+fn k_split_q_gate(src: [*]f32, q: [*]f32, gate: [*]f32, rows: i32, heads: i32, hd: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var h: i32 = 0;
+    while (h < heads) : (h += 1) {
+      var from: i32 = (r * heads + h) * 2 * hd;
+      var to: i32 = (r * heads + h) * hd;
+      k_copy(q, to, src, from, hd);
+      k_copy(gate, to, src, from + hd, hd);
+    }
+  }
+}
+
+// @@ k_split_qkv
+// packed = [q | k | v] rows cut into q (qw), k and v (kw each).
+fn k_split_qkv(src: [*]f32, q: [*]f32, k: [*]f32, v: [*]f32, rows: i32, qw: i32, kw: i32) void {
+  var width: i32 = qw + 2 * kw;
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    k_copy(q, r * qw, src, r * width, qw);
+    k_copy(k, r * kw, src, r * width + qw, kw);
+    k_copy(v, r * kw, src, r * width + qw + kw, kw);
+  }
+}
+
+// @@ k_embed_part
+// y[r] = table[ids[r]] for the ids in this PE's table rows [lo, lo + share)
+// (an id outside [0, limit) reads row 0), zeros for the others: the PEs'
+// parts add up to the gather.
+fn k_embed_part(ids: [*]i32, table: [*]f32, y: [*]f32, rows: i32, width: i32, limit: i32, lo: i32, share: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var id: i32 = ids[r];
+    if (id < 0 or id >= limit) { id = 0; }
+    if (id >= lo and id < lo + share) {
+      k_copy(y, r * width, table, (id - lo) * width, width);
+    } else {
+      var i: i32 = 0;
+      while (i < width) : (i += 1) { y[r * width + i] = 0.0; }
+    }
+  }
+}
+
+// @@ k_embed_concat_part
+// y[r] = table[ids[r][0]] | ... | table[ids[r][heads - 1]] for the ids in
+// this PE's table rows (an id outside [0, limit) lands zeros), zeros for the
+// others.
+fn k_embed_concat_part(ids: [*]i32, table: [*]f32, y: [*]f32, rows: i32, heads: i32, width: i32, limit: i32, lo: i32, share: i32) void {
+  var s: i32 = 0;
+  while (s < rows * heads) : (s += 1) {
+    var id: i32 = ids[s];
+    if (id >= 0 and id < limit and id >= lo and id < lo + share) {
+      k_copy(y, s * width, table, (id - lo) * width, width);
+    } else {
+      var i: i32 = 0;
+      while (i < width) : (i += 1) { y[s * width + i] = 0.0; }
+    }
+  }
+}
+
+// @@ k_embed_weighted_part
+// y[r] = sum over taps of weights[r][t] * table[ids[r][t]] over the ids in
+// this PE's table rows (an id outside [0, limit) reads row 0), in tap
+// order; the PEs' parts add up to the whole.
+fn k_embed_weighted_part(ids: [*]i32, weights: [*]f32, table: [*]f32, y: [*]f32, rows: i32, taps: i32, width: i32, limit: i32, lo: i32, share: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var i: i32 = 0;
+    while (i < width) : (i += 1) { y[r * width + i] = 0.0; }
+    var t: i32 = 0;
+    while (t < taps) : (t += 1) {
+      var id: i32 = ids[r * taps + t];
+      if (id < 0 or id >= limit) { id = 0; }
+      if (id >= lo and id < lo + share) {
+        var g: f32 = weights[r * taps + t];
+        i = 0;
+        while (i < width) : (i += 1) { y[r * width + i] = y[r * width + i] + g * table[(id - lo) * width + i]; }
+      }
+    }
+  }
+}
+
+// @@ k_selector_walk
+// The drafter's greedy walk over each lane's candidate rows (lanes by
+// indptr): row t scores its candidates unary[t][c] + sum_d pred[prev][d] *
+// hp[t][d] * succ[cand][d] (the bilinear term only when both ids are in the
+// vocab; hp 1 when absent), picks the first strict best (a NaN never wins
+// past slot 0) and the pick is the next row's prev; the lane's first row
+// takes its own candidate 0 when `first` is 1, and prev starts at the
+// lane's first token.
+fn k_selector_walk(cand: [*]i32, indptr: [*]i32, lanes: i32, unary: [*]f32, hp: [*]f32, has_hp: bool, tokens: [*]i32,
+                   pred: [*]f32, succ: [*]f32, picks: [*]i32, rows: i32, k: i32, rank: i32, vocab: i32, first: i32) void {
+  var l: i32 = 0;
+  while (l < lanes) : (l += 1) {
+    var lo: i32 = indptr[l];
+    var hi: i32 = indptr[l + 1];
+    if (hi <= lo or lo < 0 or lo >= rows) { continue; }
+    if (hi > rows) { hi = rows; }
+    if (first > 0) { picks[lo] = cand[lo * k]; }
+    var prev: i32 = tokens[lo];
+    var row: i32 = lo + first;
+    while (row < hi) : (row += 1) {
+      var best: i32 = 0;
+      var best_s: f32 = 0.0;
+      var c: i32 = 0;
+      while (c < k) : (c += 1) {
+        var id: i32 = cand[row * k + c];
+        var s: f32 = unary[row * k + c];
+        if (prev >= 0 and prev < vocab and id >= 0 and id < vocab) {
+          var d: i32 = 0;
+          while (d < rank) : (d += 1) {
+            var h: f32 = 1.0;
+            if (has_hp) { h = hp[row * rank + d]; }
+            s = s + pred[prev * rank + d] * h * succ[id * rank + d];
+          }
+        }
+        if (c == 0) {
+          best_s = s;
+          if (math.isNaN_f32(s)) { best_s = @bitcast(f32, @as(u32, 0xFF800000)); c = k; }
+        } else {
+          var cs: f32 = s;
+          if (math.isNaN_f32(cs)) { cs = @bitcast(f32, @as(u32, 0xFF800000)); }
+          if (cs > best_s) { best_s = cs; best = c; }
+        }
+      }
+      var pick: i32 = cand[row * k + best];
+      picks[row] = pick;
+      prev = pick;
+    }
+  }
+}
+
+// @@ k_cols_unblock
+// y[i][c * nl + j] = all[c][i][j]: the n column blocks of a gathered
+// `[n][m][nl]` laid back as rows of y (`m` rows of `n * nl`).
+fn k_cols_unblock(all: [*]f32, y: [*]f32, n: i32, m: i32, nl: i32) void {
+  var c: i32 = 0;
+  while (c < n) : (c += 1) {
+    var i: i32 = 0;
+    while (i < m) : (i += 1) {
+      k_copy(y, i * n * nl + c * nl, all, (c * m + i) * nl, nl);
+    }
+  }
+}
+
+// @@ k_half
+// Arrays kept two bf16 a u32 word: element e is the low half of word e / 2
+// when e is even, the high half when odd. `k_unpack_bf16` widens a run into
+// f32, `k_pack_bf16` lands f32 (bf16-valued) words as halves, and
+// `k_dot_packed` dots an f32 run with a packed one through widened chunks.
+var k_half_tmp: [K_DOT_CHUNK]f32;
+fn k_unpack_bf16(dst: [*]f32, w: [*]u32, off: i32, n: i32) void {
+  var i: i32 = 0;
+  while (i < n) : (i += 1) {
+    var e: i32 = off + i;
+    var word: u32 = w[e >> 1];
+    if ((e & 1) == 0) {
+      dst[i] = @bitcast(f32, word << 16);
+    } else {
+      dst[i] = @bitcast(f32, word & 0xFFFF0000);
+    }
+  }
+}
+fn k_dot_packed(a: [*]f32, aoff: i32, w: [*]u32, woff: i32, n: i32) f32 {
+  var s: f32 = 0.0;
+  var at: i32 = 0;
+  while (at < n) : (at += K_DOT_CHUNK) {
+    var len: i32 = n - at;
+    if (len > K_DOT_CHUNK) { len = K_DOT_CHUNK; }
+    k_unpack_bf16(@ptrcast([*]f32, &k_half_tmp), w, woff + at, len);
+    s = s + k_dot(a, aoff + at, @ptrcast([*]f32, &k_half_tmp), 0, len);
+  }
+  return s;
+}
+// dst (two bf16 a u32 word) elements [doff, doff + n) = src[soff ..] (bf16
+// values held as f32), the low half first in a word.
+fn k_pack_bf16(dst: [*]u32, doff: i32, src: [*]f32, soff: i32, n: i32) void {
+  var i: i32 = 0;
+  while (i < n) : (i += 1) {
+    var e: i32 = doff + i;
+    var h: u32 = @bitcast(u32, src[soff + i]) >> 16;
+    var word: u32 = dst[e >> 1];
+    if ((e & 1) == 0) {
+      dst[e >> 1] = (word & 0xFFFF0000) | h;
+    } else {
+      dst[e >> 1] = (word & 0xFFFF) | (h << 16);
+    }
+  }
+}
+
+// @@ k_matmul_packed
+// y[m, n] = sum_k a[m, k] * w[n, k] with w packed; a is [m, k] f32. Each
+// weight row is widened chunk by chunk once and dotted with every row of a.
+fn k_matmul_packed(a: [*]f32, w: [*]u32, y: [*]f32, m: i32, k: i32, n: i32) void {
+  var j: i32 = 0;
+  while (j < n) : (j += 1) {
+    var i: i32 = 0;
+    while (i < m) : (i += 1) { y[i * n + j] = 0.0; }
+    var at: i32 = 0;
+    while (at < k) : (at += K_DOT_CHUNK) {
+      var len: i32 = k - at;
+      if (len > K_DOT_CHUNK) { len = K_DOT_CHUNK; }
+      k_unpack_bf16(@ptrcast([*]f32, &k_half_tmp), w, j * k + at, len);
+      i = 0;
+      while (i < m) : (i += 1) {
+        y[i * n + j] = y[i * n + j] + k_dot(a, i * k + at, @ptrcast([*]f32, &k_half_tmp), 0, len);
+      }
+    }
+  }
+}
+
+// @@ k_attend_packed
+// k_attend over a pool packed two bf16 a word: a key row is widened before
+// its dot and a value row (into vrow) before its accumulate.
+fn k_attend_packed(q: [*]f32, keys: [*]u32, values: [*]u32, vrow: [*]f32, idx: [*]i32, ptr: [*]i32, pos: [*]i32, req: [*]i32, en: [*]u32, mask: [*]u32, o: [*]f32, lse: [*]f32, acc: [*]f32, mrow: [*]u32,
+            sel: [*]i32, sblk: [*]u32, top_k: i32, ratio: i32,
+            r0: i32, r1: i32, kp0: i32, kh0: i32, kh1: i32, pr0: i32, pr1: i32, group: i32, d: i32, ps: i32, span: i32, mask_w: i32, mask_width: i32, scale: f32, window: i32, causal: bool, lanes: i32, has_lse: bool) void {
+  // A block selection (ratio > 0): row r reads the keys of the `ratio`-wide
+  // blocks its sel[r, 0..top_k) names among the closed blocks
+  // [0, (qpos + 1) / ratio), and every key of the open block after them.
+  var nblk_max: i32 = 0;
+  if (ratio > 0) { nblk_max = span / ratio + 1; }
+  // Of each page this PE holds rows [pr0, pr1) (row groups): its local
+  // pages are (pr1 - pr0) rows tall and it attends just those positions.
+  var psl: i32 = pr1 - pr0;
+  // This PE's pages hold the lane's keys from position kp0 on (page groups)
+  // and kv heads [kh0, kh1) of them (head groups): its key rows are
+  // (kh1 - kh0) * d wide, and its q, o and lse rows hold just the query
+  // heads of those kv heads.
+  var kwl: i32 = (kh1 - kh0) * d;
+  var h0: i32 = kh0 * group;
+  var h1: i32 = kh1 * group;
+  var lw: i32 = h1 - h0;
+  var dacc = @set_dsd_base_addr(k_base_f32, acc);
+  dacc = @set_dsd_length(dacc, @bitcast(u16, @as(i16, d)));
+  var r: i32 = r0;
+  while (r < r1) : (r += 1) {
+    var lane: i32 = req[r];
+    if (lane < 0) { lane = 0; } else if (lane >= lanes) { lane = lanes - 1; }
+    var qpos: i32 = pos[r];
+    var first_page: i32 = ptr[lane];
+    var count: i32 = ptr[lane + 1] - first_page;
+    var cap: i32 = kp0 + count * ps;
+    if (cap > span) { cap = span; }
+    var flag: u32 = en[r];
+    var hi: i32 = cap;
+    var wide: bool = !causal or flag == 2;
+    if (!wide) { hi = qpos + 1; if (hi > cap) { hi = cap; } }
+    var lo: i32 = 0;
+    if (window > 0 and qpos >= window) { lo = qpos - window + 1; }
+    if (lo < kp0) { lo = kp0; }
+    if (hi < lo) { hi = lo; }
+    if (flag != 0 and mask_w > 0) {
+      k_copy_u32(mrow, 0, mask, r * mask_width, mask_w);
+    }
+    var nblocks: i32 = 0;
+    if (ratio > 0) {
+      if (qpos + 1 > 0) { nblocks = (qpos + 1) / ratio; }
+      if (nblocks > nblk_max) { nblocks = nblk_max; }
+      var bi: i32 = 0;
+      while (bi < nblocks) : (bi += 1) { sblk[bi] = 0; }
+      var si: i32 = 0;
+      while (si < top_k) : (si += 1) {
+        var sb: i32 = sel[r * top_k + si];
+        if (sb >= 0 and sb < nblocks) { sblk[sb] = 1; }
+      }
+    }
+    var h: i32 = h0;
+    while (h < h1) : (h += 1) {
+      var kh: i32 = h / group;
+      var head: i32 = r * lw + (h - h0);
+      var qoff: i32 = head * d;
+      var m: f32 = 0.0;
+      var l: f32 = 0.0;
+      var any: bool = false;
+      var kp: i32 = 0;
+      while (kp < hi) : (kp += 1) {
+        if (kp < lo) { continue; }
+        if (flag != 0) {
+          if (kp >= mask_w) { continue; }
+          if (mrow[kp] == 0) { continue; }
+        }
+        if (ratio > 0) {
+          var blk: i32 = kp / ratio;
+          if (blk < nblocks and sblk[blk] == 0) { continue; }
+        }
+        var prow: i32 = (kp - kp0) % ps;
+        if (prow < pr0 or prow >= pr1) { continue; }
+        var page: i32 = idx[first_page + (kp - kp0) / ps];
+        if (page < 0) { continue; }
+        var slot: i32 = page * psl + (prow - pr0);
+        var koff: i32 = slot * kwl + (kh - kh0) * d;
+        var s: f32 = k_dot_packed(q, qoff, keys, koff, d) * scale;
+        k_unpack_bf16(vrow, values, koff, d);
+        var dv = @set_dsd_base_addr(k_base_f32, vrow);
+        dv = @set_dsd_length(dv, @bitcast(u16, @as(i16, d)));
+        if (!any) {
+          any = true;
+          m = s;
+          l = 1.0;
+          @fmovs(dacc, dv);
+        } else if (s > m) {
+          var alpha: f32 = math.exp_f32(m - s);
+          l = l * alpha + 1.0;
+          @fmuls(dacc, dacc, alpha);
+          @fadds(dacc, dacc, dv);
+          m = s;
+        } else {
+          var p: f32 = math.exp_f32(s - m);
+          l = l + p;
+          @fmacs(dacc, dacc, dv, p);
+        }
+      }
+      var dout = @set_dsd_base_addr(k_base_f32, o);
+      dout = @set_dsd_length(dout, @bitcast(u16, @as(i16, d)));
+      dout = @increment_dsd_offset(dout, @as(i16, qoff), f32);
+      if (any) {
+        @fmuls(dout, dacc, 1.0 / l);
+        if (has_lse) { lse[head] = (m + math.log_f32(l)) * 1.4426950408889634; }
+      } else {
+        var i: i32 = 0;
+        while (i < d) : (i += 1) { o[qoff + i] = 0.0; }
+        if (has_lse) { lse[head] = @bitcast(f32, @as(u32, 0xFF800000)); }
+      }
+    }
+  }
+}
+
+// @@ k_kv_append_packed
+// k_kv_append into a pool packed two bf16 a word (slot and w in elements).
+fn k_kv_append_packed(k: [*]f32, v: [*]f32, keys: [*]u32, values: [*]u32, page: [*]i32, off: [*]i32, r0: i32, r1: i32, w: i32, ps: i32, pages: i32, shared: bool) void {
+  var i: i32 = r0;
+  while (i < r1) : (i += 1) {
+    var pg: i32 = page[i];
+    var o: i32 = off[i];
+    if (pg >= 0 and pg < pages and o >= 0 and o < ps) {
+      var slot: i32 = pg * ps + o;
+      k_pack_bf16(keys, slot * w, k, i * w, w);
+      if (!shared) {
+        k_pack_bf16(values, slot * w, v, i * w, w);
+      }
+    }
+  }
+}

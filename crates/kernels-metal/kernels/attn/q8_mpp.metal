@@ -5,7 +5,7 @@ using namespace mpp::tensor_ops;
 #include "../common/mpp.metal"
 // KV is int8_t over a q8 pool, whose cells carry their own scale, and bfloat over a pool
 // stored as it was written.
-template <int D, bool DIRECT, typename KV>
+template <int D, bool DIRECT, typename KV, bool LSE = false>
 kernel void
 q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]],
        const device KV *values [[buffer(2)]], device bfloat *out [[buffer(3)]],
@@ -16,7 +16,7 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
        const device uchar *mask [[buffer(12)]], constant uint &mask_stride [[buffer(13)]],
        const device uchar *enabled [[buffer(14)]], constant int &window [[buffer(15)]],
        const device bfloat *sinks [[buffer(16)]], constant int &rows [[buffer(17)]],
-       uint2 tile [[threadgroup_position_in_grid]], uint2 grid [[threadgroups_per_grid]],
+       device float *lse [[buffer(18)]], uint2 tile [[threadgroup_position_in_grid]], uint2 grid [[threadgroups_per_grid]],
        uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
        uint sg [[simdgroup_index_in_threadgroup]]) {
   constexpr int M = 32, N = 32, SG = 8;
@@ -25,7 +25,9 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
   const int head = tile.x, heads = grid.x, kv = head / gqa, row0 = tile.y * M;
   threadgroup bfloat qs[DIRECT ? 1 : M * D];
   threadgroup float scores[M * N], maxima[M], totals[M], factors[M];
-  threadgroup bfloat probs[M * N];
+  // A 64-wide head keeps its probabilities in half, as the simdgroup kernel it replaces does.
+  using Prob = metal::conditional_t<D == 64, half, bfloat>;
+  threadgroup Prob probs[M * N];
   if constexpr (!DIRECT)
     for (uint i = tid; i < M * D; i += 256) {
       const uint r = i / D, d = i % D;
@@ -99,7 +101,7 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
         const float factor = totals[r] > 0 ? fast::exp(maxima[r] - newmax) : 0;
         const float e = keep ? fast::exp(s - newmax) : 0;
         const float total = simd_sum(e);
-        probs[r * N + lane] = bfloat(e * vs);
+        probs[r * N + lane] = Prob(e * vs);
         if (lane == 0) {
           maxima[r] = newmax;
           totals[r] = totals[r] * factor + total;
@@ -118,6 +120,12 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
     }
     sub = end;
   }
+  // The log-sum-exp in base 2 of each row's scaled scores, as the simdgroup kernel publishes it.
+  if constexpr (LSE)
+    for (uint r = tid; r < M; r += 256)
+      if (row0 + int(r) < rows)
+        lse[ulong(row0 + r) * heads + head] =
+            totals[r] > 0 ? maxima[r] * 1.44269504088896340736f + log2(totals[r]) : -INFINITY;
   mpp_for_each(acc, valid, [&](ushort i) __attribute__((always_inline)) {
     auto ix = acc.get_multidimensional_index(i);
     if (row0 + ix[1] < rows)
@@ -126,16 +134,19 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
   });
 }
 
-#define Q8_MPP(DIM, DIRECT, KV, NAME)                                                              \
-  template [[host_name(NAME)]] kernel void q8_mpp<DIM, DIRECT, KV>(                                \
+#define Q8_MPP_LSE(DIM, DIRECT, KV, LSE, NAME)                                                     \
+  template [[host_name(NAME)]] kernel void q8_mpp<DIM, DIRECT, KV, LSE>(                           \
       const device bfloat *, const device KV *, const device KV *, device bfloat *,                \
       constant int &, const device int *, const device int *, const device uint *,                 \
       const device uint *, constant int &, constant int &, constant float &, const device uchar *, \
       constant uint &, const device uchar *, constant int &, const device bfloat *,                \
-      constant int &, uint2, uint2, uint, uint, uint);
+      constant int &, device float *, uint2, uint2, uint, uint, uint);
+#define Q8_MPP(DIM, DIRECT, KV, NAME) Q8_MPP_LSE(DIM, DIRECT, KV, false, NAME)
 Q8_MPP(128, false, int8_t, "q8_mpp_d128")
 Q8_MPP(256, false, int8_t, "q8_mpp_d256")
 Q8_MPP(256, true, int8_t, "q8_visit_direct")
 Q8_MPP(128, false, bfloat, "sdpa_mpp_d128")
 Q8_MPP(256, false, bfloat, "sdpa_mpp_d256")
 Q8_MPP(256, true, bfloat, "sdpa_visit_direct")
+Q8_MPP(64, false, bfloat, "sdpa_mpp_d64")
+Q8_MPP_LSE(64, false, bfloat, true, "sdpa_mpp_lse_d64")

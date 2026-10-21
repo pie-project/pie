@@ -5,6 +5,8 @@ enum Round<'a> {
     Prompt(&'a [u32]),
     Draft,
     Verify(u32),
+    /// One token, folding every buffered row.
+    Plain,
 }
 
 async fn pass(
@@ -22,12 +24,12 @@ async fn pass(
     let slots = Channel::from_iter(base..end).named("spec_slots");
     let readouts = match round {
         Round::Prompt(_) => vec![count - 1],
-        Round::Draft | Round::Verify(_) => (0..count).collect(),
+        Round::Draft | Round::Verify(_) | Round::Plain => (0..count).collect(),
     };
     let shown = readouts.len() as u32;
     let readout = Channel::from(readouts).named("spec_readout");
     let fold = match round {
-        Round::Prompt(_) => None,
+        Round::Prompt(_) | Round::Plain => None,
         Round::Draft => Some(0),
         Round::Verify(survivors) => Some(survivors),
     };
@@ -68,6 +70,94 @@ async fn pass(
         .context("speculative readback")
 }
 
+/// Fire prices, the median of the last few of each shape, so the loop drafts
+/// only while a round returns more tokens a second than a plain fire.
+struct Prices {
+    draft: Vec<u64>,
+    /// Indexed by verify width; `[1]` is the plain fire.
+    verify: Vec<Vec<u64>>,
+}
+
+impl Prices {
+    const KEEP: usize = 5;
+
+    fn keep(bucket: &mut Vec<u64>, ns: u64) {
+        bucket.push(ns);
+        if bucket.len() > Self::KEEP {
+            bucket.remove(0);
+        }
+    }
+
+    fn median(bucket: &[u64]) -> Option<f64> {
+        if bucket.is_empty() {
+            return None;
+        }
+        let mut sorted = bucket.to_vec();
+        sorted.sort_unstable();
+        Some(sorted[sorted.len() / 2] as f64)
+    }
+
+    /// An unfired width prices on the line between the fired widths around
+    /// it (the plain fire is width 1), so a narrower rung gets tried.
+    fn round(&self, width: u32) -> Option<f64> {
+        let draft = Self::median(&self.draft)?;
+        let w = width as usize;
+        let below = (1..=w).rev().find_map(|v| Self::median(&self.verify[v]).map(|p| (v, p)))?;
+        let verify = match (w + 1..self.verify.len()).find_map(|v| Self::median(&self.verify[v]).map(|p| (v, p))) {
+            _ if below.0 == w => below.1,
+            Some(above) => below.1 + (above.1 - below.1) * (w - below.0) as f64 / (above.0 - below.0) as f64,
+            None => below.1,
+        };
+        Some(draft + verify)
+    }
+}
+
+/// Per-position acceptance, decayed so a changed text shows within a few rounds.
+struct Yield {
+    hits: Vec<f64>,
+    tries: Vec<f64>,
+}
+
+impl Yield {
+    const DECAY: f64 = 0.9;
+
+    /// A round verified `width - 1` proposals and kept the first `kept`.
+    fn record(&mut self, kept: usize, width: u32) {
+        for (h, t) in self.hits.iter_mut().zip(self.tries.iter_mut()) {
+            *h *= Self::DECAY;
+            *t *= Self::DECAY;
+        }
+        for i in 0..kept {
+            self.hits[i] += 1.0;
+            self.tries[i] += 1.0;
+        }
+        if kept + 1 < width as usize {
+            self.tries[kept] += 1.0;
+        }
+    }
+
+    /// Tokens a round at `width` is expected to emit, the target's own included.
+    fn expect(&self, width: u32) -> f64 {
+        let (mut chain, mut total, mut rate) = (1.0f64, 1.0f64, 1.0f64);
+        for i in 0..width.saturating_sub(1) as usize {
+            // An untried position takes the rate of the one before it.
+            if self.tries[i] > 0.0 {
+                rate = self.hits[i] / self.tries[i];
+            }
+            chain *= rate;
+            total += chain;
+        }
+        total
+    }
+}
+
+/// The widths a round may verify at: a fire's price is a staircase in rows.
+fn rungs(widest: u32) -> Vec<u32> {
+    let mut out: Vec<u32> = [2u32, 4, 8, 16].into_iter().filter(|w| *w < widest).collect();
+    out.push(widest);
+    out
+}
+
 pub async fn generate(
     prompt: &[u32],
     ends: &[u32],
@@ -76,6 +166,10 @@ pub async fn generate(
     on_token: &mut dyn FnMut(u32) -> ControlFlow<()>,
 ) -> Result<(usize, usize)> {
     let block = draft.rows;
+    // The first block row whose pick is a proposal (1 for DFlash, 0 for DSpark),
+    // and the widest verify a block feeds: the anchor and every proposal.
+    let from = draft.proposals_from.min(1) as usize;
+    let widest = block + 1 - from as u32;
     let ws = WorkingSet::new();
     let pipe = Pipeline::new();
     let prompt: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
@@ -88,21 +182,82 @@ pub async fn generate(
     }
     let mut held = prompt.len() as u32;
     let mut survivors = 0;
+    let mut prices = Prices { draft: Vec::new(), verify: vec![Vec::new(); widest as usize + 1] };
+    let mut yields = Yield { hits: vec![0.0; widest as usize], tries: vec![0.0; widest as usize] };
+    let rungs = rungs(widest);
+    // Plain fires left before drafting is tried again, and the gap the next
+    // closure waits: a probe that loses doubles it.
+    let (mut wait, mut backoff) = (0u32, 8u32);
+    let mut rounds = 0u32;
     while generated < max_tokens {
+        // Price the plain fire first; then draft at the widest rung until the
+        // yield is known, then at whichever width (or none) earns the most.
+        let best = rungs
+            .iter()
+            .filter_map(|&w| prices.round(w).map(|p| (w, yields.expect(w) / p)))
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        let width = match (Prices::median(&prices.verify[1]), best) {
+            (None, _) => None,
+            // Beside other requests a plain fire batches with theirs for
+            // nearly nothing, and a round would cost all of them.
+            _ if Pipeline::live() > 1 => None,
+            (Some(_), _) if rounds < 2 => Some(widest),
+            (Some(_), _) if wait > 1 => {
+                wait -= 1;
+                None
+            }
+            // The wait is over: one round probes whether drafting pays again.
+            (Some(_), Some((w, _))) if wait == 1 => {
+                wait = 0;
+                Some(w)
+            }
+            (Some(plain), Some((w, rate))) if rate * plain >= 1.0 => {
+                backoff = 8;
+                Some(w)
+            }
+            _ => {
+                wait = backoff;
+                backoff = (backoff * 2).min(256);
+                None
+            }
+        };
+        let Some(width) = width else {
+            // A plain fire folds whatever the last round buffered.
+            let fired = inferlet::monotonic_now_ns();
+            let truth = pass(&pipe, &ws, &[anchor], held, Round::Plain).await?;
+            if survivors == 0 {
+                Prices::keep(&mut prices.verify[1], inferlet::monotonic_now_ns() - fired);
+            }
+            survivors = 0;
+            anchor = truth[0];
+            held += 1;
+            generated += 1;
+            if on_token(anchor as u32).is_break() || generated == max_tokens {
+                pipe.close();
+                return Ok((generated, cached));
+            }
+            continue;
+        };
         // The draft and its verify write the same slots: the verify replaces
         // the draft, and the next round's slots replace what it rejected.
         let mut input = vec![draft.mask_token as i32; block as usize];
         input[0] = anchor;
+        let fired = inferlet::monotonic_now_ns();
         let picks = pass(&pipe, &ws, &input, held, Round::Draft).await?;
-        let proposals = &picks[1..block as usize];
+        Prices::keep(&mut prices.draft, inferlet::monotonic_now_ns() - fired);
+        let proposals = &picks[from..from + width as usize - 1];
         let mut verify = vec![anchor];
         verify.extend_from_slice(proposals);
+        let fired = inferlet::monotonic_now_ns();
         let truth = pass(&pipe, &ws, &verify, held, Round::Verify(survivors)).await?;
+        Prices::keep(&mut prices.verify[width as usize], inferlet::monotonic_now_ns() - fired);
         let kept = proposals
             .iter()
             .zip(&truth)
             .take_while(|(p, t)| p == t)
             .count();
+        yields.record(kept, width);
+        rounds += 1;
         survivors = kept as u32 + 1;
         anchor = truth[kept];
         held += survivors;

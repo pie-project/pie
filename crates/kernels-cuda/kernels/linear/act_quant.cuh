@@ -59,6 +59,20 @@ __device__ __forceinline__ unsigned e2m1_code(float v) {
     return (v < 0.f ? 8u : 0u) | c;
 }
 
+// Two values' e2m1 codes in a byte, `lo` in the low nibble: one conversion
+// on a B200 (whose -0 keeps its sign bit, a zero all the same).
+__device__ __forceinline__ u32 e2m1_pair(float lo, float hi) {
+#if defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM103_ALL)
+    u32 byte;
+    asm("{\n\t.reg .b8 q;\n\tcvt.rn.satfinite.e2m1x2.f32 q, %1, %2;\n\tcvt.u32.u8 %0, q;\n\t}"
+        : "=r"(byte)
+        : "f"(hi), "f"(lo));
+    return byte;
+#else
+    return e2m1_code(lo) | (e2m1_code(hi) << 4);
+#endif
+}
+
 __device__ __forceinline__ float e4m3_value(u8 b) {
     __nv_fp8_e4m3 v;
     v.__x = b;
@@ -93,6 +107,36 @@ __device__ __forceinline__ float global_of(const float* __restrict__ input_scale
     return __fdiv_rn(1.f, input_scales[e]);
 }
 
+// A 16-wide bf16 block read to `v`; its largest magnitude.
+__device__ __forceinline__ float load_block16(const bf16* __restrict__ x, float (&v)[16]) {
+    uint4 raw[2];
+    raw[0] = reinterpret_cast<const uint4*>(x)[0];
+    raw[1] = reinterpret_cast<const uint4*>(x)[1];
+    const bf16* h = reinterpret_cast<const bf16*>(raw);
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        v[i] = bf16_to_f32(h[i]);
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+    return amax;
+}
+
+// A 16-wide block's e2m1 codes `w` under global `gs`; its scale's e4m3 code.
+__device__ __forceinline__ u8 nvfp4_block16(const float (&v)[16], float amax, float gs, uint2& w) {
+    const u8 sf_code = __nv_cvt_float_to_fp8(gs * (amax * rcp_approx_ftz(6.f)), __NV_SATFINITE, __NV_E4M3);
+    const float sf_value = e4m3_value(sf_code);
+    const float out_scale = sf_value != 0.f ? rcp_approx_ftz(sf_value * rcp_approx_ftz(gs)) : 0.f;
+    u32 c[2] = {0u, 0u};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const u32 byte = e2m1_pair(v[2 * i] * out_scale, v[2 * i + 1] * out_scale);
+        c[i / 4] |= byte << (8 * (i % 4));
+    }
+    w = make_uint2(c[0], c[1]);
+    return sf_code;
+}
+
 // One thread a 16-wide block. Under `kFan` (codes only) row `r` is a token
 // read once, its block's codes landed at each of its `div` routes' rows
 // (`pos[r * div + j]`) under that route's expert's global, as each route's
@@ -117,45 +161,44 @@ __global__ void act_quant_nvfp4(
     const int r = static_cast<int>(at / blocks);
     const int b = static_cast<int>(at % blocks);
     if constexpr (kFan) {
-        uint4 raw[2];
-        const uint4* src = reinterpret_cast<const uint4*>(x + static_cast<long long>(r) * k + b * 16);
-        raw[0] = src[0];
-        raw[1] = src[1];
-        const bf16* h = reinterpret_cast<const bf16*>(raw);
         float v[16];
-        float amax = 0.f;
-#pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            v[i] = bf16_to_f32(h[i]);
-            amax = fmaxf(amax, fabsf(v[i]));
-        }
+        const float amax = load_block16(x + static_cast<long long>(r) * k + b * 16, v);
         // The routes' globals are one (load lays the experts' largest), so
-        // the block's codes are quantized once and land at each route.
-        float last_gs = -1.f;
+        // the block's codes are quantized once a global (its divide once a
+        // scale) and land at each route. Where a warp holds whole rows (and
+        // a row's routes fit it), lane j reads route j's row and scale once
+        // for the warp.
+        const int lane = threadIdx.x & 31;
+        const bool shared_routes = blocks % 32 == 0 && div <= 32;
+        int my_o = -1;
+        float my_scale = 0.f;
+        if (shared_routes && lane < div) {
+            my_o = pos[r * div + lane];
+            const int e = routes != nullptr ? routes[r * div + lane] : 0;
+            if (e < 0) my_o = -1;
+            if (my_o >= 0) my_scale = input_scales[e];
+        }
+        float last_scale = -1.f;
         uint2 w = make_uint2(0u, 0u);
         u8 sf_code = 0;
         for (int j = 0; j < div; ++j) {
-            const int route = r * div + j;
-            const int o = pos[route];
-            if (o < 0) continue;
-            bool dropped = false;
-            const float gs = global_of(input_scales, routes, route, &dropped);
-            if (dropped) continue;
-            if (gs != last_gs) {
-                last_gs = gs;
-                const float sf = gs * (amax * rcp_approx_ftz(6.f));
-                sf_code = __nv_cvt_float_to_fp8(sf, __NV_SATFINITE, __NV_E4M3);
-                const float sf_value = e4m3_value(sf_code);
-                const float out_scale =
-                    sf_value != 0.f ? rcp_approx_ftz(sf_value * rcp_approx_ftz(gs)) : 0.f;
-                u32 c[2] = {0u, 0u};
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    const u32 byte =
-                        e2m1_code(v[2 * i] * out_scale) | (e2m1_code(v[2 * i + 1] * out_scale) << 4);
-                    c[i / 4] |= byte << (8 * (i % 4));
-                }
-                w = make_uint2(c[0], c[1]);
+            int o;
+            float scale;
+            if (shared_routes) {
+                o = __shfl_sync(0xffffffffu, my_o, j);
+                scale = __shfl_sync(0xffffffffu, my_scale, j);
+                if (o < 0) continue;
+            } else {
+                const int route = r * div + j;
+                o = pos[route];
+                if (o < 0) continue;
+                const int e = routes != nullptr ? routes[route] : 0;
+                if (e < 0) continue;
+                scale = input_scales[e];
+            }
+            if (scale != last_scale) {
+                last_scale = scale;
+                sf_code = nvfp4_block16(v, amax, __fdiv_rn(1.f, scale), w);
             }
             *reinterpret_cast<uint2*>(codes + static_cast<long long>(o) * (k / 2) + b * 8) = w;
             atoms[atom_offset(atom_row(o, m_max), b, blocks)] = sf_code;
@@ -185,8 +228,7 @@ __global__ void act_quant_nvfp4(
         u8* dst = codes + static_cast<long long>(o) * (k / 2) + b * 8;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            dst[i] = static_cast<u8>(e2m1_code(v[2 * i] * out_scale)
-                                     | (e2m1_code(v[2 * i + 1] * out_scale) << 4));
+            dst[i] = static_cast<u8>(e2m1_pair(v[2 * i] * out_scale, v[2 * i + 1] * out_scale));
         }
         atoms[atom_offset(atom_row(o, m_max), b, blocks)] = sf_code;
     } else {
@@ -294,9 +336,10 @@ struct E4m3Block {
         for (int i = 0; i < 4; ++i) {
             const float lo = fminf(fmaxf(v[2 * i] * inv, -448.f), 448.f);
             const float hi = fminf(fmaxf(v[2 * i + 1] * inv, -448.f), 448.f);
-            unsigned short pair;
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(pair) : "f"(hi), "f"(lo));
-            half[i] = pair;
+            // The shim's convert: the instruction from sm_89, its portable
+            // rounding below (sm_80 serves its W8A16 load through here).
+            half[i] = static_cast<unsigned short>(
+                __nv_cvt_float2_to_fp8x2(make_float2(lo, hi), __NV_SATFINITE, __NV_E4M3));
         }
         return static_cast<unsigned long long>(half[0] | (half[1] << 16)) |
                (static_cast<unsigned long long>(half[2] | (half[3] << 16)) << 32);
@@ -395,6 +438,45 @@ __global__ void act_quant_e4m3_v8(
         *reinterpret_cast<uint4*>(values + static_cast<long long>(r) * k + b * kGran + sub * 8) =
             make_uint4(w[0], w[1], w[2], w[3]);
     }
+}
+
+// A gate-up's bf16 rows (`[rows][gate inter | up inter]`) through SwiGLU
+// (rounded to bf16, as a GLU landing them would) into e4m3 codes in 1x128
+// blocks at the same rows, eight a lane, `m_max` a masked layout's.
+__global__ void swiglu_quant_e4m3_v8(
+    const bf16* __restrict__ h, int rows, int inter, int m_max, u8* __restrict__ codes,
+    u8* __restrict__ atoms)
+{
+    pdl_wait();
+    pdl_launch();
+    using Block = E4m3Block<128>;
+    const int blocks = inter / 128;
+    const long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const long long slot = at / Block::kLanes;
+    const int lane = static_cast<int>(threadIdx.x % 32);
+    const bool live = slot < static_cast<long long>(rows) * blocks;
+    const long long sl = live ? slot : 0;
+    const int r = static_cast<int>(sl / blocks);
+    const int b = static_cast<int>(sl % blocks);
+    const bf16* g8 = h + static_cast<long long>(r) * 2 * inter + b * 128 + (lane % Block::kLanes) * 8;
+    const uint4 gw = *reinterpret_cast<const uint4*>(g8);
+    const uint4 uw = *reinterpret_cast<const uint4*>(g8 + inter);
+    const unsigned gs[4] = {gw.x, gw.y, gw.z, gw.w};
+    const unsigned us[4] = {uw.x, uw.y, uw.z, uw.w};
+    float y[8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const float g = __uint_as_float(j ? gs[i] & 0xFFFF0000u : gs[i] << 16);
+            const float u = __uint_as_float(j ? us[i] & 0xFFFF0000u : us[i] << 16);
+            y[2 * i + j] = g / (1.f + __expf(-g)) * u;
+        }
+    }
+    Block q;
+    q.hold(y);
+    if (!live) return;
+    q.store(codes, atoms, r, b, inter, m_max, lane);
 }
 
 // A 128x128-block FP8 plane under f32 block factors (DeepSeek-V3's and
@@ -640,6 +722,143 @@ __global__ void __launch_bounds__(kOffsetThreads) route_lay_out_small(
     }
 }
 
+// `route_lay_out_small` and the NVFP4 quantize of a narrow W4A4 fire (at
+// most 1024 routes over 512 experts) in one launch: every block lays the
+// routes out alike -- a route's rank its 32-route chunk's matches ahead of it
+// past the chunks before -- so each lands the same rows; block 0 lands the
+// layout and the experts' alphas, and each block quantizes its share of the
+// routes' 16-wide blocks to their rows. Dynamic shared memory: `33 * experts`
+// ints for the counts and starts, `count` for the rows.
+__global__ void __launch_bounds__(256) route_lay_out_quant_nvfp4(
+    const i32* __restrict__ routes,
+    int count,
+    int top,
+    const u32* __restrict__ win,
+    int experts,
+    int align,
+    i32* __restrict__ counts,
+    i32* __restrict__ offsets,
+    i32* __restrict__ pos,
+    const float* __restrict__ tensor_scales,
+    float* __restrict__ alpha,
+    int alpha_rows,
+    const float* __restrict__ tensor_scales2,
+    const float* __restrict__ input_scales2,
+    float* __restrict__ alpha2,
+    int alpha_rows2,
+    const bf16* __restrict__ x,
+    const float* __restrict__ input_scales,
+    u8* __restrict__ codes,
+    u8* __restrict__ atoms,
+    int k)
+{
+    // A programmatic dependent (`kernel.pdl`) reads nothing until its
+    // producer is done; its consumer (the gate-up GEMM) may launch from here.
+    pdl_wait();
+    pdl_launch();
+    extern __shared__ int lay[];
+    int* cnt = lay;                     // [32 chunks][experts]
+    int* start = lay + 32 * experts;    // [experts]
+    int* row = start + experts;         // [count]
+    __shared__ int run_sum[8];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31, warp = tid >> 5;
+    const int chunks = (count + 31) / 32;
+    for (int i = tid; i < chunks * experts; i += 256) cnt[i] = 0;
+    __syncthreads();
+    int rank[4], ex[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int c = warp + 8 * i;
+        const int r = c * 32 + lane;
+        int e = -1;
+        if (r < count) {
+            e = routes[r];
+            if (e < 0 || e >= experts || !route_live(r, top, win)) e = -1;
+        }
+        const unsigned m = __match_any_sync(0xffffffffu, e);
+        rank[i] = __popc(m & ((1u << lane) - 1u));
+        ex[i] = e;
+        if (c < chunks && e >= 0 && rank[i] == 0) cnt[c * experts + e] = __popc(m);
+    }
+    __syncthreads();
+    // Each expert's chunks prefixed in place, its rows (two experts a
+    // thread, experts <= 512).
+    constexpr int kPer = 2;
+    int rows_e[kPer], tally[kPer], sum = 0;
+#pragma unroll
+    for (int p = 0; p < kPer; ++p) {
+        const int e = tid * kPer + p;
+        tally[p] = 0;
+        rows_e[p] = 0;
+        if (e >= experts) continue;
+        for (int c = 0; c < chunks; ++c) {
+            const int v = cnt[c * experts + e];
+            cnt[c * experts + e] = tally[p];
+            tally[p] += v;
+        }
+        rows_e[p] = (tally[p] + align - 1) / align * align;
+        sum += rows_e[p];
+    }
+    // The experts' rows scanned.
+    int incl = sum;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const int y = __shfl_up_sync(0xffffffffu, incl, off);
+        if (lane >= off) incl += y;
+    }
+    if (lane == 31) run_sum[warp] = incl;
+    __syncthreads();
+    int before = 0;
+    for (int w = 0; w < warp; ++w) before += run_sum[w];
+    int at_e = before + incl - sum;
+#pragma unroll
+    for (int p = 0; p < kPer; ++p) {
+        const int e = tid * kPer + p;
+        if (e >= experts) continue;
+        start[e] = at_e;
+        if (blockIdx.x == 0) {
+            offsets[e] = at_e;
+            counts[e] = tally[p];
+            if (alpha != nullptr)
+                alpha[e] = input_scales[e] * tensor_scales[static_cast<long long>(e) * alpha_rows];
+            if (alpha2 != nullptr)
+                alpha2[e] = input_scales2[e] * tensor_scales2[static_cast<long long>(e) * alpha_rows2];
+        }
+        at_e += rows_e[p];
+    }
+    if (blockIdx.x == 0 && tid == 255) {
+        int total = 0;
+        for (int w = 0; w < 8; ++w) total += run_sum[w];
+        offsets[experts] = total;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int c = warp + 8 * i;
+        const int r = c * 32 + lane;
+        if (r < count) {
+            const int o = ex[i] >= 0 ? start[ex[i]] + cnt[c * experts + ex[i]] + rank[i] : -1;
+            row[r] = o;
+            if (blockIdx.x == 0) pos[r] = o;
+        }
+    }
+    __syncthreads();
+    // A thread a route's 16-wide block, under its expert's global.
+    const int blocks = k / 16;
+    for (long long at = static_cast<long long>(blockIdx.x) * 256 + tid; at < static_cast<long long>(count) * blocks;
+         at += static_cast<long long>(gridDim.x) * 256) {
+        const int r = static_cast<int>(at / blocks), b = static_cast<int>(at % blocks);
+        const int o = row[r];
+        if (o < 0) continue;
+        float v[16];
+        const float amax = load_block16(x + static_cast<long long>(r / top) * k + b * 16, v);
+        uint2 w;
+        atoms[atom_offset(o, b, blocks)] = nvfp4_block16(v, amax, __fdiv_rn(1.f, input_scales[routes[r]]), w);
+        *reinterpret_cast<uint2*>(codes + static_cast<long long>(o) * (k / 2) + b * 8) = w;
+    }
+}
+
 __global__ void __launch_bounds__(kOffsetThreads) route_offsets_scan(
     const i32* __restrict__ counts,
     int experts,
@@ -725,34 +944,58 @@ __global__ void route_gather_vec8(
     *dst = *reinterpret_cast<const uint4*>(grouped + static_cast<long long>(o) * n + c);
 }
 
-// The block's sum of `v`, as norm_gate's block folds it (warps, then the
-// warps' sums in the first); `part` is reusable on return.
-__device__ __forceinline__ float route_row_sum(float v, float* part)
+// A word's two bf16 as f32 (`lo` low).
+__device__ __forceinline__ float bf16x2_lo(u32 w) { return __uint_as_float(w << 16); }
+__device__ __forceinline__ float bf16x2_hi(u32 w) { return __uint_as_float(w & 0xffff0000u); }
+
+// Two bf16 products rounded once (an fma adding -0, which keeps a zero's
+// sign).
+__device__ __forceinline__ u32 bf16x2_mul(u32 a, u32 b)
+{
+    u32 w;
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(w) : "r"(a), "r"(b), "r"(0x80008000u));
+    return w;
+}
+
+// The block's sum of each of `v`'s K values, as norm_gate's block folds one
+// (warps, then the warps' sums in the first), all K at once; `part` holds
+// 33 * K and is reusable on return.
+template <int K>
+__device__ __forceinline__ void route_row_sums(float (&v)[K], float* part)
 {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
-    if (lane == 0) part[warp] = v;
-    __syncthreads();
-    if (warp == 0) {
-        float w = lane < static_cast<int>(blockDim.x >> 5) ? part[lane] : 0.f;
+    for (int k = 0; k < K; ++k) {
 #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) w += __shfl_xor_sync(0xffffffffu, w, off);
-        if (lane == 0) part[32] = w;
+        for (int off = 16; off > 0; off >>= 1) v[k] += __shfl_xor_sync(0xffffffffu, v[k], off);
+        if (lane == 0) part[warp * K + k] = v[k];
     }
     __syncthreads();
-    const float total = part[32];
+    if (warp == 0) {
+#pragma unroll
+        for (int k = 0; k < K; ++k) {
+            float w = lane < static_cast<int>(blockDim.x >> 5) ? part[lane * K + k] : 0.f;
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) w += __shfl_xor_sync(0xffffffffu, w, off);
+            if (lane == 0) part[32 * K + k] = w;
+        }
+    }
     __syncthreads();
-    return total;
+#pragma unroll
+    for (int k = 0; k < K; ++k) v[k] = part[32 * K + k];
+    __syncthreads();
 }
 
 // `moe_weighted_sum_vec8` of the grouped product read where it lies: token
 // t's eight columns from `grouped[pos[t * top + j]]`, weighted, summed in f32
 // in `j` order; a dropped route adds nothing. A token past the live window
-// (`win`, in tokens) is untouched. With a `scale`, a block holds the row
-// (`n / 8` threads) and each route is first normed as norm_gate norms it:
-// `u = x * scale` rounded, `u / rms(u)` rounded.
-__global__ void route_weighted_gather_vec8(
+// (`win`, in tokens) is untouched. Normed, a block holds the row (`n / 8`
+// threads) and each route is first normed as norm_gate norms it under
+// `scale`: `u = x * scale` rounded, `u / rms(u)` rounded (a row of at most
+// 4096). `kAheadNorm` normed routes are in flight at once (each normed by its
+// own block sum, the same whatever the batch).
+template <bool kNorm, int kAheadNorm = 2>
+__global__ void __launch_bounds__(kNorm ? 512 : 1024, kNorm ? (kAheadNorm > 2 ? 1 : 4) : 1) route_weighted_gather_vec8(
     const bf16* __restrict__ grouped,
     const i32* __restrict__ pos,
     const float* __restrict__ weights,
@@ -774,35 +1017,69 @@ __global__ void route_weighted_gather_vec8(
     float acc[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) acc[i] = 0.f;
-    __shared__ float part[33];
+    // Eight routes' rows (and weights) in flight at once, summed in route
+    // order: a row's latency paid once a batch, not once a route. Normed,
+    // `kAheadNorm`, their norms' block sums taken together: two lets a row's
+    // block fit four to a multiprocessor, which hides more latency than a
+    // deeper batch over a long fire; a decode's few rows' blocks leave the
+    // multiprocessors idle, and a deeper batch pays fewer rounds.
+    constexpr int kAhead = kNorm ? kAheadNorm : 8;
+    __shared__ float part[kNorm ? 33 * kAhead : 1];
     uint4 sv = {};
-    if (scale != nullptr) sv = *reinterpret_cast<const uint4*>(scale + h0);
-    const bf16* s8 = reinterpret_cast<const bf16*>(&sv);
+    if constexpr (kNorm) sv = *reinterpret_cast<const uint4*>(scale + h0);
     const long long base = static_cast<long long>(plane) * top;
-    for (int j = 0; j < top; ++j) {
-        const int o = pos[base + j];
-        if (o < 0) continue;
-        const uint4 w = *reinterpret_cast<const uint4*>(grouped + static_cast<long long>(o) * n + h0);
-        const bf16* v8 = reinterpret_cast<const bf16*>(&w);
-        float u[8];
+    for (int j0 = 0; j0 < top; j0 += kAhead) {
+        int at[kAhead];
+        uint4 rows[kAhead];
+        float wts[kAhead];
 #pragma unroll
-        for (int i = 0; i < 8; ++i) u[i] = bf16_to_f32(v8[i]);
-        if (scale != nullptr) {
-            float ss = 0.f;
+        for (int a = 0; a < kAhead; ++a) at[a] = j0 + a < top ? pos[base + j0 + a] : -1;
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                u[i] = bf16_to_f32(f32_to_bf16(u[i] * bf16_to_f32(s8[i])));
-                ss = fmaf(u[i], u[i], ss);
-            }
-            const float inv = rsqrtf(route_row_sum(ss, part) / static_cast<float>(n) + eps);
-#pragma unroll
-            for (int i = 0; i < 8; ++i) u[i] = bf16_to_f32(f32_to_bf16(u[i] * inv));
+        for (int a = 0; a < kAhead; ++a) {
+            rows[a] = at[a] >= 0 ? *reinterpret_cast<const uint4*>(grouped + static_cast<long long>(at[a]) * n + h0)
+                                 : uint4{};
+            // No weights: the routes already carry theirs (DeepSeek's, before
+            // the down leg), and moe_sum_add sums them as they are.
+            wts[a] = weights != nullptr && at[a] >= 0 ? weights[base + j0 + a] : 1.f;
         }
-        // No weights: the routes already carry theirs (DeepSeek's, before
-        // the down leg), and moe_sum_add sums them as they are.
-        const float wr = weights != nullptr ? weights[base + j] : 1.f;
+        if constexpr (kNorm) {
+            // Two values a word: `x * scale` rounded is one bf16 product
+            // (the f32 one is exact), and `u / rms(u)` rounds in pairs.
+            float inv[kAhead];
 #pragma unroll
-        for (int i = 0; i < 8; ++i) acc[i] += wr * u[i];
+            for (int a = 0; a < kAhead; ++a) {
+                u32* r = reinterpret_cast<u32*>(&rows[a]);
+                const u32* sc = reinterpret_cast<const u32*>(&sv);
+                inv[a] = 0.f;
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    r[w] = bf16x2_mul(r[w], sc[w]);
+                    inv[a] = fmaf(bf16x2_lo(r[w]), bf16x2_lo(r[w]), inv[a]);
+                    inv[a] = fmaf(bf16x2_hi(r[w]), bf16x2_hi(r[w]), inv[a]);
+                }
+            }
+            route_row_sums(inv, part);
+#pragma unroll
+            for (int a = 0; a < kAhead; ++a) {
+                if (at[a] < 0) continue;
+                const float v = rsqrtf(inv[a] / static_cast<float>(n) + eps), wr = wts[a];
+                const u32* r = reinterpret_cast<const u32*>(&rows[a]);
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    const u32 o = pack_bf16x2(bf16x2_lo(r[w]) * v, bf16x2_hi(r[w]) * v);
+                    acc[2 * w] += wr * bf16x2_lo(o);
+                    acc[2 * w + 1] += wr * bf16x2_hi(o);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int a = 0; a < kAhead; ++a) {
+                if (at[a] < 0) continue;
+                const bf16* v8 = reinterpret_cast<const bf16*>(&rows[a]);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[i] += wts[a] * bf16_to_f32(v8[i]);
+            }
+        }
     }
     // Qwen's shared expert under its sigmoid gate, as moe_sigmoid_gate_add
     // adds it; with no gate, the shared row added as it is (moe_sum_add).

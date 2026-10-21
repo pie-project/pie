@@ -630,6 +630,7 @@ pub fn emit_fused_region(
             &direct.intrinsic,
             &slots,
             gumbel.as_ref(),
+            dialect.cut_mark,
         );
 
         source.push_str(TAIL);
@@ -695,6 +696,7 @@ struct GumbelSlots {
     noise_desc: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_body(
     source: &mut String,
     stage: &CompiledStage,
@@ -703,6 +705,7 @@ fn emit_body(
     direct_intrinsic: &[u16],
     slots: &Slots,
     gumbel: Option<&GumbelSlots>,
+    cut_mark: &str,
 ) {
     let Slots { a0, a1, a2, o0, o1 } = slots;
     let tag = op.tag;
@@ -864,6 +867,7 @@ fn emit_body(
             "    if (threadIdx.x == 0u) ptir_scatter_updates({tag}u, {a1}, {a2}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2]);"
         );
     } else if tag == tags::PIVOT_THRESHOLD && op.pred_tag == 1 {
+        source.push_str(cut_mark);
         let _ = writeln!(
             source,
             "    ptir_parallel_pivot_cummass({a0}, {a1}, {o0}, descriptors[p.a0], descriptors[p.a1]);"

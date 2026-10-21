@@ -300,6 +300,8 @@ pub struct Module {
     #[cfg(feature = "device")]
     function: crate::device::dr::CUfunction,
     block_threads: u32,
+    /// The dynamic shared memory each launch hands it.
+    dynamic_shared: u32,
     entry_name: String,
 }
 
@@ -312,7 +314,9 @@ unsafe impl Send for Module {}
 unsafe impl Sync for Module {}
 
 impl Module {
-    pub fn load(cubin: &[u8], entry_name: &str) -> Result<Module> {
+    /// `dynamic_shared` bytes of dynamic shared memory each launch hands
+    /// the entry, its allowance raised to them here.
+    pub fn load(cubin: &[u8], entry_name: &str, dynamic_shared: u32) -> Result<Module> {
         if cubin.is_empty() {
             return Err(Fault::program("cuModuleLoadData", "the cubin is empty"));
         }
@@ -352,18 +356,44 @@ impl Module {
                     code: code as i32,
                 });
             }
+            // ROCm keeps the cut's state static and never asks for any.
+            #[cfg(not(feature = "rocm"))]
+            if dynamic_shared > 0 {
+                // SAFETY: `function` was just resolved out of the loaded module.
+                let code = unsafe {
+                    dr::cuFuncSetAttribute(
+                        function,
+                        dr::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        i32::try_from(dynamic_shared).unwrap_or(i32::MAX),
+                    )
+                };
+                if code != dr::CUresult::CUDA_SUCCESS {
+                    // SAFETY: as above, no function of it is in flight.
+                    unsafe { dr::cuModuleUnload(module) };
+                    return Err(Fault::Device {
+                        call: "cuFuncSetAttribute",
+                        code: code as i32,
+                    });
+                }
+            }
             Ok(Module {
                 module,
                 function,
                 block_threads: launch_width(function),
+                dynamic_shared,
                 entry_name: entry_name.to_string(),
             })
         }
         #[cfg(not(feature = "device"))]
         {
-            let _ = entry_name;
+            let _ = (entry_name, dynamic_shared);
             Err(Fault::Runtimeless)
         }
+    }
+
+    #[must_use]
+    pub const fn dynamic_shared(&self) -> u32 {
+        self.dynamic_shared
     }
 
     #[cfg(feature = "device")]
@@ -822,8 +852,17 @@ impl Cache {
         architecture: &str,
     ) -> std::result::Result<Arc<Module>, Failure> {
         let key = disk_key(identity, source);
+        // CUDA keeps the exact cut's state in dynamic shared memory; HIP's
+        // text keeps it static.
+        let dynamic = if !cfg!(feature = "rocm")
+            && source.contains(eta_compiler::codegen::cuda::CUT_STATE_MARK)
+        {
+            eta_compiler::codegen::cuda::CUT_STATE_BYTES
+        } else {
+            0
+        };
         if let Some(cubin) = self.disk.load(&key, region_index, entry) {
-            match Module::load(&cubin, entry) {
+            match Module::load(&cubin, entry, dynamic) {
                 Ok(module) => {
                     self.stats.persistent_hits += 1;
                     return Ok(Arc::new(module));
@@ -834,7 +873,7 @@ impl Cache {
 
         let cubin = compile(source, architecture)?;
         self.stats.compilations += 1;
-        let module = Module::load(&cubin, entry).map_err(|error| Failure::Retryable {
+        let module = Module::load(&cubin, entry, dynamic).map_err(|error| Failure::Retryable {
             reason: format!("loading `{entry}`: {error}"),
         })?;
         self.disk.store(&key, region_index, entry, &cubin);

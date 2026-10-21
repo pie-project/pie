@@ -73,6 +73,10 @@ pub struct Root {
     /// plain one: tcgen05, TMEM and the block-scaled MMAs exist only there,
     /// and a cubin built for it loads on that exact chip alone.
     pub specific: bool,
+    /// Compiled for the arch-specific target where the chip has tcgen05
+    /// (its instructions behind the target's feature macros), the plain one
+    /// elsewhere.
+    pub tcgen05_twin: bool,
 }
 
 const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
@@ -106,7 +110,12 @@ const SPECIFIC: &[(&str, Toolchain)] = &[
     ("attn/mla_sparse.cuh", Toolchain::new(12, 9)),
     ("attn/gdn_tc5.cuh", Toolchain::new(12, 9)),
     ("linear/moe_w4_cvt.cuh", Toolchain::new(12, 9)),
+    ("linear/moe_wgmma.cuh", Toolchain::ANY),
 ];
+
+/// The units compiled for the arch-specific target on a tcgen05 chip and the
+/// plain one elsewhere: the per-route NVFP4 quant's e2m1 conversion.
+const TCGEN05_TWIN: &[&str] = &["linear/act_quant.cuh"];
 
 const fn specific_for(file: &str) -> Option<Toolchain> {
     let mut i = 0;
@@ -139,6 +148,7 @@ impl Root {
         let name = file.strip_suffix(".cuh")?;
         let (options, headers, floor) = configured_for(file);
         let (specific, floor) = specific_for(file).map_or((false, floor), |floor| (true, floor));
+        let tcgen05_twin = TCGEN05_TWIN.contains(&file);
         Some(Self {
             name,
             text,
@@ -147,6 +157,7 @@ impl Root {
             headers,
             floor,
             specific,
+            tcgen05_twin,
         })
     }
 
@@ -175,11 +186,12 @@ impl Root {
     }
 
     /// The target this unit compiles for on a device whose plain target is
-    /// `arch`: that one, or its arch-specific twin when the unit asks for
-    /// it. `None` when the unit asks and the device has no twin.
+    /// `arch` (with tcgen05 where `tcgen05`): that one, or its arch-specific
+    /// twin when the unit asks for it. `None` when the unit asks and the
+    /// device has no twin.
     #[must_use]
-    pub fn target(&self, arch: &str) -> Option<String> {
-        if self.specific {
+    pub fn target(&self, arch: &str, tcgen05: bool) -> Option<String> {
+        if self.specific || (self.tcgen05_twin && tcgen05) {
             specific_of(arch)
         } else {
             Some(arch.to_owned())
@@ -319,10 +331,10 @@ mod tests {
     fn an_arch_specific_unit_keys_apart_from_the_plain_one() {
         let plain = Root::of("linear/skinny.cuh").expect("a carried unit");
         let specific = plain.arch_specific();
-        let a = plain.key("x", &plain.target("sm_100").expect("plain"));
-        let b = specific.key("x", &specific.target("sm_100").expect("twin"));
+        let a = plain.key("x", &plain.target("sm_100", true).expect("plain"));
+        let b = specific.key("x", &specific.target("sm_100", true).expect("twin"));
         assert_ne!(a, b, "an sm_100a cubin must not answer for an sm_100 one");
         assert!(b.contains("/sm_100a/"), "{b}");
-        assert_eq!(specific.target("sm_89"), None);
+        assert_eq!(specific.target("sm_89", false), None);
     }
 }

@@ -124,6 +124,12 @@ using VariantCustomSoftcap = ::flashinfer::DefaultAttention<true, true, true, fa
 using DecodeParams = ::flashinfer::BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 using PrefillParams = ::flashinfer::BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 
+// An e4m3 pool's (vLLM's `fp8` KV, a unit scale): its pages read as they
+// are, the queries bf16.
+using DTypeKV8 = __nv_fp8_e4m3;
+using DecodeParams8 = ::flashinfer::BatchDecodeParams<DTypeQ, DTypeKV8, DTypeO, IdType>;
+using PrefillParams8 = ::flashinfer::BatchPrefillPagedParams<DTypeQ, DTypeKV8, DTypeO, IdType>;
+
 using CaptureWindow = PieScoreCapture<VariantWindow>;
 using CaptureFull = PieScoreCapture<VariantFull>;
 using CapturePrefill = PieScoreCaptureWindow<VariantFull>;
@@ -196,10 +202,10 @@ using PrefillRelParams = RelBiasParams<PrefillParams>;
 template <::flashinfer::MaskMode MASK, std::uint32_t CTA_TILE_Q, std::uint32_t NUM_MMA_Q,
           std::uint32_t NUM_MMA_KV, std::uint32_t NUM_MMA_D_QK, std::uint32_t NUM_MMA_D_VO,
           std::uint32_t NUM_WARPS_Q, std::uint32_t NUM_WARPS_KV, class Variant,
-          class Params = PrefillParams>
+          class Params = PrefillParams, class KV = DTypeKV>
 using PagedTraits =
     ::flashinfer::KernelTraits<MASK, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
-                              NUM_WARPS_Q, NUM_WARPS_KV, POS_ENC, DTypeQ, DTypeKV, DTypeO, float,
+                              NUM_WARPS_Q, NUM_WARPS_KV, POS_ENC, DTypeQ, KV, DTypeO, float,
                               IdType, Variant>;
 
 template <class KTraits>
@@ -357,8 +363,9 @@ using IdType = std::int32_t;
 // output and log-sum-exp. A row of no partials lands zeros and -inf, one
 // partial lands as it stands. `win` is the staged `(count, start)` seat.
 // With `sinks`, each head's output is scaled as `sink_rescale` scales it,
-// by 1 / (1 + exp(sink - lse)), from the f32 sum before it rounds.
-template <int HEAD_DIM, class S = float>
+// by 1 / (1 + exp(sink - lse)), from the f32 sum before it rounds. Rows lie
+// HEAD_DIM apart; LIVE of their columns are folded (the rest no one's).
+template <int HEAD_DIM, class S = float, int LIVE = HEAD_DIM>
 __global__ void __launch_bounds__(256) merge_partials_warp(
     const merge_lse::DTypeIn* __restrict__ v,
     const float* __restrict__ s,
@@ -371,8 +378,8 @@ __global__ void __launch_bounds__(256) merge_partials_warp(
     const S* __restrict__ sinks,
     const u32* __restrict__ win)
 {
-    static_assert(HEAD_DIM % 64 == 0, "two columns a lane at least");
-    constexpr int PER = HEAD_DIM / 32;
+    static_assert(LIVE % 64 == 0 && LIVE <= HEAD_DIM, "two columns a lane at least");
+    constexpr int PER = LIVE / 32;
     const u32 staged = seq_len_ptr != nullptr ? *seq_len_ptr : max_seq_len;
     const u32 rows = (win != nullptr && win[0] < staged) ? win[0] : staged;
     const u32 row_base = win != nullptr ? win[1] : 0;

@@ -370,6 +370,7 @@ fn the_kv_ends_land_what_the_host_lands() {
         last_page_lens,
         max_pages_per_request: 3,
         pages_in_batch: 6,
+        live: [0, 0],
         ..pool
     };
     let (req_t, ends_at) = (

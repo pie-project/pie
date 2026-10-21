@@ -124,6 +124,15 @@ fn lanes_carry(
     ))
 }
 
+/// The width of the pool's pages as the FA2 kernels read them.
+fn kv_width(pool: &KvPool) -> fa2::KvWidth {
+    if kv::native_e4m3(pool) {
+        fa2::KvWidth::E4M3
+    } else {
+        fa2::KvWidth::BF16
+    }
+}
+
 fn pool_buffers(q_ptr: u64, pool: &KvPool, plan_ws: plan::Workspace, o_ptr: u64) -> Buffers {
     Buffers {
         q: q_ptr,
@@ -209,6 +218,7 @@ fn fa2_decode_with(
         head_dim: plan.shape.head_dim,
         group_size: plan.shape.group_size(),
         arm,
+        kv: kv_width(pool),
         padded_batch_size: params.padded_batch_size,
         num_kv_heads: plan.shape.num_kv_heads,
         device: plan.device,
@@ -224,11 +234,11 @@ fn fa2_decode_with(
                 partition_kv: false,
                 ..params
             };
-            xqa::decode(ctx, op, plan, &direct, sinks)?;
+            xqa::decode(ctx, op, plan, &direct, sinks, kv::native_e4m3(pool))?;
             return Ok(sinks.is_some());
         }
         None if tensor_cores => {
-            xqa::decode(ctx, op, plan, &params, sinks)?;
+            xqa::decode(ctx, op, plan, &params, sinks, kv::native_e4m3(pool))?;
             if !plan.info.split_kv {
                 return Ok(sinks.is_some());
             }
@@ -365,10 +375,29 @@ fn fa2_prefill_with(
         params.maybe_custom_mask = bits.ptr;
         params.maybe_mask_indptr = indptr.ptr;
     }
+    // A bf16 pool's live widths, read out of its wider heads where the
+    // profile says (`kernel.sdpa.fa2_live`): the padding past them is zeros
+    // the product need not read.
+    let head = plan.shape.head_dim;
+    let [lk, lv] = pool.live;
+    let widths = if ctx.tuning().fa2_live
+        && kv_width(pool) == fa2::KvWidth::BF16
+        && pool.live != [head; 2]
+        && lk <= head
+        && (64..=head).contains(&lv)
+        && lk.is_multiple_of(16)
+        && lv.is_multiple_of(16)
+    {
+        [lk, lv]
+    } else {
+        [head; 2]
+    };
     let point = |arm| fa2::PrefillPoint {
         head_dim: plan.shape.head_dim,
+        widths,
         cta_tile_q: plan.cta_tile_q(),
         arm,
+        kv: kv_width(pool),
         padded_batch_size: params.padded_batch_size,
         num_kv_heads: plan.shape.num_kv_heads,
         device: plan.device,
@@ -408,6 +437,10 @@ fn fa2_prefill_with(
         }
     }
     if plan.info.split_kv {
+        let split = fa2_abi::Partials {
+            live: if widths == [head; 2] { 0 } else { widths[1] },
+            ..split
+        };
         fa2::fold(ctx, op, &sinked(split, sinks))
     } else {
         Ok(false)

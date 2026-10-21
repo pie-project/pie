@@ -38,7 +38,7 @@ pub struct MoeTc5From(pub u32);
 /// register-dequant MMA kernel with; 0 (never) but where a chip's profile
 /// says (B200's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.mxfp4_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
+#[decision(id = "kernel.moe.mxfp4_mma_until", constant(range(0..=16_777_216)), default = 0, tune = search)]
 pub struct MoeMxfp4MmaUntil(pub u32);
 
 /// The routes a routed NVFP4 select of bf16 activations (W4A16) runs on the
@@ -109,12 +109,45 @@ pub struct GemmSplitLaunchFrom(pub u32);
 #[decision(id = "kernel.moe.w4a4_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct MoeW4a4FusedFrom(pub u32);
 
+/// The fewest waves of units a swapped grouped tcgen05 GEMM (a decode's
+/// routed experts) spans before it deals them over the fewest CTAs that keep
+/// its waves, the same count each, rather than a CTA an SM with the last
+/// wave part full (a launch of two waves' short units hides their latency
+/// on the SMs it would retire). 0, never, but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.even_waves_from", constant(range(0..=64)), default = 0, tune = search)]
+pub struct MoeEvenWavesFrom(pub u32);
+
+/// Whether a grouped tcgen05 GEMM's shared memory holds its routing for the
+/// bank's experts alone rather than the most a launch routes (1028), the
+/// room going to the ring: Muse Spark's bs64 W4A4 down leg takes a fourth
+/// stage. Off but where a chip's profile turns it on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.routes_sized", flag, default = false, tune = search)]
+pub struct MoeRoutesSized;
+
+/// The most tokens a routed MLP's normed gather (Muse Spark's routes, each
+/// normed under its scale before the weighted sum) takes with eight routes in
+/// flight a round rather than two: a decode's few row blocks leave the
+/// multiprocessors idle, so a deeper batch pays fewer rounds of load and
+/// block sum (the same bits: each route's sum is its own, the routes added
+/// in order). 0, never, but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.gather_ahead_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeGatherAheadUntil(pub u32);
+
 /// The fewest rows the fused qkv norm, rotation and KV write takes a block a
 /// row (a warp a head below): 64 but where a chip's profile says (B200's,
 /// where 64 decode rows' blocks leave most SMs idle).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.attn.qkv_rows_from", constant(range(1..=65_536)), default = 64, tune = search)]
 pub struct AttnQkvRowsFrom(pub u32);
+
+/// Whether a narrow W4A4 routed MLP lays its routes out and quantizes their
+/// rows in one launch. Off but where a chip's profile turns it on (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.w4a4_fused_layout", flag, default = false, tune = search)]
+pub struct MoeW4a4FusedLayout;
 
 /// Whether a KDA prefill walks its chunks on the tensor cores (a chunk's
 /// update directions in parallel, then the state chunk by chunk) instead of
@@ -159,6 +192,13 @@ pub struct MlaExpandedFrom(pub u32);
 #[decision(id = "kernel.gemm.fp8_gemv_until", constant(range(0..=64)), default = 0, tune = search)]
 pub struct GemmFp8GemvUntil(pub u32);
 
+/// Whether a block-FP8 dense projection read at bf16 activations (no
+/// tcgen05) keeps a bf16 copy widened once at load beside its codes: a
+/// batch's rows run cuBLAS on it, a decode's few the codes (half the bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.fp8_shadow", flag, default = false, tune = search)]
+pub struct GemmFp8Shadow;
+
 /// The most rows a dense fp8b128 projection runs on the mma.sync fp8
 /// kernel (`moe::dense_fp8_shape` says where it leads, in which CTA
 /// shape), its rows quantized in the same launch. 0: never.
@@ -185,6 +225,19 @@ pub struct GemmBiasEpilogue;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.mxfp4_mma_from", constant(range(1..=65_536)), default = 64, tune = search)]
 pub struct MoeMxfp4MmaFrom(pub u32);
+
+/// The fewest routes a routed bf16 select runs on the graph-safe grouped
+/// mma.sync kernel with (`moe_select_bf16_mma`), rather than the per-route
+/// GEMV. Bf16 experts have no tcgen05 or cuBLAS grouped path under a
+/// captured graph, so this is their only fast route. 0 never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.bf16_mma_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeBf16MmaFrom(pub u32);
+
+/// The most routes the bf16 grouped mma.sync kernel takes (0 never).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.bf16_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeBf16MmaUntil(pub u32);
 
 /// Whether the register-dequant mxfp4 select turns its codes into f16 with
 /// the e2m1 converts of the arch-specific Blackwells (`linear/moe_w4_cvt.cuh`)
@@ -401,6 +454,12 @@ pub enum MlaPath {
 #[decision(id = "kernel.qmm.gemm_from", constant(range(1..=4096)), default = 16, tune = search)]
 pub struct QmmGemmFrom(pub u32);
 
+/// The rows from which a tiled four-bit decode point multiplies on the
+/// tensor cores (`gemv_affine_tiled_mma`); below, on the CUDA cores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.qmm.gemv_mma_from", constant(range(1..=17)), default = 2, tune = search)]
+pub struct QmmGemvMmaFrom(pub u32);
+
 /// The fewest rows the tiled quantised GEMM takes its long tile (64 x 128,
 /// 2 stages) for; fewer take the short one (32 x 128, 4 stages).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -493,6 +552,14 @@ pub struct SsmGdnFusedScan;
 #[decision(id = "kernel.ssm.gdn_tc5", flag, default = false, tune = search)]
 pub struct SsmGdnTc5;
 
+/// The fire rows up to which a gated delta fire runs the sequential scan
+/// (`ssm_gated_delta_chunked_batched_fla`) over the chunked walk: a verify's
+/// or a fold's handful of rows barely fill a chunk, and the scan reads each
+/// lane's state once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_scan_until", constant(range(0..=4096)), default = 32, tune = search)]
+pub struct SsmGdnScanUntil(pub u32);
+
 /// Whether the row kernels a prefill streams run their bandwidth-shaped
 /// forms: a 128- or 256-wide RMS norm a warp a row (per head or whole), a
 /// scale-free per-head norm of whole 256-element runs a warp a head, the
@@ -533,6 +600,28 @@ pub struct SsmConvVec4;
 #[decision(id = "kernel.ssm.gdn_out_bf16", flag, default = false, tune = search)]
 pub struct SsmGdnOutBf16;
 
+/// The most blocks an SM seats of the fused gated delta decode step: 4 but
+/// where a chip's profile says (A100's 3: its persistent warps stream the
+/// state 7% faster).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_step_blocks", constant(set(1, 2, 3, 4)), default = 4, tune = search)]
+pub struct SsmGdnStepBlocks(pub u32);
+
+/// Whether the per-route MXFP4 and NVFP4 selects (a decode's few routes an
+/// expert, and NVFP4's dense product) run lean: two-warp blocks, one code
+/// block a row in flight a lane, the codes widened by integer ops, no
+/// converts. Off but where a chip's profile turns it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_select_lean", flag, default = false, tune = search)]
+pub struct MoeMxfp4SelectLean;
+
+/// Whether a strided grouped bf16 projection at one row (DeepSeek-V4.1's
+/// grouped output LoRA at decode) is one GEMV over every group's rows rather
+/// than batched cuBLAS. Off but where a chip's profile turns it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.grouped_gemv", flag, default = false, tune = search)]
+pub struct GemmGroupedGemv;
+
 /// Whether a prefill the tcgen05 FMHA (`attn/tc5_fmha.cuh`, sm_100a) can
 /// serve runs on it; off, FA2 serves every prefill, as before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -559,6 +648,21 @@ pub struct DecodeGroupedPrefillFrom(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.decode.grouped_prefill_lse", flag, default = false, tune = search)]
 pub struct DecodeGroupedPrefillLse;
+
+/// Whether those log-sum-exp rows take the prefill kernel under a sliding
+/// window too (MiMo's sink layers: a wide group the decode kernel walks on
+/// CUDA cores).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.grouped_prefill_window", flag, default = false, tune = search)]
+pub struct DecodeGroupedPrefillWindow;
+
+/// Whether the FA2 prefill kernel (a decode's grouped rows too) reads a
+/// pool's live widths out of its wider heads (MiMo's 192-wide keys and
+/// 128-wide values stored 256 wide), not the padding. Off but where a chip's
+/// profile turns it on (A100's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.fa2_live", flag, default = false, tune = search)]
+pub struct Fa2Live;
 
 /// Whether a paged decode of a group of at most eight query heads reads its
 /// cache on tensor cores (`attn/xqa.cuh`, the group's rows one MMA tile)
@@ -587,6 +691,15 @@ pub struct DecodeXqaWholeWindow(pub u32);
 #[decision(id = "kernel.sdpa.decode.xqa_cluster", constant(set(0, 1, 2, 4, 8)), default = 0, tune = search)]
 pub struct DecodeXqaCluster(pub u32);
 
+/// Whether a 64-wide tensor-core decode over a bf16 pool keeps three key
+/// tiles in flight a warp rather than two, its key rows swizzled rather than
+/// padded so four blocks still share an SM: a decode's two or three tiles a
+/// warp load at once, one memory latency rather than two. The same products,
+/// so the same bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.xqa_deep_64", flag, default = false, tune = search)]
+pub struct DecodeXqaDeep64;
+
 /// Whether a split attention's partial states fold a warp a (row, head)
 /// rather than through the staged persistent merge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -605,6 +718,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemvSplitkMaxN>()
         .add::<MlaPath>()
         .add::<QmmGemmFrom>()
+        .add::<QmmGemvMmaFrom>()
         .add::<QmmLongRows>()
         .add::<QmmSplitWarpsPerSm>()
         .add::<QmmSplitThinMax>()
@@ -626,14 +740,20 @@ pub fn register(registry: &mut Registry) {
         .add::<Dsv4DecodeUntil>()
         .add::<SsmGdnFusedScan>()
         .add::<SsmGdnTc5>()
+        .add::<SsmGdnScanUntil>()
         .add::<ElemwiseRowsVec>()
         .add::<ElemwiseHcTile>()
         .add::<ElemwiseHcMma>()
         .add::<SsmConvVec4>()
         .add::<SsmGdnOutBf16>()
+        .add::<SsmGdnStepBlocks>()
+        .add::<MoeMxfp4SelectLean>()
+        .add::<GemmGroupedGemv>()
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
+        .add::<MoeBf16MmaFrom>()
+        .add::<MoeBf16MmaUntil>()
         .add::<MoeMxfp4Cvt>()
         .add::<MoeMxfp4CvtKsplitUntil>()
         .add::<GemmFp8ODown>()
@@ -644,9 +764,14 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeW4a8FusedFrom>()
         .add::<MlaExpandedFrom>()
         .add::<GemmFp8GemvUntil>()
+        .add::<GemmFp8Shadow>()
         .add::<GemmFp8MmaGemvUntil>()
         .add::<AttnResFusedNorm>()
         .add::<SsmKdaChunked>()
+        .add::<MoeW4a4FusedLayout>()
+        .add::<MoeEvenWavesFrom>()
+        .add::<MoeRoutesSized>()
+        .add::<MoeGatherAheadUntil>()
         .add::<AttnQkvRowsFrom>()
         .add::<SsmKdaStepFused>()
         .add::<GemmSplitLaunchNs>()
@@ -661,10 +786,13 @@ pub fn register(registry: &mut Registry) {
         .add::<PrefillWideSliding>()
         .add::<DecodeGroupedPrefillFrom>()
         .add::<DecodeGroupedPrefillLse>()
+        .add::<DecodeGroupedPrefillWindow>()
+        .add::<Fa2Live>()
         .add::<DecodeXqa>()
         .add::<DecodeXqaFrom64>()
         .add::<DecodeXqaWholeWindow>()
         .add::<DecodeXqaCluster>()
+        .add::<DecodeXqaDeep64>()
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<SdpaIndexTc5>()
@@ -719,6 +847,7 @@ tuning! {
     /// `kernel.mla.path = naive`.
     mla_naive: bool = false, is MlaPath::Naive;
     qmm_gemm_from: u32 = 16, get QmmGemmFrom;
+    qmm_gemv_mma_from: u32 = 2, get QmmGemvMmaFrom;
     qmm_long_rows: u32 = 512, get QmmLongRows;
     qmm_split_warps_per_sm: u32 = 58, get QmmSplitWarpsPerSm;
     qmm_split_thin_max: u32 = 32, get QmmSplitThinMax;
@@ -740,14 +869,20 @@ tuning! {
     dsv4_decode_until: u32 = 0, get Dsv4DecodeUntil;
     ssm_gdn_fused_scan: bool = false, on SsmGdnFusedScan;
     ssm_gdn_tc5: bool = false, on SsmGdnTc5;
+    ssm_gdn_scan_until: u32 = 32, get SsmGdnScanUntil;
     rows_vec: bool = false, on ElemwiseRowsVec;
     hc_tile: bool = false, on ElemwiseHcTile;
     hc_mma: bool = false, on ElemwiseHcMma;
     ssm_conv_vec4: bool = false, on SsmConvVec4;
     ssm_gdn_out_bf16: bool = false, on SsmGdnOutBf16;
+    ssm_gdn_step_blocks: u32 = 4, get SsmGdnStepBlocks;
+    mxfp4_select_lean: bool = false, on MoeMxfp4SelectLean;
+    grouped_gemv: bool = false, on GemmGroupedGemv;
     merge_warp: bool = false, on SdpaMergeWarp;
     mxfp4_mma_until: u32 = 0, get MoeMxfp4MmaUntil;
     mxfp4_mma_from: u32 = 64, get MoeMxfp4MmaFrom;
+    bf16_mma_from: u32 = 0, get MoeBf16MmaFrom;
+    bf16_mma_until: u32 = 0, get MoeBf16MmaUntil;
     mxfp4_cvt: bool = false, on MoeMxfp4Cvt;
     mxfp4_cvt_ksplit_until: u32 = 0, get MoeMxfp4CvtKsplitUntil;
     fp8_o_down: bool = false, on GemmFp8ODown;
@@ -758,9 +893,14 @@ tuning! {
     moe_w4a8_fused_from: u32 = 65_536, get MoeW4a8FusedFrom;
     mla_expanded_from: u32 = 65_536, get MlaExpandedFrom;
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
+    gemm_fp8_shadow: bool = false, on GemmFp8Shadow;
     gemm_fp8_mma_gemv_until: u32 = 0, get GemmFp8MmaGemvUntil;
     attn_res_fused_norm: bool = false, on AttnResFusedNorm;
     ssm_kda_chunked: bool = false, on SsmKdaChunked;
+    moe_w4a4_fused_layout: bool = false, on MoeW4a4FusedLayout;
+    moe_even_waves_from: u32 = 0, get MoeEvenWavesFrom;
+    moe_routes_sized: bool = false, on MoeRoutesSized;
+    moe_gather_ahead_until: u32 = 0, get MoeGatherAheadUntil;
     qkv_rows_from: u32 = 64, get AttnQkvRowsFrom;
     ssm_kda_step_fused: bool = false, on SsmKdaStepFused;
     gemm_split_launch_ns: u32 = 0, get GemmSplitLaunchNs;
@@ -775,10 +915,13 @@ tuning! {
     prefill_wide_sliding: bool = false, on PrefillWideSliding;
     decode_grouped_prefill_from: u32 = 0, get DecodeGroupedPrefillFrom;
     decode_grouped_prefill_lse: bool = false, on DecodeGroupedPrefillLse;
+    decode_grouped_prefill_window: bool = false, on DecodeGroupedPrefillWindow;
+    fa2_live: bool = false, on Fa2Live;
     decode_xqa: bool = false, on DecodeXqa;
     decode_xqa_from_64: u32 = 0, get DecodeXqaFrom64;
     decode_xqa_whole_window: u32 = 0, get DecodeXqaWholeWindow;
     decode_xqa_cluster: u32 = 0, get DecodeXqaCluster;
+    decode_xqa_deep_64: bool = false, on DecodeXqaDeep64;
     selected_mma: bool = false, on SdpaSelectedMma;
     index_mma: bool = false, on SdpaIndexMma;
     index_tc5: bool = false, on SdpaIndexTc5;

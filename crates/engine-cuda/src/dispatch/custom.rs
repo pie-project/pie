@@ -7,7 +7,11 @@ use crate::run::Run;
 impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
-            Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op),
+            Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op, None),
+            Fused::SplitQkvFused { rest, qkv, .. } => {
+                let rest = self.tensor(*rest);
+                self.custom_cuda(qkv, Some(rest))
+            }
             Fused::GdnStep { .. } | Fused::QGateNormRopeAppend { .. } => {
                 Err(kernels_cuda::Error::Unsupported { op: op.name() })
             }
@@ -1483,7 +1487,12 @@ impl Run<'_> {
         )
     }
 
-    fn custom_cuda(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+    /// The fused qkv write; `rest`, a row split's second half it lands too.
+    fn custom_cuda(
+        &mut self,
+        op: &Fused,
+        rest: Option<kernels_cuda::Tensor>,
+    ) -> Result<(), kernels_cuda::Error> {
         match op {
             Fused::QkvFusedQknormRopeVnormWrite {
                 packed,
@@ -1523,6 +1532,7 @@ impl Run<'_> {
                 *qk_norm,
                 *v_scale,
                 *widths,
+                rest,
                 &mut self.tensor(*q),
             ),
             _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),

@@ -42,6 +42,10 @@ pub fn sorted_rows(pairs: u32, experts: u32, tuning: &crate::Tuning) -> u32 {
     if tile <= 1 {
         return pairs;
     }
+    stack_rows(pairs, experts, tile)
+}
+
+fn stack_rows(pairs: u32, experts: u32, tile: u32) -> u32 {
     let touched = pairs.min(experts);
     let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
     bound.div_ceil(tile) * tile
@@ -696,6 +700,30 @@ fn mpp_point(
     fits.then_some((m, n, simdgroups))
 }
 
+/// The MPP point of a routed MXFP4 matmul, as `(row tile, column tile, simdgroups)`: the
+/// codes are decoded into threadgroup bfloat a 64-wide slice at a time, as mlx-lm's
+/// `gather_qmm_rhs_nax` does, so a row tile is the sorted tile, inside one expert's rows.
+fn mxfp4_mpp_point(
+    x: Tensor,
+    bank: Bank,
+    y: Tensor,
+    tile: u32,
+    tuning: &crate::Tuning,
+) -> Option<(u32, u32, u32)> {
+    // A bank lays an expert's codes out as `y.width` rows of `x.width` or as one row.
+    let whole =
+        bank.ld == x.width || u64::from(bank.ld) == u64::from(y.width) * u64::from(x.width) / 2;
+    let fits = tuning.moe_mpp()
+        && !bank.affine()
+        && bank.group == MXFP4_BLOCK
+        && bank.bits == 4
+        && whole
+        && tile >= 32
+        && x.width.is_multiple_of(64)
+        && y.width.is_multiple_of(64);
+    fits.then_some((tile, 64, 4))
+}
+
 fn batched_point(
     op: &'static str,
     bank: Bank,
@@ -745,14 +773,66 @@ pub struct Sorted {
     pub input: bool,
     /// Leave the output's rows sorted in `scratch.y`; `y` is not written.
     pub output: bool,
+    /// `scratch.sums` already holds the sorted input's group sums at the MPP row tile
+    /// [`mpp_sums_tile`] names: the activation that wrote the rows landed them.
+    pub sums: bool,
 }
 
-/// The rows a batched routed matmul sorts `pairs` routes into, and its tile,
-/// when it runs at all.
+/// The row tile whose 64-wide group sums the batched routed matmul of `x` over `bank` into
+/// `y` reads from `scratch.sums`, when it takes the MPP kernel: what a pass writing its
+/// input rows lands them at to spare the matmul its sums pass.
 #[must_use]
-pub fn sorted_stack(pairs: u32, experts: u32, tuning: &crate::Tuning) -> Option<(u32, u32)> {
-    let tile = tile_rows(pairs, experts, tuning);
-    (tile > 1).then(|| (sorted_rows(pairs, experts, tuning), tile))
+pub fn mpp_sums_tile(
+    x: Tensor,
+    bank: Bank,
+    y: Tensor,
+    experts: u32,
+    sums: Tensor,
+    tuning: &crate::Tuning,
+) -> Option<u32> {
+    let mut tile = tile_rows(y.rows, experts, tuning);
+    if tile <= 1 || tile_cols(y.width).is_none() || !x.width.is_multiple_of(QMM_BK) {
+        return None;
+    }
+    let fp16 = tuning.fp16_gemm_format(bank.bits, bank.group);
+    if tile == MOE_TILE_ROWS[0] && !(fp16 && bank.affine() && bank.bits == 4 && bank.group == 64) {
+        tile = MOE_TILE_ROWS[1];
+    }
+    let tile = bank_tile(x, bank, y, tile, tuning);
+    let padded = stack_rows(y.rows, experts, tile);
+    let sums_fit = sums.dtype == Dtype::F32
+        && u64::from(sums.rows) * u64::from(sums.width)
+            >= u64::from(padded) * u64::from(x.width / 64);
+    mpp_point(x, bank, false, y, tile, tuning)
+        .filter(|_| sums_fit && x.width.is_multiple_of(64))
+        .map(|(m, _, _)| m)
+}
+
+/// The rows a batched routed matmul of `x` over `bank` into `y` sorts its routes into, and
+/// its tile, when it runs at all.
+#[must_use]
+pub fn sorted_stack(
+    x: Tensor,
+    bank: Bank,
+    y: Tensor,
+    experts: u32,
+    tuning: &crate::Tuning,
+) -> Option<(u32, u32)> {
+    let tile = tile_rows(y.rows, experts, tuning);
+    (tile > 1).then(|| {
+        let tile = bank_tile(x, bank, y, tile, tuning);
+        (stack_rows(y.rows, experts, tile), tile)
+    })
+}
+
+/// A 64-row tile only where the MXFP4 MPP kernel multiplies it whole; any other kernel
+/// multiplies at most 32 rows at a time, and the wider tile would only pad more.
+fn bank_tile(x: Tensor, bank: Bank, y: Tensor, tile: u32, tuning: &crate::Tuning) -> u32 {
+    if tile == MOE_TILE_ROWS[3] && mxfp4_mpp_point(x, bank, y, tile, tuning).is_none() {
+        MOE_TILE_ROWS[2]
+    } else {
+        tile
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -787,17 +867,15 @@ pub fn matmul_select_batched(
     if tile == MOE_TILE_ROWS[0] && !(fp16 && bank.affine() && bank.bits == 4 && bank.group == 64) {
         tile = MOE_TILE_ROWS[1];
     }
-    let padded = {
-        let touched = pairs.min(experts);
-        let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
-        bound.div_ceil(tile) * tile
-    };
+    let tile = bank_tile(x, bank, y, tile, tuning);
+    let padded = stack_rows(pairs, experts, tile);
     let sums = scratch.sums;
     let sums_fit = sums.dtype == Dtype::F32
         && u64::from(sums.rows) * u64::from(sums.width)
             >= u64::from(padded) * u64::from(x.width / 64);
     let mpp = mpp_point(x, bank, bias.is_some(), y, tile, tuning).filter(|_| sums_fit);
-    let point = match mpp {
+    let mxfp4 = mxfp4_mpp_point(x, bank, y, tile, tuning);
+    let point = match mpp.or(mxfp4) {
         Some(_) => None,
         None => match batched_point(op, bank, bias.is_some(), tile, bn, fp16)? {
             Some(point) => Some(point),
@@ -825,11 +903,30 @@ pub fn matmul_select_batched(
         0u32.arg(),
     ];
     let lanes = router_lanes(op, experts)?;
+    // The MPP kernel's group sums ride the gather, which has the rows in hand.
+    let gathered_sums = !sorted.input && mpp.is_some() && x.width.is_multiple_of(64);
     if !sorted.input {
         ctx.fire(
             Fire::at(ROUTE_FILE, "route_sort").apply(Grid::of([lanes, 1, 1], [lanes, 1, 1])),
             &sort,
         )?;
+    }
+    if let (true, Some((m, _, _))) = (gathered_sums, mpp) {
+        ctx.fire(
+            Fire::at(ROUTE_FILE, "route_gather_sums")
+                .apply(Grid::of([256, padded, 1], [256, 1, 1])),
+            &[
+                x.arg(),
+                scratch.x.arg_mut(),
+                scratch.perm.arg(),
+                scratch.sums.arg_mut(),
+                gather_fan.arg(),
+                x.width.arg(),
+                m.arg(),
+                0u32.arg(),
+            ],
+        )?;
+    } else if !sorted.input {
         ctx.fire(
             Fire::at(ROUTE_FILE, "route_gather").apply(route_rows(op, x.width, padded)?),
             &[
@@ -847,14 +944,52 @@ pub fn matmul_select_batched(
         )?;
     }
 
-    if let Some((m, n, simdgroups)) = mpp {
+    if let Some((m, n, simdgroups)) = mxfp4 {
+        const FILE: &str = "linear/quant_qmm_mpp.metal";
+        let biased = bias.is_some();
+        let entry = crate::linear::quant::symbol(&format!(
+            "mxfp4_qmm_mpp_routed_m{m}_n{n}_s{simdgroups}_t{tile}_b{}",
+            u8::from(biased)
+        ));
+        let stamp = crate::linear::quant::symbol(&format!(
+            "PIE_MPP_MXFP4_POINT(\"{entry}\",{m},{n},{simdgroups},{tile},{biased})"
+        ));
+        ctx.fire(
+            Fire::at(FILE, entry).stamp(stamp).apply(Grid::of(
+                [32 * simdgroups * (y.width / n), padded / m, 1],
+                [32 * simdgroups, 1, 1],
+            )),
+            &[
+                bank.codes.arg(),
+                bank.scales.arg(),
+                scratch.x.arg(),
+                scratch.y.arg_mut(),
+                stated(op, x.width)?.arg(),
+                stated(op, y.width)?.arg(),
+                match bias {
+                    Some(bias) => bias.arg(),
+                    None => ctx.absent()?,
+                },
+                scratch.tile_expert.arg(),
+                scratch.perm.arg(),
+            ],
+        )?;
+    } else if let Some((m, n, simdgroups)) = mpp {
         const FILE: &str = "linear/quant_qmm_mpp.metal";
         let k = stated(op, x.width)?;
-        ctx.fire(
-            Fire::at(FILE, "qmm_mpp_input_sums")
-                .apply(Grid::of([32 * (x.width / 64), padded, 1], [32, 4, 1])),
-            &[scratch.x.arg(), scratch.sums.arg_mut(), k.arg(), m.arg()],
-        )?;
+        debug_assert!(
+            !sorted.sums
+                || (bias.is_none()
+                    && mpp_sums_tile(x, bank, y, experts, scratch.sums, tuning) == Some(m)),
+            "`{op}`'s input sums were landed at the tile its MPP kernel reads"
+        );
+        if !gathered_sums && !sorted.sums {
+            ctx.fire(
+                Fire::at(FILE, "qmm_mpp_input_sums")
+                    .apply(Grid::of([32 * (x.width / 64), padded, 1], [32, 4, 1])),
+                &[scratch.x.arg(), scratch.sums.arg_mut(), k.arg(), m.arg()],
+            )?;
+        }
         let entry = crate::linear::quant::symbol(&format!(
             "affine_qmm_mpp_routed_m{m}_n{n}_s{simdgroups}_t{tile}"
         ));
@@ -896,20 +1031,27 @@ pub fn matmul_select_batched(
             args.push(ctx.absent()?);
         }
         args.push(scratch.tile_expert.arg());
+        let mut grid = crate::linear::quant::qmm_grid(
+            op,
+            stated(op, y.width)?,
+            stated(op, bn)?,
+            stated(op, padded)?,
+            stated(op, tile)?,
+            1,
+        )?;
+        // The stamped affine kernel is the steel tile's own; the MXFP4 and fp16 ones
+        // take the routed threadgroup.
+        let group = if point.stamp.is_empty() {
+            let group = crate::linear::quant::routed_group(stated(op, tile)?);
+            grid[2] = group[2];
+            group
+        } else {
+            crate::linear::quant::qmm_group(stated(op, tile)?)
+        };
         ctx.fire(
             Fire::at(QMM_FILE, point.entry)
                 .stamp(point.stamp)
-                .apply(Grid::of(
-                    crate::linear::quant::qmm_grid(
-                        op,
-                        stated(op, y.width)?,
-                        stated(op, bn)?,
-                        stated(op, padded)?,
-                        stated(op, tile)?,
-                        1,
-                    )?,
-                    crate::linear::quant::qmm_group(stated(op, tile)?),
-                )),
+                .apply(Grid::of(grid, group)),
             &args,
         )?;
     }

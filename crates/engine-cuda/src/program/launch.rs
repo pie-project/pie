@@ -492,12 +492,12 @@ pub struct Prepared {
     params: Buffer,
     offsets: Buffer,
     scratch: Buffer,
-    pending: Buffer,
-    intrinsic_bases: Buffer,
-    intrinsic_modes: Buffer,
-    intrinsic_widths: Buffer,
-    intrinsic_strides: Buffer,
-    intrinsic_offsets: Buffer,
+    /// The lanes' intrinsic tables (bases, modes, widths, strides,
+    /// offsets) and pending flags, one allocation staged in one copy a
+    /// commit (`cell_at` their offsets, `cells_host` its image).
+    cells: Buffer,
+    cell_at: [usize; 6],
+    cells_host: Vec<u8>,
     intrinsic_bases_host: Vec<u64>,
     intrinsic_modes_host: Vec<u32>,
     intrinsic_widths_host: Vec<u32>,
@@ -950,12 +950,9 @@ impl Prepared {
             params,
             offsets,
             scratch: Buffer::zeroed(0)?,
-            pending: Buffer::zeroed(0)?,
-            intrinsic_bases: Buffer::zeroed(0)?,
-            intrinsic_modes: Buffer::zeroed(0)?,
-            intrinsic_widths: Buffer::zeroed(0)?,
-            intrinsic_strides: Buffer::zeroed(0)?,
-            intrinsic_offsets: Buffer::zeroed(0)?,
+            cells: Buffer::zeroed(0)?,
+            cell_at: [0; 6],
+            cells_host: Vec::new(),
             intrinsic_bases_host: Vec::new(),
             intrinsic_modes_host: Vec::new(),
             intrinsic_widths_host: Vec::new(),
@@ -981,11 +978,10 @@ impl Prepared {
         if lanes <= self.lanes {
             return Ok(());
         }
-        // The buffers the last growth outgrew were kept for the fires still
-        // reading them; freeing waits for the device, so it happens here,
-        // once per growth, rather than hoarding a generation per doubling
-        // until this batch is dropped.
-        self.retired.clear();
+        // The buffers a growth outgrows stay with this batch until it drops
+        // (at most its own size again, a doubling at a time): freeing one
+        // waits for the whole device, which at a burst's first fires would
+        // stall them; a growth that does not fit frees them first.
         let lanes = lanes
             .checked_next_power_of_two()
             .unwrap_or(lanes)
@@ -1066,6 +1062,7 @@ impl Prepared {
         // since a frame past static admission has no retry to answer.
         let scratch = match Buffer::zeroed_on(stream, scratch_bytes) {
             Err(Fault::OutOfMemory { .. }) => {
+                self.retired.clear();
                 self.scratch = Buffer::zeroed(0)?;
                 self.lanes = 0;
                 Buffer::zeroed_on(stream, scratch_bytes).map_err(|fault| match fault {
@@ -1094,30 +1091,33 @@ impl Prepared {
         };
         self.retired
             .push(std::mem::replace(&mut self.scratch, scratch));
-        self.retired.push(std::mem::replace(
-            &mut self.pending,
-            Buffer::zeroed_on(
-                stream,
-                (self.channel_count as usize * lanes as usize).max(1),
-            )?,
-        ));
-
         let words = INTRINSIC_SLOTS * lanes as usize;
         self.intrinsic_bases_host.resize(words, 0u64);
         self.intrinsic_modes_host.resize(words, 0u32);
         self.intrinsic_widths_host.resize(words, 0u32);
         self.intrinsic_strides_host.resize(words, 0u32);
         self.intrinsic_offsets_host.resize(words, 0u32);
-        for (slot, bytes) in [
-            (&mut self.intrinsic_bases, words * size_of::<u64>()),
-            (&mut self.intrinsic_modes, words * size_of::<u32>()),
-            (&mut self.intrinsic_widths, words * size_of::<u32>()),
-            (&mut self.intrinsic_strides, words * size_of::<u32>()),
-            (&mut self.intrinsic_offsets, words * size_of::<u32>()),
-        ] {
-            self.retired
-                .push(std::mem::replace(slot, Buffer::zeroed_on(stream, bytes)?));
+        let pending = (self.channel_count as usize * lanes as usize).max(1);
+        let mut at = 0usize;
+        for (cell, bytes) in [
+            words * size_of::<u64>(),
+            words * size_of::<u32>(),
+            words * size_of::<u32>(),
+            words * size_of::<u32>(),
+            words * size_of::<u32>(),
+            pending,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.cell_at[cell] = at;
+            at += bytes.div_ceil(16) * 16;
         }
+        self.cells_host = vec![0u8; at];
+        self.retired.push(std::mem::replace(
+            &mut self.cells,
+            Buffer::zeroed_on(stream, at)?,
+        ));
         self.lanes = lanes;
         Ok(())
     }
@@ -1206,19 +1206,24 @@ impl Prepared {
             },
         );
         self.table.stage(stream, 0, &self.table_host)?;
-        self.intrinsic_bases
-            .stage(stream, 0, &slice_bytes(&self.intrinsic_bases_host))?;
-        self.intrinsic_modes
-            .stage(stream, 0, &slice_bytes(&self.intrinsic_modes_host))?;
-        self.intrinsic_widths
-            .stage(stream, 0, &slice_bytes(&self.intrinsic_widths_host))?;
-        self.intrinsic_strides
-            .stage(stream, 0, &slice_bytes(&self.intrinsic_strides_host))?;
-        self.intrinsic_offsets
-            .stage(stream, 0, &slice_bytes(&self.intrinsic_offsets_host))?;
-        let lanes = self.filled as usize;
-        self.pending
-            .zero_span_on(stream, 0, lanes * self.channel_count as usize)?;
+        // The intrinsic tables and the pending flags (zeroed) in one copy:
+        // seven small ones each cost the stream a few microseconds a fire.
+        let at = self.cell_at;
+        let image = &mut self.cells_host;
+        for (cell, bytes) in [
+            slice_bytes(&self.intrinsic_bases_host),
+            slice_bytes(&self.intrinsic_modes_host),
+            slice_bytes(&self.intrinsic_widths_host),
+            slice_bytes(&self.intrinsic_strides_host),
+            slice_bytes(&self.intrinsic_offsets_host),
+        ]
+        .iter()
+        .enumerate()
+        {
+            image[at[cell]..at[cell] + bytes.len()].copy_from_slice(bytes);
+        }
+        image[at[5]..].fill(0);
+        self.cells.stage(stream, 0, image)?;
         Ok(())
     }
 
@@ -1258,6 +1263,10 @@ impl Prepared {
         Ok(())
     }
 
+    fn cell(&self, cell: usize) -> u64 {
+        self.cells.ptr() + self.cell_at[cell] as u64
+    }
+
     pub fn launch_region(&self, region: &Region, stream: *mut core::ffi::c_void) -> Result<()> {
         if self.filled == 0 {
             return Ok(());
@@ -1273,12 +1282,12 @@ impl Prepared {
             .u32(self.value_count)
             .u32(self.scratch_stride)
             .u32(self.temporary_offset)
-            .ptr(self.pending.ptr())
-            .ptr(self.intrinsic_bases.ptr())
-            .ptr(self.intrinsic_modes.ptr())
-            .ptr(self.intrinsic_widths.ptr())
-            .ptr(self.intrinsic_strides.ptr())
-            .ptr(self.intrinsic_offsets.ptr());
+            .ptr(self.cell(5))
+            .ptr(self.cell(0))
+            .ptr(self.cell(1))
+            .ptr(self.cell(2))
+            .ptr(self.cell(3))
+            .ptr(self.cell(4));
         let rows = self
             .region_rows
             .get(region.region_index as usize)
@@ -1528,7 +1537,7 @@ pub fn launch(
                 block,
                 1,
                 1,
-                0,
+                module.dynamic_shared(),
                 stream.cast(),
                 args.slots.as_mut_ptr(),
                 std::ptr::null_mut(),

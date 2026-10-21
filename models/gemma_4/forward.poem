@@ -35,6 +35,24 @@ def plans(m, input, plan):
         plan(input, m.q_heads, m.glob.kv_heads, m.glob.head_dim, None),
     ]
 
+def readout_tail(m, inputs, dr):
+    """The first layer of the shared tail, when the backend attends a
+    readout row as its token and nothing past the trunk reads its other
+    rows; else None."""
+    if dr != None or m.self_cond != None or not inputs.readout_attention():
+        return None
+    for l, w in enumerate(m.layers):
+        if w.attn.banks.shared:
+            return l
+    return None
+
+def select(x, bank, routes, top_k):
+    """A routed bank's select: a bf16 bank's plain, a quantized one's
+    through its codes and factors."""
+    if bank.dtype == dtype.bf16:
+        return ops.linear.moe_matmul_select(x, bank, routes, top_k)
+    return ops.linear.moe_matmul_select_quant(x, bank, routes, top_k)
+
 def forward(m, inputs):
     classes = [fact.has(fact.Mask), fact.scores(), fact.single_token()]
     dr = m.dflash
@@ -87,8 +105,26 @@ def forward(m, inputs):
 
     routes = inputs.adapter_routes()
 
-    def block(l, w, carried):
-        y, tapped = carried
+    # The shared tail writes no kv, so past its first layer only the rows a
+    # lane reads out still matter: a lane that masks its attention or
+    # captures scores keeps every row, the rest go on as their readouts.
+    tail = readout_tail(m, inputs, dr)
+    if tail != None:
+        read = ~fact.has(fact.Mask) & ~fact.scores()
+        input_r = trunk_inputs.on(read)
+        rows_r = input_r.readout_rows()
+        plan_r = plans(m, input_r, ops.attn.plan_decode)
+        gathered = lambda v: ops.layout.gather_rows(v.on(read), rows_r)
+        adapted_r = read & fact.has(fact.Adapter)
+        ro = struct(
+            positions = gathered(positions),
+            ids = gathered(ids),
+            relay = gathered(relay) if relay != None else None,
+            routes = ops.layout.gather_rows(routes.on(adapted_r), input_r.on(fact.has(fact.Adapter)).readout_rows()),
+            plans = plan_r,
+        )
+
+    def attend(l, w, y, whole):
         normed = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
         at = w.attn
         d, kv_heads, win = geometry(m, at.reading)
@@ -101,22 +137,43 @@ def forward(m, inputs):
         seam.at(seam.ATTN_Q, [q])
 
         r = at.reading
-        ([mq, sq, dq], p) = q.partition(classes)
+        if whole:  # the tail's rows of lanes that mask or capture scores
+            ([mq], sq) = q.partition(classes[:1])
+        else:
+            ([mq, sq, dq], p) = q.partition(classes)
         if r == SLIDING:
             so = ops.attn.prefill(sq, plan_s[r], pages, win, d, kv_heads, at.sm_scale)
         else:
             so, lse = ops.attn.prefill_lse(sq, plan_s[r], pages, win, d, kv_heads, at.sm_scale)
             seam.at(seam.SCORES, [lse])
-        a = merge([
-            ops.attn.masked(mq, plan_m[r], mask, pages, win, d, kv_heads, True, at.sm_scale),
-            so,
-            ops.attn.decode(dq, plan_d[r], pages, win, d, at.sm_scale),
-            ops.attn.prefill(p, plan_p[r], pages, win, d, kv_heads, at.sm_scale),
-        ])
+        arms = [ops.attn.masked(mq, plan_m[r], mask, pages, win, d, kv_heads, True, at.sm_scale), so]
+        if not whole:
+            arms += [
+                ops.attn.decode(dq, plan_d[r], pages, win, d, at.sm_scale),
+                ops.attn.prefill(p, plan_p[r], pages, win, d, kv_heads, at.sm_scale),
+            ]
+        a = merge(arms)
         seam.at(seam.ATTN_OUT, [a])
+        return normed, a, routes
+
+    def attend_readouts(l, w, y):
+        """A shared layer over readout rows: each attends as the token it
+        reads out."""
+        normed = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
+        at = w.attn
+        d, _, win = geometry(m, at.reading)
+        q = q_only(normed, ro.positions, m, at, d, at.banks.q_proj)
+        a = ops.attn.decode(q, ro.plans[at.reading], inputs.kv(at.kv), win, d, at.sm_scale)
+        return normed, a, ro.routes
+
+    def layer(l, w, y, readouts = False, whole = False):
+        if readouts:
+            normed, a, layer_routes = attend_readouts(l, w, y)
+        else:
+            normed, a, layer_routes = attend(l, w, y, whole)
         o = ops.linear.matmul(a, w.o_proj)
         adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(normed.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = ops.linear.lora_correct(normed.on(adapted), w.lora_a, w.lora_b, layer_routes, o.on(adapted))
 
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, w.post_attn_norm_eps), y)
         mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, w.pre_ffw_norm_eps)
@@ -132,8 +189,8 @@ def forward(m, inputs):
                 x.top_k,
             )
             moe_in = ops.elemwise.rmsnorm(y, x.pre_ffw_norm_2, x.pre_ffw_norm_2_eps)
-            hidden = ops.linear.mlp_geglu_tanh_packed(ops.linear.moe_matmul_select_quant(moe_in, x.gate_up, experts, x.top_k), x.inter)
-            routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select_quant(hidden, x.down, experts, x.top_k), weights)
+            hidden = ops.linear.mlp_geglu_tanh_packed(select(moe_in, x.gate_up, experts, x.top_k), x.inter)
+            routed = ops.linear.moe_weighted_sum(select(hidden, x.down, experts, x.top_k), weights)
             h2 = ops.elemwise.rmsnorm(routed, x.post_ffw_norm_2, x.post_ffw_norm_2_eps)
             f = ops.elemwise.residual_add(h1, h2)
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, w.post_ffw_norm_eps), y)
@@ -141,8 +198,9 @@ def forward(m, inputs):
         if relay != None:
             ple = m.ple
             lp = ple.per_layer[l]
-            table = ops.layout.embed(ids, lp.table, m.vocab) * f32(sqrt(ple.dim))
-            mixed = ops.elemwise.residual_add(table, ops.layout.select(relay, l, ple.dim)) * FRAC_1_SQRT_2
+            layer_ids, layer_relay = (ro.ids, ro.relay) if readouts else (ids, relay)
+            table = ops.layout.embed(layer_ids, lp.table, m.vocab) * f32(sqrt(ple.dim))
+            mixed = ops.elemwise.residual_add(table, ops.layout.select(layer_relay, l, ple.dim)) * FRAC_1_SQRT_2
             gated = ops.linear.mlp_geglu_tanh(ops.linear.matmul(y, lp.gate), mixed)
             out = ops.linear.matmul(gated, lp.proj)
             out = ops.elemwise.rmsnorm(out, lp.norm, lp.norm_eps)
@@ -150,18 +208,30 @@ def forward(m, inputs):
 
         if w.scalar != None:
             y = ops.elemwise.scale(w.scalar, y)
+        return y
+
+    def block(l, w, carried):
+        y, tapped = carried
+        if tail != None and l >= tail:
+            if l == tail:
+                y = struct(whole = y.on(~read), readouts = gathered(y))
+            return (struct(whole = layer(l, w, y.whole, whole = True), readouts = layer(l, w, y.readouts, readouts = True)), tapped)
+        y = layer(l, w, y)
         if dr != None:
             tapped = tap(dr, l, y, tapped)
         return (y, tapped)
 
     y, tapped = inputs.fold_layers(m.layers, (y, None), block)
 
+    if tail != None:
+        y = merge([ops.layout.gather_rows(y.whole, trunk_inputs.on(~read).readout_rows()), y.readouts])
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     hb = None
     if dr != None:
         hb = arm(dr, inputs, tapped, h_block, mask, block_rows(dr))
         x = merge([hb, x])
-    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    if tail == None:
+        x = ops.layout.gather_rows(x, inputs.readout_rows())
     logits = ops.attn.logit_softcap(ops.linear.lm_head(x, m.embed), m.softcap)
     if dr != None:
         plant_readout(dr, logits, inputs, x, block_rows(dr))

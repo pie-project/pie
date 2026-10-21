@@ -103,6 +103,7 @@ fn options_struct(engine: EngineKind) -> Option<&'static str> {
         EngineKind::Vulkan => Some("VulkanEngineOptions"),
         EngineKind::Wgpu => Some("WgpuEngineOptions"),
         EngineKind::Xla => Some("XlaEngineOptions"),
+        EngineKind::Cerebras => Some("CerebrasEngineOptions"),
     }
 }
 
@@ -204,6 +205,7 @@ fn default_values(engine: EngineKind) -> toml::Value {
         EngineKind::Vulkan => defaults_of::<crate::config::VulkanEngineOptions>(&empty),
         EngineKind::Wgpu => defaults_of::<crate::config::WgpuEngineOptions>(&empty),
         EngineKind::Xla => defaults_of::<crate::config::XlaEngineOptions>(&empty),
+        EngineKind::Cerebras => defaults_of::<crate::config::CerebrasEngineOptions>(&empty),
     };
     if let (Some(options), Some(engine_table)) = (
         options,
@@ -247,6 +249,7 @@ mod tests {
             EngineKind::Vulkan,
             EngineKind::Wgpu,
             EngineKind::Xla,
+            EngineKind::Cerebras,
         ] {
             let keys = keys(engine);
             assert!(

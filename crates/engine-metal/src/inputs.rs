@@ -104,6 +104,11 @@ pub struct Handles {
     pub adapter_routes: Option<Tensor>,
     pub request_of_token: Tensor,
     pub readout_rows: Tensor,
+    /// Each readout row's position, lane and mask flag: the tables a decode
+    /// attention over readout rows reads in place of the tokens'.
+    pub readout_positions: Tensor,
+    pub readout_request_of_token: Tensor,
+    pub readout_mask_enabled: Tensor,
     pub mask: Tensor,
     pub mask_enabled: Tensor,
     pub mask_stride: u32,
@@ -113,6 +118,7 @@ pub struct Handles {
     pub self_cond_weights: Option<Tensor>,
     pub rs_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
+    pub rs_snaps: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
     pub ports: Vec<Tensor>,
@@ -173,6 +179,7 @@ pub struct Fire<'a> {
     pub self_cond_weights: Option<&'a [f32]>,
     pub rs_replay: Option<&'a [i32]>,
     pub rs_commit: Option<&'a [i32]>,
+    pub rs_snaps: Option<&'a [i32]>,
     pub group_of_lane: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
 }
@@ -215,6 +222,9 @@ pub struct Inputs {
     adapter_routes: u64,
     request_of_token: u64,
     readout_rows: u64,
+    readout_positions: u64,
+    readout_request_of_token: u64,
+    readout_mask_enabled: u64,
     mask_planes: u64,
     mask_plane_bytes: u64,
     mask_enabled: u64,
@@ -229,6 +239,7 @@ pub struct Inputs {
     self_cond: Option<(u64, u64, u64)>,
     rs_replay: u64,
     rs_commit: u64,
+    rs_snaps: u64,
 }
 
 /// The ints one fire's packed window boundaries can fill, at the ceiling.
@@ -315,6 +326,9 @@ impl Inputs {
         let adapter_routes = take(rows * 4);
         let request_of_token = take(rows * 4);
         let readout_rows = take(rows * 4);
+        let readout_positions = take(rows * 4);
+        let readout_request_of_token = take(rows * 4);
+        let readout_mask_enabled = take(rows);
         let context = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
         let mask_stride = u32::try_from(context).unwrap_or(u32::MAX);
         let mask_plane_bytes = rows * context;
@@ -379,6 +393,7 @@ impl Inputs {
         });
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
+        let rs_snaps = take(lanes * u64::from(SNAP_INTS) * 4);
         let total = at;
 
         let store = Buffer::zeroed(device, total)?;
@@ -394,6 +409,9 @@ impl Inputs {
             adapter_routes,
             request_of_token,
             readout_rows,
+            readout_positions,
+            readout_request_of_token,
+            readout_mask_enabled,
             mask_planes,
             mask_plane_bytes,
             mask_enabled,
@@ -408,6 +426,7 @@ impl Inputs {
             self_cond,
             rs_replay,
             rs_commit,
+            rs_snaps,
         })
     }
 
@@ -466,6 +485,36 @@ impl Inputs {
         }
         self.store
             .write(self.readout_rows, bytes_of(fire.readout_rows))?;
+        let enabled = fire.mask.map(|staged| staged.enabled.as_slice());
+        let mut readout_positions = Vec::with_capacity(fire.readout_rows.len());
+        let mut readout_request_of_token = Vec::with_capacity(fire.readout_rows.len());
+        let mut readout_mask_enabled = Vec::with_capacity(fire.readout_rows.len());
+        for &row in fire.readout_rows {
+            let at = usize::try_from(row)
+                .ok()
+                .filter(|&at| at < rows as usize)
+                .ok_or(Fault::Ceiling {
+                    what: "a readout row inside the fire's tokens",
+                    need: u64::try_from(row).unwrap_or(u64::MAX).saturating_add(1),
+                    have: u64::from(rows),
+                })?;
+            readout_positions.push(fire.positions[at]);
+            readout_request_of_token.push(fire.request_of_token[at]);
+            readout_mask_enabled.push(
+                enabled
+                    .and_then(|flags| flags.get(at))
+                    .copied()
+                    .unwrap_or(0),
+            );
+        }
+        self.store
+            .write(self.readout_positions, bytes_of(&readout_positions))?;
+        self.store.write(
+            self.readout_request_of_token,
+            bytes_of(&readout_request_of_token),
+        )?;
+        self.store
+            .write(self.readout_mask_enabled, &readout_mask_enabled)?;
         self.store
             .write(self.slot_of_row, bytes_of(fire.slot_of_row))?;
         let rs_tables = match (fire.rs_replay, fire.rs_commit) {
@@ -483,6 +532,16 @@ impl Inputs {
             }
             _ => false,
         };
+        if let Some(snaps) = fire.rs_snaps {
+            if snaps.len() != lanes as usize * SNAP_INTS as usize {
+                return Err(Fault::Ceiling {
+                    what: "recurrent snapshot tables, one row per lane",
+                    need: snaps.len() as u64,
+                    have: u64::from(lanes) * u64::from(SNAP_INTS),
+                });
+            }
+            self.store.write(self.rs_snaps, bytes_of(snaps))?;
+        }
 
         let adapter_routes = match fire.adapter_routes {
             None => None,
@@ -864,6 +923,28 @@ impl Inputs {
                 self.readout_rows,
                 fire.readout_rows.len() as u32,
             )?,
+            readout_positions: i32s(
+                handles,
+                &self.store,
+                self.readout_positions,
+                fire.readout_rows.len() as u32,
+            )?,
+            readout_request_of_token: i32s(
+                handles,
+                &self.store,
+                self.readout_request_of_token,
+                fire.readout_rows.len() as u32,
+            )?,
+            readout_mask_enabled: Tensor::new(
+                handles.bind(
+                    &self.store,
+                    self.readout_mask_enabled,
+                    fire.readout_rows.len() as u64,
+                )?,
+                fire.readout_rows.len() as u32,
+                1,
+                Dtype::U8,
+            ),
             group_of_lane,
             packings,
             ports,
@@ -899,6 +980,15 @@ impl Inputs {
             } else {
                 None
             },
+            rs_snaps: match fire.rs_snaps {
+                Some(snaps) => Some(i32s(
+                    handles,
+                    &self.store,
+                    self.rs_snaps,
+                    snaps.len() as u32,
+                )?),
+                None => None,
+            },
         })
     }
 
@@ -930,6 +1020,9 @@ impl Inputs {
         }
     }
 }
+
+/// The ints of one lane's row in the snapshot table: its rows, then its slots.
+const SNAP_INTS: u32 = 2 * kernels_metal::attn::ssm::RS_SNAPSHOTS;
 
 fn csr(into: &mut Vec<i32>, staged: &[i32], ceiling: u32) {
     into.clear();

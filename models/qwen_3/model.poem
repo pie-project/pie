@@ -259,6 +259,10 @@ FIXED = {
     "qwen35-tiny": dims(hidden = 256, layers = 4, attn_every = 4, q_heads = 4, kv_heads = 2,
                         head_dim = 64, rotary_dim = 32, k_heads = 4, v_heads = 8, k_dim = 128,
                         v_dim = 128, mlp = dense(512), vocab = 248320, tied = True),
+    # Every weight, pool and activation of a fire fits one Cerebras PE.
+    "qwen35-pico": dims(hidden = 16, layers = 2, attn_every = 2, q_heads = 1, kv_heads = 1,
+                        head_dim = 8, rotary_dim = 4, theta = 10000.0, k_heads = 1, v_heads = 1,
+                        k_dim = 8, v_dim = 8, mlp = dense(32), vocab = 32, tied = True),
     "qwen36-35b-a3b-mini": a3b(layers = 5, mlp = moe(16, 8, 512, 512)),
     "qwen36-35b-a3b-mini64": a3b(layers = 5, mlp = moe(64, 8, 512, 512)),
     "ornith15-397b-mini": a17b(layers = 5, mlp = moe(16, 10, 1024, 1024)),
@@ -348,7 +352,12 @@ def layout(id, deploy):
     d = struct(**drafted(id, deploy))
     bonsai = id == "qwen36-27b-bonsai"
     dense = compute(w)
-    gate = dtype.u8g64 if w == dtype.u4g64 else w
+    # The release's FP8 (Qwen3.6-35B-A3B-FP8) as vLLM serves it: projections
+    # and experts as stored, 128-square blocks against e4m3 activations; its
+    # table, head, router, gates and GDN beta/alpha, unquantized, at bf16.
+    fp8 = w in [dtype.e4m3tile128, dtype.e4m3tile128a8]
+    table = dtype.bf16 if fp8 else w
+    gate = dtype.u8g64 if w == dtype.u4g64 else table
     proj = dtype.u4g64tiled if w == dtype.u4g64 else w
     hidden = d.hidden
     attn_at = lambda l: l % d.attn_every == d.attn_every - 1
@@ -364,7 +373,8 @@ def layout(id, deploy):
         else:
             # Ternary-Bonsai stores the GDN beta/alpha projections in bf16,
             # not ternary: they are served as stored.
-            ba = dense if bonsai else proj
+            # The FP8 release keeps them unquantized, as does its router.
+            ba = dense if bonsai or fp8 else proj
             delta = gdn(n, d, proj, ba, dense, "conv.{}".format(l), "delta.{}".format(l))
         if d.mlp.routed:
             mlp = routed(n, hidden, d.mlp, w, proj, gate)
@@ -410,14 +420,14 @@ def layout(id, deploy):
         )
     dflash = None
     if d.draft in blocks:
-        dflash = dflash_declare(d.dflash_head, "aux", hidden, d.vocab, d.norm_eps, w, dense)
+        dflash = dflash_declare(d.dflash_head, "aux", hidden, d.vocab, d.norm_eps, w, dense, blocks_w = proj)
 
     # Ternary-Bonsai's token embedding is gathered whole, which no ternary
     # kernel does: it is served decoded.
-    embed = weight("embed", [d.vocab, hidden], dense if bonsai else w)
+    embed = weight("embed", [d.vocab, hidden], dense if bonsai else table)
     head = None
     if not d.tied:
-        head = weight("lm_head", [d.vocab, hidden], w).columns()
+        head = weight("lm_head", [d.vocab, hidden], proj if table == w else table).columns()
     signs = None
     if bonsai:
         sign = lambda width: weight(sign_name(width), [1, width], dense)

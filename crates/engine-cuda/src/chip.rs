@@ -176,6 +176,7 @@ seeded!("gfx94.toml");
 #[cfg(not(feature = "rocm"))]
 seeded!(
     "sm80.toml",
+    "sm80/nvidia-a100-80gb-pcie.toml",
     "sm86.toml",
     "sm87.toml",
     "sm89.toml",
@@ -524,6 +525,7 @@ mod tests {
                     "{gpu}"
                 );
                 assert_eq!(tuning.decode_xqa_cluster, if b200 { 8 } else { 0 }, "{gpu}");
+                assert_eq!(tuning.decode_xqa_deep_64, b200, "{gpu}");
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
@@ -545,6 +547,10 @@ mod tests {
                         decode_grouped_prefill_from: 0,
                         gemm_bias_epilogue: false,
                         moe_w4a4_fused_from: 65_536,
+                        moe_w4a4_fused_layout: defaults.moe_w4a4_fused_layout,
+                        moe_even_waves_from: defaults.moe_even_waves_from,
+                        moe_routes_sized: defaults.moe_routes_sized,
+                        moe_gather_ahead_until: defaults.moe_gather_ahead_until,
                         moe_w4a8_fused_from: 65_536,
                         mla_expanded_from: 65_536,
                         gemm_fp8_gemv_until: 0,
@@ -564,6 +570,7 @@ mod tests {
                         decode_xqa_from_64: 0,
                         decode_xqa_whole_window: 0,
                         decode_xqa_cluster: 0,
+                        decode_xqa_deep_64: false,
                         pool_mma: false,
                         dsv4_prefill_from: 0,
                         index_radix: false,
@@ -581,11 +588,50 @@ mod tests {
                         hc_mma: false,
                         index_tc5: false,
                         norm_emit: false,
+                        qkv_rows_from: defaults.qkv_rows_from,
                         ..tuning
                     },
                     defaults,
                     "{gpu}: only the Blackwell kernels differ"
                 );
+            } else if major == 9 {
+                assert_eq!(
+                    kernels_cuda::tuning::Tuning {
+                        pdl: false,
+                        ssm_gdn_fused_scan: false,
+                        ssm_kda_chunked: false,
+                        ssm_gdn_out_bf16: false,
+                        ssm_conv_vec4: false,
+                        rows_vec: false,
+                        hc_tile: false,
+                        hc_mma: false,
+                        qg_prologue_until: 0,
+                        merge_warp: false,
+                        pool_mma: false,
+                        dsv4_decode_until: 0,
+                        gemm_bias_epilogue: false,
+                        gemm_rows_m: 0,
+                        attn_res_fused_norm: false,
+                        mxfp4_mma_from: defaults.mxfp4_mma_from,
+                        mxfp4_mma_until: defaults.mxfp4_mma_until,
+                        nvfp4_mma_from: defaults.nvfp4_mma_from,
+                        nvfp4_mma_until: defaults.nvfp4_mma_until,
+                        bf16_mma_from: defaults.bf16_mma_from,
+                        bf16_mma_until: defaults.bf16_mma_until,
+                        selected_mma: defaults.selected_mma,
+                        gemm_fp8_gemv_until: defaults.gemm_fp8_gemv_until,
+                        mla_dense_short: defaults.mla_dense_short,
+                        ..tuning
+                    },
+                    defaults,
+                    "{gpu}: Hopper takes the arch-generic arms alone"
+                );
+                assert!(
+                    tuning.ssm_gdn_fused_scan && tuning.pool_mma && tuning.pdl,
+                    "{gpu}"
+                );
+                assert_eq!((tuning.mxfp4_mma_from, tuning.mxfp4_mma_until), (28, 1024));
+                assert_eq!((tuning.bf16_mma_from, tuning.bf16_mma_until), (16, 65536));
             } else {
                 assert_eq!(tuning, defaults, "{gpu}");
             }
@@ -703,13 +749,16 @@ mod tests {
         assert_eq!(Engine::of(&family).lattice_steps, 1);
     }
 
-    /// The two-launch gated delta scan is an sm_100 family decision; every
-    /// other family keeps the three wmma launches it ran before.
+    /// The two-launch gated delta scan is a Hopper and sm_100 family decision;
+    /// every other family keeps the three wmma launches it ran before.
     #[cfg(not(feature = "rocm"))]
     #[test]
-    fn only_the_sm100_family_runs_the_two_launch_gated_delta_scan() {
-        for (name, major, minor, sms) in [("NVIDIA B200", 10, 0, 148), ("NVIDIA GB200", 10, 0, 152)]
-        {
+    fn only_hopper_and_the_sm100_family_run_the_two_launch_gated_delta_scan() {
+        for (name, major, minor, sms) in [
+            ("NVIDIA B200", 10, 0, 148),
+            ("NVIDIA GB200", 10, 0, 152),
+            ("NVIDIA H100 80GB HBM3", 9, 0, 132),
+        ] {
             let (p, _) = resolve(name, &facts(major, minor, sms), None);
             assert!(
                 kernels_cuda::tuning::Tuning::of(&p).ssm_gdn_fused_scan,
@@ -721,7 +770,6 @@ mod tests {
             ("NVIDIA GeForce RTX 3090", 8, 6, 82),
             ("NVIDIA Jetson AGX Orin", 8, 7, 16),
             ("NVIDIA L40S", 8, 9, 142),
-            ("NVIDIA H100 80GB HBM3", 9, 0, 132),
             ("NVIDIA B300", 10, 3, 148),
             ("NVIDIA Thor", 11, 0, 20),
             ("NVIDIA GeForce RTX 5090", 12, 0, 170),
@@ -749,6 +797,8 @@ mod tests {
         );
         assert_eq!((b200.nvfp4_mma_from, b200.nvfp4_mma_until), (32, 8192));
         assert_eq!(b200.moe_w4a4_fused_from, 1);
+        assert_eq!((b200.moe_even_waves_from, b200.moe_routes_sized), (3, true));
+        assert_eq!(b200.moe_gather_ahead_until, 128);
         assert_eq!(b200.moe_w4a8_fused_from, 512);
         assert_eq!(b200.mla_expanded_from, 256);
         assert_eq!(b200.gemm_fp8_gemv_until, 4);
@@ -772,12 +822,16 @@ mod tests {
         assert!(b200.pdl);
         assert_eq!(b200.gemm_tc5_split_tickets, 8);
         assert_eq!(b200.gemm_rows_m, 8);
+        // Hopper takes the register-dequant selects and none of tcgen05's.
+        let h100 = tuning(9, 0, 132);
+        assert!(!h100.moe_tc5 && !h100.mxfp4_cvt && h100.gemm_tc5_split_tickets == 0);
+        assert_eq!((h100.mxfp4_mma_from, h100.mxfp4_mma_until), (28, 1024));
+        assert_eq!((h100.nvfp4_mma_from, h100.nvfp4_mma_until), (32, 8192));
         for (major, minor) in [
             (8, 0),
             (8, 6),
             (8, 7),
             (8, 9),
-            (9, 0),
             (10, 3),
             (11, 0),
             (12, 0),

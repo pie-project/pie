@@ -478,16 +478,17 @@ pub(crate) static OPS: &[Op] = &[
     Op {
         module: "attn",
         name: "ssm_causal_conv1d",
-        params: &["x", "weight", "state", "conv_width"],
+        params: &["x", "weight", "state", "conv_width", "bias"],
         call: |a, heap| {
             let x: Value = a.next()?;
             let weight: Weight = a.next()?;
             let state: ValueId = a.next()?;
             let conv_width: u32 = a.next()?;
+            let bias: Option<Weight> = a.next()?;
             result(
                 heap,
                 dsl("attn.ssm_causal_conv1d", || {
-                    ops::attn::ssm_causal_conv1d(&x, &weight, state, conv_width)
+                    ops::attn::ssm_causal_conv1d(&x, &weight, bias.as_ref(), state, conv_width)
                 })?,
             )
         },
@@ -505,7 +506,9 @@ pub(crate) static OPS: &[Op] = &[
             result(
                 heap,
                 dsl("attn.ssm_causal_conv1d_dilated", || {
-                    ops::attn::ssm_causal_conv1d_dilated(&x, &weight, state, conv_width, dilation)
+                    ops::attn::ssm_causal_conv1d_dilated(
+                        &x, &weight, None, state, conv_width, dilation,
+                    )
                 })?,
             )
         },
@@ -513,16 +516,23 @@ pub(crate) static OPS: &[Op] = &[
     Op {
         module: "attn",
         name: "ssm_causal_conv1d_chunked",
-        params: &["x", "weight", "state", "conv_width"],
+        params: &["x", "weight", "state", "conv_width", "bias"],
         call: |a, heap| {
             let x: Value = a.next()?;
             let weight: Weight = a.next()?;
             let state: ValueId = a.next()?;
             let conv_width: u32 = a.next()?;
+            let bias: Option<Weight> = a.next()?;
             result(
                 heap,
                 dsl("attn.ssm_causal_conv1d_chunked", || {
-                    ops::attn::ssm_causal_conv1d_chunked(&x, &weight, state, conv_width)
+                    ops::attn::ssm_causal_conv1d_chunked(
+                        &x,
+                        &weight,
+                        bias.as_ref(),
+                        state,
+                        conv_width,
+                    )
                 })?,
             )
         },
@@ -541,7 +551,7 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("attn.ssm_causal_conv1d_chunked_dilated", || {
                     ops::attn::ssm_causal_conv1d_chunked_dilated(
-                        &x, &weight, state, conv_width, dilation,
+                        &x, &weight, None, state, conv_width, dilation,
                     )
                 })?,
             )
@@ -841,6 +851,49 @@ pub(crate) static OPS: &[Op] = &[
                     ops::attn::ssm_kda_chunked(
                         &mixed, &f, &b, &dt_bias, &a_log, state, heads, head_dim, norm_eps,
                         gate_floor,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "ssm_mamba2",
+        params: &[
+            "xbc",
+            "dt",
+            "z",
+            "a_log",
+            "dt_bias",
+            "d",
+            "norm",
+            "eps",
+            "state",
+            "heads",
+            "groups",
+            "state_dim",
+            "chunked",
+        ],
+        call: |a, heap| {
+            let xbc: Value = a.next()?;
+            let dt: Value = a.next()?;
+            let z: Value = a.next()?;
+            let a_log: Weight = a.next()?;
+            let dt_bias: Weight = a.next()?;
+            let d: Weight = a.next()?;
+            let norm: Weight = a.next()?;
+            let eps: f32 = a.next()?;
+            let state: ValueId = a.next()?;
+            let heads: u32 = a.next()?;
+            let groups: u32 = a.next()?;
+            let state_dim: u32 = a.next()?;
+            let chunked: bool = a.next()?;
+            result(
+                heap,
+                dsl("attn.ssm_mamba2", || {
+                    ops::attn::ssm_mamba2(
+                        &xbc, &dt, &z, &a_log, &dt_bias, &d, &norm, eps, state, heads, groups,
+                        state_dim, chunked,
                     )
                 })?,
             )
@@ -3360,6 +3413,18 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "linear",
+        name: "mlp_relu2",
+        params: &["x"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            result(
+                heap,
+                dsl("linear.mlp_relu2", || ops::linear::mlp_relu2(&x))?,
+            )
+        },
+    },
+    Op {
+        module: "linear",
         name: "mlp_geglu_tanh_packed",
         params: &["packed", "intermediate"],
         call: |a, heap| {
@@ -4256,6 +4321,15 @@ pub(crate) static INPUTS: &[Op] = &[
         call: |a, heap| {
             let inputs: Input = a.next()?;
             Ok(heap.alloc(inputs.route_hints()))
+        },
+    },
+    Op {
+        module: "inputs",
+        name: "readout_attention",
+        params: &["inputs"],
+        call: |a, heap| {
+            let inputs: Input = a.next()?;
+            Ok(heap.alloc(inputs.readout_attention()))
         },
     },
     Op {

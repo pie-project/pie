@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated, symbol};
 use crate::tensor::{KvPool, Tensor};
 
 const FILE: &str = "attn/kv.cuh";
@@ -52,12 +52,76 @@ pub fn native_bf16(pool: &KvPool) -> bool {
     pool.keys.dtype == Dtype::Bf16
 }
 
+/// Whether the pool's pages are e4m3 under a unit scale, read as they are
+/// (vLLM's `fp8` KV): no planes of scales, no bf16 copy.
+#[must_use]
+pub fn native_e4m3(pool: &KvPool) -> bool {
+    pool.keys.dtype == Dtype::E4m3
+        && pool.values.dtype == Dtype::E4m3
+        && KvScheme::of_byte(pool.scheme_byte) == Some(KvScheme::Native)
+}
+
 #[must_use]
 pub fn max_touched_pages(total_tokens: i32, num_requests: i32, page_size: i32) -> i32 {
     if page_size <= 0 {
         return 0;
     }
     (total_tokens + page_size - 1) / page_size + num_requests
+}
+
+/// An e4m3 pool's pages this fire reads, widened to a bf16 shadow in its
+/// page list's order, as a pool of its own (its list `0..pages`), for a
+/// kernel that reads bf16 pages alone; `None` where the shadow would pass
+/// `cap` bytes.
+#[cfg(feature = "cuda")]
+pub(crate) fn widen_e4m3(
+    ctx: &Ctx,
+    op: &'static str,
+    pool: &KvPool,
+    cap: usize,
+) -> Result<Option<KvPool>, Error> {
+    const SHADOW_K: &str = "attn.kv_e4m3_shadow_k";
+    const SHADOW_V: &str = "attn.kv_e4m3_shadow_v";
+    const SHADOW_PAGES: &str = "attn.kv_e4m3_shadow_pages";
+    let pages = pool.page_indices.rows;
+    let page = u32::try_from(pool.page_size).unwrap_or(0);
+    let width = pool.keys.width;
+    let row_bytes = u64::from(page) * u64::from(width);
+    if pages == 0 || pool.layout != 0 || !row_bytes.is_multiple_of(16) {
+        return Ok(None);
+    }
+    let bytes = usize::try_from(u64::from(pages) * row_bytes * 2).unwrap_or(usize::MAX);
+    if bytes > cap {
+        return Ok(None);
+    }
+    let k = ctx.scratch_stream(op, SHADOW_K, bytes)? as u64;
+    let v = ctx.scratch_stream(op, SHADOW_V, bytes)? as u64;
+    let ids = ctx.scratch_stream(op, SHADOW_PAGES, pages as usize * 4)? as u64;
+    let chunks = u64::from(pages) * row_bytes / 16;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::attn::widen_e4m3_pages").apply(Launch::flat(
+            u32::try_from(chunks).unwrap_or(u32::MAX),
+            BLOCK,
+        )),
+        &[
+            pool.keys.arg(),
+            pool.values.arg(),
+            ArgValue::Ptr(k),
+            ArgValue::Ptr(v),
+            pool.page_indices.arg(),
+            ArgValue::Ptr(ids),
+            i64::try_from(chunks).unwrap_or(i64::MAX).arg(),
+            i32::try_from(row_bytes / 16).unwrap_or(i32::MAX).arg(),
+        ],
+    )?;
+    let cells = pages * page;
+    Ok(Some(KvPool {
+        keys: Tensor::new(k, cells, width, Dtype::Bf16),
+        values: Tensor::new(v, cells, pool.values.width, Dtype::Bf16),
+        page_indices: Tensor::new(ids, pages, 1, Dtype::I32),
+        ..*pool
+    }))
 }
 
 pub(crate) fn head_split(
@@ -117,7 +181,7 @@ pub(crate) fn write_kv_to_pages(
     write_offset: Tensor,
 ) -> Result<(), Error> {
     let (kv_heads, head_dim) = head_split(op, pool, k.width)?;
-    if native_bf16(pool) {
+    if native_bf16(pool) || native_e4m3(pool) {
         write_kv_bf16(
             ctx,
             op,
@@ -150,14 +214,25 @@ fn write_kv_bf16(
     head_dim: i32,
 ) -> Result<(), Error> {
     let hnd = pool.layout != 0;
-    let instantiation = if hnd {
-        "::pie::attn::kv_append_explicit<::pie::true_type::value>"
+    let layout = if hnd {
+        "::pie::true_type::value"
     } else {
-        "::pie::attn::kv_append_explicit<::pie::false_type::value>"
+        "::pie::false_type::value"
+    };
+    let pages = if native_e4m3(pool) {
+        "__nv_fp8_e4m3"
+    } else {
+        "::pie::bf16"
     };
     ctx.fire(
         op,
-        Fire::at(FILE, instantiation).apply(Launch::per_row(k.rows, BLOCK)),
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::attn::kv_append_explicit<{layout}, {pages}>"
+            )),
+        )
+        .apply(Launch::per_row(k.rows, BLOCK)),
         &[
             k.arg(),
             v.arg(),
@@ -174,7 +249,7 @@ fn write_kv_bf16(
         ],
     )?;
 
-    if pool.has_envelopes && !hnd && k.rows > 0 {
+    if pool.has_envelopes && !hnd && k.rows > 0 && native_bf16(pool) {
         let num_requests = lanes_of(op, indptr)?;
         let _ = envelope_update_appended(
             ctx,

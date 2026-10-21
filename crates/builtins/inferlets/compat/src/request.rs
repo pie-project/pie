@@ -26,6 +26,9 @@ pub struct ToolCall {
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// The reasoning an assistant turn carried (`reasoning_content`), which a
+    /// template that replays reasoning writes back inside its thinking block.
+    pub reasoning: String,
     /// Encoded pictures (PNG, JPEG, ...) a user turn carries ahead of its text.
     pub images: Vec<Vec<u8>>,
     /// Tool calls an assistant turn made (empty for every other role).
@@ -39,6 +42,7 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            reasoning: String::new(),
             images: Vec::new(),
             tool_calls: Vec::new(),
             tool_name: None,
@@ -67,6 +71,17 @@ pub enum ResponseFormat {
     JsonObject,
     /// A JSON document matching this JSON Schema (grammar-forced).
     JsonSchema(String),
+}
+
+/// How hard a thinking request asks the model to think; a template that
+/// states an instruction for it (Qwen3.8) writes that into the system turn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Effort {
+    /// The template's default.
+    #[default]
+    Xhigh,
+    Medium,
+    Low,
 }
 
 /// Model reasoning ("thinking") for a request: on, off, or whatever the
@@ -104,6 +119,7 @@ pub struct Request {
     /// the sequence itself is not returned.
     pub stop: Vec<String>,
     pub thinking: Thinking,
+    pub effort: Effort,
     pub stream: bool,
 }
 
@@ -126,6 +142,7 @@ impl Request {
             ignore_eos: false,
             stop: Vec::new(),
             thinking: Thinking::ModelDefault,
+            effort: Effort::Xhigh,
             stream: false,
         }
     }

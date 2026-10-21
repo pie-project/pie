@@ -189,6 +189,12 @@ pub fn takes(heads: u32, head_dim: u32, window: &KvPool, pooled: Option<&Pooled<
 /// How many blocks split a row's keys: enough that the rows' four head
 /// groups fill the chip, a power of two up to [`MAX_RANKS`].
 fn ranks(ctx: &Ctx, rows: u32) -> u32 {
+    // Thread block clusters arrive with sm_90; below it the kernel folds
+    // nothing across ranks (`dsv4_decode.cuh`), so a block holds every key.
+    #[cfg(feature = "cuda")]
+    if crate::jit::device::compute_capability_major().is_some_and(|major| major < 9) {
+        return 1;
+    }
     let sms = ctx.multiprocessors().unwrap_or(148);
     let blocks = rows.saturating_mul(HEADS / GROUP);
     let mut r = 1;
@@ -201,8 +207,14 @@ fn ranks(ctx: &Ctx, rows: u32) -> u32 {
 fn smem(rows: Option<(Rows, Rows)>) -> u32 {
     let ld = HEAD_DIM + 8;
     let tile = KEYS * ld * 2;
-    // Tiles in flight: six of quantized rows (and the one they widen into),
-    // four of bf16. A raw key holds the wider format's data and scales.
+    // Tiles in flight: six of quantized rows (five below sm_90, as
+    // `dsv4_decode.cuh` lays them) and the one they widen into, four of
+    // bf16. A raw key holds the wider format's data and scales.
+    let stages = if crate::jit::device::compute_capability_major().is_some_and(|major| major < 9) {
+        5
+    } else {
+        6
+    };
     let ring = if let Some((w, p)) = rows {
         let split = |r: Rows| match r {
             Rows::Ds => (DS_DATA, DS_SCALES),
@@ -210,7 +222,7 @@ fn smem(rows: Option<(Rows, Rows)>) -> u32 {
             Rows::Nv4 => (256, 32),
         };
         let ((wd, ws), (pd, ps)) = (split(w), split(p));
-        6 * KEYS * (wd.max(pd) + ws.max(ps)) + tile
+        stages * KEYS * (wd.max(pd) + ws.max(ps)) + tile
     } else {
         4 * tile
     };

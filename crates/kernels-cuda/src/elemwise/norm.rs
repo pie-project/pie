@@ -102,6 +102,39 @@ fn rms_row(
     } else {
         per_head_dim
     };
+    // A whole row's norm (no heads) in 16-byte runs a thread, read once.
+    let runs = y.width.div_ceil(8 * BLOCK);
+    if ctx.tuning().rows_vec
+        && per_head_dim == 0
+        && y.width > 256
+        && y.width.is_multiple_of(8)
+        && runs <= 4
+        && x.width.is_multiple_of(8)
+        && [x.ptr, weight.ptr, y.ptr].iter().all(|&at| aligned16(at))
+    {
+        let plus_one = template == OFFSET_BANK;
+        let runs = runs.next_power_of_two();
+        return ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_runs<{t}, {runs}, {plus_one}>"
+                )),
+            )
+            .apply(Launch::grid([y.rows, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl)),
+            &[
+                x.arg(),
+                weight.arg(),
+                y.arg(),
+                hidden.arg(),
+                hidden.arg(),
+                hidden.arg(),
+                eps.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     if ctx.tuning().rows_vec
         && (width == 128 || width == 256)
         && [x.ptr, weight.ptr, y.ptr].iter().all(|&at| aligned16(at))
@@ -139,6 +172,22 @@ fn rms_row(
                 heads.arg(),
                 ctx.stage(),
             ],
+        );
+    }
+    // A whole row of 2048 to 8192 held in registers, read once.
+    if per_head_dim == 0 && matches!(width, 2048 | 4096 | 8192) {
+        let plus_one = template == OFFSET_BANK;
+        return ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_held<{t}, {}, {plus_one}>",
+                    width / 256
+                )),
+            )
+            .apply(launch),
+            &[x.arg(), weight.arg(), y.arg(), eps.arg(), ctx.stage()],
         );
     }
     ctx.fire(
@@ -296,31 +345,39 @@ pub fn norm_gate(
         ));
     }
     let tail = next.is_some();
-    ctx.fire(
-        OP,
-        Fire::at(
-            FILE,
-            symbol(&format!(
-                "::pie::elemwise::norm_gate<{t}, {threads}, {tail}>"
-            )),
+    // A long fire's block walks sixteen rows; a short one's keeps a row.
+    const WALK: u32 = 16;
+    let walk = rows >= 8192;
+    let (entry, launch) = if walk {
+        (
+            format!("::pie::elemwise::norm_gate_rows<{t}, {threads}, {tail}, {WALK}>"),
+            Launch::per_row(rows.div_ceil(WALK), threads),
         )
-        .apply(Launch::per_row(rows, threads)),
-        &[
-            x.arg(),
-            absent(scale),
-            absent(res),
-            absent(gate),
-            y.arg(),
-            eps.arg(),
-            temperature.arg(),
-            stated(OP, fan)?.arg(),
-            absent(next.map(|n| n.weight)),
-            next.map_or(0.0, |n| n.eps).arg(),
-            i32::from(next.is_some_and(|n| n.plus_one)).arg(),
-            absent(next.map(|n| n.y)),
-            ctx.stage(),
-        ],
-    )
+    } else {
+        (
+            format!("::pie::elemwise::norm_gate<{t}, {threads}, {tail}>"),
+            Launch::per_row(rows, threads),
+        )
+    };
+    let mut args = vec![
+        x.arg(),
+        absent(scale),
+        absent(res),
+        absent(gate),
+        y.arg(),
+        eps.arg(),
+        temperature.arg(),
+        stated(OP, fan)?.arg(),
+        absent(next.map(|n| n.weight)),
+        next.map_or(0.0, |n| n.eps).arg(),
+        i32::from(next.is_some_and(|n| n.plus_one)).arg(),
+        absent(next.map(|n| n.y)),
+    ];
+    if walk {
+        args.push(stated(OP, rows)?.arg());
+    }
+    args.push(ctx.stage());
+    ctx.fire(OP, Fire::at(FILE, symbol(&entry)).apply(launch), &args)
 }
 
 pub fn rmsnorm_no_scale(
@@ -547,12 +604,36 @@ pub fn rmsnorm_grouped_plus_one(
     eps: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_grouped_plus_one";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let group = nonzero(OP, "the group width", group)?;
+    rmsnorm_grouped(
+        ctx,
+        "elementwise.rmsnorm_grouped_plus_one",
+        x,
+        weight,
+        group,
+        eps,
+        true,
+        y,
+    )
+}
+
+/// Each `group`-wide run of `x`'s rows RMS-normed into `y` and scaled by
+/// its own `weight`s (`1 + weight` under `plus_one`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rmsnorm_grouped(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    weight: Tensor,
+    group: u32,
+    eps: f32,
+    plus_one: bool,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let group = nonzero(op, "the group width", group)?;
     if y.width == 0 || !y.width.is_multiple_of(group) {
         return Err(refuse(
-            OP,
+            op,
             format!(
                 "the {}-wide row is not a whole number of {group}-wide groups",
                 y.width
@@ -565,13 +646,13 @@ pub fn rmsnorm_grouped_plus_one(
         "the weight spans the row's full width"
     );
     let groups = y.width / group;
-    let launch = rows_per_head(OP, y.rows, y.width, group)?;
+    let launch = rows_per_head(op, y.rows, y.width, group)?;
     ctx.fire(
-        OP,
+        op,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::elemwise::rmsnorm_grouped_plus_one<{t}, 256>"
+                "::pie::elemwise::rmsnorm_grouped<{t}, 256, {plus_one}>"
             )),
         )
         .apply(launch),
@@ -579,8 +660,8 @@ pub fn rmsnorm_grouped_plus_one(
             x.arg(),
             weight.arg(),
             y.arg(),
-            stated(OP, group)?.arg(),
-            stated(OP, groups)?.arg(),
+            stated(op, group)?.arg(),
+            stated(op, groups)?.arg(),
             eps.arg(),
             ctx.stage(),
         ],
@@ -617,13 +698,20 @@ pub fn rmsnorm_gated_by(
         .rows
         .checked_mul(heads)
         .ok_or_else(|| refuse(OP, "the rows' heads do not count"))?;
+    // A warp's (row, head) pairs.
+    let per_warp: u32 = if ctx.tuning().rows_vec { 2 } else { 1 };
     ctx.fire(
         OP,
         Fire::at(
             "elemwise/norm.cuh",
-            symbol(&format!("::pie::elemwise::rmsnorm_gated_by<{t}>")),
+            symbol(&format!(
+                "::pie::elemwise::rmsnorm_gated_by<{t}, {per_warp}>"
+            )),
         )
-        .apply(Launch::grid([pairs.div_ceil(8), 1, 1], [256, 1, 1])),
+        .apply(
+            Launch::grid([pairs.div_ceil(8 * per_warp), 1, 1], [256, 1, 1])
+                .programmatic(ctx.tuning().pdl),
+        ),
         &[
             x.arg(),
             gate.arg(),
@@ -647,7 +735,8 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         let lanes = u32::try_from(n / 8).unwrap_or(u32::MAX);
         return ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::elemwise::residual_add_vec8").apply(Launch::flat(lanes, BLOCK)),
+            Fire::at(FILE, "::pie::elemwise::residual_add_vec8")
+                .apply(Launch::flat(lanes, BLOCK).programmatic(ctx.tuning().pdl)),
             &[
                 y.arg(),
                 x.arg(),
@@ -713,7 +802,11 @@ pub fn residual_add_rmsnorm(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entrypoint)).apply(Launch::per_row(rows, block)),
+        // The register kernel waits on its producer in-kernel (`kernel.pdl`).
+        Fire::at(FILE, symbol(&entrypoint)).apply(
+            Launch::per_row(rows, block)
+                .programmatic(ctx.tuning().pdl && entrypoint.contains("_reg<")),
+        ),
         &[
             x.arg(),
             y.arg(),
@@ -819,7 +912,9 @@ pub fn rmsnorm_residual_add(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entrypoint)).apply(Launch::per_row(rows, block)),
+        // The vec8 form waits on its producer in-kernel (`kernel.pdl`).
+        Fire::at(FILE, symbol(&entrypoint))
+            .apply(Launch::per_row(rows, block).programmatic(ctx.tuning().pdl && vectors)),
         &[
             x.arg(),
             w0.arg(),
@@ -929,7 +1024,8 @@ pub fn scale(ctx: &Ctx, s: Tensor, x: &mut Tensor) -> Result<(), Error> {
     let (launch, n) = elementwise(OP, *x)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::scale<{t}>"))).apply(launch),
+        Fire::at(FILE, symbol(&format!("::pie::elemwise::scale<{t}>")))
+            .apply(launch.programmatic(ctx.tuning().pdl)),
         &[
             x.arg(),
             s.arg(),

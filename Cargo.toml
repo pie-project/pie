@@ -55,6 +55,8 @@ members = [
     "crates/engine-wgpu",
     "crates/kernels-xla",
     "crates/engine-xla",
+    "crates/kernels-cerebras",
+    "crates/engine-cerebras",
     "crates/web-std",
     "packages/javascript/server-web",
     "packages/c",
@@ -101,6 +103,8 @@ default-members = [
     "crates/engine-wgpu",
     "crates/kernels-xla",
     "crates/engine-xla",
+    "crates/kernels-cerebras",
+    "crates/engine-cerebras",
     "crates/eta-ir",
     "crates/eta-dsl",
     "crates/eta-compiler",
@@ -153,11 +157,12 @@ default = []
 cuda = ["engine-cuda", "worker/cuda"]
 rocm = ["engine-cuda", "worker/rocm"]
 # engine-cuda is built in, under `cuda` or `rocm`.
-engine-cuda = []
+engine-cuda = ["worker/engine-cuda"]
 metal = ["worker/metal"]
 vulkan = ["worker/vulkan"]
 wgpu = ["worker/wgpu"]
 xla = ["worker/xla"]
+cerebras = ["worker/cerebras"]
 profile-fire = ["worker/profile-fire"]
 
 [dependencies]

@@ -58,6 +58,23 @@ impl pie::inferlet::chat::Host for ProcessCtx {
             .system_thinking(message.as_deref(), effort))
     }
 
+    async fn open(
+        &mut self,
+        system: Option<String>,
+        tools: Vec<String>,
+        effort: Option<pie::inferlet::chat::ReasoningEffort>,
+    ) -> Result<Vec<u32>> {
+        use pie::inferlet::chat::ReasoningEffort as E;
+        let effort = effort.map(|effort| match effort {
+            E::Xhigh => chat_template::Effort::Xhigh,
+            E::Medium => chat_template::Effort::Medium,
+            E::Low => chat_template::Effort::Low,
+        });
+        Ok(crate::model::model()
+            .instruct()
+            .open(system.as_deref(), &tools, effort))
+    }
+
     async fn cue(&mut self) -> Result<Vec<u32>> {
         Ok(crate::model::model().instruct().cue())
     }

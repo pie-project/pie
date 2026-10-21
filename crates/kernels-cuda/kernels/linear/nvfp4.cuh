@@ -40,8 +40,10 @@ __global__ void dequant_nvfp4(
 
 // One block a route and `kRowsT` rows a warp, the route's expert read once a
 // route: the decode arm. A null `routes` reads one expert, route `r` being
-// activation row `r`, which is the dense product.
-template <class T, int kRowsT>
+// activation row `r`, which is the dense product. With kLean (A100's
+// profile) one 32-code chunk a row in flight a lane and the codes widened by
+// integer ops as `moe_matmul_select_mxfp4`'s lean arm widens them.
+template <class T, int kRowsT, bool kLean = false>
 __global__ void moe_matmul_select_nvfp4(
     const T* __restrict__ act,
     const i32* __restrict__ routes,
@@ -107,7 +109,7 @@ __global__ void moe_matmul_select_nvfp4(
 #pragma unroll
     for (int r = 0; r < kRows; ++r) row_of[r] = min(row0 + r, n - 1);
 
-    constexpr int kU = 2;
+    constexpr int kU = kLean ? 1 : 2;
     float acc[kRows];
 #pragma unroll
     for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
@@ -138,23 +140,29 @@ __global__ void moe_matmul_select_nvfp4(
                 const T* xe = reinterpret_cast<const T*>(&xq);
                 float xv[8];
 #pragma unroll
-                for (int j = 0; j < 8; ++j) xv[j] = Elem<T>::to_f32(xe[j]);
+                for (int j = 0; j < 8; ++j) xv[j] = Elem<T>::to_f32(xe[j]) * (kLean ? 0x1p100f : 1.f);
 #pragma unroll
                 for (int r = 0; r < kRows; ++r) {
-                    __half2 qd[4];
-                    mxfp4_unpack8((&ww[u][r].x)[q], qd);
+                    if constexpr (kLean) {
+                        part[q >> 1][r] = e2m1x8_dot_lean((&ww[u][r].x)[q], xv, part[q >> 1][r]);
+                    } else {
+                        __half2 qd[4];
+                        mxfp4_unpack8((&ww[u][r].x)[q], qd);
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        const float2 f = __half22float2(qd[j]);
-                        part[q >> 1][r] = fmaf(f.x, xv[2 * j], part[q >> 1][r]);
-                        part[q >> 1][r] = fmaf(f.y, xv[2 * j + 1], part[q >> 1][r]);
+                        for (int j = 0; j < 4; ++j) {
+                            const float2 f = __half22float2(qd[j]);
+                            part[q >> 1][r] = fmaf(f.x, xv[2 * j], part[q >> 1][r]);
+                            part[q >> 1][r] = fmaf(f.y, xv[2 * j + 1], part[q >> 1][r]);
+                        }
                     }
                 }
             }
+            // The lean arm's products are 2^-26 short: the scale takes it back.
+            constexpr float kBack = kLean ? 0x1p26f : 1.f;
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
-                acc[r] = fmaf(part[0][r], nvfp4_scale(static_cast<u8>(sc[u][r] & 0xFFu)), acc[r]);
-                acc[r] = fmaf(part[1][r], nvfp4_scale(static_cast<u8>(sc[u][r] >> 8)), acc[r]);
+                acc[r] = fmaf(part[0][r], nvfp4_scale(static_cast<u8>(sc[u][r] & 0xFFu)) * kBack, acc[r]);
+                acc[r] = fmaf(part[1][r], nvfp4_scale(static_cast<u8>(sc[u][r] >> 8)) * kBack, acc[r]);
             }
         }
     }

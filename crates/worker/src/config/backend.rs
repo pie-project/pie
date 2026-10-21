@@ -203,6 +203,66 @@ impl XlaEngineOptions {
     }
 }
 
+/// The Cerebras engine: the fabric simulator, or a CS system reached by
+/// `cmaddr`, driving one wafer.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CerebrasEngineOptions {
+    /// The wafer generation the program is compiled for: `"wse2"` or
+    /// `"wse3"`.
+    pub target: String,
+    /// The CS system's `host:port`. Omit to run the fabric simulator.
+    pub cmaddr: Option<String>,
+    /// Host threads the simulator and the host-side staging use.
+    pub num_threads: u32,
+    /// The most tokens one fire carries.
+    pub max_forward_tokens: u32,
+    /// The most requests one fire carries.
+    pub max_forward_requests: u32,
+    /// Recurrent-state seats (hybrid models).
+    pub max_state_slots: Option<u32>,
+    /// The longest sequence (prompt + output) one lane holds, in tokens.
+    /// Omit for the engine default (4096).
+    pub max_model_len: Option<u32>,
+    /// Trace and compile the first fire shapes at load.
+    pub prewarm: bool,
+}
+
+impl Default for CerebrasEngineOptions {
+    fn default() -> Self {
+        Self {
+            target: "wse3".to_string(),
+            cmaddr: None,
+            num_threads: 16,
+            max_forward_tokens: 64,
+            max_forward_requests: 4,
+            max_state_slots: None,
+            max_model_len: None,
+            prewarm: false,
+        }
+    }
+}
+
+impl CerebrasEngineOptions {
+    pub(super) fn validate(&self) -> Result<()> {
+        ensure!(
+            matches!(self.target.as_str(), "wse2" | "wse3"),
+            "engine.target must be one of \"wse2\", \"wse3\"; got {:?}",
+            self.target
+        );
+        ensure!(self.num_threads > 0, "engine.num_threads must be > 0");
+        ensure!(
+            self.max_forward_tokens > 0,
+            "engine.max_forward_tokens must be > 0"
+        );
+        ensure!(
+            self.max_forward_requests > 0,
+            "engine.max_forward_requests must be > 0"
+        );
+        Ok(())
+    }
+}
+
 impl CudaNativeEngineOptions {
     pub(super) fn validate(&self) -> Result<()> {
         if let Some(size) = self.kv_page_size {

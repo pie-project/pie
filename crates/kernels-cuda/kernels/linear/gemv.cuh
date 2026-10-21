@@ -4,21 +4,16 @@
 
 namespace pie::linear {
 
-template <int kWarps, int kUnrollP = 4>
-__global__ void gemv_bf16_kernel(
-    const bf16* __restrict__ weight,
-    const bf16* __restrict__ act,
-    const bf16* __restrict__ bias,
-    bf16* __restrict__ out,
-    int N, int K, float beta)
+// A warp's dot of weight row `row` (K wide) with the activation `act`,
+// folded to lane 0.
+template <int kUnroll>
+__device__ __forceinline__ float gemv_bf16_row(
+    const bf16* __restrict__ weight, const bf16* __restrict__ act, int row, int K)
 {
-    const int row = blockIdx.x * kWarps + threadIdx.y;
-    if (row >= N) return;
     const float4* w4 =
         reinterpret_cast<const float4*>(weight + (long long)row * K);
     const float4* x4 = reinterpret_cast<const float4*>(act);
     const int vectors = K / 8;
-    constexpr int kUnroll = kUnrollP;
     float acc = 0.f;
     int i = threadIdx.x;
     for (; i + 32 * (kUnroll - 1) < vectors; i += 32 * kUnroll) {
@@ -53,6 +48,24 @@ __global__ void gemv_bf16_kernel(
     for (int off = 16; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     }
+    return acc;
+}
+
+template <int kWarps, int kUnrollP = 4>
+__global__ void gemv_bf16_kernel(
+    const bf16* __restrict__ weight,
+    const bf16* __restrict__ act,
+    const bf16* __restrict__ bias,
+    bf16* __restrict__ out,
+    int N, int K, float beta)
+{
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
+    const int row = blockIdx.x * kWarps + threadIdx.y;
+    if (row >= N) return;
+    float acc = gemv_bf16_row<kUnrollP>(weight, act, row, K);
     if (threadIdx.x == 0) {
         if (beta != 0.f) acc += beta * bf16_to_f32(out[row]);
 
@@ -62,6 +75,21 @@ __global__ void gemv_bf16_kernel(
         }
         out[row] = v;
     }
+}
+
+// `gemv_bf16_kernel` over a grouped plane at one row: weight row `row` is
+// group `row / group_n`'s, against that group's K-wide slice of the row.
+template <int kWarps>
+__global__ void gemv_bf16_grouped_kernel(
+    const bf16* __restrict__ weight,
+    const bf16* __restrict__ act,
+    bf16* __restrict__ out,
+    int N, int K, int group_n)
+{
+    const int row = blockIdx.x * kWarps + threadIdx.y;
+    if (row >= N) return;
+    const float acc = gemv_bf16_row<4>(weight, act + (long long)(row / group_n) * K, row, K);
+    if (threadIdx.x == 0) out[row] = f32_to_bf16(acc);
 }
 
 // `out[row][n] = act[row] . weight[n]` for a product a few columns wide
@@ -124,6 +152,10 @@ __global__ void gemv_splitk_bf16_kernel(
     bf16* __restrict__ out,
     int N, int K, float beta)
 {
+    // A programmatic dependent (`kernel.pdl`) touches nothing until its
+    // producer is done; its own dependents may launch from here.
+    pdl_wait();
+    pdl_launch();
     const int row = blockIdx.x;
     if (row >= N) return;
     const int warp = threadIdx.y;
@@ -192,8 +224,11 @@ __global__ void gemv_splitk_bf16_kernel(
 // each activation load serves four weight loads), `kSplit` warps the rows'
 // slices; each warp's sums fold across its lanes, and a row's slices add in
 // slice order, so a launch lands the same bits each time. One launch, every
-// weight byte read once: a split GEMM's reduce launch saved.
-template <int kM, int kSplit>
+// weight byte read once: a split GEMM's reduce launch saved. Over a cluster
+// of `kCl` blocks (a few columns, too few blocks to keep the loads in
+// flight), each block takes a slice of K and the first adds the blocks' sums
+// in rank order.
+template <int kM, int kSplit, int kCl = 1>
 __global__ void __launch_bounds__(256) gemm_rows_bf16_kernel(
     const bf16* __restrict__ weight,
     const bf16* __restrict__ act,
@@ -210,12 +245,15 @@ __global__ void __launch_bounds__(256) gemm_rows_bf16_kernel(
     constexpr int kR = 2;                     // weight rows a warp
     constexpr int kRows = 8 / kSplit * kR;    // weight rows a block
     __shared__ float red[8][kR][kM];
+    __shared__ float sum[kRows * kM];
     const int warp = static_cast<int>(threadIdx.x) / 32;
     const int lane = static_cast<int>(threadIdx.x) % 32;
-    const int row0 = static_cast<int>(blockIdx.x) * kRows + warp / kSplit * kR;
-    const int part = warp % kSplit;
+    const int block = static_cast<int>(blockIdx.x) / kCl;
+    const int rank = static_cast<int>(blockIdx.x) % kCl;
+    const int row0 = block * kRows + warp / kSplit * kR;
+    const int part = rank * kSplit + warp % kSplit;
     const int vectors = K / 8;
-    const int per = vectors / kSplit;
+    const int per = vectors / (kSplit * kCl);
     float acc[kR][kM];
 #pragma unroll
     for (int q = 0; q < kR; ++q) {
@@ -270,23 +308,47 @@ __global__ void __launch_bounds__(256) gemm_rows_bf16_kernel(
         }
     }
     __syncthreads();
-    // Thread t lands block row t / kM's column for activation row t % kM.
+    // Thread t sums block row t / kM's column for activation row t % kM.
     for (int t = static_cast<int>(threadIdx.x); t < kRows * kM; t += 256) {
         const int local = t / kM;
         const int r = t % kM;
         const int group = local / kR;   // the warp group holding the row
         const int q = local % kR;
-        const int n = static_cast<int>(blockIdx.x) * kRows + local;
-        if (n < N) {
-            float s = red[group * kSplit][q][r];
+        float s = red[group * kSplit][q][r];
 #pragma unroll
-            for (int p = 1; p < kSplit; ++p) s += red[group * kSplit + p][q][r];
-            bf16 v = f32_to_bf16(s);
-            if (bias != nullptr) {
-                v = f32_to_bf16(bf16_to_f32(v) + bf16_to_f32(bias[n]));
+        for (int p = 1; p < kSplit; ++p) s += red[group * kSplit + p][q][r];
+        sum[t] = s;
+    }
+    if constexpr (kCl > 1) {
+        asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
+    } else {
+        __syncthreads();
+    }
+    if (rank == 0) {
+        for (int t = static_cast<int>(threadIdx.x); t < kRows * kM; t += 256) {
+            const int n = block * kRows + t / kM;
+            float s = sum[t];
+#pragma unroll
+            for (int c = 1; c < kCl; ++c) {
+                const unsigned local = static_cast<unsigned>(__cvta_generic_to_shared(sum + t));
+                unsigned remote;
+                float v;
+                asm("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(local), "r"(c));
+                asm("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(remote));
+                s += v;
             }
-            out[static_cast<long long>(r) * N + n] = v;
+            if (n < N) {
+                bf16 v = f32_to_bf16(s);
+                if (bias != nullptr) {
+                    v = f32_to_bf16(bf16_to_f32(v) + bf16_to_f32(bias[n]));
+                }
+                out[static_cast<long long>(t % kM) * N + n] = v;
+            }
         }
+    }
+    if constexpr (kCl > 1) {
+        // No block retires while the first may read its sums.
+        asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
     }
 }
 

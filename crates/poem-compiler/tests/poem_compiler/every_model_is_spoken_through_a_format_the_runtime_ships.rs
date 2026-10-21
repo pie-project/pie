@@ -14,6 +14,7 @@ fn every_model_is_spoken_through_a_format_the_runtime_ships() {
             preserve_thinking: t.preserve_thinking,
             reasoning_effort: t.reasoning_effort,
             tools: t.tools,
+            xml_tools: t.xml_tools,
             generation_suffix: t.generation_suffix.clone(),
             stop: t.stop.clone(),
             bos: t.bos.clone(),

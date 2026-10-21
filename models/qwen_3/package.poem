@@ -7,10 +7,10 @@ load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
 
 # Qwen 3.5, 3.6 and 3.8 templates end a thinking request's prompt inside an open `<think>`.
 THINKING_CUE = "<think>\n"
-CHATML = template("chatml", thinking = True, tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
+CHATML = template("chatml", thinking = True, tools = True, xml_tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
 CHATML_INTERLEAVED = template("chatml", thinking = True, preserve_thinking = True, tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
 # Qwen3.8's template opens a thinking request's system turn with its reasoning-effort instruction.
-CHATML_QWEN38 = template("chatml", thinking = True, preserve_thinking = True, reasoning_effort = True, tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
+CHATML_QWEN38 = template("chatml", thinking = True, preserve_thinking = True, reasoning_effort = True, tools = True, xml_tools = True, generation_suffix = THINKING_CUE, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP], parts = {"vision": [QWEN_VISION]})
 TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"vision": [QWEN_VISION]})
 
@@ -46,11 +46,13 @@ MODELS = [
     fixture("qwen3-micro-text-hd128-rotated"),
     fixture("qwen3-micro-text-hd256"),
     fixture("qwen3-micro-text-hd256-rotated"),
+    fixture("qwen35-pico"),
 ]
 
 U4 = dtype.u4g64
 BF = dtype.bf16
 U8 = dtype.u8g64
+F8 = dtype.e4m3tile128a8
 
 DEPLOYMENTS = [
     deployment("qwen36-27b", weights = U4, kv = BF, drafter = "mtp"),
@@ -86,6 +88,9 @@ DEPLOYMENTS = [
     deployment("qwen38-27b", weights = BF, kv = BF),
     deployment("qwen35-a3b", weights = BF, kv = BF),
     deployment("qwen36-35b-a3b", weights = BF, kv = BF),
+    # Qwen3.6-35B-A3B-FP8 as released: its projections and experts as stored
+    # (128-square blocks, activations e4m3 in 1x128), the rest bf16.
+    deployment("qwen36-35b-a3b", weights = F8, kv = BF),
     deployment("qwen35-d3b", weights = BF, kv = BF),
     deployment("qwen35-d0.8b", weights = BF, kv = BF, drafter = "eagle"),
     deployment("qwen35-d0.8b", weights = BF, kv = BF),

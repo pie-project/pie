@@ -39,6 +39,10 @@ pub(crate) struct Demux {
     /// Drop whitespace at the start of a reasoning block: the template opens
     /// it with a newline.
     reasoning_strip_leading: bool,
+    /// Whitespace at the end of the reasoning so far, held until more
+    /// reasoning follows it: the template closes the block on a newline, and
+    /// a streamed answer should read as the whole one does, trimmed.
+    reasoning_held: String,
     in_tool_call: bool,
     content_filter: HoldBack,
     /// Drop whitespace at the start of the next content: the template puts
@@ -61,6 +65,7 @@ impl Demux {
             chat: chat::Decoder::new(),
             in_reasoning,
             reasoning_strip_leading: true,
+            reasoning_held: String::new(),
             in_tool_call: false,
             content_filter: HoldBack::new(vec!["<tool_call>".to_string()]),
             strip_leading: true,
@@ -82,10 +87,12 @@ impl Demux {
             reasoning::Event::Start => {
                 self.in_reasoning = true;
                 self.reasoning_strip_leading = true;
+                self.reasoning_held.clear();
                 return Ok(events);
             }
             reasoning::Event::Complete(_) => {
                 self.in_reasoning = false;
+                self.reasoning_held.clear();
                 self.strip_leading = true;
                 events.push(Event::ReasoningEnd);
                 return Ok(events);
@@ -96,11 +103,19 @@ impl Demux {
                 } else {
                     delta
                 };
-                if !delta.is_empty() {
-                    self.reasoning_strip_leading = false;
-                    self.reasoning_text.push_str(&delta);
-                    events.push(Event::Reasoning(delta));
+                let body = delta.trim_end();
+                if body.is_empty() {
+                    if !self.reasoning_strip_leading {
+                        self.reasoning_held.push_str(&delta);
+                    }
+                    return Ok(events);
                 }
+                let tail = delta[body.len()..].to_string();
+                let text = std::mem::take(&mut self.reasoning_held) + body;
+                self.reasoning_held = tail;
+                self.reasoning_strip_leading = false;
+                self.reasoning_text.push_str(&text);
+                events.push(Event::Reasoning(text));
                 return Ok(events);
             }
             reasoning::Event::Delta(_) => {}

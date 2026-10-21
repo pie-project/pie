@@ -1,0 +1,137 @@
+# The weights of Nemotron-3 Super: per layer an RMS norm and one mixer, a
+# Mamba-2 (`M`), a NoPE GQA attention (`*`) or a latent MoE (`E`) of relu2
+# experts beside a relu2 shared expert; the token embedding, a final norm and
+# the head.
+
+PATTERN = "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME"
+
+def dims(layers):
+    return struct(
+        layers = layers,
+        hidden = 4096,
+        vocab = 131072,
+        heads = 32,
+        kv_heads = 2,
+        head_dim = 128,
+        mamba_heads = 128,
+        mamba_head_dim = 64,
+        groups = 8,
+        state_dim = 128,
+        conv_kernel = 4,
+        experts = 512,
+        top_k = 22,
+        latent = 1024,
+        moe_inter = 2688,
+        shared_inter = 5376,
+        scaling = 5.0,
+        eps = 1e-5,
+    )
+
+DIMS = {
+    "nemotron3-super": dims(88),
+    "nemotron3-super-mini": dims(9),
+}
+
+# The release's own precision a projection, as modelopt chose it layer by
+# layer: the layers each projection is kept bf16 at where most are FP8, or
+# FP8 at where most are bf16; and the one shared expert stored NVFP4, read
+# here as bf16.
+BF16_AT = {
+    "in_proj": [22, 24, 33, 35, 38, 42, 44, 46, 64, 75, 77, 80],
+    "out_proj": [6, 15, 20, 22, 24, 27, 29, 31, 33, 35, 46],
+    "shared_up": [41],
+    "shared_down": [1, 8, 76],
+}
+FP8_AT = {
+    "fc1_latent": [1, 3, 5],
+    "fc2_latent": [3],
+    "o_proj": [69, 78],
+}
+
+def layout(id, deploy):
+    if deploy.weights != [dtype.bf16, dtype.nvfp4a4, dtype.e4m3tile128a8] or deploy.drafter != None or deploy.parts:
+        fail("{} ships as released: bf16, NVFP4 experts against NVFP4 activations and its FP8 projections; not {}".format(id, deploy))
+    w, experts, f8 = deploy.weights
+    d = DIMS[id]
+    norms = compute(w)
+    hidden = d.hidden
+    inner = d.mamba_heads * d.mamba_head_dim
+    conv_dim = inner + 2 * d.groups * d.state_dim
+
+    def proj(name, kind, l, shape):
+        kept = l in BF16_AT[kind] if kind in BF16_AT else l not in FP8_AT[kind]
+        return weight(name, shape, w if kept else f8)
+
+    def mamba(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        return struct(
+            in_proj = proj(n("in_proj"), "in_proj", l, [inner + conv_dim + d.mamba_heads, hidden]),
+            conv = weight(n("conv"), [conv_dim, d.conv_kernel], w),
+            conv_bias = weight(n("conv_bias"), [conv_dim], w),
+            a_log = weight(n("a_log"), [d.mamba_heads], dtype.f32),
+            dt_bias = weight(n("dt_bias"), [d.mamba_heads], dtype.f32),
+            d = weight(n("d"), [d.mamba_heads], dtype.f32),
+            norm = weight(n("ssm_norm"), [inner], norms),
+            out_proj = proj(n("out_proj"), "out_proj", l, [hidden, inner]),
+            conv_state = "conv.{}".format(l),
+            ssm_state = "ssm.{}".format(l),
+        )
+
+    def attention(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        hd = d.head_dim
+        return struct(
+            q = weight(n("q"), [d.heads * hd, hidden], w),
+            k = weight(n("k"), [d.kv_heads * hd, hidden], w),
+            v = weight(n("v"), [d.kv_heads * hd, hidden], w),
+            o = proj(n("o"), "o_proj", l, [hidden, d.heads * hd]),
+            kv = "kv.{}".format(l),
+        )
+
+    def moe(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        return struct(
+            router = weight(n("router"), [d.experts, hidden], w),
+            bias = weight(n("router_bias"), [d.experts], dtype.f32),
+            down_latent = proj(n("fc1_latent"), "fc1_latent", l, [d.latent, hidden]),
+            up_latent = proj(n("fc2_latent"), "fc2_latent", l, [hidden, d.latent]),
+            up = weight(n("experts_up"), [d.experts, d.moe_inter, d.latent], experts),
+            down = weight(n("experts_down"), [d.experts, d.latent, d.moe_inter], experts),
+            shared_up = proj(n("shared_up"), "shared_up", l, [d.shared_inter, hidden]),
+            shared_down = proj(n("shared_down"), "shared_down", l, [hidden, d.shared_inter]),
+        )
+
+    def layer(l):
+        kind = PATTERN[l]
+        return struct(
+            kind = kind,
+            norm = weight("layer.{}.norm".format(l), [hidden], norms),
+            mamba = mamba(l) if kind == "M" else None,
+            attn = attention(l) if kind == "*" else None,
+            moe = moe(l) if kind == "E" else None,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        heads = d.heads,
+        kv_heads = d.kv_heads,
+        head_dim = d.head_dim,
+        sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
+        mamba_heads = d.mamba_heads,
+        mamba_head_dim = d.mamba_head_dim,
+        groups = d.groups,
+        state_dim = d.state_dim,
+        conv_kernel = d.conv_kernel,
+        inner = inner,
+        conv_dim = conv_dim,
+        experts = d.experts,
+        top_k = d.top_k,
+        scaling = d.scaling,
+        eps = d.eps,
+        kv = deploy.kv,
+        embed = weight("embed", [d.vocab, hidden], w),
+        head = weight("lm_head", [d.vocab, hidden], w),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight("final_norm", [hidden], norms),
+    )

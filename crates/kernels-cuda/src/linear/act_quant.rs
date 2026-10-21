@@ -257,6 +257,46 @@ pub fn quantize(
     launch(ctx, op, fmt, 0, src, codes, atoms, 0)
 }
 
+/// A gate-up's bf16 rows (`[rows][gate inter | up inter]`) through SwiGLU
+/// into e4m3 codes in 1x128 blocks and their atoms (`m_max` a masked
+/// layout's), the GLU's values rounded to bf16 first as apart: `act_quant`'s
+/// eight a lane over the GLU's output.
+#[allow(clippy::too_many_arguments)]
+pub fn swiglu_quant(
+    ctx: &Ctx,
+    op: &'static str,
+    h: u64,
+    rows: u32,
+    inter: u32,
+    m_max: u32,
+    codes: u64,
+    atoms: u64,
+) -> Result<(), Error> {
+    if !inter.is_multiple_of(128) || !h.is_multiple_of(16) || !codes.is_multiple_of(8) {
+        return Err(refuse(
+            op,
+            format!("a {inter}-wide GLU lands whole 128-wide e4m3 blocks"),
+        ));
+    }
+    let lanes = u64::from(rows) * u64::from(inter / 8);
+    let threads = u32::try_from(lanes.next_multiple_of(32))
+        .map_err(|_| refuse(op, format!("{lanes} lanes overflow a launch")))?;
+    let int = |v: u32| stated(op, v).map(|v| v.arg());
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::swiglu_quant_e4m3_v8")
+            .apply(Launch::flat(threads, BLOCK).programmatic(ctx.tuning().pdl)),
+        &[
+            ArgValue::Ptr(h),
+            int(rows)?,
+            int(inter)?,
+            int(m_max)?,
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+        ],
+    )
+}
+
 /// A stream's slab named `name` (one name a format) of `bytes` activation
 /// atoms, zeroed when fresh, for [`quantize`]: no clear a launch.
 pub(crate) fn atoms_of(
@@ -290,17 +330,18 @@ pub fn read_back(
     Ok(Tensor::new(out, src.rows, src.x.width, Dtype::Bf16))
 }
 
-/// A 128x128-block FP8 projection (`n x k` e4m3 codes at `codes`, their
-/// ue8m0 exponents laid in atoms a row a 128 columns) at a decode's few rows
-/// as a GEMV (`linear/fp8_gemv.cuh`): the activations as they are, bf16, the
-/// codes streamed once. `Ok(false)` past `kernel.gemm.fp8_gemv_until` rows
-/// or for a shape it does not read (`k` a whole number of 512s, the rows'
-/// activations within its shared memory).
+/// A block-FP8 projection (`n x k` e4m3 codes at `codes`, their ue8m0
+/// exponents laid in atoms a row a `gran` columns, 128 or 32) at a decode's
+/// few rows as a GEMV (`linear/fp8_gemv.cuh`): the activations as they are,
+/// bf16, the codes streamed once. `Ok(false)` past `kernel.gemm.fp8_gemv_until` rows
+/// or for a shape it does not read (`k` a whole number of 128s: a warp's
+/// lanes past `k` on its last 512-code pass read nothing).
 pub fn fp8_block_gemv(
     ctx: &Ctx,
     act: Tensor,
     codes: u64,
     atoms: u64,
+    gran: u32,
     y: &mut Tensor,
 ) -> Result<bool, Error> {
     const OP: &str = "linear.fp8_block_gemv";
@@ -312,8 +353,9 @@ pub fn fp8_block_gemv(
         || act.dtype != Dtype::Bf16
         || y.dtype != Dtype::Bf16
         || y.rows != m
+        || !matches!(gran, 32 | 128)
         || k == 0
-        || !k.is_multiple_of(512)
+        || !k.is_multiple_of(128)
         || n == 0
         || !codes.is_multiple_of(16)
         || !act.ptr.is_multiple_of(16)
@@ -333,13 +375,21 @@ pub fn fp8_block_gemv(
         Fire::at(
             "linear/fp8_gemv.cuh",
             symbol(&format!(
-                "::pie::linear::fp8_block_gemv<{WARPS}, {ROWS}, {rows_pad}>"
+                "::pie::linear::fp8_block_gemv<{WARPS}, {ROWS}, {rows_pad}{}>",
+                if gran == 128 {
+                    String::new()
+                } else {
+                    format!(", {gran}")
+                }
             )),
         )
-        .apply(Launch::grid(
-            [n.div_ceil(ROWS * (WARPS / splits)), 1, 1],
-            [WARPS * 32, 1, 1],
-        )),
+        .apply(
+            Launch::grid(
+                [n.div_ceil(ROWS * (WARPS / splits)), 1, 1],
+                [WARPS * 32, 1, 1],
+            )
+            .programmatic(ctx.tuning().pdl),
+        ),
         &[
             act.arg(),
             stated(OP, act.width)?.arg(),
@@ -754,6 +804,107 @@ pub(crate) fn lay_out(
     lay_out_with(ctx, op, routes, experts, align, Some(distinct), &[])
 }
 
+/// The most routes and experts [`lay_out_quant_nvfp4`] takes in one launch.
+pub(crate) const FUSED_ROUTES: u32 = 1024;
+pub(crate) const FUSED_EXPERTS: u32 = 512;
+
+/// [`lay_out_with`] contiguous (each expert's rows `align` apart) and the
+/// NVFP4 quantize of `x`'s tokens to their routes' rows (`codes`, atoms in
+/// `atoms`) under `input_scales` in one launch, for a fire of at most
+/// [`FUSED_ROUTES`] routes over [`FUSED_EXPERTS`] experts; each leg's alpha
+/// laid as [`lay_out_with`] lays it. The layout's rows are
+/// [`contiguous_rows`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lay_out_quant_nvfp4(
+    ctx: &Ctx,
+    op: &'static str,
+    routes: Tensor,
+    experts: u32,
+    align: u32,
+    alphas: [(AlphaFrom, u64); 2],
+    x: Tensor,
+    input_scales: Tensor,
+    codes: u64,
+    atoms: u64,
+) -> Result<Layout, Error> {
+    let count = routes.rows * routes.width;
+    let k = x.width;
+    if count > FUSED_ROUTES
+        || experts > FUSED_EXPERTS
+        || !k.is_multiple_of(16)
+        || x.rows < routes.rows
+    {
+        return Err(refuse(
+            op,
+            "the fused layout takes 1024 routes over 512 experts, k a whole number of 16s",
+        ));
+    }
+    let e = experts as usize;
+    let i32s = |name, len: usize| -> Result<u64, Error> {
+        Ok(ctx.scratch_stream(op, name, len * 4)? as u64)
+    };
+    let counts = i32s(ROUTE_COUNTS, e)?;
+    let offsets = i32s(ROUTE_OFFSETS, e + 1)?;
+    let pos = i32s(ROUTE_POS, count as usize)?;
+    let int = |v: u32| stated(op, v).map(|v| v.arg());
+    let items = count * (k / 16);
+    let grid = items
+        .div_ceil(256)
+        .clamp(1, 4 * ctx.multiprocessors().unwrap_or(148));
+    let smem = (33 * experts + count) * 4;
+    let [(up, up_alpha), (down, down_alpha)] = alphas;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::route_lay_out_quant_nvfp4").apply(
+            Launch::grid([grid, 1, 1], [256, 1, 1])
+                .smem(smem)
+                .programmatic(ctx.tuning().pdl),
+        ),
+        &[
+            routes.arg(),
+            int(count)?,
+            int(routes.width)?,
+            ctx.stage(),
+            int(experts)?,
+            int(align)?,
+            ArgValue::Ptr(counts),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(pos),
+            ArgValue::Ptr(up.tensor_scales),
+            ArgValue::Ptr(up_alpha),
+            int(up.rows)?,
+            ArgValue::Ptr(down.tensor_scales),
+            ArgValue::Ptr(down.input_scales),
+            ArgValue::Ptr(down_alpha),
+            int(down.rows)?,
+            x.arg(),
+            input_scales.arg(),
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            int(k)?,
+        ],
+    )?;
+    let rows = contiguous_rows(count, experts, align);
+    Ok(Layout {
+        pos,
+        rows,
+        // A router names an expert once a token.
+        groups: tc5::Groups::Contiguous {
+            offsets,
+            rows,
+            cap: routes.rows,
+        },
+        m_max: 0,
+        counts,
+    })
+}
+
+/// The rows a contiguous layout of `count` routes over `experts` holds,
+/// each expert's start `align` apart.
+pub(crate) fn contiguous_rows(count: u32, experts: u32, align: u32) -> u32 {
+    (count + (align - 1) * experts.min(count)).next_multiple_of(align)
+}
+
 /// [`lay_out`], laying NVFP4's per-expert alpha too for each leg `alphas`
 /// names the sources and destination of (at most two): in the narrow
 /// fire's one launch, else apart. `distinct` `None`: contiguous however
@@ -794,11 +945,15 @@ pub(crate) fn lay_out_with(
             }
         } else {
             // Each expert's rows start a whole alignment apart.
-            let rows = (count + (align - 1) * experts.min(count)).next_multiple_of(align);
+            let rows = contiguous_rows(count, experts, align);
             Layout {
                 pos,
                 rows,
-                groups: tc5::Groups::Contiguous { offsets, rows },
+                groups: tc5::Groups::Contiguous {
+                    offsets,
+                    rows,
+                    cap: if distinct == Some(true) { tokens } else { 0 },
+                },
                 m_max,
                 counts,
             }
@@ -959,7 +1114,7 @@ pub(crate) fn weighted_gather(
         || !y.ptr.is_multiple_of(16)
         || !scale.is_multiple_of(16)
         || (scale != 0 && !(n / 8).is_multiple_of(32))
-        || (scale != 0 && n / 8 > 1024)
+        || (scale != 0 && n / 8 > 512)
     {
         return Err(refuse(
             op,
@@ -973,10 +1128,24 @@ pub(crate) fn weighted_gather(
     } else {
         ((n / 8).div_ceil(BLOCK), BLOCK)
     };
+    // A normed fire of `kernel.moe.gather_ahead_until` tokens or fewer has
+    // eight routes in flight a round (its blocks too few to fill the
+    // multiprocessors), else two.
+    let ahead = if tokens <= ctx.tuning().moe_gather_ahead_until {
+        8
+    } else {
+        2
+    };
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_weighted_gather_vec8")
-            .apply(Launch::grid([tokens, blocks, 1], [block, 1, 1])),
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::linear::route_weighted_gather_vec8<{}, {ahead}>",
+                scale != 0
+            )),
+        )
+        .apply(Launch::grid([tokens, blocks, 1], [block, 1, 1])),
         &[
             ArgValue::Ptr(grouped),
             ArgValue::Ptr(pos),
@@ -1021,7 +1190,7 @@ pub(crate) fn sum_gather(
     let int = |v: u32| stated(op, v).map(|v| v.arg());
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_weighted_gather_vec8").apply(Launch::grid(
+        Fire::at(FILE, "::pie::linear::route_weighted_gather_vec8<false>").apply(Launch::grid(
             [tokens, (n / 8).div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),

@@ -262,7 +262,10 @@ fn by_route(
     top_k: i32,
     act_div: i32,
 ) -> Result<(), Error> {
-    let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
+    // A lean select (`kernel.moe.mxfp4_select_lean`) runs blocks of two warps.
+    let lean = ctx.tuning().mxfp4_select_lean;
+    let block = if lean { 2 * WARP } else { DECODE_BLOCK };
+    let tile = (block / WARP) * ROWS_PER_WARP;
     if route_count == 0 {
         return Ok(());
     }
@@ -271,12 +274,13 @@ fn by_route(
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::linear::moe_matmul_select_nvfp4<{t}, ::pie::i32({ROWS_PER_WARP})>"
+                "::pie::linear::moe_matmul_select_nvfp4<{t}, ::pie::i32({ROWS_PER_WARP}){}>",
+                if lean { ", true" } else { "" }
             )),
         )
         .apply(Launch::grid(
             [route_count, y.width.div_ceil(tile), 1],
-            [DECODE_BLOCK, 1, 1],
+            [block, 1, 1],
         )),
         &[
             x.arg(),
