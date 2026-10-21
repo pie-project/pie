@@ -386,6 +386,10 @@ pub struct Seat {
     pub work: Tensor,
     pub rows_ext: u32,
     pub ext: RefCell<HashMap<u32, Tensor>>,
+    /// The gate preps whose gates the verify scan derives as it stages its
+    /// rows, by the gates value: the extended `[b | a]` rows, `dt_bias` and
+    /// `a_log`.
+    pub prepped: RefCell<HashMap<u32, [Tensor; 3]>>,
 }
 
 impl Seat {
@@ -470,6 +474,7 @@ impl Seat {
             work,
             rows_ext,
             ext: RefCell::new(HashMap::new()),
+            prepped: RefCell::new(HashMap::new()),
         })
     }
 
