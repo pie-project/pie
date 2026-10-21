@@ -3,6 +3,13 @@ api = 1
 [target]
 device = "NVIDIA L40S"
 
+# A prefill's fire on four buckets a doubling from 1024 rows (its GEMMs run
+# its bucket's rows): Qwen3-14B under 48 decoding streams and a 4k-token
+# prompt a second, decode 416 -> 487 tok/s, a prompt's last chunk no longer
+# padded to the next power of two.
+[engine]
+prefill_lattice_from = 1024
+
 [provenance]
 measured = [
   "kernel.gemm.heuristics",
@@ -32,6 +39,7 @@ measured = [
   "engine.copies",
   "engine.graphs",
   "engine.lattice_steps",
+  "engine.prefill_lattice_from",
   "engine.recording",
   "engine.working_set_percent",
   "fuse.embed_scale_add",
