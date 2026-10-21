@@ -323,15 +323,23 @@ pub fn rmsnorm_per_head_plus_one_pair(
     let threads = rms_threads(OP, head_dim)?;
     let groups = |t: Tensor| -> Result<u32, Error> {
         nonzero(OP, "rows", t.rows)?;
-        if t.width % head_dim != 0 {
-            return Err(refuse(OP, format!("the {}-wide row holds no whole {head_dim}-wide heads", t.width)));
+        if !t.width.is_multiple_of(head_dim) {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the {}-wide row holds no whole {head_dim}-wide heads",
+                    t.width
+                ),
+            ));
         }
         Ok(t.width / head_dim * t.rows)
     };
     let (first, second) = (groups(x)?, groups(x2)?);
     ctx.fire(
-        Fire::at("elemwise/norm_rms.metal", "rms_single_row_pair_bfloat16")
-            .apply(Grid::of([threads * (first + second), 1, 1], [threads, 1, 1])),
+        Fire::at("elemwise/norm_rms.metal", "rms_single_row_pair_bfloat16").apply(Grid::of(
+            [threads * (first + second), 1, 1],
+            [threads, 1, 1],
+        )),
         &[
             x.arg(),
             weight.arg(),
@@ -507,7 +515,6 @@ pub fn rmsnorm_gated_table(
         ],
     )
 }
-
 
 pub fn rmsnorm_gated_by(
     ctx: &Ctx<'_>,

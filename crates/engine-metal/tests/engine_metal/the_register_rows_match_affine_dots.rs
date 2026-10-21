@@ -712,7 +712,6 @@ fn a_gate_and_a_gated_norm_lay_the_table_their_out_projection_reads() {
             frame.commit().expect("commit");
             check(plain, laid, th, "gated norm");
             checked += 2;
-
         }
     }
     eprintln!("checked {checked} tables a gate or a gated norm laid");
