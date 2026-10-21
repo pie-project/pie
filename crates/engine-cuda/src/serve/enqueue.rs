@@ -235,6 +235,17 @@ impl Shell {
         super::btrace::mark("route");
         let readback = fire.readback(p, &staged)?;
         super::btrace::mark("readback");
+        if tapping.is_some() {
+            // The read-outs hold the tapped pages until they land: a later
+            // fire that writes one waits for them (`Pools::fence_swaps`).
+            let pages: Vec<u32> = p
+                .lanes
+                .iter()
+                .filter_map(|seated| seated.tap)
+                .flat_map(|tap| tap.pages.iter().copied())
+                .collect();
+            self.pools.hold_until(self.device.tap_stream(), pages)?;
+        }
         super::btrace::flush(seq);
         Ok((p.windows.launches(), readback))
     }
@@ -1109,7 +1120,7 @@ impl FireCtx<'_> {
         // a tensor-parallel rank captured only its band of each layer's heads;
         // the epilogue reads the model's planes, so the bands are gathered
         // first (every rank fires the same frame, so every rank gathers the
-        // same lanes)
+        // same seats)
         if let Some(slab) = self.scores {
             for seat in p.score_seat_of.iter().flatten() {
                 slab.gather(self.device.ctx(), *seat)?;

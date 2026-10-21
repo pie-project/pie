@@ -3,7 +3,37 @@ pub mod conditional;
 pub mod ctx;
 pub mod elastic;
 pub mod graph;
+#[cfg(feature = "device")]
 pub mod held;
+/// Without a device runtime nothing is kept: no shape pools.
+#[cfg(not(feature = "device"))]
+pub mod held {
+    pub mod pool {
+        use crate::device::{Buffer, Pinned};
+
+        pub type Held = (Pinned, Pinned, Option<Buffer>);
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub struct PoolKey;
+
+        #[must_use]
+        pub fn key(_device_only: bool, _cells: usize) -> Option<PoolKey> {
+            None
+        }
+
+        #[must_use]
+        pub fn commit_key(_bytes: usize) -> Option<PoolKey> {
+            None
+        }
+
+        #[must_use]
+        pub fn take(_key: PoolKey) -> Option<Held> {
+            None
+        }
+
+        pub fn give(_key: PoolKey, _held: Held) {}
+    }
+}
 #[cfg(feature = "rocm")]
 pub mod hip;
 

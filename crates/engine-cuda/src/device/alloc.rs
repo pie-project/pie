@@ -6,6 +6,7 @@ pub struct Buffer {
     bytes: usize,
     /// The device heap's class this is a cell of, and the device
     /// (`device::held::heap`).
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
     carved: Option<(usize, i32)>,
 }
 
@@ -1000,7 +1001,9 @@ pub fn copy_batch(
         use crate::device::rt;
         use std::sync::atomic::{AtomicBool, Ordering};
         static REFUSED: AtomicBool = AtomicBool::new(false);
-        if !REFUSED.load(Ordering::Relaxed) {
+        if !REFUSED.load(Ordering::Relaxed)
+            && let Some(device) = crate::device::held::current_device()
+        {
             let dsts: Vec<*mut core::ffi::c_void> =
                 live.iter().map(|s| s.0 as *mut core::ffi::c_void).collect();
             let srcs: Vec<*const core::ffi::c_void> = live
@@ -1008,9 +1011,6 @@ pub fn copy_batch(
                 .map(|s| s.1 as *const core::ffi::c_void)
                 .collect();
             let sizes: Vec<usize> = live.iter().map(|s| s.2).collect();
-            let mut device: i32 = 0;
-            // SAFETY: plain query.
-            let _ = unsafe { rt::cudaGetDevice(&raw mut device) };
             let host = rt::cudaMemLocation {
                 type_: rt::cudaMemLocationType::cudaMemLocationTypeHost,
                 id: 0,
@@ -1053,6 +1053,7 @@ pub fn copy_batch(
             REFUSED.store(true, Ordering::Relaxed);
         }
     }
+    #[cfg(not(all(feature = "cuda", not(feature = "rocm"))))]
     let _ = to_host;
     for (dst, src, bytes) in live {
         copy_any(stream, dst, src, bytes)?;

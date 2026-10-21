@@ -268,20 +268,15 @@ impl Shell {
         self.pools.copy_kv(self.device.stream(), moves, &[])
     }
 
-    /// Pins this rank's host pool: one rs row per device slot, then kv
-    /// pages, then windowed pages, from `stated` bytes shared by `ranks`,
-    /// within the host memory the load left. Unstated, it holds `seats`
-    /// sequences at `context` tokens, and at least one device pool's worth
-    /// of each.
-    /// The kv planes, for another worker to read in place
-    /// ([`crate::store::Pools::export_kv`]). One rank's planes hold a band of
-    /// each layer's heads, so a tensor-parallel load is refused until a
-    /// handle carries every rank's.
-    /// [`crate::store::Pools::back_whole`].
+    /// Backs every page the pools declare ([`crate::store::Pools::back_whole`]).
     pub fn back_whole(&mut self) -> Result<()> {
         self.pools.back_whole()
     }
 
+    /// The kv planes, for another worker to read in place
+    /// ([`crate::store::Pools::export_kv`]). One rank's planes hold a band of
+    /// each layer's heads, so a tensor-parallel load is refused until a
+    /// handle carries every rank's.
     pub fn export_kv(&mut self, world: crate::World) -> Result<engine::KvHandle> {
         if world.size > 1 {
             return Err(Fault::Residency(
@@ -290,7 +285,9 @@ impl Shell {
                     .to_string(),
             ));
         }
-        let ordinal = u32::try_from(self.ordinal()).unwrap_or(0);
+        let ordinal = u32::try_from(self.ordinal()).map_err(|_| {
+            Fault::Residency(format!("device ordinal {} names no device", self.ordinal()))
+        })?;
         let exported = self.pools.export_kv(ordinal)?;
         let layout = engine::KvLayout {
             num_layers: exported.layers,
@@ -312,6 +309,11 @@ impl Shell {
         })
     }
 
+    /// Pins this rank's host pool: one rs row per device slot, then kv
+    /// pages, then windowed pages, from `stated` bytes shared by `ranks`,
+    /// within the host memory the load left. Unstated, it holds `seats`
+    /// sequences at `context` tokens, and at least one device pool's worth
+    /// of each.
     pub fn seat_host_kv(
         &mut self,
         stated: Option<u64>,

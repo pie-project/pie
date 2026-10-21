@@ -479,8 +479,8 @@ pub struct Pools {
     /// Every declared page and slot is backed ([`Pools::back_whole`]), and
     /// never trimmed since.
     whole: bool,
-    /// The moves to or from the host tier still on the swap stream, each
-    /// with the device pages it holds.
+    /// The moves to or from the host tier still on the swap stream, and
+    /// the read-outs on the tap stream, each with the device pages it holds.
     swaps: Vec<Swap>,
 }
 
@@ -1598,22 +1598,22 @@ impl Pools {
                 } => Some((dtype, keys_width, head_stride)),
                 _ => None,
             })
-            .map_or(
-                (0, 0, 0, Dtype::Bf16),
-                |(dtype, keys_width, head_stride)| {
-                    let layers = self
-                        .shapes
-                        .iter()
-                        .filter(|shape| matches!(shape, Shape::Kv { .. }))
-                        .count();
-                    (
-                        u32::try_from(layers).unwrap_or(u32::MAX),
-                        u32::try_from(keys_width / head_stride.max(1)).unwrap_or(u32::MAX),
-                        u32::try_from(head_stride).unwrap_or(u32::MAX),
-                        dtype,
-                    )
-                },
-            );
+            .map(|(dtype, keys_width, head_stride)| {
+                let layers = self
+                    .shapes
+                    .iter()
+                    .filter(|shape| matches!(shape, Shape::Kv { .. }))
+                    .count();
+                (
+                    u32::try_from(layers).unwrap_or(u32::MAX),
+                    u32::try_from(keys_width / head_stride.max(1)).unwrap_or(u32::MAX),
+                    u32::try_from(head_stride).unwrap_or(u32::MAX),
+                    dtype,
+                )
+            })
+            .ok_or_else(|| {
+                Fault::Residency("this load pages no full-attention kv row to export".to_string())
+            })?;
         Ok(ExportedKv {
             regions,
             layers,
@@ -1885,6 +1885,19 @@ impl Pools {
             landed,
             paged: device.to_vec(),
             windowed: windowed.iter().map(|&(page, _)| page).collect(),
+        });
+        Ok(())
+    }
+
+    /// `paged` device pages are read on `stream` by what it has enqueued:
+    /// a fire that names one waits for it, as for a move.
+    pub fn hold_until(&mut self, stream: *mut core::ffi::c_void, paged: Vec<u32>) -> Result<()> {
+        let landed = crate::device::graph::Event::new()?;
+        landed.record(stream)?;
+        self.swaps.push(Swap {
+            landed,
+            paged,
+            windowed: Vec::new(),
         });
         Ok(())
     }

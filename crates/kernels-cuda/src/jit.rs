@@ -8,6 +8,13 @@ mod launch;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod device;
+/// Without a device runtime there is no card to ask.
+#[cfg(not(feature = "cuda"))]
+pub(crate) mod device {
+    pub(crate) fn compute_capability_major() -> Option<u32> {
+        None
+    }
+}
 #[cfg(feature = "cuda")]
 pub mod nvrtc;
 mod root;

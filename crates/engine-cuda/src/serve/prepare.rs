@@ -765,8 +765,10 @@ impl FrameShell for Shell {
             ..Default::default()
         };
         let scoring = lanes.iter().any(|seated| seated.captures_scores);
+        let seated_scores = self.scores.as_ref().map_or(0, crate::scores::Scores::seats);
         let mut score_seats: Vec<i32> = Vec::new();
         let mut score_seat_of: Vec<Option<u32>> = vec![None; lanes.len()];
+        let mut next_seat = 0u32;
         let mut adapter_routes: Vec<i32> = Vec::new();
         let any_adapter = lanes.iter().any(|seated| seated.adapter.is_some());
         if any_adapter {
@@ -869,12 +871,20 @@ impl FrameShell for Shell {
             if scoring {
                 // Capturing lanes take the slab's seats in the order the
                 // fire lays its lanes out.
-                let seat = seated.captures_scores.then(|| {
-                    let seat = score_seat_of.iter().flatten().count() as u32;
-                    score_seat_of[source] = Some(seat);
-                    seat
-                });
-                score_seats.push(seat.map_or(-1, |seat| seat as i32));
+                if seated.captures_scores {
+                    if next_seat >= seated_scores {
+                        return Err(Fault::Ceiling {
+                            what: "capturing lanes the score slab seats",
+                            need: u64::from(next_seat) + 1,
+                            have: u64::from(seated_scores),
+                        });
+                    }
+                    score_seat_of[source] = Some(next_seat);
+                    score_seats.push(next_seat as i32);
+                    next_seat += 1;
+                } else {
+                    score_seats.push(-1);
+                }
             }
             if !seated.rs_snapshots.is_empty() && row.rows as usize != lane.tokens.len() {
                 return Err(Fault::program(
@@ -1518,15 +1528,6 @@ impl FrameShell for Shell {
         let geometries = geometries;
 
         super::btrace::mark("windows");
-        let capturing = score_seat_of.iter().flatten().count() as u64;
-        let seated_scores = self.scores.as_ref().map_or(0, crate::scores::Scores::seats);
-        if capturing > u64::from(seated_scores) {
-            return Err(Fault::Ceiling {
-                what: "capturing lanes the score slab seats",
-                need: capturing,
-                have: u64::from(seated_scores),
-            });
-        }
         let slot = self.inputs.claim()?;
         let packing_fires: Vec<crate::inputs::PackingFire<'_>> = packings
             .iter()

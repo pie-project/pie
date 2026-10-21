@@ -142,11 +142,11 @@ impl Tapping {
             if group.layer >= layer {
                 return;
             }
-            self.next.set(self.next.get() + 1);
             if let Err(error) = self.issue(group) {
                 self.fail(&format!("reading a layer out: {error}"));
                 return;
             }
+            self.next.set(self.next.get() + 1);
         }
     }
 

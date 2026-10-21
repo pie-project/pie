@@ -946,6 +946,17 @@ fn stage_plans_are_parallel(stages: &[(u64, bool)], plans: &[u64]) -> Result<()>
     Ok(())
 }
 
+/// The commit slot goes back to the pool for the next session.
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(key) = self.commit_key {
+            for commit in self.commits.drain(..) {
+                crate::device::held::pool::give(key, (commit, Pinned::empty(), None));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -960,16 +971,5 @@ mod tests {
             text.contains("scratch") || text.contains("descriptors"),
             "and what would go wrong: {text}"
         );
-    }
-}
-
-/// The commit slot goes back to the pool for the next session.
-impl Drop for Session {
-    fn drop(&mut self) {
-        if let Some(key) = self.commit_key {
-            for commit in self.commits.drain(..) {
-                crate::device::held::pool::give(key, (commit, Pinned::empty(), None));
-            }
-        }
     }
 }

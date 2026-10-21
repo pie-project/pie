@@ -96,8 +96,17 @@ impl Context {
                 check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
                 crate::device::held::adopt_stream(ordinal, stream.cast());
                 // The heaps' first chunks, while the load may wait.
-                crate::device::held::heap::reserve(crate::device::held::heap::Kind::Pinned)?;
-                crate::device::held::heap::reserve(crate::device::held::heap::Kind::Device)?;
+                let reserved =
+                    crate::device::held::heap::reserve(crate::device::held::heap::Kind::Pinned)
+                        .and_then(|()| {
+                            crate::device::held::heap::reserve(
+                                crate::device::held::heap::Kind::Device,
+                            )
+                        });
+                if let Err(fault) = reserved {
+                    destroy_stream(ordinal, stream.cast());
+                    return Err(fault);
+                }
 
                 let mut handle: blas::cublasHandle_t = core::ptr::null_mut();
                 let status = blas::cublasCreate_v2(&raw mut handle);
@@ -426,6 +435,10 @@ impl Context {
                 )?;
                 check(
                     "cudaStreamSynchronize",
+                    crate::device::rt::cudaStreamSynchronize(self.tap.cast()),
+                )?;
+                check(
+                    "cudaStreamSynchronize",
                     crate::device::rt::cudaStreamSynchronize(self.notify.cast()),
                 )
             }
@@ -474,7 +487,6 @@ impl Drop for Context {
     }
 }
 
-#[cfg(feature = "device")]
 /// `work` on the host once what `stream` has before it is done.
 pub fn host_fn_on(stream: *mut c_void, work: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
     #[cfg(feature = "device")]
@@ -505,6 +517,7 @@ pub fn host_fn_on(stream: *mut c_void, work: Box<dyn FnOnce() + Send + 'static>)
     }
 }
 
+#[cfg(feature = "device")]
 extern "C" fn host_fn_trampoline(user: *mut c_void) {
     if user.is_null() {
         return;

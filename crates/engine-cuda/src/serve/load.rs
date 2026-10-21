@@ -300,13 +300,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
 /// resident. What a fire's working set takes at those budgets (the
 /// activation arena, the attention workspaces, the decoded-weight tiles, the
 /// guests' programs, the capturing lanes' score planes and the readout
-/// indices) is held to
-/// half of the card past the weights, the half `bake` sizes the token budget
-/// against before the weights are down, and to what leaves one sequence and
-/// the bodies' floor beside it. The tile yields first, held to the widest
-/// plane fired at token rows (a plane past it is served by the fused-dequant
-/// arm), then the token budget halves toward its floor, then the lanes
-/// halve toward one; `Pools::fit_the_card` still refuses past that.
+/// indices) is held to half of the card past the weights, the half `bake`
+/// sizes the token budget against before the weights are down, and to what
+/// leaves one sequence and the bodies' floor beside it. The tile yields
+/// first, held to the widest plane fired at token rows (a plane past it is
+/// served by the fused-dequant arm), then the token budget halves toward its
+/// floor, then the lanes halve toward one; `Pools::fit_the_card` still
+/// refuses past that.
 #[allow(clippy::too_many_arguments)]
 fn refit(
     boot: &mut Boot<'_>,
@@ -860,7 +860,11 @@ impl Shell {
         let adapter_seats = weights.adapter_seats();
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let compiled_towered = compiled.order_for(poem_ir::RowAxis::Patches).is_some();
-        let kv_taps = crate::tap::row_layers(&boot.trace).and_then(|rows| pools.tap_groups(&rows));
+        // A tensor-parallel rank holds its band of every page's heads, not
+        // the page: it reads nothing out.
+        let kv_taps = (boot.world.size <= 1)
+            .then(|| crate::tap::row_layers(&boot.trace).and_then(|rows| pools.tap_groups(&rows)))
+            .flatten();
         let mut shell = Shell {
             device,
             accounting,

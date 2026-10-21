@@ -555,9 +555,9 @@ impl Engine for Cuda {
                 self.boot.world.size,
             )
             .map_err(fault)?;
-        // Every page the load serves is backed now: a serving load maps
-        // nothing, so a dying peer holding the driver's lock holds no fire
-        // of this one's.
+        // Every page the load serves is backed now, so serving maps nothing:
+        // a dying process holding the driver's lock stalls no fire of this
+        // one's.
         shell.back_whole().map_err(fault)?;
         let kv_handle = if residency.kv_export {
             Some(shell.export_kv(self.boot.world).map_err(fault)?)
@@ -662,7 +662,6 @@ impl Engine for Cuda {
         };
 
         self.replay = crate::replay::Replay::of(&shell);
-        let mut shell = shell;
         if let Some(sink) = &self.tap_sink {
             shell.on_tapped(sink.clone());
         }
@@ -754,7 +753,7 @@ impl Engine for Cuda {
     }
 
     /// One rank's planes hold a band of each layer's heads, so a
-    /// tensor-parallel load (a group, apart from this) taps nothing.
+    /// tensor-parallel rank taps nothing.
     fn tap_groups(&self) -> Option<engine::TapGroups> {
         self.shell.as_ref()?.tap_groups()
     }

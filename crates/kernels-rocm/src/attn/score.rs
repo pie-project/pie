@@ -129,6 +129,13 @@ pub fn capture(
         plane + num_q_heads <= plane_stride,
         "`{OP}` writes one plane per query head inside a lane's block of {plane_stride}"
     );
+    // A seat's bound is in the table on the device; the host bounds the
+    // planes a seat's block holds and the lanes the table names.
+    debug_assert!(
+        plane_stride <= scores.rows,
+        "`{OP}` writes a block of {plane_stride} planes into a slab of {} rows",
+        scores.rows
+    );
     debug_assert!(
         lane_offset + requests <= seat_of.rows,
         "`{OP}` seats {requests} lanes from lane {lane_offset}, and the seat table holds {}",

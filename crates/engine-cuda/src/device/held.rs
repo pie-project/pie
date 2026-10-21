@@ -658,9 +658,11 @@ pub(crate) mod heap {
     /// has run dry makes a chunk here, holding no lock while it does.
     pub fn take(kind: Kind, class: usize) -> Result<Cell> {
         let bytes = kind.class_bytes(class);
-        let key = Key::of(kind).ok_or(crate::error::Fault::Unsupported(
-            "a device cell asked for with no device bound".to_string(),
-        ))?;
+        let key = Key::of(kind).ok_or_else(|| {
+            crate::error::Fault::Unsupported(
+                "a heap cell asked for with no device bound".to_string(),
+            )
+        })?;
         loop {
             {
                 let mut all = locked(&heaps().heaps);
