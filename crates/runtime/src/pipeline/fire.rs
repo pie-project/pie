@@ -2819,13 +2819,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     cells: cells.clone(),
                     failure: pipeline_failure.clone(),
                 }));
-            if !last {
-                // The next fire reads the KV this one writes.
-                drain_pipeline_fires(ctx, &pipe_fires).await?;
-                if let Some(error) = pipeline_failed(&pipeline_failure) {
-                    return Ok(Err(error));
-                }
-            }
+            // The next piece reads the KV this one writes: they run in
+            // order on the device, so it is submitted now, as a decode's
+            // next pass is, rather than once this one retires.
         }
         advance_cursors(&pass_lanes, Some(&landings), &fold, &settles);
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
@@ -2835,13 +2831,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
 }
 
 /// The frame each of a pass's `pieces` fires carries, the pass's frame
-/// `frame`. A piece is submitted once the one before it has retired (it
-/// reads the KV and state that one writes), so a pass alone in its frame
-/// runs each piece as a frame of its own: the first takes `frame`'s sequence
-/// and each later one the next the pipeline hands out (`next_seq`). A lane's
-/// pieces queue in their order, one frame each, and the pieces of concurrent
-/// lanes seal together rather than one launch at a time. A pass sharing its
-/// frame keeps that frame for its last piece, its earlier pieces unframed.
+/// `frame`. A piece reads the KV and state the one before it writes, so a
+/// pass alone in its frame runs each piece as a frame of its own, in order:
+/// the first takes `frame`'s sequence and each later one the next the
+/// pipeline hands out (`next_seq`). A lane's pieces queue in their order, one
+/// frame each, and the pieces of concurrent lanes seal together rather than
+/// one launch at a time. A pass sharing its frame keeps that frame for its
+/// last piece, its earlier pieces unframed.
 pub(crate) fn piece_frames(
     frame: Option<crate::scheduler::FrameStamp>,
     pieces: usize,

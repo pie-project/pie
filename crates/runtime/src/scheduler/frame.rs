@@ -784,10 +784,15 @@ impl FramePolicy {
         let max_wave_tokens = self.max_wave_tokens;
         // One frame of prompts on the card at a time: prompts arriving behind
         // it bind together into the next, while decodes keep running ahead.
-        let prompt_in_flight = self
+        // A lane whose own prompt is in flight continues it in the next frame
+        // (its next piece reads what that one writes, in order on the
+        // device): there is no prompt behind it to bind.
+        let prompting_in_flight: BTreeSet<ProcessId> = self
             .in_flight_lanes
             .iter()
-            .any(|lane| self.lanes.get(lane).is_some_and(|state| state.prompting));
+            .copied()
+            .filter(|lane| self.lanes.get(lane).is_some_and(|state| state.prompting))
+            .collect();
         loop {
             let mut fresh: Vec<ProcessId> = Vec::new();
             let mut continuing: Vec<ProcessId> = Vec::new();
@@ -919,7 +924,9 @@ impl FramePolicy {
                     .and_then(LaneState::group_key)
                     .is_some();
                 if (self.prompts_only && (!prompt || grouped))
-                    || (prompt && !grouped && prompt_in_flight)
+                    || (prompt
+                        && !grouped
+                        && prompting_in_flight.iter().any(|lane| !unit.contains(lane)))
                 {
                     continue;
                 }
