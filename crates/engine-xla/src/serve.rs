@@ -1019,9 +1019,49 @@ impl Shell {
 
     /// One fire whose lanes may carry clips on the voxel axis.
     pub fn fire_full_with(&mut self, lanes: &[Seated<'_>], clips: &[Clips<'_>]) -> Result<Fired> {
+        self.profile_window();
         let result = self.fire_inner(lanes, clips);
         self.handles.rewind();
         result
+    }
+
+    /// `PIE_XLA_PROFILE=<path>:<from>:<to>`: a device trace of fires `from..to`.
+    fn profile_window(&self) {
+        static FIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static ON: std::sync::Mutex<Option<crate::pjrt::profiler::Profiler>> =
+            std::sync::Mutex::new(None);
+        let Some(spec) = std::env::var("PIE_XLA_PROFILE").ok() else {
+            return;
+        };
+        let mut parts = spec.rsplitn(3, ':');
+        let (Some(to), Some(from), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            return;
+        };
+        let (Ok(from), Ok(to)) = (from.parse::<u64>(), to.parse::<u64>()) else {
+            return;
+        };
+        let at = FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(api) = self.device.api() else {
+            return;
+        };
+        let mut on = ON.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if at == from {
+            match crate::pjrt::profiler::Profiler::start(api) {
+                Ok(p) => *on = Some(p),
+                Err(e) => eprintln!("xla profile: {e}"),
+            }
+        } else if at == to
+            && let Some(p) = on.take()
+        {
+            match p.finish() {
+                Ok(bytes) => {
+                    let file = format!("{path}.{}.xplane.pb", std::process::id());
+                    let _ = std::fs::write(&file, bytes);
+                    eprintln!("xla profile: fires {from}..{to} written to {file}");
+                }
+                Err(e) => eprintln!("xla profile: {e}"),
+            }
+        }
     }
 
     /// Fires lanes that carry clips and answers each one's pixels and output
