@@ -5,15 +5,19 @@
 # blocks), as NVIDIA's modelopt exports it in NVFP4, and miniatures that read
 # the first layers and experts of the whole models' checkpoints at full width.
 # The original releases rotate at theta 1e6 and the 2507 ones at their own,
-# so each is its own model.
+# so each is its own model. Qwen3-Coder-30B-A3B's configuration is the
+# 30B-A3B-2507's, so an import reads it as that unless told `--deployment
+# qwen3-coder-30b-a3b-...`.
 
 load("//lib/spoken.poem", "QWEN_STOP")
 
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
-TOKENIZER = tokenizer(markers = [QWEN_STOP])
+# Qwen3-Coder: no thinking block, its calls XML.
+CODER = template("qwen3_coder")
+TOKENIZER = tokenizer(markers = [QWEN_STOP, ["<|im_start|>"]])
 
-def qwen3(id, layers, mini = False):
-    return model(id, mini = mini, template = CHATML, tokenizer = TOKENIZER, arch = "qwen3_moe", layers = layers, vocab = 151936)
+def qwen3(id, layers, mini = False, spoken = CHATML):
+    return model(id, mini = mini, template = spoken, tokenizer = TOKENIZER, arch = "qwen3_moe", layers = layers, vocab = 151936)
 
 MODELS = [
     qwen3("qwen3-30b-a3b", layers = 48),
@@ -22,8 +26,9 @@ MODELS = [
     qwen3("qwen3-235b-a22b", layers = 94),
     qwen3("qwen3-235b-a22b-2507", layers = 94),
     qwen3("qwen3-235b-a22b-2507-mini", layers = 4, mini = True),
-    qwen3("qwen3-coder-480b-a35b", layers = 62),
-    qwen3("qwen3-coder-480b-a35b-mini", layers = 4, mini = True),
+    qwen3("qwen3-coder-480b-a35b", layers = 62, spoken = CODER),
+    qwen3("qwen3-coder-480b-a35b-mini", layers = 4, mini = True, spoken = CODER),
+    qwen3("qwen3-coder-30b-a3b", layers = 48, spoken = CODER),
 ]
 
 BF = dtype.bf16
@@ -56,5 +61,6 @@ DEPLOYMENTS = (
     rows("qwen3-235b-a22b-2507") +
     rows("qwen3-235b-a22b-2507-mini", mini = True) +
     rows("qwen3-coder-480b-a35b") +
-    rows("qwen3-coder-480b-a35b-mini", mini = True)
+    rows("qwen3-coder-480b-a35b-mini", mini = True) +
+    rows("qwen3-coder-30b-a3b")
 )

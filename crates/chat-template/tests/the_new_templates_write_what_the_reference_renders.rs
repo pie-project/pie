@@ -41,6 +41,79 @@ fn the_new_templates_write_what_the_reference_renders_every_case() {
     glm47_writes_its_turns_back_to_back_and_its_calls_in_xml();
     glm45_writes_a_newline_after_each_marker();
     minimax2_opens_on_its_identity_and_cues_an_open_think_block();
+    qwen3_coder_lists_its_tools_as_xml_and_writes_its_calls_as_functions();
+}
+
+/// Qwen3-Coder's template: plain ChatML turns, the tools a system turn of
+/// their own on the coder's identity, calls as `<function=…>` blocks,
+/// results in a user turn.
+fn qwen3_coder_lists_its_tools_as_xml_and_writes_its_calls_as_functions() {
+    let Some(tokenizer) = snapshot(
+        "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        "b2cff646eb4bb1d68355c01b18ae02e7cf42d120",
+    ) else {
+        return;
+    };
+    let template = chat_template::qwen3_coder::Qwen3Coder::new(tokenizer);
+    let question: Vec<u32> = vec![
+        151644, 872, 198, 3838, 374, 220, 16, 22, 3039, 220, 17, 18, 30, 151645, 198,
+    ];
+    let cue: Vec<u32> = vec![151644, 77091, 198];
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.cue());
+    assert_eq!(got, [question.clone(), cue.clone()].concat());
+
+    let mut got = template.system_user("You are terse.", MESSAGE);
+    got.extend(template.cue());
+    let terse: Vec<u32> = vec![151644, 8948, 198, 2610, 525, 50537, 13, 151645, 198];
+    assert_eq!(got, [terse, question.clone(), cue.clone()].concat());
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.assistant("391"));
+    got.extend(template.user("And 18 times 23?"));
+    got.extend(template.cue());
+    let want = [
+        question,
+        cue.clone(),
+        vec![18, 24, 16, 151645, 198],
+        vec![
+            151644, 872, 198, 3036, 220, 16, 23, 3039, 220, 17, 18, 30, 151645, 198,
+        ],
+        cue,
+    ]
+    .concat();
+    assert_eq!(got, want);
+
+    let mut got = template.equip(&[GLM_TOOL.to_string()]);
+    got.extend(template.user("Weather in Paris?"));
+    got.extend(template.assistant(GLM_CALL));
+    got.extend(template.answer("get_weather", "{\"temp\": 21}"));
+    got.extend(template.cue());
+    let want: Vec<u32> = vec![
+        151644, 8948, 198, 2610, 525, 1207, 16948, 11, 264, 10950, 15235, 17847, 429, 646, 16282,
+        448, 264, 6366, 311, 11625, 9079, 382, 2, 13852, 271, 2610, 614, 2615, 311, 279, 2701,
+        5746, 1447, 27, 15918, 397, 27, 1688, 397, 27, 606, 29, 455, 69364, 522, 606, 397, 27,
+        4684, 29, 28981, 522, 4684, 397, 27, 13786, 397, 27, 16181, 397, 27, 606, 29, 8926, 522,
+        606, 397, 27, 1313, 29, 917, 522, 1313, 397, 522, 16181, 397, 522, 13786, 397, 522, 1688,
+        397, 522, 15918, 1339, 2679, 498, 5157, 311, 1618, 264, 729, 26687, 9851, 304, 279, 2701,
+        3561, 448, 5664, 20525, 1447, 151657, 198, 27, 1688, 28, 8687, 9174, 1269, 397, 27, 16181,
+        28, 8687, 24899, 62, 16, 397, 957, 62, 16, 198, 522, 16181, 397, 27, 16181, 28, 8687,
+        24899, 62, 17, 397, 1986, 374, 279, 897, 369, 279, 2086, 5733, 198, 9033, 646, 9390, 198,
+        35673, 5128, 198, 522, 16181, 397, 522, 1688, 397, 151658, 271, 27, 98743, 397, 95359, 510,
+        12, 5712, 6738, 27732, 1795, 279, 5189, 3561, 25, 458, 9179, 366, 1688, 28, 1112, 1472,
+        1688, 29, 2504, 1969, 387, 24034, 2878, 220, 151657, 151658, 11874, 9492, 198, 12, 12659,
+        5029, 27732, 387, 5189, 198, 12, 1446, 1231, 3410, 10101, 32711, 369, 697, 729, 1618, 304,
+        5810, 4128, 56482, 279, 729, 1618, 11, 714, 4183, 1283, 198, 12, 1416, 1052, 374, 902, 729,
+        1618, 2500, 11, 4226, 279, 3405, 1075, 4622, 448, 697, 1482, 6540, 323, 653, 537, 3291,
+        279, 1196, 911, 729, 6738, 198, 522, 98743, 29, 151645, 198, 151644, 872, 198, 28981, 304,
+        12095, 30, 151645, 198, 151644, 77091, 198, 151657, 198, 27, 1688, 28280, 69364, 397, 27,
+        16181, 28, 8926, 397, 59604, 198, 522, 16181, 397, 27, 16181, 28, 13778, 397, 17, 198, 522,
+        16181, 397, 522, 1688, 397, 151658, 151645, 198, 151644, 872, 198, 151665, 198, 4913, 3888,
+        788, 220, 17, 16, 532, 151666, 198, 151645, 198, 151644, 77091, 198,
+    ];
+    assert_eq!(got, want);
+    assert_eq!(template.seal(), vec![151645, 151643]);
 }
 
 /// MiniMax-M2.5's template: a system turn of the release's identity (or the

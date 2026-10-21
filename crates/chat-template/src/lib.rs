@@ -20,6 +20,7 @@ pub mod llama;
 pub mod mimo;
 pub mod minimax;
 pub mod minimax2;
+pub mod qwen3_coder;
 pub mod raw;
 pub mod spec;
 

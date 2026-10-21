@@ -162,6 +162,15 @@ struct MimoToolDecoder {
     inside: bool,
 }
 
+/// Qwen3-Coder's XML calls read back, as MiMo writes them too.
+pub(crate) fn xml_call_decoder(tokenizer: &Arc<Tokenizer>) -> Box<dyn ToolDecoder> {
+    Box::new(MimoToolDecoder {
+        decoder: tokenizer.decoder(false),
+        accumulated: String::new(),
+        inside: false,
+    })
+}
+
 /// A parameter's text as JSON: itself when it is JSON (a number, an object),
 /// else the string it spells.
 fn parameter_value(text: &str) -> serde_json::Value {

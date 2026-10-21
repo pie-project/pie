@@ -10,8 +10,26 @@ use crate::Instruct;
 use crate::chatml::{ChatML, ChatMLInstruct};
 
 pub const FORMATS: &[&str] = &[
-    "chatml", "harmony", "gemma", "deepseek", "dots", "glm", "glm47", "glm45", "kimi", "kimi3",
-    "inkling", "atem", "mimo", "minimax", "minimax2", "hy", "llama", "lines", "raw",
+    "chatml",
+    "harmony",
+    "gemma",
+    "deepseek",
+    "dots",
+    "glm",
+    "glm47",
+    "glm45",
+    "kimi",
+    "kimi3",
+    "inkling",
+    "atem",
+    "mimo",
+    "minimax",
+    "minimax2",
+    "hy",
+    "llama",
+    "qwen3_coder",
+    "lines",
+    "raw",
 ];
 
 /// A format and its settings; a setting the format does not read is refused.
@@ -94,7 +112,7 @@ impl Spec {
             "minimax2" => &["identity"],
             "raw" => &["stop"],
             "harmony" | "deepseek" | "dots" | "glm" | "glm47" | "glm45" | "kimi" | "kimi3"
-            | "inkling" | "atem" | "mimo" | "minimax" | "llama" => &[],
+            | "inkling" | "atem" | "mimo" | "minimax" | "llama" | "qwen3_coder" => &[],
             other => {
                 return Err(format!(
                     "`{other}` names no template format; this build ships {}",
@@ -161,6 +179,7 @@ pub fn build(spec: &Spec, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>
         "minimax2" => Arc::new(crate::minimax2::MiniMax2::new(tokenizer, &spec.identity)),
         "hy" => Arc::new(crate::hy::Hy::new(tokenizer, spec.thinking)),
         "llama" => Arc::new(crate::llama::Llama::new(tokenizer)),
+        "qwen3_coder" => Arc::new(crate::qwen3_coder::Qwen3Coder::new(tokenizer)),
         "lines" => Arc::new(crate::lines::Lines::new(
             tokenizer,
             spec.bos.as_deref().unwrap_or_default(),
