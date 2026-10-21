@@ -338,19 +338,33 @@ __global__ void moe_weighted_sum(T* __restrict__ out, const T* __restrict__ src,
 }
 
 // y[n][h] = Σ_k src[n·top_k + k][h] + shared[n][h], the routed rows already
-// weighted, summed in f32 and rounded once.
-template <class T>
+// weighted, summed in f32 and rounded once; VEC columns a lane (8: one
+// 16-byte pack of every row, the width a whole number of them).
+template <class T, int VEC>
 __global__ void moe_sum_add(T* __restrict__ out, const T* __restrict__ src, const T* __restrict__ shared,
                             int top_k, int hidden, const u32* __restrict__ win) {
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long n = window.plane(blockIdx.x);
-    const int h = blockIdx.y * blockDim.x + threadIdx.x;
+    const int h = (blockIdx.y * blockDim.x + threadIdx.x) * VEC;
     if (h >= hidden) return;
     const long long base = n * top_k;
-    float acc = 0.f;
-    for (int k = 0; k < top_k; ++k) acc += to_f32(src[(base + k) * hidden + h]);
-    out[n * hidden + h] = from_f32<T>(acc + to_f32(shared[n * hidden + h]));
+    float acc[VEC] = {};
+    if constexpr (VEC == 8) {
+        for (int k = 0; k < top_k; ++k) {
+            const Pack8<T> v = *reinterpret_cast<const Pack8<T>*>(src + (base + k) * hidden + h);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc[e] += to_f32(v.v[e]);
+        }
+        const Pack8<T> sh = *reinterpret_cast<const Pack8<T>*>(shared + n * hidden + h);
+        Pack8<T> o;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) o.v[e] = from_f32<T>(acc[e] + to_f32(sh.v[e]));
+        *reinterpret_cast<Pack8<T>*>(out + n * hidden + h) = o;
+    } else {
+        for (int k = 0; k < top_k; ++k) acc[0] += to_f32(src[(base + k) * hidden + h]);
+        out[n * hidden + h] = from_f32<T>(acc[0] + to_f32(shared[n * hidden + h]));
+    }
 }
 
 // y[n][h] = x[n][h] + Σ_k weights[n][k] · bias[routes[n][k]][h]; a dead

@@ -185,30 +185,41 @@ __global__ void mlp_swiglu_clamp(const T* __restrict__ packed, T* __restrict__ y
     });
 }
 
-// `mlp_swiglu_clamp` element `at` of a gate and an up plane held apart, or
-// of packed rows (`PACKED`: row r's `width` gate columns at 2 r width, its up
-// columns after them); under `ROUTED` each row times its route's weight
-// before it rounds.
-template <class T, bool PACKED, bool ROUTED>
+// `mlp_swiglu_clamp` over VEC elements of a row a lane (8: one 16-byte
+// pack, the row a whole number of them), of a gate and an up plane held
+// apart, or of packed rows (`PACKED`: row r's `width` gate columns at 2 r
+// width, its up columns after them); under `ROUTED` each row times its
+// route's weight before it rounds. `n` counts the lanes' runs.
+template <class T, bool PACKED, bool ROUTED, int VEC>
 __global__ void mlp_swiglu_clamp_lanes(const T* __restrict__ gate, const T* __restrict__ up,
                                        const float* __restrict__ weights, T* __restrict__ y, i32 n, i32 width,
                                        float limit, i32 fan, const u32* __restrict__ win) {
     const i32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const long long at = flat_at(i, width, fan, win);
-    if (at < 0) return;
-    const long long row = at / width;
-    long long g_at = at;
-    const T* u_plane = up;
-    if constexpr (PACKED) {
-        g_at = row * 2 * width + (at - row * width);
-        u_plane = gate + width;
+    const i32 r = i * VEC / width, col = i * VEC - r * width;
+    const Window window{win};
+    if (!window.live(r, fan)) return;
+    const long long row = window.plane(r, fan);
+    const T* g = gate + (PACKED ? row * 2 * width : row * width) + col;
+    const T* u = PACKED ? g + width : up + row * width + col;
+    const float w = ROUTED ? weights[row] : 1.f;
+    auto one = [&](T gv, T uv) {
+        const float a = fminf(to_f32(gv), limit);
+        const float b = fminf(fmaxf(to_f32(uv), -limit), limit);
+        float s = a / (1.f + expf(-a)) * b;
+        if constexpr (ROUTED) s *= w;
+        return from_f32<T>(s);
+    };
+    if constexpr (VEC == 8) {
+        const Pack8<T> gp = *reinterpret_cast<const Pack8<T>*>(g);
+        const Pack8<T> up8 = *reinterpret_cast<const Pack8<T>*>(u);
+        Pack8<T> o;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) o.v[e] = one(gp.v[e], up8.v[e]);
+        *reinterpret_cast<Pack8<T>*>(y + row * width + col) = o;
+    } else {
+        y[row * width + col] = one(*g, *u);
     }
-    const float g = fminf(to_f32(gate[g_at]), limit);
-    const float u = fminf(fmaxf(to_f32(u_plane[g_at]), -limit), limit);
-    float s = g / (1.f + expf(-g)) * u;
-    if constexpr (ROUTED) s *= weights[row];
-    y[at] = from_f32<T>(s);
 }
 
 // As mlp_swiglu_clamp, with the gate's sigmoid sharpened by `alpha` and the

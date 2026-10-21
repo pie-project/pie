@@ -1210,6 +1210,22 @@ fn the_routed_clamp_and_the_sum_add_answer_the_host() {
         })
         .collect();
     common::close_bf16("swiglu_clamp_split_routed", &gpu.read(&y), &want, 1.0);
+    let packed: Vec<f32> = (0..rows)
+        .flat_map(|r| g[r * width..][..width].iter().chain(&u[r * width..][..width]))
+        .copied()
+        .collect();
+    let mut y = gpu.zeros(rows as u32, width as u32, Dtype::Bf16);
+    kernels_rocm::linear::mlp::swiglu_clamp_routed(
+        &ctx,
+        gpu.tensor(&packed, rows as u32, 2 * width as u32, Dtype::Bf16),
+        width as u32,
+        gpu.tensor(&w, rows as u32, 1, Dtype::F32),
+        1,
+        limit,
+        &mut y,
+    )
+    .unwrap();
+    common::close_bf16("swiglu_clamp_routed", &gpu.read(&y), &want, 1.0);
 
     let routed = values(rows * hidden, 4, 2.0)
         .into_iter()

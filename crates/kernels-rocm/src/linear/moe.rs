@@ -2562,10 +2562,22 @@ pub fn sum_add(ctx: &Ctx, routed: Tensor, shared: Tensor, y: &mut Tensor) -> Res
         ));
     }
     let top_k = routed.rows / y.rows;
+    let vec = if y.width.is_multiple_of(8)
+        && [y.ptr, routed.ptr, shared.ptr]
+            .iter()
+            .all(|p| p.is_multiple_of(16))
+    {
+        8
+    } else {
+        1
+    };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::moe_sum_add<{t}>")))
-            .apply(elementwise_rows(OP, y.rows, y.width)?),
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::linear::moe_sum_add<{t}, {vec}>")),
+        )
+        .apply(elementwise_rows(OP, y.rows, y.width / vec)?),
         &[
             y.arg(),
             routed.arg(),

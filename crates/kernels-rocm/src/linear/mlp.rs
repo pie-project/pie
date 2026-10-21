@@ -184,12 +184,23 @@ fn swiglu_clamp_lanes(
     nonzero(op, "the activation's element count", lanes)?;
     let (packed, routed) = (up.is_none(), weights.is_some());
     let absent = crate::jit::ArgValue::ABSENT;
+    // A lane takes a 16-byte pack where every row is whole packs.
+    let vec = if y.width.is_multiple_of(8)
+        && [gate.ptr, up.map_or(0, |u| u.ptr), y.ptr]
+            .iter()
+            .all(|p| p.is_multiple_of(16))
+    {
+        8
+    } else {
+        1
+    };
+    let lanes = lanes / vec;
     ctx.fire(
         op,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::linear::mlp_swiglu_clamp_lanes<{t}, {packed}, {routed}>"
+                "::pie::linear::mlp_swiglu_clamp_lanes<{t}, {packed}, {routed}, {vec}>"
             )),
         )
         .apply(Launch::flat(lanes, BLOCK)),
