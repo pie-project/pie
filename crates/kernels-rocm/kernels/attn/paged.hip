@@ -299,13 +299,13 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
         if constexpr (QLDS) {
             if (wave == 0 && g < G) {
 #pragma unroll
-                for (int st = 0; st < KP; ++st) qs[st][quad][g] = load8(qrow + st * 32 + 8 * quad);
+                for (int st = 0; st < KP; ++st) qs[st][quad][g] = load8(qrow + KV::col(st, quad));
             }
             __syncthreads();
         } else {
 #pragma unroll
             for (int st = 0; st < KP; ++st) {
-                qf[st] = load8(qrow + st * 32 + 8 * quad);
+                qf[st] = load8(qrow + KV::col(st, quad));
                 if (g >= G) qf[st] = mfma_ab2{};
             }
         }
@@ -352,9 +352,7 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
         auto read_keys = [&](int half) {
 #pragma unroll
             for (int kt = 0; kt < KT; ++kt) {
-                const long long row = at(min(t0 + kt * 16 + g, wend - 1), 0) + 8 * quad + half * KH * 32;
-#pragma unroll
-                for (int st = 0; st < KH; ++st) kr[kt][st] = KV::raw(p.k, row + st * 32);
+                KV::keys(p.k, at(min(t0 + kt * 16 + g, wend - 1), 0), quad, half * KH, kr[kt]);
             }
         };
         auto score_keys = [&](int half) {
@@ -581,9 +579,9 @@ __global__ __launch_bounds__(256) void paged_decode_cols(const Paged p) {
     mfma_ab2 qf[KPW];
     {
         const bf16* qrow = p.q + static_cast<long long>(p.q_indptr[req]) * p.q_stride_n +
-                           static_cast<long long>(kv_head * G + min(g, G - 1)) * p.q_stride_h + c0 + 8 * quad;
+                           static_cast<long long>(kv_head * G + min(g, G - 1)) * p.q_stride_h + c0;
 #pragma unroll
-        for (int st = 0; st < KPW; ++st) qf[st] = load8(qrow + st * 32);
+        for (int st = 0; st < KPW; ++st) qf[st] = load8(qrow + KV::col(st, quad));
     }
 
     float m = neg_inf(), lsum = 0.f;
@@ -610,9 +608,7 @@ __global__ __launch_bounds__(256) void paged_decode_cols(const Paged p) {
         // (past the chunk they reread its last key, which weighs zero).
         typename KV::Raw kr[KPW];
         {
-            const long long row = at(min(t0 + g, wend - 1), c0 + 8 * quad);
-#pragma unroll
-            for (int st = 0; st < KPW; ++st) kr[st] = KV::raw(p.k, row + st * 32);
+            KV::keys(p.k, at(min(t0 + g, wend - 1), c0), quad, 0, kr);
         }
         typename KV::Raw4 vr[VR];
 #pragma unroll

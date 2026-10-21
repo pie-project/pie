@@ -50,7 +50,10 @@ __device__ __forceinline__ mfma_ab2 e4m3x8_bf16(u64 w) {
 // A pool's elements as its readers take them: `FP8` an e4m3 pool's codes
 // (at the element offsets a bf16 pool's would be), read as bf16 of `1 /
 // unit` their value. A read lands raw (`Raw` eight elements, `Raw4` four)
-// and widens where it is used, so a prefetch stays in flight.
+// and widens where it is used, so a prefetch stays in flight. A matrix-core
+// operand's k step `st` of lane group `quad` sits at column `col(st, quad)`
+// (which k a step takes is the operands' own business): sixteen bytes a
+// lane a read either way, `keys` the reads of N steps from `st0` (even).
 template <bool FP8>
 struct Kv {
     using Raw = Pack8<bf16>;
@@ -64,6 +67,12 @@ struct Kv {
     __device__ static mfma_ab2 ab2(const Raw& r) { return __builtin_bit_cast(mfma_ab2, r); }
     __device__ static float f(const Raw4& r, int c) { return to_f32(r.v[c]); }
     __device__ static float one(const bf16* base, long long at) { return to_f32(base[at]); }
+    __device__ static int col(int st, int quad) { return 32 * st + 8 * quad; }
+    template <int N>
+    __device__ static void keys(const bf16* base, long long row, int quad, int st0, Raw (&out)[N]) {
+#pragma unroll
+        for (int i = 0; i < N; ++i) out[i] = raw(base, row + col(st0 + i, quad));
+    }
 };
 
 template <>
@@ -78,6 +87,18 @@ struct Kv<true> {
     __device__ static mfma_ab2 ab2(Raw r) { return e4m3x8_bf16(r); }
     __device__ static float f(Raw4 r, int c) { return __builtin_amdgcn_cvt_f32_fp8(r >> (8 * c), 0); }
     __device__ static float one(const bf16* base, long long at) { return __builtin_amdgcn_cvt_f32_fp8(bytes(base)[at], 0); }
+    __device__ static int col(int st, int quad) { return 64 * (st >> 1) + 16 * quad + 8 * (st & 1); }
+    template <int N>
+    __device__ static void keys(const bf16* base, long long row, int quad, int st0, Raw (&out)[N]) {
+        static_assert(N % 2 == 0, "steps in pairs");
+#pragma unroll
+        for (int i = 0; i < N; i += 2) {
+            const Pack8<bf16> w = *reinterpret_cast<const Pack8<bf16>*>(bytes(base) + row + col(st0 + i, quad));
+            const auto pair = __builtin_bit_cast(mfma_ab2, w);
+            out[i] = __builtin_bit_cast(u64, pair.lo);
+            out[i + 1] = __builtin_bit_cast(u64, pair.hi);
+        }
+    }
 };
 
 // Token row b's k and v (h_kv·d each) into page w_page[b], slot w_off[b],
