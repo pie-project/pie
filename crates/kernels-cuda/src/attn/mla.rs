@@ -783,9 +783,10 @@ mod sparse {
     ) -> Option<Result<(), Error>> {
         let pool = s.pool;
         let fp8 = fp8_rows(pool);
-        // fp8 rows have no other reader: any head count is read 64 heads a
-        // pass (a rank's share under tensor parallelism, or more than 64).
-        if fp8 && s.heads != 64 && s.heads > 0 {
+        // Where the tcgen05 pass serves, fp8 rows at any head count are read
+        // 64 heads a pass (a rank's share under tensor parallelism, or more
+        // than 64); elsewhere they take the path any other shape takes.
+        if fp8 && s.heads != 64 && s.heads > 0 && ctx.tuning().mla_sparse && supported() {
             return Some(by_sixty_four(ctx, op, s, o));
         }
         let cells = pool.keys.rows;
