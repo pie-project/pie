@@ -1139,9 +1139,22 @@ pub const REGISTER_TOKENS: u32 = 8;
 
 const REGISTER_FILE: &str = "linear/moe_sg.metal";
 
-/// The intermediate columns a simdgroup of the register gate-up takes, in
-/// 8-column fragments (each with its gate and up columns).
-pub const REGISTER_GLU_FRAGMENTS: u32 = 1;
+/// How the register expert passes cut their columns: the intermediate's
+/// 8-column fragments a simdgroup of the gate-up takes (each with its gate
+/// and up columns), and the simdgroups a threadgroup of each pass holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegisterCut {
+    pub fragments: u32,
+    pub glu_simdgroups: u32,
+    pub down_simdgroups: u32,
+}
+
+/// The cut the register expert passes run at.
+pub const REGISTER_CUT: RegisterCut = RegisterCut {
+    fragments: 1,
+    glu_simdgroups: 4,
+    down_simdgroups: 4,
+};
 
 /// The scratch of a routed MLP on the register tile, as `moe_sg.metal` reads it.
 #[derive(Clone, Copy, Debug)]
@@ -1187,6 +1200,14 @@ pub fn register_bank(bank: Bank, width: u32, columns: u32) -> bool {
         && bank.ld == width
         && width.is_multiple_of(256)
         && columns.is_multiple_of(64)
+}
+
+/// Whether the register passes cut as `cut` take an intermediate of `inter`
+/// columns and a down of `columns`.
+#[must_use]
+pub fn register_cuts(inter: u32, columns: u32, cut: RegisterCut) -> bool {
+    inter.is_multiple_of((8 * cut.fragments * cut.glu_simdgroups).max(64))
+        && columns.is_multiple_of(16 * cut.down_simdgroups)
 }
 
 /// The routes of `routes` (at most [`REGISTER_TOKENS`] tokens) grouped into
@@ -1238,9 +1259,13 @@ pub fn register_group(
             u32::from(shared).arg(),
         ],
     )?;
+    // A threadgroup a tile (of up to 32 groups): the tiles past the count cost
+    // a dispatch each.
+    let groups = x.width / 64;
+    let group = (1..=groups.min(32)).rev().find(|g| groups.is_multiple_of(*g)).unwrap_or(1);
     ctx.fire(
         Fire::at(REGISTER_FILE, "moe_sg_gather")
-            .apply(Grid::of([32, x.width / 64, tiles], [32, 4, 1])),
+            .apply(Grid::of([32, groups, tiles], [32, group, 1])),
         &[
             x.arg(),
             rooms.table.arg_mut(),
@@ -1268,8 +1293,7 @@ fn register_banks(ctx: &Ctx<'_>, bank: Bank, shared: Option<Bank>) -> Result<[cr
 /// A routed gate-up (`gate_up`: each expert's `2 * inter` packed gate and up
 /// rows over `width` inputs) and its SwiGLU on the register tile, over the
 /// tiles [`register_group`] laid: lands each tile's down input table in
-/// `rooms.hidden`. `fragments` is the intermediate's 8-column fragments a
-/// simdgroup takes ([`REGISTER_GLU_FRAGMENTS`]).
+/// `rooms.hidden`.
 #[allow(clippy::too_many_arguments)]
 pub fn register_glu(
     ctx: &Ctx<'_>,
@@ -1280,15 +1304,27 @@ pub fn register_glu(
     tiles: u32,
     experts: u32,
     rooms: RegisterRooms,
-    fragments: u32,
+    cut: RegisterCut,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
-    let entry = match fragments {
-        1 => "affine_qmm_sg_glu_routed_h1",
-        2 => "affine_qmm_sg_glu_routed_h2",
-        _ => return Err(refuse(OP, format!("no register gate-up takes {fragments} fragments a simdgroup"))),
+    let (fragments, simdgroups) = (cut.fragments, cut.glu_simdgroups);
+    let entry = match (fragments, simdgroups) {
+        (1, 4) => "affine_qmm_sg_glu_routed_h1_s4",
+        (1, 8) => "affine_qmm_sg_glu_routed_h1_s8",
+        (1, 16) => "affine_qmm_sg_glu_routed_h1_s16",
+        (2, 4) => "affine_qmm_sg_glu_routed_h2_s4",
+        (2, 8) => "affine_qmm_sg_glu_routed_h2_s8",
+        _ => {
+            return Err(refuse(
+                OP,
+                format!(
+                    "no register gate-up takes {fragments} fragments a simdgroup in \
+                     {simdgroups}-simdgroup threadgroups"
+                ),
+            ));
+        }
     };
-    let columns = 32 * fragments;
+    let columns = 8 * fragments * simdgroups;
     if !inter.is_multiple_of(columns.max(64)) || !register_bank(gate_up, width, 2 * inter) {
         return Err(refuse(
             OP,
@@ -1298,8 +1334,10 @@ pub fn register_glu(
     let [codes, scales, biases, own_codes, own_scales, own_biases] =
         register_banks(ctx, gate_up, shared)?;
     ctx.fire(
-        Fire::at(REGISTER_FILE, entry)
-            .apply(Grid::of([128 * (inter / columns), tiles, 1], [128, 1, 1])),
+        Fire::at(REGISTER_FILE, entry).apply(Grid::of(
+            [32 * simdgroups * (inter / columns), tiles, 1],
+            [32 * simdgroups, 1, 1],
+        )),
         &[
             codes,
             scales,
@@ -1330,9 +1368,23 @@ pub fn register_down(
     tiles: u32,
     experts: u32,
     rooms: RegisterRooms,
+    cut: RegisterCut,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
-    if !register_bank(down, inter, columns) {
+    let simdgroups = cut.down_simdgroups;
+    let entry = match simdgroups {
+        4 => "affine_qmm_sg_routed_s4",
+        8 => "affine_qmm_sg_routed_s8",
+        16 => "affine_qmm_sg_routed_s16",
+        _ => {
+            return Err(refuse(
+                OP,
+                format!("no register down runs {simdgroups}-simdgroup threadgroups"),
+            ));
+        }
+    };
+    let span = 16 * simdgroups;
+    if !columns.is_multiple_of(span) || !register_bank(down, inter, columns) {
         return Err(refuse(
             OP,
             format!("the register down does not take this bank over {inter} x {columns}"),
@@ -1341,8 +1393,10 @@ pub fn register_down(
     let [codes, scales, biases, own_codes, own_scales, own_biases] =
         register_banks(ctx, down, shared)?;
     ctx.fire(
-        Fire::at(REGISTER_FILE, "affine_qmm_sg_routed")
-            .apply(Grid::of([128 * (columns / 64), tiles, 1], [128, 1, 1])),
+        Fire::at(REGISTER_FILE, entry).apply(Grid::of(
+            [32 * simdgroups * (columns / span), tiles, 1],
+            [32 * simdgroups, 1, 1],
+        )),
         &[
             codes,
             scales,

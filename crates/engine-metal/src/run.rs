@@ -660,7 +660,7 @@ impl<'c> Run<'c> {
         let (gate_up, down) = (self.planes(bank), self.planes(*down_bank));
         let columns = self.tensor(*routed).width;
         if self.tensor(y).width != 2 * inter
-            || !inter.is_multiple_of(64)
+            || !moe::register_cuts(inter, columns, moe::REGISTER_CUT)
             || !moe::register_bank(gate_up, xt.width, 2 * inter)
             || !moe::register_bank(down, inter, columns)
         {
@@ -691,7 +691,7 @@ impl<'c> Run<'c> {
             tiles,
             experts,
             rooms,
-            moe::REGISTER_GLU_FRAGMENTS,
+            moe::REGISTER_CUT,
         )?;
         self.tiles.set(Some(Tiled {
             step: TiledStep::GateUp,
@@ -802,6 +802,7 @@ impl<'c> Run<'c> {
             tiled.tiles,
             self.experts(routes),
             rooms,
+            kernels_metal::linear::moe::REGISTER_CUT,
         )?;
         self.tiles.set(Some(Tiled {
             step: TiledStep::Down,

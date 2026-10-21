@@ -114,7 +114,11 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
     };
     let mut checked = 0;
     for tokens in [2u32, 5, 8] {
-        for fragments in [1u32, 2] {
+        for cut in [
+            moe::REGISTER_CUT,
+            moe::RegisterCut { fragments: 2, glu_simdgroups: 8, down_simdgroups: 16 },
+            moe::RegisterCut { fragments: 1, glu_simdgroups: 16, down_simdgroups: 8 },
+        ] {
             for shared in [false, true] {
                 let pairs = tokens * TOP_K;
                 let r = routes(tokens, u64::from(tokens) * 31);
@@ -201,10 +205,10 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                     tiles,
                     EXPERTS,
                     rooms,
-                    fragments,
+                    cut,
                 )
                 .expect("register gate-up");
-                moe::register_down(&sink, down, own_banks(shared_down), INTER, HIDDEN, tiles, EXPERTS, rooms)
+                moe::register_down(&sink, down, own_banks(shared_down), INTER, HIDDEN, tiles, EXPERTS, rooms, cut)
                     .expect("register down");
                 let sorted = Tensor::new(y_t.buf, tiles * 8, HIDDEN, Dtype::Bf16);
                 moe::weighted_sum_sorted(&sink, sorted, inv_t, wt, TOP_K, sft).expect("sorted fold");
@@ -230,7 +234,7 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                     let off = spread(w, g);
                     assert!(
                         off < 0.02,
-                        "tokens {tokens} fragments {fragments} shared {shared}: route {route}'s \
+                        "tokens {tokens} cut {cut:?} shared {shared}: route {route}'s \
                          down row {row} is {off:.2e} off the per-route path's"
                     );
                     checked += 1;
@@ -246,7 +250,7 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                         assert!(off < 0.02, "tokens {tokens}: shared row {t} is {off:.2e} off");
                     }
                 }
-                eprintln!("tokens {tokens} fragments {fragments} shared {shared}: fold {off:.2e} off");
+                eprintln!("tokens {tokens} cut {cut:?} shared {shared}: fold {off:.2e} off");
             }
         }
     }

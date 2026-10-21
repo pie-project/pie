@@ -211,13 +211,15 @@ struct Shifted {
   }
 }
 
-// A routed gate-up and its SwiGLU: each simdgroup takes HF 8-column fragments
-// of the intermediate and the gate and up columns of each (rows c and
-// `inter` + c of the expert's packed rows), and lands silu(gate) * up, both
-// rounded to bf16 first as the packed rows would hold them, straight into the
-// down's input table of the tile; the threadgroup's 32 HF columns are whole
-// halves of a 64-input group, whose sums it adds as `qmm_sg_table` does.
-template <int HF>
+// A routed gate-up and its SwiGLU: each of the threadgroup's SG simdgroups
+// takes HF 8-column fragments of the intermediate and the gate and up columns
+// of each (rows c and `inter` + c of the expert's packed rows), and lands
+// silu(gate) * up, both rounded to bf16 first as the packed rows would hold
+// them, straight into the down's input table of the tile; the threadgroup's
+// 8 HF SG columns are whole halves of 64-input groups, whose sums it adds as
+// `qmm_sg_table` does. A threadgroup of more simdgroups is fewer for the GPU
+// to dispatch, of which the tiles past the count are pure cost.
+template <int HF, int SG>
 [[kernel]] void affine_qmm_sg_glu_routed(
     const device uint *codes [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
     const device bfloat *biases [[buffer(2)]], const device uint *shared_codes [[buffer(3)]],
@@ -228,7 +230,8 @@ template <int HF>
     uint2 position [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]) {
   constexpr int NF = 2 * HF;
-  constexpr uint COLUMNS = 32 * HF;
+  constexpr uint COLUMNS = 8 * HF * SG, HALVES = COLUMNS / 32;
+  static_assert(COLUMNS % 32 == 0, "a threadgroup's columns are whole halves of 64-input groups");
   threadgroup bfloat laid[8][COLUMNS];
   const uint tile = position.y;
   if (int(tile) >= tiles[0])
@@ -266,26 +269,31 @@ template <int HF>
     }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   // Rows x halves: a thread each.
-  if (lid < 8 * HF) {
+  if (lid < 8 * HALVES) {
     const uint row = lid & 7, part = lid >> 3;
-    const uint n = position.x * HF + part; // the 32-input half of the down's input
+    const uint n = position.x * HALVES + part; // the 32-input half of the down's input
     const moe_sg::Shifted src{&laid[row][0], int(position.x * COLUMNS)};
     register_table::sums(out, inter)[ulong(n) * 8 + row] =
         register_table::half_sum(src, n >> 1, n & 1);
   }
 }
 
-template [[host_name("affine_qmm_sg_glu_routed_h1")]] [[kernel]] void affine_qmm_sg_glu_routed<1>(
-    const device uint *, const device bfloat *, const device bfloat *, const device uint *,
-    const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *,
-    const device int *, constant int &, constant int &, constant int &, uint2, uint, uint, uint);
-template [[host_name("affine_qmm_sg_glu_routed_h2")]] [[kernel]] void affine_qmm_sg_glu_routed<2>(
-    const device uint *, const device bfloat *, const device bfloat *, const device uint *,
-    const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *,
-    const device int *, constant int &, constant int &, constant int &, uint2, uint, uint, uint);
+#define PIE_MOE_SG_GLU(hf, sg)                                                                     \
+  template [[host_name("affine_qmm_sg_glu_routed_h" #hf "_s" #sg)]] [[kernel]] void               \
+  affine_qmm_sg_glu_routed<hf, sg>(                                                                \
+      const device uint *, const device bfloat *, const device bfloat *, const device uint *,      \
+      const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *,        \
+      const device int *, constant int &, constant int &, constant int &, uint2, uint, uint, uint);
+PIE_MOE_SG_GLU(1, 4)
+PIE_MOE_SG_GLU(1, 8)
+PIE_MOE_SG_GLU(1, 16)
+PIE_MOE_SG_GLU(2, 4)
+PIE_MOE_SG_GLU(2, 8)
 
-// A routed projection of each live tile's table by its expert's columns,
-// into the tile's eight rows of `out` (rows past its routes are zero).
+// A routed projection of each live tile's table by its expert's columns, SG
+// simdgroups of 16 a threadgroup, into the tile's eight rows of `out` (rows
+// past its routes are zero).
+template <int SG>
 [[kernel]] void affine_qmm_sg_routed(
     const device uint *codes [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
     const device bfloat *biases [[buffer(2)]], const device uint *shared_codes [[buffer(3)]],
@@ -303,7 +311,7 @@ template [[host_name("affine_qmm_sg_glu_routed_h2")]] [[kernel]] void affine_qmm
   const bool own = expert == experts;
   const ulong first = own ? 0 : ulong(expert) * ulong(columns);
   const moe_sg::Lane l = moe_sg::lane_of(lane);
-  const uint at = position.x * 32 * NF + simd * 8 * NF + l.fm;
+  const uint at = position.x * 8 * NF * SG + simd * 8 * NF + l.fm;
   ulong column[NF];
 #pragma unroll
   for (int f = 0; f < NF; ++f)
@@ -323,3 +331,12 @@ template [[host_name("affine_qmm_sg_glu_routed_h2")]] [[kernel]] void affine_qmm
       out[row * columns + at + 8 * f] = bfloat(acc[f][i]);
   }
 }
+
+#define PIE_MOE_SG_DOWN(sg)                                                                        \
+  template [[host_name("affine_qmm_sg_routed_s" #sg)]] [[kernel]] void affine_qmm_sg_routed<sg>(   \
+      const device uint *, const device bfloat *, const device bfloat *, const device uint *,      \
+      const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *,        \
+      const device int *, constant int &, constant int &, constant int &, uint2, uint, uint);
+PIE_MOE_SG_DOWN(4)
+PIE_MOE_SG_DOWN(8)
+PIE_MOE_SG_DOWN(16)

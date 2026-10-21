@@ -286,63 +286,63 @@ fn the_register_routed_mlp_prices_its_tiles() {
             mlp::swiglu(s, spt, INTER, sht).expect("shared swiglu");
             quant::matmul(s, &register, sht, l[3], syt, scratch(), 8).expect("shared down");
         };
-        let tiled = |s: &Sink, l: &[Bank; 4], shared: bool, fragments: u32| {
+        let cut = |fragments, glu_simdgroups, down_simdgroups| moe::RegisterCut {
+            fragments,
+            glu_simdgroups,
+            down_simdgroups,
+        };
+        let tiled = |s: &Sink, l: &[Bank; 4], shared: bool, cut: moe::RegisterCut| {
             let tiles = moe::register_tiles(tokens, TOP_K, EXPERTS, shared);
             let own = |b: Bank| shared.then_some(b);
             moe::register_group(s, xt, rt, EXPERTS, shared, rooms).expect("group");
-            moe::register_glu(s, l[0], own(l[2]), HIDDEN, INTER, tiles, EXPERTS, rooms, fragments).expect("glu");
-            moe::register_down(s, l[1], own(l[3]), INTER, HIDDEN, tiles, EXPERTS, rooms).expect("down");
+            moe::register_glu(s, l[0], own(l[2]), HIDDEN, INTER, tiles, EXPERTS, rooms, cut).expect("glu");
+            moe::register_down(s, l[1], own(l[3]), INTER, HIDDEN, tiles, EXPERTS, rooms, cut).expect("down");
             let sorted = Tensor::new(rooms.y.buf, tiles * 8, HIDDEN, Dtype::Bf16);
             moe::weighted_sum_sorted(s, sorted, rooms.inv, wt, TOP_K, ft).expect("fold");
         };
-        let per_route = time(&|s, l| { route_gate_up(s, l); route_down(s, l); });
-        let per_route_gate_up = time(&|s, l| route_gate_up(s, l));
+        let per_route = time(&|s, l| {
+            route_gate_up(s, l);
+            route_down(s, l);
+        });
         let shared_dense = time(&|s, l| own(s, l));
-        let routed_h1 = time(&|s, l| tiled(s, l, false, 1));
-        let routed_h2 = time(&|s, l| tiled(s, l, false, 2));
-        let folded_h1 = time(&|s, l| tiled(s, l, true, 1));
-        let folded_h2 = time(&|s, l| tiled(s, l, true, 2));
-        let glu_h1 = time(&|s, l| {
-            moe::register_group(s, xt, rt, EXPERTS, true, rooms).expect("group");
-            moe::register_glu(s, l[0], Some(l[2]), HIDDEN, INTER, tiles, EXPERTS, rooms, 1).expect("glu");
-        });
-        let group_only = time(&|s, _l| {
-            moe::register_group(s, xt, rt, EXPERTS, true, rooms).expect("group");
-        });
-        let down_only = time(&|s, l| {
-            moe::register_down(s, l[1], Some(l[3]), INTER, HIDDEN, tiles, EXPERTS, rooms).expect("down");
-        });
-        // The same passes launched over the live tiles alone, as an indirect grid would.
+        let group = time(&|s, _l| moe::register_group(s, xt, rt, EXPERTS, true, rooms).expect("group"));
+        // Each pass over every tile a fire may fill, and over the live tiles alone, as an
+        // indirect grid would launch them.
         let live = u32::try_from(unique).unwrap() + 1;
-        let glu_live = time(&|s, l| {
-            moe::register_glu(s, l[0], Some(l[2]), HIDDEN, INTER, live, EXPERTS, rooms, 1).expect("glu");
-        });
-        let glu_max = time(&|s, l| {
-            moe::register_glu(s, l[0], Some(l[2]), HIDDEN, INTER, tiles, EXPERTS, rooms, 1).expect("glu");
-        });
-        let down_live = time(&|s, l| {
-            moe::register_down(s, l[1], Some(l[3]), INTER, HIDDEN, live, EXPERTS, rooms).expect("down");
-        });
-        let fold_only = time(&|s, _l| {
-            let sorted = Tensor::new(rooms.y.buf, tiles * 8, HIDDEN, Dtype::Bf16);
-            moe::weighted_sum_sorted(s, sorted, rooms.inv, wt, TOP_K, ft).expect("fold");
-        });
-        eprintln!(
-            "rows={tokens} unique={unique:2}: glu {glu_max:6.1} us ({glu_live:6.1} over the live tiles), \
-             down {down_only:6.1} us ({down_live:6.1} live), fold {fold_only:6.1} us"
-        );
-        let route_down_only = time(&|s, l| {
-            moe::matmul_select_quant(s, ht, l[1], rt, yt).expect("down");
-        });
-        eprintln!(
-            "rows={tokens} unique={unique:2}: group+gather {group_only:6.1} us, register down {down_only:6.1} us, \
-             per-route down {route_down_only:6.1} us"
-        );
-        eprintln!(
-            "rows={tokens} unique={unique:2}: per-route {per_route:6.1} us (gate-up+swiglu {per_route_gate_up:6.1}) \
-             + dense shared {shared_dense:6.1} = {:6.1} | register h1 {routed_h1:6.1} h2 {routed_h2:6.1} | \
-             with shared tile h1 {folded_h1:6.1} h2 {folded_h2:6.1} (group+glu h1 {glu_h1:6.1}) us a layer",
+        let mut line = format!(
+            "rows={tokens} unique={unique:2}: per-route {per_route:6.1} + dense shared {shared_dense:5.1} = {:6.1} us | group+gather {group:5.1} us\n  glu",
             per_route + shared_dense
         );
+        for (f, sg) in [(1, 4), (1, 8), (1, 16), (2, 4), (2, 8)] {
+            let at = |tiles| {
+                time(&|s, l| {
+                    moe::register_glu(s, l[0], Some(l[2]), HIDDEN, INTER, tiles, EXPERTS, rooms, cut(f, sg, 4))
+                        .expect("glu");
+                })
+            };
+            line += &format!(" h{f}s{sg} {:6.1} ({:6.1} live)", at(tiles), at(live));
+        }
+        line += "\n  down";
+        for sg in [4, 8, 16] {
+            let at = |tiles| {
+                time(&|s, l| {
+                    moe::register_down(s, l[1], Some(l[3]), INTER, HIDDEN, tiles, EXPERTS, rooms, cut(1, 4, sg))
+                        .expect("down");
+                })
+            };
+            line += &format!(" s{sg} {:6.1} ({:6.1} live)", at(tiles), at(live));
+        }
+        line += "\n  chain with the shared tile";
+        for c in [cut(1, 4, 4), cut(1, 8, 8), cut(1, 16, 8), cut(1, 16, 16), cut(2, 8, 16)] {
+            line += &format!(
+                " h{}s{}/s{} {:6.1}",
+                c.fragments,
+                c.glu_simdgroups,
+                c.down_simdgroups,
+                time(&|s, l| tiled(s, l, true, c))
+            );
+        }
+        line += &format!(" | without it h1s4/s4 {:6.1} us a layer", time(&|s, l| tiled(s, l, false, cut(1, 4, 4))));
+        eprintln!("{line}");
     }
 }
