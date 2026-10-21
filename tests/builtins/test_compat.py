@@ -330,6 +330,8 @@ def test_bad_requests(http: Http):
     assert err["type"] == "invalid_request_error" and err["param"] == "messages", err
 
     status, _, text = chat(http, n=3)
+    assert status == 200 and len(json.loads(text)["choices"]) == 3, text
+    status, _, text = chat(http, n=0)
     assert status == 400 and json.loads(text)["error"]["param"] == "n", text
 
     status, _, text = chat(
