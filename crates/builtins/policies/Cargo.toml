@@ -23,6 +23,7 @@ members = [
     "test-spin",
     "test-trap",
     "test-route",
+    "test-share",
 ]
 
 [profile.release]

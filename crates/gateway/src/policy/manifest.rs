@@ -27,6 +27,9 @@ const EDGES: &[&str] = &[
     "dropped",
     "tier-pressure",
     "link-changed",
+    "placement-changed",
+    "replication-changed",
+    "published",
 ];
 
 const GRANTS: &[&str] = &[
@@ -40,7 +43,12 @@ const GRANTS: &[&str] = &[
     "transfer-shares",
     "acceptance",
     "discard",
+    "publish",
 ];
+
+/// Grants whose writes land under the writer's own name, so any number of
+/// programs may hold them: each is still the one author of what it writes.
+pub const NAMESPACED: &[&str] = &["publish"];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]

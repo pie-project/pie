@@ -4,7 +4,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -417,19 +417,29 @@ fn run(
 ) {
     let mut registry = Registry::default();
     loop {
-        let first = match programs.iter().filter_map(Program::alarm).min() {
-            Some(at_ms) => {
-                let wait = at_ms.saturating_sub(now_ms());
-                match events.recv_timeout(Duration::from_millis(wait)) {
-                    Ok(event) => Some(event),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => return,
-                }
-            }
-            None => match events.recv() {
+        // What the last round's calls changed reaches the others now.
+        let carried = std::mem::take(&mut registry.carried);
+        let first = if !carried.is_empty() {
+            match events.try_recv() {
                 Ok(event) => Some(event),
-                Err(_) => return,
-            },
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        } else {
+            match programs.iter().filter_map(Program::alarm).min() {
+                Some(at_ms) => {
+                    let wait = at_ms.saturating_sub(now_ms());
+                    match events.recv_timeout(Duration::from_millis(wait)) {
+                        Ok(event) => Some(event),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                None => match events.recv() {
+                    Ok(event) => Some(event),
+                    Err(_) => return,
+                },
+            }
         };
         let mut edges = Vec::new();
         let mut heard = None;
@@ -457,6 +467,12 @@ fn run(
         let mut withdrawn = Vec::new();
         for (at, program) in programs.iter_mut().enumerate() {
             let mut edges = edges.clone();
+            edges.extend(
+                carried
+                    .iter()
+                    .filter(|(author, _)| author != program.name())
+                    .map(|(_, edge)| edge.clone()),
+            );
             if program.alarm().is_some_and(|at_ms| at_ms <= now) {
                 edges.push(Edge::Timer);
             }
@@ -464,7 +480,7 @@ fn run(
                 continue;
             }
             tracing::debug!(policy = program.name(), ?edges, "cluster policy edges");
-            let plane = registry.snapshot(&routing.borrow());
+            let plane = registry.snapshot(&routing.borrow(), &shared.tables.read().unwrap());
             match program.react(Box::new(plane), edges, now) {
                 Ok(commit) => {
                     tracing::debug!(
@@ -474,11 +490,12 @@ fn run(
                         placement = commit.placement.as_ref().map(|t| t.len()),
                         "cluster policy call"
                     );
-                    enact(&shared, &mut registry, commit);
+                    let author = program.name().to_string();
+                    enact(&shared, &mut registry, commit, &author);
                 }
                 Err(Fault::Dead(error)) => {
                     tracing::error!(policy = program.name(), %error, "cluster policy is dead; its tables are withdrawn");
-                    withdraw(&shared, &mut registry, program.manifest());
+                    withdraw(&shared, &mut registry, program.name(), program.manifest());
                     withdrawn.push(at);
                 }
                 Err(fault) => {
@@ -509,10 +526,17 @@ fn run(
     }
 }
 
-/// A dead program's tables revert to empty; the others' stand.
-fn withdraw(shared: &Shared, registry: &mut Registry, manifest: &super::manifest::Manifest) {
+/// A dead program's tables revert to empty, and what it published is
+/// withdrawn; the others' stand.
+fn withdraw(
+    shared: &Shared,
+    registry: &mut Registry,
+    author: &str,
+    manifest: &super::manifest::Manifest,
+) {
     {
         let mut tables = shared.tables.write().unwrap();
+        let before = placed_all(&tables);
         if manifest.grants("schedule") {
             tables.schedule = None;
         }
@@ -522,10 +546,25 @@ fn withdraw(shared: &Shared, registry: &mut Registry, manifest: &super::manifest
         if manifest.grants("executors") {
             tables.executors.clear();
         }
+        let after = placed_all(&tables);
+        registry.carry_placements(author, &before, &after);
     }
     if manifest.grants("replication") {
+        let before = replicated(&registry.replication);
         registry.replication.clear();
+        registry.carry_replications(author, &before);
     }
+    let gone: Vec<(Subject, String, Option<Value>)> = registry
+        .said
+        .values()
+        .flat_map(|(subject, said)| {
+            said.keys()
+                .filter_map(|key| key.strip_prefix(&format!("{author}/")))
+                .map(|name| (subject.clone(), name.to_string(), None))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    registry.say(author, gone);
     shared.changed.notify_waiters();
 }
 
@@ -582,14 +621,23 @@ fn replicate(
     }
 }
 
-fn enact(shared: &Shared, registry: &mut Registry, commit: Commit) {
+fn enact(shared: &Shared, registry: &mut Registry, commit: Commit, author: &str) {
     if let Some(replication) = commit.state.replication {
+        let before = replicated(&registry.replication);
         registry.replication = replication;
         registry.replaced = true;
+        registry.carry_replications(author, &before);
     }
+    registry.say(author, commit.publish);
     let mut changed = false;
     {
         let mut tables = shared.tables.write().unwrap();
+        let placing = commit.placement.is_some() || commit.executors.is_some();
+        let before = if placing {
+            placed_all(&tables)
+        } else {
+            HashMap::new()
+        };
         if let Some(schedule) = commit.schedule {
             tables.schedule = Some(schedule);
             changed = true;
@@ -617,6 +665,10 @@ fn enact(shared: &Shared, registry: &mut Registry, commit: Commit) {
             }
             tables.placement = placement;
         }
+        if placing {
+            let after = placed_all(&tables);
+            registry.carry_placements(author, &before, &after);
+        }
     }
     for (id, reason) in commit.terminate {
         if !registry.procs.contains_key(&id) {
@@ -633,6 +685,63 @@ fn enact(shared: &Shared, registry: &mut Registry, commit: Commit) {
     }
     if changed {
         shared.changed.notify_waiters();
+    }
+}
+
+/// A process's committed placement as another program reads it: its
+/// worker, its executors and its props.
+type Placed = (
+    Option<String>,
+    Vec<String>,
+    Vec<(String, Option<serde_json::Value>)>,
+);
+
+fn placed_all(tables: &Tables) -> HashMap<String, Placed> {
+    let ids: BTreeSet<&String> = tables
+        .placement
+        .keys()
+        .chain(tables.executors.keys())
+        .collect();
+    ids.into_iter()
+        .map(|id| {
+            let placement = tables.placement.get(id);
+            let placed = (
+                placement.and_then(|p| p.worker.clone()),
+                tables.executors.get(id).cloned().unwrap_or_default(),
+                placement
+                    .map(|p| p.props.iter().map(|(n, v)| (n.clone(), json(v))).collect())
+                    .unwrap_or_default(),
+            );
+            (id.clone(), placed)
+        })
+        .collect()
+}
+
+/// The workers each group's replication table asks for.
+fn replicated(table: &[wit::Replicate]) -> BTreeMap<String, Vec<String>> {
+    let mut sites: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for entry in table {
+        sites
+            .entry(entry.group.clone())
+            .or_default()
+            .extend(entry.at.iter().map(|site| site.worker.clone()));
+    }
+    for workers in sites.values_mut() {
+        workers.sort_unstable();
+        workers.dedup();
+    }
+    sites
+}
+
+/// Where a subject's publications are kept.
+fn subject_key(subject: &Subject) -> String {
+    match subject {
+        Subject::Session(id) => format!("session:{id}"),
+        Subject::Process(id) => format!("process:{id}"),
+        Subject::WorkingSet(id) => format!("working-set:{id}"),
+        Subject::Worker(id) => format!("worker:{id}"),
+        Subject::Group(id) => format!("group:{id}"),
+        Subject::Link(id) => format!("link:{id}"),
     }
 }
 
@@ -681,6 +790,11 @@ struct Registry {
     published: HashMap<String, HashMap<String, serde_json::Value>>,
     /// Workers draining, as of the routing table last heard.
     draining: BTreeSet<String>,
+    /// What cluster programs published, by subject: each value under
+    /// `<program>/<name>`.
+    said: HashMap<String, (Subject, BTreeMap<String, Value>)>,
+    /// Edges a call caused, for every program but its author's next call.
+    carried: Vec<(String, Edge)>,
 }
 
 /// The prompt blocks the router counts a worker as holding: about 4M tokens
@@ -840,8 +954,79 @@ impl Registry {
         }
     }
 
-    fn snapshot(&self, routing: &RoutingTable) -> Snapshot {
+    /// `placement-changed` for each process whose committed placement
+    /// differs, caused by `author`.
+    fn carry_placements(
+        &mut self,
+        author: &str,
+        before: &HashMap<String, Placed>,
+        after: &HashMap<String, Placed>,
+    ) {
+        let ids: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+        for id in ids {
+            if before.get(id) != after.get(id) {
+                self.carried
+                    .push((author.to_string(), Edge::PlacementChanged(id.clone())));
+            }
+        }
+    }
+
+    /// `replication-changed` for each group whose committed sites differ
+    /// from `before`, caused by `author`.
+    fn carry_replications(&mut self, author: &str, before: &BTreeMap<String, Vec<String>>) {
+        let after = replicated(&self.replication);
+        let groups: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+        for group in groups {
+            if before.get(group) != after.get(group) {
+                self.carried
+                    .push((author.to_string(), Edge::ReplicationChanged(group.clone())));
+            }
+        }
+    }
+
+    /// `author`'s publications, in order; `published` for each subject one
+    /// of them changed.
+    fn say(&mut self, author: &str, said: Vec<(Subject, String, Option<Value>)>) {
+        let mut changed: Vec<(String, Subject)> = Vec::new();
+        for (subject, name, value) in said {
+            let key = subject_key(&subject);
+            let full = format!("{author}/{name}");
+            let entry = self
+                .said
+                .entry(key.clone())
+                .or_insert_with(|| (subject.clone(), BTreeMap::new()));
+            let was = entry.1.get(&full).and_then(json);
+            let now = value.as_ref().and_then(json);
+            if was == now {
+                continue;
+            }
+            match value {
+                Some(value) => entry.1.insert(full, value),
+                None => entry.1.remove(&full),
+            };
+            if entry.1.is_empty() {
+                self.said.remove(&key);
+            }
+            if !changed.iter().any(|(k, _)| *k == key) {
+                changed.push((key, subject));
+            }
+        }
+        for (_, subject) in changed {
+            self.carried
+                .push((author.to_string(), Edge::Published(subject)));
+        }
+    }
+
+    fn snapshot(&self, routing: &RoutingTable, tables: &Tables) -> Snapshot {
         Snapshot {
+            placement: tables.placement.clone(),
+            executors: tables.executors.clone(),
+            replication: replicated(&self.replication),
+            said: self
+                .said
+                .iter()
+                .map(|(key, (_, said))| (key.clone(), said.clone()))
+                .collect(),
             groups: self.groups.clone(),
             pools: self.pools.clone(),
             published: self.published.clone(),
@@ -886,6 +1071,11 @@ fn json(value: &Value) -> Option<serde_json::Value> {
 }
 
 struct Snapshot {
+    /// What the programs' calls have committed, read-only.
+    placement: HashMap<String, wit::Placement>,
+    executors: HashMap<String, Vec<String>>,
+    replication: BTreeMap<String, Vec<String>>,
+    said: HashMap<String, BTreeMap<String, Value>>,
     groups: HashMap<String, crate::directory::Group>,
     pools: Vec<String>,
     published: HashMap<String, HashMap<String, serde_json::Value>>,
@@ -929,7 +1119,32 @@ impl Plane for Snapshot {
     }
 
     fn attr(&self, of: &Subject, name: &str) -> Option<Value> {
+        // What a cluster program published, under its name.
+        if let Some(said) = name
+            .strip_prefix("published/")
+            .and_then(|key| self.said.get(&subject_key(of))?.get(key))
+        {
+            return Some(said.clone());
+        }
         match of {
+            Subject::Process(id) if name.starts_with("placement/") => match name {
+                "placement/worker" => self.placement.get(id)?.worker.clone().and_then(text),
+                "placement/executors" => Some(Value::Json(
+                    serde_json::to_string(self.executors.get(id)?).unwrap_or_default(),
+                )),
+                _ => {
+                    let prop = name.strip_prefix("placement/props/")?;
+                    let placement = self.placement.get(id)?;
+                    placement
+                        .props
+                        .iter()
+                        .find(|(n, _)| n == prop)
+                        .map(|(_, value)| value.clone())
+                }
+            },
+            Subject::Group(id) if name == "replication/sites" => Some(Value::Json(
+                serde_json::to_string(self.replication.get(id)?).unwrap_or_default(),
+            )),
             Subject::Process(id) => {
                 let (proc, live) = match (self.procs.get(id), self.exited.get(id)) {
                     (Some(proc), _) => (proc, true),
@@ -1028,6 +1243,13 @@ impl Plane for Snapshot {
                         Role::Encode => "encode",
                     }),
                     "model" => text(worker.model.clone()),
+                    // The machine it serves from: workers sharing one share
+                    // a node's links.
+                    "host" => worker
+                        .addr
+                        .rsplit_once(':')
+                        .map(|(host, _)| host.trim_start_matches("tcp://"))
+                        .and_then(text),
                     "draining" => Some(Value::Boolean(worker.health != Health::Healthy)),
                     "pie/kv-pressure" => {
                         Some(Value::Int(i64::from(worker.coarse_load.kv_pressure_bucket)))
@@ -1161,7 +1383,7 @@ mod tests {
         ] {
             registry.apply(event, &mut edges);
         }
-        let plane = registry.snapshot(&table(0));
+        let plane = registry.snapshot(&table(0), &Tables::default());
         let of = |id: &str, name| format!("{:?}", plane.attr(&Subject::Process(id.into()), name));
         let int = |n| format!("{:?}", Some(Value::Int(n)));
         assert_eq!(of("1", "generated-tokens"), int(30));
@@ -1181,7 +1403,7 @@ mod tests {
         assert_eq!(worker("used-tokens"), int(250));
 
         registry.exited.clear();
-        let plane = registry.snapshot(&table(0));
+        let plane = registry.snapshot(&table(0), &Tables::default());
         assert!(
             plane
                 .attr(&Subject::Process("1".into()), "worker")
@@ -1208,7 +1430,7 @@ mod tests {
             },
             &mut edges,
         );
-        let plane = registry.snapshot(&table(0));
+        let plane = registry.snapshot(&table(0), &Tables::default());
         let of = |name| format!("{:?}", plane.attr(&Subject::Process("1".into()), name));
         assert_eq!(of("prompt-tokens"), format!("{:?}", Some(Value::Int(160))));
         assert_eq!(of("max-tokens"), format!("{:?}", Some(Value::Int(64))));
@@ -1242,7 +1464,7 @@ mod tests {
         ] {
             registry.apply(event, &mut edges);
         }
-        let plane = registry.snapshot(&table(0));
+        let plane = registry.snapshot(&table(0), &Tables::default());
         let of = |id: &str, name| format!("{:?}", plane.attr(&Subject::Process(id.into()), name));
         // 1000 bytes: fifteen whole 64-byte blocks, at a guessed 16 tokens each.
         assert_eq!(
@@ -1268,7 +1490,7 @@ mod tests {
             &mut edges,
         );
         assert!(matches!(&edges[..], [Edge::PropChanged(c)] if c.names == ["tool-eta-ms"]));
-        let plane = registry.snapshot(&table(0));
+        let plane = registry.snapshot(&table(0), &Tables::default());
         assert_eq!(plane.candidates(SubjectKind::Session), ["default/s"]);
         assert!(matches!(
             plane.prop(&Subject::Session("default/s".into()), "tool-eta-ms"),
@@ -1282,7 +1504,7 @@ mod tests {
             &mut edges,
         );
         assert!(matches!(&edges[..], [Edge::Closed(s)] if s == "default/s"));
-        let plane = registry.snapshot(&table(0));
+        let plane = registry.snapshot(&table(0), &Tables::default());
         assert!(
             plane
                 .prop(&Subject::Session("default/s".into()), "tool-eta-ms")
@@ -1455,5 +1677,200 @@ mod tests {
             .await
             .expect("the gateway is told to cancel it");
         assert_eq!(cancelled, Some(ReqId(2)));
+    }
+
+    fn placed(worker: &str, props: &[(&str, &str)]) -> wit::Placement {
+        wit::Placement {
+            process: String::new(),
+            worker: Some(worker.into()),
+            executors: Vec::new(),
+            props: props
+                .iter()
+                .map(|(n, v)| (n.to_string(), Value::Text(v.to_string())))
+                .collect(),
+        }
+    }
+
+    fn carried_kinds(registry: &mut Registry) -> Vec<(String, String)> {
+        std::mem::take(&mut registry.carried)
+            .into_iter()
+            .map(|(author, edge)| {
+                let what = match edge {
+                    Edge::PlacementChanged(id) => format!("placement {id}"),
+                    Edge::ReplicationChanged(id) => format!("replication {id}"),
+                    Edge::Published(subject) => format!("published {}", subject_key(&subject)),
+                    other => format!("{other:?}"),
+                };
+                (author, what)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_committed_placement_reads_as_attrs_and_its_change_is_carried_once() {
+        let mut registry = Registry::default();
+        let mut tables = Tables::default();
+        let before = placed_all(&tables);
+        tables
+            .placement
+            .insert("7".into(), placed("3", &[("tier", "gold")]));
+        tables
+            .executors
+            .insert("7".into(), vec!["5".into(), "4".into()]);
+        registry.carry_placements("a", &before, &placed_all(&tables));
+        assert_eq!(
+            carried_kinds(&mut registry),
+            [("a".to_string(), "placement 7".to_string())],
+            "one edge for the one process that changed, carried by its author"
+        );
+
+        let plane = registry.snapshot(&table(0), &tables);
+        let process = Subject::Process("7".into());
+        assert!(
+            matches!(plane.attr(&process, "placement/worker"), Some(Value::Text(w)) if w == "3")
+        );
+        assert!(
+            matches!(plane.attr(&process, "placement/executors"), Some(Value::Json(j)) if j == r#"["5","4"]"#)
+        );
+        assert!(
+            matches!(plane.attr(&process, "placement/props/tier"), Some(Value::Text(v)) if v == "gold")
+        );
+        assert!(plane.attr(&process, "placement/props/none").is_none());
+
+        // The same table again is no change.
+        let before = placed_all(&tables);
+        registry.carry_placements("b", &before, &placed_all(&tables));
+        assert!(carried_kinds(&mut registry).is_empty());
+    }
+
+    #[test]
+    fn a_published_value_reads_under_its_author_s_name_and_is_carried_only_when_it_changes() {
+        let mut registry = Registry::default();
+        let worker = Subject::Worker("1".into());
+        registry.published.insert(
+            "1".into(),
+            HashMap::from([("mark".to_string(), serde_json::json!("own"))]),
+        );
+        registry.say(
+            "a",
+            vec![(worker.clone(), "mark".into(), Some(Value::Int(3)))],
+        );
+        registry.say(
+            "b",
+            vec![(worker.clone(), "mark".into(), Some(Value::Int(4)))],
+        );
+        assert_eq!(
+            carried_kinds(&mut registry),
+            [
+                ("a".to_string(), "published worker:1".to_string()),
+                ("b".to_string(), "published worker:1".to_string()),
+            ]
+        );
+        let plane = registry.snapshot(&table(0), &Tables::default());
+        assert!(matches!(
+            plane.attr(&worker, "published/a/mark"),
+            Some(Value::Int(3))
+        ));
+        assert!(matches!(
+            plane.attr(&worker, "published/b/mark"),
+            Some(Value::Int(4))
+        ));
+        assert!(
+            matches!(plane.attr(&worker, "published/mark"), Some(Value::Text(t)) if t == "own"),
+            "the worker's own policy's value stands beside the programs'"
+        );
+
+        registry.say(
+            "a",
+            vec![(worker.clone(), "mark".into(), Some(Value::Int(3)))],
+        );
+        assert!(
+            carried_kinds(&mut registry).is_empty(),
+            "the same value again is no change"
+        );
+
+        registry.say("a", vec![(worker.clone(), "mark".into(), None)]);
+        assert_eq!(
+            carried_kinds(&mut registry),
+            [("a".to_string(), "published worker:1".to_string())]
+        );
+        let plane = registry.snapshot(&table(0), &Tables::default());
+        assert!(
+            plane.attr(&worker, "published/a/mark").is_none(),
+            "withdrawn"
+        );
+        assert!(matches!(
+            plane.attr(&worker, "published/b/mark"),
+            Some(Value::Int(4))
+        ));
+    }
+
+    #[test]
+    fn a_group_s_committed_replication_reads_as_its_sites() {
+        let mut registry = Registry::default();
+        let before = replicated(&registry.replication);
+        registry.replication = vec![wit::Replicate {
+            group: "g".into(),
+            upto: None,
+            at: vec![
+                wit::Site {
+                    worker: "2".into(),
+                    tier: wit::Tier::Host,
+                },
+                wit::Site {
+                    worker: "1".into(),
+                    tier: wit::Tier::Device,
+                },
+            ],
+        }];
+        registry.carry_replications("r", &before);
+        assert_eq!(
+            carried_kinds(&mut registry),
+            [("r".to_string(), "replication g".to_string())]
+        );
+        let plane = registry.snapshot(&table(0), &Tables::default());
+        assert!(
+            matches!(plane.attr(&Subject::Group("g".into()), "replication/sites"), Some(Value::Json(j)) if j == r#"["1","2"]"#)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_program_answers_another_s_placement_and_that_one_acts_on_the_answer() {
+        // test-route places the process on worker 1; test-share, told the
+        // placement changed, publishes it; test-route, told of that, names
+        // what it read as the process's executors.
+        let rig = rig_of(0, &["test-share", "test-route"]);
+        let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
+        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (worker, _, executors) = rig.router.placement(&placed);
+            if executors == [WorkerId(1)] {
+                assert_eq!(worker, Some(WorkerId(1)));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "executors never followed the published placement: {executors:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn any_number_of_programs_may_publish() {
+        let (_table, table_rx) = watch::channel(table(0));
+        let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::new()));
+        let share = builtins::policy("test-share").unwrap().component.to_vec();
+        assert!(
+            Cluster::start(
+                vec![("one".into(), share.clone()), ("two".into(), share)],
+                table_rx,
+                connected_rx,
+                crate::worker::WorkerRegistry::new(),
+            )
+            .is_ok(),
+            "each publishes under its own name"
+        );
     }
 }

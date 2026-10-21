@@ -25,7 +25,7 @@ in a compat body, or as `LaunchProcess.props`) and the session it names.
 | `session-affinity` | cluster | sends a session's processes where its last one went | the session |
 | `pool-replicate` | cluster | keeps every run some worker caches in every pool too, so it outlives the worker | |
 | `replicate` | cluster | keeps every run some worker caches on two decode workers (the two a hash of the run picks), in their host tier, so losing a worker leaves its runs on another | |
-| `disaggregate` | cluster | names the prefill workers (least loaded first) as every process's executors, so its passes are prefilled there; it writes executors alone, so `cache-aware` places processes beside it | |
+| `disaggregate` | cluster | names the prefill workers as every process's executors, so its passes are prefilled there: those on the host another program's committed placement put the process first, then the least loaded; it writes executors alone, so `cache-aware` places processes beside it | `placement/worker` |
 | `relocate` | cluster | places a launch by `worker`, then moves it to `move-to` once it has run `move-after-ms`; its stream goes on | `worker`, `move-to`, `move-after-ms` |
 | `drain-migrate` | cluster | moves every turn running on a draining worker to the least loaded one that is not, so a worker leaves without ending what it runs | |
 | `rebalance` | cluster | keeps running turns even across serving workers by moving the youngest from the busiest to the idlest (after Llumnix); a `worker` prop names where a launch starts | `worker` |
@@ -33,5 +33,13 @@ in a compat body, or as `LaunchProcess.props`) and the session it names.
 | `cluster-priority` | cluster | launches leave the gateway's queue by priority, and pass it on as `cluster/priority` | `priority` |
 
 Pair `cluster-priority` with the worker's `priority` and the two planes order
-alike. `test-*` policies misbehave on purpose and are built only for the
+alike.
+
+Cluster policies running side by side see each other through the host:
+what their calls committed reads as attrs (a process's `placement/worker`,
+`placement/executors` and `placement/props/<name>`, a group's
+`replication/sites`), and a policy granted `publish` says a value for the
+others as `published/<its name>/<name>`. A change reaches the others as an
+edge (`placement-changed`, `replication-changed`, `published`) on their
+next call; see `crates/policy/wit`. `test-*` policies misbehave on purpose and are built only for the
 hosts' own tests.

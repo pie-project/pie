@@ -1,5 +1,5 @@
 plane = "cluster"
-subscribe = ["arrived", "dispatched", "exited"]
+subscribe = ["arrived", "dispatched", "exited", "published"]
 grants = ["schedule", "placement", "executors", "terminate"]
 gate-ms = 50
 
@@ -18,3 +18,7 @@ doc = "Terminate it while it waits, for this reason."
 [props.stop]
 type = "boolean"
 doc = "Terminate it once it runs."
+
+[props.publish]
+type = "text"
+doc = "Publish it as `mark`; refused, for this program is not granted `publish`."

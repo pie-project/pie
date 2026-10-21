@@ -15,7 +15,7 @@ use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Store, StoreLimits, StoreLimitsBuilder, Trap};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use super::manifest::{Manifest, ManifestError};
+use super::manifest::{Manifest, ManifestError, NAMESPACED};
 
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
@@ -108,6 +108,8 @@ pub struct Commit {
     pub scale: Option<Vec<Scale>>,
     pub terminate: Vec<(String, String)>,
     pub state: StateCommit,
+    /// What the call published, in order: `None` withdraws a name.
+    pub publish: Vec<(Subject, String, Option<Value>)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -254,6 +256,7 @@ impl Program {
             scale: staged.scale,
             terminate: staged.terminate,
             state: staged.state,
+            publish: staged.publish,
         }
     }
 
@@ -281,7 +284,8 @@ fn start(
 
 /// Loads programs on a thread of their own named `thread`, which then runs
 /// `serve` with them; their manifests, or why one did not load, come back
-/// here. No two may be granted the same write: each table has one author.
+/// here. No two may be granted the same write: each table has one author
+/// (a namespaced grant, such as `publish`, writes under each holder's name).
 pub fn spawn(
     programs: Vec<(String, Vec<u8>)>,
     capability: fn(&str) -> bool,
@@ -302,7 +306,12 @@ pub fn spawn(
                 .and_then(|programs| {
                     let mut authors: HashMap<&str, &str> = HashMap::new();
                     for program in &programs {
-                        for grant in &program.manifest.grants {
+                        let owned = program
+                            .manifest
+                            .grants
+                            .iter()
+                            .filter(|grant| !NAMESPACED.contains(&grant.as_str()));
+                        for grant in owned {
                             if let Some(first) = authors.insert(grant, &program.name) {
                                 return Err(LoadError::Shared {
                                     grant: grant.clone(),
@@ -390,6 +399,9 @@ fn edge_name(edge: &Edge) -> &'static str {
         Edge::Dropped(_) => "dropped",
         Edge::TierPressure(_) => "tier-pressure",
         Edge::LinkChanged(_) => "link-changed",
+        Edge::PlacementChanged(_) => "placement-changed",
+        Edge::ReplicationChanged(_) => "replication-changed",
+        Edge::Published(_) => "published",
         Edge::Started(_) => "started",
         Edge::Paused(_) => "paused",
         Edge::Retained(_) => "retained",
@@ -410,6 +422,7 @@ struct Grants {
     transfer_shares: bool,
     acceptance: bool,
     discard: bool,
+    publish: bool,
 }
 
 struct HostState {
@@ -439,6 +452,7 @@ impl HostState {
                 transfer_shares: manifest.grants("transfer-shares"),
                 acceptance: manifest.grants("acceptance"),
                 discard: manifest.grants("discard"),
+                publish: manifest.grants("publish"),
             },
             call: None,
         }
@@ -489,6 +503,7 @@ struct Staged {
     scale: Option<Vec<Scale>>,
     terminate: Vec<(String, String)>,
     state: StateCommit,
+    publish: Vec<(Subject, String, Option<Value>)>,
     alarm: Option<u64>,
 }
 
@@ -592,6 +607,20 @@ impl cluster_writes::Host for HostState {
                 return Err(Refusal::DuplicateSubject);
             }
             state.call()?.staged.scale = Some(entries);
+            Ok(())
+        });
+    }
+
+    fn publish(&mut self, of: Subject, name: String, val: Option<Value>) {
+        self.write("publish", |state| {
+            if !state.grants.publish {
+                return Err(Refusal::NotGranted);
+            }
+            let staged = &mut state.call()?.staged;
+            if staged.publish.len() >= MAX_ENTRIES {
+                return Err(Refusal::TooLarge);
+            }
+            staged.publish.push((of, name, val));
             Ok(())
         });
     }

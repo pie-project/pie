@@ -23,8 +23,16 @@ impl cluster::Policy for Route {
                 worker: prop(&Subject::Process(p.clone()), "worker")
                     .text()
                     .map(str::to_string),
+                // Stated, or what `test-share` published of the worker
+                // this program placed it on.
                 executors: prop(&Subject::Process(p.clone()), "executors")
                     .text()
+                    .map(str::to_string)
+                    .or_else(|| {
+                        attr(&Subject::Process(p.clone()), "published/test-share/placed")
+                            .text()
+                            .map(str::to_string)
+                    })
                     .map(|ids| ids.split(',').map(str::to_string).collect())
                     .unwrap_or_default(),
                 props: vec![("from".to_string(), Value::Text(p.clone()))],
@@ -36,6 +44,9 @@ impl cluster::Policy for Route {
             let process = Subject::Process(p.clone());
             if let Some(reason) = prop(&process, "refuse").text() {
                 terminate(p, reason);
+            }
+            if let Some(mark) = prop(&process, "publish").text() {
+                cluster::publish(&process, "mark", Some(&Value::Text(mark.to_string())));
             }
             let running = attr(&process, "state").text() == Some("running");
             if running && prop(&process, "stop").boolean() == Some(true) {
