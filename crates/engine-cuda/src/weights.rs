@@ -1768,7 +1768,7 @@ fn lay_tile_banks(
         let shape = &trace.params[at].shape;
         let (&k, lead) = shape.split_last().unwrap_or((&0, &[]));
         let rows: u64 = lead.iter().product();
-        if rows == 0 || k == 0 || !rows.is_multiple_of(128) || !k.is_multiple_of(512) {
+        if rows == 0 || k == 0 || !rows.is_multiple_of(128) || !k.is_multiple_of(128) {
             continue;
         }
         // The factors plane is bound as bytes; its param states it f32.
