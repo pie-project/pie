@@ -191,14 +191,16 @@ pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) ->
     )
 }
 
-/// [`rmsnorm`] over at most eight bf16 rows that also lays the register
+/// [`rmsnorm`] (or [`rmsnorm_plus_one`]) over at most eight bf16 rows that also lays the register
 /// tile's input table of the normed rows in `table`, with `counters` arrival
 /// counters zeroed: the table `linear::quant`'s register matmul lays over `y`,
 /// bit for bit, so the projections of `y` run no table pass.
+#[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_table(
     ctx: &Ctx<'_>,
     x: Tensor,
     weight: Tensor,
+    plus_one: bool,
     eps: f32,
     y: Tensor,
     table: Tensor,
@@ -225,7 +227,7 @@ pub fn rmsnorm_table(
             eps.arg(),
             stated(OP, x.width)?.arg(),
             DENSE_BANK.arg(),
-            ABSOLUTE_BANK.arg(),
+            if plus_one { OFFSET_BANK } else { ABSOLUTE_BANK }.arg(),
             UNIT_GAIN.arg(),
             table.arg_mut(),
             y.rows.arg(),

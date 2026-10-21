@@ -9,6 +9,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/common/mpp.metal")),
     ),
     (
+        "common/register_table.metal",
+        include_str!(concat!(source_root!(), "/common/register_table.metal")),
+    ),
+    (
         "attn/q8_write.metal",
         include_str!(concat!(source_root!(), "/attn/q8_write.metal")),
     ),

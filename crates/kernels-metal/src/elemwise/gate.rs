@@ -83,19 +83,20 @@ pub fn sigmoid_mul_table(
         gate.rows == x.rows && gate.width == x.width && gate.dtype == x.dtype,
         "the gate plane rides the rectangle it gates"
     );
-    if x.rows > 8 || !x.width.is_multiple_of(64) {
+    if x.rows > 8 || !x.width.is_multiple_of(64) || x.width > 8192 {
         return Err(refuse(
             OP,
             format!(
-                "a register table holds at most 8 rows of whole 64-input groups, not {} x {}",
+                "a register table holds at most 8 rows of whole 64-input groups, and this \
+                 one stages at most 8192, not {} x {}",
                 x.rows, x.width
             ),
         ));
     }
     ctx.fire(
         Fire::at("elemwise/gate.metal", "gate_table_bfloat16").apply(Grid::of(
-            [x.width / 32, 8, 1],
-            [(x.width / 32).min(256), 1, 1],
+            [x.width.min(1024), 8, 1],
+            [x.width.min(1024), 1, 1],
         )),
         &[
             x.arg_mut(),

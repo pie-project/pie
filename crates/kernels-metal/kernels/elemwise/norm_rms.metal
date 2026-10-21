@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include "../common/register_table.metal"
 using namespace metal;
 
 template <typename T, int N_READS>
@@ -182,60 +183,19 @@ template <typename T, int N_READS>
   }
 }
 
-// The register tile's input table (`qmm_sg_table` in linear/quant_qmm_sg.metal)
-// of the rows this threadgroup's row is one of, laid from the normed row it
-// just wrote: each of the row's inputs at its lane slot, each 32 inputs' sum
-// added in the very order `qmm_sg_table` adds them, the rows past `rows`
-// zeroed by the first row's threadgroup, as are the split tile's `counters`
-// arrival counters. Bit for bit the table `qmm_sg_table` lays over `out`.
+// Lays row `row` of the register tile's input table from the normed row this
+// threadgroup just wrote at `outr`; the first row's threadgroup lays the rows
+// past `rows` as zeros and zeroes the split tile's `counters` arrival counters.
 METAL_FUNC void rms_lay_register_table(
     const device bfloat* outr, device bfloat* table, uint width, uint row,
     uint rows, uint counters, uint lid, uint tg_size) {
-  // The sums add in `qmm_sg_table`'s order, not one the compiler picks.
-#pragma clang fp reassociate(off)
   // The row's writes, seen by every thread of its threadgroup.
   threadgroup_barrier(mem_flags::mem_device);
-  device float* sums = reinterpret_cast<device float*>(table + 8 * ulong(width));
-  const uint c = row >> 1, r = row & 1;
-  // A thread per 32 inputs: group h = at / 2, half q = at % 2.
-  for (uint at = lid; at < width / 32; at += tg_size) {
-    const uint h = at >> 1, q = at & 1;
-    float part[2][2];
-    for (uint cl = 0; cl < 2; ++cl) {
-      const uint cp = 2 * q + cl;
-      for (uint i = 0; i < 2; ++i) {
-        const uint fm = 2 * cp + i;
-        float sum = 0.0f;
-        for (uint j = 0; j < 2; ++j)
-          for (uint p = 0; p < 4; ++p) {
-            const uint k = 64 * h + 8 * (2 * cp + j) + p + 4 * i;
-            const bfloat v = outr[k];
-            table[(ulong(h) * 32 + fm * 4 + c) * 16 + 8 * j + 2 * p + r] = v;
-            sum += float(v);
-          }
-        part[cl][i] = sum;
-      }
-    }
-    sums[(2 * ulong(h) + q) * 8 + row] = (part[0][0] + part[0][1]) + (part[1][0] + part[1][1]);
-  }
-  if (row != 0)
-    return;
-  for (uint gone = rows; gone < 8; ++gone) {
-    const uint gc = gone >> 1, gr = gone & 1;
-    for (uint at = lid; at < width / 32; at += tg_size) {
-      const uint h = at >> 1, q = at & 1;
-      for (uint cl = 0; cl < 2; ++cl)
-        for (uint i = 0; i < 2; ++i)
-          for (uint j = 0; j < 2; ++j)
-            for (uint p = 0; p < 4; ++p)
-              table[(ulong(h) * 32 + (2 * (2 * q + cl) + i) * 4 + gc) * 16 + 8 * j + 2 * p + gr] =
-                  bfloat(0.0f);
-      sums[(2 * ulong(h) + q) * 8 + gone] = 0.0f;
-    }
-  }
-  device uint* count = reinterpret_cast<device uint*>(sums) + width / 4;
-  for (uint at = lid; at < counters; at += tg_size)
-    count[at] = 0;
+  for (uint k = lid; k < width; k += tg_size)
+    table[register_table::slot(k, row)] = outr[k];
+  register_table::lay_sums(outr, table, width, row, lid, tg_size);
+  if (row == 0)
+    register_table::lay_rest(table, width, rows, counters, lid, tg_size);
 }
 
 // `residual_add_rms_single_row` that also lays the register tile's input table
