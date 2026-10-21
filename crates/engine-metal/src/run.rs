@@ -298,9 +298,9 @@ impl<'c> Run<'c> {
 
     /// When a projection of `value` may run on the register tile (a 4-bit,
     /// 64-group bank over at most eight rows, a whole number of the tile's
-    /// 64 columns), the arrival counters the widest such projection's split
-    /// may take: the producer of `value` then lays the tile's input table
-    /// with that many zeroed, and the projections read it.
+    /// 64 columns), the arrival counters the widest split one takes: the
+    /// producer of `value` then lays the tile's input table with that many
+    /// zeroed, and the projections read it.
     pub(crate) fn register_readers(&self, value: ValueId) -> Option<u32> {
         use poem_ir::{Linear, Operation};
         let x = self.tensor(value);
@@ -315,14 +315,21 @@ impl<'c> Run<'c> {
         self.readers_of(value)
             .iter()
             .filter_map(|&at| match &self.nodes.get(at as usize)?.op {
-                Operation::Linear(Linear::Matmul { act, w, y }) if *act == value => {
+                Operation::Linear(Linear::Matmul { act, w, y } | Linear::LmHead { act, w, y })
+                    if *act == value =>
+                {
                     let bank = self.banked(*w)?;
                     let columns = self.tensor(*y).width;
+                    let (Ok(cols), Ok(k)) = (i32::try_from(columns), i32::try_from(x.width)) else {
+                        return None;
+                    };
+                    let split =
+                        kernels_metal::linear::quant::register_split(cols, k, self.tuning.cores());
                     (bank.bits == 4
                         && bank.group == 64
                         && bank.biases.is_some()
                         && columns.is_multiple_of(64))
-                    .then_some(columns / 64)
+                    .then_some(if split > 1 { columns / 64 } else { 0 })
                 }
                 _ => None,
             })

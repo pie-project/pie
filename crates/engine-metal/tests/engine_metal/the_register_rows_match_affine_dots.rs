@@ -720,3 +720,82 @@ fn a_gate_and_a_gated_norm_lay_the_table_their_out_projection_reads() {
     }
     eprintln!("checked {checked} tables a gate or a gated norm laid");
 }
+
+/// A plain RMS norm that lays the register tile's input table lands the rows
+/// the plain norm lands and the table its projections lay, the counters zeroed.
+#[test]
+fn a_plain_norm_lays_the_table_its_projections_read() {
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(&device, bytes.len() as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let n = 4096u32;
+    let counters = n / 64;
+    for k in [2048u32, 512] {
+        let table_rows = (17 * k + 4 * counters).div_ceil(2 * k);
+        for m in [1u32, 6, 8] {
+            let x: Vec<u8> = (0..m * k)
+                .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0x81)) - 127.0) * 0.37))
+                .collect();
+            let w: Vec<u8> = (0..k)
+                .flat_map(|at| bf16(0.3 + f32::from(noise(u64::from(at) ^ 0x82)) / 97.0))
+                .collect();
+            let x_t = Tensor::new(bind(&upload(&x)), m, k, Dtype::Bf16);
+            let w_t = Tensor::new(bind(&upload(&w)), 1, k, Dtype::Bf16);
+            let plain = Tensor::new(
+                bind(&upload(&vec![0; (m * k * 2) as usize])),
+                m,
+                k,
+                Dtype::Bf16,
+            );
+            let laid = Tensor::new(
+                bind(&upload(&vec![0; (m * k * 2) as usize])),
+                m,
+                k,
+                Dtype::Bf16,
+            );
+            let th = bind(&upload(&vec![0xa5; (table_rows * k * 2) as usize]));
+            let frame = device.frame().expect("frame");
+            let sink = Sink::new(&device, &frame, &pipelines, &handles);
+            kernels_metal::elemwise::norm::rmsnorm(&sink, x_t, w_t, 1e-6, plain).expect("norm");
+            kernels_metal::elemwise::norm::rmsnorm_table(
+                &sink,
+                x_t,
+                w_t,
+                1e-6,
+                laid,
+                Tensor::new(th, table_rows, k, Dtype::F16),
+                counters,
+            )
+            .expect("norm and table");
+            frame.commit().expect("commit");
+            let bytes = u64::from(m * k * 2);
+            assert!(
+                handles.read(plain.buf, bytes).expect("read")
+                    == handles.read(laid.buf, bytes).expect("read"),
+                "k={k} M={m}: the table-laying norm lands other rows"
+            );
+            let table = handles
+                .read(th, u64::from(table_rows * k * 2))
+                .expect("read");
+            let own = own_table(&device, &handles, &pipelines, plain, n);
+            assert!(
+                table[..(17 * k) as usize] == own[..],
+                "k={k} M={m}: another table"
+            );
+            assert!(
+                table[(17 * k) as usize..(17 * k + 4 * counters) as usize]
+                    .iter()
+                    .all(|&b| b == 0),
+                "k={k} M={m}: an arrival counter left standing"
+            );
+        }
+    }
+}
