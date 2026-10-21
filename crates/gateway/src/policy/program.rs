@@ -100,7 +100,11 @@ pub struct StateCommit {
 #[derive(Debug, Default)]
 pub struct Commit {
     pub schedule: Option<Table>,
+    /// Where each process runs, and its props: what `placement` grants.
     pub placement: Option<HashMap<String, Placement>>,
+    /// The workers each process's passes run on, best first: what
+    /// `executors` grants. Empty lists are left out.
+    pub executors: Option<HashMap<String, Vec<String>>>,
     pub scale: Option<Vec<Scale>>,
     pub terminate: Vec<(String, String)>,
     pub state: StateCommit,
@@ -246,6 +250,7 @@ impl Program {
         Commit {
             schedule: staged.schedule,
             placement: staged.placement,
+            executors: staged.executors,
             scale: staged.scale,
             terminate: staged.terminate,
             state: staged.state,
@@ -397,6 +402,7 @@ fn edge_name(edge: &Edge) -> &'static str {
 struct Grants {
     schedule: bool,
     placement: bool,
+    executors: bool,
     scale: bool,
     terminate: bool,
     replication: bool,
@@ -425,6 +431,7 @@ impl HostState {
             grants: Grants {
                 schedule: manifest.grants("schedule"),
                 placement: manifest.grants("placement"),
+                executors: manifest.grants("executors"),
                 scale: manifest.grants("scale"),
                 terminate: manifest.grants("terminate"),
                 replication: manifest.grants("replication"),
@@ -478,6 +485,7 @@ impl Call {
 struct Staged {
     schedule: Option<Table>,
     placement: Option<HashMap<String, Placement>>,
+    executors: Option<HashMap<String, Vec<String>>>,
     scale: Option<Vec<Scale>>,
     terminate: Vec<(String, String)>,
     state: StateCommit,
@@ -540,14 +548,33 @@ impl cluster_writes::Host for HostState {
         });
     }
 
+    /// Each part of a placement is its own write: where a process runs and
+    /// its props under `placement`, the workers its passes run on under
+    /// `executors`; what the policy is not granted it does not write.
     fn install_placement(&mut self, entries: Vec<Placement>) {
         self.write("install-placement", |state| {
-            if !state.grants.placement {
+            let grants = (state.grants.placement, state.grants.executors);
+            if grants == (false, false) {
                 return Err(Refusal::NotGranted);
             }
             let entries = entries.into_iter().map(|p| (p.process.clone(), p));
-            let table = by_subject(entries.collect())?;
-            state.call()?.staged.placement = Some(table);
+            let mut table = by_subject(entries.collect())?;
+            let staged = &mut state.call()?.staged;
+            if grants.1 {
+                staged.executors = Some(
+                    table
+                        .iter_mut()
+                        .filter(|(_, p)| !p.executors.is_empty())
+                        .map(|(process, p)| (process.clone(), std::mem::take(&mut p.executors)))
+                        .collect(),
+                );
+            }
+            if grants.0 {
+                for placement in table.values_mut() {
+                    placement.executors.clear();
+                }
+                staged.placement = Some(table);
+            }
             Ok(())
         });
     }

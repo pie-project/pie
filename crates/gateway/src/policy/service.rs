@@ -46,6 +46,8 @@ fn hex(key: &[u8; 32]) -> String {
 struct Tables {
     schedule: Option<Table>,
     placement: HashMap<String, wit::Placement>,
+    /// Each process's executors, best first.
+    executors: HashMap<String, Vec<String>>,
 }
 
 struct Shared {
@@ -306,8 +308,16 @@ impl Cluster {
     /// workers its passes may run on, best first.
     pub fn placement(&self, req: &Request) -> (Option<WorkerId>, Props, Vec<WorkerId>) {
         let tables = self.shared.tables.read().unwrap();
-        let Some(placement) = tables.placement.get(&req.req_id.0.to_string()) else {
-            return (None, Props::new(), Vec::new());
+        let id = req.req_id.0.to_string();
+        let executors = tables
+            .executors
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.parse().ok().map(WorkerId))
+            .collect();
+        let Some(placement) = tables.placement.get(&id) else {
+            return (None, Props::new(), executors);
         };
         let worker = placement
             .worker
@@ -318,11 +328,6 @@ impl Cluster {
             .props
             .iter()
             .filter_map(|(name, value)| Some((name.clone(), json(value)?)))
-            .collect();
-        let executors = placement
-            .executors
-            .iter()
-            .filter_map(|id| id.parse().ok().map(WorkerId))
             .collect();
         (worker, props, executors)
     }
@@ -514,6 +519,9 @@ fn withdraw(shared: &Shared, registry: &mut Registry, manifest: &super::manifest
         if manifest.grants("placement") {
             tables.placement.clear();
         }
+        if manifest.grants("executors") {
+            tables.executors.clear();
+        }
     }
     if manifest.grants("replication") {
         registry.replication.clear();
@@ -585,6 +593,9 @@ fn enact(shared: &Shared, registry: &mut Registry, commit: Commit) {
         if let Some(schedule) = commit.schedule {
             tables.schedule = Some(schedule);
             changed = true;
+        }
+        if let Some(executors) = commit.executors {
+            tables.executors = executors;
         }
         if let Some(placement) = commit.placement {
             // A running process given another worker moves there.
@@ -1358,6 +1369,22 @@ mod tests {
         let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
         rig.router.admit(&placed, &rig.routing).await.unwrap();
         assert_eq!(rig.router.placement(&placed).0, Some(WorkerId(1)));
+    }
+
+    #[tokio::test]
+    async fn a_placement_s_parts_have_an_author_each() {
+        let (_table, table_rx) = watch::channel(table(0));
+        let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::new()));
+        assert!(
+            Cluster::start(
+                programs(&["cache-aware", "disaggregate"]),
+                table_rx,
+                connected_rx,
+                crate::worker::WorkerRegistry::new(),
+            )
+            .is_ok(),
+            "one places processes, the other names their executors"
+        );
     }
 
     #[tokio::test]

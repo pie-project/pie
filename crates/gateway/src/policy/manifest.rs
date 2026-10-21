@@ -32,6 +32,7 @@ const EDGES: &[&str] = &[
 const GRANTS: &[&str] = &[
     "schedule",
     "placement",
+    "executors",
     "scale",
     "terminate",
     "replication",

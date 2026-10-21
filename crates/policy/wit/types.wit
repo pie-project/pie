@@ -136,7 +136,9 @@ interface types {
         /// process given another worker migrates there (`placement.migrate`).
         worker: option<id>,
         /// Workers its passes may run on, best first. Empty leaves them
-        /// to the worker plane's host.
+        /// to the worker plane's host. Written under the `executors` grant;
+        /// `worker` and `props` under `placement`, so two programs may each
+        /// write their part.
         executors: list<id>,
         /// Passed on with the process; the worker plane sees each as
         /// prop `cluster/<name>`.

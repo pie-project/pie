@@ -1,6 +1,6 @@
 plane = "cluster"
 subscribe = ["arrived", "dispatched", "exited"]
-grants = ["schedule", "placement", "terminate"]
+grants = ["schedule", "placement", "executors", "terminate"]
 gate-ms = 50
 
 [props.key]
