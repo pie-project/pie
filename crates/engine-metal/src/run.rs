@@ -1111,6 +1111,18 @@ impl<'c> Run<'c> {
         Some((room, standing))
     }
 
+    /// The register tile's input table room for `value`, laid by the op that
+    /// writes `value` (with the counters its widest register projection may
+    /// take zeroed), when a projection of it runs on the register tile:
+    /// recorded as standing, so the projections read it.
+    pub(crate) fn producer_table(&self, value: ValueId) -> Option<(Tensor, u32)> {
+        let counters = self.register_readers(value)?;
+        let width = self.tensor(value).width;
+        let rows = (17 * width + 4 * counters).div_ceil(2 * width);
+        let (table, _) = self.register_table(value, rows, width, counters)?;
+        Some((table, counters))
+    }
+
     pub(crate) fn partials(&self, rows: u32, width: u32) -> Option<Tensor> {
         if !self.scratch.partials_clear_of_precast() {
             self.table.set(None);

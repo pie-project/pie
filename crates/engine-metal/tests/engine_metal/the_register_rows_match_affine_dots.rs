@@ -546,3 +546,177 @@ fn a_swiglu_lays_the_table_its_down_reads() {
     }
     eprintln!("checked {checked} tables a swiglu laid");
 }
+
+/// The table a matmul of `act` (`m` x `k`) over an `n`-column bank lays, byte
+/// for byte as far as its inputs and sums go.
+fn own_table(
+    device: &Context,
+    handles: &Handles,
+    pipelines: &Pipelines,
+    act: Tensor,
+    n: u32,
+) -> Vec<u8> {
+    let (m, k) = (act.rows, act.width);
+    let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"register\", \"qmv\"]", false);
+    let (bank, _planes) = bank_of(device, handles, k, n, 0x5);
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(device, bytes.len() as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let table_rows = (17 * k + 4 * (n / 64)).div_ceil(2 * k);
+    let (table_b, partial_b, out_b) = (
+        upload(&vec![0xa5; (table_rows * k * 2) as usize]),
+        upload(&vec![0xa5; (64 * n * 4) as usize]),
+        upload(&vec![0; (m * n * 2) as usize]),
+    );
+    let (th, ph) = (bind(&table_b), bind(&partial_b));
+    let precast = |rows: u32, width: u32| {
+        (rows <= table_rows && width == k).then(|| Tensor::new(th, rows, width, Dtype::F16))
+    };
+    let partials = |rows: u32, width: u32| {
+        (rows <= 64 && width == n).then(|| Tensor::new(ph, rows, width, Dtype::F32))
+    };
+    let frame = device.frame().expect("frame");
+    let sink = Sink::new(device, &frame, pipelines, handles);
+    quant::matmul(
+        &sink,
+        &tuning,
+        act,
+        bank,
+        Tensor::new(bind(&out_b), m, n, Dtype::Bf16),
+        quant::Scratch {
+            precast: &precast,
+            partials: &partials,
+            table: None,
+        },
+        8,
+    )
+    .expect("register");
+    frame.commit().expect("commit");
+    handles.read(th, u64::from(17 * k)).expect("read")
+}
+
+/// The attention gate and the gated RMS norm that lay the register tile's
+/// input table of their rows land the rows the plain ops land and the table
+/// the out projection lays over them, byte for byte, the counters zeroed.
+#[test]
+fn a_gate_and_a_gated_norm_lay_the_table_their_out_projection_reads() {
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(&device, bytes.len() as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let n = 2048u32;
+    let counters = n / 64;
+    let mut checked = 0;
+    for k in [4096u32, 1024] {
+        let table_rows = (17 * k + 4 * counters).div_ceil(2 * k);
+        for m in [1u32, 5, 8] {
+            let plane = |salt: u64, scale: f32| -> Vec<u8> {
+                (0..m * k)
+                    .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ salt)) - 127.0) * scale))
+                    .collect()
+            };
+            let check = |plain: Tensor, laid: Tensor, th: u32, what: &str| {
+                let bytes = u64::from(m * k * 2);
+                assert!(
+                    handles.read(plain.buf, bytes).expect("read")
+                        == handles.read(laid.buf, bytes).expect("read"),
+                    "{what} k={k} M={m}: the table-laying op lands other rows"
+                );
+                let table = handles
+                    .read(th, u64::from(table_rows * k * 2))
+                    .expect("read");
+                let own = own_table(&device, &handles, &pipelines, plain, n);
+                let first = table[..(17 * k) as usize]
+                    .iter()
+                    .zip(&own)
+                    .position(|(a, b)| a != b);
+                assert!(
+                    first.is_none(),
+                    "{what} k={k} M={m}: another table from byte {first:?}"
+                );
+                assert!(
+                    table[(17 * k) as usize..(17 * k + 4 * counters) as usize]
+                        .iter()
+                        .all(|&b| b == 0),
+                    "{what} k={k} M={m}: an arrival counter left standing"
+                );
+            };
+            // The attention gate, in place.
+            let attn = plane(0x61, 0.05);
+            let gate = Tensor::new(bind(&upload(&plane(0x62, 0.09))), m, k, Dtype::Bf16);
+            let plain = Tensor::new(bind(&upload(&attn)), m, k, Dtype::Bf16);
+            let laid = Tensor::new(bind(&upload(&attn)), m, k, Dtype::Bf16);
+            let th = bind(&upload(&vec![0xa5; (table_rows * k * 2) as usize]));
+            let frame = device.frame().expect("frame");
+            let sink = Sink::new(&device, &frame, &pipelines, &handles);
+            kernels_metal::elemwise::gate::sigmoid_mul(&sink, gate, plain).expect("gate");
+            kernels_metal::elemwise::gate::sigmoid_mul_table(
+                &sink,
+                gate,
+                laid,
+                Tensor::new(th, table_rows, k, Dtype::F16),
+                counters,
+            )
+            .expect("gate and table");
+            frame.commit().expect("commit");
+            check(plain, laid, th, "gate");
+            // The gated norm over f32 rows of 128-wide heads.
+            let x: Vec<u8> = (0..m * k)
+                .flat_map(|at| {
+                    ((f32::from(noise(u64::from(at) ^ 0x71)) - 127.0) * 0.013).to_le_bytes()
+                })
+                .collect();
+            let w: Vec<u8> = (0..128u32)
+                .flat_map(|at| (0.6 + f32::from(noise(u64::from(at) ^ 0x72)) / 300.0).to_le_bytes())
+                .collect();
+            let x_t = Tensor::new(bind(&upload(&x)), m, k, Dtype::F32);
+            let w_t = Tensor::new(bind(&upload(&w)), 1, 128, Dtype::F32);
+            let z = Tensor::new(bind(&upload(&plane(0x73, 0.07))), m, k, Dtype::Bf16);
+            let plain = Tensor::new(
+                bind(&upload(&vec![0; (m * k * 2) as usize])),
+                m,
+                k,
+                Dtype::Bf16,
+            );
+            let laid = Tensor::new(
+                bind(&upload(&vec![0; (m * k * 2) as usize])),
+                m,
+                k,
+                Dtype::Bf16,
+            );
+            let th = bind(&upload(&vec![0xa5; (table_rows * k * 2) as usize]));
+            let frame = device.frame().expect("frame");
+            let sink = Sink::new(&device, &frame, &pipelines, &handles);
+            kernels_metal::elemwise::norm::rmsnorm_gated(
+                &sink, x_t, z, w_t, 128, 1e-6, false, plain,
+            )
+            .expect("gated norm");
+            kernels_metal::elemwise::norm::rmsnorm_gated_table(
+                &sink,
+                x_t,
+                z,
+                w_t,
+                128,
+                1e-6,
+                laid,
+                Tensor::new(th, table_rows, k, Dtype::F16),
+                counters,
+            )
+            .expect("gated norm and table");
+            frame.commit().expect("commit");
+            check(plain, laid, th, "gated norm");
+            checked += 2;
+        }
+    }
+    eprintln!("checked {checked} tables a gate or a gated norm laid");
+}

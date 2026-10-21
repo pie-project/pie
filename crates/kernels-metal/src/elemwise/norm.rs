@@ -363,6 +363,58 @@ pub fn rmsnorm_gated(
     )
 }
 
+/// [`rmsnorm_gated`] with the SiLU gate over at most eight rows that also
+/// lays the register tile's input table of `y` in `table`, with `counters`
+/// arrival counters zeroed: the table `linear::quant`'s register matmul lays
+/// over `y`, bit for bit, so the out projection runs no table pass.
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm_gated_table(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    gate: Tensor,
+    weight: Tensor,
+    head_dim: u32,
+    eps: f32,
+    y: Tensor,
+    table: Tensor,
+    counters: u32,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.rmsnorm_gated";
+    debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
+    debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
+    dtype_dispatch!(OP, gate.dtype, { Bf16 => () });
+    let vd = head_width(OP, head_dim)?;
+    if x.width == 0 || !x.width.is_multiple_of(vd) || !vd.is_multiple_of(32) || y.rows > 8 {
+        return Err(refuse(
+            OP,
+            format!(
+                "a register table takes at most 8 rows of whole 32-input heads' halves, not {} \
+                 rows of {}-wide heads",
+                y.rows, vd
+            ),
+        ));
+    }
+    let lanes = head_row_grid(OP, vd, x.width / vd, x.rows)?;
+    ctx.fire(
+        Fire::at(
+            "elemwise/norm_gated_rms.metal",
+            "gated_rms_table_f32_bfloat16",
+        )
+        .apply(Grid::of(lanes, [vd, 1, 1])),
+        &[
+            x.arg(),
+            gate.arg(),
+            weight.arg(),
+            y.arg_mut(),
+            eps.arg(),
+            stated(OP, vd)?.arg(),
+            table.arg_mut(),
+            y.rows.arg(),
+            counters.arg(),
+        ],
+    )
+}
+
 pub fn rmsnorm_gated_by(
     ctx: &Ctx<'_>,
     x: Tensor,

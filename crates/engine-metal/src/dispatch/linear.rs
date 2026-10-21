@@ -337,13 +337,7 @@ impl Run<'_> {
                 None => {
                     // The down projection on the register tile reads its
                     // input table as the activation lays it.
-                    let laid = self.register_readers(*y).and_then(|counters| {
-                        let width = self.tensor(*y).width;
-                        let rows = (17 * width + 4 * counters).div_ceil(2 * width);
-                        let (table, _) = self.register_table(*y, rows, width, counters)?;
-                        Some((table, counters))
-                    });
-                    match laid {
+                    match self.producer_table(*y) {
                         Some((table, counters)) => linear::mlp::swiglu_table(
                             self.ctx(),
                             self.tensor(*packed),

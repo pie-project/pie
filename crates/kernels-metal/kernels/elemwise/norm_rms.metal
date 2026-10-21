@@ -191,6 +191,8 @@ template <typename T, int N_READS>
 METAL_FUNC void rms_lay_register_table(
     const device bfloat* outr, device bfloat* table, uint width, uint row,
     uint rows, uint counters, uint lid, uint tg_size) {
+  // The sums add in `qmm_sg_table`'s order, not one the compiler picks.
+#pragma clang fp reassociate(off)
   // The row's writes, seen by every thread of its threadgroup.
   threadgroup_barrier(mem_flags::mem_device);
   device float* sums = reinterpret_cast<device float*>(table + 8 * ulong(width));
