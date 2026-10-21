@@ -552,8 +552,8 @@ inline float2 gdn_verify_gates(
 // `kVerifyChunk` rows' normed q and k, the group's value rows, decay and beta
 // in threadgroup memory, every row's loads issued side by side, so a row of
 // the walk reads no device memory; `gated_delta_scan_committed` loaded each
-// row's inputs behind the row before, and a verify walk of a dozen rows
-// spent most of its time waiting on them. A replayed row only folds into the
+// row's inputs behind the row before, so a verify walk of a dozen rows
+// waited on a dozen loads in turn. A replayed row only folds into the
 // state: its readout was landed the fire that first ran it. A row of this
 // fire's own lands its readout in `y` at its own row, where the window reads
 // it. At 32 lanes the arithmetic is `gdn_scan_token`'s, so the bits are the
