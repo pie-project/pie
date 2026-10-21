@@ -712,6 +712,20 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused(
     const bf16* in_row = qkvz + row * QW;
     const int span = K - 1;
 
+    // This head's state, in flight under the conv and the ticket.
+    const int cg = tid % CG, rg = tid / CG, j0 = cg * VEC;
+    bf16* head = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * KD * VD;
+    u32x4 sp[Q];
+#pragma unroll
+    for (int q = 0; q < Q; ++q) sp[q] = state_load(head + (rg + RG * q) * VD + j0);
+
+    // The gates, as `ssm_gdn_prep_ba_gates` lands them.
+    const float bb = to_f32(ba[row * 2 * V_h + h]);
+    const float za = to_f32(ba[row * 2 * V_h + V_h + h]) + to_f32(dt_bias[h]);
+    const float softplus = za > 20.f ? za : log1pf(__expf(za));
+    const float g_log = -__expf(a_log[h]) * softplus;
+    const float beta = 1.f / (1.f + __expf(-bb));
+
     // The conv over this block's channels: q and k of its key head, v of
     // its own; every read in flight before any is used.
     int ch[CPT];
@@ -774,19 +788,7 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused(
         }
     }
 
-    // The gates, as `ssm_gdn_prep_ba_gates` lands them.
-    const float bb = to_f32(ba[row * 2 * V_h + h]);
-    const float za = to_f32(ba[row * 2 * V_h + V_h + h]) + to_f32(dt_bias[h]);
-    const float softplus = za > 20.f ? za : log1pf(__expf(za));
-    const float g_log = -__expf(a_log[h]) * softplus;
-    const float beta = 1.f / (1.f + __expf(-bb));
-
     // The recurrence, as `ssm_gdn_decode_rows` walks it.
-    const int cg = tid % CG, rg = tid / CG, j0 = cg * VEC;
-    bf16* head = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * KD * VD;
-    u32x4 sp[Q];
-#pragma unroll
-    for (int q = 0; q < Q; ++q) sp[q] = state_load(head + (rg + RG * q) * VD + j0);
     const bool fold = folds_uniform(write_state, mask, rl);
     float qi[Q], ki[Q], vv[VEC];
 #pragma unroll
