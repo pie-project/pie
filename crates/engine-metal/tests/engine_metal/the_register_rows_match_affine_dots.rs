@@ -769,3 +769,143 @@ fn register_tables_on_this_gpu() {
     a_gate_lays_the_table_its_out_projection_reads();
     eprintln!("every register table producer matched qmm_sg_table on this GPU");
 }
+
+/// A segment launch lands each of its matmuls' bits as that matmul's own
+/// launch lands them: a GDN in-projection and its gates, a query, key and
+/// value, and segments of other contractions, at five to eight rows, each at
+/// its own split (one, two, four or eight partitions side by side), over one
+/// table; and every walk of the tile lands the default walk's bits.
+#[test]
+fn a_segment_launch_lands_each_matmuls_bits() {
+    use kernels_metal::linear::quant::Segment;
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(&device, bytes.len().max(16) as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let partials_b = upload(&vec![0xa5; 8 << 20]);
+    let partials = Tensor::new(bind(&partials_b), 1, 2 << 20, Dtype::F32);
+    let mut checked = 0;
+    for (k, widths) in [
+        (2048u32, &[12288u32, 64][..]),
+        (2048, &[8192, 512, 512][..]),
+        (4096, &[2048, 64, 1024][..]),
+        (512, &[1024, 2048][..]),
+    ] {
+        let banks: Vec<(Bank, [Buffer; 3])> = widths
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| bank_of(&device, &handles, k, n, 0x51 + i as u64))
+            .collect();
+        for m in [5u32, 8] {
+            let x: Vec<u8> = (0..m * k)
+                .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0x2468)) - 127.0) * 0.021))
+                .collect();
+            let x_b = upload(&x);
+            let act = Tensor::new(bind(&x_b), m, k, Dtype::Bf16);
+            let outputs = |fill: u8| -> Vec<Buffer> {
+                widths.iter().map(|&n| upload(&vec![fill; (m * n * 2) as usize])).collect()
+            };
+            let segments = |ys: &[Buffer]| -> Vec<Segment> {
+                banks
+                    .iter()
+                    .zip(ys)
+                    .zip(widths)
+                    .map(|(((bank, _), y), &n)| Segment {
+                        w: *bank,
+                        y: Tensor::new(bind(y), m, n, Dtype::Bf16),
+                        split: quant::register_split(n as i32, k as i32, Some(20)),
+                    })
+                    .collect()
+            };
+            let (counters, floats) = quant::segments_scratch(&segments(&outputs(0)), m);
+            assert!(floats <= 2 << 20, "the test's partials hold the segments' sums");
+            let rows = quant::register_table_rows(k as i32, counters as i32);
+            let table_b = upload(&vec![0xa5; (rows * k * 2) as usize]);
+            let table = Tensor::new(bind(&table_b), rows, k, Dtype::Bf16);
+            let read = |ys: &[Buffer]| -> Vec<Vec<u8>> {
+                ys.iter()
+                    .map(|y| handles.read(bind(y), y.bytes()).expect("read"))
+                    .collect()
+            };
+            // each matmul its own launch, on the default walk: the reference
+            let alone = outputs(0x5a);
+            let frame = device.frame().expect("frame");
+            let sink = Sink::new(&device, &frame, &pipelines, &handles);
+            quant::register_table(&sink, act, table, m as i32, k as i32, counters as i32)
+                .expect("table");
+            for s in segments(&alone) {
+                let n = s.y.width as i32;
+                quant::register_matmul(
+                    &sink,
+                    s.w,
+                    s.w.biases.expect("biases"),
+                    table,
+                    s.y,
+                    (m as i32, n, k as i32, n, k as i32),
+                    s.split,
+                    (s.split > 1).then_some(partials),
+                    quant::REGISTER_WALK,
+                )
+                .expect("matmul");
+            }
+            frame.commit().expect("commit");
+            let reference = read(&alone);
+            for walk in [quant::REGISTER_WALK, (2, 2), (4, 4), (4, 2)] {
+                let (own, one) = (outputs(0x5a), outputs(0x3c));
+                let frame = device.frame().expect("frame");
+                let sink = Sink::new(&device, &frame, &pipelines, &handles);
+                for s in segments(&own) {
+                    let n = s.y.width as i32;
+                    quant::register_matmul(
+                        &sink,
+                        s.w,
+                        s.w.biases.expect("biases"),
+                        table,
+                        s.y,
+                        (m as i32, n, k as i32, n, k as i32),
+                        s.split,
+                        (s.split > 1).then_some(partials),
+                        walk,
+                    )
+                    .expect("matmul");
+                }
+                quant::register_segments(
+                    &sink,
+                    &segments(&one),
+                    table,
+                    m as i32,
+                    k as i32,
+                    Some(partials),
+                    walk,
+                )
+                .expect("segments");
+                frame.commit().expect("commit");
+                assert!(
+                    read(&own) == reference,
+                    "K={k} {widths:?} M={m}: walk {walk:?} lands other bits than the default walk"
+                );
+                assert!(
+                    read(&one) == reference,
+                    "K={k} {widths:?} M={m}: the segment launch on walk {walk:?} lands other bits \
+                     than its matmuls' own launches"
+                );
+                checked += 1;
+            }
+            // the launches put every arrival counter back to zero
+            let laid = handles.read(bind(&table_b), table_b.bytes()).expect("read");
+            let at = (17 * k) as usize;
+            assert!(
+                laid[at..at + 4 * counters as usize].iter().all(|&b| b == 0),
+                "K={k} {widths:?} M={m}: a segment launch left an arrival counter standing"
+            );
+        }
+    }
+    eprintln!("checked {checked} segment launches against their matmuls' own");
+}

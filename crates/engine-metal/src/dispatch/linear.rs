@@ -264,6 +264,115 @@ impl Run<'_> {
         ane.after(self.ctx(), plan, out)
     }
 
+    /// The matmuls of `act` the trace places right after the one by `w` into
+    /// `y` (a GDN layer's in-projection then its gates; a query, key and
+    /// value) in one register-tile launch with it, when every one of them
+    /// runs on the register tile and their outputs stand clear of each other
+    /// and of `act`: each lands as its own launch would land it, bit for bit,
+    /// and the later ones' nodes find it done ([`Run::landed_ahead`]).
+    /// False where they run as their own launches.
+    fn matmul_segments(
+        &self,
+        act: poem_ir::ValueId,
+        w: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> Result<bool, kernels_metal::Error> {
+        use linear::quant::{Segment, register_split};
+        use poem_ir::Operation;
+        let readers = self.readers_of(act);
+        let matmul = |at: u32| match self.nodes().get(at as usize).map(|n| &n.op) {
+            Some(Operation::Linear(Linear::Matmul { act: a, w, y })) if *a == act => Some((*w, *y)),
+            _ => None,
+        };
+        let Some(&first) = readers.iter().find(|&&at| matmul(at) == Some((w, y))) else {
+            return Ok(false);
+        };
+        let mut members = vec![(w, y)];
+        while members.len() < 3 {
+            let at = first + members.len() as u32;
+            match matmul(at).filter(|_| readers.contains(&at)) {
+                Some(next) => members.push(next),
+                None => break,
+            }
+        }
+        if members.len() < 2 {
+            return Ok(false);
+        }
+        let x = self.tensor(act);
+        let (m, k) = (x.rows, x.width);
+        let mut segments = Vec::with_capacity(members.len());
+        for &(w, y) in &members {
+            let out = self.tensor(y);
+            let fits = self.register_counters(act, w, out.width).is_some()
+                && out.rows == m
+                && self
+                    .ane()
+                    .and_then(|ane| ane.plan_columns(w, m))
+                    .is_none();
+            let Some(bank) = self.banked(w).filter(|b| fits && b.ld % 256 == 0) else {
+                return Ok(false);
+            };
+            let split = register_split(
+                i32::try_from(out.width).unwrap_or(0),
+                i32::try_from(k).unwrap_or(0),
+                self.tuning().cores(),
+            );
+            segments.push(Segment { w: bank, y: out, split });
+        }
+        // Every output its own bytes, apart from each other and the activation.
+        let span = |t: kernels_metal::Tensor| {
+            self.address(t.buf).map(|(slab, at)| {
+                (slab, at, at + u64::from(t.rows) * u64::from(t.width) * 2)
+            })
+        };
+        let mut spans = vec![span(x)];
+        spans.extend(segments.iter().map(|s| span(s.y)));
+        let Some(spans) = spans.into_iter().collect::<Option<Vec<_>>>() else {
+            return Ok(false);
+        };
+        for (i, a) in spans.iter().enumerate() {
+            for b in &spans[i + 1..] {
+                if a.0 == b.0 && a.1 < b.2 && b.1 < a.2 {
+                    return Ok(false);
+                }
+            }
+        }
+        let (counters, floats) = linear::quant::segments_scratch(&segments, m);
+        // Each split segment sums as its own launch would, or they run alone.
+        let partials = if floats > 0 {
+            match self.partials(1, floats) {
+                Some(partials) => Some(partials),
+                None => return Ok(false),
+            }
+        } else {
+            None
+        };
+        let (m, k, counters) = (
+            i32::try_from(m).unwrap_or(0),
+            i32::try_from(k).unwrap_or(0),
+            i32::try_from(counters).unwrap_or(0),
+        );
+        let rows = linear::quant::register_table_rows(k, counters);
+        let Some((table, laid)) = self.register_table(act, rows, x.width, counters.unsigned_abs())
+        else {
+            return Ok(false);
+        };
+        if !laid {
+            linear::quant::register_table(self.ctx(), x, table, m, k, counters)?;
+        }
+        linear::quant::register_segments(
+            self.ctx(),
+            &segments,
+            table,
+            m,
+            k,
+            partials,
+            linear::quant::REGISTER_WALK,
+        )?;
+        self.land_ahead([members.get(1).map(|s| s.1), members.get(2).map(|s| s.1)]);
+        Ok(true)
+    }
+
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
         match op {
             Linear::MlpRelu2 { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
@@ -280,7 +389,14 @@ impl Run<'_> {
             }
             Linear::Matmul { act, w, y } => match self.banked(*w) {
                 Some(bank) => {
+                    // A segment launch of an earlier matmul of this activation landed it.
+                    if self.landed_ahead(*y) {
+                        return Ok(());
+                    }
                     let x = self.tensor(*act);
+                    if self.matmul_segments(*act, *w, *y)? {
+                        return Ok(());
+                    }
                     if let Some((ane, plan)) = self
                         .ane()
                         .and_then(|ane| Some((ane, ane.plan_columns(*w, x.rows)?)))

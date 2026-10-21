@@ -185,6 +185,19 @@ pub struct Run<'c> {
 
     /// The register tile's input table the precast room holds, if one does.
     table: std::cell::Cell<Option<Laid>>,
+
+    /// The outputs a segment launch landed ahead of their own matmuls.
+    landed: std::cell::Cell<Option<Landed>>,
+}
+
+/// The outputs of the matmuls after a segment launch's first (at most two),
+/// which the launch landed at `rows` of region `region`: each of those
+/// matmuls, reached at the same place, has nothing left to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Landed {
+    ys: [Option<ValueId>; 2],
+    region: u32,
+    rows: Rows,
 }
 
 /// A register-tile input table standing in the precast room: `act`'s rows as
@@ -274,6 +287,7 @@ impl<'c> Run<'c> {
             chain: std::cell::Cell::new(None),
             readers: std::cell::OnceCell::new(),
             table: std::cell::Cell::new(None),
+            landed: std::cell::Cell::new(None),
         }
     }
 
@@ -286,7 +300,7 @@ impl<'c> Run<'c> {
     }
 
     /// The nodes that read `value`, in trace order.
-    fn readers_of(&self, value: ValueId) -> &[u32] {
+    pub(crate) fn readers_of(&self, value: ValueId) -> &[u32] {
         use poem_ir::Operands as _;
         let readers = self.readers.get_or_init(|| {
             let mut readers = vec![Vec::new(); self.values.len()];
@@ -309,9 +323,10 @@ impl<'c> Run<'c> {
 
     /// When a projection of `value` may run on the register tile (a 4-bit,
     /// 64-group bank over at most eight rows, a whole number of the tile's
-    /// 64 columns), the arrival counters the widest split one takes: the
-    /// producer of `value` then lays the tile's input table with that many
-    /// zeroed, and the projections read it. A fused MLP's gate-up is one.
+    /// 64 columns), the arrival counters its split projections take together
+    /// (a segment launch of several takes theirs side by side): the producer
+    /// of `value` then lays the tile's input table with that many zeroed, and
+    /// the projections read it. A fused MLP's gate-up is one.
     pub(crate) fn register_readers(&self, value: ValueId) -> Option<u32> {
         use poem_ir::{Fused, Linear, Operation};
         self.readers_of(value)
@@ -332,7 +347,7 @@ impl<'c> Run<'c> {
                 }
                 _ => None,
             })
-            .max()
+            .reduce(|a, b| a + b)
     }
 
     /// When the projection of `act` by bank `w` into `columns` columns runs on
@@ -1137,20 +1152,7 @@ impl<'c> Run<'c> {
             .unwrap_or_else(|fault| {
                 panic!("the precast plane this load reserved does not mint: {fault}")
             });
-        let window = self.window();
-        let rows = if window.gathered.is_some() || window.passes > 1 {
-            Rows::Region(
-                self.place.region.get(),
-                self.place.run.get(),
-                self.place.tail.get(),
-            )
-        } else {
-            Rows::Span(
-                [window.span, window.patch, window.voxel],
-                window.pass,
-                self.place.tail.get(),
-            )
-        };
+        let rows = self.rows_here();
         let standing = self.table.get().is_some_and(|laid| {
             laid.act == act
                 && laid.rows == rows
@@ -1166,6 +1168,54 @@ impl<'c> Run<'c> {
             }));
         }
         Some((room, standing))
+    }
+
+    /// The rows of a value the walk's place reads ([`Rows`]).
+    fn rows_here(&self) -> Rows {
+        let window = self.window();
+        if window.gathered.is_some() || window.passes > 1 {
+            Rows::Region(
+                self.place.region.get(),
+                self.place.run.get(),
+                self.place.tail.get(),
+            )
+        } else {
+            Rows::Span(
+                [window.span, window.patch, window.voxel],
+                window.pass,
+                self.place.tail.get(),
+            )
+        }
+    }
+
+    /// Records that a segment launch here landed `ys`, the outputs of the
+    /// matmuls that follow its first.
+    pub(crate) fn land_ahead(&self, ys: [Option<ValueId>; 2]) {
+        self.landed.set(Some(Landed {
+            ys,
+            region: self.place.region.get(),
+            rows: self.rows_here(),
+        }));
+    }
+
+    /// Whether a segment launch at this place already landed `y`; it is then
+    /// struck off, and the matmul writing it has nothing to do. Anywhere
+    /// else the matmul runs again, which lands the same values.
+    pub(crate) fn landed_ahead(&self, y: ValueId) -> bool {
+        let Some(mut landed) = self.landed.get() else {
+            return false;
+        };
+        if landed.region != self.place.region.get() || landed.rows != self.rows_here() {
+            self.landed.set(None);
+            return false;
+        }
+        let Some(at) = landed.ys.iter().position(|&v| v == Some(y)) else {
+            return false;
+        };
+        landed.ys[at] = None;
+        self.landed
+            .set(landed.ys.iter().any(Option::is_some).then_some(landed));
+        true
     }
 
     /// The register tile's input table room for `value`, laid by the op that
