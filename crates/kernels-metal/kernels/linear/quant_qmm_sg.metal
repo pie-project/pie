@@ -71,7 +71,7 @@ __attribute__((always_inline)) inline vec<bfloat, V> factors(const device bfloat
 // lane `l` of the simdgroup at column `column - fm`. `stride` is the bank's row stride, `width`
 // the table's contraction. Each group's chain closes into `acc` in group order, `U` groups a
 // step, their scales and biases `V` groups a load.
-template <int U, int V, bool LAZY>
+template <int U, int V>
 __attribute__((always_inline)) inline void walk(const device uint *weights, const device bfloat *scales,
                                                 const device bfloat *biases, const device bfloat *table,
                                                 int width, int stride, uint column, Lane l, int first,
@@ -102,21 +102,13 @@ __attribute__((always_inline)) inline void walk(const device uint *weights, cons
   for (int h0 = first; h0 < last; h0 += U) {
     uint2 cw[U][NF];
     float2 ck[U][NF];
-    vec<bfloat, V> cs[NF][FV], cb[NF][FV];
-#pragma unroll
-    for (int f = 0; f < NF; ++f)
-#pragma unroll
-      for (int v = 0; v < FV; ++v)
-        cs[f][v] = qs[f][v], cb[f][v] = qb[f][v];
 #pragma unroll
     for (int u = 0; u < U; ++u)
 #pragma unroll
       for (int f = 0; f < NF; ++f) {
         cw[u][f] = q[u][f];
-        if constexpr (!LAZY) {
-          const float s = float(cs[f][u / V][u % V]);
-          ck[u][f] = float2(s, fma(-128.0f, s, float(cb[f][u / V][u % V])));
-        }
+        const float s = float(qs[f][u / V][u % V]);
+        ck[u][f] = float2(s, fma(-128.0f, s, float(qb[f][u / V][u % V])));
       }
     if (h0 + U < last) {
 #pragma unroll
@@ -153,11 +145,6 @@ __attribute__((always_inline)) inline void walk(const device uint *weights, cons
                         *reinterpret_cast<const device float2 *>(sums + (2 * ulong(h) + 1) * 8 + l.fn);
 #pragma unroll
       for (int f = 0; f < NF; ++f) {
-        if constexpr (LAZY) {
-          // the scale and bias closing the chain, made as it closes
-          const float s = float(cs[f][u / V][u % V]);
-          ck[u][f] = float2(s, fma(-128.0f, s, float(cb[f][u / V][u % V])));
-        }
         acc[f] = fma(d[f], ck[u][f].x, acc[f]);
         acc[f] = fma(sm, ck[u][f].y, acc[f]);
       }
@@ -288,7 +275,7 @@ __attribute__((always_inline)) inline device atomic_uint *counters(const device 
 }
 
 // One matmul: a threadgroup per 64-column tile (x) and partition (y) of `SPLIT`.
-template <int SPLIT, int U, int V, bool LAZY>
+template <int SPLIT, int U, int V>
 [[kernel]] void
 affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
               const device bfloat *biases [[buffer(2)]], const device bfloat *table [[buffer(3)]],
@@ -303,14 +290,14 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
   const uint column = position.x * 32 * NF + simd * 8 * NF + l.fm;
   const int2 span = partition(width, SPLIT, int(position.y));
   float2 acc[NF];
-  walk<U, V, LAZY>(weights, scales, biases, table, width, stride, column, l, span.x, span.y, acc);
+  walk<U, V>(weights, scales, biases, table, width, stride, column, l, span.x, span.y, acc);
   threadgroup uint arrival;
   land(acc, output, columns, rows, column, l, SPLIT, position.y, partials,
        counters(table, width) + position.x, simd * 32 + lane, arrival);
 }
 
-#define PIE_SG_POINT(name, split, u, v, lazy)                                                      \
-  template [[host_name(name)]] [[kernel]] void affine_qmm_sg<split, u, v, lazy>(                   \
+#define PIE_SG_POINT(name, split, u, v)                                                            \
+  template [[host_name(name)]] [[kernel]] void affine_qmm_sg<split, u, v>(                         \
       const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
       device bfloat *, constant int &, constant int &, device float *, constant int &,             \
       constant int &, uint2, uint, uint);
@@ -323,7 +310,7 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
 // threadgroups: segment s takes columns[s] / 64 x splits[s] of them, partition-major, after the
 // segments before it; a split segment's partials follow those of the split segments before it in
 // `partials`, and its tiles' arrival counters theirs in the table.
-template <int S, int U, int V, bool LAZY>
+template <int S, int U, int V>
 [[kernel]] void
 affine_qmm_sg_segments(const device uint *w0 [[buffer(0)]], const device bfloat *s0 [[buffer(1)]],
                        const device bfloat *b0 [[buffer(2)]], device bfloat *y0 [[buffer(3)]],
@@ -372,15 +359,15 @@ affine_qmm_sg_segments(const device uint *w0 [[buffer(0)]], const device bfloat 
   const uint column = tile * 32 * NF + simd * 8 * NF + l.fm;
   const int2 span = partition(width, split, int(part));
   float2 acc[NF];
-  walk<U, V, LAZY>(weights, scales, biases, table, width, strides[s], uint(offsets[s]) + column, l, span.x,
+  walk<U, V>(weights, scales, biases, table, width, strides[s], uint(offsets[s]) + column, l, span.x,
              span.y, acc);
   threadgroup uint arrival;
   land(acc, output, n, rows, column, l, split, part, partials + floats_before,
        counters(table, width) + tiles_before + tile, simd * 32 + lane, arrival);
 }
 
-#define PIE_SG_SEGMENTS(name, s, u, v, lazy)                                                       \
-  template [[host_name(name)]] [[kernel]] void affine_qmm_sg_segments<s, u, v, lazy>(              \
+#define PIE_SG_SEGMENTS(name, s, u, v)                                                             \
+  template [[host_name(name)]] [[kernel]] void affine_qmm_sg_segments<s, u, v>(                    \
       const device uint *, const device bfloat *, const device bfloat *, device bfloat *,          \
       const device uint *, const device bfloat *, const device bfloat *, device bfloat *,          \
       const device uint *, const device bfloat *, const device bfloat *, device bfloat *,          \
