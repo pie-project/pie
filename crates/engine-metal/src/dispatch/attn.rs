@@ -739,46 +739,15 @@ impl Run<'_> {
                 y,
                 ..
             } if self.rs_seat().is_some() => {
-                const OP: &str = "attention.ssm_causal_conv1d_committed";
                 let seat = self.rs_seat().expect("guarded");
-                let ext_y = self.rs_out(OP, &seat, *y)?;
-                // The verify conv lands the window's own rows itself, and
-                // through the page table reads and lands the buffer's too.
-                if attn::ssm::causal_conv1d_verify_fits(ext_y.width, *conv_width, *dilation) {
-                    let paged = seat.paged(self.handles(), *x);
-                    let source = match paged {
-                        Some(_) => self.tensor(*x),
-                        None => self.rs_extend(OP, &seat, *x)?,
-                    };
-                    return attn::ssm::causal_conv1d_verify(
-                        self.ctx(),
-                        source,
-                        paged,
-                        self.qo_indptr(),
-                        &self.rs_committed(&seat),
-                        self.tensor(*weight),
-                        &self.recurrent(*state),
-                        *conv_width,
-                        *dilation,
-                        ext_y,
-                        self.tensor(*y),
-                        self.rs_snapshots(),
-                    );
-                }
-                let ext_x = self.rs_extend(OP, &seat, *x)?;
-                attn::ssm::causal_conv1d_committed_landing(
-                    self.ctx(),
-                    ext_x,
-                    self.qo_indptr(),
-                    &self.rs_committed(&seat),
-                    self.tensor(*weight),
-                    &self.recurrent(*state),
-                    *conv_width,
-                    *dilation,
-                    ext_y,
-                    self.rs_snapshots(),
-                )?;
-                self.rs_land(OP, &seat, ext_y, *y)
+                let conv = crate::rs::Convolved {
+                    x: *x,
+                    weight: self.tensor(*weight),
+                    state: *state,
+                    conv_width: *conv_width,
+                    dilation: *dilation,
+                };
+                self.rs_convolve(&seat, &conv, *y).map(|_| ())
             }
             Attention::SsmGdnPrep {
                 ba,
@@ -787,12 +756,14 @@ impl Run<'_> {
                 gates,
             } if self.rs_seat().is_some() => {
                 let seat = self.rs_seat().expect("guarded");
-                // The scan that reads the gates derives them as it stages
-                // its rows, and lands the window's own.
-                seat.prepped
-                    .borrow_mut()
-                    .insert(gates.0, (*ba, self.tensor(*dt_bias), self.tensor(*a_log)));
-                Ok(())
+                let prep = (*ba, self.tensor(*dt_bias), self.tensor(*a_log));
+                // The scan that alone reads the gates derives them as it
+                // stages its rows, and lands the window's own.
+                if self.read_only_by_scan(*gates) {
+                    seat.prepped.borrow_mut().insert(gates.0, prep);
+                    return Ok(());
+                }
+                self.rs_prep(&seat, prep, *gates)
             }
             Attention::SsmGatedDelta {
                 qkv,
@@ -851,11 +822,8 @@ impl Run<'_> {
                 }
                 // Heads the verify scan does not stage take the gate prep
                 // the verify scan would have folded in.
-                if let Some((ba, dt_bias, a_log)) = prepped {
-                    let ext_ba = self.rs_extend(OP, &seat, ba)?;
-                    let ext_gates = self.rs_out(OP, &seat, *gates)?;
-                    attn::ssm::gdn_prep(self.ctx(), ext_ba, dt_bias, a_log, ext_gates)?;
-                    self.rs_land(OP, &seat, ext_gates, *gates)?;
+                if let Some(prep) = prepped {
+                    self.rs_prep(&seat, prep, *gates)?;
                 }
                 let ext_gates = self.rs_ext_of(OP, &seat, *gates)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;

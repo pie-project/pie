@@ -385,8 +385,11 @@ constant constexpr int kConvVerifyHeld = 4;
 // scan reads, and a row of the window's own in `land` too, at its own row.
 // The window as of `commit` rows is read before any of it is written back:
 // the bank is read and written in place. Through a page table (`paged`), `x`
-// is the window's own rows: the replayed rows are read from the lane's
-// buffer, and the window's own rows land there for the next fire.
+// is the window's own rows, `x_pitch` apart: the replayed rows are read from
+// the lane's buffer, and the window's own rows land there for the next fire.
+// Where `x` is the packed `[x | z]` projection the window's split would have
+// cut, its own rows' `z` lands in `z` (`z_width` wide), the split's other
+// half.
 template <typename T>
 [[kernel]] void causal_conv1d_verify(
     const device T* x              [[buffer(0)]],
@@ -411,6 +414,9 @@ template <typename T>
     const constant uint& page_bytes [[buffer(19)]],
     const constant uint& row_bytes [[buffer(20)]],
     const constant int& paged      [[buffer(21)]],
+    const constant int& x_pitch    [[buffer(22)]],
+    device T* z                    [[buffer(23)]],
+    const constant int& z_width    [[buffer(24)]],
     uint3 pos [[thread_position_in_grid]],
     uint3 at [[thread_position_in_threadgroup]],
     uint3 shape [[threads_per_threadgroup]]) {
@@ -457,7 +463,7 @@ template <typename T>
     if (src < rep) {
       return float4(*buffered(src));
     }
-    return float4(*reinterpret_cast<const device vec<T, 4>*>(x + size_t(own + src) * chans + col));
+    return float4(*reinterpret_cast<const device vec<T, 4>*>(x + size_t(own + src) * size_t(x_pitch) + col));
   };
 
   if (live) {
@@ -482,8 +488,13 @@ template <typename T>
       *reinterpret_cast<device vec<T, 4>*>(y + size_t(begin + t) * chans + col) = out;
       if (t >= rep) {
         *reinterpret_cast<device vec<T, 4>*>(land + size_t(own + t) * chans + col) = out;
+        const device T* row = x + size_t(own + t) * size_t(x_pitch);
         if (buffers) {
-          *buffered(t) = *reinterpret_cast<const device vec<T, 4>*>(x + size_t(own + t) * chans + col);
+          *buffered(t) = *reinterpret_cast<const device vec<T, 4>*>(row + col);
+        }
+        if (z_width > 0 && c < z_width) {
+          *reinterpret_cast<device vec<T, 4>*>(z + size_t(own + t) * size_t(z_width) + col) =
+              *reinterpret_cast<const device vec<T, 4>*>(row + chans + col);
         }
       }
     }
@@ -526,6 +537,7 @@ template <typename T>
       const constant int&, const constant int&, const device int*,      \
       const constant int&, device uchar*, const device int*,            \
       const constant uint&, const constant uint&, const constant uint&, \
+      const constant int&, const constant int&, device itype*,          \
       const constant int&, uint3, uint3, uint3);
 
 instantiate_causal_conv1d_verify(bfloat16, bfloat)

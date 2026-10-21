@@ -1,8 +1,8 @@
-use kernels_metal::attn::ssm::Committed;
+use kernels_metal::attn::{self, ssm::Committed};
 use kernels_metal::{Error, Tensor, layout};
-use poem_ir::ValueId;
+use poem_ir::{Attention, Operation, ValueId};
 
-use crate::rs::Seat;
+use crate::rs::{Convolved, Seat};
 use crate::run::Run;
 
 fn extended_origin(
@@ -243,5 +243,164 @@ impl Run<'_> {
             )?;
         }
         self.rs_flush(&copies)
+    }
+
+    /// Whether `gates` is read by one node alone, a gated-delta scan.
+    pub(crate) fn read_only_by_scan(&self, gates: ValueId) -> bool {
+        matches!(
+            self.sole_reader(gates).map(|node| &node.op),
+            Some(Operation::Attention(
+                Attention::SsmGatedDelta { gates: read, .. }
+                    | Attention::SsmGatedDeltaChunked { gates: read, .. }
+            )) if *read == gates
+        )
+    }
+
+    /// Runs the gate prep over the extended `[b | a]` rows, landing the
+    /// window's own gates in `gates`.
+    pub(crate) fn rs_prep(
+        &self,
+        seat: &Seat,
+        (ba, dt_bias, a_log): (ValueId, Tensor, Tensor),
+        gates: ValueId,
+    ) -> Result<(), Error> {
+        const OP: &str = "attention.ssm_gdn_prep";
+        let ext_ba = self.rs_extend(OP, seat, ba)?;
+        let ext_gates = self.rs_out(OP, seat, gates)?;
+        attn::ssm::gdn_prep(self.ctx(), ext_ba, dt_bias, a_log, ext_gates)?;
+        self.rs_land(OP, seat, ext_gates, gates)
+    }
+
+    /// Whether a split of `x` at `width` into `left` and `right` is left to
+    /// the verify conv that alone reads `left`, through the page table and
+    /// before anything reads `right`: it reads its own rows from `x` and
+    /// lands `right` itself.
+    pub(crate) fn rs_split_into_conv(
+        &self,
+        x: ValueId,
+        width: u32,
+        left: ValueId,
+        right: ValueId,
+    ) -> bool {
+        let Some(seat) = self.rs_seat() else {
+            return false;
+        };
+        let &[at] = self.readers(left) else {
+            return false;
+        };
+        let Some(Operation::Attention(
+            Attention::SsmCausalConv1d {
+                x: input,
+                conv_width,
+                dilation,
+                ..
+            }
+            | Attention::SsmCausalConv1dChunked {
+                x: input,
+                conv_width,
+                dilation,
+                ..
+            },
+        )) = self.nodes().get(at as usize).map(|node| &node.op)
+        else {
+            return false;
+        };
+        let z = self.tensor(right).width;
+        let fits = *input == left
+            && attn::ssm::causal_conv1d_verify_fits(width, *conv_width, *dilation)
+            && z <= width
+            && z.is_multiple_of(4)
+            && seat.paged(self.handles(), left).is_some()
+            && self.readers(right).iter().all(|&reader| reader > at);
+        if fits {
+            seat.split.borrow_mut().insert(left.0, (x, right));
+        }
+        fits
+    }
+
+    /// Runs the window's conv into the extended plane, landing the window's
+    /// own rows in `y`, and returns the extended plane.
+    pub(crate) fn rs_convolve(
+        &self,
+        seat: &Seat,
+        conv: &Convolved,
+        y: ValueId,
+    ) -> Result<Tensor, Error> {
+        const OP: &str = "attention.ssm_causal_conv1d_committed";
+        let ext_y = self.rs_out(OP, seat, y)?;
+        let split = seat.split.borrow_mut().remove(&conv.x.0);
+        // The verify conv lands the window's own rows itself, and through the
+        // page table reads and lands the buffer's too, and the split's other
+        // half where it reads the packed rows.
+        let paged = seat.paged(self.handles(), conv.x);
+        let fits =
+            attn::ssm::causal_conv1d_verify_fits(ext_y.width, conv.conv_width, conv.dilation);
+        if let (Some((packed, right)), Some(_), true) = (split, paged, fits) {
+            return attn::ssm::causal_conv1d_verify(
+                self.ctx(),
+                self.tensor(packed),
+                paged,
+                Some(attn::ssm::VerifySplit {
+                    z: self.tensor(right),
+                }),
+                self.qo_indptr(),
+                &self.rs_committed(seat),
+                conv.weight,
+                &self.recurrent(conv.state),
+                conv.conv_width,
+                conv.dilation,
+                ext_y,
+                self.tensor(y),
+                self.rs_snapshots(),
+            )
+            .map(|()| ext_y);
+        }
+        // A split left to a conv that cannot take it is cut here.
+        if let Some((packed, right)) = split {
+            layout::split_rows(
+                self.ctx(),
+                self.tensor(packed),
+                ext_y.width,
+                self.tensor(conv.x),
+                self.tensor(right),
+            )?;
+        }
+        if fits {
+            let source = match paged {
+                Some(_) => self.tensor(conv.x),
+                None => self.rs_extend(OP, seat, conv.x)?,
+            };
+            attn::ssm::causal_conv1d_verify(
+                self.ctx(),
+                source,
+                paged,
+                None,
+                self.qo_indptr(),
+                &self.rs_committed(seat),
+                conv.weight,
+                &self.recurrent(conv.state),
+                conv.conv_width,
+                conv.dilation,
+                ext_y,
+                self.tensor(y),
+                self.rs_snapshots(),
+            )?;
+            return Ok(ext_y);
+        }
+        let ext_x = self.rs_extend(OP, seat, conv.x)?;
+        attn::ssm::causal_conv1d_committed_landing(
+            self.ctx(),
+            ext_x,
+            self.qo_indptr(),
+            &self.rs_committed(seat),
+            conv.weight,
+            &self.recurrent(conv.state),
+            conv.conv_width,
+            conv.dilation,
+            ext_y,
+            self.rs_snapshots(),
+        )?;
+        self.rs_land(OP, seat, ext_y, y)?;
+        Ok(ext_y)
     }
 }
