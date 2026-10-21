@@ -112,9 +112,14 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     } else {
         lane_run
     };
+    // The pages it writes: bf16, or e4m3 under a unit scale.
+    let fp8 = crate::attn::kv::native_e4m3(pool);
+    if !fp8 && !crate::attn::kv::native_bf16(pool) {
+        return Err(refuse(OP, "the fused write lands bf16 or e4m3 pages"));
+    }
     let warped = matches!(head_dim, 64 | 128 | 256 | 512).then(|| {
         format!(
-            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32({head_dim}), false, ::pie::i32({run})>"
+            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32({head_dim}), false, ::pie::i32({run}), {fp8}>"
         )
     });
     let heads_a_wave = 64 / (head_dim.unsigned_abs() / run);
@@ -172,7 +177,14 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
             ],
         );
     }
-    // The block-a-head kernel turns half-head pairs under norms alone.
+    // The block-a-head kernel turns half-head pairs under norms alone, into
+    // bf16 pages.
+    if fp8 {
+        return Err(refuse(
+            OP,
+            format!("a {head_dim}-wide head's fused write into e4m3 pages wants 16-byte-aligned planes"),
+        ));
+    }
     if !classic {
         return Err(refuse(
             OP,

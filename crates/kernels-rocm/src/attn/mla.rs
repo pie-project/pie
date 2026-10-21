@@ -19,6 +19,9 @@ struct Layer {
     page_size: i32,
     kv_lora_rank: i32,
     rope_dim: i32,
+    /// The pool holds fp8 rows (`kv::mla_fp8_rows`), the matrix-core walks'
+    /// alone.
+    fp8: bool,
 }
 
 impl Layer {
@@ -28,13 +31,37 @@ impl Layer {
         kv_lora_rank: u32,
         rope_dim: i32,
     ) -> Result<Self, Error> {
+        let fp8 = kv::mla_fp8_rows(pool);
+        let kv_lora_rank = stated(op, kv_lora_rank)?;
+        if fp8
+            && (kv_lora_rank != latent::RANK
+                || i64::from(pool.keys.width) != i64::from(kv_lora_rank + rope_dim)
+                || !latent::supported(kv_lora_rank, rope_dim))
+        {
+            return Err(refuse(
+                op,
+                format!(
+                    "fp8 latent rows of {} codes hold a 512 latent and its 64 or no rotated dims, \
+                     and this attention reads {kv_lora_rank} + {rope_dim}",
+                    pool.keys.width
+                ),
+            ));
+        }
         Ok(Self {
             ckv_pages: pool.keys.ptr,
             kpe_pages: pool.values.ptr,
             page_size: pool.page_size,
-            kv_lora_rank: stated(op, kv_lora_rank)?,
+            kv_lora_rank,
             rope_dim,
+            fp8,
         })
+    }
+
+    /// The scores' scale in the log2 domain, an fp8 row's unit folded in
+    /// (its codes read as half their value).
+    fn scale_log2(&self, sm_scale: f32) -> f32 {
+        let unit = if self.fp8 { 2.0 } else { 1.0 };
+        sm_scale * unit * core::f32::consts::LOG2_E
     }
 }
 
@@ -440,6 +467,18 @@ pub fn kv_append(
         k_pe.rows, kv_c.data.rows,
         "the rope plane is appended beside the latent plane, one row each"
     );
+    if kv::mla_fp8_rows(pool)
+        && (kv_c.data.width != 512 || pool.keys.width != kv_c.data.width + k_pe.width)
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "fp8 latent rows of {} codes hold a 512 latent and its rotated dims, and this \
+                 append brings {} + {}",
+                pool.keys.width, kv_c.data.width, k_pe.width
+            ),
+        ));
+    }
     kv::write_mla_to_pages(
         ctx,
         OP,
@@ -632,10 +671,6 @@ pub(crate) mod latent {
         (rank == RANK || rank == 2 * RANK) && (rope == 0 || rope == 64)
     }
 
-    fn scale_log2(sm_scale: f32) -> f32 {
-        sm_scale * core::f32::consts::LOG2_E
-    }
-
     fn by_value<P>(params: &P) -> ArgValue {
         ArgValue::Bytes {
             ptr: core::ptr::from_ref(params).cast::<u8>(),
@@ -784,12 +819,15 @@ pub(crate) mod latent {
             partial_lse: at(float, info.partial_lse_offset),
             num_heads,
             page_size: layer.page_size,
-            scale_log2: scale_log2(sm_scale),
+            scale_log2: layer.scale_log2(sm_scale),
             causal: i32::from(causal),
         };
         #[allow(clippy::cast_sign_loss)]
         let grid = [info.num_blks_x as u32, info.num_blks_y as u32, 1];
-        let entry = symbol(&format!("::pie::attn::mla::mla_paged<{}>", layer.rope_dim));
+        let entry = symbol(&format!(
+            "::pie::attn::mla::mla_paged<{}, {}>",
+            layer.rope_dim, layer.fp8
+        ));
         ctx.fire(
             op,
             Fire::at(FILE, entry).apply(Launch::grid(grid, [THREADS, 1, 1])),
@@ -836,6 +874,7 @@ pub(crate) mod latent {
         op: &'static str,
         rank: i32,
         rope: i32,
+        fp8: bool,
         rows: u32,
         mut g: Gather,
     ) -> Result<(), Error> {
@@ -865,7 +904,9 @@ pub(crate) mod latent {
         if let ArgValue::Ptr(win) = ctx.stage() {
             g.win = win;
         }
-        let entry = symbol(&format!("::pie::attn::mla::latent_gather<{rope}, {rank}>"));
+        let entry = symbol(&format!(
+            "::pie::attn::mla::latent_gather<{rope}, {rank}, {fp8}>"
+        ));
         ctx.fire(
             op,
             Fire::at(FILE, entry).apply(Launch::grid(
@@ -963,6 +1004,7 @@ fn dispatch_dense(
             op,
             layer.kv_lora_rank,
             layer.rope_dim,
+            layer.fp8,
             o.rows,
             latent::Gather {
                 q_nope: q_nope.ptr,
@@ -981,7 +1023,7 @@ fn dispatch_dense(
                 ratio: 1,
                 splits: latent::splits(ctx, o.rows, num_heads, i64::from(window)),
                 causal: i32::from(causal),
-                scale_log2: sm_scale * core::f32::consts::LOG2_E,
+                scale_log2: layer.scale_log2(sm_scale),
                 window,
                 ..latent::Gather::default()
             },
@@ -1127,6 +1169,7 @@ fn selected(
             op,
             layer.kv_lora_rank,
             layer.rope_dim,
+            layer.fp8,
             o.rows,
             latent::Gather {
                 q_nope: q.data.ptr,
@@ -1147,7 +1190,7 @@ fn selected(
                 ratio: 1,
                 splits: latent::splits(ctx, o.rows, heads, i64::from(top_k)),
                 causal: i32::from(causal),
-                scale_log2: sm_scale * core::f32::consts::LOG2_E,
+                scale_log2: layer.scale_log2(sm_scale),
                 ..latent::Gather::default()
             },
         );

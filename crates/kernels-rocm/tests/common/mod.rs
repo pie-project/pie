@@ -327,6 +327,20 @@ pub fn e4m3_value(code: u8) -> f32 {
     if code & 0x80 != 0 { -a } else { a }
 }
 
+/// The nearest finite e4m3 code, a tie to the even code, saturating at 448
+/// (no −0: zero is 0x00).
+pub fn e4m3_code(x: f32) -> u8 {
+    let a = x.abs();
+    let mut best = 0u8;
+    for c in 1..=0x7eu8 {
+        let (dc, db) = ((e4m3_value(c) - a).abs(), (e4m3_value(best) - a).abs());
+        if dc < db || (dc == db && c % 2 == 0) {
+            best = c;
+        }
+    }
+    if x < 0.0 && best != 0 { best | 0x80 } else { best }
+}
+
 /// Every `have[i]` is within `ulps` bf16 steps of `want[i]`.
 pub fn close_bf16(what: &str, have: &[f32], want: &[f32], ulps: f32) {
     assert_eq!(have.len(), want.len(), "{what}: lengths");

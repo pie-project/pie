@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{Gpu, KV, STATE, bf16s, close_abs, close_bf16, indptr_of, values};
+use common::{Gpu, KV, STATE, bf16s, close_abs, close_bf16, e4m3_value, indptr_of, values};
 use dtype::Dtype;
 use kernels_rocm::attn::{self, plan, selected, selector};
 use kernels_rocm::{KvPool, RaggedTensor, RecurrentPool};
@@ -948,13 +948,17 @@ fn ple_ngram_ids_hash_windows_across_the_state() {
 fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
-    // 64/128/256/512 run the wavefront entry, 96 the block entry.
-    for (d, rotary, hnd) in [
-        (128u32, 128u32, false),
-        (64, 32, true),
-        (256, 256, false),
-        (512, 128, true),
-        (96, 64, true),
+    // 64/128/256/512 run the wavefront entry, 96 the block entry; the
+    // wavefront entry also into e4m3 pages.
+    for (d, rotary, hnd, fp8) in [
+        (128u32, 128u32, false, false),
+        (64, 32, true, false),
+        (256, 256, false, false),
+        (512, 128, true, false),
+        (96, 64, true, false),
+        (128, 128, false, true),
+        (64, 32, true, true),
+        (512, 128, true, true),
     ] {
         let (hq, hk, ps, rows) = (4u32, 2u32, 8u32, 5u32);
         let width = (hq + 2 * hk) * d;
@@ -970,9 +974,16 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
         let (theta, eps) = (1e6f32, 1e-6f32);
 
         let run = |win: Option<[i32; 4]>| {
+            let plane = || {
+                if fp8 {
+                    gpu.upload(&vec![0u8; slots * row], slots as u32, row as u32, Dtype::E4m3)
+                } else {
+                    gpu.zeros(slots as u32, row as u32, Dtype::Bf16)
+                }
+            };
             let pool = KvPool {
-                keys: gpu.zeros(slots as u32, row as u32, Dtype::Bf16),
-                values: gpu.zeros(slots as u32, row as u32, Dtype::Bf16),
+                keys: plane(),
+                values: plane(),
                 page_size: ps as i32,
                 seq_stride: if hnd { i64::from(d) } else { row as i64 },
                 head_stride: if hnd { i64::from(ps * d) } else { i64::from(d) },
@@ -1006,7 +1017,27 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
             )
             .unwrap();
             ctx.disarm_stage();
-            (gpu.read(&q), gpu.read(&pool.keys), gpu.read(&pool.values))
+            let read = |t: &kernels_rocm::Tensor| {
+                if fp8 {
+                    gpu.read_as::<u8>(t).into_iter().map(e4m3_value).collect()
+                } else {
+                    gpu.read(t)
+                }
+            };
+            (gpu.read(&q), read(&pool.keys), read(&pool.values))
+        };
+        // An e4m3 code is within half its step (2^-4 of the value) of what
+        // it stands for.
+        let kv_close = |what: &str, have: &[f32], want: &[f32], bf16_ulps: f32, tol: f32| {
+            if fp8 {
+                for (i, (h, w)) in have.iter().zip(want).enumerate() {
+                    assert!((h - w).abs() <= w.abs() / 16.0 + tol, "{what}[{i}] = {h}, want {w}");
+                }
+            } else if bf16_ulps > 0.0 {
+                close_bf16(what, have, want, bf16_ulps);
+            } else {
+                close_abs(what, have, want, tol);
+            }
         };
 
         let d_ = d as usize;
@@ -1069,13 +1100,14 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
                     let ks = &src[(hq as usize + h) * d_..(hq as usize + h + 1) * d_];
                     let vs = &src[((hq + hk) as usize + h) * d_..((hq + hk) as usize + h + 1) * d_];
                     let tag = format!("fused d{d} hnd={hnd} win={win:?} row {r} kv head {h}");
-                    close_abs(
-                        &format!("{tag} k"),
+                    kv_close(
+                        &format!("{tag} fp8={fp8} k"),
                         &k[at..at + d_],
                         &roped(normed(ks, Some(&kw)), positions[r]),
+                        0.0,
                         2e-2,
                     );
-                    close_bf16(&format!("{tag} v"), &v[at..at + d_], &normed(vs, None), 1.0);
+                    kv_close(&format!("{tag} fp8={fp8} v"), &v[at..at + d_], &normed(vs, None), 1.0, 1e-2);
                 }
             }
         }

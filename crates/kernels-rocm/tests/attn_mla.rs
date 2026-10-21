@@ -3,13 +3,13 @@
 //! prefill over the paged latent cache (split and unsplit schedules, with
 //! and without a rope plane, 16 to 96 heads), the selected walk over a
 //! top-k list, and the reference walk at widths the matrix core does not
-//! take.
+//! take; over bf16 planes and over fp8 rows.
 
 #![cfg(feature = "rocm")]
 
 mod common;
 
-use common::{Gpu, KV, close_abs, close_bf16, round_bf16, values};
+use common::{Gpu, KV, close_abs, close_bf16, e4m3_code, e4m3_value, round_bf16, values};
 use dtype::Dtype;
 use kernels_rocm::attn::{mla, plan};
 use kernels_rocm::{KvPool, RaggedTensor, Tensor};
@@ -77,20 +77,32 @@ fn pages(kv_lens: &[usize], ps: usize) -> (Vec<i32>, Vec<i32>, Vec<i32>, usize) 
     (indices, indptr, last, total)
 }
 
-fn cache(gpu: &Gpu, kv_lens: &[usize], rank: usize, rope: usize, ps: usize, seed: u64) -> Cache {
+/// `fp8`: the pool as fp8 rows (one u8 plane of the latent's then the
+/// rope's e4m3 codes), the host copy their values.
+#[allow(clippy::too_many_arguments)]
+fn cache(
+    gpu: &Gpu,
+    kv_lens: &[usize],
+    rank: usize,
+    rope: usize,
+    ps: usize,
+    seed: u64,
+    fp8: bool,
+) -> Cache {
     let (indices, indptr, last, total) = pages(kv_lens, ps);
     let cells = total * ps;
     let mut cp = vec![0f32; cells * rank];
     let mut kp = vec![0f32; cells * rope.max(1)];
     let (mut ckv, mut kpe) = (Vec::new(), Vec::new());
     for (r, &n) in kv_lens.iter().enumerate() {
+        let quant = |x: f32| if fp8 { e4m3_value(e4m3_code(x)) } else { round_bf16(x) };
         let c: Vec<f32> = values(n * rank, seed + r as u64, 1.0)
             .into_iter()
-            .map(round_bf16)
+            .map(quant)
             .collect();
         let k: Vec<f32> = values(n * rope, seed + 50 + r as u64, 1.0)
             .into_iter()
-            .map(round_bf16)
+            .map(quant)
             .collect();
         for t in 0..n {
             let cell = indices[indptr[r] as usize + t / ps] as usize * ps + t % ps;
@@ -101,8 +113,19 @@ fn cache(gpu: &Gpu, kv_lens: &[usize], rank: usize, rope: usize, ps: usize, seed
         kpe.push(k);
     }
     let max_pages = indptr.windows(2).map(|w| w[1] - w[0]).max().unwrap() as usize;
-    let keys = gpu.tensor(&cp, cells as u32, rank as u32, Dtype::Bf16);
-    let vals = gpu.tensor(&kp, cells as u32, rope.max(1) as u32, Dtype::Bf16);
+    let (keys, vals) = if fp8 {
+        let rows: Vec<u8> = (0..cells)
+            .flat_map(|i| cp[i * rank..(i + 1) * rank].iter().chain(&kp[i * rope..(i + 1) * rope]))
+            .map(|&x| e4m3_code(x))
+            .collect();
+        let plane = gpu.upload(&rows, cells as u32, (rank + rope) as u32, Dtype::U8);
+        (plane, plane)
+    } else {
+        (
+            gpu.tensor(&cp, cells as u32, rank as u32, Dtype::Bf16),
+            gpu.tensor(&kp, cells as u32, rope.max(1) as u32, Dtype::Bf16),
+        )
+    };
     Cache {
         pool: pool(
             gpu, keys, vals, &indices, &indptr, &last, ps, rank, max_pages,
@@ -261,7 +284,7 @@ fn query(gpu: &Gpu, qo_lens: &[usize], heads: usize, rank: usize, rope: usize, s
 /// The planned walk (`mla_decode` / `mla_prefill`) over requests of
 /// `qo_lens` new tokens after `prefix` cached ones, against the host.
 fn run_planned(heads: usize, rope: usize, ps: usize, qo_lens: &[usize], prefix: &[usize]) {
-    run_dense(512, heads, rope, ps, qo_lens, prefix, None, false);
+    run_dense(512, heads, rope, ps, qo_lens, prefix, None, false, false);
 }
 
 /// `mla_decode` / `mla_prefill` at a `rank`-wide latent, reading back
@@ -277,11 +300,12 @@ fn run_dense(
     prefix: &[usize],
     window: Option<u32>,
     with_lse: bool,
+    fp8: bool,
 ) {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
     let kv_lens: Vec<usize> = qo_lens.iter().zip(prefix).map(|(q, p)| q + p).collect();
-    let c = cache(&gpu, &kv_lens, rank, rope, ps, 7);
+    let c = cache(&gpu, &kv_lens, rank, rope, ps, 7, fp8);
     let decode = qo_lens.iter().all(|&l| l == 1);
     let p = mla_plan(&gpu, &c, qo_lens, &kv_lens, heads as u32, !decode);
     let q = query(&gpu, qo_lens, heads, rank, rope, 3);
@@ -327,7 +351,7 @@ fn run_dense(
                 f64::from(scale),
             );
             close_rows(
-                &format!("mla r{rank} h{heads} rope{rope} ps{ps} w{window:?} req {r} token {i}"),
+                &format!("mla r{rank} h{heads} rope{rope} ps{ps} w{window:?} fp8={fp8} req {r} token {i}"),
                 &got[t * row..(t + 1) * row],
                 &want,
                 1.5e-2,
@@ -366,8 +390,8 @@ fn decode_without_a_rope_plane() {
 #[test]
 fn the_planned_walk_lands_its_log_sum_exp() {
     // Split and unsplit decode rows, and a causal prefill.
-    run_dense(512, 64, 64, 64, &[1, 1, 1], &[0, 300, 2900], None, true);
-    run_dense(512, 16, 64, 16, &[5, 70, 1], &[0, 33, 200], None, true);
+    run_dense(512, 64, 64, 64, &[1, 1, 1], &[0, 300, 2900], None, true, false);
+    run_dense(512, 16, 64, 16, &[5, 70, 1], &[0, 33, 200], None, true, false);
 }
 
 #[test]
@@ -383,11 +407,12 @@ fn a_windowed_walk_reads_only_its_window() {
         &[0, 300, 2900],
         Some(513),
         true,
+        false,
     );
-    run_dense(512, 16, 64, 16, &[5, 70, 1], &[0, 33, 600], Some(40), true);
+    run_dense(512, 16, 64, 16, &[5, 70, 1], &[0, 33, 600], Some(40), true, false);
     // dots.llm3's sliding layers: a 1024 latent on the reference walk.
-    run_dense(1024, 8, 64, 16, &[1, 1], &[20, 600], Some(513), true);
-    run_dense(1024, 8, 64, 16, &[9, 3], &[560, 0], Some(513), false);
+    run_dense(1024, 8, 64, 16, &[1, 1], &[20, 600], Some(513), true, false);
+    run_dense(1024, 8, 64, 16, &[9, 3], &[560, 0], Some(513), false, false);
 }
 
 #[test]
@@ -398,13 +423,20 @@ fn prefill_is_causal_within_and_across_tiles() {
 
 /// The selected walk: each token row lists key positions (some out of its
 /// causal range, some −1), as `attention.index_topk` publishes them.
-fn run_selected(heads: usize, rope: usize, qo_lens: &[usize], prefix: &[usize], top_k: usize) {
+fn run_selected(
+    heads: usize,
+    rope: usize,
+    qo_lens: &[usize],
+    prefix: &[usize],
+    top_k: usize,
+    fp8: bool,
+) {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
     let rank = 512;
     let ps = 32;
     let kv_lens: Vec<usize> = qo_lens.iter().zip(prefix).map(|(q, p)| q + p).collect();
-    let c = cache(&gpu, &kv_lens, rank, rope, ps, 9);
+    let c = cache(&gpu, &kv_lens, rank, rope, ps, 9, fp8);
     let decode = qo_lens.iter().all(|&l| l == 1);
     let p = mla_plan(&gpu, &c, qo_lens, &kv_lens, heads as u32, !decode);
     let q = query(&gpu, qo_lens, heads, rank, rope, 4);
@@ -465,7 +497,7 @@ fn run_selected(heads: usize, rope: usize, qo_lens: &[usize], prefix: &[usize], 
                 f64::from(scale),
             );
             close_rows(
-                &format!("selected h{heads} rope{rope} row {t}"),
+                &format!("selected h{heads} rope{rope} fp8={fp8} row {t}"),
                 &got[t * row..(t + 1) * row],
                 &want,
                 1.5e-2,
@@ -483,20 +515,20 @@ fn run_selected(heads: usize, rope: usize, qo_lens: &[usize], prefix: &[usize], 
 
 #[test]
 fn selected_decode_walks_its_list_in_splits() {
-    run_selected(64, 64, &[1, 1], &[3000, 70], 2048);
-    run_selected(16, 0, &[1], &[600], 300);
+    run_selected(64, 64, &[1, 1], &[3000, 70], 2048, false);
+    run_selected(16, 0, &[1], &[600], 300, false);
 }
 
 #[test]
 fn selected_prefill_skips_entries_past_the_row() {
-    run_selected(64, 64, &[6, 2], &[10, 400], 96);
+    run_selected(64, 64, &[6, 2], &[10, 400], 96, false);
 }
 
 #[test]
 fn a_long_unsplit_list_refills_the_slot_table() {
     // Enough rows that each takes one split: 22 tiles a block, the slot
     // table refilled past tiles 8 and 16.
-    run_selected(2, 64, &[700], &[40], 700);
+    run_selected(2, 64, &[700], &[40], 700, false);
 }
 
 #[test]
@@ -507,7 +539,7 @@ fn the_reference_walk_takes_other_widths() {
     let (heads, rank, rope) = (6usize, 128usize, 32usize);
     let qo_lens = [3usize, 1];
     let kv_lens = [10usize, 75];
-    let c = cache(&gpu, &kv_lens, rank, rope, 16, 13);
+    let c = cache(&gpu, &kv_lens, rank, rope, 16, 13, false);
     let p = mla_plan(&gpu, &c, &qo_lens, &kv_lens, heads as u32, true);
     let q = query(&gpu, &qo_lens, heads, rank, rope, 5);
     let mut o = gpu.zeros(4, (heads * rank) as u32, Dtype::Bf16);
@@ -545,6 +577,48 @@ fn the_reference_walk_takes_other_widths() {
             close_rows("naive", &got[t * row..(t + 1) * row], &want, 1e-2);
             t += 1;
         }
+    }
+}
+
+/// fp8 rows (an e4m3 kv deployment's): the append's codes, and the planned
+/// decode and prefill, the windowed walk and the selected one over them.
+#[test]
+fn fp8_rows_append_and_walk() {
+    run_dense(512, 64, 64, 64, &[1, 1, 1], &[0, 300, 2900], None, true, true);
+    run_dense(512, 16, 0, 32, &[1, 1], &[77, 1024], None, false, true);
+    run_dense(512, 16, 64, 16, &[5, 70, 1], &[0, 33, 200], None, true, true);
+    run_dense(512, 16, 64, 16, &[5, 70, 1], &[0, 33, 600], Some(40), true, true);
+    run_selected(64, 64, &[1, 1], &[3000, 70], 2048, true);
+    run_selected(64, 64, &[6, 2], &[10, 400], 96, true);
+
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let (rank, rope, ps) = (512usize, 64usize, 4usize);
+    let kv_lens = [5usize, 3];
+    let (indices, indptr, last, total) = pages(&kv_lens, ps);
+    let cells = total * ps;
+    let plane = gpu.upload(&vec![0x5au8; cells * (rank + rope)], cells as u32, (rank + rope) as u32, Dtype::U8);
+    let pl = pool(&gpu, plane, plane, &indices, &indptr, &last, ps, rank + rope, 2);
+    let new = 5usize;
+    let mut ckv: Vec<f32> = values(new * rank, 4, 300.0).into_iter().map(round_bf16).collect();
+    ckv[..3].copy_from_slice(&[-0.0, 1000.0, 0.0009765625]);
+    let kpe: Vec<f32> = values(new * rope, 5, 1.0).into_iter().map(round_bf16).collect();
+    let rag = RaggedTensor {
+        data: gpu.tensor(&ckv, new as u32, rank as u32, Dtype::Bf16),
+        indptr: gpu.column(&[0, 2, 5]),
+    };
+    let kp = gpu.tensor(&kpe, new as u32, rope as u32, Dtype::Bf16);
+    mla::kv_append(&ctx, rag, kp, &pl, Tensor::ABSENT, Tensor::ABSENT).unwrap();
+    let rows = gpu.read_as::<u8>(&pl.keys);
+    let land = [(0usize, 3usize), (0, 4), (1, 0), (1, 1), (1, 2)];
+    for (t, &(r, pos)) in land.iter().enumerate() {
+        let cell = indices[indptr[r] as usize + pos / ps] as usize * ps + pos % ps;
+        let want: Vec<u8> = ckv[t * rank..(t + 1) * rank]
+            .iter()
+            .chain(&kpe[t * rope..(t + 1) * rope])
+            .map(|&x| e4m3_code(x))
+            .collect();
+        assert_eq!(&rows[cell * (rank + rope)..(cell + 1) * (rank + rope)], &want[..], "row {t}");
     }
 }
 
@@ -671,7 +745,7 @@ fn selected_decode_under_a_window() {
     let ctx = gpu.ctx();
     let (heads, rank, rope, top_k) = (16usize, 512usize, 64usize, 512usize);
     let kv_lens = [700usize, 90];
-    let c = cache(&gpu, &kv_lens, rank, rope, 32, 21);
+    let c = cache(&gpu, &kv_lens, rank, rope, 32, 21, false);
     let p = mla_plan(&gpu, &c, &[1, 1], &kv_lens, heads as u32, false);
     let qn: Vec<f32> = values(3 * heads * rank, 5, 1.0)
         .into_iter()

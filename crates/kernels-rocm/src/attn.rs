@@ -123,14 +123,6 @@ fn fa2_decode(
     let window_left = plan::window_left(op, window)?;
     lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
 
-    let _ = kv::dequant_active(
-        ctx,
-        op,
-        pool,
-        stated(op, plan.shape.num_kv_heads)?,
-        stated(op, head_dim)?,
-    );
-
     if let Some(rel) = rel {
         if lse.is_some() {
             return Err(Error::Unsupported { op });
@@ -202,14 +194,6 @@ fn fa2_prefill(
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
-
-    let _ = kv::dequant_active(
-        ctx,
-        op,
-        pool,
-        stated(op, plan.shape.num_kv_heads)?,
-        stated(op, head_dim)?,
-    );
 
     lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
     if let Some(rel) = rel {

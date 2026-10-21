@@ -138,7 +138,21 @@ struct alignas(2 * E) BfRun {
     bf16 v[E];
 };
 
-template <int HEAD_DIM, bool USE_ROPE_TABLE, int E>
+// A run's e4m3 codes (an e4m3 pool's pages), each from the bf16 the
+// unfused append would have read.
+template <int E>
+__device__ __forceinline__ void put_e4m3(bf16* pages, long long at, const BfRun<E>& x) {
+    float f[E < 4 ? 4 : E] = {};
+#pragma unroll
+    for (int i = 0; i < E; ++i) f[i] = to_f32(x.v[i]);
+    u64 c = 0;
+#pragma unroll
+    for (int i = 0; i < E; i += 4) c |= u64{attn::e4m3x4(f[i], f[i + 1], f[i + 2], f[i + 3])} << (8 * i);
+    using U = typename conditional<E == 8, u64, typename conditional<E == 4, u32, typename conditional<E == 2, u16, u8>::type>::type>::type;
+    *reinterpret_cast<U*>(reinterpret_cast<u8*>(pages) + at) = static_cast<U>(c);
+}
+
+template <int HEAD_DIM, bool USE_ROPE_TABLE, int E, bool FP8>
 __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     const bf16* __restrict__ packed, bf16* __restrict__ q_out, bf16* __restrict__ k_pages,
     bf16* __restrict__ v_pages, const bf16* __restrict__ q_weight, const bf16* __restrict__ k_weight,
@@ -242,6 +256,11 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
         Run vq;
 #pragma unroll
         for (int i = 0; i < E; ++i) vq.v[i] = from_f32<bf16>(y[i] * inv_v * v_scale);
+        if constexpr (FP8) {
+            put_e4m3<E>(k_pages, at + ln * E, out);
+            put_e4m3<E>(v_pages, at + ln * E, vq);
+            return;
+        }
         reinterpret_cast<Run*>(v_pages + at)[ln] = vq;
     }
     reinterpret_cast<Run*>(dst)[ln] = out;
