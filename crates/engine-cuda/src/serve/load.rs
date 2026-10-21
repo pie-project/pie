@@ -1285,6 +1285,18 @@ fn decoded_weight_planes(
                 ) if matches!(**select, poem_ir::Linear::MoeMatmulSelectActQuant { .. }) => {
                     continue;
                 }
+                // A routed select reads its bank's codes as they are, whatever
+                // the arm (the register-dequant and staged kernels, the
+                // grouped and per-route ones): it decodes no bf16 tile.
+                #[cfg(not(feature = "rocm"))]
+                poem_ir::Operation::Linear(
+                    poem_ir::Linear::MoeMatmulSelect { .. }
+                    | poem_ir::Linear::MoeMatmulSelectBias { .. }
+                    | poem_ir::Linear::MoeMatmulSelectQuant { .. },
+                )
+                | poem_ir::Operation::Fused(
+                    poem_ir::Fused::MoeSelectGlu { .. } | poem_ir::Fused::MoeExperts { .. },
+                ) => continue,
                 // A fused projection runs its matmul when no fused kernel
                 // takes it, and decodes the same plane that matmul would.
                 poem_ir::Operation::Linear(_)
@@ -1294,9 +1306,15 @@ fn decoded_weight_planes(
                     | poem_ir::Fused::MlpSwiglu { .. }
                     | poem_ir::Fused::MatmulBias { .. }
                     | poem_ir::Fused::MatmulSplitRows { .. }
-                    | poem_ir::Fused::LmHeadSoftcap { .. }
-                    | poem_ir::Fused::MoeSelectGlu { .. }
-                    | poem_ir::Fused::MoeExperts { .. },
+                    | poem_ir::Fused::LmHeadSoftcap { .. },
+                ) => {
+                    outputs.clear();
+                    node.op.outputs(&mut outputs);
+                    outputs.iter().any(|id| token_rows(*id))
+                }
+                #[cfg(feature = "rocm")]
+                poem_ir::Operation::Fused(
+                    poem_ir::Fused::MoeSelectGlu { .. } | poem_ir::Fused::MoeExperts { .. },
                 ) => {
                     outputs.clear();
                     node.op.outputs(&mut outputs);
