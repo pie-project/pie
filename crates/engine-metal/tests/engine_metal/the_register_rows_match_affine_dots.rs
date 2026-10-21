@@ -721,8 +721,8 @@ fn a_gate_and_a_gated_norm_lay_the_table_their_out_projection_reads() {
     eprintln!("checked {checked} tables a gate or a gated norm laid");
 }
 
-/// A plain RMS norm that lays the register tile's input table lands the rows
-/// the plain norm lands and the table its projections lay, the counters zeroed.
+/// A plain RMS norm (scaled by its weight or by one plus it) that lays the
+/// register tile's input table lands the rows the plain norm lands and the table its projections lay, the counters zeroed.
 #[test]
 fn a_plain_norm_lays_the_table_its_projections_read() {
     let Ok(device) = Context::bind() else {
@@ -740,7 +740,7 @@ fn a_plain_norm_lays_the_table_its_projections_read() {
     let counters = n / 64;
     for k in [2048u32, 512] {
         let table_rows = (17 * k + 4 * counters).div_ceil(2 * k);
-        for m in [1u32, 6, 8] {
+        for (m, plus_one) in [(1u32, false), (6, true), (8, false), (8, true)] {
             let x: Vec<u8> = (0..m * k)
                 .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0x81)) - 127.0) * 0.37))
                 .collect();
@@ -764,11 +764,17 @@ fn a_plain_norm_lays_the_table_its_projections_read() {
             let th = bind(&upload(&vec![0xa5; (table_rows * k * 2) as usize]));
             let frame = device.frame().expect("frame");
             let sink = Sink::new(&device, &frame, &pipelines, &handles);
-            kernels_metal::elemwise::norm::rmsnorm(&sink, x_t, w_t, 1e-6, plain).expect("norm");
+            if plus_one {
+                kernels_metal::elemwise::norm::rmsnorm_plus_one(&sink, x_t, w_t, 1e-6, plain)
+            } else {
+                kernels_metal::elemwise::norm::rmsnorm(&sink, x_t, w_t, 1e-6, plain)
+            }
+            .expect("norm");
             kernels_metal::elemwise::norm::rmsnorm_table(
                 &sink,
                 x_t,
                 w_t,
+                plus_one,
                 1e-6,
                 laid,
                 Tensor::new(th, table_rows, k, Dtype::F16),

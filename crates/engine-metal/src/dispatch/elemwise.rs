@@ -64,6 +64,7 @@ impl Run<'_> {
                         self.ctx(),
                         self.tensor(*x),
                         self.tensor(*weight),
+                        false,
                         *eps,
                         self.tensor(*y),
                         table,
@@ -92,13 +93,31 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elementwise::RmsnormPlusOne { x, weight, eps, y } => elemwise::norm::rmsnorm_plus_one(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *eps,
-                self.tensor(*y),
-            ),
+            Elementwise::RmsnormPlusOne { x, weight, eps, y } => {
+                // As `Rmsnorm`: the projections read the table this lays.
+                match (self.tensor(*x).width == self.tensor(*y).width)
+                    .then(|| self.producer_table(*y))
+                    .flatten()
+                {
+                    Some((table, counters)) => elemwise::norm::rmsnorm_table(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*weight),
+                        true,
+                        *eps,
+                        self.tensor(*y),
+                        table,
+                        counters,
+                    ),
+                    None => elemwise::norm::rmsnorm_plus_one(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*weight),
+                        *eps,
+                        self.tensor(*y),
+                    ),
+                }
+            }
             Elementwise::RmsnormPerHeadPlusOne {
                 x,
                 weight,
