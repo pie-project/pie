@@ -114,6 +114,21 @@ pub(crate) struct ArgmaxScan {
     pub(crate) gumbel: Vec<Option<GumbelChain>>,
 }
 
+impl ArgmaxScan {
+    /// The intrinsic each argmax reads directly, a plain scan's or a fused
+    /// Gumbel draw's: the argmaxes the row streams must leave to this
+    /// emitter. A Gumbel draw's operands are skipped, so a stream that took
+    /// its argmax would scan a row nothing wrote, and answer index 0 every
+    /// fire.
+    pub(crate) fn claimed(&self) -> Vec<u16> {
+        self.intrinsic
+            .iter()
+            .zip(&self.gumbel)
+            .map(|(&intrinsic, gumbel)| gumbel.map_or(intrinsic, |chain| chain.intrinsic))
+            .collect()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GumbelChain {
     pub(crate) intrinsic: u16,
@@ -426,6 +441,7 @@ pub fn emit_fused_region(
 
     let mut aliases = crate::codegen::alias::AliasTable::new();
     let direct = analyze_direct_argmax(stage, region, &bases);
+    let claimed = direct.claimed();
     let skipped = direct.skipped;
 
     let mut source = runtime_source(dialect);
@@ -529,7 +545,7 @@ pub fn emit_fused_region(
             &ops,
             &bases,
             &row_kinds,
-            &direct.intrinsic,
+            &claimed,
             &skipped,
             &direct_topk,
         )
