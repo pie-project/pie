@@ -355,3 +355,114 @@ template <typename T>
       uint2);
 
 instantiate_causal_conv1d_committed(bfloat16, bfloat)
+
+// The history the verify conv commits, at most: a thread of it holds the
+// rows it writes back until the threadgroup has read them.
+constant constexpr int kConvVerifyHist = 16;
+
+// `causal_conv1d_committed` with the rows of a lane spread over the
+// threadgroup's `rows` threads of a channel: a verify window's dozen rows,
+// one thread a channel walking them in turn, left the conv waiting on each
+// row's loads. Every row's output lands in the extended plane `y` the scan
+// reads, and a row of the window's own in `land` too, at its own row. The
+// window as of `commit` rows is read before any of it is written back: the
+// bank is read and written in place.
+template <typename T>
+[[kernel]] void causal_conv1d_verify(
+    const device T* x              [[buffer(0)]],
+    const device int* indptr       [[buffer(1)]],
+    const device int* replay       [[buffer(2)]],
+    const device int* commit       [[buffer(3)]],
+    const device int* slots        [[buffer(4)]],
+    const constant int& lane0      [[buffer(5)]],
+    const device T* weight         [[buffer(6)]],
+    const device float* conv_state [[buffer(7)]],
+    device float* new_conv_state   [[buffer(8)]],
+    device T* y                    [[buffer(9)]],
+    device T* land                 [[buffer(10)]],
+    const constant int& channels   [[buffer(11)]],
+    const constant int& conv_width [[buffer(12)]],
+    const constant int& dilation   [[buffer(13)]],
+    const device int* snaps        [[buffer(14)]],
+    const constant int& snap_lane0 [[buffer(15)]],
+    uint3 pos [[thread_position_in_grid]],
+    uint3 at [[thread_position_in_threadgroup]],
+    uint3 shape [[threads_per_threadgroup]]) {
+  const int c = int(pos.x);
+  const int first = int(at.y);
+  const int rows = int(shape.y);
+  const int r = int(pos.z);
+  const bool live = c < channels;
+  int begin = indptr[r];
+  for (int j = 0; j < r; ++j) {
+    begin += replay[lane0 + j];
+  }
+  const int rep = replay[lane0 + r];
+  const int span = (indptr[r + 1] - indptr[r]) + rep;
+  const int slot = slots[lane0 + r];
+  // Uniform over the threadgroup, so its barrier below is too.
+  if (span <= 0 || slot < 0) {
+    return;
+  }
+  const int width = conv_width;
+  const int dil = dilation;
+  const int hist = (width - 1) * dil + 1;
+  const size_t chans = size_t(channels);
+  const size_t col = size_t(c);
+  const size_t slab = size_t(slot) * size_t(hist) * chans;
+  const size_t tap0 = size_t(c) * size_t(width);
+  const int own = indptr[r] - rep;
+  // The window's row `src`, the bank's rows before the lane's first.
+  auto tap = [&](int src) -> float {
+    return (src < 0) ? conv_state[slab + size_t(hist + src) * chans + col]
+                     : float(x[size_t(begin + src) * chans + col]);
+  };
+
+  for (int t = first; live && t < span; t += rows) {
+    float acc = 0.0f;
+    for (int k = 0; k < width; ++k) {
+      acc += tap(t - (width - 1 - k) * dil) * float(weight[tap0 + size_t(k)]);
+    }
+    const T out = T(causal_conv1d_silu(acc));
+    y[size_t(begin + t) * chans + col] = out;
+    if (t >= rep) {
+      land[size_t(own + t) * chans + col] = out;
+    }
+  }
+
+  // A lane that snapshots folds its own rows, none replayed; snapshots land
+  // in slots of their own, read from the bank before it is written.
+  if (live && snap_lane0 >= 0) {
+    const device int* snap = snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS;
+    for (int i = 0; i < PIE_RS_SNAPSHOTS && snap[i] > 0; ++i) {
+      const size_t into = size_t(snap[PIE_RS_SNAPSHOTS + i]) * size_t(hist) * chans;
+      for (int s = first; s < hist; s += rows) {
+        new_conv_state[into + size_t(s) * chans + col] = tap(snap[i] - hist + s);
+      }
+    }
+  }
+
+  const int keep = min(commit[lane0 + r], span);
+  float next[kConvVerifyHist];
+  int held = 0;
+  for (int s = first; live && keep > 0 && s < hist; s += rows) {
+    next[held++] = tap(keep - hist + s);
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  held = 0;
+  for (int s = first; live && keep > 0 && s < hist; s += rows) {
+    new_conv_state[slab + size_t(s) * chans + col] = next[held++];
+  }
+}
+
+#define instantiate_causal_conv1d_verify(name, itype)                   \
+  template [[host_name("causal_conv1d_verify_" #name)]]                 \
+  [[kernel]] void causal_conv1d_verify<itype>(                          \
+      const device itype*, const device int*, const device int*,        \
+      const device int*, const device int*, const constant int&,        \
+      const device itype*, const device float*, device float*,          \
+      device itype*, device itype*, const constant int&,                \
+      const constant int&, const constant int&, const device int*,      \
+      const constant int&, uint3, uint3, uint3);
+
+instantiate_causal_conv1d_verify(bfloat16, bfloat)

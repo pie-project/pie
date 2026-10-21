@@ -439,7 +439,8 @@ template <typename T, int LANES, int VROWS, int PER>
 // The rows of a committed scan one pass stages in threadgroup memory.
 constant constexpr int kVerifyChunk = 16;
 
-// A committed scan over 128-wide heads whose threadgroup holds `SG` simdgroups
+// A committed scan over 128-wide heads, its gates derived from the `[b | a]`
+// projection as it stages them, whose threadgroup holds `SG` simdgroups
 // of `32 / LANES` value-row groups, `VROWS` rows each. Each pass stages up to
 // `kVerifyChunk` rows' normed q and k, the group's value rows, decay and beta
 // in threadgroup memory, every row's loads issued side by side, so a row of
@@ -458,13 +459,16 @@ template <typename T, int LANES, int SG, int VROWS>
     const device int* commit    [[buffer(3)]],
     const device int* slots     [[buffer(4)]],
     const constant int& lane0   [[buffer(5)]],
-    const device float* gates   [[buffer(6)]],
-    device float* rstate        [[buffer(7)]],
-    device float* y             [[buffer(8)]],
-    const constant int& k_heads [[buffer(9)]],
-    const constant int& v_heads [[buffer(10)]],
-    const device int* snaps     [[buffer(11)]],
-    const constant int& snap_lane0 [[buffer(12)]],
+    const device T* ba          [[buffer(6)]],
+    const device float* a_log   [[buffer(7)]],
+    const device T* dt_bias     [[buffer(8)]],
+    device float* rstate        [[buffer(9)]],
+    device float* y             [[buffer(10)]],
+    device float* gates         [[buffer(11)]],
+    const constant int& k_heads [[buffer(12)]],
+    const constant int& v_heads [[buffer(13)]],
+    const device int* snaps     [[buffer(14)]],
+    const constant int& snap_lane0 [[buffer(15)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]],
     uint sg_u [[simdgroup_index_in_threadgroup]]) {
@@ -547,10 +551,25 @@ template <typename T, int LANES, int SG, int VROWS>
       const size_t vbase = size_t(begin + c0 + j) * pitch + 2 * keys + size_t(hv) * D;
       v_s[j][v] = float(qkv[vbase + size_t(group_base + v)]);
     }
+    // The row's gates, as `qwen_gdn_ba_gates` derives them; the first
+    // group of the head lands a row of the window's own in `gates`.
     if (tid < rows) {
-      const size_t fused = size_t(begin + c0 + tid) * 2 * size_t(v_heads) + size_t(hv);
-      decay_s[tid] = metal::exp(gates[fused]);
-      beta_s[tid] = gates[fused + size_t(v_heads)];
+      const int t = c0 + tid;
+      const size_t vh = size_t(v_heads);
+      const size_t fused = size_t(begin + t) * 2 * vh;
+      const float bv = float(ba[fused + size_t(hv)]);
+      const float av = float(ba[fused + vh + size_t(hv)]);
+      const float z = av + float(dt_bias[hv]);
+      const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::fast::exp(z));
+      const float g_log = -metal::fast::exp(a_log[hv]) * sp;
+      const float beta = 1.0f / (1.0f + metal::fast::exp(-bv));
+      decay_s[tid] = metal::exp(g_log);
+      beta_s[tid] = beta;
+      if (group.y == 0 && t >= rep) {
+        const size_t at = size_t(own + t) * 2 * vh + size_t(hv);
+        gates[at] = g_log;
+        gates[at + vh] = beta;
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -609,7 +628,8 @@ template <typename T, int LANES, int SG, int VROWS>
   [[kernel]] void gated_delta_verify<bfloat, lanes, sg, vrows>(                \
       const device bfloat*, const device int*, const device int*,              \
       const device int*, const device int*, const constant int&,               \
-      const device float*, device float*, device float*,                       \
+      const device bfloat*, const device float*, const device bfloat*,         \
+      device float*, device float*, device float*,                             \
       const constant int&, const constant int&, const device int*,             \
       const constant int&, uint3, uint, uint);
 

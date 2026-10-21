@@ -1052,17 +1052,64 @@ pub fn gated_delta_verify_fits(k_dim: u32, v_dim: u32) -> bool {
     k_dim == GDN_VERIFY_DIM && v_dim == GDN_VERIFY_DIM
 }
 
+/// The `[b | a]` projection a verify scan derives its gates from, as
+/// [`gdn_prep`] does: the extended rows, and the window's own rows' gates
+/// it lands.
+#[derive(Clone, Copy, Debug)]
+pub struct VerifyGates {
+    pub ba: Tensor,
+    pub dt_bias: Tensor,
+    pub a_log: Tensor,
+    pub gates: Tensor,
+}
+
 /// [`gated_delta_committed_landing`] over 128-wide heads, a threadgroup's
-/// rows staged before it walks them. A replayed row only folds in; a row of
-/// the window's own lands its readout in `y`, the window's own rows, where
-/// the committed scan landed every row in the extended plane.
+/// rows staged before it walks them, the gates [`gdn_prep`] derives
+/// derived as they stage. A replayed row only folds in; a row of the
+/// window's own lands its readout in `y` and its gates in `gates.gates`,
+/// the window's own rows, where the committed scan landed every row in the
+/// extended plane.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_verify(
     ctx: &Ctx<'_>,
     qkv: Tensor,
     indptr: Tensor,
     committed: &Committed,
-    gates: Tensor,
+    gates: &VerifyGates,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: Tensor,
+    snapshots: Option<Snapshots>,
+) -> Result<(), Error> {
+    gated_delta_verify_at(
+        ctx,
+        GDN_VERIFY_GROUP,
+        qkv,
+        indptr,
+        committed,
+        gates,
+        state,
+        k_heads,
+        v_heads,
+        k_dim,
+        v_dim,
+        y,
+        snapshots,
+    )
+}
+
+/// [`gated_delta_verify`] at a stated `(lanes, simdgroups, value rows)`.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_verify_at(
+    ctx: &Ctx<'_>,
+    (row_lanes, groups, vrows): (u32, u32, u32),
+    qkv: Tensor,
+    indptr: Tensor,
+    committed: &Committed,
+    gates: &VerifyGates,
     state: &RecurrentPool,
     k_heads: u32,
     v_heads: u32,
@@ -1073,7 +1120,20 @@ pub fn gated_delta_verify(
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_gated_delta_committed";
     let _ = dtype_dispatch!(OP, qkv.dtype, { Bf16 => "gated_delta_verify_bfloat16" });
-    debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
+    debug_assert_eq!(
+        gates.ba.dtype, qkv.dtype,
+        "`{OP}` reads a `[b | a]` row as its qkv"
+    );
+    debug_assert_eq!(
+        gates.a_log.dtype,
+        Dtype::F32,
+        "`{OP}` reads an f32 decay bank"
+    );
+    debug_assert_eq!(
+        gates.gates.dtype,
+        Dtype::F32,
+        "`{OP}` lands an f32 decay row"
+    );
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     nonzero(OP, "the key heads this statement states", k_heads)?;
     nonzero(OP, "the value heads this statement states", v_heads)?;
@@ -1081,6 +1141,15 @@ pub fn gated_delta_verify(
         return Err(refuse(
             OP,
             format!("the {v_heads} value heads are not a whole number of the {k_heads} key heads"),
+        ));
+    }
+    if gates.ba.width != 2 * v_heads {
+        return Err(refuse(
+            OP,
+            format!(
+                "the {}-wide `[b | a]` projection is not two entries of each of the {v_heads} value heads",
+                gates.ba.width
+            ),
         ));
     }
     if !gated_delta_verify_fits(k_dim, v_dim) {
@@ -1091,11 +1160,10 @@ pub fn gated_delta_verify(
             ),
         ));
     }
-    let lanes = committed_lanes(OP, indptr)?;
-    let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
-    let (row_lanes, groups, vrows) = GDN_VERIFY_GROUP;
     let entry = gated_delta_verify_entry(row_lanes, groups, vrows)
         .ok_or_else(|| refuse(OP, "no verify scan is stamped at this geometry"))?;
+    let lanes = committed_lanes(OP, indptr)?;
+    let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     let z = v_heads
         .checked_mul(lanes)
         .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
@@ -1108,11 +1176,93 @@ pub fn gated_delta_verify(
             committed.commit.arg(),
             committed.slots.arg(),
             stated(OP, committed.lane0)?.arg(),
-            gates.arg(),
+            gates.ba.arg(),
+            gates.a_log.arg(),
+            gates.dt_bias.arg(),
             state.state.arg_mut(),
             y.arg_mut(),
+            gates.gates.arg_mut(),
             stated(OP, k_heads)?.arg(),
             stated(OP, v_heads)?.arg(),
+            snaps,
+            lane0,
+        ],
+    )
+}
+
+/// The rows of a lane one threadgroup of the verify conv runs side by side,
+/// and the channels beside them.
+const CONV_VERIFY_ROWS: u32 = 4;
+const CONV_VERIFY_CHANNELS: u32 = 64;
+
+/// The history the verify conv commits, at most (`kConvVerifyHist`): with
+/// [`CONV_VERIFY_ROWS`] rows a thread holds a quarter of it.
+const CONV_VERIFY_HIST: u32 = 16;
+
+/// Whether [`causal_conv1d_verify`] holds a conv this wide.
+#[must_use]
+pub fn causal_conv1d_verify_fits(conv_width: u32, dilation: u32) -> bool {
+    conv_history("", conv_width, dilation).is_ok_and(|hist| hist <= CONV_VERIFY_HIST)
+}
+
+/// [`causal_conv1d_committed_landing`] with a thread a row: every row lands
+/// in the extended plane `y`, and a row of the window's own in `land`, the
+/// window's own rows.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_verify(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    indptr: Tensor,
+    committed: &Committed,
+    weight: Tensor,
+    state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    y: Tensor,
+    land: Tensor,
+    snapshots: Option<Snapshots>,
+) -> Result<(), Error> {
+    const OP: &str = "attention.ssm_causal_conv1d_committed";
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "causal_conv1d_verify_bfloat16" });
+    let channels = nonzero(OP, "the conv's channel count", x.width)?;
+    nonzero(OP, "extended rows", x.rows)?;
+    debug_assert!(
+        land.width == x.width && land.dtype == x.dtype,
+        "the window's own rows land as the conv's row"
+    );
+    let taps = stated(
+        OP,
+        nonzero(OP, "the conv width this statement states", conv_width)?,
+    )?;
+    let hist = conv_history(OP, conv_width, dilation)?;
+    if hist > CONV_VERIFY_HIST {
+        return Err(refuse(
+            OP,
+            format!("a history of {hist} rows is past the {CONV_VERIFY_HIST} this arm commits"),
+        ));
+    }
+    let lanes = committed_lanes(OP, indptr)?;
+    let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
+    ctx.fire(
+        Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(Grid::of(
+            [channels, CONV_VERIFY_ROWS, lanes],
+            [CONV_VERIFY_CHANNELS, CONV_VERIFY_ROWS, 1],
+        )),
+        &[
+            x.arg(),
+            indptr.arg(),
+            committed.replay.arg(),
+            committed.commit.arg(),
+            committed.slots.arg(),
+            stated(OP, committed.lane0)?.arg(),
+            weight.arg(),
+            state.conv_state.arg(),
+            state.new_conv_state.arg_mut(),
+            y.arg_mut(),
+            land.arg_mut(),
+            stated(OP, x.width)?.arg(),
+            taps.arg(),
+            stated(OP, dilation)?.arg(),
             snaps,
             lane0,
         ],
