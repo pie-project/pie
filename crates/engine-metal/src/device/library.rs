@@ -24,6 +24,11 @@ pub(crate) type Pipeline = ();
 pub struct Pipelines {
     libraries: RefCell<HashMap<(&'static str, &'static str), Library>>,
     pipelines: RefCell<HashMap<(&'static str, &'static str, &'static str), Pipeline>>,
+    /// Per pipeline, the buffer indices its kernel declares read-only
+    /// (`const device` or `constant`), one bit each: what lets a launch's
+    /// read of a binding be told from a write by the shader's own word, not
+    /// only by the caller's.
+    read_only: RefCell<HashMap<(&'static str, &'static str, &'static str), u64>>,
     compiles: std::cell::Cell<u64>,
 }
 
@@ -83,11 +88,12 @@ impl Pipelines {
         descriptor.setComputeFunction(Some(&function));
         descriptor.setSupportIndirectCommandBuffers(true);
         descriptor.setLabel(Some(&super::ctx::nsstring(fire.entrypoint)));
+        let mut reflection = None;
         let pipeline = device
             .newComputePipelineStateWithDescriptor_options_reflection_error(
                 &descriptor,
-                objc2_metal::MTLPipelineOption::None,
-                None,
+                objc2_metal::MTLPipelineOption::BindingInfo,
+                Some(&mut reflection),
             )
             .map_err(|error| Fault::Shader {
                 file: fire.file,
@@ -95,8 +101,23 @@ impl Pipelines {
                 why: error.localizedDescription().to_string(),
             })?;
         self.compiles.set(self.compiles.get() + 1);
+        self.read_only
+            .borrow_mut()
+            .insert(key, reflection.as_deref().map_or(0, read_only_of));
         self.pipelines.borrow_mut().insert(key, pipeline.clone());
         Ok(pipeline)
+    }
+
+    /// The buffer indices `fire`'s kernel declares read-only, one bit each;
+    /// none for a pipeline not yet compiled or compiled without reflection,
+    /// so every binding of it counts as written.
+    #[must_use]
+    pub(crate) fn read_only(&self, fire: kernels_metal::Fire) -> u64 {
+        self.read_only
+            .borrow()
+            .get(&(fire.file, fire.entrypoint, fire.stamp))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn warm(&self, device: &super::Context, fire: kernels_metal::Fire) -> Result<()> {
@@ -126,6 +147,13 @@ impl Pipelines {
             let _ = (device, file);
             Err(Fault::Deviceless)
         }
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    #[must_use]
+    pub(crate) fn read_only(&self, fire: kernels_metal::Fire) -> u64 {
+        let _ = (fire, &self.read_only);
+        0
     }
 
     #[cfg(target_vendor = "apple")]
@@ -160,4 +188,21 @@ impl Pipelines {
         self.libraries.borrow_mut().insert(key, library.clone());
         Ok(library)
     }
+}
+
+/// The buffer bindings `reflection` reports read-only, one bit per index
+/// below 64.
+#[cfg(target_vendor = "apple")]
+fn read_only_of(reflection: &objc2_metal::MTLComputePipelineReflection) -> u64 {
+    use objc2_metal::{MTLBinding, MTLBindingAccess, MTLBindingType};
+    let mut mask = 0u64;
+    for binding in &reflection.bindings() {
+        if binding.r#type() == MTLBindingType::Buffer
+            && binding.access() == MTLBindingAccess::ReadOnly
+            && binding.index() < 64
+        {
+            mask |= 1 << binding.index();
+        }
+    }
+    mask
 }

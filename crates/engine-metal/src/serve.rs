@@ -3942,7 +3942,7 @@ impl Shell {
     fn walk_once(&self, p: &Prepared<'_>, mode: Mode) -> Result<Walked> {
         let place = At::new();
         let mut frame = match mode {
-            Mode::Encode => Some(self.device.frame()?),
+            Mode::Encode => Some(self.device.concurrent_frame()?),
             Mode::Record | Mode::Build { .. } | Mode::Replay => None,
         };
         if let Some(frame) = frame.as_mut() {
@@ -4400,6 +4400,7 @@ impl engine::frame::Shell for Shell {
             keepalive.touch();
         }
         fire_trace(|| "encode-begin".to_string());
+        let census = crate::device::ctx::barrier_census();
         let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {
             let trace = crate::diag::on().tier_trace;
             let before = trace.then(|| {
@@ -4435,6 +4436,15 @@ impl engine::frame::Shell for Shell {
             self.walk_once(&prepared, Mode::Encode)?
         };
         fire_trace(|| "forward-encoded".to_string());
+        if crate::diag::on().barrier_trace {
+            let (launches, barriers) = crate::device::ctx::barrier_census();
+            eprintln!(
+                "barriers: fire of {} row(s): {} barrier(s) over {} concurrent launch(es)",
+                prepared.descriptor.rows,
+                barriers - census.1,
+                launches - census.0
+            );
+        }
         let profile = crate::encode::kernel_profile();
         if !profile.is_empty() {
             let total: u64 = profile.iter().map(|(_, ns, _)| ns).sum();

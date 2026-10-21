@@ -3,6 +3,7 @@
 mod a_buffered_fold_is_the_fold_it_replaces;
 mod a_capped_fire_packs_no_more_windows_than_the_load_reserved;
 mod a_column_cut_of_a_bank_multiplies_as_its_copy;
+mod a_concurrent_frame_orders_only_what_shares_bytes;
 mod a_copied_window_is_one_encode_over_the_same_rows;
 mod a_drafting_neighbour_leaves_a_plain_lane_alone;
 mod a_family_is_read_against_its_reference;

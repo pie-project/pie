@@ -9,6 +9,10 @@ pub const NIL: u32 = u32::MAX;
 pub struct Binding {
     slab: Slab,
     offset: u64,
+    /// The bytes a launch bound here may touch: the span stated when the
+    /// row was minted, and for a cut its parent's span with it, since a
+    /// kernel handed a row cut may still step past it by its own stride.
+    span: (u64, u64),
 }
 
 impl Binding {
@@ -20,6 +24,12 @@ impl Binding {
     #[must_use]
     pub fn offset(&self) -> u64 {
         self.offset
+    }
+
+    /// `[start, end)` of the reservation a launch bound here may touch.
+    #[must_use]
+    pub fn span(&self) -> (u64, u64) {
+        self.span
     }
 }
 
@@ -70,6 +80,7 @@ impl Handles {
         rows.push(Binding {
             slab: buffer.slab().clone(),
             offset,
+            span: (offset, offset.saturating_add(len)),
         });
         Ok(at as u32)
     }
@@ -121,19 +132,20 @@ impl Handles {
     }
 
     pub fn cut(&self, handle: u32, skip: u64, len: u64) -> Result<u32> {
-        let (slab, offset) = {
+        let (slab, offset, parent) = {
             let rows = self.rows.borrow();
             let row = rows.get(handle as usize).ok_or_else(|| Fault::Unbound {
                 what: format!("handle {handle}, which this load minted no row for"),
             })?;
-            (row.slab.clone(), row.offset)
+            (row.slab.clone(), row.offset, row.span)
         };
         let at_offset = offset.checked_add(skip).ok_or(Fault::Ceiling {
             what: "bytes of a device reservation",
             need: u64::MAX,
             have: offset,
         })?;
-        let _ = len;
+        let end = at_offset.saturating_add(len);
+        let span = (parent.0.min(at_offset), parent.1.max(end));
         let mut rows = self.rows.borrow_mut();
         let at = rows.len();
         if at >= NIL as usize {
@@ -146,6 +158,7 @@ impl Handles {
         rows.push(Binding {
             slab,
             offset: at_offset,
+            span,
         });
         Ok(at as u32)
     }

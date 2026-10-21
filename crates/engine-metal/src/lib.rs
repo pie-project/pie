@@ -27,6 +27,7 @@ pub mod weight_store;
 pub mod decoded;
 pub(crate) mod feeds;
 pub mod gather;
+pub mod hazard;
 pub mod host_source;
 #[cfg(target_vendor = "apple")]
 pub mod icb;

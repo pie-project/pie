@@ -37,6 +37,9 @@ struct Built {
     region: u32,
     run: u32,
     live: bool,
+    /// Whether the command carries a barrier: waits for every command
+    /// before it.
+    barrier: bool,
 }
 
 pub struct Icb {
@@ -47,6 +50,12 @@ pub struct Icb {
     slabs: HashMap<u64, Slab>,
     rebinder: Option<crate::rebind::Rebinder>,
     stale: bool,
+    /// Whether the barriers are still the ones placed at the build, from
+    /// what each command read and wrote there. A rebind that moves anything
+    /// but a scalar's value — an offset, a pipeline, a grid, a command off
+    /// or back on — leaves those reads and writes unknown, and the buffer
+    /// goes back to a barrier on every command.
+    planned: bool,
 }
 
 // SAFETY: Metal objects here are thread-safe for retain/release/binding, and
@@ -171,6 +180,7 @@ impl Icb {
                         if self.built[*index].live || forced {
                             unsafe { self.icb.indirectComputeCommandAtIndex(*index).reset() };
                             self.built[*index].live = false;
+                            self.built[*index].barrier = false;
                             moved.turned_off += 1;
                         }
                     }
@@ -202,10 +212,40 @@ impl Icb {
                 }
             }
         }
+        if self.planned
+            && (forced
+                || moved.offsets
+                    + moved.grids
+                    + moved.pipelines
+                    + moved.turned_off
+                    + moved.turned_on
+                    > 0)
+        {
+            self.planned = false;
+        }
+        if !self.planned {
+            self.serialize();
+        }
         if let Some(rebinder) = self.rebinder.as_mut() {
             rebinder.desync()?;
         }
         Ok(moved)
+    }
+
+    /// A barrier on every live command, as the device rebind places them.
+    fn serialize(&mut self) {
+        for (index, built) in self.built.iter_mut().enumerate() {
+            if built.live && !built.barrier {
+                unsafe { self.icb.indirectComputeCommandAtIndex(index).setBarrier() };
+                built.barrier = true;
+            }
+        }
+    }
+
+    /// Commands that carry a barrier, of the live ones.
+    #[must_use]
+    pub fn barriers(&self) -> usize {
+        self.built.iter().filter(|b| b.live && b.barrier).count()
     }
 
     fn slot(
@@ -242,6 +282,7 @@ impl Icb {
         if revived {
             command.setBarrier();
             self.built[index].live = true;
+            self.built[index].barrier = true;
             moved.turned_on += 1;
         }
         Ok(())
@@ -364,7 +405,9 @@ impl Icb {
     }
 
     pub fn execute(&self, device: &Context) -> Result<()> {
-        let frame = device.frame()?;
+        // A concurrent pass, so the commands with no barrier between them
+        // overlap; the barriers are the commands' own.
+        let frame = device.concurrent_frame()?;
         {
             let encoder = frame.encoder();
             for slab in &self.residents {
@@ -426,6 +469,7 @@ pub struct Builder<'a> {
     cursor: std::cell::Cell<u64>,
     built: RefCell<Vec<Built>>,
     slabs: RefCell<HashMap<u64, Slab>>,
+    hazards: RefCell<crate::hazard::Hazards>,
     ceiling: usize,
 }
 
@@ -468,6 +512,7 @@ impl<'a> Builder<'a> {
             cursor: std::cell::Cell::new(0),
             built: RefCell::new(Vec::with_capacity(slots)),
             slabs: RefCell::new(HashMap::new()),
+            hazards: RefCell::new(crate::hazard::Hazards::new()),
             ceiling: slots,
         })
     }
@@ -492,6 +537,7 @@ impl<'a> Builder<'a> {
             slabs,
             rebinder: None,
             stale: false,
+            planned: true,
         })
     }
 
@@ -548,7 +594,17 @@ impl Builder<'_> {
             size(fire.group)
         };
         command.concurrentDispatchThreads_threadsPerThreadgroup(size(fire.lanes), group);
-        command.setBarrier();
+        let barrier = self.hazards.borrow_mut().admit(&crate::encode::accesses(
+            self.handles,
+            self.pipelines,
+            fire,
+            args,
+        ));
+        if barrier {
+            command.setBarrier();
+        } else {
+            command.clearBarrier();
+        }
 
         self.built.borrow_mut().push(Built {
             point: point_of(fire),
@@ -559,6 +615,7 @@ impl Builder<'_> {
             region: self.place.region.get(),
             run: self.place.run.get(),
             live: true,
+            barrier,
         });
         Ok(())
     }

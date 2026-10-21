@@ -392,7 +392,11 @@ impl Encode for Sink<'_> {
                 return Ok(());
             }
             self.with_frame(|frame| {
-                let encoder = frame.encoder();
+                let encoder = if frame.concurrent() {
+                    frame.tracked(&accesses(self.handles, self.pipelines, fire, args))
+                } else {
+                    frame.encoder()
+                };
                 encoder.setComputePipelineState(&pipeline);
                 for (at, arg) in args.iter().enumerate() {
                     self.bind(&encoder, fire, at, *arg)?;
@@ -586,4 +590,40 @@ impl Sink<'_> {
         }
         Ok(())
     }
+}
+
+/// The bytes a launch of `fire` over `args` touches. A buffer is read only
+/// when both the caller binds it read-only and the kernel declares it so;
+/// anything else counts as written. A handle no row answers is refused at
+/// binding, so here it is only left out.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+pub(crate) fn accesses(
+    handles: &Handles,
+    pipelines: &Pipelines,
+    fire: Fire,
+    args: &[ArgValue],
+) -> Vec<crate::hazard::Access> {
+    let read_only = pipelines.read_only(fire);
+    let mut accesses = Vec::with_capacity(args.len());
+    for (at, arg) in args.iter().enumerate() {
+        let (handle, mutable) = match *arg {
+            ArgValue::Buffer(handle) => (handle, false),
+            ArgValue::BufferMut(handle) => (handle, true),
+            ArgValue::I32(_) | ArgValue::U32(_) | ArgValue::F32(_) | ArgValue::Usize(_) => {
+                continue;
+            }
+        };
+        let Some(binding) = handles.get(handle) else {
+            continue;
+        };
+        let write = mutable || at >= 64 || read_only & (1 << at) == 0;
+        let (start, end) = binding.span();
+        accesses.push(crate::hazard::Access::of(
+            crate::device::alloc::slab_id(binding.slab()),
+            start,
+            Some(end.saturating_sub(start)),
+            write,
+        ));
+    }
+    accesses
 }
