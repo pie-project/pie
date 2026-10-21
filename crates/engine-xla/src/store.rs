@@ -19,9 +19,6 @@ use kernels_xla::hlo::Elem;
 use kernels_xla::{KvPool, RecurrentPool, Tensor};
 use poem_ir::{CacheRow, Dtype, Trace};
 
-/// Source and destination rows of a pool copy.
-type Moves = (Vec<i64>, Vec<i64>);
-
 use crate::device::Device;
 use crate::error::{Fault, Result};
 use crate::pjrt::Buffer;
@@ -574,20 +571,21 @@ impl Pools {
         if !self.has_state() {
             return Ok(());
         }
-        let tracer = Tracer::new(handles);
+        let (inputs, at) = indices(handles, &[i64::from(slot)]);
+        let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
         let rows: Vec<Tensor> = self.state_rows().map(|r| r.1).collect();
         for &t in &rows {
             tracer.emit(&mut |cx| {
                 let whole = cx.read(t)?;
                 let elem = cx.elem(whole);
                 let zero = cx.const_i(elem, 0, &[1, i64::from(t.width)]);
-                let at = cx.const_i(Elem::I32, i64::from(slot), &[]);
+                let at = index_at(cx, at, 0, 1)?;
                 let col = cx.const_i(Elem::I32, 0, &[]);
                 let next = cx.dynamic_update_slice(whole, zero, &[at, col])?;
                 cx.write(t, next)
             })?;
         }
-        crate::exec::maintain(device, tracer, self)
+        crate::exec::maintain(device, tracer, self, &inputs)
     }
 
     /// Copies slot `src` of every state slab over slot `dst`.
@@ -600,7 +598,8 @@ impl Pools {
     ) -> Result<()> {
         self.check_slot(src)?;
         self.check_slot(dst)?;
-        let tracer = Tracer::new(handles);
+        let (inputs, at) = indices(handles, &[i64::from(src), i64::from(dst)]);
+        let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
         // A recurrent slot is its state row and its buffered page (rows
         // `slot * page ..` of each buffer plane): a copy that left the page
         // behind would hand the next fold whatever `dst` last held.
@@ -612,15 +611,16 @@ impl Pools {
         for (t, span) in rows.collect::<Vec<_>>() {
             tracer.emit(&mut |cx| {
                 let whole = cx.read(t)?;
-                let from = i64::from(src) * span;
-                let row = cx.slice_axis(whole, 0, from, from + span)?;
-                let at = cx.const_i(Elem::I32, i64::from(dst) * span, &[]);
+                let width = cx.dims(whole)[1];
+                let from = index_at(cx, at, 0, span)?;
+                let to = index_at(cx, at, 1, span)?;
                 let col = cx.const_i(Elem::I32, 0, &[]);
-                let next = cx.dynamic_update_slice(whole, row, &[at, col])?;
+                let row = cx.dynamic_slice(whole, &[from, col], &[span, width])?;
+                let next = cx.dynamic_update_slice(whole, row, &[to, col])?;
                 cx.write(t, next)
             })?;
         }
-        crate::exec::maintain(device, tracer, self)
+        crate::exec::maintain(device, tracer, self, &inputs)
     }
 
     #[must_use]
@@ -653,22 +653,36 @@ impl Pools {
                 have: u64::from(pages),
             });
         }
+        // The moves land in order (a later one may read what an earlier one
+        // wrote), padded to a power of two by repeating the last, which
+        // writes again what it wrote.
+        let mut flat: Vec<i64> = moves
+            .iter()
+            .flat_map(|&(src, dst)| [i64::from(src), i64::from(dst)])
+            .collect();
+        let n = moves.len().next_power_of_two();
+        let last = [flat[flat.len() - 2], flat[flat.len() - 1]];
+        while flat.len() < 2 * n {
+            flat.extend_from_slice(&last);
+        }
+        let (inputs, at) = indices(handles, &flat);
         let rows = i64::from(self.paging.page_size.max(1));
-        let tracer = Tracer::new(handles);
+        let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
         for &t in &self.rs_buffers {
             tracer.emit(&mut |cx| {
                 let mut whole = cx.read(t)?;
-                for &(src, dst) in moves {
-                    let page =
-                        cx.slice_axis(whole, 0, i64::from(src) * rows, i64::from(src + 1) * rows)?;
-                    let at = cx.const_i(Elem::I32, i64::from(dst) * rows, &[]);
-                    let col = cx.const_i(Elem::I32, 0, &[]);
-                    whole = cx.dynamic_update_slice(whole, page, &[at, col])?;
+                let width = cx.dims(whole)[1];
+                let col = cx.const_i(Elem::I32, 0, &[]);
+                for m in 0..n as i64 {
+                    let from = index_at(cx, at, 2 * m, rows)?;
+                    let to = index_at(cx, at, 2 * m + 1, rows)?;
+                    let page = cx.dynamic_slice(whole, &[from, col], &[rows, width])?;
+                    whole = cx.dynamic_update_slice(whole, page, &[to, col])?;
                 }
                 cx.write(t, whole)
             })?;
         }
-        crate::exec::maintain(device, tracer, self)
+        crate::exec::maintain(device, tracer, self, &inputs)
     }
 
     /// Applies kv `moves` to every full kv plane and `windowed` (whole
@@ -716,26 +730,45 @@ impl Pools {
         if full.0.is_empty() && window.0.is_empty() {
             return Ok(());
         }
-        let tracer = Tracer::new(handles);
-        let mut planes: Vec<(Tensor, &Moves)> = Vec::new();
+        // Each list as one input, padded to a power of two by repeating its
+        // last cell, which lands again what it landed.
+        let mut lists: Vec<i64> = Vec::new();
+        let mut spans: Vec<(i64, i64)> = Vec::new();
+        for (src, dst) in [&full, &window] {
+            if src.is_empty() {
+                spans.push((0, 0));
+                continue;
+            }
+            let n = src.len().next_power_of_two();
+            spans.push((lists.len() as i64, n as i64));
+            for list in [src, dst] {
+                lists.extend_from_slice(list);
+                let last = list[list.len() - 1];
+                lists.extend(std::iter::repeat_n(last, n - list.len()));
+            }
+        }
+        let (inputs, at) = indices(handles, &lists);
+        let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
+        let mut planes: Vec<(Tensor, (i64, i64))> = Vec::new();
         if !full.0.is_empty() {
-            planes.extend(self.kv_planes(false).map(|t| (t, &full)));
+            planes.extend(self.kv_planes(false).map(|t| (t, spans[0])));
         }
         if !window.0.is_empty() {
-            planes.extend(self.kv_planes(true).map(|t| (t, &window)));
+            planes.extend(self.kv_planes(true).map(|t| (t, spans[1])));
         }
-        for &(t, (src, dst)) in &planes {
+        for &(t, (from, n)) in &planes {
             tracer.emit(&mut |cx| {
                 let whole = cx.read(t)?;
-                let n = src.len() as i64;
-                let s = cx.const_ints(Elem::I32, src, &[n])?;
-                let d = cx.const_ints(Elem::I32, dst, &[n])?;
+                let all = cx.read(at)?;
+                let all = cx.reshape(all, &[lists.len() as i64])?;
+                let s = cx.slice_axis(all, 0, from, from + n)?;
+                let d = cx.slice_axis(all, 0, from + n, from + 2 * n)?;
                 let rows = cx.take_rows(whole, s)?;
                 let next = cx.put_rows(whole, d, rows, kernels_xla::hlo::Combine::Set)?;
                 cx.write(t, next)
             })?;
         }
-        crate::exec::maintain(device, tracer, self)
+        crate::exec::maintain(device, tracer, self, &inputs)
     }
 
     /// The bytes of slot `slot` across every state slab, in row order.
@@ -753,6 +786,36 @@ impl Pools {
         }
         Ok(out)
     }
+}
+
+/// `values` as the one i32 input of a maintenance program, so its text names
+/// how many slots, pages or cells it moves and not which: one program serves
+/// every slot.
+fn indices(handles: &Handles, values: &[i64]) -> (crate::inputs::Inputs, Tensor) {
+    let mut inputs = crate::inputs::Inputs::new();
+    let values: Vec<i32> = values
+        .iter()
+        .map(|&v| i32::try_from(v).unwrap_or(i32::MAX))
+        .collect();
+    let at = inputs.i32s(handles, &values, 1);
+    (inputs, at)
+}
+
+/// Entry `i` of an `indices` input, times `scale`, as an i32 scalar.
+fn index_at(
+    cx: &mut kernels_xla::Cx<'_>,
+    at: Tensor,
+    i: i64,
+    scale: i64,
+) -> std::result::Result<kernels_xla::hlo::Val, kernels_xla::Error> {
+    let all = cx.read(at)?;
+    let one = cx.slice_axis(all, 0, i, i + 1)?;
+    let one = cx.reshape(one, &[])?;
+    if scale == 1 {
+        return Ok(one);
+    }
+    let by = cx.const_i(Elem::I32, scale, &[]);
+    Ok(cx.mul(one, by)?)
 }
 
 impl engine::frame::Supply for Pools {

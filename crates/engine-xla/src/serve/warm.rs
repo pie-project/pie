@@ -6,7 +6,7 @@
 //! The ladder, over the canonical shapes `fire_inner` pads fires to:
 //! - a decode at every lane rung, at every page bound from the page floor to
 //!   the context's, as many lanes as the pool seats at half that bound;
-//! - a prefill at every row rung from 16, over 1 lane (one that fills its
+//! - a prefill at every row rung from the prefill floor (16), over 1 lane (one that fills its
 //!   rung, and one that leaves a padding lane) and, from 64 rows, 4 and 8;
 //! - a prefill beside a decode at every lane rung, at every row rung from
 //!   256 (such a fire pads its prefill lanes to the mixed host rung).
@@ -86,7 +86,10 @@ impl Shell {
             }
             pages = pad.next(pages);
         }
-        for &b in buckets.iter().filter(|&&b| (16..=widest).contains(&b)) {
+        for &b in buckets
+            .iter()
+            .filter(|&&b| (pad.prefill_floor.max(2)..=widest).contains(&b))
+        {
             shapes.push(vec![fresh(prefill, b)]);
             shapes.push(vec![fresh(prefill, b - 1)]);
             for n in [4u32, 8] {

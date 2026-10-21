@@ -1105,7 +1105,7 @@ fn delta_chunked(
     let beta = blank(f, h.beta, &[nc, c], &[0, 2, 1])?;
 
     // Cumulative decay inside each chunk.
-    let gcum = f.scan(g, 2, Fold::Sum)?;
+    let gcum = f.scan_steps(g, 2, Fold::Sum)?;
     let glast = f.slice_axis(gcum, 2, c - 1, c)?;
     let glast = f.reshape(glast, &[nc, hh, gd])?;
     let e = f.exp(gcum);
