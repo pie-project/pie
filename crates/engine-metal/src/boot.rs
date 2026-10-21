@@ -27,12 +27,17 @@ fn adapter_dir(doc: &toml::Table) -> Option<std::path::PathBuf> {
 }
 
 fn diagnostics(doc: &toml::Table) -> Result<crate::diag::Diagnostics, String> {
+    // PROFILING BRANCH ONLY (not for merge): with no [metal] diagnostics, take $PIE_METAL_DIAGNOSTICS, and
+    // with neither, print every fire's per-kernel device time, so a CI bench cell carries its profile
     let Some(words) = doc
         .get("metal")
         .and_then(toml::Value::as_table)
         .and_then(|metal| metal.get("diagnostics"))
     else {
-        return Ok(crate::diag::Diagnostics::default());
+        let words = std::env::var("PIE_METAL_DIAGNOSTICS").unwrap_or_else(|_| "kernel-profile=2".to_string());
+        return words
+            .parse::<crate::diag::Diagnostics>()
+            .map_err(|error| format!("PIE_METAL_DIAGNOSTICS: {error}"));
     };
     let words = words.as_str().ok_or_else(|| {
         format!("[metal] diagnostics is a comma-separated word list, not {words}")
