@@ -405,6 +405,9 @@ impl Run<'_> {
         if segments.len() > 3 {
             return Ok(false);
         }
+        // The narrow segments' threadgroups first, so they run in the first
+        // wave rather than trail the wide ones'.
+        segments.sort_by_key(|s| s.y.width);
         // Every output its own bytes, apart from each other and the activation.
         let span = |t: kernels_metal::Tensor| {
             self.address(t.buf)
@@ -423,12 +426,13 @@ impl Run<'_> {
             }
         }
         // ... and from what a node between them writes, which runs after the
-        // launch landed them (the first segment's output it reads).
+        // launch landed the later matmuls' outputs (it reads the first's).
+        let first_out = span(self.tensor(y));
         for &v in &between {
             let Some(b) = span(self.tensor(v)) else {
                 return Ok(false);
             };
-            if spans[2..].iter().any(|a| !apart(a, &b)) {
+            if spans[1..].iter().any(|a| Some(*a) != first_out && !apart(a, &b)) {
                 return Ok(false);
             }
         }
