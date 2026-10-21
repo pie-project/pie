@@ -19,6 +19,7 @@ members = [
     "relocate",
     "pool-replicate",
     "replicate",
+    "disaggregate",
     "test-spin",
     "test-trap",
     "test-route",

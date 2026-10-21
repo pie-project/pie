@@ -23,7 +23,10 @@ impl cluster::Policy for Route {
                 worker: prop(&Subject::Process(p.clone()), "worker")
                     .text()
                     .map(str::to_string),
-                executors: Vec::new(),
+                executors: prop(&Subject::Process(p.clone()), "executors")
+                    .text()
+                    .map(|ids| ids.split(',').map(str::to_string).collect())
+                    .unwrap_or_default(),
                 props: vec![("from".to_string(), Value::Text(p.clone()))],
             })
             .collect();

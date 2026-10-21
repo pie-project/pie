@@ -1,0 +1,8 @@
+# Runs every process's passes on the cluster's prefill workers, the least
+# loaded first; where it runs is the gateway's default.
+plane = "cluster"
+subscribe = ["arrived", "worker-removed", "worker-draining"]
+grants = ["placement"]
+requires = ["placement.executors"]
+# Long enough for the call that names a new arrival's executors to answer.
+gate-ms = 20
