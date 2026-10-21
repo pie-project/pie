@@ -439,6 +439,60 @@ template <typename T, int LANES, int VROWS, int PER>
 // The rows of a committed scan one pass stages in threadgroup memory.
 constant constexpr int kVerifyChunk = 16;
 
+// The ints of a lane's row in a recurrent buffer's page table.
+#ifndef PIE_RS_PAGE_INTS
+#define PIE_RS_PAGE_INTS 8
+#endif
+
+// Row `e` of a lane's extended rows in its buffer's plane: `pages` is the
+// lane's row of the page table, the in-page token of its first extended
+// row, then the slab slots of the pages its rows touch.
+inline device uchar* gdn_buffered_row(
+    device uchar* slab, const device int* pages, int e, uint page_tokens, uint page_bytes,
+    uint plane_at, uint row_bytes) {
+  const uint at = uint(pages[0] + e);
+  return slab + size_t(pages[1 + at / page_tokens]) * page_bytes + plane_at +
+         size_t(at % page_tokens) * row_bytes;
+}
+
+// A row's `[b | a]` gates of head `hv`, as `qwen_gdn_ba_gates` derives them:
+// `ba` the extended rows, or through a page table the window's own rows,
+// the replayed rows read from the lane's buffer and the window's own landed
+// there for the next fire.
+template <typename T>
+inline float2 gdn_verify_gates(
+    const device T* ba, const device float* a_log, const device T* dt_bias, int hv, int v_heads,
+    int t, int begin, int own, int rep, bool lands, device uchar* slab, const device int* pages,
+    uint page_tokens, uint page_bytes, uint plane_at, uint row_bytes) {
+  const size_t vh = size_t(v_heads);
+  float bv, av;
+  if (pages == nullptr) {
+    const size_t fused = size_t(begin + t) * 2 * vh;
+    bv = float(ba[fused + size_t(hv)]);
+    av = float(ba[fused + vh + size_t(hv)]);
+  } else if (t < rep) {
+    const device T* row = reinterpret_cast<const device T*>(
+        gdn_buffered_row(slab, pages, t, page_tokens, page_bytes, plane_at, row_bytes));
+    bv = float(row[hv]);
+    av = float(row[vh + size_t(hv)]);
+  } else {
+    const size_t fused = size_t(own + t) * 2 * vh;
+    const T b = ba[fused + size_t(hv)];
+    const T a = ba[fused + vh + size_t(hv)];
+    bv = float(b);
+    av = float(a);
+    if (lands && pages[0] >= 0) {
+      device T* row = reinterpret_cast<device T*>(
+          gdn_buffered_row(slab, pages, t, page_tokens, page_bytes, plane_at, row_bytes));
+      row[hv] = b;
+      row[vh + size_t(hv)] = a;
+    }
+  }
+  const float z = av + float(dt_bias[hv]);
+  const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::fast::exp(z));
+  return float2(-metal::fast::exp(a_log[hv]) * sp, 1.0f / (1.0f + metal::fast::exp(-bv)));
+}
+
 // A committed scan over 128-wide heads, its gates derived from the `[b | a]`
 // projection as it stages them, whose threadgroup holds `SG` simdgroups
 // of `32 / LANES` value-row groups, `VROWS` rows each. Each pass stages up to
@@ -469,6 +523,13 @@ template <typename T, int LANES, int SG, int VROWS, bool STRIDED>
     const constant int& v_heads [[buffer(13)]],
     const device int* snaps     [[buffer(14)]],
     const constant int& snap_lane0 [[buffer(15)]],
+    device uchar* slab          [[buffer(16)]],
+    const device int* page_table [[buffer(17)]],
+    const constant uint& page_tokens [[buffer(18)]],
+    const constant uint& page_bytes [[buffer(19)]],
+    const constant uint& plane_at [[buffer(20)]],
+    const constant uint& row_bytes [[buffer(21)]],
+    const constant int& paged   [[buffer(22)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]],
     uint sg_u [[simdgroup_index_in_threadgroup]]) {
@@ -506,6 +567,8 @@ template <typename T, int LANES, int SG, int VROWS, bool STRIDED>
   }
   const int own = indptr[r] - rep;
   const int keep = min(commit[lane0 + r], span);
+  const device int* pages =
+      paged != 0 ? page_table + size_t(lane0 + r) * PIE_RS_PAGE_INTS : nullptr;
   const int hk = hv / (v_heads / k_heads);
   const size_t keys = size_t(k_heads) * D;
   const size_t pitch = 2 * keys + size_t(v_heads) * D;
@@ -572,20 +635,15 @@ template <typename T, int LANES, int SG, int VROWS, bool STRIDED>
     // group of the head lands a row of the window's own in `gates`.
     if (tid < rows) {
       const int t = c0 + tid;
-      const size_t vh = size_t(v_heads);
-      const size_t fused = size_t(begin + t) * 2 * vh;
-      const float bv = float(ba[fused + size_t(hv)]);
-      const float av = float(ba[fused + vh + size_t(hv)]);
-      const float z = av + float(dt_bias[hv]);
-      const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::fast::exp(z));
-      const float g_log = -metal::fast::exp(a_log[hv]) * sp;
-      const float beta = 1.0f / (1.0f + metal::fast::exp(-bv));
-      decay_s[tid] = metal::exp(g_log);
-      beta_s[tid] = beta;
+      const float2 g = gdn_verify_gates<T>(ba, a_log, dt_bias, hv, v_heads, t, begin, own, rep,
+                                           group.y == 0, slab, pages, page_tokens, page_bytes,
+                                           plane_at, row_bytes);
+      decay_s[tid] = metal::exp(g.x);
+      beta_s[tid] = g.y;
       if (group.y == 0 && t >= rep) {
-        const size_t at = size_t(own + t) * 2 * vh + size_t(hv);
-        gates[at] = g_log;
-        gates[at + vh] = beta;
+        const size_t at = size_t(own + t) * 2 * size_t(v_heads) + size_t(hv);
+        gates[at] = g.x;
+        gates[at + size_t(v_heads)] = g.y;
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -647,7 +705,9 @@ template <typename T, int LANES, int SG, int VROWS, bool STRIDED>
       const device bfloat*, const device float*, const device bfloat*,         \
       device float*, device float*, device float*,                             \
       const constant int&, const constant int&, const device int*,             \
-      const constant int&, uint3, uint, uint);
+      const constant int&, device uchar*, const device int*,                   \
+      const constant uint&, const constant uint&, const constant uint&,        \
+      const constant uint&, const constant int&, uint3, uint, uint);
 
 PIE_GDN_VERIFY(32, 4, 4, false, "")
 PIE_GDN_VERIFY(32, 8, 4, false, "")
@@ -686,6 +746,13 @@ template <typename T, int SG, int VROWS, int BATCHES>
     const constant int& v_heads [[buffer(13)]],
     const device int* snaps     [[buffer(14)]],
     const constant int& snap_lane0 [[buffer(15)]],
+    device uchar* slab          [[buffer(16)]],
+    const device int* page_table [[buffer(17)]],
+    const constant uint& page_tokens [[buffer(18)]],
+    const constant uint& page_bytes [[buffer(19)]],
+    const constant uint& plane_at [[buffer(20)]],
+    const constant uint& row_bytes [[buffer(21)]],
+    const constant int& paged   [[buffer(22)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]],
     uint sg_u [[simdgroup_index_in_threadgroup]]) {
@@ -719,6 +786,8 @@ template <typename T, int SG, int VROWS, int BATCHES>
   }
   const int own = indptr[r] - rep;
   const int keep = min(commit[lane0 + r], span);
+  const device int* pages =
+      paged != 0 ? page_table + size_t(lane0 + r) * PIE_RS_PAGE_INTS : nullptr;
   const int hk = hv / (v_heads / k_heads);
   const size_t keys = size_t(k_heads) * D;
   const size_t pitch = 2 * keys + size_t(v_heads) * D;
@@ -764,20 +833,15 @@ template <typename T, int SG, int VROWS, int BATCHES>
   // of the head lands a row of the window's own in `gates`.
   if (tid < span) {
     const int t = tid;
-    const size_t vh = size_t(v_heads);
-    const size_t fused = size_t(begin + t) * 2 * vh;
-    const float bv = float(ba[fused + size_t(hv)]);
-    const float av = float(ba[fused + vh + size_t(hv)]);
-    const float z = av + float(dt_bias[hv]);
-    const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::fast::exp(z));
-    const float g_log = -metal::fast::exp(a_log[hv]) * sp;
-    const float beta = 1.0f / (1.0f + metal::fast::exp(-bv));
-    decay_s[t] = metal::exp(g_log);
-    beta_s[t] = beta;
+    const float2 g = gdn_verify_gates<T>(ba, a_log, dt_bias, hv, v_heads, t, begin, own, rep,
+                                         group.y == 0, slab, pages, page_tokens, page_bytes,
+                                         plane_at, row_bytes);
+    decay_s[t] = metal::exp(g.x);
+    beta_s[t] = g.y;
     if (group.y == 0 && t >= rep) {
-      const size_t at = size_t(own + t) * 2 * vh + size_t(hv);
-      gates[at] = g_log;
-      gates[at + vh] = beta;
+      const size_t at = size_t(own + t) * 2 * size_t(v_heads) + size_t(hv);
+      gates[at] = g.x;
+      gates[at + size_t(v_heads)] = g.y;
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -857,7 +921,9 @@ template <typename T, int SG, int VROWS, int BATCHES>
       const device bfloat*, const device float*, const device bfloat*,         \
       device float*, device float*, device float*,                             \
       const constant int&, const constant int&, const device int*,             \
-      const constant int&, uint3, uint, uint);
+      const constant int&, device uchar*, const device int*,                   \
+      const constant uint&, const constant uint&, const constant uint&,        \
+      const constant uint&, const constant int&, uint3, uint, uint);
 
 PIE_GDN_VERIFY_BATCHED(8, 4, 4)
 PIE_GDN_VERIFY_BATCHED(8, 2, 8)

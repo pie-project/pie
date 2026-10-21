@@ -741,13 +741,19 @@ impl Run<'_> {
             } if self.rs_seat().is_some() => {
                 const OP: &str = "attention.ssm_causal_conv1d_committed";
                 let seat = self.rs_seat().expect("guarded");
-                let ext_x = self.rs_extend(OP, &seat, *x)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
-                // The verify conv lands the window's own rows itself.
-                if attn::ssm::causal_conv1d_verify_fits(ext_x.width, *conv_width, *dilation) {
+                // The verify conv lands the window's own rows itself, and
+                // through the page table reads and lands the buffer's too.
+                if attn::ssm::causal_conv1d_verify_fits(ext_y.width, *conv_width, *dilation) {
+                    let paged = seat.paged(*x);
+                    let source = match paged {
+                        Some(_) => self.tensor(*x),
+                        None => self.rs_extend(OP, &seat, *x)?,
+                    };
                     return attn::ssm::causal_conv1d_verify(
                         self.ctx(),
-                        ext_x,
+                        source,
+                        paged,
                         self.qo_indptr(),
                         &self.rs_committed(&seat),
                         self.tensor(*weight),
@@ -759,6 +765,7 @@ impl Run<'_> {
                         self.rs_snapshots(),
                     );
                 }
+                let ext_x = self.rs_extend(OP, &seat, *x)?;
                 attn::ssm::causal_conv1d_committed_landing(
                     self.ctx(),
                     ext_x,
@@ -779,15 +786,12 @@ impl Run<'_> {
                 a_log,
                 gates,
             } if self.rs_seat().is_some() => {
-                const OP: &str = "attention.ssm_gdn_prep";
                 let seat = self.rs_seat().expect("guarded");
                 // The scan that reads the gates derives them as it stages
                 // its rows, and lands the window's own.
-                let ext_ba = self.rs_extend(OP, &seat, *ba)?;
-                seat.prepped.borrow_mut().insert(
-                    gates.0,
-                    [ext_ba, self.tensor(*dt_bias), self.tensor(*a_log)],
-                );
+                seat.prepped
+                    .borrow_mut()
+                    .insert(gates.0, (*ba, self.tensor(*dt_bias), self.tensor(*a_log)));
                 Ok(())
             }
             Attention::SsmGatedDelta {
@@ -816,9 +820,14 @@ impl Run<'_> {
                 let seat = self.rs_seat().expect("guarded");
                 let ext_qkv = self.rs_ext_of(OP, &seat, *qkv)?;
                 let prepped = seat.prepped.borrow_mut().remove(&gates.0);
-                if let Some([ba, dt_bias, a_log]) = prepped
+                if let Some((ba, dt_bias, a_log)) = prepped
                     && attn::ssm::gated_delta_verify_fits(*k_dim, *v_dim)
                 {
+                    let paged = seat.paged(ba);
+                    let ba = match paged {
+                        Some(_) => self.tensor(ba),
+                        None => self.rs_extend(OP, &seat, ba)?,
+                    };
                     return attn::ssm::gated_delta_verify(
                         self.ctx(),
                         ext_qkv,
@@ -830,6 +839,7 @@ impl Run<'_> {
                             a_log,
                             gates: self.tensor(*gates),
                         },
+                        paged,
                         &self.recurrent(*state),
                         *k_heads,
                         *v_heads,
@@ -841,9 +851,10 @@ impl Run<'_> {
                 }
                 // Heads the verify scan does not stage take the gate prep
                 // the verify scan would have folded in.
-                if let Some([ba, dt_bias, a_log]) = prepped {
+                if let Some((ba, dt_bias, a_log)) = prepped {
+                    let ext_ba = self.rs_extend(OP, &seat, ba)?;
                     let ext_gates = self.rs_out(OP, &seat, *gates)?;
-                    attn::ssm::gdn_prep(self.ctx(), ba, dt_bias, a_log, ext_gates)?;
+                    attn::ssm::gdn_prep(self.ctx(), ext_ba, dt_bias, a_log, ext_gates)?;
                     self.rs_land(OP, &seat, ext_gates, *gates)?;
                 }
                 let ext_gates = self.rs_ext_of(OP, &seat, *gates)?;
