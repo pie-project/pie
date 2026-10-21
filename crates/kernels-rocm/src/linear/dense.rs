@@ -11,7 +11,9 @@ use crate::hip::{lt, sys};
 use crate::jit::{Ctx, refuse};
 
 use super::dense_batch::dense_batch_bf16;
-use super::gemv::{SkinnyEpilogue, gemv_bf16, skinny_bf16, skinny_f32, skinny_swiglu_bf16, skinnyt, turn_plan};
+use super::gemv::{
+    SkinnyEpilogue, gemv_bf16, skinny_bf16, skinny_f32, skinny_swiglu_bf16, skinnyt, turn_plan,
+};
 
 /// Up to eight rows the skinny kernels always take a small weight.
 const SKINNY_SMALL: i32 = 8;
@@ -90,7 +92,10 @@ pub(crate) fn act_x_wt(
         return Ok(false);
     }
     let way = route(ctx, m, n, k);
-    if bias == 0 && way == Route::Turn && skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::Store).is_ok() {
+    if bias == 0
+        && way == Route::Turn
+        && skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::Store).is_ok()
+    {
         return Ok(false);
     }
     if bias == 0 && way == Route::Skinny && skinny_bf16(ctx, w, act, y, m, n, k).is_ok() {
@@ -213,7 +218,19 @@ pub(crate) fn act_x_wt_swiglu(
         return Ok(false);
     }
     let way = route(ctx, m, 2 * intermediate, k);
-    if way == Route::Turn && skinnyt(ctx, gate_up, act, h, m, intermediate, k, SkinnyEpilogue::Swiglu).is_ok() {
+    if way == Route::Turn
+        && skinnyt(
+            ctx,
+            gate_up,
+            act,
+            h,
+            m,
+            intermediate,
+            k,
+            SkinnyEpilogue::Swiglu,
+        )
+        .is_ok()
+    {
         return Ok(true);
     }
     if way == Route::Skinny && skinny_swiglu_bf16(ctx, gate_up, act, h, m, intermediate, k).is_ok()
@@ -258,16 +275,29 @@ pub(crate) fn act_x_wt_live(
         return Ok(false);
     };
     let tiles = ctx.tuning().gemm_live_tiles;
-    let Some(at) = tiles.iter().map(|&t| lib.pick(t)).collect::<Option<Vec<usize>>>() else {
+    let Some(at) = tiles
+        .iter()
+        .map(|&t| lib.pick(t))
+        .collect::<Option<Vec<usize>>>()
+    else {
         return Ok(false);
     };
     // Launch r takes live rows up to its tile's MT1 (the last, up to m).
-    let bound = |r: usize| if r == 2 { m } else { lib.solutions[at[r]].mt[1].min(m) };
+    let bound = |r: usize| {
+        if r == 2 {
+            m
+        } else {
+            lib.solutions[at[r]].mt[1].min(m)
+        }
+    };
     let args = ctx.scratch(op, "linear.live_args", 6 * USER_ARGS_BYTES)? as u64;
     ctx.fire(
         op,
-        Fire::at("linear/moe.hip", symbol("::pie::linear::dense_lt_live_args<::pie::bf16>"))
-            .apply(Launch::grid([1, 1, 1], [64, 1, 1])),
+        Fire::at(
+            "linear/moe.hip",
+            symbol("::pie::linear::dense_lt_live_args<::pie::bf16>"),
+        )
+        .apply(Launch::grid([1, 1, 1], [64, 1, 1])),
         &[
             ArgValue::Ptr(live),
             ArgValue::Ptr(args),
@@ -286,7 +316,8 @@ pub(crate) fn act_x_wt_live(
         let record = args + (2 * r * USER_ARGS_BYTES) as u64;
         // SAFETY: the records were written on this stream, naming act, w and
         // y, live device planes of [m, k], [n, k] and [m, n] bf16.
-        unsafe { lib.launch(solution, 2, record, grid, ctx.stream()) }.map_err(|why| refuse(op, why))?;
+        unsafe { lib.launch(solution, 2, record, grid, ctx.stream()) }
+            .map_err(|why| refuse(op, why))?;
     }
     Ok(true)
 }

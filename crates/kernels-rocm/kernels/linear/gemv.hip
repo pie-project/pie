@@ -376,8 +376,9 @@ __global__ __launch_bounds__(1024) void skinny4_bf16(const bf16* __restrict__ we
 // ------------------------------------------------------------ skinnyt --
 
 // y = act · Wᵀ for up to 32 decode rows (one or two 16-row activation
-// blocks), the weight read in whole 512-byte row runs (two rows an instruction) and turned through LDS into the
-// 16x16x16 core's operand order. A block of KS wavefronts walks 16-row
+// blocks), the weight read in whole 512-byte row runs (two rows an
+// instruction) and turned through LDS into the 16x16x16 core's operand
+// order. A block of KS wavefronts walks 16-row
 // tiles; wavefront w owns K's 256-element slices w, w + KS, ... (R of them),
 // its activation slices held in registers for the whole walk and the next
 // tile's weight in flight under this one's products. The slices' sums meet

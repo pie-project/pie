@@ -106,7 +106,9 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     // in whole runs of eight, else a wavefront a head.
     let run = if span.unsigned_abs().is_multiple_of(8)
         && (span.unsigned_abs() / 8).is_power_of_two()
-        && [qk_width, v_width].iter().all(|w| w.unsigned_abs().is_multiple_of(8))
+        && [qk_width, v_width]
+            .iter()
+            .all(|w| w.unsigned_abs().is_multiple_of(8))
     {
         8
     } else {
@@ -182,7 +184,9 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     if fp8 {
         return Err(refuse(
             OP,
-            format!("a {head_dim}-wide head's fused write into e4m3 pages wants 16-byte-aligned planes"),
+            format!(
+                "a {head_dim}-wide head's fused write into e4m3 pages wants 16-byte-aligned planes"
+            ),
         ));
     }
     if !classic {

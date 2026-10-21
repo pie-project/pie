@@ -416,7 +416,7 @@ pub(crate) fn turn_plan(m: u32, rows: u32, k: u32) -> Option<(u32, u32, u32)> {
     Some((ks, r, rows.div_ceil(16).min(resident)))
 }
 
-/// `y[m, n] = act[m, k] · w[n, k]ᵀ` for 1 ≤ m ≤ 16 on the turned kernel
+/// `y[m, n] = act[m, k] · w[n, k]ᵀ` for 1 ≤ m ≤ 32 on the turned kernel
 /// (`skinnyt_bf16`), K up to 2048 in whole 256s. Refuses what it does not
 /// cover.
 #[allow(clippy::too_many_arguments)]
@@ -432,7 +432,11 @@ pub(crate) fn skinnyt(
 ) -> Result<(), Error> {
     const OP: &str = "linear.skinnyt";
     let glu = matches!(epilogue, SkinnyEpilogue::Swiglu | SkinnyEpilogue::Geglu);
-    let plan = turn_plan(m.unsigned_abs(), n.unsigned_abs() * if glu { 2 } else { 1 }, k.unsigned_abs());
+    let plan = turn_plan(
+        m.unsigned_abs(),
+        n.unsigned_abs() * if glu { 2 } else { 1 },
+        k.unsigned_abs(),
+    );
     let (Some((ks, r, grid)), true) = (plan, n > 0 && k > 0) else {
         return Err(refuse(
             OP,

@@ -116,7 +116,12 @@ fn attn_mamba2_step() {
     let mut state = case.state.clone();
     for (r, &slot) in slots.iter().enumerate() {
         let want = case.token(&mut state, slot as usize, r);
-        close_abs(&format!("step row {r}"), &got[r * INNER..(r + 1) * INNER], &want, 3e-2);
+        close_abs(
+            &format!("step row {r}"),
+            &got[r * INNER..(r + 1) * INNER],
+            &want,
+            3e-2,
+        );
     }
     close_abs("step state", &gpu.read(&pool.slab), &state, 1e-4);
 }
@@ -142,7 +147,12 @@ fn attn_mamba2_scan() {
     for (r, &slot) in slots.iter().enumerate() {
         for row in indptr[r] as usize..indptr[r + 1] as usize {
             let want = case.token(&mut state, slot as usize, row);
-            close_abs(&format!("scan row {row}"), &got[row * INNER..(row + 1) * INNER], &want, 3e-2);
+            close_abs(
+                &format!("scan row {row}"),
+                &got[row * INNER..(row + 1) * INNER],
+                &want,
+                3e-2,
+            );
         }
     }
     close_abs("scan state", &gpu.read(&pool.slab), &state, 1e-3);

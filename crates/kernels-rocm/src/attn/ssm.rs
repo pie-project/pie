@@ -1097,10 +1097,18 @@ fn chunk_parallel(
     common(&mut args)?;
     let from = ctx.tuning().ssm_gdn_wide_from;
     let slices = lanes * v_heads * (v_dim / CHUNK_SLICE);
-    let bvt = if from > 0 && slices >= from { 2 * CHUNK_SLICE } else { CHUNK_SLICE };
+    let bvt = if from > 0 && slices >= from {
+        2 * CHUNK_SLICE
+    } else {
+        CHUNK_SLICE
+    };
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&format!("::pie::attn::ssm_gdn_chunk_h<128, 128, {bvt}>"))).apply(Launch::grid(
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::attn::ssm_gdn_chunk_h<128, 128, {bvt}>")),
+        )
+        .apply(Launch::grid(
             [lanes * v_heads * (v_dim / bvt), 1, 1],
             [BLOCK, 1, 1],
         )),

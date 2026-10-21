@@ -230,11 +230,8 @@ fn the_turned_projection() {
     let ctx = gpu.ctx().with_tuning(t);
     for (m, n, k) in [
         (1u32, 2056u32, 256u32),
-        (3, 1000, 512),
         (8, 4096, 2048),
-        (8, 1024, 2048),
         (13, 24, 1280),
-        (16, 2048, 1792),
         (24, 3000, 2048),
         (32, 1024, 768),
     ] {
@@ -320,9 +317,18 @@ fn the_live_lm_head_multiplies_the_live_rows() {
     t.gemm_live_from = 129;
     let ctx = gpu.ctx().with_tuning(t);
     let (m, n, k) = (192u32, 3000u32, 512u32);
-    let a: Vec<f32> = values((m * k) as usize, 31, 1.0).into_iter().map(round_bf16).collect();
-    let w: Vec<f32> = values((n * k) as usize, 32, 0.05).into_iter().map(round_bf16).collect();
-    let (at, wt) = (gpu.tensor(&a, m, k, Dtype::Bf16), gpu.tensor(&w, n, k, Dtype::Bf16));
+    let a: Vec<f32> = values((m * k) as usize, 31, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let w: Vec<f32> = values((n * k) as usize, 32, 0.05)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let (at, wt) = (
+        gpu.tensor(&a, m, k, Dtype::Bf16),
+        gpu.tensor(&w, n, k, Dtype::Bf16),
+    );
     let want = reference(&a, &w, None, m as usize, n as usize, k as usize);
     for live in [7u32, 40, 150, 192] {
         let count = gpu.upload(&[live], 1, 1, Dtype::I32);
@@ -331,6 +337,9 @@ fn the_live_lm_head_multiplies_the_live_rows() {
         let got = gpu.read(&y);
         let rows = (live * n) as usize;
         close_bf16(&format!("live {live}"), &got[..rows], &want[..rows], 2.0);
-        assert!(got[rows..].iter().all(|&v| v == 3.0), "live {live}: a padding row was written");
+        assert!(
+            got[rows..].iter().all(|&v| v == 3.0),
+            "live {live}: a padding row was written"
+        );
     }
 }

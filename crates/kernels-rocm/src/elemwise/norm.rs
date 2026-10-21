@@ -138,15 +138,16 @@ fn rms_row(
     )?;
     let launch = rows_per_head(op, y.rows, y.width, per_head_dim)?;
     let heads = stated(op, per_head_split(y.width, per_head_dim))?;
-    if let Some((lph, lanes, total)) =
-        head_lanes(op, y, per_head_dim, &[x.ptr, weight.ptr, y.ptr])?
+    if let Some((lph, lanes, total)) = head_lanes(op, y, per_head_dim, &[x.ptr, weight.ptr, y.ptr])?
     {
         let plus = template == OFFSET_BANK;
         return ctx.fire(
             op,
             Fire::at(
                 FILE,
-                symbol(&format!("::pie::elemwise::rmsnorm_lanes<{t}, {lph}, {plus}>")),
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_lanes<{t}, {lph}, {plus}>"
+                )),
             )
             .apply(lanes),
             &[
@@ -283,7 +284,9 @@ pub fn rmsnorm_no_scale(
             OP,
             Fire::at(
                 FILE,
-                symbol(&format!("::pie::elemwise::rmsnorm_lanes<{t}, {lph}, false>")),
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_lanes<{t}, {lph}, false>"
+                )),
             )
             .apply(lanes),
             &[
@@ -353,7 +356,9 @@ pub fn rmsnorm_gated(
             OP,
             Fire::at(
                 FILE,
-                symbol(&format!("::pie::elemwise::rmsnorm_gated_f32_lanes<{t}, {lph}>")),
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_gated_f32_lanes<{t}, {lph}>"
+                )),
             )
             .apply(lanes),
             &[
@@ -855,8 +860,7 @@ pub fn norm_gate(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entry))
-        .apply(Launch::per_row(rows, BLOCK)),
+        Fire::at(FILE, symbol(&entry)).apply(Launch::per_row(rows, BLOCK)),
         &[
             x.arg(),
             absent(scale.as_ref()),

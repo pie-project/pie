@@ -956,8 +956,7 @@ mod hip {
                     ..Engine::of(&registry().defaults())
                 }
             );
-            // The defaults, but for the routed MLP's, MLA absorbs' and FP8
-            // tiles' paths the family measured.
+            // The defaults, but for the paths the family measured.
             let mut want = kernels_cuda::tuning::Tuning::of(&registry().defaults());
             want.mla_absorb_q_until = 2048;
             want.mla_absorb_out_from = 33;
@@ -971,6 +970,9 @@ mod hip {
             want.moe_lt_deep_k = 2048;
             want.moe_ordered_from = 128;
             want.gemm_live_from = 129;
+            want.gemm_turn_from = 3;
+            want.gemm_turn_wide_until = 32;
+            want.ssm_gdn_wide_from = 512;
             assert_eq!(kernels_cuda::tuning::Tuning::of(&profile), want, "{gpu}");
         }
     }

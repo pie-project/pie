@@ -494,7 +494,11 @@ fn norm_gate() {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
     let (eps, temp) = (1e-6f32, 0.7f32);
-    for (rows, n, fan, gated) in [(3u32, 4096u32, 1u32, true), (4, 8192, 2, false), (2, 100, 1, true)] {
+    for (rows, n, fan, gated) in [
+        (3u32, 4096u32, 1u32, true),
+        (4, 8192, 2, false),
+        (2, 100, 1, true),
+    ] {
         let len = (rows * n) as usize;
         let xs = bf16s(len, 11, 2.0);
         let ss = bf16s(n as usize, 12, 1.0);
@@ -513,12 +517,32 @@ fn norm_gate() {
             plus_one: true,
             y: z,
         };
-        let (res_t, gate_t) = if gated { (Some(res), Some(gate)) } else { (None, None) };
-        norm::norm_gate(&ctx, x, Some(scale), res_t, gate_t, eps, temp, fan, Some(next), &mut y).unwrap();
+        let (res_t, gate_t) = if gated {
+            (Some(res), Some(gate))
+        } else {
+            (None, None)
+        };
+        norm::norm_gate(
+            &ctx,
+            x,
+            Some(scale),
+            res_t,
+            gate_t,
+            eps,
+            temp,
+            fan,
+            Some(next),
+            &mut y,
+        )
+        .unwrap();
         let (mut want_y, mut want_z) = (Vec::new(), Vec::new());
         for r in 0..rows as usize {
             let row = &xs[r * n as usize..(r + 1) * n as usize];
-            let u: Vec<f32> = row.iter().zip(&ss).map(|(v, s)| round_bf16(v * s)).collect();
+            let u: Vec<f32> = row
+                .iter()
+                .zip(&ss)
+                .map(|(v, s)| round_bf16(v * s))
+                .collect();
             let inv = inv_rms(&u, eps);
             let out: Vec<f32> = u
                 .iter()
@@ -536,7 +560,11 @@ fn norm_gate() {
                 })
                 .collect();
             let inv2 = inv_rms(&out, eps);
-            want_z.extend(out.iter().zip(&nw).map(|(o, w)| round_bf16(o * inv2 * (w + 1.0))));
+            want_z.extend(
+                out.iter()
+                    .zip(&nw)
+                    .map(|(o, w)| round_bf16(o * inv2 * (w + 1.0))),
+            );
             want_y.extend(out);
         }
         close_bf16(&format!("norm_gate {n} y"), &gpu.read(&y), &want_y, 2.0);

@@ -338,7 +338,11 @@ pub fn e4m3_code(x: f32) -> u8 {
             best = c;
         }
     }
-    if x < 0.0 && best != 0 { best | 0x80 } else { best }
+    if x < 0.0 && best != 0 {
+        best | 0x80
+    } else {
+        best
+    }
 }
 
 /// Every `have[i]` is within `ulps` bf16 steps of `want[i]`.

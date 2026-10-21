@@ -1324,8 +1324,9 @@ __global__ __launch_bounds__(512) void ssm_gdn_chunk_wu(
 // each 16-column tile. Records each chunk's entering state (hcT
 // [s][V_h][BV][BK]) and V' (vnT [s][V_h][BV][CH], zero past the chunk's
 // rows). The next chunk's operands are loaded while this one computes, two
-// wavefronts a SIMD (a deeper ring spills them). A wider slice reads a chunk's W and k̂ᵀ for more
-// columns; a narrower one fills the device at fewer requests.
+// wavefronts a SIMD (a deeper ring spills them). A wider slice reads a
+// chunk's W and k̂ᵀ for more columns; a narrower one fills the device at
+// fewer requests.
 template <int BK, int BV, int BVT>
 __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(2, 2))) void ssm_gdn_chunk_h(
     const float* __restrict__ gcum, const bf16* __restrict__ kT, const bf16* __restrict__ w,

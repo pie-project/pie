@@ -53,12 +53,13 @@ fn packed_halves(
 /// The launch of a packed GLU's eight-a-thread form, where the halves are
 /// whole eights in 16-byte aligned planes.
 fn vec8(packed: Tensor, intermediate: u32, y: &Tensor) -> Option<Launch> {
-    (intermediate.is_multiple_of(8) && packed.ptr.is_multiple_of(16) && y.ptr.is_multiple_of(16)).then(|| {
-        Launch::grid(
-            [y.rows, (intermediate / 8).div_ceil(BLOCK), 1],
-            [BLOCK, 1, 1],
-        )
-    })
+    (intermediate.is_multiple_of(8) && packed.ptr.is_multiple_of(16) && y.ptr.is_multiple_of(16))
+        .then(|| {
+            Launch::grid(
+                [y.rows, (intermediate / 8).div_ceil(BLOCK), 1],
+                [BLOCK, 1, 1],
+            )
+        })
 }
 
 pub fn swiglu(
@@ -71,10 +72,10 @@ pub fn swiglu(
     const OP: &str = "linear.mlp_swiglu";
     let t = dtype_dispatch!(OP, packed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
-    let (entry, launch) = vec8(packed, intermediate, y)
-        .map_or((format!("::pie::linear::mlp_swiglu<{t}>"), launch), |packs| {
-            (format!("::pie::linear::mlp_swiglu_vec8<{t}>"), packs)
-        });
+    let (entry, launch) = vec8(packed, intermediate, y).map_or(
+        (format!("::pie::linear::mlp_swiglu<{t}>"), launch),
+        |packs| (format!("::pie::linear::mlp_swiglu_vec8<{t}>"), packs),
+    );
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&entry)).apply(launch),
@@ -348,8 +349,11 @@ fn act(
     nonzero(op, "the activation's element count", lanes)?;
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&format!("::pie::linear::mlp_act<{t}, {relu2}>")))
-            .apply(Launch::flat(lanes, BLOCK)),
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::linear::mlp_act<{t}, {relu2}>")),
+        )
+        .apply(Launch::flat(lanes, BLOCK)),
         &[
             x.arg(),
             y.arg(),
@@ -371,10 +375,15 @@ pub fn geglu_tanh_packed(
     const OP: &str = "linear.mlp_geglu_tanh_packed";
     let t = dtype_dispatch!(OP, packed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
-    let (entry, launch) = vec8(packed, intermediate, y)
-        .map_or((format!("::pie::linear::mlp_geglu_tanh_packed<{t}>"), launch), |packs| {
-            (format!("::pie::linear::mlp_geglu_tanh_packed_vec8<{t}>"), packs)
-        });
+    let (entry, launch) = vec8(packed, intermediate, y).map_or(
+        (format!("::pie::linear::mlp_geglu_tanh_packed<{t}>"), launch),
+        |packs| {
+            (
+                format!("::pie::linear::mlp_geglu_tanh_packed_vec8<{t}>"),
+                packs,
+            )
+        },
+    );
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&entry)).apply(launch),

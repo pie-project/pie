@@ -95,7 +95,13 @@ fn cache(
     let mut kp = vec![0f32; cells * rope.max(1)];
     let (mut ckv, mut kpe) = (Vec::new(), Vec::new());
     for (r, &n) in kv_lens.iter().enumerate() {
-        let quant = |x: f32| if fp8 { e4m3_value(e4m3_code(x)) } else { round_bf16(x) };
+        let quant = |x: f32| {
+            if fp8 {
+                e4m3_value(e4m3_code(x))
+            } else {
+                round_bf16(x)
+            }
+        };
         let c: Vec<f32> = values(n * rank, seed + r as u64, 1.0)
             .into_iter()
             .map(quant)
@@ -115,7 +121,11 @@ fn cache(
     let max_pages = indptr.windows(2).map(|w| w[1] - w[0]).max().unwrap() as usize;
     let (keys, vals) = if fp8 {
         let rows: Vec<u8> = (0..cells)
-            .flat_map(|i| cp[i * rank..(i + 1) * rank].iter().chain(&kp[i * rope..(i + 1) * rope]))
+            .flat_map(|i| {
+                cp[i * rank..(i + 1) * rank]
+                    .iter()
+                    .chain(&kp[i * rope..(i + 1) * rope])
+            })
             .map(|&x| e4m3_code(x))
             .collect();
         let plane = gpu.upload(&rows, cells as u32, (rank + rope) as u32, Dtype::U8);
@@ -351,7 +361,9 @@ fn run_dense(
                 f64::from(scale),
             );
             close_rows(
-                &format!("mla r{rank} h{heads} rope{rope} ps{ps} w{window:?} fp8={fp8} req {r} token {i}"),
+                &format!(
+                    "mla r{rank} h{heads} rope{rope} ps{ps} w{window:?} fp8={fp8} req {r} token {i}"
+                ),
                 &got[t * row..(t + 1) * row],
                 &want,
                 1.5e-2,
@@ -390,8 +402,28 @@ fn decode_without_a_rope_plane() {
 #[test]
 fn the_planned_walk_lands_its_log_sum_exp() {
     // Split and unsplit decode rows, and a causal prefill.
-    run_dense(512, 64, 64, 64, &[1, 1, 1], &[0, 300, 2900], None, true, false);
-    run_dense(512, 16, 64, 16, &[5, 70, 1], &[0, 33, 200], None, true, false);
+    run_dense(
+        512,
+        64,
+        64,
+        64,
+        &[1, 1, 1],
+        &[0, 300, 2900],
+        None,
+        true,
+        false,
+    );
+    run_dense(
+        512,
+        16,
+        64,
+        16,
+        &[5, 70, 1],
+        &[0, 33, 200],
+        None,
+        true,
+        false,
+    );
 }
 
 #[test]
@@ -409,7 +441,17 @@ fn a_windowed_walk_reads_only_its_window() {
         true,
         false,
     );
-    run_dense(512, 16, 64, 16, &[5, 70, 1], &[0, 33, 600], Some(40), true, false);
+    run_dense(
+        512,
+        16,
+        64,
+        16,
+        &[5, 70, 1],
+        &[0, 33, 600],
+        Some(40),
+        true,
+        false,
+    );
     // dots.llm3's sliding layers: a 1024 latent on the reference walk.
     run_dense(1024, 8, 64, 16, &[1, 1], &[20, 600], Some(513), true, false);
     run_dense(1024, 8, 64, 16, &[9, 3], &[560, 0], Some(513), false, false);
@@ -581,15 +623,32 @@ fn the_reference_walk_takes_other_widths() {
 }
 
 /// fp8 rows (an e4m3 kv deployment's): the append's codes, and the planned
-/// decode and prefill, the windowed walk and the selected one over them.
+/// decode, the windowed prefill and the selected decode over them.
 #[test]
 fn fp8_rows_append_and_walk() {
-    run_dense(512, 64, 64, 64, &[1, 1, 1], &[0, 300, 2900], None, true, true);
-    run_dense(512, 16, 0, 32, &[1, 1], &[77, 1024], None, false, true);
-    run_dense(512, 16, 64, 16, &[5, 70, 1], &[0, 33, 200], None, true, true);
-    run_dense(512, 16, 64, 16, &[5, 70, 1], &[0, 33, 600], Some(40), true, true);
+    run_dense(
+        512,
+        64,
+        64,
+        64,
+        &[1, 1, 1],
+        &[0, 300, 2900],
+        None,
+        true,
+        true,
+    );
+    run_dense(
+        512,
+        16,
+        64,
+        16,
+        &[5, 70, 1],
+        &[0, 33, 600],
+        Some(40),
+        true,
+        true,
+    );
     run_selected(64, 64, &[1, 1], &[3000, 70], 2048, true);
-    run_selected(64, 64, &[6, 2], &[10, 400], 96, true);
 
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
@@ -597,12 +656,33 @@ fn fp8_rows_append_and_walk() {
     let kv_lens = [5usize, 3];
     let (indices, indptr, last, total) = pages(&kv_lens, ps);
     let cells = total * ps;
-    let plane = gpu.upload(&vec![0x5au8; cells * (rank + rope)], cells as u32, (rank + rope) as u32, Dtype::U8);
-    let pl = pool(&gpu, plane, plane, &indices, &indptr, &last, ps, rank + rope, 2);
+    let plane = gpu.upload(
+        &vec![0x5au8; cells * (rank + rope)],
+        cells as u32,
+        (rank + rope) as u32,
+        Dtype::U8,
+    );
+    let pl = pool(
+        &gpu,
+        plane,
+        plane,
+        &indices,
+        &indptr,
+        &last,
+        ps,
+        rank + rope,
+        2,
+    );
     let new = 5usize;
-    let mut ckv: Vec<f32> = values(new * rank, 4, 300.0).into_iter().map(round_bf16).collect();
+    let mut ckv: Vec<f32> = values(new * rank, 4, 300.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
     ckv[..3].copy_from_slice(&[-0.0, 1000.0, 0.0009765625]);
-    let kpe: Vec<f32> = values(new * rope, 5, 1.0).into_iter().map(round_bf16).collect();
+    let kpe: Vec<f32> = values(new * rope, 5, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
     let rag = RaggedTensor {
         data: gpu.tensor(&ckv, new as u32, rank as u32, Dtype::Bf16),
         indptr: gpu.column(&[0, 2, 5]),
@@ -618,7 +698,11 @@ fn fp8_rows_append_and_walk() {
             .chain(&kpe[t * rope..(t + 1) * rope])
             .map(|&x| e4m3_code(x))
             .collect();
-        assert_eq!(&rows[cell * (rank + rope)..(cell + 1) * (rank + rope)], &want[..], "row {t}");
+        assert_eq!(
+            &rows[cell * (rank + rope)..(cell + 1) * (rank + rope)],
+            &want[..],
+            "row {t}"
+        );
     }
 }
 

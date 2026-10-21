@@ -1211,7 +1211,11 @@ fn the_routed_clamp_and_the_sum_add_answer_the_host() {
         .collect();
     common::close_bf16("swiglu_clamp_split_routed", &gpu.read(&y), &want, 1.0);
     let packed: Vec<f32> = (0..rows)
-        .flat_map(|r| g[r * width..][..width].iter().chain(&u[r * width..][..width]))
+        .flat_map(|r| {
+            g[r * width..][..width]
+                .iter()
+                .chain(&u[r * width..][..width])
+        })
         .copied()
         .collect();
     let mut y = gpu.zeros(rows as u32, width as u32, Dtype::Bf16);

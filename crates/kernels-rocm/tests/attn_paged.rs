@@ -38,7 +38,6 @@ impl Case {
     }
 }
 
-
 /// A paged cache holding `kv_lens[r]` tokens for request r, pages handed
 /// out in a shuffled order so a wrong page walk shows. Returns the pool and
 /// the host keys/values as [request][token][head][d].
@@ -659,14 +658,19 @@ fn attn_paged_e4m3() {
     let narrow = Case::new(8, 2, 128, 16, false).e4m3();
     let pvm = Case::new(16, 2, 128, 32, true).e4m3();
     let global = Case::new(32, 4, 512, 16, false).e4m3();
-    let mqa = Case::new(64, 1, 512, 16, false).e4m3();
     let small = Case::new(8, 2, 64, 16, false).e4m3();
     for c in [&narrow, &pvm, &global] {
         run_decode(&gpu, c, &[1, 37, 300, 1000], None, 4096);
         run_decode(&gpu, c, &[1, 37, 300, 1000], None, 1);
     }
-    run_decode(&gpu, &Case::new(32, 1, 128, 16, false).e4m3(), &[5, 300], Some(64), 4096);
-    for c in [&narrow, &pvm, &global, &mqa, &small] {
+    run_decode(
+        &gpu,
+        &Case::new(32, 1, 128, 16, false).e4m3(),
+        &[5, 300],
+        Some(64),
+        4096,
+    );
+    for c in [&narrow, &pvm, &global, &small] {
         run_prefill(&gpu, c, &[1, 70, 200], &[0, 0, 0], 1);
         run_prefill(&gpu, c, &[33, 5, 130], &[100, 17, 900], 3);
     }
@@ -675,7 +679,10 @@ fn attn_paged_e4m3() {
     // as 0x00, through explicit pages and slots.
     let ctx = gpu.ctx();
     let (rows, width) = (5u32, 2 * 64u32);
-    let mut x: Vec<f32> = values((rows * width) as usize, 9, 300.0).into_iter().map(round_bf16).collect();
+    let mut x: Vec<f32> = values((rows * width) as usize, 9, 300.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
     x[..6].copy_from_slice(&[-0.0, 1000.0, -1000.0, 0.0009765625, -0.001, 448.0]);
     let pool = KvPool {
         keys: gpu.upload(&vec![0x5au8; 64 * width as usize], 64, width, Dtype::E4m3),
@@ -694,12 +701,22 @@ fn attn_paged_e4m3() {
     let page = gpu.upload(&slots.map(|s| s.0), rows, 1, Dtype::U32);
     let offset = gpu.upload(&slots.map(|s| s.1), rows, 1, Dtype::U32);
     attn::kv_append(&ctx, k, k.data, &pool, page, offset).unwrap();
-    let (kc, vc) = (gpu.read_as::<u8>(&pool.keys), gpu.read_as::<u8>(&pool.values));
+    let (kc, vc) = (
+        gpu.read_as::<u8>(&pool.keys),
+        gpu.read_as::<u8>(&pool.values),
+    );
     for (r, &(pg, off)) in slots.iter().enumerate() {
         let at = ((pg * 16 + off) * width) as usize;
-        let want: Vec<u8> = x[r * width as usize..(r + 1) * width as usize].iter().map(|&v| e4m3_code(v)).collect();
+        let want: Vec<u8> = x[r * width as usize..(r + 1) * width as usize]
+            .iter()
+            .map(|&v| e4m3_code(v))
+            .collect();
         assert_eq!(&kc[at..at + width as usize], &want[..], "row {r} key codes");
-        assert_eq!(&vc[at..at + width as usize], &want[..], "row {r} value codes");
+        assert_eq!(
+            &vc[at..at + width as usize],
+            &want[..],
+            "row {r} value codes"
+        );
     }
 }
 

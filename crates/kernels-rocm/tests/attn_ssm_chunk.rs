@@ -219,7 +219,10 @@ fn the_chunked_gated_delta_answers_the_serial_scan() {
             "case {n}: two chunked fires disagree"
         );
         assert!(
-            gpu.read(&wide.y).iter().zip(&yc).all(|(a, b)| a.to_bits() == b.to_bits())
+            gpu.read(&wide.y)
+                .iter()
+                .zip(&yc)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
                 && gpu.read(&wide.slab) == sc,
             "case {n}: the 32-column slices disagree with the 16-column ones"
         );

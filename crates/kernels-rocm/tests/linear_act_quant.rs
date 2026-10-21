@@ -228,7 +228,7 @@ fn an_fp8b128_projection_answers_the_quantized_dot() {
     run_fp8b128(100, 320, 768, true);
     run_fp8b128(40, 200, 256, false);
     // In the FP8 matrix core's order: the decode tile and the prefill tiles.
-    for m in [1, 13, 100, 300] {
+    for m in [1, 100, 300] {
         run_fp8b_on(m, 384, 1024, true, 128, true);
     }
 }

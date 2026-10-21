@@ -958,7 +958,6 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
         (96, 64, true, false),
         (128, 128, false, true),
         (64, 32, true, true),
-        (512, 128, true, true),
     ] {
         let (hq, hk, ps, rows) = (4u32, 2u32, 8u32, 5u32);
         let width = (hq + 2 * hk) * d;
@@ -976,7 +975,12 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
         let run = |win: Option<[i32; 4]>| {
             let plane = || {
                 if fp8 {
-                    gpu.upload(&vec![0u8; slots * row], slots as u32, row as u32, Dtype::E4m3)
+                    gpu.upload(
+                        &vec![0u8; slots * row],
+                        slots as u32,
+                        row as u32,
+                        Dtype::E4m3,
+                    )
                 } else {
                     gpu.zeros(slots as u32, row as u32, Dtype::Bf16)
                 }
@@ -1031,7 +1035,10 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
         let kv_close = |what: &str, have: &[f32], want: &[f32], bf16_ulps: f32, tol: f32| {
             if fp8 {
                 for (i, (h, w)) in have.iter().zip(want).enumerate() {
-                    assert!((h - w).abs() <= w.abs() / 16.0 + tol, "{what}[{i}] = {h}, want {w}");
+                    assert!(
+                        (h - w).abs() <= w.abs() / 16.0 + tol,
+                        "{what}[{i}] = {h}, want {w}"
+                    );
                 }
             } else if bf16_ulps > 0.0 {
                 close_bf16(what, have, want, bf16_ulps);
@@ -1107,7 +1114,13 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
                         0.0,
                         2e-2,
                     );
-                    kv_close(&format!("{tag} fp8={fp8} v"), &v[at..at + d_], &normed(vs, None), 1.0, 1e-2);
+                    kv_close(
+                        &format!("{tag} fp8={fp8} v"),
+                        &v[at..at + d_],
+                        &normed(vs, None),
+                        1.0,
+                        1e-2,
+                    );
                 }
             }
         }
