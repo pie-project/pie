@@ -596,11 +596,16 @@ def _rewrite_nemotron_h(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     # `hybrid_override_pattern` is a character a source layer: M Mamba-2,
     # E routed MoE, * attention.
+    # Super states it as `hybrid_override_pattern`, Ultra as the list
+    # `layers_block_type` (whose length is its depth).
     pat = cfg.get("hybrid_override_pattern")
     if isinstance(pat, str):
         cfg["hybrid_override_pattern"] = "".join(pat[i] for i in plan.src_layers)
+    if isinstance(cfg.get("layers_block_type"), list):
+        cfg["layers_block_type"] = _slice_list(cfg["layers_block_type"], plan.src_layers)
     # The draft head is not shipped; nothing may claim it.
     cfg.pop("mtp_hybrid_override_pattern", None)
+    cfg.pop("mtp_layers_block_type", None)
 
 
 def _rewrite_gpt_oss(cfg: dict, plan: Plan) -> None:

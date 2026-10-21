@@ -7,9 +7,10 @@
 SUPER = "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME"
 ULTRA = "MEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
 
-def dims(layers, pattern = SUPER, wide = 1):
+def dims(layers, pattern = SUPER, wide = 1, experts = 512):
     """Super's widths, or Ultra's (`wide = 2`): twice the residual, heads,
-    Mamba heads, latent and expert widths, the same experts and fan-out."""
+    Mamba heads, latent and expert widths, the same experts and fan-out; a
+    miniature may keep fewer `experts`."""
     return struct(
         layers = layers,
         pattern = pattern,
@@ -23,7 +24,7 @@ def dims(layers, pattern = SUPER, wide = 1):
         groups = 8,
         state_dim = 128,
         conv_kernel = 4,
-        experts = 512,
+        experts = experts,
         top_k = 22,
         latent = 1024 * wide,
         moe_inter = 2688 if wide == 1 else 5120,
@@ -36,6 +37,9 @@ DIMS = {
     "nemotron3-super": dims(88),
     "nemotron3-super-mini": dims(9),
     "nemotron3-ultra": dims(108, ULTRA, 2),
+    # Ultra's first nine layers at 64 of its experts: a 512-expert bank is
+    # 21 GiB a layer in bf16, past one 80 GB card four times over.
+    "nemotron3-ultra-mini": dims(9, ULTRA, 2, experts = 64),
 }
 
 # The release's own precision a projection, as modelopt chose it layer by
