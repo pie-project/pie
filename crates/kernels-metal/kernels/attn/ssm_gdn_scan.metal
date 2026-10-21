@@ -444,14 +444,15 @@ constant constexpr int kVerifyChunk = 16;
 #define PIE_RS_PAGE_INTS 8
 #endif
 
-// Row `e` of a lane's extended rows in its buffer's plane: `pages` is the
-// lane's row of the page table, the in-page token of its first extended
-// row, then the slab slots of the pages its rows touch.
+// Row `e` of a lane's extended rows in its buffer's plane, `slab` the
+// plane's first row in the buffer's first slot: `pages` is the lane's row of
+// the page table, the in-page token of its first extended row, then the
+// slab slots of the pages its rows touch.
 inline device uchar* gdn_buffered_row(
     device uchar* slab, const device int* pages, int e, uint page_tokens, uint page_bytes,
-    uint plane_at, uint row_bytes) {
+    uint row_bytes) {
   const uint at = uint(pages[0] + e);
-  return slab + size_t(pages[1 + at / page_tokens]) * page_bytes + plane_at +
+  return slab + size_t(pages[1 + at / page_tokens]) * page_bytes +
          size_t(at % page_tokens) * row_bytes;
 }
 
@@ -515,7 +516,7 @@ template <typename T>
 inline float2 gdn_verify_gates(
     const device T* ba, const device float* a_log, const device T* dt_bias, int hv, int v_heads,
     int t, int begin, int own, int rep, bool lands, device uchar* slab, const device int* pages,
-    uint page_tokens, uint page_bytes, uint plane_at, uint row_bytes) {
+    uint page_tokens, uint page_bytes, uint row_bytes) {
   const size_t vh = size_t(v_heads);
   float bv, av;
   if (pages == nullptr) {
@@ -524,7 +525,7 @@ inline float2 gdn_verify_gates(
     av = float(ba[fused + vh + size_t(hv)]);
   } else if (t < rep) {
     const device T* row = reinterpret_cast<const device T*>(
-        gdn_buffered_row(slab, pages, t, page_tokens, page_bytes, plane_at, row_bytes));
+        gdn_buffered_row(slab, pages, t, page_tokens, page_bytes, row_bytes));
     bv = float(row[hv]);
     av = float(row[vh + size_t(hv)]);
   } else {
@@ -535,7 +536,7 @@ inline float2 gdn_verify_gates(
     av = float(a);
     if (lands && pages[0] >= 0) {
       device T* row = reinterpret_cast<device T*>(
-          gdn_buffered_row(slab, pages, t, page_tokens, page_bytes, plane_at, row_bytes));
+          gdn_buffered_row(slab, pages, t, page_tokens, page_bytes, row_bytes));
       row[hv] = b;
       row[vh + size_t(hv)] = a;
     }
@@ -579,9 +580,8 @@ template <typename T, int LANES, int SG, int VROWS, bool STRIDED>
     const device int* page_table [[buffer(17)]],
     const constant uint& page_tokens [[buffer(18)]],
     const constant uint& page_bytes [[buffer(19)]],
-    const constant uint& plane_at [[buffer(20)]],
-    const constant uint& row_bytes [[buffer(21)]],
-    const constant int& paged   [[buffer(22)]],
+    const constant uint& row_bytes [[buffer(20)]],
+    const constant int& paged   [[buffer(21)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]],
     uint sg_u [[simdgroup_index_in_threadgroup]]) {
@@ -689,7 +689,7 @@ template <typename T, int LANES, int SG, int VROWS, bool STRIDED>
       const int t = c0 + tid;
       const float2 g = gdn_verify_gates<T>(ba, a_log, dt_bias, hv, v_heads, t, begin, own, rep,
                                            group.y == 0, slab, pages, page_tokens, page_bytes,
-                                           plane_at, row_bytes);
+                                           row_bytes);
       decay_s[tid] = metal::exp(g.x);
       beta_s[tid] = g.y;
       if (group.y == 0 && t >= rep) {
@@ -774,7 +774,7 @@ template <typename T, int LANES, int SG, int VROWS, bool STRIDED>
       const constant int&, const constant int&, const device int*,             \
       const constant int&, device uchar*, const device int*,                   \
       const constant uint&, const constant uint&, const constant uint&,        \
-      const constant uint&, const constant int&, uint3, uint, uint);
+      const constant int&, uint3, uint, uint);
 
 PIE_GDN_VERIFY(32, 4, 4, false, "")
 PIE_GDN_VERIFY(32, 8, 4, false, "")
@@ -817,9 +817,8 @@ template <typename T, int SG, int VROWS, int BATCHES>
     const device int* page_table [[buffer(17)]],
     const constant uint& page_tokens [[buffer(18)]],
     const constant uint& page_bytes [[buffer(19)]],
-    const constant uint& plane_at [[buffer(20)]],
-    const constant uint& row_bytes [[buffer(21)]],
-    const constant int& paged   [[buffer(22)]],
+    const constant uint& row_bytes [[buffer(20)]],
+    const constant int& paged   [[buffer(21)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]],
     uint sg_u [[simdgroup_index_in_threadgroup]]) {
@@ -902,7 +901,7 @@ template <typename T, int SG, int VROWS, int BATCHES>
     const int t = tid;
     const float2 g = gdn_verify_gates<T>(ba, a_log, dt_bias, hv, v_heads, t, begin, own, rep,
                                          group.y == 0, slab, pages, page_tokens, page_bytes,
-                                         plane_at, row_bytes);
+                                         row_bytes);
     decay_s[t] = metal::exp(g.x);
     beta_s[t] = g.y;
     if (group.y == 0 && t >= rep) {
@@ -990,7 +989,7 @@ template <typename T, int SG, int VROWS, int BATCHES>
       const constant int&, const constant int&, const device int*,             \
       const constant int&, device uchar*, const device int*,                   \
       const constant uint&, const constant uint&, const constant uint&,        \
-      const constant uint&, const constant int&, uint3, uint, uint);
+      const constant int&, uint3, uint, uint);
 
 PIE_GDN_VERIFY_BATCHED(8, 4, 4)
 PIE_GDN_VERIFY_BATCHED(8, 2, 8)

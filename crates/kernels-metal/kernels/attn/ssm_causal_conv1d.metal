@@ -361,14 +361,15 @@ template <typename T>
 
 instantiate_causal_conv1d_committed(bfloat16, bfloat)
 
-// Row `e` of a lane's extended rows in its buffer's plane: `pages` is the
-// lane's row of the page table, the in-page token of its first extended
-// row, then the slab slots of the pages its rows touch.
+// Row `e` of a lane's extended rows in its buffer's plane, `slab` the
+// plane's first row in the buffer's first slot: `pages` is the lane's row of
+// the page table, the in-page token of its first extended row, then the
+// slab slots of the pages its rows touch.
 inline device uchar* rs_buffered_row(
     device uchar* slab, const device int* pages, int e, uint page_tokens, uint page_bytes,
-    uint plane_at, uint row_bytes) {
+    uint row_bytes) {
   const uint at = uint(pages[0] + e);
-  return slab + size_t(pages[1 + at / page_tokens]) * page_bytes + plane_at +
+  return slab + size_t(pages[1 + at / page_tokens]) * page_bytes +
          size_t(at % page_tokens) * row_bytes;
 }
 
@@ -408,9 +409,8 @@ template <typename T>
     const device int* page_table   [[buffer(17)]],
     const constant uint& page_tokens [[buffer(18)]],
     const constant uint& page_bytes [[buffer(19)]],
-    const constant uint& plane_at  [[buffer(20)]],
-    const constant uint& row_bytes [[buffer(21)]],
-    const constant int& paged      [[buffer(22)]],
+    const constant uint& row_bytes [[buffer(20)]],
+    const constant int& paged      [[buffer(21)]],
     uint3 pos [[thread_position_in_grid]],
     uint3 at [[thread_position_in_threadgroup]],
     uint3 shape [[threads_per_threadgroup]]) {
@@ -442,7 +442,7 @@ template <typename T>
   const bool buffers = pages != nullptr && pages[0] >= 0;
   auto buffered = [&](int e) -> device vec<T, 4>* {
     return reinterpret_cast<device vec<T, 4>*>(
-        rs_buffered_row(slab, pages, e, page_tokens, page_bytes, plane_at, row_bytes) +
+        rs_buffered_row(slab, pages, e, page_tokens, page_bytes, row_bytes) +
         col * sizeof(T));
   };
   // Four channels of the lane's row `src`, the carried window's before it.
@@ -526,6 +526,6 @@ template <typename T>
       const constant int&, const constant int&, const device int*,      \
       const constant int&, device uchar*, const device int*,            \
       const constant uint&, const constant uint&, const constant uint&, \
-      const constant uint&, const constant int&, uint3, uint3, uint3);
+      const constant int&, uint3, uint3, uint3);
 
 instantiate_causal_conv1d_verify(bfloat16, bfloat)

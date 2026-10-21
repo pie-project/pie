@@ -535,16 +535,21 @@ impl Seat {
 
     /// The buffer of the plane `value` is read into, as a verify arm reads
     /// it through the page table; `None` without a page table or a plane.
-    #[must_use]
-    pub fn paged(&self, value: ValueId) -> Option<kernels_metal::attn::ssm::Paged> {
+    pub fn paged(
+        &self,
+        handles: &Handles,
+        value: ValueId,
+    ) -> Option<kernels_metal::attn::ssm::Paged> {
         let pages = self.pages?;
         let plane = *self.layout.in_of.get(&value.0)?;
+        let at = self.plane_at[plane];
+        let slab = self.page_bytes.checked_mul(u64::from(self.pool_slots))?;
+        let view = handles.cut(self.pool, at, slab.checked_sub(at)?).ok()?;
         Some(kernels_metal::attn::ssm::Paged {
-            slab: Tensor::new(self.pool, 1, 1, Dtype::U8),
+            slab: Tensor::new(view, 1, 1, Dtype::U8),
             pages,
             page_tokens: self.page_tokens,
             page_bytes: u32::try_from(self.page_bytes).ok()?,
-            plane_at: u32::try_from(self.plane_at[plane]).ok()?,
             row_bytes: u32::try_from(self.layout.planes[plane].row_bytes).ok()?,
         })
     }
