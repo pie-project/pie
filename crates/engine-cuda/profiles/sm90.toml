@@ -36,6 +36,9 @@ sdpa.dsv4_decode_until = 64
 gemm.bias_epilogue = true
 # Bf16 products of 2 to 8 rows may time the few-rows kernel.
 gemm.rows_m = 8
+# cuBLAS, not the fused skinny GEMM, for Gemma's GEGLU and soft-capped
+# head (Gemma 4 26B-A4B +4% at one request, +2% at 64).
+gemm.skinny_rows = 0
 # AttnRes's blend and its row's norm in one pass.
 attn_res.fused_norm = true
 # MXFP4 selects on the register-dequant mma.sync from 28 to 1024 routes,
