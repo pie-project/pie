@@ -167,12 +167,12 @@ macro_rules! shelved {
         #[cfg(not(feature = "rocm"))]
         pub const SEEDED: &[(&str, &str)] =
             &[$(($cuda, include_str!(concat!("../profiles/", $cuda)))),*];
-        #[cfg(not(feature = "rocm"))]
+        #[cfg(all(test, not(feature = "rocm")))]
         const BESIDE: &[&str] = &[$($rocm),*];
         #[cfg(feature = "rocm")]
         pub const SEEDED: &[(&str, &str)] =
             &[$(($rocm, include_str!(concat!("../profiles/", $rocm)))),*];
-        #[cfg(feature = "rocm")]
+        #[cfg(all(test, feature = "rocm"))]
         const BESIDE: &[&str] = &[$($cuda),*];
     };
 }
