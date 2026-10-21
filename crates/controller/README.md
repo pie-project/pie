@@ -41,8 +41,9 @@ With slots configured, the controller's actuator converges on it every tick:
   finds its launch token in `PIE_LAUNCH` and registers with it, so the
   controller knows which launch it is.
 - **Over a shape:** it stops a worker it launched, by SIGTERM. pie-worker
-  drains on the signal: it takes no new turns, the cluster policy moves its
-  running turns to others by their resume logs, then it leaves.
+  drains on the signal: it takes no new turns, the cluster policy may move
+  the ones that have sent no output elsewhere, and it waits for the rest to
+  finish before it leaves.
 - **What it leaves alone:** a worker it did not launch is never stopped, and
   a shape the table does not name keeps what it has.
 - **Short of slots:** when the table asks for more than the slots of a shape
