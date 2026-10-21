@@ -301,6 +301,9 @@ __global__ void __launch_bounds__(kWarpsN * kWarpsK * 32) fp8_w8a16_mma(
 // `fp8_w8a16_mma` lays them, the codes a weight row's 64 bytes a stage row
 // (a quarter-warp's 16-byte reads land on 32 banks unswizzled) -- and each
 // warp widening its columns' codes from shared memory as it reads them.
+// With `splits` > 1 a CTA takes the `blockIdx.z`-th of K's steps and lays
+// its f32 sums in `part` (a `[splits, m, n]` slab) for `fp8_w8a16_fold`:
+// a plane too narrow to fill the card at a batch's rows, split along K.
 template <int kBM, int kStages, int kGran>
 __global__ void __launch_bounds__(256) fp8_w8a16_gemm(
     const bf16* __restrict__ x,
@@ -312,7 +315,9 @@ __global__ void __launch_bounds__(256) fp8_w8a16_gemm(
     int m,
     int n,
     int k,
-    const u32* __restrict__ win)
+    const u32* __restrict__ win,
+    float* __restrict__ part,
+    int splits)
 {
     using namespace w8a16;
     static_assert(kGran == 32 || kGran == 128, "a block is 32 or 128 columns of K");
@@ -341,16 +346,22 @@ __global__ void __launch_bounds__(256) fp8_w8a16_gemm(
     x += static_cast<long long>(m0) * x_stride;
     y += static_cast<long long>(m0) * y_stride;
     const int n0 = static_cast<int>(blockIdx.x) * kBN;
-    const int steps = k >> 6;
+    // This CTA's run of K's 64-column steps.
+    const int per = ((k >> 6) + splits - 1) / splits;
+    const int first = static_cast<int>(blockIdx.z) * per;
+    const int steps = max(0, min(k >> 6, first + per) - first);
     const int kblocks = k / kGran;
+    // The blocks this CTA's steps read, from `kb0`.
+    const int kb0 = first * 64 / kGran;
+    const int spans = steps > 0 ? ((first + steps) * 64 - 1) / kGran + 1 - kb0 : 0;
 
-    // The stages, then the CTA's block exponents (`kBN` rows of `kblocks`),
+    // The stages, then the CTA's block exponents (`kBN` rows of `spans`),
     // laid once.
     extern __shared__ __align__(16) unsigned char w8a16_gemm_smem[];
     u8* exps = w8a16_gemm_smem + kStages * kStageBytes;
-    for (int i = tid; i < kBN * kblocks; i += 256) {
-        const int r = i / kblocks;
-        exps[i] = atoms[atom_offset(min(n0 + r, n - 1), i - r * kblocks, kblocks)];
+    for (int i = tid; i < kBN * spans; i += 256) {
+        const int r = i / spans;
+        exps[i] = atoms[atom_offset(min(n0 + r, n - 1), kb0 + i - r * spans, kblocks)];
     }
     const unsigned smem0 = smem_addr(w8a16_gemm_smem);
 
@@ -382,7 +393,7 @@ __global__ void __launch_bounds__(256) fp8_w8a16_gemm(
     auto issue = [&]() {
         if (issued < steps) {
             const unsigned base = smem0 + (issued % kStages) * kStageBytes;
-            const long long ka = static_cast<long long>(issued) * 64;
+            const long long ka = static_cast<long long>(first + issued) * 64;
 #pragma unroll
             for (int j = 0; j < kACopies; ++j) cp_async16(base + a_dst[j], a_src[j] + ka, a_bytes[j]);
 #pragma unroll
@@ -404,7 +415,7 @@ __global__ void __launch_bounds__(256) fp8_w8a16_gemm(
         a_at[mt][3] = (rb * 64 + (((2 * t + 1) ^ (rb & 7)) * 8)) * 2;
     }
     const unsigned b_at = kABytes + (wn * 32 + g) * 64 + t * 16;
-    const u8* my_exps = exps + (wn * 32 + g) * kblocks;
+    const u8* my_exps = exps + (wn * 32 + g) * spans - kb0;
 
     float acc[kMT][kNSub][4];
 #pragma unroll
@@ -423,12 +434,12 @@ __global__ void __launch_bounds__(256) fp8_w8a16_gemm(
         cp_wait<kStages - 2>();
         __syncthreads();
         const unsigned char* stage = w8a16_gemm_smem + slot * kStageBytes;
-        const int kb = kGran == 128 ? (step >> 1) : ((step * 64 + 16 * t) >> 5);
+        const int kb = kGran == 128 ? ((first + step) >> 1) : (((first + step) * 64 + 16 * t) >> 5);
         unsigned f[kNSub];
         uint4 bw[kNSub];
 #pragma unroll
         for (int j = 0; j < kNSub; ++j) {
-            f[j] = factor2(my_exps[8 * j * kblocks + kb]);
+            f[j] = factor2(my_exps[8 * j * spans + kb]);
             bw[j] = *reinterpret_cast<const uint4*>(stage + b_at + j * 8 * 64);
         }
 #pragma unroll
@@ -469,6 +480,15 @@ __global__ void __launch_bounds__(256) fp8_w8a16_gemm(
             for (int h = 0; h < 2; ++h) {
                 const int r = wm * (kBM / 2) + mt * 16 + g + 8 * h;
                 if (r >= rows) continue;
+                if (part != nullptr) {
+                    float* out = part + (static_cast<long long>(blockIdx.z) * m + m0 + r) * n + col;
+                    if (col + 1 < n) {
+                        *reinterpret_cast<float2*>(out) = make_float2(acc[mt][j][2 * h], acc[mt][j][2 * h + 1]);
+                    } else if (col < n) {
+                        out[0] = acc[mt][j][2 * h];
+                    }
+                    continue;
+                }
                 bf16* out = y + static_cast<long long>(r) * y_stride + col;
                 if (col + 1 < n) {
                     *reinterpret_cast<unsigned*>(out) = pack_bf16x2(acc[mt][j][2 * h], acc[mt][j][2 * h + 1]);
@@ -477,6 +497,33 @@ __global__ void __launch_bounds__(256) fp8_w8a16_gemm(
                 }
             }
         }
+}
+
+// `fp8_w8a16_gemm`'s K splits summed: `y = sum_z part[z]`, a thread a pair
+// of columns (`n` even).
+__global__ void __launch_bounds__(256) fp8_w8a16_fold(
+    const float* __restrict__ part,
+    bf16* __restrict__ y,
+    int y_stride,
+    int m,
+    int n,
+    int splits,
+    const u32* __restrict__ win)
+{
+    int rows = m;
+    if (win != nullptr) rows = min(rows, static_cast<int>(win[0]));
+    const long long i = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) * 2;
+    if (i >= static_cast<long long>(rows) * n) return;
+    const long long plane = static_cast<long long>(m) * n;
+    float2 sum = *reinterpret_cast<const float2*>(part + i);
+    for (int z = 1; z < splits; ++z) {
+        const float2 v = *reinterpret_cast<const float2*>(part + z * plane + i);
+        sum.x += v.x;
+        sum.y += v.y;
+    }
+    const int r = static_cast<int>(i / n);
+    const int c = static_cast<int>(i % n);
+    *reinterpret_cast<unsigned*>(y + static_cast<long long>(r) * y_stride + c) = pack_bf16x2(sum.x, sum.y);
 }
 
 // The same plane widened whole to bf16 (`out`, `[n, k]`), for a wide fire's

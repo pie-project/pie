@@ -11,6 +11,10 @@ use crate::linear::gemm;
 use crate::tensor::Tensor;
 
 const DECODED_WEIGHT: &str = "linear.quant.decoded_weight";
+const SPLIT_PARTIALS: &str = "linear.w8a16.split_partials";
+
+/// The most ways the tiled GEMM splits K for a plane too narrow to fill the card.
+const MOST_SPLITS: u32 = 16;
 
 const FILE: &str = "linear/w8a16.cuh";
 
@@ -96,11 +100,20 @@ pub fn matmul(
     if m == 0 {
         return Ok(true);
     }
-    // A small plane at a batch's rows tiles too few CTAs to fill the card:
-    // widened (a few microseconds at its size) for cuBLAS, which splits K.
+    // A plane at a batch's rows that tiles too few CTAs to fill the card
+    // splits K, the codes still read once.
     let sms = ctx.multiprocessors().unwrap_or(108);
-    let few = m > MMA_UNTIL && n.div_ceil(128) * m.div_ceil(64) < 2 * sms;
-    if m > GEMM_UNTIL || few {
+    let tiles = n.div_ceil(128) * m.div_ceil(64);
+    let splits = if m > MMA_UNTIL && tiles < 2 * sms && n.is_multiple_of(2) {
+        (2 * sms)
+            .div_ceil(tiles)
+            .min(MOST_SPLITS)
+            .min(k / 128)
+            .max(1)
+    } else {
+        1
+    };
+    if m > GEMM_UNTIL {
         // A prefill's rows against the plane widened once, on cuBLAS.
         let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
         let tile = ctx.scratch_stream(op, DECODED_WEIGHT, bytes)? as usize as u64;
@@ -120,19 +133,66 @@ pub fn matmul(
         stated(op, k)?.arg(),
         ctx.stage(),
     ];
-    let fire = if m > MMA_UNTIL {
+    if m > MMA_UNTIL {
         // The tiled GEMM: 64-row CTAs while that keeps the grid wide, 128 past it.
         let (bm, stages) = if m <= 128 { (64u32, 4u32) } else { (128, 3) };
         // The stages, and the CTA's block exponents laid beside them.
         let smem = stages * (bm * 64 * 2 + 128 * 64) + 128 * (k / gran);
-        Fire::at(
-            FILE,
-            symbol(&format!(
-                "::pie::linear::fp8_w8a16_gemm<{bm}, {stages}, {gran}>"
-            )),
-        )
-        .apply(Launch::grid([n.div_ceil(128), m.div_ceil(bm), 1], [256, 1, 1]).smem(smem))
-    } else {
+        let part = if splits > 1 {
+            let bytes = u64::from(splits) * u64::from(m) * u64::from(n) * 4;
+            ctx.scratch_stream(
+                op,
+                SPLIT_PARTIALS,
+                usize::try_from(bytes).unwrap_or(usize::MAX),
+            )? as u64
+        } else {
+            0
+        };
+        let mut args = args.to_vec();
+        args.extend([ArgValue::Ptr(part), stated(op, splits)?.arg()]);
+        // Hopper's wgmma, the codes widened once into its A registers.
+        let fire = if crate::linear::moe::hopper_wgmma() {
+            const WG_STAGES: u32 = 3;
+            Fire::at(
+                "linear/moe_wgmma.cuh",
+                symbol(&format!(
+                    "::pie::linear::fp8_w8a16_wgmma<{gran}, {WG_STAGES}>"
+                )),
+            )
+            .apply(
+                Launch::grid([n.div_ceil(128), 1, splits], [128, 1, 1])
+                    .smem(WG_STAGES * 33792 + 1024),
+            )
+        } else {
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::linear::fp8_w8a16_gemm<{bm}, {stages}, {gran}>"
+                )),
+            )
+            .apply(Launch::grid([n.div_ceil(128), m.div_ceil(bm), splits], [256, 1, 1]).smem(smem))
+        };
+        ctx.fire(op, fire, &args)?;
+        if splits > 1 {
+            let pairs = m * n / 2;
+            ctx.fire(
+                op,
+                Fire::at(FILE, symbol("::pie::linear::fp8_w8a16_fold"))
+                    .apply(Launch::grid([pairs.div_ceil(256), 1, 1], [256, 1, 1])),
+                &[
+                    ArgValue::Ptr(part),
+                    y.arg(),
+                    stated(op, n)?.arg(),
+                    stated(op, m)?.arg(),
+                    stated(op, n)?.arg(),
+                    stated(op, splits)?.arg(),
+                    ctx.stage(),
+                ],
+            )?;
+        }
+        return Ok(true);
+    }
+    let fire = {
         let s = Shape::for_rows(m);
         Fire::at(
             FILE,
