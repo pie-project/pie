@@ -12,6 +12,15 @@ impl DispatchLinear for Run<'_> {
 
 impl Run<'_> {
     pub(super) fn fused_linear(&mut self, op: &Fused) -> Result<(), kernels_metal::Error> {
+        // The shared expert rode along on the routed register tiles: its rows
+        // are tile 0 of their down.
+        if let Fused::MlpSwiglu { y, .. } = op
+            && let Some(rows) = self.tiles_shared(*y)
+        {
+            let y = self.tensor(*y);
+            let bytes = u64::from(y.rows) * u64::from(y.width) * y.dtype.bytes_ceil();
+            return kernels_metal::layout::copy_words(self.ctx(), rows, y, bytes);
+        }
         match op {
             Fused::MlpSwiglu {
                 act,
@@ -559,6 +568,8 @@ impl Run<'_> {
                 ),
             },
 
+            // The register chain's gate-up landed its SwiGLU already.
+            Linear::MlpSwiglu { packed, y, .. } if self.tiles_swiglu(*packed, *y) => Ok(()),
             Linear::MlpSwiglu {
                 packed,
                 intermediate,
@@ -896,6 +907,12 @@ impl Run<'_> {
             }
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
                 const OP: &str = "linear.moe_matmul_select_quant";
+                // A routed MLP of a verify's few tokens on the register expert tiles.
+                if self.tiles_down(*x, *bank, *routes, *y)?
+                    || self.tiles_start(*x, *bank, *routes, *y)?
+                {
+                    return Ok(());
+                }
                 if let Some(scratch) = self.routed_rooms() {
                     let sorted = self.chain_select(*x, *bank, *routes, *y);
                     if linear::moe::matmul_select_batched(
@@ -945,7 +962,10 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*y_out),
             ),
-            Linear::MoeWeightedSum { routed, weights, y } => match self.chain_combine(*routed) {
+            Linear::MoeWeightedSum { routed, weights, y } => match self
+                .tiles_combine(*routed)
+                .or_else(|| self.chain_combine(*routed))
+            {
                 Some((sorted, inv, top_k)) => linear::moe::weighted_sum_sorted(
                     self.ctx(),
                     sorted,

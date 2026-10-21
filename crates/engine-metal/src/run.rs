@@ -180,6 +180,13 @@ pub struct Run<'c> {
     /// A routed MLP whose rows stay sorted from gate-up to the fold.
     chain: std::cell::Cell<Option<Chain>>,
 
+    /// A routed MLP on the register expert tiles, from gate-up to the fold
+    /// (and its shared expert's rows, where they ride along).
+    tiles: std::cell::Cell<Option<Tiled>>,
+
+    /// The nodes walked so far: what tells a node it is the very next one.
+    walked: std::cell::Cell<u64>,
+
     /// Per value, the nodes that read it, made on first ask.
     readers: std::cell::OnceCell<Vec<Vec<u32>>>,
 
@@ -254,6 +261,44 @@ enum ChainStep {
     Down,
 }
 
+/// Where a routed MLP on the register expert tiles has got to: its gate-up
+/// grouped the routes into expert tiles and landed its SwiGLU as the down's
+/// input tables (the swiglu node then runs nothing), the down left each tile's
+/// rows in the register rooms for the fold. Where the fused shared expert of
+/// the same rows is the node right after the fold, its codes rode along as
+/// tile 0 and that node copies its rows out.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Tiled {
+    step: TiledStep,
+    routes: ValueId,
+    packed: ValueId,
+    hidden: ValueId,
+    routed: ValueId,
+    /// The tiles a fire of these tokens may fill.
+    tiles: u32,
+    shared: Option<SharedTile>,
+    /// The region and run the gate-up ran in.
+    region: (u32, u32),
+    /// The walk position of the fold, once it ran.
+    folded: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TiledStep {
+    GateUp,
+    Swiglu,
+    Down,
+    Folded,
+}
+
+/// The shared expert riding along as tile 0: its fused MLP's banks and output.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SharedTile {
+    gate_up: kernels_metal::Bank,
+    down: kernels_metal::Bank,
+    y: ValueId,
+}
+
 impl<'c> Run<'c> {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -289,6 +334,8 @@ impl<'c> Run<'c> {
             ane: None,
             tuning,
             chain: std::cell::Cell::new(None),
+            tiles: std::cell::Cell::new(None),
+            walked: std::cell::Cell::new(0),
             readers: std::cell::OnceCell::new(),
             table: std::cell::Cell::new(None),
             landed: std::cell::Cell::new(None),
@@ -619,6 +666,320 @@ impl<'c> Run<'c> {
             scratch.inv,
             routes.width,
         ))
+    }
+
+    /// Counts a walked node.
+    pub(crate) fn walk_one(&self) {
+        self.walked.set(self.walked.get() + 1);
+    }
+
+    /// The register expert tiles' rooms, which overlap the precast room.
+    pub(crate) fn register_rooms(&self) -> Option<kernels_metal::linear::moe::RegisterRooms> {
+        self.table.set(None);
+        Some(
+            self.scratch
+                .register(self.handles)?
+                .unwrap_or_else(|fault| {
+                    panic!("the register expert rooms this load reserved do not mint: {fault}")
+                }),
+        )
+    }
+
+    /// Whether the routed gate-up of `x` by `bank` over `routes` into `y`
+    /// starts a routed MLP on the register expert tiles: 2 to 8 tokens (the
+    /// rows of one tile an expert), a gate-up whose output only a SwiGLU
+    /// reads, whose output only a down over the same routes reads, whose
+    /// output only a fold reads, each bank one the tile takes. Where the fold
+    /// feeds a sigmoid-gated add whose shared expert is a fused MLP of `x`,
+    /// the very node after the fold, that expert rides along. The chain then
+    /// runs at each of its nodes; the gate-up's runs here.
+    pub(crate) fn tiles_start(
+        &self,
+        x: ValueId,
+        bank: ValueId,
+        routes: ValueId,
+        y: ValueId,
+    ) -> Result<bool, kernels_metal::Error> {
+        use kernels_metal::linear::moe;
+        use poem_ir::{Linear, Operation};
+        self.tiles.set(None);
+        if !self.tuning.moe_register() {
+            return Ok(false);
+        }
+        let (xt, rt) = (self.tensor(x), self.tensor(routes));
+        if rt.rows < 2
+            || rt.rows > moe::REGISTER_TOKENS
+            || rt.width > moe::REGISTER_FAN_OUT
+            || xt.rows != rt.rows
+            || self.windows.runs(self.place.region.get()) > 1
+        {
+            return Ok(false);
+        }
+        let Some(Operation::Linear(Linear::MlpSwiglu {
+            packed,
+            intermediate,
+            y: hidden,
+        })) = self.sole_reader(y).map(|n| &n.op)
+        else {
+            return Ok(false);
+        };
+        let Some(Operation::Linear(Linear::MoeMatmulSelectQuant {
+            x: down_x,
+            bank: down_bank,
+            routes: down_routes,
+            y: routed,
+        })) = self.sole_reader(*hidden).map(|n| &n.op)
+        else {
+            return Ok(false);
+        };
+        let &[fold_at] = self.readers_of(*routed) else {
+            return Ok(false);
+        };
+        let Some(fold) = self.nodes.get(fold_at as usize) else {
+            return Ok(false);
+        };
+        let Operation::Linear(Linear::MoeWeightedSum {
+            routed: summed,
+            y: folded,
+            ..
+        }) = &fold.op
+        else {
+            return Ok(false);
+        };
+        if *packed != y || down_x != hidden || *down_routes != routes || summed != routed {
+            return Ok(false);
+        }
+        let inter = *intermediate;
+        let (gate_up, down) = (self.planes(bank), self.planes(*down_bank));
+        let columns = self.tensor(*routed).width;
+        if self.tensor(y).width != 2 * inter
+            || !moe::register_cuts(inter, columns, moe::REGISTER_CUT)
+            || !moe::register_bank(gate_up, xt.width, 2 * inter)
+            || !moe::register_bank(down, inter, columns)
+        {
+            return Ok(false);
+        }
+        let experts = self.experts(routes);
+        if experts == 0 || experts > moe::REGISTER_EXPERTS {
+            return Ok(false);
+        }
+        let shared = self.shared_tile(x, fold_at, fold, *folded, inter, columns);
+        let tiles = moe::register_tiles(rt.rows, rt.width, experts, shared.is_some());
+        let Some(rooms) = self.register_rooms() else {
+            return Ok(false);
+        };
+        if rooms.tiles.width <= tiles
+            || u64::from(rooms.table.width) < u64::from(tiles) * moe::register_table_width(xt.width)
+            || u64::from(rooms.hidden.width) < u64::from(tiles) * moe::register_table_width(inter)
+            || u64::from(rooms.y.rows) < 8 * u64::from(tiles)
+            || rooms.y.width < columns
+            || rooms.inv.width < rt.rows * rt.width
+        {
+            return Ok(false);
+        }
+        moe::register_group(self.ctx(), xt, rt, experts, shared.is_some(), rooms)?;
+        moe::register_glu(
+            self.ctx(),
+            gate_up,
+            shared.map(|s| s.gate_up),
+            xt.width,
+            inter,
+            tiles,
+            experts,
+            rooms,
+            moe::REGISTER_CUT,
+        )?;
+        self.tiles.set(Some(Tiled {
+            step: TiledStep::GateUp,
+            routes,
+            packed: y,
+            hidden: *hidden,
+            routed: *routed,
+            tiles,
+            shared,
+            region: (self.place.region.get(), self.place.run.get()),
+            folded: 0,
+        }));
+        Ok(true)
+    }
+
+    /// The fused shared expert of `x` that rides along as tile 0, when the
+    /// node after the fold (`fold_at`, landing `folded`) is it and its output
+    /// only the fold's sigmoid-gated add reads.
+    fn shared_tile(
+        &self,
+        x: ValueId,
+        fold_at: u32,
+        fold: &Node,
+        folded: ValueId,
+        inter: u32,
+        columns: u32,
+    ) -> Option<SharedTile> {
+        use kernels_metal::linear::moe;
+        use poem_ir::{Fused, Linear, Operation};
+        let Some(Operation::Linear(Linear::MoeSigmoidGateAdd { shared, .. })) =
+            self.sole_reader(folded).map(|n| &n.op)
+        else {
+            return None;
+        };
+        let next = self.nodes.get(fold_at as usize + 1)?;
+        let Operation::Fused(Fused::MlpSwiglu {
+            act,
+            gate_up,
+            down,
+            intermediate,
+            y,
+            ..
+        }) = &next.op
+        else {
+            return None;
+        };
+        if *act != x || *y != *shared || *intermediate != inter || next.guard != fold.guard {
+            return None;
+        }
+        let (gate_up, down) = (self.banked(*gate_up)?, self.banked(*down)?);
+        let width = self.tensor(x).width;
+        (self.tensor(*y).width == columns
+            && moe::register_bank(gate_up, width, 2 * inter)
+            && moe::register_bank(down, inter, columns))
+        .then_some(SharedTile {
+            gate_up,
+            down,
+            y: *y,
+        })
+    }
+
+    /// Whether the SwiGLU of `packed` into `hidden` is the register chain's,
+    /// which its gate-up already landed: it then runs nothing.
+    pub(crate) fn tiles_swiglu(&self, packed: ValueId, hidden: ValueId) -> bool {
+        let Some(tiled) = self.tiles.get() else {
+            return false;
+        };
+        let here =
+            tiled.step == TiledStep::GateUp && tiled.packed == packed && tiled.hidden == hidden;
+        self.tiles_hold(here);
+        if here {
+            self.tiles.set(Some(Tiled {
+                step: TiledStep::Swiglu,
+                ..tiled
+            }));
+        }
+        here
+    }
+
+    /// Runs the routed down of `x` over `routes` into `y` on the register
+    /// tiles, when it is the register chain's: true where it ran.
+    pub(crate) fn tiles_down(
+        &self,
+        x: ValueId,
+        bank: ValueId,
+        routes: ValueId,
+        y: ValueId,
+    ) -> Result<bool, kernels_metal::Error> {
+        let Some(tiled) = self.tiles.get() else {
+            return Ok(false);
+        };
+        let here = tiled.step == TiledStep::Swiglu
+            && tiled.hidden == x
+            && tiled.routes == routes
+            && tiled.routed == y;
+        self.tiles_hold(here);
+        if !here {
+            return Ok(false);
+        }
+        let rooms = self
+            .register_rooms()
+            .expect("the register chain began over the rooms the load reserved");
+        kernels_metal::linear::moe::register_down(
+            self.ctx(),
+            self.planes(bank),
+            tiled.shared.map(|s| s.down),
+            self.tensor(x).width,
+            self.tensor(y).width,
+            tiled.tiles,
+            self.experts(routes),
+            rooms,
+            kernels_metal::linear::moe::REGISTER_CUT,
+        )?;
+        self.tiles.set(Some(Tiled {
+            step: TiledStep::Down,
+            ..tiled
+        }));
+        Ok(true)
+    }
+
+    /// The register chain's down rows (eight a tile), the route-to-row
+    /// map and the fan-out, when `routed` is its down's output.
+    pub(crate) fn tiles_combine(&self, routed: ValueId) -> Option<(Tensor, Tensor, u32)> {
+        let tiled = self.tiles.get()?;
+        let here = tiled.step == TiledStep::Down && tiled.routed == routed;
+        self.tiles_hold(here);
+        if !here {
+            return None;
+        }
+        let rooms = self
+            .register_rooms()
+            .expect("the register chain began over the rooms the load reserved");
+        let width = self.tensor(routed).width;
+        // The node after the fold reads the shared rows.
+        self.tiles.set(tiled.shared.map(|_| Tiled {
+            step: TiledStep::Folded,
+            folded: self.walked.get(),
+            ..tiled
+        }));
+        Some((
+            Tensor::new(rooms.y.buf, tiled.tiles * 8, width, poem_ir::Dtype::Bf16),
+            rooms.inv,
+            self.tensor(tiled.routes).width,
+        ))
+    }
+
+    /// The shared expert's rows, tile 0 of the register chain's down, when
+    /// the fused MLP landing `y` is the shared expert that rode along and is
+    /// walked right after the fold over the same rows; the chain ends. A
+    /// walk that put anything between runs the shared expert as it always has.
+    pub(crate) fn tiles_shared(&self, y: ValueId) -> Option<Tensor> {
+        let tiled = self.tiles.get()?;
+        let shared = tiled.shared?;
+        if tiled.step != TiledStep::Folded {
+            return None;
+        }
+        self.tiles.set(None);
+        let here =
+            shared.y == y && self.walked.get() == tiled.folded + 1 && self.tiles_reach(&tiled);
+        if !here {
+            return None;
+        }
+        let rooms = self
+            .register_rooms()
+            .expect("the register chain began over the rooms the load reserved");
+        let rows = self.tensor(y);
+        Some(Tensor::new(
+            rooms.y.buf,
+            rows.rows,
+            rows.width,
+            poem_ir::Dtype::Bf16,
+        ))
+    }
+
+    /// Whether a node of the register chain walked here reads the rows its
+    /// gate-up laid: in the region and run the gate-up ran in, or in a region
+    /// of one run after a gate-up whose region was too, each over every row.
+    fn tiles_reach(&self, tiled: &Tiled) -> bool {
+        let here = (self.place.region.get(), self.place.run.get());
+        let whole = |region: u32| self.windows.runs(region) <= 1;
+        tiled.region == here || (whole(tiled.region.0) && whole(here.0))
+    }
+
+    /// The register chain's next node reads the rows its gate-up laid.
+    fn tiles_hold(&self, here: bool) {
+        if let Some(tiled) = self.tiles.get().filter(|_| here) {
+            assert!(
+                self.tiles_reach(&tiled),
+                "a routed MLP on the register tiles walks its nodes over the rows its gate-up \
+                 laid"
+            );
+        }
     }
 
     pub(crate) fn tuning(&self) -> &'c kernels_metal::Tuning {
