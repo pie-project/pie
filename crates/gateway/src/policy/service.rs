@@ -488,6 +488,8 @@ fn run(
                         schedule = commit.schedule.as_ref().map(|t| t.keys.len()),
                         floor = commit.schedule.as_ref().and_then(|t| t.floor),
                         placement = commit.placement.as_ref().map(|t| t.len()),
+                        executors = commit.executors.as_ref().map(|t| t.len()),
+                        published = commit.publish.len(),
                         "cluster policy call"
                     );
                     let author = program.name().to_string();
