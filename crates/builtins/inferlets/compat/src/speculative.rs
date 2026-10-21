@@ -102,10 +102,16 @@ impl Prices {
     fn round(&self, width: u32) -> Option<f64> {
         let draft = Self::median(&self.draft)?;
         let w = width as usize;
-        let below = (1..=w).rev().find_map(|v| Self::median(&self.verify[v]).map(|p| (v, p)))?;
-        let verify = match (w + 1..self.verify.len()).find_map(|v| Self::median(&self.verify[v]).map(|p| (v, p))) {
+        let below = (1..=w)
+            .rev()
+            .find_map(|v| Self::median(&self.verify[v]).map(|p| (v, p)))?;
+        let verify = match (w + 1..self.verify.len())
+            .find_map(|v| Self::median(&self.verify[v]).map(|p| (v, p)))
+        {
             _ if below.0 == w => below.1,
-            Some(above) => below.1 + (above.1 - below.1) * (w - below.0) as f64 / (above.0 - below.0) as f64,
+            Some(above) => {
+                below.1 + (above.1 - below.1) * (w - below.0) as f64 / (above.0 - below.0) as f64
+            }
             None => below.1,
         };
         Some(draft + verify)
@@ -153,7 +159,10 @@ impl Yield {
 
 /// The widths a round may verify at: a fire's price is a staircase in rows.
 fn rungs(widest: u32) -> Vec<u32> {
-    let mut out: Vec<u32> = [2u32, 4, 8, 16].into_iter().filter(|w| *w < widest).collect();
+    let mut out: Vec<u32> = [2u32, 4, 8, 16]
+        .into_iter()
+        .filter(|w| *w < widest)
+        .collect();
     out.push(widest);
     out
 }
@@ -182,8 +191,14 @@ pub async fn generate(
     }
     let mut held = prompt.len() as u32;
     let mut survivors = 0;
-    let mut prices = Prices { draft: Vec::new(), verify: vec![Vec::new(); widest as usize + 1] };
-    let mut yields = Yield { hits: vec![0.0; widest as usize], tries: vec![0.0; widest as usize] };
+    let mut prices = Prices {
+        draft: Vec::new(),
+        verify: vec![Vec::new(); widest as usize + 1],
+    };
+    let mut yields = Yield {
+        hits: vec![0.0; widest as usize],
+        tries: vec![0.0; widest as usize],
+    };
     let rungs = rungs(widest);
     // Plain fires left before drafting is tried again, and the gap the next
     // closure waits: a probe that loses doubles it.
@@ -250,7 +265,10 @@ pub async fn generate(
         verify.extend_from_slice(proposals);
         let fired = inferlet::monotonic_now_ns();
         let truth = pass(&pipe, &ws, &verify, held, Round::Verify(survivors)).await?;
-        Prices::keep(&mut prices.verify[width as usize], inferlet::monotonic_now_ns() - fired);
+        Prices::keep(
+            &mut prices.verify[width as usize],
+            inferlet::monotonic_now_ns() - fired,
+        );
         let kept = proposals
             .iter()
             .zip(&truth)
