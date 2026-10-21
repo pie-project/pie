@@ -120,9 +120,12 @@ pub struct HostPlanes;
 
 /// Rows from which the default bucket lattice takes four buckets a doubling
 /// whatever `engine.lattice_steps` says (a prefill's GEMMs run its bucket's
-/// rows); 0 never.
+/// rows); 0 never. Past a GEMM's ridge, where its rows cost compute rather
+/// than the weights' read, every padded row costs as much as a real one; the
+/// ridge (peak flops over memory bandwidth) is some 150 to 450 rows on the
+/// cards CUDA serves, so the default starts there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.prefill_lattice_from", constant(range(0..=65536)), default = 0, tune = engine)]
+#[decision(id = "engine.prefill_lattice_from", constant(range(0..=65536)), default = 256, tune = engine)]
 pub struct PrefillLatticeFrom(pub u32);
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
@@ -637,7 +640,7 @@ mod tests {
                 forward_tokens: 0,
                 walk_fire_rows: 0,
                 host_planes: false,
-                prefill_lattice_from: 0,
+                prefill_lattice_from: 256,
             }
         );
         assert_eq!(
