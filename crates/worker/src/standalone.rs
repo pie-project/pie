@@ -46,6 +46,11 @@ impl gateway::GatewayControl for EmbeddedControl {
     fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
         self.0.gateway_watch()
     }
+
+    async fn desire_scale(&self, entries: Vec<controller_api::ScaleEntry>) -> Result<()> {
+        self.0.desire_scale(entries).await;
+        Ok(())
+    }
 }
 
 pub struct StandaloneHandle {

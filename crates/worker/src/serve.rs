@@ -196,8 +196,15 @@ pub async fn start_runtime_embedded<C: ControlLink>(
 ) -> Result<RuntimeHandle> {
     let (model, booted) = boot_decode(&user_cfg, home).await?;
     let addr = topology::addr_from_host_port(&user_cfg.server.host, user_cfg.server.port);
-    let (edge_server, control_tasks, worker_id) =
-        assemble_distributed(control, &gateways, Role::Decode, model, addr).await?;
+    let (edge_server, control_tasks, worker_id) = assemble_distributed(
+        control,
+        &gateways,
+        Role::Decode,
+        model,
+        engine_of(&user_cfg),
+        addr,
+    )
+    .await?;
     let url = client_edge.unwrap_or_else(|| edge_server.url());
     log_serving(&user_cfg, &url);
     Ok(RuntimeHandle {
@@ -303,6 +310,7 @@ async fn assemble_control_and_edge(
                 &gateways,
                 role,
                 model,
+                engine_of(user_cfg),
                 coordinator.control_addr.clone(),
             )
             .await?;
@@ -331,17 +339,26 @@ async fn assemble_control_and_edge(
     }
 }
 
+/// The engine kind a worker registers its shape with, as its config spells it.
+fn engine_of(cfg: &config::Config) -> String {
+    cfg.model.engine.kind.as_str().to_string()
+}
+
 async fn assemble_distributed<C: ControlLink>(
     control: C,
     gateways: &[String],
     role: Role,
     model: String,
+    engine: String,
     addr: String,
 ) -> Result<(EdgeServer, Vec<tokio::task::JoinHandle<()>>, WorkerId)> {
     let info = WorkerInfo {
         role,
         model,
+        engine,
         addr,
+        // Launched by the controller's actuator, the token it was given.
+        launch: std::env::var(controller_api::LAUNCH_ENV).ok(),
         prior: None,
     };
     let worker_id = ControlLink::register_worker(&control, info.clone())

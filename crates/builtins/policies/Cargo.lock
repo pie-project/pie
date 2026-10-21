@@ -235,6 +235,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "scale-by-prop"
+version = "0.1.0"
+dependencies = [
+ "policy",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"

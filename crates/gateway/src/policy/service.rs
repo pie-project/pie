@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use client_api::props::{PROMPT_BLOCK_BYTES, PromptIndex, TOKENS_PER_BYTE};
 use client_api::{ClientMessage, Props};
-use controller_api::{Health, Role, RoutableWorker, RoutingTable};
+use controller_api::{Health, Role, RoutableWorker, RoutingTable, ScaleEntry};
 use ids::{ReqId, WorkerId};
 use tokio::sync::{Notify, mpsc, watch};
 use worker_api::Request;
@@ -21,6 +21,9 @@ use crate::admission::{AdmissionDecision, RejectReason};
 use crate::route::RoutingHandle;
 use crate::session::AdmitReject;
 
+/// What this host carries whatever its controller can do. `cluster.scale`
+/// is not among them: it is there only while the controller has an actuator
+/// to meet a scale table, so a policy `uses` it and reads it at run time.
 fn capability(name: &str) -> bool {
     // Runs replicate to pools and to serving workers' host tiers; a running
     // turn moves by ending where it runs and resuming where it goes, after
@@ -52,6 +55,8 @@ struct Tables {
 
 struct Shared {
     tables: RwLock<Tables>,
+    /// The scale table, for the controller to converge on.
+    scale: watch::Sender<Vec<ScaleEntry>>,
     waiting: Mutex<BTreeMap<u64, String>>,
     refused: Mutex<HashMap<String, Option<String>>>,
     cancels: mpsc::UnboundedSender<ReqId>,
@@ -135,6 +140,7 @@ impl Cluster {
         let (migrations, moves) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             tables: RwLock::default(),
+            scale: watch::Sender::new(Vec::new()),
             waiting: Mutex::default(),
             refused: Mutex::default(),
             cancels,
@@ -204,6 +210,12 @@ impl Cluster {
 
     fn send(&self, event: Event) {
         let _ = self.events.send(event);
+    }
+
+    /// The scale table the policies installed (`install-scale`), whole.
+    #[must_use]
+    pub fn scale_watch(&self) -> watch::Receiver<Vec<ScaleEntry>> {
+        self.shared.scale.subscribe()
     }
 
     pub async fn admit(&self, req: &Request, routing: &RoutingHandle) -> Result<(), AdmitReject> {
@@ -551,6 +563,10 @@ fn withdraw(
         let after = placed_all(&tables);
         registry.carry_placements(author, &before, &after);
     }
+    if manifest.grants("scale") {
+        // No shape named: each keeps what it has.
+        shared.scale.send_replace(Vec::new());
+    }
     if manifest.grants("replication") {
         let before = replicated(&registry.replication);
         registry.replication.clear();
@@ -624,6 +640,21 @@ fn replicate(
 }
 
 fn enact(shared: &Shared, registry: &mut Registry, commit: Commit, author: &str) {
+    if let Some(scale) = commit.scale {
+        let entries: Vec<ScaleEntry> = scale
+            .into_iter()
+            .map(|s| ScaleEntry {
+                model: s.model,
+                engine: s.engine,
+                workers: s.workers,
+            })
+            .collect();
+        shared.scale.send_if_modified(|table| {
+            let changed = *table != entries;
+            *table = entries;
+            changed
+        });
+    }
     if let Some(replication) = commit.state.replication {
         let before = replicated(&registry.replication);
         registry.replication = replication;
@@ -1042,6 +1073,7 @@ impl Registry {
                 .filter(|w| self.workers.contains(&w.id.0.to_string()))
                 .map(|w| (w.id.0.to_string(), w.clone()))
                 .collect(),
+            scales: routing.scales,
         }
     }
 }
@@ -1086,6 +1118,8 @@ struct Snapshot {
     sessions: HashMap<String, Props>,
     held: HashMap<String, Arc<PromptIndex>>,
     workers: BTreeMap<String, RoutableWorker>,
+    /// The controller has an actuator to meet a scale table.
+    scales: bool,
 }
 
 fn text(value: impl Into<String>) -> Option<Value> {
@@ -1252,6 +1286,7 @@ impl Plane for Snapshot {
                         .rsplit_once(':')
                         .map(|(host, _)| host.trim_start_matches("tcp://"))
                         .and_then(text),
+                    "engine" if !worker.engine.is_empty() => text(worker.engine.clone()),
                     "draining" => Some(Value::Boolean(worker.health != Health::Healthy)),
                     "pie/kv-pressure" => {
                         Some(Value::Int(i64::from(worker.coarse_load.kv_pressure_bucket)))
@@ -1291,7 +1326,10 @@ impl Plane for Snapshot {
     }
 
     fn capability(&self, name: &str) -> bool {
-        capability(name)
+        match name {
+            "cluster.scale" => self.scales,
+            name => capability(name),
+        }
     }
 
     fn terminable(&self, process: &str) -> bool {
@@ -1312,11 +1350,13 @@ mod tests {
     fn table(kv: u8) -> RoutingTable {
         RoutingTable {
             epoch: 1,
+            scales: false,
             workers: vec![RoutableWorker {
                 id: WorkerId(1),
                 addr: "w1".into(),
                 role: Role::Decode,
                 model: "m".into(),
+                engine: String::new(),
                 health: Health::Healthy,
                 coarse_load: WorkerStatus {
                     kv_pressure_bucket: kv,
@@ -1593,6 +1633,59 @@ mod tests {
         let placed = launch(1, serde_json::json!({"key": 1, "worker": "1"}));
         rig.router.admit(&placed, &rig.routing).await.unwrap();
         assert_eq!(rig.router.placement(&placed).0, Some(WorkerId(1)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scale_table_comes_only_from_the_policy_granted_it() {
+        let ask = serde_json::json!({
+            "key": 1,
+            "scale-workers": 2,
+            "scale-engine": "cuda_native",
+            "scale-model": "m",
+        });
+        let granted = rig_of(0, &["scale-by-prop", "test-route"]);
+        let mut scale = granted.router.scale_watch();
+        granted
+            .router
+            .admit(&launch(1, ask.clone()), &granted.routing)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), scale.wait_for(|t| !t.is_empty()))
+            .await
+            .expect("the scale table is installed")
+            .unwrap();
+        assert_eq!(
+            *scale.borrow(),
+            [ScaleEntry {
+                model: Some("m".into()),
+                engine: "cuda_native".into(),
+                workers: 2,
+            }]
+        );
+
+        // test-route installs one too, and holds no `scale` grant.
+        let ungranted = rig_of(0, &["test-route"]);
+        let scale = ungranted.router.scale_watch();
+        ungranted
+            .router
+            .admit(&launch(1, ask), &ungranted.routing)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(scale.borrow().is_empty(), "refused: not granted");
+    }
+
+    #[test]
+    fn cluster_scale_is_there_while_the_controller_can_act() {
+        let registry = Registry::default();
+        let mut routing = table(0);
+        assert!(!registry.snapshot(&routing).capability("cluster.scale"));
+        routing.scales = true;
+        assert!(registry.snapshot(&routing).capability("cluster.scale"));
+        assert!(
+            registry.snapshot(&routing).capability("placement.migrate"),
+            "the rest as before"
+        );
     }
 
     #[tokio::test]

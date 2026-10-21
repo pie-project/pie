@@ -27,9 +27,10 @@ in a compat body, or as `LaunchProcess.props`) and the session it names.
 | `replicate` | cluster | keeps every run some worker caches on two decode workers (the two a hash of the run picks), in their host tier, so losing a worker leaves its runs on another | |
 | `disaggregate` | cluster | names the prefill workers as every process's executors, so its passes are prefilled there: those on the host another program's committed placement put the process first, then the least loaded; it writes executors alone, so `cache-aware` places processes beside it | `placement/worker` |
 | `relocate` | cluster | places a launch by `worker`, then moves it to `move-to` once it has run `move-after-ms`; its stream goes on | `worker`, `move-to`, `move-after-ms` |
-| `drain-migrate` | cluster | moves every turn running on a draining worker to the least loaded one that is not, so a worker leaves without ending what it runs | |
+| `drain-migrate` | cluster | moves every turn running on a draining worker to the least loaded one that is not, so a worker leaves without ending what it runs; a `worker` prop places a launch, as `pin` does, and a drain still moves it | `worker` |
 | `rebalance` | cluster | keeps running turns even across serving workers by moving the youngest from the busiest to the idlest (after Llumnix); a `worker` prop names where a launch starts | `worker` |
 | `pin` | cluster | sends a launch to the worker its `worker` prop names | `worker` |
+| `scale-by-prop` | cluster | keeps the cluster at the worker counts launches ask for: the last ask of each shape (model and engine kind) stands, as the scale table the controller's actuator converges on (`cluster.scale`); a shape never asked for keeps what it has | `scale-workers`, `scale-engine`, `scale-model` |
 | `cluster-priority` | cluster | launches leave the gateway's queue by priority, and pass it on as `cluster/priority` | `priority` |
 
 Pair `cluster-priority` with the worker's `priority` and the two planes order

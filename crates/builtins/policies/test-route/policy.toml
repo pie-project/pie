@@ -22,3 +22,7 @@ doc = "Terminate it once it runs."
 [props.publish]
 type = "text"
 doc = "Publish it as `mark`; refused, for this program is not granted `publish`."
+
+[props.scale-workers]
+type = "int"
+doc = "Install a scale table of this many workers, which this policy is not granted."

@@ -1,7 +1,9 @@
 //! Orders, holds, places and ends launches by their props, so a test can see
 //! the cluster host enact each table and verb.
 
-use policy::{Placement, Subject, SubjectKind, Value, attr, candidates, cluster, prop, terminate};
+use policy::{
+    Placement, Scale, Subject, SubjectKind, Value, attr, candidates, cluster, prop, terminate,
+};
 
 #[derive(Default)]
 struct Route;
@@ -40,6 +42,17 @@ impl cluster::Policy for Route {
             .collect();
         cluster::install_schedule(&keys, Some(1));
         cluster::install_placement(&placements);
+        // Not granted `scale`: the host refuses it.
+        if let Some(workers) = processes
+            .iter()
+            .find_map(|p| prop(&Subject::Process(p.clone()), "scale-workers").int())
+        {
+            cluster::install_scale(&[Scale {
+                model: None,
+                engine: "cuda_native".to_string(),
+                workers: u32::try_from(workers.max(0)).unwrap_or(0),
+            }]);
+        }
         for p in &processes {
             let process = Subject::Process(p.clone());
             if let Some(reason) = prop(&process, "refuse").text() {

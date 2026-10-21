@@ -317,6 +317,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
         Some((router, cancelled, moves))
     };
     let policy_router = router.as_ref().map(|(router, _, _)| router.clone());
+    let scale = policy_router.as_ref().map(|router| router.scale_watch());
     let sessions = Sessions::new(Arc::new(RouteBackend {
         routing: routing.clone(),
         workers: workers.clone(),
@@ -367,7 +368,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
         .await
         .context("register gateway with controller")?;
     tracing::info!(%gateway_id, %worker_addr, "gateway registered with controller");
-    tokio::spawn(controller::heartbeat_loop(control, gateway_id, info));
+    tokio::spawn(controller::heartbeat_loop(control, gateway_id, info, scale));
 
     let app = Router::new()
         .merge(ingress::router(state.clone()))
