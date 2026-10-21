@@ -356,17 +356,18 @@ template <typename T>
 
 instantiate_causal_conv1d_committed(bfloat16, bfloat)
 
-// The history the verify conv commits, at most: a thread of it holds the
-// rows it writes back until the threadgroup has read them.
-constant constexpr int kConvVerifyHist = 16;
+// The rows of history a thread of the verify conv holds, at most, from
+// reading them to writing them back once its threadgroup has read them all.
+constant constexpr int kConvVerifyHeld = 4;
 
-// `causal_conv1d_committed` with the rows of a lane spread over the
-// threadgroup's `rows` threads of a channel: a verify window's dozen rows,
-// one thread a channel walking them in turn, left the conv waiting on each
-// row's loads. Every row's output lands in the extended plane `y` the scan
-// reads, and a row of the window's own in `land` too, at its own row. The
-// window as of `commit` rows is read before any of it is written back: the
-// bank is read and written in place.
+// `causal_conv1d_committed`, four channels a thread as the prompt's
+// `causal_conv1d_chunked_x4`, with the rows of a lane spread over the
+// threadgroup's `rows` threads of those channels: a verify window's dozen
+// rows, one thread a channel walking them in turn, left the conv waiting on
+// each row's loads. Every row's output lands in the extended plane `y` the
+// scan reads, and a row of the window's own in `land` too, at its own row.
+// The window as of `commit` rows is read before any of it is written back:
+// the bank is read and written in place.
 template <typename T>
 [[kernel]] void causal_conv1d_verify(
     const device T* x              [[buffer(0)]],
@@ -388,7 +389,7 @@ template <typename T>
     uint3 pos [[thread_position_in_grid]],
     uint3 at [[thread_position_in_threadgroup]],
     uint3 shape [[threads_per_threadgroup]]) {
-  const int c = int(pos.x);
+  const int c = int(pos.x) * 4;
   const int first = int(at.y);
   const int rows = int(shape.y);
   const int r = int(pos.z);
@@ -410,23 +411,32 @@ template <typename T>
   const size_t chans = size_t(channels);
   const size_t col = size_t(c);
   const size_t slab = size_t(slot) * size_t(hist) * chans;
-  const size_t tap0 = size_t(c) * size_t(width);
   const int own = indptr[r] - rep;
-  // The window's row `src`, the bank's rows before the lane's first.
-  auto tap = [&](int src) -> float {
-    return (src < 0) ? conv_state[slab + size_t(hist + src) * chans + col]
-                     : float(x[size_t(begin + src) * chans + col]);
-  };
 
-  for (int t = first; live && t < span; t += rows) {
-    float acc = 0.0f;
+  if (live) {
+    float4 w[PIE_CONV_X4_TAPS];
     for (int k = 0; k < width; ++k) {
-      acc += tap(t - (width - 1 - k) * dil) * float(weight[tap0 + size_t(k)]);
+      w[k] = float4(float(weight[(col + 0) * size_t(width) + size_t(k)]),
+                    float(weight[(col + 1) * size_t(width) + size_t(k)]),
+                    float(weight[(col + 2) * size_t(width) + size_t(k)]),
+                    float(weight[(col + 3) * size_t(width) + size_t(k)]));
     }
-    const T out = T(causal_conv1d_silu(acc));
-    y[size_t(begin + t) * chans + col] = out;
-    if (t >= rep) {
-      land[size_t(own + t) * chans + col] = out;
+    for (int t = first; t < span; t += rows) {
+      float4 acc = 0.0f;
+      for (int k = 0; k < width; ++k) {
+        const float4 tap = causal_conv1d_x4_tap<T>(x, conv_state, slab, chans, col, begin, hist,
+                                                   t - (width - 1 - k) * dil);
+        acc.x += tap.x * w[k].x;
+        acc.y += tap.y * w[k].y;
+        acc.z += tap.z * w[k].z;
+        acc.w += tap.w * w[k].w;
+      }
+      const vec<T, 4> out(T(causal_conv1d_silu(acc.x)), T(causal_conv1d_silu(acc.y)),
+                          T(causal_conv1d_silu(acc.z)), T(causal_conv1d_silu(acc.w)));
+      *reinterpret_cast<device vec<T, 4>*>(y + size_t(begin + t) * chans + col) = out;
+      if (t >= rep) {
+        *reinterpret_cast<device vec<T, 4>*>(land + size_t(own + t) * chans + col) = out;
+      }
     }
   }
 
@@ -437,21 +447,25 @@ template <typename T>
     for (int i = 0; i < PIE_RS_SNAPSHOTS && snap[i] > 0; ++i) {
       const size_t into = size_t(snap[PIE_RS_SNAPSHOTS + i]) * size_t(hist) * chans;
       for (int s = first; s < hist; s += rows) {
-        new_conv_state[into + size_t(s) * chans + col] = tap(snap[i] - hist + s);
+        *reinterpret_cast<device float4*>(new_conv_state + into + size_t(s) * chans + col) =
+            causal_conv1d_x4_tap<T>(x, conv_state, slab, chans, col, begin, hist,
+                                    snap[i] - hist + s);
       }
     }
   }
 
   const int keep = min(commit[lane0 + r], span);
-  float next[kConvVerifyHist];
+  float4 next[kConvVerifyHeld];
   int held = 0;
   for (int s = first; live && keep > 0 && s < hist; s += rows) {
-    next[held++] = tap(keep - hist + s);
+    next[held++] = causal_conv1d_x4_tap<T>(x, conv_state, slab, chans, col, begin, hist,
+                                           keep - hist + s);
   }
   threadgroup_barrier(mem_flags::mem_device);
   held = 0;
   for (int s = first; live && keep > 0 && s < hist; s += rows) {
-    new_conv_state[slab + size_t(s) * chans + col] = next[held++];
+    *reinterpret_cast<device float4*>(new_conv_state + slab + size_t(s) * chans + col) =
+        next[held++];
   }
 }
 
