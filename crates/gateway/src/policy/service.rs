@@ -23,9 +23,9 @@ use crate::session::AdmitReject;
 
 fn capability(name: &str) -> bool {
     // Runs replicate to pools and to serving workers' host tiers; a running
-    // turn moves by ending where it runs and resuming where it goes, after
-    // what its client was sent; the workers a placement names run its
-    // process's passes.
+    // turn that has sent no output moves by ending where it runs and running
+    // again where it goes; the workers a placement names run its process's
+    // passes.
     matches!(
         name,
         "cluster.hold" | "state.replicate" | "placement.migrate" | "placement.executors"
@@ -1121,7 +1121,6 @@ mod tests {
                 capture_outputs: true,
                 props: serde_json::from_value(props).unwrap(),
                 session: None,
-                resume: None,
                 cluster_props: Props::new(),
                 executors: Vec::new(),
             },

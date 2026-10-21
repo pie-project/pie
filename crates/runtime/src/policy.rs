@@ -66,8 +66,6 @@ pub struct Arrival {
     pub tenant: String,
     pub session: Option<String>,
     pub props: Props,
-    /// The resume log a move relaunched it with (`session.resumed`).
-    pub resumed: Option<String>,
     /// The workers the cluster names to run its passes, best first.
     pub executors: Vec<String>,
 }

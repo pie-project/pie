@@ -133,7 +133,8 @@ interface types {
     record placement {
         process: id,
         /// None leaves the worker to the gateway's default choice. A running
-        /// process given another worker migrates there (`placement.migrate`).
+        /// process given another worker migrates there (`placement.migrate`)
+        /// while it has sent its client no output; one that has stays.
         worker: option<id>,
         /// Workers its passes may run on, best first. Empty leaves them
         /// to the worker plane's host. Written under the `executors` grant;

@@ -79,8 +79,6 @@ pub enum ProcessEvent {
     Stdout(String),
     Stderr(String),
     Message(String),
-    /// A resume note, as JSON ([`client_api::resume::Note`]).
-    Resume(String),
     Return(String),
     Error(String),
 }
@@ -91,7 +89,6 @@ impl ProcessEvent {
             Self::Stdout(_) => "stdout",
             Self::Stderr(_) => "stderr",
             Self::Message(_) => "message",
-            Self::Resume(_) => client_api::resume::EVENT,
             Self::Return(_) => "return",
             Self::Error(_) => "error",
         }
@@ -102,7 +99,6 @@ impl ProcessEvent {
             Self::Stdout(v)
             | Self::Stderr(v)
             | Self::Message(v)
-            | Self::Resume(v)
             | Self::Return(v)
             | Self::Error(v) => v,
         }
@@ -704,9 +700,8 @@ impl Process {
         mut arrival: Arrival,
     ) {
         // A process arrives, as a policy sees it, before it waits: every gate
-        // below orders by its key. Its resume log is the program's alone.
+        // below orders by its key. Its executors are the offload's alone.
         let props = arrival.props.clone();
-        let resumed = arrival.resumed.take();
         crate::offload::executors::set(process_id, std::mem::take(&mut arrival.executors));
         crate::policy::report(crate::policy::Event::Arrived(process_id, arrival));
         // Held ahead of every admission permit: a preempted process coming
@@ -735,7 +730,6 @@ impl Process {
             instantiate_us = duration_us(instantiate_start.elapsed());
             store.data_mut().install_prewarm_permit(prewarm_permit);
             store.data_mut().set_props(props);
-            store.data_mut().set_resumed(resumed);
 
             let run_interface = RUN_INTERFACE;
 

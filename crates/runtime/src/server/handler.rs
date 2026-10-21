@@ -469,7 +469,6 @@ impl Session {
         capture_outputs: bool,
         mut props: client_api::Props,
         session: Option<String>,
-        resume: Option<String>,
         cluster_props: client_api::Props,
         executors: Vec<String>,
     ) {
@@ -545,7 +544,6 @@ impl Session {
                 tenant: self.tenant.clone(),
                 session,
                 props,
-                resumed: resume,
                 executors,
             },
         ) {

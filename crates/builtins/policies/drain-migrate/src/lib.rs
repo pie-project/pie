@@ -1,5 +1,6 @@
-//! Moves every turn running on a draining worker to the least loaded worker
-//! that is not draining.
+//! Moves the turns on a draining worker to the least loaded worker that is
+//! not draining. The gateway moves a turn only while it has sent no output;
+//! one that has finishes where it runs, which the drain waits for.
 
 use policy::{Placement, Subject, SubjectKind, attr, candidates, cluster};
 

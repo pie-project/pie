@@ -15,10 +15,10 @@
 
 use serde_json::{Value, json};
 
-/// A frame, the tokens it covers going into the resume log with it, so the
-/// turn can move ([`crate::resume`]).
+/// A frame, carrying the tokens it covers, so the gateway can continue the
+/// turn elsewhere ([`crate::continuation`]).
 fn frame(frame: Value) {
-    crate::resume::send(&frame.to_string());
+    crate::continuation::send(frame);
 }
 
 /// A JSON frame with no event name.

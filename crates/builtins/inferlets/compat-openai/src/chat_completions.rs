@@ -410,7 +410,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
 
     // The role rides on the first delta, as the open servers send it: an
     // empty role chunk ahead of the prefill would read as the first token. A
-    // turn resumed after a move builds and drops that delta again, with the
+    // turn the gateway continues builds and drops that delta again, with the
     // frames the client already has.
     let mut role = Some("assistant");
     let mut delta = |mut v: Value| {

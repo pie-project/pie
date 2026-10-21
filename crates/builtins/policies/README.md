@@ -27,7 +27,7 @@ in a compat body, or as `LaunchProcess.props`) and the session it names.
 | `replicate` | cluster | keeps every run some worker caches on two decode workers (the two a hash of the run picks), in their host tier, so losing a worker leaves its runs on another | |
 | `disaggregate` | cluster | names the prefill workers (least loaded first) as every process's executors, so its passes are prefilled there; it writes executors alone, so `cache-aware` places processes beside it | |
 | `relocate` | cluster | places a launch by `worker`, then moves it to `move-to` once it has run `move-after-ms`; its stream goes on | `worker`, `move-to`, `move-after-ms` |
-| `drain-migrate` | cluster | moves every turn running on a draining worker to the least loaded one that is not, so a worker leaves without ending what it runs | |
+| `drain-migrate` | cluster | moves the turns on a draining worker that have sent no output to the least loaded one that is not; the rest finish where they run, which the drain waits for | |
 | `rebalance` | cluster | keeps running turns even across serving workers by moving the youngest from the busiest to the idlest (after Llumnix); a `worker` prop names where a launch starts | `worker` |
 | `pin` | cluster | sends a launch to the worker its `worker` prop names | `worker` |
 | `cluster-priority` | cluster | launches leave the gateway's queue by priority, and pass it on as `cluster/priority` | `priority` |

@@ -58,24 +58,13 @@ pub fn open_session() -> Result<ClientId> {
 }
 
 pub fn open_session_for(tenant: String) -> Result<ClientId> {
-    open(tenant, false)
-}
-
-/// A session for a client that moves turns between workers (a gateway's):
-/// its programs' resume notes reach it as they are ([`client_api::resume`]),
-/// where any other client sees only the messages they carry.
-pub fn open_session_resuming(tenant: String) -> Result<ClientId> {
-    open(tenant, true)
-}
-
-fn open(tenant: String, resumes: bool) -> Result<ClientId> {
     let state = get_state()?;
     let id = state.next_client_id.fetch_add(1, Ordering::Relaxed);
 
     let (out_tx, out_rx) = mpsc::channel(1000);
     SESSION_OUTBOX.insert(id, Arc::new(TokioMutex::new(out_rx)));
 
-    let session = Session::new_inproc(id, state, out_tx, tenant, resumes);
+    let session = Session::new_inproc(id, state, out_tx, tenant);
     CLIENT_SERVICES.spawn(id, || session)?;
     Ok(id)
 }
@@ -232,8 +221,6 @@ struct Session {
     pub(super) installed_programs: HashSet<ProgramName>,
     pub(super) file_waiters: HashMap<ProcessId, tokio::sync::oneshot::Sender<Bytes>>,
     out_tx: mpsc::Sender<WireServerMessage>,
-    /// The client takes resume notes ([`open_session_resuming`]).
-    resumes: bool,
 }
 
 impl Session {
@@ -242,7 +229,6 @@ impl Session {
         state: Arc<ServerState>,
         out_tx: mpsc::Sender<WireServerMessage>,
         tenant: String,
-        resumes: bool,
     ) -> Self {
         Session {
             id,
@@ -255,7 +241,6 @@ impl Session {
             installed_programs: HashSet::new(),
             file_waiters: HashMap::new(),
             out_tx,
-            resumes,
         }
     }
 
@@ -336,19 +321,6 @@ impl Session {
         event: &str,
         value: String,
     ) {
-        // A client that moves nothing sees what a note carries, not the note.
-        let (event, value) = match event {
-            client_api::resume::EVENT if !self.resumes => {
-                match serde_json::from_str::<client_api::resume::Note>(&value) {
-                    Ok(client_api::resume::Note {
-                        message: Some(message),
-                        ..
-                    }) => ("message", message),
-                    _ => return,
-                }
-            }
-            event => (event, value),
-        };
         self.send(WireServerMessage::ProcessEvent {
             process_id: process_id.to_string(),
             event: event.to_string(),
@@ -412,7 +384,6 @@ impl Session {
                 capture_outputs,
                 props,
                 session,
-                resume,
                 cluster_props,
                 executors,
             } => {
@@ -423,7 +394,6 @@ impl Session {
                     capture_outputs,
                     props,
                     session,
-                    resume,
                     cluster_props,
                     executors,
                 )
@@ -481,47 +451,6 @@ mod tests {
     use crate::inferlet::process::probe::{self, Seen};
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_client_that_moves_nothing_sees_what_a_resume_note_carries() {
-        let note = |message: Option<&str>| {
-            serde_json::to_string(&client_api::resume::Note {
-                more: "1 ".into(),
-                message: message.map(Into::into),
-                ..client_api::resume::Note::default()
-            })
-            .unwrap()
-        };
-        let pid = ProcessId::new_v4();
-        let seen = |resumes: bool| async move {
-            let (tx, mut rx) = mpsc::channel(4);
-            let session =
-                Session::new_inproc(9, install_state(0), tx, DEFAULT_TENANT.into(), resumes);
-            for message in [Some("hi"), None] {
-                session
-                    .send_process_event(pid, client_api::resume::EVENT, note(message))
-                    .await;
-            }
-            drop(session);
-            let mut events = Vec::new();
-            while let Ok(WireServerMessage::ProcessEvent { event, value, .. }) = rx.try_recv() {
-                events.push((event, value));
-            }
-            events
-        };
-        assert_eq!(
-            seen(false).await,
-            [("message".to_string(), "hi".to_string())],
-            "the message alone, and nothing of a note that carries none"
-        );
-        let gateway = seen(true).await;
-        assert_eq!(gateway.len(), 2, "a gateway hears every note");
-        assert!(
-            gateway
-                .iter()
-                .all(|(event, _)| event == client_api::resume::EVENT)
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn a_closed_session_ends_what_it_launched_and_only_detaches_what_it_attached() {
         let launched = ProcessId::new_v4();
         let attached = ProcessId::new_v4();
@@ -535,7 +464,6 @@ mod tests {
             install_state(0),
             mpsc::channel(1).0,
             DEFAULT_TENANT.to_string(),
-            false,
         );
         session.attached_processes = vec![launched, attached];
         session.launched_processes.insert(launched);

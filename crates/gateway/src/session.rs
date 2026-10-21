@@ -63,13 +63,28 @@ impl std::error::Error for SessionError {}
 
 pub struct TokenRx {
     rx: mpsc::Receiver<Tokens>,
+    lost: Arc<AtomicBool>,
 }
 
 impl TokenRx {
     pub async fn recv(&mut self) -> Option<Tokens> {
         self.rx.recv().await
     }
+
+    /// The turn ended because its worker was lost after it had sent the
+    /// client output: what it sent cannot be unsent, so it was not run
+    /// again. An ingress that knows the API may continue it
+    /// (`ingress::compat`); any other client is told to retry.
+    #[must_use]
+    pub fn lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
 }
+
+/// What a client hears when the worker running its turn is lost after the
+/// turn sent output.
+pub const LOST_AFTER_OUTPUT: &str = "the worker running this turn was lost after it sent output; \
+                                     what it sent stands, and the turn did not finish: retry it";
 
 #[derive(Debug, Clone)]
 pub enum AdmitReject {
@@ -110,18 +125,22 @@ struct TurnState {
     worker: Option<WorkerId>,
     request: Request,
     affinity: Option<u64>,
+    /// The client has had output (a process event or a file), not just
+    /// the launch's answer: from then on the turn is not run again.
     emitted: bool,
     sink: mpsc::Sender<Tokens>,
     open: Arc<AtomicBool>,
     outcome: Option<Outcome>,
-    /// The program's resume log as of what the client has been sent: what
-    /// a move relaunches it with. None: it keeps none, and a turn that has
-    /// sent anything cannot be moved.
-    resume: Option<String>,
-    /// Moved: the worker it left, whose late frames are dropped, and the
-    /// new launch's answer, which the client does not see again.
+    /// Run again elsewhere before it sent output: the worker it left, whose
+    /// late frames are dropped, and the new launch's answer, which the
+    /// client does not see again.
     left: Option<WorkerId>,
     relaunched: bool,
+    /// The client has had the launch's answer, naming this process: what a
+    /// launch run again elsewhere is called to the client too.
+    answered: bool,
+    process: Option<String>,
+    lost: Arc<AtomicBool>,
 }
 
 struct Inner {
@@ -134,41 +153,13 @@ struct Inner {
     pipe_cap: usize,
 }
 
-/// A program's resume note ([`client_api::resume`]): kept on the turn, and
-/// what the client sees of it, the message it carries, put in its place.
-/// `false`: the note carries no message, so the client sees nothing.
-fn take_note(turn: &mut TurnState, message: &mut ServerMessage) -> bool {
-    let ServerMessage::ProcessEvent { event, value, .. } = message else {
-        return true;
-    };
-    if event != client_api::resume::EVENT {
-        return true;
-    }
-    let Ok(note) = serde_json::from_str::<client_api::resume::Note>(value) else {
-        tracing::warn!("a resume note that does not parse is dropped");
-        return false;
-    };
-    turn.resume = note.apply(turn.resume.take());
-    match note.message {
-        Some(sent) => {
-            *event = "message".to_string();
-            *value = sent;
-            true
-        }
-        None => false,
-    }
-}
-
-/// Readies a turn to be launched again away from `old`: its launch carries
-/// what the client was sent, which the program continues after, and `old`'s
-/// late frames and the new launch's answer are kept from the client.
+/// Readies a turn that has sent no output to be launched again away from
+/// `old`, from its own input: `old`'s late frames are kept from the client,
+/// and so is the new launch's answer if it had the first one.
 fn relaunch(turn: &mut TurnState, old: WorkerId) {
-    if let ClientMessage::LaunchProcess { resume, .. } = &mut turn.request.message {
-        *resume = turn.resume.clone();
-    }
     turn.worker = None;
     turn.left = Some(old);
-    turn.relaunched = true;
+    turn.relaunched = turn.answered;
 }
 
 fn is_launch_answer(turn: &TurnState, message: &ServerMessage) -> bool {
@@ -226,6 +217,7 @@ impl Inner {
         }
 
         let (tx, rx) = mpsc::channel(self.pipe_cap);
+        let lost = Arc::new(AtomicBool::new(false));
         {
             let mut turns = self.turns.lock().unwrap();
             turns.insert(
@@ -238,9 +230,11 @@ impl Inner {
                     sink: tx,
                     open: open.clone(),
                     outcome: None,
-                    resume: None,
                     left: None,
                     relaunched: false,
+                    answered: false,
+                    process: None,
+                    lost: lost.clone(),
                 },
             );
         }
@@ -252,7 +246,7 @@ impl Inner {
         match tokio::spawn(async move { inner.dispatch(req_id, &request, affinity, &open).await })
             .await
         {
-            Ok(Ok(_)) => Ok((req_id, TokenRx { rx })),
+            Ok(Ok(_)) => Ok((req_id, TokenRx { rx, lost })),
             _ => Err(SessionError::NoWorker),
         }
     }
@@ -377,8 +371,7 @@ impl Sessions {
     }
 
     /// A chunk from worker `from`: one from a worker the turn has left is
-    /// dropped, and a program's resume note is kept on the turn for a move,
-    /// the client seeing only the message it carries.
+    /// dropped.
     pub async fn feed_from(
         &self,
         req_id: ReqId,
@@ -396,8 +389,13 @@ impl Sessions {
                 return Control::Abort;
             }
             if let Tokens::Chunk(message) = &mut chunk {
-                if !take_note(turn, message) {
-                    return Control::Continue;
+                // A launch run again is another process to the worker, and
+                // the one the client knows to the client.
+                if let Some(known) = &turn.process
+                    && let ServerMessage::ProcessEvent { process_id, .. }
+                    | ServerMessage::File { process_id, .. } = message
+                {
+                    process_id.clone_from(known);
                 }
                 let relaunch = turn.relaunched && is_launch_answer(turn, message);
                 self.note(turn, req_id, message);
@@ -410,11 +408,17 @@ impl Sessions {
         };
 
         let is_eos = matches!(chunk, Tokens::Eos);
+        let output = matches!(
+            chunk,
+            Tokens::Chunk(ServerMessage::ProcessEvent { .. } | ServerMessage::File { .. })
+        );
         match sink.send(chunk).await {
             Ok(()) => {
                 if is_eos {
                     self.inner.end(req_id, Outcome::Completed, By::Host);
-                } else if let Some(turn) = self.inner.turns.lock().unwrap().get_mut(&req_id) {
+                } else if output
+                    && let Some(turn) = self.inner.turns.lock().unwrap().get_mut(&req_id)
+                {
                     turn.emitted = true;
                 }
                 Control::Continue
@@ -442,6 +446,10 @@ impl Sessions {
                 ok,
                 result,
             } if answered == corr_id => {
+                if !turn.answered && *ok {
+                    turn.process = Some(result.clone());
+                }
+                turn.answered = true;
                 if !ok {
                     turn.outcome = Some(Outcome::Failed);
                 } else if let Some(worker) = turn.worker
@@ -460,11 +468,10 @@ impl Sessions {
         }
     }
 
-    /// Moves a running turn to `target`: ends it where it runs, and launches
-    /// it again with what the client was sent, which the program continues
-    /// after under the same response id. The client's stream does not break.
-    /// The placement table already names `target`, so the dispatch goes
-    /// there.
+    /// Moves a running turn to `target` while it has sent no output: ends it
+    /// where it runs and launches it again from its own input. One that has
+    /// sent output stays where it is. The placement table already names
+    /// `target`, so the dispatch goes there.
     pub async fn migrate(&self, req_id: ReqId, target: WorkerId) -> bool {
         let entry = {
             let mut turns = self.inner.turns.lock().unwrap();
@@ -477,9 +484,9 @@ impl Sessions {
             if old == target || turn.outcome.is_some() {
                 return false;
             }
-            // Its program keeps no resume log: run again, it would send
-            // what the client already has.
-            if turn.emitted && turn.resume.is_none() {
+            // Run again, it would send what the client already has.
+            if turn.emitted {
+                tracing::debug!(req = %req_id, "a turn that sent output is not moved");
                 return false;
             }
             relaunch(turn, old);
@@ -635,11 +642,16 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                     .collect()
             };
 
-            // A turn that has said nothing is launched again as it came; one
-            // whose frames named what they covered goes on after it, as a
-            // moved turn does; any other has said what cannot be unsaid.
+            // A turn that has sent no output is launched again from its own
+            // input; one that has is told why it ends, and ends: what it sent
+            // cannot be unsent.
             for (req_id, _, _, affinity, open) in affected {
-                let (request, resumed) = {
+                enum Next {
+                    Again(Box<Request>),
+                    Lost(mpsc::Sender<Tokens>, String),
+                    End,
+                }
+                let next = {
                     let mut turns = inner.turns.lock().unwrap();
                     let Some(turn) = turns.get_mut(&req_id) else {
                         continue;
@@ -647,27 +659,35 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                     let Some(old) = turn.worker else {
                         continue;
                     };
-                    let resumed = turn.emitted;
-                    if !turn.emitted {
-                        turn.worker = None;
-                    } else if turn.resume.is_some() && turn.outcome.is_none() {
-                        relaunch(turn, old);
-                        tracing::info!(req = %req_id, from = %old, "resuming a turn its worker dropped");
+                    if turn.outcome.is_some() {
+                        Next::End
+                    } else if turn.emitted {
+                        turn.lost.store(true, Ordering::Release);
+                        tracing::info!(req = %req_id, from = %old, "a turn that sent output lost its worker");
+                        Next::Lost(turn.sink.clone(), turn.process.clone().unwrap_or_default())
                     } else {
-                        drop(turns);
-                        inner.end(req_id, Outcome::Failed, By::Host);
-                        continue;
+                        relaunch(turn, old);
+                        tracing::info!(req = %req_id, from = %old, "running a turn again: its worker dropped it before it sent output");
+                        Next::Again(Box::new(turn.request.clone()))
                     }
-                    (turn.request.clone(), resumed)
                 };
-                match inner.dispatch(req_id, &request, affinity, &open).await {
-                    Ok(worker) if resumed => inner.router.moved(&request, Some(worker), ""),
-                    Err(_) if resumed => {
-                        inner
-                            .router
-                            .moved(&request, None, "no worker took the dropped turn")
+                match next {
+                    Next::Again(request) => {
+                        let _ = inner.dispatch(req_id, &request, affinity, &open).await;
                     }
-                    _ => {}
+                    Next::Lost(sink, process_id) => {
+                        let _ = sink
+                            .send(Tokens::Chunk(ServerMessage::ProcessEvent {
+                                process_id,
+                                event: "error".to_string(),
+                                value: LOST_AFTER_OUTPUT.to_string(),
+                            }))
+                            .await;
+                        inner.end(req_id, Outcome::Failed, By::Host);
+                    }
+                    Next::End => {
+                        inner.end(req_id, Outcome::Failed, By::Host);
+                    }
                 }
             }
         }
@@ -780,7 +800,6 @@ mod tests {
                 capture_outputs: true,
                 props: Default::default(),
                 session: None,
-                resume: None,
                 cluster_props: Default::default(),
                 executors: Vec::new(),
             },
@@ -933,7 +952,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_turn_its_worker_dropped_goes_on_after_what_the_client_was_sent() {
+    async fn a_turn_its_worker_dropped_before_it_sent_output_runs_again_from_its_input() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
         let mut turn = launch();
@@ -952,52 +971,11 @@ mod tests {
                 result: "p".into(),
             })
         };
-        let frame = |value: &str| {
-            Tokens::Chunk(ServerMessage::ProcessEvent {
-                process_id: "p".into(),
-                event: "message".into(),
-                value: value.into(),
-            })
-        };
-        let note = |note: client_api::resume::Note| {
-            Tokens::Chunk(ServerMessage::ProcessEvent {
-                process_id: "p".into(),
-                event: client_api::resume::EVENT.into(),
-                value: serde_json::to_string(&note).unwrap(),
-            })
-        };
         sessions.feed_from(req, answer(), Some(WorkerId(7))).await;
-        sessions
-            .feed_from(
-                req,
-                note(client_api::resume::Note {
-                    state: Some("cmpl-1\n".into()),
-                    ..Default::default()
-                }),
-                Some(WorkerId(7)),
-            )
-            .await;
-        sessions
-            .feed_from(
-                req,
-                note(client_api::resume::Note {
-                    more: "1 2 ".into(),
-                    message: Some(r#"{"text":"ab"}"#.into()),
-                    ..Default::default()
-                }),
-                Some(WorkerId(7)),
-            )
-            .await;
-        rx.recv().await;
-        let Some(Tokens::Chunk(ServerMessage::ProcessEvent { event, value, .. })) = rx.recv().await
-        else {
-            panic!("the frame");
-        };
-        assert_eq!(
-            (event.as_str(), value.as_str()),
-            ("message", r#"{"text":"ab"}"#),
-            "the client sees what a note carries, and not a note carrying nothing"
-        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(Tokens::Chunk(ServerMessage::Response { .. }))
+        ));
 
         // Worker 7 goes; 8 is all there is.
         *router.dispatch_worker.lock().unwrap() = Some(WorkerId(8));
@@ -1007,37 +985,43 @@ mod tests {
         settle().await;
         assert_eq!(router.dispatched.lock().unwrap().len(), 2);
         let relaunch = router.messages.lock().unwrap()[1].clone();
-        let ClientMessage::LaunchProcess { input, resume, .. } = &relaunch else {
+        let ClientMessage::LaunchProcess { input, .. } = &relaunch else {
             panic!("a launch");
         };
         assert_eq!(input, r#"{"prompt":"hi"}"#, "the program's own input");
-        assert_eq!(
-            resume.as_deref(),
-            Some("cmpl-1\n1 2 "),
-            "its log as the client had it"
-        );
-        assert_eq!(*router.moves.lock().unwrap(), [(req, Some(WorkerId(8)))]);
         assert!(
             router.endings.lock().unwrap().is_empty(),
             "the turn goes on"
         );
 
-        // The new launch's answer is not heard again; its frames are.
-        sessions.feed_from(req, answer(), Some(WorkerId(8))).await;
+        // The new launch's answer is not heard again; its frames are, and
+        // late frames from the worker it left are not.
         sessions
-            .feed_from(req, frame(r#"{"text":"c"}"#), Some(WorkerId(8)))
+            .feed_from(req, event("message"), Some(WorkerId(7)))
             .await;
-        let Some(Tokens::Chunk(ServerMessage::ProcessEvent { value, .. })) = rx.recv().await else {
+        sessions.feed_from(req, answer(), Some(WorkerId(8))).await;
+        let again = Tokens::Chunk(ServerMessage::ProcessEvent {
+            process_id: "q".into(),
+            event: "message".into(),
+            value: String::new(),
+        });
+        sessions.feed_from(req, again, Some(WorkerId(8))).await;
+        let Some(Tokens::Chunk(ServerMessage::ProcessEvent {
+            event, process_id, ..
+        })) = rx.recv().await
+        else {
             panic!("the next frame");
         };
-        assert_eq!(value, r#"{"text":"c"}"#);
+        assert_eq!(event, "message");
+        assert_eq!(process_id, "p", "under the process the client knows");
+        assert!(!rx.lost());
     }
 
     #[tokio::test]
-    async fn a_turn_that_said_what_it_cannot_resume_from_fails_with_its_worker() {
+    async fn a_turn_that_sent_output_fails_with_its_worker_and_says_why() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
-        let (_h, _rx) = sessions
+        let (_h, mut rx) = sessions
             .create(ident(), launch(), Affinity::Sticky)
             .await
             .unwrap();
@@ -1045,17 +1029,27 @@ mod tests {
         sessions
             .feed_from(req, event("message"), Some(WorkerId(7)))
             .await;
+        rx.recv().await;
         router._connected_tx.send_replace(Arc::new(HashSet::new()));
         settle().await;
         assert_eq!(
             *router.endings.lock().unwrap(),
             [(req, Outcome::Failed, By::Host)]
         );
-        assert_eq!(router.dispatched.lock().unwrap().len(), 1);
+        assert_eq!(router.dispatched.lock().unwrap().len(), 1, "not run again");
+        let Some(Tokens::Chunk(ServerMessage::ProcessEvent { event, value, .. })) = rx.recv().await
+        else {
+            panic!("the reason");
+        };
+        assert_eq!(
+            (event.as_str(), value.as_str()),
+            ("error", LOST_AFTER_OUTPUT)
+        );
+        assert!(rx.lost());
     }
 
     #[tokio::test]
-    async fn a_turn_that_sent_without_a_resume_log_is_not_moved() {
+    async fn a_turn_that_sent_output_is_not_moved() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
         let (_h, _rx) = sessions
@@ -1063,14 +1057,19 @@ mod tests {
             .await
             .unwrap();
         let req = router.dispatched.lock().unwrap()[0];
+        assert!(
+            sessions.migrate(req, WorkerId(8)).await,
+            "before output a turn moves"
+        );
+        let req = router.dispatched.lock().unwrap()[1];
         sessions
-            .feed_from(req, event("message"), Some(WorkerId(7)))
+            .feed_from(req, event("message"), Some(WorkerId(8)))
             .await;
         assert!(
-            !sessions.migrate(req, WorkerId(8)).await,
+            !sessions.migrate(req, WorkerId(7)).await,
             "run again, it would send what the client has"
         );
-        assert_eq!(router.dispatched.lock().unwrap().len(), 1);
+        assert_eq!(router.dispatched.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

@@ -8,9 +8,10 @@
 //!
 //! `path` and `query` are there for the APIs that put meaning in them (Gemini
 //! chooses streaming by path); `time` is the request's wall-clock arrival in
-//! unix seconds, because the guest has no wall clock of its own. An input
-//! without a `body` key is taken to be the body itself, so `pie run` with a
-//! hand-written request works too.
+//! unix seconds, because the guest has no wall clock of its own. The gateway
+//! adds `continuation` when it continues a turn whose worker was lost
+//! ([`crate::continuation`]). An input without a `body` key is taken to be
+//! the body itself, so `pie run` with a hand-written request works too.
 
 use std::collections::BTreeMap;
 
@@ -62,6 +63,11 @@ impl Envelope {
             })
             .unwrap_or_default();
         let time = object.get("time").and_then(Value::as_u64).unwrap_or(0);
+        crate::continuation::begin(
+            object
+                .get("continuation")
+                .and_then(crate::continuation::Continuation::of),
+        );
         Ok(Self {
             path,
             query,

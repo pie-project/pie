@@ -453,7 +453,6 @@ impl Client {
             capture_outputs,
             props,
             session,
-            resume: None,
             cluster_props: Props::new(),
             executors: Vec::new(),
         };

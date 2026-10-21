@@ -339,7 +339,7 @@ impl WorkerControlServer {
         {
             return Ok(handle.turns.clone());
         }
-        let client_id = runtime::server::open_session_resuming(tenant.0.clone())
+        let client_id = runtime::server::open_session_for(tenant.0.clone())
             .map_err(|e| anyhow!("open session: {e}"))?;
         let (turns_tx, turns_rx) = mpsc::channel::<Request>(TURN_QUEUE_DEPTH);
         let cancels: Arc<Mutex<HashMap<ReqId, Arc<Notify>>>> = Arc::default();

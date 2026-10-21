@@ -53,10 +53,6 @@ pub enum ClientMessage {
         props: Props,
         #[serde(default)]
         session: Option<String>,
-        /// The resume log a move relaunches the program with
-        /// ([`crate::resume`]); none for a fresh launch.
-        #[serde(default)]
-        resume: Option<String>,
         /// Set by the worker, never on the wire.
         #[serde(skip)]
         cluster_props: Props,

@@ -914,7 +914,6 @@ mod tests {
                 tenant: tenant.into(),
                 session: session.map(Into::into),
                 props: Default::default(),
-                resumed: None,
                 executors: Vec::new(),
             },
         ));
@@ -935,7 +934,6 @@ mod tests {
             tenant: "t".into(),
             session: None,
             props: props(json!({"priority": 1})),
-            resumed: None,
             executors: Vec::new(),
         };
         let arrived = registry.apply(Event::Arrived(pid, arrival));
@@ -1110,7 +1108,6 @@ mod tests {
                     tenant: "t".into(),
                     session: None,
                     props: props(json!({ "prompt": prompt })),
-                    resumed: None,
                     executors: Vec::new(),
                 },
             ));
