@@ -609,11 +609,13 @@ const DENSE_WIDE_NBW: u32 = 2;
 /// The routes a batch item takes, if the batch legs take this fire: from
 /// `kernel.moe.batch_from` tokens' routes (one token's read each expert once
 /// on the stream, which orders nothing), while the experts average (routes over
-/// experts, rounded up) at most `until`. An item is the least of 4, 8, 16, 32
-/// and (a bank whose kernels take it, `widest`) 64 routes past the average by
-/// two of its square roots and one, so the busier experts of a random routing
-/// still read their weight once, and an item stages no more empty rows than
-/// that takes; past them an expert takes several of the widest.
+/// experts, rounded up) at most `until`. An item is never under 16 routes:
+/// its products are one 16-route block whatever it holds, and a real
+/// routing's busy experts (Qwen3.6 at 32 tokens: 98 of 256 experts, the
+/// busiest past 16 routes) split into several items, each reading the
+/// weight again (4-route items: 120 expert reads a layer, 13% slower). From
+/// three routes an expert, 32 (at 128 tokens: 169 reads at 16, 154 at 32),
+/// and past 25 the widest; an expert past its item takes several.
 fn batch_items(ctx: &Ctx, fan: &Selected, experts: u32, widest: u32, until: u32) -> Option<u32> {
     let t = ctx.tuning();
     let top_k = fan.top_k.unsigned_abs();
@@ -624,13 +626,9 @@ fn batch_items(ctx: &Ctx, fan: &Selected, experts: u32, widest: u32, until: u32)
     if per > until {
         return None;
     }
-    // per + 2·√per + 1 = (√per + 1)², so an item of `mt` covers it while
-    // √per + 1 ≤ √mt, i.e. per ≤ (√mt - 1)².
     Some(match per {
-        0..=1 => 4,
-        2..=3 => 8,
-        4..=9 => 16,
-        10..=25 => 32,
+        0..=2 => 16,
+        3..=25 => 32,
         _ => widest,
     })
 }
