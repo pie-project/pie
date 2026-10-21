@@ -51,3 +51,9 @@ moe.bf16_mma_until = 65536
 # A block-FP8 projection's decode rows (to 4) on the GEMV over bf16 rows,
 # ahead of the W8A16 mma.sync kernel (GLM-5.3-Flash's dense layers).
 gemm.fp8_gemv_until = 4
+
+[compiler]
+# A taken conditional node costs about 12 us on an H100, past the launches it
+# skips at decode: priced out, every region launches (DeepSeek-V4.1-Flash's
+# miniature +5% at one request, MiMo-V2.6-Flash's +7% at 64, six others even).
+cond_fixed_us = 1000000
