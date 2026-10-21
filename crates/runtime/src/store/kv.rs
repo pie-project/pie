@@ -731,9 +731,6 @@ impl KvStore {
         true
     }
 
-    /// A run of sealed pages, held so it is neither moved nor reclaimed while
-    /// its bytes are read out, with each page's device id; `None` unless all
-    /// of it is on the device.
     /// The tokens' hashes of every page of `run`, page after page: what a
     /// worker that keeps the run without computing it needs to go on from
     /// it. `None` when a page of it is not hashed whole.
@@ -747,6 +744,9 @@ impl KvStore {
         Some(slots)
     }
 
+    /// A run of sealed pages, held so it is neither moved nor reclaimed while
+    /// its bytes are read out, with each page's device id; `None` unless all
+    /// of it is on the device.
     pub fn pin_resident(
         &mut self,
         run: &[TriePageLocation],

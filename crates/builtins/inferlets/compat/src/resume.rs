@@ -29,13 +29,12 @@ impl Resume {
     /// A log as [`Resume::head`] and the frames after it wrote it.
     pub fn parse(log: &str) -> Option<Self> {
         let (id, frames) = log.split_once('\n')?;
-        let sent = frames.strip_suffix(';').map_or(frames, |all| all);
         if !frames.is_empty() && !frames.ends_with(';') {
             return None;
         }
         Some(Self {
             id: id.to_string(),
-            tokens: sent
+            tokens: frames
                 .split(|c: char| c == ';' || c.is_ascii_whitespace())
                 .filter(|token| !token.is_empty())
                 .map(|token| token.parse().ok())
@@ -81,7 +80,6 @@ pub fn get() -> Option<Resume> {
         .clone()
     })
 }
-
 
 /// A token generated here, to be named by the next frame.
 pub(crate) fn note(token: u32) {

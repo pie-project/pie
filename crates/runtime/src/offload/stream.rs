@@ -313,7 +313,17 @@ async fn route(mut told: mpsc::UnboundedReceiver<engine::Tapped>) {
             let run = tag.run;
             match tapped.bytes {
                 Ok(bytes) => {
-                    tag.left -= 1;
+                    let Some(left) = tag.left.checked_sub(1) else {
+                        let tag = streams.tags.remove(&tapped.tag).expect("the tag told");
+                        fail(
+                            &mut streams,
+                            run,
+                            format!("a tap told group {} past its groups", tapped.group),
+                        );
+                        release(tag.slots);
+                        continue;
+                    };
+                    tag.left = left;
                     let part = Part {
                         group: tapped.group,
                         first: tag.first,
@@ -342,11 +352,16 @@ async fn route(mut told: mpsc::UnboundedReceiver<engine::Tapped>) {
                 }
             }
         };
-        if let Some(slots) = freed
-            && let Some(stores) = crate::store::registry::try_get(0, 0)
-        {
-            with_kv_lock(&stores.kv, "offload-stream", |kv| kv.free_host_slots(slots));
+        if let Some(slots) = freed {
+            release(slots);
         }
+    }
+}
+
+/// A tap's host slots, back to the host tier.
+fn release(slots: Vec<HostKvSlotId>) {
+    if let Some(stores) = crate::store::registry::try_get(0, 0) {
+        with_kv_lock(&stores.kv, "offload-stream", |kv| kv.free_host_slots(slots));
     }
 }
 

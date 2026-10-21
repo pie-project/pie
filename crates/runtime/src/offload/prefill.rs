@@ -217,7 +217,7 @@ pub(crate) async fn before_pass(
     // Best first; one that cannot take the pass gives way to the next, and
     // when none can, it runs here.
     let mut last = None;
-    for peer in super::executors::candidates(pid, &named).await {
+    for (executor, peer) in super::executors::candidates(pid, &named).await {
         let started = std::time::Instant::now();
         match take(pid, stores, engine, peer, &pass).await {
             Ok(pages) => {
@@ -229,7 +229,7 @@ pub(crate) async fn before_pass(
                 );
                 crate::policy::report(crate::policy::Event::Offloaded(
                     pid,
-                    "peer".into(),
+                    executor,
                     u32::try_from(pages).unwrap_or(u32::MAX) * page,
                 ));
                 return;
@@ -254,8 +254,8 @@ pub(crate) async fn before_pass(
 }
 
 /// The fewest uncached tokens worth a peer's prefill, and the executors the
-/// worker policy names: its rule, else the configuration's. Unstated, 2048:
-/// the pages come back inline. `None`: this process's passes stay home.
+/// worker policy names: its rule, else the configuration's; unstated, 2048.
+/// `None`: this process's passes stay home.
 fn rule(pid: crate::inferlet::process::ProcessId) -> Option<(u64, Vec<String>)> {
     use crate::policy::offload::Mode;
     match crate::policy::offload::rule(pid) {
@@ -419,6 +419,15 @@ async fn take(
     let have = pass.at(pass.have);
     if let Some(held) = pages.held {
         let lease = held.lease;
+        if held.pages.len() != want {
+            if let Err(error) = peer.release(lease).await {
+                tracing::warn!(target: "pie::offload", %error, lease, "a peer's lease was not released");
+            }
+            bail!(
+                "the peer held {} pages of {want} to read in place",
+                held.pages.len()
+            );
+        }
         let read = read_in_place(pid, stores, &*peer, pass, have, held).await;
         if let Err(error) = peer.release(lease).await {
             tracing::warn!(target: "pie::offload", %error, lease, "a peer's lease was not released");
@@ -641,10 +650,6 @@ fn keyed_pages(stores: &Stores, tokens: &[u32]) -> (Vec<Vec<Option<Hash256>>>, V
     (token_hashes, keys)
 }
 
-/// Prefills `tokens` here and reads out the pages from `from_page` that the
-/// run fills completely. Pages before `from_page` this worker holds nowhere
-/// are first fetched from `home`, which holds them, so only the rest is
-/// computed.
 /// How long an executor holds pages for an asker that never releases them
 /// (it died, or its link did).
 const LEASE_TTL: Duration = Duration::from_secs(60);
@@ -712,6 +717,12 @@ fn hold(stores: &Stores, keys: &[Hash256], from: usize) -> Option<Held> {
     })
 }
 
+/// Prefills `tokens` here and hands the asker the pages from `from_page`
+/// that the run fills completely, as `delivery` asks: kept for it to fetch,
+/// held on this device for it to read in place, or streamed a layer at a
+/// time as they are computed. Pages before `from_page` this worker holds
+/// nowhere are first fetched from `home`, which holds them, so only the
+/// rest is computed.
 pub async fn serve(
     tokens: Vec<u32>,
     from_page: u32,

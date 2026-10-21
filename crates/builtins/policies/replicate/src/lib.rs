@@ -7,7 +7,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use policy::{Replicate, Site, Subject, SubjectKind, Tier, attr, candidates, cluster};
 
-/// Workers each run is kept on, besides wherever it was computed.
+/// Workers each run is kept on; the one that computed it may be one of them.
 const COPIES: usize = 2;
 
 #[derive(Default)]
@@ -29,7 +29,7 @@ impl cluster::Policy for KeepTwo {
                     && attr(&of, "draining").boolean() != Some(true)
             })
             .collect();
-        if workers.len() < 2 {
+        if workers.len() < COPIES {
             return;
         }
         let entries: Vec<Replicate> = candidates(SubjectKind::Group)
@@ -51,7 +51,7 @@ impl cluster::Policy for KeepTwo {
                 }
             })
             .collect();
-        let _ = cluster::install_replication(&entries);
+        cluster::install_replication(&entries);
     }
 }
 

@@ -1410,7 +1410,7 @@ mod tests {
         graceful_close_releases_the_wait();
         no_prompt_waits_for_a_lane_off_a_prompt();
         consumed_release_leaves_no_phantom_hold_for_bystander();
-        a_burst_of_cut_prefills_seals_its_pieces_frame_by_frame();
+        a_burst_of_cut_prefills_seals_its_pieces_step_by_step();
     }
 
     /// Concurrent prompts whose prefills are cut at checkpoints, each lane's
@@ -1418,7 +1418,7 @@ mod tests {
     /// frames in order (`piece_frames`), so the pieces of every lane seal
     /// into one frame, each piece in its own step, not one unframed launch
     /// at a time.
-    fn a_burst_of_cut_prefills_seals_its_pieces_frame_by_frame() {
+    fn a_burst_of_cut_prefills_seals_its_pieces_step_by_step() {
         const LANES: usize = 8;
         let mut policy = FramePolicy::new(2, 64, 4096, None);
         let lanes: Vec<ProcessId> = (0..LANES).map(|_| pid()).collect();

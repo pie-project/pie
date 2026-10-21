@@ -784,6 +784,20 @@ impl WorkItemCompletion {
         self.state.resolve_from_terminal()
     }
 
+    /// Resolves a fire its engine settled from its terminal cell, `at` (a
+    /// step or a frame) naming where.
+    pub fn resolve_landed(&self, at: &str) {
+        self.mark_native_retired();
+        match self.resolve_from_terminal() {
+            Ok(WorkItemAttemptOutcome::Retry) => self.reject(format!(
+                "engine published RETRY at {at}; retry is not a v14 outcome (frame admission \
+                 bounds every in-frame gate)"
+            )),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(?err, at, "terminal settlement failed"),
+        }
+    }
+
     pub fn is_settled(&self) -> bool {
         self.state.result().is_some()
     }
@@ -836,47 +850,68 @@ struct PendingFrame {
 }
 
 impl PendingFrame {
-    /// Publishes step `step` as it settled; `true` once every step has, and
-    /// the frame with them. A faulted step fails the steps still to come
-    /// and the frame.
-    fn settle_step(&mut self, step: usize, failed: bool, broker: &CompletionBroker) -> bool {
-        let code = if failed {
+    /// Takes out what step `step` settles, landing as `failed` says: that
+    /// step, or on a fault every step not yet published, and the frame once
+    /// none is left. Published with [`Landed::publish`], off the book's lock.
+    fn land(&mut self, step: usize, failed: bool) -> Landed {
+        let range = if failed {
+            0..self.steps.len()
+        } else {
+            step.min(self.steps.len())..(step + 1).min(self.steps.len())
+        };
+        let steps = self.steps[range]
+            .iter_mut()
+            .filter_map(Option::take)
+            .collect();
+        let frame = (failed || self.steps.iter().all(Option::is_none)).then_some((
+            self.frame_cell,
+            self.wait_id,
+            self.epoch,
+        ));
+        Landed {
+            steps,
+            failed,
+            frame,
+        }
+    }
+}
+
+/// What a landing settles: its steps' fires and waiters, and the frame's
+/// cell and waiter once its last step is in.
+struct Landed {
+    steps: Vec<LandingStep>,
+    failed: bool,
+    frame: Option<(CellPtr, u64, u64)>,
+}
+
+impl Landed {
+    fn publish(self, broker: &CompletionBroker) {
+        let code = if self.failed {
             TERMINAL_OUTCOME_FAILED
         } else {
             TERMINAL_OUTCOME_SUCCESS
         };
-        let to = if failed { self.steps.len() } else { step + 1 };
-        for at in step.min(self.steps.len())..to.min(self.steps.len()) {
-            if let Some(LandingStep {
-                cells,
-                completions,
-                wakes,
-            }) = self.steps[at].take()
-            {
-                settle(&cells, code);
-                // Each fire resolves as its step lands, so what waits on it
-                // goes on a step later rather than once the frame retires.
-                for completion in &completions {
-                    completion.mark_native_retired();
-                    if let Ok(WorkItemAttemptOutcome::Retry) = completion.resolve_from_terminal() {
-                        completion.reject(
-                            "engine published RETRY at step settle; retry is not a v14 \
-                             outcome (frame admission bounds every in-frame gate)",
-                        );
-                    }
-                }
-                for wait_id in &wakes {
-                    let outcome = waker::WakerTable::global().wake(*wait_id);
-                    tracing::debug!(wait_id, ?outcome, "published to a waiter");
-                }
+        for LandingStep {
+            cells,
+            completions,
+            wakes,
+        } in self.steps
+        {
+            settle(&cells, code);
+            // Each fire resolves as its step lands, so what waits on it goes
+            // on a step later rather than once the frame retires.
+            for completion in &completions {
+                completion.resolve_landed("step settle");
+            }
+            for wait_id in &wakes {
+                let outcome = waker::WakerTable::global().wake(*wait_id);
+                tracing::debug!(wait_id, ?outcome, "published to a waiter");
             }
         }
-        if !failed && self.steps.iter().any(Option::is_some) {
-            return false;
+        if let Some((cell, wait_id, epoch)) = self.frame {
+            settle(&[cell], code);
+            broker.notify(wait_id, epoch);
         }
-        settle(&[self.frame_cell], code);
-        broker.notify(self.wait_id, self.epoch);
-        true
     }
 }
 
@@ -933,14 +968,22 @@ impl FrameSettlements {
             wait_id: completion.wait_id(),
             epoch: completion.target_epoch(),
         };
-        let mut book = self.inner.lock().unwrap();
-        let early = book.early.remove(&frame).unwrap_or_default();
-        let mut done = false;
-        for (step, failed) in early {
-            done |= pending.settle_step(step, failed, broker);
+        let mut landed = Vec::new();
+        {
+            let mut book = self.inner.lock().unwrap();
+            let early = book.early.remove(&frame).unwrap_or_default();
+            let mut done = false;
+            for (step, failed) in early {
+                let landing = pending.land(step, failed);
+                done |= landing.frame.is_some();
+                landed.push(landing);
+            }
+            if !done {
+                book.frames.insert(frame, pending);
+            }
         }
-        if !done {
-            book.frames.insert(frame, pending);
+        for landing in landed {
+            landing.publish(broker);
         }
     }
 
@@ -959,16 +1002,21 @@ impl FrameSettlements {
         broker: &CompletionBroker,
     ) {
         let failed = matches!(outcome, engine::StepOutcome::Faulted(_));
-        let mut book = self.inner.lock().unwrap();
-        let Some(pending) = book.frames.get_mut(&frame) else {
-            book.early.entry(frame).or_default().push((step, failed));
-            tracing::debug!(frame, step, failed, "settled before its frame was booked");
-            return;
+        let landed = {
+            let mut book = self.inner.lock().unwrap();
+            let Some(pending) = book.frames.get_mut(&frame) else {
+                book.early.entry(frame).or_default().push((step, failed));
+                tracing::debug!(frame, step, failed, "settled before its frame was booked");
+                return;
+            };
+            let landed = pending.land(step, failed);
+            if landed.frame.is_some() {
+                tracing::debug!(frame, failed, "frame settled");
+                book.frames.remove(&frame);
+            }
+            landed
         };
-        if pending.settle_step(step, failed, broker) {
-            tracing::debug!(frame, failed, "frame settled");
-            book.frames.remove(&frame);
-        }
+        landed.publish(broker);
     }
 
     pub fn close_all(&self, broker: &CompletionBroker) {
@@ -978,7 +1026,7 @@ impl FrameSettlements {
             book.frames.drain().map(|(_, f)| f).collect()
         };
         for mut pending in frames {
-            pending.settle_step(0, true, broker);
+            pending.land(0, true).publish(broker);
         }
     }
 }
