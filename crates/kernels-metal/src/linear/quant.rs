@@ -1067,9 +1067,11 @@ pub fn register_split(cols: i32, k: i32, cores: Option<u32>) -> i32 {
     split
 }
 
-/// The register tile's walk over a partition: `(U, V)`, the 64-code groups a
-/// step loads ahead and the groups a scale or bias load takes.
-pub const REGISTER_WALK: (u32, u32) = (2, 1);
+/// The register tile's walk over a partition: `(U, V, lazy)`, the 64-code
+/// groups a step loads ahead, the groups a scale or bias load takes, and
+/// whether a chain's closing factors are made as it closes (1) or as the step
+/// starts (0).
+pub const REGISTER_WALK: (u32, u32, u32) = (2, 1, 0);
 
 /// The rows of a `k`-wide room the register tile's input table takes: the
 /// rows' inputs as the lanes take them (8 x k bf16), their sums (k / 4 f32)
@@ -1112,14 +1114,15 @@ pub fn register_matmul(
     (m, n, k, cols, ld): (i32, i32, i32, i32, i32),
     split: i32,
     partial: Option<Tensor>,
-    (u, v): (u32, u32),
+    (u, v, lazy): (u32, u32, u32),
 ) -> Result<(), Error> {
-    let entry = symbol(&if (u, v) == REGISTER_WALK {
+    let entry = symbol(&if (u, v, lazy) == REGISTER_WALK {
         format!("affine_qmm_sg_k{split}")
     } else {
-        format!("affine_qmm_sg_k{split}_u{u}_v{v}")
+        format!("affine_qmm_sg_k{split}_u{u}_v{v}_l{lazy}")
     });
-    let stamp = symbol(&format!("PIE_SG_POINT(\"{entry}\",{split},{u},{v})"));
+    let lazy = lazy != 0;
+    let stamp = symbol(&format!("PIE_SG_POINT(\"{entry}\",{split},{u},{v},{lazy})"));
     ctx.fire(
         Fire::at(REGISTER_FILE, entry).stamp(stamp).apply(Grid::of(
             [
@@ -1188,7 +1191,7 @@ pub fn register_segments(
     m: i32,
     k: i32,
     partials: Option<Tensor>,
-    (u, v): (u32, u32),
+    (u, v, lazy): (u32, u32, u32),
 ) -> Result<(), Error> {
     const OP: &str = "linear.matmul_segments";
     if !(2..=3).contains(&segments.len()) {
@@ -1254,8 +1257,9 @@ pub fn register_segments(
         }
     }
     let count = segments.len();
-    let entry = symbol(&format!("affine_qmm_sg_segments_s{count}_u{u}_v{v}"));
-    let stamp = symbol(&format!("PIE_SG_SEGMENTS(\"{entry}\",{count},{u},{v})"));
+    let entry = symbol(&format!("affine_qmm_sg_segments_s{count}_u{u}_v{v}_l{lazy}"));
+    let lazy = lazy != 0;
+    let stamp = symbol(&format!("PIE_SG_SEGMENTS(\"{entry}\",{count},{u},{v},{lazy})"));
     ctx.fire(
         Fire::at(REGISTER_FILE, entry)
             .stamp(stamp)
