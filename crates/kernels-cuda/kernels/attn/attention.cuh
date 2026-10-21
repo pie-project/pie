@@ -136,6 +136,8 @@ using CapturePrefill = PieScoreCaptureWindow<VariantFull>;
 
 using DecodeCaptureParams = PieScoreParams<DecodeParams, IdType>;
 using PrefillCaptureParams = PieScoreWindowParams<PrefillParams, IdType>;
+using DecodeCaptureParams8 = PieScoreParams<DecodeParams8, IdType>;
+using PrefillCaptureParams8 = PieScoreWindowParams<PrefillParams8, IdType>;
 
 template <typename Base>
 struct RelBiasParams : Base {
@@ -198,6 +200,8 @@ using VariantRelBiasFull = VariantRelBias<false>;
 using VariantRelBiasWindow = VariantRelBias<true>;
 using DecodeRelParams = RelBiasParams<DecodeParams>;
 using PrefillRelParams = RelBiasParams<PrefillParams>;
+using DecodeRelParams8 = RelBiasParams<DecodeParams8>;
+using PrefillRelParams8 = RelBiasParams<PrefillParams8>;
 
 template <::flashinfer::MaskMode MASK, std::uint32_t CTA_TILE_Q, std::uint32_t NUM_MMA_Q,
           std::uint32_t NUM_MMA_KV, std::uint32_t NUM_MMA_D_QK, std::uint32_t NUM_MMA_D_VO,

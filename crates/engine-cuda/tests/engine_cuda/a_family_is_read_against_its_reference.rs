@@ -95,7 +95,14 @@ fn every_probe_is_dumped() {
             let snapshot = PathBuf::from(snapshot);
             let name = std::env::var("PIE_PARITY_DEPLOYMENT")
                 .expect("PIE_PARITY_DEPLOYMENT names the row that reads the snapshot");
+            // A row the catalog does not list (a listed row at another kv,
+            // say) still reads as its name spells.
             let deployment = poem_compiler::catalog::deployment(&name)
+                .or_else(|| {
+                    poem_compiler::catalog::repository()
+                        .parse(&name)
+                        .map(|d| &*Box::leak(Box::new(d)))
+                })
                 .unwrap_or_else(|| panic!("no deployment {name}"));
             // As an import opens it: its `config.json` rides along, which a
             // format reads (an int4 export's `quantization_config`).

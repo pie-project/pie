@@ -45,18 +45,6 @@ fn instantiated(op: &'static str, head_dim: u32) -> Result<(), Error> {
     ))
 }
 
-/// An e4m3 pool's plain arms read it as it is; the others read bf16 pages.
-fn e4m3_arm(op: &'static str, kv: KvWidth, plain: bool) -> Result<bool, Error> {
-    match (kv == KvWidth::E4M3, plain) {
-        (false, _) => Ok(false),
-        (true, true) => Ok(true),
-        (true, false) => Err(refuse(
-            op,
-            "an e4m3 pool is read by the plain arms alone; this arm reads bf16 pages",
-        )),
-    }
-}
-
 fn decode_symbol(
     op: &'static str,
     g: &DecodeGeometry,
@@ -64,15 +52,7 @@ fn decode_symbol(
     kv: KvWidth,
 ) -> Result<&'static str, Error> {
     instantiated(op, g.head_dim)?;
-    let plain = matches!(
-        arm,
-        DecodeArm::Full | DecodeArm::Softcap | DecodeArm::Window
-    );
-    let e4m3 = e4m3_arm(op, kv, plain)?;
     let (variant, params) = match arm {
-        DecodeArm::Full if e4m3 => ("VariantFull", "DecodeParams8"),
-        DecodeArm::Softcap if e4m3 => ("VariantWindowSoftcap", "DecodeParams8"),
-        DecodeArm::Window if e4m3 => ("VariantWindow", "DecodeParams8"),
         DecodeArm::Full => ("VariantFull", "DecodeParams"),
         DecodeArm::Softcap => ("VariantWindowSoftcap", "DecodeParams"),
         DecodeArm::Window => ("VariantWindow", "DecodeParams"),
@@ -81,11 +61,14 @@ fn decode_symbol(
         DecodeArm::RelBiasFull => ("VariantRelBiasFull", "DecodeRelParams"),
         DecodeArm::RelBiasWindow => ("VariantRelBiasWindow", "DecodeRelParams"),
     };
+    // An e4m3 pool's pages read as they are: every arm, over the same params
+    // with e4m3 pages (`attention.cuh`'s `*8` spellings).
+    let width = if kv == KvWidth::E4M3 { "8" } else { "" };
     Ok(symbol(&format!(
         "::flashinfer::BatchDecodeWithPagedKVCacheKernel<\
          ::flashinfer::PosEncodingMode::kNone, \
          {ns}, {tile}, {vec}, {bdx}, {bdy}, {bdz}, \
-         ::pie::attn::fa2::{variant}, ::pie::attn::fa2::{params}>",
+         ::pie::attn::fa2::{variant}, ::pie::attn::fa2::{params}{width}>",
         ns = g.num_stages_smem,
         tile = g.tile_size_per_bdx,
         vec = g.vec_size,
@@ -102,16 +85,6 @@ fn prefill_symbol(
     kv: KvWidth,
 ) -> Result<&'static str, Error> {
     instantiated(op, g.head_dim)?;
-    let plain = matches!(
-        arm,
-        PrefillArm::CausalFullSoftcap
-            | PrefillArm::NoneFullSoftcap
-            | PrefillArm::CausalFull
-            | PrefillArm::NoneFull
-            | PrefillArm::CausalSoftcap
-            | PrefillArm::CausalWindow
-    );
-    let e4m3 = e4m3_arm(op, kv, plain)?;
     let (mask, variant, params) = match arm {
         PrefillArm::CausalFullSoftcap => ("kCausal", "VariantFullSoftcap", "PrefillParams"),
         PrefillArm::NoneFullSoftcap => ("kNone", "VariantFullSoftcap", "PrefillParams"),
@@ -126,10 +99,13 @@ fn prefill_symbol(
         PrefillArm::CausalRelBiasFull => ("kCausal", "VariantRelBiasFull", "PrefillRelParams"),
         PrefillArm::CausalRelBiasWindow => ("kCausal", "VariantRelBiasWindow", "PrefillRelParams"),
     };
-    let (params, pages) = if e4m3 {
+    // An e4m3 pool's pages read as they are: every arm, over the same params
+    // with e4m3 pages (`attention.cuh`'s `*8` spellings).
+    let (params, pages) = if kv == KvWidth::E4M3 {
+        let params = symbol(&format!("{params}8"));
         (
-            "PrefillParams8",
-            ", ::pie::attn::fa2::PrefillParams8, __nv_fp8_e4m3",
+            params,
+            symbol(&format!(", ::pie::attn::fa2::{params}, __nv_fp8_e4m3")),
         )
     } else {
         (params, "")
