@@ -216,6 +216,65 @@ fn the_batch_engine_projection() {
     }
 }
 
+/// The turned kernel (forced over every row count it covers): K of one to
+/// eight slices, a ragged N, the f32 landing and the fused swiglu.
+#[test]
+fn the_turned_projection() {
+    let Some(gpu) = Gpu::open() else { return };
+    let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
+    t.gemm_turn_from = 1;
+    t.gemm_turn_min_n = 0;
+    let ctx = gpu.ctx().with_tuning(t);
+    for (m, n, k) in [
+        (1u32, 2056u32, 256u32),
+        (3, 1000, 512),
+        (8, 4096, 2048),
+        (8, 1024, 2048),
+        (13, 24, 1280),
+        (16, 2048, 1792),
+    ] {
+        let a: Vec<f32> = values((m * k) as usize, 31, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let w: Vec<f32> = values((n * k) as usize, 32, 0.05)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let at = gpu.tensor(&a, m, k, Dtype::Bf16);
+        let wt = gpu.tensor(&w, n, k, Dtype::Bf16);
+        let want = reference(&a, &w, None, m as usize, n as usize, k as usize);
+        let mut y = gpu.zeros(m, n, Dtype::Bf16);
+        gemm::matmul(&ctx, at, wt, &mut y).unwrap();
+        close_bf16(&format!("turned {m}x{n}x{k}"), &gpu.read(&y), &want, 2.0);
+        let mut yf = gpu.zeros(m, n, Dtype::F32);
+        gemm::matmul_f32(&ctx, at, wt, &mut yf).unwrap();
+        let got = gpu.read(&yf);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs() / w.abs().max(1.0))
+            .fold(0.0, f32::max);
+        assert!(worst < 1e-3, "turned f32 {m}x{n}x{k}: {worst}");
+        // The fused swiglu over the bank as [gate | up] lands its matmul's bits.
+        let i = n / 2;
+        let mut h = gpu.zeros(m, i, Dtype::Bf16);
+        assert!(
+            gemm::matmul_swiglu(&ctx, at, wt, &mut h).unwrap(),
+            "turned {m}x{i}x{k} fused"
+        );
+        let mut h2 = gpu.zeros(m, i, Dtype::Bf16);
+        kernels_rocm::linear::mlp::swiglu(&ctx, y, i, 1, &mut h2).unwrap();
+        let diff = gpu
+            .read(&h)
+            .iter()
+            .zip(&gpu.read(&h2))
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(diff, 0, "turned {m}x{i}x{k}: {diff} cells differ");
+    }
+}
+
 #[test]
 fn the_f32_projection_lands_unrounded() {
     let Some(gpu) = Gpu::open() else { return };

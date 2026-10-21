@@ -11,7 +11,7 @@ use crate::hip::{lt, sys};
 use crate::jit::{Ctx, refuse};
 
 use super::dense_batch::dense_batch_bf16;
-use super::gemv::{gemv_bf16, skinny_bf16, skinny_f32, skinny_swiglu_bf16};
+use super::gemv::{SkinnyEpilogue, gemv_bf16, skinny_bf16, skinny_f32, skinny_swiglu_bf16, skinnyt, turn_plan};
 
 /// Up to eight rows the skinny kernels always take a small weight.
 const SKINNY_SMALL: i32 = 8;
@@ -26,6 +26,8 @@ const SKINNY_QUAD_ROWS: i32 = super::gemv::QUAD_MIN_ROWS as i32;
 /// so the two land the same bits.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Route {
+    /// The turned kernel (`kernel.gemm.turn_*`).
+    Turn,
     /// The skinny kernels (`linear/gemv.hip`).
     Skinny,
     /// The decode-batch engine (`kernel.dense.batch_*`, or up to eight rows
@@ -37,6 +39,13 @@ enum Route {
 
 fn route(ctx: &Ctx, m: i32, rows: i32, k: i32) -> Route {
     let t = ctx.tuning();
+    if t.gemm_turn_from > 0
+        && (t.gemm_turn_from as i32..=t.gemm_turn_until.min(16) as i32).contains(&m)
+        && rows.unsigned_abs() >= t.gemm_turn_min_n
+        && turn_plan(rows.unsigned_abs(), k.unsigned_abs()).is_some()
+    {
+        return Route::Turn;
+    }
     if m <= SKINNY_SMALL && i64::from(rows) * i64::from(k) <= SKINNY_SMALL_WEIGHT {
         return Route::Skinny;
     }
@@ -76,6 +85,9 @@ pub(crate) fn act_x_wt(
         return Ok(false);
     }
     let way = route(ctx, m, n, k);
+    if bias == 0 && way == Route::Turn && skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::Store).is_ok() {
+        return Ok(false);
+    }
     if bias == 0 && way == Route::Skinny && skinny_bf16(ctx, w, act, y, m, n, k).is_ok() {
         return Ok(false);
     }
@@ -138,7 +150,11 @@ pub(crate) fn act_x_wt_f32(
     n: i32,
     k: i32,
 ) -> Result<(), Error> {
-    if route(ctx, m, n, k) == Route::Skinny && skinny_f32(ctx, w, act, y, m, n, k).is_ok() {
+    let way = route(ctx, m, n, k);
+    if way == Route::Turn && skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::F32).is_ok() {
+        return Ok(());
+    }
+    if way == Route::Skinny && skinny_f32(ctx, w, act, y, m, n, k).is_ok() {
         return Ok(());
     }
     let shape = lt::Shape {
@@ -192,6 +208,9 @@ pub(crate) fn act_x_wt_swiglu(
         return Ok(false);
     }
     let way = route(ctx, m, 2 * intermediate, k);
+    if way == Route::Turn && skinnyt(ctx, gate_up, act, h, m, intermediate, k, SkinnyEpilogue::Swiglu).is_ok() {
+        return Ok(true);
+    }
     if way == Route::Skinny && skinny_swiglu_bf16(ctx, gate_up, act, h, m, intermediate, k).is_ok()
     {
         return Ok(true);

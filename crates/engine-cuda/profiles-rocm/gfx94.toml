@@ -44,6 +44,15 @@ fp8.narrow_until = 128
 # trail it by ~4% at full count).
 gemm.live_from = 129
 
+# A dense bf16 projection of 3-16 rows over a bank at least 2048 wide and K
+# up to 2048 takes the turned kernel: whole 512-byte weight row runs turned
+# through LDS into the matrix core's order (Qwen3.6 at 8 rows, cold weights:
+# 12288 x 2048 18.5 us vs hipBLASLt's 23.6, 9216 x 2048 14.6 vs 16.2,
+# 2048 x 512 3.1 vs 4.2; 4 rows 16.7 vs the skinny kernel's 20.5).
+gemm.turn_from = 3
+gemm.turn_until = 16
+gemm.turn_min_n = 2048
+
 # The gated-delta chunk scan walks 32-column state slices from 512 slices
 # of 16 (two Qwen3.6 requests): the slices of a head read the same chunk
 # operands, and at 14K rows the 16-column walk is 1.4x the time (one

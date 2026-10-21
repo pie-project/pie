@@ -132,6 +132,23 @@ pub struct GemmSkinnyDenseRows(pub u32);
 #[decision(id = "kernel.gemm.skinny_batch_min_n", constant(range(0..=4_194_304)), default = 65536, tune = search)]
 pub struct GemmSkinnyBatchMinN(pub u32);
 
+/// The rows a dense bf16 projection gives the turned kernel (whole 512-byte
+/// weight row runs turned through LDS into the matrix core's order), from
+/// and up to (at most 16); from 0, never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.turn_from", constant(range(0..=16)), default = 0, tune = search)]
+pub struct GemmTurnFrom(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.turn_until", constant(range(0..=16)), default = 16, tune = search)]
+pub struct GemmTurnUntil(pub u32);
+
+/// The fewest output columns (a bank's rows) the turned kernel takes: a
+/// narrower bank's tiles leave the card idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.turn_min_n", constant(range(0..=4_194_304)), default = 2048, tune = search)]
+pub struct GemmTurnMinN(pub u32);
+
 /// Routes an expert must average before bf16/f16 routed matmuls group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.group_at", constant(range(1..=4096)), default = 4, tune = search)]
@@ -295,6 +312,9 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmSkinnyQuadFrom>()
         .add::<GemmSkinnyDenseRows>()
         .add::<GemmSkinnyBatchMinN>()
+        .add::<GemmTurnFrom>()
+        .add::<GemmTurnUntil>()
+        .add::<GemmTurnMinN>()
         .add::<MoeGroupAt>()
         .add::<MoeMxfp4GroupedReuse>()
         .add::<MoeAffineGrouped>()
@@ -346,6 +366,9 @@ pub struct Tuning {
     pub gemm_skinny_quad_from: u32,
     pub gemm_skinny_dense_rows: u32,
     pub gemm_skinny_batch_min_n: u32,
+    pub gemm_turn_from: u32,
+    pub gemm_turn_until: u32,
+    pub gemm_turn_min_n: u32,
     pub moe_group_at: u32,
     pub mxfp4_grouped_reuse: u32,
     pub affine_grouped: bool,
@@ -399,6 +422,9 @@ impl Tuning {
         gemm_skinny_quad_from: 3,
         gemm_skinny_dense_rows: 4,
         gemm_skinny_batch_min_n: 65536,
+        gemm_turn_from: 0,
+        gemm_turn_until: 16,
+        gemm_turn_min_n: 2048,
         moe_group_at: 4,
         mxfp4_grouped_reuse: 2,
         affine_grouped: true,
@@ -450,6 +476,9 @@ impl Tuning {
             gemm_skinny_quad_from: profile.get::<GemmSkinnyQuadFrom>().0,
             gemm_skinny_dense_rows: profile.get::<GemmSkinnyDenseRows>().0,
             gemm_skinny_batch_min_n: profile.get::<GemmSkinnyBatchMinN>().0,
+            gemm_turn_from: profile.get::<GemmTurnFrom>().0,
+            gemm_turn_until: profile.get::<GemmTurnUntil>().0,
+            gemm_turn_min_n: profile.get::<GemmTurnMinN>().0,
             moe_group_at: profile.get::<MoeGroupAt>().0,
             mxfp4_grouped_reuse: profile.get::<MoeMxfp4GroupedReuse>().0,
             affine_grouped: profile.on::<MoeAffineGrouped>(&Anywhere),
