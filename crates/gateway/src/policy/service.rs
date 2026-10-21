@@ -1678,12 +1678,23 @@ mod tests {
     #[test]
     fn cluster_scale_is_there_while_the_controller_can_act() {
         let registry = Registry::default();
+        let tables = Tables::default();
         let mut routing = table(0);
-        assert!(!registry.snapshot(&routing).capability("cluster.scale"));
-        routing.scales = true;
-        assert!(registry.snapshot(&routing).capability("cluster.scale"));
         assert!(
-            registry.snapshot(&routing).capability("placement.migrate"),
+            !registry
+                .snapshot(&routing, &tables)
+                .capability("cluster.scale")
+        );
+        routing.scales = true;
+        assert!(
+            registry
+                .snapshot(&routing, &tables)
+                .capability("cluster.scale")
+        );
+        assert!(
+            registry
+                .snapshot(&routing, &tables)
+                .capability("placement.migrate"),
             "the rest as before"
         );
     }
