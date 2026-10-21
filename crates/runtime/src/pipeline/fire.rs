@@ -82,6 +82,21 @@ impl PendingFireQueue {
         }
     }
 
+    /// How many of `cell`'s unread cells can still be a pending fire's. A
+    /// fire writes at most one cell of a channel (its one ring ticket) and
+    /// the pending fires are the newest, so unread cells beyond this count
+    /// are the oldest ones, and their fires are finalized.
+    pub(crate) fn writers_of(
+        &self,
+        cell: &Arc<Mutex<crate::pipeline::channel::ChannelCell>>,
+    ) -> usize {
+        self.lock()
+            .unwrap()
+            .iter()
+            .filter(|op| op.binds(cell))
+            .count()
+    }
+
     pub(crate) fn try_finalize_guard(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         Arc::clone(&self.finalizer).try_lock_owned().ok()
     }
@@ -1209,6 +1224,14 @@ impl PendingOp {
     pub(crate) fn is_settled(&self) -> bool {
         match self {
             PendingOp::Fire(fire) => fire.completion.is_settled(),
+            #[cfg(test)]
+            PendingOp::TestStub => true,
+        }
+    }
+
+    fn binds(&self, cell: &Arc<Mutex<crate::pipeline::channel::ChannelCell>>) -> bool {
+        match self {
+            PendingOp::Fire(fire) => fire.cells.iter().any(|bound| Arc::ptr_eq(bound, cell)),
             #[cfg(test)]
             PendingOp::TestStub => true,
         }

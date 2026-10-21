@@ -183,6 +183,10 @@ fn extents(stated: &BindExtents) -> eta_exec::Extents {
     }
 }
 
+/// The narrowest forward width a load lowers `[engine] max_forward_tokens` to
+/// so its arena scratch fits beside resident weights.
+const MIN_FITTED_FORWARD_TOKENS: u32 = 512;
+
 fn bake_budgets(budgets: &LoadBudgets) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
@@ -410,67 +414,98 @@ impl Engine for Metal {
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
 
         let planes = crate::weights::attachments(&trace, &contract, &path).map_err(fault)?;
-        let gathered = crate::gather::Plan::of(
-            &trace,
-            &planes,
-            residency.device_weight_budget,
-            budgets.max_tokens,
-        )
-        .map_err(fault)?;
-        let mut residency_plan =
-            experts::Plan::beside(&trace, &planes, residency.device_weight_budget, gathered)
-                .map_err(fault)?;
-
-        // Compiled before the residency check, so the check prices the arena
-        // scratch the load will wire beside the weights and the kv pool.
-        let mut prepared = Shell::prepare(Boot {
-            trace: trace.clone(),
-            contract: &contract,
-            checkpoint: &path,
-            budget: bake_budgets(&budgets),
-            patches: patch_ladder(&trace, &budgets),
-            voxels: voxel_ladder(&trace, &budgets),
-            profile: None::<DeviceProfile>,
-            page_size: budgets.page_size,
-            context: budgets.max_context,
-            slots: budgets.slots,
-            kv_budget: residency.device_kv_budget,
-            memory_share: residency.device_memory_share,
-            runahead: engine::runahead::Runahead::of(frames_in_flight),
-            residency: residency_plan.clone(),
-            profiles: self.boot.profiles.clone(),
-        })
-        .map_err(fault)?;
-        let scratch = prepared.arena_bytes();
-
-        {
+        let (working_set, elsewhere) = {
             let device = crate::device::Context::bind().map_err(fault)?;
-            let (working_set, elsewhere) = (device.working_set(), device.held_elsewhere());
-            let util = residency.device_memory_share;
-            let paging = crate::store::kv::Paging::of(
-                budgets.page_size,
-                budgets.max_context,
-                engine::fit::least_state_slots(1).min(budgets.slots),
-                1,
-            )
-            .map_err(|error| fault(Fault::from(error)))?;
-            // The pool the weights must leave room for: the stated budget,
-            // or one sequence when the pool fills what is left.
-            let kv_pool = match residency.device_kv_budget {
-                Some(budget) => budget,
-                None => crate::store::PoolDemand::of(&trace, paging, None)
-                    .map_err(fault)?
-                    .bytes(u64::from(paging.pages_per_slot)),
-            };
-
-            let acct = crate::store::accounting::Accounting::with_scratch(
+            (device.working_set(), device.held_elsewhere())
+        };
+        let util = residency.device_memory_share;
+        let paging = crate::store::kv::Paging::of(
+            budgets.page_size,
+            budgets.max_context,
+            engine::fit::least_state_slots(1).min(budgets.slots),
+            1,
+        )
+        .map_err(|error| fault(Fault::from(error)))?;
+        // The pool the weights must leave room for: the stated budget,
+        // or one sequence when the pool fills what is left.
+        let kv_pool = match residency.device_kv_budget {
+            Some(budget) => budget,
+            None => crate::store::PoolDemand::of(&trace, paging, None)
+                .map_err(fault)?
+                .bytes(u64::from(paging.pages_per_slot)),
+        };
+        let accounting = |weights: u64, scratch: u64| {
+            crate::store::accounting::Accounting::with_scratch(
                 working_set,
                 elsewhere,
                 util,
-                residency_plan.device_demand(),
+                weights,
                 scratch,
                 kv_pool,
+            )
+        };
+
+        // Compiled before the residency check, so the check prices the arena
+        // scratch the load will wire beside the weights and the kv pool. When
+        // the weights fit resident and only the scratch the forward width
+        // reserves pushes the load past the device (a 12B on a 16 GB Mac),
+        // the width halves until it fits: a narrower prefill fire is slower,
+        // a refused load serves nothing.
+        let mut budgets = budgets;
+        let (mut prepared, mut residency_plan) = loop {
+            let gathered = crate::gather::Plan::of(
+                &trace,
+                &planes,
+                residency.device_weight_budget,
+                budgets.max_tokens,
+            )
+            .map_err(fault)?;
+            let plan =
+                experts::Plan::beside(&trace, &planes, residency.device_weight_budget, gathered)
+                    .map_err(fault)?;
+            let prepared = Shell::prepare(Boot {
+                trace: trace.clone(),
+                contract: &contract,
+                checkpoint: &path,
+                budget: bake_budgets(&budgets),
+                patches: patch_ladder(&trace, &budgets),
+                voxels: voxel_ladder(&trace, &budgets),
+                profile: None::<DeviceProfile>,
+                page_size: budgets.page_size,
+                context: budgets.max_context,
+                slots: budgets.slots,
+                kv_budget: residency.device_kv_budget,
+                memory_share: residency.device_memory_share,
+                runahead: engine::runahead::Runahead::of(frames_in_flight),
+                residency: plan.clone(),
+                profiles: self.boot.profiles.clone(),
+            })
+            .map_err(fault)?;
+            let weights = plan.device_demand();
+            let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
+            if narrower >= budgets.max_tokens
+                || accounting(weights, prepared.arena_bytes())
+                    .admit(residency.device_weight_budget, util)
+                    .is_ok()
+                || accounting(weights, 0)
+                    .admit(residency.device_weight_budget, util)
+                    .is_err()
+            {
+                break (prepared, plan);
+            }
+            eprintln!(
+                "the arena scratch for {} forward tokens ({} bytes) does not fit beside the \
+                 resident weights on this device: `[engine] max_forward_tokens` lowered to {narrower}",
+                budgets.max_tokens,
+                prepared.arena_bytes(),
             );
+            budgets.max_tokens = narrower;
+            budgets.buckets.retain(|&rows| rows <= narrower);
+        };
+        let scratch = prepared.arena_bytes();
+
+        {
+            let acct = accounting(residency_plan.device_demand(), scratch);
             if acct.admit(residency.device_weight_budget, util).is_err() {
                 let headroom = acct.weight_headroom();
                 let regathered =

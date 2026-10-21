@@ -634,6 +634,7 @@ mod tests {
                         selected_mma: defaults.selected_mma,
                         gemm_fp8_gemv_until: defaults.gemm_fp8_gemv_until,
                         mla_dense_short: defaults.mla_dense_short,
+                        gemm_skinny_rows: defaults.gemm_skinny_rows,
                         ..tuning
                     },
                     defaults,
