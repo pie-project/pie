@@ -98,6 +98,7 @@ pub fn reassign(cluster: &Cluster) -> (Topology, RoutingTable) {
             addr: w.addr.clone(),
             role: w.role,
             model: w.model.clone(),
+            engine: w.engine.clone(),
             health: w.health,
             coarse_load: w.load,
         })
@@ -106,6 +107,7 @@ pub fn reassign(cluster: &Cluster) -> (Topology, RoutingTable) {
     let routing = RoutingTable {
         epoch: cluster.gateway_epoch,
         workers,
+        scales: cluster.scales,
     };
 
     (topology, routing)
@@ -119,6 +121,7 @@ pub fn empty_routing() -> RoutingTable {
     RoutingTable {
         epoch: 0,
         workers: Vec::new(),
+        scales: false,
     }
 }
 

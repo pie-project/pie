@@ -2,7 +2,7 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use controller_api::{Ack, ControlClient, GatewayInfo, RoutingTable};
+use controller_api::{Ack, ControlClient, GatewayInfo, RoutingTable, ScaleEntry};
 use ids::{GatewayId, NodeId};
 use tarpc::serde_transport::tcp;
 #[cfg(unix)]
@@ -23,6 +23,9 @@ pub trait GatewayControl: Clone + Send + Sync + 'static {
     fn heartbeat(&self, id: NodeId) -> impl Future<Output = Result<Ack>> + Send;
 
     fn routing_watch(&self) -> watch::Receiver<RoutingTable>;
+
+    /// The cluster policies' scale table, whole (`cluster.scale`).
+    fn desire_scale(&self, entries: Vec<ScaleEntry>) -> impl Future<Output = Result<()>> + Send;
 }
 
 impl GatewayControl for ControlClient {
@@ -38,10 +41,17 @@ impl GatewayControl for ControlClient {
             .context("heartbeat rpc")
     }
 
+    async fn desire_scale(&self, entries: Vec<ScaleEntry>) -> Result<()> {
+        self.desire_scale(tarpc::context::current(), entries)
+            .await
+            .context("desire_scale rpc")
+    }
+
     fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
         let (tx, rx) = watch::channel(RoutingTable {
             epoch: 0,
             workers: Vec::new(),
+            scales: false,
         });
         tokio::spawn(watch_routing_loop(self.clone(), tx));
         rx
@@ -120,10 +130,25 @@ impl GatewayControl for Controller {
         }
     }
 
+    async fn desire_scale(&self, entries: Vec<ScaleEntry>) -> Result<()> {
+        let (client, seen) = self.client();
+        match client
+            .desire_scale(tarpc::context::current(), entries)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.heal(&e, seen).await;
+                Err(e).context("desire_scale rpc")
+            }
+        }
+    }
+
     fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
         let (tx, rx) = watch::channel(RoutingTable {
             epoch: 0,
             workers: Vec::new(),
+            scales: false,
         });
         let control = self.clone();
         tokio::spawn(async move {
@@ -160,17 +185,41 @@ impl GatewayControl for Controller {
     }
 }
 
+/// Beats for the gateway, registering it again when the controller lost it;
+/// and keeps the controller's scale table the policies' one: sent when it
+/// changes, again when a send failed, and again after a re-registration (a
+/// restarted controller desires nothing).
 pub(crate) async fn heartbeat_loop<C: GatewayControl>(
     control: C,
     mut id: GatewayId,
     info: GatewayInfo,
+    mut scale: Option<watch::Receiver<Vec<ScaleEntry>>>,
 ) {
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut owed = scale.is_some();
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            changed = async {
+                match scale.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_err() {
+                    scale = None;
+                } else {
+                    owed = true;
+                }
+                send_scale(&control, scale.as_mut(), &mut owed).await;
+                continue;
+            }
+        }
+        send_scale(&control, scale.as_mut(), &mut owed).await;
         match control.heartbeat(NodeId::Gateway(id)).await {
             Ok(Ack::Ok) => {}
             Ok(Ack::ReRegister) => {
+                owed = scale.is_some();
                 tracing::warn!(%id, "controller lost our registration; re-registering");
                 let again = GatewayInfo {
                     prior: Some(id),
@@ -187,6 +236,23 @@ pub(crate) async fn heartbeat_loop<C: GatewayControl>(
                 }
             }
             Err(e) => tracing::warn!(error = %e, "heartbeat transport error"),
+        }
+    }
+}
+
+async fn send_scale<C: GatewayControl>(
+    control: &C,
+    scale: Option<&mut watch::Receiver<Vec<ScaleEntry>>>,
+    owed: &mut bool,
+) {
+    let Some(scale) = scale.filter(|_| *owed) else {
+        return;
+    };
+    let entries = scale.borrow_and_update().clone();
+    match control.desire_scale(entries).await {
+        Ok(()) => *owed = false,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "scale table not delivered; again next beat")
         }
     }
 }

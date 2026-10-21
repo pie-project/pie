@@ -298,6 +298,7 @@ mod tests {
             addr: format!("10.0.0.{id}:7000"),
             role: Role::Decode,
             model: model.to_string(),
+            engine: String::new(),
             health,
             coarse_load: WorkerStatus {
                 kv_pressure_bucket: kv,
@@ -308,7 +309,11 @@ mod tests {
     }
 
     fn table(workers: Vec<RoutableWorker>) -> RoutingTable {
-        RoutingTable { epoch: 1, workers }
+        RoutingTable {
+            epoch: 1,
+            workers,
+            scales: false,
+        }
     }
 
     fn connset(ids: &[u64]) -> HashSet<WorkerId> {
