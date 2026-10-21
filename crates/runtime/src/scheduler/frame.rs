@@ -1425,10 +1425,11 @@ mod tests {
         let mut ids = Vec::new();
         for (at, &lane) in lanes.iter().enumerate() {
             let mut seq = 0u64;
-            let framed = crate::pipeline::fire::piece_frames(Some(stamp(lane, 0, 0, 1)), 2, 2, || {
-                seq += 1;
-                seq
-            });
+            let framed =
+                crate::pipeline::fire::piece_frames(Some(stamp(lane, 0, 0, 1)), 2, 2, || {
+                    seq += 1;
+                    seq
+                });
             assert_eq!(
                 framed,
                 vec![Some(stamp(lane, 0, 0, 2)), Some(stamp(lane, 0, 1, 2))],
@@ -1447,15 +1448,18 @@ mod tests {
         for (step, wave) in waves.iter().enumerate() {
             let mut wave = wave.clone();
             wave.sort_unstable();
-            let want: Vec<u64> = (0..LANES as u64).map(|at| 100 + 2 * at + step as u64).collect();
+            let want: Vec<u64> = (0..LANES as u64)
+                .map(|at| 100 + 2 * at + step as u64)
+                .collect();
             assert_eq!(wave, want, "step {step} holds piece {step} of every lane");
         }
 
         let mut seq = 0u64;
-        let three = crate::pipeline::fire::piece_frames(Some(stamp(lanes[0], 4, 0, 1)), 3, 2, || {
-            seq += 1;
-            seq
-        });
+        let three =
+            crate::pipeline::fire::piece_frames(Some(stamp(lanes[0], 4, 0, 1)), 3, 2, || {
+                seq += 1;
+                seq
+            });
         assert_eq!(
             three,
             vec![
@@ -1466,7 +1470,8 @@ mod tests {
             "a third piece opens the next frame, alone"
         );
 
-        let shared = crate::pipeline::fire::piece_frames(Some(stamp(lanes[0], 9, 1, 2)), 3, 2, || 0);
+        let shared =
+            crate::pipeline::fire::piece_frames(Some(stamp(lanes[0], 9, 1, 2)), 3, 2, || 0);
         assert_eq!(
             shared,
             vec![None, None, Some(stamp(lanes[0], 9, 1, 2))],

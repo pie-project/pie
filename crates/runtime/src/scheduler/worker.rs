@@ -2783,7 +2783,7 @@ mod tests {
                         voxels: Vec::new(),
                     },
                     terminal_cells: Vec::new(),
-                        completions: Vec::new(),
+                    completions: Vec::new(),
                     instances: vec![0],
                     logical_fire_ids: vec![42],
                 }],
