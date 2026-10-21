@@ -355,6 +355,53 @@ impl<'c> Run<'c> {
             .reduce(|a, b| a + b)
     }
 
+    /// The per-head norm the trace places right after the one of `x` into `y`,
+    /// in the region the walk is in, over the same head width and epsilon and
+    /// bf16 rows of its own (a layer's key heads after its query heads): its
+    /// input, weight and output, when its rows stand apart from the first's,
+    /// so one launch lands both.
+    pub(crate) fn norm_pair(
+        &self,
+        x: ValueId,
+        y: ValueId,
+        head_dim: u32,
+        eps: f32,
+    ) -> Option<(ValueId, ValueId, ValueId)> {
+        use poem_ir::{Elementwise, Operation};
+        let (nodes, _) = self.region_nodes()?;
+        let at = self.readers_of(x).iter().copied().find(|&at| {
+            matches!(&self.nodes.get(at as usize).map(|n| &n.op),
+                Some(Operation::Elementwise(Elementwise::RmsnormPerHeadPlusOne { x: a, y: b, .. }))
+                    if *a == x && *b == y)
+        })?;
+        let Some(Operation::Elementwise(Elementwise::RmsnormPerHeadPlusOne {
+            x: x2,
+            weight: w2,
+            head_dim: d2,
+            eps: e2,
+            y: y2,
+        })) = self.nodes.get(at as usize + 1).map(|n| &n.op)
+        else {
+            return None;
+        };
+        if !nodes.contains(&at) || !nodes.contains(&(at + 1)) || *d2 != head_dim || *e2 != eps || *x2 == y {
+            return None;
+        }
+        let span = |v: ValueId| {
+            let t = self.tensor(v);
+            (t.dtype == poem_ir::Dtype::Bf16)
+                .then(|| self.address(t.buf))
+                .flatten()
+                .map(|(slab, at)| (slab, at, at + u64::from(t.rows) * u64::from(t.width) * 2))
+        };
+        let spans = [span(x)?, span(y)?, span(*x2)?, span(*y2)?];
+        let apart = |a: (u64, u64, u64), b: (u64, u64, u64)| a.0 != b.0 || a.2 <= b.1 || b.2 <= a.1;
+        // The second's rows land apart from everything the first reads and writes, and the
+        // first's apart from what the second reads.
+        (apart(spans[3], spans[0]) && apart(spans[3], spans[1]) && apart(spans[1], spans[2]))
+            .then_some((*x2, *w2, *y2))
+    }
+
     /// The merge of the arms `value` is one of, when the merge's rows here are
     /// the very bytes `value` lands in: the merge's readers then read what the
     /// arm writes, in place.

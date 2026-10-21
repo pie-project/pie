@@ -340,6 +340,41 @@ template <typename T, int N_READS>
       inv_rms, partials, lid, simd_lane, simd_group, tg_size);
 }
 
+// Two `rms_single_row` launches in one: the `first` threadgroups norm x into out by w, the rest
+// x2 into out2 by w2 (a layer's query and key heads), each row as its own launch norms it.
+template <typename T, int N_READS>
+[[kernel]] void rms_single_row_pair(
+    const device T* x          [[buffer(0)]],
+    const device T* w          [[buffer(1)]],
+    device T* out              [[buffer(2)]],
+    const device T* x2         [[buffer(3)]],
+    const device T* w2         [[buffer(4)]],
+    device T* out2             [[buffer(5)]],
+    const constant uint& first [[buffer(6)]],
+    const constant float& eps  [[buffer(7)]],
+    const constant uint& axis_size [[buffer(8)]],
+    const constant uint& w_stride  [[buffer(9)]],
+    const constant uint& plus_one  [[buffer(10)]],
+    const constant float& gain     [[buffer(11)]],
+    uint gid                   [[threadgroup_position_in_grid]],
+    uint lid                   [[thread_position_in_threadgroup]],
+    uint simd_lane             [[thread_index_in_simdgroup]],
+    uint simd_group            [[simdgroup_index_in_threadgroup]],
+    uint tg_size               [[threads_per_threadgroup]]) {
+  threadgroup float inv_rms[1], partials[32];
+  const bool second = gid >= first;
+  rms_row_body<T, N_READS>(
+      second ? x2 : x, second ? w2 : w, second ? out2 : out, eps, axis_size, w_stride, plus_one,
+      gain, size_t(second ? gid - first : gid) * axis_size,
+      inv_rms, partials, lid, simd_lane, simd_group, tg_size);
+}
+
+template [[host_name("rms_single_row_pair_bfloat16")]] [[kernel]] void rms_single_row_pair<bfloat, 4>(
+    const device bfloat*, const device bfloat*, device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant uint&, const constant float&,
+    const constant uint&, const constant uint&, const constant uint&, const constant float&,
+    uint, uint, uint, uint, uint);
+
 #define instantiate_rms_grouped_row(name, itype, n_reads)              \
   template [[host_name("rms_grouped_row_" #name)]] [[kernel]] void      \
   rms_grouped_row<itype, n_reads>(                                      \
