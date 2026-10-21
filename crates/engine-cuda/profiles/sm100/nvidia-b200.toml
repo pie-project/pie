@@ -15,9 +15,10 @@ sdpa.selected_mma = true
 # Two state slots a lane (one frame a lane where they seat fewer lanes than
 # the engine batches), host-mapped `host` planes, 16384-row fires, a decoding
 # lane's pages before a waiting prompt, a lattice bucket between powers of
-# two, and a gated delta fire at most 4096 rows.
+# two (four from 4096 rows), and a gated delta fire at most 4096 rows.
 [engine]
 lattice_steps = 2
+prefill_lattice_from = 4096
 host_planes = true
 one_frame_when_short = true
 seated_first = true

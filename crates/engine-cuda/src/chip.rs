@@ -741,9 +741,11 @@ mod tests {
         assert_eq!(Engine::of(&b200).walk_fire_rows, 4096);
         assert!(Engine::of(&b200).host_planes);
         assert_eq!(Engine::of(&b200).lattice_steps, 2);
+        assert_eq!(Engine::of(&b200).prefill_lattice_from, 4096);
         assert_eq!(
             Engine {
                 lattice_steps: 1,
+                prefill_lattice_from: 0,
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 seated_first: false,
