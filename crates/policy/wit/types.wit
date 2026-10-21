@@ -120,6 +120,21 @@ interface types {
         /// A worker's tier crossed a pressure band; its attrs say which.
         tier-pressure(id),
         link-changed(id),
+
+        // Cluster plane: what the other programs decided and said. Each is
+        // delivered to every subscriber but the program whose call caused
+        // it, on its next call, and only when the committed value changed.
+        // Two programs that keep answering each other's change can still
+        // go on forever; that is theirs to avoid.
+        /// The committed placement of this process changed: its worker, its
+        /// executors or its props (attrs `placement/*`).
+        placement-changed(id),
+        /// The committed replication of this group changed (attr
+        /// `replication/sites`).
+        replication-changed(id),
+        /// A value a cluster program published about this subject changed
+        /// (attrs `published/<program>/<name>`).
+        published(subject),
     }
 
     /// A key on a working-set's first `upto` tokens, or on all of it. A block

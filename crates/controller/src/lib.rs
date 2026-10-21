@@ -1,9 +1,11 @@
 mod actor;
+mod actuator;
 mod service;
 mod state;
 mod store;
 mod topology;
 
+pub use actuator::Slot;
 pub use store::{SoftState, StateStore};
 
 use std::sync::{Arc, Mutex};
@@ -15,7 +17,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use controller_api::{Ack, GatewayInfo, Neighbors, RoutingTable, WorkerInfo, WorkerStatus};
+use controller_api::{
+    Ack, GatewayInfo, Neighbors, RoutingTable, ScaleEntry, ScaleStatus, WorkerInfo, WorkerStatus,
+};
 use ids::{GatewayId, NodeId, WorkerId};
 
 use actor::{Actor, ActorConfig, Command};
@@ -29,6 +33,9 @@ pub struct Config {
     pub heartbeat_timeout: Duration,
     pub tick_interval: Duration,
     pub command_buffer: usize,
+    /// The workers the actuator may launch to meet a scale table; none,
+    /// and the controller does not scale (`cluster.scale` is absent).
+    pub slots: Vec<Slot>,
 }
 
 impl Default for Config {
@@ -38,6 +45,7 @@ impl Default for Config {
             heartbeat_timeout: Duration::from_secs(8),
             tick_interval: Duration::from_secs(2),
             command_buffer: 256,
+            slots: Vec::new(),
         }
     }
 }
@@ -49,6 +57,15 @@ struct ConfigToml {
     heartbeat_timeout_secs: u64,
     tick_interval_secs: u64,
     command_buffer: usize,
+    scale: ScaleToml,
+}
+
+/// `[scale]`: `[[scale.slot]]` entries, each a worker the actuator may
+/// launch (`model`, `engine`, `command`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ScaleToml {
+    slot: Vec<Slot>,
 }
 
 impl Default for ConfigToml {
@@ -59,6 +76,7 @@ impl Default for ConfigToml {
             heartbeat_timeout_secs: d.heartbeat_timeout.as_secs(),
             tick_interval_secs: d.tick_interval.as_secs(),
             command_buffer: d.command_buffer,
+            scale: ScaleToml::default(),
         }
     }
 }
@@ -70,6 +88,7 @@ impl From<ConfigToml> for Config {
             heartbeat_timeout: Duration::from_secs(t.heartbeat_timeout_secs),
             tick_interval: Duration::from_secs(t.tick_interval_secs),
             command_buffer: t.command_buffer,
+            slots: t.scale.slot,
         }
     }
 }
@@ -95,6 +114,16 @@ impl Config {
             !self.tick_interval.is_zero(),
             "controller config: `tick_interval_secs` must be > 0"
         );
+        for (at, slot) in self.slots.iter().enumerate() {
+            ensure!(
+                !slot.command.is_empty(),
+                "controller config: `[[scale.slot]]` {at} has an empty `command`"
+            );
+            ensure!(
+                !slot.engine.trim().is_empty(),
+                "controller config: `[[scale.slot]]` {at} names no `engine`"
+            );
+        }
         Ok(())
     }
 }
@@ -113,16 +142,7 @@ pub type Handle = ControllerHandle;
 impl ControllerHandle {
     pub async fn register_worker(&self, info: WorkerInfo) -> WorkerId {
         let (reply, rx) = oneshot::channel();
-        let _ = self
-            .cmd
-            .send(Command::RegisterWorker {
-                role: info.role,
-                model: info.model,
-                addr: info.addr,
-                prior: info.prior,
-                reply,
-            })
-            .await;
+        let _ = self.cmd.send(Command::RegisterWorker { info, reply }).await;
         rx.await.expect("controller actor stopped")
     }
 
@@ -147,6 +167,18 @@ impl ControllerHandle {
 
     pub async fn report_worker(&self, id: WorkerId, status: WorkerStatus) {
         let _ = self.cmd.send(Command::ReportWorker { id, status }).await;
+    }
+
+    /// The scale table to converge on, whole (`cluster.scale`).
+    pub async fn desire_scale(&self, entries: Vec<ScaleEntry>) {
+        let _ = self.cmd.send(Command::DesireScale { entries }).await;
+    }
+
+    /// Each shape the scale table names, desired against current.
+    pub async fn scale_status(&self) -> Vec<ScaleStatus> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.cmd.send(Command::ScaleStatus { reply }).await;
+        rx.await.unwrap_or_default()
     }
 
     pub fn worker_watch(&self, id: WorkerId) -> watch::Receiver<Neighbors> {
@@ -217,6 +249,7 @@ pub fn embed(config: Config) -> ControllerHandle {
         ActorConfig {
             heartbeat_timeout: config.heartbeat_timeout,
         },
+        actuator::Actuator::new(config.slots.clone()),
     );
     let actor_token = shutdown.clone();
     let actor_task = tokio::spawn(async move {
@@ -273,6 +306,27 @@ mod tests {
     fn lib_every_case() {
         parse_empty_is_default();
         parse_overrides_fields();
+        parse_scale_slots();
+    }
+
+    fn parse_scale_slots() {
+        let cfg = Config::parse(
+            r#"
+            [[scale.slot]]
+            model = "Qwen/Qwen3-14B"
+            engine = "cuda_native"
+            command = ["pie-worker", "-c", "wa.toml"]
+
+            [[scale.slot]]
+            engine = "cuda_native"
+            command = ["pie-pool"]
+            "#,
+        )
+        .expect("scale slots parse");
+        assert_eq!(cfg.slots.len(), 2);
+        assert_eq!(cfg.slots[0].model.as_deref(), Some("Qwen/Qwen3-14B"));
+        assert_eq!(cfg.slots[1].model, None);
+        assert!(Config::parse("[[scale.slot]]\nengine = \"cuda_native\"\ncommand = []\n").is_err());
     }
 
     fn parse_empty_is_default() {

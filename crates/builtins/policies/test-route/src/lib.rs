@@ -1,7 +1,9 @@
 //! Orders, holds, places and ends launches by their props, so a test can see
 //! the cluster host enact each table and verb.
 
-use policy::{Placement, Subject, SubjectKind, Value, attr, candidates, cluster, prop, terminate};
+use policy::{
+    Placement, Scale, Subject, SubjectKind, Value, attr, candidates, cluster, prop, terminate,
+};
 
 #[derive(Default)]
 struct Route;
@@ -23,8 +25,16 @@ impl cluster::Policy for Route {
                 worker: prop(&Subject::Process(p.clone()), "worker")
                     .text()
                     .map(str::to_string),
+                // Stated, or what `test-share` published of the worker
+                // this program placed it on.
                 executors: prop(&Subject::Process(p.clone()), "executors")
                     .text()
+                    .map(str::to_string)
+                    .or_else(|| {
+                        attr(&Subject::Process(p.clone()), "published/test-share/placed")
+                            .text()
+                            .map(str::to_string)
+                    })
                     .map(|ids| ids.split(',').map(str::to_string).collect())
                     .unwrap_or_default(),
                 props: vec![("from".to_string(), Value::Text(p.clone()))],
@@ -32,10 +42,24 @@ impl cluster::Policy for Route {
             .collect();
         cluster::install_schedule(&keys, Some(1));
         cluster::install_placement(&placements);
+        // Not granted `scale`: the host refuses it.
+        if let Some(workers) = processes
+            .iter()
+            .find_map(|p| prop(&Subject::Process(p.clone()), "scale-workers").int())
+        {
+            cluster::install_scale(&[Scale {
+                model: None,
+                engine: "cuda_native".to_string(),
+                workers: u32::try_from(workers.max(0)).unwrap_or(0),
+            }]);
+        }
         for p in &processes {
             let process = Subject::Process(p.clone());
             if let Some(reason) = prop(&process, "refuse").text() {
                 terminate(p, reason);
+            }
+            if let Some(mark) = prop(&process, "publish").text() {
+                cluster::publish(&process, "mark", Some(&Value::Text(mark.to_string())));
             }
             let running = attr(&process, "state").text() == Some("running");
             if running && prop(&process, "stop").boolean() == Some(true) {

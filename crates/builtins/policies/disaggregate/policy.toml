@@ -1,8 +1,9 @@
-# Runs every process's passes on the cluster's prefill workers, the least
-# loaded first. It writes only executors, so a policy that places processes
-# (`cache-aware`) runs beside it.
+# Runs every process's passes on the cluster's prefill workers: those on the
+# host where another program's committed placement put the process first,
+# then the least loaded. It writes only executors, so a policy that places
+# processes (`cache-aware`) runs beside it.
 plane = "cluster"
-subscribe = ["arrived", "worker-removed", "worker-draining"]
+subscribe = ["arrived", "worker-removed", "worker-draining", "placement-changed"]
 grants = ["executors"]
 requires = ["placement.executors"]
 # Long enough for the call that names a new arrival's executors to answer.
