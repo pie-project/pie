@@ -9,9 +9,12 @@ assumes = { cc = 100 }
 gemv.bf16 = "narrow"
 # A latent prefill from 256 rows runs expanded, as vLLM's MLA prefill does.
 mla.expanded_from = 256
-# Block-FP8 projections: a GEMV up to 4 rows, mma.sync up to 8.
+# Block-FP8 projections: a GEMV up to 4 rows, mma.sync up to 8 at K up to
+# 5120 (GLM-5.3's 6144-wide q_a, kv_a and indexer key lead on tcgen05: FP8
+# bs8 1.67-1.78 -> 1.55-1.58 ms; DeepSeek-V4/V4.1 and GLM-5.3-Flash keep it).
 gemm.fp8_gemv_until = 4
 gemm.fp8_mma_gemv_until = 8
+gemm.fp8_mma_k_until = 5120
 # DeepSeek-V4's attention: pool on mma.sync, prefill from 512 rows and
 # decode up to 64 in one launch, V4.1's bounded replay, its FP4 pass from 32.
 sdpa.pool_mma = true
