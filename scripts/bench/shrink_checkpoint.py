@@ -1403,6 +1403,37 @@ FAMILIES: dict[str, dict[str, Any]] = {
         # the miniature loads unmodified as `InklingForConditionalGeneration`.
         keep_res=(re.compile(r"^model\.visual\."), re.compile(r"^model\.audio\.")),
     ),
+    # Dense, one layer kind: the first layers at the whole model's width.
+    "llama": dict(
+        layer_prefix="model.layers.",
+        expert_re=None,
+        router_suffixes=(),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        default_layers="0-3",
+        config_rewrite=_rewrite_common,
+    ),
+    # Every layer routed, each expert apart, no shared expert: the router's
+    # rows slice with the bank.
+    "qwen3_moe": dict(
+        layer_prefix="model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight",),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        default_layers="0-3",
+        config_rewrite=_rewrite_common,
+    ),
+    # GLM-4.5 / 4.6 / 4.7: dense first layers (three, the Air's one), then
+    # routed experts each apart beside a shared expert; the router and its
+    # score bias slice with the bank. The draft layer after the last is
+    # dropped with the depth.
+    "glm4_moe": dict(
+        layer_prefix="model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight", "mlp.gate.e_score_correction_bias"),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        default_layers="0-4",
+        config_rewrite=_rewrite_common,
+    ),
     "gpt_oss": dict(
         layer_prefix="model.layers.",
         # gpt-oss stacks the whole expert bank on dim 0 of a handful of
