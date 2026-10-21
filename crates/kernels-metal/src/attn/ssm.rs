@@ -1011,6 +1011,46 @@ pub fn gated_delta_committed_landing(
     )
 }
 
+/// The ints of one lane's row in a recurrent buffer's page table
+/// (`PIE_RS_PAGE_INTS`).
+pub const RS_PAGE_INTS: u32 = 8;
+
+/// A recurrent buffer's plane as a verify arm reads it through the fire's
+/// page table: each lane's row of `pages` names the in-page token of its
+/// first extended row, then the slots of the pages its rows touch.
+#[derive(Clone, Copy, Debug)]
+pub struct Paged {
+    pub slab: Tensor,
+    pub pages: Tensor,
+    pub page_tokens: u32,
+    pub page_bytes: u32,
+    pub plane_at: u32,
+    pub row_bytes: u32,
+}
+
+fn paged_args(ctx: &Ctx<'_>, paged: Option<Paged>) -> Result<[crate::encode::ArgValue; 7], Error> {
+    Ok(match paged {
+        Some(paged) => [
+            paged.slab.arg_mut(),
+            paged.pages.arg(),
+            paged.page_tokens.arg(),
+            paged.page_bytes.arg(),
+            paged.plane_at.arg(),
+            paged.row_bytes.arg(),
+            1i32.arg(),
+        ],
+        None => [
+            ctx.absent()?,
+            ctx.absent()?,
+            0u32.arg(),
+            0u32.arg(),
+            0u32.arg(),
+            0u32.arg(),
+            0i32.arg(),
+        ],
+    })
+}
+
 /// The `(lanes a value row, simdgroups, value rows a lane)` of a verify
 /// scan's threadgroup.
 const GDN_VERIFY_GROUP: (i32, u32, u32) = (32, 4, 4);
@@ -1100,7 +1140,9 @@ pub struct VerifyGates {
 /// derived as they stage. A replayed row only folds in; a row of the
 /// window's own lands its readout in `y` and its gates in `gates.gates`,
 /// the window's own rows, where the committed scan landed every row in the
-/// extended plane.
+/// extended plane. Through `paged`, `gates.ba` is the window's own rows:
+/// the replayed rows' are read from the lane's buffer, and the window's own
+/// land there.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_verify(
     ctx: &Ctx<'_>,
@@ -1108,6 +1150,7 @@ pub fn gated_delta_verify(
     indptr: Tensor,
     committed: &Committed,
     gates: &VerifyGates,
+    paged: Option<Paged>,
     state: &RecurrentPool,
     k_heads: u32,
     v_heads: u32,
@@ -1123,6 +1166,7 @@ pub fn gated_delta_verify(
         indptr,
         committed,
         gates,
+        paged,
         state,
         k_heads,
         v_heads,
@@ -1142,6 +1186,7 @@ pub fn gated_delta_verify_at(
     indptr: Tensor,
     committed: &Committed,
     gates: &VerifyGates,
+    paged: Option<Paged>,
     state: &RecurrentPool,
     k_heads: u32,
     v_heads: u32,
@@ -1196,6 +1241,15 @@ pub fn gated_delta_verify_at(
         .ok_or_else(|| refuse(OP, "no verify scan is stamped at this geometry"))?;
     let lanes = committed_lanes(OP, indptr)?;
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
+    let [
+        slab,
+        pages,
+        page_tokens,
+        page_bytes,
+        plane_at,
+        row_bytes,
+        is_paged,
+    ] = paged_args(ctx, paged)?;
     let z = v_heads
         .checked_mul(lanes)
         .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
@@ -1218,6 +1272,13 @@ pub fn gated_delta_verify_at(
             stated(OP, v_heads)?.arg(),
             snaps,
             lane0,
+            slab,
+            pages,
+            page_tokens,
+            page_bytes,
+            plane_at,
+            row_bytes,
+            is_paged,
         ],
     )
 }
@@ -1242,11 +1303,14 @@ pub fn causal_conv1d_verify_fits(channels: u32, conv_width: u32, dilation: u32) 
 
 /// [`causal_conv1d_committed_landing`] with a thread a row: every row lands
 /// in the extended plane `y`, and a row of the window's own in `land`, the
-/// window's own rows.
+/// window's own rows. Through `paged`, `x` is the window's own rows: the
+/// replayed rows are read from the lane's buffer, and the window's own land
+/// there.
 #[allow(clippy::too_many_arguments)]
 pub fn causal_conv1d_verify(
     ctx: &Ctx<'_>,
     x: Tensor,
+    paged: Option<Paged>,
     indptr: Tensor,
     committed: &Committed,
     weight: Tensor,
@@ -1281,6 +1345,15 @@ pub fn causal_conv1d_verify(
     }
     let lanes = committed_lanes(OP, indptr)?;
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
+    let [
+        slab,
+        pages,
+        page_tokens,
+        page_bytes,
+        plane_at,
+        row_bytes,
+        is_paged,
+    ] = paged_args(ctx, paged)?;
     ctx.fire(
         Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(Grid::of(
             [channels / 4, CONV_VERIFY_ROWS, lanes],
@@ -1303,6 +1376,13 @@ pub fn causal_conv1d_verify(
             stated(OP, dilation)?.arg(),
             snaps,
             lane0,
+            slab,
+            pages,
+            page_tokens,
+            page_bytes,
+            plane_at,
+            row_bytes,
+            is_paged,
         ],
     )
 }

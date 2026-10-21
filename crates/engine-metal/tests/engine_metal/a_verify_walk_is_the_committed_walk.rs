@@ -12,7 +12,7 @@
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
-use kernels_metal::attn::ssm::{self, Committed, RS_SNAPSHOTS, Snapshots, VerifyGates};
+use kernels_metal::attn::ssm::{self, Committed, Paged, RS_SNAPSHOTS, Snapshots, VerifyGates};
 use kernels_metal::tensor::RecurrentPool;
 use poem_ir::Dtype;
 
@@ -23,7 +23,11 @@ const QKV_WIDTH: u32 = 2 * K_HEADS * DIM + V_HEADS * DIM;
 const Y_WIDTH: u32 = V_HEADS * DIM;
 const BA_WIDTH: u32 = 2 * V_HEADS;
 const BANK_FLOATS: u64 = V_HEADS as u64 * DIM as u64 * DIM as u64;
-const SLOTS: u32 = 32;
+const SLOTS: u32 = 40;
+/// The slot of a lane's paged walk past its unpaged one.
+const PAGED_SLOTS: i32 = 20;
+/// Tokens a page of the test's buffer, so a lane's rows cross pages.
+const PAGE: u32 = 4;
 const TAPS: u32 = 4;
 const CONV_FLOATS: u64 = TAPS as u64 * QKV_WIDTH as u64;
 const LAYERS: u32 = 30;
@@ -235,6 +239,82 @@ fn snapshots(bench: &Bench, table: Option<&[i32]>) -> Option<Snapshots> {
     })
 }
 
+/// A buffer of one plane holding each lane's replayed rows of an extended
+/// plane, read through a page table: [`PAGE`] tokens a page behind 256 bytes
+/// of another plane, a lane's first extended row at token 2 of its first
+/// page, and its pages its own, in descending slots. `window` is the
+/// window's own rows.
+struct Buffered {
+    paged: Paged,
+    window: Tensor,
+}
+
+fn buffered(bench: &Bench, lanes: &Lanes, ext: Tensor) -> Buffered {
+    const FIRST: u32 = 2;
+    const PLANE_AT: u32 = 256;
+    let row = u64::from(ext.width) * ext.dtype.bits() / 8;
+    let page_bytes = (u64::from(PLANE_AT) + u64::from(PAGE) * row).next_multiple_of(256);
+    let pages_a_lane = (kernels_metal::attn::ssm::RS_PAGE_INTS - 1) as usize;
+    let slots = lanes.rows.len() * pages_a_lane;
+    let mut slab = vec![0u8; slots * page_bytes as usize];
+    let mut table = Vec::new();
+    let mut window = Vec::new();
+    for (r, (from, _, rows)) in lanes.spans().into_iter().enumerate() {
+        let rep = lanes.replay[r] as usize;
+        let slot = |page: usize| (r + 1) * pages_a_lane - 1 - page;
+        table.push(FIRST as i32);
+        table.extend((0..pages_a_lane).map(|page| slot(page) as i32));
+        for e in 0..rep {
+            let token = FIRST as usize + e;
+            let at = slot(token / PAGE as usize) * page_bytes as usize
+                + PLANE_AT as usize
+                + (token % PAGE as usize) * row as usize;
+            slab[at..at + row as usize].copy_from_slice(&bench.rows(ext, from - rep + e, 1));
+        }
+        window.extend(bench.rows(ext, from, rows));
+    }
+    let own = lanes.own();
+    Buffered {
+        paged: Paged {
+            slab: bench.upload(&slab, slots as u32, page_bytes as u32, Dtype::U8),
+            pages: bench.i32s(&table),
+            page_tokens: PAGE,
+            page_bytes: page_bytes as u32,
+            plane_at: PLANE_AT,
+            row_bytes: row as u32,
+        },
+        window: bench.upload(&window, own, ext.width, ext.dtype),
+    }
+}
+
+impl Buffered {
+    /// Whether each lane's own rows landed in its buffer after its replayed
+    /// ones.
+    fn landed(&self, bench: &Bench, lanes: &Lanes) -> bool {
+        let pages_a_lane = (kernels_metal::attn::ssm::RS_PAGE_INTS - 1) as usize;
+        let row = u64::from(self.paged.row_bytes);
+        lanes
+            .spans()
+            .into_iter()
+            .enumerate()
+            .all(|(r, (_, at, rows))| {
+                let rep = lanes.replay[r] as usize;
+                (0..rows).all(|i| {
+                    let token = 2 + rep + i;
+                    let slot = (r + 1) * pages_a_lane - 1 - token / PAGE as usize;
+                    let offset = slot as u64 * u64::from(self.paged.page_bytes)
+                        + u64::from(self.paged.plane_at)
+                        + (token % PAGE as usize) as u64 * row;
+                    bench.read(self.paged.slab, offset, row) == bench.rows(self.window, at + i, 1)
+                })
+            })
+    }
+}
+
+fn shifted(slots: &[i32]) -> Vec<i32> {
+    slots.iter().map(|slot| slot + PAGED_SLOTS).collect()
+}
+
 /// The gate prep and the committed scan into the extended plane, then the
 /// verify scan into the window's rows; each lane's banks, its own rows'
 /// readouts and gates compared bit for bit, and each snapshot's bank too.
@@ -290,6 +370,7 @@ fn walks_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
             indptr,
             &new,
             &gates,
+            None,
             &pool(&x, new.slots),
             K_HEADS,
             V_HEADS,
@@ -300,11 +381,53 @@ fn walks_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
         )
         .expect("the verify scan");
     });
+    // Through a page table: the replayed rows' `[b | a]` from the buffer,
+    // the window's own landed there.
+    let ba = buffered(bench, lanes, x.ba);
+    let paged_slots = shifted(&lanes.new_slots);
+    let paged = committed(&paged_slots);
+    let paged_y = bench.zeroed(own, Y_WIDTH, Dtype::F32);
+    let paged_gates = VerifyGates {
+        ba: ba.window,
+        gates: bench.zeroed(own, BA_WIDTH, Dtype::F32),
+        ..gates
+    };
+    bench.run(&|sink| {
+        ssm::gated_delta_verify(
+            sink,
+            x.qkv,
+            indptr,
+            &paged,
+            &paged_gates,
+            Some(ba.paged),
+            &pool(&x, paged.slots),
+            K_HEADS,
+            V_HEADS,
+            DIM,
+            DIM,
+            paged_y,
+            None,
+        )
+        .expect("the paged verify scan");
+    });
+    assert!(
+        ba.landed(bench, lanes),
+        "the paged verify scan left the window's own `[b | a]` rows out of the buffer"
+    );
     let bank = |slot: i32| bench.read(x.state, slot as u64 * BANK_FLOATS * 4, BANK_FLOATS * 4);
     for (r, (from, at, rows)) in lanes.spans().into_iter().enumerate() {
         assert!(
             bank(lanes.old_slots[r]) == bank(lanes.new_slots[r]),
             "lane {r}: the verify scan committed other bank bits than the committed scan"
+        );
+        assert!(
+            bank(lanes.old_slots[r]) == bank(paged_slots[r]),
+            "lane {r}: the paged verify scan committed other bank bits than the committed scan"
+        );
+        assert!(
+            bench.rows(ext_y, from, rows) == bench.rows(paged_y, at, rows)
+                && bench.rows(ext_gates, from, rows) == bench.rows(paged_gates.gates, at, rows),
+            "lane {r}: the paged verify scan read out or derived other bits"
         );
         assert!(
             bench.rows(ext_y, from, rows) == bench.rows(own_y, at, rows),
@@ -371,6 +494,7 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
         ssm::causal_conv1d_verify(
             sink,
             x.x,
+            None,
             indptr,
             &new,
             x.weight,
@@ -383,12 +507,46 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
         )
         .expect("the verify conv");
     });
+    // Through a page table: the replayed rows from the buffer, the window's
+    // own landed there.
+    let xs = buffered(bench, lanes, x.x);
+    let paged_slots = shifted(&lanes.new_slots);
+    let paged = committed(&paged_slots);
+    let paged_y = bench.zeroed(ext, QKV_WIDTH, Dtype::Bf16);
+    let paged_land = bench.zeroed(own, QKV_WIDTH, Dtype::Bf16);
+    bench.run(&|sink| {
+        ssm::causal_conv1d_verify(
+            sink,
+            xs.window,
+            Some(xs.paged),
+            indptr,
+            &paged,
+            x.weight,
+            &pool(&x, paged.slots),
+            TAPS,
+            1,
+            paged_y,
+            paged_land,
+            None,
+        )
+        .expect("the paged verify conv");
+    });
+    assert!(
+        xs.landed(bench, lanes),
+        "the paged verify conv left the window's own rows out of the buffer"
+    );
     let window = |slot: i32| bench.read(x.conv, slot as u64 * CONV_FLOATS * 4, CONV_FLOATS * 4);
     assert!(
-        bench.rows(old_y, 0, ext as usize) == bench.rows(new_y, 0, ext as usize),
+        bench.rows(old_y, 0, ext as usize) == bench.rows(new_y, 0, ext as usize)
+            && bench.rows(old_y, 0, ext as usize) == bench.rows(paged_y, 0, ext as usize),
         "the verify conv convolved the extended rows into other bits"
     );
     for (r, (from, at, rows)) in lanes.spans().into_iter().enumerate() {
+        assert!(
+            bench.rows(old_y, from, rows) == bench.rows(paged_land, at, rows)
+                && window(lanes.old_slots[r]) == window(paged_slots[r]),
+            "lane {r}: the paged verify conv landed or committed other bits"
+        );
         assert!(
             bench.rows(old_y, from, rows) == bench.rows(land, at, rows),
             "lane {r}: the verify conv landed its own rows in other bits"
@@ -574,6 +732,7 @@ fn price_round(bench: &Bench, rows: i32, replay: i32) {
         ssm::causal_conv1d_verify(
             sink,
             x.x,
+            None,
             indptr,
             c,
             x.weight,
@@ -616,6 +775,7 @@ fn price_round(bench: &Bench, rows: i32, replay: i32) {
                 indptr,
                 c,
                 gates,
+                None,
                 &pool(x, c.slots),
                 K_HEADS,
                 V_HEADS,

@@ -369,6 +369,55 @@ impl Buffers {
     }
 }
 
+/// The ints of one lane's row in the page table a verify arm reads its
+/// buffer through: the in-page token of the lane's first extended row, or
+/// -1 for a lane that buffers nothing, then the slab slots of the pages its
+/// extended rows touch.
+pub const PAGE_INTS: u32 = kernels_metal::attn::ssm::RS_PAGE_INTS;
+
+/// The page table of `lanes`, one [`PAGE_INTS`] row a lane, where every
+/// lane's replayed and own rows fit the row's pages; else `None`, and the
+/// fire's recurrent ops gather and scatter by copies.
+#[must_use]
+pub fn page_table(lanes: &[LanePlan], page_tokens: u32, pool_slots: u32) -> Option<Vec<i32>> {
+    let page_tokens = page_tokens.max(1);
+    let mut table = Vec::with_capacity(lanes.len() * PAGE_INTS as usize);
+    for plan in lanes {
+        let mut row = [0i32; PAGE_INTS as usize];
+        row[0] = -1;
+        let (first, pages) = match (&plan.gather, &plan.scatter) {
+            (Some(gather), Some(scatter)) => {
+                if scatter.from != gather.from + gather.count || scatter.pages != gather.pages {
+                    return None;
+                }
+                (gather.from, &gather.pages)
+            }
+            (Some(run), None) | (None, Some(run)) => (run.from, &run.pages),
+            (None, None) => {
+                table.extend(row);
+                continue;
+            }
+        };
+        let span = plan.gather.as_ref().map_or(0, |run| run.count)
+            + plan.scatter.as_ref().map_or(0, |run| run.count);
+        let page0 = (first / page_tokens) as usize;
+        let in_page = first % page_tokens;
+        let touched = (in_page + span).div_ceil(page_tokens) as usize;
+        if touched >= PAGE_INTS as usize {
+            return None;
+        }
+        row[0] = i32::try_from(in_page).ok()?;
+        for (at, &slot) in pages.get(page0..page0 + touched)?.iter().enumerate() {
+            if slot >= pool_slots {
+                return None;
+            }
+            row[1 + at] = i32::try_from(slot).ok()?;
+        }
+        table.extend(row);
+    }
+    Some(table)
+}
+
 #[derive(Debug)]
 pub struct Seat {
     pub lanes: Vec<LanePlan>,
@@ -385,11 +434,15 @@ pub struct Seat {
     pub ext_out: Vec<Tensor>,
     pub work: Tensor,
     pub rows_ext: u32,
+    /// Each lane's [`page_table`] row, when every lane's rows fit one: a
+    /// verify arm then reads the replayed rows from the buffer and lands the
+    /// window's own there itself.
+    pub pages: Option<Tensor>,
     pub ext: RefCell<HashMap<u32, Tensor>>,
     /// The gate preps whose gates the verify scan derives as it stages its
-    /// rows, by the gates value: the extended `[b | a]` rows, `dt_bias` and
+    /// rows, by the gates value: the `[b | a]` projection, `dt_bias` and
     /// `a_log`.
-    pub prepped: RefCell<HashMap<u32, [Tensor; 3]>>,
+    pub prepped: RefCell<HashMap<u32, (ValueId, Tensor, Tensor)>>,
 }
 
 impl Seat {
@@ -420,6 +473,7 @@ impl Seat {
         commit: Tensor,
         slots: Tensor,
         rows_ext: u32,
+        pages: Option<Tensor>,
     ) -> Result<Seat> {
         let lane_count = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
         let need = Seat::scratch_bytes(layout, rows_ext, lane_count);
@@ -473,8 +527,25 @@ impl Seat {
             ext_out,
             work,
             rows_ext,
+            pages,
             ext: RefCell::new(HashMap::new()),
             prepped: RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// The buffer of the plane `value` is read into, as a verify arm reads
+    /// it through the page table; `None` without a page table or a plane.
+    #[must_use]
+    pub fn paged(&self, value: ValueId) -> Option<kernels_metal::attn::ssm::Paged> {
+        let pages = self.pages?;
+        let plane = *self.layout.in_of.get(&value.0)?;
+        Some(kernels_metal::attn::ssm::Paged {
+            slab: Tensor::new(self.pool, 1, 1, Dtype::U8),
+            pages,
+            page_tokens: self.page_tokens,
+            page_bytes: u32::try_from(self.page_bytes).ok()?,
+            plane_at: u32::try_from(self.plane_at[plane]).ok()?,
+            row_bytes: u32::try_from(self.layout.planes[plane].row_bytes).ok()?,
         })
     }
 

@@ -5,6 +5,11 @@ using namespace metal;
 #define PIE_RS_SNAPSHOTS 4
 #endif
 
+// The ints of a lane's row in a recurrent buffer's page table.
+#ifndef PIE_RS_PAGE_INTS
+#define PIE_RS_PAGE_INTS 8
+#endif
+
 
 inline float causal_conv1d_silu(float z) {
   return z / (1.0f + metal::exp(-z));
@@ -356,6 +361,17 @@ template <typename T>
 
 instantiate_causal_conv1d_committed(bfloat16, bfloat)
 
+// Row `e` of a lane's extended rows in its buffer's plane: `pages` is the
+// lane's row of the page table, the in-page token of its first extended
+// row, then the slab slots of the pages its rows touch.
+inline device uchar* rs_buffered_row(
+    device uchar* slab, const device int* pages, int e, uint page_tokens, uint page_bytes,
+    uint plane_at, uint row_bytes) {
+  const uint at = uint(pages[0] + e);
+  return slab + size_t(pages[1 + at / page_tokens]) * page_bytes + plane_at +
+         size_t(at % page_tokens) * row_bytes;
+}
+
 // The rows of history a thread of the verify conv holds, at most, from
 // reading them to writing them back once its threadgroup has read them all.
 constant constexpr int kConvVerifyHeld = 4;
@@ -367,7 +383,9 @@ constant constexpr int kConvVerifyHeld = 4;
 // each row's loads. Every row's output lands in the extended plane `y` the
 // scan reads, and a row of the window's own in `land` too, at its own row.
 // The window as of `commit` rows is read before any of it is written back:
-// the bank is read and written in place.
+// the bank is read and written in place. Through a page table (`paged`), `x`
+// is the window's own rows: the replayed rows are read from the lane's
+// buffer, and the window's own rows land there for the next fire.
 template <typename T>
 [[kernel]] void causal_conv1d_verify(
     const device T* x              [[buffer(0)]],
@@ -386,6 +404,13 @@ template <typename T>
     const constant int& dilation   [[buffer(13)]],
     const device int* snaps        [[buffer(14)]],
     const constant int& snap_lane0 [[buffer(15)]],
+    device uchar* slab             [[buffer(16)]],
+    const device int* page_table   [[buffer(17)]],
+    const constant uint& page_tokens [[buffer(18)]],
+    const constant uint& page_bytes [[buffer(19)]],
+    const constant uint& plane_at  [[buffer(20)]],
+    const constant uint& row_bytes [[buffer(21)]],
+    const constant int& paged      [[buffer(22)]],
     uint3 pos [[thread_position_in_grid]],
     uint3 at [[thread_position_in_threadgroup]],
     uint3 shape [[threads_per_threadgroup]]) {
@@ -410,8 +435,30 @@ template <typename T>
   const int hist = (width - 1) * dil + 1;
   const size_t chans = size_t(channels);
   const size_t col = size_t(c);
-  const size_t slab = size_t(slot) * size_t(hist) * chans;
+  const size_t bank = size_t(slot) * size_t(hist) * chans;
   const int own = indptr[r] - rep;
+  const device int* pages =
+      paged != 0 ? page_table + size_t(lane0 + r) * PIE_RS_PAGE_INTS : nullptr;
+  const bool buffers = pages != nullptr && pages[0] >= 0;
+  auto buffered = [&](int e) -> device vec<T, 4>* {
+    return reinterpret_cast<device vec<T, 4>*>(
+        rs_buffered_row(slab, pages, e, page_tokens, page_bytes, plane_at, row_bytes) +
+        col * sizeof(T));
+  };
+  // Four channels of the lane's row `src`, the carried window's before it.
+  auto tap = [&](int src) -> float4 {
+    if (src < 0) {
+      return *reinterpret_cast<const device float4*>(conv_state + bank +
+                                                     size_t(hist + src) * chans + col);
+    }
+    if (pages == nullptr) {
+      return float4(*reinterpret_cast<const device vec<T, 4>*>(x + size_t(begin + src) * chans + col));
+    }
+    if (src < rep) {
+      return float4(*buffered(src));
+    }
+    return float4(*reinterpret_cast<const device vec<T, 4>*>(x + size_t(own + src) * chans + col));
+  };
 
   if (live) {
     float4 w[PIE_CONV_X4_TAPS];
@@ -424,18 +471,20 @@ template <typename T>
     for (int t = first; t < span; t += rows) {
       float4 acc = 0.0f;
       for (int k = 0; k < width; ++k) {
-        const float4 tap = causal_conv1d_x4_tap<T>(x, conv_state, slab, chans, col, begin, hist,
-                                                   t - (width - 1 - k) * dil);
-        acc.x += tap.x * w[k].x;
-        acc.y += tap.y * w[k].y;
-        acc.z += tap.z * w[k].z;
-        acc.w += tap.w * w[k].w;
+        const float4 in = tap(t - (width - 1 - k) * dil);
+        acc.x += in.x * w[k].x;
+        acc.y += in.y * w[k].y;
+        acc.z += in.z * w[k].z;
+        acc.w += in.w * w[k].w;
       }
       const vec<T, 4> out(T(causal_conv1d_silu(acc.x)), T(causal_conv1d_silu(acc.y)),
                           T(causal_conv1d_silu(acc.z)), T(causal_conv1d_silu(acc.w)));
       *reinterpret_cast<device vec<T, 4>*>(y + size_t(begin + t) * chans + col) = out;
       if (t >= rep) {
         *reinterpret_cast<device vec<T, 4>*>(land + size_t(own + t) * chans + col) = out;
+        if (buffers) {
+          *buffered(t) = *reinterpret_cast<const device vec<T, 4>*>(x + size_t(own + t) * chans + col);
+        }
       }
     }
   }
@@ -448,8 +497,7 @@ template <typename T>
       const size_t into = size_t(snap[PIE_RS_SNAPSHOTS + i]) * size_t(hist) * chans;
       for (int s = first; s < hist; s += rows) {
         *reinterpret_cast<device float4*>(new_conv_state + into + size_t(s) * chans + col) =
-            causal_conv1d_x4_tap<T>(x, conv_state, slab, chans, col, begin, hist,
-                                    snap[i] - hist + s);
+            tap(snap[i] - hist + s);
       }
     }
   }
@@ -458,13 +506,12 @@ template <typename T>
   float4 next[kConvVerifyHeld];
   int held = 0;
   for (int s = first; live && keep > 0 && s < hist; s += rows) {
-    next[held++] = causal_conv1d_x4_tap<T>(x, conv_state, slab, chans, col, begin, hist,
-                                           keep - hist + s);
+    next[held++] = tap(keep - hist + s);
   }
   threadgroup_barrier(mem_flags::mem_device);
   held = 0;
   for (int s = first; live && keep > 0 && s < hist; s += rows) {
-    *reinterpret_cast<device float4*>(new_conv_state + slab + size_t(s) * chans + col) =
+    *reinterpret_cast<device float4*>(new_conv_state + bank + size_t(s) * chans + col) =
         next[held++];
   }
 }
@@ -477,6 +524,8 @@ template <typename T>
       const device itype*, const device float*, device float*,          \
       device itype*, device itype*, const constant int&,                \
       const constant int&, const constant int&, const device int*,      \
-      const constant int&, uint3, uint3, uint3);
+      const constant int&, device uchar*, const device int*,            \
+      const constant uint&, const constant uint&, const constant uint&, \
+      const constant uint&, const constant int&, uint3, uint3, uint3);
 
 instantiate_causal_conv1d_verify(bfloat16, bfloat)
