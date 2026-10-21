@@ -13,6 +13,10 @@ use crate::tensor::Tensor;
 const DECODED_WEIGHT: &str = "linear.quant.decoded_weight";
 const SPLIT_PARTIALS: &str = "linear.w8a16.split_partials";
 
+/// The fewest rows Hopper's wgmma kernel takes from the GEMV-shaped mma.sync
+/// one: at 16 rows the two are even, at 32 wgmma is a quarter faster.
+const WGMMA_FROM: u32 = 17;
+
 /// The most ways the tiled GEMM splits K for a plane too narrow to fill the card.
 const MOST_SPLITS: u32 = 16;
 
@@ -104,12 +108,11 @@ pub fn matmul(
     // splits K, the codes still read once.
     let sms = ctx.multiprocessors().unwrap_or(108);
     let tiles = n.div_ceil(128) * m.div_ceil(64);
-    let splits = if m > MMA_UNTIL && tiles < 2 * sms && n.is_multiple_of(2) {
-        (2 * sms)
-            .div_ceil(tiles)
-            .min(MOST_SPLITS)
-            .min(k / 128)
-            .max(1)
+    let wgmma = crate::linear::moe::hopper_wgmma() && m >= WGMMA_FROM;
+    let tiled = m > MMA_UNTIL || wgmma;
+    // Splits that keep the fire one wave deep at two CTAs an SM.
+    let splits = if tiled && tiles < 2 * sms && n.is_multiple_of(2) {
+        (2 * sms / tiles).min(MOST_SPLITS).min(k / 128).max(1)
     } else {
         1
     };
@@ -133,7 +136,7 @@ pub fn matmul(
         stated(op, k)?.arg(),
         ctx.stage(),
     ];
-    if m > MMA_UNTIL {
+    if tiled {
         // The tiled GEMM: 64-row CTAs while that keeps the grid wide, 128 past it.
         let (bm, stages) = if m <= 128 { (64u32, 4u32) } else { (128, 3) };
         // The stages, and the CTA's block exponents laid beside them.
@@ -151,7 +154,7 @@ pub fn matmul(
         let mut args = args.to_vec();
         args.extend([ArgValue::Ptr(part), stated(op, splits)?.arg()]);
         // Hopper's wgmma, the codes widened once into its A registers.
-        let fire = if crate::linear::moe::hopper_wgmma() {
+        let fire = if wgmma {
             const WG_STAGES: u32 = 3;
             Fire::at(
                 "linear/moe_wgmma.cuh",
