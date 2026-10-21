@@ -45,6 +45,46 @@ pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Re
     )
 }
 
+/// [`swiglu`] over at most eight rows that also lays the register tile's
+/// input table of `y` in `table`, with `counters` arrival counters zeroed:
+/// the table `linear::quant`'s register matmul lays over `y`, bit for bit,
+/// so the down projection reads it and runs no table pass.
+pub fn swiglu_table(
+    ctx: &Ctx<'_>,
+    packed: Tensor,
+    intermediate: u32,
+    y: Tensor,
+    table: Tensor,
+    counters: u32,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mlp_swiglu";
+    dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
+    let cut = halves(OP, packed, intermediate, y)?;
+    if y.rows > 8 || !intermediate.is_multiple_of(64) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a register table holds at most 8 rows of whole 64-input groups, not {} x {intermediate}",
+                y.rows
+            ),
+        ));
+    }
+    ctx.fire(
+        Fire::at("linear/mlp_packed.metal", "packed_swiglu_table").apply(Grid::of(
+            [intermediate / 32, 8, 1],
+            [(intermediate / 32).min(GROUP), 1, 1],
+        )),
+        &[
+            cut.packed.arg(),
+            cut.y.arg_mut(),
+            cut.intermediate.arg(),
+            table.arg_mut(),
+            y.rows.arg(),
+            counters.arg(),
+        ],
+    )
+}
+
 /// [`swiglu`] over a routed stack's sorted rows: padding rows, whose `perm`
 /// is negative, are left as they are.
 pub fn swiglu_sorted(

@@ -268,6 +268,14 @@ impl<'c> Run<'c> {
 
     /// The single node that reads `value`, if exactly one does.
     fn sole_reader(&self, value: ValueId) -> Option<&'c Node> {
+        match self.readers_of(value) {
+            &[only] => self.nodes.get(only as usize),
+            _ => None,
+        }
+    }
+
+    /// The nodes that read `value`, in trace order.
+    fn readers_of(&self, value: ValueId) -> &[u32] {
         use poem_ir::Operands as _;
         let readers = self.readers.get_or_init(|| {
             let mut readers = vec![Vec::new(); self.values.len()];
@@ -285,10 +293,40 @@ impl<'c> Run<'c> {
             }
             readers
         });
-        match readers.get(value.0 as usize).map(Vec::as_slice) {
-            Some(&[only]) => self.nodes.get(only as usize),
-            _ => None,
+        readers.get(value.0 as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// When a projection of `value` may run on the register tile (a 4-bit,
+    /// 64-group bank over at most eight rows, a whole number of the tile's
+    /// 64 columns), the arrival counters the widest such projection's split
+    /// may take: the producer of `value` then lays the tile's input table
+    /// with that many zeroed, and the projections read it.
+    pub(crate) fn register_readers(&self, value: ValueId) -> Option<u32> {
+        use poem_ir::{Linear, Operation};
+        let x = self.tensor(value);
+        if !self.tuning.qmm_register()
+            || x.dtype != poem_ir::Dtype::Bf16
+            || x.rows == 0
+            || x.rows > 8
+            || !x.width.is_multiple_of(256)
+        {
+            return None;
         }
+        self.readers_of(value)
+            .iter()
+            .filter_map(|&at| match &self.nodes.get(at as usize)?.op {
+                Operation::Linear(Linear::Matmul { act, w, y }) if *act == value => {
+                    let bank = self.banked(*w)?;
+                    let columns = self.tensor(*y).width;
+                    (bank.bits == 4
+                        && bank.group == 64
+                        && bank.biases.is_some()
+                        && columns.is_multiple_of(64))
+                    .then_some(columns / 64)
+                }
+                _ => None,
+            })
+            .max()
     }
 
     pub(crate) fn chain_clear(&self) {
