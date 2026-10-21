@@ -1018,9 +1018,21 @@ impl<'c> Run<'c> {
 
     pub(crate) fn routed_scratch(&self) -> Option<RoutedScratch> {
         self.table.set(None);
+        self.routed_rooms()
+    }
+
+    /// The routed scratch, for a pass that may yet decline it: one that runs
+    /// over it knocks the register table down itself ([`Run::knock_table`]).
+    pub(crate) fn routed_rooms(&self) -> Option<RoutedScratch> {
         Some(self.scratch.routed(self.handles)?.unwrap_or_else(|fault| {
             panic!("the routed scratch this load reserved does not mint: {fault}")
         }))
+    }
+
+    /// Forgets the register table: a pass wrote a scratch room the precast
+    /// room overlaps.
+    pub(crate) fn knock_table(&self) {
+        self.table.set(None);
     }
 
     pub(crate) fn index_scores(&self) -> Option<Tensor> {
