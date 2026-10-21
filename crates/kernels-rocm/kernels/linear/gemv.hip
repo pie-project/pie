@@ -375,8 +375,8 @@ __global__ __launch_bounds__(1024) void skinny4_bf16(const bf16* __restrict__ we
 
 // ------------------------------------------------------------ skinnyt --
 
-// y = act · Wᵀ for up to 16 decode rows, the weight read in whole 512-byte
-// row runs (two rows an instruction) and turned through LDS into the
+// y = act · Wᵀ for up to 32 decode rows (one or two 16-row activation
+// blocks), the weight read in whole 512-byte row runs (two rows an instruction) and turned through LDS into the
 // 16x16x16 core's operand order. A block of KS wavefronts walks 16-row
 // tiles; wavefront w owns K's 256-element slices w, w + KS, ... (R of them),
 // its activation slices held in registers for the whole walk and the next
@@ -386,7 +386,8 @@ __global__ __launch_bounds__(1024) void skinny4_bf16(const bf16* __restrict__ we
 template <int M, int R, int KS, int EPI = kSkinnyStore>
 __global__ __launch_bounds__(kWave* KS) void skinnyt_bf16(const bf16* __restrict__ weight, const bf16* __restrict__ act,
                                                          bf16* __restrict__ out, int N, int K, float cap) {
-    static_assert(M >= 1 && M <= 16, "one 16-row activation block");
+    constexpr int MB = (M + 15) / 16;
+    static_assert(M >= 1 && MB <= 2, "one or two 16-row activation blocks");
     constexpr bool GLU = EPI == kSkinnySwiglu || EPI == kSkinnyGeglu;
     constexpr int COLS = GLU ? 8 : 16;  // output columns a tile
     // A wavefront's 16 x 256 turn (8 KB, 16-byte chunks swizzled by row), its
@@ -399,16 +400,19 @@ __global__ __launch_bounds__(kWave* KS) void skinnyt_bf16(const bf16* __restrict
     const int tiles = (N + COLS - 1) / COLS;
     b128* mine = turn[wave];
 
-    // This wavefront's activation: row r at chunk 4s + q of each slice.
-    b128 xv[R][8];
+    // This wavefront's activation: rows 16b + r at chunk 4s + q of each slice.
+    b128 xv[MB][R][8];
 #pragma unroll
-    for (int p = 0; p < R; ++p) {
-        const int sl = wave + KS * p;
+    for (int b = 0; b < MB; ++b)
 #pragma unroll
-        for (int s = 0; s < 8; ++s)
-            xv[p][s] = r < M && sl < slices ? reinterpret_cast<const b128*>(act + static_cast<long long>(r) * K + sl * 256)[4 * s + q]
-                                            : b128{};
-    }
+        for (int p = 0; p < R; ++p) {
+            const int sl = wave + KS * p, j = 16 * b + r;
+#pragma unroll
+            for (int s = 0; s < 8; ++s)
+                xv[b][p][s] = j < M && sl < slices
+                                  ? reinterpret_cast<const b128*>(act + static_cast<long long>(j) * K + sl * 256)[4 * s + q]
+                                  : b128{};
+        }
     auto load = [&](skinny_v4 (&wv)[R][8], int tile) {
         const int n0 = tile * COLS;
 #pragma unroll
@@ -424,7 +428,9 @@ __global__ __launch_bounds__(kWave* KS) void skinnyt_bf16(const bf16* __restrict
         }
     };
     auto work = [&](skinny_v4 (&wv)[R][8], int tile) {
-        skinny_cd acc = {0.f, 0.f, 0.f, 0.f};
+        skinny_cd acc[MB];
+#pragma unroll
+        for (int b = 0; b < MB; ++b) acc[b] = skinny_cd{0.f, 0.f, 0.f, 0.f};
 #pragma unroll
         for (int p = 0; p < R; ++p) {
             if (wave + KS * p >= slices) continue;
@@ -438,21 +444,29 @@ __global__ __launch_bounds__(kWave* KS) void skinnyt_bf16(const bf16* __restrict
                 const int c = 4 * s + q;
                 const b128 w = mine[r * 32 + (c ^ (r & 7))];
                 const skinny_ab* w4 = reinterpret_cast<const skinny_ab*>(&w);
-                const skinny_ab* x4 = reinterpret_cast<const skinny_ab*>(&xv[p][s]);
-                acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w4[0], x4[0], acc, 0, 0, 0);
-                acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w4[1], x4[1], acc, 0, 0, 0);
+#pragma unroll
+                for (int b = 0; b < MB; ++b) {
+                    const skinny_ab* x4 = reinterpret_cast<const skinny_ab*>(&xv[b][p][s]);
+                    acc[b] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w4[0], x4[0], acc[b], 0, 0, 0);
+                    acc[b] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w4[1], x4[1], acc[b], 0, 0, 0);
+                }
             }
         }
-        reinterpret_cast<skinny_cd*>(mine)[l] = acc;
+#pragma unroll
+        for (int b = 0; b < MB; ++b) reinterpret_cast<skinny_cd*>(mine)[b * kWave + l] = acc[b];
         __syncthreads();
         if (wave == 0) {
 #pragma unroll
-            for (int w = 1; w < KS; ++w) acc += reinterpret_cast<const skinny_cd*>(turn[w])[l];
-            // Lane (j, q) holds tile rows 4q..4q+3 against activation row j
-            // (under a GLU, up rows from q = 2, each rounded as stored).
+            for (int w = 1; w < KS; ++w)
+#pragma unroll
+                for (int b = 0; b < MB; ++b) acc[b] += reinterpret_cast<const skinny_cd*>(turn[w])[b * kWave + l];
+            // Lane (j, q) holds tile rows 4q..4q+3 against activation row
+            // 16b + j (under a GLU, up rows from q = 2, each rounded as stored).
+#pragma unroll
+            for (int b = 0; b < MB; ++b)
 #pragma unroll
             for (int v = 0; v < 4; ++v) {
-                float x = acc[v];
+                float x = acc[b][v];
                 if constexpr (GLU) {
                     const float g = to_f32(from_f32<bf16>(x));
                     const float u = to_f32(from_f32<bf16>(__shfl(x, l + 32, kWave)));
@@ -462,8 +476,8 @@ __global__ __launch_bounds__(kWave* KS) void skinnyt_bf16(const bf16* __restrict
                 } else if constexpr (EPI == kSkinnySoftcap) {
                     x = cap * tanhf(to_f32(from_f32<bf16>(x)) * (1.f / cap));
                 }
-                const int n = tile * COLS + 4 * q + v;
-                if (r < M && n < N && 4 * q < COLS) skinny_put<EPI>(out, static_cast<long long>(r) * N + n, x);
+                const int j = 16 * b + r, n = tile * COLS + 4 * q + v;
+                if (j < M && n < N && 4 * q < COLS) skinny_put<EPI>(out, static_cast<long long>(j) * N + n, x);
             }
         }
         __syncthreads();

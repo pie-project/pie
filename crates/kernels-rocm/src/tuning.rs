@@ -143,6 +143,12 @@ pub struct GemmTurnFrom(pub u32);
 #[decision(id = "kernel.gemm.turn_until", constant(range(0..=16)), default = 16, tune = search)]
 pub struct GemmTurnUntil(pub u32);
 
+/// The most rows the turned kernel takes over a bank at least
+/// `kernel.gemm.skinny_batch_min_n` wide (an lm head), up to 32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.turn_wide_until", constant(range(0..=32)), default = 16, tune = search)]
+pub struct GemmTurnWideUntil(pub u32);
+
 /// The fewest output columns (a bank's rows) the turned kernel takes: a
 /// narrower bank's tiles leave the card idle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -314,6 +320,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmSkinnyBatchMinN>()
         .add::<GemmTurnFrom>()
         .add::<GemmTurnUntil>()
+        .add::<GemmTurnWideUntil>()
         .add::<GemmTurnMinN>()
         .add::<MoeGroupAt>()
         .add::<MoeMxfp4GroupedReuse>()
@@ -368,6 +375,7 @@ pub struct Tuning {
     pub gemm_skinny_batch_min_n: u32,
     pub gemm_turn_from: u32,
     pub gemm_turn_until: u32,
+    pub gemm_turn_wide_until: u32,
     pub gemm_turn_min_n: u32,
     pub moe_group_at: u32,
     pub mxfp4_grouped_reuse: u32,
@@ -424,6 +432,7 @@ impl Tuning {
         gemm_skinny_batch_min_n: 65536,
         gemm_turn_from: 0,
         gemm_turn_until: 16,
+        gemm_turn_wide_until: 16,
         gemm_turn_min_n: 2048,
         moe_group_at: 4,
         mxfp4_grouped_reuse: 2,
@@ -478,6 +487,7 @@ impl Tuning {
             gemm_skinny_batch_min_n: profile.get::<GemmSkinnyBatchMinN>().0,
             gemm_turn_from: profile.get::<GemmTurnFrom>().0,
             gemm_turn_until: profile.get::<GemmTurnUntil>().0,
+            gemm_turn_wide_until: profile.get::<GemmTurnWideUntil>().0,
             gemm_turn_min_n: profile.get::<GemmTurnMinN>().0,
             moe_group_at: profile.get::<MoeGroupAt>().0,
             mxfp4_grouped_reuse: profile.get::<MoeMxfp4GroupedReuse>().0,

@@ -217,13 +217,16 @@ fn the_batch_engine_projection() {
 }
 
 /// The turned kernel (forced over every row count it covers): K of one to
-/// eight slices, a ragged N, the f32 landing and the fused swiglu.
+/// eight slices, one and two activation blocks, a ragged N, the f32 landing
+/// and the fused swiglu.
 #[test]
 fn the_turned_projection() {
     let Some(gpu) = Gpu::open() else { return };
     let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
     t.gemm_turn_from = 1;
+    t.gemm_turn_wide_until = 32;
     t.gemm_turn_min_n = 0;
+    t.gemm_skinny_batch_min_n = 0;
     let ctx = gpu.ctx().with_tuning(t);
     for (m, n, k) in [
         (1u32, 2056u32, 256u32),
@@ -232,6 +235,8 @@ fn the_turned_projection() {
         (8, 1024, 2048),
         (13, 24, 1280),
         (16, 2048, 1792),
+        (24, 3000, 2048),
+        (32, 1024, 768),
     ] {
         let a: Vec<f32> = values((m * k) as usize, 31, 1.0)
             .into_iter()

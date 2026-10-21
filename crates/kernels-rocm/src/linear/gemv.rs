@@ -405,12 +405,12 @@ const TURN_WAVE_LDS: u32 = 8 << 10;
 /// slice of K each, up to four), slices a wavefront (`r`, up to two) and
 /// blocks (as many as the LDS keeps resident, at most a 16-row tile each).
 /// `None` past K 2048.
-pub(crate) fn turn_plan(rows: u32, k: u32) -> Option<(u32, u32, u32)> {
-    if k == 0 || !k.is_multiple_of(256) || k > 2048 || rows == 0 {
+pub(crate) fn turn_plan(m: u32, rows: u32, k: u32) -> Option<(u32, u32, u32)> {
+    if !(1..=32).contains(&m) || k == 0 || !k.is_multiple_of(256) || k > 2048 || rows == 0 {
         return None;
     }
     let slices = k / 256;
-    let ks = slices.min(4);
+    let ks = slices.min(if m > 16 { 8 } else { 4 });
     let r = slices.div_ceil(ks);
     let resident = compute_units() * ((64 << 10) / (ks * TURN_WAVE_LDS));
     Some((ks, r, rows.div_ceil(16).min(resident)))
@@ -432,11 +432,11 @@ pub(crate) fn skinnyt(
 ) -> Result<(), Error> {
     const OP: &str = "linear.skinnyt";
     let glu = matches!(epilogue, SkinnyEpilogue::Swiglu | SkinnyEpilogue::Geglu);
-    let plan = turn_plan(n.unsigned_abs() * if glu { 2 } else { 1 }, k.unsigned_abs());
-    let (Some((ks, r, grid)), true) = (plan, (1..=16).contains(&m) && n > 0 && k > 0) else {
+    let plan = turn_plan(m.unsigned_abs(), n.unsigned_abs() * if glu { 2 } else { 1 }, k.unsigned_abs());
+    let (Some((ks, r, grid)), true) = (plan, n > 0 && k > 0) else {
         return Err(refuse(
             OP,
-            format!("covers 1..=16 rows of K up to 2048 in whole 256s, not m={m} n={n} k={k}"),
+            format!("covers 1..=32 rows of K up to 2048 in whole 256s, not m={m} n={n} k={k}"),
         ));
     };
     for (address, what) in [

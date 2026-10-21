@@ -48,9 +48,12 @@ gemm.live_from = 129
 # up to 2048 takes the turned kernel: whole 512-byte weight row runs turned
 # through LDS into the matrix core's order (Qwen3.6 at 8 rows, cold weights:
 # 12288 x 2048 18.5 us vs hipBLASLt's 23.6, 9216 x 2048 14.6 vs 16.2,
-# 2048 x 512 3.1 vs 4.2; 4 rows 16.7 vs the skinny kernel's 20.5).
+# 2048 x 512 3.1 vs 4.2; 4 rows 16.7 vs the skinny kernel's 20.5). An lm head
+# keeps it to 32 rows (248320 x 2048: 24-32 rows 260-265 us vs hipBLASLt's
+# 346-358); a narrower bank past 16 loses to hipBLASLt.
 gemm.turn_from = 3
 gemm.turn_until = 16
+gemm.turn_wide_until = 32
 gemm.turn_min_n = 2048
 
 # The gated-delta chunk scan walks 32-column state slices from 512 slices

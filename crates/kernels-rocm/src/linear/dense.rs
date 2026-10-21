@@ -26,7 +26,7 @@ const SKINNY_QUAD_ROWS: i32 = super::gemv::QUAD_MIN_ROWS as i32;
 /// so the two land the same bits.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Route {
-    /// The turned kernel (`kernel.gemm.turn_*`).
+    /// The turned kernel (`kernel.gemm.turn_*`; past 16 rows, an lm head).
     Turn,
     /// The skinny kernels (`linear/gemv.hip`).
     Skinny,
@@ -39,10 +39,15 @@ enum Route {
 
 fn route(ctx: &Ctx, m: i32, rows: i32, k: i32) -> Route {
     let t = ctx.tuning();
+    let until = if rows.unsigned_abs() >= t.gemm_skinny_batch_min_n {
+        t.gemm_turn_wide_until
+    } else {
+        t.gemm_turn_until.min(16)
+    };
     if t.gemm_turn_from > 0
-        && (t.gemm_turn_from as i32..=t.gemm_turn_until.min(16) as i32).contains(&m)
+        && (t.gemm_turn_from as i32..=until as i32).contains(&m)
         && rows.unsigned_abs() >= t.gemm_turn_min_n
-        && turn_plan(rows.unsigned_abs(), k.unsigned_abs()).is_some()
+        && turn_plan(m.unsigned_abs(), rows.unsigned_abs(), k.unsigned_abs()).is_some()
     {
         return Route::Turn;
     }
