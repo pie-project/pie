@@ -188,17 +188,28 @@ pub struct Run<'c> {
 }
 
 /// A register-tile input table standing in the precast room: `act`'s rows as
-/// the tile's lanes take them, laid in this walk's region, run and pass, with
-/// `counters` arrival counters zeroed. Another matmul of `act` there reads it
-/// rather than laying it again; anything else that takes a scratch room the
-/// precast room overlaps knocks it down, and a value is written once a walk
-/// of its region, so `act` itself cannot change under it.
+/// the tile's lanes take them, laid over the window `rows` names, with
+/// `counters` arrival counters zeroed. Another matmul of `act` over the same
+/// window reads it rather than laying it again, in this region or a later one
+/// (a layer's MoE norm and its shared expert sit in different regions);
+/// anything else that takes a scratch room the precast room overlaps knocks
+/// it down, and `act` is written once, so it cannot change under it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Laid {
     act: ValueId,
-    place: (u32, u32, bool),
+    rows: Rows,
     contraction: u32,
     counters: u32,
+}
+
+/// The rows of a value a walk's place reads: its window's spans (rows,
+/// patches, voxels), pass and tail; or, where the window is gathered into the
+/// copy room or cut into passes the encoder may skip, the region, run and
+/// tail themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rows {
+    Span([poem_exec::fire::MaskSpan; 3], u32, bool),
+    Region(u32, u32, bool),
 }
 
 /// Where a routed MLP that keeps its rows sorted, as Splash's does, has got
@@ -1100,8 +1111,8 @@ impl<'c> Run<'c> {
     }
 
     /// The register tile's input table for `act` in the precast room, and
-    /// whether it already stands there, laid by another matmul of `act` in
-    /// this region, run and pass with at least `counters` arrival counters
+    /// whether it already stands there, laid by another matmul or the
+    /// producer of `act` over the same window with at least `counters` arrival counters
     /// zeroed (each split matmul's last partition puts its counters back to
     /// zero, so the next reader finds them so). A table laid now is
     /// remembered as standing: the caller lays it before anything else runs.
@@ -1118,21 +1129,30 @@ impl<'c> Run<'c> {
             .unwrap_or_else(|fault| {
                 panic!("the precast plane this load reserved does not mint: {fault}")
             });
-        let place = (
-            self.place.region.get(),
-            self.place.run.get(),
-            self.place.tail.get(),
-        );
+        let window = self.window();
+        let rows = if window.gathered.is_some() || window.passes > 1 {
+            Rows::Region(
+                self.place.region.get(),
+                self.place.run.get(),
+                self.place.tail.get(),
+            )
+        } else {
+            Rows::Span(
+                [window.span, window.patch, window.voxel],
+                window.pass,
+                self.place.tail.get(),
+            )
+        };
         let standing = self.table.get().is_some_and(|laid| {
             laid.act == act
-                && laid.place == place
+                && laid.rows == rows
                 && laid.contraction == contraction
                 && laid.counters >= counters
         });
         if !standing {
             self.table.set(Some(Laid {
                 act,
-                place,
+                rows,
                 contraction,
                 counters,
             }));
