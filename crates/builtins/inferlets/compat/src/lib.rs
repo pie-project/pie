@@ -34,9 +34,39 @@ mod speculative;
 pub use demux::Event;
 pub use envelope::Envelope;
 pub use error::ApiError;
-pub use generate::Sampling;
+pub use generate::{Logprob, MAX_TOP_LOGPROBS, Sampling};
 pub use request::{Effort, Message, Request, ResponseFormat, Role, Thinking, ToolCall, ToolChoice};
 pub use run::{Finish, Outcome, run};
+
+/// Runs `futures` side by side to their ends, their outputs in order: the
+/// `n` choices of one request, each its own generation, fly together.
+pub async fn join_all<T>(
+    futures: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = T> + '_>>>,
+) -> Vec<T> {
+    let mut futures: Vec<_> = futures.into_iter().map(Some).collect();
+    let mut outputs: Vec<Option<T>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (slot, out) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if let Some(future) = slot {
+                match future.as_mut().poll(cx) {
+                    std::task::Poll::Ready(value) => {
+                        *out = Some(value);
+                        *slot = None;
+                    }
+                    std::task::Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    outputs.into_iter().flatten().collect()
+}
 
 /// A short id unique to this process: the instance id's leading characters.
 /// Every response id an adapter mints is built on it.

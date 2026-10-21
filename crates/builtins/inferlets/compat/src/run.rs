@@ -9,7 +9,7 @@ use inferlet::grammar::{Grammar, Matcher};
 use inferlet::pie::inferlet::tools;
 
 use crate::demux::{Demux, Event};
-use crate::generate::generate;
+use crate::generate::{Logprob, generate};
 use crate::holdback::HoldBack;
 use crate::prompt;
 use crate::request::{Request, ResponseFormat, ToolCall};
@@ -38,6 +38,9 @@ pub struct Outcome {
     pub content: String,
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
+    /// Every sampled token's logprobs, in order (the stop token that ended
+    /// the turn among them), where the request asked for them.
+    pub logprobs: Vec<(u32, Logprob)>,
 }
 
 /// Each report takes a lock on the host.
@@ -117,6 +120,9 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
     let matcher = constraint(req)?;
     let stop_tokens = chat::stop_tokens();
     let mut demux = Demux::new(&chat::cue_thinking(prompt::thinks(req)));
+    if req.raw_prompt.is_some() {
+        demux.verbatim();
+    }
     let mut out = Output {
         stops: HoldBack::new(req.stop.clone()),
         content: String::new(),
@@ -132,8 +138,15 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
         }
     }
 
-    let mut on_token = |token: u32| -> ControlFlow<()> {
+    let mut logprobs: Vec<(u32, Logprob)> = Vec::new();
+    let mut on_token = |token: u32, logprob: Option<Logprob>| -> ControlFlow<()> {
         crate::resume::note(token);
+        if let Some(logprob) = logprob {
+            if req.stream {
+                sink(Event::Logprobs(vec![(token, logprob.clone())]));
+            }
+            logprobs.push((token, logprob));
+        }
         generated += 1;
         if generated == 1 || generated.is_multiple_of(REPORT_EVERY) {
             inferlet::session::set_tokens(prompt_tokens, generated);
@@ -193,5 +206,6 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
         content: out.content,
         reasoning: demux.reasoning_text,
         tool_calls: demux.tool_calls,
+        logprobs,
     })
 }

@@ -12,15 +12,17 @@
 //! `stream_options.include_usage`, `temperature`, `top_p`, `top_k`,
 //! `max_tokens`/`max_completion_tokens`, `ignore_eos`, `stop`, `seed`,
 //! `presence_penalty`, `frequency_penalty`, `repetition_penalty`, vLLM's
-//! `min_tokens`,
+//! `min_tokens` and `min_p`, `n` (each choice its own generation, flown
+//! together), `logprobs` and `top_logprobs` (up to 20, of the raw logits,
+//! every sampled token's as vLLM reports them, the stop token's among them),
 //! `reasoning_effort` (`none` switches thinking off; `low`, `medium` and
 //! `high`/`xhigh` set the effort a template states, Qwen3.8's) and
 //! `chat_template_kwargs.enable_thinking` to switch thinking off or on, and
 //! an assistant message's `reasoning_content` replayed where the template
 //! replays reasoning.
 //!
-//! Refused with 400: `n > 1`, `logprobs`, and non-text content parts. Every
-//! other unknown field is ignored, as OpenAI does.
+//! Refused with 400: content parts other than text and images. Every other
+//! unknown field is ignored, as OpenAI does.
 
 use compat::{
     ApiError, Effort, Envelope, Event, Finish, Message, Request, ResponseFormat, Role, Thinking,
@@ -29,7 +31,7 @@ use compat::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{invalid, stop_sequences, usage};
+use crate::{chat_logprob, choice_request, choices, invalid, stop_sequences, usage};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -52,6 +54,8 @@ struct Body {
     seed: Option<i64>,
     n: Option<u32>,
     logprobs: Option<bool>,
+    top_logprobs: Option<u32>,
+    min_p: Option<f32>,
     presence_penalty: Option<f32>,
     frequency_penalty: Option<f32>,
     repetition_penalty: Option<f32>,
@@ -160,20 +164,25 @@ fn data_url(url: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// The normalized request, and whether a streamed reply ends with a usage
-/// chunk.
-fn parse(body: Value) -> Result<(Request, bool), ApiError> {
+/// The normalized request, whether a streamed reply ends with a usage
+/// chunk, and how many choices it asks for.
+fn parse(body: Value) -> Result<(Request, bool, u32), ApiError> {
     let body: Body =
         serde_json::from_value(body).map_err(|e| invalid(format!("request body: {e}"), None))?;
     if body.messages.is_empty() {
         return Err(invalid("`messages` must not be empty", Some("messages")));
     }
-    if body.n.is_some_and(|n| n != 1) {
-        return Err(invalid("`n` other than 1 is not supported", Some("n")));
-    }
-    if body.logprobs == Some(true) {
-        return Err(invalid("`logprobs` is not supported", Some("logprobs")));
-    }
+    let n = choices(body.n)?;
+    let logprobs = match (body.logprobs.unwrap_or(false), body.top_logprobs) {
+        (false, Some(k)) if k > 0 => {
+            return Err(invalid(
+                "`top_logprobs` needs `logprobs: true`",
+                Some("top_logprobs"),
+            ));
+        }
+        (false, _) => None,
+        (true, k) => Some(k.unwrap_or(0)),
+    };
 
     // Tool-result messages carry a call id; the template wants the tool's
     // name, which the assistant turn that made the call knows.
@@ -321,6 +330,10 @@ fn parse(body: Value) -> Result<(Request, bool), ApiError> {
     if let Some(p) = body.repetition_penalty {
         req.sampling.repetition_penalty = p;
     }
+    if let Some(p) = body.min_p {
+        req.sampling.min_p = p;
+    }
+    req.sampling.logprobs = logprobs;
     if let Some(seed) = body.seed {
         req.sampling.set_seed(seed);
     }
@@ -361,7 +374,7 @@ fn parse(body: Value) -> Result<(Request, bool), ApiError> {
         };
     }
     let include_usage = body.stream_options.is_some_and(|o| o.include_usage);
-    Ok((req, include_usage))
+    Ok((req, include_usage, n))
 }
 
 fn finish_reason(finish: Finish) -> &'static str {
@@ -388,26 +401,31 @@ struct Ids {
 }
 
 impl Ids {
-    fn chunk(&self, delta: Value, finish: Option<&str>) -> Value {
+    fn chunk(&self, index: u32, delta: Value, finish: Option<&str>, logprobs: Value) -> Value {
         json!({
             "id": self.id,
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish, "logprobs": null}],
+            "choices": [{"index": index, "delta": delta, "finish_reason": finish, "logprobs": logprobs}],
         })
     }
 }
 
-pub async fn serve(envelope: Envelope) -> Result<String, String> {
-    let (req, include_usage) = parse(envelope.body)?;
-    let ids = Ids {
-        id: format!("chatcmpl-{}", compat::short_id()),
-        created: envelope.time,
-        model: inferlet::model::name(),
-    };
-    let stream = req.stream;
+/// The `logprobs` a chunk or a choice carries: the entries, or null where
+/// the request asked for none.
+fn logprobs_field(asked: bool, entries: Vec<Value>) -> Value {
+    if asked {
+        json!({"content": entries})
+    } else {
+        Value::Null
+    }
+}
 
+/// One choice's generation, its chunks streamed under `index`.
+async fn choice(req: &Request, index: u32, ids: &Ids) -> Result<compat::Outcome, String> {
+    let stream = req.stream;
+    let asked = req.sampling.logprobs.is_some();
     // The role rides on the first delta, as the open servers send it: an
     // empty role chunk ahead of the prefill would read as the first token. A
     // turn resumed here after a move sent it before the move.
@@ -419,31 +437,73 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         v
     };
     let mut calls = 0usize;
-    let outcome = compat::run(&req, |event| {
+    // Logprobs of sampled tokens not yet sent: they ride on the next chunk.
+    let mut pending: Vec<Value> = Vec::new();
+    let outcome = compat::run(req, |event| {
         if !stream {
             return;
         }
-        match event {
-            Event::Reasoning(text) => {
-                emit::send(&ids.chunk(delta(json!({"reasoning_content": text})), None));
+        let body = match event {
+            Event::Logprobs(steps) => {
+                pending.extend(steps.iter().map(|(t, lp)| chat_logprob(*t, lp)));
+                return;
             }
-            Event::ReasoningEnd => {}
-            Event::Text(text) => {
-                emit::send(&ids.chunk(delta(json!({"content": text})), None));
-            }
+            Event::Reasoning(text) => delta(json!({"reasoning_content": text})),
+            Event::ReasoningEnd => return,
+            Event::Text(text) => delta(json!({"content": text})),
             Event::ToolCall(call) => {
-                emit::send(&ids.chunk(
-                    delta(json!({"tool_calls": [tool_call_json(calls, &call)]})),
-                    None,
-                ));
+                let d = delta(json!({"tool_calls": [tool_call_json(calls, &call)]}));
                 calls += 1;
+                d
             }
-        }
+        };
+        let logprobs = logprobs_field(asked, std::mem::take(&mut pending));
+        emit::send(&ids.chunk(index, body, None, logprobs));
     })
     .await?;
+    if stream {
+        let logprobs = logprobs_field(asked, pending);
+        emit::send(&ids.chunk(
+            index,
+            delta(json!({})),
+            Some(finish_reason(outcome.finish)),
+            logprobs,
+        ));
+    }
+    Ok(outcome)
+}
+
+pub async fn serve(envelope: Envelope) -> Result<String, String> {
+    let (req, include_usage, n) = parse(envelope.body)?;
+    let ids = Ids {
+        id: format!("chatcmpl-{}", compat::short_id()),
+        created: envelope.time,
+        model: inferlet::model::name(),
+    };
+    let stream = req.stream;
+    let asked = req.sampling.logprobs.is_some();
+
+    let requests: Vec<Request> = (0..n).map(|i| choice_request(&req, i)).collect();
+    let outcomes: Vec<compat::Outcome> = if n == 1 {
+        vec![choice(&req, 0, &ids).await?]
+    } else {
+        compat::join_all(
+            requests
+                .iter()
+                .zip(0u32..)
+                .map(|(req, i)| {
+                    Box::pin(choice(req, i, &ids))
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = _>>>
+                })
+                .collect(),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()?
+    };
+    let total = usage_of(&outcomes);
 
     if stream {
-        emit::send(&ids.chunk(delta(json!({})), Some(finish_reason(outcome.finish))));
         if include_usage {
             emit::send(&json!({
                 "id": ids.id,
@@ -451,41 +511,65 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
                 "created": ids.created,
                 "model": ids.model,
                 "choices": [],
-                "usage": usage(&outcome),
+                "usage": total,
             }));
         }
         emit::send_raw("[DONE]");
         return Ok(String::new());
     }
 
-    let usage = usage(&outcome);
-    let mut message = json!({"role": "assistant"});
-    message["content"] = if outcome.content.is_empty() && !outcome.tool_calls.is_empty() {
-        Value::Null
-    } else {
-        Value::String(outcome.content)
-    };
-    let reasoning = outcome.reasoning.trim();
-    if !reasoning.is_empty() {
-        message["reasoning_content"] = Value::String(reasoning.to_string());
-    }
-    if !outcome.tool_calls.is_empty() {
-        message["tool_calls"] = Value::Array(
-            outcome
-                .tool_calls
-                .iter()
-                .enumerate()
-                .map(|(i, c)| tool_call_json(i, c))
-                .collect(),
-        );
-    }
+    let choices: Vec<Value> = outcomes
+        .into_iter()
+        .zip(0u32..)
+        .map(|(outcome, index)| {
+            let mut message = json!({"role": "assistant"});
+            message["content"] = if outcome.content.is_empty() && !outcome.tool_calls.is_empty() {
+                Value::Null
+            } else {
+                Value::String(outcome.content.clone())
+            };
+            let reasoning = outcome.reasoning.trim();
+            if !reasoning.is_empty() {
+                message["reasoning_content"] = Value::String(reasoning.to_string());
+            }
+            if !outcome.tool_calls.is_empty() {
+                message["tool_calls"] = Value::Array(
+                    outcome
+                        .tool_calls
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| tool_call_json(i, c))
+                        .collect(),
+                );
+            }
+            let logprobs = logprobs_field(
+                asked,
+                outcome
+                    .logprobs
+                    .iter()
+                    .map(|(t, lp)| chat_logprob(*t, lp))
+                    .collect(),
+            );
+            json!({"index": index, "message": message, "finish_reason": finish_reason(outcome.finish), "logprobs": logprobs})
+        })
+        .collect();
     Ok(json!({
         "id": ids.id,
         "object": "chat.completion",
         "created": ids.created,
         "model": ids.model,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason(outcome.finish), "logprobs": null}],
-        "usage": usage,
+        "choices": choices,
+        "usage": total,
     })
     .to_string())
+}
+
+/// The usage of every choice together: the prompt once, every choice's
+/// completion.
+fn usage_of(outcomes: &[compat::Outcome]) -> Value {
+    let mut total = usage(&outcomes[0]);
+    let completion: usize = outcomes.iter().map(|o| o.completion_tokens).sum();
+    total["completion_tokens"] = json!(completion);
+    total["total_tokens"] = json!(outcomes[0].prompt_tokens + completion);
+    total
 }

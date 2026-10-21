@@ -6,8 +6,10 @@
 //! The sampler is one ETA epilogue: the OpenAI penalties (presence,
 //! frequency, and the multiplicative repetition penalty) over a vocabulary
 //! histogram carried on the device, an optional grammar mask, temperature,
-//! then top-k / top-p truncation and a Gumbel-max draw. Temperature zero is
-//! exact greedy.
+//! then min-p, top-k and top-p truncation and a Gumbel-max draw. Temperature
+//! zero is exact greedy. Asked for logprobs, the epilogue also lands the
+//! sampled token's log-probability under the model's raw logits and the
+//! `top_logprobs` likeliest tokens', as vLLM's `raw_logprobs` reports them.
 //!
 //! With a grammar the loop is depth-1 — the mask for fire k+1 exists only
 //! once fire k's token has advanced the matcher — so constrained generation
@@ -38,6 +40,23 @@ pub struct Sampling {
     pub frequency_penalty: f32,
     /// 1.0 means off.
     pub repetition_penalty: f32,
+    /// Keep tokens at least this fraction as likely as the likeliest after
+    /// temperature; 0 means off.
+    pub min_p: f32,
+    /// Land each sampled token's logprob and this many likeliest
+    /// alternatives' (`Some(0)`: the sampled token's alone).
+    pub logprobs: Option<u32>,
+}
+
+/// The most alternatives a step reports, as OpenAI caps `top_logprobs`.
+pub const MAX_TOP_LOGPROBS: u32 = 20;
+
+/// A sampled token's log-probability under the model's raw logits, and the
+/// likeliest tokens' with theirs, most likely first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Logprob {
+    pub logprob: f32,
+    pub top: Vec<(u32, f32)>,
 }
 
 impl Default for Sampling {
@@ -51,6 +70,8 @@ impl Default for Sampling {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             repetition_penalty: 1.0,
+            min_p: 0.0,
+            logprobs: None,
         }
     }
 }
@@ -80,6 +101,12 @@ impl Sampling {
         if !(self.repetition_penalty.is_finite() && self.repetition_penalty > 0.0) {
             return Err("repetition_penalty must be > 0".into());
         }
+        if !(0.0..=1.0).contains(&self.min_p) {
+            return Err("min_p must be in [0, 1]".into());
+        }
+        if self.logprobs.is_some_and(|k| k > MAX_TOP_LOGPROBS) {
+            return Err(format!("top_logprobs must be at most {MAX_TOP_LOGPROBS}"));
+        }
         Ok(())
     }
 }
@@ -93,9 +120,12 @@ struct Knobs {
     temperature: Option<f32>,
     top_p: Option<Tensor>,
     top_k: Option<Tensor>,
+    min_p: Option<Tensor>,
     repetition: Option<Tensor>,
     frequency: Option<Tensor>,
     presence: Option<Tensor>,
+    /// A program constant: how many alternatives a step lands, if any.
+    logprobs: Option<u32>,
 }
 
 /// The channels a pass's knobs are seeded in.
@@ -103,9 +133,11 @@ struct KnobChannels {
     temperature: Option<f32>,
     top_p: Option<Channel>,
     top_k: Option<Channel>,
+    min_p: Option<Channel>,
     repetition: Option<Channel>,
     frequency: Option<Channel>,
     presence: Option<Channel>,
+    logprobs: Option<u32>,
 }
 
 impl KnobChannels {
@@ -120,9 +152,23 @@ impl KnobChannels {
             top_p: f(sampled && s.top_p < 1.0, s.top_p, "top_p"),
             top_k: (sampled && s.top_k > 0)
                 .then(|| Channel::from([s.top_k]).named(&format!("top_k{tag}"))),
-            repetition: f(penalized && s.repetition_penalty != 1.0, s.repetition_penalty, "rep_pen"),
-            frequency: f(penalized && s.frequency_penalty != 0.0, s.frequency_penalty, "freq_pen"),
-            presence: f(penalized && s.presence_penalty != 0.0, s.presence_penalty, "pres_pen"),
+            min_p: f(sampled && s.min_p > 0.0, s.min_p, "min_p"),
+            repetition: f(
+                penalized && s.repetition_penalty != 1.0,
+                s.repetition_penalty,
+                "rep_pen",
+            ),
+            frequency: f(
+                penalized && s.frequency_penalty != 0.0,
+                s.frequency_penalty,
+                "freq_pen",
+            ),
+            presence: f(
+                penalized && s.presence_penalty != 0.0,
+                s.presence_penalty,
+                "pres_pen",
+            ),
+            logprobs: s.logprobs,
         }
     }
 
@@ -133,24 +179,36 @@ impl KnobChannels {
             temperature: self.temperature,
             top_p: t(&self.top_p),
             top_k: t(&self.top_k),
+            min_p: t(&self.min_p),
             repetition: t(&self.repetition),
             frequency: t(&self.frequency),
             presence: t(&self.presence),
+            logprobs: self.logprobs,
         }
     }
 }
 
-/// The sampled token as a rank-0 i32, and the next output-token histogram.
-/// `histogram` is `(counts, present)`: how often each token was generated,
-/// and whether it was in the prompt.
+/// What a step lands beside its token when asked for logprobs: the sampled
+/// token's logprob then the alternatives' (`[1 + top]` f32), and the
+/// alternatives' ids (`[top]` i32, absent for none).
+struct Landed {
+    logprobs: Tensor,
+    ids: Option<Tensor>,
+}
+
+/// The sampled token as a rank-0 i32, the next output-token histogram, and
+/// the step's logprobs where the knobs ask. `histogram` is `(counts,
+/// present)`: how often each token was generated, and whether it was in the
+/// prompt.
 fn sample(
     vocab: u32,
     k: &Knobs,
     r: &Tensor,
     histogram: Option<(&Tensor, &Tensor)>,
     mask: Option<&Tensor>,
-) -> (Tensor, Option<Tensor>) {
+) -> (Tensor, Option<Tensor>, Option<Landed>) {
     let mut logits = reshape(intrinsics::logits(), [vocab]);
+    let raw = k.logprobs.map(|_| logits.clone());
     if let Some((counts, present)) = histogram {
         let zero = broadcast(0.0f32, [vocab]);
         let seen_out = gt(counts, &zero);
@@ -177,10 +235,18 @@ fn sample(
         Some(temperature) => {
             let scaled = &logits / temperature;
             let mut keep: Option<Tensor> = None;
-            if k.top_k.is_some() || k.top_p.is_some() {
+            if k.top_k.is_some() || k.top_p.is_some() || k.min_p.is_some() {
                 let probs = softmax(&scaled);
+                if let Some(min_p) = &k.min_p {
+                    let floor = reduce_max(&probs) * min_p;
+                    keep = Some(ge(&probs, broadcast(&floor, [vocab])));
+                }
                 if let Some(top_k) = &k.top_k {
-                    keep = Some(pivot_threshold(&probs, rank_le(top_k)));
+                    let ranked = pivot_threshold(&probs, rank_le(top_k));
+                    keep = Some(match keep {
+                        Some(k) => and(&k, &ranked),
+                        None => ranked,
+                    });
                 }
                 if let Some(top_p) = &k.top_p {
                     let nucleus = pivot_threshold(&probs, cummass_le(top_p));
@@ -198,7 +264,75 @@ fn sample(
         }
     };
     let next = histogram.map(|(counts, _)| scatter_add(counts, &token, 1.0f32));
-    (token, next)
+    let landed = raw.zip(k.logprobs).map(|(raw, top)| {
+        let lp = log_softmax(&raw);
+        let chosen = reshape(scalar_gather(&lp, reshape(&token, [1])), [1]);
+        if top == 0 {
+            return Landed {
+                logprobs: chosen,
+                ids: None,
+            };
+        }
+        let (values, ids) = top_k(&lp, top);
+        Landed {
+            logprobs: concat_f32(&chosen, &values, top),
+            ids: Some(cast(&ids, dtype::i32)),
+        }
+    });
+    (token, next, landed)
+}
+
+/// `[1]` and `[n]` f32 rows as one `[1 + n]` row.
+fn concat_f32(head: &Tensor, tail: &Tensor, n: u32) -> Tensor {
+    let at = iota(n + 1);
+    let first = eq(&at, broadcast(0u32, [n + 1]));
+    let shifted = gather(tail, select(&first, broadcast(0u32, [n + 1]), &at - 1u32));
+    select(&first, broadcast(reshape(head, []), [n + 1]), &shifted)
+}
+
+/// The host's read of a step's landed logprobs.
+fn logprob_of(values: &[f32], ids: &[i32]) -> Logprob {
+    Logprob {
+        logprob: values.first().copied().unwrap_or(f32::NEG_INFINITY),
+        top: ids
+            .iter()
+            .zip(values.iter().skip(1))
+            .map(|(&id, &lp)| (id as u32, lp))
+            .collect(),
+    }
+}
+
+/// The channels a pass lands its logprobs in, where asked.
+fn logprob_channels(
+    logprobs: Option<u32>,
+    tag: &str,
+    capacity: u32,
+) -> Option<(Channel, Option<Channel>)> {
+    logprobs.map(|top| {
+        (
+            Channel::new([1 + top], dtype::f32)
+                .capacity(capacity)
+                .named(&format!("lp{tag}")),
+            (top > 0).then(|| {
+                Channel::new([top], dtype::i32)
+                    .capacity(capacity)
+                    .named(&format!("lp_ids{tag}"))
+            }),
+        )
+    })
+}
+
+/// A step's logprobs off the host side of its channels.
+async fn take_logprob(channels: &Option<(Channel, Option<Channel>)>) -> Result<Option<Logprob>> {
+    let Some((values, ids)) = channels else {
+        return Ok(None);
+    };
+    let values = values.take_host::<Vec<f32>>().await?;
+    let ids = match ids {
+        Some(ids) => ids.take_host::<Vec<i32>>().await?,
+        None => Vec::new(),
+    };
+    Ok(Some(logprob_of(&values, &ids)))
 }
 
 /// Generate up to `max_tokens` after `prompt`; each picture's span is
@@ -215,7 +349,7 @@ pub async fn generate(
     sampling: Sampling,
     max_tokens: usize,
     matcher: Option<&Matcher>,
-    on_token: &mut dyn FnMut(u32) -> ControlFlow<()>,
+    on_token: &mut dyn FnMut(u32, Option<Logprob>) -> ControlFlow<()>,
 ) -> Result<(usize, usize)> {
     sampling.validate()?;
     let images = &prompt.images;
@@ -228,6 +362,7 @@ pub async fn generate(
         && sampling.temperature == 0.0
         && !sampling.penalized()
         && matcher.is_none()
+        && sampling.logprobs.is_none()
         && !prompt.is_empty()
         && images.is_empty()
         // Beside other requests the run-ahead decode below batches with
@@ -237,7 +372,10 @@ pub async fn generate(
         && draft.proposals_from <= 1
         && (2..=16).contains(&draft.rows)
     {
-        return crate::speculative::generate(prompt, ends, max_tokens, draft, on_token).await;
+        return crate::speculative::generate(prompt, ends, max_tokens, draft, &mut |t| {
+            on_token(t, None)
+        })
+        .await;
     }
     if model::pass_kind() == model::ForwardKind::Diffusion {
         return Err(
@@ -286,6 +424,7 @@ pub async fn generate(
 
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let mut g0 = 0i32;
+    let mut lp0 = None;
     for (k, &(base, end)) in spans.iter().enumerate() {
         let len = end - base;
         let lag: u32 = runs.iter().filter(|r| r.1 <= base).map(|r| r.2).sum();
@@ -304,6 +443,8 @@ pub async fn generate(
         });
         let mask = matcher.map(|_| Channel::new([vocab], dtype::bool).named("mask_p"));
         let g0_ch = Channel::new([1], dtype::i32).named("g0");
+        let lp_ch = logprob_channels(sampling.logprobs, "_p", 1);
+        let lp_dev = lp_ch;
         let knobs = KnobChannels::new(&sampling, "_p");
 
         let fwd = ForwardPass::new();
@@ -322,7 +463,7 @@ pub async fn generate(
             let r = rng.take();
             let taken = hist.map(|(c, p)| (c.take(), p.take()));
             let m = mask.map(|m| m.take());
-            let (token, _) = sample(
+            let (token, _, landed) = sample(
                 vocab,
                 &knobs.read(),
                 &r,
@@ -330,6 +471,12 @@ pub async fn generate(
                 m.as_ref(),
             );
             g0_ch.put(reshape(token, [1]));
+            if let (Some(landed), Some((values, ids))) = (landed, lp_dev) {
+                values.put(&landed.logprobs);
+                if let (Some(landed), Some(ids)) = (landed.ids, ids) {
+                    ids.put(&landed);
+                }
+            }
         });
         if let (Some(m), Some(matcher)) = (mask, matcher) {
             m.put(unpack_mask(&matcher.mask(), vocab));
@@ -342,6 +489,7 @@ pub async fn generate(
             .take_host::<i32>()
             .await
             .with_context(|| format!("prefill drain @{base}"))?;
+        lp0 = take_logprob(&lp_ch).await?;
     }
     let cached = ws.cached_tokens();
 
@@ -351,7 +499,7 @@ pub async fn generate(
             .accept_tokens(&[g0 as u32])
             .context("advance grammar")?;
     }
-    if on_token(g0 as u32).is_break()
+    if on_token(g0 as u32, lp0).is_break()
         || max_tokens == 1
         || matcher.is_some_and(|m| m.is_terminated())
     {
@@ -371,6 +519,8 @@ pub async fn generate(
         .named("out");
     let rng = Channel::from([sampling.seed ^ 0x9e37, 1u32]).named("rng");
     let knobs = KnobChannels::new(&sampling, "");
+    let lp_ch = logprob_channels(sampling.logprobs, "", channel_capacity() as u32);
+    let lp_dev = lp_ch;
     let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
     let hist = penalized.then(|| {
         let mut counts0 = vec![0.0f32; vocab as usize];
@@ -401,7 +551,7 @@ pub async fn generate(
         let m = mask.map(|m| m.take());
         let k = knobs.read();
 
-        let (token, counts_next) = sample(
+        let (token, counts_next, landed) = sample(
             vocab,
             &k,
             &r,
@@ -409,6 +559,12 @@ pub async fn generate(
             m.as_ref(),
         );
         let token = reshape(token, [1]);
+        if let (Some(landed), Some((values, ids))) = (landed, lp_dev) {
+            values.put(&landed.logprobs);
+            if let (Some(landed), Some(ids)) = (landed.ids, ids) {
+                ids.put(&landed);
+            }
+        }
         let r_next = &r + iota(2);
 
         tok_in.put(&token);
@@ -435,9 +591,10 @@ pub async fn generate(
                 fired += 1;
                 let t = out.take_host::<Vec<i32>>().await?;
                 let token = *t.first().unwrap_or(&0) as u32;
+                let lp = take_logprob(&lp_ch).await?;
                 sampled += 1;
                 matcher.accept_tokens(&[token]).context("advance grammar")?;
-                if on_token(token).is_break() || matcher.is_terminated() {
+                if on_token(token, lp).is_break() || matcher.is_terminated() {
                     break;
                 }
             }
@@ -446,8 +603,9 @@ pub async fn generate(
             run_ahead(&pipe, &fwd, budget, async || {
                 let t = out.take_host::<Vec<i32>>().await?;
                 let token = *t.first().unwrap_or(&0) as u32;
+                let lp = take_logprob(&lp_ch).await?;
                 sampled += 1;
-                Ok(on_token(token))
+                Ok(on_token(token, lp))
             })
             .await?;
         }
