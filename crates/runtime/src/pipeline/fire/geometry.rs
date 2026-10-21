@@ -58,12 +58,18 @@ pub fn classify_decode_envelope_why(
         })
     };
     let loop_carried = puts_channel(token_channel);
+    // No host writes it, no seed fills it and this pass does not put it:
+    // another pass of the frame puts it on the device, and this one embeds
+    // what that one picked without the host reading it in between.
+    let queued = !loop_carried && taint.device_decided.contains(&(token_channel as u32));
     let token = container
         .channels
         .get(token_channel)
         .ok_or_else(|| "decode envelope token channel is out of range".to_string())?;
-    if !token.seeded && !loop_carried {
-        return decline("the token channel is neither seeded nor loop-carried".to_string());
+    if !token.seeded && !loop_carried && !queued {
+        return decline(
+            "the token channel is neither seeded, loop-carried nor put by another pass".to_string(),
+        );
     }
     let token_dims = token.shape.dims();
     if token_dims.len() != 1
@@ -922,6 +928,38 @@ mod tests {
         a_decode_whose_slots_the_host_states_keeps_the_envelope_path();
         a_decode_stating_no_slots_is_not_pooled();
         a_decode_another_pass_lays_out_is_pooled_device_geometry();
+        a_verify_embedding_another_passes_picks_rides_the_envelope();
+    }
+
+    fn a_verify_embedding_another_passes_picks_rides_the_envelope() {
+        // A speculative verify: its tokens are what the draft ahead of it in
+        // the frame picked, and where its rows land is the host's.
+        let mut container = decode(8, &[(Port::Slots, Shape::vector(8), Dtype::U32)]);
+        container.stages[0].ops.clear();
+        container.channels[0].seeded = false;
+        let queued = GeometryTaint {
+            device_decided: BTreeSet::from([0]),
+            device_dependent_ports: BTreeSet::from([Port::EmbedTokens]),
+        };
+        assert_eq!(
+            classify_decode_envelope(&container, &queued),
+            Ok(Some(PortMask::of(&[Port::EmbedTokens]))),
+            "tokens another pass puts are the device's, slots stay the host's"
+        );
+        let mut why = String::new();
+        assert_eq!(
+            classify_decode_envelope_why(&container, &taint(&[Port::EmbedTokens]), &mut why),
+            Ok(None),
+            "a channel no pass puts carries nothing to embed"
+        );
+        assert!(why.contains("put by another pass"), "{why}");
+        let mut slots_too = queued.clone();
+        slots_too.device_dependent_ports.insert(Port::Slots);
+        assert_eq!(
+            classify_decode_envelope(&container, &slots_too),
+            Ok(None),
+            "where rows land, decided on the device, is device geometry's"
+        );
     }
 
     fn a_decode_another_pass_lays_out_is_pooled_device_geometry() {

@@ -9,6 +9,7 @@ use eta_ir::types::name_or_unknown;
 use crate::error::{Fault, Result};
 
 use super::launch::{ChannelShape, Cursor, Rings};
+use crate::device::Buffer;
 
 static RESOLVED: AtomicU64 = AtomicU64::new(0);
 
@@ -17,17 +18,66 @@ pub fn resolved() -> u64 {
     RESOLVED.load(Ordering::Relaxed)
 }
 
+/// The tokens of a fire a pass ahead of it puts: `bytes` at `at` of `slab`,
+/// the cell that pass writes, copied in on the device once the queue has run it.
+#[derive(Clone, Debug)]
+pub struct Fed {
+    pub slab: Buffer,
+    pub at: u64,
+    pub bytes: u64,
+}
+
+/// `unlanded[channel]` marks a channel whose next cell an airborne pass owes:
+/// its tokens are fed on the device, and any other port read off it is
+/// refused, since the host would read the cell before it is written.
 pub fn resolve(
     plan: &ExecPlan,
     class: GeometryClass,
     rings: &Rings,
     cursors: &[Cursor],
     shapes: &[ChannelShape],
-) -> Result<Envelope> {
+    unlanded: &[bool],
+) -> Result<(Envelope, Option<Fed>)> {
     let mut out = Envelope::default();
+    let mut fed = None;
     RESOLVED.fetch_add(1, Ordering::Relaxed);
     for binding in &plan.package.ports {
         if !resolves(class, binding.port) {
+            continue;
+        }
+        if !binding.is_const && unlanded.get(binding.channel as usize).copied() == Some(true) {
+            if binding.port != Port::EmbedTokens {
+                return Err(Fault::program(
+                    "program::ports",
+                    format!(
+                        "port {}'s channel {} is put by a pass still airborne, and only \
+                         `embed_tokens` is fed on the device; the host would read this \
+                         port before it is written",
+                        binding.port.name(),
+                        binding.channel
+                    ),
+                ));
+            }
+            let (cursor, shape) = cell_of(binding.port, binding.channel, cursors, shapes)?;
+            if !matches!(shape.dtype, Dtype::I32 | Dtype::U32) {
+                return Err(Fault::program(
+                    "program::ports",
+                    format!(
+                        "port {}'s channel {} holds {}, and a token is an index",
+                        binding.port.name(),
+                        binding.channel,
+                        name_or_unknown(shape.dtype)
+                    ),
+                ));
+            }
+            let channel = binding.channel as usize;
+            fed = Some(Fed {
+                slab: rings.slab(channel)?.clone(),
+                at: rings.cell_offset(channel, cursor.head)?,
+                bytes: shape.cell_bytes() as u64,
+            });
+            // The rows are the cell's; their ids are the device's.
+            out.tokens = Some(vec![0; shape.numel]);
             continue;
         }
         if binding.port == Port::AttnMask {
@@ -72,7 +122,7 @@ pub fn resolve(
         };
         *slot = Some(value);
     }
-    Ok(out)
+    Ok((out, fed))
 }
 
 fn read_cell(

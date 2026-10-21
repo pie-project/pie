@@ -19,6 +19,7 @@ use crate::error::{Fault, Result};
 
 pub use compile::{Cache, Compiled, Module, Region, Stage, Target};
 pub use launch::{ChannelShape, Cursor, Prepared, Rings};
+pub use ports::Fed;
 pub use session::{Blocked, Fired, Launched, Session, seeds_of};
 pub use shared::{MAX_ATTACHMENTS, SharedRing};
 
@@ -244,6 +245,65 @@ impl Plane {
         cohort
     }
 
+    /// Whether staging `instances` waits for an airborne pass of `held`. It
+    /// does when `held` is one of them, or shares a ring with one that the
+    /// host reads at staging; it does not for a ring an instance's embedded
+    /// tokens alone come off, under a class that resolves them: the device
+    /// copies that cell in behind the pass that puts it, the queue keeping
+    /// the two in order. `feeds` are channel ids the fire's lanes copy from
+    /// at their committed cell, and those it waits for.
+    #[must_use]
+    pub fn waits_for(&self, instances: &[u64], held: u64, feeds: &[u64]) -> bool {
+        if instances.contains(&held) {
+            return true;
+        }
+        let Some(theirs) = self.instances.get(&held) else {
+            return false;
+        };
+        instances
+            .iter()
+            .filter_map(|id| self.instances.get(id))
+            .any(|bound| {
+                let tokens = self.token_ring(bound);
+                bound
+                    .shared
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(dense, ring)| ring.as_ref().map(|ring| (dense, ring)))
+                    .filter(|(_, mine)| {
+                        theirs
+                            .shared
+                            .iter()
+                            .flatten()
+                            .any(|ring| Arc::ptr_eq(mine, ring))
+                    })
+                    .any(|(dense, _)| {
+                        tokens != Some(dense)
+                            || bound.ids.get(dense).is_some_and(|id| feeds.contains(id))
+                    })
+            })
+    }
+
+    /// The channel an instance embeds its tokens from, when its class has
+    /// the device resolve them and no other port it resolves reads that
+    /// channel.
+    fn token_ring(&self, bound: &Bound) -> Option<usize> {
+        let program = self.programs.get(&bound.program_id)?;
+        let ports = &program.plan.package.ports;
+        let tokens = ports
+            .iter()
+            .find(|binding| binding.port == eta_ir::registry::Port::EmbedTokens)
+            .filter(|binding| {
+                !binding.is_const && engine::ports::resolves(bound.geometry, binding.port)
+            })?;
+        let alone = ports.iter().all(|binding| {
+            binding.port == eta_ir::registry::Port::EmbedTokens
+                || binding.is_const
+                || binding.channel != tokens.channel
+        });
+        alone.then_some(tokens.channel as usize)
+    }
+
     fn seats_for(&self, plan: &ExecPlan, channels: &[u64]) -> Result<Vec<Option<Arc<SharedRing>>>> {
         let mut adopted: Vec<Option<Arc<SharedRing>>> =
             Vec::with_capacity(plan.package.channels.len());
@@ -261,7 +321,7 @@ impl Plane {
         Ok(adopted)
     }
 
-    pub fn envelope(&self, id: u64) -> Result<Option<Envelope>> {
+    pub fn envelope(&self, id: u64) -> Result<Option<(Envelope, Option<Fed>)>> {
         let bound = self
             .instances
             .get(&id)

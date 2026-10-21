@@ -430,6 +430,12 @@ impl Inputs {
         })
     }
 
+    /// The store and offset of the fire's token row, one i32 a row.
+    #[must_use]
+    pub fn token_seat(&self) -> (&Buffer, u64) {
+        (&self.store, self.tokens)
+    }
+
     #[must_use]
     pub fn self_cond_seat(&self) -> Option<(&Buffer, u64, u64)> {
         self.self_cond

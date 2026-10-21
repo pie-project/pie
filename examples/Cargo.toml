@@ -5,6 +5,7 @@ members = [
     "attention-sink",
     "beam-search",
     "cacheback-speculative-decoding",
+    "chain-probe",
     "chat-completion", "image-captioning",
     "consensus-decoding",
     "constrained-speculative-decoding",

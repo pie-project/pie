@@ -18,6 +18,11 @@ pub struct SharedRing {
 struct Counters {
     head: AtomicU64,
     tail: AtomicU64,
+    /// Takes and puts of passes encoded behind the committed cursors and not
+    /// yet harvested: the queue runs them before anything encoded after, so a
+    /// pass staged now addresses the ring as they will leave it.
+    owed_takes: AtomicU64,
+    owed_puts: AtomicU64,
     attachments: AtomicU32,
     seeded: AtomicU32,
 }
@@ -81,6 +86,23 @@ impl SharedRing {
         self.counters.bump_tail();
     }
 
+    /// The cursor once every airborne pass has committed: what a pass
+    /// encoded now reads and writes.
+    #[must_use]
+    pub fn projected(&self) -> Cursor {
+        self.counters.projected()
+    }
+
+    /// An airborne pass will take (`take`) and put (`put`) one cell here.
+    pub fn owe(&self, take: bool, put: bool) {
+        self.counters.owe(take, put);
+    }
+
+    /// What [`SharedRing::owe`] promised has committed or will not.
+    pub fn repay(&self, take: bool, put: bool) {
+        self.counters.repay(take, put);
+    }
+
     pub fn attach(&self) -> Result<u32> {
         self.counters.attach()
     }
@@ -104,6 +126,37 @@ impl Counters {
         Cursor {
             head: self.head.load(Ordering::Acquire),
             tail: self.tail.load(Ordering::Acquire),
+        }
+    }
+
+    fn projected(&self) -> Cursor {
+        let Cursor { head, tail } = self.cursor();
+        Cursor {
+            head: head + self.owed_takes.load(Ordering::Acquire),
+            tail: tail + self.owed_puts.load(Ordering::Acquire),
+        }
+    }
+
+    fn owe(&self, take: bool, put: bool) {
+        if take {
+            self.owed_takes.fetch_add(1, Ordering::AcqRel);
+        }
+        if put {
+            self.owed_puts.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn repay(&self, take: bool, put: bool) {
+        let less = |owed: &AtomicU64| {
+            let _ = owed.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(1))
+            });
+        };
+        if take {
+            less(&self.owed_takes);
+        }
+        if put {
+            less(&self.owed_puts);
         }
     }
 
@@ -154,6 +207,33 @@ mod tests {
 
     fn ring() -> Counters {
         Counters::default()
+    }
+
+    #[test]
+    fn an_airborne_pass_moves_the_projected_cursor_until_it_commits() {
+        let ring = ring();
+        ring.owe(false, true);
+        assert_eq!(ring.cursor().tail, 0, "nothing has committed");
+        assert_eq!(
+            ring.projected().tail,
+            1,
+            "a pass staged now reads past the owed put"
+        );
+        ring.owe(true, false);
+        assert_eq!(ring.projected().head, 1);
+        // The put commits and its debt is repaid: the projection stands still.
+        ring.bump_tail();
+        ring.repay(false, true);
+        assert_eq!((ring.cursor().tail, ring.projected().tail), (1, 1));
+        // A take that never commits is forgiven, and the projection falls back.
+        ring.repay(true, false);
+        assert_eq!(ring.projected().head, 0);
+        ring.repay(true, false);
+        assert_eq!(
+            ring.projected().head,
+            0,
+            "a repayment never runs below nothing owed"
+        );
     }
 
     #[test]

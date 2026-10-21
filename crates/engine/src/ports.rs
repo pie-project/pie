@@ -103,6 +103,12 @@ impl LanePorts<'_> {
         u32::try_from(self.rows.end.saturating_sub(self.rows.start)).unwrap_or(u32::MAX)
     }
 
+    /// The lane's rows inside its instance's flat vectors.
+    #[must_use]
+    pub fn span(&self) -> std::ops::Range<usize> {
+        self.rows.clone()
+    }
+
     pub fn tokens_for(&self, rows: usize) -> Result<&[u32]> {
         let source = self.source;
         let Some(tokens) = &self.envelope.tokens else {

@@ -244,6 +244,17 @@ struct PortFeedPlan {
     lane: u32,
 }
 
+/// A lane's tokens copied on the device out of the cell a pass ahead of it
+/// in the queue puts: `bytes` from `at` of `slab` to `into` bytes into the
+/// fire's token row.
+#[derive(Debug, Clone)]
+struct TokenFeed {
+    slab: Buffer,
+    at: u64,
+    into: u64,
+    bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Attached {
     pub lane: u32,
@@ -2309,7 +2320,28 @@ impl Shell {
         Ok(())
     }
 
+    /// Waits for every airborne step of `instances` and of the instances
+    /// sharing a ring with them: what the host reads or writes of a ring
+    /// after this is committed.
     fn fence_instances(&mut self, instances: &[u64]) -> Result<()> {
+        self.fence_where(instances, |_, _| true)
+    }
+
+    /// Waits for the airborne steps `instances` cannot be staged behind:
+    /// their own, and those of instances sharing a ring the host reads at
+    /// staging (see [`crate::program::Plane::waits_for`]). `feeds` are the
+    /// channels the fire's lanes copy from.
+    fn fence_staging(&mut self, instances: &[u64], feeds: &[u64]) -> Result<()> {
+        self.fence_where(instances, |programs, held| {
+            programs.waits_for(instances, held, feeds)
+        })
+    }
+
+    fn fence_where(
+        &mut self,
+        instances: &[u64],
+        waits: impl Fn(&crate::program::Plane, u64) -> bool,
+    ) -> Result<()> {
         if instances.is_empty() {
             return Ok(());
         }
@@ -2319,10 +2351,10 @@ impl Shell {
             .inflight
             .iter()
             .find(|flight| {
-                flight
-                    .attached
-                    .iter()
-                    .any(|held| instances.contains(held) || cohort.contains(held))
+                flight.attached.iter().any(|held| {
+                    instances.contains(held)
+                        || (cohort.contains(held) && waits(&self.programs, *held))
+                })
             })
             .map(|flight| flight.seq)
         {
@@ -2337,7 +2369,7 @@ impl Shell {
         }
 
         let instances: Vec<u64> = attachments.iter().map(|a| a.instance).collect();
-        self.fence_instances(&instances)?;
+        self.fence_staging(&instances, &lane_feeds(lanes))?;
 
         for (index, attached) in attachments.iter().enumerate() {
             if attached.lane as usize >= lanes.len() {
@@ -2520,12 +2552,13 @@ impl Shell {
         })?;
 
         let mut resolved: Vec<engine::ports::Envelope> = Vec::new();
+        let mut fed_of: Vec<Option<crate::program::Fed>> = Vec::new();
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
         if !attachments.is_empty() {
             let instances: Vec<u64> = attachments.iter().map(|a| a.instance).collect();
-            self.fence_instances(&instances)?;
+            self.fence_staging(&instances, &lane_feeds(lanes))?;
             for attached in attachments {
-                let Some(envelope) = self.programs.envelope(attached.instance)? else {
+                let Some((envelope, fed)) = self.programs.envelope(attached.instance)? else {
                     continue;
                 };
                 let first = attached.lane as usize;
@@ -2560,6 +2593,7 @@ impl Shell {
                     envelope_of[first + lane] = Some((held, lane));
                 }
                 resolved.push(envelope);
+                fed_of.push(fed);
             }
         }
 
@@ -2801,6 +2835,7 @@ impl Shell {
         }
         let mut beginning: Vec<u32> = Vec::new();
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
+        let mut token_feeds: Vec<TokenFeed> = Vec::new();
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
@@ -3015,6 +3050,30 @@ impl Shell {
                         ));
                     }
                     ports.check_extent(have.saturating_add(row.rows))?;
+                    if let Some((held, _)) = envelope_of[source]
+                        && let Some(fed) = fed_of.get(held).and_then(Option::as_ref)
+                    {
+                        const ID: u64 = std::mem::size_of::<i32>() as u64;
+                        let bytes = rows_here as u64 * ID;
+                        let at = fed.at + ports.span().start as u64 * ID;
+                        if at + bytes > fed.at + fed.bytes {
+                            return Err(Fault::program(
+                                "serve::prepare",
+                                format!(
+                                    "lane {source} embeds {rows_here} token(s) from row {} of \
+                                     a cell of {} byte(s) a pass ahead of it puts",
+                                    ports.span().start,
+                                    fed.bytes
+                                ),
+                            ));
+                        }
+                        token_feeds.push(TokenFeed {
+                            slab: fed.slab.clone(),
+                            at,
+                            into: u64::from(row.row_offset) * ID,
+                            bytes,
+                        });
+                    }
                     for &token in ports.tokens_for(rows_here)? {
                         tokens.push(token as i32);
                     }
@@ -3060,6 +3119,9 @@ impl Shell {
             }
         }
 
+        if !token_feeds.is_empty() {
+            fire_trace(|| format!("tokens fed on the device lanes={}", token_feeds.len()));
+        }
         let page_size = u64::from(self.pools.paging().page_size).max(1);
         let paging = self.pools.paging();
         let written = writes
@@ -3725,6 +3787,7 @@ impl Shell {
 
         Ok(Prepared {
             lanes,
+            token_feeds,
             self_cond_feeds,
             port_feeds,
             merge_lands,
@@ -3744,6 +3807,27 @@ impl Shell {
             bindings,
             demand,
         })
+    }
+
+    /// Copies in the tokens a pass ahead of this one in the queue put, over
+    /// the ids the host wrote for those rows.
+    fn feed_tokens(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
+        if p.token_feeds.is_empty() {
+            return Ok(());
+        }
+        let (store, row) = self.inputs[p.arm].token_seat();
+        for feed in &p.token_feeds {
+            frame.copy(
+                feed.slab.slab(),
+                feed.at,
+                store.slab(),
+                row + feed.into,
+                feed.bytes,
+            )?;
+        }
+        #[cfg(target_vendor = "apple")]
+        frame.next_pass()?;
+        Ok(())
     }
 
     fn feed_self_cond(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
@@ -3942,6 +4026,7 @@ impl Shell {
                 #[cfg(target_vendor = "apple")]
                 frame.next_pass()?;
             }
+            self.feed_tokens(frame, p)?;
             self.feed_self_cond(frame, p)?;
             self.feed_ports(frame, p)?;
             self.land_merges(frame, p)?;
@@ -4052,6 +4137,7 @@ impl Shell {
 
         let place = At::new();
         let mut frame = self.device.frame()?;
+        self.feed_tokens(&mut frame, p)?;
         self.feed_self_cond(&mut frame, p)?;
         let sink = Encoded::Live(Sink::streaming(
             &self.device,
@@ -4285,6 +4371,7 @@ pub struct Clips<'a> {
 
 pub struct Prepared<'a> {
     lanes: &'a [Seated<'a>],
+    token_feeds: Vec<TokenFeed>,
     self_cond_feeds: Vec<(u64, u64, u64, u64)>,
     port_feeds: Vec<PortFeedPlan>,
     merge_lands: Vec<MergeLand>,
@@ -4742,4 +4829,21 @@ fn refused(fired: &crate::Fired, instance: u64) -> Fault {
 
 fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+/// The channels a fire's lanes copy from at their committed cell: their port
+/// and self-conditioning feeds.
+fn lane_feeds(lanes: &[Seated<'_>]) -> Vec<u64> {
+    lanes
+        .iter()
+        .flat_map(|seated| {
+            seated.ports.iter().map(|feed| feed.channel).chain(
+                seated
+                    .self_cond
+                    .and_then(|sc| sc.channels)
+                    .into_iter()
+                    .flat_map(|(rows, weights)| [rows, weights]),
+            )
+        })
+        .collect()
 }

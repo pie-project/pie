@@ -71,6 +71,11 @@ pub struct Session {
     poisoned: bool,
     fires: u64,
     airborne: Option<Vec<usize>>,
+    /// Per shared ring the airborne pass takes or puts, what it owes it.
+    owing: Vec<(usize, bool, bool)>,
+    /// Shared rings whose cell the airborne pass reads before the pass that
+    /// puts it has committed.
+    relied: Vec<usize>,
 }
 
 impl Session {
@@ -118,6 +123,8 @@ impl Session {
             poisoned: false,
             fires: 0,
             airborne: None,
+            owing: Vec::new(),
+            relied: Vec::new(),
         };
         for (channel, wire) in seeds {
             if let Some(ring) = session.rings.shared(*channel as usize)
@@ -166,6 +173,30 @@ impl Session {
             }
         }
         cursors
+    }
+
+    /// The cursors once every airborne pass has committed: a shared ring's
+    /// owed takes and puts counted in, since the queue runs those passes
+    /// before anything encoded now.
+    #[must_use]
+    pub fn cursors_projected(&self) -> Vec<Cursor> {
+        let mut cursors = self.cursors.clone();
+        for (channel, cursor) in cursors.iter_mut().enumerate() {
+            if let Some(ring) = self.rings.shared(channel) {
+                *cursor = ring.projected();
+            }
+        }
+        cursors
+    }
+
+    /// Whether the cell a take of `channel` reads now has been committed,
+    /// rather than owed by a pass still airborne.
+    #[must_use]
+    pub fn landed(&self, channel: u32) -> bool {
+        let Some(ring) = self.rings.shared(channel as usize) else {
+            return true;
+        };
+        ring.projected().head < ring.cursor().tail
     }
 
     #[must_use]
@@ -247,8 +278,19 @@ impl Session {
         self.rings.read_cell(channel as usize, sequence)
     }
 
-    pub fn envelope(&self, plan: &ExecPlan, class: GeometryClass) -> Result<Envelope> {
-        ports::resolve(plan, class, &self.rings, &self.cursors_now(), &self.shapes)
+    /// The ports the host resolves for the next pass, and where its tokens
+    /// are when a pass ahead of it has yet to land them: the device copies
+    /// that cell in once the queue reaches it.
+    pub fn envelope(
+        &self,
+        plan: &ExecPlan,
+        class: GeometryClass,
+    ) -> Result<(Envelope, Option<ports::Fed>)> {
+        let cursors = self.cursors_projected();
+        let unlanded: Vec<bool> = (0..self.shapes.len() as u32)
+            .map(|channel| !self.landed(channel))
+            .collect();
+        ports::resolve(plan, class, &self.rings, &cursors, &self.shapes, &unlanded)
     }
 
     pub fn bind_intrinsic(
@@ -281,7 +323,8 @@ impl Session {
                  read from, and both fires would report the second's verdict",
             ));
         }
-        if let Some(refused) = self.gate(compiled, plan)? {
+        let now = self.cursors_now();
+        if let Some(refused) = self.gate(compiled, plan, &now)? {
             return Ok(refused);
         }
 
@@ -316,11 +359,11 @@ impl Session {
                  and the first's commit would be lost",
             ));
         }
-        if let Some(refused) = self.gate(compiled, plan)? {
+        let cursors = self.cursors_projected();
+        if let Some(refused) = self.gate(compiled, plan, &cursors)? {
             return Ok(Launched::Refused(refused));
         }
 
-        let cursors = self.cursors_now();
         let mut launched = Vec::with_capacity(compiled.stages.len());
         for (index, stage) in compiled.stages.iter().enumerate() {
             let Some(prepared) = self.prepared.get_mut(index).and_then(Option::as_mut) else {
@@ -334,6 +377,7 @@ impl Session {
         }
 
         self.airborne = Some(launched);
+        self.owe(plan, &cursors);
         Ok(Launched::Airborne)
     }
 
@@ -351,10 +395,10 @@ impl Session {
                  and the first's commit would be lost",
             ));
         }
-        if let Some(refused) = self.gate(compiled, plan)? {
+        let cursors = self.cursors_projected();
+        if let Some(refused) = self.gate(compiled, plan, &cursors)? {
             return Ok(Some(refused));
         }
-        let cursors = self.cursors_now();
         let mut launched = Vec::with_capacity(compiled.stages.len());
         for (index, stage) in compiled.stages.iter().enumerate() {
             let Some(prepared) = self.prepared.get_mut(index).and_then(Option::as_mut) else {
@@ -367,7 +411,38 @@ impl Session {
             launched.push(index);
         }
         self.airborne = Some(launched);
+        self.owe(plan, &cursors);
         Ok(None)
+    }
+
+    /// Owes each shared ring what the pass just staged will take and put
+    /// there, so a pass staged behind it reads the ring as it will be left;
+    /// and notes the cells it reads that a pass ahead of it has yet to land.
+    fn owe(&mut self, plan: &ExecPlan, cursors: &[Cursor]) {
+        self.owing.clear();
+        self.relied.clear();
+        for (channel, cursor) in cursors.iter().enumerate() {
+            let Some(ring) = self.rings.shared(channel) else {
+                continue;
+            };
+            let take = plan.takes_channel(channel as u32) && cursor.tail > cursor.head;
+            let put = plan.puts_channel(channel as u32);
+            if take && cursor.head >= ring.cursor().tail {
+                self.relied.push(channel);
+            }
+            if take || put {
+                ring.owe(take, put);
+                self.owing.push((channel, take, put));
+            }
+        }
+    }
+
+    fn repay(&mut self) {
+        for (channel, take, put) in std::mem::take(&mut self.owing) {
+            if let Some(ring) = self.rings.shared(channel) {
+                ring.repay(take, put);
+            }
+        }
     }
 
     pub fn prepared_mut(&mut self, stage: usize) -> Option<&mut Prepared> {
@@ -378,11 +453,16 @@ impl Session {
         let Some(launched) = self.airborne.take() else {
             return Ok(Fired::Committed);
         };
-        self.verdict(plan, &launched)
+        self.repay();
+        let fired = self.verdict(plan, &launched);
+        self.relied.clear();
+        fired
     }
 
     pub fn abandon_launched(&mut self) {
         self.airborne = None;
+        self.repay();
+        self.relied.clear();
     }
 
     #[must_use]
@@ -390,7 +470,12 @@ impl Session {
         self.airborne.is_some()
     }
 
-    fn gate(&mut self, compiled: &Compiled, plan: &ExecPlan) -> Result<Option<Fired>> {
+    fn gate(
+        &mut self,
+        compiled: &Compiled,
+        plan: &ExecPlan,
+        cursors: &[Cursor],
+    ) -> Result<Option<Fired>> {
         if self.poisoned {
             return Ok(Some(Fired::Faulted("instance is poisoned".to_string())));
         }
@@ -439,8 +524,8 @@ impl Session {
             ));
         }
 
-        if let Some(blocked) = self.blocked_channel(plan) {
-            return Ok(Some(Fired::Blocked(blocked)));
+        if let Some(blocked) = self.readiness_at(plan, cursors) {
+            return Ok(Some(Fired::Blocked(blocked.channel)));
         }
 
         Ok(None)
@@ -488,15 +573,23 @@ impl Session {
         self.readiness(plan).map(|blocked| blocked.channel)
     }
 
+    /// Whether the next pass staged can fire, airborne passes counted as
+    /// committed: they run first.
     #[must_use]
     pub fn readiness(&self, plan: &ExecPlan) -> Option<Blocked> {
+        self.readiness_at(plan, &self.cursors_projected())
+    }
+
+    fn readiness_at(&self, plan: &ExecPlan, cursors: &[Cursor]) -> Option<Blocked> {
         for channel in 0..self.shapes.len() {
             let needs = plan
                 .package
                 .channels
                 .get(channel)
                 .and_then(|declared| declared.readiness);
-            let live = self.depth(channel as u32);
+            let live = cursors
+                .get(channel)
+                .map_or(0, |cursor| cursor.tail.saturating_sub(cursor.head));
             let capacity = u64::from(self.shapes[channel].capacity);
             let ready = match needs {
                 Some(Direction::NeedsFull) => live != 0,
@@ -517,6 +610,15 @@ impl Session {
 
     fn commit(&mut self, plan: &ExecPlan) -> std::result::Result<(), String> {
         let now = self.cursors_now();
+        if let Some(&channel) = self.relied.iter().find(|&&channel| {
+            now.get(channel)
+                .is_none_or(|cursor| cursor.tail == cursor.head)
+        }) {
+            return Err(format!(
+                "channel {channel}: this pass read a cell a pass ahead of it was to put, and \
+                 that pass never committed it"
+            ));
+        }
         let mut next = now.clone();
         let mut bumps: Vec<(usize, bool, bool)> = Vec::new();
         for (channel, cursor) in now.iter().enumerate() {
