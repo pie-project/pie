@@ -21,7 +21,10 @@ Each of its weights is a dtype or a precision: a stored dtype whose products
 quantize their activations, spelled with what they quantize to (`nvfp4a4`,
 NVFP4 codes against NVFP4 activations; `mxfp4a8`, MXFP4 codes against e4m3
 in 1x128 blocks). A weight declared at a precision stores its dtype's planes
-and its products run on CUDA's tcgen05 GEMMs, refused where there are none.
+and its products run on CUDA's tcgen05 GEMMs. Where there are none (Hopper,
+Ampere, sm120), CUDA reads the same planes against bf16 activations: an
+MXFP4 or NVFP4 bank as W4A16, a block-FP8 one as W8A16
+(`crates/engine-cuda/src/dispatch/linear.rs`, `select_a16` and `matmul_a16`).
 
 ## What a model says of its tokens
 
