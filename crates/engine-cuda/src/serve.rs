@@ -264,6 +264,7 @@ impl Shell {
                     .to_string(),
             });
         }
+        self.pools.fence_all_swaps(self.device.stream())?;
         self.pools.copy_kv(self.device.stream(), moves, &[])
     }
 
@@ -380,6 +381,7 @@ impl Shell {
     }
 
     pub fn spill_kv(&mut self, to_disk: bool, device: &[u32], disk: &[u32]) -> Result<()> {
+        self.pools.fence_all_swaps(self.device.stream())?;
         self.pools
             .spill_kv(self.device.stream(), to_disk, device, disk)
     }
@@ -408,8 +410,14 @@ impl Shell {
         host: &[u32],
         windowed: &[(u32, u32)],
     ) -> Result<()> {
-        self.pools
-            .swap_kv(self.device.stream(), to_host, device, host, windowed)
+        self.pools.swap_kv(
+            self.device.stream(),
+            self.device.swap_stream(),
+            to_host,
+            device,
+            host,
+            windowed,
+        )
     }
 
     #[must_use]

@@ -1260,6 +1260,8 @@ impl FrameShell for Shell {
             .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
             .collect();
         self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;
+        self.pools
+            .fence_swaps(self.device.stream(), &kv_ranges, &window_pages)?;
         super::btrace::mark("commit_frame");
 
         let indptr_host = kv::indptr(&seats)?;

@@ -479,6 +479,18 @@ pub struct Pools {
     /// Every declared page and slot is backed ([`Pools::back_whole`]), and
     /// never trimmed since.
     whole: bool,
+    /// The moves to or from the host tier still on the swap stream, each
+    /// with the device pages it holds.
+    swaps: Vec<Swap>,
+}
+
+/// A move between the device and the host tier, on the swap stream: its
+/// paged and windowed device pages, and the event it lands at.
+#[derive(Debug)]
+struct Swap {
+    landed: crate::device::graph::Event,
+    paged: Vec<u32>,
+    windowed: Vec<u32>,
 }
 
 /// The slot file kv is suspended into below host memory, and the pinned
@@ -710,6 +722,7 @@ impl Pools {
             host: None,
             disk: None,
             whole: false,
+            swaps: Vec::new(),
         })
     }
 
@@ -1797,11 +1810,14 @@ impl Pools {
     }
     /// Copies whole kv pages between the device pool and the host pages,
     /// `device[i]` with `host[i]`, and the windowed pages `(device, host)`
-    /// between the windowed rows and theirs, enqueued on `stream` behind the
-    /// fires that wrote them.
+    /// between the windowed rows and theirs: on `swap`, behind what `stream`
+    /// has enqueued (the fires that wrote them), so the fires after run
+    /// beside it; one that holds its pages waits for it
+    /// ([`Pools::fence_swaps`]).
     pub fn swap_kv(
         &mut self,
         stream: *mut core::ffi::c_void,
+        swap: *mut core::ffi::c_void,
         to_host: bool,
         device: &[u32],
         host: &[u32],
@@ -1856,7 +1872,69 @@ impl Pools {
                 base += have * page_bytes;
             }
         }
-        crate::device::copy_batch(stream, to_host, &spans)
+        if spans.is_empty() {
+            return Ok(());
+        }
+        let written = crate::device::graph::Event::new()?;
+        written.record(stream)?;
+        written.wait(swap)?;
+        crate::device::copy_batch(swap, to_host, &spans)?;
+        let landed = crate::device::graph::Event::new()?;
+        landed.record(swap)?;
+        self.swaps.push(Swap {
+            landed,
+            paged: device.to_vec(),
+            windowed: windowed.iter().map(|&(page, _)| page).collect(),
+        });
+        Ok(())
+    }
+
+    /// Orders `stream` behind the moves still landing that hold any of the
+    /// device pages a fire names: its paged runs `(first, count)` and its
+    /// windowed pages.
+    pub fn fence_swaps(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        paged: &[(u64, u64)],
+        windowed: &[u64],
+    ) -> Result<()> {
+        self.prune_swaps()?;
+        for swap in &self.swaps {
+            let holds = swap.paged.iter().any(|&page| {
+                let page = u64::from(page);
+                paged
+                    .iter()
+                    .any(|&(first, count)| first <= page && page < first + count)
+            }) || swap
+                .windowed
+                .iter()
+                .any(|&page| windowed.contains(&u64::from(page)));
+            if holds {
+                swap.landed.wait(stream)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Orders `stream` behind every move still landing: for work that reads
+    /// or writes pages without naming them.
+    pub fn fence_all_swaps(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
+        self.prune_swaps()?;
+        for swap in &self.swaps {
+            swap.landed.wait(stream)?;
+        }
+        Ok(())
+    }
+
+    fn prune_swaps(&mut self) -> Result<()> {
+        let mut kept = Vec::with_capacity(self.swaps.len());
+        for swap in self.swaps.drain(..) {
+            if !swap.landed.done()? {
+                kept.push(swap);
+            }
+        }
+        self.swaps = kept;
+        Ok(())
     }
 
     /// How a host kv slot lays out its pages, rank by rank: each paged plane

@@ -64,6 +64,10 @@ pub struct Context {
     notify: *mut c_void,
     /// Where taps read pages out, behind the layers that wrote them.
     tap: *mut c_void,
+    /// Where kv pages move between the device and the host tier, beside
+    /// the fires: a move waits on the fires that wrote its pages, and a fire
+    /// on the moves that hold its own.
+    swap: *mut c_void,
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     cublas: *mut c_void,
     ctx: Ctx,
@@ -137,9 +141,23 @@ impl Context {
                     });
                 }
 
+                let mut swap: rt::cudaStream_t = core::ptr::null_mut();
+                let status = rt::cudaStreamCreateWithFlags(&raw mut swap, 1);
+                if status != rt::cudaError::cudaSuccess {
+                    let _ = rt::cudaStreamDestroy(tap);
+                    let _ = rt::cudaStreamDestroy(notify);
+                    blas::cublasDestroy_v2(handle);
+                    destroy_stream(ordinal, stream.cast());
+                    return Err(Fault::Device {
+                        call: "cudaStreamCreateWithFlags",
+                        code: status as i32,
+                    });
+                }
+
                 let stream: *mut c_void = stream.cast();
                 let notify: *mut c_void = notify.cast();
                 let tap: *mut c_void = tap.cast();
+                let swap: *mut c_void = swap.cast();
                 let cublas: *mut c_void = handle.cast();
                 let slabs = Slabs::open();
                 slabs.attach(stream);
@@ -186,6 +204,7 @@ impl Context {
                     stream,
                     notify,
                     tap,
+                    swap,
                     cublas,
                     ctx,
                     slabs,
@@ -229,6 +248,11 @@ impl Context {
     #[must_use]
     pub fn tap_stream(&self) -> *mut c_void {
         self.tap
+    }
+
+    #[must_use]
+    pub fn swap_stream(&self) -> *mut c_void {
+        self.swap
     }
 
     pub fn host_fn(&self, work: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
@@ -387,11 +411,15 @@ impl Context {
     pub fn synchronize(&self) -> Result<()> {
         #[cfg(feature = "device")]
         {
-            // SAFETY: both handles are live for this context's lifetime.
+            // SAFETY: the handles are live for this context's lifetime.
             unsafe {
                 check(
                     "cudaStreamSynchronize",
                     crate::device::rt::cudaStreamSynchronize(self.stream.cast()),
+                )?;
+                check(
+                    "cudaStreamSynchronize",
+                    crate::device::rt::cudaStreamSynchronize(self.swap.cast()),
                 )?;
                 check(
                     "cudaStreamSynchronize",
@@ -434,6 +462,9 @@ impl Drop for Context {
                 }
                 if !self.tap.is_null() {
                     let _ = crate::device::rt::cudaStreamDestroy(self.tap.cast());
+                }
+                if !self.swap.is_null() {
+                    let _ = crate::device::rt::cudaStreamDestroy(self.swap.cast());
                 }
             }
         }
