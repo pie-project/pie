@@ -1261,6 +1261,16 @@ impl TuneArena {
             clear_error();
             return None;
         }
+        // A decode's product streams a weight no cache holds and runs a
+        // few microseconds, which the difference of two spans of evictions
+        // cannot resolve (one read 0.2 us for a 7 MB weight, A100): one
+        // eviction, then a run of products back to back, each over a
+        // different slice of the slab, timed alone.
+        if call.m == 1
+            && let Some(ms) = self.streamed(tactic, lt_handle, plan, bench)
+        {
+            return Some(ms);
+        }
         // The product's share of a run of evicted products, past the
         // evictions alone: the device's timer steps some 2 us, coarser than
         // the tactics' gaps, so one product a span reads as a tie.
@@ -1274,6 +1284,98 @@ impl TuneArena {
         };
         let with = self.span(&fire)?;
         Some((with - alone).max(0.0) / REPS as f32)
+    }
+
+    /// The least of a few timings (ms) of one product, as up to `STREAMED`
+    /// of them run back to back after one eviction, each reading its weight
+    /// from its own slice of the slab's first half (the eviction leaves its
+    /// last third cached); `None` when that half holds fewer than four.
+    fn streamed(
+        &self,
+        tactic: Tactic,
+        lt_handle: lt::cublasLtHandle_t,
+        plan: Option<&LtPlan>,
+        bench: Call,
+    ) -> Option<f32> {
+        let weight = (bench.n as usize) * (bench.k as usize) * 2;
+        let cold = self.flush_bytes / 2;
+        let runs = (cold / weight.next_multiple_of(256).max(1)).min(STREAMED);
+        if weight == 0 || runs < 4 {
+            return None;
+        }
+        let stride = (cold / runs) & !255;
+        let at = self.flush.addr() as u64;
+        let stream = self.stream.cast();
+        let mut graph: cudaGraph_t = std::ptr::null_mut();
+        let mut exec: cudaGraphExec_t = std::ptr::null_mut();
+        let captured = unsafe {
+            cudaStreamBeginCapture(
+                stream,
+                cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal,
+            ) == cudaError::cudaSuccess
+                && self.evict()
+                && cudaEventRecordWithFlags(self.start, stream, cudaEventRecordExternal)
+                    == cudaError::cudaSuccess
+                && (0..runs).all(|i| {
+                    let call = Call {
+                        w: at + (i * stride) as u64,
+                        ..bench
+                    };
+                    run_tactic(
+                        self.handle,
+                        self.stream,
+                        lt_handle,
+                        plan,
+                        tactic,
+                        call,
+                        self.workspace,
+                        self.workspace_bytes,
+                        crate::tuning::Tuning::DEFAULT,
+                    )
+                })
+                && cudaEventRecordWithFlags(self.stop, stream, cudaEventRecordExternal)
+                    == cudaError::cudaSuccess
+        };
+        let ended =
+            unsafe { cudaStreamEndCapture(stream, &raw mut graph) } == cudaError::cudaSuccess;
+        if !captured || !ended || graph.is_null() {
+            if !graph.is_null() {
+                let _ = unsafe { cudaGraphDestroy(graph) };
+            }
+            let _ = unsafe { cudaStreamSynchronize(stream) };
+            clear_error();
+            return None;
+        }
+        let instantiated = unsafe { cudaGraphInstantiateWithFlags(&raw mut exec, graph, 0) }
+            == cudaError::cudaSuccess;
+        let _ = unsafe { cudaGraphDestroy(graph) };
+        if !instantiated || exec.is_null() {
+            clear_error();
+            return None;
+        }
+        let mut best: Option<f32> = None;
+        for round in 0..ROUNDS {
+            let mut ms = 0.0f32;
+            let timed = unsafe {
+                cudaGraphLaunch(exec, stream) == cudaError::cudaSuccess
+                    && cudaEventSynchronize(self.stop) == cudaError::cudaSuccess
+                    && (round == 0
+                        || cudaEventElapsedTime(&raw mut ms, self.start, self.stop)
+                            == cudaError::cudaSuccess)
+            };
+            if !timed {
+                let _ = unsafe { cudaStreamSynchronize(stream) };
+                let _ = unsafe { cudaGraphExecDestroy(exec) };
+                clear_error();
+                return None;
+            }
+            if round > 0 && best.is_none_or(|b| ms < b) {
+                best = Some(ms);
+            }
+        }
+        let _ = unsafe { cudaStreamSynchronize(stream) };
+        let _ = unsafe { cudaGraphExecDestroy(exec) };
+        best.map(|ms| ms / runs as f32)
     }
 
     /// The least of a few timings (ms) of `REPS` evictions, each followed by
@@ -1344,6 +1446,9 @@ impl TuneArena {
 /// Evicted products a timed span, and the spans timed (the first a warm-up).
 const REPS: usize = 4;
 const ROUNDS: usize = 3;
+
+/// Products of one row a streamed span runs back to back.
+const STREAMED: usize = 16;
 
 fn flush_bytes() -> usize {
     const FALLBACK: usize = 64 << 20;
@@ -1456,7 +1561,7 @@ fn signature() -> String {
         .to_string_lossy()
         .into_owned();
     format!(
-        "# pie-dense-gemm v7 sm{}{} cublas={version} dev={name}",
+        "# pie-dense-gemm v8 sm{}{} cublas={version} dev={name}",
         prop.major, prop.minor
     )
 }
