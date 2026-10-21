@@ -38,6 +38,13 @@ impl Layer {
     }
 }
 
+/// Whether `pool` holds vLLM's standard fp8 MLA rows (`attn/mla.cuh`'s
+/// `mla_kv_append_fp8`): one u8 plane, 512 latent and 64 or no rotated e4m3
+/// codes a cell under one scale of 1.
+fn fp8_rows(pool: &KvPool) -> bool {
+    pool.keys.dtype == Dtype::U8 && matches!(pool.keys.width, 512 | 576)
+}
+
 fn rope_per_head(op: &'static str, q_pe: Tensor, heads: i32) -> Result<i32, Error> {
     if heads <= 0 {
         return Err(refuse(op, "the stated head count is zero"));
@@ -508,6 +515,9 @@ pub(crate) mod naive {
         pub causal: bool,
         pub top_k: i32,
         pub window: i32,
+        /// The pool's rows are fp8 (`fp8_rows`): the tensor-core kernel
+        /// widens them as it stages them, and no other kernel here reads them.
+        pub fp8: bool,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -577,8 +587,9 @@ pub(crate) mod naive {
                 Fire::at(
                     "attn/mla.cuh",
                     crate::jit::symbol(&format!(
-                        "::pie::attn::mla_naive::mma_detail::mla_mma_paged_kernel<{}>",
-                        shape.rope_dim
+                        "::pie::attn::mla_naive::mma_detail::mla_mma_paged_kernel<{}{}>",
+                        shape.rope_dim,
+                        if shape.fp8 { ", true" } else { "" }
                     )),
                 )
                 .apply(launch),
@@ -629,6 +640,13 @@ pub(crate) mod naive {
             );
         }
 
+        if shape.fp8 {
+            return Err(refuse(
+                op,
+                "fp8 latent rows are read by the tensor-core kernels alone (a 512-wide \
+                 latent, a 64-wide rotated part or none, heads in whole MMA tiles, no window)",
+            ));
+        }
         let ckv = shape.kv_lora_rank;
         let kpe = shape.rope_dim;
         if ckv % 32 != 0 || ckv / 32 > NAIVE_MAX_PER {
@@ -805,24 +823,13 @@ mod sparse {
                     && aligned16(s.q_pe.ptr)
                     && s.q_pe.width == 64 * 64));
         if !fits {
-            // An fp8 pool has no other reader.
-            return fp8.then(|| {
-                Err(crate::jit::refuse(
-                    op,
-                    "fp8 latent rows are read by the tcgen05 sparse pass alone, and this \
-                     shape or device is not one it serves",
-                ))
-            });
+            // An fp8 pool falls to the tensor-core kernel, which widens it.
+            return None;
         }
         Some(launch(ctx, op, s, o))
     }
 
-    /// Whether `pool` holds vLLM's standard fp8 rows (`attn/mla.cuh`'s
-    /// `mla_kv_append_fp8`): one u8 plane, 512 latent and 64 or no rotated
-    /// e4m3 codes a cell under one scale of 1.
-    pub(super) fn fp8_rows(pool: &KvPool) -> bool {
-        pool.keys.dtype == Dtype::U8 && matches!(pool.keys.width, 512 | 576)
-    }
+    pub(super) use super::fp8_rows;
 
     fn launch(ctx: &Ctx, op: &'static str, s: &Shape<'_>, o: &mut Tensor) -> Result<(), Error> {
         let rows = o.rows;
@@ -1242,10 +1249,12 @@ fn dispatch_dense(
     // every row, so a window or another width is the naive kernel's too.
     // A rope part other than 64 wide (GLM-5.3-Flash's none) is the naive
     // kernel's too: the FA2 arms read a 64-wide one beside the latent.
+    // An fp8 pool is the naive arm's tensor-core kernel's, which widens it.
     if ctx.tuning().mla_naive
         || window.is_some()
         || layer.kv_lora_rank != 512
         || layer.rope_dim != 64
+        || fp8_rows(pool)
     {
         let window = match window {
             None => 0,
@@ -1282,6 +1291,7 @@ fn dispatch_dense(
                 causal,
                 top_k: 0,
                 window,
+                fp8: fp8_rows(pool),
             },
         );
     }
@@ -1474,6 +1484,7 @@ fn selected(
             causal,
             top_k: stated(op, selection.width)?,
             window: 0,
+            fp8: fp8_rows(pool),
         },
     )
 }

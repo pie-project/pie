@@ -725,6 +725,24 @@ fn glm_fp8_rows_score_in_e4m3() {
     }
 }
 
+/// Off tcgen05 the fp8 rows take the tensor-core kernel, widened as they are
+/// staged: the same values as the bf16 rows, so the same output, bit for bit.
+#[test]
+fn fp8_rows_widen_on_the_mma_kernel() {
+    if kernels_cuda::linear::tc5::supported() {
+        return;
+    }
+    for (rows, kv, rope) in [(4, 300, 64), (4, 1000, 0), (64, 1000, 0)] {
+        let want = decode_short(rows, kv, rope, false, false);
+        let got = decode_short(rows, kv, rope, true, false);
+        let differ = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+        assert_eq!(
+            differ, 0,
+            "{rows} rows of {kv} keys, rope {rope}: {differ} values differ"
+        );
+    }
+}
+
 #[test]
 fn glm_reads_a_short_selection_dense() {
     // Fp8 latent rows need the tcgen05 sparse pass (Blackwell).
