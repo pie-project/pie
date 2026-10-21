@@ -82,6 +82,7 @@ pub fn get() -> Option<Resume> {
     })
 }
 
+
 /// A token generated here, to be named by the next frame.
 pub(crate) fn note(token: u32) {
     PENDING.with_borrow_mut(|pending| pending.push(token));
