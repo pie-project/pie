@@ -126,7 +126,7 @@ fn both(
             ..pool(keys, ids, indptr, PAGE)
         };
         let o_at = gpu.zeros(rows * qw * 2);
-        let o = &mut ten(o_at, rows, qw as usize, Bf16);
+        let o = &mut ten(o_at, rows, qw, Bf16);
         let what = format!("{arm:?} over {qh}/{kvh} heads of {d}, {window:?}");
         let fired = match arm {
             Arm::RelDecode => {
@@ -165,15 +165,18 @@ fn both(
         };
         fired.unwrap_or_else(|e| panic!("{what}: {e}"));
         gpu.sync();
-        gpu.down::<u16>(o_at, rows * qw as usize)
+        gpu.down::<u16>(o_at, rows * qw)
     })
 }
 
+/// Heads, requests, window and arm.
+type Case = ([usize; 3], &'static [(usize, usize)], Option<u32>, Arm);
+
 #[test]
 fn the_masked_and_biased_arms_read_an_e4m3_pool() {
-    let dec: &[_] = &[(1, 0), (1, 15), (1, 40), (1, 300)];
-    let chunks: &[_] = &[(70, 0), (33, 17), (129, 40)];
-    let cases: &[([usize; 3], &[(usize, usize)], Option<u32>, Arm)] = &[
+    let dec: &'static [_] = &[(1, 0), (1, 15), (1, 40), (1, 300)];
+    let chunks: &'static [_] = &[(70, 0), (33, 17), (129, 40)];
+    let cases: &[Case] = &[
         ([16, 4, 128], chunks, None, Arm::Masked),
         ([8, 8, 256], chunks, Some(64), Arm::Masked),
         ([16, 4, 128], chunks, None, Arm::RelPrefill),
