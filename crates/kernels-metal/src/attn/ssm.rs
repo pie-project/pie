@@ -1191,18 +1191,21 @@ pub fn gated_delta_verify_at(
 }
 
 /// The rows of a lane one threadgroup of the verify conv runs side by side,
-/// and the channels beside them.
+/// and the threads of four channels beside them.
 const CONV_VERIFY_ROWS: u32 = 4;
-const CONV_VERIFY_CHANNELS: u32 = 64;
+const CONV_VERIFY_CHANNELS: u32 = 32;
 
-/// The history the verify conv commits, at most (`kConvVerifyHist`): with
-/// [`CONV_VERIFY_ROWS`] rows a thread holds a quarter of it.
-const CONV_VERIFY_HIST: u32 = 16;
+/// The history the verify conv commits, at most: a thread holds
+/// `kConvVerifyHeld` rows of it, four.
+const CONV_VERIFY_HIST: u32 = 4 * CONV_VERIFY_ROWS;
 
-/// Whether [`causal_conv1d_verify`] holds a conv this wide.
+/// Whether [`causal_conv1d_verify`] holds a conv this wide over this many
+/// channels: four a thread, as the prompt's four-channel conv.
 #[must_use]
-pub fn causal_conv1d_verify_fits(conv_width: u32, dilation: u32) -> bool {
-    conv_history("", conv_width, dilation).is_ok_and(|hist| hist <= CONV_VERIFY_HIST)
+pub fn causal_conv1d_verify_fits(channels: u32, conv_width: u32, dilation: u32) -> bool {
+    channels.is_multiple_of(4)
+        && conv_width <= CONV_X4_TAPS
+        && conv_history("", conv_width, dilation).is_ok_and(|hist| hist <= CONV_VERIFY_HIST)
 }
 
 /// [`causal_conv1d_committed_landing`] with a thread a row: every row lands
@@ -1234,18 +1237,21 @@ pub fn causal_conv1d_verify(
         OP,
         nonzero(OP, "the conv width this statement states", conv_width)?,
     )?;
-    let hist = conv_history(OP, conv_width, dilation)?;
-    if hist > CONV_VERIFY_HIST {
+    if !causal_conv1d_verify_fits(channels, conv_width, dilation) {
         return Err(refuse(
             OP,
-            format!("a history of {hist} rows is past the {CONV_VERIFY_HIST} this arm commits"),
+            format!(
+                "the verify conv runs four of a multiple of four channels, at most \
+                 {CONV_X4_TAPS} taps and {CONV_VERIFY_HIST} rows of history; this one is \
+                 {channels} channels, {conv_width} taps at dilation {dilation}"
+            ),
         ));
     }
     let lanes = committed_lanes(OP, indptr)?;
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     ctx.fire(
         Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(Grid::of(
-            [channels, CONV_VERIFY_ROWS, lanes],
+            [channels / 4, CONV_VERIFY_ROWS, lanes],
             [CONV_VERIFY_CHANNELS, CONV_VERIFY_ROWS, 1],
         )),
         &[

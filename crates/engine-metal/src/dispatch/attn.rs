@@ -744,7 +744,7 @@ impl Run<'_> {
                 let ext_x = self.rs_extend(OP, &seat, *x)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 // The verify conv lands the window's own rows itself.
-                if attn::ssm::causal_conv1d_verify_fits(*conv_width, *dilation) {
+                if attn::ssm::causal_conv1d_verify_fits(ext_x.width, *conv_width, *dilation) {
                     return attn::ssm::causal_conv1d_verify(
                         self.ctx(),
                         ext_x,
