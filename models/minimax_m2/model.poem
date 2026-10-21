@@ -1,0 +1,84 @@
+# The weights of MiniMax-M2: per layer an RMS norm, q, k and v packed into
+# one projection, q's and k's norms across all their heads, the output
+# projection, an RMS norm, the router, its score bias and the routed experts'
+# banks (gate and up packed); the token embedding, a final norm and the head.
+# The deployment's first dtype stores the attention's projections, its second
+# (or the first) the expert banks; the norms, router, embedding and head stay
+# bf16.
+
+def dims(layers, experts, max_position):
+    return struct(
+        hidden = 3072,
+        layers = layers,
+        q_heads = 48,
+        kv_heads = 8,
+        head_dim = 128,
+        rotary_dim = 64,
+        experts = experts,
+        top_k = 8,
+        inter = 1536,
+        vocab = 200064,
+        theta = 5000000.0,
+        norm_eps = 1e-6,
+        max_position = max_position,
+    )
+
+DIMS = {
+    "minimax-m25": dims(layers = 62, experts = 256, max_position = 196608),
+    "minimax-m25-mini": dims(layers = 4, experts = 16, max_position = 196608),
+    "minimax-m27": dims(layers = 62, experts = 256, max_position = 204800),
+}
+
+def layout(id, deploy):
+    ws = deploy.weights
+    if len(ws) == 1:
+        proj, experts = ws[0], ws[0]
+    elif len(ws) == 2:
+        proj, experts = ws
+    else:
+        fail("{} stores its weights at one dtype, or its attention and experts at a dtype each; not {}".format(id, ws))
+    if deploy.drafter != None or deploy.parts:
+        fail("{} ships no drafter and no parts".format(id))
+    dense = compute(dtype.bf16)
+    d = DIMS[id]
+    hidden, hd = d.hidden, d.head_dim
+    q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
+
+    def layer(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        return struct(
+            attn_norm = weight(n("attn_norm"), [hidden], dense),
+            qkv = weight(n("qkv"), [q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+            o = weight(n("o"), [hidden, q_width], proj).rows(),
+            q_norm = weight(n("q_norm"), [q_width], dense),
+            k_norm = weight(n("k_norm"), [kv_width], dense),
+            mlp_norm = weight(n("mlp_norm"), [hidden], dense),
+            router = weight(n("router"), [d.experts, hidden], dense),
+            bias = weight(n("router_bias"), [d.experts], dtype.f32),
+            gate_up = weight(n("experts_gate_up"), [d.experts, 2 * d.inter, hidden], experts).bank([d.inter, d.inter]),
+            down = weight(n("experts_down"), [d.experts, hidden, d.inter], experts).rows(),
+            kv = "kv.{}".format(l),
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        kv_heads = d.kv_heads,
+        head_dim = hd,
+        rotary_dim = d.rotary_dim,
+        q_width = q_width,
+        kv_width = kv_width,
+        experts = d.experts,
+        top_k = d.top_k,
+        inter = d.inter,
+        theta = d.theta,
+        max_position = d.max_position,
+        eps = d.norm_eps,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        kv = deploy.kv,
+        embed = weight("embed", [d.vocab, hidden], dense),
+        head = weight("lm_head", [d.vocab, hidden], dense).columns(),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight("final_norm", [hidden], dense),
+    )
