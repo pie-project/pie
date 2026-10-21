@@ -6,7 +6,8 @@
 //! page layout: v1 moves a page's bytes as they are. The bytes ride the bulk
 //! link (`transport::tcp`), one port above the peer link.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -162,6 +163,16 @@ pub fn bulk_addr(listen: &str) -> Result<String> {
 }
 
 static LISTEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static LINK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Where this worker's peer link listens, as it tells the directory.
+pub fn set_link(addr: String) {
+    let _ = LINK.set(addr);
+}
+
+pub fn link() -> Option<String> {
+    LINK.get().cloned()
+}
 
 /// Where this worker serves its pages' bytes, as it tells the directory and
 /// the peers it sends passes to.
@@ -362,6 +373,19 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
 /// Dials `addr` and, if it can take this worker's passes, makes it the
 /// runtime's prefill peer.
 pub async fn dial(addr: &str, ours: &Hello, listen: Option<String>) -> Result<()> {
+    let dialed = greet(addr, ours, listen).await?;
+    tracing::info!(
+        peer = %addr,
+        in_place = dialed.kv.is_some(),
+        "prefilling passes on a peer"
+    );
+    runtime::offload::prefill::set_peer(Some(Arc::new(dialed)));
+    Ok(())
+}
+
+/// A link to the peer at `addr`, greeted: one of this worker's model, class
+/// and page.
+async fn greet(addr: &str, ours: &Hello, listen: Option<String>) -> Result<Dialed> {
     let client = connect(addr).await?;
     let theirs = client
         .hello(tarpc::context::current(), ours.clone())
@@ -389,19 +413,66 @@ pub async fn dial(addr: &str, ours: &Hello, listen: Option<String>) -> Result<()
         }),
         None => None,
     };
-    runtime::offload::prefill::set_peer(Some(Arc::new(Dialed {
+    Ok(Dialed {
         client,
         home: listen,
         kv,
-    })));
-    tracing::info!(
-        peer = %addr,
-        worker = %theirs.worker,
-        in_place = kv.is_some(),
-        "prefilling passes on a peer"
-    );
-    Ok(())
+    })
 }
+
+static HELLO: std::sync::OnceLock<Hello> = std::sync::OnceLock::new();
+
+/// What this worker greets its peers with.
+pub fn set_hello(hello: Hello) {
+    let _ = HELLO.set(hello);
+}
+
+/// Reaches the workers the cluster names by id: their links' addresses
+/// from the gateway's directory, each greeted once and kept while it stays
+/// where it was.
+struct GatewayDialer {
+    gateway: worker_api::GatewayInboundClient,
+    dialed: Mutex<HashMap<String, (String, Arc<Dialed>)>>,
+}
+
+impl runtime::offload::executors::Dialer for GatewayDialer {
+    fn dial(
+        &self,
+        worker: String,
+    ) -> BoxFuture<'static, Result<Arc<dyn runtime::offload::prefill::PrefillPeer>>> {
+        let gateway = self.gateway.clone();
+        let kept = self.dialed.lock().unwrap().get(&worker).cloned();
+        let dialer = DIALER.get().cloned();
+        Box::pin(async move {
+            let id: u64 = worker.parse().context("a worker id")?;
+            let addr = gateway
+                .link(tarpc::context::current(), WorkerId(id))
+                .await
+                .context("asking the gateway's directory")?
+                .ok_or_else(|| anyhow::anyhow!("worker {worker} has no peer link"))?;
+            if let Some((at, dialed)) = kept
+                && at == addr
+            {
+                return Ok(dialed as Arc<dyn runtime::offload::prefill::PrefillPeer>);
+            }
+            let hello = HELLO
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("this worker greets no peer"))?;
+            let dialed = Arc::new(greet(&addr, hello, listen()).await?);
+            if let Some(dialer) = dialer {
+                dialer
+                    .dialed
+                    .lock()
+                    .unwrap()
+                    .insert(worker.clone(), (addr.clone(), dialed.clone()));
+            }
+            tracing::info!(%worker, peer = %addr, "an executor reached");
+            Ok(dialed as Arc<dyn runtime::offload::prefill::PrefillPeer>)
+        })
+    }
+}
+
+static DIALER: std::sync::OnceLock<Arc<GatewayDialer>> = std::sync::OnceLock::new();
 
 /// The gateway's directory, asked by this worker.
 struct GatewayDirectory {
@@ -440,6 +511,15 @@ pub async fn report_state(gateway: worker_api::GatewayInboundClient, worker: Wor
         gateway: gateway.clone(),
         worker,
     })));
+    let dialer = DIALER
+        .get_or_init(|| {
+            Arc::new(GatewayDialer {
+                gateway: gateway.clone(),
+                dialed: Mutex::default(),
+            })
+        })
+        .clone();
+    runtime::offload::executors::set_dialer(Some(dialer));
     let peer = listen();
     let mut said: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let mut said_runs: std::collections::HashMap<[u8; 32], Vec<[u8; 32]>> =
@@ -486,6 +566,7 @@ pub async fn report_state(gateway: worker_api::GatewayInboundClient, worker: Wor
             },
             pool: false,
             published: (full || published != said_published).then(|| published.clone()),
+            link: link(),
         };
         // Sent even when nothing changed: it is also how a link finds its
         // gateway gone, and ends so the link is dialed again.

@@ -20,6 +20,8 @@ pub struct Directory {
 struct Inner {
     held: HashMap<WorkerId, HashSet<Key>>,
     peers: HashMap<WorkerId, String>,
+    /// Where each worker's peer link listens.
+    links: HashMap<WorkerId, String>,
     /// Runs workers keep whole from token 0, by their last key: the groups
     /// a cluster policy places.
     runs: HashMap<WorkerId, HashMap<Key, Arc<Vec<Key>>>>,
@@ -131,6 +133,7 @@ impl Directory {
         inner.published.remove(&worker);
         inner.held.remove(&worker);
         inner.peers.remove(&worker);
+        inner.links.remove(&worker);
         inner.runs.remove(&worker);
         inner.pools.remove(&worker);
     }
@@ -170,6 +173,15 @@ impl Directory {
     /// Where `worker` serves its pages' bytes.
     pub fn peer(&self, worker: WorkerId) -> Option<String> {
         self.inner.lock().unwrap().peers.get(&worker).cloned()
+    }
+
+    pub fn report_link(&self, worker: WorkerId, link: String) {
+        self.inner.lock().unwrap().links.insert(worker, link);
+    }
+
+    /// Where `worker`'s peer link listens.
+    pub fn link(&self, worker: WorkerId) -> Option<String> {
+        self.inner.lock().unwrap().links.get(&worker).cloned()
     }
 
     /// The workers other than `asker`, reachable by their peers, that hold a

@@ -58,7 +58,7 @@ fn capability(name: &str) -> bool {
         "retention.tier" => crate::planner::planner().is_some_and(|p| p.can_pause()),
         // Passes go to a peer while one is linked; `cost` reads only the
         // rule's threshold.
-        "offload.remote" => crate::offload::prefill::has_peer(),
+        "offload.remote" => crate::offload::executors::reachable(),
         // The worker's own values reach the cluster plane with its state
         // report; a process's do not yet.
         "publish" => true,
@@ -915,6 +915,7 @@ mod tests {
                 session: session.map(Into::into),
                 props: Default::default(),
                 resumed: None,
+                executors: Vec::new(),
             },
         ));
         pid
@@ -935,6 +936,7 @@ mod tests {
             session: None,
             props: props(json!({"priority": 1})),
             resumed: None,
+            executors: Vec::new(),
         };
         let arrived = registry.apply(Event::Arrived(pid, arrival));
         assert!(matches!(arrived[..], [Edge::Arrived(ref p)] if *p == id));
@@ -1109,6 +1111,7 @@ mod tests {
                     session: None,
                     props: props(json!({ "prompt": prompt })),
                     resumed: None,
+                    executors: Vec::new(),
                 },
             ));
             schedule::plex_id(pid)

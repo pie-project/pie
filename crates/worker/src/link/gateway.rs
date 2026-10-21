@@ -467,8 +467,14 @@ async fn session_driver(
         }
 
         let mut message = req.message;
-        if let ClientMessage::LaunchProcess { cluster_props, .. } = &mut message {
+        if let ClientMessage::LaunchProcess {
+            cluster_props,
+            executors,
+            ..
+        } = &mut message
+        {
             *cluster_props = req.cluster_props;
+            *executors = req.executors.iter().map(|w| w.0.to_string()).collect();
         }
         let fed = feed_turn(client_id, req_id, message);
 

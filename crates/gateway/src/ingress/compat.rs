@@ -217,6 +217,7 @@ async fn relay(
                 .map(str::to_string),
             resume: None,
             cluster_props: Props::new(),
+            executors: Vec::new(),
         },
         blobs: Vec::new(),
         priority: Priority::Normal,

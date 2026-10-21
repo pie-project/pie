@@ -23,11 +23,12 @@ use crate::session::AdmitReject;
 
 fn capability(name: &str) -> bool {
     // Runs replicate to pools and to serving workers' host tiers; a running
-    // turn of a built-in API moves by ending where it runs and resuming
-    // where it goes, after what its client was sent.
+    // turn moves by ending where it runs and resuming where it goes, after
+    // what its client was sent; the workers a placement names run its
+    // process's passes.
     matches!(
         name,
-        "cluster.hold" | "state.replicate" | "placement.migrate"
+        "cluster.hold" | "state.replicate" | "placement.migrate" | "placement.executors"
     )
 }
 
@@ -301,10 +302,12 @@ impl Cluster {
             .is_some_and(|(s, _)| *s == seq)
     }
 
-    pub fn placement(&self, req: &Request) -> (Option<WorkerId>, Props) {
+    /// Where the placement table puts `req`: its worker, its props, and the
+    /// workers its passes may run on, best first.
+    pub fn placement(&self, req: &Request) -> (Option<WorkerId>, Props, Vec<WorkerId>) {
         let tables = self.shared.tables.read().unwrap();
         let Some(placement) = tables.placement.get(&req.req_id.0.to_string()) else {
-            return (None, Props::new());
+            return (None, Props::new(), Vec::new());
         };
         let worker = placement
             .worker
@@ -316,7 +319,12 @@ impl Cluster {
             .iter()
             .filter_map(|(name, value)| Some((name.clone(), json(value)?)))
             .collect();
-        (worker, props)
+        let executors = placement
+            .executors
+            .iter()
+            .filter_map(|id| id.parse().ok().map(WorkerId))
+            .collect();
+        (worker, props, executors)
     }
 
     pub fn dispatched(&self, req: &Request, worker: WorkerId) {
@@ -1104,8 +1112,10 @@ mod tests {
                 session: None,
                 resume: None,
                 cluster_props: Props::new(),
+                executors: Vec::new(),
             },
             cluster_props: Props::new(),
+            executors: Vec::new(),
         }
     }
 
@@ -1316,7 +1326,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_launch_is_held_below_the_floor_and_placed_where_its_policy_says() {
         let rig = rig(0);
-        let held = launch(1, serde_json::json!({"key": 0, "worker": "1"}));
+        let held = launch(
+            1,
+            serde_json::json!({"key": 0, "worker": "1", "executors": "3,2"}),
+        );
         let free = launch(2, serde_json::json!({}));
 
         let waiting = tokio::spawn({
@@ -1327,9 +1340,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!waiting.is_finished(), "key 0 is below the floor of 1");
 
-        let (worker, props) = rig.router.placement(&held);
+        let (worker, props, executors) = rig.router.placement(&held);
         assert_eq!(worker, Some(WorkerId(1)));
         assert_eq!(props["from"], serde_json::json!("1"));
+        assert_eq!(
+            executors,
+            [WorkerId(3), WorkerId(2)],
+            "its passes' workers, best first"
+        );
         assert_eq!(rig.router.placement(&free).0, None, "the router's default");
         waiting.abort();
     }

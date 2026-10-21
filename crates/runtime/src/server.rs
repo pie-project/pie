@@ -414,6 +414,7 @@ impl Session {
                 session,
                 resume,
                 cluster_props,
+                executors,
             } => {
                 self.handle_launch_process(
                     corr_id,
@@ -424,6 +425,7 @@ impl Session {
                     session,
                     resume,
                     cluster_props,
+                    executors,
                 )
                 .await
             }

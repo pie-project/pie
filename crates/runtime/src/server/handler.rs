@@ -471,6 +471,7 @@ impl Session {
         session: Option<String>,
         resume: Option<String>,
         cluster_props: client_api::Props,
+        executors: Vec<String>,
     ) {
         // A worker also takes clients that did not come through a gateway.
         if let Err(why) = client_api::props::from_client(&mut props)
@@ -545,6 +546,7 @@ impl Session {
                 session,
                 props,
                 resumed: resume,
+                executors,
             },
         ) {
             Ok(process_id) => {

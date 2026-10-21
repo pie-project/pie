@@ -242,9 +242,11 @@ async fn start_peers(user_cfg: &config::Config) -> Result<()> {
         kv::open(&name, handle)?;
     }
     let hello = peer::hello(WorkerId(0), &engine);
+    peer::set_hello(hello.clone());
     if let Some(listen) = &user_cfg.offload.listen {
         peer::serve(listen, hello.clone()).await?;
         peer::set_listen(peer::bulk_addr(listen)?);
+        peer::set_link(listen.clone());
     }
     peer::clients();
     if !user_cfg.offload.pools.is_empty() {

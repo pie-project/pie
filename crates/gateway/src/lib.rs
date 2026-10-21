@@ -138,9 +138,10 @@ impl TurnRouter for RouteBackend {
         let placed: Request;
         let (req, preferred) = match router {
             Some(router) => {
-                let (preferred, cluster_props) = router.placement(req);
+                let (preferred, cluster_props, executors) = router.placement(req);
                 placed = Request {
                     cluster_props,
+                    executors,
                     ..req.clone()
                 };
                 (&placed, preferred)

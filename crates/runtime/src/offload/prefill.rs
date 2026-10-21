@@ -137,7 +137,8 @@ pub fn set_peer(peer: Option<Arc<dyn PrefillPeer>>) {
     *PEER.write().unwrap() = peer;
 }
 
-fn peer() -> Option<Arc<dyn PrefillPeer>> {
+/// The peer the worker's configuration dialed (`offload.peers`), if any.
+pub(crate) fn configured_peer() -> Option<Arc<dyn PrefillPeer>> {
     PEER.read().unwrap().clone()
 }
 
@@ -206,61 +207,71 @@ pub(crate) async fn before_pass(
             ),
         }
     }
-    let Some(min_tokens) = min_tokens(pid) else {
+    let Some((min_tokens, named)) = rule(pid) else {
         return;
     };
     let page = stores.kv_page_size;
     if pass.have >= pass.limit || (pass.limit - pass.have) * u64::from(page) < min_tokens {
         return;
     }
-    let Some(peer) = peer() else {
-        return;
-    };
-    let started = std::time::Instant::now();
-    match take(pid, stores, engine, peer, pass).await {
-        Ok(pages) => {
-            tracing::info!(
-                target: "pie::offload",
-                pages,
-                ms = started.elapsed().as_millis() as u64,
-                "a pass's pages were prefilled on the peer"
-            );
-            crate::policy::report(crate::policy::Event::Offloaded(
-                pid,
-                "peer".into(),
-                u32::try_from(pages).unwrap_or(u32::MAX) * page,
-            ));
+    // Best first; one that cannot take the pass gives way to the next, and
+    // when none can, it runs here.
+    let mut last = None;
+    for peer in super::executors::candidates(pid, &named).await {
+        let started = std::time::Instant::now();
+        match take(pid, stores, engine, peer, &pass).await {
+            Ok(pages) => {
+                tracing::info!(
+                    target: "pie::offload",
+                    pages,
+                    ms = started.elapsed().as_millis() as u64,
+                    "a pass's pages were prefilled on the peer"
+                );
+                crate::policy::report(crate::policy::Event::Offloaded(
+                    pid,
+                    "peer".into(),
+                    u32::try_from(pages).unwrap_or(u32::MAX) * page,
+                ));
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(target: "pie::offload", %error, "a peer could not prefill a pass");
+                last = Some(error);
+            }
         }
-        Err(error) => {
-            tracing::warn!(
-                target: "pie::offload",
-                %error,
-                "the peer could not prefill a pass; it runs here"
-            );
-            crate::policy::report(crate::policy::Event::OffloadFailed(
-                pid,
-                format!("{error:#}"),
-            ));
-        }
+    }
+    if let Some(error) = last {
+        tracing::warn!(
+            target: "pie::offload",
+            %error,
+            "no peer could prefill a pass; it runs here"
+        );
+        crate::policy::report(crate::policy::Event::OffloadFailed(
+            pid,
+            format!("{error:#}"),
+        ));
     }
 }
 
-/// The fewest uncached tokens worth a peer's prefill: the worker policy's
-/// rule, else the configuration's. Unstated, 2048: the pages come back
-/// inline. `None`: this process's passes stay home.
-fn min_tokens(pid: crate::inferlet::process::ProcessId) -> Option<u64> {
+/// The fewest uncached tokens worth a peer's prefill, and the executors the
+/// worker policy names: its rule, else the configuration's. Unstated, 2048:
+/// the pages come back inline. `None`: this process's passes stay home.
+fn rule(pid: crate::inferlet::process::ProcessId) -> Option<(u64, Vec<String>)> {
     use crate::policy::offload::Mode;
     match crate::policy::offload::rule(pid) {
         Some(None) => None,
         Some(Some(rule)) => match rule.mode {
             Mode::Never => None,
-            Mode::Always => Some(u64::from(rule.min_tokens).max(1)),
-            Mode::Cost => Some(u64::from(rule.min_tokens)),
+            Mode::Always => Some((u64::from(rule.min_tokens).max(1), rule.executors)),
+            Mode::Cost => Some((u64::from(rule.min_tokens), rule.executors)),
         },
-        None => Some(match super::prefill_min_suffix_tokens() {
-            0 => 2048,
-            n => n as u64,
-        }),
+        None => Some((
+            match super::prefill_min_suffix_tokens() {
+                0 => 2048,
+                n => n as u64,
+            },
+            Vec::new(),
+        )),
     }
 }
 
@@ -376,7 +387,7 @@ async fn take(
     stores: &Stores,
     engine: usize,
     peer: Arc<dyn PrefillPeer>,
-    pass: Pass,
+    pass: &Pass,
 ) -> Result<usize> {
     let t0 = std::time::Instant::now();
     let pages = peer
@@ -408,7 +419,7 @@ async fn take(
     let have = pass.at(pass.have);
     if let Some(held) = pages.held {
         let lease = held.lease;
-        let read = read_in_place(pid, stores, &*peer, &pass, have, held).await;
+        let read = read_in_place(pid, stores, &*peer, pass, have, held).await;
         if let Err(error) = peer.release(lease).await {
             tracing::warn!(target: "pie::offload", %error, lease, "a peer's lease was not released");
         }

@@ -201,6 +201,7 @@ impl Inner {
             blobs: input.blobs,
             message: input.message,
             cluster_props: Default::default(),
+            executors: Vec::new(),
         };
 
         if let Err(refusal) = self.router.admit(&request).await {
@@ -781,6 +782,7 @@ mod tests {
                 session: None,
                 resume: None,
                 cluster_props: Default::default(),
+                executors: Vec::new(),
             },
             blobs: Vec::new(),
             priority: Priority::Normal,

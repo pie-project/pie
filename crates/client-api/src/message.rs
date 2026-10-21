@@ -60,6 +60,10 @@ pub enum ClientMessage {
         /// Set by the worker, never on the wire.
         #[serde(skip)]
         cluster_props: Props,
+        /// The workers the cluster names to run its passes, best first, by
+        /// id; set by the worker, never on the wire.
+        #[serde(skip)]
+        executors: Vec<String>,
     },
 
     #[serde(rename = "attach_process")]

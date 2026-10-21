@@ -373,6 +373,7 @@ mod tests {
             priority: Priority::Normal,
             blobs: Vec::new(),
             cluster_props: Default::default(),
+            executors: Vec::new(),
             message: ClientMessage::Query {
                 corr_id: 1,
                 subject: "s".to_string(),
@@ -436,6 +437,7 @@ mod tests {
                 session: None,
                 resume: None,
                 cluster_props: Default::default(),
+                executors: Vec::new(),
             };
             assert!(matches!(h.admit(&request), AdmissionDecision::Reject(_)));
         }
@@ -459,6 +461,7 @@ mod tests {
             session: None,
             resume: None,
             cluster_props: Default::default(),
+            executors: Vec::new(),
         };
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut waiting = Vec::new();

@@ -68,6 +68,8 @@ pub struct Arrival {
     pub props: Props,
     /// The resume log a move relaunched it with (`session.resumed`).
     pub resumed: Option<String>,
+    /// The workers the cluster names to run its passes, best first.
+    pub executors: Vec<String>,
 }
 
 /// Each is a no-op when no policy is loaded.

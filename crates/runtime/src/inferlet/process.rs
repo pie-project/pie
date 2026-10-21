@@ -707,6 +707,7 @@ impl Process {
         // below orders by its key. Its resume log is the program's alone.
         let props = arrival.props.clone();
         let resumed = arrival.resumed.take();
+        crate::offload::executors::set(process_id, std::mem::take(&mut arrival.executors));
         crate::policy::report(crate::policy::Event::Arrived(process_id, arrival));
         // Held ahead of every admission permit: a preempted process coming
         // back must not queue behind permits the held-back processes own.
@@ -896,6 +897,7 @@ impl Process {
             planner.unregister(self.process_id);
         }
         residency::unregister_residency(self.process_id);
+        crate::offload::executors::forget(self.process_id);
     }
 }
 

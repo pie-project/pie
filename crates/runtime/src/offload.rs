@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, RwLock};
 
 pub mod directory;
+pub mod executors;
 pub mod prefill;
 pub mod stream;
 
