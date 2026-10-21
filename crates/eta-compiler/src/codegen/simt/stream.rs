@@ -1039,13 +1039,14 @@ pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
     let bases = crate::codegen::op_view::result_bases(&ops);
     let direct = super::fused::analyze_direct_argmax(stage, region, &bases);
     let direct_topk = super::fused::analyze_direct_topk(stage);
+    let claimed = direct.claimed();
     let streams = Streams::new(
         stage,
         region,
         &ops,
         &bases,
         &kinds,
-        &direct.intrinsic,
+        &claimed,
         &direct.skipped,
         &direct_topk,
     );
