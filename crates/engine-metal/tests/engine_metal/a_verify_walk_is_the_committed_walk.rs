@@ -771,7 +771,7 @@ fn price_round(bench: &Bench, rows: i32, replay: i32) {
         )
         .expect("the committed scan");
     };
-    let new_walk = |geometry: (i32, u32, u32)| {
+    let new_walk = |geometry: (u32, u32)| {
         let gates = &gates;
         let x = &x;
         move |sink: &Sink, c: &Committed| {
@@ -794,67 +794,9 @@ fn price_round(bench: &Bench, rows: i32, replay: i32) {
             .expect("the verify scan");
         }
     };
-    let geometries = [
-        (32, 4, 4),
-        (32, 8, 2),
-        (8, 4, 1),
-        (-8, 4, 1),
-        (-8, 4, 2),
-        (-4, 4, 1),
-        (-4, 8, 1),
-        (-4, 4, 2),
-        (-16, 4, 1),
-    ];
-    let batched = [
-        (8, 4, 4),
-        (8, 2, 8),
-        (4, 4, 4),
-        (8, 4, 2),
-        (4, 4, 2),
-        (8, 2, 4),
-    ];
-    let batched_walk = |(groups, vrows, batches): (u32, u32, u32)| {
-        let gates = &gates;
-        let x = &x;
-        move |sink: &Sink, c: &Committed| {
-            use kernels_metal::encode::{Arg, Encode, Fire};
-            sink.fire(
-                Fire::at(
-                    "attn/ssm_gdn_scan.metal",
-                    ssm::gated_delta_verify_batched_entry(groups, vrows, batches)
-                        .expect("a stamped entry"),
-                )
-                .apply(ssm::gated_delta_verify_batched_grid(
-                    groups, vrows, batches, V_HEADS,
-                )),
-                &[
-                    x.qkv.arg(),
-                    indptr.arg(),
-                    c.replay.arg(),
-                    c.commit.arg(),
-                    c.slots.arg(),
-                    0i32.arg(),
-                    gates.ba.arg(),
-                    gates.a_log.arg(),
-                    gates.dt_bias.arg(),
-                    x.state.arg_mut(),
-                    own_y.arg_mut(),
-                    gates.gates.arg_mut(),
-                    (K_HEADS as i32).arg(),
-                    (V_HEADS as i32).arg(),
-                    sink.absent().expect("an absent table"),
-                    (-1i32).arg(),
-                ],
-            )
-            .expect("the batched verify scan");
-        }
-    };
-    let mut batched_best = vec![f64::MAX; batched.len()];
+    let geometries = [(8, 2), (4, 4), (8, 4)];
     let mut best = vec![f64::MAX; geometries.len() + 3];
     for _ in 0..3 {
-        for (at, geometry) in batched.into_iter().enumerate() {
-            batched_best[at] = batched_best[at].min(price(&batched_walk(geometry)));
-        }
         best[0] = best[0].min(price(&old_conv));
         best[1] = best[1].min(price(&new_conv));
         best[2] = best[2].min(price(&old_walk));
@@ -870,13 +812,8 @@ fn price_round(bench: &Bench, rows: i32, replay: i32) {
         "one layer of {replay} + {rows} rows: prep and committed scan {:.1} us; verify",
         best[2]
     );
-    for ((l, g, v), us) in geometries.iter().zip(&best[3..]) {
-        line += &format!(" l{l}s{g}v{v} {us:.1}");
-    }
-    eprintln!("{line}");
-    let mut line = format!("one layer of {replay} + {rows} rows: batched verify");
-    for ((g, v, b), us) in batched.iter().zip(&batched_best) {
-        line += &format!(" s{g}v{v}b{b} {us:.1}");
+    for ((g, v), us) in geometries.iter().zip(&best[3..]) {
+        line += &format!(" s{g}v{v} {us:.1}");
     }
     eprintln!("{line}");
 }

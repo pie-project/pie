@@ -1049,69 +1049,33 @@ fn paged_args(ctx: &Ctx<'_>, paged: Option<Paged>) -> Result<[crate::encode::Arg
     })
 }
 
-/// The `(lanes a value row, simdgroups, value rows a lane)` of a verify
-/// scan's threadgroup.
-const GDN_VERIFY_GROUP: (i32, u32, u32) = (32, 4, 4);
+/// The `(simdgroups, value rows a simdgroup)` of a verify scan's
+/// threadgroup. On the M4 Pro a verify round's layer (5 replayed rows and 8
+/// of its own) walks in 36.6 us at (8, 2), 40.7 us at (4, 4) and 54.8 us
+/// in the gate prep and the committed scan, against a floor of 25 us for
+/// one row: the bank's read and write.
+const GDN_VERIFY_GROUP: (u32, u32) = (8, 2);
 
 /// The key and value head width the verify scan stages.
 const GDN_VERIFY_DIM: u32 = 128;
 
-/// The batched verify scan stamped at `(simdgroups, value rows, batches)`.
+/// The verify scan stamped at `(simdgroups, value rows)`.
 #[must_use]
-pub fn gated_delta_verify_batched_entry(
-    groups: u32,
-    vrows: u32,
-    batches: u32,
-) -> Option<&'static str> {
-    Some(match (groups, vrows, batches) {
-        (8, 4, 4) => "gated_delta_verify_batched_bfloat16_s_8_v_4_b_4",
-        (8, 2, 8) => "gated_delta_verify_batched_bfloat16_s_8_v_2_b_8",
-        (4, 4, 4) => "gated_delta_verify_batched_bfloat16_s_4_v_4_b_4",
-        (8, 4, 2) => "gated_delta_verify_batched_bfloat16_s_8_v_4_b_2",
-        (4, 4, 2) => "gated_delta_verify_batched_bfloat16_s_4_v_4_b_2",
-        (8, 2, 4) => "gated_delta_verify_batched_bfloat16_s_8_v_2_b_4",
+pub fn gated_delta_verify_entry(groups: u32, vrows: u32) -> Option<&'static str> {
+    Some(match (groups, vrows) {
+        (8, 2) => "gated_delta_verify_bfloat16_l_32_s_8_v_2",
+        (4, 4) => "gated_delta_verify_bfloat16_l_32_s_4_v_4",
+        (8, 4) => "gated_delta_verify_bfloat16_l_32_s_8_v_4",
         _ => return None,
     })
 }
 
-/// The launch of a batched verify scan over `heads` value heads of every
-/// lane.
+/// The launch of a verify scan at `(simdgroups, value rows)` over `heads`
+/// value heads of every lane.
 #[must_use]
-pub fn gated_delta_verify_batched_grid(groups: u32, vrows: u32, batches: u32, heads: u32) -> Grid {
-    let tiles = GDN_VERIFY_DIM / (groups * vrows * batches);
+pub fn gated_delta_verify_grid(groups: u32, vrows: u32, heads: u32) -> Grid {
     Grid::of(
-        [GDN_SCAN_LANES, groups * tiles, heads],
-        [GDN_SCAN_LANES, groups, 1],
-    )
-}
-
-/// The verify scan stamped at `(lanes, simdgroups, value rows)`, a lane's
-/// keys side by side; at negative lanes, every `-lanes`-th.
-#[must_use]
-pub fn gated_delta_verify_entry(lanes: i32, groups: u32, vrows: u32) -> Option<&'static str> {
-    Some(match (lanes, groups, vrows) {
-        (32, 4, 4) => "gated_delta_verify_bfloat16_l_32_s_4_v_4",
-        (32, 8, 4) => "gated_delta_verify_bfloat16_l_32_s_8_v_4",
-        (32, 8, 2) => "gated_delta_verify_bfloat16_l_32_s_8_v_2",
-        (8, 4, 1) => "gated_delta_verify_bfloat16_l_8_s_4_v_1",
-        (8, 4, 2) => "gated_delta_verify_bfloat16_l_8_s_4_v_2",
-        (-8, 4, 1) => "gated_delta_verify_bfloat16_l_8_s_4_v_1_strided",
-        (-8, 4, 2) => "gated_delta_verify_bfloat16_l_8_s_4_v_2_strided",
-        (-4, 4, 1) => "gated_delta_verify_bfloat16_l_4_s_4_v_1_strided",
-        (-4, 8, 1) => "gated_delta_verify_bfloat16_l_4_s_8_v_1_strided",
-        (-4, 4, 2) => "gated_delta_verify_bfloat16_l_4_s_4_v_2_strided",
-        (-16, 4, 1) => "gated_delta_verify_bfloat16_l_16_s_4_v_1_strided",
-        _ => return None,
-    })
-}
-
-/// The launch of a verify scan at `(lanes, simdgroups, value rows)` over
-/// `heads` value heads of every lane.
-#[must_use]
-pub fn gated_delta_verify_grid(lanes: i32, groups: u32, vrows: u32, heads: u32) -> Grid {
-    let rows_a_simdgroup = (GDN_SCAN_LANES / lanes.unsigned_abs()) * vrows;
-    Grid::of(
-        [GDN_SCAN_LANES, GDN_VERIFY_DIM / rows_a_simdgroup, heads],
+        [GDN_SCAN_LANES, GDN_VERIFY_DIM / vrows, heads],
         [GDN_SCAN_LANES, groups, 1],
     )
 }
@@ -1179,7 +1143,7 @@ pub fn gated_delta_verify(
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_verify_at(
     ctx: &Ctx<'_>,
-    (row_lanes, groups, vrows): (i32, u32, u32),
+    (groups, vrows): (u32, u32),
     qkv: Tensor,
     indptr: Tensor,
     committed: &Committed,
@@ -1235,7 +1199,7 @@ pub fn gated_delta_verify_at(
             ),
         ));
     }
-    let entry = gated_delta_verify_entry(row_lanes, groups, vrows)
+    let entry = gated_delta_verify_entry(groups, vrows)
         .ok_or_else(|| refuse(OP, "no verify scan is stamped at this geometry"))?;
     let lanes = committed_lanes(OP, indptr)?;
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
@@ -1244,7 +1208,7 @@ pub fn gated_delta_verify_at(
         .checked_mul(lanes)
         .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
     ctx.fire(
-        Fire::at(GDN_SCAN_FILE, entry).apply(gated_delta_verify_grid(row_lanes, groups, vrows, z)),
+        Fire::at(GDN_SCAN_FILE, entry).apply(gated_delta_verify_grid(groups, vrows, z)),
         &[
             qkv.arg(),
             indptr.arg(),
