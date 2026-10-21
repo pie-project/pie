@@ -41,6 +41,57 @@ template <typename T>
 
 instantiate_packed_swiglu(bfloat16, bfloat)
 
+// packed_swiglu over at most eight rows that also lays the register tile's
+// input table of the rows it writes (`qmm_sg_table` in
+// linear/quant_qmm_sg.metal), bit for bit, so the down projection runs no
+// table pass: a thread per 32 inputs of a row (x: 64-input group h = x / 2,
+// half x % 2; y: the row, of the table's eight), each input at its lane
+// slot and the 32 summed in the order `qmm_sg_table` adds them. Rows past
+// `rows` are laid as zeros, and the split tile's `counters` arrival
+// counters are zeroed.
+[[kernel]] void packed_swiglu_table(
+    const device bfloat* packed [[buffer(0)]],
+    device bfloat* out          [[buffer(1)]],
+    const constant uint& intermediate [[buffer(2)]],
+    device bfloat* table        [[buffer(3)]],
+    const constant uint& rows   [[buffer(4)]],
+    const constant uint& counters [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 grid [[threads_per_grid]]) {
+  const uint width = intermediate;
+  const uint row = gid.y, h = gid.x >> 1, q = gid.x & 1;
+  const uint c = row >> 1, r = row & 1;
+  const bool live = row < rows;
+  const size_t at = size_t(row) * size_t(width);
+  float part[2][2];
+  for (uint cl = 0; cl < 2; ++cl) {
+    const uint cp = 2 * q + cl;
+    for (uint i = 0; i < 2; ++i) {
+      const uint fm = 2 * cp + i;
+      float sum = 0.0f;
+      for (uint j = 0; j < 2; ++j)
+        for (uint p = 0; p < 4; ++p) {
+          const uint k = 64 * h + 8 * (2 * cp + j) + p + 4 * i;
+          bfloat v = bfloat(0.0f);
+          if (live) {
+            const float g = float(packed[at * 2 + k]);
+            const float u = float(packed[at * 2 + width + k]);
+            v = static_cast<bfloat>((g / (1.0f + metal::exp(-g))) * u);
+            out[at + k] = v;
+          }
+          table[(ulong(h) * 32 + fm * 4 + c) * 16 + 8 * j + 2 * p + r] = v;
+          sum += float(v);
+        }
+      part[cl][i] = sum;
+    }
+  }
+  device float* sums = reinterpret_cast<device float*>(table + 8 * ulong(width));
+  sums[(2 * ulong(h) + q) * 8 + row] = (part[0][0] + part[0][1]) + (part[1][0] + part[1][1]);
+  device uint* count = reinterpret_cast<device uint*>(sums) + width / 4;
+  for (uint n = gid.y * grid.x + gid.x; n < counters; n += grid.x * grid.y)
+    count[n] = 0;
+}
+
 template <typename T>
 [[kernel]] void packed_swiglu_clamp(
     const device T* packed [[buffer(0)]],

@@ -21,15 +21,38 @@ impl Run<'_> {
                 plus_one,
                 eps,
                 out,
-            } => elemwise::norm::residual_add_rmsnorm(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*y),
-                self.tensor(*weight),
-                *plus_one,
-                *eps,
-                self.tensor(*out),
-            ),
+            } => {
+                // The normed rows' projections on the register tile read
+                // their input table as this norm lays it.
+                let width = self.tensor(*out).width;
+                let laid = self.register_readers(*out).and_then(|counters| {
+                    let rows = (17 * width + 4 * counters).div_ceil(2 * width);
+                    let (table, _) = self.register_table(*out, rows, width, counters)?;
+                    Some((table, counters))
+                });
+                if let Some((table, counters)) = laid {
+                    return elemwise::norm::residual_add_rmsnorm_table(
+                        self.ctx(),
+                        self.tensor(*x),
+                        self.tensor(*y),
+                        self.tensor(*weight),
+                        *plus_one,
+                        *eps,
+                        self.tensor(*out),
+                        table,
+                        counters,
+                    );
+                }
+                elemwise::norm::residual_add_rmsnorm(
+                    self.ctx(),
+                    self.tensor(*x),
+                    self.tensor(*y),
+                    self.tensor(*weight),
+                    *plus_one,
+                    *eps,
+                    self.tensor(*out),
+                )
+            }
             _ => Err(kernels_metal::Error::Unsupported { op: op.name() }),
         }
     }

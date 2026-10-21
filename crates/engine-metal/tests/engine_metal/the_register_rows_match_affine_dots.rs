@@ -306,3 +306,243 @@ fn a_table_one_matmul_laid_feeds_the_next() {
     }
     eprintln!("checked {checked} matmuls reading a table another laid");
 }
+
+/// A residual add and RMS norm that lays the register tile's input table of
+/// its normed rows lands the rows the plain norm lands, and a matmul reading
+/// that table lands the bits it lands over the table it lays itself, the
+/// counters of its split zeroed and the rows past the norm's left empty.
+#[test]
+fn a_norm_lays_the_table_its_projections_read() {
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"register\", \"qmv\"]", false);
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(&device, bytes.len() as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let mut checked = 0;
+    for &(k, n) in &[(2048u32, 12288u32), (2048, 64), (4096, 2048), (512, 2048)] {
+        let (bank, _planes) = bank_of(&device, &handles, k, n, 0x3);
+        for m in [1u32, 5, 8] {
+            let rows = |salt: u64, scale: f32| -> Vec<u8> {
+                (0..m * k)
+                    .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ salt)) - 127.0) * scale))
+                    .collect()
+            };
+            let x = rows(0x77, 0.031);
+            let residual = rows(0x99, 0.017);
+            let gains: Vec<u8> = (0..k)
+                .flat_map(|at| bf16(0.5 + f32::from(noise(u64::from(at) ^ 0x42)) / 256.0))
+                .collect();
+            let (x_b, w_b) = (upload(&x), upload(&gains));
+            let (plain_res_b, laid_res_b) = (upload(&residual), upload(&residual));
+            let plain_out_b = upload(&vec![0; (m * k * 2) as usize]);
+            let laid_out_b = upload(&vec![0; (m * k * 2) as usize]);
+            let counters = n / 64;
+            let table_rows = (17 * k + 4 * counters).div_ceil(2 * k);
+            let table_b = upload(&vec![0xa5; (table_rows * k * 2) as usize]);
+            let th = bind(&table_b);
+            let tensor = |b: &Buffer| Tensor::new(bind(b), m, k, Dtype::Bf16);
+            let weight = Tensor::new(bind(&w_b), 1, k, Dtype::Bf16);
+            let (x_t, plain_out, laid_out) =
+                (tensor(&x_b), tensor(&plain_out_b), tensor(&laid_out_b));
+            let frame = device.frame().expect("frame");
+            let sink = Sink::new(&device, &frame, &pipelines, &handles);
+            kernels_metal::elemwise::norm::residual_add_rmsnorm(
+                &sink,
+                x_t,
+                tensor(&plain_res_b),
+                weight,
+                false,
+                1e-6,
+                plain_out,
+            )
+            .expect("norm");
+            kernels_metal::elemwise::norm::residual_add_rmsnorm_table(
+                &sink,
+                x_t,
+                tensor(&laid_res_b),
+                weight,
+                false,
+                1e-6,
+                laid_out,
+                Tensor::new(th, table_rows, k, Dtype::F16),
+                counters,
+            )
+            .expect("norm and table");
+            frame.commit().expect("commit");
+            let bytes = u64::from(m * k * 2);
+            assert!(
+                handles.read(plain_out.buf, bytes).expect("read")
+                    == handles.read(laid_out.buf, bytes).expect("read"),
+                "k={k} M={m}: the table-laying norm lands other rows"
+            );
+            let partial_b = upload(&vec![0xa5; (64 * n * 4) as usize]);
+            let ph = bind(&partial_b);
+            let own_b = upload(&vec![0xa5; (table_rows * k * 2) as usize]);
+            let oh = bind(&own_b);
+            let run = |out: u32, table: u32, laid: bool| {
+                let precast = |rows: u32, width: u32| {
+                    (rows <= table_rows && width == k)
+                        .then(|| Tensor::new(table, rows, width, Dtype::F16))
+                };
+                let partials = |rows: u32, width: u32| {
+                    (rows <= 64 && width == n).then(|| Tensor::new(ph, rows, width, Dtype::F32))
+                };
+                let kept = |rows: u32, width: u32, _: u32| Some((precast(rows, width)?, laid));
+                let frame = device.frame().expect("frame");
+                let sink = Sink::new(&device, &frame, &pipelines, &handles);
+                quant::matmul(
+                    &sink,
+                    &tuning,
+                    plain_out,
+                    bank,
+                    Tensor::new(out, m, n, Dtype::Bf16),
+                    quant::Scratch {
+                        precast: &precast,
+                        partials: &partials,
+                        table: Some(&kept),
+                    },
+                    8,
+                )
+                .expect("register");
+                frame.commit().expect("commit");
+            };
+            let alone_b = upload(&vec![0x5a; (m * n * 2) as usize]);
+            let read_b = upload(&vec![0x5a; (m * n * 2) as usize]);
+            run(bind(&alone_b), oh, false);
+            run(bind(&read_b), th, true);
+            let bytes = u64::from(m * n * 2);
+            assert!(
+                handles.read(bind(&alone_b), bytes).expect("read")
+                    == handles.read(bind(&read_b), bytes).expect("read"),
+                "k={k} N={n} M={m}: the matmul over the norm's table lands other bits"
+            );
+            // The inputs and their sums, byte for byte the table the matmul laid itself;
+            // then the counters, zeroed.
+            let laid = handles
+                .read(th, u64::from(table_rows * k * 2))
+                .expect("read");
+            let own = handles.read(oh, u64::from(17 * k)).expect("read");
+            assert!(
+                laid[..(17 * k) as usize] == own[..],
+                "k={k} M={m}: the norm's table is not the one the matmul lays"
+            );
+            assert!(
+                laid[(17 * k) as usize..(17 * k + 4 * counters) as usize]
+                    .iter()
+                    .all(|&b| b == 0),
+                "k={k} M={m}: the norm left an arrival counter standing"
+            );
+            checked += 1;
+        }
+    }
+    eprintln!("checked {checked} matmuls over a table their norm laid");
+}
+
+/// A swiglu that lays the register tile's input table of its rows lands the
+/// rows the plain swiglu lands and the table the down projection lays over
+/// them, byte for byte, its split's counters zeroed.
+#[test]
+fn a_swiglu_lays_the_table_its_down_reads() {
+    let Ok(device) = Context::bind() else {
+        return;
+    };
+    let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"register\", \"qmv\"]", false);
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(&device, bytes.len() as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let mut checked = 0;
+    for &(k, n) in &[(512u32, 2048u32), (1024, 4096), (6144, 2048)] {
+        let (bank, _planes) = bank_of(&device, &handles, k, n, 0x4);
+        for m in [1u32, 5, 8] {
+            let packed: Vec<u8> = (0..m * 2 * k)
+                .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0x31)) - 127.0) * 0.043))
+                .collect();
+            let packed_t = Tensor::new(bind(&upload(&packed)), m, 2 * k, Dtype::Bf16);
+            let plain = Tensor::new(
+                bind(&upload(&vec![0; (m * k * 2) as usize])),
+                m,
+                k,
+                Dtype::Bf16,
+            );
+            let laid = Tensor::new(
+                bind(&upload(&vec![0; (m * k * 2) as usize])),
+                m,
+                k,
+                Dtype::Bf16,
+            );
+            let counters = n / 64;
+            let table_rows = (17 * k + 4 * counters).div_ceil(2 * k);
+            let th = bind(&upload(&vec![0xa5; (table_rows * k * 2) as usize]));
+            let oh = bind(&upload(&vec![0xa5; (table_rows * k * 2) as usize]));
+            let ph = bind(&upload(&vec![0xa5; (64 * n * 4) as usize]));
+            let yh = bind(&upload(&vec![0x5a; (m * n * 2) as usize]));
+            let frame = device.frame().expect("frame");
+            let sink = Sink::new(&device, &frame, &pipelines, &handles);
+            kernels_metal::linear::mlp::swiglu(&sink, packed_t, k, plain).expect("swiglu");
+            kernels_metal::linear::mlp::swiglu_table(
+                &sink,
+                packed_t,
+                k,
+                laid,
+                Tensor::new(th, table_rows, k, Dtype::F16),
+                counters,
+            )
+            .expect("swiglu and table");
+            let precast = |rows: u32, width: u32| {
+                (rows <= table_rows && width == k).then(|| Tensor::new(oh, rows, width, Dtype::F16))
+            };
+            let partials = |rows: u32, width: u32| {
+                (rows <= 64 && width == n).then(|| Tensor::new(ph, rows, width, Dtype::F32))
+            };
+            quant::matmul(
+                &sink,
+                &tuning,
+                plain,
+                bank,
+                Tensor::new(yh, m, n, Dtype::Bf16),
+                quant::Scratch {
+                    precast: &precast,
+                    partials: &partials,
+                    table: None,
+                },
+                8,
+            )
+            .expect("register");
+            frame.commit().expect("commit");
+            let bytes = u64::from(m * k * 2);
+            assert!(
+                handles.read(plain.buf, bytes).expect("read")
+                    == handles.read(laid.buf, bytes).expect("read"),
+                "k={k} M={m}: the table-laying swiglu lands other rows"
+            );
+            let table = handles
+                .read(th, u64::from(table_rows * k * 2))
+                .expect("read");
+            let own = handles.read(oh, u64::from(17 * k)).expect("read");
+            assert!(
+                table[..(17 * k) as usize] == own[..],
+                "k={k} M={m}: the swiglu's table is not the one the matmul lays"
+            );
+            assert!(
+                table[(17 * k) as usize..(17 * k + 4 * counters) as usize]
+                    .iter()
+                    .all(|&b| b == 0),
+                "k={k} M={m}: the swiglu left an arrival counter standing"
+            );
+            checked += 1;
+        }
+    }
+    eprintln!("checked {checked} tables a swiglu laid");
+}
